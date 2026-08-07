@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en" data-lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Building — TENRYU Documentation</title>
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>Building <span class="badge">reference</span></h1>
+    <p class="abstract">TENRYU configures its C++20 and CUDA C++ sources with CMake and Ninja. The supported build target is an NVIDIA sm_80-or-newer GPU with a CUDA 12.x toolkit. This page covers a Release build, three levels of testing, the MPI option, and ccache for faster rebuilds.</p>
+
+    <aside class="planned" aria-labelledby="at-a-glance">
+      <h3 id="at-a-glance">At a glance</h3>
+      <ul>
+        <li>Install a CUDA 12.x toolkit, CMake 3.25 or newer, Ninja, and use an NVIDIA sm_80+ GPU.</li>
+        <li>The standard workflow configures <code>build/</code> with <code>cmake</code>, then compiles it with <code>ninja -C build</code>.</li>
+        <li>Use the complete CTest suite, a targeted <code>-R</code> selection, or a named <code>tenryu verify</code> case according to the scope of the check.</li>
+        <li>MPI is OFF by default. Configure with <code>-DTENRYU_ENABLE_MPI=ON</code> for a multi-rank executable.</li>
+      </ul>
+    </aside>
+
+    <section aria-labelledby="prerequisites">
+      <h2 id="prerequisites">Prerequisites</h2>
+      <p>Build on a system where the NVIDIA driver and CUDA compiler are available and CMake can discover the selected dependencies. HDF5 and Python support are enabled by default in the top-level CMake configuration; MPI is disabled by default. Any optional feature also requires its development package to be visible during configuration. The complete requirement picture — supported GPU generations, compilers, minimum library versions, CMake option defaults, and pre-flight check commands — is on <a href="requirements.html">System requirements</a>; the table below restates the essentials.</p>
+      <p><strong>About networking.</strong> The small test/logging/CLI dependencies (Catch2, spdlog, CLI11, pybind11) are fetched automatically by CMake's FetchContent at configure time when missing. On offline machines, preinstall them or run the first configure where the network is available. CUDA, HDF5, Python, MPI, and Hypre are never auto-fetched.</p>
+      <table class="quick-facts">
+        <thead><tr><th>Component</th><th>Requirement</th><th>Role</th></tr></thead>
+        <tbody>
+          <tr><th>GPU</th><td>NVIDIA, sm_80 or newer</td><td>Runs CUDA kernels and verification cases.</td></tr>
+          <tr><th>CUDA Toolkit</th><td>12.x (12.0 or newer)</td><td>Provides <code>nvcc</code>, CUDA headers, and runtime libraries.</td></tr>
+          <tr><th>CMake</th><td>3.25 or newer</td><td>Configures C++20/CUDA targets, dependencies, and CTest.</td></tr>
+          <tr><th>Ninja</th><td>Available on <code>PATH</code></td><td>Executes the generated build graph in parallel.</td></tr>
+          <tr><th>HDF5</th><td>1.12 or newer (enabled by default)</td><td>Provides snapshot, history, and checkpoint I/O; parallel HDF5 is used for collective MPI output.</td></tr>
+          <tr><th>Python + pybind11</th><td>Python 3.10+, pybind11 2.11+ (enabled by default)</td><td>Supplies the embedded interpreter that reads the namelist during initialization only.</td></tr>
+          <tr><th>Optional features</th><td>MPI 3.1+ (<code>-DTENRYU_ENABLE_MPI=ON</code>); Hypre — the LLNL linear-solver library whose BoomerAMG preconditioner backs the optional conduction <code>solver="hypre"</code> path</td><td>Each enabled CMake option needs its matching development package.</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section aria-labelledby="configure-build">
+      <h2 id="configure-build">Configure and build</h2>
+      <p>Run these commands from the repository root. The first leaves the source tree untouched and creates a Release build tree in <code>build/</code>. The second compiles the default targets, producing <code>build/tenryu</code> and the enabled test targets.</p>
+      <pre><code>cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+ninja -C build</code></pre>
+      <p>After changing sources, an incremental <code>ninja -C build</code> is normally sufficient. When changing a CMake option, rerun the configure command with the new option before invoking Ninja. If configuration reports a missing dependency, install that package and repeat the same configure command.</p>
+      <p>Once the build succeeds, run one registered analytic case as the minimal end-to-end smoke check, time loop included:</p>
+      <pre><code>./build/tenryu --help          # the CLI starts
+./build/tenryu verify noh      # an analytic case PASSes (uses the GPU)</code></pre>
+      <p>With these passing, continue to the template walkthrough on <a href="running.html">Running simulations</a>.</p>
+    </section>
+
+    <section aria-labelledby="test-tiers">
+      <h2 id="test-tiers">Three test tiers</h2>
+      <p>The three entry points answer different questions. The complete CTest run checks the configured build broadly. A targeted CTest gives a short loop around a changed module. A named verification runs one analytic problem, benchmark, or regression directly. The complete CTest run keeps failure output visible.</p>
+      <pre><code>ctest --test-dir build -j8 --output-on-failure
+ctest --test-dir build -R &lt;pattern&gt;
+./build/tenryu verify &lt;name&gt;</code></pre>
+      <table class="quick-facts">
+        <thead><tr><th>Tier</th><th>When to use it</th><th>Selection</th></tr></thead>
+        <tbody>
+          <tr><th>Complete CTest</th><td>Before integration or after a broad change.</td><td>Runs every test registered in the build tree, with eight-way parallelism.</td></tr>
+          <tr><th>Targeted CTest</th><td>Fast iteration during development.</td><td>Replace <code>&lt;pattern&gt;</code> with a test-name regular expression, such as a module or verification name.</td></tr>
+          <tr><th>Named verify</th><td>One analytic case, benchmark, or golden regression.</td><td>Replace <code>&lt;name&gt;</code> with a registered name such as <code>sedov</code> or <code>gxii_1d_fld_regression</code>.</td></tr>
+        </tbody>
+      </table>
+      <p>Because <code>-R</code> performs regular-expression matching, it can select more tests than an exact name would. Inspect the CTest listing first when the boundary matters. Also distinguish skips from passes in the log: a test that did not run because a GPU or optional dependency was unavailable is not evidence that the tested behavior passed.</p>
+    </section>
+
+    <section aria-labelledby="mpi-build">
+      <h2 id="mpi-build">MPI build</h2>
+      <p>Add the MPI option to the same Release configuration for multi-rank runs. Execute it where CMake can find an MPI implementation and its headers.</p>
+      <pre><code>cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DTENRYU_ENABLE_MPI=ON
+ninja -C build</code></pre>
+      <p><code>TENRYU_ENABLE_MPI</code> is a top-level CMake option whose default is <code>OFF</code>. If an existing <code>build/</code> tree is reconfigured with the option changed, run Ninja afterward so it can rebuild the affected targets. See the <a href="../physics/mpi.html">MPI decomposition</a> page for launch syntax and rank-to-GPU placement.</p>
+    </section>
+
+    <section aria-labelledby="ccache">
+      <h2 id="ccache">Faster rebuilds with ccache</h2>
+      <p>For repeated compilation, especially after header changes, make <code>ccache</code> the compiler launcher. With <code>ccache</code> available on <code>PATH</code>, append both settings to the configure command:</p>
+      <pre><code>-DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+-DCMAKE_CUDA_COMPILER_LAUNCHER=ccache</code></pre>
+      <p>Set both launchers so C++ and CUDA compilation can use the cache. ccache accelerates matching compilation work; it does not replace configuration, linking, or testing. A changed toolchain, compile option, or included header changes the cache key and causes the necessary compilation to run normally.</p>
+    </section>
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["\\[", "\\]"]] } };</script>
+  <script defer src="../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../nav.js" data-page="building" data-root="../"></script>
+</body>
+</html>

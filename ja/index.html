@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="ja" data-lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TENRYU — TENRYU ドキュメント</title>
+  <link rel="stylesheet" href="../style.css">
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>TENRYU</h1>
+    <p class="tagline">レーザー駆動の高エネルギー密度 (HED)・慣性閉じ込め核融合 (ICF) 物理を対象とする CUDA ネイティブのラグランジュ/ALE (任意ラグランジュ・オイラー) 輻射流体コード。1D の球・円筒・平面形状と、2D 軸対称 (RZ) 形状に対応する。</p>
+    <p class="abstract">TENRYU は、エネルギー整合なラグランジュ流体、多群輻射輸送 (流束制限拡散および離散座標法 S<sub>N</sub>)、非局所電子熱伝導、逆制動輻射吸収を伴うレーザー光線追跡、交差ビームエネルギー転送 (CBET)、ホット電子の生成・輸送、表形式または解析的な EOS・不透明度、核燃焼を連成する。すべての計算は GPU 上で実行され、単位系は cgs + eV に固定されている。フォーム形式の GUI (TENRYU Studio) では、入力デッキの生成と往復編集が可能である。本ドキュメントが記述するのは現行プロダクション世代の TENRYU バージョン 1 (v1) である。全体で使うバージョン表記・略語・記号は<a href="overview/nomenclature.html">記号・用語集</a>にまとめている。</p>
+
+    <h2>ドキュメント</h2>
+    <div class="card-grid">
+      <a class="card" href="overview/index.html">
+        <h3>概要</h3>
+        <p>対象範囲、アーキテクチャ、数値基盤、検証の哲学。</p>
+      </a>
+      <a class="card" href="use/index.html">
+        <h3>TENRYU を使う</h3>
+        <p>ビルド、入力の準備、シミュレーションの実行、出力の解析。</p>
+      </a>
+      <a class="card" href="physics/index.html">
+        <h3>物理カーネル</h3>
+        <p>全 11 カーネルページ — 9 つの物理演算子と、それを支えるメッシュ・MPI 基盤 — のモデル、離散化、制御項目、検証。</p>
+      </a>
+      <a class="card" href="verification/index.html">
+        <h3>検証とベンチマーク</h3>
+        <p>解析解による検査、基準解との回帰、統合試験、ベンチマーク。</p>
+      </a>
+    </div>
+    <a class="card compact" href="develop/index.html">
+      <h3>開発者ガイド</h3>
+      <p>コントリビューション規則、テスト手順、再現性契約。</p>
+    </a>
+    <a class="card compact" href="overview/nomenclature.html">
+      <h3>記号・用語集</h3>
+      <p>バージョン表記、略語、外部コード名、記号の対照表。</p>
+    </a>
+
+    <h2>クイックファクト</h2>
+    <table class="quick-facts">
+      <tbody>
+        <tr><th scope="row">バージョン</th><td>TENRYU v1 (本ドキュメントの基準。burn v2 などカーネル別のモデル世代は各ページに明記)</td></tr>
+        <tr><th scope="row">幾何</th><td><code>1D_SPH</code> (球・円筒・平面 — <code>Mesh.geometry_1d</code> で選択)、<code>2D_RZ</code> (軸対称 RZ)</td></tr>
+        <tr><th scope="row">メッシュ</th><td>ラグランジュおよび ALE、構造格子・極座標・マルチブロック</td></tr>
+        <tr><th scope="row">計算基盤</th><td>CUDA (<code>sm_80</code> 以降)、単一・複数ランク MPI</td></tr>
+        <tr><th scope="row">単位</th><td>cgs + eV (固定)</td></tr>
+        <tr><th scope="row">入力</th><td>Python namelist デッキ</td></tr>
+        <tr><th scope="row">出力</th><td>HDF5 スナップショットと履歴、Studio および Scope ビューア</td></tr>
+      </tbody>
+    </table>
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["\\[", "\\]"]] } };</script>
+  <script defer src="../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../nav.js" data-page="home" data-root=""></script>
+</body>
+</html>

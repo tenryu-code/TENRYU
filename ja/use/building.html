@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="ja" data-lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ビルド — TENRYU ドキュメント</title>
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>ビルド <span class="badge">reference</span></h1>
+    <p class="abstract">TENRYU は C++20 / CUDA C++ のコードを CMake と Ninja で構成し、CUDA 12.x のツールキットと sm_80 以降の NVIDIA GPU を対象にビルドする。このページでは、リリースビルドの作成、全体・対象限定・名前指定の 3 段階のテスト、MPI の有効化、そして ccache を使った反復ビルドまでを扱う。</p>
+
+    <aside class="planned" aria-labelledby="at-a-glance">
+      <h3 id="at-a-glance">要点</h3>
+      <ul>
+        <li>必要なものは、CUDA 12.x のツールキット、CMake 3.25 以上、Ninja、そして sm_80 以降の NVIDIA GPU である。</li>
+        <li>標準の手順は、<code>cmake</code> で <code>build/</code> を構成し、<code>ninja -C build</code> でコンパイルする 2 段階である。</li>
+        <li>確認は、CTest の全実行、<code>-R</code> による対象限定の CTest、<code>tenryu verify</code> による名前指定の検証を、目的に応じて使い分ける。</li>
+        <li>MPI は既定でオフである。複数ランク用のバイナリを作るには、構成時に <code>-DTENRYU_ENABLE_MPI=ON</code> を指定する。</li>
+      </ul>
+    </aside>
+
+    <section aria-labelledby="prerequisites">
+      <h2 id="prerequisites">前提条件</h2>
+      <p>ビルドは NVIDIA CUDA の環境上で行う。CUDA のコンパイラとドライバが見えていることに加え、CMake が CUDA のツールチェーンと依存ライブラリを検出できる必要がある。HDF5 と Python への対応は最上位の CMake で既定オン、MPI は既定オフである。追加機能の有無を変える場合も、まずは同じ「構成 → ビルド」の流れを保つこと。要求の全体像（対応 GPU 世代・コンパイラ・全ライブラリの最低バージョン・CMake オプション一覧・事前チェックのコマンド）は<a href="requirements.html">動作環境と要求スペック</a>にまとめてある。以下は要点の再掲である。</p>
+      <p><strong>ネットワークについて。</strong>テスト・ログ・CLI 系の小依存（Catch2・spdlog・CLI11・pybind11）は、システムに見つからない場合 CMake の FetchContent が構成時に自動取得する。オフライン環境では事前導入するか、ネットワークのある場所で初回の構成を済ませること。CUDA・HDF5・Python・MPI・Hypre は自動取得の対象外である。</p>
+      <table class="quick-facts">
+        <thead><tr><th>項目</th><th>要件</th><th>役割</th></tr></thead>
+        <tbody>
+          <tr><th>GPU</th><td>NVIDIA 製、sm_80 以降</td><td>CUDA カーネルと検証の実行先である。</td></tr>
+          <tr><th>CUDA ツールキット</th><td>12.x (12.0 以上)</td><td><code>nvcc</code>、CUDA のヘッダ、実行時ライブラリを提供する。</td></tr>
+          <tr><th>CMake</th><td>3.25 以上</td><td>C++20 / CUDA のターゲット、依存関係、CTest を構成する。</td></tr>
+          <tr><th>Ninja</th><td>利用できること</td><td>生成されたビルドの依存グラフを並列に実行する。</td></tr>
+          <tr><th>HDF5</th><td>1.12 以上 (既定でオン)</td><td>スナップショット・履歴・チェックポイントの入出力を担う。MPI の集団出力には並列 HDF5 を使う。</td></tr>
+          <tr><th>Python + pybind11</th><td>Python 3.10 以上、pybind11 2.11 以上 (既定でオン)</td><td>初期化時にだけ namelist を読む組み込みインタープリタである。</td></tr>
+          <tr><th>任意の機能</th><td>MPI 3.1 以上 (<code>-DTENRYU_ENABLE_MPI=ON</code>)、Hypre — LLNL の線形ソルバライブラリで、その BoomerAMG 前処理が熱伝導の任意の <code>solver="hypre"</code> 経路を支える</td><td>有効にした CMake のオプションに対応する開発用パッケージが必要である。</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section aria-labelledby="configure-build">
+      <h2 id="configure-build">構成とビルド</h2>
+      <p>リポジトリのルートで次の 2 つのコマンドを実行する。最初のコマンドはソースツリーを変更せず、リリース用のビルドツリーを <code>build/</code> に生成する。2 つ目は既定のターゲットをコンパイルし、<code>build/tenryu</code> と、有効になっているテストのターゲットを作る。</p>
+      <pre><code>cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+ninja -C build</code></pre>
+      <p>ソースやビルド設定を変更したあとの差分ビルドは、通常 <code>ninja -C build</code> を実行し直せば十分である。CMake のオプションを変える場合は、構成のコマンドを新しいオプション付きで実行し直してから Ninja を走らせる。CMake の診断でパッケージが見つからないと出た場合は、そのパッケージを導入したうえで、同じ構成コマンドを実行し直すこと。</p>
+      <p>ビルドが通ったら、時間ループまで含めた最小の動作確認として、登録済みの解析解ケースを 1 本走らせる。</p>
+      <pre><code>./build/tenryu --help          # CLI が起動すること
+./build/tenryu verify noh      # 解析解ケースが PASS すること（GPU を使う）</code></pre>
+      <p>ここまで通れば、<a href="running.html">シミュレーションの実行</a>のテンプレート完走へ進める。</p>
+    </section>
+
+    <section aria-labelledby="test-tiers">
+      <h2 id="test-tiers">テストの 3 段階</h2>
+      <p>すべての確認を、常に同じ粒度で走らせる必要はない。CTest の全実行はビルド全体の健全性を、対象を限定した CTest は変更したモジュールの周辺を、名前を指定した検証はひとつの物理問題や回帰を直接確認する。失敗したときに出力を残すため、CTest の全実行では <code>--output-on-failure</code> を付ける。</p>
+      <pre><code>ctest --test-dir build -j8 --output-on-failure
+ctest --test-dir build -R &lt;pattern&gt;
+./build/tenryu verify &lt;name&gt;</code></pre>
+      <table class="quick-facts">
+        <thead><tr><th>段階</th><th>使いどころ</th><th>選び方</th></tr></thead>
+        <tbody>
+          <tr><th>CTest の全実行</th><td>統合の前や、広い範囲を変更したあとの回帰確認。</td><td>ビルドツリーに登録されたすべてのテストを 8 並列で実行する。</td></tr>
+          <tr><th>対象を限定した CTest</th><td>開発中の短い反復。</td><td><code>&lt;pattern&gt;</code> をテスト名の正規表現に置き換える。たとえばモジュール名や検証名を使う。</td></tr>
+          <tr><th>名前を指定した検証</th><td>特定の解析解、ベンチマーク、基準解との回帰。</td><td><code>&lt;name&gt;</code> を <code>sedov</code> や <code>gxii_1d_fld_regression</code> などに置き換える。</td></tr>
+        </tbody>
+      </table>
+      <p><code>-R</code> は部分一致なので、意図より広いテストの集合を選んでしまう可能性がある。実行対象を先に確かめたいときは CTest の一覧表示を使い、ログではスキップと合格を区別すること。GPU や任意の依存関係がないために実行されなかったテストは、合格したテストの代わりにはならない。</p>
+    </section>
+
+    <section aria-labelledby="mpi-build">
+      <h2 id="mpi-build">MPI 対応のビルド</h2>
+      <p>複数ランクでの実行用には、同じリリース構成に MPI のオプションを追加する。MPI の実装とヘッダが CMake から見える環境で実行すること。</p>
+      <pre><code>cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DTENRYU_ENABLE_MPI=ON
+ninja -C build</code></pre>
+      <p><code>TENRYU_ENABLE_MPI</code> は最上位の CMake のオプションで、既定値は <code>OFF</code> である。すでに構成済みの <code>build/</code> に対してオプションを切り替えた場合も、CMake の再構成のあとに Ninja が必要なターゲットを再ビルドする。MPI 対応バイナリの実行方法と、ランクごとの GPU の割り当てについては、<a href="../physics/mpi.html">MPI 分割</a>のページを参照のこと。</p>
+    </section>
+
+    <section aria-labelledby="ccache">
+      <h2 id="ccache">ccache による反復ビルド</h2>
+      <p>ヘッダを含む再コンパイルを繰り返す環境では、<code>ccache</code> をコンパイラのラッパとして使うと、既にコンパイル済みのオブジェクトを再利用できる。<code>ccache</code> が <code>PATH</code> にある状態で、構成のコマンドに次の 2 つを追加する。</p>
+      <pre><code>-DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+-DCMAKE_CUDA_COMPILER_LAUNCHER=ccache</code></pre>
+      <p>C++ と CUDA の両方を指定することが重要である。ccache はコンパイルの時間を短くするが、構成、リンク、テストを省く仕組みではない。ツールチェーン、コンパイルオプション、ヘッダが変わればキャッシュのキーも変わり、必要なコンパイルは通常どおり実行される。</p>
+    </section>
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["\\[", "\\]"]] } };</script>
+  <script defer src="../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../nav.js" data-page="building" data-root="../"></script>
+</body>
+</html>

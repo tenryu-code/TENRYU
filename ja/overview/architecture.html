@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="ja" data-lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>アーキテクチャとモジュール地図 — TENRYU ドキュメント</title>
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>アーキテクチャとモジュール地図 <span class="badge">reference</span></h1>
+    <p class="abstract">TENRYU は、Python の namelist を初期化時に純粋なデータへ凍結し、GPU 上の共有された状態を、責務の明確な物理モジュールが更新する CUDA 専用のコードである。連成ドライバが、演算子の順序、時間刻み、再試行、演算子のあいだの熱力学的な再クロージャを一元的に管理し、その HDF5 出力を TENRYU Studio と TENRYU Scope が利用する。</p>
+
+    <aside class="planned" aria-labelledby="at-a-glance">
+      <h3 id="at-a-glance">要点</h3>
+      <ul>
+        <li>主要な計算は GPU を第一とし、公式に対応するバックエンドは NVIDIA CUDA のみである。モジュールの依存は一方向とし、循環を作らない。</li>
+        <li>Python は入力を構築するときだけ実行し、関数は表または状態の配列へ凍結する。時間ループから Python を呼ぶことはない。</li>
+        <li><code>Config</code> は変更されない実行の契約、<code>State</code> は時間発展する場と台帳を所有し、連成ドライバが更新を受理する境界をもつ。</li>
+        <li>Studio はデッキを作って実行するアプリ、Scope は HDF5 の場と履歴を観察して比較する姉妹アプリである。</li>
+      </ul>
+    </aside>
+
+    <section aria-labelledby="principles-build">
+      <h2 id="principles-build">設計原則とビルドの境界</h2>
+      <p>設計の第一原則は、GPU を第一に考えることである。流体、FLD / S<sub>N</sub> の輻射、レーザーの光線追跡といった主要な計算を NVIDIA の GPU 上で実行し、CUDA 以外のバックエンドは公式の対象としない。大域的な MPI 通信を抑えるための局所性、流体・輻射・レーザー・材料・メッシュ・連成・診断・入出力・ドライバのあいだの固定された依存の向き、そして同じ GPU・同じ構成に対する再現性を、性能と同じくアーキテクチャ上の契約として扱う。将来の 3D や追加の物理が、既存の境界を崩さずに入れられることも原則のひとつである。</p>
+      <p>計算のコアは C++20 と CUDA C++ で実装し、CMake (3.25 以上) と Ninja で構成する。基盤となる依存には、CUDA Toolkit 12.x (12.0 以上)、MPI 3.1 以上、HDF5 1.12 以上、Python 3.10 以上と pybind11 2.11 以上が含まれる — <a href="../use/building.html">ビルド</a>のページが表にしているものと同じ要件一式である。Python は Smilei 形式の単一の namelist を読み取るために埋め込んでいる環境であり、設定の生成が終わると関連するリソースを解放する。MPI と並列 HDF5 は分散実行と集団入出力を担うが、物理モジュールは共有された契約を介してやり取りし、互いの内部表現に直接依存することはない。</p>
+
+      <figure>
+        <img src="../../assets/overview-architecture-flow.png" width="980" height="430" style="max-width:100%;height:auto" alt="Python デッキの凍結から Config と State、連成ドライバのループ、HDF5 出力、Studio と Scope までのブロック図">
+        <figcaption>図A. 入力と実行状態の境界。Python のデッキは初期化時に凍結され、受理されたドライバのステップだけが、HDF5 のスナップショット、履歴、チェックポイントとして公開される。</figcaption>
+      </figure>
+    </section>
+
+    <section aria-labelledby="module-map">
+      <h2 id="module-map">モジュール地図</h2>
+      <p>モジュールの分割は、単なるディレクトリの整理ではなく、データの所有権と依存の向きに関する仕様である。次の表は、概要として押さえておきたい主要な境界を示す。熱伝導は独立した演算子として進むが、実装上は流体の名前空間に置かれ、時系列上どこで呼ぶかは連成が所有する。</p>
+      <table class="quick-facts">
+        <thead>
+          <tr><th>モジュール</th><th>責務</th></tr>
+        </thead>
+        <tbody>
+          <tr><th><code>core/</code></th><td>設定、namelist の凍結、単位、エラー処理、性能計測、共通のデバイス配列や作業領域など、全体が使う基盤を提供する。</td></tr>
+          <tr><th><code>mesh/</code></th><td>ラグランジュ / ALE の計算格子、RZ の幾何量、近傍・面・節点の接続、そしてメッシュ品質の契約を所有する。</td></tr>
+          <tr><th><code>hydro/</code></th><td>運動量、位置、密度、イオン・電子の内部エネルギー、境界条件を更新し、電子・イオンの熱伝導も実装する。</td></tr>
+          <tr><th><code>radiation/</code></th><td>1D / 2D の多群 FLD と S<sub>N</sub>、輻射の源、物質との交換、境界での集計を提供する。</td></tr>
+          <tr><th><code>laser/</code></th><td>屈折を含む光線追跡、逆制動輻射による吸収、流体メッシュへの保存的な沈着を担当する。</td></tr>
+          <tr><th><code>materials/</code></th><td>状態から EOS、不透明度、伝導率、緩和時間、平均電離度などの物性係数を返す。</td></tr>
+          <tr><th><code>burn/</code></th><td>Bosch–Hale の反応率、セルごとの核種の反応網、生成物によるエネルギーの沈着と核種の収支を進める。</td></tr>
+          <tr><th><code>coupling/</code></th><td>演算子分割、時間刻みの選択、源の注入、EOS の再クロージャ、全ステップの再試行の受理を所有する。</td></tr>
+          <tr><th><code>diagnostics/</code></th><td>エネルギー収支、面密度、球対称性、シェルの追跡といった ICF 向けの観測量と、安全性の監査を構成する。</td></tr>
+          <tr><th><code>drivers/</code></th><td><code>run</code> / <code>verify</code> の入口として、設定、メッシュ、状態、各コールバックを組み立て、実行のライフサイクルを開始する。</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section aria-labelledby="config-state-driver">
+      <h2 id="config-state-driver">Config、State、連成ドライバ</h2>
+      <p>単一の <code>.py</code> による namelist は、CPython と pybind11 を介してビルダへ渡される。ビルダは型、必須の値、単位、範囲、場のあいだの不変条件を検証し、既定値を適用する。幾何を与える関数はメッシュ座標上の状態配列へ、レーザーの波形や時間に依存する境界温度は <code>FrozenTable1D</code> へ、それぞれ一括して評価される。実行した元のスクリプトと、純粋なデータ化した凍結後の JSON は HDF5 に保存できるため、結果がどの入力契約から作られたのかを後から追跡できる。</p>
+      <p><code>Config</code> は、この解析結果を保持するホスト側の中心的な構造体で、各モジュールの <code>init()</code> へ <code>const</code> 参照として渡される。GPU へは必要な場だけをコピーする。これに対し <code>State</code> は、メッシュ座標、密度、速度、2 温度の内部エネルギー、圧力、輻射場、沈着量、エネルギーの台帳など、ステップとともに変化する量を所有する。この分離により、「何を実行するか」と「いまどこまで進んだか」を混同せずに済む。</p>
+      <p>連成ドライバは物理カーネルの寄せ集めではなく、時間発展の所有者である。時間刻みは、流体の CFL 条件、熱伝導、輻射、利用者が指定する上限、次の出力時刻の最小値から選び、前のステップからの増加率も制限する。続いて、レーザーの全ステップ、流体の半ステップ、熱伝導の全ステップ、輻射の全ステップ、流体の半ステップを順に呼び、各演算子のあとに必要な EOS の同期とハロー交換を挿入する。全ステップの再試行を有効にした構成では、ステップ入口の状態をスナップショットとして保存し、流体の修正段が受理されなければ復元して、時間刻みを半分にして分割の列全体をやり直す。履歴、スナップショット、チェックポイント、累積のエネルギー集計はいずれも受理の境界より後にあるため、棄却された試行が正式な出力になることはない。</p>
+    </section>
+
+    <section aria-labelledby="device-memory">
+      <h2 id="device-memory">デバイスメモリの作法</h2>
+      <p>時間発展する大きな場は、ホスト側コンテナの延長としては扱わず、型付きの <code>DeviceArray&lt;T&gt;</code> や次元ごとの場のラッパが、所有権・ムーブ・再初期化を明示する。一時的な作業領域は、プロセスの生存期間にわたって確保される、拡張のみを行うタグ付きの作業領域プールから取得し、演算子ごとの用途を一意なタグで分離する。プールは内容を 0 で埋めない <code>cudaMalloc</code> 相当の契約なので、0 での初期化が必要なカーネルは明示的に初期化する。プールから取った領域のデストラクタは個別に解放せず、終了時にまとめて解放する。この規約により、ステップの内側で確保と解放を繰り返すことを避けつつ、同時に生存する領域が別名で参照されることや、暗黙の初期値に依存することを防げる。</p>
+    </section>
+
+    <section aria-labelledby="desktop-apps">
+      <h2 id="desktop-apps">2 つのデスクトップアプリ</h2>
+      <h3>TENRYU Studio — デッキを作り、実行する</h3>
+      <p>TENRYU Studio は、Tauri 2 と React / TypeScript によるフォーム形式のデッキ用 GUI である。材料、メッシュ、レーザー、輻射、数値解法、出力を画面から構成し、編集の状態を埋め込んだ Python のデッキをその場で生成して、行き来しながら編集できる。生成したデッキの検証、ローカルのファイル管理、システムの <code>ssh</code> / <code>scp</code> を介した設定済みサーバへの投入と実行状況の確認までを扱う。Studio はソルバの内部状態を別の形式で持つのではなく、最終的には同じ単一の namelist の契約を生成する。</p>
+      <h3>TENRYU Scope — 結果を見て、調べて、比べる</h3>
+      <p>TENRYU Scope は、HDF5 のスナップショットと履歴を観察することに特化した姉妹アプリである。ローカルのファイル、または Studio と共有するサーバのプロファイルから実行結果を開き、1D の分布、時系列、2D のテンソル格子や CSR (compressed sparse row 接続) のマルチブロックメッシュ上の場を描画する。2D の場のカラーマップ、線形・対数のレンジ、拡大縮小と平行移動、時刻のスクラブとアニメーション、ラインアウト、レーザー光線の重ね描き、PNG / CSV / 動画の書き出しを備える。Studio による軽量な結果確認を置き換えるのではなく、大きな場の探索と、実行どうしの比較へ責務を分けている。</p>
+    </section>
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["\\[", "\\]"]] } };</script>
+  <script defer src="../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../nav.js" data-page="architecture" data-root="../"></script>
+</body>
+</html>

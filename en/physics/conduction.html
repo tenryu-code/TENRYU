@@ -1,0 +1,233 @@
+<!doctype html>
+<html lang="en" data-lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Electron &amp; ion conduction — TENRYU Documentation</title>
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>Electron &amp; ion conduction <span class="badge">reference</span></h1>
+    <p class="abstract">TENRYU's local electron transport combines Spitzer–Härm conductivity with the unconditional Z-dependent γ<sub>0</sub> correction, a harmonic flux limiter, and super-time-stepping (STS). In 1D, the opt-in SNB (Schurtz–Nicolaï–Busquet) multigroup model adds a nonlocal correction and couples it in time with the implicit-SNB (iSNB) Picard iteration of Cao 2015. Ion conduction is a separate option.</p>
+
+    <aside class="planned" aria-labelledby="at-a-glance">
+      <h3 id="at-a-glance">At a glance</h3>
+      <ul>
+        <li>The Z-dependent γ<sub>0</sub> correction is unconditional on every path. The old fixed-coefficient path was removed and cannot be re-enabled.</li>
+        <li>Local SH and SNB use the same outer harmonic cap. The default <code>f_lim</code> is 0.06 for SH and 0.5 for SNB.</li>
+        <li>1D uses a conservative per-material FV operator; 2D RZ uses symmetric Kershaw conductances. STS accelerates both explicit diffusion paths.</li>
+        <li>Void cells are insulating with κ<sub>eff</sub>=0. The SNB multigroup correction cannot cross a void either.</li>
+      </ul>
+    </aside>
+
+    <section aria-labelledby="mechanism">
+      <h2 id="mechanism">The physical mechanism</h2>
+      <p>In a laser target, the place where laser energy is absorbed (the dilute corona outside the critical surface) and the place where that energy does work as ablation pressure (the dense ablation front) are spatially separate. Electron thermal conduction is the main energy transport that connects them. Its strength sets the ablation pressure and the mass ablation rate, and it also sets how much heat runs ahead of the front into cold material — the preheat.</p>
+      <p>The starting model makes the heat flux proportional to the local temperature gradient: \(\mathbf q_{SH}=-\kappa_{SH}\nabla T_e\), i.e. a Fourier law, with the conductivity \(\kappa_{SH}\) taken from Spitzer–Härm (SH) theory of electron–ion Coulomb collisions. The temperature scaling follows from a short chain. Coulomb scattering deflects fast electrons poorly, so the collision frequency drops steeply with speed, \(\nu_{ei}\propto v^{-3}\). Evaluated for thermal electrons (\(v\sim v_{th,e}\propto T_e^{1/2}\)) this gives \(T_e^{-3/2}\), and the mean free path \(\lambda_{ei}=v/\nu_{ei}\) grows as \(\lambda_{ei}\propto T_e^{2}/(n_e Z\ln\Lambda)\) — quadratically in temperature. Since conductivity is roughly "density × thermal speed × mean free path", the density dependence cancels and \(\kappa_{SH}\propto T_e^{5/2}/(Z\ln\Lambda)\) remains. Doubling the temperature multiplies the conductivity by about 5.7 — a strongly nonlinear response. A hotter corona therefore conducts much more strongly, and, as discussed below, becomes numerically "stiff" to integrate explicitly, with a vanishing stable time step. The Fourier law itself is a local approximation — the electron is assumed to feel only the gradient at its own position — and it is justified only while the electron mean free path stays well below the temperature-gradient scale length \(L_T=T_e/|\nabla T_e|\).</p>
+      <p>Most of the heat, however, is not carried by average thermal electrons. Decomposing the flux by electron energy (the SNB spectral weight \(\beta^4e^{-\beta}/24\) introduced below is this distribution), the contribution peaks for suprathermal electrons moving at roughly \(3–4\,v_{th,e}\). Because the mean free path scales as \(v^4\) (a consequence of \(\lambda=v/\nu\) with \(\nu\propto v^{-3}\)), these electrons have mean free paths 3<sup>4</sup>–4<sup>4</sup>, roughly 80–260 times longer than thermal electrons. The local condition \(\lambda\ll L_T\) can therefore hold when evaluated for thermal electrons while already being violated for the electrons that actually carry the heat. The violation sets in first near the ablation front, where the gradient is steepest.</p>
+      <p>Even in the strong-gradient limit where the local law fails, there is a firm physical ceiling on the flux: the free-streaming flux \(n_e k_BT_ev_{th,e}\), obtained if the entire thermal energy content streamed one way at the thermal speed. Kinetic calculations and experiments both show that only a fraction of it can actually be sustained, and TENRYU carries that fraction in the coefficient \(f_{lim}\), imposing the cap \(q_{max}=f_{lim}n_ek_BT_ev_{th,e}\). The cap is applied through the factor \(\theta=1/(1+|q_{raw}|/q_{max})\); the resulting flux \(q=\theta q_{raw}\) satisfies, in magnitude, \(1/|q|=1/|q_{raw}|+1/q_{max}\) — the same harmonic composition as resistors in parallel, which is why this is called the harmonic limiter. Where gradients are gentle, \(q\approx q_{raw}\); at strong gradients it saturates smoothly toward \(q_{max}\) with no kink. The local-SH default \(f_{lim}=0.06\) lies in the calibration range long used against direct-drive experiments. Why the SNB default of 0.5 is so much looser is explained below — there the limiter is no longer the physics model, only an outer safety valve against anomalous composite fluxes.</p>
+      <p>A flux limiter alone cannot represent nonlocal transport. The \(v^4\) mean-free-path scaling produces two consequences at once. First, at the steepest point, the electrons cross the gradient without colliding, so the flux never builds up to the local-gradient prediction: the real flux falls below Spitzer–Härm (flux inhibition). Second, the same electrons keep carrying heat forward for several mean free paths before stopping, heating material beyond the ablation front (preheat). Because a flux limiter can only reduce the local flux, it can approximate the first effect but cannot, in principle, represent the second — moving heat ahead of the gradient. Capturing both requires a nonlocal model that follows electrons by energy and resolves where they reach and where they deposit.</p>
+      <p>The Schurtz–Nicolaï–Busquet (SNB) model is the standard reduced-kinetic model for this purpose. Instead of solving the full kinetic equation, it splits the SH flux into electron-energy groups and, for each group, solves a diffusion equation for a transport field \(H_g\) (dimensionally a heat flux) whose spatial scale is the group's stopping length \(\lambda_g\) (mean free path, mfp). The spreading of \(H_g\) away from its source — the group's share of the local SH flux — is what represents carriers transporting heat away from the gradient, and the reconstructed correction \(\delta q=-\sum_g(\lambda_g^{tr}/3)\nabla H_g\) both reduces the flux at the steep point and produces preheat ahead of it. In TENRYU, SNB is an additive correction to the same limited SH pipeline, not an alternative solver, and the corrected composite flux passes through the single shared cap. The default mean-free-path calibration (the \(r=2\) form of Sherlock 2017) already folds in electric-field flux suppression, so the optional explicit E-field term defaults off to avoid double counting.</p>
+      <p>The main numerical challenge is the stability limit of explicit diffusion, \(\Delta t\lesssim\Delta x^2/D\). The thermal diffusivity \(D\propto T_e^{5/2}/\rho\) grows rapidly in a hot, dilute corona, so the stable substep becomes far smaller than the hydrodynamic global step. In a representative <a href="../verification/index.html#gxii">GXII</a> corona (coronal cells of the 500 µm benchmark capsule at \(T_e\approx2\) keV, \(\rho\approx10^{-3}\) g/cm³, \(\Delta l\approx50\,\mu\)m), one global driver step would require 130–340 ordinary substeps. Super-time-stepping (STS) replaces that substep chain with a Chebyshev ladder of \(s\) stages whose combined stability interval grows as \(O(s^2)\), so the required stage count is only about the square root of the substep count (\(s\approx\lceil\sqrt{2N_{sub}}\rceil\)) — 16–27 stages in this example. Coefficients are frozen at the entry temperature, and one EOS resynchronization closes the step. Every update is conservative finite volume; per-material resolution and the optional ion-conduction pass reuse the same machinery.</p>
+    </section>
+
+    <section aria-labelledby="local-model">
+      <h2 id="local-model">Local Spitzer–Härm model and flux limiter</h2>
+      <p>Electron conductivity is evaluated in the cgs+eV unit system. The mean ionization \(\bar Z\) comes from the material model. Because Coulomb collision rates are governed by the mean of the charge <em>squared</em>, materials that provide the charge-moment ratio \(r_2=\langle Z^2\rangle/\bar Z^2\) replace \(\bar Z\) with the collisional effective charge \(\bar Z r_2\):</p>
+      $$
+      \kappa_{SH}=\kappa_0\,\xi(\bar Z)\,
+      \frac{T_e^{5/2}}{\bar Z\ln\Lambda},\qquad
+      \xi(Z)=\frac{(Z+0.24)/(Z+4.2)}{(1+0.24)/(1+4.2)},
+      $$
+      $$
+      \kappa_0=3.06\times10^9
+      \;\mathrm{erg/(cm\,s\,eV^{7/2})},\qquad
+      \mathbf q_{SH}=-\kappa_{SH}\nabla T_e.
+      $$
+      <p>Here \(\kappa_0\) is the Spitzer prefactor in cgs + eV units, \(\xi(\bar Z)\) is the Z-dependent correction detailed in the list below, \(\ln\Lambda\) is the Coulomb logarithm, and \(\mathbf q_{SH}\) is the resulting unlimited heat flux.</p>
+      <p>The flux limit is applied per face. The face electron density, temperature, and thermal speed — each the arithmetic average of the adjacent cells — build \(q_{max}\), and the harmonic composition described in the mechanism section caps the flux (\(k_B\) is the eV→erg conversion constant <code>eV_to_erg</code>, as everywhere in the cgs + eV system):</p>
+      $$
+      v_{th,e}=\sqrt{\frac{k_BT_e}{m_e}},\qquad
+      q_{max}=f_{lim}n_ek_BT_ev_{th,e},\qquad
+      \theta=\frac{1}{1+|q_{raw}|/q_{max}},\qquad q=\theta q_{raw}.
+      $$
+      <ul>
+        <li><strong>\(\xi(Z)\).</strong> This is the Epperlein–Short fit of Braginskii's γ<sub>0</sub>(Z), with ξ(1)=1 and ξ(∞)=4.19. It is unconditional in 1D, 2D, per-material conduction, and the SH base flux used by SNB; the removed fixed-coefficient branch cannot be re-enabled.</li>
+        <li><strong>\(q_{max}\) and \(\theta\).</strong> \(q_{max}=f_{lim}n_ek_BT_ev_{th,e}\) sets the free-streaming fraction and θ provides harmonic interpolation. The local path uses \(q_{raw}=q_{SH}\), whereas SNB uses \(q_{raw}=q_{SH}+\delta q\); SH and SH+δq pass through one shared cap, never a second limiter.</li>
+        <li><strong>Face-κ closure.</strong> The closure — the rule that builds a face κ from the two adjacent cell values — defaults to <code>kirchhoff_same_material</code>. On a smooth same-material face it evaluates the strongly nonlinear κ(T) ∝ \(T^{5/2}\) as the secant of its exact integral over the two cell temperatures (a Kirchhoff-transform face average), reducing grid pinning of steep heat fronts. Interfaces, voids, and strong table jumps retain the more conservative harmonic closure. The limiter's SH estimate and the applied flux always use the same closure.</li>
+        <li><strong>Voids.</strong> <code>cell_is_void</code> forces κ<sub>eff</sub>=0, forming an adiabatic boundary and preventing floor-density exterior cells from collapsing Δt<sub>exp</sub>. SNB gives voids an identity row and zeroes adjacent group diffusivities.</li>
+        <li><strong>SNB groups.</strong> Energy groups are laid out geometrically in the temperature-normalized electron energy β̂=E/(k<sub>B</sub> max T<sub>e</sub>) over [0.1, <code>snb_E_max_over_Te</code>], with weights ξ<sub>g</sub>=P(β<sub>g</sub>)−P(β<sub>g−1</sub>) formed as exact primitive differences. The two mfp variants are the default <code>geometric_r2</code> and the original Schurtz form.</li>
+        <li><strong>iSNB Picard.</strong> The Cao 2015 coupling freezes (θ, δq), repeats the STS superstep from \(T_e^n\), and recomputes the correction. It performs at least two iterations and uses a flux max-norm relative tolerance; at convergence the amplification factor lies in (0,1) for every Δt, giving unconditional stability.</li>
+      </ul>
+
+      <figure>
+        <img src="../../assets/conduction-flux-composition.png" width="920" height="307" style="max-width:100%;height:auto" alt="Flow from the Spitzer–Härm flux and SNB correction through their shared harmonic cap to the final flux">
+        <figcaption>Figure A. Flux composition. With <code>nonlocal_model="none"</code>, δq=0 and the path reduces to the established limited SH flux.</figcaption>
+      </figure>
+    </section>
+
+    <section aria-labelledby="faces-materials">
+      <h2 id="faces-materials">Face closure, materials, and voids</h2>
+      <p>A face κ must be composed from the two adjacent cell states; the composition rule is called the closure. The production default is <code>kirchhoff_same_material</code>. On smooth same-material Spitzer faces — and only there — it evaluates the strongly nonlinear κ(T) ∝ \(T^{5/2}\) as the secant of its exact integral over the two cell temperatures (a Kirchhoff-transform face average). A naive two-point evaluation underestimates the face κ just ahead of a steep heat front, which tends to pin the front to the grid; the secant value reduces that tendency. Material interfaces, voids, and strong κ<sub>0</sub> table jumps fall back to harmonic closure. The historic <code>harmonic</code> closure remains selectable; it handles material interfaces and large conductivity jumps conservatively — being a harmonic mean, a zero conductivity on either side closes the face. The SH estimate used by the limiter and the applied flux always use the same closure.</p>
+      <p>The 1D planar, cylindrical, and spherical operators are conservative finite volumes; geometry appears only through face areas \(A_f\) and cell volumes \(V_i\). In per-material mode, each material m gets its own face volume fraction α<sub>f,m</sub>, temperature, density, \(\bar Z\), lnΛ, and limited κ<sub>eff,f,m</sub>. Each face power enters one neighboring cell with a + sign and the other with a − sign at identical magnitude, so the total Σ<sub>c,m</sub>E<sub>e,c,m</sub> over cells and materials is conserved exactly (unless a temperature floor intervenes). The aggregate Σ<sub>m</sub>α<sub>f,m</sub>κ<sub>eff,f,m</sub> schedules STS, but the energy update remains material resolved.</p>
+      <p>A <code>cell_is_void</code> cell is forced to κ<sub>eff</sub>=0, making its boundary an insulating, adiabatic surface. The mask is also needed for performance: if a floor-density void cell were treated as ordinary matter, the tiny ρc<sub>v</sub> denominator of the diffusivity κ/(ρc<sub>v</sub>) would produce an enormous diffusion coefficient, collapse the stability limit Δt<sub>exp</sub>, and effectively stall STS. SNB applies the same discipline: a void cell becomes an identity row with H<sub>g</sub>=0 and the adjacent group diffusivities are zeroed, leaving no path for the group diffusion to carry preheat across a void.</p>
+      <p><code>ion_conduction=True</code> adds a pass using ion conductivity κ<sub>i</sub> and the same conservative diffusion machinery; in 2D RZ it uses the electron path's Kershaw nine-point operator. It defaults off because κ<sub>i</sub>≪κ<sub>e</sub> in typical ICF plasmas, but can matter in a dense fuel core.</p>
+    </section>
+
+    <section aria-labelledby="sts">
+      <h2 id="sts">Super-time-stepping</h2>
+      <p>Because Spitzer conductivity scales as \(T_e^{5/2}\), marching the global step \(\Delta t\) in explicit substeps of size \(\Delta t_{exp}\) would require \(N_{sub}=\lceil\Delta t/\Delta t_{exp}\rceil\) kernel launches. In a representative GXII corona — the same \(T_e\approx2\) keV, \(\rho\approx10^{-3}\) g/cm³, \(\Delta l\approx50\,\mu\)m conditions quoted in the mechanism section — \(N_{sub}\) reaches 130–340. STS widens the stability interval with a Chebyshev ladder and covers the same interval in 16–27 stages (\(s\approx\lceil\sqrt{2N_{sub}}\rceil\)). The procedure is as follows.</p>
+      <h3>One conduction step, step by step</h3>
+      <ol>
+        <li><p><strong>Close every face.</strong> Evaluate face κ with <code>kirchhoff_same_material</code> on eligible smooth same-material Spitzer faces and harmonic closure on interfaces, voids, and strong table jumps. Per-material conduction constructs and retains each material's face coefficient separately.</p></li>
+        <li><p><strong>Limit every face.</strong> Form the SH face estimate with that same closure, evaluate \(q_{max}\), and freeze \(\theta=1/(1+|q_{raw}|/q_{max})\). This produces the limited κ<sub>eff</sub> used by the step.</p></li>
+        <li>
+          <p><strong>Find the explicit limit.</strong> Form \(D_{eff}=\kappa_{eff}/(\rho c_v)\) and take the most restrictive cell value (\(\Delta l_c\): the 1D cell width, or \(\sqrt{A_c}\) of the meridian-plane cell area in 2D):</p>
+          $$
+          \Delta t_{exp}=C_{cond}\min_c\frac{(\Delta l_c)^2}{D_{eff,c}},\qquad C_{cond}=0.25\ \text{(default)}.
+          $$
+        </li>
+        <li>
+          <p><strong>Choose the stage count.</strong> The Chebyshev interval grows as \(O(s^2)\):</p>
+          $$
+          s=\max\!\left(1,\left\lceil\sqrt{2\Delta t/\Delta t_{exp}}\right\rceil\right).
+          $$
+          <p>When the configured stage ceiling (<code>sts_max_stages</code>, default 40) is reached, the requested interval is divided into multiple supersteps.</p>
+        </li>
+        <li>
+          <p><strong>Build the ladder.</strong> With the default damping ν=0.01 (the Chebyshev damping parameter, <code>sts_damping</code> — distinct from the collision frequencies \(\nu_{ei}\), \(\nu_a\) of other pages), construct</p>
+          $$
+          \tau_j=\frac{\Delta t_{exp}}
+          {\nu^2+(1-\nu^2)\cos^2\!\left(\frac{\pi(2j-1)}{4s+2}\right)},
+          \quad j=1,\ldots,s,
+          $$
+          <p>then rescale all τ<sub>j</sub> uniformly so the stage times sum to the superstep, \(\sum_j\tau_j=\Delta t\). With the shipped defaults the raw ladder sums to more than \(\Delta t\), so this rescale shrinks the τ<sub>j</sub>.</p>
+        </li>
+        <li>
+          <p><strong>Apply all stages with frozen coefficients.</strong> \(D_{eff}\), face κ, and ρc<sub>v</sub> stay at their entry-\(T_e^n\) values. Only temperature in 1D, or conservative thermal energy in 2D, changes between stages — \(\mathcal M_{1D}\) denotes the conservative 1D face-flux divergence operator and \(\mathcal M^{\kappa}_{Kershaw}\) the 2D Kershaw nine-point diffusion operator, both at the frozen coefficients:</p>
+          $$
+          T_{e,j}=T_{e,j-1}+\frac{\tau_j}{\rho c_v}\mathcal M_{1D}(T_{e,j-1}),\qquad
+          E_{c,j}=E_{c,j-1}+\tau_jV_c\mathcal M_{Kershaw}^{\kappa}(T_{e,j-1}).
+          $$
+          <p>Opposite face powers make both finite-volume updates conservative; the per-material path applies the same pairwise update to its frozen material-resolved coefficients.</p>
+        </li>
+        <li><p><strong>Resynchronize once.</strong> After all stages, one post-conduction EOS forward evaluation rebuilds e<sub>e</sub>, P<sub>e</sub>, and C<sub>v,e</sub> from the updated temperature.</p></li>
+      </ol>
+    </section>
+
+    <section aria-labelledby="snb">
+      <h2 id="snb">SNB multigroup nonlocal model</h2>
+      <p><code>nonlocal_model="snb"</code> adds the opt-in Schurtz–Nicolaï–Busquet correction to 1D planar, cylindrical, or spherical electron conduction. Each conduction step rebuilds geometric global edges in the normalized electron energy β̂=E/(k<sub>B</sub> max T<sub>e</sub>) over [0.1, <code>snb_E_max_over_Te</code>], using 24 groups by default. Each group then solves the following diffusion-type equation for its transport field \(H_g\) (dimensionally a heat flux). The source on the right-hand side is the divergence of \(U_g\), the group's share of the local SH flux; \(H_g\) is that injected source spread out over the stopping-length scale, and its gradient rebuilds the nonlocal correction defined below:</p>
+      $$
+      \frac{H_g}{\lambda_g^{abs}}-
+      \nabla\!\cdot\!\left(\frac{\lambda_g^{tr}}{3}\nabla H_g\right)
+      =-\nabla\!\cdot U_g,\qquad U_g=\xi_g q_{SH},
+      $$
+      $$
+      \xi_g=P(\beta_g)-P(\beta_{g-1}),\qquad
+      P(\beta)=1-\frac{e^{-\beta}}{24}
+      (\beta^4+4\beta^3+12\beta^2+24\beta+24).
+      $$
+      <p>Here \(P(\beta)\) is the cumulative distribution of the Spitzer–Härm heat flux over normalized electron energy — the flux carries a \(\beta^4e^{-\beta}/24\) spectral weight, and \(P\) is its running integral — so the weight ξ<sub>g</sub> is an exact primitive difference, not a numerical quadrature. The total correction is \(\delta q=-\sum_g(\lambda_g^{tr}/3)\nabla H_g\). A cell-centered, volume-integrated FV discretization gives a strictly diagonally dominant tridiagonal system. Groups are solved as a strided batch; face diffusivity is the harmonic mean of neighboring λ<sup>tr</sup> values divided by three, with reflecting closed boundaries.</p>
+
+      <figure>
+        <img src="../../assets/conduction-snb-group-ladder.png" width="920" height="690" style="max-width:100%;height:auto" alt="SNB geometric group edges from 0.1 to 20 and group weights obtained as differences of the analytic function P">
+        <figcaption>Figure B. SNB group ladder. Global β̂ edges map to physical energies, while differences in P at local β=E/(k<sub>B</sub>T<sub>e</sub>) supply the source weights.</figcaption>
+      </figure>
+
+      <p>The representative energy \(\varepsilon_g=(E_{g-1}+E_g)/2\) is evaluated in erg. Two mean-free-path (mfp) variants define the common stopping length \(\lambda_g\) — both \(\lambda_g^{abs}\) and \(\lambda_g^{tr}\) equal this \(\lambda_g\) unless the E-field option below shortens the transport one:</p>
+      $$
+      \lambda_g=
+      \begin{cases}
+      \dfrac{2\sqrt2\,\varepsilon_g^2}
+      {4\pi n_e e^4\ln\Lambda\,\sqrt{\bar Z\varphi}},
+      &amp; \texttt{geometric\_r2}\quad(\text{Sherlock 2017; default}),\\[6pt]
+      \dfrac{2\,\varepsilon_g^2}
+      {4\pi n_e e^4\ln\Lambda\,\sqrt{\bar Z+1}},
+      &amp; \texttt{original}\quad(\text{Schurtz 2000}),
+      \end{cases}
+      \qquad \varphi=\frac{\bar Z+4.2}{\bar Z+0.24}.
+      $$
+      <p>Normally λ<sup>abs</sup>=λ<sup>tr</sup>. <code>snb_efield="local"</code> shortens only the transport mfp through \(1/\lambda_g^{tr}\mathrel{+}=|e\mathcal E|/\varepsilon_g\), where \(\mathcal E\) (script, to avoid clashing with the energies \(E\)) is the local electrostatic field magnitude evaluated from the plasma state; the option defaults to <code>none</code> because the r=2 calibration already incorporates electric-field suppression, so adding it can double count the effect.</p>
+      <h3>The SNB correction, step by step</h3>
+      <ol>
+        <li><p><strong>Rebuild the groups.</strong> At every conduction step, use max \(T_e\) to reconstruct the global geometric β̂ edges over [0.1, <code>snb_E_max_over_Te</code>] and form the exact primitive-difference weights ξ<sub>g</sub>.</p></li>
+        <li><p><strong>Evaluate stopping lengths.</strong> Compute each λ<sub>g</sub> from the local electron density, Coulomb logarithm, charge state, and group-center energy, using <code>geometric_r2</code> by default or the <code>original</code> Schurtz form.</p></li>
+        <li><p><strong>Assemble.</strong> For every group, volume-integrate the cell-centered FV equation into a strictly diagonally dominant tridiagonal system. Reflecting boundaries close the domain; voids receive identity rows and zero adjacent diffusivity.</p></li>
+        <li><p><strong>Solve all groups.</strong> Run the groups together as a strided-batch tridiagonal solve for \(H_g\).</p></li>
+        <li>
+          <p><strong>Reconstruct the correction.</strong> Accumulate groups in fixed order:</p>
+          $$
+          \delta q=-\sum_g\frac{\lambda_g^{tr}}{3}\nabla H_g.
+          $$
+        </li>
+        <li><p><strong>Compose the raw flux.</strong> Form \(q_{raw}=q_{SH}+\delta q\) using the same face-κ closure as the local SH path.</p></li>
+        <li><p><strong>Apply the shared cap.</strong> Evaluate \(\theta=1/(1+|q_{raw}|/q_{max})\) once and apply \(q=\theta q_{raw}\); there is no second SNB limiter.</p></li>
+        <li><p><strong>Close the iSNB Picard loop.</strong> Freeze (θ, δq), repeat the full STS superstep from \(T_e^n\), and recompute the correction at the endpoint. Run at least two iterations and test the relative flux max norm against <code>snb_picard_rtol</code>, up to <code>snb_picard_max_iters</code>. Nonconvergence is reported and the final iterate is accepted; at convergence the amplification factor is in (0,1) for every Δt.</p></li>
+      </ol>
+      <p>Selecting SNB loosens the default <code>f_lim</code> to 0.5. How strongly the flux is suppressed is computed by SNB itself, so this value does not tune the nonlocal strength; the loose limiter remains only as an outer safety valve that stops an anomalous composite flux if one ever arises. Studio applies the same model-dependent default.</p>
+    </section>
+
+    <section aria-labelledby="controls">
+      <h2 id="controls">Namelist controls</h2>
+      <p>These are the principal keys under <code>Numerics.conduction</code>. See the <a href="../use/namelist.html">namelist reference</a> for the complete surface and validation rules.</p>
+      <table class="quick-facts">
+        <thead>
+          <tr><th>Key</th><th>Default</th><th>Purpose</th></tr>
+        </thead>
+        <tbody>
+          <tr><th><code>conduction.enabled</code></th><td><code>True</code></td><td>Enables the electron-conduction operator.</td></tr>
+          <tr><th><code>f_lim</code></th><td>SH: <code>0.06</code><br>SNB: <code>0.5</code></td><td>Shared outer harmonic flux cap; the SNB value is a safety valve, not a physics model.</td></tr>
+          <tr><th><code>ion_conduction</code></th><td><code>False</code></td><td>Adds the independent ion-conduction pass.</td></tr>
+          <tr><th><code>solver</code></th><td><code>"sts"</code></td><td>Accepted values: <code>"sts"</code> (default explicit Chebyshev super-time-stepping), <code>"implicit"</code>, and <code>"hypre"</code> — the latter backed by the hypre library's BoomerAMG preconditioner [6,7] and requiring the optional Hypre build dependency. SNB requires <code>"sts"</code>.</td></tr>
+          <tr><th><code>face_kappa_policy</code></th><td><code>"kirchhoff_same_material"</code></td><td>Production-default same-material Kirchhoff secant face-κ; historic <code>"harmonic"</code> closure remains selectable.</td></tr>
+          <tr><th><code>nonlocal_model</code></th><td><code>"none"</code></td><td><code>"none"</code> or 1D <code>"snb"</code>.</td></tr>
+          <tr><th><code>snb_n_groups</code></th><td><code>24</code></td><td>Number of SNB energy groups.</td></tr>
+          <tr><th><code>snb_E_max_over_Te</code></th><td><code>20</code></td><td>Upper edge of the geometric β̂ ladder.</td></tr>
+          <tr><th><code>snb_mfp</code></th><td><code>"geometric_r2"</code></td><td>Sherlock r=2 default or <code>"original"</code>.</td></tr>
+          <tr><th><code>snb_efield</code></th><td><code>"none"</code></td><td>Optional local E-field mfp correction is <code>"local"</code>.</td></tr>
+          <tr><th><code>snb_picard_max_iters</code></th><td><code>8</code></td><td>iSNB Picard cap, with at least two iterations.</td></tr>
+          <tr><th><code>snb_picard_rtol</code></th><td><code>0.01</code></td><td>Relative flux max-norm convergence tolerance.</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section aria-labelledby="verification">
+      <h2 id="verification">Verification</h2>
+      <ul>
+        <li><strong>The four SNB gates G1–G4:</strong> G1 is the no-regression gate: with <code>nonlocal_model="none"</code>, all six GXII FLD metrics stay bit-identical to a feature-off run (relative difference 0). G2 checks the local limit: that SNB reduces to local SH as the mean free path λ→0, tested through the flux-reduction ratio for a sinusoidal temperature perturbation (the dispersion response) \(R(k)=\sum_g\xi_g/(1+\lambda_g^{abs}\lambda_g^{tr}k^2/3)\), holding the discrete operator's \(R_{disc}\) to ∣R−R<sub>disc</sub>∣≤5.5×10<sup>−8</sup> at tolerance 10<sup>−3</sup>; it further checks the small-k asymptote \((1-R)\propto k^2\) via a log–log slope of 1.986 (≈2), and that a two-rung tanh-temperature-ramp amplification of 100.7 stays within the derived curvature bound. G3 is the analytic comparison: the discrete Epperlein–Short solution matches within 7.2×10<sup>−7</sup> (gate 3×10<sup>−3</sup>; the dispersion check covers the band \(k\lambda_{ei}&lt;0.5\)). G4 is the conservation gate, closing planar, cylindrical, and spherical ledgers to 7.4×10<sup>−17</sup> against a 10<sup>−14</sup> gate.</li>
+        <li><strong>STS twins:</strong> 1D zero-flux eigenmodes with analytic solutions exercise the spherical, planar, and cylindrical STS ladders against their implicit and per-material twins, checking the spatial order of accuracy and closed-domain electron-energy conservation. In addition, <code>test_conduction_pattle_1d</code> gates the propagation of the \(T^{5/2}\) heat front against the Pattle nonlinear-diffusion similarity solution [4].</li>
+        <li><strong>GXII golden:</strong> an integrated regression with conduction active gates absorbed energy, bang time, minimum shell radius, peak density, areal density, and central temperature.</li>
+        <li><strong>Kirchhoff diagnostics:</strong> on steep same-material faces, four checks run: the ratio of heat flow and time step between the Kirchhoff and harmonic closures, that \(|q|\le q_{max}\) holds while the limiter is active, the time-step protection given by a Gershgorin-circle diagonal-dominance audit of the frozen-coefficient operator (zero-volume cells excluded), and that the closure falls back to harmonic correctly at material interfaces.</li>
+      </ul>
+    </section>
+
+    <section aria-labelledby="references">
+      <h2 id="references">References</h2>
+      <ol class="references">
+        <li>L. Spitzer, Jr. and R. Härm, "Transport Phenomena in a Completely Ionized Gas," Phys. Rev. 89, 977–981 (1953). <a href="https://doi.org/10.1103/PhysRev.89.977">doi:10.1103/PhysRev.89.977</a></li>
+        <li>S. I. Braginskii, "Transport Processes in a Plasma," Reviews of Plasma Physics 1, 205–311 (1965).</li>
+        <li>E. M. Epperlein and R. W. Short, "A Practical Nonlocal Model for Electron Heat Transport in Laser Plasmas," Phys. Fluids B 3, 3092–3098 (1991). <a href="https://doi.org/10.1063/1.859789">doi:10.1063/1.859789</a></li>
+        <li>R. E. Pattle, "Diffusion from an Instantaneous Point Source with a Concentration-Dependent Coefficient," Q. J. Mech. Appl. Math. 12, 407–409 (1959). <a href="https://doi.org/10.1093/qjmam/12.4.407">doi:10.1093/qjmam/12.4.407</a></li>
+        <li>V. Alexiades, G. Amiez, and P.-A. Gremaud, "Super-Time-Stepping Acceleration of Explicit Schemes for Parabolic Problems," Commun. Numer. Methods Eng. 12, 31–42 (1996). <a href="https://doi.org/10.1002/(SICI)1099-0887(199601)12:1%3C31::AID-CNM950%3E3.0.CO;2-5">doi:10.1002/(SICI)1099-0887(199601)12:1&lt;31::AID-CNM950&gt;3.0.CO;2-5</a></li>
+        <li>R. D. Falgout and U. M. Yang, "hypre: A Library of High Performance Preconditioners," Computational Science—ICCS 2002, LNCS 2331, 632–641 (2002).</li>
+        <li>V. E. Henson and U. M. Yang, "BoomerAMG: A Parallel Algebraic Multigrid Solver and Preconditioner," Appl. Numer. Math. 41, 155–177 (2002).</li>
+        <li>G. P. Schurtz, Ph. D. Nicolaï, and M. Busquet, "A Nonlocal Electron Conduction Model for Multidimensional Radiation Hydrodynamics Codes," Phys. Plasmas 7, 4238–4249 (2000). <a href="https://doi.org/10.1063/1.1289512">doi:10.1063/1.1289512</a></li>
+        <li>M. Sherlock, J. P. Brodrick, and C. P. Ridgers, "A Comparison of Non-Local Electron Transport Models for Laser-Plasmas Relevant to Inertial Confinement Fusion," Phys. Plasmas 24, 082706 (2017). <a href="https://doi.org/10.1063/1.4986095">doi:10.1063/1.4986095</a></li>
+        <li>D. Cao, G. Moses, and J. Delettrez, "Improved Non-Local Electron Thermal Transport Model for Two-Dimensional Radiation Hydrodynamics Simulations," Phys. Plasmas 22, 082308 (2015). <a href="https://doi.org/10.1063/1.4928445">doi:10.1063/1.4928445</a></li>
+        <li>A. Marocchino, M. Tzoufras, S. Atzeni, et al., "Comparison for Non-Local Hydrodynamic Thermal Conduction Models," Phys. Plasmas 20, 022702 (2013). <a href="https://doi.org/10.1063/1.4789878">doi:10.1063/1.4789878</a></li>
+      </ol>
+    </section>
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["$$", "$$"], ["\\[", "\\]"]] } };</script>
+  <script defer src="../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../nav.js" data-page="conduction" data-root="../"></script>
+</body>
+</html>

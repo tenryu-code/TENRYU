@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="en" data-lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Nuclear burn — TENRYU Documentation</title>
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>Nuclear burn <span class="badge">reference</span></h1>
+    <p class="abstract">TENRYU's 1D spherical burn kernel advances Bosch–Hale DT, DD, and D³He reactions, fuel depletion, charged-product deposition or transport, and electron/ion energy partition as one explicit source stage. Version 2 adds screening, multigroup diffusion, Monte Carlo alpha transport, and two-line first-collision neutron heating.</p>
+
+    <aside class="planned" aria-labelledby="at-a-glance">
+      <h3 id="at-a-glance">At a glance</h3>
+      <ul>
+        <li>Burn is off by default. The core target is spherical <code>1D_SPH</code> Lagrangian cells; the 2D RZ port supports <code>scheme="local"</code> and <code>"diffusion"</code> only (<code>"fraley"</code>'s point-source sphere kernel is 1D-specific and <code>"mc"</code> is not ported, so both are rejected by configuration validation in 2D).</li>
+        <li>Inventories are specific abundances \(Y_s=n_s/\rho\) [1/g], so hydrodynamic compression and dilution do not create or destroy particles.</li>
+        <li><code>scheme</code> selects charged-product treatment. The v2-E neutron model has a separate <code>neutron_heating</code> switch.</li>
+        <li>Fusion rest-mass energy is an external source; deposited, escaped, and in-flight energy are audited separately.</li>
+      </ul>
+    </aside>
+
+    <section aria-labelledby="mechanism">
+      <h2 id="mechanism">The physical mechanism</h2>
+      <p>The burn stage converts fusion rest mass into fast charged products and neutrons. In a two-temperature Lagrangian calculation, the kernel advances channel rates \(n_i n_j\langle\sigma v\rangle/(1+\delta_{ij})\) with Bosch–Hale reactivities, depletes the fuel, and returns the released energy as electron- and ion-heating sources. Inventories are specific abundances \(Y_s=n_s/\rho\), which are Lagrangian invariants: compression changes \(n_s\) through \(\rho\) alone, so hydrodynamics cannot create or destroy particles. This removes the failure in which a frozen birth density overburns an expanding cell.</p>
+      <p>Charged-product transport matters because a 3.5-MeV alpha has a range measured in areal density; whether that energy remains in the hot spot or escapes controls self-heating and ignition margin. TENRYU provides a deliberate model ladder: the Fraley point-sphere model gives a cheap analytic locally retained fraction in spherical geometry, multigroup diffusion slows six product slots — one per charged product and channel: the DT alpha, the DD proton, triton, and helion, and the D³He proton and alpha — on a Corman energy grid without statistical noise, and Monte Carlo CSDA persists straight-line particles between steps as the statistical reference. All three report through the same energy ledgers.</p>
+      <p>A fast ion initially loses energy mainly to plasma electrons; once it slows below the critical energy — the energy at which losses to electrons and to ions are exactly equal — ion losses take over. That partition matters because ion heating promotes further burn, whereas electron heating can leak through conduction and radiation. The default Li–Petrasso stopping split is tabulated at initialization over \(T_e,T_i,n_e\), leaving interpolation only at runtime. The simpler Fraley law \(f_i=1/(1+32/T_e[\mathrm{keV}])\) is retained only for DT alphas.</p>
+      <p>The v2-E neutron model is single-flight, first-collision recoil heating on fuel D and T, with discrete 14.049- and 2.449-MeV lines. The first collision deposits the mean recoil locally and partitions it with the same Li–Petrasso table. Subsequent flights, kerma (the kinetic energy released in matter per unit mass by neutron interactions), (n,2n) breakup, time of flight, and spectrum width are omitted explicitly, so the resulting profile is a fuel-self-heating approximation rather than a neutronics answer. Salpeter two-temperature and Chugunov–DeWitt screening modify low-temperature reactivities; the two-temperature Salpeter form is a TENRYU extension. Fusion energy is an external rest-mass source audited separately as deposited, escaped, or in-flight energy.</p>
+    </section>
+
+    <section aria-labelledby="reactions">
+      <h2 id="reactions">Reactivities and fuel inventory</h2>
+      <p>The available channels are DT = T(d,n)⁴He, both DD branches D(d,p)T and D(d,n)³He, and D³He = ³He(d,p)⁴He. Reactivities use the Bosch–Hale (1992) Padé fits. Cell ion temperature is converted from eV to keV exactly once at the kernel boundary. The volume rate is \(r=n_i n_j\langle\sigma v\rangle/(1+\delta_{ij})\), giving the required factor 1/2 for DD. Rates are zero below each fit floor and clamped at the high-temperature ceiling. The default <code>T_floor_keV=0.2</code> matches the DT/DD floor; the D³He fit begins at 0.5 keV.</p>
+      <p><code>fuel_materials</code> names the non-void materials that receive inventories. <code>x_D</code>, <code>x_T</code>, and <code>x_He3</code> set their initial mole fractions; all must be non-negative and sum to one. D, T, ³He, ⁴He, and proton inventories are stored as \(Y_s=n_s/\rho\), with \(n_s=\rho Y_s\) reconstructed for each rate evaluation. This is the Lagrangian invariant and avoids the severe overburn caused by freezing birth number density in an expanding cell.</p>
+      <p><code>screening="none"</code> is the identity and preserves v1 behavior. <code>salpeter</code> applies weak screening with an electron-inclusive, two-temperature Debye length; <code>chugunov_dewitt</code> uses the Chugunov–DeWitt 2009 interpolation formula (their Eq. (A4)) [3] with a rigid electron background. The two-temperature Salpeter form is a TENRYU extension. Invalid thermodynamic inputs fall back to unity, and its exponent is capped at \(h=2\) outside the weak-screening regime.</p>
+      <ul>
+        <li>\(r=n_i n_j\langle\sigma v\rangle/(1+\delta_{ij})\) — the channel reaction rate per volume; \(\delta_{ij}=1\) supplies the DD half factor for identical reactants.</li>
+        <li>\(Y_s=n_s/\rho\) — the Lagrangian specific abundance. Hydrodynamic compression or expansion changes \(n_s=\rho Y_s\), not \(Y_s\) itself.</li>
+        <li>Temperature boundary — ion temperature is converted from TENRYU's internal eV to keV exactly once before evaluating the Bosch–Hale fit.</li>
+        <li>Fit bounds — rates vanish below the inclusive floors (0.2 keV for DT/DD and 0.5 keV for D³He) and clamp above the Bosch–Hale fit-validity ceilings [1]: 100 keV for DT and both DD branches, 190 keV for D³He; <code>T_floor_keV</code> defaults to 0.2.</li>
+        <li>Screening — the selected factor multiplies each reaction pair's reactivity; Salpeter invalid inputs revert to one, and its weak-model exponent \(h\) (the screening enhancement is \(e^h\)) is capped at \(h\le2\) outside the weak-screening regime.</li>
+        <li>Fraley retention — the point-sphere kernel determines the locally retained fraction from the fuel-sphere column and the product's birth radius.</li>
+        <li>\(f_i=1/(1+32/T_e[\mathrm{keV}])\) — the optional Fraley electron/ion split, restricted by validation to DT alphas.</li>
+      </ul>
+    </section>
+
+    <section aria-labelledby="depletion">
+      <h2 id="depletion">Depletion and explicit time control</h2>
+      <p>Each burn stage freezes density and temperature and advances the per-cell species ODE with explicit-midpoint RK2 subcycles. The requested count is based on the larger of gross production and gross destruction for every reactant in an enabled channel, keeping relative inventory change per substep below <code>eps_deplete</code>. Gross control resolves cases where DD breeds trace T while DT consumes it almost as quickly, even though the net T rate is small. A deterministic scale-back of reaction counts preserves positivity and stoichiometric ledgers.</p>
+      <p>If the requested count exceeds <code>subcycle_max</code>, the current step uses the cap, reports saturation, and folds \(0.9\,dt\,M_{max}/M_{req}\) into the next burn time-step limit (\(M_{req}\) is the requested subcycle count and \(M_{max}\) the <code>subcycle_max</code> cap). Deposited power also imposes \(\Delta t\le f_E e_{cell}/P_{dep}\), where \(f_E=\)<code>explicit_source_limit</code> and \(e_{cell}=\rho_cV_c(e_e+e_i)\) is the cell's total internal energy — the same limiter construction as the hot-electron kernel's identically named key, with the electron-plus-ion reservoir here. This bounds self-heating while stage temperatures remain frozen.</p>
+    </section>
+
+    <section aria-labelledby="pipeline">
+      <h2 id="pipeline">One burn stage, step by step</h2>
+      <ol>
+        <li>Freeze each cell's density and electron/ion temperatures for the duration of the burn stage.</li>
+        <li>Compute the enabled channel rates and the required RK2 subcycle count from gross production and gross destruction for every reactant, targeting a relative inventory change below <code>eps_deplete</code> per substep. Gross rather than net control resolves the trace-tritium DD-to-DT turnover case.</li>
+        <li>Advance the five-species network with explicit-midpoint RK2. If a proposed reaction count would exhaust a reactant, deterministically scale the counts back before reconstructing inventories, preserving positivity and the stoichiometric ledgers.</li>
+        <li>If the required count saturates <code>subcycle_max</code>, report it and fold \(0.9\,dt\,M_{max}/M_{req}\) into the next burn time-step limit. Independently impose \(\Delta t\le f_E e_{cell}/P_{dep}\) on deposited source power.</li>
+        <li>Hand charged products to the selected <code>fraley</code>, <code>diffusion</code>, or <code>mc</code> treatment, and send neutron products through the optional first-collision heating path.</li>
+        <li>Partition deposited energy into electron and ion sources, update the deposited, escaped, and in-flight ledgers, and expose the combined burn time-step limiter to the driver.</li>
+      </ol>
+    </section>
+
+    <section aria-labelledby="products">
+      <h2 id="products">Product transport and electron/ion partition</h2>
+      <p>The default <code>scheme="fraley"</code> combines the Fraley alpha-range fit with a point-source spherical kernel. It computes the locally retained fraction from fuel-sphere column and birth radius, deposits that fraction in the birth cell, and sends the remainder to the charged-escape ledger. <code>scheme="diffusion"</code> follows six product slots on a Corman-1975 multigroup energy grid and deposits energy lost during group-to-group slowing. <code>scheme="mc"</code> persists straight-line CSDA particles between steps and samples <code>mc_particles_per_cell</code> particles per slot, cell, and step. MC tallies are statistical, but the counter-based Philox RNG streams (Philox4x32-10) remain independent through particle global IDs.</p>
+      <p>The default local-deposition split, <code>partition="li_petrasso"</code>, tabulates Li–Petrasso stopping over \(T_e,T_i,n_e\) during initialization; runtime performs only interpolation. The alternative Fraley law, \(f_i=1/(1+32/T_e[\mathrm{keV}])\), is restricted to DT alphas and is rejected with DD or D³He. Multigroup diffusion has an intrinsic energy-integrated stopping partition and does not use this key.</p>
+
+      <figure>
+        <img src="../../assets/burn-reaction-partition-en.png" width="920" height="430" style="max-width:100%;height:auto" alt="Flow from DT, DD, and D3He products through charged-particle transport or neutron heating into electron and ion energy">
+        <figcaption>Figure A. Reaction counts branch into distinct energy paths. Multigroup diffusion and MC are charged-product transport schemes; neutron heating is the separate two-line first-collision model.</figcaption>
+      </figure>
+    </section>
+
+    <section aria-labelledby="neutrons">
+      <h2 id="neutrons">Neutron heating v2-E</h2>
+      <p>With <code>neutron_heating=True</code>, DT-n at 14.049 MeV and DD-n at 2.449 MeV are emitted isotropically. A <code>neutron_heating_n_mu</code>-point Gauss–Legendre quadrature traces shell chords. Attenuation uses elastic scattering on fuel D and T only. The first collision deposits the mean recoil energy locally, and the Li–Petrasso table partitions the recoil D/T energy between electrons and ions. Residual scattered-neutron energy is recorded as <em>degraded</em>; energy crossing the outer boundary is <em>escaped</em>.</p>
+      <p>This tier-1 model is single-flight. It omits subsequent flights of degraded neutrons, shell-material kerma, (n,2n) breakup, time-of-flight retardation, and recoil-spectrum width. Its spatial heating profile should therefore be read as a first-collision fuel-self-heating approximation.</p>
+    </section>
+
+    <section aria-labelledby="controls">
+      <h2 id="controls">Namelist controls</h2>
+      <p>These are the principal keys in the top-level <code>Burn</code> block. See the <a href="../use/namelist.html">namelist reference</a> for complete validation rules.</p>
+      <table class="quick-facts">
+        <thead><tr><th>Key</th><th>Default</th><th>Purpose</th></tr></thead>
+        <tbody>
+          <tr><th><code>enabled</code></th><td><code>False</code></td><td>Master switch; 1D requires spherical geometry, and 2D RZ accepts <code>scheme="local"</code>/<code>"diffusion"</code> only.</td></tr>
+          <tr><th><code>fuels</code></th><td><code>["DT","DD"]</code></td><td>Selects channels from <code>DT</code>, <code>DD</code>, and <code>D3He</code>.</td></tr>
+          <tr><th><code>scheme</code></th><td><code>"fraley"</code></td><td>Charged-product treatment: <code>fraley</code>, <code>diffusion</code>, or <code>mc</code> in 1D; <code>local</code> or <code>diffusion</code> in 2D RZ.</td></tr>
+          <tr><th><code>screening</code></th><td><code>"none"</code></td><td><code>none</code>, <code>salpeter</code>, or <code>chugunov_dewitt</code>.</td></tr>
+          <tr><th><code>fuel_materials</code></th><td><code>["DT"]</code></td><td>Material names carrying the initial fuel inventory.</td></tr>
+          <tr><th><code>x_D / x_T / x_He3</code></th><td><code>0.5 / 0.5 / 0.0</code></td><td>Initial mole fractions; non-negative and summing to one.</td></tr>
+          <tr><th><code>T_floor_keV</code></th><td><code>0.2</code></td><td>Reactivity temperature floor [keV].</td></tr>
+          <tr><th><code>partition</code></th><td><code>"li_petrasso"</code></td><td>Local-deposition e/i split; <code>fraley</code> is DT-alpha-only.</td></tr>
+          <tr><th><code>eps_deplete / subcycle_max</code></th><td><code>0.1 / 64</code></td><td>Substep inventory-change target and count cap.</td></tr>
+          <tr><th><code>explicit_source_limit</code></th><td><code>0.2</code></td><td>Explicit time-step fraction for deposited energy.</td></tr>
+          <tr><th><code>diffusion_groups / diffusion_E_min_keV</code></th><td><code>30 / 20.0</code></td><td>Charged-particle group count and the bottom edge of the group grid: a product slowed below it deposits its remaining energy locally. The default 20 keV sits far below the MeV birth energies yet far above \(T_i\), where the residual range is negligible.</td></tr>
+          <tr><th><code>mc_particles_per_cell</code></th><td><code>16</code></td><td>MC samples per slot, cell, and step.</td></tr>
+          <tr><th><code>neutron_heating</code></th><td><code>False</code></td><td>Enables two-line first-collision neutron heating.</td></tr>
+          <tr><th><code>neutron_heating_n_mu</code></th><td><code>16</code></td><td>Even-order μ quadrature for isotropic-emission chords.</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section aria-labelledby="verification">
+      <h2 id="verification">Verification</h2>
+      <ul>
+        <li>G-R0 pins eight Bosch–Hale temperatures across four reactions to relative \(1.5\times10^{-3}\), catching eV/keV errors. G-R1 covers closed-form DT/DD depletion, coupled bred-species chains, gross-turnover subcycling, and reaction-count stoichiometry.</li>
+        <li>G-K0/K1/K2 cover the Fraley range, point kernel, and sphere-average identity; G-P1/P2 cover the published Li–Petrasso stopping-power reference values (their Table I [5]) and the intentionally different Fraley partition. The six-run rung-2 microsphere gate combines the fuel-pair bound, rate scaling, and early alpha-recapture self-heating.</li>
+        <li>Disabled-versus-baseline A/B twins matched 53/53 field and 164/164 history datasets bitwise, with <a href="../verification/index.html#gxii">GXII</a> golden rel=0 in six runs. G-L1 and v2 transport gates require released = deposited + escaped + Δin-flight within floating-point closure.</li>
+        <li>v2-E gates frozen constants, the thin limit, analytic spherical attenuation, and emitted = deposited + degraded + escaped. MC separately gates fixed-seed CV ≤0.1% (CV: coefficient of variation, \(\sigma/|\mu|\)), cross-seed CV ≤5%, and Philox stream independence.</li>
+      </ul>
+    </section>
+
+    <section aria-labelledby="references">
+      <h2 id="references">References</h2>
+      <ol class="references">
+        <li>H. S. Bosch and G. M. Hale, "Improved Formulas for Fusion Cross-Sections and Thermal Reactivities," Nucl. Fusion 32, 611–631 (1992). <a href="https://doi.org/10.1088/0029-5515/32/4/I07">doi:10.1088/0029-5515/32/4/I07</a></li>
+        <li>E. E. Salpeter, "Electron Screening and Thermonuclear Reactions," Aust. J. Phys. 7, 373–388 (1954). <a href="https://doi.org/10.1071/PH540373">doi:10.1071/PH540373</a></li>
+        <li>A. I. Chugunov and H. E. DeWitt, "Nuclear Fusion Reaction Rates for Strongly Coupled Ionic Mixtures," Phys. Rev. C 80, 014611 (2009). <a href="https://doi.org/10.1103/PhysRevC.80.014611">doi:10.1103/PhysRevC.80.014611</a></li>
+        <li>G. S. Fraley, E. J. Linnebur, R. J. Mason, and R. L. Morse, "Thermonuclear Burn Characteristics of Compressed Deuterium-Tritium Microspheres," Phys. Fluids 17, 474–489 (1974). <a href="https://doi.org/10.1063/1.1694739">doi:10.1063/1.1694739</a></li>
+        <li>C.-K. Li and R. D. Petrasso, "Charged-Particle Stopping Powers in Inertial Confinement Fusion Plasmas," Phys. Rev. Lett. 70, 3059–3062 (1993). <a href="https://doi.org/10.1103/PhysRevLett.70.3059">doi:10.1103/PhysRevLett.70.3059</a></li>
+        <li>E. G. Corman, W. E. Loewe, G. W. Cooper, and A. M. Winslow, "Multi-Group Diffusion of Energetic Charged Particles," Nucl. Fusion 15, 377–386 (1975). <a href="https://doi.org/10.1088/0029-5515/15/3/003">doi:10.1088/0029-5515/15/3/003</a></li>
+        <li>H. Brysk, "Fusion Neutron Energies and Spectra," Plasma Phys. 15, 611–617 (1973). <a href="https://doi.org/10.1088/0032-1028/15/7/001">doi:10.1088/0032-1028/15/7/001</a></li>
+        <li>J. Yuan, G. A. Moses, and P. W. McKenty, "Monte Carlo Charged-Particle Tracking and Energy Deposition on a Lagrangian Mesh," Phys. Rev. E 72, 046706 (2005). <a href="https://doi.org/10.1103/PhysRevE.72.046706">doi:10.1103/PhysRevE.72.046706</a></li>
+      </ol>
+    </section>
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["$$", "$$"], ["\\[", "\\]"]] } };</script>
+  <script defer src="../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../nav.js" data-page="burn" data-root="../"></script>
+</body>
+</html>

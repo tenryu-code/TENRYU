@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="ja" data-lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ラグランジュ流体 — TENRYU ドキュメント</title>
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>ラグランジュ流体 <span class="badge">reference</span></h1>
+    <p class="abstract">TENRYU は、1D — <code>Mesh.geometry_1d</code> で選ぶ球・円筒・平面の各測度 — および 2D 軸対称 RZ の幾何において、スタッガード配置のラグランジュ法で物質の運動を更新する。熱力学状態をセルに、運動学量を節点に置き、2D のエネルギー整合（compatible）経路では、節点に働くコーナー力と、内部エネルギーの更新に使う仕事を同一の離散力から構成する。</p>
+
+    <aside class="planned" aria-labelledby="at-a-glance">
+      <h3 id="at-a-glance">要点</h3>
+      <ul>
+        <li>スタッガードかつエネルギー整合な配置：セル中心に ρ, e, P, T、節点に x, u を置く。</li>
+        <li>コーナー質量とコーナー力により、運動エネルギーと内部エネルギーの交換を構成上保存する。</li>
+        <li><code>pc_v0</code> は従来の予測子–修正子法、<code>midpoint_v1</code> は既定の 2 次精度中点法で、修正は必ず 1 回だけ行う。</li>
+        <li>衝撃波の捕捉には、従来のスカラー vNR（von Neumann–Richtmyer）粘性と、CSW98（Caramana–Shashkov–Whalen 1998 [3]）の中央メッシュ上のテンソル族辺人工粘性を用意している。サブゾーン圧力と砂時計モード制御は任意選択で、既定は無効である。</li>
+      </ul>
+    </aside>
+
+    <section aria-labelledby="mechanism">
+      <h2 id="mechanism">物理機構</h2>
+      <p>ラグランジュ・メッシュは物質とともに動くため、物質界面と接触不連続はセル間へ拡散せず、セル面上に留まる。収束する球殻は解像度を保ち、体積が 1000 倍圧縮されても物質とともにセルが圧縮されるだけで、離散化すべき移流項も現れない。その代償が 2D でのメッシュ歪みである。ずり流れと渦度は移動メッシュを絡ませることがあるが、その扱いは本ページではなく、対になる ALE のページで述べる。</p>
+      <p>熱力学状態をセルに、運動学量を節点に置くのは、古典的な von Neumann のスタッガード配置である。Caramana–Burton–Shashkov–Whalen のエネルギー整合流体では、節点へ働くコーナー力とセルの \(p\,dV\) 仕事を、同じ幾何ベクトル \(\mathbf S_{c,k}=\partial V_c/\partial\mathbf x_{c,k}\) から構成する。こうすると「力 × 節点速度」で運動エネルギーが得る量と「圧力 × 体積変化率」で内部エネルギーが失う量が、同じ離散量の二通りの読み方になり（運動量式と内部エネルギー式が互いに転置 — 随伴 — の関係）、運動エネルギーの変化と内部エネルギーの変化の和は恒等的に相殺する。その結果、全エネルギーは事後の補正によってではなく、構成上、丸め誤差の範囲まで保存される。RZ でも、回転体の体積の厳密な勾配を用いることで同じ考え方が成り立つ。</p>
+      <p>粘性のないスタッガード法には、衝撃波が必要とするエントロピーを生成する機構がない。人工粘性は圧縮時にだけ散逸的な圧力を加え、強い衝撃波には 2 次項、弱い衝撃波の裾には線形項を働かせることで、数セルにわたって捕捉された衝撃波が跳躍条件を満たすようにする。スカラー vNR 粘性は方向を区別しないため、収束流やずり流れを過剰に減衰させる。CSW98 の辺・テンソル族は中央メッシュ — セル中心と面の中点を結ぶ辺からなる補助メッシュ — 上で辺ごとに圧縮を測り、制限関数が自己相似圧縮・剛体回転・線形ずりでは散逸を無効にする。双一次四辺形にはさらに、セル平均の発散からは見えないゼロエネルギーの市松模様、すなわち砂時計モードも生じる。サブゾーン圧力は、セル内で正味 0 となるコーナー力によってこれに抵抗する安定化機構であり、衝撃波捕捉用の人工粘性の代用ではない。</p>
+      <p>実運用の積分器は、修正を厳密に 1 回だけ行う中点法である。演算回数が固定されているため、許容誤差まで反復する修正子と違って、実行はビット単位で再現する。滑らかな流れでの実測精度次数は \(p_\rho=2.0000\)、\(p_e=1.9999\) であり、従来の予測子–修正子法の約 1.0007 に対して 2 次である。従来法は圧縮の途中で古い圧力クロージャを使うため、次数を 1 失う。ドライバのレベルでは、場に作用する演算子群を挟む 2 回の流体半ステップとして実行し、状態を読む各演算子の前で EOS を閉じ直す。</p>
+    </section>
+
+    <section aria-labelledby="discretization">
+      <h2 id="discretization">離散化と状態量の配置</h2>
+      <p>1D 球対称では、節点 <em>j</em> に球殻境界の半径 \(r_j\) と動径速度 \(u_j\) を、セル <em>i</em> に密度、イオン・電子の比内部エネルギー、温度、圧力、人工粘性を置く。純ラグランジュのセルは質量 \(\Delta M_i\) を一定に保ったまま両端の節点を動かし、\(V_i=4\pi(r_{j+1}^3-r_j^3)/3\) と \(\rho_i=\Delta M_i/V_i\) から密度を求める。したがって、固定された面を通して質量を移流させるのではなく、メッシュそのものが質量座標を追跡する。</p>
+      <p>通常の 1D 経路は純ラグランジュである。球対称セルはメッシュの絡まりを起こさず、また緩和は衝撃波をにじませてしまうため、旧来の 1D メッシュ緩和経路は削除されている。これとは別系統の、実験的な 1D 解適応型 ALE 経路（内部機能名「V3」）は明示指定の機能で、1D 球対称かつ決定論的な輻射計算の場合に限られる。退役した旧リゾーナの復活ではない。</p>
+      <p>2D RZ では、軸対称なゾーンを \((R,Z)\) 子午面上の四辺形として表す。セル中心の \((\rho,e,P,T)\) を、節点の位置・速度ベクトルと結び付ける。正典となるコーナーベクトルは、回転体としてのセル体積の厳密な勾配 \(\mathbf S_{c,k}=\partial V_c/\partial\mathbf x_{c,k}\) である。これを、力の組み立てと、連鎖律による体積変化率 \(\dot V_c=\sum_k\mathbf u_{n_k}\cdot\mathbf S_{c,k}\) の双方に用いる。</p>
+
+      <figure>
+        <img src="../../assets/hydro-staggered-rz.png" width="600" height="450" style="max-width:100%;height:auto" alt="セル中心の熱力学量、節点速度、コーナー質量、コーナー力をもつ RZ 四辺形">
+        <figcaption>図A. 2D RZ 四辺形のスタッガード配置と、4 つのコーナー小セル。図は模式的で、実際の幾何には厳密な RZ 体積勾配を用いる。</figcaption>
+      </figure>
+    </section>
+
+    <section aria-labelledby="corner-masses">
+      <h2 id="corner-masses">コーナー質量とエネルギー整合な力</h2>
+      <p>セル質量を各コーナーへ分配し、節点質量は、その節点に接続するすべてのコーナー質量を決定論的な順序で集めて作る。既定の <code>kinematic_basis_rz_v1</code> は、双一次 Q1（4 節点四辺形有限要素）運動学基底を R で重み付けして厳密に集中化したもので、2×2 のガウス求積で評価する。</p>
+      $$
+      m_{c,k}=M_c\,
+      \frac{\int N_k(\xi,\eta)\,R(\xi,\eta)\,J(\xi,\eta)\,d\xi\,d\eta}
+           {\int R(\xi,\eta)\,J(\xi,\eta)\,d\xi\,d\eta}.
+      $$
+      <p>ここで \(N_k(\xi,\eta)\) は基準正方形上のコーナー \(k\) の双一次 Q1 基底関数、\(J\) はそのヤコビアン、\(R\) は半径である。各コーナーは、セル質量 \(M_c\) のうち自分の基底の R 重み付き積分に相当する分を受け取る。</p>
+      <p>任意の双一次四辺形に対して厳密であり、整列した矩形では従来の半径線形 BBSW（Barlow–Burton–Shashkov–Wendroff）集中化に一致し、軸に接する列のセルでは厳密に \([1/6,1/6,1/3,1/3]\) の分配になる。コーナー質量は初期化時に一度だけ計算し、純ラグランジュ運動のあいだは不変である。再構築できるのはリマップが受理された時点だけである。選択できる <code>bbsw_radial_v0</code> は従来の凍結設定を保存するもので、軸上では等分配に退化する。マルチブロックメッシュは、部分多角形を厳密に帰属させる別の契約に従うため、このキーの対象外である。</p>
+      <p>エネルギー整合なスカラー圧力・粘性の組では、コーナー力と仕事がまったく同じ幾何ベクトルを使う。</p>
+      $$
+      \mathbf F_{c\to n_k}=+(P_c+Q_c)\,\mathbf S_{c,k},
+      \qquad
+      \dot V_c=\sum_k\mathbf u_{n_k}\cdot\mathbf S_{c,k},
+      $$
+      $$
+      \sum_n\mathbf u_n\cdot\mathbf F_n
+      =\sum_c(P_c+Q_c)\dot V_c,
+      \qquad
+      \dot U_c=-\sum_k\mathbf F_{c,k}\cdot\mathbf u_{n_k}.
+      $$
+      <ul>
+        <li>\(\mathbf S_{c,k}\) は回転体体積の厳密な勾配であり、力の組み立て、体積変化率、仕事の監査が共有する唯一の幾何量である。</li>
+        <li><code>kinematic_basis_rz_v1</code> の \(m_{c,k}\) は、双一次 Q1 基底を R で重み付けして厳密に集中化した質量である。軸対称ではコーナーの質量が半径とともに増えるため R で重み付けし、軸に接する列のセルでは厳密に \([1/6,1/6,1/3,1/3]\) となる。ラグランジュ運動のあいだは不変で、リマップが受理された後にだけ再構築する。</li>
+        <li>符号の規約 \(\mathbf F=+(P_c+Q_c)\mathbf S_{c,k}\) は外向きを正とする。\(\mathbf S\) が体積の増える向きを指すためで、圧縮は内部エネルギーに正の仕事をする。</li>
+        <li>随伴の恒等式 \(\sum_n\mathbf u_n\cdot\mathbf F_n=\sum_c(P_c+Q_c)\dot V_c\) が、離散版の全エネルギー保存の言明にあたる。</li>
+        <li>スカラー vNR 粘性は \(\Delta l_c=\sqrt{A_c}\)（\(A_c\) はセルの子午面面積）と、2 次項に対する \(C_2^2\) の規約を用いる。</li>
+        <li>CSW98 の Kuropatenko 波速 [5] は、弱い圧縮では音速に、強い圧縮では強衝撃波の速度に漸近する単一の式である。</li>
+      </ul>
+      <p>\(\mathbf S\) は体積の増える向きを指すため、力の符号は外向きが正である。したがって圧縮では内部エネルギーへの仕事が正になる。CSW のエネルギー整合経路では、圧力、サブゾーン圧力、辺ごとの人工粘性の力を別々の配列に保持するが、それぞれのエネルギー寄与は、保存した同じ力と同じ時間中心の速度から求める。この離散的な随伴の対が、全エネルギー恒等式の基礎である。</p>
+    </section>
+
+    <section aria-labelledby="time-integration">
+      <h2 id="time-integration">時間積分</h2>
+      <p>ドライバのレベルでは、流体は「レーザー全ステップ → 流体半ステップ → 熱伝導全ステップ → 輻射全ステップ → 流体半ステップ」という既定の順序に組み込まれた半ステップ演算子である。各流体半ステップは、その半区間に対して選択した積分器の 1 サイクルを完全に実行し、後続の演算子が状態を読む前に EOS を閉じ直す。</p>
+      <p><code>pc_v0</code> は、従来の凍結設定のために残してある。旧時刻の力から半ステップの位置と速度を予測し、半ステップでの幾何と力を評価して全ステップを修正する。予測段階で内部エネルギーを進めないため、圧縮中の圧力クロージャが古いままとなり、滑らかな流れの時間収束では約 1 次と測定されている。</p>
+      <p>既定の <code>midpoint_v1</code> は、エネルギー整合な半ステップの仕事を行い、半ステップの幾何から厳密に \(\rho^h=M_c/V(x^h)\) を求め、\((\rho^h,e^h)\) で EOS を閉じる。運動量、仕事、監査はひとつの中点コーナー力の組を共有する。暫定的な全ステップ更新のあと、修正した中点で力を厳密に 1 回だけ、決定論的に再評価する。最終状態はあらためて \(t^n\) から進め、\(\bar{\mathbf u}=(\mathbf u^n+\mathbf u^{n+1})/2\) を使う。滑らかな流れでの実測次数（検証ゲート <code>2d_rz_v3_smooth_temporal</code> による）は \(p_\rho=2.0000\)、\(p_e=1.9999\) で、<code>pc_v0</code> は約 1.0007 である。マルチブロック/CSR（compressed sparse row 接続）、HLLC（Harten–Lax–van Leer-contact 近似リーマン解法）、中心ボタン — <a href="mesh/2d.html">2D メッシュ族</a>の極中心を組み立てた「ボタン」メッシュ — の各経路は、現時点ではこのキーの値によらず <code>pc_v0</code> のままである。なお 2 ランク以上の MPI ではドライバが <code>midpoint_v1</code> を明示的に拒否するため、複数ランクの 2D デッキでは <code>pc_v0</code> を指定する必要がある（<a href="mpi.html">MPI ページ</a>参照）。</p>
+
+      <figure>
+        <img src="../../assets/hydro-midpoint-v1-flow.png" width="840" height="280" style="max-width:100%;height:auto" alt="midpoint_v1 時間積分の流れ図">
+        <figcaption>図B. <code>midpoint_v1</code> の修正回数は 1 回に固定されている。エネルギー整合な半ステップの仕事、中点での力、暫定的な全ステップ更新、決定論的な 1 回の再評価を経て、最終更新に至る。</figcaption>
+      </figure>
+    </section>
+
+    <section aria-labelledby="pipeline">
+      <h2 id="pipeline">流体半ステップ 1 回（<code>midpoint_v1</code>）の手順</h2>
+      <ol>
+        <li>\(t^n\) における EOS 適用後の状態から始め、\(P+Q\) と保持済みの \(\mathbf S\) から旧時刻のコーナー力を組み立てる。</li>
+        <li>エネルギー整合な半ステップとして \(x^h,u^h\) を進め、半ステップでの力の仕事を \(e^h\) に積み上げ、半ステップの幾何から厳密な密度 \(\rho^h=M_c/V(x^h)\) を求め、\((\rho^h,e^h)\) で EOS を閉じる。</li>
+        <li>中点でのコーナー力の組——圧力、有効化されていればサブゾーン圧力、別配列に置く辺ごとの人工粘性——をひとつだけ組み立て、運動量にも仕事にも監査にも同じものを使う。</li>
+        <li>暫定的な全ステップ更新 \(x^{n+1,*},u^{n+1,*}\) を作る。</li>
+        <li>厳密に 1 回だけ再評価する。修正した中点で幾何、エネルギー、力を計算し直す。これが「修正は 1 回」という契約である。</li>
+        <li>\(\bar{\mathbf u}=(\mathbf u^n+\mathbf u^{n+1})/2\) を使って \(t^n\) から最終状態をあらためて進め、境界条件を適用し、EOS を閉じ直す。</li>
+      </ol>
+      <p>ドライバはこのサイクルに入る前に、候補となる時間刻みを選ぶ。流体の CFL 条件は \(\Delta l_c/(|\mathbf u_c|+c_{s,c})\) を含み、2D ではさらに、メッシュ品質と最小高さの保護判定、および予測的なコーナーヤコビアンの保護判定が、時間刻みを縮めるか、位置を確定する前に候補の状態を棄却できる。</p>
+      <p>圧力による \(p\,dV\)、サブゾーン圧力の仕事、人工粘性の仕事は、運動量に使ったものと同じ力の組から、セルごとの仕事配列へ入る。これらの寄与は内部エネルギーの更新とエネルギー監査に厳密に 1 回だけ入り、境界での仕事は従来どおりの台帳の帰属を保つ。各段階の内部で使う試行状態は、永続的な台帳には書き込まない。</p>
+    </section>
+
+    <section aria-labelledby="artificial-viscosity">
+      <h2 id="artificial-viscosity">人工粘性</h2>
+      <p>従来のスカラー von Neumann–Richtmyer 粘性は圧縮時にのみ働く。TENRYU の 2 次項の係数は \(C_2\) ではなく \(C_2^2\) である点に注意すること。</p>
+      $$
+      Q_c=
+      \begin{cases}
+      \rho_c\left[C_2^2(\Delta l_c)^2(\nabla\!\cdot\!\mathbf u_c)^2
+      +C_1\Delta l_c\,c_{s,c}\lvert\nabla\!\cdot\!\mathbf u_c\rvert\right],
+      &amp; \nabla\!\cdot\!\mathbf u_c&lt;0,\\
+      0, &amp; \text{otherwise},
+      \end{cases}
+      \qquad \Delta l_c=\sqrt{A_c}.
+      $$
+      <p>ここで \(c_{s,c}\) はセルの音速、\(\nabla\!\cdot\mathbf u_c\) はセル平均の速度発散、\(C_1\)・\(C_2\) は直後に既定値を示す線形・2 次の係数である。</p>
+      <p>一般的な既定値は <code>av_C1=0.1</code>、<code>av_C2=1.5</code> である。1D では <code>av_type</code> が <code>vnr</code>、任意選択のリーマン形式、1D の CSW 形式を切り替える。2D ではこれとは別の <code>av_model</code> が、従来の <code>scalar_vnr_legacy</code> か、エネルギー整合な辺力モデルかを選ぶ。</p>
+      <p><code>csw_edge_csw98</code> は、修正を経た実運用向けの 2D エネルギー整合オプションである。コーナーで対称化した中央メッシュ上の CSW-1998 テンソル族の構成に、厳密な圧縮側スイッチ、Kuropatenko の波速、符号付きのエネルギー整合な仕事を組み合わせる。連続辺の制限関数は同一の論理線上で速度勾配を比較し、自己相似圧縮・剛体回転・線形な格子ずりでは制限比が 1 となって人工散逸を抑える。2D の CSW モデルを選んで係数を省略した場合は、原論文の既定値 \(C_1=C_2=1\) を使う。旧来の <code>csw_edge</code> は、認証の連続性のためビット単位で同一のまま保持している。名前だけ用意されている namelist 値 <code>csw_edge_plus_tensor_limited</code> は未実装で、入力検証が拒否する。</p>
+    </section>
+
+    <section aria-labelledby="subzonal-hourglass">
+      <h2 id="subzonal-hourglass">サブゾーン圧力と砂時計モード制御</h2>
+      <p>双一次のラグランジュ四辺形には、ゼロエネルギーの市松模様、すなわち砂時計モードが生じ得る。これを抑える二つの機構はいずれも明示的に有効化するもので、既定では無効である。正統な Caramana–Shashkov のサブゾーン圧力は、ラグランジュ更新のあいだコーナー質量を固定したうえで、現在の部分体積から各サブゾーンの密度を求め、EOS による圧力の摂動を評価して、セル内で正味 0 となるコーナー力を構成する。速度に対するフィルタではなくサブゾーンの体積変化に応答し、仕事も同じ力から計算する。</p>
+      <p>これとは別系統の従来経路 <code>hourglass.enabled</code> は、線形化したサブゾーン圧力による復元力、力の制限、エネルギー整合な仕事を用いる。並進やアフィンな伸縮・ずりを変えないまま、双一次の市松成分だけを抑える。いずれも衝撃波捕捉用の人工粘性の代用ではない。正統なサブゾーン圧力にはエネルギー整合な CSW 辺モデルが必要である。<code>csw_edge_csw98</code> 自体は、サブゾーン圧力の有無どちらでも実行できる。</p>
+    </section>
+
+    <section aria-labelledby="momentum-schemes">
+      <h2 id="momentum-schemes">RZ 運動量スキーム</h2>
+      <p>既定は <code>volume_weighted</code> で、保持しておいた厳密 RZ の体積勾配コーナーベクトルと、真の RZ 節点質量を使う。任意選択の <code>area_weighted_symmetric</code> v1 演算子は、代わりに平面的な外向きコーナーベクトルと、平面的なサブゾーン節点質量を使う。対象は構造化された単一ブロックメッシュと、全セルが四辺形のマルチブロック CSR メッシュに限られ、スカラー vNR 粘性を使い、サブゾーン圧力を無効にしておく必要がある。三角形扇による極冠（極メッシュ中心の tri-fan）は拒否される。</p>
+      <p>面積重み付きのオプションでも、内部エネルギーの更新は従来どおり真の RZ 幾何による \(P\,dV\) のままである。そのため全エネルギーの厳密な整合性は成り立たず、従来の非整合な保存クラスに属する。診断量、時間刻みの見積り、リマップは引き続き真の RZ 節点質量を使う。</p>
+    </section>
+
+    <section aria-labelledby="controls">
+      <h2 id="controls">namelist による制御</h2>
+      <p>以下は <code>Numerics.hydro</code> の主要キーの抜粋である。全項目と検証規則は <a href="../use/namelist.html">namelist リファレンス</a>を参照のこと。</p>
+      <table class="quick-facts">
+        <thead>
+          <tr><th>キー</th><th>既定値</th><th>用途</th></tr>
+        </thead>
+        <tbody>
+          <tr><th><code>av_type</code></th><td><code>"vnr"</code></td><td>1D の衝撃波捕捉方式の選択：<code>vnr</code>、<code>riemann</code>、<code>csw</code>。</td></tr>
+          <tr><th><code>av_model</code></th><td><code>"scalar_vnr_legacy"</code></td><td>2D RZ での選択。<code>csw_edge_csw98</code> は修正済みのエネルギー整合な CSW98 辺人工粘性である。</td></tr>
+          <tr><th><code>av_C1</code></th><td><code>0.1</code></td><td>線形人工粘性の係数。2D の CSW モードで省略した場合は 1.0。</td></tr>
+          <tr><th><code>av_C2</code></th><td><code>1.5</code></td><td>2 次人工粘性の係数。スカラー vNR では \(C_2^2\) として入り、2D の CSW モードで省略した場合は 1.0。</td></tr>
+          <tr><th><code>corner_mass_convention</code></th><td><code>"kinematic_basis_rz_v1"</code></td><td>2D 単一ブロックにおけるコーナー質量の分配。従来の選択肢は <code>bbsw_radial_v0</code>。</td></tr>
+          <tr><th><code>time_integration</code></th><td><code>"midpoint_v1"</code></td><td>2D RZ の時間積分器。<code>pc_v0</code> は従来経路を保持する。</td></tr>
+          <tr><th><code>rz_momentum_scheme</code></th><td><code>"volume_weighted"</code></td><td>厳密 RZ の既定、または制約付きの <code>area_weighted_symmetric</code> v1。</td></tr>
+          <tr><th><code>subzonal_pressure_enabled</code></th><td><code>False</code></td><td>正統なエネルギー整合サブゾーン圧力の力を有効化。</td></tr>
+          <tr><th><code>hourglass.enabled</code></th><td><code>False</code></td><td>2D RZ における従来の線形化砂時計モード抑制経路を有効化。</td></tr>
+          <tr><th><code>boundary_1d</code></th><td><code>"free"</code></td><td>1D 外側境界：<code>free</code>、<code>fixed</code>、<code>reflect</code>、<code>pressure</code>。</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section aria-labelledby="verification">
+      <h2 id="verification">検証</h2>
+      <ul>
+        <li>Noh・Sod 系の解析解による検査は、強衝撃波の位置と密度のプラトー、平面の厳密リーマン解における三波構造、質量と力積の収支、1D のエネルギー保存を確認する。2D RZ の H1/H2 デッキは、平面 Sod と円筒 Noh の配置を実行する。</li>
+        <li><code>verify_gxii_1d_fld_regression</code> は現行の <a href="../verification/index.html#gxii">GXII</a> 基準回帰試験で、吸収エネルギーと、履歴から得られる最大圧縮時刻、ピーク密度、面密度、中心温度を判定する。</li>
+        <li>エネルギー整合な力の試験は、\(\sum \mathbf u\cdot\mathbf F=\sum (P_c+Q_c)\dot V_c\)、外部と切り離した流体計算における運動エネルギーと内部エネルギーの交換、決定論的な集約、マルチブロック接合部の保存を固定する。実運用構成の簡易検査は、記録されたエネルギー残差にも上限を課す。</li>
+        <li><code>2d_rz_v3_smooth_temporal</code> は、上記 <code>midpoint_v1</code> の密度とエネルギーの精度次数を測定し、保持されている <code>pc_v0</code> と区別する。</li>
+      </ul>
+    </section>
+
+    <section aria-labelledby="references">
+      <h2 id="references">参考文献</h2>
+      <ol class="references">
+        <li>J. von Neumann and R. D. Richtmyer, "A Method for the Numerical Calculation of Hydrodynamic Shocks," J. Appl. Phys. 21, 232–237 (1950). <a href="https://doi.org/10.1063/1.1699639">doi:10.1063/1.1699639</a></li>
+        <li>E. J. Caramana, D. E. Burton, M. J. Shashkov, and P. P. Whalen, "The Construction of Compatible Hydrodynamics Algorithms Utilizing Conservation of Total Energy," J. Comput. Phys. 146, 227–262 (1998). <a href="https://doi.org/10.1006/jcph.1998.6029">doi:10.1006/jcph.1998.6029</a></li>
+        <li>E. J. Caramana, M. J. Shashkov, and P. P. Whalen, "Formulations of Artificial Viscosity for Multi-dimensional Shock Wave Computations," J. Comput. Phys. 144, 70–97 (1998).</li>
+        <li>E. J. Caramana and M. J. Shashkov, "Elimination of Artificial Grid Distortion and Hourglass-Type Motions by Means of Lagrangian Subzonal Masses and Pressures," J. Comput. Phys. 142, 521–561 (1998). <a href="https://doi.org/10.1006/jcph.1998.5952">doi:10.1006/jcph.1998.5952</a></li>
+        <li>V. F. Kuropatenko, "On Difference Methods for the Equations of Hydrodynamics," in <i>Difference Methods for Solutions of Problems of Mathematical Physics, I</i>, edited by N. N. Janenko (American Mathematical Society, Providence, 1967), p. 116.</li>
+      </ol>
+    </section>
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["$$", "$$"], ["\\[", "\\]"]] } };</script>
+  <script defer src="../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../nav.js" data-page="hydrodynamics" data-root="../"></script>
+</body>
+</html>

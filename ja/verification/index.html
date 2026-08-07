@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="ja" data-lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>検証とベンチマーク — TENRYU ドキュメント</title>
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>検証とベンチマーク <span class="badge">reference</span></h1>
+    <p class="abstract">TENRYU の検証は、個々のカーネルを閉じた形の解で固定する小さな検査から、基準解との回帰試験、再現性の監査、2D RZ の統合試験群、外部コードとの比較へと段階的に進む。上の段の試験ほど多くの物理を同時に通すが、下の段の解析的な検査を置き換えるものではない。各段は「どの契約が壊れたか」を切り分けられるよう、それぞれ異なる正解の基準と許容帯をもつ。</p>
+
+    <aside class="planned" aria-labelledby="at-a-glance">
+      <h3 id="at-a-glance">要点</h3>
+      <ul>
+        <li>解析的な検査は、Sedov / Noh、多群 Marshak のスペクトル、SNB の Epperlein–Short 分散関係の帯、レーザーの屈折・吸収則などを、コード本体から独立した参照と比較する。</li>
+        <li><a href="#gxii">GXII</a> の 1D FLD は、履歴上の爆縮指標を基準解と比較する。基準解は期待どおりに通すために動かす値ではなく、物理的に説明できる変更に限り、定量的なレビューを経て取り直す。</li>
+        <li>決定論的な 1D の経路では、実行のたびにビット単位で一致することが基準である。2D RZ の一部は、<code>atomicAdd</code> の加算順序に由来する最下位ビットの差を、明示的な雑音帯として扱う。</li>
+        <li>I 系列は、グレイの輻射衝撃波、多群 FLD の一致、S<sub>N</sub> の輻射衝撃波の段階列を、2D RZ の連成条件での受け入れ判定へ引き上げる。</li>
+      </ul>
+    </aside>
+
+    <section aria-labelledby="ladder">
+      <h2 id="ladder">検証の階層</h2>
+      <p>この階層は、単一の演算子に対する数式、構成を固定した数値の軌道、実行ごとの再現性、複数の演算子の連成、別実装との比較、という順に証拠を積み上げる。小さな検査は符号・単位・係数・境界条件の誤りを局所化し、統合試験群は、正しい部品が実際の時間ループ、メッシュ、台帳のなかでも整合することを確認する。外部コードとの比較は妥当性確認の補助的な証拠であり、内部の検証の代用にはならない。</p>
+
+      <table class="quick-facts">
+        <thead>
+          <tr><th>検査の種類</th><th>何を検査するか</th><th>どこで走るか</th></tr>
+        </thead>
+        <tbody>
+          <tr><th>1. 単体・解析解</th><td>単一のカーネル、離散演算子、保存の恒等式を、閉じた形の解や独立な実装と比較する。</td><td><code>ctest</code> の <code>verify_sedov</code>、<code>verify_noh</code>、Marshak / SNB / レーザーの各パターン。対応する多くは <code>tenryu verify &lt;name&gt;</code> でも実行できる。</td></tr>
+          <tr><th>2. 基準解との回帰</th><td>固定したデッキの履歴指標が、承認済みの JSON の基準値と許容差の範囲で一致するかを検査する。</td><td><code>ctest -R verify_gxii_1d_fld_regression</code> または <code>tenryu verify gxii_1d_fld_regression</code>。</td></tr>
+          <tr><th>3. 再現性</th><td>同じ入力での反復実行や、必要に応じてランク数を変えた実行を、T-bit / T-sum / T-noise の契約（<a href="#reproducibility">後述の凡例</a>参照）で比較する。</td><td>文書化された <code>parallel_determinism_audit</code> の契約と、各連成試験群における反復実行・機能オフの経路。</td></tr>
+          <tr><th>4. 統合試験群</th><td>2D RZ で流体、輻射、材料との結合、メッシュ、境界の台帳を同時に検査する。</td><td>CTest の I1 / I2 / I3 の試験群。完全に連成した行は <code>strict</code> を名前に含み、長時間かかる行には <code>expensive</code> のラベルが付く。</td></tr>
+          <tr><th>5. コード間ベンチマーク</th><td>入力の物理的な意味をそろえたうえで、別のコードと傾向や吸収量を比較する。</td><td>HELIOS との照射条件をそろえた LTE のキャンペーン。コミットごとの通常の検査ではなく、記録を伴うベンチマークである。</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section aria-labelledby="analytic-catalog">
+      <h2 id="analytic-catalog">解析解・単体検査のカタログ</h2>
+      <p>解析解による検査の価値は、単に実行が完走することではなく、実装が誤っていれば異なる値を返す「正解の基準」をもつことにある。可能な箇所では、参照となる計算は実運用のカーネルと同じ補助関数を呼ばず、独立な積分、離散的な固有値、あるいは文献の解から作る。</p>
+
+      <table class="quick-facts">
+        <thead>
+          <tr><th>対象</th><th>参照と主な観測量</th><th>代表的な検査の名前</th></tr>
+        </thead>
+        <tbody>
+          <tr><th>流体</th><td>Sedov–Taylor の爆風は、衝撃波の半径・密度分布・エネルギーを相似解と照合する。Noh は、衝撃波の位置、圧縮のプラトー、外向きの流れ、保存を、幾何ごとの解析値と照合する。</td><td><code>sedov</code>、<code>noh</code>、<code>noh_planar</code>、<code>noh_cylindrical</code></td></tr>
+          <tr><th>多群 FLD</th><td>8 群の Marshak のプラトーを、独立なプランク積分から得たスペクトルと照合する。振動数に依存する緩和では、群ごとの不透明度の配線を、閉じた形の後退オイラー応答で検査する。</td><td><code>fld_1d_mg_planar_marshak_spectrum</code>、<code>fld_1d_mg_planar_freqdep_relaxation</code></td></tr>
+          <tr><th>SNB 熱伝導</th><td>離散的な分散関係との厳しい比較と、Epperlein–Short や VFP（Vlasov–Fokker–Planck 運動論計算）のデータに基づく物理的な帯 [4,5] とを分離する。格子と群の段階列、単調性、局所極限、保存も同じ試験群で確認する。</td><td><code>snb_local_limit_1d</code>、<code>snb_dispersion_1d</code>、<code>snb_conservation_1d</code></td></tr>
+          <tr><th>レーザー・不透明度</th><td>一様な媒質での Beer–Lambert 減衰、解析的な屈折率分布における転回点、3 次元光線の吸収と沈着の台帳を検査し、<code>rho*kappa</code> の掛け忘れや二重掛けも検出する。</td><td><code>beer_lambert</code>、<code>laser_3d_beer_lambert</code>、<code>laser_3d_refraction</code></td></tr>
+          <tr><th>輻射の波面</th><td>Hammer–Rosen の超音速 Marshak 波 [3] について、波面の等値面と、入射・逸出のエネルギー台帳を摂動論の解析解と照合する。</td><td><code>hammer_rosen_supersonic</code></td></tr>
+        </tbody>
+      </table>
+      <p>許容差は一律ではない。たとえば決定論的な Beer–Lambert の光線追跡は統計誤差をもたないため、厳しい相対誤差を要求できる。一方、文献の図から読み取った SNB の物理的な帯は、離散演算子の精度に対する検査とは分けて扱い、モデルの既知の適用限界までを「合格」に見せないよう、対象とする段を明記する。</p>
+    </section>
+
+    <section aria-labelledby="gxii">
+      <h2 id="gxii">GXII ベンチマーク</h2>
+      <p>本ドキュメントで <strong>GXII</strong> とは、激光 XII 号（GEKKO XII）— 大阪大学レーザー科学研究所の 12 ビーム Nd:ガラスレーザー — のことである。TENRYU の常設アプリケーションベンチマークは GXII 相当の直接照射爆縮で、正十二面体の面に配置した 12 ビーム（実装上は正二十面体の 12 頂点方向）が 500&nbsp;µm カプセルを照射する。基準回帰デッキ <code>examples/verification/gxii_1d_fld_regression.py</code> は次の構成を凍結している。</p>
+      <table class="quick-facts">
+        <thead><tr><th>項目</th><th>回帰デッキでの値</th></tr></thead>
+        <tbody>
+          <tr><th>ターゲット</th><td>CH シェル（\(\rho=1.05\) g/cm³、厚さ 20 µm、外半径 250 µm；\(A=6.5\)、\(Z=3.5\)）と内側の DT ガス（0.010 g/cm³；\(A=2.5\)、\(Z=1\)）。外側は VOID。</td></tr>
+          <tr><th>シード・コロナ</th><td>指数ランプ \(\rho=0.05\,e^{-(r-250\,\mu m)/2\,\mu m}\) g/cm³（延長 10 µm、裾ガード \(3\times10^{-4}\) g/cm³）。351 nm での CH 臨界密度（0.028 g/cm³）を分解されたランプ内に置く。</td></tr>
+          <tr><th>駆動</th><td>10 kJ / 1 ns 矩形パルス（総計 10 TW、10 ps ランプ）、\(\lambda=351\) nm（3ω）；f/3 の 12 ビーム、super-Gaussian スポット（\(w_0=200\) µm、\(m=4\)）、ビームあたり 1000 本の弦追跡。</td></tr>
+          <tr><th>物理</th><td>2 温度ラグランジュ流体、Spitzer–Härm 伝導、20 群 FLD（対数境界 0.01–100 eV、Levermore–Pomraning リミッタ）；理想気体 EOS（\(\gamma=5/3\)）、固定不透明度 \(\kappa=100\) cm²/g、完全電離固定 \(\bar Z\)。CBET・ホット電子はオフ。</td></tr>
+          <tr><th>格子・時間</th><td>0–500 µm を 200 セルの一様ラグランジュ格子、2 ns まで。</td></tr>
+        </tbody>
+      </table>
+      <p>各カーネルページが引用する「GXII」条件 — 基準吸収率、コロナのサブステップ数、S<sub>8</sub>/S<sub>16</sub> 比較、Studio の「GXII 級」プリセット — は、このデッキまたはその明示された変種を指す。「GXII 級」と書かれた箇所の物理的定義は、この表のターゲットと駆動のパラメータである。</p>
+    </section>
+
+    <section aria-labelledby="golden">
+      <h2 id="golden">基準解との回帰と、その取り直し</h2>
+      <p><code>verify_gxii_1d_fld_regression</code> は、レーザー、流体、熱伝導、2 温度の物質、FLD を通る 1D 球対称爆縮の、実運用向けの回帰試験である。最終スナップショットではなく履歴から、吸収したレーザーエネルギー、最大圧縮時刻、<code>rho_peak_max</code>、面密度 <code>rhoR_max</code>、中心温度 <code>Tc_max</code> を取り出す。現在の契約では、<code>rho_peak_max</code> は基準解から相対 10% 以内、最大圧縮時刻は 5% 以内、その他の主要な履歴指標は指定された物理的許容差の範囲であることを要求する。<code>shell_r_min</code> は参考値だが、<code>run_profile</code> が一致しない場合は比較そのものを失敗させる。</p>
+      <p>基準解は「正解であることの証明」ではなく、同じ格子と実行プロファイルにおける変化の検出器である。取り直しが許されるのは、既知の不具合の修正、物理アルゴリズムや基準となる数値パラメータの変更、あるいはコードの責任者が承認した理由がある場合だけである。更新には、理由、旧値と新値の定量的な差、複数解像度での収束データ、そしてレビューを伴わせる。説明のない許容差の緩和や、失敗した実行の値へ合わせにいくことは、更新の理由にならない。</p>
+    </section>
+
+    <section aria-labelledby="reproducibility">
+      <h2 id="reproducibility">再現性の検査と 2D における例外</h2>
+      <p>再現性の契約はティア名で呼ばれる。各カーネルページに現れるタグは次のとおりである。</p>
+      <table class="quick-facts">
+        <thead><tr><th>ティア</th><th>契約</th></tr></thead>
+        <tbody>
+          <tr><th>T-bit</th><td>反復実行間（宣言があればランク数を変えた実行間も）のビット単位の一致。</td></tr>
+          <tr><th>T-sum</th><td>MPI の縮約順序だけが変わり得る場合。正規化した差を、通常 \(10^{-8}\) で判定する。</td></tr>
+          <tr><th>T-noise</th><td>文書化された 2D RZ の <code>atomicAdd</code> 最下位ビット機構。受け入れは、反復実行から自己較正した帯、またはアンサンブルから凍結した帯による、デッキ・指標限定の契約。</td></tr>
+          <tr><th>OFF-bit</th><td>機能を無効化（または一度も発火させない）した実行が、その機能なしの経路とビット単位で一致すること。</td></tr>
+          <tr><th>envelope</th><td>文書化された非決定性をもつ指標に使う、参照実行のアンサンブルから較正した、より広いデッキごとの最悪値の帯。</td></tr>
+        </tbody>
+      </table>
+      <p>決定論的な 1D の経路では、同じバイナリ・入力・GPU 構成による実行について、場と主要な診断量が実行のたびにビット単位で一致することを要求する。GXII の 1D では、レーザーの沈着を光線ごとの専用領域と固定順序の総和に変えた結果、全軌道をビット単位で再現できることが検査の前提になった。物理量に対する広い許容差はツールチェーンの頑健性のために残っていても、同じ構成での反復実行に差を許す根拠にはしない。</p>
+      <p>2D RZ の流体におけるコーナー力や一部の集計では、多数のスレッドによる <code>atomicAdd</code> の順序が実行ごとに変わり、最下位ビットの差を生み得る。この文書化された例外では、ビット単位の一致を誤った正解基準としては使わず、同じ構成での反復実行から自己較正した雑音帯、または凍結したアンサンブルによる帯を使う。長い実行では、最初のステップが完全に一致することと、終端での差が実行の長さに応じた成長の帯に収まることを、別々に検査する。これは恣意的な許容差ではなく、対象とするデッキと指標を限定した T-noise の契約である。決定論的な中間量や 1D の経路は、引き続きビット単位で一致しなければならない。</p>
+    </section>
+
+    <section aria-labelledby="integrated">
+      <h2 id="integrated">I 系列の 2D RZ 統合試験群</h2>
+      <p>I 系列は単一の「2D 簡易試験」ではなく、参照問題を段階的に、連成した実運用の経路へ移していく階層である。各ハーネスはデッキを複数の角度、不透明度、格子、あるいはソルバの段で実行し、要約 JSON のすべての検査が閉じたときにだけ試験群を合格とする。</p>
+
+      <table class="quick-facts">
+        <thead>
+          <tr><th>試験群</th><th>検査する連成の契約</th><th>CTest での見つけ方</th></tr>
+        </thead>
+        <tbody>
+          <tr><th>I1: グレイ輻射衝撃波の基準点</th><td>半解析的なグレイ輻射衝撃波の基準解 — LR07 と LE08 [6,7]、およびリミッタを切った FLD-CED の ODE 参照（<a href="#tag-legend">タグ凡例</a>参照）— を 1D で、さらに 2D RZ の z 方向スラブの脚（半径方向に薄いスラブ内を z 方向に走る平面衝撃波で、半径方向の不変性を判定）を用い、衝撃波、前駆領域、保存、参照分布への一致を固定する。</td><td><code>ctest --test-dir build -R "I1|i1"</code></td></tr>
+          <tr><th>I2: 多群 FLD のグレイ一致</th><td>振動数に依らない不透明度のもとで、多群 FLD の群についての和が連成したグレイ計算へ収束すること、波面のコーシー・リチャードソンによる収束、健全性監査（NaN・フロア発動・台帳の整合性検査）と保存を検査する。</td><td><code>ctest --test-dir build -R "I2|i2.*mgfld"</code></td></tr>
+          <tr><th>I3: S<sub>N</sub> 輻射衝撃波の段階列</th><td>角度の段、不透明度のスケール、格子の段階列を横断し、輻射の分布、流束、前駆領域、物質側の衝撃波、保存、FLD との順序関係、半径方向の不変性を検査する。</td><td><code>ctest --test-dir build -R "I3|i3.*radshock"</code></td></tr>
+        </tbody>
+      </table>
+      <p>I1 の連成する行と、I2 / I3 の完全な受け入れ判定は、試験の名前に <code>strict</code> を含み、部分的な簡易試験ではなくハーネスの必須項目をすべて評価する構成である。Catch2 の <code>[.expensive]</code> タグは CTest の <code>expensive</code> ラベルとして公開され、長時間かかる GPU の試験群を短い開発ループから分離する。これは品質を弱める印ではなく、実行時間とキャンペーンの規模による分類である。</p>
+    </section>
+
+    <section aria-labelledby="tag-legend">
+      <h2 id="tag-legend">ゲートタグの凡例</h2>
+      <p>各カーネルページは検査の族を短いタグで略記する。タグは名前であって強さの序列ではない。「rung（段）」はひとつの試験群の内部段階列（角度分解能の段階列など）を、「tier-1」は意図的に縮約した第 1 世代モデルの契約を指す。</p>
+      <table class="quick-facts">
+        <thead><tr><th>タグの族</th><th>意味</th></tr></thead>
+        <tbody>
+          <tr><th>L1 / L2（レーザー）</th><td>レーザー検査の階層。L1 = 単一物理のレーザー閉包契約（屈折・Beer–Lambert・エネルギー台帳・光線数収束）、L2 = レーザー+流体の連成契約。誤差ノルムの \(L_2\)/\(L_\infty\) とは無関係。</td></tr>
+          <tr><th>G1–G4（熱伝導）</th><td>SNB 非局所伝導の検査系列。G1 = 局所モデルとの OFF-bit、G2 = 局所極限と 2 次漸近、G3 = Epperlein–Short 分散、G4 = 保存。</td></tr>
+          <tr><th>G-R / G-K / G-P / G-L（核燃焼）</th><td>領域別の燃焼検査系列。R = 反応率と燃料消費、K = Fraley の飛程・カーネル、P = 電子・イオン分配、L = エネルギー台帳。</td></tr>
+          <tr><th>B1 / B2 / N1 / W1–W8（粘性）</th><td>Braginskii 粘性の試験群。B = 係数・歪み・減衰の検査、N1 = 曲率幾何モードの検査、W = 電子チャネルと 2D パリティ移植の系列。</td></tr>
+          <tr><th>H1 / H2（2D 流体）</th><td>2D RZ 流体の参照デッキ。H1 = 平面 Sod、H2 = 円筒 Noh。</td></tr>
+          <tr><th>I1 / I2 / I3 / I6</th><td>2D RZ 統合試験群。I1 = グレイ輻射衝撃波、I2 = 多群 FLD のグレイ一致、I3 = S<sub>N</sub> 輻射衝撃波の段階列、I6 = S<sub>N</sub> 多群グレイ一致の受け入れ判定。</td></tr>
+          <tr><th>R2（S<sub>N</sub>）</th><td>S<sub>N</sub> の求積・Marshak 参照試験群（座標の段階列と独立な Marshak 分布比較）。EOS の電荷モーメント \(r_2\) とは無関係。</td></tr>
+          <tr><th>LR07 / LE08 / FLD-CED（I1 の基準点）</th><td>I1 を固定する参照解。Lowrie–Rauenzahn 2007 と Lowrie–Edwards 2008 の半解析的グレイ輻射衝撃波 [6,7]、およびフラックスリミッタを切った（エディントン因子 1/3 固定の）グレイ FLD を ODE として積分した参照（「FLD-CED」）。</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section aria-labelledby="cross-code">
+      <h2 id="cross-code">HELIOS との 1D コード間ベンチマーク</h2>
+      <p>HELIOS — Prism Computational Sciences の商用 1D ラグランジュ輻射流体コード — との LTE（局所熱力学平衡）比較では、単に同じ公称レーザーパワーを与えるのではなく、照射条件を対応させたケース — 約 113 µm のガウススポットをほぼ平行ビーム（f/191）で与え、両側とも LTE テーブル不透明度 — を用いることで、初めて意味のある比較の土台が得られた。その条件で測定した吸収率は TENRYU が約 45%、HELIOS がケースにより約 55〜73% であり、この差については要因の帰属を調べた記録が残されている。これらの数字は<a href="#gxii">基準デッキ</a>の吸収率 83–84% とは意図的に比較不能である：基準デッキは f/3 の 12 ビームが 200 µm の super-Gaussian スポットで半径 250 µm のターゲットを覆う、はるかに広い照射幾何である（3 つの吸収率と条件の対照は<a href="../use/examples.html#absorption-numbers">「例題とプリセット」ページ</a>参照）。この比較だけをもって、どちらかの実装の正しさや実験の再現性を主張するものではない。</p>
+    </section>
+
+    <section aria-labelledby="how-to-run">
+      <h2 id="how-to-run">実行方法</h2>
+      <p>CTest はビルドツリーに登録された検査をパターンで選び、<code>tenryu verify</code> は単一の検証ドライバを直接起動する。</p>
+      <pre><code>ctest --test-dir build -R &lt;pattern&gt;
+./build/tenryu verify &lt;name&gt;
+
+# Examples
+ctest --test-dir build -R "sedov|noh|snb|gxii_1d_fld"
+./build/tenryu verify snb_dispersion_1d</code></pre>
+      <p>利用できる CTest の名前は <code>ctest --test-dir build -N</code> で確認できる。長時間の試験群を明示的に選ぶ場合は <code>-L expensive</code>、通常の確認から除外する場合は <code>-LE expensive</code> を使う。検査はビルドオプション、HDF5、MPI、GPU の実行環境に依存するため、スキップを合格と読み替えず、CTest のラベルと実行ログを結果と一緒に保存すること。</p>
+    </section>
+
+    <section aria-labelledby="references">
+      <h2 id="references">References</h2>
+      <ol class="references">
+        <li>L. I. Sedov, <i>Similarity and Dimensional Methods in Mechanics</i> (Academic Press, New York, 1959).</li>
+        <li>W. F. Noh, "Errors for Calculations of Strong Shocks Using an Artificial Viscosity and an Artificial Heat Flux," J. Comput. Phys. 72, 78–120 (1987). <a href="https://doi.org/10.1016/0021-9991(87)90074-X">doi:10.1016/0021-9991(87)90074-X</a></li>
+        <li>J. H. Hammer and M. D. Rosen, "A Consistent Approach to Solving the Radiation Diffusion Equation," Phys. Plasmas 10, 1829–1845 (2003). <a href="https://doi.org/10.1063/1.1564599">doi:10.1063/1.1564599</a></li>
+        <li>E. M. Epperlein and R. W. Short, "A Practical Nonlocal Model for Electron Heat Transport in Laser Plasmas," Phys. Fluids B 3, 3092–3098 (1991). <a href="https://doi.org/10.1063/1.859789">doi:10.1063/1.859789</a></li>
+        <li>A. Marocchino, M. Tzoufras, S. Atzeni, et al., "Comparison for Non-Local Hydrodynamic Thermal Conduction Models," Phys. Plasmas 20, 022702 (2013). <a href="https://doi.org/10.1063/1.4789878">doi:10.1063/1.4789878</a></li>
+        <li>R. B. Lowrie and R. M. Rauenzahn, "Radiative Shock Solutions in the Equilibrium Diffusion Limit," Shock Waves 16, 445–453 (2007). <a href="https://doi.org/10.1007/s00193-007-0081-2">doi:10.1007/s00193-007-0081-2</a></li>
+        <li>R. B. Lowrie and J. D. Edwards, "Radiative Shock Solutions with Grey Nonequilibrium Diffusion," Shock Waves 18, 129–143 (2008). <a href="https://doi.org/10.1007/s00193-008-0143-0">doi:10.1007/s00193-008-0143-0</a></li>
+      </ol>
+    </section>
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["\\[", "\\]"]] } };</script>
+  <script defer src="../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../nav.js" data-page="verification" data-root="../"></script>
+</body>
+</html>

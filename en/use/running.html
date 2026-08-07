@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="en" data-lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Running simulations — TENRYU Documentation</title>
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>Running simulations <span class="badge">reference</span></h1>
+    <p class="abstract">Starting from a built <code>build/tenryu</code>, this page takes you all the way through: complete a first run, write your own deck, and fix things when they break. TENRYU's input is one Python file (the namelist deck). Python callables are evaluated once at initialization and frozen into tables; Python never runs inside the time loop.</p>
+
+    <aside class="planned" aria-labelledby="at-a-glance">
+      <h3 id="at-a-glance">At a glance</h3>
+      <ul>
+        <li>Four CLI subcommands: <code>run</code> (execute), <code>validate</code> (check without running), <code>verify</code> (registered verification cases), <code>freeze</code> (dump the frozen JSON). <strong>Always validate before run</strong> — nearly all configuration mistakes are caught before execution.</li>
+        <li>For a first run, execute a template from <code>examples/templates/</code> as-is; it completes without any editing.</li>
+        <li><code>tenryu</code> always means the built executable <code>build/tenryu</code> — there is no install step. Invoke it by path from the repository root, or add <code>build/</code> to <code>PATH</code>.</li>
+        <li>The schema is strict: unknown keys, wrong types, and unsupported combinations stop with an error rather than a warning, and typos get suggestions like <code>did you mean 'kappa_a'?</code>.</li>
+        <li>Re-running into the same output directory does not overwrite; results go to a numbered sibling like <code>_001</code>. If "nothing changed", check the output location first.</li>
+      </ul>
+    </aside>
+
+    <section aria-labelledby="prereq">
+      <h2 id="prereq">Prerequisites</h2>
+      <p>Machine and compiler conditions are on <a href="requirements.html">System requirements</a>; producing <code>build/tenryu</code> is covered by <a href="building.html">Building</a>. Everything below assumes a finished build and a shell at the repository root.</p>
+    </section>
+
+    <section aria-labelledby="cli">
+      <h2 id="cli">CLI subcommands</h2>
+      <table class="quick-facts">
+        <thead><tr><th>Command</th><th>Input</th><th>Purpose</th></tr></thead>
+        <tbody>
+          <tr><th><code>tenryu validate &lt;deck.py&gt;</code></th><td>any deck</td><td>Checks without running (seconds). Beyond schema and combination checks it prints a pre-flight summary — dimension, grid, materials, which physics modules are ON/OFF, output location. <strong>Eyeball the summary before running</strong>; it is the cheapest debugging there is.</td></tr>
+          <tr><th><code>tenryu run &lt;deck.py&gt;</code></th><td>any deck</td><td>The real run: reads the deck, validates and freezes it, builds mesh/material tables/initial state, then enters the time loop. <code>--output-dir &lt;dir&gt;</code> overrides the output location without editing the deck (new runs only; combining with a restart is a <code>ConfigError</code>).</td></tr>
+          <tr><th><code>tenryu verify &lt;name&gt;</code></th><td>registered case name</td><td>Re-runs analytic, golden, and integrated checks (e.g. <code>sedov</code>, <code>noh</code>, <code>gxii_1d_fld_regression</code>). See <a href="../verification/index.html">Verification &amp; benchmarks</a>.</td></tr>
+          <tr><th><code>tenryu freeze &lt;deck.py&gt;</code></th><td>any deck</td><td>Writes out the frozen configuration JSON — for inspecting or diffing effective values without running.</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section aria-labelledby="first-run">
+      <h2 id="first-run">A first run (complete a template)</h2>
+      <p><code>examples/templates/</code> ships three runnable skeletons with comments on every block. Start with the lightest one, the radiation slab, unmodified:</p>
+      <pre><code># 1. pre-flight check (does not run; takes seconds)
+./build/tenryu validate examples/templates/template_1d_slab_radiation.py
+
+# 2. run
+./build/tenryu run examples/templates/template_1d_slab_radiation.py
+
+# 3. inspect the results (location set by the deck's Output(directory=...))
+ls outputs/template_1d_slab_radiation/results/</code></pre>
+      <p>If step 3 shows snapshots like <code>&lt;name&gt;_0000.h5</code> next to <code>&lt;name&gt;_history.h5</code>, the run completed. While running, the console (and <code>log/</code>) shows step progress and output events like <code>[output] wrote snapshot (step=…, …)</code>. The fastest way to look at the data is the bundled tool:</p>
+      <pre><code>python3 -m tools.tenryu_plot profile outputs/template_1d_slab_radiation   # spatial profiles
+python3 -m tools.tenryu_plot history outputs/template_1d_slab_radiation   # time series</code></pre>
+      <table class="quick-facts">
+        <thead><tr><th>Template</th><th>Content</th><th>What it teaches</th></tr></thead>
+        <tbody>
+          <tr><th><code>template_1d_slab_radiation.py</code></th><td>Planar 1D, grey FLD, Marshak-driven boundary, hydro OFF</td><td>The minimal radiation setup; the validate → run → plot loop.</td></tr>
+          <tr><th><code>template_1d_laser_sphere.py</code></th><td>Spherical 1D, direct laser drive, two temperatures, conduction ON</td><td>Writing laser waveforms; multi-physics.</td></tr>
+          <tr><th><code>template_1d_indirect_tr.py</code></th><td>Spherical 1D, Tr(t) indirect drive</td><td>The time-dependent-callable → frozen-table idiom.</td></tr>
+        </tbody>
+      </table>
+      <p>The standard first modifications: change the drive temperature or laser power (the callable's return value), double <code>nr</code> and check convergence, and switch to <code>Radiation(mode="sn_transport")</code> to compare with FLD. <strong>Copy a template and rename it before editing.</strong> The three Studio presets validated through to their physics metrics are on <a href="examples.html">Examples &amp; presets</a>.</p>
+    </section>
+
+    <section aria-labelledby="deck-anatomy">
+      <h2 id="deck-anatomy">Deck anatomy</h2>
+      <p><code>Main</code> identifies the case and supplies its dimension and stopping conditions. <code>Mesh</code> creates the domain and zoning. <code>Materials</code> registers materials with EOS and opacity models, while <code>Geometry</code> maps initial volume fractions, density, temperature, and velocity onto the mesh. <code>Radiation</code> and <code>Laser</code> select physical operators. <code>Numerics</code> groups dt, hydrodynamics, conduction, ALE, and safety controls. Finally, <code>Output</code> sets file locations and cadence, and <code>Diagnostics</code> chooses quantities accumulated during the run.</p>
+      <p>The following is a minimal complete 1D spherical deck made only from real keys. It fills the domain with one ideal-gas material and advances Lagrangian hydrodynamics with radiation, laser drive, and conduction disabled. Its values demonstrate the input form; they do not define a physics benchmark.</p>
+      <pre><code>from tenryu_namelist import *
+
+fuel = Material(
+    name="fuel", A=2.0, Z=1.0,
+    eos=dict(model="ideal_gas", ideal_gas=dict(gamma=5.0 / 3.0)),
+    opacity=dict(model="constant", kappa_a=0.0, kappa_s=0.0,
+                 units="cm2_per_g"),
+)
+
+Main(name="minimal_1d", dimension="1D_SPH", temperature_model="2T",
+     t_end=1.0e-9, max_steps=1000, seed=12345)
+Mesh(r_min=0.0, r_max=0.05, nr=64, grid="uniform",
+     motion="lagrangian")
+Materials(materials=[fuel])
+Geometry(
+    volfrac=dict(fuel=lambda r_cm: 1.0),
+    rho=lambda r_cm: 1.0,
+    Te=lambda r_cm: 1.0,
+    Ti=lambda r_cm: 1.0,
+    velocity=None,
+    radiation_field="zero",
+)
+Radiation(enabled=False)
+Laser(enabled=False)
+Numerics(
+    dt=dict(initial_s=1.0e-12, max_s=1.0e-10, min_s=1.0e-18,
+            cfl_hydro=0.3),
+    hydro=dict(boundary_1d="free"),
+    conduction=dict(enabled=False),
+)
+Output(directory="outputs/minimal_1d", plot_every=10,
+       history_every=1, checkpoint_every=100)
+Diagnostics(enabled=True, every=1)</code></pre>
+    </section>
+
+    <section aria-labelledby="writing-decks">
+      <h2 id="writing-decks">Principles for writing your own decks</h2>
+      <ul>
+        <li><strong>Units are always cgs + eV.</strong> Length cm, time s, density g/cm³, temperature eV. To write in µm, define <code>um = 1.0e-4</code> yourself and convert. Only keys whose names state a unit (<code>wavelength_nm</code>, …) are exceptions.</li>
+        <li><strong>Spatial profiles and time waveforms are functions.</strong> <code>Geometry.rho</code>/<code>Te</code>/<code>Ti</code>/<code>volfrac</code> are vector-evaluated once over cell-center coordinates, laser powers and Marshak temperatures once over time, and frozen into tables. A deck that relies on mutable external state or per-step re-evaluation is incorrect.</li>
+        <li><strong>Unwritten keys take defaults.</strong> The canonical defaults are <code>docs/SPECIFICATION.md</code> §9.1. When unsure, leave the key out and confirm effective values in the validate summary and <code>config/*_frozen.json</code>.</li>
+        <li><strong>Typos stop the run.</strong> Unknown blocks or keys, numbers where strings belong, negative cell counts, and combinations unsupported in the chosen dimension are a <code>ConfigError</code>, never silently ignored. When a "did you mean …?" suggestion appears, apply it.</li>
+        <li><strong>Add physics one piece at a time.</strong> The opt-in packages (CBET, hot electrons, SNB, viscosity, burn, …) are contractually inert unless written. Bring a new deck up first on a small mesh with a short <code>t_end</code>, then raise the resolution and output cadence to production values.</li>
+      </ul>
+    </section>
+
+    <section aria-labelledby="during-run">
+      <h2 id="during-run">What you see while it runs</h2>
+      <p><code>run</code> first validates and freezes the deck (the same checks as validate), builds the mesh and initial state, and enters the time loop. From there the log carries step progress, and every snapshot/checkpoint write emits a line like <code>[output] wrote snapshot (step=…, …)</code>. Logs go both to the console and to <code>outputs/&lt;name&gt;/log/</code>.</p>
+      <p>When "\(\Delta t\) keeps shrinking and the run crawls", read the limiter name in the log (<code>hydro</code>, <code>conduction</code>, <code>braginskii</code>, …) to identify the limiting kernel, then revisit that physics (floors, zoning). The decision rule and every kernel's formula are collected on <a href="../overview/timestep.html">Time-step control &amp; CFL</a>.</p>
+    </section>
+
+    <section aria-labelledby="outputs">
+      <h2 id="outputs">Output locations</h2>
+      <p>Plots, history, and checkpoints go under <code>Output.directory</code>; <code>outputs/&lt;name&gt;</code> is the standard organization. The directory contents (<code>results/</code>, <code>config/</code>, <code>checkpoints/</code>, <code>log/</code>, <code>run_info.json</code>), file naming, and the complete dataset enumeration are on <a href="outputs.html">Outputs &amp; analysis</a>. <code>plot_every</code>, <code>history_every</code>, <code>checkpoint_every</code> are step-count cadences (0 disables); the <code>_s</code> variants (<code>plot_every_s</code>, …) are seconds-based, and both fire under OR logic. <strong>To specify cadence in time, always use the <code>_s</code> keys</strong> — a classic unit accident otherwise.</p>
+    </section>
+
+    <section aria-labelledby="restart">
+      <h2 id="restart">Checkpoints and restart</h2>
+      <p>A restarting deck sets <code>Main.restart_from</code> to a checkpoint prefix — e.g. <code>Main(..., restart_from="outputs/minimal_1d/checkpoints/minimal_1d_ckpt_0100")</code>, i.e. the prefix without any rank suffix or <code>.h5</code>. The restart inherits the stored state, time, and time step, and continues the original output layout. If no checkpoint matches the prefix, or the frozen configuration disagrees (dimension, mesh, materials, groups, seed), the run fails before starting.</p>
+    </section>
+
+    <section aria-labelledby="troubleshooting">
+      <h2 id="troubleshooting">When it does not work</h2>
+      <table class="quick-facts">
+        <thead><tr><th>Symptom</th><th>Cause and fix</th></tr></thead>
+        <tbody>
+          <tr><th><code>ConfigError: ... is not a supported key (did you mean 'X'?)</code></th><td>A typo; apply the suggestion.</td></tr>
+          <tr><th><code>ConfigError: eos.file is required for model=sesame</code></th><td>Table EOS models need their file. Use <code>ideal_gas</code> while learning.</td></tr>
+          <tr><th>Errors on <code>Radiation.mode="imc_ddmc"</code></th><td>The old Monte Carlo transport is retired. Omit the mode (= FLD default) or use <code>sn_transport</code>. The <code>imc=dict(...)</code>/<code>ddmc=dict(...)</code> subblocks are likewise retired-path compatibility keys.</td></tr>
+          <tr><th>Ran again but results look stale</th><td>The output directory collided and results went to a numbered <code>_001</code> sibling; check the location.</td></tr>
+          <tr><th>No heating / the wave does not move</th><td>Check the enabled modules in the validate summary first, then the effective boundary/opacity values in <code>config/*_frozen.json</code>.</td></tr>
+          <tr><th>\(\Delta t\) shrinks forever</th><td>Identify the limiting kernel from the limiter name in the log (<a href="../overview/timestep.html">Time-step control</a>). Falling below <code>dt.min_s</code> stops FATAL.</td></tr>
+          <tr><th>CMake / build-stage failures</th><td>See <a href="building.html">Building</a> and <a href="requirements.html">System requirements</a>.</td></tr>
+        </tbody>
+      </table>
+      <p>The efficient inspection order is ① the validate summary → ② <code>config/*_frozen.json</code> (effective values) → ③ warnings in <code>log/</code>.</p>
+    </section>
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["\\[", "\\]"]] } };</script>
+  <script defer src="../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../nav.js" data-page="running" data-root="../"></script>
+</body>
+</html>

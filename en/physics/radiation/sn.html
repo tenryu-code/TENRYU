@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="en" data-lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Radiation: S_N transport — TENRYU Documentation</title>
+  <link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>Radiation: S<sub>N</sub> transport <span class="badge">reference</span></h1>
+    <p class="abstract">TENRYU's \(S_N\) solver is deterministic discrete-ordinates radiation transport for 1D — spherical by default, with planar and cylindrical <code>Mesh.geometry_1d</code> measures also supported (cylindrical uses a product quadrature with \(n=2L^2\) ordinates) — and 2D axisymmetric RZ geometry. It follows finite directions in every photon-energy group, then forms cell energies and face fluxes from directional intensities. It complements <a href="fld.html">multigroup FLD</a> when optically thin streaming or strong anisotropy matters, at the cost of angular sweeps and source iterations whose work grows with ordinate count.</p>
+
+    <aside class="planned" aria-labelledby="at-a-glance">
+      <h3 id="at-a-glance">At a glance</h3>
+      <ul>
+        <li>For each group, intensities \(\psi_{g,m}\) are solved along discrete directions \(\boldsymbol\mu_m\); \(E_g=\sum_m w_m\psi_{g,m}/c\) and face fluxes come from the same angular states.</li>
+        <li>2D RZ uses a product level-symmetric quadrature and sign-ordered wavefront sweeps, with reflective parity on the axis.</li>
+        <li>Pure <code>sn_transport</code> bypasses Fleck linearization and passes raw \(\sigma^{PA}\) and \(\sigma^{PE}\) into a conservative active-set material closure.</li>
+        <li>An inner iteration converges the scattering source; a Picard outer iteration refreshes opacities and electron temperature.</li>
+      </ul>
+    </aside>
+
+    <section aria-labelledby="mechanism">
+      <h2 id="mechanism">The physics: when direction is the answer</h2>
+      <p>FLD collapses the angular distribution into a scalar energy and a closure for its flux. Wherever photons stream through a transparent region, cast a shadow, or arrive from discrete directions—as in burn-through, gaps, and direct illumination—the angular distribution itself is part of the answer. Discrete ordinates replaces the continuous direction sphere by a quadrature set \(\{\boldsymbol\mu_m,w_m\}\), solves the transport equation along each fixed direction, and rebuilds radiation moments from weighted sums.</p>
+      <p>For one direction, the steady streaming–absorption operator is a first-order advection equation, so a cell depends only on its upwind neighbors and the mesh is solved in one upwind-to-downwind pass: a sweep. In RZ geometry each sign combination advances as a diagonal \(k=i+j\) wavefront. TENRYU's production linear-characteristic scheme integrates the exponential attenuation of a constant source exactly along the characteristic through each cell. Classic diamond differencing instead treats the cell average as the arithmetic mean of the inflow and outflow faces — an extrapolation that can produce negative intensities in optically thick cells — whereas the characteristic state is always positive for a nonnegative source.</p>
+      <p>Collisions make the directions communicate. In the discrete-ordinates method, an isotropic source term couples the sweeps through the angular scalar flux, so the sweeps sit inside a source iteration whose convergence slows as the scattering ratio — the scattered fraction of total extinction — approaches one; optional DSA (diffusion synthetic acceleration) accelerates that slow error mode. In TENRYU v1.0 the physical scattering opacity is zero (\(\sigma_{s,g}=0\) — see <a href="../../overview/numerics-foundations.html">Numerical foundations</a>), so this machinery serves the isotropically re-emitted source and the angular redistribution of curved geometry, and would carry a future physical-scattering table. Outside it, a Picard loop refreshes \(T_e\), Planck weights, and opacities and closes matter coupling with a cell-local active-set Newton solve — “active-set” meaning the nonnegativity-constrained groups are identified and held at their bound while the unconstrained set is solved. Unlike FLD, pure <code>sn_transport</code> has no Fleck effective scattering: \(f=1\), and the raw \(\sigma^{PA}\) and \(\sigma^{PE}\) enter the nonlinear energy balance.</p>
+      <p>Direction also has memory. TENRYU persists the previous step's directional intensity in <code>sn_psi_prev</code>; reconstructing it isotropically from scalar energy every step would turn free streaming into artificial diffusion. The price of that fidelity is work scaling approximately as cells × groups × ordinates × iterations, plus angular and face workspaces. This remains the same static-medium approximation as FLD — no material-motion \(O(v/c)\) terms are present (the scope decision recorded in the repository's <code>docs/NUMERICS.md</code> §1.2).</p>
+    </section>
+
+    <section aria-labelledby="angular-discretization">
+      <h2 id="angular-discretization">Angular discretization and transport moments</h2>
+      <p>The discrete-ordinates method replaces continuous angle space by a finite set \(\{\boldsymbol\mu_m,w_m\}\). In 1D spherical geometry TENRYU uses even-order Gauss–Legendre sets, with \(S_{16}\) as the production default. \(S_8\) is an allowed performance choice, but validation warns about the tradeoff and an S8/S16 convergence gate covers it. In 2D RZ, a product level-symmetric quadrature supplies \(\boldsymbol\mu_m=(\mu_{R,m},\mu_{Z,m})\), with azimuthal weights folded into the axisymmetric solve.</p>
+      <p>The angular sweep produces cell-average intensity. Scalar flux and radiation energy density are</p>
+      $$
+      \phi_{c,g}=\sum_m w_m\psi_{c,g,m},
+      \qquad E_{c,g}=\frac{\phi_{c,g}}{c}.
+      $$
+      <p>Face states use the same ordinate set, giving the signed flux on an R or Z face \(f\),</p>
+      $$
+      F^{SN}_{f,g}=\sum_m w_m\,\mu^{face}_m\,\psi^{face}_{m,g}.
+      $$
+      <p>The global sign is positive \(+R\) on radial faces and \(+Z\) on axial faces. Forming cell and face moments from one angular solution ties the streaming update and boundary escape ledger to the same transport operator.</p>
+      <ul>
+        <li>\(\{\boldsymbol\mu_m,w_m\}\) is the angular quadrature: direction cosines and their integration weights. 1D spherical geometry uses even-order Gauss–Legendre sets with \(S_{16}\) as the production default; 2D RZ uses a product level-symmetric set. The weights are normalized to the angular measure — the 1D Gauss–Legendre set sums to \(\int_{-1}^{1}d\mu=2\), with the azimuthal integral folded into \(\psi\) — so \(\sum_{\mu_m>0}w_m\mu_m=1/2\); that half-range moment is what makes <a href="#boundaries-choice">the Marshak normalization below</a> come out.</li>
+        <li>\(\phi_{c,g}=\sum_mw_m\psi_{c,g,m}\) is the zeroth angular moment, or scalar flux, and \(E_{c,g}=\phi_{c,g}/c\) is the group radiation energy density stored in the cell.</li>
+        <li>\(F^{SN}_{f,g}\) is the first angular moment on a face. Its sign is global rather than cell-outward, so one unique value enters the two neighboring cell divergences with opposite signs.</li>
+        <li>The donor-\(\theta\) limiter is an export limiter on that face moment. It scales an outgoing face flux only when its upwind cell would otherwise send more radiation energy than is available during the step.</li>
+        <li>\(\psi_{\rm in}\) is the prescribed incoming half-range intensity at a boundary. On a 2D Marshak face, \(\psi_{{\rm in},m}=2F_{\rm inc}\) makes the discrete half-range first moment equal the requested incident flux: with \(\sum_{\mu_m&gt;0}w_m\mu_m=1/2\), the moment \(\sum_{\mu_m&gt;0}w_m\mu_m\,(2F_{\rm inc})=F_{\rm inc}\).</li>
+      </ul>
+
+      <figure>
+        <img src="../../../assets/radiation-sn-rz-ordinates.png" width="920" height="651" style="max-width:100%;height:auto" alt="A fan of discrete ordinates in an RZ quadrant and diagonal wavefronts ordered from upwind to downwind">
+        <figcaption>Figure A. For one ordinate, its signs select the upwind faces and cells advance by wavefront index. Deterministic direction-order reductions then form scalar and pressure moments and unique-face fluxes.</figcaption>
+      </figure>
+    </section>
+
+    <section aria-labelledby="rz-sweeps">
+      <h2 id="rz-sweeps">Sweeps and the finite-volume update on RZ meshes</h2>
+      <p>Each 2D RZ source iteration sweeps the structured mesh from upwind to downwind for every group and direction. Production executes four ordered angular-quadrant launches — one per \((\mu_R,\mu_Z)\) sign combination — each with a wavefront order that respects R and Z dependencies. Per-direction cell averages and face states occupy private workspaces and are reduced in increasing direction index. This exposes direction parallelism while fixing accumulation order.</p>
+      <p>The default <code>spatial_scheme="linear_characteristic"</code> (LC) integrates exponential attenuation through a constant-source cell. The older <code>diamond_difference</code> (DD) path is a deprecated regression option. LC preserves thin-limit finite-volume source scaling while replacing extrapolated DD outflow by a positive characteristic state for nonnegative sources.</p>
+      <p>For a cell \(c=(i,j)\), the streaming-only state comes from the unique-face flux divergence:</p>
+      $$
+      E^{*,flux}_{i,j,g}=E^n_{i,j,g}-\Delta t\,
+      \frac{A^R_+F^R_+-A^R_-F^R_-+A^Z_+F^Z_+-A^Z_-F^Z_-}{V_{i,j}}.
+      $$
+      <p>Here \(A^R=2\pi r\Delta z\) and \(A^Z=\pi(r_+^2-r_-^2)\). The axis face has zero area and its buffers are zeroed before evaluating divergence. \(E^{*,flux}\) is not floored. A donor-\(\theta\) limiter instead scales outgoing flux when a cell would export unavailable energy. Each shared face retains one value, so adjacent-cell contributions cancel.</p>
+    </section>
+
+    <section aria-labelledby="matter-coupling">
+      <h2 id="matter-coupling">Same-time collisions, material closure, and iteration</h2>
+      <ol>
+        <li><p><strong>Construct quadrature and dependency order.</strong> Build the even-order Gauss–Legendre set in 1D or the product level-symmetric set in RZ, including reflective-parity maps. RZ forms four ordered sign-quadrant launches and the upwind dependency wavefront for each direction; the direction index is also the fixed later reduction order.</p></li>
+        <li><p><strong>Sweep each group and direction.</strong> The backward-Euler ordinate equation combines the persisted transient source from <code>sn_psi_prev</code>, streaming, same-time extinction, lagged isotropic scattering, and material emission. The production LC path integrates the constant-source exponential attenuation from each upwind state. Cell averages and downwind face states are written to private per-direction workspaces, preventing cross-direction accumulation races.</p></li>
+        <li><p><strong>Reduce angular moments deterministically.</strong> After the directional sweeps, kernels sum private workspaces in increasing direction index to form \(\phi\), \(P_{rr}\) (the rr component of the second angular moment — the radiation-pressure moment, kept diagnostically), and the unique R/Z face fluxes. This preserves the prior serial-direction accumulation order bit-exactly while exposing direction-level parallelism.</p></li>
+        <li><p><strong>Apply conservative streaming.</strong> The unique face moments enter the finite-volume flux-divergence equation above. A two-pass donor-\(\theta\) construction first caps each donor by stored energy, then credits only inflow that the upstream pass-1 donors can deliver; each face flux is finally scaled once by its upwind donor. The streaming state \(E_g^{*,flux}\) is not floored, and the limited flux remains single-valued so internal-face contributions cancel.</p></li>
+        <li><p><strong>Converge same-time scattering.</strong> At a fixed matter state, the inner unknown is the scalar flux \(\phi_{c,g}\): the isotropic source needs \(\phi\), but \(\phi\) is only known after sweeping with that source. Source iteration closes this circularity by plain substitution — each pass solves every direction exactly for the lagged source, then rebuilds the source from the new \(\phi\) — and stops when the relative scalar-flux change between passes satisfies <code>inner_tol</code> (default <code>1e-6</code>). Per-group DSA is optional and accelerates the source-iteration error without replacing the high-order face flux.</p></li>
+        <li>
+          <p><strong>Close matter in the outer Picard loop.</strong> Pure <code>sn_transport</code> sets \(f=1\), uses raw \(\sigma^{PA}_g\) for absorption/deposition and \(\sigma^{PE}_g\) for emission, and solves the cell-local active-set balance</p>
+          $$
+          F(T_e)=\rho\frac{e_e(\rho,T_e)-e_e(\rho,T_e^n)}{\Delta t}
+          -\sum_g c\sigma^{PA}_gE_g
+          +\sum_g c\sigma^{PE}_g a_{eV}T_e^4b_g(T_e)=0.
+          $$
+          <p>Here \(a_{\rm eV}\) is the eV-unit radiation constant, and the \(E_g\) in the balance stands schematically for the group energies being closed. The closure's input is the streamed, pre-coupling \(E_g^*\) (the \(E^{*,flux}_g\) above, which remains unfloored); what the closure returns is the nonnegative group energy \(E_g^+(T_e)\) consistent with the temperature \(T_e\). Positivity applies only to that final \(E_g^+(T_e)\), and the residual evaluation and writeback use the identical active-set state. Updated \(T_e\), \(b_g\), and opacities return to the sweeps, with</p>
+          $$
+          r_k=\max_c\frac{|T^{k+1}_{e,c}-T^k_{e,c}|}
+          {\max(T^{k+1}_{e,c},T_{floor})}
+          $$
+          <p>tested against \(r_{\rm tol}=\max(\texttt{outer_tol},10\,\texttt{outer_tol_hydro_error_scale})\) (defaults \(10^{-4}\) and \(10^{-5}\)); <code>max_outer_iterations</code> defaults to 20. The outer unknown is thus \(T_e\), with \(b_g\) and the opacities riding on it; like the inner loop, the update is undamped Picard substitution, and every outer pass re-solves the transport anchored at the same step-entry state — the transient source from \(\psi^n\) (<code>sn_psi_prev</code>) and the matter balance at \(e_e(\rho,T_e^n)\) — so a pass replaces the iterate rather than accumulating on it. If the cap is exhausted without meeting \(r_{\rm tol}\), the final iterate is accepted with <code>sn_converged</code> left false. In 2D RZ, three consecutive inner-residual plateau comparisons satisfying \(|r_k^{\rm inner}-r_{k-1}^{\rm inner}|\le10^{-6}\max(|r_k^{\rm inner}|,|r_{k-1}^{\rm inner}|,10^{-300})\) stop redundant identical-input sweeps. That exit records <code>sn_outer_stagnated=true</code> and, if <code>inner_tol</code> was not met, keeps <code>sn_converged=false</code> — these are internal solver-state flags surfaced through run-log warnings and driver diagnostics, not namelist keys or output datasets.</p>
+        </li>
+        <li><p><strong>Close the transport ledger.</strong> The converged fields define <code>rad_dep</code> \(=c\sigma^{PA}E_gV\Delta t\) and <code>rad_emit</code> \(=c\sigma^{PE}a_{\rm eV}T_e^4b_gV\Delta t\). Boundary escape is integrated from the same \(\theta\)-limited unique-face array consumed by the streaming update; Marshak inflow is paired separately. One value per shared face makes interior divergence telescope, leaving only radiation–matter exchange and the discrete boundary integral.</p></li>
+      </ol>
+    </section>
+
+    <section aria-labelledby="boundaries-choice">
+      <h2 id="boundaries-choice">Boundary conditions and choosing S<sub>N</sub> versus FLD</h2>
+      <p>The \(R=0\) axis uses reflective ordinate parity. Outer R is vacuum by default, with zero incoming intensity; reflect supports closed-cylinder benchmarks in 2D. Bottom and top Z faces may independently be vacuum, reflect, or Marshak. A 2D Marshak face injects steady grey flux \(F_{inc}\) as \(\psi_{in,m}=2F_{inc}\), normalized so the half-range quadrature moment equals the requested flux. Its discrete net boundary flux drives both the finite-volume update and escape accounting.</p>
+      <p>Choose \(S_N\) when a transparent gap, free-streaming front, directional illumination, shadow, or ray effect makes angular distribution part of the answer. FLD closes angle dependence into scalar energy and limited diffusive flux, and is generally cheaper in optically thick, nearly isotropic regions. \(S_N\) work scales approximately as cells × groups × ordinates × iterations and needs angular and face workspaces. Lower order costs less but increases angular truncation and ray effects, so quantities of interest should be checked on an S8/S16/S32 ladder.</p>
+    </section>
+
+    <section aria-labelledby="controls">
+      <h2 id="controls">Selected namelist keys</h2>
+      <p>These are selected controls under <code>Radiation</code>. See the <a href="../../use/namelist.html">namelist reference</a> for the complete schema and combination rules.</p>
+
+      <aside class="planned" aria-labelledby="boundary-key-note">
+        <h3 id="boundary-key-note">Important boundary-key rule</h3>
+        <p>\(S_N\) <strong>face types</strong> belong under <code>Radiation.sn_transport.boundary</code>. This mirrors FLD's mode-specific <code>Radiation.multigroup_diffusion.boundary</code> nesting; face types do not belong under top-level <code>Radiation.boundary</code>.</p>
+      </aside>
+
+      <table class="quick-facts">
+        <thead>
+          <tr><th>Key</th><th>Default / example</th><th>Purpose</th></tr>
+        </thead>
+        <tbody>
+          <tr><th><code>Radiation.mode</code></th><td><code>"sn_transport"</code></td><td>Select this deterministic discrete-ordinates solver.</td></tr>
+          <tr><th><code>Radiation.groups</code></th><td><code>1</code></td><td>Number \(G\) of photon-energy groups, shared with FLD.</td></tr>
+          <tr><th><code>Radiation.group_bounds_eV</code></th><td>\(G+1\) entries</td><td>Energy-group boundaries in eV, shared with FLD.</td></tr>
+          <tr><th><code>Radiation.sn_transport.n_angles</code></th><td><code>16</code></td><td>Ordinate count or representative quadrature order.</td></tr>
+          <tr><th><code>Radiation.sn_transport.spatial_scheme</code></th><td><code>"linear_characteristic"</code></td><td>Production LC sweep; DD remains for regression.</td></tr>
+          <tr><th><code>Radiation.sn_transport.max_outer_iterations</code></th><td><code>20</code></td><td>Cap on material/opacity Picard iterations.</td></tr>
+          <tr><th><code>Radiation.sn_transport.outer_tol</code></th><td><code>1e-4</code></td><td>Base electron-temperature Picard tolerance.</td></tr>
+          <tr><th><code>Radiation.sn_transport.inner_tol</code></th><td><code>1e-6</code></td><td>Scalar-flux source-iteration tolerance.</td></tr>
+          <tr><th><code>Radiation.sn_transport.boundary.inner_r / outer_r</code></th><td><code>"reflect_parity" / "vacuum"</code></td><td>Axis parity and outer-R face type.</td></tr>
+          <tr><th><code>Radiation.sn_transport.boundary.z / z_bottom / z_top</code></th><td><code>"vacuum"</code></td><td>Common or face-specific 2D Z boundary; reflect and Marshak are available.</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section aria-labelledby="verification">
+      <h2 id="verification">Verification</h2>
+      <ul>
+        <li><code>test_r2_quadrature_sweep</code> runs a 2D RZ 8/16/32-ordinate ladder and gates monotone Cauchy convergence toward the 32-ordinate reference.</li>
+        <li><code>test_sn_1d_s8_vs_s16_convergence</code> requires the maximum relative \(S_8\)-versus-\(S_{16}\) energy difference on a <a href="../../verification/index.html#gxii">GXII</a>-like 1D profile to be \(<0.05\), gating the lower-cost \(S_8\) option.</li>
+        <li><code>test_sn_face_flux_conservation</code> and <code>test_sn_2d_rz_step_total_energy_conservation</code> cover single-valued face fluxes, divergence, and the step ledger; the 2D step-total-energy identity is gated at \(10^{-10}\). <code>test_sn_2d_rz_bug25_escape_ledger</code> matches escape to the discrete boundary-face integral to \(10^{-12}\) relative.</li>
+        <li>The permanent I6 G1 gate <code>test_sn_2d_rz_mg_grey_collapse</code> requires the relative L2 difference \(\varepsilon_2\le10^{-6}\) for both \(\sum_gE_g\) and \(\sum_gF_{z,g}\) versus the grey run. For \(G=8\), production <code>inner_tol=1e-6</code> measured \(4.5\times10^{-9}\) in energy and \(3.0\times10^{-7}\) in \(F_z\); tightening <code>inner_tol</code> to \(10^{-12}\) recovered \(6.4\times10^{-15}\) and \(2.9\times10^{-13}\), with a required \(10^{-12}\) mechanism-closure ceiling. A coupled follow-on certification (I6 G2) extends this gate.</li>
+        <li>The R2 Marshak profile comparison is gated at 0.15 against its independent reference; the production \(S_{16}\) deck measured \(7.94\times10^{-3}\).</li>
+      </ul>
+    </section>
+
+    <section aria-labelledby="references">
+      <h2 id="references">References</h2>
+      <ol class="references">
+        <li>J. A. Fleck, Jr. and J. D. Cummings, "An Implicit Monte Carlo Scheme for Calculating Time and Frequency Dependent Nonlinear Radiation Transport," J. Comput. Phys. 8, 313–342 (1971). <a href="https://doi.org/10.1016/0021-9991(71)90015-5">doi:10.1016/0021-9991(71)90015-5</a></li>
+        <li>M. L. Adams and E. W. Larsen, "Fast Iterative Methods for Discrete-Ordinates Particle Transport Calculations," Prog. Nucl. Energy 40, 3–159 (2002). <a href="https://doi.org/10.1016/S0149-1970(01)00023-3">doi:10.1016/S0149-1970(01)00023-3</a></li>
+        <li>E. W. Larsen, "Unconditionally Stable Diffusion-Synthetic Acceleration Methods for the Slab Geometry Discrete Ordinates Equations. Part I: Theory," Nucl. Sci. Eng. 82, 47–63 (1982). <a href="https://doi.org/10.13182/NSE82-1">doi:10.13182/NSE82-1</a></li>
+        <li>J. E. Morel and G. R. Montry, "Analysis and Elimination of the Discrete-Ordinates Flux Dip," Transp. Theory Stat. Phys. 13, 615–633 (1984). <a href="https://doi.org/10.1080/00411458408211661">doi:10.1080/00411458408211661</a></li>
+        <li>B. G. Carlson, "Solution of the Transport Equation by S<sub>N</sub> Approximations," Los Alamos Scientific Laboratory Report LA-1891 (1955). <a href="https://doi.org/10.2172/4376236">doi:10.2172/4376236</a></li>
+      </ol>
+    </section>
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["$$", "$$"], ["\\[", "\\]"]] } };</script>
+  <script defer src="../../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../../nav.js" data-page="radiation-sn" data-root="../../"></script>
+</body>
+</html>

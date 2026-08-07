@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en" data-lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Verification philosophy — TENRYU Documentation</title>
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>Verification philosophy <span class="badge">reference</span></h1>
+    <p class="abstract">TENRYU verification accumulates evidence from small analytic gates with closed-form solutions and invariants, through frozen-deck goldens and run-to-run reproducibility, to integrated 2D RZ batteries and cross-code benchmarks. A higher rung does not replace a lower gate: each is a different oracle for a different failure class. Changes may not regress applicable gates, and exceptions require a documented scope and rationale.</p>
+
+    <aside class="planned" aria-labelledby="at-a-glance">
+      <h3 id="at-a-glance">At a glance</h3>
+      <ul>
+        <li>Analytic gates compare against known solutions, independent integrals, conservation identities, or convergence and localize sign, unit, coefficient, and boundary errors.</li>
+        <li>A golden is a change detector for one grid and run profile, not proof of correctness or grid convergence.</li>
+        <li>Deterministic 1D paths require bitwise run-to-run identity with the same binary, input, and GPU configuration.</li>
+        <li>Only documented 2D RZ <code>atomicAdd</code>-order effects use deck- and metric-specific noise bands.</li>
+      </ul>
+    </aside>
+
+    <section aria-labelledby="meaning">
+      <h2 id="meaning">What verification answers</h2>
+      <p>Verification asks whether the implemented numerical method solves its equations and discrete contract correctly. Validation—whether the modeled physics adequately agrees with experiment—is a different question. TENRYU checks Hydro, Conduction, Radiation, and Laser against known or reference solutions and convergence, then tests unit boundaries, conservation ledgers, and coupling between modules. Small discriminating tests are especially important for failures such as confusing mass opacity \(\kappa\) [cm²/g] with length opacity \(\sigma\) [cm⁻¹], where a run may finish while the physics is wrong by a large factor.</p>
+      <p>The foundational organization is unit, integration, and regression, but operationally five gate classes make the evidence clearer. Small gates narrow the source of a failure. Coupled batteries ask whether individually correct components remain consistent inside the production time loop, mesh update, EOS closure, and energy ledger. Cross-code comparisons expose trends and implementation differences, but they cannot substitute for internal verification or experimental validation.</p>
+    </section>
+
+    <section aria-labelledby="taxonomy">
+      <h2 id="taxonomy">Gate taxonomy</h2>
+      <table class="quick-facts">
+        <thead>
+          <tr><th>Gate class</th><th>Oracle and scope</th><th>Representative examples</th></tr>
+        </thead>
+        <tbody>
+          <tr><th>1. Analytic / unit</th><td>Compares one kernel, discrete operator, or conservation identity with a closed form, independent integral, eigenvalue, or published solution.</td><td>Sedov/Noh, Marshak spectrum, SNB dispersion, Beer–Lambert, and laser refraction.</td></tr>
+          <tr><th>2. Golden regression</th><td>Compares history metrics from a frozen deck and run profile with an approved JSON baseline under metric-specific tolerances.</td><td><code>verify_gxii_1d_fld_regression</code>: absorbed energy, bang, peak density, ρR, and central temperature.</td></tr>
+          <tr><th>3. Reproducibility</th><td>Compares replicas of one input, and rank counts where applicable, under T-bit (bitwise), T-sum (reduction-order band), or T-noise (documented 2D <code>atomicAdd</code> band) contracts — see the <a href="../verification/index.html#reproducibility">reproducibility legend</a>.</td><td>Deterministic 1D fields/diagnostics and replica or OFF-bit legs in coupled batteries.</td></tr>
+          <tr><th>4. Integrated battery</th><td>Exercises Hydro, radiation, materials, mesh behavior, and boundary ledgers together in the production loop.</td><td>I1 grey radshock, I2 multigroup FLD collapse, and I3 S<sub>N</sub> radshock ladder.</td></tr>
+          <tr><th>5. Cross-code</th><td>Compares profiles, trends, and absorption with another implementation after matching the physical meaning of inputs.</td><td>The HELIOS 1D matched-irradiation LTE campaign.</td></tr>
+        </tbody>
+      </table>
+      <p>This is not a simple ranking of strength. An analytic gate has a powerful oracle over a narrow surface; an integrated battery covers a broad surface with many components at once. The battery cannot retire the analytic test because compensating errors can hide a wrong sign in one operator. Conversely, passing every unit gate cannot expose coupling defects such as the wrong operator order, stale EOS state, an inconsistent mesh update, or double injection of a source.</p>
+    </section>
+
+    <section aria-labelledby="oracle-tolerances">
+      <h2 id="oracle-tolerances">Designing oracles and tolerances</h2>
+      <p>A useful gate does not build its reference by calling the same production helper that could contain the defect. Where practical, TENRYU uses an independent integral, analytic shock position, discrete eigenvalue, or published solution. Measurements follow the problem: Sedov and Noh inspect front location, plateau, and conservation; multigroup Marshak uses an independent Planck integral; Beer–Lambert checks a known optical depth. Mere run completion is a smoke test, not an accuracy oracle.</p>
+      <p>Tolerances are properties of the oracle and numerical noise, not one convenient percentage applied everywhere. A deterministic attenuation trace can use a tight relative error. A shock-capturing profile must account for grid error and the measurement estimator. A stochastic method needs confidence intervals or particle-count convergence. A physical model band is also kept separate from discrete-operator accuracy: widening a band must not make a known model limit appear certified.</p>
+    </section>
+
+    <section aria-labelledby="golden-policy">
+      <h2 id="golden-policy">Goldens and re-baselining</h2>
+      <p>The <a href="../verification/index.html#gxii">GXII</a> 1D FLD golden (GXII: the GEKKO XII laser benchmark defined on the Verification page) is a production-trajectory regression through laser deposition, Hydro, Conduction, two-temperature matter, and FLD. Rather than comparing only a final file, it extracts absorbed laser energy, bang time, <code>rho_peak_max</code>, areal density <code>rhoR_max</code>, and central temperature <code>Tc_max</code> from history and applies each metric's contract. A mismatched <code>run_profile</code> fails the comparison, preventing a shortened run or different grid from masquerading as the same baseline.</p>
+      <p>A golden is a change detector on the same grid and profile. Agreement does not prove analytic correctness or grid convergence. Re-baselining requires a known bug fix, an intentional physics-algorithm or baseline-parameter change, or another explicit reason approved by the code owner. The update must state why, quantify old-to-new differences, provide convergence data across resolutions, and receive review. A currently failing run, or the fact that copying its values would make CI green, is not a rationale. Relaxing a tolerance follows the same policy.</p>
+    </section>
+
+    <section aria-labelledby="reproducibility-policy">
+      <h2 id="reproducibility-policy">Reproducibility and the bounded 2D exception</h2>
+      <p>A deterministic 1D path must produce bitwise-identical fields and primary diagnostics between replicas using the same binary, namelist, and GPU configuration. A physics gate may retain a percent tolerance for toolchain portability, but that width does not authorize same-configuration run-to-run drift. Fixed-order reductions and private accumulation, such as the deterministic 1D laser-deposition path, are therefore part of the algorithmic contract. The requirement is the same numerical trajectory, not merely two answers near one target.</p>
+      <p>Some 2D RZ corner-force and tally paths use <code>atomicAdd</code> from many threads. Variation in addition order can introduce least-significant-bit differences. For this documented mechanism only, bitwise equality is the wrong oracle; acceptance uses a band self-calibrated from same-configuration replicas or a frozen ensemble band. Long cases distinguish a clean first-step audit from a terminal growth band appropriate to run length. This T-noise contract names its deck and metrics. It is not a blanket tolerance for all 2D results: deterministic intermediates, 1D legs, and quantities unrelated to the known noise remain bitwise or retain their original tight gates.</p>
+    </section>
+
+    <section aria-labelledby="change-policy">
+      <h2 id="change-policy">Conditions for accepting a change</h2>
+      <p>A change to physics, numerics, parallel reduction, or an output metric must pass the affected existing gates and place any new contract at the appropriate rung of the taxonomy. An improved integrated result cannot offset a regressed analytic gate, and updating a golden cannot hide the regression. If an exception is necessary, its test, metric, configuration, physical or numerical rationale, alternative oracle, and duration or permanent contract must be documented. A skip is not a pass; an environment-dependent non-run retains its status and execution log.</p>
+      <p>The purpose is not to prevent change, but to make clear what changed, which evidence supports it, and which guarantees remain. Analytic, golden, reproducibility, battery, and cross-code evidence need not produce the same kind of answer. Each watches its own failure class, and every applicable contract must remain non-regressed after the change. That layered, explicit evidence is the TENRYU verification gate.</p>
+    </section>
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["\\[", "\\]"]] } };</script>
+  <script defer src="../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../nav.js" data-page="verification-philosophy" data-root="../"></script>
+</body>
+</html>

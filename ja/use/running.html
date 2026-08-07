@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="ja" data-lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>シミュレーションの実行 — TENRYU ドキュメント</title>
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>シミュレーションの実行 <span class="badge">reference</span></h1>
+    <p class="abstract">このページは、ビルド済みの <code>build/tenryu</code> を前提に、「最初の 1 本を完走させる → 自分のデッキを書く → つまずいたら直す」までを通しで説明する。TENRYU の入力は 1 個の Python ファイル（namelist デッキ）である。Python の関数は初期化時に評価して表へ凍結されるため、時間ループの最中に Python が呼ばれることはない。</p>
+
+    <aside class="planned" aria-labelledby="at-a-glance">
+      <h3 id="at-a-glance">要点</h3>
+      <ul>
+        <li>CLI は 4 つ: <code>run</code>（実行）・<code>validate</code>（実行せず検査）・<code>verify</code>（登録済み検証ケース）・<code>freeze</code>（凍結 JSON の出力）。<strong>run の前に必ず validate</strong> — 設定ミスは実行前にほぼ全部見つかる。</li>
+        <li>最初の 1 本は <code>examples/templates/</code> のテンプレートをそのまま実行すればよい。写経なしで完走する。</li>
+        <li><code>tenryu</code> とは常にビルドされた実行ファイル <code>build/tenryu</code> のことである — インストール手順はない。リポジトリのルートからパス指定で起動するか、<code>build/</code> を <code>PATH</code> に加える。</li>
+        <li>スキーマは厳格である。未知のキー・型違い・不正な組合せは警告ではなくエラーで止まり、打ち間違いには <code>did you mean 'kappa_a'?</code> のような修正候補が出る。</li>
+        <li>同じ出力先へ再実行すると上書きせず <code>_001</code> の連番ディレクトリへ書かれる。「結果が変わらない」と思ったらまず出力先を確認する。</li>
+      </ul>
+    </aside>
+
+    <section aria-labelledby="prereq">
+      <h2 id="prereq">前提</h2>
+      <p>マシン・コンパイラの条件は<a href="requirements.html">動作環境と要求スペック</a>、<code>build/tenryu</code> の作り方は<a href="building.html">ビルド</a>を参照のこと。以下はビルドが済んでいて、リポジトリのルートにいる前提で書く。</p>
+    </section>
+
+    <section aria-labelledby="cli">
+      <h2 id="cli">CLI サブコマンド</h2>
+      <table class="quick-facts">
+        <thead><tr><th>コマンド</th><th>入力</th><th>用途</th></tr></thead>
+        <tbody>
+          <tr><th><code>tenryu validate &lt;deck.py&gt;</code></th><td>任意のデッキ</td><td>実行せずに検査する（数秒）。スキーマ・組合せの検査に加え、次元・格子・材料・物理モジュールの ON/OFF・出力先をまとめた実行前サマリを表示する。<strong>要約を目で確認してから run</strong> — これが最も安上がりなデバッグである。</td></tr>
+          <tr><th><code>tenryu run &lt;deck.py&gt;</code></th><td>任意のデッキ</td><td>本実行。デッキを読み、検証・凍結し、メッシュ・材料表・初期条件を作ってから時間ループに入る。<code>--output-dir &lt;dir&gt;</code> でデッキを編集せずに出力先を上書きできる（新規 run 専用。restart との併用は <code>ConfigError</code>）。</td></tr>
+          <tr><th><code>tenryu verify &lt;name&gt;</code></th><td>登録済みケース名</td><td>解析解・基準解・統合検査の再実行（例: <code>sedov</code>、<code>noh</code>、<code>gxii_1d_fld_regression</code>）。<a href="../verification/index.html">検証とベンチマーク</a>参照。</td></tr>
+          <tr><th><code>tenryu freeze &lt;deck.py&gt;</code></th><td>任意のデッキ</td><td>凍結後の設定 JSON を書き出す。実行せずに「実効値」を確認・差分比較したいときに使う。</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section aria-labelledby="first-run">
+      <h2 id="first-run">最初の 1 本（テンプレートを完走させる）</h2>
+      <p><code>examples/templates/</code> に、全ブロックへコメントを付けた実行可能な雛形が 3 本ある。まずは一番軽い輻射スラブをそのまま動かす。</p>
+      <pre><code># ① 実行前検査（実行しない。数秒で終わる）
+./build/tenryu validate examples/templates/template_1d_slab_radiation.py
+
+# ② 実行
+./build/tenryu run examples/templates/template_1d_slab_radiation.py
+
+# ③ 結果の確認（出力先はデッキの Output(directory=...) が決める）
+ls outputs/template_1d_slab_radiation/results/</code></pre>
+      <p>③ で <code>&lt;name&gt;_0000.h5</code> のようなスナップショットと <code>&lt;name&gt;_history.h5</code> が並んでいれば完走である。実行中はコンソール（と <code>log/</code>）にステップの進行と、<code>[output] wrote snapshot (step=…, …)</code> のような出力イベントの行が流れる。最短の可視化は付属ツールで足りる:</p>
+      <pre><code>python3 -m tools.tenryu_plot profile outputs/template_1d_slab_radiation   # 空間プロファイル
+python3 -m tools.tenryu_plot history outputs/template_1d_slab_radiation   # 時系列</code></pre>
+      <table class="quick-facts">
+        <thead><tr><th>テンプレート</th><th>内容</th><th>学べること</th></tr></thead>
+        <tbody>
+          <tr><th><code>template_1d_slab_radiation.py</code></th><td>平面 1D・灰色 FLD・Marshak 境界駆動・流体 OFF</td><td>放射伝播の最小構成。validate → run → 可視化の流れ。</td></tr>
+          <tr><th><code>template_1d_laser_sphere.py</code></th><td>球 1D・レーザー直接照射・2 温度・伝導 ON</td><td>レーザー波形の書き方、複合物理。</td></tr>
+          <tr><th><code>template_1d_indirect_tr.py</code></th><td>球 1D・Tr(t) 間接照射駆動</td><td>時間依存 callable → 凍結テーブルの流儀。</td></tr>
+        </tbody>
+      </table>
+      <p>改造の定番は、駆動温度・レーザーパワー（callable の返り値）を変える、<code>nr</code> を倍にして収束を見る、<code>Radiation(mode="sn_transport")</code> にして FLD と比べる、の 3 つである。テンプレートは<strong>コピーして名前を変えてから</strong>改造する。物理指標まで確認済みの Studio プリセット 3 種は<a href="examples.html">例題とプリセット</a>にある。</p>
+    </section>
+
+    <section aria-labelledby="deck-anatomy">
+      <h2 id="deck-anatomy">デッキの構造</h2>
+      <p><code>Main</code> はケース名、次元、終了条件を定め、<code>Mesh</code> は計算領域とゾーニングを作る。<code>Materials</code> には EOS と不透明度をもつ材料を登録し、<code>Geometry</code> の関数が初期の体積分率、密度、温度、速度を空間へ割り当てる。<code>Radiation</code> と <code>Laser</code> は演算子を選び、<code>Numerics</code> は時間刻み、流体、熱伝導、ALE と安全のための制御をまとめる。<code>Output</code> はファイルの場所と出力の間隔を、<code>Diagnostics</code> は実行中に集計する量を決める。</p>
+      <p>次は、実在するキーだけで構成した最小の 1 次元球対称のデッキである。単一の理想気体の材料で一様に満たし、輻射・レーザー・熱伝導を無効にしてラグランジュ流体を進める。値は入力形式を説明するためのものであり、物理的なベンチマークではない。</p>
+      <pre><code>from tenryu_namelist import *
+
+fuel = Material(
+    name="fuel", A=2.0, Z=1.0,
+    eos=dict(model="ideal_gas", ideal_gas=dict(gamma=5.0 / 3.0)),
+    opacity=dict(model="constant", kappa_a=0.0, kappa_s=0.0,
+                 units="cm2_per_g"),
+)
+
+Main(name="minimal_1d", dimension="1D_SPH", temperature_model="2T",
+     t_end=1.0e-9, max_steps=1000, seed=12345)
+Mesh(r_min=0.0, r_max=0.05, nr=64, grid="uniform",
+     motion="lagrangian")
+Materials(materials=[fuel])
+Geometry(
+    volfrac=dict(fuel=lambda r_cm: 1.0),
+    rho=lambda r_cm: 1.0,
+    Te=lambda r_cm: 1.0,
+    Ti=lambda r_cm: 1.0,
+    velocity=None,
+    radiation_field="zero",
+)
+Radiation(enabled=False)
+Laser(enabled=False)
+Numerics(
+    dt=dict(initial_s=1.0e-12, max_s=1.0e-10, min_s=1.0e-18,
+            cfl_hydro=0.3),
+    hydro=dict(boundary_1d="free"),
+    conduction=dict(enabled=False),
+)
+Output(directory="outputs/minimal_1d", plot_every=10,
+       history_every=1, checkpoint_every=100)
+Diagnostics(enabled=True, every=1)</code></pre>
+    </section>
+
+    <section aria-labelledby="writing-decks">
+      <h2 id="writing-decks">自分のデッキを書くときの原則</h2>
+      <ul>
+        <li><strong>単位は常に cgs + eV。</strong>長さ cm・時間 s・密度 g/cm³・温度 eV。µm で書きたいときは <code>um = 1.0e-4</code> を自分で定義して換算する。名前が単位を明示するキー（<code>wavelength_nm</code> など）だけが例外である。</li>
+        <li><strong>空間分布と時間波形は関数で与える。</strong><code>Geometry.rho</code>・<code>Te</code>・<code>Ti</code>・<code>volfrac</code> はセル中心座標に対して、レーザーパワーや Marshak 温度は時間に対して、初期化時に一度だけベクトル化評価され、凍結された表へ変換される。関数が外部状態を持ち続けることや、実行中に再評価されることを前提にしたデッキは正しくない。</li>
+        <li><strong>書かなかったキーは既定値になる。</strong>既定値の正典はリポジトリの <code>docs/SPECIFICATION.md</code> §9.1。迷ったら書かず、validate の要約と <code>config/*_frozen.json</code> で実効値を確認するのが安全である。</li>
+        <li><strong>打ち間違いはエラーで止まる。</strong>未知のブロックやキー、文字列を要求する場所への数値、負のセル数、選んだ次元では対応していない組合せは、黙って無視されず <code>ConfigError</code> になる。修正候補（did you mean …?）が出たらそのまま直す。</li>
+        <li><strong>物理は 1 個ずつ足す。</strong>opt-in 群（CBET・ホット電子・SNB・粘性・燃焼など）は「書かなければ完全に不活性」という契約で実装されている。新しいデッキは、まず小さいメッシュと短い <code>t_end</code> で初期化と数ステップを確認し、そのあとで実運用の解像度と出力の間隔へ上げること。</li>
+      </ul>
+    </section>
+
+    <section aria-labelledby="during-run">
+      <h2 id="during-run">実行中に見えるもの</h2>
+      <p><code>run</code> は最初にデッキを検証・凍結し（validate と同じ検査）、メッシュと初期状態を構築してから時間ループへ入る。以後はステップの進行がログに流れ、スナップショット・チェックポイントを書くたびに <code>[output] wrote snapshot (step=…, …)</code> の行が出る。ログはコンソールと <code>outputs/&lt;name&gt;/log/</code> の双方に残る。</p>
+      <p>「\(\Delta t\) がどんどん小さくなって進まない」ときは、ログの limiter 名（<code>hydro</code>・<code>conduction</code>・<code>braginskii</code> など）で律速カーネルを特定し、該当物理の設定（床値・格子）を見直す。決定則と全カーネルの式は<a href="../overview/timestep.html">時間刻み制御と CFL</a> にまとめてある。</p>
+    </section>
+
+    <section aria-labelledby="outputs">
+      <h2 id="outputs">出力先</h2>
+      <p>実行時の描画、履歴、チェックポイントは <code>Output.directory</code> に書き出される。ケース名に合わせた <code>outputs/&lt;name&gt;</code> が標準的な整理の仕方である。ディレクトリの内訳（<code>results/</code>・<code>config/</code>・<code>checkpoints/</code>・<code>log/</code>・<code>run_info.json</code>）、ファイルの命名、全データセットの一覧は<a href="outputs.html">出力と解析</a>にまとめた。<code>plot_every</code>・<code>history_every</code>・<code>checkpoint_every</code> はステップ数で指定する間隔（0 で無効）、<code>_s</code> 付き（<code>plot_every_s</code> 等）は秒で指定する間隔で、両方が有効なら OR で発火する。<strong>時間で指定したいときは必ず <code>_s</code> 付きを使う</strong> — 単位事故の定番ポイントである。</p>
+    </section>
+
+    <section aria-labelledby="restart">
+      <h2 id="restart">チェックポイントと再開</h2>
+      <p>再開するデッキでは、<code>Main.restart_from</code> にチェックポイントの接頭辞を指定する。たとえば <code>Main(..., restart_from="outputs/minimal_1d/checkpoints/minimal_1d_ckpt_0100")</code> のように、ランクの接尾辞や <code>.h5</code> を除いた接頭辞を渡す。再開は、チェックポイントに保存された状態、時刻、時間刻みを引き継ぎ、元の出力の配置をそのまま続ける。指定した接頭辞に一致するチェックポイントがない場合や、凍結後の設定と整合しない場合（次元・メッシュ・材料・群・seed の不一致）は、開始する前に失敗する。</p>
+    </section>
+
+    <section aria-labelledby="troubleshooting">
+      <h2 id="troubleshooting">うまくいかないとき</h2>
+      <table class="quick-facts">
+        <thead><tr><th>症状</th><th>原因と対処</th></tr></thead>
+        <tbody>
+          <tr><th><code>ConfigError: ... is not a supported key (did you mean 'X'?)</code></th><td>キー名の打ち間違い。候補が出るのでそのまま直す。</td></tr>
+          <tr><th><code>ConfigError: eos.file is required for model=sesame</code></th><td>テーブル EOS はファイル必須。入門は <code>ideal_gas</code> にする。</td></tr>
+          <tr><th><code>Radiation.mode="imc_ddmc"</code> でエラー</th><td>旧 Monte Carlo 輸送は退役済み。書かない（= FLD 既定）か <code>sn_transport</code> にする。<code>imc=dict(...)</code>/<code>ddmc=dict(...)</code> も同様に退役経路専用の互換キーである。</td></tr>
+          <tr><th>実行したのに結果が古いまま</th><td>出力先の衝突で <code>_001</code> の連番ディレクトリへ書かれている。出力先を確認する。</td></tr>
+          <tr><th>温度が上がらない / 波が進まない</th><td>まず validate の要約で有効な物理モジュールを確認し、次に <code>config/*_frozen.json</code> で境界・不透明度の実効値を確認する。</td></tr>
+          <tr><th>\(\Delta t\) が縮み続けて進まない</th><td>ログの limiter 名で律速カーネルを特定する（<a href="../overview/timestep.html">時間刻み制御</a>）。床（<code>dt.min_s</code>）を割ると FATAL 停止する。</td></tr>
+          <tr><th>CMake・ビルド段階の失敗</th><td><a href="building.html">ビルド</a>と<a href="requirements.html">動作環境</a>のページを参照。</td></tr>
+        </tbody>
+      </table>
+      <p>調べる順番は ① validate の要約 → ② <code>config/*_frozen.json</code>（実効値）→ ③ <code>log/</code> の warning、が早い。</p>
+    </section>
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["\\[", "\\]"]] } };</script>
+  <script defer src="../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../nav.js" data-page="running" data-root="../"></script>
+</body>
+</html>

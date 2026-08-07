@@ -1,0 +1,260 @@
+<!doctype html>
+<html lang="en" data-lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Outputs &amp; analysis — TENRYU Documentation</title>
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>Outputs &amp; analysis <span class="badge">reference</span></h1>
+    <p class="abstract">One TENRYU run produces three kinds of HDF5 — snapshots (spatial fields), a history (scalar time series), and checkpoints (for restart) — plus provenance files (frozen configuration, run info, logs). This page is a <strong>complete enumeration of what gets written</strong>: file kinds and naming, every snapshot group and dataset, every history channel, the checkpoint additions, and how to read them. The canonical source including dtypes and array shapes is <code>docs/SPECIFICATION.md</code> §7 in the repository (summarized in <code>docs/OUTPUT_SCHEMA.md</code>).</p>
+
+    <aside class="planned" aria-labelledby="at-a-glance">
+      <h3 id="at-a-glance">At a glance</h3>
+      <ul>
+        <li>Three HDF5 kinds: snapshots <code>&lt;name&gt;_NNNN.h5</code>, the history <code>&lt;name&gt;_history.h5</code> (append-only), and checkpoints <code>&lt;name&gt;_ckpt_NNNN.h5</code>. Cadence fires on step-based (<code>plot_every</code> …) OR seconds-based (<code>plot_every_s</code> …) triggers.</li>
+        <li>Every numeric dataset carries a <code>units</code> attribute. <code>mesh/</code> and <code>hydro/</code> dataset names map 1:1 to the internal State field names.</li>
+        <li>Stagnation peaks are short — about 15 ps for the GXII-class <code>laser_capsule</code> preset — so peak values are read from the per-step history (<code>implosion/*</code>), not from snapshots.</li>
+        <li>Re-running into the same output directory does not overwrite: results go to a numbered sibling like <code>_001</code>. If "nothing changed", check the output location first.</li>
+      </ul>
+    </aside>
+
+    <section aria-labelledby="files">
+      <h2 id="files">Files, naming, cadence</h2>
+      <table class="quick-facts">
+        <thead><tr><th>File</th><th>Naming</th><th>Cadence</th><th>Purpose</th></tr></thead>
+        <tbody>
+          <tr><th>Snapshot</th><td><code>&lt;case&gt;_NNNN.h5</code> (4-digit zero-padded cycle)</td><td>every <code>plot_every</code> steps <em>or</em> every <code>plot_every_s</code> seconds (OR logic)</td><td>Field visualization and post-processing. Physical time in root attribute <code>t</code>.</td></tr>
+          <tr><th>History</th><td><code>&lt;case&gt;_history.h5</code></td><td><code>history_every</code> / <code>history_every_s</code> (OR, appended)</td><td>Scalar diagnostics time series; extensible datasets appended each output.</td></tr>
+          <tr><th>Checkpoint</th><td><code>&lt;case&gt;_ckpt_NNNN.h5</code> (per-rank files add <code>_rNNNN</code>)</td><td><code>checkpoint_every</code> / <code>checkpoint_every_s</code> (OR)</td><td>Restart. Only <code>checkpoint_keep_last</code> files are kept; older ones are deleted automatically.</td></tr>
+        </tbody>
+      </table>
+      <p><code>&lt;case&gt;</code> is <code>Main.name</code>, falling back to the namelist file name (without extension). Parallel I/O differs by role: snapshots are one file via parallel HDF5 (MPI-IO, collective writes), the history is written by rank 0 only, and checkpoints are per-rank files. The directory layout:</p>
+      <pre><code>outputs/&lt;name&gt;/
+├── results/                  ← snapshots and history
+│   ├── &lt;name&gt;_0000.h5
+│   ├── &lt;name&gt;_0001.h5
+│   └── &lt;name&gt;_history.h5
+├── config/                   ← provenance (frozen config, namelist copy)
+│   ├── &lt;name&gt;_frozen.json
+│   └── &lt;name&gt;_namelist.py
+├── checkpoints/              ← restart
+│   └── &lt;name&gt;_ckpt_0100.h5
+├── log/                      ← run logs
+└── run_info.json             ← run summary (termination state etc.)</code></pre>
+      <p>If the output directory already exists and collides, nothing is overwritten: results are written to a 3-digit numbered sibling such as <code>outputs/&lt;name&gt;_001/</code>. To redirect output without editing the deck, use <code>tenryu run &lt;deck&gt; --output-dir &lt;dir&gt;</code> (new runs only; combining with a restart is a <code>ConfigError</code>).</p>
+    </section>
+
+    <section aria-labelledby="snapshots">
+      <h2 id="snapshots">Snapshots: every dataset</h2>
+      <p>Root attributes: <code>t</code> (time [s]), <code>cycle</code>, <code>geometry</code> (<code>"1D_SPH"</code>|<code>"2D_RZ"</code>), <code>n_cells</code>, <code>n_nodes</code>, <code>n_groups</code>, <code>n_materials</code>, <code>schema_version</code>. In 1D, arrays are flat and <code>mesh/x_z</code>, <code>v_z</code> are omitted. Group by group ("optional" = written conditionally):</p>
+
+      <h3>metadata/ — provenance</h3>
+      <table class="quick-facts">
+        <thead><tr><th>Dataset</th><th>Content</th></tr></thead>
+        <tbody>
+          <tr><th><code>namelist_source</code></th><td>The executed namelist (full Python source).</td></tr>
+          <tr><th><code>frozen_config</code></th><td>Frozen-configuration JSON; attributes <code>git_hash</code>, <code>build_type</code>, <code>cuda_arch</code>, <code>gpu_name</code>, <code>n_ranks</code>, <code>rng_seed</code>.</td></tr>
+          <tr><th><code>group_bounds_eV</code></th><td>Radiation group edges [eV] (length G+1).</td></tr>
+        </tbody>
+      </table>
+
+      <h3>mesh/ — nodes and connectivity</h3>
+      <table class="quick-facts">
+        <thead><tr><th>Dataset</th><th>Content</th></tr></thead>
+        <tbody>
+          <tr><th><code>x_r</code>, <code>x_z</code></th><td>Node coordinates [cm]; <code>x_z</code> 2D only.</td></tr>
+          <tr><th><code>v_r</code>, <code>v_z</code></th><td>Node velocities [cm/s]; <code>v_z</code> 2D only.</td></tr>
+          <tr><th><code>cell_material_id</code></th><td>Representative material index per cell (largest volume fraction; ties go to the smaller index).</td></tr>
+          <tr><th><code>topology/v2/</code>, <code>v3/</code>, <code>v4/</code></th><td>optional. Multiblock connectivity (v2: 3-block; v3: half-butterfly 5-block — block/seam tables plus CSR connectivity; v4: pentagon-belt <code>cell_nverts</code> with a <code>corner_stride</code> attribute). Omitted for single-block meshes.</td></tr>
+        </tbody>
+      </table>
+
+      <h3>hydro/ — cell-centered state</h3>
+      <table class="quick-facts">
+        <thead><tr><th>Dataset</th><th>Content</th></tr></thead>
+        <tbody>
+          <tr><th><code>rho</code>, <code>Te</code>, <code>Ti</code></th><td>Density [g/cm³], electron/ion temperatures [eV].</td></tr>
+          <tr><th><code>ee</code>, <code>ei</code></th><td>Electron/ion specific internal energies [erg/g].</td></tr>
+          <tr><th><code>Pe</code>, <code>Pi</code>, <code>Qvisc</code></th><td>Electron/ion pressures and artificial-viscosity pressure [dyne/cm²].</td></tr>
+          <tr><th><code>mass</code>, <code>vol</code></th><td>Cell mass [g] and volume [cm³].</td></tr>
+          <tr><th><code>zbar</code></th><td>Mean ionization.</td></tr>
+          <tr><th><code>volFrac</code></th><td>Material volume fractions [N_cell, N_mat] (multi-material).</td></tr>
+          <tr><th><code>shock_time</code></th><td>optional. Time of last detected shock [s] (post-shock features active).</td></tr>
+          <tr><th><code>adaptive_av_gate</code>, <code>adaptive_av_mode_cell</code></th><td>optional. Adaptive-AV gate history and visualization mask (<code>adaptive_av.enabled=True</code>).</td></tr>
+          <tr><th><code>corner_mass</code></th><td>optional. 2D subzonal corner masses [g] (Lagrangian invariant).</td></tr>
+          <tr><th><code>eta_compatible</code></th><td>optional. Legacy volume-form compatibility mismatch diagnostic [cm³].</td></tr>
+          <tr><th><code>per_material/v1/</code></th><td>optional. Per-material conservation schema skeleton (<code>per_material_conservation_enabled=True</code>).</td></tr>
+        </tbody>
+      </table>
+
+      <h3>diagnostics/ — snapshot-side physics diagnostics (optional)</h3>
+      <table class="quick-facts">
+        <thead><tr><th>Group</th><th>Trigger and content</th></tr></thead>
+        <tbody>
+          <tr><th><code>areal_density/v1/</code></th><td><code>Diagnostics.areal_density.enabled=True</code>. Angle list <code>angles_deg</code> and areal densities <code>rhoR</code> [g/cm²]; optional hotspot-gas-tracer variant <code>rhoR_hotspot_tracer</code>.</td></tr>
+          <tr><th><code>hotspot_gas/v1/</code></th><td><code>Numerics.diagnostics.hotspot_gas.enabled=True</code>. Stagnation-hotspot Te/Ti statistics (mean/p10/p50/p90), energies (internal/kinetic/total plus initial values), work proxies, and the definition string.</td></tr>
+        </tbody>
+      </table>
+
+      <h3>radiation/ — radiation field and diagnostics</h3>
+      <table class="quick-facts">
+        <thead><tr><th>Dataset</th><th>Content</th></tr></thead>
+        <tbody>
+          <tr><th><code>energy_density</code></th><td>Group radiation energy density E_g [erg/cm³] ([N_cell, G]).</td></tr>
+          <tr><th><code>rad_dep</code>, <code>rad_emit</code></th><td>Per-step accumulated absorption and emission [erg] (per group).</td></tr>
+          <tr><th><code>deposited_power</code></th><td>Absorbed power density [erg/cm³/s] (= rad_dep/(VΔt); for visualization).</td></tr>
+          <tr><th><code>boundary_flux</code></th><td>Per-group boundary outflow [erg/s].</td></tr>
+          <tr><th><code>momentum_dep</code></th><td>Momentum deposition (diagnostic only, not coupled to hydro).</td></tr>
+          <tr><th><code>fleck_factor</code></th><td>2D FLD only: per-cell Fleck factor (diagnostic meaning valid at grey G=1).</td></tr>
+          <tr><th><code>sn_tau_R</code>, <code>sn_reduced_flux</code>, <code>sn_ap_alpha</code></th><td>2D S<sub>N</sub> only: AP face-blend diagnostics (optical-depth, reduced-flux, and face-weight proxies).</td></tr>
+          <tr><th><code>diag_rad_*</code> (10 kinds)</th><td>1D S<sub>N</sub> output-only diagnostics: <code>E_pre</code>/<code>E_post</code>/<code>emission_at_Tn</code>/<code>emission_at_Tnp1</code>/<code>absorption</code>/<code>clip_energy</code>/<code>clip_full_deficit</code>/<code>chi_opacity</code>/<code>F_first_moment</code>/<code>E_star_flux</code>, plus <code>diag_stream_theta</code> and <code>diag_ap_alpha_face</code>. Never used to restore restart state.</td></tr>
+          <tr><th><code>ddmc_flag</code></th><td>Meaningful only on the retired <code>imc_ddmc</code> path; carries no meaning under production FLD/S<sub>N</sub>.</td></tr>
+        </tbody>
+      </table>
+
+      <h3>laser/ — laser (only with <code>Laser.enabled=True</code>)</h3>
+      <table class="quick-facts">
+        <thead><tr><th>Dataset</th><th>Content</th></tr></thead>
+        <tbody>
+          <tr><th><code>deposited_power</code></th><td>Laser deposition power density [erg/cm³/s].</td></tr>
+          <tr><th><code>absorption_fraction</code></th><td>Overall absorption fraction (absorbed/incident).</td></tr>
+          <tr><th><code>ray_density</code></th><td>Initial ray placement density [1/cm³].</td></tr>
+          <tr><th><code>A_Q_r_shells</code>, <code>A_Q_z_shells</code></th><td>2D only: per-shell deposition asymmetry \((q_{max}-q_{min})/(q_{max}+q_{min})\).</td></tr>
+          <tr><th><code>mesh/</code></th><td>Only on non-skip steps with <code>ray_output_trajectory=True</code>: LaserMesh node coordinates, \(\hat n_e\), T_e, Z̄, density gradients, <code>n_crit</code>.</td></tr>
+          <tr><th><code>rays/</code></th><td>Only on non-skip steps with <code>ray_output_count&gt;0</code>: initial ray positions/directions/powers (1D: R0/Z0/vR0/vZ0; 2D: x0/y0/z0/vx0/vy0/vz0) and beam IDs.</td></tr>
+          <tr><th><code>rays/trajectory/</code></th><td>With <code>ray_output_trajectory=True</code>: CSR-format trajectories (offsets, step counts, position columns, residual power) — the source data for ray overlays.</td></tr>
+        </tbody>
+      </table>
+      <p>Under <code>mode="radial_absorption_1d"</code> there are no physical ray trajectories: <code>deposited_power</code> and <code>absorption_fraction</code> are written as usual but the <code>rays/</code> family is empty or absent. The <code>holo/</code> and <code>difference/</code> groups belong exclusively to the retired <code>imc_ddmc</code> paths and do not apply to production FLD/S<sub>N</sub> runs.</p>
+    </section>
+
+    <section aria-labelledby="history">
+      <h2 id="history">History: every channel</h2>
+      <p><code>results/&lt;name&gt;_history.h5</code> is append-only. The root holds the three series <code>t</code>, <code>cycle</code>, <code>dt</code> and, on completion, the attribute <code>termination_reason</code> (<code>"t_end"</code>|<code>"max_steps"</code>).</p>
+
+      <h3>energy/ — the energy ledger (always)</h3>
+      <table class="quick-facts">
+        <thead><tr><th>Channel</th><th>Content</th></tr></thead>
+        <tbody>
+          <tr><th><code>laser_incident</code> / <code>laser_deposited</code> / <code>laser_escaped</code></th><td>Cumulative incident, absorbed, and unabsorbed laser energy [erg]; incident vs deposited gives the absorption fraction.</td></tr>
+          <tr><th><code>marshak_in</code> / <code>radiation_escaped</code></th><td>Cumulative Marshak-boundary injection and radiation boundary escape [erg] (summed over groups).</td></tr>
+          <tr><th><code>pdv_boundary</code></th><td>Cumulative boundary PdV work [erg].</td></tr>
+          <tr><th><code>kinetic</code> / <code>internal_electron</code> / <code>internal_ion</code> / <code>radiation_field</code></th><td>Total kinetic, electron-internal, ion-internal, and radiation-field energies [erg].</td></tr>
+          <tr><th><code>numerical_loss</code></th><td>Cumulative numerical loss [erg].</td></tr>
+          <tr><th><code>floor_injected</code> / <code>safety_injected</code> / <code>redistribution_unresolved</code> / <code>solver_residual</code></th><td>Floor, safety, ALE-redistribution, and solver-residual injections [erg] (diagnostic-only; excluded from the conservation-error numerator).</td></tr>
+          <tr><th><code>conservation_error</code></th><td>Relative conservation error ε_budget (per the NUMERICS §10.2 identity).</td></tr>
+          <tr><th><code>E_volume_in</code> / <code>E_total</code> / <code>dE_total</code> / <code>E_denom</code></th><td>Internal diagnostics (boundary volume work, total energy, its increment, the conservation denominator).</td></tr>
+          <tr><th><code>phase_diagnostic/</code></th><td>optional (<code>phase_resolved_energy=True</code>): matter energies before/after hydro and after ALE, with per-phase internal/kinetic increments.</td></tr>
+          <tr><th><code>ale_closure_audit/</code></th><td>optional (<code>ke_conservation_closure_audit=True</code>): the ALE kinetic-energy closure audit (K/I decompositions, residuals, floor counters).</td></tr>
+        </tbody>
+      </table>
+
+      <h3>Physics summaries (always)</h3>
+      <table class="quick-facts">
+        <thead><tr><th>Group / channel</th><th>Content</th></tr></thead>
+        <tbody>
+          <tr><th><code>mesh/ale_rezone_invocations</code></th><td>Cumulative ALE rezone count.</td></tr>
+          <tr><th><code>plasma/Zbar_mean</code>, <code>Zbar_max</code></th><td>Mass-weighted mean and maximum ionization.</td></tr>
+          <tr><th><code>implosion/rho_peak</code></th><td>Peak density [g/cm³]; read stagnation values and times here.</td></tr>
+          <tr><th><code>implosion/rho_R</code> (+ optional <code>rho_R_hotspot_tracer</code>)</th><td>Per-angle areal densities [g/cm²] (attribute <code>angles_deg</code>); backward-compatible per-angle scalars <code>rhoR_deg_&lt;angle&gt;</code> are also written.</td></tr>
+          <tr><th><code>implosion/shell_radius_mean</code>, <code>shell_radius_min</code></th><td>Mean and minimum shell radii [cm] (cells with ρ &gt; 0.1×ρ_max).</td></tr>
+          <tr><th><code>implosion/center_temperature</code></th><td>Central electron temperature [eV].</td></tr>
+          <tr><th><code>modes/P_ell</code>, <code>ell_values</code></th><td>2D only: Legendre mode amplitudes and orders (backward-compatible <code>a&lt;ℓ&gt;</code> scalars also written).</td></tr>
+          <tr><th><code>safety/clamp_count</code></th><td>Temperature/energy clamp counts.</td></tr>
+        </tbody>
+      </table>
+
+      <h3>laser/ — laser time series (laser enabled)</h3>
+      <table class="quick-facts">
+        <thead><tr><th>Channel</th><th>Content</th></tr></thead>
+        <tbody>
+          <tr><th><code>critical_surface_r</code></th><td>Critical-surface radius [cm].</td></tr>
+          <tr><th><code>absorbed_total</code> / <code>absorbed_power_total</code></th><td>This step's absorbed energy [erg] and power [erg/s].</td></tr>
+          <tr><th><code>commanded_power_total</code> / <code>unabsorbed_power_total</code> / <code>trace_unabsorbed_power_total</code></th><td>Incident and unabsorbed power (final / right after the trace) [erg/s].</td></tr>
+          <tr><th><code>absorption_efficiency_total</code> / <code>trace_absorption_efficiency_total</code></th><td>Total absorption efficiency (final / right after the trace).</td></tr>
+          <tr><th><code>transfer_blocked_power_total</code></th><td>Power dropped for lack of a receiver [erg/s].</td></tr>
+          <tr><th><code>tail_closure_count</code> / <code>tail_closure_absorbed_power_total</code> / <code>critical_surface_hit_count</code></th><td>Rays ended by the near-critical tail closure and their absorbed power; rays terminated at the critical surface.</td></tr>
+          <tr><th><code>cbet_exchanged_power_total</code> / <code>cbet_ledger_residual_rel</code> / <code>cbet_iterations</code> / <code>cbet_clamp_count</code></th><td>CBET exchanged power, ledger residual, iteration count, clamp count. Written as zeros even with CBET disabled.</td></tr>
+          <tr><th><code>absorbed_fraction_beam_&lt;i&gt;</code></th><td>Per-beam absorption weights (always 1 for a single beam).</td></tr>
+        </tbody>
+      </table>
+
+      <h3>radiation/ and the opt-in diagnostic groups</h3>
+      <table class="quick-facts">
+        <thead><tr><th>Group</th><th>Trigger and content</th></tr></thead>
+        <tbody>
+          <tr><th><code>radiation/fld_outer_*</code></th><td>Always (zero when FLD is off): outer Picard iteration count, exit residual, convergence flag.</td></tr>
+          <tr><th><code>diagnostics/icf/v1/</code></th><td><code>diagnostics.icf.enabled</code>: shell radius, thickness, IFAR, convergence ratio CR.</td></tr>
+          <tr><th><code>diagnostics/hotspot_gas/v1/</code></th><td><code>diagnostics.hotspot_gas.enabled</code>: tracer-gas mass, radius family (R50…R99 and CR variants), density/pressure/adiabat summaries, Te/Ti statistics, energies, and work proxies.</td></tr>
+          <tr><th><code>diagnostics/ale_provenance/v1/</code></th><td>ALE provenance (violation/escape-valve/geometry-failure counters, escape-valve event table, final claim attributes).</td></tr>
+          <tr><th><code>diagnostics/mesh_quality_min/v1/</code></th><td><code>diagnostics.mesh_quality_min.enabled</code>: run minima of corner/Gauss Jacobians, RZ volume, edge length/altitude (relative to initial), and the max condition number over accepted meshes.</td></tr>
+          <tr><th><code>diagnostics/ale_lambda_sweep/v1/</code></th><td>ALE backtrack λ-sweep diagnostic (admissibility profile of Gauss/corner J and volume).</td></tr>
+          <tr><th><code>diagnostics/radial_fourier_audit/v1/</code>, <code>_v2/v1/</code></th><td>Per-operator radial Fourier audits (v1: peak amplitude; v2: fixed-(m,j) complex coefficients).</td></tr>
+          <tr><th><code>diagnostics/dt_breakdown_history/</code></th><td><code>diagnostics.dt_breakdown_history_enabled</code>: per-step Δt components and winner (see <a href="../overview/timestep.html">Time-step control</a>).</td></tr>
+          <tr><th><code>diagnostics/cfl_winner/</code>, <code>corner_bc_audit/v1/</code></th><td>Acoustic-CFL winner-cell records, plus boundary-value audits when the winner sits in a specific corner halo.</td></tr>
+          <tr><th><code>diagnostics/fld_substage_audit/v1/</code></th><td>FLD substage radial-Fourier audit (<code>diagnostic_radial_fourier_substage_enabled</code>).</td></tr>
+          <tr><th><code>diagnostics/per_row_mass/</code>, <code>av_max/</code></th><td>With the dt-breakdown diagnostics: per-z-row mass/density summaries and the maximum-AV cell record.</td></tr>
+          <tr><th><code>diagnostics/conservation/v1/</code></th><td><code>diagnostics.conservation.enabled</code>: per-operator conservation residuals ε_E with before/after energies.</td></tr>
+          <tr><th><code>diagnostics/material_interface/v1/</code></th><td>PLIC material-interface diagnostics (attributes, per-sample statistics, event tables; additive V21 schema).</td></tr>
+          <tr><th><code>mc/</code>, <code>difference/</code>, <code>holo/</code></th><td>Compatibility diagnostics of the retired <code>imc_ddmc</code> paths; meaningless under production FLD/S<sub>N</sub> runs.</td></tr>
+        </tbody>
+      </table>
+      <p>The golden-regression summary metrics quoted on the verification page are time reductions of these series: <code>rho_peak_max</code> = max of <code>implosion/rho_peak</code>, <code>rhoR_max</code> = max of <code>implosion/rho_R</code>, <code>Tc_max</code> = max of <code>implosion/center_temperature</code>, <code>shell_r_min</code> = min of <code>implosion/shell_radius_min</code>.</p>
+      <aside class="planned" aria-labelledby="cadence-warning">
+        <h3 id="cadence-warning">Warning: cadence can miss the peak</h3>
+        <p>Snapshot cadence is per-deck, but stagnation peaks can be very short — about 15 ps measured (2026-07-31) for the GXII-class <code>laser_capsule</code> preset. When output times straddle the peak, the maximum density among snapshots badly underestimates the true peak. Read sharp peak values and times from the per-step history (<code>implosion/rho_peak</code>) and use snapshots for the spatial structure around the peak.</p>
+      </aside>
+    </section>
+
+    <section aria-labelledby="checkpoints">
+      <h2 id="checkpoints">Checkpoint additions and restart compatibility</h2>
+      <p>Checkpoints store the snapshot content plus the internal state needed to resume.</p>
+      <table class="quick-facts">
+        <thead><tr><th>Group</th><th>Content</th></tr></thead>
+        <tbody>
+          <tr><th><code>hydro_flags/hydro_active</code></th><td>Per-cell hydro activity mask.</td></tr>
+          <tr><th><code>rng/</code></th><td>RNG state (<code>rng_counter</code>, <code>global_id</code>).</td></tr>
+          <tr><th><code>time_state/</code></th><td><code>t</code>, <code>step</code>, <code>dt</code>, cumulative energy terms, <code>user_seed</code>. The restart Δt comes from here.</td></tr>
+          <tr><th><code>output_state/</code></th><td>Next scheduled output times (<code>t_next_plot</code>, <code>t_next_history</code>, <code>t_next_checkpoint</code>).</td></tr>
+          <tr><th><code>particles/</code></th><td>Particle pool of the retired Monte Carlo paths (not applicable to production FLD/S<sub>N</sub>).</td></tr>
+        </tbody>
+      </table>
+      <p>Restart compatibility: matching <code>schema_version</code> reads normally; an older (or missing) version reads with backward-compatible defaults; a newer version is refused. A mismatch in the frozen items (dimension, mesh, materials, group count, seed, group bounds) refuses the restart. How to specify a restart is on the <a href="running.html#restart">running page</a>.</p>
+    </section>
+
+    <section aria-labelledby="provenance">
+      <h2 id="provenance">Provenance: frozen JSON, run_info, logs</h2>
+      <p><code>config/&lt;name&gt;_frozen.json</code> records the fully resolved configuration, the tables frozen from callables at initialization, and hashes of their sources. It is the primary audit of what the run actually received (rather than what you think you typed); keep it with the deck for reproduction and comparison. <code>run_info.json</code> summarizes the run and <code>log/</code> holds the run logs. When "did my setting take effect?" arises, read the frozen JSON first, then the warnings in the log.</p>
+    </section>
+
+    <section aria-labelledby="analysis-tools">
+      <h2 id="analysis-tools">Reading the data: CLI, bundled tools, Scope</h2>
+      <p>Structure inspection needs only the standard HDF5 tools:</p>
+      <pre><code>h5ls  outputs/&lt;name&gt;/results/&lt;name&gt;_0010.h5          # group listing
+h5dump -H outputs/&lt;name&gt;/results/&lt;name&gt;_history.h5  # header structure</code></pre>
+      <p>The fastest plots come from the bundled <strong>tenryu_plot</strong> (<code>tools/</code>), with subcommands including <code>profile</code> (spatial profiles), <code>history</code> (time series), <code>spacetime</code>, <code>summary</code>, <code>compare</code>, and <code>spectrum</code>:</p>
+      <pre><code>python3 -m tools.tenryu_plot --help                  # list
+python3 -m tools.tenryu_plot profile outputs/&lt;name&gt;  # spatial profiles
+python3 -m tools.tenryu_plot history outputs/&lt;name&gt;  # time series</code></pre>
+      <p>For direct reading, h5py is shortest. Every numeric dataset has a <code>units</code> attribute, and array lengths follow the field layout (cells, nodes, cells×materials, cells×groups) — read root attributes, shapes, and units together:</p>
+      <pre><code>import h5py
+f = h5py.File("outputs/&lt;name&gt;/results/&lt;name&gt;_0010.h5")
+Te = f["hydro/Te"][:]; r = f["mesh/x_r"][:]
+print(f["hydro/Te"].attrs["units"])   # -&gt; "eV"</code></pre>
+      <p>For interactive exploration and run-to-run comparison, use TENRYU Scope (see <a href="../overview/architecture.html">Architecture</a>). Find the interesting times and quantities in the viewer, then make the final figures from the frozen configuration and explicit script arguments to combine interactivity with reproducibility.</p>
+    </section>
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["\\[", "\\]"]] } };</script>
+  <script defer src="../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../nav.js" data-page="outputs" data-root="../"></script>
+</body>
+</html>

@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="en" data-lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Cross-beam energy transfer (CBET) — TENRYU Documentation</title>
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>Cross-beam energy transfer (CBET) <span class="badge">reference</span></h1>
+    <p class="abstract">TENRYU’s cross-beam energy transfer model redistributes laser power through the ion-acoustic wave driven where beams cross. In 1D spherical <code>port_section</code> mode, TENRYU traces one prototype beam and rotates its phase space onto the physical ports. This keeps spherical material while representing the port layout, crossing angles, polarization average, wavelength detuning, and pump depletion. Pair exchange is conservative; detuned exchange closes optical wave action and a signed ion-acoustic-wave (IAW) ledger. CBET is stimulated Brillouin scattering in the strongly damped limit — the beat of two crossing beams ponderomotively drives an ion-acoustic wave, and the Doppler-shifted resonance decides how much power flows and in which direction.</p>
+
+    <aside class="planned" aria-labelledby="at-a-glance">
+      <h3 id="at-a-glance">At a glance</h3>
+      <ul>
+        <li><strong>Physics:</strong> linear, steady-state, strongly damped Marozas/DRACO ion-acoustic response — a local plane-wave SBS gain, resonant where the Doppler-shifted beat frequency matches \(|\mathbf{k}_a|c_a\).</li>
+        <li><strong>Geometry:</strong> one reference trace is rotated to every port (<code>port_section</code>); each unordered \((port, sheet, impact, section)\) pair is evaluated once.</li>
+        <li><strong>Conservation:</strong> pairwise exchange is bitwise antisymmetric; donor caps preserve positivity; the per-cell ledger closes to machine precision.</li>
+        <li><strong>Detuning:</strong> per-port \(\Delta\lambda\) moves the resonance operating point; wave-action (Manley–Rowe) bookkeeping routes the frequency deficit into a signed IAW ledger <code>E_cbet_iaw</code>.</li>
+        <li>Studio emits CBET decks only in <code>port_section</code> mode and expands <a href="../verification/index.html#gxii">GXII</a> (GEKKO XII, 12 ports), OMEGA (60 ports), or NIF (National Ignition Facility, 192 ports) port presets.</li>
+      </ul>
+    </aside>
+
+    <section aria-labelledby="mechanism">
+      <h2 id="mechanism">The physical mechanism</h2>
+      <p>Two electromagnetic waves \((\omega_p,\mathbf{k}_p)\) and \((\omega_q,\mathbf{k}_q)\) crossing in the same plasma volume produce a beat: their ponderomotive force oscillates at the difference frequency \(\Delta\omega=\omega_q-\omega_p\) and beat wavevector \(\mathbf{k}_a=\mathbf{k}_q-\mathbf{k}_p\). This force drives an ion-density perturbation — an ion-acoustic wave. A periodic density modulation is also a refractive-index modulation, so the acoustic wave acts as a moving diffraction grating, and each beam Bragg-scatters off it. The scattered wave matches the other beam in direction and phase, so scattering off the resonantly driven grating transfers energy coherently from one beam to the other. This is the three-wave coupling of stimulated Brillouin scattering (SBS); it differs from ordinary SBS only in that the seed is the other beam rather than noise.</p>
+      <p>In a plasma flowing with velocity \(\mathbf{u}\), the beat seen by the ions is Doppler shifted; the natural response occurs when \(\Delta\omega-\mathbf{k}_a\cdot\mathbf{u}=\pm|\mathbf{k}_a|c_a\). The normalized detuning \(g\) (defined below) is exactly this condition: \(|g|=1\) is resonance. Two consequences familiar from direct drive follow: even equal-color beams (\(\Delta\omega=0\)) exchange strongly where the projected flow is sonic, \(\mathbf{k}_a\cdot\mathbf{u}=\mp|\mathbf{k}_a|c_a\) — the Mach-1 surface of the expanding corona — and imposed wavelength detuning \(\Delta\lambda\) shifts the operating point along the response curve, which is the CBET mitigation knob (<a href="#fig-cbet-detuning">Figure B</a>).</p>
+      <p>The ion-acoustic response function \(P(g)\) (defined in the next section) is odd in \(g\), so the sign of \(g\) sets the direction: for \(g_{pq}>0\) power flows from pump \(q\) to probe \(p\); the beam that is blue-shifted in the frame moving with the plasma pumps the red-shifted one. In photon terms the exchange conserves wave action (photon number): each scattered photon keeps its number but drops from \(\omega_s\) to \(\omega_r\), and the Manley–Rowe deficit \(1-\omega_r/\omega_s\) per unit power is deposited in the ion-acoustic wave. TENRYU books exactly this deficit in the signed IAW ledger (<a href="#detuning-action">§ wave action below</a>).</p>
+      <p>TENRYU evaluates the linear, steady-state, strongly damped local plane-wave limit of Marozas et al. [1], the form used by LLE's 2D hydrocode DRACO: the IAW is assumed slaved to its local drive — it does not propagate or store energy across cells — which is what makes a LOCAL gain coefficient per crossing legitimate. The dimensionless damping \(\alpha_{iaw}=\nu_a/(|\mathbf{k}_a|c_a)\) (default 0.2, calibrated against the LILAC lineage — LLE's 1D hydrocode) sets the resonance width. Deliberately outside v1 — a recorded scope decision of the model's design — are ion-acoustic heating corrections of order \(|\Delta\omega|/\omega_0\), caustic corrections, speckle statistics, polarization dynamics, broadband drive, and a kinetic \(\nu_a(k)\).</p>
+    </section>
+
+    <section aria-labelledby="gain-model">
+      <h2 id="gain-model">Ion-acoustic gain model</h2>
+      <p>When probe \(p\) and pump \(q\) cross the same plasma cell, TENRYU evaluates the dimensionless gain \(d\tau_{pq}\). The probe intensity amplifies as \(dI_p=d\tau_{pq}\,I_p\): \(d\tau_{pq}\) is the logarithmic gain \(d\ln I_p\), and in the linear (strongly damped, steady-state) model it is proportional to the pump intensity \(I_q\) and the path length \(ds\). The transferred power \(d\tau_{pq}\,I_p\) is proportional to both beam intensities; this bilinearity corresponds to the product \(L_{A,c}L_{B,c}\) in the pair-exchange formula \(\Delta P_{A\leftarrow B,c}=\chi\,L_{A,c}L_{B,c}/V_c\) below. With the roles swapped, \(d\tau_{qp}\) is proportional to \(I_p\). Temperatures are converted from eV to erg and the expression is evaluated in Gaussian cgs.</p>
+      $$
+      d\tau_{pq}=\eta_{pol}\frac{\lambda_0 e^2}{c^3m_e}
+      \frac{\hat n_e}{1-\hat n_e}
+      \frac{\langle Z\rangle}{\langle Z\rangle T_e+3T_i}
+      P(g_{pq})I_q\,ds,
+      \qquad
+      \eta_{pol}=\frac{f_{cbet}}{4}(1+\cos^2\psi).
+      $$
+      $$
+      g_{pq}=\frac{(\omega_q-\omega_p)-\mathbf{k}_a\!\cdot\!\mathbf{u}}
+      {|\mathbf{k}_a|c_a},\qquad
+      P(g)=\frac{g\alpha_{iaw}}{(g\alpha_{iaw})^2+(1-g^2)^2},
+      \qquad \mathbf{k}_a=\mathbf{k}_q-\mathbf{k}_p.
+      $$
+      <ul>
+        <li>\(\eta_{pol}=\tfrac{f_{cbet}}{4}[1+(\hat k_q\cdot\hat k_p)^2]\) — the polarization average for unpolarized/smoothed beams crossing at angle \(\psi\) (\(\cos\psi=\hat k_q\cdot\hat k_p\)); <code>f_cbet</code> absorbs experimental calibration (DRACO uses 1.5; TENRYU default 1.0).</li>
+        <li>\(\lambda_0 e^2/(c^3 m_e)\) — the SBS coupling constant; the explicit \(\lambda_0\) is the familiar statement that longer-wavelength light suffers stronger CBET.</li>
+        <li>\(\hat n_e/(1-\hat n_e)\) — density coupling \(\propto\hat n_e\) times the EM dielectric enhancement \(1/(1-\hat n_e)\) as the pair approaches critical density.</li>
+        <li>\(\langle Z\rangle/(\langle Z\rangle T_e+3T_i)\) — since \(\langle Z\rangle T_e+3T_i=\bar m_i c_a^2\), this is the inverse acoustic stiffness: a hotter (faster-sound) plasma is harder to compress and responds less.</li>
+        <li>\(P(g)\) — the absorptive part of the driven ion-acoustic oscillator with damping \(\alpha_{iaw}\): peaked near \(|g|\simeq 1\), FWHM \(\simeq\alpha_{iaw}\) in \(g\), and odd in \(g\).</li>
+        <li>\(I_q\,ds\) — gain is linear in pump intensity and path length; pump depletion enters only through the outer iteration below, keeping each evaluation linear.</li>
+      </ul>
+      <p>Everything is evaluated in Gaussian cgs with temperatures in erg (converted from eV); \(n_{crit}=m_e\omega_0^2/(4\pi e^2)\) gives \(9.06\times10^{21}\,\mathrm{cm^{-3}}\) at 351 nm and \(4.02\times10^{21}\,\mathrm{cm^{-3}}\) at 527 nm; the electron constants are shared with the laser package. \(c_a=[(\langle Z\rangle T_e+3T_i)/\bar m_i]^{1/2}\) with \(\bar m_i=A_{eff}m_p\); in 1T runs \(T_i=T_e\).</p>
+    </section>
+
+    <section aria-labelledby="spherical-reduction">
+      <h2 id="spherical-reduction">The 1D spherical reduction: angle groups and azimuthal quadrature</h2>
+      <p>The legacy reduction groups traced rays by beam \(b\), inbound/outbound leg \(\sigma=\mathbb{1}[\mu_{seg}>0]\) (each leg is a “sheet” — trajectories fold at their turning points into separate sheets), and impact-parameter bin \(a\), giving tally-group index \(g=b\,(2N_{bin})+\sigma N_{bin}+a\) — a bookkeeping index unrelated to the normalized detuning \(g\) of the gain model above. The segment direction cosine is the exact path average \(\mu_{seg}=(r_{stop}-r_{old})/\Delta s\) on the refracted trajectory. In cell \(c\), the per-cell tallies are the power line integral \(L_{g,c}=\sum P\Delta s\), intensity \(I_{g,c}=L_{g,c}/V_c\), and power-weighted direction cosine \(\bar\mu_{g,c}=\sum P\Delta s\mu/L_{g,c}\), with \(V_c\) the Lagrangian cell volume at the trace snapshot.</p>
+      $$
+      \cos\psi(\varphi)=\bar\mu_p\bar\mu_q+s_ps_q\cos\varphi,\quad s=\sqrt{1-\bar\mu^2},\qquad
+      |\mathbf{k}_a|(\varphi)=\bar k\sqrt{2(1-\cos\psi)},\quad \bar k=n_r\omega_0/c,
+      $$
+      $$
+      \mathbf{k}_a\cdot\mathbf{u}=\bar k\,u_r(\bar\mu_q-\bar\mu_p)\ \ (\varphi\text{-independent}),\qquad
+      \langle P\cdot pol\rangle_\varphi=\frac{1}{N_\varphi}\sum_k\frac{1+\cos^2\psi(\varphi_k)}{4}\,P(g(\varphi_k)).
+      $$
+      <p>Here \(\varphi\) is the relative azimuth between the two rays' planes, \(s_p,s_q\) are the sines of the tally direction cosines \(\bar\mu_p,\bar\mu_q\), \(\bar k=n_r\omega_0/c\) is the local optical wavenumber, and \(\langle P\cdot pol\rangle_\varphi\) is the azimuthal midpoint average of response times polarization factor that enters the pair coupling.</p>
+      <p>A 1D fluid does not resolve the relative azimuth \(\varphi\) between two ray planes, so the pair kinematics are averaged by midpoint quadrature over \(\varphi\) — averaging \(P(g)\), never the nonlinear substitute \(P(\langle g\rangle)\). The radial flow enters through \(\mathbf{k}_a\cdot\mathbf{u}=\bar k u_r(\bar\mu_q-\bar\mu_p)\), which is exact and \(\varphi\)-independent. The resonance FWHM is \(\simeq\alpha_{iaw}\), and the midpoint quadrature resolves it when \(\max_k|g(\varphi_{k+1})-g(\varphi_k)|\lesssim\alpha_{iaw}/4\); configurations with much smaller <code>alpha_iaw</code> need a larger <code>n_phi</code>.</p>
+      <p>Cells at or above <code>ne_frac_cutoff</code> (default 0.95), void cells, and cells with any non-finite state (\(\rho,\bar Z,A_{eff},T_e,T_i,u_r,V_c\)) are excluded; \(u_r\) is the cell-average node velocity. A node with \(|\mathbf{k}_a|/\bar k&lt;\)<code>k_a_floor</code> has no beat wave and contributes zero. The gain prefactor and \(\bar k\) floor \(1-\hat n\) at the same <code>absorption.eps_n</code> as IB, and config validation enforces <code>ne_frac_cutoff</code> \(\le 1-\)<code>eps_n</code> so the floor can never silently saturate gain inside the active band. <code>port_section</code> replaces that unresolved average with a sector/section map of the real ports.</p>
+    </section>
+
+    <section aria-labelledby="port-section">
+      <h2 id="port-section">Port-section reconstruction from one trace</h2>
+      <p>The reference trace retains radius, direction cosine \(\mu\), path length \(ds\), sheet, and impact bin at each cell crossing. Polar angle is reconstructed by Simpson accumulation of \(\sqrt{1-\mu^2}/r\); neighboring rays define a finite bundle area. Sheets fold at turning points, and crossings in the turning-to-caustic limiter zone are omitted from field evaluation. An inverse rotation into the pump-port frame produces a shadow beyond the reference fan’s maximum polar angle; that crossing is removed from numerator and denominator.</p>
+
+      <figure>
+        <img src="../../assets/cbet-port-section-geometry.png" width="860" height="645" style="max-width:100%;height:auto" alt="A single reference chord fan rigidly rotated to two physical ports, producing a highlighted CBET crossing inside a sphere">
+        <figcaption>Figure A. The same reference phase space is rigidly rotated onto an icosahedral-like port layout. Only crossings that coexist in physical space are coupled; no per-port retracing is performed.</figcaption>
+      </figure>
+
+      <p>An extended state is \(A=(i,\sigma,\beta,m)\): port, sheet, impact bin, and section. Reference records are initialized with each port’s power weight, then tallied and propagated in canonical port-ID order. Every unordered cell pair \(\{A,B\}\) is evaluated once and applied with opposite signs. There is no \(N(N-1)/2\) normalization. Splitting one physical beam into two coincident, equal-color ports must leave the solution unchanged; this beam-splitting invariance fixes the convention. Different sheets of the same port are also legitimate pairs.</p>
+      <p>Computational details: the polar angle along the reference chord is reconstructed by Simpson accumulation of \(\sqrt{1-\mu^2}/r\) per record interval; the finite bundle area of neighboring rays follows the discrete sector-area form of Follett et al. [2] (their Eq. (10)); the pump lookup inversely rotates each seed crossing into the pump-port frame (the rotation of Follett et al.'s Eq. (21) [2]) and linearly interpolates its (shell, leg, \(\theta'\)) table. Shadow crossings beyond the reference fan’s maximum polar angle are removed from numerator and denominator alike, while below-floor \(|\mathbf{k}_a|\) keeps the denominator (diluting, not renormalizing, the pair). v1 bounds the expanded pair count at 65536 — GXII-scale port sets run now; OMEGA/NIF-scale sets are a documented extension.</p>
+    </section>
+
+    <section aria-labelledby="pair-exchange">
+      <h2 id="pair-exchange">One CBET solve, step by step</h2>
+      <ol>
+        <li id="pair-exchange-s1"><p><strong>Record.</strong> With CBET on, the trace kernel runs in record mode and stores, per ray, one entry per cell crossing: \(\{c,\mu,\Delta s,S,w\}\), where \(S\) is the trapezoidal IB optical depth summed over the crossing and \(w\) is the ray's power at the crossing in this IB-only trace — the seed of the first iteration's tally in <a href="#pair-exchange-s5">step 5</a>. Critical-layer tail closure is stored as a terminal record with \(\Delta s=0,\ S=\tau_{tail}\). Capacity overflow is a hard error (a silently truncated path would pump tallies while quietly moving IB absorption into “unabsorbed”).</p></li>
+        <li id="pair-exchange-s2"><p><strong>Tally.</strong> Per group and cell, \(L,\bar\mu,\Delta s^{max}\) are accumulated by fixed-order sequential sums over sorted segments (no floating-point atomics anywhere in the solve — the result is run-to-run bit-stable on a given build+device).</p></li>
+        <li id="pair-exchange-s3">
+          <p><strong>Couple.</strong> The coupling table is evaluated once per cell and unordered pair. In <code>port_section</code> this happens once, before iteration: the geometry comes from the phase-space table and does not depend on the iterating \(L\), so \(\chi^{ps}\) is iteration-invariant. The legacy reduction instead re-evaluates \(\chi\) at each pass of <a href="#pair-exchange-s5">step 5</a>, because its power-weighted directions \(\bar\mu\) move with \(L\).</p>
+          $$
+          \chi^{ps}_{c,\{A,B\}}=\chi_{pref}(c)
+          \frac{\sum_x\sum_m \hat w_A(x)\hat I_B(x,m)\eta_{pol}P(g)}
+               {\sum_x\sum_m \hat w_A(x)\hat I_B(x,m)},\qquad
+          \Delta P_{A\leftarrow B,c}=\chi^{ps}_{c,\{A,B\}}\frac{L_{A,c}L_{B,c}}{V_c}.
+          $$
+          <p>In the coupling table, \(x\) indexes state \(A\)'s seed-side crossing records in the cell, \(m\) the pump-side azimuthal section sample, \(\hat w_A(x)\) the seed record's power weight, \(\hat I_B(x,m)\) the pump-port intensity looked up at that record after the inverse port rotation, and \(\chi_{pref}(c)\) the cell's gain prefactor — every factor of the gain increment \(d\tau\) above except \(P(g)\,\eta_{pol}\,I_q\,ds\), which the weighted average supplies. Sections are midpoint samples on \([0,2\pi)\); the pump table is linearly interpolated after the inverse port rotation. The device fast path assigns one thread to each \((cell,pair)\) and uses no floating-point atomics. A reusable GPU workspace retains port frames, frequencies, pair tables, and readback capacity; the host implementation remains as a tolerance-gated reference. The antisymmetry is mechanical: \(g_{qp}=-g_{pq}\) holds exactly in floating point and \(P(g)\) is an FP-odd function; the implementation additionally evaluates \(\chi\) once per pair and rounds the applied product in a canonical (min,max) operand order on both sides, so the pair exchange is bitwise antisymmetric by construction, not just to rounding error.</p>
+        </li>
+        <li id="pair-exchange-s4"><p><strong>Cap.</strong> The cap is two-stage flux limiting on each group’s total loss \(\ell_{g,c}\). A donor cap prevents strong coupling from making a ray negative. For group \(g\), \(f_g=\min[1,\theta L_g/(\Delta s_g^{max}\ell_g)]\), where \(\theta\) is <code>theta_cap</code> and \(\Delta s_g^{max}\) is the group's largest single-crossing path length in the cell (so the bound applies per crossing, not per cell total); the pair receives \(\min(f_A,f_B)\). Applying the same factor on both sides preserves antisymmetry and limits relative loss per crossing to <code>theta_cap</code>.</p></li>
+        <li id="pair-exchange-s5">
+          <p><strong>Propagate and iterate.</strong> The quantity the solve must make self-consistent — and the one whose convergence is tested — is the intensity field the beams present to one another: discretely, the per-cell, per-group tallies \(L_{g,c}\) of <a href="#pair-exchange-s2">step 2</a>. Each pair's exchange needs both partners' local powers, but those powers must themselves already include IB absorption and every upstream CBET exchange along each ray. TENRYU closes this circular dependence with an undamped fixed-point (Picard) iteration on \(L\). Pass \(m\) does the following, in order:</p>
+          <ul>
+            <li><em>Tally.</em> Form \(L^{(m)}_{g,c}\) from the ray powers of pass \(m-1\); the first pass tallies the IB-only recording trace, i.e. the field before any CBET.</li>
+            <li><em>Exchange.</em> From those tallies, evaluate every pair's \(\Delta P_{A\leftarrow B,c}=\chi\,L^{(m)}_AL^{(m)}_B/V_c\) — this is where pump depletion enters, since a partner weakened in the previous pass now offers a smaller \(L\) — re-apply the donor caps of <a href="#pair-exchange-s4">step 4</a>, and reduce the pair exchanges to each cell's net ledger \(dQ_{g,c}=\sum_q\Delta P^{final}\). In <code>port_section</code> the geometric \(\chi^{ps}\) is iteration-invariant; the legacy path re-evaluates \(\chi\) here because its power-weighted directions \(\bar\mu\) move with \(L\).</li>
+            <li><em>Test.</em> Convergence is the relative L1 change of the tallies, \(\sum_{g,c}|L^{(m)}_{g,c}-L^{(m-1)}_{g,c}|\,\big/\sum_{g,c}L^{(m-1)}_{g,c}<{}\)<code>tol</code> (default 1e-3, <code>max_iters</code> 50).</li>
+            <li><em>Re-march.</em> If unconverged, every ray is propagated again from its launch power \(P_0\) — not from the previous pass's endpoint — applying at each crossing IB-half, its share of the cell's net exchange, IB-half:</li>
+          </ul>
+          $$
+          P \mathrel{-}= -P\,\mathrm{expm1}(-S/2),\qquad
+          P \mathrel{+}= dQ_{g,c}\,\frac{w^{(m-1)}\Delta s}{L^{(m-1)}_{g,c}},\qquad
+          P \mathrel{-}= -P\,\mathrm{expm1}(-S/2).
+          $$
+          <p>A crossing's share of \(dQ_{g,c}\) is its previous-generation tally fraction \(w^{(m-1)}\Delta s/L^{(m-1)}_{g,c}\); those fractions sum to one by construction (\(\sum_j w_j\Delta s_j=L\)), so the power applied along rays telescopes exactly to the ledger \(dQ\). There is no under-relaxation or adjustable damping: each pass simply <em>replaces</em> the intensity field with the one that a complete, consistent propagation produces under the latest exchange field — plain Picard substitution, with the <a href="#pair-exchange-s4">step-4</a> caps bounding how far any single pass can move — and the post-CBET powers become generation \(m\)'s tally weights for the next pass. The final pass deposits with matched \(dQ\)/\(w\) generations — a generation mismatch would silently break conservation, and this is gated by the analytic slab test.</p>
+        </li>
+        <li id="pair-exchange-s6"><p><strong>Positivity and ledgers.</strong> Intermediate iterations treat any negative-power clamp as a positivity projection and only count it; the physical gate is that the final pass injects zero clamped power. The step then audits the ledger \(P_{in}=P_{dep}+P_{unabs}+\Sigma_{applied}\). \(\Sigma_{applied}\) is the sum of all applied pair exchanges; since each exchange is exactly antisymmetric it is ideally zero, and in practice it closes at the accumulated-rounding level \(O(N\varepsilon)\) (measured \(\lesssim10^{-12}\) relative). CBET never heats matter directly — only IB deposits energy; exchanged power just re-routes which rays carry it. Deposition and unabsorbed power flow into the ordinary per-beam fixed-order reductions.</p></li>
+      </ol>
+      <p>The final pass records deposition and unabsorbed power, then writes the exchanged power back along the original trajectories for visualization. Per-beam power rescaling of skipped traces is exact for linear IB but not for nonlinear CBET, so with CBET on a retrace is also triggered when any group’s power changes by more than 1%.</p>
+    </section>
+
+    <section aria-labelledby="detuning-action">
+      <h2 id="detuning-action">Wavelength detuning and wave action</h2>
+      <p>Each port carries \(\Delta\lambda_b\), with \(\omega_b=2\pi c/(\lambda_0+\Delta\lambda_b)\). In v1, trajectories, \(|\mathbf{k}|\), and \(n_{crit}\) remain frozen at common \(\lambda_0\); detuning affects only the resonance. The quantities being frozen shift only at relative order \(\Delta\lambda/\lambda_0\) (\(n_{crit}\propto\lambda^{-2}\) moves by \(2\Delta\lambda/\lambda_0\approx6\times10^{-4}\) for a 0.1 nm split at 351 nm), so sub-nanometre GXII/OMEGA-scale detunings sit well inside the approximation; multi-ångström NIF-scale splits are the recorded caveat below. Studio’s <code>detune_split_nm</code> preset assigns alternating \(+\Delta\lambda/2\) and \(-\Delta\lambda/2\) in canonical port order.</p>
+
+      <figure id="fig-cbet-detuning">
+        <img src="../../assets/cbet-pair-exchange-detuning.png" width="820" height="580" style="max-width:100%;height:auto" alt="CBET donor-to-gainer exchange and a gain curve whose operating point moves under wavelength detuning">
+        <figcaption>Figure B. Left: one unordered exchange and its signed IAW ledger. Right: detuning moves the operating point on the odd response, weakening, strengthening, or reversing transfer. The horizontal scale is qualitative.</figcaption>
+      </figure>
+
+      <p>At unequal frequencies an equal-power exchange would create photons: what is conserved in the three-wave process is wave action (photon number, the Manley–Rowe relations). If the sender loses power \(A\) at \(\omega_s\), the receiver gains \(A(\omega_r/\omega_s)\) at \(\omega_r\), and the Manley–Rowe deficit \(A(1-\omega_r/\omega_s)\) is the power fed to the ion-acoustic wave; TENRYU enters it once per exchange in the signed ledger <code>E_cbet_iaw</code>. Every cell asserts \(\sum_g dQ_{c,g}+Q_c^{IAW}=0\). At zero detuning, finite \(\omega/\omega\) is exactly one: receiver gain is bitwise identical to the neutral path and the IAW term is exactly <code>0.0</code>.</p>
+    </section>
+
+    <section aria-labelledby="controls">
+      <h2 id="controls">Key controls</h2>
+      <p>These are Studio’s principal <code>port_section</code> values. Studio does not generate legacy CBET decks; these are generation defaults, not the low-level parser’s general defaults.</p>
+      <table class="quick-facts">
+        <thead>
+          <tr><th>Key</th><th>Default</th><th>Purpose</th></tr>
+        </thead>
+        <tbody>
+          <tr><th><code>Laser.cbet.enable</code></th><td><code>False</code></td><td>Master switch (note the key is <code>enable</code>, not <code>enabled</code>); enabling it in Studio emits <code>geometry_mode="port_section"</code>.</td></tr>
+          <tr><th><code>f_cbet</code></th><td><code>1.0</code></td><td>Polarization-average and calibration factor.</td></tr>
+          <tr><th><code>alpha_iaw</code></th><td><code>0.2</code></td><td>Dimensionless IAW damping rate.</td></tr>
+          <tr><th><code>theta_cap</code></th><td><code>0.3</code></td><td>Maximum relative donor loss per crossing.</td></tr>
+          <tr><th><code>tol</code></th><td><code>1e-3</code></td><td>Relative L1 Picard convergence threshold.</td></tr>
+          <tr><th><code>max_iters</code></th><td><code>50</code></td><td>Maximum Picard iterations.</td></tr>
+          <tr><th><code>n_impact_bins</code></th><td><code>4</code></td><td>Impact-parameter bins per sheet.</td></tr>
+          <tr><th><code>n_section_phi</code></th><td><code>8</code></td><td>Azimuthal midpoints on \([0,2\pi)\).</td></tr>
+          <tr><th><code>port preset</code></th><td><code>gxii</code></td><td><code>gxii</code>, <code>omega</code>, and <code>nif</code> expand to 12, 60, and 192 ports.</td></tr>
+          <tr><th><code>detune_split_nm</code></th><td><code>0.0</code></td><td>Alternating \(+\Delta\lambda/2,-\Delta\lambda/2\) by canonical port order.</td></tr>
+          <tr><th><code>ne_frac_cutoff</code></th><td><code>0.95</code></td><td>Excludes cells at or above this \(n_e/n_{crit}\).</td></tr>
+          <tr><th><code>k_a_floor</code></th><td><code>1e-6</code></td><td>Zeros nodes below this \(|\mathbf{k}_a|/\bar k\).</td></tr>
+        </tbody>
+      </table>
+      <p>The current mode requires 1D spherical geometry, one prototype trace, and one MPI rank. Expanded-pair limits constrain port-count and resolution combinations. NIF-scale (multi-ångström) detuning also requires a per-color explicit-trace comparison because v1 uses common-wavelength trajectories; the frozen-trajectory error grows with \(\Delta\lambda/\lambda_0\) as quantified in <a href="#detuning-action">the detuning section above</a>.</p>
+    </section>
+
+    <section aria-labelledby="verification">
+      <h2 id="verification">Verification</h2>
+      <ul>
+        <li><strong>Analytic two-beam gates:</strong> the co-propagating slab problem follows the bilinear coupling \(dI_2/ds=\gamma I_1I_2\) at constant \(I_1+I_2=I_{tot}\) and has the closed-form logistic solution \(I_2(s)=I_{tot}/(1+Ce^{-\gamma I_{tot}s})\), where \(\gamma\) is the constant gain coefficient of the uniform slab and \(C\) the integration constant fixed by the inlet intensities; <code>test_cbet_slab</code> holds the discrete solve to relative error \(&lt;10^{-3}\) against it (measured \(\sim7\times10^{-5}\)) with first-order \(ds\) convergence, pairwise ledger \(\le10^{-13}\), and the clamp identity under stressed caps; <code>test_cbet_sphere</code> closes \(|P_{in}-P_{dep}-P_{unabs}|/P_{in}\le10^{-4}\) (measured \(\sim10^{-12}\)) on a synthetic corona.</li>
+        <li><strong>Beam-splitting invariance:</strong> one weight-1 port equals two coincident, equal-color weight-0.5 ports.</li>
+        <li><strong>Explicit-N references:</strong> 2-, 12-, and 60-beam cases versus legacy pairwise results require \(E_{abs}\) within 1%, \(Q_{abs}(r)\) L2 within 2%, and per-port outgoing power within 3%.</li>
+        <li><strong>Section convergence:</strong> <code>n_section_phi</code> = 8, 16, and 32 must converge monotonically.</li>
+        <li><strong>Zero-detuning neutrality:</strong> receiver power remains bitwise neutral and <code>E_cbet_iaw</code> is exactly zero.</li>
+        <li><strong>Wave-action closure:</strong> per-cell \(\sum_g dQ_{c,g}+Q_c^{IAW}=0\) and global laser ledgers are assertion-gated.</li>
+      </ul>
+    </section>
+
+    <section aria-labelledby="references">
+      <h2 id="references">References</h2>
+      <ol class="references">
+        <li>J. A. Marozas et al., "Wavelength-Detuning Cross-Beam Energy Transfer Mitigation Scheme for Direct Drive: Modeling and Evidence from National Ignition Facility Implosions," Phys. Plasmas 25, 056314 (2018). <a href="https://doi.org/10.1063/1.5022181">doi:10.1063/1.5022181</a></li>
+        <li>R. K. Follett et al., "Modeling Cross-Beam Energy Transfer with Sector Ray Tracing," Phys. Plasmas 32, 022709 (2025). <a href="https://doi.org/10.1063/5.0253858">doi:10.1063/5.0253858</a></li>
+        <li>W. L. Kruer, S. C. Wilks, B. B. Afeyan, and R. K. Kirkwood, "Energy transfer between crossing laser beams," Phys. Plasmas 3, 382–385 (1996). <a href="https://doi.org/10.1063/1.871863">doi:10.1063/1.871863</a></li>
+        <li>P. Michel et al., "Energy transfer between laser beams crossing in ignition hohlraums," Phys. Plasmas 16, 042702 (2009). <a href="https://doi.org/10.1063/1.3103788">doi:10.1063/1.3103788</a></li>
+        <li>I. V. Igumenshchev et al., "Crossed-beam energy transfer in implosion experiments on OMEGA," Phys. Plasmas 17, 122708 (2010). <a href="https://doi.org/10.1063/1.3532817">doi:10.1063/1.3532817</a></li>
+      </ol>
+    </section>
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["$$", "$$"], ["\\[", "\\]"]] } };</script>
+  <script defer src="../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../nav.js" data-page="cbet" data-root="../"></script>
+</body>
+</html>

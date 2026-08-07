@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="ja" data-lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>1D メッシュ: 格子と領域 — TENRYU ドキュメント</title>
+  <link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>1D メッシュ: 格子と領域 <span class="badge">reference</span></h1>
+    <p class="abstract">TENRYU の 1D 計算領域は、一様または傾斜配置のゾーニングと、球・円筒・平面の測度を備えた半径方向の節点格子である。デッキ側の領域ペイントによって、材料、前駆プラズマのコロナ、外側の VOID を割り当てる。</p>
+
+    <section aria-labelledby="mechanism">
+      <h2 id="mechanism">物理機構</h2>
+      <p>ラグランジュ的な 1D 爆縮では、格子そのものが誤差の内訳の一部になる。各セルが質量を保ち続けるため、初期のゾーニングが全時刻の解像度分布を決める。アブレータの表面や、燃料とシェルの界面へ質量を配置することは、最大圧縮時に急な勾配が現れる場所へ解像度を配置することにあたる。傾斜配置のゾーニングはそこへセルを配分し、スーパーガウス型の重み分布がセル幅を滑らかかつ単調に遷移させる。セル幅が急に跳ぶと、音波や衝撃波の信号を数値的に反射してしまうためである。</p>
+      <p>球・円筒・平面の違いは、節点の配置ではなく測度として入る。同じ節点列を、それぞれに対応する面の面積 \(A(r)\) と殻の体積 \(V(r_0,r_1)\) で解釈する。半径の大きな場所にある薄い球殻では、ほぼ等しい 3 乗の値を直接引くと破滅的な桁落ちが起きるため、因数分解した殻体積の式を使う。</p>
+      <p>材料の領域は体積分率でペイントするため、材料の配置を格子の構築から独立に定義できる。VOID は、正の状態の下限と <code>cell_is_void</code> のマスクを組み合わせ、熱伝導と輻射の結合から除外する。真空を通常の極低密度の材料として扱うと、代わりに巨大な拡散係数が生じてしまう。また、解像された指数関数的なコロナは、レーザーの計算を始めるための物理的な前提である。コロナは VOID まで狭義単調に減少しなければならず、平坦な部分があると共振器として働く。これは<a href="#regions-corona">後述のコロナ層の節</a>で説明する、反対称な節点対の不安定性として実証されている。</p>
+      <ul>
+        <li><strong>スーパーガウス型のパラメータ:</strong> \(\epsilon_{\rm edge}\) は端における正の下限（<code>Mesh.grid.grading.edge_ratio</code>）、\(\sigma_{\rm sg}\) は分布の広がり（<code>grading.sg_sigma</code>）、偶数の指数 \(m_{\rm sg}\) は肩の鋭さ（<code>grading.sg_order</code>）を決める。</li>
+        <li><strong><code>exact_measure_v2</code></strong>（<code>grading.mapping</code>）<strong>:</strong> 累積した重みを、球・円筒・平面それぞれの厳密な殻の測度で反転する。したがって密度が一定の場合、重みに従うのはセルの幅ではなくセルの<em>質量</em>である。</li>
+        <li><strong>生成時の検査:</strong> すべての幅が有限かつ正であること、組み立てた節点が狭義単調に増加すること、最後の節点が指定した外端と一致することを検査する。</li>
+      </ul>
+    </section>
+
+    <section aria-labelledby="one-d-geometry">
+      <h2 id="one-d-geometry">1D の座標幾何とゾーニング</h2>
+      <p><code>Mesh.geometry_1d</code> は、同じ節点列 \(r_j\) を異なる座標の測度で解釈する。球対称、軸長を 1 とした円筒、断面積を 1 とした平面に対して、面積とセル体積はそれぞれ</p>
+      $$
+      A(r)=4\pi r^2\;|\;2\pi r\;|\;1,
+      \qquad
+      V(r_0,r_1)=\frac{4\pi}{3}(r_1^3-r_0^3)\;|\;\pi(r_1^2-r_0^2)\;|\;(r_1-r_0).
+      $$
+      <p>節点 \(j=0,\ldots,N\) はセル境界の位置と速度をもち、セル \(i=0,\ldots,N-1\) は区間 \([r_i,r_{i+1}]\) の密度、内部エネルギー、温度、圧力などをもつ。球殻の薄いセルでは 3 乗の差による桁落ちを避けるため、実装は必要な箇所で因数分解した体積の式を使う。球面の既定経路は従来の演算順序を保ち、別の幾何を選んでも内部の単位系は cgs のままである。</p>
+      <p><code>Mesh.grid="uniform"</code> は領域を等しい幅のセルに分ける。<code>graded</code> は連続した半径方向の区間と、区間ごとのセル数を受け取り、区間のセル数を \(n_s\) として、規格化したセル中心 \(\xi_k=(k+1/2)/n_s\) に対するスーパーガウス型の重み</p>
+      $$
+      w_k=\epsilon_{\rm edge}+(1-\epsilon_{\rm edge})
+      \exp\!\left[-\left(\frac{|2\xi_k-1|}{\sigma_{\rm sg}}\right)^{m_{\rm sg}}\right]
+      $$
+      <p>から、幅または殻の測度を配分する。区間の長さは厳密に保存し、隣り合う区間の境界における幅は幾何平均を目標にそろえる。明示的に有効化する <code>exact_measure_v2</code> の写像は、累積した重みを球・円筒・平面それぞれの厳密な殻の測度で反転し、密度が一定の区間ではセルの質量を重みに対応させる。生成後は、節点列が有限で幅が正であること、狭義単調であること、そして指定した外端に一致することを検査する。</p>
+    </section>
+
+    <section aria-labelledby="regions-corona">
+      <h2 id="regions-corona">領域のペイント、VOID、コロナ層</h2>
+      <p>1D のデッキは、外半径が狭義単調な同心の領域を、区分的に一定な材料の状態として記述する。各領域は半径に関する判定条件を体積分率の関数へ変換し、<code>Geometry.volfrac</code> がセルごとの材料の割り当てを与える。これにより、中心のガス、固体のシェル、外層を格子の生成から切り離して記述でき、体積分率の総和が 1 になることをデッキ側で強制できる。</p>
+      <p>外側の真空を単なる極低密度の通常材料にすると、レーザーで加熱したあとの熱伝導係数や輻射係数が数値の系に残ってしまう。そこで外側の帯には <code>Material(..., is_void=True)</code> の予約材料 <code>VOID</code> を塗り、<code>Materials.void_config</code> に正の \(\rho,T_e,T_i\) の下限を与える。下限は状態の配列を有限に保つための値だが、<code>cell_is_void</code> のマスクにより、VOID のセルは電子熱伝導と輻射における物質との結合や源の求解から除外される。</p>
+      <p>レーザー標的では、冷たい固体表面から VOID への 1 セル分の密度の跳びだけでは、351 nm の光がほとんど伝搬距離をもたないまま臨界密度で反射してしまい、逆制動輻射吸収が種となるコロナを作れない。Studio の <code>coronaRamp1d</code> は、標的の外面 \(R\) から</p>
+      $$
+      \rho(r)=\rho_0\exp[-(r-R)/L],\qquad R&lt;r\le R_{\rm corona},
+      $$
+      <p>という指数関数的な吹き出しを生成する。ここで \(\rho_0\) はターゲット表面 \(R\) におけるランプの基部密度、\(L\) はその指数スケール長、\(R_{\rm corona}\) はランプの外端である。<a href="../../verification/index.html#gxii">GXII</a> の回帰試験では \(L=2\,\mu\mathrm m\)、広がり \(10\,\mu\mathrm m\)、\(\rho_0=0.05\,\mathrm{g\,cm^{-3}}\)、裾の下限 \(3\times10^{-4}\,\mathrm{g\,cm^{-3}}\) を使い、351 nm に対する CH の臨界密度 \(0.028\,\mathrm{g\,cm^{-3}}\)（完全電離 CH、\(\bar Z=3.5\)・\(\bar A=6.5\) を仮定した値）を、解像された傾斜層の内側に置いている。この傾斜層は VOID まで狭義単調でなければならず、一様な下限による平坦部を作ってはいけない。かつて存在した 3 セルの平坦部は共振器となり、わずかな吸収から反対称な節点対を指数関数的に成長させたためである。</p>
+
+      <figure>
+        <img src="../../../assets/mesh-1d-regions-corona.png" width="900" height="390" style="max-width:100%;height:auto" alt="中心のガス、シェル、指数関数的なコロナ層、VOID からなる 1D の領域ペイントと、対数表示の密度分布">
+        <figcaption>図A. 体積分率による 1D の領域ペイントと、解像された臨界面を含む前駆プラズマの密度。裾の下限は平坦部を作るためのものではなく安全のための値であり、実際の分布は VOID の境界まで減少する。</figcaption>
+      </figure>
+    </section>
+
+    <section aria-labelledby="pipeline">
+      <h2 id="pipeline">デッキから格子へ：各段階</h2>
+      <ol>
+        <li><p><strong>読み込みと検証。</strong> 連続する半径方向の区間と、区間ごとのセル数を読み、無効な端点・セル数・傾斜配置のパラメータを拒否する。</p></li>
+        <li><p><strong>重みを生成する。</strong> 各区間のすべての規格化セル中心で、スーパーガウス型の重みを評価する。</p></li>
+        <li><p><strong>区間へ配分する。</strong> 重みを幅へ変換し、<code>exact_measure_v2</code> では累積した重みを厳密な測度で反転する。内部の区間境界では、両側で隣り合う幅の幾何平均を目標にする。</p></li>
+        <li><p><strong>節点を組み立てる。</strong> 区間内のセルを積み上げ、幅が有限かつ正であること、狭義単調であること、外端が厳密に一致することを検査する。</p></li>
+        <li><p><strong>領域をペイントする。</strong> 節点の生成方法とは独立に、半径方向の材料の判定条件をセルごとの体積分率へ変換する。</p></li>
+        <li><p><strong>外側の物理を加える。</strong> Studio のキーから VOID の帯と、レーザー標的の場合は狭義単調に減少する指数関数的なコロナ層を生成する。</p></li>
+        <li><p><strong>在庫を確定する。</strong> こうして得られたセル質量が、ラグランジュ運動によって運ばれる材料の在庫になる。</p></li>
+      </ol>
+    </section>
+
+    <section aria-labelledby="controls">
+      <h2 id="controls">選択に関わるキー</h2>
+      <p>以下は、メッシュとデッキ側の幾何に関する代表的な入口である。検証規則の全体と段階ごとの対応範囲は <a href="../../use/namelist.html">namelist リファレンス</a>を参照のこと。</p>
+      <table class="quick-facts">
+        <thead>
+          <tr><th>キー</th><th>対象</th><th>用途</th></tr>
+        </thead>
+        <tbody>
+          <tr><th><code>Mesh.r_max</code>, <code>nr</code>, <code>grid</code></th><td>1D</td><td>外端、半径方向のセル数、一様または区間ごとの傾斜配置のゾーニング。</td></tr>
+          <tr><th><code>Mesh.geometry_1d</code></th><td>1D</td><td><code>"spherical"</code>（既定）、<code>"cylindrical"</code>、<code>"planar"</code> の座標測度。</td></tr>
+          <tr><th><code>Material.is_void</code>, <code>Materials.void_config</code></th><td>デッキ</td><td>外側の材料を VOID のマスクとして識別し、有限な下限の状態を指定する。</td></tr>
+          <tr><th><code>vacuumOutside1d</code></th><td>Studio 生成</td><td>最も外側の 1D 領域のさらに外へ、<code>VOID</code> 材料と体積分率を生成する。</td></tr>
+          <tr><th><code>coronaRamp1d.{scaleUm, extentUm, rho0, rhoMin}</code></th><td>Studio 生成</td><td>VOID の内側に置く、指数関数的な前駆プラズマ層の長さ、広がり、基部の密度、裾の下限。</td></tr>
+          <tr><th><code>Mesh.grid.grading.{edge_ratio, sg_sigma, sg_order, mapping}</code></th><td>1D 傾斜配置</td><td>スーパーガウスの端の下限 \(\epsilon_{\rm edge}\)、広がり \(\sigma_{\rm sg}\)、指数 \(m_{\rm sg}\)、および任意の <code>"exact_measure_v2"</code> 質量重み写像。</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section aria-labelledby="verification">
+      <h2 id="verification">検証</h2>
+      <ul>
+        <li><code>test_mesh_create</code> のビルダ検査が、既定および区間指定の傾斜配置ゾーニングと、<code>exact_measure_v2</code> の契約 — 一定密度でセル質量が原点でスーパーガウスの目標重みに一致すること、等しい重みが（等幅ではなく）等質量のゾーニングを与えること — を判定する。</li>
+        <li>生成そのものは、非有限・非正の幅、単調でない節点列、外端の不一致で明示的に失敗するため、無効な傾斜配置が物理に到達することはない。</li>
+        <li>コロナ層の契約 — VOID まで狭義単調に減少し、臨界面を解像すること — は、上記のランプパラメータをデッキに固定した <a href="../../verification/index.html#gxii">GXII 基準回帰試験</a>が端から端まで検査する。</li>
+      </ul>
+    </section>
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["$$", "$$"], ["\\[", "\\]"]] } };</script>
+  <script defer src="../../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../../nav.js" data-page="mesh-1d" data-root="../../"></script>
+</body>
+</html>

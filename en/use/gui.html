@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en" data-lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TENRYU Studio (GUI) — TENRYU Documentation</title>
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>TENRYU Studio (GUI) <span class="badge">reference</span></h1>
+    <p class="abstract">TENRYU Studio is a desktop application for creating TENRYU Python namelist decks through a form. It generates the deck live as inputs change and brings validation, saving, and local or server execution into one workspace. A saved deck also carries its form state, so a configuration can move between code and the GUI without a separate project file.</p>
+
+    <div class="button-row">
+      <a class="button" href="../../../../gui/manual/index_en.html">English GUI manual</a>
+      <a class="button" href="../../../../gui/manual/index_ja.html">Japanese GUI manual</a>
+    </div>
+    <p>The GUI manual is a separate document set shipped with the TENRYU repository under <code>gui/manual/</code>; the buttons above (and the “GUI manual” link in the top bar) resolve when this documentation is browsed inside a repository checkout, not from a standalone copy of the site.</p>
+
+    <aside class="planned" aria-labelledby="at-a-glance">
+      <h3 id="at-a-glance">At a glance</h3>
+      <ul>
+        <li>Editing the center form immediately updates the Python deck in the right pane.</li>
+        <li>Pass both form validation and server-side <code>tenryu validate</code> before saving or running.</li>
+        <li>Keep the <code>TENRYU-GUI-STATE</code> comment to restore the complete form from a saved deck.</li>
+        <li>Three physics presets were run to completion on an RTX 4090 on 2026-07-31.</li>
+      </ul>
+    </aside>
+
+    <section aria-labelledby="workflow">
+      <h2 id="workflow">From form to run</h2>
+      <p>Studio's left navigation follows the normal setup order: Presets, Basic, Materials, Geometry, Physics, Drive, and Output. The center pane contains the selected form, while the live deck in the right pane always shows the latest Python namelist. Missing required values or inconsistent combinations produce errors in place; deck generation resumes after they are corrected. This makes the TENRYU cgs + eV contract visible while editing: lengths are in cm, times in s, temperatures in eV, and densities in g/cm³.</p>
+      <figure>
+        <img src="../../../../gui/manual/img/en/01_overview.png" alt="Complete TENRYU Studio window" style="max-width: 100%; height: auto;">
+        <figcaption>The header and navigation, center configuration form, and live deck and validation panel on the right.</figcaption>
+      </figure>
+      <p>The basic sequence is form → live deck → validate → save or run. A preset is a starting point, and every field remains editable after it is applied. Read the generated deck, resolve all validation errors, then save it to a file. The result is an ordinary Python deck: it can be run outside Studio with <code>./build/tenryu run deck.py</code> and inspected in any text editor.</p>
+    </section>
+
+    <section aria-labelledby="roundtrip">
+      <h2 id="roundtrip">Round-tripping with <code>TENRYU-GUI-STATE</code></h2>
+      <p>Studio embeds a <code>TENRYU-GUI-STATE</code> comment near the beginning of every deck it saves. Opening that deck restores the entire form—including materials, regions, physics, drive waveforms, and output settings—and restarts live generation. The executable deck itself is therefore the unit to share or archive; there is no separate GUI project file to keep synchronized.</p>
+      <p>A saved deck remains valid Python and may be edited by hand. Removing the state comment, however, prevents Studio from reconstructing the form. If the embedded state and the hand-edited Python body diverge, reopening the file regenerates the deck from the embedded state. For a deck that will return to the GUI, retain the comment and make persistent changes through the restored form before saving again.</p>
+    </section>
+
+    <section aria-labelledby="presets">
+      <h2 id="presets">Run-validated 1D presets</h2>
+      <p>In addition to a blank setup, Studio provides three physics presets. These were not merely accepted by the schema: each was run to its endpoint on an RTX 4090 on 2026-07-31 and checked for its characteristic physical result.</p>
+      <ul>
+        <li><strong>Radiation slab:</strong> a 120 eV Marshak drive and grey FLD produce a heat front near 35 µm at 1 ns, with a cold region still ahead of it.</li>
+        <li><strong>Laser implosion capsule:</strong> a <a href="../verification/index.html#gxii">GXII</a>-class 10 TW × 1 ns drive (GXII: the GEKKO XII laser — see the linked benchmark definition), DT + CH target, corona ramp, and 20-group FLD give about 86% absorption and bang near 1.4 ns. This preset's ≈86% is not comparable with the regression deck's 83–84% or the HELIOS campaign's ≈45% — <a href="examples.html#absorption-numbers">the Examples page</a> lists the three conditions.</li>
+        <li><strong>Indirect-drive Tr(t):</strong> a Marshak waveform rising from a 120 eV foot to 200 eV follows stagnation at 4.2–4.5 ns and the subsequent rebound.</li>
+      </ul>
+      <p><a href="examples.html">The Examples &amp; presets page</a> records the numerical inputs and measured values. When modifying a case, first retain an unmodified short reference run, then vary one input at a time. That makes changes in absorption, compression, and output cadence much easier to identify.</p>
+    </section>
+
+    <section aria-labelledby="server-execution">
+      <h2 id="server-execution">Validate and run on a server</h2>
+      <p>Define an execution profile and TENRYU binary under Servers, then select that profile in the header. Run validate sends a temporary deck to the selected server and performs dry-run validation there. Run ▶ submits the validated setup to the same server. Run History retains its queued, running, completed, or failed status and provides access to the results. Without a configured server, deck generation and saving still work; run the saved file with the TENRYU command line on a suitable host.</p>
+    </section>
+
+    <aside class="planned" aria-labelledby="full-manual">
+      <h3 id="full-manual">Detailed screen-by-screen instructions</h3>
+      <p>Use the English GUI manual linked above for screenshot-driven coverage of every form, server configuration, outputs, and troubleshooting.</p>
+    </aside>
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["\\[", "\\]"]] } };</script>
+  <script defer src="../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../nav.js" data-page="gui" data-root="../"></script>
+</body>
+</html>

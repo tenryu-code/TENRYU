@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="ja" data-lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TENRYU を使う — TENRYU ドキュメント</title>
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>TENRYU を使う</h1>
+    <p class="abstract">この節は、要求環境の確認からビルド、最初の実行、Python namelist デッキの記述 (または TENRYU Studio による生成)、HDF5 出力の読み取りまでの実用ワークフロー全体を扱う。以下のクイックスタートと順路に沿えば、この節のページだけで最初の 1 本を完走できる。</p>
+
+    <section aria-labelledby="quickstart">
+      <h2 id="quickstart">クイックスタート（コピーして実行）</h2>
+      <p>前提が揃っているか不安なら、まず<a href="requirements.html">動作環境と要求スペック</a>の事前チェックから。以降はリポジトリのルートで実行する。</p>
+      <pre><code># 1. ビルド（初回のみ。詳細と失敗時の対処は「ビルド」ページ）
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+ninja -C build
+
+# 2. 動作確認（登録済みの解析解ケースを 1 本）
+./build/tenryu verify noh
+
+# 3. 最初の実行（テンプレートは編集不要でそのまま完走する）
+./build/tenryu validate examples/templates/template_1d_slab_radiation.py   # 実行前検査
+./build/tenryu run      examples/templates/template_1d_slab_radiation.py  # 本実行
+
+# 4. 結果を見る
+ls outputs/template_1d_slab_radiation/results/
+python3 -m tools.tenryu_plot profile outputs/template_1d_slab_radiation</code></pre>
+    </section>
+
+    <h2>ワークフローガイド</h2>
+    <div class="card-grid">
+      <a class="card" href="requirements.html"><h3>動作環境と要求スペック</h3><p>GPU・コンパイラ・ライブラリの要求と、事前チェックのコマンド。</p></a>
+      <a class="card" href="building.html"><h3>ビルド</h3><p>CUDA のリリースビルドの構成、テスト、MPI と ccache の有効化を説明する。</p></a>
+      <a class="card" href="running.html"><h3>シミュレーションの実行</h3><p>テンプレートの完走、デッキの書き方、validate/run/verify/freeze、トラブル対処。</p></a>
+      <a class="card" href="namelist.html"><h3>namelist リファレンス</h3><p>最上位のブロック、代表的なキー、単位、正典となる既定値へ案内する。</p></a>
+      <a class="card" href="gui.html"><h3>TENRYU Studio (GUI)</h3><p>フォーム形式のデスクトップアプリでデッキを作成、検証、保存、実行する。</p></a>
+      <a class="card" href="examples.html"><h3>例題とプリセット</h3><p>実行可能なテンプレート、検証済みの Studio プリセット、検証用のデッキ集。</p></a>
+      <a class="card" href="outputs.html"><h3>出力と解析</h3><p>3 種の HDF5 と来歴ファイルの全データセットを列挙し、読み方を示す。</p></a>
+    </div>
+
+    <aside class="planned" aria-labelledby="first-run">
+      <h3 id="first-run">初めての 1 本：推奨の順路</h3>
+      <ol>
+        <li><a href="requirements.html">動作環境と要求スペック</a>で GPU・ツールチェーンの前提を確認する。</li>
+        <li><a href="building.html">ビルド</a>で、バイナリと <code>ctest</code> の通る環境を作る。</li>
+        <li><a href="running.html">シミュレーションの実行</a>の手順どおり、テンプレートを validate → run で完走させる。</li>
+        <li><a href="examples.html">例題とプリセット</a>の検証済みプリセット — まずは <code>laser_capsule</code> — を、配布された条件のまま実行する。</li>
+        <li><a href="outputs.html">出力と解析</a>に沿って結果を読む。吸収率はエネルギーの台帳（入射と沈着の比）から、爆縮のピークはステップごとの履歴 <code>implosion/rho_peak</code> から読み取る。</li>
+      </ol>
+      <p>物理の詳細が必要になったら<a href="../physics/index.html">物理カーネル</a>の該当ページへ。各ページの「物理機構」の節が、式に入る前の背景を説明する。時間刻みの決まり方は<a href="../overview/timestep.html">時間刻み制御と CFL</a> にまとめてある。</p>
+    </aside>
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["\\[", "\\]"]] } };</script>
+  <script defer src="../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../nav.js" data-page="using-tenryu" data-root="../"></script>
+</body>
+</html>

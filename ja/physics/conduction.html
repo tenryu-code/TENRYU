@@ -1,0 +1,233 @@
+<!doctype html>
+<html lang="ja" data-lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>電子・イオン熱伝導 — TENRYU ドキュメント</title>
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>電子・イオン熱伝導 <span class="badge">reference</span></h1>
+    <p class="abstract">TENRYU の局所電子熱輸送は、Z 依存の γ<sub>0</sub> 補正を常に含む Spitzer–Härm 伝導率、調和型の流束制限、スーパータイムステッピング（STS）で構成される。1D では、明示的に有効化する SNB（Schurtz–Nicolaï–Busquet）多群モデルが非局所補正を加え、Cao 2015 の implicit-SNB（iSNB）ピカール反復で時間方向に連成する。イオン熱伝導は独立したオプションである。</p>
+
+    <aside class="planned" aria-labelledby="at-a-glance">
+      <h3 id="at-a-glance">要点</h3>
+      <ul>
+        <li>Z 依存の γ<sub>0</sub> 補正は全経路で無条件に適用される。旧来の固定係数の経路は削除され、無効化できない。</li>
+        <li>局所 SH と SNB は、外側で同じ調和型の上限を共有する。既定の <code>f_lim</code> は SH で 0.06、SNB で 0.5 である。</li>
+        <li>1D は材料別の保存型有限体積演算子、2D RZ は対称なコンダクタンスをもつ Kershaw 演算子を用い、STS が陽的拡散を加速する。</li>
+        <li>ボイドは κ<sub>eff</sub>=0 の断熱領域である。SNB の多群補正もボイドを透過しない。</li>
+      </ul>
+    </aside>
+
+    <section aria-labelledby="mechanism">
+      <h2 id="mechanism">物理機構</h2>
+      <p>レーザー標的では、レーザーエネルギーが吸収される場所（臨界密度面より外側の希薄なコロナ）と、そのエネルギーがアブレーション圧として仕事をする場所（高密度側のアブレーション面）が空間的に離れている。この二つの領域をつなぐ主要なエネルギー輸送が電子熱伝導である。その強さはアブレーション圧と質量アブレーション率を決め、同時に、アブレーション面より前方の低温物質へどれだけ熱が先回りするか — 予熱の量 — も決める。</p>
+      <p>出発点となるモデルは、熱流束を「その場の温度勾配」に比例させる拡散型の式 \(\mathbf q_{SH}=-\kappa_{SH}\nabla T_e\)、すなわちフーリエ則である。伝導率 \(\kappa_{SH}\) には、電子–イオンのクーロン衝突に基づく Spitzer–Härm（SH）理論の値を使う。温度依存は次の連鎖で決まる。クーロン散乱は速い電子ほど曲げにくいので、衝突周波数は \(\nu_{ei}\propto v^{-3}\) で急減する。これを熱的電子（\(v\sim v_{th,e}\propto T_e^{1/2}\)）で評価すると \(T_e^{-3/2}\) になり、平均自由行程 \(\lambda_{ei}=v/\nu_{ei}\) は \(\lambda_{ei}\propto T_e^{2}/(n_e Z\ln\Lambda)\) と温度の 2 乗で伸びる。伝導率はおおよそ「電子密度 × 熱速度 × 平均自由行程」で見積もれるため、密度依存が打ち消し合い、\(\kappa_{SH}\propto T_e^{5/2}/(Z\ln\Lambda)\) が残る。温度が 2 倍になるだけで伝導率は約 5.7 倍という強い非線形である。したがってコロナが高温になるほど熱伝導は物理的に強くなり、同時に、後述するとおり陽的に解くには時間刻みが極端に小さくなる、数値的に「硬い」拡散問題になる。ただしフーリエ則は「電子がその場の勾配だけを感じて流束が決まる」という局所近似なので、成り立つのは電子の平均自由行程が温度勾配のスケール長 \(L_T=T_e/|\nabla T_e|\) より十分短い場合に限られる。</p>
+      <p>一方、熱流束の大半を運ぶのは平均的な熱的電子ではない。流束への寄与を電子エネルギー別に分解すると（後述の SNB が使うスペクトル重み \(\beta^4e^{-\beta}/24\) がこの分布である）、寄与のピークはおよそ \(3–4\,v_{th,e}\) で動く超熱的な電子にある。平均自由行程は \(\lambda=v/\nu\) と \(\nu\propto v^{-3}\) の帰結として \(v^4\) に比例するので、これらの電子の平均自由行程は熱的電子の 3<sup>4</sup>–4<sup>4</sup>、約 80–260 倍に達する。したがって局所近似の条件 \(\lambda\ll L_T\) は、熱的電子で評価すれば満たされていても、実際に熱を運ぶ電子でははるかに早く破れる。この破れは、勾配が最も急なアブレーション面付近から生じる。</p>
+      <p>局所近似が破れた強勾配の極限でも、プラズマが運べる熱流束には明確な物理上限がある。全熱エネルギーが熱速度で一方向へ流れると仮定した自由流束（free-streaming flux）\(n_e k_BT_ev_{th,e}\) である。実際に持続できる流束はその一部でしかないことが運動論計算と実験の双方で知られており、TENRYU はその割合を係数 \(f_{lim}\) に持たせて、上限 \(q_{max}=f_{lim}n_ek_BT_ev_{th,e}\) を課す。制限は係数 \(\theta=1/(1+|q_{raw}|/q_{max})\) を掛ける形で行い、適用後の流束 \(q=\theta q_{raw}\) は、大きさについて \(1/|q|=1/|q_{raw}|+1/q_{max}\) を満たす — 抵抗の並列合成と同じ「調和合成」であり、これが「調和型リミッタ」の名の由来である。勾配が緩いところでは \(q\approx q_{raw}\) のまま、強勾配では折れ点を作らずに滑らかに \(q_{max}\) へ飽和する。局所 SH モデルの既定値 \(f_{lim}=0.06\) は、直接照射実験との比較で古くから使われてきた較正範囲の値である。SNB 有効時の既定値 0.5 が大きく緩いのは役割が違うためで、流束の抑制は SNB 自身が計算し、リミッタは異常な合成流束を止める外側の安全弁としてだけ残る（詳細は SNB 節）。</p>
+      <p>流束リミッタだけでは非局所輸送は表せない。平均自由行程の \(v^4\) 依存は二つの帰結を同時にもたらす。第一に、勾配が最も急な点では、電子が勾配スケールを衝突なしに走り抜けるため、局所勾配から期待される流束は立たず、実流束は Spitzer–Härm 値を下回る（流束抑制）。第二に、同じ電子は停止するまでの数平均自由行程のあいだ前方へ熱を運び続けるため、アブレーション面より先の物質が加熱される（予熱）。流束リミッタは局所流束を減らすことしかできないので、第一の効果は近似できるが、熱を勾配の前方へ運ぶ第二の効果は原理的に表せない。両方を捉えるには、電子をエネルギー別に追い、どこまで届きどこで熱を落とすかを解く非局所モデルが必要である。</p>
+      <p>Schurtz–Nicolaï–Busquet（SNB）モデルは、この目的の標準的な簡約運動論モデルである。完全な運動論方程式を解く代わりに、SH 流束を電子エネルギー群に分割し、各群の輸送場 \(H_g\)（次元は熱流束）に対して、その群の停止長 \(\lambda_g\)（平均自由行程、mfp）を距離スケールとする拡散方程式を解く。局所 SH 流束の群配分を源泉として \(H_g\) が周囲へ広がることが「担い手が勾配から離れて熱を運ぶ」ことの表現で、そこから再構成した補正 \(\delta q=-\sum_g(\lambda_g^{tr}/3)\nabla H_g\) が、急勾配点の流束を減らすと同時に前方に予熱を作る。TENRYU の SNB は独立したソルバではなく、同じ制限付き SH 経路への加算補正である。補正後の合成流束は、局所経路と共通のただひとつの上限を通る。また、既定の平均自由行程較正（Sherlock 2017 の \(r=2\)）は電場による流束抑制を実効的に含むため、明示的な電場項は二重計上を避ける目的で既定オフである。</p>
+      <p>数値面の主課題は、陽的な拡散更新に付く安定条件 \(\Delta t\lesssim\Delta x^2/D\) である。熱拡散率 \(D\propto T_e^{5/2}/\rho\) は高温・希薄なコロナで急増するため、安定に許される部分ステップ幅は流体の大域ステップよりはるかに小さくなる。典型的な <a href="../verification/index.html#gxii">GXII</a> のコロナ（500 µm ベンチマークカプセルのコロナセル：\(T_e\approx2\) keV、\(\rho\approx10^{-3}\) g/cm³、\(\Delta l\approx50\,\mu\)m）では、大域のドライバステップ 1 回に対して通常の部分ステップが 130–340 回必要になる。スーパータイムステッピング（STS）は、この部分ステップ列を \(s\) 段のチェビシェフ段列で置き換える。段列を合成した安定区間が \(O(s^2)\) で広がるため、必要な段数は部分ステップ数の平方根程度（\(s\approx\lceil\sqrt{2N_{sub}}\rceil\)）で済み、この例では 16–27 段になる。係数は入口の温度で凍結し、ステップの最後に EOS を 1 回だけ再同期する。更新はすべて保存型の有限体積であり、材料別の解像と、任意選択のイオン熱伝導の処理も同じ機構を再利用する。</p>
+    </section>
+
+    <section aria-labelledby="local-model">
+      <h2 id="local-model">局所 Spitzer–Härm モデルと流束制限</h2>
+      <p>電子伝導率は cgs+eV 単位系で次のように評価する。平均電離度 \(\bar Z\) には物性モデルの値を使う。クーロン衝突の頻度を支配するのは電荷の 2 乗平均なので、電荷モーメント比 \(r_2=\langle Z^2\rangle/\bar Z^2\) が得られる材料では、\(\bar Z\) を衝突実効電荷 \(\bar Z r_2\) に置き換える。</p>
+      $$
+      \kappa_{SH}=\kappa_0\,\xi(\bar Z)\,
+      \frac{T_e^{5/2}}{\bar Z\ln\Lambda},\qquad
+      \xi(Z)=\frac{(Z+0.24)/(Z+4.2)}{(1+0.24)/(1+4.2)},
+      $$
+      $$
+      \kappa_0=3.06\times10^9
+      \;\mathrm{erg/(cm\,s\,eV^{7/2})},\qquad
+      \mathbf q_{SH}=-\kappa_{SH}\nabla T_e.
+      $$
+      <p>ここで \(\kappa_0\) は cgs + eV 単位系での Spitzer 前置係数、\(\xi(\bar Z)\) は下の箇条書きで詳述する Z 依存補正、\(\ln\Lambda\) はクーロン対数、\(\mathbf q_{SH}\) が得られる制限前の熱流束である。</p>
+      <p>流束制限は面ごとに適用する。面の電子密度・温度・熱速度 — いずれも左右セルの算術平均 — から \(q_{max}\) を作り、機構節で述べた調和合成の形で制限する（\(k_B\) は cgs + eV 単位系の常として eV→erg の換算定数 <code>eV_to_erg</code> である）。</p>
+      $$
+      v_{th,e}=\sqrt{\frac{k_BT_e}{m_e}},\qquad
+      q_{max}=f_{lim}n_ek_BT_ev_{th,e},\qquad
+      \theta=\frac{1}{1+|q_{raw}|/q_{max}},\qquad q=\theta q_{raw}.
+      $$
+      <ul>
+        <li><strong>\(\xi(Z)\)：</strong>Braginskii の γ<sub>0</sub>(Z) に対する Epperlein–Short の近似式で、ξ(1)=1、ξ(∞)=4.19 である。1D/2D、材料別伝導、SNB の基底となる SH 流束を含むすべての経路で無条件に適用され、削除済みの固定係数の分岐を再び有効にすることはできない。</li>
+        <li><strong>\(q_{max}\) と \(\theta\)：</strong>\(q_{max}=f_{lim}n_ek_BT_ev_{th,e}\) が自由流束に対する割合を定め、θ が調和的な補間を与える。局所経路は \(q_{raw}=q_{SH}\)、SNB は \(q_{raw}=q_{SH}+\delta q\) を使う。SH と SH+δq が二重に制限されることはなく、通るのはひとつの共通した上限だけである。</li>
+        <li><strong>面 κ の閉包：</strong>面の κ を左右セルの値からどう作るかという閉包の既定は <code>kirchhoff_same_material</code> である。同一材料の滑らかな面では、\(T^{5/2}\) に強く非線形な κ(T) を両側の温度区間で厳密に積分した割線値（Kirchhoff 変換に基づく面平均）を使い、急峻な熱波面が格子に固着する傾向を弱める。物質界面、ボイド、テーブル値が大きく跳ぶ箇所では、より保守的な調和平均の閉包を維持する。制限に使う SH の推定値と、実際に適用する流束は、常に同じ閉包を使う。</li>
+        <li><strong>ボイド：</strong><code>cell_is_void</code> は κ<sub>eff</sub>=0 を強制して断熱境界を作り、下限密度しかもたない外側のセルが Δt<sub>exp</sub> を潰してしまうのを防ぐ。SNB ではボイドを恒等行とし、隣接する群の拡散係数を 0 にする。</li>
+        <li><strong>SNB の群：</strong>電子エネルギーを温度で規格化した β̂=E/(k<sub>B</sub> max T<sub>e</sub>) を等比数列で区切って [0.1, <code>snb_E_max_over_Te</code>] にエネルギー群を張り、各群の重み ξ<sub>g</sub>=P(β<sub>g</sub>)−P(β<sub>g−1</sub>) を原始関数の厳密な差として作る。平均自由行程には、既定の <code>geometric_r2</code> と Schurtz の原型の 2 通りがある。</li>
+        <li><strong>iSNB のピカール反復：</strong>Cao 2015 型の連成は (θ, δq) を凍結したうえで、\(T_e^n\) から STS の大ステップを繰り返し、補正を計算し直す。最低 2 回は反復し、流束の最大ノルムの相対許容値で収束を判定する。収束したときの増幅率は任意の Δt で (0,1) に入り、無条件安定である。</li>
+      </ul>
+
+      <figure>
+        <img src="../../assets/conduction-flux-composition.png" width="920" height="307" style="max-width:100%;height:auto" alt="Spitzer–Härm 流束と SNB 補正を合成し、共通の調和型の上限で最終流束を得る流れ図">
+        <figcaption>図A. 流束の合成。<code>nonlocal_model="none"</code> では δq=0 となり、従来の制限付き SH 流束に戻る。</figcaption>
+      </figure>
+    </section>
+
+    <section aria-labelledby="faces-materials">
+      <h2 id="faces-materials">面の閉包、材料別演算子、ボイド</h2>
+      <p>面の κ は左右セルの状態から合成する必要があり、その合成規則を「閉包」と呼ぶ。実運用の既定は <code>kirchhoff_same_material</code> である。同一材料の滑らかな Spitzer 面に限って、\(T^{5/2}\) に強く非線形な κ(T) を両側の温度区間で厳密に積分した割線値（Kirchhoff 変換に基づく面平均）を使う。単純な両端評価では急峻な熱波面の前面で面 κ が過小になり、波面が格子に固着しがちだが、割線値はこの傾向を弱める。物質界面、ボイド、κ<sub>0</sub> のテーブル値が大きく跳ぶ箇所では調和平均の閉包へ戻す。従来の <code>harmonic</code> 閉包も引き続き選択でき、物質界面や伝導率の大きな跳びを保守的に扱う — 調和平均なので、片側の κ が 0 なら面の流束も 0 である。流束制限に使う SH の推定値と実際の流束は、必ず同じ面閉包を使う。</p>
+      <p>1D の平面・円筒・球の演算子は保存型の有限体積で、幾何の違いは面積 \(A_f\) とセル体積 \(V_i\) にしか現れない。材料別モードでは、材料 \(m\) ごとに面の体積率 α<sub>f,m</sub>、温度、密度、\(\bar Z\)、lnΛ から制限済みの κ<sub>eff,f,m</sub> を作る。面で計算した熱流は、片側のセルに +、反対側のセルに − として同じ大きさで与えるため、セル・材料にわたる総和 Σ<sub>c,m</sub>E<sub>e,c,m</sub> は（温度下限による頭打ちが介入しないかぎり）厳密に保存される。STS の段数を決めるときは材料合成値 Σ<sub>m</sub>α<sub>f,m</sub>κ<sub>eff,f,m</sub> を使うが、更新自体は材料別のままである。</p>
+      <p><code>cell_is_void</code> のセルでは κ<sub>eff</sub>=0 を強制する。これによりボイドの境界は熱を通さない断熱面になる。このマスクは性能の面でも必要である。下限密度しかもたないボイドのセルを通常の物質として評価すると、拡散率 κ/(ρc<sub>v</sub>) の分母が極端に小さいために巨大な拡散係数が生じ、それが安定限界 Δt<sub>exp</sub> を潰して STS を実質的に止めてしまうからである。SNB でも同じ扱いを徹底する。ボイドのセルは H<sub>g</sub>=0 の恒等行とし、隣接面の群拡散係数を 0 にして、群拡散がボイドを飛び越えて予熱を運ぶ経路を残さない。</p>
+      <p><code>ion_conduction=True</code> は、イオン熱伝導率 κ<sub>i</sub> を用いて同じ保存型拡散の機構をもう一度適用する。2D RZ では電子と同じ Kershaw の 9 点演算子を使う。典型的な ICF プラズマでは κ<sub>i</sub>≪κ<sub>e</sub> なので既定では無効だが、高密度の燃料コアでは明示的に有効化できる。</p>
+    </section>
+
+    <section aria-labelledby="sts">
+      <h2 id="sts">スーパータイムステッピング</h2>
+      <p>Spitzer 伝導率は \(T_e^{5/2}\) に比例するため、大域ステップ \(\Delta t\) を陽的な安定限界 \(\Delta t_{exp}\) 刻みの部分サイクルで進めると、\(N_{sub}=\lceil\Delta t/\Delta t_{exp}\rceil\) 回のカーネル起動が必要になる。典型的な GXII のコロナ — 機構節と同じ \(T_e\approx2\) keV、\(\rho\approx10^{-3}\) g/cm³、\(\Delta l\approx50\,\mu\)m の条件 — では \(N_{sub}\) は 130–340 に達する。STS はチェビシェフ段列で安定区間を広げ、同じ区間を 16–27 段（\(s\approx\lceil\sqrt{2N_{sub}}\rceil\)）で進める。手順は次のとおりである。</p>
+      <h3>1 回の熱伝導ステップ</h3>
+      <ol>
+        <li><p><strong>すべての面を閉じる。</strong>適用できる範囲では、同一材料の滑らかな Spitzer 面に <code>kirchhoff_same_material</code> を、物質界面・ボイド・テーブル値の大きな跳びには調和平均の閉包を使って、面の κ を評価する。材料別伝導では、材料ごとの面係数を別々に構成して保持する。</p></li>
+        <li><p><strong>すべての面に制限を掛ける。</strong>同じ閉包で面の SH 推定値を作り、\(q_{max}\) を評価して \(\theta=1/(1+|q_{raw}|/q_{max})\) を凍結する。これが、そのステップで用いる制限済みの κ<sub>eff</sub> になる。</p></li>
+        <li>
+          <p><strong>陽解法の安定限界を求める。</strong>\(D_{eff}=\kappa_{eff}/(\rho c_v)\) を作り、最も厳しいセルの値を取る。</p>
+          $$
+          \Delta t_{exp}=C_{cond}\min_c\frac{(\Delta l_c)^2}{D_{eff,c}},\qquad C_{cond}=0.25\ \text{（既定）}.
+          $$
+        </li>
+        <li>
+          <p><strong>段数を決める。</strong>チェビシェフの安定区間は \(O(s^2)\) で広がる。</p>
+          $$
+          s=\max\!\left(1,\left\lceil\sqrt{2\Delta t/\Delta t_{exp}}\right\rceil\right).
+          $$
+          <p>設定した段数の上限（<code>sts_max_stages</code>、既定 40）に達する場合は、要求された区間を複数の大ステップへ分割する。</p>
+        </li>
+        <li>
+          <p><strong>段列を構成する。</strong>既定の減衰 ν=0.01（チェビシェフの減衰パラメータ <code>sts_damping</code> — 他ページの衝突周波数 \(\nu_{ei}\)・\(\nu_a\) とは別物）として次を作る。</p>
+          $$
+          \tau_j=\frac{\Delta t_{exp}}
+          {\nu^2+(1-\nu^2)\cos^2\!\left(\frac{\pi(2j-1)}{4s+2}\right)},
+          \quad j=1,\ldots,s,
+          $$
+          <p>その後、段時間の総和が大ステップに一致する（\(\sum_j\tau_j=\Delta t\)）よう、すべての τ<sub>j</sub> を一様に再スケールする。既定の構成では段列の素の総和が \(\Delta t\) を上回るため、この再スケールは τ<sub>j</sub> を縮める方向に働く。</p>
+        </li>
+        <li>
+          <p><strong>係数を凍結したまま全段を適用する。</strong>\(D_{eff}\)、面の κ、ρc<sub>v</sub> は入口の \(T_e^n\) における値に固定し、1D では温度を、2D では保存型の熱エネルギーだけを段のあいだで更新する。</p>
+          $$
+          T_{e,j}=T_{e,j-1}+\frac{\tau_j}{\rho c_v}\mathcal M_{1D}(T_{e,j-1}),\qquad
+          E_{c,j}=E_{c,j-1}+\tau_jV_c\mathcal M_{Kershaw}^{\kappa}(T_{e,j-1}).
+          $$
+          <p>ここで \(\mathcal M_{1D}\) は凍結係数での保存的な 1D 面流束発散演算子、\(\mathcal M^{\kappa}_{Kershaw}\) は同じく凍結係数での 2D Kershaw 9 点拡散演算子である。面での熱流を符号を反転して入れるため、どちらの有限体積更新も保存的である。材料別の経路でも、凍結した材料別の係数に同じ対の更新を適用する。</p>
+        </li>
+        <li><p><strong>最後に 1 回だけ再同期する。</strong>全段を終えたあと、熱伝導後の EOS を順方向に評価し、更新された温度から e<sub>e</sub>、P<sub>e</sub>、C<sub>v,e</sub> を再構成する。</p></li>
+      </ol>
+    </section>
+
+    <section aria-labelledby="snb">
+      <h2 id="snb">SNB 多群非局所モデル</h2>
+      <p><code>nonlocal_model="snb"</code> は、1D の平面・円筒・球の電子熱伝導に、明示的に有効化する Schurtz–Nicolaï–Busquet 補正を加える。熱伝導ステップごとに、規格化電子エネルギー β̂=E/(k<sub>B</sub> max T<sub>e</sub>) の等比な群境界を [0.1, <code>snb_E_max_over_Te</code>] に張り、既定では 24 群を作り直す。各群では、輸送場 \(H_g\)（次元は熱流束）に対する次の拡散型方程式を解く。右辺の源泉は局所 SH 流束の群配分 \(U_g\) の発散である。源泉として注入された \(U_g\) が停止長のスケールで周囲へ拡散し広がったものが \(H_g\) で、その勾配から後述の非局所補正を再構成する。</p>
+      $$
+      \frac{H_g}{\lambda_g^{abs}}-
+      \nabla\!\cdot\!\left(\frac{\lambda_g^{tr}}{3}\nabla H_g\right)
+      =-\nabla\!\cdot U_g,\qquad U_g=\xi_g q_{SH},
+      $$
+      $$
+      \xi_g=P(\beta_g)-P(\beta_{g-1}),\qquad
+      P(\beta)=1-\frac{e^{-\beta}}{24}
+      (\beta^4+4\beta^3+12\beta^2+24\beta+24).
+      $$
+      <p>ここで \(P(\beta)\) は、Spitzer–Härm 熱流束を規格化電子エネルギーについて累積した分布関数である — 流束は \(\beta^4e^{-\beta}/24\) のスペクトル重みをもち、\(P\) はその積分である。したがって ξ<sub>g</sub> は解析的な原始関数の差であり、数値求積は使わない。補正の総和は \(\delta q=-\sum_g(\lambda_g^{tr}/3)\nabla H_g\) である。セル中心の H<sub>g</sub> を体積積分した有限体積の式は厳密に対角優位な三重対角系となり、全群をストライド付きの一括処理で解く。面の拡散係数は左右の λ<sup>tr</sup> の調和平均を 3 で割った値で、閉じた境界では反射条件を課す。</p>
+
+      <figure>
+        <img src="../../assets/conduction-snb-group-ladder.png" width="920" height="690" style="max-width:100%;height:auto" alt="0.1 から 20 までの SNB の等比群境界と、解析関数 P の差として得られる群重み xi の模式図">
+        <figcaption>図B. SNB の群の段列。大域的な β̂ の境界を物理的なエネルギーへ写し、局所的な β=E/(k<sub>B</sub>T<sub>e</sub>) における P の差を源の重みとして使う。</figcaption>
+      </figure>
+
+      <p>群を代表するエネルギー \(\varepsilon_g=(E_{g-1}+E_g)/2\) は erg で評価する。平均自由行程（mfp）には次の 2 通りがあり、いずれも共通の停止長 \(\lambda_g\) を定義する — 下の電場オプションが輸送側を短くしないかぎり、\(\lambda_g^{abs}\) と \(\lambda_g^{tr}\) はどちらもこの \(\lambda_g\) に等しくなる。</p>
+      $$
+      \lambda_g=
+      \begin{cases}
+      \dfrac{2\sqrt2\,\varepsilon_g^2}
+      {4\pi n_e e^4\ln\Lambda\,\sqrt{\bar Z\varphi}},
+      &amp; \texttt{geometric\_r2}\quad(\text{Sherlock 2017; default}),\\[6pt]
+      \dfrac{2\,\varepsilon_g^2}
+      {4\pi n_e e^4\ln\Lambda\,\sqrt{\bar Z+1}},
+      &amp; \texttt{original}\quad(\text{Schurtz 2000}),
+      \end{cases}
+      \qquad \varphi=\frac{\bar Z+4.2}{\bar Z+0.24}.
+      $$
+      <p>通常は λ<sup>abs</sup>=λ<sup>tr</sup> である。<code>snb_efield="local"</code> は輸送側の平均自由行程だけを \(1/\lambda_g^{tr}\mathrel{+}=|e\mathcal E|/\varepsilon_g\) によって短くするが（\(\mathcal E\) は筆記体で表した局所静電場の大きさ — エネルギーの \(E\) との衝突を避けた記法 — で、プラズマ状態から評価する）、既定は <code>none</code> である。r=2 の較正がすでに電場による抑制を含むため、併用すると二重計上になり得る。</p>
+      <h3>SNB 補正の手順</h3>
+      <ol>
+        <li><p><strong>群を作り直す。</strong>熱伝導ステップごとに、最大の \(T_e\) から [0.1, <code>snb_E_max_over_Te</code>] の大域的な等比 β̂ 境界を作り直し、原始関数の厳密な差から ξ<sub>g</sub> を作る。</p></li>
+        <li><p><strong>停止長を評価する。</strong>局所の電子密度、クーロン対数、電離状態、群の中心エネルギーから各 λ<sub>g</sub> を計算する。式は既定の <code>geometric_r2</code>、または Schurtz の <code>original</code> を使う。</p></li>
+        <li><p><strong>連立系を組み立てる。</strong>各群のセル中心の有限体積方程式を体積積分し、厳密に対角優位な三重対角系にする。反射境界で領域を閉じ、ボイドは恒等行、隣接する拡散係数は 0 とする。</p></li>
+        <li><p><strong>全群を解く。</strong>全群をストライド付き一括の三重対角求解としてまとめて実行し、\(H_g\) を得る。</p></li>
+        <li>
+          <p><strong>補正を再構成する。</strong>群の順序を固定して次を加算する。</p>
+          $$
+          \delta q=-\sum_g\frac{\lambda_g^{tr}}{3}\nabla H_g.
+          $$
+        </li>
+        <li><p><strong>制限前の流束を合成する。</strong>局所 SH 経路と同じ面 κ の閉包を使い、\(q_{raw}=q_{SH}+\delta q\) を作る。</p></li>
+        <li><p><strong>共通の上限を適用する。</strong>\(\theta=1/(1+|q_{raw}|/q_{max})\) を 1 回だけ評価し、\(q=\theta q_{raw}\) を適用する。SNB 専用の 2 つ目の制限はない。</p></li>
+        <li><p><strong>iSNB のピカール反復を閉じる。</strong>(θ, δq) を凍結し、\(T_e^n\) から STS の大ステップ全体をやり直して、区間の端で補正を計算し直す。最低 2 回は反復し、<code>snb_picard_max_iters</code> に達するまで、流束の最大ノルムの相対値を <code>snb_picard_rtol</code> と比較する。収束しなかった場合はその旨を報告し、最後の反復結果を採用する。収束したときの増幅率は、任意の Δt で (0,1) に入る。</p></li>
+      </ol>
+      <p>SNB を選ぶと <code>f_lim</code> の既定値は 0.5 に緩む。流束をどれだけ抑えるかは SNB 自身が計算するので、この値で非局所効果の強さを調整するわけではない。緩いリミッタは、万一異常な合成流束が生じたときに止める外側の安全弁としてだけ残る。Studio でも SNB を選ぶと同じ既定値へ切り替わる。</p>
+    </section>
+
+    <section aria-labelledby="controls">
+      <h2 id="controls">namelist による制御</h2>
+      <p>以下は <code>Numerics.conduction</code> の主要キーである。全項目と検証規則は <a href="../use/namelist.html">namelist リファレンス</a>を参照のこと。</p>
+      <table class="quick-facts">
+        <thead>
+          <tr><th>キー</th><th>既定値</th><th>用途</th></tr>
+        </thead>
+        <tbody>
+          <tr><th><code>conduction.enabled</code></th><td><code>True</code></td><td>電子熱伝導の演算子全体を有効化。</td></tr>
+          <tr><th><code>f_lim</code></th><td>SH: <code>0.06</code><br>SNB: <code>0.5</code></td><td>外側で共通に掛ける調和型の流束上限。SNB での値は物理モデルではなく安全弁である。</td></tr>
+          <tr><th><code>ion_conduction</code></th><td><code>False</code></td><td>独立したイオン熱伝導の処理を追加。</td></tr>
+          <tr><th><code>solver</code></th><td><code>"sts"</code></td><td>許容値は <code>"sts"</code>（既定の陽的チェビシェフ・スーパータイムステッピング）、<code>"implicit"</code>、<code>"hypre"</code> — 最後のものは hypre ライブラリの BoomerAMG 前処理 [6,7] を使い、任意の Hypre ビルド依存を要する。SNB は <code>"sts"</code> を要求する。</td></tr>
+          <tr><th><code>face_kappa_policy</code></th><td><code>"kirchhoff_same_material"</code></td><td>実運用の既定である、同一材料での Kirchhoff 割線による面 κ。従来の <code>"harmonic"</code> 閉包も選べる。</td></tr>
+          <tr><th><code>nonlocal_model</code></th><td><code>"none"</code></td><td><code>"none"</code> または 1D の <code>"snb"</code>。</td></tr>
+          <tr><th><code>snb_n_groups</code></th><td><code>24</code></td><td>SNB のエネルギー群数。</td></tr>
+          <tr><th><code>snb_E_max_over_Te</code></th><td><code>20</code></td><td>等比 β̂ 段列の上端。</td></tr>
+          <tr><th><code>snb_mfp</code></th><td><code>"geometric_r2"</code></td><td>Sherlock の r=2 が既定、または <code>"original"</code>。</td></tr>
+          <tr><th><code>snb_efield</code></th><td><code>"none"</code></td><td>任意選択の局所電場による平均自由行程の補正は <code>"local"</code>。</td></tr>
+          <tr><th><code>snb_picard_max_iters</code></th><td><code>8</code></td><td>iSNB のピカール反復の上限。最低 2 回は反復する。</td></tr>
+          <tr><th><code>snb_picard_rtol</code></th><td><code>0.01</code></td><td>流束の最大ノルムによる相対収束判定。</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section aria-labelledby="verification">
+      <h2 id="verification">検証</h2>
+      <ul>
+        <li><strong>SNB の 4 ゲート G1–G4：</strong>G1 は退行防止のゲートである。<code>nonlocal_model="none"</code> のとき、<a href="../verification/index.html#gxii">GXII</a> FLD の 6 指標が機能オフの実行とビット単位で同一（相対差 0）に保たれることを確認する。G2 は局所極限の検査である。平均自由行程 λ→0 で SNB が局所 SH に戻ることを、正弦的な温度摂動に対する流束低減比（分散応答）\(R(k)=\sum_g\xi_g/(1+\lambda_g^{abs}\lambda_g^{tr}k^2/3)\) で確かめ、離散演算子の値 \(R_{disc}\) が許容値 10<sup>−3</sup> のもとで ∣R−R<sub>disc</sub>∣≤5.5×10<sup>−8</sup> に収まることを見る。さらに、小さな k での漸近挙動 \((1-R)\propto k^2\) を log–log 勾配 1.986（≈2）で、2 段 tanh 温度ランプに対する増幅 100.7 が導出した曲率の上界に収まることを、それぞれ検査する。G3 は解析解との比較である。離散化した Epperlein–Short の解析解と 7.2×10<sup>−7</sup> 以内で一致する（判定値は 3×10<sup>−3</sup>、分散関係の検査は \(k\lambda_{ei}&lt;0.5\) の帯が対象である）。G4 は保存の検査で、平面・円筒・球の保存収支を、判定値 10<sup>−14</sup> に対して 7.4×10<sup>−17</sup> まで閉じる。</li>
+        <li><strong>STS の対比較：</strong>解析解を持つ 1D の零流束固有モードについて、球・平面・円筒の STS 段列を、陰解法および材料別の対応する計算と突き合わせ、空間の精度次数と、閉じた領域での電子エネルギー保存を検査する。さらに <code>test_conduction_pattle_1d</code> が、Pattle の非線形拡散相似解 [4] との比較で \(T^{5/2}\) 熱波面の伝播を判定する。</li>
+        <li><strong>GXII の基準解：</strong>熱伝導を有効にした統合回帰試験が、吸収エネルギー、最大圧縮時刻、シェル最小半径、ピーク密度、面密度、中心温度を判定する。</li>
+        <li><strong>Kirchhoff の診断：</strong>同一材料の急峻な面を対象に、次を検査する。Kirchhoff 閉包と調和平均閉包とで熱流と時間刻みがどう変わるかの比、制限が効いた状態で \(|q|\le q_{max}\) が守られること、凍結係数の演算子への Gershgorin 円板の対角優位性監査による時間刻みの保護（体積 0 のセルは除外）、物質界面で調和平均へ正しく切り替わること。</li>
+      </ul>
+    </section>
+
+    <section aria-labelledby="references">
+      <h2 id="references">参考文献</h2>
+      <ol class="references">
+        <li>L. Spitzer, Jr. and R. Härm, "Transport Phenomena in a Completely Ionized Gas," Phys. Rev. 89, 977–981 (1953). <a href="https://doi.org/10.1103/PhysRev.89.977">doi:10.1103/PhysRev.89.977</a></li>
+        <li>S. I. Braginskii, "Transport Processes in a Plasma," Reviews of Plasma Physics 1, 205–311 (1965).</li>
+        <li>E. M. Epperlein and R. W. Short, "A Practical Nonlocal Model for Electron Heat Transport in Laser Plasmas," Phys. Fluids B 3, 3092–3098 (1991). <a href="https://doi.org/10.1063/1.859789">doi:10.1063/1.859789</a></li>
+        <li>R. E. Pattle, "Diffusion from an Instantaneous Point Source with a Concentration-Dependent Coefficient," Q. J. Mech. Appl. Math. 12, 407–409 (1959). <a href="https://doi.org/10.1093/qjmam/12.4.407">doi:10.1093/qjmam/12.4.407</a></li>
+        <li>V. Alexiades, G. Amiez, and P.-A. Gremaud, "Super-Time-Stepping Acceleration of Explicit Schemes for Parabolic Problems," Commun. Numer. Methods Eng. 12, 31–42 (1996). <a href="https://doi.org/10.1002/(SICI)1099-0887(199601)12:1%3C31::AID-CNM950%3E3.0.CO;2-5">doi:10.1002/(SICI)1099-0887(199601)12:1&lt;31::AID-CNM950&gt;3.0.CO;2-5</a></li>
+        <li>R. D. Falgout and U. M. Yang, "hypre: A Library of High Performance Preconditioners," Computational Science—ICCS 2002, LNCS 2331, 632–641 (2002).</li>
+        <li>V. E. Henson and U. M. Yang, "BoomerAMG: A Parallel Algebraic Multigrid Solver and Preconditioner," Appl. Numer. Math. 41, 155–177 (2002).</li>
+        <li>G. P. Schurtz, Ph. D. Nicolaï, and M. Busquet, "A Nonlocal Electron Conduction Model for Multidimensional Radiation Hydrodynamics Codes," Phys. Plasmas 7, 4238–4249 (2000). <a href="https://doi.org/10.1063/1.1289512">doi:10.1063/1.1289512</a></li>
+        <li>M. Sherlock, J. P. Brodrick, and C. P. Ridgers, "A Comparison of Non-Local Electron Transport Models for Laser-Plasmas Relevant to Inertial Confinement Fusion," Phys. Plasmas 24, 082706 (2017). <a href="https://doi.org/10.1063/1.4986095">doi:10.1063/1.4986095</a></li>
+        <li>D. Cao, G. Moses, and J. Delettrez, "Improved Non-Local Electron Thermal Transport Model for Two-Dimensional Radiation Hydrodynamics Simulations," Phys. Plasmas 22, 082308 (2015). <a href="https://doi.org/10.1063/1.4928445">doi:10.1063/1.4928445</a></li>
+        <li>A. Marocchino, M. Tzoufras, S. Atzeni, et al., "Comparison for Non-Local Hydrodynamic Thermal Conduction Models," Phys. Plasmas 20, 022702 (2013). <a href="https://doi.org/10.1063/1.4789878">doi:10.1063/1.4789878</a></li>
+      </ol>
+    </section>
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["$$", "$$"], ["\\[", "\\]"]] } };</script>
+  <script defer src="../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../nav.js" data-page="conduction" data-root="../"></script>
+</body>
+</html>

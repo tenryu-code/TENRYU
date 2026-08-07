@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="ja" data-lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>2D RZ メッシュ: 構造格子とマルチブロック — TENRYU ドキュメント</title>
+  <link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>2D RZ メッシュ: 構造格子とマルチブロック <span class="badge">reference</span></h1>
+    <p class="abstract">2D では、構造矩形、球面極座標、箱の中の極座標、そして CSR 接続によるマルチブロックの各系統を、同じ RZ 幾何の契約へ写像する。</p>
+
+    <section aria-labelledby="mechanism">
+      <h2 id="mechanism">物理機構</h2>
+      <p>矩形、極座標、箱の中の極座標、シェルと襟のマルチブロック、五角形帯のいずれの 2D 系統であっても、物理へ渡すものは同じでなければならない。すなわち、回転体としての RZ セル体積、正確なコーナーの幾何、そして節点・セル・面の一貫した接続関係である。物理カーネルは、どの生成器がメッシュを作ったかを知らない。これが「RZ 幾何の契約はひとつ」という言い方の意味であり、問題ごとに系統を差し替えられる理由でもある。</p>
+      <p>各系統は、それぞれ異なる幾何の問題を解く。矩形 RZ は頑健な既定であり、極座標は球状の収束に沿い、等立体角の分割はリングごとの質量流束を均等に配分する。箱の中の極座標は、球形の標的と矩形の外周を両立させる。シェルと襟からなるマルチブロックの組み立ては、実際の標的の構造に沿う。極座標の中心近傍では、五角形の帯が角度分割数の変化を接続関係の側へ吸収する。入れ子になった 2:1 の段列の上に置く 5 辺の遷移セルが、退化した <code>TWO_TO_ONE</code> の接合を置き換え、平滑化だけでは解けない問題を処理する。</p>
+      <p>メッシュの品質は見栄えの指標ではなく、許容されるための条件である。最小高さとコーナーのヤコビアンは、体積・力・リマップの各演算子が必要とする不変量である。このため保護判定は、時間刻みを予測的に制限したり、候補となる状態を拒否したりすることがある。生成器も、向きや体積が正であるという契約を守れないメッシュは返さず、明示的に失敗する。</p>
+      <ul>
+        <li><strong>接続関係:</strong> 単一ブロックの構造格子セルは、暗黙の 4 コーナーの添字付けを使う。マルチブロックの系統は CSR 形式のセル→節点、逆向きの節点→セル、面の隣接関係を使い、各接合部では単一の所有側が書き込む共有の節点 ID を共有する。</li>
+        <li><strong>コーナーの容量:</strong> 通常の四辺形の配置では <code>corner_stride=4</code>、五角形帯の方式では <code>corner_stride=8</code> を使い、<code>cell_nverts</code> が有効な枠の数を指定する。</li>
+        <li><strong>極座標の切り詰め:</strong> <code>polar_theta_min</code> が正のとき、切断する半直線が鏡映境界になり、反対側の辺は \(R=0\) の軸へ厳密に合わせられる。</li>
+        <li><strong>等 \(\mu\) 分割:</strong> <code>polar_equal_mu_zoning</code> は角度方向の節点を \(\mu=\cos\theta\) について等間隔に配置し、\(\theta\) 等間隔ではなく等立体角を与える。</li>
+      </ul>
+    </section>
+
+    <section aria-labelledby="two-d-layout">
+      <h2 id="two-d-layout">2D RZ の構造的な配置</h2>
+      <p>2D の既定である <code>logical_mesh_2d="rectangular_rz"</code> は、\(N_rN_z\) 個の四辺形セルと \((N_r+1)(N_z+1)\) 個の節点をもつ行優先の構造格子である。セル \((i,j)\) は 4 つの節点 \((i,j),(i+1,j),(i+1,j+1),(i,j+1)\) に囲まれ、熱力学量をセルに、位置と速度を節点に置く。断面上の四辺形は方位角方向へ回転させた RZ 体積として評価するため、単なる平面の面積ではない。ラグランジュ運動や ALE のリゾーンで物理座標が動いても、単一ブロックにおける論理的な \((i,j)\) の接続は変わらない。</p>
+    </section>
+
+    <section aria-labelledby="mesh-families">
+      <h2 id="mesh-families">極座標とマルチブロックの系統</h2>
+      <p>構造化された極座標メッシュは \((s,\theta)\mapsto(R,Z)=(s\sin\theta,s\cos\theta)\) によって半平面へ写像する。\(\theta\) は一様、区間ごとの指定、または <code>polar_equal_mu_zoning</code> による等立体角の配置から選べる。<code>polar_theta_min&gt;0</code> は三角形扇のメッシュを \([\theta_{\min},\pi]\) に切り、切断する半直線を鏡映境界、その反対側を厳密な \(R=0\) の軸とする。箱の中の極座標は、内側の極座標部分を滑らかに矩形の外周へ変形させ、箱に沿う襟状のリングで閉じる。物体に沿ったシェルと襟の組み立ては、シェル、壁近傍の帯、充填ガスを、隙間のないブロックとして組み合わせる。中心側で角度分割数を変える五角形帯の接続は、一般的な <code>TWO_TO_ONE</code> の接合の代わりに 5 頂点の遷移セルを置き、細かい \(\theta\) の段列を 2:1 で間引く。構造格子が暗黙の 4 コーナーの添字付けを使うのに対し、マルチブロックはセル→節点、逆向きの節点→セル、面の隣接関係を CSR 形式で保持し、接合部の節点は単一の所有側がもつ共有 ID になる。各セルは <code>cell_nverts</code> として有効な頂点数をもち、通常は <code>corner_stride=4</code>、五角形帯における多角形の容量は <code>corner_stride=8</code> である。各生成器が段階ごとに対応する物理と制約は namelist リファレンスに従う。</p>
+
+      <figure>
+        <img src="../../../assets/mesh-2d-family-gallery.png" width="1000" height="310" style="max-width:100%;height:auto" alt="矩形RZ、構造polar、polar-in-box、pentagon-beltの4種類の2Dメッシュ模式図">
+        <figcaption>図A. 2D メッシュの系統の模式図。左の 3 つは単一の論理ブロックの代表例、右端は 5 角形のセルで粗いリングと細かいリングを接続する CSR の接続関係を示す。</figcaption>
+      </figure>
+    </section>
+
+    <section aria-labelledby="pipeline">
+      <h2 id="pipeline">namelist から受理されたメッシュまで</h2>
+      <ol>
+        <li><p><strong>選択と検証。</strong> メッシュの系統を選び、半径方向・軸方向・角度方向のうち該当する区間の数と端点を検証する。</p></li>
+        <li><p><strong>節点を生成する。</strong> 該当する一様・傾斜配置・等 \(\mu\) の段列を構築し、必要な軸上の節点を厳密に \(R=0\) へ合わせる。</p></li>
+        <li><p><strong>接続関係を組み立てる。</strong> 構造ブロックでは暗黙の添字付けを、マルチブロックのセルでは CSR の接続を使い、共有される接合部の節点について所有側を明示する。</p></li>
+        <li><p><strong>セルを検査する。</strong> メッシュを次の段へ渡す前に、向きと、厳密な回転体としての RZ 体積が正であることを検証する。</p></li>
+        <li><p><strong>コーナーの幾何を保持する。</strong> エネルギー整合な演算子と品質検査が使うコーナー面積ベクトル \(\mathbf S\) と、最小高さのデータを構築する。</p></li>
+        <li><p><strong>流体へ引き渡す。</strong> 共通の幾何・接続の契約を公開し、予測的な最小高さの保護判定と、コーナーヤコビアンの保護判定を有効にする。</p></li>
+      </ol>
+    </section>
+
+    <section aria-labelledby="controls">
+      <h2 id="controls">選択に関わるキー</h2>
+      <p>以下は、メッシュとデッキ側の幾何に関する代表的な入口である。検証規則の全体と段階ごとの対応範囲は <a href="../../use/namelist.html">namelist リファレンス</a>を参照のこと。</p>
+      <table class="quick-facts">
+        <thead>
+          <tr><th>キー</th><th>対象</th><th>用途</th></tr>
+        </thead>
+        <tbody>
+          <tr><th><code>Mesh.nr</code>, <code>nz</code>, <code>logical_mesh_2d</code></th><td>2D</td><td>論理的な解像度と、<code>rectangular_rz</code>、<code>spherical_polar_halfplane</code>、<code>polar_in_box</code>、<code>cone_shell</code> の選択。</td></tr>
+          <tr><th><code>Mesh.grid_r</code>, <code>grid_z</code>, <code>grid_theta</code></th><td>2D</td><td>方向ごとの一様・傾斜配置の区間。極座標の θ 区間は、材料や壁の境界を面に合わせて固定できる。</td></tr>
+          <tr><th><code>Mesh.polar_equal_mu_zoning</code></th><td>2D 極座標</td><td>一様な θ の代わりに、等立体角の節点を生成する。</td></tr>
+          <tr><th><code>Mesh.polar_theta_min</code></th><td>2D 極座標</td><td>既定は 0。正の値では三角形扇の範囲を \([\theta_{\min},\pi]\) に切断する。</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section aria-labelledby="verification">
+      <h2 id="verification">検証</h2>
+      <ul>
+        <li><code>test_mesh_quality_dt_limiter</code> と流体内での保護判定の試験は、最小高さとコーナー \(J\) の下限、膨張時には制限しないこと、反転する候補を拒否すること、そして決定論性を検査する。</li>
+        <li><code>test_polar_truncated_span</code> は、\(\theta_{\min}\) からの開始、鏡映による切断、体積が正であること、解析的なくさび体積、閉じた中心の扇、ビット単位の決定性を固定する。</li>
+        <li><code>test_h02_axis_exact_snap</code> は、環状・三角形扇・ボタンのいずれについても両極の行が厳密に \(R=0\) となり、赤道と南北の鏡映が必要な経路で厳密になることを検査する。</li>
+        <li>マルチブロックの接続に関する試験は、接合部で共有される節点 ID、CSR の面隣接関係の対における双方向・相互の整合性、逆向きの接続、五角形帯における頂点数・向き・2:1 の θ の入れ子を検査する。</li>
+      </ul>
+    </section>
+
+    <section aria-labelledby="references">
+      <h2 id="references">References</h2>
+      <ol class="references">
+        <li>P. M. Knupp, "Algebraic Mesh Quality Metrics," SIAM J. Sci. Comput. 23, 193–218 (2001). <a href="https://doi.org/10.1137/S1064827500371499">doi:10.1137/S1064827500371499</a> — 許容性判定に使う最小高さ・ヤコビアン型の品質尺度の背景文献。</li>
+      </ol>
+    </section>
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["$$", "$$"], ["\\[", "\\]"]] } };</script>
+  <script defer src="../../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../../nav.js" data-page="mesh-2d" data-root="../../"></script>
+</body>
+</html>

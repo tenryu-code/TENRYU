@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="ja" data-lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ALE: リゾーニングとリマップ — TENRYU ドキュメント</title>
+  <link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>ALE: リゾーニングとリマップ <span class="badge">reference</span></h1>
+    <p class="abstract">TENRYU の 2D RZ ALE は、ラグランジュ計算のあとでメッシュ形状だけを整える「リゾーン」と、物質の状態を新しいメッシュへ移す「保存的リマップ」を分離している。従来型 Winslow 系、参照・障壁目標、M1/TMOP 目的関数ソルバのいずれも同じ許容性契約に接続されており、受理された目標メッシュに対してのみ、質量・運動量・内部エネルギー・輻射群エネルギーを保存的に転写する。</p>
+
+    <aside class="planned" aria-labelledby="at-a-glance">
+      <h3 id="at-a-glance">要点</h3>
+      <ul>
+        <li>1 サイクルは、ラグランジュ更新 → 発動判定 → 目標メッシュ生成 → 許容性判定 → 保存的リマップ の順に進む。</li>
+        <li>既定のソルバはビット単位で従来実装と一致する Winslow 法で、M1/TMOP と参照障壁法は明示的に有効化して使う。</li>
+        <li>リマップが運ぶのは密度や速度といった示強量ではなくセル積分量であり、最後に新しい体積と質量で割って基本変数を復元する。</li>
+        <li>RZ 体積、コーナーヤコビアン、ガウス点ヤコビアン、軸マージン、掃引の正値性のいずれかを満たさない候補メッシュは、変位を縮小するか、変更前の状態へ巻き戻される。</li>
+      </ul>
+    </aside>
+
+    <section aria-labelledby="mechanism">
+      <h2 id="mechanism">物理機構</h2>
+      <p>物質に追随するメッシュは物質界面を鋭く保つが、ずり流れ・渦度・収束時の非対称性はラグランジュメッシュに次第に無理をかける。セルはひずみ、扁平化し、ついには反転する。物質の物理が破綻するよりはるか前に、セルの最小高さが時間刻みを崩壊させる。ALE はこの問題への対処である。TENRYU はメッシュが健全なあいだはラグランジュ的な忠実さを保ち、健全でなくなった時点で、物質は動かさずにメッシュだけを動かす。リゾーンがより良い節点座標を提案し、リマップがその新しいメッシュ上へ状態量を保存的に転写する。名前の「任意（arbitrary）」は、メッシュの速度を物質速度（ラグランジュ）にも 0（オイラー）にも固定せず任意に選べる、という定式化上の自由を指す。TENRYU は、健全なあいだは物質速度を、必要になった時点ではリゾーンが提案する座標を採用する。</p>
+      <p>リゾーニングが扱うのは幾何であって物理ではない。後述するソルバ族の Winslow 型平滑化とその制約付き変種は、目標メッシュを構築するだけであり、解を暗黙のうちに変えてはならない。この分離を強制するのが、RZ 体積の正値性、コーナーヤコビアンの下限、ガウス点ヤコビアン、節点経路の検査、そして直線探索と巻き戻しである。許容できない目標メッシュは棄却され、そのサイクルはラグランジュ計算のまま進む。そもそもリゾーンを試みるかどうかは、実行間隔、メッシュ品質指標、軸およびコーナーヤコビアンの保護判定が決める。</p>
+      <p>リマップは、同じ接続関係をもつ旧メッシュと新メッシュのあいだで交わされる保存則の取引である。両者の面のあいだにできる符号付き掃過体積を用いて、厳密に帳尻を合わせる。各掃過領域は供給側セル（ドナー）の状態をひとつ取り、勾配再構成と MS2（Margolin–Shashkov 2 次 [4]）制限関数による単調 2 次精度で評価する。質量、化学種質量、運動量、内部エネルギーと運動エネルギー、輻射群エネルギーという示量量の収支はいずれも、ひとつの符号付き体積・ひとつのドナー・隣接セル間で大きさが等しく符号が逆の更新によって運ばれる。したがってメッシュの移動は、構成上、丸め誤差の範囲まで保存的である。文書化されたエネルギークロージャは、運動エネルギーのリマップと射影の差を物質の内部エネルギーへ繰り入れる。コーナー質量が再構築されるのは受理されたリマップの後だけであり、そこがコーナー質量のラグランジュ不変性が変化しうる唯一の点である。</p>
+      <p>実運用の管理型 ALE は、全体を一様に緩和するのではなく帯状に制御する。軸帯とオイラー窓が再配置の作用域を限定し（RZ のラグランジュメッシュは軸で最初に破綻する）、帯の内側だけの掃過体積リマップが保存則の取引を局所に保つ。受理されるサイクルはすべて、機能オフ時のビット一致契約も維持する。コントローラが無効な場合、あるいは一度も発動しなかった場合、結果は純ラグランジュ経路とビット単位で同一である。</p>
+    </section>
+
+    <section aria-labelledby="cycle-triggers">
+      <h2 id="cycle-triggers">ALE サイクルと発動条件</h2>
+      <p>通常の入口はラグランジュ更新の直後である。ここで <code>every_n_steps</code>（既定 5）が定める実行間隔と、セル品質の低下を評価する。双一次写像を 2×2 のガウス点で調べ、セル品質を</p>
+      $$
+      q_c=\frac{J_{\min}}{J_{\max}},
+      \qquad \min_c q_c&lt;q_{\mathrm{threshold}}
+      $$
+      <p>と定義する。既定のしきい値は <code>quality_threshold=0.2</code> で、\(q_c=1\) は平行四辺形、0 に近づくほど退化したセルであることを表す。<code>spacing_ratio_threshold</code> は設定と検証の対象ではあるものの、v1 では実行時の発火規則をもたない予約キーである（数値契約 — リポジトリの <code>docs/NUMERICS.md</code> §3.3 — に発火条件が定義されていない）。そのため現行の発動条件には数えない。</p>
+      <p>定期実行を待たない保護経路もある。予防的な軸ガードは、軸マージンが初期値の設定割合を下回った時点でリゾーンを強制する。既定オフの流体計算前コーナーヤコビアン判定は、予測される軌道上で符号付きコーナーヤコビアンが下限に達する時刻を求め、許容される変位倍率がしきい値を下回るなら、演算子分割の前に ALE を起動する。参照障壁経路はさらに、軸近傍のマージン、コーナーヤコビアン比、対角コーナー長さ比を専用の発動条件として使う。</p>
+
+      <figure>
+        <img src="../../../assets/ale-remap-cycle.png" width="1080" height="360" style="max-width:100%;height:auto" alt="ラグランジュ更新、発動判定、リゾーン、許容性判定、保存的リマップ、コーナー質量の再構築からなる ALE サイクル">
+        <figcaption>図A. リゾーンが提案するのは節点座標だけである。状態量の転写とコーナー質量の再構築は、目標メッシュとリマップの判定をすべて通過した取引においてのみ確定される。</figcaption>
+      </figure>
+    </section>
+
+    <section aria-labelledby="rezone-solvers">
+      <h2 id="rezone-solvers">リゾーンソルバ族</h2>
+      <p><code>legacy_winslow</code> は、既定である簡略化直交 Winslow 更新をビット単位で従来どおりに保つ。論理格子上の計量係数を現在の座標から 1 反復遅らせてヤコビ反復し、交差微分項を省いた式（ここでの \(\alpha\)・\(\beta\) は Winslow の計量係数であり、輻射ページの同名記号とは無関係である）</p>
+      $$
+      r_{i,j}^{new}=\frac{\alpha(r_{i+1,j}+r_{i-1,j})+\beta(r_{i,j+1}+r_{i,j-1})}
+      {2(\alpha+\beta)}
+      $$
+      <p>を \(z\) にも適用する。明示的に有効化する完全 R-Z 計量版は、混合微分項と R 重み付き候補を含み、節点に接するセルのガウス点ヤコビアン、コーナーヤコビアン、符号付き RZ 体積、軸以外での半径を調べる節点局所の直線探索を利用できる。</p>
+      <p>参照 Winslow・障壁族は、初期のオイラーメッシュや等角度球面メッシュといった参照目標への変位を作り、参照メッシュに対する相対下限を課した全体直線探索で混合する。軸近傍の参照障壁や保護区画では、Winslow の提案を初期値として、体積とコーナーヤコビアンの障壁が定める実行可能領域へ射影する。検査されるのは終点だけでなく、ラグランジュメッシュから目標メッシュへ至る経路全体である。</p>
+      <p><code>m1_tmop</code> は、明示的に有効化する減衰ガウス–ニュートン法のソルバである。参照計量に対する M1 品質、ラグランジュ位置への係留、極座標行の間隔正則化、行列式が小さいときに作用する障壁項を合わせた目的関数を最小化する。</p>
+      $$
+      \mathcal J(\mathbf x)=
+      \frac{\sum_{c,q}\omega_{cq}\det(W_{cq})\,\mu(A_{cq}W_{cq}^{-1};\gamma_{\rm align})}
+           {\sum_{c,q}\omega_{cq}\det(W_{cq})}
+      +\frac{\lambda_{\rm tether}}{N_v}\sum_i\frac{\|\mathbf x_i-\mathbf x_i^L\|^2}{h_i^2}
+      +\frac{w_\theta}{N_v}\sum_{i\in\mathcal R}
+       \left(\frac{d_{iL}-d_{iR}}{d_{iL}+d_{iR}}\right)^2
+      +\beta\sum_{c,q}\left[\det A_{cq}&lt;\sigma_b\det W_{cq}\right]
+       \log\frac{\sigma_b\det W_{cq}}{\det A_{cq}}.
+      $$
+      <p>ここで \(A_{cq}\)・\(W_{cq}\) はセル \(c\) のガウス点 \(q\) における実メッシュ・参照メッシュのコーナーヤコビアン、\(\omega_{cq}\) はその重み、\(\mu\) は整列重み \(\gamma_{\rm align}\) をもつ形状品質尺度で、ここまでが M1 品質項である。\(\lambda_{\rm tether}\) はラグランジュ位置 \(\mathbf x^L_i\) からの変位を局所スケール \(h_i\) で罰する係留項、\(w_\theta\) の項は行集合 \(\mathcal R\) 上で左右の隣接距離 \(d_{iL},d_{iR}\) により極方向の行間隔を整える正則化、\(\beta\) の障壁項は \(\det A_{cq}&lt;\sigma_b\det W_{cq}\) で発動する。</p>
+      <p>各節点の提案変位は局所的な辺長で頭打ちにされ、最大 12 回の半分刻み直線探索を通る。取引が受理されるのは、候補メッシュの判定器が許容と答え、かつ</p>
+      $$
+      \frac{\mathcal J_{before}-\mathcal J_{after}}
+           {\max(|\mathcal J_{before}|,10^{-300})}
+      &gt;\texttt{m1\_min\_j\_dec\_rel}
+      $$
+      <p>を満たすときだけである。既定値 0.0 は目的関数の狭義減少を要求しつつ、わずかでも有益な改善は受け入れる。第 1 世代の M1 ソルバ（「M1 v1」）は極座標族メッシュ向けであり、受理された座標は移動参照メッシュを再固定してから保存的リマップへ渡される。</p>
+    </section>
+
+    <section aria-labelledby="admissibility">
+      <h2 id="admissibility">許容性と受理判定</h2>
+      <p>リゾーン反復が収束したことと、メッシュが受理されることは別問題である。候補メッシュは有効セルごとに、符号付き RZ 体積が正であること、コーナーヤコビアンが正であること、2×2 ガウス点ヤコビアンが下限以上であることを満たし、軸上のセルではさらに解析的な軸マージンも満たす必要がある。方向分離型リマップでは、最初の掃引で生じる中間体積も正でなければならない。安全な後退探索はまず混合係数 \(\lambda=0\)（\(\lambda\) はラグランジュメッシュから提案メッシュへの混合率）、すなわちラグランジュメッシュそのものを検証し、\(\lambda=2^{-e}\) から二分探索で許容できる最大の混合率を求める。正の \(\lambda\) がひとつも通らなければ、メッシュと状態量を取引前へ巻き戻す。</p>
+      <p>この判定を分離しているため、「目的関数が下がった」「Winslow 残差が小さい」というだけでは確定されない。参照目標、M1 目標、管理型の修復のいずれも、最後には同じ幾何・経路の判定器と、保存的リマップの正値性検査を通る。</p>
+    </section>
+
+    <section aria-labelledby="conservative-remap">
+      <h2 id="conservative-remap">掃過領域による保存的リマップ</h2>
+      <p>既定の <code>legacy_split</code> は、R 方向と Z 方向の掃引を交互の順序で実行する掃過領域リマップである。旧い面と新しい面が作る子午面上の多角形 \(P_f\) を軸まわりに回転して得られる符号付き体積は</p>
+      $$
+      \Delta V_f=V(P_f)=\frac{\pi}{3}\sum_k(r_k+r_{k+1})
+      (r_kz_{k+1}-r_{k+1}z_k)
+      $$
+      <p>である。ここで \((r_k,z_k)\) は新旧の面のあいだで掃過される子午面多角形 \(P_f\) の頂点、係数 \(\pi/3\) は軸まわりの厳密な回転体化に由来する。内部の面ひとつについてドナーと流束を一度だけ決め、隣り合う 2 つのセルへ大きさが等しく符号が逆になるように適用する。保存量のセル積分 \(\bar q=qV\) は</p>
+      $$
+      \bar q_i^{new}=\bar q_i^{old}-F_{i+1/2}+F_{i-1/2}
+      $$
+      <p>で更新される。転写の対象は、質量、R/Z 方向運動量、電子・イオンの内部エネルギー、物質体積、および輻射群ごとのエネルギーである。密度は \(m^{new}/V^{new}\)、速度はリマップ後の運動量を質量で割った値、比エネルギーはリマップ後の示量エネルギーを質量で割った値として復元する。要点は、\(\rho\)、\(\mathbf u\)、\(e\) のような示強量をそのまま平均するのではなく、先に保存量の積分を運ぶことにある。</p>
+
+      <ul>
+        <li><strong>符号付き掃過領域 \(P_f\):</strong> 符号は面が動いた向きを表し、絶対値はその面を横切って受け渡される体積である。</li>
+        <li><strong>ドナーの選択:</strong> 掃過体積の符号が風上側の供給セルを決め、同じセルが、その面ひとつ分の流束に使う再構成状態を供給する。</li>
+        <li><strong>MS2 制限関数:</strong> 制限を課した線形再構成は単調 2 次精度であり、リマップによって新たな局所的極値が生じることを防ぐ。</li>
+        <li><strong>厳密な RZ 幾何:</strong> 多角形の回転体として掃過体積を評価し、MS2 では掃過多角形の 1 次モーメントも厳密に求める。軸近傍を 1 次近似で済ませることはしない。</li>
+        <li><strong>エネルギークロージャ:</strong> 文書化されたクロージャは、診断量と整合する形で、運動エネルギーのリマップと射影の差を物質の内部エネルギーへ繰り入れる。</li>
+        <li><strong>コーナー質量の更新時期:</strong> コーナー質量はラグランジュ運動中も、棄却された提案の下でも不変であり、受理された保存的リマップの後にだけ再構築される。</li>
+        <li><strong>発動指標:</strong> 実行間隔、セル品質、軸マージン、コーナーヤコビアンが、幾何の取引を試みるかどうかを決める。</li>
+      </ul>
+
+      <figure>
+        <img src="../../../assets/ale-remap-swept-region.png" width="760" height="570" style="max-width:100%;height:auto" alt="旧い面と新しい面のあいだの掃過領域と、隣接セルへの保存的な流束">
+        <figcaption>図B. 掃過領域リマップを 1 次元の帯で表した模式図。実際の 2D RZ では、網掛けした多角形の軸対称体積と 1 次モーメントを厳密に評価する。</figcaption>
+      </figure>
+    </section>
+
+    <section aria-labelledby="ms2-energy">
+      <h2 id="ms2-energy">MS2 制限関数とエネルギークロージャ</h2>
+      <p>明示的に有効化する <code>ms2_moments</code> は、Margolin–Shashkov 型の 2 次モーメントリマップである。隣接 4 セルの最小二乗勾配から \(q(\mathbf x)=q_L+\nabla q_L\cdot(\mathbf x-\mathbf x_L)\) を再構成し、<code>van_leer</code> または <code>barth_jespersen</code> で新たな局所極値を抑える。掃過多角形の厳密な 1 次モーメント \(M_1(P_f)\) を使うドナー積分は</p>
+      $$
+      I_f=\rho_L|P_f|+\nabla\rho_L\cdot
+      \left(M_1(P_f)-\mathbf x_L|P_f|\right).
+      $$
+      <p>従来の分離型でも MS2 でも、同一の面流束を両側に符号を反転して用いるため、制限関数が 2 セル間の保存を壊すことはない。掃引ごとの質量・内部エネルギー・輻射エネルギーの正値性と、最後の EOS 再クロージャは、これとは別の判定である。</p>
+      <p>セルの運動量を節点速度へ戻す射影は、一般には運動エネルギーを厳密には保存しない。既定オンの <code>ke_fixup</code> は従来実装との互換のための制御である。明示的に指定する <code>ke_conservation_closure</code>（既定オフ）は、コーナー質量と節点速度で測った \(q_K=K_c^{diag}/V_c\) を同じリマップ機構で運び、射影後の \(K_c^{node,*}\) との差 \(\Delta I_c=K_c^{remap,*}-K_c^{node,*}\) を物質の内部エネルギーへ繰り入れる。正値性の再分配オプションは、内部エネルギーを負にしてしまう不足分を全体の余力から補い、補いきれない残差は収支表に明示する。</p>
+    </section>
+
+    <section aria-labelledby="managed-regions">
+      <h2 id="managed-regions">軸帯・オイラー窓・コーナー質量</h2>
+      <p><code>axis_band_managed_remap_enabled</code> は既定オフの軸近傍コントローラである。第 K 行のマージンがしきい値を下回ると、帯 \(i\in[0,K-1]\) だけを RZ 体積が等しくなる目標</p>
+      $$
+      r_i^{target}(j)=R_K(j)\sqrt{i/K},\qquad
+      z_i^{target}(j)=z_K^{node}(j)
+      $$
+      <p>へリマップする。ここで \(R_K(j)\) は軸方向添字 \(j\) における固定された第 \(K\) 行節点の半径で、帯の節点は回転体体積が等しくなるよう再配置され、軸方向座標は第 \(K\) 行に従う。K を設定範囲で広げながら正値性と保存収支を検査し、すべての候補が失敗した場合は、状態量を変えずに従来どおり時間刻みを縮小する経路へ戻る。質量、運動量、電子・イオンの内部エネルギー、輻射群は保存的に運ばれる。節点への射影に伴う運動エネルギーの差だけは、構成上、警告レベルの扱いである。</p>
+      <p><code>euler_window.enabled</code> は、明示的に有効化するマルチブロック CSR 領域向けの目標メッシュである。矩形または円環の内側では凍結した参照格子を、外側ではラグランジュ座標を使い、その間を C1 連続な遷移重みで混合する。混合された目標メッシュは候補判定器を通過したうえで参照メッシュを再固定し、受理された M1 リゾーンと同じ保存的リマップの取引に入る。保存的リマップが必須であり、M1/TMOP とは同時に使えない。</p>
+      <p>流体側のサブゾーンコーナー質量は、純ラグランジュ運動のあいだは固定される。幾何だけを試して棄却されたリゾーンでは更新せず、受理されたリゾーンとリマップの後に、リマップ後のセル質量と新しいメッシュからのみ再構築する。この更新順序が、エネルギー整合な仕事と、砂時計モード抑制・サブゾーン圧力のラグランジュ不変性を守る。</p>
+    </section>
+
+    <section aria-labelledby="pipeline">
+      <h2 id="pipeline">受理される ALE サイクルの手順</h2>
+      <ol>
+        <li><p><strong>発動条件を評価する。</strong> ALE の入口で、定期実行の間隔と、セル品質・軸マージン・コーナーヤコビアンの保護判定を評価する。どれも発火しなければ、ラグランジュメッシュと状態量をそのまま保持する。</p></li>
+        <li><p><strong>目標メッシュを構築する。</strong> 選択した Winslow、参照・障壁、または M1/TMOP のソルバ族を実行し、節点座標だけを提案する。管理型コントローラでは、提案の範囲を選んだ軸帯またはオイラー窓に限定する。</p></li>
+        <li><p><strong>許容性を判定する。</strong> 符号付き RZ 体積が正であること、コーナーヤコビアン、2×2 ガウス点ヤコビアンの下限、該当する場合は軸マージン、そしてラグランジュメッシュから目標メッシュへ至る節点経路を検査する。必要なら直線探索で変位を縮小する。安全な後退探索は \(\lambda=0\) を検証したうえで \(\lambda=2^{-e}\) を探索し、許容できる最大の混合率まで細分化する。正の混合率がひとつも通らなければ、取引前のスナップショットを復元してラグランジュ計算に留まる。</p></li>
+        <li><p><strong>掃過領域を構築する。</strong> 旧い面と新しい面のあいだに向きの付いた多角形を作り、その軸対称な符号付き体積を厳密に評価する。2 次精度の経路では 1 次モーメントも厳密に求める。最初の方向掃引で生じる中間体積は正でなければならない。</p></li>
+        <li><p><strong>保存量の収支を転写する。</strong> 掃過体積の符号からドナーを選び、指定された van Leer または MS2 の制限関数で状態を再構成し、面ごとの流束を一度だけ評価して両側のセルへ符号を反転して適用する。質量、化学種と物質の収支、R/Z 方向運動量、電子・イオンの内部エネルギー、輻射群エネルギー、有効化されている運動エネルギー診断の収支は、すべてこの取引に従う。掃引ごとの正値性は引き続き巻き戻しの判定条件である。</p></li>
+        <li><p><strong>クロージャを適用して確定する。</strong> リマップ後の運動量を節点へ射影し、有効であれば文書化された運動エネルギークロージャを内部エネルギーへ適用する。続いて、リマップ後のセル質量と受理されたメッシュからコーナー質量を再構築し、熱力学的な再クロージャを行う。受理の際はメッシュと状態量をひとつの取引として同時に確定し、失敗した場合は両方を復元する。</p></li>
+        <li><p><strong>機能契約を監査する。</strong> 保存収支が取引の受理を関門として検査し、ALE 無効・一度も発動しない・恒等モードの各実行が、純ラグランジュ計算とビット単位で一致することを監査する。この機能オフ時のビット一致検査と保存検査が、ALE 機能全体の関門である。</p></li>
+      </ol>
+    </section>
+
+    <section aria-labelledby="controls">
+      <h2 id="controls">namelist による制御</h2>
+      <p>以下は <code>Numerics.ale</code> の主要キーの抜粋である。全項目と検証規則は <a href="../../use/namelist.html">namelist リファレンス</a>を参照のこと。</p>
+      <table class="quick-facts">
+        <thead>
+          <tr><th>キー</th><th>既定値</th><th>用途</th></tr>
+        </thead>
+        <tbody>
+          <tr><th><code>enabled</code></th><td><code>True</code></td><td>2D RZ の ALE リゾーン・リマップサイクル全体の有効化（<code>Numerics.ale</code> 直下のキーである。<code>rezoning</code> という下位ブロックは存在しない）。</td></tr>
+          <tr><th><code>every_n_steps</code></th><td><code>5</code></td><td>定期リゾーンの実行間隔。</td></tr>
+          <tr><th><code>quality_threshold</code></th><td><code>0.2</code></td><td>\(\min q_c\) がこの値を下回ると品質判定で発動。</td></tr>
+          <tr><th><code>rezone_solver</code></th><td><code>"legacy_winslow"</code></td><td>従来の Winslow 族、または明示的に有効化する <code>"m1_tmop"</code>。</td></tr>
+          <tr><th><code>m1_min_j_dec_rel</code></th><td><code>0.0</code></td><td>M1 の取引に要求する目的関数の相対減少量の下限。</td></tr>
+          <tr><th><code>remap_scheme</code></th><td><code>"legacy_split"</code></td><td>方向分離型の掃過領域リマップ。明示指定で <code>"ms2_moments"</code>。</td></tr>
+          <tr><th><code>remap_limiter</code></th><td><code>"van_leer"</code></td><td>従来の分離型リマップにおけるドナー再構成の制限関数。</td></tr>
+          <tr><th><code>ke_fixup</code></th><td><code>True</code></td><td>リマップ後の運動エネルギー補正（従来実装との互換のための制御）。</td></tr>
+          <tr><th><code>axis_band_managed_remap_enabled</code></th><td><code>False</code></td><td>軸近傍の帯だけを等体積目標へ移す管理型リマップ。</td></tr>
+          <tr><th><code>euler_window.enabled</code></th><td><code>False</code></td><td>局所オイラー参照目標と C1 遷移の有効化。</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section aria-labelledby="verification">
+      <h2 id="verification">検証</h2>
+      <ul>
+        <li>機能オフ経路のビット一致検査は、ALE を無効にした実行が変更前の場と履歴にビット単位で一致することを確認する。</li>
+        <li>リマップの保存収支は、質量、R/Z 方向運動量、物質内部エネルギー、輻射群エネルギーと、明示的な下限・再分配項の閉じ方を追跡する。一般のリマップに対する質量の判定基準は相対誤差 \(\le 10^{-14}\) である。管理型軸帯の単体検査は、質量・内部エネルギー・輻射エネルギーに \(10^{-12}\)、並進不変な運動エネルギーに \(10^{-10}\) を用い、実行時は質量・内部エネルギー・輻射・セル運動量の残差が \(10^{-8}\) を超えた時点で巻き戻す。</li>
+        <li><code>ale_identity_mode</code> は ALE の入口をラグランジュ更新の直後で素通りさせるヌル試験である。ALE を有効にした実行が、同じ時間刻みで ALE を切った実行と場のレベルで一致することを要求する。</li>
+        <li>I 系列の検査群は、実運用 ALE のリゾーン、許容性判定、保存的リマップ、軸・マルチブロック経路を、実際の連成計算全体を通して動作させる。</li>
+      </ul>
+    </section>
+
+    <section aria-labelledby="references">
+      <h2 id="references">参考文献</h2>
+      <ol class="references">
+        <li>A. M. Winslow, "Numerical Solution of the Quasilinear Poisson Equation in a Nonuniform Triangle Mesh," J. Comput. Phys. 1, 149–172 (1966). <a href="https://doi.org/10.1016/0021-9991(66)90001-5">doi:10.1016/0021-9991(66)90001-5</a></li>
+        <li>P. M. Knupp, "Algebraic Mesh Quality Metrics," SIAM J. Sci. Comput. 23, 193–218 (2001). <a href="https://doi.org/10.1137/S1064827500371499">doi:10.1137/S1064827500371499</a></li>
+        <li>V. A. Dobrev, P. Knupp, T. V. Kolev, K. Mittal, and V. Z. Tomov, "The Target-Matrix Optimization Paradigm for High-Order Meshes," SIAM J. Sci. Comput. 41, B50–B68 (2019). <a href="https://doi.org/10.1137/18M1167206">doi:10.1137/18M1167206</a></li>
+        <li>L. G. Margolin and M. J. Shashkov, "Second-Order Sign-Preserving Conservative Interpolation (Remapping) on General Grids," J. Comput. Phys. 184, 266–298 (2003). <a href="https://doi.org/10.1016/S0021-9991(02)00033-5">doi:10.1016/S0021-9991(02)00033-5</a></li>
+      </ol>
+    </section>
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["$$", "$$"], ["\\[", "\\]"]] } };</script>
+  <script defer src="../../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../../nav.js" data-page="ale-remap" data-root="../../"></script>
+</body>
+</html>

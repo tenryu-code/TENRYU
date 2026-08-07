@@ -1,0 +1,204 @@
+<!doctype html>
+<html lang="en" data-lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Numerical foundations — TENRYU Documentation</title>
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>Numerical foundations <span class="badge">reference</span></h1>
+    <p class="abstract">This page collects what every kernel shares and no single physics page owns: the frozen cgs + eV unit system, the governing equations and their closures (including electron–ion relaxation), variable placement and the conserve-by-construction design, the activity mask for low-density fill regions, operator splitting and its re-closure discipline, floors/clamps/safety guards, and the energy-ledger identity. The time-step decision rule and per-kernel CFL formulas live on the dedicated <a href="timestep.html">Time-step control &amp; CFL</a> page. The canonical equations are in <code>docs/NUMERICS.md</code> (§0–§2, §10–§11) in the repository.</p>
+
+    <aside class="planned" aria-labelledby="at-a-glance">
+      <h3 id="at-a-glance">At a glance</h3>
+      <ul>
+        <li>Internal units are frozen: length cm, time s, density g/cm³, temperatures and radiation group edges eV, energy erg, pressure dyne/cm². The \(k_B\) in every formula is the eV→erg conversion constant.</li>
+        <li>Matter carries single-fluid momentum and separate ion/electron specific internal energies, coupled by PdV work, conduction, laser, radiation, and the Spitzer-type electron–ion relaxation \(Q_{ei}\).</li>
+        <li>Conservation is enforced by construction, not by after-the-fact fixes: invariant cell masses, compatible corner forces for total energy, conservative remap transfers, and boundary ledgers — with the residual violation quantified every step as \(\varepsilon_{budget}\).</li>
+        <li>Only hydro is split into bracketing half-steps; the full four-operator sequence is not claimed to be second order unconditionally. A rejected step restores the entry state and reruns the whole sequence at half the step.</li>
+        <li>Floors and clamps are numerical guards, not physics: every injection is counted and booked, and is separated out of the conservation-error numerator.</li>
+      </ul>
+    </aside>
+
+    <section aria-labelledby="units-symbols">
+      <h2 id="units-symbols">Units and symbols</h2>
+      <p>Never converting units at module boundaries is the first numerical contract. In particular, temperature \(T\) is in eV, and the \(k_B\) in \(P=nk_BT\) means <code>eV_to_erg</code> = \(1.6022\times10^{-12}\) erg/eV — do not confuse it with the kelvin constant \(1.3807\times10^{-16}\) erg/K. The radiation constant follows the same convention, \(a_{\rm eV}=1.3720\times10^{2}\) erg cm⁻³ eV⁻⁴, so the equilibrium radiation energy density is \(a_{\rm eV}T^4\) with \(T\) in eV. Specific heat per mass \(c_v\) [erg/(g·eV)] and per volume \(C_v=\rho c_v\) [erg/(cm³·eV)] are also kept distinct. The shared constants and overloaded symbols are collected in the <a href="nomenclature.html">nomenclature</a>.</p>
+      <table class="quick-facts">
+        <thead>
+          <tr><th>Quantity / symbol</th><th>Internal unit / meaning</th><th>Accident-preventing boundary</th></tr>
+        </thead>
+        <tbody>
+          <tr><th>\(\rho,\mathbf u,t\)</th><td>g/cm³, cm/s, s</td><td>Mesh geometry also uses cm and cm³.</td></tr>
+          <tr><th>\(T_i,T_e,\epsilon_g\)</th><td>eV</td><td>Temperatures and photon group edges \(\epsilon_g\) share one energy axis.</td></tr>
+          <tr><th>\(E_g\)</th><td>group-integrated radiation energy density, erg/cm³</td><td>Do not confuse with the eV group edges \(\epsilon_g\); same subscript g, different quantity.</td></tr>
+          <tr><th>\(e_i,e_e,P\)</th><td>erg/g, dyne/cm²</td><td>Do not confuse specific and volumetric energies.</td></tr>
+          <tr><th>\(\kappa_{P,g},\kappa_{R,g}\)</th><td>mass opacities, cm²/g</td><td>Table values; never hand them to transport directly.</td></tr>
+          <tr><th>\(\sigma_{a,g}=\rho\kappa_{P,g}\)</th><td>length opacity, cm⁻¹</td><td>Swapping \(\kappa\) and \(\sigma\) shifts absorption lengths by a factor of \(\rho\).</td></tr>
+          <tr><th>\(c_v,\ C_v\)</th><td>specific heat per mass, per volume</td><td>\(C_v=\rho c_v\); swapping them shifts coefficients by \(\rho\).</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section aria-labelledby="governing-equations">
+      <h2 id="governing-equations">Governing equations and closures</h2>
+      <p>The fluid solves Lagrangian single-fluid motion with two-temperature internal energies. Mass conservation and momentum for the material derivative \(D/Dt\) are</p>
+      $$
+      \frac{D\rho}{Dt}=-\rho\nabla\!\cdot\mathbf u,
+      \qquad
+      \rho\frac{D\mathbf u}{Dt}
+      =-\nabla(P_i+P_e+Q)+\mathbf f_{\mathrm{geom}}.
+      $$
+      <p>Here \(Q\) is the artificial-viscosity pressure and \(\mathbf f_{\mathrm{geom}}\) the coordinate-geometry term. The v1.0 momentum equation contains no radiation force. The ion and electron specific internal energies obey</p>
+      $$
+      \rho\frac{De_i}{Dt}=-(P_i+Q)\nabla\!\cdot\mathbf u+Q_{ei}+S_i,
+      $$
+      $$
+      \rho\frac{De_e}{Dt}=-P_e\nabla\!\cdot\mathbf u
+      -\nabla\!\cdot\mathbf q_e-Q_{ei}+S_e+S_L+S_r.
+      $$
+      <p>\(\mathbf q_e\) is the electron heat flux, \(S_L\) the laser deposition, and \(S_r\) the radiation exchange. Sign convention: \(Q_{ei}&gt;0\) means energy flowing from electrons to ions, i.e. ion heating. The same \(Q_{ei}\) appears in both equations with opposite signs, so in-cell exchange alone never changes the total matter energy.</p>
+
+      <h3 id="qei">Electron–ion relaxation \(Q_{ei}\)</h3>
+      <p>The exchange term at the heart of the two-temperature model closes with Spitzer–Braginskii collisional relaxation:</p>
+      $$
+      Q_{ei}=\frac{C_{v,e}\,(T_e-T_i)}{\tau_{eq}}\ \ [\mathrm{erg/cm^3/s}],
+      \qquad
+      \tau_{eq}=\frac{A\,m_p}{2\,m_e}\,\tau_e,
+      $$
+      $$
+      \tau_e=\frac{3.44\times10^{5}\;T_e[\mathrm{eV}]^{3/2}}
+      {n_e[\mathrm{cm^{-3}}]\;\bar Z\;\ln\Lambda_{ei}}\ \ [\mathrm s],
+      \qquad
+      \tau_{eq}=\frac{3.16\times10^{8}\;A\;T_e[\mathrm{eV}]^{3/2}}
+      {\bar Z^{2}\;n_i[\mathrm{cm^{-3}}]\;\ln\Lambda_{ei}}\ \ [\mathrm s].
+      $$
+      <p>The term relaxes the temperature difference \(T_e-T_i\), weighted by the electron heat capacity, on the equilibration time \(\tau_{eq}\). Because a single collision transfers only a fraction of order \(m_e/m_i\) of the energy, \(\tau_{eq}\) is the electron collision time \(\tau_e\) multiplied by \(Am_p/(2m_e)\); the right-hand expression packages this in cgs+eV. The \(T_e^{3/2}\) dependence makes relaxation slow in hot plasma, so the corona keeps its electron and ion temperatures separated for a long time. The formula is the ICF-regime approximation \(T_e\gg(m_e/m_i)T_i\), and it is consistent with the sign convention: \(T_e&gt;T_i\) gives \(Q_{ei}&gt;0\) (ion heating). It is applied inside each hydro half-step's corrector, and the subsequent conduction operator receives the \(Q_{ei}\)-updated \(T_e\) as its initial value.</p>
+
+      <h3 id="lagrangian-divergence">Discretizing the divergence; cell mass</h3>
+      <p>The Lagrangian discretization never differences \(\nabla\!\cdot\mathbf u\) independently: it evaluates it as the cell volume rate, \((\nabla\!\cdot\mathbf u)_c=\dot V_c/V_c\). In 1D spherical symmetry, \(\dot V_i=A_{j+1}u_{j+1}-A_ju_j\) with \(A_j\) the shell-boundary areas. The continuity equation is exactly the cell version of this identity, and the cell mass \(\Delta M_c=\rho_cV_c\) stays constant by construction.</p>
+
+      <h3 id="radiation-eq">The radiation transport equation</h3>
+      <p>For group \(g\), the continuous transport equation for the radiance \(I_g(\mathbf r,\mathbf\Omega,t)\) and the exchange term entering the electron energy equation are</p>
+      $$
+      \frac{1}{c}\frac{\partial I_g}{\partial t}
+      +\mathbf\Omega\!\cdot\nabla I_g
+      =\sigma_{a,g}B_g(T_e)-\sigma_{t,g}I_g+\mathcal S_{\mathrm{sca}},
+      $$
+      <p>where \(B_g(T_e)\) is the group Planck function, \(\sigma_{t,g}=\sigma_{a,g}+\sigma_{s,g}\) the total extinction, and \(\mathcal S_{\mathrm{sca}}\) the scattering source (zero in v1.0, below):</p>
+      $$
+      S_r=\sum_g c\,\sigma_{a,g}
+      \left[E_g-a_{eV}T_e^4 b_g(T_e)\right].
+      $$
+      <p>\(b_g(T_e)\) is the per-group Planck fraction, normalized to sum to one. \(S_r&gt;0\) is net heating of electrons by the radiation field. Production v1.0 carries no physical scattering: \(\sigma_{s,g}=0\) in every cell and group — the namelist accepts a per-material <code>kappa_s</code> for forward compatibility, but the v1 production solvers do not consume it as physical scattering (the Fleck effective scattering \((1-f)\sigma_a\) on the FLD page is an implicitness device, not physics). Radiation forces are diagnostic-only.</p>
+    </section>
+
+    <section aria-labelledby="staggering-conservation">
+      <h2 id="staggering-conservation">Variable placement and conservation by construction</h2>
+      <p>Variable placement is shared by every kernel. Thermodynamic state — density, ion/electron specific internal energies, temperatures, pressures, artificial-viscosity pressure, material volume fractions — lives at cell centers; kinematics — positions and velocities — live at nodes. 1D nodes are shell boundaries; 2D RZ nodes are quadrilateral corners. The primary evolved variables are the conserved quantities (mass, momentum, energy); temperatures and pressures are derived by the EOS. The HDF5 <code>mesh/</code> and <code>hydro/</code> dataset names map 1:1 to these internal State fields (<a href="../use/outputs.html">Outputs &amp; analysis</a>).</p>
+      <p>The conservation policy is "write it in a form that cannot break", not "fix it afterwards". What guarantees what, and where, is summarized below; details live on the kernel pages.</p>
+      <table class="quick-facts">
+        <thead><tr><th>Conserved quantity</th><th>Constructive mechanism</th><th>Details</th></tr></thead>
+        <tbody>
+          <tr><th>Mass</th><td>Under pure Lagrangian motion the cell mass \(\Delta M_c\) is invariant by definition; density only changes through the reconstruction \(\rho=\Delta M/V\).</td><td>this page, above</td></tr>
+          <tr><th>Momentum and total energy (hydro)</th><td>Compatible (adjoint-pair) construction: corner forces and \(p\,dV\) work built from the same geometric vectors \(\mathbf S_{c,k}\).</td><td><a href="../physics/hydrodynamics.html">Lagrangian hydrodynamics</a></td></tr>
+          <tr><th>Remap (ALE)</th><td>Transfers cell-integrated quantities, not intensives, with one flux per face applied with opposite signs.</td><td><a href="../physics/mesh/ale-remap.html">ALE</a></td></tr>
+          <tr><th>Radiation ⇄ matter</th><td>The actually-applied source \(S^{used}\) is frozen and reused in the matter balance; shared-face contributions cancel exactly.</td><td><a href="../physics/radiation/fld.html">FLD</a> · <a href="../physics/radiation/sn.html">S<sub>N</sub></a></td></tr>
+          <tr><th>Laser</th><td>Every call closes incident = absorbed + unabsorbed exactly; the termination taxonomy assigns residuals.</td><td><a href="../physics/laser.html">Laser</a></td></tr>
+          <tr><th>Conduction, viscosity, burn</th><td>Sign-flipped face fluxes (conduction, viscosity); the released = deposited + escaped + in-flight ledger (burn).</td><td>kernel pages</td></tr>
+        </tbody>
+      </table>
+      <p>What still leaks — floor injections, rounding, algorithmic limits — is not hidden: it is quantified every step by the <a href="#energy-ledger">energy ledger below</a>.</p>
+    </section>
+
+    <section aria-labelledby="hydro-active">
+      <h2 id="hydro-active">The activity mask for low-density fill (hydro_active)</h2>
+      <p>Treating a low-density fill region (the vacuum stand-in) as ordinary matter creates meaningless sound waves and extreme CFL limits. Each cell therefore carries a hydro activity flag, <code>hydro_active</code>. Inactive cells contribute zero pressure and artificial-viscosity forces, and their coordinates and velocities stay fixed; a node moves if any adjacent cell is active (OR propagation). An inactive cell activates when its temperature reaches the activation threshold, at which point its density and internal energy are recomputed from the current volume — the volume may already have changed through neighboring active nodes, and this keeps the first post-activation PdV work continuous. The CFL minimum runs over active cells only, and with every cell inactive, hydro drops out of the time-step ladder entirely (<a href="timestep.html">Time-step control</a>).</p>
+      <p><strong>Usage constraint (important).</strong> This is a numerical mask for statically holding low-density fill (\(\rho\ll\rho_{shell}\)); it must not be used to suppress the motion of dense matter by temperature conditions. An inactive cell is in a one-sided mechanical state — it can be moved but pushes nothing back — which is acceptable for fill regions but injects or destroys unphysical energy and momentum when applied to dense material. Excluding cells from conduction and radiation coupling is a separate mechanism, the void contract (<code>cell_is_void</code>, <a href="../physics/eos-opacity.html">EOS, opacity &amp; ionization</a>).</p>
+    </section>
+
+    <section aria-labelledby="operator-splitting">
+      <h2 id="operator-splitting">Operator splitting and the re-closure discipline</h2>
+      <p>One outer step is the map below; composition acts right to left, so the execution order is \(\mathcal L\), \(\mathcal H/2\), \(\mathcal C\), \(\mathcal R\), \(\mathcal H/2\):</p>
+      $$
+      \mathcal U^{n+1}=
+      \mathcal H_{\Delta t/2}\circ
+      \mathcal R_{\Delta t}\circ
+      \mathcal C_{\Delta t}\circ
+      \mathcal H_{\Delta t/2}\circ
+      \mathcal L_{\Delta t}(\mathcal U^n).
+      $$
+      <p>\(\mathcal H\) is Lagrangian hydro with boundary conditions (each half-step's corrector includes \(Q_{ei}\)), \(\mathcal C\) electron conduction, \(\mathcal L\) ray trace and deposition, \(\mathcal R\) radiation transport with matter exchange. In 2D RZ, ALE rezone/remap runs conditionally only after the second hydro half-step. How the candidate \(\Delta t\) is chosen before the sequence starts is on <a href="timestep.html">Time-step control &amp; CFL</a>.</p>
+      <p>The most accident-prone part of splitting is "the next operator reading state the previous one changed through a stale closure". TENRYU closes that door by discipline: after any operator changes \(T_e\) or \(e_e\), the EOS is re-closed so no later operator reads stale \(T\), \(e\), \(P\), or \(C_v\). Under MPI, halos are exchanged right after owned regions are written and before the first ghost read (<a href="../physics/mpi.html">MPI decomposition</a>); dynamic mean ionization is likewise re-evaluated at each operator's entry (<a href="../physics/eos-opacity.html">EOS page</a>).</p>
+      <p>"Strang-type" is qualified: hydro symmetrically brackets the conduction–radiation block, so that combination is symmetric. The laser runs once as a full-step external source at the head of the step, and conduction and radiation are ordered full steps relative to each other. Those couplings are first-order Lie splittings — operators simply applied in sequence — so the complete sequence is not generally second order.</p>
+      <p>This first-order coupling is acceptable because the splitting errors between the laser and the rest, and between conduction and radiation, are not the dominant error sources in ICF runs — each operator advances different physical quantities, and practical accuracy is secured by the time-step control. The fully second-order multi-stage splitting \(\mathcal H_{/2}\circ\mathcal C_{/2}\circ\mathcal L_{/2}\circ\mathcal R\circ\mathcal L_{/2}\circ\mathcal C_{/2}\circ\mathcal H_{/2}\) is recorded as a future option in the numerical contract, <code>docs/NUMERICS.md</code> §2.1.</p>
+      <p><strong>Full-step retry.</strong> Choosing a smaller step in advance cannot predict every nonlinear mesh-admissibility failure. With driver-level retry enabled, the driver snapshots the state before entering the split sequence. If the hydro corrector reports a recoverable failure, the partially advanced laser, energy, radiation, and mesh states are discarded, the snapshot is restored, and the whole outer step reruns at half the step. Attempts are capped; exhausting the cap is a hard failure. Because outputs and cumulative ledgers commit only after acceptance, failed attempts are never double-counted in histories or energies.</p>
+
+      <figure>
+        <img src="../../assets/overview-numerics-step-flow.png" width="1040" height="480" style="max-width:100%;height:auto" alt="Flow of one outer step: time-step limits from hydro, conduction, radiation, user, and output merge; then laser, hydro half-step, conduction, radiation, hydro half-step advance">
+        <figcaption>Figure A. One outer step. Time-step limits are gathered, then the split sequence runs; time and outputs commit only on acceptance. A rejected step restores the entry snapshot and reruns the whole sequence at a reduced step.</figcaption>
+      </figure>
+    </section>
+
+    <section aria-labelledby="floors-safety">
+      <h2 id="floors-safety">Floors, clamps, and safety guards</h2>
+      <p>Floors and clamps are not physics models. They are numerical guards against NaNs and negative temperatures destroying the whole calculation — and every intervention is counted, with injected energy booked in the ledger. "Fix it silently" is exactly what the design forbids.</p>
+      <ul>
+        <li><strong>Temperature floors:</strong> \(T_e\ge T_{e,floor}\), \(T_i\ge T_{i,floor}\) (both default \(10^{-3}\) eV; individually settable via <code>Numerics.floors</code> <code>Te_floor_eV</code>/<code>Ti_floor_eV</code>). Clamps apply after each operator's temperature update — hydro, conduction, laser, radiation — and the injected energy is booked as \(\Delta E_{clamp}=\rho c_v(T_{floor}-T_{computed})V\).</li>
+        <li><strong>Clamp-count monitoring:</strong> <code>clamp_count</code> resets to zero at step start and increments on every operator clamp. More than 100 clamps per step is a WARNING, more than 10000 a FATAL (defaults). The series persists as <code>safety/clamp_count</code> in the history.</li>
+        <li><strong>Opacity-table out-of-range:</strong> no extrapolation — \((\rho,T)\) is clamped into the table domain before interpolation (input clamping). Each occurrence warns, capped at 10 messages per rank per step with the rest counted.</li>
+        <li><strong>Energy-budget monitoring:</strong> \(\varepsilon_{budget}\le10^{-3}\) (default threshold) is checked every step. Exceedance warns by default and becomes fatal with <code>Numerics.safety.energy_fatal=True</code>; NaN policy is likewise selected by <code>nan_fatal</code>.</li>
+        <li><strong>Kernel-specific guards:</strong> the laser's \(\varepsilon_n\) floor and Coulomb-logarithm floor of 2, conduction's void mask and floor-protection throttle, the EOS's non-positive-\(c_v\) clamp, and others are described on their kernel pages. The shared contract: warn on firing and, where applicable, book the injection.</li>
+      </ul>
+    </section>
+
+    <section aria-labelledby="energy-ledger">
+      <h2 id="energy-ledger">The energy ledger and \(\varepsilon_{budget}\)</h2>
+      <p>Every step accumulates the identity that reconciles the total-energy change with the flows in and out:</p>
+      $$
+      \Delta E_{total}=\Delta E_{int,e}+\Delta E_{int,i}+\Delta E_{kin}+\Delta E_{rad}
+      $$
+      $$
+      =E_{laser,in}-E_{laser,esc}+E_{Marshak,in}-E_{rad,esc}
+      -E_{pdV}^{bdry}-E_{num.loss}
+      +E_{floor}+E_{safety}+E_{redist}+E_{solver}.
+      $$
+      <p>The left side sums the electron-internal, ion-internal, kinetic, and radiation-field energy changes. The first half of the right side is the physical traffic (laser incident and unabsorbed, Marshak injection, radiation escape, boundary PdV work, numerical loss); the last four terms are artificial injections — floor corrections, the conduction safety correction, unresolved ALE redistribution, and the implicit-solver residual. The artificial terms are accumulated separately from the physical sources, and the conservation error</p>
+      $$
+      \varepsilon_{budget}=\frac{\bigl|(\Delta E_{total}-E_{artificial})-(E_{source}-E_{sink})\bigr|}{E_{denom}},
+      \qquad
+      E_{denom}=\max\bigl(E_{total}^{\,n},\,E_{source},\,10^{-20}\ \mathrm{erg}\bigr)
+      $$
+      <p>excludes them from its numerator. \(\varepsilon_{budget}\) therefore measures physical conservation violation, while the artificial fractions (\(E_{floor}/E_{denom}\) etc.) are monitored independently to detect numerical safety machinery dominating a result. The denominator floor prevents division by zero and false FATALs on cold starts (total energy ≈ 0).</p>
+      <p>All of these terms appear verbatim in the history's <code>energy/</code> group — <code>laser_incident</code>, <code>marshak_in</code>, <code>radiation_escaped</code>, <code>pdv_boundary</code>, <code>floor_injected</code>, <code>safety_injected</code>, <code>conservation_error</code>, and the rest (full enumeration on <a href="../use/outputs.html">Outputs &amp; analysis</a>). Reading guide: when \(\varepsilon_{budget}\) jumps, look at the artificial fractions first. If they dominate, chase the floor/clamp source (which operator; the <code>clamp_count</code> trend); otherwise question the boundary and source attribution (absorption, escapes).</p>
+    </section>
+
+    <section aria-labelledby="contracts">
+      <h2 id="contracts">The numerical contracts at a glance</h2>
+      <p>The cross-cutting promises scattered across the site, in one table. All are contracts the codebase publishes; changes pass the verification gates (<a href="verification-philosophy.html">Verification philosophy</a>).</p>
+      <table class="quick-facts">
+        <thead><tr><th>Contract</th><th>Content</th><th>Details</th></tr></thead>
+        <tbody>
+          <tr><th>Frozen units</th><td>Internals fixed to cgs + eV; no unit conversion at module boundaries.</td><td>this page</td></tr>
+          <tr><th>No runtime Python</th><td>Namelist callables are frozen into tables at initialization and never called in the time loop.</td><td><a href="../use/running.html">Running</a> · <a href="architecture.html">Architecture</a></td></tr>
+          <tr><th>Strict input validation</th><td>Unknown keys, wrong types, and invalid combinations are errors, not warnings; defaults are canonical in the specification.</td><td><a href="../use/namelist.html">Namelist</a></td></tr>
+          <tr><th>Determinism</th><td>Deterministic 1D paths are bitwise run-to-run identical; only the documented 2D <code>atomicAdd</code> ordering is treated as a noise band.</td><td><a href="verification-philosophy.html">Verification philosophy</a></td></tr>
+          <tr><th>Conservation ledgers</th><td>Boundary and source traffic closes in ledgers; artificial injections are booked separately.</td><td>this page · kernel pages</td></tr>
+          <tr><th>Time step</th><td>The global \(\Delta t\) is the minimum of every kernel's cap; falling below the floor is FATAL.</td><td><a href="timestep.html">Time-step control</a></td></tr>
+          <tr><th>Output schema</th><td>Dataset names map 1:1 to State, every numeric dataset has a units attribute, compatibility is schema-versioned.</td><td><a href="../use/outputs.html">Outputs &amp; analysis</a></td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["$$", "$$"], ["\\[", "\\]"]] } };</script>
+  <script defer src="../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../nav.js" data-page="numerics-foundations" data-root="../"></script>
+</body>
+</html>

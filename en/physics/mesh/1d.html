@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en" data-lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>1D meshes: zoning &amp; regions — TENRYU Documentation</title>
+  <link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>1D meshes: zoning &amp; regions <span class="badge">reference</span></h1>
+    <p class="abstract">TENRYU's 1D domain is a radial node grid with uniform or graded zoning and spherical, cylindrical, or planar measures; deck-side region painting assigns materials, a pre-plasma corona, and exterior VOID.</p>
+
+    <section aria-labelledby="mechanism">
+      <h2 id="mechanism">Physical mechanism</h2>
+      <p>In a Lagrangian 1D implosion, the grid is part of the error budget: the initial zoning determines the resolution history because every cell keeps its mass. Placing mass at the ablator surface and the fuel–shell interface therefore places resolution where steep gradients will exist at bang time. Graded zoning spends cells there, while a super-Gaussian weight profile makes the size transition smooth and monotone; abrupt jumps in cell size can numerically reflect acoustic and shock signals.</p>
+      <p>Spherical, cylindrical, and planar coordinates enter through measures rather than through different node layouts. The same node sequence is interpreted with the appropriate face area \(A(r)\) and shell volume \(V(r_0,r_1)\). For a thin shell at large radius, the factored spherical-volume form avoids the catastrophic cancellation suffered by a direct difference of nearly equal cubes.</p>
+      <p>Material regions are painted by volume fraction, so material layout is independent of grid construction. VOID combines positive state floors with a <code>cell_is_void</code> mask that excludes conduction and radiation coupling; treating vacuum as an ordinary low-density material would instead create enormous diffusivities. A resolved exponential corona is also a physical prerequisite for starting a laser calculation. It must decrease strictly to VOID: a plateau acts as a resonant cavity, as demonstrated by the antisymmetric-node-pair instability described in <a href="#regions-corona">the corona section below</a>.</p>
+      <ul>
+        <li><strong>Super-Gaussian parameters:</strong> \(\epsilon_{\rm edge}\) is the positive edge floor (<code>Mesh.grid.grading.edge_ratio</code>), \(\sigma_{\rm sg}\) sets the profile breadth (<code>grading.sg_sigma</code>), and the even exponent \(m_{\rm sg}\) controls the shoulder sharpness (<code>grading.sg_order</code>).</li>
+        <li><strong><code>exact_measure_v2</code></strong> (<code>grading.mapping</code>): cumulative weights are inverted through the exact spherical, cylindrical, or planar shell measure. At constant density, cell <em>masses</em>, not cell widths, therefore follow the weights.</li>
+        <li><strong>Generation checks:</strong> every width must be finite and positive, the assembled nodes must be strictly increasing, and the last node must equal the requested outer endpoint.</li>
+      </ul>
+    </section>
+
+    <section aria-labelledby="one-d-geometry">
+      <h2 id="one-d-geometry">1D coordinate geometry and zoning</h2>
+      <p><code>Mesh.geometry_1d</code> interprets one node sequence \(r_j\) with different coordinate measures. For spherical symmetry, a cylinder of unit axial length, and a plane of unit cross-sectional area, respectively, the face area and cell volume are</p>
+      $$
+      A(r)=4\pi r^2\;|\;2\pi r\;|\;1,
+      \qquad
+      V(r_0,r_1)=\frac{4\pi}{3}(r_1^3-r_0^3)\;|\;\pi(r_1^2-r_0^2)\;|\;(r_1-r_0).
+      $$
+      <p>Node \(j=0,\ldots,N\) carries a cell-boundary position and velocity; cell \(i=0,\ldots,N-1\) carries density, internal energies, temperatures, pressures, and related state over \([r_i,r_{i+1}]\). For thin spherical shells, the implementation uses a factored volume expression where needed to avoid cancellation in the difference of cubes. The default spherical path preserves its established floating-point operation order, and every geometry continues to use internal cgs units.</p>
+      <p><code>Mesh.grid="uniform"</code> divides the interval into equal-width cells. A <code>graded</code> grid accepts contiguous radial segments and a cell count for each segment. With \(n_s\) the segment's cell count, it forms a super-Gaussian weight at normalized cell center \(\xi_k=(k+1/2)/n_s\),</p>
+      $$
+      w_k=\epsilon_{\rm edge}+(1-\epsilon_{\rm edge})
+      \exp\!\left[-\left(\frac{|2\xi_k-1|}{\sigma_{\rm sg}}\right)^{m_{\rm sg}}\right],
+      $$
+      <p>then apportions width or shell measure from those weights. Segment length is preserved exactly, and the target widths on the two sides of an internal segment boundary use their geometric mean. The opt-in <code>exact_measure_v2</code> mapping inverts the cumulative weights through the exact spherical, cylindrical, or planar shell measure, so constant-density cell masses follow the weights. Generation finishes by checking finite positive widths, a strictly increasing node sequence, and the requested outer endpoint.</p>
+    </section>
+
+    <section aria-labelledby="regions-corona">
+      <h2 id="regions-corona">Region painting, VOID, and the corona ramp</h2>
+      <p>A 1D deck describes concentric regions with strictly increasing outer radii and piecewise-constant material states. Each region becomes a radial predicate used as a volume-fraction callable, and <code>Geometry.volfrac</code> supplies the per-cell material assignment. Gas cores, solid shells, and exterior layers can therefore be described independently of grid construction, while the deck can enforce that volume fractions sum to one.</p>
+      <p>Treating the exterior as an ordinary material at a tiny density would leave conduction and radiation coefficients in laser-heated floor cells. Instead, the outer band is painted with the reserved <code>VOID</code> material declared by <code>Material(..., is_void=True)</code>, while <code>Materials.void_config</code> supplies positive \(\rho,T_e,T_i\) floors. Those floors keep state arrays finite; the derived <code>cell_is_void</code> mask excludes VOID cells from electron-conduction and radiation material-coupling/source solves.</p>
+      <p>For a laser target, a one-cell density jump from a cold solid edge directly to VOID gives 351 nm light almost no propagation length before critical reflection, so inverse bremsstrahlung cannot bootstrap a corona. Studio's <code>coronaRamp1d</code> feature generates an exponential blowoff from target surface \(R\),</p>
+      $$
+      \rho(r)=\rho_0\exp[-(r-R)/L],\qquad R&lt;r\le R_{\rm corona}.
+      $$
+      <p>Here \(\rho_0\) is the ramp's base density at the target surface \(R\), \(L\) is its exponential scale length, and \(R_{\rm corona}\) is its outer end.</p>
+      <p>The <a href="../../verification/index.html#gxii">GXII</a> regression uses \(L=2\,\mu\mathrm m\), a \(10\,\mu\mathrm m\) extent, \(\rho_0=0.05\,\mathrm{g\,cm^{-3}}\), and a \(3\times10^{-4}\,\mathrm{g\,cm^{-3}}\) tail guard. This places the 351 nm CH critical density, \(0.028\,\mathrm{g\,cm^{-3}}\) assuming fully ionized CH (\(\bar Z=3.5\), \(\bar A=6.5\)), inside a resolved profile. The ramp must stay strictly monotone to VOID, with no uniform floor plateau. A historical three-cell plateau formed a resonant cavity in which trace absorption drove an exponentially growing antisymmetric node pair.</p>
+
+      <figure>
+        <img src="../../../assets/mesh-1d-regions-corona.png" width="900" height="390" style="max-width:100%;height:auto" alt="One-dimensional region painting and logarithmic density profile for a gas core, shell, exponential corona ramp, and VOID">
+        <figcaption>Figure A. Volume-fraction painting and a pre-plasma density profile with a resolved critical surface. The tail guard is a safety lower bound, not a plateau; the realized profile decreases to the VOID boundary.</figcaption>
+      </figure>
+    </section>
+
+    <section aria-labelledby="pipeline">
+      <h2 id="pipeline">From deck to grid, step by step</h2>
+      <ol>
+        <li><p><strong>Parse and validate.</strong> Read the contiguous radial segments and their cell counts, then reject invalid endpoints, counts, or grading parameters.</p></li>
+        <li><p><strong>Form weights.</strong> Evaluate the super-Gaussian weight at every normalized cell center in each segment.</p></li>
+        <li><p><strong>Apportion the segment.</strong> Convert weights to widths, or invert cumulative weights through the exact measure under <code>exact_measure_v2</code>. At each internal segment boundary, target the geometric mean of the two adjoining widths.</p></li>
+        <li><p><strong>Assemble nodes.</strong> Accumulate the segment cells and check finite positive widths, strict monotonicity, and the exact outer endpoint.</p></li>
+        <li><p><strong>Paint regions.</strong> Turn radial material predicates into per-cell volume fractions, independently of how the nodes were generated.</p></li>
+        <li><p><strong>Add the exterior physics.</strong> Studio keys generate the VOID band and, for a laser target, the strictly decreasing exponential corona ramp.</p></li>
+        <li><p><strong>Freeze the inventory.</strong> The resulting cell masses become the material inventory carried by the Lagrangian motion.</p></li>
+      </ol>
+    </section>
+
+    <section aria-labelledby="controls">
+      <h2 id="controls">Selected keys</h2>
+      <p>These are the principal mesh and deck-side geometry entry points. See the <a href="../../use/namelist.html">namelist reference</a> for complete validation rules and staged scopes.</p>
+      <table class="quick-facts">
+        <thead>
+          <tr><th>Key</th><th>Scope</th><th>Purpose</th></tr>
+        </thead>
+        <tbody>
+          <tr><th><code>Mesh.r_max</code>, <code>nr</code>, <code>grid</code></th><td>1D</td><td>Outer endpoint, radial cell count, and uniform or segment-based graded zoning.</td></tr>
+          <tr><th><code>Mesh.geometry_1d</code></th><td>1D</td><td><code>"spherical"</code> (default), <code>"cylindrical"</code>, or <code>"planar"</code> coordinate measure.</td></tr>
+          <tr><th><code>Material.is_void</code>, <code>Materials.void_config</code></th><td>deck</td><td>Identify exterior material as a VOID mask and provide a finite floor state.</td></tr>
+          <tr><th><code>vacuumOutside1d</code></th><td>Studio-generated</td><td>Generate the <code>VOID</code> material and volume fraction outside the last 1D region.</td></tr>
+          <tr><th><code>coronaRamp1d.{scaleUm, extentUm, rho0, rhoMin}</code></th><td>Studio-generated</td><td>Set the scale, extent, base density, and tail guard of the exponential pre-plasma ramp inside VOID.</td></tr>
+          <tr><th><code>Mesh.grid.grading.{edge_ratio, sg_sigma, sg_order, mapping}</code></th><td>1D graded</td><td>Super-Gaussian edge floor \(\epsilon_{\rm edge}\), breadth \(\sigma_{\rm sg}\), exponent \(m_{\rm sg}\), and the optional <code>"exact_measure_v2"</code> mass-weight mapping.</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section aria-labelledby="verification">
+      <h2 id="verification">Verification</h2>
+      <ul>
+        <li>Builder gates in <code>test_mesh_create</code> cover default and segment-honoring graded zoning, and the <code>exact_measure_v2</code> contracts: constant-density cell masses matching the super-Gaussian target weights at the origin, and equal weights producing equal-mass (rather than equal-width) zoning.</li>
+        <li>Generation itself fails loudly on non-finite or non-positive widths, non-monotone node sequences, or a wrong outer endpoint, so an invalid grading never reaches the physics.</li>
+        <li>The corona-ramp contract — strictly monotone decrease to VOID with a resolved critical surface — is exercised end-to-end by the <a href="../../verification/index.html#gxii">GXII golden regression</a>, whose deck encodes the ramp parameters quoted above.</li>
+      </ul>
+    </section>
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["$$", "$$"], ["\\[", "\\]"]] } };</script>
+  <script defer src="../../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../../nav.js" data-page="mesh-1d" data-root="../../"></script>
+</body>
+</html>

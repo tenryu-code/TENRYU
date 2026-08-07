@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en" data-lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>System requirements — TENRYU Documentation</title>
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>System requirements <span class="badge">reference</span></h1>
+    <p class="abstract">TENRYU is a CUDA-only GPU code. This page collects the machine, GPU, compiler, and library requirements for building and running it in one place. The <a href="building.html">Building</a> page covers the procedure; this page covers the conditions under which that procedure works.</p>
+
+    <aside class="planned" aria-labelledby="at-a-glance">
+      <h3 id="at-a-glance">At a glance</h3>
+      <ul>
+        <li>Required: an NVIDIA GPU plus CUDA Toolkit 12.x (12.0+), a C++20 compiler (GCC 12+ / Clang 15+), CMake 3.25+, Ninja, and Python 3.10+ (with development headers).</li>
+        <li>The default CUDA architectures are <code>70;80;89;90</code> (a Volta/Ampere/Ada/Hopper fatbin). Continuously exercised hardware: A100 (40/80 GB), RTX 4090, RTX 3090.</li>
+        <li>MPI and Hypre are opt-in (default OFF); HDF5 and Python are default ON. The small test/logging dependencies (Catch2/spdlog/CLI11/pybind11) are fetched automatically at configure time if missing — offline machines need them preinstalled.</li>
+        <li>All development and validation experience is on Linux x86_64; other operating systems are untested.</li>
+      </ul>
+    </aside>
+
+    <section aria-labelledby="platform">
+      <h2 id="platform">Platform and GPU</h2>
+      <p>The only supported backend is NVIDIA CUDA (other backends such as HIP are out of scope by design). Without a GPU the code may build but cannot run. The basic execution shape is one process = one GPU: a single GPU needs no MPI, and multiple GPUs run as one MPI rank per GPU (see below).</p>
+      <table class="quick-facts">
+        <thead><tr><th>Item</th><th>Requirement / default</th><th>Notes</th></tr></thead>
+        <tbody>
+          <tr><th>GPU vendor</th><td>NVIDIA only</td><td>CUDA-only; no other GPU vendors, no CPU-only execution.</td></tr>
+          <tr><th>GPU architecture</th><td>default fatbin: <code>70;80;89;90</code></td><td>Adjustable via <code>CMAKE_CUDA_ARCHITECTURES</code>. The theoretical floor is compute capability 6.0+ (double-precision <code>atomicAdd</code>; ARCHITECTURE §2.2). sm_86 (RTX 30 series) runs via forward compatibility of the sm_80 binary.</td></tr>
+          <tr><th>Exercised hardware</th><td>A100 40/80 GB, RTX 4090 (24 GB), RTX 3090 (24 GB)</td><td>The configurations that run the regressions and benchmarks. VRAM needs scale with the grid — 1D reference problems are small; large 2D runs need more.</td></tr>
+          <tr><th>OS</th><td>Linux x86_64 (exercised)</td><td>All development, CI-grade validation, and production runs are on Linux. Other OSes are untested.</td></tr>
+          <tr><th>GPU driver</th><td>CUDA 12.x capable</td><td>The CUDA Version reported by <code>nvidia-smi</code> must be 12.x or newer.</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section aria-labelledby="toolchain">
+      <h2 id="toolchain">Toolchain and libraries</h2>
+      <p>The canonical minimum versions live in <code>docs/ARCHITECTURE.md</code> §2.2 in the repository. Requirements fall into three tiers: required, default-ON (removable but normally used), and opt-in.</p>
+      <table class="quick-facts">
+        <thead><tr><th>Dependency</th><th>Minimum</th><th>Tier</th><th>Role / caveats</th></tr></thead>
+        <tbody>
+          <tr><th>CUDA Toolkit</th><td>12.0+</td><td>required</td><td><code>nvcc</code>, runtime, cuSPARSE. The cuRAND device API (Philox4x32-10) and NVTX ship with the toolkit, no extra links.</td></tr>
+          <tr><th>C++ compiler</th><td>GCC 12+ / Clang 15+</td><td>required</td><td>C++20 support is the condition (used as the <code>nvcc</code> host compiler).</td></tr>
+          <tr><th>CMake</th><td>3.25+</td><td>required</td><td>Configure, dependency detection, CTest.</td></tr>
+          <tr><th>Ninja</th><td>—</td><td>required</td><td>Build executor (this documentation assumes <code>-GNinja</code>).</td></tr>
+          <tr><th>Python 3 + dev headers</th><td>3.10+</td><td>default ON</td><td>Embedded interpreter that reads the namelist deck at initialization; needs the <code>python3-dev</code> equivalent.</td></tr>
+          <tr><th>pybind11</th><td>2.11+</td><td>default ON</td><td>namelist → Config conversion. Auto-fetched if missing.</td></tr>
+          <tr><th>HDF5</th><td>1.12+</td><td>default ON</td><td>Snapshot/history/checkpoint I/O. MPI builds use parallel HDF5 (<code>--enable-parallel</code>).</td></tr>
+          <tr><th>MPI</th><td>3.1+</td><td>opt-in (<code>-DTENRYU_ENABLE_MPI=ON</code>)</td><td>Multi-rank execution. GPU-aware MPI recommended (host staging otherwise).</td></tr>
+          <tr><th>Hypre</th><td>2.25+</td><td>opt-in (<code>-DTENRYU_ENABLE_HYPRE=ON</code>)</td><td>For conduction's <code>solver="hypre"</code> (BoomerAMG+PCG). Requires a Hypre built with <code>--with-cuda --with-gpu-aware-mpi</code>.</td></tr>
+          <tr><th>AmgX</th><td>—</td><td>opt-in (auto-detect)</td><td>2D FLD solver option; enabled by default when <code>find_package(amgx)</code> succeeds.</td></tr>
+          <tr><th>fmt / spdlog</th><td>9.0+ / 1.12+</td><td>internal</td><td>Logging. Auto-fetched if missing.</td></tr>
+          <tr><th>Catch2</th><td>3.0+</td><td>tests</td><td>Unit and integration tests under <code>ctest</code>. Auto-fetched if missing.</td></tr>
+          <tr><th>CLI11</th><td>2.4+</td><td>internal</td><td>The <code>run/verify/validate/freeze</code> subcommand CLI. Auto-fetched if missing.</td></tr>
+        </tbody>
+      </table>
+      <p><strong>About networking.</strong> Catch2, spdlog, CLI11, and pybind11 are downloaded by CMake's FetchContent at configure time when not found on the system, so the first <code>cmake</code> is easiest with internet access. On offline machines (e.g. compute nodes of a computing center), preinstall them or run the first configure where the network is available. CUDA, HDF5, Python, MPI, and Hypre are never auto-fetched and must always be preinstalled.</p>
+    </section>
+
+    <section aria-labelledby="cmake-options">
+      <h2 id="cmake-options">CMake option defaults</h2>
+      <table class="quick-facts">
+        <thead><tr><th>Option</th><th>Default</th><th>Meaning</th></tr></thead>
+        <tbody>
+          <tr><th><code>CMAKE_CUDA_ARCHITECTURES</code></th><td><code>70;80;89;90</code></td><td>Target SASS generations. Restricting to your one GPU speeds up builds (e.g. <code>89</code> for an RTX 4090).</td></tr>
+          <tr><th><code>TENRYU_ENABLE_HDF5</code></th><td><code>ON</code></td><td>HDF5 I/O. OFF disables outputs and restarts.</td></tr>
+          <tr><th><code>TENRYU_ENABLE_PYTHON</code></th><td><code>ON</code></td><td>Python namelist input. OFF cannot read <code>.py</code> decks.</td></tr>
+          <tr><th><code>TENRYU_ENABLE_MPI</code></th><td><code>OFF</code></td><td>Multi-rank execution. Leave OFF for single-GPU use.</td></tr>
+          <tr><th><code>TENRYU_ENABLE_HYPRE</code></th><td><code>OFF</code></td><td>Implicit conduction solver path.</td></tr>
+          <tr><th><code>TENRYU_ENABLE_NVTX</code></th><td><code>OFF</code></td><td>Profiling instrumentation (for Nsight).</td></tr>
+          <tr><th><code>TENRYU_ENABLE_AMGX</code></th><td>auto (ON when found)</td><td>AmgX solver for 2D FLD.</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section aria-labelledby="preflight">
+      <h2 id="preflight">Pre-flight checks</h2>
+      <p>If the following four checks pass, the required conditions are essentially met.</p>
+      <pre><code># GPU and driver (CUDA Version must be 12.x or newer)
+nvidia-smi
+
+# CUDA compiler (release 12.x)
+nvcc --version
+
+# Build tools
+cmake --version     # 3.25 or newer
+ninja --version
+
+# Python (3.10+, with development headers)
+python3 --version
+python3 -c "import sysconfig; print(sysconfig.get_paths()['include'])"</code></pre>
+      <p>Once these pass, continue to <a href="building.html">Building</a>; that page also covers what to do when CMake reports a missing package.</p>
+    </section>
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["\\[", "\\]"]] } };</script>
+  <script defer src="../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../nav.js" data-page="requirements" data-root="../"></script>
+</body>
+</html>
