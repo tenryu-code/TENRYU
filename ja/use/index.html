@@ -17,7 +17,11 @@
     <section aria-labelledby="quickstart">
       <h2 id="quickstart">クイックスタート（コピーして実行）</h2>
       <p>前提が揃っているか不安なら、まず<a href="requirements.html">動作環境と要求スペック</a>の事前チェックから。以降はリポジトリのルートで実行する。</p>
-      <pre><code># 1. ビルド（初回のみ。詳細と失敗時の対処は「ビルド」ページ）
+      <pre><code># 0. ソースコードの入手（初回のみ）
+git clone https://github.com/tenryu-code/TENRYU.git
+cd TENRYU
+
+# 1. ビルド（初回のみ。詳細と失敗時の対処は「ビルド」ページ）
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 ninja -C build
 

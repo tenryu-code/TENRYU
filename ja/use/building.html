@@ -42,6 +42,14 @@
       </table>
     </section>
 
+    <section aria-labelledby="get-source">
+      <h2 id="get-source">ソースコードの入手</h2>
+      <p>ソースコードは GitHub リポジトリ <a href="https://github.com/tenryu-code/TENRYU">tenryu-code/TENRYU</a> から取得する。以降の手順はすべて、clone したリポジトリのルートで実行する。</p>
+      <pre><code>git clone https://github.com/tenryu-code/TENRYU.git
+cd TENRYU</code></pre>
+      <p>特定のリリースを使う場合はタグを checkout する（例: <code>git checkout v1.0.0-beta.1</code>）。既存の checkout を更新するには <code>git pull</code> を実行してから、あらためてビルドする。</p>
+    </section>
+
     <section aria-labelledby="configure-build">
       <h2 id="configure-build">構成とビルド</h2>
       <p>リポジトリのルートで次の 2 つのコマンドを実行する。最初のコマンドはソースツリーを変更せず、リリース用のビルドツリーを <code>build/</code> に生成する。2 つ目は既定のターゲットをコンパイルし、<code>build/tenryu</code> と、有効になっているテストのターゲットを作る。</p>

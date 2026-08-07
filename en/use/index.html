@@ -17,7 +17,11 @@
     <section aria-labelledby="quickstart">
       <h2 id="quickstart">Quick start (copy and run)</h2>
       <p>If unsure about prerequisites, start with the pre-flight checks on <a href="requirements.html">System requirements</a>. Everything below runs from the repository root.</p>
-      <pre><code># 1. build (first time only; details and failure handling on "Building")
+      <pre><code># 0. get the source (first time only)
+git clone https://github.com/tenryu-code/TENRYU.git
+cd TENRYU
+
+# 1. build (first time only; details and failure handling on "Building")
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 ninja -C build
 

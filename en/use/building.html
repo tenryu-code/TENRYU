@@ -42,6 +42,14 @@
       </table>
     </section>
 
+    <section aria-labelledby="get-source">
+      <h2 id="get-source">Getting the source</h2>
+      <p>The source code is hosted on GitHub at <a href="https://github.com/tenryu-code/TENRYU">tenryu-code/TENRYU</a>. Every step below runs from the root of the cloned repository.</p>
+      <pre><code>git clone https://github.com/tenryu-code/TENRYU.git
+cd TENRYU</code></pre>
+      <p>To use a specific release, check out its tag (for example <code>git checkout v1.0.0-beta.1</code>). To update an existing checkout, run <code>git pull</code> and rebuild.</p>
+    </section>
+
     <section aria-labelledby="configure-build">
       <h2 id="configure-build">Configure and build</h2>
       <p>Run these commands from the repository root. The first leaves the source tree untouched and creates a Release build tree in <code>build/</code>. The second compiles the default targets, producing <code>build/tenryu</code> and the enabled test targets.</p>
