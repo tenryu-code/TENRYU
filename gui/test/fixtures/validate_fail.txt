@@ -1,0 +1,4 @@
+TENRYU ERROR [namelist]: Python execution failed: RuntimeError: Mesh.nrr is not a supported key (did you mean 'nr'?)
+
+At:
+  /tmp/deck_bad.py(24): <module>

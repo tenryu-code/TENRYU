@@ -1,0 +1,72 @@
+#!/usr/bin/env node
+// Mock ssh for tests: records argv+stdin, emulates a TENRYU server.
+"use strict";
+const fs = require("node:fs");
+const path = require("node:path");
+
+const argv = process.argv.slice(2);
+
+function readStdin() {
+  try {
+    return fs.readFileSync(0, "utf8");
+  } catch {
+    return "";
+  }
+}
+
+function fixture(name, fallback) {
+  const dir = process.env.TENRYU_GUI_MOCK_FIXTURES;
+  if (dir) {
+    try {
+      return fs.readFileSync(path.join(dir, name), "utf8");
+    } catch {
+      /* fall through */
+    }
+  }
+  return fallback;
+}
+
+const stdin = readStdin();
+if (process.env.TENRYU_GUI_MOCK_LOG) {
+  fs.appendFileSync(
+    process.env.TENRYU_GUI_MOCK_LOG,
+    JSON.stringify({ argv, stdin }) + "\n",
+  );
+}
+
+const remoteCommand = argv.length > 0 ? argv[argv.length - 1] : "";
+
+if (remoteCommand.includes("validate")) {
+  if (remoteCommand.includes("bad_deck")) {
+    process.stderr.write(
+      fixture(
+        "validate_fail.txt",
+        "TENRYU ERROR [namelist]: Python execution failed: RuntimeError: Mesh.nrr is not a supported key (did you mean 'nr'?)\n",
+      ),
+    );
+    process.exit(1);
+  }
+  process.stdout.write(
+    fixture(
+      "validate_ok.txt",
+      "[2026-07-11 00:00:00.000] [info] [TENRYU] Configuration validated successfully.\n",
+    ),
+  );
+  process.exit(0);
+}
+
+if (remoteCommand === "printenv HOME") {
+  process.stdout.write("/home/mockuser\n");
+  process.exit(0);
+}
+
+if (remoteCommand === "true" || remoteCommand.includes("echo tenryu-studio-ping")) {
+  process.stdout.write("tenryu-studio-pong\n");
+  process.exit(0);
+}
+
+if (remoteCommand.includes("mkdir -p") && remoteCommand.includes("printf")) {
+  process.exit(0);
+}
+
+process.exit(0);

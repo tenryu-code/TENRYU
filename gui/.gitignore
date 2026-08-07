@@ -1,0 +1,8 @@
+node_modules/
+dist/
+dev-bridge/profiles.dev.json
+dev-bridge/settings.dev.json
+dev-bridge/*.log
+src-tauri/target/
+.DS_Store
+*.tsbuildinfo

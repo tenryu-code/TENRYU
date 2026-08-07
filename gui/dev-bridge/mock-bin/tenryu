@@ -1,0 +1,41 @@
+#!/usr/bin/env node
+// Mock tenryu for run-lifecycle tests: emits real-format [progress] lines.
+// Env: TENRYU_MOCK_STEPS (default 5), TENRYU_MOCK_SLEEP_MS (default 60),
+//      TENRYU_MOCK_FAIL=1 -> exit 9 halfway.
+"use strict";
+
+const steps = Number(process.env.TENRYU_MOCK_STEPS || 5);
+const sleepMs = Number(process.env.TENRYU_MOCK_SLEEP_MS || 60);
+const failAt = process.env.TENRYU_MOCK_FAIL ? Math.ceil(steps / 2) : -1;
+const maxSteps = 500000;
+const tEnd = 2e-9;
+
+function line(s) {
+  process.stdout.write(`[2026-07-11 00:00:00.000] [info] [TENRYU] ${s}\n`);
+}
+
+async function main() {
+  const sub = process.argv[2];
+  if (sub !== "run") {
+    process.stderr.write(`mock tenryu: unsupported subcommand ${String(sub)}\n`);
+    process.exit(64);
+  }
+  line("TENRYU starting (mock)");
+  for (let k = 1; k <= steps; k++) {
+    await new Promise((r) => setTimeout(r, sleepMs));
+    const step = k * 100;
+    const t = (tEnd * k) / steps;
+    const pct = ((100 * k) / steps).toFixed(1);
+    line(
+      `[progress] step=${step}/${maxSteps} t=${t.toExponential(3)}/${tEnd.toExponential(3)} dt=1.000e-12 (${pct}%) elapsed=0:00:0${k}`,
+    );
+    if (k === failAt) {
+      process.stderr.write("TENRYU ERROR [mock]: injected failure\n");
+      process.exit(9);
+    }
+  }
+  line("run complete (mock)");
+  process.exit(0);
+}
+
+void main();

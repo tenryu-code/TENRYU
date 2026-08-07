@@ -1,0 +1,97 @@
+TENRYU License (Source-Available)
+
+Copyright (c) 2026 Ryunosuke Takizawa,
+Institute of Laser Engineering, The University of Osaka.
+All rights reserved except as expressly granted below.
+
+TENRYU is distributed as source-available software. The source code is
+publicly readable, but this is not an open-source license in the OSI
+sense: redistribution and commercial use are restricted.
+
+1. Permitted use
+   a. You may view and download the source code.
+   b. You may run TENRYU free of charge for academic and other
+      non-commercial purposes. (use by or within a for-profit company, including its internal research and development, is commercial use; see Section 3)
+   c. You may modify the code internally, for your own research within
+      your organization. Internal modification requires no permission.
+
+2. Restrictions
+   a. You may not redistribute the code -- original or modified, in
+      whole or in part, including public forks or mirrors -- without
+      prior written permission of the copyright holder.
+   b. You may not distribute or publish modified versions. Internal
+      modification is permitted; making a modified version available
+      to others is not.
+   c. You may not use TENRYU commercially -- including in paid services, consulting deliverables, products, or internal research and development at a for-profit company -- without a
+      fee-based license agreement with the copyright holder.
+
+3. Commercial licensing
+   Commercial use includes use by or within a for-profit entity, including its internal research and development.
+   Commercial use requires a fee-based license agreement. Contact the
+   developer in advance through the TENRYU GitHub repository (Issues)
+   to arrange terms.
+
+4. Citation
+   If TENRYU contributes to published work, please acknowledge it,
+   e.g.: "This work used the TENRYU radiation-hydrodynamics code
+   developed by Ryunosuke Takizawa (Institute of Laser Engineering,
+   The University of Osaka)."
+
+5. No warranty
+   TENRYU IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+   OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+   MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE. IN NO EVENT
+   SHALL THE COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES, OR
+   OTHER LIABILITY ARISING FROM THE USE OF THE SOFTWARE.
+
+6. Contact
+   Permission requests and commercial-licensing inquiries are received
+   through the TENRYU GitHub repository (Issues).
+
+----------------------------------------------------------------------
+
+日本語（参考訳 — 英語版と相違がある場合は英語版が優先します）
+
+TENRYU ライセンス（ソース公開）
+
+Copyright (c) 2026 瀧澤龍之介（大阪大学レーザー科学研究所）。
+以下で明示的に許諾された事項を除き、全ての権利を留保します。
+
+TENRYU はソース公開（source-available）ソフトウェアとして配布され
+ます。ソースコードは公開されていますが、OSI 定義のオープンソース
+ライセンスではありません — 再配布と商用利用には制限があります。
+
+1. 許諾されること
+   a. ソースコードの閲覧・ダウンロード。
+   b. 学術目的およびその他の非商用目的での無償の実行。（営利企業による利用は、社内の研究開発を含めて商用利用です — 第3節参照）
+   c. 所属組織内で、自身の研究のための内部的な改変。内部での改変に
+      許可は不要です。
+
+2. 禁止事項
+   a. 著作権者の事前の書面による許可のない、コードの原版または
+      改変版の全部または一部の再配布（公開フォーク・ミラーを含む）。
+   b. 改変版の配布・公開。（内部での改変は許可されますが、改変版を
+      他者が利用できるようにすることはできません。）
+   c. 著作権者との有償ライセンス契約のない商用利用（有償サービス・
+      コンサルティング成果物・製品・営利企業における社内研究開発での利用を含む）。
+
+3. 商用ライセンス
+   商用利用には、営利企業（営利団体）による利用 — 社内の研究開発を含む — が含まれます。
+   商用利用には有償のライセンス契約が必要です。条件を取り決める
+   ため、事前に TENRYU の GitHub リポジトリ（Issues）経由でご連絡
+   ください。
+
+4. 引用のお願い
+   TENRYU が公表される研究成果に寄与した場合は、例えば次のように
+   明記してください。「本研究では瀧澤龍之介（大阪大学レーザー科学
+   研究所）が開発した輻射流体コード TENRYU を使用した。」
+
+5. 無保証
+   TENRYU は「現状のまま」提供され、商品性・特定目的適合性を含む
+   いかなる明示または黙示の保証もありません。著作権者は、本ソフト
+   ウェアの利用から生じるいかなる請求・損害・その他の責任も負い
+   ません。
+
+6. 連絡先
+   許可申請・商用ライセンスのご相談は TENRYU の GitHub リポジトリ
+   （Issues）経由で受け付けます。
