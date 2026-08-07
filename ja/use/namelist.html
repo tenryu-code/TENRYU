@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="ja" data-lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>namelist リファレンス — TENRYU ドキュメント</title>
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>namelist リファレンス <span class="badge">reference</span></h1>
+    <p class="abstract">このページは Python の namelist の全キーを列挙する仕様書ではなく、目的の設定へたどり着くための案内図である。最上位のブロック、主要な下位ブロック、代表的なキーの関係を示す。完全なキーの表面 — 型、単位、許容値、組合せの制約、正典となる既定値の一覧 — は、ソースとともに配布される仕様書が保持する：TENRYU リポジトリ（コードと同様に公開されている）の <code>docs/SPECIFICATION.md</code> §6.4（スキーマ）と §9.1（既定値）である。</p>
+
+    <aside class="planned" aria-labelledby="at-a-glance">
+      <h3 id="at-a-glance">要点</h3>
+      <ul>
+        <li><code>Main</code> から <code>Parallel</code> までのブロックが、ケースの識別、メッシュ、物性、初期条件、物理、数値解法、出力を分担する。</li>
+        <li>括弧内の <code>dict</code> は、独立したスキーマをもつ下位ブロックである。たとえば <code>Numerics.dt.max_s</code> と <code>Numerics.hydro.av_C2</code> は別々の契約である。</li>
+        <li>未知のキー、型の違い、範囲外の値、対応していないブロックの組合せは、いずれも入力エラーである。打ち間違いが黙って既定値に戻ることはない。</li>
+        <li>以下のキーは入口を示す例であり、完全な一覧ではない。このページの表は意図的に既定値を載せていない。各カーネルページには主要な既定値が載っており、両者が食い違う場合は SPECIFICATION §9.1 が正である。</li>
+      </ul>
+    </aside>
+
+    <section aria-labelledby="block-map">
+      <h2 id="block-map">ブロックの地図</h2>
+      <p>デッキでは通常、<code>from tenryu_namelist import *</code> のあと、各コンストラクタを 1 回ずつ呼ぶ。材料は <code>Material(...)</code> を作って <code>Materials(materials=[...])</code> に登録し、レーザーのビームは <code>LaserBeam(...)</code> を <code>Laser.beams</code> へ渡す。表の「代表的なキー」は探し始める起点である。詳細な入れ子のスキーマや、モードごとの排他条件は仕様書の側にある。</p>
+      <table class="quick-facts">
+        <thead>
+          <tr><th>ブロック / 下位ブロック</th><th>目的</th><th>代表的なキー</th></tr>
+        </thead>
+        <tbody>
+          <tr><th><code>Main</code></th><td>ケースの名前、次元、温度のモデル、停止条件、乱数の種、再開元。</td><td><code>name</code>, <code>dimension</code>, <code>temperature_model</code>, <code>t_end</code>, <code>max_steps</code>, <code>seed</code>, <code>restart_from</code></td></tr>
+          <tr><th><code>Mesh</code></th><td>1D / 2D の領域、ゾーン数、格子の分布、メッシュの運動と接続関係。</td><td><code>r_min</code>, <code>r_max</code>, <code>nr</code>, <code>z_min</code>, <code>z_max</code>, <code>nz</code>, <code>grid</code>, <code>motion</code></td></tr>
+          <tr><th><code>Materials</code><br><code>Material</code></th><td>材料の一覧、EOS、不透明度、平均電離度、ボイドと混合の規則。</td><td><code>materials</code>, <code>opacity_mix_rule</code>, <code>zbar</code>, <code>void_config</code>; 各材料の <code>name</code>, <code>A</code>, <code>Z</code>, <code>eos</code>, <code>opacity</code>, <code>is_void</code></td></tr>
+          <tr><th><code>Geometry</code></th><td>材料の体積分率と、初期の密度、電子・イオン温度、速度、輻射場をメッシュ上に配置する。</td><td><code>volfrac</code>, <code>rho</code>, <code>Te</code>, <code>Ti</code>, <code>velocity</code>, <code>radiation_field</code>, <code>enforce_sum_to_one</code></td></tr>
+          <tr><th><code>Radiation</code></th><td>輻射の演算子、エネルギー群、FLD / S<sub>N</sub> のソルバと境界条件。</td><td><code>enabled</code>, <code>mode</code>, <code>groups</code>, <code>group_bounds_eV</code>, <code>compute_T_range_eV</code>, <code>multigroup_diffusion</code>, <code>sn_transport</code>, <code>boundary</code></td></tr>
+          <tr><th><code>Laser</code></th><td>波長、光線追跡のモード、ビームの集合、吸収と屈折の設定。</td><td><code>enabled</code>, <code>wavelength_nm</code>, <code>mode</code>, <code>rays_per_beam</code>, <code>beams</code>, <code>absorption</code></td></tr>
+          <tr><th><code>Laser.cbet</code></th><td>交差ビームエネルギー転送、ポートと区画の離散化、イオン音波の応答と反復。</td><td><code>enable</code>, <code>geometry_mode</code>, <code>f_cbet</code>, <code>alpha_iaw</code>, <code>theta_cap</code>, <code>tol</code>, <code>max_iters</code>, <code>n_section_phi</code></td></tr>
+          <tr><th><code>Laser.hot_electron</code></th><td>ホット電子の生成源、変換効率、スペクトル、角度分布、減速とエネルギーの台帳。</td><td><code>enable</code>, <code>eta_hot</code>, <code>eta_hot_table</code>, <code>sources</code>, <code>T_hot_eV</code>, <code>n_energy_groups</code>, <code>angular_model</code>, <code>subtract_from_laser</code></td></tr>
+          <tr><th><code>Numerics.dt</code></th><td>初期の時間刻み、CFL 条件、増加率、上下限、Fleck による制限。</td><td><code>initial_s</code>, <code>cfl_hydro</code>, <code>cfl_cond</code>, <code>f_min_fleck</code>, <code>growth_factor</code>, <code>max_s</code>, <code>min_s</code></td></tr>
+          <tr><th><code>Numerics.hydro</code></th><td>流体、人工粘性、時間積分、1D / 2D の境界と再試行。</td><td><code>enabled</code>, <code>boundary_1d</code>, <code>boundary_2d</code>, <code>av_type</code>, <code>av_model</code>, <code>av_C1</code>, <code>av_C2</code>, <code>time_integration</code></td></tr>
+          <tr><th><code>Numerics.conduction</code></th><td>電子・イオンの熱伝導、ソルバ、流束の制限、非局所モデル。</td><td><code>enabled</code>, <code>solver</code>, <code>f_lim</code>, <code>ion_conduction</code>, <code>face_kappa_policy</code>, <code>nonlocal_model</code>, <code>snb_n_groups</code></td></tr>
+          <tr><th><code>Numerics.ale</code><br>リゾーン / リマップ</th><td>2D RZ のメッシュ品質による発動、リゾーンのソルバ、許容性、保存的なリマップ。</td><td><code>enabled</code>, <code>every_n_steps</code>, <code>quality_threshold</code>, <code>rezone_solver</code>, <code>remap_scheme</code>, <code>remap_limiter</code>, <code>conservative_remap_enabled</code></td></tr>
+          <tr><th><code>Numerics.floors</code></th><td>密度と、電子・イオン温度の下限。</td><td><code>rho_floor_gcc</code>, <code>Te_floor_eV</code>, <code>Ti_floor_eV</code></td></tr>
+          <tr><th><code>Numerics.safety</code></th><td>NaN、エネルギー収支、不透明度の制限などに対する、警告か致命的エラーかの方針。</td><td><code>energy_fatal</code>, <code>nan_fatal</code>, <code>energy_threshold</code>, <code>energy_budget_tol</code>, <code>opacity_floor</code>, <code>opacity_cap</code></td></tr>
+          <tr><th><code>Burn</code></th><td>核反応のチャネル、燃料の組成、荷電生成物の輸送、遮蔽と部分サイクル。</td><td><code>enabled</code>, <code>fuels</code>, <code>scheme</code>, <code>screening</code>, <code>fuel_materials</code>, <code>x_D</code>, <code>x_T</code>, <code>partition</code>, <code>subcycle_max</code></td></tr>
+          <tr><th><code>Output</code></th><td>出力先のディレクトリ、形式、描画・履歴・チェックポイントの間隔と保持の方針。</td><td><code>directory</code>, <code>format</code>, <code>plot_every</code>, <code>history_every</code>, <code>checkpoint_every</code>, <code>checkpoint_keep_last</code></td></tr>
+          <tr><th><code>Diagnostics</code></th><td>実行中の履歴の集計、面密度、シェル、球対称性、エネルギー収支。</td><td><code>enabled</code>, <code>every</code>, <code>energy_budget</code>, <code>areal_density</code>, <code>shell</code>, <code>sphericity</code>, <code>laser_pattern</code></td></tr>
+          <tr><th><code>Parallel</code></th><td>MPI による領域分割、袖領域の層、GPU 対応の転送。</td><td><code>decomposition.method</code>, <code>decomposition.dims</code>, <code>decomposition.min_cells_per_rank</code>, <code>halo.gpu_aware_mpi</code>, <code>halo.ghost_layers</code></td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section aria-labelledby="how-to-read">
+      <h2 id="how-to-read">キーの読み方</h2>
+      <p>完全修飾名で考えると、似た名前を取り違えにくくなる。たとえば <code>enabled</code> は多くのブロックにあるが、<code>Radiation.enabled</code>、<code>Numerics.conduction.enabled</code>、<code>Burn.enabled</code> はそれぞれ別のスイッチである。同様に、輻射の境界には、選んだソルバごとの下位ブロックに置くものと、最上位の <code>Radiation.boundary</code> に置くものがある。名前だけから入れ子の位置を推測せず、§6.4 の該当ブロックを確認すること。</p>
+      <p>値には cgs + eV の単位系を使う。長さは cm、時間は s、密度は g/cm³、温度と光子群の境界は eV である。ただし <code>wavelength_nm</code> や <code>T_floor_keV</code> のように名前が単位を明示しているキーでは、その接尾辞が契約になる。単位、型、次元ごとの制約は代表的なキーの表からは省いてあるため、実際の値を入力する前に仕様書の個別の記述を読む必要がある。</p>
+    </section>
+
+    <section aria-labelledby="validation-defaults">
+      <h2 id="validation-defaults">検証と既定値</h2>
+      <p>パーサは各階層で、既知のキーかどうかを検証する。未知のキーを捨てて続行することはせず、誤った型、必須の値の欠落、範囲の違反、相互に排他的なモード、次元や MPI のランク数に対して対応していない設定を、<code>ConfigError</code> として停止させる。この挙動は、設定の打ち間違いを物理結果の違いとして後から発見する事態を避けるための、入力の契約である。</p>
+      <aside class="planned" aria-labelledby="authoritative-reference">
+        <h3 id="authoritative-reference">正典となる完全なリファレンス</h3>
+        <p>このページは案内図である。完全なキーのリファレンスは TENRYU リポジトリ（ソースとともに配布される公開文書）の <code>docs/SPECIFICATION.md</code> §6.4、既定値の正典となる一覧は同 §9.1 である。本サイトの各カーネルページに載る既定値は、フッタに示すドキュメント日付の時点で正確なものである。サイトと §9.1 が食い違う場合は §9.1 が優先される。新しいデッキを作るとき、モードを変えるとき、既定値に依存した解釈をするとき、検証のエラーを解消するときは、この仕様書を確認すること。</p>
+      </aside>
+    </section>
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["\\[", "\\]"]] } };</script>
+  <script defer src="../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../nav.js" data-page="namelist" data-root="../"></script>
+</body>
+</html>

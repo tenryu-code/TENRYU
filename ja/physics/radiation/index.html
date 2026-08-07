@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="ja" data-lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>輻射輸送 — TENRYU ドキュメント</title>
+  <link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>輻射輸送</h1>
+    <p class="abstract">TENRYU は、電子物質と連成した多群の輻射輸送を、<code>Radiation.mode</code> で選ぶ 2 つの実運用向け決定論的ソルバで解く。多群の流束制限拡散（<code>"multigroup_diffusion"</code>）と、離散座標法による \(S_N\) 輸送（<code>"sn_transport"</code>）である。どちらも 1D — <code>Mesh.geometry_1d</code> の 3 つの測度（球・円筒・平面）すべて — と 2D 軸対称 RZ の幾何で動作し、群の構造と物質側の閉包を共有するが、角度の扱い方と、物質との結合の閉じ方が異なる。このページでは両モデルを説明・比較し、それぞれの詳細ページへ案内する。</p>
+    <div class="card-grid">
+      <a class="card" href="fld.html"><h3>多群 FLD</h3><p>Fleck 線形化による物質との連成を用いる流束制限拡散。</p></a>
+      <a class="card" href="sn.html"><h3>S<sub>N</sub> 輸送</h3><p>掃引と反復的な物質閉包を用いる離散座標法の輸送。</p></a>
+    </div>
+
+    <section aria-labelledby="models">
+      <h2 id="models">2 つのモデル</h2>
+      <p><strong>多群 FLD。</strong> 多群の流束制限拡散は、光子のエネルギーを群に分け、Fleck 線形化によって電子物質との「硬い」（時定数が時間刻みよりはるかに短い）放出・吸収を陰的に連成する。1D では一括処理する三重対角の系を、2D RZ では共役勾配法系のソルバを用いる 5 点 CSR の保存型有限体積の系を構成する。光学的に厚い領域では拡散極限を回復し、Levermore–Pomraning の流束制限関数が薄い領域での輸送を抑える。</p>
+      <p><strong>\(S_N\) 輸送。</strong> 離散座標法の輸送は、光子エネルギー群ごとに有限個の方向を追跡し、方向別の放射強度からセルのエネルギーと面の流束を構成する。波面に沿う掃引に、源反復とピカール法による物質との連成を組み合わせる。角度の情報を保持するため、拡散のクロージャでは表せない自由飛行、影、異方性を扱える。</p>
+    </section>
+
+    <section aria-labelledby="comparison">
+      <h2 id="comparison">比較と使い分け</h2>
+      <table class="quick-facts">
+        <thead>
+          <tr><th>観点</th><th>多群 FLD</th><th>\(S_N\) 輸送</th></tr>
+        </thead>
+        <tbody>
+          <tr><th>角度の扱い</th><td>スカラーのエネルギーと、制限付きの拡散流束（角度は流束制限関数で閉じる）。</td><td>離散的な方向 \(\{\boldsymbol\mu_m,w_m\}\)。1D はガウス–ルジャンドル（実運用の既定は \(S_{16}\)）、2D RZ は直積型の level-symmetric。</td></tr>
+          <tr><th>有効な領域</th><td>光学的に厚く、ほぼ等方な輻射場。</td><td>光学的に薄い自由飛行、方向性のある照射、影、レイ効果まで扱える。</td></tr>
+          <tr><th>物質との連成</th><td>Fleck 線形化と、外側反復およびセル局所のニュートン法による物質の更新。</td><td>Fleck の実効散乱を使わない（\(f=1\)、素の \(\sigma^{PA}\)/\(\sigma^{PE}\)）。源反復と外側のピカール反復、能動集合によるニュートン法での閉包である。</td></tr>
+          <tr><th>計算量とソルバ</th><td>群ごとに 1 回の拡散求解：1D は一括処理の三重対角、2D RZ は 5 点 CSR とヤコビ前処理付き共役勾配法／GMG。</td><td>計算量はおよそ、セル数 × 群数 × 方向数 × 反復数。角度と面の作業領域も必要である。</td></tr>
+          <tr><th>幾何</th><td>1D（球・円筒・平面）&amp; 2D RZ。</td><td>1D（球・平面は Gauss–Legendre、円筒は \(n=2L^2\) 本の積求積）&amp; 2D RZ。</td></tr>
+          <tr><th>迷ったときは</th><td>輻射爆縮における実運用の既定である（<a href="../../verification/index.html#gxii">GXII</a> の基準回帰試験）。</td><td>S<sub>8</sub>/S<sub>16</sub>/S<sub>32</sub> の段階列で着目量の収束を確認する。</td></tr>
+        </tbody>
+      </table>
+      <p>透明な空隙、自由飛行する波面、方向性の強い照射、影、レイ効果のように、角度分布そのものが解の一部になる場合は \(S_N\) を選ぶ。FLD は角度をスカラーのエネルギーと制限付きの拡散流束に閉じるため、光学的に厚くほぼ等方な領域では一般に安価である。方向数を減らせば計算は安くなるが、角度の打ち切り誤差とレイ効果が大きくなる。</p>
+    </section>
+
+    <section aria-labelledby="shared">
+      <h2 id="shared">両モデルが共有するもの</h2>
+      <ul>
+        <li>共有する光子エネルギーの群境界、プランク分率 \(b_g(T)\)、電子 EOS の基本量。</li>
+        <li>同じ境界条件の族（反射、真空、Marshak）。面の種別は、モードごとのブロックの下に置く。</li>
+        <li><code>VOID</code> のセルを物質との交換から除外する、ボイドセルの契約。</li>
+        <li>機械精度で閉じる、境界と物質のエネルギーの台帳。</li>
+        <li>内部の単位系 cgs + eV。</li>
+      </ul>
+    </section>
+
+    <section aria-labelledby="controls">
+      <h2 id="controls">共有する namelist のキー</h2>
+      <p>完全なスキーマと組合せの制約は <a href="../../use/namelist.html">namelist リファレンス</a>を参照のこと。</p>
+      <table class="quick-facts">
+        <thead>
+          <tr><th>キー</th><th>既定値 / 例</th><th>用途</th></tr>
+        </thead>
+        <tbody>
+          <tr><th><code>Radiation.enabled</code></th><td><code>True</code></td><td>輻射の演算子を有効にする。</td></tr>
+          <tr><th><code>Radiation.mode</code></th><td><code>"multigroup_diffusion"</code></td><td><a href="fld.html">多群 FLD</a>、または <code>"sn_transport"</code> で <a href="sn.html">\(S_N\)</a> を選ぶ。</td></tr>
+          <tr><th><code>Radiation.groups</code></th><td><code>1</code></td><td>両方のソルバが共有する光子エネルギー群の数 \(G\)。</td></tr>
+          <tr><th><code>Radiation.group_bounds_eV</code></th><td><code>[]</code> または <code>"log_uniform"</code></td><td>eV 単位での \(G+1\) 個の群境界、または対数等間隔での生成指定。</td></tr>
+          <tr><th><code>Radiation.compute_T_range_eV</code></th><td><code>[]</code></td><td><code>"log_uniform"</code> による群の生成に使う温度の範囲。</td></tr>
+        </tbody>
+      </table>
+      <p>FLD の面種別は <code>Radiation.multigroup_diffusion.boundary</code> の下に、\(S_N\) の面種別は <code>Radiation.sn_transport.boundary</code> の下に置く。面種別を最上位の <code>Radiation.boundary</code> に置くことはなく、そこに置くのは Marshak の <code>marshak_Tr_eV</code>/<code>marshak_Tr</code> だけである。</p>
+    </section>
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["\\[", "\\]"]] } };</script>
+  <script defer src="../../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../../nav.js" data-page="radiation" data-root="../../"></script>
+</body>
+</html>

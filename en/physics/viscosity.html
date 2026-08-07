@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="en" data-lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Plasma viscosity — TENRYU Documentation</title>
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>Plasma viscosity <span class="badge">reference</span></h1>
+    <p class="abstract">TENRYU's unmagnetized Braginskii module adds shear stress, momentum diffusion, and viscous heating to planar, cylindrical, and spherical 1D hydro and 2D RZ Lagrangian hydro. It supports ion, electron, or both channels, with mean-free-path caps and an explicit time-step limit.</p>
+
+    <aside class="planned" aria-labelledby="at-a-glance">
+      <h3 id="at-a-glance">At a glance</h3>
+      <ul>
+        <li>The module is off by default; <code>species="ion"</code> preserves compatibility.</li>
+        <li><code>species="both"</code> uses \(\eta_{\mathrm{eff}}=\eta_i+\eta_e\) and returns each channel's dissipation to its temperature.</li>
+        <li>Classical coefficients scale approximately as \(\eta\propto T^{5/2}\); density enters through Coulomb logs and the mean-free-path cap.</li>
+        <li>Physical viscosity does not replace artificial viscosity; shock-capturing AV normally remains enabled.</li>
+      </ul>
+    </aside>
+
+    <section aria-labelledby="mechanism">
+      <h2 id="mechanism">Physical mechanism</h2>
+      <p>This module represents real momentum diffusion from Coulomb collisions through Braginskii's unmagnetized closure, rather than the artificial viscosity described on the hydro page. The temperature scaling mirrors thermal conduction: the viscosity coefficient is roughly "pressure × collision time", \(\eta\sim nkT\tau\), and with \(\tau\propto T^{3/2}/(n\ln\Lambda)\) the density cancels, so the coefficient stiffens as \(T^{5/2}\). It damps resolved shear and acoustic structure and converts kinetic energy into heat by channel: ion dissipation heats \(T_i\), and electron dissipation heats \(T_e\).</p>
+      <p>The coefficient \(\eta_i=0.96\,n_i kT_i\tau_i\) gives \(\eta_i\propto\sqrt A\,T_i^{5/2}/(Z^4\ln\Lambda)\). The fourth power of charge makes the ion channel nearly inviscid at high \(Z\). The electron channel, by contrast, suffers no such strong \(Z\) suppression — its Whitney coefficient even rises with \(Z\) from 0.733 to 1.81 — so it can take over for \(T_e\gg T_i\) or high \(Z\). The ratio \(R=\eta_e/\eta_i\propto(T_e/T_i)^{5/2}Z^3/\sqrt A\) is the useful regime map: low-\(Z\), isothermal fuel is ion dominated.</p>
+      <p>Physical viscosity must not replace artificial viscosity. A real shock front is only a few ion mean free paths thick, far below an affordable mesh when \(\Delta x/\lambda_{ii}\gg1\), so Braginskii viscosity cannot hold a captured shock; AV supplies that unresolved shock dissipation. Physical viscosity acts on resolved gradients. When the mean free path approaches the cell scale, the fluid closure itself fails: the default 20-cell mean-free-path cap ties the collision time to the resolved scale as a regularization, but does not make the model kinetic.</p>
+      <p>The discretization forms the trace-free strain \(W\) and stress \(\boldsymbol\pi=-\eta_{\rm eff}W\). Curvilinear 1D includes hoop terms; 2D RZ uses the same compatible corner-force and adjoint-work discipline as hydro. Because the update is explicit, the module exports a diffusion limit proportional to \(\rho\Delta l^2/\eta\) into the driver's time-step limiter fan-in. A final Gershgorin audit catches curvature stiffness and coefficient growth within the step that the entrance-state scalar bound cannot see.</p>
+    </section>
+
+    <section aria-labelledby="model">
+      <h2 id="model">Braginskii coefficient and species</h2>
+      <p>In the frozen cgs+eV system — where \(k\) in \(kT\) is the <code>eV_to_erg</code> conversion, as on every physics page — the ion dynamic viscosity is</p>
+      $$
+      \eta_i=0.96\,n_i(kT_i)\tau_i\,s_\eta,
+      \qquad
+      \tau_i=2.0852\times10^7\,
+      \frac{\sqrt A\,T_i[\mathrm{eV}]^{3/2}}
+           {n_iZ^4\ln\Lambda_{ii}}\ \mathrm{s}.
+      $$
+      <ul>
+        <li>\(0.96\) and \(2.0852\times10^7\) — respectively the Braginskii single-species coefficient and the cgs+eV prefactor in \(\tau_i\).</li>
+        <li>\(s_\eta=\)<code>eta0_scale</code> — an uncertainty scale applied to both physical channels.</li>
+        <li><code>mfp_cap_cells=20</code> — limits each channel to \(\tau_s\le C\Delta l/v_{th,s}\). Setting zero disables the cap and is not recommended.</li>
+        <li>\(\eta_{00}^e(Z)\) — the Whitney electron coefficient, from 0.733 at \(Z=1\) toward 1.81 at high \(Z\).</li>
+        <li><code>lnlambda_fixed</code> — a positive value overrides both the NRL (Naval Research Laboratory Plasma Formulary [10]) ion–ion and electron–ion Coulomb logarithms.</li>
+        <li>\(8/3\) and <code>dt_safety</code> — the longitudinal-diffusion factor and its safety multiplier in the explicit dt bound. The latter is not a subcycle count; v1 has no STS here.</li>
+      </ul>
+      <p>Before capping, \(\eta_i\simeq3.21\times10^{-5}\sqrt A\,T_i^{5/2}/(Z^4\ln\Lambda_{ii})\) poise. Here \(s_\eta=\)<code>eta0_scale</code> scales uncertainty. Mixed cells use one effective species from \(A_{\mathrm{eff}}\) and \(\bar Z\).</p>
+      <p>The electron channel uses \(\eta_e=\eta_{00}^e(Z)n_e(kT_e)\tau_e s_\eta\). The Whitney coefficient rises from 0.733 at \(Z=1\) toward 1.81 at high \(Z\). <code>species="ion"</code> and <code>"electron"</code> select one channel; <code>"both"</code> adds them. Since \(R=\eta_e/\eta_i\propto(T_e/T_i)^{5/2}Z^3/\sqrt A\), ions dominate low-Z isothermal fuel, while electrons can dominate high-Z or \(T_e\gg T_i\) plasma. In 2T mode, \(\dot Q_i=\eta_iW{:}W/2\) heats ions and \(\dot Q_e=\eta_eW{:}W/2\) heats electrons.</p>
+    </section>
+
+    <section aria-labelledby="numerics">
+      <h2 id="numerics">Stress, cap, and time step</h2>
+      <p>The trace-free strain \(W\) gives \(\boldsymbol\pi=-\eta_{\mathrm{eff}}W\). Curvilinear 1D adds the hoop term \(\alpha(\pi_{rr}-\pi_{tt})/r\), where \(\alpha\) is the geometry factor of the stress divergence — 1 in cylindrical and 2 in spherical coordinates (with \(\pi_{tt}\) the tangential stress) — unrelated to the Fleck \(\alpha\). 2D RZ uses a quadrilateral shoelace gradient plus azimuthal strain; the compatible path pairs corner force and adjoint work. <code>model="constant"</code> uses uniform <code>eta_const</code> for verification.</p>
+      <p>The classical \(T^{5/2}\) growth can produce non-fluid mean free paths and tiny steps in hot dilute cells. The default <code>mfp_cap_cells=20</code> limits each channel's collision time to \(C\Delta l/v_{th}\), tying the coefficient to resolved scale. Zero disables the cap and is not recommended. Positive <code>lnlambda_fixed</code> replaces both NRL ion-ion and electron-ion Coulomb logs.</p>
+      <p>Because the update is explicit, the driver adds</p>
+      $$
+      \Delta t_{\mathrm{visc}}\le
+      \mathrm{dt\_safety}\,
+      \frac{\rho\,\Delta l^2}{(8/3)\eta_{\mathrm{eff}}}
+      $$
+      <p>to the hydro time-step lineage as <code>braginskii</code>. A final 1D Gershgorin audit — a Gershgorin-circle diagonal-dominance check of the assembled update — also sees curvature stiffness and within-step coefficient growth. <code>dt_safety</code> is a safety factor, not an internal STS/subcycle count; v1 has no STS implementation.</p>
+    </section>
+
+    <section aria-labelledby="pipeline">
+      <h2 id="pipeline">One viscosity application, step by step</h2>
+      <ol>
+        <li><p><strong>Evaluate collision logs.</strong> Compute the NRL ion–ion and electron–ion Coulomb logarithms, or use the positive fixed override.</p></li>
+        <li><p><strong>Build channel coefficients.</strong> Evaluate each channel's \(\tau_s\), apply \(\tau_s\le C\Delta l/v_{th,s}\), form \(\eta_i\) and \(\eta_e\), and select or add them into \(\eta_{\rm eff}\) according to <code>species</code>.</p></li>
+        <li><p><strong>Form strain.</strong> Compute \(W\) from velocity gradients: radial derivatives and curvature terms in 1D, or the quadrilateral shoelace gradient and azimuthal strain in 2D RZ.</p></li>
+        <li><p><strong>Apply stress and force.</strong> Set \(\boldsymbol\pi=-\eta_{\rm eff}W\); use the 1D flux form with its hoop term or the compatible 2D corner forces.</p></li>
+        <li><p><strong>Return dissipated energy.</strong> Deposit \(\dot Q_s=\eta_sW{:}W/2\) by channel, sending ion work to \(T_i\) and electron work to \(T_e\) in 2T mode.</p></li>
+        <li><p><strong>Limit the next step.</strong> Export the <code>braginskii</code> diffusion dt limit and the final Gershgorin stability audit to the driver.</p></li>
+      </ol>
+    </section>
+
+    <section aria-labelledby="physical-role">
+      <h2 id="physical-role">Where it matters</h2>
+      <p>Physical viscosity damps resolved shear and acoustic modes, converting kinetic energy into heat. Artificial viscosity supplies numerical dissipation to capture unresolved compressive shocks and is normally inactive in expansion or smooth shear. For ICF shocks with \(\Delta x/\lambda_{ii}\gg1\), Braginskii viscosity cannot support the front, so it must not replace AV. At Knudsen number near one — the ratio of the mean free path to the gradient scale length — the fluid closure fails; a cap does not make it kinetic.</p>
+      <p>Version 1 is unmagnetized, single-fluid (\(V_e=V_i\)), and uses one effective ion species. It omits magnetized coefficients, multispecies ion mixing laws, and WDM (warm-dense-matter), degeneracy, or strong-coupling corrections. The electron channel uses a fully ionized \(Z\ge1\) Whitney fit [2] and may overstate temperature sensitivity in degenerate matter.</p>
+    </section>
+
+    <section aria-labelledby="controls">
+      <h2 id="controls">Namelist controls</h2>
+      <p>These are the principal keys under <code>Numerics.hydro.plasma_viscosity</code>.</p>
+      <table class="quick-facts">
+        <thead><tr><th>Key</th><th>Default</th><th>Purpose</th></tr></thead>
+        <tbody>
+          <tr><th><code>enabled</code></th><td><code>False</code></td><td>Master switch for physical viscosity.</td></tr>
+          <tr><th><code>model</code></th><td><code>"braginskii"</code></td><td>Physical coefficients or verification-only <code>"constant"</code>.</td></tr>
+          <tr><th><code>species</code></th><td><code>"ion"</code></td><td><code>ion</code>, <code>electron</code>, or additive <code>both</code>.</td></tr>
+          <tr><th><code>eta_const</code></th><td><code>0.0</code> P</td><td>Uniform dynamic viscosity for the constant model.</td></tr>
+          <tr><th><code>eta0_scale</code></th><td><code>1.0</code></td><td>Multiplier on both Braginskii channels.</td></tr>
+          <tr><th><code>mfp_cap_cells</code></th><td><code>20.0</code></td><td>Mean-free-path cap in cell widths; zero disables it.</td></tr>
+          <tr><th><code>lnlambda_fixed</code></th><td><code>0.0</code></td><td>Zero selects NRL logs; positive fixes both channels.</td></tr>
+          <tr><th><code>dt_safety</code></th><td><code>0.3</code></td><td>Safety factor for the explicit viscous time step.</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section aria-labelledby="verification">
+      <h2 id="verification">Verification</h2>
+      <ul>
+        <li>The B1 battery covers \(W\equiv0\) for spherical homologous flow, flux–hoop cancellation in cylindrical and spherical divergence-free flows, uniform planar strain, and coefficient, cap, and time-step pins. B2 gates planar standing-wave decay against \(\gamma=(2/3)(\eta/\rho)k^2\) within 5% (\(k\) here is the standing-wave wavenumber, not the Boltzmann conversion of \(kT\)).</li>
+        <li>The N1 curvature-geometry gate tests the first rigid-wall radial mode and its \(\Lambda_{\mathrm{geom}}\equiv1\) theorem — \(\Lambda_{\mathrm{geom}}\) is the geometry-dependent factor in the mode's viscous decay rate, which the theorem fixes to exactly one in all three geometries, so the gate measures the ratio of observed to predicted decay. Measured ratios are 1.000248, 1.000046, and 0.9995975 in planar, cylindrical, and spherical geometry; all satisfy \(|ratio-1|\le4\times10^{-4}\).</li>
+        <li>The electron/2D W1–W8 parity port rechecked default-ion bit/noise-class parity, \(\eta_{\mathrm{both}}=\eta_i+\eta_e\), species heat routing, additive time steps, electron wave decay, three \(R\) regimes, and structured/multiblock history. The ported 1D electron wave reproduced ratio 1.000248 digit-for-digit; the 2D electron wave also passed.</li>
+      </ul>
+    </section>
+
+    <section aria-labelledby="references">
+      <h2 id="references">References</h2>
+      <ol class="references">
+        <li>S. I. Braginskii, "Transport Processes in a Plasma," Reviews of Plasma Physics 1, 205–311 (1965).</li>
+        <li>K. G. Whitney, "Momentum and Heat Conduction in Highly Ionizable Plasmas," Phys. Plasmas 6, 816–830 (1999). <a href="https://doi.org/10.1063/1.873321">doi:10.1063/1.873321</a></li>
+        <li>A. L. Velikovich, K. G. Whitney, and J. W. Thornhill, "A Role for Electron Viscosity in Plasma Shock Heating," Phys. Plasmas 8, 4524–4533 (2001). <a href="https://doi.org/10.1063/1.1400126">doi:10.1063/1.1400126</a></li>
+        <li>P. Hunana et al., "Generalized Fluid Models of the Braginskii Type," Astrophys. J. Suppl. Ser. 260, 26 (2022). <a href="https://doi.org/10.3847/1538-4365/ac5044">doi:10.3847/1538-4365/ac5044</a></li>
+        <li>E. L. Vold, A. S. Joglekar, M. I. Ortega, et al., "Plasma Viscosity with Mass Transport in Spherical Inertial Confinement Fusion Implosion Simulations," Phys. Plasmas 22, 112708 (2015). <a href="https://doi.org/10.1063/1.4935906">doi:10.1063/1.4935906</a></li>
+        <li>W. Manheimer and D. Colombant, "Effects of Viscosity in Modeling Laser Fusion Implosions," Laser Part. Beams 25, 541–547 (2007). <a href="https://doi.org/10.1017/S0263034607000663">doi:10.1017/S0263034607000663</a></li>
+        <li>R. J. Mason, R. C. Kirkpatrick, and R. J. Faehl, "Real Viscosity Effects in Inertial Confinement Fusion Target Deuterium–Tritium Micro-Implosions," Phys. Plasmas 21, 022705 (2014). <a href="https://doi.org/10.1063/1.4864641">doi:10.1063/1.4864641</a></li>
+        <li>D. S. Miller, "Splitting Shock Heating Between Ions and Electrons in an Ionized Gas," Comput. Fluids 210, 104672 (2020). <a href="https://doi.org/10.1016/j.compfluid.2020.104672">doi:10.1016/j.compfluid.2020.104672</a></li>
+        <li>B. M. Haines, "Charged Particle Transport Coefficient Challenges in High Energy Density Plasmas," Phys. Plasmas 31, 050501 (2024). <a href="https://doi.org/10.1063/5.0197128">doi:10.1063/5.0197128</a></li>
+        <li>J. D. Huba, <i>NRL Plasma Formulary</i>, Naval Research Laboratory, NRL/PU/6770--19-652 (2019) — source of the ion–ion and electron–ion Coulomb-logarithm expressions.</li>
+      </ol>
+    </section>
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["$$", "$$"], ["\\[", "\\]"]] } };</script>
+  <script defer src="../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../nav.js" data-page="viscosity" data-root="../"></script>
+</body>
+</html>

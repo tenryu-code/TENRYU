@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en" data-lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Namelist reference — TENRYU Documentation</title>
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>Namelist reference <span class="badge">reference</span></h1>
+    <p class="abstract">This page is an orientation map, not an exhaustive Python-namelist specification. It connects top-level blocks and important sub-blocks to representative keys. The complete key surface — types, units, accepted values, combination rules, and the authoritative default list — lives in the specification shipped with the source: <code>docs/SPECIFICATION.md</code> §6.4 (schema) and §9.1 (defaults) in the TENRYU repository, which is publicly readable alongside the code.</p>
+
+    <aside class="planned" aria-labelledby="at-a-glance">
+      <h3 id="at-a-glance">At a glance</h3>
+      <ul>
+        <li>Blocks from <code>Main</code> through <code>Parallel</code> divide case identity, mesh, materials, initialization, physics, numerics, and output responsibilities.</li>
+        <li>Each nested <code>dict</code> has its own schema. For example, <code>Numerics.dt.max_s</code> and <code>Numerics.hydro.av_C2</code> belong to different contracts.</li>
+        <li>Unknown keys, wrong types, out-of-range values, and unsupported block combinations are input errors. A typo does not silently fall back to a default.</li>
+        <li>The keys below are entry points, not complete lists. This page's tables deliberately omit defaults; the per-kernel pages list selected defaults, and SPECIFICATION §9.1 is authoritative if they ever disagree.</li>
+      </ul>
+    </aside>
+
+    <section aria-labelledby="block-map">
+      <h2 id="block-map">Block map</h2>
+      <p>A deck normally imports <code>tenryu_namelist</code> and calls each top-level constructor once. Create <code>Material(...)</code> objects and register them through <code>Materials(materials=[...])</code>; create <code>LaserBeam(...)</code> objects and pass them through <code>Laser.beams</code>. The “representative keys” column is a search index. Detailed nested schemas and mode-specific exclusions remain in the specification.</p>
+      <table class="quick-facts">
+        <thead>
+          <tr><th>Block / sub-block</th><th>Purpose</th><th>Representative keys</th></tr>
+        </thead>
+        <tbody>
+          <tr><th><code>Main</code></th><td>Case name, dimension, temperature model, stopping conditions, random seed, and restart source.</td><td><code>name</code>, <code>dimension</code>, <code>temperature_model</code>, <code>t_end</code>, <code>max_steps</code>, <code>seed</code>, <code>restart_from</code></td></tr>
+          <tr><th><code>Mesh</code></th><td>1D/2D domain, zone counts, grid distribution, mesh motion, and topology.</td><td><code>r_min</code>, <code>r_max</code>, <code>nr</code>, <code>z_min</code>, <code>z_max</code>, <code>nz</code>, <code>grid</code>, <code>motion</code></td></tr>
+          <tr><th><code>Materials</code><br><code>Material</code></th><td>Material catalog, EOS, opacity, ionization, void handling, and mixture rules.</td><td><code>materials</code>, <code>opacity_mix_rule</code>, <code>zbar</code>, <code>void_config</code>; per material: <code>name</code>, <code>A</code>, <code>Z</code>, <code>eos</code>, <code>opacity</code>, <code>is_void</code></td></tr>
+          <tr><th><code>Geometry</code></th><td>Map volume fractions and initial density, electron/ion temperatures, velocity, and radiation field onto the mesh.</td><td><code>volfrac</code>, <code>rho</code>, <code>Te</code>, <code>Ti</code>, <code>velocity</code>, <code>radiation_field</code>, <code>enforce_sum_to_one</code></td></tr>
+          <tr><th><code>Radiation</code></th><td>Radiation operator, energy groups, FLD or S<sub>N</sub> solver, and boundary conditions.</td><td><code>enabled</code>, <code>mode</code>, <code>groups</code>, <code>group_bounds_eV</code>, <code>compute_T_range_eV</code>, <code>multigroup_diffusion</code>, <code>sn_transport</code>, <code>boundary</code></td></tr>
+          <tr><th><code>Laser</code></th><td>Wavelength, ray-trace mode, beam set, absorption, and refraction.</td><td><code>enabled</code>, <code>wavelength_nm</code>, <code>mode</code>, <code>rays_per_beam</code>, <code>beams</code>, <code>absorption</code></td></tr>
+          <tr><th><code>Laser.cbet</code></th><td>Cross-beam energy transfer, port/section discretization, IAW response, and iteration.</td><td><code>enable</code>, <code>geometry_mode</code>, <code>f_cbet</code>, <code>alpha_iaw</code>, <code>theta_cap</code>, <code>tol</code>, <code>max_iters</code>, <code>n_section_phi</code></td></tr>
+          <tr><th><code>Laser.hot_electron</code></th><td>Hot-electron sources, generation efficiency, spectrum, angular distribution, stopping, and energy ledger.</td><td><code>enable</code>, <code>eta_hot</code>, <code>eta_hot_table</code>, <code>sources</code>, <code>T_hot_eV</code>, <code>n_energy_groups</code>, <code>angular_model</code>, <code>subtract_from_laser</code></td></tr>
+          <tr><th><code>Numerics.dt</code></th><td>Initial dt, CFL controls, growth, hard bounds, and Fleck limiter.</td><td><code>initial_s</code>, <code>cfl_hydro</code>, <code>cfl_cond</code>, <code>f_min_fleck</code>, <code>growth_factor</code>, <code>max_s</code>, <code>min_s</code></td></tr>
+          <tr><th><code>Numerics.hydro</code></th><td>Hydrodynamics, artificial viscosity, time integration, 1D/2D boundaries, and retry behavior.</td><td><code>enabled</code>, <code>boundary_1d</code>, <code>boundary_2d</code>, <code>av_type</code>, <code>av_model</code>, <code>av_C1</code>, <code>av_C2</code>, <code>time_integration</code></td></tr>
+          <tr><th><code>Numerics.conduction</code></th><td>Electron/ion conduction, solver, flux limit, and nonlocal model.</td><td><code>enabled</code>, <code>solver</code>, <code>f_lim</code>, <code>ion_conduction</code>, <code>face_kappa_policy</code>, <code>nonlocal_model</code>, <code>snb_n_groups</code></td></tr>
+          <tr><th><code>Numerics.ale</code><br>rezoning / remap</th><td>2D RZ quality triggers, rezoning solver, admissibility, and conservative remap.</td><td><code>enabled</code>, <code>every_n_steps</code>, <code>quality_threshold</code>, <code>rezone_solver</code>, <code>remap_scheme</code>, <code>remap_limiter</code>, <code>conservative_remap_enabled</code></td></tr>
+          <tr><th><code>Numerics.floors</code></th><td>Lower bounds for density and electron/ion temperatures.</td><td><code>rho_floor_gcc</code>, <code>Te_floor_eV</code>, <code>Ti_floor_eV</code></td></tr>
+          <tr><th><code>Numerics.safety</code></th><td>Warning/fatal policy for NaNs, energy budgets, and opacity clamps.</td><td><code>energy_fatal</code>, <code>nan_fatal</code>, <code>energy_threshold</code>, <code>energy_budget_tol</code>, <code>opacity_floor</code>, <code>opacity_cap</code></td></tr>
+          <tr><th><code>Burn</code></th><td>Nuclear channels, fuel composition, charged-product transport, screening, and subcycling.</td><td><code>enabled</code>, <code>fuels</code>, <code>scheme</code>, <code>screening</code>, <code>fuel_materials</code>, <code>x_D</code>, <code>x_T</code>, <code>partition</code>, <code>subcycle_max</code></td></tr>
+          <tr><th><code>Output</code></th><td>Output directory, format, plot/history/checkpoint cadence, and checkpoint retention.</td><td><code>directory</code>, <code>format</code>, <code>plot_every</code>, <code>history_every</code>, <code>checkpoint_every</code>, <code>checkpoint_keep_last</code></td></tr>
+          <tr><th><code>Diagnostics</code></th><td>Runtime history aggregation, areal density, shell, sphericity, and energy budgets.</td><td><code>enabled</code>, <code>every</code>, <code>energy_budget</code>, <code>areal_density</code>, <code>shell</code>, <code>sphericity</code>, <code>laser_pattern</code></td></tr>
+          <tr><th><code>Parallel</code></th><td>MPI domain decomposition, halo layers, and GPU-aware transport.</td><td><code>decomposition.method</code>, <code>decomposition.dims</code>, <code>decomposition.min_cells_per_rank</code>, <code>halo.gpu_aware_mpi</code>, <code>halo.ghost_layers</code></td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section aria-labelledby="how-to-read">
+      <h2 id="how-to-read">Reading key paths</h2>
+      <p>Think in fully qualified paths when similarly named controls appear in several places. <code>Radiation.enabled</code>, <code>Numerics.conduction.enabled</code>, and <code>Burn.enabled</code> are separate switches. Radiation boundary keys are another important example: some belong to the selected solver's mode-specific sub-block, while other drive controls belong to top-level <code>Radiation.boundary</code>. Do not infer nesting from the final key name; consult the matching §6.4 block.</p>
+      <p>Values use the cgs + eV system: length in cm, time in s, density in g/cm³, and temperatures and photon-group edges in eV. A key that names another unit—such as <code>wavelength_nm</code> or <code>T_floor_keV</code>—uses the suffix as part of its contract. Units, exact types, and dimension-specific restrictions are intentionally omitted from this map and must be checked before entering production values.</p>
+    </section>
+
+    <section aria-labelledby="validation-defaults">
+      <h2 id="validation-defaults">Validation and defaults</h2>
+      <p>The parser applies known-key validation at every hierarchy level. It does not discard unknown keys and continue. Wrong types, missing required values, invalid ranges, mutually exclusive modes, and settings unsupported for the selected dimension or MPI rank count raise <code>ConfigError</code>. This contract prevents a configuration typo from appearing later as an unexplained physics result.</p>
+      <aside class="planned" aria-labelledby="authoritative-reference">
+        <h3 id="authoritative-reference">Authoritative full reference and defaults</h3>
+        <p>This page is only an orientation map. The authoritative full key reference is <code>docs/SPECIFICATION.md</code> §6.4 in the TENRYU repository (a public document distributed with the source), and the authoritative defaults are in its §9.1. The default values printed in the per-kernel pages of this site are accurate as of the documentation date in the footer; where the site and SPECIFICATION §9.1 ever disagree, §9.1 wins. Consult it when writing a new deck, changing mode, relying on a default, or resolving a validation error.</p>
+      </aside>
+    </section>
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["\\[", "\\]"]] } };</script>
+  <script defer src="../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../nav.js" data-page="namelist" data-root="../"></script>
+</body>
+</html>

@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="en" data-lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Radiation: multigroup FLD — TENRYU Documentation</title>
+  <link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>Radiation: multigroup FLD <span class="badge">reference</span></h1>
+    <p class="abstract">Multigroup flux-limited diffusion (FLD) is one of TENRYU's production deterministic radiation solvers. It partitions photon energy into groups, couples the "stiff" emission and absorption implicitly to electron matter through Fleck linearization, and solves conservative finite-volume systems in 1D (spherical, cylindrical, or planar measures) or 2D axisymmetric RZ geometry. It recovers diffusion in optically thick regions while a flux limiter bounds transport in thin regions.</p>
+
+    <aside class="planned" aria-labelledby="at-a-glance">
+      <h3 id="at-a-glance">At a glance</h3>
+      <ul>
+        <li>Normalized Planck group weights \(b_g(T_e)\) and the Fleck factor \(f\) close group emission and the matter-energy update with one linearization.</li>
+        <li>The default Levermore–Pomraning limiter controls \(D_g=c\lambda_g/\sigma_{R,g}\) from the local radiation gradient.</li>
+        <li>1D uses a batched tridiagonal solve; 2D RZ uses a conservative-FV five-point CSR matrix and CG-family solvers.</li>
+        <li>Marshak input, vacuum escape, and matter deposition are tallied from the same face and source terms, so closed balances telescope to machine precision.</li>
+      </ul>
+    </aside>
+
+    <section aria-labelledby="mechanism">
+      <h2 id="mechanism">The physics: why flux-limited diffusion</h2>
+      <p>In an ICF (inertial-confinement-fusion) or HED (high-energy-density) plasma, photons emitted by hot matter carry energy across the target. TENRYU evolves the group-integrated radiation energy density \(E_g\) in every cell and couples it to electron internal energy. That exchange is often the stiffest process in the calculation — "stiff" meaning its intrinsic timescale is far shorter than the hydrodynamic time step: thermal emission scales as \(T_e^4\) and soars with temperature, while absorption can act over a photon mean free path much shorter than a mesh cell.</p>
+      <p>When the photon mean free path \(1/\sigma_R\) is short compared with the radiation-gradient scale, repeated scattering and reabsorption erase directional memory: the angular intensity is nearly isotropic and the first angular moment (the flux) closes as Fick's law, \(\mathbf F_g=-D_g\nabla E_g\), with \(D_g=c\lambda(R)/\sigma_{R,g}\). The Levermore–Pomraning flux limiter guards the regions where that ordering fails. Physically, radiation can never carry more flux than its energy density moving at the speed of light, \(cE_g\); the limiter returns \(\lambda\to1/3\) in the diffusion limit, recovering ordinary diffusion, and lowers \(\lambda\) in a steep gradient so that \(|\mathbf F_g|\le cE_g\) always holds. FLD therefore transitions toward free streaming without violating the causal bound — but it does not retain angular information; beams, shadows, and directionally illuminated gaps belong to the companion <a href="sn.html">\(S_N\) solver</a>.</p>
+      <p>During one hydro step a cell may emit and reabsorb its thermal content many times. The response ratio \(\beta=4a_{\rm eV}T_e^3/C_{v,e}\) measures the sensitivity of equilibrium radiation energy relative to electron heat capacity. Treating the \(T_e^4\) source explicitly would make the step prohibitively small, so TENRYU uses the Fleck linearization \(f=(1+\alpha\beta c\Delta t\,\sigma_a)^{-1}\), where \(\alpha\) is the standard Fleck implicitness parameter (fixed at its fully implicit value 1.0 in production): the fraction \(f\) is new within-step thermal emission, while \(1-f\) is represented as scattering-like within-step re-emission. Small \(f\) marks the stiff regime and removes the need for a nonlinear matter iteration inside each group solve.</p>
+      <p>The model is multigroup because opacity and emission can vary by orders of magnitude across photon energy; a grey average can misrepresent both Marshak-wave penetration and the emitted spectrum. Coefficients may come from LTE (local-thermodynamic-equilibrium) or table/NLTE (non-LTE) paths. Like TENRYU's other production radiation solver, FLD is a deterministic static-medium transport approximation — it includes no material-motion \(O(v/c)\) terms, so radiation advection, Doppler work, and aberration are outside this solve (a scope decision recorded in the repository's numerical contract, <code>docs/NUMERICS.md</code> §1.2).</p>
+    </section>
+
+    <section aria-labelledby="groups-fleck">
+      <h2 id="groups-fleck">Group structure and Fleck linearization</h2>
+      <p>For bounds \(\epsilon_0&lt;\epsilon_1&lt;\cdots&lt;\epsilon_G\), \(E_{c,g}\) is the radiation energy density in cell <em>c</em> integrated over \([\epsilon_g,\epsilon_{g+1})\). The normalized Planck fraction at temperature \(T\) is \(b_g(T)\), with \(\sum_g b_g=1\). Equilibrium initialization is therefore \(E_{c,g}=a_{\rm eV}T^4b_g(T)\), whose group sum is \(a_{\rm eV}T^4\); here \(a_{\rm eV}=1.3720\times10^{2}\) erg cm⁻³ eV⁻⁴ is the radiation constant expressed in eV units. Bounds are specified in eV; TENRYU's internal units remain cgs + eV.</p>
+      <p>When the bounds are generated with <code>Radiation.group_bounds_eV="log_uniform"</code>, TENRYU spans \(G\) logarithmically equal bins over the photon-energy window <code>compute_T_range_eV</code> \(=[T_{min},T_{max}]\). Logarithmic spacing is used because the Planck peak moves in proportion to temperature (\(h\nu\approx2.82\,k_BT\)) and opacities vary by orders of magnitude across photon energy, so geometric bounds give a roughly constant relative resolution over the whole expected temperature range. The blackbody tail above the window's upper edge falls outside the group structure (the normalized \(b_g\) still sum to one, so conservation is not broken); give the range generous margins below the coolest and above the hottest temperatures the run will reach.</p>
+      <p>The material response is built from the electron constant-volume heat capacity and its temperature sensitivity,</p>
+      $$
+      C_{v,e}=\rho\left(\frac{\partial e_e}{\partial T_e}\right)_\rho,
+      \qquad
+      \beta=\frac{4a_{\rm eV}T_e^3}{C_{v,e}}.
+      $$
+      <p>The shared standard Fleck factor is \(f=(1+\alpha\beta c\Delta t\,\sigma_{a,P})^{-1}\), with \(\alpha\) the Fleck implicitness parameter (1.0 in production). The current constant-opacity FLD path resolves it by group as \(f_{c,g}=(1+\alpha\beta_c c\Delta t\,\sigma_{a,c,g})^{-1}\); the table/NLTE path uses an emission-mean coefficient. A smaller \(f\) linearizes more of the within-step emission and reabsorption as effective scattering, reducing the explicit temperature response. The driver also bounds the time step so that \(f\) stays above <code>Numerics.dt.f_min_fleck</code> (default 0.01) on Fleck-linearized paths — the radiation dt limit described on <a href="../../overview/timestep.html">Time-step control &amp; CFL</a>.</p>
+      <p>Each group's backward-Euler finite-volume equation uses that same linearized source:</p>
+      $$
+      \begin{aligned}
+      V_cE^{n+1}_{c,g}
+      &amp;+\Delta t\,c\sigma^{PA}_{c,g}V_cE^{n+1}_{c,g}
+      -\Delta t\sum_{f\in\partial c}
+      A_fD_{f,g}\frac{E^{n+1}_{n(f),g}-E^{n+1}_{c,g}}{d_f} \\
+      &amp;=V_cE^n_{c,g}
+      +\Delta t\,V_cf_{c,g}\eta_{c,g}
+      +\Delta t\,V_c(1-f_{c,g})c\sigma^{PA}_{c,g}E^n_{c,g},
+      \end{aligned}
+      $$
+      $$
+      \eta_{c,g}=c\sigma^{PE}_{c,g}a_{\rm eV}(T_e^n)^4b_g(T_e^n).
+      $$
+      <p>Here \(\sigma^{PA}\) and \(\sigma^{PE}\) are the group coefficients used for absorption and emission. The right-hand terms \(f\eta_g\) and \((1-f)c\sigma^{PA}E_g^n\) are the linearized thermal emission and effective within-step re-emission.</p>
+      <ul>
+        <li>\(b_g(T)\) is the normalized Planck fraction: the share of blackbody energy and thermal emission in photon-energy group \(g\), with \(\sum_g b_g=1\).</li>
+        <li>\(\beta=4a_{\rm eV}T_e^3/C_{v,e}\) is the radiation–matter stiffness ratio: the temperature derivative of equilibrium radiation energy divided by the electron volumetric heat capacity.</li>
+        <li>\(f_{c,g}\) is the Fleck implicitness fraction. The term \((1-f_{c,g})c\sigma^{PA}_{c,g}E^n_{c,g}\) returns within-step absorption as effective scattering-like re-emission rather than a new thermal source.</li>
+        <li>\(\sigma^{PA}_{c,g}\) is the Planck absorption coefficient used for removal and deposition, whereas \(\sigma^{PE}_{c,g}\) sets emissivity through \(\eta_{c,g}\). They coincide on LTE paths but may differ for NLTE tables.</li>
+        <li>\(D_{f,g}\) is the diffusion coefficient on face \(f\): 1D evaluates it from face-centered \(E\) and \(\sigma_R\), while 2D RZ takes the harmonic mean of neighboring cell-centered \(D\). One coefficient is shared by both cells. In the flux term, \(A_f\) is the face area, \(d_f\) the distance between the two adjacent cell centers, and \(n(f)\) the neighbor cell across face \(f\).</li>
+        <li>\(R=|\nabla E_g|/(\sigma_{R,g}E_g)\) compares the photon mean free path with the radiation-energy gradient length. \(R\ll1\) is diffusive; \(R\gg1\) signals the streaming limit where the limiter becomes active.</li>
+      </ul>
+
+      <figure>
+        <img src="../../../assets/radiation-fld-group-fleck-flow.png" width="980" height="430" style="max-width:100%;height:auto" alt="Iteration flow connecting photon-energy groups, the Fleck-linearized source, per-group FLD solves, and the material-energy update">
+        <figcaption>Figure A. Every group receives emission proportional to \(f_gb_ga_{\rm eV}cT_e^4\) and returns implicit absorption to matter. The updated \(T_e\) refreshes group weights and coefficients for the outer iteration.</figcaption>
+      </figure>
+    </section>
+
+    <section aria-labelledby="diffusion-solvers">
+      <h2 id="diffusion-solvers">Flux limiter and linear solvers</h2>
+      <p>FLD constructs a local dimensionless gradient and diffusion coefficient for every group:</p>
+      $$
+      R_{c,g}=\frac{|\nabla E_g|_c}{\sigma_{R,c,g}\max(E_{c,g},E_{\rm floor})},
+      \qquad
+      D_{c,g}=\frac{c\lambda(R_{c,g})}{\sigma_{R,c,g}},
+      $$
+      <p>where \(E_{\rm floor}\) is a small positivity floor that only guards the denominator of the dimensionless gradient.</p>
+      $$
+      \lambda_{\rm LP}(R)=\frac{1}{R}\left(\coth R-\frac{1}{R}\right).
+      $$
+      <p>The Levermore–Pomraning form approaches \(\lambda=1/3\) as \(R\to0\), recovering diffusion, and limits flux at large gradients. The 1D path evaluates face coefficients from face-centered \(\sigma_R\) and \(E\). The 2D RZ path forms cell-centered \(D\) and takes its harmonic mean on internal faces. Both cells use the same \(A_fD_f/d_f\) on a shared face, so internal fluxes cancel with opposite signs. A degenerate face whose center distance is below the geometry tolerance is excluded to prevent a singular coefficient.</p>
+      <p>In 1D, each group matrix is tridiagonal. On the GPU, \(G\) is the batch count and the number of cells is the system size for <code>cusparseDgtsv2StridedBatch</code>. In 2D RZ, each cell couples only to its \(R-\), \(R+\), \(Z-\), and \(Z+\) face neighbors, producing one CSR five-point stencil per group. Linear iteration is CG-based. The default <code>linear_solver_2d="auto"</code> resolves the preconditioner from the mesh shape at validation time: an \(n_r\) that is a power of two with \(n_z\ge3\) selects the r-semicoarsened geometric multigrid (GMG); otherwise \(n_z\ge3\) selects a z-line block-Jacobi preconditioner, which solves one tridiagonal per radial line exactly to tame the iteration growth of \(\Delta z&lt;\Delta r\) anisotropic stencils; failing both, plain Jacobi-PCG is used. Local Jacobi preconditioning converges more slowly as the grid grows, whereas GMG handles the long-wavelength error components that local preconditioners damp poorly on its coarse-grid hierarchy. The resolved choice is logged once at startup and written into the frozen configuration.</p>
+
+      <figure>
+        <img src="../../../assets/radiation-fld-rz-five-point.png" width="820" height="615" style="max-width:100%;height:auto" alt="Conservative five-point stencil formed by a center cell and four face neighbors on a structured RZ mesh">
+        <figcaption>Figure B. Production 2D RZ FLD uses a five-point CSR stencil per group. Each face coefficient is \(C_{f,g}=\Delta t\,A_fD_{f,g}/d_f\), shared by the two adjacent cells.</figcaption>
+      </figure>
+
+      <p>GMG uses radial aggregation with piecewise-constant prolongation \(P\) and its transpose as restriction; each coarse-level operator is the Galerkin product \(P^T\!AP\) of the finer-level matrix \(A\). It does not recompute coefficients or boundary conditions on coarse levels, preserving the conservative-FV five-point form and aggregated boundary leakage. The Kershaw nine-point method [8] is a reference discretization for diffusion on distorted quadrilaterals (used by the conduction kernel's 2D operator); it is not the production FLD stencil.</p>
+    </section>
+
+    <section aria-labelledby="outer-matter">
+      <h2 id="outer-matter">Outer iteration, matter update, and void cells</h2>
+      <ol>
+        <li><p><strong>Build coefficients.</strong> Resolve the group bounds, evaluate the normalized \(b_g(T_e)\), and fill \(\sigma^{PA}_{c,g}\), \(\sigma^{PE}_{c,g}\), and \(\sigma_{R,c,g}\). From the same electron-EOS heat capacity form \(\beta_c\), the Fleck factor, limiter argument, and face diffusion coefficients for every active cell and group. A Marshak temperature callable has already been frozen into a table; its solve-entry value is fixed throughout this outer iteration.</p></li>
+        <li><p><strong>Assemble and solve every group.</strong> The 1D spherical matrices are tridiagonal and all \(G\) systems are solved as one <code>cusparseDgtsv2StridedBatch</code> batch. The 2D RZ path assembles a conservative five-point CSR system per group and uses a Jacobi-PCG or GMG-family preconditioner. Its linear stopping test is \(\lVert r_k\rVert\le\texttt{cg_inner_tol}\,N_{\rm ref}\), with default <code>cg_inner_tol=1e-10</code> and reference norm \(N_{\rm ref}=\lVert r_0\rVert\) or \(\max(\lVert b\rVert,\mathrm{tiny})\) according to the selected normalization (“tiny” is a minute positive constant that only guards a zero right-hand side). This is a deterministic, non-particle transport path; alternative 2D preconditioners target the same \(A^{-1}b\), although bit-identical iteration sequences between preconditioners are not promised.</p></li>
+        <li>
+          <p><strong>Freeze the source that was actually used.</strong> After all group systems are solved, retain</p>
+          $$
+          S^{\rm used}_{c,g}=\Delta t\,V_c
+          \left[f_{c,g}\eta_{c,g}+(1-f_{c,g})c\sigma^{PA}_{c,g}E^n_{c,g}\right].
+          $$
+          <p>This exact quantity, rather than a newly evaluated gross Planck source, is the emission side of the matter ledger.</p>
+        </li>
+        <li>
+          <p><strong>Close matter locally.</strong> A cell-local Newton solve updates electron internal energy from the absorption in the solved group fields and the same \(S^{\rm used}\):</p>
+          $$
+          \rho_cV_c\left[e_e(\rho_c,T_e^{n+1})-e_e(\rho_c,T_e^n)\right]
+          =\sum_g\left[\Delta t\,V_c\,c\sigma^{PA}_{c,g}E^{n+1}_{c,g}-S^{\rm used}_{c,g}\right].
+          $$
+          <p>The left side is the cell's electron-energy change over the step (anchored at \(T_e^n\)); the right side is the absorbed group energy minus the emission actually applied, using exactly the frozen \(S^{\rm used}\).</p>
+        </li>
+        <li><p><strong>Test the outer fixed point.</strong> The quantity this loop drives to self-consistency — and the one whose convergence is tested — is the electron temperature \(T_e\), equivalently the coefficient set evaluated from it. The circularity is that the group systems need \(b_g\), the opacities, and \(f\) at \(T_e\) (and the limiter's diffusion coefficients at the current \(E_g\) iterate), while \(T_e\) itself comes from the matter closure fed by the solved \(E_g\). Each pass is plain, undamped Picard substitution that re-solves the whole backward-Euler step from the frozen step-entry state — the right-hand sides always anchor at \(E^n_g\) and the matter balance at \(T_e^n\), so a pass <em>replaces</em> the iterate rather than accumulating on it. Refresh \(b_g\), opacities, \(f\), and \(D_g\) from the new \(T_e\), then repeat the group solves until the change between successive iterates satisfies \(\max_c|T^{k+1}_{e,c}-T^{k}_{e,c}|/\max(T^{k+1}_{e,c},T_{\rm floor})&lt;\texttt{outer_tol}\), where \(T_{\rm floor}\) is the configured temperature floor (<code>Te_floor_eV</code>). The production defaults are <code>outer_tol=1e-5</code> and <code>max_outer_iterations=20</code>; if the cap is reached without meeting the tolerance, the final iterate is accepted and a rate-limited run-log warning records the unconverged residual.</p></li>
+        <li><p><strong>Close boundaries and ledgers.</strong> The terms used above define <code>rad_dep</code> \(=\Delta t\,V_c\,c\sigma^{PA}E^{n+1}\) and <code>rad_emit</code> \(=S^{\rm used}\); the same boundary rows define <code>marshak_in</code> and <code>escaped</code>. A shared face uses one \(A_fD_{f,g}/d_f\), so its two cell contributions cancel and the group-summed radiation-plus-matter change telescopes to the boundary ledgers up to floating-point summation.</p></li>
+        <li><p><strong>Honor the void contract.</strong> On table/NLTE paths with an explicit void mask, set \(f=1\) and \(\sigma^{PA}=\sigma^{PE}=\sigma_R=\eta=0\), skip matter exchange and temperature updates, and apply the opacity floor only to keep diffusion-coefficient evaluation finite. This is a stable numerical void, not an angular free-streaming model.</p></li>
+      </ol>
+    </section>
+
+    <section aria-labelledby="boundaries-ledgers">
+      <h2 id="boundaries-ledgers">Boundary conditions and energy accounting</h2>
+      <p>A reflecting face has zero normal flux. A vacuum face uses the Milne leakage form \(F_{{\rm out},g}=cE_g/2\). A Marshak face pairs the incoming blackbody field and diffusion field as</p>
+      $$
+      F_{{\rm out},g}=\frac{c}{4}E_g-F_{{\rm inc},g},
+      \qquad
+      F_{{\rm inc},g}=\frac{c}{4}a_{\rm eV}T_r^4b_g(T_r).
+      $$
+      <p>This adds \(\Delta t\,A_fc/4\) to the matrix diagonal and \(\Delta t\,A_fF_{{\rm inc},g}\) to the right-hand side. The factor-of-two difference between the vacuum coefficient \(cE_g/2\) and the Marshak-face leak \(cE_g/4\) is a difference of boundary closures, not an inconsistency: the vacuum face imposes the Marshak/Milne zero-incoming condition under the P1 (diffusion) angular closure — eliminating the incoming half of a field whose half-range emission is \(cE/4\) doubles the net outflow to \(cE/2\) — whereas the Marshak drive face books the half-range exchange explicitly, \(cE_g/4\) outgoing against the prescribed incoming \(F_{{\rm inc},g}\), so that the net flux vanishes exactly at radiative equilibrium (\(E_g=a_{\rm eV}T_r^4b_g\)). The 1D inner-r face is reflecting; the outer-r face may be vacuum, reflecting, or Marshak. The same face contract applies to radial and axial exterior faces in 2D RZ.</p>
+      <p>\(T_r\) may be a constant <code>Radiation.boundary.marshak_Tr_eV</code> or a deck callable <code>Radiation.boundary.marshak_Tr</code>. A callable is frozen into a time table at initialization—Python is never called during time integration. Its value is sampled once at solve entry using <code>state.t</code> and remains invariant through the outer iteration.</p>
+      <p>The same discrete terms add positive Marshak input to <code>marshak_in</code> and vacuum or positive Marshak outflow to the escape ledger, written to history as <code>energy/radiation_escaped</code>. Matter-side <code>rad_dep</code> and <code>rad_emit</code> come directly from the absorption term and \(S^{\rm used}\). Shared-face terms cancel exactly between cells, so the group-summed change in radiation plus matter telescopes to the boundary ledgers. A flat-opacity multigroup/grey collapse has the same balance apart from floating-point summation order.</p>
+    </section>
+
+    <section aria-labelledby="controls">
+      <h2 id="controls">Selected namelist keys</h2>
+      <p>These are selected controls under <code>Radiation</code>. See the <a href="../../use/namelist.html">namelist reference</a> for the complete schema and combination rules.</p>
+
+      <aside class="planned" aria-labelledby="boundary-key-note">
+        <h3 id="boundary-key-note">Important boundary-key rule</h3>
+        <p>FLD <strong>face types</strong> must live under <code>Radiation.multigroup_diffusion.boundary</code>. Validation rejects face-type settings under top-level <code>Radiation.boundary</code>. The Marshak temperature channels <code>marshak_Tr_eV</code> and <code>marshak_Tr</code>, however, correctly remain under top-level <code>Radiation.boundary</code>.</p>
+      </aside>
+
+      <table class="quick-facts">
+        <thead>
+          <tr><th>Key</th><th>Default / example</th><th>Purpose</th></tr>
+        </thead>
+        <tbody>
+          <tr><th><code>Radiation.enabled</code></th><td><code>True</code></td><td>Enable the radiation operator.</td></tr>
+          <tr><th><code>Radiation.mode</code></th><td><code>"multigroup_diffusion"</code></td><td>Select the deterministic FLD solver documented here.</td></tr>
+          <tr><th><code>Radiation.groups</code></th><td><code>1</code></td><td>Number \(G\) of photon-energy groups.</td></tr>
+          <tr><th><code>Radiation.group_bounds_eV</code></th><td><code>[]</code> or <code>"log_uniform"</code></td><td>A \(G+1\)-entry boundary list or logarithmic generator.</td></tr>
+          <tr><th><code>Radiation.compute_T_range_eV</code></th><td><code>[]</code></td><td>Temperature range used to generate <code>"log_uniform"</code> groups.</td></tr>
+          <tr><th><code>Radiation.multigroup_diffusion.flux_limiter</code></th><td><code>"levermore_pomraning"</code></td><td>FLD limiter; LP is the default.</td></tr>
+          <tr><th><code>Radiation.multigroup_diffusion.max_outer_iterations</code></th><td><code>20</code></td><td>Cap on coefficient/matter outer iterations.</td></tr>
+          <tr><th><code>Radiation.multigroup_diffusion.outer_tol</code></th><td><code>1e-5</code></td><td>Relative electron-temperature convergence tolerance.</td></tr>
+          <tr><th><code>Radiation.multigroup_diffusion.boundary.inner_r / outer_r</code></th><td><code>"reflect" / "vacuum"</code></td><td>FLD radial face types; the exterior also accepts <code>marshak</code>.</td></tr>
+          <tr><th><code>Radiation.boundary.marshak_Tr_eV / marshak_Tr</code></th><td>constant / callable</td><td>Marshak \(T_r\); the callable is tabulated at initialization, with no runtime Python.</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section aria-labelledby="verification">
+      <h2 id="verification">Verification</h2>
+      <ul>
+        <li>Analytic multigroup Marshak-spectrum gates <code>fld_1d_mg_planar_marshak_spectrum</code> and <code>fld_1d_mg_planar_freqdep_relaxation</code> check a \(G=8\) plateau against independently computed Planck fractions and closed-form per-group relaxation for the same frequency-dependent opacity.</li>
+        <li>Linearized-coupling twin tests combine the closed-form 0D Fleck ODE, groupwise NLTE spectrum/Fleck probes, and the Su–Olson picket-fence problem [6] — a two-opacity-band model with a semi-analytic solution, whose superposition symmetry under swapping the band assignment the gate exploits. The <code>fld_1d_volume_source_balance</code> correction reduced its balance residual from \(7.9\times10^{-6}\) to \(2.1\times10^{-10}\).</li>
+        <li><code>verify_gxii_1d_fld_regression</code> is the <a href="../../verification/index.html#gxii">GXII</a> 1D golden regression. It gates absorbed radiation energy, bang time, shell radius, peak density, areal density, central temperature, and related radiative-implosion metrics.</li>
+        <li>Energy-conservation tests close shared faces, <code>marshak_in</code>, <code>escaped</code>, material emission, and deposition in one ledger. The frozen-hydro 2D multigroup/grey identity requires \(\varepsilon_{L2}\le10^{-8}\) and \(\varepsilon_{L\infty}\le10^{-6}\) — the relative root-mean-square and maximum-magnitude field differences — and ledger-drift difference \(\le10^{-10}\); measured closed-box drift is \(\le5.1\times10^{-16}\).</li>
+        <li>The 2D RZ layered slab-Marshak battery compares boundary ignition, front position, profile, material-interface flux, and each step's ledger residual with an independent implicit-Newton finite-volume reference. Its short-window ledger gate is \(\le10^{-10}\); certification gates include \(\varepsilon_{L2}(E)\le0.02\) and interface-flux discontinuity \(\le10^{-3}\).</li>
+      </ul>
+    </section>
+
+    <section aria-labelledby="references">
+      <h2 id="references">References</h2>
+      <ol class="references">
+        <li>J. A. Fleck, Jr. and J. D. Cummings, "An Implicit Monte Carlo Scheme for Calculating Time and Frequency Dependent Nonlinear Radiation Transport," J. Comput. Phys. 8, 313–342 (1971). <a href="https://doi.org/10.1016/0021-9991(71)90015-5">doi:10.1016/0021-9991(71)90015-5</a></li>
+        <li>G. D. Levermore and G. C. Pomraning, "A Flux-Limited Diffusion Theory," Astrophys. J. 248, 321–334 (1981). <a href="https://doi.org/10.1086/159157">doi:10.1086/159157</a></li>
+        <li>J. E. Morel and G. R. Montry, "Analysis and Elimination of the Discrete-Ordinates Flux Dip," Transp. Theory Stat. Phys. 13, 615–633 (1984). <a href="https://doi.org/10.1080/00411458408211661">doi:10.1080/00411458408211661</a></li>
+        <li>N. J. Turner and J. M. Stone, "A Module for Radiation Hydrodynamic Calculations with ZEUS-2D Using Flux-Limited Diffusion," Astrophys. J. Suppl. Ser. 135, 95–107 (2001). <a href="https://doi.org/10.1086/321779">doi:10.1086/321779</a></li>
+        <li>E. W. Larsen, A. Kumar, and J. E. Morel, "Properties of the Implicitly Time-Differenced Equations of Thermal Radiation Transport," J. Comput. Phys. 238, 82–96 (2013). <a href="https://doi.org/10.1016/j.jcp.2012.11.034">doi:10.1016/j.jcp.2012.11.034</a></li>
+        <li>B. Su and G. L. Olson, "Benchmark Results for the Non-Equilibrium Marshak Diffusion Problem," J. Quant. Spectrosc. Radiat. Transfer 56, 337–351 (1996). <a href="https://doi.org/10.1016/0022-4073(96)84524-9">doi:10.1016/0022-4073(96)84524-9</a></li>
+        <li>R. E. Marshak, "Effect of Radiation on Shock Wave Behavior," Phys. Fluids 1, 24–29 (1958). <a href="https://doi.org/10.1063/1.1724332">doi:10.1063/1.1724332</a></li>
+        <li>D. S. Kershaw, "Differencing of the Diffusion Equation in Lagrangian Hydrodynamic Codes," J. Comput. Phys. 39, 375–395 (1981). <a href="https://doi.org/10.1016/0021-9991(81)90158-3">doi:10.1016/0021-9991(81)90158-3</a></li>
+      </ol>
+    </section>
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["$$", "$$"], ["\\[", "\\]"]] } };</script>
+  <script defer src="../../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../../nav.js" data-page="radiation-fld" data-root="../../"></script>
+</body>
+</html>

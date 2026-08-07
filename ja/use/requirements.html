@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="ja" data-lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>動作環境と要求スペック — TENRYU ドキュメント</title>
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>動作環境と要求スペック <span class="badge">reference</span></h1>
+    <p class="abstract">TENRYU は NVIDIA CUDA 専用の GPU コードである。このページは、ビルドと実行に必要なマシン・GPU・コンパイラ・ライブラリの要求を一箇所にまとめる。<a href="building.html">ビルド</a>のページは手順を、本ページは「その手順が成立する環境の条件」を扱う。</p>
+
+    <aside class="planned" aria-labelledby="at-a-glance">
+      <h3 id="at-a-glance">要点</h3>
+      <ul>
+        <li>必須: NVIDIA GPU + CUDA Toolkit 12.x（12.0 以上）、C++20 コンパイラ（GCC 12+ / Clang 15+）、CMake 3.25+、Ninja、Python 3.10+（開発ヘッダ含む）。</li>
+        <li>既定ビルドの CUDA アーキテクチャは <code>70;80;89;90</code>（Volta/Ampere/Ada/Hopper の fatbin）。継続的に検証している実機は A100（40/80 GB）・RTX 4090・RTX 3090 である。</li>
+        <li>MPI と Hypre は opt-in（既定 OFF）。HDF5 と Python は既定 ON。テスト・ログ系の小依存（Catch2/spdlog/CLI11/pybind11）は未導入なら CMake 構成時に自動取得される — オフライン環境では事前導入が要る。</li>
+        <li>開発・検証の実績はすべて Linux x86_64 上である。他 OS は未検証。</li>
+      </ul>
+    </aside>
+
+    <section aria-labelledby="platform">
+      <h2 id="platform">プラットフォームと GPU</h2>
+      <p>対応バックエンドは NVIDIA CUDA のみである（HIP 等の他バックエンドは設計上の非対象）。GPU がなければビルドはできても実行はできない。基本の実行形態は 1 プロセス = 1 GPU で、単一 GPU なら MPI なしで動く。複数 GPU は MPI ビルド（後述）で 1 ランク = 1 GPU として使う。</p>
+      <table class="quick-facts">
+        <thead><tr><th>項目</th><th>要求 / 既定</th><th>備考</th></tr></thead>
+        <tbody>
+          <tr><th>GPU ベンダ</th><td>NVIDIA のみ</td><td>CUDA 専用。他ベンダ GPU・CPU 単独実行は非対応。</td></tr>
+          <tr><th>GPU アーキテクチャ</th><td>既定 fatbin: <code>70;80;89;90</code></td><td><code>CMAKE_CUDA_ARCHITECTURES</code> で変更可。理論上の下限は倍精度 <code>atomicAdd</code> が要る compute capability 6.0+（ARCHITECTURE §2.2）。sm_86（RTX 30 系）は sm_80 バイナリの前方互換で動く。</td></tr>
+          <tr><th>検証済みの実機</th><td>A100 40/80 GB、RTX 4090（24 GB）、RTX 3090（24 GB）</td><td>回帰・ベンチマークを継続実行している構成。VRAM の必要量は格子規模に依存する — 1D の基準問題は小さく、大規模 2D ほど要る。</td></tr>
+          <tr><th>OS</th><td>Linux x86_64（実績）</td><td>開発・CI 相当の検証・本番実行はすべて Linux。他 OS は未検証。</td></tr>
+          <tr><th>GPU ドライバ</th><td>CUDA 12.x 対応版</td><td><code>nvidia-smi</code> が表示する CUDA Version が 12.x 以上であること。</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section aria-labelledby="toolchain">
+      <h2 id="toolchain">ツールチェーンとライブラリ</h2>
+      <p>最低バージョンの正典はリポジトリの <code>docs/ARCHITECTURE.md</code> §2.2 である。要求は「必須」「既定 ON（外せるが通常は使う）」「opt-in」の三層に分かれる。</p>
+      <table class="quick-facts">
+        <thead><tr><th>依存</th><th>最低バージョン</th><th>層</th><th>役割・注意</th></tr></thead>
+        <tbody>
+          <tr><th>CUDA Toolkit</th><td>12.0+</td><td>必須</td><td><code>nvcc</code>・ランタイム・cuSPARSE。cuRAND device API（Philox4x32-10）と NVTX はツールキット同梱でリンク不要。</td></tr>
+          <tr><th>C++ コンパイラ</th><td>GCC 12+ / Clang 15+</td><td>必須</td><td>C++20 対応が条件（<code>nvcc</code> のホストコンパイラとして使う）。</td></tr>
+          <tr><th>CMake</th><td>3.25+</td><td>必須</td><td>構成・依存検出・CTest。</td></tr>
+          <tr><th>Ninja</th><td>—</td><td>必須</td><td>ビルド実行系（本ドキュメントの手順は <code>-GNinja</code> 前提）。</td></tr>
+          <tr><th>Python 3 + 開発ヘッダ</th><td>3.10+</td><td>既定 ON</td><td>namelist（入力デッキ）を初期化時に読む埋め込みインタプリタ。<code>python3-dev</code> 相当が必要。</td></tr>
+          <tr><th>pybind11</th><td>2.11+</td><td>既定 ON</td><td>namelist → Config 変換。未導入なら自動取得。</td></tr>
+          <tr><th>HDF5</th><td>1.12+</td><td>既定 ON</td><td>スナップショット・履歴・チェックポイントの入出力。MPI ビルドでは並列 HDF5（<code>--enable-parallel</code>）を使う。</td></tr>
+          <tr><th>MPI</th><td>3.1+</td><td>opt-in（<code>-DTENRYU_ENABLE_MPI=ON</code>）</td><td>複数ランク実行。GPU-aware MPI 推奨（なければホスト経由で中継）。</td></tr>
+          <tr><th>Hypre</th><td>2.25+</td><td>opt-in（<code>-DTENRYU_ENABLE_HYPRE=ON</code>）</td><td>熱伝導の <code>solver="hypre"</code>（BoomerAMG+PCG）用。<code>--with-cuda --with-gpu-aware-mpi</code> でビルドされた Hypre が必要。</td></tr>
+          <tr><th>AmgX</th><td>—</td><td>opt-in（自動検出）</td><td>2D FLD の線形ソルバ選択肢。<code>find_package(amgx)</code> が見つかれば既定で有効。</td></tr>
+          <tr><th>fmt / spdlog</th><td>9.0+ / 1.12+</td><td>内部依存</td><td>ログ系。未導入なら自動取得。</td></tr>
+          <tr><th>Catch2</th><td>3.0+</td><td>テスト用</td><td><code>ctest</code> の単体・統合テスト。未導入なら自動取得。</td></tr>
+          <tr><th>CLI11</th><td>2.4+</td><td>内部依存</td><td><code>run/verify/validate/freeze</code> のサブコマンド CLI。未導入なら自動取得。</td></tr>
+        </tbody>
+      </table>
+      <p><strong>ネットワークについて。</strong>Catch2・spdlog・CLI11・pybind11 はシステムに見つからない場合、CMake の FetchContent が構成時にダウンロードする。したがって初回の <code>cmake</code> はインターネット接続があると楽である。オフライン環境（計算機センターの計算ノード等）では、これらをあらかじめ導入するか、ネットワークのあるログインノードで構成を済ませること。CUDA・HDF5・Python・MPI・Hypre は自動取得の対象外で、常に事前導入が要る。</p>
+    </section>
+
+    <section aria-labelledby="cmake-options">
+      <h2 id="cmake-options">CMake オプションの既定</h2>
+      <table class="quick-facts">
+        <thead><tr><th>オプション</th><th>既定</th><th>意味</th></tr></thead>
+        <tbody>
+          <tr><th><code>CMAKE_CUDA_ARCHITECTURES</code></th><td><code>70;80;89;90</code></td><td>生成する SASS の対象世代。自分の GPU 1 種に絞るとビルドが速くなる（例: RTX 4090 なら <code>89</code>）。</td></tr>
+          <tr><th><code>TENRYU_ENABLE_HDF5</code></th><td><code>ON</code></td><td>HDF5 入出力。OFF では出力・リスタートが使えない。</td></tr>
+          <tr><th><code>TENRYU_ENABLE_PYTHON</code></th><td><code>ON</code></td><td>Python namelist の読込。OFF では <code>.py</code> デッキを読めない。</td></tr>
+          <tr><th><code>TENRYU_ENABLE_MPI</code></th><td><code>OFF</code></td><td>複数ランク実行。単一 GPU 利用なら OFF のままでよい。</td></tr>
+          <tr><th><code>TENRYU_ENABLE_HYPRE</code></th><td><code>OFF</code></td><td>熱伝導の陰的ソルバ経路。</td></tr>
+          <tr><th><code>TENRYU_ENABLE_NVTX</code></th><td><code>OFF</code></td><td>プロファイル計装（Nsight 用）。</td></tr>
+          <tr><th><code>TENRYU_ENABLE_AMGX</code></th><td>自動（検出時 ON）</td><td>2D FLD の AmgX ソルバ。</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section aria-labelledby="preflight">
+      <h2 id="preflight">事前チェックの実行例</h2>
+      <p>ビルドに入る前に、次の 4 つが通れば必須要件はほぼ満たしている。</p>
+      <pre><code># GPU とドライバ（CUDA Version が 12.x 以上であること）
+nvidia-smi
+
+# CUDA コンパイラ（release 12.x であること）
+nvcc --version
+
+# ビルドツール
+cmake --version     # 3.25 以上
+ninja --version
+
+# Python（3.10 以上・開発ヘッダの有無）
+python3 --version
+python3 -c "import sysconfig; print(sysconfig.get_paths()['include'])"</code></pre>
+      <p>ここまで確認できたら<a href="building.html">ビルド</a>のページへ進む。CMake の構成段階で「パッケージが見つからない」と出た場合の対処も同ページにある。</p>
+    </section>
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["\\[", "\\]"]] } };</script>
+  <script defer src="../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../nav.js" data-page="requirements" data-root="../"></script>
+</body>
+</html>

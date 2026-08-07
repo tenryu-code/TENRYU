@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en" data-lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Architecture &amp; module map — TENRYU Documentation</title>
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>Architecture &amp; module map <span class="badge">reference</span></h1>
+    <p class="abstract">TENRYU is a CUDA-only code that freezes a Python namelist into plain data during initialization, then lets clearly bounded physics modules update shared GPU-resident State. The coupling driver centrally owns operator order, time-step selection, retry, and thermodynamic reclosure between operators; HDF5 products are consumed by TENRYU Studio and TENRYU Scope.</p>
+
+    <aside class="planned" aria-labelledby="at-a-glance">
+      <h3 id="at-a-glance">At a glance</h3>
+      <ul>
+        <li>The main computation is GPU-first and NVIDIA CUDA is the only supported backend. Module dependencies are directed and must not form cycles.</li>
+        <li>Python runs only while constructing the input. Callables are frozen into tables or State arrays; the time loop never calls Python.</li>
+        <li><code>Config</code> is the immutable run contract, <code>State</code> owns evolving fields and ledgers, and the coupling driver owns the acceptance boundary.</li>
+        <li>Studio builds and launches decks; Scope is the companion application for inspecting and comparing HDF5 results.</li>
+      </ul>
+    </aside>
+
+    <section aria-labelledby="principles-build">
+      <h2 id="principles-build">Design principles and build boundary</h2>
+      <p>The first principle is GPU-first execution. Hydrodynamics, FLD and S<sub>N</sub> radiation, and laser ray tracing perform their principal work on NVIDIA GPUs; non-CUDA backends are unsupported. Locality reduces global MPI communication, and fixed dependency directions separate Hydro, Radiation, Laser, Materials, Mesh, Coupling, Diagnostics, I/O, and Driver. Same-GPU, same-configuration reproducibility is an architectural contract.</p>
+      <p>The core uses C++20 and CUDA C++ with CMake (3.25 or newer) and Ninja. Dependencies include CUDA Toolkit 12.x (12.0 or newer), MPI 3.1+, HDF5 1.12+, Python 3.10+, and pybind11 2.11+ — the same requirement set the <a href="../use/building.html">Building</a> page tabulates. Embedded Python reads the single namelist and is released after configuration. MPI and parallel HDF5 provide distributed execution and collective I/O.</p>
+
+      <figure>
+        <img src="../../assets/overview-architecture-flow.png" width="980" height="430" style="max-width:100%;height:auto" alt="Block diagram from a Python deck through namelist freezing, Config and State, the coupling driver loop, HDF5 outputs, Studio, and Scope">
+        <figcaption>Figure A. Boundary between input and execution state. The Python deck is frozen during initialization, and only accepted driver steps publish snapshots, history, and checkpoints to HDF5.</figcaption>
+      </figure>
+    </section>
+
+    <section aria-labelledby="module-map">
+      <h2 id="module-map">Module map</h2>
+      <p>The module split specifies ownership and dependency direction. Conduction advances as a separate operator, but its implementation lives under Hydro and its sequence placement belongs to Coupling.</p>
+      <table class="quick-facts">
+        <thead>
+          <tr><th>Module</th><th>One-line responsibility</th></tr>
+        </thead>
+        <tbody>
+          <tr><th><code>core/</code></th><td>Provides configuration, namelist freezing, units, errors, profiling, common device arrays, and scratch facilities used across layers.</td></tr>
+          <tr><th><code>mesh/</code></th><td>Owns Lagrangian and ALE meshes, RZ geometry, face/node connectivity, neighborhoods, and mesh-quality contracts.</td></tr>
+          <tr><th><code>hydro/</code></th><td>Updates momentum, position, density, ion/electron internal energy, and boundaries, and implements electron/ion conduction.</td></tr>
+          <tr><th><code>radiation/</code></th><td>Provides 1D/2D multigroup FLD and S<sub>N</sub>, radiation sources, matter exchange, and boundary tallies.</td></tr>
+          <tr><th><code>laser/</code></th><td>Traces refracting rays, applies inverse-bremsstrahlung absorption, and deposits energy conservatively on the Hydro mesh.</td></tr>
+          <tr><th><code>materials/</code></th><td>Maps state to EOS, opacity, conductivity, relaxation, mean-ionization, and related material coefficients.</td></tr>
+          <tr><th><code>burn/</code></th><td>Advances Bosch–Hale reaction rates, per-cell species networks, product-energy deposition, and species ledgers.</td></tr>
+          <tr><th><code>coupling/</code></th><td>Owns operator splitting, dt selection, source injection, EOS reclosure, and acceptance of full-step retries.</td></tr>
+          <tr><th><code>diagnostics/</code></th><td>Builds ICF observables and audits such as energy budgets, areal density, sphericity, and shell tracking.</td></tr>
+          <tr><th><code>drivers/</code></th><td>Implements the <code>run</code>/<code>verify</code> entry points that assemble Config, mesh, State, callbacks, and the run lifecycle.</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section aria-labelledby="config-state-driver">
+      <h2 id="config-state-driver">Config, State, and the coupling driver</h2>
+      <p>A <code>.py</code> namelist reaches the Builder through CPython and pybind11. The Builder checks types, units, ranges, and cross-field invariants before applying defaults. Geometry callables are evaluated into State arrays; waveforms and time-dependent boundaries become <code>FrozenTable1D</code>. The source and frozen JSON can be stored in HDF5.</p>
+      <p><code>Config</code> is passed by const reference to module initialization, with only required fields copied to the GPU. <code>State</code> owns evolving mesh coordinates, density, velocity, 2T energies, pressures, radiation fields, deposition, and ledgers.</p>
+      <p>The coupling driver is the owner of time evolution, not another physics kernel. It chooses dt from the Hydro CFL, conduction and radiation limits, user and output caps, then applies the growth limit relative to the previous accepted step. It calls laser full, hydro half, conduction full, radiation full, and hydro half, inserting required EOS synchronization and halo exchange between operators. When full-step retry is enabled, the driver snapshots State at step entry. An inadmissible Hydro corrector causes a restore, dt halving, and repetition of the entire split sequence. History, snapshots, checkpoints, and cumulative energy accounting sit below the acceptance boundary, so rejected attempts do not become official output.</p>
+    </section>
+
+    <section aria-labelledby="device-memory">
+      <h2 id="device-memory">Device-memory idioms</h2>
+      <p>Typed <code>DeviceArray&lt;T&gt;</code> and dimension-specific Field wrappers make ownership, moves, and reset explicit. Temporary workspaces use process-lifetime, named, grow-only scratch pools with unique tags for simultaneous buffers. Acquisition has <code>cudaMalloc</code>'s uninitialized-content contract, so required zeroing is explicit. Pooled wrappers do not free individually; shutdown releases the pools together. This removes repeated time-loop allocation while preventing aliasing and dependence on old contents.</p>
+    </section>
+
+    <section aria-labelledby="desktop-apps">
+      <h2 id="desktop-apps">The two desktop applications</h2>
+      <h3>TENRYU Studio — build and run</h3>
+      <p>TENRYU Studio is a Tauri 2 and React/TypeScript form-based deck application. It configures the run and generates a Python deck with embedded state for round-trip editing. It validates decks and uses system <code>ssh</code>/<code>scp</code> for configured servers. Its final artifact is the same single-namelist contract accepted by the CLI.</p>
+      <h3>TENRYU Scope — inspect and compare</h3>
+      <p>TENRYU Scope specializes in HDF5 snapshots and history. It opens local or remote runs, then renders 1D profiles, histories, and 2D tensor or CSR (compressed-sparse-row connectivity) multiblock fields. It provides colormaps, linear/log ranges, zoom/pan, time animation, lineouts, laser-ray overlays, and PNG, CSV, or video export, separating result exploration from deck authoring.</p>
+    </section>
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["\\[", "\\]"]] } };</script>
+  <script defer src="../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../nav.js" data-page="architecture" data-root="../"></script>
+</body>
+</html>

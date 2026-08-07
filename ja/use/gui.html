@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="ja" data-lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TENRYU Studio (GUI) — TENRYU ドキュメント</title>
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>TENRYU Studio (GUI) <span class="badge">reference</span></h1>
+    <p class="abstract">TENRYU Studio は、TENRYU の Python namelist のデッキをフォームから作成するデスクトップアプリである。入力に応じてデッキをその場で生成し、検証、保存、ローカルまたはサーバーでの実行までを、ひとつの画面で扱える。保存したデッキにはフォームの状態も埋め込まれるため、コードと GUI のあいだを行き来しながら設定を育てられる。</p>
+
+    <div class="button-row">
+      <a class="button" href="../../../../gui/manual/index_ja.html">日本語 GUI マニュアル</a>
+      <a class="button" href="../../../../gui/manual/index_en.html">英語 GUI マニュアル</a>
+    </div>
+    <p>GUI マニュアルは TENRYU リポジトリの <code>gui/manual/</code> に同梱される別の文書一式である。上のボタン（およびトップバーの「GUI マニュアル」リンク）は、本ドキュメントをリポジトリのチェックアウト内で閲覧しているときに解決する。サイト単体の複製では解決しない。</p>
+
+    <aside class="planned" aria-labelledby="at-a-glance">
+      <h3 id="at-a-glance">要点</h3>
+      <ul>
+        <li>中央のフォームを編集すると、右のペインにある Python のデッキがその場で更新される。</li>
+        <li>フォームの検証と、サーバー上での <code>tenryu validate</code> を通してから、保存または実行へ進む。</li>
+        <li><code>TENRYU-GUI-STATE</code> のコメントを残しておけば、保存済みのデッキからフォーム全体を復元できる。</li>
+        <li>3 つの物理プリセットは、2026-07-31 に RTX 4090 上で完走を確認した 1 次元の構成である。</li>
+      </ul>
+    </aside>
+
+    <section aria-labelledby="workflow">
+      <h2 id="workflow">フォームから実行まで</h2>
+      <p>Studio の左のナビゲーションは、プリセット、基本設定、材料、ジオメトリー、物理、駆動、出力を、設定する順に並べている。中央で選択中のフォームを編集すると、右のペインに常に最新の Python namelist が表示される。必須の値が欠けていたり、整合しない組合せがあったりする場合は、その場でエラーを示し、修正すると生成を再開する。これにより、長さは cm、時間は s、温度は eV、密度は g/cm³ という TENRYU の cgs + eV の規約を確認しながら入力できる。</p>
+      <figure>
+        <img src="../../../../gui/manual/img/ja/01_overview.png" alt="TENRYU Studio の画面全体" style="max-width: 100%; height: auto;">
+        <figcaption>ヘッダーと左のナビゲーション、中央の設定フォーム、右側の生成されたデッキと検証パネル。</figcaption>
+      </figure>
+      <p>基本の流れは「フォームを作る → 生成されたデッキを読む → 検証する → 保存または実行」である。プリセットは出発点であり、適用したあとの項目はすべて編集できる。右のペインで生成内容を確認し、検証結果のエラーを解消してからファイルへ保存すること。保存したデッキは通常の Python のファイルなので、Studio を介さずに <code>./build/tenryu run deck.py</code> で実行することも、テキストエディタで内容を確認することもできる。</p>
+    </section>
+
+    <section aria-labelledby="roundtrip">
+      <h2 id="roundtrip"><code>TENRYU-GUI-STATE</code> による行き来しながらの編集</h2>
+      <p>Studio が保存するデッキの先頭には、フォームの完全な状態を表す <code>TENRYU-GUI-STATE</code> のコメントが埋め込まれる。「読込」でそのデッキを開くと、材料、領域、物理、駆動の波形、出力の設定などが元のフォームへ復元され、デッキの生成が再開される。したがって、配布や保管の単位は実行できるデッキそのものであり、別の GUI 用プロジェクトファイルを同期する必要はない。</p>
+      <p>保存したあとに Python を手で編集しても、デッキとしては実行できる。ただし、このコメントを削除すると、Studio はフォームの状態を復元できない。また、コメント内の状態と、手で編集した Python の本文が別々に変わってしまうと、次に読み込んだときは埋め込まれた状態から生成し直される。GUI へ戻る予定のあるデッキでは、状態のコメントを残し、フォーム側で変更して保存し直す運用が確実である。</p>
+    </section>
+
+    <section aria-labelledby="presets">
+      <h2 id="presets">実行まで確認済みの 1D プリセット</h2>
+      <p>空の構成に加えて、次の 3 つの物理プリセットを収録している。いずれも単に検証を通しただけの例ではなく、2026-07-31 に RTX 4090 で終端まで実際に計算し、特徴的な物理解が得られることを確認した構成である。</p>
+      <ul>
+        <li><strong>輻射スラブ:</strong> 120 eV の Marshak 駆動とグレイ FLD により、1 ns で約 35 µm まで進む熱波の前線と、その前方の低温領域を再現する。</li>
+        <li><strong>レーザー爆縮カプセル:</strong> <a href="../verification/index.html#gxii">GXII</a> 級（GXII = 激光 XII 号 — リンク先のベンチマーク定義参照）の 10 TW × 1 ns、DT + CH + コロナ層、20 群 FLD により、約 86% の吸収と、約 1.4 ns での最大圧縮が得られる。このプリセットの約 86% は、回帰デッキの 83–84% や HELIOS キャンペーンの約 45% とは比較できない — 3 つの条件の対照は<a href="examples.html#absorption-numbers">「例題とプリセット」ページ</a>にある。</li>
+        <li><strong>間接照射 Tr(t):</strong> 120 eV のフットから 200 eV へ立ち上げる Marshak の波形で、4.2〜4.5 ns の停滞と、その後の反跳まで追跡する。</li>
+      </ul>
+      <p>プリセットの数値条件と観測値は<a href="examples.html">「例題とプリセット」のページ</a>にまとめてある。条件を変えるときは、まず変更していないプリセットを基準となる短い実行として保存し、そのあとで入力をひとつずつ変えていくと、吸収、圧縮、出力の間隔の差を追いやすくなる。</p>
+    </section>
+
+    <section aria-labelledby="server-execution">
+      <h2 id="server-execution">サーバーで検証・実行する</h2>
+      <p>「サーバー」で実行先のプロファイルと TENRYU のバイナリを設定し、ヘッダーで対象を選ぶ。検証パネルの「validate 実行」は、選んだサーバーへ一時的なデッキを送り、実行せずに検証だけを行う。「実行 ▶」は検証済みの設定を同じサーバーへ投入し、「実行履歴」には待機中、実行中、完了・失敗といった状態と、結果への導線が残る。サーバーを設定しない場合でも、デッキの生成と保存は利用でき、保存先で TENRYU のコマンドラインから実行できる。</p>
+    </section>
+
+    <aside class="planned" aria-labelledby="full-manual">
+      <h3 id="full-manual">画面ごとの詳しい操作</h3>
+      <p>各フォーム、サーバーの設定、出力、トラブルシューティングをスクリーンショット付きで確認するには、上の「日本語 GUI マニュアル」を参照のこと。</p>
+    </aside>
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["\\[", "\\]"]] } };</script>
+  <script defer src="../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../nav.js" data-page="gui" data-root="../"></script>
+</body>
+</html>

@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en" data-lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Using TENRYU — TENRYU Documentation</title>
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>Using TENRYU</h1>
+    <p class="abstract">This section covers the whole practical workflow: checking the system requirements, building, completing a first run, writing Python namelist decks (or generating them with TENRYU Studio), and reading the HDF5 outputs. Following the quick start and the path below, this section alone takes you to a completed first run.</p>
+
+    <section aria-labelledby="quickstart">
+      <h2 id="quickstart">Quick start (copy and run)</h2>
+      <p>If unsure about prerequisites, start with the pre-flight checks on <a href="requirements.html">System requirements</a>. Everything below runs from the repository root.</p>
+      <pre><code># 1. build (first time only; details and failure handling on "Building")
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+ninja -C build
+
+# 2. smoke check (one registered analytic case)
+./build/tenryu verify noh
+
+# 3. first run (the template completes unmodified)
+./build/tenryu validate examples/templates/template_1d_slab_radiation.py   # pre-flight check
+./build/tenryu run      examples/templates/template_1d_slab_radiation.py  # the run
+
+# 4. look at the results
+ls outputs/template_1d_slab_radiation/results/
+python3 -m tools.tenryu_plot profile outputs/template_1d_slab_radiation</code></pre>
+    </section>
+
+    <h2>Workflow guides</h2>
+    <div class="card-grid">
+      <a class="card" href="requirements.html"><h3>System requirements</h3><p>GPU, compiler, and library requirements, plus pre-flight check commands.</p></a>
+      <a class="card" href="building.html"><h3>Building</h3><p>Configure a CUDA Release build, run tests, and enable MPI or ccache.</p></a>
+      <a class="card" href="running.html"><h3>Running simulations</h3><p>Complete a template, write decks, use validate/run/verify/freeze, and troubleshoot.</p></a>
+      <a class="card" href="namelist.html"><h3>Namelist reference</h3><p>Navigate top-level blocks, representative keys, units, and authoritative defaults.</p></a>
+      <a class="card" href="gui.html"><h3>TENRYU Studio (GUI)</h3><p>Create, validate, save, and run decks from the form-based desktop application.</p></a>
+      <a class="card" href="examples.html"><h3>Examples &amp; presets</h3><p>Runnable templates, verified Studio presets, and the verification deck library.</p></a>
+      <a class="card" href="outputs.html"><h3>Outputs &amp; analysis</h3><p>A complete enumeration of the three HDF5 kinds and provenance files, and how to read them.</p></a>
+    </div>
+
+    <aside class="planned" aria-labelledby="first-run">
+      <h3 id="first-run">Your first run: a suggested path</h3>
+      <ol>
+        <li><a href="requirements.html">System requirements</a> — confirm the GPU and toolchain prerequisites.</li>
+        <li><a href="building.html">Building</a> — get a binary and a passing <code>ctest</code>.</li>
+        <li><a href="running.html">Running simulations</a> — complete a template through validate → run, exactly as written there.</li>
+        <li><a href="examples.html">Examples &amp; presets</a> — run a verified preset, starting with <code>laser_capsule</code>, exactly as distributed.</li>
+        <li><a href="outputs.html">Outputs &amp; analysis</a> — read the result: absorption from the energy ledgers (incident versus deposited) and the implosion peak from the per-step history <code>implosion/rho_peak</code>.</li>
+      </ol>
+      <p>When you need the physics behind a result, go to the matching <a href="../physics/index.html">physics kernel</a> page; each page's mechanism section explains the background before the equations. How the time step is chosen is collected on <a href="../overview/timestep.html">Time-step control &amp; CFL</a>.</p>
+    </aside>
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["\\[", "\\]"]] } };</script>
+  <script defer src="../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../nav.js" data-page="using-tenryu" data-root="../"></script>
+</body>
+</html>

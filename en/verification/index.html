@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="en" data-lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Verification &amp; benchmarks — TENRYU Documentation</title>
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>Verification &amp; benchmarks <span class="badge">reference</span></h1>
+    <p class="abstract">TENRYU verification progresses from kernel gates with closed-form results, through golden regressions and reproducibility audits, to integrated 2D RZ batteries and cross-code comparisons. Higher rungs exercise more physics but do not replace the analytic gates below them. Distinct oracles and acceptance bands identify the contract that changed.</p>
+
+    <aside class="planned" aria-labelledby="at-a-glance">
+      <h3 id="at-a-glance">At a glance</h3>
+      <ul>
+        <li>Analytic gates cover Sedov and Noh hydrodynamics, the multigroup Marshak spectrum, the SNB Epperlein–Short dispersion band, and analytic laser refraction and absorption laws.</li>
+        <li>The <a href="#gxii">GXII</a> 1D FLD regression compares implosion history metrics with a golden. Goldens are re-baselined only for justified physics or numerical changes, with quantitative review.</li>
+        <li>Deterministic 1D paths require run-to-run bitwise identity. Selected 2D RZ paths treat <code>atomicAdd</code> ordering at the least-significant-bit level through explicit noise-band contracts.</li>
+        <li>The I-series raises grey radiative shocks, multigroup FLD collapse, and S<sub>N</sub> radiative-shock ladders into coupled 2D RZ acceptance batteries.</li>
+      </ul>
+    </aside>
+
+    <section aria-labelledby="ladder">
+      <h2 id="ladder">Verification ladder</h2>
+      <p>The ladder accumulates evidence in order: one operator, a frozen configuration, execution reproducibility, multi-operator coupling, and comparison with another implementation. Small gates localize sign, unit, coefficient, and boundary-condition errors. Integrated batteries ask whether those parts remain consistent in the production time loop, mesh, and energy ledgers. Cross-code results support validation; they do not replace internal verification.</p>
+
+      <table class="quick-facts">
+        <thead>
+          <tr><th>Gate class</th><th>What it checks</th><th>Where it runs</th></tr>
+        </thead>
+        <tbody>
+          <tr><th>1. Unit / analytic</th><td>One kernel, discrete operator, or conservation identity against a closed form or independent implementation.</td><td><code>ctest</code> targets such as <code>verify_sedov</code>, <code>verify_noh</code>, and the Marshak, SNB, and laser patterns. Many also run as <code>tenryu verify &lt;name&gt;</code>.</td></tr>
+          <tr><th>2. Golden regression</th><td>History metrics from a frozen deck against an approved JSON baseline and metric-specific tolerances.</td><td><code>ctest -R verify_gxii_1d_fld_regression</code> or <code>tenryu verify gxii_1d_fld_regression</code>.</td></tr>
+          <tr><th>3. Reproducibility</th><td>Replicas of the same input, and where applicable different rank counts, under T-bit, T-sum, or T-noise contracts (<a href="#reproducibility">defined below</a>).</td><td>The documented <code>parallel_determinism_audit</code> contract and replica or OFF-bit legs inside coupled batteries.</td></tr>
+          <tr><th>4. Integrated battery</th><td>Hydrodynamics, radiation, material coupling, mesh behavior, and boundary ledgers together in 2D RZ.</td><td>CTest I1, I2, and I3 batteries; full coupled rows use <code>strict</code> names, and long rows carry the <code>expensive</code> label.</td></tr>
+          <tr><th>5. Cross-code benchmark</th><td>Trends and absorption under physically matched inputs in a separate code.</td><td>The HELIOS matched-irradiation LTE campaign, recorded as a benchmark rather than a routine per-commit gate.</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section aria-labelledby="analytic-catalog">
+      <h2 id="analytic-catalog">Analytic and unit-gate catalog</h2>
+      <p>An analytic gate owns an oracle that a wrong implementation would not reproduce. Where practical, its reference avoids production helpers and uses an independent integral, discrete eigenvalue, or published solution.</p>
+
+      <table class="quick-facts">
+        <thead>
+          <tr><th>Area</th><th>Reference and principal observables</th><th>Representative gate names</th></tr>
+        </thead>
+        <tbody>
+          <tr><th>Hydrodynamics</th><td>Sedov–Taylor compares shock radius, density profile, and energy with the similarity solution. Noh checks shock position, compression plateau, upstream flow, and conservation in each geometry.</td><td><code>sedov</code>, <code>noh</code>, <code>noh_planar</code>, <code>noh_cylindrical</code></td></tr>
+          <tr><th>Multigroup FLD</th><td>An eight-group Marshak plateau is compared with a spectrum from independent Planck integration. Frequency-dependent relaxation checks group-opacity wiring through a closed-form backward-Euler response.</td><td><code>fld_1d_mg_planar_marshak_spectrum</code>, <code>fld_1d_mg_planar_freqdep_relaxation</code></td></tr>
+          <tr><th>SNB conduction</th><td>A tight comparison with the discrete dispersion relation is separated from a physical band based on Epperlein–Short / Vlasov–Fokker–Planck (VFP) kinetic data [4,5]. Grid and group ladders, monotonicity, the local limit, and conservation complete the suite.</td><td><code>snb_local_limit_1d</code>, <code>snb_dispersion_1d</code>, <code>snb_conservation_1d</code></td></tr>
+          <tr><th>Laser / opacity</th><td>Beer–Lambert attenuation in uniform matter, the turning point in an analytic refractive-index profile, 3D-ray absorption, and the deposition ledger expose errors such as missing or double application of <code>rho*kappa</code>.</td><td><code>beer_lambert</code>, <code>laser_3d_beer_lambert</code>, <code>laser_3d_refraction</code></td></tr>
+          <tr><th>Radiation front</th><td>The Hammer–Rosen supersonic Marshak wave [3] compares front isotherms and the incoming/escaping energy ledger with the perturbative analytic solution.</td><td><code>hammer_rosen_supersonic</code></td></tr>
+        </tbody>
+      </table>
+      <p>Tolerances are not uniform. A deterministic Beer–Lambert trace has no sampling noise and uses a tight relative error. The SNB band from published data remains separate from the operator gate; its high-wavenumber model limit is not certified by widening the band.</p>
+    </section>
+
+    <section aria-labelledby="gxii">
+      <h2 id="gxii">The GXII benchmark</h2>
+      <p>Throughout this documentation, <strong>GXII</strong> is GEKKO XII — the 12-beam Nd:glass laser facility at the Institute of Laser Engineering, The University of Osaka. TENRYU's standing application benchmark is a GXII-equivalent direct-drive implosion: twelve beams arranged on the faces of a regular dodecahedron (implemented as the twelve icosahedron-vertex directions) irradiate a 500&nbsp;µm capsule. The golden-regression deck <code>examples/verification/gxii_1d_fld_regression.py</code> freezes this configuration:</p>
+      <table class="quick-facts">
+        <thead><tr><th>Item</th><th>Value in the regression deck</th></tr></thead>
+        <tbody>
+          <tr><th>Target</th><td>CH shell (\(\rho=1.05\) g/cm³, 20 µm thick, outer radius 250 µm; \(A=6.5\), \(Z=3.5\)) around DT gas (0.010 g/cm³; \(A=2.5\), \(Z=1\)); VOID exterior.</td></tr>
+          <tr><th>Seed corona</th><td>Exponential blowoff \(\rho=0.05\,e^{-(r-250\,\mu m)/2\,\mu m}\) g/cm³ over 10 µm with a \(3\times10^{-4}\) g/cm³ tail guard, placing the 351 nm CH critical density (0.028 g/cm³) inside a resolved ramp.</td></tr>
+          <tr><th>Drive</th><td>10 kJ in a 1 ns square pulse (10 TW total, 10 ps ramps) at \(\lambda=351\) nm (3ω); 12 beams at f/3 with super-Gaussian spots (\(w_0=200\) µm, \(m=4\)), 1000 rays per beam, chord raytrace.</td></tr>
+          <tr><th>Physics</th><td>Two-temperature Lagrangian hydrodynamics, Spitzer–Härm conduction, 20-group FLD (log-spaced bounds 0.01–100 eV, Levermore–Pomraning limiter); ideal-gas EOS (\(\gamma=5/3\)), constant opacity \(\kappa=100\) cm²/g, fixed full-ionization \(\bar Z\). CBET and hot electrons off.</td></tr>
+          <tr><th>Mesh / duration</th><td>200 uniform Lagrangian cells over 0–500 µm, run to 2 ns.</td></tr>
+        </tbody>
+      </table>
+      <p>Kernel pages that quote “GXII” conditions — golden absorption, corona substep counts, S<sub>8</sub>/S<sub>16</sub> comparisons, “GXII-class” Studio presets — refer to this deck or a stated variant of it. Its target and drive parameters double as the physical definition wherever “GXII-class” appears.</p>
+    </section>
+
+    <section aria-labelledby="golden">
+      <h2 id="golden">Golden regression and re-baselining</h2>
+      <p><code>verify_gxii_1d_fld_regression</code> covers a 1D spherical implosion with laser deposition, hydrodynamics, conduction, two-temperature matter, and FLD. Its history metrics are absorbed laser energy, bang time, <code>rho_peak_max</code>, areal density <code>rhoR_max</code>, and central temperature <code>Tc_max</code>. The contract requires <code>rho_peak_max</code> within 10% of its golden, bang time within 5%, and other gated metrics within their stated tolerances. <code>shell_r_min</code> is informational; a mismatched <code>run_profile</code> fails the comparison.</p>
+      <p>A golden detects changes on the same grid and run profile; it does not prove exactness or grid convergence. Re-baselining requires a known bug fix, a physics-algorithm or baseline-parameter change, or code-owner approval. The update must state the reason, quantify old-to-new differences, provide convergence data across resolutions, and receive review. A failing run alone is not a rationale.</p>
+    </section>
+
+    <section aria-labelledby="reproducibility">
+      <h2 id="reproducibility">Reproducibility gates and the 2D exception</h2>
+      <p>Reproducibility contracts are named by tier. These tags appear across the kernel pages:</p>
+      <table class="quick-facts">
+        <thead><tr><th>Tier</th><th>Contract</th></tr></thead>
+        <tbody>
+          <tr><th>T-bit</th><td>Bitwise identity between replicas (and across rank counts where declared).</td></tr>
+          <tr><th>T-sum</th><td>Only MPI reduction order may differ; normalized differences are gated, normally at \(10^{-8}\).</td></tr>
+          <tr><th>T-noise</th><td>The documented 2D RZ <code>atomicAdd</code> least-significant-bit mechanism; acceptance is a deck- and metric-specific band self-calibrated from replicas or frozen from an ensemble.</td></tr>
+          <tr><th>OFF-bit</th><td>With a feature disabled or never triggered, the run must be bitwise identical to the path without the feature.</td></tr>
+          <tr><th>Envelope</th><td>A wider per-deck worst-case bound calibrated from reference-run ensembles, used for metrics with documented nondeterminism.</td></tr>
+        </tbody>
+      </table>
+      <p>Deterministic 1D runs with the same binary, input, and GPU configuration must produce bitwise-identical fields and diagnostics. GXII 1D uses per-ray private laser deposition followed by fixed-order reduction; the complete trajectory must reproduce bitwise. Physical tolerances retained for toolchain robustness do not permit same-configuration replica drift.</p>
+      <p>Some 2D RZ corner-force and tally paths use <code>atomicAdd</code> from many threads. Their addition order may vary and inject a difference in the least significant bits. For this documented exception, bitwise equality would be the wrong oracle: acceptance uses a self-calibrated band from same-configuration replicas or a frozen ensemble band. Long-run radial-invariance checks separate a clean first-step audit from the terminal difference, which must lie inside a growth band appropriate to the run length. This is a metric- and deck-specific T-noise contract, not a general tolerance. Deterministic intermediates and 1D legs remain bitwise requirements.</p>
+    </section>
+
+    <section aria-labelledby="integrated">
+      <h2 id="integrated">I-series integrated 2D RZ batteries</h2>
+      <p>The I-series promotes reference problems into the coupled production path. Each harness executes angular, opacity, grid, or solver rungs and passes only when every required item in its summary JSON closes.</p>
+
+      <table class="quick-facts">
+        <thead>
+          <tr><th>Battery</th><th>Coupled contract</th><th>How to find it in CTest</th></tr>
+        </thead>
+        <tbody>
+          <tr><th>I1: grey radshock anchors</th><td>Semi-analytic grey radiative-shock anchors — LR07 and LE08 [6,7] plus a limiter-off FLD-CED ODE reference (see the <a href="#tag-legend">tag legend</a>) — in 1D, and a 2D RZ z-slab leg (a planar shock along z in a radially thin slab, gated for radial invariance); shock and precursor behavior, conservation, and landing against reference profiles.</td><td><code>ctest --test-dir build -R "I1|i1"</code></td></tr>
+          <tr><th>I2: multigroup FLD collapse</th><td>With frequency-flat opacity, group-summed multigroup FLD must collapse to the grey coupled solution. The battery also checks front Cauchy/Richardson contraction, run-hygiene audits (NaN, floor-hit, and ledger sanity checks), and conservation.</td><td><code>ctest --test-dir build -R "I2|i2.*mgfld"</code></td></tr>
+          <tr><th>I3: S<sub>N</sub> radshock ladder</th><td>Angular, opacity-scale, and grid rungs check radiation profiles and flux, the precursor and matter shock, conservation, ordering against FLD, and radial invariance.</td><td><code>ctest --test-dir build -R "I3|i3.*radshock"</code></td></tr>
+        </tbody>
+      </table>
+      <p>The coupled I1 row and the full I2 and I3 acceptance tests include <code>strict</code> in their names: they evaluate the complete mandatory harness rather than a partial smoke. Their Catch2 <code>[.expensive]</code> tag is exported as the CTest <code>expensive</code> label, keeping long GPU batteries separate from the short development loop. The label classifies runtime and campaign scale; it does not weaken acceptance.</p>
+    </section>
+
+    <section aria-labelledby="tag-legend">
+      <h2 id="tag-legend">Gate-tag legend</h2>
+      <p>Kernel pages abbreviate their gate families with short tags. The tags are names, not a strength ranking. “Rungs” are the levels of one battery's internal ladder (for example an angular-resolution ladder), and “tier-1” marks a deliberately reduced first-generation model contract.</p>
+      <table class="quick-facts">
+        <thead><tr><th>Tag family</th><th>Meaning</th></tr></thead>
+        <tbody>
+          <tr><th>L1 / L2 (laser)</th><td>Laser gate tiers: L1 = single-physics laser closure contracts (refraction, Beer–Lambert, energy ledger, ray-count convergence); L2 = laser+hydro coupled contracts. Unrelated to the \(L_2\)/\(L_\infty\) error norms.</td></tr>
+          <tr><th>G1–G4 (conduction)</th><td>The SNB nonlocal-conduction gate series: G1 OFF-bit against the local model, G2 local limit and quadratic asymptote, G3 Epperlein–Short dispersion, G4 conservation.</td></tr>
+          <tr><th>G-R / G-K / G-P / G-L (burn)</th><td>Burn gate series by area: R = reactivities and depletion, K = Fraley range/kernel, P = electron–ion partition, L = energy ledgers.</td></tr>
+          <tr><th>B1 / B2 / N1 / W1–W8 (viscosity)</th><td>Braginskii-viscosity batteries: B = coefficient, strain, and decay gates; N1 = the curvature-geometry mode gate; W = the electron-channel and 2D parity port series.</td></tr>
+          <tr><th>H1 / H2 (2D hydro)</th><td>2D RZ hydro reference decks: H1 planar Sod, H2 cylindrical Noh.</td></tr>
+          <tr><th>I1 / I2 / I3 / I6</th><td>Integrated 2D RZ batteries: I1 grey radiative shock, I2 multigroup-FLD grey collapse, I3 S<sub>N</sub> radiative-shock ladder, I6 S<sub>N</sub> multigroup grey-collapse acceptance.</td></tr>
+          <tr><th>R2 (S<sub>N</sub>)</th><td>The S<sub>N</sub> quadrature and Marshak-profile reference battery (ordinate ladder plus an independent Marshak comparison). Unrelated to the EOS charge moment \(r_2\).</td></tr>
+          <tr><th>LR07 / LE08 / FLD-CED (I1 anchors)</th><td>Reference solutions anchoring I1: the Lowrie–Rauenzahn 2007 and Lowrie–Edwards 2008 semi-analytic grey radiative shocks [6,7], and a grey FLD run with the flux limiter off — a constant Eddington factor 1/3 — integrated as an ODE reference (“FLD-CED”).</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section aria-labelledby="cross-code">
+      <h2 id="cross-code">HELIOS 1D cross-code benchmark</h2>
+      <p>For LTE (local-thermodynamic-equilibrium) comparison with HELIOS — a commercial 1D Lagrangian radiation-hydrodynamics code from Prism Computational Sciences — matched-irradiation cases, rather than merely equal nominal laser power, were established as the meaningful basis: a ≈113 µm Gaussian spot delivered by a nearly collimated f/191 beam, with LTE table opacities on both sides. Across those matched cases, measured absorbed fractions were about 45% in TENRYU and about 55–73% in HELIOS, with attribution work recorded for the difference. These numbers are deliberately not comparable with the <a href="#gxii">golden deck's</a> 83–84% absorption: the golden's twelve f/3 beams with 200 µm super-Gaussian spots overfill the 250 µm-radius target, a much broader drive geometry (<a href="../use/examples.html#absorption-numbers">the Examples page</a> collects the three absorption figures and their conditions). This comparison alone does not establish that either implementation is correct or validated against experiment.</p>
+    </section>
+
+    <section aria-labelledby="how-to-run">
+      <h2 id="how-to-run">How to run</h2>
+      <p>CTest selects registered gates from the build tree by pattern; <code>tenryu verify</code> invokes one verification driver directly.</p>
+      <pre><code>ctest --test-dir build -R &lt;pattern&gt;
+./build/tenryu verify &lt;name&gt;
+
+# Examples
+ctest --test-dir build -R "sedov|noh|snb|gxii_1d_fld"
+./build/tenryu verify snb_dispersion_1d</code></pre>
+      <p>Use <code>ctest --test-dir build -N</code> to list available names. Select long batteries explicitly with <code>-L expensive</code>, or omit them from a routine pass with <code>-LE expensive</code>. Gates depend on build options and, in some cases, HDF5, MPI, and a usable GPU. Do not interpret a skip as a pass; retain the CTest labels and execution log with the result.</p>
+    </section>
+
+    <section aria-labelledby="references">
+      <h2 id="references">References</h2>
+      <ol class="references">
+        <li>L. I. Sedov, <i>Similarity and Dimensional Methods in Mechanics</i> (Academic Press, New York, 1959).</li>
+        <li>W. F. Noh, "Errors for Calculations of Strong Shocks Using an Artificial Viscosity and an Artificial Heat Flux," J. Comput. Phys. 72, 78–120 (1987). <a href="https://doi.org/10.1016/0021-9991(87)90074-X">doi:10.1016/0021-9991(87)90074-X</a></li>
+        <li>J. H. Hammer and M. D. Rosen, "A Consistent Approach to Solving the Radiation Diffusion Equation," Phys. Plasmas 10, 1829–1845 (2003). <a href="https://doi.org/10.1063/1.1564599">doi:10.1063/1.1564599</a></li>
+        <li>E. M. Epperlein and R. W. Short, "A Practical Nonlocal Model for Electron Heat Transport in Laser Plasmas," Phys. Fluids B 3, 3092–3098 (1991). <a href="https://doi.org/10.1063/1.859789">doi:10.1063/1.859789</a></li>
+        <li>A. Marocchino, M. Tzoufras, S. Atzeni, et al., "Comparison for Non-Local Hydrodynamic Thermal Conduction Models," Phys. Plasmas 20, 022702 (2013). <a href="https://doi.org/10.1063/1.4789878">doi:10.1063/1.4789878</a></li>
+        <li>R. B. Lowrie and R. M. Rauenzahn, "Radiative Shock Solutions in the Equilibrium Diffusion Limit," Shock Waves 16, 445–453 (2007). <a href="https://doi.org/10.1007/s00193-007-0081-2">doi:10.1007/s00193-007-0081-2</a></li>
+        <li>R. B. Lowrie and J. D. Edwards, "Radiative Shock Solutions with Grey Nonequilibrium Diffusion," Shock Waves 18, 129–143 (2008). <a href="https://doi.org/10.1007/s00193-008-0143-0">doi:10.1007/s00193-008-0143-0</a></li>
+      </ol>
+    </section>
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["\\[", "\\]"]] } };</script>
+  <script defer src="../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../nav.js" data-page="verification" data-root="../"></script>
+</body>
+</html>

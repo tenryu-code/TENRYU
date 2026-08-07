@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en" data-lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Radiation transport — TENRYU Documentation</title>
+  <link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>Radiation transport</h1>
+    <p class="abstract">TENRYU solves multigroup radiative transfer coupled to electron matter with two production deterministic solvers, selected by <code>Radiation.mode</code>: multigroup flux-limited diffusion (<code>"multigroup_diffusion"</code>) and discrete-ordinates \(S_N\) transport (<code>"sn_transport"</code>). Both operate in 1D — all three <code>Mesh.geometry_1d</code> measures: spherical, cylindrical, and planar — and in 2D axisymmetric RZ geometry, and share the group structure and material closure; they differ in how angle is treated and how matter coupling is closed. This page explains each model, compares them, and points to the detailed model pages below.</p>
+    <div class="card-grid">
+      <a class="card" href="fld.html"><h3>Multigroup FLD</h3><p>Flux-limited diffusion with Fleck-linearized matter coupling.</p></a>
+      <a class="card" href="sn.html"><h3>S<sub>N</sub> transport</h3><p>Discrete-ordinates transport with sweeps and iterative matter closure.</p></a>
+    </div>
+
+    <section aria-labelledby="models">
+      <h2 id="models">The two models</h2>
+      <p><strong>Multigroup FLD.</strong> Multigroup flux-limited diffusion partitions photon energy into groups and couples the "stiff" emission and absorption — whose timescales are far shorter than the time step — implicitly to electron matter through Fleck linearization. It forms conservative finite-volume systems: a 1D batched tridiagonal system or a 2D RZ five-point CSR system with CG-family solvers. It recovers diffusion in optically thick regions while the Levermore–Pomraning flux limiter bounds transport in thin regions.</p>
+      <p><strong>\(S_N\) transport.</strong> Discrete-ordinates transport follows finite directions in every photon-energy group and forms cell energies and face fluxes from directional intensities. Wavefront sweeps use source iteration and Picard matter coupling. The angular representation retains free streaming, shadows, and anisotropy that a diffusion closure cannot represent.</p>
+    </section>
+
+    <section aria-labelledby="comparison">
+      <h2 id="comparison">Comparing and choosing a solver</h2>
+      <table class="quick-facts">
+        <thead>
+          <tr><th>Aspect</th><th>Multigroup FLD</th><th>\(S_N\) transport</th></tr>
+        </thead>
+        <tbody>
+          <tr><th>Angular treatment</th><td>Scalar energy + limited diffusive flux; angle closed by the flux limiter.</td><td>Discrete ordinates \(\{\boldsymbol\mu_m,w_m\}\); Gauss–Legendre in 1D (\(S_{16}\) production default), product level-symmetric in 2D RZ.</td></tr>
+          <tr><th>Valid regime</th><td>Optically thick, nearly isotropic radiation fields.</td><td>Adds optically thin streaming, directional illumination, shadows, and ray effects.</td></tr>
+          <tr><th>Matter coupling</th><td>Fleck linearization + outer iteration with cell-local Newton matter update.</td><td>No Fleck effective scattering (\(f=1\), raw \(\sigma^{PA}\)/\(\sigma^{PE}\)); source iteration + Picard outer with active-set Newton closure.</td></tr>
+          <tr><th>Cost and solvers</th><td>One diffusion solve per group: 1D batched tridiagonal, 2D RZ five-point CSR with Jacobi-PCG/GMG.</td><td>Work ≈ cells × groups × ordinates × iterations; angular and face workspaces.</td></tr>
+          <tr><th>Geometry</th><td>1D (spherical, cylindrical, planar) and 2D RZ.</td><td>1D (spherical/planar Gauss–Legendre; cylindrical uses a product quadrature with \(n=2L^2\) ordinates) and 2D RZ.</td></tr>
+          <tr><th>When in doubt</th><td>The production default for radiative implosions (the <a href="../../verification/index.html#gxii">GXII</a> golden regression).</td><td>Check quantities of interest on an S<sub>8</sub>/S<sub>16</sub>/S<sub>32</sub> ladder.</td></tr>
+        </tbody>
+      </table>
+      <p>Choose \(S_N\) when a transparent gap, free-streaming front, directional illumination, shadow, or ray effect makes the angular distribution part of the answer. FLD closes angle into scalar energy and limited diffusive flux and is generally cheaper in optically thick, nearly isotropic regions. Lower ordinate order costs less but increases angular truncation and ray effects.</p>
+    </section>
+
+    <section aria-labelledby="shared">
+      <h2 id="shared">What the solvers share</h2>
+      <ul>
+        <li>Shared photon-energy group bounds, Planck fractions \(b_g(T)\), and electron-EOS primitives.</li>
+        <li>The same boundary-condition family (reflecting, vacuum, Marshak), with face types nested under each mode's own block.</li>
+        <li>The void-cell contract excludes <code>VOID</code> cells from matter exchange.</li>
+        <li>Boundary/matter energy ledgers that close to machine precision.</li>
+        <li>Internal units cgs + eV.</li>
+      </ul>
+    </section>
+
+    <section aria-labelledby="controls">
+      <h2 id="controls">Shared namelist keys</h2>
+      <p>See the <a href="../../use/namelist.html">namelist reference</a> for the full schema and combination rules.</p>
+      <table class="quick-facts">
+        <thead>
+          <tr><th>Key</th><th>Default / example</th><th>Purpose</th></tr>
+        </thead>
+        <tbody>
+          <tr><th><code>Radiation.enabled</code></th><td><code>True</code></td><td>Enable the radiation operator.</td></tr>
+          <tr><th><code>Radiation.mode</code></th><td><code>"multigroup_diffusion"</code></td><td>Select <a href="fld.html">multigroup FLD</a> or <code>"sn_transport"</code> → <a href="sn.html">\(S_N\)</a>.</td></tr>
+          <tr><th><code>Radiation.groups</code></th><td><code>1</code></td><td>Number \(G\) of photon-energy groups, shared by both solvers.</td></tr>
+          <tr><th><code>Radiation.group_bounds_eV</code></th><td><code>[]</code> or <code>"log_uniform"</code></td><td>\(G+1\) group boundaries in eV or logarithmic generator.</td></tr>
+          <tr><th><code>Radiation.compute_T_range_eV</code></th><td><code>[]</code></td><td>Temperature range used to generate <code>"log_uniform"</code> groups.</td></tr>
+        </tbody>
+      </table>
+      <p>FLD face types live under <code>Radiation.multigroup_diffusion.boundary</code>, and \(S_N\) face types live under <code>Radiation.sn_transport.boundary</code>. Face types never belong under top-level <code>Radiation.boundary</code>; only the Marshak <code>marshak_Tr_eV</code>/<code>marshak_Tr</code> channels do.</p>
+    </section>
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["\\[", "\\]"]] } };</script>
+  <script defer src="../../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../../nav.js" data-page="radiation" data-root="../../"></script>
+</body>
+</html>

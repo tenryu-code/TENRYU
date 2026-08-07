@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="en" data-lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Time-step control &amp; CFL — TENRYU Documentation</title>
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>Time-step control &amp; CFL <span class="badge">reference</span></h1>
+    <p class="abstract">All TENRYU kernels share one global time step \(\Delta t\). Every step, each kernel proposes a cap — "no further than this" — from its own stability or accuracy condition, and the driver takes the minimum. CFL-type constraints therefore differ kernel by kernel, and which kernel is limiting changes from step to step. This page collects the full decision rule and every per-kernel \(\Delta t\) formula in one place (the canonical source for the equations is <code>docs/NUMERICS.md</code> §2.2 in the repository).</p>
+
+    <aside class="planned" aria-labelledby="at-a-glance">
+      <h3 id="at-a-glance">At a glance</h3>
+      <ul>
+        <li>The global rule is \(\Delta t=\min(\Delta t_{hydro},\Delta t_{cond},\Delta t_{rad},\Delta t_{burn},\Delta t_{hot\,e},\Delta t_{visc},\ldots)\), further capped by the growth limit, <code>dt.max_s</code>, landing on output times, and the remaining time. The name of the winning constraint (<code>hydro</code>/<code>conduction</code>/<code>radiation</code>…) is recorded as the limiter in the log and diagnostics.</li>
+        <li>Hydro is the acoustic CFL (\(C_{CFL}=0.3\)). Conduction proposes the STS-relaxed value — \(s_{max}(s_{max}+1)/2\) times the explicit limit, a factor 820 at the default \(s_{max}=40\) — and drops out entirely (\(\infty\)) with the implicit solvers. Radiation derives its cap from the Fleck-factor floor \(f_{min}=0.01\).</li>
+        <li>Laser and CBET have no independent \(\Delta t\). Burn and hot electrons are trailing limits: the power deposited in one step caps the next step.</li>
+        <li>Under MPI, rank-local minima are combined into the shared \(\Delta t\) by a single <code>MPI_Allreduce(MPI_MIN)</code>.</li>
+      </ul>
+    </aside>
+
+    <section aria-labelledby="global-rule">
+      <h2 id="global-rule">The decision rule</h2>
+      <p>Choosing the step is a single gather-and-minimize. First the kernels' caps are combined,</p>
+      $$
+      \Delta t_{phys}=\min\bigl(\Delta t_{hydro},\;\Delta t_{cond},\;\Delta t_{rad},\;
+      \Delta t_{burn},\;\Delta t_{hot\,e},\;\Delta t_{visc}\bigr)
+      $$
+      <p>and then the physics-independent operational caps are applied on top:</p>
+      $$
+      \Delta t=\min\bigl(\Delta t_{phys},\;
+      g_{dt}\,\Delta t^{n},\;
+      \texttt{dt.max\_s},\;
+      \Delta t_{output},\;
+      t_{end}-t\bigr),\qquad g_{dt}=1.2\;(\text{default})
+      $$
+      <p>The pieces mean the following.</p>
+      <ul>
+        <li><strong>Growth limit \(g_{dt}\):</strong> caps sudden expansion relative to the previous step (<code>Numerics.dt.growth_factor</code>, default 1.2). Even when the physics caps loosen, \(\Delta t\) grows by at most 20% per step. This is also what absorbs, in practice, the one-step coefficient lag described under radiation below.</li>
+        <li><strong>Ceiling and floor:</strong> <code>dt.max_s</code> is the user ceiling. If \(\Delta t\) falls below the floor <code>dt.min_s</code> (default \(10^{-20}\) s), the run stops FATAL to prevent silent stalling.</li>
+        <li><strong>Initial value:</strong> <code>dt.initial_s</code> is used only on step 0 (there is no previous step, so the growth limit cannot apply). From step 1 it is ignored; a restart inherits the \(\Delta t\) stored in the checkpoint.</li>
+        <li><strong>Landing on outputs and the end time:</strong> with seconds-based output cadences active, \(\Delta t_{output}\) keeps the step from jumping past the next scheduled output time (<a href="#output-landing">below</a>); the remaining time \(t_{end}-t\) works the same way.</li>
+        <li><strong>Retry:</strong> in configurations with full-step retry, a rejected hydro corrector restores the entry snapshot and reruns the whole split sequence at half the step (see <a href="numerics-foundations.html">Numerical foundations</a>); the limiter is then recorded as <code>driver_retry</code>.</li>
+      </ul>
+      <p>Which candidate the adopted \(\Delta t\) matched — <code>hydro</code>, <code>conduction</code>, <code>burn</code>, <code>hot_electron</code>, <code>braginskii</code>, <code>radiation</code>, <code>growth</code>, <code>output</code>, <code>t_end</code>, <code>max</code>, <code>init</code>, <code>driver_retry</code> — appears in the log as the limiter name. When "\(\Delta t\) keeps shrinking", the first move is always to read this name and identify the limiting kernel (<a href="#observing">see below</a>).</p>
+      <p>Under MPI, each CFL's \(\min_c\) runs over rank-local cells and one <code>MPI_Allreduce(MPI_MIN)</code> makes the global step. Time and the scheduled output times are identical on every rank, so \(\Delta t_{output}\) needs no extra communication.</p>
+    </section>
+
+    <section aria-labelledby="per-kernel">
+      <h2 id="per-kernel">Per-kernel caps</h2>
+      <p>The derivation and context of each row lives on its kernel page; this table lists what limits, with which formula and defaults.</p>
+      <table class="quick-facts">
+        <thead>
+          <tr><th>Kernel</th><th>Proposed cap</th><th>Key defaults</th><th>Notes</th></tr>
+        </thead>
+        <tbody>
+          <tr><th><a href="../physics/hydrodynamics.html">Hydro</a></th><td>\(C_{CFL}\min_c[\Delta l_c/(|\mathbf u_c|+c_{s,c})]\)</td><td><code>cfl_hydro</code> = 0.3</td><td>Acoustic CFL. \(\Delta l_c\) is the cell width in 1D and \(\sqrt{A_c}\) in 2D. <a href="#hydro-guards">Guard family below</a>.</td></tr>
+          <tr><th><a href="../physics/conduction.html">Electron conduction</a></th><td>STS: \(\dfrac{s_{max}(s_{max}+1)}{2}\Delta t_{exp}\)<br>implicit/Hypre: \(\infty\)</td><td>\(C_{cond}\) = 0.25, <code>sts_max_stages</code> = 40</td><td>\(\Delta t_{exp}=C_{cond}\min_c[(\Delta l_c)^2/D_{eff,c}]\). The default relaxes the explicit limit by 820×.</td></tr>
+          <tr><th><a href="../physics/radiation/index.html">Radiation</a></th><td>\(\min_c\!\left[\dfrac{1-f_{min}}{f_{min}}\cdot\dfrac{1}{\alpha c\,\beta_c\sigma_{P,c}}\right]\)</td><td><code>f_min_fleck</code> = 0.01</td><td>Keeps the Fleck factor above \(f_{min}\). Evaluated whenever radiation is enabled with an absorbing material.</td></tr>
+          <tr><th><a href="../physics/viscosity.html">Braginskii viscosity</a></th><td>\(\texttt{dt\_safety}\cdot\dfrac{\rho\,\Delta l^2}{(8/3)\,\eta_{\rm eff}}\)</td><td><code>dt_safety</code> = 0.3</td><td>Explicit momentum-diffusion stability limit; only when viscosity is enabled.</td></tr>
+          <tr><th><a href="../physics/burn.html">Nuclear burn</a></th><td>min of \(0.9\,\Delta t\,M_{max}/M_{req}\) and \(f_E\,e_{cell}/P_{dep}\)</td><td><code>explicit_source_limit</code> = 0.2</td><td>Trailing limit computed by the previous step's burn stage; bounds both subcycle pressure and self-heating.</td></tr>
+          <tr><th><a href="../physics/hot-electrons.html">Hot electrons</a></th><td>\(f_E\min_{P_i>0}(m_ie_{e,i}/P_i)\)</td><td><code>explicit_source_limit</code> = 0.2</td><td>Trailing limit from the previous step's deposited power.</td></tr>
+          <tr><th><a href="../physics/laser.html">Laser</a></th><td>none</td><td>—</td><td>Absorption is handled inside the hydro step, so no independent constraint (NUMERICS §2.2 (d)).</td></tr>
+          <tr><th><a href="../physics/cbet.html">CBET</a></th><td>none</td><td>—</td><td>Solved inside the laser call; no independent constraint.</td></tr>
+          <tr><th><a href="../physics/conduction.html#snb">SNB</a></th><td>none</td><td>—</td><td>The converged iSNB Picard coupling is unconditionally stable at any \(\Delta t\) (see the conduction page).</td></tr>
+          <tr><th><a href="../physics/mesh/ale-remap.html">ALE</a></th><td>no direct cap</td><td>—</td><td>Trigger-driven; it affects \(\Delta t\) only indirectly through the hydro-side guards (axis margin, mesh quality).</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section aria-labelledby="hydro-guards">
+      <h2 id="hydro-guards">The hydro CFL and its guard family</h2>
+      <p>The base form is the acoustic CFL: information — sound waves and material motion — must not skip a cell in one step.</p>
+      $$
+      \Delta t_{hydro}=C_{CFL}\cdot\min_c\!\left(\frac{\Delta l_c}{|\mathbf u_c|+c_{s,c}}\right),
+      \qquad C_{CFL}=0.3\;(\text{default})
+      $$
+      <p>\(\Delta l_c\) is the cell length scale: the cell width \(\Delta r_i\) in 1D, the square root of the meridian-plane cell area \(\sqrt{A_c}\) in 2D. The minimum runs over hydro-active cells only; \(c_s=0\) cells (unheated fill regions) count as \(\Delta t_{hydro}\to\infty\) and leave the limiting to other cells. If every cell is inactive, hydro drops out of the ladder.</p>
+      <p>Depending on the configuration, the following guards join the base form. All of them act only to shrink \(\Delta t\) (or to force a rezone).</p>
+      <ul>
+        <li><strong>Post-shock heat (1D, opt-in):</strong> with <code>post_shock_heat=True</code>, an explicit constraint \(\Delta t_{ps}\) on the post-shock heat flux is evaluated and \(\Delta t_{hydro}=\min(\Delta t_{acoustic+AV},\Delta t_{ps})\).</li>
+        <li><strong>Axis margin (2D, opt-in):</strong> with <code>axis_margin_dt_floor_fraction&gt;0</code>, a shrink-side constraint derived from the near-axis margin joins \(\Delta t_{hydro}\). The default 0.0 disables it, bitwise identical to the ordinary hydro \(\Delta t\).</li>
+        <li><strong>Volume-rate CFL (2D, opt-in):</strong> with <code>volume_rate_cfl_enabled=True</code>, the relative volume-change rate \(r_{V,c}=f_{V,c}/\Delta t_{used}\) measured over the previous hydro step caps the next step at \(\min_c(f_{V,max}/r_{V,c})\). It is a one-step-late safety net for source-driven volume changes that the standard \(|v|/\Delta x\) CFL can underestimate; after an accepted ALE the baseline volume is reset so ALE displacement is not mistaken for flow.</li>
+        <li><strong>Trial-volume floor (2D, opt-in, diagnostic-only):</strong> with <code>trial_volume_cfl_enabled=True</code>, the trial volumes the corrector is about to commit are checked against \(V_c^{trial}\ge f_{trial}V_c^n\); a violation warns with a suggested retry step \(f_{shrink}\Delta t\) but does not rerun the step.</li>
+        <li><strong>Corner-Jacobian ALE trigger (2D, opt-in):</strong> with <code>corner_jacobian_ale_trigger_enabled=True</code>, bisection along the trial trajectory \(\mathbf x^n+\tau\mathbf v^n\) finds when a signed corner Jacobian would cross its floor \(\epsilon_JJ^n_{c,k}\); if the admissible fraction of \(\Delta t_*\) is below a threshold, an ALE rezone is forced before the split operators run. It does not clamp \(\Delta t\) directly.</li>
+        <li><strong>Retry-time static mesh repair (2D, opt-in):</strong> with <code>driver_retry_active_mesh_repair_enabled=True</code>, each retry attempt checks the corner-Jacobian balance \(q_{bal,c}=\min_kJ_{c,k}/\max_kJ_{c,k}\) and forces a rezone before retrying when inadmissible.</li>
+      </ul>
+      <p>In addition, the mesh-quality guards (minimum altitude, corner Jacobians) can predictively limit the step, as described on <a href="../physics/mesh/index.html">Meshes &amp; geometry</a>. Observationally, the hydro components (acoustic, axis margin, volume rate, post-shock) can be recorded separately by the <a href="#observing">dt-breakdown diagnostics below</a>.</p>
+    </section>
+
+    <section aria-labelledby="conduction-dt">
+      <h2 id="conduction-dt">Conduction: STS relaxation and the implicit solvers</h2>
+      <p>The raw explicit-diffusion stability limit is</p>
+      $$
+      \Delta t_{exp}=C_{cond}\cdot\min_c\!\left(\frac{(\Delta l_c)^2}{D_{eff,c}}\right),
+      \qquad C_{cond}=0.25\;(\text{default})
+      $$
+      <p>but the default STS solver (<code>conduction.solver="sts"</code>) does not impose it on the global \(\Delta t\). STS widens the stability region to \(O(s^2)\) with an \(s\)-stage Chebyshev ladder, so the cap proposed to the driver is relaxed up to the stage ceiling \(s_{max}\) (<code>sts_max_stages</code>, default 40):</p>
+      $$
+      \Delta t_{cond}=\frac{s_{max}(s_{max}+1)}{2}\,\Delta t_{exp}
+      $$
+      <p>— a factor \(40\times41/2=820\) at the defaults, which removes conduction from the limiting set in most configurations. The shape avoids a design contradiction: if \(\Delta t_{exp}\) itself entered the global min, then \(N_{sub}=\lceil\Delta t/\Delta t_{exp}\rceil=1\) would always hold and subcycling would be effectively disabled. The implicit solvers (1D <code>"implicit"</code>, 2D <code>"hypre"</code>) are backward Euler and unconditionally stable, so \(\Delta t_{cond}=\infty\): conduction never limits the global step.</p>
+    </section>
+
+    <section aria-labelledby="radiation-dt">
+      <h2 id="radiation-dt">Radiation: a cap derived from the Fleck-factor floor</h2>
+      <p>Radiation–matter coupling is characterized by the implicitness of the Fleck linearization (see the <a href="../physics/radiation/fld.html">FLD page</a>):</p>
+      $$
+      f_c=\frac{1}{1+\alpha\,c\,\beta_c\,\sigma_{P,c}\,\Delta t},\qquad
+      \beta_c=\frac{4a_{\rm eV}T_{e,c}^3}{C_{v,e,c}},\qquad
+      \sigma_{P,c}=\rho_c\kappa_{P,c}
+      $$
+      <p>The larger \(\Delta t\), the smaller \(f_c\) and the larger the fraction of within-step emission/reabsorption represented as effective scattering. To avoid extreme \(f_c\), the driver proposes the cap equivalent to enforcing a floor \(f_{min}\) (<code>Numerics.dt.f_min_fleck</code>, default 0.01):</p>
+      $$
+      \Delta t_{rad}=\min_c\!\left(\frac{1-f_{min}}{f_{min}}\cdot
+      \frac{1}{\alpha\,c\,\beta_c\,\sigma_{P,c}}\right)
+      $$
+      <p>It is evaluated whenever radiation is enabled with absorbing material (constant \(\kappa_a&gt;0\) or a table opacity). Note that \(\sigma_{P,c}\) was computed at the head of the radiation operator; the hydro half-step afterwards changes \(T_e\), so the value is one step stale by the time \(\Delta t_{rad}\) is evaluated. The growth limit (\(g_{dt}=1.2\)) absorbs this in practice, and a large \(T_e\) change automatically shrinks the next step's \(\Delta t_{rad}\), making the lag self-correcting.</p>
+    </section>
+
+    <section aria-labelledby="source-dt">
+      <h2 id="source-dt">Explicit-source trailing limits: burn, hot electrons, viscosity</h2>
+      <p>Burn and hot electrons cap the <em>next</em> step based on the power they deposited in the current one. These are limits on explicit sources that never re-update the temperature mid-stage, keeping one step's self-heating small relative to the stored internal energy; both use <code>explicit_source_limit</code> (default 0.2, a same-named key in each block).</p>
+      <ul>
+        <li><strong>Burn:</strong> \(\Delta t\le f_E\,e_{cell}/P_{dep}\) with \(e_{cell}=\rho_cV_c(e_e+e_i)\) the total cell internal energy, plus \(0.9\,\Delta t\,M_{max}/M_{req}\) when the subcycle count pinned at its cap (<a href="../physics/burn.html">burn page</a>).</li>
+        <li><strong>Hot electrons:</strong> \(\Delta t\le f_E\min_{P_i&gt;0}(m_ie_{e,i}/P_i)\); the reservoir is the electron energy only, unlike burn's electron+ion (<a href="../physics/hot-electrons.html">hot-electron page</a>).</li>
+        <li><strong>Braginskii viscosity:</strong> not trailing — evaluated in place at the head of the step as the explicit diffusion limit \(\Delta t_{visc}\le\texttt{dt\_safety}\cdot\rho\Delta l^2/[(8/3)\eta_{\rm eff}]\) (<a href="../physics/viscosity.html">viscosity page</a>).</li>
+      </ul>
+    </section>
+
+    <section aria-labelledby="output-landing">
+      <h2 id="output-landing">Landing on output times</h2>
+      <p>With any seconds-based cadence active (<code>plot_every_s</code>, <code>history_every_s</code>, <code>checkpoint_every_s</code> &gt; 0), the step is kept from crossing the next scheduled output time by including</p>
+      $$
+      \Delta t_{output}=\min\bigl(t_{next,plot}-t,\;t_{next,history}-t,\;t_{next,ckpt}-t\bigr)
+      $$
+      <p>in the candidates (only active series enter the min; all-inactive gives \(\infty\)). Output firing uses the floating-point tolerance \(\varepsilon=10^{-14}\times\max(|t|,X\_every\_s)\), firing at \(t\ge t_{next}-\varepsilon\). After firing, a while loop advances \(t_{next}\) in \(X\_every\_s\) increments, so even extreme settings (\(\Delta t\) larger than the cadence) never lose a scheduled time. Initialization is \(t_{start}+X\_every\_s\); a restart restores the schedule from the checkpoint's <code>output_state/</code>. Because \(\Delta t_{output}\) only ever shrinks the step, it cannot harm stability.</p>
+    </section>
+
+    <section aria-labelledby="stall">
+      <h2 id="stall">Floors and stall detection</h2>
+      <p>\(\Delta t&lt;\texttt{dt.min\_s}\) (default \(10^{-20}\) s) is a FATAL stop — the run must not keep taking vanishing steps that look alive but make no progress. The opt-in stall detector <code>Numerics.dt.floor_stall_max_consecutive_steps=N</code> (default 0 = disabled) additionally counts committed steps that satisfy all of: (i) \(\Delta t\) within a factor \(1+10^{-6}\) of the floor, (ii) remaining time exceeding \(10^3\) floors, (iii) limiter not <code>output</code>/<code>t_end</code>; exceeding \(N\) consecutive such steps stops FATAL with diagnostics (floor, current \(\Delta t\), remaining time, limiter, and how to disable).</p>
+    </section>
+
+    <section aria-labelledby="observing">
+      <h2 id="observing">Observing which constraint won</h2>
+      <ul>
+        <li><strong>History <code>/dt</code>:</strong> the adopted \(\Delta t\) series is always recorded in <code>&lt;case&gt;_history.h5</code> (<a href="../use/outputs.html">Outputs &amp; analysis</a>).</li>
+        <li><strong>Limiter names in the log:</strong> each step's \(\Delta t\) and the winning constraint's name appear in the run log. Look here first.</li>
+        <li><strong>dt-breakdown diagnostics (opt-in):</strong> <code>Numerics.diagnostics.dt_breakdown_history_enabled=True</code> creates <code>diagnostics/dt_breakdown_history/</code> in the history every step, recording <code>dt_chosen</code>, <code>dt_hydro</code>, <code>dt_rad</code>, <code>dt_cond</code>, <code>dt_post_shock</code>, <code>dt_growth</code>, <code>dt_max</code>, <code>dt_output</code>, <code>dt_remaining</code>, the hydro components (acoustic, axis margin, volume rate), and the winner name <code>dt_winner</code>; <code>diagnostics/cfl_winner/</code> additionally records the acoustic-CFL winner cell (position, \(\Delta l\), \(c_s\), \(\rho\)).</li>
+      </ul>
+      <p>Typical readings: limiter <code>hydro</code> with <code>cfl_winner</code> pinned to one cell points at that cell's zoning (collapsed or tiny cells) or its sound speed (overheating, floors); <code>conduction</code> points at the coronal \(D_{eff}\) blow-up (the κ∝\(T^{5/2}\) of the <a href="../physics/conduction.html">conduction page</a>); <code>radiation</code> at stiff high-β coupling cells; a run that only ever shows <code>growth</code> is simply still ramping up.</p>
+    </section>
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["$$", "$$"], ["\\[", "\\]"]] } };</script>
+  <script defer src="../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../nav.js" data-page="timestep" data-root="../"></script>
+</body>
+</html>

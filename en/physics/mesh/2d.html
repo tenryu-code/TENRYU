@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en" data-lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>2D RZ meshes: structured &amp; multiblock — TENRYU Documentation</title>
+  <link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>2D RZ meshes: structured &amp; multiblock <span class="badge">reference</span></h1>
+    <p class="abstract">The 2D path maps structured rectangular, spherical-polar, polar-in-box, and CSR-connected multiblock families onto one axisymmetric RZ geometry contract.</p>
+
+    <section aria-labelledby="mechanism">
+      <h2 id="mechanism">Physical mechanism</h2>
+      <p>Every 2D family—rectangular, polar, polar-in-box, shell/collar multiblock, and pentagon belt—must deliver the same objects to the physics: revolved RZ cell volumes, exact corner geometry, and consistent node, cell, and face topology. Physics kernels do not know which builder produced the mesh. That is the meaning of one RZ geometry contract, and it allows a problem to select a family without changing those kernels.</p>
+      <p>The families solve different geometric problems. Rectangular RZ is the robust default; polar coordinates follow spherical convergence, and equal-solid-angle zoning equidistributes mass flux per ring. Polar-in-box reconciles a spherical target with a rectangular outer boundary, while multiblock shell/collar assemblies fit target hardware. Near a polar center, a pentagon belt absorbs a change in angular count into topology: five-sided transition cells replace degenerate <code>TWO_TO_ONE</code> junctions along a nested 2:1 ladder, solving a problem that smoothing alone cannot.</p>
+      <p>Mesh quality is an admissibility condition, not an aesthetic score. Minimum altitude and the corner Jacobian are invariants required by the volume, force, and remap operators. The guards therefore predictively limit the timestep and may reject a candidate state. A builder likewise fails loudly instead of returning a mesh whose orientation or positive-volume contract cannot be honored.</p>
+      <ul>
+        <li><strong>Connectivity:</strong> single-block structured cells use implicit four-corner indexing. Multiblock families use CSR cell-to-node, reverse node-to-cell, and face-adjacency structures, with one owner-written shared node ID at each seam.</li>
+        <li><strong>Corner capacity:</strong> ordinary quadrilateral layouts use <code>corner_stride=4</code>; the pentagon-belt scheme uses <code>corner_stride=8</code> and <code>cell_nverts</code> identifies the active slots.</li>
+        <li><strong>Polar truncation:</strong> positive <code>polar_theta_min</code> makes the cut ray a mirror boundary while the opposite edge is snapped exactly to the \(R=0\) axis.</li>
+        <li><strong>Equal-\(\mu\) zoning:</strong> <code>polar_equal_mu_zoning</code> spaces angular nodes uniformly in \(\mu=\cos\theta\), giving equal solid angle rather than equal \(\theta\).</li>
+      </ul>
+    </section>
+
+    <section aria-labelledby="two-d-layout">
+      <h2 id="two-d-layout">Structured 2D RZ layout</h2>
+      <p>The default 2D setting, <code>logical_mesh_2d="rectangular_rz"</code>, is a row-major structured grid with \(N_rN_z\) quadrilateral cells and \((N_r+1)(N_z+1)\) nodes. Cell \((i,j)\) is bounded by nodes \((i,j),(i+1,j),(i+1,j+1),(i,j+1)\); thermodynamic quantities live in cells, while positions and velocities live at nodes. Each meridional quadrilateral is evaluated as a revolved RZ volume, not merely as a planar area. Lagrangian motion or ALE rezoning can move the physical coordinates without changing the single-block logical \((i,j)\) connectivity.</p>
+    </section>
+
+    <section aria-labelledby="mesh-families">
+      <h2 id="mesh-families">Polar and multiblock families</h2>
+      <p>A structured polar mesh maps \((s,\theta)\) to \((R,Z)=(s\sin\theta,s\cos\theta)\) over the half-plane and supports uniform \(\theta\), segment-defined zoning, or equal-solid-angle nodes through <code>polar_equal_mu_zoning</code>. With <code>polar_theta_min&gt;0</code>, a tri-fan mesh is truncated to \([\theta_{\min},\pi]\); the cut ray is a mirror boundary and the opposite edge remains exactly on the \(R=0\) axis. Polar-in-box smoothly morphs an inner polar prefix to a rectangular boundary and closes it with box-aligned collar rings. Body-fitted shell/collar assemblies combine shells, near-wall strips, and gas fills as watertight blocks. Where the angular count changes toward the center, the pentagon-belt topology replaces a generic <code>TWO_TO_ONE</code> junction with five-vertex transition cells and subsamples the fine \(\theta\) ladder in a nested 2:1 pattern. Structured meshes use implicit four-corner indexing; multiblock meshes instead store cell-to-node, reverse node-to-cell, and face adjacency in CSR, with one owner-written shared node ID at each seam. Every cell supplies its active <code>cell_nverts</code>; ordinary layouts use <code>corner_stride=4</code>, while the polygon capacity for a pentagon belt uses <code>corner_stride=8</code>. This is a topology overview—consult the namelist reference for each builder's staged physics scope and constraints.</p>
+
+      <figure>
+        <img src="../../../assets/mesh-2d-family-gallery.png" width="1000" height="310" style="max-width:100%;height:auto" alt="Schematics of rectangular RZ, structured polar, polar-in-box, and pentagon-belt two-dimensional meshes">
+        <figcaption>Figure A. Representative 2D mesh families. The first three panels show single-logical-block forms; the final panel shows a CSR topology joining coarse and fine angular rings with five-sided cells.</figcaption>
+      </figure>
+    </section>
+
+    <section aria-labelledby="pipeline">
+      <h2 id="pipeline">From namelist to accepted mesh</h2>
+      <ol>
+        <li><p><strong>Select and validate.</strong> Choose the mesh family, then validate its radial, axial, or angular segment counts and endpoints.</p></li>
+        <li><p><strong>Generate nodes.</strong> Build uniform, graded, or equal-\(\mu\) ladders as applicable, and snap required axis nodes exactly to \(R=0\).</p></li>
+        <li><p><strong>Assemble topology.</strong> Use implicit indexing for a structured block or CSR connectivity for multiblock cells, with explicit ownership of shared seam nodes.</p></li>
+        <li><p><strong>Check cells.</strong> Verify orientation and positive exact revolved RZ volume before the mesh can proceed.</p></li>
+        <li><p><strong>Cache corner geometry.</strong> Construct the corner area vectors \(\mathbf S\) and minimum-altitude data required by the compatible operators and quality tests.</p></li>
+        <li><p><strong>Hand off to hydro.</strong> Expose the common geometry/topology contract with the predictive minimum-altitude and corner-Jacobian guards armed.</p></li>
+      </ol>
+    </section>
+
+    <section aria-labelledby="controls">
+      <h2 id="controls">Selected keys</h2>
+      <p>These are the principal mesh and deck-side geometry entry points. See the <a href="../../use/namelist.html">namelist reference</a> for complete validation rules and staged scopes.</p>
+      <table class="quick-facts">
+        <thead>
+          <tr><th>Key</th><th>Scope</th><th>Purpose</th></tr>
+        </thead>
+        <tbody>
+          <tr><th><code>Mesh.nr</code>, <code>nz</code>, <code>logical_mesh_2d</code></th><td>2D</td><td>Logical resolution and selection of <code>rectangular_rz</code>, <code>spherical_polar_halfplane</code>, <code>polar_in_box</code>, or <code>cone_shell</code>.</td></tr>
+          <tr><th><code>Mesh.grid_r</code>, <code>grid_z</code>, <code>grid_theta</code></th><td>2D</td><td>Per-direction uniform/graded segments; polar θ segments can pin material or wall boundaries to faces.</td></tr>
+          <tr><th><code>Mesh.polar_equal_mu_zoning</code></th><td>2D polar</td><td>Generate equal-solid-angle nodes instead of uniform θ.</td></tr>
+          <tr><th><code>Mesh.polar_theta_min</code></th><td>2D polar</td><td>Default 0; a positive value truncates a tri-fan span to \([\theta_{\min},\pi]\).</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section aria-labelledby="verification">
+      <h2 id="verification">Verification</h2>
+      <ul>
+        <li><code>test_mesh_quality_dt_limiter</code> and the in-hydro guard tests cover minimum-altitude/corner-\(J\) floors, unconstrained expansion, candidate-inversion rejection, and determinism.</li>
+        <li><code>test_polar_truncated_span</code> fixes the \(\theta_{\min}\) start, mirror cut, positive volumes, analytic wedge volume, closed center fan, and bitwise determinism.</li>
+        <li><code>test_h02_axis_exact_snap</code> checks exact \(R=0\) pole rows for annular, tri-fan, and button centers, plus exact equator and north–south mirrors where required.</li>
+        <li>Multiblock topology tests check shared seam-node IDs, bilateral/reciprocal CSR face-adjacency twins, reverse connectivity, and pentagon-belt vertex counts, orientation, and nested 2:1 θ zoning.</li>
+      </ul>
+    </section>
+
+    <section aria-labelledby="references">
+      <h2 id="references">References</h2>
+      <ol class="references">
+        <li>P. M. Knupp, "Algebraic Mesh Quality Metrics," SIAM J. Sci. Comput. 23, 193–218 (2001). <a href="https://doi.org/10.1137/S1064827500371499">doi:10.1137/S1064827500371499</a> — background for the minimum-altitude and Jacobian quality measures used by the admissibility guards.</li>
+      </ol>
+    </section>
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["$$", "$$"], ["\\[", "\\]"]] } };</script>
+  <script defer src="../../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../../nav.js" data-page="mesh-2d" data-root="../../"></script>
+</body>
+</html>

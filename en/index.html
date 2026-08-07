@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en" data-lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TENRYU — TENRYU Documentation</title>
+  <link rel="stylesheet" href="../style.css">
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>TENRYU</h1>
+    <p class="tagline">A CUDA-native Lagrangian/ALE (arbitrary Lagrangian–Eulerian) radiation-hydrodynamics code for laser-driven high-energy-density (HED) and inertial-confinement-fusion (ICF) physics, in 1D spherical/cylindrical/planar and 2D axisymmetric (RZ) geometry.</p>
+    <p class="abstract">TENRYU couples compatible Lagrangian hydrodynamics with multigroup radiation transport (flux-limited diffusion and discrete-ordinates S<sub>N</sub>), nonlocal electron conduction, laser ray tracing with inverse-bremsstrahlung absorption, cross-beam energy transfer (CBET), hot-electron generation and transport, tabulated or analytic EOS/opacity, and nuclear burn. Everything runs on the GPU; the unit system is frozen to cgs + eV. A form-based GUI (TENRYU Studio) generates and round-trips input decks. This documentation describes TENRYU version 1 (v1), the current production generation; see <a href="overview/nomenclature.html">Nomenclature &amp; conventions</a> for the version vocabulary, abbreviations, and symbol table used throughout.</p>
+
+    <h2>Documentation</h2>
+    <div class="card-grid">
+      <a class="card" href="overview/index.html">
+        <h3>Overview</h3>
+        <p>Scope, architecture, numerical foundations, and verification philosophy.</p>
+      </a>
+      <a class="card" href="use/index.html">
+        <h3>Using TENRYU</h3>
+        <p>Build the code, prepare inputs, run simulations, and analyze outputs.</p>
+      </a>
+      <a class="card" href="physics/index.html">
+        <h3>Physics kernels</h3>
+        <p>Models, discretizations, controls, and verification for all 11 kernel pages — nine physics operators plus the mesh and MPI infrastructure they run on.</p>
+      </a>
+      <a class="card" href="verification/index.html">
+        <h3>Verification &amp; benchmarks</h3>
+        <p>Analytic gates, golden regressions, integrated tests, and benchmarks.</p>
+      </a>
+    </div>
+    <a class="card compact" href="develop/index.html">
+      <h3>Developer guide</h3>
+      <p>Contribution rules, test workflows, and reproducibility contracts.</p>
+    </a>
+    <a class="card compact" href="overview/nomenclature.html">
+      <h3>Nomenclature &amp; conventions</h3>
+      <p>Version vocabulary, abbreviations, external code names, and the symbol table.</p>
+    </a>
+
+    <h2>Quick facts</h2>
+    <table class="quick-facts">
+      <tbody>
+        <tr><th scope="row">Version</th><td>TENRYU v1 (this documentation's baseline; per-kernel model generations such as burn v2 are labeled on their pages)</td></tr>
+        <tr><th scope="row">Geometry</th><td><code>1D_SPH</code> (spherical, cylindrical, or planar via <code>Mesh.geometry_1d</code>); <code>2D_RZ</code> (axisymmetric RZ)</td></tr>
+        <tr><th scope="row">Mesh</th><td>Lagrangian and ALE; structured, polar, and multiblock</td></tr>
+        <tr><th scope="row">Compute</th><td>CUDA (<code>sm_80</code>+), with single- or multi-rank MPI</td></tr>
+        <tr><th scope="row">Units</th><td>cgs + eV (fixed)</td></tr>
+        <tr><th scope="row">Inputs</th><td>Python namelist decks</td></tr>
+        <tr><th scope="row">Outputs</th><td>HDF5 snapshots and history; Studio and Scope viewers</td></tr>
+      </tbody>
+    </table>
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["\\[", "\\]"]] } };</script>
+  <script defer src="../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../nav.js" data-page="home" data-root=""></script>
+</body>
+</html>

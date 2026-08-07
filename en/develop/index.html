@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en" data-lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Developer guide — TENRYU Documentation</title>
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>Developer guide <span class="badge">reference</span></h1>
+    <p class="abstract">A TENRYU contribution should make its physics, input contract, implementation, verification, and documentation one traceable change. The frozen cgs + eV unit system, strict namelist, verification gates, reproducibility rules, and prohibition on Python after initialization are public engineering contracts, not checks deferred until after performance or convenience work.</p>
+
+    <aside class="planned" aria-labelledby="at-a-glance">
+      <h3 id="at-a-glance">At a glance</h3>
+      <ul>
+        <li>The internal unit system is frozen to cgs + eV; do not replace it with SI or another internal representation.</li>
+        <li>Unknown namelist keys are errors, and every key must document its type, units, constraints, and default.</li>
+        <li>Update <code>NUMERICS.md</code> with equation or discretization changes and <code>SPECIFICATION.md</code> with new keys.</li>
+        <li>Deterministic 1D is bitwise, documented 2D exceptions use noise bands, and particle RNG streams remain independent by <code>global_id</code>.</li>
+      </ul>
+    </aside>
+
+    <section aria-labelledby="layout">
+      <h2 id="layout">Repository layout</h2>
+      <p>The principal implementation lives under <code>src/</code>: <code>core</code> owns state, configuration, and units; <code>mesh</code> geometry and topology; <code>hydro</code> Lagrangian hydrodynamics and ALE; <code>radiation</code> FLD and S<sub>N</sub>; <code>laser</code> ray tracing and deposition; <code>materials</code> EOS and opacity; <code>coupling</code> operator evolution; <code>diagnostics</code> histories and physics metrics; and <code>drivers</code> command entry points. <code>tests/</code> contains unit and integration tests, <code>examples/</code> user and verification decks, <code>docs/</code> design and numerical contracts, and <code>gui/</code> TENRYU Studio. Identify the owning module and affected tests, examples, and documents before editing.</p>
+    </section>
+
+    <section aria-labelledby="units-namelist">
+      <h2 id="units-namelist">Units and namelist contracts</h2>
+      <p>TENRYU's internal state and I/O use cgs + eV: cm for length, s for time, g for mass, erg for energy, g/cm³ for density, and eV for temperature. Do not convert internal state to SI or another unit system. A human-facing input may accept another unit only by converting explicitly at its boundary; kernel units, constants, and equation coefficients must remain unambiguous. Treat a unit-bearing change as one change across equations, parser, frozen configuration, I/O, and verification references.</p>
+      <p>The namelist schema is strict. Unknown blocks or keys, misspellings, wrong types, out-of-range values, and unsupported mode combinations must be input errors—not ignored values or warnings. Every new key requires a fully qualified name, type, units, valid range, cross-field constraints, and default. Behavior when a deck omits the key is also API, so defaults belong in the authoritative specification rather than only in implementation. If compatibility aliases are necessary, document precedence and reject conflicting forms instead of silently choosing one.</p>
+    </section>
+
+    <section aria-labelledby="documentation">
+      <h2 id="documentation">Change documentation with implementation</h2>
+      <p>The engineering contracts named on this page — <code>docs/NUMERICS.md</code>, <code>docs/ARCHITECTURE.md</code>, and <code>docs/SPECIFICATION.md</code> — are documents that live in the TENRYU repository beside the code, publicly readable with the source. Any change to an equation, physical coefficient, time integration, spatial discretization, boundary condition, or unit convention must update <code>docs/NUMERICS.md</code> in the same contribution. <code>NUMERICS.md</code> is the authoritative contract for equations and discretization, not commentary reconstructed later from code. Update <code>docs/ARCHITECTURE.md</code> as well when module ownership or data flow changes.</p>
+      <p>A new namelist key must update both the applicable schema in <code>docs/SPECIFICATION.md</code> §6.4 and the authoritative default list in §9.1. Update user pages and examples when behavior exposed there changes. Code, defaults, frozen representation, validation, and documentation must land together; omitting one leaves the public input contract unreproducible.</p>
+    </section>
+
+    <section aria-labelledby="verification">
+      <h2 id="verification">Verification and goldens</h2>
+      <p>Changes must not break the relevant gates under <code>examples/verification/</code>. In addition to local kernel tests, select the analytic case, conservation check, and coupled regression traversed by the changed operator. Do not erase a failure merely by widening a tolerance or moving an expected value. Determine whether its cause is a sign, unit, boundary, coefficient, discretization, or reference issue.</p>
+      <p>Golden updates require explicit justification: for example, a known bug fix, a reviewed physics or numerical-algorithm change, or an intentional baseline-parameter change. Record old-to-new differences, affected metrics, and any required convergence or independent reference. A failing current output is not itself a reason to rebaseline. New behavior outside existing gate coverage needs a new oracle or diagnostic.</p>
+    </section>
+
+    <section aria-labelledby="reproducibility">
+      <h2 id="reproducibility">Reproducibility contracts</h2>
+      <p>Deterministic one-dimensional production paths must produce bitwise-identical fields and principal diagnostics with the same binary, input, and GPU configuration. A physical tolerance in a regression does not permit drift between same-configuration replicas. Some 2D RZ paths can differ in least-significant bits because many threads contribute through <code>atomicAdd</code>. Handle such exceptions only through deck- and metric-specific documented noise bands; do not generalize them into broad tolerances.</p>
+      <p>For stochastic particle paths, each RNG stream is independently identified through particle <code>global_id</code>, seed, and step. Generation, duplication, migration, and restart changes must not collide ID ranges or make a particle's stream depend on parallel decomposition. RNG partitioning is a reproducibility contract spanning storage and MPI, not a local optimization detail.</p>
+    </section>
+
+    <section aria-labelledby="python-runtime">
+      <h2 id="python-runtime">Freeze Python inputs at initialization</h2>
+      <p>Python namelist callables are an input convenience for describing initial conditions and time waveforms. Evaluate them over their mesh or time domain during initialization, tabulate them, and transfer the result into the frozen configuration and C++/CUDA-owned data. Do not add Python calls to the time loop or GPU execution path. This boundary excludes runtime dependencies, the GIL, mutable external state, and rank-dependent evaluation from the simulation. A new callable input must define its evaluation domain, table resolution, hash, and frozen representation.</p>
+    </section>
+
+    <section aria-labelledby="pull-requests">
+      <h2 id="pull-requests">Pull-request scope</h2>
+      <p>One pull request should have one purpose. Mixing an unrelated bug fix, physics model, performance tuning, refactor, and schema migration makes numerical differences and verification evidence impossible to isolate. In particular, do not combine physics changes with performance work: establish the physical contract and baseline first, then submit optimization as a result-preserving change. State the purpose, changed contracts, impact, gates run, and untested configurations so reviewers can map every part of the diff to evidence.</p>
+    </section>
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["\\[", "\\]"]] } };</script>
+  <script defer src="../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../nav.js" data-page="develop" data-root="../"></script>
+</body>
+</html>

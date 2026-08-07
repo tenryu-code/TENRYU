@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="ja" data-lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>例題とプリセット — TENRYU ドキュメント</title>
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>例題とプリセット <span class="badge">reference</span></h1>
+    <p class="abstract">TENRYU Studio の 1 次元プリセットは、輻射熱波、レーザー直接照射、輻射温度による間接照射という 3 つの入口を提供する。ここに示す構成は、2026-07-31 に RTX 4090 上で終端まで実行し、代表的な物理指標を確認済みである。検証の各項目を再現するための独立したデッキ集は <code>examples/verification/</code> にある。</p>
+
+    <aside class="planned" aria-labelledby="at-a-glance">
+      <h3 id="at-a-glance">要点</h3>
+      <ul>
+        <li>3 つのプリセットは、スキーマの検証だけでなく、RTX 4090 上での完走と、出力の物理的な解釈まで確認済みである。</li>
+        <li>輻射スラブは熱波の伝播を、レーザーカプセルは直接照射の爆縮を、間接照射は Tr(t) による駆動での停滞と反跳を示す。</li>
+        <li>スナップショットでは見逃しうる鋭い爆縮のピークは、ステップごとの履歴の指標で評価する。</li>
+        <li>回帰試験の標準的な参照は <code>examples/verification/gxii_1d_fld_regression.py</code> — <a href="../verification/index.html#gxii">GXII ベンチマークデッキ</a>（GXII = 激光 XII 号、大阪大学レーザー科学研究所の 12 ビームレーザー）である。</li>
+      </ul>
+    </aside>
+
+    <section aria-labelledby="templates">
+      <h2 id="templates">実行可能なテンプレート（<code>examples/templates/</code>）</h2>
+      <p>最初の 1 本には、全ブロックへコメントを付けた実行可能な雛形をそのまま使うのが早い。編集不要で完走する。コピーして名前を変えてから改造すること。実行手順は<a href="running.html#first-run">シミュレーションの実行</a>にある。</p>
+      <table class="quick-facts">
+        <thead><tr><th>テンプレート</th><th>内容</th><th>学べること</th></tr></thead>
+        <tbody>
+          <tr><th><code>template_1d_slab_radiation.py</code></th><td>平面 1D・灰色 FLD・Marshak 境界駆動・流体 OFF</td><td>放射伝播の最小構成。validate → run → 可視化の流れ。</td></tr>
+          <tr><th><code>template_1d_laser_sphere.py</code></th><td>球 1D・レーザー直接照射・2 温度・伝導 ON</td><td>レーザー波形の書き方、複合物理。</td></tr>
+          <tr><th><code>template_1d_indirect_tr.py</code></th><td>球 1D・Tr(t) 間接照射駆動</td><td>時間依存 callable → 凍結テーブルの流儀。</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section aria-labelledby="validated-presets">
+      <h2 id="validated-presets">実際の計算で検証済みのプリセット</h2>
+      <p>表の値は、プリセットが意図したとおりの問題を構成できているかを判断するための、観測の目安である。GPU、バイナリ、解像度、終了条件、物性値を変えたデッキに対してまで通用する基準解ではない。まずは配布された条件のまま実行し、履歴とスナップショットの両方を確認してから、パラメータ調査へ進むこと。</p>
+      <table class="quick-facts">
+        <thead>
+          <tr><th>プリセット</th><th>主な条件</th><th>2026-07-31 の実行結果</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <th><code>slab_radiation</code><br>輻射スラブ</th>
+            <td>平面 1D、グレイ FLD、流体はオフ。κ=2000 cm²/g、<i>c</i><sub>v,e</sub>=3×10<sup>11</sup> erg/(g·eV)、ρ=0.2 g/cm³、厚さ 100 µm。Marshak 境界 120 eV で 1 ns 駆動。</td>
+            <td>壁の温度は約 104 eV、熱波の前線は約 35 µm。前線より先に明瞭な低温領域が残り、拡散する輻射熱波の分布を形成する。</td>
+          </tr>
+          <tr>
+            <th><code>laser_capsule</code><br>レーザー爆縮</th>
+            <td><a href="../verification/index.html#gxii">GXII</a> 級の 10 TW × 1 ns。DT ガス、CH のシェル、前駆プラズマのコロナ層、光線追跡、2 温度の物質、20 群 FLD。</td>
+            <td>レーザーの吸収は約 86%、最大圧縮は約 1.4 ns。ステップごとの ρ<sub>peak</sub> は約 122 g/cm³、RTX 4090 での実行時間は約 22 s。</td>
+          </tr>
+          <tr>
+            <th><code>indirect_tr</code><br>間接照射 Tr(t)</th>
+            <td>外側の Marshak 境界を 120 eV のフットで 0.5 ns 保ち、1 ns までに 200 eV へ立ち上げる。5 ns まで計算し、アブレータは κ=2000 cm²/g。</td>
+            <td>最大圧縮は約 4.2〜4.5 ns、最小半径は約 10 µm、圧縮比は CR≈30。停滞を越えて反跳へ移る軌道まで捉えている。</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section aria-labelledby="reading-results">
+      <h2 id="reading-results">結果の読み方</h2>
+      <p><code>slab_radiation</code> では、壁のセルだけでなく温度勾配の全体を見る。高温側から約 35 µm の位置で前線が折れ、その先に低温の領域が残ることが、単なる一様加熱との違いである。κ、密度、比熱、厚さは光学的厚さと熱容量を同時に決めるため、どれかを変えれば 104 eV や 35 µm がそのまま保たれるとはかぎらない。</p>
+      <p><code>laser_capsule</code> では、入射したレーザーエネルギーと沈着したレーザーエネルギーの比から吸収率を読み、<code>implosion/rho_peak</code> の最大値とその時刻から、圧縮と最大圧縮時刻を評価する。冷たい固体表面だけを置いてコロナ層を外すと、光線は逆制動輻射で吸収される有効な経路をもたず、臨界面の近くで反射してしまい、駆動が成立しない。プリセットのコロナ層は飾りではなく、直接照射を成立させる初期条件の一部である。</p>
+      <p><code>indirect_tr</code> では、フットが最初の衝撃波を整え、200 eV への立ち上がりが主圧縮を駆動する。シェルの最小半径のあとに半径が増加へ転じることまで確認できれば、計算が停滞の直前で終わったのではなく、反跳まで捉えられたと判断できる。爆縮時の最大密度は短時間しか続かないため、間引かれたスナップショットの最大値ではなく、ステップごとの履歴を使うこと。</p>
+      <aside class="planned" aria-labelledby="absorption-numbers">
+        <h3 id="absorption-numbers">3 つの吸収率と、その異なる条件</h3>
+        <p>本ドキュメントには 3 つのレーザー吸収率が登場するが、照射幾何と不透明度モデルが異なるため、<em>互いに比較できない</em>。</p>
+        <ul>
+          <li><strong>約 83–84%</strong> — <a href="../verification/index.html#gxii">GXII 基準回帰デッキ</a>：f/3 の 12 ビームが 200 µm の super-Gaussian スポットで半径 250 µm のターゲットを覆う広い照射。固定不透明度・理想気体のベンチマーク物理。</li>
+          <li><strong>約 86%</strong> — Studio の <code>laser_capsule</code> プリセット：同じ GXII 級 10 TW × 1 ns 駆動だが、層の厚み・コロナランプ・格子が回帰デッキとは異なるプリセットターゲット。</li>
+          <li><strong>約 45%</strong> — HELIOS との照射整合 LTE キャンペーン：意図的に狭い約 113 µm のガウススポットをほぼ平行ビーム（f/191）で与え、LTE テーブル不透明度を使用（<a href="../verification/index.html">検証とベンチマーク</a>参照）。</li>
+        </ul>
+        <p>吸収率はスポット径、ビーム開口、不透明度モデルに強く依存するため、これらの数字が一致することは期待されず、一致しないことに意味もない。</p>
+      </aside>
+    </section>
+
+    <section aria-labelledby="verification-library">
+      <h2 id="verification-library">検証用のデッキ集</h2>
+      <p><code>examples/verification/</code> は、解析解、保存則、演算子の単体、統合的な回帰といった検査を再現するためのデッキ集である。ここではすべてのケースを列挙しない。レーザー直接照射、2 温度、流体、熱伝導、多群 FLD を、ひとつの実用的な 1 次元の経路で確認する標準的な参照が <code>gxii_1d_fld_regression.py</code> である。このデッキは基準解との回帰試験の入力であると同時に、初期のコロナ層がなぜ必要かという実装上の教訓をコメントに記録している。新しいレーザーのデッキを作るときは、設定の名前だけを写すのではなく、そのコメントと、パルス、材料の境界、出力の履歴を合わせて参照のこと。</p>
+      <p>プリセットは学習と新しいデッキ作成の出発点、検証用のデッキは契約の再現と変化の検出が主な目的である。前者の代表値が妥当に見えることと、後者の検査が通ることは互いに補い合う関係であり、どちらか一方で他方を代用できるものではない。</p>
+    </section>
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["\\[", "\\]"]] } };</script>
+  <script defer src="../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../nav.js" data-page="examples" data-root="../"></script>
+</body>
+</html>

@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en" data-lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Overview — TENRYU Documentation</title>
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>Overview</h1>
+    <p class="abstract">TENRYU is organized as a set of physics operators advanced by Strang splitting around a compatible Lagrangian hydrodynamics core. This section explains the code's scope and design principles, the module architecture, the numerical foundations shared by all kernels, and the verification philosophy that gates every change.</p>
+    <h2>Overview guides</h2>
+    <div class="card-grid">
+      <a class="card" href="architecture.html">
+        <h3>Architecture &amp; module map</h3>
+        <p>Follow configuration from the Python namelist into GPU-resident state, physics operators, and HDF5 products.</p>
+      </a>
+      <a class="card" href="numerics-foundations.html">
+        <h3>Numerical foundations</h3>
+        <p>Review the shared equations, staggering, units, operator order, and time-step control.</p>
+      </a>
+      <a class="card" href="timestep.html">
+        <h3>Time-step control &amp; CFL</h3>
+        <p>The global Δt decision rule and every kernel's CFL/stability formula in one place.</p>
+      </a>
+      <a class="card" href="verification-philosophy.html">
+        <h3>Verification philosophy</h3>
+        <p>See how analytic gates, golden regressions, reproducibility tests, and benchmarks build evidence.</p>
+      </a>
+      <a class="card" href="nomenclature.html">
+        <h3>Nomenclature &amp; conventions</h3>
+        <p>Version vocabulary, abbreviations, external code names, shared constants, and the symbol table.</p>
+      </a>
+    </div>
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["\\[", "\\]"]] } };</script>
+  <script defer src="../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../nav.js" data-page="overview" data-root="../"></script>
+</body>
+</html>

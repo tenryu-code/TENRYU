@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="ja" data-lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>開発者ガイド — TENRYU ドキュメント</title>
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>開発者ガイド <span class="badge">reference</span></h1>
+    <p class="abstract">TENRYU への変更は、物理モデル、入力の契約、実装、検証、文書がひとつの追跡可能な変更としてまとまるように構成する。固定された cgs + eV の単位系、厳格な namelist、検証の関門、再現性、初期化のあとは Python を呼ばないという実行時の境界は、性能や利便性のために後回しにしてよい事項ではなく、コードベースが公開している契約である。</p>
+
+    <aside class="planned" aria-labelledby="at-a-glance">
+      <h3 id="at-a-glance">要点</h3>
+      <ul>
+        <li>内部の単位系は cgs + eV に固定されている。内部を SI 化したり別の単位系へ置き換えたりする変更は受け入れない。</li>
+        <li>未知の namelist のキーはエラーとし、すべてのキーについて型、単位、制約、既定値を文書化する。</li>
+        <li>数式と離散化の変更は <code>NUMERICS.md</code> を、新しいキーは <code>SPECIFICATION.md</code> を、同じ変更のなかで更新する。</li>
+        <li>決定論的な 1D の経路はビット単位の一致、2D の例外は文書化した雑音帯、粒子の乱数は <code>global_id</code> ごとに独立した系列、というのが契約である。</li>
+      </ul>
+    </aside>
+
+    <section aria-labelledby="layout">
+      <h2 id="layout">リポジトリの構成</h2>
+      <p>主要な実装は <code>src/</code> にあり、<code>core</code> が状態・設定・単位、<code>mesh</code> が幾何と接続関係、<code>hydro</code> がラグランジュ流体と ALE、<code>radiation</code> が FLD / S<sub>N</sub>、<code>laser</code> が光線追跡と沈着、<code>materials</code> が EOS と不透明度、<code>coupling</code> が演算子の時間発展、<code>diagnostics</code> が履歴と物理指標、<code>drivers</code> がコマンドの入口を担当する。<code>tests/</code> は単体と統合のテスト、<code>examples/</code> は利用例と検証用デッキ、<code>docs/</code> は設計・仕様・数値の契約、<code>gui/</code> は TENRYU Studio を収めている。変更する前に、担当するモジュールと、影響を受けるテスト・例・文書を特定すること。</p>
+    </section>
+
+    <section aria-labelledby="units-namelist">
+      <h2 id="units-namelist">単位系と namelist の契約</h2>
+      <p>TENRYU の内部表現と入出力は cgs + eV である。長さ cm、時間 s、質量 g、エネルギー erg、密度 g/cm³、温度 eV という既存の契約を維持し、内部の状態を SI などへ変えることはしない。人が読み書きしやすい入力として別の単位を受け付ける場合も、境界で明示的に変換し、カーネルと状態がもつ単位、定数、式の係数を曖昧にしない実装が必要である。単位の変換を伴う変更は、数式、パーサ、凍結後の設定、入出力、検証の参照値を一体として扱う。</p>
+      <p>namelist のスキーマは厳格である。未知のブロックやキー、打ち間違い、型の違い、範囲外の値、対応していないモードの組合せは、無視や警告ではなく入力エラーにする。新しいキーには、完全修飾名、型、単位、許容範囲、相互の制約、既定値を定義すること。明示的な値を書かないデッキの挙動も API の一部なので、既定値は実装のなかに隠さず、正典となる仕様に記載する。後方互換のための別名が必要な場合も、優先順位と、競合したときのエラーを明示し、黙ってどちらかを選ぶことのないようにすること。</p>
+    </section>
+
+    <section aria-labelledby="documentation">
+      <h2 id="documentation">文書と実装を同時に変更する</h2>
+      <p>このページに現れる工学上の契約書 — <code>docs/NUMERICS.md</code>、<code>docs/ARCHITECTURE.md</code>、<code>docs/SPECIFICATION.md</code> — は、TENRYU リポジトリにコードと並んで置かれ、ソースとともに公開されている文書である。数式、物理の係数、時間積分、空間の離散化、境界条件、単位の規約を変更する場合は、同じ変更のなかで <code>docs/NUMERICS.md</code> を更新する。<code>NUMERICS.md</code> は、実装から推測するための解説ではなく、式と離散化に関する正典の契約である。モジュールの責務やデータの流れが変わる場合は、<code>docs/ARCHITECTURE.md</code> も更新する。</p>
+      <p>新しい namelist のキーを追加する場合は、<code>docs/SPECIFICATION.md</code> §6.4 の該当スキーマと、§9.1 の既定値の一覧を、同じプルリクエストで更新する。利用者向けのページや例に影響するなら、それらも合わせて変更すること。コード、既定値、凍結後の表現、検証、文書のうち、どれかだけが先行した状態では、公開している入力の契約を再現できない。</p>
+    </section>
+
+    <section aria-labelledby="verification">
+      <h2 id="verification">検証と基準解</h2>
+      <p>変更によって <code>examples/verification/</code> の関連する検査を壊してはならない。局所的なカーネルの試験だけでなく、変更した演算子が通る解析解のケース、保存則、連成した回帰を選び、意図しない差がないことを確認する。失敗を、許容差の拡大や期待値の移動だけで消すのは修正ではない。原因を符号、単位、境界、係数、離散化、参照値のどこに求めるのかを明確にすること。</p>
+      <p>基準解の更新には、明示的な正当化が必要である。既知の不具合の修正、レビュー済みの物理・数値アルゴリズムの変更、基準となるパラメータの意図的な変更などを示し、旧値と新値の差、影響する指標、必要な収束の確認または独立な参照を記録する。単に現在の出力へ基準解を合わせることは認められない。既存の検査が確認していない新しい挙動には、新しい正解の基準または診断を追加する。</p>
+    </section>
+
+    <section aria-labelledby="reproducibility">
+      <h2 id="reproducibility">再現性の契約</h2>
+      <p>決定論的な 1 次元の実運用の経路では、同じバイナリ、入力、GPU 構成のもとで、場と主要な診断量が実行のたびにビット単位で一致することを要求する。物理的な許容差をもつ回帰試験であっても、それが同じ構成での反復実行のずれを許す理由にはならない。2D RZ の一部では、多数のスレッドによる <code>atomicAdd</code> の加算順序に由来する、最下位ビットの差があり得る。この例外は、デッキと指標ごとに文書化した雑音帯のなかでのみ扱い、一般的な許容差として広げることはしない。</p>
+      <p>確率的な粒子の経路における乱数の系列は、粒子ごとの <code>global_id</code> と種、ステップによって独立に識別される。生成、複製、移送、再開の変更によって ID の空間を衝突させたり、並列の領域分割によって同じ粒子の系列を変えたりしてはいけない。乱数の分割は、保存形式や MPI を含む再現性の契約なので、局所的な最適化として変更しないこと。</p>
+    </section>
+
+    <section aria-labelledby="python-runtime">
+      <h2 id="python-runtime">Python は初期化時に凍結する</h2>
+      <p>Python の namelist における関数は、読みやすい初期条件や時間波形を書くための入力の仕組みである。関数は初期化の段階でメッシュまたは時間軸の上で評価して表へ変換し、凍結後の設定と、C++ / CUDA 側が所有するデータへ移す。時間ループや GPU のカーネルから Python を呼び出す実装は追加しない。この境界によって、実行時の依存、GIL、外部状態の変化、ランクごとの評価の差を、計算から取り除ける。新しく関数を受け取る入力を追加する場合も、評価する定義域、表の解像度、ハッシュと凍結後の表現を定義すること。</p>
+    </section>
+
+    <section aria-labelledby="pull-requests">
+      <h2 id="pull-requests">プルリクエストの範囲</h2>
+      <p>ひとつのプルリクエストは、ひとつの目的に限定する。不具合の修正、物理モデル、性能の調整、リファクタリング、スキーマの移行を無関係に混ぜると、数値の差の原因と検証の証拠を切り分けられない。とくに、物理の変更と性能の変更は同じプルリクエストに入れず、まず物理の契約と基準となる出力を確立し、そのうえで結果を変えない最適化として提出すること。説明には、目的、変更した契約、影響の範囲、実行した検査、検証していない構成を記載し、レビュアーが差分と証拠を一対一で追える状態にする。</p>
+    </section>
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["\\[", "\\]"]] } };</script>
+  <script defer src="../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../nav.js" data-page="develop" data-root="../"></script>
+</body>
+</html>

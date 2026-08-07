@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="ja" data-lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>物理カーネル — TENRYU ドキュメント</title>
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>物理カーネル</h1>
+    <p class="abstract">各カーネルのページでは、物理モデル、実装されている離散化、namelist の制御項目、適用される検証ゲートを説明する。ここでの「カーネル」とは文書化された演算子ページのことで、9 つの物理演算子と、それを支えるメッシュ生成・MPI 分割の基盤を指す。以下の一覧は 1 ステップ内の演算子の実行順序に沿っている。</p>
+    <div class="card-grid physics-grid">
+      <a class="card" href="hydrodynamics.html"><h3>ラグランジュ流体</h3><p>エネルギー整合なスタッガード流体、時間積分、衝撃波の捕捉。</p></a>
+      <a class="card" href="mesh/index.html"><h3>メッシュと幾何</h3><p>1D 格子と領域、2D RZ メッシュ族、ALE リゾーニングとリマップ。</p></a>
+      <a class="card" href="radiation/index.html"><h3>輻射輸送</h3><p>Fleck 線形化で陰的に物質と結合する多群 FLD と、Picard 反復で物質を閉じる離散座標法 S<sub>N</sub>。</p></a>
+      <a class="card" href="conduction.html"><h3>電子・イオン熱伝導</h3><p>局所 Spitzer-Härm と非局所 SNB 熱輸送。</p></a>
+      <a class="card" href="laser.html"><h3>レーザー駆動と吸収</h3><p>屈折光線追跡と逆制動輻射によるエネルギー付与。</p></a>
+      <a class="card" href="cbet.html"><h3>CBET (交差ビームエネルギー転送)</h3><p>離調と波作用の収支を含む、ビーム対ごとの連成。</p></a>
+      <a class="card" href="hot-electrons.html"><h3>ホット電子</h3><p>レーザー生成源モデル、角度輸送、エネルギー付与。</p></a>
+      <a class="card" href="eos-opacity.html"><h3>EOS・不透明度・電離</h3><p>解析的または表形式の物性閉包と電離モデル。</p></a>
+      <a class="card" href="burn.html"><h3>核燃焼</h3><p>核融合反応、荷電粒子への配分、中性子加熱。</p></a>
+      <a class="card" href="viscosity.html"><h3>プラズマ粘性</h3><p>安定性制御を備えた Braginskii 運動量拡散。</p></a>
+      <a class="card" href="mpi.html"><h3>MPI 分割</h3><p>所有ウィンドウ、ゴースト交換、決定論的な縮約。</p></a>
+    </div>
+
+    <section aria-labelledby="availability">
+      <h2 id="availability">次元と有効化の早見表</h2>
+      <p>どのカーネルがどの次元で動き、既定で有効か、何で有効化するかの一覧である。各行の詳細と例外は各カーネルページが正典で、既定値の完全な一覧はリポジトリの仕様書 <code>docs/SPECIFICATION.md</code> §9.1 である。</p>
+      <table class="quick-facts">
+        <thead><tr><th>カーネル</th><th>1D</th><th>2D RZ</th><th>既定 / 有効化</th></tr></thead>
+        <tbody>
+          <tr><th><a href="hydrodynamics.html">ラグランジュ流体</a></th><td>球・円筒・平面</td><td>対応</td><td>常時有効（中核）。</td></tr>
+          <tr><th><a href="mesh/ale-remap.html">ALE リゾーン・リマップ</a></th><td>純ラグランジュ（解適応 V3 のみ実験的な明示指定）</td><td>対応</td><td>2D では <code>Numerics.ale.enabled=True</code> が既定。</td></tr>
+          <tr><th><a href="radiation/fld.html">多群 FLD</a></th><td>球・円筒・平面</td><td>対応</td><td><code>Radiation.enabled=True</code>・<code>mode="multigroup_diffusion"</code> が既定。</td></tr>
+          <tr><th><a href="radiation/sn.html">S<sub>N</sub> 輸送</a></th><td>球・平面（円筒は積求積）</td><td>対応</td><td><code>Radiation.mode="sn_transport"</code> で選択。</td></tr>
+          <tr><th><a href="conduction.html">電子熱伝導（Spitzer–Härm）</a></th><td>球・円筒・平面</td><td>対応（Kershaw 9 点）</td><td><code>Numerics.conduction.enabled=True</code> が既定。イオン伝導は明示指定。</td></tr>
+          <tr><th><a href="conduction.html#snb">SNB 非局所補正</a></th><td>球・円筒・平面</td><td>非対応</td><td><code>nonlocal_model="snb"</code> の明示指定（1D 専用）。</td></tr>
+          <tr><th><a href="laser.html">レーザー駆動</a></th><td>弦追跡 <code>raytrace_2d</code> は球のみ。円筒・平面は <code>radial_absorption_1d</code> が必須</td><td><code>raytrace_3d</code></td><td>デッキで <code>Laser.enabled=True</code> とビーム列を構成。</td></tr>
+          <tr><th><a href="cbet.html">CBET</a></th><td>球対称の <code>port_section</code>（単一ランク）</td><td><code>geometry_mode="legacy"</code> のペア交換（<code>raytrace_3d</code> 前提）</td><td><code>Laser.cbet.enable=True</code> の明示指定。</td></tr>
+          <tr><th><a href="hot-electrons.html">ホット電子</a></th><td>対応（円筒測度では <code>"cone"</code> 不可）</td><td>対応（<code>raytrace_3d</code>+<code>"cone"</code> が前提）</td><td><code>Laser.hot_electron.enable=True</code> の明示指定。</td></tr>
+          <tr><th><a href="eos-opacity.html">EOS・不透明度・電離</a></th><td>全測度</td><td>対応</td><td>常時有効（材料クロージャ）。</td></tr>
+          <tr><th><a href="burn.html">核燃焼</a></th><td>球対称（<code>fraley</code>・<code>diffusion</code>・<code>mc</code>）</td><td><code>local</code>・<code>diffusion</code> のみ</td><td><code>Burn.enabled=True</code> の明示指定。</td></tr>
+          <tr><th><a href="viscosity.html">プラズマ粘性</a></th><td>平面・円筒・球</td><td>対応</td><td><code>Numerics.hydro.plasma_viscosity.enabled=True</code> の明示指定。</td></tr>
+          <tr><th><a href="mpi.html">MPI 分割</a></th><td>r スラブ</td><td>r スラブ（複数ランクは <code>time_integration="pc_v0"</code> 必須）</td><td><code>Parallel</code> ブロックで構成。</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["\\[", "\\]"]] } };</script>
+  <script defer src="../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../nav.js" data-page="physics" data-root="../"></script>
+</body>
+</html>

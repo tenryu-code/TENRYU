@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="en" data-lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MPI decomposition — TENRYU Documentation</title>
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>MPI decomposition <span class="badge">reference</span></h1>
+    <p class="abstract">TENRYU uses one MPI rank per GPU and the design's “Option C” layout — every rank retains global-size arrays but updates only its owned windows (the rejected alternatives compacted arrays to remapped local indices). Ghost exchanges couple partition boundaries, and explicit kernel ranges make one-rank execution the full-range special case.</p>
+
+    <aside class="planned" aria-labelledby="at-a-glance">
+      <h3 id="at-a-glance">At a glance</h3>
+      <ul>
+        <li>All ranks share one global index space; each rank writes only its owned cell and node ranges.</li>
+        <li>The canonical ghost width is two layers. Exchanges overwrite natural global-index positions with the owner's bits.</li>
+        <li>Owned partials normally use <code>MPI_Allreduce(SUM)</code>, which does not generally guarantee bitwise identity when the rank count changes.</li>
+        <li>Features not audited for MPI v1 fail cleanly during validation or in the driver when more than one rank is present.</li>
+      </ul>
+    </aside>
+
+    <section aria-labelledby="mechanism">
+      <h2 id="mechanism">Why this decomposition</h2>
+      <p>The constraints are one MPI rank per GPU, deterministic physics kernels, and kernels already expressed over explicit index ranges. “Option C” — the name the decomposition design gave this layout when it was chosen over compacted local-index alternatives — makes every rank hold global-size arrays but own only a window. It trades memory for simplicity and safety: there is no local-index remapping to get wrong, one-rank execution is the same code with a full-range window, and an operator is ported to MPI by narrowing the range over which its kernels may act.</p>
+      <p>Stencil physics still needs neighboring state. Two ghost layers cover every stencil in the audited set: the 1D checkerboard PQ filter reads \(\rho\) and active state at \(i\pm2\), and the electron odd-even flux reaches from \(j-2\) through \(j+1\). Shared planes use owner-overwrite semantics, so authority is unambiguous: a ghost is a copy of the owner's value and is never merged with it.</p>
+      <p>Reproducibility and scope are explicit. Owned partials normally combine with <code>MPI_Allreduce(SUM)</code>, so bitwise identity is not promised across different rank counts; for a fixed rank count, deterministic kernels remain deterministic. Features not audited for MPI fail cleanly during validation instead of running incorrectly. Far cells are stale-but-finite by design, but physics must never read them, making each launch window a checkable correctness contract.</p>
+      <ul>
+        <li><strong><code>cw</code>, <code>nw</code>, <code>pw</code>, <code>fw</code>:</strong> these are launch-range roles, not array copies — short names that appear in the source code only, never in namelists or output files. The table below defines their owned-cell, owned-node, and owned-plus-ghost uses.</li>
+        <li><strong>Two ghost layers:</strong> the \(i\pm2\) checkerboard PQ filter and \(j-2\ldots j+1\) electron odd-even flux set the width; audited one-layer stencils fit inside it.</li>
+        <li><strong>Shared i-planes:</strong> neighboring ranks may compute the same node, but owner-overwrite supplies the single authoritative bit pattern.</li>
+        <li><strong>2D layout:</strong> with flat index \(c=i\,n_z+j\), an r-slab is a contiguous span of the global array.</li>
+      </ul>
+    </section>
+
+    <section aria-labelledby="owned-window">
+      <h2 id="owned-window">Owned-window decomposition</h2>
+      <p>For 1D_SPH, the global cell line is split statically into contiguous radial slabs. The 2D_RZ v1 implementation uses r-slabs, contiguous in the flat cell index \(c=i\,n_z+j\). Arrays are not remapped to compressed local indices. Every rank allocates them globally, but only the owner updates physical state.</p>
+      <p>The short window names seen in the implementation describe launch-range roles, not separate array copies:</p>
+
+      <table class="quick-facts">
+        <thead>
+          <tr><th>Window</th><th>Extent and use</th></tr>
+        </thead>
+        <tbody>
+          <tr><th><code>cw</code></th><td><code>State::owned_cell_window(n)</code>: owned-cell updates and local partial reductions.</td></tr>
+          <tr><th><code>nw</code></th><td><code>State::owned_node_window(n)</code>: owned-node updates. Owner-overwrite establishes the authoritative value on shared i-planes.</td></tr>
+          <tr><th><code>pw</code></th><td>A call-site name for an owned-plus-ghost cell window used by stencil producers and intermediate fields.</td></tr>
+          <tr><th><code>fw</code></th><td><code>State::owned_cell_window_ghost(n, stride)</code>: the owned-plus-ghost range for force/scatter passes and ghost-derived fields.</td></tr>
+        </tbody>
+      </table>
+
+      <figure>
+        <img src="../../assets/mpi-owned-window-decomposition-en.png" width="960" height="720" style="max-width:100%;height:auto" alt="Three MPI ranks holding the same global cell array and exchanging two layers of ghost cells around their owned windows">
+        <figcaption>Figure A. Option C global index space. Blue cells are owned, yellow cells are the two-layer ghost region, and grey cells are far. Arrows show owner values overwriting the neighboring rank's ghosts.</figcaption>
+      </figure>
+    </section>
+
+    <section aria-labelledby="halo-exchange">
+      <h2 id="halo-exchange">Ghost and halo exchange</h2>
+      <p>The canonical v1 width is <code>n_ghost=2</code>. The 1D checkerboard PQ filter (the odd–even filter on the total pressure \(P+Q\)) and electron odd-even flux reach \(i\pm2\); this also covers the one layer required by the Kershaw nine-point conduction stencil (see <a href="conduction.html">Electron &amp; ion conduction</a>), the hydro corner-force scatter (see <a href="hydrodynamics.html">Lagrangian hydrodynamics</a>), and the Winslow rezoning iterations (see <a href="mesh/ale-remap.html">ALE</a>). Ghosts occupy natural global-index positions and match the owner's bits after exchange.</p>
+      <p>Far entries beyond owned plus ghost may be stale, but must remain finite and cannot influence owned results, decisions, or diagnostics. Reductions are therefore masked to the owned window.</p>
+      <p>Exchange occurs after an owned write and before the first ghost consumer. Hydro entry exchanges thermodynamic cell fields; predictor/corrector position commits are followed by node position and velocity exchange. Face and corner transfers fill 2D diagonal neighbors. GPU-aware MPI performs device pack, <code>MPI_Isend</code>/<code>MPI_Irecv</code>, <code>MPI_Waitall</code>, and device unpack; otherwise host staging is used.</p>
+    </section>
+
+    <section aria-labelledby="windowed-kernels">
+      <h2 id="windowed-kernels">Windowed kernel signatures</h2>
+      <p>Update kernels receive <code>(begin, end)</code> and form <code>absolute_index = begin + tid</code>. Global boundary predicates retain their serial meaning. Cell and node updates use <code>cw</code> and <code>nw</code>; stencil or interface-scatter passes expand to <code>pw/fw</code> only when required.</p>
+      <p>The 2D hydro corner-force scatter runs over <code>fw</code>, giving each shared node both adjacent cell contributions without a separate force exchange. Distributed FLD-2D CG uses owned-row SpMV (sparse matrix–vector products) and owned-window dots, exchanging its search direction each iteration. On one rank all four windows collapse to <code>[0,n)</code>, preserving the defined full-range identity.</p>
+    </section>
+
+    <section aria-labelledby="reductions">
+      <h2 id="reductions">Reductions and reproducibility</h2>
+      <p>Global energies, timesteps, and solver dots combine owned-window partials with standard <code>MPI_Allreduce</code>. Generic <code>MPI_Allreduce(SUM)</code> does <strong>not</strong> guarantee bitwise identity across rank counts: MPI-dependent association can move least-significant bits. The reproducibility contract (the repository's <code>docs/NUMERICS.md</code> §12) classes these reductions as statistically rather than bitwise reproducible across rank counts; the former Gather plus root sequential sum is retired.</p>
+      <p>Quantities requiring rank-invariant bits use only source-defined canonical paths. The laser conservation rescale coefficient, for example, is summed in canonical order on rank 0 and distributed with an exact-zero Allreduce. A fixed cooperative-grid reduction tree is deterministic only for a fixed grid size. These exceptions do not make MPI execution generally bitwise across rank counts.</p>
+    </section>
+
+    <section aria-labelledby="v1-scope">
+      <h2 id="v1-scope">MPI v1 scope and deferral guards</h2>
+      <p>MPI v1 treats an unsupported feature with <code>n_ranks&gt;1</code> as fail-loud: validation or the driver returns a clean error rather than running or silently falling back. Listed deferrals include SNB, CBET, hot-electron transport, Braginskii viscosity, and per-material conservation.</p>
+      <p><code>midpoint_v1</code> is code-enforced as well. With two or more ranks, the driver rejects <code>Numerics.hydro.time_integration="midpoint_v1"</code> — the 2D default — and states that its internals are not rank-decomposed. A multi-rank 2D deck must therefore set <code>time_integration="pc_v0"</code> explicitly; there is no silent fallback.</p>
+    </section>
+
+    <section aria-labelledby="pipeline">
+      <h2 id="pipeline">One step under MPI</h2>
+      <ol>
+        <li><p><strong>Launch owned work.</strong> Each operator updates only its owned cell or node range through <code>cw</code> or <code>nw</code>, and forms reductions from owned entries only.</p></li>
+        <li><p><strong>Extend stencil producers.</strong> Passes that must construct neighbor-visible intermediate state expand deliberately to <code>pw</code> or <code>fw</code>; far entries remain outside the contract.</p></li>
+        <li><p><strong>Refresh halos.</strong> After an owner writes and before the first ghost consumer, fields are packed on the device, transferred with nonblocking sends and receives, waited, and unpacked into the two ghost layers. In 2D, face exchange completes before corner and mixed physical/parallel corner values are filled; host staging is used only when GPU-aware MPI is unavailable.</p></li>
+        <li><p><strong>Combine global quantities.</strong> Owned partial energies, timestep limits, and solver dots are combined with the appropriate <code>MPI_Allreduce</code>, normally <code>SUM</code> for additive quantities.</p></li>
+        <li><p><strong>Synchronize LaserMesh.</strong> In 1D, owned radial profiles are assembled with <code>MPI_Allgatherv</code> before tracing and only local HydroMesh cells receive the result. In 2D, owned HydroMesh contributions are projected and summed into a replicated LaserMesh with <code>MPI_Allreduce(SUM)</code>; each rank traces the same field and scatters deposition only to its owned cells.</p></li>
+        <li><p><strong>Gate the scope.</strong> Validation or the driver rejects any enabled feature whose kernels, exchanges, or collective ordering have not been audited for multiple ranks.</p></li>
+      </ol>
+    </section>
+
+    <section aria-labelledby="controls">
+      <h2 id="controls">Build and launch notes</h2>
+      <table class="quick-facts">
+        <thead>
+          <tr><th>Item</th><th>Setting</th><th>Meaning</th></tr>
+        </thead>
+        <tbody>
+          <tr><th>MPI build</th><td><code>cmake -S . -B build -DTENRYU_ENABLE_MPI=ON</code></td><td>Enables MPI support with the canonical CMake feature flag.</td></tr>
+          <tr><th>Launch</th><td><code>mpirun -n N ./build/tenryu run &lt;deck.py&gt;</code></td><td>Starts <code>N</code> ranks. The base placement model is one rank per GPU.</td></tr>
+          <tr><th>Deferral guard</th><td>unsupported feature + <code>n_ranks&gt;1</code></td><td>Validation or the driver stops explicitly; there is no silent fallback or unaudited execution.</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section aria-labelledby="verification">
+      <h2 id="verification">Verification</h2>
+      <ul>
+        <li>Rank comparisons use P=1 as reference and assign each deck a T-bit, T-sum, or T-noise tier. T-bit is bitwise; T-sum normally gates normalized Allreduce-order differences at \(10^{-8}\); T-noise uses a self-calibrated 2D <code>atomicAdd</code> band.</li>
+        <li><code>parallel_halo_exchange_np2</code> and <code>parallel_halo_exchange_np4</code> check cell/node owner-overwrite and corner ghosts, requiring machine-exact agreement with the analytic values and at shared nodes.</li>
+        <li><code>ctest --test-dir build -L mpi_gate --output-on-failure</code> runs the current ten-case MPI battery, covering 1D FLD/S<sub>N</sub>, <a href="../verification/index.html#gxii">GXII</a>, 1D/2D burn, 2D S<sub>N</sub>/FLD, and LaserMesh. Each case compares P&gt;1 owned dumps with P=1 under its configured bit, band, or envelope tier (envelope: a wider per-deck worst-case bound calibrated from reference-run ensembles — see the Verification page's reproducibility legend).</li>
+      </ul>
+    </section>
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["\\[", "\\]"]] } };</script>
+  <script defer src="../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../nav.js" data-page="mpi" data-root="../"></script>
+</body>
+</html>

@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="ja" data-lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>メッシュと幾何 — TENRYU ドキュメント</title>
+  <link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>メッシュと幾何</h1>
+    <p class="abstract">TENRYU の計算領域は、1D の半径方向の格子、または 2D 軸対称 RZ のメッシュとして構築する。1D は一様または傾斜配置のゾーニングと、球・円筒・平面の測度を備え、デッキ側の領域ペイントで材料、前駆プラズマのコロナ、外側の VOID を割り当てる。2D は、構造矩形、球面極座標、箱の中の極座標、そして CSR（compressed sparse row）接続によるマルチブロックの各系統を、同じ RZ 幾何の契約へ写像する。</p>
+
+    <aside class="planned" aria-labelledby="at-a-glance">
+      <h3 id="at-a-glance">要点</h3>
+      <ul>
+        <li>1D では節点がセルの境界、セルが熱力学の状態を保持し、幾何の測度は球・円筒・平面から選ぶ。</li>
+        <li><code>uniform</code> は等間隔、<code>graded</code> は区間ごとのセルの重みと、境界での整合を使う。</li>
+        <li>Studio は、体積分率による同心の領域、熱伝導と輻射から除外される VOID、レーザー標的用の単調なコロナ層を、デッキに生成できる。</li>
+        <li>2D の既定は構造化された四辺形である。極座標、箱への埋め込み、シェルと襟、五角形帯は、明示的に有効化する論理格子・マルチブロックの系統である。</li>
+      </ul>
+    </aside>
+
+    <div class="card-grid">
+      <a class="card" href="1d.html"><h3>1D メッシュと領域</h3><p>一様・傾斜配置のゾーニング、領域ペイント、VOID、コロナ層。</p></a>
+      <a class="card" href="2d.html"><h3>2D RZ メッシュ族</h3><p>矩形・極座標・箱の中の極座標・マルチブロックの RZ メッシュ。</p></a>
+      <a class="card" href="ale-remap.html"><h3>ALE: リゾーニングとリマップ</h3><p>メッシュの最適化と、連成した状態の保存的な転写。</p></a>
+    </div>
+
+    <section aria-labelledby="quality">
+      <h2 id="quality">メッシュ品質の保護</h2>
+      <p>生成器は、区間が領域を覆っていること、節点が狭義単調であること、極座標の軸が厳密に一致していること、セルの向き、RZ 体積が正であることを、明示的に失敗させる形で検査する。時間発展の最中は、最小高さとコーナーのヤコビアン \(J\) が、セルのつぶれとコーナーの反転を別々に監視する。下限に達すると予測された場合はメッシュ品質による時間刻みの制限を与え、受理しようとした候補が判定を破れば、そのステップを拒否する。これらは物理のモデルではなく、無効な幾何のうえで体積、力、リマップを評価しないための許容性の契約である。</p>
+    </section>
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["$$", "$$"], ["\\[", "\\]"]] } };</script>
+  <script defer src="../../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../../nav.js" data-page="mesh" data-root="../../"></script>
+</body>
+</html>

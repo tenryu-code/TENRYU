@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en" data-lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Examples &amp; presets — TENRYU Documentation</title>
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>Examples &amp; presets <span class="badge">reference</span></h1>
+    <p class="abstract">TENRYU Studio's one-dimensional presets provide three entry points: a radiation heat wave, a direct-drive laser implosion, and an indirect drive set by radiation temperature. Each configuration was run to completion on an RTX 4090 on 2026-07-31 and checked against representative physics metrics. A separate deck library under <code>examples/verification/</code> reproduces the verification gates.</p>
+
+    <aside class="planned" aria-labelledby="at-a-glance">
+      <h3 id="at-a-glance">At a glance</h3>
+      <ul>
+        <li>The three presets were checked beyond schema validation: each completed on an RTX 4090 and produced an interpretable result.</li>
+        <li>The slab demonstrates heat-front propagation, the laser capsule a direct-drive implosion, and the indirect case stagnation and rebound under Tr(t).</li>
+        <li>Use per-step history metrics for sharp implosion peaks that sparse snapshots can miss.</li>
+        <li>The canonical regression reference is <code>examples/verification/gxii_1d_fld_regression.py</code> — the <a href="../verification/index.html#gxii">GXII benchmark deck</a> (GXII: the GEKKO XII laser at ILE, The University of Osaka).</li>
+      </ul>
+    </aside>
+
+    <section aria-labelledby="templates">
+      <h2 id="templates">Runnable templates (<code>examples/templates/</code>)</h2>
+      <p>For a first run, the fastest start is a runnable skeleton with comments on every block; they complete unmodified. Copy and rename before editing. The step-by-step procedure is on <a href="running.html#first-run">Running simulations</a>.</p>
+      <table class="quick-facts">
+        <thead><tr><th>Template</th><th>Content</th><th>What it teaches</th></tr></thead>
+        <tbody>
+          <tr><th><code>template_1d_slab_radiation.py</code></th><td>Planar 1D, grey FLD, Marshak-driven boundary, hydro OFF</td><td>The minimal radiation setup; the validate → run → plot loop.</td></tr>
+          <tr><th><code>template_1d_laser_sphere.py</code></th><td>Spherical 1D, direct laser drive, two temperatures, conduction ON</td><td>Writing laser waveforms; multi-physics.</td></tr>
+          <tr><th><code>template_1d_indirect_tr.py</code></th><td>Spherical 1D, Tr(t) indirect drive</td><td>The time-dependent-callable → frozen-table idiom.</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section aria-labelledby="validated-presets">
+      <h2 id="validated-presets">Run-validated presets</h2>
+      <p>The values below are observation targets for deciding whether a preset forms its intended problem. They are not universal goldens for a deck changed to use another GPU, binary, resolution, stopping condition, or material model. Run the distributed setup unchanged first and inspect both its history and snapshots before beginning a parameter study.</p>
+      <table class="quick-facts">
+        <thead>
+          <tr><th>Preset</th><th>Principal conditions</th><th>Result on 2026-07-31</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <th><code>slab_radiation</code><br>Radiation slab</th>
+            <td>Planar 1D, grey FLD, hydrodynamics off. κ=2000 cm²/g, <i>c</i><sub>v,e</sub>=3×10<sup>11</sup> erg/(g·eV), ρ=0.2 g/cm³, thickness 100 µm; a 120 eV Marshak drive for 1 ns.</td>
+            <td>Wall temperature about 104 eV and heat front about 35 µm. A distinct cold-ahead region remains, forming the expected diffusive heat-wave profile.</td>
+          </tr>
+          <tr>
+            <th><code>laser_capsule</code><br>Laser implosion</th>
+            <td><a href="../verification/index.html#gxii">GXII</a>-class 10 TW × 1 ns; DT gas, CH shell, pre-plasma corona ramp, ray tracing, two-temperature matter, and 20-group FLD.</td>
+            <td>About 86% laser absorption and bang near 1.4 ns. Per-step ρ<sub>peak</sub> reaches about 122 g/cm³; wall time is about 22 s on an RTX 4090.</td>
+          </tr>
+          <tr>
+            <th><code>indirect_tr</code><br>Indirect-drive Tr(t)</th>
+            <td>Outer Marshak boundary at a 120 eV foot for 0.5 ns, ramping to 200 eV by 1 ns; simulation through 5 ns with ablator κ=2000 cm²/g.</td>
+            <td>Bang at about 4.2–4.5 ns, minimum radius about 10 µm, and convergence ratio CR≈30. The trajectory captures stagnation and the following rebound.</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section aria-labelledby="reading-results">
+      <h2 id="reading-results">Reading the results</h2>
+      <p>For <code>slab_radiation</code>, examine the full temperature gradient rather than only the wall cell. The front turns near 35 µm and leaves cold material farther into the slab, distinguishing a propagating diffusive heat wave from uniform heating. Opacity, density, heat capacity, and thickness jointly set the optical depth and thermal capacity; changing any one of them need not preserve either 104 eV or 35 µm.</p>
+      <p>For <code>laser_capsule</code>, obtain absorption from the ratio of deposited to incident laser energy, then evaluate compression and bang from the maximum of <code>implosion/rho_peak</code> and its time. Removing the corona ramp leaves no useful inverse-bremsstrahlung path outside the cold solid surface: rays reflect near critical density and the intended drive does not form. The ramp is a physical part of this initial condition, not cosmetic mesh padding.</p>
+      <p>For <code>indirect_tr</code>, the foot organizes the initial shock and the rise to 200 eV drives the main compression. Confirming that the shell radius grows again after its minimum distinguishes a captured rebound from a run that stopped just before stagnation. Because peak density persists only briefly, use the per-step history rather than the largest value among cadence-limited snapshots.</p>
+      <aside class="planned" aria-labelledby="absorption-numbers">
+        <h3 id="absorption-numbers">Three absorption figures, three different conditions</h3>
+        <p>This documentation quotes three laser-absorption numbers that are <em>not</em> comparable with one another, because they belong to different irradiation geometries and opacity models:</p>
+        <ul>
+          <li><strong>≈83–84%</strong> — the <a href="../verification/index.html#gxii">GXII golden-regression deck</a>: twelve f/3 beams with broad 200 µm super-Gaussian spots overfilling the 250 µm-radius target, constant-opacity ideal-gas benchmark physics.</li>
+          <li><strong>≈86%</strong> — the Studio <code>laser_capsule</code> preset: the same GXII-class 10 TW × 1 ns drive on a preset target whose layer thicknesses, corona ramp, and mesh differ from the regression deck.</li>
+          <li><strong>≈45%</strong> — the HELIOS matched-irradiation LTE campaign: a deliberately narrower ≈113 µm Gaussian spot from a nearly collimated f/191 beam, with LTE table opacities (see <a href="../verification/index.html">Verification &amp; benchmarks</a>).</li>
+        </ul>
+        <p>Absorbed fraction depends strongly on spot size, beam aperture, and the opacity model, so agreement between these numbers is neither expected nor meaningful.</p>
+      </aside>
+    </section>
+
+    <section aria-labelledby="verification-library">
+      <h2 id="verification-library">Verification deck library</h2>
+      <p><code>examples/verification/</code> is the deck library for reproducing analytic, conservation, single-operator, and integrated regression gates; this page does not enumerate every case. The canonical practical 1D reference spanning direct laser drive, two-temperature matter, hydrodynamics, conduction, and multigroup FLD is <code>gxii_1d_fld_regression.py</code>. In addition to defining the golden-regression input, its comments preserve the corona-ramp lesson. When developing a laser deck, consult those comments together with the pulse, material interfaces, and output history rather than copying key names alone.</p>
+      <p>Presets primarily teach and seed new configurations; verification decks reproduce contracts and detect changes. A plausible preset metric and a passing gate are complementary evidence, and neither substitutes for the other.</p>
+    </section>
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["\\[", "\\]"]] } };</script>
+  <script defer src="../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../nav.js" data-page="examples" data-root="../"></script>
+</body>
+</html>

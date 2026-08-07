@@ -1,0 +1,203 @@
+<!doctype html>
+<html lang="en" data-lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ALE: rezoning &amp; remap — TENRYU Documentation</title>
+  <link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>ALE: rezoning &amp; remap <span class="badge">reference</span></h1>
+    <p class="abstract">TENRYU's 2D RZ ALE separates rezoning, which changes only mesh shape after Lagrangian hydrodynamics, from conservative remap, which transfers the material state to that mesh. The legacy Winslow family, reference/barrier targets, and the M1/TMOP objective solver connect to a common admissibility contract. Only an accepted target receives a conservative transfer of mass, momentum, internal energies, and radiation-group energies.</p>
+
+    <aside class="planned" aria-labelledby="at-a-glance">
+      <h3 id="at-a-glance">At a glance</h3>
+      <ul>
+        <li>A cycle is Lagrangian step → trigger → target mesh → admissibility gates → conservative remap.</li>
+        <li>The default solver is bit-exact legacy Winslow; M1/TMOP and reference-barrier paths are opt-in.</li>
+        <li>Remap transports cell integrals, not intensive values, then recovers primitive state using the new volumes and masses.</li>
+        <li>A candidate that fails RZ-volume, corner-J, Gauss-J, axis-margin, or sweep-positivity checks is reduced or rolled back.</li>
+      </ul>
+    </aside>
+
+    <section aria-labelledby="mechanism">
+      <h2 id="mechanism">The physical mechanism</h2>
+      <p>A mesh that follows the material keeps interfaces sharp, but shear, vorticity, and converging asymmetries progressively strain that Lagrangian mesh: cells shear, flatten, and eventually invert, while the timestep collapses with the smallest cell altitude long before the material physics itself fails. ALE is the escape. TENRYU retains Lagrangian fidelity while the mesh is healthy; when it is not, it moves the mesh without moving the material. Rezoning proposes better node coordinates, and remap conservatively transfers the state onto them. The “arbitrary” in the name refers to exactly this freedom: the mesh velocity is pinned neither to the material velocity (Lagrangian) nor to zero (Eulerian) but may be chosen at will — TENRYU's choice being the material velocity while the mesh is healthy, and the rezoner's proposal once it is not.</p>
+      <p>Rezoning is geometry, not physics: it constructs only a target mesh through the Winslow-type smoothing and constrained variants in the solver family below, and must not silently change the answer. RZ-volume positivity, corner-J floors, Gauss-point Jacobians, and node-path checks enforce that separation through line search and rollback. An unacceptable target is rejected and the cycle simply remains Lagrangian. Cadence, mesh-quality metrics, and axis/corner-J guards decide when a rezone is attempted at all.</p>
+      <p>Remap is a conservation transaction between old and new meshes with the same topology. Exact bookkeeping uses the signed volumes swept between their faces. Each swept region takes one donor-cell state, with slope reconstruction and MS2 (Margolin–Shashkov second-order [4]) limiting for monotone second order, and transfers every extensive ledger—mass, species masses, momentum, internal and kinetic energy, and radiation-group energy—with one signed volume, one donor, and equal-and-opposite cell updates. Mesh motion therefore conserves those transported ledgers to round-off by construction. The documented energy closure deposits the kinetic-energy remap/projection discrepancy into material internal energy, and corner masses are rebuilt only after an accepted remap—the one point where their Lagrangian invariance may change.</p>
+      <p>The production managed-ALE shape is a banded controller rather than a global relaxation. Axis bands and Euler windows confine where respacing acts—the axis is where RZ Lagrangian meshes fail first—and band-only swept-volume remap keeps the conservation transaction local. Every accepted cycle also preserves the OFF bit-identity contract: if the controller is disabled or never triggered, the result is bitwise identical to the pure-Lagrangian path.</p>
+    </section>
+
+    <section aria-labelledby="cycle-triggers">
+      <h2 id="cycle-triggers">ALE cycle and triggers</h2>
+      <p>The normal entry is the post-Lagrange point. TENRYU evaluates the <code>every_n_steps</code> cadence (default 5) and cell quality. It samples a bilinear map at four 2×2 Gauss points and defines</p>
+      $$
+      q_c=\frac{J_{\min}}{J_{\max}},
+      \qquad \min_c q_c&lt;q_{\mathrm{threshold}}.
+      $$
+      <p>The default is <code>quality_threshold=0.2</code>; \(q_c=1\) denotes a parallelogram, while zero indicates degeneracy. <code>spacing_ratio_threshold</code> is a parsed and validated reserved key with no runtime firing rule in v1 (the numerical contract, <code>docs/NUMERICS.md</code> §3.3 in the repository, defines none), so it is not counted as an active trigger here.</p>
+      <p>Protective paths can bypass cadence. The preventive axis guard forces rezoning when the axis margin falls below a configured fraction of its initial value. The default-off pre-hydro corner-J trigger finds where a signed corner Jacobian reaches its floor along the predicted trajectory and invokes ALE before operator splitting when the admissible scale is too small. Reference-barrier ALE has additional near-axis margin, corner-J ratio, and diagonal-corner length-ratio triggers.</p>
+
+      <figure>
+        <img src="../../../assets/ale-remap-cycle.png" width="1080" height="360" style="max-width:100%;height:auto" alt="ALE cycle from a Lagrangian step through trigger evaluation, rezoning, admissibility gates, conservative remap, and corner-mass rebuilding">
+        <figcaption>Figure A. Rezoning proposes node coordinates only. State transfer and corner-mass rebuilding commit only when the target and remap pass every gate.</figcaption>
+      </figure>
+    </section>
+
+    <section aria-labelledby="rezone-solvers">
+      <h2 id="rezone-solvers">Rezone solver family</h2>
+      <p><code>legacy_winslow</code> preserves the simplified orthogonal Winslow update bit-exactly. Metric coefficients are lagged from the current logical-grid coordinates in a Jacobi iteration, and the cross derivative is omitted (here \(\alpha\) and \(\beta\) are the Winslow metric coefficients — unrelated to the radiation pages' symbols):</p>
+      $$
+      r_{i,j}^{new}=\frac{\alpha(r_{i+1,j}+r_{i-1,j})+\beta(r_{i,j+1}+r_{i,j-1})}
+      {2(\alpha+\beta)}.
+      $$
+      <p>The same equation updates \(z\). An opt-in full R-Z metric variant adds the mixed derivative and an R-weighted candidate. Its node-local line search can test incident-cell Gauss-J, corner-J, signed RZ volume, and non-axis radii.</p>
+      <p>The reference-Winslow/barrier family constructs displacements toward targets such as the initial Eulerian mesh or an equal-angle spherical mesh, then uses a global line search with reference-relative floors. Near-axis reference barriers and protected patches may use a Winslow proposal as a seed and project it into the feasible volume/corner-J set. The path from the Lagrangian mesh to the endpoint is checked, not merely the endpoint.</p>
+      <p><code>m1_tmop</code> is an opt-in damped Gauss–Newton solver. Its objective combines M1 quality relative to a reference metric, a tether to the Lagrangian position, polar-row spacing regularization, and a small-determinant activation barrier:</p>
+      $$
+      \mathcal J(\mathbf x)=
+      \frac{\sum_{c,q}\omega_{cq}\det(W_{cq})\,\mu(A_{cq}W_{cq}^{-1};\gamma_{\rm align})}
+           {\sum_{c,q}\omega_{cq}\det(W_{cq})}
+      +\frac{\lambda_{\rm tether}}{N_v}\sum_i\frac{\|\mathbf x_i-\mathbf x_i^L\|^2}{h_i^2}
+      +\frac{w_\theta}{N_v}\sum_{i\in\mathcal R}
+       \left(\frac{d_{iL}-d_{iR}}{d_{iL}+d_{iR}}\right)^2
+      +\beta\sum_{c,q}\left[\det A_{cq}&lt;\sigma_b\det W_{cq}\right]
+       \log\frac{\sigma_b\det W_{cq}}{\det A_{cq}}.
+      $$
+      <p>Here \(A_{cq}\) and \(W_{cq}\) are the actual and reference corner Jacobians at Gauss point \(q\) of cell \(c\), with weights \(\omega_{cq}\) and the shape-quality measure \(\mu\) at alignment weight \(\gamma_{\rm align}\) — the M1 quality term; \(\lambda_{\rm tether}\) penalizes displacement from the Lagrangian positions \(\mathbf x^L_i\) on the local scale \(h_i\); the \(w_\theta\) term regularizes polar-row spacing through the left/right neighbor distances \(d_{iL},d_{iR}\) over the row set \(\mathcal R\); and the \(\beta\) barrier activates where \(\det A_{cq}&lt;\sigma_b\det W_{cq}\).</p>
+      <p>Each node proposal is capped by a local edge scale and receives up to 12 line-search halvings. A transaction is accepted only when the candidate-mesh oracle is admissible and</p>
+      $$
+      \frac{\mathcal J_{before}-\mathcal J_{after}}
+           {\max(|\mathcal J_{before}|,10^{-300})}
+      &gt;\texttt{m1\_min\_j\_dec\_rel}.
+      $$
+      <p>The 0.0 default requires a strict decrease while retaining small useful improvements. The first-generation M1 solver (“M1 v1”) targets polar-family meshes; accepted coordinates re-anchor the moving reference before conservative remap.</p>
+    </section>
+
+    <section aria-labelledby="admissibility">
+      <h2 id="admissibility">Admissibility and acceptance gates</h2>
+      <p>Rezoner convergence is not mesh acceptance. Every active candidate cell must retain positive signed RZ volume and corner-J, satisfy the 2×2 Gauss-J floors, and, for axis cells, satisfy the analytic axis margin. The first directional-remap sweep must also keep intermediate volumes positive. Safe backtracking first validates the Lagrangian mesh at blend factor \(\lambda=0\) (\(\lambda\) blends the Lagrangian mesh toward the proposed target), samples \(\lambda=2^{-e}\), and bisects upward to the largest admissible blend. If no positive value passes, the mesh and state roll back to the pre-transaction snapshot.</p>
+      <p>Thus, a smaller objective or Winslow residual alone never commits a mesh. Reference targets, M1 targets, and managed repairs all end at the same geometry/path oracle and remap-positivity checks.</p>
+    </section>
+
+    <section aria-labelledby="conservative-remap">
+      <h2 id="conservative-remap">Swept-region conservative remap</h2>
+      <p>The default <code>legacy_split</code> alternates the ordering of R and Z swept-region sweeps. Revolving the meridional polygon \(P_f\) between an old and new face gives the signed volume</p>
+      $$
+      \Delta V_f=V(P_f)=\frac{\pi}{3}\sum_k(r_k+r_{k+1})
+      (r_kz_{k+1}-r_{k+1}z_k).
+      $$
+      <p>Here \((r_k,z_k)\) are the vertices of the meridional polygon \(P_f\) swept between the old and new face; the prefactor \(\pi/3\) comes from the exact revolution about the axis.</p>
+      <p>For each internal face, TENRYU chooses one donor and computes one flux, then applies equal-and-opposite updates. A conservative cell integral \(\bar q=qV\) changes as</p>
+      $$
+      \bar q_i^{new}=\bar q_i^{old}-F_{i+1/2}+F_{i-1/2}.
+      $$
+      <p>The transferred quantities are mass, R/Z momentum, electron/ion internal energy, material volume, and every radiation-group energy. Density is recovered as \(m^{new}/V^{new}\), velocity as remapped momentum/mass, and specific energy as remapped extensive energy/mass. The central lesson is to transport conservative integrals first, rather than directly averaging intensives such as \(\rho\), \(\mathbf u\), or \(e\).</p>
+
+      <ul>
+        <li><strong>Signed swept region \(P_f\):</strong> its sign records the direction of face motion, while its magnitude is the volume exchanged across that face.</li>
+        <li><strong>Donor selection:</strong> the sign of the swept volume selects the upwind donor cell; that same donor supplies the reconstructed state for the single face flux.</li>
+        <li><strong>MS2 limiter:</strong> the limited linear reconstruction is monotone second order and prevents the remap from creating new local extrema.</li>
+        <li><strong>Exact RZ geometry:</strong> polygon revolution evaluates both the swept volume and, for MS2, the swept polygon's exact first moment rather than a near-axis first-order approximation.</li>
+        <li><strong>Energy closure:</strong> the documented closure adds the diagnostic-compatible kinetic-energy remap/projection discrepancy to material internal energy.</li>
+        <li><strong>Corner-mass timing:</strong> corner masses remain invariant through Lagrangian motion and rejected proposals, and are rebuilt only after an accepted conservative remap.</li>
+        <li><strong>Trigger metrics:</strong> cadence, cell quality, axis margin, and corner-J determine whether the geometry transaction is attempted.</li>
+      </ul>
+
+      <figure>
+        <img src="../../../assets/ale-remap-swept-region.png" width="760" height="570" style="max-width:100%;height:auto" alt="Swept region between an old and a new face, with a conservative flux between adjacent cells">
+        <figcaption>Figure B. A one-dimensional strip view of swept-region remap. The 2D RZ implementation uses the exact axisymmetric volume and first moment of the shaded polygon.</figcaption>
+      </figure>
+    </section>
+
+    <section aria-labelledby="ms2-energy">
+      <h2 id="ms2-energy">MS2 limiters and energy closure</h2>
+      <p>The opt-in <code>ms2_moments</code> path is a Margolin–Shashkov-style second-order moment remap. It reconstructs \(q(\mathbf x)=q_L+\nabla q_L\cdot(\mathbf x-\mathbf x_L)\) from a four-neighbor least-squares slope and limits it with <code>van_leer</code> or <code>barth_jespersen</code>. Using the exact first moment \(M_1(P_f)\), the donor integral is</p>
+      $$
+      I_f=\rho_L|P_f|+\nabla\rho_L\cdot
+      \left(M_1(P_f)-\mathbf x_L|P_f|\right).
+      $$
+      <p>Legacy split and MS2 both use the same face flux with opposite signs on its two cells, so limiting preserves pairwise conservation. Per-sweep mass/internal/radiation positivity and final EOS reclosure remain separate gates.</p>
+      <p>Projecting cell momentum back to nodal velocity does not generally preserve kinetic energy exactly. The default-on <code>ke_fixup</code> is a legacy compatibility control. The explicit <code>ke_conservation_closure</code> (default off) remaps \(q_K=K_c^{diag}/V_c\) using the corner-mass/nodal-velocity measure, then deposits \(\Delta I_c=K_c^{remap,*}-K_c^{node,*}\) into material internal energy. An optional positivity redistribution draws a deficit from global positive capacity and records any unresolved remainder in a ledger.</p>
+    </section>
+
+    <section aria-labelledby="managed-regions">
+      <h2 id="managed-regions">Axis bands, Euler windows, and corner mass</h2>
+      <p><code>axis_band_managed_remap_enabled</code> is a default-off near-axis controller. When the row-K margin falls below its threshold, it remaps only \(i\in[0,K-1]\) to the equal-RZ-volume target</p>
+      $$
+      r_i^{target}(j)=R_K(j)\sqrt{i/K},\qquad
+      z_i^{target}(j)=z_K^{node}(j).
+      $$
+      <p>Here \(R_K(j)\) is the radius of the fixed row-\(K\) node at axial index \(j\), so the band nodes are respaced to equal revolved volumes while their axial coordinates follow row \(K\).</p>
+      <p>It widens K through the configured range while checking positivity and conservation ledgers. If every K fails, state is unchanged and control returns to legacy timestep reduction. Mass, momentum, electron/ion internal energy, and radiation groups are conserved; only the nodal-projection kinetic-energy delta is warning-level by construction.</p>
+      <p><code>euler_window.enabled</code> is an opt-in multiblock CSR region target. A rectangle or annulus uses the frozen reference grid inside and Lagrangian coordinates outside, joined by a C1 transition weight. The blended target passes the candidate oracle, re-anchors the reference, and enters the same conservative-remap transaction as accepted M1 rezoning. It requires conservative remap and is mutually exclusive with M1/TMOP.</p>
+      <p>Hydrodynamic subzonal corner masses remain fixed during pure Lagrangian motion. A rejected geometric proposal does not change them; they are rebuilt from remapped cell mass and the post-remap mesh only after an accepted rezone/remap. This lifecycle preserves the Lagrangian invariance required by compatible work and anti-hourglass/subzonal-pressure terms.</p>
+    </section>
+
+    <section aria-labelledby="pipeline">
+      <h2 id="pipeline">One accepted ALE cycle, step by step</h2>
+      <ol>
+        <li><p><strong>Evaluate triggers.</strong> At the ALE entry point, evaluate scheduled cadence together with cell-quality, axis-margin, and corner-J guards. If nothing fires, retain the Lagrangian mesh and state unchanged.</p></li>
+        <li><p><strong>Construct a target.</strong> Run the selected Winslow, reference/barrier, or M1/TMOP solver family to propose node coordinates only. The managed controller confines this proposal to its selected axis band or Euler window.</p></li>
+        <li><p><strong>Gate admissibility.</strong> Test positive signed RZ volume, corner-J, 2×2 Gauss-J floors, the applicable axis margin, and the node path from the Lagrangian mesh to the target. Line search reduces the displacement when needed; safe backtracking validates \(\lambda=0\), searches \(\lambda=2^{-e}\), and refines the largest admissible blend. If no positive blend passes, restore the pre-transaction snapshot and stay Lagrangian.</p></li>
+        <li><p><strong>Build swept regions.</strong> Between every old and new face, construct the oriented polygon and evaluate its exact axisymmetric signed volume and, for the second-order path, exact first moments. The first directional sweep's intermediate volumes must remain positive.</p></li>
+        <li><p><strong>Transfer conservative ledgers.</strong> Select the donor from the swept-volume sign, reconstruct its state with the selected Van Leer or MS2 limiter, and apply each face flux once with opposite signs to its two cells. Mass and species/material ledgers, R/Z momentum, electron/ion internal energy, radiation-group energy, and the enabled diagnostic kinetic-energy ledger all follow this transaction; sweep positivity remains a rollback gate.</p></li>
+        <li><p><strong>Close and commit.</strong> Project remapped momentum, apply the documented kinetic-energy closure into internal energy when enabled, rebuild corner masses from the remapped cell mass and accepted mesh, and perform thermodynamic reclosure. Acceptance commits mesh and state together as one transaction; failure restores both.</p></li>
+        <li><p><strong>Audit the feature contract.</strong> Conservation ledgers gate the accepted transaction, while ALE-disabled, never-triggered, and identity-mode runs audit bitwise equality with pure Lagrangian evolution. These OFF/bit-identity and conservation checks gate the feature as a whole.</p></li>
+      </ol>
+    </section>
+
+    <section aria-labelledby="controls">
+      <h2 id="controls">Namelist controls</h2>
+      <p>These are selected <code>Numerics.ale</code> controls. See the <a href="../../use/namelist.html">namelist reference</a> for all fields and validation rules.</p>
+      <table class="quick-facts">
+        <thead>
+          <tr><th>Key</th><th>Default</th><th>Purpose</th></tr>
+        </thead>
+        <tbody>
+          <tr><th><code>enabled</code></th><td><code>True</code></td><td>Master enable for the 2D RZ rezone/remap cycle (a direct key of <code>Numerics.ale</code>; there is no <code>rezoning</code> sub-block).</td></tr>
+          <tr><th><code>every_n_steps</code></th><td><code>5</code></td><td>Scheduled rezone cadence.</td></tr>
+          <tr><th><code>quality_threshold</code></th><td><code>0.2</code></td><td>Quality trigger when \(\min q_c\) falls below it.</td></tr>
+          <tr><th><code>rezone_solver</code></th><td><code>"legacy_winslow"</code></td><td>Legacy Winslow family or opt-in <code>"m1_tmop"</code>.</td></tr>
+          <tr><th><code>m1_min_j_dec_rel</code></th><td><code>0.0</code></td><td>Minimum relative objective decrease for M1.</td></tr>
+          <tr><th><code>remap_scheme</code></th><td><code>"legacy_split"</code></td><td>Directional swept-region remap; opt-in <code>"ms2_moments"</code>.</td></tr>
+          <tr><th><code>remap_limiter</code></th><td><code>"van_leer"</code></td><td>Limiter for legacy-split donor reconstruction.</td></tr>
+          <tr><th><code>ke_fixup</code></th><td><code>True</code></td><td>Legacy post-remap kinetic-energy fixup compatibility control.</td></tr>
+          <tr><th><code>axis_band_managed_remap_enabled</code></th><td><code>False</code></td><td>Near-axis, band-only equal-volume remap controller.</td></tr>
+          <tr><th><code>euler_window.enabled</code></th><td><code>False</code></td><td>Local Eulerian reference target with a C1 transition.</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section aria-labelledby="verification">
+      <h2 id="verification">Verification</h2>
+      <ul>
+        <li>OFF-path bitwise gates require an ALE-disabled run to remain bit-identical in fields and history.</li>
+        <li>Remap conservation ledgers track mass, R/Z momentum, material internal energy, radiation-group energy, and explicit floor or redistribution terms. The general remap mass gate is \(\le 10^{-14}\) relative error. Managed axis-band unit gates use \(10^{-12}\) for mass/internal/radiation energy and \(10^{-10}\) for translation-invariant kinetic energy; runtime mass/internal/radiation/cell-momentum residuals roll back at \(10^{-8}\).</li>
+        <li><code>ale_identity_mode</code> returns from every ALE entry point after Lagrange; it is a null test against an ALE=0 run at matched timesteps.</li>
+        <li>I-series batteries exercise production rezoning, admissibility, conservative remap, axis, and multiblock paths in coupled configurations.</li>
+      </ul>
+    </section>
+
+    <section aria-labelledby="references">
+      <h2 id="references">References</h2>
+      <ol class="references">
+        <li>A. M. Winslow, "Numerical Solution of the Quasilinear Poisson Equation in a Nonuniform Triangle Mesh," J. Comput. Phys. 1, 149–172 (1966). <a href="https://doi.org/10.1016/0021-9991(66)90001-5">doi:10.1016/0021-9991(66)90001-5</a></li>
+        <li>P. M. Knupp, "Algebraic Mesh Quality Metrics," SIAM J. Sci. Comput. 23, 193–218 (2001). <a href="https://doi.org/10.1137/S1064827500371499">doi:10.1137/S1064827500371499</a></li>
+        <li>V. A. Dobrev, P. Knupp, T. V. Kolev, K. Mittal, and V. Z. Tomov, "The Target-Matrix Optimization Paradigm for High-Order Meshes," SIAM J. Sci. Comput. 41, B50–B68 (2019). <a href="https://doi.org/10.1137/18M1167206">doi:10.1137/18M1167206</a></li>
+        <li>L. G. Margolin and M. J. Shashkov, "Second-Order Sign-Preserving Conservative Interpolation (Remapping) on General Grids," J. Comput. Phys. 184, 266–298 (2003). <a href="https://doi.org/10.1016/S0021-9991(02)00033-5">doi:10.1016/S0021-9991(02)00033-5</a></li>
+      </ol>
+    </section>
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["$$", "$$"], ["\\[", "\\]"]] } };</script>
+  <script defer src="../../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../../nav.js" data-page="ale-remap" data-root="../../"></script>
+</body>
+</html>

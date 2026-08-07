@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="en" data-lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Hot electrons — TENRYU Documentation</title>
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>Hot electrons <span class="badge">reference</span></h1>
+    <p class="abstract">TENRYU implements a Colaïtis (2015) / LILAC-style prescribed LPI (laser–plasma-instability) hot-electron preheat model as a chain of laser capture, exponential spectra, cone quadrature, straight-line transport, collisional stopping, and material-energy deposition. It is not a self-consistent solution of LPI wave growth or saturation: the conversion efficiency η(t) and hot-electron temperature are calibration inputs or outputs of a reduced closure.</p>
+
+    <aside class="planned" aria-labelledby="at-a-glance">
+      <h3 id="at-a-glance">At a glance</h3>
+      <ul>
+        <li>The default capture surface is \(n_e=0.25n_c\) (\(n_c\): the laser critical density, written \(n_{\rm crit}\) on the laser page); η(t) converts laser power remaining after upstream absorption at that surface.</li>
+        <li>An exponential energy spectrum is divided into logarithmic groups, while a deterministic cone quadrature supplies directions.</li>
+        <li>Each electron beamlet follows a straight path through the shell and deposits energy through free-electron stopping.</li>
+        <li><code>subtract_from_laser=True</code> removes converted power from the laser ledger and prevents double counting.</li>
+        <li>Supported dimensions are <code>1D_SPH</code> and <code>2D_RZ</code>. 2D RZ requires <code>Laser.mode="raytrace_3d"</code> and accepts only <code>angular_model="cone"</code>; <code>"radial"</code> is 1D-only, and conversely the 1D cylindrical measure does not accept <code>"cone"</code>.</li>
+      </ul>
+    </aside>
+
+    <section aria-labelledby="mechanism">
+      <h2 id="mechanism">The physical mechanism</h2>
+      <p>Above intensity thresholds, laser-driven parametric instabilities — two-plasmon decay (TPD) and stimulated Raman scattering (SRS) — drive large-amplitude electron-plasma waves. The action concentrates near the quarter-critical density because there a daughter electron-plasma wave oscillates at about half the laser frequency, which is where the TPD and SRS frequency-matching conditions can be satisfied. The driven plasma waves trap and accelerate electrons to tens or hundreds of keV, far beyond the thermal bulk. Because their range is much longer than a thermal electron's, they penetrate the shell ahead of the shock and preheat the fuel, raising its adiabat and degrading compression. Quantifying that preheat is the purpose of this kernel.</p>
+      <p>The instabilities occupy kinetic, sub-wavelength scales that a radiation-hydrodynamics mesh cannot resolve, so TENRYU does not solve their wave growth or saturation. Following the Colaïtis/LILAC philosophy, the conversion efficiency η(t) and hot-electron temperature \(T_h\) (the namelist's <code>T_hot_eV</code>) are calibration inputs, or η is supplied by the reduced closure driven by local plasma quantities. The source is placed where the generation physics occurs: at each traced ray's first crossing of \(n_e=f_s n_c\), using the power that actually survives upstream absorption to that point.</p>
+      <p>Measured hot-electron spectra are approximately exponential in energy with a single temperature. TENRYU divides that exponential into logarithmic groups whose weights and flux-averaged representative energies come from analytic moments. Because each group weight is a difference of the cumulative distribution at its two edges, the intermediate terms cancel when summed, and \(\sum_g W_g=1\) holds exactly without numerical quadrature. Direction is a deterministic uniform cone around the capture direction, evaluated by quadrature rather than sampling and therefore bitwise reproducible.</p>
+      <p>Transport is deliberately explicit about its approximations: the chords are straight, with no refraction — these are roughly 100-keV electrons, not light — and v1 includes no angular scattering. Continuous slowing-down on free electrons uses relativistic kinematics and a Coulomb logarithm. The identity \(\Delta P=\dot N_g(E_{in}-E_{out})\) lets integration error move deposition only between neighboring cells, never create or destroy group power. Every watt is assigned to a deposited, escaped, or, where applicable, in-flight ledger. On the banked optical path (the path that reuses the stored per-ray upstream optical depths when evaluating capture power), the gate is that "deposited + unabsorbed + \(P_{hot}\) = input" closes to relative \(10^{-10}\).</p>
+    </section>
+
+    <section aria-labelledby="scope-source">
+      <h2 id="scope-source">Model scope and capture source</h2>
+      <p>Set <code>Laser.hot_electron.enable=True</code> to activate the model. In the scalar prescription, every traced ray moving inward creates a source at its first upward crossing of \(n_e=f_s n_c\). The default \(f_s=\)<code>source_nc_fraction</code> is 0.25, representing a source near the quarter-critical LPI region. A trace segment containing the crossing is split at the event. Inverse-bremsstrahlung (IB) absorption on the upstream part is applied first, so the source uses the power that actually reaches the capture surface rather than the power at the segment entrance.</p>
+      $$
+      P_{h,ray}(t)=\eta(t)P_{ray}^{cross}(t).
+      $$
+      <p>\(P_{ray}^{cross}\) is post-upstream-processing power. On the supported CBET coexistence path, capture records come from the final post-CBET propagation, not from nominal beam power before CBET exchange. CBET and hot electrons are otherwise mutually exclusive; the sole relaxed combination is <code>cbet.geometry_mode="port_section"</code> with <code>eta_mode="model"</code>, which follows this post-CBET rule.</p>
+      <p>There are four ways to supply η(t). For the one-cone shorthand, <code>eta_hot</code> gives a constant and <code>eta_hot_table</code> gives a time table frozen during initialization. A <code>sources</code> list defines up to four mechanism-resolved cone, TPD, or SRS channels, each with its own capture surface, constant or tabulated η, temperature, spectral window, and angular band. Multiple channels fire in ascending \(f_s\) order and deplete the laser sequentially. Finally, <code>eta_mode="model"</code> evolves η from local plasma conditions. All four are reduced prescriptions for generation; none turns this feature into a self-consistent LPI solver.</p>
+    </section>
+
+    <section aria-labelledby="spectrum-angle">
+      <h2 id="spectrum-angle">Multigroup spectrum and cone angles</h2>
+      <p>The source number flux follows an exponential spectrum with temperature \(T_h\). <code>T_hot_eV</code> is expressed in eV, not keV.</p>
+      $$
+      \frac{d\dot N}{dE}=\frac{P_h}{T_h^2}\exp(-E/T_h),
+      \qquad T_h=\texttt{T\_hot\_eV}\,\mathrm{eV\_to\_erg}.
+      $$
+      $$
+      W_g=\frac{\phi_1(u_{g-1/2})-\phi_1(u_{g+1/2})}
+      {\phi_1(u_{min})-\phi_1(u_{max})},
+      \qquad \phi_1(u)=(1+u)e^{-u},
+      $$
+      $$
+      E_g=T_h\frac{\phi_2(u_{g-1/2})-\phi_2(u_{g+1/2})}
+      {\phi_1(u_{g-1/2})-\phi_1(u_{g+1/2})},
+      \qquad \phi_2(u)=(2+2u+u^2)e^{-u}.
+      $$
+      <ul>
+        <li>\(P_h=\eta P^{cross}_{ray}\) — the post-IB crossing power: the capture segment is split at the crossing event and upstream IB is applied first, so the source sees crossing-point power rather than segment-entry power.</li>
+        <li>\(T_h=\texttt{T\_hot\_eV}\,\mathrm{eV\_to\_erg}\) — the configured spectrum temperature is converted from eV to erg before the energy moments are evaluated.</li>
+        <li>\(W_g\) and \(E_g\) — analytic moments built from \(\phi_1\) and \(\phi_2\), with \(u=E/T_h\) the normalized energy, \(u_{g\pm1/2}\) the group edges, and \(u_{min},u_{max}\) the window edges; the differences telescope to \(\sum_g W_g=1\), while \(E_g\) is the group's flux-averaged energy.</li>
+        <li>Cone quadrature — Gauss–Legendre nodes in \(\mu\) times uniform nodes in \(\phi\), with direction weights summing to one.</li>
+        <li>\(f_s=\texttt{source\_nc\_fraction}=0.25\) — the default quarter-critical capture anchor.</li>
+        <li><code>subtract_from_laser</code> — the Manley-style no-double-count contract: after capture, \((1-\eta)P^{cross}\) continues down the laser path.</li>
+      </ul>
+      <p>The code places <code>n_energy_groups</code> logarithmic groups over \([E_{min},E_{max}]=[\texttt{E\_min\_over\_Th}T_h,\texttt{E\_max\_over\_Th}T_h]\). Analytic moments of the exponential give each group its power weight and flux-averaged representative energy. The defaults are 30 groups and \([0.2,8]T_h\). Power outside that window is not discarded; the in-window groups are renormalized so their weights sum to one.</p>
+      <p>With <code>angular_model="cone"</code>, the capture direction is the axis of a uniform solid-angle cone with half-angle <code>theta_div_deg</code>. The polar cosine uses an <code>n_mu</code>-point Gauss–Legendre rule and the azimuth uses <code>n_phi</code> uniformly spaced points; all angular weights sum to one. Increasing the half-angle distributes the same source power over chords with different lengths and areal densities. The alternative <code>radial</code> mode marches inward at \(\mu=1\) for verification. It is not a production substitute for finite cone divergence.</p>
+    </section>
+
+    <section aria-labelledby="transport-deposition">
+      <h2 id="transport-deposition">Straight-line transport and deposition</h2>
+      <figure>
+        <img src="../../assets/hot-electron-generation-deposition-en.png" width="800" height="454" style="max-width:100%;height:auto" alt="Laser power converted to hot electrons at a quarter-critical capture surface and transported on conical straight-line paths into a shell deposition band">
+        <figcaption>Figure A. Generation through deposition. The capture surface creates \(P_h=\eta(t)P^{cross}_{ray}\) (the drawing labels it \(P_L^{cross}\)), then multigroup, multidirection straight chords enter the shell. The colored band marks collisional deposition; the central arrow shows residual handling for the radial verification path.</figcaption>
+      </figure>
+      <p>Transport paths are straight chords without refraction or angular scattering. In spherical geometry, analytic intersections with shell faces produce inbound, pericenter, and outbound segments. A source inside a cell starts with the exact partial segment to the first face. Within each cell, \(n_e,T_e,\rho\) are frozen while an adaptive RK4 integration advances continuous-slowing-down (CSDA) free-electron stopping, using relativistic velocity and a Coulomb logarithm.</p>
+      $$
+      \Delta P_{i,g}=\dot N_g\left(E_{in}-E_{out}\right).
+      $$
+      <p>Bookkeeping always uses the number flux times the entry-to-exit energy loss. Integration accuracy can therefore move deposition between neighboring cells, but it cannot change total group power. Energy remaining at the thermalization floor is deposited locally, and power leaving the outer boundary enters the escape ledger. <code>inner_bc="deposit_residual"</code> applies only to <code>radial</code> mode: residual energy reaching the inner boundary is placed in the innermost non-void cell. The <code>"escape"</code> alternative records it as escaped. Cone chords turn at their pericenters and continue outward, so they do not use this radial-only boundary rule.</p>
+    </section>
+
+    <section aria-labelledby="pipeline">
+      <h2 id="pipeline">From capture to heating, step by step</h2>
+      <ol>
+        <li>Capture events are found on traced rays. A crossing segment is split, upstream IB is applied first, and the event records the crossing power. Captures in the ghost-corona band — trace cells outside the outermost physical cell — are clamped to the boundary cell, counted, and reported.</li>
+        <li>The ray ensemble is reduced to a fixed 16-bin \((\text{source cell},\mu_{axis})\) table. Each bin retains power-weighted, continuous representatives for both \(\mu_{axis}\) and source radius \(r_s\), without snapping the launch point to a cell face.</li>
+        <li>Each populated bin is expanded into logarithmic energy groups and the deterministic cone directions, carrying the product of its spectral and angular weights.</li>
+        <li>Each beamlet marches along its chord. Analytic shell intersections order inbound, pericenter, and outbound legs and retain the exact partial first segment; per-cell \(n_e,T_e,\rho\) are frozen while adaptive RK4 integrates CSDA stopping with a 2% energy-per-substep target and at most 256 substeps per cell.</li>
+        <li>Each cell receives \(\Delta P=\dot N(E_{in}-E_{out})\). The remainder at the thermalization floor is deposited locally, outer-boundary crossings escape, and a radial-mode inner residual follows <code>inner_bc</code>.</li>
+        <li>Ledgers are closed and matter is coupled. Per-cell hot-electron power joins the laser source channel after deposition smoothing; a 2T run heats electron internal energy. The named <code>"hot_electron"</code> limiter bounds the next step by \(\Delta t\le f_E\min_{P_i&gt;0}(m_i e_{e,i}/P_i)\), with \(f_E=\texttt{explicit\_source\_limit}\).</li>
+      </ol>
+    </section>
+
+    <section aria-labelledby="coupling-timestep">
+      <h2 id="coupling-timestep">Laser ledger, matter coupling, and timestep</h2>
+      <p>With <code>subtract_from_laser=True</code>, a captured ray continues with \((1-\eta)P_{ray}^{cross}\). This prevents the converted power from being counted in both thermal laser absorption and hot-electron preheat. Setting it to False is an intentional additive sensitivity mode that injects external hot-electron energy without depleting the laser; it is not the normal closed-energy configuration. For multiple channels, a downstream channel sees the power left by upstream channels.</p>
+      <p>Per-cell hot-electron power joins the laser source channel after laser-deposition smoothing. Standard source injection then heats electron specific internal energy in a two-temperature calculation or the single total matter energy in a one-temperature calculation. To prevent an excessive explicit energy increment in one step, the named <code>"hot_electron"</code> limiter uses the preceding step's deposited power to limit the next timestep.</p>
+      $$
+      \Delta t\le f_E\min_{P_i>0}\frac{m_i e_{e,i}}{P_i},
+      \qquad f_E=\texttt{explicit\_source\_limit}.
+      $$
+      <p>Here \(m_i\) is the mass of cell \(i\) (not an ion mass) and \(e_{e,i}\) its specific electron internal energy, so \(m_ie_{e,i}\) is the cell's electron energy reservoir. This is the same construction as the burn kernel's identically named <code>explicit_source_limit</code> — dt ≤ \(f_E\) × available internal energy / deposited power — differing only in the reservoir: electron energy here, electron-plus-ion internal energy there. It is a dedicated explicit-source guard, not another name for the laser CFL limit. Diagnostics track source, deposited, and escaped power and their conservation residual; depletion from <code>subtract_from_laser</code> is also reflected in the laser ledger.</p>
+    </section>
+
+    <section aria-labelledby="eta-model">
+      <h2 id="eta-model">Physics-model option for η(t)</h2>
+      <p><code>eta_mode="model"</code> replaces constant or tabulated η with an opt-in first-order relaxation closure for TPD and SRS channels in 1D spherical geometry. Each step evaluates \(T_e\) and the density scale length \(L_n\) near the channel's evaluation surface. Illumination intensity comes from the previous step's raw capture-crossing power. A reduced TPD or SRS threshold parameter gives \(\eta_{eq}=0\) below threshold and a saturating equilibrium efficiency above it, subject to per-channel hard caps and a total-efficiency cap. The update uses either a fixed or Vu-2012-style relaxation time and an exact exponential step.</p>
+      $$
+      \eta^{n+1}=\eta^n+\left[1-\exp(-\Delta t/\tau)\right]
+      \left(\eta_{eq}-\eta^n\right).
+      $$
+      <p>The intensity measurement is one-step lagged. η starts at zero, the first step measures crossing power, and nonzero evolution begins on the following step. This option requires TPD/SRS entries in <code>sources</code>, <code>subtract_from_laser=True</code>, single-rank 1D_SPH, and rejects scalar shorthand. Although local conditions drive η, the closure does not resolve plasma waves, nonlinear LPI saturation, or kinetic electron generation.</p>
+    </section>
+
+    <section aria-labelledby="controls">
+      <h2 id="controls">Key controls</h2>
+      <p>The principal <code>Laser.hot_electron</code> controls are listed below. The channel form cannot be combined with scalar shorthand keys.</p>
+      <table class="quick-facts">
+        <thead>
+          <tr><th>Key / mode</th><th>Default</th><th>Purpose</th></tr>
+        </thead>
+        <tbody>
+          <tr><th><code>enable</code></th><td><code>False</code></td><td>Enable hot-electron preheat.</td></tr>
+          <tr><th><code>eta_hot</code></th><td><code>0.0</code></td><td>Constant efficiency for the one-cone shorthand.</td></tr>
+          <tr><th><code>eta_hot_table</code></th><td>absent</td><td>η(t) table frozen at initialization; overrides the constant.</td></tr>
+          <tr><th><code>sources</code></th><td>absent</td><td>Mechanism-resolved cone / TPD / SRS channels with constant or tabulated η.</td></tr>
+          <tr><th><code>eta_mode="model"</code></th><td><code>"legacy"</code></td><td>Select the local-condition-driven TPD / SRS η(t) closure.</td></tr>
+          <tr><th><code>source_nc_fraction</code></th><td><code>0.25</code></td><td>Single-source capture density \(n_e/n_c\).</td></tr>
+          <tr><th><code>T_hot_eV</code></th><td><code>5.0e4</code></td><td>Exponential-spectrum temperature [eV].</td></tr>
+          <tr><th><code>n_energy_groups</code></th><td><code>30</code></td><td>Number of logarithmic energy groups.</td></tr>
+          <tr><th><code>E_min_over_Th</code> / <code>E_max_over_Th</code></th><td><code>0.2</code> / <code>8.0</code></td><td>Multigroup spectral window \(E/T_h\).</td></tr>
+          <tr><th><code>angular_model</code></th><td><code>"cone"</code></td><td>Cone transport; <code>"radial"</code> is for verification.</td></tr>
+          <tr><th><code>theta_div_deg</code></th><td><code>60.0</code></td><td>Cone divergence half-angle [deg].</td></tr>
+          <tr><th><code>n_mu</code> / <code>n_phi</code></th><td><code>6</code> / <code>8</code></td><td>Polar-cosine / azimuth quadrature counts.</td></tr>
+          <tr><th><code>subtract_from_laser</code></th><td><code>True</code></td><td>Sequentially subtract converted power from each ray.</td></tr>
+          <tr><th><code>inner_bc</code></th><td><code>"deposit_residual"</code></td><td>Deposit radial-mode inner-boundary residual in the innermost cell.</td></tr>
+          <tr><th><code>explicit_source_limit</code></th><td><code>0.2</code></td><td>\(f_E\) for the <code>"hot_electron"</code> timestep limiter.</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section aria-labelledby="verification-limits">
+      <h2 id="verification-limits">Verification and limits</h2>
+      <ul>
+        <li>The scalar 1D bookkeeping identity \(|P_{dep}+P_{esc}-P_h|/P_h\) closes by construction; the <a href="../verification/index.html#gxii">GXII</a>-derived smoke test measured at most \(7\times10^{-15}\).</li>
+        <li>Mechanism-channel gates preserve the disabled GXII golden result at rel=0 over 53/53 snapshots and the scalar shorthand versus <code>sources=[cone]</code> over 55/55 snapshots. In the three-channel 20-ps run, each channel closed within \(1.6\times10^{-14}\), and the sum of channel ledgers matched the total within \(3\times10^{-16}\).</li>
+        <li>The fixed planar angular-trend gate — a 200-cell planar slab with \(T_h\), η, and \(f_s\) held identical across all four legs, so launch angle is the only variable — places the 90% deposition depth at cells 154, 152, 144, and 142 for cone 0°, SRS 20°, cone 60°, and TPD 45°, respectively; its absorbed fractions are 0.734, 0.742, 0.805, and 0.820, in the pre-registered monotone order.</li>
+        <li>The η(t) physics-model gates exercise the relaxation update and its capture, depletion, and diagnostic wiring.</li>
+      </ul>
+      <p>The present stopping model omits bound-electron, plasmon, and degeneracy effects, collisional angular scattering, and reflux (the return of escaped electrons to the target by sheath electric fields). It can therefore underestimate stopping and overestimate range in cold, partially ionized matter. η and \(T_h\) remain calibration-dependent: results should be interpreted as the target's preheat response to the selected generation closure, not as a first-principles prediction of LPI.</p>
+    </section>
+
+    <section aria-labelledby="references">
+      <h2 id="references">References</h2>
+      <ol class="references">
+        <li>A. Colaïtis et al., "Coupled Hydrodynamic Model for Laser-Plasma Interaction and Hot Electron Generation," Phys. Rev. E 92, 041101(R) (2015). <a href="https://doi.org/10.1103/PhysRevE.92.041101">doi:10.1103/PhysRevE.92.041101</a></li>
+        <li>H. X. Vu et al., "Hot-Electron Production and Suprathermal Heat Flux Scaling with Laser Intensity from the Two-Plasmon-Decay Instability," Phys. Plasmas 19, 102703 (2012). <a href="https://doi.org/10.1063/1.4757978">doi:10.1063/1.4757978</a></li>
+        <li>R. K. Follett et al., "Simulations and Measurements of Hot-Electron Generation Driven by the Multibeam Two-Plasmon-Decay Instability," Phys. Plasmas 24, 102134 (2017). <a href="https://doi.org/10.1063/1.4998934">doi:10.1063/1.4998934</a></li>
+        <li>E. Rovere et al., "Hot Electron Scaling for Two-Plasmon Decay in ICF Plasmas," Phys. Plasmas 30, 042104 (2023). <a href="https://doi.org/10.1063/5.0128052">doi:10.1063/5.0128052</a></li>
+        <li>M. J. Rosenberg et al., "Origins and Scaling of Hot-Electron Preheat in Ignition-Scale Direct-Drive Inertial Confinement Fusion Experiments," Phys. Rev. Lett. 120, 055001 (2018). <a href="https://doi.org/10.1103/PhysRevLett.120.055001">doi:10.1103/PhysRevLett.120.055001</a></li>
+        <li>M. J. Rosenberg et al., "Stimulated Raman Scattering Mechanisms and Scaling Behavior in Planar Direct-Drive Experiments at the National Ignition Facility," Phys. Plasmas 27, 042705 (2020). <a href="https://doi.org/10.1063/1.5139226">doi:10.1063/1.5139226</a></li>
+        <li>A. A. Solodov et al., "Hot-Electron Generation at Direct-Drive Ignition-Relevant Plasma Conditions at the National Ignition Facility," Phys. Plasmas 27, 052706 (2020). <a href="https://doi.org/10.1063/1.5134044">doi:10.1063/1.5134044</a></li>
+        <li>A. Simon, R. W. Short, E. A. Williams, and T. Dewandre, "On the Inhomogeneous Two-Plasmon Instability," Phys. Fluids 26, 3107–3118 (1983). <a href="https://doi.org/10.1063/1.864037">doi:10.1063/1.864037</a></li>
+      </ol>
+    </section>
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["$$", "$$"], ["\\[", "\\]"]] } };</script>
+  <script defer src="../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../nav.js" data-page="hot-electrons" data-root="../"></script>
+</body>
+</html>

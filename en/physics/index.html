@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en" data-lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Physics kernels — TENRYU Documentation</title>
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>Physics kernels</h1>
+    <p class="abstract">Each kernel page documents the physical model, the discretization actually implemented, the namelist controls, and the verification that gates it. “Kernel” here means a documented operator page: nine physics operators plus the mesh-generation and MPI-decomposition infrastructure they run on. The catalog below follows the operator ordering of a time step.</p>
+    <div class="card-grid physics-grid">
+      <a class="card" href="hydrodynamics.html"><h3>Lagrangian hydrodynamics</h3><p>Compatible staggered hydrodynamics, time integration, and shock capturing.</p></a>
+      <a class="card" href="mesh/index.html"><h3>Meshes &amp; geometry</h3><p>1D zoning and regions, 2D RZ mesh families, and ALE rezoning and remap.</p></a>
+      <a class="card" href="radiation/index.html"><h3>Radiation transport</h3><p>Multigroup FLD with Fleck-linearized implicit matter coupling, and discrete-ordinates S<sub>N</sub> with iterative Picard matter closure.</p></a>
+      <a class="card" href="conduction.html"><h3>Electron &amp; ion conduction</h3><p>Local Spitzer-Härm and nonlocal SNB thermal transport.</p></a>
+      <a class="card" href="laser.html"><h3>Laser drive &amp; absorption</h3><p>Refracted ray tracing and inverse-bremsstrahlung deposition.</p></a>
+      <a class="card" href="cbet.html"><h3>Cross-beam energy transfer (CBET)</h3><p>Pairwise beam coupling with detuning and wave-action accounting.</p></a>
+      <a class="card" href="hot-electrons.html"><h3>Hot electrons</h3><p>Laser-generated source models, angular transport, and deposition.</p></a>
+      <a class="card" href="eos-opacity.html"><h3>EOS, opacity &amp; ionization</h3><p>Analytic or tabulated material closures and ionization models.</p></a>
+      <a class="card" href="burn.html"><h3>Nuclear burn</h3><p>Fusion reactions, charged-particle partition, and neutron heating.</p></a>
+      <a class="card" href="viscosity.html"><h3>Plasma viscosity</h3><p>Braginskii momentum diffusion with stability controls.</p></a>
+      <a class="card" href="mpi.html"><h3>MPI decomposition</h3><p>Owned windows, ghost exchange, and deterministic reductions.</p></a>
+    </div>
+
+    <section aria-labelledby="availability">
+      <h2 id="availability">Dimension and activation at a glance</h2>
+      <p>Which kernel runs in which dimension, what is on by default, and what turns each on. The kernel pages are authoritative for details and exceptions; the complete list of defaults is the specification shipped with the source, <code>docs/SPECIFICATION.md</code> §9.1.</p>
+      <table class="quick-facts">
+        <thead><tr><th>Kernel</th><th>1D</th><th>2D RZ</th><th>Default / activation</th></tr></thead>
+        <tbody>
+          <tr><th><a href="hydrodynamics.html">Lagrangian hydrodynamics</a></th><td>Spherical, cylindrical, planar</td><td>Yes</td><td>Always on (core).</td></tr>
+          <tr><th><a href="mesh/ale-remap.html">ALE rezone and remap</a></th><td>Pure Lagrangian (only the experimental solution-adaptive V3 is opt-in)</td><td>Yes</td><td>In 2D, <code>Numerics.ale.enabled=True</code> by default.</td></tr>
+          <tr><th><a href="radiation/fld.html">Multigroup FLD</a></th><td>Spherical, cylindrical, planar</td><td>Yes</td><td><code>Radiation.enabled=True</code> with <code>mode="multigroup_diffusion"</code> by default.</td></tr>
+          <tr><th><a href="radiation/sn.html">S<sub>N</sub> transport</a></th><td>Spherical, planar (cylindrical via product quadrature)</td><td>Yes</td><td>Selected by <code>Radiation.mode="sn_transport"</code>.</td></tr>
+          <tr><th><a href="conduction.html">Electron conduction (Spitzer–Härm)</a></th><td>Spherical, cylindrical, planar</td><td>Yes (Kershaw nine-point)</td><td><code>Numerics.conduction.enabled=True</code> by default; ion conduction is opt-in.</td></tr>
+          <tr><th><a href="conduction.html#snb">SNB nonlocal correction</a></th><td>Spherical, cylindrical, planar</td><td>No</td><td>Opt-in via <code>nonlocal_model="snb"</code> (1D-only).</td></tr>
+          <tr><th><a href="laser.html">Laser drive</a></th><td>Chord tracing <code>raytrace_2d</code> is spherical-only; cylindrical/planar require <code>radial_absorption_1d</code></td><td><code>raytrace_3d</code></td><td>Configured per deck: <code>Laser.enabled=True</code> plus beams.</td></tr>
+          <tr><th><a href="cbet.html">CBET</a></th><td>Spherical <code>port_section</code> (single rank)</td><td><code>geometry_mode="legacy"</code> pairwise exchange (requires <code>raytrace_3d</code>)</td><td>Opt-in via <code>Laser.cbet.enable=True</code>.</td></tr>
+          <tr><th><a href="hot-electrons.html">Hot electrons</a></th><td>Yes (the cylindrical measure rejects <code>"cone"</code>)</td><td>Yes (requires <code>raytrace_3d</code> and <code>"cone"</code>)</td><td>Opt-in via <code>Laser.hot_electron.enable=True</code>.</td></tr>
+          <tr><th><a href="eos-opacity.html">EOS, opacity, and ionization</a></th><td>All measures</td><td>Yes</td><td>Always on (material closure).</td></tr>
+          <tr><th><a href="burn.html">Nuclear burn</a></th><td>Spherical (<code>fraley</code>, <code>diffusion</code>, <code>mc</code>)</td><td><code>local</code> and <code>diffusion</code> only</td><td>Opt-in via <code>Burn.enabled=True</code>.</td></tr>
+          <tr><th><a href="viscosity.html">Plasma viscosity</a></th><td>Planar, cylindrical, spherical</td><td>Yes</td><td>Opt-in via <code>Numerics.hydro.plasma_viscosity.enabled=True</code>.</td></tr>
+          <tr><th><a href="mpi.html">MPI decomposition</a></th><td>Radial slabs</td><td>Radial slabs (multi-rank requires <code>time_integration="pc_v0"</code>)</td><td>Configured via the <code>Parallel</code> block.</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["\\[", "\\]"]] } };</script>
+  <script defer src="../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../nav.js" data-page="physics" data-root="../"></script>
+</body>
+</html>
