@@ -1,0 +1,341 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TENRYU Studio ユーザーマニュアル (1D)</title>
+  <link rel="stylesheet" href="manual.css">
+</head>
+<body>
+  <main>
+    <header>
+      <h1>TENRYU Studio ユーザーマニュアル (1D)</h1>
+      <p class="lead">TENRYU 1D 放射流体シミュレーションの入力デッキを、フォーム操作だけで安全に組み立てる GUI。</p>
+      <p class="meta">生成日: 2026-07-31</p>
+      <a class="language-link" href="index_en.html" lang="en">English version</a>
+    </header>
+
+    <nav class="toc" aria-labelledby="toc-title">
+      <h2 id="toc-title">目次</h2>
+      <ol>
+        <li><a href="#overview">概要とワークフロー</a></li>
+        <li><a href="#quickstart">クイックスタート (3 分)</a></li>
+        <li><a href="#presets">1D プリセット (実 run 検証済み)</a></li>
+        <li><a href="#basic">基本設定</a></li>
+        <li><a href="#materials">材料</a></li>
+        <li><a href="#geometry">ジオメトリー: 格子と領域</a></li>
+        <li><a href="#physics">物理</a></li>
+        <li><a href="#drive">駆動</a></li>
+        <li><a href="#output">出力</a></li>
+        <li><a href="#deck">デッキの確認・保存・実行</a></li>
+        <li><a href="#troubleshooting">トラブルシューティング</a></li>
+      </ol>
+    </nav>
+
+    <section id="overview">
+      <h2>1. 概要とワークフロー</h2>
+      <p>TENRYU Studio は、フォームへの入力から右ペインの Python デッキ (namelist) を常時自動生成し、検証 (validate) を経て保存・実行までを行うための GUI です。単位系は <strong>cgs + eV</strong> で、長さは cm、時間は s、温度は eV、密度は g/cm<sup>3</sup>、パワーは W を使用します。</p>
+
+      <figure>
+        <img src="img/ja/01_overview.png" alt="TENRYU Studio の画面全体">
+        <figcaption>画面構成。ヘッダー、左ナビ、中央フォーム、右側のデッキプレビューと検証パネルから成ります。</figcaption>
+      </figure>
+
+      <p>ヘッダーには「読込」「保存」「別名保存」、言語切替、実行サーバー選択、validate 実行、実行▶があります。左ナビには「プリセット」「基本設定」「材料」「ジオメトリー」「物理」「駆動」「出力」「実行履歴」「サーバー」が並び、中央に選択中のフォーム、右側に deck プレビューと検証パネルが表示されます。</p>
+
+      <aside class="tip">
+        <strong>ヒント:</strong> デッキ先頭に埋め込まれる <code>TENRYU-GUI-STATE</code> コメントにより、保存したデッキを「読込」するとフォーム状態が完全復元されます。
+      </aside>
+
+      <figure>
+        <img src="img/ja/16_langswitch.png" alt="ヘッダーの言語切替ドロップダウン">
+        <figcaption>言語はヘッダーのドロップダウンでいつでも切り替えられます。</figcaption>
+      </figure>
+    </section>
+
+    <section id="quickstart">
+      <h2>2. クイックスタート (3 分)</h2>
+      <ol>
+        <li>
+          左ナビの「プリセット」を開き、<strong>1D</strong> タブを選びます。目的に近いカードの「このプリセットを適用」を押します。
+          <figure>
+            <img src="img/ja/02_presets.png" alt="1D プリセット選択画面">
+            <figcaption>検証済みの 1D プリセットから開始すると、必要な設定一式がフォームに反映されます。</figcaption>
+          </figure>
+        </li>
+        <li>
+          右ペインの deck プレビューで生成内容を確認します。
+          <figure>
+            <img src="img/ja/14_deck_laser_preset.png" alt="レーザープリセットから生成されたデッキ">
+            <figcaption>プリセット適用直後のデッキプレビュー。フォーム変更は即座に反映されます。</figcaption>
+          </figure>
+        </li>
+        <li>「ファイルへ保存」でデッキを書き出し、<code>./build/tenryu run &lt;deck&gt;.py</code> で実行します。実行サーバーを設定済みなら、ヘッダーの実行▶から投入することもできます。</li>
+      </ol>
+
+      <aside class="tip">
+        <strong>ヒント:</strong> フォームに検証エラーがある間は deck の代わりに赤字のエラー一覧が表示され、修正するとデッキ生成が再開されます。詳しくは <a href="#basic">§4</a> と <a href="#geometry">§6</a> を参照してください。
+      </aside>
+    </section>
+
+    <section id="presets">
+      <h2>3. 1D プリセット (実 run 検証済み)</h2>
+      <p>Studio には 3 つの物理プリセットと空白プリセットがあります。物理プリセットはいずれも 2026-07-31 に実機 (RTX 4090) で完走し、物理的に成立することを確認した条件です。</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>プリセット</th>
+              <th>物理</th>
+              <th>実証結果</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>放射スラブ (平面 1D)</td>
+              <td>灰色 FLD + Marshak 120 eV、流体 OFF、κ=2000 cm²/g、cv<sub>e</sub>=3×10<sup>11</sup> erg/(g·eV)、ρ=0.2 g/cm³、L=100 µm、1 ns</td>
+              <td>壁は約 104 eV、放射熱波前線は約 35 µm。前方に冷域が残る教科書的プロファイル。</td>
+            </tr>
+            <tr>
+              <td>レーザー爆縮カプセル (直接照射)</td>
+              <td>GXII 級。DT ガス 0.01 g/cc / 230 µm + CH シェル 250 µm + コロナ ramp、351 nm raytrace 10 TW × 1 ns (10 ps ramp)、2T + 20 群 FLD</td>
+              <td>吸収は約 86%、bang は約 1.4 ns、ρ<sub>peak</sub> は約 120 g/cc (per-step 履歴)。RTX 4090 で約 22 秒で完走。</td>
+            </tr>
+            <tr>
+              <td>間接照射 Tr(t)</td>
+              <td>外側 Marshak 境界の折れ線 Tr(t): foot 120 eV (0.5 ns) → 1 ns で 200 eV へ ramp → 5 ns 保持。ablator κ=2000 cm²/g</td>
+              <td>bang は約 4.2–4.5 ns、最小半径は約 10 µm (CR≈30)。停滞・反跳まで捕捉。</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <aside class="tip">
+        <strong>ヒント:</strong> プリセット適用後も全フィールドは自由に編集できます。まずプリセットで動く状態を作り、そこから条件を振るのが安全な進め方です。
+      </aside>
+    </section>
+
+    <section id="basic">
+      <h2>4. 基本設定</h2>
+      <figure>
+        <img src="img/ja/03_basic.png" alt="基本設定フォーム">
+        <figcaption>ケース名、次元、1D 幾何、温度モデル、乱数 seed、ステップ数、終了時刻を設定します。</figcaption>
+      </figure>
+
+      <ul>
+        <li><strong>ケース名:</strong> 出力ディレクトリ名 <code>outputs/&lt;name&gt;</code> になります。</li>
+        <li><strong>次元:</strong> 本マニュアルでは 1D を使用します。<strong>2D RZ モードは本マニュアルの対象外です (別途)</strong>。</li>
+        <li><strong>1D 幾何:</strong> 球対称、円筒、平面から選びます。</li>
+        <li><strong>温度モデル:</strong> 通常は 2T を推奨します。1T は放射スラブのような単純問題向けです。</li>
+        <li><strong>乱数 seed:</strong> 確率過程の再現に使う seed です。</li>
+        <li><strong>最大ステップ数:</strong> 計算ステップ数の上限です。</li>
+        <li><strong>終了時刻 <code>t_end</code>:</strong> シミュレーションの物理終了時刻を s で指定します。</li>
+      </ul>
+    </section>
+
+    <section id="materials">
+      <h2>5. 材料</h2>
+      <figure>
+        <img src="img/ja/04_materials.png" alt="材料設定フォーム">
+        <figcaption>材料ごとに A/Z、EOS、不透明度を定義します。</figcaption>
+      </figure>
+
+      <ul>
+        <li><strong>A/Z:</strong> 原子量 A と原子番号 Z を指定します。</li>
+        <li><strong>EOS:</strong> <code>ideal_gas</code> では γ を指定し、必要なら cv<sub>e</sub> を上書きします。TMAT テーブルを使う場合はテーブルファイルを指定します。</li>
+        <li><strong>不透明度:</strong> <code>constant</code> では κ<sub>a</sub>、κ<sub>s</sub> [cm²/g] を指定します。テーブル不透明度も選択できます。</li>
+      </ul>
+
+      <aside class="tip">
+        <strong>定数不透明度の目安:</strong> CH の sub-keV 帯 Planck 平均は数千 cm²/g 級です。旧来デモでよく使われる κ=100 は薄すぎて放射がほぼ素通りし、爆縮系では殻がその場加熱で爆発します。検証済みプリセットが κ=2000 を使うのはこのためです。
+      </aside>
+    </section>
+
+    <section id="geometry">
+      <h2>6. ジオメトリー: 格子と領域</h2>
+      <figure>
+        <img src="img/ja/05_mesh.png" alt="格子と材料領域の設定">
+        <figcaption>1D Lagrangian 格子と、内側から外側へ積み重ねる材料領域を設定します。</figcaption>
+      </figure>
+
+      <h3>格子</h3>
+      <p><code>r_max</code>、セル数 <code>nr</code>、格子タイプ (<code>uniform</code> など) を指定します。メッシュは流体とともに動く Lagrangian メッシュです。</p>
+
+      <h3>領域</h3>
+      <p>内側から順に材料領域を積みます。各領域には材料、外半径 <code>rOuter</code>、密度、初期電子温度 Te、初期イオン温度 Ti を指定します。既定では、最終領域の <code>rOuter</code> は <code>r_max</code> と一致している必要があります。</p>
+
+      <h3>外側真空 (VOID)</h3>
+      <p>「外側真空」を ON にすると、最終領域の外側が VOID 材料でマスクされます。このとき <code>rOuter &lt; r_max</code> が必要です。伝導・放射は VOID を素通りしない扱いになり、床密度で真空域を充填することによる数値病理を避けられます。</p>
+
+      <h3>プリプラズマ・コロナ ramp</h3>
+      <p>外側真空が ON のとき、コロナ ramp をさらに有効化できます。最終領域表面から指数減衰する低密度コロナを、スケール長 L、範囲、ρ<sub>0</sub>、床密度で指定します。</p>
+
+      <aside class="warn">
+        <strong>重要:</strong> レーザーデッキでコロナ ramp を切ると、冷たい固体端で光線が臨界面反射し、吸収が約 0.04% まで落ちて何も起きません。逆制動放射の光路がないためです。レーザー直接照射では ramp を必ず有効にしてください。既定値 (L=2 µm / 範囲 10 µm / ρ<sub>0</sub>=0.05 g/cm³ / 床 3×10<sup>−4</sup> g/cm³) は GXII 検証構成そのものです。
+      </aside>
+
+      <figure>
+        <img src="img/ja/06_mesh_vacuum.png" alt="外側真空設定によるバリデーションエラー">
+        <figcaption>バリデーションエラーの実演。<code>rOuter=r_max</code> のまま外側真空を ON にすると、右ペインは赤字のエラー一覧に切り替わります。<code>rOuter &lt; r_max</code> に修正するとデッキ生成が自動再開されます。</figcaption>
+      </figure>
+    </section>
+
+    <section id="physics">
+      <h2>7. 物理</h2>
+      <figure>
+        <img src="img/ja/07_radiation.png" alt="輻射輸送設定">
+        <figcaption>FLD の群構成と外側輻射境界を設定します。</figcaption>
+      </figure>
+
+      <h3>輻射輸送</h3>
+      <p>輻射輸送を有効化し、ソルバーに FLD (flux-limited diffusion、流束制限拡散) を選びます。群数と群境界 [eV] を指定し、1 群なら灰色近似になります。外側境界は真空または Marshak です。Marshak 温度は定数 Tr、または駆動タブの間接照射と連動する折れ線 Tr(t) で与えられます。</p>
+
+      <h3>電子熱伝導</h3>
+      <p>電子熱伝導を有効にすると、非局所電子熱輸送モデルを選択できます。「なし」は局所 Spitzer–Härm (SH)、「SNB」は非局所モデルです。モデル選択の下にある flux limiter の係数 <code>f_lim</code> は、モデル切替時に SH → 0.06 (較正済みリミッタ)、SNB → 0.5 (安全キャップ) へ自動設定されます。SNB 自身が非局所抑制を担うため、小さい f のままでは SNB の物理を覆い隠します。</p>
+
+      <figure>
+        <img src="img/ja/08_conduction_snb.png" alt="SNB 非局所電子熱伝導の詳細設定">
+        <figcaption>SNB の既定詳細設定。検証済みのため通常は変更不要です。</figcaption>
+      </figure>
+
+      <p>SNB の既定値は、エネルギー群数 24、E<sub>max</sub>/(k<sub>B</sub>T<sub>e</sub>)=20、群 mfp 変種 <code>geometric_r2</code> (Sherlock 2017)、電場補正「なし」、Picard 反復上限 8、<code>rtol</code>=0.01 です。r=2 の較正には電場補正が織り込み済みなので、<code>local</code> と併用すると二重計上になります。</p>
+
+      <ul>
+        <li><strong>イオン熱伝導:</strong> イオンの熱伝導を個別に ON/OFF します。</li>
+        <li><strong>流体:</strong> 有効化、外側境界 (<code>free</code> / <code>pressure</code>)、開始時刻 <code>T_start</code> を設定します。</li>
+        <li><strong>プラズマ粘性:</strong> 既定は OFF です。</li>
+      </ul>
+    </section>
+
+    <section id="drive">
+      <h2>8. 駆動</h2>
+      <p>駆動方式は「なし」「レーザー直接照射」「輻射温度 Tr(t) (間接照射)」「外部圧力 P<sub>ext</sub>(t)」から選びます。</p>
+
+      <h3>レーザー直接照射</h3>
+      <p>波長、レイトレース、波形、パワー、パルス長を設定します。1D では単一参照ビームの光学のみを指定し、方向・本数・配分は意味を持たないため表示されません。波形は矩形 (rise/fall 付き)、ガウス、折れ線テーブルから選べます。</p>
+
+      <figure>
+        <img src="img/ja/09_laser.png" alt="レーザー直接照射の設定">
+        <figcaption>レーザーの波長、レイトレース、時間波形、パワー、パルス長を設定します。</figcaption>
+      </figure>
+
+      <h3>ビーム光学</h3>
+      <p>f 値、スポット <code>w0</code>、スーパーガウス次数を設定します。GXII 検証値は f/3、w<sub>0</sub>=200 µm、m=4 です。</p>
+
+      <figure>
+        <img src="img/ja/10_laser_beam.png" alt="レーザービーム光学設定">
+        <figcaption>1D の単一参照ビームに対するビーム光学パラメータ。</figcaption>
+      </figure>
+
+      <h3>CBET</h3>
+      <p>CBET を有効化すると、ポート配置プリセット (GXII 12 / OMEGA 60 / NIF 192 の理想化配置) と Δλ デチューニングなどが表示されます。多ビーム間エネルギー交換を、単一参照トレースの位相空間再構成で計算する 1D 専用実装です。</p>
+
+      <figure>
+        <img src="img/ja/11_laser_cbet.png" alt="CBET 設定">
+        <figcaption>CBET のポート配置プリセットとデチューニング設定。</figcaption>
+      </figure>
+
+      <h3>ホット電子</h3>
+      <p>η(t) モデルなどを使って、高速電子の生成・輸送・沈着を付加します。</p>
+
+      <figure>
+        <img src="img/ja/12_laser_hote.png" alt="ホット電子設定">
+        <figcaption>ホット電子の生成効率モデルと輸送・沈着の設定。</figcaption>
+      </figure>
+
+      <h3>間接照射 Tr(t)</h3>
+      <p>駆動方式で「輻射温度 Tr(t)」を選ぶと、Marshak Tr(t) の波形エディタが使えます。検証済みの波形例は <a href="#presets">§3 の間接照射プリセット</a>を参照してください。</p>
+
+      <h3>外部圧力</h3>
+      <p>1D 境界に対する圧力駆動 P<sub>ext</sub>(t) を指定します。</p>
+    </section>
+
+    <section id="output">
+      <h2>9. 出力</h2>
+      <figure>
+        <img src="img/ja/13_output.png" alt="出力設定フォーム">
+        <figcaption>出力先、スナップショット、履歴、チェックポイントを設定します。</figcaption>
+      </figure>
+
+      <ul>
+        <li><strong>出力ディレクトリ:</strong> 空欄なら <code>outputs/&lt;ケース名&gt;</code> です。</li>
+        <li><strong>スナップショット間隔:</strong> <code>plot_every_s</code> で指定します。</li>
+        <li><strong>履歴:</strong> 時系列の診断量を保存します。</li>
+        <li><strong>チェックポイント:</strong> 再開用データの出力を設定します。</li>
+      </ul>
+
+      <aside class="tip">
+        <strong>重要:</strong> スナップショットは既定で 50 ps 間隔です。爆縮の停滞ピークは約 15 ps 程度しかなく、スナップショットの ρ 最大値はピークを過小評価しえます。ピーク値は per-step 履歴の <code>implosion/rho_peak</code> で読んでください。
+      </aside>
+    </section>
+
+    <section id="deck">
+      <h2>10. デッキの確認・保存・実行</h2>
+      <p>右ペインには常に最新のデッキが表示されます。「コピー」「ファイルへ保存」「読み込み」を使ってデッキを扱えます。</p>
+
+      <figure>
+        <img src="img/ja/14_deck_laser_preset.png" alt="右ペインのデッキプレビュー">
+        <figcaption>フォームから自動生成された最新の Python デッキ。</figcaption>
+      </figure>
+
+      <figure>
+        <img src="img/ja/15_deck_scrolled.png" alt="スクロールしたデッキプレビューと検証パネル">
+        <figcaption>デッキ全体を確認しながら、検証パネルから validate と実行を行えます。</figcaption>
+      </figure>
+
+      <p>検証パネルの「validate 実行」は、選択サーバー上で dry-run 検証を行います。実行▶は選択サーバーへジョブを投入し、進行状況は「実行履歴」タブで追跡できます。サーバー未設定でも、デッキを保存して手元で次のように実行できます。</p>
+
+      <pre><code>./build/tenryu run deck.py</code></pre>
+
+      <aside class="tip">
+        <strong>ヒント:</strong> デッキはただの Python なので、保存後に手で編集しても構いません。ただし <code>TENRYU-GUI-STATE</code> コメントを消すとフォーム状態を復元できなくなります。
+      </aside>
+    </section>
+
+    <section id="troubleshooting">
+      <h2>11. トラブルシューティング</h2>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>症状</th>
+              <th>原因</th>
+              <th>対処</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>レーザーの吸収がほぼゼロ</td>
+              <td>コロナ ramp が無効</td>
+              <td><a href="#geometry">§6</a> の ramp を ON にします。既定値で構いません。</td>
+            </tr>
+            <tr>
+              <td>デッキが表示されず、赤字のエラー一覧が出る</td>
+              <td>フォーム検証エラー</td>
+              <td>一覧の各行を修正します。たとえば外側真空が ON のときは <code>rOuter &lt; r_max</code> が必要です。</td>
+            </tr>
+            <tr>
+              <td>Marshak 駆動で殻が爆縮しない</td>
+              <td>不透明度が薄い (τ&lt;1 で体積加熱)、または foot が長すぎる</td>
+              <td>κ を実材料相当の数千 cm²/g へ上げ、ramp を早めます。検証済みの間接照射プリセットを参照してください。</td>
+            </tr>
+            <tr>
+              <td>ρ<sub>peak</sub> がプリセット記載より低い</td>
+              <td>スナップショットの間引き</td>
+              <td>per-step 履歴で読みます (<a href="#output">§9</a>)。</td>
+            </tr>
+            <tr>
+              <td>実行が <code>t_end</code> 直前で警告 <code>[dt_floor_abort]</code> を出す</td>
+              <td>旧版の端点丸め表示 (2026-07-31 修正済み)</td>
+              <td>最新版へ更新してください。</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <footer>TENRYU Studio manual — generated 2026-07-31. 1D edition.</footer>
+  </main>
+</body>
+</html>

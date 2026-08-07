@@ -15,10 +15,10 @@
     <p class="abstract">TENRYU Studio は、TENRYU の Python namelist のデッキをフォームから作成するデスクトップアプリである。入力に応じてデッキをその場で生成し、検証、保存、ローカルまたはサーバーでの実行までを、ひとつの画面で扱える。保存したデッキにはフォームの状態も埋め込まれるため、コードと GUI のあいだを行き来しながら設定を育てられる。</p>
 
     <div class="button-row">
-      <a class="button" href="../../../../gui/manual/index_ja.html">日本語 GUI マニュアル</a>
-      <a class="button" href="../../../../gui/manual/index_en.html">英語 GUI マニュアル</a>
+      <a class="button" href="../../gui/manual/index_ja.html">日本語 GUI マニュアル</a>
+      <a class="button" href="../../gui/manual/index_en.html">英語 GUI マニュアル</a>
     </div>
-    <p>GUI マニュアルは TENRYU リポジトリの <code>gui/manual/</code> に同梱される別の文書一式である。上のボタン（およびトップバーの「GUI マニュアル」リンク）は、本ドキュメントをリポジトリのチェックアウト内で閲覧しているときに解決する。サイト単体の複製では解決しない。</p>
+    <p>GUI マニュアルは <code>gui/manual/</code> に同梱される別の文書一式で、本サイトにも含まれている。上のボタン（およびトップバーの「GUI マニュアル」リンク）から開ける。</p>
 
     <aside class="planned" aria-labelledby="at-a-glance">
       <h3 id="at-a-glance">要点</h3>
@@ -34,7 +34,7 @@
       <h2 id="workflow">フォームから実行まで</h2>
       <p>Studio の左のナビゲーションは、プリセット、基本設定、材料、ジオメトリー、物理、駆動、出力を、設定する順に並べている。中央で選択中のフォームを編集すると、右のペインに常に最新の Python namelist が表示される。必須の値が欠けていたり、整合しない組合せがあったりする場合は、その場でエラーを示し、修正すると生成を再開する。これにより、長さは cm、時間は s、温度は eV、密度は g/cm³ という TENRYU の cgs + eV の規約を確認しながら入力できる。</p>
       <figure>
-        <img src="../../../../gui/manual/img/ja/01_overview.png" alt="TENRYU Studio の画面全体" style="max-width: 100%; height: auto;">
+        <img src="../../gui/manual/img/ja/01_overview.png" alt="TENRYU Studio の画面全体" style="max-width: 100%; height: auto;">
         <figcaption>ヘッダーと左のナビゲーション、中央の設定フォーム、右側の生成されたデッキと検証パネル。</figcaption>
       </figure>
       <p>基本の流れは「フォームを作る → 生成されたデッキを読む → 検証する → 保存または実行」である。プリセットは出発点であり、適用したあとの項目はすべて編集できる。右のペインで生成内容を確認し、検証結果のエラーを解消してからファイルへ保存すること。保存したデッキは通常の Python のファイルなので、Studio を介さずに <code>./build/tenryu run deck.py</code> で実行することも、テキストエディタで内容を確認することもできる。</p>
