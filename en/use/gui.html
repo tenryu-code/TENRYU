@@ -15,10 +15,10 @@
     <p class="abstract">TENRYU Studio is a desktop application for creating TENRYU Python namelist decks through a form. It generates the deck live as inputs change and brings validation, saving, and local or server execution into one workspace. A saved deck also carries its form state, so a configuration can move between code and the GUI without a separate project file.</p>
 
     <div class="button-row">
-      <a class="button" href="../../../../gui/manual/index_en.html">English GUI manual</a>
-      <a class="button" href="../../../../gui/manual/index_ja.html">Japanese GUI manual</a>
+      <a class="button" href="../../gui/manual/index_en.html">English GUI manual</a>
+      <a class="button" href="../../gui/manual/index_ja.html">Japanese GUI manual</a>
     </div>
-    <p>The GUI manual is a separate document set shipped with the TENRYU repository under <code>gui/manual/</code>; the buttons above (and the “GUI manual” link in the top bar) resolve when this documentation is browsed inside a repository checkout, not from a standalone copy of the site.</p>
+    <p>The GUI manual is a separate document set shipped under <code>gui/manual/</code> and bundled with this site; use the buttons above (or the “GUI manual” link in the top bar) to open it.</p>
 
     <aside class="planned" aria-labelledby="at-a-glance">
       <h3 id="at-a-glance">At a glance</h3>
@@ -34,7 +34,7 @@
       <h2 id="workflow">From form to run</h2>
       <p>Studio's left navigation follows the normal setup order: Presets, Basic, Materials, Geometry, Physics, Drive, and Output. The center pane contains the selected form, while the live deck in the right pane always shows the latest Python namelist. Missing required values or inconsistent combinations produce errors in place; deck generation resumes after they are corrected. This makes the TENRYU cgs + eV contract visible while editing: lengths are in cm, times in s, temperatures in eV, and densities in g/cm³.</p>
       <figure>
-        <img src="../../../../gui/manual/img/en/01_overview.png" alt="Complete TENRYU Studio window" style="max-width: 100%; height: auto;">
+        <img src="../../gui/manual/img/en/01_overview.png" alt="Complete TENRYU Studio window" style="max-width: 100%; height: auto;">
         <figcaption>The header and navigation, center configuration form, and live deck and validation panel on the right.</figcaption>
       </figure>
       <p>The basic sequence is form → live deck → validate → save or run. A preset is a starting point, and every field remains editable after it is applied. Read the generated deck, resolve all validation errors, then save it to a file. The result is an ordinary Python deck: it can be run outside Studio with <code>./build/tenryu run deck.py</code> and inspected in any text editor.</p>

@@ -205,8 +205,8 @@
           <span class="subtitle">${text.subtitle}</span>
         </a>
         <nav class="topbar-links" aria-label="${text.externalLinks}">
-          <a href="${rootPrefix}../../../gui/manual/index_${lang}.html">${text.guiManual}</a>
-          <a href="#" aria-label="TENRYU on GitHub">GitHub</a>
+          <a href="${rootPrefix}../gui/manual/index_${lang}.html">${text.guiManual}</a>
+          <a href="https://github.com/tenryu-code/TENRYU" aria-label="TENRYU on GitHub">GitHub</a>
           <span class="language-switcher" aria-label="${text.language}">
             ${languageLink("en", "English")}<span aria-hidden="true">|</span>${languageLink("ja", "日本語")}
           </span>
