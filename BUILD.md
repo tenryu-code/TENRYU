@@ -16,7 +16,7 @@
 計算サーバ上で次のコマンドを実行します。
 
 ```bash
-git clone <beta-repo> TENRYU && cd TENRYU
+git clone https://github.com/tenryu-code/TENRYU.git && cd TENRYU
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DPython3_EXECUTABLE=$(which python3)
 ninja -C build tenryu
 ./build/tenryu run examples/verification/sod_planar.py   # 動作確認
