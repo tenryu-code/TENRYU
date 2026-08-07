@@ -1,0 +1,13 @@
+[2026-07-11 16:09:17.768] [info] [TENRYU] Configuration validated successfully.
+[2026-07-11 16:09:17.768] [info] [TENRYU] ---- pre-flight summary ----
+[2026-07-11 16:09:17.768] [info] [TENRYU] main      : name=template_1d_slab_radiation  dimension=1D_SPH  geometry=planar  t_end=1e-09 s
+[2026-07-11 16:09:17.768] [info] [TENRYU] mesh      : nr=200  r=[0, 0.06] cm  cells=200
+[2026-07-11 16:09:17.768] [info] [TENRYU] material  : ch_slab  A=6.5 Z=3.5  eos=ideal_gas  opacity=constant kappa_a=100 cm2/g
+[2026-07-11 16:09:17.768] [info] [TENRYU] radiation : enabled=true  mode=multigroup_diffusion  groups=1  boundary inner=reflect outer=marshak
+[2026-07-11 16:09:17.768] [info] [TENRYU] laser     : enabled=false
+[2026-07-11 16:09:17.768] [info] [TENRYU] hydro     : enabled=false
+[2026-07-11 16:09:17.768] [info] [TENRYU] conduction: enabled=false
+[2026-07-11 16:09:17.768] [info] [TENRYU] burn      : enabled=false
+[2026-07-11 16:09:17.768] [info] [TENRYU] numerics  : dt_initial=1e-14 s  dt_max=2e-12 s
+[2026-07-11 16:09:17.768] [info] [TENRYU] output    : dir=outputs/template_1d_slab_radiation  plot_every=0  history_every=1
+[2026-07-11 16:09:17.768] [info] [TENRYU] ----------------------------

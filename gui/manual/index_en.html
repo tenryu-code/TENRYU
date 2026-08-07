@@ -1,0 +1,341 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TENRYU Studio User Manual (1D)</title>
+  <link rel="stylesheet" href="manual.css">
+</head>
+<body>
+  <main>
+    <header>
+      <h1>TENRYU Studio User Manual (1D)</h1>
+      <p class="lead">A GUI for safely building input decks for TENRYU 1D radiation-hydrodynamics simulations using forms alone.</p>
+      <p class="meta">Generated: 2026-07-31</p>
+      <a class="language-link" href="index_ja.html" lang="ja">日本語版</a>
+    </header>
+
+    <nav class="toc" aria-labelledby="toc-title">
+      <h2 id="toc-title">Contents</h2>
+      <ol>
+        <li><a href="#overview">Overview and workflow</a></li>
+        <li><a href="#quickstart">Three-minute quick start</a></li>
+        <li><a href="#presets">1D presets (run-verified)</a></li>
+        <li><a href="#basic">Basic settings</a></li>
+        <li><a href="#materials">Materials</a></li>
+        <li><a href="#geometry">Geometry: mesh and regions</a></li>
+        <li><a href="#physics">Physics</a></li>
+        <li><a href="#drive">Drive</a></li>
+        <li><a href="#output">Output</a></li>
+        <li><a href="#deck">Reviewing, saving, and running a deck</a></li>
+        <li><a href="#troubleshooting">Troubleshooting</a></li>
+      </ol>
+    </nav>
+
+    <section id="overview">
+      <h2>1. Overview and workflow</h2>
+      <p>TENRYU Studio is a GUI that continuously generates a Python deck (namelist) in the right pane from form inputs, then supports validation, saving, and execution. The unit system is <strong>cgs + eV</strong>: length in cm, time in s, temperature in eV, density in g/cm<sup>3</sup>, and power in W.</p>
+
+      <figure>
+        <img src="img/en/01_overview.png" alt="Complete TENRYU Studio window">
+        <figcaption>The interface consists of the header, left navigation, central form, and the deck preview and validation panel on the right.</figcaption>
+      </figure>
+
+      <p>The header contains Open, Save, Save As, the language selector, execution-server selector, Validate, and Run ▶. The left navigation contains Presets, Basic, Materials, Geometry, Physics, Drive, Output, Run History, and Servers. The selected form appears in the center, while the deck preview and validation panel appear on the right.</p>
+
+      <aside class="tip">
+        <strong>Tip:</strong> A <code>TENRYU-GUI-STATE</code> comment embedded at the beginning of the deck lets Open restore the complete form state from a saved deck.
+      </aside>
+
+      <figure>
+        <img src="img/en/16_langswitch.png" alt="Language selector in the header">
+        <figcaption>You can change the interface language at any time from the drop-down menu in the header.</figcaption>
+      </figure>
+    </section>
+
+    <section id="quickstart">
+      <h2>2. Three-minute quick start</h2>
+      <ol>
+        <li>
+          Open Presets in the left navigation and select the <strong>1D</strong> tab. On the card closest to your intended problem, click “Apply this preset.”
+          <figure>
+            <img src="img/en/02_presets.png" alt="1D preset selection screen">
+            <figcaption>Starting from a verified 1D preset populates the form with a complete, consistent set of settings.</figcaption>
+          </figure>
+        </li>
+        <li>
+          Review the generated content in the deck preview on the right.
+          <figure>
+            <img src="img/en/14_deck_laser_preset.png" alt="Deck generated from the laser preset">
+            <figcaption>The deck preview immediately after applying a preset. Form changes appear here automatically.</figcaption>
+          </figure>
+        </li>
+        <li>Use “Save to file” to write the deck, then run <code>./build/tenryu run &lt;deck&gt;.py</code>. If an execution server is configured, you can instead submit it with Run ▶ in the header.</li>
+      </ol>
+
+      <aside class="tip">
+        <strong>Tip:</strong> While the form contains validation errors, the deck is replaced by a red error list. Deck generation resumes after the errors are corrected. See <a href="#basic">§4</a> and <a href="#geometry">§6</a>.
+      </aside>
+    </section>
+
+    <section id="presets">
+      <h2>3. 1D presets (run-verified)</h2>
+      <p>Studio provides three physics presets plus a blank preset. All three physics presets completed successfully on actual hardware (RTX 4090) and were confirmed to produce physically valid results on 2026-07-31.</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Preset</th>
+              <th>Physics</th>
+              <th>Verified result</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Radiation slab (planar 1D)</td>
+              <td>Gray FLD + Marshak 120 eV, hydro OFF, κ=2000 cm²/g, cv<sub>e</sub>=3×10<sup>11</sup> erg/(g·eV), ρ=0.2 g/cm³, L=100 µm, 1 ns</td>
+              <td>Wall temperature about 104 eV and radiation heat-front position about 35 µm, with a cold region remaining ahead: a textbook profile.</td>
+            </tr>
+            <tr>
+              <td>Laser implosion capsule (direct drive)</td>
+              <td>GXII class. DT gas at 0.01 g/cc / 230 µm + CH shell at 250 µm + corona ramp; 351 nm ray tracing at 10 TW × 1 ns (10 ps ramp); 2T + 20-group FLD</td>
+              <td>About 86% absorption, bang at about 1.4 ns, and ρ<sub>peak</sub> about 120 g/cc in per-step history. Completes in about 22 seconds on an RTX 4090.</td>
+            </tr>
+            <tr>
+              <td>Indirect-drive Tr(t)</td>
+              <td>Piecewise-linear Tr(t) at the outer Marshak boundary: 120 eV foot (0.5 ns) → ramp to 200 eV by 1 ns → hold through 5 ns. Ablator κ=2000 cm²/g</td>
+              <td>Bang at about 4.2–4.5 ns and minimum radius about 10 µm (CR≈30), capturing stagnation and rebound.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <aside class="tip">
+        <strong>Tip:</strong> Every field remains editable after a preset is applied. A safe workflow is to establish a working case with a preset first, then vary its conditions.
+      </aside>
+    </section>
+
+    <section id="basic">
+      <h2>4. Basic settings</h2>
+      <figure>
+        <img src="img/en/03_basic.png" alt="Basic settings form">
+        <figcaption>Set the case name, dimension, 1D geometry, temperature model, random seed, maximum step count, and end time.</figcaption>
+      </figure>
+
+      <ul>
+        <li><strong>Case name:</strong> Becomes the output directory name <code>outputs/&lt;name&gt;</code>.</li>
+        <li><strong>Dimension:</strong> This manual uses 1D. <strong>2D RZ mode is outside the scope of this manual (covered separately).</strong></li>
+        <li><strong>1D geometry:</strong> Choose spherical, cylindrical, or planar symmetry.</li>
+        <li><strong>Temperature model:</strong> 2T is recommended in general. 1T is intended for simple problems such as the radiation slab.</li>
+        <li><strong>Random seed:</strong> The seed used to reproduce stochastic processes.</li>
+        <li><strong>Maximum steps:</strong> The upper limit on the number of calculation steps.</li>
+        <li><strong>End time <code>t_end</code>:</strong> The physical end time of the simulation, in s.</li>
+      </ul>
+    </section>
+
+    <section id="materials">
+      <h2>5. Materials</h2>
+      <figure>
+        <img src="img/en/04_materials.png" alt="Material settings form">
+        <figcaption>Define A/Z, the EOS, and opacity for each material.</figcaption>
+      </figure>
+
+      <ul>
+        <li><strong>A/Z:</strong> Specify atomic mass A and atomic number Z.</li>
+        <li><strong>EOS:</strong> For <code>ideal_gas</code>, specify γ and override cv<sub>e</sub> if needed. For a TMAT table, specify the table file.</li>
+        <li><strong>Opacity:</strong> For <code>constant</code>, specify κ<sub>a</sub> and κ<sub>s</sub> [cm²/g]. Tabulated opacity is also available.</li>
+      </ul>
+
+      <aside class="tip">
+        <strong>Constant-opacity guideline:</strong> The sub-keV Planck mean for CH is on the order of several thousand cm²/g. The κ=100 value common in older demos is too transparent: radiation passes almost straight through, and an implosion shell explodes from in-place heating. This is why the verified presets use κ=2000.
+      </aside>
+    </section>
+
+    <section id="geometry">
+      <h2>6. Geometry: mesh and regions</h2>
+      <figure>
+        <img src="img/en/05_mesh.png" alt="Mesh and material-region settings">
+        <figcaption>Configure the 1D Lagrangian mesh and material regions stacked from the inside outward.</figcaption>
+      </figure>
+
+      <h3>Mesh</h3>
+      <p>Specify <code>r_max</code>, the cell count <code>nr</code>, and a mesh type such as <code>uniform</code>. This is a Lagrangian mesh that moves with the fluid.</p>
+
+      <h3>Regions</h3>
+      <p>Stack material regions from the inside outward. Each region specifies a material, outer radius <code>rOuter</code>, density, initial electron temperature Te, and initial ion temperature Ti. By default, the final region's <code>rOuter</code> must equal <code>r_max</code>.</p>
+
+      <h3>Outer vacuum (VOID)</h3>
+      <p>Enabling Outer vacuum masks the area outside the final region with the VOID material. This requires <code>rOuter &lt; r_max</code>. Conduction and radiation do not pass through VOID, avoiding numerical pathologies caused by filling a vacuum region at the density floor.</p>
+
+      <h3>Preplasma/corona ramp</h3>
+      <p>When Outer vacuum is enabled, you can also enable the corona ramp. It places a low-density corona that decays exponentially from the final region's surface, specified by scale length L, extent, ρ<sub>0</sub>, and density floor.</p>
+
+      <aside class="warn">
+        <strong>Important:</strong> If the corona ramp is disabled in a laser deck, rays reflect at the critical surface at the cold solid edge. Absorption drops to about 0.04%, and nothing happens because there is no inverse-bremsstrahlung path length. Always enable the ramp for direct laser drive. The defaults (L=2 µm / extent 10 µm / ρ<sub>0</sub>=0.05 g/cm³ / floor 3×10<sup>−4</sup> g/cm³) are the verified GXII configuration itself.
+      </aside>
+
+      <figure>
+        <img src="img/en/06_mesh_vacuum.png" alt="Validation error caused by the outer-vacuum setting">
+        <figcaption>A validation-error example. If Outer vacuum is enabled while <code>rOuter=r_max</code>, the right pane switches to a red error list. Correcting it to <code>rOuter &lt; r_max</code> automatically resumes deck generation.</figcaption>
+      </figure>
+    </section>
+
+    <section id="physics">
+      <h2>7. Physics</h2>
+      <figure>
+        <img src="img/en/07_radiation.png" alt="Radiation-transport settings">
+        <figcaption>Configure the FLD groups and outer radiation boundary.</figcaption>
+      </figure>
+
+      <h3>Radiation transport</h3>
+      <p>Enable radiation transport and select FLD (flux-limited diffusion) as the solver. Specify the number of groups and group boundaries [eV]; one group gives gray transport. The outer boundary can be vacuum or Marshak. The Marshak temperature can be a constant Tr or a piecewise-linear Tr(t) linked to indirect drive in the Drive tab.</p>
+
+      <h3>Electron thermal conduction</h3>
+      <p>After enabling electron thermal conduction, select a nonlocal electron-transport model. “None” gives local Spitzer–Härm (SH); “SNB” gives nonlocal transport. The flux-limiter coefficient <code>f_lim</code> appears below the model selector and is set automatically when the model changes: SH → 0.06 (calibrated limiter), SNB → 0.5 (safety cap). Because SNB itself supplies the nonlocal suppression, leaving a small f would mask the SNB physics.</p>
+
+      <figure>
+        <img src="img/en/08_conduction_snb.png" alt="Detailed SNB nonlocal electron-conduction settings">
+        <figcaption>The verified default SNB details normally do not need adjustment.</figcaption>
+      </figure>
+
+      <p>The SNB defaults are 24 energy groups, E<sub>max</sub>/(k<sub>B</sub>T<sub>e</sub>)=20, group-mfp variant <code>geometric_r2</code> (Sherlock 2017), no electric-field correction, Picard iteration limit 8, and <code>rtol</code>=0.01. The electric-field correction is already folded into the r=2 calibration; combining it with <code>local</code> would count the correction twice.</p>
+
+      <ul>
+        <li><strong>Ion thermal conduction:</strong> Separately enable or disable ion thermal conduction.</li>
+        <li><strong>Hydrodynamics:</strong> Set enabled/disabled, outer boundary (<code>free</code> / <code>pressure</code>), and start time <code>T_start</code>.</li>
+        <li><strong>Plasma viscosity:</strong> OFF by default.</li>
+      </ul>
+    </section>
+
+    <section id="drive">
+      <h2>8. Drive</h2>
+      <p>Select the drive type from None, Direct laser drive, Radiation temperature Tr(t) (indirect drive), or External pressure P<sub>ext</sub>(t).</p>
+
+      <h3>Direct laser drive</h3>
+      <p>Set wavelength, ray tracing, waveform, power, and pulse duration. In 1D, only the optics of a single reference beam are specified; direction, beam count, and power allocation are omitted because they have no meaning in 1D. Available waveforms are rectangular with rise/fall, Gaussian, and a piecewise-linear table.</p>
+
+      <figure>
+        <img src="img/en/09_laser.png" alt="Direct laser-drive settings">
+        <figcaption>Set laser wavelength, ray tracing, temporal waveform, power, and pulse duration.</figcaption>
+      </figure>
+
+      <h3>Beam optics</h3>
+      <p>Set the f-number, spot size <code>w0</code>, and super-Gaussian order. The verified GXII values are f/3, w<sub>0</sub>=200 µm, and m=4.</p>
+
+      <figure>
+        <img src="img/en/10_laser_beam.png" alt="Laser beam-optics settings">
+        <figcaption>Beam-optics parameters for the single 1D reference beam.</figcaption>
+      </figure>
+
+      <h3>CBET</h3>
+      <p>Enabling CBET reveals port-layout presets (idealized GXII 12 / OMEGA 60 / NIF 192 layouts), Δλ detuning, and related settings. This 1D-specific implementation computes multibeam energy exchange through phase-space reconstruction from a single reference trace.</p>
+
+      <figure>
+        <img src="img/en/11_laser_cbet.png" alt="CBET settings">
+        <figcaption>CBET port-layout presets and detuning settings.</figcaption>
+      </figure>
+
+      <h3>Hot electrons</h3>
+      <p>Add fast-electron generation, transport, and deposition using an η(t) model and related settings.</p>
+
+      <figure>
+        <img src="img/en/12_laser_hote.png" alt="Hot-electron settings">
+        <figcaption>Hot-electron generation-efficiency model and transport/deposition settings.</figcaption>
+      </figure>
+
+      <h3>Indirect-drive Tr(t)</h3>
+      <p>Selecting Radiation temperature Tr(t) as the drive type enables the Marshak Tr(t) waveform editor. See the <a href="#presets">verified indirect-drive preset in §3</a> for an example waveform.</p>
+
+      <h3>External pressure</h3>
+      <p>Specify the boundary-pressure drive P<sub>ext</sub>(t) for the 1D domain.</p>
+    </section>
+
+    <section id="output">
+      <h2>9. Output</h2>
+      <figure>
+        <img src="img/en/13_output.png" alt="Output settings form">
+        <figcaption>Configure the output destination, snapshots, history, and checkpoints.</figcaption>
+      </figure>
+
+      <ul>
+        <li><strong>Output directory:</strong> If blank, this is <code>outputs/&lt;case-name&gt;</code>.</li>
+        <li><strong>Snapshot interval:</strong> Set by <code>plot_every_s</code>.</li>
+        <li><strong>History:</strong> Saves time-series diagnostic quantities.</li>
+        <li><strong>Checkpoints:</strong> Configures output of restart data.</li>
+      </ul>
+
+      <aside class="tip">
+        <strong>Important:</strong> The default snapshot interval is 50 ps. An implosion stagnation peak lasts only about 15 ps, so the maximum snapshot ρ can underestimate the actual peak. Read the peak from <code>implosion/rho_peak</code> in the per-step history.
+      </aside>
+    </section>
+
+    <section id="deck">
+      <h2>10. Reviewing, saving, and running a deck</h2>
+      <p>The right pane always displays the latest deck. Use Copy, Save to file, and Open to work with it.</p>
+
+      <figure>
+        <img src="img/en/14_deck_laser_preset.png" alt="Deck preview in the right pane">
+        <figcaption>The latest Python deck generated automatically from the form.</figcaption>
+      </figure>
+
+      <figure>
+        <img src="img/en/15_deck_scrolled.png" alt="Scrolled deck preview and validation panel">
+        <figcaption>Review the complete deck and use the validation panel to validate or run it.</figcaption>
+      </figure>
+
+      <p>Validate performs a dry-run validation on the selected server. Run ▶ submits the job to that server; track its progress in the Run History tab. Even without a configured server, you can save the deck and run it locally as follows.</p>
+
+      <pre><code>./build/tenryu run deck.py</code></pre>
+
+      <aside class="tip">
+        <strong>Tip:</strong> A deck is ordinary Python, so you may edit it by hand after saving. However, deleting the <code>TENRYU-GUI-STATE</code> comment prevents the form state from being restored.
+      </aside>
+    </section>
+
+    <section id="troubleshooting">
+      <h2>11. Troubleshooting</h2>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Symptom</th>
+              <th>Cause</th>
+              <th>Action</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Laser absorption is nearly zero</td>
+              <td>Corona ramp is disabled</td>
+              <td>Enable the ramp in <a href="#geometry">§6</a>. The default values are suitable.</td>
+            </tr>
+            <tr>
+              <td>The deck is absent and a red error list appears</td>
+              <td>Form validation error</td>
+              <td>Correct each listed item. For example, enabling Outer vacuum requires <code>rOuter &lt; r_max</code>.</td>
+            </tr>
+            <tr>
+              <td>The shell does not implode under Marshak drive</td>
+              <td>Opacity is too low (τ&lt;1 causes volumetric heating), or the foot is too long</td>
+              <td>Raise κ to the several-thousand cm²/g range appropriate for the real material and start the ramp earlier. Refer to the verified indirect-drive preset.</td>
+            </tr>
+            <tr>
+              <td>ρ<sub>peak</sub> is lower than the preset's stated value</td>
+              <td>Snapshot subsampling</td>
+              <td>Read the per-step history (<a href="#output">§9</a>).</td>
+            </tr>
+            <tr>
+              <td>The run reports <code>[dt_floor_abort]</code> just before <code>t_end</code></td>
+              <td>Endpoint-rounding display in an older version (fixed on 2026-07-31)</td>
+              <td>Update to the latest version.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <footer>TENRYU Studio manual — generated 2026-07-31. 1D edition.</footer>
+  </main>
+</body>
+</html>

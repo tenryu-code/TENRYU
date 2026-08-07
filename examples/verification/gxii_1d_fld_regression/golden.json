@@ -1,0 +1,9 @@
+{
+  "run_profile": "full_t_end_deck_nr200",
+  "E_laser_absorbed": 8.7498843499088196e+10,
+  "bang_time_s": 1.1182619171833444e-09,
+  "shell_r_min_cm": 1.7179230302464777e-03,
+  "rho_peak_max": 2.7660009111702745e+01,
+  "rhoR_max": 2.9758486105274783e-02,
+  "Tc_max_eV": 8.6638307394394656e+02
+}
