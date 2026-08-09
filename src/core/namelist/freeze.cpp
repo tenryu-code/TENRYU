@@ -2115,6 +2115,8 @@ py::dict serialize_numerics(const Config::NumericsConfig& numerics) {
       numerics.ale1d.min_width_floor.relief_halfwidth_cells;
   ale1d_min_width_floor["max_growth_factor"] =
       numerics.ale1d.min_width_floor.max_growth_factor;
+  ale1d_min_width_floor["retrigger_cooldown_steps"] =
+      numerics.ale1d.min_width_floor.retrigger_cooldown_steps;
   ale1d["min_width_floor"] = ale1d_min_width_floor;
 
   py::dict ale1d_remap;

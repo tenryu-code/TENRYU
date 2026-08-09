@@ -1371,6 +1371,8 @@ __global__ void deposit_kinetic_closure_audit_kernel(
       const double ei_before = ei[c];
       const double e_e_raw = fmax(ee_before, 0.0);
       const double e_i_raw = fmax(ei_before, 0.0);
+      const double floor_ee = fmin(0.0, ee_before);
+      const double floor_ei = fmin(0.0, ei_before);
       const double e_sum = e_e_raw + (two_temperature != 0 ? e_i_raw : 0.0);
       bool apply = true;
       if (dE_raw < 0.0) {
@@ -1385,23 +1387,23 @@ __global__ void deposit_kinetic_closure_audit_kernel(
       if (apply) {
         const double de = dE_raw / m;
         if (two_temperature == 0) {
-          tentative_e_e = e_e_raw + de;
+          tentative_e_e = ee_before + de;
           tentative_e_i = ei_before;
-          const double ee_after = fmax(tentative_e_e, 0.0);
-          const double ei_after = fmax(ei_before, 0.0);
-          floor_e = (tentative_e_e < 0.0) ? 1 : 0;
-          floor_i = (tentative_e_i < 0.0) ? 1 : 0;
+          const double ee_after = fmax(tentative_e_e, floor_ee);
+          const double ei_after = ei_before;
+          floor_e = (tentative_e_e < floor_ee) ? 1 : 0;
+          floor_i = 0;
           ee[c] = ee_after;
           ei[c] = ei_after;
           dI_after_floor = m * ((ee_after - ee_before) + (ei_after - ei_before));
         } else {
           const double f_e = (e_sum > 0.0 && isfinite(e_sum)) ? (e_e_raw / e_sum) : 0.5;
-          tentative_e_e = e_e_raw + f_e * de;
-          tentative_e_i = e_i_raw + (1.0 - f_e) * de;
-          const double ee_after = fmax(tentative_e_e, 0.0);
-          const double ei_after = fmax(tentative_e_i, 0.0);
-          floor_e = (tentative_e_e < 0.0) ? 1 : 0;
-          floor_i = (tentative_e_i < 0.0) ? 1 : 0;
+          tentative_e_e = ee_before + f_e * de;
+          tentative_e_i = ei_before + (1.0 - f_e) * de;
+          const double ee_after = fmax(tentative_e_e, floor_ee);
+          const double ei_after = fmax(tentative_e_i, floor_ei);
+          floor_e = (tentative_e_e < floor_ee) ? 1 : 0;
+          floor_i = (tentative_e_i < floor_ei) ? 1 : 0;
           ee[c] = ee_after;
           ei[c] = ei_after;
           dI_after_floor = m * ((ee_after - ee_before) + (ei_after - ei_before));
@@ -1458,8 +1460,12 @@ __global__ void deposit_kinetic_closure_kernel(
     return;
   }
 
-  const double e_e_raw = fmax(ee[c], 0.0);
-  const double e_i_raw = fmax(ei[c], 0.0);
+  const double ee_before = ee[c];
+  const double ei_before = ei[c];
+  const double e_e_raw = fmax(ee_before, 0.0);
+  const double e_i_raw = fmax(ei_before, 0.0);
+  const double floor_ee = fmin(0.0, ee_before);
+  const double floor_ei = fmin(0.0, ei_before);
   const double e_sum = e_e_raw + (two_temperature != 0 ? e_i_raw : 0.0);
   if (dE < 0.0) {
     const double removable = m * e_sum;
@@ -1471,14 +1477,13 @@ __global__ void deposit_kinetic_closure_kernel(
 
   const double de = dE / m;
   if (two_temperature == 0) {
-    ee[c] = fmax(e_e_raw + de, 0.0);
-    ei[c] = fmax(ei[c], 0.0);
+    ee[c] = fmax(ee_before + de, floor_ee);
     return;
   }
 
   const double f_e = (e_sum > 0.0 && isfinite(e_sum)) ? (e_e_raw / e_sum) : 0.5;
-  ee[c] = fmax(e_e_raw + f_e * de, 0.0);
-  ei[c] = fmax(e_i_raw + (1.0 - f_e) * de, 0.0);
+  ee[c] = fmax(ee_before + f_e * de, floor_ee);
+  ei[c] = fmax(ei_before + (1.0 - f_e) * de, floor_ei);
 }
 
 __global__ void compute_kinetic_closure_deficit_capacity_kernel(
@@ -1524,25 +1529,29 @@ __global__ void compute_kinetic_closure_deficit_capacity_kernel(
     dE = 0.0;
   }
 
-  const double e_e_raw = fmax(ee[c], 0.0);
-  const double e_i_raw = fmax(ei[c], 0.0);
+  const double ee_before = ee[c];
+  const double ei_before = ei[c];
+  const double e_e_raw = fmax(ee_before, 0.0);
+  const double e_i_raw = fmax(ei_before, 0.0);
   const double floor_e = fmax(e_floor, 0.0);
+  const double floor_ee = fmin(floor_e, ee_before);
+  const double floor_ei = fmin(floor_e, ei_before);
   const double de = dE / m;
   if (two_temperature == 0) {
-    const double ee_tent = e_e_raw + de;
-    deficit[c] = fmax(0.0, floor_e - ee_tent) * m;
-    capacity[c] = fmax(0.0, ee_tent - floor_e) * m;
+    const double ee_tent = ee_before + de;
+    deficit[c] = fmax(0.0, floor_ee - ee_tent) * m;
+    capacity[c] = fmax(0.0, ee_tent - floor_ee) * m;
     return;
   }
 
   const double e_sum = e_e_raw + e_i_raw;
   const double f_e = (e_sum > 0.0 && isfinite(e_sum)) ? (e_e_raw / e_sum) : 0.5;
-  const double ee_tent = e_e_raw + f_e * de;
-  const double ei_tent = e_i_raw + (1.0 - f_e) * de;
-  const double D_e = fmax(0.0, floor_e - ee_tent) * m;
-  const double D_i = fmax(0.0, floor_e - ei_tent) * m;
-  const double C_e = fmax(0.0, ee_tent - floor_e) * m;
-  const double C_i = fmax(0.0, ei_tent - floor_e) * m;
+  const double ee_tent = ee_before + f_e * de;
+  const double ei_tent = ei_before + (1.0 - f_e) * de;
+  const double D_e = fmax(0.0, floor_ee - ee_tent) * m;
+  const double D_i = fmax(0.0, floor_ei - ei_tent) * m;
+  const double C_e = fmax(0.0, ee_tent - floor_ee) * m;
+  const double C_i = fmax(0.0, ei_tent - floor_ei) * m;
   deficit[c] = D_e + D_i;
   capacity[c] = C_e + C_i;
 }
@@ -1600,36 +1609,38 @@ __global__ void apply_kinetic_closure_redistribution_kernel(
     const double e_e_raw = fmax(ee_before, 0.0);
     const double e_i_raw = fmax(ei_before, 0.0);
     const double floor_e = fmax(e_floor, 0.0);
+    const double floor_ee = fmin(floor_e, ee_before);
+    const double floor_ei = fmin(floor_e, ei_before);
     const double de = dE / m;
-    double ee_after = e_e_raw;
-    double ei_after = e_i_raw;
+    double ee_after = ee_before;
+    double ei_after = ei_before;
 
     if (two_temperature == 0) {
-      tentative_e_e = e_e_raw + de;
+      tentative_e_e = ee_before + de;
       tentative_e_i = ei_before;
-      const double D_e = fmax(0.0, floor_e - tentative_e_e) * m;
-      const double C_e = fmax(0.0, tentative_e_e - floor_e) * m;
+      const double D_e = fmax(0.0, floor_ee - tentative_e_e) * m;
+      const double C_e = fmax(0.0, tentative_e_e - floor_ee) * m;
       floor_e_flag = (D_e > 0.0) ? 1 : 0;
-      floor_i_flag = (tentative_e_i < floor_e) ? 1 : 0;
-      ee_after = (D_e > 0.0) ? floor_e
-                             : fmax(floor_e, tentative_e_e - absorption_factor * C_e / m);
-      ei_after = fmax(ei_before, floor_e);
+      floor_i_flag = 0;
+      ee_after = (D_e > 0.0) ? floor_ee
+                             : fmax(floor_ee, tentative_e_e - absorption_factor * C_e / m);
+      ei_after = ei_before;
     } else {
       const double e_sum = e_e_raw + e_i_raw;
       const double f_e =
           (e_sum > 0.0 && isfinite(e_sum)) ? (e_e_raw / e_sum) : 0.5;
-      tentative_e_e = e_e_raw + f_e * de;
-      tentative_e_i = e_i_raw + (1.0 - f_e) * de;
-      const double D_e = fmax(0.0, floor_e - tentative_e_e) * m;
-      const double D_i = fmax(0.0, floor_e - tentative_e_i) * m;
-      const double C_e = fmax(0.0, tentative_e_e - floor_e) * m;
-      const double C_i = fmax(0.0, tentative_e_i - floor_e) * m;
+      tentative_e_e = ee_before + f_e * de;
+      tentative_e_i = ei_before + (1.0 - f_e) * de;
+      const double D_e = fmax(0.0, floor_ee - tentative_e_e) * m;
+      const double D_i = fmax(0.0, floor_ei - tentative_e_i) * m;
+      const double C_e = fmax(0.0, tentative_e_e - floor_ee) * m;
+      const double C_i = fmax(0.0, tentative_e_i - floor_ei) * m;
       floor_e_flag = (D_e > 0.0) ? 1 : 0;
       floor_i_flag = (D_i > 0.0) ? 1 : 0;
-      ee_after = (D_e > 0.0) ? floor_e
-                             : fmax(floor_e, tentative_e_e - absorption_factor * C_e / m);
-      ei_after = (D_i > 0.0) ? floor_e
-                             : fmax(floor_e, tentative_e_i - absorption_factor * C_i / m);
+      ee_after = (D_e > 0.0) ? floor_ee
+                             : fmax(floor_ee, tentative_e_e - absorption_factor * C_e / m);
+      ei_after = (D_i > 0.0) ? floor_ei
+                             : fmax(floor_ei, tentative_e_i - absorption_factor * C_i / m);
     }
 
     ee[c] = ee_after;

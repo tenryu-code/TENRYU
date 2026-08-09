@@ -472,6 +472,7 @@ State State::allocate(const Config& cfg, const double hydro_t_start_eV) {
   state.ale_rezone_invocations = 0;
   state.ale_remaps_applied = 0;
   state.ale_last_applied_step = -1;
+  state.ale1d_floor_cooldown_remaining = 0;
   state.diff_ref_diag_baseline_initialized = false;
   state.diff_ref_diag_gas_mesh_volume_initial = 0.0;
   state.diff_ref_diag_gas_rho_p50_initial = 0.0;
@@ -1039,6 +1040,7 @@ void State::reset() {
   ale_rezone_invocations = 0;
   ale_remaps_applied = 0;
   ale_last_applied_step = -1;
+  ale1d_floor_cooldown_remaining = 0;
   diff_ref_diag_baseline_initialized = false;
   diff_ref_diag_gas_mesh_volume_initial = 0.0;
   diff_ref_diag_gas_rho_p50_initial = 0.0;

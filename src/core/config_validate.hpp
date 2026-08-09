@@ -715,6 +715,10 @@ inline void validate_ale1d_config(const Config& config) {
       throw namelist::ConfigError(
           "Numerics.ale1d.min_width_floor.max_growth_factor must be <= 2");
     }
+    if (min_width_floor.retrigger_cooldown_steps < 0) {
+      throw namelist::ConfigError(
+          "Numerics.ale1d.min_width_floor.retrigger_cooldown_steps must be >= 0");
+    }
   }
   if (!(remap.limiter_theta > 0.0)) {
     throw namelist::ConfigError(

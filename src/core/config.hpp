@@ -2093,6 +2093,7 @@ struct Config {
         double target_factor = 1.25;    // respace target = target_factor * floor_cm
         int relief_halfwidth_cells = 3;  // half-width of the minimum-cell relief neighborhood
         double max_growth_factor = 1.8;  // per-application cap: no cell grows more than this per rezone
+        int retrigger_cooldown_steps = 0;  // after a floor-triggered attempt is not applied, skip the floor-trigger evaluation for this many steps (0 = evaluate every step)
       };
 
       struct RemapConfig {

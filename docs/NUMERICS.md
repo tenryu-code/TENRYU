@@ -10917,37 +10917,53 @@ f_e=\frac{e_{e,c}^{raw}}{e_{e,c}^{raw}+e_{i,c}^{raw}},\qquad
 \]
 If the denominator is zero for a positive deposit, \(f_e=1/2\). For a negative
 deposit, the default path clips removal to the available nonnegative internal
-energy \(m_c^*(e_e^{raw}+e_i^{raw})\), preserving \(e_e,e_i\ge0\). This is the
+energy \(m_c^*(e_e^{raw}+e_i^{raw})\). This is the
 legacy behavior used when `Numerics.ale.ke_closure_redistribute_floor=false`.
+
+**Baseline-relative floors (wave-10 2026-08-10).** With a table EOS the
+remapped specific internal energies can be legitimately negative (cold-curve
+states). All closure write-back paths (the legacy deposit, its audit variant,
+and the two-pass redistribution below) therefore floor each species at the
+per-cell baseline-relative value \(\phi_{k,c}=\min(e_{floor},\,e_{k,c}^{before})\)
+(the 2D driver passes \(e_{floor}=0\)), never at a bare zero, and the 1T paths
+do not modify \(e_i\) at all; the clamped raws
+\(e_k^{raw}=\max(e_k^{before},0)\) remain in use only for the \(f_e\) split
+weights and the negative-deposit removable clip. Flooring can therefore never
+raise a cell above its own input. For non-negative (ideal-gas) inputs every
+path is bit-identical to the historic all-clamp behavior. This mirrors the
+wave-9 1D ALE KE-closure contract fix (`ale_1d_velocity_project.cu`).
 
 When `Numerics.ale.ke_closure_redistribute_floor=true`, the closure instead
 uses a conservative two-pass positivity correction. First compute the
 unclipped tentative species energies
 \[
-\tilde e_{e,c}=e_{e,c}^{raw}+f_e\frac{\Delta I_c}{m_c^*},\qquad
-\tilde e_{i,c}=e_{i,c}^{raw}+(1-f_e)\frac{\Delta I_c}{m_c^*},
+\tilde e_{e,c}=e_{e,c}^{before}+f_e\frac{\Delta I_c}{m_c^*},\qquad
+\tilde e_{i,c}=e_{i,c}^{before}+(1-f_e)\frac{\Delta I_c}{m_c^*},
 \]
 with the 1T path using only the \(e_e\) equation. The closure positivity floor
-for this redistribution is zero specific internal energy; the thermal
+for this redistribution is the per-cell baseline-relative
+\(\phi_{k,c}=\min(0,\,e_{k,c}^{before})\); the thermal
 \(T_{floor}\) clamp remains owned by the following EOS reclosure. For each
 active species \(k\in\{e,i\}\),
 \[
-D_{k,c}=m_c^*\max(0,-\tilde e_{k,c}),\qquad
-C_{k,c}=m_c^*\max(0,\tilde e_{k,c}),
+D_{k,c}=m_c^*\max(0,\phi_{k,c}-\tilde e_{k,c}),\qquad
+C_{k,c}=m_c^*\max(0,\tilde e_{k,c}-\phi_{k,c}),
 \]
 and \(D_{tot}=\sum_{c,k}D_{k,c}\), \(C_{tot}=\sum_{c,k}C_{k,c}\) are reduced
 globally across MPI ranks. If \(C_{tot}\ge D_{tot}\), set
 \(a=D_{tot}/C_{tot}\) (or \(a=0\) when both totals are zero). Deficit species
-are set to zero; capacity species are reduced by their proportional share:
+are set to their per-cell floor \(\phi_{k,c}\); capacity species are reduced by
+their proportional share:
 \[
 e_{k,c}^{n+1} =
 \begin{cases}
-0, & D_{k,c}>0,\\
-\tilde e_{k,c}-a\,C_{k,c}/m_c^*, & D_{k,c}=0.
+\phi_{k,c}, & D_{k,c}>0,\\
+\max\!\big(\phi_{k,c},\,\tilde e_{k,c}-a\,C_{k,c}/m_c^*\big), & D_{k,c}=0.
 \end{cases}
 \]
 This preserves \(\sum_c m_c(e_{e,c}+e_{i,c})\) with the raw closure target
-\(\sum_c\Delta I_c\) while enforcing \(e_e,e_i\ge0\). If \(C_{tot}<D_{tot}\),
+\(\sum_c\Delta I_c\) while enforcing \(e_{k,c}\ge\phi_{k,c}\) (\(\ge 0\) for
+non-negative inputs). If \(C_{tot}<D_{tot}\),
 all available capacity is removed (\(a=1\)); the remaining
 \(E_{redistribution\_unresolved}=D_{tot}-C_{tot}\) is recorded as an artificial
 budget term rather than silently appearing as floor injection. EOS reclosure
@@ -12474,6 +12490,17 @@ one-cell sweep 述語に対する安全クランプを候補側でも課す。�
 幾何テーパ）を原理的に浸食できない — 局所ドナーで賄える最小値のみ救済する
 契約であり、オフライン複製で証明済み）。下流（境界強制・候補検証・
 remap_v3・速度射影・保存則ゲート・commit）は monitor 経路と共有。
+
+**再トリガ cooldown（wave-10 2026-08-10）**：`retrigger_cooldown_steps`（int、
+既定 0、`>=0`）は、floor トリガ由来の rezone 試行が理由を問わず適用されなかった
+（no_relief・候補棄却・保存則棄却・benefit gate 棄却等）直後から、以後 N step の
+あいだ floor トリガの評価自体（node 座標の host 転送と最小幅スキャンを含む）を
+スキップする。cadence/quality トリガは影響を受けず、いずれかの経路で rezone が
+適用されたら cooldown は 0 にリセットされる。カウンタは in-memory の driver 状態
+（`State::ale1d_floor_cooldown_remaining`）であり checkpoint には保存しない —
+restart 直後は floor を一度再評価し、不適用なら再装填される。既定 0 は従来どおり
+毎 step 評価で bit 同一。
+
 **現状**: 採用候補が remap_v3 の extensive-field 検証で棄却される未同定の
 段が残っており（ConservationRejected）、ベンチデッキでの実適用は未達成。
 本モードは default-OFF の research prototype であり、後続アークの起点は
