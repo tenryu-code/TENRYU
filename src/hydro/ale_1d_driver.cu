@@ -4,8 +4,11 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <iomanip>
 #include <limits>
 #include <memory>
+#include <sstream>
 #include <utility>
 #include <vector>
 
@@ -37,6 +40,14 @@ inline void cuda_check(const cudaError_t err, const char* message) {
 
 int blocks_for(const int n) {
   return (n + kBlockSize - 1) / kBlockSize;
+}
+
+bool closure_dump_enabled() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("TENRYU_ALE1D_CLOSURE_DUMP");
+    return value != nullptr && value[0] == '1' && value[1] == '\0';
+  }();
+  return enabled;
 }
 
 __device__ inline double atomic_add_double(double* address, const double value) {
@@ -265,8 +276,8 @@ __global__ void eos_reclosure_kernel(double* __restrict__ Te,
   const double cv_i = kEvToErg / (A * kProtonMass * (gamma - 1.0));
   const double cv_e = z * kEvToErg / (A * kProtonMass * (gamma - 1.0));
   const double rho_c = fmax(rho[c], rho_floor);
-  double e_i = fmax(ei[c], 0.0);
-  double e_e = fmax(ee[c], 0.0);
+  double e_i = ei[c];
+  double e_e = ee[c];
 
   const bool use_ion_table =
       tab_ion.n_rho > 0 && tab_ion.n_T > 0 && tab_ion.e_table != nullptr &&
@@ -290,6 +301,7 @@ __global__ void eos_reclosure_kernel(double* __restrict__ Te,
                              low_density_extrapolation, energy_authoritative,
                              &e_i, &Ti_c, &Pi_c, &cv_i_c, &de_floor_specific);
   } else if (cv_i > 0.0) {
+    e_i = fmax(e_i, 0.0);
     const double Ti_old = e_i / cv_i;
     Ti_c = fmax(Ti_old, ti_floor);
     if (Ti_c > Ti_old) {
@@ -307,6 +319,7 @@ __global__ void eos_reclosure_kernel(double* __restrict__ Te,
                              low_density_extrapolation, energy_authoritative,
                              &e_e, &Te_c, &Pe_c, &cv_e_c, &de_floor_specific);
   } else if (cv_e > 0.0) {
+    e_e = fmax(e_e, 0.0);
     const double Te_old = e_e / cv_e;
     Te_c = fmax(Te_old, te_floor);
     if (Te_c > Te_old) {
@@ -576,9 +589,11 @@ const char* to_string(const Ale1dSkipReason r) {
   return "Unknown";
 }
 
-Ale1dStepResult apply_ale_1d(core::State& state,
-                              const core::Config& cfg,
-                              const HydroEOSContext* eos_ctx) {
+namespace {
+
+Ale1dStepResult apply_ale_1d_attempt(core::State& state,
+                                     const core::Config& cfg,
+                                     const HydroEOSContext* eos_ctx) {
   Ale1dStepResult out;
   const auto& ale = cfg.numerics.ale1d;
 
@@ -620,16 +635,23 @@ Ale1dStepResult apply_ale_1d(core::State& state,
       ale.emergency_enabled && out.max_dr_ratio > emergency_threshold;
   std::vector<double> floor_r_nodes;
   if (ale.min_width_floor.enabled) {
-    floor_r_nodes.assign(static_cast<std::size_t>(n_cells + 1), 0.0);
-    state.x_r.copy_to_host(floor_r_nodes.data());
-    double min_dl = std::numeric_limits<double>::infinity();
-    for (int i = 0; i < n_cells; ++i) {
-      min_dl = std::min(
-          min_dl,
-          floor_r_nodes[static_cast<std::size_t>(i + 1)] -
-              floor_r_nodes[static_cast<std::size_t>(i)]);
+    if (state.ale1d_floor_cooldown_remaining > 0) {
+      // Cooling down after a rejected floor-triggered attempt: skip the
+      // floor-trigger evaluation itself. Cadence/quality triggers are
+      // unaffected; any applied rezone resets the cooldown (see wrapper).
+      --state.ale1d_floor_cooldown_remaining;
+    } else {
+      floor_r_nodes.assign(static_cast<std::size_t>(n_cells + 1), 0.0);
+      state.x_r.copy_to_host(floor_r_nodes.data());
+      double min_dl = std::numeric_limits<double>::infinity();
+      for (int i = 0; i < n_cells; ++i) {
+        min_dl = std::min(
+            min_dl,
+            floor_r_nodes[static_cast<std::size_t>(i + 1)] -
+                floor_r_nodes[static_cast<std::size_t>(i)]);
+      }
+      out.floor_triggered = min_dl < ale.min_width_floor.floor_cm;
     }
-    out.floor_triggered = min_dl < ale.min_width_floor.floor_cm;
   }
   if (!out.cadence_triggered && !out.quality_triggered &&
       !out.floor_triggered) {
@@ -770,6 +792,18 @@ Ale1dStepResult apply_ale_1d(core::State& state,
       diagnostics.radiation_conservation_rel_err;
   out.kinetic_energy_drift_rel = diagnostics.kinetic_energy_drift_rel;
   if (!diagnostics.hard_tolerance_passed) {
+    static int closure_dump_reject_count = 0;
+    if (closure_dump_enabled() && closure_dump_reject_count < 2) {
+      const int invocation = ++closure_dump_reject_count;
+      std::ostringstream message;
+      message << std::scientific << std::setprecision(6)
+              << "[ale1d-ke-closure-reject] invocation=" << invocation
+              << " KE_old=" << velocity_result.kinetic_energy_old
+              << " KE_new=" << velocity_result.kinetic_energy_new
+              << " deposited_total="
+              << velocity_result.ke_closure_deposited;
+      core::log_info(message.str());
+    }
     out.remap_rejected = true;
     out.skip_reason = Ale1dSkipReason::ConservationRejected;
     return out;
@@ -783,6 +817,22 @@ Ale1dStepResult apply_ale_1d(core::State& state,
                  eos_ctx);
   out.applied = true;
   out.skip_reason = Ale1dSkipReason::None;
+  return out;
+}
+
+}  // namespace
+
+Ale1dStepResult apply_ale_1d(core::State& state,
+                              const core::Config& cfg,
+                              const HydroEOSContext* eos_ctx) {
+  Ale1dStepResult out = apply_ale_1d_attempt(state, cfg, eos_ctx);
+  const int cooldown_steps =
+      cfg.numerics.ale1d.min_width_floor.retrigger_cooldown_steps;
+  if (out.applied) {
+    state.ale1d_floor_cooldown_remaining = 0;
+  } else if (out.floor_triggered && cooldown_steps > 0) {
+    state.ale1d_floor_cooldown_remaining = cooldown_steps;
+  }
   return out;
 }
 

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstdio>
 
 #include "core/device_scratch.hpp"
 #include "core/error.hpp"
@@ -57,7 +58,8 @@ __global__ void fast_trace_1d_kernel(
     double* __restrict__ per_ray_critical_hits,
     double* __restrict__ per_ray_invalid,
     double* __restrict__ per_ray_ra,
-    double* __restrict__ tau_shell_out) {
+    double* __restrict__ tau_shell_out,
+    double* __restrict__ tail_stats) {
   const int local_ray = blockIdx.x * blockDim.x + threadIdx.x;
   if (local_ray >= batch_rays) {
     return;
@@ -180,6 +182,84 @@ __global__ void fast_trace_1d_kernel(
         return;
       }
       if (tail_status == ray_trace_bodies::TailClosureStatus::kClosed) {
+        constexpr int kMaxTailClosureShells = 32;
+        const double dP = P - P_tail;
+        const double L = ::fmax(0.0, (1.0 - n_hat_raw) / g_mag);
+        int tail_shells[kMaxTailClosureShells];
+        double tail_fractions[kMaxTailClosureShells];
+        double tail_weights[kMaxTailClosureShells];
+        int tail_shell_count = 0;
+        bool redistribute_tail = L > 0.0 && ::isfinite(L);
+        if (redistribute_tail) {
+          const double r_hi = r_upper;
+          const double r_lo_unclamped = r_upper - L;
+          const double r_lo_span =
+              ::fmax(radial_node_r[0], r_lo_unclamped);
+          const double represented_length = r_hi - r_lo_span;
+          const double fraction_length =
+              (r_lo_span > r_lo_unclamped) ? represented_length : L;
+          redistribute_tail = fraction_length > 0.0;
+          for (int k = j;
+               redistribute_tail && k >= 0 &&
+               tail_shell_count < kMaxTailClosureShells;
+               --k) {
+            const double overlap =
+                ::fmax(0.0, ::fmin(radial_node_r[k + 1], r_hi) -
+                                    ::fmax(radial_node_r[k], r_lo_span));
+            if (overlap > 0.0) {
+              tail_shells[tail_shell_count] = k;
+              tail_fractions[tail_shell_count] = overlap / fraction_length;
+              ++tail_shell_count;
+            }
+            if (radial_node_r[k] <= r_lo_span) {
+              break;
+            }
+          }
+
+          const double tau_tail =
+              -::log(::fmax(P_tail / ::fmax(P, 1.0e-300), 1.0e-300));
+          redistribute_tail =
+              tail_shell_count > 0 && ::isfinite(tau_tail);
+          if (redistribute_tail) {
+            const double absorption_fraction = 1.0 - ::exp(-tau_tail);
+            double cumulative_fraction = 0.0;
+            double tau_previous = 0.0;
+            for (int idx = 0; idx < tail_shell_count; ++idx) {
+              cumulative_fraction += tail_fractions[idx];
+              const double tau_current =
+                  (idx + 1 == tail_shell_count)
+                      ? tau_tail
+                      : tau_tail * cumulative_fraction;
+              tail_weights[idx] =
+                  (::exp(-tau_previous) - ::exp(-tau_current)) /
+                  absorption_fraction;
+              if (!::isfinite(tail_weights[idx])) {
+                redistribute_tail = false;
+                break;
+              }
+              tau_previous = tau_current;
+            }
+          }
+        }
+        if (redistribute_tail) {
+          per_ray_shell[static_cast<std::size_t>(j) * batch_capacity +
+                        local_ray] -= dP;
+          // The normalized weights sum to one, so redistribution conserves dP.
+          for (int idx = 0; idx < tail_shell_count; ++idx) {
+            per_ray_shell[static_cast<std::size_t>(tail_shells[idx]) *
+                              batch_capacity +
+                          local_ray] += dP * tail_weights[idx];
+          }
+        }
+        if (tail_stats != nullptr) {
+          if (redistribute_tail) {
+            atomicAdd(&tail_stats[0], 1.0);
+            atomicAdd(&tail_stats[2], dP);
+          } else {
+            atomicAdd(&tail_stats[1], 1.0);
+            atomicAdd(&tail_stats[3], dP);
+          }
+        }
         P = P_tail;
         if (phys_ext_active != 0 && phys_opt.crit_terminate_deposit != 0) {
           per_ray_shell[static_cast<std::size_t>(j) * batch_capacity +
@@ -528,6 +608,20 @@ cudaError_t launch_fast_trace_1d(
                 "fast_trace_1d requires positive hydro cell count");
   TENRYU_ASSERT(d_deposit_1d != nullptr,
                 "fast_trace_1d requires deposit_1d");
+  static double* const d_tail_stats = [] {
+    double* p = nullptr;
+    if (cudaMalloc(reinterpret_cast<void**>(&p), 4 * sizeof(double)) !=
+        cudaSuccess) {
+      return static_cast<double*>(nullptr);
+    }
+    if (cudaMemset(p, 0, 4 * sizeof(double)) != cudaSuccess) {
+      cudaFree(p);
+      return static_cast<double*>(nullptr);
+    }
+    return p;
+  }();
+  static unsigned long long tail_stats_calls = 0;
+  ++tail_stats_calls;
 
   if (d_step_histogram != nullptr) {
     cudaMemsetAsync(d_step_histogram, 0,
@@ -604,7 +698,7 @@ cudaError_t launch_fast_trace_1d(
         laser_cfg.raytrace.eps_crit, laser_cfg.raytrace.test_kappa, lambda_cm,
         phys, phys_ext != nullptr ? 1 : 0, beam_P_w, beam_w_cm, slab,
         per_ray_unabsorbed, per_ray_critical_hits, per_ray_invalid, per_ray_ra,
-        d_tau_shell_out);
+        d_tau_shell_out, d_tail_stats);
     if (d_pabs_per_ray_out != nullptr) {
       sum_fast_trace_absorbed_per_ray_kernel<<<ray_grid, kBlockSize, 0, stream>>>(
           slab, per_ray_ra, ray_offset, batch_rays, batch_capacity, n_shells,
@@ -623,6 +717,25 @@ cudaError_t launch_fast_trace_1d(
         n_hydro_cells, critical_adjacent_subcritical_cell, d_deposit_1d,
         d_unabsorbed, d_ra_power_total, d_critical_surface_hit_count,
         d_error_flags);
+  }
+  if (d_tail_stats != nullptr && (tail_stats_calls % 5000ULL) == 0ULL) {
+    double h_tail_stats[4] = {0.0, 0.0, 0.0, 0.0};
+    const cudaError_t copy_status =
+        cudaMemcpyAsync(h_tail_stats, d_tail_stats, sizeof(h_tail_stats),
+                        cudaMemcpyDeviceToHost, stream);
+    if (copy_status == cudaSuccess &&
+        cudaStreamSynchronize(stream) == cudaSuccess) {
+      char msg[256];
+      std::snprintf(
+          msg, sizeof(msg),
+          "[laser][fast-tail] calls=%llu redistributed=%llu fallback=%llu "
+          "dP_redist_total=%.6e dP_lump_total=%.6e",
+          tail_stats_calls,
+          static_cast<unsigned long long>(h_tail_stats[0]),
+          static_cast<unsigned long long>(h_tail_stats[1]),
+          h_tail_stats[2], h_tail_stats[3]);
+      core::log_info(msg);
+    }
   }
   return cudaGetLastError();
 }

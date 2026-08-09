@@ -10252,7 +10252,7 @@ void Builder::set_numerics(py::dict kwargs) {
       enforce_known_keys(
           floor, path,
           {"enabled", "floor_cm", "target_factor", "relief_halfwidth_cells",
-           "max_growth_factor"});
+           "max_growth_factor", "retrigger_cooldown_steps"});
       auto& cfg = ale1d_cfg.min_width_floor;
       if (has_key(floor, "enabled")) {
         cfg.enabled = strict_bool(floor["enabled"], path + ".enabled");
@@ -10272,6 +10272,11 @@ void Builder::set_numerics(py::dict kwargs) {
       if (has_key(floor, "max_growth_factor")) {
         cfg.max_growth_factor = numeric_as_double(
             floor["max_growth_factor"], path + ".max_growth_factor");
+      }
+      if (has_key(floor, "retrigger_cooldown_steps")) {
+        cfg.retrigger_cooldown_steps = strict_int32(
+            floor["retrigger_cooldown_steps"],
+            path + ".retrigger_cooldown_steps");
       }
     };
     const auto parse_remap_dict = [&]() {

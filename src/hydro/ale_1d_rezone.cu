@@ -286,6 +286,10 @@ MinWidthFloorCandidateResult build_min_width_floor_candidate(
 
   std::vector<int> offenders;
   for (int i = 0; i < n_cells; ++i) {
+    // The outer boundary cell is the vacuum-expansion buffer and is never rezoned by the floor.
+    if (i == n_cells - 1) {
+      continue;
+    }
     if (dl[static_cast<std::size_t>(i)] < floor_cm) {
       offenders.push_back(i);
     }
@@ -301,13 +305,13 @@ MinWidthFloorCandidateResult build_min_width_floor_candidate(
     int w0 = std::max(0, k - relief_halfwidth_cells);
     int w1 = std::min(n_cells - 1, k + relief_halfwidth_cells);
     for (int j = k; j > w0; --j) {
-      if (pinned[static_cast<std::size_t>(j)]) {
+      if (j == n_cells - 1 || pinned[static_cast<std::size_t>(j)]) {
         w0 = j;
         break;
       }
     }
     for (int j = k + 1; j <= w1; ++j) {
-      if (pinned[static_cast<std::size_t>(j)]) {
+      if (j == n_cells - 1 || pinned[static_cast<std::size_t>(j)]) {
         w1 = j - 1;
         break;
       }

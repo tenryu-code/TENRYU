@@ -955,6 +955,10 @@ struct State {
   int ale_rezone_invocations = 0;
   int ale_remaps_applied = 0;
   int ale_last_applied_step = -1;
+  // ALE1D min-width-floor retrigger cooldown: remaining steps for which the
+  // floor-trigger evaluation is skipped after a rejected floor-triggered
+  // attempt. In-memory only (not checkpointed).
+  int ale1d_floor_cooldown_remaining = 0;
   double axis_margin_initial = -1.0;
   bool plic_remap_sticky_fallback = false;
   int plic_consecutive_drift_triggers = 0;

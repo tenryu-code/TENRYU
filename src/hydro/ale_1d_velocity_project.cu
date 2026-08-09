@@ -3,7 +3,12 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstdlib>
+#include <iomanip>
 #include <limits>
+#include <numeric>
+#include <optional>
+#include <sstream>
 #include <vector>
 
 #include <cub/cub.cuh>
@@ -25,6 +30,14 @@ inline void cuda_check(const cudaError_t err, const char* message) {
 
 int blocks_for(const int n) {
   return (n + kBlockSize - 1) / kBlockSize;
+}
+
+bool closure_dump_enabled() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("TENRYU_ALE1D_CLOSURE_DUMP");
+    return value != nullptr && value[0] == '1' && value[1] == '\0';
+  }();
+  return enabled;
 }
 
 template <typename T>
@@ -290,6 +303,12 @@ __global__ void deposit_kinetic_closure_kernel(
   if (!(m > 0.0)) {
     return;
   }
+  const double ee_before = ee[i];
+  const double ei_before = ei[i];
+  const double e_e_raw = fmax(ee_before, 0.0);
+  const double e_i_raw = fmax(ei_before, 0.0);
+  const double floor_ee = fmin(0.0, ee_before);
+  const double floor_ei = fmin(0.0, ei_before);
 
   const double kinetic_new =
       0.25 * m * (v_new[i] * v_new[i] + v_new[i + 1] * v_new[i + 1]);
@@ -298,8 +317,6 @@ __global__ void deposit_kinetic_closure_kernel(
     return;
   }
 
-  const double e_e_raw = fmax(ee[i], 0.0);
-  const double e_i_raw = fmax(ei[i], 0.0);
   const double e_sum = e_e_raw + (two_temperature != 0 ? e_i_raw : 0.0);
   if (dE < 0.0) {
     const double removable = m * e_sum;
@@ -311,17 +328,17 @@ __global__ void deposit_kinetic_closure_kernel(
 
   const double de = dE / m;
   if (two_temperature == 0) {
-    ee[i] = fmax(e_e_raw + de, 0.0);
-    ei[i] = fmax(ei[i], 0.0);
-    deposited[i] = dE;
+    ee[i] = fmax(ee_before + de, floor_ee);
+    deposited[i] = m * (ee[i] - ee_before);
     return;
   }
 
   const double f_e =
       (e_sum > 0.0 && isfinite(e_sum)) ? (e_e_raw / e_sum) : 0.5;
-  ee[i] = fmax(e_e_raw + f_e * de, 0.0);
-  ei[i] = fmax(e_i_raw + (1.0 - f_e) * de, 0.0);
-  deposited[i] = dE;
+  ee[i] = fmax(ee_before + f_e * de, floor_ee);
+  ei[i] = fmax(ei_before + (1.0 - f_e) * de, floor_ei);
+  deposited[i] =
+      m * ((ee[i] - ee_before) + (ei[i] - ei_before));
 }
 
 __global__ void compute_kinetic_closure_deficit_capacity_kernel(
@@ -346,6 +363,13 @@ __global__ void compute_kinetic_closure_deficit_capacity_kernel(
   if (!(m > 0.0)) {
     return;
   }
+  const double ee_before = ee[i];
+  const double ei_before = ei[i];
+  const double e_e_raw = fmax(ee_before, 0.0);
+  const double e_i_raw = fmax(ei_before, 0.0);
+  const double floor_e = fmax(e_floor, 0.0);
+  const double floor_ee = fmin(floor_e, ee_before);
+  const double floor_ei = fmin(floor_e, ei_before);
 
   const double kinetic_new =
       0.25 * m * (v_new[i] * v_new[i] + v_new[i + 1] * v_new[i + 1]);
@@ -354,26 +378,23 @@ __global__ void compute_kinetic_closure_deficit_capacity_kernel(
     dE = 0.0;
   }
 
-  const double e_e_raw = fmax(ee[i], 0.0);
-  const double e_i_raw = fmax(ei[i], 0.0);
-  const double floor_e = fmax(e_floor, 0.0);
   const double de = dE / m;
   if (two_temperature == 0) {
-    const double ee_tent = e_e_raw + de;
-    deficit[i] = fmax(0.0, floor_e - ee_tent) * m;
-    capacity[i] = fmax(0.0, ee_tent - floor_e) * m;
+    const double ee_tent = ee_before + de;
+    deficit[i] = fmax(0.0, floor_ee - ee_tent) * m;
+    capacity[i] = fmax(0.0, ee_tent - floor_ee) * m;
     return;
   }
 
   const double e_sum = e_e_raw + e_i_raw;
   const double f_e =
       (e_sum > 0.0 && isfinite(e_sum)) ? (e_e_raw / e_sum) : 0.5;
-  const double ee_tent = e_e_raw + f_e * de;
-  const double ei_tent = e_i_raw + (1.0 - f_e) * de;
-  const double D_e = fmax(0.0, floor_e - ee_tent) * m;
-  const double D_i = fmax(0.0, floor_e - ei_tent) * m;
-  const double C_e = fmax(0.0, ee_tent - floor_e) * m;
-  const double C_i = fmax(0.0, ei_tent - floor_e) * m;
+  const double ee_tent = ee_before + f_e * de;
+  const double ei_tent = ei_before + (1.0 - f_e) * de;
+  const double D_e = fmax(0.0, floor_ee - ee_tent) * m;
+  const double D_i = fmax(0.0, floor_ei - ei_tent) * m;
+  const double C_e = fmax(0.0, ee_tent - floor_ee) * m;
+  const double C_i = fmax(0.0, ei_tent - floor_ei) * m;
   deficit[i] = D_e + D_i;
   capacity[i] = C_e + C_i;
 }
@@ -399,6 +420,13 @@ __global__ void apply_kinetic_closure_redistribution_kernel(
   if (!(m > 0.0)) {
     return;
   }
+  const double ee_before = ee[i];
+  const double ei_before = ei[i];
+  const double e_e_raw = fmax(ee_before, 0.0);
+  const double e_i_raw = fmax(ei_before, 0.0);
+  const double floor_e = fmax(e_floor, 0.0);
+  const double floor_ee = fmin(floor_e, ee_before);
+  const double floor_ei = fmin(floor_e, ei_before);
 
   const double kinetic_new =
       0.25 * m * (v_new[i] * v_new[i] + v_new[i + 1] * v_new[i + 1]);
@@ -407,41 +435,36 @@ __global__ void apply_kinetic_closure_redistribution_kernel(
     dE = 0.0;
   }
 
-  const double ee_before = ee[i];
-  const double ei_before = ei[i];
-  const double e_e_raw = fmax(ee_before, 0.0);
-  const double e_i_raw = fmax(ei_before, 0.0);
-  const double floor_e = fmax(e_floor, 0.0);
   const double de = dE / m;
-  double ee_after = e_e_raw;
-  double ei_after = e_i_raw;
+  double ee_after = ee_before;
+  double ei_after = ei_before;
 
   if (two_temperature == 0) {
-    const double tentative_e_e = e_e_raw + de;
-    const double D_e = fmax(0.0, floor_e - tentative_e_e) * m;
-    const double C_e = fmax(0.0, tentative_e_e - floor_e) * m;
+    const double tentative_e_e = ee_before + de;
+    const double D_e = fmax(0.0, floor_ee - tentative_e_e) * m;
+    const double C_e = fmax(0.0, tentative_e_e - floor_ee) * m;
     ee_after = (D_e > 0.0)
-                   ? floor_e
-                   : fmax(floor_e,
+                   ? floor_ee
+                   : fmax(floor_ee,
                           tentative_e_e - absorption_factor * C_e / m);
-    ei_after = fmax(ei_before, floor_e);
+    ei_after = ei_before;
   } else {
     const double e_sum = e_e_raw + e_i_raw;
     const double f_e =
         (e_sum > 0.0 && isfinite(e_sum)) ? (e_e_raw / e_sum) : 0.5;
-    const double tentative_e_e = e_e_raw + f_e * de;
-    const double tentative_e_i = e_i_raw + (1.0 - f_e) * de;
-    const double D_e = fmax(0.0, floor_e - tentative_e_e) * m;
-    const double D_i = fmax(0.0, floor_e - tentative_e_i) * m;
-    const double C_e = fmax(0.0, tentative_e_e - floor_e) * m;
-    const double C_i = fmax(0.0, tentative_e_i - floor_e) * m;
+    const double tentative_e_e = ee_before + f_e * de;
+    const double tentative_e_i = ei_before + (1.0 - f_e) * de;
+    const double D_e = fmax(0.0, floor_ee - tentative_e_e) * m;
+    const double D_i = fmax(0.0, floor_ei - tentative_e_i) * m;
+    const double C_e = fmax(0.0, tentative_e_e - floor_ee) * m;
+    const double C_i = fmax(0.0, tentative_e_i - floor_ei) * m;
     ee_after = (D_e > 0.0)
-                   ? floor_e
-                   : fmax(floor_e,
+                   ? floor_ee
+                   : fmax(floor_ee,
                           tentative_e_e - absorption_factor * C_e / m);
     ei_after = (D_i > 0.0)
-                   ? floor_e
-                   : fmax(floor_e,
+                   ? floor_ei
+                   : fmax(floor_ei,
                           tentative_e_i - absorption_factor * C_i / m);
   }
 
@@ -605,8 +628,9 @@ Ale1dVelocityProjectResult project_velocity(
   cuda_check(cudaGetLastError(),
              "ALE1D velocity projection node launch failed");
 
+  std::optional<DeviceBuffer<double>> d_deposited;
   if (ke_conservation_closure) {
-    DeviceBuffer<double> d_deposited(static_cast<std::size_t>(n));
+    d_deposited.emplace(static_cast<std::size_t>(n));
     DeviceBuffer<double> d_deficit(static_cast<std::size_t>(n));
     DeviceBuffer<double> d_capacity(static_cast<std::size_t>(n));
     // Deposit into the remapped-but-uncommitted candidate. This moves the KE
@@ -644,7 +668,7 @@ Ale1dVelocityProjectResult project_velocity(
         <<<blocks_for(n), kBlockSize, 0, stream>>>(
             ee_new,
             ei_new,
-            d_deposited.data(),
+            d_deposited->data(),
             ke_remap,
             d_mass_new.data(),
             scratch.v_new_node.data(),
@@ -655,7 +679,7 @@ Ale1dVelocityProjectResult project_velocity(
     cuda_check(cudaGetLastError(),
                "ALE1D velocity projection KE closure launch failed");
     result.ke_closure_deposited = reduce_sum(
-        d_deposited.data(), n, stream,
+        d_deposited->data(), n, stream,
         "ALE1D velocity projection KE closure reduction failed");
   }
 
@@ -675,6 +699,110 @@ Ale1dVelocityProjectResult project_velocity(
       d_ke_new.data(), n + 1, stream,
       "ALE1D velocity projection new KE reduction failed");
   if (ke_conservation_closure) {
+    static int closure_dump_count = 0;
+    if (closure_dump_enabled() && closure_dump_count < 2) {
+      const int invocation = ++closure_dump_count;
+      std::vector<double> ke_remap_host(static_cast<std::size_t>(n));
+      std::vector<double> deposited_host(static_cast<std::size_t>(n));
+      std::vector<double> ee_new_host(static_cast<std::size_t>(n));
+      std::vector<double> ei_new_host(static_cast<std::size_t>(n));
+      std::vector<double> mass_new_host(static_cast<std::size_t>(n));
+      std::vector<double> v_new_host(static_cast<std::size_t>(n + 1));
+      cuda_check(cudaMemcpyAsync(ke_remap_host.data(),
+                                 ke_remap,
+                                 static_cast<std::size_t>(n) * sizeof(double),
+                                 cudaMemcpyDeviceToHost,
+                                 stream),
+                 "ALE1D closure dump ke_remap download failed");
+      cuda_check(cudaMemcpyAsync(deposited_host.data(),
+                                 d_deposited->data(),
+                                 static_cast<std::size_t>(n) * sizeof(double),
+                                 cudaMemcpyDeviceToHost,
+                                 stream),
+                 "ALE1D closure dump deposited download failed");
+      cuda_check(cudaMemcpyAsync(ee_new_host.data(),
+                                 ee_new,
+                                 static_cast<std::size_t>(n) * sizeof(double),
+                                 cudaMemcpyDeviceToHost,
+                                 stream),
+                 "ALE1D closure dump ee_new download failed");
+      cuda_check(cudaMemcpyAsync(ei_new_host.data(),
+                                 ei_new,
+                                 static_cast<std::size_t>(n) * sizeof(double),
+                                 cudaMemcpyDeviceToHost,
+                                 stream),
+                 "ALE1D closure dump ei_new download failed");
+      cuda_check(cudaMemcpyAsync(mass_new_host.data(),
+                                 d_mass_new.data(),
+                                 static_cast<std::size_t>(n) * sizeof(double),
+                                 cudaMemcpyDeviceToHost,
+                                 stream),
+                 "ALE1D closure dump mass_new download failed");
+      cuda_check(cudaMemcpyAsync(v_new_host.data(),
+                                 scratch.v_new_node.data(),
+                                 static_cast<std::size_t>(n + 1) *
+                                     sizeof(double),
+                                 cudaMemcpyDeviceToHost,
+                                 stream),
+                 "ALE1D closure dump v_new download failed");
+      cuda_check(cudaStreamSynchronize(stream),
+                 "ALE1D closure dump synchronization failed");
+
+      double ke_remap_total = 0.0;
+      double ke_new_cell_total = 0.0;
+      for (int i = 0; i < n; ++i) {
+        const auto idx = static_cast<std::size_t>(i);
+        ke_remap_total += ke_remap_host[idx];
+        ke_new_cell_total +=
+            0.25 * mass_new_host[idx] *
+            (v_new_host[idx] * v_new_host[idx] +
+             v_new_host[idx + 1U] * v_new_host[idx + 1U]);
+      }
+
+      std::ostringstream totals;
+      totals << std::scientific << std::setprecision(6)
+             << "[ale1d-ke-closure-dump] invocation=" << invocation
+             << " KE_old=" << result.kinetic_energy_old
+             << " KE_new=" << result.kinetic_energy_new
+             << " deposited_total=" << result.ke_closure_deposited
+             << " ke_remap_total=" << ke_remap_total
+             << " KE_new_cell_total=" << ke_new_cell_total;
+      core::log_info(totals.str());
+
+      std::vector<int> order(static_cast<std::size_t>(n));
+      std::iota(order.begin(), order.end(), 0);
+      const int top_count = std::min(n, 5);
+      std::partial_sort(
+          order.begin(),
+          order.begin() + top_count,
+          order.end(),
+          [&deposited_host](const int lhs, const int rhs) {
+            const double lhs_abs =
+                std::abs(deposited_host[static_cast<std::size_t>(lhs)]);
+            const double rhs_abs =
+                std::abs(deposited_host[static_cast<std::size_t>(rhs)]);
+            return lhs_abs == rhs_abs ? lhs < rhs : lhs_abs > rhs_abs;
+          });
+      for (int rank = 0; rank < top_count; ++rank) {
+        const int i = order[static_cast<std::size_t>(rank)];
+        const auto idx = static_cast<std::size_t>(i);
+        const double kinetic_new_cell =
+            0.25 * mass_new_host[idx] *
+            (v_new_host[idx] * v_new_host[idx] +
+             v_new_host[idx + 1U] * v_new_host[idx + 1U]);
+        std::ostringstream cell;
+        cell << std::scientific << std::setprecision(6)
+             << "[ale1d-ke-closure-dump-cell] invocation=" << invocation
+             << " index=" << i
+             << " ke_remap=" << ke_remap_host[idx]
+             << " K_new_cell=" << kinetic_new_cell
+             << " deposited=" << deposited_host[idx]
+             << " ee_new=" << ee_new_host[idx]
+             << " ei_new=" << ei_new_host[idx]
+             << " mass_new=" << mass_new_host[idx];
+        core::log_info(cell.str());
+      }
+    }
     const double diff = std::abs(result.kinetic_energy_new +
                                  result.ke_closure_deposited -
                                  result.kinetic_energy_old);
