@@ -10100,6 +10100,7 @@ void Builder::set_numerics(py::dict kwargs) {
                         "min_movable_segment_warn", "min_movable_segment_hard",
                         "max_node_displacement_fraction_mu",
                         "max_node_displacement_fraction_r",
+                        "ke_conservation_closure",
                         "total_mass_tol", "material_mass_tol",
                         "radiation_group_energy_tol",
                         "material_internal_energy_tol",
@@ -10111,7 +10112,7 @@ void Builder::set_numerics(py::dict kwargs) {
                         "diagnostics_fail_on_unexpected_apply",
                         "laser_sensor", "ablation_sensor", "shock_sensor",
                         "interface_sensor", "center_sensor", "rezone",
-                        "remap"});
+                        "min_width_floor", "remap"});
     auto& ale1d_cfg = numerics.ale1d;
     const auto parse_tol = [&](const char* key, auto& tol) {
       if (!has_key(ale1d, key)) {
@@ -10238,6 +10239,41 @@ void Builder::set_numerics(py::dict kwargs) {
             path + ".shock_spatial_dr_max_cm");
       }
     };
+    const auto parse_min_width_floor_dict = [&]() {
+      if (!has_key(ale1d, "min_width_floor")) {
+        return;
+      }
+      const py::handle floor_obj = ale1d["min_width_floor"];
+      const std::string path = "Numerics.ale1d.min_width_floor";
+      if (!py::isinstance<py::dict>(floor_obj)) {
+        throw_value_type_error(path, "dict", floor_obj);
+      }
+      const py::dict floor = py::reinterpret_borrow<py::dict>(floor_obj);
+      enforce_known_keys(
+          floor, path,
+          {"enabled", "floor_cm", "target_factor", "relief_halfwidth_cells",
+           "max_growth_factor"});
+      auto& cfg = ale1d_cfg.min_width_floor;
+      if (has_key(floor, "enabled")) {
+        cfg.enabled = strict_bool(floor["enabled"], path + ".enabled");
+      }
+      if (has_key(floor, "floor_cm")) {
+        cfg.floor_cm = numeric_as_double(floor["floor_cm"], path + ".floor_cm");
+      }
+      if (has_key(floor, "target_factor")) {
+        cfg.target_factor = numeric_as_double(
+            floor["target_factor"], path + ".target_factor");
+      }
+      if (has_key(floor, "relief_halfwidth_cells")) {
+        cfg.relief_halfwidth_cells = strict_int32(
+            floor["relief_halfwidth_cells"],
+            path + ".relief_halfwidth_cells");
+      }
+      if (has_key(floor, "max_growth_factor")) {
+        cfg.max_growth_factor = numeric_as_double(
+            floor["max_growth_factor"], path + ".max_growth_factor");
+      }
+    };
     const auto parse_remap_dict = [&]() {
       if (!has_key(ale1d, "remap")) {
         return;
@@ -10343,6 +10379,11 @@ void Builder::set_numerics(py::dict kwargs) {
       ale1d_cfg.max_node_displacement_fraction_r = numeric_as_double(
           ale1d["max_node_displacement_fraction_r"],
           "Numerics.ale1d.max_node_displacement_fraction_r");
+    }
+    if (has_key(ale1d, "ke_conservation_closure")) {
+      ale1d_cfg.ke_conservation_closure = strict_bool(
+          ale1d["ke_conservation_closure"],
+          "Numerics.ale1d.ke_conservation_closure");
     }
     parse_tol("total_mass_tol", ale1d_cfg.total_mass_tol);
     parse_tol("material_mass_tol", ale1d_cfg.material_mass_tol);
@@ -10555,6 +10596,7 @@ void Builder::set_numerics(py::dict kwargs) {
       }
     });
     parse_rezone_dict();
+    parse_min_width_floor_dict();
     parse_remap_dict();
   }
 

@@ -4,7 +4,10 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <iomanip>
 #include <limits>
+#include <sstream>
+#include <string>
 #include <vector>
 
 #include <cub/cub.cuh>
@@ -27,6 +30,7 @@ constexpr int kFallbackEe = 1 << 1;
 constexpr int kFallbackEi = 1 << 2;
 constexpr int kFallbackRadiation = 1 << 3;
 constexpr int kFallbackMaterial = 1 << 4;
+constexpr int kFallbackKinetic = 1 << 5;
 
 inline void cuda_check(const cudaError_t err, const char* message) {
   TENRYU_ASSERT(err == cudaSuccess, message);
@@ -377,6 +381,25 @@ __global__ void fill_radiation_density_kernel(
   q[i] = rad_e[i * n_groups + group];
 }
 
+__global__ void fill_kinetic_density_kernel(
+    const double* __restrict__ mass,
+    const double* __restrict__ v_r,
+    const double* __restrict__ r_old,
+    double* __restrict__ q,
+    const int n,
+    const int geom) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) {
+    return;
+  }
+  // Each cell contributes half its mass to each endpoint, so summing this
+  // cell convention equals the nodal sum used by kinetic_energy_kernel.
+  const double kinetic =
+      0.25 * mass[i] * (v_r[i] * v_r[i] + v_r[i + 1] * v_r[i + 1]);
+  const double vol = fmax(cell_volume_from_nodes(r_old, i, geom), kTiny);
+  q[i] = kinetic / vol;
+}
+
 __device__ double limited_face_flux(const int face,
                                     const double* __restrict__ r_old,
                                     const double* __restrict__ delta_y,
@@ -419,6 +442,43 @@ __global__ void remap_density_to_extensive_kernel(
   q_ext_new[i] = q_old_ext + fp - fm;
 }
 
+__global__ void compute_limited_face_flux_kernel(
+    const double* __restrict__ r_old,
+    const double* __restrict__ delta_y,
+    const int* __restrict__ donor,
+    const double* __restrict__ phi_face,
+    const double* __restrict__ q,
+    const double* __restrict__ slope,
+    double* __restrict__ face_flux,
+    const int n,
+    const int geom) {
+  const int j = blockIdx.x * blockDim.x + threadIdx.x;
+  if (j > n) {
+    return;
+  }
+  face_flux[j] =
+      limited_face_flux(j, r_old, delta_y, donor, phi_face, q, slope, geom);
+}
+
+__global__ void remap_specific_with_mass_flux_kernel(
+    const double* __restrict__ q_specific_old,
+    const double* __restrict__ mass_old_ext,
+    const double* __restrict__ mass_flux,
+    const int* __restrict__ donor,
+    double* __restrict__ q_ext_new,
+    const int n) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) {
+    return;
+  }
+  const int dp = donor[i + 1];
+  const int dm = donor[i];
+  const double ep = (dp >= 0) ? q_specific_old[dp] : 0.0;
+  const double em = (dm >= 0) ? q_specific_old[dm] : 0.0;
+  q_ext_new[i] = q_specific_old[i] * mass_old_ext[i] +
+                 ep * mass_flux[i + 1] - em * mass_flux[i];
+}
+
 __global__ void remap_density_to_density_kernel(
     const double* __restrict__ r_old,
     const double* __restrict__ vol_new,
@@ -451,6 +511,24 @@ __global__ void extensive_to_specific_kernel(const double* __restrict__ q_ext,
     return;
   }
   specific[i] = (mass[i] > kTiny) ? q_ext[i] / mass[i] : 0.0;
+}
+
+__global__ void density_to_extensive_kernel(double* __restrict__ q,
+                                             const double* __restrict__ vol,
+                                             const int n) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) {
+    q[i] *= fmax(vol[i], 0.0);
+  }
+}
+
+__global__ void shift_specific_field_kernel(double* __restrict__ specific,
+                                            const double offset,
+                                            const int n) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) {
+    specific[i] += offset;
+  }
 }
 
 __global__ void scatter_material_extensive_kernel(
@@ -494,6 +572,8 @@ __global__ void validate_extensive_density_bounds_kernel(
     const double* __restrict__ q_ext_new,
     int* __restrict__ fallback_flags,
     int* __restrict__ fail_count,
+    double* __restrict__ first_fail_data,
+    int* __restrict__ first_fail_cell,
     const int n,
     const int fallback_bit,
     const bool record_fallback) {
@@ -508,6 +588,16 @@ __global__ void validate_extensive_density_bounds_kernel(
   const double q_new = q_ext_new[i] / fmax(vol_new[i], kTiny);
   if (bounds_fail(q_new, q_min, q_max)) {
     atomicAdd(fail_count, 1);
+    if (first_fail_cell != nullptr &&
+        atomicCAS(first_fail_cell, -1, i) == -1 &&
+        first_fail_data != nullptr) {
+      first_fail_data[0] = q_new;
+      first_fail_data[1] = q_min;
+      first_fail_data[2] = q_max;
+      first_fail_data[3] = q_old[i];
+      first_fail_data[4] = vol_new[i];
+      first_fail_data[5] = q_ext_new[i];
+    }
     if (record_fallback && fallback_flags != nullptr) {
       atomicOr(&fallback_flags[i], fallback_bit);
     }
@@ -544,6 +634,8 @@ __global__ void validate_specific_bounds_kernel(
     const double* __restrict__ q_ext_new,
     int* __restrict__ fallback_flags,
     int* __restrict__ fail_count,
+    double* __restrict__ first_fail_data,
+    int* __restrict__ first_fail_cell,
     const int n,
     const int fallback_bit,
     const bool record_fallback) {
@@ -558,6 +650,16 @@ __global__ void validate_specific_bounds_kernel(
   const double q_new = (mass_new[i] > kTiny) ? q_ext_new[i] / mass_new[i] : 0.0;
   if (bounds_fail(q_new, q_min, q_max)) {
     atomicAdd(fail_count, 1);
+    if (first_fail_cell != nullptr &&
+        atomicCAS(first_fail_cell, -1, i) == -1 &&
+        first_fail_data != nullptr) {
+      first_fail_data[0] = q_new;
+      first_fail_data[1] = q_min;
+      first_fail_data[2] = q_max;
+      first_fail_data[3] = q_old[i];
+      first_fail_data[4] = mass_new[i];
+      first_fail_data[5] = q_ext_new[i];
+    }
     if (record_fallback && fallback_flags != nullptr) {
       atomicOr(&fallback_flags[i], fallback_bit);
     }
@@ -775,6 +877,26 @@ double relative_error(const double old_total, const double new_total) {
   return denom > kTiny ? diff / denom : diff;
 }
 
+double compute_specific_energy_offset(const double* specific,
+                                      const int n,
+                                      cudaStream_t stream) {
+  std::vector<double> host_specific(static_cast<std::size_t>(n));
+  cuda_check(cudaMemcpyAsync(host_specific.data(),
+                             specific,
+                             static_cast<std::size_t>(n) * sizeof(double),
+                             cudaMemcpyDeviceToHost,
+                             stream),
+             "ALE1D remap specific energy download failed");
+  cuda_check(cudaStreamSynchronize(stream),
+             "ALE1D remap specific energy download sync failed");
+  const double min_specific =
+      *std::min_element(host_specific.begin(), host_specific.end());
+  // Negative table-EOS offsets commute with conservative remap under affine shift.
+  return min_specific < 0.0
+             ? (-min_specific) * (1.0 + 1.0e-6) + 1.0e-30
+             : 0.0;
+}
+
 struct MassEnergyOp {
   const double* mass = nullptr;
   const double* e = nullptr;
@@ -933,12 +1055,21 @@ int validate_extensive_field(const double* q_old,
                              const double* q_ext_new,
                              int* fallback_flags,
                              DeviceBuffer<int>& fail_count,
+                             double* first_fail_data,
+                             int* first_fail_cell,
                              const int n,
                              const int fallback_bit,
                              const bool record_fallback,
                              cudaStream_t stream) {
+  DeviceBuffer<double> d_first_fail_data(6);
+  DeviceBuffer<int> d_first_fail_cell(1);
   cuda_check(cudaMemsetAsync(fail_count.data(), 0, sizeof(int), stream),
              "ALE1D remap bounds count memset failed");
+  cuda_check(cudaMemsetAsync(d_first_fail_cell.data(),
+                             0xff,
+                             sizeof(int),
+                             stream),
+             "ALE1D remap first-fail cell memset failed");
   validate_extensive_density_bounds_kernel<<<blocks_for(n), kBlockSize, 0,
                                              stream>>>(
       q_old,
@@ -946,12 +1077,31 @@ int validate_extensive_field(const double* q_old,
       q_ext_new,
       fallback_flags,
       fail_count.data(),
+      d_first_fail_data.data(),
+      d_first_fail_cell.data(),
       n,
       fallback_bit,
       record_fallback);
   cuda_check(cudaGetLastError(), "ALE1D remap bounds kernel launch failed");
-  return download_count(fail_count, stream,
-                        "ALE1D remap bounds count download failed");
+  const int failed = download_count(
+      fail_count, stream, "ALE1D remap bounds count download failed");
+  if (failed > 0) {
+    cuda_check(cudaMemcpyAsync(first_fail_cell,
+                               d_first_fail_cell.data(),
+                               sizeof(int),
+                               cudaMemcpyDeviceToHost,
+                               stream),
+               "ALE1D remap first-fail cell download failed");
+    cuda_check(cudaMemcpyAsync(first_fail_data,
+                               d_first_fail_data.data(),
+                               6 * sizeof(double),
+                               cudaMemcpyDeviceToHost,
+                               stream),
+               "ALE1D remap first-fail data download failed");
+    cuda_check(cudaStreamSynchronize(stream),
+               "ALE1D remap first-fail download failed");
+  }
+  return failed;
 }
 
 int validate_density_field(const double* q_old,
@@ -982,25 +1132,53 @@ int validate_specific_field(const double* q_old,
                             const double* q_ext_new,
                             int* fallback_flags,
                             DeviceBuffer<int>& fail_count,
+                            double* first_fail_data,
+                            int* first_fail_cell,
                             const int n,
                             const int fallback_bit,
                             const bool record_fallback,
                             cudaStream_t stream) {
+  DeviceBuffer<double> d_first_fail_data(6);
+  DeviceBuffer<int> d_first_fail_cell(1);
   cuda_check(cudaMemsetAsync(fail_count.data(), 0, sizeof(int), stream),
              "ALE1D remap bounds count memset failed");
+  cuda_check(cudaMemsetAsync(d_first_fail_cell.data(),
+                             0xff,
+                             sizeof(int),
+                             stream),
+             "ALE1D remap first-fail cell memset failed");
   validate_specific_bounds_kernel<<<blocks_for(n), kBlockSize, 0, stream>>>(
       q_old,
       mass_new,
       q_ext_new,
       fallback_flags,
       fail_count.data(),
+      d_first_fail_data.data(),
+      d_first_fail_cell.data(),
       n,
       fallback_bit,
       record_fallback);
   cuda_check(cudaGetLastError(),
              "ALE1D remap specific bounds kernel launch failed");
-  return download_count(fail_count, stream,
-                        "ALE1D remap bounds count download failed");
+  const int failed = download_count(
+      fail_count, stream, "ALE1D remap bounds count download failed");
+  if (failed > 0) {
+    cuda_check(cudaMemcpyAsync(first_fail_cell,
+                               d_first_fail_cell.data(),
+                               sizeof(int),
+                               cudaMemcpyDeviceToHost,
+                               stream),
+               "ALE1D remap first-fail cell download failed");
+    cuda_check(cudaMemcpyAsync(first_fail_data,
+                               d_first_fail_data.data(),
+                               6 * sizeof(double),
+                               cudaMemcpyDeviceToHost,
+                               stream),
+               "ALE1D remap first-fail data download failed");
+    cuda_check(cudaStreamSynchronize(stream),
+               "ALE1D remap first-fail download failed");
+  }
+  return failed;
 }
 
 struct FieldRemapStatus {
@@ -1008,6 +1186,29 @@ struct FieldRemapStatus {
   bool used_fallback = false;
   int fallback_cells = 0;
 };
+
+void log_field_validation_failure(const char* field_label,
+                                  const int fail_count,
+                                  const int first_fail_cell = -1,
+                                  const double* first_fail_data = nullptr) {
+  static int log_count = 0;
+  if (log_count >= 8) {
+    return;
+  }
+  ++log_count;
+  std::ostringstream message;
+  message << std::scientific << std::setprecision(6)
+          << "[ale1d][remap] field=" << field_label
+          << " validation failed after fallback: fail_count=" << fail_count;
+  if (first_fail_data != nullptr) {
+    message << " first_cell=" << first_fail_cell
+            << " q_new=" << first_fail_data[0] << " bounds=["
+            << first_fail_data[1] << "," << first_fail_data[2] << "]"
+            << " q_old=" << first_fail_data[3]
+            << " vol_new=" << first_fail_data[4];
+  }
+  core::log_info(message.str());
+}
 
 FieldRemapStatus remap_extensive_field_with_fallback(
     const double* r_old,
@@ -1027,9 +1228,12 @@ FieldRemapStatus remap_extensive_field_with_fallback(
     const bool high_order,
     const bool fallback_enabled,
     const int fallback_bit,
+    const char* field_label,
     cudaStream_t stream,
     const int geom) {
   FieldRemapStatus status;
+  double first_fail_data[6] = {};
+  int first_fail_cell = -1;
   const double* active_phi = high_order ? phi_face : zero_phi;
   compute_slopes_for_field(
       q_old, r_old, protected_face, slope, n, theta, high_order, stream, geom);
@@ -1046,6 +1250,8 @@ FieldRemapStatus remap_extensive_field_with_fallback(
                                               q_ext_new,
                                               fallback_flags,
                                               fail_count,
+                                              first_fail_data,
+                                              &first_fail_cell,
                                               n,
                                               fallback_bit,
                                               true,
@@ -1057,6 +1263,8 @@ FieldRemapStatus remap_extensive_field_with_fallback(
   status.fallback_cells = failed;
   if (!fallback_enabled) {
     status.success = false;
+    log_field_validation_failure(
+        field_label, failed, first_fail_cell, first_fail_data);
     return status;
   }
 
@@ -1071,11 +1279,17 @@ FieldRemapStatus remap_extensive_field_with_fallback(
                                                        q_ext_new,
                                                        nullptr,
                                                        fail_count,
+                                                       first_fail_data,
+                                                       &first_fail_cell,
                                                        n,
                                                        fallback_bit,
                                                        false,
                                                        stream);
-  status.success = fallback_failed == 0;
+  if (fallback_failed > 0) {
+    status.success = false;
+    log_field_validation_failure(
+        field_label, fallback_failed, first_fail_cell, first_fail_data);
+  }
   return status;
 }
 
@@ -1097,6 +1311,7 @@ FieldRemapStatus remap_density_field_with_fallback(
     const bool high_order,
     const bool fallback_enabled,
     const int fallback_bit,
+    const char* field_label,
     cudaStream_t stream,
     const int geom) {
   FieldRemapStatus status;
@@ -1126,6 +1341,7 @@ FieldRemapStatus remap_density_field_with_fallback(
   status.fallback_cells = failed;
   if (!fallback_enabled) {
     status.success = false;
+    log_field_validation_failure(field_label, failed);
     return status;
   }
 
@@ -1143,7 +1359,10 @@ FieldRemapStatus remap_density_field_with_fallback(
                                                      fallback_bit,
                                                      false,
                                                      stream);
-  status.success = fallback_failed == 0;
+  if (fallback_failed > 0) {
+    status.success = false;
+    log_field_validation_failure(field_label, fallback_failed);
+  }
   return status;
 }
 
@@ -1156,6 +1375,8 @@ FieldRemapStatus remap_specific_field_with_fallback(
     const std::uint8_t* protected_face,
     const double* q_density_old,
     const double* q_specific_old,
+    const double* mass_old_ext,
+    const double* mass_flux,
     const double* mass_new,
     double* q_ext_new,
     double* slope,
@@ -1166,9 +1387,12 @@ FieldRemapStatus remap_specific_field_with_fallback(
     const bool high_order,
     const bool fallback_enabled,
     const int fallback_bit,
+    const char* field_label,
     cudaStream_t stream,
     const int geom) {
   FieldRemapStatus status;
+  double first_fail_data[6] = {};
+  int first_fail_cell = -1;
   const double* active_phi = high_order ? phi_face : zero_phi;
   compute_slopes_for_field(q_density_old,
                            r_old,
@@ -1194,6 +1418,8 @@ FieldRemapStatus remap_specific_field_with_fallback(
                                              q_ext_new,
                                              fallback_flags,
                                              fail_count,
+                                             first_fail_data,
+                                             &first_fail_cell,
                                              n,
                                              fallback_bit,
                                              true,
@@ -1205,21 +1431,18 @@ FieldRemapStatus remap_specific_field_with_fallback(
   status.fallback_cells = failed;
   if (!fallback_enabled) {
     status.success = false;
+    log_field_validation_failure(
+        field_label, failed, first_fail_cell, first_fail_data);
     return status;
   }
 
-  compute_slopes_for_field(q_density_old,
-                           r_old,
-                           protected_face,
-                           slope,
-                           n,
-                           theta,
-                           false,
-                           stream,
-                           geom);
-  remap_density_to_extensive_kernel<<<blocks_for(n), kBlockSize, 0, stream>>>(
-      r_old, q_density_old, delta_y, donor, zero_phi, slope, q_ext_new, n,
-      geom);
+  remap_specific_with_mass_flux_kernel<<<blocks_for(n), kBlockSize, 0,
+                                          stream>>>(q_specific_old,
+                                                    mass_old_ext,
+                                                    mass_flux,
+                                                    donor,
+                                                    q_ext_new,
+                                                    n);
   cuda_check(cudaGetLastError(),
              "ALE1D remap fallback specific kernel launch failed");
   const int fallback_failed = validate_specific_field(q_specific_old,
@@ -1227,11 +1450,17 @@ FieldRemapStatus remap_specific_field_with_fallback(
                                                       q_ext_new,
                                                       nullptr,
                                                       fail_count,
+                                                      first_fail_data,
+                                                      &first_fail_cell,
                                                       n,
                                                       fallback_bit,
                                                       false,
                                                       stream);
-  status.success = fallback_failed == 0;
+  if (fallback_failed > 0) {
+    status.success = false;
+    log_field_validation_failure(
+        field_label, fallback_failed, first_fail_cell, first_fail_data);
+  }
   return status;
 }
 
@@ -1248,7 +1477,8 @@ void accumulate_fallback(Ale1dRemapResult& result,
 
 void Ale1dRemapScratch::resize(const int n_cells,
                                const int n_groups,
-                               const int n_materials) {
+                               const int n_materials,
+                               const bool ke_conservation_closure) {
   TENRYU_ASSERT(n_cells >= 0, "ALE1D remap scratch n_cells must be nonnegative");
   TENRYU_ASSERT(n_groups >= 0, "ALE1D remap scratch n_groups must be nonnegative");
   TENRYU_ASSERT(n_materials >= 0,
@@ -1257,6 +1487,9 @@ void Ale1dRemapScratch::resize(const int n_cells,
   mass_new.resize(n);
   ee_new.resize(n);
   ei_new.resize(n);
+  if (ke_conservation_closure) {
+    ke_remap.resize(n);
+  }
   rad_E_new.resize(n * static_cast<std::size_t>(n_groups));
   volFrac_new.resize(n * static_cast<std::size_t>(n_materials));
   vol_new.resize(n);
@@ -1268,12 +1501,14 @@ void Ale1dRemapScratch::resize(const int n_cells,
 
 bool Ale1dRemapScratch::size_matches(const int n_cells,
                                      const int n_groups,
-                                     const int n_materials) const {
+                                     const int n_materials,
+                                     const bool ke_conservation_closure) const {
   if (n_cells < 0 || n_groups < 0 || n_materials < 0) {
     return false;
   }
   const auto n = static_cast<std::size_t>(n_cells);
   return mass_new.size() == n && ee_new.size() == n && ei_new.size() == n &&
+         (!ke_conservation_closure || ke_remap.size() == n) &&
          rad_E_new.size() == n * static_cast<std::size_t>(n_groups) &&
          volFrac_new.size() == n * static_cast<std::size_t>(n_materials) &&
          vol_new.size() == n && delta_Y.size() == n + 1U &&
@@ -1333,7 +1568,13 @@ Ale1dRemapResult remap_v3(const core::State& state,
   TENRYU_ASSERT(state.volFrac.size() >=
                     static_cast<std::size_t>(n) * static_cast<std::size_t>(n_mat),
                 "ALE1D remap requires volFrac field");
-  TENRYU_ASSERT(scratch.size_matches(n, n_groups, n_mat),
+  if (cfg.numerics.ale1d.ke_conservation_closure) {
+    TENRYU_ASSERT(state.v_r.size() >= static_cast<std::size_t>(n + 1),
+                  "ALE1D kinetic remap requires n_cells+1 velocities");
+  }
+  TENRYU_ASSERT(scratch.size_matches(
+                    n, n_groups, n_mat,
+                    cfg.numerics.ale1d.ke_conservation_closure),
                 "ALE1D remap scratch size mismatch");
 
   cudaStream_t stream = nullptr;
@@ -1450,6 +1691,7 @@ Ale1dRemapResult remap_v3(const core::State& state,
 
   DeviceBuffer<double> d_q(static_cast<std::size_t>(n));
   DeviceBuffer<double> d_slope(static_cast<std::size_t>(n));
+  DeviceBuffer<double> d_mass_flux(static_cast<std::size_t>(n + 1));
   DeviceBuffer<int> d_fail_count(1);
   const double theta = cfg.numerics.ale1d.remap.limiter_theta;
   const bool fallback_enabled =
@@ -1476,6 +1718,7 @@ Ale1dRemapResult remap_v3(const core::State& state,
       high_order,
       fallback_enabled,
       kFallbackMass,
+      "mass",
       stream,
       geom);
   accumulate_fallback(result, mass_status);
@@ -1486,6 +1729,62 @@ Ale1dRemapResult remap_v3(const core::State& state,
   }
 
   bool mass_basis_first_order = !high_order || mass_status.used_fallback;
+  const auto persist_mass_flux = [&](const bool first_order) {
+    const double* accepted_phi =
+        first_order ? d_zero_phi.data() : scratch.phi_face.data();
+    compute_limited_face_flux_kernel<<<blocks_for(n + 1), kBlockSize, 0,
+                                       stream>>>(state.x_r.data(),
+                                                 scratch.delta_Y.data(),
+                                                 scratch.donor.data(),
+                                                 accepted_phi,
+                                                 d_q.data(),
+                                                 d_slope.data(),
+                                                 d_mass_flux.data(),
+                                                 n,
+                                                 geom);
+    cuda_check(cudaGetLastError(),
+               "ALE1D remap accepted mass flux kernel launch failed");
+#ifndef NDEBUG
+    std::vector<double> mass_old_host(static_cast<std::size_t>(n));
+    std::vector<double> mass_new_host(static_cast<std::size_t>(n));
+    std::vector<double> mass_flux_host(static_cast<std::size_t>(n + 1));
+    cuda_check(cudaMemcpyAsync(mass_old_host.data(),
+                               state.mass.data(),
+                               static_cast<std::size_t>(n) * sizeof(double),
+                               cudaMemcpyDeviceToHost,
+                               stream),
+               "ALE1D remap old mass consistency download failed");
+    cuda_check(cudaMemcpyAsync(mass_new_host.data(),
+                               scratch.mass_new.data(),
+                               static_cast<std::size_t>(n) * sizeof(double),
+                               cudaMemcpyDeviceToHost,
+                               stream),
+               "ALE1D remap new mass consistency download failed");
+    cuda_check(cudaMemcpyAsync(mass_flux_host.data(),
+                               d_mass_flux.data(),
+                               static_cast<std::size_t>(n + 1) * sizeof(double),
+                               cudaMemcpyDeviceToHost,
+                               stream),
+               "ALE1D remap mass flux consistency download failed");
+    cuda_check(cudaStreamSynchronize(stream),
+               "ALE1D remap mass flux consistency sync failed");
+    double max_rel_diff = 0.0;
+    for (int i = 0; i < n; ++i) {
+      const double reconstructed =
+          mass_old_host[static_cast<std::size_t>(i)] +
+          mass_flux_host[static_cast<std::size_t>(i + 1)] -
+          mass_flux_host[static_cast<std::size_t>(i)];
+      const double accepted = mass_new_host[static_cast<std::size_t>(i)];
+      const double scale =
+          std::max(kTiny, std::max(std::abs(accepted), std::abs(reconstructed)));
+      max_rel_diff =
+          std::max(max_rel_diff, std::abs(accepted - reconstructed) / scale);
+    }
+    TENRYU_ASSERT(max_rel_diff < 1.0e-12,
+                  "ALE1D remap accepted mass flux consistency check failed");
+#endif
+  };
+  persist_mass_flux(mass_basis_first_order);
   const auto force_mass_first_order = [&]() {
     if (mass_basis_first_order) {
       return;
@@ -1511,18 +1810,40 @@ Ale1dRemapResult remap_v3(const core::State& state,
                                         false,
                                         false,
                                         kFallbackMass,
+                                        "mass",
                                         stream,
                                         geom);
     mass_basis_first_order = true;
+    persist_mass_flux(true);
   };
 
   FieldRemapStatus ee_status;
   FieldRemapStatus ei_status;
+  const double ee_offset =
+      compute_specific_energy_offset(state.ee.data(), n, stream);
+  const double ei_offset =
+      compute_specific_energy_offset(state.ei.data(), n, stream);
+  DeviceBuffer<double> d_shifted_energy;
+  if (ee_offset > 0.0 || ei_offset > 0.0) {
+    d_shifted_energy.reset(static_cast<std::size_t>(n));
+  }
   const auto remap_specific_energies = [&]() {
+    const double* ee_specific = state.ee.data();
+    if (ee_offset > 0.0) {
+      cuda_check(cudaMemcpyAsync(d_shifted_energy.data(),
+                                 state.ee.data(),
+                                 static_cast<std::size_t>(n) * sizeof(double),
+                                 cudaMemcpyDeviceToDevice,
+                                 stream),
+                 "ALE1D remap ee shift copy failed");
+      shift_specific_field_kernel<<<blocks_for(n), kBlockSize, 0, stream>>>(
+          d_shifted_energy.data(), ee_offset, n);
+      cuda_check(cudaGetLastError(), "ALE1D remap ee shift launch failed");
+      ee_specific = d_shifted_energy.data();
+    }
     fill_material_energy_density_kernel<<<blocks_for(n), kBlockSize, 0,
                                            stream>>>(
-        state.x_r.data(), state.mass.data(), state.ee.data(), d_q.data(), n,
-        geom);
+        state.x_r.data(), state.mass.data(), ee_specific, d_q.data(), n, geom);
     cuda_check(cudaGetLastError(), "ALE1D remap ee density launch failed");
     ee_status = remap_specific_field_with_fallback(state.x_r.data(),
                                                    scratch.delta_Y.data(),
@@ -1531,7 +1852,9 @@ Ale1dRemapResult remap_v3(const core::State& state,
                                                    d_zero_phi.data(),
                                                    d_protected_face.data(),
                                                    d_q.data(),
-                                                   state.ee.data(),
+                                                   ee_specific,
+                                                   state.mass.data(),
+                                                   d_mass_flux.data(),
                                                    scratch.mass_new.data(),
                                                    scratch.ee_new.data(),
                                                    d_slope.data(),
@@ -1542,16 +1865,29 @@ Ale1dRemapResult remap_v3(const core::State& state,
                                                    high_order,
                                                    fallback_enabled,
                                                    kFallbackEe,
+                                                   "ee",
                                                    stream,
                                                    geom);
     if (!ee_status.success) {
       return false;
     }
 
+    const double* ei_specific = state.ei.data();
+    if (ei_offset > 0.0) {
+      cuda_check(cudaMemcpyAsync(d_shifted_energy.data(),
+                                 state.ei.data(),
+                                 static_cast<std::size_t>(n) * sizeof(double),
+                                 cudaMemcpyDeviceToDevice,
+                                 stream),
+                 "ALE1D remap ei shift copy failed");
+      shift_specific_field_kernel<<<blocks_for(n), kBlockSize, 0, stream>>>(
+          d_shifted_energy.data(), ei_offset, n);
+      cuda_check(cudaGetLastError(), "ALE1D remap ei shift launch failed");
+      ei_specific = d_shifted_energy.data();
+    }
     fill_material_energy_density_kernel<<<blocks_for(n), kBlockSize, 0,
                                            stream>>>(
-        state.x_r.data(), state.mass.data(), state.ei.data(), d_q.data(), n,
-        geom);
+        state.x_r.data(), state.mass.data(), ei_specific, d_q.data(), n, geom);
     cuda_check(cudaGetLastError(), "ALE1D remap ei density launch failed");
     ei_status = remap_specific_field_with_fallback(state.x_r.data(),
                                                    scratch.delta_Y.data(),
@@ -1560,7 +1896,9 @@ Ale1dRemapResult remap_v3(const core::State& state,
                                                    d_zero_phi.data(),
                                                    d_protected_face.data(),
                                                    d_q.data(),
-                                                   state.ei.data(),
+                                                   ei_specific,
+                                                   state.mass.data(),
+                                                   d_mass_flux.data(),
                                                    scratch.mass_new.data(),
                                                    scratch.ei_new.data(),
                                                    d_slope.data(),
@@ -1571,6 +1909,7 @@ Ale1dRemapResult remap_v3(const core::State& state,
                                                    high_order,
                                                    fallback_enabled,
                                                    kFallbackEi,
+                                                   "ei",
                                                    stream,
                                                    geom);
     return ei_status.success;
@@ -1594,10 +1933,20 @@ Ale1dRemapResult remap_v3(const core::State& state,
       scratch.ee_new.data(), scratch.mass_new.data(), scratch.ee_new.data(), n);
   cuda_check(cudaGetLastError(),
              "ALE1D remap ee specific kernel launch failed");
+  if (ee_offset > 0.0) {
+    shift_specific_field_kernel<<<blocks_for(n), kBlockSize, 0, stream>>>(
+        scratch.ee_new.data(), -ee_offset, n);
+    cuda_check(cudaGetLastError(), "ALE1D remap ee unshift launch failed");
+  }
   extensive_to_specific_kernel<<<blocks_for(n), kBlockSize, 0, stream>>>(
       scratch.ei_new.data(), scratch.mass_new.data(), scratch.ei_new.data(), n);
   cuda_check(cudaGetLastError(),
              "ALE1D remap ei specific kernel launch failed");
+  if (ei_offset > 0.0) {
+    shift_specific_field_kernel<<<blocks_for(n), kBlockSize, 0, stream>>>(
+        scratch.ei_new.data(), -ei_offset, n);
+    cuda_check(cudaGetLastError(), "ALE1D remap ei unshift launch failed");
+  }
 
   if (n_mat > 0) {
     DeviceBuffer<double> d_material_ext(static_cast<std::size_t>(n));
@@ -1613,6 +1962,7 @@ Ale1dRemapResult remap_v3(const core::State& state,
           geom);
       cuda_check(cudaGetLastError(),
                  "ALE1D remap material density launch failed");
+      const std::string field_label = "material_" + std::to_string(m);
       const FieldRemapStatus mat_status = remap_extensive_field_with_fallback(
           state.x_r.data(),
           scratch.vol_new.data(),
@@ -1631,6 +1981,7 @@ Ale1dRemapResult remap_v3(const core::State& state,
           high_order,
           fallback_enabled,
           kFallbackMaterial,
+          field_label.c_str(),
           stream,
           geom);
       accumulate_fallback(result, mat_status);
@@ -1657,6 +2008,7 @@ Ale1dRemapResult remap_v3(const core::State& state,
           state.rad_E.data(), d_q.data(), n, n_groups, g);
       cuda_check(cudaGetLastError(),
                  "ALE1D remap radiation density launch failed");
+      const std::string field_label = "radiation_" + std::to_string(g);
       const FieldRemapStatus rad_status = remap_density_field_with_fallback(
           state.x_r.data(),
           scratch.vol_new.data(),
@@ -1675,6 +2027,7 @@ Ale1dRemapResult remap_v3(const core::State& state,
           high_order,
           fallback_enabled,
           kFallbackRadiation,
+          field_label.c_str(),
           stream,
           geom);
       accumulate_fallback(result, rad_status);
@@ -1688,6 +2041,44 @@ Ale1dRemapResult remap_v3(const core::State& state,
       cuda_check(cudaGetLastError(),
                  "ALE1D remap radiation scatter kernel launch failed");
     }
+  }
+
+  if (cfg.numerics.ale1d.ke_conservation_closure) {
+    fill_kinetic_density_kernel<<<blocks_for(n), kBlockSize, 0, stream>>>(
+        state.mass.data(), state.v_r.data(), state.x_r.data(), d_q.data(), n, geom);
+    cuda_check(cudaGetLastError(),
+               "ALE1D remap kinetic density launch failed");
+    const FieldRemapStatus kinetic_status = remap_density_field_with_fallback(
+        state.x_r.data(),
+        scratch.vol_new.data(),
+        scratch.delta_Y.data(),
+        scratch.donor.data(),
+        d_radiation_phi.data(),
+        d_zero_phi.data(),
+        d_protected_face.data(),
+        d_q.data(),
+        scratch.ke_remap.data(),
+        d_slope.data(),
+        d_fail_count,
+        scratch.fallback_flags.data(),
+        n,
+        theta,
+        high_order,
+        fallback_enabled,
+        kFallbackKinetic,
+        "kinetic",
+        stream,
+        geom);
+    accumulate_fallback(result, kinetic_status);
+    if (!kinetic_status.success) {
+      result.success = false;
+      result.skip_reason = Ale1dSkipReason::ConservationRejected;
+      return result;
+    }
+    density_to_extensive_kernel<<<blocks_for(n), kBlockSize, 0, stream>>>(
+        scratch.ke_remap.data(), scratch.vol_new.data(), n);
+    cuda_check(cudaGetLastError(),
+               "ALE1D remap kinetic extensive launch failed");
   }
 
   if (mass_basis_first_order && high_order) {
@@ -1752,7 +2143,13 @@ Ale1dRemapResult remap_first_order(const core::State& state,
   TENRYU_ASSERT(state.volFrac.size() >=
                     static_cast<std::size_t>(n) * static_cast<std::size_t>(n_mat),
                 "ALE1D remap requires volFrac field");
-  TENRYU_ASSERT(scratch.size_matches(n, n_groups, n_mat),
+  if (cfg.numerics.ale1d.ke_conservation_closure) {
+    TENRYU_ASSERT(state.v_r.size() >= static_cast<std::size_t>(n + 1),
+                  "ALE1D kinetic remap requires n_cells+1 velocities");
+  }
+  TENRYU_ASSERT(scratch.size_matches(
+                    n, n_groups, n_mat,
+                    cfg.numerics.ale1d.ke_conservation_closure),
                 "ALE1D remap scratch size mismatch");
 
   cudaStream_t stream = nullptr;
@@ -1870,6 +2267,46 @@ Ale1dRemapResult remap_first_order(const core::State& state,
         geom);
     cuda_check(cudaGetLastError(),
                "ALE1D remap radiation kernel launch failed");
+  }
+
+  if (cfg.numerics.ale1d.ke_conservation_closure) {
+    DeviceBuffer<double> d_q(static_cast<std::size_t>(n));
+    DeviceBuffer<double> d_slope(static_cast<std::size_t>(n));
+    DeviceBuffer<int> d_fail_count(1);
+    fill_kinetic_density_kernel<<<blocks_for(n), kBlockSize, 0, stream>>>(
+        state.mass.data(), state.v_r.data(), state.x_r.data(), d_q.data(), n, geom);
+    cuda_check(cudaGetLastError(),
+               "ALE1D first-order kinetic density launch failed");
+    const FieldRemapStatus kinetic_status = remap_density_field_with_fallback(
+        state.x_r.data(),
+        scratch.vol_new.data(),
+        scratch.delta_Y.data(),
+        scratch.donor.data(),
+        scratch.phi_face.data(),
+        scratch.phi_face.data(),
+        nullptr,
+        d_q.data(),
+        scratch.ke_remap.data(),
+        d_slope.data(),
+        d_fail_count,
+        scratch.fallback_flags.data(),
+        n,
+        cfg.numerics.ale1d.remap.limiter_theta,
+        false,
+        false,
+        kFallbackKinetic,
+        "kinetic",
+        stream,
+        geom);
+    if (!kinetic_status.success) {
+      result.success = false;
+      result.skip_reason = Ale1dSkipReason::ConservationRejected;
+      return result;
+    }
+    density_to_extensive_kernel<<<blocks_for(n), kBlockSize, 0, stream>>>(
+        scratch.ke_remap.data(), scratch.vol_new.data(), n);
+    cuda_check(cudaGetLastError(),
+               "ALE1D first-order kinetic extensive launch failed");
   }
 
   result = compute_conservation(state, n, n_groups, n_mat, scratch, stream, geom);

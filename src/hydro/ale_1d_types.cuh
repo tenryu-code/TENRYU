@@ -41,6 +41,7 @@ const char* to_string(Ale1dSkipReason r);
 struct Ale1dStepResult {
   bool applied = false;
   bool quality_triggered = false;
+  bool floor_triggered = false;
   bool cadence_triggered = false;
   bool converged = true;
   bool remap_rejected = false;

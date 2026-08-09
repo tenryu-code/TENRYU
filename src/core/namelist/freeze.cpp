@@ -1976,6 +1976,8 @@ py::dict serialize_numerics(const Config::NumericsConfig& numerics) {
       numerics.ale1d.max_node_displacement_fraction_mu;
   ale1d["max_node_displacement_fraction_r"] =
       numerics.ale1d.max_node_displacement_fraction_r;
+  ale1d["ke_conservation_closure"] =
+      numerics.ale1d.ke_conservation_closure;
   ale1d["total_mass_tol"] = serialize_tol(numerics.ale1d.total_mass_tol);
   ale1d["material_mass_tol"] = serialize_tol(numerics.ale1d.material_mass_tol);
   ale1d["radiation_group_energy_tol"] =
@@ -2101,6 +2103,19 @@ py::dict serialize_numerics(const Config::NumericsConfig& numerics) {
   ale1d_rezone["shock_spatial_dr_max_cm"] =
       numerics.ale1d.rezone.shock_spatial_dr_max_cm;
   ale1d["rezone"] = ale1d_rezone;
+
+  py::dict ale1d_min_width_floor;
+  ale1d_min_width_floor["enabled"] =
+      numerics.ale1d.min_width_floor.enabled;
+  ale1d_min_width_floor["floor_cm"] =
+      numerics.ale1d.min_width_floor.floor_cm;
+  ale1d_min_width_floor["target_factor"] =
+      numerics.ale1d.min_width_floor.target_factor;
+  ale1d_min_width_floor["relief_halfwidth_cells"] =
+      numerics.ale1d.min_width_floor.relief_halfwidth_cells;
+  ale1d_min_width_floor["max_growth_factor"] =
+      numerics.ale1d.min_width_floor.max_growth_factor;
+  ale1d["min_width_floor"] = ale1d_min_width_floor;
 
   py::dict ale1d_remap;
   ale1d_remap["reject_multicell_sweeps"] =

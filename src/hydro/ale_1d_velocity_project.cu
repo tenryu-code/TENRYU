@@ -1,5 +1,6 @@
 #include "hydro/ale_1d_velocity_project.cuh"
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <limits>
@@ -270,6 +271,186 @@ __global__ void kinetic_energy_kernel(const double* __restrict__ mass,
   ke_node[j] = 0.5 * m_node * v[j] * v[j];
 }
 
+__global__ void deposit_kinetic_closure_kernel(
+    double* __restrict__ ee,
+    double* __restrict__ ei,
+    const double* __restrict__ ke_remap,
+    const double* __restrict__ mass_new,
+    const double* __restrict__ v_new,
+    double* __restrict__ deposited,
+    const int n,
+    const int two_temperature) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) {
+    return;
+  }
+  deposited[i] = 0.0;
+
+  const double m = fmax(mass_new[i], 0.0);
+  if (!(m > 0.0)) {
+    return;
+  }
+
+  const double kinetic_new =
+      0.25 * m * (v_new[i] * v_new[i] + v_new[i + 1] * v_new[i + 1]);
+  double dE = ke_remap[i] - kinetic_new;
+  if (!isfinite(dE) || dE == 0.0) {
+    return;
+  }
+
+  const double e_e_raw = fmax(ee[i], 0.0);
+  const double e_i_raw = fmax(ei[i], 0.0);
+  const double e_sum = e_e_raw + (two_temperature != 0 ? e_i_raw : 0.0);
+  if (dE < 0.0) {
+    const double removable = m * e_sum;
+    if (!(removable > 0.0)) {
+      return;
+    }
+    dE = fmax(dE, -removable);
+  }
+
+  const double de = dE / m;
+  if (two_temperature == 0) {
+    ee[i] = fmax(e_e_raw + de, 0.0);
+    ei[i] = fmax(ei[i], 0.0);
+    deposited[i] = dE;
+    return;
+  }
+
+  const double f_e =
+      (e_sum > 0.0 && isfinite(e_sum)) ? (e_e_raw / e_sum) : 0.5;
+  ee[i] = fmax(e_e_raw + f_e * de, 0.0);
+  ei[i] = fmax(e_i_raw + (1.0 - f_e) * de, 0.0);
+  deposited[i] = dE;
+}
+
+__global__ void compute_kinetic_closure_deficit_capacity_kernel(
+    double* __restrict__ deficit,
+    double* __restrict__ capacity,
+    const double* __restrict__ ee,
+    const double* __restrict__ ei,
+    const double* __restrict__ ke_remap,
+    const double* __restrict__ mass_new,
+    const double* __restrict__ v_new,
+    const double e_floor,
+    const int n,
+    const int two_temperature) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) {
+    return;
+  }
+
+  deficit[i] = 0.0;
+  capacity[i] = 0.0;
+  const double m = fmax(mass_new[i], 0.0);
+  if (!(m > 0.0)) {
+    return;
+  }
+
+  const double kinetic_new =
+      0.25 * m * (v_new[i] * v_new[i] + v_new[i + 1] * v_new[i + 1]);
+  double dE = ke_remap[i] - kinetic_new;
+  if (!isfinite(dE)) {
+    dE = 0.0;
+  }
+
+  const double e_e_raw = fmax(ee[i], 0.0);
+  const double e_i_raw = fmax(ei[i], 0.0);
+  const double floor_e = fmax(e_floor, 0.0);
+  const double de = dE / m;
+  if (two_temperature == 0) {
+    const double ee_tent = e_e_raw + de;
+    deficit[i] = fmax(0.0, floor_e - ee_tent) * m;
+    capacity[i] = fmax(0.0, ee_tent - floor_e) * m;
+    return;
+  }
+
+  const double e_sum = e_e_raw + e_i_raw;
+  const double f_e =
+      (e_sum > 0.0 && isfinite(e_sum)) ? (e_e_raw / e_sum) : 0.5;
+  const double ee_tent = e_e_raw + f_e * de;
+  const double ei_tent = e_i_raw + (1.0 - f_e) * de;
+  const double D_e = fmax(0.0, floor_e - ee_tent) * m;
+  const double D_i = fmax(0.0, floor_e - ei_tent) * m;
+  const double C_e = fmax(0.0, ee_tent - floor_e) * m;
+  const double C_i = fmax(0.0, ei_tent - floor_e) * m;
+  deficit[i] = D_e + D_i;
+  capacity[i] = C_e + C_i;
+}
+
+__global__ void apply_kinetic_closure_redistribution_kernel(
+    double* __restrict__ ee,
+    double* __restrict__ ei,
+    double* __restrict__ deposited,
+    const double* __restrict__ ke_remap,
+    const double* __restrict__ mass_new,
+    const double* __restrict__ v_new,
+    const double e_floor,
+    const double absorption_factor,
+    const int n,
+    const int two_temperature) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) {
+    return;
+  }
+
+  deposited[i] = 0.0;
+  const double m = fmax(mass_new[i], 0.0);
+  if (!(m > 0.0)) {
+    return;
+  }
+
+  const double kinetic_new =
+      0.25 * m * (v_new[i] * v_new[i] + v_new[i + 1] * v_new[i + 1]);
+  double dE = ke_remap[i] - kinetic_new;
+  if (!isfinite(dE)) {
+    dE = 0.0;
+  }
+
+  const double ee_before = ee[i];
+  const double ei_before = ei[i];
+  const double e_e_raw = fmax(ee_before, 0.0);
+  const double e_i_raw = fmax(ei_before, 0.0);
+  const double floor_e = fmax(e_floor, 0.0);
+  const double de = dE / m;
+  double ee_after = e_e_raw;
+  double ei_after = e_i_raw;
+
+  if (two_temperature == 0) {
+    const double tentative_e_e = e_e_raw + de;
+    const double D_e = fmax(0.0, floor_e - tentative_e_e) * m;
+    const double C_e = fmax(0.0, tentative_e_e - floor_e) * m;
+    ee_after = (D_e > 0.0)
+                   ? floor_e
+                   : fmax(floor_e,
+                          tentative_e_e - absorption_factor * C_e / m);
+    ei_after = fmax(ei_before, floor_e);
+  } else {
+    const double e_sum = e_e_raw + e_i_raw;
+    const double f_e =
+        (e_sum > 0.0 && isfinite(e_sum)) ? (e_e_raw / e_sum) : 0.5;
+    const double tentative_e_e = e_e_raw + f_e * de;
+    const double tentative_e_i = e_i_raw + (1.0 - f_e) * de;
+    const double D_e = fmax(0.0, floor_e - tentative_e_e) * m;
+    const double D_i = fmax(0.0, floor_e - tentative_e_i) * m;
+    const double C_e = fmax(0.0, tentative_e_e - floor_e) * m;
+    const double C_i = fmax(0.0, tentative_e_i - floor_e) * m;
+    ee_after = (D_e > 0.0)
+                   ? floor_e
+                   : fmax(floor_e,
+                          tentative_e_e - absorption_factor * C_e / m);
+    ei_after = (D_i > 0.0)
+                   ? floor_e
+                   : fmax(floor_e,
+                          tentative_e_i - absorption_factor * C_i / m);
+  }
+
+  ee[i] = ee_after;
+  ei[i] = ei_after;
+  deposited[i] =
+      m * ((ee_after - ee_before) + (ei_after - ei_before));
+}
+
 double reduce_sum(const double* input,
                   const int n,
                   cudaStream_t stream,
@@ -321,6 +502,11 @@ Ale1dVelocityProjectResult project_velocity(
     const std::vector<double>& delta_Y,
     const std::vector<int>& donor,
     const std::vector<double>& phi_face,
+    const bool ke_conservation_closure,
+    const bool two_temperature,
+    const double* ke_remap,
+    double* ee_new,
+    double* ei_new,
     Ale1dVelocityProjectScratch& scratch) {
   Ale1dVelocityProjectResult result;
   const int n = static_cast<int>(mass_new.size());
@@ -338,6 +524,12 @@ Ale1dVelocityProjectResult project_velocity(
                 "ALE1D velocity projection requires old mass");
   TENRYU_ASSERT(scratch.size_matches(n),
                 "ALE1D velocity projection scratch size mismatch");
+  if (ke_conservation_closure) {
+    TENRYU_ASSERT(ke_remap != nullptr,
+                  "ALE1D velocity projection requires remapped kinetic energy");
+    TENRYU_ASSERT(ee_new != nullptr && ei_new != nullptr,
+                  "ALE1D velocity projection requires candidate internal energy");
+  }
 
   cudaStream_t stream = nullptr;
   DeviceBuffer<double> d_mass_new(static_cast<std::size_t>(n));
@@ -413,6 +605,60 @@ Ale1dVelocityProjectResult project_velocity(
   cuda_check(cudaGetLastError(),
              "ALE1D velocity projection node launch failed");
 
+  if (ke_conservation_closure) {
+    DeviceBuffer<double> d_deposited(static_cast<std::size_t>(n));
+    DeviceBuffer<double> d_deficit(static_cast<std::size_t>(n));
+    DeviceBuffer<double> d_capacity(static_cast<std::size_t>(n));
+    // Deposit into the remapped-but-uncommitted candidate. This moves the KE
+    // discrepancy into internal energy before diagnostics, so
+    // global_total_energy_rel_err retains its KE + internal + radiation meaning.
+    constexpr double kClosureSpecificEnergyFloor = 0.0;
+    compute_kinetic_closure_deficit_capacity_kernel
+        <<<blocks_for(n), kBlockSize, 0, stream>>>(
+            d_deficit.data(),
+            d_capacity.data(),
+            ee_new,
+            ei_new,
+            ke_remap,
+            d_mass_new.data(),
+            scratch.v_new_node.data(),
+            kClosureSpecificEnergyFloor,
+            n,
+            two_temperature ? 1 : 0);
+    cuda_check(cudaGetLastError(),
+               "ALE1D velocity projection KE closure deficit/capacity launch "
+               "failed");
+    const double global_deficit = reduce_sum(
+        d_deficit.data(), n, stream,
+        "ALE1D velocity projection KE closure deficit reduction failed");
+    const double global_capacity = reduce_sum(
+        d_capacity.data(), n, stream,
+        "ALE1D velocity projection KE closure capacity reduction failed");
+
+    double absorption_factor = 0.0;
+    if (global_deficit > 0.0 && global_capacity > 0.0) {
+      absorption_factor = std::min(1.0, global_deficit / global_capacity);
+    }
+
+    apply_kinetic_closure_redistribution_kernel
+        <<<blocks_for(n), kBlockSize, 0, stream>>>(
+            ee_new,
+            ei_new,
+            d_deposited.data(),
+            ke_remap,
+            d_mass_new.data(),
+            scratch.v_new_node.data(),
+            kClosureSpecificEnergyFloor,
+            absorption_factor,
+            n,
+            two_temperature ? 1 : 0);
+    cuda_check(cudaGetLastError(),
+               "ALE1D velocity projection KE closure launch failed");
+    result.ke_closure_deposited = reduce_sum(
+        d_deposited.data(), n, stream,
+        "ALE1D velocity projection KE closure reduction failed");
+  }
+
   kinetic_energy_kernel<<<blocks_for(n + 1), kBlockSize, 0, stream>>>(
       state.mass.data(), state.v_r.data(), d_ke_old.data(), n);
   cuda_check(cudaGetLastError(),
@@ -428,11 +674,19 @@ Ale1dVelocityProjectResult project_velocity(
   result.kinetic_energy_new = reduce_sum(
       d_ke_new.data(), n + 1, stream,
       "ALE1D velocity projection new KE reduction failed");
-  const double diff =
-      std::abs(result.kinetic_energy_new - result.kinetic_energy_old);
-  result.kinetic_energy_drift_rel =
-      result.kinetic_energy_old > kTiny ? diff / result.kinetic_energy_old
-                                        : diff;
+  if (ke_conservation_closure) {
+    const double diff = std::abs(result.kinetic_energy_new +
+                                 result.ke_closure_deposited -
+                                 result.kinetic_energy_old);
+    result.kinetic_energy_drift_rel =
+        diff / std::max(result.kinetic_energy_old, kTiny);
+  } else {
+    const double diff =
+        std::abs(result.kinetic_energy_new - result.kinetic_energy_old);
+    result.kinetic_energy_drift_rel =
+        result.kinetic_energy_old > kTiny ? diff / result.kinetic_energy_old
+                                          : diff;
+  }
   result.success = true;
   return result;
 }

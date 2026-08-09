@@ -22,6 +22,7 @@ struct Ale1dVelocityProjectResult {
   double kinetic_energy_drift_rel = 0.0;
   double kinetic_energy_old = 0.0;
   double kinetic_energy_new = 0.0;
+  double ke_closure_deposited = 0.0;
 };
 
 Ale1dVelocityProjectResult project_velocity(
@@ -30,6 +31,11 @@ Ale1dVelocityProjectResult project_velocity(
     const std::vector<double>& delta_Y,
     const std::vector<int>& donor,
     const std::vector<double>& phi_face,
+    bool ke_conservation_closure,
+    bool two_temperature,
+    const double* ke_remap,
+    double* ee_new,
+    double* ei_new,
     Ale1dVelocityProjectScratch& scratch);
 
 }  // namespace tenryu::hydro::ale1d

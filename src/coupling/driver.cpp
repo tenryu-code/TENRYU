@@ -50,6 +50,7 @@
 #include "diagnostics/radial_fourier_audit.hpp"
 #include "diagnostics/shock_approach.hpp"
 #include "hydro/ale_1d_driver.cuh"
+#include "hydro/ale_1d_types.cuh"
 #include "hydro/ale_gcl.hpp"
 #include "hydro/ale_axis_band_controller.cuh"
 #include "hydro/ale_driver.cuh"
@@ -11528,6 +11529,28 @@ void Driver::run(core::State& state,
       // 1D V3 ALE is a conservative remap between hydro steps. Unlike the
       // pure Lagrangian 1D hydro update, state.mass may change after this call.
       const auto ale1d_out = hydro::ale1d::apply_ale_1d(state, cfg, &eos_ctx);
+      static int ale1d_reject_logged = 0;
+      if ((ale1d_out.cadence_triggered || ale1d_out.quality_triggered ||
+           ale1d_out.floor_triggered) &&
+          !ale1d_out.applied && ale1d_reject_logged < 5) {
+        std::ostringstream message;
+        message << std::scientific << std::setprecision(3)
+                << "[ale1d] step=" << state.step << " triggered(cad="
+                << (ale1d_out.cadence_triggered ? 1 : 0)
+                << " qual=" << (ale1d_out.quality_triggered ? 1 : 0)
+                << " floor=" << (ale1d_out.floor_triggered ? 1 : 0)
+                << ") NOT applied: reason="
+                << hydro::ale1d::to_string(ale1d_out.skip_reason)
+                << " remap_rejected=" << (ale1d_out.remap_rejected ? 1 : 0)
+                << " mass_err=" << ale1d_out.mass_conservation_rel_err
+                << " energy_err=" << ale1d_out.energy_conservation_rel_err
+                << " radiation_conservation_rel_err="
+                << ale1d_out.radiation_conservation_rel_err
+                << " kinetic_energy_drift_rel="
+                << ale1d_out.kinetic_energy_drift_rel;
+        core::log_info(message.str());
+        ++ale1d_reject_logged;
+      }
       state.ale_rezoned = ale1d_out.applied;
       if (state.ale_rezoned) {
         state.ale_rezone_invocations += 1;

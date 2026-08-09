@@ -203,6 +203,32 @@ int trace_tau_diag_max_step() {
   return max_step;
 }
 
+int trace_tau_diag_min_step() {
+  static const int min_step = [] {
+    const char* v = std::getenv("TENRYU_TRACE_TAU_DIAG_MINSTEP");
+    if (v == nullptr || v[0] == '\0') {
+      return 0;
+    }
+    char* end = nullptr;
+    const long parsed = std::strtol(v, &end, 10);
+    if (end == v || *end != '\0' ||
+        parsed < std::numeric_limits<int>::min() ||
+        parsed > std::numeric_limits<int>::max()) {
+      return 0;
+    }
+    return static_cast<int>(parsed);
+  }();
+  return min_step;
+}
+
+bool trace_tau_diag_pabs_only() {
+  static const bool enabled = [] {
+    const char* v = std::getenv("TENRYU_TRACE_TAU_DIAG_PABS_ONLY");
+    return v != nullptr && std::strcmp(v, "1") == 0;
+  }();
+  return enabled;
+}
+
 void write_tau_diag_dump(const std::string& output_dir,
                          const char* trace_kind,
                          const int step,
@@ -272,6 +298,100 @@ void write_pabs_diag_dump(const std::string& output_dir,
                static_cast<std::streamsize>(pabs_per_ray.size() * sizeof(double)));
   TENRYU_ASSERT(binary,
                 "TENRYU_TRACE_TAU_DIAG failed to write pabs binary output");
+}
+
+void write_profile_diag_dump(
+    const std::string& output_dir,
+    const char* trace_kind,
+    const int step,
+    const int n_nodes,
+    const std::vector<double>& radial_node_r,
+    const std::vector<double>& radial_n_hat,
+    const std::vector<double>& radial_n_hat_raw,
+    const std::vector<double>& radial_smooth_kappa,
+    const std::vector<double>& radial_dn_dr) {
+  const std::filesystem::path base_dir =
+      output_dir.empty() ? std::filesystem::path(".")
+                         : std::filesystem::path(output_dir);
+  const std::filesystem::path diag_dir = base_dir / "tau_diag";
+  std::error_code mkdir_error;
+  std::filesystem::create_directories(diag_dir, mkdir_error);
+  TENRYU_ASSERT(!mkdir_error,
+                "TENRYU_TRACE_TAU_DIAG failed to create output directory");
+
+  const std::string stem = std::string(trace_kind) + "_step" +
+                           std::to_string(step) + "_profile";
+  const std::filesystem::path binary_path = diag_dir / (stem + ".bin");
+  std::ofstream binary(binary_path, std::ios::binary | std::ios::trunc);
+  TENRYU_ASSERT(binary,
+                "TENRYU_TRACE_TAU_DIAG failed to open profile binary output");
+  const auto write_array = [&](const std::vector<double>& values) {
+    binary.write(reinterpret_cast<const char*>(values.data()),
+                 static_cast<std::streamsize>(values.size() * sizeof(double)));
+  };
+  write_array(radial_node_r);
+  write_array(radial_n_hat);
+  write_array(radial_n_hat_raw);
+  write_array(radial_smooth_kappa);
+  write_array(radial_dn_dr);
+  TENRYU_ASSERT(binary,
+                "TENRYU_TRACE_TAU_DIAG failed to write profile binary output");
+
+  const std::filesystem::path header_path = diag_dir / (stem + ".txt");
+  std::ofstream header(header_path, std::ios::trunc);
+  TENRYU_ASSERT(header,
+                "TENRYU_TRACE_TAU_DIAG failed to open profile text header");
+  header << "n_nodes " << n_nodes << '\n'
+         << "radial_node_r " << radial_node_r.size() << '\n'
+         << "radial_n_hat " << radial_n_hat.size() << '\n'
+         << "radial_n_hat_raw " << radial_n_hat_raw.size() << '\n'
+         << "radial_smooth_kappa " << radial_smooth_kappa.size() << '\n'
+         << "radial_dn_dr " << radial_dn_dr.size() << '\n';
+  TENRYU_ASSERT(header,
+                "TENRYU_TRACE_TAU_DIAG failed to write profile text header");
+}
+
+static void write_ray0_diag_dump(const std::string& output_dir,
+                                 const char* trace_kind,
+                                 const int step,
+                                 const int n_rays,
+                                 const std::vector<double>& ray_R0,
+                                 const std::vector<double>& ray_Z0,
+                                 const std::vector<double>& ray_vR0,
+                                 const std::vector<double>& ray_vZ0) {
+  const std::filesystem::path base_dir =
+      output_dir.empty() ? std::filesystem::path(".")
+                         : std::filesystem::path(output_dir);
+  const std::filesystem::path diag_dir = base_dir / "tau_diag";
+  std::error_code mkdir_error;
+  std::filesystem::create_directories(diag_dir, mkdir_error);
+  TENRYU_ASSERT(!mkdir_error,
+                "TENRYU_TRACE_TAU_DIAG failed to create output directory");
+
+  const std::string stem = std::string(trace_kind) + "_step" +
+                           std::to_string(step) + "_ray0";
+  const std::filesystem::path binary_path = diag_dir / (stem + ".bin");
+  std::ofstream binary(binary_path, std::ios::binary | std::ios::trunc);
+  TENRYU_ASSERT(binary,
+                "TENRYU_TRACE_TAU_DIAG failed to open ray0 binary output");
+  const auto write_array = [&](const std::vector<double>& values) {
+    binary.write(reinterpret_cast<const char*>(values.data()),
+                 static_cast<std::streamsize>(values.size() * sizeof(double)));
+  };
+  write_array(ray_R0);
+  write_array(ray_Z0);
+  write_array(ray_vR0);
+  write_array(ray_vZ0);
+  TENRYU_ASSERT(binary,
+                "TENRYU_TRACE_TAU_DIAG failed to write ray0 binary output");
+
+  const std::filesystem::path header_path = diag_dir / (stem + ".txt");
+  std::ofstream header(header_path, std::ios::trunc);
+  TENRYU_ASSERT(header,
+                "TENRYU_TRACE_TAU_DIAG failed to open ray0 text header");
+  header << "n_rays " << n_rays << '\n';
+  TENRYU_ASSERT(header,
+                "TENRYU_TRACE_TAU_DIAG failed to write ray0 text header");
 }
 
 struct FoldKey {
@@ -2824,6 +2944,7 @@ void laser_step(core::State& state,
       const int traj_max_steps = laser.ray_output_max_steps;
       const bool tau_diag_this_step =
           trace_tau_diag_enabled() && part.rank == 0 &&
+          state.step >= trace_tau_diag_min_step() &&
           state.step <= trace_tau_diag_max_step();
       long long traj_ray_offset = 0;
       int traj_beam_id = 0;
@@ -2888,14 +3009,16 @@ void laser_step(core::State& state,
       double* d_pabs_per_ray_out = nullptr;
       std::size_t tau_diag_doubles = 0;
       if (tau_diag_this_step) {
-        tau_diag_doubles = static_cast<std::size_t>(rays.n_rays) *
-                           static_cast<std::size_t>(n_radial_intervals);
-        d_tau_shell_out = static_cast<double*>(core::device_scratch_acquire(
-            "laser:tau_shell_diag", tau_diag_doubles * sizeof(double)));
-        check_traj_or_cleanup(
-            cudaMemsetAsync(d_tau_shell_out, 0,
-                            tau_diag_doubles * sizeof(double), stream),
-            "laser_step memset tau-shell diagnostic failed");
+        if (!trace_tau_diag_pabs_only()) {
+          tau_diag_doubles = static_cast<std::size_t>(rays.n_rays) *
+                             static_cast<std::size_t>(n_radial_intervals);
+          d_tau_shell_out = static_cast<double*>(core::device_scratch_acquire(
+              "laser:tau_shell_diag", tau_diag_doubles * sizeof(double)));
+          check_traj_or_cleanup(
+              cudaMemsetAsync(d_tau_shell_out, 0,
+                              tau_diag_doubles * sizeof(double), stream),
+              "laser_step memset tau-shell diagnostic failed");
+        }
         d_pabs_per_ray_out = static_cast<double*>(core::device_scratch_acquire(
             "laser:pabs_per_ray_diag",
             static_cast<std::size_t>(rays.n_rays) * sizeof(double)));
@@ -3185,6 +3308,81 @@ void laser_step(core::State& state,
         write_pabs_diag_dump(output_dir,
                              use_fast_trace_1d ? "fast" : "march",
                              state.step, b, pabs_per_ray);
+      }
+      if (tau_diag_this_step && b == 0) {
+        const std::size_t n_profile_nodes =
+            static_cast<std::size_t>(lmesh.radial_n_nodes);
+        std::vector<double> radial_node_r(n_profile_nodes, 0.0);
+        std::vector<double> radial_n_hat(n_profile_nodes, 0.0);
+        std::vector<double> radial_n_hat_raw(n_profile_nodes, 0.0);
+        std::vector<double> radial_smooth_kappa(n_profile_nodes, 0.0);
+        std::vector<double> radial_dn_dr(n_profile_nodes, 0.0);
+        check_traj_or_cleanup(
+            cudaMemcpyAsync(radial_node_r.data(), lmesh.radial_node_r,
+                            n_profile_nodes * sizeof(double),
+                            cudaMemcpyDeviceToHost, stream),
+            "laser_step radial_node_r diagnostic D2H failed");
+        check_traj_or_cleanup(
+            cudaMemcpyAsync(radial_n_hat.data(), lmesh.radial_n_hat,
+                            n_profile_nodes * sizeof(double),
+                            cudaMemcpyDeviceToHost, stream),
+            "laser_step radial_n_hat diagnostic D2H failed");
+        check_traj_or_cleanup(
+            cudaMemcpyAsync(radial_n_hat_raw.data(), lmesh.radial_n_hat_raw,
+                            n_profile_nodes * sizeof(double),
+                            cudaMemcpyDeviceToHost, stream),
+            "laser_step radial_n_hat_raw diagnostic D2H failed");
+        check_traj_or_cleanup(
+            cudaMemcpyAsync(radial_smooth_kappa.data(),
+                            lmesh.radial_smooth_kappa,
+                            n_profile_nodes * sizeof(double),
+                            cudaMemcpyDeviceToHost, stream),
+            "laser_step radial_smooth_kappa diagnostic D2H failed");
+        check_traj_or_cleanup(
+            cudaMemcpyAsync(radial_dn_dr.data(), lmesh.radial_dn_dr,
+                            n_profile_nodes * sizeof(double),
+                            cudaMemcpyDeviceToHost, stream),
+            "laser_step radial_dn_dr diagnostic D2H failed");
+        check_traj_or_cleanup(
+            cudaStreamSynchronize(stream),
+            "laser_step radial profile diagnostic synchronize failed");
+        write_profile_diag_dump(output_dir,
+                                use_fast_trace_1d ? "fast" : "march",
+                                state.step, lmesh.radial_n_nodes,
+                                radial_node_r, radial_n_hat, radial_n_hat_raw,
+                                radial_smooth_kappa, radial_dn_dr);
+        const std::size_t n_rays = static_cast<std::size_t>(rays.n_rays);
+        std::vector<double> ray_R0(n_rays, 0.0);
+        std::vector<double> ray_Z0(n_rays, 0.0);
+        std::vector<double> ray_vR0(n_rays, 0.0);
+        std::vector<double> ray_vZ0(n_rays, 0.0);
+        check_traj_or_cleanup(
+            cudaMemcpyAsync(ray_R0.data(), rays.R0,
+                            n_rays * sizeof(double),
+                            cudaMemcpyDeviceToHost, stream),
+            "laser_step ray_R0 diagnostic D2H failed");
+        check_traj_or_cleanup(
+            cudaMemcpyAsync(ray_Z0.data(), rays.Z0,
+                            n_rays * sizeof(double),
+                            cudaMemcpyDeviceToHost, stream),
+            "laser_step ray_Z0 diagnostic D2H failed");
+        check_traj_or_cleanup(
+            cudaMemcpyAsync(ray_vR0.data(), rays.vR0,
+                            n_rays * sizeof(double),
+                            cudaMemcpyDeviceToHost, stream),
+            "laser_step ray_vR0 diagnostic D2H failed");
+        check_traj_or_cleanup(
+            cudaMemcpyAsync(ray_vZ0.data(), rays.vZ0,
+                            n_rays * sizeof(double),
+                            cudaMemcpyDeviceToHost, stream),
+            "laser_step ray_vZ0 diagnostic D2H failed");
+        check_traj_or_cleanup(
+            cudaStreamSynchronize(stream),
+            "laser_step ray0 diagnostic synchronize failed");
+        write_ray0_diag_dump(output_dir,
+                             use_fast_trace_1d ? "fast" : "march",
+                             state.step, rays.n_rays,
+                             ray_R0, ray_Z0, ray_vR0, ray_vZ0);
       }
       if (!use_fast_trace_1d) {
         ray_steps_pending[b] = 1U;

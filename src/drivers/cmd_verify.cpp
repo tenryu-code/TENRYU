@@ -2120,19 +2120,33 @@ bool run_laser_skip_consistency_verify() {
     v = inv_n;
   }
   cache.update_cache(state_crit, fhat, {1.0e14}, beam_dirs, {}, {}, nullptr);
-  const bool skip_near_crit =
+  const bool skip_static_overdense_ok =
       cache.should_skip(state_crit, cfg_on.laser, lmesh_on.n_crit, lmesh_on.n_hat_margin,
                         lmesh_on.material_A_list, lmesh_on.material_A, {1.0e14}, beam_dirs, {}, {}, false,
                         nullptr, cfg_on.numerics.floors.rho, cfg_on.numerics.floors.Te);
-  const bool crit_guard_fired = !skip_near_crit;
+  std::fill(rho_crit.begin(), rho_crit.end(), 0.5 * rho_trigger);
+  state_crit.rho.copy_from_host(rho_crit.data());
+  cache.update_cache(state_crit, fhat, {1.0e14}, beam_dirs, {}, {}, nullptr);
+  std::fill(rho_crit.begin(), rho_crit.end(), rho_trigger);
+  state_crit.rho.copy_from_host(rho_crit.data());
+  core::Config::LaserConfig laser_wide = cfg_on.laser;
+  laser_wide.raytrace_skip_config.threshold = 10.0;
+  const bool crit_crossing_fired =
+      !cache.should_skip(state_crit, laser_wide, lmesh_on.n_crit, lmesh_on.n_hat_margin,
+                         lmesh_on.material_A_list, lmesh_on.material_A, {1.0e14}, beam_dirs, {}, {}, false,
+                         nullptr, cfg_on.numerics.floors.rho, cfg_on.numerics.floors.Te);
 
-  const bool pass = (rel <= 0.02) && skip_count_ok && crit_guard_fired;
+  const bool pass =
+      (rel <= 0.02) && skip_count_ok && skip_static_overdense_ok && crit_crossing_fired;
   core::log_info("[verify:laser_skip_consistency] rel=" + format_double(rel) +
                  ", dep_off_total=" + format_double(dep_off_total) +
                  ", dep_on_total=" + format_double(dep_on_total) +
                  ", skip_count=" + std::to_string(skip_count) + "/" + std::to_string(kSteps) +
                  ", skip_count_ok=" + std::string(skip_count_ok ? "true" : "false") +
-                 ", crit_guard_fired=" + std::string(crit_guard_fired ? "true" : "false"));
+                 ", skip_static_overdense_ok=" +
+                 std::string(skip_static_overdense_ok ? "true" : "false") +
+                 ", crit_crossing_fired=" +
+                 std::string(crit_crossing_fired ? "true" : "false"));
   if (!pass) {
     core::log_error("[verify:laser_skip_consistency] FAILED");
   } else {

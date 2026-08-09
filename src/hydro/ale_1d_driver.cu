@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <utility>
 #include <vector>
 
 #include <cuda_runtime.h>
@@ -381,15 +382,19 @@ struct Ale1dDriverScratch {
   int n_groups = -1;
   int n_materials = -1;
 
-  void ensure_size(const int n, const int groups, const int materials) {
+  void ensure_size(const int n,
+                   const int groups,
+                   const int materials,
+                   const bool ke_conservation_closure) {
     if (e_floor_ledger.size() != 1U) {
       e_floor_ledger.resize(1U);
     }
     if (n == n_cells && groups == n_groups && materials == n_materials &&
-        remap.size_matches(n, groups, materials) && velocity.size_matches(n)) {
+        remap.size_matches(n, groups, materials, ke_conservation_closure) &&
+        velocity.size_matches(n)) {
       return;
     }
-    remap.resize(n, groups, materials);
+    remap.resize(n, groups, materials, ke_conservation_closure);
     velocity.resize(n);
     n_cells = n;
     n_groups = groups;
@@ -613,7 +618,21 @@ Ale1dStepResult apply_ale_1d(core::State& state,
   const double emergency_threshold = std::max(1.0, ale.candidate_dt_penalty_max);
   out.quality_triggered =
       ale.emergency_enabled && out.max_dr_ratio > emergency_threshold;
-  if (!out.cadence_triggered && !out.quality_triggered) {
+  std::vector<double> floor_r_nodes;
+  if (ale.min_width_floor.enabled) {
+    floor_r_nodes.assign(static_cast<std::size_t>(n_cells + 1), 0.0);
+    state.x_r.copy_to_host(floor_r_nodes.data());
+    double min_dl = std::numeric_limits<double>::infinity();
+    for (int i = 0; i < n_cells; ++i) {
+      min_dl = std::min(
+          min_dl,
+          floor_r_nodes[static_cast<std::size_t>(i + 1)] -
+              floor_r_nodes[static_cast<std::size_t>(i)]);
+    }
+    out.floor_triggered = min_dl < ale.min_width_floor.floor_cm;
+  }
+  if (!out.cadence_triggered && !out.quality_triggered &&
+      !out.floor_triggered) {
     return out;
   }
   if (state.ale_last_applied_step >= 0 &&
@@ -623,7 +642,52 @@ Ale1dStepResult apply_ale_1d(core::State& state,
   }
 
   std::vector<Ale1dFeature> features = compute_features(state, cfg, state.dt);
-  Ale1dRezoneResult rezone_result = rezone(state, cfg, features);
+  Ale1dRezoneResult rezone_result;
+  if (out.floor_triggered) {
+    std::vector<bool> pinned(static_cast<std::size_t>(n_cells + 1), false);
+    pinned.front() = true;
+    pinned.back() = true;
+    for (const Ale1dFeature& feature : features) {
+      const int face = feature.peak_cell_or_face;
+      if (feature.pinned_face && face >= 0 && face <= n_cells) {
+        pinned[static_cast<std::size_t>(face)] = true;
+      }
+    }
+    std::vector<double> rho_host(static_cast<std::size_t>(n_cells), 0.0);
+    state.rho.copy_to_host(rho_host.data());
+    std::vector<bool> eligible(static_cast<std::size_t>(n_cells), false);
+    // Never remap density-floored corona cells: near-zero extensive fields fail remap validators, and relief there is physically meaningless.
+    for (int i = 0; i < n_cells; ++i) {
+      eligible[static_cast<std::size_t>(i)] =
+          rho_host[static_cast<std::size_t>(i)] >
+          100.0 * cfg.numerics.floors.rho;
+    }
+    MinWidthFloorCandidateResult floor_result =
+        build_min_width_floor_candidate(
+            floor_r_nodes,
+            pinned,
+            eligible,
+            ale.min_width_floor.floor_cm,
+            ale.min_width_floor.target_factor,
+            ale.min_width_floor.relief_halfwidth_cells,
+            ale.min_width_floor.max_growth_factor);
+    if (!floor_result.success) {
+      out.skip_reason = Ale1dSkipReason::CandidateInvalid;
+      return out;
+    }
+    if (floor_result.no_relief_available) {
+      out.skip_reason = Ale1dSkipReason::BenefitTooSmall;
+      return out;
+    }
+    rezone_result.r_candidate = std::move(floor_result.r_candidate);
+    rezone_result.node_mask.pinned = std::move(pinned);
+    rezone_result.node_mask.n_protected_nodes = static_cast<int>(std::count(
+        rezone_result.node_mask.pinned.begin(),
+        rezone_result.node_mask.pinned.end(), true));
+    rezone_result.success = true;
+  } else {
+    rezone_result = rezone(state, cfg, features);
+  }
   if (!rezone_result.success) {
     out.skip_reason = rezone_result.skip_reason;
     return out;
@@ -640,8 +704,11 @@ Ale1dStepResult apply_ale_1d(core::State& state,
   const int n_groups = std::max(0, cfg.radiation.groups);
   const int n_materials = static_cast<int>(cfg.materials.materials.size());
   TENRYU_ASSERT(n_materials > 0, "ALE1D requires at least one material");
+  const bool ke_conservation_closure =
+      cfg.numerics.ale1d.ke_conservation_closure;
   Ale1dDriverScratch& scratch = driver_scratch();
-  scratch.ensure_size(n_cells, n_groups, n_materials);
+  scratch.ensure_size(
+      n_cells, n_groups, n_materials, ke_conservation_closure);
 
   const std::vector<int> protected_faces =
       protected_faces_from_features(features, n_cells);
@@ -677,6 +744,17 @@ Ale1dStepResult apply_ale_1d(core::State& state,
                        delta_y,
                        donor,
                        phi_face,
+                       ke_conservation_closure,
+                       cfg.main.two_temperature,
+                       ke_conservation_closure
+                           ? scratch.remap.ke_remap.data()
+                           : nullptr,
+                       ke_conservation_closure
+                           ? scratch.remap.ee_new.data()
+                           : nullptr,
+                       ke_conservation_closure
+                           ? scratch.remap.ei_new.data()
+                           : nullptr,
                        scratch.velocity);
   out.kinetic_energy_drift_rel = velocity_result.kinetic_energy_drift_rel;
   if (!velocity_result.success) {

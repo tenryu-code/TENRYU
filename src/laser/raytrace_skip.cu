@@ -84,10 +84,15 @@ __device__ inline void ray_skip_check_kernel_body(
       }
     }
   }
-  const double ne = fmax(0.0, rho_now) * fmax(0.0, Zbar_now) /
-                    (fmax(A_eff, 1.0e-30) * core::constants::proton_mass);
-  const double nhat = ne / fmax(n_crit, 1.0e-30);
-  if (nhat > n_hat_margin - crit_guard) {
+  const double ne_now = fmax(0.0, rho_now) * fmax(0.0, Zbar_now) /
+                        (fmax(A_eff, 1.0e-30) * core::constants::proton_mass);
+  const double ne_cached = fmax(0.0, rho_ref) * fmax(0.0, Zbar_ref) /
+                           (fmax(A_eff, 1.0e-30) * core::constants::proton_mass);
+  const double band = n_hat_margin - crit_guard;
+  const double inv_ncrit = 1.0 / fmax(n_crit, 1.0e-30);
+  const bool above_now = ne_now * inv_ncrit > band;
+  const bool above_cached = ne_cached * inv_ncrit > band;
+  if (above_now != above_cached) {
     atomicExch(crit_hit, 1);
   }
 }
@@ -266,15 +271,30 @@ bool RaytraceSkipCache::should_skip(const core::State& state,
     consecutive_skip_count = 0;
     return false;
   }
+  ++ctr_calls;
+  if ((ctr_calls % 5000) == 0) {
+    core::log_info("[laser][skip] calls=" + std::to_string(ctr_calls) +
+                   " fires=" + std::to_string(ctr_fires) +
+                   " veto{warmup=" + std::to_string(ctr_veto_warmup) +
+                   " maxc=" + std::to_string(ctr_veto_maxconsec) +
+                   " ale=" + std::to_string(ctr_veto_ale) +
+                   " power=" + std::to_string(ctr_veto_power) +
+                   " geom=" + std::to_string(ctr_veto_geometry) +
+                   " crit=" + std::to_string(ctr_veto_crit) +
+                   " metric=" + std::to_string(ctr_veto_metric) + "}");
+  }
   if (!valid || n_cells <= 0 || n_groups <= 0 || state.step == 0) {
+    ++ctr_veto_warmup;
     consecutive_skip_count = 0;
     return false;
   }
   if (consecutive_skip_count >= skip_cfg.max_consecutive) {
+    ++ctr_veto_maxconsec;
     consecutive_skip_count = 0;
     return false;
   }
   if (ale_rezoned) {
+    ++ctr_veto_ale;
     consecutive_skip_count = 0;
     return false;
   }
@@ -286,17 +306,20 @@ bool RaytraceSkipCache::should_skip(const core::State& state,
   const bool now_zero = !(total_power > 0.0);
   const bool cached_zero = !(cached_total_power > 0.0);
   if (now_zero != cached_zero) {
+    ++ctr_veto_power;
     consecutive_skip_count = 0;
     return false;
   }
   const double power_rel_change =
       std::abs(total_power - cached_total_power) / std::max(cached_total_power, 1.0e-30);
   if (power_rel_change > 0.01) {
+    ++ctr_veto_power;
     consecutive_skip_count = 0;
     return false;
   }
 
   if (group_powers.size() != cached_group_powers.size()) {
+    ++ctr_veto_power;
     consecutive_skip_count = 0;
     return false;
   }
@@ -305,6 +328,7 @@ bool RaytraceSkipCache::should_skip(const core::State& state,
     const bool now_g_zero = !(group_powers[static_cast<std::size_t>(g)] > 0.0);
     const bool cached_g_zero = !(cached_group_powers[static_cast<std::size_t>(g)] > 0.0);
     if (now_g_zero != cached_g_zero) {
+      ++ctr_veto_power;
       consecutive_skip_count = 0;
       return false;
     }
@@ -318,17 +342,20 @@ bool RaytraceSkipCache::should_skip(const core::State& state,
       if (rel_g > 0.01) {
         // CBET couples beams nonlinearly; per-beam power scaling is no longer
         // exact, so any per-group drift forces a full re-trace.
+        ++ctr_veto_power;
         consecutive_skip_count = 0;
         return false;
       }
     }
   }
   if (beam_dirs.size() != cached_beam_dirs.size()) {
+    ++ctr_veto_geometry;
     consecutive_skip_count = 0;
     return false;
   }
   if (beam_focuses.size() != cached_beam_focuses.size() ||
       beam_defocus.size() != cached_beam_defocus.size()) {
+    ++ctr_veto_geometry;
     consecutive_skip_count = 0;
     return false;
   }
@@ -339,6 +366,7 @@ bool RaytraceSkipCache::should_skip(const core::State& state,
     const double dz = beam_dirs[i].z - cached_beam_dirs[i].z;
     const double l2 = std::sqrt(dx * dx + dy * dy + dz * dz);
     if (l2 > kBeamDirL2Tol) {
+      ++ctr_veto_geometry;
       consecutive_skip_count = 0;
       return false;
     }
@@ -350,6 +378,7 @@ bool RaytraceSkipCache::should_skip(const core::State& state,
     const double dz = beam_focuses[i].z - cached_beam_focuses[i].z;
     const double l2 = std::sqrt(dx * dx + dy * dy + dz * dz);
     if (l2 > kBeamFocusL2Tol) {
+      ++ctr_veto_geometry;
       consecutive_skip_count = 0;
       return false;
     }
@@ -357,6 +386,7 @@ bool RaytraceSkipCache::should_skip(const core::State& state,
   constexpr double kBeamDefocusTol = 1.0e-12;
   for (std::size_t i = 0; i < beam_defocus.size(); ++i) {
     if (std::abs(beam_defocus[i] - cached_beam_defocus[i]) > kBeamDefocusTol) {
+      ++ctr_veto_geometry;
       consecutive_skip_count = 0;
       return false;
     }
@@ -417,6 +447,7 @@ bool RaytraceSkipCache::should_skip(const core::State& state,
     if (crit_hit_out != nullptr) {
       *crit_hit_out = true;
     }
+    ++ctr_veto_crit;
     consecutive_skip_count = 0;
     return false;
   }
@@ -448,10 +479,12 @@ bool RaytraceSkipCache::should_skip(const core::State& state,
   }
 
   if (metric < skip_cfg.threshold) {
+    ++ctr_fires;
     ++consecutive_skip_count;
     return true;
   }
 
+  ++ctr_veto_metric;
   consecutive_skip_count = 0;
   return false;
 }
