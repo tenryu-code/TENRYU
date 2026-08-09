@@ -258,6 +258,150 @@ bool monitor_is_uniform(const std::vector<double>& W) {
 
 }  // namespace
 
+MinWidthFloorCandidateResult build_min_width_floor_candidate(
+    const std::vector<double>& r_nodes,
+    const std::vector<bool>& pinned,
+    const std::vector<bool>& eligible,
+    const double floor_cm,
+    const double target_factor,
+    const int relief_halfwidth_cells,
+    const double max_growth_factor) {
+  MinWidthFloorCandidateResult out;
+  out.r_candidate = r_nodes;
+  const int n_cells = static_cast<int>(r_nodes.size()) - 1;
+
+  std::vector<double> dl(static_cast<std::size_t>(n_cells), 0.0);
+  for (int i = 0; i < n_cells; ++i) {
+    dl[static_cast<std::size_t>(i)] =
+        r_nodes[static_cast<std::size_t>(i + 1)] -
+        r_nodes[static_cast<std::size_t>(i)];
+  }
+  out.min_dl_before = *std::min_element(dl.begin(), dl.end());
+  if (out.min_dl_before >= floor_cm) {
+    out.success = true;
+    out.fully_relieved = true;
+    out.min_dl_after = out.min_dl_before;
+    return out;
+  }
+
+  std::vector<int> offenders;
+  for (int i = 0; i < n_cells; ++i) {
+    if (dl[static_cast<std::size_t>(i)] < floor_cm) {
+      offenders.push_back(i);
+    }
+  }
+  std::stable_sort(
+      offenders.begin(), offenders.end(),
+      [&dl](const int a, const int b) {
+        return dl[static_cast<std::size_t>(a)] <
+               dl[static_cast<std::size_t>(b)];
+      });
+
+  for (const int k : offenders) {
+    int w0 = std::max(0, k - relief_halfwidth_cells);
+    int w1 = std::min(n_cells - 1, k + relief_halfwidth_cells);
+    for (int j = k; j > w0; --j) {
+      if (pinned[static_cast<std::size_t>(j)]) {
+        w0 = j;
+        break;
+      }
+    }
+    for (int j = k + 1; j <= w1; ++j) {
+      if (pinned[static_cast<std::size_t>(j)]) {
+        w1 = j - 1;
+        break;
+      }
+    }
+
+    bool window_is_eligible = true;
+    for (int i = w0; i <= w1; ++i) {
+      if (!eligible[static_cast<std::size_t>(i)]) {
+        window_is_eligible = false;
+        break;
+      }
+    }
+    if (!window_is_eligible) {
+      continue;
+    }
+
+    const int count = w1 - w0 + 1;
+    std::vector<double> widths(dl.begin() + w0, dl.begin() + w1 + 1);
+    const std::vector<double> original_widths = widths;
+    const double span = std::accumulate(widths.begin(), widths.end(), 0.0);
+    const double target_eff = std::min(
+        target_factor * floor_cm, span / static_cast<double>(count));
+    std::vector<double> targets(static_cast<std::size_t>(count), 0.0);
+    for (int i = 0; i < count; ++i) {
+      targets[static_cast<std::size_t>(i)] =
+          std::fmin(target_eff,
+                    original_widths[static_cast<std::size_t>(i)] *
+                        max_growth_factor);
+    }
+    for (int iter = 0; iter < 8; ++iter) {
+      for (int i = 0; i < count; ++i) {
+        widths[static_cast<std::size_t>(i)] = std::max(
+            widths[static_cast<std::size_t>(i)],
+            targets[static_cast<std::size_t>(i)]);
+      }
+      const double width_sum =
+          std::accumulate(widths.begin(), widths.end(), 0.0);
+      const double scale = span / width_sum;
+      for (double& width : widths) {
+        width *= scale;
+      }
+    }
+
+    std::vector<double> candidate = r_nodes;
+    double position = r_nodes[static_cast<std::size_t>(w0)];
+    for (int i = 0; i + 1 < count; ++i) {
+      position += widths[static_cast<std::size_t>(i)];
+      candidate[static_cast<std::size_t>(w0 + i + 1)] = position;
+    }
+    candidate[static_cast<std::size_t>(w1 + 1)] =
+        r_nodes[static_cast<std::size_t>(w1 + 1)];
+
+    for (int j = w0 + 1; j <= w1; ++j) {
+      const std::size_t node = static_cast<std::size_t>(j);
+      if (candidate[node] > r_nodes[node] &&
+          candidate[node] > r_nodes[node + 1]) {
+        candidate[node] =
+            r_nodes[node + 1] - 0.05 * (r_nodes[node + 1] - r_nodes[node]);
+      } else if (candidate[node] < r_nodes[node] &&
+                 candidate[node] < r_nodes[node - 1]) {
+        candidate[node] =
+            r_nodes[node - 1] + 0.05 * (r_nodes[node] - r_nodes[node - 1]);
+      }
+    }
+
+    if (!candidate_is_strictly_ordered(candidate)) {
+      continue;
+    }
+    const double relieved_width =
+        candidate[static_cast<std::size_t>(k + 1)] -
+        candidate[static_cast<std::size_t>(k)];
+    if (relieved_width >=
+        dl[static_cast<std::size_t>(k)] * (1.0 + 1.0e-3)) {
+      out.r_candidate = std::move(candidate);
+      out.n_windows = 1;
+      out.min_dl_after = std::numeric_limits<double>::infinity();
+      for (int i = 0; i < n_cells; ++i) {
+        out.min_dl_after = std::min(
+            out.min_dl_after,
+            out.r_candidate[static_cast<std::size_t>(i + 1)] -
+                out.r_candidate[static_cast<std::size_t>(i)]);
+      }
+      out.fully_relieved = out.min_dl_after >= floor_cm;
+      out.success = true;
+      return out;
+    }
+  }
+
+  out.success = true;
+  out.no_relief_available = true;
+  out.min_dl_after = out.min_dl_before;
+  return out;
+}
+
 std::vector<double> build_monitor(const core::State& state,
                                   const core::Config& cfg,
                                   const std::vector<Ale1dFeature>& features) {

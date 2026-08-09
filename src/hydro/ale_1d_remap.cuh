@@ -125,6 +125,7 @@ struct Ale1dRemapScratch {
   DeviceArray<double> mass_new;
   DeviceArray<double> ee_new;
   DeviceArray<double> ei_new;
+  DeviceArray<double> ke_remap;
   DeviceArray<double> rad_E_new;
   DeviceArray<double> volFrac_new;
   DeviceArray<double> vol_new;
@@ -134,10 +135,14 @@ struct Ale1dRemapScratch {
   DeviceArray<int> donor;
   DeviceArray<int> fallback_flags;
 
-  void resize(int n_cells, int n_groups, int n_materials);
+  void resize(int n_cells,
+              int n_groups,
+              int n_materials,
+              bool ke_conservation_closure = false);
   [[nodiscard]] bool size_matches(int n_cells,
                                   int n_groups,
-                                  int n_materials) const;
+                                  int n_materials,
+                                  bool ke_conservation_closure = false) const;
 };
 
 struct Ale1dRemapResult {

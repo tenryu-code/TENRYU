@@ -27,6 +27,25 @@ struct Ale1dRezoneResult {
   int min_movable_segment_size = 0;
 };
 
+struct MinWidthFloorCandidateResult {
+  bool success = false;
+  bool fully_relieved = false;
+  bool no_relief_available = false;
+  std::vector<double> r_candidate;
+  double min_dl_before = 0.0;
+  double min_dl_after = 0.0;
+  int n_windows = 0;
+};
+
+MinWidthFloorCandidateResult build_min_width_floor_candidate(
+    const std::vector<double>& r_nodes,
+    const std::vector<bool>& pinned,
+    const std::vector<bool>& eligible,
+    double floor_cm,
+    double target_factor,
+    int relief_halfwidth_cells,
+    double max_growth_factor);
+
 std::vector<double> build_monitor(
     const core::State& state,
     const core::Config& cfg,

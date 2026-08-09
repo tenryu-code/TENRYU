@@ -895,7 +895,7 @@ struct Config {
     };
 
     struct RaytraceSkipConfig {
-      bool enabled = true;
+      bool enabled = false;
       double threshold = 0.01;
       int max_consecutive = 10;
       std::string norm = "max_relative";
@@ -1075,6 +1075,7 @@ struct Config {
     RaytraceConfig raytrace;
     // Backward-compatible scalar alias for legacy namelists.
     // Canonical settings live in raytrace_skip_config.
+    // Skip is OFF by default and is an opt-in accelerator.
     // If only this scalar is specified and raytrace_skip > 0, parser maps it to
     // raytrace_skip_config.threshold and enables skip.
     double raytrace_skip = 0.0;
@@ -2086,6 +2087,14 @@ struct Config {
         double shock_spatial_dr_max_cm = 8.0e-5;
       };
 
+      struct MinWidthFloorConfig {
+        bool enabled = false;
+        double floor_cm = 0.0;          // trigger + guarantee: no cell below this after rezone
+        double target_factor = 1.25;    // respace target = target_factor * floor_cm
+        int relief_halfwidth_cells = 3;  // half-width of the minimum-cell relief neighborhood
+        double max_growth_factor = 1.8;  // per-application cap: no cell grows more than this per rezone
+      };
+
       struct RemapConfig {
         bool reject_multicell_sweeps = true;
         bool high_order_enabled = true;
@@ -2113,6 +2122,7 @@ struct Config {
       int min_movable_segment_hard = 8;
       double max_node_displacement_fraction_mu = 0.35;
       double max_node_displacement_fraction_r = 0.35;
+      bool ke_conservation_closure = false;
 
       // Conservation tolerances
       struct Tol {
@@ -2139,6 +2149,7 @@ struct Config {
       InterfaceSensorConfig interface_sensor;
       CenterSensorConfig center_sensor;
       RezoneConfig rezone;
+      MinWidthFloorConfig min_width_floor;
       RemapConfig remap;
     };
 

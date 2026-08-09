@@ -598,6 +598,7 @@ inline void validate_ale1d_config(const Config& config) {
   const auto& radiation = config.radiation;
   const auto& ale = config.numerics.ale1d;
   const auto& rezone = ale.rezone;
+  const auto& min_width_floor = ale.min_width_floor;
   const auto& remap = ale.remap;
   const auto validate_tol = [](const auto& tol, const char* path) {
     if (tol.soft > tol.hard) {
@@ -693,6 +694,28 @@ inline void validate_ale1d_config(const Config& config) {
                  rezone.shock_spatial_dr_max_cm,
                  "Numerics.ale1d.rezone.shock_spatial_dr_min_cm",
                  "Numerics.ale1d.rezone.shock_spatial_dr_max_cm");
+  if (min_width_floor.enabled) {
+    if (!(min_width_floor.floor_cm > 0.0)) {
+      throw namelist::ConfigError(
+          "Numerics.ale1d.min_width_floor.floor_cm must be positive");
+    }
+    if (!(min_width_floor.target_factor > 1.0)) {
+      throw namelist::ConfigError(
+          "Numerics.ale1d.min_width_floor.target_factor must be > 1");
+    }
+    if (min_width_floor.relief_halfwidth_cells < 1) {
+      throw namelist::ConfigError(
+          "Numerics.ale1d.min_width_floor.relief_halfwidth_cells must be >= 1");
+    }
+    if (!(min_width_floor.max_growth_factor > 1.0)) {
+      throw namelist::ConfigError(
+          "Numerics.ale1d.min_width_floor.max_growth_factor must be > 1");
+    }
+    if (!(min_width_floor.max_growth_factor <= 2.0)) {
+      throw namelist::ConfigError(
+          "Numerics.ale1d.min_width_floor.max_growth_factor must be <= 2");
+    }
+  }
   if (!(remap.limiter_theta > 0.0)) {
     throw namelist::ConfigError(
         "Numerics.ale1d.remap.limiter_theta must be positive");

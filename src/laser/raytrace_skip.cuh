@@ -22,6 +22,15 @@ struct RaytraceSkipCache {
   int n_groups = 0;
   bool valid = false;
   int consecutive_skip_count = 0;
+  long long ctr_calls = 0;
+  long long ctr_fires = 0;
+  long long ctr_veto_warmup = 0;
+  long long ctr_veto_maxconsec = 0;
+  long long ctr_veto_ale = 0;
+  long long ctr_veto_power = 0;
+  long long ctr_veto_geometry = 0;
+  long long ctr_veto_crit = 0;
+  long long ctr_veto_metric = 0;
   double cached_total_power = 0.0;
   std::vector<double> cached_group_powers;
   std::vector<Vec3> cached_beam_dirs;

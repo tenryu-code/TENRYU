@@ -22,6 +22,7 @@ constexpr int kUnabsorbedScalar = 0;
 constexpr int kRaScalar = 1;
 constexpr int kCriticalHitsScalar = 2;
 constexpr int kInvalidScalar = 3;
+constexpr int kMaxShellOverlaps = 8;
 
 // Bouguer-invariant reduction for the CC perf wave-3 S1 design (2026-08-04).
 // In a shell with constant refractive index n, a = b / n is constant and
@@ -270,7 +271,7 @@ __global__ void fast_trace_1d_kernel(
   per_ray_unabsorbed[local_ray] = P;
 }
 
-__global__ void map_fast_trace_shells_kernel(
+__global__ void precompute_fast_trace_shell_overlaps_kernel(
     const double* __restrict__ radial_node_r,
     const double* __restrict__ hydro_r_edges,
     const int n_shells,
@@ -278,18 +279,81 @@ __global__ void map_fast_trace_shells_kernel(
     const int allowed_supercritical_cell,
     const int critical_adjacent_subcritical_cell,
     const double critical_adjacent_split_r,
-    int* __restrict__ shell_to_hydro) {
+    int* __restrict__ targets,
+    double* __restrict__ weights) {
   const int shell = blockIdx.x * blockDim.x + threadIdx.x;
   if (shell >= n_shells) {
     return;
   }
-  const double r_mid =
-      0.5 * (radial_node_r[shell] + radial_node_r[shell + 1]);
-  // Reuse the march's radial-position -> hydro-cell correspondence, including
-  // its critical-adjacent split rule, at the shell midpoint.
-  shell_to_hydro[shell] = ray_trace_bodies::cbet_locate_deposit_cell_1d(
-      hydro_r_edges, n_hydro_cells, allowed_supercritical_cell,
-      critical_adjacent_subcritical_cell, critical_adjacent_split_r, r_mid);
+
+  const int base = shell * kMaxShellOverlaps;
+  for (int k = 0; k < kMaxShellOverlaps; ++k) {
+    targets[base + k] = -1;
+    weights[base + k] = 0.0;
+  }
+
+  const double r_lo = radial_node_r[shell];
+  const double r_up = radial_node_r[shell + 1];
+  const double r_lo3 = r_lo * r_lo * r_lo;
+  const double r_up3 = r_up * r_up * r_up;
+  const double shell_volume = r_up3 - r_lo3;
+  if (r_up <= r_lo || shell_volume == 0.0) {
+    const double r_mid = 0.5 * (r_lo + r_up);
+    targets[base] = ray_trace_bodies::cbet_locate_deposit_cell_1d(
+        hydro_r_edges, n_hydro_cells, allowed_supercritical_cell,
+        critical_adjacent_subcritical_cell, critical_adjacent_split_r, r_mid);
+    weights[base] = 1.0;
+    return;
+  }
+
+  int lo = 0;
+  int hi = n_hydro_cells + 1;
+  while (lo < hi) {
+    const int mid = lo + (hi - lo) / 2;
+    if (hydro_r_edges[mid] <= r_lo) {
+      lo = mid + 1;
+    } else {
+      hi = mid;
+    }
+  }
+
+  int n_overlaps = 0;
+  double a = r_lo;
+  int edge = lo;
+  while (a < r_up) {
+    const double b = (edge <= n_hydro_cells)
+                         ? ::fmin(r_up, hydro_r_edges[edge])
+                         : r_up;
+    if (b > a) {
+      const double b3 = b * b * b;
+      const double a3 = a * a * a;
+      const double weight = (b3 - a3) / shell_volume;
+      const int slot = (n_overlaps < kMaxShellOverlaps)
+                           ? n_overlaps
+                           : kMaxShellOverlaps - 1;
+      if (n_overlaps < kMaxShellOverlaps) {
+        targets[base + slot] =
+            ray_trace_bodies::cbet_locate_deposit_cell_1d(
+                hydro_r_edges, n_hydro_cells, allowed_supercritical_cell,
+                critical_adjacent_subcritical_cell, critical_adjacent_split_r,
+                0.5 * (a + b));
+      }
+      weights[base + slot] += weight;
+      ++n_overlaps;
+    }
+    a = b;
+    ++edge;
+  }
+
+  const int n_entries =
+      (n_overlaps < kMaxShellOverlaps) ? n_overlaps : kMaxShellOverlaps;
+  double weight_sum = 0.0;
+  for (int k = 0; k < n_entries; ++k) {
+    weight_sum += weights[base + k];
+  }
+  for (int k = 0; k < n_entries; ++k) {
+    weights[base + k] /= weight_sum;
+  }
 }
 
 __global__ void reduce_fast_trace_per_shell_kernel(
@@ -378,7 +442,8 @@ __global__ void sum_fast_trace_absorbed_per_ray_kernel(
 __global__ void gather_fast_trace_tallies_kernel(
     const double* __restrict__ shell_sum,
     const double* __restrict__ reduced_scalars,
-    const int* __restrict__ shell_to_hydro,
+    const int* __restrict__ targets,
+    const double* __restrict__ weights,
     const int n_shells,
     const int n_hydro_cells,
     const int critical_adjacent_subcritical_cell,
@@ -395,8 +460,11 @@ __global__ void gather_fast_trace_tallies_kernel(
   if (cell < n_hydro_cells) {
     double acc = 0.0;
     for (int shell = 0; shell < n_shells; ++shell) {
-      if (shell_to_hydro[shell] == cell) {
-        acc += shell_sum[shell];
+      const int base = shell * kMaxShellOverlaps;
+      for (int k = 0; k < kMaxShellOverlaps; ++k) {
+        if (targets[base + k] == cell) {
+          acc += weights[base + k] * shell_sum[shell];
+        }
       }
     }
     if (cell == critical_adjacent_subcritical_cell) {
@@ -490,19 +558,25 @@ cudaError_t launch_fast_trace_1d(
   const std::size_t reduction_doubles =
       static_cast<std::size_t>(n_shells) + kReducedScalarCount;
   const std::size_t scratch_bytes =
-      (slab_doubles + reduction_doubles) * sizeof(double) +
-      static_cast<std::size_t>(n_shells) * sizeof(int);
+      (slab_doubles + reduction_doubles) * sizeof(double);
   double* const slab = static_cast<double*>(core::device_scratch_acquire(
       "fast_trace_1d:per_ray_shell", scratch_bytes));
   double* const shell_sum = slab + slab_doubles;
   double* const reduced_scalars = shell_sum + n_shells;
-  int* const shell_to_hydro =
-      reinterpret_cast<int*>(reduced_scalars + kReducedScalarCount);
+  const std::size_t overlap_slots =
+      static_cast<std::size_t>(n_shells) * kMaxShellOverlaps;
+  int* const overlap_targets = static_cast<int*>(core::device_scratch_acquire(
+      "fast_trace_1d:shell_overlap_targets", overlap_slots * sizeof(int)));
+  double* const overlap_weights =
+      static_cast<double*>(core::device_scratch_acquire(
+          "fast_trace_1d:shell_overlap_weights",
+          overlap_slots * sizeof(double)));
   const int shell_grid = (n_shells + kBlockSize - 1) / kBlockSize;
-  map_fast_trace_shells_kernel<<<shell_grid, kBlockSize, 0, stream>>>(
+  precompute_fast_trace_shell_overlaps_kernel<<<shell_grid, kBlockSize, 0,
+                                                stream>>>(
       mesh.radial_node_r, d_hydro_r_edges, n_shells, n_hydro_cells,
       allowed_supercritical_cell, critical_adjacent_subcritical_cell,
-      critical_adjacent_split_r, shell_to_hydro);
+      critical_adjacent_split_r, overlap_targets, overlap_weights);
 
   const LaserPhysExtOptions phys =
       (phys_ext != nullptr) ? *phys_ext : LaserPhysExtOptions{};
@@ -545,9 +619,10 @@ cudaError_t launch_fast_trace_1d(
     const int reduce_total = n_hydro_cells + 1;
     const int reduce_grid = (reduce_total + kBlockSize - 1) / kBlockSize;
     gather_fast_trace_tallies_kernel<<<reduce_grid, kBlockSize, 0, stream>>>(
-        shell_sum, reduced_scalars, shell_to_hydro, n_shells, n_hydro_cells,
-        critical_adjacent_subcritical_cell, d_deposit_1d, d_unabsorbed,
-        d_ra_power_total, d_critical_surface_hit_count, d_error_flags);
+        shell_sum, reduced_scalars, overlap_targets, overlap_weights, n_shells,
+        n_hydro_cells, critical_adjacent_subcritical_cell, d_deposit_1d,
+        d_unabsorbed, d_ra_power_total, d_critical_surface_hit_count,
+        d_error_flags);
   }
   return cudaGetLastError();
 }
