@@ -1432,9 +1432,6 @@ void ray_trace_1d_sph(double* __restrict__ deposit_1d,
                       double* __restrict__ hot_e_capture,  // rows [(tid*n_channels + ch)*4 + {0:valid,1:r_s,2:mu_axis,3:P_before}]
                       const laser::LaserPhysExtOptions phys_opt,
                       const double* __restrict__ radial_T_e,
-                      const double beam_P_w,
-                      const double beam_w_cm,
-                      const int beam_profile_flat,
                       double* __restrict__ ra_per_ray,
                       double* __restrict__ tau_shell_out
                       ) {
@@ -1520,8 +1517,7 @@ void ray_trace_1d_sph(double* __restrict__ deposit_1d,
       n_output_rays, output_stride, traj_max_steps, step_histogram, step_count,
       ray_steps_out, P_unabsorbed, tail_closure_count, tail_closure_absorbed_power,
       critical_surface_hit_count, error_flags, cbet_args, hot_e_params,
-      hot_e_capture, phys_opt, body_radial_T_e, beam_P_w, beam_w_cm,
-      beam_profile_flat, ra_per_ray, tau_shell_out);
+      hot_e_capture, phys_opt, body_radial_T_e, ra_per_ray, tau_shell_out);
 }
 
 
@@ -1720,8 +1716,7 @@ template __global__ void ray_trace_1d_sph<false, false, false>(
     unsigned long long* __restrict__, double* __restrict__, unsigned long long* __restrict__,
     core::DeviceErrorFlags* __restrict__, const CbetRecordDeviceArgs,
     const HotECaptureParams, double* __restrict__, const laser::LaserPhysExtOptions,
-    const double* __restrict__, const double, const double, const int,
-    double* __restrict__, double* __restrict__);
+    const double* __restrict__, double* __restrict__, double* __restrict__);
 template __global__ void ray_trace_1d_sph<false, true, false>(
     double* __restrict__, double* __restrict__, double* __restrict__, double* __restrict__,
     const double* __restrict__, const double* __restrict__, const double* __restrict__,
@@ -1738,8 +1733,7 @@ template __global__ void ray_trace_1d_sph<false, true, false>(
     unsigned long long* __restrict__, double* __restrict__, unsigned long long* __restrict__,
     core::DeviceErrorFlags* __restrict__, const CbetRecordDeviceArgs,
     const HotECaptureParams, double* __restrict__, const laser::LaserPhysExtOptions,
-    const double* __restrict__, const double, const double, const int,
-    double* __restrict__, double* __restrict__);
+    const double* __restrict__, double* __restrict__, double* __restrict__);
 template __global__ void ray_trace_1d_sph<true, false, false>(
     double* __restrict__, double* __restrict__, double* __restrict__, double* __restrict__,
     const double* __restrict__, const double* __restrict__, const double* __restrict__,
@@ -1756,8 +1750,7 @@ template __global__ void ray_trace_1d_sph<true, false, false>(
     unsigned long long* __restrict__, double* __restrict__, unsigned long long* __restrict__,
     core::DeviceErrorFlags* __restrict__, const CbetRecordDeviceArgs,
     const HotECaptureParams, double* __restrict__, const laser::LaserPhysExtOptions,
-    const double* __restrict__, const double, const double, const int,
-    double* __restrict__, double* __restrict__);
+    const double* __restrict__, double* __restrict__, double* __restrict__);
 template __global__ void ray_trace_1d_sph<true, true, false>(
     double* __restrict__, double* __restrict__, double* __restrict__, double* __restrict__,
     const double* __restrict__, const double* __restrict__, const double* __restrict__,
@@ -1774,8 +1767,7 @@ template __global__ void ray_trace_1d_sph<true, true, false>(
     unsigned long long* __restrict__, double* __restrict__, unsigned long long* __restrict__,
     core::DeviceErrorFlags* __restrict__, const CbetRecordDeviceArgs,
     const HotECaptureParams, double* __restrict__, const laser::LaserPhysExtOptions,
-    const double* __restrict__, const double, const double, const int,
-    double* __restrict__, double* __restrict__);
+    const double* __restrict__, double* __restrict__, double* __restrict__);
 
 template __global__ void ray_trace_1d_sph<false, false, true>(
     double* __restrict__, double* __restrict__, double* __restrict__, double* __restrict__,
@@ -1793,8 +1785,7 @@ template __global__ void ray_trace_1d_sph<false, false, true>(
     unsigned long long* __restrict__, double* __restrict__, unsigned long long* __restrict__,
     core::DeviceErrorFlags* __restrict__, const CbetRecordDeviceArgs,
     const HotECaptureParams, double* __restrict__, const laser::LaserPhysExtOptions,
-    const double* __restrict__, const double, const double, const int,
-    double* __restrict__, double* __restrict__);
+    const double* __restrict__, double* __restrict__, double* __restrict__);
 template __global__ void ray_trace_1d_sph<false, true, true>(
     double* __restrict__, double* __restrict__, double* __restrict__, double* __restrict__,
     const double* __restrict__, const double* __restrict__, const double* __restrict__,
@@ -1811,8 +1802,7 @@ template __global__ void ray_trace_1d_sph<false, true, true>(
     unsigned long long* __restrict__, double* __restrict__, unsigned long long* __restrict__,
     core::DeviceErrorFlags* __restrict__, const CbetRecordDeviceArgs,
     const HotECaptureParams, double* __restrict__, const laser::LaserPhysExtOptions,
-    const double* __restrict__, const double, const double, const int,
-    double* __restrict__, double* __restrict__);
+    const double* __restrict__, double* __restrict__, double* __restrict__);
 template __global__ void ray_trace_1d_sph<true, false, true>(
     double* __restrict__, double* __restrict__, double* __restrict__, double* __restrict__,
     const double* __restrict__, const double* __restrict__, const double* __restrict__,
@@ -1829,8 +1819,7 @@ template __global__ void ray_trace_1d_sph<true, false, true>(
     unsigned long long* __restrict__, double* __restrict__, unsigned long long* __restrict__,
     core::DeviceErrorFlags* __restrict__, const CbetRecordDeviceArgs,
     const HotECaptureParams, double* __restrict__, const laser::LaserPhysExtOptions,
-    const double* __restrict__, const double, const double, const int,
-    double* __restrict__, double* __restrict__);
+    const double* __restrict__, double* __restrict__, double* __restrict__);
 template __global__ void ray_trace_1d_sph<true, true, true>(
     double* __restrict__, double* __restrict__, double* __restrict__, double* __restrict__,
     const double* __restrict__, const double* __restrict__, const double* __restrict__,
@@ -1847,8 +1836,7 @@ template __global__ void ray_trace_1d_sph<true, true, true>(
     unsigned long long* __restrict__, double* __restrict__, unsigned long long* __restrict__,
     core::DeviceErrorFlags* __restrict__, const CbetRecordDeviceArgs,
     const HotECaptureParams, double* __restrict__, const laser::LaserPhysExtOptions,
-    const double* __restrict__, const double, const double, const int,
-    double* __restrict__, double* __restrict__);
+    const double* __restrict__, double* __restrict__, double* __restrict__);
 
 __global__ __launch_bounds__(64)
 void ray_trace_2d(double* __restrict__ deposit,
@@ -3411,9 +3399,6 @@ cudaError_t launch_ray_trace_1d_sph(const RayArray1D& rays,
                                     double** d_hot_e_capture_out,
                                     const laser::LaserPhysExtOptions* phys_ext,
                                     const double* d_radial_T_e,
-                                    const double beam_P_w,
-                                    const double beam_w_cm,
-                                    const int beam_profile_flat,
                                     double* d_ra_power_total,
                                     const int* h_ray_order,
                                     int* h_ray_steps_out,
@@ -3534,8 +3519,7 @@ cudaError_t launch_ray_trace_1d_sph(const RayArray1D& rays,
           d_tail_closure_count, d_tail_closure_absorbed_power,
           d_critical_surface_hit_count, d_error_flags, *cbet_record,
           hot_e_params, d_per_ray_hot_e_capture, *phys_ext, d_radial_T_e,
-          beam_P_w, beam_w_cm, beam_profile_flat, d_ra_per_ray,
-          d_tau_shell_out);
+          d_ra_per_ray, d_tau_shell_out);
     } else {
       ray_trace_1d_sph<true, true, false>
           <<<grid, block, ray_trace_shared_bytes, stream>>>(
@@ -3556,7 +3540,7 @@ cudaError_t launch_ray_trace_1d_sph(const RayArray1D& rays,
           d_tail_closure_count, d_tail_closure_absorbed_power,
           d_critical_surface_hit_count, d_error_flags, *cbet_record,
           hot_e_params, d_per_ray_hot_e_capture, laser::LaserPhysExtOptions{},
-          nullptr, 0.0, 0.0, 0, nullptr, d_tau_shell_out);
+          nullptr, nullptr, d_tau_shell_out);
     }
   } else if (cbet_record_mode) {
     if (phys_ext != nullptr) {
@@ -3578,8 +3562,8 @@ cudaError_t launch_ray_trace_1d_sph(const RayArray1D& rays,
           d_step_count, kernel_ray_order, d_ray_steps_out, d_unabsorbed,
           d_tail_closure_count, d_tail_closure_absorbed_power,
           d_critical_surface_hit_count, d_error_flags, *cbet_record,
-          HotECaptureParams{}, nullptr, *phys_ext, d_radial_T_e, beam_P_w,
-          beam_w_cm, beam_profile_flat, d_ra_per_ray, d_tau_shell_out);
+          HotECaptureParams{}, nullptr, *phys_ext, d_radial_T_e,
+          d_ra_per_ray, d_tau_shell_out);
     } else {
       ray_trace_1d_sph<true, false, false>
           <<<grid, block, ray_trace_shared_bytes, stream>>>(
@@ -3600,7 +3584,7 @@ cudaError_t launch_ray_trace_1d_sph(const RayArray1D& rays,
           d_tail_closure_count, d_tail_closure_absorbed_power,
           d_critical_surface_hit_count, d_error_flags, *cbet_record,
           HotECaptureParams{}, nullptr, laser::LaserPhysExtOptions{}, nullptr,
-          0.0, 0.0, 0, nullptr, d_tau_shell_out);
+          nullptr, d_tau_shell_out);
     }
   } else if (hot_e_capture_enabled) {
     if (phys_ext != nullptr) {
@@ -3623,8 +3607,7 @@ cudaError_t launch_ray_trace_1d_sph(const RayArray1D& rays,
           d_tail_closure_count, d_tail_closure_absorbed_power,
           d_critical_surface_hit_count, d_error_flags, CbetRecordDeviceArgs{},
           hot_e_params, d_per_ray_hot_e_capture, *phys_ext, d_radial_T_e,
-          beam_P_w, beam_w_cm, beam_profile_flat, d_ra_per_ray,
-          d_tau_shell_out);
+          d_ra_per_ray, d_tau_shell_out);
     } else {
       ray_trace_1d_sph<false, true, false>
           <<<grid, block, ray_trace_shared_bytes, stream>>>(
@@ -3645,7 +3628,7 @@ cudaError_t launch_ray_trace_1d_sph(const RayArray1D& rays,
           d_tail_closure_count, d_tail_closure_absorbed_power,
           d_critical_surface_hit_count, d_error_flags, CbetRecordDeviceArgs{},
           hot_e_params, d_per_ray_hot_e_capture, laser::LaserPhysExtOptions{},
-          nullptr, 0.0, 0.0, 0, nullptr, d_tau_shell_out);
+          nullptr, nullptr, d_tau_shell_out);
     }
   } else {
     if (phys_ext != nullptr) {
@@ -3667,8 +3650,8 @@ cudaError_t launch_ray_trace_1d_sph(const RayArray1D& rays,
           d_step_count, kernel_ray_order, d_ray_steps_out, d_unabsorbed,
           d_tail_closure_count, d_tail_closure_absorbed_power,
           d_critical_surface_hit_count, d_error_flags, CbetRecordDeviceArgs{},
-          HotECaptureParams{}, nullptr, *phys_ext, d_radial_T_e, beam_P_w,
-          beam_w_cm, beam_profile_flat, d_ra_per_ray, d_tau_shell_out);
+          HotECaptureParams{}, nullptr, *phys_ext, d_radial_T_e,
+          d_ra_per_ray, d_tau_shell_out);
     } else {
       ray_trace_1d_sph<false, false, false>
           <<<grid, block, ray_trace_shared_bytes, stream>>>(
@@ -3689,7 +3672,7 @@ cudaError_t launch_ray_trace_1d_sph(const RayArray1D& rays,
           d_tail_closure_count, d_tail_closure_absorbed_power,
           d_critical_surface_hit_count, d_error_flags, CbetRecordDeviceArgs{},
           HotECaptureParams{}, nullptr, laser::LaserPhysExtOptions{}, nullptr,
-          0.0, 0.0, 0, nullptr, d_tau_shell_out);
+          nullptr, d_tau_shell_out);
     }
   }
   if (d_pabs_per_ray_out != nullptr) {

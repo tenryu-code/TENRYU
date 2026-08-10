@@ -1998,14 +1998,20 @@ void laser_step(core::State& state,
 
   const double z_center = 0.5 * (lmesh.Z_min + lmesh.Z_max);
   const Beams beams = create_from_config(laser, state, lmesh.target_radius, z_center);
-  if (laser.ib.langdon_model != "off") {
-    TENRYU_ASSERT(beams.items.size() == 1,
-                  "langdon legacy_vacuum_map requires a single beam");
-    TENRYU_ASSERT(beams.items.front().profile_model == "gaussian" ||
-                      beams.items.front().profile_model == "flat_top",
-                  "langdon legacy_vacuum_map requires a gaussian or flat_top beam "
-                  "profile (2026-08-02: flat_top uniform-disc vacuum map added for "
-                  "HELIOS-parity decks)");
+  if (laser.ib.langdon_model == "legacy_vacuum_map" && !beams.items.empty()) {
+    const Beam& common_profile = beams.items.front();
+    TENRYU_ASSERT(common_profile.profile_model == "gaussian" ||
+                      common_profile.profile_model == "super_gaussian" ||
+                      common_profile.profile_model == "flat_top",
+                  "langdon legacy_vacuum_map requires gaussian, super_gaussian, "
+                  "or flat_top beam profiles");
+    for (const Beam& beam : beams.items) {
+      TENRYU_ASSERT(beam.profile_model == common_profile.profile_model &&
+                        beam.profile_w0_cm == common_profile.profile_w0_cm &&
+                        beam.profile_m == common_profile.profile_m,
+                    "langdon legacy_vacuum_map requires all beams to share one "
+                    "effective (model, w0, m) profile");
+    }
   }
   RaytraceSkipCache* skip_cache = nullptr;
   if (!radial_absorption_1d && !hot_e_on) {
@@ -2036,6 +2042,37 @@ void laser_step(core::State& state,
   }
 
   const double total_power = beams.total_power(t);
+  if (phys_ext_options.langdon_model != 0) {
+    constexpr double kPiLangdon = 3.14159265358979323846;
+    const Beam& common_profile = beams.items.front();
+    const double P_total_w = total_power * 1.0e-7;
+    if (common_profile.profile_model == "flat_top") {
+      phys_ext_options.langdon_profile_kind = 1;
+      phys_ext_options.langdon_w_cm = common_profile.profile_w0_cm;
+      phys_ext_options.langdon_I0_wcm2 =
+          P_total_w /
+          (kPiLangdon * common_profile.profile_w0_cm *
+           common_profile.profile_w0_cm);
+    } else if (common_profile.profile_model == "super_gaussian" &&
+               common_profile.profile_m >= 2) {
+      const double m = static_cast<double>(common_profile.profile_m);
+      phys_ext_options.langdon_profile_kind = 2;
+      phys_ext_options.langdon_w_cm = common_profile.profile_w0_cm;
+      phys_ext_options.langdon_sg_two_m = 2.0 * m;
+      phys_ext_options.langdon_I0_wcm2 =
+          P_total_w * m * std::pow(2.0, 1.0 / m) /
+          (kPiLangdon * common_profile.profile_w0_cm *
+           common_profile.profile_w0_cm * std::tgamma(1.0 / m));
+    } else {
+      phys_ext_options.langdon_profile_kind = 0;
+      phys_ext_options.langdon_w_cm =
+          common_profile.profile_w0_cm / std::sqrt(2.0);
+      phys_ext_options.langdon_I0_wcm2 =
+          P_total_w /
+          (kPiLangdon * phys_ext_options.langdon_w_cm *
+           phys_ext_options.langdon_w_cm);
+    }
+  }
   lmesh.last_commanded_energy = total_power * dt;
   if (!(total_power > 0.0)) {
     // Keep skip cache transitions consistent when power goes to zero.
@@ -2600,6 +2637,28 @@ void laser_step(core::State& state,
   CbetLmFields cbet_lm;
   if (state.mesh.dim == 1) {
     build_hydro_mirror_1d(lmesh, state, hydro_mirror);
+    if (phys_ext_options.langdon_model != 0 &&
+        phys_ext_options.n_species == 0) {
+      const std::vector<std::uint8_t>& cell_is_void =
+          hydro_mirror.cell_is_void.empty() ? state.cell_is_void
+                                            : hydro_mirror.cell_is_void;
+      for (int c = static_cast<int>(hydro_mirror.zbar.size()) - 1;
+           c >= 0; --c) {
+        if (cell_is_void[static_cast<std::size_t>(c)] == 0U) {
+          phys_ext_options.langdon_zcoll =
+              hydro_mirror.zbar[static_cast<std::size_t>(c)];
+          break;
+        }
+      }
+      static bool logged_langdon_zcoll_fallback = false;
+      if (!logged_langdon_zcoll_fallback) {
+        core::log_info(
+            "langdon Z_coll fallback: outermost-cell Zbar = " +
+            std::to_string(phys_ext_options.langdon_zcoll) +
+            " (no Laser.ib.species)");
+        logged_langdon_zcoll_fallback = true;
+      }
+    }
     map_from_hydro_1d(lmesh, state, laser, hydro_mirror, stream);
   } else {
     cbet_on_2d ? map_from_hydro_2d_cbet(lmesh, state, laser, cbet_lm, stream)
@@ -3167,14 +3226,6 @@ void laser_step(core::State& state,
                          1.0e-5, 1.0);
         }
       }
-      const double beam_P_w =
-          (phys_ext_options.langdon_model != 0) ? P_beam * 1.0e-7 : 0.0;
-      const double beam_w_cm =
-          (phys_ext_options.langdon_model != 0)
-              ? beam.profile_w0_cm / std::sqrt(2.0)
-              : 0.0;
-      const int beam_profile_flat =
-          (beam.profile_model == "flat_top") ? 1 : 0;
       // Opt-in until the S1.1 physics-accuracy pass closes the march parity gap;
       // see perf wave-3 notes.
       static const bool fast_trace_enabled = [] {
@@ -3252,7 +3303,6 @@ void laser_step(core::State& state,
               d_traj_step_count, n_output_rays_traj,
               phys_ext_active ? &phys_ext_options : nullptr,
               phys_ext_active ? lmesh.radial_T_e : nullptr,
-              beam_P_w, beam_w_cm,
               phys_ext_active && phys_ext_options.ra_enable != 0
                   ? d_ra_power_total
                   : nullptr,
@@ -3271,7 +3321,6 @@ void laser_step(core::State& state,
               cbet_on ? &cbet_rec_args : nullptr, hot_e_params, &d_hot_e_capture_rays,
               phys_ext_active ? &phys_ext_options : nullptr,
               phys_ext_active ? lmesh.radial_T_e : nullptr,
-              beam_P_w, beam_w_cm, beam_profile_flat,
               phys_ext_active && phys_ext_options.ra_enable != 0
                   ? d_ra_power_total
                   : nullptr,

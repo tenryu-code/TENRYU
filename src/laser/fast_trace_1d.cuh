@@ -32,8 +32,6 @@ struct LaserPhysExtOptions;
     int n_output_rays = 0,
     const LaserPhysExtOptions* phys_ext = nullptr,
     const double* d_radial_T_e = nullptr,
-    double beam_P_w = 0.0,
-    double beam_w_cm = 0.0,
     double* d_ra_power_total = nullptr,
     double* d_tau_shell_out = nullptr,
     double* d_pabs_per_ray_out = nullptr);

@@ -51,8 +51,6 @@ __global__ void fast_trace_1d_kernel(
     const double lambda_cm,
     const LaserPhysExtOptions phys_opt,
     const int phys_ext_active,
-    const double beam_P_w,
-    const double beam_w_cm,
     double* __restrict__ per_ray_shell,
     double* __restrict__ per_ray_unabsorbed,
     double* __restrict__ per_ray_critical_hits,
@@ -93,7 +91,9 @@ __global__ void fast_trace_1d_kernel(
   const double b = ::abs(R0 * vZ0 - Z0 * vR0) / v_norm;
   const double I_vac =
       (phys_ext_active != 0 && phys_opt.langdon_model != 0)
-          ? vacuum_map_intensity(beam_P_w, beam_w_cm, ::abs(R0), 1)
+          ? vacuum_map_intensity(
+                phys_opt.langdon_I0_wcm2, phys_opt.langdon_w_cm, ::abs(R0),
+                phys_opt.langdon_profile_kind, phys_opt.langdon_sg_two_m)
           : 0.0;
 
   int turning_shell = -1;
@@ -592,8 +592,6 @@ cudaError_t launch_fast_trace_1d(
     const int n_output_rays,
     const LaserPhysExtOptions* phys_ext,
     const double* d_radial_T_e,
-    const double beam_P_w,
-    const double beam_w_cm,
     double* d_ra_power_total,
     double* d_tau_shell_out,
     double* d_pabs_per_ray_out) {
@@ -696,7 +694,7 @@ cudaError_t launch_fast_trace_1d(
         rays.Z0, rays.vR0, rays.vZ0, rays.power, rays.power0, ray_offset,
         batch_rays, batch_capacity, n_shells, laser_cfg.absorption.eps_n,
         laser_cfg.raytrace.eps_crit, laser_cfg.raytrace.test_kappa, lambda_cm,
-        phys, phys_ext != nullptr ? 1 : 0, beam_P_w, beam_w_cm, slab,
+        phys, phys_ext != nullptr ? 1 : 0, slab,
         per_ray_unabsorbed, per_ray_critical_hits, per_ray_invalid, per_ray_ra,
         d_tau_shell_out, d_tail_stats);
     if (d_pabs_per_ray_out != nullptr) {

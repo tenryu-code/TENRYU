@@ -29,6 +29,10 @@ struct LaserPhysExtOptions {
                                // Langdon alpha (host fills full-ionization
                                // Z_eff of the composition; corona-valid)
   double langdon_te_min_eV = 100.0;  // f_L=1 below this Te (validity domain)
+  double langdon_I0_wcm2 = 0.0;   // on-axis/in-disc intensity of the TOTAL beam power [W/cm^2]
+  double langdon_w_cm = 0.0;      // gaussian: 1/e-intensity radius w0/sqrt2; flat/super: w0
+  int langdon_profile_kind = 0;   // 0 gaussian, 1 flat_top, 2 super_gaussian
+  double langdon_sg_two_m = 0.0;  // super_gaussian: 2m exponent
   int ra_enable = 0;           // resonance absorption master flag (used by later tasks)
   double ra_chi_p = 0.5;       // polarization fraction
   double ra_c = 1.0;           // overall multiplier
@@ -164,28 +168,28 @@ TENRYU_HOST_DEVICE inline double compute_langdon_factor(
   return ::fmin(1.0, ::fmax(0.447, f_langdon));
 }
 
-// Vacuum-map local intensity of a collimated Gaussian or flat-top beam of
-// total power P_w [W] and radius w_cm at cylindrical radius rcyl_cm.
-// Gaussian (flat_top == 0), with w_cm the 1/e-INTENSITY radius:
-//   I = P_w / (pi w^2) * exp(-(rcyl/w)^2)   [W/cm^2]
-// Flat-top (flat_top != 0), uniform inside the disc of radius w_cm:
-//   I = P_w / (pi w^2) inside, 0 outside   [W/cm^2]
-// w_cm <= 0 or P_w <= 0 -> returns 0.
+// Vacuum-map local intensity at cylindrical radius rcyl_cm of the combined beam bundle
+// (all beams share one profile; I0_wcm2 is the host-precomputed on-axis/in-disc intensity
+// of the TOTAL power).
+//   kind 0 gaussian:       I = I0 * exp(-(r/w)^2)      (w = 1/e-intensity radius)
+//   kind 1 flat_top:       I = I0 for r < w else 0     (w = disc radius w0)
+//   kind 2 super_gaussian: I = I0 * exp(-2*(r/w)^(2m)) (w = w0; sg_two_m = 2m)
+// I0<=0 or w<=0 -> 0.
 TENRYU_HOST_DEVICE inline double vacuum_map_intensity(
-    const double P_w, const double w_cm, const double rcyl_cm,
-    const int flat_top) {
-  if (!(w_cm > 0.0) || !(P_w > 0.0)) {
+    const double I0_wcm2, const double w_cm, const double rcyl_cm,
+    const int kind, const double sg_two_m) {
+  if (!(w_cm > 0.0) || !(I0_wcm2 > 0.0)) {
     return 0.0;
   }
-  constexpr double pi = 3.14159265358979323846;
-  if (flat_top != 0) {
-    // Uniform disc of radius w_cm (HELIOS-parity spatial model):
-    // I = P / (pi w^2) inside, 0 outside.
-    return (rcyl_cm < w_cm) ? P_w / (pi * w_cm * w_cm) : 0.0;
+  if (kind == 1) {
+    return (rcyl_cm < w_cm) ? I0_wcm2 : 0.0;
+  }
+  if (kind == 2) {
+    return I0_wcm2 *
+           ::exp(-2.0 * ::pow(rcyl_cm / w_cm, sg_two_m));
   }
   const double radius_ratio = rcyl_cm / w_cm;
-  return P_w / (pi * w_cm * w_cm) *
-         ::exp(-radius_ratio * radius_ratio);
+  return I0_wcm2 * ::exp(-radius_ratio * radius_ratio);
 }
 
 // eta = (k0 Ln)^(2/3) * (b/rc)^2 ; f_p = 1.74098 * eta / sqrt(eta+0.435)
