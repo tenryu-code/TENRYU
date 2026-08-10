@@ -1399,9 +1399,6 @@ __device__ inline void ray_trace_1d_sph_body(const int ray,
                       double* __restrict__ hot_e_capture,  // rows [(tid*n_channels + ch)*4 + {0:valid,1:r_s,2:mu_axis,3:P_before}]
                       const laser::LaserPhysExtOptions phys_opt,
                       const double* __restrict__ radial_T_e,
-                      const double beam_P_w,
-                      const double beam_w_cm,
-                      const int beam_profile_flat,
                       double* __restrict__ ra_per_ray,
                       double* __restrict__ tau_shell_out
                       ) {
@@ -1581,7 +1578,8 @@ __device__ inline void ray_trace_1d_sph_body(const int ray,
             radial_T_e != nullptr) {
           const double Te0 = interpolate_radial_field(radial_T_e, carried_c);
           const double I_vac = vacuum_map_intensity(
-              beam_P_w, beam_w_cm, R, beam_profile_flat);
+              phys_opt.langdon_I0_wcm2, phys_opt.langdon_w_cm, R,
+              phys_opt.langdon_profile_kind, phys_opt.langdon_sg_two_m);
           kappa0 *= compute_langdon_factor(phys_opt.langdon_model,
                                            phys_opt.langdon_zcoll, I_vac,
                                            lambda_cm, Te0,
@@ -2286,7 +2284,8 @@ __device__ inline void ray_trace_1d_sph_body(const int ray,
             radial_T_e != nullptr) {
           const double Te0 = interpolate_radial_field(radial_T_e, c_stop);
           const double I_vac = vacuum_map_intensity(
-              beam_P_w, beam_w_cm, R, beam_profile_flat);
+              phys_opt.langdon_I0_wcm2, phys_opt.langdon_w_cm, R,
+              phys_opt.langdon_profile_kind, phys_opt.langdon_sg_two_m);
           kappa_stop *= compute_langdon_factor(phys_opt.langdon_model,
                                                phys_opt.langdon_zcoll, I_vac,
                                                lambda_cm, Te0,

@@ -915,8 +915,9 @@ struct Config {
       std::vector<double> species_z = {};         // nuclear charges (ascending)
       std::vector<double> species_x = {};         // number fractions (sum ~ 1)
       std::string coulomb_log_model = "debye";    // debye | laser_frequency
-      std::string langdon_model = "off";          // off | legacy_vacuum_map
+      std::string langdon_model = "auto";         // auto | off | legacy_vacuum_map
       double langdon_te_min_eV = 100.0;
+      bool langdon_auto_resolved = false;  // true when "auto" resolved to legacy_vacuum_map (not serialized)
     };
 
     struct RAConfig {
@@ -1089,8 +1090,9 @@ struct Config {
     std::vector<BeamDef> beams;
 
     [[nodiscard]] bool laser_phys_ext_active() const {
-      return ib.zeff_model != "off" || ib.coulomb_log_model != "debye" ||
-             ib.langdon_model != "off" || ra.enable ||
+      return (ib.zeff_model != "off" && ib.zeff_model != "auto") ||
+             ib.coulomb_log_model != "debye" ||
+             (ib.langdon_model != "off" && ib.langdon_model != "auto") || ra.enable ||
              absorption.terminate_mode == "deposit";
     }
   };

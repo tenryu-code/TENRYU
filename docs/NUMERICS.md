@@ -14506,17 +14506,21 @@ P \leftarrow P\,\exp(-\tau_c).
 吸収モデルは既存 IB（§5.4）と同一であり、単位系は cgs + eV から変更しない。
 v1.0 では臨界反射、ポンデロモーティブ力、非線形吸収を扱わない。
 
-#### 5.4.5 拡張吸収物理（opt-in、既定 OFF、v1 は 1D_SPH 限定）
+#### 5.4.5 拡張吸収物理（v1 は 1D_SPH 限定；Langdon は 1D raytrace 既定有効）
 
 HELIOS ベンチマーク吸収率監査（2026-07-29/30、
 `benchmarks/helios/comparison_LTE/ANALYSIS_laser_algorithm_comparison.md`
-追補 2/3）を受けて導入した 4 つの拡張。すべて namelist opt-in
-（`Laser.ib` / `Laser.ra`、SPECIFICATION §6.4）で、**既定ではすべて OFF
-であり、生産経路は変更前とビット同一**（GXII フルレグレッションの
-HEAD／導入前バイナリ二重実行で共通 235 データセットの byte 一致を確認済み。
-実装はカーネル第 3 テンプレート引数 `kPhysExt` + `if constexpr` で、
-OFF 実体はレガシーコードと同一命令列 — runtime 分岐による FMA 再配置を
-避ける本プロジェクトの bitwise 規約に従う）。診断として snapshot
+追補 2/3）を受けて導入した 4 つの拡張。(a)〜(b) および (d) は
+namelist opt-in（`Laser.ib` / `Laser.ra`、SPECIFICATION §6.4）で既定 OFF。
+(c) Langdon は `ib.langdon_model="auto"` が既定で、`laser.enabled=True`、
+`Main.dimension="1D_SPH"`、`laser.mode!="radial_absorption_1d"`、ビーム
+リストが非空、かつ全ビームの有効な (profile model, w0, m) が共通で
+model が gaussian / super_gaussian / flat_top のときだけ
+`"legacy_vacuum_map"`、それ以外は `"off"` に構築時解決する（INFO ログ
+1 行）。4 つとも v1 は 1D_SPH 限定である。OFF 解決時の実装はカーネル
+第 3 テンプレート引数 `kPhysExt` + `if constexpr` によりレガシーコードと
+同一命令列となり、runtime 分岐による FMA 再配置を避ける本プロジェクトの
+bitwise 規約に従う。診断として snapshot
 `laser/E_ra`・history `energy/laser_ra_deposited`（累積 erg）を追加。
 
 **(a) 混合プラズマ衝突電荷 Z_eff**（`ib.zeff_model`）。§5.4.3 の
@@ -14556,15 +14560,43 @@ n̂=0.01 で −2.3）。フロアは既定と同じ。
 f_L = 1-\frac{0.553}{1+(0.27/\alpha)^{0.75}}
 \]
 （\(v_T^2=k_BT_e/m_e\) 規約、α∈[10⁻⁶,10³]・f_L∈[0.447,1] クランプ）。
-局所強度は **vacuum-map 近似**: 単一 ±z ガウスビームの真空強度
-\(I=P(t)/(\pi w^2)\exp(-(r_{cyl}/w)^2)\)（w = 1/e 強度半径 =
-TENRYU プロファイル w0/√2）をレイの現在 R 座標で評価する。近似の内容
-と限界: (i) 減衰・屈折集光を無視（枯渇領域で α 過大 → f_L 過小 =
-吸収過小側）、(ii) 往復重なり（転回近傍 ~2 倍）を無視、(iii)
-segment 途中停止点では全段末 R を使用（w=113 µm スケールに対し
-誤差無視可能）、(iv) \(Z_{\rm coll}\) は組成の完全電離 Z_eff 定数
-（コロナで妥当）。制約: 単一ガウスビーム必須（それ以外は起動時
-エラー）。適用域: `langdon_te_min_eV`（既定 100 eV）未満の Te では
+局所強度は **vacuum-map 近似**: 全ビームの合計瞬時パワー
+\(P(t)=\sum_b P_b(t)\) を担う、共通プロファイルの単一等価ビームの
+真空強度をレイの現在 R 座標（\(r=|R|\)）で評価する:
+\[
+\begin{aligned}
+\text{gaussian:}\quad
+&I(r)=\frac{P}{\pi w^2}\exp\!\left[-\left(\frac{r}{w}\right)^2\right],
+\qquad w=\frac{w_0}{\sqrt{2}},\\
+\text{flat\_top:}\quad
+&I(r)=\begin{cases}
+P/(\pi w_0^2),&r<w_0,\\
+0,&r\ge w_0,
+\end{cases}\\
+\text{super\_gaussian:}\quad
+&I(r)=I_0\exp\!\left[-2\left(\frac{r}{w_0}\right)^{2m}\right],
+\qquad I_0=\frac{P m 2^{1/m}}{\pi w_0^2\Gamma(1/m)} .
+\end{aligned}
+\]
+gaussian の \(w=w_0/\sqrt2\) は 1/e 強度半径である。
+super_gaussian は \(m\ge2\) とし、\(m=1\) は gaussian に写像する。
+flat_top の半径は \(w_0\) 自身である。従来の \(w_0/\sqrt2\) は gaussian
+変換の誤適用であり、2026-08-10 に修正したため、opt-in の
+HELIOS-parity deck は構成上結果が変わる。近似の内容と限界: (i)
+減衰・屈折集光を無視（枯渇領域で α 過大 → f_L 過小 = 吸収過小側）、
+(ii) 往復重なり（転回近傍 ~2 倍）を無視、(iii) segment 途中停止点では
+全段末 R を使用（w=113 µm スケールに対し誤差無視可能）、(iv)
+\(Z_{\rm coll}\) は `ib.species` 指定時には組成の完全電離
+\(Z_{\rm eff}=\sum_s x_s z_s^2/\sum_s x_s z_s\) を用い、未指定時には
+1D radial mirror の最外非 void セルの \(\bar Z\) をレーザー呼び出しごとに
+更新して代用する（1 run に 1 回 INFO）。どちらも得られなければ 1 とする。
+単一完全電離元素ではこの fallback は厳密だが、混合物では
+\(\langle Z^2\rangle/\langle Z\rangle\) を過小評価し、吸収低減が弱い
+保守側となるため、`species` が正確な経路である。制約: 全ビームが共通の
+gaussian / super_gaussian / flat_top プロファイルを共有しなければならない。
+`"auto"` では非互換構成は `"off"` に解決する（INFO）が、明示的な
+`"legacy_vacuum_map"` は非対応構成で起動時 ConfigError となる。適用域:
+`langdon_te_min_eV`（既定 100 eV）未満の Te では
 f_L=1（eV 級高衝突物質では超ガウス歪みが e-e 衝突で即緩和されるため。
 コールドスタートのスモークで界面 κ の非物理的 44% 抑制を実測し導入）。radial 事前吸収経路（§5.4 の radial_absorption_1d）には
 適用しない（コロナ形成前の冷高密度域で f_L≈1）。

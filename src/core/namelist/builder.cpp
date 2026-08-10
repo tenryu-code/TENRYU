@@ -18,6 +18,7 @@
 #include <set>
 #include <sstream>
 #include <string_view>
+#include <tuple>
 #include <type_traits>
 #include <unordered_set>
 #include <utility>
@@ -100,6 +101,40 @@ std::uint64_t compute_material_eos_signature(const Config::MaterialsConfig::MatD
 bool valid_temperature_range(const std::vector<double>& range) {
   return range.size() == 2U && std::isfinite(range[0]) && std::isfinite(range[1]) &&
          range[0] > 0.0 && range[1] > range[0];
+}
+
+static std::string langdon_profile_compatibility_error(
+    const Config::LaserConfig& laser) {
+  if (laser.beams.empty()) {
+    return {};
+  }
+
+  const auto effective_profile = [&laser](const Config::LaserConfig::BeamDef& beam) {
+    const std::string model =
+        beam.profile_model.empty() ? laser.profile_model : beam.profile_model;
+    const double w0_um =
+        (beam.profile_w0_um > 0.0) ? beam.profile_w0_um : laser.profile_w0_um;
+    const int m = (beam.profile_m > 0) ? beam.profile_m : laser.profile_m;
+    return std::tuple<std::string, double, int>{model, w0_um, m};
+  };
+
+  const auto [model0, w0_um0, m0] = effective_profile(laser.beams.front());
+  if (model0 != "gaussian" && model0 != "super_gaussian" &&
+      model0 != "flat_top") {
+    return "profile model \"" + model0 + "\" is not supported";
+  }
+  for (std::size_t i = 1; i < laser.beams.size(); ++i) {
+    const auto [model, w0_um, m] = effective_profile(laser.beams[i]);
+    if (model != "gaussian" && model != "super_gaussian" &&
+        model != "flat_top") {
+      return "beam " + std::to_string(i) + " profile model \"" + model +
+             "\" is not supported";
+    }
+    if (model != model0 || w0_um != w0_um0 || m != m0) {
+      return "beams do not share one effective (model, w0, m) profile";
+    }
+  }
+  return {};
 }
 
 void expand_temperature_range(std::vector<double>& range,
@@ -4570,11 +4605,12 @@ void Builder::set_laser(py::dict kwargs) {
     if (has_key(ib, "langdon_model")) {
       laser.ib.langdon_model =
           strict_string(ib["langdon_model"], "Laser.ib.langdon_model");
-      if (laser.ib.langdon_model != "off" &&
+      if (laser.ib.langdon_model != "auto" &&
+          laser.ib.langdon_model != "off" &&
           laser.ib.langdon_model != "legacy_vacuum_map") {
         throw ValueError(
-            "Laser.ib.langdon_model must be \"off\" or "
-            "\"legacy_vacuum_map\"");
+            "Laser.ib.langdon_model must be one of "
+            "{\"auto\", \"off\", \"legacy_vacuum_map\"}");
       }
     }
     if (has_key(ib, "langdon_te_min_eV")) {
@@ -4585,12 +4621,10 @@ void Builder::set_laser(py::dict kwargs) {
         throw ValueError("Laser.ib.langdon_te_min_eV must be in [0, 1e5]");
       }
     }
-    if ((laser.ib.zeff_model == "sequential_strip" ||
-         laser.ib.langdon_model != "off") &&
+    if (laser.ib.zeff_model == "sequential_strip" &&
         laser.ib.species_z.empty()) {
       throw ConfigError(
-          "Laser.ib.species is required when zeff_model=sequential_strip or "
-          "langdon_model is enabled");
+          "Laser.ib.species is required when zeff_model=sequential_strip");
     }
   }
   if (has_key(kwargs, "ra")) {
@@ -14356,6 +14390,54 @@ void Builder::validate() {
           "Laser.ib.zeff_model=auto -> table (TMAT ionization fractions detected)");
     } else {
       laser.ib.zeff_model = "off";
+    }
+  }
+  if (laser.ib.langdon_model == "auto") {
+    std::string off_reason;
+    if (!laser.enabled) {
+      off_reason = "laser disabled";
+    } else if (main.dimension != "1D_SPH") {
+      off_reason = "not 1D_SPH";
+    } else if (laser.mode == "radial_absorption_1d") {
+      off_reason = "radial_absorption_1d path (Langdon not applied there)";
+    } else {
+      const std::string profile_error =
+          langdon_profile_compatibility_error(laser);
+      if (!profile_error.empty()) {
+        off_reason = "beam profiles not vacuum-map compatible (" +
+                     profile_error + ")";
+      } else if (laser.beams.empty()) {
+        off_reason = "no beams";
+      }
+    }
+    if (off_reason.empty()) {
+      laser.ib.langdon_model = "legacy_vacuum_map";
+      laser.ib.langdon_auto_resolved = true;
+      tenryu::core::log_info(
+          "Laser.ib.langdon_model=auto -> legacy_vacuum_map (1D raytrace default-on)");
+    } else {
+      laser.ib.langdon_model = "off";
+      tenryu::core::log_info(
+          "Laser.ib.langdon_model=auto -> off (" + off_reason + ")");
+    }
+  }
+  if (laser.ib.langdon_model == "legacy_vacuum_map" &&
+      !laser.ib.langdon_auto_resolved) {
+    if (laser.enabled && main.dimension != "1D_SPH") {
+      throw ConfigError(
+          "Laser.ib.langdon_model=legacy_vacuum_map requires 1D_SPH");
+    }
+    if (laser.enabled && laser.mode == "radial_absorption_1d") {
+      throw ConfigError(
+          "Laser.ib.langdon_model=legacy_vacuum_map is not supported for "
+          "radial_absorption_1d");
+    }
+    const std::string profile_error =
+        langdon_profile_compatibility_error(laser);
+    if (!profile_error.empty()) {
+      throw ConfigError(
+          "Laser.ib.langdon_model=legacy_vacuum_map beam profiles are not "
+          "vacuum-map compatible (" + profile_error + ")");
     }
   }
   if (laser.ib.zeff_model == "table") {

@@ -2417,7 +2417,7 @@ __device__ void persistent_laser_raytrace_1d_folded(
         b.laser_tail_closure_absorbed_power,
         b.laser_critical_surface_hit_count, b.laser_error_flags,
         laser::CbetRecordDeviceArgs{}, laser::HotECaptureParams{}, nullptr,
-        laser::LaserPhysExtOptions{}, nullptr, 0.0, 0.0, 0, nullptr, nullptr);
+        laser::LaserPhysExtOptions{}, nullptr, nullptr, nullptr);
   }
   __threadfence();
   pk_sync(p);
