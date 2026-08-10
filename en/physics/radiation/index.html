@@ -33,8 +33,8 @@
         <tbody>
           <tr><th>Angular treatment</th><td>Scalar energy + limited diffusive flux; angle closed by the flux limiter.</td><td>Discrete ordinates \(\{\boldsymbol\mu_m,w_m\}\); Gauss–Legendre in 1D (\(S_{16}\) production default), product level-symmetric in 2D RZ.</td></tr>
           <tr><th>Valid regime</th><td>Optically thick, nearly isotropic radiation fields.</td><td>Adds optically thin streaming, directional illumination, shadows, and ray effects.</td></tr>
-          <tr><th>Matter coupling</th><td>Fleck linearization + outer iteration with cell-local Newton matter update.</td><td>No Fleck effective scattering (\(f=1\), raw \(\sigma^{PA}\)/\(\sigma^{PE}\)); source iteration + Picard outer with active-set Newton closure.</td></tr>
-          <tr><th>Cost and solvers</th><td>One diffusion solve per group: 1D batched tridiagonal, 2D RZ five-point CSR with Jacobi-PCG/GMG.</td><td>Work ≈ cells × groups × ordinates × iterations; angular and face workspaces.</td></tr>
+          <tr><th>Matter coupling</th><td>Fleck linearization + outer iteration with cell-local Newton matter update.</td><td>No Fleck effective scattering (\(f=1\), raw Planck-mean absorption/emission opacities \(\sigma^{PA}\)/\(\sigma^{PE}\)); source iteration + Picard outer with active-set Newton closure.</td></tr>
+          <tr><th>Cost and solvers</th><td>One diffusion solve per group: 1D batched tridiagonal, 2D RZ five-point CSR with Jacobi-PCG/GMG (geometric multigrid).</td><td>Work ≈ cells × groups × ordinates × iterations; angular and face workspaces.</td></tr>
           <tr><th>Geometry</th><td>1D (spherical, cylindrical, planar) and 2D RZ.</td><td>1D (spherical/planar Gauss–Legendre; cylindrical uses a product quadrature with \(n=2L^2\) ordinates) and 2D RZ.</td></tr>
           <tr><th>When in doubt</th><td>The production default for radiative implosions (the <a href="../../verification/index.html#gxii">GXII</a> golden regression).</td><td>Check quantities of interest on an S<sub>8</sub>/S<sub>16</sub>/S<sub>32</sub> ladder.</td></tr>
         </tbody>

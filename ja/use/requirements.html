@@ -50,12 +50,13 @@
           <tr><th>CMake</th><td>3.25+</td><td>必須</td><td>構成・依存検出・CTest。</td></tr>
           <tr><th>Ninja</th><td>—</td><td>必須</td><td>ビルド実行系（本ドキュメントの手順は <code>-GNinja</code> 前提）。</td></tr>
           <tr><th>Python 3 + 開発ヘッダ</th><td>3.10+</td><td>既定 ON</td><td>namelist（入力デッキ）を初期化時に読む埋め込みインタプリタ。<code>python3-dev</code> 相当が必要。</td></tr>
+          <tr><th>numpy / matplotlib / h5py</th><td>—</td><td>解析用（任意）</td><td>付属の解析ツール <code>tools.tenryu_plot</code> が使う。本体のビルド・実行には不要。</td></tr>
           <tr><th>pybind11</th><td>2.11+</td><td>既定 ON</td><td>namelist → Config 変換。未導入なら自動取得。</td></tr>
           <tr><th>HDF5</th><td>1.12+</td><td>既定 ON</td><td>スナップショット・履歴・チェックポイントの入出力。MPI ビルドでは並列 HDF5（<code>--enable-parallel</code>）を使う。</td></tr>
           <tr><th>MPI</th><td>3.1+</td><td>opt-in（<code>-DTENRYU_ENABLE_MPI=ON</code>）</td><td>複数ランク実行。GPU-aware MPI 推奨（なければホスト経由で中継）。</td></tr>
           <tr><th>Hypre</th><td>2.25+</td><td>opt-in（<code>-DTENRYU_ENABLE_HYPRE=ON</code>）</td><td>熱伝導の <code>solver="hypre"</code>（BoomerAMG+PCG）用。<code>--with-cuda --with-gpu-aware-mpi</code> でビルドされた Hypre が必要。</td></tr>
           <tr><th>AmgX</th><td>—</td><td>opt-in（自動検出）</td><td>2D FLD の線形ソルバ選択肢。<code>find_package(amgx)</code> が見つかれば既定で有効。</td></tr>
-          <tr><th>fmt / spdlog</th><td>9.0+ / 1.12+</td><td>内部依存</td><td>ログ系。未導入なら自動取得。</td></tr>
+          <tr><th>spdlog (fmt 同梱)</th><td>1.12+ (fmt 9.0+)</td><td>内部依存</td><td>ログ系。未導入なら自動取得（fmt は spdlog の同梱版を使う）。</td></tr>
           <tr><th>Catch2</th><td>3.0+</td><td>テスト用</td><td><code>ctest</code> の単体・統合テスト。未導入なら自動取得。</td></tr>
           <tr><th>CLI11</th><td>2.4+</td><td>内部依存</td><td><code>run/verify/validate/freeze</code> のサブコマンド CLI。未導入なら自動取得。</td></tr>
         </tbody>
@@ -94,7 +95,7 @@ ninja --version
 
 # Python（3.10 以上・開発ヘッダの有無）
 python3 --version
-python3 -c "import sysconfig; print(sysconfig.get_paths()['include'])"</code></pre>
+python3 -c "import sysconfig, pathlib; p = pathlib.Path(sysconfig.get_paths()['include'], 'Python.h'); print(p, 'OK' if p.exists() else 'MISSING')"</code></pre>
       <p>ここまで確認できたら<a href="building.html">ビルド</a>のページへ進む。CMake の構成段階で「パッケージが見つからない」と出た場合の対処も同ページにある。</p>
     </section>
 

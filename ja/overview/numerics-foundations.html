@@ -61,7 +61,7 @@
       \rho\frac{De_e}{Dt}=-P_e\nabla\!\cdot\mathbf u
       -\nabla\!\cdot\mathbf q_e-Q_{ei}+S_e+S_L+S_r.
       $$
-      <p>\(\mathbf q_e\) は電子の熱流束、\(S_L\) はレーザーの吸収、\(S_r\) は輻射との交換である。符号の規約として、\(Q_{ei}&gt;0\) は電子からイオンへのエネルギーの移動、すなわちイオンの加熱を表す。同じ \(Q_{ei}\) が両方の式に符号を変えて現れるため、セル内の交換だけでは物質の全エネルギーは変わらない。</p>
+      <p>\(\mathbf q_e\) は電子の熱流束、\(S_L\) はレーザーの吸収、\(S_r\) は輻射との交換である。\(S_i\)・\(S_e\) はそれ以外の追加源であり、v1 では 0 に固定されたプレースホルダである（核燃焼は独立の演算子段として、ホット電子はレーザーの源経路を通じて、それぞれ直接沈着する）。符号の規約として、\(Q_{ei}&gt;0\) は電子からイオンへのエネルギーの移動、すなわちイオンの加熱を表す。同じ \(Q_{ei}\) が両方の式に符号を変えて現れるため、セル内の交換だけでは物質の全エネルギーは変わらない。</p>
 
       <h3 id="qei">電子–イオン緩和 \(Q_{ei}\)</h3>
       <p>2 温度モデルの要となる交換項は、Spitzer–Braginskii の衝突緩和で閉じる。</p>
@@ -167,13 +167,13 @@
       -E_{pdV}^{bdry}-E_{num.loss}
       +E_{floor}+E_{safety}+E_{redist}+E_{solver}.
       $$
-      <p>左辺は電子・イオン内部、運動、輻射場の各エネルギー変化の和である。右辺の前半が物理的な出入り（レーザーの入射と未吸収、Marshak 入射、輻射の境界流出、境界 PdV 仕事、数値的喪失）、後半の 4 項が人工的な注入 — 床補正、伝導の安全補正、ALE 再分配の未解決分、陰的ソルバの残差 — である。人工項は物理源と明確に分離して積算され、保存誤差</p>
+      <p>左辺は電子・イオン内部、運動、輻射場の各エネルギー変化の和である。右辺の前半が物理的な出入り（レーザーの入射と未吸収、Marshak 入射、輻射の境界流出、境界 PdV 仕事、数値的喪失）、後半の 4 項が人工的な注入 — 床補正、伝導の安全補正、ALE 再分配の未解決分、陰的ソルバの残差 — である。\(E_{num.loss}\) はアルゴリズム上の限界で系外へ落ち、喪失として記帳されるエネルギー（例: SNB の流束上限処理で除去した分）である。床や安全弁のようにエネルギーを注入する人工補正とは異なり、既知の流出として物理的な出入りの側で数える。人工項は物理源と明確に分離して積算され、保存誤差</p>
       $$
       \varepsilon_{budget}=\frac{\bigl|(\Delta E_{total}-E_{artificial})-(E_{source}-E_{sink})\bigr|}{E_{denom}},
       \qquad
       E_{denom}=\max\bigl(E_{total}^{\,n},\,E_{source},\,10^{-20}\ \mathrm{erg}\bigr)
       $$
-      <p>の分子には含めない。すなわち \(\varepsilon_{budget}\) は物理的な保存の破れを測り、人工補正の寄与（\(E_{floor}/E_{denom}\) など）は独立に監視して、数値安全策が結果を支配していないかを別途検出する。分母の床はコールドスタート（全エネルギー ≈ 0）での 0 除算と偽 FATAL を防ぐ。</p>
+      <p>の分子には含めない。ここで \(E_{source}=E_{laser,in}+E_{Marshak,in}+E_{volume,in}+\max(E_{solver},0)\)、\(E_{sink}=E_{laser,esc}+E_{rad,esc}+E_{num.loss}+E_{pdV}^{bdry}+\max(-E_{solver},0)\)、\(E_{artificial}=E_{floor}+\max(E_{safety}-E_{floor},0)+E_{redist}\) である。上の恒等式で人工の側に並べたソルバ残差は、この分組みでは符号に応じて源か流出のどちらかへ数え、安全補正は床補正と重なる分を除いて人工項に数える。すなわち \(\varepsilon_{budget}\) は物理的な保存の破れを測り、人工補正の寄与（\(E_{floor}/E_{denom}\) など）は独立に監視して、数値安全策が結果を支配していないかを別途検出する。分母の床はコールドスタート（全エネルギー ≈ 0）での 0 除算と偽 FATAL を防ぐ。</p>
       <p>これらの項はすべて履歴の <code>energy/</code> 群にそのまま現れる — <code>laser_incident</code>・<code>marshak_in</code>・<code>radiation_escaped</code>・<code>pdv_boundary</code>・<code>floor_injected</code>・<code>safety_injected</code>・<code>conservation_error</code> など（対応の全列挙は<a href="../use/outputs.html">出力と解析</a>）。読み方の指針: \(\varepsilon_{budget}\) が跳ねたらまず人工項の比率を見る。人工項が支配的なら床・クランプの発動源（どの演算子か、<code>clamp_count</code> の推移）を、そうでなければ境界と源の帰属（吸収率・逸出）を疑う。</p>
     </section>
 

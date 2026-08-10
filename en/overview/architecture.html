@@ -50,7 +50,7 @@
           <tr><th><code>laser/</code></th><td>Traces refracting rays, applies inverse-bremsstrahlung absorption, and deposits energy conservatively on the Hydro mesh.</td></tr>
           <tr><th><code>materials/</code></th><td>Maps state to EOS, opacity, conductivity, relaxation, mean-ionization, and related material coefficients.</td></tr>
           <tr><th><code>burn/</code></th><td>Advances Bosch–Hale reaction rates, per-cell species networks, product-energy deposition, and species ledgers.</td></tr>
-          <tr><th><code>coupling/</code></th><td>Owns operator splitting, dt selection, source injection, EOS reclosure, and acceptance of full-step retries.</td></tr>
+          <tr><th><code>coupling/</code></th><td>Owns operator splitting, dt selection, source injection, EOS reclosure (re-evaluating the EOS whenever an operator changes temperatures or energies, to bring the thermodynamic quantities back into consistency — see <a href="numerics-foundations.html">Numerical foundations</a>), and acceptance of full-step retries.</td></tr>
           <tr><th><code>diagnostics/</code></th><td>Builds ICF observables and audits such as energy budgets, areal density, sphericity, and shell tracking.</td></tr>
           <tr><th><code>drivers/</code></th><td>Implements the <code>run</code>/<code>verify</code> entry points that assemble Config, mesh, State, callbacks, and the run lifecycle.</td></tr>
         </tbody>

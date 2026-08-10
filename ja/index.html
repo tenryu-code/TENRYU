@@ -49,7 +49,7 @@
         <tr><th scope="row">バージョン</th><td>TENRYU v1 (本ドキュメントの基準。burn v2 などカーネル別のモデル世代は各ページに明記)</td></tr>
         <tr><th scope="row">幾何</th><td><code>1D_SPH</code> (球・円筒・平面 — <code>Mesh.geometry_1d</code> で選択)、<code>2D_RZ</code> (軸対称 RZ)</td></tr>
         <tr><th scope="row">メッシュ</th><td>ラグランジュおよび ALE、構造格子・極座標・マルチブロック</td></tr>
-        <tr><th scope="row">計算基盤</th><td>CUDA (<code>sm_80</code> 以降)、単一・複数ランク MPI</td></tr>
+        <tr><th scope="row">計算基盤</th><td>CUDA(検証済み実機は <code>sm_80</code> 以降 — <a href="use/requirements.html">要求スペック</a>)、単一・複数ランク MPI</td></tr>
         <tr><th scope="row">単位</th><td>cgs + eV (固定)</td></tr>
         <tr><th scope="row">入力</th><td>Python namelist デッキ</td></tr>
         <tr><th scope="row">出力</th><td>HDF5 スナップショットと履歴、Studio および Scope ビューア</td></tr>

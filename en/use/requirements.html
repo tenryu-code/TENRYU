@@ -50,12 +50,13 @@
           <tr><th>CMake</th><td>3.25+</td><td>required</td><td>Configure, dependency detection, CTest.</td></tr>
           <tr><th>Ninja</th><td>—</td><td>required</td><td>Build executor (this documentation assumes <code>-GNinja</code>).</td></tr>
           <tr><th>Python 3 + dev headers</th><td>3.10+</td><td>default ON</td><td>Embedded interpreter that reads the namelist deck at initialization; needs the <code>python3-dev</code> equivalent.</td></tr>
+          <tr><th>numpy / matplotlib / h5py</th><td>—</td><td>analysis (optional)</td><td>Used by the bundled analysis tool <code>tools.tenryu_plot</code>. Not needed to build or run the code itself.</td></tr>
           <tr><th>pybind11</th><td>2.11+</td><td>default ON</td><td>namelist → Config conversion. Auto-fetched if missing.</td></tr>
           <tr><th>HDF5</th><td>1.12+</td><td>default ON</td><td>Snapshot/history/checkpoint I/O. MPI builds use parallel HDF5 (<code>--enable-parallel</code>).</td></tr>
           <tr><th>MPI</th><td>3.1+</td><td>opt-in (<code>-DTENRYU_ENABLE_MPI=ON</code>)</td><td>Multi-rank execution. GPU-aware MPI recommended (host staging otherwise).</td></tr>
           <tr><th>Hypre</th><td>2.25+</td><td>opt-in (<code>-DTENRYU_ENABLE_HYPRE=ON</code>)</td><td>For conduction's <code>solver="hypre"</code> (BoomerAMG+PCG). Requires a Hypre built with <code>--with-cuda --with-gpu-aware-mpi</code>.</td></tr>
           <tr><th>AmgX</th><td>—</td><td>opt-in (auto-detect)</td><td>2D FLD solver option; enabled by default when <code>find_package(amgx)</code> succeeds.</td></tr>
-          <tr><th>fmt / spdlog</th><td>9.0+ / 1.12+</td><td>internal</td><td>Logging. Auto-fetched if missing.</td></tr>
+          <tr><th>spdlog (bundled fmt)</th><td>1.12+ (fmt 9.0+)</td><td>internal</td><td>Logging. Auto-fetched if missing (fmt comes bundled with spdlog).</td></tr>
           <tr><th>Catch2</th><td>3.0+</td><td>tests</td><td>Unit and integration tests under <code>ctest</code>. Auto-fetched if missing.</td></tr>
           <tr><th>CLI11</th><td>2.4+</td><td>internal</td><td>The <code>run/verify/validate/freeze</code> subcommand CLI. Auto-fetched if missing.</td></tr>
         </tbody>
@@ -94,7 +95,7 @@ ninja --version
 
 # Python (3.10+, with development headers)
 python3 --version
-python3 -c "import sysconfig; print(sysconfig.get_paths()['include'])"</code></pre>
+python3 -c "import sysconfig, pathlib; p = pathlib.Path(sysconfig.get_paths()['include'], 'Python.h'); print(p, 'OK' if p.exists() else 'MISSING')"</code></pre>
       <p>Once these pass, continue to <a href="building.html">Building</a>; that page also covers what to do when CMake reports a missing package.</p>
     </section>
 

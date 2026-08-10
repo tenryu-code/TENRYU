@@ -125,9 +125,10 @@
         <thead><tr><th>記号</th><th>文脈ごとの意味</th></tr></thead>
         <tbody>
           <tr><th>\(\alpha\)</th><td>Fleck 陰性度パラメータ（既定 1.0、FLD）／曲率フープ項の幾何係数（粘性：円筒 1・球 2）／Winslow 計量係数（ALE）／\(\alpha_{iaw}\) は CBET のイオン音波減衰率。</td></tr>
-          <tr><th>\(\beta\)</th><td>輻射–物質剛性比 \(4a_{\rm eV}T_e^3/C_{v,e}\)（FLD）／SNB の規格化電子エネルギー \(E/(k_BT_e)\)（\(\hat\beta\) は大域端）／Winslow 計量係数・M1 バリア重み（ALE）。</td></tr>
+          <tr><th>\(\beta\)</th><td>輻射–物質剛性比 \(4a_{\rm eV}T_e^3/C_{v,e}\)（FLD）／SNB の規格化電子エネルギー \(E/(k_BT_e)\)（\(\hat\beta\) は大域 max \(T_e\) で規格化した群境界値）／Winslow 計量係数・M1 バリア重み（ALE）。</td></tr>
           <tr><th>\(\lambda\)</th><td>FLD リミッタ関数 \(\lambda(R)\)／SNB 群停止長 \(\lambda_g\)（abs/tr 変種）／ALE ラインサーチのブレンド係数／\(\lambda_0\) はレーザー真空波長。</td></tr>
           <tr><th>\(\theta\)</th><td>伝導の調和フラックス制限係数／CBET の <code>theta_cap</code>／\(S_N\) の donor-\(\theta\) リミッタ／極角。</td></tr>
+          <tr><th>\(\kappa\)</th><td>質量不透明度 [cm²/g]（輻射・EOS/不透明度）。伝導の文脈では電子熱伝導率（\(\kappa\propto T_e^{5/2}\)）。\(\kappa_{\rm IB}\) は逆制動放射の吸収係数（レーザー）。</td></tr>
           <tr><th>\(g\)</th><td>光子・電子エネルギー群添字（輻射・SNB・ホット電子・燃焼）／CBET では利得曲線 \(P(g)\) の規格化離調 — CBET ページの集計「群」添字は第 3 の無関係な整理番号。</td></tr>
           <tr><th>\(f\)</th><td>Fleck 因子 \(f_{c,g}\)／伝導の自由流フラックス割合 <code>f_lim</code>／陽的ソース時間刻み割合 \(f_E\)（<code>explicit_source_limit</code>）／CBET 較正係数 <code>f_cbet</code>／ホット電子捕獲密度割合 \(f_s\)（<code>source_nc_fraction</code>）／燃焼のイオン加熱割合 \(f_i\)／CBET のドナーキャップ係数 \(f_g\)。</td></tr>
           <tr><th>\(R\)</th><td>FLD リミッタ引数 \(|\nabla E_g|/(\sigma_{R,g}E_g)\)／\((R,Z)\) の径座標／SNB G2 ゲートのフラックス応答比／粘性のチャネル比 \(\eta_e/\eta_i\)。</td></tr>

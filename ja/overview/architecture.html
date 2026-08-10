@@ -50,7 +50,7 @@
           <tr><th><code>laser/</code></th><td>屈折を含む光線追跡、逆制動輻射による吸収、流体メッシュへの保存的な沈着を担当する。</td></tr>
           <tr><th><code>materials/</code></th><td>状態から EOS、不透明度、伝導率、緩和時間、平均電離度などの物性係数を返す。</td></tr>
           <tr><th><code>burn/</code></th><td>Bosch–Hale の反応率、セルごとの核種の反応網、生成物によるエネルギーの沈着と核種の収支を進める。</td></tr>
-          <tr><th><code>coupling/</code></th><td>演算子分割、時間刻みの選択、源の注入、EOS の再クロージャ、全ステップの再試行の受理を所有する。</td></tr>
+          <tr><th><code>coupling/</code></th><td>演算子分割、時間刻みの選択、源の注入、EOS の再クロージャ（演算子が温度やエネルギーを変えるたびに EOS を評価し直し、熱力学量を整合させ直す操作 — <a href="numerics-foundations.html">数値基盤</a>参照）、全ステップの再試行の受理を所有する。</td></tr>
           <tr><th><code>diagnostics/</code></th><td>エネルギー収支、面密度、球対称性、シェルの追跡といった ICF 向けの観測量と、安全性の監査を構成する。</td></tr>
           <tr><th><code>drivers/</code></th><td><code>run</code> / <code>verify</code> の入口として、設定、メッシュ、状態、各コールバックを組み立て、実行のライフサイクルを開始する。</td></tr>
         </tbody>

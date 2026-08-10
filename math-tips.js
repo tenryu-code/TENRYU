@@ -432,7 +432,8 @@
       "t_{start}+X\\_every\\_s": "initial scheduled output time",
       "t_{end}-t": "remaining time (landing on the end time)",
       "\\infty": "∞: this kernel never limits Δt",
-      "T^{5/2}": "T: temperature (Spitzer conductivity scaling)"
+      "T^{5/2}": "T: temperature (Spitzer conductivity scaling)",
+      "\\alpha": "α: Fleck time-centering parameter (default 1; 0.5 = Crank–Nicolson)"
     },
     "numerics-foundations": {
       "(\\rho,T)": "ρ: density\nT: temperature (table lookup point)",
@@ -495,7 +496,13 @@
       "s_{max}(s_{max}+1)\\Delta t_{exp}/2": "s_max: STS stage cap\nΔt_exp: explicit stability limit",
       "I_g(\\mathbf r,\\mathbf\\Omega,t)": "I_g: group specific intensity\nr: position\nΩ: direction\nt: time",
       "\\mathcal S_{\\mathrm{sca}}": "𝒮_sca: scattering source (zero in v1.0)",
-      "1.3807\\times10^{-16}": "the Kelvin-based Boltzmann constant - never used here"
+      "1.3807\\times10^{-16}": "the Kelvin-based Boltzmann constant - never used here",
+      "S_i": "S_i: additional ion source (zero in v1)",
+      "S_e": "S_e: additional electron source (zero in v1)",
+      "E_{num.loss}": "E_num.loss: known algorithmic energy loss (booked)",
+      "E_{source}=E_{laser,in}+E_{Marshak,in}+E_{volume,in}+\\max(E_{solver},0)": "E_source: total physical inflow\n(laser incident, Marshak, volume source, positive solver residual)",
+      "E_{sink}=E_{laser,esc}+E_{rad,esc}+E_{num.loss}+E_{pdV}^{bdry}+\\max(-E_{solver},0)": "E_sink: total physical outflow\n(laser escape, radiation escape, numerical loss, boundary PdV, negative solver residual)",
+      "E_{artificial}=E_{floor}+\\max(E_{safety}-E_{floor},0)+E_{redist}": "E_artificial: total artificial injection\n(floors, safety excess over floors, ALE redistribution)"
     },
     "nomenclature": {
       "|\\nabla E_g|/(\\sigma_{R,g}E_g)": "∇E_g: group-energy gradient\nσ_R,g: Rosseland opacity\nE_g: group energy\n(= FLD limiter argument)",
@@ -523,7 +530,10 @@
       "4a_{\\rm eV}T_e^3/C_{v,e}": "a_eV: radiation constant\nT_e: electron temperature\nC_v,e: electron heat capacity\n(= stiffness ratio β)",
       "M_{req}/M_{max}": "M_req: requested subcycles\nM_max: subcycle cap",
       "i": "i: cell index",
-      "P(\\langle g\\rangle)": "P: IAW response\n⟨g⟩: record-averaged detuning"
+      "P(\\langle g\\rangle)": "P: IAW response\n⟨g⟩: record-averaged detuning",
+      "\\kappa": "κ: multi-use - mass opacity; electron thermal conductivity; κ_IB = IB absorption",
+      "\\kappa\\propto T_e^{5/2}": "κ: electron thermal conductivity\nT_e: electron temperature\n(Spitzer scaling)",
+      "\\kappa_{\\rm IB}": "κ_IB: inverse-bremsstrahlung absorption coefficient (laser)"
     },
     "hydrodynamics": {
       "(\\rho,e,P,T)": "ρ: density\ne: specific energy\nP: pressure\nT: temperature",
@@ -558,7 +568,8 @@
       "u^h": "u^h: half-step node velocity",
       "x^h": "x^h: half-step node position",
       "x^h,u^h": "x^h: half-step position\nu^h: half-step velocity",
-      "x^{n+1,*},u^{n+1,*}": "x^n+1,*: provisional position\nu^n+1,*: provisional velocity"
+      "x^{n+1,*},u^{n+1,*}": "x^n+1,*: provisional position\nu^n+1,*: provisional velocity",
+      "U_c": "U_c: extensive cell internal energy [erg]"
     },
     "mesh-1d": {
       "A(r)": "A(r): face area measure at radius r",
@@ -579,7 +590,8 @@
       "j=0,\\ldots,N": "j: node index (N+1 nodes)",
       "m_{\\rm sg}": "m_sg: super-Gaussian grading exponent (sg_order)",
       "n_s": "n_s: the segment's cell count",
-      "0.028\\,\\mathrm{g\\,cm^{-3}}": "351 nm CH critical mass density (fully ionized)"
+      "0.028\\,\\mathrm{g\\,cm^{-3}}": "351 nm CH critical mass density (fully ionized)",
+      "r=0": "r=0: the origin (spherical/cylindrical center)"
     },
     "mesh-2d": {
       "(N_r+1)(N_z+1)": "N_r, N_z: cell counts (node count = product of both +1)",
@@ -632,9 +644,19 @@
       "q_K=K_c^{diag}/V_c": "q_K: kinetic-energy density\nK_c^diag: cell kinetic energy\nV_c: cell volume",
       "q_c=1": "q_c: cell quality (1 = perfect parallelogram)",
       "w_\\theta": "w_θ: polar-row spacing regularizer weight",
-      "z": "z: axial coordinate"
+      "z": "z: axial coordinate",
+      "N_v": "N_v: total node count",
+      "|P_f|": "|P_f|: revolved volume of the swept polygon (= ΔV_f)",
+      "\\Delta V_f": "ΔV_f: signed swept volume of the face",
+      "F_{i\\pm1/2}": "F_i±1/2: conserved-quantity fluxes through the two faces of cell i",
+      "K_c^{remap,*}": "K_c^remap,*: remapped cell kinetic energy",
+      "i": "i: cell index"
     },
     "radiation-fld": {
+      "J^\\pm=cE/4\\pm F/2": "J^±: half-range boundary fluxes (+ outgoing / − incoming)\ncE/4: half-range emission of an isotropic field\nF: net flux",
+      "J^-=0": "J^−: incoming half-range flux (zero under the vacuum condition)",
+      "F=cE/2": "F: net outflow at a vacuum face (twice the half-range emission cE/4)",
+      "\\sigma_{a,c,g}": "σ_a,c,g: cell/group absorption opacity (same quantity as σ^PA in the diffusion equation)",
       "cE_g": "c·E_g: speed of light × group radiation energy density (causal flux bound)",
       "f": "f: Fleck factor (1+αβcΔtσ)^-1",
       "R": "R: flux-limiter argument |∇E_g|/(σ_R·E_g)",
@@ -755,9 +777,20 @@
       "|r_k^{\\rm inner}-r_{k-1}^{\\rm inner}|\\le10^{-6}\\max(|r_k^{\\rm inner}|,|r_{k-1}^{\\rm inner}|,10^{-300})": "r_k^inner: inner residual at pass k\n(stagnation acceptance test)",
       "\\varepsilon_2\\le10^{-6}": "ε_2: relative L2 difference (grey-collapse gate)",
       "\\sum_gE_g": "E_g: group energies (summed over groups)",
-      "\\sum_gF_{z,g}": "F_z,g: group axial fluxes (summed over groups)"
+      "\\sum_gF_{z,g}": "F_z,g: group axial fluxes (summed over groups)",
+      "L": "L: level count of the cylindrical product quadrature",
+      "\\mu^{face}_m": "μ^face_m: cosine component along the face normal",
+      "\\mu_{R,m}": "μ_R,m: radial cosine of ordinate m",
+      "\\mu_{Z,m}": "μ_Z,m: axial cosine of ordinate m",
+      "\\psi^{face}_{m,g}": "ψ^face_m,g: face angular intensity from the sweep",
+      "\\sigma_s\\phi/2": "σ_s: scattering opacity\nφ: scalar flux\n(isotropic scattering source - zero in v1.0 production)",
+      "T_{floor}": "T_floor: configured temperature floor"
     },
     "conduction": {
+      "E_g": "E_g: SNB group edge mapped to physical energy [erg]",
+      "\\beta_g=E_g/(k_BT_e)": "β_g: group edge reread in the cell's local temperature\nE_g: physical-energy group edge\nk_B·T_e: electron thermal energy",
+      "\\kappa_c/T_c^{5/2}": "κ_c/T_c^{5/2}: Spitzer prefactor extracted from the cell conductivity",
+      "r": "r: group-mfp scaling parameter (Brodrick notation; the adopted mfp is equivalent to r=2)",
       "\\mathbf q_{SH}=-\\kappa_{SH}\\nabla T_e": "q_SH: SH heat flux\nκ_SH: SH conductivity\n∇T_e: electron temperature gradient (Fourier law)",
       "\\nu_{ei}\\propto v^{-3}": "ν_ei: electron–ion collision frequency\nv: electron speed",
       "\\nu\\propto v^{-3}": "ν: collision frequency\nv: electron speed",
@@ -839,6 +872,7 @@
       "(r,b)": "r: radius\nb: impact parameter",
       "1/\\sqrt{1-\\hat n}": "n̂: normalized density\n(path stretch near critical)",
       "10^{-4}": "refractive-floor default (eps_n)",
+      "O(|\\nabla\\hat n|\\,|\\Delta(\\Delta s)|)": "truncation-error scale — density gradient × change in step size",
       "A=1-\\exp[-(32/15)C\\ell\\cos^5\\theta]": "A: round-trip absorption\nC: IB coefficient scale\nℓ: profile thickness\nθ: incidence angle",
       "B=n_{\\rm refr}(r)r\\sin\\alpha": "B: Bouguer invariant\nn_refr: refractive index\nr: radius\nα: local ray angle",
       "B=n_{\\rm refr}(r)\\,r\\sin\\alpha": "B: Bouguer invariant\nn_refr: refractive index\nr: radius\nα: local ray angle",
@@ -878,7 +912,6 @@
       "\\rho,\\bar Z,T_e": "ρ: density\nZ̄: mean ionization\nT_e: electron temperature",
       "\\sqrt{\\varepsilon_n}": "ε_n: index floor (its square root = residual index at critical)",
       "\\sum\\Delta P=P_0-P_{\\rm final}": "ΔP: segment absorptions\nP_0: launch power\nP_final: exit power\n(telescoping identity)",
-      "\\sum\\Delta P=I_0-I_{\\rm final}": "ΔP: segment absorptions\nI_0: launch intensity\nI_final: exit intensity\n(telescoping identity)",
       "\\tau=C\\ell\\int_0^1\\hat n^2/\\sqrt{1-\\hat n}\\,d\\hat n=(16/15)C\\ell": "τ: one-way optical depth\nC: IB coefficient scale\nℓ: profile thickness\nn̂: normalized density",
       "\\theta": "θ: incidence angle",
       "\\theta_{\\rm beam}=\\tan^{-1}(1/2F)": "θ_beam: beam half-angle\nF: f-number",
@@ -975,7 +1008,9 @@
       "\\eta_{pol}=\\tfrac{f_{cbet}}{4}[1+(\\hat k_q\\cdot\\hat k_p)^2]": "η_pol: polarization average\nf_cbet: calibration factor\nk̂_q·k̂_p: crossing cosine",
       "\\gamma": "γ: uniform-slab gain coefficient",
       "\\hat I_B(x,m)": "Î_B: pump intensity\nx: record index\nm: section sample",
+      "\\hat n_e": "n̂_e: electron density normalized to critical",
       "\\hat n_e/(1-\\hat n_e)": "n̂_e: normalized density\n(gain density enhancement)",
+      "\\hat n_e=n_e/n_{crit}": "n̂_e: electron density normalized to critical\nn_e: electron number density\nn_crit: critical density",
       "\\hat w_A(x)": "ŵ_A: seed record's power weight\nx: record index",
       "\\langle P\\cdot pol\\rangle_\\varphi": "P: IAW response\npol: polarization factor\nφ: azimuth (averaged over)",
       "\\langle Z\\rangle T_e+3T_i=\\bar m_i c_a^2": "⟨Z⟩: mean charge\nT_e, T_i: temperatures\nm̄_i: mean ion mass\nc_a: acoustic speed",
@@ -1071,6 +1106,10 @@
       "f_E=\\texttt{explicit\\_source\\_limit}": "f_E: source dt fraction\nexplicit_source_limit: its namelist key",
       "f_s=": "f_s: capture density fraction n_e/n_c",
       "f_s=\\texttt{source\\_nc\\_fraction}=0.25": "f_s: capture fraction\nsource_nc_fraction: namelist key (default 0.25)",
+      "g": "g: normalized TPD/SRS threshold indicator (1 = threshold)",
+      "g\\le 1": "g: normalized threshold indicator (at or below threshold — η_eq = 0)",
+      "g>1": "g: normalized threshold indicator (above threshold)",
+      "1-e^{-a\\sqrt{g-1}}": "g: normalized threshold indicator\na: saturation coefficient\n(saturating equilibrium-efficiency form)",
       "i": "i: cell index",
       "m_i": "m_i: mass of cell i (not an ion mass)",
       "m_ie_{e,i}": "m_i: cell mass\ne_e,i: specific electron energy\n(product = energy reservoir)",
@@ -1120,7 +1159,8 @@
       "\\rho=n_i A m_p": "ρ: density\nn_i: ion number density\nA: mass number\nm_p: proton mass",
       "\\sigma=\\rho\\kappa": "σ: length opacity\nρ: density\nκ: mass opacity",
       "e": "e: specific internal energy",
-      "e=k_BT/[(\\gamma-1)Am_p]": "e: specific energy\nk_B·T: thermal energy\nγ: adiabatic index\nA·m_p: ion mass",
+      "e_i=k_BT_i/[(\\gamma-1)Am_p]": "e_i: ion specific energy\nk_B·T_i: thermal energy\nγ: adiabatic index\nA·m_p: ion mass",
+      "e_e=\\bar Z\\,k_BT_e/[(\\gamma-1)Am_p]": "e_e: electron specific energy\nZ̄: mean ionization\nk_B·T_e: thermal energy\nγ: adiabatic index\nA·m_p: ion mass",
       "e_e=10^6\\ldots10^{12}": "e_e: electron specific energy (validity span, erg/g)",
       "g=[E_{g-1},E_g)": "g: photon group\nE_g−1, E_g: its energy boundaries",
       "n_e=\\bar Z n_i": "n_e: electron density\nZ̄: mean ionization\nn_i: ion density",
@@ -1193,9 +1233,10 @@
     },
     "mpi": {
       "c=i\\,n_z+j": "c: linear cell id\ni: radial index\nn_z: axial cell count\nj: axial index",
-      "j+1": "j: axial index (+1 = upper stencil reach)",
-      "j-2": "j: axial index (−2 = lower stencil reach)",
-      "j-2\\ldots j+1": "j: axial index (−2…+1 = electron odd-even flux stencil reach)"
+      "j": "j: cell index",
+      "j+1": "j: cell index (+1 = upper stencil reach)",
+      "j-2": "j: cell index (−2 = lower stencil reach)",
+      "j-2\\ldots j+1": "j: cell index (−2…+1 = electron odd-even flux stencil reach)"
     },
     "verification": {
       "A=2.5": "A: mean mass number (2.5 = DT)",
@@ -1280,7 +1321,8 @@
       "t_{start}+X\\_every\\_s": "出力予定時刻の初期値",
       "t_{end}-t": "残り時間（終端への着地）",
       "\\infty": "∞: そのカーネルは Δt を制約しない",
-      "T^{5/2}": "T: 温度（Spitzer 伝導率の温度依存）"
+      "T^{5/2}": "T: 温度（Spitzer 伝導率の温度依存）",
+      "\\alpha": "α: Fleck 線形化の時間中心化パラメータ（既定 1、0.5 = Crank–Nicolson）"
     },
     "numerics-foundations": {
       "(\\rho,T)": "ρ: 密度\nT: 温度（テーブル参照点）",
@@ -1343,7 +1385,13 @@
       "s_{max}(s_{max}+1)\\Delta t_{exp}/2": "s_max: STS 段数上限\nΔt_exp: 陽的安定限界",
       "I_g(\\mathbf r,\\mathbf\\Omega,t)": "I_g: 群比強度\nr: 位置\nΩ: 方向\nt: 時間",
       "\\mathcal S_{\\mathrm{sca}}": "𝒮_sca: 散乱源（v1.0 ではゼロ）",
-      "1.3807\\times10^{-16}": "ケルビン系ボルツマン定数（本コードでは不使用）"
+      "1.3807\\times10^{-16}": "ケルビン系ボルツマン定数（本コードでは不使用）",
+      "S_i": "S_i: イオンの追加源（v1 では 0）",
+      "S_e": "S_e: 電子の追加源（v1 では 0）",
+      "E_{num.loss}": "E_num.loss: アルゴリズム限界による既知の喪失（記帳値）",
+      "E_{source}=E_{laser,in}+E_{Marshak,in}+E_{volume,in}+\\max(E_{solver},0)": "E_source: 物理的な流入の合計\n（レーザー入射・Marshak・体積源・ソルバ残差の正部）",
+      "E_{sink}=E_{laser,esc}+E_{rad,esc}+E_{num.loss}+E_{pdV}^{bdry}+\\max(-E_{solver},0)": "E_sink: 物理的な流出の合計\n（レーザー逸出・輻射逸出・数値喪失・境界 PdV・ソルバ残差の負部）",
+      "E_{artificial}=E_{floor}+\\max(E_{safety}-E_{floor},0)+E_{redist}": "E_artificial: 人工注入の合計\n（床・安全補正の床超過分・ALE 再分配）"
     },
     "nomenclature": {
       "|\\nabla E_g|/(\\sigma_{R,g}E_g)": "∇E_g: 群エネルギー勾配\nσ_R,g: ロスランド不透明度\nE_g: 群エネルギー\n（= FLD リミッタ引数）",
@@ -1371,7 +1419,10 @@
       "4a_{\\rm eV}T_e^3/C_{v,e}": "a_eV: 輻射定数\nT_e: 電子温度\nC_v,e: 電子熱容量\n（= 剛性比 β）",
       "M_{req}/M_{max}": "M_req: 要求サブサイクル数\nM_max: サブサイクル上限",
       "i": "i: セル添字",
-      "P(\\langle g\\rangle)": "P: IAW 応答\n⟨g⟩: 記録平均の離調"
+      "P(\\langle g\\rangle)": "P: IAW 応答\n⟨g⟩: 記録平均の離調",
+      "\\kappa": "κ: 文脈依存 — 質量不透明度・電子熱伝導率（κ_IB = IB 吸収係数）",
+      "\\kappa\\propto T_e^{5/2}": "κ: 電子熱伝導率\nT_e: 電子温度\n（Spitzer スケーリング）",
+      "\\kappa_{\\rm IB}": "κ_IB: 逆制動放射の吸収係数（レーザー）"
     },
     "hydrodynamics": {
       "(\\rho,e,P,T)": "ρ: 密度\ne: 比エネルギー\nP: 圧力\nT: 温度",
@@ -1406,7 +1457,8 @@
       "u^h": "u^h: 半ステップの節点速度",
       "x^h": "x^h: 半ステップの節点位置",
       "x^h,u^h": "x^h: 半ステップ位置\nu^h: 半ステップ速度",
-      "x^{n+1,*},u^{n+1,*}": "x^n+1,*: 仮の位置\nu^n+1,*: 仮の速度（補正前）"
+      "x^{n+1,*},u^{n+1,*}": "x^n+1,*: 仮の位置\nu^n+1,*: 仮の速度（補正前）",
+      "U_c": "U_c: セルの示量的内部エネルギー [erg]"
     },
     "mesh-1d": {
       "A(r)": "A(r): 半径 r での面面積測度",
@@ -1427,7 +1479,8 @@
       "j=0,\\ldots,N": "j: 節点添字（N+1 個）",
       "m_{\\rm sg}": "m_sg: super-Gaussian グレーディングの指数（sg_order）",
       "n_s": "n_s: セグメントのセル数",
-      "0.028\\,\\mathrm{g\\,cm^{-3}}": "351 nm の CH 臨界質量密度（完全電離仮定）"
+      "0.028\\,\\mathrm{g\\,cm^{-3}}": "351 nm の CH 臨界質量密度（完全電離仮定）",
+      "r=0": "r=0: 原点（球・円筒の中心）"
     },
     "mesh-2d": {
       "(N_r+1)(N_z+1)": "N_r, N_z: セル数（節点数 = 各 +1 の積）",
@@ -1480,9 +1533,19 @@
       "q_K=K_c^{diag}/V_c": "q_K: 運動エネルギー密度\nK_c^diag: セル運動エネルギー\nV_c: セル体積",
       "q_c=1": "q_c: セル品質（1 = 完全平行四辺形）",
       "w_\\theta": "w_θ: 極方向行間隔の正則化重み",
-      "z": "z: 軸座標"
+      "z": "z: 軸座標",
+      "N_v": "N_v: 節点総数",
+      "|P_f|": "|P_f|: 掃過多角形の回転体体積（= ΔV_f）",
+      "\\Delta V_f": "ΔV_f: 面の符号付き掃過体積",
+      "F_{i\\pm1/2}": "F_i±1/2: セル i の両面を通る保存量流束",
+      "K_c^{remap,*}": "K_c^remap,*: リマップで運んだセル運動エネルギー",
+      "i": "i: セル添字"
     },
     "radiation-fld": {
+      "J^\\pm=cE/4\\pm F/2": "J^±: 境界の半区間流束（+ 流出側 / − 入射側）\ncE/4: 等方場の半区間放出\nF: 正味流束",
+      "J^-=0": "J^−: 入射側の半区間流束（真空条件で 0）",
+      "F=cE/2": "F: 真空面の正味流出流束（半区間放出 cE/4 の 2 倍）",
+      "\\sigma_{a,c,g}": "σ_a,c,g: セル・群の吸収不透明度（方程式の σ^PA と同じ量）",
       "cE_g": "c·E_g: 光速 × 群輻射エネルギー密度（流束の因果上限）",
       "f": "f: Fleck 因子 (1+αβcΔtσ)^-1",
       "R": "R: リミッタ引数 |∇E_g|/(σ_R·E_g)",
@@ -1603,9 +1666,20 @@
       "|r_k^{\\rm inner}-r_{k-1}^{\\rm inner}|\\le10^{-6}\\max(|r_k^{\\rm inner}|,|r_{k-1}^{\\rm inner}|,10^{-300})": "r_k^inner: パス k の内側残差\n（停滞受理テスト）",
       "\\varepsilon_2\\le10^{-6}": "ε_2: 相対 L2 差分（グレイ縮約ゲート）",
       "\\sum_gE_g": "E_g: 群エネルギー（群について総和）",
-      "\\sum_gF_{z,g}": "F_z,g: 群の軸流束（群について総和）"
+      "\\sum_gF_{z,g}": "F_z,g: 群の軸流束（群について総和）",
+      "L": "L: 円筒積求積のレベル数",
+      "\\mu^{face}_m": "μ^face_m: 当該面の法線方向の余弦成分",
+      "\\mu_{R,m}": "μ_R,m: 方向 m の動径余弦",
+      "\\mu_{Z,m}": "μ_Z,m: 方向 m の軸余弦",
+      "\\psi^{face}_{m,g}": "ψ^face_m,g: 掃引で得た面上の角度強度",
+      "\\sigma_s\\phi/2": "σ_s: 散乱不透明度\nφ: スカラー束\n（等方散乱源 — v1.0 生産では 0）",
+      "T_{floor}": "T_floor: 設定した温度下限"
     },
     "conduction": {
+      "E_g": "E_g: 物理エネルギーへ写した SNB 群境界 [erg]",
+      "\\beta_g=E_g/(k_BT_e)": "β_g: 群境界をセルの局所温度で読み替えた規格化エネルギー\nE_g: 物理エネルギーの群境界\nk_B·T_e: 電子熱エネルギー",
+      "\\kappa_c/T_c^{5/2}": "κ_c/T_c^{5/2}: セルの伝導率から抽出した Spitzer 前置因子",
+      "r": "r: 群平均自由行程の縮尺パラメータ（Brodrick らの整理。採用した mfp は r=2 と等価）",
       "\\mathbf q_{SH}=-\\kappa_{SH}\\nabla T_e": "q_SH: SH 熱流束\nκ_SH: SH 伝導率\n∇T_e: 電子温度勾配（フーリエ則）",
       "\\nu_{ei}\\propto v^{-3}": "ν_ei: 電子–イオン衝突周波数\nv: 電子速度",
       "\\nu\\propto v^{-3}": "ν: 衝突周波数\nv: 電子速度",
@@ -1687,6 +1761,7 @@
       "(r,b)": "r: 半径\nb: 衝突径数",
       "1/\\sqrt{1-\\hat n}": "n̂: 規格化密度\n（臨界近傍の光路伸長）",
       "10^{-4}": "屈折率床の既定値（eps_n）",
+      "O(|\\nabla\\hat n|\\,|\\Delta(\\Delta s)|)": "打ち切り誤差の規模 — 密度勾配 × 刻み幅の変化量",
       "A=1-\\exp[-(32/15)C\\ell\\cos^5\\theta]": "A: 往復吸収率\nC: IB 係数スケール\nℓ: プロファイル厚\nθ: 入射角",
       "B=n_{\\rm refr}(r)r\\sin\\alpha": "B: Bouguer 不変量\nn_refr: 屈折率\nr: 半径\nα: 局所光線角",
       "B=n_{\\rm refr}(r)\\,r\\sin\\alpha": "B: Bouguer 不変量\nn_refr: 屈折率\nr: 半径\nα: 局所光線角",
@@ -1726,7 +1801,6 @@
       "\\rho,\\bar Z,T_e": "ρ: 密度\nZ̄: 平均電離度\nT_e: 電子温度",
       "\\sqrt{\\varepsilon_n}": "ε_n: 屈折率床（平方根 = 臨界での残存屈折率）",
       "\\sum\\Delta P=P_0-P_{\\rm final}": "ΔP: 区間吸収\nP_0: 発射パワー\nP_final: 出口パワー\n（テレスコープ恒等式）",
-      "\\sum\\Delta P=I_0-I_{\\rm final}": "ΔP: 区間吸収\nI_0: 発射強度\nI_final: 出口強度\n（テレスコープ恒等式）",
       "\\tau=C\\ell\\int_0^1\\hat n^2/\\sqrt{1-\\hat n}\\,d\\hat n=(16/15)C\\ell": "τ: 片道光学的厚さ\nC: IB 係数スケール\nℓ: プロファイル厚\nn̂: 規格化密度",
       "\\theta": "θ: 入射角",
       "\\theta_{\\rm beam}=\\tan^{-1}(1/2F)": "θ_beam: ビーム半角\nF: F ナンバー",
@@ -1823,7 +1897,9 @@
       "\\eta_{pol}=\\tfrac{f_{cbet}}{4}[1+(\\hat k_q\\cdot\\hat k_p)^2]": "η_pol: 偏光平均\nf_cbet: 較正係数\nk̂_q·k̂_p: 交差角余弦",
       "\\gamma": "γ: 一様スラブの利得係数",
       "\\hat I_B(x,m)": "Î_B: ポンプ強度\nx: 記録添字\nm: セクション標本",
+      "\\hat n_e": "n̂_e: 臨界密度で規格化した電子密度",
       "\\hat n_e/(1-\\hat n_e)": "n̂_e: 規格化密度\n（利得の密度増強因子）",
+      "\\hat n_e=n_e/n_{crit}": "n̂_e: 臨界密度で規格化した電子密度\nn_e: 電子数密度\nn_crit: 臨界密度",
       "\\hat w_A(x)": "ŵ_A: シード記録のパワー重み\nx: 記録添字",
       "\\langle P\\cdot pol\\rangle_\\varphi": "P: IAW 応答\npol: 偏光因子\nφ: 方位角（で平均）",
       "\\langle Z\\rangle T_e+3T_i=\\bar m_i c_a^2": "⟨Z⟩: 平均電荷\nT_e, T_i: 温度\nm̄_i: 平均イオン質量\nc_a: 音速",
@@ -1919,6 +1995,10 @@
       "f_E=\\texttt{explicit\\_source\\_limit}": "f_E: ソース dt 割合\nexplicit_source_limit: その namelist キー",
       "f_s=": "f_s: 捕獲密度割合 n_e/n_c",
       "f_s=\\texttt{source\\_nc\\_fraction}=0.25": "f_s: 捕獲割合\nsource_nc_fraction: namelist キー（既定 0.25）",
+      "g": "g: TPD/SRS の規格化閾値指標（1 が閾値）",
+      "g\\le 1": "g: 規格化閾値指標（閾値以下 — η_eq = 0）",
+      "g>1": "g: 規格化閾値指標（閾値超過）",
+      "1-e^{-a\\sqrt{g-1}}": "g: 規格化閾値指標\na: 飽和係数\n（飽和形の平衡効率）",
       "i": "i: セル添字",
       "m_i": "m_i: セル i の質量（イオン質量ではない）",
       "m_ie_{e,i}": "m_i: セル質量\ne_e,i: 比電子エネルギー\n（積 = エネルギー貯蔵量）",
@@ -1968,7 +2048,8 @@
       "\\rho=n_i A m_p": "ρ: 密度\nn_i: イオン数密度\nA: 質量数\nm_p: 陽子質量",
       "\\sigma=\\rho\\kappa": "σ: 長さ不透明度\nρ: 密度\nκ: 質量不透明度",
       "e": "e: 比内部エネルギー",
-      "e=k_BT/[(\\gamma-1)Am_p]": "e: 比エネルギー\nk_B·T: 熱エネルギー\nγ: 断熱指数\nA·m_p: イオン質量",
+      "e_i=k_BT_i/[(\\gamma-1)Am_p]": "e_i: イオンの比エネルギー\nk_B·T_i: 熱エネルギー\nγ: 断熱指数\nA·m_p: イオン質量",
+      "e_e=\\bar Z\\,k_BT_e/[(\\gamma-1)Am_p]": "e_e: 電子の比エネルギー\nZ̄: 平均電離度\nk_B·T_e: 熱エネルギー\nγ: 断熱指数\nA·m_p: イオン質量",
       "e_e=10^6\\ldots10^{12}": "e_e: 電子比エネルギー（妥当範囲、erg/g）",
       "g=[E_{g-1},E_g)": "g: 光子群\nE_g−1, E_g: その両端エネルギー",
       "n_e=\\bar Z n_i": "n_e: 電子密度\nZ̄: 平均電離度\nn_i: イオン密度",
@@ -2041,9 +2122,10 @@
     },
     "mpi": {
       "c=i\\,n_z+j": "c: 線形セル id\ni: 動径添字\nn_z: 軸セル数\nj: 軸添字",
-      "j+1": "j: 軸添字（+1 = ステンシルの上側到達）",
-      "j-2": "j: 軸添字（−2 = ステンシルの下側到達）",
-      "j-2\\ldots j+1": "j: 軸添字（−2…+1 = 電子奇偶流束ステンシルの到達）"
+      "j": "j: セル添字",
+      "j+1": "j: セル添字（+1 = ステンシルの上側到達）",
+      "j-2": "j: セル添字（−2 = ステンシルの下側到達）",
+      "j-2\\ldots j+1": "j: セル添字（−2…+1 = 電子奇偶流束ステンシルの到達）"
     },
     "verification": {
       "A=2.5": "A: 平均質量数（2.5 = DT）",

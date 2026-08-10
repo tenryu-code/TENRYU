@@ -12,7 +12,7 @@
   <main>
     <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
     <h1>輻射輸送: S<sub>N</sub> <span class="badge">reference</span></h1>
-    <p class="abstract">TENRYU の \(S_N\) ソルバは、1D — 既定は球対称で、<code>Mesh.geometry_1d</code> の平面・円筒測度にも対応する（円筒は \(n=2L^2\) 本の積求積）— と 2D 軸対称 RZ を対象とする決定論的な離散座標法の輻射輸送である。光子エネルギー群ごとに有限個の方向を追跡し、方向別の放射強度からセルのエネルギーと面の流束を構成する。光学的に薄い領域、自由飛行、強い異方性が効く場面で <a href="fld.html">多群 FLD</a> を補完するが、方向数に比例する掃引と源反復のコストを要する。</p>
+    <p class="abstract">TENRYU の \(S_N\) ソルバは、1D — 既定は球対称で、<code>Mesh.geometry_1d</code> の平面・円筒測度にも対応する（円筒はレベル数 \(L\) の積求積で \(n=2L^2\) 本）— と 2D 軸対称 RZ を対象とする決定論的な離散座標法の輻射輸送である。光子エネルギー群ごとに有限個の方向を追跡し、方向別の放射強度からセルのエネルギーと面の流束を構成する。光学的に薄い領域、自由飛行、強い異方性が効く場面で <a href="fld.html">多群 FLD</a> を補完するが、方向数に比例する掃引と源反復のコストを要する。</p>
 
     <aside class="planned" aria-labelledby="at-a-glance">
       <h3 id="at-a-glance">要点</h3>
@@ -44,7 +44,7 @@
       $$
       F^{SN}_{f,g}=\sum_m w_m\,\mu^{face}_m\,\psi^{face}_{m,g}
       $$
-      <p>である。符号の大域的な規約は、R 面では \(+R\)、Z 面では \(+Z\) 向きを正とする。セルのモーメントと面のモーメントを別々の近似から作らないことが、輸送の更新と逸出の台帳を同じ離散輸送に結び付ける。</p>
+      <p>である。\(\mu^{face}_m\) は当該面の法線方向の余弦成分（R 面では \(\mu_{R,m}\)、Z 面では \(\mu_{Z,m}\)）、\(\psi^{face}_{m,g}\) は掃引で得た面上の角度強度である。符号の大域的な規約は、R 面では \(+R\)、Z 面では \(+Z\) 向きを正とする。セルのモーメントと面のモーメントを別々の近似から作らないことが、輸送の更新と逸出の台帳を同じ離散輸送に結び付ける。</p>
       <ul>
         <li>\(\{\boldsymbol\mu_m,w_m\}\) は角度求積の方向余弦と積分重みである。1D 球対称では偶数次数のガウス–ルジャンドル集合を使い、実運用の既定は \(S_{16}\) である。2D RZ では直積型の level-symmetric 集合を使う。重みは角度測度に規格化されており、1D のガウス–ルジャンドル集合の総和は \(\int_{-1}^{1}d\mu=2\)（方位角の積分は \(\psi\) に畳み込み）なので、\(\sum_{\mu_m&gt;0}w_m\mu_m=1/2\) が成り立つ — この半範囲モーメントが、<a href="#boundaries-choice">下の Marshak 規格化</a>の係数 2 の根拠である。</li>
         <li>\(\phi_{c,g}=\sum_mw_m\psi_{c,g,m}\) は 0 次の角度モーメント、すなわちスカラー束であり、\(E_{c,g}=\phi_{c,g}/c\) がセルに保持する群ごとの輻射エネルギー密度である。</li>
@@ -78,7 +78,7 @@
         <li><p><strong>群と方向ごとに掃引する。</strong> 方向ごとの後退オイラー式へ、<code>sn_psi_prev</code> に保持した過渡源、輸送項、同時刻の消衰、1 反復遅れの等方散乱、物質からの放出をまとめて入れる。実運用の線形特性経路では、各上流状態から一定源の指数減衰を積分する。セル平均と下流側の面の状態は方向ごとの専用作業領域へ書き込み、方向間で加算が競合しないようにする。</p></li>
         <li><p><strong>角度モーメントを決定論的に縮約する。</strong> 全方向の掃引を終えたあと、専用作業領域を方向番号の昇順で加算し、\(\phi\)、\(P_{rr}\)（角度 2 次モーメントの rr 成分 — 診断用に保持する輻射圧モーメント）、R/Z の面ごとに一意な流束を作る。方向レベルの並列性を使いながら、従来の逐次方向での加算順序をビット単位で保つ。</p></li>
         <li><p><strong>保存型の輸送を適用する。</strong> 面ごとに一意なモーメントを、上の有限体積の流束発散式へ入れる。2 段階のドナー \(\theta\) 構成では、第 1 段で各供給セルを蓄積エネルギーによって制限し、第 2 段では、上流の供給セルが第 1 段で実際に渡せる流入分だけを利用可能量へ加える。最後に、各面流束を上流の供給セルの係数で 1 回だけ縮小する。輸送だけの状態 \(E_g^{*,flux}\) には下限を課さず、制限後の流束は面ごとに 1 値のままなので、内部面の寄与は相殺する。</p></li>
-        <li><p><strong>同時刻の散乱を収束させる。</strong> 物質状態を固定したとき、内側反復の未知量はスカラー束 \(\phi_{c,g}\) である：等方源は \(\phi\) を必要とする一方、\(\phi\) はその源で掃引した後にしか分からない。源反復はこの循環を純粋な代入で閉じる — 各回は 1 反復遅れの源に対して全方向を厳密に解き、新しい \(\phi\) から源を作り直す — そして反復間のスカラー束の相対変化が <code>inner_tol</code>（既定 <code>1e-6</code>）を満たしたら停止する。群ごとの拡散合成加速（DSA）は任意であり、高次の面流束を置き換えることなく、源反復の誤差を加速的に減らす。</p></li>
+        <li><p><strong>同時刻の散乱を収束させる。</strong> 物質状態を固定したとき、内側反復の未知量はスカラー束 \(\phi_{c,g}\) である：等方源は \(\phi\) を必要とする一方、\(\phi\) はその源で掃引した後にしか分からない。この等方源の実体は物理散乱の \(\sigma_s\phi/2\) であり、散乱を持つ構成のための機構である。散乱ゼロの v1.0 生産構成では源は恒等的に消え、内側反復が実際に担うのは反射境界での角度閉包の伝搬である。源反復はこの循環を純粋な代入で閉じる — 各回は 1 反復遅れの源に対して全方向を厳密に解き、新しい \(\phi\) から源を作り直す — そして反復間のスカラー束の相対変化が <code>inner_tol</code>（既定 <code>1e-6</code>）を満たしたら停止する。群ごとの拡散合成加速（DSA）は任意であり、高次の面流束を置き換えることなく、源反復の誤差を加速的に減らす。</p></li>
         <li>
           <p><strong>外側ピカール反復で物質を閉じる。</strong> 純粋な <code>sn_transport</code> では \(f=1\) とし、吸収と沈着には素の \(\sigma^{PA}_g\)、放出には \(\sigma^{PE}_g\) を使って、セル局所の能動集合による収支</p>
           $$
@@ -91,7 +91,7 @@
           r_k=\max_c\frac{|T^{k+1}_{e,c}-T^k_{e,c}|}
           {\max(T^{k+1}_{e,c},T_{floor})}
           $$
-          <p>を \(r_{\rm tol}=\max(\texttt{outer_tol},10\,\texttt{outer_tol_hydro_error_scale})\)（既定値は \(10^{-4}\) と \(10^{-5}\)）と比較する。<code>max_outer_iterations</code> の既定値は 20 である。つまり外側反復の未知量は \(T_e\)（それに乗って \(b_g\) と不透明度も動く）であり、内側と同じく緩和なしのピカール代入である。各外側反復は同じ段入口状態 — \(\psi^n\)（<code>sn_psi_prev</code>）による過渡源と、\(e_e(\rho,T_e^n)\) に係留した物質収支 — から輸送を解き直すため、前の結果へ積み増すのではなく反復値を置き換える。\(r_{\rm tol}\) に達しないまま上限を使い切った場合は最終反復の結果を採用し、<code>sn_converged</code> は false のまま残る。2D RZ では、内側残差の停滞判定が 3 回連続で \(|r_k^{\rm inner}-r_{k-1}^{\rm inner}|\le10^{-6}\max(|r_k^{\rm inner}|,|r_{k-1}^{\rm inner}|,10^{-300})\) を満たした時点で、同じ入力に対する冗長な掃引を打ち切る。この打ち切りは <code>sn_outer_stagnated=true</code> として記録し、<code>inner_tol</code> に達していなければ <code>sn_converged=false</code> のままにする — これらは実行ログの警告とドライバ診断に現れる内部ソルバ状態のフラグであり、namelist のキーでも出力データセットでもない。</p>
+          <p>を \(r_{\rm tol}=\max(\texttt{outer_tol},10\,\texttt{outer_tol_hydro_error_scale})\)（既定値は \(10^{-4}\) と \(10^{-5}\)）と比較する（\(T_{floor}\) は設定した温度下限）。<code>outer_tol_hydro_error_scale</code>（既定 <code>1e-5</code>）は演算子分割の流体側の時間積分誤差の水準を表す設定で、これより厳しい収束要求は意味を持たないため、その 10 倍を許容値の床とする。<code>max_outer_iterations</code> の既定値は 20 である。つまり外側反復の未知量は \(T_e\)（それに乗って \(b_g\) と不透明度も動く）であり、内側と同じく緩和なしのピカール代入である。各外側反復は同じ段入口状態 — \(\psi^n\)（<code>sn_psi_prev</code>）による過渡源と、\(e_e(\rho,T_e^n)\) に係留した物質収支 — から輸送を解き直すため、前の結果へ積み増すのではなく反復値を置き換える。\(r_{\rm tol}\) に達しないまま上限を使い切った場合は最終反復の結果を採用し、<code>sn_converged</code> は false のまま残る。2D RZ では、連続する外側反復それぞれの最終内側残差を比較し、相対変化が 3 回連続で \(10^{-6}\) 以下に留まった時点で、同じ入力に対する冗長な掃引を打ち切る。この打ち切りは <code>sn_outer_stagnated=true</code> として記録し、<code>inner_tol</code> に達していなければ <code>sn_converged=false</code> のままにする — これらは実行ログの警告とドライバ診断に現れる内部ソルバ状態のフラグであり、namelist のキーでも出力データセットでもない。</p>
         </li>
         <li><p><strong>輸送の台帳を閉じる。</strong> 収束した場から <code>rad_dep</code> \(=c\sigma^{PA}E_gV\Delta t\)、<code>rad_emit</code> \(=c\sigma^{PE}a_{\rm eV}T_e^4b_gV\Delta t\) を作る。境界からの逸出は、輸送の更新が使ったものと同じ \(\theta\) 制限済みの面配列から積分し、Marshak の流入は別に対応付ける。共有面が 1 値なので内部の発散は打ち消し合い、輻射と物質のやり取りと、離散化した境界積分だけが残る。</p></li>
       </ol>
@@ -124,6 +124,7 @@
           <tr><th><code>Radiation.sn_transport.spatial_scheme</code></th><td><code>"linear_characteristic"</code></td><td>実運用の線形特性掃引。<code>"diamond_difference"</code> は回帰確認用である。</td></tr>
           <tr><th><code>Radiation.sn_transport.max_outer_iterations</code></th><td><code>20</code></td><td>物質・不透明度のピカール反復の上限回数。</td></tr>
           <tr><th><code>Radiation.sn_transport.outer_tol</code></th><td><code>1e-4</code></td><td>電子温度に対するピカール残差の基本許容値。</td></tr>
+          <tr><th><code>Radiation.sn_transport.outer_tol_hydro_error_scale</code></th><td><code>1e-5</code></td><td>ピカール許容値の床を与える流体時間誤差スケール。</td></tr>
           <tr><th><code>Radiation.sn_transport.inner_tol</code></th><td><code>1e-6</code></td><td>スカラー束の源反復に対する許容値。</td></tr>
           <tr><th><code>Radiation.sn_transport.boundary.inner_r / outer_r</code></th><td><code>"reflect_parity" / "vacuum"</code></td><td>軸のパリティと、外側 R 面の種別。</td></tr>
           <tr><th><code>Radiation.sn_transport.boundary.z / z_bottom / z_top</code></th><td><code>"vacuum"</code></td><td>2D RZ における Z 境界（共通指定または面別指定）。<code>reflect</code>、<code>marshak</code> も選べる。</td></tr>
@@ -137,8 +138,8 @@
         <li><code>test_r2_quadrature_sweep</code> は 2D RZ で 8/16/32 方向の段階列を実行し、32 方向の参照解へ向かう輻射エネルギーの単調なコーシー収束を判定する。</li>
         <li><code>test_sn_1d_s8_vs_s16_convergence</code> は <a href="../../verification/index.html#gxii">GXII</a> 相当の 1D 分布で、\(S_8\) と \(S_{16}\) のあいだの最大相対エネルギー差に \(<0.05\) を要求し、方向数を減らす性能上の選択肢に精度面の下限を課す。</li>
         <li><code>test_sn_face_flux_conservation</code> と <code>test_sn_2d_rz_step_total_energy_conservation</code> は、面流束が 1 値であること、有限体積の発散、輻射と物質のステップ収支が閉じることを検査する。2D のステップ全エネルギー恒等式は \(10^{-10}\) で判定する。<code>test_sn_2d_rz_bug25_escape_ledger</code> は、境界からの逸出と、離散化した境界面積分の一致を相対 \(10^{-12}\) で要求する。</li>
-        <li>I6 の恒久的な G1 検査 <code>test_sn_2d_rz_mg_grey_collapse</code> は、グレイ計算に対する \(\sum_gE_g\) と \(\sum_gF_{z,g}\) の双方に相対 L2 差 \(\varepsilon_2\le10^{-6}\) を要求する。\(G=8\)、実運用の <code>inner_tol=1e-6</code> では、エネルギーで \(4.5\times10^{-9}\)、\(F_z\) で \(3.0\times10^{-7}\) を実測した。<code>inner_tol</code> を \(10^{-12}\) にするとそれぞれ \(6.4\times10^{-15}\)、\(2.9\times10^{-13}\) まで戻り、機構の閉包に対する上限 \(10^{-12}\) を満たしている。連成条件での後続認証（I6 G2）がこの検査を拡張する。</li>
-        <li>R2 の Marshak 分布の比較は、独立な参照解に対して 0.15 を判定基準とし、実運用の \(S_{16}\) デッキでの実測値は \(7.94\times10^{-3}\) である。</li>
+        <li>2D RZ 受入ゲート I6 の恒久的な G1 検査（凍結輸送の恒等検査）<code>test_sn_2d_rz_mg_grey_collapse</code> は、グレイ計算に対する \(\sum_gE_g\) と \(\sum_gF_{z,g}\) の双方に相対 L2 差 \(\varepsilon_2\le10^{-6}\) を要求する。\(G=8\)、実運用の <code>inner_tol=1e-6</code> では、エネルギーで \(4.5\times10^{-9}\)、\(F_z\) で \(3.0\times10^{-7}\) を実測した。<code>inner_tol</code> を \(10^{-12}\) にするとそれぞれ \(6.4\times10^{-15}\)、\(2.9\times10^{-13}\) まで戻り、機構の閉包に対する上限 \(10^{-12}\) を満たしている。連成条件での後続認証（I6 G2）がこの検査を拡張する。</li>
+        <li>2D RZ 検証ラダーの R2 段による Marshak 分布の比較は、独立な参照解に対して 0.15 を判定基準とし、実運用の \(S_{16}\) デッキでの実測値は \(7.94\times10^{-3}\) である。</li>
       </ul>
     </section>
 
