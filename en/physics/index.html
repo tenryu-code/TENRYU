@@ -12,7 +12,7 @@
   <main>
     <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
     <h1>Physics kernels</h1>
-    <p class="abstract">Each kernel page documents the physical model, the discretization actually implemented, the namelist controls, and the verification that gates it. “Kernel” here means a documented operator page: nine physics operators plus the mesh-generation and MPI-decomposition infrastructure they run on. The catalog below follows the operator ordering of a time step.</p>
+    <p class="abstract">Each kernel page documents the physical model, the discretization actually implemented, the namelist controls, and the verification that gates it. “Kernel” here means a documented operator page: nine physics operators plus the mesh-generation and MPI-decomposition infrastructure they run on. The default execution order within a step is laser (nuclear burn immediately after it) → hydro half-step → electron conduction → radiation → hydro half-step, with the ALE rezone/remap entering conditionally after the second hydro half-step. The catalog below orders the physics kernels for ease of learning.</p>
     <div class="card-grid physics-grid">
       <a class="card" href="hydrodynamics.html"><h3>Lagrangian hydrodynamics</h3><p>Compatible staggered hydrodynamics, time integration, and shock capturing.</p></a>
       <a class="card" href="mesh/index.html"><h3>Meshes &amp; geometry</h3><p>1D zoning and regions, 2D RZ mesh families, and ALE rezoning and remap.</p></a>

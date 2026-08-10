@@ -61,7 +61,7 @@
       \rho\frac{De_e}{Dt}=-P_e\nabla\!\cdot\mathbf u
       -\nabla\!\cdot\mathbf q_e-Q_{ei}+S_e+S_L+S_r.
       $$
-      <p>\(\mathbf q_e\) is the electron heat flux, \(S_L\) the laser deposition, and \(S_r\) the radiation exchange. Sign convention: \(Q_{ei}&gt;0\) means energy flowing from electrons to ions, i.e. ion heating. The same \(Q_{ei}\) appears in both equations with opposite signs, so in-cell exchange alone never changes the total matter energy.</p>
+      <p>\(\mathbf q_e\) is the electron heat flux, \(S_L\) the laser deposition, and \(S_r\) the radiation exchange. \(S_i\) and \(S_e\) are the remaining additional sources, placeholders fixed at zero in v1 (nuclear burn deposits directly as an independent operator stage, and hot electrons deposit directly through the laser source path). Sign convention: \(Q_{ei}&gt;0\) means energy flowing from electrons to ions, i.e. ion heating. The same \(Q_{ei}\) appears in both equations with opposite signs, so in-cell exchange alone never changes the total matter energy.</p>
 
       <h3 id="qei">Electron–ion relaxation \(Q_{ei}\)</h3>
       <p>The exchange term at the heart of the two-temperature model closes with Spitzer–Braginskii collisional relaxation:</p>
@@ -167,13 +167,13 @@
       -E_{pdV}^{bdry}-E_{num.loss}
       +E_{floor}+E_{safety}+E_{redist}+E_{solver}.
       $$
-      <p>The left side sums the electron-internal, ion-internal, kinetic, and radiation-field energy changes. The first half of the right side is the physical traffic (laser incident and unabsorbed, Marshak injection, radiation escape, boundary PdV work, numerical loss); the last four terms are artificial injections — floor corrections, the conduction safety correction, unresolved ALE redistribution, and the implicit-solver residual. The artificial terms are accumulated separately from the physical sources, and the conservation error</p>
+      <p>The left side sums the electron-internal, ion-internal, kinetic, and radiation-field energy changes. The first half of the right side is the physical traffic (laser incident and unabsorbed, Marshak injection, radiation escape, boundary PdV work, numerical loss); the last four terms are artificial injections — floor corrections, the conduction safety correction, unresolved ALE redistribution, and the implicit-solver residual. \(E_{num.loss}\) is energy that leaves the system through algorithmic limitations and is booked as a loss (for example, the amount removed by the SNB flux-cap treatment); unlike the artificial corrections that inject energy — floors and safety valves — it is counted on the physical-traffic side as a known outflow. The artificial terms are accumulated separately from the physical sources, and the conservation error</p>
       $$
       \varepsilon_{budget}=\frac{\bigl|(\Delta E_{total}-E_{artificial})-(E_{source}-E_{sink})\bigr|}{E_{denom}},
       \qquad
       E_{denom}=\max\bigl(E_{total}^{\,n},\,E_{source},\,10^{-20}\ \mathrm{erg}\bigr)
       $$
-      <p>excludes them from its numerator. \(\varepsilon_{budget}\) therefore measures physical conservation violation, while the artificial fractions (\(E_{floor}/E_{denom}\) etc.) are monitored independently to detect numerical safety machinery dominating a result. The denominator floor prevents division by zero and false FATALs on cold starts (total energy ≈ 0).</p>
+      <p>excludes them from its numerator. Here \(E_{source}=E_{laser,in}+E_{Marshak,in}+E_{volume,in}+\max(E_{solver},0)\), \(E_{sink}=E_{laser,esc}+E_{rad,esc}+E_{num.loss}+E_{pdV}^{bdry}+\max(-E_{solver},0)\), and \(E_{artificial}=E_{floor}+\max(E_{safety}-E_{floor},0)+E_{redist}\). The solver residual, listed on the artificial side of the identity above, is booked here as a source or a sink according to its sign, and the safety correction enters the artificial group only net of its overlap with the floor correction. \(\varepsilon_{budget}\) therefore measures physical conservation violation, while the artificial fractions (\(E_{floor}/E_{denom}\) etc.) are monitored independently to detect numerical safety machinery dominating a result. The denominator floor prevents division by zero and false FATALs on cold starts (total energy ≈ 0).</p>
       <p>All of these terms appear verbatim in the history's <code>energy/</code> group — <code>laser_incident</code>, <code>marshak_in</code>, <code>radiation_escaped</code>, <code>pdv_boundary</code>, <code>floor_injected</code>, <code>safety_injected</code>, <code>conservation_error</code>, and the rest (full enumeration on <a href="../use/outputs.html">Outputs &amp; analysis</a>). Reading guide: when \(\varepsilon_{budget}\) jumps, look at the artificial fractions first. If they dominate, chase the floor/clamp source (which operator; the <code>clamp_count</code> trend); otherwise question the boundary and source attribution (absorption, escapes).</p>
     </section>
 

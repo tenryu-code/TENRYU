@@ -54,7 +54,7 @@
 
 # 3. inspect the results (location set by the deck's Output(directory=...))
 ls outputs/template_1d_slab_radiation/results/</code></pre>
-      <p>If step 3 shows snapshots like <code>&lt;name&gt;_0000.h5</code> next to <code>&lt;name&gt;_history.h5</code>, the run completed. While running, the console (and <code>log/</code>) shows step progress and output events like <code>[output] wrote snapshot (step=…, …)</code>. The fastest way to look at the data is the bundled tool:</p>
+      <p>If step 3 shows snapshots like <code>&lt;name&gt;_0000.h5</code> next to <code>&lt;name&gt;_history.h5</code>, the run completed. While running, the console (and <code>log/</code> under the output directory <code>outputs/&lt;name&gt;/</code>) shows step progress and output events like <code>[output] wrote snapshot (step=…, …)</code>. The fastest way to look at the data is the bundled tool:</p>
       <pre><code>python3 -m tools.tenryu_plot profile outputs/template_1d_slab_radiation   # spatial profiles
 python3 -m tools.tenryu_plot history outputs/template_1d_slab_radiation   # time series</code></pre>
       <table class="quick-facts">
@@ -112,7 +112,7 @@ Diagnostics(enabled=True, every=1)</code></pre>
       <ul>
         <li><strong>Units are always cgs + eV.</strong> Length cm, time s, density g/cm³, temperature eV. To write in µm, define <code>um = 1.0e-4</code> yourself and convert. Only keys whose names state a unit (<code>wavelength_nm</code>, …) are exceptions.</li>
         <li><strong>Spatial profiles and time waveforms are functions.</strong> <code>Geometry.rho</code>/<code>Te</code>/<code>Ti</code>/<code>volfrac</code> are vector-evaluated once over cell-center coordinates, laser powers and Marshak temperatures once over time, and frozen into tables. A deck that relies on mutable external state or per-step re-evaluation is incorrect.</li>
-        <li><strong>Unwritten keys take defaults.</strong> The canonical defaults are <code>docs/SPECIFICATION.md</code> §9.1. When unsure, leave the key out and confirm effective values in the validate summary and <code>config/*_frozen.json</code>.</li>
+        <li><strong>Unwritten keys take defaults.</strong> The canonical defaults are <code>docs/SPECIFICATION.md</code> §9.1. When unsure, leave the key out and confirm effective values in the validate summary and <code>config/*_frozen.json</code> in the output directory.</li>
         <li><strong>Typos stop the run.</strong> Unknown blocks or keys, numbers where strings belong, negative cell counts, and combinations unsupported in the chosen dimension are a <code>ConfigError</code>, never silently ignored. When a "did you mean …?" suggestion appears, apply it.</li>
         <li><strong>Add physics one piece at a time.</strong> The opt-in packages (CBET, hot electrons, SNB, viscosity, burn, …) are contractually inert unless written. Bring a new deck up first on a small mesh with a short <code>t_end</code>, then raise the resolution and output cadence to production values.</li>
       </ul>

@@ -30,6 +30,11 @@
       </ul>
     </aside>
 
+    <section aria-labelledby="obtain-launch">
+      <h2 id="obtain-launch">入手と起動</h2>
+      <p>Studio はリポジトリの <code>gui/</code> ディレクトリに含まれる（単体配布はしていない）。Web コアは純 Web 構成であり、開発起動は <code>gui/</code> で <code>npm install</code> を済ませたうえで、<code>npm run bridge</code>（ローカル実行ブリッジ）と <code>npm run dev</code>（Vite 開発サーバ、<code>http://localhost:5173</code>）を並走させてブラウザから開く。Mac ネイティブアプリ（Tauri シェル）のビルドは Mac 上でのみ行える。手順の詳細はリポジトリの <code>gui/README.md</code> を参照のこと。</p>
+    </section>
+
     <section aria-labelledby="workflow">
       <h2 id="workflow">フォームから実行まで</h2>
       <p>Studio の左のナビゲーションは、プリセット、基本設定、材料、ジオメトリー、物理、駆動、出力を、設定する順に並べている。中央で選択中のフォームを編集すると、右のペインに常に最新の Python namelist が表示される。必須の値が欠けていたり、整合しない組合せがあったりする場合は、その場でエラーを示し、修正すると生成を再開する。これにより、長さは cm、時間は s、温度は eV、密度は g/cm³ という TENRYU の cgs + eV の規約を確認しながら入力できる。</p>

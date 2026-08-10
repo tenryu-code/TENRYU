@@ -30,6 +30,11 @@
       </ul>
     </aside>
 
+    <section aria-labelledby="obtain-launch">
+      <h2 id="obtain-launch">Obtaining and launching</h2>
+      <p>Studio ships inside the repository's <code>gui/</code> directory (there is no standalone distribution). The web core is pure web: for a development launch, run <code>npm install</code> in <code>gui/</code>, then run <code>npm run bridge</code> (the local execution bridge) and <code>npm run dev</code> (the Vite dev server, <code>http://localhost:5173</code>) side by side and open it in a browser. The Mac native app (the Tauri shell) can be built only on a Mac. See <code>gui/README.md</code> in the repository for the detailed procedure.</p>
+    </section>
+
     <section aria-labelledby="workflow">
       <h2 id="workflow">From form to run</h2>
       <p>Studio's left navigation follows the normal setup order: Presets, Basic, Materials, Geometry, Physics, Drive, and Output. The center pane contains the selected form, while the live deck in the right pane always shows the latest Python namelist. Missing required values or inconsistent combinations produce errors in place; deck generation resumes after they are corrected. This makes the TENRYU cgs + eV contract visible while editing: lengths are in cm, times in s, temperatures in eV, and densities in g/cm³.</p>

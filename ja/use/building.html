@@ -12,12 +12,12 @@
   <main>
     <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
     <h1>ビルド <span class="badge">reference</span></h1>
-    <p class="abstract">TENRYU は C++20 / CUDA C++ のコードを CMake と Ninja で構成し、CUDA 12.x のツールキットと sm_80 以降の NVIDIA GPU を対象にビルドする。このページでは、リリースビルドの作成、全体・対象限定・名前指定の 3 段階のテスト、MPI の有効化、そして ccache を使った反復ビルドまでを扱う。</p>
+    <p class="abstract">TENRYU は C++20 / CUDA C++ のコードを CMake と Ninja で構成し、CUDA 12.x のツールキットと NVIDIA GPU(既定 fatbin は sm_70/80/89/90、継続検証している実機は sm_80 以降)を対象にビルドする。このページでは、リリースビルドの作成、全体・対象限定・名前指定の 3 段階のテスト、MPI の有効化、そして ccache を使った反復ビルドまでを扱う。</p>
 
     <aside class="planned" aria-labelledby="at-a-glance">
       <h3 id="at-a-glance">要点</h3>
       <ul>
-        <li>必要なものは、CUDA 12.x のツールキット、CMake 3.25 以上、Ninja、そして sm_80 以降の NVIDIA GPU である。</li>
+        <li>必要なものは、CUDA 12.x のツールキット、CMake 3.25 以上、Ninja、そして NVIDIA GPU(検証済み実機は sm_80 以降)である。</li>
         <li>標準の手順は、<code>cmake</code> で <code>build/</code> を構成し、<code>ninja -C build</code> でコンパイルする 2 段階である。</li>
         <li>確認は、CTest の全実行、<code>-R</code> による対象限定の CTest、<code>tenryu verify</code> による名前指定の検証を、目的に応じて使い分ける。</li>
         <li>MPI は既定でオフである。複数ランク用のバイナリを作るには、構成時に <code>-DTENRYU_ENABLE_MPI=ON</code> を指定する。</li>
@@ -31,7 +31,7 @@
       <table class="quick-facts">
         <thead><tr><th>項目</th><th>要件</th><th>役割</th></tr></thead>
         <tbody>
-          <tr><th>GPU</th><td>NVIDIA 製、sm_80 以降</td><td>CUDA カーネルと検証の実行先である。</td></tr>
+          <tr><th>GPU</th><td>NVIDIA 製。既定 fatbin は sm_70;80;89;90、検証済み実機は sm_80 以降。</td><td>CUDA カーネルと検証の実行先である。</td></tr>
           <tr><th>CUDA ツールキット</th><td>12.x (12.0 以上)</td><td><code>nvcc</code>、CUDA のヘッダ、実行時ライブラリを提供する。</td></tr>
           <tr><th>CMake</th><td>3.25 以上</td><td>C++20 / CUDA のターゲット、依存関係、CTest を構成する。</td></tr>
           <tr><th>Ninja</th><td>利用できること</td><td>生成されたビルドの依存グラフを並列に実行する。</td></tr>
@@ -76,7 +76,7 @@ ctest --test-dir build -R &lt;pattern&gt;
           <tr><th>名前を指定した検証</th><td>特定の解析解、ベンチマーク、基準解との回帰。</td><td><code>&lt;name&gt;</code> を <code>sedov</code> や <code>gxii_1d_fld_regression</code> などに置き換える。</td></tr>
         </tbody>
       </table>
-      <p><code>-R</code> は部分一致なので、意図より広いテストの集合を選んでしまう可能性がある。実行対象を先に確かめたいときは CTest の一覧表示を使い、ログではスキップと合格を区別すること。GPU や任意の依存関係がないために実行されなかったテストは、合格したテストの代わりにはならない。</p>
+      <p><code>-R</code> は部分一致なので、意図より広いテストの集合を選んでしまう可能性がある。実行対象を先に確かめたいときは CTest の一覧表示(<code>ctest --test-dir build -N -R &lt;pattern&gt;</code>)を使い、ログではスキップと合格を区別すること。GPU や任意の依存関係がないために実行されなかったテストは、合格したテストの代わりにはならない。</p>
     </section>
 
     <section aria-labelledby="mpi-build">

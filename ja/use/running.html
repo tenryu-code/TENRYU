@@ -54,7 +54,7 @@
 
 # ③ 結果の確認（出力先はデッキの Output(directory=...) が決める）
 ls outputs/template_1d_slab_radiation/results/</code></pre>
-      <p>③ で <code>&lt;name&gt;_0000.h5</code> のようなスナップショットと <code>&lt;name&gt;_history.h5</code> が並んでいれば完走である。実行中はコンソール（と <code>log/</code>）にステップの進行と、<code>[output] wrote snapshot (step=…, …)</code> のような出力イベントの行が流れる。最短の可視化は付属ツールで足りる:</p>
+      <p>③ で <code>&lt;name&gt;_0000.h5</code> のようなスナップショットと <code>&lt;name&gt;_history.h5</code> が並んでいれば完走である。実行中はコンソール（と、出力先 <code>outputs/&lt;name&gt;/</code> 配下の <code>log/</code>）にステップの進行と、<code>[output] wrote snapshot (step=…, …)</code> のような出力イベントの行が流れる。最短の可視化は付属ツールで足りる:</p>
       <pre><code>python3 -m tools.tenryu_plot profile outputs/template_1d_slab_radiation   # 空間プロファイル
 python3 -m tools.tenryu_plot history outputs/template_1d_slab_radiation   # 時系列</code></pre>
       <table class="quick-facts">
@@ -112,7 +112,7 @@ Diagnostics(enabled=True, every=1)</code></pre>
       <ul>
         <li><strong>単位は常に cgs + eV。</strong>長さ cm・時間 s・密度 g/cm³・温度 eV。µm で書きたいときは <code>um = 1.0e-4</code> を自分で定義して換算する。名前が単位を明示するキー（<code>wavelength_nm</code> など）だけが例外である。</li>
         <li><strong>空間分布と時間波形は関数で与える。</strong><code>Geometry.rho</code>・<code>Te</code>・<code>Ti</code>・<code>volfrac</code> はセル中心座標に対して、レーザーパワーや Marshak 温度は時間に対して、初期化時に一度だけベクトル化評価され、凍結された表へ変換される。関数が外部状態を持ち続けることや、実行中に再評価されることを前提にしたデッキは正しくない。</li>
-        <li><strong>書かなかったキーは既定値になる。</strong>既定値の正典はリポジトリの <code>docs/SPECIFICATION.md</code> §9.1。迷ったら書かず、validate の要約と <code>config/*_frozen.json</code> で実効値を確認するのが安全である。</li>
+        <li><strong>書かなかったキーは既定値になる。</strong>既定値の正典はリポジトリの <code>docs/SPECIFICATION.md</code> §9.1。迷ったら書かず、validate の要約と出力先の <code>config/*_frozen.json</code> で実効値を確認するのが安全である。</li>
         <li><strong>打ち間違いはエラーで止まる。</strong>未知のブロックやキー、文字列を要求する場所への数値、負のセル数、選んだ次元では対応していない組合せは、黙って無視されず <code>ConfigError</code> になる。修正候補（did you mean …?）が出たらそのまま直す。</li>
         <li><strong>物理は 1 個ずつ足す。</strong>opt-in 群（CBET・ホット電子・SNB・粘性・燃焼など）は「書かなければ完全に不活性」という契約で実装されている。新しいデッキは、まず小さいメッシュと短い <code>t_end</code> で初期化と数ステップを確認し、そのあとで実運用の解像度と出力の間隔へ上げること。</li>
       </ul>

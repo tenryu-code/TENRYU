@@ -71,7 +71,7 @@
           <tr><th><code>x_r</code>, <code>x_z</code></th><td>節点座標 [cm]。<code>x_z</code> は 2D のみ。</td></tr>
           <tr><th><code>v_r</code>, <code>v_z</code></th><td>節点速度 [cm/s]。<code>v_z</code> は 2D のみ。</td></tr>
           <tr><th><code>cell_material_id</code></th><td>セルの代表材料インデックス（多材料セルは体積分率最大、同率なら小さい方）。</td></tr>
-          <tr><th><code>topology/v2/</code>・<code>v3/</code>・<code>v4/</code></th><td>optional。マルチブロックメッシュの接続（v2: 3 ブロック、v3: half-butterfly 5 ブロック — block/seam 表と CSR 接続、v4: 五角形帯の <code>cell_nverts</code> と <code>corner_stride</code> 属性）。単一ブロックでは省略。</td></tr>
+          <tr><th><code>topology/v2/</code>・<code>v3/</code>・<code>v4/</code></th><td>optional。マルチブロックメッシュの接続（v2: 3 ブロック、v3: half-butterfly 5 ブロック — block/seam 表と CSR 接続、v4: 五角形帯の <code>cell_nverts</code> と <code>corner_stride</code> 属性）。単一ブロックでは省略。構成の詳細は <a href="../physics/mesh/2d.html">2D メッシュ</a>参照。</td></tr>
         </tbody>
       </table>
 
@@ -89,7 +89,7 @@
           <tr><th><code>adaptive_av_gate</code>, <code>adaptive_av_mode_cell</code></th><td>optional。適応 AV のゲート履歴と可視化マスク（<code>adaptive_av.enabled=True</code> 時）。</td></tr>
           <tr><th><code>corner_mass</code></th><td>optional。2D のサブゾーンコーナー質量 [g]（ラグランジュ不変量）。</td></tr>
           <tr><th><code>eta_compatible</code></th><td>optional。旧 compatible 診断の体積差不整合 [cm³]。</td></tr>
-          <tr><th><code>per_material/v1/</code></th><td>optional。材料別保存の schema skeleton（<code>per_material_conservation_enabled=True</code> 時）。</td></tr>
+          <tr><th><code>per_material/v1/</code></th><td>optional。材料別保存の schema skeleton（<code>Numerics.materials.per_material_conservation_enabled=True</code> 時）。</td></tr>
         </tbody>
       </table>
 
@@ -125,8 +125,8 @@
           <tr><th><code>deposited_power</code></th><td>レーザー沈着パワー密度 [erg/cm³/s]。</td></tr>
           <tr><th><code>absorption_fraction</code></th><td>全体吸収率（absorbed/incident）。</td></tr>
           <tr><th><code>ray_density</code></th><td>レイ初期配置密度 [1/cm³]。</td></tr>
-          <tr><th><code>A_Q_r_shells</code>, <code>A_Q_z_shells</code></th><td>2D のみ。シェルごとの沈着非対称度 \((q_{max}-q_{min})/(q_{max}+q_{min})\)。</td></tr>
-          <tr><th><code>mesh/</code></th><td><code>ray_output_trajectory=True</code> の非 skip ステップのみ。LaserMesh の節点座標・\(\hat n_e\)・T_e・Z̄・密度勾配・<code>n_crit</code>。</td></tr>
+          <tr><th><code>A_Q_r_shells</code>, <code>A_Q_z_shells</code></th><td>2D のみ。シェル（r 添字固定の z 方向セル列/z 添字固定の r 方向セル列）ごとの沈着非対称度 \((q_{max}-q_{min})/(q_{max}+q_{min})\)。q は各セルにそのステップで沈着したレーザーエネルギー [erg]。</td></tr>
+          <tr><th><code>mesh/</code></th><td><code>ray_output_trajectory=True</code> の非 skip ステップ（= レイトレースを実行したステップ。<code>Laser.raytrace_skip</code> の間引き再利用ステップでは出力されない）のみ。レーザー専用の独立格子 LaserMesh（流体メッシュとは別の 2D RZ 構造格子 — <a href="../physics/laser.html">レーザー</a>参照）の節点座標・\(\hat n_e\)（電子密度の対臨界密度比）・T_e・Z̄・密度勾配・<code>n_crit</code>。</td></tr>
           <tr><th><code>rays/</code></th><td><code>ray_output_count&gt;0</code> の非 skip ステップのみ。レイの初期位置・方向・パワー（1D: R0/Z0/vR0/vZ0、2D: x0/y0/z0/vx0/vy0/vz0）とビーム ID。</td></tr>
           <tr><th><code>rays/trajectory/</code></th><td><code>ray_output_trajectory=True</code> 時。CSR 形式の軌跡（offsets・step_count・位置列・残存パワー列）。可視化のレイ重ね描きの元データ。</td></tr>
         </tbody>
@@ -150,8 +150,8 @@
           <tr><th><code>floor_injected</code> / <code>safety_injected</code> / <code>redistribution_unresolved</code> / <code>solver_residual</code></th><td>床補正・安全補正・ALE 再分配未解決分・ソルバ残差の各注入量 [erg]（診断専用、保存誤差の分子には含めない）。</td></tr>
           <tr><th><code>conservation_error</code></th><td>相対保存誤差 ε_budget（NUMERICS §10.2 の恒等式に基づく）。</td></tr>
           <tr><th><code>E_volume_in</code> / <code>E_total</code> / <code>dE_total</code> / <code>E_denom</code></th><td>内部診断（境界体積仕事・全エネルギー・その差分・保存誤差分母）。</td></tr>
-          <tr><th><code>phase_diagnostic/</code></th><td>optional（<code>phase_resolved_energy=True</code>）。hydro 前後・ALE 後の物質エネルギーと、相ごとの内部/運動エネルギー差分。</td></tr>
-          <tr><th><code>ale_closure_audit/</code></th><td>optional（<code>ke_conservation_closure_audit=True</code>）。ALE の運動エネルギークロージャ監査（K/I の分解と残差、床カウンタ）。</td></tr>
+          <tr><th><code>phase_diagnostic/</code></th><td>optional（<code>Numerics.diagnostics.phase_resolved_energy=True</code>）。hydro 前後・ALE 後の物質エネルギーと、相ごとの内部/運動エネルギー差分。</td></tr>
+          <tr><th><code>ale_closure_audit/</code></th><td>optional（<code>Numerics.ale.ke_conservation_closure_audit=True</code>）。ALE の運動エネルギークロージャ監査（K/I の分解と残差、床カウンタ）。</td></tr>
         </tbody>
       </table>
 
@@ -179,7 +179,7 @@
           <tr><th><code>commanded_power_total</code> / <code>unabsorbed_power_total</code> / <code>trace_unabsorbed_power_total</code></th><td>入射・未吸収（最終／トレース直後）の各パワー [erg/s]。</td></tr>
           <tr><th><code>absorption_efficiency_total</code> / <code>trace_absorption_efficiency_total</code></th><td>総吸収効率（最終／トレース直後）。</td></tr>
           <tr><th><code>transfer_blocked_power_total</code></th><td>受け皿がなく捨てられたパワー [erg/s]。</td></tr>
-          <tr><th><code>tail_closure_count</code> / <code>tail_closure_absorbed_power_total</code> / <code>critical_surface_hit_count</code></th><td>臨界面近傍の裾閉包で終端したレイ数とその吸収パワー、臨界面で打ち切られたレイ数。</td></tr>
+          <tr><th><code>tail_closure_count</code> / <code>tail_closure_absorbed_power_total</code> / <code>critical_surface_hit_count</code></th><td>臨界面近傍の裾閉包（残存パワーを解析的に沈着させて光線を終端する処理 — <a href="../physics/laser.html">レーザー</a>参照）で終端したレイ数とその吸収パワー、臨界面で打ち切られたレイ数。</td></tr>
           <tr><th><code>cbet_exchanged_power_total</code> / <code>cbet_ledger_residual_rel</code> / <code>cbet_iterations</code> / <code>cbet_clamp_count</code></th><td>CBET の交換パワー・台帳残差・反復数・クランプ数。CBET 無効でも 0 値で常に出力される。</td></tr>
           <tr><th><code>absorbed_fraction_beam_&lt;i&gt;</code></th><td>ビーム別の吸収配分重み（単一ビームでは常に 1）。</td></tr>
         </tbody>
@@ -190,17 +190,17 @@
         <thead><tr><th>グループ</th><th>有効条件と内容</th></tr></thead>
         <tbody>
           <tr><th><code>radiation/fld_outer_*</code></th><td>常時（FLD 無効時 0）。外側ピカール反復の回数・終了残差・収束フラグ。</td></tr>
-          <tr><th><code>diagnostics/icf/v1/</code></th><td><code>diagnostics.icf.enabled</code>。シェル半径・厚さ・IFAR・収束比 CR。</td></tr>
-          <tr><th><code>diagnostics/hotspot_gas/v1/</code></th><td><code>diagnostics.hotspot_gas.enabled</code>。トレーサガスの質量・半径群（R50…R99、CR 系）・密度/圧力/断熱度・Te/Ti 統計・エネルギーと仕事プロキシ。</td></tr>
+          <tr><th><code>diagnostics/icf/v1/</code></th><td><code>Numerics.diagnostics.icf.enabled</code>。シェル半径・厚さ・IFAR・収束比 CR。</td></tr>
+          <tr><th><code>diagnostics/hotspot_gas/v1/</code></th><td><code>Numerics.diagnostics.hotspot_gas.enabled</code>。トレーサガスの質量・半径群（R50…R99、CR 系）・密度/圧力/断熱度・Te/Ti 統計・エネルギーと仕事プロキシ。</td></tr>
           <tr><th><code>diagnostics/ale_provenance/v1/</code></th><td>ALE 来歴（違反・退避弁・幾何失敗のカウンタ、退避弁イベント表、最終 claim 属性）。</td></tr>
-          <tr><th><code>diagnostics/mesh_quality_min/v1/</code></th><td><code>diagnostics.mesh_quality_min.enabled</code>。受理メッシュの最小コーナー/ガウス J・最小体積・最小辺長/高さ（初期比）と最大条件数。</td></tr>
+          <tr><th><code>diagnostics/mesh_quality_min/v1/</code></th><td><code>Numerics.diagnostics.mesh_quality_min.enabled</code>。受理メッシュの最小コーナー/ガウス J・最小体積・最小辺長/高さ（初期比）と最大条件数。</td></tr>
           <tr><th><code>diagnostics/ale_lambda_sweep/v1/</code></th><td>ALE 後退探索の λ 掃引診断（Gauss/corner J・体積の許容性プロファイル）。</td></tr>
           <tr><th><code>diagnostics/radial_fourier_audit/v1/</code>・<code>_v2/v1/</code></th><td>演算子段ごとの動径フーリエ監査（v1: 最大振幅、v2: 固定 (m,j) の複素係数）。</td></tr>
-          <tr><th><code>diagnostics/dt_breakdown_history/</code></th><td><code>diagnostics.dt_breakdown_history_enabled</code>。毎ステップの Δt 内訳と勝者（<a href="../overview/timestep.html">時間刻み制御</a>参照）。</td></tr>
+          <tr><th><code>diagnostics/dt_breakdown_history/</code></th><td><code>Numerics.diagnostics.dt_breakdown_history_enabled</code>。毎ステップの Δt 内訳と勝者（<a href="../overview/timestep.html">時間刻み制御</a>参照）。</td></tr>
           <tr><th><code>diagnostics/cfl_winner/</code>・<code>corner_bc_audit/v1/</code></th><td>音響 CFL 勝者セルの記録と、その勝者が特定コーナーハローに入った場合の境界値監査。</td></tr>
-          <tr><th><code>diagnostics/fld_substage_audit/v1/</code></th><td>FLD サブステージの動径フーリエ監査（<code>diagnostic_radial_fourier_substage_enabled</code>）。</td></tr>
+          <tr><th><code>diagnostics/fld_substage_audit/v1/</code></th><td>FLD サブステージの動径フーリエ監査（<code>Radiation.multigroup_diffusion.diagnostic_radial_fourier_substage_enabled</code>）。</td></tr>
           <tr><th><code>diagnostics/per_row_mass/</code>・<code>av_max/</code></th><td>dt 内訳診断の有効時。z 行ごとの質量・密度サマリと、最大人工粘性セルの記録。</td></tr>
-          <tr><th><code>diagnostics/conservation/v1/</code></th><td><code>diagnostics.conservation.enabled</code>。演算子別の保存残差 ε_E と前後エネルギー。</td></tr>
+          <tr><th><code>diagnostics/conservation/v1/</code></th><td><code>Numerics.diagnostics.conservation.enabled</code>。演算子別の保存残差 ε_E と前後エネルギー。</td></tr>
           <tr><th><code>diagnostics/material_interface/v1/</code></th><td>PLIC 材料界面診断（属性・per-sample 統計・イベント表。V21 additive スキーマ）。</td></tr>
           <tr><th><code>mc/</code>・<code>difference/</code>・<code>holo/</code></th><td>退役 <code>imc_ddmc</code> 系の互換診断群。現行 FLD/S<sub>N</sub> の実行では意味を持たない。</td></tr>
         </tbody>

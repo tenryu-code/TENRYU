@@ -80,7 +80,7 @@
       \Delta t_{hydro}=C_{CFL}\cdot\min_c\!\left(\frac{\Delta l_c}{|\mathbf u_c|+c_{s,c}}\right),
       \qquad C_{CFL}=0.3\;(\text{default})
       $$
-      <p>\(\Delta l_c\) is the cell length scale: the cell width \(\Delta r_i\) in 1D, the square root of the meridian-plane cell area \(\sqrt{A_c}\) in 2D. The minimum runs over hydro-active cells only; \(c_s=0\) cells (unheated fill regions) count as \(\Delta t_{hydro}\to\infty\) and leave the limiting to other cells. If every cell is inactive, hydro drops out of the ladder.</p>
+      <p>\(\Delta l_c\) is the cell length scale: the cell width \(\Delta r_i\) in 1D, the square root of the meridian-plane cell area \(\sqrt{A_c}\) in 2D. The minimum runs over <a href="numerics-foundations.html#hydro-active">hydro-active cells</a> only; \(c_s=0\) cells (unheated fill regions) count as \(\Delta t_{hydro}\to\infty\) and leave the limiting to other cells. If every cell is inactive, hydro drops out of the ladder.</p>
       <p>Depending on the configuration, the following guards join the base form. All of them act only to shrink \(\Delta t\) (or to force a rezone).</p>
       <ul>
         <li><strong>Post-shock heat (1D, opt-in):</strong> with <code>post_shock_heat=True</code>, an explicit constraint \(\Delta t_{ps}\) on the post-shock heat flux is evaluated and \(\Delta t_{hydro}=\min(\Delta t_{acoustic+AV},\Delta t_{ps})\).</li>
@@ -100,7 +100,7 @@
       \Delta t_{exp}=C_{cond}\cdot\min_c\!\left(\frac{(\Delta l_c)^2}{D_{eff,c}}\right),
       \qquad C_{cond}=0.25\;(\text{default})
       $$
-      <p>but the default STS solver (<code>conduction.solver="sts"</code>) does not impose it on the global \(\Delta t\). STS widens the stability region to \(O(s^2)\) with an \(s\)-stage Chebyshev ladder, so the cap proposed to the driver is relaxed up to the stage ceiling \(s_{max}\) (<code>sts_max_stages</code>, default 40):</p>
+      <p>but the default STS solver (<code>conduction.solver="sts"</code>) does not impose it on the global \(\Delta t\) (\(D_{eff}\) is the effective thermal diffusivity — see <a href="../physics/conduction.html">conduction</a>). STS widens the stability region to \(O(s^2)\) with an \(s\)-stage Chebyshev ladder, so the cap proposed to the driver is relaxed up to the stage ceiling \(s_{max}\) (<code>sts_max_stages</code>, default 40):</p>
       $$
       \Delta t_{cond}=\frac{s_{max}(s_{max}+1)}{2}\,\Delta t_{exp}
       $$
@@ -115,7 +115,7 @@
       \beta_c=\frac{4a_{\rm eV}T_{e,c}^3}{C_{v,e,c}},\qquad
       \sigma_{P,c}=\rho_c\kappa_{P,c}
       $$
-      <p>The larger \(\Delta t\), the smaller \(f_c\) and the larger the fraction of within-step emission/reabsorption represented as effective scattering. To avoid extreme \(f_c\), the driver proposes the cap equivalent to enforcing a floor \(f_{min}\) (<code>Numerics.dt.f_min_fleck</code>, default 0.01):</p>
+      <p>\(\alpha\) is the time-centering parameter of the Fleck linearization (the implicitness; default 1 = fully implicit, 0.5 being Crank–Nicolson). The larger \(\Delta t\), the smaller \(f_c\) and the larger the fraction of within-step emission/reabsorption represented as effective scattering. To avoid extreme \(f_c\), the driver proposes the cap equivalent to enforcing a floor \(f_{min}\) (<code>Numerics.dt.f_min_fleck</code>, default 0.01):</p>
       $$
       \Delta t_{rad}=\min_c\!\left(\frac{1-f_{min}}{f_{min}}\cdot
       \frac{1}{\alpha\,c\,\beta_c\,\sigma_{P,c}}\right)

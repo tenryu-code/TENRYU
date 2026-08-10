@@ -80,7 +80,7 @@
       \Delta t_{hydro}=C_{CFL}\cdot\min_c\!\left(\frac{\Delta l_c}{|\mathbf u_c|+c_{s,c}}\right),
       \qquad C_{CFL}=0.3\;(\text{既定})
       $$
-      <p>\(\Delta l_c\) はセル代表長で、1D ではセル幅 \(\Delta r_i\)、2D では子午面セル面積の平方根 \(\sqrt{A_c}\) である。min は hydro が活性なセルだけを対象とし、\(c_s=0\) のセル（未加熱のフィル領域など）は \(\Delta t_{hydro}\to\infty\) 相当として他セルに律速を委ねる。全セルが非活性なら流体は制約から外れる。</p>
+      <p>\(\Delta l_c\) はセル代表長で、1D ではセル幅 \(\Delta r_i\)、2D では子午面セル面積の平方根 \(\sqrt{A_c}\) である。min は <a href="numerics-foundations.html#hydro-active">hydro が活性なセル</a>だけを対象とし、\(c_s=0\) のセル（未加熱のフィル領域など）は \(\Delta t_{hydro}\to\infty\) 相当として他セルに律速を委ねる。全セルが非活性なら流体は制約から外れる。</p>
       <p>この基本形に、構成に応じて次の保護が加わる。いずれも \(\Delta t\) を縮める方向（またはリゾーンの強制）にのみ働く。</p>
       <ul>
         <li><strong>post-shock heat（1D、opt-in）：</strong><code>post_shock_heat=True</code> のとき、衝撃波後面の熱流束に対する明示的な制約 \(\Delta t_{ps}\) を評価し、\(\Delta t_{hydro}=\min(\Delta t_{acoustic+AV},\Delta t_{ps})\) とする。</li>
@@ -100,7 +100,7 @@
       \Delta t_{exp}=C_{cond}\cdot\min_c\!\left(\frac{(\Delta l_c)^2}{D_{eff,c}}\right),
       \qquad C_{cond}=0.25\;(\text{既定})
       $$
-      <p>だが、既定の STS ソルバ（<code>conduction.solver="sts"</code>）はこの値を大域 \(\Delta t\) に直接は要求しない。STS は \(s\) 段のチェビシェフ段列で安定領域を \(O(s^2)\) に広げるため、大域 \(\Delta t\) への提案は段数上限 \(s_{max}\)（<code>sts_max_stages</code>、既定 40）まで緩和した</p>
+      <p>だが、既定の STS ソルバ（<code>conduction.solver="sts"</code>）はこの値を大域 \(\Delta t\) に直接は要求しない（\(D_{eff}\) は実効熱拡散率 — <a href="../physics/conduction.html">伝導</a>参照）。STS は \(s\) 段のチェビシェフ段列で安定領域を \(O(s^2)\) に広げるため、大域 \(\Delta t\) への提案は段数上限 \(s_{max}\)（<code>sts_max_stages</code>、既定 40）まで緩和した</p>
       $$
       \Delta t_{cond}=\frac{s_{max}(s_{max}+1)}{2}\,\Delta t_{exp}
       $$
@@ -115,7 +115,7 @@
       \beta_c=\frac{4a_{\rm eV}T_{e,c}^3}{C_{v,e,c}},\qquad
       \sigma_{P,c}=\rho_c\kappa_{P,c}
       $$
-      <p>で特徴づけられる。\(\Delta t\) が大きいほど \(f_c\) は小さくなり、刻み内の放出・再吸収を実効散乱として表す割合が増える。極端に小さい \(f_c\) を避けるため、下限 \(f_{min}\)（<code>Numerics.dt.f_min_fleck</code>、既定 0.01）を課すことと等価な上限</p>
+      <p>で特徴づけられる。\(\alpha\) は Fleck 線形化の時間中心化パラメータ（陰性度。既定 1 = 完全陰的、0.5 が Crank–Nicolson 相当）である。\(\Delta t\) が大きいほど \(f_c\) は小さくなり、刻み内の放出・再吸収を実効散乱として表す割合が増える。極端に小さい \(f_c\) を避けるため、下限 \(f_{min}\)（<code>Numerics.dt.f_min_fleck</code>、既定 0.01）を課すことと等価な上限</p>
       $$
       \Delta t_{rad}=\min_c\!\left(\frac{1-f_{min}}{f_{min}}\cdot
       \frac{1}{\alpha\,c\,\beta_c\,\sigma_{P,c}}\right)

@@ -71,7 +71,7 @@
           <tr><th><code>x_r</code>, <code>x_z</code></th><td>Node coordinates [cm]; <code>x_z</code> 2D only.</td></tr>
           <tr><th><code>v_r</code>, <code>v_z</code></th><td>Node velocities [cm/s]; <code>v_z</code> 2D only.</td></tr>
           <tr><th><code>cell_material_id</code></th><td>Representative material index per cell (largest volume fraction; ties go to the smaller index).</td></tr>
-          <tr><th><code>topology/v2/</code>, <code>v3/</code>, <code>v4/</code></th><td>optional. Multiblock connectivity (v2: 3-block; v3: half-butterfly 5-block — block/seam tables plus CSR connectivity; v4: pentagon-belt <code>cell_nverts</code> with a <code>corner_stride</code> attribute). Omitted for single-block meshes.</td></tr>
+          <tr><th><code>topology/v2/</code>, <code>v3/</code>, <code>v4/</code></th><td>optional. Multiblock connectivity (v2: 3-block; v3: half-butterfly 5-block — block/seam tables plus CSR connectivity; v4: pentagon-belt <code>cell_nverts</code> with a <code>corner_stride</code> attribute). Omitted for single-block meshes. See <a href="../physics/mesh/2d.html">2D meshes</a> for the configuration details.</td></tr>
         </tbody>
       </table>
 
@@ -89,7 +89,7 @@
           <tr><th><code>adaptive_av_gate</code>, <code>adaptive_av_mode_cell</code></th><td>optional. Adaptive-AV gate history and visualization mask (<code>adaptive_av.enabled=True</code>).</td></tr>
           <tr><th><code>corner_mass</code></th><td>optional. 2D subzonal corner masses [g] (Lagrangian invariant).</td></tr>
           <tr><th><code>eta_compatible</code></th><td>optional. Legacy volume-form compatibility mismatch diagnostic [cm³].</td></tr>
-          <tr><th><code>per_material/v1/</code></th><td>optional. Per-material conservation schema skeleton (<code>per_material_conservation_enabled=True</code>).</td></tr>
+          <tr><th><code>per_material/v1/</code></th><td>optional. Per-material conservation schema skeleton (<code>Numerics.materials.per_material_conservation_enabled=True</code>).</td></tr>
         </tbody>
       </table>
 
@@ -125,8 +125,8 @@
           <tr><th><code>deposited_power</code></th><td>Laser deposition power density [erg/cm³/s].</td></tr>
           <tr><th><code>absorption_fraction</code></th><td>Overall absorption fraction (absorbed/incident).</td></tr>
           <tr><th><code>ray_density</code></th><td>Initial ray placement density [1/cm³].</td></tr>
-          <tr><th><code>A_Q_r_shells</code>, <code>A_Q_z_shells</code></th><td>2D only: per-shell deposition asymmetry \((q_{max}-q_{min})/(q_{max}+q_{min})\).</td></tr>
-          <tr><th><code>mesh/</code></th><td>Only on non-skip steps with <code>ray_output_trajectory=True</code>: LaserMesh node coordinates, \(\hat n_e\), T_e, Z̄, density gradients, <code>n_crit</code>.</td></tr>
+          <tr><th><code>A_Q_r_shells</code>, <code>A_Q_z_shells</code></th><td>2D only: deposition asymmetry \((q_{max}-q_{min})/(q_{max}+q_{min})\) per shell (a z-direction cell column at fixed r index / an r-direction cell row at fixed z index). q is the laser energy [erg] deposited in each cell during that step.</td></tr>
+          <tr><th><code>mesh/</code></th><td>Only on non-skip steps (= steps that executed the raytrace; not written on the thinned reuse steps of <code>Laser.raytrace_skip</code>) with <code>ray_output_trajectory=True</code>: node coordinates of the LaserMesh (the laser-dedicated independent grid — a 2D RZ structured grid separate from the hydro mesh; see <a href="../physics/laser.html">Laser</a>), \(\hat n_e\) (electron density over the critical density), T_e, Z̄, density gradients, <code>n_crit</code>.</td></tr>
           <tr><th><code>rays/</code></th><td>Only on non-skip steps with <code>ray_output_count&gt;0</code>: initial ray positions/directions/powers (1D: R0/Z0/vR0/vZ0; 2D: x0/y0/z0/vx0/vy0/vz0) and beam IDs.</td></tr>
           <tr><th><code>rays/trajectory/</code></th><td>With <code>ray_output_trajectory=True</code>: CSR-format trajectories (offsets, step counts, position columns, residual power) — the source data for ray overlays.</td></tr>
         </tbody>
@@ -150,8 +150,8 @@
           <tr><th><code>floor_injected</code> / <code>safety_injected</code> / <code>redistribution_unresolved</code> / <code>solver_residual</code></th><td>Floor, safety, ALE-redistribution, and solver-residual injections [erg] (diagnostic-only; excluded from the conservation-error numerator).</td></tr>
           <tr><th><code>conservation_error</code></th><td>Relative conservation error ε_budget (per the NUMERICS §10.2 identity).</td></tr>
           <tr><th><code>E_volume_in</code> / <code>E_total</code> / <code>dE_total</code> / <code>E_denom</code></th><td>Internal diagnostics (boundary volume work, total energy, its increment, the conservation denominator).</td></tr>
-          <tr><th><code>phase_diagnostic/</code></th><td>optional (<code>phase_resolved_energy=True</code>): matter energies before/after hydro and after ALE, with per-phase internal/kinetic increments.</td></tr>
-          <tr><th><code>ale_closure_audit/</code></th><td>optional (<code>ke_conservation_closure_audit=True</code>): the ALE kinetic-energy closure audit (K/I decompositions, residuals, floor counters).</td></tr>
+          <tr><th><code>phase_diagnostic/</code></th><td>optional (<code>Numerics.diagnostics.phase_resolved_energy=True</code>): matter energies before/after hydro and after ALE, with per-phase internal/kinetic increments.</td></tr>
+          <tr><th><code>ale_closure_audit/</code></th><td>optional (<code>Numerics.ale.ke_conservation_closure_audit=True</code>): the ALE kinetic-energy closure audit (K/I decompositions, residuals, floor counters).</td></tr>
         </tbody>
       </table>
 
@@ -179,7 +179,7 @@
           <tr><th><code>commanded_power_total</code> / <code>unabsorbed_power_total</code> / <code>trace_unabsorbed_power_total</code></th><td>Incident and unabsorbed power (final / right after the trace) [erg/s].</td></tr>
           <tr><th><code>absorption_efficiency_total</code> / <code>trace_absorption_efficiency_total</code></th><td>Total absorption efficiency (final / right after the trace).</td></tr>
           <tr><th><code>transfer_blocked_power_total</code></th><td>Power dropped for lack of a receiver [erg/s].</td></tr>
-          <tr><th><code>tail_closure_count</code> / <code>tail_closure_absorbed_power_total</code> / <code>critical_surface_hit_count</code></th><td>Rays ended by the near-critical tail closure and their absorbed power; rays terminated at the critical surface.</td></tr>
+          <tr><th><code>tail_closure_count</code> / <code>tail_closure_absorbed_power_total</code> / <code>critical_surface_hit_count</code></th><td>Rays ended by the near-critical tail closure (which deposits the remaining power analytically and terminates the ray — see <a href="../physics/laser.html">Laser</a>) and their absorbed power; rays terminated at the critical surface.</td></tr>
           <tr><th><code>cbet_exchanged_power_total</code> / <code>cbet_ledger_residual_rel</code> / <code>cbet_iterations</code> / <code>cbet_clamp_count</code></th><td>CBET exchanged power, ledger residual, iteration count, clamp count. Written as zeros even with CBET disabled.</td></tr>
           <tr><th><code>absorbed_fraction_beam_&lt;i&gt;</code></th><td>Per-beam absorption weights (always 1 for a single beam).</td></tr>
         </tbody>
@@ -190,17 +190,17 @@
         <thead><tr><th>Group</th><th>Trigger and content</th></tr></thead>
         <tbody>
           <tr><th><code>radiation/fld_outer_*</code></th><td>Always (zero when FLD is off): outer Picard iteration count, exit residual, convergence flag.</td></tr>
-          <tr><th><code>diagnostics/icf/v1/</code></th><td><code>diagnostics.icf.enabled</code>: shell radius, thickness, IFAR, convergence ratio CR.</td></tr>
-          <tr><th><code>diagnostics/hotspot_gas/v1/</code></th><td><code>diagnostics.hotspot_gas.enabled</code>: tracer-gas mass, radius family (R50…R99 and CR variants), density/pressure/adiabat summaries, Te/Ti statistics, energies, and work proxies.</td></tr>
+          <tr><th><code>diagnostics/icf/v1/</code></th><td><code>Numerics.diagnostics.icf.enabled</code>: shell radius, thickness, IFAR, convergence ratio CR.</td></tr>
+          <tr><th><code>diagnostics/hotspot_gas/v1/</code></th><td><code>Numerics.diagnostics.hotspot_gas.enabled</code>: tracer-gas mass, radius family (R50…R99 and CR variants), density/pressure/adiabat summaries, Te/Ti statistics, energies, and work proxies.</td></tr>
           <tr><th><code>diagnostics/ale_provenance/v1/</code></th><td>ALE provenance (violation/escape-valve/geometry-failure counters, escape-valve event table, final claim attributes).</td></tr>
-          <tr><th><code>diagnostics/mesh_quality_min/v1/</code></th><td><code>diagnostics.mesh_quality_min.enabled</code>: run minima of corner/Gauss Jacobians, RZ volume, edge length/altitude (relative to initial), and the max condition number over accepted meshes.</td></tr>
+          <tr><th><code>diagnostics/mesh_quality_min/v1/</code></th><td><code>Numerics.diagnostics.mesh_quality_min.enabled</code>: run minima of corner/Gauss Jacobians, RZ volume, edge length/altitude (relative to initial), and the max condition number over accepted meshes.</td></tr>
           <tr><th><code>diagnostics/ale_lambda_sweep/v1/</code></th><td>ALE backtrack λ-sweep diagnostic (admissibility profile of Gauss/corner J and volume).</td></tr>
           <tr><th><code>diagnostics/radial_fourier_audit/v1/</code>, <code>_v2/v1/</code></th><td>Per-operator radial Fourier audits (v1: peak amplitude; v2: fixed-(m,j) complex coefficients).</td></tr>
-          <tr><th><code>diagnostics/dt_breakdown_history/</code></th><td><code>diagnostics.dt_breakdown_history_enabled</code>: per-step Δt components and winner (see <a href="../overview/timestep.html">Time-step control</a>).</td></tr>
+          <tr><th><code>diagnostics/dt_breakdown_history/</code></th><td><code>Numerics.diagnostics.dt_breakdown_history_enabled</code>: per-step Δt components and winner (see <a href="../overview/timestep.html">Time-step control</a>).</td></tr>
           <tr><th><code>diagnostics/cfl_winner/</code>, <code>corner_bc_audit/v1/</code></th><td>Acoustic-CFL winner-cell records, plus boundary-value audits when the winner sits in a specific corner halo.</td></tr>
-          <tr><th><code>diagnostics/fld_substage_audit/v1/</code></th><td>FLD substage radial-Fourier audit (<code>diagnostic_radial_fourier_substage_enabled</code>).</td></tr>
+          <tr><th><code>diagnostics/fld_substage_audit/v1/</code></th><td>FLD substage radial-Fourier audit (<code>Radiation.multigroup_diffusion.diagnostic_radial_fourier_substage_enabled</code>).</td></tr>
           <tr><th><code>diagnostics/per_row_mass/</code>, <code>av_max/</code></th><td>With the dt-breakdown diagnostics: per-z-row mass/density summaries and the maximum-AV cell record.</td></tr>
-          <tr><th><code>diagnostics/conservation/v1/</code></th><td><code>diagnostics.conservation.enabled</code>: per-operator conservation residuals ε_E with before/after energies.</td></tr>
+          <tr><th><code>diagnostics/conservation/v1/</code></th><td><code>Numerics.diagnostics.conservation.enabled</code>: per-operator conservation residuals ε_E with before/after energies.</td></tr>
           <tr><th><code>diagnostics/material_interface/v1/</code></th><td>PLIC material-interface diagnostics (attributes, per-sample statistics, event tables; additive V21 schema).</td></tr>
           <tr><th><code>mc/</code>, <code>difference/</code>, <code>holo/</code></th><td>Compatibility diagnostics of the retired <code>imc_ddmc</code> paths; meaningless under production FLD/S<sub>N</sub> runs.</td></tr>
         </tbody>
