@@ -179,7 +179,7 @@ class FortranSequentialReader {
   // (interpreted in the candidate's endianness) matches the leading one.
   // Plausibility alone is defeated by small records — byte_swap(8) =
   // 134217728 is under the 1 GB cap, so a big-endian 8-byte first record
-  // used to be accepted as a native 128 MB record (AI review k12 §5.2).
+  // used to be accepted as a native 128 MB record (2026-07-26 review).
   [[nodiscard]] bool candidate_marker_validates(const std::int32_t len,
                                                 const bool swapped) {
     if (!is_plausible_record_marker(len)) {
@@ -844,7 +844,7 @@ IonmixOpacityData load_ionmix_opacity(const std::string& filename) {
   // snap kappa_PE := kappa_PA when the two agree within 1e-6 relative — this
   // makes near-LTE tables exactly Kirchhoff-consistent so the separate-
   // emissivity path degenerates cleanly to LTE instead of carrying table-
-  // generation roundoff as a spurious net NLTE source (AI review k12 §5.8
+  // generation roundoff as a spurious net NLTE source (2026-07-26 review
   // documented the previous comment's "diagnostic only" claim as false).
   out.is_lte = (max_rel <= 1.0e-6);
   if (out.is_lte && out.has_PE) {

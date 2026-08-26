@@ -1,6 +1,6 @@
 from tenryu_namelist import *
 
-# W-H B3 gate deck: cold spherical homologous (Hubble) expansion u = H r.
+# Braginskii homologous-expansion null gate deck: cold spherical expansion u = H r.
 # For the trace-free Braginskii stress this flow is EXACTLY stress-free in
 # spherical geometry, so a constant-eta viscous run must reproduce the
 # inviscid trajectory to roundoff when both runs share the same dt path.

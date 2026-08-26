@@ -3839,7 +3839,7 @@ int remap_energy_audit_every_n() {
   return every;
 }
 
-// Macro rim-KE audit (mixed-core endgame energy forensics): the energy
+// Macro rim-KE audit (mixed-core terminal-phase energy forensics): the energy
 // budget counts, at every macro BOUNDARY node, the kinetic energy carried
 // by the MEMBER-side cached corner masses (real velocities, member corner
 // weights), but the TER/OptionB-velocity-remap conservation ledger excludes

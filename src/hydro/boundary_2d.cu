@@ -376,7 +376,7 @@ __global__ void apply_multiblock_axis_reflect_velocity_kernel(
   }
   // NODE_BOUNDARY without axis/center/inner/outer flags does not occur in any
   // multiblock builder; internal block-seam nodes receive no velocity
-  // constraint (AI-review 2026-07-26, k02 F-05 — unreachable seam
+  // constraint (2026-07-26 review — unreachable seam
   // tangent-projection fallthrough removed).
 }
 
@@ -694,8 +694,8 @@ void validate_boundary_2d(const core::Config& cfg) {
       logged_state_supply_ale = true;
       core::log_info(
           "Numerics.hydro.boundary_2d state_supply combined with "
-          "Numerics.ale.enabled=true - using ALE-safe mesh-velocity decoupling "
-          "(PR 4.6).");
+          "Numerics.ale.enabled=true - using ALE-safe mesh-velocity "
+          "decoupling.");
     }
   }
 }

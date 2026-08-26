@@ -703,7 +703,7 @@ __device__ inline void cfl_1d_kernel_body(
     return;
   }
 
-  // k01 P0-4 (AI review 2026-07-26): node-crossing guard. The acoustic+AV
+  // 2026-07-26 review: node-crossing guard. The acoustic+AV
   // denominator can vanish for cold, limiter-smooth compression (cs -> 0,
   // chi -> 0) while a face still closes at u_i - u_{i+1} > 0; bound the step
   // so one face sweep stays below crossing_dt_safety of the cell width.
@@ -745,7 +745,7 @@ __device__ inline void cfl_1d_kernel_body(
                          ? fmax(rho[i], 0.0) * fmax(vol[i], 0.0)
                          : 0.0;
 
-  // k03 F-14 / k01 §4.2 (AI review 2026-07-26): explicit stability bound for
+  // 2026-07-26 review: explicit stability bound for
   // the artificial heat flux H (VNR chi only; H is disabled under riemann and
   // csw uses its own chi_lim <= raw compression, left on the legacy margin).
   // Face conductance G_f = A_f C_H rho_f l_f chi_f (flux = -C_H rho l^2 chi
@@ -778,7 +778,7 @@ __device__ inline void cfl_1d_kernel_body(
     }
   }
 
-  // k01 §4.3 (AI review 2026-07-26): post-shock heat bound as the exact
+  // 2026-07-26 review: post-shock heat bound as the exact
   // row-sum of the operator's face conductances G_f = A_f C_ps rho_f cs_f
   // psi_f (the operator's flux is -C_ps rho_f cs_f psi_f (e_R - e_L); the
   // face length cancels), replacing the former dr-based estimate that
@@ -2457,7 +2457,7 @@ HydroDtDiagnostics compute_dt_hydro_diagnostics(const core::State& state,
     av_c1 = std::max({av_c1, adapt.base.c1, adapt.primary.c1, adapt.rebound.c1});
     av_c2 = std::max({av_c2, adapt.base.c2, adapt.primary.c2, adapt.rebound.c2});
   } else if (cfg.numerics.hydro.av_type == "csw") {
-    // k03 §10 (AI review 2026-07-26): the CSW operator applies csw_C1/csw_C2,
+    // 2026-07-26 review: the CSW operator applies csw_C1/csw_C2,
     // so the CFL correction must use the same coefficients — the former
     // av_linear/av_quadratic values under-estimated the AV stiffness when
     // the CSW coefficients are larger (defaults: 0.5/2.0 vs 0.1/1.5).

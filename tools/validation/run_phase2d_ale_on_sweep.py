@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run Phase 2d ALE-on carry-over validation gates."""
+"""Run the ALE-on carry-over validation gates."""
 
 from __future__ import annotations
 

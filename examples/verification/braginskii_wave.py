@@ -1,7 +1,7 @@
 from tenryu_namelist import *
 import math
 
-# W-H B2 gate deck: planar standing sound wave, AV off, conduction off,
+# Braginskii acoustic-decay gate deck: planar standing sound wave, AV off, conduction off,
 # ideal gas gamma=5/3 with cs = 1e5 cm/s (e = 9e9 erg/g at Te=Ti below).
 # The gate overlays a constant-eta Braginskii run on a control run and
 # compares the differential decay rate to gamma = (2/3)(eta/rho) k^2.

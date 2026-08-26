@@ -95,7 +95,7 @@ FldEnergyScratch& fld_energy_scratch() {
   return scratch;
 }
 
-// AI review k15 C-3 (2026-07-26): an energy AUDIT must not sanitize the
+// 2026-07-26 review: an energy AUDIT must not sanitize the
 // field it audits. Negative E_g now contributes with its sign and is
 // counted; non-finite E or an invalid volume is zero-contribution but
 // counted so the failure is surfaced instead of silently folded into a
@@ -240,7 +240,7 @@ double compute_fld_rad_energy_total_device(const core::State& state,
   const std::size_t n_cell_groups = n_cells * n_groups;
   // Empty rad_E = radiation inactive (legitimate zero). A NONEMPTY field
   // with the wrong size is state corruption and must not silently audit as
-  // "total energy 0" (AI review k15 C-3/9, 2026-07-26).
+  // "total energy 0" (2026-07-26 review).
   if (state.rad_E.empty() || n_cell_groups == 0U) {
     return 0.0;
   }

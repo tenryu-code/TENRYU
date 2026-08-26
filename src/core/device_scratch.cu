@@ -52,7 +52,7 @@ void* device_scratch_acquire(const char* tag, const std::size_t bytes) {
     return v != nullptr && v[0] == '1';
   }();
   if (poison) {
-    // BUG-22 hunt: fill EVERY acquire with a recognizable pattern so any
+    // Scribble-pattern debugging aid: fill EVERY acquire with a recognizable pattern so any
     // read-before-write surfaces deterministically (0xFF bytes = NaN as
     // double). Debug-only knob; default path untouched.
     const cudaError_t err_fill = cudaMemset(entry.ptr, 0xFF, bytes);

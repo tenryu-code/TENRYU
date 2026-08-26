@@ -156,7 +156,7 @@ CaseMetrics run_case(const std::string& label,
   state.mesh.recompute_geometry();
   state.vol = state.mesh.cell_vol;
 
-  // BUG-10 binding assert: fail fast if the geometry did not reach the mesh.
+  // Geometry binding assert: fail fast if the geometry did not reach the mesh.
   if (state.mesh.geometry_code != want_geom) {
     core::log_error("[verify:" + label + "] geometry_code=" +
                     std::to_string(state.mesh.geometry_code) + " want=" +

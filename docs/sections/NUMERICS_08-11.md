@@ -134,6 +134,7 @@ N_{p,f} = \text{round}\!\left(N_{marshak\_total} \times \frac{A_f}{\sum_f A_f}\r
 
 ---
 
+
 ## 9. 移動メッシュと粒子セル再同定
 Lagrangian/ALEでメッシュが動くため、粒子の空間座標は固定でも cellId が変わりうる。
 
@@ -177,9 +178,9 @@ r_{ij}=s_i\sin\theta_j,\qquad z_{ij}=s_i\cos\theta_j.
 
 Thus the logical halfplane covers \(\theta\in[0,\pi]\) with \(r\ge0\). The inner boundary is a finite regularized core at \(s_{\min}=\kappa S_{\max}/(N_s+\kappa)\); the outer boundary is \(s=S_{\max}\).
 
-**Exact axis snap (H-02, 2026-07-27, golden epoch G2).** Axis-end nodes are assigned \(r=0\) exactly by logical index (\(j=0\) and \(j=N_\theta\)), never by evaluating \(s_i\sin\theta_j\) (which yields \(r\approx1.2\times10^{-16}s_i\) at \(\theta=\pi\)). The snap is applied at node construction, before any volume/area/S-vector/corner-mass derivation, uniformly across the single-block spherical-polar center treatments (annular, tri\_fan, button, polar\_in\_box prefix) and the polar-in-box collar previous-ring reconstruction. Interior nodes and non-axis-reaching wedge builders are untouched. `NODE_AXIS` classification retains its relative-tolerance machinery, which the snap now satisfies trivially.
+**Exact axis snap (2026-07-27).** Axis-end nodes are assigned \(r=0\) exactly by logical index (\(j=0\) and \(j=N_\theta\)), never by evaluating \(s_i\sin\theta_j\) (which yields \(r\approx1.2\times10^{-16}s_i\) at \(\theta=\pi\)). The snap is applied at node construction, before any volume/area/S-vector/corner-mass derivation, uniformly across the single-block spherical-polar center treatments (annular, tri\_fan, button, polar\_in\_box prefix) and the polar-in-box collar previous-ring reconstruction. Interior nodes and non-axis-reaching wedge builders are untouched. `NODE_AXIS` classification retains its relative-tolerance machinery, which the snap now satisfies trivially.
 
-**Equator mirror-and-snap (H-03, 2026-07-27, golden epoch G3).** For symmetric-by-construction \(\theta\) ladders (uniform and `polar_equal_mu_zoning`), only the northern half \(j\le N_\theta/2\) is evaluated from \(\sin/\cos\); the equator node (even \(N_\theta\), \(j=N_\theta/2\)) is assigned \(z=\text{center}_z\) exactly, and every southern node is the bitwise mirror of its northern partner: \(r_j=r_{N_\theta-j}\) (bit copy), \(z_j=\text{center}_z-(z_{N_\theta-j}-\text{center}_z)\) (sign-flipped offset). The southern axis node thereby inherits \(r=0\) exactly and \(z=\text{center}_z-s\) exactly. User-specified ladders (`explicit_nodes_theta`, `grid_segments_theta`) and the box-anchored `polar_in_box` paths keep direct per-node evaluation — the equator has no privileged status in user geometry.
+**Equator mirror-and-snap (2026-07-27).** For symmetric-by-construction \(\theta\) ladders (uniform and `polar_equal_mu_zoning`), only the northern half \(j\le N_\theta/2\) is evaluated from \(\sin/\cos\); the equator node (even \(N_\theta\), \(j=N_\theta/2\)) is assigned \(z=\text{center}_z\) exactly, and every southern node is the bitwise mirror of its northern partner: \(r_j=r_{N_\theta-j}\) (bit copy), \(z_j=\text{center}_z-(z_{N_\theta-j}-\text{center}_z)\) (sign-flipped offset). The southern axis node thereby inherits \(r=0\) exactly and \(z=\text{center}_z-s\) exactly. User-specified ladders (`explicit_nodes_theta`, `grid_segments_theta`) and the box-anchored `polar_in_box` paths keep direct per-node evaluation — the equator has no privileged status in user geometry.
 
 For a spherical-polar logical cell \([s_i,s_{i+1}]\times[\theta_j,\theta_{j+1}]\), the exact swept volume is obtained from \(dV=2\pi r\,dr\,dz\). With \(r=s\sin\theta\), \(z=s\cos\theta\), and \(|\partial(r,z)/\partial(s,\theta)|=s\),
 
@@ -1008,4 +1009,3 @@ T_{max}^{n} \equiv \max\!\left(\max_i T_{e,i}^n,\; T_{boundary}\right)
 > （陽的/STS 更新は安定性条件により単調性を保証する）。
 
 ---
-

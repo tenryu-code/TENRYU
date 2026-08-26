@@ -1,9 +1,7 @@
-"""TENRYU first-shock convergence analyzer (Phase 2cd Wave 2 deliverable).
+"""TENRYU first-shock convergence analyzer.
 
 Computes informational metrics for ICF first-shock convergence on TENRYU 2D RZ
-HDF5 dumps. Locked spec from CC ⇄ Codex MCP plan-consensus thread
-019e02d1-45c4-7a33-931f-a2c417a9184e (3 rounds, Q1-Q13 CONSENSUS), inheriting
-Round 3 Q4 from earlier thread 019e0114-b868-7a20-bb05-2c1aa8ac792c.
+HDF5 dumps.
 
 Metrics per snapshot:
 - core_rho_volume_weighted_mean / core_rho_p95_volume_weighted (5 µm core default)
@@ -442,7 +440,7 @@ def discover_snapshot_files(results_dir: Path, run_id: str) -> list[Path]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="TENRYU first-shock convergence analyzer (Phase 2cd Wave 2)")
+    parser = argparse.ArgumentParser(description="TENRYU first-shock convergence analyzer")
     parser.add_argument("--results-dir", type=Path, help="Directory of HDF5 snapshots")
     parser.add_argument("--run-id", type=str, help="Run id prefix for snapshot filenames")
     parser.add_argument("--single-snapshot", type=Path, help="Process a single snapshot instead of trajectory")

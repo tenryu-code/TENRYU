@@ -1435,7 +1435,7 @@ PlicRemapStatus launch_plic_material_volume_remap(
     status.fallback_engaged = true;
     status.class_d_events += 1;
     tenryu::core::log_warning(
-        "[plic_remap] scalar fallback engaged because Wave C face kernel supports "
+        "[plic_remap] scalar fallback engaged because the PLIC face kernel supports "
         "at most 8 materials");
     return status;
   }

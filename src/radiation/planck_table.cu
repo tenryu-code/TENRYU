@@ -121,7 +121,7 @@ void PlanckTable::build(const Groups& groups,
   const double log_min = std::log(T_min_eV);
   const double log_max = std::log(T_max_eV);
   std::vector<double> raw_b(static_cast<std::size_t>(n_groups_), 0.0);
-  // AI review k05 5.3 (2026-07-26): the renormalization below silently folds
+  // 2026-07-26 review: the renormalization below silently folds
   // the out-of-range Planck tails back into the configured groups. Track the
   // raw coverage per table temperature so a group structure that misses a
   // significant emission fraction is surfaced at build time (diagnostic only

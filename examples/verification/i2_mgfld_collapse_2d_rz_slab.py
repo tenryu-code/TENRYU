@@ -117,7 +117,7 @@ if INIT_MODE not in ("reference_table", "two_state"):
 I2_2D_RZ_ALE = _env_bool(
     "TENRYU_I2_2D_RZ_ALE_ENABLED", I2_2D_RZ_MODE != "front"
 )
-# PR 4.3 fallback (per high-AI consultation 2026-05-15): annular+conduction-off
+# 2026-05-15 external-review fallback: annular+conduction-off
 # was insufficient; apply stronger AV (av_C1 0.1->0.5, av_C2 1.5->2.0), tighter
 # hydro CFL (0.2->0.1), and ALE every step (5->1).
 I2_2D_RZ_ALE_EVERY_N_STEPS = _env_int("TENRYU_I2_2D_RZ_ALE_EVERY_N_STEPS", 1)
@@ -248,7 +248,7 @@ U_TABLE = [float(x) for x in TABLE["u_cm_per_s"]]
 R_MIN = _env_float("TENRYU_I2_2D_RZ_R_MIN_CM", 0.5)  # PR 4.2: annular slab, axis row removed
 R_MAX = _env_float("TENRYU_I2_2D_RZ_R_MAX_CM", 10.0)
 I2_2D_RZ_ANNULAR_SLAB = R_MIN > 0.0
-# PR 4.6 enabled r_inner="reflect" for 2D_RZ when r_min > 0 (annular).
+# r_inner="reflect" is supported for 2D_RZ when r_min > 0 (annular).
 # r_inner="axis" with r_min > 0 was a legacy ambiguity (semantically reflective).
 R_INNER_BC = "reflect" if R_MIN > 0.0 else "axis"
 Z_MIN = _env_float(
@@ -521,7 +521,7 @@ Numerics(
     radiation_thermal_subcycle=not I2_2D_RZ_HYDRO_ONLY,
     dt=dict(
         initial_s=DT_INITIAL,
-        # PR 4.3 fallback (per high-AI consultation 2026-05-15): hydro CFL 0.2->0.1.
+        # 2026-05-15 external-review fallback: hydro CFL 0.2->0.1.
         cfl_hydro=I2_2D_RZ_CFL_HYDRO,
         cfl_cond=0.3,
         growth_factor=1.1,
@@ -532,7 +532,7 @@ Numerics(
         # front mode: radiation + matter-energy only (frozen hydro)
         enabled=I2_2D_RZ_MODE != "front",
         boundary_2d=HYDRO_BOUNDARY,
-        # PR 4.3 fallback (per high-AI consultation 2026-05-15): AV 0.1/1.5->0.5/2.0.
+        # 2026-05-15 external-review fallback: AV 0.1/1.5->0.5/2.0.
         av_C1=I2_2D_RZ_AV_C1,
         av_C2=I2_2D_RZ_AV_C2,
         total_energy_remap_2d_rz=TOTAL_ENERGY_REMAP,

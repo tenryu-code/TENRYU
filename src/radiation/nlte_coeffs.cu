@@ -516,7 +516,7 @@ __global__ void compute_nlte_coefficients_kernel(
       atomicAdd(d_nan_inf_count, 1);
     }
     f = fmin(fmax(f, 0.0), 1.0);
-    // Layout contract (BUG-11): out_f (fleck) is a [n_cells x n_groups] cg
+    // Fleck-array layout contract: out_f is a [n_cells x n_groups] cg
     // array like every other per-group FLD field. The gray Fleck factor is
     // broadcast to all groups; the old per-cell write left the g > 0 slots
     // of the cg-indexed consumers stale for G > 1 (silent wrong blend).

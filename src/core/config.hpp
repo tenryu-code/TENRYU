@@ -225,7 +225,7 @@ struct Config {
       double edge_ratio = 0.1;
       int sg_order = 4;
       double sg_sigma = 0.7;
-      // k01 P0-1 (AI review 2026-07-26): graded width mapping.
+      // 2026-07-26 review: graded width mapping.
       // "legacy_estimated_radius" — historic one-shot thin-shell estimate
       //   q_k = w_k / (r_est^2 + r_ref^2) with r_ref = L/sqrt(N) on
       //   origin segments (bit-preserving default).
@@ -364,7 +364,7 @@ struct Config {
     double multiblock_cap_p = 6.0;
     int multiblock_bridge_elliptic_sweeps = 0;
     double multiblock_bridge_elliptic_omega = 0.5;
-    // BUG-25: every-step tangential projection of outer-shell corner Svec
+    // Outer-shell tangent-balance fix: every-step tangential projection of corner Svec
     // pairs (I1-B S3-T3 G1 constant-state seam GCL closure). Statically
     // load-bearing for the seam-GCL constant-state gates; under strong drive
     // it deletes tangential restoring forces on the outer arc every step and
@@ -655,7 +655,7 @@ struct Config {
       // Heat-capacity source for the Fleck stiffness beta = 4*a_eV*Te^3/C_e.
       // "table": C_e from the SAME electron-EOS table the matter Newton
       // advances (Fleck & Cummings consistency; default since the 2026-07-11
-      // external-AI verdict — docs/design/fleck_cv_default_flip_20260711.md).
+      // 2026-07-11 review — docs/design/fleck_cv_default_flip_20260711.md).
       // "legacy": the pre-flip cv chain (override -> state cv -> ideal gas),
       // kept byte-identical as the explicit frozen compatibility mode.
       std::string fleck_cv_source = "table";
@@ -1252,7 +1252,7 @@ struct Config {
       double growth_factor = 1.2;
       double max_s = 1e-9;
       double min_s = 1e-20;
-      // Stage 22 Wave 2: consecutive committed-step floor-stall detector.
+      // Consecutive committed-step floor-stall detector.
       // 0 = disabled (bit-exact baseline preserved). 32 is the production
       // policy decks may opt into.
       int floor_stall_max_consecutive_steps = 0;
@@ -1263,11 +1263,11 @@ struct Config {
       bool compatible_energy = false;
       bool rho_e_linear_grid = false;
       bool eos_writeback = true;
-      // BUG-24: EOS closure energy policy. "energy_authoritative" (default
+      // EOS closure energy policy. "energy_authoritative" (default
       // since the 2026-07-18 user ruling; production re-baselined) keeps the
       // evolved energy on table-edge inverse clamps and routes all
       // table-ceiling evaluations through the high-T ideal tail;
-      // "legacy" restores the pre-BUG-24 projection behavior (deletes the
+      // "legacy" restores the pre-fix projection behavior (deletes the
       // super-ceiling excess; kept for reproduction of old baselines).
       std::string eos_closure_mode = "energy_authoritative";
       bool qei_evaluate_at_t_n = true;
@@ -1471,7 +1471,7 @@ struct Config {
         }
       } boundary_2d;
       // 1D_SPH raw decks that omit av_type are defaulted to "csw" by the
-      // builder (2026-08-03, AV-modernization Stage 1A: limited CSW98 —
+      // builder (2026-08-03 AV modernization: limited CSW98 —
       // measured post-shock ripple 3.43% -> 1.97% rms with absorption and
       // bang-time parity). The struct default stays "vnr" because "csw"
       // here is 1D_SPH-only (2-D uses av_model) and frozen configs always
@@ -1485,7 +1485,7 @@ struct Config {
       bool total_energy_identity_check = false;
       std::string rz_momentum_scheme = "volume_weighted";
       int rz_momentum_scheme_id = 0;
-      // BUG-25: axis-node (r==0) nodal-mass convention for the multiblock CSR
+      // Axis-node (r==0) nodal-mass convention for the multiblock CSR
       // path. "corner_subzonal" (legacy) sums exact r-weighted subzonal corner
       // masses — axis nodes carry half the structured path's equal-split mass
       // and over-accelerate 4/3 under drive. "equal_split" assembles axis-node
@@ -1516,13 +1516,13 @@ struct Config {
       double post_shock_velocity_damping_C = 0.0;
       double bulk_viscosity_C = 0.0;
       double ion_art_heat_C = 0.0;
-      // k01 P0-4 (AI review 2026-07-26): 1D node-crossing timestep guard.
+      // 2026-07-26 review: 1D node-crossing timestep guard.
       // Limits the step so one cell face cannot close more than this fraction
       // of the current cell width per step (raw geometric bound, not scaled
       // by cfl_hydro). 0 disables. Never binds while the acoustic+AV
       // denominator dominates (safety >= cfl_hydro / av_quadratic).
       double crossing_dt_safety = 0.5;
-      // k01 P0-2/P0-3 (AI review 2026-07-26): 1D hydro time integrator.
+      // 2026-07-26 review: 1D hydro time integrator.
       // "legacy_pc"  — historic predictor-corrector: predictor advances only
       //                u,r,rho to the half step (energy stays at t^n) and the
       //                legacy PdV uses (P^n + P^{n+1/2})/2 (quarter-step bias).
@@ -1576,7 +1576,7 @@ struct Config {
         double taper_r_start = 0.25;
         double taper_r_end = 0.05;
         double hysteresis_w = 0.3;
-        // k01 §8.1 (AI review 2026-07-26): physical hysteresis time scale [s].
+        // 2026-07-26 review: physical hysteresis time scale [s].
         // > 0 replaces the per-step fixed blend hysteresis_w with
         // w(dt) = 1 - exp(-dt/tau) so the gate relaxation rate is
         // timestep-refinement invariant. 0 keeps the legacy fixed-w blend.
@@ -1584,7 +1584,7 @@ struct Config {
         int support_ahead = 1;
         int support_behind = 10;
       } adaptive_av;
-      // W-H (NUMERICS §3.1.x): Braginskii ion shear viscosity for the 1D
+      // Braginskii ion shear viscosity (NUMERICS §3.1.x) for the 1D
       // Lagrangian step. Default disabled => bit-identical trajectories.
       // model: "braginskii" (eta0 = 0.96 n_i kT_i tau_i, NRL tau_i/lnLambda_ii,
       // Mason-2014 mfp cap) | "constant" (uniform eta_const, verification).
@@ -1593,7 +1593,7 @@ struct Config {
         bool enabled = false;
         std::string model = "braginskii";
         // Electron-viscosity lane (2026-07-12): which Braginskii channel(s)
-        // feed pi = -eta_eff W. "ion" = W-H legacy (bit-preserving default),
+        // feed pi = -eta_eff W. "ion" = ion-only legacy (bit-preserving default),
         // "electron" = electron channel only, "both" = additive
         // eta_eff = eta_i + eta_e (regime-automatic; NUMERICS 3.1.13).
         std::string species = "ion";
@@ -1623,7 +1623,7 @@ struct Config {
       std::string solver = "sts";  // "sts" | "implicit" | "hypre"
       // "net" (legacy): alpha from net power, pairs scaled by min(alpha_c, alpha_nb).
       // "donor": alpha from the outflow sum, each pair scaled by its donor's alpha —
-      // guarantees Te_trial >= floor (BUG-18 fix, docs/design/bug18_...20260712.md).
+      // guarantees Te_trial >= floor (Te-floor guarantee fix, docs/design/bug18_...20260712.md).
       std::string sts_floor_limiter = "net";
       bool ion_conduction = false;
       double f_lim = 0.06;
@@ -1854,7 +1854,7 @@ struct Config {
       // Phase 11 - 2nd-order MS2 remap (opt-in, default legacy_split)
       std::string remap_scheme = "legacy_split";
       std::string remap_ms2_limiter = "van_leer";
-      // Wave 2A (AI review R1): the corrected oriented convention
+      // 2026-07 review: the corrected oriented convention
       // (dV > 0 = low-to-high transfer donor) is the production default.
       // The legacy reversed-donor convention survives only under
       // legacy_regression@2026-07-27 or an explicit namelist false; restarts
@@ -1977,7 +1977,7 @@ struct Config {
       bool enabled = false;
       std::string normal_estimator = "youngs_seeded_LVIRA";
       std::string t0_volume_cut_method = "adaptive_subdivision_2x2";
-      int t0_volume_cut_max_depth = 6;  // range [4, 16] (was [8, 16] in Wave A; 12 was too tight for hard step interfaces)
+      int t0_volume_cut_max_depth = 6;  // range [4, 16] (was [8, 16] initially; 12 was too tight for hard step interfaces)
       double t0_volume_cut_volfrac_tol = 1.0e-10;
       double fast_path_threshold_min = 1.0e-10;
       double fast_path_threshold_max = 0.9999999999;

@@ -104,7 +104,7 @@ struct AleStepResult {
   // driver rejects the step through the full-step retry snapshot when it
   // exceeds TENRYU_I1B_REMAP_CLOSURE_REJECT_TOL.
   double remap_mass_closure_rel = 0.0;
-  // Stage 24 Wave 1: AleMode whose RezoneResult was accepted by the
+  // AleMode whose RezoneResult was accepted by the
   // request/escalation quality gate. ScheduledDefault means no request-mode
   // rezone was accepted.
   AleMode effective_mode_executed = AleMode::ScheduledDefault;

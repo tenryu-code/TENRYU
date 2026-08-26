@@ -647,8 +647,8 @@ RezoneResult solve_planar_rezone(const RezoneInput& input,
         const double h_fd =
             params.fd_relative_step * std::sqrt(minimum_area);
 
-        // PROTOTYPE-ONLY(Stage 1-2): deterministic central finite differences
-        // replace the analytic nodal gradient until the Stage-6 GPU preparation.
+        // PROTOTYPE-ONLY: deterministic central finite differences replace the
+        // analytic nodal gradient until a later GPU-preparation revision.
         const double original_r = result.node_r[n];
         result.node_r[n] = original_r + h_fd;
         const double energy_r_plus = adjacent_patch_energy(

@@ -2860,7 +2860,7 @@ __device__ void persistent_conduction_flux_limiter_faces(
       p.n_cells <= 1) {
     return;
   }
-  // BUG-19: limiter estimate follows the face_kappa_policy of the consuming
+  // Face-kappa-policy consistency fix: limiter estimate follows the policy of the consuming
   // stage kernels (same guard as persistent_conduction_stage_geom).
   const bool limiter_face_kirchhoff =
       (p.conduction_face_kappa_policy != 0 && p.conduction_test_kappa <= 0.0);

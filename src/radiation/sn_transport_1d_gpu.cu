@@ -682,7 +682,7 @@ __global__ void build_sweep_inputs_kernel(
   const double sig_a = nonnegative_finite(sigma_a[idx]);
   const double sig_s = nonnegative_finite(sigma_s[idx]);
   sigma_t_work[idx] = sig_a + sig_s;
-  // BUG-21: the backward-Euler time source is now per-angle
+  // Per-angle time-source fix: the backward-Euler time source is now per-angle
   // (inv_cdt * psi_prev[p], added inside the sweep kernels); the historic
   // isotropized 0.5*inv_cdt*c*rad_E_old term is gone from the scalar source.
   source_work[idx] =
@@ -690,7 +690,7 @@ __global__ void build_sweep_inputs_kernel(
       0.5 * sig_s * nonnegative_finite(phi_old[idx]);
 }
 
-// BUG-21: isotropic seed for the persistent angular intensity (first step /
+// Persistent-angular-intensity fix: isotropic seed for the first step /
 // mesh change / restart): psi_iso = phi/2 = 0.5 * c * rad_E (GL weights sum
 // to 2). Step-1 sources are then bitwise-equivalent to the historic
 // isotropized construction by design.
@@ -951,7 +951,7 @@ __global__ void sn_sweep_spherical_lc_kernel(
     const double* __restrict__ mu,
     const double* __restrict__ weights,
     const double* __restrict__ alpha_half,
-    const double* __restrict__ tau_wd,  // BUG-8: weighted-diamond factors
+    const double* __restrict__ tau_wd,  // Weighted-diamond factors (conservative-streaming fix)
     const double* __restrict__ psi_prev,
     double* __restrict__ psi,
     double* __restrict__ psi_outgoing,
@@ -987,7 +987,7 @@ __global__ void sn_sweep_spherical_lc_kernel(
   const double inv_cdt =
       (dt > 0.0) ? (1.0 / (core::constants::c_light * dt)) : 0.0;
 
-  // BUG-8 fix (Miller-Alcouffe): the angular ladder is seeded with the
+  // Conservative-streaming fix (Miller-Alcouffe): the angular ladder is seeded with the
   // starting-direction (mu = -1) flux, obtained from the slab-geometry
   // equation along the diameter (no angular redistribution at zero angular
   // measure). Step-characteristic with the isotropic source.
@@ -1063,7 +1063,7 @@ __global__ void sn_sweep_spherical_lc_kernel(
       const double alpha_prev = ang_scale * neg_alpha_prev_raw;
       const double alpha_next = ang_scale * neg_alpha_next_raw;
       const double inv_V = (V > 0.0) ? (1.0 / V) : 0.0;
-      // BUG-8: the lower angular edge carries the starting-direction seed
+      // Conservative-streaming fix: the lower angular edge carries the starting-direction seed
       // for m = 0 and the weighted-diamond ladder value afterwards.
       const double edge_in = fmax(angular_edge[c], 0.0);
       // Weighted-diamond balance: eliminating psi_{m+1/2} via the closure
@@ -1077,7 +1077,7 @@ __global__ void sn_sweep_spherical_lc_kernel(
           source +
           (alpha_prev + alpha_next * (1.0 - neg_tau_wd) / neg_tau_wd) *
               edge_in * inv_V;
-      // BUG-8 conservative rewrite: solve the conservative FV balance
+      // Conservative-streaming rewrite: solve the conservative FV balance
       //   |mu| (A_dn psi_dn - A_up psi_up)/V + kappa psi_m = q_total
       // with the theta-weighted closure psi_m = theta psi_dn +
       // (1-theta) psi_up (theta precomputed into lc_A_work). For a
@@ -1172,7 +1172,7 @@ __global__ void sn_sweep_spherical_lc_kernel(
           source +
           (alpha_prev + alpha_next * (1.0 - pos_tau_wd) / pos_tau_wd) *
               edge_in * inv_V;
-      // BUG-8 conservative rewrite (see the negative branch). mu > 0:
+      // Conservative-streaming rewrite (see the negative branch). mu > 0:
       // upstream face is the geometric inner face (c).
       const double theta_sp = finite_or_zero(lc_A_work[p]);
       const double abs_mu_p = fabs(pos_mu);
@@ -1755,7 +1755,7 @@ __global__ void precompute_lc_weights_kernel(
                          : 0.0;
   const LCWeights lc = compute_lc_weights(tau);
   lc_E_work[idx] = lc.E;
-  // BUG-8 conservative rewrite: the sweep now solves the CONSERVATIVE
+  // Conservative-streaming rewrite: the sweep now solves the CONSERVATIVE
   // finite-volume balance (streaming |mu| (A_dn psi_dn - A_up psi_up)/V)
   // with a theta-weighted spatial closure psi_m = theta psi_dn +
   // (1-theta) psi_up. theta(tau) = 1/(1-e^-tau) - 1/tau (classic
@@ -1984,7 +1984,7 @@ __global__ void phi_to_rad_E_kernel(const double* __restrict__ phi,
   }
 }
 
-// BUG-21c: in effectively-void cells (per-step absorbed fraction
+// Void-anchor fix: in effectively-void cells (per-step absorbed fraction
 // lambda_pa = c dt sigma_pa below ~1e-4) the conservative flux-form E update
 // has no relaxation mechanism — any transient bookkeeping imprint freezes
 // (neutral equilibrium; measured +6..+87% vs the transport moments). There
@@ -2008,10 +2008,10 @@ __global__ void anchor_void_rad_E_to_moments_kernel(
   if (idx >= n_total) {
     return;
   }
-  // BUG-25: gate on TOTAL extinction — a thick pure-scattering cell is in the
+  // Total-extinction gate fix: a thick pure-scattering cell is in the
   // diffusion regime (AP-blend authority; E evolves via the flux form), not a
   // void. Only genuinely transparent cells (c dt (sigma_a + sigma_s) below the
-  // band) anchor rad_E to the transport moments (BUG-21c).
+  // band) anchor rad_E to the transport moments (void-anchor fix).
   const double lambda_ext = fmax(dt, 0.0) * core::constants::c_light *
                             (nonnegative_finite(sigma_a[idx]) +
                              nonnegative_finite(sigma_s[idx]));
@@ -2030,7 +2030,7 @@ __global__ void anchor_void_rad_E_to_moments_kernel(
   const double E_before = nonnegative_finite(rad_E[idx]);
   const double E_after = w * E_before + (1.0 - w) * E_moments;
   rad_E[idx] = E_after;
-  // AI review k06 C8 (2026-07-26): the anchor is deliberately nonconservative
+  // 2026-07-26 review: the anchor is deliberately nonconservative
   // (it replaces the flux-form state with the transport moment in transparent
   // cells); ledger the energy it moves so a validation run can assert the
   // anchor stayed inert (sum |dE| == 0) before trusting the run as an S_N
@@ -2199,13 +2199,13 @@ __global__ void apply_face_flux_boundary_kernel(
   const std::size_t outer =
       static_cast<std::size_t>(n_cells) * static_cast<std::size_t>(n_groups) +
       static_cast<std::size_t>(g);
-  // BUG-25: both branches use the sweep's DISCRETE outgoing half-range tally
+  // Outer-boundary escape-flux fix: both branches use the sweep's DISCRETE outgoing half-range tally
   // already accumulated into face_flux[outer] by the face reduction; Marshak
   // subtracts the discrete incoming S_neg*psi_in, vacuum has zero inflow.
   // The historic vacuum-only "Milne escape estimate" 0.5*c*E was 2x the
   // discrete outgoing flux of a near-isotropic field (S_pos*psi ~= 0.25*c*E
   // with the sum-w=2 GL convention) and broke the volume-integrated
-  // streaming-conservation identity once BUG-21c anchored rad_E to the
+  // streaming-conservation identity once the void-anchor fix anchored rad_E to the
   // transport moments (tests 1600/1603; ledger diagnostic 2026-07-19).
   const double outgoing_tally = finite_or_zero(face_flux[outer]);
   double net = outgoing_tally;
@@ -2329,8 +2329,8 @@ __global__ void compute_ap_blended_face_flux_kernel(
     return;
   }
 
-  // BUG-25: blend the outer boundary face one-sidedly (thick limit -> FLD-style
-  // diffusion boundary flux, streaming limit -> discrete transport tally); the pre-BUG-25 Milne overwrite made them coincide.
+  // Outer-boundary escape-flux fix: blend the face one-sidedly (thick limit -> FLD-style
+  // diffusion boundary flux, streaming limit -> discrete transport tally); the pre-fix Milne overwrite made them coincide.
   const bool outer_boundary = (f == n_cells);
   const int c_l = outer_boundary ? (n_cells - 1) : (f - 1);
   const int c_r = outer_boundary ? (n_cells - 1) : f;
@@ -2371,7 +2371,7 @@ __global__ void compute_ap_blended_face_flux_kernel(
       F_abs / fmax(core::constants::c_light * E_avg, kEnergyFloor);
   const double alpha_f = smooth_full_at_low(f_red, f_full, f_off);
 
-  // BUG-25: at the outer free surface the escape flux makes f_red ~ 0.25
+  // Outer-boundary escape-flux fix: at the free surface the escape flux makes f_red ~ 0.25
   // intrinsically; the reduced-flux streaming detector must not veto the
   // thick-limit diffusion closure there. tau and equilibrium factors alone
   // decide the boundary regime.
@@ -2423,7 +2423,7 @@ __global__ void compute_streaming_theta_kernel(
   theta[idx] = (out > kEnergyFloor) ? fmin(1.0, E_old / out) : 1.0;
 }
 
-// BUG-21b: pass-2 inflow credit. The donor-only cap (pass 1) makes
+// Pass-2 inflow credit. The donor-only cap (pass 1) makes
 // free-streaming pass-through impossible (a conduit cell is throttled by its
 // stored E even though the inflow replenishes it within the same step) and
 // freezes transient accumulation at a neutral equilibrium. Crediting the
@@ -3000,7 +3000,7 @@ struct SnQuadratureDeviceCache {
       compute_gauss_legendre(requested_angles, host_mu, host_weight);
       const std::vector<double> host_alpha =
           angular_coefficients(host_mu, host_weight);
-      // BUG-8 fix (Morel & Montry 1984, Eqs. 15-16): weighted-diamond
+      // Conservative-streaming fix (Morel & Montry 1984, Eqs. 15-16): weighted-diamond
       // angular closure factors. Standard cell-edge cosines partition
       // [-1, 1] by the quadrature weights (sum W = 2 convention):
       // mu_{1/2} = -1, mu_{m+1/2} = mu_{m-1/2} + W_m; tau_m places the
@@ -3926,7 +3926,7 @@ void advance_radiation_step_sn_1d(
   ensure_state_buffers(state, n_cells, n_groups, n_angles);
   initialize_rad_E_old_if_needed(state, n_cells, n_groups);
 
-  // BUG-21: (re)seed the persistent angular intensity when its size does not
+  // Persistent-angular-intensity fix: (re)seed when its size does not
   // match (first step, mesh change, restart) — isotropic from rad_E_old.
   if (state.sn_psi_prev.size() != n_psi) {
     state.sn_psi_prev.reset(n_psi);
@@ -3934,7 +3934,7 @@ void advance_radiation_step_sn_1d(
         static_cast<int>((n_psi + kBlock - 1) / static_cast<std::size_t>(kBlock));
     seed_psi_prev_from_rad_E_kernel<<<seed_grid, kBlock>>>(
         state.sn_psi_prev.data(), state.rad_E_old.data(), total, n_angles);
-    // AI review k06 C5 (2026-07-26): sn_psi_prev is not checkpointed, so a
+    // 2026-07-26 review: sn_psi_prev is not checkpointed, so a
     // restart (or mesh change) silently replaces the converged angular
     // distribution with an isotropic seed — a one-step artificial-scattering
     // transient. Surface every reseed after step 0 so restarted S_N runs
@@ -4299,7 +4299,7 @@ void advance_radiation_step_sn_1d(
     if (mat.hydro_eos_backend != "exact_ideal_gas") {
       newton.electron_eos = sn_electron_eos_device_view(mat.eos_tables.get());
     }
-    // BUG-1 Stage 2: shared per-cell effective properties (radiation can run
+    // Shared per-cell effective properties (multi-material fix; radiation can run
     // with hydro disabled, so ensure here).
     state.ensure_cell_material_props(cfg);
     newton.n_cells = n_cells;
@@ -4361,7 +4361,7 @@ void advance_radiation_step_sn_1d(
     if (state.sn_outer_residual <= effective_outer_tol || stagnated) {
       if (stagnated && !(state.sn_outer_residual <= effective_outer_tol)) {
         state.sn_outer_stagnated = true;  // 2D sets this; 1D silently omitted it
-        // AI review k06 C9 (2026-07-26): a stagnation exit is a heuristic
+        // 2026-07-26 review: a stagnation exit is a heuristic
         // acceptance above outer_tol, not convergence. The acceptance policy
         // itself is unchanged (a policy change is a user decision); this
         // makes every such exit visible so production runs can audit how
@@ -4403,7 +4403,7 @@ void advance_radiation_step_sn_1d(
     }
   }
 
-  // BUG-21: converged psi^{n+1} becomes the next step's time-source memory.
+  // Persistent-angular-intensity fix: converged psi^{n+1} becomes the next step's time-source memory.
   cuda_check(cudaMemcpyAsync(state.sn_psi_prev.data(),
                              state.sn_psi_scratch.data(),
                              n_psi * sizeof(double), cudaMemcpyDeviceToDevice,
@@ -4434,7 +4434,7 @@ void advance_radiation_step_sn_1d(
   {
     SnTimingScope timing_scope(timing, SnTimingBlock::EscapedRadEOld);
     state.sn_escaped_step = compute_escaped_energy(state, n_cells, n_groups, dt);
-    // BUG-25 follow-up (2026-07-20): the driver energy budget pairs +marshak_in
+    // Outer-boundary escape-flux follow-up (2026-07-20): the driver energy budget pairs +marshak_in
     // (source) with +escape (sink), which requires GROSS conventions on both.
     // The face ledger is NET at a Marshak boundary (outgoing - discrete inflow),
     // so add the inflow back: escape reports the gross outgoing energy and the

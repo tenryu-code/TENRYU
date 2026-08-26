@@ -9,7 +9,7 @@
 # (offset from the origin so the free rear face is away from r=0), free
 # boundaries both ends (MULTI ileft=iright=0): rear breakout is physical.
 # Coupled rad+hydro+conduction (f=0.1, both codes; TENRYU limiter is the
-# BUG-19-fixed Kirchhoff-consistent one), 2T with live exchange both codes
+# face-kappa-policy-consistent Kirchhoff one), 2T with live exchange both codes
 # (hydro ON => TENRYU Q_ei alive — the xc0a asymmetry does not apply).
 # No analytic reference: code-to-code with N-ladders (TENRYU_XC3_NR).
 import os

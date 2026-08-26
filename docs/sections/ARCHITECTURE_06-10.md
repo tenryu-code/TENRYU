@@ -20,19 +20,19 @@ drivers    ->  (coupling, io, diagnostics, materials, core, parallel)
 ### 6.1 Hydro::ALE retry repair modes
 
 `Hydro::ALE` owns the 2D_RZ rezone/remap path and the driver-requested local
-repair ladder. `AleMode::AxisVariationalProjection` is the Stage 23 Wave 1
+repair ladder. `AleMode::AxisVariationalProjection` is the
 axis-band escalation mode, default-off via
 `Numerics.ale.axis_variational_projection_enabled` (SPECIFICATION §6.4.2).
 Its ladder position is:
 
-AxisSpinePlusLocal (front-stage) → AxisVariationalProjection (Stage 23
-escalation rung) → InteriorMultiNodeProjection (Stage 22 rung) → FullWinslow
-(terminal).
+AxisSpinePlusLocal (first rung) → AxisVariationalProjection (the
+axis-band escalation rung) → InteriorMultiNodeProjection (the interior
+multi-node projection rung) → FullWinslow (terminal).
 
 `AxisVariationalProjection` is implemented as a deterministic projection-style
 half-space feasibility operator in `src/hydro/local_rezone.{cuh,cu}`. The
 algorithm, constraint set, Picard schedule, telemetry
-`record_kind="axis_projection_attempt"`, and Stage 24 carry-over items are
+`record_kind="axis_projection_attempt"`, and documented carry-over items are
 specified in NUMERICS §3.3.5 (Rezone制約 — axis variational projection 系小節).
 
 （注記 2026-07-10: 本節は doc 監査で docs/sections/ARCHITECTURE_06-10.md split

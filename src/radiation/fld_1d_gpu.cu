@@ -390,7 +390,7 @@ __device__ double harmonic_positive(const double a, const double b) {
   return 2.0 / (1.0 / a + 1.0 / b);
 }
 
-// BUG-9: face-centered flux-limiter evaluation (Turner & Stone 2001, Fig. 2:
+// Face-centered flux-limiter fix (Turner & Stone 2001, Fig. 2:
 // D lives on zone faces; CASTRO II Sec. 6.4: the limiter is what lets a
 // radiation front propagate at ~c). The previous cell-centered lambda +
 // harmonic averaging collapsed the face D to ~2*D_cold at a hot/cold front
@@ -792,7 +792,7 @@ __device__ inline void update_matter_body(
     } else if (cv_e_override > 0.0) {
       cv_mass = cv_e_override / rho_c;
     } else {
-      // BUG-1 Stage 2: per-cell effective properties (was materials[0]'s
+      // Shared per-cell effective properties (multi-material fix; was materials[0]'s
       // scalar A/gamma for every cell — wrong in multi-material decks).
       const double gamma_c = fmax(gamma_eff[c], 1.0 + 1.0e-12);
       const double gm1 = fmax(gamma_c - 1.0, 1.0e-12);
@@ -2269,7 +2269,7 @@ void advance_radiation_step_fld_1d(
   // per step. Start-of-solve copy is byte-identical for every no-coupling
   // config and correct under coupling.)
   copy_rad_E_to_old(state, n_cells, n_groups);
-  // BUG-1 Stage 2: matter coupling consumes the shared per-cell effective
+  // Matter coupling consumes the shared per-cell effective properties (multi-material fix)
   // properties (radiation can run with hydro disabled, so ensure here too).
   state.ensure_cell_material_props(cfg);
 

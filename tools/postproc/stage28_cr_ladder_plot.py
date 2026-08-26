@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Plot Stage 28 CR ladder diagnostics from a history HDF5 file.
+"""Plot CR ladder diagnostics from a history HDF5 file.
 
 Usage: python tools/postproc/stage28_cr_ladder_plot.py --input history.h5 --out-dir tmp/stage28-plots/
 """

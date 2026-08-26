@@ -147,7 +147,7 @@ Tensor2 build_structure_tensor(double grad_rho_r,
 
 Result compute_monitor(const Input& input, const Params& params);
 
-// Stage 0 is deliberately log-only: run_info has no natural dynamic summary
+// This implementation is deliberately log-only: run_info has no natural dynamic summary
 // hook at the post-Lagrange ALE entry point. This adapter copies state to the
 // host, never mutates simulation state, and emits at most one summary line.
 void maybe_log_post_lagrange(const core::State& state,

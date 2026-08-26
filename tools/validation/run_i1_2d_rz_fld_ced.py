@@ -2399,7 +2399,7 @@ def main(argv: list[str] | None = None) -> int:
         "grids": [{"nr": nr, "nz": nz} for nr, nz in args.grids],
         "init_mode": args.init_mode,
         "boundary_mode": args.boundary_mode,
-        "strict_scope": "PR4 production strict: three-grid Richardson plus Wave 12 shock-windowed gates",
+        "strict_scope": "production strict: three-grid Richardson plus shock-windowed gates",
         "t_end_override_s": args.t_end_s,
         "t0_admissibility": {"rows": t0_rows, "aggregate": t0_aggregate},
         "first_step_audit": {"rows": first_step_rows},

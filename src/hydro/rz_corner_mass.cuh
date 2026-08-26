@@ -34,7 +34,7 @@ struct CornerMassFallbackRecorder {
   CornerMassFallbackRecord first;
 };
 
-// F-09 production-stage mapping:
+// Production mapping:
 //  1 hydro structured corner mass; 2 hydro multiblock exact-subpolygon;
 //  3/4 HLLC pre/post corner mass; 5 CSR node projection;
 //  6/7 CSR pre/post KE; 8/9/10 CSR total-energy scale/build/recover;

@@ -588,7 +588,7 @@ if CENTRAL_PSEUDO_CORE_ENABLED:
         central_pseudo_core_s_c=CENTRAL_PSEUDO_CORE_S_C_CM,
         central_pseudo_core_ring_absorption_enabled=(CASE == "D"),
     )
-    # Namelist-path mode for the core1d sub-model (promotion package Wave A):
+    # Namelist-path mode for the core1d sub-model (namelist-path promotion package):
     # emit the promoted parameters through the namelist instead of relying on
     # the historical TENRYU_I1B_CORE_1D_* C++ envs. Default off; the
     # env-override convention keeps existing scripts working unchanged.
@@ -606,8 +606,8 @@ if CENTRAL_PSEUDO_CORE_ENABLED:
             central_pseudo_core_core1d_dist_append=_env_bool(
                 PREFIX + "DECK_CORE1D_DIST_APPEND", False),
         )
-    # Namelist-path mode for the absorption schedules, terminal endgame and
-    # remap conservation gate (promotion Waves B/C/D verification).
+    # Namelist-path mode for the absorption schedules, terminal absorption and
+    # remap conservation gate (promotion verification).
     if _env_float(PREFIX + "DECK_PC_NAMELIST", 1.0 if CASE == "D" else 0.0) > 0.0:
         ale_config.update(
             central_pseudo_core_spherical_absorb_gasfront=True,
@@ -623,7 +623,7 @@ if CENTRAL_PSEUDO_CORE_ENABLED:
                 PREFIX + "DECK_PC_CLOSURE_TOL", 1.0e-8),
         )
     # Namelist-path mode for the certified transport/robustness flags
-    # (promotion Wave E verification).
+    # (promotion verification).
     if _env_float(PREFIX + "DECK_FLAGS_NAMELIST", 1.0 if CASE == "D" else 0.0) > 0.0:
         ale_config.update(
             csr_optionb_coherent_enabled=True,

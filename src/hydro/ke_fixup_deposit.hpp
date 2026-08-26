@@ -14,7 +14,7 @@ namespace tenryu::hydro::ale {
 // state.corner_mass nodal sums M^F) and the remap's own first-moment
 // basis (M^{B,-} pre / M^{B,+} post) disagree, so each velocity change
 // carries a basis-weighted KE residual no ledger compensates (the
-// adjudicated -1%..+21% endgame drift). This deposits that residual,
+// adjudicated -1%..+21% terminal-phase drift). This deposits that residual,
 // SIGNED, into cell internal energy so the energy budget closes. The
 // momentum defect remains — this is the verdict's interim measure, not
 // the basis-contract fix (PR5/6).

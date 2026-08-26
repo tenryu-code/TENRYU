@@ -37,7 +37,7 @@ struct MeshFailureAttributionRecord {
   std::uint8_t dominant_source = static_cast<std::uint8_t>(MeshDeformSource::Other);
   double dominant_fraction = 0.0;
   double nonlinear_residual = 0.0;
-  // Stage 24 Wave 0 telemetry. Zero-initialized here; attribution kernels may
+  // Axis-failure telemetry. Zero-initialized here; attribution kernels may
   // populate these only when TENRYU_STAGE24_TELEMETRY=1.
   double d_area_dt_by_source[kMeshDeformSourceCount] = {};
   double d_rzvol_dt_by_source[kMeshDeformSourceCount] = {};

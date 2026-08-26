@@ -306,7 +306,7 @@ const std::vector<double>& mg_gate_bounds_eV() {
   return bounds;
 }
 
-// ---- Mission 2 (BUG-11 coverage): table_nlte fixture plumbing ----
+// ---- Multigroup-coverage extension: table_nlte fixture plumbing ----
 
 constexpr const char* kMgNlteFixturePath = "tests/data/ionmix_mg_fld_g4.cn4";
 
@@ -982,7 +982,7 @@ bool run_fld_1d_mg_planar_freqdep_relaxation_verify() {
   return pass;
 }
 
-// Mission 2, gate C. Same physics target and check structure as
+// Multigroup-coverage gate C. Same physics target and check structure as
 // run_fld_1d_mg_planar_marshak_spectrum_verify, but every coefficient flows
 // through the table_nlte path (evaluate_fld_opacity_and_emission ->
 // compute_nlte_coefficients_cuda_with_pe, src/radiation/nlte_coeffs.cu):
@@ -1157,7 +1157,7 @@ bool run_fld_1d_mg_nlte_marshak_spectrum_verify() {
   return pass;
 }
 
-// Mission 2, gate D — the BUG-11-class detector. table_nlte, uniform slab,
+// Multigroup-coverage gate D — the fleck-array layout detector. table_nlte, uniform slab,
 // reflect outer, E(0) = 0, Te0 = 50 eV, and max_outer_iterations = 1 so the
 // published E1 is EXACTLY the single backward-Euler solve with eta(Te0) and
 // f(Te0):
@@ -1170,10 +1170,10 @@ bool run_fld_1d_mg_nlte_marshak_spectrum_verify() {
 // dt = 2e-11 puts z = beta c dt sigma_p_em ~ 1.01 => f_ref ~ 0.4967 with
 // sigma_p_em = rho sum_g b_g kappa_g ~ 246.4 /cm. Checks: (i) f_meas is
 // group-INDEPENDENT (the gray f is broadcast to every group slot — the
-// BUG-11 layout contract), (ii) cell-uniform, (iii) matches the replicated
-// formula. Under the pre-BUG-11 code the g > 0 slots of cells c >= 1 read
+// fleck-array layout contract), (ii) cell-uniform, (iii) matches the replicated
+// formula. Under the pre-fix code the g > 0 slots of cells c >= 1 read
 // stale memory (cell 0's slots alias the old per-cell values), so (i)/(ii)
-// fail decisively — this gate is the regression lock for BUG-11.
+// fail decisively — this gate is the regression lock for the layout fix.
 bool run_fld_1d_mg_nlte_fleck_probe_verify() {
   const std::string label = "fld_1d_mg_nlte_fleck_probe";
   if (!mg_verify_cuda_available(label.c_str())) {

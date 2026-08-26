@@ -2099,11 +2099,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dt-max-s", type=float, default=None)
     parser.add_argument("--verbosity", choices=("quiet", "normal", "verbose"), default="quiet")
     parser.add_argument("--wall-time-s", type=float, default=None)
-    parser.add_argument("--dump-profiles", action="store_true", help="write Wave 5 per-snapshot profile CSV dumps")
+    parser.add_argument("--dump-profiles", action="store_true", help="write per-snapshot profile CSV dumps")
     parser.add_argument(
         "--allow-partial-checkpoint",
         action="store_true",
-        help="return success for the Phase A partial checkpoint when gates 1-2 and t=0 pass",
+        help="return success for the partial checkpoint when gates 1-2 and t=0 pass",
     )
     return parser
 

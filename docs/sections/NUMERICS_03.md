@@ -18,7 +18,7 @@ W-G 以前のリテラル式と同一の浮動小数点演算順で評価する�
 各呼び出し箇所は歴史的綴りを維持する。非球面の対応範囲と ConfigError 制約は
 SPECIFICATION §6.4 Mesh（imc_ddmc 不可 / cylindrical+S_N は W-G3 まで不可 /
 laser は radial_absorption_1d 限定）。W-G1=平面（全現行物理; 平面 S_N は
-\(\alpha\equiv0\) で角度再配分が恒等的に消え、BUG-8 の球面 flux dip と
+\(\alpha\equiv0\) で角度再配分が恒等的に消え、既知の球面 flux dip と
 無縁）、W-G2=円筒（FLD + 電子熱伝導 — 伝導カーネルは §4.1a の
 template\<int GEOM\> 化で 3 幾何対応、2026-07-04）、W-G3=円筒 S_N
 （積求積、別設計）。
@@ -73,8 +73,8 @@ q_k = \frac{w_k}{(r_k^{\mathrm{est}})^2 + r_{\mathrm{ref}}^2}, \qquad
 \(r_{\mathrm{guard}}=10^{-20}\,\mathrm{cm}\) の max クリップは実装に存在
 しない。実装は上記の \(r_{\mathrm{ref}}\) 加算正則化であり、これが無いと
 原点区間では \(N \to \infty\) でも第 1 セルが区間長の \(8/\pi^2 \approx 81\%\)
-・一様密度質量の約 53% を占める定性的破綻になる — AI review 2026-07-26
-k01 P0-1 の指摘は旧スペック式に対して正しい。\(r_{\mathrm{ref}}\) 付きの
+・一様密度質量の約 53% を占める定性的破綻になる — 2026-07-26 カーネルレビューの
+指摘は旧スペック式に対して正しい。\(r_{\mathrm{ref}}\) 付きの
 実装では第 1 セル幅は \((2/\pi)L_s/\sqrt{n_s}\) に整い、質量比は
 \(O(n_s^{-3/2})\) で消える）。これにより
 \[
@@ -84,8 +84,8 @@ m_k \propto r_k^2 \Delta r_k \approx w_k
 \(r^{\mathrm{est}}\) は生成後の実セル中心と自己無撞着でないため、原点近傍
 では質量分布は \(w_k\) 比から有界にずれる（中心側へ過剰細分化する側）。
 
-**`Mesh.grid.grading.mapping="exact_measure_v2"`（opt-in、1D 専用；k01
-P0-1 是正）**：推定半径近似を使わず、累積重み分率
+**`Mesh.grid.grading.mapping="exact_measure_v2"`（opt-in、1D 専用；
+2026-07-26 是正）**：推定半径近似を使わず、累積重み分率
 \[
 W_k = \frac{\sum_{\ell=0}^{k} w_\ell}{\sum_{\ell=0}^{n_s-1} w_\ell}
 \]
@@ -125,14 +125,14 @@ d = \begin{cases} 3 & \text{spherical} \\ 2 & \text{cylindrical} \\ 1 & \text{pl
 最初と最後の区間は片側境界だけを固定し、残りセルを同様に再スケールする。
 セル数が少なすぎて境界目標幅と区間長を両立できない場合は、その構成は不正とする。
 
-> **優先順位の正典化（2026-07-26 AI カーネルレビュー k17 Z-01）**: 本構成は
+> **優先順位の正典化（2026-07-26 カーネルレビュー）**: 本構成は
 > 「区間総長さの厳密保存」と「界面近傍セル幅の連続（幾何平均目標）」を厳密に
 > 満たし、その代償として「セル質量が \(w_k\) に厳密比例」は近似に留める
 > （\(q_k\) は一回評価の推定半径に基づき、境界幅補正はさらに \(w_k\) から
 > ずらす）。厳密 mass-coordinate 生成（\(r_i=[a^3+(b^3-a^3)W_i/W]^{1/3}\)）は
-> 未実装の将来 opt-in 候補（レビュー Z-02、ユーザー裁定待ち）。
+> 未実装の将来 opt-in 候補（ユーザー裁定待ち）。
 >
-> **実行可能条件の enforcement（同 Z-03; 実装 `graded_grid_apply_boundary_targets`）**:
+> **実行可能条件の enforcement（実装 `graded_grid_apply_boundary_targets`）**:
 > 「不正とする」の実体は fail-loud assert 群 — \(n_s=1\): 目標幅=区間長（両側
 > 目標時は一致も要求）、\(n_s=2\)（両側目標）: \(h_L+h_R=L_s\)、\(n_s\ge3\):
 > 補正前後の内部幅和 \(>0\)（\(L_s-h_L-h_R>0\) と等価）。補正後は全幅の
@@ -230,7 +230,7 @@ and the two-face area average used by 1D node/cell diagnostics is
 \(0.5\,2\pi(r_a+r_b)\).  Implementation is by compile-time `Geometry1D`
 template forks of the 1D kernels; spherical branches keep the historical
 arithmetic verbatim (bitwise regime), with 1D_SPH bit-neutrality anchored by
-`tests/hydro/test_1d_sph_bitwise_golden.cu`.  Wave-1 scope is the pure hydro
+`tests/hydro/test_1d_sph_bitwise_golden.cu`.  The initial scope is the pure hydro
 core: radiation, laser, conduction, and ale1d are rejected at validation.  The
 boundary-PdV energy-audit diagnostic is geometry-aware.  The Sedov gate is
 H3-RADIAL-CYL multi-grid exponent \(1/2\).
@@ -561,7 +561,7 @@ guard で無効化された pair 数を表す。
   表示式を「正規化した比」と呼ぶのみで正規化式を欠いており、字義どおりでは
   \(\tilde f_e + \tilde f_{iQ} \ne 1\) の場合（例: 負の cold pressure）に
   総 work の過大・過小配分＝保存則違反を意味した。実装は当初からこの
-  後段正規化を持つ — AI review 2026-07-26 k01 P0-6）。
+  後段正規化を持つ — 2026-07-26 カーネルレビュー指摘）。
   \(\tilde f_e+\tilde f_{iQ}=0\)（または非有限）の退化セルでは 1/2–1/2 とする。
   v1 では artificial-viscosity pressure work \(Q_i^{n+1/2}\) は常に ion energy へ含める。
   TMAT 2T path では compatible work と \(Q_{ei}\) transfer は分離し、
@@ -649,8 +649,8 @@ guard で無効化された pair 数を表す。
   \qquad
   |F^{ee}_{i+1/2}| \le \mu_{i+1/2}\,|e_{e,i+1} - e_{e,i}|
   \]
-  を課して与える（符号は raw のまま；**2026-07-26 追加、AI review k01
-  §4.1**: 強い質量 grading では \(M^{ee}_{i+1/2} = \rho_f V_{harm}\) が軽い
+  を課して与える（符号は raw のまま；**2026-07-26 追加**:
+  強い質量 grading では \(M^{ee}_{i+1/2} = \rho_f V_{harm}\) が軽い
   セル自身の質量を超え、cap 無しの一発交換が軽セルの \(e_e\) を相手側を
   越えて負値まで押し込み得た。reduced-mass cap は両セルを
   \([\min(e_L,e_R),\max(e_L,e_R)]\) hull 内に保つ（正値性・単調性）。
@@ -694,7 +694,7 @@ coupling と同一である。さらに \(m_{ei}\Delta t \ll \tau_{eff}\) では
 \(f_{relax}\approx m_{ei}\Delta t/\tau_{eff}\) となり、
 \(q_{ei}^{step}\approx m_{ei}Q_{ei}\Delta t/\rho\) に一致する。
 
-> **床との整合（2026-07-26、AI review k15 1.4/P0-4）**: 実装は shared transfer を
+> **床との整合（2026-07-26）**: 実装は shared transfer を
 > 許容区間 \(q\in[-\max(e_i,0),\ \max(e_e,0)]\) へ bracket してから
 > \(e_e\mathrel{-}=q\)、\(e_i\mathrel{+}=q\) を一つの適用量で更新する
 > （1D: `qei_coupling_substep_kernel`・`apply_qei_transfer_2t_kernel`・
@@ -704,7 +704,7 @@ coupling と同一である。さらに \(m_{ei}\Delta t \ll \tau_{eff}\) では
 > 発火時は移送を admissible 区間端でクリップする（エネルギー生成なし、
 > hydro 側は clip を `clamp_count` で計数）。\(f_{relax}\) の数値評価は
 > `-expm1(-x)`（\(x\ll1\) の桁落ち回避、旧 `1-exp(-x)` は相対 ~eps/x 損失）。
-> 2D hydro corrector 内の同型独立 clamp は別レーン所掌（cross-lane 項）。
+> 2D hydro corrector 内の同型独立 clamp は2D 側の対応項目。
 
 **温度更新**：EOS（§1.1.5）を用いて
 \[
@@ -1173,7 +1173,7 @@ A_j = 4\pi r_j^2
 - セル中心半径：\(r_{c,i} = (r_j + r_{j+1})/2\)
 - 境界条件：\(H_0 = H_N = 0\)。`hydro_active` の非活性界面でも \(H=0\) とする
 - 既定：\(C_H = 0.0\)。`av_heat_C = 0` で人工熱流束を無効化する
-- **AV type 別の \(\chi\) と有効性（2026-07-26 明確化、AI review k03 F-13）**：
+- **AV type 別の \(\chi\) と有効性（2026-07-26 明確化）**：
   \(\chi_i\) は有効な AV type 自身の limited compression を用いる —
   `vnr` は Christensen limiter 後の \(\chi_i\)、`csw` は §3.1.6 CSW の
   \(\chi^{lim}_i\)。`av_type="riemann"` および `"riemann_compatible"` では
@@ -1212,14 +1212,14 @@ c_{s,j}=\frac{c_{s,L}+c_{s,R}}{2},
 c_{s,j}^2=\frac{c_{s,L}^2+c_{s,R}^2}{2},\quad
 c_{v,i,j}=\frac{c_{v,i,L}+c_{v,i,R}}{2}
 \]
-である。**face 音速の 2 定義の使い分け（2026-07-26 明確化、AI review k01
-§4.5）**: 算術平均 \(c_{s,j}\) は compression Mach sensor
+である。**face 音速の 2 定義の使い分け（2026-07-26 明確化）**:
+算術平均 \(c_{s,j}\) は compression Mach sensor
 \(M_c = \Delta n_j\theta_j/c_{s,j}\) にのみ、二乗平均 \(c_{s,j}^2\) は
 contact sensor の分母 \(c_{s,j}^2|\Delta\rho|\) にのみ使う（それぞれ速度
 スケール・音響インピーダンススケールとしての用途別であり、同一式内で
 混用しない）。EOS が `state.cv_i` を持たない ideal-gas path では解析的なイオン
-\(c_v\) を用いる。**係数の名称について（2026-07-26 明確化、AI review k03
-F-14）**: TENRYU の EOS state は \(c_p\) を保持せず、本演算子の熱容量は
+\(c_v\) を用いる。**係数の名称について（2026-07-26 明確化）**:
+TENRYU の EOS state は \(c_p\) を保持せず、本演算子の熱容量は
 一貫して mass-specific \(c_{v,i}\) [erg g\(^{-1}\) eV\(^{-1}\)] である。
 expert specification 由来の記号 \(c_p\) は本仕様では使用しない（\(c_p\) を
 入力とする式に \(c_v\) を代入しているのではなく、演算子定義そのものが
@@ -1277,7 +1277,7 @@ C_{L/R} = \Delta M_{L/R}\,c_{v,i,L/R},\qquad
 \[
 \kappa^{ion}_j=\min(\kappa^{raw}_j,\kappa^{cap}_j)
 \]
-とする（**2026-07-26 是正、AI review k01 §4.4 / k03 F-14**: 旧 slab 型 cap
+とする（**2026-07-26 是正**: 旧 slab 型 cap
 \(0.25\rho_j c_{v,i,j}\Delta n_j^2/\Delta t\) は面面積と軽い側セルの熱容量を
 無視しており、graded/球面メッシュで軽セル側の明示安定限界を超え得た。
 新 cap は face 交換の陽的更新
@@ -1357,7 +1357,7 @@ C_{bulk}\,\rho_i\,c_{s,i}\,
   膨張中に正の scalar pressure を残すと粘性仕事 \(-Q\,dV/dt\) が負になり、
   内部エネルギーを運動エネルギーへ戻す反散逸（エントロピー減少）となるため
   （Caramana–Shashkov–Whalen 1998 の「人工粘性は膨張でゼロ」要件；
-  AI review 2026-07-26 k01 P0-5 / k03 F-03 で是正。旧仕様は圧縮・膨張の
+  2026-07-26 カーネルレビューで是正。旧仕様は圧縮・膨張の
   両方で作用としていたが、これは熱力学的に誤りであった）
 - 適用対象は active な圧縮セル全体であり、shock front では通常の AV が支配的、post-shock 圧縮域では \(Q_i^{bulk}\) が残留速度振動を減衰する
 - 既定：`bulk_viscosity_C = 0.0`（無効）
@@ -1380,7 +1380,7 @@ Q_i^{probe} > 0.01\max_k Q_k^{probe},\qquad
 J_P > 0.02 \;\lor\; J_\rho > 0.01
 \]
 
-（**2026-07-26 記法是正、AI review k03 F-05**: 旧記法
+（**2026-07-26 記法是正**: 旧記法
 \(\max(J_P,J_\rho) > (0.02,0.01)\) はスカラーと順序対の比較で数学的に
 未定義だった。実装は上記の論理和である）
 
@@ -1429,7 +1429,7 @@ g_i^{n+1} = (1-w)g_i^n + w\,g_i^{target}
 \[
 w(\Delta t) = 1 - \exp(-\Delta t/\tau_g),\qquad \tau_g = \texttt{hysteresis\_tau}
 \]
-を用いる（**2026-07-26 追加、AI review k01 §8.1 / k03 F-05**: 固定 \(w\) は
+を用いる（**2026-07-26 追加**: 固定 \(w\) は
 gate 緩和率が step 数依存になり \(\Delta t\) refinement で AV 履歴が収束
 しない。\(\tau_g\) 形は同一物理時間で同一の緩和を与える。既定
 `hysteresis_tau=0` は legacy 固定 \(w\) を bitwise 保存）。係数は
@@ -1469,7 +1469,7 @@ M_j\,\frac{du_j}{dt} = -A_j\,(p_{q,i} - p_{q,i-1}),\qquad A_j = 4\pi r_j^2
 \(du_j/dt = 0\)**（uniform-pressure null）。これは連続極限
 \(-\rho^{-1}\partial P/\partial r = 0\) と整合する。
 
-> **2026-07-26 スペック是正（AI review k01 §2.12）**: 旧記載は
+> **2026-07-26 スペック是正（カーネルレビュー）**: 旧記載は
 > \(A_{j+1}P - A_jP = 4\pi P(r_{j+1}^2 - r_j^2) \ne 0\) を「球殻の幾何加速」
 > として掲げていたが、これは誤りである。この面積差項は球殻表面の radial
 > スカラー射影だけを抜き出したもので、側面（横方向）圧力の radial 成分と
@@ -1500,16 +1500,16 @@ M_j\,\frac{du_j}{dt} = -A_j\,(p_{q,i} - p_{q,i-1}),\qquad A_j = 4\pi r_j^2
   \]
   を用いる。
 - `av_type="csw"` では、CFL 分母の AV 補正係数 \(C_1, C_2\) に
-  `csw_C1`, `csw_C2` を用いる（AI review 2026-07-26 k03 §10 是正 —
+  `csw_C1`, `csw_C2` を用いる（2026-07-26 カーネルレビューで是正 —
   旧実装は `av_linear`/`av_quadratic` を流用しており、CSW 係数の方が
   大きい既定（0.5/2.0 vs 0.1/1.5）では AV 剛性を過小評価していた）。
-- `av_type="riemann_compatible"`（2026-08-03、k03 §10 同型是正を実装時に
+- `av_type="riemann_compatible"`（2026-08-03、同型是正を実装時に
   適用）でも VNR 係数を CFL に使用せず、raw nodal 圧縮 jump
   \(\max(0,\ u_i-u_{i+1})\) を CFL 分母へ加算する（BJ 制限付き射影 jump の
   上位スケール。\(b_1\Delta u\) でなく \(\Delta u\) を加える点も保守側）。
   acoustic estimator・argmin 診断は `riemann` と同じ扱い
   （`av_linear` のまま — 主 CFL カーネルが AV 剛性を担う）。
-- **節点交差ガード（k01 P0-4, AI review 2026-07-26）**：acoustic+AV 分母は
+- **節点交差ガード（2026-07-26 カーネルレビュー指摘）**：acoustic+AV 分母は
   冷たい滑らかな圧縮（\(c_s \to 0\), limiter により \(\chi_i \to 0\)）で
   消失しうるが、セル面は \(u_i - u_{i+1} > 0\) の速度で幾何学的に閉じ続ける。
   これを防ぐため
@@ -1528,8 +1528,8 @@ M_j\,\frac{du_j}{dt} = -A_j\,(p_{q,i} - p_{q,i-1}),\qquad A_j = 4\pi r_j^2
   非正体積検出 + driver full-step retry がバックストップ）。
 - `post_shock_heat=True` のときは、post-shock 熱流束演算子
   （flux \(= -C_{ps}\rho_f c_{s,f}\psi_f (e_R - e_L)\)、face 長は打ち消える）
-  の**行和コンダクタンス束縛**を追加評価する（AI review 2026-07-26 k01
-  §4.3 是正 — 旧式 \(0.5\Delta r_i/(C_{ps}\psi_i c_{s,i})\) は graded mesh
+  の**行和コンダクタンス束縛**を追加評価する（2026-07-26
+  カーネルレビューで是正 — 旧式 \(0.5\Delta r_i/(C_{ps}\psi_i c_{s,i})\) は graded mesh
   と密度ジャンプ面で拡散率を過小評価していた）：
   \[
   G_f = A_f\,C_{ps}\,\rho_f\,c_{s,f}\,\psi_f,\qquad
@@ -1552,7 +1552,7 @@ M_j\,\frac{du_j}{dt} = -A_j\,(p_{q,i} - p_{q,i-1}),\qquad A_j = 4\pi r_j^2
   \frac{0.5\,m_i}{\sum_{f \in \partial i} G_f^{H}}
   \]
   を追加評価する（\(l_f = (\Delta r_L + \Delta r_R)/2\)、
-  \(\chi_f = \max(\chi_L, \chi_R)\)；k01 §4.2 — 従来 \(H\) には専用の
+  \(\chi_f = \max(\chi_L, \chi_R)\)；2026-07-26 カーネルレビュー指摘 — 従来 \(H\) には専用の
   timestep 制約が無かった）。`av_type="csw"` の \(H\)（\(\chi^{lim}\) 使用）
   は本束縛の対象外（従来マージン運用のまま）。
   いずれの \(\psi, \chi\) も CFL 時点（\(t^n\) 状態）の値で評価するため、
@@ -1593,7 +1593,7 @@ M_j\,\frac{du_j}{dt} = -A_j\,(p_{q,i} - p_{q,i-1}),\qquad A_j = 4\pi r_j^2
 > exact compatible path では Corrector 加速度に使った
 > \(P_e^{n+1/2}, P_i^{n+1/2}, Q^{n+1/2}\) と filter 後の \(p_q^{n+1/2}\) をそのまま使う。
 
-> **既知の時間精度制限（legacy_pc；AI review 2026-07-26 k01 P0-2/P0-3）**：
+> **既知の時間精度制限（legacy_pc；2026-07-26 カーネルレビュー指摘）**：
 > Predictor は \(e_e, e_i\) を half step へ進めないため、EOS の返す
 > \(P^{n+1/2} = P(\rho^{n+1/2}, e^n)\) は断熱圧縮でエネルギー寄与分
 > \(O(\Delta t)\) だけ真の midpoint 圧力から外れる（理想気体断熱で
@@ -1603,8 +1603,8 @@ M_j\,\frac{du_j}{dt} = -A_j\,(p_{q,i} - p_{q,i-1}),\qquad A_j = 4\pi r_j^2
 > 時間 1 次精度（圧縮加熱の系統的過小評価）に留まる。歴史的挙動として
 > bitwise 保存するため legacy_pc 既定は据え置く。
 
-**`Numerics.hydro.time_integrator="midpoint_v2"`（opt-in、1D 専用；k01
-P0-2/P0-3 是正）**：Predictor 段で全熱力学状態を half step へ進める。
+**`Numerics.hydro.time_integrator="midpoint_v2"`（opt-in、1D 専用；
+2026-07-26 是正）**：Predictor 段で全熱力学状態を half step へ進める。
 
 1. Predictor の座標半更新・\(\rho^{n+1/2}\) 再計算の後、EOS closure の前に
    stage エネルギー更新を行う：
@@ -1655,8 +1655,8 @@ P0-2/P0-3 是正）**：Predictor 段で全熱力学状態を half step へ進�
   compatible work の両方で同じ \(p_q - p_{q,ghost}\) を使うため、境界面の
   \(Q\) は力・仕事の双方から一貫して打ち消える）
 
-**節点量のゴースト規約（スカラー量とは別系統；2026-07-26 明確化、AI review
-k01 §2.11）**：AV の slope 再構成（§3.1.6 の \(\sigma_j\)）が参照する仮想
+**節点量のゴースト規約（スカラー量とは別系統；
+2026-07-26 明確化）**：AV の slope 再構成（§3.1.6 の \(\sigma_j\)）が参照する仮想
 節点は次で定義する：
 - 中心（\(j=0\)）：鏡映 \(r_{-1} = -r_1\)、\(u_{-1} = -u_1\)
 - 外側（\(j=N\)）：線形外挿 \(r_{N+1} = 2r_N - r_{N-1}\)、
@@ -1792,9 +1792,9 @@ voidゾーン：等半径間隔 \(\Delta r = (r_{out} - r_{in}) / N\)。
 - `violations`：`mass_ratio_max` 超過のゾーン数（void境界は除外）
 - 警告メッセージ：`dr_min binding`（ハード制約発動）、`mass-ratio relaxation`（ソフト制約緩和）
 
-#### 3.1.13 Braginskii プラズマ粘性（W-H イオン 2026-07-04 / 電子 channel 2026-07-12 / 2D species port 2026-07-17）
+#### 3.1.13 Braginskii プラズマ粘性（イオン channel 2026-07-04 / 電子 channel 2026-07-12 / 2D species port 2026-07-17）
 
-Physical-viscosity module adding unmagnetized Braginskii shear viscosity (ion + electron channels, single-fluid \(V_e=V_i\)) to the 1D (all geometries) and 2D RZ Lagrangian steps (**default OFF** — namelist `Numerics.hydro.plasma_viscosity`; diagnostic env hooks `TENRYU_BRAG_{ENABLE,MODEL,SPECIES,ETA_CONST,ETA0_SCALE,MFP_CAP_CELLS,LNLAMBDA_FIXED,DT_SAFETY}` remain available; all unset leaves the module inactive and bit-identical. `species="ion"` (default) is bit-identical to the pre-electron W-H trajectories in BOTH dims — the kernels are SPECIES-templated with a source-identical ion branch). Implementation: `src/hydro/braginskii_viscosity.{cuh,cu}`, `src/hydro/braginskii_viscosity_device.cuh` (shared coefficient device functions), and `src/hydro/braginskii_viscosity_2d.cu`; designs: `docs/design/wh_braginskii_viscosity_design.md` (ion), `docs/design/2d_visc_port_spec.md` (2D RZ), `docs/design/electron_viscosity_1d_20260712.md` (electron channel + regime adjudication, landed on feature/1d-brushup), `docs/design/visc_2d_parity_20260717.md` (this branch's port + 2D species extension); literature: Braginskii 1965（原典照合 2026-07-12: τ_e=Eq.(2.5e)、η₀^e=Eq.(2.25) "(Z=1)" 明記、η₀^i=Eq.(2.22)）/ Whitney PoP 6, 816 (1999)（η₀₀^e(Z)、一次文献は調達依頼中）/ Velikovich, Whitney & Thornhill PoP 8, 4524 (2001)（電子粘性 shock 加熱の物理; η₀₀^e(Z) 転写元 Eq.(3)）/ Hunana ApJS (2022)（η₀₀^e=0.73094 近代追認）/ Vold et al. PoP 22, 112708 (2015) (1D spherical reference implementation) / Manheimer & Colombant LPB 25, 541 (2007) (coefficient transcription) / Mason et al. PoP 21, 022705 (2014) (mfp cap) / Miller CF 210, 104672 (2020) / Haines PoP 31, 050501 (2024).
+Physical-viscosity module adding unmagnetized Braginskii shear viscosity (ion + electron channels, single-fluid \(V_e=V_i\)) to the 1D (all geometries) and 2D RZ Lagrangian steps (**default OFF** — namelist `Numerics.hydro.plasma_viscosity`; diagnostic env hooks `TENRYU_BRAG_{ENABLE,MODEL,SPECIES,ETA_CONST,ETA0_SCALE,MFP_CAP_CELLS,LNLAMBDA_FIXED,DT_SAFETY}` remain available; all unset leaves the module inactive and bit-identical. `species="ion"` (default) is bit-identical to the pre-electron ion-only trajectories in BOTH dims — the kernels are SPECIES-templated with a source-identical ion branch). Implementation: `src/hydro/braginskii_viscosity.{cuh,cu}`, `src/hydro/braginskii_viscosity_device.cuh` (shared coefficient device functions), and `src/hydro/braginskii_viscosity_2d.cu`; designs: `docs/design/wh_braginskii_viscosity_design.md` (ion), `docs/design/2d_visc_port_spec.md` (2D RZ), `docs/design/electron_viscosity_1d_20260712.md` (electron channel + regime adjudication, landed on feature/1d-brushup), `docs/design/visc_2d_parity_20260717.md` (this branch's port + 2D species extension); literature: Braginskii 1965（原典照合 2026-07-12: τ_e=Eq.(2.5e)、η₀^e=Eq.(2.25) "(Z=1)" 明記、η₀^i=Eq.(2.22)）/ Whitney PoP 6, 816 (1999)（η₀₀^e(Z)、一次文献は調達依頼中）/ Velikovich, Whitney & Thornhill PoP 8, 4524 (2001)（電子粘性 shock 加熱の物理; η₀₀^e(Z) 転写元 Eq.(3)）/ Hunana ApJS (2022)（η₀₀^e=0.73094 近代追認）/ Vold et al. PoP 22, 112708 (2015) (1D spherical reference implementation) / Manheimer & Colombant LPB 25, 541 (2007) (coefficient transcription) / Mason et al. PoP 21, 022705 (2014) (mfp cap) / Miller CF 210, 104672 (2020) / Haines PoP 31, 050501 (2024).
 
 **係数（cgs+eV 凍結系）**:
 
@@ -1812,7 +1812,7 @@ Physical-viscosity module adding unmagnetized Braginskii shear viscosity (ion + 
 
 合成形 \( \eta_e \approx \eta_{00}^e(Z)\times 5.513\times10^{-7}\, T_e^{5/2}/(Z \ln\Lambda_{ei}) \) poise — イオン channel 同様**密度非依存**（n_e は lnΛ_ei と mfp cap 経由のみ）。Z = fmax(zbar, 1)（イオン channel と同一床; Whitney fit は完全電離 Z≥1 域）、T_e 床 = `Numerics.floors.Te`。
 
-**species 合成（user 指示 2026-07-12 の 3-regime 要求）**: `species = "ion"`（既定 = W-H bit 恒等; kernel は SPECIES template + `if constexpr` でイオン分岐 source 恒等）| `"electron"` | `"both"`。`"both"` は**加法合成** \( \eta_\mathrm{eff} = \eta_i + \eta_e \)（単一流体運動量方程式が含む π_i+π_e そのもの）。比
+**species 合成（user 指示 2026-07-12 の 3-regime 要求）**: `species = "ion"`（既定 = ion-only trajectory と bit 恒等; kernel は SPECIES template + `if constexpr` でイオン分岐 source 恒等）| `"electron"` | `"both"`。`"both"` は**加法合成** \( \eta_\mathrm{eff} = \eta_i + \eta_e \)（単一流体運動量方程式が含む π_i+π_e そのもの）。比
 
 \[ R \equiv \eta_e/\eta_i = 0.01719\;\eta_{00}^e(Z)\,(T_e/T_i)^{5/2}\,\frac{Z^3}{\sqrt{A}}\cdot\frac{\ln\Lambda_{ii}}{\ln\Lambda_{ei}} \]
 
@@ -1830,13 +1830,13 @@ Physical-viscosity module adding unmagnetized Braginskii shear viscosity (ion + 
 
 ノード力 = 面積重み flux 差 \( A_j(\pi_{rr,R}-\pi_{rr,L}) \)（圧力核 §3.1.4 と同型）+ hoop 項 \( \bar V_j\,\alpha(\bar\pi_{rr}-\bar\pi_{tt})/r_j \)（ノード半セル体積重み）。**スカラー pq 融合は不可**（等方応力にのみ正しい離散化で、球面では +3π_rr/r の hoop が欠落する）ため専用加算カーネル。時間中心化は圧力・AV と同一: predictor は n 状態、corrector は half 状態の応力、いずれも damping filter 群の**前**に accel へ加算。境界: ノード 0 スキップ（中心対称）、外側ノードは FIXED/REFLECT でスキップ・FREE では外側応力ゼロ（stress-free 面）。
 
-**粘性加熱**: \( \dot Q_i = \tfrac{\eta_i}{2}\sum W_{\alpha\beta}^2,\ \dot Q_e = \tfrac{\eta_e}{2}\sum W_{\alpha\beta}^2 \ \ge 0 \)（half 状態で評価、セル電力を `apply_artificial_heat_kernel` 経路で堆積; \(\dot Q_i+\dot Q_e = \tfrac{\eta_\mathrm{eff}}{2}W\!:\!W\)）→ **2T では \(\dot Q_i\) がイオン内部エネルギー（W-H 規約不変・AV の `av_heat_to="ion"` 既定と同規約）、\(\dot Q_e\) が電子内部エネルギー**（Velikovich 2001 §II–III: 電子粘性散逸は電子を直接加熱 — 高 Z 衝撃波の T_e/T_i 構造・K-shell 収量への一次効果）; 1T では両方とも全体エネルギー（ee）。正定値形を選択（compatible force-work 形は離散的に符号不定になり得る）; force-work との O(Δ²) 不整合は Vold 2015 と同じ受容で、B2 gate の全エネルギードリフト差分が常時監視する。
+**粘性加熱**: \( \dot Q_i = \tfrac{\eta_i}{2}\sum W_{\alpha\beta}^2,\ \dot Q_e = \tfrac{\eta_e}{2}\sum W_{\alpha\beta}^2 \ \ge 0 \)（half 状態で評価、セル電力を `apply_artificial_heat_kernel` 経路で堆積; \(\dot Q_i+\dot Q_e = \tfrac{\eta_\mathrm{eff}}{2}W\!:\!W\)）→ **2T では \(\dot Q_i\) がイオン内部エネルギー（ion-only 規約不変・AV の `av_heat_to="ion"` 既定と同規約）、\(\dot Q_e\) が電子内部エネルギー**（Velikovich 2001 §II–III: 電子粘性散逸は電子を直接加熱 — 高 Z 衝撃波の T_e/T_i 構造・K-shell 収量への一次効果）; 1T では両方とも全体エネルギー（ee）。正定値形を選択（compatible force-work 形は離散的に符号不定になり得る）; force-work との O(Δ²) 不整合は Vold 2015 と同じ受容で、B2 gate の全エネルギードリフト差分が常時監視する。
 
-**恒等式検証**（`tests/hydro/test_braginskii_viscosity.cu` B1 電池 + gates B2/B3）: (i) 球 homologous \(u\propto r\) → \(W\equiv 0\)（等方 3D 膨張; B3 gate は dt 経路固定で粘性 ON/OFF 軌道一致 ≤1e-12 + dt 解放で limiter 発火 = step 数増を別建てで確認）; (ii) div-free 流（球 \(u\propto 1/r^2\)、円筒 \(u\propto 1/r\)）→ \((\nabla\cdot\pi)_r \equiv 0\) — flux と hoop の相殺で **hoop 係数を単独検定**（円筒は一様格子で離散的にも厳密 = roundoff-null、球は O(Δr²) 収束比 ≈4）; (iii) 平面定在音波の減衰率 \( \gamma = \tfrac{1}{2}\nu_L k^2 = \tfrac{2}{3}(\eta/\rho)k^2 \)（\(\nu_L = \tfrac43 \eta/\rho\)）を inviscid 対照との差分で ±5%（B2 gate、定数 η・AV off・reflect 壁・波エネルギー KE+音響 PE の対数線形フィット）。電子 channel gates（2026-07-12 レーン着地、2026-07-17 本 branch へ移植）: B1 電池に電子版を追加（η_e pin: DT 級 A=2.5, Z=1, T_e=1 keV, n_i=5e22 で η_e=2.676 P・lnΛ_ei=4.775; 電子 mfp cap pin 0.8856 P; Au 級 Z=50 で η₀₀^e 経由 R≈162 と加法恒等 η_both=η_i+η_e ≤1e-12; species 熱分配; dt 加法等式）+ `braginskii_electron_wave_decay`（B2 planar deck を species=electron / both で再走: 同一 γ_th ±5%・E-drift ≤5e-9・γ の species 不変性 ≤1e-6 γ_th）+ `braginskii_regime_map`（静的 2T 3 deck edom/idom/mixed: R 帯 [>50 / <0.05 / 0.2–5]・regime count=active・history H5 round-trip）。
+**恒等式検証**（`tests/hydro/test_braginskii_viscosity.cu` 単体恒等式試験群 + 音波減衰／粘性 ON/OFF 軌道一致ゲート）: (i) 球 homologous \(u\propto r\) → \(W\equiv 0\)（等方 3D 膨張; 粘性 ON/OFF 軌道一致ゲートは dt 経路固定で粘性 ON/OFF 軌道一致 ≤1e-12 + dt 解放で limiter 発火 = step 数増を別建てで確認）; (ii) div-free 流（球 \(u\propto 1/r^2\)、円筒 \(u\propto 1/r\)）→ \((\nabla\cdot\pi)_r \equiv 0\) — flux と hoop の相殺で **hoop 係数を単独検定**（円筒は一様格子で離散的にも厳密 = roundoff-null、球は O(Δr²) 収束比 ≈4）; (iii) 平面定在音波の減衰率 \( \gamma = \tfrac{1}{2}\nu_L k^2 = \tfrac{2}{3}(\eta/\rho)k^2 \)（\(\nu_L = \tfrac43 \eta/\rho\)）を inviscid 対照との差分で ±5%（音波減衰ゲート、定数 η・AV off・reflect 壁・波エネルギー KE+音響 PE の対数線形フィット）。電子 channel gates（2026-07-12 に先行ブランチで実装、2026-07-17 本 branch へ移植）: 単体恒等式試験群に電子版を追加（η_e pin: DT 級 A=2.5, Z=1, T_e=1 keV, n_i=5e22 で η_e=2.676 P・lnΛ_ei=4.775; 電子 mfp cap pin 0.8856 P; Au 級 Z=50 で η₀₀^e 経由 R≈162 と加法恒等 η_both=η_i+η_e ≤1e-12; species 熱分配; dt 加法等式）+ `braginskii_electron_wave_decay`（音波減衰ゲートの平面 deck を species=electron / both で再走: 同一 γ_th ±5%・E-drift ≤5e-9・γ の species 不変性 ≤1e-6 γ_th）+ `braginskii_regime_map`（静的 2T 3 deck edom/idom/mixed: R 帯 [>50 / <0.05 / 0.2–5]・regime count=active・history H5 round-trip）。
 
-**dt 制限（陽的）**: \( \Delta t \le \mathrm{dt\_safety}\cdot \rho\,\Delta r^2 / (\tfrac{8}{3}\eta_\mathrm{eff}) \)（縦拡散率 \(\nu_L\) の 1D 陽的安定条件）。`compute_dt_lineage`（driver.cpp）に `dt_visc` フィールドと limiter ラベル `"braginskii"` を追加済み。cap 活性域では \( \Delta t \gtrsim \mathrm{safety}\cdot\Delta r/(2.56\,C\,v_{th,i}) \)（音響 CFL の定数分の一）に下支えされる。生産 deck で恒常束縛が観測された場合の escalation path は conduction 同型の STS 部分循環（設計 doc §5; v1 未実装 — 黙った cap 強化での回避は禁止）。電子 channel は同一の縦拡散演算子に入るため `dt_safety` は共有（species 別ノブなし; \(1/\Delta t_\mathrm{both} = 1/\Delta t_i + 1/\Delta t_e\) が厳密に成り立つ — B1 電池で等式検証）。
+**dt 制限（陽的）**: \( \Delta t \le \mathrm{dt\_safety}\cdot \rho\,\Delta r^2 / (\tfrac{8}{3}\eta_\mathrm{eff}) \)（縦拡散率 \(\nu_L\) の 1D 陽的安定条件）。`compute_dt_lineage`（driver.cpp）に `dt_visc` フィールドと limiter ラベル `"braginskii"` を追加済み。cap 活性域では \( \Delta t \gtrsim \mathrm{safety}\cdot\Delta r/(2.56\,C\,v_{th,i}) \)（音響 CFL の定数分の一）に下支えされる。生産 deck で恒常束縛が観測された場合の escalation path は conduction 同型の STS 部分循環（設計 doc §5; v1 未実装 — 黙った cap 強化での回避は禁止）。電子 channel は同一の縦拡散演算子に入るため `dt_safety` は共有（species 別ノブなし; \(1/\Delta t_\mathrm{both} = 1/\Delta t_i + 1/\Delta t_e\) が厳密に成り立つ — 単体恒等式試験群で等式検証）。
 
-**Gershgorin 安定性監査（fail-closed、2026-07-26 AI カーネルレビュー k13 F-05/F-09）**: 上記スカラー式は縦拡散のみをステップ開始状態で束縛する。球/円筒の hoop 剛性 \(\alpha(\pi_{rr}-\pi_{tt})/r\)（原点近傍で縦成分の最大 ~2.5 倍）と、ステップ内の \(\eta\propto T^{5/2}\) 成長（predictor 衝撃加熱の T 倍化で corrector 剛性 ~5.7 倍）は見えない。このため 1D Lagrangian step の終端で、組立済みノード加速度演算子（`braginskii_add_accel_1d_kernel` の凍結 η 線形化 — 一様平面格子で \(2/\lambda_G\) がスカラー式の安定限界に厳密一致）の Gershgorin 行和 \(\lambda_G\) を評価し、\(\Delta t \le 2/\lambda_G\) を監査する（`compute_viscous_gershgorin_lambda_1d`）。既定 `dt_safety=0.3` では常に合格（bit 中立）。違反時は non-positive-volume ガードと同型の soft retry（`driver_full_step_retry_enabled` 時、`suggested_dt = dt_safety · 2/\lambda_G`）または fail-fast。**入力検証（F-01）**: `TENRYU_BRAG_*` env と namelist の両起点で strict parse（完全 parse・有限性）+ 範囲検証（負の `eta0_scale` は反拡散、`dt_safety<=0` は dt 無効化）+ 未知 model/species の reject を `validate_params` が enabled 時に強制する（fail-open の黙認廃止）。**診断の物理値純化（F-10）**: history 診断の `eta_{i,e}_phys` は uncapped・unscaled・NRL-log の古典値に固定（cap 既定 20 cells が regime 地図へ格子依存を持ち込まないため）。構成値 channel（`eta_eff`・heat rate）は従来どおり run の knob を反映する。scratch-pool 化（W-F 規約準拠、旧 per-call cudaMalloc/Free の除去）も同時に実施。
+**Gershgorin 安定性監査（fail-closed、2026-07-26 カーネルレビュー）**: 上記スカラー式は縦拡散のみをステップ開始状態で束縛する。球/円筒の hoop 剛性 \(\alpha(\pi_{rr}-\pi_{tt})/r\)（原点近傍で縦成分の最大 ~2.5 倍）と、ステップ内の \(\eta\propto T^{5/2}\) 成長（predictor 衝撃加熱の T 倍化で corrector 剛性 ~5.7 倍）は見えない。このため 1D Lagrangian step の終端で、組立済みノード加速度演算子（`braginskii_add_accel_1d_kernel` の凍結 η 線形化 — 一様平面格子で \(2/\lambda_G\) がスカラー式の安定限界に厳密一致）の Gershgorin 行和 \(\lambda_G\) を評価し、\(\Delta t \le 2/\lambda_G\) を監査する（`compute_viscous_gershgorin_lambda_1d`）。既定 `dt_safety=0.3` では常に合格（bit 中立）。違反時は non-positive-volume ガードと同型の soft retry（`driver_full_step_retry_enabled` 時、`suggested_dt = dt_safety · 2/\lambda_G`）または fail-fast。**入力検証**: `TENRYU_BRAG_*` env と namelist の両起点で strict parse（完全 parse・有限性）+ 範囲検証（負の `eta0_scale` は反拡散、`dt_safety<=0` は dt 無効化）+ 未知 model/species の reject を `validate_params` が enabled 時に強制する（fail-open の黙認廃止）。**診断の物理値純化**: history 診断の `eta_{i,e}_phys` は uncapped・unscaled・NRL-log の古典値に固定（cap 既定 20 cells が regime 地図へ格子依存を持ち込まないため）。構成値 channel（`eta_eff`・heat rate）は従来どおり run の knob を反映する。scratch-pool 化（scratch-pool 規約準拠、旧 per-call cudaMalloc/Free の除去）も同時に実施。
 
 **history 診断（診断バンドル原則、2026-07-12; dim==2 は 2026-07-17）**: enabled 時、history cadence で `/diagnostics/plasma_viscosity_history/` に {cycle, t_s, eta_i_max, eta_e_max, eta_eff_max, ratio_{min,geomean_masswt,max}, n_cells_{e_dom,i_dom,mixed,active}, heat_rate_{i,e}_tot} を追記する。eta_i/eta_e と R 統計は**物理 channel 値**（model/species 非依存 — legacy ion run でも regime 地図が見える）、eta_eff と heat rate は構成値。regime 分類（R≥10 で e_dom / R≤0.1 で i_dom）は診断専用定数で物理への feedback なし。還元は device per-cell 配列の host 逐次集約（atomics 不使用 — bitwise 再現性域に非決定を持ち込まない）。積算器は持たない（瞬時 rate のみ — Strang retry 安全）。dim==2 は同一場のセマンティクスで、歪み演算子は 2D 応力 kernel の shoelace-gradient + hoop 分解、cap 長は dt kernel と同じ最小 active 辺長（`compute_history_diagnostics_2d`、structured/multiblock 両対応）。
 
@@ -1876,7 +1876,7 @@ These formulas give the exact per-cell identities
 \sum_kF_{r,k}=\frac{V_c\pi_{\phi\phi}}{\bar r},
 \]
 
-where \(\bar r=(\sum_k r_k)/n_{verts}\). On the compatible force/work path, `work_visc_per_cell` tallies \(-\sum_k\mathbf F_k\cdot\mathbf v_k\); the disabled arm retains the byte-identical original expression. On the legacy path, the positive-definite \(V_c\eta W{:}W/2\) heat rates are deposited immediately after the PdV update. The 2D heating routing is hard-wired per channel in 2T and deliberately does not follow `av_heat_to` (the 1D path is hard-wired the same way — `H_brag` to `ei` in 2T / `ee` in 1T and `H_brag_e` to `ee`, `hydro_1d.cu`; `av_heat_to` governs ONLY the artificial-viscosity heat. An earlier revision of this sentence claimed the 1D physical-viscosity heat followed `av_heat_to` — stale text corrected 2026-07-26, AI kernel review k13 F-13): the ion-channel heat goes to `ei` and — since the 2026-07-17 species port — the electron-channel heat goes to `ee` (1T deposits everything into the single matter energy). Concretely, on the legacy path a species-gated second `apply_visc_heat_kernel` launch deposits `visc_heat_rate_e_per_cell` with the `use_two_temp=0` routing (= `ee` in both modes); on the compatible path the kernel is templated on `VISC_SPLIT` — the split arm routes \(f_e\,W_{visc}\) to `ee` and \((1-f_e)W_{visc}\) to `ei` with \(f_e = \dot Q_e/(\dot Q_i+\dot Q_e)\) from the corrector-stage heat-rate buffers (equal to \(\eta_e/\eta_\mathrm{eff}\) exactly in real arithmetic; \(W{:}W=0\) zeroes the work itself, so the \(f_e=0\) guard routes nothing), while the `VISC_SPLIT=0` arm (OFF and `species="ion"`) keeps the pre-electron arithmetic source-identical. The exact-adjointness total-energy closure is untouched — the split only routes it.
+where \(\bar r=(\sum_k r_k)/n_{verts}\). On the compatible force/work path, `work_visc_per_cell` tallies \(-\sum_k\mathbf F_k\cdot\mathbf v_k\); the disabled arm retains the byte-identical original expression. On the legacy path, the positive-definite \(V_c\eta W{:}W/2\) heat rates are deposited immediately after the PdV update. The 2D heating routing is hard-wired per channel in 2T and deliberately does not follow `av_heat_to` (the 1D path is hard-wired the same way — `H_brag` to `ei` in 2T / `ee` in 1T and `H_brag_e` to `ee`, `hydro_1d.cu`; `av_heat_to` governs ONLY the artificial-viscosity heat. An earlier revision of this sentence claimed the 1D physical-viscosity heat followed `av_heat_to` — stale text corrected 2026-07-26): the ion-channel heat goes to `ei` and — since the 2026-07-17 species port — the electron-channel heat goes to `ee` (1T deposits everything into the single matter energy). Concretely, on the legacy path a species-gated second `apply_visc_heat_kernel` launch deposits `visc_heat_rate_e_per_cell` with the `use_two_temp=0` routing (= `ee` in both modes); on the compatible path the kernel is templated on `VISC_SPLIT` — the split arm routes \(f_e\,W_{visc}\) to `ee` and \((1-f_e)W_{visc}\) to `ei` with \(f_e = \dot Q_e/(\dot Q_i+\dot Q_e)\) from the corrector-stage heat-rate buffers (equal to \(\eta_e/\eta_\mathrm{eff}\) exactly in real arithmetic; \(W{:}W=0\) zeroes the work itself, so the \(f_e=0\) guard routes nothing), while the `VISC_SPLIT=0` arm (OFF and `species="ion"`) keeps the pre-electron arithmetic source-identical. The exact-adjointness total-energy closure is untouched — the split only routes it.
 
 For 2D, let \(L_c=\min_k|\mathbf x_{k+1}-\mathbf x_k|\). The explicit limit and mfp cap use the same length (both channels):
 
@@ -2077,7 +2077,7 @@ i.e. the cross product and the norms are taken about the polar center
 subtracts `box_center_z` from every \(z\) before forming the cross product
 and the ulp bound). [2026-07-26: the previous canon wrote the global-origin
 form \(|R_pZ_{p+1}-Z_pR_{p+1}|\), which is wrong whenever \(z_c\ne0\) —
-k17 AI-review §5.3 (M-14/E-03); the implementation has always been
+a 2026-07-26 kernel-review finding; the implementation has always been
 center-relative, canon corrected to match.]
 
 The tip-length gate is
@@ -2203,7 +2203,7 @@ x_t(n_j,k)=\Gamma_t(n_j)-\sigma_z d_k e_z.
 [2026-07-26: the previous canonical text wrote a constant \(\pm\nu\)
 offset at every station; the implementation has always used the rotated
 normalized direction inside the rotation zones, which is the
-C1-consistent choice — k17 AI-review §6.2 (M-09/CS-03); canon updated to
+C1-consistent choice — the 2026-07-26 kernel review; canon updated to
 the implementation.]
 
 Interior strip nodes are layer-major and station-minor. Cell numbering is
@@ -2287,7 +2287,7 @@ from inside the box; emitted exterior nodes are asserted to satisfy
 \(0<r\le\texttt{box\_r\_max}\). [2026-07-26: the arrival tangent was
 previously emitted as \(-d\,e_r\), which makes
 \(H(1-\varepsilon)=P_1-\varepsilon m_1\) overshoot the box face just before
-arrival — k17 AI-review §6.3 (C-01); fixed together with the containment
+arrival — a 2026-07-26 kernel-review finding; fixed together with the containment
 assert.]
 
 For either column family, let \(d_{\min}\), \(d_{\max}\) be its chord extrema
@@ -2316,8 +2316,8 @@ lie in the \([0.5,1.5]\) band of the first ladder width. [2026-07-26:
 previously the ladder spanned the chord and \(\eta_k=s_k/d\) fed the
 Hermite parameter directly; with near-parametric speed
 \(\lambda=\min(d,8h_{\rm start})\) this compressed the first physical width
-to \(\approx8h_{\rm start}^2/d\) on long stations — k17 AI-review §6.4
-(M-08); the arclength inversion restores the requested widths.]
+to \(\approx8h_{\rm start}^2/d\) on long stations — a 2026-07-26
+kernel-review finding; the arclength inversion restores the requested widths.]
 
 Below the tip, the final `TIP_FILL_WEST`, `TIP_FILL_MID`, and
 `TIP_FILL_EAST` decomposition reaches the tip-side box face. The full-depth
@@ -2340,7 +2340,7 @@ box radial face → exterior column → outer strip column → wall base column 
 inner strip column → cavity column → axis. Every tagged edge must be a
 member and the count must match, so seams, cracks, or holes anywhere else
 still fail loudly; only the census mode downgrades to logging.
-[2026-07-26: k17 AI-review §6.6 (C-05) — previously ANY unclassified
+[2026-07-26: previously ANY unclassified
 one-incidence edge was accepted as free in `wall_normal` mode.]
 `TENRYU_CONE_C4B_CENSUS=1` lists every such edge with coordinates. [2026-07-20:
 this restored the `wall_normal` analytic-twin gate (#479), which the C4b gate
@@ -2656,7 +2656,7 @@ V_{cell} = \frac{\pi}{3}\sum_{k=1}^{4}(r_k z_{k+1} - r_{k+1} z_k)(r_k + r_{k+1})
 > "library only" framing above is historical), so preserving production bit
 > behavior rests on the default-off contract fields below.
 >
-> [2026-07-26, k17 AI-review §8] The evaluator gained opt-in contract fields
+> [2026-07-26] The evaluator gained opt-in contract fields
 > on `CandidateMeshAdmissibilityFloors` (all default-off; existing callers
 > keep their endpoint-only bit behavior): `continuous_path` also minimises
 > each corner Jacobian (quadratic in the path parameter) and the revolved RZ
@@ -2746,7 +2746,7 @@ z 方向加速度の column invariance を保つ。
 corner mass を受け取る。実装上、退化した不正 RZ セルで
 \(R_L+R_R\le0\) となる場合のみ defensive fallback として一様 1/4 分配を用いる。
 
-**KINEMATIC_BASIS_RZ_V1 (G4 epoch, 2026-07-27).** The production corner-mass partition is
+**KINEMATIC_BASIS_RZ_V1 (2026-07-27).** The production corner-mass partition is
 the exact R-weighted lump of the Q1 kinematic basis: \(m_{c,k} = M_c\,\int N_k R\,J\,
 d\xi d\eta / \int R\,J\,d\xi d\eta\) on the bilinear reference cell (2\(\times\)2 Gauss,
 exact at bilinear-quad degree 3), computed at initialization and after each remap and
@@ -2796,7 +2796,7 @@ single-block and tri_fan use BBSW, multiblock uses exact subpolygon
 fractions, each used self-consistently for inertia, kinetic energy, and work
 (difference locked by tests/hydro/test_rz_svec_exact_gradient.cu;
 unification across topologies is a pending design decision — 2026-07-26
-audit k02 F-07/§15-6 corrected the earlier "reduces to BBSW up to roundoff"
+the 2026-07-26 spec audit corrected the earlier "reduces to BBSW up to roundoff"
 claim, which was algebraically false). Single-block and tri_fan paths
 continue to use their pre-existing dispatch.
 The legacy scalar-AV multiblock path keeps its pre-existing parent-volume
@@ -3027,7 +3027,7 @@ m_n \frac{d\mathbf{v}_n}{dt} = \sum_{c\in\mathcal{C}(n)} \mathbf{F}_{c\to n}
 \(\mathbf{S}\) は体積増加方向を向くので圧力力は \(+\) 符号で外向きに働き、
 \(\sum_n\mathbf{u}_n\cdot\mathbf{F}_n=+\sum_c(P_c+Q_c)\dot V_c\)、セル内部エネルギー仕事は
 \(-\sum_k\mathbf{F}_{c,k}\cdot\mathbf{u}_{n_k}=-(P_c+Q_c)\dot V_c\)（圧縮で加熱）である。
-（2026-07-26 スペック監査 k02 F-03/§15-3,4: 旧記述 \(-(P_c+Q_c)\mathbf{S}_{c,k}\)（Wilkins
+（2026-07-26 スペック監査: 旧記述 \(-(P_c+Q_c)\mathbf{S}_{c,k}\)（Wilkins
 内向き規約）は実装と不一致だった。実装は全力経路で \(+p_q\,\mathbf{S}_{c,k}\)。）
 
 **FIX2-W1/W2 area-weighted symmetric RZ momentum (v1, default off).**
@@ -3103,7 +3103,7 @@ multiblock dispatch, nodes tagged as the physical outer shell receive the
 `NODE_BOUNDARY` flag in any current builder (multiblock flags mark only the
 cylindrical axis, the cap center, and the outer physical shell) and receive
 no vector constraint — conforming shared-node topology alone couples the
-blocks (2026-07-26 audit k02 F-05). `NODE_CENTER`
+blocks (2026-07-26 spec audit). `NODE_CENTER`
 pins both components at the tri_fan origin and takes priority. The same
 ordering is used after ALE cell-to-node velocity projection and
 reference/conservative remap projection.
@@ -3142,7 +3142,7 @@ The projection is guarded by \(s>0\). No further branch follows: non-outer
 axis nodes keep their axial velocity on the cylindrical \(Z\)-axis, and no
 seam node carries `NODE_BOUNDARY`, so no seam projection exists (the
 historical unreachable seam tangent-projection fallthrough was removed —
-2026-07-26 audit k02 F-05). This dispatch is only in the multiblock boundary
+2026-07-26 spec audit). This dispatch is only in the multiblock boundary
 path; `single_block` and `tri_fan` paths keep their existing boundary
 kernels.
 
@@ -3153,7 +3153,7 @@ and combined ordering before the velocity update. `NODE_CENTER` zeros
 dispatch above and return. Nothing else is constrained: pure axis nodes
 preserve their axial component, pole-outer corner nodes receive both the
 axis constraint and the `r_outer` physical-shell dispatch, and internal
-seam nodes are untouched (2026-07-26 audit k02 F-05).
+seam nodes are untouched (2026-07-26 spec audit).
 
 For multiblock topology, the pressure and AV force assembly is the same
 compatible work discretization on CSR connectivity:
@@ -3256,24 +3256,24 @@ candidate-admissibility sign convention and makes the button seam and
   \(\sum_{c\ni n}\mathbf{S}_{c,k(n)} = \partial\bigl(\sum_{c\ni n}V_c\bigr)/\partial\mathbf{x}_n = \mathbf{0}\)。
   G2 gate はこのノード単位 cancellation を検査する。旧記述の「\(\sum_k \mathbf{S}_{c,k}
   =\mathbf{0}\) を機械精度で満たす」はセル単位の主張であり、exact-gradient 契約では
-  **成立しないし要求もしない**（2026-07-26 スペック監査 k02 F-01/§15-1,2 で訂正。
+  **成立しないし要求もしない**（2026-07-26 スペック監査で訂正。
   contract lock: tests/hydro/test_rz_svec_exact_gradient.cu）。
 - \(\dot V_c = \sum_k \mathbf{u}_{n_k}\cdot\mathbf{S}_{c,k}\) は chain rule により厳密（§3.2.7、GCL）。
 
 > **設計注記（履歴・保存量・境界）**：v1.0 初期の Wilkins 面積重み
-> （\(\sum_k\mathbf{S}=\mathbf{0}\) 型。exact 勾配への移行を C-06 として延期していた）
-> は退役済みで、現行実装は上記 exact 勾配に統一されている（C-06 完了）。
+> （\(\sum_k\mathbf{S}=\mathbf{0}\) 型。exact 勾配への移行を延期していた）
+> は退役済みで、現行実装は上記 exact 勾配に統一されている（移行完了）。
 > この離散化では**スカラー radial 運動量 \(\sum_a m_a u_{r,a}\) は保存量ではない**：
 > \(dP_r/dt = \sum_c p_c\,2\pi A_c + （境界・拘束項）\) の hoop ソースを持つ
 > （axisymmetric Euler の \(\partial_t(\rho u_r)+\cdots = p/r\) に対応）。診断の
 > `R_momentum_residual` は静的力平衡問題でのみ自明にゼロとなる監査量であり、
-> 動的 RZ 流れの保存則ゲートには使えない（2026-07-26 監査 k02 F-06/§15-11）。
+> 動的 RZ 流れの保存則ゲートには使えない（2026-07-26 監査）。
 > 境界力：spherical-polar 外殻の圧力境界は exact RZ endpoint traction
 > \(\mathbf{G}_a=\frac{\pi}{3}(2r_a+r_b)(\Delta z,-\Delta r)\)、
 > \(\mathbf{G}_b=\frac{\pi}{3}(r_a+2r_b)(\Delta z,-\Delta r)\) を常時使用する
 > （`rz_exact_endpoint`：`logical_mesh_2d="spherical_polar_halfplane"` で有効。
-> 旧 C-07「境界 \(2\pi r\) 係数欠落の延期」はこの経路では解消済み。矩形 RZ
-> 境界経路は従来のまま — 2026-07-26 監査 k02 §7.3/§15-8 で記述を統一）。
+> 旧記述「境界 \(2\pi r\) 係数欠落の延期」はこの経路では解消済み。矩形 RZ
+> 境界経路は従来のまま — 2026-07-26 監査で記述を統一）。
 > 輻射輸送の面幾何（§6.3.2, §7.3.2）は独立に修正する（Hydro Svec に依存しない）。
 
 #### 3.2.7 体積変化率
@@ -3503,7 +3503,7 @@ Stage A compatible force/work path は `av_model="csw_edge"` かつ
 `subzonal_pressure_enabled=True`、または `av_model="csw_edge_csw98"`
 （subzonal pressure の有効・無効によらず常時 — I1-B column A/B isolation）で
 有効である（`compatible_force_work_enabled`）。edge AV の compatible work は
-subzonal pressure の enable 状態に依存しない（2026-07-26 監査 k03 F-02/§11-2,3
+subzonal pressure の enable 状態に依存しない（2026-07-26 監査
 で dispatch 記述を実装に一致させた）。legacy
 `av_model="scalar_vnr_legacy"` かつ `subzonal_pressure_enabled=False` では
 従来の scalar \(p_q=P_e+P_i+Q\) nodal force assembly をそのまま使う。
@@ -3677,7 +3677,7 @@ with \(W_e\) the §3.2.9b Kuropatenko wave speed (\(C_1/C_2\) defaults
 with \(q_{Kur,e}=\rho_e W_e|d\mathbf{v}_e|\)). 旧版は
 \((d\mathbf{v}_e\cdot S_e)/|d\mathbf{v}_e|\) と正規化済み \(\hat{d\mathbf{v}}_e\)
 を併記した速度因子一つ不足の誤記（実装 `compatible_av_csw.cu` は当初から本式 —
-2026-07-26 監査 k03 F-01 で訂正）。Zero-force continuity holds:
+2026-07-26 監査で訂正）。Zero-force continuity holds:
 \(f_e\to0\) as \(d\mathbf{v}_e\cdot S_e\to0^-\).
 
 Limiter (Eq. 12 + Eq. 18):
@@ -3834,7 +3834,7 @@ T5 wires `work_p_per_cell`, `work_sub_per_cell`, and `work_av_per_cell` into
 the Lagrangian cell internal-energy update whenever the compatible
 force/work path is enabled (`av_model="csw_edge"` with
 `subzonal_pressure_enabled=True`, or `av_model="csw_edge_csw98"` regardless
-of the subzonal setting — k03 F-02 correction).  The corrector
+of the subzonal setting — corrected by the 2026-07-26 audit).  The corrector
 first recomputes pressure, CSW edge AV, and subzonal pressure forces at the
 half-step geometry/state.  After the final nodal velocity update, the work
 buffers are refreshed from those stored half-step forces using
@@ -4030,7 +4030,7 @@ e_{k,c}^{n+1} = e_{k,c}^{n} - \left(P_{k,c}^{n+1/2} + \delta_{k,i}\,Q_{visc,c}^{
 - \(P_{k,c}^{n+1/2} = (P_{k,c}^n + P_{k,c}^{pred})/2\)：\(P_{k,c}^{pred} = P_k(\rho^{n+1/2}, T_k^n)\) は Predictor 半ステップの密度と時刻 \(n\) の温度で評価した種別圧力（\(k=i\)：イオン圧力、\(k=e\)：電子圧力）
 - \(Q_{visc,c}^{n+1/2}\)：§3.2.9 の人工粘性圧力を Predictor の \(\nabla\cdot\mathbf{u}\)（= \((V^{n+1/2} - V^n)/(\Delta t/2 \cdot V^{n+1/2})\) で近似した体積変化率）で評価した値
 - \(\delta_{k,i}\) はKroneckerデルタ：\(\delta_{i,i}=1\)（イオン）、\(\delta_{e,i}=0\)（電子）。§3.2.10 の「Q加熱：全量イオンへ」の規約により、人工粘性仕事は **イオンのみ** に適用される
-- イオン（\(k=i\)）の粘性仕事は \(-Q_{visc,c}^{n+1/2} \times (V_c^{n+1} - V_c^n) / \Delta M_c\)（符号注意：圧縮時 \(\Delta V < 0\) で正の加熱）。旧版の式は \(Q_{visc}\) 項を \(+\delta_{k,i}\,Q_{visc}\,\Delta t/\Delta M_c\)（次元不整合）と誤記していた — 実装は当初から \(-Q\,\Delta V/\Delta M\) 形（2026-07-26 スペック監査 k02 F-04/§15-5 で訂正）
+- イオン（\(k=i\)）の粘性仕事は \(-Q_{visc,c}^{n+1/2} \times (V_c^{n+1} - V_c^n) / \Delta M_c\)（符号注意：圧縮時 \(\Delta V < 0\) で正の加熱）。旧版の式は \(Q_{visc}\) 項を \(+\delta_{k,i}\,Q_{visc}\,\Delta t/\Delta M_c\)（次元不整合）と誤記していた — 実装は当初から \(-Q\,\Delta V/\Delta M\) 形（2026-07-26 スペック監査で訂正）
 - 電子（\(k=e\)）の PdV 仕事は \(-P_{e,c}^{n+1/2} \times (V_c^{n+1} - V_c^n) / \Delta M_c\) のみ（Q項なし）
 - \(Q_{ei,c}^{n+1/2}\) は §1.1.3 の式を \(T_e^n, T_i^n\)（時刻 \(n\) の温度）で評価し、有限 \(\Delta t\) 更新の指数に `Numerics.hydro.qei_multiplier` を掛ける
 - 実装は Predictor entry の EOS 再クロージャ直後に `Te/Ti` を `T^n` snapshot として保存し、既定 `Numerics.hydro.qei_evaluate_at_t_n=True` ではこの snapshot を Qei 評価に用いる。`False` は legacy compatibility mode で、Predictor 後の再クロージャ済み `Te/Ti` を使う。
@@ -4045,7 +4045,7 @@ e_{k,c}^{n+1} = e_{k,c}^{n} - \left(P_{k,c}^{n+1/2} + \delta_{k,i}\,Q_{visc,c}^{
 > これは Predictor-Corrector 法の標準的な規約であり、温度の暗黙的更新は
 > Corrector ステップ4（本式）で初めて行われる。
 
-**Midpoint time integration (F-08, G5 epoch, 2026-07-27).** The production single-block integrator is the fixed-one-corrector midpoint scheme: a predictor with old-time forces builds \(u^h, x^h\) and the compatible half-step internal energy \(e^h_c = e^n_c - \tfrac{\Delta t}{2M_c}\sum_p \mathbf f^n_{c,p}\cdot\bar{\mathbf u}^{n\to h}_p\); the midpoint closure evaluates \(\rho^h = M_c/V(x^h)\) and the EOS at \((\rho^h, e^h)\), producing one midpoint corner-force family shared by momentum, work, and audit; a provisional full update and exactly one deterministic re-evaluation (\(x^{h,\mathrm{corr}} = (x^n + x^{n+1,*})/2\), half energy recomputed from the provisional midpoint forces) precede the final update from \(t^n\) with \(\bar{\mathbf u} = (u^n + u^{n+1})/2\), preserving the discrete kinetic–internal exchange identity. Measured smooth-flow temporal orders: \(p_\rho = 2.0000\), \(p_e = 1.9999\) (V3 harness), versus \(1.0007\) for the retained pc_v0 scheme. Work ownership per force family, \(Q_{ei}\) operator position, floors, and boundary-work ledgering are unchanged from pc_v0; stage-local trial states never write back to tables or persistent ledgers.
+**Midpoint time integration (2026-07-27).** The production single-block integrator is the fixed-one-corrector midpoint scheme: a predictor with old-time forces builds \(u^h, x^h\) and the compatible half-step internal energy \(e^h_c = e^n_c - \tfrac{\Delta t}{2M_c}\sum_p \mathbf f^n_{c,p}\cdot\bar{\mathbf u}^{n\to h}_p\); the midpoint closure evaluates \(\rho^h = M_c/V(x^h)\) and the EOS at \((\rho^h, e^h)\), producing one midpoint corner-force family shared by momentum, work, and audit; a provisional full update and exactly one deterministic re-evaluation (\(x^{h,\mathrm{corr}} = (x^n + x^{n+1,*})/2\), half energy recomputed from the provisional midpoint forces) precede the final update from \(t^n\) with \(\bar{\mathbf u} = (u^n + u^{n+1})/2\), preserving the discrete kinetic–internal exchange identity. Measured smooth-flow temporal orders: \(p_\rho = 2.0000\), \(p_e = 1.9999\) (V3 harness), versus \(1.0007\) for the retained pc_v0 scheme. Work ownership per force family, \(Q_{ei}\) operator position, floors, and boundary-work ledgering are unchanged from pc_v0; stage-local trial states never write back to tables or persistent ledgers.
 
 #### 3.2.12a Axis-row Lagrangian motion preflight
 
@@ -4409,7 +4409,7 @@ result is diagnostic-only and the existing non-positive-volume guard remains
 authoritative.  With driver retry enabled, the same predicate can reject the
 current split-operator attempt before the final position commit.
 
-#### 3.2.13a Driver-level full-step retry on inadmissible corrector (Phase 2d-extension v4 Wave 1)
+#### 3.2.13a Driver-level full-step retry on inadmissible corrector
 
 `Numerics.hydro.driver_full_step_retry_enabled` is a default-off driver policy
 for recovering from an inadmissible 2D_RZ Hydro corrector trial.  At the top of
@@ -4441,7 +4441,7 @@ The snapshot covers all deterministic `State` fields needed by FLD, SN, HOLO,
 hydro, conduction, laser deposition, cumulative energy scalars, ALE/adaptive-AV
 state, and per-step radiation diagnostics.  It intentionally excludes the IMC
 particle pool and IMC class-owned mutable counters.  Therefore driver retry is
-fatal-disabled at driver entry when `radiation.mode == ImcDdmc`; Wave 1 scope is
+fatal-disabled at driver entry when `radiation.mode == ImcDdmc`; the supported scope is
 deterministic FLD/SN modes.
 
 When `driver_full_step_retry_enabled=False`, which is the default, Hydro2D keeps
@@ -4462,7 +4462,7 @@ snapshot 復元 + 厳密 dt/2 の単純経路で全 split step を再試行す�
 遅れて abort する旧挙動より文脈情報が正確になった。SN material Newton の
 timestep 拒否（§6.8）と同じ driver 予算を共有する。
 
-`Numerics.hydro.mesh_geometry_soft_fail_enabled` is a default-off Wave 1 mesh
+`Numerics.hydro.mesh_geometry_soft_fail_enabled` is a default-off mesh
 geometry control-flow option.  When it is false, Hydro2D geometry refresh uses
 the legacy `Mesh::recompute_geometry()` hard-assert path and the existing
 post-refresh host cell-volume guard unchanged.  When it is true, the StepStart,
@@ -4473,7 +4473,7 @@ Retry snapshot restore validation recomputes only the mesh geometry caches and
 uses a controlled fatal path if the restored mesh is invalid.  This is control
 flow only -- no physics/equation/discretization/RNG/unit change.
 
-`Numerics.hydro.in_hydro_corner_j_guard_enabled` is a default-off Wave 2
+`Numerics.hydro.in_hydro_corner_j_guard_enabled` is a default-off
 candidate-mesh control-flow option.  When it is false, Hydro2D does not allocate
 new buffers, launch the candidate corner-J kernel, or change the predictor /
 corrector refresh path.  When it is true, Hydro2D checks the predictor and
@@ -4505,7 +4505,7 @@ non-positive or non-finite, the reported scale is zero.  This is an admissibilit
 predicate on the candidate mesh only; it does not change units, equations,
 discretization, or accepted-step physics.
 
-Q2.5 adds two default-off predicates to the same in-hydro candidate trajectory.
+Two default-off predicates are added to the same in-hydro candidate trajectory.
 When `Numerics.hydro.in_hydro_gauss_j_guard_enabled=True`, each active cell also
 evaluates \(J_g(\sigma)\) at the four \(2\times2\) Gauss-Legendre points
 \((\xi,\eta)=(\pm1/\sqrt3,\pm1/\sqrt3)\).  The derivative vectors at each Gauss
@@ -4551,7 +4551,7 @@ The accepted-step invariant is: if the trial-volume, signed corner-J, in-hydro
 Gauss-J, or in-hydro RZ-volume pre-commit predicates are enabled, the accepted
 Hydro corrector has passed the corresponding admissibility check before final
 position commit.  This addresses
-the Phase 2cd-coupled-ALE Wave 1 evidence item
+the coupled-ALE evidence item
 `I1_mid_step_corner_J_corrector_inversion_bulk_cell`, where the pre-hydro ALE
 trigger alone could miss an inversion that appears only after the corrector
 velocity update.
@@ -4721,7 +4721,7 @@ envelope supersedes it because the envelope checks the full candidate path for
 corner-J, Gauss-J, and signed RZ-volume floor crossings rather than shrinking
 from a single endpoint volume ratio.
 
-`Numerics.hydro.regime_aware_corner_j_guard_enabled` is a default-off Wave 3
+`Numerics.hydro.regime_aware_corner_j_guard_enabled` is a default-off regime-aware
 extension of the signed corner-J guard.  When false, no regime buffer is
 allocated and the pre-hydro comparison remains the legacy
 `trial_scale < Numerics.hydro.corner_jacobian_ale_trigger_scale` path.  When
@@ -4779,7 +4779,7 @@ The per-cell trigger threshold is 0.5 for smooth/default regimes and 0.85 for
 `InteriorCD`.  Because the trigger condition is `trial_scale < threshold`, the
 0.85 CD threshold is a more conservative earlier trigger under the existing
 comparison direction.  No additional namelist knobs expose the constants in
-Wave 3.
+the current implementation.
 
 `Numerics.hydro.axis_margin_guard_enabled` is a separate default-off axis
 predicate.  When true, axis-face cells (\(i=0\)) skip the generic corner-J root
@@ -4797,7 +4797,7 @@ corner-J, Gauss-J, and RZ-volume checks still run; the composite
 \(\sigma\)/location reduction chooses the first predicate to fail.  When false,
 the legacy replacement behavior above is preserved.
 
-#### 3.2.13b Retry active mesh repair with corner-J balance (Phase 2d-extension v5)
+#### 3.2.13b Retry active mesh repair with corner-J balance
 
 `Numerics.hydro.driver_retry_active_mesh_repair_enabled` is a default-off
 extension of the retry epoch in §3.2.13a, active only when driver-level retry
@@ -4834,9 +4834,9 @@ but this retry context reports bad corner balance, the Phase 9c--9e cascade may
 enter through `gate_reason=hydro_retry_bad_corner_balance`.  The original
 `gate_reason=ale_backtrack_exhausted` branch remains unchanged.
 
-Wave 4 adds a host-side retry repair selector between typed hydro failure
+A host-side retry repair selector is added between typed hydro failure
 metadata (§3.2.13a) and the retry-only ALE invocation.  The in-hydro guard first
-records `RetryActionHint::ReduceDtOnly`, preserving the Wave 2 default.  Only
+records `RetryActionHint::ReduceDtOnly`, preserving the ReduceDtOnly default.  Only
 when the relevant default-off regime or axis guard is enabled may the driver
 override the hint to a forced repair:
 
@@ -4847,7 +4847,7 @@ override the hint to a forced repair:
 | `InteriorCD` | `ForceCdLocalRezone` | `CdLocalWinslow` |
 | `InteriorSmooth` / `Unknown` | `ForceFullWinslow` | `FullWinslow` |
 
-If all Wave 4 selector inputs are default-off, the hint remains
+If all repair-selector inputs are default-off, the hint remains
 `ReduceDtOnly` or `RepairOnly`, the legacy retry-halving behavior is preserved,
 and no local repair request is emitted.  Explicit
 `ForceInteriorMultiNodeRepair` requests run `InteriorMultiNodeProjection` only
@@ -4869,7 +4869,7 @@ where \(\sigma=\texttt{trial\_scale}\) is the analytic corner-J admissible
 scale from §3.2.13a.  The quantities are times in seconds; the scale and 0.7
 safety factor are dimensionless.
 
-Stage 24 adds a default-off retry dispatcher,
+A default-off retry dispatcher is added,
 `Numerics.hydro.dispatcher_state_sensitive_bypass_enabled`.  The typed
 corner-J guard classifies axis failures as state-sensitive when the
 step-start same-cell relative corner-J margin
@@ -4887,7 +4887,7 @@ dt floor-stall counter is reset.  When a pending repair plan and retry-active
 mesh repair are both present, the pending repair request supplies the ALE mode
 and focus cell; the active-repair balance remains diagnostic for that attempt.
 
-#### 3.2.13c Mesh-failure attribution diagnostics (Phase 2 Mesh Stability Wave 5)
+#### 3.2.13c Mesh-failure attribution diagnostics
 
 `Numerics.diagnostics.mesh_attribution.*` is a default-off D6 investigation
 path.  When both `enabled=True` and `record_node_displacements=True`, each
@@ -4922,7 +4922,7 @@ failure.  With `dump_on_failure_only=False`, one aggregate record is emitted per
 Hydro2D invocation with `failing_cell=-1` and per-source values equal to the
 sum over cells of positive degradation at each cell's most-degraded corner.
 
-#### 3.2.13d ICF shell and operator energy diagnostics (Stage 27 Wave C)
+#### 3.2.13d ICF shell and operator energy diagnostics
 
 `Numerics.diagnostics.icf.*` is default-off and also becomes effective when
 `Numerics.profile.icf_standard_ale.enabled=True`.  The shell radius uses the
@@ -5086,7 +5086,7 @@ with \(p=10,50,90\).  In two-temperature runs the same definitions are emitted
 for \(T_i\).  In one-temperature runs the ion-temperature fields are not
 written; the scalar `hotspot_Ti_valid` is 0 in history/snapshot diagnostics.
 
-For Phase A stagnation work there is no unique boundary for the diffuse
+For stagnation work there is no unique boundary for the diffuse
 tracer-defined hotspot control volume, so TENRYU does not fabricate a
 pressure-work surface integral.  The emitted `hotspot_work_proxy_*` fields are
 an explicitly named total-material-energy-change proxy:
@@ -5248,7 +5248,7 @@ using incident seam-cell neighbors. Reference-barrier ALE backtracking uses CSR
 candidate admissibility and the same CSR conservative remap for multiblock
 states.
 
-#### 3.2.13f Phase 2 multiblock path-admissibility dt rejection
+#### 3.2.13f Multiblock path-admissibility dt rejection
 
 When `Numerics.ale.multiblock_path_admissibility_enabled=true`, Hydro2D checks
 the multiblock Lagrangian path before committing predictor and corrector node
@@ -5908,10 +5908,10 @@ whenever the multiblock Svec arrays are recomputed — it is not gated on any
 pressure-field detection, and the post-balance arrays feed both force
 assembly and \(\dot V_c\), so the compatible-work identity is preserved by
 construction (§3.2.5; the earlier "only when uniform-pressure detection is
-active" wording matched no implementation — corrected per 2026-07-26 audit
-k02 F-11/§15-7). Single-block and tri_fan paths are unchanged.
+active" wording matched no implementation — corrected by the 2026-07-26
+audit). Single-block and tri_fan paths are unchanged.
 
-#### 3.2.13e Mesh-degeneracy forensics diagnostic (Phase A)
+#### 3.2.13e Mesh-degeneracy forensics diagnostic
 
 `Numerics.diagnostics.mesh_degeneracy_forensics.*` is a default-off diagnostic
 only path for repeated pre-commit `mesh_quality_*` / `in_hydro_*` failures.
@@ -5958,10 +5958,10 @@ The same coefficient is stored for candidate position and
 \(\Delta \mathbf{x}/\Delta t\), along with ratios to the affine gradient
 amplitude and local sound speed.  With `Numerics.hydro.hourglass.enabled=True`,
 the nodal acceleration fields record the Phase B anti-hourglass contribution
-from §3.2.9b; otherwise `a_hourglass=0` preserves the Phase A default-off
+from §3.2.9b; otherwise `a_hourglass=0` preserves the default-off
 diagnostic path.
 
-Phase D-1 adds an independent default-off corner-J source budget under
+An independent default-off corner-J source budget is added under
 `Numerics.diagnostics.mesh_degeneracy_forensics.corner_j_source_budget_enabled`.
 For each corner \(q\), the budget records a first-order projection
 \[
@@ -5997,7 +5997,7 @@ predictor and corrector budget arrays are total geometric displacements for
 those substeps; the dominant-source classifier subtracts pressure/Q/hourglass
 from those totals before assigning `predictor_other` or `corrector_other`.
 
-When Phase D-1 is active, the driver may snapshot node coordinates at
+When the source-budget diagnostic is active, the driver may snapshot node coordinates at
 `post_lagrange`, `post_ale_rezone`, and `post_remap` within the current retry
 attempt/step.  ALE and remap \(\Delta J\) use these direct coordinate
 differences; remap is normally zero because the implemented remap changes
@@ -6109,7 +6109,7 @@ comparison, not a global conservation criterion.
 
 **(d2) z-face state-supply 境界セル**
 - `Numerics.hydro.boundary.{z_bottom,z_top}` に `{"type":"state_supply", "rho_g_per_cc": rho_s, "u_z_cm_per_s": u_s, "T_eV": T_s}` を指定した場合、対応する境界セル row（下端 j=0、上端 j=nz-1）を reservoir-supplied cell として扱う。
-- Lagrangian corrector 後、および radiation/Qei/conduction block 後に、境界セルの `rho` と `mass=rho_s*V_current`、`Te=Ti=T_s` を再設定し、既存 EOS closure で `ee/ei/Pe/Pi` を一貫して再計算する。Wave 1 では single-T 供給のみをサポートし、2T mode でも `Te=Ti=T_s` とする。
+- Lagrangian corrector 後、および radiation/Qei/conduction block 後に、境界セルの `rho` と `mass=rho_s*V_current`、`Te=Ti=T_s` を再設定し、既存 EOS closure で `ee/ei/Pe/Pi` を一貫して再計算する。v1 では single-T 供給のみをサポートし、2T mode でも `Te=Ti=T_s` とする。
 - この境界は保存形ではない。各 override で reservoir から注入/除去された `delta_mass`、`delta_E_total`、`delta_p_z` を step/cumulative tally として集計し、verbose energy budget で報告する。`delta_E_total` は override 前に保存した `mass,ee,ei,u_z` と、EOS closure 後の post state を用いて評価する。`pre_uz` には supply `u_z_cm_per_s` を使い、tally と restored material velocity の規約を一致させる。
 - state-supply z-face の open-flow 保存フラックスは supplied material state \((\rho_s,u_{z,s},T_s)\) から作る。ALE remap kernel の signed face-speed convention に合わせた法線速度を \(u_{n,s}\) と書くと、advective mass flux は
   \[
@@ -6126,14 +6126,14 @@ comparison, not a global conservation criterion.
   \]
   境界 mesh position が z_min/z_max に clamped されても \(u_{n,s}\) はゼロではなく、active state-supply face では conservative remap が projected node `v_z` ではなく `supply_u_z_cm_per_s` を boundary face speed として直接使う。
 - ALE open-flow remap では、outflow 時の interior donor は既定 `boundary_2d.state_supply_donor_mode="interior_per_i"` で各 i の境界 row cell state \((\rho,u_z,e_e+e_i,E_{rad})\) を使う。`"interior_radial_average"` では remap flux pre-pass が同じ row の i 方向算術平均 donor を計算し、全 i の outflow donor に同じ平均値を用いる。inflow 時の reservoir donor はこの mode に依存しない。
-- Wave 1 では z-face のみ有効であり、r-face/1D の `state_supply` は不正入力である。PR 4.6 以降は z-face state-supply と 2D_RZ ALE の併用を許可する。ALE rezone は interior nodes を移動できるが、state-supply z-boundary nodes は z_min/z_max に固定され、mesh velocity と material velocity は分離される。Hydro2D position update は temporary `predictor_pos_z` / `corrector_pos_z` buffers だけをゼロ化して clamped z-boundary node を動かさず、material `state.v_z` は supply velocity を保持する。PR A 以降、`boundary_2d.mesh_tangential_target="reference"` は clamped r-face node の z 座標と clamped z-face node の r 座標を `State.x_*_reference` へ戻す。T2 以降の conservative remap はこの open-flow flux contract（state-supply z-face で rho*(u_n-w_n)*A*dt）を active state-supply faces に適用し、boundary face speed には `supply_u_z_cm_per_s` を直接使う。
+- v1 では z-face のみ有効であり、r-face/1D の `state_supply` は不正入力である。z-face state-supply と 2D_RZ ALE の併用は許可される（state-supply 節点は mesh 速度と材料速度の分離により ALE-safe）。ALE rezone は interior nodes を移動できるが、state-supply z-boundary nodes は z_min/z_max に固定され、mesh velocity と material velocity は分離される。Hydro2D position update は temporary `predictor_pos_z` / `corrector_pos_z` buffers だけをゼロ化して clamped z-boundary node を動かさず、material `state.v_z` は supply velocity を保持する。`boundary_2d.mesh_tangential_target="reference"` は clamped r-face node の z 座標と clamped z-face node の r 座標を `State.x_*_reference` へ戻す。conservative remap はこの open-flow flux contract（state-supply z-face で rho*(u_n-w_n)*A*dt）を active state-supply faces に適用し、boundary face speed には `supply_u_z_cm_per_s` を直接使う。
 - RH invariant audit は snap 0001 で mass、z-momentum、energy face flux の相対誤差が \(10^{-3}\) 以下であること、および `supply_u_z_cm_per_s` の正符号が z_bottom/z_top の両方で保たれることを検査する。
 
 **(e) コーナーノード（2境界の交点）**
 - 両方の境界条件を同時に適用。例：r=0 かつ z=z_min のノードでは v_r = 0 かつ v_z = 0（反射の場合）
 - 優先順位：r=0 対称軸の v_r=0 は常に適用（他の境界条件より優先）。`state_supply` は mesh-normal z 成分（x_z/v_z）を設定する。`mesh_tangential_target="reference"` のときだけ、BC-tangential 成分（z-face では x_r、r-face では x_z）を reference mesh 座標へ戻すため、corner nodes は幾何学的に固定されるが material-tied ではなくなる。
 
-### §3.2.y Pentagon-belt shell topology — ALE P2 (2026-07-28)
+### §3.2.y Pentagon-belt shell topology (2026-07-28)
 
 Polar-shell mesh with K∈[1,4] static angular-coarsening rings ("belts"): pentagon
 transition cells implement 2:1 zoning between angular bands, killing the near-axis
@@ -6201,9 +6201,9 @@ tri_fan/button center treatments. Restart: belt checkpoints write topology v3 + 
 test_pentagon_belt_builder.cu).** Builder counts/orientation/analytic shell volume/
 bitwise θ-nesting/F1 oracle (orientation-normalized copy)/HDF5 round-trip; node-force
 closure audit; static-gas smoke (25 steps: max|v| < 1e-8·c_s, mass 1e-12, energy
-1e-10, corner-mass sums intact); P2-5 mini killer (κ=4, v0=1.5·c_s inward: the
-convergent shock crosses the belt row with all cells positive-volume — the P2 exit
-criterion at mini scale; production-scale Phase-0 battery and refinement convergence
+1e-10, corner-mass sums intact); a mini-scale convergent-shock stress deck (κ=4, v0=1.5·c_s inward: the
+convergent shock crosses the belt row with all cells positive-volume — the exit
+criterion at mini scale; the production-scale battery and refinement convergence
 remain open).
 
 ### 3.3 ALE Rezone/Remap（2D RZ）
@@ -6983,7 +6983,7 @@ V_i^{mid}=V_i^{old}-\Delta V_{i+1/2}^{fixed}
           +\Delta V_{i-1/2}^{fixed}.
 \]
 MS2 moment remap applies the same `FixedSign` choice to swept-volume moments,
-and Stage 24 axis-band remap uses the same fixed source sign rather than a
+and the managed axis-band remap uses the same fixed source sign rather than a
 separate negated polygon convention.
 
 `swept_volume_sign_fixed=false` (default) preserves the legacy pre-2026-05-11
@@ -7818,14 +7818,14 @@ f_\alpha^{renorm} = \frac{f_\alpha^{remap}}{\sum_\beta f_\beta^{remap}}
 > 最大成分の添字 \(\alpha^* = \arg\max_\alpha f_\alpha^{remap}\) に対し \(f_{\alpha^*} = 1\)、
 > 他を \(f_\alpha = 0\) に設定する（NaN/Inf 防止）。DeviceErrorFlags の `volfrac_degenerate` を設定する。
 
-**Stage 30 Wave C PLIC material-volume remap**: when
+**PLIC material-volume remap**: when
 `Numerics.plic.enabled=True`, `Numerics.plic.in_run_disabled=False`, and the
 per-run sticky fallback is not engaged, ALE keeps the scalar remapper above for
 \(\rho\), \(\rho u_r\), \(\rho u_z\), \(\rho e_e\), \(\rho e_i\), diagnostic
 kinetic energy, and radiation energy.  Only the material volume integrals
 \(f_m V\) branch to the PLIC material-volume remapper.
 
-With the Stage 30 Wave E CF6 preview
+With the CF6 preview
 `Numerics.plic.rho_material_aware_donor=True`, this invariant changes only for
 \(\rho\): after successful PLIC face-volume construction, density is gathered
 with \(\Delta V_f\rho^{\rm eff}_d\) at interface donor cells, where
@@ -7833,7 +7833,7 @@ with \(\Delta V_f\rho^{\rm eff}_d\) at interface donor cells, where
 queried/estimated at runtime and are not stored in `State`.  If CF6 is false or
 PLIC remap falls back, density remains on the scalar remapper.
 
-For each R-face and Z-face, Wave C computes one signed swept volume
+For each R-face and Z-face, the PLIC material-volume remap computes one signed swept volume
 \(\Delta V_f\) with the same helper used by the scalar remapper.  PLIC then
 computes per-material face volumes \(\Delta V_{f,m}\) from the donor-cell
 interface reconstruction and enforces face closure exactly:
@@ -7860,9 +7860,9 @@ states, no-interface states, disabled PLIC, `in_run_disabled=True`, and sticky
 fallback all use the scalar material-fraction remap and the generic
 normalization path above.
 
-Wave C PLIC remap is serial-only.  If `part.n_ranks > 1` and
+The PLIC material-volume remap is serial-only.  If `part.n_ranks > 1` and
 `Numerics.plic.enabled=True`, ALE rejects the step with
-`ConfigError("Wave C PLIC remap not validated under MPI; deferred to Stage 31")`.
+`ConfigError("PLIC material-volume remap not validated under MPI; serial-only")`.
 
 **質量保存精度**：機械精度（\(\le 10^{-14}\) 相対誤差）。
 
@@ -8331,9 +8331,9 @@ stagnation. State counters record attempts, successes, lambda-collapse events,
 and each abort class.
 
 This is a bounded kill-test framework. If H3-B nr=256 does not reach `t_end`
-with bounded rezone count and clean Sedov metrics, Phase 6
-(`rz_logical="spherical_polar_halfplane"`) is the next consensus round per the
-AI Round 6 verdict.
+with bounded rezone count and clean Sedov metrics, the spherical-polar
+halfplane topology (`rz_logical="spherical_polar_halfplane"`) is the next step per the
+external-AI review verdict.
 
 **Tier-A butterfly-center authority harness (geometry only):**
 
@@ -8476,7 +8476,7 @@ guard and retry active mesh repair. The check is controlled by
 it restores the pre-Phase-9a Gauss-only post-tangle gate for diagnostic
 comparisons.
 
-Phase 2d-extension v6 Wave 4 adds a default-off strict-floor refinement to the
+A default-off strict-floor refinement is added to the
 same post-tangle gate. When
 `Numerics.ale.corner_post_tangle_strict_floor_enabled=true`, each active cell
 also forms
@@ -8500,7 +8500,7 @@ Telemetry distinguishes the two geometry failure modes: JSONL
 `[ale-stats] backtrack_lambda_accepted` line reports Gauss, corner-J, and other
 backtrack rejection counts.
 
-Phase 2d-extension v6 Wave 4 also lands the I1-B high-drive physics-stack
+The same change-set also adds the I1-B high-drive physics-stack
 anchor (`I1B_1D_RADIAL_GXII_5PCT`) as a deck-only validation gate. It introduces
 no new equations, units, discretization, constants, or namelist parameters: the
 gate reuses existing 1D_SPH Lagrangian hydro, 1D-supported laser raytrace,
@@ -8508,7 +8508,7 @@ grey multigroup FLD, electron heat conduction, and Qei coupling. The production
 deck fixes the GXII 5% drive at \(1.8\times10^9\) erg over a 1 ns square pulse
 and evaluates the same global matter+radiation+laser/radiation-escape residual
 used by the 2D I1 harness, with 1D cell-centered kinetic energy. Empirical
-Wave-4 result: `t_end_reached`, step 1000,
+Measured result: `t_end_reached`, step 1000,
 `energy_residual=2.75396e-3 <= 3.0e-3`.
 
 **λ-sweep rejection diagnostic (default off):**
@@ -8689,7 +8689,7 @@ corner-J inequalities, and the final candidate is accepted only after exact
 local validation.  This mode is opt-in through
 `Numerics.ale.multi_node_interior_repair_enabled=False` by default.
 
-**Stage 22 Wave 2 repair escalation ladder**：forced retry requests from
+**Repair escalation ladder**：forced retry requests from
 `AxisSpinePlusLocal` and `BoundaryPatchProjection` use a guarded ladder on local
 non-convergence:
 \[
@@ -8749,7 +8749,7 @@ The controller considers the band healthy when this exceeds
 For the K-selection policy, the controller scans \(K' \in
 [K_{\mathrm{initial}},K_{\max}]\) and selects the smallest \(K'\) for which the
 row-\(K'\) margin clears the threshold. If no \(K'\) clears, the controller
-defers to the legacy halve-dt path (Wave 1 dispatcher).
+defers to the legacy halve-dt dispatcher.
 
 ### Band-Only Swept-Volume Remap
 
@@ -8781,7 +8781,7 @@ ion channel is not independently evolved and is required only to remain finite
 and non-negative. In addition, every radiation group extensive energy
 \(E_{g,c}^{\rm rad}\) must remain non-negative after each sweep; a single
 negative group is a hard rollback gate even when the group sum stays positive
-(AI review k04 R13).
+(2026-07-26 kernel-review finding).
 
 On successful commit, cell-centered momentum is projected back to band nodes
 with the same corner-mass weighting used by the 2D_RZ ALE velocity projection:
@@ -8789,7 +8789,7 @@ with the same corner-mass weighting used by the 2D_RZ ALE velocity projection:
 u_n = \frac{\sum_{c \in C(n)} m_{c,n} u_c}{\sum_{c \in C(n)} m_{c,n}}.
 \]
 Here \(m_{c,n}\) is the RZ corner mass assigned from the remapped cell mass.
-This is the Wave-2 first-cut choice because it preserves translation-invariant
+This choice preserves translation-invariant
 kinetic energy and is consistent with the existing 2D_RZ ALE projection
 convention.
 
@@ -8802,7 +8802,7 @@ physical-scale-normalized band cell-momentum deltas
 \(10^{-10}\) for translation-invariant kinetic energy. At runtime the residuals
 for mass, internal energies, radiation energy (when the band held radiation
 energy before the remap), and band cell momentum are a **hard rollback gate**
-at \(10^{-8}\) (AI review k04 R14): the band remap is a serial host
+at \(10^{-8}\) (2026-07-26 kernel-review finding): the band remap is a serial host
 transaction, so these residuals are deterministic and roundoff-level unless a
 genuine defect is present. The node-projection kinetic-energy delta remains a
 warning-level diagnostic only, because the mass-weighted cell-to-node
@@ -8848,7 +8848,7 @@ success) or restores and increments K (on positivity failure).
 
 When all K in [K_initial, K_max] fail (AllKFailed), the controller
 returns without modifying state and the caller falls through to the
-Wave 1 legacy halve-dt path (no Path gamma scope creep).
+legacy halve-dt dispatcher (no Path gamma scope creep).
 
 Conservation diagnostics (mass / E_int_e / E_int_i / E_kin / E_rad
 relative deltas) are emitted via `AxisBandResult`; tolerances of 1e-12
@@ -8857,14 +8857,14 @@ radiation / band cell-momentum residuals are a hard rollback gate at 1e-8
 inside `apply_axis_band_remap` (`ConservationViolation`), and any negative
 radiation group after a sweep is a hard rollback gate
 (`RemappedRadiationNegative`); only the projection kinetic-energy delta
-remains warning-only (see the band-remap section above, AI review k04
-R13/R14).
+remains warning-only (see the band-remap section above, the 2026-07-26
+kernel review).
 
 Telemetry: when the controller commits a remap, the driver's
 `stage24_axis_variational_projection_engaged_via` is set to
 `"axis_band_managed_remap"` (first-set per step), distinct from
-`"primary"` and `"escalation"` introduced by Wave 1's effective_mode_executed
-plumbing. The pre-Wave-2 dispatcher state machine remains active when
+`"primary"` and `"escalation"` recorded by the
+effective_mode_executed field. The pre-existing dispatcher state machine remains active when
 the namelist flag is off.
 
 **Phase 9b: predictive next-hydro acceptance gate (opt-in):**
@@ -9071,7 +9071,7 @@ deposit, the default path clips removal to the available nonnegative internal
 energy \(m_c^*(e_e^{raw}+e_i^{raw})\). This is the
 legacy behavior used when `Numerics.ale.ke_closure_redistribute_floor=false`.
 
-**Baseline-relative floors (wave-10 2026-08-10).** With a table EOS the
+**Baseline-relative floors (2026-08-10).** With a table EOS the
 remapped specific internal energies can be legitimately negative (cold-curve
 states). All closure write-back paths (the legacy deposit, its audit variant,
 and the two-pass redistribution below) therefore floor each species at the
@@ -9082,7 +9082,7 @@ do not modify \(e_i\) at all; the clamped raws
 weights and the negative-deposit removable clip. Flooring can therefore never
 raise a cell above its own input. For non-negative (ideal-gas) inputs every
 path is bit-identical to the historic all-clamp behavior. This mirrors the
-wave-9 1D ALE KE-closure contract fix (`ale_1d_velocity_project.cu`).
+1D ALE KE-closure contract fix (`ale_1d_velocity_project.cu`).
 
 When `Numerics.ale.ke_closure_redistribute_floor=true`, the closure instead
 uses a conservative two-pass positivity correction. First compute the
@@ -9653,7 +9653,7 @@ execution path:
    cached when the unit first entered the watch window, not the \(t=0\)
    volume. The watch spans the first `TENRYU_I1B_ABSORB_WATCH_ROWS` active
    units (default 1 = the historical single-ring watch). A wider window is
-   the endgame PRE-trigger: a row beyond the first active unit can collapse
+   the terminal-absorption PRE-trigger: a row beyond the first active unit can collapse
    to a committed-degenerate volume within one accepted step — observed as
    a hard non-positive-volume assert at \(t=2.78\) ns while the single-ring
    watch looked only at the first unit — and absorbing it at \(\tau\) of
@@ -9884,7 +9884,7 @@ clamped at zero if a current roundoff gap is already exhausted, and is folded
 into the hydro dt minimum.
 
 *Emergency mixed-material absorption* (experimental, env
-`TENRYU_I1B_MIXED_ABSORB`, default off; macro-boundary endgame verdict
+`TENRYU_I1B_MIXED_ABSORB`, default off; macro-boundary terminal-absorption verdict
 direction (a), ideal-gas MVP). The terminal failure of the best-surviving
 Case B runs is, by direct forensics, a SIMPLE-LOOP self-intersection of the
 macro boundary at the pole after the pure-gas ladder is exhausted (the
@@ -9908,7 +9908,7 @@ per-material-EOS physics MUST replace this with a true multi-material macro
 state (per-material \(M_m,U_m\), pressure-equilibrium solve, and the
 compressibility-weighted work partition
 \(\chi_m=(V_m/K_m)/\sum_j V_j/K_j\)). A run that performs at least one
-emergency absorption is a *mixed-core endgame* run: the macro CV then
+emergency absorption is a *mixed-core terminal-absorption* run: the macro CV then
 contains dense-shell material, and gas-region metrics that count the whole
 macro volume (e.g. CR\(_V\) including the macro core) carry that caveat
 from the first mixed absorption onward (`mixed_absorbed_row_count` in the
@@ -9918,7 +9918,7 @@ macro state and the granted-log line mark the transition).
 dynamics' nodal masses and the energy-budget KE use the cached subzonal
 corner-mass basis (`state.corner_mass`), while the Option-B velocity remap
 conserves corner momenta in its transient first-moment basis; under heavy
-remap activity (the mixed-core endgame) the basis product
+remap activity (the mixed-core terminal-absorption phase) the basis product
 \(\sum \tfrac12(m^{F}_a-m^{B}_a)\,\Delta(v^2)\) appears as a roll-dependent
 budget drift (frozen-basis N=4 envelope \([-1.6\%,+23\%]\)). The landed
 mitigation is the V-PAIRED INSTALL (`TENRYU_I1B_INSTALL_VPAIRED_CORNER_MASS`):
@@ -9928,7 +9928,7 @@ by (uniform states give \(\rho_a\equiv\rho_c\) and zero subzonal noise to
 round-off; one multiplicative per-cell scale enforces
 \(\sum_a m_a=m_c\) exactly), validated and abandoned-on-violation. This
 narrows the drift envelope ×12 (N=4: \([+1.5\%,+3.5\%]\), all-positive,
-monotone in the install count) and makes the endgame trajectory nearly
+monotone in the install count) and makes the terminal-absorption trajectory nearly
 roll-deterministic, at the cost of a deterministically different (deeper,
 earlier) absorption cascade. Related env-gated arms retained for
 adjudication evidence only (NOT production candidates): per-step geometry
@@ -10156,9 +10156,9 @@ DDMC粒子は pos=NaN sentinel のため空間探索不可であり、cell_id �
 - CFL制約によりrezoneのノード変位は小さいため、現在セル＋近傍の局所探索で十分
 - 失敗時のみ拡張探索を行う
 
-#### 3.3.13 Young/PLIC material-interface reconstruction (Stage 30 Wave B)
+#### 3.3.13 Young/PLIC material-interface reconstruction
 
-This section defines the default-disabled Stage 30 Wave B PLIC reconstruction
+This section defines the default-disabled PLIC reconstruction
 core.  Unless `Numerics.plic.enabled=True`, none of these paths are active:
 initial geometry sampling remains the legacy centroid-only evaluation and
 PLIC reconstruction is inert.
@@ -10223,12 +10223,12 @@ volume element \(2\pi r\,dA\).  `t0_volume_cut_max_depth` defaults to 6
 (was 12) and is tunable over [4, 16]. Empirically: max_depth=6 is sufficient to
 resolve smooth Legendre-perturbed shell interfaces in I1 capsule deck within
 ~5 sec/cell. Higher depths (>=12) cause exponential blowup against hard step
-functions and are not recommended for production. Wave A range was [8, 16];
-Wave E expanded to [4, 16] to allow faster init for empirical runs. This path
+functions and are not recommended for production. The initial range was [8, 16];
+the CF6 empirical-calibration range expanded to [4, 16] to allow faster init for empirical runs. This path
 is gated by `Numerics.plic.enabled=True`; setting `t0_volume_cut_method` alone
 must not change disabled runs.
 
-Wave B also defines three deterministic degradation detectors/helpers:
+The PLIC reconstruction stage also defines three deterministic degradation detectors/helpers:
 negative corner-\(J\) preflight (case 1), ill-conditioned normal fallback
 chain previous-normal/LVIRA/facial jump/skip (case 2), and flux-weighted
 thermodynamic closure mismatch
@@ -10240,7 +10240,7 @@ thermodynamic closure mismatch
 (case 3).  Class-(d) PLIC events are separate from class-(c) ALE escape-valve
 events and do not increment `class_c_runtime_fires`.
 
-Stage 30 Wave C wires this reconstruction into ALE material-volume remap
+This reconstruction is wired into the ALE material-volume remap
 without expanding the physical state contract.  There are no per-material
 \(\rho_m\), \(e_m\), or momentum arrays.  The PLIC path transports only
 \(f_m V\); all scalar conserved fields continue to use §3.3.4 scalar remap.
@@ -10250,10 +10250,10 @@ The GPU fast path builds an interface mask from
 cells outside the mask on the donor-fraction material-volume closure inside the
 PLIC remapper.
 
-Stage 32a Wave A adds a default-disabled per-material conservation state
-contract for Wave F.  When
+A default-disabled per-material conservation state
+contract is added for per-material conservation mode.  When
 `Numerics.materials.per_material_conservation_enabled=false`, all new
-per-material arrays remain size zero and the Stage 30 scalar remap semantics
+per-material arrays remain size zero and the pre-existing scalar remap semantics
 above are unchanged.  When enabled, the authoritative per-material conserved
 state is cell-major and extensive:
 \[
@@ -10261,14 +10261,14 @@ M_{c,m}\ [g],\qquad E_{e,c,m}\ [erg],\qquad E_{i,c,m}\ [erg],
 \]
 stored as `mass_per_material`, `Ee_per_material`, and `Ei_per_material` with
 index \(cN_{\rm mat}+m\).  Momentum is not persistent per material; later remap
-waves derive per-material momentum from \(M_{c,m}\) and the shared cell
+operations derive per-material momentum from \(M_{c,m}\) and the shared cell
 velocity.  `Te_per_material` and `Ti_per_material` are optional lazy caches of
 derived EOS inversions, never authoritative thermodynamic state, and are size
 zero unless `Numerics.materials.lazy_cache_te_m_enabled=true` while the master
 switch is enabled.
 
-Stage 30 Wave E adds a default-disabled CF6 preview,
-`Numerics.plic.rho_material_aware_donor`.  When this flag is false, Wave C
+The CF6 preview adds a default-disabled option,
+`Numerics.plic.rho_material_aware_donor`.  When this flag is false, the material-volume remap
 semantics above are unchanged: density uses the scalar ALE remapper.  When it
 is true and the PLIC remap succeeds, \(\rho\) is remapped through the PLIC face
 volume fluxes with a material-aware donor density at PLIC interface donor
@@ -10293,7 +10293,7 @@ d_c = \frac{\|x^{\,new}_{I,c}-x^{\,last}_{I,c}\|}{h_c},
 where \(h_c\) is the maximum R/Z cell span.  A drift trigger occurs when
 \(\max_c d_c >\) `drift_sensor_max_relative`; the swept-volume-fraction metric
 is recorded with the same `drift_sensor_max_swept_fraction` threshold for
-Wave D production-comparable policy wiring.  Out-of-cycle checks refresh the
+the PLIC provenance/claim wiring.  Out-of-cycle checks refresh the
 stored centroids and log a warning, but they do not mutate
 `numerics.ale.every_n_steps`.
 
@@ -10304,10 +10304,10 @@ scalar path.  This PLIC fallback is orthogonal to class-(c) ALE escape valves:
 both may fire in one step, but `class_c_runtime_fires` is controlled only by
 the ALE escape-valve path.
 
-#### 3.3.14 Per-material remap recovery rules (Stage 32a Wave B)
+#### 3.3.14 Per-material remap recovery rules
 
 This section documents the per-material conservation array recovery rules
-introduced in Stage 32a Wave B. These rules apply only when
+introduced for per-material conservation. These rules apply only when
 `Numerics.materials.per_material_conservation_enabled=True`. When disabled,
 legacy single-field scalar remap behavior is preserved.
 
@@ -10317,7 +10317,7 @@ Each ALE call chooses one per-material conserved remap route for the whole
 pass: either the PLIC unified pass, where per-material face-volume fluxes
 drive all five conserved-density slabs at every interface cell, or the scalar
 5 x `n_mat` fallback, where each slab is handled independently. Mixed
-face-by-face routing within one ALE call is not supported in Stage 32a.
+face-by-face routing within one ALE call is not currently supported.
 
 PLIC is active for this route only when `Numerics.plic.enabled=True`, sticky
 fallback is not engaged (`state.plic_remap_sticky_fallback=false`), no drift
@@ -10328,7 +10328,7 @@ separate density field under §3.3.4.
 
 ##### 3.3.14.2 Sum-then-divide momentum reduction
 
-Per Stage 31 Q2.3, `recover_primitive_kernel_per_material` implements the
+By design, `recover_primitive_kernel_per_material` implements the
 cell-mean velocity as
 \[
 v_{r,c}=\frac{\sum_m p_{r,c,m}}{\sum_m M_{c,m}},
@@ -10373,23 +10373,23 @@ checks still pass.
 
 ##### 3.3.14.5 CF6 rho_material_aware_donor bypass
 
-When per-material mode is active, the Stage 30 Wave E CF6 preview
+When per-material mode is active, the CF6 preview
 (`Numerics.plic.rho_material_aware_donor`) is redundant because \(\rho\) is
 recovered as \(\sum_m M_{c,m}/V_c\). The CF6 code path is skipped by a host
 guard. When per-material mode is disabled, the CF6 path remains unchanged.
 
 ##### 3.3.14.6 Four-clause floor discipline
 
-Per Stage 31 Q2.5, four floor clauses apply:
+By design, four floor clauses apply:
 
 - Numerical presence threshold: gates per-material ratio extraction only.
 - Nonnegative conserved repairs: pack and recover clamp negative \(M_m\),
   \(E_{e,m}\), and \(E_{i,m}\) to zero with repair-count auditing.
-- EOS-domain query clamps: gated at EOS query sites and reserved for Wave C.
+- EOS-domain query clamps: gated at EOS query sites and reserved for the per-material EOS-projection layer.
 - Non-positive cell volume: remains a remap failure and is not hidden by
   `fmax(vol, 1e-30)` in per-material mode.
 
-##### 3.3.14.7 Per-material EOS inverse + cell-mean projection (Stage 32a Wave C)
+##### 3.3.14.7 Per-material EOS inverse + cell-mean projection
 
 When `numerics.materials.per_material_conservation_enabled = true`, the legacy
 scalar material-0 EOS reclosure is replaced by a per-material refresh launcher.
@@ -10466,9 +10466,9 @@ Cell-mean projections are:
 
 The \(T_e,T_i,\bar Z,c_v\) projections are mass-weighted. \(P_e,P_i\) are
 volume-weighted intensive projections. The sound speed uses max-over-present
-materials for CFL conservatism (Stage 32a Lock #19). The scalar `ee` and `ei`
+materials for CFL conservatism. The scalar `ee` and `ei`
 fields are reductions of the authoritative extensive per-material energies,
-not independent state in per-material mode. In Wave C, the device
+not independent state in per-material mode. In per-material mode, the device
 projection sources \(\bar Z_m\) from fixed material-\(\bar Z\) configuration
 when provided, otherwise from `materials.mat_defs[m].Z`; extending this path
 to device-resident tabular/Thomas-Fermi per-material \(\bar Z\) is deferred to
@@ -10484,19 +10484,19 @@ Lazy cache (`numerics.materials.lazy_cache_te_m_enabled`, default off):
   \(E_{e,m}\), \(E_{i,m}\), mass, volume-fraction, or volume mutation site.
 - Cache values must be identical to recomputation. The cache is a pure
   performance optimization and never changes EOS semantics.
-- Wave D Part 2 profiling (§4.1.4) keeps this default off because the
+- Profiling (§4.1.4) keeps this default off because the
   baseline median EOS-refresh/step ratio did not exceed 10% in any measured
-  regime (Q-XAI-1).
+  regime.
 
-Wave D/F operators that mutate per-material energy, mass, volume fraction, or
+Per-material mutation operators that mutate per-material energy, mass, volume fraction, or
 volume must invalidate affected entries and invoke
 `refresh_per_material_derived_cell_fields()` after their mutations to keep
 cell-mean projections coherent.
 
-##### 3.3.14.8 V22 restart/output contract and diagnostics (Stage 32a Wave E)
+##### 3.3.14.8 V22 restart/output contract and diagnostics
 
 When `Numerics.materials.per_material_conservation_enabled=True`, HDF5 output
-writes the authoritative Wave F conserved state under
+writes the authoritative per-material conservation state under
 `/hydro/per_material/v1/`:
 
 - `mass[N_cell,N_mat]` in [g]
@@ -10514,7 +10514,7 @@ derived arrays are also emitted:
 `mass`, `Ee`, and `Ei`, then rebuilds derived cell fields.
 
 The cell-mean datasets `/hydro/{rho,ee,ei,Te,Ti,Pe,Pi,zbar,cv_e,cv_i,cs}` carry
-`derived_projection_when_per_material_enabled=1` when Wave F mode is active.
+`derived_projection_when_per_material_enabled=1` when per-material conservation mode is active.
 This attribute tells readers that these cell means are projections of the
 per-material extensive state rather than independent conserved quantities.
 
@@ -10534,8 +10534,8 @@ and analogously for \(E_e\) against \(M_c e_{e,c}\) and \(E_i\) against
 `conservation_residual_warn_threshold_rel` (default \(10^{-12}\)) logs a
 WARNING and increments `conservation_drift_warnings`; above
 `conservation_residual_hard_warning_threshold_rel` (default \(10^{-10}\)) logs
-a HARD WARNING.  No hard-fail threshold is defined in Stage 32a; empirical
-calibration is deferred to Stage 33+.
+a HARD WARNING.  No hard-fail threshold is currently defined; empirical
+calibration is deferred to future work.
 
 Per-material event counters are cumulative and written under
 `/diagnostics/per_material/v1/`: EOS table validity violations, absent-material
@@ -10554,13 +10554,13 @@ per-material disabled.  V22 enabled files load `mass/Ee/Ei` into
 are reset to false on restart; lazy cache values are never checkpoint
 authoritative.
 
-##### 3.3.14.9 production_comparable Wave F gate structure (Stage 32a Wave E)
+##### 3.3.14.9 production_comparable gate structure for per-material conservation
 
-The Stage 32b empirical rerun will classify Wave F outcomes with the following
+The planned follow-up empirical rerun will classify per-material conservation outcomes with the following
 seven `production_comparable` criteria:
 
 1. PLIC enabled.
-2. Wave F per-material conservation enabled.
+2. Per-material conservation enabled.
 3. The run reached `t_end`.
 4. Final ALE provenance is `PUBLIC_BASELINE`.
 5. Class-(d) aggregate is `none` or `soft_only`.
@@ -10571,14 +10571,14 @@ seven `production_comparable` criteria:
 
 The code-level enum is
 `PASS`, `PARTIAL_A_CR_PROGRESSION`, `PARTIAL_B_PRODUCTION_RESIDUAL`,
-`INCONCLUSIVE`, `FAIL`, and `DISABLED`.  Stage 32a Wave E wires the criteria
-and enum only; Stage 32b supplies the multi-CF empirical data and applies the
+`INCONCLUSIVE`, `FAIL`, and `DISABLED`.  The V22 restart/output contract wires the criteria
+and enum only; the planned follow-up empirical rerun supplies the multi-CF empirical data and applies the
 final route.
 
-##### 3.3.14.10 Wave F t=0 per-material initialization projection (Stage 32b Wave F)
+##### 3.3.14.10 t=0 per-material initialization projection
 
 For fresh deck initialization, or for V20/V21 legacy restart files that lack
-`/hydro/per_material/v1/`, Wave F initializes the authoritative per-material
+`/hydro/per_material/v1/`, per-material conservation mode initializes the authoritative per-material
 conserved arrays from the already-constructed cell-mean state by a volume-
 fraction fan-out:
 \[
@@ -10601,7 +10601,7 @@ In mixed cells this projection assumes the initial cell-mean \(\rho\),
 \(e_e\), and \(e_i\) apply to every material at \(t=0\).  This is a deliberate
 initialization approximation: material-specific evolution diverges after
 startup through the per-material EOS, conduction, \(Q_{ei}\), artificial
-viscosity, radiation, and remap operators.  A future Stage 33+ deck extension
+viscosity, radiation, and remap operators.  A future deck extension
 may provide explicit \(\rho_m\), \(e_{e,m}\), and \(e_{i,m}\) callables to
 replace this fan-out when physically resolved material thermodynamic profiles
 are available.
@@ -10609,7 +10609,7 @@ are available.
 V22 restarts with complete enabled per-material data do not apply this
 projection; the checkpoint arrays remain authoritative.  A V22 checkpoint with
 an enabled per-material group missing any of `mass`, `Ee`, or `Ei` is treated
-as corrupt for Wave F enabled restart and must fail rather than silently
+as corrupt for a per-material-conservation-enabled restart and must fail rather than silently
 falling back to cell-mean fan-out.
 
 ### 3.4 1D_SPH pure Lagrangian hydro and optional V3 ALE
@@ -10618,15 +10618,15 @@ falling back to cell-mean fan-out.
 
 #### 3.4.1 1D 方針
 
-通常の 1D 球対称シミュレーションでは pure Lagrangian を使用する。旧 ALE rezoner は cell tangling のない 1D 球対称では不要であり、shock smearing の原因となるため削除された (ALE-FIX-1, 2026-04-26)。
+通常の 1D 球対称シミュレーションでは pure Lagrangian を使用する。旧 ALE rezoner は cell tangling のない 1D 球対称では不要であり、shock smearing の原因となるため削除された (2026-04-26)。
 
 したがって `numerics.ale.enabled` は 2D_RZ ALE のみを制御する。1D_SPH では `mesh.motion="lagrangian"` を用い、`mesh.motion="ale"` は許可しない。旧 1D 専用 ALE の設定面および実装面は削除された。
 
-V3 solution-adaptive ALE は `numerics.ale1d.enabled` でのみ制御する。これは旧 1D ALE の復活ではなく、feature sensor、monitor equidistribution、conservative remap、velocity projection を二相 commit で行う独立機能である。Week 6 では `apply_ale_1d` が 21-step data flow を実装し、sensor/rezone/remap/projection/diagnostics は scratch にのみ書き、hard 許容誤差を満たした場合だけ mesh・保存量・速度を commit する。
+V3 solution-adaptive ALE は `numerics.ale1d.enabled` でのみ制御する。これは旧 1D ALE の復活ではなく、feature sensor、monitor equidistribution、conservative remap、velocity projection を二相 commit で行う独立機能である。現行版では `apply_ale_1d` が 21-step data flow を実装し、sensor/rezone/remap/projection/diagnostics は scratch にのみ書き、hard 許容誤差を満たした場合だけ mesh・保存量・速度を commit する。
 
 > **運用注意**：`Ale1dConfig::enabled=false` / `numerics.ale1d.enabled=False` が既定であり、1D ALE V3 は実験的な opt-in 機能として、long-pulse ablation front penetration や multi-shock systems など localized moving feature がある場合に限って検討する。
 
-**min-width floor モード（wave-5 2026-08-07、experimental-incomplete）**：
+**min-width floor モード（2026-08-07、experimental-incomplete）**：
 `numerics.ale1d.min_width_floor`（既定 `enabled=False`）は、最小セル幅が
 `floor_cm` を下回ったステップで sensor/monitor 経路を経ずに直接候補を構築する
 dt 救済トリガである。候補構築は昇順・救済可能性スキャン：床未満のセルを幅昇順に
@@ -10642,7 +10642,7 @@ one-cell sweep 述語に対する安全クランプを候補側でも課す。�
 契約であり、オフライン複製で証明済み）。下流（境界強制・候補検証・
 remap_v3・速度射影・保存則ゲート・commit）は monitor 経路と共有。
 
-**再トリガ cooldown（wave-10 2026-08-10）**：`retrigger_cooldown_steps`（int、
+**再トリガ cooldown（2026-08-10）**：`retrigger_cooldown_steps`（int、
 既定 0、`>=0`）は、floor トリガ由来の rezone 試行が理由を問わず適用されなかった
 （no_relief・候補棄却・保存則棄却・benefit gate 棄却等）直後から、以後 N step の
 あいだ floor トリガの評価自体（node 座標の host 転送と最小幅スキャンを含む）を
@@ -10654,7 +10654,7 @@ restart 直後は floor を一度再評価し、不適用なら再装填され�
 
 **現状**: 採用候補が remap_v3 の extensive-field 検証で棄却される未同定の
 段が残っており（ConservationRejected）、ベンチデッキでの実適用は未達成。
-本モードは default-OFF の research prototype であり、後続アークの起点は
+本モードは default-OFF の research prototype であり、後続開発の起点は
 `docs/design/perf_1d_wave5_20260807.md` B1 節を参照。
 > 典型的な GXII short-pulse cases では ALE off の pure Lagrangian を推奨する。120J/6ns FLD 評価では中央収束領域が広く局在 feature ではないため、ALE による speedup は確認されていない。
 
@@ -10853,7 +10853,7 @@ For \(N_{\rm ramp}=2\), \(\phi(0)=0\), \(\phi(1)=0.5\), and \(\phi(d\ge2)=1\). R
 
 After the high-order attempt, each field is checked for positivity and local boundedness. Mass, material component mass, and radiation are checked as densities; electron/ion energies are checked as recovered specific energies after the conservative energy and mass remaps. If a field fails and `fallback_to_first_order_on_bounds_fail=True`, that field is recomputed with \(\phi=0\). For electron/ion energy fallback, the recovered specific energy uses a mass denominator from the same first-order donor remap; if the high-order mass candidate had passed its own bounds, mass is recomputed with \(\phi=0\) before the specific-energy fallback is accepted. If the fallback still fails, remap returns `ConservationRejected`. Scratch diagnostics record the cells/fields that required fallback. `high_order_enabled=False` directly selects the Week 4 first-order donor path.
 
-The remapped conserved quantities are mass \(m_i\), material masses \(m_if_{i,m}\), electron and ion material energies \(m_ie_{e,i}\), \(m_ie_{i,i}\), and radiation group energies \(V_iE_{g,i}\). Scratch outputs store \(m_i^n\), \(V_i^n\), normalized \(f_{i,m}^n\), specific \(e_{e,i}^n,e_{i,i}^n\), and radiation energy densities \(E_{g,i}^n\). This function is a two-phase operation: it reads `State` and `r_candidate`, writes only `Ale1dRemapScratch`, and does not mutate mesh or physics state. The Week 6 driver then projects velocity into `Ale1dVelocityProjectScratch`, computes hard diagnostics, and only on acceptance commits `x_r`, mass, energies, radiation energy density, volume fractions, and nodal velocity, followed by boundary application, geometry/rho refresh, EOS reclosure, and transient source/viscosity invalidation.
+The remapped conserved quantities are mass \(m_i\), material masses \(m_if_{i,m}\), electron and ion material energies \(m_ie_{e,i}\), \(m_ie_{i,i}\), and radiation group energies \(V_iE_{g,i}\). Scratch outputs store \(m_i^n\), \(V_i^n\), normalized \(f_{i,m}^n\), specific \(e_{e,i}^n,e_{i,i}^n\), and radiation energy densities \(E_{g,i}^n\). This function is a two-phase operation: it reads `State` and `r_candidate`, writes only `Ale1dRemapScratch`, and does not mutate mesh or physics state. The driver then projects velocity into `Ale1dVelocityProjectScratch`, computes hard diagnostics, and only on acceptance commits `x_r`, mass, energies, radiation energy density, volume fractions, and nodal velocity, followed by boundary application, geometry/rho refresh, EOS reclosure, and transient source/viscosity invalidation.
 
 Velocity projection is also two-phase. From old nodal velocities and old cell masses,
 \[

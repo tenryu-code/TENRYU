@@ -526,7 +526,7 @@ void corner_mass_remap_audit_capture_pre(const core::State& state,
                                          CornerMassRemapAuditPre* pre) {
   TENRYU_ASSERT(
       state.corner_stride == 4,
-      "corner_stride != 4: remap-audit corner path is staged (ALE P2-1c/P2-4+)");
+      "corner_stride != 4: remap-audit corner path is staged for a later revision");
   state.x_r.copy_to_host(pre->x_r);
   state.x_z.copy_to_host(pre->x_z);
   state.mass.copy_to_host(pre->mass);
@@ -912,7 +912,7 @@ void gap_form_compensation_bracket(
     const bool audit_only) {
   TENRYU_ASSERT(
       state.corner_stride == 4,
-      "corner_stride != 4: remap-audit corner path is staged (ALE P2-1c/P2-4+)");
+      "corner_stride != 4: remap-audit corner path is staged for a later revision");
   if (!state.mesh.topo.multiblock.has_value()) {
     return;
   }

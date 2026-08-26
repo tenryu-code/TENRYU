@@ -26,7 +26,7 @@ namespace {
 constexpr double kTiny = 1.0e-300;
 constexpr double kFluxTiny = 1.0e-30;
 constexpr double kWarnRel = 1.0e-8;
-// Hard-rollback threshold for conservation residuals (k04 R14). The band
+// Hard-rollback threshold for conservation residuals (2026-07-26 kernel-review finding). The band
 // remap is a serial host computation, so residuals are deterministic and
 // roundoff-level (<< 1e-8) unless a genuine defect is present.
 constexpr double kConsFailRel = 1.0e-8;
@@ -1117,7 +1117,7 @@ AxisBandRemapResult apply_axis_band_remap(
       return result;
     }
   }
-  // Hard conservation gate (k04 R14): mass, internal energies, radiation
+  // Hard conservation gate (2026-07-26 kernel-review finding): mass, internal energies, radiation
   // energy, and band cell momentum must close to roundoff. The projection
   // kinetic-energy delta is intentionally excluded — the mass-weighted
   // cell-to-node projection is not KE-conserving by construction and its

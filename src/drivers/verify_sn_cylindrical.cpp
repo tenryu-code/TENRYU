@@ -139,7 +139,7 @@ bool run_sn_1d_cylindrical_marshak_equilibration_verify() {
   }
   // Full cylinder by default: the axis cell exercises the per-level
   // starting-direction + reflection machinery (the cylindrical analog of
-  // the BUG-8 spherical center dip).
+  // the conservative-streaming spherical center-dip fix).
   const char* diag_r0 = std::getenv("TENRYU_SN_MARSHAK_DIAG_R0");
   const double gate_r0 = (diag_r0 != nullptr && diag_r0[0] != 0)
                              ? std::atof(diag_r0)

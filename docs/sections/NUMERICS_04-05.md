@@ -159,7 +159,7 @@ min 合成（一様極限で歴史値と一致）。定数 test_kappa 経路は�
 （tmp/ab_kirchhoff_gxii.sh、main 直列実行）後のユーザー判断として完了した。
 Default flipped 2026-07-06 per user decision (rebaseline sprint).
 
-**BUG-19（2026-07-13）: flux-limiter 面推定の閉包整合契約**：面 flux-limiter
+**flux-limiter 面推定の閉包整合契約（2026-07-13）**：面 flux-limiter
 係数 \(\lambda_f=1/(1+|q_{SH,f}|/q_{max,f})\) の \(q_{SH,f}\) 推定は、
 **消費側 flux カーネルと同一の面 κ 閉包**（`face_kappa_policy` に追従）で
 評価しなければならない。修正前は推定が常に調和平均 κ で行われており、
@@ -178,7 +178,7 @@ harmonic 閉包・test_kappa 経路は bit 恒等。回帰:
 `test_conduction_limiter_policy_consistency`（2 セル急峻 front で
 \(|q_{applied}|\le q_{max}\) 不変量 + 判別 assert \(\lambda<10^{-2}\)）。
 
-**BUG-20（2026-07-13）: kirchhoff dt Gershgorin の零体積セル guard**：上記
+**kirchhoff dt Gershgorin の零体積セル guard（2026-07-13）**：上記
 Gershgorin 型 dt 推定 \(2C_iV_i/\sum G_f\) は歴史的に \(V=\max(vol_i,10^{-30})\)
 で床当てしていたため、\(x_r\) は有効だが \(vol\) が未評価（全零）の状態
 （unit-test 級の手組み state）で \(V=10^{-30}\) を製造し、dt_exp が
@@ -193,7 +193,7 @@ state は常に \(vol>0\) のため健常 dt_exp は bit 恒等。診断確定�
 ctest へ零体積 property test（零 vol=無寄与 sentinel + 真球殻 vol=有限比）
 を追加、#845 green 化。
 
-**BUG-12（2026-07-06）: 1T conduction \(c_v\) convention**：
+**1T conduction \(c_v\) convention（2026-07-06）**：
 `Main.temperature_model="1T"` では `ee` は total internal energy であり、
 EOS closure の比熱契約は \(c_{v,total}=c_{v,i}+c_{v,e}\)（理想気体固定 \(Z\) では
 \((1+\bar Z)k_B/[A m_p(\gamma-1)]\)）である。旧挙動では `state.cv_e` が無い
@@ -233,7 +233,7 @@ ctest `C1 Zel'dovich-Raizer thermal-wave gate is production-level` は
 \(\kappa_{SH}\propto T_e^{5/2}/(\bar Z\ln\Lambda)\) と flux/MFP limiter を持つため未実装であり、
 この deck は production HDF5/波面抽出 gate として線形伝導解析解を用いる代替である。
 
-#### 4.1.1 Per-material Spitzer-Härm conduction (Stage 32a Wave D)
+#### 4.1.1 Per-material Spitzer-Härm conduction
 
 `numerics.materials.per_material_conservation_enabled=true` かつ hydro EOS context が利用可能な場合、
 電子熱伝導は材料ごとの電子エネルギー \(E_{e,c,m}\) を直接更新する。従来の単一材料/disabled 経路は
@@ -268,7 +268,7 @@ STS の安定性評価と stage scheduling には集約係数
 \kappa_{eff,f}=\sum_m \alpha_{f,m}\kappa_{eff,f,m}
 \]
 を用いる。ただし分母は従来通り cell-mean の \(\rho c_{v,e}^{eff}\) であり、
-\(c_{v,e}^{eff}\) は Wave C の mass-weighted projection `state.cv_e` である。
+\(c_{v,e}^{eff}\) は per-material mass-weighted projection `state.cv_e` である。
 
 STS apply では凍結した \(\kappa_{eff,f,m}\) を material-major scratch に保持し、各 face の symmetric
 power を材料別に加算する。1D の保存形は
@@ -284,7 +284,7 @@ P_{f,m}=A_f\,\alpha_{f,m}\kappa_{eff,f,m}\nabla T_{e,f},
 e_{e,c}=\frac{\sum_m E_{e,c,m}}{m_c}
 \]
 を再計算し、`refresh_per_material_derived_cell_fields(..., force_invalidate_all=true)` により
-`Te/Ti/Pe/Pi/cs/cv_e/cv_i` を Wave C の中央 projection で再同期する。
+`Te/Ti/Pe/Pi/cs/cv_e/cv_i` を per-material 中央 projection で再同期する。
 
 Dirichlet/source conduction boundary では Marshak 境界を用いない（Marshak は radiation 専用）。
 2D RZ の `state_supply` z-face は固定境界温度 \(T_b\) として扱い、
@@ -347,11 +347,11 @@ operator diagonal \(1+\Delta t\,4\pi a_{cc}/(\rho c_{v,e}V_c)\).  These
 diagnostics observe frozen operator coefficients only and do not feed back into
 the conduction update.
 
-#### 4.1.2 Per-material electron-ion coupling (Stage 32a Wave D)
+#### 4.1.2 Per-material electron-ion coupling
 
 `numerics.materials.per_material_conservation_enabled=true` の場合、
-electron-ion coupling は常に per-material conserved energy に対して行う
-（Stage 32a XR3）。Radiation/source/laser の deposit-and-redistribute
+electron-ion coupling は常に per-material conserved energy に対して行う。
+Radiation/source/laser の deposit-and-redistribute
 fallback が将来導入されても、\(Q_{ei}\) は per-material end-to-end のまま
 維持する。
 
@@ -362,7 +362,7 @@ e_{e,c,m}=\frac{E_{e,c,m}}{M_{c,m}},\quad
 e_{i,c,m}=\frac{E_{i,c,m}}{M_{c,m}}
 \]
 を用いる。\(T_{e,c,m}\), \(T_{i,c,m}\), \(c_{v,e,c,m}\), \(c_{v,i,c,m}\)
-は Wave C accessor で取得し、lazy cache が有効な場合も accessor の
+は per-material accessor で取得し、lazy cache が有効な場合も accessor の
 cache/miss 規約に従う。材料定数は \(A_m\) と \(\bar Z_m\) を用いる。
 
 Finite-\(\Delta t\) の transfer は legacy source-term と同じ
@@ -404,12 +404,12 @@ mirror を host vector へ戻し、batch 完了後に
 authoritative per-material energies から再投影する。Disabled mode は legacy
 `qei_coupling_substep_kernel` をそのまま使う。
 
-#### 4.1.3 Per-material artificial viscosity in 2D RZ (Stage 32a Wave D)
+#### 4.1.3 Per-material artificial viscosity in 2D RZ
 
 2D_RZ では VNR artificial viscosity の scalar shock sensor と velocity
 gradient は従来通り cell で評価するが、粘性 pressure \(Q_{c,m}\) は材料別
 thermodynamics を用いて計算する。Present material について
-\(\rho_{c,m}\), \(P_{e,c,m}\), \(P_{i,c,m}\), \(c_{s,c,m}\) は Wave C accessor
+\(\rho_{c,m}\), \(P_{e,c,m}\), \(P_{i,c,m}\), \(c_{s,c,m}\) は per-material accessor
 から得る。圧縮 \((\nabla\cdot u)_c<0\) のとき、
 \[
 Q_{c,m}=
@@ -442,11 +442,11 @@ per-material energies から再生成する。これにより `state.Qvisc` に�
 momentum work と `Qvisc_per_material` による energy deposition の二重加算を
 避ける。
 
-1D_SPH の compatible-energy path と per-material AV は Stage 33 へ deferred と
-する。Stage 32a では 1D per-material conservation enabled run も AV については
+1D_SPH の compatible-energy path と per-material AV は将来対応へ deferred と
+する。現状では 1D per-material conservation enabled run も AV については
 legacy single-fluid path を使う。
 
-#### 4.1.4 EOS bisection cost profiling milestone (Stage 32a Wave D)
+#### 4.1.4 EOS bisection cost profiling milestone
 
 `TENRYU_PROFILE_EOS_BISECTION=1` の場合、
 `refresh_per_material_derived_cell_fields()` は CUDA event で refresh elapsed time
@@ -457,7 +457,7 @@ mixed-material shell、50% mixed-cell stress の 3 regimes を 3 repeats 実行�
 5 warmup steps を除いた 55 measured steps について per-run median と p95 を
 集計する。
 
-Wave D Part 2 measurement artifact:
+Profiling measurement artifact (§4.1.4):
 `tmp/profiling/wave_d_eos_bisection_cost.log`。
 
 Baseline median refresh/step ratios:
@@ -470,7 +470,7 @@ Activation rule は「いずれかの regime の baseline median ratio が 10% �
 である。今回の baseline は全 regime で 10% 未満だったため、
 `numerics.materials.lazy_cache_te_m_enabled` は既定どおり `false` のままにする。
 Harness は参考として lazy-cache-enabled pass も実行したが、force-invalidate
-refresh が多い Wave D workload では median ratio が上がったため、本 milestone では
+refresh が多い per-material 負荷の workload では median ratio が上がったため、本 milestone では
 lazy cache activation は行わない。
 
 ### 4.2 離散化と安全策（負温度防止）
@@ -544,7 +544,7 @@ s = \max\!\left(1,\;\left\lceil \sqrt{2\,\frac{\Delta t}{\Delta t_{exp}}} \right
 \tau_j \leftarrow \tau_j \times \frac{\Delta t}{\Delta t_{STS}}
 \]
 
-**ラダー増幅監査（fail-closed、2026-07-26 AI カーネルレビュー k07 F-08）**：
+**ラダー増幅監査（fail-closed、2026-07-26 カーネルレビュー）**：
 一様スケーリングは Chebyshev 安定多項式の根配置を保存しないため、その安定性は
 スケール方向に依存する。既定（\(C_{cond}=0.25\)、\(\nu=0.01\)）では自然和
 \(\Delta t_{STS}\) が要求 \(\Delta t_{sub}\) を常に上回り（縮小方向、実測増幅上界
@@ -564,7 +564,7 @@ Gershgorin 律速（\(2C_iV_i/\sum G_f\) の min 合成、§4.1a）で厳密。�
 \(\Delta l^2/D_{eff}\) 推定のみに頼る harmonic 閉包経路では、強い格子勾配で
 \(\lambda_{max}\Delta t_{exp}\) が最大 \(2/(1+r)\)（\(r\)=隣接セル幅比）まで証明書を
 超過し得る（残存リスクとして記録；既定閉包は kirchhoff_same_material）。2D STS は
-同じ rescale を共有するが監査は未接続（2D レーン側 todo、cross-ref k07 triage）。
+同じ rescale を共有するが監査は未接続（2D 側 todo）。
 
 **拡散係数の凍結**：STSの理論的安定性保証は**線形演算子**（定係数）を前提とするため、
 \(D_{eff}\)（安定性評価）と伝導係数（1D face \(\kappa\)、2D Kershaw \(\kappa_{eff}\)）は
@@ -673,10 +673,10 @@ total_stages / n_sub / dt_exp を含む診断付き abort（ハングではな�
 - なおフロア割れが残るセルは温度をフロアにクランプ
 - clampが発生したセル数を診断へ出す（物理破綻検出）
 
-**対整合スケーリングとエネルギー会計（BUG-15/BUG-18 後の現行実装；2026-07-26 記述更新、AI カーネルレビュー k07 F-07）**：
+**対整合スケーリングとエネルギー会計（一連の既知バグ修正後の現行実装；2026-07-26 記述更新）**：
 \(\alpha\) は面（対）ごとに両側セルで同一の係数として適用される —
 `sts_floor_limiter="net"`（既定）は対の両側の \(\min(\alpha_c,\alpha_{nb})\)、
-`"donor"` は当該対の donor セルの \(\alpha\)（§4.2.1 末尾・BUG-18 設計文書参照）。
+`"donor"` は当該対の donor セルの \(\alpha\)（§4.2.1 末尾・対整合スケーリング設計文書参照）。
 いずれも対反対称 \(P_{nc}=-P_{cn}\) を保存するため、旧記述（当該セルの寄与のみを
 \(\alpha\) 倍し、非対称分 \(\Delta E_{scaling}\) を \(E_{safety}\) に計上する方式）は
 もはや実装に存在しない（1D/2D STS とも）。エネルギー計上が生じるのは最終クランプ
@@ -686,8 +686,8 @@ total_stages / n_sub / dt_exp を含む診断付き abort（ハングではな�
 `E_floor_injected` としてステップ末のエネルギー収支（§10.2 の \(E_{safety}\) 項）へ
 計上する。donor モードは構成的に \(T_{e,trial}\ge T_{floor}\) を保証するため、床下
 不足分の clamp 計上は原理上生じない（非有限ガードのみ残る）。例外：SNB stage
-kernel（§4.4）の床スロットルは BUG-15 以前の per-cell 形を暫定継承しており
-（対非対称・発火時は無記帳）、merge train での BUG-15 族修正待ちである。
+kernel（§4.4）の床スロットルは床スロットル修正以前の per-cell 形を暫定継承しており
+（対非対称・発火時は無記帳）、merge train での対称 pair-min 化待ちである。
 
 > **STSステージ数の典型値**：上記のICF典型パラメータでは、
 > コロナ支配時に素朴法で \(N_{sub}=130\text{–}340\) 必要な状況を、
@@ -932,7 +932,7 @@ n_e, lnΛ は §4.1 と同一のセル式。λ_g は lnΛ 依存を除き局所 
 （T 依存は ξ_g 側に集約）— 高温セル起源の長 mfp 電子が低温物質へ侵入する preheat の機構
 そのもの。低 T_e 域での λ∝ε² 過大評価（Cao 2015 §V の range-mfp 問題）は既知の v1 制限。
 
-**単位規約（cgs+eV 明示化、2026-07-26 AI カーネルレビュー k07 F-19）**：群端
+**単位規約（cgs+eV 明示化、2026-07-26 カーネルレビュー）**：群端
 \(E_g\) は実装上 **erg** で保持する（\(E_g=\hat\beta_g\,k_BT_{ref}\)、
 \(k_BT_{ref}\) は eV→erg 換算後; `conduction_snb_1d.cu` の `edges_erg`）。上記 mfp 式の
 \(\varepsilon_g\) は erg で代入しなければならない — 分母の \(e^4\) は esu（\(e^2\) が
@@ -1045,8 +1045,7 @@ Kershaw 9 点、`symmetric_pair_power`）で書かれており、SNB は同じ�
   min 2 反復、非収束は warn + 診断）。
 - 適用範囲（この tree の validation）: 2D_RZ + 2T + `solver="sts"` + 単一
   rank + 非 per-material。`snb_efield="local"` は 2D v1 で ConfigError
-  （fail-closed）。1D_SPH はこの tree では ConfigError（1d-brushup 系譜と
-  merge train でガードが union になる）。
+  （fail-closed）。1D_SPH はこの tree では ConfigError（feature/1d-brushup ブランチとの merge でガードが union になる）。
 
 **検証（VERIFICATION §4.10、実測 2026-07-11）**: G2 z-mode ladder
 |R−R_disc| = 5.5e-8/5.3e-9/5.9e-10（1D gate と同値クラス）、slope 1.986、
@@ -1240,9 +1239,9 @@ Hamiltonian 散逸を生む（実測: θ-limiter の単調縮小下で転回深�
 \(\hat{\mathbf v}^{-1/2}=\hat{\mathbf v}^0-\tfrac{h}{2}\mathbf a^0\) に
 \(\mathbf a=-\tfrac12\hat\nabla\hat n\) を代入した符号が正である
 （2026-07-26 修正 — 旧仕様の \(-C_{ray}/4\) は最初のドリフトに 3 倍の
-加速度寄与を与えていた。AI review k08 C1）。\(|v|\) リスケールは (i) と同一。
+加速度寄与を与えていたというカーネルレビュー指摘）。\(|v|\) リスケールは (i) と同一。
 可変ステップ Verlet への移行は適応 \(\Delta s\) 変動が同様の散逸を生むため
-望ましいが、2D 系 gate 再認定と併せて 2D lane が所掌する。
+望ましいが、2D 系 gate 再認定と併せて 2D 側が所掌する。
 
 **安定性条件**（全カーネル共通）：\(C_{ray} \le 1\)（レイが1ステップで1セル幅
 以上進まない）。既定 \(C_{ray,max}=0.8\)（`cfl_ray`）。
@@ -1251,7 +1250,7 @@ Hamiltonian 散逸を生む（実測: θ-limiter の単調縮小下で転回深�
 body を含む）。(ii) は `ray_trace_2d`。2D_RZ の `ray_trace_3d` は**旧 seeding
 （負符号・\(\Delta s_{base}\)・\(|v|=1\) 発射）のまま**である — mirror 適用は
 2D CBET slab detuning 傾向 gate を marginal red にしたため、gate 再認定と
-併せて 2D lane が所掌する（コード内 2D_RZ NOTE 参照）。
+併せて 2D 側が所掌する（コード内 2D_RZ NOTE 参照）。
 
 **適応ステップ幅制御**（v1.0既定、expand-only + 転回弧角度制御）：
 
@@ -1306,7 +1305,7 @@ m_\theta = \frac{2\,\theta_{target}\,(1-\hat n_{raw}^n)}
 ステップ数は格子非依存の \(\sim\pi/\theta_{target}\) 本に規格化される
 （床 \(10^{-4}\) は退化格子でのストール防止、`max_steps` が最終ガード）。
 1D_SPH/`ray_trace_2d`/`ray_trace_3d` の全 modulator サイトに適用される。
-Default raised 0.02 -> 0.04 (2026-08-05, perf wave-4): the θ ladder showed A_total +0.007 pt only, while halving turning-arc cost.
+Default raised 0.02 -> 0.04 (2026-08-05): the θ ladder showed A_total +0.007 pt only, while halving turning-arc cost.
 
 実効ステップ幅 \(\Delta s_{cur} = m\,\Delta s_{base}\) に対し、キックは
 実効ステップ幅で適用する。1D_SPH（可変ステップ Verlet、(i)）では前後の
@@ -1545,7 +1544,7 @@ IB吸収（§5.4）および臨界近傍処理（§5.2）はレイ位置の \((R
 | IB吸収 | 同一 | 同一（場の参照経路のみ異なる） |
 | LaserMesh外判定 | \(r=\sqrt{R^2+Z^2}>R_{max}\) | 同一（\(R=\sqrt{x^2+y^2}\) で判定） |
 
-#### 5.3.5 球対称高速経路（Bouguer 閉形式掃引、perf wave-3 S1、2026-08-04）
+#### 5.3.5 球対称高速経路（Bouguer 閉形式掃引、2026-08-04）
 
 1D_SPH の `mode="raytrace_2d"` では、以下の全条件が成立するとき §5.3.2 の
 leapfrog 行進を**球対称縮約**で置換できる（**現状 opt-in**: 環境変数
@@ -1706,12 +1705,12 @@ I^{n+1} = I^n - \Delta P
 臨界面までの残余光学厚を解析式で閉じる。最後の条件は**密度勾配を上る
 （臨界面へ向かう）レイのみ**が closure の対象であることを保証する — これが
 無いと、亜臨界 turning を終えた外向きレイが near-critical 帯を再通過する際に
-架空の臨界層 tail を二重に吸収して終端されうる（2026-07-26 追加、AI review
-k08 C4。臨界交差による切替経路＝副ステップ終点が
+架空の臨界層 tail を二重に吸収して終端されうる（2026-07-26 追加、
+カーネルレビュー指摘。臨界交差による切替経路＝副ステップ終点が
 \(\hat n_{raw}\ge1-\varepsilon_{crit}\) の場合は交差自体が内向きの証拠なので
 方向条件は課さない。**適用範囲**: 1D_SPH 系カーネルのみ — 2D_RZ
 `ray_trace_3d` は方向条件を bypass（v_dot_g=1.0 固定）しており、
-mirror は 2D lane 所掌）。
+mirror は 2D 側の対応範囲）。
 さらに、通常積分の副ステップ終点が \(\hat n_{raw} \ge 1-\varepsilon_{crit}\) に到達した場合も、
 その副ステップは「臨界面で単純打ち切り」へは戻さず、**同じ entry-state tail closure** へ切り替える。
 したがって near-critical 終端 ray は、`tail closure` と `critical-hit cutoff` の二重モデルに分岐せず、
@@ -2067,7 +2066,7 @@ R_k = \left(k+\tfrac12\right)\Delta R,\qquad
 とする。これで \([0,R_{beam}]\) が隙間なく被覆される（2026-07-26 変更 —
 旧仕様の node-based 配置 \(R_k=k\Delta R\) は最外半リング
 \([R_{beam}-\Delta R/2,\,R_{beam}]\) を欠き、profile モーメントを内向きに
-\(O(1/N_R)\) 偏らせていた。AI review k08 8.1）。
+\(O(1/N_R)\) 偏らせていた（2026-07-26 カーネルレビュー指摘）。
 
 **(b) 2D_RZ：2D断面配列（ビーム軸直交平面）**
 
@@ -2741,14 +2740,14 @@ ICFシミュレーションでは、プラズマ条件（ρ, T_e, Z̄）は流�
 - **総パワー相対変化ガード**：\(\left|\sum_b P_b(t)-\sum_b P_b(t_{cached})\right|/\max(\sum_b P_b(t_{cached}), 10^{-30}) > 0.01\) の場合は再計算する
 - **ビーム方向変化ガード**：いずれかのビーム b で \(\|\mathbf{d}_b(t)-\mathbf{d}_b(t_{cached})\|_2 > 10^{-10}\) の場合は再計算する
 - **ALE rezone ガード**：ALE再ゾーニングが発生したステップ直後は、メッシュ位相変化を保守的に扱うため強制再計算する
-- **臨界帯横断ガード**（wave-5 2026-08-07 改定）：いずれかのセルで、キャッシュ時と現在の
+- **臨界帯横断ガード**（2026-08-07 改定）：いずれかのセルで、キャッシュ時と現在の
   \(\hat{n}\) が帯域 \(\hat{n}_{margin} - \varepsilon_{crit\_guard}\)（既定
   \(\varepsilon_{crit\_guard} = 0.01\)）を**横断**した場合
   （\([\hat{n}_i > \text{band}] \ne [\hat{n}_i^{\rm cached} > \text{band}]\)、両向き）に
   強制再計算する。臨界面近傍の \(\hat{n}\) 変化はレイ terminate の有無を左右するためである。
   旧実装は現在値のみの絶対判定 \(\hat{n}_i > \text{band}\) であり、過臨界の固体内部
   （\(\hat{n} \sim 80\)）が常時ヒットして overdense 材料を含む全デッキで Skip が
-  構造的に不発だった（wave-5 で実測・修正）。比較の \(\hat{n}^{\rm cached}\) は
+  構造的に不発だった（2026-08-07 の改定で実測・修正）。比較の \(\hat{n}^{\rm cached}\) は
   キャッシュ済み ρ, Z̄ から現在の volFrac 由来 A_eff で再構成する（一貫コンパレータ）
 
 CBET（§5.10）有効時は追加の無効化条件がある：いずれかのビームグループ g で
@@ -2761,7 +2760,7 @@ CBET（§5.10）有効時は追加の無効化条件がある：いずれかの�
 
 | パラメータ | 型 | 既定値 | 説明 |
 |-----------|------|-------|------|
-| `enabled` | bool | **false** | マスタースイッチ（wave-5 2026-08-07 で既定 OFF 化。従来の既定 true は crit ガード不発により全デッキで実質不活性だったため挙動互換。有効化は opt-in の加速機能として、認証済み threshold で行う） |
+| `enabled` | bool | **false** | マスタースイッチ（2026-08-07 に既定 OFF 化。従来の既定 true は crit ガード不発により全デッキで実質不活性だったため挙動互換。有効化は opt-in の加速機能として、認証済み threshold で行う） |
 | `threshold` | double | 0.01 | 最大相対変化量（1%） |
 | `max_consecutive` | int | 10 | 強制再計算までの最大連続スキップ数 |
 | `norm` | string | "max_relative" | "max_relative" または "l2_relative" |
@@ -2920,7 +2919,7 @@ cutoff 1e-6 で実害なし）。記録容量は ray あたり `cbet.max_segment
 振り替わる — 「IB-only fallback」にも台帳閉包にもならないので、黙った
 truncation は禁止し `max_segments_per_ray` の引き上げを促して停止する
 （旧仕様の「溢れ ray は IB-only として継続」は実装と乖離していたため撤回；
-2026-07-26 AI review C-02）。
+2026-07-26 カーネルレビュー指摘）。
 
 準定常解は固定点反復（全 kernel 決定論的・atomic-free tally／同一 build+device
 で replica bit 安定）：
@@ -2949,7 +2948,7 @@ P \mathrel{-}= -P\,\mathrm{expm1}(-S/2)\ (\text{IB 後半、沈着})
 エネルギー台帳：\(P_{in} = P_{dep} + P_{unabs} + \Sigma_{applied}\)、
 \(\Sigma_{applied}\) は按分丸め \(O(N\varepsilon)\)（実測 ≤1e-12 相対）。
 CBET 交換は物質を直接加熱しない（加熱は IB のみ）。沈着・未吸収は既存の
-per-ray 行 + 固定順 reduction（BUG-6 機構）でビーム毎に集計され、下流
+per-ray 行 + 固定順 reduction でビーム毎に集計され、下流
 （`apply_deposit_redistribution_1d`、skip cache の per-beam \(\hat f\)、
 `laser_unabsorbed` 台帳）は従来と同一経路。
 
@@ -3214,7 +3213,7 @@ pericenter / outbound の順に shell segment を歩く（発射点 \(r_s\) か�
 最初の面までの部分セグメントは交点式が厳密に扱う）。planar 幾何では slab
 cosine で segment 長を求め、セル内部からの発射は進行方向側の面までの
 **部分初期セグメント**を先頭に発行する（内部面上の発射で逆向き側のセルを
-全幅通過していた誤りの根治；2026-07-26 AI review k10-3.1）。
+全幅通過していた誤りの根治；2026-07-26 カーネルレビュー指摘）。
 \(|\mu_x|<10^{-12}\) の面内 chord は無限側方 slab では経路長が発散する
 ため、発射セルでの全量局所熱化として扱う（旧実装の escape 分類を訂正）。
 `radial` モードは全チャネル電力を最外 source に併合し（documented merge
@@ -3350,7 +3349,7 @@ G3 機構傾向（planar 200-cell slab、\(T_h,\eta,f_s\) を全 leg で固定�
   k_φ=(v_y x−v_x y)/(R_s|v|)、k_Z=v_z/|v|；軸上極限は k_R=√(v_x²+v_y²)/|v|、
   k_φ=0。減耗 I←(1−η_k)I は閾値昇順に逐次適用。**注**：2D port の capture は
   現在もセグメント開始点 P を用いる（1D の 2026-07-26 イベント分割修正
-  = P^cross 化は未随伴 — 2D lane の mirror 待ち、O(S·frac) の hot-e 源
+  = P^cross 化は未随伴 — 2D 側の mirror 対応待ち、O(S·frac) の hot-e 源
   バイアスが残る）。
 - **縮約**：capture を (hydro cell, χ=atan2(k_R,k_Z) の 16 分割,
   |k_φ|<0.3 の 2 クラス) で束ね、電力加重平均の位置・方向（再正規化）を持つ

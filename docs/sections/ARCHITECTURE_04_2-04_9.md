@@ -13,7 +13,7 @@
   result-struct イディオム（`PolygonMeshValidation`、`MeshGeometryResult` と同型）+
   構築時 fail-loud。structured quad import が現行 mesh を特殊例として再現。P0A では
   mutation API・device mirror・幾何モーメントを持たない（幾何は F4 が権威）。
-- `Mesh::PentagonBeltShell`（`src/mesh/pentagon_belt_shell.cu`、ALE P2）：五角形
+- `Mesh::PentagonBeltShell`（`src/mesh/pentagon_belt_shell.cu`）：五角形
   belt 遷移リング付き polar-shell の生産 builder。ring-major 節点（θ は最細 ladder の
   サブサンプリング＝2:1 入れ子 bitwise・南半球は鏡映）、block-major セル（2K+1 block、
   role PENTAGON_BELT、orientation −1）、stride-8 CSR＋nverts-aware bilateral 検証、
@@ -566,6 +566,7 @@ Mesh::Search（NUMERICS §9.3–§9.5）を使用。粒子の物理座標は変�
 
 ---
 
+
 ### 4.3 materials/
 **責務**：EOS/opacity/導電率/緩和/Zbar など物性を提供（状態→係数）
 
@@ -1001,7 +1002,7 @@ Config パース時に文字列→enum変換を行う。
     state when disabled.
 - `Hydro::PerMaterialEOS` (`src/hydro/per_material_eos_accessors.cuh`,
   `src/hydro/per_material_eos_project.{cuh,cu}`)
-  - Stage 32a Wave C の per-material EOS refresh module. Raw-view
+  - The per-material EOS refresh module. Raw-view
     `TENRYU_DEVICE` accessors reuse the shared materials inverse-reclosure and
     sound-speed helpers. The projection kernel maps per-material
     thermodynamic state back to cell means (mass-weighted
@@ -1009,20 +1010,20 @@ Config パース時に文字列→enum変換を行う。
     volume-weighted \(P_e,P_i\), max-over-present
     \(c_s\)). The host launcher owns temporary lazy-cache valid-flag device
     mirrors and local dispatch counters, and exposes cache invalidation
-    helpers for later Wave D/F mutation sites.
+    helpers for the per-material mutation sites.
 - `Hydro::ALE1D`（`src/hydro/ale_1d_driver.{cuh,cu}`, `ale_1d_types.cuh`, `ale_1d_sensor.{cuh,cu}`, `ale_1d_rezone.{cuh,cu}`, `ale_1d_remap.{cuh,cu}`, `ale_1d_velocity_project.{cuh,cu}`, `ale_1d_diagnostics.{cuh,cu}`）
-  - 1D_SPH solution-adaptive ALE V3 の public API と skip-path diagnostics を保持する。Week 6 では GPU sensor が `compute_features` で feature list を構築し、`ale_1d_rezone` が monitor、common node mask、CPU equidistribution scratch candidate を構築し、`ale_1d_remap` が volume-coordinate MUSCL/minmod remap（first-order donor fallback と cosine protected-face taper 付き）を caller-owned scratch に書き、`ale_1d_velocity_project` が同じ swept volumes と mass phi を使って cell momentum remap と mass-weighted node projection scratch を構築する。`ale_1d_diagnostics` が scratch diagnostics を評価し、`apply_ale_1d` は hard 許容誤差を満たした場合だけ二相 commit で state を更新する。
+  - 1D_SPH solution-adaptive ALE V3 の public API と skip-path diagnostics を保持する。現行版では GPU sensor が `compute_features` で feature list を構築し、`ale_1d_rezone` が monitor、common node mask、CPU equidistribution scratch candidate を構築し、`ale_1d_remap` が volume-coordinate MUSCL/minmod remap（first-order donor fallback と cosine protected-face taper 付き）を caller-owned scratch に書き、`ale_1d_velocity_project` が同じ swept volumes と mass phi を使って cell momentum remap と mass-weighted node projection scratch を構築する。`ale_1d_diagnostics` が scratch diagnostics を評価し、`apply_ale_1d` は hard 許容誤差を満たした場合だけ二相 commit で state を更新する。
   - V3 1D ALE は opt-in / experimental。既定は `numerics.ale1d.enabled=False` で、通常の GXII short-pulse は pure Lagrangian を使う。
   - runtime scope は 1D_SPH + deterministic radiation (FLD/S_N) のみ。IMC/DDMC は config validation で `ConfigError` とし、runtime guard は defensive skip として残す。
 - `Hydro::PLIC` (`src/hydro/plic_geometry.{cuh,cu}`,
   `src/hydro/plic_normal.{cuh,cu}`, `src/hydro/plic_fast_path.{cuh,cu}`,
   `src/hydro/plic_remap.{cuh,cu}`)
-  - Stage 30 Wave B material-interface reconstruction core.  Geometry helpers
+  - The PLIC material-interface reconstruction core.  Geometry helpers
     provide RZ Pappus polygon clipping and bracketed alpha bisection; normal
     helpers provide Youngs-seeded LVIRA and deterministic degradation
     fallbacks; fast-path helpers build host-side interface masks.
-  - Stage 30 Wave C adds the default-disabled ALE material-volume remap entry
-    points in `plic_remap`.  The ALE driver branches once at the material
+  - Default-disabled PLIC material-volume remap entry points were added
+    in `plic_remap`.  The ALE driver branches once at the material
     volume-fraction remap loop boundary: rho, momentum, electron/ion internal
     energy, diagnostic kinetic energy, and radiation energy stay on the scalar
     remapper, while `f_m V` may use PLIC face material-volume fluxes.
@@ -1031,10 +1032,10 @@ Config パース時に文字列→enum変換を行う。
     interface centroids, face material-volume fluxes, and per-cell residuals.
     The buffers are allocated lazily only when `numerics.plic.enabled` is true,
     `in_run_disabled` is false, and sticky fallback is not engaged.
-  - Wave C is serial-only.  `part.n_ranks > 1` with PLIC enabled is rejected at
-    ALE entry; MPI validation is deferred to Stage 31.  PLIC scalar fallback
+  - The PLIC material-volume remap is serial-only.  `part.n_ranks > 1` with PLIC enabled is rejected at
+    ALE entry; MPI validation is deferred to future work.  PLIC scalar fallback
     and class-(c) ALE escape valves report independently.
-- ALE-FIX-1 で削除された旧 1D ALE path は復活させない。2D_RZ の `Hydro::ALE` / Winslow path は2D専用実装として維持する。
+- 初期の ALE 整理で削除された旧 1D ALE path は復活させない。2D_RZ の `Hydro::ALE` / Winslow path は2D専用実装として維持する。
   - 2D_RZ ALE backtracking first evaluates the legacy 4-Gauss Jacobian
     `post_tangle` gate, then, when
     `Numerics.ale.corner_jacobian_post_tangle_enabled=True`, a parallel
@@ -1170,7 +1171,7 @@ Config パース時に文字列→enum変換を行う。
     device fields を host にコピーし、mesh-motion stages を stderr に出力する。
     Kernel force assembly, remap logic, and HDF5 schema are unchanged.
 - `Hydro::MeshRegime` (`src/hydro/mesh_regime.{hpp,cuh,cu}`)
-  - Default-off Wave 3 regime metadata for the 2D_RZ corner-J guard.  The
+  - Default-off regime metadata for the 2D_RZ corner-J guard.  The
     host-readable POD types live in `mesh_regime.hpp`; CUDA declarations and
     the classifier live in `mesh_regime.cuh/.cu`.
   - The driver owns `MeshRegimeDeviceCache` and passes it to Hydro2D, avoiding
@@ -1187,7 +1188,7 @@ Config パース時に文字列→enum変換を行う。
     from the header.  The legacy Winslow, axis-spine, and boundary repair
     operator bodies remain in their original modules.
 - `Hydro::ALEGCL` (`src/hydro/ale_gcl.{hpp,cu}`)
-  - Wave 0 Geometric Conservation Law residual hook for `apply_ale_with_request`
+  - The Geometric Conservation Law residual hook for `apply_ale_with_request`
     tail coverage of all ALE invocation paths.  It is a pure diagnostic and
     does not change ALE acceptance, remap state, or physics behavior.  The
     multiblock audit path is CSR-native for cell-node lookup and velocity
@@ -1203,16 +1204,16 @@ Config パース時に文字列→enum変換を行う。
     post-Lagrangian trigger, target installation, and existing CSR conservative
     remap. The primitive does not mutate state, mesh coordinates, velocity,
     force, pressure, or energy arrays.
-- `src/hydro/axis_band_guard.{hpp,cu}` — Stage 24 Wave 2 origin, T-v1b stage 1 (2026-07-27)
+- `src/hydro/axis_band_guard.{hpp,cu}` — 2026-07-27
   で transaction 基盤へ移行: band 行 prefix を core::ShadowTransaction の device arena に
   byte-exact capture する AxisBandGuard（旧 axis_band_snapshot.{hpp,cu} の D2H/H2D 実装を
   置換・削除。検証 assert 契約は旧実装から逐語維持）。
-- `src/hydro/axis_band_margin.{cuh,cu}` — Stage 24 Wave 2:
+- `src/hydro/axis_band_margin.{cuh,cu}` — managed axis-band controller:
   row-K margin diagnostics and K-selection for managed axis-band remap.
-- `src/hydro/axis_band_remap.{cuh,cu}` — Stage 24 Wave 2:
+- `src/hydro/axis_band_remap.{cuh,cu}` — managed axis-band controller:
   band-only swept-volume equal-volume remap with positivity hard gates and
   conservation diagnostics.
-- `src/hydro/ale_axis_band_controller.{cuh,cu}` — Stage 24 Wave 2:
+- `src/hydro/ale_axis_band_controller.{cuh,cu}` — managed axis-band controller:
   controller orchestration for margin evaluation, snapshot/restore K fallback,
   band remap commit, and post-remap EOS reclosure.
 - `Hydro::ArtificialViscosity`（`src/hydro/artificial_viscosity.hpp`, `artificial_viscosity.cu`）
@@ -1231,11 +1232,11 @@ Config パース時に文字列→enum変換を行う。
     この branch は VNR の shock-support gate、mild-compression branch、`av_C1`、`av_C2`、
     `av_limiter_J`、`av_eos_aware` を使用しない
   - 同じ \(\chi_i\) を 1D人工熱流束 `av_heat_C` にも用いる。
-  - Stage 32a Wave D adds `compute_q_per_material_2d` for 2D_RZ
+  - The per-material physics operators add `compute_q_per_material_2d` for 2D_RZ
     per-material AV pressure scratch. The 2D momentum path still consumes the
     scalar aggregate `state.Qvisc = sum_m volfrac_m Q_m`; per-material energy
     deposition in `hydro_2d.cu` consumes only the scratch to avoid double
-    counting. 1D_SPH per-material AV remains deferred to Stage 33.
+    counting. 1D_SPH per-material AV remains future work.
 - `Hydro::Conduction`（`src/hydro/conduction.cuh`, `conduction.cu`,
   `conduction_snb_2d.cuh`, `conduction_snb_2d.cu`）
   - 電子熱伝導：Spitzer-Härm + flux limiter（NUMERICS §4）
@@ -1246,7 +1247,7 @@ Config パース時に文字列→enum変換を行う。
     `conduction_snb_2d.{cu,cuh}`（群バッチ Kershaw-CSR Jacobi-PCG + iSNB
     Picard、NUMERICS §4.5）。dispatch は `conduction_step_2d_sts` 内
     else-wrap、既存 kernel byte 不変。probe API は verify 専用
-    （`snb2d::snb2d_probe`）。1D 実装は 1d-brushup 系譜（merge train で合流）
+    （`snb2d::snb2d_probe`）。1D 実装は feature/1d-brushup ブランチ（merge で合流）
   - 多材料セルでは `Materials::Mixture` の \(A_{eff},\gamma_{eff}\) を使って
     `C1 compute_spitzer_deff` が \(n_e\), \(q_{max}\), \(c_{v,e}\), \(D_{eff}\) を評価
   - **2つのソルバパス**（`conduction.solver` で選択、NUMERICS §4.2.1/§4.2.3）：
@@ -1966,7 +1967,7 @@ source-injection owned.
 - `Laser::Cbet`（`cbet.cu/.cuh`、v1 = 1D_SPH `raytrace_2d` + 2D_RZ `raytrace_3d` opt-in）：Marozas 型保存的 pairwise CBET
   - trace kernel の record モード（`template<bool kCbetRecord>`、OFF 実体化は従来と構造同一）が ray 毎のセル横断記録を生成
   - CbetWorkspace（grow-only device 常駐）上で決定論的固定点反復（tally → 反対称交換+donor cap → IB/2·CBET·IB/2 propagate）
-  - 沈着・未吸収は per-ray 行 + 固定順 reduction（BUG-6 機構）でビーム毎に集計し、既存の deposit 再配分・skip cache 経路へ接続（NUMERICS §5.10）
+  - 沈着・未吸収は per-ray 行 + 固定順 reduction でビーム毎に集計し、既存の deposit 再配分・skip cache 経路へ接続（NUMERICS §5.10）
   - 2D_RZ CBET は theta-group ごとの record-mode trace → joint exchange solve → per-group LaserMesh node deposit を生成し、既存の 2D transfer path に接続する。Workspace singleton は 1D と共有し、recorder template 実体化は defining TU に閉じる；nvcc+RDC では header 側 template declaration を増やすと OFF path まで再実体化されるため、新規宣言は wrapper/header isolation で分離する。
 - `Laser::HotElectron1D`（`hot_electron_1d.cuh/.cpp`）：1D hot-electron preheat: capture reduction, cone quadrature, chord walkers, CSDA pipelines（host; device-ready header）
 - `Laser::HotElectron2D`（`hot_electron_2d.cuh/.cpp`）：2D RZ hot-electron transport: topology-agnostic MeshView2D, revolved-face chord walker, 3D band quadrature, capture reduction, host cone pipeline（reference path）
@@ -2197,8 +2198,7 @@ void laser_step(
     snapshot/restore primitive for driver-level full-step retry on an
     inadmissible hydro corrector.
     Scope is deterministic radiation modes (FLD/SN/HOLO); it does not snapshot
-    the IMC particle pool. This is Wave 1 of Phase 2d-extension v4
-    (Codex Round 7 P1).
+    the IMC particle pool.
   - `src/coupling/dispatcher_decision.{hpp,cpp}` provides the pure free-function
     retry dispatcher classifier consumed by `Driver::run` when
     `Numerics.hydro.dispatcher_state_sensitive_bypass_enabled=True`.
@@ -2207,10 +2207,10 @@ void laser_step(
     run start when `Numerics.profile.icf_standard_ale.enabled=True`, threads a
     nullable pointer through Hydro2D/ALE geometry soft-fail sites, and logs
     `[ale_provenance]` state at run start, fatal-abort, and run end.
-    Stage 32a Wave E also defines the production_comparable Wave F gate data
-    structure: seven criteria, residual-aware status enum, and the
+    The V22 restart/output contract also defines the production_comparable
+    gate structure for per-material conservation: seven criteria, residual-aware status enum, and the
     PASS/PARTIAL-A/PARTIAL-B/INCONCLUSIVE/FAIL/DISABLED classifier used by the
-    Stage 32b empirical rerun.
+    planned follow-up empirical rerun.
   - When `Numerics.hydro.driver_full_step_retry_enabled=True`, the main driver
     loop wraps each outer step in a retry epoch: capture State at step entry,
     run split operators, accept only if Hydro reports an admissible corrector,
@@ -2226,7 +2226,7 @@ void laser_step(
     ALE strategy remains the configured 2D ALE mode (`axis_spine_only`,
     `full_winslow`, etc.); the driver adds only the retry-time invocation
     policy.
-  - Wave 0 production audit infrastructure in `src/coupling/driver.cpp`
+  - Production-audit infrastructure in `src/coupling/driver.cpp`
     initializes at run start when
     `Numerics.diagnostics.production_audit.enabled=True`, consumes per-step
     escape-valve events, launches the positivity scan, enforces the Tier-A
@@ -2277,14 +2277,14 @@ void laser_step(
 - `Diag::MCStats`：分散推定、粒子数統計、CI計算
 - `Diag::TemperatureMaximumPrinciple`：放射演算子後の温度最大原理違反（`overshoot_count`, `overshoot_max`）の検出・記録
 - `Diag::MeshDeformAttribution`（`src/diagnostics/mesh_deform_attribution.{hpp,cuh,cu}`）：default-off の 2D_RZ mesh failure root-cause diagnostics。`Hydro2D::lagrangian_step` invocation ごとに opt-in workspace が start node positions と per-source displacement buffers を所有し、failure 時だけ `mesh_failure_attribution.jsonl` に per-source corner-J degradation を書く。HDF5 schema と `dt_lineage.jsonl` format は変更しない。
-- `Diag::MeshDegeneracyForensics`（`src/diagnostics/mesh_degeneracy_forensics.{hpp,cu}`）：Phase A default-off の repeated pre-commit `mesh_quality_*` / `in_hydro_*` failure diagnostics。`Hydro2D` は opt-in 時だけ failing cell の4 node position/velocity/acceleration sample を `HydroStepResult` に載せ、`Coupling::Driver` retry path が同一 `(cell, corner, stage)` count と `sigma_safe` threshold を評価して `mesh_degeneracy_forensics.jsonl` へ J(σ), nodal velocity, hourglass amplitude, material/work context を追記する。HDF5 schema と physics state は変更しない。
+- `Diag::MeshDegeneracyForensics`（`src/diagnostics/mesh_degeneracy_forensics.{hpp,cu}`）：default-off の repeated pre-commit `mesh_quality_*` / `in_hydro_*` failure diagnostics。`Hydro2D` は opt-in 時だけ failing cell の4 node position/velocity/acceleration sample を `HydroStepResult` に載せ、`Coupling::Driver` retry path が同一 `(cell, corner, stage)` count と `sigma_safe` threshold を評価して `mesh_degeneracy_forensics.jsonl` へ J(σ), nodal velocity, hourglass amplitude, material/work context を追記する。HDF5 schema と physics state は変更しない。
 - `Diag::IcfShellDiagnostics`, `Diag::HotspotGasDiagnostics`, と `Diag::OperatorEnergyResiduals`（`src/diagnostics/diagnostics.{hpp,cu}`, `operator_energy_residuals.{hpp,cu}`）：default-off の ICF shell IFAR/CR、inert gas-hotspot tracer compression metrics、per-operator energy residual。`Coupling::Driver` が history cadence で初期 shell 半径、hotspot tracer state、operator 境界、明示的 `delta_E_ext` を渡し、`HistoryWriter` が `/diagnostics/icf/v1/`, `/diagnostics/hotspot_gas/v1/`, `/diagnostics/conservation/v1/`, `/diagnostics/ale_provenance/v1/` に path-versioned HDF5 series を追記する。HDF5 root `schema_version` は変更しない。
 - `Diag::CornerBCAudit`（`src/diagnostics/history_writer.cpp`）：`dt_breakdown_history_enabled=True` の history writer が、CFL winner が r_outer-reflect ∩ z_top-state_supply corner halo に入った step だけ `/diagnostics/corner_bc_audit/v1/` へ interior/ghost state と local dt/cs/Qvisc を追記する diagnostic-only HDF5 group。physics state と HDF5 root `schema_version` は変更しない。
 - `Diag::EscapeValveHistory` (`src/diagnostics/escape_valve_history.{hpp,cpp}`):
-  Wave 0 fixed-column HDF5 writer for
+  Fixed-column HDF5 writer for
   `/diagnostics/escape_valve_audit/v1`.
 - `Diag::PositivityHistory` (`src/diagnostics/positivity_history.{hpp,cpp}`):
-  Wave 0 fixed-field HDF5 writer for `/diagnostics/positivity/v1`.
+  Fixed-field HDF5 writer for `/diagnostics/positivity/v1`.
 - `Diag::RadialFourierAudit` (`src/diagnostics/radial_fourier_audit.{hpp,cu}`):
   default-off 2D_RZ per-operator radial-null-mode audit. `Coupling::Driver`
   emits before/after stage samples inside the configured time window. The v1
@@ -2313,7 +2313,7 @@ void laser_step(
   stage, stamps cycle/time metadata, and `HistoryWriter` appends
   `/diagnostics/fld_substage_audit/v1/` on rank 0 only. The path is additive
   and does not modify physics state or root HDF5 `schema_version`.
-- Wave 0 diagnostics library invariant: `tenryu_diagnostics` now PUBLIC links
+- Production-audit diagnostics library invariant: `tenryu_diagnostics` now PUBLIC links
   `tenryu_verification` for the shared audit summary data model.  The schema is
   additive-only: existing `/diagnostics/ale_provenance/v1` output is unchanged,
   and new audit output uses new `/diagnostics/*/v1` paths.
@@ -2413,7 +2413,7 @@ namespace IO {
     // /hydro/vol          : double[n_cells]   — セル体積 [cm³] (State.vol)
     // /hydro/zbar         : double[n_cells]   — 平均電離度 Z̄ [-] (State.zbar)
     // /hydro/per_material/v1/{mass,Ee,Ei}
-    //                      : double[n_cells,n_materials] — Stage 32a Wave F
+    //                      : double[n_cells,n_materials] — per-material conservation
     //                        authoritative extensive per-material state.
     // /diagnostics/conservation/v1/per_material_*_residual
     //                      : scalar residual diagnostics for Σ_m conserved
@@ -2422,7 +2422,7 @@ namespace IO {
     //                      : cumulative per-material event counters.
     // /metadata/dispatch_counters/*
     //                      : dispatch counter regression-hash inputs; disabled
-    //                        Wave F mode persists all-zero per-material counts.
+    //                        per-material conservation mode persists all-zero per-material counts.
     // /mesh/topology/v2/*  : optional group written only when
     //                        topology_scheme="multiblock_cart_core_polar_shell";
     //                        path-versioned topology extension, no root
@@ -2543,7 +2543,7 @@ namespace IO {
   `marshak.cu`, `sedov_analytic.cpp`, `noh_analytic.cpp`,
   `diffusion_ref.cpp`, and `laser_analytic.cu`.
 - `Verification::TierThreshold` (`src/verification/tier_threshold.{hpp,cu}`):
-  Wave 0 9-tier threshold framework.
+  The 9-tier threshold framework.
 - `Verification::AuditSummary` (`src/verification/audit_summary.{hpp,cpp}`):
   shared audit summary data model and JSON serialization.
 - `Verification::EscapeValveAudit`
@@ -2553,8 +2553,8 @@ namespace IO {
   (`src/verification/positivity_tracker.{hpp,cu}`): per-step positivity scanner
   over six fields.
 - The `tenryu_verification` library now PUBLIC links `tenryu_parallel` for the
-  Reduction primitive used by Wave 0 scanners.
-- Wave 0 architectural invariants from commits `cc62bad5`, `f56f8612`,
+  Reduction primitive used by production-audit scanners.
+- Architectural invariants from commits `cc62bad5`, `f56f8612`,
   `547d894c`, and `f08646b8`:
   - all infrastructure is default OFF, preserving the bit-exact baseline when
     `production_audit.enabled=false`;
@@ -2563,7 +2563,7 @@ namespace IO {
     engineering uses the 6-condition escape-valve policy.
 
 ### 4.11 tools/validation/
-**責務**：Wave 0 validation postprocessing
+**責務**：production-audit validation postprocessing
 
 - `tools/validation/audit_summary.py` assembles `<case>.audit.json` from
   `run_info.json`, history HDF5, and reproducibility metadata.
@@ -2572,4 +2572,3 @@ namespace IO {
   `cross_arch_metadata.json`.
 
 ---
-

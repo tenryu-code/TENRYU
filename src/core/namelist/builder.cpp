@@ -11395,7 +11395,7 @@ void Builder::validate() {
   }
   main.two_temperature = (main.temperature_model == "2T");
   main.dim = (main.dimension == "2D_RZ") ? 2 : 1;
-  // AV-modernization Stage 1A (2026-08-03): 1D_SPH default is limited
+  // 2026-08-03 AV modernization: 1D_SPH default is limited
   // CSW98; explicit av_type (including "vnr") is always honored, and
   // frozen configs are unaffected (av_type is always emitted).
   if (!numerics.hydro.av_type_explicit && main.dimension == "1D_SPH") {
@@ -11848,7 +11848,7 @@ void Builder::validate() {
       !(laser.cbet.ne_frac_cutoff <= 1.0 - laser.absorption.eps_n)) {
     // Inside the active band the CBET gain prefactor and IAW wavenumber floor
     // (1 - n_hat) at eps_n; a cutoff above 1 - eps_n would let the floor
-    // silently saturate the gain instead of masking the cell (AI review M-13).
+    // silently saturate the gain instead of masking the cell (2026-07-26 review).
     throw ConfigError(
         "Laser.cbet.ne_frac_cutoff must be <= 1 - Laser.absorption.eps_n "
         "(the eps_n floor would saturate the CBET gain inside the active band)");
@@ -12436,7 +12436,7 @@ void Builder::validate() {
         mesh.polar_center_treatment != "annular" &&
         mesh.polar_center_treatment != "tri_fan") {
       throw ConfigError(
-          "polar_in_box Stage 1 general-quad initialization requires "
+          "polar_in_box general-quad initialization requires "
           "Mesh.polar_center_treatment='annular'");
     }
     if (mesh.topology_scheme != TopologyScheme::SINGLE_BLOCK &&
@@ -14691,27 +14691,27 @@ void Builder::validate() {
   tenryu::core::validate_tri_fan_stage2_config(config);
   tenryu::core::validate_button_stage1_config(config);
   if (main.dimension == "1D_CYL") {
-    // B1 wave-1 scope: pure hydro core only
+    // 1D_CYL v1 scope: pure hydro core only
     // (docs/design/b1_1d_cyl_mode_spec.md section 3).
     if (radiation.enabled) {
       throw ConfigError(
           "Radiation.enabled=True is not supported for "
-          "Main.dimension=\"1D_CYL\" (wave-1 hydro core only)");
+          "Main.dimension=\"1D_CYL\" (1D_CYL v1: pure hydro core only)");
     }
     if (laser.enabled) {
       throw ConfigError(
           "Laser.enabled=True is not supported for "
-          "Main.dimension=\"1D_CYL\" (wave-1 hydro core only)");
+          "Main.dimension=\"1D_CYL\" (1D_CYL v1: pure hydro core only)");
     }
     if (numerics.conduction.enabled) {
       throw ConfigError(
           "Numerics.conduction.enabled=True is not supported for "
-          "Main.dimension=\"1D_CYL\" (wave-1 hydro core only)");
+          "Main.dimension=\"1D_CYL\" (1D_CYL v1: pure hydro core only)");
     }
     if (numerics.ale1d.enabled) {
       throw ConfigError(
           "Numerics.ale1d.enabled=True is not supported for "
-          "Main.dimension=\"1D_CYL\" (wave-1 hydro core only)");
+          "Main.dimension=\"1D_CYL\" (1D_CYL v1: pure hydro core only)");
     }
   }
   if (numerics.hydro.compatible_energy && main.dimension != "1D_SPH") {
@@ -15828,7 +15828,7 @@ void Builder::validate() {
           "Numerics.hydro.boundary_2d.z_bottom/z_top='pressure' is not supported");
     }
     // State-supply mesh nodes are ALE-safe via mesh-velocity/material-velocity
-    // decoupling (PR 4.6).  ALE rezone of interior nodes is allowed; the
+    // decoupling.  ALE rezone of interior nodes is allowed; the
     // boundary node stays at z_min/z_max with v_z_mesh = 0.
     if (b2d.r_outer == "pressure" && !numerics.hydro.pressure_drive_1d.detected) {
       throw ConfigError(

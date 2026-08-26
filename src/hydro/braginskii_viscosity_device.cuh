@@ -11,7 +11,7 @@ constexpr double kEvToErg = 1.6022e-12;
 constexpr double kProtonMass = 1.6726219e-24;
 constexpr double kElectronMass = 9.1093837e-28;
 // kTauI0 = 3*sqrt(m_p)*kEvToErg^{3/2} / (4*sqrt(pi)*e^4), e = 4.80320e-10
-// esu, so that (NUMERICS W-H section; NRL formulary quotes 2.09e7 and
+// esu, so that (NUMERICS plasma-viscosity section; NRL formulary quotes 2.09e7 and
 // Manheimer & Colombant 2007 Eq. (2) is the same with n_e = Z n_i):
 //   tau_i = kTauI0 * sqrt(A) * Ti_eV^{3/2} / (n_i * Z^4 * lnLambda_ii)  [s]
 constexpr double kTauI0 = 2.0852e7;

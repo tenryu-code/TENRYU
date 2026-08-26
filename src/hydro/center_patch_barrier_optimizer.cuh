@@ -27,7 +27,7 @@ Design note: CP4 center-patch Phi-barrier optimizer
 Scope:
   This header is intentionally cfg-free and uncalled by construction. It owns
   only the local center-patch mesh optimizer requested by the I1-B ALE verdict;
-  CC integration is responsible for trigger hysteresis, mask construction,
+  Driver integration is responsible for trigger hysteresis, mask construction,
   final CSR sigma-linesearch, diagnostics, and default-off config plumbing.
 
 Coordinates and units:

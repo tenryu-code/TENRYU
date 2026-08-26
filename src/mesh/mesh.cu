@@ -639,8 +639,8 @@ double graded_super_gaussian_weight(const GradingConfig& grading,
 
 // measure_dim: 0 => always use the legacy estimated-radius mapping;
 // 1/2/3 (planar/cylindrical/spherical geometric measure) enables the opt-in
-// grading.mapping == "exact_measure_v2" inversion (k01 P0-1, AI review
-// 2026-07-26): node positions come from the cumulative weight fraction
+// grading.mapping == "exact_measure_v2" inversion (2026-07-26 review):
+// node positions come from the cumulative weight fraction
 // W_k = cumsum(w)/sum(w) mapped through the exact shell measure
 // r_k^d = r_in^d + W_k (r_out^d - r_in^d), so constant-density cell masses
 // are proportional to w_k to roundoff — including origin segments, where the
@@ -6206,7 +6206,7 @@ Mesh create_mesh(const tenryu::core::Config& cfg, tenryu::core::State& state) {
                     (mesh.logical == LogicalMesh2D::PolarInBox &&
                      mesh.polar_center_treatment == PolarCenterTreatment::TriFan),
                 "non-annular Mesh.polar_center_treatment requires "
-                "spherical_polar_halfplane; polar_in_box Stage 1 uses general quads");
+                "spherical_polar_halfplane; the current polar_in_box scope uses general quads");
   if (mesh.polar_center_treatment == PolarCenterTreatment::Button) {
     mesh.button_center = ButtonCenterTopology{
         true,
@@ -6663,7 +6663,7 @@ Mesh create_mesh(const tenryu::core::Config& cfg, tenryu::core::State& state) {
     set_rectangular_edge_tags(mesh);
   }
 
-  // k17 AI-review §3.1/§3.2(1): generation-time discrete no-fold gate for
+  // 2026-07-26 kernel review: generation-time discrete no-fold gate for
   // the 2D single-block structured family. Bilinear cell Jacobians are
   // affine in the logical coordinates, so orientation-consistent corner
   // Jacobians imply interior positivity cell-by-cell; a fold appears as a

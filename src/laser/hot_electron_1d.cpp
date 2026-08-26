@@ -205,7 +205,7 @@ std::vector<HotESource> reduce_captures(const std::vector<RayCapture>& captures,
     if (cap.r_s < r_nodes.front() || cap.r_s > r_nodes.back()) {
       // Captures outside the hydro mesh (e.g. in the ghost corona beyond the
       // outer edge) are clamped into the boundary cell below; count them so
-      // the handoff is visible instead of silent (AI review k10-S3).
+      // the handoff is visible instead of silent (2026-07-26 review).
       ++out_of_domain;
       out_of_domain_power += cap.P_hot;
     }
@@ -457,7 +457,7 @@ DepositResult deposit_hot_electrons_radial_1d(
   TENRYU_ASSERT(outermost->cell >= 0 && outermost->cell < static_cast<int>(n),
                 "hot_electron radial source cell out of range");
   result.n_sources = static_cast<int>(sources.size());
-  // Power-weighted mean per the DepositResult contract (AI review k10-S4);
+  // Power-weighted mean per the DepositResult contract (2026-07-26 review);
   // the march itself still starts all power at the outermost source
   // (documented radial-mode merge rule, NUMERICS 5.11).
   result.r_source_mean = Pr / result.P_hot;
@@ -486,7 +486,7 @@ DepositResult deposit_hot_electrons_radial_1d(
         continue;
       }
       // Partial first cell: the inward march starts at r_s, not at the outer
-      // face of the source cell (AI review k10-S6).
+      // face of the source cell (2026-07-26 review).
       const double r_hi = (c_int == outermost->cell)
                               ? std::min(std::max(outermost->r_s, r_nodes[c]),
                                          r_nodes[c + 1])

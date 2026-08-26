@@ -357,7 +357,7 @@ __global__ void component_bounds_kernel(const double* __restrict__ signal,
   }
 }
 
-// k16 C10 (AI review 2026-07-26): the component moments used to be
+// 2026-07-26 review: the component moments used to be
 // accumulated with floating-point atomicAdd, whose arrival order is not
 // deterministic — the rezone candidate could differ run-to-run, violating
 // the 1D bitwise reproducibility contract whenever ALE v3 is enabled.

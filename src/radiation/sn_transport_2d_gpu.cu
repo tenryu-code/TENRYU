@@ -224,11 +224,11 @@ __global__ void initialize_phi_from_rad_E_kernel(const double* __restrict__ rad_
   }
 }
 
-// BUG-25 (2D port): gate on TOTAL extinction — a thick pure-scattering cell
+// Total-extinction gate fix (2D port): a thick pure-scattering cell
 // is in the diffusion regime (AP-blend authority; E evolves via the flux
 // form), not a void. Only genuinely transparent cells
 // (c dt (sigma_a + sigma_s) below the band) anchor rad_E to the transport
-// moments (BUG-21c).
+// moments (void-anchor fix).
 // 2D note: the converged sweep moments live in sn_phi_sweep (sn_phi_old is
 // the step-start isotropic seed — do NOT anchor to it).
 __global__ void anchor_void_rad_E_to_moments_2d_kernel(
@@ -274,7 +274,7 @@ __global__ void max_relative_delta_kernel(const double* __restrict__ next,
   atomic_max_nonnegative_double(out, rel);
 }
 
-// BUG-25 (2D port): the escape ledger books the sweep's discrete boundary
+// Outer-boundary escape-flux fix (2D port): the ledger books the sweep's discrete boundary
 // face flux (the array the E*-flux update consumes) instead of the historic
 // coefficient model 0.5cE (vacuum) / 0.25cE (marshak), which disagreed with
 // the discrete outgoing tally by up to 2x for a near-isotropic field.
@@ -787,7 +787,7 @@ __global__ void compute_ap_cell_diagnostics_2d_kernel(
   sn_ap_alpha[c] = isfinite(alpha_max) ? alpha_max : 0.0;
 }
 
-// BUG-21b (2D port): pass 1 — donor-only availability (no inflow credit).
+// Pass-1 donor-only availability (2D port; no inflow credit).
 // Used to throttle the inflow credit in pass 2 so positivity is exact:
 // E_new = E_old + dt (theta_up·in − theta'·out)/V >= 0 by construction,
 // while a uniformly throttled stream relaxes to full pass-through.
@@ -2099,7 +2099,7 @@ void advance_radiation_step_sn_2d_rz(
     if (mat.hydro_eos_backend != "exact_ideal_gas") {
       newton.electron_eos = sn_electron_eos_device_view(mat.eos_tables.get());
     }
-    // BUG-1 Stage 2: shared per-cell effective properties (radiation can run
+    // Shared per-cell effective properties (multi-material fix; radiation can run
     // with hydro disabled, so ensure here).
     state.ensure_cell_material_props(cfg);
     newton.n_cells = n_cells;
@@ -2259,7 +2259,7 @@ void advance_radiation_step_sn_2d_rz(
       state, nr, nz, n_groups, dt, r_outer_bc, z_bottom_bc, z_top_bc);
   state.sn_marshak_in_step = compute_marshak_in_energy(
       state, nr, nz, dt, z_bottom_bc, z_top_bc, marshak_flux);
-  // BUG-25 follow-up (2026-07-20): the driver energy budget pairs +marshak_in
+  // Outer-boundary escape-flux follow-up (2026-07-20): the driver energy budget pairs +marshak_in
   // (source) with +escape (sink), which requires GROSS conventions on both.
   // The face ledger is NET at a Marshak boundary (outgoing - inflow),
   // so add the inflow back: escape reports the gross outgoing energy and the

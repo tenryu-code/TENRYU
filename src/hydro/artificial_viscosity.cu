@@ -676,7 +676,7 @@ __device__ __forceinline__ double rc_bj_phi_1d_device(
   return fmin(1.0, fmax(0.0, phi));
 }
 
-// Stage 1C v1.1 (2026-08-03): Morgan-faithful staggered Godunov-like
+// Version 1.1 (2026-08-03): Morgan-faithful staggered Godunov-like
 // dissipation reduced to the 1-D cell Q slot (consult 20260803-1442,
 // Morgan et al. JCP 259 (2014); Dukowicz JCP 61 (1985)).
 // Nodal velocities are projected to the cell center with a nodal

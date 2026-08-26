@@ -40,7 +40,7 @@ struct SnMaterialNewton1DInputs {
   double dt = 0.0;
   double cv_e_const = 0.0;          // [erg/(g*eV)]
   double Cv_e_const = 0.0;          // [erg/(cm^3*eV)]
-  // BUG-1 Stage 2: per-cell effective ideal-gas properties (see
+  // Shared per-cell effective ideal-gas properties (multi-material fix; see
   // State::ensure_cell_material_props). Null pointers fall back to A=1,
   // gamma=5/3 for direct-constructed test inputs.
   const double* A_eff = nullptr;      // [n_cells]

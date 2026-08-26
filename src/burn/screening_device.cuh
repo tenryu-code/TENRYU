@@ -24,7 +24,7 @@ constexpr double kProtonMassG = 1.6726219e-24;
 
 // Salpeter weak-screening validity: h << 1. Beyond h ~ 2 the linearized
 // Debye picture is meaningless; cap the enhancement (e^2 ~ 7.4x) and warn
-// instead of letting exp(h) run away (AI review k14 §4.5, 2026-07-26).
+// instead of letting exp(h) run away (2026-07-26 review).
 constexpr double kSalpeterHMax = 2.0;
 
 struct ReactionPair {

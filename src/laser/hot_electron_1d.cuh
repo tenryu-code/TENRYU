@@ -243,7 +243,7 @@ struct ChordWalkerSph {
 // per cell = dx / |mu_x|. Escapes at either slab face.
 //
 // Interior starts emit a partial first segment from x0 to the exit face in
-// the travel direction (AI review k10-3.1: the previous full-cell first
+// the travel direction (2026-07-26 review: the previous full-cell first
 // segment overstated the first chord and, for a source exactly on an
 // internal face with mu_x < 0, walked the wrong (outward) cell first).
 inline constexpr double kMuxEpsilon = 1.0e-12;

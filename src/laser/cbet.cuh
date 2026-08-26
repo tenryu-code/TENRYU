@@ -159,7 +159,7 @@ struct CbetWorkspace {
   // [G*G], and omega_group [G] have different lengths and MUST track separate
   // capacities: a single shared capacity lets a modest G growth skip the
   // reallocation of the shorter arrays while the H2D staging writes the new
-  // (larger) element counts — a device buffer overrun (AI review C-01).
+  // (larger) element counts — a device buffer overrun (2026-07-26 review).
   std::size_t cap_records = 0;
   std::size_t cap_rays = 0;
   std::size_t cap_gc = 0;

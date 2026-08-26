@@ -218,7 +218,7 @@ DepositResult deposit_hot_electrons_cone_1d_device(
   const std::size_t rows_bytes =
       static_cast<std::size_t>(n_rows) * static_cast<std::size_t>(n_cells) * sizeof(double);
   // The dense per-(job,group) row scratch is O(n_jobs * n_groups * n_cells)
-  // and its theoretical worst case grows as O(n_cells^2) (AI review k10-5.6).
+  // and its theoretical worst case grows as O(n_cells^2) (2026-07-26 review).
   // Physical capture bands are narrow so real sizes stay in the MB range;
   // fail loudly before an OOM-by-design allocation instead of crashing.
   TENRYU_ASSERT(rows_bytes <= (4ULL << 30),

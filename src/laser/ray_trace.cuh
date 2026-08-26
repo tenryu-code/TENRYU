@@ -306,7 +306,7 @@ void ray_trace_3d(double* __restrict__ deposit,
                                               bool allow_debug_one_ray = true,
                                               const CbetRecordDeviceArgs* cbet_record = nullptr);
 
-// Fixed-order per-ray tally reduction (BUG-6 machinery), exported so the CBET
+// Fixed-order tally-reduction machinery, exported so the CBET
 // solve can reduce per-beam row ranges without relaunching the tracer.
 [[nodiscard]] cudaError_t launch_reduce_per_ray_tallies_1d(
     const double* d_deposit_per_ray,

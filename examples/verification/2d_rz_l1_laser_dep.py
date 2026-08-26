@@ -253,7 +253,7 @@ if CONDUCTION_ENABLED:
         sts_max_stages=40,
     )
     if MODE == "l1_conduction_submode":
-        # Spitzer conduction with MFP limiter (Phase 2f-1 pattern from L2 deck).
+        # Spitzer conduction with MFP limiter (MFP-limiter pattern from the L2 deck).
         # test_kappa=10 is too weak to drive observable smoothing in the
         # L1 pure-conduction (no hydro) 1 ns / 1 cm regime.
         conduction_config["mfp_limiter_C"] = 0.1

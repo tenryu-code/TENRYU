@@ -122,7 +122,7 @@ __host__ __device__ inline double relative_floor_baseline(
   return abs_double(previous_value);
 }
 
-// k17 AI-review §8.7/§8.8 continuous-path helpers (file-local clean-room;
+// 2026-07-26 kernel-review continuous-path helpers (file-local clean-room;
 // semantics mirror the path_admissibility.cuh unit-interval minimisation:
 // endpoints plus interior stationary points, deterministic closed form).
 __host__ __device__ inline double path_quadratic_value(const double q0,
@@ -859,7 +859,7 @@ __global__ void evaluate_candidate_mesh_quality_kernel(
   }
 
   // "gauss" = arithmetic mean of the corner Jacobians == center Jacobian of
-  // the bilinear map; NOT a Gauss-quadrature-point value (k17 AI-review 8.2).
+  // the bilinear map; NOT a Gauss-quadrature-point value (2026-07-26 kernel review).
   double old_gauss = 0.0;
   double new_gauss = 0.0;
   double reference_gauss = 0.0;
@@ -1197,7 +1197,7 @@ __global__ void evaluate_candidate_mesh_quality_csr_kernel(
 
   // "gauss" = arithmetic mean of the corner Jacobians; for quads this equals
   // the center Jacobian of the bilinear map. It is NOT a
-  // Gauss-quadrature-point value (k17 AI-review 8.2).
+  // Gauss-quadrature-point value (2026-07-26 kernel review).
   double old_gauss = 0.0;
   double new_gauss = 0.0;
   double reference_gauss = 0.0;
@@ -1330,7 +1330,7 @@ inline bool host_on_segment(const double ax,
                             const double bz,
                             const double px,
                             const double pz) {
-  // Scale-aware predicate (k17 AI-review 8.10): the previous absolute
+  // Scale-aware predicate (2026-07-26 kernel review): the previous absolute
   // 1e-14 shared a length tolerance [cm] and an orient2d tolerance [cm^2],
   // which is dimensionally inconsistent and collapses for submicron cells.
   const double seg_scale = std::abs(bx - ax) + std::abs(bz - az);
@@ -1868,7 +1868,7 @@ CandidateMeshQuality evaluate_candidate_mesh_quality_csr(
   return out;
 }
 
-// Contract note (k17 AI-review 8.9): this is a dyadic halving search — it
+// Contract note (2026-07-26 kernel review): this is a dyadic halving search — it
 // returns the FIRST accepted sigma among sigma_init / 2^k, which is not the
 // supremum of admissible sigma. If halving drops below sigma_min, the exact
 // sigma_min value is never evaluated and 0.0 is returned.

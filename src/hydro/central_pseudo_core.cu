@@ -731,7 +731,7 @@ bool phase_ledger_enabled(const core::State& state) {
   }();
   // Step window, default [0, 3] (the historical activation-forensics
   // window). Overridable for late-time forensics, e.g. the mixed-core
-  // endgame energy bracket (TENRYU_I1B_PSEUDOCELL_PHASE_LEDGER_FROM/TO).
+  // terminal-phase energy bracket (TENRYU_I1B_PSEUDOCELL_PHASE_LEDGER_FROM/TO).
   static const int from = [] {
     const char* env =
         std::getenv("TENRYU_I1B_PSEUDOCELL_PHASE_LEDGER_FROM");
@@ -1796,7 +1796,7 @@ int absorbable_shell_row_count(core::State& state,
   return rows;
 }
 
-// Emergency mixed-material absorption (macro-boundary endgame verdict,
+// Emergency mixed-material absorption (macro-boundary terminal-phase verdict,
 // rank-1 direction (a), ideal-gas MVP): when the pure-gas ladder is
 // exhausted and the macro boundary itself is the failure surface, allow
 // absorbing the immediately-next DENSE shell row — bypassing the gas-tracer
@@ -1818,7 +1818,7 @@ bool mixed_absorption_enabled(const core::Config& cfg) {
   return cfg.numerics.ale.central_pseudo_core_mixed_absorb_enabled;
 }
 
-// Terminal absorption (I1-B-R endgame): opt-in master switch, and the
+// Terminal absorption (I1-B-R): opt-in master switch, and the
 // rebound detector threshold — the terminal grant requires the shell-resolved
 // gas volume to have risen past factor*min (the capsule is re-expanding, so
 // the LAST shell row is fold-doomed exhaust, not load-bearing physics).
@@ -2435,7 +2435,7 @@ bool request_ring_absorption(core::State& state,
   }
   const int target = depth + 1;
   if (target > max_depth || target > ring_absorption_max_rings(cfg)) {
-    // Emergency mixed-material absorption (endgame verdict direction (a)):
+    // Emergency mixed-material absorption (terminal-phase verdict direction (a)):
     // the gas prefix is exhausted but the failure sits AT or BEYOND the
     // macro boundary. Absorb the immediately-NEXT unit as a MIXED row —
     // one row per request, so repeated failures WALK the boundary outward
@@ -2486,7 +2486,7 @@ bool request_ring_absorption(core::State& state,
                        "new_loop_V=%.6e new_loop_simple=%d "
                        "mixed_rows=%d step=%d\n",
                        is_mixed_row ? "mixed" : "walk",
-                       is_mixed_row ? " (mixed-core endgame)" : "",
+                       is_mixed_row ? " (mixed-core terminal phase)" : "",
                        failing_cell,
                        depth,
                        emergency_target,
@@ -2543,7 +2543,7 @@ bool request_ring_absorption(core::State& state,
                  pc.core1d_V_gas_min_c > 0.0 &&
                  pc.core1d_V_gas_c >
                      terminal_rebound_factor(cfg) * pc.core1d_V_gas_min_c) {
-        // I1-B-R endgame: the walk wants the LAST shell row — structurally
+        // I1-B-R terminal phase: the walk wants the LAST shell row — structurally
         // unabsorbable in the 2D framework (a one-row shell has every node
         // pinned by the boundary contracts, measured zero repair DOF) — and
         // the capsule is measurably re-expanding (V_gas past minimum by the
@@ -2908,7 +2908,7 @@ void maybe_absorb_first_active_ring(core::State& state,
   // Watch the first W ACTIVE absorption units starting at depth D = member
   // depth: a core ring for D < n_cap, otherwise fan layer D - n_cap across
   // the three fan blocks, otherwise a polar-shell row. W defaults to 1 (the
-  // historical single-ring watch); a wider window is the endgame verdict's
+  // historical single-ring watch); a wider window is the terminal-phase verdict's
   // PRE-trigger — a row beyond the first active unit can collapse to a
   // committed-degenerate volume within one accepted step (observed:
   // cell=1023 vol=-0.0 hard assert at t=2.78 ns while the single-ring

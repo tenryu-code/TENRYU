@@ -1385,7 +1385,7 @@ __global__ void compute_node_mass_2d_multiblock_kernel(
   // incident-cell planar control volume only for roundoff-scale cancellations.
   // The opt-in BBS axis path replaces that denominator at R=0 with exact RZ
   // subzonal volume masses, with no planar fallback.
-  // BUG-25 opt-in: assemble axis-node (r==0) mass from equal-split shares,
+  // Axis-node mass-convention opt-in: assemble axis-node (r==0) mass from equal-split shares,
   // matching the structured polar path's corner-mass convention. The exact
   // r-weighted subzonal sum halves the axis-node mass and makes the pole
   // accelerate 4/3x the interior under drive (the pole impedance seed).
@@ -2011,7 +2011,7 @@ __global__ void apply_boundary_accel_constraints_multiblock_kernel(
   // multiblock builder (flags are set only on the cylindrical axis, the
   // annular inner ring, the cap center, and the outer physical shell), so
   // internal block-seam nodes are ordinary interior nodes and receive no
-  // vector constraint (AI-review 2026-07-26, k02 F-05: the historical seam
+  // vector constraint (2026-07-26 review: the historical seam
   // tangent projection fallthrough was unreachable and has been removed).
 }
 
@@ -5615,7 +5615,7 @@ std::string format_multiblock_path_admissibility_location(
       tenryu::mesh::kCentralMacroCoreSentinelCell) {
     // Terminal-failure forensics (always on: macro rejections are rare and
     // the volume-floor vs simple-loop distinction plus the angular location
-    // of the violating segments is decision-critical for the endgame).
+    // of the violating segments is decision-critical for the terminal phase).
     std::string reason = "unknown";
     if (path_check.macro_has_anatomy != 0) {
       if (!std::isfinite(path_check.macro_v_old) ||

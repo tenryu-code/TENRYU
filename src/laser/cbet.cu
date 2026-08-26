@@ -328,7 +328,7 @@ __global__ void cbet_losscap_kernel(const double* __restrict__ L,
       const double chi_pq = chi[static_cast<std::int64_t>(c) * n_pairs + pair];
       // Canonical (min,max) operand order so both orientations of the pair
       // round the product identically — exact FP antisymmetry of the pair
-      // amount, matching the NUMERICS 5.10.3 claim (AI review M-01/S-04).
+      // amount, matching the NUMERICS 5.10.3 claim (2026-07-26 review).
       const double Lmin = L[row + ::min(g, gp)];
       const double Lmax = L[row + ::max(g, gp)];
       const double amt = chi_pq * Lmin * Lmax * inv_vol;  // >0: pair_p gains
@@ -396,7 +396,7 @@ __global__ void cbet_dq_kernel(const double* __restrict__ L,
       const double f = ::fmin(f_g, f_gp);
       // Canonical (min,max) operand order: chi is a single cached evaluation
       // and fmin is symmetric, so with this ordering the applied pair amount
-      // is bitwise identical from both orientations (AI review M-01/S-04).
+      // is bitwise identical from both orientations (2026-07-26 review).
       const double Lmin = L[row + ::min(g, gp)];
       const double Lmax = L[row + ::max(g, gp)];
       const double amt = chi_pq * Lmin * Lmax * inv_vol * f;
@@ -1286,7 +1286,7 @@ void cbet_workspace_prepare(CbetWorkspace& ws,
   ws.ps_n_channels = ps_n_channels;
   // pair_p/pair_q are int16_t and n_pairs = G(G-1)/2 must fit in int, so the
   // group count is hard-bounded; evaluate the product in 64-bit before the
-  // int assignment (AI review C-01 companion check).
+  // int assignment (2026-07-26 review companion check).
   const long long n_groups_ref_64 = static_cast<long long>(n_beams) *
                                     static_cast<long long>(n_branches) *
                                     static_cast<long long>(n_impact_bins);
@@ -1303,7 +1303,7 @@ void cbet_workspace_prepare(CbetWorkspace& ws,
                 "port_section v1 supports at most 65536 expanded pairs");
 
   // Grow-only allocation groups (no per-solve malloc when sizes are stable —
-  // per-call cudaMalloc is the measured W-F host-cost antipattern).
+  // per-call cudaMalloc is the measured per-call-allocation host-cost antipattern).
   const std::size_t n_rec = static_cast<std::size_t>(n_rays_total) *
                             static_cast<std::size_t>(cap_per_ray);
   const std::size_t n_rec_ps =
@@ -1687,7 +1687,7 @@ void cbet_stage_cell_fields(CbetWorkspace& ws,
     const bool is_void = (!mirror.cell_is_void.empty() && mirror.cell_is_void[si] != 0);
     // NaN in any staged field silently poisons chi_pref/c_a/g for the cell
     // (std::max(NaN, 0.0) keeps the NaN; Ti and u_r were previously unchecked
-    // — AI review M-12). Non-finite cells are masked out like rho<=0 cells.
+    // — 2026-07-26 review). Non-finite cells are masked out like rho<=0 cells.
     const bool finite_fields = std::isfinite(rho) && std::isfinite(zbar) &&
                                std::isfinite(A_eff) && std::isfinite(Te_erg) &&
                                std::isfinite(Ti_erg) && std::isfinite(u_r_cell) &&
@@ -1811,7 +1811,7 @@ void cbet_stage_cell_fields_2d(CbetWorkspace& ws,
       const double Z1 = lm.node_Z[static_cast<std::size_t>(cj + 1)];
       const double V_c = kPi * (R1 * R1 - R0 * R0) * std::fabs(Z1 - Z0);
       // Mirror the 1D staging guard: non-finite node means (incl. Ti/u which
-      // feed c_a and kdotu) must not enter the gain kernels (AI review M-12).
+      // feed c_a and kdotu) must not enter the gain kernels (2026-07-26 review).
       const bool finite_fields = std::isfinite(nh_raw) && std::isfinite(zbar) &&
                                  std::isfinite(Te_erg) && std::isfinite(Ti_erg) &&
                                  std::isfinite(A_eff) && std::isfinite(u_R) &&
@@ -2308,8 +2308,8 @@ CbetSolveResult cbet_solve_and_deposit(CbetWorkspace& ws,
                                           static_cast<long long>(0),
                                           thrust::plus<long long>());
   }
-  // Record-capacity overflow (AI review C-02/S-02, requantified
-  // 2026-07-31): an overflowed ray keeps its prefix records (their IB
+  // Record-capacity overflow (2026-07-26 review; requantified 2026-07-31):
+  // an overflowed ray keeps its prefix records (their IB
   // deposit replays normally), its truncated tail is classified
   // unabsorbed by the replay's final power (energy conserving, deposit
   // location approximated), and the ray is excluded from the CBET

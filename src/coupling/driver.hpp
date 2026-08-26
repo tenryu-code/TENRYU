@@ -167,7 +167,7 @@ struct DtLineage {
   double retry_dt_before = 0.0;
   double retry_dt_after = 0.0;
   double retry_min_metric = 0.0;
-  // Stage 24 Wave 0 telemetry. Populated only when
+  // Axis-failure telemetry. Populated only when
   // TENRYU_STAGE24_TELEMETRY=1; otherwise left at defaults.
   int repair_generation = 0;
   int rung_reached = 0;

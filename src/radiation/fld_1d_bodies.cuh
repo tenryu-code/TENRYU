@@ -299,7 +299,7 @@ __device__ inline void eval_nlte_opacity_emission_kernel_body(
   // branch inflated f in hot low-C_v cells and under-damped the emission
   // linearization exactly where the Fleck factor must protect. f = 1/(1+z)
   // stays in (0, 1] for any beta >= 0, so the cap never served its stated
-  // "f > 1 prevention" purpose. (AI review k05 4.4, 2026-07-26.)
+  // "f > 1 prevention" purpose. (2026-07-26 review.)
   double beta =
       4.0 * core::constants::a_eV * T_eval * T_eval * T_eval / Cv_e;
   if (!isfinite(beta) || beta < 0.0) {
@@ -506,7 +506,7 @@ __device__ inline void compute_fleck_for_fld_kernel_body(
     } else if (state_cv_e != nullptr && state_cv_e[c] > 0.0) {
       Cv_e = fmax(rho_c, 0.0) * state_cv_e[c];
     } else {
-      // BUG-1 Stage 2: per-cell effective properties.
+      // Shared per-cell effective properties (multi-material fix).
       const double z_atom = fmax(zbar[c], 0.0);
       const double gamma_c = fmax(gamma_eff[c], 1.0 + 1.0e-12);
       const double gm1 = fmax(gamma_c - 1.0, 1.0e-12);

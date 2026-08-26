@@ -10,7 +10,7 @@ Radiation: HYDRA-aligned discrete-ordinates S_N transport (NUMERICS §6.8).
 - DSA acceleration (cuSPARSE tridiag)
 - PA/PE-consistent matter Newton with TMAT-aware electron EOS
 
-Hydro: pure Lagrangian (1D ALE removed in ALE-FIX-1).
+Hydro: pure Lagrangian (1D ALE removed in the ALE cleanup).
 
 Reference run: GXII solid 1D_SPH square 120J/6ns SN ALE-off matched TMAT Hugoniot
 within 0.4% on shock front compression (peak ρ₂/ρ₁ ≈ 19.5× at t=4.10 ns,

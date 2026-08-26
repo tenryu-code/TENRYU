@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stage 23 Wave 3 physics-validity critique for TENRYU HDF5 dumps."""
+"""Physics-validity critique for TENRYU HDF5 dumps."""
 
 from __future__ import annotations
 

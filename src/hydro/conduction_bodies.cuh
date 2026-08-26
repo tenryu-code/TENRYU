@@ -511,7 +511,7 @@ __device__ inline void compute_1d_flux_limiter_faces_kernel_body(
   const int iL = face;
   const int iR = face + 1;
 
-  // BUG-19: the limiter estimate must use the SAME face-kappa closure as the
+  // Face-kappa-policy consistency fix: the limiter estimate must use the SAME closure as the
   // consuming flux kernel — a harmonic estimate under a Kirchhoff flux leaves
   // sharp fronts effectively unlimited (q_face >> q_max; XC-0b 2026-07-13).
   const double k_face =
@@ -927,7 +927,7 @@ __device__ inline void kirchhoff_dt_ratio_1d_kernel_body(
     return;
   }
 
-  // BUG-20 / #833: an unset/zero/nonfinite cell extent must not contribute a
+  // Unset-extent guard (#833): an unset/zero/nonfinite cell extent must not contribute a
   // Gershgorin ratio — the historic 1e-30 floor manufactured a ~1e-27 s dt_exp
   // (STS ~1e9 substeps = effective hang). Healthy states carry positive finite
   // extents, so dt_exp stays bit-identical; degenerate cells fall back to the
@@ -981,10 +981,10 @@ __device__ inline void kirchhoff_dt_ratio_1d_kernel_body(
   }
 }
 // PK-C2a-2 megakernel path: the persistent loop was certified (rmtv ON/OFF
-// bit-identical) against the pre-BUG-15 single-pass in-body alpha form. The
-// standard conduction path moved to the two-pass pair-min alpha (BUG-15) with
+// bit-identical) against the pre-revision single-pass in-body alpha form. The
+// standard conduction path moved to the two-pass pair-min alpha revision with
 // a precomputed alpha_cells field the megakernel does not stage yet; these
-// legacy clones pin the certified megakernel numerics until the BUG-15 port
+// legacy clones pin the certified megakernel numerics until the pair-min alpha port
 // lands there with its own gate (persistent lane is #56-gated, non-production).
 template <int GEOM>
 __device__ inline void conduction_1d_sts_stage_legacy_inline_alpha_kernel_body(
@@ -1406,7 +1406,7 @@ __host__ __device__ inline double sts_tau_for_stage(const double dt,
 }
 
 // Amplification bound of the uniformly rescaled STS ladder (AI kernel review
-// 2026-07-26, k07 F-08): max_{lambda in (0, lambda_max]} |prod_j (1 - lambda
+// 2026-07-26 kernel review): max_{lambda in (0, lambda_max]} |prod_j (1 - lambda
 // tau_j)|.  The rescale in initialize_sts_taus / sts_tau_for_stage is a
 // stability-preserving SHRINK at the shipped defaults (cfl_cond = 0.25,
 // conduction.sts_damping = 0.01; measured bound 0.175 up to the subcycle cap),

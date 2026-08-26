@@ -182,7 +182,7 @@ TENRYU_HOST_DEVICE inline bool should_trigger_tail_closure(const double n_hat_ra
       !(A_entry > 0.0) || !::isfinite(g_mag) || !(g_mag > 0.0)) {
     return false;
   }
-  // Direction gate (AI review k08 C4): the tail closure models the remaining
+  // Direction gate (2026-07-26 review): the tail closure models the remaining
   // inbound path to the critical surface, so it must only fire for rays
   // moving UP the density gradient. Without this, an outbound ray (after a
   // subcritical turning) re-entering the near-critical band could absorb a
@@ -1413,7 +1413,7 @@ __device__ inline void ray_trace_1d_sph_body(const int ray,
   int n_steps = 0;
   RayStepHistogramGuard histogram_guard(
       step_histogram, &n_steps, step_count, ray_steps_out, tid, n_rays);
-  // BUG-6 (reproducibility contract): when per-ray buffers are provided each
+  // Fixed-order tally-reduction reproducibility contract: when per-ray buffers are provided each
   // ray owns an exclusive row, so the cached atomic adds are contention-free
   // and the later fixed-order reduction makes the deposition bitwise
   // deterministic. Null buffers fall back to the legacy shared-atomic tally.
@@ -1608,7 +1608,7 @@ __device__ inline void ray_trace_1d_sph_body(const int ray,
     }
 
     // Launch speed |v| = sqrt(1 - n_hat) at the profile entry point (H = 1;
-    // AI review k08 2.9). Vacuum entry (nh0 = 0) multiplies by exactly 1.0.
+    // 2026-07-26 review). Vacuum entry (nh0 = 0) multiplies by exactly 1.0.
     {
       const double v_entry_scale = ::sqrt(::fmax(0.0, 1.0 - nh0));
       vR *= v_entry_scale;
@@ -2064,7 +2064,7 @@ __device__ inline void ray_trace_1d_sph_body(const int ray,
     // The power accounting is deferred so the recorded capture power is the
     // ray power AT the crossing (P^cross, NUMERICS 5.11), i.e. after the IB
     // absorption of the pre-crossing sub-segment, not the segment-entry
-    // power (AI review k10-2.1/P0-5). Channels are sorted by f_s ascending
+    // power (2026-07-26 review). Channels are sorted by f_s ascending
     // host-side, so on a rising segment the staged fracs are ascending.
     [[maybe_unused]] int hot_e_n_pend = 0;
     [[maybe_unused]] int hot_e_pend_ch[HotECaptureParams::kMaxChannels];
@@ -2559,7 +2559,7 @@ __device__ inline void reduce_per_ray_tallies_1d_body(
     const int n_cells,
     const double* __restrict__ ra_per_ray,
     double* __restrict__ d_ra_total) {
-  // BUG-6: fixed ascending-ray-order reduction makes the laser tallies
+  // Fixed ascending-ray-order reduction makes the laser tallies
   // bitwise deterministic (identical seed => identical deposition). Thread c
   // owns exactly one output slot, so the trailing atomic adds have a single
   // writer per launch and beam launches accumulate in stream order.

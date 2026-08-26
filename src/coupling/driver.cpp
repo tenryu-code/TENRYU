@@ -1555,7 +1555,7 @@ void assert_driver_retry_supported(const core::Config& cfg) {
       cfg.radiation.mode == core::RadiationMode::ImcDdmc) {
     TENRYU_ASSERT(false,
                   "Numerics.hydro.driver_full_step_retry_enabled does not support "
-                  "RadiationMode::ImcDdmc (Wave 1 P1 scope: deterministic FLD/SN only). "
+                  "RadiationMode::ImcDdmc (v1 scope: deterministic FLD/SN only). "
                   "Set retry_enabled=false or change radiation.mode.");
   }
 }
@@ -1939,7 +1939,7 @@ void initialize_eos_fields_if_needed_impl(core::State& state, core::Config& cfg)
   state.zbar.copy_to_host(zbar.data());
   state.Te.copy_to_host(Te.data());
   state.Ti.copy_to_host(Ti.data());
-  // Per-cell effective properties (BUG-1): the historic scalar
+  // Per-cell effective properties (multi-material fix): the historic scalar
   // first-nonvoid A/gamma poisoned every other material's initial energies.
   state.ensure_cell_material_props(cfg);
   std::vector<double> A_eff_h(n, 0.0);
@@ -2013,7 +2013,7 @@ void initialize_eos_fields_if_needed_impl(core::State& state, core::Config& cfg)
         Pe[i] = (gamma - 1.0) * rho[i] * e_total;
       } else if (mat.eos_tables && !use_exact_hydro &&
                  !mat.eos_tables->total.empty()) {
-        // BUG-26 (2026-07-20): the 1T branch initialized ee from the ideal-gas
+        // 1T ee-init fix (2026-07-20): the 1T branch initialized ee from the ideal-gas
         // cv even for table-EOS materials (the 2T branch above consults the
         // table). The legacy eos closure silently rewrote ee to the table
         // value on the first radiation step, while energy_authoritative
@@ -2074,7 +2074,7 @@ static void sync_ee_from_Te_table(core::State& state, const core::Config& cfg) {
   const bool two_temp = cfg.main.two_temperature;
   const bool energy_authoritative =
       (cfg.numerics.hydro.eos_closure_mode == "energy_authoritative");
-  // BUG-24 host-side high-T ideal tail (mirror of the device helpers):
+  // Host-side high-T ideal tail (mirror of the device helpers):
   // above the table's temperature ceiling, extend instead of saturating.
   struct HostTailThermo {
     double e;
@@ -2191,7 +2191,7 @@ static void sync_ee_from_Te_table(core::State& state, const core::Config& cfg) {
   }
 }
 
-// BUG-24 (energy-authoritative): conservative conduction handoff — book the
+// Energy-authoritative conservative conduction handoff — book the
 // solve's own cv-linear energy increment exactly, then re-derive Te/Pe/cv
 // from the updated energy by tail-aware inversion of the table.
 static void apply_conduction_energy_increment(
@@ -5018,7 +5018,7 @@ DtLineage compute_dt_lineage(const core::State& state,
       dt_new = std::min(dt_new, dt_cond);
     }
     {
-      // W-H Braginskii viscosity explicit stability limit (config-gated,
+      // Braginskii viscosity explicit stability limit (config-gated,
       // with env diagnostic overrides; disabled => +inf/no effect).
       const double dt_brag =
           hydro::braginskii::compute_dt_braginskii(state, cfg);
@@ -6332,11 +6332,11 @@ void Driver::run(core::State& state,
           "cone_shell stepping lands with a later stage; Stage C2 supports mesh build/init/output only");
     }
     if (state.mesh.logical == mesh::LogicalMesh2D::PolarInBox) {
-      // Stage 1 deliberately stops before polar-only BC/axis/ALE machinery can
+      // The current scope stops before polar-only BC/axis/ALE machinery can
       // engage. The mesh build, initialization, and step-0 snapshot above are
-      // supported; time integration lands with the Stage-4 BC refactor.
+      // supported; time integration is deferred to the BC refactor.
       throw core::namelist::ConfigError(
-          "polar_in_box stepping lands with the Stage-4 BC refactor; Stage 1 supports mesh build/init/output only");
+          "polar_in_box stepping is not yet supported (pending the BC refactor); the current scope supports mesh build/init/output only");
     }
     int retry_attempts = 0;
     HydroStepResult last_hydro_result{};
@@ -6382,7 +6382,7 @@ void Driver::run(core::State& state,
     }
 
     while (true) {
-      // I1-B-R terminal endgame: a granted terminal absorption executes on
+      // I1-B-R terminal absorption: a granted request executes on
       // the restored pre-step state (ALL remaining cells become stratified
       // 1D shells), then the run completes as a core1d-only tail — the 2D
       // mesh is frozen and never stepped again.
@@ -7298,7 +7298,7 @@ void Driver::run(core::State& state,
               (armed ? "true" : "false"));
         }
         TENRYU_ASSERT(floor_event_count <= budget,
-                      "ALE remap mass-floor injections exceeded the endgame "
+                      "ALE remap mass-floor injections exceeded the terminal-phase "
                       "budget (TENRYU_I1B_MASS_FLOOR_MAX_EVENTS) — the run is "
                       "no longer mass-conservative; aborting loudly instead "
                       "of accumulating");
@@ -10191,7 +10191,7 @@ void Driver::run(core::State& state,
         copy_device_field(backup_Ti, state.Ti, "thermal-subcycle backup Ti");
         copy_device_field(backup_Pe, state.Pe, "thermal-subcycle backup Pe");
         copy_device_field(backup_Pi, state.Pi, "thermal-subcycle backup Pi");
-        // AI review k15 C-4/12 (2026-07-26): the retry rollback must be
+        // 2026-07-26 review: the retry rollback must be
         // transactional for the deterministic FLD/S_N lanes. A failed
         // attempt has already advanced the radiation prognostic state
         // (rad_E; rad_E_old via the SN stage-end copy; sn_psi_prev = the

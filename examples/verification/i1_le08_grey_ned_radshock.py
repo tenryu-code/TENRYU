@@ -1,8 +1,8 @@
 """LE08 nED grey radiative-shock verification deck.
 
-Wave 10 defaults use a large 1D_SPH radius as the quasi-planar workaround and a
+The defaults use a large 1D_SPH radius as the quasi-planar workaround and a
 radiation-relaxation-time run so the two-state IC reaches the steady shock
-structure; see CONSENSUS Round 5 thread 019e25c4-... for traceability.
+structure.
 """
 
 import bisect

@@ -232,7 +232,7 @@ __device__ inline double compute_qei_term_analytical(const double rho,
   const double ratio = dt * qei_multiplier / tau_eff;
   // -expm1(-x) == 1 - exp(-x) exactly, but keeps full relative precision for
   // ratio << 1 (the raw form loses ~eps/ratio relative accuracy to
-  // cancellation; AI review k15 1.3, 2026-07-26).
+  // cancellation; 2026-07-26 review).
   const double f_relax = (ratio > 500.0) ? 1.0 : (-expm1(-ratio));
 
   return cv_e * cv_i / cv_sum * (te_safe - Ti) * f_relax;
@@ -313,7 +313,7 @@ __host__ __device__ inline double compute_qei_term_analytical_ext(
   const double ratio = dt * qei_multiplier / tau_eff;
   // -expm1(-x) == 1 - exp(-x) exactly, but keeps full relative precision for
   // ratio << 1 (the raw form loses ~eps/ratio relative accuracy to
-  // cancellation; AI review k15 1.3, 2026-07-26).
+  // cancellation; 2026-07-26 review).
   const double f_relax = (ratio > 500.0) ? 1.0 : (-expm1(-ratio));
 
   return cv_e * cv_i / cv_sum * (te_safe - Ti) * f_relax;
@@ -386,7 +386,7 @@ __device__ inline double compute_qei_term_with_cv(const double rho,
   const double ratio = dt * qei_multiplier / tau_eff;
   // -expm1(-x) == 1 - exp(-x) exactly, but keeps full relative precision for
   // ratio << 1 (the raw form loses ~eps/ratio relative accuracy to
-  // cancellation; AI review k15 1.3, 2026-07-26).
+  // cancellation; 2026-07-26 review).
   const double f_relax = (ratio > 500.0) ? 1.0 : (-expm1(-ratio));
 
   return cv_e_mass * cv_i_mass / cv_sum * (te_safe - Ti) * f_relax;
@@ -460,7 +460,7 @@ __host__ __device__ inline double compute_qei_term_with_cv_ext(
   const double ratio = dt * qei_multiplier / tau_eff;
   // -expm1(-x) == 1 - exp(-x) exactly, but keeps full relative precision for
   // ratio << 1 (the raw form loses ~eps/ratio relative accuracy to
-  // cancellation; AI review k15 1.3, 2026-07-26).
+  // cancellation; 2026-07-26 review).
   const double f_relax = (ratio > 500.0) ? 1.0 : (-expm1(-ratio));
 
   return cv_e_mass * cv_i_mass / cv_sum * (te_safe - Ti) * f_relax;

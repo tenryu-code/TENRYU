@@ -293,7 +293,7 @@ RayArray1D initialize_rays_1d(const Beam& beam,
       std::abs(Z_init - beam.focus_lab_z) / (2.0 * std::max(beam.f_number, 1.0e-12));
   const double dR = (rays_per_beam > 0) ? (R_beam / static_cast<double>(rays_per_beam)) : 0.0;
 
-  // Face-based annular quadrature (AI review k08 8.1): ring faces at k*dR,
+  // Face-based annular quadrature (2026-07-26 review): ring faces at k*dR,
   // representative radii at the ring centers (k+1/2)*dR, exact annulus areas
   // pi*((k+1)^2 - k^2)*dR^2. The previous node-based layout (rays at k*dR
   // with a half-cell disk at k=0) left the outermost half ring

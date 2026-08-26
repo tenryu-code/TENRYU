@@ -1,6 +1,6 @@
 #pragma once
 
-// W-H: Braginskii plasma shear viscosity for the Lagrangian hydro
+// Braginskii plasma shear viscosity for the Lagrangian hydro
 // (docs/design/wh_braginskii_viscosity_design.md; 2D RZ port
 // docs/design/2d_visc_port_spec.md), extended with the electron channel
 // (docs/design/electron_viscosity_1d_20260712.md, ported by
@@ -45,7 +45,7 @@ struct Params {
   double te_floor_ev = 1.0e-3;   // matches Numerics.floors.Te default
 };
 
-// Fail-closed parameter validation (AI kernel review 2026-07-26, k13 F-01):
+// Fail-closed parameter validation (2026-07-26 kernel review):
 // throws std::runtime_error when an enabled parameter set carries a
 // non-finite or out-of-range value (eta_const/eta0_scale/mfp_cap_cells/
 // lnlambda_fixed < 0, dt_safety <= 0, unknown model/species code). Called by
@@ -56,7 +56,7 @@ void validate_params(const Params& p);
 // LNLAMBDA_FIXED,DT_SAFETY}. Unset TENRYU_BRAG_ENABLE (or "0") => disabled
 // and the remaining variables are not consulted. Numeric variables must
 // parse completely as finite numbers and unknown MODEL/SPECIES strings are
-// rejected (F-01: no silent fallback, no fail-open override).
+// rejected (no silent fallback, no fail-open override).
 Params params_from_env();
 
 // Namelist-authoritative parameters (Numerics.hydro.plasma_viscosity),
@@ -134,7 +134,7 @@ double compute_dt_braginskii(const core::State& state, const core::Config& cfg);
 // scalar formula does not see (up to ~2.5x at the spherical origin), and
 // graded meshes the center-distance coupling. Used by the end-of-step
 // viscous stability audit in hydro_1d.cu (AI kernel review 2026-07-26,
-// k13 F-05/F-09): dt must satisfy dt <= 2/lambda_G or the step is retried
+// 2026-07-26 kernel review: dt must satisfy dt <= 2/lambda_G or the step is retried
 // (soft failure) / aborted. Returns 0 when disabled or nothing contributes.
 double compute_viscous_gershgorin_lambda_1d(const double* x_r,
                                             const double* rho,
@@ -156,7 +156,7 @@ double compute_viscous_gershgorin_lambda_1d(const double* x_r,
 // and the ratio statistics are the PHYSICAL Braginskii channel viscosities
 // evaluated from the instantaneous state — independent of model/species AND
 // of the numerical knobs (eta0_scale = 1, mfp cap off, NRL Coulomb log;
-// AI kernel review 2026-07-26, k13 F-10: a capped/scaled "physical" channel
+// 2026-07-26 kernel review: a capped/scaled "physical" channel
 // would make the regime map mesh-dependent). eta_eff_max and the heat-rate
 // totals reflect the configured (species, model, cap, scale) run. Ratio statistics are
 // over active cells with eta_i > 0; regime counts use R >= 10 (electron-

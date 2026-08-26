@@ -12,7 +12,7 @@ matrix (spec v3.1 §7) and writes a summary.json consumed by the
            contraction gate), Richardson nz-ladder at N_g=4 (contraction
            reported; window frozen by main at first battery, Q1 ruling).
 
-Wave-12 absolute metrics vs the FLD-CED ODE reference are REPORTED only
+Absolute metrics vs the FLD-CED ODE reference are REPORTED only
 (two_state-mode calibration caveat, adjudication Q6); the binding collapse
 comparator is the same-binary R0 grey run. Reuses the I1-A harness readers
 (run_i1_2d_rz_fld_ced.read_snapshot sums the HDF5 group axis into a grey
