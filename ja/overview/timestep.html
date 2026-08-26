@@ -47,7 +47,7 @@
         <li><strong>出力への着地と終端：</strong>時間間隔ベースの出力が有効なら、次の出力時刻を飛び越えないよう \(\Delta t_{output}\) を候補に含める（<a href="#output-landing">後述</a>）。残り時間 \(t_{end}-t\) も同様である。</li>
         <li><strong>再試行：</strong>全ステップ再試行が有効な構成で流体の修正段が棄却されると、入口のスナップショットへ戻り、\(\Delta t\) を半分にして分割の列全体をやり直す（<a href="numerics-foundations.html">数値基盤</a>参照）。このとき limiter は <code>driver_retry</code> と記録される。</li>
       </ul>
-      <p>採用された \(\Delta t\) がどの候補と一致したか — <code>hydro</code>、<code>conduction</code>、<code>burn</code>、<code>hot_electron</code>、<code>braginskii</code>、<code>radiation</code>、<code>growth</code>、<code>output</code>、<code>t_end</code>、<code>max</code>、<code>init</code>、<code>driver_retry</code> — が limiter 名としてログに出る。「\(\Delta t\) がどんどん小さくなる」ときは、まずこの名前を見て律速カーネルを特定するのが定石である（<a href="#observing">観測手段</a>参照）。</p>
+      <p>採用された \(\Delta t\) がどの候補と一致したか — <code>hydro</code>、<code>conduction</code>、<code>burn</code>、<code>hot_electron</code>、<code>braginskii</code>、<code>radiation</code>、<code>growth</code>、<code>output</code>、<code>t_end</code>、<code>max</code>、<code>init</code>、<code>driver_retry</code> — が limiter 名としてログに出る。「\(\Delta t\) がどんどん小さくなる」ときは、まずこの名前を見て律速カーネルを特定するのが定石である（<a href="#observing">観測手段</a>参照）。<code>mesh_mode="reale_v2"</code> の実行では、リゾーン確定直後の 1 ステップに限り、成長 ladder の上方再アンカーを表す <code>rezone_reanchor</code> も現れる（<a href="../physics/mesh/ale-remap.html#reale-reanchor">ALE ページ</a>参照）。</p>
       <p>MPI 実行では各 CFL の \(\min_c\) はランク局所のセルに対して計算され、ランク局所の \(\Delta t\) を 1 回の <code>MPI_Allreduce(MPI_MIN)</code> で全ランク共通の値にする。時刻・出力予定時刻は全ランクで同一に保たれるため、\(\Delta t_{output}\) に追加の通信は要らない。</p>
     </section>
 
