@@ -93,7 +93,7 @@ TENRYU_HOST_DEVICE inline int burn_network_step(
   // 1e-9*n_tot keeps near-empty reactants from demanding infinite M while
   // still forcing subcycle_max when they grow from ~zero. Controlled on
   // max(gross production, gross consumption) per reactant; the net rate hides
-  // balanced breeding/consumption turnover (AI review k14 B-2, 2026-07-26).
+  // balanced breeding/consumption turnover (2026-07-26 review).
   double r0[kNumReactions];
   burn_reaction_rates(n, sv1, sv2, sv3, sv4, r0);
   double n_tot = 0.0;

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stage 30 material-interface HDF5 reader skeleton."""
+"""Material-interface HDF5 reader skeleton."""
 
 from __future__ import annotations
 

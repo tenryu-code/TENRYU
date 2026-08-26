@@ -3,8 +3,8 @@
 
 Tiers:
   smoke (dev-time, default): SHORT-WINDOW MECHANISM CHECK. Runs the layered deck for
-    t_end=1e-13 s (~3.5e3 dt-limited steps, tens of seconds) and gates on the BUG-14
-    defect class: boundary-cell Te ignition, radiative front formed but still short of
+    t_end=1e-13 s (~3.5e3 dt-limited steps, tens of seconds) and gates on the
+    boundary-cell Te ignition defect class: radiative front formed but still short of
     the interface, per-step energy-ledger closure (operator audit), and both layered
     materials materialized in state. No reference generator, no profile comparison.
   cert (campaign): full registry window (t_end=3e-10 s) with the reference-generator

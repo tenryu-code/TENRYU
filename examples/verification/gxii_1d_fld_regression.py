@@ -43,7 +43,7 @@ DOMAIN_R_MAX = 500.0 * um
 # strictly monotone with NO uniform floor plateau: a 3-cell rho=1e-4 plateau
 # next to void formed a resonant cavity where trace IB deposition drove an
 # exponentially growing antisymmetric node pair (laser-off runs are stable;
-# tracked as BUG-3). (A 1e-7 tail let the
+# tracked as a tail artifact). (A 1e-7 tail let the
 # first heated cells accelerate their nodes into crossing within ~1 ps).
 # The seed adds <1% of shell mass and places
 # the critical surface (0.028 g/cc for CH at 351 nm) inside a resolved ramp.

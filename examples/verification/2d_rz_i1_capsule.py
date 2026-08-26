@@ -1,12 +1,12 @@
-"""Stage 27 pre-PLIC characterization deck, with Stage 30 Wave E CF modes.
+"""Pre-PLIC characterization deck with optional PLIC/CF modes.
 
-This manual-use I1 capsule deck represents a simplified direct-drive,
-cryogenic-target-style 2D_RZ baseline for public Stage 27 characterization.
+This manual-use I1 capsule deck is the public characterization baseline for a
+simplified direct-drive, cryogenic-target-style 2D_RZ target.
 It is intended to generate early IFAR/CR and Legendre mode trajectories before
 high-convergence PLIC comparisons. It is not production-comparable.
-Stage 30 Wave E can enable PLIC and CF variants through TENRYU_I1CAPSULE_PLIC_*
-environment variables; defaults preserve the Stage 27 characterization mode.
-Round 4 ALE fixes can be activated via TENRYU_I1CAPSULE_REZONE_SOLVER,
+PLIC and CF variants can be enabled through TENRYU_I1CAPSULE_PLIC_*
+environment variables; defaults preserve the characterization mode.
+Optional ALE fixes can be activated via TENRYU_I1CAPSULE_REZONE_SOLVER,
 TENRYU_I1CAPSULE_REJECT_ZERO_GAUSS_J, TENRYU_I1CAPSULE_STRATEGY_FIRST_RETRY,
 TENRYU_I1CAPSULE_IN_HYDRO_GAUSS_J_GUARD,
 TENRYU_I1CAPSULE_IN_HYDRO_RZ_VOLUME_GUARD, and
@@ -162,7 +162,7 @@ REMAP_MS2_LIMITER = os.environ.get("TENRYU_I1CAPSULE_REMAP_MS2_LIMITER", "van_le
 DRIVER_RETRY = _env_bool("TENRYU_I1CAPSULE_RETRY", True)
 DRIVER_RETRY_MAX_ATTEMPTS = _env_int("TENRYU_I1CAPSULE_RETRY_MAX_ATTEMPTS", 4)
 
-# Round 4 ALE fixes (default-off opt-in flags)
+# Optional ALE fixes (default-off opt-in flags)
 REZONE_SOLVER = os.environ.get("TENRYU_I1CAPSULE_REZONE_SOLVER", "legacy_winslow")
 REZONE_LOCAL_LINESEARCH = _env_bool("TENRYU_I1CAPSULE_REZONE_LOCAL_LINESEARCH", False)
 REZONE_LOCAL_J_FLOOR_REL = _env_float("TENRYU_I1CAPSULE_REZONE_LOCAL_J_FLOOR_REL", 1e-8)

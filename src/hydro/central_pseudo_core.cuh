@@ -27,7 +27,7 @@ bool request_ring_absorption(core::State& state,
 // request_ring_absorption.
 bool request_macro_boundary_absorption(core::State& state,
                                        const core::Config& cfg);
-// Terminal absorption (I1-B-R endgame, env TENRYU_I1B_TERMINAL_ABSORB):
+// Terminal absorption (I1-B-R, env TENRYU_I1B_TERMINAL_ABSORB):
 // armed by request_ring_absorption when the rebound-phase emergency walk
 // requests the structurally unabsorbable LAST shell row. The driver checks
 // the pending flag at the top of every step attempt, executes the terminal

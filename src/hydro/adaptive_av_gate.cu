@@ -127,7 +127,7 @@ void build_adaptive_av_fields_1d(core::State& state,
   const AdaptiveAVMode mode = select_mode(state, cfg, shock);
   state.adaptive_av_mode = static_cast<int>(mode);
   const AdaptiveAVCoeff coeff = mode_coeff(state, cfg, shock, mode);
-  // k01 §8.1 (AI review 2026-07-26): a fixed per-step blend weight makes the
+  // 2026-07-26 review: a fixed per-step blend weight makes the
   // gate relaxation rate depend on the timestep count, breaking dt-refinement
   // convergence. hysteresis_tau > 0 opts into the physical-time-constant
   // blend w(dt) = 1 - exp(-dt/tau); tau == 0 keeps the legacy fixed w.

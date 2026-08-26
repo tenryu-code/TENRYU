@@ -197,7 +197,7 @@ __global__ void recompute_density_kernel(double* __restrict__ rho,
   rho[i] = (vol[i] > 0.0) ? mass[i] / vol[i] : 0.0;
 }
 
-// Post-remap per-species table reclosure honoring the BUG-24 closure policy
+// Post-remap per-species table reclosure honoring the energy-authoritative closure policy
 // (Numerics.hydro.eos_closure_mode). Under "energy_authoritative" the evolved
 // energy is kept on table-edge inverse clamps (writeback veto) and
 // super-ceiling targets invert into the high-T ideal tail; "legacy" keeps the

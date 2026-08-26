@@ -2742,7 +2742,7 @@ void apply_legacy_mesh_defaults(py::dict& root) {
   grading["mapping"] = defaults.grading.mapping;
   set_default_if_missing(mesh, "grading", grading);
   // Per-key completion for checkpoints that predate grading.mapping
-  // (AI review 2026-07-26 k01 P0-1): their grading dict exists but lacks
+  // (2026-07-26 review): their grading dict exists but lacks
   // the key, so the whole-dict default above does not fill it.
   if (py::isinstance<py::dict>(mesh[py::str("grading")])) {
     py::dict grading_existing = mesh[py::str("grading")].cast<py::dict>();
@@ -2816,7 +2816,7 @@ void normalize_mesh_default_elision(py::dict& root) {
                py::cast(defaults.multiblock_bridge_elliptic_sweeps));
   pop_if_equal(mesh, "multiblock_bridge_elliptic_omega",
                py::cast(defaults.multiblock_bridge_elliptic_omega));
-  // AI review 2026-07-26 k01 P0-1: grading.mapping is compared by elision —
+  // 2026-07-26 review: grading.mapping is compared by elision —
   // checkpoints that predate the key and current configs at the default value
   // both end up without it. apply_legacy_mesh_defaults only runs for
   // schema<=V1 checkpoints, so per-key completion there cannot equalize
@@ -4100,7 +4100,7 @@ void apply_legacy_numerics_defaults(py::dict& root) {
   if (py::isinstance<py::dict>(numerics[py::str("hydro")])) {
     hydro = numerics[py::str("hydro")].cast<py::dict>();
     const Config::NumericsConfig::HydroConfig hydro_defaults;
-    // AI review 2026-07-26 (k01 P0-4 / P0-2+P0-3): legacy frozen-config
+    // 2026-07-26 review: legacy frozen-config
     // default completion for the new 1D keys — no schema bump needed.
     set_default_if_missing(hydro, "crossing_dt_safety",
                            py::cast(hydro_defaults.crossing_dt_safety));

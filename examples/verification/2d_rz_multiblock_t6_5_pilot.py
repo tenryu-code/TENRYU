@@ -152,10 +152,10 @@ Numerics(
         subzonal_mass_enabled=True,
         anti_hourglass_kappa=float(os.environ.get("TENRYU_T6_5_KAPPA", "0.05")),
         subzonal_pressure_mode="uniform_cell",
-        # Round 3 Patch 3: enable full-step retry to handle path_admissibility soft fails
+        # Enable full-step retry to handle path_admissibility soft fails
         driver_full_step_retry_enabled=True,
     ),
-    # T6.5 PILOT v6: AI Silver Bullet Trio (Phase 1+2+3)
+    # T6.5 pilot: combined multiblock repair configuration (Phases 1+2+3)
     ale=dict(
         enabled=True,
         every_n_steps=1,

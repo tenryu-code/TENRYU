@@ -1,6 +1,6 @@
 """Reusable radiative-shock verification metrics for 2D RZ z-slab gates.
 
-This module implements the Wave 12 shock-windowed, cell-averaged,
+This module implements the shock-windowed, cell-averaged,
 convolved-reference metric framework in a reusable form for I1-I7 2D RZ
 production verification harnesses.  It operates on 1D z-profiles, typically
 produced from 2D RZ snapshots by ``rz_profile_average.py``.

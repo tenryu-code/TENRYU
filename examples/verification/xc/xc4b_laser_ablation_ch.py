@@ -2,7 +2,8 @@
 # Same-tables directive: TENRYU runs tmp/xc/tmat/CH_multi.h5 (converted from
 # MULTI's bundled tables/Carbon — eeos 75901 / ieos 75902 / planck 50003000 /
 # ross 50004000, Z=3.5 fixed, LTE); MULTI runs tables/Carbon directly.
-# 20-group FLD at the TMAT bounds == MULTI ng=20. Single material => BUG-23-safe.
+# 20-group FLD at the TMAT bounds == MULTI ng=20. Single material, so the
+# multi-material closure pitfall does not apply.
 # MULTI pair: ops/xc/cases/xc4_laser_ablation/multi.input (CPC88-heritage numbers:
 # Al-like foil, 3e14 W/cm^2, 300 ps FWHM sin^2, 0.44 um — the 2015CPC example
 # reduced to a single synthetic ideal-gas material).

@@ -274,29 +274,29 @@ inline void validate_tri_fan_stage2_config(const Config& config) {
   if (config.numerics.hydro.hourglass.enabled) {
     throw namelist::ConfigError(
         "Mesh.polar_center_treatment='tri_fan' does not support "
-        "Numerics.hydro.hourglass.enabled=true in Stage 2");
+        "Numerics.hydro.hourglass.enabled=true");
   }
   if (config.numerics.hydro.subzonal_mass_enabled) {
     throw namelist::ConfigError(
         "Mesh.polar_center_treatment='tri_fan' does not support "
-        "Numerics.hydro.subzonal_mass_enabled=true in Stage 2");
+        "Numerics.hydro.subzonal_mass_enabled=true");
   }
   if (config.numerics.hydro.hllc_z_flux_2d_rz) {
     throw namelist::ConfigError(
         "Mesh.polar_center_treatment='tri_fan' does not support "
-        "Numerics.hydro.hllc_z_flux_2d_rz=true in Stage 2");
+        "Numerics.hydro.hllc_z_flux_2d_rz=true");
   }
   if (config.numerics.hydro.rz_geometric_cfl_precise_u_half_enabled) {
     throw namelist::ConfigError(
         "Mesh.polar_center_treatment='tri_fan' does not support "
-        "Numerics.hydro.rz_geometric_cfl_precise_u_half_enabled=true in Stage 2");
+        "Numerics.hydro.rz_geometric_cfl_precise_u_half_enabled=true");
   }
   if (config.numerics.hydro.total_energy_remap_2d_rz &&
       config.mesh.topology_scheme !=
           TopologyScheme::MULTIBLOCK_HALF_BUTTERFLY_TRIFAN_CAP_5BLOCK) {
     throw namelist::ConfigError(
         "Mesh.polar_center_treatment='tri_fan' does not support "
-        "Numerics.hydro.total_energy_remap_2d_rz=true in Stage 3");
+        "Numerics.hydro.total_energy_remap_2d_rz=true");
   }
 }
 
@@ -310,19 +310,18 @@ inline void validate_button_stage1_config(const Config& config) {
   }
   if (config.main.dimension != "2D_RZ") {
     throw namelist::ConfigError(
-        "Mesh.polar_center_treatment='button' requires Main.dimension='2D_RZ' "
-        "in Stage 1");
+        "Mesh.polar_center_treatment='button' requires Main.dimension='2D_RZ'");
   }
   if (config.mesh.topology_scheme != TopologyScheme::SINGLE_BLOCK) {
     throw namelist::ConfigError(
         "Mesh.polar_center_treatment='button' requires "
-        "Mesh.topology_scheme='single_block' in Stage 1");
+        "Mesh.topology_scheme='single_block'");
   }
   if (!is_polar_family(config.mesh.logical_mesh_2d)) {
     throw namelist::ConfigError(
         "Mesh.polar_center_treatment='button' requires "
         "Mesh.logical_mesh_2d in {'spherical_polar_halfplane', "
-        "'polar_in_box'} in Stage 1");
+        "'polar_in_box'}");
   }
   if (!(config.mesh.center_button_outer_node_ring >= 1 &&
         config.mesh.center_button_outer_node_ring < config.mesh.nr)) {
@@ -332,27 +331,27 @@ inline void validate_button_stage1_config(const Config& config) {
   if (config.numerics.hydro.hourglass.enabled) {
     throw namelist::ConfigError(
         "Mesh.polar_center_treatment='button' does not support "
-        "Numerics.hydro.hourglass.enabled=true in Stage 1");
+        "Numerics.hydro.hourglass.enabled=true");
   }
   if (config.numerics.hydro.subzonal_mass_enabled) {
     throw namelist::ConfigError(
         "Mesh.polar_center_treatment='button' does not support "
-        "Numerics.hydro.subzonal_mass_enabled=true in Stage 1");
+        "Numerics.hydro.subzonal_mass_enabled=true");
   }
   if (config.numerics.hydro.hllc_z_flux_2d_rz) {
     throw namelist::ConfigError(
         "Mesh.polar_center_treatment='button' does not support "
-        "Numerics.hydro.hllc_z_flux_2d_rz=true in Stage 1");
+        "Numerics.hydro.hllc_z_flux_2d_rz=true");
   }
   if (config.numerics.hydro.rz_geometric_cfl_precise_u_half_enabled) {
     throw namelist::ConfigError(
         "Mesh.polar_center_treatment='button' does not support "
-        "Numerics.hydro.rz_geometric_cfl_precise_u_half_enabled=true in Stage 1");
+        "Numerics.hydro.rz_geometric_cfl_precise_u_half_enabled=true");
   }
   if (config.numerics.hydro.total_energy_remap_2d_rz) {
     throw namelist::ConfigError(
         "Mesh.polar_center_treatment='button' does not support "
-        "Numerics.hydro.total_energy_remap_2d_rz=true in Stage 1");
+        "Numerics.hydro.total_energy_remap_2d_rz=true");
   }
 }
 
@@ -448,7 +447,7 @@ inline void validate_multiblock_topology_config(const Config& config) {
     }
     if (config.numerics.hydro.subzonal_mass_enabled) {
       throw namelist::ConfigError(
-          "pentagon-belt: subzonal corner masses are staged to ALE P2-1c");
+          "pentagon-belt: subzonal corner masses are staged for a later revision");
     }
     if (config.numerics.hydro.hllc_z_flux_2d_rz) {
       throw namelist::ConfigError("pentagon-belt: HLLC z-flux staged");
@@ -530,7 +529,7 @@ inline void validate_multiblock_topology_config(const Config& config) {
     throw namelist::ConfigError(
         "Numerics.plic.enabled is not supported on multiblock topologies: "
         "PLIC interface reconstruction is structured-index only "
-        "(AI-review k02 F-13 fail-loud guard)");
+        "(fail-loud guard)");
   }
   if (config.main.dimension != "2D_RZ" || config.main.dim != 2) {
     throw namelist::ConfigError(
@@ -754,7 +753,7 @@ inline void validate_ale1d_config(const Config& config) {
         "Numerics.ale1d.enabled=True requires deterministic radiation "
         "(multigroup_diffusion) or radiation off, not IMC/DDMC/HOLO");
   }
-  // k16 C3/C7/C8 (AI review 2026-07-26) fail-closed operating boundary for
+  // 2026-07-26 review: fail-closed operating boundary for
   // the experimental V3 ALE prototype: the remap has no companion-field
   // registry (S_N angular state and burn inventories are left on the old mesh),
   // and post-remap EOS closure remains single-material. Reject configurations

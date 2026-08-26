@@ -33,7 +33,7 @@ struct MeshGeometryResult {
   double min_cell_vol = 0.0;
   double min_cell_area = 0.0;
   const char* reason = "";
-  // Stage 24 Wave 0 telemetry fields. Populated only when
+  // Axis-failure telemetry fields. Populated only when
   // TENRYU_STAGE24_TELEMETRY=1; otherwise left at defaults.
   bool dt_sensitive = false;
   bool state_sensitive = false;

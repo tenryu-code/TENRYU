@@ -15,7 +15,7 @@ namespace tenryu::hydro::ale {
 
 // Failure modes for the band-only remap. Hard gates trip the rollback in
 // W2-D. Conservation residuals for mass, internal energies, radiation
-// energy, and band cell momentum are hard gates (AI review k04 R14);
+// energy, and band cell momentum are hard gates (2026-07-26 kernel review);
 // the node-projection kinetic-energy delta remains diagnostic-only because
 // the mass-weighted projection is not KE-conserving by construction.
 enum class AxisBandRemapFailure : std::uint8_t {
@@ -67,7 +67,7 @@ struct AxisBandRemapResult {
   double E_rad_delta_rel = 0.0;  // sum rad_E_g * V over band cells
   // Band cell-momentum deltas across both sweeps, normalized by the physical
   // scale max(|P_r_before|, |P_z_before|, M_band * max|v|, tiny) so that a
-  // symmetry-zero total momentum does not inflate the residual (k04 R14).
+  // symmetry-zero total momentum does not inflate the residual (2026-07-26 kernel-review finding).
   double mom_r_delta_scaled = 0.0;
   double mom_z_delta_scaled = 0.0;
   // Min volumes (diagnostic).

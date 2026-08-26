@@ -8,7 +8,7 @@ Radiation: HYDRA-aligned multigroup flux-limited diffusion (NUMERICS §6.7).
 - Fleck-implicit linearization
 - PA/PE-consistent matter Newton with TMAT-aware electron EOS
 
-Hydro: pure Lagrangian (1D ALE removed in ALE-FIX-1; 1D_SPH does not require
+Hydro: pure Lagrangian (1D ALE removed in the ALE cleanup; 1D_SPH does not require
 mesh rezoning).
 
 Reference run: GXII solid 1D_SPH square 120J/6ns FLD ALE-off matched TMAT Hugoniot

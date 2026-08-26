@@ -31,7 +31,7 @@ struct CandidateMeshAdmissibilityFloors {
   double volume_abs = 0.0;
   double corner_j_abs = 0.0;
   double gauss_j_abs = 0.0;
-  // k17 AI-review §8 hardening. All fields below default to "off" so the
+  // 2026-07-26 kernel-review hardening. All fields below default to "off" so the
   // legacy endpoint-only contract is unchanged unless a caller opts in.
   // §8.7/§8.8: also check the interior of the linear node path
   // [0, sigma] — corner Jacobians are quadratic and the revolved RZ volume

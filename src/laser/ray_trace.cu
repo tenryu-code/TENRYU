@@ -161,7 +161,7 @@ TENRYU_HOST_DEVICE inline bool should_trigger_tail_closure(const double n_hat_ra
       !(A_entry > 0.0) || !::isfinite(g_mag) || !(g_mag > 0.0)) {
     return false;
   }
-  // Direction gate (AI review k08 C4): fire only for rays moving UP the
+  // Direction gate (2026-07-26 review): fire only for rays moving UP the
   // density gradient — the closure models the remaining inbound path to
   // critical. Keep in sync with ray_trace_bodies.cuh.
   if (!(v_dot_g > 0.0)) {
@@ -1995,8 +1995,8 @@ void ray_trace_2d(double* __restrict__ deposit,
       }
       return;
     }
-    // Launch speed |v| = sqrt(1 - n_hat) at the start point (H = 1; AI
-    // review k08 2.9). Vacuum starts (nh0 = 0) multiply by exactly 1.0.
+    // Launch speed |v| = sqrt(1 - n_hat) at the start point (H = 1;
+    // 2026-07-26 review). Vacuum starts (nh0 = 0) multiply by exactly 1.0.
     {
       const double v_entry_scale = ::sqrt(::fmax(0.0, 1.0 - nh0));
       vR *= v_entry_scale;
@@ -2627,7 +2627,7 @@ void ray_trace_3d(double* __restrict__ deposit,
     // h, and |v| = sqrt(1 - n_hat) at the start) is applied in the 1D
     // kernels only; mirroring it here moved the 2D CBET slab detuning
     // tendency gate marginally red, so the 2D migration is owned by the 2D
-    // lane together with its gate re-qualification (AI review k08 C1/2.9).
+    // lane together with its gate re-qualification (2026-07-26 review).
     vx -= 0.25 * ds_local * g3.x;
     vy -= 0.25 * ds_local * g3.y;
     vz -= 0.25 * ds_local * g3.z;
@@ -3438,7 +3438,7 @@ cudaError_t launch_ray_trace_1d_sph(const RayArray1D& rays,
           ? requested_shared_bytes
           : 0;
 
-  // BUG-6 (statistical-reproducibility contract): per-ray private tallies +
+  // Fixed-order tally-reduction statistical-reproducibility contract: per-ray private tallies +
   // fixed-order reduction give bitwise-deterministic deposition. Falls back to
   // the legacy shared-atomic path only if the scratch allocation would be
   // unreasonably large.

@@ -2,7 +2,7 @@
 """I7a coupled-stack smoke and cert harness.
 
 Smoke tier runs two identical replicas in fresh output directories.  The replica
-pair is the dev-time noise-band instrument.  Cert tier evaluates one fresh or
+pair is the dev-time noise-band instrument.  The certification runs evaluate one fresh or
 one or more existing runs against a frozen high-resolution ensemble reference.
 """
 

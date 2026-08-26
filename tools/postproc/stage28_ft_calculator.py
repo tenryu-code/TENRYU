@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compute Stage 28 F_t from baseline and profile-enabled history HDF5 files.
+"""Compute F_t from baseline and profile-enabled history HDF5 files.
 
 Usage: python tools/postproc/stage28_ft_calculator.py --baseline a.h5 --enabled b.h5 --label D6
 """

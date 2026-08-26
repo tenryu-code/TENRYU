@@ -76,7 +76,7 @@ struct HydroStepResult {
   double failing_value = 0.0;
   double min_cell_vol = 0.0;
   double min_cell_area = 0.0;
-  // Corner-J-specific signed minimum. Wave 1 leaves this at the default; later
+  // Corner-J-specific signed minimum. The base feature leaves this at the default; later
   // in-hydro guards/classifiers may populate it.
   double min_corner_j = 0.0;
   bool gauss_j_failed = false;
@@ -118,7 +118,7 @@ struct HydroStepResult {
   double cap_energy_audit_W_uF = 0.0;
   double cap_energy_audit_W_apex_pinned = 0.0;
   tenryu::hydro::I1BSpuriousSensorSummary i1b_hydro_nonaffine_sensor{};
-  // Stage 24 axis-classification fields. Populated when telemetry is enabled
+  // Axis-classification fields. Populated when telemetry is enabled
   // or dispatcher_state_sensitive_bypass_enabled is active.
   bool state_sensitive = false;
   bool dt_sensitive = false;

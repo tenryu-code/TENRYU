@@ -25,7 +25,7 @@ constexpr int kCriticalHitsScalar = 2;
 constexpr int kInvalidScalar = 3;
 constexpr int kMaxShellOverlaps = 8;
 
-// Bouguer-invariant reduction for the CC perf wave-3 S1 design (2026-08-04).
+// Bouguer-invariant reduction (2026-08-04 design; NUMERICS §5.3.5).
 // In a shell with constant refractive index n, a = b / n is constant and
 // ds = sqrt(r2^2 - a^2) - sqrt(r1^2 - a^2) is the exact leg length.
 __global__ void fast_trace_1d_kernel(

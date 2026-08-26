@@ -4998,7 +4998,7 @@ Ring7SeamRemapResult apply_ring7_seam_quotient_remap(
   Ring7SeamPatch patch = discover_ring7_seam_patch(state, cfg);
   // Core-growth guard: once ring absorption has grown the pseudo-core into
   // the seam rings, the seam machinery's invariants (central exclusion) no
-  // longer hold — decline instead of asserting mid-endgame.
+  // longer hold — decline instead of asserting mid-terminal phase.
   if (patch.valid && state.mesh.topo.multiblock.has_value()) {
     const auto& mb_guard = *state.mesh.topo.multiblock;
     for (const int cell : patch.p_seam_cells) {

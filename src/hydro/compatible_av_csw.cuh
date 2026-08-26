@@ -138,7 +138,7 @@ __host__ __device__ inline double csw98_winding_orientation(const double* r,
     ::tenryu::core::tenryu_abort(
         "fabs(area2) > threshold",
         "csw98_winding_orientation: zero/near-zero signed area (degenerate cell) "
-        "must not silently orient +1 (AI-review Amendment A)",
+        "must not silently orient +1",
         __FILE__, __LINE__);
   #endif
   }

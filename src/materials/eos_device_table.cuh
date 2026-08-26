@@ -531,7 +531,7 @@ device_inverse_reclose_with_low_density_extrap(
   return out;
 }
 
-// ---- BUG-24 high-temperature ideal-tail extension -------------------------
+// ---- High-temperature ideal-tail extension --------------------------------
 // Beyond the table's temperature ceiling T_top(rho) the tabulated e/P/cv
 // saturate, so every table-projecting energy write deletes the excess of a
 // super-ceiling cell. These helpers extend the state surface with a
@@ -706,7 +706,7 @@ __device__ inline double device_eos_sound_speed(const DeviceEOSTableView& tab,
   // evaluated at the query point clamped into the enclosing cell, matching the
   // clamped bracket the interpolation itself uses. Cell-wide linear secants
   // (P1-P0)/(rho1-rho0) would give the mean slope near the cell's logarithmic
-  // mean, not the slope at the query point (AI review k11 §3.2).
+  // mean, not the slope at the query point (2026-07-26 review).
   const double dln_rho = log_rho1 - log_rho0;
   const double dln_T = log_T1 - log_T0;
   const double rho_q = fmin(fmax(rho, rho0), rho1);

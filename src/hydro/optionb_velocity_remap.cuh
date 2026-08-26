@@ -675,7 +675,7 @@ __host__ __device__ inline void gather_corner_momentum(
   }
 }
 
-// If v_min/v_max are omitted, Stage 3a uses the current cell's own corner
+// If v_min/v_max are omitted, the current cell's own corner
 // velocity range as a placeholder bound; expanded donor-stencil bounds are
 // expected to replace that at wiring time.
 __host__ __device__ inline AffineHourglassFilterResult

@@ -290,7 +290,7 @@ __host__ __device__ inline void barycentric_weights(const double* r,
   const double w_tol =
       128.0 * detail::kDoubleEps * (fabs(w_sum) + 1.0e-300);
   if (!(fabs(w_sum) > w_tol) || !tenryu::hydro::rz::finite_double(w_sum)) {
-    // Stage 1 does not define production out-of-hull behavior; keep results
+    // Production out-of-hull behavior is not defined; keep results
     // finite for degenerate/outside queries and let later remap stages reject.
     detail::fill_uniform(nverts, lambda);
     return;

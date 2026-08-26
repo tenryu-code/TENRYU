@@ -12,7 +12,7 @@ NOT_LITERAL_LE: this is a radiation-pressure-projected proxy. It drops
 radiation pressure from matter momentum while retaining matter-radiation energy
 exchange. The default gas convention is hydrogen-like, A_amu=1.
 
-Audit (Phase 2c-extension-reference, 2026-05-08): The interior T_rad column of
+Audit (2026-05-08): The interior T_rad column of
 the produced table is NOT a defensible reference and must not be used for gating.
 The downstream branch RK4 shoot does not converge for any tested initial fraction
 (error stays at ~1296x target), the upstream branch RK4 underflows in one step,
@@ -340,7 +340,7 @@ def solve_le_proxy(cfg: LEProxyConfig) -> dict:
         ),
         "interior_T_rad_unreliable": True,
         "T_rad_valid_for": "far_state_endpoints_only",
-        "audit_reference": "docs/validation/2d_rz/phase2c-extension-reference/closure_summary.md (Phase 2c-extension-reference Wave 1)",
+        "audit_reference": "docs/validation/2d_rz/phase2c-extension-reference/closure_summary.md",
     }
     x_s = np.array(x_cm[sample], copy=True)
     rho_s = np.array(rho[sample], copy=True)

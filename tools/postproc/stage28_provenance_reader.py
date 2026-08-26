@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Summarize Stage 28 ALE provenance diagnostics from a history HDF5 file.
+"""Summarize ALE provenance diagnostics from a history HDF5 file.
 
 Usage: python tools/postproc/stage28_provenance_reader.py --input history.h5
 """

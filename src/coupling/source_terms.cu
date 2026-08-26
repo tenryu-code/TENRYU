@@ -944,7 +944,7 @@ __global__ void qei_coupling_substep_kernel(
         gamma_c, dt, qei_multiplier);
   }
 
-  // AI review k15 1.4/P0-4 (2026-07-26): bracket the transfer into the
+  // 2026-07-26 review: bracket the transfer into the
   // physically admissible interval instead of clamping each side
   // independently — the old independent fmax floors created or destroyed
   // pair energy whenever one side hit zero (reachable for table-EOS cells
@@ -1144,7 +1144,7 @@ __global__ void qei_coupling_substep_kernel_per_material(
       qei_multiplier);
   const double dE = qei_specific * mass_m;
   if (isfinite(dE)) {
-    // AI review k15 1.4/P0-4 (2026-07-26): shared bracketed transfer —
+    // 2026-07-26 review: shared bracketed transfer —
     // exact per-material pair conservation (see qei_coupling_substep_kernel).
     const double dE_hi = fmax(Ee_per_material[idx], 0.0);
     const double dE_lo = -fmax(Ei_per_material[idx], 0.0);

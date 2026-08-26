@@ -4,6 +4,7 @@
 
 ---
 
+
 ## 1. 設計原則（Design Principles）
 1. **GPU-first（CUDA-only）**  
    主要計算（Hydro更新、FLD/S_N 輻射ソルバ（tridiagonal/CG solve・S_N sweep）、レーザーレイトレース）はNVIDIA GPU上で実行する。  
@@ -164,11 +165,11 @@ tenryu/
   - `auto_zone.hpp`：`AutoZoneRegion`, `AutoZoneConfig`, `AutoZoneDiagnostics` 構造体、`compute_auto_zone_nodes()` API
   - `auto_zone.cpp`：等質量球殻分割、非対称幾何級数ブリッジ、二分法 \(q\) 求解、制約調整、ファイナライゼーション
   - 初期化時に `Namelist::Builder` から呼び出され、生成されたノード配列を `MeshConfig::explicit_nodes` に格納。ランタイムでは使用されない
-- `Core::DeviceScratch`（`src/core/device_scratch.{hpp,cu}`、W-F opt#1/W-F-2D）：
+- `Core::DeviceScratch`（`src/core/device_scratch.{hpp,cu}`、per-call cudaMalloc/cudaFree を scratch pool に置換する host オーバーヘッド削減）：
   プロセス寿命・タグ指名・grow-only のデバイス／ピン止めホスト scratch プール
   （`device_scratch_acquire(tag, bytes)` / `host_pinned_scratch_acquire`、内容はゼロ化されない
   = cudaMalloc と同一契約、単一ホストスレッド前提、解放は `device_scratch_shutdown()` のみ）。
-  1D は step 経路の生 cudaMalloc/cudaFree 対を直接置換（opt#1）。2D 拡張（W-F-2D、2026-07-07）は
+  1D は step 経路の生 cudaMalloc/cudaFree 対を直接置換（最初の scratch-pool 適用）。その 2D 拡張（2026-07-07）は
   RAII ラッパ三種（`core::Field1D<Tag>` / `core::DeviceArray<T>` / `parallel::DeviceArray`）に
   **opt-in の pool-tag コンストラクタ**を追加する形で行う：`core::CellField1D f{"mod:purpose"};`
   は reset()/operator= がプールから取得し（ゼロ初期化契約は明示 memset で維持）、デストラクタは
@@ -211,7 +212,7 @@ tenryu/
   - 出力HDF5へ保存（再現性）
 - `Namelist::GeometryVolumeCut`
   (`src/core/namelist/geometry_eval_volume_cut.{hpp,cpp}`)
-  - Stage 30 PLIC-enabled t0 material volume-cut sampler.  It is called only
+  - The PLIC-enabled t0 material volume-cut sampler.  It is called only
     from initial geometry evaluation, samples already-frozen geometry
     callables, and writes volume-averaged rho/Te/Ti/material fractions into
     `State`; it has no runtime Python dependency.
@@ -836,7 +837,7 @@ struct Config {
             bool sort_after_migration = false; // デバッグ用 global_id ソート
         } reproducibility;
 
-        // --- gpu_optimization（Phase A/B）---
+        // --- gpu_optimization ---
         struct GpuOptimization {
             bool particle_sort_by_cell = true;  // セルソート（NUMERICS §6.5）
             std::string tally_mode = "warp";    // "global" | "warp"（NUMERICS §10.3）
@@ -853,4 +854,3 @@ struct Config {
 > - 各モジュールの `init()` 関数は `const Config&` を受け取り、自身の内部状態を構築する
 
 ---
-

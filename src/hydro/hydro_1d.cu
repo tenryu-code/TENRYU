@@ -1224,7 +1224,7 @@ __global__ void predictor_update_kernel(double* __restrict__ v_r,
       j, v_r, x_r, u_half, u_old, r_old, accel, node_active, n_nodes, dt);
 }
 
-// k01 P0-2 (AI review 2026-07-26, time_integrator="midpoint_v2"): advance the
+// 2026-07-26 review (time_integrator="midpoint_v2"): advance the
 // internal energies to the half step with the t^n pressure/AV over the
 // predictor's geometric half-step volume change, so the mid-step EOS closure
 // evaluates a genuine time-centered P^{n+1/2} = P(rho^{n+1/2}, e^{n+1/2})
@@ -1672,7 +1672,7 @@ __global__ void apply_qei_transfer_2t_kernel(
                   fmax(rho[i], 0.0), fmax(Te[i], 0.0), fmax(Ti[i], 0.0), z, A,
                   gamma, dt, qei_multiplier);
   }
-  // AI review k15 1.4/P0-4 (2026-07-26): bracket the transfer into the
+  // 2026-07-26 review: bracket the transfer into the
   // admissible interval instead of clamping ee/ei independently — the old
   // floors created pair energy whenever one side hit zero (tallied into
   // E_floor_injected). One shared applied transfer keeps ee + ei exactly
@@ -1837,7 +1837,7 @@ __device__ __forceinline__ double compute_ion_artificial_heat_face_power_1d(
 
   const double beta = q2_face / fmax(compression, kIonArtHeatEps);
   const double kappa_raw = heat_c * S_comp * S_contact * beta * cv_face;
-  // k01 §4.4 / k03 F-14 (AI review 2026-07-26): the former slab-style cap
+  // 2026-07-26 review: the former slab-style cap
   // 0.25 rho_f cv_f dn^2 / dt ignores the actual face area and the smaller
   // neighbor heat capacity, so on graded/spherical meshes the explicit
   // exchange could exceed the light cell's stability limit. Bound the pair
@@ -1998,7 +1998,7 @@ __device__ inline void compute_electron_odd_even_flux_1d_kernel_body(
   const double exchange_mass = rho_face * vol_face;
   const double sensor = fmin(w_left, w_right);
   double flux = C_ee_oe * sensor * exchange_mass * (ee[right] - ee[left]);
-  // k01 §4.1 (AI review 2026-07-26): donor/hull cap. With strong mass
+  // 2026-07-26 review: donor/hull cap. With strong mass
   // grading rho_face * vol_face can exceed the light cell's own mass, so
   // the uncapped one-shot exchange could push its e_e past the neighbor
   // value (and below zero). Capping the transfer at the reduced-mass value
@@ -3057,7 +3057,7 @@ void enforce_eos_closure(core::State& state,
                          const bool preserve_table_energy = false,
                          const bool report_inverse_reclosure = false) {
   // Single choke point: every closure consumer gets consistent per-cell
-  // effective properties (BUG-1 fix — no more materials[0]-for-all-cells).
+  // effective properties (multi-material fix — no more materials[0]-for-all-cells).
   state.ensure_cell_material_props(cfg);
   const bool energy_authoritative_closure =
       (cfg.numerics.hydro.eos_closure_mode == "energy_authoritative");
@@ -3328,7 +3328,7 @@ __global__ void follow_void_nodes_1d_kernel(double* __restrict__ x_r,
                                             const double rho_void) {
   // Void cells carry no forces, so their interior nodes never move on their
   // own and a Lagrangian edge expanding into the void region inverts cells
-  // (BUG-5). Re-space the void-interior nodes uniformly between the plasma
+  // Void-interior respacing fix: re-space the nodes uniformly between the plasma
   // edge node (owned by the last real cell — never touched here) and the
   // outer boundary node (owned by the free-boundary physics). Void masses
   // are re-pinned to rho_void * V so the placeholder cells keep their floor
@@ -3573,7 +3573,7 @@ tenryu::coupling::HydroStepResult Hydro1D::lagrangian_step(
   const double hk_velocity_damper_c = cfg.numerics.hydro.hk_velocity_damper_C;
   const bool hk_velocity_damper_enabled = hk_velocity_damper_c > 0.0;
   const int q_heat_to_electron = (av_heat_to == "electron") ? 1 : 0;
-  // k01 P0-2/P0-3 (AI review 2026-07-26): opt-in midpoint_v2 integrator —
+  // 2026-07-26 review: opt-in midpoint_v2 integrator —
   // stage-advance the energies to t^{n+1/2} before the mid-step closure and
   // use the stage P/Q directly (no (P^n + P^{n+1/2})/2 quarter-step average)
   // in the corrector energy update. Default legacy_pc is bit-preserving.
@@ -4085,7 +4085,7 @@ tenryu::coupling::HydroStepResult Hydro1D::lagrangian_step(
     hydro_step_probe(probe_step, "P4_an",
                      {{"a", {a_n.data(), a_n.size()}}});
   }
-  // W-H Braginskii ion viscosity (config-gated, default-inert, env diagnostic
+  // Braginskii ion viscosity (config-gated, default-inert, env diagnostic
   // overrides): trace-free stress force added to the pressure/AV acceleration
   // at both stages, before the damping filters, so it is time-centered like
   // the pressure.
@@ -4339,7 +4339,7 @@ tenryu::coupling::HydroStepResult Hydro1D::lagrangian_step(
   if (midpoint_v2) {
     // midpoint_v2: the stage closure already sits at t^{n+1/2}; averaging it
     // with t^n values would re-introduce the legacy quarter-step bias
-    // (k01 P0-3), so the corrector energy uses the stage values directly.
+    // (2026-07-26 review), so the corrector energy uses the stage values directly.
     copy_array_kernel<<<blocks_cells, 256>>>(P_half.data(), state.Pe.data(),
                                              n_cells);
     copy_array_kernel<<<blocks_cells, 256>>>(Pi_half.data(), state.Pi.data(),
@@ -5339,7 +5339,7 @@ tenryu::coupling::HydroStepResult Hydro1D::lagrangian_step(
                         " for soft retry");
     }
   }
-  // k13 F-05/F-09 (AI kernel review 2026-07-26): end-of-step viscous
+  // 2026-07-26 kernel review: end-of-step viscous
   // stability audit. The scalar dt formula bounds only the longitudinal
   // diffusion at the step-start state; the exact Gershgorin row-sum of the
   // assembled operator additionally sees the spherical/cylindrical hoop

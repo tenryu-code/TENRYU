@@ -1,4 +1,4 @@
-// W-H Braginskii viscosity verify gates.
+// Braginskii viscosity verify gates.
 //
 // B2 (braginskii_wave): planar standing sound wave with the constant-eta
 //   model. The wave energy E_w = KE + acoustic PE decays as exp(-2 gamma t)

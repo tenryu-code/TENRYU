@@ -750,7 +750,7 @@ A100: L2キャッシュ 40MB。
 
 ## 11. パフォーマンス推定
 
-> **【状態注記 2026-07-10】** 本節の見積りは退役 imc_ddmc（粒子輸送、alive 粒子数前提）の歴史的推定。現行の性能実測は `PERFORMANCE.md`（W-F 系列の wall/steps + host API 呼数）と `ops/runpod/bench/CALIBRATION.md` を正とする。
+> **【状態注記 2026-07-10】** 本節の見積りは退役 imc_ddmc（粒子輸送、alive 粒子数前提）の歴史的推定。現行の性能実測は `PERFORMANCE.md`（host オーバーヘッド削減系列の wall/steps + host API 呼数）と `ops/runpod/bench/CALIBRATION.md` を正とする。
 
 ### 11.1 Phase別時間内訳推定
 
@@ -854,7 +854,7 @@ Scratch 単体では RadixSort が支配的 → ~24 × N_particles bytes。
 
 ## 13. 最適化ロードマップと実装段階
 
-### Phase A（v1.0 baseline）— 設計済み
+### v1.0 baseline — 設計済み
 以下は v1.0 初版の仕様として本文書内で定義済みである。
 
 1. **Composite Key Sort**（§0.5、NUMERICS §6.5）: 合成キーソートによるセルソート + dead compaction + モード分離の融合。
@@ -875,7 +875,7 @@ Scratch 単体では RadixSort が支配的 → ~24 × N_particles bytes。
    - 適用: Hydro, Conduction のセルベースカーネル
    - 効果：4 GPU時 ~1.2 ms/step 隠蔽（2-3%改善）、GPU数増加で効果増大
 
-### Phase C（高度な最適化）— 将来検討
+### 高度な最適化 — 将来検討
 以下は将来の検討事項として記録する。
 
 6. **Block-level タリー集約（将来拡張）**: 共有メモリビンヒストグラム（§6.4、§10.4、NUMERICS §10.3.4）

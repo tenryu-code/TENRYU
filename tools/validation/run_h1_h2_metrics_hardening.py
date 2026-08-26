@@ -61,7 +61,7 @@ def harden_h1(run_id: str, mesh_pair: tuple[int, int], runs_root: Path) -> dict:
     z_cell = 0.25 * (x_z[:-1,:-1] + x_z[1:,:-1] + x_z[:-1,1:] + x_z[1:,1:])
     z_axis = z_cell[0, :]
 
-    # Cylindrical-volume-weighted radial mean (Codex-recommended)
+    # Cylindrical-volume-weighted radial mean
     # V_ij ∝ R_{i+1}^2 - R_i^2 ; for uniform R-grid with r_min=0, r_max=R_OUT:
     R_OUT = 0.1  # r_max per H1 deck
     r_edges = np.linspace(0, R_OUT, nr + 1)

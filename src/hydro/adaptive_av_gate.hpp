@@ -24,7 +24,7 @@ struct AdaptiveAVFields {
 
 // dt: current hydro step [s]; used only when
 // Numerics.hydro.adaptive_av.hysteresis_tau > 0 to form the
-// timestep-invariant gate blend w(dt) = 1 - exp(-dt/tau) (k01 §8.1,
+// timestep-invariant gate blend w(dt) = 1 - exp(-dt/tau) (2026-07-26 review,
 // AI review 2026-07-26). hysteresis_tau == 0 keeps the legacy fixed
 // per-step hysteresis_w blend.
 void build_adaptive_av_fields_1d(core::State& state,

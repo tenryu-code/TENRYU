@@ -1,4 +1,4 @@
-// W-H: Braginskii plasma shear viscosity kernels (1D planar / cylindrical /
+// Braginskii plasma shear viscosity kernels (1D planar / cylindrical /
 // spherical), ion + electron channels. See braginskii_viscosity.cuh,
 // docs/design/wh_braginskii_viscosity_design.md and
 // docs/design/electron_viscosity_1d_20260712.md for the derivations.
@@ -43,7 +43,7 @@ void brag_sync(const char* msg) {
 //   cylindrical once plus the zero-strain axial W_zz = -(2/3)div; planar
 //   twice with h = 0). pi = -eta_eff * W with eta_eff per SPECIES
 //   (0 = ion, 1 = electron, 2 = both, fully separated if-constexpr branches
-//   so SPECIES=0 keeps the W-H arithmetic source-identical); heating powers
+//   so SPECIES=0 keeps the ion-only arithmetic source-identical); heating powers
 //   (eta_i/2) W:W vol -> heat_rate and (eta_e/2) W:W vol -> heat_rate_e.
 template <int SPECIES, bool kZMom>
 __global__ void braginskii_cell_stress_1d_kernel(
@@ -309,7 +309,7 @@ __global__ void braginskii_dt_1d_kernel(
 }
 
 // Exact Gershgorin row-sum of the assembled node-acceleration operator
-// (AI kernel review 2026-07-26, k13 F-05/F-09). One thread per NODE j mirrors
+// (2026-07-26 kernel review). One thread per NODE j mirrors
 // braginskii_add_accel_1d_kernel: accel_j = -F_j / M_j with
 //   F_j = A_j (pi_rr,R - pi_rr,L) + Vn_j alpha (pbar_rr - pbar_tt) / r_j,
 // linearized in the node velocities at frozen eta. Per adjacent cell c
@@ -543,7 +543,7 @@ __global__ void braginskii_history_diag_1d_kernel(
 
 namespace {
 
-// F-01 (AI kernel review 2026-07-26): strict env parsing — the previous
+// 2026-07-26 kernel review: strict env parsing — the previous
 // atof/atoi path accepted NaN, partial parses ("1.5x"), and negatives, which
 // turn the stress anti-diffusive (eta < 0 => pi = +|eta| W, Q < 0) while the
 // dt kernel's (eta > 0) guard silently drops the stability limit.
@@ -690,7 +690,7 @@ Params params_from_config(const core::Config& cfg) {
   p.ti_floor_ev = cfg.numerics.floors.Ti;
   p.te_floor_ev = cfg.numerics.floors.Te;
   // Env diagnostic overrides (TENRYU_FLD_* hook precedent): each set
-  // variable wins over the namelist value. Strict parse + validation (F-01).
+  // variable wins over the namelist value. Strict parse + validation.
   if (p.enabled) {
     apply_env_overrides(p);
   }
@@ -716,7 +716,7 @@ void compute_cell_stress_1d(double* pi_rr,
                             const Params& p,
                             const double* zmom_r4) {
   if (!p.enabled || n_cells <= 0) {
-    // F-02: the header contract is "gated on Params.enabled"; enforce it here
+    // Enabled-contract hardening: enforce the header's Params.enabled gate here
     // instead of relying on every caller (callers all gate today, so this is
     // bit-neutral hardening).
     return;
@@ -780,7 +780,7 @@ void add_node_accel_1d(double* accel,
                        const int skip_outer,
                        const Params& p) {
   if (!p.enabled || n_cells <= 0) {
-    return;  // F-02: same enabled-contract hardening as compute_cell_stress_1d
+    return;  // Same enabled-contract hardening as compute_cell_stress_1d
   }
   const int n_nodes = n_cells + 1;
   const int blocks = (n_nodes + 255) / 256;
@@ -804,7 +804,7 @@ double compute_dt_braginskii_raw(const double* x_r,
   if (!p.enabled || n_cells <= 0) {
     return inf;
   }
-  // F-21 / W-F conformance: scratch pool instead of per-call cudaMalloc/Free
+  // Scratch pool instead of per-call cudaMalloc/Free (host-overhead rule)
   // (this runs every driver step when viscosity is enabled).
   double* d_min = static_cast<double*>(
       core::device_scratch_acquire("braginskii:dt:min", sizeof(double)));
@@ -991,7 +991,7 @@ HistoryDiagnostics compute_history_diagnostics(const core::State& state,
   }
   const std::size_t n = static_cast<std::size_t>(n_cells);
   const std::size_t bytes = n * sizeof(double);
-  // F-21 / W-F conformance: scratch pool instead of per-call cudaMalloc/Free
+  // Scratch pool instead of per-call cudaMalloc/Free (host-overhead rule)
   // (the 2D parity design already specifies scratch reuse for this path).
   double* d_buf = static_cast<double*>(
       core::device_scratch_acquire("braginskii:history:diag5", 5 * bytes));
@@ -1011,7 +1011,7 @@ HistoryDiagnostics compute_history_diagnostics(const core::State& state,
                     "braginskii: copy diag hydro_active failed");
   }
   DeviceParams p_run = to_device_params(p);
-  // F-10 (AI kernel review 2026-07-26): the "physical channel" diagnostics
+  // 2026-07-26 kernel review: the "physical channel" diagnostics
   // must be the uncapped, unscaled classical Braginskii values with the NRL
   // Coulomb log — otherwise the regime map inherits the mesh through the mfp
   // cap (default 20 cells) and the eta0_scale/lnlambda_fixed knobs, and the

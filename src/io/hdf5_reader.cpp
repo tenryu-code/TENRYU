@@ -1465,7 +1465,7 @@ void validate_schema_and_frozen_config(const hid_t file, const core::Config& cfg
     TENRYU_ASSERT(
         false,
         "restart carries PLIC-enabled state; multiblock topologies do not "
-        "support PLIC (AI-review k02 F-13 restart guard); restart on a "
+        "support PLIC (PLIC restart guard); restart on a "
         "structured topology or fork the lineage");
   }
   const auto config_swept_volume_contract =

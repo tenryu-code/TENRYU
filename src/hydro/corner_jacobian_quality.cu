@@ -26,7 +26,7 @@ namespace {
 constexpr double kCornerJacobianRatioEps = 1.0e-300;
 constexpr double kInHydroCornerJQuadraticDegeneracyEps = 1.0e-12;
 constexpr double kInHydroCornerJDtSafety = 0.7;
-constexpr double kStage24TelemetryEpsRel = 1.0e-6;
+constexpr double kAxisTelemetryEpsRel = 1.0e-6;
 constexpr int kNoFailingCornerKey = std::numeric_limits<int>::max();
 constexpr int kInHydroGaussSlotOffset = 4;
 constexpr int kInHydroRzSlot = 8;
@@ -2538,11 +2538,11 @@ tenryu::coupling::HydroStepResult compute_in_hydro_candidate_mesh_guard(
       }
       const double g_dot_est = (global_g1_rel - global_g0_rel) / dt;
       telemetry_dt_sensitive =
-          global_g0_rel > kStage24TelemetryEpsRel &&
-          global_g1_rel <= kStage24TelemetryEpsRel;
+          global_g0_rel > kAxisTelemetryEpsRel &&
+          global_g1_rel <= kAxisTelemetryEpsRel;
       telemetry_repair_sensitive =
-          global_g0_rel <= kStage24TelemetryEpsRel;
-      if (global_g0_rel > kStage24TelemetryEpsRel && g_dot_est < 0.0) {
+          global_g0_rel <= kAxisTelemetryEpsRel;
+      if (global_g0_rel > kAxisTelemetryEpsRel && g_dot_est < 0.0) {
         global_dt_star_est = global_g0_rel * dt / -g_dot_est;
       }
     }

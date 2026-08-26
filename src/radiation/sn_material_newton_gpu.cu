@@ -433,7 +433,7 @@ __global__ void sn_material_newton_kernel(
 
   const double rho_c = fmax(nonnegative_finite(rho[c]), kTiny);
   const double Zbar = (zbar != nullptr) ? zbar[c] : 1.0;
-  // BUG-1 Stage 2: per-cell effective ideal-gas properties.
+  // Shared per-cell effective ideal-gas properties (multi-material fix).
   const double A_c = (A_eff != nullptr) ? fmax(A_eff[c], 1.0e-12) : 1.0;
   const double gamma_c =
       (gamma_eff != nullptr) ? fmax(gamma_eff[c], 1.0 + 1.0e-12) : 5.0 / 3.0;

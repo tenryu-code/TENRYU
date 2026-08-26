@@ -1140,9 +1140,8 @@ void ddmc_event_loop(
 - **Newton は coupling solve の外**でドライバが呼ぶ（1D は outer 内）— `update_material=false` で sweep し、スイープ後連鎖（拡散/AP/リミッタ/E*、各段後に `zero_axis_faces_checked_kernel` :308 で r=0 軸面ゼロ）→ Newton :1712。
 - 境界: 真空/反射/Marshak（`kSNBoundary*`）、軸対称は軸面フラックスゼロ化。
 
-#### 6.8.3 設計上の注意（W-F/perf 文脈）
+#### 6.8.3 設計上の注意（host オーバーヘッド削減/perf 文脈）
 
-1. **1D 既定 sweep は 1 群=1 thread の逐次**（並列度=群数のみ；LC のみ warp 波面）— 1D S_N の GPU 占有率は原理的に低く、host 律速（W-F 系列）と併せて 1D が local-GPU tier に留まる一因。
+1. **1D 既定 sweep は 1 群=1 thread の逐次**（並列度=群数のみ；LC のみ warp 波面）— 1D S_N の GPU 占有率は原理的に低く、host 律速（ホスト側オーバーヘッド削減系列で追跡）と併せて 1D が local-GPU tier に留まる一因。
 2. **2D は (polar×群) block × KBA 波面**で並列度が立つ（方位 m と波面 stage は逐次）。
 3. **DSA 実装の 1D/2D 非対称**（直接 tridiag vs 50 回 Jacobi）と **FLD の D 評価の 1D/2D 非対称**（face-centered vs cell-centered）は将来の統一候補として明示しておく。
-

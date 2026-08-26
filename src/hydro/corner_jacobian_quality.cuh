@@ -31,7 +31,7 @@ struct CornerJacobianQualityResult {
   double suggested_dt = 0.0;
   int first_failing_cell = -1;
   int first_failing_corner = -1;
-  // Stage 24 axis-classification fields. Populated only when the telemetry
+  // Axis-classification fields. Populated only when the telemetry
   // env gate or dispatcher state-sensitive bypass is active.
   double g0_rel = 0.0;
   double g1_rel = 0.0;

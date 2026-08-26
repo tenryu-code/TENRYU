@@ -858,7 +858,7 @@ void compute_compatible_subzonal_pressure_force_2d(
   }
   TENRYU_ASSERT(
       state.corner_stride == 4,
-      "corner_stride != 4: subzonal-pressure corner path is staged (ALE P2-1c/P2-4+)");
+      "corner_stride != 4: subzonal-pressure corner path is staged for a later revision");
   const int n_cells = static_cast<int>(state.rho.size());
   if (n_cells <= 0) {
     state.max_corner_density_spread_step = 0.0;

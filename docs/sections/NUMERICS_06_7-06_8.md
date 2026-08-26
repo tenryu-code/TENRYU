@@ -38,19 +38,19 @@ table_nlte/tmat と同じ RHS emission/effective-scattering split に適用す�
 「\(\sigma_{a,P}\) 単一 \(f_c\) + McClarren-Urbatsch smooth blend」は実装と
 乖離していた — blend は stiff 極限 \(zf\to0\) の交換凍結のため 1D では退役済み、
 時間形状は既定 `"be"` \(f=1/(1+z)\)（下記 fleck_form 参照）。2026-07-26
-doc 真実復元、AI review k05）。この kernel は FLD の
+doc 真実復元）。この kernel は FLD の
 stiff-cell 要件のため IMC 共有の `compute_fleck_kernel` と分離し、IMC safety の
 \(\beta\le1\) cap と `f_min_fleck` 下限を適用しない。table_nlte/tmat の NLTE
 係数経路（`eval_nlte_opacity_emission` — cell 単一 \(f_c\) を emission-mean
 \(\sigma_{P,\rm em}=\sum_g\eta_g/(a_{eV}cT_e^4)\) から作る）も同様に
-\(\beta\le1\) cap を適用しない（2026-07-26、AI review k05 4.4: ideal-gas
+\(\beta\le1\) cap を適用しない（2026-07-26： ideal-gas
 fallback 分岐に残存していた IMC 系譜 cap を除去。cap は「\(f>1\) 防止」に
 不要 — \(z\ge0\) で常に \(0<f\le1\) — であり、高温・低 \(C_v\) セルで f を
 過大化し Fleck 線形化保護を弱めるだけだった。table cv / state cv 経路は
 cap 非経由のため挙動不変）。放射エネルギー式に
 \(\rho c_v\) 型の項は入れない。
 
-> **fleck_cv_source（2026-07-10、HR-W1c；既定フリップ 2026-07-11）**: 本カーネルの \(\beta=4a_{\rm eV}T_e^3/(\rho c_{v,e})\)
+> **fleck_cv_source（2026-07-10 導入；既定フリップ 2026-07-11）**: 本カーネルの \(\beta=4a_{\rm eV}T_e^3/(\rho c_{v,e})\)
 > に入る電子比熱の出所は `Radiation.multigroup_diffusion.fleck_cv_source` で選ぶ。
 > `"table"`（**既定**、2026-07-11 フリップ — 外部AI裁定、docs/design/fleck_cv_default_flip_20260711.md）は
 > 電子 EOS テーブル存在時に現在 \(T_e\) の `device_eos_cv`（matter 更新 `update_matter_body` と
@@ -159,7 +159,7 @@ Marshak-like escape \(F_{out}=cE/2\)、`"reflect"` では face flux 0 とする�
 `boundary.z_bottom` / `boundary.z_top` の面別指定で与える。`"vacuum"` では
 \(F_{out}=cE/2\)、`"reflect"` では face flux 0 とする。
 
-FLD state-supply BC（Phase 2c Wave 2）は 2D_RZ の Z 端のみ、灰色1群の
+FLD state-supply BCは 2D_RZ の Z 端のみ、灰色1群の
 Dirichlet 放射境界として実装する。`boundary.z_bottom` または
 `boundary.z_top` が `"state_supply"` の面 \(f\) では、同じ面の
 `Numerics.hydro.boundary_2d.{z_bottom,z_top}` の供給温度 \(T_s\) [eV] から
@@ -188,8 +188,8 @@ state-supply boundary coefficient closure. The production default
 `"local_D_current"` is the existing local-D closure: the boundary Dirichlet row
 uses the current boundary-cell \(D_{c,g}\) in the diagonal/RHS terms above, so
 the operator coefficients remain local to the solved state. `"harmonic_ghost_D_test"`
-and `"radial_mean_D_test"` are **DIAGNOSTIC-ONLY** Round 13 candidate-A
-isolation policies, not production defaults. In the currently validated
+and `"radial_mean_D_test"` are **DIAGNOSTIC-ONLY** policies for isolating
+the diffusion-coefficient contribution, not production defaults. In the currently validated
 configuration (`groups=1` with constant opacity), `"harmonic_ghost_D_test"`
 uses the hydro supply \(\rho_s\) plus the boundary-row local effective
 \(\kappa_R/\bar Z\) to form a ghost coefficient and then harmonic-averages it
@@ -207,7 +207,7 @@ The 2D_RZ FLD CG inner tolerance is exposed as
 `Radiation.multigroup_diffusion.cg_inner_tol`. The default \(10^{-10}\)
 preserves the previous solver behavior; user values must be positive.
 
-FLD Marshak source BC（Phase 2a-2）は 2D_RZ の Z 端のみ、灰色1群の定常入射
+FLD Marshak source BCは 2D_RZ の Z 端のみ、灰色1群の定常入射
 flux として実装する。`boundary.z_bottom` または `boundary.z_top` が
 `"marshak"` の面 \(f\) では、入力
 `Radiation.multigroup_diffusion.marshak.flux_erg_per_cm2_s` を
@@ -247,7 +247,7 @@ Tr(t) 経路が提供する）。
   灰色）であり、Tr 経路は solve 冒頭に解決した
   \(F_{\mathrm{inc}}=(c/4)a_{eV}T_r^4\) を既存スカラー slot へ供給する
   （sweep kernel 不変）。v1 制限: `groups==1` 必須（多群 spectral 注入は
-  将来 wave）、両 z 面 marshak + 面別テーブルは `ConfigError`（単一スカラー
+  将来拡張）、両 z 面 marshak + 面別テーブルは `ConfigError`（単一スカラー
   共有のため; 定数/スカラーテーブル源は両面共通で可）。ledger
   `sn_marshak_in_step` は flux×面積×\(\Delta t\) の既存定義のまま正しい。
 
@@ -317,11 +317,11 @@ The drive temperature accepts the same constant-or-time-callable sources as the 
 plateau 一致 2.6e-4（≤5e-3）+ 全域 ≤5%。**gate 設計注記**: 境界駆動定常は
 球面 LC 角度再配分の曲率比例エネルギー欠損を初めて露呈した（中心含む球で
 中心セル −89%、r0=0.35 で −47%、r0=10 で −3.3%; 外側セルは常に target 一致
-= BC 無実、物質は局所平衡）。これは既存輸送特性で **BUG-8** として独立
+= BC 無実、物質は局所平衡）。これは既存輸送特性で **別個の既知問題**として独立
 workstream 追跡（純吸収体 ballistic / α和恒等式監査 / S_N 次数掃引が診断
 ladder）。vacuum 経路・既存 golden への影響なし（psi_in=nullptr で bitwise 温存）。
 
-**BUG-8 解決（2026-07-03, 保存形 1D 球面 sweep）** — 旧 LC sweep は slab 形
+**保存形 1D 球面 sweep による解決（2026-07-03）** — 旧 LC sweep は slab 形
 特性（\(\mu\,d\psi/ds+\kappa\psi=q\)）で球面保存形の幾何ストリーミング項
 \(\mu\psi\,dA/V\) を演算子から欠いており、一様等方場で角度発散
 \(-\mu_m\psi_0\,dA/V\) が相殺されず、曲率比例の中心 flux dip
@@ -356,7 +356,7 @@ E\*-面 flux 閉包の定常不動点は輸送モーメント \(E=\varphi/c\) �
 実測 6.5e-10）、Part B は limiter 不活性 dt での定常
 \(\mathrm{rad\_E}=\varphi/c\) 恒等（実測 3.6e-16）。
 
-**BUG-9（2026-07-03, FLD 限流子の face 中心評価化）** — 1D FLD は
+**FLD 限流子の face 中心評価化（2026-07-03）** — 1D FLD は
 Levermore–Pomraning 限流子引数 \(R=|\nabla E|/(\sigma E)\) を**セル中心**で
 評価し D を調和平均で面へ落としていた。放射前線では受け手セルの小さな E が
 その D を \(\sim cE_{cold}/|\nabla E|\) に潰し、調和平均が面 flux を
@@ -372,12 +372,12 @@ Levermore–Pomraning 限流子引数 \(R=|\nabla E|/(\sigma E)\) を**セル中
 
 
 
-> **Phase 2a-1.5c 実装修正**：旧 2D_RZ FLD は shared internal face でも各隣接 cell が
+> **実装修正**：旧 2D_RZ FLD は shared internal face でも各隣接 cell が
 > 自分の cell-centered face area を使っていたため、z-deformed Lagrangian mesh で
 > \(A_{L\to R}\ne A_{R\to L}\) となり、`sum_face_div` に非保存な残差が生じた。
 > 共有 edge 面積 \(A_{edge}\) への統一により、この face-area asymmetry を除去した。
 
-> **Degenerate-face handling (Phase 2a-1.5d, 2026-05-07)**: Interior FLD
+> **Degenerate-face handling (2026-05-07)**: Interior FLD
 > diffusion coupling for adjacent cells \((i,j)\) and \((i',j')\) is skipped
 > when the center-to-center distance is below `kFldFaceDistMin = 1e-12 cm`.
 > This handles late-time Lagrangian mesh pinch / inversion where
@@ -399,19 +399,19 @@ D_{c,g}=\frac{c\,\lambda(R_{c,g})}{\sigma_{R,c,g}}
 \(\lambda=(9+R^2)^{-1/2}\)、`"none"` は \(\lambda=1/3\) を使う。LP の数値評価は
 \(R<10^{-3}\) で級数 \(1/3-R^2/45+2R^4/945\)（打ち切り誤差 \(O(R^6/4725)\)）、
 \(R>50\) で \((1-1/R)/R\)（\(\coth\) の指数補正 \(<4\times10^{-44}\)）、
-中間域のみ raw 形とする（2026-07-26、AI review k05 6.1: 旧分岐
+中間域のみ raw 形とする（2026-07-26： 旧分岐
 \(R<10^{-6}\to1/3\) / \(R>50\to1/R\) は \(R\sim10^{-6}\) 近傍の桁落ち
 ~\(10^{-4}\) 相対と \(R=50\) での +2% 不連続を持った — 1D 2 コピー修正済み、
-2D コピーは別レーン）。面係数の構成は次元で異なる（2026-07-26 doc 真実復元）:
-**1D_SPH は face-centered 評価**（1D BUG-9 根治後の現行実装）—
+2D コピーは別途対応）。面係数の構成は次元で異なる（2026-07-26 doc 真実復元）:
+**1D_SPH は face-centered 評価**（1D face 中心評価化後の現行実装）—
 \(\sigma_{R,f}=\tfrac12(\sigma_{R,L}+\sigma_{R,R})\)、
 \(E_f=\max(\tfrac12(E_L+E_R),10^{-300})\)、
 \(R_f=|E_R-E_L|/(d_f\,\sigma_{R,f}\,E_f)\)、
 \(D_f=c\,\lambda(R_f)/\sigma_{R,f}\)。拡散極限（両側 \(\lambda=1/3\)）では旧
 harmonic 形 \(\mathrm{harm}(c/3\sigma_L,\,c/3\sigma_R)=c/(3\cdot\tfrac12(\sigma_L+\sigma_R))\)
 と厳密一致する。**2D_RZ は現行 cell-centered** \(D_c\)（cell 勾配で \(R_c\)）を
-隣接 harmonic mean して \(D_f\) を作る — 1D BUG-9 と同型の front-stall 機構が
-残存する既知課題（AI review k05 M1、face-centered 化は 2D レーン所掌）。
+隣接 harmonic mean して \(D_f\) を作る — 1D の修正前と同型の front-stall 機構が
+残存する既知課題（2026-07-26 カーネルレビュー指摘、face-centered 化は 2D 側の対応範囲）。
 
 1D_SPH の群ごとの線形系は tridiagonal で、CUDA の cuSPARSE
 `cusparseDgtsv2StridedBatch` を使う。batch 数は \(G\)、各 system size は
@@ -510,7 +510,7 @@ EOS テーブルから \((\rho,T)\) で書く。電子 EOS device view が無い
 fallback する。放射源は固定済みの \(S^{used}\) なので、放射 Jacobian は物質
 Newton には入れない。
 
-> **W-B 適合修正（BUG-7, 2026-07-03）**: 1D `update_matter_kernel` は上の
+> **W-B 適合修正（2026-07-03）**: 1D `update_matter_kernel` は上の
 > \(S^{used}\) 契約に違反して**未混合** \(c\sigma^{PE}B(T)\) を emission として
 > 記帳していた（\(f_c\) を完全に無視）。放射側は混合源で解くため、
 > \((1-f)c\sigma\Delta t\,|E^n-B|\) の幻エネルギーが毎 step 発生していた
@@ -658,7 +658,7 @@ requiring radial invariance as an independent 2D RZ kernel check.
 
 The 2D RZ I1-A strict gate uses `tools/validation/rz_profile_average.py` for
 volume-weighted radial averaging and radial-invariance diagnostics, and
-`tools/validation/radiative_shock_metrics.py` for the Wave 12
+`tools/validation/radiative_shock_metrics.py` for the
 shock-windowed \(L_2\), legacy convolved peak-gap diagnostic, and Richardson
 \(D_\infty\) metric framework. The production gate no longer accepts or rejects
 I1-A using a candidate-inferred convolution kernel.  The strict precursor gate
@@ -704,7 +704,7 @@ PR 4 promotes the PR 3 smoke scaffold to the strict production CTest
 `expensive.I1 FLD-CED 2D RZ z-slab strict`. The gate runs the three production
 grids \(16\times256\), \(32\times512\), and \(64\times1024\), with z-resolution
 prioritized. The harness does not override `t_end`; the deck default is the
-Wave 10 production horizon
+final runtime-calibration production horizon
 \[
 t_{end}=\max(5\tau_{rel},3L/|u_{upstream}|)=32.35\ \mu s
 \]
@@ -793,7 +793,7 @@ z reflect). ALE remains off.
 
 ##### §I1-A auxiliary anchors: 1D_SPH LR07-EDA / LE08 nED / FLD-CED
 
-The existing Wave 5/6C/7B/8/9/10/12 LR07-EDA, LE08 LM_nED, and FLD-CED
+The existing LR07-EDA, LE08 LM_nED, and FLD-CED
 documentation below is preserved as explicit I1-A auxiliary rows. Commits
 `c88eb0e9 -> d3d68c59` verified the quasi-planar 1D_SPH code path at
 `r_min=1e6 cm`, dispatching to `fld_1d_gpu.cu`. This is a valid auxiliary
@@ -858,7 +858,7 @@ Schema v2 samples the frozen table uniformly in branch temperature rather than
 uniformly in \(x\), because branch-wise finite-difference checks differentiate
 the frozen table itself and must resolve the asymptotic far-state tails.
 
-Phase A Wave 3 executes this planar reference as a mesh-robust 1D_SPH
+The planar-reference calibration executes this planar reference as a mesh-robust 1D_SPH
 large-radius approximation instead of a 2D_RZ slab. The deck maps the frozen
 table coordinate to
 \[
@@ -874,7 +874,7 @@ therefore an explicit verification-deck approximation, bounded by the large
 reference radius and not a change to the LR07-EDA equations, constants, or unit
 system.
 
-The Wave 3 calibration uses:
+The planar-reference calibration uses:
 \[
 \gamma=5/3,\quad A=1,\quad \bar Z=1,\quad
 \rho_0=2.0\ \mathrm{g/cm^3},\quad T_0=30\ \mathrm{eV},\quad
@@ -883,8 +883,8 @@ The Wave 3 calibration uses:
 for \(M_0\in\{1.5,2.0,3.0\}\) with 1601 points per table. This preserves
 \(\kappa_R\rho_0=1\ \mathrm{cm^{-1}}\) while reducing the omitted-radiation-force
 perturbation. The relevant scaling is \(P_{rad}/P_{mat}\propto T^3/\rho\),
-not \(T^4\), because \(P_{mat}\propto\rho T\). Relative to the Wave 2
-\(T_0=80\) eV, \(\rho_0=1\ \mathrm{g/cm^3}\) references, the Wave 3
+not \(T^4\), because \(P_{mat}\propto\rho T\). Relative to the earlier
+\(T_0=80\) eV, \(\rho_0=1\ \mathrm{g/cm^3}\) references, the planar-reference calibration
 \(T_0=30\) eV, \(\rho_0=2\ \mathrm{g/cm^3}\) tables reduce the reference
 pressure ratio by \((30/80)^3/2\). The frozen-table diagnostics are:
 
@@ -895,7 +895,7 @@ pressure ratio by \((30/80)^3/2\). The frozen-table diagnostics are:
 | 3.0 | \(1.4341980\times10^{-5}\) | \(2.5420334\times10^{-5}\) | \(2.718628\times10^{-16}\) |
 
 The production CTest uses the \(M_0=2.0\) table on \(N_r=64,128,256\) 1D_SPH
-radial grids. Phase A Wave 4 follows the Round 9 AI fallback decision and
+radial grids. The two-state shock-front localization protocol follows an external-AI review decision and
 changes the default deck initialization from the smooth `reference_table`
 profile to a `two_state` Riemann shock-formation protocol. In this mode the
 discontinuity is placed at
@@ -905,12 +905,12 @@ r_{shock}=\frac{r_{\min}+r_{\max}}{2},
 with the LR07-EDA upstream Rankine-Hugoniot state for \(r<r_{shock}\) and the
 downstream state for \(r\ge r_{shock}\). The smooth `reference_table` path
 remains available by explicit harness/deck override for diagnostics, but is no
-longer the production default. The Wave 4 deck also lengthens the default
+longer the production default. The two-state protocol deck also lengthens the default
 runtime to
 \[
 t_{end}=1.5\,\frac{x_{\max}-x_{\min}}{|u_{upstream}|},
 \]
-three times the Wave 3 half-crossing default, so the two-state initial
+three times the earlier half-crossing default, so the two-state initial
 discontinuity can form and propagate before the production comparison.
 
 Before the production ladder, the harness runs a t=0 admissibility audit on the
@@ -928,7 +928,7 @@ The production harness locates the shock in both simulation and reference
 profiles by the strongest \(T_e\) gradient, shifts each simulated profile by the
 measured shock displacement before computing profile errors, and masks the
 outer 10% of cells at each domain boundary for the \(L_2\) comparisons. For the
-Wave 4 two-state protocol, the blocking \(L_2\) values are averages over a
+two-state shock-front localization protocol, the blocking \(L_2\) values are averages over a
 quasi-steady snapshot window rather than final-snapshot-only values. The window
 starts at the first snapshot interval whose adjacent shock speeds differ by
 less than 1% relative to the mean shock-speed magnitude; if no such interval is
@@ -939,7 +939,7 @@ averages as non-gating diagnostics. It also runs a non-gating
 production \(L_2\) gates fail while this shorter diagnostic passes, the summary
 flags the result as possible boundary/transient contamination.
 
-Phase A Wave 5 adds non-gating diagnostic instrumentation to distinguish
+Non-gating diagnostic instrumentation is added to distinguish
 reference fidelity, EDA-closure, and 2T material-partition causes of residual
 Gate 3--5 failures. The t=0 admissibility audit now builds its expected profile
 from the active initialization mode: `reference_table` uses the frozen smooth
@@ -963,7 +963,7 @@ harness labels the flux source and infers \(F_{rad}\) from the steady
 shock-frame matter energy-flux defect for diagnostic use only; no production
 equation or output schema is changed.
 
-Wave 5 also emits shock-centered profile dumps in \(r-r_s\),
+The diagnostic instrumentation also emits shock-centered profile dumps in \(r-r_s\),
 \(\tau=\int_{r_s}^{r}\kappa_R\rho\,dr\), and
 \(m=\int_{r_s}^{r}\rho\,dr\), and reports \(T_e\) and \(T_{rad}\) relative
 \(L_2\) errors in all three coordinates. Far-state R-H residuals are computed
@@ -974,19 +974,18 @@ J=\rho(u-v_s),\qquad
 \Phi=J\left(e+\frac{(u-v_s)^2}{2}+\frac{P_{mat}}{\rho}\right),
 \]
 with radiation momentum omitted consistently with the low-\(P_{rad}\) I1
-acceptance regime. These diagnostics feed Wave 6 branch selection only; they do
+acceptance regime. These diagnostics feed the branch-selection revision only; they do
 not relax the Gate 4 \(T_e\) 5% threshold.
 
-Phase A Wave 6C-revised regenerates the LR07-EDA references using the
+The branch-selection revision regenerates the LR07-EDA references using the
 radiation-momentum-free reduction required by TENRYU v1.0 (§1.1.2; see also
 `docs/validation/2d_rz/RH1/audit/lowrie_edwards_feasibility.md:15-33`).
-The implementation follows the CC-Codex consensus recorded in
-`tmp/discussions/20260514-181253-wave6-6c-ext-vs-7b-le08-switch/log.md`:
+The implementation follows the recorded design consensus:
 the I1 table remains a low-\(P_{rad}\), equilibrium-diffusion energy reference,
 but the steady momentum invariant is gas-only and no production radiation
 momentum equation is introduced.
 
-Wave 6C-revised also bumps the frozen JSON table to schema version 2 with a
+The same revision also bumps the frozen JSON table to schema version 2 with a
 dual-flux contract:
 
 - `F_rad_erg_per_cm2_s` is the radiation flux conjugate to the monotone
@@ -1009,13 +1008,13 @@ energy-invariant field is reported as a sanity diagnostic with the downstream
 orientation sign restored, but the strict gate is on the monotone-coordinate
 schema contract.
 
-Wave 7 escalation rule: if, after Wave 6C-revised, the harness still reports
+The escalation rule: if, after the branch-selection revision, the harness still reports
 `max_abs_delta_Tr_interior > 0.05`, `max_abs_flux_resid_EDA > 1e-3`, and
-`max_R_J/Pi/Phi > 0.05`, the next wave must first run the sensitivity sweep
+`max_R_J/Pi/Phi > 0.05`, the next revision must first run the sensitivity sweep
 \(2\times\kappa_R\), \(dt/2\), and \(N_R=512\) before reopening a 7B
-Lowrie-Edwards switch. This rule is documentation-only in Wave 6C-revised.
+Lowrie-Edwards switch. This rule is documentation-only in the branch-selection revision.
 
-Phase A Wave 7B reopens that switch after the Wave 7 sensitivity sweep on
+The later sensitivity-sweep revision reopens that switch after the sensitivity sweep on
 commit `be0944ed` showed the grey-FLD solution is intrinsically
 nonequilibrium-diffusion in this calibration: the EDA flux residual stayed at
 1.0 under baseline, \(N_R=512\), \(t_{end}\times2\), \(dt/2\), and
@@ -1028,7 +1027,7 @@ LE08. The consensus record is
 `tmp/discussions/20260514-181253-wave6-6c-ext-vs-7b-le08-switch/log.md`.
 
 The LE08 frozen tables use the same cgs+eV material convention and low
-\(P_{rad}\) calibration as Wave 6C:
+\(P_{rad}\) calibration as the branch-selection revision:
 \[
 \gamma=5/3,\quad A=1,\quad \bar Z=1,\quad
 \rho_0=2.0\ \mathrm{g/cm^3},\quad T_0=30\ \mathrm{eV},\quad
@@ -1050,7 +1049,7 @@ sound speed; the schema-v3 `F_rad_erg_per_cm2_s` field subtracts the
 the monotone `x_cm` diffusion identity. `F_rad_lab_erg_per_cm2_s` is retained
 as an LE08-v3 diagnostic field for the full ExactPack conservation check.
 
-Schema v3 extends the Wave 6C schema-v2 dual-flux contract. It preserves
+Schema v3 extends the earlier schema-v2 dual-flux contract. It preserves
 `x_cm`, `rho_g_per_cc`, `u_cm_per_s`, `T_eV`,
 `P_mat_dyne_per_cm2`, `P_rad_dyne_per_cm2`,
 `F_rad_erg_per_cm2_s`, `F_rad_energy_invariant_erg_per_cm2_s`, and `branch`,
@@ -1063,7 +1062,7 @@ dependency only; regeneration can use
 `pip install git+https://github.com/lanl/ExactPack.git@master`. TENRYU runtime,
 ctest, and the frozen-table checker do not import ExactPack.
 
-The LE08 Wave 7B files are:
+The LE08 sensitivity-sweep files are:
 
 - `tools/validation/le08_ned_reference_generator.py`
 - `tools/validation/check_le08_exactpack.py`
@@ -1072,11 +1071,11 @@ The LE08 Wave 7B files are:
 - `tests/verification/test_i1_le08_grey_ned_radshock.cu`
 - `tests/verification/data/le08_ned_reference/le08_nED_M{1p5,2,3}.json`
 
-For Wave 7B, LR07-EDA ctest #436 remains an auxiliary dual-flux schema
+For the sensitivity-sweep revision, LR07-EDA ctest #436 remains an auxiliary dual-flux schema
 regression guard. Its generator, checker, harness, ctest, and frozen v2 tables
 are intentionally left unchanged.
 
-Wave 8 changes only the LE08 deck defaults and partial-checkpoint interpretation:
+The LE08 deck-default update changes only the deck defaults and partial-checkpoint interpretation:
 `r_min=1.0e6 cm` makes TENRYU's 1D_SPH mesh quasi-planar, while
 `t_end=3.0 (x_max-x_min)/|u_upstream|` lets the two-state Riemann initial
 condition settle to the steady nED shock. The previous `r_min=100 cm` introduced
@@ -1096,7 +1095,7 @@ The blocking production gates are:
 - Gate 3: final-time shock-position convergence rate \(\ge1.0\) over
   \(h,h/2,h/4\), using the peak-\(|dT_e/dx|\) shock location and adjacent-grid
   \(L_1\) position differences. The first-order threshold is specific to the
-  Wave 4 two-state shock-front localization protocol; it does not relax the
+  two-state shock-front localization protocol; it does not relax the
   radiation-pressure or conservation gates.
 - Gate 4: phase-aligned, interior-masked post-shock \(T_e\) relative
   \(L_2\le5\%\) against the LR07-EDA table, averaged over the quasi-steady
@@ -1105,16 +1104,16 @@ The blocking production gates are:
   \(T_{rad}=(E_{rad}/a_{eV})^{1/4}\) relative \(L_2\le10\%\) against the same
   table, averaged over the quasi-steady window.
 
-Phase A Wave 9 adds an in-house constant-Eddington FLD nED reference because
-Wave 7B/8 isolated a model mismatch between ExactPack `problem="LM_nED"` and
+The in-house constant-Eddington FLD nED reference was added because
+the sensitivity sweep and LE08 deck-default update isolated a model mismatch between ExactPack `problem="LM_nED"` and
 TENRYU's grey FLD operator with `flux_limiter="none"`. The ExactPack LE08 table
 retains its role as an auxiliary cross-check, while the FLD-CED table is the
 equation-matched reference for TENRYU's current no-\(O(v/c)\), gas-momentum-only
-model. The consensus record is CONSENSUS Round 5 thread `019e25c4-...`; the
+model. The consensus record is CONSENSUS thread `019e25c4-...`; the
 local design trace remains
 `tmp/discussions/20260514-181253-wave6-6c-ext-vs-7b-le08-switch/log.md`.
 
-The Wave 9 smooth-branch invariants are
+The in-house constant-Eddington reference smooth-branch invariants are
 \[
 \rho u=J,\qquad \rho u^2+P_{mat}=\Pi,\qquad
 J\left(c_pT+\frac{u^2}{2}\right)+F=\Phi ,
@@ -1179,9 +1178,9 @@ strict:
 where \(R_F\) compares the tabulated \(F\) to
 \(-c(3\kappa_R\rho)^{-1}\partial_xE\) on each branch.
 
-The Wave 9 production ctest is
+The in-house constant-Eddington reference production ctest is
 `expensive.I1 FLD const-Eddington nED grey radiative shock`. It keeps the
-Wave 8 quasi-planar default \(r_{\min}=10^6\ \mathrm{cm}\), the
+The LE08 deck-default update uses quasi-planar default \(r_{\min}=10^6\ \mathrm{cm}\), the
 `two_state` initialization, and the \(3.0(x_{\max}-x_{\min})/|u_0|\) runtime.
 Its strict acceptance gates are t=0 Mach and pressure-ratio admissibility,
 \(\max(P_{rad}/P_{mat})\le10^{-3}\), frozen-reference conservation residual
@@ -1192,10 +1191,10 @@ Its strict acceptance gates are t=0 Mach and pressure-ratio admissibility,
 \]
 The \(0.2\) threshold is deliberately wider than the expected \(O(0.05)\)
 equation-matched result so it does not fail on normal shock-localization and
-finite-grid error, but it is tight enough to reject the Wave 7B/8 \(O(1)\)
+finite-grid error, but it is tight enough to reject the earlier \(O(1)\)
 model-mismatch signature.
 
-Phase A Wave 10 supersedes the Wave 8/9 runtime calibration for the LE08 and
+The final runtime calibration supersedes the earlier runtime calibration for the LE08 and
 FLD-CED nED decks. The default end time is no longer set only by the hydro
 crossing time. Instead, the decks use the local electron radiation-relaxation
 time of the grey absorption source,
@@ -1228,7 +1227,7 @@ At \(M_0=2\), the widened references make the hydro-crossing fallback
 \(7.66\ \mu\mathrm{s}\) for FLD-CED and \(7.93\ \mu\mathrm{s}\) for LE08,
 so the default selects \(5\tau_{rel}=32.35\ \mu\mathrm{s}\).
 
-Wave 10 also extends the nED reference domains by padding only the far
+The final runtime calibration also extends the nED reference domains by padding only the far
 upstream/downstream equilibrium tails. The solved relaxation zone and shock
 matching are unchanged; the padded points carry the branch endpoint state and
 preserve the branch-wise diffusion identity used by the checker. The generated
@@ -1246,9 +1245,9 @@ The LE08 ctest remains an auxiliary partial-checkpoint comparison unless host
 verification demonstrates that its dynamics gates should be restored: ExactPack
 `problem="LM_nED"` includes \(v/c\) source-correction physics outside TENRYU's
 current constant-Eddington, gas-momentum-only FLD model. LR07-EDA is unchanged
-by Wave 10.
+by the final runtime calibration.
 
-Phase A Wave 12 changes the FLD-CED production metric, not the TENRYU
+The final FLD-CED metric revision changes the production metric, not the TENRYU
 discretization. The revised high-AI consultation
 `tmp/prompts/20260515-105506-tenryu-fld-ced-shock-revised.md` supersedes
 `tmp/prompts/20260515-101923-tenryu-fld-ced-shock-2x-gap.md` and closes Q3
@@ -1258,7 +1257,7 @@ The remaining FLD-CED `dTr_max` gap at NR=1024 is treated as the expected
 finite-grid embedded-shock observable: finite shock-tube/reference-window
 mismatch (Q7-extended), HLL/HLLC hydro shock smearing (Q4), post-shock MFP
 under-resolution (Q1), and pointwise-vs-cell-average comparison at the
-discontinuous hydro jump (Q6). The NR=2048 Wave 11 run hit a
+discontinuous hydro jump (Q6). The earlier NR=2048 run hit a
 thermal-subcycle floor cascade (`dTr_max=89.65`) and is outside the verified
 resolution envelope for this calibration; NR=1024 is the I1-A auxiliary
 verification resolution until that high-resolution stability issue is fixed.
@@ -1281,7 +1280,7 @@ is no longer a production gate at the embedded shock. It is retained as a
 diagnostic because it is first-order convergent and dominated by where a cell
 center samples the smeared hydro jump.
 
-Wave 12 replaces that gate with a shock-windowed, cell-averaged,
+The final FLD-CED metric revision replaces that gate with a shock-windowed, cell-averaged,
 convolved-reference metric. For each production snapshot the harness detects
 the TENRYU shock cell by \(\max|\partial T_e/\partial x|\), phase-aligns the
 reference shock to that position, and measures the hydro kernel
@@ -1314,14 +1313,14 @@ from the same steady snapshot:
 \]
 
 The Richardson envelope remains a separate asymptotic check on the raw
-`dTr_max` sequence. The Wave 12 harness requires the NR=256, 512, 1024 sequence
+`dTr_max` sequence. The revised harness requires the NR=256, 512, 1024 sequence
 and fits the first-order embedded-shock model above using the bracketing
 NR=256 and NR=1024 values, with the NR=512 point retained in the summary as
 part of the sequence diagnostics. The strict bound is
 \[
 0.65\le D_\infty^{fit}\le 0.87 .
 \]
-For the existing Wave 11 NR=256/512/1024 dumps, the fitted value is
+For the existing NR=256/512/1024 dumps, the fitted value is
 \(D_\infty^{fit}\approx 0.749\), consistent with the reference peak 0.7614 and
 with the high-AI conclusion that the factor-of-two NR=1024 pointwise gap is a
 first-order embedded-shock convergence effect rather than a FLD-CED equation
@@ -1337,7 +1336,7 @@ rational model disagree by more than a factor of two in every measured era
 (certified-era pairs: (256,512) 0.20, (512,1024) −2.26 i.e. model-invalid,
 (256,1024) 0.749), and the (256,1024) value amplifies percent-level
 physics-consistency row changes by 2.5–3.0×. Two sanctioned physics
-corrections (BUG-7 1D FLD Fleck conservation fixes, 2026-07-03; and the
+corrections (1D FLD Fleck conservation fixes, 2026-07-03; and the
 `gamma_r_43` hydro-coupling default, 2026-07-06) moved the fine row by only
 −4.7% / −1.3% (physics gates 6/7 green throughout) while the fitted
 \(D_\infty\) drifted 0.7491 → 0.6346, out the bottom of the frozen window.
@@ -1350,18 +1349,18 @@ G_{1024}\le\max\left(0.5\,G_{512},\ 0.02\right),
 where \(G_{NR}\) is the per-row `wave12_convolved_peak_gap`, with
 fail-closed handling (non-finite or missing rows fail the gate).
 Back-test: contraction ratios \(G_{1024}/G_{512}\) = 0.024 (certified era),
-0.075 (post-BUG-7), 0.207 (post-`gamma_r_43`) — green in every era with
+0.075 (after the 2026-07-03 conservation fix), 0.207 (post-`gamma_r_43`) — green in every era with
 ≥2.4× margin; the coarse pair (256→512) is excluded because it rose (1.09×)
-at the post-BUG-7 era (coarse-row peak detection is pre-asymptotic). A
+after the 2026-07-03 conservation fix (coarse-row peak detection is pre-asymptotic). A
 finite-but-large \(G_{512}\) weakens only the contraction evidence, not the
 absolute bound: gate 7 independently caps \(G_{1024}\le 0.15\).
 \(D_\infty^{fit}\) remains computed and reported
 (`richardson_d_infinity_fit_status = "diagnostic_only_20260715"`).
 
-The NR=2048 "resolution envelope" note (Wave 11/12) is refined by the same
+The NR=2048 "resolution envelope" note from the earlier and final metric revisions is refined by the same
 investigation: a 2026-07-15 NR=2048 rerun under current physics completes
 healthily with all fields finite (replica-identical, i.e. deterministic);
-the historical `dTr_max` explosion there (89.65 in Wave 11, 65.9 today) is
+the historical `dTr_max` explosion there (89.65 in the earlier run, 65.9 today) is
 the ratio metric \(|T_{rad}/T_e-1|\) evaluated on a resolved near-floor
 cold cell (\(T_e\approx 0.108\) eV, \(T_{rad}\approx 7.2\) eV), plus
 reference-table-edge \(1/E_{FLOOR}\) blowups in auxiliary traversal
@@ -1460,7 +1459,7 @@ The tool sorts detailed rows by \(\Delta\log|C|\) rather than by v1 `A_max` and
 emits a per-cycle summary of the dominant stage versus distributed sub-stage
 gain.
 
-Round 13 adds an independent FLD substage audit controlled by
+An independent FLD substage audit is added, controlled by
 `Radiation.multigroup_diffusion.diagnostic_radial_fourier_substage_enabled`.
 When enabled, FLD records selected substage Fourier coefficients and solver
 residual diagnostics under `/diagnostics/fld_substage_audit/v1/`. The HDF5
@@ -1471,7 +1470,7 @@ and does not feed back into the FLD solve or material update.
 
 #### 6.7.4 §I2-aux Phase B: 1D_SPH FLD-CED Multigroup Grey-Collapse Limit
 
-> **SUPERSEDED (2026-07-04, main-CC adjudication Q7 of
+> **SUPERSEDED (2026-07-04 adjudication, Q7 of
 > `docs/design/i2_mgfld_collapse_spec.md` v3.1).** The 1D_SPH aux gate
 > specified below was never implemented (no deck/harness/ctest was ever
 > committed on any branch). Its verification intent is covered by (a) the
@@ -1484,7 +1483,7 @@ and does not feed back into the FLD solve or material update.
 > section is retained for the derivation of the collapse identity it records.
 
 Phase B I2-aux verifies a 1D_SPH code-path equivalence rather than a new reference
-solution. The foundation is the Phase A I1 Wave 12 FLD-CED infrastructure at
+solution. The foundation is the final I1 FLD-CED infrastructure at
 commit `d3d68c59`: the in-house constant-Eddington nED grey table, schema-v3
 dual-flux identity checks, the \(N_R=256,512,1024\) 1D_SPH production ladder at
 \(r_{\min}=10^6\ \mathrm{cm}\), and the shock-windowed/convolved/Richardson
@@ -1550,7 +1549,7 @@ bounds span \([0,10^6]\ \mathrm{eV}\), and
 Planck table over \(0.01\le T\le1000\ \mathrm{eV}\).
 
 The I2 harness is `tools/validation/run_i2_grey_collapse.py`. It reuses the I1
-Wave 12 shock-windowed \(L_2\), cell-averaged convolved-reference peak gap, and
+shock-windowed \(L_2\), cell-averaged convolved-reference peak gap, and
 Richardson \(D_\infty\) implementation on the \(G=1\) grey baseline ladder. It
 also runs the requested multigroup \(G\) ladder (production default \(G=2\));
 the fine-grid \(G=2\) result is paired with the fine-grid \(G=1\) result for
@@ -1571,7 +1570,7 @@ The strict I2 acceptance is:
   upstream/downstream median \(<10^{-3}\), p95 \(<10^{-2}\);
 - I1 low-\(P_{rad}\), frozen-reference conservation, and t=0 admissibility
   gates unchanged;
-- Wave 12 strict gates on the \(G=1\) grey baseline ladder unchanged:
+- The strict gates on the \(G=1\) grey baseline ladder remain unchanged:
   shock-windowed \(L_2\le0.10\), convolved peak gap \(\le0.15\), and
   \(0.65\le D_\infty^{fit}\le0.87\);
 - new grey-collapse gate:
@@ -1591,7 +1590,7 @@ Grey is the \(N_g=1\) operation of the same multigroup kernels (no separate
 grey path; dispatch branches on dimension only), so the collapse comparison
 verifies the group-partition machinery — b_g weights (renormalized
 \(\sum_g b_g=1\) at table build, debug-asserted to 1e-12), per-group
-\(\sigma/D/E\) storage, the Fleck cg layout contract (BUG-11,
+\(\sigma/D/E\) storage, the Fleck cg layout contract (
 `f95ba49a`+`92013efe`), the group-blocked CSR solve, and the group-summed
 matter coupling — against the I1-A-anchored grey endpoint.
 
@@ -1623,7 +1622,7 @@ outer-Picard termination, and fp summation order — hence the gate tiers.
   \(N_g\)/steps/fields; absolute closed-box drift \(\le5.1\times10^{-16}\)
   over 4 steps; drift difference \(\le3.4\times10^{-16}\). Gate
   sensitivity is EMPIRICAL: with `fld_2d_rz_gpu.cu` reverted to base
-  3f246289 (pre-BUG-11) the gate fails loudly (mutation test).
+  3f246289 (before the Fleck-layout correction) the gate fails loudly (mutation test).
 - **I2b (coupled collapse)** — deck
   `examples/verification/i2_mgfld_collapse_2d_rz_slab.py` (I1-A clone;
   `two_state` Riemann + all-reflecting BCs because groups>1 forbids
@@ -1636,7 +1635,7 @@ outer-Picard termination, and fp summation order — hence the gate tiers.
   T_{rad,\Sigma},u_z\}\); flat-ladder pairwise \(\varepsilon_{L2}\le
   10^{-4}\); per-run hygiene (t_end termination, Newton gates, zero
   escape valves, radial invariance \(\le10^{-6}\), effective-group-count
-  banner assert against the auto-grey trap). Wave-12 absolute metrics vs
+  banner assert against the auto-grey trap). The revised absolute metrics vs
   the FLD-CED ODE table are REPORTED, not gated (two_state-mode
   calibration caveat; adjudication Q6). Main strict battery measurement
   (2026-07-05, `ctest #603`, summary `all_checks_passed=true`): hygiene,
@@ -1903,7 +1902,7 @@ all-reflect boundary angular closure (geometric contraction ≈0.32/sweep; grey 
 magnitude \(10^{-12}\)–\(10^{-9}\) cannot hide under production-tol truncation noise.
 
 **G2 coupled shock collapse (I3 deck + `TENRYU_I3_SN_RS_GROUPS`; harness
-`tools/validation/run_i6_sn_mg_collapse.py`).** Binding (cert tier, batched campaign):
+`tools/validation/run_i6_sn_mg_collapse.py`).** Binding (certification runs, batched):
 \(\varepsilon_2\le 10^{-3}\) on radial-mean z-profiles of \(\sum_g E_g\) and
 \(\sum_g F_{z,g}\) vs the same-binary grey run at full \(t_{end}\), \(N_g\in\{2,4,8\}\),
 S_16 (+S_8 confirmation once the `N8_K20` reference table is generated).
@@ -1935,7 +1934,7 @@ knob, tri-fan degenerate at the axis).
 cumulative laser_in vs ramp integral (audit `laser_in` is PER-STEP; sum it),
 ablation front (nearest-to-slab steep |dTe/dz|), shock launched (windowed ρ-jump
 face inside the slab; **Qvisc locators do not work under HLLC z-flux**),
-per-step ledger eps ≤ 1e-6 (the row ε; conservation restored by the BUG-15
+per-step ledger eps ≤ 1e-6 (the row ε; conservation restored by the
 pair-min throttle fix, §4.2.x conduction note), energies sane, replica band on the
 four STABLE QoIs (positions / laser_in / mass_ablated ≤ 5e-2; measured: positions
 identical, laser 7e-5, mass 0.4-0.7%).
@@ -1981,7 +1980,7 @@ F(T_e)=
 +\sum_g c\,\sigma^{PE}_g a_{eV}T_e^4 b_g(T_e),
 \]
 with derivative contribution (implemented form — 2026-07-26 doc truth
-restoration, AI review k06 4.4: the old text omitted the \(1/(1+\lambda^{PA})\)
+restoration: the old text omitted the \(1/(1+\lambda^{PA})\)
 reduction and the active-set mask that the production active-set Newton has
 always applied; see the Phase B closure below):
 \[
@@ -2110,11 +2109,11 @@ which avoids subtracting nearly equal thick-LTE algebraic terms. DSA remains
 cell-centered and does not modify \(F_{f,g}\); the face flux is recomputed from
 the high-order sweep each Picard outer iteration.
 
-[BUG-21c, 2026-07-14] After the material Newton writeback (each Picard outer
+[2026-07-14] After the material Newton writeback (each Picard outer
 iteration), transparent cells are re-anchored to the transport moments. With
 \(\lambda^{ext}_{c,g}=c\Delta t\,(\sigma^{a}_{c,g}+\sigma^{s}_{c,g})\)
 (`state.sn_sigma_a` + `state.sn_sigma_s` — total extinction; scattering included since
-BUG-25, 2026-07-19: an optically thick pure-scattering cell is in the diffusion regime
+the 2026-07-19 total-extinction correction: an optically thick pure-scattering cell is in the diffusion regime
 under AP-blend authority, not a void), the final radiation energy is
 \[
 E_{c,g}\leftarrow w\,E^{+}_{c,g}+(1-w)\,\phi^{m+1}_{c,g}/c,\qquad
@@ -2126,14 +2125,14 @@ with an exact early-out \(w=1\) for \(\lambda^{ext}_{c,g}\ge10^{-3}\)
 (absorbing cells stay bitwise on the flux-form ledger) and \(w=0\) for
 \(\lambda^{ext}_{c,g}\le10^{-4}\). Rationale: the flux-form ledger integrates
 from \(E^n\) and in a void (\(\nabla\cdot F\to0\), no absorption or emission)
-permanently freezes any transient imprint — the BUG-21 reproduction measured
+permanently freezes any transient imprint — the transparent-gap reproduction measured
 \(E=1.887\,\phi/c\) frozen in the gap — while the swept moments are exact
 there. The regimes sit 4+ orders apart in \(\lambda^{ext}\) (su_olson
 \(\sim3\times10^{-2}\), the transparent-gap reproduction \(\sim10^{-8}\)), so
 the anchor never activates in absorbing benchmarks. Gates:
 `verify sn_1d_planar_transparent_gap` (contract C3) and the void-contract
 case in `test_sn_streaming_limiter`.
-Since 2026-07-26 (AI review k06 C8) every 1D anchor application is ledgered:
+Since 2026-07-26, every 1D anchor application is ledgered:
 `state.sn_void_anchor_dE_step` / `sn_void_anchor_dE_abs_step` accumulate the
 signed and absolute \(V\,\Delta E\) over the step (ledger-class scalars,
 atomicAdd order within the documented host-ledger replica band; the anchored
@@ -2141,18 +2140,18 @@ field itself is bit-unchanged). A validation run that claims independent
 \(S_N\)-reference status can require the abs sum to be exactly 0; a nonzero
 sum is reported to the log (rate-limited). The 1D stagnation exit now also
 sets the pre-existing `state.sn_outer_stagnated` flag (2D already did) and
-logs the acceptance (AI review k06 C9 — the acceptance policy itself is
+logs the acceptance (the 2026-07-26 kernel review left the acceptance policy
 unchanged; changing it is a user decision).
 
-[BUG-25, 2026-07-19] The 1D outer-boundary face-flux export and escape ledger
+[2026-07-19] The 1D outer-boundary face-flux export and escape ledger
 are now discretely consistent with the sweep in every regime. (i) The vacuum
 branch of the boundary export previously overwrote the outer face flux with a
 "Milne escape estimate" \(F_{out}=cE/2\) — exactly twice the discrete outgoing
 half-range flux of a near-isotropic field (\(S^{+}\psi\simeq cE/4\) under the
-\(\sum w=2\) GL convention). The pre-BUG-21 flux-form E update consumed the
+\(\sum w=2\) GL convention). The pre-anchor flux-form E update consumed the
 same overwritten value, so the pair was self-consistently wrong (the
-transparent-limit E*-accumulation pathology recorded in the BUG-21 execution
-log); once BUG-21c anchored \(E=\phi/c\) to the moments, the 2x surplus broke
+transparent-limit E*-accumulation pathology recorded in the transparent-gap execution
+log); once the void moment anchor set \(E=\phi/c\) from the moments, the 2x surplus broke
 the volume-integrated streaming-conservation identity (ctests 1600/1603,
 first full-suite run 2026-07-19). Vacuum now uses the sweep's discrete
 outgoing tally, i.e. the Marshak branch's form with \(\psi_{in}=0\). (ii) The
@@ -2171,14 +2170,14 @@ the Marshak-inflow part subtracted inside the net face ledger is added back
 (`sn_escaped_step += sn_marshak_in_step`); the identity closes exactly because
 the same scalar cancels on both sides, and vacuum configs add \(+0.0\)
 (bit-identical). (iv) With
-the anchor gated on total extinction (BUG-21c amendment above), every regime
+the anchor gated on total extinction (the total-extinction amendment above), every regime
 has a single energy authority: anchored transport moments where
 \(\lambda^{ext}\) is below the band, the flux-form/AP ledger elsewhere.
 Gates: ctests `test_sn_face_flux_conservation`, `test_sn_ap_face_blend`
 (conservation + FLD-match + gating cases), and the SN 1D family battery
 (84/84 on the merged tree, 2026-07-19).
 
-[BUG-25 2D port, 2026-07-20] Two of the four 1D mechanisms apply to the 2D_RZ
+[2D port, 2026-07-20] Two of the four 1D mechanisms apply to the 2D_RZ
 sweep and are ported. (iii) `sn_escaped_step` books the \(\theta\)-limited face
 array (`sn_face_flux_limited`) integrated over the non-reflect boundary faces
 with outward signs (\(+\) at the outer R face and top Z face, \(-\) at the
@@ -2187,7 +2186,7 @@ coefficient model \(cE/2\) (vacuum) / \(cE/4\) (Marshak) that disagreed with
 the discrete outgoing tally by up to 2x for a near-isotropic field. The scalar
 feeds only the driver energy budget and diagnostics, so fields are bit-unchanged
 by this rebooking. (iv) `anchor_void_rad_E_to_moments_2d_kernel` now gates on
-the total extinction \(\lambda^{ext}\) exactly as the dimension-neutral BUG-21c
+the total extinction \(\lambda^{ext}\) exactly as the dimension-neutral void-anchor
 formula above prescribes (it previously used \(\sigma^{a}\) alone). Mechanism
 (i) does not apply in 2D: there is no Milne overwrite — the face reduction
 writes the full-range discrete net flux \(\sum_m w_m \mu_m^{face}\psi_m\) at
@@ -2246,7 +2245,7 @@ F^{diff}_{f,g}=-D_{f,g}\frac{E^n_{R,g}-E^n_{L,g}}
  {0.5(r_{f+1}-r_{f-1})}.
 \]
 The AP path reuses `state.sn_sigma_s` as its "\(\sigma^R\)". **Fill truth
-(2026-07-26 doc restoration, AI review k06 C2/C11)**: `sn_sigma_s` holds the
+(2026-07-26 doc restoration)**: `sn_sigma_s` holds the
 PHYSICAL scattering opacity — constant/power-law materials fill it with
 \(\rho\kappa_s\) (`kappa_s`), and the NLTE pure-SN path fills it with the
 Fleck-bypassed effective scattering \((1-f)\sigma^{PA}=0\) (f=1). It is NOT
@@ -2284,13 +2283,13 @@ diagnostic in the optically thick interior:
 \max(|\langle\alpha_{\mathrm{AP}}\rangle|,10^{-300})}.
 \]
 For axisymmetric SN validation modes, \(\mathrm{CV}_\alpha \le 0.5\) is the
-Phase 2b-1 loose gate for persistent ray-effect contamination. If no cell
+loose gate for persistent ray-effect contamination. If no cell
 satisfies the optically thick interior mask, the validation harness reports the
 same statistic on the geometric interior as a fallback and records the mask
 source.
 
 The face-flux path applies a conservative donor-cell limiter before
-Phase B, in two passes [BUG-21b, 2026-07-14]. For each cell and group, with
+Phase B, in two passes [two-pass inflow-credit correction, 2026-07-14]. For each cell and group, with
 raw inflow/outflow loads
 \[
 I_{c,g}=\Delta t\,
@@ -2346,8 +2345,8 @@ signs.
 
 In 2D_RZ the limiter remains single-pass with the raw inflow credit,
 \(\theta=\min(1,(E^n_{c,g}+I_{c,g})/O_{c,g})\); the two-pass positivity-exact
-credit above is 1D-only as of BUG-21b, and the port is on the 2D lane's
-ledger together with the BUG-21 psi-persistence itself. The outgoing-energy
+credit above is 1D-only as of the two-pass inflow-credit revision, and the port is on the 2D-side
+ledger together with the angular-state persistence itself. The outgoing-energy
 sum includes all non-axis R/Z faces with the cylindrical face areas above. The donor is the upwind cell in the global face
 orientation: lower \(i\) or lower \(j\) for positive R/Z flux, higher \(i\) or
 higher \(j\) for negative R/Z flux. Incoming face power contributes to
@@ -2357,7 +2356,7 @@ flux uses the adjacent cell's \(\theta\). Axis faces
 \(R_{i=0,j}\) are skipped in donor selection and outflow accounting and remain
 zero in the limited flux.
 
-**2D two-pass inflow credit (BUG-21b port, 2026-07-17).** In 2D_RZ the
+**2D two-pass inflow credit (2026-07-17).** In 2D_RZ the
 incoming-power credit \(I_{c,g}\) is evaluated in two passes
 (`compute_streaming_theta_donor_2d_kernel` then
 `compute_streaming_theta_2d_kernel`): pass 1 computes a donor-only
@@ -2392,7 +2391,7 @@ Relative to the previous single-pass raw credit
 and only in streaming-limited transients where the raw credit overdrew
 (negative-\(E\) events). 1D twin: commit 3aeeab4f (1D branch).
 
-**Void moment anchor (BUG-21c port, 2026-07-17).** After the 2D Picard outer
+**Void moment anchor (2026-07-17).** After the 2D Picard outer
 loop finalizes \(E\) and before the fixup tallies are published,
 `anchor_void_rad_E_to_moments_2d_kernel` re-synchronizes effectively-void
 cells to the transport moments. With
@@ -2455,7 +2454,7 @@ starting-direction passes read the nearest regular ordinate). At the end of
 each radiation step the swept \(\psi^{m+1}\) is copied into `sn_psi_prev`; on
 first allocation the buffer is seeded isotropically as
 \(\psi^{seed}=\tfrac12\,c\,E^n\), making the first step bit-identical to the
-retired scheme. [BUG-21, 2026-07-13/14] The retired scheme stored only the
+retired scheme. [2026-07-13/14] The retired scheme stored only the
 scalar `state.rad_E_old` and reconstructed the old intensity isotropically
 each step; in transparent regions that re-isotropization acts as an
 artificial per-step scattering, so free-streaming fronts advanced
@@ -2751,7 +2750,7 @@ closed-cylinder benchmarks and 1D-z reductions. Z boundaries use
 `boundary.z_bottom` / `boundary.z_top`: `"vacuum"` sets incoming intensity to
 zero, while `"reflect"` maps
 \(\psi(\mu_R,\mu_Z)\leftrightarrow\psi(\mu_R,-\mu_Z)\) at the lower/upper Z end.
-For Phase 2b-1 SN Marshak source BC, a Z face \(f\) with boundary type
+For SN Marshak source BC, a Z face \(f\) with boundary type
 `"marshak"` injects a steady gray incoming flux
 \(F_{\mathrm{inc}}=\)
 `Radiation.sn_transport.marshak.flux_erg_per_cm2_s`
@@ -2886,7 +2885,7 @@ provided, the kernel falls back to the legacy constant-\(c_v\) residual and
 ideal-gas pressure write. The radiation Jacobian uses the PE-side analytic per-group term
 \(\sum_{g:\,E^+_g>0}[\lambda^{PE}_g/(1+\lambda^{PA}_g)]\,4a_{eV}T^3b_g\)
 — the active-set mask and the \(1/(1+\lambda^{PA})\) reduction included
-(2026-07-26 doc truth restoration, AI review k06 4.4); \(db_g/dT\) is not
+(2026-07-26 doc truth restoration); \(db_g/dT\) is not
 included. The
 Picard residual is
 \[
@@ -2963,7 +2962,7 @@ edges double as the chain delimiters the sweep kernels already key on
 (`alpha_prev_raw == 0.0`), and the per-ordinate metric identity
 \((\Delta A/w)(\alpha_{+}-\alpha_{-})=-\mu\,\Delta A\) holds ordinate-wise, so
 a uniform isotropic field is annihilated by streaming+redistribution for any
-\(A(r)\) — the BUG-8 fixed-point identity, geometry-independent.
+\(A(r)\) — the spherical fixed-point identity, geometry-independent.
 
 **Weighted diamond (M&M Eqs. A1-A4)**: unlike spherical, the angular cell-edge
 cosines are NOT weight partial sums; the azimuthal **angle** edges partition
@@ -3007,6 +3006,7 @@ cylindrical faces; multigroup cylindrical marshak (G=1 parity with the other
 geometries).
 
 ---
+
 
 ## 7. DDMC（Discrete Diffusion Monte Carlo） [RETIRED — legacy; 現行輻射は §6.7 FLD / §6.8 \(S_N\)]
 
@@ -5038,4 +5038,3 @@ p_j = \frac{1}{2c}\left(\sigma^+_{R,j-1/2}\, F_{j-1/2} + \sigma^-_{R,j+1/2}\, F_
 > - Cleveland & Gentile, JCP 291 (2015) Appendix A, Eq.(A.3): 面フラックス方式
 
 ---
-

@@ -5,7 +5,7 @@
 namespace tenryu::mesh {
 
 // Low-mode constraint basis for a closed boundary loop (macro-boundary
-// endgame verdict, docs/design/external-ai-responses/
+// terminal-phase verdict, docs/design/external-ai-responses/
 // 20260611-i1b-macro-boundary-endgame-verdict.md §2, basis option 2:
 // boundary-loop graph Laplacian low modes).
 //

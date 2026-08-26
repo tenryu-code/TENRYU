@@ -121,7 +121,7 @@ core::Config make_button_morph_config(const char* name,
   cfg.mesh.multiblock_cart_core_r_c = frozen::kCoreRadiusCm;
   cfg.mesh.multiblock_cart_core_r_match = frozen::kMatchRadiusCm;
   cfg.mesh.multiblock_cart_core_bridge_grading = "quintic_log";
-  // BUG-25 opt-out (deck-faithful): the default-True outer-shell Svec tangent balance
+  // Outer-shell tangent-balance opt-out (deck-faithful): the default-True Svec projection
   // deletes tangential restoring forces and kills driven button runs at the outer pole.
   cfg.mesh.multiblock_outer_svec_tangent_balance = false;
   cfg.mesh.explicit_nodes.assign(frozen::kShellNodes,

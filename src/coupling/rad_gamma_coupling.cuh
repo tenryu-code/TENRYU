@@ -1,7 +1,7 @@
 #pragma once
 
 // W-K: gamma_r = 4/3 radiation-field compression coupling for the 1D
-// Lagrangian step (external-AI verdict Decision 2,
+// Lagrangian step (2026-07-04 external review,
 // docs/design/external-ai-responses/20260704-conduction-kirchhoff-radiation-gammar-verdict.md;
 // design docs/design/wk_gamma_r_coupling_design.md).
 //

@@ -595,7 +595,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--allow-partial-checkpoint",
         action="store_true",
-        help="deprecated Wave 10/11 compatibility flag; Wave 12 gates remain strict",
+        help="deprecated compatibility flag; the strict shock-windowed gates remain active",
     )
     return parser
 

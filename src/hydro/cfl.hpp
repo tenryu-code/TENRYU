@@ -323,9 +323,9 @@ struct HydroDtDiagnostics {
   double dt = std::numeric_limits<double>::infinity();
   double acoustic_dt = std::numeric_limits<double>::infinity();
   double post_shock_dt = std::numeric_limits<double>::infinity();
-  // 1D node-crossing guard (Numerics.hydro.crossing_dt_safety; k01 P0-4).
+  // 1D node-crossing guard (Numerics.hydro.crossing_dt_safety; 2026-07-26 review).
   double crossing_dt = std::numeric_limits<double>::infinity();
-  // 1D artificial-heat row-sum bound (av_heat_C, VNR chi; k01 §4.2).
+  // 1D artificial-heat row-sum bound (av_heat_C, VNR chi; 2026-07-26 review).
   double art_heat_dt = std::numeric_limits<double>::infinity();
   double axis_margin_dt = std::numeric_limits<double>::infinity();
   double edge_av_dt = std::numeric_limits<double>::infinity();

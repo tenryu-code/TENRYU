@@ -83,7 +83,7 @@ void corner_mass_fallback_run_start() {
                                     0,
                                     sizeof(CornerMassFallbackRecorder));
   TENRYU_ASSERT(err == cudaSuccess,
-                "F-09 corner-mass fallback recorder reset failed");
+                "corner-mass fallback recorder reset failed");
 }
 
 CornerMassFallbackRecorder* corner_mass_fallback_device_recorder() {
@@ -100,7 +100,7 @@ CornerMassFallbackRecorder corner_mass_fallback_copy_to_host() {
                                      sizeof(CornerMassFallbackRecorder),
                                      cudaMemcpyDeviceToHost);
   TENRYU_ASSERT(err == cudaSuccess,
-                "F-09 corner-mass fallback recorder D2H failed");
+                "corner-mass fallback recorder D2H failed");
   return host;
 }
 
@@ -4382,7 +4382,7 @@ int pole_shear_diag_every() {
   return every;
 }
 
-// Stage-resolved sampling (macro-boundary endgame verdict Q2 #1 / Exp 3):
+// Stage-resolved sampling (macro-boundary terminal-phase verdict Q2 #1 / Exp 3):
 // with TENRYU_I1B_POLE_SHEAR_DIAG_STAGES=1 the H_q diagnostic is also
 // sampled after the rezone target is finalized (stage R, reference mesh)
 // and after the conservative remap commits (stage A), in addition to the
@@ -4502,7 +4502,7 @@ void log_pole_shear_stage_sample(const core::State& state,
   log_pole_shear_diag(state, r_h, z_h, t_post, stage);
 }
 
-// Macro-boundary loop diagnostics (macro-boundary endgame verdict Q4 #3/#4):
+// Macro-boundary loop diagnostics (macro-boundary terminal-phase verdict Q4 #3/#4):
 // every N steps (TENRYU_I1B_BOUNDARY_DIAG_EVERY, default 0 = off) log
 //  (1) the boundary loop's own high-frequency metric: theta_i = atan2(r,z)
 //      along boundary_nodes_ordered, H_i = second difference of theta
@@ -12132,7 +12132,7 @@ AleStepResult apply_ale_with_request(
   AleStepResult out;
   TENRYU_ASSERT(
       state.corner_stride == 4,
-      "corner_stride != 4: runtime-ALE corner path is staged (ALE P2-1c/P2-4+)");
+      "corner_stride != 4: runtime-ALE corner path is staged for a later revision");
   if (ale_identity_mode_enabled(cfg)) {
     return out;
   }
@@ -12161,7 +12161,7 @@ AleStepResult apply_ale_with_request(
   }
   if (cfg.numerics.plic.enabled && part.n_ranks > 1) {
     throw core::namelist::ConfigError(
-        "Wave C PLIC remap not validated under MPI; deferred to Stage 31");
+        "PLIC material-volume remap not validated under MPI; serial-only");
   }
   if (observability != nullptr && state.plic_remap_sticky_fallback) {
     observability->plic_remap_fallback_engaged = true;
@@ -15362,7 +15362,7 @@ AleStepResult apply_ale_with_request(
   // Reset volume-rate CFL Lagrangian baseline after accepted ALE rezone+remap.
   // ALE displacement is non-Lagrangian; without this reset, the next
   // compute_dt_hydro's volume-rate clamp interprets it as one-step hydro flow.
-  // Phase 2d-ext v3 root cause for L2 256x512 dt-collapse cascade.
+  // Root cause of the L2 256x512 dt-collapse cascade.
   hydro::reset_volume_rate_cfl_history_after_ale(state);
   central_pseudo_core::aggregate_state(state, cfg, "post_ale_remap", false);
   pole_angular_derefine::maintain_pole_spans(state, cfg, "post_ale_remap");

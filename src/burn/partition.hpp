@@ -8,7 +8,7 @@ struct PartitionTable {
   // f_ion(species, Te, Ti, ne): fraction of the charged product's birth energy
   // deposited on IONS, integrated over LP slowing from E0 to
   // max(1.5 kTe, 1e-3 E0); electron field evaluated at Te, ion fields
-  // (D/T/He3) at Ti (AI review k14 B-1 fix, 2026-07-26).
+  // (D/T/He3) at Ti (2026-07-26 review fix).
   // Grid: log-uniform Te [0.1, 200] keV x log-uniform ne [1e20, 1e28] cm^-3.
   int n_te = 64;
   int n_ti = 16;

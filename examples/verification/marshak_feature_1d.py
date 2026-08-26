@@ -75,7 +75,7 @@ Numerics(
         min_s=DT,
         growth_factor=1.0,
     ),
-    # BUG-26 closure (2026-07-20): the 2026-07-18 "EA x exp front offset" freeze
+    # 1T ee-init fix (2026-07-20): the 2026-07-18 "EA x exp front offset" freeze
     # traced to the 1T init ignoring the material EOS table (ideal-gas ee, healed
     # silently by the legacy closure at step 1, propagated by energy_authoritative).
     # With the init fixed the closures agree bit-tightly on this deck; the gate now

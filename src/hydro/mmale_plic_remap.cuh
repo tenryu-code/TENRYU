@@ -27,7 +27,7 @@ Geometry and units:
     fractions; dV_1 is computed as dV_total - dV_0 so the per-face split closes
     to round-off under the existing CSR debit/credit sign convention.
 
-Conservative update sketch for CC wiring:
+Conservative update sketch for integration:
   1. For mixed donor cells, call reconstruct_plic_plane_from_stencil_2mat()
      on an explicit local volume-fraction stencil and store n/alpha.  The
      reconstruction mirrors the existing Youngs-seeded fixed-angle LVIRA path

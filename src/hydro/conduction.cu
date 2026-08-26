@@ -289,7 +289,7 @@ void compute_effective_material_properties(const core::Config& cfg,
     return;
   }
 
-  // BUG-1 fix: when the state carries the shared per-cell effective
+  // Multi-material fix: when the state carries the shared per-cell effective
   // properties (State::ensure_cell_material_props — the single source of
   // truth also used by the hydro closure kernels), read them instead of
   // recomputing locally, so conduction and hydro can never disagree.
@@ -3524,7 +3524,7 @@ void initialize_sts_taus(std::vector<double>& tau,
   }
 }
 
-// Fail-closed ladder stability audit (AI kernel review 2026-07-26, k07 F-08;
+// Fail-closed ladder stability audit (2026-07-26 kernel review;
 // NUMERICS 4.2.1).  The uniform tau rescale above is only certified stable
 // when the composite amplification |prod (1 - lambda tau_j)| stays <= 1 over
 // the spectral certificate lambda <= 4 * cfl_cond / dt_exp that dt_exp itself
@@ -3564,7 +3564,7 @@ void conduction_sync_eos(core::State& state, const core::Config& cfg) {
   if (n_cells <= 0) {
     return;
   }
-  // BUG-24: in energy-authoritative mode with a table backend the driver's
+  // In energy-authoritative mode with a table backend the driver's
   // post-conduction sync (single, tail-aware table surface) performs the
   // Te -> ee conversion; the internal linear cv*T projection would fight
   // it (measured +-16 kJ/subcycle representation swing, net leak).
@@ -3795,7 +3795,7 @@ ConductionResult conduction_step_1d_implicit(core::State& state,
     d_flux_limiter_faces = static_cast<double*>(core::device_scratch_acquire(
         "conduction:conduction_step_1d_implicit:d_flux_limiter_faces",
         static_cast<std::size_t>(n_cells) * sizeof(double)));
-    // BUG-19: the limiter estimate follows the face_kappa_policy of the
+    // Face-kappa-policy consistency fix: the limiter estimate follows the policy of the
     // consuming build kernel (guards mirror the build dispatch below;
     // test-kappa paths never dispatch Kirchhoff).
     const char* limiter_policy_env =
@@ -4826,7 +4826,7 @@ ConductionResult conduction_step_1d_sts(core::State& state,
     d_flux_limiter_faces = static_cast<double*>(core::device_scratch_acquire(
         "conduction:conduction_step_1d_sts:d_flux_limiter_faces",
         static_cast<std::size_t>(n_cells) * sizeof(double)));
-    // BUG-19: the limiter estimate follows the face_kappa_policy of the
+    // Face-kappa-policy consistency fix: the limiter estimate follows the policy of the
     // consuming stage kernel (guards mirror the stage dispatch below; the
     // test-kappa/nlheat paths never dispatch Kirchhoff, so test_kappa <= 0
     // is the complete guard here).

@@ -181,15 +181,15 @@ struct CentralPseudoCoreState {
   bool valid = false;
   double s_c = 0.0;
   int representative_cell = -1;
-  // Dynamic complete-ring absorption (high-AI verdict Phase-2): when the
+  // Dynamic complete-ring absorption: when the
   // first active ring is crushed below tau*V_birth, rebuild the macro cell
   // with one more ring (env TENRYU_I1B_RING_ABSORB).
   int member_ring_count = 0;
   int min_member_ring_count = 0;
   int absorbed_ring_count = 0;
-  // Emergency mixed-material absorption (macro-boundary endgame verdict):
+  // Emergency mixed-material absorption (macro-boundary terminal-phase verdict):
   // rows absorbed BEYOND the pure-gas prefix. > 0 marks the run as a
-  // "mixed-core endgame" — the macro CV then contains dense-shell material
+  // "mixed-core terminal phase" — the macro CV then contains dense-shell material
   // and gas-region metrics that count the whole macro volume carry a
   // documented caveat.
   int mixed_absorbed_row_count = 0;
@@ -242,7 +242,7 @@ struct CentralPseudoCoreState {
   // absorption: V_gas rising a factor past this minimum marks the post-peak
   // phase where eating the LAST shell row is legitimate).
   double core1d_V_gas_min_c = std::numeric_limits<double>::infinity();
-  // Terminal absorption (I1-B-R endgame, env TENRYU_I1B_TERMINAL_ABSORB):
+  // Terminal absorption (I1-B-R, env TENRYU_I1B_TERMINAL_ABSORB):
   // when the rebound-phase emergency walk requests the structurally
   // unabsorbable LAST shell row, the whole remaining 2D mesh is absorbed
   // into the stratified 1D sub-model and the run completes as a core1d-only
@@ -531,7 +531,7 @@ struct State {
   int ring7_pole_cap_validation_cell = -1;
   double ring7_pole_cap_validation_dt = 0.0;
   double ring7_pole_cap_eta_prod_proxy = 0.0;
-  // --- Per-material conservation arrays (Stage 32a Wave A) ---
+  // --- Per-material conservation arrays ---
   // Cell-major layout: idx_cm = c * n_mat + m. All extensive (cgs).
   // Disabled by default via numerics.materials.per_material_conservation_enabled.
   CellField1D mass_per_material;  // [n_cells * n_mat] [g]
@@ -662,14 +662,14 @@ struct State {
   GroupField1D sn_face_flux_limited;  // 1D: [(n_cells+1) * G]; 2D: [(n_R_faces+n_Z_faces) * G], [erg/cm^2/s]
   GroupField1D sn_face_alpha;         // 1D: [(n_cells+1) * G]; 2D: [(n_R_faces+n_Z_faces) * G], dimensionless
   GroupField1D sn_stream_theta;      // [n_cells * G], donor streaming limiter theta [dimensionless]
-  // BUG-21b: pass-1 donor-only theta (inflow-credit pass 2 writes the final
+  // Pass-1 donor-only theta (inflow-credit pass 2 writes the final
   // theta into sn_stream_theta).
   GroupField1D sn_stream_theta_donor;
   GroupField1D sn_E_star_flux;       // [n_cells * G], face-flux E* [erg/cm^3]
   GroupField1D sn_diag_E_star_flux;  // [n_cells * G], always-written face-flux E* diagnostic
   GroupField1D sn_psi_scratch;
   GroupField1D sn_psi_outgoing_scratch;
-  // BUG-21: previous-step angular intensity psi^n (n_cells*groups*angles).
+  // Previous-step angular intensity psi^n (n_cells*groups*angles).
   // Persists across radiation steps so the backward-Euler time source is
   // per-angle (inv_cdt * psi_prev) instead of the isotropized
   // 0.5*inv_cdt*c*rad_E_old (which made transparent-medium fronts diffusive).
@@ -742,7 +742,7 @@ struct State {
   double fld_outer_residual = 0.0;
   std::uint64_t cg_cap_exit_unconverged = 0;
   std::uint64_t newton_cap_exit_unconverged = 0;
-  // Phase 2a-1.5 diagnostics (variant A)
+  // FLD solver diagnostics
   int fld_clamp_hits_step = 0;                  // sum over Picard outers
   double fld_clamp_energy_delta_step = 0.0;     // sum V*(x_pub - x_raw)
   double fld_min_x_raw_step = 0.0;              // min over Picard outers
@@ -813,7 +813,7 @@ struct State {
   double sn_inner_residual = 0.0;
   double sn_escaped_step = 0.0;
   double sn_marshak_in_step = 0.0;
-  // AI review k06 C8 (2026-07-26): per-step void-anchor energy ledger —
+  // 2026-07-26 review: per-step void-anchor energy ledger —
   // signed and absolute sums of V*(E_after - E_before) over every anchor
   // application in the step (1D SN). A validation run can require the abs
   // sum == 0 before trusting the run as an independent S_N reference.

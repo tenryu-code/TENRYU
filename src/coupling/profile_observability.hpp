@@ -70,7 +70,7 @@ struct EscapeValveEvent {
   double E_thermal_after = 0.0;
   double E_kinetic_before = 0.0;
   double E_kinetic_after = 0.0;
-  // Stage 27 wires transfer terms as explicit zeros unless a rescue path
+  // Transfer terms are wired as explicit zeros unless a rescue path
   // exposes source-term transfer data.
   double mass_transfer = 0.0;
   double momentum_transfer_R = 0.0;
@@ -102,8 +102,8 @@ struct ProfileObservability {
   int public_baseline_terminal_failures = 0;
   bool emergency_cell_deactivation_fired = false;
 
-  // Stage 30 Wave A skeleton: class-(d) PLIC degradation tracking.
-  // Wiring (note_plic_*) is Wave B. Wave A only declares storage.
+  // PLIC degradation-tracking skeleton (class (d)).
+  // Wiring (note_plic_*) came later; this declares storage only.
   struct PlicDegradationEvent {
     std::uint8_t case_id = 0;
     std::uint8_t severity = 0;

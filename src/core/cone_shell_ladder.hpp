@@ -444,7 +444,7 @@ inline double adjacent_ratio(const std::vector<double>& q,
 // Normalized along-wall MONITOR measure u_monitor(q): the per-segment
 // equidistributed station-count fraction (NOT the geometric fraction q/L_w,
 // and NOT the station index fraction j/N_q — those coincide only segment-wise
-// up to the l_ratio_max repair band). See docs/design/cone_assembly_smooth_joins_20260720.md Stage 0.
+// up to the l_ratio_max repair band). See docs/design/cone_assembly_smooth_joins_20260720.md.
 inline double cone_shell_along_wall_monitor_measure(
     const double q, const ConeShellAlongWallSpec& spec) {
   if (q <= 0.0) {

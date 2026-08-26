@@ -316,7 +316,7 @@ __device__ inline void enforce_2t_closure_kernel_body(
   const double rho_i = fmax(rho[i], 1.0e-30);
   // Per-cell effective ideal-gas properties (State::ensure_cell_material_props
   // is the single source of truth; historic behavior used materials[0] for
-  // every cell, which poisoned multi-material closures — see BUG-1).
+  // every cell, which poisoned multi-material closures before the shared-properties fix).
   const double gamma = fmax(gamma_eff[i], 1.0 + 1.0e-12);
   const double A = fmax(A_eff[i], 1.0e-12);
   const bool allow_table_energy_writeback =
@@ -1173,7 +1173,7 @@ __device__ inline void follow_void_nodes_1d_body_persistent(
     const double rho_void) {
   // Void cells carry no forces, so their interior nodes never move on their
   // own and a Lagrangian edge expanding into the void region inverts cells
-  // (BUG-5). Re-space the void-interior nodes uniformly between the plasma
+  // Void-interior respacing fix: re-space the nodes uniformly between the plasma
   // edge node (owned by the last real cell — never touched here) and the
   // outer boundary node (owned by the free-boundary physics). Void masses
   // are re-pinned to rho_void * V so the placeholder cells keep their floor

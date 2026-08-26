@@ -3703,7 +3703,7 @@ void HistoryWriter::append_record_to_file(
                       static_cast<std::int32_t>(rec.snb_nonconverged_steps), "count");
     // 2D residual is a pair POWER (erg/s), not the 1D face flux; this tree
     // is 2D-only for SNB (1D fail-closed) — per-dimension reconciliation at
-    // the 1d-brushup merge train (2d_snbtr closure A1.3.4).
+    // the feature/1d-brushup merge (2d_snbtr closure).
     append_scalar_double(file, base + "picard_resid_last",
                          rec.snb_picard_resid_last, "erg/s");
     append_scalar_i32(file, base + "cap_faces_99_last",

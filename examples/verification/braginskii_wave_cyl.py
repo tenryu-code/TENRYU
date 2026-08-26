@@ -1,7 +1,7 @@
 from tenryu_namelist import *
 import math
 
-# W-H N1 gate deck: cylindrical standing sound wave (first rigid-wall
+# Braginskii standing-wave null gate deck: cylindrical standing sound wave (first rigid-wall
 # radial acoustic eigenmode u ~ J1(k r), kR = j_{1,1}); otherwise a
 # verbatim mirror of braginskii_wave.py. See wh_braginskii_viscosity_design.md N1.
 

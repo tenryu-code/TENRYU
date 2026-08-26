@@ -809,7 +809,7 @@ HllcZFlux2DRZResult apply_hllc_z_flux_2d_rz(
   result.applied = true;
   TENRYU_ASSERT(
       state.corner_stride == 4,
-      "corner_stride != 4: HLLC z-flux corner path is staged (ALE P2-1c/P2-4+)");
+      "corner_stride != 4: HLLC z-flux corner path is staged for a later revision");
   TENRYU_ASSERT(cfg.main.dimension == "2D_RZ",
                 "HLLC z flux is supported only in 2D_RZ");
   TENRYU_ASSERT(cfg.numerics.hydro.total_energy_remap_2d_rz,

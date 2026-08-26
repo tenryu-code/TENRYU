@@ -897,7 +897,7 @@ inline std::array<int, 4> mesh_topo_cell_corner_nodes(
       mb.cell_node_csr_offsets[static_cast<std::size_t>(c) + 1U];
   TENRYU_ASSERT(next - off == kMeshTopoCellStorageSlots,
                 "quad (stride-4) storage accessor; pentagon-belt meshes are not "
-                "supported here (ALE P2-3)");
+                "supported here yet");
   TENRYU_ASSERT(off >= 0, "multiblock cell-node CSR offset must be non-negative");
   TENRYU_ASSERT(static_cast<std::size_t>(off) +
                     static_cast<std::size_t>(kMeshTopoCellStorageSlots) <=
@@ -1003,7 +1003,7 @@ inline std::array<int, 4> mesh_topo_cell_face_adjacent_cells(
       mb.face_adj_csr_offsets[static_cast<std::size_t>(c) + 1U];
   TENRYU_ASSERT(next - off == kMeshTopoCellStorageSlots,
                 "quad (stride-4) storage accessor; pentagon-belt meshes are not "
-                "supported here (ALE P2-3)");
+                "supported here yet");
   TENRYU_ASSERT(off >= 0,
                 "multiblock face-adjacency CSR offset must be non-negative");
   TENRYU_ASSERT(static_cast<std::size_t>(off) +
@@ -1097,7 +1097,7 @@ inline std::array<int, 4> mesh_topo_cell_face_bc_tags(
       mb.face_adj_csr_offsets[static_cast<std::size_t>(c) + 1U];
   TENRYU_ASSERT(next - off == kMeshTopoCellStorageSlots,
                 "quad (stride-4) storage accessor; pentagon-belt meshes are not "
-                "supported here (ALE P2-3)");
+                "supported here yet");
   TENRYU_ASSERT(off >= 0, "multiblock face-tag offset must be non-negative");
   TENRYU_ASSERT(static_cast<std::size_t>(off) +
                     static_cast<std::size_t>(kMeshTopoCellStorageSlots) <=

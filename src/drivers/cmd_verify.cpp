@@ -3318,7 +3318,7 @@ bool run_sod_planar_verify() {
 // (machine) + untouched far-field. Part C: in-gate nr self-convergence
 // (400/800/1600) with a shock-dominated order estimate. Seven runs total,
 // each a FRESH deck load (driver.run in-memory re-entry is unsupported and
-// pumps energy — W-H lesson).
+// pumps energy — a Braginskii-verify lesson).
 struct SodCylRun {
   std::vector<double> rho;
   std::vector<double> xr;
@@ -9237,7 +9237,7 @@ bool run_sn_1d_marshak_equilibration_impl(const std::string& label,
   }
   // Shell geometry (r0 > 0) isolates the OUTER marshak BC; the sweep's
   // origin parity acts as a mirror at the inner face. Full-sphere probing
-  // via TENRYU_SN_MARSHAK_DIAG_R0=0 also passes since the BUG-8 fix
+  // via TENRYU_SN_MARSHAK_DIAG_R0=0 also passes since the conservative-streaming fix
   // (conservative FV streaming); the historical S8 center deficit is gone.
   const char* diag_r0 = std::getenv("TENRYU_SN_MARSHAK_DIAG_R0");
   const double gate_r0 = (diag_r0 != nullptr && diag_r0[0] != 0)
@@ -9299,7 +9299,7 @@ bool run_sn_1d_marshak_equilibration_impl(const std::string& label,
     }
   }
   // Gate scope: the outer marshak BC AND the conservative sweep. With the
-  // BUG-8 fix (conservative FV streaming + Morel-Montry weighted diamond +
+  // Conservative-streaming fix (conservative FV streaming + Morel-Montry weighted diamond +
   // Miller-Alcouffe starting direction) the uniform blackbody field is a
   // machine-precision fixed point and the whole domain reaches the plateau
   // to ~1e-6; the tolerances are set accordingly (they were 5e-3 / 5e-2
@@ -9527,11 +9527,11 @@ bool run_sn_1d_planar_slab_attenuation_verify() {
 }
 
 bool run_sn_1d_planar_transparent_gap_verify() {
-  // BUG-21 regression gate: a Marshak front crossing an optically transparent
+  // Void-anchor regression gate: a Marshak front crossing an optically transparent
   // gap must arrive ballistically (per-angle psi persistence, not the
   // isotropized rad_E_old time source), must never exceed the drive energy
   // density (donor-theta two-pass inflow credit), and transparent-cell rad_E
-  // must track the transport moments (BUG-21c void anchor). The pre-fix code
+  // must track the transport moments (void anchor). The pre-fix code
   // crept diffusively (arrival ~25x causal here) and spiked to 2.4x the drive.
   if (!verify_cuda_available("sn_1d_planar_transparent_gap")) {
     return true;
@@ -9581,7 +9581,7 @@ bool run_sn_1d_planar_transparent_gap_verify() {
   planck.build(groups, 32, 1.0e-2, 1.0e4);
 
   const double c_light = core::constants::c_light;
-  const double dt = 8.0e-13;  // c*dt ~ 4.8 dx: the regime where BUG-21 crept
+  const double dt = 8.0e-13;  // c*dt ~ 4.8 dx: the regime that exposed the void-anchor defect
   const double E_drive = core::constants::a_eV * Tr * Tr * Tr * Tr;
   // Arrival cell = the gap cell adjacent to the wall; the front travels from
   // the outer marshak face down to its center.
@@ -9611,7 +9611,7 @@ bool run_sn_1d_planar_transparent_gap_verify() {
       t_arrive = dt * static_cast<double>(s);
     }
   }
-  // BUG-21c void contract at the final step: transparent cells must carry
+  // Void-anchor contract at the final step: transparent cells must carry
   // rad_E == phi/c (lambda_pa ~ 2.4e-8 << the 1e-4 anchor threshold; the
   // wall cells stay on the flux-form ledger and are NOT asserted here).
   const auto E_final = copy_field_to_host(state.rad_E);

@@ -72,7 +72,8 @@ elif MODE in (
     "i1c_grey_fld_10pct_powerstress",
     "i1d_grey_fld_25pct_powerstress",
 ):
-    # Ladder rows stay at 5e-11 s for Wave 1; first-shock convergence is Wave 2.
+    # Ladder rows stay at 5e-11 s for the base battery; first-shock convergence
+    # is handled by the dedicated analyzer.
     T_END_DEFAULT = 5.0e-11
 T_END = _env_float("TENRYU_I1_T_END_S", T_END_DEFAULT)
 DT_INITIAL = _env_float("TENRYU_I1_DT_INITIAL_S", 2.0e-13)
@@ -126,7 +127,7 @@ ALE_EVERY_N_STEPS = _env_int("TENRYU_I1_ALE_EVERY_N_STEPS", 5)
 AXIS_REPAIR_MODE = os.environ.get("TENRYU_I1_AXIS_REPAIR_MODE", "axis_spine_only")
 REMAP_SCHEME = os.environ.get("TENRYU_I1_REMAP_SCHEME", "ms2_moments")
 REMAP_MS2_LIMITER = os.environ.get("TENRYU_I1_REMAP_MS2_LIMITER", "van_leer")
-# Stage 19 Phase 2 mesh-stability flags (Stage 20 empirical validation)
+# Mesh-stability flags (empirically validated)
 PHASE2_MESH_GEOMETRY_SOFT_FAIL = _env_bool("TENRYU_I1_MESH_GEOMETRY_SOFT_FAIL", False)
 PHASE2_IN_HYDRO_CORNER_J_GUARD = _env_bool("TENRYU_I1_IN_HYDRO_CORNER_J_GUARD", False)
 PHASE2_REGIME_AWARE_CORNER_J_GUARD = _env_bool("TENRYU_I1_REGIME_AWARE_CORNER_J_GUARD", False)

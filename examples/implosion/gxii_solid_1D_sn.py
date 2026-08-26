@@ -2,7 +2,7 @@
 
 Equivalent to examples/implosion/gxii_solid_1D.py but with:
 - Radiation mode = sn_transport (instead of legacy IMC/DDMC)
-- 1D pure Lagrangian hydro (1D ALE removed in ALE-FIX-1)
+- 1D pure Lagrangian hydro (1D ALE removed in the ALE cleanup)
 
 Pulse: Gaussian, FWHM=1.3 ns, peak at t=1.3 ns, integrated energy
   E_TOTAL = 300 J × 12 beams = 3600 J, 1 effective beam in 1D_SPH.

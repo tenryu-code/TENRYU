@@ -1,7 +1,7 @@
 """2D RZ z-slab FLD-CED grey radiative-shock deck.
 
 PR 4 promotes this deck to the production strict I1 2D RZ gate. The default
-time horizon is the Wave 10 production scale,
+time horizon is the production scale,
 max(5 tau_rel, 3 L / |u_upstream|).
 
 PR 4.8: I1 production gate is now a shock-frame stationary benchmark.
@@ -75,7 +75,7 @@ if INIT_MODE not in ("reference_table", "two_state"):
 # (emergency_cell_deactivation = thermal_subcycle_floor_hit =
 #  axis_spike_floor = newton_invalid = 0) remains satisfiable.
 I1_2D_RZ_ALE = _env_bool("TENRYU_I1_2D_RZ_ALE_ENABLED", True)
-# PR 4.3 fallback (per high-AI consultation 2026-05-15): annular+conduction-off
+# 2026-05-15 external-review fallback: annular+conduction-off
 # was insufficient; apply stronger AV (av_C1 0.1->0.5, av_C2 1.5->2.0), tighter
 # hydro CFL (0.2->0.1), and ALE every step (5->1).
 I1_2D_RZ_ALE_EVERY_N_STEPS = _env_int("TENRYU_I1_2D_RZ_ALE_EVERY_N_STEPS", 1)
@@ -200,7 +200,7 @@ U_TABLE = [float(x) for x in TABLE["u_cm_per_s"]]
 R_MIN = _env_float("TENRYU_I1_2D_RZ_R_MIN_CM", 0.5)  # PR 4.2: annular slab, axis row removed
 R_MAX = _env_float("TENRYU_I1_2D_RZ_R_MAX_CM", 10.0)
 I1_2D_RZ_ANNULAR_SLAB = R_MIN > 0.0
-# PR 4.6 enabled r_inner="reflect" for 2D_RZ when r_min > 0 (annular).
+# r_inner="reflect" is supported for 2D_RZ when r_min > 0 (annular).
 # r_inner="axis" with r_min > 0 was a legacy ambiguity (semantically reflective).
 R_INNER_BC = "reflect" if R_MIN > 0.0 else "axis"
 Z_MIN = _env_float("TENRYU_I1_2D_RZ_Z_MIN_CM", X_TABLE[0])
@@ -431,7 +431,7 @@ Numerics(
     radiation_thermal_subcycle=not I1_2D_RZ_HYDRO_ONLY,
     dt=dict(
         initial_s=DT_INITIAL,
-        # PR 4.3 fallback (per high-AI consultation 2026-05-15): hydro CFL 0.2->0.1.
+        # 2026-05-15 external-review fallback: hydro CFL 0.2->0.1.
         cfl_hydro=I1_2D_RZ_CFL_HYDRO,
         cfl_cond=0.3,
         growth_factor=1.1,
@@ -441,7 +441,7 @@ Numerics(
     hydro=dict(
         enabled=True,
         boundary_2d=HYDRO_BOUNDARY,
-        # PR 4.3 fallback (per high-AI consultation 2026-05-15): AV 0.1/1.5->0.5/2.0.
+        # 2026-05-15 external-review fallback: AV 0.1/1.5->0.5/2.0.
         av_C1=I1_2D_RZ_AV_C1,
         av_C2=I1_2D_RZ_AV_C2,
         total_energy_remap_2d_rz=TOTAL_ENERGY_REMAP,

@@ -1,5 +1,5 @@
-// This is the ONLY donor-decision point for swept-volume remap (AI-review R1 /
-// Amendment A); new consumers must take OrientedSweptVolume or
+// This is the ONLY donor-decision point for swept-volume remap (2026-07-26
+// review); new consumers must take OrientedSweptVolume or
 // SweptVolumeConvention, never a raw bool with a default.
 #pragma once
 

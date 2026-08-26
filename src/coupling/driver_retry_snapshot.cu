@@ -498,9 +498,9 @@ void capture_driver_retry_snapshot(DriverRetrySnapshot& snap,
   snap.state_supply_mask = state.state_supply_mask;
   snap.cell_is_void = state.cell_is_void;
   // Active/void masks encode topology decisions. Emergency ALE cell
-  // deactivation (Phase 2d-ext-v5 Wave 7) must persist across hydro retries
+  // deactivation (emergency-cell-deactivation feature) must persist across hydro retries
   // instead of being rewound with transient hydro state.
-  // state_supply_mask (Phase 2c RH1 LE BC) is also re-applied each step from
+  // state_supply_mask (RH1 state-supply BC) is also re-applied each step from
   // the BC config, so excluding it from snapshot is safe.
 
   snap.E_safety = state.E_safety;
@@ -731,7 +731,7 @@ void restore_driver_retry_snapshot(tenryu::core::State& state,
   state.holo_mass_q = snap.holo_mass_q;
   state.holo_lo_weight = snap.holo_lo_weight;
   // Keep active/void masks as they stand after any retry-local topology update
-  // (Phase 2d-ext-v5 Wave 7 emergency cell deactivation persistence).
+  // (Emergency-cell-deactivation persistence.)
   if (restore_transient_topology_masks) {
     state.hydro_active = snap.hydro_active;
     state.state_supply_mask = snap.state_supply_mask;

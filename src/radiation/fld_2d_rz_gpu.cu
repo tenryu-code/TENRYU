@@ -53,7 +53,7 @@ constexpr int kFldBcStateSupply = 3;
 constexpr int kStateSupplyBoundaryPolicyLocalDCurrent = 0;
 constexpr int kStateSupplyBoundaryPolicyHarmonicGhostDTest = 1;
 constexpr int kStateSupplyBoundaryPolicyRadialMeanDTest = 2;
-// Phase 2a-1.5d: Minimum cell-center distance for FLD interior face
+// Minimum cell-center distance for the FLD interior-face contract
 // coupling. Below this, the mesh is considered degenerate (pinch or
 // inversion); the face contributes no diffusion flux. 1e-12 cm is well
 // below typical ICF mesh scales (1e-4 cm cell size) and represents a
@@ -1454,7 +1454,7 @@ __device__ double fld_rhs_source_rate(const double* __restrict__ eta,
   const double E_old = nonnegative_finite(rad_E_old[cg]);
   double source = nonnegative_finite(eta[cg]);
   if (fleck != nullptr && sigma_pa != nullptr) {
-    // BUG-11: fleck is a cg array (see nlte_coeffs.cu layout contract);
+    // Fleck-array layout contract: fleck is a cg array (see nlte_coeffs.cu);
     // the bare-cell read consumed group 0's f for every group when G > 1.
     const double f = fmin(fmax(finite_or_zero(fleck[cg]), 0.0), 1.0);
     source = f * source +
@@ -1685,7 +1685,7 @@ __global__ void assemble_fld_2d_csr_kernel(
   const double E_old = nonnegative_finite(rad_E_old[cg]);
   const double sigma_pa_value =
       (sigma_pa != nullptr) ? nonnegative_finite(sigma_pa[cg]) : sig;
-  // BUG-11: cg read (see nlte_coeffs.cu layout contract).
+  // Fleck-array layout contract: cg read (see nlte_coeffs.cu).
   const double fleck_f =
       (fleck != nullptr) ? fmin(fmax(finite_or_zero(fleck[cg]), 0.0), 1.0) : 1.0;
   const double eta_value = nonnegative_finite(eta[cg]);
@@ -2755,7 +2755,7 @@ __global__ void cg_update_x_r_kernel(double* __restrict__ x,
   if (i >= n) {
     return;
   }
-  // Phase 2a-1.5: removed in-loop fmax(..., 0.0) clamp on x.
+  // Removed in-loop fmax(..., 0.0) clamp on x.
   // Clamp inside CG breaks the invariant r = b - A x because r is updated
   // by the unclamped linear recurrence below. Positivity is now enforced
   // at publish time with diagnostics.
@@ -2862,7 +2862,7 @@ __global__ void cg_update_x_r_from_dev_kernel(
   if (i >= n) {
     return;
   }
-  // Phase 2a-1.5 contract as in cg_update_x_r_kernel: no in-loop clamp.
+  // Contract as in cg_update_x_r_kernel: no in-loop clamp.
   x[i] = finite_or_zero(x[i]) + alpha_s * finite_or_zero(p[i]);
   r[i] = finite_or_zero(r[i]) - alpha_s * finite_or_zero(Ap[i]);
 }
@@ -3271,7 +3271,7 @@ __global__ void compute_row_identity_diagnostic_kernel(
   const double E_old = nonnegative_finite(rad_E_old[cg]);
   const double E_new = nonnegative_finite(rad_E[cg]);
   const double eta_v = nonnegative_finite(eta[cg]);
-  // BUG-11: mirror the assembly's cg read (fleck is a [n_cells x n_groups]
+  // Fleck-array layout contract: mirror the assembly's cg read (fleck is a [n_cells x n_groups]
   // array; layout contract in nlte_coeffs.cu) so this diagnostic recomputes
   // exactly what assemble_fld_2d_csr_kernel assembles for G > 1.
   const double f = (fleck != nullptr)
@@ -4142,7 +4142,7 @@ __global__ void update_matter_kernel(
                                fmax(T, temperature_floor_eV)
                          : 1.0;
     if (fld_fleck != nullptr) {
-      // BUG-11: fleck is a cg array; the per-cell diagnostic takes the cell's
+      // Fleck-array layout contract: fleck is a cg array; the per-cell diagnostic takes the cell's
       // group-0 slot (producers broadcast one gray f per cell to all groups).
       const double f = (fleck != nullptr)
                            ? fmin(fmax(finite_or_zero(fleck[c * n_groups]), 0.0), 1.0)
@@ -4843,7 +4843,7 @@ void compute_cell_centers(core::State& state, const int nr, const int nz) {
     state.fld_cell_rc.reset(static_cast<std::size_t>(n_cells));
     state.fld_cell_zc.reset(static_cast<std::size_t>(n_cells));
   }
-  // Phase 2a-1.5c: Always recompute. The previous cache-skip logic
+  // Always recompute. The previous cache-skip logic
   // (resize / step==0 / holo_ale_invalidated) was unsafe because normal
   // 2D Lagrangian hydro updates state.x_r/x_z every step WITHOUT setting
   // holo_ale_invalidated. Stale rc/zc caches → asymmetric face distances
@@ -8261,7 +8261,7 @@ void advance_radiation_step_fld_2d_rz(
   // ~(1-f) c sigma (E_old-E_now) per step. The unconditional start-of-solve
   // copy is byte-identical for every config whose rad_E is untouched between
   // solves — including the ALE case previously covered by
-  // initialize_rad_E_old_if_needed — and correct under coupling. BUG-14b:
+  // initialize_rad_E_old_if_needed — and correct under coupling. The rad_E_old init fix uses the
   // same repair as the 1D gamma_r arc, fld_1d_gpu.cu advance.)
   copy_rad_E_to_old(state, n_cells, n_groups);
 
@@ -9077,7 +9077,7 @@ void advance_radiation_step_fld_2d_rz(
               "FLD2D matter Newton reject/invalid/cap counts: r=" +
               std::to_string(reject_count) + " i=" +
               std::to_string(invalid_count) + " c=" +
-              std::to_string(cap_count) + " (BUG-14 visibility)");
+              std::to_string(cap_count) + " (cap-count visibility)");
           warned_newton_visibility = true;
           last_reject_count = reject_count;
           last_invalid_count = invalid_count;

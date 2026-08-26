@@ -478,7 +478,7 @@ __global__ void snb_dq_theta_kernel(double* __restrict__ dq_face,
 // (conduction_bodies.cuh conduction_1d_sts_stage_*_kernel_body) with the face
 // flux replaced by theta * (k grad Te - dq_phys). Existing kernels/bodies stay
 // byte-untouched (bitwise-safety strategy, design §3.5). The floor throttle is
-// inherited as-is (per-cell alpha; BUG-15 family fix arrives via merge train).
+// inherited as-is (per-cell alpha; the pair-min alpha revision arrives with the 1D merge).
 template <int GEOM, bool KIRCHHOFF>
 __global__ void snb_stage_kernel(const double* __restrict__ Te_old,
                                  double* __restrict__ Te_new,

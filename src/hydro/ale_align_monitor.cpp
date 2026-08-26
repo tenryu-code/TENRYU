@@ -19,8 +19,8 @@ namespace {
 constexpr double kPi = 3.141592653589793238462643383279502884;
 constexpr double kWlsDetFloor = 1.0e-30;
 constexpr double kSmoothingBlend = 0.25;
-// PROVISIONAL(Stage 0): §5.9 does not provide s_{phi,0}, epsilon_g,
-// epsilon_Q, or epsilon_h. Keep these diagnostics-local until a later stage
+// PROVISIONAL: §5.9 does not provide s_{phi,0}, epsilon_g, epsilon_Q, or
+// epsilon_h. Keep these diagnostics-local until a later revision
 // promotes them to configured monitor parameters.
 constexpr double kStrengthScaleRho = 1.0;
 constexpr double kStrengthScalePressure = 1.0;
@@ -149,7 +149,7 @@ double topology_weight(const Input& input, const int i) {
       i >= input.polar_prefix_nr + input.morph_rings) {
     return 0.0;
   }
-  // PROVISIONAL(Stage 0): Stage 4 will replace this index-only topology
+  // PROVISIONAL: a later revision will replace this index-only topology
   // approximation with mesh-generation metadata.
   return clamp01(1.0 -
                  (static_cast<double>(i - input.polar_prefix_nr) + 0.5) /
@@ -308,7 +308,7 @@ Tensor2 build_structure_tensor(const double grad_rho_r,
                                double* S_p) {
   const double rho_norm = std::hypot(grad_rho_r, grad_rho_z);
   const double pressure_norm = std::hypot(grad_p_r, grad_p_z);
-  // PROVISIONAL(Stage 0): h_cell=sqrt(general-quad area) represents the
+  // PROVISIONAL: h_cell=sqrt(general-quad area) represents the
   // Jacobian-derived reference length requested by consult §5.3.
   const double s_rho = cell_length * rho_norm;
   const double s_pressure = cell_length * pressure_norm;
@@ -424,7 +424,7 @@ Result compute_monitor(const Input& input, const Params& params) {
         const double fraction =
             input.vol_frac[c * static_cast<std::size_t>(input.n_materials) +
                            static_cast<std::size_t>(m)];
-        // Stage 0 uses volFrac only; PLIC-derived interface masks are ignored.
+        // The current implementation uses volFrac only; PLIC-derived interface masks are ignored.
         if (fraction > 0.01 && fraction < 0.99) {
           interface_mask[c] = 1U;
           break;
@@ -491,9 +491,9 @@ Result compute_monitor(const Input& input, const Params& params) {
     }
   }
 
-  // One fixed smoothing pass. PROVISIONAL(Stage 0): §5.5 leaves omega_cd
+  // One fixed smoothing pass. PROVISIONAL: §5.5 leaves omega_cd
   // unspecified, so face neighbors use unit weights. Polar and polar_in_box
-  // tensors are smoothed in global (r,z) components until Stage 4 supplies an
+  // tensors are smoothed in global (r,z) components until a later revision supplies an
   // unambiguous local reference basis.
   std::vector<Tensor2> smooth_Q = raw_Q;
   constexpr std::array<std::pair<int, int>, 4> face_neighbors = {

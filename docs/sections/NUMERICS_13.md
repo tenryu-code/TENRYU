@@ -49,7 +49,7 @@ production 構成である。
 - 境界非球性診断: 境界ループ物理弧 (軸閉鎖除外) の Legendre ℓ≤4
   分解 (`TENRYU_I1B_CORE1D_ASPH_EVERY`、handoff 前後は常時)。
 
-### 13.4 終端吸収と core1d 単独 tail (I1-B-R endgame)
+### 13.4 終端吸収と core1d 単独 tail (I1-B-R terminal absorption)
 - **rebound 期の壁の実測機構**: 吸収 walk が shell 行を消費し尽くすと
   生存 2D shell は最終 1 行のみとなり、内側行 (macro 境界) と外側行
   (物理境界) の全節点が契約 pin 済み = 修復自由度ゼロ (予測計量 TMOP は
@@ -137,7 +137,7 @@ ICF 燃焼域は Γ_e~0.01-0.14 の弱結合で A4 枝が operative）。両モ�
 F_CD = 1.002 (10 g/cc, 3 keV) 〜 1.08 (10³ g/cc, 1 keV)。設計・凍結参照値は
 `docs/design/burn_kernel_v2_20260710.md` §B。
 
-> **ガード（2026-07-26, AI review k14 §4.5）**: Salpeter は非有限/非正の入力
+> **ガード（2026-07-26）**: Salpeter は非有限/非正の入力
 > （T_i, T_e, n_e）で全反応 F=1 に落として one-shot WARNING、指数は
 > \(h \le h_{max}=2\) にクランプ（弱遮蔽模型の有効域外 — \(e^2\simeq7.4\) 倍で頭打ち、
 > 超過は one-shot WARNING）。2T Debye 形は Salpeter 1954 の平衡理論の
@@ -153,15 +153,15 @@ gate G0 f_r ≤ 1 が常設番人）。将来の ALE/remap 結合は Y_s の質�
 
 ステップ内は温度・密度凍結の per-cell 常微分方程式を RK2（explicit midpoint）で
 subcycle：\(M=\mathrm{clamp}(\lceil dt\,\max_s q_s/\max(n_s, 10^{-9}n_{tot})/\varepsilon_{dep}\rceil, 1, M_{max})\)、
-\(q_s = \max(q_s^+, q_s^-)\)（**総生成と総消費の大きい方** — 2026-07-26 修正,
-AI review k14 B-2: 旧実装は net \(|\dot n_s|\) を使っており、DD-bred T が DT 消費と
+\(q_s = \max(q_s^+, q_s^-)\)（**総生成と総消費の大きい方** — 2026-07-26 修正:
+旧実装は net \(|\dot n_s|\) を使っており、DD-bred T が DT 消費と
 釣り合うセルで短い turnover が不可視だった。総量制御への修正で純消費燃料
 （pure-DT deck）は bit 不変）。
 制御対象は**有効チャネルの反応物種すべて（成長含む）** — 微量 bred-T（DD→DT 連鎖）の
 分解能欠落は G-R1c（scipy LSODA rtol 1e-12 凍結参照との 3 checkpoint 照合 rel ≤ 1e-6）が
 検出した実障害モードで、消費種限定制御は棄却済み。gross-turnover 回帰は
 G-R1d（R_DDp≒R_DT の人工均衡で required substeps が飽和すること）。
-\(M_{req} > M_{max}\) の飽和は黙認しない（k14 B-3）: 必要数を報告し、
+\(M_{req} > M_{max}\) の飽和は黙認しない（2026-07-26 カーネルレビュー指摘）: 必要数を報告し、
 \(0.9\,dt\,M_{max}/M_{req}\) を burn dt 制限（state.burn_dt_limit_s、次ステップ制御）
 へ畳み込み、rate-limited WARNING を出す。current-step retry 化は driver
 transaction 拡張が必要で escalate 済み（同 dt 内の当該ステップは M_max で受理される
@@ -199,7 +199,7 @@ R_b = 最外燃料セル外縁、ρ̄ は外向き radial 台形 column の平�
 u²=v_t²+v_f²）を初期化時に減速積分し、
 **(log T_e × log T_i × log n_e) 64×16×16 表 × 生成物 slot** に凍結
 （runtime Python 不使用；slot 毎に std::async 並列 build、書込み範囲が互いに素なので
-bitwise 決定的）。**field 温度は種別**（2026-07-26 修正, AI review k14 B-1/§5.1）:
+bitwise 決定的）。**field 温度は種別**（2026-07-26 修正）:
 電子 field の熱速度は T_e、D/T/³He イオン field は T_i（\(v_f^2=2T_f/m_f\)）。
 旧実装は全 field に T_e を渡しており、\(T_e\ne T_i\) の hot-spot 形成期に
 イオン stopping と e/i 分配が系統的に誤っていた。Debye 長は電子（T_e）のまま。
@@ -253,7 +253,7 @@ D_g は flux-limited（加算型 limiter + Post-Wilson \(|\bar\mu|^{-1}=1+3e^{-(
 log 処方を含むため転写対象から棄却 — log-free 恒等式 e/i∝E^{3/2}・λ∝E² と 0-D 解析
 減速極限 \(E(t)=[(E_0^{3/2}+\gamma t_E)e^{-3t/2t_E}-\gamma t_E]^{2/3}\) が gate）。
 **イオン Coulomb log と γ は (群, セル) 毎**に群中心エネルギーで評価する
-（2026-07-26 修正, AI review k14 §6.4 — 旧実装は出生エネルギーで 1 回評価し
+（2026-07-26 修正 — 旧実装は出生エネルギーで 1 回評価し
 全群へ流用しており、最接近距離の E 依存が終端域で欠落していた）。
 t_E 非正/非有限のセルは γ が有限なら純イオン drag で減速を継続
 （\(\tau=(2/3)(E_{g+1}^{3/2}-E_g^{3/2})/\gamma\)、分配は全イオン — §6.5 修正;
@@ -262,10 +262,10 @@ t_E 非正/非有限のセルは γ が有限なら純イオン drag で減速�
 簿記はカスケード転送構成で厳密: 出生は隣接 2 群へ数+エネルギー両保存 binning
 （出生エネルギーが最上位群**中心**を超える超過分 `top_excess` は電子へ即時沈着 —
 既定格子で D³He 14.663 MeV proton は 704 keV=4.80% が該当。2026-07-26 から
-one-shot WARNING で定量報告する。格子再設計（product-aligned grid）は escalate 済み,
-AI review k14 B-5）、
+one-shot WARNING で定量報告する。格子再設計（product-aligned grid）は escalate 済み、
+2026-07-26 カーネルレビュー指摘）、
 転送 1 粒子毎に (Ē_{g+1}−Ē_g) を沈着（**e/i 分配は群内のエネルギー重み付き積分
-\(f_i=\frac{1}{\Delta E}\int S_i/F\,dE\)** — 2026-07-26 修正, AI review k14 B-4/§6.2:
+\(f_i=\frac{1}{\Delta E}\int S_i/F\,dE\)** — 2026-07-26 修正:
 旧実装は滞在時間重み \(\int(S_i/F^2)/\int(1/F)\) で、粗い群の e/i crossover 帯で
 構造的に別の積分だった。本 scheme の分配は内在で `Burn.partition` は不使用）、
 g=1 退場は Ē₁ を全イオンへ（熱化）。**在庫は比スペクトル Y_g = N_g/ρ [1/g] で持続**（§14.2 と同じ Lagrangian
@@ -295,7 +295,7 @@ history `burn/neutron_{Ti_burn,mean_shift,sigma_thermal,sigma_total}_{dt,dd}`
 Yuan-Moses-McKenty 2005 型の直線 CSDA Monte Carlo（1D 球面特化、角散乱なし —
 偏向 λ は拡散 scheme のみ）。**停止能係数は §14.7 と同一**（corman_tE/γ 共有 —
 scheme 間一致 gate が模型恒等性の検証になる）。イオン Coulomb log は
-**粒子の現在エネルギー**で毎セグメント評価（2026-07-26 修正, AI review k14 B-7 —
+**粒子の現在エネルギー**で毎セグメント評価（2026-07-26 修正 —
 旧実装は出生エネルギーで凍結、Bragg-peak 近傍の γ を誤っていた。RNG 消費は不変）。粒子 (r, μ, E, w, slot) は
 ステップ間持続 pool（時間依存近似）、出生は殻内 r³ 一様 + 等方 μ、
 **RNG は Philox / curand_init(seed^global_id, subsequence=step, offset) —
@@ -347,7 +347,7 @@ corman_diffusion_2d + driver 2D 配線）。1D との差分のみ記す：
   燃焼複合 1.38e-13、閉箱 esc_charged 0.0 厳密、10 keV で dep_e/dep_i≈5.5。
 - **2T/per-material 沈着**: dE_e/dE_i の沈着は inject_burn_source_terms
   （1D 移植）+ per_material_conservation 有効時は FLD と同一の質量比配分
-  （fld_2d_rz_gpu.cu の BUG-16 規約、max(...,0) clamp、Te/Ti_per_material
+  （fld_2d_rz_gpu.cu の per-material 沈着規約、max(...,0) clamp、Te/Ti_per_material
   キャッシュ無効化）。
 - **retry 整合**: DriverRetrySnapshot が burn 在庫・累積台帳・Y_g を
   capture/restore（STRANG では burn が hydro half より先に走るため必須）。

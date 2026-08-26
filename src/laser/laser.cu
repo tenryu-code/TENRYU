@@ -3227,7 +3227,7 @@ void laser_step(core::State& state,
         }
       }
       // Opt-in until the S1.1 physics-accuracy pass closes the march parity gap;
-      // see perf wave-3 notes.
+      // see NUMERICS §5.3.5 (2026-08-04 Bouguer fast path).
       static const bool fast_trace_enabled = [] {
         const char* s = std::getenv("TENRYU_FAST_TRACE");
         return s != nullptr && std::strcmp(s, "1") == 0;
@@ -4262,7 +4262,7 @@ void laser_step(core::State& state,
         // The RK substep cap deposits the chord's remaining energy in the
         // current cell (a thermalization-in-place fallback). Surface it —
         // the per-channel counter was previously computed but dropped
-        // (AI review k10-3.4).
+        // (2026-07-26 review).
         core::log_warning("hot_electron: " +
                           std::to_string(total_substep_cap_hits) +
                           " chord-cell march(es) hit the RK substep cap and "

@@ -5,6 +5,7 @@
 
 ---
 
+
 ## 0. 規約・単位・記号（必読）
 ### 0.1 単位（cgs + eV）
 - 長さ：cm、時間：s、密度：g/cm³、温度：eV
@@ -112,7 +113,7 @@ b_g(T)=\frac{15}{\pi^4}\int_{x_{g-1}}^{x_g}\frac{x^3}{\exp(x)-1}dx,\quad x=E/T
   この診断により「テーブル範囲不足による静かな精度劣化」を防止する。
 - **推奨範囲**：\(T_{min}^{tab} \le \min(E_0)/10\)、\(T_{max}^{tab} \ge \max(E_G) \times 10\)
   （群境界の1/10〜10倍）。Marshak/Su-Olson等の高温検証では境界温度を必ずカバーすること。
-  **記号注意（2026-07-26 明確化, AI review k12 §3.3）**：ここでの
+  **記号注意（2026-07-26 明確化）**：ここでの
   \(T_{min}^{tab}, T_{max}^{tab}\) は **`compute_T_range_eV` = \(b_g(T)\) テーブルの温度軸範囲**であり、
   上の群境界設計則（\(E_0 \ll T_{min}^{plasma}\)、\(E_G \gg T_{max}^{plasma}\)）に現れる
   **プラズマ温度範囲とは別物**。同じ記号で読むと二つの規則が逆向きに見えるが矛盾ではない
@@ -127,7 +128,7 @@ b_g(T)=\frac{15}{\pi^4}\int_{x_{g-1}}^{x_g}\frac{x^3}{\exp(x)-1}dx,\quad x=E/T
 2--5 keV 帯に 20 群を置く。
 実装（`repack_radiation_group_bounds_for_hard_xray`）は固定エッジ
 \(\{10,200,1000,2000,5000\}\) のうち \((T_{min},T_{max})\) の**内側にあるものだけ**を採用する —
-\(T_{max} < 5000\) 等でも逆転区間は生成されない（2026-07-26 明記, AI review k12 §3.4 対応）。
+\(T_{max} < 5000\) 等でも逆転区間は生成されない（2026-07-26 明記）。
 既知の設計制約：photon domain の上端が `compute_T_range_eV` の \(T_{max}\) で切られるため、
 \(T\sim T_{max}\) の黒体尾部は群外になる（\(b_g\) 再正規化が保存は維持する）。
 domain を \(15\times T_{max}\) 級へ拡張する再設計は P1 相当の follow-up。
@@ -357,7 +358,7 @@ hot-e 停止能は \(n_e\) 支配で対象外、輻射不透明度はテーブ�
 n_i = \frac{\rho}{A\,m_p} \quad [\text{cm}^{-3}]
 \]
 
-> **A の契約（2026-07-26 明文化, AI review k12 §5.6）**：`Materials.materials[*].A` は
+> **A の契約（2026-07-26 明文化）**：`Materials.materials[*].A` は
 > **イオン 1 個あたりの平均質量 [amu]** である（分子質量ではない）。化合物では
 > number fraction \(x_j\) による平均 \(\bar A = \sum_j x_j A_j\) を与えること —
 > 等原子数 CH は \(\bar A = 6.5\)（13 ではない）、CD は 7、等モル DT は 2.5、
@@ -474,7 +475,7 @@ TENRYU は **SESAME を既定テーブル EOS** として使用する。IONMIX/T
 
 2T 分離：テーブル 301 と 304 は**グリッドサイズが異なる**場合がある（例：Polystyrene 301=73×41, 304=63×33）。
 形状の異なる配列の要素ごとの減算は不可（旧実装は 301 サイズの添字で 304 配列を読む
-out-of-bounds だった — 2026-07-26 修正, AI review k11 C4）。実装（**build 時差分**）：
+out-of-bounds だった — 2026-07-26 修正）。実装（**build 時差分**）：
 - `eos_total[mat]`: テーブル 301 の固有グリッドで EOSTable を構築
 - `eos_e[mat]`: テーブル 304 の固有グリッドで EOSTable を構築（runtime の electron 参照はこのまま）
 - イオン EOS は `build_sesame_ion_table` が **301 グリッド上で build 時に差分算出**：
@@ -667,7 +668,7 @@ P_i = P_{total} - P_e,\quad e_i = e_{total} - e_e
   then recomputes \(e_e\), \(P_e\), and \(c_{v,e}\) using the forward extrapolation formulas above. The helper is opt-in;
   2D_RZ ALE post-remap reclosure uses it when `HydroEOSContext` provides table-backed EOS.
 
-**EOS 閉包のエネルギー方針（`Numerics.hydro.eos_closure_mode`、2026-07-18 BUG-24）**:
+**EOS 閉包のエネルギー方針（`Numerics.hydro.eos_closure_mode`、2026-07-18）**:
 1D の hydro 入口/出口 EOS 閉包（1T/2T の table 分岐と persistent 経路）は、table 逆算
 `device_inverse_reclose` が lower/upper clamp（目標 \(e\) が当該 \(\rho\) 行の表域外）を報告した
 セルについて、従来（`"legacy"`、bit 凍結・旧既定）は内部エネルギーを clamp 後の表値
@@ -688,9 +689,9 @@ dt 推定暴走のため射影形を維持（+17.5 J/2.5 ns の文書化残差�
 （GXII golden・fleck 0-D a–k・SN×4・Marshak feature・namelist）。QA 標準: 累積保存は
 per-step `dE_total` の総和ではなく端点閉包式 \((E_0+\sum\text{src}-E_{\rm end})-\sum\text{esc}\)
 で評価する（per-step 系列の cumsum は縫い目二重計上で 5–10× 過大）。2D_RZ の閉包は
-別構造のため本ノブの対象外（BUG-24 doc の relay 節参照）。
+別構造のため本ノブの対象外（EOS 閉包修正文書の relay 節参照）。
 
-> **追補（2026-07-26, AI review k11 C2）**: 1D ALE の post-remap EOS reclosure
+> **追補（2026-07-26）**: 1D ALE の post-remap EOS reclosure
 > （`ale_1d_driver.cu::eos_reclosure_kernel`）は上記ファミリ閉鎖から漏れており、
 > closure mode にかかわらず常に表射影を行っていた（super-ceiling 超過の無記帳破棄・
 > 表下端 clamp の無記帳注入）。修正済み: `energy_authoritative` では hydro 閉包と同じ
@@ -699,9 +700,9 @@ per-step `dE_total` の総和ではなく端点閉包式 \((E_0+\sum\text{src}-E
 > T-floor 注入は両モードで `State::E_floor_injected`（retry rollback 対象の正典 ledger）
 > へ計上する — 従来この kernel の ledger 引数は唯一の呼び出し点で `nullptr` に
 > 配線されており死んでいた。2D_RZ 側の同型経路（`ale_axis_band_controller`）は
-> 未修正（2D lane への relay）。
+> 未修正（2D 側への relay）。
 
-[BUG-26, 2026-07-20] The 1T branch of the driver EOS initialization computed
+[2026-07-20] The 1T branch of the driver EOS initialization computed
 \(e_e\) from the ideal-gas cv even for table-EOS materials (power_law_te /
 TMAT), while the 2T branch consults the table; the conduction-side
 `sync_ee_from_Te_table` never runs at init when conduction is disabled. Every
@@ -1074,7 +1075,7 @@ T_{eff} = \frac{T_i + \bar{Z}\,T_e}{1+\bar{Z}}
 ここで \(T_{eff} = (T_i + \bar{Z}\,T_e)/(1+\bar{Z})\) は圧力重み平均温度
 （\(P = P_e + P_i = n_i k_B(T_i + \bar{Z} T_e)\)）を使った等価な書き換えである。
 
-> **訂正（2026-07-26, AI review k11 §2.2）**：\(c_s^2=(\gamma_e P_e+\gamma_i P_i)/\rho\) は
+> **訂正（2026-07-26）**：\(c_s^2=(\gamma_e P_e+\gamma_i P_i)/\rho\) は
 > 「\(T_e \simeq T_i\) のときのみ有効な 1T 等価近似」ではない。電子・イオン成分が加法的
 > （\(P=\sum_k P_k(\rho,T_k)\)）で、音響摂動中に各成分が独立に断熱圧縮される
 > （e–i 交換は source operator に分離済み — TENRYU の operator splitting と整合）とき、
@@ -1171,7 +1172,7 @@ c_s^2 = \Gamma_1 \frac{P}{\rho}.
 \]
 Derivatives are the **analytic local derivatives of the bilinear-in-\((\ln\rho,\ln T)\)
 interpolant**, evaluated at the query point clamped into the enclosing cell
-(2026-07-26 fix, AI review k11 §3.2 — previously cell-wide linear secants
+(2026-07-26 fix — previously cell-wide linear secants
 \((P(\rho_1,T)-P(\rho_0,T))/(\rho_1-\rho_0)\), which give the mean slope near the
 cell's logarithmic mean rather than the slope at the query point; the distortion
 factor spans \(\Delta x/(e^{\Delta x}-1)\) to \(\Delta x\,e^{\Delta x}/(e^{\Delta x}-1)\)
@@ -1325,7 +1326,7 @@ Algorithm:
    no-op）を GPU 上の backup field へ device-to-device copy し、step energy
    ledger accumulator（escaped / marshak_in / volume_source_in /
    numerical_loss / HOLO LO 4 量）の現在値を host snapshot する
-   （2026-07-26、AI review k15 C-4: 従来は熱力学 6 field のみで、retry が
+   （2026-07-26: 従来は熱力学 6 field のみで、retry が
    half-advanced な放射場から再開し、失敗 attempt の境界流が step budget に
    二重計上されていた）。
 2. 前ステップ以降かつ cell 数が正の場合、compressed cell
@@ -1358,7 +1359,7 @@ Prototype limitation（IMC 系。deterministic FLD/\(S_N\) は 2026-07-26 の
 transactional 化で解消）: IMC photon pool / census state は復元しない。
 そのため IMC での retry 後 Monte Carlo history は初回試行と bitwise には一致せず、
 `imc.save_census_snapshot()` / restore 相当の導入が必要である（IMC は退役済み）。
-deterministic lane の残存既知事項: 失敗 attempt が書く診断（fld substage audit
+deterministic 経路の残存既知事項: 失敗 attempt が書く診断（fld substage audit
 history 行、conduction step counter）は巻き戻さない（診断専用・prognostic 影響なし）。
 
 `Radiation.imc.net_e_source_smoothing.enabled = true` の場合、Radiation 演算子の
@@ -1560,7 +1561,7 @@ reset, the immediately following volume-rate sample would treat ALE motion as a
 one-step hydro flow signal.  The reset skips only that polluted post-ALE
 measurement.  It does not change `state.dt_prev_hydro`, so trial-volume
 diagnostics that require a positive previous hydro timestep keep their history.
-This behavior closes the Phase 2d-ext v3 L2 256x512 ALE-on dt-collapse root
+This behavior closes the L2 256x512 ALE-on dt-collapse root
 cause, where accepted ALE motion polluted the volume-rate CFL baseline.
 
 For 2D_RZ, `Numerics.hydro.trial_volume_cfl_enabled=True` adds an opt-in
@@ -1583,7 +1584,7 @@ and a suggested retry step
 with \(f_{shrink}\) given by
 `Numerics.hydro.trial_volume_cfl_shrink_fraction`.
 The current driver has no full-step retry/restore path for split hydro,
-laser, and radiation state, so this Phase 2d-extension implementation is
+laser, and radiation state, so this implementation is
 diagnostic-only: it warns before the existing geometry refresh/volume assert
 path rather than re-running the step.  The first hydro step is bypassed while
 the previous-step sentinel \(\Delta t_{prev}\le0\) is present.  The default is
@@ -1622,7 +1623,7 @@ C_{cond}=0.25\;(\text{既定})
 > 1D_SPH では三重対角直接解法、2D_RZ では Hypre を用いることで、
 > いずれもグローバルΔtから伝導CFL制約を外せる。
 
-**床保護スロットル（BUG-15 修正、2026-07-08、対称 pair-min 形）**：
+**床保護スロットル（2026-07-08 修正、対称 pair-min 形）**：
 各ステージの床保護は二段構成である。第1パスがセル毎に
 \(\alpha_c = \min\!\bigl(1,\ \rho c_v V (T_e - T_{floor}) / (|P_{net,c}|\,\Delta t_{sub})\bigr)\)
 （流出 \(P_{net,c}<0\) のセルのみ、他は 1）を評価し、第2パスは**各 face/pair の
@@ -1725,4 +1726,3 @@ while ループにより、Δtが `X_every_s` より大きい場合（極端な�
 \(\Delta t_{output}\)（(f) 出力時刻整合）はホスト側で適用し、全rankで同一値のため追加 Allreduce は不要。
 
 ---
-
