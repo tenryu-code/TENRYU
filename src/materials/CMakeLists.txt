@@ -14,7 +14,9 @@ add_library(tenryu_materials STATIC
   eos_rho_e_device.cu
   eos_device_table.cu
   opacity_table.cpp
-  zbar_tf.cpp
+  # zbar_tf.cpp is compiled into tenryu_core (materials links it PUBLIC);
+  # listing it here too would duplicate its symbols under whole-archive
+  # linking (tenryu_lib).
   sesame_reader.cpp
   tmat_reader.cpp
   zmoment_state.cu
