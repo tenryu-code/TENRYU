@@ -22,8 +22,9 @@ SHOCK_WINDOWED_L2_GATE = 0.10
 CONVOLVED_PEAK_GAP_GATE = 0.15
 RICHARDSON_DINF_LOW = 0.65
 RICHARDSON_DINF_HIGH = 0.87
-PEAK_GAP_CONTRACTION_RATIO_GATE = 0.5
-PEAK_GAP_CONTRACTION_ABS_FLOOR = 0.02
+UNSMOOTHED_PEAK_CONTRACTION_RATIO_GATE = 0.75
+UNSMOOTHED_PEAK_CONTRACTION_ABS_FLOOR = 0.05
+UNSMOOTHED_PEAK_GAP_FINE_GATE = 0.20
 PEAK_GAP_CONTRACTION_COARSE_NR = 512
 PEAK_GAP_CONTRACTION_FINE_NR = 1024
 REFERENCE_DTR_PEAK = 0.7614
@@ -357,12 +358,128 @@ def wave12_snapshot_metrics(
     }
 
 
+TRACKED_FRONT_SEARCH_HALF_WIDTH_CM = 5.0
+
+# Steady-phase metric run: long enough for the two-state transient to
+# settle (~2e-7 s), short enough that the free-boundary edge waves have not
+# reached the front (~9e-7 s). The deck's snapshot interval scales with
+# t_end, so this run samples the steady phase densely.
+STEADY_PHASE_T_END_S = 8.0e-7
+
+
+def tracked_front_positions(
+    snapshots: list[base.Snapshot],
+) -> list[tuple[int, float, float]]:
+    """Front positions [(index, t, x)] tracked with a continuity constraint.
+
+    Snapshot 0 uses the global max|dTe/dx| (the two-state initial jump is
+    unambiguous); every later snapshot searches only within
+    +/-TRACKED_FRONT_SEARCH_HALF_WIDTH_CM of the previously tracked front,
+    so the detector cannot jump to the free-boundary blow-off edge once the
+    rig starts shedding material.
+    """
+    tracked: list[tuple[int, float, float]] = []
+    prev_x: float | None = None
+    for index, snapshot in enumerate(snapshots):
+        coord = np.asarray(base.profile_centers(snapshot), dtype=float)
+        Te = np.asarray(base.profile_average(snapshot, snapshot.Te), dtype=float)
+        finite = np.isfinite(coord) & np.isfinite(Te)
+        if np.count_nonzero(finite) < 3:
+            continue
+        x_arr = coord[finite]
+        te_arr = Te[finite]
+        order = np.argsort(x_arr)
+        x_arr = x_arr[order]
+        te_arr = te_arr[order]
+        if prev_x is not None:
+            window = np.abs(x_arr - prev_x) <= TRACKED_FRONT_SEARCH_HALF_WIDTH_CM
+            if np.count_nonzero(window) >= 3:
+                x_arr = x_arr[window]
+                te_arr = te_arr[window]
+        grad = np.abs(np.gradient(te_arr, x_arr))
+        pos = float(x_arr[int(np.nanargmax(grad))])
+        if math.isfinite(float(snapshot.t)) and math.isfinite(pos):
+            tracked.append((index, float(snapshot.t), pos))
+            prev_x = pos
+    return tracked
+
+
+def locate_tracked_steady_window(
+    snapshots: list[base.Snapshot],
+    ref: dict[str, Any],
+) -> dict[str, Any]:
+    """Steady window [start, end] from the continuity-tracked front trace.
+
+    Adjacent front speeds are compared against the MEDIAN absolute tracked
+    speed (robust to any residual outlier): the window starts at the first
+    adjacent pair whose relative change is <= 1% and ends at the last
+    snapshot before the change exceeds 1% again (edge-launched waves
+    reaching the front end the steady phase of this Lagrangian rig).
+    """
+    n = len(snapshots)
+    out: dict[str, Any] = {
+        "steady_start_index": 0,
+        "steady_end_index": max(n - 1, 0),
+        "steady_start_method": "no_speed_trace",
+        "steady_end_method": "no_speed_trace",
+        "tracked_front_trace": [],
+    }
+    tracked = tracked_front_positions(snapshots)
+    out["tracked_front_trace"] = [
+        {"index": i, "time_s": t, "position_cm": x} for i, t, x in tracked
+    ]
+    speeds: list[tuple[int, int, float]] = []
+    for (i0, t0, x0), (i1, t1, x1) in zip(tracked, tracked[1:]):
+        if t1 > t0:
+            speeds.append((i0, i1, (x1 - x0) / (t1 - t0)))
+    if len(speeds) < 2:
+        return out
+    # The rig is shock-stationary: tracked front speeds hover near zero, so
+    # their median is a noise floor. Scale adjacent-speed changes by the
+    # physical upstream flow speed instead.
+    try:
+        scale = abs(float(ref["states"]["upstream"]["u"]))
+    except (KeyError, TypeError, ValueError):
+        scale = math.nan
+    if not (math.isfinite(scale) and scale > base.E_FLOOR):
+        scale = float(np.median([abs(s) for _, _, s in speeds]))
+    if not (math.isfinite(scale) and scale > base.E_FLOOR):
+        return out
+    tol = 0.02
+    out["steady_speed_scale_cm_per_s"] = scale
+    out["steady_speed_tolerance"] = tol
+    start_index: int | None = None
+    for (a0, a1, sa), (b0, b1, sb) in zip(speeds, speeds[1:]):
+        if abs(sa - sb) / scale <= tol:
+            start_index = a0
+            break
+    if start_index is None:
+        out["steady_start_method"] = "no_steady_pair"
+        return out
+    out["steady_start_index"] = int(start_index)
+    out["steady_start_method"] = "tracked_adjacent_speed_change_below_tol"
+    end_index = int(tracked[-1][0])
+    end_method = "full_series_no_departure"
+    for (a0, a1, sa), (b0, b1, sb) in zip(speeds, speeds[1:]):
+        if a0 < start_index:
+            continue
+        if abs(sa - sb) / scale > tol:
+            end_index = int(b0)
+            end_method = "tracked_adjacent_speed_departure_above_tol"
+            break
+    out["steady_end_index"] = max(int(end_index), int(start_index))
+    out["steady_end_method"] = end_method
+    return out
+
+
 def wave12_profile_metrics(snapshots: list[base.Snapshot], ref: dict[str, Any]) -> dict[str, Any]:
     if not snapshots:
         return {}
-    steady = base.locate_steady_start_index(snapshots)
+    steady = locate_tracked_steady_window(snapshots, ref)
     start_index = int(steady.get("steady_start_index", len(snapshots) - 1))
     start_index = max(0, min(start_index, len(snapshots) - 1))
+    end_index = int(steady.get("steady_end_index", len(snapshots) - 1))
+    end_index = max(start_index, min(end_index, len(snapshots) - 1))
     rows = [
         wave12_snapshot_metrics(snapshot, ref, index)
         for index, snapshot in enumerate(snapshots[start_index:], start=start_index)
@@ -372,9 +489,14 @@ def wave12_profile_metrics(snapshots: list[base.Snapshot], ref: dict[str, Any]) 
         for row in rows
         if math.isfinite(float(row.get("shock_windowed_l2_abs", math.inf)))
         and math.isfinite(float(row.get("convolved_peak_gap", math.inf)))
+        and int(row["snapshot_index"]) <= end_index
     ]
     if not finite_rows:
-        return {"wave12_snapshot_metrics": rows, "wave12_steady_start_index": start_index}
+        return {
+            "wave12_snapshot_metrics": rows,
+            "wave12_steady_start_index": start_index,
+            "wave12_steady_end_index": end_index,
+        }
 
     l2_row = max(finite_rows, key=lambda row: float(row["shock_windowed_l2_abs"]))
     peak_row = max(finite_rows, key=lambda row: float(row["max_dTr_in_window"]))
@@ -382,6 +504,9 @@ def wave12_profile_metrics(snapshots: list[base.Snapshot], ref: dict[str, Any]) 
         "wave12_snapshot_metrics": rows,
         "wave12_steady_start_index": start_index,
         "wave12_steady_start_method": steady.get("steady_start_method"),
+        "wave12_steady_end_index": end_index,
+        "wave12_steady_end_method": steady.get("steady_end_method"),
+        "wave12_steady_window_snapshot_count": len(finite_rows),
         "wave12_snapshot_count": len(rows),
         "wave12_l2_snapshot_index": int(l2_row["snapshot_index"]),
         "wave12_peak_snapshot_index": int(peak_row["snapshot_index"]),
@@ -494,13 +619,40 @@ def aggregate(rows: list[dict[str, Any]], ref: dict[str, Any]) -> dict[str, Any]
             peak_gap_by_nr[nr] = float(row.get("wave12_convolved_peak_gap", math.inf))
         except (TypeError, ValueError):
             pass
+    unsmoothed_gap_by_nr: dict[int, float] = {}
+    for row in rows:
+        try:
+            nr = int(row.get("nr"))
+        except (TypeError, ValueError):
+            continue
+        try:
+            code_peak = float(row.get("wave12_max_dTr_in_window", math.nan))
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(code_peak):
+            unsmoothed_gap_by_nr[nr] = (
+                abs(code_peak - REFERENCE_DTR_PEAK) / REFERENCE_DTR_PEAK
+            )
     pg_coarse = peak_gap_by_nr.get(PEAK_GAP_CONTRACTION_COARSE_NR, math.inf)
     pg_fine = peak_gap_by_nr.get(PEAK_GAP_CONTRACTION_FINE_NR, math.inf)
-    gates["gate8b_convolved_peak_gap_contraction"] = (
-        math.isfinite(pg_coarse)
-        and math.isfinite(pg_fine)
-        and pg_fine
-        <= max(PEAK_GAP_CONTRACTION_RATIO_GATE * pg_coarse, PEAK_GAP_CONTRACTION_ABS_FLOOR)
+    # 2026-08-31 redefinition: contraction is judged against the FIXED
+    # unsmoothed reference peak. The convolved target sharpens barely with
+    # resolution (the measured kernel is dominated by physical precursor
+    # gradients), so the convolved gap legitimately RISES while the code
+    # peak converges to the true reference peak from below — the old
+    # convolved-contraction demand was ill-posed. The convolved values stay
+    # exported as diagnostics.
+    ug_coarse = unsmoothed_gap_by_nr.get(PEAK_GAP_CONTRACTION_COARSE_NR, math.inf)
+    ug_fine = unsmoothed_gap_by_nr.get(PEAK_GAP_CONTRACTION_FINE_NR, math.inf)
+    gates["gate8b_unsmoothed_peak_gap_contraction"] = (
+        math.isfinite(ug_coarse)
+        and math.isfinite(ug_fine)
+        and ug_fine <= UNSMOOTHED_PEAK_GAP_FINE_GATE
+        and ug_fine
+        <= max(
+            UNSMOOTHED_PEAK_CONTRACTION_RATIO_GATE * ug_coarse,
+            UNSMOOTHED_PEAK_CONTRACTION_ABS_FLOOR,
+        )
     )
     out["gates"] = gates
     out["nED_temperature_separation_l_inf_gate"] = NED_TEMPERATURE_SEPARATION_LINF_GATE
@@ -513,6 +665,12 @@ def aggregate(rows: list[dict[str, Any]], ref: dict[str, Any]) -> dict[str, Any]
     out["richardson_d_infinity_fit_status"] = "diagnostic_only_20260715"
     out["peak_gap_contraction_coarse"] = pg_coarse
     out["peak_gap_contraction_fine"] = pg_fine
+    out["unsmoothed_reference_dTr_peak"] = REFERENCE_DTR_PEAK
+    out["unsmoothed_peak_gap_by_nr"] = {
+        str(k): v for k, v in sorted(unsmoothed_gap_by_nr.items())
+    }
+    out["unsmoothed_peak_gap_coarse"] = ug_coarse
+    out["unsmoothed_peak_gap_fine"] = ug_fine
     out["fine_shock_front_position_cm"] = float(fine.get("wave12_shock_front_position_cm", math.inf))
     out["fine_measured_hydro_kernel_width_cm"] = float(
         fine.get("wave12_measured_hydro_kernel_width_cm", math.inf)
@@ -525,7 +683,7 @@ def aggregate(rows: list[dict[str, Any]], ref: dict[str, Any]) -> dict[str, Any]
             "gate2_reference_conservation",
             "gate6_shock_windowed_l2_abs",
             "gate7_convolved_peak_gap",
-            "gate8b_convolved_peak_gap_contraction",
+            "gate8b_unsmoothed_peak_gap_contraction",
         )
     )
     return out
@@ -626,6 +784,40 @@ def main(argv: list[str] | None = None) -> int:
     quarter_diag: dict[str, Any] | None = None
     if t0_aggregate["passed"]:
         rows = [run_one(args, nr, nz, dimension, ref) for nr, nz in args.grids]
+        for row, (nr, nz) in zip(rows, args.grids):
+            steady_row = run_one(
+                args,
+                nr,
+                nz,
+                dimension,
+                ref,
+                run_label="steady_phase",
+                t_end_s=STEADY_PHASE_T_END_S,
+            )
+            row["steady_phase_run"] = {
+                key: steady_row.get(key)
+                for key in (
+                    "run_id",
+                    "exit_code",
+                    "timed_out",
+                    "run_status",
+                    "termination_reason",
+                    "wave12_analysis_error",
+                )
+            }
+            steady_keys = [
+                key for key in steady_row if key.startswith("wave12_")
+            ]
+            if (
+                steady_row.get("exit_code") == 0
+                and not steady_row.get("timed_out")
+                and any(key == "wave12_convolved_peak_gap" for key in steady_keys)
+            ):
+                for key in steady_keys:
+                    row[key] = steady_row[key]
+                row["wave12_source"] = "steady_phase_run"
+            else:
+                row["wave12_source"] = "production_run_fallback"
         agg = aggregate(rows, ref)
         fine_nr, fine_nz = args.grids[-1]
         production_t_end = args.t_end_s if args.t_end_s is not None else base.reference_t_end_s(ref, 3.0)

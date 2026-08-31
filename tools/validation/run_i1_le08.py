@@ -1044,6 +1044,48 @@ def locate_steady_start_index(snapshots: list[Snapshot]) -> dict[str, Any]:
     }
 
 
+def locate_steady_window(snapshots: list[Snapshot]) -> dict[str, Any]:
+    """Steady window [start_index, end_index] for metric sampling.
+
+    The start is locate_steady_start_index. The end is the last snapshot
+    before the adjacent shock speed departs again by more than the same
+    tolerance: a Lagrangian free-boundary rig holds the steady shock only
+    until edge-launched waves reach the front, so metrics must not sample
+    past that departure.
+    """
+    info = dict(locate_steady_start_index(snapshots))
+    n = len(snapshots)
+    start = int(info.get("steady_start_index", 0))
+    end = n - 1
+    method = "full_series_no_departure"
+    speeds = info.get("shock_speed_trace") or []
+    avg = info.get("steady_speed_avg_cm_per_s")
+    tol = float(info.get("steady_speed_tolerance", 0.01))
+    if (
+        speeds
+        and isinstance(avg, float)
+        and math.isfinite(avg)
+        and avg > E_FLOOR
+    ):
+        for left, right in zip(speeds, speeds[1:]):
+            if int(left["start_index"]) < start:
+                continue
+            rel_change = abs(
+                float(left["speed_cm_per_s"]) - float(right["speed_cm_per_s"])
+            ) / avg
+            if rel_change > tol:
+                end = int(right["start_index"])
+                method = "adjacent_shock_speed_departure_above_tolerance"
+                break
+    end = max(end, start)
+    info["steady_end_index"] = end
+    info["steady_end_method"] = method
+    info["steady_end_time_s"] = (
+        float(snapshots[end].t) if 0 <= end < n else None
+    )
+    return info
+
+
 def profile_window_metrics(snapshots: list[Snapshot], ref: dict[str, Any]) -> dict[str, Any]:
     per_snapshot = [profile_metrics(snapshot, ref) for snapshot in snapshots]
     steady = locate_steady_start_index(snapshots)
