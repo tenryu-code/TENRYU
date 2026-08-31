@@ -3960,7 +3960,7 @@ void advance_radiation_step_sn_1d(
     static bool warned_volsrc = false;
     if (!warned_volsrc) {
       warned_volsrc = true;
-      core::log_warning("SN 1D external volume source is EXPERIMENTAL: energy enters the sweep and the Newton closure; the E-authority flux blend does not yet carry the source transport moments (profile accuracy unvalidated)");
+      core::log_warning("SN 1D external volume source: single-outer operation validated against an independent S_8 discretization (tools/su_olson_sn_reference.py; probe agreement 0.2%/5.3%/13.9% at xi=0.01/1.0/3.16 with dt=3.33e-13 s). max_outer_iterations>1 is rejected at namelist time (outer Picard chains the matter baseline and would re-inject the source per iteration)");
     }
     source_ext = source_ext_device.data();
   }

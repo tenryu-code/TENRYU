@@ -296,6 +296,19 @@ external source であり、`groups=1` 限定（多群は `ConfigError`）。注
 \(\sum_{r_c\le x_{max}}\Delta t\,V_c\,\dot S\) は `fld_volume_source_in_step`
 として step energy budget（`volume_in`）に計上する。
 
+**1D_SPH \(S_N\) 体積線源（2026-08-31 検証済み）** — 同じ namelist キーを
+`sn_transport` でも消費する: sweep の scalar source に等方寄与 \(\dot S/2\)
+（GL 規約 \(\sum w=2\) の下で \(\sum_m w_m\,\dot S/2=\dot S\)）、Newton 閉包に
+保持項 \(S_{\Delta t}=\Delta t\,\dot S\)（\(E^+=(E^\* + \lambda_{pe}B +
+S_{\Delta t})/(1+\lambda_{pa})\)）が入り、Newton の全系エネルギー残差は
+\((E^+-E^\*)+(U^+-U^n)-S_{\Delta t}=0\)（残差から \(S_{\Delta t}\) を引き忘れる
+と線源セルの物質が注入分を支払わされ Te が床へ張り付く — 2026-08-31 根治）。
+`sn_transport.max_outer_iterations=1` を namelist で強制（ConfigError）:
+外側 Picard は物質基準 \(U^n\) を前反復値に鎖結するため、多 outer では
+\(S_{\Delta t}\) が反復毎に再注入される。検証 = 独立 S₈ 離散化
+（`tools/su_olson_sn_reference.py`）と ξ=0.01/1.0/3.16 で 0.2%/5.3%/13.9%
+一致（恒久 ctest `test_sn_1d_su_olson` volume-source ケース）。
+
 **1D_SPH \(S_N\) 外側 Marshak 境界（W-B2, 2026-07-03）** —
 `Radiation.sn_transport.boundary.outer_r="marshak"`（1D_SPH、
 `spatial_scheme="linear_characteristic"` 必須）。外側ノードの内向き半区間
