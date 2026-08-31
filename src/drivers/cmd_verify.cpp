@@ -9285,9 +9285,15 @@ bool run_sn_1d_marshak_equilibration_impl(const std::string& label,
   double max_rel = std::numeric_limits<double>::infinity();
   int steps = 0;
   const char* diag_max_steps = std::getenv("TENRYU_SN_MARSHAK_DIAG_MAX_STEPS");
+  // 2026-09-01: 4000 was calibrated while the outer Picard chained the
+  // matter baseline and over-applied the exchange per outer (an artificial
+  // acceleration toward equilibrium). With the baseline pinned to the step
+  // start the honest transient reaches max_rel < 1e-6 at ~5600 steps
+  // (measured); 8000 keeps a comfortable margin. The gate tests the
+  // equilibrium fixed point, not the rate.
   const int max_steps = (diag_max_steps != nullptr && diag_max_steps[0] != 0)
                             ? std::atoi(diag_max_steps)
-                            : 4000;
+                            : 8000;
   for (; steps < max_steps && max_rel > 1.0e-6; ++steps) {
     radiation::advance_radiation_step_sn_1d(
         state, cfg, planck, cfg.materials.materials.front(), dt);

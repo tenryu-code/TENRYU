@@ -11720,17 +11720,6 @@ void Builder::validate() {
           "formulations) are frozen.");
     }
   }
-  if (radiation.enabled && radiation.mode == RadiationMode::SnTransport &&
-      radiation.volume_source_rate > 0.0 &&
-      radiation.sn_transport.max_outer_iterations != 1) {
-    throw ConfigError(
-        "Radiation.volume_source_rate with mode=\"sn_transport\" requires "
-        "sn_transport.max_outer_iterations=1: the outer Picard chains the "
-        "matter baseline across iterations, so every extra outer iteration "
-        "re-injects the external source energy (validated single-outer "
-        "against an independent S_8 discretization, "
-        "tools/su_olson_sn_reference.py)");
-  }
   if (laser.enabled) {
     const auto& ports = laser.port_configuration.ports;
     if (!ports.empty()) {

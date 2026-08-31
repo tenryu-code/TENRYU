@@ -18269,9 +18269,12 @@ external source であり、`groups=1` 限定（多群は `ConfigError`）。注
 S_{\Delta t})/(1+\lambda_{pa})\)）が入り、Newton の全系エネルギー残差は
 \((E^+-E^\*)+(U^+-U^n)-S_{\Delta t}=0\)（残差から \(S_{\Delta t}\) を引き忘れる
 と線源セルの物質が注入分を支払わされ Te が床へ張り付く — 2026-08-31 根治）。
-`sn_transport.max_outer_iterations=1` を namelist で強制（ConfigError）:
-外側 Picard は物質基準 \(U^n\) を前反復値に鎖結するため、多 outer では
-\(S_{\Delta t}\) が反復毎に再注入される。検証 = 独立 S₈ 離散化
+外側 Picard の物質基準 \(U^n\)（`sn_Te_old`）は **step 開始値に固定**
+（2026-09-01）: 従来は前反復値に鎖結され、多 outer が弱結合交換を反復回数
+倍に過大適用し（実測: outer=8 で物質冷却 ×4.9）、体積線源を反復毎に再注入
+していた（outer=8 で源点 +25%）。固定後は追加反復が同一の保存的不動点へ
+収束する（無源 1 step で outer=8 が outer=1 と bit 一致、線源つき outer=8
+が参照帯に着地）ため、outer 数の制限は不要。検証 = 独立 S₈ 離散化
 （`tools/su_olson_sn_reference.py`）と ξ=0.01/1.0/3.16 で 0.2%/5.3%/13.9%
 一致（恒久 ctest `test_sn_1d_su_olson` volume-source ケース）。
 

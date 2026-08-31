@@ -3960,7 +3960,7 @@ void advance_radiation_step_sn_1d(
     static bool warned_volsrc = false;
     if (!warned_volsrc) {
       warned_volsrc = true;
-      core::log_warning("SN 1D external volume source: single-outer operation validated against an independent S_8 discretization (tools/su_olson_sn_reference.py; probe agreement 0.2%/5.3%/13.9% at xi=0.01/1.0/3.16 with dt=3.33e-13 s). max_outer_iterations>1 is rejected at namelist time (outer Picard chains the matter baseline and would re-inject the source per iteration)");
+      core::log_warning("SN 1D external volume source: validated against an independent S_8 discretization (tools/su_olson_sn_reference.py; probe agreement 0.2%/5.3%/13.9% at xi=0.01/1.0/3.16 with dt=3.33e-13 s); multi-outer operation converges to the same conservative fixed point since the Newton matter baseline is pinned to the step start");
     }
     source_ext = source_ext_device.data();
   }
@@ -4068,6 +4068,16 @@ void advance_radiation_step_sn_1d(
   if (cell_grid > 0) {
     copy_kernel<<<cell_grid, kBlock>>>(state.Te.data(), state.sn_Te_old.data(), n_cells);
     cuda_check(cudaGetLastError(), "SN Te snapshot launch failed");
+  }
+  // Outer-residual scratch: previous-outer Te. sn_Te_old itself stays
+  // pinned at the step start — it is the Newton matter baseline (U_n), and
+  // chaining it to the previous outer made every extra outer re-apply the
+  // matter-radiation exchange (and re-inject any external volume source).
+  core::CellField1D outer_prev_Te;
+  outer_prev_Te.reset(static_cast<std::size_t>(n_cells));
+  if (cell_grid > 0) {
+    copy_kernel<<<cell_grid, kBlock>>>(state.Te.data(), outer_prev_Te.data(), n_cells);
+    cuda_check(cudaGetLastError(), "SN outer prev-Te snapshot launch failed");
   }
   if (total_grid > 0) {
     initialize_phi_from_rad_E_kernel<<<total_grid, kBlock>>>(
@@ -4389,10 +4399,10 @@ void advance_radiation_step_sn_1d(
     {
       SnTimingScope timing_scope(timing, SnTimingBlock::Residual);
       state.sn_outer_residual =
-          reduce_relative_delta(state, state.Te.data(), state.sn_Te_old.data(), n_cells);
+          reduce_relative_delta(state, state.Te.data(), outer_prev_Te.data(), n_cells);
       if (cell_grid > 0) {
-        copy_kernel<<<cell_grid, kBlock>>>(state.Te.data(), state.sn_Te_old.data(), n_cells);
-        cuda_check(cudaGetLastError(), "SN update Te snapshot launch failed");
+        copy_kernel<<<cell_grid, kBlock>>>(state.Te.data(), outer_prev_Te.data(), n_cells);
+        cuda_check(cudaGetLastError(), "SN update outer prev-Te snapshot launch failed");
       }
     }
     state.sn_outer_iterations = outer + 1;
