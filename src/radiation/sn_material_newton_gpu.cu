@@ -359,7 +359,7 @@ __device__ inline ResidualEval compute_residual_R_production(
     if (E_plus > 0.0) {
       dPdT += r_g * 4.0 * core::constants::a_eV * T3 * b;
     }
-    out.R += E_plus - E_star;
+    out.R += E_plus - E_star - S_dt;
   }
   out.A = A_eff;
   out.P = P_eff;
@@ -579,7 +579,7 @@ __global__ void sn_material_newton_kernel(
           if (E_plus > 0.0) {
             Rprimeg = r_g * 4.0 * core::constants::a_eV * T3 * b;
           }
-          Rg = E_plus - E_star;
+          Rg = E_plus - E_star - S_dt;
         } else {
           const double E = nonnegative_finite(rad_E[idx]);
           const double b =

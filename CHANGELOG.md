@@ -54,8 +54,13 @@
   本例題集の全デッキは固体材料の EOS に tmat テーブルを用いるため、
   実行には PrOpacEOS/SESAME からのテーブル生成が必要です
   （`tools/tmat/propaceos_to_tmat.py` 参照）。
-- S_N 1D に外部体積源（`Radiation.volume_source_rate`）を実験実装
-  しました（実行時に EXPERIMENTAL 警告を表示）。
+- S_N 1D の外部体積源（`Radiation.volume_source_rate`）を検証完了し
+  実験扱いを解除しました。物質側エネルギー残差に注入項が欠けて
+  線源セルの電子温度が床に張り付く欠陥を修正し、独立な S₈ 離散化
+  参照（`tools/su_olson_sn_reference.py`、同梱）と 0.2%/5.3%/13.9% で
+  一致します。外側反復が線源を反復毎に再注入する既知の構造のため、
+  体積源使用時は `sn_transport.max_outer_iterations=1` が必須です
+  （namelist 検証でエラーになります）。
 - レーザー転送の保存監査（環境変数 `TENRYU_LASER_TRANSFER_AUDIT=1`）と
   FLD ソルバ健全性検査（`TENRYU_FLD_SOLVE_CHECK=1`）を追加しました。
 
