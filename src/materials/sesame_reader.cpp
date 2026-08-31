@@ -150,7 +150,7 @@ SesameFormat detect_sesame_format(std::istream& in) {
 }
 
 bool is_text_record(const int table_id) {
-  return table_id == 101 || table_id == 102;
+  return table_id >= 101 && table_id <= 199;
 }
 
 void skip_text_record_lines(std::istream& in, const int n_words) {

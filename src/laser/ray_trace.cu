@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <map>
 #include <type_traits>
 
 #include "core/device_scratch.hpp"
@@ -616,6 +617,19 @@ __device__ __forceinline__ void accumulate_masked_deposit(DepositCacheGuard& dep
     deposit_cache.accumulate(n00, n10, n01, n11, m00 * inv_w * absorbed_power,
                              m10 * inv_w * absorbed_power, m01 * inv_w * absorbed_power,
                              m11 * inv_w * absorbed_power);
+    return;
+  }
+  // All four nodes supercritical: masked weights vanish and this power used
+  // to be silently dropped (tallied absorbed, never deposited — 2026-08-30
+  // I1 radial gate root cause). Deposit with the plain bilinear weights;
+  // the transfer stage's blocked-cell pass re-routes supercritical deposit
+  // to the nearest subcritical receiver.
+  const double plain_sum = w.w00 + w.w10 + w.w01 + w.w11;
+  if (plain_sum > 0.0) {
+    const double inv_p = 1.0 / plain_sum;
+    deposit_cache.accumulate(n00, n10, n01, n11, w.w00 * inv_p * absorbed_power,
+                             w.w10 * inv_p * absorbed_power, w.w01 * inv_p * absorbed_power,
+                             w.w11 * inv_p * absorbed_power);
   }
 }
 
@@ -1411,6 +1425,7 @@ void ray_trace_1d_sph(double* __restrict__ deposit_1d,
                       const int n_radial_nodes,
                       const int n_hydro_cells,
                       const int n_rays,
+                      const int use_shared_staging,
                       double* __restrict__ traj_pos_R,
                       double* __restrict__ traj_pos_Z,
                       double* __restrict__ traj_power,
@@ -1447,8 +1462,7 @@ void ray_trace_1d_sph(double* __restrict__ deposit_1d,
   const std::size_t total_stage_doubles =
       static_cast<std::size_t>(n_stage_arrays) *
       static_cast<std::size_t>(n_slab);
-  const bool stage_per_cell =
-      total_stage_doubles * sizeof(double) <= kRayTrace1DSharedBytesCap;
+  const bool stage_per_cell = use_shared_staging != 0;
 
   const double* body_radial_node_r = radial_node_r;
   const double* body_radial_n_hat = radial_n_hat;
@@ -1709,7 +1723,7 @@ template __global__ void ray_trace_1d_sph<false, false, false>(
     const double* __restrict__, const double, const double, const double, const double,
     const double, const double, const double, const double, const double, const double,
     const double,
-    const int, const int, const int, const int, double* __restrict__, double* __restrict__,
+    const int, const int, const int, const int, const int, double* __restrict__, double* __restrict__,
     double* __restrict__, int* __restrict__, const int, const int, const int,
     int* __restrict__, int* __restrict__, const int* __restrict__, int* __restrict__,
     double* __restrict__,
@@ -1726,7 +1740,7 @@ template __global__ void ray_trace_1d_sph<false, true, false>(
     const double* __restrict__, const double, const double, const double, const double,
     const double, const double, const double, const double, const double, const double,
     const double,
-    const int, const int, const int, const int, double* __restrict__, double* __restrict__,
+    const int, const int, const int, const int, const int, double* __restrict__, double* __restrict__,
     double* __restrict__, int* __restrict__, const int, const int, const int,
     int* __restrict__, int* __restrict__, const int* __restrict__, int* __restrict__,
     double* __restrict__,
@@ -1743,7 +1757,7 @@ template __global__ void ray_trace_1d_sph<true, false, false>(
     const double* __restrict__, const double, const double, const double, const double,
     const double, const double, const double, const double, const double, const double,
     const double,
-    const int, const int, const int, const int, double* __restrict__, double* __restrict__,
+    const int, const int, const int, const int, const int, double* __restrict__, double* __restrict__,
     double* __restrict__, int* __restrict__, const int, const int, const int,
     int* __restrict__, int* __restrict__, const int* __restrict__, int* __restrict__,
     double* __restrict__,
@@ -1760,7 +1774,7 @@ template __global__ void ray_trace_1d_sph<true, true, false>(
     const double* __restrict__, const double, const double, const double, const double,
     const double, const double, const double, const double, const double, const double,
     const double,
-    const int, const int, const int, const int, double* __restrict__, double* __restrict__,
+    const int, const int, const int, const int, const int, double* __restrict__, double* __restrict__,
     double* __restrict__, int* __restrict__, const int, const int, const int,
     int* __restrict__, int* __restrict__, const int* __restrict__, int* __restrict__,
     double* __restrict__,
@@ -1778,7 +1792,7 @@ template __global__ void ray_trace_1d_sph<false, false, true>(
     const double* __restrict__, const double, const double, const double, const double,
     const double, const double, const double, const double, const double, const double,
     const double,
-    const int, const int, const int, const int, double* __restrict__, double* __restrict__,
+    const int, const int, const int, const int, const int, double* __restrict__, double* __restrict__,
     double* __restrict__, int* __restrict__, const int, const int, const int,
     int* __restrict__, int* __restrict__, const int* __restrict__, int* __restrict__,
     double* __restrict__,
@@ -1795,7 +1809,7 @@ template __global__ void ray_trace_1d_sph<false, true, true>(
     const double* __restrict__, const double, const double, const double, const double,
     const double, const double, const double, const double, const double, const double,
     const double,
-    const int, const int, const int, const int, double* __restrict__, double* __restrict__,
+    const int, const int, const int, const int, const int, double* __restrict__, double* __restrict__,
     double* __restrict__, int* __restrict__, const int, const int, const int,
     int* __restrict__, int* __restrict__, const int* __restrict__, int* __restrict__,
     double* __restrict__,
@@ -1812,7 +1826,7 @@ template __global__ void ray_trace_1d_sph<true, false, true>(
     const double* __restrict__, const double, const double, const double, const double,
     const double, const double, const double, const double, const double, const double,
     const double,
-    const int, const int, const int, const int, double* __restrict__, double* __restrict__,
+    const int, const int, const int, const int, const int, double* __restrict__, double* __restrict__,
     double* __restrict__, int* __restrict__, const int, const int, const int,
     int* __restrict__, int* __restrict__, const int* __restrict__, int* __restrict__,
     double* __restrict__,
@@ -1829,7 +1843,7 @@ template __global__ void ray_trace_1d_sph<true, true, true>(
     const double* __restrict__, const double, const double, const double, const double,
     const double, const double, const double, const double, const double, const double,
     const double,
-    const int, const int, const int, const int, double* __restrict__, double* __restrict__,
+    const int, const int, const int, const int, const int, double* __restrict__, double* __restrict__,
     double* __restrict__, int* __restrict__, const int, const int, const int,
     int* __restrict__, int* __restrict__, const int* __restrict__, int* __restrict__,
     double* __restrict__,
@@ -3368,6 +3382,77 @@ __global__ void sum_absorbed_power_per_ray_1d_kernel(
   pabs_per_ray_out[ray] = absorbed;
 }
 
+namespace {
+
+struct DynamicSharedBytesCacheEntry {
+  bool attributes_queried = false;
+  bool attributes_available = false;
+  std::size_t static_shared_bytes = 0;
+  std::size_t max_dynamic_shared_bytes = 0;
+  std::size_t failed_requested_bytes = 0;
+};
+
+template <typename KernelFunction>
+std::size_t launchable_dynamic_shared_bytes(
+    KernelFunction kernel,
+    const std::size_t requested) {
+  if (requested == 0) {
+    return 0;
+  }
+
+  static std::map<KernelFunction, DynamicSharedBytesCacheEntry> cache;
+  DynamicSharedBytesCacheEntry& cached = cache[kernel];
+  if (!cached.attributes_queried) {
+    cudaFuncAttributes attributes{};
+    const cudaError_t status = cudaFuncGetAttributes(&attributes, kernel);
+    cached.attributes_queried = true;
+    if (status != cudaSuccess) {
+      (void)cudaGetLastError();
+      return 0;
+    }
+    cached.attributes_available = true;
+    cached.static_shared_bytes = attributes.sharedSizeBytes;
+    cached.max_dynamic_shared_bytes =
+        static_cast<std::size_t>(attributes.maxDynamicSharedSizeBytes);
+  }
+  if (!cached.attributes_available) {
+    return 0;
+  }
+  if (requested <= cached.max_dynamic_shared_bytes) {
+    return requested;
+  }
+  if (requested == cached.failed_requested_bytes) {
+    return 0;
+  }
+
+  cudaError_t status = cudaFuncSetAttribute(
+      kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+      static_cast<int>(requested));
+  if (status != cudaSuccess) {
+    cached.failed_requested_bytes = requested;
+    (void)cudaGetLastError();
+    return 0;
+  }
+
+  cudaFuncAttributes attributes{};
+  status = cudaFuncGetAttributes(&attributes, kernel);
+  if (status != cudaSuccess) {
+    cached.attributes_available = false;
+    (void)cudaGetLastError();
+    return 0;
+  }
+  cached.static_shared_bytes = attributes.sharedSizeBytes;
+  cached.max_dynamic_shared_bytes =
+      static_cast<std::size_t>(attributes.maxDynamicSharedSizeBytes);
+  if (requested <= cached.max_dynamic_shared_bytes) {
+    return requested;
+  }
+  cached.failed_requested_bytes = requested;
+  return 0;
+}
+
+}  // namespace
+
 cudaError_t launch_ray_trace_1d_sph(const RayArray1D& rays,
                                     const LaserMesh& mesh,
                                     const core::Config::LaserConfig& laser_cfg,
@@ -3433,7 +3518,7 @@ cudaError_t launch_ray_trace_1d_sph(const RayArray1D& rays,
   const std::size_t requested_shared_bytes =
       static_cast<std::size_t>(n_stage_arrays) *
       static_cast<std::size_t>(n_slab) * sizeof(double);
-  const std::size_t ray_trace_shared_bytes =
+  const std::size_t requested_ray_trace_shared_bytes =
       (requested_shared_bytes <= kRayTrace1DSharedBytesCap)
           ? requested_shared_bytes
           : 0;
@@ -3500,6 +3585,10 @@ cudaError_t launch_ray_trace_1d_sph(const RayArray1D& rays,
 
   if (cbet_record_mode && hot_e_capture_enabled) {
     if (phys_ext != nullptr) {
+      const std::size_t ray_trace_shared_bytes =
+          launchable_dynamic_shared_bytes(ray_trace_1d_sph<true, true, true>,
+                                          requested_ray_trace_shared_bytes);
+      const int use_shared_staging = ray_trace_shared_bytes > 0 ? 1 : 0;
       ray_trace_1d_sph<true, true, true>
           <<<grid, block, ray_trace_shared_bytes, stream>>>(
           d_deposit_1d, d_per_ray_deposit, d_per_ray_unabsorbed, d_per_ray_tail,
@@ -3513,7 +3602,8 @@ cudaError_t launch_ray_trace_1d_sph(const RayArray1D& rays,
           laser_cfg.absorption.eps_n,
           laser_cfg.raytrace.eps_crit, lambda_cm, laser_cfg.absorption.coulomb_log_floor,
           laser_cfg.raytrace.test_kappa, laser_cfg.raytrace.intensity_cutoff, max_ray_steps,
-          mesh.radial_n_nodes, n_hydro_cells, rays.n_rays, d_traj_pos1, d_traj_pos2, d_traj_power,
+          mesh.radial_n_nodes, n_hydro_cells, rays.n_rays, use_shared_staging,
+          d_traj_pos1, d_traj_pos2, d_traj_power,
           d_traj_step_count, n_output_rays, output_stride, traj_max_steps, d_step_histogram,
           d_step_count, kernel_ray_order, d_ray_steps_out, d_unabsorbed,
           d_tail_closure_count, d_tail_closure_absorbed_power,
@@ -3521,6 +3611,10 @@ cudaError_t launch_ray_trace_1d_sph(const RayArray1D& rays,
           hot_e_params, d_per_ray_hot_e_capture, *phys_ext, d_radial_T_e,
           d_ra_per_ray, d_tau_shell_out);
     } else {
+      const std::size_t ray_trace_shared_bytes =
+          launchable_dynamic_shared_bytes(ray_trace_1d_sph<true, true, false>,
+                                          requested_ray_trace_shared_bytes);
+      const int use_shared_staging = ray_trace_shared_bytes > 0 ? 1 : 0;
       ray_trace_1d_sph<true, true, false>
           <<<grid, block, ray_trace_shared_bytes, stream>>>(
           d_deposit_1d, d_per_ray_deposit, d_per_ray_unabsorbed, d_per_ray_tail,
@@ -3534,7 +3628,8 @@ cudaError_t launch_ray_trace_1d_sph(const RayArray1D& rays,
           laser_cfg.absorption.eps_n,
           laser_cfg.raytrace.eps_crit, lambda_cm, laser_cfg.absorption.coulomb_log_floor,
           laser_cfg.raytrace.test_kappa, laser_cfg.raytrace.intensity_cutoff, max_ray_steps,
-          mesh.radial_n_nodes, n_hydro_cells, rays.n_rays, d_traj_pos1, d_traj_pos2, d_traj_power,
+          mesh.radial_n_nodes, n_hydro_cells, rays.n_rays, use_shared_staging,
+          d_traj_pos1, d_traj_pos2, d_traj_power,
           d_traj_step_count, n_output_rays, output_stride, traj_max_steps, d_step_histogram,
           d_step_count, kernel_ray_order, d_ray_steps_out, d_unabsorbed,
           d_tail_closure_count, d_tail_closure_absorbed_power,
@@ -3544,6 +3639,10 @@ cudaError_t launch_ray_trace_1d_sph(const RayArray1D& rays,
     }
   } else if (cbet_record_mode) {
     if (phys_ext != nullptr) {
+      const std::size_t ray_trace_shared_bytes =
+          launchable_dynamic_shared_bytes(ray_trace_1d_sph<true, false, true>,
+                                          requested_ray_trace_shared_bytes);
+      const int use_shared_staging = ray_trace_shared_bytes > 0 ? 1 : 0;
       ray_trace_1d_sph<true, false, true>
           <<<grid, block, ray_trace_shared_bytes, stream>>>(
           d_deposit_1d, d_per_ray_deposit, d_per_ray_unabsorbed, d_per_ray_tail,
@@ -3557,7 +3656,8 @@ cudaError_t launch_ray_trace_1d_sph(const RayArray1D& rays,
           laser_cfg.absorption.eps_n,
           laser_cfg.raytrace.eps_crit, lambda_cm, laser_cfg.absorption.coulomb_log_floor,
           laser_cfg.raytrace.test_kappa, laser_cfg.raytrace.intensity_cutoff, max_ray_steps,
-          mesh.radial_n_nodes, n_hydro_cells, rays.n_rays, d_traj_pos1, d_traj_pos2, d_traj_power,
+          mesh.radial_n_nodes, n_hydro_cells, rays.n_rays, use_shared_staging,
+          d_traj_pos1, d_traj_pos2, d_traj_power,
           d_traj_step_count, n_output_rays, output_stride, traj_max_steps, d_step_histogram,
           d_step_count, kernel_ray_order, d_ray_steps_out, d_unabsorbed,
           d_tail_closure_count, d_tail_closure_absorbed_power,
@@ -3565,6 +3665,10 @@ cudaError_t launch_ray_trace_1d_sph(const RayArray1D& rays,
           HotECaptureParams{}, nullptr, *phys_ext, d_radial_T_e,
           d_ra_per_ray, d_tau_shell_out);
     } else {
+      const std::size_t ray_trace_shared_bytes =
+          launchable_dynamic_shared_bytes(ray_trace_1d_sph<true, false, false>,
+                                          requested_ray_trace_shared_bytes);
+      const int use_shared_staging = ray_trace_shared_bytes > 0 ? 1 : 0;
       ray_trace_1d_sph<true, false, false>
           <<<grid, block, ray_trace_shared_bytes, stream>>>(
           d_deposit_1d, d_per_ray_deposit, d_per_ray_unabsorbed, d_per_ray_tail,
@@ -3578,7 +3682,8 @@ cudaError_t launch_ray_trace_1d_sph(const RayArray1D& rays,
           laser_cfg.absorption.eps_n,
           laser_cfg.raytrace.eps_crit, lambda_cm, laser_cfg.absorption.coulomb_log_floor,
           laser_cfg.raytrace.test_kappa, laser_cfg.raytrace.intensity_cutoff, max_ray_steps,
-          mesh.radial_n_nodes, n_hydro_cells, rays.n_rays, d_traj_pos1, d_traj_pos2, d_traj_power,
+          mesh.radial_n_nodes, n_hydro_cells, rays.n_rays, use_shared_staging,
+          d_traj_pos1, d_traj_pos2, d_traj_power,
           d_traj_step_count, n_output_rays, output_stride, traj_max_steps, d_step_histogram,
           d_step_count, kernel_ray_order, d_ray_steps_out, d_unabsorbed,
           d_tail_closure_count, d_tail_closure_absorbed_power,
@@ -3588,6 +3693,10 @@ cudaError_t launch_ray_trace_1d_sph(const RayArray1D& rays,
     }
   } else if (hot_e_capture_enabled) {
     if (phys_ext != nullptr) {
+      const std::size_t ray_trace_shared_bytes =
+          launchable_dynamic_shared_bytes(ray_trace_1d_sph<false, true, true>,
+                                          requested_ray_trace_shared_bytes);
+      const int use_shared_staging = ray_trace_shared_bytes > 0 ? 1 : 0;
       ray_trace_1d_sph<false, true, true>
           <<<grid, block, ray_trace_shared_bytes, stream>>>(
           d_deposit_1d, d_per_ray_deposit, d_per_ray_unabsorbed, d_per_ray_tail,
@@ -3601,7 +3710,8 @@ cudaError_t launch_ray_trace_1d_sph(const RayArray1D& rays,
           laser_cfg.absorption.eps_n,
           laser_cfg.raytrace.eps_crit, lambda_cm, laser_cfg.absorption.coulomb_log_floor,
           laser_cfg.raytrace.test_kappa, laser_cfg.raytrace.intensity_cutoff, max_ray_steps,
-          mesh.radial_n_nodes, n_hydro_cells, rays.n_rays, d_traj_pos1, d_traj_pos2, d_traj_power,
+          mesh.radial_n_nodes, n_hydro_cells, rays.n_rays, use_shared_staging,
+          d_traj_pos1, d_traj_pos2, d_traj_power,
           d_traj_step_count, n_output_rays, output_stride, traj_max_steps, d_step_histogram,
           d_step_count, kernel_ray_order, d_ray_steps_out, d_unabsorbed,
           d_tail_closure_count, d_tail_closure_absorbed_power,
@@ -3609,6 +3719,10 @@ cudaError_t launch_ray_trace_1d_sph(const RayArray1D& rays,
           hot_e_params, d_per_ray_hot_e_capture, *phys_ext, d_radial_T_e,
           d_ra_per_ray, d_tau_shell_out);
     } else {
+      const std::size_t ray_trace_shared_bytes =
+          launchable_dynamic_shared_bytes(ray_trace_1d_sph<false, true, false>,
+                                          requested_ray_trace_shared_bytes);
+      const int use_shared_staging = ray_trace_shared_bytes > 0 ? 1 : 0;
       ray_trace_1d_sph<false, true, false>
           <<<grid, block, ray_trace_shared_bytes, stream>>>(
           d_deposit_1d, d_per_ray_deposit, d_per_ray_unabsorbed, d_per_ray_tail,
@@ -3622,7 +3736,8 @@ cudaError_t launch_ray_trace_1d_sph(const RayArray1D& rays,
           laser_cfg.absorption.eps_n,
           laser_cfg.raytrace.eps_crit, lambda_cm, laser_cfg.absorption.coulomb_log_floor,
           laser_cfg.raytrace.test_kappa, laser_cfg.raytrace.intensity_cutoff, max_ray_steps,
-          mesh.radial_n_nodes, n_hydro_cells, rays.n_rays, d_traj_pos1, d_traj_pos2, d_traj_power,
+          mesh.radial_n_nodes, n_hydro_cells, rays.n_rays, use_shared_staging,
+          d_traj_pos1, d_traj_pos2, d_traj_power,
           d_traj_step_count, n_output_rays, output_stride, traj_max_steps, d_step_histogram,
           d_step_count, kernel_ray_order, d_ray_steps_out, d_unabsorbed,
           d_tail_closure_count, d_tail_closure_absorbed_power,
@@ -3632,6 +3747,10 @@ cudaError_t launch_ray_trace_1d_sph(const RayArray1D& rays,
     }
   } else {
     if (phys_ext != nullptr) {
+      const std::size_t ray_trace_shared_bytes =
+          launchable_dynamic_shared_bytes(ray_trace_1d_sph<false, false, true>,
+                                          requested_ray_trace_shared_bytes);
+      const int use_shared_staging = ray_trace_shared_bytes > 0 ? 1 : 0;
       ray_trace_1d_sph<false, false, true>
           <<<grid, block, ray_trace_shared_bytes, stream>>>(
           d_deposit_1d, d_per_ray_deposit, d_per_ray_unabsorbed, d_per_ray_tail,
@@ -3645,7 +3764,8 @@ cudaError_t launch_ray_trace_1d_sph(const RayArray1D& rays,
           laser_cfg.absorption.eps_n,
           laser_cfg.raytrace.eps_crit, lambda_cm, laser_cfg.absorption.coulomb_log_floor,
           laser_cfg.raytrace.test_kappa, laser_cfg.raytrace.intensity_cutoff, max_ray_steps,
-          mesh.radial_n_nodes, n_hydro_cells, rays.n_rays, d_traj_pos1, d_traj_pos2, d_traj_power,
+          mesh.radial_n_nodes, n_hydro_cells, rays.n_rays, use_shared_staging,
+          d_traj_pos1, d_traj_pos2, d_traj_power,
           d_traj_step_count, n_output_rays, output_stride, traj_max_steps, d_step_histogram,
           d_step_count, kernel_ray_order, d_ray_steps_out, d_unabsorbed,
           d_tail_closure_count, d_tail_closure_absorbed_power,
@@ -3653,6 +3773,10 @@ cudaError_t launch_ray_trace_1d_sph(const RayArray1D& rays,
           HotECaptureParams{}, nullptr, *phys_ext, d_radial_T_e,
           d_ra_per_ray, d_tau_shell_out);
     } else {
+      const std::size_t ray_trace_shared_bytes =
+          launchable_dynamic_shared_bytes(ray_trace_1d_sph<false, false, false>,
+                                          requested_ray_trace_shared_bytes);
+      const int use_shared_staging = ray_trace_shared_bytes > 0 ? 1 : 0;
       ray_trace_1d_sph<false, false, false>
           <<<grid, block, ray_trace_shared_bytes, stream>>>(
           d_deposit_1d, d_per_ray_deposit, d_per_ray_unabsorbed, d_per_ray_tail,
@@ -3666,7 +3790,8 @@ cudaError_t launch_ray_trace_1d_sph(const RayArray1D& rays,
           laser_cfg.absorption.eps_n,
           laser_cfg.raytrace.eps_crit, lambda_cm, laser_cfg.absorption.coulomb_log_floor,
           laser_cfg.raytrace.test_kappa, laser_cfg.raytrace.intensity_cutoff, max_ray_steps,
-          mesh.radial_n_nodes, n_hydro_cells, rays.n_rays, d_traj_pos1, d_traj_pos2, d_traj_power,
+          mesh.radial_n_nodes, n_hydro_cells, rays.n_rays, use_shared_staging,
+          d_traj_pos1, d_traj_pos2, d_traj_power,
           d_traj_step_count, n_output_rays, output_stride, traj_max_steps, d_step_histogram,
           d_step_count, kernel_ray_order, d_ray_steps_out, d_unabsorbed,
           d_tail_closure_count, d_tail_closure_absorbed_power,

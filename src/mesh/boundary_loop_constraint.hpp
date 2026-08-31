@@ -4,9 +4,10 @@
 
 namespace tenryu::mesh {
 
-// Low-mode constraint basis for a closed boundary loop: boundary-loop
-// graph Laplacian low modes (adopted from an external design consultation,
-// 2026-06-11).
+// Low-mode constraint basis for a closed boundary loop (macro-boundary
+// terminal-phase verdict, docs/design/external-ai-responses/
+// 20260611-i1b-macro-boundary-endgame-verdict.md §2, basis option 2:
+// boundary-loop graph Laplacian low modes).
 //
 // For a closed loop of N nodes the cyclic graph Laplacian eigenvectors are
 // analytic: the constant mode plus the cos/sin(2*pi*k*l/N) pair per
@@ -14,10 +15,10 @@ namespace tenryu::mesh {
 // basis is applied independently to the r and z dof families, so the
 // tangent matrix T = dX/da has 2N rows and 2*(2L+1) columns. The raw
 // trigonometric basis is deliberately NOT mass-orthonormalized; the small
-// Gram matrix G = T^T M_B T absorbs the normalization (by design).
+// Gram matrix G = T^T M_B T absorbs the normalization (verdict §2).
 //
 // Fixed layout contracts:
-// - Dof rows are interleaved as
+// - Dof rows are interleaved like the verdict's
 //   x_B = (r_1, z_1, ..., r_N, z_N)^T: row 2*l is the r-dof and row 2*l+1
 //   the z-dof of loop position l. Position l follows the caller's ORDERED
 //   loop-node sequence (N distinct nodes; cyclic adjacency implied, no
@@ -51,7 +52,7 @@ struct BoundaryLoopConstrainedForce {
   std::vector<double> reaction;
 };
 
-// Zero-work constrained projection: with the diagonal nodal
+// Zero-work constrained projection (verdict §2): with the diagonal nodal
 // mass matrix M_B and the assembled boundary-node hydrodynamic force
 // F_B^H, the generalized acceleration solves G d2a/dt2 = T^T F_B^H with
 // G = T^T M_B T (small dense SPD; factorized by Cholesky), giving

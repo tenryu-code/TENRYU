@@ -449,6 +449,12 @@ struct State {
   // ensure_cell_material_props() on the same lifecycle as A_eff/gamma_eff.
   CellField1D kappa_planck_eff;
   CellField1D kappa_rosseland_eff;
+  // Per-cell dominant NON-VOID material index (max volume fraction;
+  // ties break to the lower index; cells with no positive non-void
+  // volfrac fall back to the first non-void material, or 0 when every
+  // material is void). Filled/invalidated on the
+  // ensure_cell_material_props lifecycle (P2a multi-material tables).
+  DeviceBuffer<int> cell_material_index;
   CellField1D Te;
   CellField1D Ti;
   CellField1D ee;

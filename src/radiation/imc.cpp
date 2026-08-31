@@ -3956,12 +3956,20 @@ void IMC::transport_step(core::State& state,
   const auto& mat = cfg.materials.materials[static_cast<std::size_t>(mat_idx)];
   const bool use_freq_dep_marshak = (mat.opacity_model == "freq_dep_marshak");
   const bool use_power_law = (mat.opacity_model == "power_law");
+  const auto nonvoid_count = std::count_if(
+      cfg.materials.materials.begin(), cfg.materials.materials.end(),
+      [](const auto& m) { return !m.is_void; });
+  // P2a (2026-08-30): multi-material multigroup-diffusion decks reach here only
+  // with constant/none/LTE-tmat materials (namelist guard); their per-material
+  // tables are evaluated inside evaluate_fld_opacity_and_emission, so the
+  // single-table NLTE routing and its Phase-1 assert do not apply.
+  const bool multimat_fld_tables =
+      cfg.radiation.mode == core::RadiationMode::MultigroupDiffusion &&
+      nonvoid_count > 1;
   const bool use_nlte_table =
+      !multimat_fld_tables &&
       (mat.opacity_model == "table_nlte" || mat.opacity_model == "tmat");
   if (use_nlte_table) {
-    const auto nonvoid_count = std::count_if(
-        cfg.materials.materials.begin(), cfg.materials.materials.end(),
-        [](const auto& m) { return !m.is_void; });
     TENRYU_ASSERT(nonvoid_count == 1,
                   "Phase-1 NLTE: single non-void material contract violated");
   }

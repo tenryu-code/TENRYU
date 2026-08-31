@@ -93,11 +93,31 @@ double bilinear_log_interp(const EOSTable& table,
 }
 
 EOSTable from_sesame_raw(const SesameEOSTableRaw& raw) {
+  std::size_t rho_skip = 0;
+  while (rho_skip < raw.rho_grid.size() && raw.rho_grid[rho_skip] <= 0.0) {
+    ++rho_skip;
+  }
+  std::size_t T_skip = 0;
+  while (T_skip < raw.T_grid_eV.size() && raw.T_grid_eV[T_skip] <= 0.0) {
+    ++T_skip;
+  }
+
   EOSTable table;
-  table.rho_grid = raw.rho_grid;
-  table.T_grid_eV = raw.T_grid_eV;
-  table.P_table = raw.pressure_dyne_per_cm2;
-  table.e_table = raw.energy_erg_per_g;
+  table.rho_grid.assign(raw.rho_grid.begin() + rho_skip, raw.rho_grid.end());
+  table.T_grid_eV.assign(raw.T_grid_eV.begin() + T_skip, raw.T_grid_eV.end());
+
+  const std::size_t n_rho_raw = raw.rho_grid.size();
+  const std::size_t n_points = table.n_rho() * table.n_T();
+  table.P_table.resize(n_points);
+  table.e_table.resize(n_points);
+  for (std::size_t j = 0; j < table.n_T(); ++j) {
+    for (std::size_t i = 0; i < table.n_rho(); ++i) {
+      const std::size_t src = (j + T_skip) * n_rho_raw + (i + rho_skip);
+      const std::size_t dst = table.flat_index(i, j);
+      table.P_table[dst] = raw.pressure_dyne_per_cm2[src];
+      table.e_table[dst] = raw.energy_erg_per_g[src];
+    }
+  }
   table.finalize();
   return table;
 }

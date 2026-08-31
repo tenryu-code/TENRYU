@@ -4312,6 +4312,16 @@ void laser_step(core::State& state,
         state.hot_e_dt_limit_s = dt_lim;
       }
     }
+    static const bool transfer_audit_enabled = [] {
+      const char* value = std::getenv("TENRYU_LASER_TRANSFER_AUDIT");
+      return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    long double audit_in = 0.0L;
+    if (transfer_audit_enabled) {
+      for (const double deposit : total_dep_1d) {
+        audit_in += static_cast<long double>(deposit);
+      }
+    }
     apply_deposit_redistribution_1d(state, lmesh, hydro_mirror, total_dep_1d, dt,
                                     laser.deposit.conservation_tol, part,
                                     laser.deposit.deposit_smooth_passes,
@@ -4320,6 +4330,19 @@ void laser_step(core::State& state,
                                      !hot_e_power_cell.empty())
                                         ? &hot_e_power_cell
                                         : nullptr);
+    if (transfer_audit_enabled) {
+      const auto audit_dep_host =
+          copy_cell_deposit_to_host(state.laser_dep, stream);
+      long double audit_out = 0.0L;
+      for (const double deposit : audit_dep_host) {
+        audit_out += static_cast<long double>(deposit);
+      }
+      std::ostringstream audit;
+      audit << std::setprecision(17) << "[laser:transfer-audit] in="
+            << static_cast<double>(audit_in) << " out="
+            << static_cast<double>(audit_out);
+      core::log_warning(audit.str());
+    }
     t_transfer_end = Clock::now();
   } else {
     std::vector<double> total_dep_lm(static_cast<std::size_t>(lmesh.n_nodes()), 0.0);

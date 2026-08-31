@@ -14,7 +14,11 @@ namespace tenryu::radiation {
 namespace {
 
 constexpr double kPi = 3.141592653589793238462643383279502884;
-constexpr double kSigmaFloor = 1.0e-100;
+// Diffusion-denominator regularization only (D = 1/(3 sigma_t)):
+// mfp 10 km, physically invisible at lab scale; prevents ~1e98 matrix
+// entries in void/pure-absorber cells (the DSA correction vanishes at
+// convergence, so gate answers are unchanged).
+constexpr double kSigmaFloor = 1.0e-6;
 constexpr int kBlock = 256;
 
 inline void cuda_check(const cudaError_t err, const char* message) {

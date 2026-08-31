@@ -263,6 +263,34 @@ NlteOpacityCache& nlte_cache() {
   return cache;
 }
 
+struct MultiMatOpacityEntry {
+  std::unique_ptr<materials::IonmixOpacityData> host;
+  DeviceOpacityTable device;
+  std::string file;
+  int groups = 0;
+  bool is_lte = false;
+};
+
+struct MatOpacityDesc {
+  // kind: 0 = constant/void, 1 = LTE table, 2 = NLTE table.
+  int kind = 0;
+  double kappa_planck = 0.0;
+  double kappa_rosseland = 0.0;
+  double inv_A_mp = 0.0;
+  materials::IonmixOpacityDeviceView view;
+};
+
+struct MultiMatOpacityCache {
+  std::vector<MultiMatOpacityEntry> entries;
+  core::DeviceArray<MatOpacityDesc> device_descs;
+  std::string signature;
+};
+
+MultiMatOpacityCache& multimat_opacity_cache() {
+  static MultiMatOpacityCache cache;
+  return cache;
+}
+
 struct FldGroupBoundsCache {
   std::vector<double> last_bounds;
   bool valid = false;
@@ -348,6 +376,158 @@ void ensure_nlte_table_uploaded(const core::Config& cfg,
   cache.groups = n_groups;
 }
 
+void ensure_multimat_opacity_uploaded(const core::Config& cfg,
+                                      const int n_groups) {
+  std::string signature;
+  for (const auto& mat : cfg.materials.materials) {
+    signature += mat.opacity_model + ":" + mat.opacity_file + ";";
+  }
+
+  auto& cache = multimat_opacity_cache();
+  bool reusable = cache.signature == signature &&
+                  cache.entries.size() == cfg.materials.materials.size();
+  if (reusable) {
+    for (std::size_t m = 0; m < cfg.materials.materials.size(); ++m) {
+      if (!cfg.materials.materials[m].is_void &&
+          cfg.materials.materials[m].opacity_model == "tmat" &&
+          cache.entries[m].groups != n_groups) {
+        reusable = false;
+        break;
+      }
+    }
+  }
+  if (reusable) {
+    return;
+  }
+
+  cache.entries =
+      std::vector<MultiMatOpacityEntry>(cfg.materials.materials.size());
+  std::vector<MatOpacityDesc> descs(cfg.materials.materials.size());
+  for (std::size_t m = 0; m < cfg.materials.materials.size(); ++m) {
+    const auto& mat = cfg.materials.materials[m];
+    auto& entry = cache.entries[m];
+    auto& desc = descs[m];
+    entry.file = mat.opacity_file;
+    desc.inv_A_mp =
+        1.0 / (std::max(mat.A, 1.0e-12) * core::constants::proton_mass);
+
+    if (mat.is_void) {
+      desc.kind = 0;
+      desc.kappa_planck = 0.0;
+      desc.kappa_rosseland = 0.0;
+      continue;
+    }
+    if (mat.opacity_model == "tmat") {
+      const materials::TmatFile tmat = materials::load_tmat(mat.opacity_file);
+      TENRYU_ASSERT(tmat.opacity.has_value(),
+                    "FLD tmat opacity.model requires /opacity payload");
+      entry.host = std::make_unique<materials::IonmixOpacityData>(
+          materials::tmat_to_ionmix_opacity(*tmat.opacity));
+      if (cfg.radiation.group_repack_hard_xray) {
+        std::vector<double> target_bounds = cfg.radiation.group_bounds_eV;
+        if (target_bounds.empty()) {
+          const std::vector<double> range = resolve_compute_T_range_eV(cfg, false);
+          target_bounds = repack_group_bounds_for_hard_xray(n_groups, range);
+        }
+        *entry.host =
+            resample_opacity_groups_to_bounds(*entry.host, target_bounds);
+      }
+      TENRYU_ASSERT(
+          entry.host->ngroups == n_groups,
+          "FLD multi-material opacity table group count must match Radiation.groups");
+      entry.device.upload(*entry.host);
+      entry.groups = n_groups;
+      entry.is_lte = tmat.opacity->is_lte;
+      desc.kind = entry.is_lte ? 1 : 2;
+      desc.view = entry.device.view();
+      continue;
+    }
+
+    desc.kind = 0;
+    desc.kappa_planck = (mat.kappa_planck_override >= 0.0)
+                            ? mat.kappa_planck_override
+                            : std::max(0.0, mat.kappa_a_constant);
+    desc.kappa_rosseland = std::max(0.0, mat.kappa_a_constant);
+  }
+
+  cache.device_descs.reset(descs.size());
+  cache.device_descs.copy_from_host(descs);
+  cache.signature = std::move(signature);
+}
+
+__global__ void eval_opacity_multimat_kernel(
+    const double* __restrict__ rho,
+    const double* __restrict__ Te,
+    const int* __restrict__ cell_material_index,
+    const MatOpacityDesc* __restrict__ descs,
+    int n_materials,
+    double kappa_floor,
+    double kappa_cap,
+    double temperature_floor_eV,
+    double* __restrict__ sigma_a,
+    double* __restrict__ sigma_pe,
+    double* __restrict__ sigma_R,
+    int n_cells,
+    int n_groups) {
+  const int c = blockIdx.x * blockDim.x + threadIdx.x;
+  if (c >= n_cells) {
+    return;
+  }
+
+  const int m = min(max(cell_material_index[c], 0), n_materials - 1);
+  const MatOpacityDesc desc = descs[m];
+  if (desc.kind == 2) {
+    return;  // NLTE material: the per-material NLTE launch fills this cell
+  }
+  const double rho_c = rho[c];
+  const double rho_safe = (rho_c >= 0.0) ? rho_c : 0.0;
+  const double sigma_min = rho_safe * fmax(kappa_floor, 0.0);
+  const double sigma_max = rho_safe * fmax(kappa_cap, 0.0);
+  const int base = c * n_groups;
+
+  if (desc.kind == 0) {
+    const double sigma_a_c = fmin(
+        fmax(fmax(rho_safe * desc.kappa_planck, 0.0), sigma_min), sigma_max);
+    const double sigma_R_c = fmin(
+        fmax(fmax(rho_safe * desc.kappa_rosseland, 0.0), sigma_min), sigma_max);
+    for (int g = 0; g < n_groups; ++g) {
+      sigma_a[base + g] = sigma_a_c;
+      sigma_pe[base + g] = sigma_a_c;
+      sigma_R[base + g] = sigma_R_c;
+    }
+    return;
+  }
+
+  const double log_ni = log(fmax(rho_safe * desc.inv_A_mp, 1.0e-300));
+  const double log_T = log(fmax(Te[c], temperature_floor_eV));
+  for (int g = 0; g < n_groups; ++g) {
+    const double kappa_pa =
+        desc.view.interpolate(desc.view.kappa_PA, g, log_ni, log_T);
+    const double kappa_pe =
+        desc.view.interpolate(desc.view.kappa_PE, g, log_ni, log_T);
+    const double kappa_r =
+        desc.view.interpolate(desc.view.kappa_R, g, log_ni, log_T);
+    sigma_a[base + g] = fmin(
+        fmax(fmax(rho_safe * kappa_pa, 0.0), sigma_min), sigma_max);
+    sigma_pe[base + g] = fmin(
+        fmax(fmax(rho_safe * kappa_pe, 0.0), sigma_min), sigma_max);
+    sigma_R[base + g] = fmin(
+        fmax(fmax(rho_safe * kappa_r, 0.0), sigma_min), sigma_max);
+  }
+}
+
+__global__ void build_nlte_cell_mask_kernel(
+    const int* __restrict__ cell_material_index,
+    const MatOpacityDesc* __restrict__ descs,
+    int n_materials,
+    std::uint8_t* __restrict__ mask,
+    int n_cells) {
+  const int c = blockIdx.x * blockDim.x + threadIdx.x;
+  if (c >= n_cells) return;
+  const int m = min(max(cell_material_index[c], 0), n_materials - 1);
+  mask[c] = (descs[m].kind == 2) ? 1U : 0U;
+}
+
 __device__ inline void build_eta_from_planck_kernel_body(
     const int idx,
     const double* __restrict__ Te,
@@ -356,8 +536,12 @@ __device__ inline void build_eta_from_planck_kernel_body(
     double* __restrict__ eta,
     int n_cells,
     int n_groups,
-    double temperature_floor_eV) {
+    double temperature_floor_eV,
+    const std::uint8_t* __restrict__ cell_eval_skip) {
   const int c = idx / n_groups;
+  if (cell_eval_skip != nullptr && cell_eval_skip[c] != 0U) {
+    return;
+  }
   const int g = idx - c * n_groups;
   const double T = fmax(finite_or_zero(Te[c]), temperature_floor_eV);
   const double T2 = T * T;
@@ -373,14 +557,16 @@ __global__ void build_eta_from_planck_kernel(
     double* __restrict__ eta,
     int n_cells,
     int n_groups,
-    double temperature_floor_eV) {
+    double temperature_floor_eV,
+    const std::uint8_t* __restrict__ cell_eval_skip) {
   const int idx = blockIdx.x * blockDim.x + threadIdx.x;
   const int total = n_cells * n_groups;
   if (idx >= total) {
     return;
   }
   build_eta_from_planck_kernel_body(idx, Te, sigma_a, planck, eta, n_cells,
-                                    n_groups, temperature_floor_eV);
+                                    n_groups, temperature_floor_eV,
+                                    cell_eval_skip);
 }
 
 __device__ double harmonic_positive(const double a, const double b) {
@@ -451,7 +637,8 @@ __global__ void compute_fleck_for_fld_kernel(
     const double* __restrict__ rad_E_old,
     const PlanckTableDeviceView planck,
     const int fleck_beta_secant,
-    const int fleck_form_exp) {
+    const int fleck_form_exp,
+    const std::uint8_t* __restrict__ cell_eval_skip) {
   const int c = blockIdx.x * blockDim.x + threadIdx.x;
   if (c >= n_cells) {
     return;
@@ -461,7 +648,8 @@ __global__ void compute_fleck_for_fld_kernel(
                                     alpha, cv_e_override, gamma_eff, A_eff,
                                     electron_eos, use_table_cv,
                                     temperature_floor_eV, rad_E_old, planck,
-                                    fleck_beta_secant, fleck_form_exp);
+                                    fleck_beta_secant, fleck_form_exp,
+                                    cell_eval_skip);
 }
 
 // 1D FLD outer-boundary kinds, parsed from
@@ -694,22 +882,28 @@ __device__ inline void publish_solution_kernel_body(
     const double* __restrict__ rhs,
     double* __restrict__ rad_E,
     int n_cells,
-    int n_groups) {
+    int n_groups,
+    int* __restrict__ nonfinite_count) {
   const int g = idx / n_cells;
   const int c = idx - g * n_cells;
+  if (nonfinite_count != nullptr && !isfinite(rhs[idx])) {
+    atomicAdd(nonfinite_count, 1);
+  }
   rad_E[c * n_groups + g] = fmax(finite_or_zero(rhs[idx]), 0.0);
 }
 
 __global__ void publish_solution_kernel(const double* __restrict__ rhs,
                                         double* __restrict__ rad_E,
                                         int n_cells,
-                                        int n_groups) {
+                                        int n_groups,
+                                        int* __restrict__ nonfinite_count) {
   const int idx = blockIdx.x * blockDim.x + threadIdx.x;
   const int total = n_cells * n_groups;
   if (idx >= total) {
     return;
   }
-  publish_solution_kernel_body(idx, rhs, rad_E, n_cells, n_groups);
+  publish_solution_kernel_body(idx, rhs, rad_E, n_cells, n_groups,
+                               nonfinite_count);
 }
 
 __device__ inline void snapshot_Te_kernel_body(const int c,
@@ -1847,8 +2041,148 @@ void evaluate_fld_opacity_and_emission(
     int* const deferred_clamp_counts = nullptr) {
   const auto& fld = cfg.radiation.multigroup_diffusion;
   const int total = n_cells * n_groups;
+  const auto n_nonvoid_materials = std::count_if(
+      cfg.materials.materials.begin(), cfg.materials.materials.end(),
+      [](const auto& material) { return !material.is_void; });
+  const bool any_table = std::any_of(
+      cfg.materials.materials.begin(), cfg.materials.materials.end(),
+      [](const auto& material) {
+        return !material.is_void &&
+               (material.opacity_model == "tmat" ||
+                material.opacity_model == "table_nlte");
+      });
+  bool multimat_sigma_done = false;
+  std::uint8_t* d_nlte_mask = nullptr;
+  if (n_nonvoid_materials > 1 && any_table) {
+    ensure_multimat_opacity_uploaded(cfg, n_groups);
+    state.ensure_cell_material_props(cfg);
+    auto& cache = multimat_opacity_cache();
+    const int opacity_grid = (n_cells + kBlock - 1) / kBlock;
+    if (opacity_grid > 0) {
+      eval_opacity_multimat_kernel<<<opacity_grid, kBlock>>>(
+          state.rho.data(),
+          state.Te.data(),
+          state.cell_material_index.data(),
+          cache.device_descs.data(),
+          static_cast<int>(cfg.materials.materials.size()),
+          fld.opacity_floor,
+          fld.opacity_cap,
+          cfg.numerics.floors.Te,
+          state.fld_sigma_a.data(),
+          state.fld_sigma_pe.data(),
+          state.fld_sigma_R.data(),
+          n_cells,
+          n_groups);
+      cuda_check(cudaGetLastError(),
+                 "FLD multi-material opacity kernel launch failed");
+    }
+    const bool any_nlte = std::any_of(
+        cache.entries.begin(), cache.entries.end(),
+        [&](const auto& entry) {
+          const std::size_t m = static_cast<std::size_t>(
+              &entry - cache.entries.data());
+          const auto& material = cfg.materials.materials[m];
+          return !material.is_void && material.opacity_model == "tmat" &&
+                 !entry.is_lte;
+        });
+    if (any_nlte) {
+      d_nlte_mask = static_cast<std::uint8_t*>(core::device_scratch_acquire(
+          "fld1d:multimat_nlte_mask", static_cast<std::size_t>(n_cells)));
+      if (opacity_grid > 0) {
+        build_nlte_cell_mask_kernel<<<opacity_grid, kBlock>>>(
+            state.cell_material_index.data(),
+            cache.device_descs.data(),
+            static_cast<int>(cfg.materials.materials.size()),
+            d_nlte_mask,
+            n_cells);
+        cuda_check(cudaGetLastError(),
+                   "FLD multi-material NLTE mask kernel launch failed");
+      }
+
+      const std::size_t scratch_size = static_cast<std::size_t>(total);
+      state.fld_nlte_f_work.reset(scratch_size);
+      state.fld_nlte_sigma_eff_work.reset(scratch_size);
+      state.fld_nlte_sigma_s_eff_work.reset(scratch_size);
+      state.fld_nlte_eta_cdf_work.reset(scratch_size);
+      state.fld_nlte_lambda_work.reset(scratch_size);
+      const double* cv_e_ptr =
+          (state.cv_e.size() == static_cast<std::size_t>(n_cells))
+              ? state.cv_e.data()
+              : nullptr;
+      int* pinned_counts = nullptr;
+      if (defer_clamp_warning) {
+        pinned_counts = deferred_clamp_counts;
+        if (pinned_counts == nullptr) {
+          pinned_counts = static_cast<int*>(core::host_pinned_scratch_acquire(
+              "fld1d:nlte_clamp_counts", 3 * sizeof(int)));
+        }
+      }
+      NlteCoeffsDeviceResult result{};
+      for (std::size_t m = 0; m < cache.entries.size(); ++m) {
+        if (cache.entries[m].is_lte || cfg.materials.materials[m].is_void ||
+            cfg.materials.materials[m].opacity_model != "tmat") {
+          continue;
+        }
+        const auto& material = cfg.materials.materials[m];
+        const auto material_result = compute_nlte_coefficients_cuda_with_pe(
+            state.rho.data(),
+            state.Te.data(),
+            state.zbar.data(),
+            cv_e_ptr,
+            state.cell_is_void.data(),
+            state.cell_is_void.size(),
+            cache.entries[m].device.view(),
+            planck.device_view(),
+            n_cells,
+            n_groups,
+            dt,
+            std::max(material.A, 1.0e-12),
+            1.0,
+            0.0,
+            1.0,
+            material.lambda_fd_delta_rel,
+            material.lambda_fd_abs_min,
+            fld.opacity_cap,
+            material.cv_e_override,
+            cfg.numerics.floors.Te,
+            std::max(material.ideal_gas_gamma - 1.0, 1.0e-12),
+            false,
+            false,
+            false,
+            state.fld_nlte_f_work.data(),
+            state.fld_sigma_a.data(),
+            state.fld_sigma_pe.data(),
+            state.fld_sigma_R.data(),
+            state.fld_nlte_sigma_eff_work.data(),
+            state.fld_nlte_sigma_s_eff_work.data(),
+            state.fld_nlte_eta_cdf_work.data(),
+            state.fld_eta.data(),
+            state.fld_nlte_lambda_work.data(),
+            0,
+            false,
+            pinned_counts,
+            defer_clamp_warning && !first_outer_iter,
+            state.cell_material_index.data(),
+            static_cast<int>(m));
+        result.negative_alpha_clamp_count +=
+            material_result.negative_alpha_clamp_count;
+        result.negative_eta_clamp_count +=
+            material_result.negative_eta_clamp_count;
+        result.nan_inf_count += material_result.nan_inf_count;
+      }
+      if (!defer_clamp_warning &&
+          (result.nan_inf_count != 0 || result.negative_eta_clamp_count != 0)) {
+        core::log_warning("FLD NLTE coefficient clamp counts: nan_inf=" +
+                          std::to_string(result.nan_inf_count) +
+                          ", eta=" +
+                          std::to_string(result.negative_eta_clamp_count));
+      }
+    }
+    multimat_sigma_done = true;
+  }
   const bool use_nlte =
-      mat.opacity_model == "table_nlte" || mat.opacity_model == "tmat";
+      !multimat_sigma_done &&
+      (mat.opacity_model == "table_nlte" || mat.opacity_model == "tmat");
   if (use_nlte) {
     ensure_nlte_table_uploaded(cfg, mat, n_groups);
     const std::size_t scratch_size = static_cast<std::size_t>(total);
@@ -1917,7 +2251,7 @@ void evaluate_fld_opacity_and_emission(
     return;
   }
 
-  if (!sigma_already_evaluated) {
+  if (!multimat_sigma_done && !sigma_already_evaluated) {
     materials::OpacityEvalView opacity_view{};
     opacity_view.rho = state.rho.data();
     opacity_view.Te = state.Te.data();
@@ -1943,6 +2277,11 @@ void evaluate_fld_opacity_and_emission(
     opacity_view.power_law_lambda_rho = mat.opacity_power_law_lambda_rho;
     opacity_view.power_law_T_ref_eV = mat.opacity_power_law_T_ref_eV;
     opacity_view.power_law_rho_ref = mat.opacity_power_law_rho_ref_g_cc;
+    if (n_nonvoid_materials > 1) {
+      state.ensure_cell_material_props(cfg);
+      opacity_view.kappa_planck_cell = state.kappa_planck_eff.data();
+      opacity_view.kappa_rosseland_cell = state.kappa_rosseland_eff.data();
+    }
     std::vector<double> bounds;
     if (opacity_view.opacity_model == materials::kOpacityModelFreqDepMarshak) {
       bounds = radiation_group_bounds(cfg, n_groups);
@@ -1970,17 +2309,21 @@ void evaluate_fld_opacity_and_emission(
                                                    state.fld_eta.data(),
                                                    n_cells,
                                                    n_groups,
-                                                   cfg.numerics.floors.Te);
+                                                   cfg.numerics.floors.Te,
+                                                   d_nlte_mask);
     cuda_check(cudaGetLastError(), "FLD eta kernel launch failed");
   }
-  if (mat.opacity_model == "constant" || mat.opacity_model == "power_law") {
+  if (multimat_sigma_done || mat.opacity_model == "constant" ||
+      mat.opacity_model == "power_law") {
     const std::size_t scratch_size = static_cast<std::size_t>(total);
     state.fld_nlte_f_work.reset(scratch_size);
-    cuda_check(cudaMemcpy(state.fld_sigma_pe.data(),
-                          state.fld_sigma_a.data(),
-                          sizeof(double) * scratch_size,
-                          cudaMemcpyDeviceToDevice),
-               "FLD copy constant sigma_pe failed");
+    if (!multimat_sigma_done) {
+      cuda_check(cudaMemcpy(state.fld_sigma_pe.data(),
+                            state.fld_sigma_a.data(),
+                            sizeof(double) * scratch_size,
+                            cudaMemcpyDeviceToDevice),
+                 "FLD copy constant sigma_pe failed");
+    }
     std::uint8_t* d_cell_is_void = nullptr;
     if (state.cell_is_void.size() == static_cast<std::size_t>(n_cells)) {
       const std::size_t void_bytes =
@@ -2030,7 +2373,8 @@ void evaluate_fld_opacity_and_emission(
           (fld.fleck_beta == "secant") ? 1
           : (fld.fleck_beta == "guard") ? 2
                                         : 0,
-          (fld.fleck_form == "exp_phi1") ? 1 : 0);
+          (fld.fleck_form == "exp_phi1") ? 1 : 0,
+          d_nlte_mask);
       cuda_check(cudaGetLastError(), "FLD Fleck kernel launch failed");
       cuda_check(core::debug_kernel_sync(), "FLD Fleck kernel sync failed");
     }
@@ -2100,31 +2444,189 @@ void solve_tridiag(core::State& state, const int n_cells, const int n_groups) {
   if (cache.handle == nullptr) {
     cusparse_check(cusparseCreate(&cache.handle), "FLD cusparseCreate failed");
   }
+  static const bool use_gtsv_loop = [] {
+    const char* value = std::getenv("TENRYU_FLD_GTSV_LOOP");
+    return value != nullptr && value[0] == '1' && value[1] == '\0';
+  }();
+  static const bool solve_check = [] {
+    const char* value = std::getenv("TENRYU_FLD_SOLVE_CHECK");
+    return value != nullptr && value[0] == '1' && value[1] == '\0';
+  }();
+  struct SolveCheckSnapshots {
+    std::vector<double> lower;
+    std::vector<double> diag;
+    std::vector<double> upper;
+    std::vector<double> rhs;
+  };
+  std::unique_ptr<SolveCheckSnapshots> solve_check_snapshots;
   std::size_t buffer_size = 0U;
-  cusparse_check(cusparseDgtsv2StridedBatch_bufferSizeExt(
-                    cache.handle,
-                    n_cells,
-                    state.fld_lower.data(),
-                    state.fld_diag.data(),
-                    state.fld_upper.data(),
-                    state.fld_rhs.data(),
-                    n_groups,
-                    n_cells,
-                    &buffer_size),
-                "FLD cuSPARSE buffer size failed");
+  if (use_gtsv_loop) {
+    cusparse_check(cusparseDgtsv2_bufferSizeExt(cache.handle,
+                                                n_cells,
+                                                1,
+                                                state.fld_lower.data(),
+                                                state.fld_diag.data(),
+                                                state.fld_upper.data(),
+                                                state.fld_rhs.data(),
+                                                n_cells,
+                                                &buffer_size),
+                  "FLD cuSPARSE buffer size failed");
+  } else {
+    cusparse_check(cusparseDgtsv2StridedBatch_bufferSizeExt(
+                      cache.handle,
+                      n_cells,
+                      state.fld_lower.data(),
+                      state.fld_diag.data(),
+                      state.fld_upper.data(),
+                      state.fld_rhs.data(),
+                      n_groups,
+                      n_cells,
+                      &buffer_size),
+                  "FLD cuSPARSE buffer size failed");
+  }
   const std::size_t buffer_doubles =
       (buffer_size + sizeof(double) - 1U) / sizeof(double);
   state.fld_cusparse_buffer.reset(buffer_doubles);
-  cusparse_check(cusparseDgtsv2StridedBatch(cache.handle,
-                                            n_cells,
-                                            state.fld_lower.data(),
-                                            state.fld_diag.data(),
-                                            state.fld_upper.data(),
-                                            state.fld_rhs.data(),
-                                            n_groups,
-                                            n_cells,
-                                            state.fld_cusparse_buffer.data()),
-                "FLD cuSPARSE tridiagonal solve failed");
+  if (solve_check) {
+    const std::size_t solve_size =
+        static_cast<std::size_t>(n_groups) * static_cast<std::size_t>(n_cells);
+    solve_check_snapshots = std::make_unique<SolveCheckSnapshots>();
+    solve_check_snapshots->lower.resize(solve_size);
+    solve_check_snapshots->diag.resize(solve_size);
+    solve_check_snapshots->upper.resize(solve_size);
+    solve_check_snapshots->rhs.resize(solve_size);
+    const std::size_t solve_bytes = solve_size * sizeof(double);
+    cuda_check(cudaMemcpy(solve_check_snapshots->lower.data(),
+                          state.fld_lower.data(),
+                          solve_bytes,
+                          cudaMemcpyDeviceToHost),
+               "FLD solve check lower snapshot failed");
+    cuda_check(cudaMemcpy(solve_check_snapshots->diag.data(),
+                          state.fld_diag.data(),
+                          solve_bytes,
+                          cudaMemcpyDeviceToHost),
+               "FLD solve check diagonal snapshot failed");
+    cuda_check(cudaMemcpy(solve_check_snapshots->upper.data(),
+                          state.fld_upper.data(),
+                          solve_bytes,
+                          cudaMemcpyDeviceToHost),
+               "FLD solve check upper snapshot failed");
+    cuda_check(cudaMemcpy(solve_check_snapshots->rhs.data(),
+                          state.fld_rhs.data(),
+                          solve_bytes,
+                          cudaMemcpyDeviceToHost),
+               "FLD solve check RHS snapshot failed");
+  }
+  if (use_gtsv_loop) {
+    for (int g = 0; g < n_groups; ++g) {
+      cusparse_check(
+          cusparseDgtsv2(cache.handle,
+                         n_cells,
+                         1,
+                         state.fld_lower.data() + g * n_cells,
+                         state.fld_diag.data() + g * n_cells,
+                         state.fld_upper.data() + g * n_cells,
+                         state.fld_rhs.data() + g * n_cells,
+                         n_cells,
+                         state.fld_cusparse_buffer.data()),
+          "FLD cuSPARSE tridiagonal solve failed");
+    }
+  } else {
+    cusparse_check(cusparseDgtsv2StridedBatch(cache.handle,
+                                              n_cells,
+                                              state.fld_lower.data(),
+                                              state.fld_diag.data(),
+                                              state.fld_upper.data(),
+                                              state.fld_rhs.data(),
+                                              n_groups,
+                                              n_cells,
+                                              state.fld_cusparse_buffer.data()),
+                  "FLD cuSPARSE tridiagonal solve failed");
+  }
+  if (solve_check) {
+    const std::size_t solve_size = solve_check_snapshots->rhs.size();
+    std::vector<double> solution(solve_size);
+    cuda_check(cudaMemcpy(solution.data(),
+                          state.fld_rhs.data(),
+                          solve_size * sizeof(double),
+                          cudaMemcpyDeviceToHost),
+               "FLD solve check solution copy failed");
+    std::size_t hit_count = 0U;
+    auto fmt_d = [](double v){ char b[32]; std::snprintf(b, sizeof(b), "%.17g", v); return std::string(b); };
+    for (int g = 0; g < n_groups; ++g) {
+      for (int c = 0; c < n_cells; ++c) {
+        const std::size_t i = static_cast<std::size_t>(g) *
+                                  static_cast<std::size_t>(n_cells) +
+                              static_cast<std::size_t>(c);
+        const double x = solution[i];
+        if (!std::isfinite(x) || std::fabs(x) > 1.0e30) {
+          ++hit_count;
+          if (hit_count <= 8U) {
+            const double diag_left =
+                (c > 0) ? solve_check_snapshots->diag[i - 1U]
+                        : std::numeric_limits<double>::quiet_NaN();
+            const double diag_right =
+                (c + 1 < n_cells)
+                    ? solve_check_snapshots->diag[i + 1U]
+                    : std::numeric_limits<double>::quiet_NaN();
+            core::log_error(
+                "FLD solve check: g=" + std::to_string(g) +
+                " c=" + std::to_string(c) + " x=" + fmt_d(x) +
+                " | inputs dl=" + fmt_d(solve_check_snapshots->lower[i]) +
+                " d=" + fmt_d(solve_check_snapshots->diag[i]) +
+                " du=" + fmt_d(solve_check_snapshots->upper[i]) +
+                " rhs=" + fmt_d(solve_check_snapshots->rhs[i]) +
+                " | c-1 d=" + fmt_d(diag_left) +
+                " c+1 d=" + fmt_d(diag_right));
+          }
+        }
+      }
+    }
+    if (hit_count > 0U) {
+      core::log_error("FLD solve check: total_hits=" + std::to_string(hit_count) +
+                      " n_cells=" + std::to_string(n_cells));
+      const std::vector<double>* const input_arrays[] = {
+          &solve_check_snapshots->lower,
+          &solve_check_snapshots->diag,
+          &solve_check_snapshots->upper,
+          &solve_check_snapshots->rhs};
+      const char* const input_array_names[] = {"lower", "diag", "upper", "rhs"};
+      std::size_t input_bad_count = 0U;
+      for (int g = 0; g < n_groups; ++g) {
+        for (int c = 0; c < n_cells; ++c) {
+          const std::size_t i = static_cast<std::size_t>(g) *
+                                    static_cast<std::size_t>(n_cells) +
+                                static_cast<std::size_t>(c);
+          const double diag_left =
+              (c > 0) ? solve_check_snapshots->diag[i - 1U]
+                      : std::numeric_limits<double>::quiet_NaN();
+          const double diag_right =
+              (c + 1 < n_cells)
+                  ? solve_check_snapshots->diag[i + 1U]
+                  : std::numeric_limits<double>::quiet_NaN();
+          for (std::size_t arr = 0U; arr < 4U; ++arr) {
+            const double v = (*input_arrays[arr])[i];
+            if (!std::isfinite(v) || std::fabs(v) > 1.0e30) {
+              ++input_bad_count;
+              if (input_bad_count <= 8U) {
+                core::log_error(
+                    "FLD solve check INPUT: g=" + std::to_string(g) +
+                    " c=" + std::to_string(c) +
+                    " arr=" + input_array_names[arr] + " v=" + fmt_d(v) +
+                    " | d[c-1]=" + fmt_d(diag_left) +
+                    " d[c]=" + fmt_d(solve_check_snapshots->diag[i]) +
+                    " d[c+1]=" + fmt_d(diag_right) +
+                    " rhs[c]=" + fmt_d(solve_check_snapshots->rhs[i]));
+              }
+            }
+          }
+        }
+      }
+      core::log_error("FLD solve check INPUT: total_bad=" +
+                      std::to_string(input_bad_count));
+      TENRYU_ASSERT(false, "FLD solve produced non-finite/huge solution");
+    }
+  }
 }
 
 double copy_scalar_from_device(core::State& state) {
@@ -2397,6 +2899,10 @@ void advance_radiation_step_fld_1d(
   double rad_ebal_Ur0 = rad_ebal_field();
   double rad_ebal_Um1 = 0.0;
   double rad_ebal_Ur1 = 0.0;
+  int* const d_publish_nonfinite_count = static_cast<int*>(
+      core::device_scratch_acquire("fld1d:publish_nonfinite_count", sizeof(int)));
+  cuda_check(cudaMemset(d_publish_nonfinite_count, 0, sizeof(int)),
+             "FLD publish non-finite counter reset failed");
 
   if (fld.source_integrator == "exp_rosenbrock") {
     // rung-2 Lie split: exact frozen source transfer, then a pure diffusion
@@ -2617,7 +3123,8 @@ void advance_radiation_step_fld_1d(
       publish_solution_kernel<<<total_grid, kBlock>>>(state.fld_rhs.data(),
                                                       state.rad_E.data(),
                                                       n_cells,
-                                                      n_groups);
+                                                      n_groups,
+                                                      d_publish_nonfinite_count);
       cuda_check(cudaGetLastError(), "FLD publish solution launch failed");
     }
     state.fld_outer_residual = 0.0;
@@ -2662,7 +3169,8 @@ void advance_radiation_step_fld_1d(
         publish_solution_kernel<<<total_grid, kBlock>>>(state.fld_rhs.data(),
                                                         state.rad_E.data(),
                                                         n_cells,
-                                                        n_groups);
+                                                        n_groups,
+                                                        d_publish_nonfinite_count);
         cuda_check(cudaGetLastError(), "FLD publish solution launch failed");
       }
       if (n_cells > 0) {
@@ -2946,6 +3454,23 @@ void advance_radiation_step_fld_1d(
             std::to_string(state.fld_outer_residual) + ", warning #" +
             std::to_string(fld_outer_warn_count) + ")");
       }
+    }
+  }
+
+  int publish_nonfinite_count = 0;
+  cuda_check(cudaMemcpy(&publish_nonfinite_count,
+                        d_publish_nonfinite_count,
+                        sizeof(int),
+                        cudaMemcpyDeviceToHost),
+             "FLD publish non-finite counter read failed");
+  if (publish_nonfinite_count > 0) {
+    core::log_error("FLD publish: " +
+                    std::to_string(publish_nonfinite_count) +
+                    " non-finite solver-solution entries sanitized this step");
+    if (cfg.numerics.safety.nan_fatal) {
+      TENRYU_ASSERT(false,
+                    "FLD solver produced non-finite radiation energy "
+                    "(nan_fatal=true)");
     }
   }
 

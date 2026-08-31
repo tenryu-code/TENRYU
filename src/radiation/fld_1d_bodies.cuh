@@ -408,8 +408,12 @@ __device__ inline void build_eta_from_planck_kernel_body(
     double* __restrict__ eta,
     int n_cells,
     int n_groups,
-    double temperature_floor_eV) {
+    double temperature_floor_eV,
+    const std::uint8_t* __restrict__ cell_eval_skip) {
   const int c = idx / n_groups;
+  if (cell_eval_skip != nullptr && cell_eval_skip[c] != 0U) {
+    return;
+  }
   const int g = idx - c * n_groups;
   (void)n_cells;
   const double T = fmax(finite_or_zero(Te[c]), temperature_floor_eV);
@@ -480,7 +484,11 @@ __device__ inline void compute_fleck_for_fld_kernel_body(
     const double* __restrict__ rad_E_old,
     const PlanckTableDeviceView planck,
     const int fleck_beta_secant,
-    const int fleck_form_exp) {
+    const int fleck_form_exp,
+    const std::uint8_t* __restrict__ cell_eval_skip) {
+  if (cell_eval_skip != nullptr && cell_eval_skip[c] != 0U) {
+    return;
+  }
   const int base = c * n_groups;
   if (cell_is_void != nullptr && cell_is_void[c] != 0U) {
     for (int g = 0; g < n_groups; ++g) {

@@ -1,0 +1,26 @@
+# TENRYU assistant configuration (EXPERIMENTAL).
+# Copy to ./assistant.toml or ~/.tenryu/assistant.toml and edit.
+# The assistant is OFF unless enabled = true AND TENRYU_ASSIST_DISABLE is unset.
+
+enabled = false
+
+[providers.codex]
+# {model} and {prompt_file} are substituted; if {prompt_file} is absent the
+# prompt file path is appended as the last argument.
+command = "codex exec -m {model} -s workspace-write -"
+model = "gpt-5.6-sol"
+
+[providers.claude]
+command = "claude -p --model {model}"
+model = "opus-5"
+
+[roles]
+deck_design = "codex"
+forensics = "claude"
+intervention_proposer = "claude"
+intervention_reviewer = "codex"
+explanation = "claude"
+
+[budget]
+max_interventions_per_run = 3
+max_tokens_per_decision = 30000

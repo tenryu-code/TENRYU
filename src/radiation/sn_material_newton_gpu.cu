@@ -57,8 +57,9 @@ __host__ __device__ inline double sn_conservative_E_plus_from_star(
     const double E_star,
     const double lambda_pa,
     const double lambda_pe,
-    const double B) {
-  return fmax((E_star + lambda_pe * B) / (1.0 + lambda_pa), 0.0);
+    const double B,
+    const double S_dt) {
+  return fmax((E_star + lambda_pe * B + S_dt) / (1.0 + lambda_pa), 0.0);
 }
 
 class SnElectronEOSTableCache {
@@ -293,6 +294,7 @@ __device__ inline ResidualEval compute_residual_R_production(
     const double* sigma_pe,
     const double* rad_E,
     const double* E_star_override,
+    const double* source_ext,
     double T_prev_eV,
     PlanckTableDeviceView planck,
     double temperature_floor_eV,
@@ -345,9 +347,12 @@ __device__ inline ResidualEval compute_residual_R_production(
         use_E_star_override
             ? finite_or_zero(E_star_override[idx])
             : sn_unfloored_streaming_state(E_post, lambda_pa, lambda_pe, B_prev);
+    const double S_dt = (source_ext != nullptr && g == 0)
+                            ? dt_safe * source_ext[c]
+                            : 0.0;
     const double E_plus =
         use_E_star_override
-            ? sn_conservative_E_plus_from_star(E_star, lambda_pa, lambda_pe, B)
+            ? sn_conservative_E_plus_from_star(E_star, lambda_pa, lambda_pe, B, S_dt)
             : sn_conservative_E_plus(E_post, r_g, B, B_prev);
     A_eff += fmax(E_star, 0.0);
     P_eff += E_plus;
@@ -394,6 +399,7 @@ __global__ void sn_material_newton_kernel(
     const double* __restrict__ sigma_pe,
     const double* __restrict__ rad_E,
     const double* __restrict__ E_star_override,
+    const double* __restrict__ source_ext,
     double* __restrict__ rad_E_out,
     int legacy_2d_closure,
     int eos_low_density_extrap,
@@ -560,9 +566,13 @@ __global__ void sn_material_newton_kernel(
               use_E_star_override
                   ? finite_or_zero(E_star_override[idx])
                   : sn_unfloored_streaming_state(E_post, lambda_pa, lambda_pe, B_prev);
+          const double S_dt = (source_ext != nullptr && g == 0)
+                                  ? dt_safe * source_ext[c]
+                                  : 0.0;
           const double E_plus =
               use_E_star_override
-                  ? sn_conservative_E_plus_from_star(E_star, lambda_pa, lambda_pe, B)
+                  ? sn_conservative_E_plus_from_star(E_star, lambda_pa, lambda_pe, B,
+                                                     S_dt)
                   : sn_conservative_E_plus(E_post, r_g, B, B_prev);
           Ag = fmax(E_star, 0.0);
           Pg = E_plus;
@@ -812,6 +822,9 @@ __global__ void sn_material_newton_kernel(
       const double b_new =
           (n_groups == 1) ? 1.0 : fmax(planck.interpolate_b(g, T_final), 0.0);
       const double B_new = core::constants::a_eV * safe_pow4(T_final) * b_new;
+      const double S_dt = (source_ext != nullptr && g == 0)
+                              ? dt_safe * source_ext[c]
+                              : 0.0;
       if (diag_rad_absorption != nullptr) {
         diag_rad_absorption[idx] = lambda_pa * E_post_old;
       }
@@ -834,7 +847,8 @@ __global__ void sn_material_newton_kernel(
       }
       if (use_E_star_override) {
         rad_E_out[idx] =
-            sn_conservative_E_plus_from_star(E_star, lambda_pa, lambda_pe, B_new);
+            sn_conservative_E_plus_from_star(E_star, lambda_pa, lambda_pe, B_new,
+                                             S_dt);
       } else {
         const double r_g = lambda_pe / (1.0 + lambda_pa);
         rad_E_out[idx] =
@@ -955,6 +969,7 @@ int solve_sn_material_temperature_newton_gpu(
         in.sigma_pe,
         in.rad_E,
         in.E_star_override,
+        in.source_ext,
         in.rad_E_out,
         0,
         in.eos_low_density_extrap ? 1 : 0,
@@ -993,6 +1008,7 @@ int solve_sn_material_temperature_newton_gpu(
         in.sigma_pe,
         in.rad_E,
         in.E_star_override,
+        in.source_ext,
         in.rad_E_out,
         0,
         in.eos_low_density_extrap ? 1 : 0,
@@ -1070,6 +1086,7 @@ void solve_sn_material_temperature_newton_2d_legacy_gpu(
         in.sigma_pe,
         in.rad_E,
         nullptr,
+        in.source_ext,
         nullptr,
         1,
         in.eos_low_density_extrap ? 1 : 0,
@@ -1108,6 +1125,7 @@ void solve_sn_material_temperature_newton_2d_legacy_gpu(
         in.sigma_pe,
         in.rad_E,
         nullptr,
+        in.source_ext,
         nullptr,
         1,
         in.eos_low_density_extrap ? 1 : 0,

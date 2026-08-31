@@ -363,13 +363,20 @@ void emit_mesh_preview_json(const tenryu::core::Config& cfg) {
   oss.setf(std::ios::fmtflags(0), std::ios::floatfield);
   oss << std::setprecision(17);
   const auto& mesh = cfg.mesh;
-  const auto emit_nodes = [&oss](const std::vector<double>& nodes) {
+  const auto emit_double = [&oss](const double value) {
+    if (std::isfinite(value)) {
+      oss << value;
+    } else {
+      oss << "null";
+    }
+  };
+  const auto emit_nodes = [&oss, &emit_double](const std::vector<double>& nodes) {
     oss << "[";
     for (std::size_t i = 0; i < nodes.size(); ++i) {
       if (i > 0) {
         oss << ",";
       }
-      oss << nodes[i];
+      emit_double(nodes[i]);
     }
     oss << "]";
   };
@@ -380,14 +387,20 @@ void emit_mesh_preview_json(const tenryu::core::Config& cfg) {
   oss << ",\"geometry_1d\":\"" << mesh.geometry_1d << "\"";
   oss << ",\"nr\":" << mesh.nr;
   oss << ",\"nz\":" << mesh.nz;
-  oss << ",\"r_min\":" << mesh.r_min;
-  oss << ",\"r_max\":" << mesh.r_max;
-  oss << ",\"z_min\":" << mesh.z_min;
-  oss << ",\"z_max\":" << mesh.z_max;
+  oss << ",\"r_min\":";
+  emit_double(mesh.r_min);
+  oss << ",\"r_max\":";
+  emit_double(mesh.r_max);
+  oss << ",\"z_min\":";
+  emit_double(mesh.z_min);
+  oss << ",\"z_max\":";
+  emit_double(mesh.z_max);
   if (mesh.logical_mesh_2d != "rectangular_rz") {
     oss << ",\"polar\":{";
-    oss << "\"s_max\":" << mesh.spherical_polar_s_max;
-    oss << ",\"kappa\":" << mesh.spherical_polar_kappa;
+    oss << "\"s_max\":";
+    emit_double(mesh.spherical_polar_s_max);
+    oss << ",\"kappa\":";
+    emit_double(mesh.spherical_polar_kappa);
     oss << ",\"center_treatment\":\"" << mesh.polar_center_treatment << "\"";
     oss << ",\"equal_mu\":" << (mesh.polar_equal_mu_zoning ? "true" : "false");
     oss << "}";
@@ -405,6 +418,27 @@ void emit_mesh_preview_json(const tenryu::core::Config& cfg) {
     emit_nodes(mesh.explicit_nodes_z);
   } else {
     oss << ",\"z_nodes\":null";
+  }
+  if (mesh.zoning_intent.enabled && !mesh.zoning_intent.pins.empty()) {
+    oss << ",\"zoning_pins\":[";
+    for (std::size_t i = 0; i < mesh.zoning_intent.pins.size(); ++i) {
+      const auto& pin = mesh.zoning_intent.pins[i];
+      if (i > 0) {
+        oss << ",";
+      }
+      oss << "{\"r\":";
+      emit_double(pin.r);
+      oss << ",\"ratio_jump_allowed\":"
+          << (pin.ratio_jump_allowed ? "true" : "false") << "}";
+    }
+    oss << "]";
+  } else {
+    oss << ",\"zoning_pins\":null";
+  }
+  if (mesh.zoning_intent.enabled) {
+    oss << ",\"zoning_measure\":\"" << mesh.zoning_intent.measure << "\"";
+  } else {
+    oss << ",\"zoning_measure\":null";
   }
   oss << "}";
   std::cout << "TENRYU-MESH-PREVIEW: " << oss.str() << std::endl;

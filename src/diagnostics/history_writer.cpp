@@ -2341,6 +2341,7 @@ HistoryWriter::PendingHistoryRecord HistoryWriter::build_pending_record(
   rec.center_perturbation_enabled = center_perturbation_enabled_;
   rec.E_laser_deposited = state.E_laser_deposited;
   rec.E_laser_escaped = state.E_laser_escaped;
+  rec.E_rad_escaped = state.E_rad_escaped;
   rec.E_laser_incident = state.E_laser_incident;
   rec.E_ra_deposited = state.E_ra_deposited;
   rec.E_cbet_iaw_step = state.E_cbet_iaw_step;
@@ -3558,11 +3559,16 @@ void HistoryWriter::append_record_to_file(
   append_scalar_double_compat(
       file, "energy/laser_escaped", "energy/E_laser_esc", rec.E_laser_escaped, "erg");
   append_scalar_double(file, "energy/laser_ra_deposited", rec.E_ra_deposited, "erg");
+  // 2026-08-30 semantic fix: cumulative, matching laser counters; old per-step series moved to radiation_escaped_step.
   append_scalar_double_compat(file,
                               "energy/radiation_escaped",
                               "energy/E_rad_esc",
-                              rec.snapshot.energy.E_rad_esc,
+                              rec.E_rad_escaped,
                               "erg");
+  append_scalar_double(file,
+                       "energy/radiation_escaped_step",
+                       rec.snapshot.energy.E_rad_esc,
+                       "erg");
   append_scalar_double_compat(file,
                               "energy/numerical_loss",
                               "energy/E_numerical_loss",
