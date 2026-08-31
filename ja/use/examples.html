@@ -12,7 +12,7 @@
   <main>
     <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
     <h1>例題とプリセット <span class="badge">reference</span></h1>
-    <p class="abstract">TENRYU Studio の 1 次元プリセットは、輻射熱波、レーザー直接照射、輻射温度による間接照射という 3 つの入口を提供する。ここに示す構成は、2026-07-31 に RTX 4090 上で終端まで実行し、代表的な物理指標を確認済みである。検証の各項目を再現するための独立したデッキ集は <code>examples/verification/</code> にある。</p>
+    <p class="abstract">TENRYU Studio の 1 次元プリセットは、輻射熱波、レーザー直接照射、輻射温度による間接照射という 3 つの入口を提供する。ここに示す構成は、2026-07-31 に RTX 4090 上で終端まで実行し、代表的な物理指標を確認済みである。典型実験を扱うコミッショニング済みデッキは <code>examples/laser_plasma_1d/</code> に、検証項目を再現する独立したデッキ集は <code>examples/verification/</code> にある。</p>
 
     <aside class="planned" aria-labelledby="at-a-glance">
       <h3 id="at-a-glance">要点</h3>
@@ -35,6 +35,16 @@
           <tr><th><code>template_1d_indirect_tr.py</code></th><td>球 1D・Tr(t) 間接照射駆動</td><td>時間依存 callable → 凍結テーブルの流儀。</td></tr>
         </tbody>
       </table>
+    </section>
+
+    <section aria-labelledby="laser-plasma-1d">
+      <h2 id="laser-plasma-1d">1 次元レーザープラズマ例題集（<code>examples/laser_plasma_1d/</code>）</h2>
+      <p>典型的なレーザープラズマ実験をモデル化した、コミッショニング済みの 1 次元デッキをまとめている。</p>
+      <ul>
+        <li>収録する 10 本は、箔の衝撃波ブレークアウト、2 パルス衝撃波タイミング、インピーダンス整合、爆発箔、Kr 中の輻射衝撃波、円筒ライナー、固体球収束（600/900/1350 セルの調査）、D2 充填シェル爆縮、CBET と高温電子を含むコロナ、Marshak 駆動の DT 燃焼を扱う。</li>
+        <li>各デッキで測定したコミッショニング指標と注意点は、例題集の README に記録している。</li>
+        <li>固体材料が用いる <code>tmat</code> EOS 表は、ライセンスされた PrOpacEOS 由来のため配布しない。利用者は自身の PrOpacEOS/SESAME ワークフローから <code>tools/tmat/propaceos_to_tmat.py</code> で生成する必要があり、うち 1 本のデッキには SESAME ASCII ライブラリも必要である。</li>
+      </ul>
     </section>
 
     <section aria-labelledby="validated-presets">
