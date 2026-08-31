@@ -12,7 +12,7 @@
   <main>
     <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
     <h1>Examples &amp; presets <span class="badge">reference</span></h1>
-    <p class="abstract">TENRYU Studio's one-dimensional presets provide three entry points: a radiation heat wave, a direct-drive laser implosion, and an indirect drive set by radiation temperature. Each configuration was run to completion on an RTX 4090 on 2026-07-31 and checked against representative physics metrics. A separate deck library under <code>examples/verification/</code> reproduces the verification gates.</p>
+    <p class="abstract">TENRYU Studio's one-dimensional presets provide three entry points: a radiation heat wave, a direct-drive laser implosion, and an indirect drive set by radiation temperature. Each configuration was run to completion on an RTX 4090 on 2026-07-31 and checked against representative physics metrics. Commissioned decks for typical experiments live under <code>examples/laser_plasma_1d/</code>, while the separate library under <code>examples/verification/</code> reproduces the verification gates.</p>
 
     <aside class="planned" aria-labelledby="at-a-glance">
       <h3 id="at-a-glance">At a glance</h3>
@@ -35,6 +35,16 @@
           <tr><th><code>template_1d_indirect_tr.py</code></th><td>Spherical 1D, Tr(t) indirect drive</td><td>The time-dependent-callable → frozen-table idiom.</td></tr>
         </tbody>
       </table>
+    </section>
+
+    <section aria-labelledby="laser-plasma-1d">
+      <h2 id="laser-plasma-1d">1D laser-plasma example suite (<code>examples/laser_plasma_1d/</code>)</h2>
+      <p>This suite collects commissioned one-dimensional decks modeling typical laser-plasma experiments.</p>
+      <ul>
+        <li>Its ten decks cover foil shock breakout, two-pulse shock timing, impedance matching, an exploding foil, a radiative shock in Kr, a cylindrical liner, solid-sphere convergence (with a 600/900/1350-cell study), a D2-filled shell implosion, a CBET + hot-electron corona setup, and Marshak-driven DT burn.</li>
+        <li>The suite README records measured commissioning metrics and caveats for every deck.</li>
+        <li>The solid materials use <code>tmat</code> EOS tables that are not distributed because they derive from licensed PrOpacEOS data. Users must generate them with <code>tools/tmat/propaceos_to_tmat.py</code> from their own PrOpacEOS/SESAME workflow; one deck additionally requires a SESAME ASCII library.</li>
+      </ul>
     </section>
 
     <section aria-labelledby="validated-presets">
