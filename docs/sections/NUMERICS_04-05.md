@@ -1043,9 +1043,10 @@ Kershaw 9 点、`symmetric_pair_power`）で書かれており、SNB は同じ�
   （\(\min(\theta)\,(P^{sh}_{live}+P^{dq}_{frozen})\)、既存 kernel byte
   不変）。Picard driver は 1D と同構造（stash/restore、max-norm 収束、
   min 2 反復、非収束は warn + 診断）。
-- 適用範囲（この tree の validation）: 2D_RZ + 2T + `solver="sts"` + 単一
-  rank + 非 per-material。`snb_efield="local"` は 2D v1 で ConfigError
-  （fail-closed）。1D_SPH はこの tree では ConfigError（feature/1d-brushup ブランチとの merge でガードが union になる）。
+- 適用範囲（validation）: 1D_SPH（planar/cyl/sph、cusparse 群バッチ三重対角）
+  と 2D_RZ（Kershaw 9-point 対称化 CSR + 群バッチ Jacobi-PCG）の両次元 +
+  2T + `solver="sts"` + 単一 rank + 非 per-material。`snb_efield="local"`
+  は 2D で ConfigError（fail-closed、1D のみ）。
 
 **検証（VERIFICATION §4.10、実測 2026-07-11）**: G2 z-mode ladder
 |R−R_disc| = 5.5e-8/5.3e-9/5.9e-10（1D gate と同値クラス）、slope 1.986、

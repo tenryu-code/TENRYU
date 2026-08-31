@@ -1021,8 +1021,7 @@ Void 材料の体積分率は `cell_is_void` マスクの導出にのみ使用�
 > 使用可能になった — 各非 void 材料は constant または LTE tmat（`--kirchhoff-pe` 変換、
 > `/opacity` の `is_lte=1` をランタイムで検証）を持て、セルの支配材料 index
 > （`State::cell_material_index`、体積分率 argmax）でテーブルを選択し
-> (ρ, T_e) 補間で per-cell per-group σ_a/σ_pe/σ_R を評価する（混合セルは支配材料
-> 単独評価 — v1 近似として文書化）。**第 2 段 (同日)**: NLTE tmat も多材料対応 — NLTE 係数カーネルにセル材料フィルタを追加し材料ごとに起動（材料定数はその材料の A/cv/γ/λ 引数、σ_pe≠σ_pa と η・Fleck をカーネルが自セル分のみ充填; 共有 η/Fleck 段は skip マスクで NLTE セルを保護）。table_nlte (IONMIX 直読) は未対応のまま。
+> (ρ, T_e) 補間で per-cell per-group σ_a/σ_pe/σ_R を評価する。**第 2 段 (同日)**: NLTE tmat も多材料対応 — NLTE 係数カーネルにセル材料フィルタを追加し材料ごとに起動（材料定数はその材料の A/cv/γ/λ 引数、σ_pe≠σ_pa と η・Fleck をカーネルが自セル分のみ充填; 共有 η/Fleck 段は skip マスクで NLTE セルを保護）。table_nlte (IONMIX 直読) は未対応のまま。**第 3 段 (2026-08-31) — 混合セルの厳密混合**: 混合セルは寄与材料すべてを \(\sigma_{mix} = \rho \sum_m w_m\,\kappa_m(\rho_m, T_e)\) で厳密合成する — 重み \(w_m\) は質量分率（per-material 質量が未追跡なら体積分率で代替）、各材料のテーブルはその**部分密度** \(\rho_m = \rho\,w_m/f_m\)（\(= m_m/(V f_m)\)、\(f_m\) 縮退時はセル密度に fallback）で評価する。体積分割セルの厳密式（\(f_m \sigma_m(\rho_m) = \rho\,w_m \kappa_m(\rho_m)\)）。純セルは従来の支配材料経路に bit 一致で還元（H5 データセット単位 A/B で実証）。NLTE **支配**セルのみ NLTE 起動が支配材料近似で充填し、混合セル内の非支配 NLTE 材料はテーブル κ_PA/PE/R で寄与する。恒久 ctest `test_fld_multimat_opacity`（κ 入替 A/B・平坦テーブル vs 定数経路整合・混合セル部分密度厳密値）。なお定数材料同士の従来混合則（上記の線形体積分率加重）はテーブル無しデッキで不変に保たれる。
 
 **質量分率 \(f_{m,\alpha}\) の時間発展**：ラグランジュステップでは各セルの \(f_{m,\alpha}\) は不変（セル境界を越える物質移動なし）。ALE remap（§3.3.4）により体積分率 \(f_\alpha V\) がセル間で輸送され、remap 後に \(f_\alpha = (f_\alpha V)' / V'\) として正規化し、\(f_{m,\alpha} = f_\alpha\,\rho_\alpha / \sum_\beta f_\beta\,\rho_\beta\) として質量分率を再計算する（ARCHITECTURE §4.4 remap リスト参照）。v1.0 では材料界面追跡を行わず、remap が唯一の \(f_{m,\alpha}\) 更新機構である。
 

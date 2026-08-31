@@ -65,71 +65,78 @@ set_target_properties(tenryu PROPERTIES
   CUDA_RESOLVE_DEVICE_SYMBOLS ON
 )
 
-# ---------------------------------------------------------------------------
-# tenryu_lib: one shared library carrying the whole TENRYU code base with a
-# single device link. Test executables link this instead of re-device-linking
-# every static archive (which costs ~36 MB of NVIDIA code sections per test
-# executable, ~20 GB per build tree across ~550 tests). The production
-# `tenryu` binary above intentionally keeps its fully static link.
-#
-# - Whole-archive linking: every object participates, so kernel/host
-#   registration objects cannot be dropped by archive member selection.
-# - The plain archive entries bring the transitive third-party link
-#   closure (HDF5, cusparse, spdlog, CLI11, ...).
-# - LINKER:--no-undefined makes any missing dependency a loud link error
-#   instead of a runtime failure inside a test.
-# - tenryu_namelist_embed is included too (core's namelist runtime calls
-#   init_embedded_module()). Tests that link it explicitly as a whole
-#   archive are excluded from the rewiring and keep their full static
-#   link, so no process carries both copies.
-if(NOT EXISTS ${CMAKE_CURRENT_BINARY_DIR}/tenryu_lib_anchor.cu)
-  file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/tenryu_lib_anchor.cu
-    "// Anchor translation unit: tenryu_lib gets its code from the archives.\n")
+# The shared library below exists solely for the test executables; snapshot
+# exports without a tests/ tree skip it (same condition as the top-level
+# add_subdirectory(tests) gate).
+if(BUILD_TESTING AND EXISTS ${PROJECT_SOURCE_DIR}/tests)
+
+  # ---------------------------------------------------------------------------
+  # tenryu_lib: one shared library carrying the whole TENRYU code base with a
+  # single device link. Test executables link this instead of re-device-linking
+  # every static archive (which costs ~36 MB of NVIDIA code sections per test
+  # executable, ~20 GB per build tree across ~550 tests). The production
+  # `tenryu` binary above intentionally keeps its fully static link.
+  #
+  # - Whole-archive linking: every object participates, so kernel/host
+  #   registration objects cannot be dropped by archive member selection.
+  # - The plain archive entries bring the transitive third-party link
+  #   closure (HDF5, cusparse, spdlog, CLI11, ...).
+  # - LINKER:--no-undefined makes any missing dependency a loud link error
+  #   instead of a runtime failure inside a test.
+  # - tenryu_namelist_embed is included too (core's namelist runtime calls
+  #   init_embedded_module()). Tests that link it explicitly as a whole
+  #   archive are excluded from the rewiring and keep their full static
+  #   link, so no process carries both copies.
+  if(NOT EXISTS ${CMAKE_CURRENT_BINARY_DIR}/tenryu_lib_anchor.cu)
+    file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/tenryu_lib_anchor.cu
+      "// Anchor translation unit: tenryu_lib gets its code from the archives.\n")
+  endif()
+
+  add_library(tenryu_lib SHARED
+    ${CMAKE_CURRENT_BINARY_DIR}/tenryu_lib_anchor.cu
+  )
+
+  set(TENRYU_LIB_ARCHIVES
+    tenryu_drivers tenryu_coupling tenryu_verification tenryu_diagnostics
+    tenryu_io tenryu_materials tenryu_hydro tenryu_radiation tenryu_laser
+    tenryu_burn tenryu_mesh tenryu_parallel tenryu_core)
+
+  if(TENRYU_ENABLE_PYTHON)
+    list(APPEND TENRYU_LIB_ARCHIVES tenryu_namelist_embed)
+  endif()
+
+  # Plain entries provide the CUDA device-link inputs, the target-level build
+  # dependencies, and the transitive third-party link closure (HDF5, cusparse,
+  # spdlog, CLI11, ...).
+  target_link_libraries(tenryu_lib PRIVATE ${TENRYU_LIB_ARCHIVES})
+
+  # CMake's WHOLE_ARCHIVE link feature cannot be used here: these archives
+  # PUBLIC-link each other, so each also reaches the link line as a plain
+  # transitive item, and CMake rejects one item carrying two link features.
+  # Raw linker flags do the same job: this flag group precedes the library
+  # list on the link line and forces every archive member in (registration
+  # objects cannot be dropped by member selection); the later plain
+  # occurrences of the same archives are skipped as already loaded.
+  target_link_options(tenryu_lib PRIVATE "LINKER:--whole-archive")
+  foreach(_tenryu_lib_archive IN LISTS TENRYU_LIB_ARCHIVES)
+    target_link_options(tenryu_lib PRIVATE
+      "LINKER:$<TARGET_FILE:${_tenryu_lib_archive}>")
+  endforeach()
+  target_link_options(tenryu_lib PRIVATE "LINKER:--no-whole-archive")
+
+  if(TENRYU_ENABLE_PYTHON)
+    target_link_libraries(tenryu_lib PRIVATE pybind11::embed)
+  endif()
+  if(TENRYU_ENABLE_MPI)
+    target_link_libraries(tenryu_lib PRIVATE MPI::MPI_CXX)
+  endif()
+
+  target_link_options(tenryu_lib PRIVATE "LINKER:--no-undefined")
+
+  set_target_properties(tenryu_lib PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
+    CUDA_RUNTIME_LIBRARY Shared
+  )
+
 endif()
-
-add_library(tenryu_lib SHARED
-  ${CMAKE_CURRENT_BINARY_DIR}/tenryu_lib_anchor.cu
-)
-
-set(TENRYU_LIB_ARCHIVES
-  tenryu_drivers tenryu_coupling tenryu_verification tenryu_diagnostics
-  tenryu_io tenryu_materials tenryu_hydro tenryu_radiation tenryu_laser
-  tenryu_burn tenryu_mesh tenryu_parallel tenryu_core)
-
-if(TENRYU_ENABLE_PYTHON)
-  list(APPEND TENRYU_LIB_ARCHIVES tenryu_namelist_embed)
-endif()
-
-# Plain entries provide the CUDA device-link inputs, the target-level build
-# dependencies, and the transitive third-party link closure (HDF5, cusparse,
-# spdlog, CLI11, ...).
-target_link_libraries(tenryu_lib PRIVATE ${TENRYU_LIB_ARCHIVES})
-
-# CMake's WHOLE_ARCHIVE link feature cannot be used here: these archives
-# PUBLIC-link each other, so each also reaches the link line as a plain
-# transitive item, and CMake rejects one item carrying two link features.
-# Raw linker flags do the same job: this flag group precedes the library
-# list on the link line and forces every archive member in (registration
-# objects cannot be dropped by member selection); the later plain
-# occurrences of the same archives are skipped as already loaded.
-target_link_options(tenryu_lib PRIVATE "LINKER:--whole-archive")
-foreach(_tenryu_lib_archive IN LISTS TENRYU_LIB_ARCHIVES)
-  target_link_options(tenryu_lib PRIVATE
-    "LINKER:$<TARGET_FILE:${_tenryu_lib_archive}>")
-endforeach()
-target_link_options(tenryu_lib PRIVATE "LINKER:--no-whole-archive")
-
-if(TENRYU_ENABLE_PYTHON)
-  target_link_libraries(tenryu_lib PRIVATE pybind11::embed)
-endif()
-if(TENRYU_ENABLE_MPI)
-  target_link_libraries(tenryu_lib PRIVATE MPI::MPI_CXX)
-endif()
-
-target_link_options(tenryu_lib PRIVATE "LINKER:--no-undefined")
-
-set_target_properties(tenryu_lib PROPERTIES
-  CUDA_SEPARABLE_COMPILATION ON
-  CUDA_RESOLVE_DEVICE_SYMBOLS ON
-  CUDA_RUNTIME_LIBRARY Shared
-)
