@@ -71,7 +71,7 @@
       <p><code>opacity.model="constant"</code> は、吸収 <code>kappa_a</code> と散乱 <code>kappa_s</code> を cm²/g で与え、すべての輻射群へ同じ値を割り当てる。なお <code>kappa_s</code> はスキーマが前方互換のために受理するキーで、v1.0 のプロダクションソルバは物理散乱をゼロとしてこれを消費しない（<a href="../overview/numerics-foundations.html">数値基盤</a>参照）。表形式のモデルは、密度・温度・群に依存するロスランド平均 \(\kappa_R\)、プランク吸収 \(\kappa^{PA}\)、そして利用できる場合はプランク放射 \(\kappa^{PE}\) を読む。内部の輸送係数へは \(\sigma=\rho\kappa\) によって cm⁻¹ に変換する。LTE の表で放射側が独立に与えられない場合には、警告を伴う \(\kappa^{PE}=\kappa^{PA}\) というキルヒホッフ則に基づく代替が定義されている。</p>
       <p>現行ランタイムの多材料経路は、定数不透明度を体積分率で線形に混合し、同じ混合値をプランクとロスランドの両スロットへ書き込む。質量分率によるプランクの線形混合 \(\kappa_{P,mix}=\sum_\alpha f_{m,\alpha}\kappa_{P,\alpha}\) とロスランドの調和平均 \(1/\kappa_{R,mix}=\sum_\alpha f_{m,\alpha}/\kappa_{R,\alpha}\) は、<code>NUMERICS.md</code> の実装状況注記（2026-08-29）に記された設計目標であり、現行動作ではない。調和平均の変種は、診断用の環境スイッチ <code>TENRYU_MM_OPACITY_MIX=harmonic</code> でのみ利用できる。</p>
       <h3 id="per-material-table-opacities">材料ごとの表不透明度（多材料 1D）</h3>
-      <p>2026-08-30 以降、<code>1D_SPH</code> の多群拡散デッキでは、ボイドでない各材料に固有の <code>tmat</code> 不透明度表 — LTE と、放射率を独立にもつ NLTE のいずれも — または定数を指定できる。セルでは体積分率が最大の支配材料が表を選び、その群ごとの不透明度をセルの \((\rho,T_e)\) で補間する。界面の混合セルでも支配材料だけを使うことは、文書化された近似である。Raw-IONMIX（<code>table_nlte</code>）と 2D は、引き続き単一材料に限られる。</p>
+      <p>2026-08-30 以降、<code>1D_SPH</code> の多群拡散デッキでは、ボイドでない各材料に固有の <code>tmat</code> 不透明度表 — LTE と、放射率を独立にもつ NLTE のいずれも — または定数を指定できる。純セルでは体積分率が最大の支配材料が表を選び、その群ごとの不透明度をセルの \((\rho,T_e)\) で補間する。界面の混合セル（2026-08-31 以降）は寄与材料をすべて厳密に合成する — \(\sigma = \rho \sum_m w_m \kappa_m(\rho_m, T_e)\)、重み \(w_m\) は質量分率（無ければ体積分率）、各材料の表はその部分密度 \(\rho_m = \rho\,w_m/f_m\) で評価する。NLTE が支配材料のセルだけは NLTE カーネルが支配材料近似で埋める。Raw-IONMIX（<code>table_nlte</code>）と 2D は、引き続き単一材料に限られる。</p>
     </section>
 
     <section aria-labelledby="planck-table">
