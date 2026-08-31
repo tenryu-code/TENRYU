@@ -274,6 +274,7 @@ struct MultiMatOpacityEntry {
 struct MatOpacityDesc {
   // kind: 0 = constant/void, 1 = LTE table, 2 = NLTE table.
   int kind = 0;
+  int is_void = 0;
   double kappa_planck = 0.0;
   double kappa_rosseland = 0.0;
   double inv_A_mp = 0.0;
@@ -413,6 +414,7 @@ void ensure_multimat_opacity_uploaded(const core::Config& cfg,
 
     if (mat.is_void) {
       desc.kind = 0;
+      desc.is_void = 1;
       desc.kappa_planck = 0.0;
       desc.kappa_rosseland = 0.0;
       continue;
@@ -455,10 +457,16 @@ void ensure_multimat_opacity_uploaded(const core::Config& cfg,
   cache.signature = std::move(signature);
 }
 
+// Exact volume-partition mixing: sigma = rho * sum_m w_m * kappa_m, evaluated
+// at each material's partial density rho_m = rho*w_m/f_m. Mass fractions are
+// preferred, with volume fractions as fallback. NLTE-dominant cells are filled
+// by the NLTE launch using the dominant-material approximation.
 __global__ void eval_opacity_multimat_kernel(
     const double* __restrict__ rho,
     const double* __restrict__ Te,
     const int* __restrict__ cell_material_index,
+    const double* __restrict__ mass_per_material,  // [n_cells*n_materials] or nullptr
+    const double* __restrict__ vol_frac,           // [n_cells*n_materials] or nullptr
     const MatOpacityDesc* __restrict__ descs,
     int n_materials,
     double kappa_floor,
@@ -474,8 +482,8 @@ __global__ void eval_opacity_multimat_kernel(
     return;
   }
 
-  const int m = min(max(cell_material_index[c], 0), n_materials - 1);
-  const MatOpacityDesc desc = descs[m];
+  const int m_dom = min(max(cell_material_index[c], 0), n_materials - 1);
+  const MatOpacityDesc desc = descs[m_dom];
   if (desc.kind == 2) {
     return;  // NLTE material: the per-material NLTE launch fills this cell
   }
@@ -485,28 +493,94 @@ __global__ void eval_opacity_multimat_kernel(
   const double sigma_max = rho_safe * fmax(kappa_cap, 0.0);
   const int base = c * n_groups;
 
-  if (desc.kind == 0) {
-    const double sigma_a_c = fmin(
-        fmax(fmax(rho_safe * desc.kappa_planck, 0.0), sigma_min), sigma_max);
-    const double sigma_R_c = fmin(
-        fmax(fmax(rho_safe * desc.kappa_rosseland, 0.0), sigma_min), sigma_max);
+  constexpr int kMaxMats = 16;
+  // Raw weights: mass fractions when tracked, volume fractions otherwise,
+  // dominant-only as the last resort. Void never participates.
+  double raw[kMaxMats];
+  double wsum = 0.0;
+  for (int m = 0; m < n_materials; ++m) {
+    double r = 0.0;
+    if (!descs[m].is_void) {
+      if (mass_per_material != nullptr) {
+        r = fmax(mass_per_material[c * n_materials + m], 0.0);
+      } else if (vol_frac != nullptr) {
+        r = fmax(vol_frac[c * n_materials + m], 0.0);
+      } else {
+        r = (m == m_dom) ? 1.0 : 0.0;
+      }
+    }
+    raw[m] = r;
+    wsum += r;
+  }
+
+  if (!(wsum > 0.0)) {
+    if (desc.kind == 0) {
+      const double sigma_a_c = fmin(
+          fmax(fmax(rho_safe * desc.kappa_planck, 0.0), sigma_min), sigma_max);
+      const double sigma_R_c = fmin(
+          fmax(fmax(rho_safe * desc.kappa_rosseland, 0.0), sigma_min), sigma_max);
+      for (int g = 0; g < n_groups; ++g) {
+        sigma_a[base + g] = sigma_a_c;
+        sigma_pe[base + g] = sigma_a_c;
+        sigma_R[base + g] = sigma_R_c;
+      }
+      return;
+    }
+
+    const double log_ni = log(fmax(rho_safe * desc.inv_A_mp, 1.0e-300));
+    const double log_T = log(fmax(Te[c], temperature_floor_eV));
     for (int g = 0; g < n_groups; ++g) {
-      sigma_a[base + g] = sigma_a_c;
-      sigma_pe[base + g] = sigma_a_c;
-      sigma_R[base + g] = sigma_R_c;
+      const double kappa_pa =
+          desc.view.interpolate(desc.view.kappa_PA, g, log_ni, log_T);
+      const double kappa_pe =
+          desc.view.interpolate(desc.view.kappa_PE, g, log_ni, log_T);
+      const double kappa_r =
+          desc.view.interpolate(desc.view.kappa_R, g, log_ni, log_T);
+      sigma_a[base + g] = fmin(
+          fmax(fmax(rho_safe * kappa_pa, 0.0), sigma_min), sigma_max);
+      sigma_pe[base + g] = fmin(
+          fmax(fmax(rho_safe * kappa_pe, 0.0), sigma_min), sigma_max);
+      sigma_R[base + g] = fmin(
+          fmax(fmax(rho_safe * kappa_r, 0.0), sigma_min), sigma_max);
     }
     return;
   }
 
-  const double log_ni = log(fmax(rho_safe * desc.inv_A_mp, 1.0e-300));
+  double w[kMaxMats];
+  double log_ni_m[kMaxMats];
+  for (int m = 0; m < n_materials; ++m) {
+    w[m] = raw[m] / wsum;
+    if (w[m] > 0.0 && descs[m].kind != 0) {
+      double rho_m = rho_safe;
+      if (vol_frac != nullptr) {
+        const double f = fmax(vol_frac[c * n_materials + m], 0.0);
+        if (f > 1.0e-12) {
+          rho_m = rho_safe * w[m] / f;
+        }
+      }
+      log_ni_m[m] = log(fmax(rho_m * descs[m].inv_A_mp, 1.0e-300));
+    } else {
+      log_ni_m[m] = 0.0;
+    }
+  }
   const double log_T = log(fmax(Te[c], temperature_floor_eV));
   for (int g = 0; g < n_groups; ++g) {
-    const double kappa_pa =
-        desc.view.interpolate(desc.view.kappa_PA, g, log_ni, log_T);
-    const double kappa_pe =
-        desc.view.interpolate(desc.view.kappa_PE, g, log_ni, log_T);
-    const double kappa_r =
-        desc.view.interpolate(desc.view.kappa_R, g, log_ni, log_T);
+    double kappa_pa = 0.0;
+    double kappa_pe = 0.0;
+    double kappa_r = 0.0;
+    for (int m = 0; m < n_materials; ++m) {
+      if (!(w[m] > 0.0)) continue;
+      const MatOpacityDesc& d = descs[m];
+      if (d.kind == 0) {
+        kappa_pa += w[m] * d.kappa_planck;
+        kappa_pe += w[m] * d.kappa_planck;
+        kappa_r += w[m] * d.kappa_rosseland;
+      } else {
+        kappa_pa += w[m] * d.view.interpolate(d.view.kappa_PA, g, log_ni_m[m], log_T);
+        kappa_pe += w[m] * d.view.interpolate(d.view.kappa_PE, g, log_ni_m[m], log_T);
+        kappa_r += w[m] * d.view.interpolate(d.view.kappa_R, g, log_ni_m[m], log_T);
+      }
+    }
     sigma_a[base + g] = fmin(
         fmax(fmax(rho_safe * kappa_pa, 0.0), sigma_min), sigma_max);
     sigma_pe[base + g] = fmin(
@@ -2059,10 +2133,20 @@ void evaluate_fld_opacity_and_emission(
     auto& cache = multimat_opacity_cache();
     const int opacity_grid = (n_cells + kBlock - 1) / kBlock;
     if (opacity_grid > 0) {
+      TENRYU_ASSERT(cfg.materials.materials.size() <= 16U,
+                    "FLD multi-material opacity supports at most 16 materials");
       eval_opacity_multimat_kernel<<<opacity_grid, kBlock>>>(
           state.rho.data(),
           state.Te.data(),
           state.cell_material_index.data(),
+          (state.mass_per_material.size() ==
+           static_cast<std::size_t>(n_cells) * cfg.materials.materials.size())
+              ? state.mass_per_material.data()
+              : nullptr,
+          (state.volFrac.size() ==
+           static_cast<std::size_t>(n_cells) * cfg.materials.materials.size())
+              ? state.volFrac.data()
+              : nullptr,
           cache.device_descs.data(),
           static_cast<int>(cfg.materials.materials.size()),
           fld.opacity_floor,

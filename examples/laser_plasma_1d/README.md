@@ -25,13 +25,13 @@ Outputs land in `outputs/<deck name>/`.
   `driver_full_step_retry_max_attempts=8`, and the artificial-viscosity /
   odd-even damping set (`av_heat_C=0.5`, `av_heat_to="ion"`,
   `odd_even_damping_C=1.0`, `ee_odd_even_C=0.15`).
-- Multi-material radiative decks use per-material CONSTANT opacities
-  (volume-fraction-mixed per cell). Table opacity (`tmat`) in a
-  multi-material deck is rejected by namelist validation (Phase-1
-  table-NLTE runtime is single-material); the per-material table-opacity
-  upgrade is designed in
-  `docs/design/multimaterial_table_opacity_20260829.md`. Table EOS
-  (`eos.model="tmat"`) is fine in any deck.
+- Multi-material radiative decks may give each material its own opacity:
+  per-material constants, or a per-material tmat table (LTE or NLTE) — see
+  the table-opacity variants section below. The shipped decks stay on gray
+  constants for reproducibility. Mixed cells evaluate each contributing
+  material's table at its partial density and combine with mass-fraction
+  weights (`docs/design/multimaterial_table_opacity_20260829.md`). Table
+  EOS (`eos.model="tmat"`) is fine in any deck.
 
 ## Examples and measured commissioning metrics
 
@@ -51,9 +51,11 @@ Outputs land in `outputs/<deck name>/`.
 ## Table-opacity variants (2026-08-30)
 
 Since per-material table opacities landed, a multi-material 1D FLD deck may give each material its
-own LTE tmat opacity table instead of the gray constants: set
+own tmat opacity table instead of the gray constants: set
 `opacity=dict(model="tmat", file="TMAT-H5/<mat>.tmat.h5", ...)` per
-material (tables must be LTE — `--kirchhoff-pe`; the runtime asserts it).
+material. Both LTE tables (`--kirchhoff-pe`) and NLTE tables are accepted;
+NLTE tables carry emissivity != absorptivity and are the right choice for
+burn physics (see the EX-10 variant below).
 Measured variant behavior on this suite:
 
 - EX-05 with the Kr+CD tables: material shock 63.6 um/ns, witness arrival
