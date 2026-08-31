@@ -57,6 +57,11 @@ Numerics(
 
 Radiation(
     enabled=True,
+    mode="multigroup_diffusion",
+    multigroup_diffusion=dict(
+        flux_limiter="none",
+        boundary=dict(inner_r="reflect", outer_r="vacuum"),
+    ),
     groups=1,
     group_bounds_eV=[0.0, 1.0e6],
     volume_source_rate=3.2928e12,

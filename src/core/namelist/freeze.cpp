@@ -375,6 +375,69 @@ py::dict serialize_mesh(const Config::MeshConfig& mesh) {
     }
     out["auto_regions"] = regions;
   }
+  if (mesh.zoning_intent.enabled) {
+    const auto& zoning = mesh.zoning_intent;
+    py::dict intent;
+    intent["n_cells"] = zoning.n_cells;
+    intent["measure"] = zoning.measure;
+    intent["dr_min"] = zoning.dr_min;
+    intent["cell_measure_min"] = zoning.cell_measure_min;
+    intent["cell_measure_max"] = zoning.cell_measure_max;
+    intent["preferred_ratio"] = zoning.preferred_ratio;
+    intent["ratio_hard_max"] = zoning.ratio_hard_max;
+    intent["min_cells_per_segment"] = zoning.min_cells_per_segment;
+
+    py::list pins;
+    for (const auto& pin : zoning.pins) {
+      py::dict p;
+      p["r"] = pin.r;
+      p["ratio_jump_allowed"] = pin.ratio_jump_allowed;
+      pins.append(std::move(p));
+    }
+    intent["pins"] = pins;
+
+    py::list profile;
+    for (const auto& point : zoning.profile) {
+      py::dict p;
+      p["r"] = point.r;
+      p["w"] = point.w;
+      profile.append(std::move(p));
+    }
+    intent["profile"] = profile;
+
+    py::list anchors;
+    for (const auto& anchor : zoning.anchors) {
+      py::dict a;
+      a["r"] = anchor.r;
+      a["half_width"] = anchor.half_width;
+      a["log_amplitude"] = anchor.log_amplitude;
+      anchors.append(std::move(a));
+    }
+    intent["anchors"] = anchors;
+
+    py::list bands;
+    for (const auto& band : zoning.bands) {
+      py::dict b;
+      b["measure_frac_begin"] = band.measure_frac_begin;
+      b["measure_frac_end"] = band.measure_frac_end;
+      b["cell_measure_min"] = band.cell_measure_min;
+      b["cell_measure_max"] = band.cell_measure_max;
+      bands.append(std::move(b));
+    }
+    intent["bands"] = bands;
+
+    py::list density_regions;
+    for (const auto& region : zoning.density_regions) {
+      py::dict r;
+      r["r_end"] = region.r_end;
+      r["rho"] = region.rho;
+      density_regions.append(std::move(r));
+    }
+    intent["density_regions"] = density_regions;
+    intent["extra_events"] =
+        serialize_double_list_17g(zoning.extra_events);
+    out["zoning_intent"] = intent;
+  }
   if (mesh.auto_regions_axis != "r") {
     out["auto_regions_axis"] = mesh.auto_regions_axis;
   }

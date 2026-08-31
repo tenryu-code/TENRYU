@@ -276,6 +276,7 @@ class HistoryWriter {
     bool center_perturbation_enabled = false;
     double E_laser_deposited = 0.0;
     double E_laser_escaped = 0.0;
+    double E_rad_escaped = 0.0;
     double E_laser_incident = 0.0;
     double E_ra_deposited = 0.0;
     double E_cbet_iaw_step = 0.0;

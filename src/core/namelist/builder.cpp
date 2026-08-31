@@ -32,6 +32,7 @@
 #include "core/config_validate.hpp"
 #include "core/error.hpp"
 #include "core/radiation_group_structure.hpp"
+#include "core/zoning_intent.hpp"
 #include "materials/eos_table.hpp"
 #include "materials/ionmix_reader.hpp"
 #include "materials/tmat_reader.hpp"
@@ -1378,6 +1379,7 @@ void Builder::set_mesh(py::dict kwargs) {
   enforce_known_keys(kwargs, "Mesh",
                      {"nr", "nz", "r_min", "r_max", "z_min", "z_max", "grid_type_r",
                       "grid_type_z", "grid_r", "grid_z", "grid_theta", "grid", "auto_regions",
+                      "zoning_intent",
                       "explicit_nodes", "explicit_nodes_z", "explicit_nodes_theta",
                       "auto_regions_axis", "auto_zone",
                       "geometry_1d", "motion",
@@ -1434,6 +1436,7 @@ void Builder::set_mesh(py::dict kwargs) {
   mesh.grid_segments_theta.clear();
   mesh.grid_segments_theta_repr.clear();
   mesh.auto_regions.clear();
+  mesh.zoning_intent = Config::MeshConfig::ZoningIntentNL{};
   mesh.auto_regions_axis = mesh_defaults.auto_regions_axis;
   mesh.auto_config = Config::MeshConfig::AutoZoneConfig{};
   mesh.grading = Config::MeshConfig::GradingConfig{};
@@ -2144,6 +2147,252 @@ void Builder::set_mesh(py::dict kwargs) {
       }
       prev_r_end = az.r_end;
       mesh.auto_regions.push_back(az);
+    }
+  }
+  if (has_key(kwargs, "zoning_intent")) {
+    const py::handle intent_obj = kwargs["zoning_intent"];
+    if (!py::isinstance<py::dict>(intent_obj)) {
+      throw_value_type_error("Mesh.zoning_intent", "dict", intent_obj);
+    }
+    const py::dict intent = py::reinterpret_borrow<py::dict>(intent_obj);
+    enforce_known_keys(
+        intent, "Mesh.zoning_intent",
+        {"n_cells", "measure", "pins", "profile", "anchors", "bands",
+         "density_regions", "extra_events", "dr_min", "cell_measure_min",
+         "cell_measure_max", "preferred_ratio", "ratio_hard_max",
+         "min_cells_per_segment"});
+    auto& zoning = mesh.zoning_intent;
+    zoning.enabled = true;
+    if (!has_key(intent, "n_cells")) {
+      throw ConfigError("Mesh.zoning_intent requires key 'n_cells'");
+    }
+    zoning.n_cells =
+        strict_int32(intent["n_cells"], "Mesh.zoning_intent.n_cells");
+    if (zoning.n_cells < 1) {
+      throw ConfigError("Mesh.zoning_intent.n_cells must be >= 1");
+    }
+    if (has_key(intent, "measure")) {
+      zoning.measure =
+          strict_string(intent["measure"], "Mesh.zoning_intent.measure");
+      if (zoning.measure != "width" && zoning.measure != "areal_mass" &&
+          zoning.measure != "cylindrical_line_mass" &&
+          zoning.measure != "spherical_cell_mass") {
+        throw ValueError(
+            "Mesh.zoning_intent.measure must be one of {\"width\", "
+            "\"areal_mass\", \"cylindrical_line_mass\", "
+            "\"spherical_cell_mass\"}, got " +
+            zoning.measure);
+      }
+    }
+    if (has_key(intent, "pins")) {
+      const py::handle pins_obj = intent["pins"];
+      if (!py::isinstance<py::list>(pins_obj)) {
+        throw_value_type_error("Mesh.zoning_intent.pins", "list[dict]",
+                               pins_obj);
+      }
+      const py::list pins = py::reinterpret_borrow<py::list>(pins_obj);
+      zoning.pins.reserve(pins.size());
+      for (std::size_t k = 0; k < pins.size(); ++k) {
+        const py::handle item = pins[k];
+        if (!py::isinstance<py::dict>(item)) {
+          throw_value_type_error("Mesh.zoning_intent.pins[k]", "dict", item);
+        }
+        const py::dict pin = py::reinterpret_borrow<py::dict>(item);
+        enforce_known_keys(pin, "Mesh.zoning_intent.pins[k]",
+                           {"r", "ratio_jump_allowed"});
+        if (!has_key(pin, "r")) {
+          throw ConfigError("Mesh.zoning_intent.pins entries require r");
+        }
+        Config::MeshConfig::ZoningIntentPinNL out;
+        out.r = numeric_as_double(pin["r"], "Mesh.zoning_intent.pins[k].r");
+        if (has_key(pin, "ratio_jump_allowed")) {
+          out.ratio_jump_allowed = strict_bool(
+              pin["ratio_jump_allowed"],
+              "Mesh.zoning_intent.pins[k].ratio_jump_allowed");
+        }
+        zoning.pins.push_back(out);
+      }
+    }
+    if (has_key(intent, "profile")) {
+      const py::handle profile_obj = intent["profile"];
+      if (!py::isinstance<py::list>(profile_obj)) {
+        throw_value_type_error("Mesh.zoning_intent.profile", "list[dict]",
+                               profile_obj);
+      }
+      const py::list profile = py::reinterpret_borrow<py::list>(profile_obj);
+      zoning.profile.reserve(profile.size());
+      for (std::size_t k = 0; k < profile.size(); ++k) {
+        const py::handle item = profile[k];
+        if (!py::isinstance<py::dict>(item)) {
+          throw_value_type_error("Mesh.zoning_intent.profile[k]", "dict",
+                                 item);
+        }
+        const py::dict point = py::reinterpret_borrow<py::dict>(item);
+        enforce_known_keys(point, "Mesh.zoning_intent.profile[k]", {"r", "w"});
+        if (!has_key(point, "r") || !has_key(point, "w")) {
+          throw ConfigError("Mesh.zoning_intent.profile entries require r and w");
+        }
+        Config::MeshConfig::ZoningIntentProfilePointNL out;
+        out.r = numeric_as_double(point["r"],
+                                  "Mesh.zoning_intent.profile[k].r");
+        out.w = numeric_as_double(point["w"],
+                                  "Mesh.zoning_intent.profile[k].w");
+        zoning.profile.push_back(out);
+      }
+    }
+    if (has_key(intent, "anchors")) {
+      const py::handle anchors_obj = intent["anchors"];
+      if (!py::isinstance<py::list>(anchors_obj)) {
+        throw_value_type_error("Mesh.zoning_intent.anchors", "list[dict]",
+                               anchors_obj);
+      }
+      const py::list anchors = py::reinterpret_borrow<py::list>(anchors_obj);
+      zoning.anchors.reserve(anchors.size());
+      for (std::size_t k = 0; k < anchors.size(); ++k) {
+        const py::handle item = anchors[k];
+        if (!py::isinstance<py::dict>(item)) {
+          throw_value_type_error("Mesh.zoning_intent.anchors[k]", "dict",
+                                 item);
+        }
+        const py::dict anchor = py::reinterpret_borrow<py::dict>(item);
+        enforce_known_keys(anchor, "Mesh.zoning_intent.anchors[k]",
+                           {"r", "half_width", "log_amplitude"});
+        if (!has_key(anchor, "r") || !has_key(anchor, "half_width") ||
+            !has_key(anchor, "log_amplitude")) {
+          throw ConfigError(
+              "Mesh.zoning_intent.anchors entries require r, half_width, "
+              "and log_amplitude");
+        }
+        Config::MeshConfig::ZoningIntentAnchorNL out;
+        out.r = numeric_as_double(anchor["r"],
+                                  "Mesh.zoning_intent.anchors[k].r");
+        out.half_width = numeric_as_double(
+            anchor["half_width"],
+            "Mesh.zoning_intent.anchors[k].half_width");
+        out.log_amplitude = numeric_as_double(
+            anchor["log_amplitude"],
+            "Mesh.zoning_intent.anchors[k].log_amplitude");
+        zoning.anchors.push_back(out);
+      }
+    }
+    if (has_key(intent, "bands")) {
+      const py::handle bands_obj = intent["bands"];
+      if (!py::isinstance<py::list>(bands_obj)) {
+        throw_value_type_error("Mesh.zoning_intent.bands", "list[dict]",
+                               bands_obj);
+      }
+      const py::list bands = py::reinterpret_borrow<py::list>(bands_obj);
+      zoning.bands.reserve(bands.size());
+      for (std::size_t k = 0; k < bands.size(); ++k) {
+        const py::handle item = bands[k];
+        if (!py::isinstance<py::dict>(item)) {
+          throw_value_type_error("Mesh.zoning_intent.bands[k]", "dict", item);
+        }
+        const py::dict band = py::reinterpret_borrow<py::dict>(item);
+        enforce_known_keys(
+            band, "Mesh.zoning_intent.bands[k]",
+            {"measure_frac_begin", "measure_frac_end", "cell_measure_min",
+             "cell_measure_max"});
+        if (!has_key(band, "measure_frac_begin") ||
+            !has_key(band, "measure_frac_end")) {
+          throw ConfigError(
+              "Mesh.zoning_intent.bands entries require measure_frac_begin "
+              "and measure_frac_end");
+        }
+        Config::MeshConfig::ZoningIntentBandNL out;
+        out.measure_frac_begin = numeric_as_double(
+            band["measure_frac_begin"],
+            "Mesh.zoning_intent.bands[k].measure_frac_begin");
+        out.measure_frac_end = numeric_as_double(
+            band["measure_frac_end"],
+            "Mesh.zoning_intent.bands[k].measure_frac_end");
+        if (has_key(band, "cell_measure_min")) {
+          out.cell_measure_min = numeric_as_double(
+              band["cell_measure_min"],
+              "Mesh.zoning_intent.bands[k].cell_measure_min");
+        }
+        if (has_key(band, "cell_measure_max")) {
+          out.cell_measure_max = numeric_as_double(
+              band["cell_measure_max"],
+              "Mesh.zoning_intent.bands[k].cell_measure_max");
+        }
+        zoning.bands.push_back(out);
+      }
+    }
+    if (has_key(intent, "density_regions")) {
+      const py::handle density_obj = intent["density_regions"];
+      if (!py::isinstance<py::list>(density_obj)) {
+        throw_value_type_error("Mesh.zoning_intent.density_regions",
+                               "list[dict]", density_obj);
+      }
+      const py::list regions = py::reinterpret_borrow<py::list>(density_obj);
+      zoning.density_regions.reserve(regions.size());
+      double prev_r_end = -std::numeric_limits<double>::infinity();
+      for (std::size_t k = 0; k < regions.size(); ++k) {
+        const py::handle item = regions[k];
+        if (!py::isinstance<py::dict>(item)) {
+          throw_value_type_error("Mesh.zoning_intent.density_regions[k]",
+                                 "dict", item);
+        }
+        const py::dict region = py::reinterpret_borrow<py::dict>(item);
+        enforce_known_keys(region, "Mesh.zoning_intent.density_regions[k]",
+                           {"r_end", "rho"});
+        if (!has_key(region, "r_end") || !has_key(region, "rho")) {
+          throw ConfigError(
+              "Mesh.zoning_intent.density_regions entries require r_end "
+              "and rho");
+        }
+        Config::MeshConfig::ZoningIntentDensityRegionNL out;
+        out.r_end = numeric_as_double(
+            region["r_end"],
+            "Mesh.zoning_intent.density_regions[k].r_end");
+        out.rho = numeric_as_double(
+            region["rho"], "Mesh.zoning_intent.density_regions[k].rho");
+        if (!(out.r_end > prev_r_end)) {
+          throw ConfigError(
+              "Mesh.zoning_intent.density_regions r_end values must be "
+              "strictly increasing");
+        }
+        if (!(out.rho >= 0.0)) {
+          throw ConfigError(
+              "Mesh.zoning_intent.density_regions[k].rho must be >= 0");
+        }
+        prev_r_end = out.r_end;
+        zoning.density_regions.push_back(out);
+      }
+    }
+    if (has_key(intent, "extra_events")) {
+      zoning.extra_events = strict_double_vector(
+          intent["extra_events"], "Mesh.zoning_intent.extra_events");
+    }
+    if (has_key(intent, "dr_min")) {
+      zoning.dr_min =
+          numeric_as_double(intent["dr_min"], "Mesh.zoning_intent.dr_min");
+    }
+    if (has_key(intent, "cell_measure_min")) {
+      zoning.cell_measure_min = numeric_as_double(
+          intent["cell_measure_min"],
+          "Mesh.zoning_intent.cell_measure_min");
+    }
+    if (has_key(intent, "cell_measure_max")) {
+      zoning.cell_measure_max = numeric_as_double(
+          intent["cell_measure_max"],
+          "Mesh.zoning_intent.cell_measure_max");
+    }
+    if (has_key(intent, "preferred_ratio")) {
+      zoning.preferred_ratio = numeric_as_double(
+          intent["preferred_ratio"],
+          "Mesh.zoning_intent.preferred_ratio");
+    }
+    if (has_key(intent, "ratio_hard_max")) {
+      zoning.ratio_hard_max = numeric_as_double(
+          intent["ratio_hard_max"],
+          "Mesh.zoning_intent.ratio_hard_max");
+    }
+    if (has_key(intent, "min_cells_per_segment")) {
+      zoning.min_cells_per_segment = strict_int32(
+          intent["min_cells_per_segment"],
+          "Mesh.zoning_intent.min_cells_per_segment");
     }
   }
   const auto parse_explicit_nodes = [&](const char* key,
@@ -12612,6 +12861,164 @@ void Builder::validate() {
       tenryu::core::log_warning("[mesh-autozone] " + w);
     }
   }
+  if (mesh.zoning_intent.enabled) {
+    const auto& zoning = mesh.zoning_intent;
+    if (!mesh.auto_regions.empty()) {
+      throw ConfigError(
+          "Mesh.zoning_intent and Mesh.auto_regions are mutually exclusive");
+    }
+    if (!mesh.grid_segments.empty()) {
+      throw ConfigError(
+          "Mesh.zoning_intent and Mesh.grid segments are mutually exclusive");
+    }
+    if (main.dimension == "2D_RZ") {
+      throw ConfigError(
+          "Mesh.zoning_intent supports 1D runs only in this version");
+    }
+    std::string required_geometry;
+    if (zoning.measure == "spherical_cell_mass") {
+      required_geometry = "spherical";
+    } else if (zoning.measure == "cylindrical_line_mass") {
+      required_geometry = "cylindrical";
+    }
+    if (!required_geometry.empty() &&
+        mesh.geometry_1d != required_geometry) {
+      throw ConfigError(
+          "Mesh.zoning_intent.measure='" + zoning.measure +
+          "' requires Geometry '" + required_geometry + "', got '" +
+          mesh.geometry_1d +
+          "'; 'width' and 'areal_mass' are geometry-independent");
+    }
+    if (!std::isfinite(mesh.r_min) || !std::isfinite(mesh.r_max)) {
+      throw ConfigError("Mesh.zoning_intent requires r_min and r_max");
+    }
+
+    const bool is_width = (zoning.measure == "width");
+    if (is_width) {
+      if (!zoning.density_regions.empty()) {
+        tenryu::core::log_warning(
+            "[mesh-zoning-intent] density_regions ignored for "
+            "measure='width'");
+      }
+    } else {
+      if (zoning.density_regions.empty()) {
+        throw ConfigError("Mesh.zoning_intent." + zoning.measure +
+                          " requires density_regions");
+      }
+      const double r_last = zoning.density_regions.back().r_end;
+      if (std::abs(r_last - mesh.r_max) >
+          1.0e-12 * std::max(1.0, std::abs(mesh.r_max))) {
+        throw ConfigError(
+            "Mesh.zoning_intent.density_regions last r_end must equal the "
+            "outer boundary (" +
+            std::to_string(mesh.r_max) + "), got " +
+            std::to_string(r_last));
+      }
+    }
+
+    tenryu::core::ZoningIntentConfig zic;
+    zic.n_cells = zoning.n_cells;
+    zic.dr_min = zoning.dr_min;
+    zic.cell_measure_min = zoning.cell_measure_min;
+    zic.cell_measure_max = zoning.cell_measure_max;
+    zic.preferred_ratio = zoning.preferred_ratio;
+    zic.ratio_hard_max = zoning.ratio_hard_max;
+    zic.min_cells_per_segment = zoning.min_cells_per_segment;
+    if (zoning.measure == "width") {
+      zic.measure = tenryu::core::ZoningMeasure::kWidth;
+    } else if (zoning.measure == "areal_mass") {
+      zic.measure = tenryu::core::ZoningMeasure::kArealMass;
+    } else if (zoning.measure == "cylindrical_line_mass") {
+      zic.measure = tenryu::core::ZoningMeasure::kCylindricalLineMass;
+    } else {
+      zic.measure = tenryu::core::ZoningMeasure::kSphericalCellMass;
+    }
+    zic.pins.reserve(zoning.pins.size());
+    for (const auto& pin : zoning.pins) {
+      tenryu::core::ZoningIntentPin out;
+      out.r = pin.r;
+      out.ratio_jump_allowed = pin.ratio_jump_allowed;
+      zic.pins.push_back(out);
+    }
+    zic.profile.reserve(zoning.profile.size());
+    for (const auto& point : zoning.profile) {
+      tenryu::core::ZoningProfilePoint out;
+      out.r = point.r;
+      out.w = point.w;
+      zic.profile.push_back(out);
+    }
+    zic.anchors.reserve(zoning.anchors.size());
+    for (const auto& anchor : zoning.anchors) {
+      tenryu::core::ZoningAnchor out;
+      out.r = anchor.r;
+      out.half_width = anchor.half_width;
+      out.log_amplitude = anchor.log_amplitude;
+      zic.anchors.push_back(out);
+    }
+    zic.bands.reserve(zoning.bands.size());
+    for (const auto& band : zoning.bands) {
+      tenryu::core::ZoningBand out;
+      out.measure_frac_begin = band.measure_frac_begin;
+      out.measure_frac_end = band.measure_frac_end;
+      out.cell_measure_min = band.cell_measure_min;
+      out.cell_measure_max = band.cell_measure_max;
+      zic.bands.push_back(out);
+    }
+    zic.extra_events = zoning.extra_events;
+
+    std::function<double(double)> rho0;
+    if (!is_width) {
+      std::vector<double> r_ends;
+      std::vector<double> densities;
+      r_ends.reserve(zoning.density_regions.size());
+      densities.reserve(zoning.density_regions.size());
+      for (const auto& region : zoning.density_regions) {
+        r_ends.push_back(region.r_end);
+        densities.push_back(region.rho);
+        if (region.r_end > mesh.r_min && region.r_end < mesh.r_max) {
+          zic.extra_events.push_back(region.r_end);
+        }
+      }
+      rho0 = [r_ends = std::move(r_ends),
+              densities = std::move(densities)](const double r) {
+        std::size_t index = static_cast<std::size_t>(
+            std::upper_bound(r_ends.begin(), r_ends.end(), r) -
+            r_ends.begin());
+        index = std::min(index, densities.size() - 1);
+        return densities[index];
+      };
+    }
+
+    const tenryu::core::ZoningResult result =
+        tenryu::core::compute_zoning_intent_nodes(
+            mesh.r_min, mesh.r_max, zic, rho0);
+    if (!result.ok) {
+      throw ConfigError("[mesh-zoning-intent] " + result.diag.code + ": " +
+                        result.diag.message);
+    }
+    mesh.explicit_nodes = result.nodes;
+    const int n = static_cast<int>(mesh.explicit_nodes.size()) - 1;
+    if (mesh.nr >= 0 && mesh.nr != n) {
+      throw ConfigError(
+          "Mesh.nr (" + std::to_string(mesh.nr) +
+          ") conflicts with Mesh.zoning_intent n_cells (" +
+          std::to_string(n) + "); omit Mesh.nr or match it");
+    }
+    mesh.nr = n;
+    tenryu::core::log_info(
+        "[mesh-zoning-intent] nodes=" +
+        std::to_string(mesh.explicit_nodes.size()) +
+        " measure=" + zoning.measure +
+        " ratio_max=" + std::to_string(result.diag.ratio_max_achieved) +
+        " ratio_mean=" + std::to_string(result.diag.ratio_mean_achieved) +
+        " soft_exceed=" + std::to_string(result.diag.n_ratio_soft_exceed) +
+        " width_min=" + std::to_string(result.diag.width_min_achieved) +
+        " quad_residual=" +
+        std::to_string(result.diag.quadrature_rel_residual));
+    for (const auto& w : result.diag.warnings) {
+      tenryu::core::log_warning("[mesh-zoning-intent] " + w);
+    }
+  }
   if (mesh.nr < 4 && mesh.logical_mesh_2d != "cone_shell") {
     throw ValueError("Mesh.nr must be >= 4");
   }
@@ -14662,6 +15069,41 @@ void Builder::validate() {
         throw ConfigError(
             "Radiation.sn_transport.marshak.flux_erg_per_cm2_s requires"
             " groups=1 (grey) for 1D_SPH");
+      }
+    }
+  }
+
+  if (main.dimension == "1D_SPH" && radiation.enabled) {
+    const auto n_nonvoid_materials = std::count_if(
+        materials.materials.begin(), materials.materials.end(),
+        [](const auto& mat) { return !mat.is_void; });
+    if (n_nonvoid_materials > 1) {
+      if (radiation.mode == RadiationMode::SnTransport) {
+        throw ConfigError(
+            "Radiation.mode=\"sn_transport\" does not support multiple "
+            "non-void materials in 1D_SPH (per-cell scattering-opacity "
+            "mixing is not implemented); use a single non-void material");
+      }
+      if (radiation.mode == RadiationMode::MultigroupDiffusion) {
+        for (std::size_t material_index = 0;
+             material_index < materials.materials.size();
+             ++material_index) {
+          const auto& mat = materials.materials[material_index];
+          if (mat.is_void) {
+            continue;
+          }
+          if (mat.opacity_model != "constant" && mat.opacity_model != "none" &&
+              mat.opacity_model != "tmat") {
+            throw ConfigError(
+                "Materials.materials[" + std::to_string(material_index) +
+                "].opacity.model=\"" + mat.opacity_model +
+                "\": 1D_SPH multi-material decks with "
+                "Radiation.mode=\"multigroup_diffusion\" support "
+                "per-material constant opacities and tmat tables; use "
+                "opacity model \"constant\", \"none\", or \"tmat\", "
+                "or reduce to a single non-void material");
+          }
+        }
       }
     }
   }

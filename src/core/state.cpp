@@ -575,6 +575,7 @@ void State::invalidate_cell_material_props() {
   gamma_eff.reset(0);
   kappa_planck_eff.reset(0);
   kappa_rosseland_eff.reset(0);
+  cell_material_index.reset(0);
 }
 
 void State::ensure_cell_material_props(const Config& cfg) {
@@ -584,7 +585,8 @@ void State::ensure_cell_material_props(const Config& cfg) {
   }
   if (A_eff.size() == n_cells && gamma_eff.size() == n_cells &&
       kappa_planck_eff.size() == n_cells &&
-      kappa_rosseland_eff.size() == n_cells) {
+      kappa_rosseland_eff.size() == n_cells &&
+      cell_material_index.size() == n_cells) {
     return;
   }
   TENRYU_ASSERT(!cfg.materials.materials.empty(),
@@ -605,6 +607,14 @@ void State::ensure_cell_material_props(const Config& cfg) {
 
   const std::size_t n_mat = materials.size();
   const std::size_t expected = n_cells * n_mat;
+  std::size_t d0 = 0U;
+  for (std::size_t m = 0; m < n_mat; ++m) {
+    if (!materials[m].is_void) {
+      d0 = m;
+      break;
+    }
+  }
+  std::vector<int> host_mat_index(n_cells, static_cast<int>(d0));
   if (n_mat > 1U && volFrac.size() == expected) {
     std::vector<double> host_volfrac(expected, 0.0);
     volFrac.copy_to_host(host_volfrac.data());
@@ -620,10 +630,15 @@ void State::ensure_cell_material_props(const Config& cfg) {
       double frac_sum = 0.0;
       double inv_A_c = 0.0;
       double gamma_c = 0.0;
+      double max_non_void_frac = 0.0;
       for (std::size_t m = 0; m < n_mat; ++m) {
         const double frac_raw = host_volfrac[base + m];
         const double frac =
             (std::isfinite(frac_raw) && frac_raw > 0.0) ? frac_raw : 0.0;
+        if (!materials[m].is_void && frac > max_non_void_frac) {
+          max_non_void_frac = frac;
+          host_mat_index[c] = static_cast<int>(m);
+        }
         frac_sum += frac;
         inv_A_c += frac * inv_A_m[m];
         gamma_c += frac * gamma_m[m];
@@ -722,10 +737,12 @@ void State::ensure_cell_material_props(const Config& cfg) {
   gamma_eff.reset(n_cells);
   kappa_planck_eff.reset(n_cells);
   kappa_rosseland_eff.reset(n_cells);
+  cell_material_index.reset(n_cells);
   A_eff.copy_from_host(host_A.data());
   gamma_eff.copy_from_host(host_gamma.data());
   kappa_planck_eff.copy_from_host(host_kappa_planck.data());
   kappa_rosseland_eff.copy_from_host(host_kappa_rosseland.data());
+  cell_material_index.copy_from_host(host_mat_index.data());
 }
 
 void State::reset() {

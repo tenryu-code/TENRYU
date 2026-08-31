@@ -42,7 +42,9 @@ NlteCoeffsDeviceResult compute_nlte_coefficients_cuda(
     double* d_eta,
     double* d_lambda_raw,
     cudaStream_t stream,
-    bool low_density_extrap = false);
+    bool low_density_extrap = false,
+    const int* cell_material_index = nullptr,
+    int material_filter = -1);
 
 /// When pinned_clamp_counts is non-null, it must point to page-locked host memory
 /// with room for 3 ints: slot 0 = negative_alpha, slot 1 = negative_eta, and
@@ -78,7 +80,9 @@ NlteCoeffsDeviceResult compute_nlte_coefficients_cuda_with_pe(
     cudaStream_t stream,
     bool low_density_extrap = false,
     int* pinned_clamp_counts = nullptr,
-    bool reuse_device_void_mask = false);
+    bool reuse_device_void_mask = false,
+    const int* cell_material_index = nullptr,
+    int material_filter = -1);
 
 /// Pure deterministic S_N coefficient path: raw PA/PE opacities and emissivity,
 /// with Fleck linearization bypassed.

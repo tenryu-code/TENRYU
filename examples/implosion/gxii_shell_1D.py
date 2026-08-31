@@ -75,12 +75,8 @@ AUTO_REGIONS = [
 Mesh(
     r_min=0.0,
     r_max=R_MAX,
-    nr=sum(r["nz"] for r in AUTO_REGIONS),
-    grid=dict(
-        type="auto",
-        regions=AUTO_REGIONS,
-        auto=dict(mass_ratio_max=1.3, dr_min=1.0e-6),
-    ),
+    auto_regions=AUTO_REGIONS,
+    auto_zone=dict(mass_ratio_max=1.3, dr_min=1.0e-6),
     motion="lagrangian",
     floors=dict(rho_floor_gcc=1.0e-9, Te_floor_eV=0.1, Ti_floor_eV=0.1),
 )
@@ -128,20 +124,15 @@ Geometry(
 
 Radiation(
     enabled=True,
-    compute_T_range_eV=[0.1, 3.0e4],
-    imc=dict(
-        alpha=1.0,
-        f_max=1.0,
-        particles_per_cell_group=32,
-        census_comb=dict(enabled=True, trigger_ratio_floor=0.86),
-        source_tilting=True,
-        spectral_bias_eta=0.3,
-        net_e_source_smoothing=dict(enabled=True, alpha=0.25, tau_threshold=6.0),
-        difference=dict(enabled=True, W_max=1.0, tau0=3.0, chi0=1.0,
-                         face_transport=True),
+    mode="multigroup_diffusion",
+    group_repack_hard_xray=True,
+    multigroup_diffusion=dict(
+        hydro_coupling="none",  # explicit opt-out: compatible_energy x gamma_r_43 unsupported (v1)
+        flux_limiter="levermore_pomraning",
+        max_outer_iterations=20,
+        outer_tol=1.0e-5,
+        boundary=dict(inner_r="reflect", outer_r="vacuum"),
     ),
-    ddmc=dict(enabled=True, tau_ddmc=3.0, leak_stencil="9_kershaw"),
-    diffusion=dict(enabled=False),
     boundary=dict(inner_r="reflect", outer_r="vacuum"),
 )
 

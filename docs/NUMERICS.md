@@ -1004,6 +1004,24 @@ Void 材料の体積分率は `cell_is_void` マスクの導出にのみ使用�
 > 調和平均が物理的に正しい（光子は最も透過しやすい成分を選好する）。
 > v1.0では上記2種を固定する（SPECIFICATION §6.4.3: Planck平均 = `"linear_mass"`、Rosseland平均 = `"harmonic_mass_R"`）。
 
+> **実装状態（doc-truth 注記 2026-08-29）**: 上式は設計目標であり、現行ランタイムの
+> 実装とは異なる。実装（`State::ensure_cell_material_props`）は、定数不透明度材料の
+> \(\kappa_a\) を**体積分率の線形加重**で per-cell 混合し、**同一値を Planck/Rosseland
+> 両スロットに書く**（調和平均は診断用 env `TENRYU_MM_OPACITY_MIX=harmonic` のみ、
+> 質量分率加重・per-material `kappa_planck_override` の区別は未実装）。この per-cell
+> 実効値は 2D_RZ の FLD/S_N には従来から配線済み。**1D_SPH FLD は 2026-08-29 まで
+> 未配線で、多材料デッキでも先頭非 void 材料の κ を全セルに適用していた（黙った欠陥）
+> — 同日 2D と同型の per-cell 配線を追加**。同時に namelist 横断チェックを新設:
+> 1D_SPH × radiation 有効 × 非 void 材料 2 つ以上のとき、(a) `sn_transport` は
+> ConfigError（per-cell 散乱 κ 混合が未実装）、(b) `multigroup_diffusion` は全非 void
+> 材料の opacity.model が `"constant"`/`"none"` であること（tmat/power_law 等は
+> ConfigError — Phase-1 の table-NLTE 単一材料契約と、多材料 power_law の未実装による）。 **多材料テーブル opacity 第 1 段 (2026-08-30)**: 多材料 1D_SPH FLD で per-material **LTE tmat テーブル opacity** が
+> 使用可能になった — 各非 void 材料は constant または LTE tmat（`--kirchhoff-pe` 変換、
+> `/opacity` の `is_lte=1` をランタイムで検証）を持て、セルの支配材料 index
+> （`State::cell_material_index`、体積分率 argmax）でテーブルを選択し
+> (ρ, T_e) 補間で per-cell per-group σ_a/σ_pe/σ_R を評価する（混合セルは支配材料
+> 単独評価 — v1 近似として文書化）。**第 2 段 (同日)**: NLTE tmat も多材料対応 — NLTE 係数カーネルにセル材料フィルタを追加し材料ごとに起動（材料定数はその材料の A/cv/γ/λ 引数、σ_pe≠σ_pa と η・Fleck をカーネルが自セル分のみ充填; 共有 η/Fleck 段は skip マスクで NLTE セルを保護）。table_nlte (IONMIX 直読) は未対応のまま。
+
 **質量分率 \(f_{m,\alpha}\) の時間発展**：ラグランジュステップでは各セルの \(f_{m,\alpha}\) は不変（セル境界を越える物質移動なし）。ALE remap（§3.3.4）により体積分率 \(f_\alpha V\) がセル間で輸送され、remap 後に \(f_\alpha = (f_\alpha V)' / V'\) として正規化し、\(f_{m,\alpha} = f_\alpha\,\rho_\alpha / \sum_\beta f_\beta\,\rho_\beta\) として質量分率を再計算する（ARCHITECTURE §4.4 remap リスト参照）。v1.0 では材料界面追跡を行わず、remap が唯一の \(f_{m,\alpha}\) 更新機構である。
 
 > xRAGEの3T Z-splitting法（\(P_e = Z/(Z+1)\,P_t\) 等）はv1.0では使用しない。
@@ -1901,6 +1919,80 @@ r_N = r_{\mathrm{max}} = r_{S-1,\mathrm{end}}
 uniform/equal-μ/一様 shell の歴史分岐は逐語保持される。宣言的な複合
 ジオメトリ（球+コーン+スロープ等）から各方向 segments を合成する deck
 前処理は `tools/mesh_planner.py`（runtime 非依存）が担う。
+
+#### 3.1.0b 宣言的ゾーニング（`Mesh.zoning_intent`、1D、Experimental）
+
+`core/zoning_intent`（`compute_zoning_intent_nodes`）は、区間ごとのゾーン数では
+なく**セルサイズ測度と制約の宣言**からノード列を決定する 1D ゾーニングソルバ
+である。SPECIFICATION §6.4 の `Mesh.zoning_intent` が入力、生成ノード列は
+`explicit_nodes` として frozen config に凍結される（再実行は決定論的に同一）。
+
+**測度**: セル \(i\) のサイズは選択測度 \(\mu\) の積分
+\(q_i = \int_{r_i}^{r_{i+1}} a(r)\,dr\) で測る。測度密度は
+
+| `measure` | \(a(r)\) | 単位 |
+|---|---|---|
+| `width` | \(1\) | cm |
+| `areal_mass` | \(\rho_0(r)\) | g/cm² |
+| `cylindrical_line_mass` | \(2\pi r\,\rho_0(r)\) | g/cm |
+| `spherical_cell_mass` | \(4\pi r^2\,\rho_0(r)\) | g |
+
+\(\rho_0(r)\) は `density_regions` の piecewise 一定モデル（ゾーニング専用の
+初期密度; 実行時の材料初期化とは独立）。
+
+**等分配**: 好ましいセル測度の相対形状 \(w(r)\)（`profile` の対数線形補間
+× `anchors` のコンパクト台 cosine 核 \(K(u)=\tfrac12(1+\cos\pi u)\),
+\(|u|<1\) を \(\ln w\) に加算）に対し、モニタ \(m(r) = a(r)/w(r)\) の累積を
+pin 区間ごとに等分配すると、セル測度 \(q_i \propto w\) の好ましい配置が得られる。
+
+**求積**: パネル（区間境界・profile 点・anchor 台縁・`extra_events`・
+密度境界で分割）ごとに bin 別 Simpson（端点+中点標本）。パネル境界標本は
+**1 ulp 内側**で評価し（宣言済み不連続の片側極限）、値は名目座標に帰属させる。
+収束判定は総積分の倍分割差 ≤ 1e-12·総量 **かつ** bin 別 |Simpson−台形| ≤
+1e-10·総量（bin 内 2 次モデルの妥当性保証）; 上限 16384 bin で不収束は
+`MESH_QUADRATURE_NOT_CONVERGED`。累積の逆写像は bin 内 2 次モデル（3 点）
+の 3 回 Newton。
+
+**整数配分と実行可能性前検査**: pin 区間 \(s\) ごとに
+\(N^{\min}_s = \max(\)`min_cells_per_segment`, \(\lceil Q_s/q^{\max}\rceil)\)、
+\(N^{\max}_s = \min(\lfloor L_s/\Delta r_{\min}\rfloor, \lfloor Q_s/q^{\min}\rfloor)\)
+を構成し、区間衝突・総和不足/超過は数値入り証明書
+（`MESH_SEGMENT_BUDGET_CONFLICT` / `MESH_SEGMENT_MIN_COUNT_INFEASIBLE` /
+`MESH_DR_MIN_COUNT_INFEASIBLE` / `MESH_CELL_MEASURE_BOX_INFEASIBLE`）で棄却。
+配分は最大不足優先（同値は低位区間）の決定論 largest-deficit。
+
+**制約射影（エンベロープ+単調二分法）**: 好ましい \(q_i\) を、隣接セル測度比
+\(\max(q_{i+1}/q_i, q_i/q_{i+1}) \le R\)（`ratio_hard_max`、方針上限 2.0）と
+セル別上下限（全域 box・`bands`・`width` 測度では \(\Delta r_{\min}\) 併合）、
+および総和 \(\sum q_i = Q_s\) の全てを満たす点へ写す。\(x_i = \ln q_i\) で
+
+1. 区間伝播 \(E_i \leftarrow E_i \cap [E_{i\mp1}^{\rm lo} - \ln R,\
+   E_{i\mp1}^{\rm hi} + \ln R]\)（forward+backward）が chain×box の**厳密な**
+   セル別実行可能区間を与える（空なら不能証明書）。
+2. 総和の実行可能窓は \([\sum_i e^{E_i^{\rm lo}},\ \sum_i e^{E_i^{\rm hi}}]\)
+   （スケール正規化後）で**厳密**。\(Q_s\) が窓外なら
+   `MESH_CHAIN_SUM_INFEASIBLE`（窓を証明書として明示）。
+3. シフト \(\sigma\) に対し単一 forward pass
+   \(x_i = \mathrm{clamp}(x^0_i + \sigma,\ \max(E_i^{\rm lo}, x_{i-1} - \ln R),\
+   \min(E_i^{\rm hi}, x_{i-1} + \ln R))\) は、エンベロープ整合性により**任意の
+   \(\sigma\) で chain+box を厳密充足**する点を構成し、\(S(\sigma) = \sum e^{x_i}\)
+   は \(\sigma\) について単調非減少。200 回の二分法で \(S = Q_s\) に合わせる。
+
+（第 1 世代の log 空間 clip+renormalize は box と chain の同時活性固定点で
+サイクル、第 2 世代の Dykstra 巡回射影は tight box で収束が遅く、いずれも
+実測で棄却された経緯を持つ。）
+
+**帯域拘束の被覆固定点**: `bands` は全域累積測度の分数区間（Lagrangian 不変
+セレクタ）で帯を指定する。セルの帯所属は射影出力自身に依存するため、
+被覆集合の**単調和集合固定点**で調停する — 射影は常に好ましい測度から再実行、
+被覆は増加のみ（≤ セル数×帯数+1 回で停止保証）、一度被覆されたセルは最終
+スパンが帯を離れても拘束されたまま（保守的）。
+
+**独立検証（fail-closed）**: 倍解像度の検証求積で、単調性・有限性・pin の
+bitwise 一致・幅下限・隣接比（pin 跨ぎは `ratio_jump_allowed` で免除可）・
+セル別/帯別上下限・測度閉合を再検査する。不合格のメッシュは**ノード列ごと
+棄却**され（`MESH_POSTCHECK_*`）、達成統計（比 max/mean・ソフト超過数・
+最小幅・帯別達成値・求積残差）はこの検証格子から報告される。
 
 #### 3.1.1 スタガード格子配置
 
@@ -18286,6 +18378,19 @@ harmonic 形 \(\mathrm{harm}(c/3\sigma_L,\,c/3\sigma_R)=c/(3\cdot\tfrac12(\sigma
 と厳密一致する。**2D_RZ は現行 cell-centered** \(D_c\)（cell 勾配で \(R_c\)）を
 隣接 harmonic mean して \(D_f\) を作る — 1D の修正前と同型の front-stall 機構が
 残存する既知課題（2026-07-26 カーネルレビュー指摘、face-centered 化は 2D 側の対応範囲）。
+
+> **真空縮退の正則化（2026-08-28）**: \(\sigma_R\) は評価・組み立ての両方で
+> `radiation.multigroup_diffusion.opacity_floor`（既定 **\(10^{-6}\) cm\(^{-1}\)** = mfp 10 km）
+> で floor する。void セル（\(\sigma\to 0\)）かつ一様 \(E\)（\(\nabla E=0\)）の縮退方向では
+> \(R=0\to\lambda=1/3\) となり limiter が \(D=c/(3\sigma)\) の発散を止められない。旧既定
+> \(10^{-100}\) では tmat opacity が void 密度で underflow すると三重対角係数が
+> \(\sim 10^{98}\) に達し、非 pivoting CR（`gtsv2StridedBatch`）も QR pivoting
+> （`gtsv2`）も消去中の桁落ち増幅で NaN を生成した（550 セル zoning デッキの
+> 決定論的セル反転クラッシュの真因; NaN 解は下流の floor クランプ
+> \(\mathrm{fmax}(\mathrm{NaN},E_{floor})=E_{floor}\) で暗黙に床値化され step 800 まで潜伏）。
+> 勾配領域では \(\lambda\sim 1/R\) により \(D_f=c\,d_f E_f/|\Delta E|\) と \(\sigma\) が
+> 相殺されるため、床は縮退方向にのみ作用し、光学的厚い検証系（Su-Olson・Marshak、
+> \(\sigma\ge 1\)）は bit 不変。
 
 1D_SPH の群ごとの線形系は tridiagonal で、CUDA の cuSPARSE
 `cusparseDgtsv2StridedBatch` を使う。batch 数は \(G\)、各 system size は

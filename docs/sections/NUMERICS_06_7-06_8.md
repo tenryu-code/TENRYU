@@ -413,6 +413,19 @@ harmonic 形 \(\mathrm{harm}(c/3\sigma_L,\,c/3\sigma_R)=c/(3\cdot\tfrac12(\sigma
 隣接 harmonic mean して \(D_f\) を作る — 1D の修正前と同型の front-stall 機構が
 残存する既知課題（2026-07-26 カーネルレビュー指摘、face-centered 化は 2D 側の対応範囲）。
 
+> **真空縮退の正則化（2026-08-28）**: \(\sigma_R\) は評価・組み立ての両方で
+> `radiation.multigroup_diffusion.opacity_floor`（既定 **\(10^{-6}\) cm\(^{-1}\)** = mfp 10 km）
+> で floor する。void セル（\(\sigma\to 0\)）かつ一様 \(E\)（\(\nabla E=0\)）の縮退方向では
+> \(R=0\to\lambda=1/3\) となり limiter が \(D=c/(3\sigma)\) の発散を止められない。旧既定
+> \(10^{-100}\) では tmat opacity が void 密度で underflow すると三重対角係数が
+> \(\sim 10^{98}\) に達し、非 pivoting CR（`gtsv2StridedBatch`）も QR pivoting
+> （`gtsv2`）も消去中の桁落ち増幅で NaN を生成した（550 セル zoning デッキの
+> 決定論的セル反転クラッシュの真因; NaN 解は下流の floor クランプ
+> \(\mathrm{fmax}(\mathrm{NaN},E_{floor})=E_{floor}\) で暗黙に床値化され step 800 まで潜伏）。
+> 勾配領域では \(\lambda\sim 1/R\) により \(D_f=c\,d_f E_f/|\Delta E|\) と \(\sigma\) が
+> 相殺されるため、床は縮退方向にのみ作用し、光学的厚い検証系（Su-Olson・Marshak、
+> \(\sigma\ge 1\)）は bit 不変。
+
 1D_SPH の群ごとの線形系は tridiagonal で、CUDA の cuSPARSE
 `cusparseDgtsv2StridedBatch` を使う。batch 数は \(G\)、各 system size は
 \(N_{cell}\)、batch stride は \(N_{cell}\) である。2D_RZ の線形系は群ごとの CSR

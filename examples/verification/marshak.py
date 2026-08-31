@@ -52,6 +52,7 @@ Numerics(
 
 Radiation(
     enabled=True,
+    mode="multigroup_diffusion",
     groups=1,
     group_bounds_eV="log_uniform",
     compute_T_range_eV=[1.0, 30000.0],
@@ -67,12 +68,10 @@ Radiation(
         linearized_planck=False,
     ),
     ddmc=dict(enabled=False),
-    boundary=dict(
-        inner_r="vacuum",
-        outer_r="marshak",
-        marshak_Tr_eV=1000.0,
-        marshak_particles=50000,
+    multigroup_diffusion=dict(
+        boundary=dict(inner_r="reflect", outer_r="marshak")
     ),
+    boundary=dict(marshak_Tr_eV=1000.0),
 )
 
 Laser(enabled=False)

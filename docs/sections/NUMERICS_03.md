@@ -176,6 +176,80 @@ uniform/equal-μ/一様 shell の歴史分岐は逐語保持される。宣言�
 ジオメトリ（球+コーン+スロープ等）から各方向 segments を合成する deck
 前処理は `tools/mesh_planner.py`（runtime 非依存）が担う。
 
+#### 3.1.0b 宣言的ゾーニング（`Mesh.zoning_intent`、1D、Experimental）
+
+`core/zoning_intent`（`compute_zoning_intent_nodes`）は、区間ごとのゾーン数では
+なく**セルサイズ測度と制約の宣言**からノード列を決定する 1D ゾーニングソルバ
+である。SPECIFICATION §6.4 の `Mesh.zoning_intent` が入力、生成ノード列は
+`explicit_nodes` として frozen config に凍結される（再実行は決定論的に同一）。
+
+**測度**: セル \(i\) のサイズは選択測度 \(\mu\) の積分
+\(q_i = \int_{r_i}^{r_{i+1}} a(r)\,dr\) で測る。測度密度は
+
+| `measure` | \(a(r)\) | 単位 |
+|---|---|---|
+| `width` | \(1\) | cm |
+| `areal_mass` | \(\rho_0(r)\) | g/cm² |
+| `cylindrical_line_mass` | \(2\pi r\,\rho_0(r)\) | g/cm |
+| `spherical_cell_mass` | \(4\pi r^2\,\rho_0(r)\) | g |
+
+\(\rho_0(r)\) は `density_regions` の piecewise 一定モデル（ゾーニング専用の
+初期密度; 実行時の材料初期化とは独立）。
+
+**等分配**: 好ましいセル測度の相対形状 \(w(r)\)（`profile` の対数線形補間
+× `anchors` のコンパクト台 cosine 核 \(K(u)=\tfrac12(1+\cos\pi u)\),
+\(|u|<1\) を \(\ln w\) に加算）に対し、モニタ \(m(r) = a(r)/w(r)\) の累積を
+pin 区間ごとに等分配すると、セル測度 \(q_i \propto w\) の好ましい配置が得られる。
+
+**求積**: パネル（区間境界・profile 点・anchor 台縁・`extra_events`・
+密度境界で分割）ごとに bin 別 Simpson（端点+中点標本）。パネル境界標本は
+**1 ulp 内側**で評価し（宣言済み不連続の片側極限）、値は名目座標に帰属させる。
+収束判定は総積分の倍分割差 ≤ 1e-12·総量 **かつ** bin 別 |Simpson−台形| ≤
+1e-10·総量（bin 内 2 次モデルの妥当性保証）; 上限 16384 bin で不収束は
+`MESH_QUADRATURE_NOT_CONVERGED`。累積の逆写像は bin 内 2 次モデル（3 点）
+の 3 回 Newton。
+
+**整数配分と実行可能性前検査**: pin 区間 \(s\) ごとに
+\(N^{\min}_s = \max(\)`min_cells_per_segment`, \(\lceil Q_s/q^{\max}\rceil)\)、
+\(N^{\max}_s = \min(\lfloor L_s/\Delta r_{\min}\rfloor, \lfloor Q_s/q^{\min}\rfloor)\)
+を構成し、区間衝突・総和不足/超過は数値入り証明書
+（`MESH_SEGMENT_BUDGET_CONFLICT` / `MESH_SEGMENT_MIN_COUNT_INFEASIBLE` /
+`MESH_DR_MIN_COUNT_INFEASIBLE` / `MESH_CELL_MEASURE_BOX_INFEASIBLE`）で棄却。
+配分は最大不足優先（同値は低位区間）の決定論 largest-deficit。
+
+**制約射影（エンベロープ+単調二分法）**: 好ましい \(q_i\) を、隣接セル測度比
+\(\max(q_{i+1}/q_i, q_i/q_{i+1}) \le R\)（`ratio_hard_max`、方針上限 2.0）と
+セル別上下限（全域 box・`bands`・`width` 測度では \(\Delta r_{\min}\) 併合）、
+および総和 \(\sum q_i = Q_s\) の全てを満たす点へ写す。\(x_i = \ln q_i\) で
+
+1. 区間伝播 \(E_i \leftarrow E_i \cap [E_{i\mp1}^{\rm lo} - \ln R,\
+   E_{i\mp1}^{\rm hi} + \ln R]\)（forward+backward）が chain×box の**厳密な**
+   セル別実行可能区間を与える（空なら不能証明書）。
+2. 総和の実行可能窓は \([\sum_i e^{E_i^{\rm lo}},\ \sum_i e^{E_i^{\rm hi}}]\)
+   （スケール正規化後）で**厳密**。\(Q_s\) が窓外なら
+   `MESH_CHAIN_SUM_INFEASIBLE`（窓を証明書として明示）。
+3. シフト \(\sigma\) に対し単一 forward pass
+   \(x_i = \mathrm{clamp}(x^0_i + \sigma,\ \max(E_i^{\rm lo}, x_{i-1} - \ln R),\
+   \min(E_i^{\rm hi}, x_{i-1} + \ln R))\) は、エンベロープ整合性により**任意の
+   \(\sigma\) で chain+box を厳密充足**する点を構成し、\(S(\sigma) = \sum e^{x_i}\)
+   は \(\sigma\) について単調非減少。200 回の二分法で \(S = Q_s\) に合わせる。
+
+（第 1 世代の log 空間 clip+renormalize は box と chain の同時活性固定点で
+サイクル、第 2 世代の Dykstra 巡回射影は tight box で収束が遅く、いずれも
+実測で棄却された経緯を持つ。）
+
+**帯域拘束の被覆固定点**: `bands` は全域累積測度の分数区間（Lagrangian 不変
+セレクタ）で帯を指定する。セルの帯所属は射影出力自身に依存するため、
+被覆集合の**単調和集合固定点**で調停する — 射影は常に好ましい測度から再実行、
+被覆は増加のみ（≤ セル数×帯数+1 回で停止保証）、一度被覆されたセルは最終
+スパンが帯を離れても拘束されたまま（保守的）。
+
+**独立検証（fail-closed）**: 倍解像度の検証求積で、単調性・有限性・pin の
+bitwise 一致・幅下限・隣接比（pin 跨ぎは `ratio_jump_allowed` で免除可）・
+セル別/帯別上下限・測度閉合を再検査する。不合格のメッシュは**ノード列ごと
+棄却**され（`MESH_POSTCHECK_*`）、達成統計（比 max/mean・ソフト超過数・
+最小幅・帯別達成値・求積残差）はこの検証格子から報告される。
+
 #### 3.1.1 スタガード格子配置
 
 1D球対称メッシュのスタガード配置（2D RZ §3.2と同じ思想）。

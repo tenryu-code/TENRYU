@@ -3232,7 +3232,7 @@ __device__ void persistent_fld_step(const PersistentParams& p,
         b.fld_sigma_pe[idx] = b.fld_sigma_a[idx];
         build_eta_from_planck_kernel_body(idx, b.Te, b.fld_sigma_a, p.planck,
                                           b.fld_eta, p.n_cells, p.n_groups,
-                                          p.Te_floor);
+                                          p.Te_floor, nullptr);
       }
       pk_sync(p);
 
@@ -3258,7 +3258,7 @@ __device__ void persistent_fld_step(const PersistentParams& p,
               p.n_cells, p.n_groups, dt, 1.0, p.cv_e_override, b.gamma_eff,
               b.A_eff, materials::DeviceEOSTableView{}, 0, p.Te_floor,
               nullptr, radiation::PlanckTableDeviceView{}, 0,
-              p.fld_fleck_form_exp);
+              p.fld_fleck_form_exp, nullptr);
         }
         pk_sync(p);
       }

@@ -264,6 +264,49 @@ struct Config {
     std::vector<AutoZoneRegion> auto_regions;
     std::string auto_regions_axis = "r";  // "r" | "z" (z: 2D_RZ rect only)
     AutoZoneConfig auto_config;
+    struct ZoningIntentPinNL {
+      double r = 0.0;
+      bool ratio_jump_allowed = false;
+    };
+    struct ZoningIntentProfilePointNL {
+      double r = 0.0;
+      double w = 0.0;
+    };
+    struct ZoningIntentAnchorNL {
+      double r = 0.0;
+      double half_width = 0.0;
+      double log_amplitude = 0.0;
+    };
+    struct ZoningIntentBandNL {
+      double measure_frac_begin = 0.0;
+      double measure_frac_end = 0.0;
+      double cell_measure_min = 0.0;
+      double cell_measure_max = 0.0;
+    };
+    struct ZoningIntentDensityRegionNL {
+      double r_end = 0.0;   // outer radius of the constant-density region [cm]
+      double rho = 0.0;     // [g/cc]
+    };
+    // Declarative high-freedom 1D zoning (measure equidistribution under hard
+    // constraints); mutually exclusive with auto_regions and grid dicts.
+    struct ZoningIntentNL {
+      bool enabled = false;
+      int n_cells = 0;
+      std::string measure = "width";  // width|areal_mass|cylindrical_line_mass|spherical_cell_mass
+      std::vector<ZoningIntentPinNL> pins;
+      std::vector<ZoningIntentProfilePointNL> profile;
+      std::vector<ZoningIntentAnchorNL> anchors;
+      std::vector<ZoningIntentBandNL> bands;
+      std::vector<ZoningIntentDensityRegionNL> density_regions;
+      std::vector<double> extra_events;
+      double dr_min = 0.0;
+      double cell_measure_min = 0.0;
+      double cell_measure_max = 0.0;
+      double preferred_ratio = 1.3;
+      double ratio_hard_max = 2.0;
+      int min_cells_per_segment = 1;
+    };
+    ZoningIntentNL zoning_intent;
     GradingConfig grading;
     std::vector<double> explicit_nodes;
     std::vector<double> explicit_nodes_z;
@@ -716,7 +759,15 @@ struct Config {
       std::string linear_solver_2d_resolved;
       double rgmg_smoother_omega = 0.67;
       AmgxConfig amgx_config;
-      double opacity_floor = 1.0e-100;
+      // Rosseland-opacity floor [1/cm] for the diffusion coefficient D = c*lambda/sigma.
+      // A physically invisible floor (mfp = 10 km >> any lab-scale domain) that
+      // regularizes the degenerate void limit: with sigma -> 0 and uniform E the
+      // flux limiter stays at 1/3, D diverges, and the tridiagonal rows reach
+      // ~1e98, which overflows both CR and QR solvers into NaN (2026-08-28 root
+      // cause of the 550-cell zoning-deck cell-inversion crash). In gradient
+      // regions lambda ~ 1/R makes D independent of sigma, so the floor only
+      // acts on the degenerate direction.
+      double opacity_floor = 1.0e-6;
       double opacity_cap = 1.0e20;
       BoundaryConfig boundary;
       MarshakConfig marshak;
@@ -750,6 +801,11 @@ struct Config {
       std::string diffusion_fallback_mode = "none";
       double tau_diffusion_on = 10.0;
       double tau_diffusion_off = 5.0;
+      // Evaluation floor stays effectively zero: S_N transport is well-posed
+      // at sigma = 0 and attenuation gates compare exp(-sigma L) directly.
+      // The diffusion FORMS (DSA, AP-blend face flux) carry their own
+      // 1e-6/cm denominator regularization (same rationale as the FLD
+      // opacity_floor default, 2026-08-30).
       double opacity_floor = 1.0e-100;
       double opacity_cap = 1.0e20;
       bool timing_enabled = false;

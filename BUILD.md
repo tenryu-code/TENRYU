@@ -6,7 +6,7 @@
 - NVIDIA GPU（sm_80 以上を推奨）
 - CUDA Toolkit 12.6
 - GCC 12 以上
-- CMake 3.27 以上
+- CMake 3.24 以上
 - Ninja
 - Python 3.10 以上、および pip で導入した pybind11
 - HDF5
@@ -32,4 +32,4 @@ TENRYU Studio のサーバ設定に登録してください。
 
 - pybind11 が見つからない: `python3 -m pip install pybind11`
 - HDF5 が見つからない: Debian/Ubuntu では `libhdf5-dev` を導入
-- GPU architecture: 既定では configure 時に `nvidia-smi` でローカル GPU を検出し、その compute capability のみをビルドします（GPU が見えないホストでは可搬既定 `70;80;89;90`）。明示指定するときは CMake に `-DCMAKE_CUDA_ARCHITECTURES=<num>` を追加
+- GPU architecture が合わない: CMake に `-DCMAKE_CUDA_ARCHITECTURES=<num>` を追加

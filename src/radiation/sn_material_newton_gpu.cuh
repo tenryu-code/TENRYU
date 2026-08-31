@@ -15,6 +15,7 @@ struct SnMaterialNewton1DInputs {
   const double* sigma_pe = nullptr; // optional [n_cells * n_groups], [1/cm]
   const double* rad_E = nullptr;    // [n_cells * n_groups], [erg/cm^3]
   const double* E_star_override = nullptr; // optional [n_cells * n_groups], face-flux E* [erg/cm^3]
+  const double* source_ext = nullptr;  // per-cell external volume source [erg/cm^3/s], g==0 only
   double* rad_E_out = nullptr;      // where to write E_g^{n+1}; required by 1D production closure.
   bool eos_low_density_extrap = false;  // If true, use analytic-ideal EOS below table rho_min.
   bool energy_authoritative = false;

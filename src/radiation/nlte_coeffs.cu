@@ -220,9 +220,15 @@ __global__ void compute_nlte_coefficients_kernel(
     int low_density_extrap,
     int* __restrict__ d_negative_alpha_count,
     int* __restrict__ d_negative_eta_count,
-    int* __restrict__ d_nan_inf_count) {
+    int* __restrict__ d_nan_inf_count,
+    const int* __restrict__ cell_material_index,
+    int material_filter) {
   const int c = blockIdx.x;
   if (c >= n_cells) {
+    return;
+  }
+  if (cell_material_index != nullptr &&
+      cell_material_index[c] != material_filter) {
     return;
   }
 
@@ -610,7 +616,9 @@ NlteCoeffsDeviceResult compute_nlte_coefficients_cuda_impl(
     cudaStream_t stream,
     bool low_density_extrap = false,
     int* pinned_clamp_counts = nullptr,
-    bool reuse_device_void_mask = false) {
+    bool reuse_device_void_mask = false,
+    const int* cell_material_index = nullptr,
+    int material_filter = -1) {
   (void)f_min;
   (void)f_max;
   (void)fd_delta_rel;
@@ -695,7 +703,9 @@ NlteCoeffsDeviceResult compute_nlte_coefficients_cuda_impl(
       low_density_extrap ? 1 : 0,
       d_negative_alpha,
       d_negative_eta,
-      d_nan_inf);
+      d_nan_inf,
+      cell_material_index,
+      material_filter);
   nlte_cuda_check(cudaGetLastError(), "kernel launch");
 
   if (pinned_clamp_counts != nullptr) {
@@ -766,7 +776,9 @@ NlteCoeffsDeviceResult compute_nlte_coefficients_cuda(
     double* d_eta,
     double* d_sigma_p_em,
     cudaStream_t stream,
-    bool low_density_extrap) {
+    bool low_density_extrap,
+    const int* cell_material_index,
+    int material_filter) {
   return compute_nlte_coefficients_cuda_impl(
       d_rho,
       d_Te,
@@ -803,7 +815,11 @@ NlteCoeffsDeviceResult compute_nlte_coefficients_cuda(
       d_sigma_p_em,
       false,
       stream,
-      low_density_extrap);
+      low_density_extrap,
+      nullptr,
+      false,
+      cell_material_index,
+      material_filter);
 }
 
 NlteCoeffsDeviceResult compute_nlte_coefficients_cuda_with_pe(
@@ -843,7 +859,9 @@ NlteCoeffsDeviceResult compute_nlte_coefficients_cuda_with_pe(
     cudaStream_t stream,
     bool low_density_extrap,
     int* pinned_clamp_counts,
-    bool reuse_device_void_mask) {
+    bool reuse_device_void_mask,
+    const int* cell_material_index,
+    int material_filter) {
   return compute_nlte_coefficients_cuda_impl(
       d_rho,
       d_Te,
@@ -882,7 +900,9 @@ NlteCoeffsDeviceResult compute_nlte_coefficients_cuda_with_pe(
       stream,
       low_density_extrap,
       pinned_clamp_counts,
-      reuse_device_void_mask);
+      reuse_device_void_mask,
+      cell_material_index,
+      material_filter);
 }
 
 NlteCoeffsDeviceResult compute_nlte_coefficients_cuda_pure_sn(

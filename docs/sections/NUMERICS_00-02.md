@@ -1006,6 +1006,24 @@ Void 材料の体積分率は `cell_is_void` マスクの導出にのみ使用�
 > 調和平均が物理的に正しい（光子は最も透過しやすい成分を選好する）。
 > v1.0では上記2種を固定する（SPECIFICATION §6.4.3: Planck平均 = `"linear_mass"`、Rosseland平均 = `"harmonic_mass_R"`）。
 
+> **実装状態（doc-truth 注記 2026-08-29）**: 上式は設計目標であり、現行ランタイムの
+> 実装とは異なる。実装（`State::ensure_cell_material_props`）は、定数不透明度材料の
+> \(\kappa_a\) を**体積分率の線形加重**で per-cell 混合し、**同一値を Planck/Rosseland
+> 両スロットに書く**（調和平均は診断用 env `TENRYU_MM_OPACITY_MIX=harmonic` のみ、
+> 質量分率加重・per-material `kappa_planck_override` の区別は未実装）。この per-cell
+> 実効値は 2D_RZ の FLD/S_N には従来から配線済み。**1D_SPH FLD は 2026-08-29 まで
+> 未配線で、多材料デッキでも先頭非 void 材料の κ を全セルに適用していた（黙った欠陥）
+> — 同日 2D と同型の per-cell 配線を追加**。同時に namelist 横断チェックを新設:
+> 1D_SPH × radiation 有効 × 非 void 材料 2 つ以上のとき、(a) `sn_transport` は
+> ConfigError（per-cell 散乱 κ 混合が未実装）、(b) `multigroup_diffusion` は全非 void
+> 材料の opacity.model が `"constant"`/`"none"` であること（tmat/power_law 等は
+> ConfigError — Phase-1 の table-NLTE 単一材料契約と、多材料 power_law の未実装による）。 **多材料テーブル opacity 第 1 段 (2026-08-30)**: 多材料 1D_SPH FLD で per-material **LTE tmat テーブル opacity** が
+> 使用可能になった — 各非 void 材料は constant または LTE tmat（`--kirchhoff-pe` 変換、
+> `/opacity` の `is_lte=1` をランタイムで検証）を持て、セルの支配材料 index
+> （`State::cell_material_index`、体積分率 argmax）でテーブルを選択し
+> (ρ, T_e) 補間で per-cell per-group σ_a/σ_pe/σ_R を評価する（混合セルは支配材料
+> 単独評価 — v1 近似として文書化）。**第 2 段 (同日)**: NLTE tmat も多材料対応 — NLTE 係数カーネルにセル材料フィルタを追加し材料ごとに起動（材料定数はその材料の A/cv/γ/λ 引数、σ_pe≠σ_pa と η・Fleck をカーネルが自セル分のみ充填; 共有 η/Fleck 段は skip マスクで NLTE セルを保護）。table_nlte (IONMIX 直読) は未対応のまま。
+
 **質量分率 \(f_{m,\alpha}\) の時間発展**：ラグランジュステップでは各セルの \(f_{m,\alpha}\) は不変（セル境界を越える物質移動なし）。ALE remap（§3.3.4）により体積分率 \(f_\alpha V\) がセル間で輸送され、remap 後に \(f_\alpha = (f_\alpha V)' / V'\) として正規化し、\(f_{m,\alpha} = f_\alpha\,\rho_\alpha / \sum_\beta f_\beta\,\rho_\beta\) として質量分率を再計算する（ARCHITECTURE §4.4 remap リスト参照）。v1.0 では材料界面追跡を行わず、remap が唯一の \(f_{m,\alpha}\) 更新機構である。
 
 > xRAGEの3T Z-splitting法（\(P_e = Z/(Z+1)\,P_t\) 等）はv1.0では使用しない。

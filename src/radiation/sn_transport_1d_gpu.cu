@@ -674,7 +674,9 @@ __global__ void build_sweep_inputs_kernel(
     const double* __restrict__ rad_E_old,
     double* __restrict__ source_work,
     double* __restrict__ sigma_t_work,
-    int n_total) {
+    int n_total,
+    const double* __restrict__ source_ext,
+    const int n_groups) {
   const int idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx >= n_total) {
     return;
@@ -688,6 +690,9 @@ __global__ void build_sweep_inputs_kernel(
   source_work[idx] =
       0.5 * nonnegative_finite(eta[idx]) +
       0.5 * sig_s * nonnegative_finite(phi_old[idx]);
+  if (source_ext != nullptr && (idx % n_groups) == 0) {
+    source_work[idx] += 0.5 * source_ext[idx / n_groups];
+  }
 }
 
 // Persistent-angular-intensity fix: isotropic seed for the first step /
@@ -3067,6 +3072,7 @@ struct SnInnerGraphKey {
   const void* rad_E_old = nullptr;
   const void* source_work = nullptr;
   const void* sigma_t_work = nullptr;
+  const void* source_ext = nullptr;
   const void* x_r = nullptr;
   const void* vol = nullptr;
   const void* mu = nullptr;
@@ -3108,7 +3114,8 @@ bool operator==(const SnInnerGraphKey& a, const SnInnerGraphKey& b) {
          a.sigma_a == b.sigma_a && a.sigma_s == b.sigma_s &&
          a.eta == b.eta && a.phi_old == b.phi_old &&
          a.rad_E_old == b.rad_E_old && a.source_work == b.source_work &&
-         a.sigma_t_work == b.sigma_t_work && a.x_r == b.x_r &&
+         a.sigma_t_work == b.sigma_t_work && a.source_ext == b.source_ext &&
+         a.x_r == b.x_r &&
          a.vol == b.vol && a.mu == b.mu && a.alpha == b.alpha && a.tau == b.tau &&
          a.sd_mu == b.sd_mu &&
          a.weight == b.weight && a.psi_prev == b.psi_prev &&
@@ -3190,7 +3197,8 @@ SnInnerGraphKey make_inner_graph_key(const core::State& state,
                                      const int sweep_block_threads,
                                      const bool dsa_enabled,
                                      const bool linear_characteristic,
-                                     const double dt) {
+                                     const double dt,
+                                     const double* source_ext) {
   SnInnerGraphKey key{};
   key.n_cells = n_cells;
   key.n_groups = n_groups;
@@ -3210,6 +3218,7 @@ SnInnerGraphKey make_inner_graph_key(const core::State& state,
   key.rad_E_old = state.rad_E_old.data();
   key.source_work = state.sn_phi_new.data();
   key.sigma_t_work = state.sn_dsa_rhs.data();
+  key.source_ext = source_ext;
   key.x_r = state.x_r.data();
   key.vol = state.vol.data();
   key.mu = quad.mu.data();
@@ -3256,7 +3265,8 @@ void launch_inner_iteration_body(core::State& state,
                                  cudaStream_t stream,
                                  const bool check_errors,
                                  const double* outer_psi_in,
-                                 const int geom) {
+                                 const int geom,
+                                 const double* source_ext) {
   if (total_grid > 0) {
     build_sweep_inputs_kernel<<<total_grid, kBlock, 0, stream>>>(
         state.sn_sigma_a.data(),
@@ -3266,7 +3276,9 @@ void launch_inner_iteration_body(core::State& state,
         state.rad_E_old.data(),
         state.sn_phi_new.data(),
         state.sn_dsa_rhs.data(),
-        total);
+        total,
+        source_ext,
+        n_groups);
     if (check_errors) {
       cuda_check(cudaGetLastError(), "SN sweep input build launch failed");
     }
@@ -3523,7 +3535,8 @@ void launch_lc_weight_precompute(core::State& state,
                                  const int total,
                                  const int total_grid,
                                  const double dt,
-                                 cudaStream_t stream) {
+                                 cudaStream_t stream,
+                                 const double* source_ext) {
   if (total_grid > 0) {
     build_sweep_inputs_kernel<<<total_grid, kBlock, 0, stream>>>(
         state.sn_sigma_a.data(),
@@ -3533,7 +3546,9 @@ void launch_lc_weight_precompute(core::State& state,
         state.rad_E_old.data(),
         state.sn_phi_new.data(),
         state.sn_dsa_rhs.data(),
-        total);
+        total,
+        source_ext,
+        n_groups);
     cuda_check(cudaGetLastError(), "SN LC precompute input build launch failed");
   }
   const int n_psi = total * n_angles;
@@ -3591,7 +3606,8 @@ bool ensure_inner_graph(SnInnerGraphCache& cache,
                         const bool linear_characteristic,
                         const int unroll,
                         const double* outer_psi_in,
-                        const int geom) {
+                        const int geom,
+                        const double* source_ext) {
   if (unroll <= 1 || cache.capture_disabled) {
     return false;
   }
@@ -3611,7 +3627,8 @@ bool ensure_inner_graph(SnInnerGraphCache& cache,
       sweep_block_threads,
       dsa_enabled,
       linear_characteristic,
-      dt);
+      dt,
+      source_ext);
   SnInnerGraphKey key_with_bc = key;
   key_with_bc.outer_marshak_psi_in = outer_psi_in;
   if (cache.exec != nullptr && cache.has_key && cache.key == key_with_bc) {
@@ -3642,7 +3659,8 @@ bool ensure_inner_graph(SnInnerGraphCache& cache,
                                 cache.stream,
                                 false,
                                 outer_psi_in,
-                                geom);
+                                geom,
+                                source_ext);
   }
   err = cudaStreamEndCapture(cache.stream, &cache.graph);
   if (err != cudaSuccess) {
@@ -3921,6 +3939,31 @@ void advance_radiation_step_sn_1d(
   }
 
   const int total = n_cells * n_groups;
+  core::DeviceArray<double> source_ext_device;
+  const double* source_ext = nullptr;
+  if (cfg.radiation.volume_source_rate > 0.0 &&
+      cfg.radiation.volume_source_x_max > 0.0) {
+    std::vector<double> h_x_r;
+    state.x_r.copy_to_host(h_x_r);
+    std::vector<double> h_source_ext(static_cast<std::size_t>(n_cells), 0.0);
+    for (int c = 0; c < n_cells; ++c) {
+      const double x_center =
+          0.5 * (h_x_r[static_cast<std::size_t>(c)] +
+                 h_x_r[static_cast<std::size_t>(c + 1)]);
+      if (x_center <= cfg.radiation.volume_source_x_max) {
+        h_source_ext[static_cast<std::size_t>(c)] =
+            cfg.radiation.volume_source_rate;
+      }
+    }
+    source_ext_device.reset(static_cast<std::size_t>(n_cells));
+    source_ext_device.copy_from_host(h_source_ext);
+    static bool warned_volsrc = false;
+    if (!warned_volsrc) {
+      warned_volsrc = true;
+      core::log_warning("SN 1D external volume source is EXPERIMENTAL: energy enters the sweep and the Newton closure; the E-authority flux blend does not yet carry the source transport moments (profile accuracy unvalidated)");
+    }
+    source_ext = source_ext_device.data();
+  }
   const std::size_t n_psi =
       static_cast<std::size_t>(total) * static_cast<std::size_t>(n_angles);
   ensure_state_buffers(state, n_cells, n_groups, n_angles);
@@ -4119,7 +4162,8 @@ void advance_radiation_step_sn_1d(
                                   total,
                                   total_grid,
                                   dt,
-                                  inner_stream);
+                                  inner_stream,
+                                  source_ext);
     }
     int inner = 0;
     while (inner < max_inner) {
@@ -4142,7 +4186,8 @@ void advance_radiation_step_sn_1d(
                              linear_characteristic,
                              graph_unroll,
                              outer_psi_in,
-                             geom)) {
+                             geom,
+                             source_ext)) {
         {
           SnTimingScope timing_scope(timing, SnTimingBlock::Sweep, inner_stream);
           launch_inner_graph(graph_cache);
@@ -4176,7 +4221,8 @@ void advance_radiation_step_sn_1d(
                                     inner_stream,
                                     true,
                                     outer_psi_in,
-                                    geom);
+                                    geom,
+                                    source_ext);
       }
       {
         SnTimingScope timing_scope(timing, SnTimingBlock::Residual, inner_stream);
@@ -4227,7 +4273,8 @@ void advance_radiation_step_sn_1d(
                                             state.sn_face_flux_diff.data(),
                                             n_cells,
                                             n_groups,
-                                            sn.opacity_floor);
+                                            /* diffusion-form denominator floor */
+                                            fmax(sn.opacity_floor, 1.0e-6));
       compute_sn_ap_blended_face_flux_1d_gpu(
           state.sn_face_flux_raw.data(),
           state.sn_face_flux_diff.data(),
@@ -4236,7 +4283,8 @@ void advance_radiation_step_sn_1d(
           state.sn_sigma_s.data(),
           state.x_r.data(),
           planck.device_view(),
-          sn.opacity_floor,
+          /* diffusion-form denominator floor */
+          fmax(sn.opacity_floor, 1.0e-6),
           10.0,
           20.0,
           0.05,
@@ -4277,6 +4325,7 @@ void advance_radiation_step_sn_1d(
     newton.sigma_a = state.sn_sigma_a.data();
     newton.sigma_pe = state.sn_sigma_pe.data();
     newton.rad_E = state.rad_E.data();
+    newton.source_ext = source_ext;
     newton.rho = state.rho.data();
     newton.cv_e =
         (state.cv_e.size() == static_cast<std::size_t>(n_cells)) ? state.cv_e.data()
