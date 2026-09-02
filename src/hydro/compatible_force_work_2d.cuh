@@ -43,7 +43,8 @@ void launch_assemble_pressure_corner_forces_2d(
     const core::CellField1D& cell_pressure,
     const core::CellField1D& svec_r,
     const core::CellField1D& svec_z,
-    const std::int8_t* hydro_active);
+    const std::int8_t* hydro_active,
+    const core::Config& cfg);
 
 void launch_assemble_scalar_av_corner_forces_2d(
     core::State& state,

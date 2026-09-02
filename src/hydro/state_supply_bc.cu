@@ -298,8 +298,8 @@ void apply_state_supply_zonal_override(core::State& state,
       state.state_supply_pre_rho.data(), state.state_supply_pre_mass.data(),
       state.state_supply_pre_ee.data(), state.state_supply_pre_ei.data(),
       state.state_supply_pre_uz.data(), d_totals, nr, nz,
-      b.z_bottom_cfg.is_state_supply() ? 1 : 0,
-      b.z_top_cfg.is_state_supply() ? 1 : 0,
+      b.z_bottom_cfg.supply_active(state.t) ? 1 : 0,
+      b.z_top_cfg.supply_active(state.t) ? 1 : 0,
       b.z_bottom_cfg.supply_rho_g_per_cc,
       b.z_bottom_cfg.supply_u_z_cm_per_s,
       b.z_bottom_cfg.supply_T_eV,
@@ -334,8 +334,8 @@ void restore_state_supply_material_velocity(core::State& state,
   const auto& b = cfg.numerics.hydro.boundary_2d;
   restore_state_supply_material_vz_kernel<<<blocks, 256>>>(
       state.v_z.data(), nr, nz,
-      b.z_bottom_cfg.is_state_supply() ? 1 : 0,
-      b.z_top_cfg.is_state_supply() ? 1 : 0,
+      b.z_bottom_cfg.supply_active(state.t) ? 1 : 0,
+      b.z_top_cfg.supply_active(state.t) ? 1 : 0,
       b.z_bottom_cfg.supply_u_z_cm_per_s,
       b.z_top_cfg.supply_u_z_cm_per_s);
   cuda_check(cudaGetLastError(), "state_supply material v_z kernel launch failed");
@@ -367,8 +367,8 @@ void tally_state_supply_delta_E(core::State& state,
       state.state_supply_pre_mass.data(), state.state_supply_pre_ee.data(),
       state.state_supply_pre_ei.data(), state.state_supply_pre_uz.data(),
       d_total, nr, nz,
-      b.z_bottom_cfg.is_state_supply() ? 1 : 0,
-      b.z_top_cfg.is_state_supply() ? 1 : 0,
+      b.z_bottom_cfg.supply_active(state.t) ? 1 : 0,
+      b.z_top_cfg.supply_active(state.t) ? 1 : 0,
       b.z_bottom_cfg.supply_u_z_cm_per_s,
       b.z_top_cfg.supply_u_z_cm_per_s);
   cuda_check(cudaGetLastError(), "state_supply dE kernel launch failed");

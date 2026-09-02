@@ -8,6 +8,7 @@
 #include <functional>
 #include <iomanip>
 #include <limits>
+#include <map>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -39,18 +40,27 @@
 #include "hydro/ale_rezone.cuh"
 #include "hydro/ale_velocity_project.cuh"
 #include "hydro/axis_ale_rezone.cuh"
+#include "hydro/axis_edge_collapse.hpp"
+#include "hydro/band_ale.hpp"
 #include "hydro/boundary_2d.hpp"
 #include "hydro/center_patch_barrier_optimizer.cuh"
 #include "hydro/cfl.hpp"
 #include "hydro/central_pseudo_core.cuh"
 #include "hydro/conservation_audit.hpp"
+#include "hydro/core_clearance_controller.hpp"
 #include "hydro/core_freeze_ale.cuh"
 #include "hydro/eos_context.hpp"
 #include "hydro/euler_window_blend.hpp"
+#include "hydro/evacuated_cell_shadow.hpp"
+#include "hydro/flank_slip_patch.hpp"
+#include "hydro/flank_tangential_strip.hpp"
+#include "hydro/flank_tangential_strip_detail.hpp"
 #include "hydro/hydro_2d.hpp"
+#include "hydro/ke_fixup_deposit.hpp"
 #include "hydro/local_rezone.cuh"
 #include "hydro/multiblock_center_patch_reference.cuh"
 #include "hydro/per_material_eos_project.cuh"
+#include "hydro/phase_audit.hpp"
 #include "hydro/plic_remap.cuh"
 #include "hydro/pole_angular_derefine.cuh"
 #include "hydro/pole_axis_diag.hpp"
@@ -62,6 +72,7 @@
 #include "mesh/candidate_mesh_admissibility.hpp"
 #include "mesh/mesh.hpp"
 #include "mesh/path_admissibility.cuh"
+#include "mesh/reference_flat_path.hpp"
 #include "parallel/comm_buffers.hpp"
 #include "parallel/halo_exchange.hpp"
 #include "parallel/partition.hpp"
@@ -113,6 +124,10 @@ namespace detail {
 constexpr double kEvToErg = 1.6022e-12;
 constexpr double kProtonMass = 1.6726219e-24;  // must match core::constants::proton_mass
 constexpr int kSafeBacktrackDistributionBins = 64;
+/// A donor remap that empties >10% of a cell's pre-remap mass into the floor
+/// clamp is invalid -- the sweep exceeded donor validity; healthy closures
+/// clamp ~1e-16 fractions.
+constexpr double kRemapMassClosureRejectFraction = 0.1;
 
 std::array<std::atomic<std::uint64_t>, kSafeBacktrackDistributionBins>
     g_safe_backtrack_lambda_distribution{};
@@ -1702,9 +1717,186 @@ __global__ void interpolate_rezone_candidate_kernel(
   x_z[n] = x_z_old[n] + lambda * (x_z_cand[n] - x_z_old[n]);
 }
 
+__global__ void project_evac_contact_rezone_candidate_kernel(
+    double* x_r_state,
+    double* x_z_state,
+    double* x_r_cand,
+    double* x_z_cand,
+    const double* x_r_old,
+    const double* x_z_old,
+    const int* pair_nodes,
+    const double* pair_normal,
+    const int n_pairs,
+    const int* contact_active_cells,
+    const int n_contact_active_cells,
+    const int nr,
+    const int nz,
+    const int* node_axis_alias) {
+  if (blockIdx.x != 0 || threadIdx.x != 0) {
+    return;
+  }
+  for (int p = 0; p < n_pairs; ++p) {
+    const int na = pair_nodes[2 * p];
+    const int nb = pair_nodes[2 * p + 1];
+    const double normal_r = pair_normal[2 * p];
+    const double normal_z = pair_normal[2 * p + 1];
+    const EvacContactProjectionCorrection correction =
+        evacuated_cell_contact_projection_correction(
+            x_r_cand[na],
+            x_z_cand[na],
+            x_r_cand[nb],
+            x_z_cand[nb],
+            x_r_old[na],
+            x_z_old[na],
+            x_r_old[nb],
+            x_z_old[nb],
+            normal_r,
+            normal_z);
+    x_r_cand[na] += correction.a * normal_r;
+    x_z_cand[na] += correction.a * normal_z;
+    x_r_cand[nb] += correction.b * normal_r;
+    x_z_cand[nb] += correction.b * normal_z;
+    x_r_state[na] += correction.a * normal_r;
+    x_z_state[na] += correction.a * normal_z;
+    x_r_state[nb] += correction.b * normal_r;
+    x_z_state[nb] += correction.b * normal_z;
+  }
+  // Zero rezone displacement gives zero swept volume on every face of the
+  // contact cell, so the remap advects nothing across the engaged interface.
+  for (int k = 0; k < n_contact_active_cells; ++k) {
+    int corners[4];
+    evacuated_cell_corner_nodes(contact_active_cells[k], nr, nz, corners);
+    for (int q = 0; q < 4; ++q) {
+      const int n = corners[q];
+      x_r_cand[n] = x_r_old[n];
+      x_z_cand[n] = x_z_old[n];
+      x_r_state[n] = x_r_old[n];
+      x_z_state[n] = x_z_old[n];
+      if (node_axis_alias != nullptr) {
+        const int s = node_axis_alias[n];
+        if (s >= 0) {
+          x_r_cand[s] = x_r_old[s];
+          x_z_cand[s] = x_z_old[s];
+          x_r_state[s] = x_r_old[s];
+          x_z_state[s] = x_z_old[s];
+        }
+      }
+    }
+  }
+}
+
+__global__ void freeze_evac_contact_cell_corners_kernel(
+    double* __restrict__ x_r_new,
+    double* __restrict__ x_z_new,
+    const double* __restrict__ x_r_old,
+    const double* __restrict__ x_z_old,
+    const int* __restrict__ contact_active_cells,
+    const int n_contact_active_cells,
+    const int nz,
+    const int* __restrict__ node_axis_alias) {
+  if (blockIdx.x != 0 || threadIdx.x != 0) return;
+  for (int k = 0; k < n_contact_active_cells; ++k) {
+    int corners[4];
+    tenryu::hydro::evacuated_cell_corner_nodes(
+        contact_active_cells[k], /*nr=*/0, nz, corners);
+    for (int q = 0; q < 4; ++q) {
+      const int n = corners[q];
+      x_r_new[n] = x_r_old[n];
+      x_z_new[n] = x_z_old[n];
+      if (node_axis_alias != nullptr) {
+        const int s = node_axis_alias[n];
+        if (s >= 0) {
+          x_r_new[s] = x_r_old[s];
+          x_z_new[s] = x_z_old[s];
+        }
+      }
+    }
+  }
+}
+
+__global__ void save_evac_contact_pair_velocity_kernel(
+    double* __restrict__ saved_vr,
+    double* __restrict__ saved_vz,
+    const double* __restrict__ v_r_node,
+    const double* __restrict__ v_z_node,
+    const int* __restrict__ pair_nodes,
+    const int n_pairs) {
+  if (blockIdx.x != 0 || threadIdx.x != 0) {
+    return;
+  }
+  for (int k = 0; k < 2 * n_pairs; ++k) {
+    const int n = pair_nodes[k];
+    saved_vr[k] = v_r_node[n];
+    saved_vz[k] = v_z_node[n];
+  }
+}
+
+__global__ void restore_evac_contact_pair_velocity_kernel(
+    double* __restrict__ v_r_node,
+    double* __restrict__ v_z_node,
+    const double* __restrict__ saved_vr,
+    const double* __restrict__ saved_vz,
+    const int* __restrict__ pair_nodes,
+    const int n_pairs) {
+  if (blockIdx.x != 0 || threadIdx.x != 0) {
+    return;
+  }
+  for (int k = 0; k < 2 * n_pairs; ++k) {
+    const int n = pair_nodes[k];
+    v_r_node[n] = saved_vr[k];
+    v_z_node[n] = saved_vz[k];
+  }
+}
+
+void launch_project_evac_contact_rezone_candidate(
+    core::State& state,
+    double* const x_r_cand,
+    double* const x_z_cand,
+    const double* const x_r_old,
+    const double* const x_z_old) {
+  const int n_pairs = state.evacuated_cells.n_active_pairs;
+  const int n_contact_active_cells =
+      state.evacuated_cells.n_contact_active_cells;
+  if (n_pairs <= 0 && n_contact_active_cells <= 0) {
+    return;
+  }
+  TENRYU_ASSERT(
+      state.evacuated_cells.node_axis_alias.empty() ||
+          (state.evacuated_cells.node_axis_alias.size() ==
+               static_cast<std::size_t>(state.mesh.topo.n_nodes) &&
+           state.evacuated_cells.d_node_axis_alias.size() ==
+               state.evacuated_cells.node_axis_alias.size()),
+      "ALE evacuated-cell node axis alias host/device state mismatch");
+  project_evac_contact_rezone_candidate_kernel<<<1, 1>>>(
+      state.x_r.data(),
+      state.x_z.data(),
+      x_r_cand,
+      x_z_cand,
+      x_r_old,
+      x_z_old,
+      state.evacuated_cells.d_contact_pair_nodes.data(),
+      state.evacuated_cells.d_contact_pair_normal.data(),
+      n_pairs,
+      state.evacuated_cells.d_contact_active_cells.data(),
+      n_contact_active_cells,
+      state.mesh.topo.nr,
+      state.mesh.topo.nz,
+      !state.evacuated_cells.node_axis_alias.empty()
+          ? state.evacuated_cells.d_node_axis_alias.data()
+          : nullptr);
+  CUDA_CHECK(cudaGetLastError());
+  CUDA_CHECK(core::debug_kernel_sync());
+}
+
 struct RemapAdmissibilityResult {
   bool admissible = true;
   int nonpositive_count = 0;
+  AleMinQualityCell first_fail_cell;
+};
+
+struct RemapMassAdmissibilityResult {
+  bool admissible = true;
+  bool transport_aborted = false;
   AleMinQualityCell first_fail_cell;
 };
 
@@ -1753,10 +1945,14 @@ __global__ void remap_admissibility_check_kernel(
     const int c_begin,
     const int c_end,
     const int nr,
-    const int nz) {
+    const int nz,
+    const std::uint8_t* __restrict__ geometry_policy_exempt) {
   const int c = c_begin + blockIdx.x * blockDim.x + threadIdx.x;
   const int n_cells = nr * nz;
   if (c >= c_end) {
+    return;
+  }
+  if (geometry_policy_exempt != nullptr && geometry_policy_exempt[c] != 0u) {
     return;
   }
 
@@ -1798,7 +1994,8 @@ RemapAdmissibilityResult check_first_sweep_admissibility(
     const int nr,
     const int nz,
     const int step_number,
-    const bool donor_sign_fixed) {
+    const bool donor_sign_fixed,
+    const std::uint8_t* geometry_policy_exempt) {
   RemapAdmissibilityResult out;
   const int n_cells = nr * nz;
   if (n_cells <= 0) {
@@ -1829,7 +2026,8 @@ RemapAdmissibilityResult check_first_sweep_admissibility(
                                                             c_begin,
                                                             c_end,
                                                             nr,
-                                                            nz);
+                                                            nz,
+                                                            geometry_policy_exempt);
   } else {
     remap_admissibility_check_kernel<false><<<blocks, 256>>>(d_vol_mid,
                                                              d_nonpositive_count,
@@ -1843,7 +2041,8 @@ RemapAdmissibilityResult check_first_sweep_admissibility(
                                                              c_begin,
                                                              c_end,
                                                              nr,
-                                                             nz);
+                                                             nz,
+                                                             geometry_policy_exempt);
   }
   CUDA_CHECK(cudaGetLastError());
   CUDA_CHECK(core::debug_kernel_sync());
@@ -1867,6 +2066,34 @@ RemapAdmissibilityResult check_first_sweep_admissibility(
   return out;
 }
 
+RemapAdmissibilityResult check_first_sweep_admissibility(
+    double* d_vol_mid,
+    const double* d_vol_old,
+    const double* d_xr_old,
+    const double* d_xz_old,
+    const double* d_xr_new,
+    const double* d_xz_new,
+    const int c_begin,
+    const int c_end,
+    const int nr,
+    const int nz,
+    const int step_number,
+    const bool donor_sign_fixed) {
+  return check_first_sweep_admissibility(d_vol_mid,
+                                         d_vol_old,
+                                         d_xr_old,
+                                         d_xz_old,
+                                         d_xr_new,
+                                         d_xz_new,
+                                         c_begin,
+                                         c_end,
+                                         nr,
+                                         nz,
+                                         step_number,
+                                         donor_sign_fixed,
+                                         nullptr);
+}
+
 __device__ inline void atomic_min_double(double* address, const double value) {
   auto* address_as_ull = reinterpret_cast<unsigned long long*>(address);
   unsigned long long old = *address_as_ull;
@@ -1878,6 +2105,65 @@ __device__ inline void atomic_min_double(double* address, const double value) {
     if (assumed == old) {
       break;
     }
+  }
+}
+
+__global__ void remap_mass_preflight_check_kernel(
+    double* __restrict__ min_predicted_fraction,
+    int* __restrict__ rejected,
+    const double* __restrict__ predicted_rho,
+    const double* __restrict__ pre_rho,
+    const double* __restrict__ vol_new,
+    const double* __restrict__ vol_old,
+    const double* __restrict__ veto_floor,
+    const int c_begin,
+    const int c_end,
+    const double reject_fraction,
+    const std::uint8_t* __restrict__ geometry_policy_exempt) {
+  const int c = c_begin + blockIdx.x * blockDim.x + threadIdx.x;
+  if (c >= c_end) {
+    return;
+  }
+  if (geometry_policy_exempt != nullptr && geometry_policy_exempt[c] != 0u) {
+    return;
+  }
+
+  const double predicted_mass = predicted_rho[c] * vol_new[c];
+  const double pre_mass = pre_rho[c] * vol_old[c];
+  const double predicted_fraction = predicted_mass / pre_mass;
+  atomic_min_double(min_predicted_fraction, predicted_fraction);
+  const double veto_mass = veto_floor != nullptr ? veto_floor[c] : 0.0;
+  // A floor-band cell's clamp is the floor closure's normal job (healthy band
+  // ~1e-16 fractions); only material cells may veto a remap — measured:
+  // floor-band vetoes starved all relief for 1,313 consecutive events while
+  // the seam neighbor inverted (A497).
+  if (predicted_mass < -reject_fraction * fmax(pre_mass, veto_mass)) {
+    atomicExch(rejected, 1);
+  }
+}
+
+__global__ void remap_mass_preflight_argmin_kernel(
+    int* __restrict__ argmin_cell,
+    const double* __restrict__ predicted_rho,
+    const double* __restrict__ pre_rho,
+    const double* __restrict__ vol_new,
+    const double* __restrict__ vol_old,
+    const int c_begin,
+    const int c_end,
+    const double min_predicted_fraction,
+    const std::uint8_t* __restrict__ geometry_policy_exempt) {
+  const int c = c_begin + blockIdx.x * blockDim.x + threadIdx.x;
+  if (c >= c_end) {
+    return;
+  }
+  if (geometry_policy_exempt != nullptr && geometry_policy_exempt[c] != 0u) {
+    return;
+  }
+
+  const double predicted_mass = predicted_rho[c] * vol_new[c];
+  const double pre_mass = pre_rho[c] * vol_old[c];
+  if (predicted_mass / pre_mass == min_predicted_fraction) {
+    atomicMin(argmin_cell, c);
   }
 }
 
@@ -1944,10 +2230,12 @@ __global__ void predictive_axis_margin_collect_kernel(
     const double* __restrict__ x_z,
     const double* __restrict__ v_r,
     const double* __restrict__ v_z,
+    const std::uint8_t* __restrict__ geometry_policy_exempt,
     const int nz,
     const double dt_next) {
   const int j = blockIdx.x * blockDim.x + threadIdx.x;
-  if (j >= nz) {
+  if (j >= nz ||
+      (geometry_policy_exempt != nullptr && geometry_policy_exempt[j] != 0U)) {
     return;
   }
 
@@ -1988,11 +2276,13 @@ __global__ void predictive_axis_failure_kernel(
     const double* __restrict__ x_z,
     const double* __restrict__ v_r,
     const double* __restrict__ v_z,
+    const std::uint8_t* __restrict__ geometry_policy_exempt,
     const int nz,
     const double dt_next,
     const double axis_margin_floor) {
   const int j = blockIdx.x * blockDim.x + threadIdx.x;
-  if (j >= nz) {
+  if (j >= nz ||
+      (geometry_policy_exempt != nullptr && geometry_policy_exempt[j] != 0U)) {
     return;
   }
 
@@ -2033,6 +2323,7 @@ __global__ void predictive_cell_volume_check_kernel(
     const double* __restrict__ x_z,
     const double* __restrict__ v_r,
     const double* __restrict__ v_z,
+    const std::uint8_t* __restrict__ geometry_policy_exempt,
     const int c_begin,
     const int c_end,
     const int nr,
@@ -2042,6 +2333,9 @@ __global__ void predictive_cell_volume_check_kernel(
   const int c = c_begin + blockIdx.x * blockDim.x + threadIdx.x;
   const int n_cells = nr * nz;
   if (c >= c_end) {
+    return;
+  }
+  if (geometry_policy_exempt != nullptr && geometry_policy_exempt[c] != 0U) {
     return;
   }
 
@@ -2114,6 +2408,15 @@ PredictiveAcceptanceResult check_next_step_feasibility(
                 "ALE predictive acceptance requires v_z size to match n_nodes");
   const bool axis_check_active =
       has_physical_rz_axis && axis_floor_fraction > 0.0;
+  TENRYU_ASSERT(
+      state.evacuated_cells.d_geometry_policy_exempt_cells.empty() ||
+          state.evacuated_cells.d_geometry_policy_exempt_cells.size() ==
+              static_cast<std::size_t>(n_cells),
+      "ALE predictive acceptance axis scan requires device geometry-policy-exempt mask size == n_cells");
+  const std::uint8_t* geometry_policy_exempt =
+      state.evacuated_cells.d_geometry_policy_exempt_cells.empty()
+          ? nullptr
+          : state.evacuated_cells.d_geometry_policy_exempt_cells.data();
 
   double* d_candidate_axis_min = nullptr;
   double* d_trial_axis_min = nullptr;
@@ -2178,6 +2481,7 @@ PredictiveAcceptanceResult check_next_step_feasibility(
         d_xz_cand,
         state.v_r.data(),
         state.v_z.data(),
+        geometry_policy_exempt,
         nz,
         dt_next);
     CUDA_CHECK(cudaGetLastError());
@@ -2192,6 +2496,7 @@ PredictiveAcceptanceResult check_next_step_feasibility(
       d_xz_cand,
       state.v_r.data(),
       state.v_z.data(),
+      geometry_policy_exempt,
       cw.begin,
       cw.end,
       nr,
@@ -2271,6 +2576,7 @@ PredictiveAcceptanceResult check_next_step_feasibility(
         d_xz_cand,
         state.v_r.data(),
         state.v_z.data(),
+        geometry_policy_exempt,
         nz,
         dt_next,
         axis_margin_floor);
@@ -6813,7 +7119,8 @@ ShellProtectedRezoneResult shell_protected_rezone(
           state.x_r_reference.size() == state.x_r.size() &&
                   state.x_z_reference.size() == state.x_z.size()
               ? state.x_z_reference.data()
-              : nullptr);
+              : nullptr,
+          /*refine_iters=*/48);
   result.sigma_accepted = ls.sigma_accepted;
   result.line_search_iters = ls.iters_used;
   result.first_bad_cell = ls.quality.first_bad_cell;
@@ -8564,9 +8871,10 @@ RezoneResult run_m1_tmop_rezone_transaction(
         "M1 cell_nverts size mismatch");
     for (const std::uint8_t nverts : state.mesh.cell_nverts) {
       TENRYU_ASSERT(
-          nverts >= 3U && nverts <= 8U &&
+          nverts >= 3U &&
+              nverts <= mesh::kMeshTopoCellStorageSlotsMaxGeneral &&
               static_cast<int>(nverts) <= state.corner_stride,
-          "M1 cell vertex count must be in [3,8] and fit corner stride");
+          "M1 cell vertex count must be in [3,16] and fit corner stride");
     }
   }
 
@@ -8664,9 +8972,12 @@ RezoneResult run_m1_tmop_rezone_transaction(
     }
   }
 
+  const bool theta_reg_active = cfg.numerics.ale.m1_theta_reg > 0.0;
   const m1::RezoneRingNeighborPairs ring_pairs =
-      m1::rezone_build_ring_neighbor_pairs(
-          state.mesh.topo, cell_nverts, state.corner_stride);
+      theta_reg_active
+          ? m1::rezone_build_ring_neighbor_pairs(
+                state.mesh.topo, cell_nverts, state.corner_stride)
+          : m1::RezoneRingNeighborPairs{};
   m1::RezoneMeshView view{};
   view.n_nodes = n_nodes;
   view.n_cells = n_cells;
@@ -8683,9 +8994,11 @@ RezoneResult run_m1_tmop_rezone_transaction(
   view.x_lagrangian_r = lagrangian_r.data();
   view.x_lagrangian_z = lagrangian_z.data();
   view.axis_mask = axis_mask.data();
-  view.theta_left = ring_pairs.left.data();
-  view.theta_right = ring_pairs.right.data();
-  view.theta_touch_offsets = ring_pairs.touch_offsets.data();
+  view.theta_left = ring_pairs.left.empty() ? nullptr : ring_pairs.left.data();
+  view.theta_right = ring_pairs.right.empty() ? nullptr : ring_pairs.right.data();
+  view.theta_frac = ring_pairs.frac.empty() ? nullptr : ring_pairs.frac.data();
+  view.theta_touch_offsets =
+      ring_pairs.touch_offsets.empty() ? nullptr : ring_pairs.touch_offsets.data();
   view.theta_touch_centers =
       ring_pairs.touch_centers.empty()
           ? nullptr
@@ -8866,11 +9179,18 @@ RezoneResult run_winslow_rezone_with_parallel(
     out.min_quality = reduction->allreduce_min(out.min_quality);
     out.mesh_tangle = (reduction->allreduce_max(out.mesh_tangle ? 1.0 : 0.0) > 0.5);
   }
+  double trigger_min_quality = out.min_quality;
+  if (detail::evacuated_constraint_masks_present(state)) {
+    trigger_min_quality = compute_min_quality(state, cfg, nullptr, nullptr, true);
+    if (reduction != nullptr) {
+      trigger_min_quality = reduction->allreduce_min(trigger_min_quality);
+    }
+  }
 
   const bool corner_floor_violated =
       detail::corner_cell_aspect_floor_violated(state, cfg, reduction);
   if (!force_rezone && !corner_floor_violated &&
-      out.min_quality >= cfg.numerics.ale.quality_threshold) {
+      trigger_min_quality >= cfg.numerics.ale.quality_threshold) {
     return out;
   }
 
@@ -8879,6 +9199,12 @@ RezoneResult run_winslow_rezone_with_parallel(
   const int nz = state.mesh.topo.nz;
   const int n_nodes = state.mesh.topo.n_nodes;
   const int node_size = n_nodes;
+  const int n_contact_active_cells =
+      state.evacuated_cells.n_contact_active_cells;
+  const int* contact_active_cells =
+      n_contact_active_cells > 0
+          ? state.evacuated_cells.d_contact_active_cells.data()
+          : nullptr;
 
   std::vector<std::uint8_t> node_flags = state.mesh.topo.node_flags;
   std::uint8_t* d_node_flags = nullptr;
@@ -9017,7 +9343,9 @@ RezoneResult run_winslow_rezone_with_parallel(
           cfg.numerics.ale.corner_cell_aspect_protection_enabled,
           cfg.numerics.ale.corner_cell_aspect_eta,
           cfg.numerics.hydro.boundary_2d.z_bottom_cfg.is_state_supply(),
-          cfg.numerics.hydro.boundary_2d.z_top_cfg.is_state_supply());
+          cfg.numerics.hydro.boundary_2d.z_top_cfg.is_state_supply(),
+          contact_active_cells,
+          n_contact_active_cells);
     } else {
       detail::winslow_jacobi_step_kernel<<<blocks, 256>>>(
           nxt_r,
@@ -9048,7 +9376,9 @@ RezoneResult run_winslow_rezone_with_parallel(
           cfg.numerics.ale.corner_cell_aspect_protection_enabled,
           cfg.numerics.ale.corner_cell_aspect_eta,
           cfg.numerics.hydro.boundary_2d.z_bottom_cfg.is_state_supply(),
-          cfg.numerics.hydro.boundary_2d.z_top_cfg.is_state_supply());
+          cfg.numerics.hydro.boundary_2d.z_top_cfg.is_state_supply(),
+          contact_active_cells,
+          n_contact_active_cells);
     }
     CUDA_CHECK(cudaGetLastError());
 
@@ -9061,7 +9391,10 @@ RezoneResult run_winslow_rezone_with_parallel(
                                           axis_flags_h,
                                           nz,
                                           dz_init,
-                                          cfg.numerics.has_physical_rz_axis);
+                                          cfg.numerics.has_physical_rz_axis,
+                                          contact_active_cells,
+                                          n_contact_active_cells,
+                                          nz);
     }
 
     if (do_node_exchange) {
@@ -9171,8 +9504,16 @@ RezoneResult run_axis_spine_rezone_with_parallel(
     out.min_quality = reduction->allreduce_min(out.min_quality);
     out.mesh_tangle = (reduction->allreduce_max(out.mesh_tangle ? 1.0 : 0.0) > 0.5);
   }
+  double trigger_min_quality = out.min_quality;
+  if (detail::evacuated_constraint_masks_present(state)) {
+    trigger_min_quality = compute_min_quality(state, cfg, nullptr, nullptr, true);
+    if (reduction != nullptr) {
+      trigger_min_quality = reduction->allreduce_min(trigger_min_quality);
+    }
+  }
 
-  if (!force_rezone && out.min_quality >= cfg.numerics.ale.quality_threshold) {
+  if (!force_rezone &&
+      trigger_min_quality >= cfg.numerics.ale.quality_threshold) {
     return out;
   }
   if (!cfg.numerics.has_physical_rz_axis) {
@@ -9192,6 +9533,11 @@ RezoneResult run_axis_spine_rezone_with_parallel(
     max_dz = minimal_axis_z_repair(state.x_r,
                                    state.x_z,
                                    nr,
+                                   nz,
+                                   state.evacuated_cells.n_contact_active_cells > 0
+                                       ? state.evacuated_cells.d_contact_active_cells.data()
+                                       : nullptr,
+                                   state.evacuated_cells.n_contact_active_cells,
                                    nz,
                                    kAxisSpineRepairAlpha,
                                    1,
@@ -10512,6 +10858,334 @@ bool try_apply_axis_rezone(core::State& state,
   return true;
 }
 
+namespace {
+
+struct MaxminPoint {
+  double r = 0.0;
+  double z = 0.0;
+};
+
+struct MaxminCorner {
+  int cell = -1;
+  int corner = -1;
+  int node = -1;
+  int next = -1;
+  int previous = -1;
+  double orientation = 1.0;
+  double j_reference = 0.0;
+  bool flat_reference = false;
+};
+
+struct MaxminAffineCorner {
+  double a_r = 0.0;
+  double a_z = 0.0;
+  double b = 0.0;
+  double j_reference = 0.0;
+  bool flat_reference = false;
+};
+
+bool maxmin_rezone_enabled() {
+  static const bool enabled = [] {
+    const char* raw = std::getenv("TENRYU_I1B_MAXMIN_REZONE");
+    return raw != nullptr && raw[0] != '\0' && raw[0] != '0';
+  }();
+  return enabled;
+}
+
+double maxmin_corner_jacobian(const MaxminCorner& corner,
+                              const std::vector<double>& r,
+                              const std::vector<double>& z) {
+  const std::size_t node = static_cast<std::size_t>(corner.node);
+  const std::size_t next = static_cast<std::size_t>(corner.next);
+  const std::size_t previous = static_cast<std::size_t>(corner.previous);
+  return corner.orientation *
+         ((r[next] - r[node]) * (z[previous] - z[node]) -
+          (z[next] - z[node]) * (r[previous] - r[node]));
+}
+
+double maxmin_corner_quality(const MaxminCorner& corner,
+                             const std::vector<double>& r,
+                             const std::vector<double>& z) {
+  return maxmin_corner_jacobian(corner, r, z) / corner.j_reference;
+}
+
+bool maxmin_corner_contains_node(const MaxminCorner& corner,
+                                 const int node) {
+  return corner.node == node || corner.next == node ||
+         corner.previous == node;
+}
+
+MaxminAffineCorner maxmin_corner_affine(
+    const MaxminCorner& corner,
+    const int moving_node,
+    const std::vector<double>& r,
+    const std::vector<double>& z) {
+  MaxminAffineCorner affine;
+  affine.j_reference = corner.j_reference;
+  affine.flat_reference = corner.flat_reference;
+  const double orientation = corner.orientation;
+  const std::size_t node = static_cast<std::size_t>(corner.node);
+  const std::size_t next = static_cast<std::size_t>(corner.next);
+  const std::size_t previous = static_cast<std::size_t>(corner.previous);
+  if (corner.node == moving_node) {
+    affine.a_r = orientation * (z[next] - z[previous]);
+    affine.a_z = orientation * (r[previous] - r[next]);
+    affine.b = orientation *
+               (r[next] * z[previous] - z[next] * r[previous]);
+  } else if (corner.next == moving_node) {
+    const double previous_r = r[previous] - r[node];
+    const double previous_z = z[previous] - z[node];
+    affine.a_r = orientation * previous_z;
+    affine.a_z = -orientation * previous_r;
+    affine.b = orientation *
+               (-r[node] * previous_z + z[node] * previous_r);
+  } else {
+    TENRYU_ASSERT(corner.previous == moving_node,
+                  "max-min affine corner does not contain moving node");
+    const double next_r = r[next] - r[node];
+    const double next_z = z[next] - z[node];
+    affine.a_r = -orientation * next_z;
+    affine.a_z = orientation * next_r;
+    affine.b = orientation *
+               (-next_r * z[node] + next_z * r[node]);
+  }
+  return affine;
+}
+
+std::vector<MaxminPoint> maxmin_clip_half_plane(
+    const std::vector<MaxminPoint>& polygon,
+    const double a_r,
+    const double a_z,
+    const double rhs) {
+  std::vector<MaxminPoint> clipped;
+  if (polygon.empty()) {
+    return clipped;
+  }
+  clipped.reserve(polygon.size() + 1U);
+  const auto append_unique = [&](const MaxminPoint& point) {
+    if (clipped.empty() || clipped.back().r != point.r ||
+        clipped.back().z != point.z) {
+      clipped.push_back(point);
+    }
+  };
+  for (std::size_t i = 0; i < polygon.size(); ++i) {
+    const MaxminPoint& start = polygon[i];
+    const MaxminPoint& end = polygon[(i + 1U) % polygon.size()];
+    const double start_value = a_r * start.r + a_z * start.z - rhs;
+    const double end_value = a_r * end.r + a_z * end.z - rhs;
+    const bool start_inside = start_value >= 0.0;
+    const bool end_inside = end_value >= 0.0;
+    if (start_inside && end_inside) {
+      append_unique(end);
+    } else if (start_inside != end_inside) {
+      const double t = start_value / (start_value - end_value);
+      append_unique({start.r + t * (end.r - start.r),
+                     start.z + t * (end.z - start.z)});
+      if (end_inside) {
+        append_unique(end);
+      }
+    }
+  }
+  if (clipped.size() > 1U && clipped.front().r == clipped.back().r &&
+      clipped.front().z == clipped.back().z) {
+    clipped.pop_back();
+  }
+  return clipped;
+}
+
+bool maxmin_feasible_polygon(
+    const std::vector<MaxminAffineCorner>& affines,
+    const std::vector<MaxminPoint>& seed,
+    const double level,
+    std::vector<MaxminPoint>& feasible) {
+  feasible = maxmin_clip_half_plane(seed, 1.0, 0.0, 0.0);
+  for (const MaxminAffineCorner& affine : affines) {
+    const double rhs = affine.flat_reference
+                           ? -affine.b
+                           : level * affine.j_reference - affine.b;
+    feasible = maxmin_clip_half_plane(
+        feasible,
+        affine.a_r,
+        affine.a_z,
+        rhs);
+    if (feasible.empty()) {
+      return false;
+    }
+  }
+  return !feasible.empty();
+}
+
+double maxmin_motif_minimum(const std::vector<MaxminCorner>& corners,
+                            const std::vector<double>& r,
+                            const std::vector<double>& z) {
+  double minimum = std::numeric_limits<double>::infinity();
+  for (const MaxminCorner& corner : corners) {
+    if (corner.flat_reference) {
+      continue;
+    }
+    minimum = std::min(minimum, maxmin_corner_quality(corner, r, z));
+  }
+  return minimum;
+}
+
+double maxmin_node_local_minimum(const std::vector<MaxminCorner>& corners,
+                                 const int node,
+                                 const std::vector<double>& r,
+                                 const std::vector<double>& z) {
+  double minimum = std::numeric_limits<double>::infinity();
+  for (const MaxminCorner& corner : corners) {
+    if (!corner.flat_reference && maxmin_corner_contains_node(corner, node)) {
+      minimum = std::min(minimum, maxmin_corner_quality(corner, r, z));
+    }
+  }
+  return minimum;
+}
+
+double maxmin_node_cap(const std::vector<MaxminCorner>& corners,
+                       const int node,
+                       const std::vector<double>& r,
+                       const std::vector<double>& z) {
+  double cap = std::numeric_limits<double>::infinity();
+  for (const MaxminCorner& corner : corners) {
+    if (!corner.flat_reference &&
+        !maxmin_corner_contains_node(corner, node)) {
+      cap = std::min(cap, maxmin_corner_quality(corner, r, z));
+    }
+  }
+  return cap;
+}
+
+bool maxmin_reference_flat_path_admissible(
+    const std::vector<int>& cells,
+    const std::vector<int>& cell_node_offsets,
+    const std::vector<int>& cell_node_indices,
+    const std::vector<std::uint8_t>& cell_nverts,
+    const std::vector<int>& cell_orientation_sign,
+    const std::vector<double>& reference_r,
+    const std::vector<double>& reference_z,
+    const std::vector<double>& start_r,
+    const std::vector<double>& start_z,
+    const std::vector<double>& end_r,
+    const std::vector<double>& end_z,
+    int* first_bad_cell) {
+  for (const int cell : cells) {
+    const int offset = cell_node_offsets[static_cast<std::size_t>(cell)];
+    const int nverts =
+        static_cast<int>(cell_nverts[static_cast<std::size_t>(cell)]);
+    double cell_reference_r[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {};
+    double cell_reference_z[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {};
+    double cell_start_r[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {};
+    double cell_start_z[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {};
+    double cell_end_r[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {};
+    double cell_end_z[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {};
+    for (int corner = 0; corner < nverts; ++corner) {
+      const int node = cell_node_indices[
+          static_cast<std::size_t>(offset + corner)];
+      const std::size_t index = static_cast<std::size_t>(node);
+      cell_reference_r[corner] = reference_r[index];
+      cell_reference_z[corner] = reference_z[index];
+      cell_start_r[corner] = start_r[index];
+      cell_start_z[corner] = start_z[index];
+      cell_end_r[corner] = end_r[index];
+      cell_end_z[corner] = end_z[index];
+    }
+    const mesh::ReferenceFlatCellPathResult path =
+        mesh::evaluate_reference_flat_cell_path(
+            cell_reference_r, cell_reference_z, cell_start_r, cell_start_z,
+            cell_end_r, cell_end_z, nverts,
+            cell_orientation_sign[static_cast<std::size_t>(cell)]);
+    if (!path.admissible) {
+      if (first_bad_cell != nullptr) {
+        *first_bad_cell = cell;
+      }
+      return false;
+    }
+  }
+  return true;
+}
+
+double maxmin_longest_incident_edge(
+    const int node,
+    const std::vector<std::vector<int>>& node_cells,
+    const std::vector<int>& cell_node_offsets,
+    const std::vector<int>& cell_node_indices,
+    const std::vector<std::uint8_t>& cell_nverts,
+    const std::vector<double>& r,
+    const std::vector<double>& z) {
+  double longest = 0.0;
+  for (const int cell : node_cells[static_cast<std::size_t>(node)]) {
+    const int offset = cell_node_offsets[static_cast<std::size_t>(cell)];
+    const int nverts =
+        static_cast<int>(cell_nverts[static_cast<std::size_t>(cell)]);
+    for (int corner = 0; corner < nverts; ++corner) {
+      if (cell_node_indices[static_cast<std::size_t>(offset + corner)] !=
+          node) {
+        continue;
+      }
+      const int previous = cell_node_indices[static_cast<std::size_t>(
+          offset + (corner + nverts - 1) % nverts)];
+      const int next = cell_node_indices[static_cast<std::size_t>(
+          offset + (corner + 1) % nverts)];
+      longest = std::max(
+          longest,
+          std::hypot(r[static_cast<std::size_t>(node)] -
+                         r[static_cast<std::size_t>(previous)],
+                     z[static_cast<std::size_t>(node)] -
+                         z[static_cast<std::size_t>(previous)]));
+      longest = std::max(
+          longest,
+          std::hypot(r[static_cast<std::size_t>(node)] -
+                         r[static_cast<std::size_t>(next)],
+                     z[static_cast<std::size_t>(node)] -
+                         z[static_cast<std::size_t>(next)]));
+    }
+  }
+  return longest;
+}
+
+std::vector<double> maxmin_target_volumes(
+    const std::vector<double>& target_r,
+    const std::vector<double>& target_z,
+    const std::vector<int>& cell_node_offsets,
+    const std::vector<int>& cell_node_indices,
+    const std::vector<std::uint8_t>& cell_nverts,
+    const std::vector<int>& cell_orientation_sign,
+    const std::vector<std::int8_t>& hydro_active,
+    const std::vector<double>& existing_target_volume) {
+  const int n_cells = static_cast<int>(cell_nverts.size());
+  TENRYU_ASSERT(existing_target_volume.size() ==
+                    static_cast<std::size_t>(n_cells),
+                "max-min rezone target volume size mismatch");
+  std::vector<double> target_volume = existing_target_volume;
+  for (int cell = 0; cell < n_cells; ++cell) {
+    if (!hydro_active.empty() &&
+        hydro_active[static_cast<std::size_t>(cell)] == 0) {
+      continue;
+    }
+    const int offset = cell_node_offsets[static_cast<std::size_t>(cell)];
+    const int nverts =
+        static_cast<int>(cell_nverts[static_cast<std::size_t>(cell)]);
+    double r[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {};
+    double z[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {};
+    for (int corner = 0; corner < nverts; ++corner) {
+      const int node = cell_node_indices[
+          static_cast<std::size_t>(offset + corner)];
+      r[corner] = target_r[static_cast<std::size_t>(node)];
+      z[corner] = target_z[static_cast<std::size_t>(node)];
+    }
+    const double volume =
+        static_cast<double>(
+            cell_orientation_sign[static_cast<std::size_t>(cell)]) *
+        rz::rz_polygon_volume_exact(r, z, nverts);
+    TENRYU_ASSERT(std::isfinite(volume) && volume > 0.0,
+                  "max-min rezone target cell volume is invalid");
+    target_volume[static_cast<std::size_t>(cell)] = volume;
+  }
+  return target_volume;
+}
+
+}  // namespace
+
 AleStepResult apply_pole_axis_radial_order_repair(
     core::State& state,
     const core::Config& cfg,
@@ -10528,6 +11202,622 @@ AleStepResult apply_pole_axis_radial_order_repair(
                               dt_hydro_used,
                               out,
                               true);
+  return out;
+}
+
+// A176: exact max-min corner-J untangle repair. Motif = the failing cell's
+// 1-hop cell closure; interior nodes (all incident cells inside the motif)
+// move; the rim stays. Per-node subproblems are exact 2-variable linear
+// programs (every corner J is linear in a single vertex's coordinates),
+// swept monotonically until the motif minimum stops improving. The
+// candidate commits through whole-field admissibility + the same-time
+// conservative remap, atomically (RollbackGuard).
+AleStepResult apply_maxmin_untangle_repair(
+    core::State& state,
+    const core::Config& cfg,
+    const parallel::PartitionInfo& part,
+    const parallel::Reduction* reduction,
+    const HydroEOSContext* eos_ctx,
+    const double dt_hydro_used,
+    const int failing_cell) {
+  AleStepResult out;
+  (void)part;
+  (void)reduction;
+  (void)eos_ctx;
+  (void)dt_hydro_used;
+  if (!maxmin_rezone_enabled() || state.mesh.dim != 2 ||
+      !state.mesh.topo.multiblock.has_value()) {
+    return out;
+  }
+
+  const int n_cells = state.mesh.topo.n_cells;
+  const int n_nodes = state.mesh.topo.n_nodes;
+  if (failing_cell < 0 || failing_cell >= n_cells) {
+    return out;
+  }
+  TENRYU_ASSERT(
+      state.hydro_active.empty() ||
+          state.hydro_active.size() == static_cast<std::size_t>(n_cells),
+      "max-min rezone hydro_active size mismatch");
+  const auto cell_is_active = [&state](const int cell) {
+    return state.hydro_active.empty() ||
+           state.hydro_active[static_cast<std::size_t>(cell)] != 0;
+  };
+  if (!cell_is_active(failing_cell)) {
+    return out;
+  }
+  if (state.x_r_initial.size() != static_cast<std::size_t>(n_nodes) ||
+      state.x_z_initial.size() != static_cast<std::size_t>(n_nodes)) {
+    core::log_warning(
+        "[maxmin-rezone] x_*_initial unavailable; repair skipped");
+    return out;
+  }
+
+  const auto& topology = *state.mesh.topo.multiblock;
+  TENRYU_ASSERT(
+      n_cells > 0 && n_nodes > 0 &&
+          state.x_r.size() == static_cast<std::size_t>(n_nodes) &&
+          state.x_z.size() == static_cast<std::size_t>(n_nodes),
+      "max-min rezone state coordinate sizes are incomplete");
+  TENRYU_ASSERT(
+      state.mesh.multiblock_cell_node_csr_offsets.size() ==
+              static_cast<std::size_t>(n_cells) + 1U &&
+          topology.cell_id_stable.size() ==
+              static_cast<std::size_t>(n_cells) &&
+          topology.cell_orientation_sign.size() ==
+              static_cast<std::size_t>(n_cells),
+      "max-min rezone requires complete multiblock CSR metadata");
+  TENRYU_ASSERT(
+      state.x_r_reference.size() == static_cast<std::size_t>(n_nodes) &&
+          state.x_z_reference.size() == static_cast<std::size_t>(n_nodes) &&
+          state.cell_vol_initial.size() ==
+              static_cast<std::size_t>(n_cells),
+      "max-min rezone requires reference geometry storage");
+
+  std::vector<double> source_r;
+  std::vector<double> source_z;
+  std::vector<double> initial_r;
+  std::vector<double> initial_z;
+  std::vector<int> cell_node_offsets;
+  std::vector<int> cell_node_indices;
+  state.x_r.copy_to_host(source_r);
+  state.x_z.copy_to_host(source_z);
+  state.x_r_initial.copy_to_host(initial_r);
+  state.x_z_initial.copy_to_host(initial_z);
+  state.mesh.multiblock_cell_node_csr_offsets.copy_to_host(
+      cell_node_offsets);
+  state.mesh.multiblock_cell_node_csr_indices.copy_to_host(
+      cell_node_indices);
+  const std::vector<std::uint8_t> cell_nverts =
+      state.mesh.cell_nverts.empty()
+          ? std::vector<std::uint8_t>(
+                static_cast<std::size_t>(n_cells), 4U)
+          : state.mesh.cell_nverts;
+  TENRYU_ASSERT(cell_nverts.size() == static_cast<std::size_t>(n_cells),
+                "max-min rezone cell_nverts size mismatch");
+  TENRYU_ASSERT(
+      cell_node_offsets.size() == static_cast<std::size_t>(n_cells) + 1U &&
+          !cell_node_offsets.empty() && cell_node_offsets.front() == 0 &&
+          cell_node_offsets.back() >= 0 &&
+          static_cast<std::size_t>(cell_node_offsets.back()) <=
+              cell_node_indices.size(),
+      "max-min rezone host CSR metadata is incomplete");
+
+  std::vector<std::vector<int>> node_cells(
+      static_cast<std::size_t>(n_nodes));
+  std::vector<std::uint8_t> reference_flat_corner(
+      static_cast<std::size_t>(n_cells) *
+          state.corner_stride,
+      0U);
+  for (int cell = 0; cell < n_cells; ++cell) {
+    if (!cell_is_active(cell)) {
+      continue;
+    }
+    const int offset = cell_node_offsets[static_cast<std::size_t>(cell)];
+    const int end = cell_node_offsets[static_cast<std::size_t>(cell) + 1U];
+    const int nverts =
+        static_cast<int>(cell_nverts[static_cast<std::size_t>(cell)]);
+    TENRYU_ASSERT(
+        nverts >= 3 && nverts <= state.corner_stride &&
+            offset >= 0 && end >= offset && end - offset >= nverts &&
+            static_cast<std::size_t>(end) <= cell_node_indices.size(),
+        "max-min rezone cell CSR width is invalid");
+    for (int corner = 0; corner < nverts; ++corner) {
+      const int node =
+          cell_node_indices[static_cast<std::size_t>(offset + corner)];
+      TENRYU_ASSERT(node >= 0 && node < n_nodes,
+                    "max-min rezone cell node is out of range");
+      node_cells[static_cast<std::size_t>(node)].push_back(cell);
+      const int previous = cell_node_indices[static_cast<std::size_t>(
+          offset + (corner + nverts - 1) % nverts)];
+      const int next = cell_node_indices[static_cast<std::size_t>(
+          offset + (corner + 1) % nverts)];
+      TENRYU_ASSERT(previous >= 0 && previous < n_nodes && next >= 0 &&
+                        next < n_nodes,
+                    "max-min rezone adjacent cell node is out of range");
+      if (mesh::classify_reference_corner(
+              initial_r[static_cast<std::size_t>(previous)],
+              initial_z[static_cast<std::size_t>(previous)],
+              initial_r[static_cast<std::size_t>(node)],
+              initial_z[static_cast<std::size_t>(node)],
+              initial_r[static_cast<std::size_t>(next)],
+              initial_z[static_cast<std::size_t>(next)],
+              topology.cell_orientation_sign[
+                  static_cast<std::size_t>(cell)]) ==
+          mesh::ReferenceCornerClass::FlatReference) {
+        reference_flat_corner[
+            static_cast<std::size_t>(cell) *
+                state.corner_stride +
+            static_cast<std::size_t>(corner)] = 1U;
+      }
+    }
+  }
+
+  std::vector<std::uint8_t> motif_cell_mask(
+      static_cast<std::size_t>(n_cells), 0U);
+  motif_cell_mask[static_cast<std::size_t>(failing_cell)] = 1U;
+  const int failing_offset =
+      cell_node_offsets[static_cast<std::size_t>(failing_cell)];
+  const int failing_nverts =
+      static_cast<int>(cell_nverts[static_cast<std::size_t>(failing_cell)]);
+  for (int corner = 0; corner < failing_nverts; ++corner) {
+    const int node = cell_node_indices[
+        static_cast<std::size_t>(failing_offset + corner)];
+    for (const int cell : node_cells[static_cast<std::size_t>(node)]) {
+      motif_cell_mask[static_cast<std::size_t>(cell)] = 1U;
+    }
+  }
+
+  std::vector<std::uint8_t> motif_node_mask(
+      static_cast<std::size_t>(n_nodes), 0U);
+  std::vector<int> motif_cells;
+  for (int cell = 0; cell < n_cells; ++cell) {
+    if (!cell_is_active(cell) ||
+        motif_cell_mask[static_cast<std::size_t>(cell)] == 0U) {
+      continue;
+    }
+    motif_cells.push_back(cell);
+    const int offset = cell_node_offsets[static_cast<std::size_t>(cell)];
+    const int nverts =
+        static_cast<int>(cell_nverts[static_cast<std::size_t>(cell)]);
+    for (int corner = 0; corner < nverts; ++corner) {
+      const int node =
+          cell_node_indices[static_cast<std::size_t>(offset + corner)];
+      motif_node_mask[static_cast<std::size_t>(node)] = 1U;
+    }
+  }
+
+  std::vector<int> interior_nodes;
+  for (int node = 0; node < n_nodes; ++node) {
+    if (motif_node_mask[static_cast<std::size_t>(node)] == 0U) {
+      continue;
+    }
+    bool interior = true;
+    for (const int cell : node_cells[static_cast<std::size_t>(node)]) {
+      if (motif_cell_mask[static_cast<std::size_t>(cell)] == 0U) {
+        interior = false;
+        break;
+      }
+    }
+    if (interior) {
+      interior_nodes.push_back(node);
+    }
+  }
+  if (interior_nodes.empty()) {
+    core::log_warning(
+        "[maxmin-rezone] no interior DOF for cell=" +
+        std::to_string(failing_cell) + "; repair skipped");
+    return out;
+  }
+
+  std::vector<MaxminCorner> corners;
+  bool flat_reference_corner_logged = false;
+  bool non_positive_reference_corner_fallback_logged = false;
+  for (const int cell : motif_cells) {
+    if (!cell_is_active(cell)) {
+      continue;
+    }
+    const int offset = cell_node_offsets[static_cast<std::size_t>(cell)];
+    const int nverts =
+        static_cast<int>(cell_nverts[static_cast<std::size_t>(cell)]);
+    const double orientation = static_cast<double>(
+        topology.cell_orientation_sign[static_cast<std::size_t>(cell)]);
+    for (int corner = 0; corner < nverts; ++corner) {
+      MaxminCorner motif_corner;
+      motif_corner.cell = cell;
+      motif_corner.corner = corner;
+      motif_corner.node = cell_node_indices[
+          static_cast<std::size_t>(offset + corner)];
+      motif_corner.next = cell_node_indices[static_cast<std::size_t>(
+          offset + (corner + 1) % nverts)];
+      motif_corner.previous = cell_node_indices[static_cast<std::size_t>(
+          offset + (corner + nverts - 1) % nverts)];
+      motif_corner.orientation = orientation;
+      const std::size_t node =
+          static_cast<std::size_t>(motif_corner.node);
+      const std::size_t next =
+          static_cast<std::size_t>(motif_corner.next);
+      const std::size_t previous =
+          static_cast<std::size_t>(motif_corner.previous);
+      motif_corner.flat_reference =
+          mesh::classify_reference_corner(
+              initial_r[previous], initial_z[previous], initial_r[node],
+              initial_z[node], initial_r[next], initial_z[next],
+              topology.cell_orientation_sign[static_cast<std::size_t>(cell)]) ==
+          mesh::ReferenceCornerClass::FlatReference;
+      motif_corner.j_reference =
+          maxmin_corner_jacobian(motif_corner, initial_r, initial_z);
+      if (motif_corner.flat_reference) {
+        motif_corner.j_reference = 1.0;
+        if (!flat_reference_corner_logged) {
+          core::log_info(
+              "[maxmin-rezone] typed flat reference corner cell=" +
+              std::to_string(cell) + " corner=" + std::to_string(corner));
+          flat_reference_corner_logged = true;
+        }
+      } else if (!(motif_corner.j_reference > 0.0)) {
+        const double e1_r = initial_r[next] - initial_r[node];
+        const double e1_z = initial_z[next] - initial_z[node];
+        const double e2_r = initial_r[previous] - initial_r[node];
+        const double e2_z = initial_z[previous] - initial_z[node];
+        const double edge_scale =
+            0.5 * std::hypot(e1_r, e1_z) * std::hypot(e2_r, e2_z);
+        TENRYU_ASSERT(edge_scale > 0.0,
+                      "max-min rezone reference corner edge scale must be positive");
+        motif_corner.j_reference = edge_scale;
+        if (!non_positive_reference_corner_fallback_logged) {
+          core::log_info(
+              "[maxmin-rezone] non-positive reference corner fallback cell=" +
+              std::to_string(cell) + " corner=" + std::to_string(corner));
+          non_positive_reference_corner_fallback_logged = true;
+        }
+      }
+      corners.push_back(motif_corner);
+    }
+  }
+
+  std::vector<double> candidate_r = source_r;
+  std::vector<double> candidate_z = source_z;
+  const double q_min_before =
+      maxmin_motif_minimum(corners, candidate_r, candidate_z);
+  double q_min_current = q_min_before;
+  int sweeps = 0;
+  bool last_sweep_improved = false;
+  while (sweeps < 64) {
+    const double sweep_min_before = q_min_current;
+    for (const int node : interior_nodes) {
+      const double node_min_before = maxmin_node_local_minimum(
+          corners, node, candidate_r, candidate_z);
+      if (!std::isfinite(node_min_before)) {
+        continue;
+      }
+      double cap =
+          maxmin_node_cap(corners, node, candidate_r, candidate_z);
+      const double node_tol =
+          64.0 * std::numeric_limits<double>::epsilon() *
+          std::max(1.0, std::abs(node_min_before));
+      if (std::isfinite(cap) && !(cap > node_min_before + node_tol)) {
+        continue;
+      }
+
+      std::vector<MaxminAffineCorner> affines;
+      for (const MaxminCorner& corner : corners) {
+        if (maxmin_corner_contains_node(corner, node)) {
+          affines.push_back(maxmin_corner_affine(
+              corner, node, candidate_r, candidate_z));
+        }
+      }
+      TENRYU_ASSERT(!affines.empty(),
+                    "max-min rezone interior node has no corner constraints");
+
+      const double longest_edge = maxmin_longest_incident_edge(
+          node, node_cells, cell_node_offsets, cell_node_indices,
+          cell_nverts, candidate_r, candidate_z);
+      if (!(std::isfinite(longest_edge) && longest_edge > 0.0)) {
+        continue;
+      }
+      // STRUCTURAL bound: a repair node stays within four times its longest
+      // incident edge, so it cannot teleport beyond its own stencil scale.
+      const double half_width = 4.0 * longest_edge;
+      const double center_r = candidate_r[static_cast<std::size_t>(node)];
+      const double center_z = candidate_z[static_cast<std::size_t>(node)];
+      const std::vector<MaxminPoint> seed = {
+          {center_r - half_width, center_z - half_width},
+          {center_r + half_width, center_z - half_width},
+          {center_r + half_width, center_z + half_width},
+          {center_r - half_width, center_z + half_width},
+      };
+      if (!std::isfinite(cap)) {
+        const std::vector<MaxminPoint> radial_seed =
+            maxmin_clip_half_plane(seed, 1.0, 0.0, 0.0);
+        for (const MaxminAffineCorner& affine : affines) {
+          if (affine.flat_reference) {
+            continue;
+          }
+          double affine_max = -std::numeric_limits<double>::infinity();
+          for (const MaxminPoint& point : radial_seed) {
+            affine_max = std::max(
+                affine_max,
+                (affine.a_r * point.r + affine.a_z * point.z + affine.b) /
+                    affine.j_reference);
+          }
+          cap = std::min(cap, affine_max);
+        }
+      }
+      if (!(std::isfinite(cap) && cap > node_min_before + node_tol)) {
+        continue;
+      }
+
+      double lo = node_min_before;
+      double hi = cap;
+      std::vector<MaxminPoint> feasible;
+      for (int iteration = 0; iteration < 60; ++iteration) {
+        const double level = lo + 0.5 * (hi - lo);
+        if (maxmin_feasible_polygon(affines, seed, level, feasible)) {
+          lo = level;
+        } else {
+          hi = level;
+        }
+      }
+      if (!maxmin_feasible_polygon(affines, seed, lo, feasible) ||
+          feasible.empty()) {
+        continue;
+      }
+      MaxminPoint representative;
+      for (const MaxminPoint& point : feasible) {
+        representative.r += point.r;
+        representative.z += point.z;
+      }
+      representative.r = std::max(
+          0.0, representative.r / static_cast<double>(feasible.size()));
+      representative.z /= static_cast<double>(feasible.size());
+
+      const std::size_t node_index = static_cast<std::size_t>(node);
+      const double old_r = candidate_r[node_index];
+      const double old_z = candidate_z[node_index];
+      candidate_r[node_index] = representative.r;
+      candidate_z[node_index] = representative.z;
+      const double node_min_after = maxmin_node_local_minimum(
+          corners, node, candidate_r, candidate_z);
+      if (!(node_min_after > node_min_before + node_tol)) {
+        candidate_r[node_index] = old_r;
+        candidate_z[node_index] = old_z;
+      }
+    }
+
+    q_min_current =
+        maxmin_motif_minimum(corners, candidate_r, candidate_z);
+    ++sweeps;
+    const double sweep_tol =
+        64.0 * std::numeric_limits<double>::epsilon() *
+        std::max(1.0, std::abs(sweep_min_before));
+    last_sweep_improved = q_min_current > sweep_min_before + sweep_tol;
+    if (!last_sweep_improved) {
+      break;
+    }
+  }
+  if (sweeps == 64 && last_sweep_improved) {
+    core::log_warning(
+        "[maxmin-rezone] structural sweep cap reached for cell=" +
+        std::to_string(failing_cell));
+  }
+
+  double q_min_after =
+      maxmin_motif_minimum(corners, candidate_r, candidate_z);
+  const double improvement_tol =
+      64.0 * std::numeric_limits<double>::epsilon() *
+      std::max(1.0, std::abs(q_min_before));
+  if (!(q_min_after > q_min_before + improvement_tol)) {
+    std::ostringstream line;
+    line << std::scientific << std::setprecision(6)
+         << "[maxmin-rezone] no improvement for cell=" << failing_cell
+         << " (q_min=" << q_min_before << ")";
+    core::log_warning(line.str());
+    return out;
+  }
+
+  std::vector<double> delta_r(static_cast<std::size_t>(n_nodes), 0.0);
+  std::vector<double> delta_z(static_cast<std::size_t>(n_nodes), 0.0);
+  for (int node = 0; node < n_nodes; ++node) {
+    const std::size_t index = static_cast<std::size_t>(node);
+    delta_r[index] = candidate_r[index] - source_r[index];
+    delta_z[index] = candidate_z[index] - source_z[index];
+  }
+  core::DeviceArray<double> d_delta_r(static_cast<std::size_t>(n_nodes));
+  core::DeviceArray<double> d_delta_z(static_cast<std::size_t>(n_nodes));
+  core::DeviceArray<int> d_cell_id_stable(topology.cell_id_stable.size());
+  core::DeviceArray<int> d_cell_orientation_sign(
+      topology.cell_orientation_sign.size());
+  core::DeviceArray<std::uint8_t> d_cell_nverts(cell_nverts.size());
+  core::DeviceArray<std::uint8_t> d_reference_flat_corner(
+      reference_flat_corner.size());
+  core::DeviceArray<std::uint8_t> d_inactive_cell_mask;
+  const std::uint8_t* d_inactive_cell_mask_ptr = nullptr;
+  d_delta_r.copy_from_host(delta_r);
+  d_delta_z.copy_from_host(delta_z);
+  d_cell_id_stable.copy_from_host(topology.cell_id_stable);
+  d_cell_orientation_sign.copy_from_host(topology.cell_orientation_sign);
+  d_cell_nverts.copy_from_host(cell_nverts);
+  d_reference_flat_corner.copy_from_host(reference_flat_corner);
+  if (!state.hydro_active.empty()) {
+    std::vector<std::uint8_t> inactive_cell_mask(
+        static_cast<std::size_t>(n_cells), 0U);
+    for (int cell = 0; cell < n_cells; ++cell) {
+      if (!cell_is_active(cell)) {
+        inactive_cell_mask[static_cast<std::size_t>(cell)] = 1U;
+      }
+    }
+    d_inactive_cell_mask.reset(inactive_cell_mask.size());
+    d_inactive_cell_mask.copy_from_host(inactive_cell_mask);
+    d_inactive_cell_mask_ptr = d_inactive_cell_mask.data();
+  }
+
+  mesh::CandidateMeshAdmissibilityFloors floors;
+  floors.volume_rel = cfg.numerics.ale.reference_volume_floor_rel;
+  floors.corner_j_rel = cfg.numerics.ale.reference_corner_j_floor_rel;
+  floors.gauss_j_rel = cfg.numerics.ale.reference_gauss_j_floor_rel;
+  constexpr std::array<double, 5> backoff_scales = {
+      1.0, 0.5, 0.25, 0.125, 0.0625};
+  double accepted_scale = 0.0;
+  int backoff_tried = 0;
+  int first_bad_cell = -1;
+  bool found_admissible = false;
+  for (const double scale : backoff_scales) {
+    const mesh::CandidateMeshQuality candidate_quality =
+        mesh::evaluate_candidate_mesh_quality_csr(
+            state.x_r.data(),
+            state.x_z.data(),
+            d_delta_r.data(),
+            d_delta_z.data(),
+            scale,
+            n_cells,
+            state.corner_stride,
+            state.mesh.multiblock_cell_node_csr_offsets.data(),
+            state.mesh.multiblock_cell_node_csr_indices.data(),
+            d_cell_id_stable.data(),
+            d_cell_orientation_sign.data(),
+            floors,
+            d_cell_nverts.data(),
+            d_inactive_cell_mask_ptr,
+            nullptr,
+            0,
+            state.x_r_reference.data(),
+            state.x_z_reference.data(),
+            d_reference_flat_corner.data());
+    ++backoff_tried;
+    if (backoff_tried == 1) {
+      first_bad_cell = candidate_quality.first_bad_cell;
+    }
+    if (!candidate_quality.admissible()) {
+      continue;
+    }
+
+    std::vector<double> trial_r(static_cast<std::size_t>(n_nodes), 0.0);
+    std::vector<double> trial_z(static_cast<std::size_t>(n_nodes), 0.0);
+    for (int node = 0; node < n_nodes; ++node) {
+      const std::size_t index = static_cast<std::size_t>(node);
+      trial_r[index] = source_r[index] + scale * delta_r[index];
+      trial_z[index] = source_z[index] + scale * delta_z[index];
+    }
+    int exact_bad_cell = -1;
+    if (!maxmin_reference_flat_path_admissible(
+            motif_cells, cell_node_offsets, cell_node_indices, cell_nverts,
+            topology.cell_orientation_sign, initial_r, initial_z, source_r,
+            source_z, trial_r, trial_z, &exact_bad_cell)) {
+      if (first_bad_cell < 0) {
+        first_bad_cell = exact_bad_cell;
+      }
+      continue;
+    }
+    found_admissible = true;
+    const double trial_q_min =
+        maxmin_motif_minimum(corners, trial_r, trial_z);
+    if (trial_q_min > q_min_before) {
+      accepted_scale = scale;
+      q_min_after = trial_q_min;
+      candidate_r = std::move(trial_r);
+      candidate_z = std::move(trial_z);
+      break;
+    }
+  }
+  if (!(accepted_scale > 0.0) && found_admissible) {
+    std::ostringstream line;
+    line << std::scientific << std::setprecision(6)
+         << "[maxmin-rezone] no improvement for cell=" << failing_cell
+         << " (q_min=" << q_min_before << ")";
+    core::log_warning(line.str());
+    return out;
+  }
+  if (!(accepted_scale > 0.0)) {
+    core::log_warning(
+        "[maxmin-rezone] candidate inadmissible first_bad_cell=" +
+        std::to_string(first_bad_cell) +
+        " backoff_tried=" + std::to_string(backoff_tried));
+    return out;
+  }
+
+  std::vector<double> persistent_reference_r;
+  std::vector<double> persistent_reference_z;
+  std::vector<double> persistent_reference_volume;
+  state.x_r_reference.copy_to_host(persistent_reference_r);
+  state.x_z_reference.copy_to_host(persistent_reference_z);
+  state.cell_vol_initial.copy_to_host(persistent_reference_volume);
+  const std::vector<double> target_volume = maxmin_target_volumes(
+      candidate_r, candidate_z, cell_node_offsets, cell_node_indices,
+      cell_nverts, topology.cell_orientation_sign, state.hydro_active,
+      persistent_reference_volume);
+
+  RollbackGuard tx;
+  tx.capture(state, nullptr);
+  state.x_r_reference.copy_from_host(candidate_r.data());
+  state.x_z_reference.copy_from_host(candidate_z.data());
+  state.cell_vol_initial.copy_from_host(target_volume.data());
+  core::Config remap_cfg = cfg;
+  remap_cfg.numerics.ale.conservative_remap_enabled = true;
+  remap_cfg.numerics.ale.conservative_remap_target = "reference";
+  reset_remap_mass_closure_step_max();
+  const AleRemap2DRZResult remap_result =
+      ale_remap_2d_rz(state, remap_cfg, nullptr, 0.0);
+
+  state.x_r_reference.copy_from_host(persistent_reference_r.data());
+  state.x_z_reference.copy_from_host(persistent_reference_z.data());
+  state.cell_vol_initial.copy_from_host(persistent_reference_volume.data());
+  const double closure_tol = [] {
+    static const char* raw =
+        std::getenv("TENRYU_I1B_REMAP_CLOSURE_REJECT_TOL");
+    if (raw != nullptr && raw[0] != '\0') {
+      const double x = std::atof(raw);
+      return (std::isfinite(x) && x > 0.0) ? x : 0.0;
+    }
+    return -1.0;
+  }();
+  const double tol =
+      closure_tol >= 0.0
+          ? closure_tol
+          : cfg.numerics.ale.remap_mass_closure_reject_tol;
+  const bool closure_ok =
+      tol <= 0.0 || std::abs(remap_result.mass_closure_rel) <= tol;
+  if (!(remap_result.applied && closure_ok)) {
+    tx.restore(state, nullptr);
+    std::ostringstream line;
+    line << std::scientific << std::setprecision(6)
+         << "[maxmin-rezone] remap rejected applied="
+         << (remap_result.applied ? 1 : 0)
+         << " closure=" << remap_result.mass_closure_rel
+         << " tol=" << tol;
+    core::log_warning(line.str());
+    return out;
+  }
+  tx.accept();
+
+  out.applied = true;
+  out.rezone_triggered = true;
+  out.rezone_converged = true;
+  out.rezone_iterations = sweeps;
+  out.quality_min = q_min_after;
+  out.mass_floor_delta += remap_result.mass_floor_delta;
+  out.E_floor_injected += remap_result.E_floor_injected;
+  out.E_redistribution_unresolved +=
+      remap_result.E_redistribution_unresolved;
+  out.cap_energy_audit_D_K += remap_result.cap_energy_audit_D_K;
+  out.eta_contact_step = remap_result.eta_contact_step;
+  out.eta_contact_cumulative += remap_result.eta_contact_step;
+  out.i1b_ale_ke_sensor = remap_result.i1b_ale_ke_sensor;
+  out.accepted_remap_count = state.ale_remaps_applied;
+  out.remap_mass_closure_rel = remap_result.mass_closure_rel;
+  state.ale_rezoned = true;
+  ++state.ale_rezone_invocations;
+  state.ale_last_applied_step = state.step;
+  state.holo_ale_invalidated = true;
+
+  std::ostringstream line;
+  line << std::scientific << std::setprecision(6)
+       << "[maxmin-rezone] step=" << state.step
+       << " cell=" << failing_cell
+       << " q_min " << q_min_before << " -> " << q_min_after
+       << " interior=" << interior_nodes.size()
+       << " sweeps=" << sweeps << " committed";
+  core::log_info(line.str());
   return out;
 }
 
@@ -10576,6 +11866,1293 @@ bool rezone_closure_cooldown_active(const int step) {
   return step <= g_rezone_closure_cooldown_until_step;
 }
 
+namespace {
+
+class AxisCoreCandidateQualityContext {
+ public:
+  AxisCoreCandidateQualityContext(core::State& state,
+                                  const core::Config& cfg)
+      : state_(state),
+        n_cells_(state.mesh.topo.n_cells),
+        n_nodes_(state.mesh.topo.n_nodes),
+        d_delta_r_(static_cast<std::size_t>(n_nodes_)),
+        d_delta_z_(static_cast<std::size_t>(n_nodes_)),
+        d_cell_id_stable_(static_cast<std::size_t>(n_cells_)),
+        d_cell_orientation_sign_(static_cast<std::size_t>(n_cells_)),
+        cell_nverts_(
+            state.mesh.cell_nverts.empty()
+                ? std::vector<std::uint8_t>(
+                      static_cast<std::size_t>(n_cells_), 4U)
+                : state.mesh.cell_nverts),
+        d_cell_nverts_(cell_nverts_.size()) {
+    TENRYU_ASSERT(
+        state_.mesh.topo.multiblock.has_value(),
+        "axis-core quality evaluation requires multiblock topology");
+    const auto& topology = *state_.mesh.topo.multiblock;
+    TENRYU_ASSERT(
+        topology.cell_node_csr_offsets.size() ==
+                static_cast<std::size_t>(n_cells_) + 1U &&
+            topology.cell_id_stable.size() ==
+                static_cast<std::size_t>(n_cells_) &&
+            topology.cell_orientation_sign.size() ==
+                static_cast<std::size_t>(n_cells_),
+        "axis-core quality evaluation requires complete multiblock CSR "
+        "metadata");
+    TENRYU_ASSERT(
+        state_.mesh.cell_nverts.empty() ||
+            state_.mesh.cell_nverts.size() ==
+                static_cast<std::size_t>(n_cells_),
+        "axis-core quality evaluation cell_nverts size mismatch");
+    TENRYU_ASSERT(
+        state_.x_r_reference.size() == static_cast<std::size_t>(n_nodes_) &&
+            state_.x_z_reference.size() ==
+                static_cast<std::size_t>(n_nodes_),
+        "axis-core quality evaluation requires reference node storage");
+    d_cell_id_stable_.copy_from_host(topology.cell_id_stable);
+    d_cell_orientation_sign_.copy_from_host(
+        topology.cell_orientation_sign);
+    d_cell_nverts_.copy_from_host(cell_nverts_);
+    floors_.volume_rel = cfg.numerics.ale.reference_volume_floor_rel;
+    floors_.corner_j_rel = cfg.numerics.ale.reference_corner_j_floor_rel;
+    floors_.gauss_j_rel = cfg.numerics.ale.reference_gauss_j_floor_rel;
+  }
+
+  void upload_delta(const std::vector<double>& delta_r,
+                    const std::vector<double>& delta_z) {
+    TENRYU_ASSERT(
+        delta_r.size() == static_cast<std::size_t>(n_nodes_) &&
+            delta_z.size() == static_cast<std::size_t>(n_nodes_),
+        "axis-core candidate delta size mismatch");
+    d_delta_r_.copy_from_host(delta_r);
+    d_delta_z_.copy_from_host(delta_z);
+  }
+
+  mesh::CandidateMeshQuality evaluate(
+      const double sigma,
+      const std::uint8_t* d_inactive_cell_mask = nullptr) const {
+    return mesh::evaluate_candidate_mesh_quality_csr(
+        state_.x_r.data(),
+        state_.x_z.data(),
+        d_delta_r_.data(),
+        d_delta_z_.data(),
+        sigma,
+        n_cells_,
+        state_.corner_stride,
+        state_.mesh.multiblock_cell_node_csr_offsets.data(),
+        state_.mesh.multiblock_cell_node_csr_indices.data(),
+        d_cell_id_stable_.data(),
+        d_cell_orientation_sign_.data(),
+        floors_,
+        d_cell_nverts_.data(),
+        d_inactive_cell_mask,
+        nullptr,
+        0,
+        state_.x_r_reference.data(),
+        state_.x_z_reference.data());
+  }
+
+  const std::vector<std::uint8_t>& cell_nverts() const noexcept {
+    return cell_nverts_;
+  }
+
+ private:
+  core::State& state_;
+  int n_cells_ = 0;
+  int n_nodes_ = 0;
+  core::DeviceArray<double> d_delta_r_;
+  core::DeviceArray<double> d_delta_z_;
+  core::DeviceArray<int> d_cell_id_stable_;
+  core::DeviceArray<int> d_cell_orientation_sign_;
+  std::vector<std::uint8_t> cell_nverts_;
+  core::DeviceArray<std::uint8_t> d_cell_nverts_;
+  mesh::CandidateMeshAdmissibilityFloors floors_;
+};
+
+bool axis_core_quality_globally_admissible(
+    const mesh::CandidateMeshQuality& quality,
+    const parallel::Reduction* reduction) {
+  bool accepted = quality.admissible();
+  if (reduction != nullptr) {
+    accepted =
+        reduction->allreduce_min(
+            static_cast<std::uint64_t>(accepted ? 1U : 0U)) != 0U;
+  }
+  return accepted;
+}
+
+double axis_core_quality_global_min(
+    const mesh::CandidateMeshQuality& quality,
+    const parallel::Reduction* reduction) {
+  double q_now =
+      std::min({quality.min_rz_volume_rel,
+                quality.min_corner_j_rel,
+                quality.min_gauss_j_rel});
+  if (reduction != nullptr) {
+    q_now = reduction->allreduce_min(q_now);
+  }
+  return q_now;
+}
+
+double axis_core_largest_admissible_scale(
+    AxisCoreCandidateQualityContext& quality_context,
+    const parallel::Reduction* reduction,
+    const std::vector<double>& delta_r,
+    const std::vector<double>& delta_z) {
+  quality_context.upload_delta(delta_r, delta_z);
+  if (axis_core_quality_globally_admissible(
+          quality_context.evaluate(1.0), reduction)) {
+    return 1.0;
+  }
+  double sigma_admissible = 0.0;
+  double sigma_inadmissible = 1.0;
+  for (int iteration = 0; iteration < 8; ++iteration) {
+    const double sigma_mid =
+        0.5 * (sigma_admissible + sigma_inadmissible);
+    if (axis_core_quality_globally_admissible(
+            quality_context.evaluate(sigma_mid), reduction)) {
+      sigma_admissible = sigma_mid;
+    } else {
+      sigma_inadmissible = sigma_mid;
+    }
+  }
+  return sigma_admissible;
+}
+
+int axis_core_junction_ledger_cadence() {
+  static const int cadence = [] {
+    const char* raw = std::getenv("TENRYU_I1B_JUNCTION_LEDGER");
+    if (raw == nullptr || raw[0] == '\0') {
+      return 0;
+    }
+    char* end = nullptr;
+    const long value = std::strtol(raw, &end, 10);
+    return end != raw && value > 0 && value <= std::numeric_limits<int>::max()
+               ? static_cast<int>(value)
+               : 0;
+  }();
+  return cadence;
+}
+
+struct AxisCoreJunctionLedgerSample {
+  int belt_block_id = -1;
+  int cell = -1;
+  double volume_pre = std::numeric_limits<double>::quiet_NaN();
+  double mass_pre = std::numeric_limits<double>::quiet_NaN();
+  double internal_energy_pre = std::numeric_limits<double>::quiet_NaN();
+  double max_target_displacement = 0.0;
+};
+
+template <typename Field>
+double read_axis_core_junction_field(const Field& field, const int cell) {
+  if (cell < 0 || static_cast<std::size_t>(cell) >= field.size()) {
+    return std::numeric_limits<double>::quiet_NaN();
+  }
+  double value = std::numeric_limits<double>::quiet_NaN();
+  CUDA_CHECK(cudaMemcpy(&value,
+                        field.data() + cell,
+                        sizeof(double),
+                        cudaMemcpyDeviceToHost));
+  return value;
+}
+
+std::vector<AxisCoreJunctionLedgerSample>
+capture_axis_core_junction_ledger_pre(
+    const core::State& state,
+    const std::vector<AxisCoreJunctionLedgerCell>& entries,
+    const std::vector<double>& old_vol,
+    const std::vector<double>& delta_r,
+    const std::vector<double>& delta_z) {
+  const auto& topology = *state.mesh.topo.multiblock;
+  std::vector<AxisCoreJunctionLedgerSample> samples;
+  samples.reserve(entries.size());
+  for (const auto& entry : entries) {
+    AxisCoreJunctionLedgerSample sample;
+    sample.belt_block_id = entry.belt_block_id;
+    sample.cell = entry.cell;
+    if (entry.cell < 0 ||
+        static_cast<std::size_t>(entry.cell) >= old_vol.size() ||
+        static_cast<std::size_t>(entry.cell + 1) >=
+            topology.cell_node_csr_offsets.size()) {
+      samples.push_back(sample);
+      continue;
+    }
+    const std::size_t cell_index = static_cast<std::size_t>(entry.cell);
+    sample.volume_pre = old_vol[cell_index];
+    sample.mass_pre =
+        read_axis_core_junction_field(state.mass, entry.cell);
+    sample.internal_energy_pre =
+        read_axis_core_junction_field(state.ee, entry.cell) +
+        read_axis_core_junction_field(state.ei, entry.cell);
+    const int nverts = state.mesh.cell_nverts.empty()
+                           ? 4
+                           : static_cast<int>(
+                                 state.mesh.cell_nverts[cell_index]);
+    const int offset = topology.cell_node_csr_offsets[cell_index];
+    for (int local = 0; local < nverts; ++local) {
+      const int node = topology.cell_node_csr_indices[
+          static_cast<std::size_t>(offset + local)];
+      sample.max_target_displacement = std::max(
+          sample.max_target_displacement,
+          std::hypot(delta_r[static_cast<std::size_t>(node)],
+                     delta_z[static_cast<std::size_t>(node)]));
+    }
+    samples.push_back(sample);
+  }
+  return samples;
+}
+
+void log_axis_core_junction_ledger_post(
+    const core::State& state,
+    const std::vector<AxisCoreJunctionLedgerSample>& samples) {
+  for (const auto& sample : samples) {
+    const double volume_post =
+        read_axis_core_junction_field(state.vol, sample.cell);
+    const double mass_post =
+        read_axis_core_junction_field(state.mass, sample.cell);
+    const double internal_energy_post =
+        read_axis_core_junction_field(state.ee, sample.cell) +
+        read_axis_core_junction_field(state.ei, sample.cell);
+    const double volume_relative =
+        (volume_post - sample.volume_pre) / sample.volume_pre;
+    const double mass_relative =
+        (mass_post - sample.mass_pre) / sample.mass_pre;
+    const double energy_relative =
+        (internal_energy_post - sample.internal_energy_pre) /
+        sample.internal_energy_pre;
+    std::ostringstream message;
+    message << std::scientific << std::setprecision(17)
+            << "[junction-ledger] step=" << state.step + 1
+            << " belt=" << sample.belt_block_id
+            << " cell=" << sample.cell
+            << " dV=" << volume_relative
+            << " dm=" << mass_relative
+            << " de=" << energy_relative
+            << " maxdx=" << sample.max_target_displacement;
+    core::log_info(message.str());
+  }
+}
+
+void emit_axis_core_phase_event(
+    const core::State& state,
+    const parallel::PartitionInfo& part,
+    const double dt_hydro_used,
+    const phase_audit::EventKind kind,
+    const char* stage,
+    const char* producer,
+    const char* consumer,
+    const std::int64_t cell_or_unit = -1,
+    const bool static_state = false) {
+  if (part.rank != 0 || !phase_audit::enabled()) {
+    return;
+  }
+  phase_audit::Event event;
+  event.step = state.step + 1;
+  // v1 production emission is limited to a=0. The target deck disables
+  // full-step retry; plumbing the driver attempt into axis-core is deferred.
+  event.attempt = 0;
+  event.time = state.t + dt_hydro_used;
+  event.cell_or_unit = cell_or_unit;
+  event.stage = stage;
+  event.producer = producer;
+  event.consumer = consumer;
+  event.kind = kind;
+  event.static_state = static_state;
+  phase_audit::emit(event);
+}
+
+struct PrescribedTargetTransaction {
+  bool candidate_accepted = false;
+  double sigma_applied = 1.0;
+  AleStepResult step;
+};
+
+PrescribedTargetTransaction apply_prescribed_target_transaction(
+    core::State& state,
+    const core::Config& cfg,
+    const parallel::PartitionInfo& part,
+    const parallel::Reduction* reduction,
+    const HydroEOSContext* eos_ctx,
+    const double dt_hydro_used,
+    const std::vector<double>& target_r,
+    const std::vector<double>& target_z,
+    const bool collect_rejection_diagnostics = false,
+    const bool sigma_linesearch = false,
+    const bool junction_ledger_eligible = false,
+    const bool axis_core_transaction = false) {
+  PrescribedTargetTransaction result;
+  AleStepResult& out = result.step;
+  const int n_cells = state.mesh.topo.n_cells;
+  const int n_nodes = state.mesh.topo.n_nodes;
+  const bool has_multiblock_topology =
+      state.mesh.topo.multiblock.has_value();
+  TENRYU_ASSERT(
+      target_r.size() == static_cast<std::size_t>(n_nodes) &&
+          target_z.size() == static_cast<std::size_t>(n_nodes),
+      "prescribed-target ALE target size mismatch");
+  TENRYU_ASSERT(
+      state.x_r_reference.size() == static_cast<std::size_t>(n_nodes) &&
+          state.x_z_reference.size() ==
+              static_cast<std::size_t>(n_nodes),
+      "prescribed-target ALE requires reference node storage");
+  TENRYU_ASSERT(
+      state.cell_vol_initial.size() ==
+          static_cast<std::size_t>(n_cells),
+      "prescribed-target ALE requires reference volume storage");
+
+  if (has_multiblock_topology) {
+    const auto& topology = *state.mesh.topo.multiblock;
+    TENRYU_ASSERT(
+        topology.cell_node_csr_offsets.size() ==
+                static_cast<std::size_t>(n_cells) + 1U &&
+            topology.cell_id_stable.size() ==
+                static_cast<std::size_t>(n_cells) &&
+            topology.cell_orientation_sign.size() ==
+                static_cast<std::size_t>(n_cells),
+        "prescribed-target ALE requires complete multiblock CSR metadata");
+    TENRYU_ASSERT(
+        state.mesh.cell_nverts.empty() ||
+            state.mesh.cell_nverts.size() ==
+                static_cast<std::size_t>(n_cells),
+        "prescribed-target ALE cell_nverts size mismatch");
+  } else {
+    TENRYU_ASSERT(state.mesh.dim == 2,
+                  "prescribed-target single-block ALE requires a 2D mesh");
+    TENRYU_ASSERT(
+        n_cells == state.mesh.topo.nr * state.mesh.topo.nz,
+        "prescribed-target single-block ALE requires a structured lattice");
+    TENRYU_ASSERT(
+        state.mesh.topo.nr >= 5 && state.mesh.topo.nz >= 5,
+        "prescribed-target single-block ALE requires nr,nz >= 5");
+  }
+
+  static const int txn_diag_cell = [] {
+    const char* s = std::getenv("TENRYU_ALE_TXN_DIAG");
+    return s != nullptr ? std::atoi(s) : -1;
+  }();
+  static const bool txn_vth_diag = [] {
+    const char* s = std::getenv("TENRYU_ALE_TXN_VTH_DIAG");
+    return s != nullptr && s[0] != '\0' && s[0] != '0';
+  }();
+  static const bool txn_mesh_diag = [] {
+    const char* s = std::getenv("TENRYU_ALE_TXN_MESH_DIAG");
+    return s != nullptr && s[0] != '\0' && s[0] != '0';
+  }();
+  const auto dump_txn_diag = [&](const char* stage) {
+    if (txn_diag_cell < 0 || txn_diag_cell >= n_cells) {
+      return;
+    }
+    double mass = 0.0;
+    double vol = 0.0;
+    double rho = 0.0;
+    double ee = 0.0;
+    double ei = 0.0;
+    CUDA_CHECK(cudaMemcpy(&mass,
+                          state.mass.data() + txn_diag_cell,
+                          sizeof(double),
+                          cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(&vol,
+                          state.vol.data() + txn_diag_cell,
+                          sizeof(double),
+                          cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(&rho,
+                          state.rho.data() + txn_diag_cell,
+                          sizeof(double),
+                          cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(&ee,
+                          state.ee.data() + txn_diag_cell,
+                          sizeof(double),
+                          cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(&ei,
+                          state.ei.data() + txn_diag_cell,
+                          sizeof(double),
+                          cudaMemcpyDeviceToHost));
+    std::vector<double> corner_mass(
+        static_cast<std::size_t>(state.corner_stride), 0.0);
+    const std::size_t corner_offset =
+        static_cast<std::size_t>(txn_diag_cell) *
+        static_cast<std::size_t>(state.corner_stride);
+    for (int corner = 0; corner < state.corner_stride; ++corner) {
+      CUDA_CHECK(cudaMemcpy(
+          &corner_mass[static_cast<std::size_t>(corner)],
+          state.corner_mass.data() + corner_offset +
+              static_cast<std::size_t>(corner),
+          sizeof(double),
+          cudaMemcpyDeviceToHost));
+    }
+    std::ostringstream message;
+    message << std::scientific << std::setprecision(17)
+            << "[txn_diag] stage=" << stage
+            << " cell=" << txn_diag_cell
+            << " mass=" << mass
+            << " vol=" << vol
+            << " rho=" << rho
+            << " ee=" << ee
+            << " ei=" << ei
+            << " cm=<";
+    for (int corner = 0; corner < state.corner_stride; ++corner) {
+      if (corner != 0) {
+        message << ',';
+      }
+      message << corner_mass[static_cast<std::size_t>(corner)];
+    }
+    message << '>';
+    core::log_info(message.str());
+  };
+  const auto dump_vth = [&](const char* stage) {
+    if (!txn_vth_diag) {
+      return;
+    }
+    std::vector<double> x_r;
+    std::vector<double> x_z;
+    std::vector<double> v_r;
+    std::vector<double> v_z;
+    state.x_r.copy_to_host(x_r);
+    state.x_z.copy_to_host(x_z);
+    state.v_r.copy_to_host(v_r);
+    state.v_z.copy_to_host(v_z);
+    double max15 = 0.0;
+    double max35 = 0.0;
+    double maxin = 0.0;
+    double thin = 0.0;
+    std::size_t n15 = 0;
+    std::size_t n35 = 0;
+    int nin = -1;
+    for (int node = 0; node < n_nodes; ++node) {
+      const std::size_t index = static_cast<std::size_t>(node);
+      const double radius = std::hypot(x_r[index], x_z[index]);
+      const double theta =
+          std::atan2(std::fmax(x_r[index], 0.0), x_z[index]);
+      const double vth =
+          v_r[index] * std::cos(theta) - v_z[index] * std::sin(theta);
+      const double abs_vth = std::abs(vth);
+      if (radius > 3.0e-5 && radius < 1.5e-3 &&
+          (nin < 0 || abs_vth > maxin)) {
+        maxin = abs_vth;
+        nin = node;
+        thin = std::atan2(x_r[index], x_z[index]) * 180.0 /
+               3.14159265358979323846;
+      }
+      if (radius > 1.5e-3) {
+        max15 = std::max(max15, abs_vth);
+        if (abs_vth > 1.0e3) {
+          ++n15;
+        }
+      }
+      if (radius > 3.5e-3) {
+        max35 = std::max(max35, abs_vth);
+        if (abs_vth > 1.0e3) {
+          ++n35;
+        }
+      }
+    }
+    std::ostringstream message;
+    message << std::scientific << std::setprecision(3)
+            << "[txn_vth] stage=" << stage
+            << " max15=" << max15
+            << " n15=" << n15
+            << " max35=" << max35
+            << " n35=" << n35
+            << " maxin=" << maxin
+            << " nin=" << nin
+            << " thin=" << std::fixed << std::setprecision(2) << thin;
+    core::log_info(message.str());
+  };
+  dump_vth("entry");
+
+  const auto emit_transaction_event =
+      [&](const phase_audit::EventKind kind,
+          const char* stage,
+          const char* producer,
+          const char* consumer,
+          const std::int64_t cell_or_unit = -1) {
+        if (axis_core_transaction) {
+          emit_axis_core_phase_event(state,
+                                     part,
+                                     dt_hydro_used,
+                                     kind,
+                                     stage,
+                                     producer,
+                                     consumer,
+                                     cell_or_unit);
+        }
+      };
+  emit_transaction_event(phase_audit::EventKind::TargetBuilt,
+                         "target_build",
+                         "axis_core_target",
+                         "candidate_quality");
+
+  std::vector<double> source_r;
+  std::vector<double> source_z;
+  std::vector<double> old_vol;
+  std::vector<double> persistent_reference_r;
+  std::vector<double> persistent_reference_z;
+  std::vector<double> persistent_reference_vol;
+  state.x_r.copy_to_host(source_r);
+  state.x_z.copy_to_host(source_z);
+  state.vol.copy_to_host(old_vol);
+  state.x_r_reference.copy_to_host(persistent_reference_r);
+  state.x_z_reference.copy_to_host(persistent_reference_z);
+  state.cell_vol_initial.copy_to_host(persistent_reference_vol);
+  dump_txn_diag("pre");
+  emit_transaction_event(phase_audit::EventKind::Capture,
+                         "transaction_capture",
+                         "ale_driver",
+                         "rollback");
+
+  double delta_max = 0.0;
+  double L_domain = 0.0;
+  bool identity_metrics_finite = true;
+  for (int node = 0; node < n_nodes; ++node) {
+    const auto node_index = static_cast<std::size_t>(node);
+    const double target_delta =
+        std::hypot(target_r[node_index] - source_r[node_index],
+                   target_z[node_index] - source_z[node_index]);
+    const double domain_radius =
+        std::hypot(source_r[node_index], source_z[node_index]);
+    identity_metrics_finite = identity_metrics_finite &&
+                              std::isfinite(target_delta) &&
+                              std::isfinite(domain_radius);
+    delta_max = std::max(delta_max, target_delta);
+    L_domain = std::max(L_domain, domain_radius);
+  }
+  const double identity_floor =
+      128.0 * std::numeric_limits<double>::epsilon() * L_domain;
+  if (identity_metrics_finite && std::isfinite(identity_floor) &&
+      delta_max <= identity_floor) {
+    result.candidate_accepted = true;
+    out.status = AleStatus::Ok;
+    out.applied = false;
+    out.rezone_triggered = false;
+    out.rezone_converged = true;
+    out.min_V = 1.0;
+    out.min_J = 1.0;
+    out.max_target_displacement = 0.0;
+    out.energy_audit_ale_fallback = false;
+    out.accepted_remap_count = state.ale_remaps_applied;
+    emit_transaction_event(phase_audit::EventKind::Noop,
+                           "identity_short_circuit",
+                           "ale_driver",
+                           "state");
+    static bool identity_short_circuit_logged = false;
+    if (!identity_short_circuit_logged) {
+      identity_short_circuit_logged = true;
+      core::log_info(
+          "[ale-transaction] identity short-circuit engaged");
+    }
+    dump_txn_diag("post");
+    dump_vth("return_accept");
+    return result;
+  }
+
+  std::vector<double> delta_r(static_cast<std::size_t>(n_nodes), 0.0);
+  std::vector<double> delta_z(static_cast<std::size_t>(n_nodes), 0.0);
+  for (int node = 0; node < n_nodes; ++node) {
+    const auto node_index = static_cast<std::size_t>(node);
+    delta_r[node_index] = target_r[node_index] - source_r[node_index];
+    delta_z[node_index] = target_z[node_index] - source_z[node_index];
+  }
+
+  // Locality invariant: a prescribed-target transaction's velocity
+  // authority is its geometric support. A node's velocity may change
+  // only if it is incident to a cell whose geometry the transaction
+  // changes; every other node keeps its velocity bitwise. (Measured
+  // 2026-08-31: without this mask the remap's global velocity
+  // re-projection stamped a pole-concentrated tangential-velocity error
+  // field onto the whole mesh at every applied transaction.)
+  std::vector<std::uint8_t> moved_node(
+      static_cast<std::size_t>(n_nodes), 0U);
+  for (int p = 0; p < n_nodes; ++p) {
+    const auto k = static_cast<std::size_t>(p);
+    if (delta_r[k] != 0.0 || delta_z[k] != 0.0) {
+      moved_node[k] = 1U;
+    }
+  }
+  std::vector<std::uint8_t> allowed_velocity_node(
+      static_cast<std::size_t>(n_nodes), 0U);
+  if (has_multiblock_topology) {
+    const auto& topology = *state.mesh.topo.multiblock;
+    const auto& csr_off = topology.cell_node_csr_offsets;
+    const auto& csr_idx = topology.cell_node_csr_indices;
+    for (int c = 0; c < n_cells; ++c) {
+      bool cell_moved = false;
+      for (auto q = csr_off[static_cast<std::size_t>(c)];
+           q < csr_off[static_cast<std::size_t>(c) + 1U]; ++q) {
+        const auto node = csr_idx[static_cast<std::size_t>(q)];
+        if (node >= 0 && moved_node[static_cast<std::size_t>(node)] != 0U) {
+          cell_moved = true;
+          break;
+        }
+      }
+      if (!cell_moved) {
+        continue;
+      }
+      for (auto q = csr_off[static_cast<std::size_t>(c)];
+           q < csr_off[static_cast<std::size_t>(c) + 1U]; ++q) {
+        const auto node = csr_idx[static_cast<std::size_t>(q)];
+        if (node >= 0) {
+          allowed_velocity_node[static_cast<std::size_t>(node)] = 1U;
+        }
+      }
+    }
+  } else {
+    // Single-block structured lattice: cell (ci, cj) is incident to the
+    // four nodes of its quad; same locality invariant as the CSR path.
+    const int nr_cells = state.mesh.topo.nr;
+    const int nz_cells = state.mesh.topo.nz;
+    const int node_stride = nz_cells + 1;
+    for (int ci = 0; ci < nr_cells; ++ci) {
+      for (int cj = 0; cj < nz_cells; ++cj) {
+        const std::array<int, 4> quad_nodes = {
+            ci * node_stride + cj,
+            (ci + 1) * node_stride + cj,
+            (ci + 1) * node_stride + cj + 1,
+            ci * node_stride + cj + 1};
+        bool cell_moved = false;
+        for (const int node : quad_nodes) {
+          if (moved_node[static_cast<std::size_t>(node)] != 0U) {
+            cell_moved = true;
+            break;
+          }
+        }
+        if (!cell_moved) {
+          continue;
+        }
+        for (const int node : quad_nodes) {
+          allowed_velocity_node[static_cast<std::size_t>(node)] = 1U;
+        }
+      }
+    }
+  }
+
+  const std::vector<std::uint8_t> cell_nverts =
+      state.mesh.cell_nverts.empty()
+          ? std::vector<std::uint8_t>(
+                static_cast<std::size_t>(n_cells), 4U)
+          : state.mesh.cell_nverts;
+  core::DeviceArray<double> d_delta_r;
+  core::DeviceArray<double> d_delta_z;
+  core::DeviceArray<std::uint8_t> d_allowed_velocity_node_mask(
+      static_cast<std::size_t>(n_nodes));
+  core::DeviceArray<int> d_cell_id_stable;
+  core::DeviceArray<int> d_cell_orientation_sign;
+  core::DeviceArray<std::uint8_t> d_cell_nverts;
+  d_allowed_velocity_node_mask.copy_from_host(allowed_velocity_node);
+  if (has_multiblock_topology) {
+    const auto& topology = *state.mesh.topo.multiblock;
+    d_delta_r.reset(static_cast<std::size_t>(n_nodes));
+    d_delta_z.reset(static_cast<std::size_t>(n_nodes));
+    d_cell_id_stable.reset(topology.cell_id_stable.size());
+    d_cell_orientation_sign.reset(
+        topology.cell_orientation_sign.size());
+    d_cell_nverts.reset(cell_nverts.size());
+    d_delta_r.copy_from_host(delta_r);
+    dump_vth("post_delta_r_upload");
+    d_delta_z.copy_from_host(delta_z);
+    dump_vth("post_delta_z_upload");
+    d_cell_id_stable.copy_from_host(topology.cell_id_stable);
+    dump_vth("post_cell_id_stable_upload");
+    d_cell_orientation_sign.copy_from_host(
+        topology.cell_orientation_sign);
+    dump_vth("post_cell_orientation_sign_upload");
+    d_cell_nverts.copy_from_host(cell_nverts);
+    dump_vth("post_cell_nverts_upload");
+  }
+
+  mesh::CandidateMeshAdmissibilityFloors floors;
+  floors.volume_rel = cfg.numerics.ale.reference_volume_floor_rel;
+  floors.corner_j_rel =
+      cfg.numerics.ale.reference_corner_j_floor_rel;
+  floors.gauss_j_rel = cfg.numerics.ale.reference_gauss_j_floor_rel;
+  mesh::CandidateMeshQuality candidate_quality;
+  double sigma_accepted = 1.0;
+  bool accepted = false;
+  if (has_multiblock_topology) {
+    if (!sigma_linesearch) {
+      candidate_quality = mesh::evaluate_candidate_mesh_quality_csr(
+          state.x_r.data(),
+          state.x_z.data(),
+          d_delta_r.data(),
+          d_delta_z.data(),
+          1.0,
+          n_cells,
+          state.corner_stride,
+          state.mesh.multiblock_cell_node_csr_offsets.data(),
+          state.mesh.multiblock_cell_node_csr_indices.data(),
+          d_cell_id_stable.data(),
+          d_cell_orientation_sign.data(),
+          floors,
+          d_cell_nverts.data(),
+          nullptr,
+          nullptr,
+          0,
+          state.x_r_reference.data(),
+          state.x_z_reference.data());
+    } else {
+      const mesh::LineSearchResult ls =
+          mesh::linesearch_largest_admissible_sigma_csr(
+              state.x_r.data(),
+              state.x_z.data(),
+              d_delta_r.data(),
+              d_delta_z.data(),
+              /*sigma_init=*/1.0,
+              /*sigma_min=*/1.0 / 64.0,
+              /*max_iters=*/6,
+              n_cells,
+              state.corner_stride,
+              state.mesh.multiblock_cell_node_csr_offsets.data(),
+              state.mesh.multiblock_cell_node_csr_indices.data(),
+              d_cell_id_stable.data(),
+              d_cell_orientation_sign.data(),
+              floors,
+              d_cell_nverts.data(),
+              nullptr,
+              nullptr,
+              0,
+              state.x_r_reference.data(),
+              state.x_z_reference.data(),
+              /*refine_iters=*/48);
+      candidate_quality = ls.quality;
+      sigma_accepted = ls.sigma_accepted;
+    }
+    accepted = sigma_linesearch ? (sigma_accepted > 0.0)
+                                : candidate_quality.admissible();
+    if (reduction != nullptr) {
+      accepted =
+          reduction->allreduce_min(
+              static_cast<std::uint64_t>(accepted ? 1U : 0U)) != 0U;
+    }
+    if (sigma_linesearch && reduction != nullptr) {
+      sigma_accepted = reduction->allreduce_min(sigma_accepted);
+      accepted = accepted && sigma_accepted > 0.0;
+    }
+  } else {
+    // Single-block v1 has no linesearch, §18.6 item 5.
+    candidate_quality.min_rz_volume_rel =
+        std::numeric_limits<double>::infinity();
+    candidate_quality.min_corner_j_rel =
+        std::numeric_limits<double>::infinity();
+    candidate_quality.min_gauss_j_rel =
+        std::numeric_limits<double>::infinity();
+    const int nr = state.mesh.topo.nr;
+    const int nz = state.mesh.topo.nz;
+    const int stride = nz + 1;
+    for (int ci = 0; ci < nr; ++ci) {
+      for (int cj = 0; cj < nz; ++cj) {
+        const int cell = ci * nz + cj;
+        const std::array<int, 4> nodes = {
+            ci * stride + cj,
+            (ci + 1) * stride + cj,
+            (ci + 1) * stride + cj + 1,
+            ci * stride + cj + 1};
+        std::array<double, 4> source_cell_r{};
+        std::array<double, 4> source_cell_z{};
+        std::array<double, 4> candidate_cell_r{};
+        std::array<double, 4> candidate_cell_z{};
+        bool finite_coordinates = true;
+        for (int corner = 0; corner < 4; ++corner) {
+          const auto node =
+              static_cast<std::size_t>(nodes[static_cast<std::size_t>(corner)]);
+          source_cell_r[static_cast<std::size_t>(corner)] = source_r[node];
+          source_cell_z[static_cast<std::size_t>(corner)] = source_z[node];
+          candidate_cell_r[static_cast<std::size_t>(corner)] =
+              source_r[node] + delta_r[node];
+          candidate_cell_z[static_cast<std::size_t>(corner)] =
+              source_z[node] + delta_z[node];
+          finite_coordinates =
+              finite_coordinates &&
+              std::isfinite(candidate_cell_r[static_cast<std::size_t>(corner)]) &&
+              std::isfinite(candidate_cell_z[static_cast<std::size_t>(corner)]);
+        }
+
+        std::array<double, 4> source_j{};
+        std::array<double, 4> candidate_j{};
+        mesh::host_polygon_corner_jacobians(
+            source_cell_r.data(), source_cell_z.data(), 4, source_j.data());
+        mesh::host_polygon_corner_jacobians(
+            candidate_cell_r.data(), candidate_cell_z.data(), 4,
+            candidate_j.data());
+        bool corners_positive = true;
+        int first_bad_corner = -1;
+        double first_bad_corner_value = 0.0;
+        for (int corner = 0; corner < 4; ++corner) {
+          const double source_value =
+              source_j[static_cast<std::size_t>(corner)];
+          const double candidate_value =
+              candidate_j[static_cast<std::size_t>(corner)];
+          const double ratio =
+              std::isfinite(source_value) && source_value != 0.0 &&
+                      std::isfinite(candidate_value)
+                  ? candidate_value / source_value
+                  : -std::numeric_limits<double>::infinity();
+          candidate_quality.min_corner_j_rel =
+              std::min(candidate_quality.min_corner_j_rel, ratio);
+          if (!(std::isfinite(candidate_value) && candidate_value > 0.0)) {
+            corners_positive = false;
+            if (first_bad_corner < 0) {
+              first_bad_corner = corner;
+              first_bad_corner_value = candidate_value;
+            }
+          }
+        }
+
+        double source_area_cross_sum = 0.0;
+        double candidate_area_cross_sum = 0.0;
+        for (int corner = 0; corner < 4; ++corner) {
+          const int next = (corner + 1) & 3;
+          source_area_cross_sum +=
+              source_cell_r[static_cast<std::size_t>(corner)] *
+                  source_cell_z[static_cast<std::size_t>(next)] -
+              source_cell_r[static_cast<std::size_t>(next)] *
+                  source_cell_z[static_cast<std::size_t>(corner)];
+          candidate_area_cross_sum +=
+              candidate_cell_r[static_cast<std::size_t>(corner)] *
+                  candidate_cell_z[static_cast<std::size_t>(next)] -
+              candidate_cell_r[static_cast<std::size_t>(next)] *
+                  candidate_cell_z[static_cast<std::size_t>(corner)];
+        }
+        const double source_area = 0.5 * std::abs(source_area_cross_sum);
+        const double candidate_area =
+            0.5 * std::abs(candidate_area_cross_sum);
+        const double area_ratio =
+            std::isfinite(source_area) && source_area > 0.0 &&
+                    std::isfinite(candidate_area)
+                ? candidate_area / source_area
+                : -std::numeric_limits<double>::infinity();
+        candidate_quality.min_gauss_j_rel =
+            std::min(candidate_quality.min_gauss_j_rel, area_ratio);
+
+        const double candidate_volume =
+            tenryu::hydro::ale::detail::rz_signed_quad_volume(
+                candidate_cell_r[0], candidate_cell_z[0],
+                candidate_cell_r[1], candidate_cell_z[1],
+                candidate_cell_r[2], candidate_cell_z[2],
+                candidate_cell_r[3], candidate_cell_z[3]);
+        const double old_volume = old_vol[static_cast<std::size_t>(cell)];
+        const double volume_ratio =
+            std::isfinite(candidate_volume) &&
+                    std::isfinite(old_volume) && old_volume > 0.0
+                ? candidate_volume / old_volume
+                : -std::numeric_limits<double>::infinity();
+        candidate_quality.min_rz_volume_rel =
+            std::min(candidate_quality.min_rz_volume_rel, volume_ratio);
+
+        mesh::MeshGeometryFailureKind failure_kind =
+            mesh::MeshGeometryFailureKind::None;
+        double failure_value = 0.0;
+        if (!finite_coordinates) {
+          failure_kind = mesh::MeshGeometryFailureKind::NonFiniteNodeCoordinate;
+        } else if (!corners_positive) {
+          failure_kind = std::isfinite(first_bad_corner_value)
+                             ? mesh::MeshGeometryFailureKind::NonPositiveCellArea
+                             : mesh::MeshGeometryFailureKind::NonFiniteCellArea;
+          failure_value = first_bad_corner_value;
+        } else if (!(std::isfinite(candidate_area) && candidate_area > 0.0)) {
+          failure_kind = std::isfinite(candidate_area)
+                             ? mesh::MeshGeometryFailureKind::NonPositiveCellArea
+                             : mesh::MeshGeometryFailureKind::NonFiniteCellArea;
+          failure_value = candidate_area;
+        } else if (!std::isfinite(candidate_volume)) {
+          failure_kind = mesh::MeshGeometryFailureKind::NonFiniteCellVolume;
+          failure_value = candidate_volume;
+        } else if (!(std::isfinite(old_volume) && old_volume > 0.0) ||
+                   !(candidate_volume >= floors.volume_rel * old_volume)) {
+          failure_kind = mesh::MeshGeometryFailureKind::NonPositiveCellVolume;
+          failure_value = candidate_volume;
+        }
+        if (candidate_quality.first_bad_cell < 0 &&
+            failure_kind != mesh::MeshGeometryFailureKind::None) {
+          candidate_quality.first_bad_cell = cell;
+          candidate_quality.first_bad_stable_cell = cell;
+          candidate_quality.first_bad_corner = first_bad_corner;
+          candidate_quality.kind = failure_kind;
+          candidate_quality.failing_value = failure_value;
+        }
+      }
+    }
+    accepted = candidate_quality.admissible();
+    sigma_accepted = 1.0;
+    if (reduction != nullptr) {
+      accepted =
+          reduction->allreduce_min(
+              static_cast<std::uint64_t>(accepted ? 1U : 0U)) != 0U;
+    }
+  }
+  emit_transaction_event(phase_audit::EventKind::QualityEval,
+                         "candidate_quality",
+                         "candidate_quality",
+                         "ale_driver",
+                         candidate_quality.first_bad_cell);
+
+  result.candidate_accepted = accepted;
+  result.sigma_applied =
+      (accepted && sigma_linesearch && has_multiblock_topology)
+          ? sigma_accepted
+          : 1.0;
+  out.rezone_triggered = accepted;
+  out.rezone_converged = accepted;
+  out.quality_min =
+      std::min({candidate_quality.min_rz_volume_rel,
+                candidate_quality.min_corner_j_rel,
+                candidate_quality.min_gauss_j_rel});
+  out.energy_audit_ale_fallback = !accepted;
+  if (!has_multiblock_topology) {
+    out.quality_min = candidate_quality.min_rz_volume_rel;
+    out.first_failing_cell = candidate_quality.first_bad_cell;
+    out.geometry_failure_kind = candidate_quality.kind;
+    out.first_failing_corner = candidate_quality.first_bad_corner;
+    out.first_failing_stable_cell =
+        candidate_quality.first_bad_stable_cell;
+    out.failing_cell_area = candidate_quality.failing_value;
+    out.min_V = candidate_quality.min_rz_volume_rel;
+    out.min_J = candidate_quality.min_corner_j_rel;
+  }
+  if (collect_rejection_diagnostics && !accepted &&
+      has_multiblock_topology) {
+    const auto& topology = *state.mesh.topo.multiblock;
+    const mesh::CandidateMeshQuality post_lagrange_quality =
+        mesh::evaluate_candidate_mesh_quality_csr(
+            state.x_r.data(),
+            state.x_z.data(),
+            d_delta_r.data(),
+            d_delta_z.data(),
+            0.0,
+            n_cells,
+            state.corner_stride,
+            state.mesh.multiblock_cell_node_csr_offsets.data(),
+            state.mesh.multiblock_cell_node_csr_indices.data(),
+            d_cell_id_stable.data(),
+            d_cell_orientation_sign.data(),
+            floors,
+            d_cell_nverts.data(),
+            nullptr,
+            nullptr,
+            0,
+            state.x_r_reference.data(),
+            state.x_z_reference.data());
+    out.fails_without_target = !post_lagrange_quality.admissible();
+    if (reduction != nullptr) {
+      out.fails_without_target =
+          reduction->allreduce_min(static_cast<std::uint64_t>(
+              out.fails_without_target ? 0U : 1U)) == 0U;
+    }
+    const mesh::CandidateMeshQuality& failure_quality =
+        out.fails_without_target ? post_lagrange_quality : candidate_quality;
+    std::uint64_t first_failing_cell =
+        failure_quality.first_bad_cell >= 0
+            ? static_cast<std::uint64_t>(failure_quality.first_bad_cell)
+            : std::numeric_limits<std::uint64_t>::max();
+    double min_v = candidate_quality.min_rz_volume_rel;
+    double min_j = std::min(candidate_quality.min_corner_j_rel,
+                            candidate_quality.min_gauss_j_rel);
+    if (reduction != nullptr) {
+      first_failing_cell = reduction->allreduce_min(first_failing_cell);
+      min_v = reduction->allreduce_min(min_v);
+      min_j = reduction->allreduce_min(min_j);
+    }
+    out.first_failing_cell =
+        first_failing_cell == std::numeric_limits<std::uint64_t>::max()
+            ? -1
+            : static_cast<int>(first_failing_cell);
+    out.geometry_failure_kind = failure_quality.kind;
+    out.first_failing_corner = failure_quality.first_bad_corner;
+    out.first_failing_stable_cell =
+        failure_quality.first_bad_stable_cell;
+    out.failing_cell_area = failure_quality.failing_value;
+    out.min_V = min_v;
+    out.min_J = min_j;
+    if (out.first_failing_cell >= 0 && out.first_failing_cell < n_cells) {
+      const int cell = out.first_failing_cell;
+      const int nverts =
+          static_cast<int>(cell_nverts[static_cast<std::size_t>(cell)]);
+      out.rejection_corner_count =
+          std::min(nverts, AleStepResult::kMaxRejectionCorners);
+      const int offset = topology.cell_node_csr_offsets[
+          static_cast<std::size_t>(cell)];
+      for (int local = 0; local < out.rejection_corner_count; ++local) {
+        const int node = topology.cell_node_csr_indices[
+            static_cast<std::size_t>(offset + local)];
+        const std::size_t node_index = static_cast<std::size_t>(node);
+        out.rejection_corner_nodes[static_cast<std::size_t>(local)] = node;
+        out.rejection_corner_candidate_r[static_cast<std::size_t>(local)] =
+            source_r[node_index] + delta_r[node_index];
+        out.rejection_corner_candidate_z[static_cast<std::size_t>(local)] =
+            source_z[node_index] + delta_z[node_index];
+        out.max_target_displacement = std::max(
+            out.max_target_displacement,
+            std::hypot(delta_r[node_index], delta_z[node_index]));
+      }
+      if (reduction != nullptr) {
+        out.max_target_displacement =
+            reduction->allreduce_max(out.max_target_displacement);
+      }
+    }
+  }
+  if (!accepted) {
+    emit_transaction_event(phase_audit::EventKind::Reject,
+                           "candidate_decision",
+                           "candidate_quality",
+                           "ale_driver",
+                           candidate_quality.first_bad_cell);
+    emit_transaction_event(phase_audit::EventKind::Rollback,
+                           "candidate_rollback",
+                           "ale_driver",
+                           "state");
+    record_estep_trace_boundary(state,
+                                cfg,
+                                part,
+                                reduction,
+                                "post_rezone_pre_remap",
+                                dt_hydro_used,
+                                state.t + dt_hydro_used);
+    record_estep_trace_boundary(state,
+                                cfg,
+                                part,
+                                reduction,
+                                "post_remap",
+                                dt_hydro_used,
+                                state.t + dt_hydro_used);
+    dump_txn_diag("post");
+    dump_vth("return_reject");
+    return result;
+  }
+  emit_transaction_event(phase_audit::EventKind::Accept,
+                         "candidate_decision",
+                         "candidate_quality",
+                         "ale_driver");
+
+  const int junction_ledger_every = axis_core_junction_ledger_cadence();
+  const bool junction_ledger_due =
+      junction_ledger_eligible && junction_ledger_every > 0 &&
+      part.rank == 0 &&
+      ((state.ale_remaps_applied + 1) % junction_ledger_every) == 0;
+  std::vector<AxisCoreJunctionLedgerSample> junction_ledger_pre;
+  if (junction_ledger_due) {
+    junction_ledger_pre = capture_axis_core_junction_ledger_pre(
+        state,
+        axis_core_disk_junction_ledger_cells(state),
+        old_vol,
+        delta_r,
+        delta_z);
+  }
+
+  std::vector<double> applied_target_r;
+  std::vector<double> applied_target_z;
+  const std::vector<double>* use_target_r = &target_r;
+  const std::vector<double>* use_target_z = &target_z;
+  if (sigma_linesearch && accepted && sigma_accepted < 1.0) {
+    applied_target_r.resize(static_cast<std::size_t>(n_nodes));
+    applied_target_z.resize(static_cast<std::size_t>(n_nodes));
+    for (int node = 0; node < n_nodes; ++node) {
+      const auto k = static_cast<std::size_t>(node);
+      applied_target_r[k] = source_r[k] + sigma_accepted * delta_r[k];
+      applied_target_z[k] = source_z[k] + sigma_accepted * delta_z[k];
+    }
+    use_target_r = &applied_target_r;
+    use_target_z = &applied_target_z;
+  }
+
+  state.x_r.copy_from_host(*use_target_r);
+  dump_vth("post_target_x_r_upload");
+  state.x_z.copy_from_host(*use_target_z);
+  dump_vth("post_target_x_z_upload");
+  state.x_r_reference.copy_from_host(*use_target_r);
+  dump_vth("post_target_x_r_reference_upload");
+  state.x_z_reference.copy_from_host(*use_target_z);
+  dump_vth("post_target_x_z_reference_upload");
+  state.mesh.recompute_geometry();
+  dump_vth("post_target_geometry_recompute");
+  state.vol = state.mesh.cell_vol;
+  dump_vth("post_target_vol_upload");
+  state.cell_vol_initial.copy_from_host(state.mesh.cell_vol);
+  dump_vth("post_target_cell_vol_initial_upload");
+  ale_velcoherence::sample(state, cfg, "s1_post_rezone");
+  record_estep_trace_boundary(state,
+                              cfg,
+                              part,
+                              reduction,
+                              "post_rezone_pre_remap",
+                              dt_hydro_used,
+                              state.t + dt_hydro_used);
+
+  state.x_r.copy_from_host(source_r);
+  dump_vth("post_source_x_r_restore");
+  state.x_z.copy_from_host(source_z);
+  dump_vth("post_source_x_z_restore");
+  state.vol.copy_from_host(old_vol);
+  dump_vth("post_source_vol_restore");
+  core::Config remap_cfg = cfg;
+  remap_cfg.numerics.ale.conservative_remap_enabled = true;
+  remap_cfg.numerics.ale.conservative_remap_target = "reference";
+  AleRemap2DRZOverrides remap_overrides;
+  // Every accepted sigma > 0 preserves delta's nonzero moved-node set.
+  remap_overrides.active_node_velocity_mask =
+      d_allowed_velocity_node_mask.data();
+  remap_overrides.allow_table_eos_closure = true;
+  if (axis_core_transaction) {
+    remap_overrides.donor_fallback_cell_mask =
+        axis_core_disk_seam_donor_cell_mask(state);
+  }
+  const auto remap_result =
+      ale_remap_2d_rz(
+          state,
+          remap_cfg,
+          eos_ctx,
+          dt_hydro_used,
+          nullptr,
+          remap_overrides);
+  dump_vth("post_remap");
+  record_estep_trace_boundary(state,
+                              cfg,
+                              part,
+                              reduction,
+                              "post_remap",
+                              dt_hydro_used,
+                              state.t + dt_hydro_used);
+  out.applied = remap_result.applied;
+  out.mass_floor_delta += remap_result.mass_floor_delta;
+  out.E_floor_injected += remap_result.E_floor_injected;
+  out.E_redistribution_unresolved +=
+      remap_result.E_redistribution_unresolved;
+  out.cap_energy_audit_D_K += remap_result.cap_energy_audit_D_K;
+  out.eta_contact_step = remap_result.eta_contact_step;
+  out.eta_contact_cumulative += remap_result.eta_contact_step;
+  out.i1b_ale_ke_sensor = remap_result.i1b_ale_ke_sensor;
+  out.accepted_remap_count = state.ale_remaps_applied;
+  out.remap_mass_closure_rel = remap_result.mass_closure_rel;
+  if (out.applied) {
+    emit_transaction_event(phase_audit::EventKind::RemapApply,
+                           "remap_apply",
+                           "ale_remap_2d_rz",
+                           "ale_driver");
+  }
+  state.x_r_reference.copy_from_host(persistent_reference_r);
+  dump_vth("post_x_r_reference_restore");
+  state.x_z_reference.copy_from_host(persistent_reference_z);
+  dump_vth("post_x_z_reference_restore");
+  state.cell_vol_initial.copy_from_host(persistent_reference_vol);
+  dump_vth("post_cell_vol_initial_restore");
+  if (out.applied) {
+    state.ale_rezoned = true;
+    ++state.ale_rezone_invocations;
+    state.ale_last_applied_step = state.step;
+    state.holo_ale_invalidated = true;
+    if (junction_ledger_due) {
+      log_axis_core_junction_ledger_post(state, junction_ledger_pre);
+    }
+    // One COMMIT represents the atomic accepted geometry install and state
+    // application. No separate geometry-patch mutation event is emitted.
+    emit_transaction_event(phase_audit::EventKind::Commit,
+                           "transaction_commit",
+                           "ale_driver",
+                           "state");
+  } else {
+    state.x_r.copy_from_host(source_r);
+    dump_vth("post_rollback_x_r");
+    state.x_z.copy_from_host(source_z);
+    dump_vth("post_rollback_x_z");
+    state.vol.copy_from_host(old_vol);
+    dump_vth("post_rollback_vol");
+    state.mesh.recompute_geometry();
+    dump_vth("post_rollback_geometry_recompute");
+    state.vol = state.mesh.cell_vol;
+    dump_vth("post_rollback_mesh_vol_upload");
+    if (remap_result.table_closure_rejected) {
+      emit_transaction_event(phase_audit::EventKind::Reject,
+                             "table_eos_closure",
+                             "ale_remap_2d_rz",
+                             "ale_driver");
+    }
+    emit_transaction_event(phase_audit::EventKind::Reject,
+                           "remap_decision",
+                           "ale_remap_2d_rz",
+                           "ale_driver");
+    emit_transaction_event(phase_audit::EventKind::Rollback,
+                           "remap_rollback",
+                           "ale_driver",
+                           "state");
+  }
+  if (txn_mesh_diag) {
+    std::vector<double> exit_r;
+    std::vector<double> exit_z;
+    state.x_r.copy_to_host(exit_r);
+    state.x_z.copy_to_host(exit_z);
+    int moved = 0;
+    double d_max = 0.0;
+    double s_min = std::numeric_limits<double>::infinity();
+    double s_max = 0.0;
+    // 0.25 um radius bins, cgs: 2.5e-5 cm
+    std::map<int, std::pair<int, double>> bins;  // bin -> (count, max_d)
+    for (int node = 0; node < n_nodes; ++node) {
+      const auto k = static_cast<std::size_t>(node);
+      const double d = std::hypot(exit_r[k] - source_r[k],
+                                  exit_z[k] - source_z[k]);
+      if (!(d > 1.0e-12)) {
+        continue;
+      }
+      ++moved;
+      d_max = std::max(d_max, d);
+      const double s = std::hypot(source_r[k], source_z[k]);
+      s_min = std::min(s_min, s);
+      s_max = std::max(s_max, s);
+      auto& bin = bins[static_cast<int>(s / 2.5e-5)];
+      ++bin.first;
+      bin.second = std::max(bin.second, d);
+    }
+    std::ostringstream mesh_log;
+    mesh_log << "[txn-mesh] applied=" << (out.applied ? 1 : 0)
+             << " moved_nodes=" << moved
+             << std::scientific << std::setprecision(3)
+             << " d_max_cm=" << d_max;
+    if (moved > 0) {
+      mesh_log << " s_range_um=" << s_min * 1.0e4 << ".." << s_max * 1.0e4;
+    }
+    core::log_info(mesh_log.str());
+    for (const auto& entry : bins) {
+      std::ostringstream bin_log;
+      bin_log << "[txn-mesh-bin] s_um="
+              << std::fixed << std::setprecision(2)
+              << entry.first * 0.25
+              << " n=" << entry.second.first
+              << std::scientific << std::setprecision(3)
+              << " max_d_cm=" << entry.second.second;
+      core::log_info(bin_log.str());
+    }
+  }
+  dump_txn_diag("post");
+  dump_vth(out.applied ? "return_accept" : "return_reject");
+  return result;
+}
+
+void merge_prescribed_target_step(AleStepResult& destination,
+                                  const AleStepResult& source,
+                                  const bool first) {
+  if (first) {
+    destination = source;
+    return;
+  }
+  destination.applied = destination.applied || source.applied;
+  destination.rezone_triggered =
+      destination.rezone_triggered || source.rezone_triggered;
+  destination.rezone_converged =
+      destination.rezone_converged && source.rezone_converged;
+  destination.quality_min =
+      std::min(destination.quality_min, source.quality_min);
+  destination.energy_audit_ale_fallback =
+      destination.energy_audit_ale_fallback ||
+      source.energy_audit_ale_fallback;
+  destination.mass_floor_delta += source.mass_floor_delta;
+  destination.E_floor_injected += source.E_floor_injected;
+  destination.E_redistribution_unresolved +=
+      source.E_redistribution_unresolved;
+  destination.cap_energy_audit_D_K += source.cap_energy_audit_D_K;
+  destination.eta_contact_step += source.eta_contact_step;
+  destination.eta_contact_cumulative += source.eta_contact_cumulative;
+  destination.i1b_ale_ke_sensor = source.i1b_ale_ke_sensor;
+  destination.accepted_remap_count = source.accepted_remap_count;
+}
+
+}  // namespace
+
 AleStepResult apply_multiblock_csr_ale_step(
     core::State& state,
     const core::Config& cfg,
@@ -10587,13 +13164,32 @@ AleStepResult apply_multiblock_csr_ale_step(
     const char* force_reason) {
   (void)force_reason;
   AleStepResult out;
+  const bool euler_window_mode_active =
+      cfg.numerics.ale.euler_window.enabled ||
+      !cfg.numerics.ale.euler_windows.empty();
+  const bool axis_core_mode_active =
+      cfg.numerics.ale.euler_window.enabled &&
+      cfg.numerics.ale.euler_window.role == "axis_survival_core";
+  const bool axis_core_always_moving_mode =
+      axis_core_mode_active &&
+      cfg.numerics.ale.euler_window.axis_core_transaction_mode ==
+          "always_moving";
+  const bool axis_core_clearance_replay_mode =
+      axis_core_mode_active &&
+      cfg.numerics.ale.euler_window.axis_core_transaction_mode ==
+          "clearance_replay";
+  const bool axis_core_moving_target_mode =
+      axis_core_always_moving_mode || axis_core_clearance_replay_mode;
+  const bool band_ale_mode_active =
+      cfg.numerics.ale.band_ale.enabled;
   TENRYU_ASSERT(
       state.corner_stride == 4 ||
           ((cfg.numerics.ale.rezone_solver == "m1_tmop" ||
-            cfg.numerics.ale.euler_window.enabled) &&
+            euler_window_mode_active ||
+            band_ale_mode_active) &&
            state.corner_stride == 8),
       "corner_stride must be 4, except stride 8 for belt M1 or "
-      "Eulerian-window ALE");
+      "prescribed-target ALE");
   if (!mesh::mesh_topo_is_multiblock(cfg.mesh) || state.mesh.dim != 2 ||
       !cfg.numerics.ale.enabled) {
     return out;
@@ -10606,11 +13202,728 @@ AleStepResult apply_multiblock_csr_ale_step(
   if (n_cells <= 0 || n_nodes <= 0) {
     return out;
   }
-  if (try_apply_axis_rezone(
+  AxisCoreTransitionPassageStep transition_passage_step;
+  if (axis_core_mode_active &&
+      cfg.numerics.ale.euler_window.axis_core_transition_passage_enabled) {
+    transition_passage_step = axis_core_transition_passage_update(
+        state, state.t + dt_hydro_used, part.rank == 0, reduction);
+  }
+  const bool transition_passage_active =
+      !transition_passage_step.passage_patches.empty();
+  bool transition_passage_handled = false;
+  if (transition_passage_active) {
+    emit_axis_core_phase_event(state,
+                               part,
+                               dt_hydro_used,
+                               phase_audit::EventKind::TriggerEval,
+                               "trigger_eval",
+                               "transition_passage",
+                               "axis_core_target",
+                               -1,
+                               false);
+    AxisCoreCandidateQualityContext quality_context(state, cfg);
+    if (axis_core_moving_target_mode) {
+      const mesh::CandidateMeshQuality current_quality =
+          quality_context.evaluate(1.0);
+      emit_axis_core_phase_event(state,
+                                 part,
+                                 dt_hydro_used,
+                                 phase_audit::EventKind::QualityEval,
+                                 "current_quality",
+                                 "candidate_quality",
+                                 "transition_passage",
+                                 current_quality.first_bad_cell);
+      const bool current_admissible =
+          axis_core_quality_globally_admissible(current_quality, reduction);
+      if (!current_admissible) {
+        emit_axis_core_phase_event(state,
+                                   part,
+                                   dt_hydro_used,
+                                   phase_audit::EventKind::Reject,
+                                   "current_quality_decision",
+                                   "candidate_quality",
+                                   "ale_driver",
+                                   current_quality.first_bad_cell);
+        emit_axis_core_phase_event(state,
+                                   part,
+                                   dt_hydro_used,
+                                   phase_audit::EventKind::Abort,
+                                   "terminal_abort",
+                                   "ale_driver",
+                                   "driver");
+        out.rezone_triggered = false;
+        out.rezone_converged = false;
+        out.quality_min =
+            axis_core_quality_global_min(current_quality, reduction);
+        out.energy_audit_ale_fallback = true;
+        std::uint64_t first_failing_cell =
+            current_quality.first_bad_cell >= 0
+                ? static_cast<std::uint64_t>(current_quality.first_bad_cell)
+                : std::numeric_limits<std::uint64_t>::max();
+        double min_v = current_quality.min_rz_volume_rel;
+        double min_j = std::min(current_quality.min_corner_j_rel,
+                                current_quality.min_gauss_j_rel);
+        if (reduction != nullptr) {
+          first_failing_cell = reduction->allreduce_min(first_failing_cell);
+          min_v = reduction->allreduce_min(min_v);
+          min_j = reduction->allreduce_min(min_j);
+        }
+        out.first_failing_cell =
+            first_failing_cell == std::numeric_limits<std::uint64_t>::max()
+                ? -1
+                : static_cast<int>(first_failing_cell);
+        out.geometry_failure_kind = current_quality.kind;
+        out.first_failing_corner = current_quality.first_bad_corner;
+        out.first_failing_stable_cell =
+            current_quality.first_bad_stable_cell;
+        out.failing_cell_area = current_quality.failing_value;
+        out.fails_without_target = true;
+        out.min_V = min_v;
+        out.min_J = min_j;
+        if (out.first_failing_cell >= 0 && out.first_failing_cell < n_cells) {
+          std::vector<double> candidate_r;
+          std::vector<double> candidate_z;
+          state.x_r.copy_to_host(candidate_r);
+          state.x_z.copy_to_host(candidate_z);
+          const auto& topology = *state.mesh.topo.multiblock;
+          const int cell = out.first_failing_cell;
+          const int nverts = static_cast<int>(
+              quality_context.cell_nverts()[static_cast<std::size_t>(cell)]);
+          out.rejection_corner_count =
+              std::min(nverts, AleStepResult::kMaxRejectionCorners);
+          const int offset = topology.cell_node_csr_offsets[
+              static_cast<std::size_t>(cell)];
+          for (int local = 0; local < out.rejection_corner_count; ++local) {
+            const int node = topology.cell_node_csr_indices[
+                static_cast<std::size_t>(offset + local)];
+            const std::size_t local_index = static_cast<std::size_t>(local);
+            const std::size_t node_index = static_cast<std::size_t>(node);
+            out.rejection_corner_nodes[local_index] = node;
+            out.rejection_corner_candidate_r[local_index] =
+                candidate_r[node_index];
+            out.rejection_corner_candidate_z[local_index] =
+                candidate_z[node_index];
+          }
+        }
+        record_estep_trace_boundary(state,
+                                    cfg,
+                                    part,
+                                    reduction,
+                                    "post_rezone_pre_remap",
+                                    dt_hydro_used,
+                                    state.t + dt_hydro_used);
+        record_estep_trace_boundary(state,
+                                    cfg,
+                                    part,
+                                    reduction,
+                                    "post_remap",
+                                    dt_hydro_used,
+                                    state.t + dt_hydro_used);
+        out.status = AleStatus::MandatoryWindowTransactionRejected;
+        record_estep_trace_boundary(state,
+                                    cfg,
+                                    part,
+                                    reduction,
+                                    "step_end",
+                                    dt_hydro_used,
+                                    state.t + dt_hydro_used);
+        return out;
+      }
+    }
+
+    std::vector<double> lagrangian_r;
+    std::vector<double> lagrangian_z;
+    std::vector<double> normal_target_r;
+    std::vector<double> normal_target_z;
+    double clearance_sigma = 1.0;
+    if (axis_core_clearance_replay_mode) {
+      core_clearance_controller_build_active_target(
+          state,
+          state.step + 1,
+          state.t,
+          dt_hydro_used,
+          lagrangian_r,
+          lagrangian_z,
+          normal_target_r,
+          normal_target_z);
+      std::vector<double> clearance_delta_r(
+          static_cast<std::size_t>(n_nodes), 0.0);
+      std::vector<double> clearance_delta_z(
+          static_cast<std::size_t>(n_nodes), 0.0);
+      for (int node = 0; node < n_nodes; ++node) {
+        const std::size_t node_index = static_cast<std::size_t>(node);
+        clearance_delta_r[node_index] =
+            normal_target_r[node_index] - lagrangian_r[node_index];
+        clearance_delta_z[node_index] =
+            normal_target_z[node_index] - lagrangian_z[node_index];
+      }
+      clearance_sigma = axis_core_largest_admissible_scale(
+          quality_context,
+          reduction,
+          clearance_delta_r,
+          clearance_delta_z);
+      if (clearance_sigma != 1.0) {
+        for (int node = 0; node < n_nodes; ++node) {
+          const std::size_t node_index = static_cast<std::size_t>(node);
+          normal_target_r[node_index] =
+              lagrangian_r[node_index] +
+              clearance_sigma * clearance_delta_r[node_index];
+          normal_target_z[node_index] =
+              lagrangian_z[node_index] +
+              clearance_sigma * clearance_delta_z[node_index];
+        }
+      }
+    } else if (axis_core_always_moving_mode) {
+      axis_core_disk_build_moving_target(state,
+                                         lagrangian_r,
+                                         lagrangian_z,
+                                         normal_target_r,
+                                         normal_target_z);
+    } else {
+      state.x_r.copy_to_host(lagrangian_r);
+      state.x_z.copy_to_host(lagrangian_z);
+      axis_core_disk_build_target(
+          state, normal_target_r, normal_target_z);
+    }
+    std::vector<double> target_r = normal_target_r;
+    std::vector<double> target_z = normal_target_z;
+    axis_core_transition_passage_prepare_optimal_targets(state);
+    for (const auto& patch_step :
+         transition_passage_step.passage_patches) {
+      axis_core_transition_passage_compose_patch_target(
+          patch_step.patch_index,
+          0.0,
+          lagrangian_r,
+          lagrangian_z,
+          normal_target_r,
+          normal_target_z,
+          target_r,
+          target_z);
+    }
+
+    constexpr std::array<double, 9> alpha_ladder{{
+        1.0,
+        0.5,
+        0.25,
+        0.125,
+        0.0625,
+        0.03125,
+        0.015625,
+        0.0078125,
+        0.00390625,
+    }};
+    std::vector<double> delta_r(static_cast<std::size_t>(n_nodes), 0.0);
+    std::vector<double> delta_z(static_cast<std::size_t>(n_nodes), 0.0);
+    for (const auto& patch_step :
+         transition_passage_step.passage_patches) {
+      double accepted_alpha = 0.0;
+      for (const double alpha : alpha_ladder) {
+        axis_core_transition_passage_compose_patch_target(
+            patch_step.patch_index,
+            alpha,
+            lagrangian_r,
+            lagrangian_z,
+            normal_target_r,
+            normal_target_z,
+            target_r,
+            target_z);
+        for (int node = 0; node < n_nodes; ++node) {
+          const std::size_t node_index = static_cast<std::size_t>(node);
+          delta_r[node_index] =
+              target_r[node_index] - lagrangian_r[node_index];
+          delta_z[node_index] =
+              target_z[node_index] - lagrangian_z[node_index];
+        }
+        quality_context.upload_delta(delta_r, delta_z);
+        const mesh::CandidateMeshQuality candidate_quality =
+            quality_context.evaluate(
+                1.0,
+                axis_core_transition_passage_inactive_cell_mask(
+                    state, patch_step.patch_index));
+        if (!axis_core_quality_globally_admissible(
+                candidate_quality, reduction)) {
+          continue;
+        }
+        double max_swept_fraction =
+            axis_core_transition_passage_max_swept_fraction(
+                state, patch_step.patch_index, target_r, target_z);
+        if (reduction != nullptr) {
+          max_swept_fraction =
+              reduction->allreduce_max(max_swept_fraction);
+        }
+        if (max_swept_fraction <= 0.25) {
+          accepted_alpha = alpha;
+          break;
+        }
+      }
+      if (accepted_alpha == 0.0) {
+        axis_core_transition_passage_compose_patch_target(
+            patch_step.patch_index,
+            0.0,
+            lagrangian_r,
+            lagrangian_z,
+            normal_target_r,
+            normal_target_z,
+            target_r,
+            target_z);
+      }
+      axis_core_transition_passage_record_alpha(
+          patch_step.patch_index,
+          accepted_alpha,
+          state.step + 1,
+          state.t + dt_hydro_used,
+          part.rank == 0);
+    }
+
+    const PrescribedTargetTransaction transaction =
+        apply_prescribed_target_transaction(state,
+                                            cfg,
+                                            part,
+                                            reduction,
+                                            eos_ctx,
+                                            dt_hydro_used,
+                                            target_r,
+                                            target_z,
+                                            true,
+                                            false,
+                                            true,
+                                            true);
+    out = transaction.step;
+    if (!transaction.candidate_accepted) {
+      out.status = AleStatus::MandatoryWindowTransactionRejected;
+      record_estep_trace_boundary(state,
+                                  cfg,
+                                  part,
+                                  reduction,
+                                  "step_end",
+                                  dt_hydro_used,
+                                  state.t + dt_hydro_used);
+      return out;
+    }
+    if (axis_core_clearance_replay_mode) {
+      core_clearance_controller_record_active_accept(
+          state,
+          state.step + 1,
+          state.t + dt_hydro_used,
+          dt_hydro_used,
+          clearance_sigma);
+    }
+    transition_passage_handled = true;
+    if (!band_ale_mode_active) {
+      record_estep_trace_boundary(state,
+                                  cfg,
+                                  part,
+                                  reduction,
+                                  "step_end",
+                                  dt_hydro_used,
+                                  state.t + dt_hydro_used);
+      return out;
+    }
+  }
+  if (axis_core_moving_target_mode && !transition_passage_handled) {
+    AxisCoreCandidateQualityContext quality_context(state, cfg);
+    const mesh::CandidateMeshQuality current_quality =
+        quality_context.evaluate(1.0);
+    const bool current_admissible =
+        axis_core_quality_globally_admissible(current_quality, reduction);
+    const double q_now =
+        axis_core_quality_global_min(current_quality, reduction);
+    emit_axis_core_phase_event(state,
+                               part,
+                               dt_hydro_used,
+                               phase_audit::EventKind::QualityEval,
+                               "current_quality",
+                               "candidate_quality",
+                               "axis_core_trigger",
+                               current_quality.first_bad_cell);
+    if (!current_admissible) {
+      emit_axis_core_phase_event(state,
+                                 part,
+                                 dt_hydro_used,
+                                 phase_audit::EventKind::TriggerEval,
+                                 "trigger_eval",
+                                 "axis_core_trigger",
+                                 "axis_core_target",
+                                 -1,
+                                 true);
+      emit_axis_core_phase_event(state,
+                                 part,
+                                 dt_hydro_used,
+                                 phase_audit::EventKind::Reject,
+                                 "current_quality_decision",
+                                 "candidate_quality",
+                                 "ale_driver",
+                                 current_quality.first_bad_cell);
+      emit_axis_core_phase_event(state,
+                                 part,
+                                 dt_hydro_used,
+                                 phase_audit::EventKind::Abort,
+                                 "terminal_abort",
+                                 "ale_driver",
+                                 "driver");
+      out.rezone_triggered = false;
+      out.rezone_converged = false;
+      out.quality_min = q_now;
+      out.energy_audit_ale_fallback = true;
+      std::uint64_t first_failing_cell =
+          current_quality.first_bad_cell >= 0
+              ? static_cast<std::uint64_t>(current_quality.first_bad_cell)
+              : std::numeric_limits<std::uint64_t>::max();
+      double min_v = current_quality.min_rz_volume_rel;
+      double min_j = std::min(current_quality.min_corner_j_rel,
+                              current_quality.min_gauss_j_rel);
+      if (reduction != nullptr) {
+        first_failing_cell = reduction->allreduce_min(first_failing_cell);
+        min_v = reduction->allreduce_min(min_v);
+        min_j = reduction->allreduce_min(min_j);
+      }
+      out.first_failing_cell =
+          first_failing_cell == std::numeric_limits<std::uint64_t>::max()
+              ? -1
+              : static_cast<int>(first_failing_cell);
+      out.geometry_failure_kind = current_quality.kind;
+      out.first_failing_corner = current_quality.first_bad_corner;
+      out.first_failing_stable_cell =
+          current_quality.first_bad_stable_cell;
+      out.failing_cell_area = current_quality.failing_value;
+      out.fails_without_target = true;
+      out.min_V = min_v;
+      out.min_J = min_j;
+      if (out.first_failing_cell >= 0 && out.first_failing_cell < n_cells) {
+        std::vector<double> candidate_r;
+        std::vector<double> candidate_z;
+        state.x_r.copy_to_host(candidate_r);
+        state.x_z.copy_to_host(candidate_z);
+        const auto& topology = *state.mesh.topo.multiblock;
+        const int cell = out.first_failing_cell;
+        const int nverts = static_cast<int>(
+            quality_context.cell_nverts()[static_cast<std::size_t>(cell)]);
+        out.rejection_corner_count =
+            std::min(nverts, AleStepResult::kMaxRejectionCorners);
+        const int offset = topology.cell_node_csr_offsets[
+            static_cast<std::size_t>(cell)];
+        for (int local = 0; local < out.rejection_corner_count; ++local) {
+          const int node = topology.cell_node_csr_indices[
+              static_cast<std::size_t>(offset + local)];
+          const std::size_t local_index = static_cast<std::size_t>(local);
+          const std::size_t node_index = static_cast<std::size_t>(node);
+          out.rejection_corner_nodes[local_index] = node;
+          out.rejection_corner_candidate_r[local_index] =
+              candidate_r[node_index];
+          out.rejection_corner_candidate_z[local_index] =
+              candidate_z[node_index];
+        }
+      }
+      record_estep_trace_boundary(state,
+                                  cfg,
+                                  part,
+                                  reduction,
+                                  "post_rezone_pre_remap",
+                                  dt_hydro_used,
+                                  state.t + dt_hydro_used);
+      record_estep_trace_boundary(state,
+                                  cfg,
+                                  part,
+                                  reduction,
+                                  "post_remap",
+                                  dt_hydro_used,
+                                  state.t + dt_hydro_used);
+      out.status = AleStatus::MandatoryWindowTransactionRejected;
+      record_estep_trace_boundary(state,
+                                  cfg,
+                                  part,
+                                  reduction,
+                                  "step_end",
+                                  dt_hydro_used,
+                                  state.t + dt_hydro_used);
+      return out;
+    }
+
+    if (axis_core_clearance_replay_mode) {
+      emit_axis_core_phase_event(state,
+                                 part,
+                                 dt_hydro_used,
+                                 phase_audit::EventKind::TriggerEval,
+                                 "trigger_eval",
+                                 "axis_core_trigger",
+                                 "axis_core_target");
+      std::vector<double> lagrangian_r;
+      std::vector<double> lagrangian_z;
+      std::vector<double> target_r;
+      std::vector<double> target_z;
+      core_clearance_controller_build_active_target(
+          state,
+          state.step + 1,
+          state.t,
+          dt_hydro_used,
+          lagrangian_r,
+          lagrangian_z,
+          target_r,
+          target_z);
+      std::vector<double> delta_r(static_cast<std::size_t>(n_nodes), 0.0);
+      std::vector<double> delta_z(static_cast<std::size_t>(n_nodes), 0.0);
+      for (int node = 0; node < n_nodes; ++node) {
+        const std::size_t node_index = static_cast<std::size_t>(node);
+        delta_r[node_index] =
+            target_r[node_index] - lagrangian_r[node_index];
+        delta_z[node_index] =
+            target_z[node_index] - lagrangian_z[node_index];
+      }
+      const double sigma = axis_core_largest_admissible_scale(
+          quality_context, reduction, delta_r, delta_z);
+      if (sigma != 1.0) {
+        for (int node = 0; node < n_nodes; ++node) {
+          const std::size_t node_index = static_cast<std::size_t>(node);
+          target_r[node_index] =
+              lagrangian_r[node_index] + sigma * delta_r[node_index];
+          target_z[node_index] =
+              lagrangian_z[node_index] + sigma * delta_z[node_index];
+        }
+      }
+      const PrescribedTargetTransaction transaction =
+          apply_prescribed_target_transaction(
+              state,
+              cfg,
+              part,
+              reduction,
+              eos_ctx,
+              dt_hydro_used,
+              target_r,
+              target_z,
+              true,
+              false,
+              true,
+              true);
+      out = transaction.step;
+      if (!transaction.candidate_accepted) {
+        out.status = AleStatus::MandatoryWindowTransactionRejected;
+        record_estep_trace_boundary(state,
+                                    cfg,
+                                    part,
+                                    reduction,
+                                    "step_end",
+                                    dt_hydro_used,
+                                    state.t + dt_hydro_used);
+        return out;
+      }
+      core_clearance_controller_record_active_accept(
+          state,
+          state.step + 1,
+          state.t + dt_hydro_used,
+          dt_hydro_used,
+          sigma);
+    } else {
+      const AxisCoreFollowRepairDecision decision =
+          axis_core_disk_select_always_moving();
+      emit_axis_core_phase_event(state,
+                                 part,
+                                 dt_hydro_used,
+                                 phase_audit::EventKind::TriggerEval,
+                                 "trigger_eval",
+                                 "axis_core_trigger",
+                                 "axis_core_target",
+                                 -1,
+                                 !decision.repair);
+      if (!decision.repair) {
+        emit_axis_core_phase_event(state,
+                                   part,
+                                   dt_hydro_used,
+                                   phase_audit::EventKind::Noop,
+                                   "static_noop",
+                                   "axis_core_trigger",
+                                   "state");
+        out.rezone_triggered = true;
+        out.rezone_converged = true;
+        out.quality_min = q_now;
+        out.accepted_remap_count = state.ale_remaps_applied;
+        ale_velcoherence::sample(state, cfg, "s1_post_rezone");
+        record_estep_trace_boundary(state,
+                                    cfg,
+                                    part,
+                                    reduction,
+                                    "post_rezone_pre_remap",
+                                    dt_hydro_used,
+                                    state.t + dt_hydro_used);
+        record_estep_trace_boundary(state,
+                                    cfg,
+                                    part,
+                                    reduction,
+                                    "post_remap",
+                                    dt_hydro_used,
+                                    state.t + dt_hydro_used);
+      } else {
+        std::vector<double> lagrangian_r;
+        std::vector<double> lagrangian_z;
+        std::vector<double> target_r;
+        std::vector<double> target_z;
+        const double alpha = axis_core_disk_build_moving_target(
+            state,
+            lagrangian_r,
+            lagrangian_z,
+            target_r,
+            target_z);
+        std::vector<double> delta_r(static_cast<std::size_t>(n_nodes), 0.0);
+        std::vector<double> delta_z(static_cast<std::size_t>(n_nodes), 0.0);
+        for (int node = 0; node < n_nodes; ++node) {
+          const std::size_t node_index = static_cast<std::size_t>(node);
+          delta_r[node_index] =
+              target_r[node_index] - lagrangian_r[node_index];
+          delta_z[node_index] =
+              target_z[node_index] - lagrangian_z[node_index];
+        }
+        quality_context.upload_delta(delta_r, delta_z);
+        double sigma = 1.0;
+        mesh::CandidateMeshQuality repair_quality =
+            quality_context.evaluate(sigma);
+        if (!axis_core_quality_globally_admissible(
+                repair_quality, reduction)) {
+          double sigma_admissible = 0.0;
+          double sigma_inadmissible = 1.0;
+          for (int iteration = 0; iteration < 8; ++iteration) {
+            const double sigma_mid =
+                0.5 * (sigma_admissible + sigma_inadmissible);
+            repair_quality = quality_context.evaluate(sigma_mid);
+            if (axis_core_quality_globally_admissible(
+                    repair_quality, reduction)) {
+              sigma_admissible = sigma_mid;
+            } else {
+              sigma_inadmissible = sigma_mid;
+            }
+          }
+          sigma = sigma_admissible;
+        }
+        if (sigma == 0.0) {
+          target_r = lagrangian_r;
+          target_z = lagrangian_z;
+        } else if (sigma != 1.0) {
+          for (int node = 0; node < n_nodes; ++node) {
+            const std::size_t node_index = static_cast<std::size_t>(node);
+            target_r[node_index] =
+                delta_r[node_index] == 0.0
+                    ? lagrangian_r[node_index]
+                    : lagrangian_r[node_index] + sigma * delta_r[node_index];
+            target_z[node_index] =
+                delta_z[node_index] == 0.0
+                    ? lagrangian_z[node_index]
+                    : lagrangian_z[node_index] + sigma * delta_z[node_index];
+          }
+        }
+        const PrescribedTargetTransaction transaction =
+            apply_prescribed_target_transaction(
+                state,
+                cfg,
+                part,
+                reduction,
+                eos_ctx,
+                dt_hydro_used,
+                target_r,
+                target_z,
+                true,
+                false,
+                axis_core_always_moving_mode,
+                true);
+        out = transaction.step;
+        if (part.rank == 0) {
+          std::ostringstream message;
+          message << std::scientific << std::setprecision(17)
+                  << "[axis-core-repair] step=" << state.step + 1
+                  << " q_now=" << q_now
+                  << " alpha=" << alpha
+                  << " sigma=" << sigma;
+          core::log_info(message.str());
+        }
+        if (!transaction.candidate_accepted) {
+          out.status = AleStatus::MandatoryWindowTransactionRejected;
+          record_estep_trace_boundary(state,
+                                      cfg,
+                                      part,
+                                      reduction,
+                                      "step_end",
+                                      dt_hydro_used,
+                                      state.t + dt_hydro_used);
+          return out;
+        }
+      }
+      if (part.rank == 0 && ((state.step + 1) % 500LL) == 0LL) {
+        std::ostringstream message;
+        message << std::scientific << std::setprecision(17)
+                << "[axis-core-follow] step=" << state.step + 1
+                << " follows=" << decision.follow_count
+                << " repairs=" << decision.repair_count
+                << " q_now=" << q_now;
+        core::log_info(message.str());
+      }
+    }
+    if (!band_ale_mode_active) {
+      record_estep_trace_boundary(state,
+                                  cfg,
+                                  part,
+                                  reduction,
+                                  "step_end",
+                                  dt_hydro_used,
+                                  state.t + dt_hydro_used);
+      return out;
+    }
+  }
+  if (axis_core_mode_active && !axis_core_moving_target_mode &&
+      !transition_passage_handled) {
+    emit_axis_core_phase_event(state,
+                               part,
+                               dt_hydro_used,
+                               phase_audit::EventKind::TriggerEval,
+                               "trigger_eval",
+                               "axis_core_trigger",
+                               "axis_core_target",
+                               -1,
+                               false);
+    std::vector<double> target_r;
+    std::vector<double> target_z;
+    axis_core_disk_build_target(state, target_r, target_z);
+    const PrescribedTargetTransaction transaction =
+        apply_prescribed_target_transaction(
+            state,
+            cfg,
+            part,
+            reduction,
+            eos_ctx,
+            dt_hydro_used,
+            target_r,
+            target_z,
+            true,
+            false,
+            true,
+            true);
+    out = transaction.step;
+    if (!transaction.candidate_accepted) {
+      out.status = AleStatus::MandatoryWindowTransactionRejected;
+      record_estep_trace_boundary(state,
+                                  cfg,
+                                  part,
+                                  reduction,
+                                  "step_end",
+                                  dt_hydro_used,
+                                  state.t + dt_hydro_used);
+      return out;
+    }
+    if (out.applied) {
+      axis_core_disk_assert_plateau(state);
+    }
+    if (!band_ale_mode_active) {
+      record_estep_trace_boundary(state,
+                                  cfg,
+                                  part,
+                                  reduction,
+                                  "step_end",
+                                  dt_hydro_used,
+                                  state.t + dt_hydro_used);
+      return out;
+    }
+  }
+  if (!axis_core_mode_active && try_apply_axis_rezone(
           state, cfg, part, reduction, eos_ctx, dt_hydro_used, out)) {
     return out;
   }
-  {
+  if (!axis_core_mode_active) {
     const auto morph = tenryu::hydro::button_morph::apply_button_morph_if_due(
         state, cfg, state.t + dt_hydro_used, state.step);
     if (morph.attempted) {
@@ -10636,8 +13949,11 @@ AleStepResult apply_multiblock_csr_ale_step(
       cfg.numerics.ale.every_n_steps <= 1 ||
       (state.step % cfg.numerics.ale.every_n_steps) == 0;
   const std::uint64_t reference_barrier_trigger_mask =
-      tenryu::hydro::evaluate_reference_barrier_trigger(state, cfg);
-  if (!force_rezone && !ale_cadence_due && reference_barrier_trigger_mask == 0) {
+      axis_core_mode_active
+          ? 0U
+          : tenryu::hydro::evaluate_reference_barrier_trigger(state, cfg);
+  if (!axis_core_mode_active && !force_rezone && !ale_cadence_due &&
+      reference_barrier_trigger_mask == 0 && !band_ale_mode_active) {
     record_estep_trace_boundary(state,
                                 cfg,
                                 part,
@@ -10662,7 +13978,7 @@ AleStepResult apply_multiblock_csr_ale_step(
     return out;
   }
 
-  if (reference_barrier_trigger_mask != 0) {
+  if (!axis_core_mode_active && reference_barrier_trigger_mask != 0) {
     double* d_target_r = nullptr;
     double* d_target_z = nullptr;
     const std::size_t node_bytes =
@@ -10725,7 +14041,181 @@ AleStepResult apply_multiblock_csr_ale_step(
     return out;
   }
 
-  if (cfg.numerics.ale.euler_window.enabled) {
+  if (band_ale_mode_active) {
+    const bool ba_energy_closure =
+        cfg.numerics.ale.band_ale.transaction_energy_closure_enabled;
+    const std::vector<band_ale::ActiveBand> active_bands =
+        band_ale::begin_step(state, cfg, reduction, part.rank);
+    bool first_transaction = !axis_core_mode_active;
+    for (const auto& active_band : active_bands) {
+      const int max_bites =
+          cfg.numerics.ale.band_ale.closure_catchment_max_bites;
+      for (int bite = 0; bite < max_bites; ++bite) {
+        std::vector<double> target_r;
+        std::vector<double> target_z;
+        band_ale::build_target(
+            state, cfg, active_band.index, target_r, target_z);
+        std::vector<double> cm_pre;
+        std::vector<double> v_r_pre;
+        std::vector<double> v_z_pre;
+        if (ba_energy_closure) {
+          state.corner_mass.copy_to_host(cm_pre);
+          state.v_r.copy_to_host(v_r_pre);
+          state.v_z.copy_to_host(v_z_pre);
+        }
+        const PrescribedTargetTransaction transaction =
+            apply_prescribed_target_transaction(
+                state,
+                cfg,
+                part,
+                reduction,
+                eos_ctx,
+                dt_hydro_used,
+                target_r,
+                target_z,
+                /*collect_rejection_diagnostics=*/
+                    band_ale::is_closure_catchment(active_band.index),
+                cfg.numerics.ale.band_ale.sigma_linesearch_enabled);
+        if (part.rank == 0) {
+          std::ostringstream ledger;
+          ledger << "[band-ale-ledger] band=" << active_band.name
+                 << " step=" << state.step + 1
+                 << " t=" << std::scientific << std::setprecision(6)
+                 << state.t + dt_hydro_used;
+          if (max_bites > 1) {
+            ledger << " bite=" << bite;
+          }
+          ledger << " applied=" << (transaction.step.applied ? 1 : 0)
+                 << " sigma=" << std::fixed << std::setprecision(6)
+                 << transaction.sigma_applied
+                 << " mass_closure_rel=" << std::scientific
+                 << transaction.step.remap_mass_closure_rel
+                 << " E_floor=" << transaction.step.E_floor_injected
+                 << " pole_theta="
+                 << (band_ale::pole_theta_composed_last_build() ? 1 : 0);
+          if (!transaction.candidate_accepted &&
+              band_ale::is_closure_catchment(active_band.index)) {
+            ledger << " reject_kind="
+                   << static_cast<int>(
+                          transaction.step.geometry_failure_kind)
+                   << " first_cell=" << transaction.step.first_failing_cell
+                   << " first_stable="
+                   << transaction.step.first_failing_stable_cell
+                   << " fails_without_target="
+                   << (transaction.step.fails_without_target ? 1 : 0)
+                   << " qmin=" << transaction.step.quality_min;
+          }
+          core::log_info(ledger.str());
+        }
+        if (ba_energy_closure && transaction.candidate_accepted) {
+          std::vector<double> cm_post;
+          state.corner_mass.copy_to_host(cm_post);
+          ale::ke_fixup_apply_deposit(state,
+                                      cm_pre,
+                                      cm_post,
+                                      v_r_pre,
+                                      v_z_pre,
+                                      state.corner_stride,
+                                      /*chi_override=*/1.0,
+                                      /*full_ke_residual=*/true,
+                                      /*global_deposit=*/true);
+        }
+        merge_prescribed_target_step(
+            out, transaction.step, first_transaction);
+        first_transaction = false;
+        if (!transaction.candidate_accepted) {
+          band_ale::record_inadmissible(active_band.index);
+        } else if (transaction.sigma_applied < 1.0) {
+          band_ale::record_partial_sigma(active_band.index,
+                                         transaction.sigma_applied);
+        }
+        if (transaction.candidate_accepted) {
+          band_ale::note_pole_theta_consumed();
+        }
+        if (!transaction.candidate_accepted ||
+            !band_ale::wants_reapply(active_band.index)) {
+          break;
+        }
+      }
+    }
+    if (active_bands.empty() && !axis_core_mode_active) {
+      record_estep_trace_boundary(state,
+                                  cfg,
+                                  part,
+                                  reduction,
+                                  "post_rezone_pre_remap",
+                                  dt_hydro_used,
+                                  state.t + dt_hydro_used);
+      record_estep_trace_boundary(state,
+                                  cfg,
+                                  part,
+                                  reduction,
+                                  "post_remap",
+                                  dt_hydro_used,
+                                  state.t + dt_hydro_used);
+    }
+    record_estep_trace_boundary(state,
+                                cfg,
+                                part,
+                                reduction,
+                                "step_end",
+                                dt_hydro_used,
+                                state.t + dt_hydro_used);
+    return out;
+  }
+
+  if (euler_window_mode_active) {
+    std::vector<EulerWindowSpec> active_specs;
+    active_specs.reserve(
+        cfg.numerics.ale.euler_windows.size() + 1U);
+    const auto append_if_active = [&](const auto& config) {
+      if (!config.enabled || state.t < config.t_on_s ||
+          (config.t_off_s >= 0.0 && state.t >= config.t_off_s)) {
+        return;
+      }
+      active_specs.push_back(EulerWindowSpec{
+          config.shape == "annulus"
+              ? EulerWindowSpec::Shape::Annulus
+              : EulerWindowSpec::Shape::Rectangle,
+          config.r0,
+          config.r1,
+          config.z0,
+          config.z1,
+          config.cr,
+          config.cz,
+          config.rad_in,
+          config.rad_out,
+          config.transition_width});
+    };
+    append_if_active(cfg.numerics.ale.euler_window);
+    for (const auto& config : cfg.numerics.ale.euler_windows) {
+      append_if_active(config);
+    }
+    if (active_specs.empty()) {
+      record_estep_trace_boundary(state,
+                                  cfg,
+                                  part,
+                                  reduction,
+                                  "post_rezone_pre_remap",
+                                  dt_hydro_used,
+                                  state.t + dt_hydro_used);
+      record_estep_trace_boundary(state,
+                                  cfg,
+                                  part,
+                                  reduction,
+                                  "post_remap",
+                                  dt_hydro_used,
+                                  state.t + dt_hydro_used);
+      record_estep_trace_boundary(state,
+                                  cfg,
+                                  part,
+                                  reduction,
+                                  "step_end",
+                                  dt_hydro_used,
+                                  state.t + dt_hydro_used);
+      return out;
+    }
+
     TENRYU_ASSERT(
         state.mesh.topo.multiblock.has_value(),
         "Eulerian-window ALE requires multiblock topology");
@@ -10758,14 +14248,10 @@ AleStepResult apply_multiblock_csr_ale_step(
     std::vector<double> lagrangian_z;
     std::vector<double> euler_r;
     std::vector<double> euler_z;
-    std::vector<double> old_vol;
-    std::vector<double> persistent_reference_vol;
     state.x_r.copy_to_host(lagrangian_r);
     state.x_z.copy_to_host(lagrangian_z);
     state.x_r_reference.copy_to_host(euler_r);
     state.x_z_reference.copy_to_host(euler_z);
-    state.vol.copy_to_host(old_vol);
-    state.cell_vol_initial.copy_to_host(persistent_reference_vol);
 
     const std::vector<std::uint8_t> cell_nverts =
         state.mesh.cell_nverts.empty()
@@ -10806,38 +14292,18 @@ AleStepResult apply_multiblock_csr_ale_step(
       cell_centroid_z[cell_index] /= static_cast<double>(nverts);
     }
 
-    const auto& euler_window = cfg.numerics.ale.euler_window;
-    EulerWindowSpec spec{
-        euler_window.shape == "annulus"
-            ? EulerWindowSpec::Shape::Annulus
-            : EulerWindowSpec::Shape::Rectangle,
-        euler_window.r0,
-        euler_window.r1,
-        euler_window.z0,
-        euler_window.z1,
-        euler_window.cr,
-        euler_window.cz,
-        euler_window.rad_in,
-        euler_window.rad_out,
-        euler_window.transition_width};
-    std::vector<double> cell_weights(
-        static_cast<std::size_t>(n_cells), 0.0);
     std::vector<double> node_weights(
         static_cast<std::size_t>(n_nodes), 0.0);
-    euler_window_cell_weights(
-        spec,
+    euler_window_node_weights(
+        active_specs,
         cell_centroid_r.data(),
         cell_centroid_z.data(),
-        n_cells,
-        cell_weights.data());
-    euler_window_node_weights(
         topology.cell_node_csr_offsets.data(),
         topology.cell_node_csr_indices.data(),
         cell_nverts.data(),
         n_cells,
         state.corner_stride,
         n_nodes,
-        cell_weights.data(),
         node_weights.data());
 
     std::vector<double> target_r(static_cast<std::size_t>(n_nodes), 0.0);
@@ -10852,96 +14318,32 @@ AleStepResult apply_multiblock_csr_ale_step(
         target_r.data(),
         target_z.data());
 
-    std::vector<double> delta_r(static_cast<std::size_t>(n_nodes), 0.0);
-    std::vector<double> delta_z(static_cast<std::size_t>(n_nodes), 0.0);
     int moved_nodes = 0;
     for (int node = 0; node < n_nodes; ++node) {
       const auto node_index = static_cast<std::size_t>(node);
-      delta_r[node_index] =
-          target_r[node_index] - lagrangian_r[node_index];
-      delta_z[node_index] =
-          target_z[node_index] - lagrangian_z[node_index];
-      if (delta_r[node_index] != 0.0 || delta_z[node_index] != 0.0) {
+      if (target_r[node_index] != lagrangian_r[node_index] ||
+          target_z[node_index] != lagrangian_z[node_index]) {
         ++moved_nodes;
       }
     }
 
-    core::DeviceArray<double> d_delta_r(
-        static_cast<std::size_t>(n_nodes));
-    core::DeviceArray<double> d_delta_z(
-        static_cast<std::size_t>(n_nodes));
-    core::DeviceArray<int> d_cell_id_stable(
-        topology.cell_id_stable.size());
-    core::DeviceArray<int> d_cell_orientation_sign(
-        topology.cell_orientation_sign.size());
-    core::DeviceArray<std::uint8_t> d_cell_nverts(
-        cell_nverts.size());
-    d_delta_r.copy_from_host(delta_r);
-    d_delta_z.copy_from_host(delta_z);
-    d_cell_id_stable.copy_from_host(topology.cell_id_stable);
-    d_cell_orientation_sign.copy_from_host(
-        topology.cell_orientation_sign);
-    d_cell_nverts.copy_from_host(cell_nverts);
-
-    mesh::CandidateMeshAdmissibilityFloors floors;
-    floors.volume_rel = cfg.numerics.ale.reference_volume_floor_rel;
-    floors.corner_j_rel =
-        cfg.numerics.ale.reference_corner_j_floor_rel;
-    floors.gauss_j_rel = cfg.numerics.ale.reference_gauss_j_floor_rel;
-    const mesh::CandidateMeshQuality candidate_quality =
-        mesh::evaluate_candidate_mesh_quality_csr(
-            state.x_r.data(),
-            state.x_z.data(),
-            d_delta_r.data(),
-            d_delta_z.data(),
-            1.0,
-            n_cells,
-            state.corner_stride,
-            state.mesh.multiblock_cell_node_csr_offsets.data(),
-            state.mesh.multiblock_cell_node_csr_indices.data(),
-            d_cell_id_stable.data(),
-            d_cell_orientation_sign.data(),
-            floors,
-            d_cell_nverts.data(),
-            nullptr,
-            nullptr,
-            0,
-            state.x_r_reference.data(),
-            state.x_z_reference.data());
-    bool accepted = candidate_quality.admissible();
-    if (reduction != nullptr) {
-      accepted =
-          reduction->allreduce_min(
-              static_cast<std::uint64_t>(accepted ? 1U : 0U)) != 0U;
-    }
-
-    out.rezone_triggered = accepted;
-    out.rezone_converged = accepted;
-    out.quality_min =
-        std::min({candidate_quality.min_rz_volume_rel,
-                  candidate_quality.min_corner_j_rel,
-                  candidate_quality.min_gauss_j_rel});
-    out.energy_audit_ale_fallback = !accepted;
-    if (!accepted) {
+    const PrescribedTargetTransaction transaction =
+        apply_prescribed_target_transaction(
+            state,
+            cfg,
+            part,
+            reduction,
+            eos_ctx,
+            dt_hydro_used,
+            target_r,
+            target_z);
+    out = transaction.step;
+    if (!transaction.candidate_accepted) {
       if (part.rank == 0) {
         core::log_warning(
             "[euler-window] step=" + std::to_string(state.step + 1) +
             " inadmissible target skipped");
       }
-      record_estep_trace_boundary(state,
-                                  cfg,
-                                  part,
-                                  reduction,
-                                  "post_rezone_pre_remap",
-                                  dt_hydro_used,
-                                  state.t + dt_hydro_used);
-      record_estep_trace_boundary(state,
-                                  cfg,
-                                  part,
-                                  reduction,
-                                  "post_remap",
-                                  dt_hydro_used,
-                                  state.t + dt_hydro_used);
       record_estep_trace_boundary(state,
                                   cfg,
                                   part,
@@ -10952,56 +14354,7 @@ AleStepResult apply_multiblock_csr_ale_step(
       return out;
     }
 
-    state.x_r.copy_from_host(target_r);
-    state.x_z.copy_from_host(target_z);
-    state.x_r_reference.copy_from_host(target_r);
-    state.x_z_reference.copy_from_host(target_z);
-    state.mesh.recompute_geometry();
-    state.vol = state.mesh.cell_vol;
-    state.cell_vol_initial.copy_from_host(state.mesh.cell_vol);
-    ale_velcoherence::sample(state, cfg, "s1_post_rezone");
-    record_estep_trace_boundary(state,
-                                cfg,
-                                part,
-                                reduction,
-                                "post_rezone_pre_remap",
-                                dt_hydro_used,
-                                state.t + dt_hydro_used);
-
-    state.x_r.copy_from_host(lagrangian_r);
-    state.x_z.copy_from_host(lagrangian_z);
-    state.vol.copy_from_host(old_vol);
-    core::Config remap_cfg = cfg;
-    remap_cfg.numerics.ale.conservative_remap_enabled = true;
-    remap_cfg.numerics.ale.conservative_remap_target = "reference";
-    const auto remap_result =
-        ale_remap_2d_rz(
-            state, remap_cfg, eos_ctx, dt_hydro_used, nullptr);
-    record_estep_trace_boundary(state,
-                                cfg,
-                                part,
-                                reduction,
-                                "post_remap",
-                                dt_hydro_used,
-                                state.t + dt_hydro_used);
-    out.applied = remap_result.applied;
-    out.mass_floor_delta += remap_result.mass_floor_delta;
-    out.E_floor_injected += remap_result.E_floor_injected;
-    out.E_redistribution_unresolved +=
-        remap_result.E_redistribution_unresolved;
-    out.cap_energy_audit_D_K += remap_result.cap_energy_audit_D_K;
-    out.eta_contact_step = remap_result.eta_contact_step;
-    out.eta_contact_cumulative += remap_result.eta_contact_step;
-    out.i1b_ale_ke_sensor = remap_result.i1b_ale_ke_sensor;
-    out.accepted_remap_count = state.ale_remaps_applied;
-    state.x_r_reference.copy_from_host(euler_r);
-    state.x_z_reference.copy_from_host(euler_z);
-    state.cell_vol_initial.copy_from_host(persistent_reference_vol);
     if (out.applied) {
-      state.ale_rezoned = true;
-      ++state.ale_rezone_invocations;
-      state.ale_last_applied_step = state.step;
-      state.holo_ale_invalidated = true;
       if (part.rank == 0) {
         const auto weight_bounds =
             std::minmax_element(
@@ -11015,12 +14368,6 @@ AleStepResult apply_multiblock_csr_ale_step(
             << " moved_nodes=" << moved_nodes;
         core::log_info(log.str());
       }
-    } else {
-      state.x_r.copy_from_host(lagrangian_r);
-      state.x_z.copy_from_host(lagrangian_z);
-      state.vol.copy_from_host(old_vol);
-      state.mesh.recompute_geometry();
-      state.vol = state.mesh.cell_vol;
     }
     record_estep_trace_boundary(state,
                                 cfg,
@@ -11650,7 +14997,8 @@ AleStepResult apply_multiblock_csr_ale_step(
               state.x_r_reference.size() == state.x_r.size() &&
                       state.x_z_reference.size() == state.x_z.size()
                   ? state.x_z_reference.data()
-                  : nullptr);
+                  : nullptr,
+              /*refine_iters=*/48);
       double sigma_accepted = ls.sigma_accepted;
       out.center_patch_sigma_accepted = sigma_accepted;
       mesh::CandidateMeshQuality final_quality = ls.quality;
@@ -12116,7 +15464,7 @@ AleStepResult apply_multiblock_csr_ale_step(
   return out;
 }
 
-AleStepResult apply_ale_with_request(
+static AleStepResult apply_single_block_standard_ale_step(
     core::State& state, const core::Config& cfg,
     const AleRequest* request,
     const CellRegime* d_cell_regime,
@@ -12128,33 +15476,11 @@ AleStepResult apply_ale_with_request(
     const bool force_rezone,
 	    const char* force_reason,
 	    tenryu::coupling::ProfileObservability* observability,
-	    const AleDriverRetryContext* retry_context) {
+	    const AleDriverRetryContext* retry_context,
+    bool* post_rezone_pre_remap_recorded = nullptr,
+    bool* post_remap_recorded = nullptr,
+    bool* step_end_recorded = nullptr) {
   AleStepResult out;
-  TENRYU_ASSERT(
-      state.corner_stride == 4,
-      "corner_stride != 4: runtime-ALE corner path is staged for a later revision");
-  if (ale_identity_mode_enabled(cfg)) {
-    return out;
-  }
-  if (mesh::mesh_topo_is_multiblock(cfg.mesh)) {
-    const bool request_forced = request != nullptr && request->force_rezone;
-    return apply_multiblock_csr_ale_step(
-        state,
-        cfg,
-        part,
-        reduction,
-        eos_ctx,
-        dt_hydro_used,
-        force_rezone || request_forced,
-        force_reason);
-  }
-
-  if (state.mesh.dim != 2) {
-    return out;
-  }
-  if (!cfg.numerics.ale.enabled) {
-    return out;
-  }
   if (cfg.numerics.ale.conservative_remap_enabled && request == nullptr &&
       !force_rezone) {
     return out;
@@ -12430,6 +15756,7 @@ AleStepResult apply_ale_with_request(
       (cfg.numerics.ale.axis_z_motion == "winslow");
   RezoneResult rezone;
   AleMode effective_mode = AleMode::ScheduledDefault;
+  bool flank_slip_patch_applied = false;
   const bool request_forced = request != nullptr && request->force_rezone;
   diagnostics::EnergyTotals escape_event_pre_budget{};
   tenryu::coupling::EscapeValveEvent::CellState escape_event_pre_state{};
@@ -12487,7 +15814,8 @@ AleStepResult apply_ale_with_request(
         request->mode == AleMode::BoundaryPatchProjection ||
         request->mode == AleMode::CdLocalWinslow ||
         request->mode == AleMode::InteriorMultiNodeProjection ||
-        request->mode == AleMode::AxisVariationalProjection;
+        request->mode == AleMode::AxisVariationalProjection ||
+        request->mode == AleMode::FlankTangentialStrip;
     if (observability != nullptr && request_uses_local_repair) {
       escape_event_pre_budget = detail::reduce_energy_totals_global(
           diagnostics::compute_energy_totals_2d(state), reduction);
@@ -12510,6 +15838,10 @@ AleStepResult apply_ale_with_request(
       AleMinQualityCell pre_request_min_cell;
       pre_request_min_quality =
           compute_min_quality(state, cfg, &pre_request_tangle, &pre_request_min_cell);
+      if (detail::evacuated_constraint_masks_present(state)) {
+        pre_request_min_quality =
+            compute_min_quality(state, cfg, nullptr, nullptr, true);
+      }
       if (reduction != nullptr) {
         pre_request_min_quality = reduction->allreduce_min(pre_request_min_quality);
       }
@@ -12627,6 +15959,167 @@ AleStepResult apply_ale_with_request(
                              ? AleMode::AxisVariationalProjection
                              : AleMode::FullWinslow;
         break;
+      case AleMode::FlankTangentialStrip: {
+        const auto& strip_cfg =
+            cfg.numerics.ale.evacuated_cell.closure_contact
+                .flank_tangential_strip;
+        const auto target_is_in_flank_band = [&](const int cell) {
+          if (state.mesh.topo.nz <= 0 || cell < 0 ||
+              cell >= state.mesh.topo.n_cells) {
+            return false;
+          }
+          const int cell_i = cell / state.mesh.topo.nz;
+          return cell_i >= 1 &&
+                 cell_i <= std::min(state.mesh.topo.nr - 1,
+                                    strip_cfg.band_layers);
+        };
+        if (strip_cfg.slip_patch_enabled) {
+          const int monitor_worst_cell =
+              state.evacuated_cells.flank_strip_monitor.worst_cell;
+          const int slip_target_cell =
+              target_is_in_flank_band(request->focus_cell)
+                  ? request->focus_cell
+                  : monitor_worst_cell;
+          const bool slip_target_valid =
+              target_is_in_flank_band(slip_target_cell);
+          double slip_mismatch_signed_ratio = 0.0;
+          if (slip_target_valid) {
+            const int slot_cell =
+                tenryu::hydro::detail::active_flank_strip_slot_cell(state);
+            const int slip_focus_j =
+                slip_target_cell % state.mesh.topo.nz;
+            tenryu::hydro::detail::flank_strip_extend_reference_for_window(
+                state,
+                cfg,
+                slot_cell,
+                strip_cfg.band_layers,
+                strip_cfg.band_halfwidth_j,
+                slip_focus_j);
+            int slip_j_first = -1;
+            int slip_j_last = -1;
+            tenryu::hydro::detail::flank_strip_seam_window(
+                state,
+                slot_cell,
+                strip_cfg.band_halfwidth_j,
+                state.mesh.topo.nz,
+                slip_j_first,
+                slip_j_last,
+                slip_focus_j);
+            slip_mismatch_signed_ratio =
+                tenryu::hydro::detail::flank_strip_slip_mismatch_signed_ratio(
+                    state, slip_j_first, slip_j_last);
+          }
+          if (std::abs(slip_mismatch_signed_ratio) >=
+                  strip_cfg.slip_handoff_ratio &&
+              slip_target_valid) {
+            // Keep the mismatch-derived direction for API diagnostics; patch
+            // motion is determined by each node's equidistribution mismatch.
+            const int slip_direction =
+                (slip_mismatch_signed_ratio > 0.0) ? -1 : +1;
+            const auto slip = flank_slip_patch_execute(
+                state, cfg, slip_target_cell, slip_direction);
+            std::ostringstream slip_oss;
+            slip_oss << std::scientific << std::setprecision(3)
+                     << "[flank-slip] "
+                     << (slip.applied ? "applied" : "rejected")
+                     << " reason=" << slip.reject_reason
+                     << " rej_cell=" << slip.reject_cell
+                     << " rej_node=" << slip.reject_node
+                     << " rej_check=" << slip.reject_check
+                     << " dir=" << slip.direction
+                     << " q_before=" << slip.q_before
+                     << " q_after=" << slip.q_after
+                     << " slip_b=" << slip.slip_before
+                     << " slip_a=" << slip.slip_after
+                     << " m_defect=" << slip.mass_defect_rel
+                     << " E_defect=" << slip.energy_defect_rel
+                     << " P_defect=" << slip.momentum_defect_rel;
+            core::log_warning(slip_oss.str());
+            if (slip.applied) {
+              rezone.triggered = true;
+              rezone.converged = true;
+              rezone.min_quality =
+                  compute_min_quality(state, cfg, nullptr, nullptr, true);
+              effective_mode = AleMode::FlankTangentialStrip;
+              flank_slip_patch_applied = true;
+              break;
+            }
+          }
+        }
+        const auto strip = run_flank_tangential_strip_rezone(
+            state,
+            cfg,
+            request->focus_cell >= 0 ? request->focus_cell : -1);
+        rezone.triggered = strip.triggered;
+        rezone.converged = strip.converged;
+        rezone.min_quality =
+            compute_min_quality(state, cfg, nullptr, nullptr, true);
+        effective_mode = strip.converged ? AleMode::FlankTangentialStrip
+                                         : AleMode::ScheduledDefault;
+        std::ostringstream oss;
+        oss << std::scientific << std::setprecision(3)
+            << "[flank-strip] rezone "
+            << (strip.converged ? "accepted" : "rejected")
+            << " q_before=" << strip.q_before
+            << " q_after=" << strip.q_after
+            << " max_disp=" << strip.max_displacement
+            << " slip=" << strip.slip_mismatch_max_ratio
+            << " oob=" << strip.moved_nodes_outside_band
+            << " halvings=" << strip.alpha_halvings
+            << " untangler=" << strip.used_untangler
+            << " tc=" << strip.target_cell
+            << " Jb=[" << strip.target_corner_j_before[0]
+            << ',' << strip.target_corner_j_before[1]
+            << ',' << strip.target_corner_j_before[2]
+            << ',' << strip.target_corner_j_before[3]
+            << "] Ja=[" << strip.target_corner_j_after[0]
+            << ',' << strip.target_corner_j_after[1]
+            << ',' << strip.target_corner_j_after[2]
+            << ',' << strip.target_corner_j_after[3] << ']'
+            << " qa_cell=" << strip.band_argmin_cell_after
+            << " qb_cell=" << strip.band_argmin_cell_before;
+        core::log_warning(oss.str());
+        if (!strip.converged &&
+            cfg.numerics.ale.evacuated_cell.closure_contact
+                .flank_tangential_strip.slip_patch_enabled &&
+            std::abs(strip.slip_mismatch_signed_ratio) >=
+                cfg.numerics.ale.evacuated_cell.closure_contact
+                    .flank_tangential_strip.slip_handoff_ratio &&
+            strip.target_cell >= 0) {
+          // Keep the mismatch-derived direction for API diagnostics; patch
+          // motion is determined by each node's equidistribution mismatch.
+          const int slip_direction =
+              (strip.slip_mismatch_signed_ratio > 0.0) ? -1 : +1;
+          const auto slip = flank_slip_patch_execute(
+              state, cfg, strip.target_cell, slip_direction);
+          std::ostringstream slip_oss;
+          slip_oss << std::scientific << std::setprecision(3)
+                   << "[flank-slip] "
+                   << (slip.applied ? "applied" : "rejected")
+                   << " reason=" << slip.reject_reason
+                   << " rej_cell=" << slip.reject_cell
+                   << " rej_node=" << slip.reject_node
+                   << " rej_check=" << slip.reject_check
+                   << " dir=" << slip.direction
+                   << " q_before=" << slip.q_before
+                   << " q_after=" << slip.q_after
+                   << " slip_b=" << slip.slip_before
+                   << " slip_a=" << slip.slip_after
+                   << " m_defect=" << slip.mass_defect_rel
+                   << " E_defect=" << slip.energy_defect_rel
+                   << " P_defect=" << slip.momentum_defect_rel;
+          core::log_warning(slip_oss.str());
+          if (slip.applied) {
+            rezone.triggered = true;
+            rezone.converged = true;
+            rezone.min_quality =
+                compute_min_quality(state, cfg, nullptr, nullptr, true);
+            effective_mode = AleMode::FlankTangentialStrip;
+            flank_slip_patch_applied = true;
+          }
+        }
+        break;
+      }
       case AleMode::ScheduledDefault:
         break;
     }
@@ -12801,6 +16294,20 @@ AleStepResult apply_ale_with_request(
     }
   }
 
+  if (flank_slip_patch_applied) {
+    (void)detail::recompute_geometry_for_ale(state, cfg, observability);
+    state.vol = state.mesh.cell_vol;
+    evacuated_cell_upload_contact_device_state(state);
+    rebuild_geometry_policy_exempt(state);
+    out.applied = true;
+    out.rezone_triggered = rezone.triggered;
+    out.rezone_converged = rezone.converged;
+    out.quality_min = rezone.min_quality;
+    log_axis_uR_if_nonzero();
+    cleanup();
+    return out;
+  }
+
   if (!rezone.triggered) {
     log_axis_uR_if_nonzero();
     cleanup();
@@ -12816,6 +16323,55 @@ AleStepResult apply_ale_with_request(
   d_vol_mid = static_cast<double*>(
       core::device_scratch_acquire("ale_driver:ale_req:d_vol_mid",
                                    static_cast<std::size_t>(n_cells) * sizeof(double)));
+  d_tmp = static_cast<double*>(
+      core::device_scratch_acquire("ale_driver:ale_req:d_tmp",
+                                   static_cast<std::size_t>(n_cells) * sizeof(double)));
+  double* d_rho_mass_preflight = static_cast<double*>(core::device_scratch_acquire(
+      "ale_driver:ale_req:d_rho_mass_preflight",
+      static_cast<std::size_t>(n_cells) * sizeof(double)));
+  double* d_mass_preflight_vol_new = static_cast<double*>(
+      core::device_scratch_acquire("ale_driver:ale_req:d_mass_preflight_vol_new",
+                                   static_cast<std::size_t>(n_cells) * sizeof(double)));
+  double* d_remap_mass_veto_floor = nullptr;
+  if (!state.evacuated_cells.mass_ref.empty()) {
+    TENRYU_ASSERT(
+        state.evacuated_cells.mass_ref.size() ==
+            static_cast<std::size_t>(n_cells),
+        "ALE remap mass veto floor requires one reference mass per cell");
+    std::vector<double> remap_mass_veto_floor(static_cast<std::size_t>(n_cells));
+    for (int c = 0; c < n_cells; ++c) {
+      remap_mass_veto_floor[static_cast<std::size_t>(c)] =
+          cfg.numerics.ale.evacuated_cell.off_mass_fraction *
+          state.evacuated_cells.mass_ref[static_cast<std::size_t>(c)];
+    }
+    d_remap_mass_veto_floor = static_cast<double*>(core::device_scratch_acquire(
+        "ale_driver:ale_req:d_remap_mass_veto_floor",
+        static_cast<std::size_t>(n_cells) * sizeof(double)));
+    CUDA_CHECK(cudaMemcpy(d_remap_mass_veto_floor,
+                          remap_mass_veto_floor.data(),
+                          static_cast<std::size_t>(n_cells) * sizeof(double),
+                          cudaMemcpyHostToDevice));
+  }
+  tenryu::mesh::Mesh ladder_candidate_mesh = state.mesh;
+  ladder_candidate_mesh.geometry_exempt_cells = state.mesh.geometry_exempt_cells;
+  ladder_candidate_mesh.node_r = state.x_r.data();
+  ladder_candidate_mesh.node_z = state.x_z.data();
+  double* d_mass_preflight_min_fraction = static_cast<double*>(
+      core::device_scratch_acquire("ale_driver:ale_req:d_mass_preflight_min_fraction",
+                                   sizeof(double)));
+  int* d_mass_preflight_argmin_cell = static_cast<int*>(
+      core::device_scratch_acquire("ale_driver:ale_req:d_mass_preflight_argmin_cell",
+                                   sizeof(int)));
+  int* d_mass_preflight_rejected = static_cast<int*>(
+      core::device_scratch_acquire("ale_driver:ale_req:d_mass_preflight_rejected",
+                                   sizeof(int)));
+  const bool use_ms2_remap = (cfg.numerics.ale.remap_scheme == "ms2_moments");
+  const RemapMs2Limiter ms2_limiter =
+      (cfg.numerics.ale.remap_ms2_limiter == "barth_jespersen")
+          ? RemapMs2Limiter::BarthJespersen
+          : RemapMs2Limiter::VanLeer;
+  const RemapDispatchAuditDeviceView remap_dispatch_audit =
+      remap_dispatch_audit_device_view();
   CUDA_CHECK(cudaMemcpy(d_xr_cand,
                         state.x_r.data(),
                         static_cast<std::size_t>(n_nodes) * sizeof(double),
@@ -12824,6 +16380,9 @@ AleStepResult apply_ale_with_request(
                         state.x_z.data(),
                         static_cast<std::size_t>(n_nodes) * sizeof(double),
                         cudaMemcpyDeviceToDevice));
+  // §22 contact-constrained rezone projects both backtrack candidate arrays.
+  detail::launch_project_evac_contact_rezone_candidate(
+      state, d_xr_cand, d_xz_cand, d_xr_old, d_xz_old);
 
   bool post_tangle = false;
   bool post_corner_tangle = false;
@@ -13111,6 +16670,241 @@ AleStepResult apply_ale_with_request(
                                                 dt_hydro_used);
   };
 
+  TENRYU_ASSERT(
+      state.evacuated_cells.d_geometry_policy_exempt_cells.empty() ||
+          state.evacuated_cells.d_geometry_policy_exempt_cells.size() ==
+              static_cast<std::size_t>(n_cells),
+      "ALE remap mass preflight requires device geometry-policy-exempt mask size == n_cells");
+  const std::uint8_t* geometry_policy_exempt =
+      state.evacuated_cells.d_geometry_policy_exempt_cells.empty()
+          ? nullptr
+          : state.evacuated_cells.d_geometry_policy_exempt_cells.data();
+
+  const auto launch_mass_preflight_scalar_remap = [&](double* field) {
+    if (use_ms2_remap) {
+      return launch_remap_strang_ms2(field,
+                                     d_tmp,
+                                     d_vol_mid,
+                                     d_vol_old,
+                                     d_mass_preflight_vol_new,
+                                     d_xr_old,
+                                     d_xz_old,
+                                     state.x_r.data(),
+                                     state.x_z.data(),
+                                     nr,
+                                     nz,
+                                     state.step,
+                                     ms2_limiter,
+                                     donor_sign_fixed,
+                                     geometry_policy_exempt,
+                                     remap_dispatch_audit);
+    }
+    return launch_remap_strang(field,
+                               d_tmp,
+                               d_vol_mid,
+                               d_vol_old,
+                               d_mass_preflight_vol_new,
+                               d_xr_old,
+                               d_xz_old,
+                               state.x_r.data(),
+                               state.x_z.data(),
+                               nr,
+                               nz,
+                               state.step,
+                               donor_sign_fixed,
+                               geometry_policy_exempt,
+                               remap_dispatch_audit);
+  };
+
+  const auto check_remap_mass_admissibility =
+      [&](const auto& remap_runner,
+          const double* d_vol_new,
+          const char* rejection_log_prefix,
+          const std::uint8_t* geometry_policy_exempt) {
+    detail::RemapMassAdmissibilityResult result;
+    CUDA_CHECK(cudaMemcpy(d_rho_mass_preflight,
+                          state.rho.data(),
+                          static_cast<std::size_t>(n_cells) * sizeof(double),
+                          cudaMemcpyDeviceToDevice));
+    if (!remap_runner(d_rho_mass_preflight)) {
+      result.admissible = false;
+      result.transport_aborted = true;
+      core::log_warning(
+          std::string(rejection_log_prefix) +
+          "transport-abort (non-positive intermediate volume inside the remap runner; "
+          "see [ale-remap] line above)");
+      return result;
+    }
+
+    double min_predicted_fraction = std::numeric_limits<double>::infinity();
+    CUDA_CHECK(cudaMemcpy(d_mass_preflight_min_fraction,
+                          &min_predicted_fraction,
+                          sizeof(double),
+                          cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemset(d_mass_preflight_rejected, 0, sizeof(int)));
+    detail::remap_mass_preflight_check_kernel<<<cw.blocks(), 256>>>(
+        d_mass_preflight_min_fraction,
+        d_mass_preflight_rejected,
+        d_rho_mass_preflight,
+        state.rho.data(),
+        d_vol_new,
+        d_vol_old,
+        d_remap_mass_veto_floor,
+        cw.begin,
+        cw.end,
+        detail::kRemapMassClosureRejectFraction,
+        geometry_policy_exempt);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(core::debug_kernel_sync());
+
+    int mass_preflight_rejected = 0;
+    CUDA_CHECK(cudaMemcpy(&min_predicted_fraction,
+                          d_mass_preflight_min_fraction,
+                          sizeof(double),
+                          cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(&mass_preflight_rejected,
+                          d_mass_preflight_rejected,
+                          sizeof(int),
+                          cudaMemcpyDeviceToHost));
+    if (reduction != nullptr) {
+      min_predicted_fraction = reduction->allreduce_min(min_predicted_fraction);
+      mass_preflight_rejected =
+          reduction->allreduce_max(mass_preflight_rejected != 0 ? 1.0 : 0.0) > 0.5
+              ? 1
+              : 0;
+    }
+
+    int mass_preflight_argmin_cell = n_cells;
+    CUDA_CHECK(cudaMemcpy(d_mass_preflight_argmin_cell,
+                          &mass_preflight_argmin_cell,
+                          sizeof(int),
+                          cudaMemcpyHostToDevice));
+    detail::remap_mass_preflight_argmin_kernel<<<cw.blocks(), 256>>>(
+        d_mass_preflight_argmin_cell,
+        d_rho_mass_preflight,
+        state.rho.data(),
+        d_vol_new,
+        d_vol_old,
+        cw.begin,
+        cw.end,
+        min_predicted_fraction,
+        geometry_policy_exempt);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(core::debug_kernel_sync());
+    CUDA_CHECK(cudaMemcpy(&mass_preflight_argmin_cell,
+                          d_mass_preflight_argmin_cell,
+                          sizeof(int),
+                          cudaMemcpyDeviceToHost));
+    if (reduction != nullptr) {
+      mass_preflight_argmin_cell = static_cast<int>(reduction->allreduce_min(
+          static_cast<double>(mass_preflight_argmin_cell)));
+    }
+    if (mass_preflight_rejected != 0) {
+      core::log_info(std::string("[ale-remap-mass-oracle] ") + rejection_log_prefix +
+                     " min_frac=" + detail::format_scientific(min_predicted_fraction) +
+                     " argmin=" + std::to_string(mass_preflight_argmin_cell) +
+                     " rejected=" + std::to_string(mass_preflight_rejected));
+    }
+
+    if (mass_preflight_argmin_cell >= 0 && mass_preflight_argmin_cell < n_cells) {
+      result.first_fail_cell.c = mass_preflight_argmin_cell;
+      result.first_fail_cell.i = mass_preflight_argmin_cell / nz;
+      result.first_fail_cell.j = mass_preflight_argmin_cell % nz;
+    }
+    result.admissible = (mass_preflight_rejected == 0);
+    if (!result.admissible) {
+      double predicted_mass = 0.0;
+      double pre_mass = 0.0;
+      double vol_old = 0.0;
+      double vol_mid = 0.0;
+      double vol_new = 0.0;
+      double rho_pred = 0.0;
+      if (mass_preflight_argmin_cell >= cw.begin && mass_preflight_argmin_cell < cw.end) {
+        double pre_rho = 0.0;
+        CUDA_CHECK(cudaMemcpy(&rho_pred,
+                              d_rho_mass_preflight + mass_preflight_argmin_cell,
+                              sizeof(double),
+                              cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(&pre_rho,
+                              state.rho.data() + mass_preflight_argmin_cell,
+                              sizeof(double),
+                              cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(&vol_new,
+                              d_vol_new + mass_preflight_argmin_cell,
+                              sizeof(double),
+                              cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(&vol_old,
+                              d_vol_old + mass_preflight_argmin_cell,
+                              sizeof(double),
+                              cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(&vol_mid,
+                              d_vol_mid + mass_preflight_argmin_cell,
+                              sizeof(double),
+                              cudaMemcpyDeviceToHost));
+        predicted_mass = rho_pred * vol_new;
+        pre_mass = pre_rho * vol_old;
+      }
+      if (reduction != nullptr) {
+        double telemetry[6] = {predicted_mass, pre_mass, vol_old,
+                               vol_mid,       vol_new, rho_pred};
+        reduction->allreduce_sum(telemetry, 6);
+        predicted_mass = telemetry[0];
+        pre_mass = telemetry[1];
+        vol_old = telemetry[2];
+        vol_mid = telemetry[3];
+        vol_new = telemetry[4];
+        rho_pred = telemetry[5];
+      }
+      core::log_warning(
+          std::string(rejection_log_prefix) +
+          std::to_string(mass_preflight_argmin_cell) +
+          " predicted=" + detail::format_scientific(predicted_mass) +
+          " pre=" + detail::format_scientific(pre_mass) +
+          " predicted_fraction=" + detail::format_scientific17(min_predicted_fraction) +
+          " vol_old=" + detail::format_scientific17(vol_old) +
+          " vol_mid=" + detail::format_scientific17(vol_mid) +
+          " vol_new=" + detail::format_scientific17(vol_new) +
+          " rho_pred=" + detail::format_scientific17(rho_pred) +
+          " (permanent telemetry)");
+    }
+    return result;
+  };
+
+  const auto check_ladder_remap_mass_admissibility =
+      [&](const char* rejection_log_prefix,
+          const std::uint8_t* geometry_policy_exempt) {
+    tenryu::mesh::MeshGeometryCheckOptions opts{};
+    opts.policy = tenryu::mesh::MeshGeometryFailurePolicy::SoftReturn;
+    const tenryu::mesh::MeshGeometryResult candidate_geometry =
+        ladder_candidate_mesh.recompute_geometry_checked(opts);
+    if (!candidate_geometry.admissible) {
+      detail::RemapMassAdmissibilityResult result;
+      result.admissible = false;
+      result.first_fail_cell.c = candidate_geometry.failing_cell;
+      result.first_fail_cell.i = candidate_geometry.failing_i;
+      result.first_fail_cell.j = candidate_geometry.failing_j;
+      return result;
+    }
+    CUDA_CHECK(cudaMemcpy(d_mass_preflight_vol_new,
+                          ladder_candidate_mesh.cell_vol_device.data(),
+                          static_cast<std::size_t>(n_cells) * sizeof(double),
+                          cudaMemcpyDeviceToDevice));
+    return check_remap_mass_admissibility(launch_mass_preflight_scalar_remap,
+                                          d_mass_preflight_vol_new,
+                                          rejection_log_prefix,
+                                          geometry_policy_exempt);
+  };
+
+  int rung_quality_rejections = 0;
+  int rung_damage_rejections = 0;
+  int rung_first_sweep_rejections = 0;
+  int rung_mass_rejections = 0;
+  int rung_transport_abort_rejections = 0;
+  int rung_predictive_axis_rejections = 0;
+  int rung_predictive_vol_rejections = 0;
+  int rung_axis_margin_rejections = 0;
+  int rung_radial_rejections = 0;
+
   if (!cfg.numerics.ale.safe_backtrack_enabled) {
     for (int attempt = 0; attempt < detail::kBacktrackMaxAttempts; ++attempt) {
       const double lambda = detail::kBacktrackLambdaSchedule[attempt];
@@ -13173,6 +16967,7 @@ AleStepResult apply_ale_with_request(
                                                         backtrack_last_reason.c_str());
       };
       if (post_tangle || post_corner_tangle) {
+        ++rung_quality_rejections;
         const AleMinQualityCell current_fail_cell =
             post_tangle ? post_min_quality_cell : post_corner_fail_cell;
         if (post_tangle) {
@@ -13206,6 +17001,7 @@ AleStepResult apply_ale_with_request(
             (reduction->allreduce_max(axis_admissible ? 0.0 : 1.0) < 0.5);
       }
       if (!axis_admissible) {
+        ++rung_axis_margin_rejections;
         backtrack_last_reason = "axis-cell analytic margin negative";
         ++rezone.other_rejection_count;
         if (!first_backtrack_fail_recorded) {
@@ -13227,6 +17023,7 @@ AleStepResult apply_ale_with_request(
                                     cfg.numerics.ale.winslow_axis_kappa,
                                     reduction);
         if (!radial_bound.passed) {
+          ++rung_radial_rejections;
           backtrack_last_reason = "axis-adjacent radial bound violated";
           ++rezone.other_rejection_count;
           if (!first_backtrack_fail_recorded) {
@@ -13252,6 +17049,7 @@ AleStepResult apply_ale_with_request(
 
       detail::RemapDamageResult trial_damage;
       if (!check_remap_damage_gate(trial_damage)) {
+        ++rung_damage_rejections;
         ++rezone.other_rejection_count;
         if (capture_phase9_emergency) {
           phase9_emergency_damage = trial_damage;
@@ -13275,13 +17073,15 @@ AleStepResult apply_ale_with_request(
                                                   nr,
                                                   nz,
                                                   state.step,
-                                                  donor_sign_fixed);
+                                                  donor_sign_fixed,
+                                                  geometry_policy_exempt);
       bool remap_admissible = remap_admissibility.admissible;
       if (reduction != nullptr) {
         remap_admissible =
             (reduction->allreduce_max(remap_admissible ? 0.0 : 1.0) < 0.5);
       }
       if (!remap_admissible) {
+        ++rung_first_sweep_rejections;
         backtrack_last_reason = "remap non-positive intermediate volume";
         ++rezone.other_rejection_count;
         if (!first_backtrack_fail_recorded) {
@@ -13292,7 +17092,39 @@ AleStepResult apply_ale_with_request(
         continue;
       }
 
+      const detail::RemapMassAdmissibilityResult mass_admissibility =
+          check_ladder_remap_mass_admissibility(
+              "[ale-remap-mass-admissibility] ladder reject cell=",
+              geometry_policy_exempt);
+      if (!mass_admissibility.admissible) {
+        if (mass_admissibility.transport_aborted) {
+          ++rung_transport_abort_rejections;
+        } else {
+          ++rung_mass_rejections;
+        }
+        backtrack_last_reason =
+            mass_admissibility.transport_aborted
+                ? "remap transport aborted on non-positive intermediate volume"
+                : "remap predicted mass below donor-valid threshold";
+        ++rezone.other_rejection_count;
+        if (!first_backtrack_fail_recorded) {
+          first_backtrack_fail_cell = mass_admissibility.first_fail_cell;
+          first_backtrack_fail_recorded = true;
+        }
+        dump_backtrack_iter(false);
+        continue;
+      }
+
+      const int predictive_axis_rejects_before = predictive_axis_rejects;
+      const int predictive_cell_vol_rejects_before =
+          predictive_cell_vol_rejects;
       if (!check_predictive_acceptance_gate(state.x_r.data(), state.x_z.data())) {
+        if (predictive_axis_rejects > predictive_axis_rejects_before) {
+          ++rung_predictive_axis_rejections;
+        }
+        if (predictive_cell_vol_rejects > predictive_cell_vol_rejects_before) {
+          ++rung_predictive_vol_rejections;
+        }
         ++rezone.other_rejection_count;
         dump_backtrack_iter(false);
         continue;
@@ -13382,6 +17214,9 @@ AleStepResult apply_ale_with_request(
       };
 
       if (post_tangle || post_corner_tangle) {
+        if (count_rejections) {
+          ++rung_quality_rejections;
+        }
         const AleMinQualityCell current_fail_cell =
             post_tangle ? post_min_quality_cell : post_corner_fail_cell;
         if (post_tangle) {
@@ -13422,6 +17257,7 @@ AleStepResult apply_ale_with_request(
       if (!axis_admissible) {
         backtrack_last_reason = "axis-cell analytic margin negative";
         if (count_rejections) {
+          ++rung_axis_margin_rejections;
           ++rezone.other_rejection_count;
           if (!first_backtrack_fail_recorded) {
             first_backtrack_fail_cell.c = axis_margin.min_j;
@@ -13445,6 +17281,7 @@ AleStepResult apply_ale_with_request(
         if (!radial_bound.passed) {
           backtrack_last_reason = "axis-adjacent radial bound violated";
           if (count_rejections) {
+            ++rung_radial_rejections;
             ++rezone.other_rejection_count;
             if (!first_backtrack_fail_recorded) {
               first_backtrack_fail_cell.c = radial_bound.fail_j;
@@ -13472,6 +17309,7 @@ AleStepResult apply_ale_with_request(
       detail::RemapDamageResult trial_damage;
       if (!check_remap_damage_gate(trial_damage)) {
         if (count_rejections) {
+          ++rung_damage_rejections;
           ++rezone.other_rejection_count;
         }
         if (capture_phase9_emergency) {
@@ -13496,7 +17334,8 @@ AleStepResult apply_ale_with_request(
                                                   nr,
                                                   nz,
                                                   state.step,
-                                                  donor_sign_fixed);
+                                                  donor_sign_fixed,
+                                                  geometry_policy_exempt);
       bool remap_admissible = remap_admissibility.admissible;
       if (reduction != nullptr) {
         remap_admissible =
@@ -13505,6 +17344,7 @@ AleStepResult apply_ale_with_request(
       if (!remap_admissible) {
         backtrack_last_reason = "remap non-positive intermediate volume";
         if (count_rejections) {
+          ++rung_first_sweep_rejections;
           ++rezone.other_rejection_count;
           if (!first_backtrack_fail_recorded) {
             first_backtrack_fail_cell = remap_admissibility.first_fail_cell;
@@ -13515,8 +17355,42 @@ AleStepResult apply_ale_with_request(
         return result;
       }
 
+      const detail::RemapMassAdmissibilityResult mass_admissibility =
+          check_ladder_remap_mass_admissibility(
+              "[ale-remap-mass-admissibility] ladder reject cell=",
+              geometry_policy_exempt);
+      if (!mass_admissibility.admissible) {
+        backtrack_last_reason =
+            mass_admissibility.transport_aborted
+                ? "remap transport aborted on non-positive intermediate volume"
+                : "remap predicted mass below donor-valid threshold";
+        if (count_rejections) {
+          if (mass_admissibility.transport_aborted) {
+            ++rung_transport_abort_rejections;
+          } else {
+            ++rung_mass_rejections;
+          }
+          ++rezone.other_rejection_count;
+          if (!first_backtrack_fail_recorded) {
+            first_backtrack_fail_cell = mass_admissibility.first_fail_cell;
+            first_backtrack_fail_recorded = true;
+          }
+        }
+        dump_backtrack_iter(false);
+        return result;
+      }
+
+      const int predictive_axis_rejects_before = predictive_axis_rejects;
+      const int predictive_cell_vol_rejects_before =
+          predictive_cell_vol_rejects;
       if (!check_predictive_acceptance_gate(state.x_r.data(), state.x_z.data())) {
         if (count_rejections) {
+          if (predictive_axis_rejects > predictive_axis_rejects_before) {
+            ++rung_predictive_axis_rejections;
+          }
+          if (predictive_cell_vol_rejects > predictive_cell_vol_rejects_before) {
+            ++rung_predictive_vol_rejections;
+          }
           ++rezone.other_rejection_count;
         }
         dump_backtrack_iter(false);
@@ -13877,7 +17751,8 @@ AleStepResult apply_ale_with_request(
                                                           nr,
                                                           nz,
                                                           state.step,
-                                                          donor_sign_fixed);
+                                                          donor_sign_fixed,
+                                                          geometry_policy_exempt);
               bool remap_admissible = remap_admissibility.admissible;
               if (reduction != nullptr) {
                 remap_admissible =
@@ -13890,15 +17765,31 @@ AleStepResult apply_ale_with_request(
                   first_backtrack_fail_cell = remap_admissibility.first_fail_cell;
                   first_backtrack_fail_recorded = true;
                 }
-              } else if (!check_predictive_acceptance_gate(state.x_r.data(),
-                                                           state.x_z.data())) {
-                ++rezone.other_rejection_count;
               } else {
-                accepted_axis_inflow_this_event = trial_damage.axis_inflow_this_event;
-                accepted_backtrack = true;
-                rezone.accepted_lambda = 1.0;
-                out.quality_min = trial_quality;
-                backtrack_last_reason = "local boundary repair accepted";
+                const detail::RemapMassAdmissibilityResult mass_admissibility =
+                    check_ladder_remap_mass_admissibility(
+                        "[ale-remap-mass-admissibility] ladder reject cell=",
+                        geometry_policy_exempt);
+                if (!mass_admissibility.admissible) {
+                  backtrack_last_reason =
+                      mass_admissibility.transport_aborted
+                          ? "remap transport aborted on non-positive intermediate volume"
+                          : "post-repair remap predicted mass below donor-valid threshold";
+                  ++rezone.other_rejection_count;
+                  if (!first_backtrack_fail_recorded) {
+                    first_backtrack_fail_cell = mass_admissibility.first_fail_cell;
+                    first_backtrack_fail_recorded = true;
+                  }
+                } else if (!check_predictive_acceptance_gate(state.x_r.data(),
+                                                             state.x_z.data())) {
+                  ++rezone.other_rejection_count;
+                } else {
+                  accepted_axis_inflow_this_event = trial_damage.axis_inflow_this_event;
+                  accepted_backtrack = true;
+                  rezone.accepted_lambda = 1.0;
+                  out.quality_min = trial_quality;
+                  backtrack_last_reason = "local boundary repair accepted";
+                }
               }
             }
           }
@@ -13957,7 +17848,11 @@ AleStepResult apply_ale_with_request(
                                                                  d_node_flags,
                                                                  nz,
                                                                  omega,
-                                                                 cfg.numerics.has_physical_rz_axis);
+                                                                 cfg.numerics.has_physical_rz_axis,
+                                                                 state.evacuated_cells.n_contact_active_cells > 0
+                                                                     ? state.evacuated_cells.d_contact_active_cells.data()
+                                                                     : nullptr,
+                                                                 state.evacuated_cells.n_contact_active_cells);
           CUDA_CHECK(cudaGetLastError());
           CUDA_CHECK(core::debug_kernel_sync());
           CUDA_CHECK(cudaMemcpy(z_axis_target_h.data(),
@@ -13983,7 +17878,12 @@ AleStepResult apply_ale_with_request(
                                 cudaMemcpyDeviceToDevice));
           detail::apply_axis_spine_kernel<<<blocks_axis, 256>>>(
               state.x_r.data(), state.x_z.data(), d_z_axis_target, nz,
-              cfg.numerics.has_physical_rz_axis);
+              cfg.numerics.has_physical_rz_axis,
+              state.evacuated_cells.n_contact_active_cells > 0
+                  ? state.evacuated_cells.d_contact_active_cells.data()
+                  : nullptr,
+              state.evacuated_cells.n_contact_active_cells,
+              nz);
           CUDA_CHECK(cudaGetLastError());
           CUDA_CHECK(core::debug_kernel_sync());
 
@@ -14059,13 +17959,31 @@ AleStepResult apply_ale_with_request(
                                                       nr,
                                                       nz,
                                                       state.step,
-                                                      donor_sign_fixed);
+                                                      donor_sign_fixed,
+                                                      geometry_policy_exempt);
           bool remap_admissible = remap_admissibility.admissible;
           if (reduction != nullptr) {
             remap_admissible =
                 (reduction->allreduce_max(remap_admissible ? 0.0 : 1.0) < 0.5);
           }
           if (!remap_admissible) {
+            continue;
+          }
+
+          const detail::RemapMassAdmissibilityResult mass_admissibility =
+              check_ladder_remap_mass_admissibility(
+                  "[ale-remap-mass-admissibility] ladder reject cell=",
+                  geometry_policy_exempt);
+          if (!mass_admissibility.admissible) {
+            backtrack_last_reason =
+                mass_admissibility.transport_aborted
+                    ? "remap transport aborted on non-positive intermediate volume"
+                    : "remap predicted mass below donor-valid threshold";
+            ++rezone.other_rejection_count;
+            if (!first_backtrack_fail_recorded) {
+              first_backtrack_fail_cell = mass_admissibility.first_fail_cell;
+              first_backtrack_fail_recorded = true;
+            }
             continue;
           }
 
@@ -14107,6 +18025,20 @@ AleStepResult apply_ale_with_request(
                                       rezone.gauss_tangle_rejection_count,
                                       rezone.corner_tangle_rejection_count,
                                       rezone.other_rejection_count);
+      core::log_warning(
+          "[ale-stats] rung rejections: quality=" +
+          std::to_string(rung_quality_rejections) +
+          " damage=" + std::to_string(rung_damage_rejections) +
+          " first_sweep=" + std::to_string(rung_first_sweep_rejections) +
+          " mass=" + std::to_string(rung_mass_rejections) +
+          " transport_abort=" +
+          std::to_string(rung_transport_abort_rejections) +
+          " predictive_axis=" +
+          std::to_string(rung_predictive_axis_rejections) +
+          " predictive_vol=" +
+          std::to_string(rung_predictive_vol_rejections) +
+          " axis_margin=" + std::to_string(rung_axis_margin_rejections) +
+          " radial=" + std::to_string(rung_radial_rejections));
       detail::log_ale_rezone_stats(rezone.iterations,
                                    rezone.stats,
                                    rezone.min_quality_cell_pre,
@@ -14214,6 +18146,29 @@ AleStepResult apply_ale_with_request(
   out.applied = true;
   detail::enforce_corner_cell_aspect_floor(state.x_r.data(), state.x_z.data(), state, cfg);
 
+  if (state.evacuated_cells.n_contact_active_cells > 0) {
+    // Interface-Lagrangian chokepoint: whatever rezone path produced the
+    // accepted positions, the engaged contact cell's corners do not move,
+    // so the remap sweeps zero volume across the engaged interface.
+    // Winslow, spine, Phase-10, and aspect-floor producers are Dirichlet-aware; variational/interior projections rely on this backstop.
+    TENRYU_ASSERT(
+        state.evacuated_cells.d_node_axis_alias.size() == 0U ||
+            state.evacuated_cells.d_node_axis_alias.size() ==
+                static_cast<std::size_t>(state.mesh.topo.n_nodes),
+        "ALE evacuated-cell node axis alias device state mismatch");
+    detail::freeze_evac_contact_cell_corners_kernel<<<1, 1>>>(
+        state.x_r.data(), state.x_z.data(), d_xr_old, d_xz_old,
+        state.evacuated_cells.d_contact_active_cells.data(),
+        state.evacuated_cells.n_contact_active_cells,
+        nz,
+        state.evacuated_cells.d_node_axis_alias.size() != 0U
+            ? state.evacuated_cells.d_node_axis_alias.data()
+            : nullptr);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(core::debug_kernel_sync());
+  }
+  enforce_node_axis_aliases(state);
+
   const tenryu::mesh::MeshGeometryResult post_rezone_geometry =
       detail::recompute_geometry_for_ale(state, cfg, observability);
   if (!post_rezone_geometry.admissible) {
@@ -14245,6 +18200,9 @@ AleStepResult apply_ale_with_request(
                               "post_rezone_pre_remap",
                               dt_hydro_used,
                               state.t + dt_hydro_used);
+  if (post_rezone_pre_remap_recorded != nullptr) {
+    *post_rezone_pre_remap_recorded = true;
+  }
   if (cfg.numerics.diagnostics.mesh_attribution.enabled &&
       cfg.numerics.diagnostics.mesh_attribution.record_node_displacements) {
     auto& attr = tenryu::diagnostics::mesh_attribution::global_workspace();
@@ -14290,9 +18248,6 @@ AleStepResult apply_ale_with_request(
                                    static_cast<std::size_t>(n_cells) * sizeof(double)));
   d_vz_cell = static_cast<double*>(
       core::device_scratch_acquire("ale_driver:ale_req:d_vz_cell",
-                                   static_cast<std::size_t>(n_cells) * sizeof(double)));
-  d_tmp = static_cast<double*>(
-      core::device_scratch_acquire("ale_driver:ale_req:d_tmp",
                                    static_cast<std::size_t>(n_cells) * sizeof(double)));
   d_mom_r = static_cast<double*>(
       core::device_scratch_acquire("ale_driver:ale_req:d_mom_r",
@@ -14577,11 +18532,6 @@ AleStepResult apply_ale_with_request(
     log_axis_uR_if_nonzero();
   };
 
-  const bool use_ms2_remap = (cfg.numerics.ale.remap_scheme == "ms2_moments");
-  const RemapMs2Limiter ms2_limiter =
-      (cfg.numerics.ale.remap_ms2_limiter == "barth_jespersen")
-          ? RemapMs2Limiter::BarthJespersen
-          : RemapMs2Limiter::VanLeer;
   const auto launch_scalar_remap = [&](double* field) {
     if (use_ms2_remap) {
       return launch_remap_strang_ms2(field,
@@ -14597,7 +18547,9 @@ AleStepResult apply_ale_with_request(
                                      nz,
                                      state.step,
                                      ms2_limiter,
-                                     donor_sign_fixed);
+                                     donor_sign_fixed,
+                                     geometry_policy_exempt,
+                                     remap_dispatch_audit);
     }
     return launch_remap_strang(field,
                                d_tmp,
@@ -14611,8 +18563,21 @@ AleStepResult apply_ale_with_request(
                                nr,
                                nz,
                                state.step,
-                               donor_sign_fixed);
+                               donor_sign_fixed,
+                               geometry_policy_exempt,
+                               remap_dispatch_audit);
   };
+  const detail::RemapMassAdmissibilityResult final_mass_admissibility =
+      check_remap_mass_admissibility(launch_scalar_remap,
+                                     state.vol.data(),
+                                     "[ale-remap-mass-final] REJECTED cell=",
+                                     geometry_policy_exempt);
+  if (!final_mass_admissibility.admissible) {
+    // No remapped fields have been written, so the positions-only rollback is sufficient.
+    rollback_after_remap_failure();
+    cleanup();
+    return out;
+  }
 
   const bool cf6_plic_rho_remap_requested =
       !per_material_conservation_enabled &&
@@ -14707,7 +18672,8 @@ AleStepResult apply_ale_with_request(
                                                   nr,
                                                   nz,
                                                   state.step,
-                                                  donor_sign_fixed);
+                                                  donor_sign_fixed,
+                                                  geometry_policy_exempt);
       bool remap_admissible = remap_admissibility.admissible;
       if (reduction != nullptr) {
         remap_admissible =
@@ -14865,6 +18831,24 @@ AleStepResult apply_ale_with_request(
   }
   CUDA_CHECK(cudaGetLastError());
   CUDA_CHECK(core::debug_kernel_sync());
+
+  const int n_active_contact_pairs = state.evacuated_cells.n_active_pairs;
+  double* d_contact_saved_velocity = nullptr;
+  if (n_active_contact_pairs > 0) {
+    const std::size_t n_contact_pair_nodes =
+        2U * static_cast<std::size_t>(n_active_contact_pairs);
+    d_contact_saved_velocity = static_cast<double*>(core::device_scratch_acquire(
+        "ale_driver:ale_req:d_contact_saved_velocity",
+        2U * n_contact_pair_nodes * sizeof(double)));
+    detail::save_evac_contact_pair_velocity_kernel<<<1, 1>>>(
+        d_contact_saved_velocity,
+        d_contact_saved_velocity + n_contact_pair_nodes,
+        state.v_r.data(),
+        state.v_z.data(),
+        state.evacuated_cells.d_contact_pair_nodes.data(),
+        n_active_contact_pairs);
+    CUDA_CHECK(cudaGetLastError());
+  }
 
   if (per_material_conservation_enabled && closure_audit_enabled) {
     detail::reduce_per_material_conserved_to_cell_kernel<<<blocks_cells, 256>>>(
@@ -15048,6 +19032,20 @@ AleStepResult apply_ale_with_request(
         z_bottom_bc_mode,
         z_top_bc_mode);
     CUDA_CHECK(cudaGetLastError());
+    if (n_active_contact_pairs > 0) {
+      // Engaged pair nodes are constraint-owned (interface-Lagrangian); the
+      // remap reconstruction must not rewrite them.
+      const std::size_t n_contact_pair_nodes =
+          2U * static_cast<std::size_t>(n_active_contact_pairs);
+      detail::restore_evac_contact_pair_velocity_kernel<<<1, 1>>>(
+          state.v_r.data(),
+          state.v_z.data(),
+          d_contact_saved_velocity,
+          d_contact_saved_velocity + n_contact_pair_nodes,
+          state.evacuated_cells.d_contact_pair_nodes.data(),
+          n_active_contact_pairs);
+      CUDA_CHECK(cudaGetLastError());
+    }
     if (closure_audit_enabled) {
       detail::audit_corner_kinetic_total_kernel<<<blocks_cells, 256>>>(
           d_audit_cell,
@@ -15189,6 +19187,21 @@ AleStepResult apply_ale_with_request(
         state.v_r.data(), state.v_z.data(), d_vr_cell, d_vz_cell, state.rho.data(),
         state.vol.data(), d_node_flags, nr, nz, r_outer_bc_mode, z_bottom_bc_mode,
         z_top_bc_mode);
+    if (n_active_contact_pairs > 0) {
+      // Engaged pair nodes are constraint-owned (interface-Lagrangian); the
+      // remap reconstruction must not rewrite them.
+      CUDA_CHECK(cudaGetLastError());
+      const std::size_t n_contact_pair_nodes =
+          2U * static_cast<std::size_t>(n_active_contact_pairs);
+      detail::restore_evac_contact_pair_velocity_kernel<<<1, 1>>>(
+          state.v_r.data(),
+          state.v_z.data(),
+          d_contact_saved_velocity,
+          d_contact_saved_velocity + n_contact_pair_nodes,
+          state.evacuated_cells.d_contact_pair_nodes.data(),
+          n_active_contact_pairs);
+      CUDA_CHECK(cudaGetLastError());
+    }
   }
 
   if (per_material_conservation_enabled) {
@@ -15248,6 +19261,9 @@ AleStepResult apply_ale_with_request(
                               "post_remap",
                               dt_hydro_used,
                               state.t + dt_hydro_used);
+  if (post_remap_recorded != nullptr) {
+    *post_remap_recorded = true;
+  }
 
   if (part.n_ranks > 1 && bufs != nullptr) {
     const int cell_size = n_cells;
@@ -15375,6 +19391,9 @@ AleStepResult apply_ale_with_request(
                               "step_end",
                               dt_hydro_used,
                               state.t + dt_hydro_used);
+  if (step_end_recorded != nullptr) {
+    *step_end_recorded = true;
+  }
 
   if (cfg.numerics.diagnostics.production_audit.gcl.enabled ||
       conservation_audit::enabled()) {
@@ -15393,6 +19412,185 @@ AleStepResult apply_ale_with_request(
   cleanup();
 
   return out;
+}
+
+AleStepResult apply_ale_with_request(
+    core::State& state, const core::Config& cfg,
+    const AleRequest* request,
+    const CellRegime* d_cell_regime,
+    const parallel::PartitionInfo& part,
+    parallel::CommBuffers* bufs,
+    const parallel::Reduction* reduction,
+    const HydroEOSContext* eos_ctx,
+    const double dt_hydro_used,
+    const bool force_rezone,
+	    const char* force_reason,
+	    tenryu::coupling::ProfileObservability* observability,
+	    const AleDriverRetryContext* retry_context) {
+  AleStepResult out;
+  TENRYU_ASSERT(
+      state.corner_stride == 4,
+      "corner_stride != 4: runtime-ALE corner path is staged (ALE P2-1c/P2-4+)");
+  if (ale_identity_mode_enabled(cfg)) {
+    return out;
+  }
+  if (mesh::mesh_topo_is_multiblock(cfg.mesh)) {
+    const bool request_forced = request != nullptr && request->force_rezone;
+    return apply_multiblock_csr_ale_step(
+        state,
+        cfg,
+        part,
+        reduction,
+        eos_ctx,
+        dt_hydro_used,
+        force_rezone || request_forced,
+        force_reason);
+  }
+
+  if (state.mesh.dim != 2) {
+    return out;
+  }
+  if (!cfg.numerics.ale.enabled) {
+    return out;
+  }
+  if (cfg.numerics.ale.band_ale.enabled) {
+    const bool compose =
+        cfg.numerics.ale.band_ale.compose_with_rezone;
+    bool standard_post_rezone_pre_remap_recorded = false;
+    bool standard_post_remap_recorded = false;
+    bool standard_step_end_recorded = false;
+    if (compose) {
+      out = apply_single_block_standard_ale_step(
+          state,
+          cfg,
+          request,
+          d_cell_regime,
+          part,
+          bufs,
+          reduction,
+          eos_ctx,
+          dt_hydro_used,
+          force_rezone,
+          force_reason,
+          observability,
+          retry_context,
+          &standard_post_rezone_pre_remap_recorded,
+          &standard_post_remap_recorded,
+          &standard_step_end_recorded);
+    }
+    // §18.6: single-block estimator maintenance band (config guarantees
+    // bands=="estimator" on this path).
+    const bool ba_energy_closure =
+        cfg.numerics.ale.band_ale.transaction_energy_closure_enabled;
+    const std::vector<band_ale::ActiveBand> active_bands =
+        band_ale::begin_step(state, cfg, reduction, part.rank);
+    bool first_transaction = !compose;
+    for (const auto& active_band : active_bands) {
+      std::vector<double> target_r;
+      std::vector<double> target_z;
+      band_ale::build_target(
+          state, cfg, active_band.index, target_r, target_z);
+      std::vector<double> cm_pre;
+      std::vector<double> v_r_pre;
+      std::vector<double> v_z_pre;
+      if (ba_energy_closure) {
+        state.corner_mass.copy_to_host(cm_pre);
+        state.v_r.copy_to_host(v_r_pre);
+        state.v_z.copy_to_host(v_z_pre);
+      }
+      const PrescribedTargetTransaction transaction =
+          apply_prescribed_target_transaction(
+              state,
+              cfg,
+              part,
+              reduction,
+              eos_ctx,
+              dt_hydro_used,
+              target_r,
+              target_z,
+              /*collect_rejection_diagnostics=*/false,
+              cfg.numerics.ale.band_ale.sigma_linesearch_enabled);
+      if (part.rank == 0) {
+        std::ostringstream ledger;
+        ledger << "[band-ale-ledger] band=" << active_band.name
+               << " step=" << state.step + 1
+               << " t=" << std::scientific << std::setprecision(6)
+               << state.t + dt_hydro_used
+               << " applied=" << (transaction.step.applied ? 1 : 0)
+               << " sigma=" << std::fixed << std::setprecision(6)
+               << transaction.sigma_applied
+               << " mass_closure_rel=" << std::scientific
+               << transaction.step.remap_mass_closure_rel
+               << " E_floor=" << transaction.step.E_floor_injected;
+        core::log_info(ledger.str());
+      }
+      if (ba_energy_closure && transaction.candidate_accepted) {
+        std::vector<double> cm_post;
+        state.corner_mass.copy_to_host(cm_post);
+        ale::ke_fixup_apply_deposit(state,
+                                    cm_pre,
+                                    cm_post,
+                                    v_r_pre,
+                                    v_z_pre,
+                                    state.corner_stride,
+                                    /*chi_override=*/1.0,
+                                    /*full_ke_residual=*/true,
+                                    /*global_deposit=*/true);
+      }
+      merge_prescribed_target_step(
+          out, transaction.step, first_transaction);
+      first_transaction = false;
+      if (!transaction.candidate_accepted) {
+        band_ale::record_inadmissible(active_band.index);
+      } else if (transaction.sigma_applied < 1.0) {
+        band_ale::record_partial_sigma(active_band.index,
+                                       transaction.sigma_applied);
+      }
+    }
+    if (active_bands.empty()) {
+      if (!standard_post_rezone_pre_remap_recorded) {
+        record_estep_trace_boundary(state,
+                                    cfg,
+                                    part,
+                                    reduction,
+                                    "post_rezone_pre_remap",
+                                    dt_hydro_used,
+                                    state.t + dt_hydro_used);
+      }
+      if (!standard_post_remap_recorded) {
+        record_estep_trace_boundary(state,
+                                    cfg,
+                                    part,
+                                    reduction,
+                                    "post_remap",
+                                    dt_hydro_used,
+                                    state.t + dt_hydro_used);
+      }
+    }
+    if (!standard_step_end_recorded) {
+      record_estep_trace_boundary(state,
+                                  cfg,
+                                  part,
+                                  reduction,
+                                  "step_end",
+                                  dt_hydro_used,
+                                  state.t + dt_hydro_used);
+    }
+    return out;
+  }
+  return apply_single_block_standard_ale_step(state,
+                                              cfg,
+                                              request,
+                                              d_cell_regime,
+                                              part,
+                                              bufs,
+                                              reduction,
+                                              eos_ctx,
+                                              dt_hydro_used,
+                                              force_rezone,
+                                              force_reason,
+                                              observability,
+                                              retry_context);
 }
 
 AleStepResult apply_ale(core::State& state, const core::Config& cfg,

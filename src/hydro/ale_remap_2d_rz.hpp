@@ -17,6 +17,63 @@ class Reduction;
 
 namespace tenryu::hydro::ale {
 
+enum class RemapDispatchAuditCounter : int {
+  ExactSweptMoment = 0,
+  LegacySweptVolume,
+  FirstOrderDonorFallback,
+  LimiterActivation,
+  MomentumPacketFallback,
+  BoundaryOneSided,
+  SweptCentroidAverageFallback,
+  Ms2DegenerateGradientFallback,
+  CsrGradientZeroFallback,
+  ReconstructionNonfiniteFallback,
+  MomentumExpandedFailureFallback,
+  MomentumInvalidInputFallback,
+  ProjectionGradientConditionFallback,
+  Count,
+};
+
+struct RemapDispatchAuditDeviceView {
+  int* counters = nullptr;
+  const std::uint8_t* feather_mask = nullptr;
+  int n_cells = 0;
+};
+
+bool remap_dispatch_audit_env_enabled();
+void remap_dispatch_audit_run_start(
+    const core::State& state,
+    const tenryu::parallel::Reduction* reduction,
+    int rank);
+void remap_dispatch_audit_flush();
+RemapDispatchAuditDeviceView remap_dispatch_audit_device_view();
+
+void gcl_audit_run_start(
+    const tenryu::parallel::Reduction* reduction,
+    int rank);
+void gcl_audit_flush();
+
+#if defined(__CUDACC__)
+__device__ inline void remap_dispatch_audit_count(
+    const RemapDispatchAuditDeviceView audit,
+    const RemapDispatchAuditCounter counter,
+    const int cell) {
+  if (audit.counters == nullptr) {
+    return;
+  }
+  const int index = static_cast<int>(counter);
+  constexpr int kCounterCount =
+      static_cast<int>(RemapDispatchAuditCounter::Count);
+  // These are observational COUNTS, not gate-quality reductions; integer
+  // atomicAdd ordering is therefore sufficient and cannot perturb physics.
+  atomicAdd(audit.counters + index, 1);
+  if (audit.feather_mask != nullptr && cell >= 0 && cell < audit.n_cells &&
+      audit.feather_mask[cell] != 0U) {
+    atomicAdd(audit.counters + kCounterCount + index, 1);
+  }
+}
+#endif
+
 struct CsrConsAuditContext {
   bool enabled = false;
   const tenryu::parallel::Reduction* reduction = nullptr;
@@ -84,6 +141,9 @@ __device__ double rz_reconstructed_face_value_z(int K,
 
 struct AleRemap2DRZResult {
   bool applied = false;
+  bool table_closure_rejected = false;  // §19: EOS predicate or boundary guard fired
+  int table_closure_bad_cells = 0;
+  int table_closure_first_status = 0;
   // Total stored-mass closure of this remap: (sum_post - sum_pre)/sum_pre
   // over ALL cells, measured unconditionally around the CSR remap body. A
   // committed remap must close at roundoff; a violation marks fabricated
@@ -130,6 +190,7 @@ struct AleRemap2DRZResult {
 
 struct AleRemap2DRZOverrides {
   bool force_total_energy_remap = false;
+  bool allow_table_eos_closure = false;  // §19 v1: transaction path only
   bool force_optionb_velocity_authority = false;
   bool force_optionb_coherent = false;
   bool force_optionb_coherent_transport = false;
@@ -146,6 +207,7 @@ struct AleRemap2DRZOverrides {
   // v1 restriction: mutually exclusive with the core_freeze velocity mask.
   const std::uint8_t* velocity_projection_frozen_node_mask = nullptr;
   const std::uint8_t* active_node_velocity_mask = nullptr;
+  const std::uint8_t* donor_fallback_cell_mask = nullptr;
 };
 
 struct CsrOptionBFaceColoring {
@@ -233,7 +295,6 @@ csr_optionb_corner_velocity_remap_component(
     const core::Config& cfg,
     CsrOptionBCornerVelocityRemapBuffers& buffers,
     bool force_apply = false,
-    bool force_swept_volume_sign_fixed = false,
     const double* target_cell_mass = nullptr,
     const double* source_v_r_override = nullptr,
     const double* source_v_z_override = nullptr,
@@ -248,7 +309,8 @@ csr_optionb_corner_velocity_remap_component(
     const std::uint8_t* assembly_cell_mask = nullptr,
     const std::uint8_t* active_node_velocity_mask = nullptr,
     const std::uint8_t* target_cell_mass_mask = nullptr,
-    const std::uint8_t* discard_reference_inactive_cell_mask = nullptr);
+    const std::uint8_t* discard_reference_inactive_cell_mask = nullptr,
+    const std::uint8_t* donor_fallback_cell_mask = nullptr);
 
 AleRemap2DRZResult ale_remap_2d_rz(core::State& state,
                                    const core::Config& cfg,

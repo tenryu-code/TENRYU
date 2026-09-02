@@ -9,6 +9,8 @@
 #include "core/config.hpp"
 #include "core/error.hpp"
 #include "core/namelist/errors.hpp"
+#include "core/state.hpp"
+#include "mesh/mesh.hpp"
 
 namespace tenryu::coupling {
 struct ProfileObservability;
@@ -33,6 +35,13 @@ inline bool effective_diagnostics_conservation_enabled(const Config& cfg) {
 
 inline bool effective_diagnostics_hotspot_gas_enabled(const Config& cfg) {
   return cfg.numerics.diagnostics.hotspot_gas.enabled;
+}
+
+inline void validate_dt_config(const Config& config) {
+  if (config.numerics.dt.min_consecutive_steps < 1) {
+    throw namelist::ValueError(
+        "Numerics.dt.min_consecutive_steps must be >= 1");
+  }
 }
 
 inline bool effective_diagnostics_ale_provenance_emission_enabled(
@@ -62,6 +71,116 @@ inline bool is_icf_standard_ale_claim_level(const std::string& value) {
 inline bool is_polar_family(const std::string& logical_mesh_2d) {
   return logical_mesh_2d == "spherical_polar_halfplane" ||
          logical_mesh_2d == "polar_in_box";
+}
+
+inline void validate_reale_v2_config(const Config& config) {
+  const std::string& mode = config.numerics.ale.mesh_mode;
+  if (mode != "fixed" && mode != "reale_v2") {
+    throw namelist::ConfigError(
+        "Numerics.ale.mesh_mode must be one of {\"fixed\", \"reale_v2\"}");
+  }
+  const std::string& reale_core = config.numerics.ale.reale_core;
+  if (reale_core != "exact" && reale_core != "legacy") {
+    throw namelist::ConfigError(
+        "Numerics.ale.reale_core must be one of {\"exact\", \"legacy\"}");
+  }
+  if (config.numerics.ale.tess_gpu_restrict &&
+      !config.numerics.ale.tess_gpu_dual) {
+    throw namelist::ConfigError(
+        "Numerics.ale.tess_gpu_restrict requires tess_gpu_dual=True "
+        "(the classify kernel consumes the dual batch's device buffers)");
+  }
+  if (!(config.numerics.ale.rezone_min_dt_s >= 0.0)) {
+    throw namelist::ConfigError(
+        "Numerics.ale.rezone_min_dt_s must be >= 0");
+  }
+  if (mode == "fixed") {
+    return;
+  }
+  if (reale_core == "legacy") {
+    throw namelist::ConfigError(
+        "Numerics.ale.reale_core=\"legacy\" cannot run "
+        "mesh_mode=\"reale_v2\": the legacy builder emits no boundary "
+        "provenance and every rezone fails the carrier gates (see "
+        "authority_inversion_triage)");
+  }
+  if (config.main.dimension != "2D_RZ" || config.main.dim != 2) {
+    throw namelist::ConfigError(
+        "Numerics.ale.mesh_mode=\"reale_v2\" requires Main.dimension=\"2D_RZ\"");
+  }
+  if (config.mesh.topology_scheme !=
+          TopologyScheme::MULTIBLOCK_POLAR_TIER ||
+      !config.mesh.polar_tier_native_pentagon ||
+      corner_stride_for_config(config) !=
+          mesh::kMeshTopoCellStorageSlotsMaxGeneral) {
+    throw namelist::ConfigError(
+        "Numerics.ale.mesh_mode=\"reale_v2\" pilot requires stride-16 "
+        "Mesh.topology_scheme=\"multiblock_polar_tier\" with "
+        "polar_tier_native_pentagon=true");
+  }
+  if (config.materials.materials.size() != 1U) {
+    throw namelist::ConfigError(
+        "Numerics.ale.mesh_mode=\"reale_v2\" pilot requires exactly one "
+        "material");
+  }
+  if (config.numerics.materials.per_material_conservation_enabled ||
+      config.numerics.plic.enabled) {
+    throw namelist::ConfigError(
+        "Numerics.ale.mesh_mode=\"reale_v2\" pilot rejects per-material "
+        "conservation and PLIC state");
+  }
+  if (!config.numerics.hydro.enabled || config.radiation.enabled ||
+      config.numerics.conduction.enabled || config.laser.enabled ||
+      config.burn.enabled) {
+    throw namelist::ConfigError(
+        "Numerics.ale.mesh_mode=\"reale_v2\" pilot is hydro-only: hydro must "
+        "be enabled and radiation, conduction, laser, and burn must be "
+        "disabled");
+  }
+  if (config.mesh.motion == "ale" && config.numerics.ale.enabled) {
+    throw namelist::ConfigError(
+        "Numerics.ale.mesh_mode=\"reale_v2\" rejects the armed legacy ALE "
+        "lane (Mesh.motion=\"ale\" with Numerics.ale.enabled=true): legacy "
+        "multiblock rezone/remap kernels carry fixed 4/8-slot cell buffers "
+        "that cannot accept general reale cells; set "
+        "Numerics.ale.enabled=false (Mesh.motion=\"ale\" alone is accepted)");
+  }
+}
+
+inline void validate_z_reflection_config(const Config& config) {
+  const std::string& mode = config.numerics.z_reflection.mode;
+  if (mode == "enforce") {
+    throw namelist::ConfigError(
+        "Numerics.z_reflection.mode=enforce was retracted (user ruling "
+        "2026-08-31: answer-shaping state corrections are forbidden); use "
+        "\"audit\" for measurement");
+  }
+  if (mode != "off" && mode != "audit") {
+    throw namelist::ConfigError(
+        "Numerics.z_reflection.mode must be one of "
+        "{\"off\", \"audit\"}");
+  }
+  if (mode == "off") {
+    return;
+  }
+
+  const auto& perturbation =
+      config.numerics.hydro.pressure_drive_perturbation;
+  const bool has_odd_mode =
+      std::any_of(perturbation.mode_l.begin(),
+                  perturbation.mode_l.end(),
+                  [](const int l) { return l % 2 != 0; });
+  const bool has_random_perturbation = perturbation.random_rms != 0.0;
+  const bool has_spots = !perturbation.spot_theta0.empty() ||
+                         !perturbation.spot_sigma.empty() ||
+                         !perturbation.spot_amp.empty();
+  // Lasers, callbacks, and materials join this certification list when those
+  // systems are enabled in this vehicle.
+  if (has_odd_mode || has_random_perturbation || has_spots) {
+    throw namelist::ConfigError(
+        "Numerics.z_reflection requires an exactly even drive: odd Legendre "
+        "modes, random perturbations, and unpaired spots are ineligible");
+  }
 }
 
 inline void validate_multigroup_diffusion_config(const Config& config) {
@@ -117,6 +236,175 @@ inline void validate_hydro_av_config(const Config& config) {
   if (!(numerics.hydro.csw_C2 >= 0.0)) {
     throw namelist::ValueError("Numerics.hydro.csw_C2 must be >= 0");
   }
+  if (!(numerics.hydro.tensor_av_C1 >= 0.0 &&
+        numerics.hydro.tensor_av_C1 <= 10.0)) {
+    throw namelist::ValueError(
+        "Numerics.hydro.tensor_av_C1 must be in [0, 10]");
+  }
+  if (!(numerics.hydro.tensor_av_C2 >= 0.0 &&
+        numerics.hydro.tensor_av_C2 <= 10.0)) {
+    throw namelist::ValueError(
+        "Numerics.hydro.tensor_av_C2 must be in [0, 10]");
+  }
+  if (!(numerics.hydro.csw_rz_lift_guard_ratio >= 1.0 &&
+        numerics.hydro.csw_rz_lift_guard_ratio <= 64.0)) {
+    throw namelist::ValueError(
+        "Numerics.hydro.csw_rz_lift_guard_ratio must be in [1, 64]");
+  }
+  if (numerics.hydro.csw_rz_lift_enabled &&
+      (numerics.hydro.av_model != AvModel::CswEdgeCsw98 ||
+       !numerics.hydro.aw_compatible_force_work ||
+       !mesh::mesh_topo_is_multiblock(config.mesh))) {
+    throw namelist::ConfigError(
+        "csw_rz_lift requires av_model=csw_edge_csw98 with the AW trio on a "
+        "multiblock topology (v1 scope)");
+  }
+  if (!(numerics.hydro.csw_pole_floor_sigma0 >= 0.0 &&
+        numerics.hydro.csw_pole_floor_sigma0 <= 4.0)) {
+    throw namelist::ValueError(
+        "Numerics.hydro.csw_pole_floor_sigma0 must be in [0, 4]");
+  }
+  if (!(numerics.hydro.csw_pole_floor_theta0_rad >= 0.0 &&
+        numerics.hydro.csw_pole_floor_theta0_rad <= 0.5)) {
+    throw namelist::ValueError(
+        "Numerics.hydro.csw_pole_floor_theta0_rad must be in [0, 0.5]");
+  }
+  if (!(numerics.hydro.csw_pole_floor_thetaf_rad >= 0.0 &&
+        numerics.hydro.csw_pole_floor_thetaf_rad <= 0.5)) {
+    throw namelist::ValueError(
+        "Numerics.hydro.csw_pole_floor_thetaf_rad must be in [0, 0.5]");
+  }
+  if (!(numerics.hydro.csw_pole_desens_alpha >= 0.0 &&
+        numerics.hydro.csw_pole_desens_alpha <= 0.9)) {
+    throw namelist::ValueError(
+        "Numerics.hydro.csw_pole_desens_alpha must be in [0, 0.9]");
+  }
+  if (!(numerics.hydro.csw_pole_desens_theta0_rad >= 0.0 &&
+        numerics.hydro.csw_pole_desens_theta0_rad <= 0.5)) {
+    throw namelist::ValueError(
+        "Numerics.hydro.csw_pole_desens_theta0_rad must be in [0, 0.5]");
+  }
+  if (!(numerics.hydro.csw_pole_desens_thetaf_rad >= 0.0 &&
+        numerics.hydro.csw_pole_desens_thetaf_rad <= 0.5)) {
+    throw namelist::ValueError(
+        "Numerics.hydro.csw_pole_desens_thetaf_rad must be in [0, 0.5]");
+  }
+  if (numerics.hydro.csw_pole_desens_enabled &&
+      numerics.hydro.csw_pole_floor_enabled) {
+    throw namelist::ConfigError(
+        "csw_pole_desens and csw_pole_floor are mutually exclusive");
+  }
+  if (numerics.hydro.csw_pole_floor_enabled &&
+      (numerics.hydro.av_model != AvModel::CswEdgeCsw98 ||
+       !mesh::mesh_topo_is_multiblock(config.mesh))) {
+    throw namelist::ConfigError(
+        "csw_pole_floor requires av_model=csw_edge_csw98 on a multiblock "
+        "topology (v1 scope)");
+  }
+  if (numerics.hydro.csw_pole_desens_enabled &&
+      (numerics.hydro.av_model != AvModel::CswEdgeCsw98 ||
+       !mesh::mesh_topo_is_multiblock(config.mesh))) {
+    throw namelist::ConfigError(
+        "csw_pole_desens requires av_model=csw_edge_csw98 on a multiblock "
+        "topology (v1 scope)");
+  }
+  if (!(numerics.hydro.csw_polar_slaving_min_columns >= 8 &&
+        numerics.hydro.csw_polar_slaving_min_columns <= 4096)) {
+    throw namelist::ValueError(
+        "Numerics.hydro.csw_polar_slaving_min_columns must be in [8, 4096]");
+  }
+  if (!(numerics.hydro.csw_polar_slaving_full_columns >= 1 &&
+        numerics.hydro.csw_polar_slaving_full_columns < 32)) {
+    throw namelist::ValueError(
+        "Numerics.hydro.csw_polar_slaving_full_columns must be in [1, 32)");
+  }
+  if (!(numerics.hydro.csw_polar_slaving_outer_columns >
+            numerics.hydro.csw_polar_slaving_full_columns &&
+        numerics.hydro.csw_polar_slaving_outer_columns < 64)) {
+    throw namelist::ValueError(
+        "Numerics.hydro.csw_polar_slaving_outer_columns must be in "
+        "(full_columns, 64)");
+  }
+  if (!(numerics.hydro.csw_polar_slaving_chi_on >= 0.0 &&
+        numerics.hydro.csw_polar_slaving_chi_full >
+            numerics.hydro.csw_polar_slaving_chi_on &&
+        numerics.hydro.csw_polar_slaving_chi_full <= 10.0)) {
+    throw namelist::ValueError(
+        "Numerics.hydro polar-slaving chi values must satisfy "
+        "0 <= chi_on < chi_full <= 10");
+  }
+  if (!(numerics.hydro.csw_polar_slaving_strength >= 0.0 &&
+        numerics.hydro.csw_polar_slaving_strength <= 1.0)) {
+    throw namelist::ValueError(
+        "Numerics.hydro.csw_polar_slaving_strength must be in [0, 1]");
+  }
+  if (!(numerics.hydro.csw_polar_slaving_av_stiffness_sigma > 0.0 &&
+        numerics.hydro.csw_polar_slaving_av_stiffness_sigma <= 1.0)) {
+    throw namelist::ValueError(
+        "Numerics.hydro.csw_polar_slaving_av_stiffness_sigma must be in "
+        "(0, 1]");
+  }
+  if (numerics.hydro.csw_polar_slaving_enabled &&
+      (main.dimension != "2D_RZ" ||
+       numerics.hydro.av_model != AvModel::CswEdgeCsw98 ||
+       !mesh::mesh_topo_is_multiblock(config.mesh))) {
+    throw namelist::ConfigError(
+        "csw_polar_slaving requires 2D_RZ, av_model=csw_edge_csw98, and a "
+        "multiblock topology");
+  }
+  if (numerics.hydro.csw_polar_slaving_enabled &&
+      (numerics.hydro.csw_pole_floor_enabled ||
+       numerics.hydro.csw_pole_desens_enabled)) {
+    throw namelist::ConfigError(
+        "csw_polar_slaving is mutually exclusive with csw_pole_floor and "
+        "csw_pole_desens");
+  }
+  if (numerics.hydro.csw_polar_slaving_av_stiffness_cfl_enabled &&
+      (!numerics.hydro.csw_polar_slaving_enabled ||
+       numerics.hydro.rz_momentum_scheme != "area_weighted_symmetric")) {
+    throw namelist::ConfigError(
+        "csw_polar_slaving_av_stiffness_cfl requires "
+        "csw_polar_slaving_enabled=true and "
+        "rz_momentum_scheme=\"area_weighted_symmetric\" (v1 scope)");
+  }
+  if (!(numerics.hydro.wake_heat_flux_CE >= 0.0 &&
+        numerics.hydro.wake_heat_flux_CE <= 1.0)) {
+    throw namelist::ValueError(
+        "Numerics.hydro.wake_heat_flux_CE must be in [0, 1]");
+  }
+  if (!(numerics.hydro.wake_heat_flux_theta_a_rad >= 0.0 &&
+        numerics.hydro.wake_heat_flux_theta_b_rad >
+            numerics.hydro.wake_heat_flux_theta_a_rad &&
+        numerics.hydro.wake_heat_flux_theta_b_rad <= 3.14159265358979323846)) {
+    throw namelist::ValueError(
+        "Numerics.hydro wake-heat-flux angles must satisfy "
+        "0 <= theta_a_rad < theta_b_rad <= pi");
+  }
+  if (numerics.hydro.wake_heat_flux_enabled) {
+    if (main.dimension != "2D_RZ" ||
+        numerics.hydro.av_model != AvModel::CswEdgeCsw98 ||
+        !mesh::mesh_topo_is_multiblock(config.mesh)) {
+      throw namelist::ConfigError(
+          "wake_heat_flux v1 requires 2D_RZ, av_model=csw_edge_csw98, "
+          "and a multiblock topology");
+    }
+    if (!main.restart_from.empty()) {
+      throw namelist::ConfigError(
+          "wake_heat_flux v1 does not support restart_from");
+    }
+    if (numerics.ale.band_ale.enabled) {
+      throw namelist::ConfigError(
+          "wake_heat_flux v1 does not support band_ale (eta/zeta are not "
+          "remap-transported yet)");
+    }
+  }
+  if (numerics.hydro.csw_axis_mirror_limiter &&
+      (numerics.hydro.av_model != AvModel::CswEdgeCsw98 ||
+       !mesh::mesh_topo_is_multiblock(config.mesh))) {
+    throw namelist::ConfigError(
+        "csw_axis_mirror_limiter requires av_model=csw_edge_csw98 on a "
+        "multiblock topology");
+  }
   if (!(numerics.hydro.av_cfl_coefficient > 0.0)) {
     throw namelist::ValueError(
         "Numerics.hydro.av_cfl_coefficient must be > 0");
@@ -134,18 +422,59 @@ inline void validate_hydro_av_config(const Config& config) {
     throw namelist::ValueError(
         "Numerics.hydro.anti_hourglass_kappa must be > 0");
   }
+  if (!(std::isfinite(numerics.hydro.pentagon_affine_null_kappa) &&
+        numerics.hydro.pentagon_affine_null_kappa >= 0.0 &&
+        numerics.hydro.pentagon_affine_null_kappa <= 1.0)) {
+    throw namelist::ValueError(
+        "Numerics.hydro.pentagon_affine_null_kappa must be finite and "
+        "in [0, 1]");
+  }
+  if (numerics.hydro.aw_compatible_force_work &&
+      (numerics.hydro.rz_momentum_scheme != "area_weighted_symmetric" ||
+       (numerics.hydro.av_model != AvModel::CswEdge &&
+        numerics.hydro.av_model != AvModel::CswEdgeCsw98 &&
+        numerics.hydro.av_model != AvModel::MimeticTensorV1) ||
+       !numerics.hydro.subzonal_pressure_enabled)) {
+    throw namelist::ConfigError(
+        "Numerics.hydro.aw_compatible_force_work requires "
+        "rz_momentum_scheme=\"area_weighted_symmetric\" with "
+        "av_model=\"csw_edge\", \"csw_edge_csw98\" or "
+        "\"mimetic_tensor_v1\" and subzonal_pressure_enabled=true");
+  }
+  if (numerics.hydro.aw_compatible_force_work &&
+      config.mesh.polar_center_treatment == "button") {
+    throw namelist::ConfigError(
+        "Numerics.hydro.aw_compatible_force_work is not yet supported with "
+        "the multiblock cart-core button center (fixed 4-corner compatible "
+        "buffers; the Phase III polar-tier center removes this restriction)");
+  }
+  if (numerics.hydro.aw_compatible_force_work &&
+      config.mesh.polar_center_treatment == "tri_fan") {
+    throw namelist::ConfigError(
+        "Numerics.hydro.aw_compatible_force_work is not yet supported with "
+        "the tri_fan center (fixed 4-corner compatible buffers; the Phase III "
+        "polar-tier center adds the mixed-cell force forms)");
+  }
   if (numerics.hydro.av_model == AvModel::CswEdgePlusTensorLimited) {
     throw namelist::ConfigError(
         "Stage G tensor AV is not yet implemented; use csw_edge");
   }
+  if (numerics.hydro.av_model == AvModel::MimeticTensorV1 &&
+      (!numerics.hydro.aw_compatible_force_work || main.dim != 2)) {
+    throw namelist::ConfigError(
+        "mimetic_tensor_v1 v1 supports the AW compatible trio only "
+        "(aw_compatible_force_work=true, 2D)");
+  }
   if (numerics.hydro.av_model == AvModel::CswEdge &&
-      !numerics.hydro.subzonal_pressure_enabled) {
+      !numerics.hydro.subzonal_pressure_enabled &&
+      !numerics.hydro.aw_compatible_force_work) {
     throw namelist::ConfigError(
         "Phase 4 csw_edge AV requires subzonal_pressure_enabled=true "
         "(DRACO/HYDRA pair)");
   }
   if (numerics.hydro.av_model == AvModel::ScalarVnrLegacy &&
-      numerics.hydro.subzonal_pressure_enabled) {
+      numerics.hydro.subzonal_pressure_enabled &&
+      !numerics.hydro.aw_compatible_force_work) {
     throw namelist::ConfigError(
         "Subzonal pressure requires av_model=csw_edge (DRACO/HYDRA pair)");
   }
@@ -161,12 +490,14 @@ inline void validate_hydro_av_config(const Config& config) {
           "Numerics.hydro.rz_momentum_scheme=\"area_weighted_symmetric\" "
           "is supported only in 2D_RZ");
     }
-    if (numerics.hydro.av_model != AvModel::ScalarVnrLegacy) {
+    if (numerics.hydro.av_model != AvModel::ScalarVnrLegacy &&
+        !numerics.hydro.aw_compatible_force_work) {
       throw namelist::ConfigError(
           "Numerics.hydro.rz_momentum_scheme=\"area_weighted_symmetric\" "
           "requires av_model=\"scalar_vnr_legacy\"");
     }
-    if (numerics.hydro.subzonal_pressure_enabled) {
+    if (numerics.hydro.subzonal_pressure_enabled &&
+        !numerics.hydro.aw_compatible_force_work) {
       throw namelist::ConfigError(
           "Numerics.hydro.rz_momentum_scheme=\"area_weighted_symmetric\" "
           "requires subzonal_pressure_enabled=false");
@@ -363,13 +694,21 @@ inline void validate_central_pseudo_core_config(const Config& config) {
     throw namelist::ConfigError(
         "Numerics.ale.central_pseudo_core_enabled=true is supported only in 2D_RZ");
   }
-  if (config.mesh.topology_scheme !=
-          TopologyScheme::MULTIBLOCK_HALF_BUTTERFLY_5BLOCK &&
-      config.mesh.topology_scheme !=
-          TopologyScheme::MULTIBLOCK_HALF_BUTTERFLY_TRIFAN_CAP_5BLOCK) {
+  const bool five_block =
+      config.mesh.topology_scheme ==
+          TopologyScheme::MULTIBLOCK_HALF_BUTTERFLY_5BLOCK ||
+      config.mesh.topology_scheme ==
+          TopologyScheme::MULTIBLOCK_HALF_BUTTERFLY_TRIFAN_CAP_5BLOCK;
+  const bool hybrid_trifan_cap =
+      config.mesh.topology_scheme ==
+          TopologyScheme::MULTIBLOCK_POLAR_TIER_CART_CENTER &&
+      config.mesh.polar_tier_center_kind == "trifan_cap";
+  if (!five_block && !hybrid_trifan_cap) {
     throw namelist::ConfigError(
         "Numerics.ale.central_pseudo_core_enabled=true requires a 5-block "
-        "multiblock center topology");
+        "multiblock center topology or "
+        "Mesh.topology_scheme=\"multiblock_polar_tier_cart_center\" with "
+        "Mesh.polar_tier_center_kind=\"trifan_cap\"");
   }
   if (config.numerics.materials.per_material_conservation_enabled) {
     throw namelist::ConfigError(
@@ -377,12 +716,14 @@ inline void validate_central_pseudo_core_config(const Config& config) {
         "per-material conservation in Exp1");
   }
   if ((config.numerics.hydro.av_model != AvModel::CswEdge &&
-       config.numerics.hydro.av_model != AvModel::CswEdgeCsw98) ||
+       config.numerics.hydro.av_model != AvModel::CswEdgeCsw98 &&
+       config.numerics.hydro.av_model != AvModel::MimeticTensorV1) ||
       !config.numerics.hydro.subzonal_pressure_enabled) {
     throw namelist::ConfigError(
         "Numerics.ale.central_pseudo_core_enabled=true requires the 2D "
         "compatible pressure-force path: Numerics.hydro.av_model='csw_edge' "
-        "or 'csw_edge_csw98', and subzonal_pressure_enabled=true");
+        "or 'csw_edge_csw98' or 'mimetic_tensor_v1', and "
+        "subzonal_pressure_enabled=true");
   }
   if (!(config.numerics.ale.central_pseudo_core_s_c > 0.0)) {
     throw namelist::ValueError(
@@ -397,11 +738,282 @@ inline bool is_cart_core_parameterized_topology(const TopologyScheme scheme) {
   return scheme == TopologyScheme::MULTIBLOCK_CART_CORE_POLAR_SHELL ||
          scheme == TopologyScheme::MULTIBLOCK_HALF_BUTTERFLY_5BLOCK ||
          scheme ==
-             TopologyScheme::MULTIBLOCK_HALF_BUTTERFLY_TRIFAN_CAP_5BLOCK;
+             TopologyScheme::MULTIBLOCK_HALF_BUTTERFLY_TRIFAN_CAP_5BLOCK ||
+         scheme == TopologyScheme::MULTIBLOCK_POLAR_TIER_CART_CENTER;
+}
+
+inline void validate_polar_tier_topology_config(const Config& config) {
+  const auto& mesh = config.mesh;
+  const bool hybrid =
+      mesh.topology_scheme ==
+      TopologyScheme::MULTIBLOCK_POLAR_TIER_CART_CENTER;
+  if (mesh.topology_scheme != TopologyScheme::MULTIBLOCK_POLAR_TIER &&
+      !hybrid) {
+    return;
+  }
+  if (config.main.dimension != "2D_RZ" || config.main.dim != 2) {
+    throw namelist::ConfigError(
+        "Mesh.topology_scheme=\"multiblock_polar_tier\" requires "
+        "Main.dimension=\"2D_RZ\" and Main.dim=2");
+  }
+  if (mesh.logical_mesh_2d != "spherical_polar_halfplane") {
+    throw namelist::ConfigError(
+        "Mesh.topology_scheme=\"multiblock_polar_tier\" requires "
+        "Mesh.logical_mesh_2d=\"spherical_polar_halfplane\"");
+  }
+  if (mesh.polar_equal_mu_zoning ||
+      !mesh.grid_segments_theta.empty() ||
+      !mesh.explicit_nodes_theta.empty()) {
+    throw namelist::ConfigError(
+        "multiblock_polar_tier requires the canonical equiangular theta "
+        "ladder and rejects polar_equal_mu_zoning, grid_theta, and "
+        "explicit_nodes_theta");
+  }
+  if (!(std::isfinite(mesh.multiblock_cart_core_r_match) &&
+        mesh.multiblock_cart_core_r_match > 0.0 &&
+        std::isfinite(mesh.spherical_polar_s_max) &&
+        mesh.spherical_polar_s_max >
+            mesh.multiblock_cart_core_r_match)) {
+    throw namelist::ConfigError(
+        "multiblock_polar_tier requires finite "
+        "0 < multiblock_cart_core_r_match < spherical_polar_s_max");
+  }
+  if (!(std::isfinite(mesh.polar_tier_chi_lo) &&
+        std::isfinite(mesh.polar_tier_chi_hi) &&
+        mesh.polar_tier_chi_lo > 0.0 &&
+        mesh.polar_tier_chi_hi > mesh.polar_tier_chi_lo)) {
+    throw namelist::ConfigError(
+        "Mesh.polar_tier_chi_lo/chi_hi must be finite with "
+        "0 < chi_lo < chi_hi");
+  }
+  if (mesh.polar_tier_belt_rows != 1 &&
+      mesh.polar_tier_belt_rows != 2 &&
+      mesh.polar_tier_belt_rows != 3) {
+    throw namelist::ConfigError(
+        "Mesh.polar_tier_belt_rows must be one of {1, 2, 3}");
+  }
+  if (mesh.polar_tier_fan_sectors != 6 &&
+      mesh.polar_tier_fan_sectors != 12) {
+    throw namelist::ConfigError(
+        "Mesh.polar_tier_fan_sectors must be 6 or 12");
+  }
+  if (mesh.polar_tier_min_tier_columns !=
+      mesh.polar_tier_fan_sectors) {
+    throw namelist::ConfigError(
+        "Mesh.polar_tier_min_tier_columns must equal "
+        "Mesh.polar_tier_fan_sectors for a conforming center fan");
+  }
+  if (mesh.polar_tier_belt_rows == 2 &&
+      mesh.polar_tier_min_tier_columns % 4 != 0) {
+    throw namelist::ConfigError(
+        "Mesh.polar_tier_belt_rows=2 requires every coarse tier column "
+        "count to be divisible by 4");
+  }
+  if (mesh.polar_tier_belt_rows == 3 &&
+      mesh.polar_tier_min_tier_columns % 6 != 0) {
+    throw namelist::ConfigError(
+        "Mesh.polar_tier_belt_rows=3 requires every coarse tier column "
+        "count to be divisible by 6");
+  }
+  if (!(std::isfinite(mesh.polar_tier_fan_first_ring_radius_cm) &&
+        mesh.polar_tier_fan_first_ring_radius_cm >= 0.0)) {
+    throw namelist::ConfigError(
+        "Mesh.polar_tier_fan_first_ring_radius_cm must be finite and >= 0");
+  }
+  if (mesh.polar_center_treatment != "annular" ||
+      mesh.polar_theta_min != 0.0 ||
+      !mesh.multiblock_outer_svec_tangent_balance) {
+    throw namelist::ConfigError(
+        "multiblock_polar_tier rejects button/tri_fan-specific center "
+        "settings and requires the default outer-shell Svec balance");
+  }
+  if (hybrid && mesh.shell_polar_cap_dendrite) {
+    throw namelist::ConfigError(
+        "multiblock_polar_tier_cart_center with "
+        "Mesh.shell_polar_cap_dendrite=true lands with the svec "
+        "shell-chain generalization wave");
+  }
+
+  const PolarTierLayout layout = make_polar_tier_layout(mesh);
+  if (layout.tier_columns.empty() ||
+      layout.tier_columns.front() != mesh.nz ||
+      layout.tier_columns.back() !=
+          mesh.polar_tier_min_tier_columns) {
+    throw namelist::ConfigError(
+        "Mesh.nz must equal polar_tier_min_tier_columns times an exact "
+        "power of two");
+  }
+  if (!(std::isfinite(layout.h_r) && layout.h_r > 0.0 &&
+        std::isfinite(layout.fan_radius) &&
+        layout.fan_radius > 0.0)) {
+    throw namelist::ConfigError(
+        "multiblock_polar_tier radial ladder cannot place a valid fan "
+        "first ring");
+  }
+  if (layout.transition_radii.size() + 1U !=
+          layout.tier_columns.size() ||
+      layout.tier_radial_rows.size() != layout.tier_columns.size() ||
+      layout.tier_outer_radii.size() != layout.tier_columns.size() ||
+      layout.tier_inner_radii.size() != layout.tier_columns.size() ||
+      layout.tier_radial_spacings.size() != layout.tier_columns.size() ||
+      (mesh.polar_tier_belt_rows > 1 &&
+       (layout.transition_outer_radii.size() !=
+            layout.transition_radii.size() ||
+        layout.transition_inner_radii.size() !=
+            layout.transition_radii.size() ||
+        layout.transition_intermediate_columns.size() !=
+            layout.transition_radii.size() ||
+        layout.transition_intermediate_radii.size() !=
+            layout.transition_radii.size()))) {
+    throw namelist::ConfigError(
+        "multiblock_polar_tier cannot place a complete uniform tier ladder "
+        "ending at the fan first ring; for N0=12 try "
+        "polar_tier_fan_sectors=6");
+  }
+  for (std::size_t tier = 0;
+       tier < layout.tier_radial_rows.size(); ++tier) {
+    if (layout.tier_radial_rows[tier] < 1 ||
+        !(std::isfinite(layout.tier_outer_radii[tier]) &&
+          std::isfinite(layout.tier_inner_radii[tier]) &&
+          std::isfinite(layout.tier_radial_spacings[tier]) &&
+          layout.tier_outer_radii[tier] >
+              layout.tier_inner_radii[tier] &&
+          layout.tier_radial_spacings[tier] > 0.0)) {
+      throw namelist::ConfigError(
+          "multiblock_polar_tier requires a positive uniform radial ladder "
+          "in every tier");
+    }
+  }
+  double previous_radius = mesh.multiblock_cart_core_r_match;
+  for (std::size_t transition = 0;
+       transition < layout.transition_radii.size(); ++transition) {
+    const double radius = layout.transition_radii[transition];
+    const double chi_fine = layout.transition_chi_fine[transition];
+    const double chi_coarse = layout.transition_chi_coarse[transition];
+    if (!(std::isfinite(radius) && radius < previous_radius &&
+          radius >= layout.fan_radius &&
+          chi_fine >= 0.70 && chi_fine <= 0.85 &&
+          chi_coarse >= 1.40 && chi_coarse <= 1.70)) {
+      throw namelist::ConfigError(
+          "multiblock_polar_tier snapped transition violates monotonicity, "
+          "fan-radius ordering, or the chi fine/coarse bands");
+    }
+    previous_radius = radius;
+  }
+  if (!(layout.n_cells > 0 && layout.n_nodes > 0 &&
+        layout.n_cells <= std::numeric_limits<int>::max() &&
+        layout.n_nodes <= std::numeric_limits<int>::max())) {
+    throw namelist::ConfigError(
+        "multiblock_polar_tier cell/node counts exceed supported range");
+  }
+  if (hybrid) {
+    if (mesh.polar_tier_cart_cut_ring <= 0) {
+      throw namelist::ConfigError(
+          "Mesh.polar_tier_cart_cut_ring must be > 0 for "
+          "multiblock_polar_tier_cart_center");
+    }
+    PolarTierTruncation truncation;
+    (void)make_polar_tier_layout_truncated(
+        mesh, mesh.polar_tier_cart_cut_ring, &truncation);
+    const int derived_n_c = truncation.n_theta_cut / 4;
+    if (mesh.multiblock_cart_core_n_c != -1 &&
+        mesh.multiblock_cart_core_n_c != derived_n_c) {
+      throw namelist::ConfigError(
+          "Mesh.multiblock_cart_core_n_c=" +
+          std::to_string(mesh.multiblock_cart_core_n_c) +
+          " does not match the cut-ring-derived value " +
+          std::to_string(derived_n_c));
+    }
+    // multiblock_cart_core_r_match remains the parent polar-ladder scale;
+    // the cart-side seam radius is exclusively the realized r_cut.
+    if (!(std::isfinite(mesh.multiblock_cart_core_r_c) &&
+          mesh.multiblock_cart_core_r_c > 0.0 &&
+          std::sqrt(2.0) * mesh.multiblock_cart_core_r_c <
+              truncation.r_cut)) {
+      throw namelist::ConfigError(
+          "Mesh.multiblock_cart_core_r_c must be finite and satisfy "
+          "0 < r_c < r_cut/sqrt(2) for "
+          "multiblock_polar_tier_cart_center");
+    }
+    if (mesh.multiblock_cart_core_bridge_layers < 1) {
+      throw namelist::ConfigError(
+          "Mesh.multiblock_cart_core_bridge_layers must be >= 1 for "
+          "multiblock_polar_tier_cart_center");
+    }
+    if (mesh.multiblock_cart_core_bridge_grading != "uniform" &&
+        mesh.multiblock_cart_core_bridge_grading != "log") {
+      throw namelist::ConfigError(
+          "multiblock_polar_tier_cart_center requires "
+          "Mesh.multiblock_cart_core_bridge_grading=\"uniform\" or "
+          "\"log\"");
+    }
+    if (mesh.multiblock_cart_core_bridge_grading == "log" &&
+        mesh.polar_tier_center_kind != "trifan_cap") {
+      throw namelist::ConfigError(
+          "Mesh.multiblock_cart_core_bridge_grading=\"log\" requires "
+          "Mesh.polar_tier_center_kind=\"trifan_cap\"");
+    }
+    if (mesh.multiblock_transition_scheme !=
+        MultiblockTransitionScheme::HERMITE_BRIDGE) {
+      throw namelist::ConfigError(
+          "multiblock_polar_tier_cart_center requires "
+          "Mesh.multiblock_transition_scheme=\"hermite_bridge\"");
+    }
+  }
+}
+
+inline void validate_polar_tier_runtime_config(const Config& config) {
+  if (config.mesh.topology_scheme !=
+          TopologyScheme::MULTIBLOCK_POLAR_TIER &&
+      config.mesh.topology_scheme !=
+          TopologyScheme::MULTIBLOCK_POLAR_TIER_CART_CENTER) {
+    return;
+  }
+  if (config.numerics.hydro.enabled &&
+      !config.mesh.polar_tier_hydro_enabled) {
+    throw namelist::ConfigError(
+        "running hydro with Mesh.topology_scheme=\"multiblock_polar_tier\" "
+        "requires Mesh.polar_tier_hydro_enabled=true");
+  }
+  const auto& hydro = config.numerics.hydro;
+  if (hydro.enabled &&
+      (!hydro.aw_compatible_force_work ||
+       hydro.rz_momentum_scheme != "area_weighted_symmetric" ||
+       (hydro.av_model != AvModel::CswEdge &&
+        hydro.av_model != AvModel::CswEdgeCsw98 &&
+        hydro.av_model != AvModel::MimeticTensorV1) ||
+       !hydro.subzonal_pressure_enabled)) {
+    throw namelist::ConfigError(
+        "Mesh.polar_tier_hydro_enabled=true requires the mixed-cell hydro "
+        "trio: rz_momentum_scheme=\"area_weighted_symmetric\", "
+        "aw_compatible_force_work=true, av_model=\"csw_edge\", "
+        "\"csw_edge_csw98\" or \"mimetic_tensor_v1\", and "
+        "subzonal_pressure_enabled=true");
+  }
 }
 
 inline void validate_multiblock_topology_config(const Config& config) {
   const auto& mesh = config.mesh;
+  if (mesh.polar_tier_center_kind != "cart_box" &&
+      mesh.polar_tier_center_kind != "trifan_cap") {
+    throw namelist::ConfigError(
+        "Mesh.polar_tier_center_kind must be one of "
+        "{\"cart_box\", \"trifan_cap\"}");
+  }
+  if (mesh.topology_scheme !=
+          TopologyScheme::MULTIBLOCK_POLAR_TIER_CART_CENTER &&
+      mesh.polar_tier_center_kind != "cart_box") {
+    throw namelist::ConfigError(
+        "Mesh.polar_tier_center_kind is only meaningful for "
+        "Mesh.topology_scheme=\"multiblock_polar_tier_cart_center\"");
+  }
+  if (mesh.topology_scheme !=
+          TopologyScheme::MULTIBLOCK_POLAR_TIER_CART_CENTER &&
+      mesh.polar_tier_cart_cut_ring != -1) {
+    throw namelist::ConfigError(
+        "Mesh.polar_tier_cart_cut_ring is only meaningful for "
+        "Mesh.topology_scheme=\"multiblock_polar_tier_cart_center\"");
+  }
   if (!(std::isfinite(mesh.multiblock_cap_p) &&
         mesh.multiblock_cap_p > 2.0)) {
     throw namelist::ConfigError(
@@ -422,7 +1034,9 @@ inline void validate_multiblock_topology_config(const Config& config) {
        mesh.multiblock_transition_scheme ==
            MultiblockTransitionScheme::ROUNDED_CORE_SEAM) &&
       mesh.topology_scheme !=
-          TopologyScheme::MULTIBLOCK_CART_CORE_POLAR_SHELL) {
+          TopologyScheme::MULTIBLOCK_CART_CORE_POLAR_SHELL &&
+      mesh.topology_scheme !=
+          TopologyScheme::MULTIBLOCK_POLAR_TIER_CART_CENTER) {
     throw namelist::ConfigError(
         "Mesh.multiblock_transition_scheme=\"rounded_half_butterfly\" or "
         "\"rounded_core_seam\" "
@@ -522,8 +1136,21 @@ inline void validate_multiblock_topology_config(const Config& config) {
           "staged");
     }
   }
+  validate_polar_tier_topology_config(config);
+  if (mesh.topology_scheme == TopologyScheme::MULTIBLOCK_POLAR_TIER ||
+      mesh.topology_scheme ==
+          TopologyScheme::MULTIBLOCK_POLAR_TIER_CART_CENTER) {
+    return;
+  }
   if (!is_cart_core_parameterized_topology(mesh.topology_scheme)) {
     return;
+  }
+  if (mesh.topology_scheme !=
+          TopologyScheme::MULTIBLOCK_POLAR_TIER_CART_CENTER &&
+      mesh.multiblock_cart_core_bridge_grading == "log") {
+    throw namelist::ConfigError(
+        "multiblock_cart_core_bridge_grading=\"log\" is only supported for "
+        "multiblock_polar_tier_cart_center");
   }
   if (config.numerics.plic.enabled) {
     throw namelist::ConfigError(
@@ -924,6 +1551,323 @@ inline void validate_multiblock_differential_reference_config(
     throw namelist::ValueError(
         "Numerics.ale.multiblock_center_patch_gaussj_on/off must be in (0, 1) "
         "with on < off");
+  }
+}
+
+inline void validate_closure_catchment_config(const Config& config) {
+  const auto& ale = config.numerics.ale;
+  const auto& catchment = ale.band_ale;
+  if (catchment.closure_catchment_forced_active &&
+      !catchment.closure_catchment_enabled) {
+    throw namelist::ConfigError(
+        "Numerics.ale.band_ale.closure_catchment_forced_active=true requires "
+        "closure_catchment_enabled=true");
+  }
+  if (!catchment.closure_catchment_enabled) {
+    return;
+  }
+  if (!(std::isfinite(catchment.closure_catchment_s_catch_cm) &&
+        std::isfinite(catchment.closure_catchment_s_protect_cm) &&
+        catchment.closure_catchment_s_catch_cm > 0.0 &&
+        catchment.closure_catchment_s_catch_cm <
+            catchment.closure_catchment_s_protect_cm)) {
+    throw namelist::ConfigError(
+        "Numerics.ale.band_ale closure catchment radii must satisfy "
+        "0 < closure_catchment_s_catch_cm < "
+        "closure_catchment_s_protect_cm");
+  }
+  if (!(std::isfinite(catchment.closure_catchment_spacing_floor_cm) &&
+        catchment.closure_catchment_spacing_floor_cm > 0.0)) {
+    throw namelist::ConfigError(
+        "Numerics.ale.band_ale.closure_catchment_spacing_floor_cm must be "
+        "finite and > 0");
+  }
+  if (!(std::isfinite(catchment.closure_catchment_ratio_max) &&
+        catchment.closure_catchment_ratio_max > 1.0 &&
+        catchment.closure_catchment_ratio_max <= 1.5)) {
+    throw namelist::ConfigError(
+        "Numerics.ale.band_ale.closure_catchment_ratio_max must be finite "
+        "and in (1, 1.5]");
+  }
+  if (!(std::isfinite(catchment.closure_catchment_nu_max) &&
+        catchment.closure_catchment_nu_max > 0.0 &&
+        catchment.closure_catchment_nu_max <= 1.0)) {
+    throw namelist::ConfigError(
+        "Numerics.ale.band_ale.closure_catchment_nu_max must be finite and "
+        "in (0, 1]");
+  }
+  if (catchment.closure_catchment_max_bites < 1 ||
+      catchment.closure_catchment_max_bites > 256) {
+    throw namelist::ConfigError(
+        "Numerics.ale.band_ale.closure_catchment_max_bites must be in "
+        "[1, 256]");
+  }
+  if (!std::isfinite(catchment.closure_catchment_shock_hold)) {
+    throw namelist::ConfigError(
+        "Numerics.ale.band_ale.closure_catchment_shock_hold must be finite");
+  }
+  if (!(catchment.closure_catchment_eta_h_full > 0.0 &&
+        catchment.closure_catchment_eta_h_full <
+            catchment.closure_catchment_eta_h_arm &&
+        catchment.closure_catchment_eta_h_arm <= 1.0)) {
+    throw namelist::ConfigError(
+        "Numerics.ale.band_ale closure_catchment_eta_h_full/arm must satisfy "
+        "0 < full < arm <= 1");
+  }
+  if (!(catchment.closure_catchment_eta_m_full > 0.0 &&
+        catchment.closure_catchment_eta_m_full <
+            catchment.closure_catchment_eta_m_arm &&
+        catchment.closure_catchment_eta_m_arm <= 1.0)) {
+    throw namelist::ConfigError(
+        "Numerics.ale.band_ale closure_catchment_eta_m_full/arm must satisfy "
+        "0 < full < arm <= 1");
+  }
+  if (!(catchment.closure_catchment_reset_eta > 0.0 &&
+        catchment.closure_catchment_reset_eta <= 1.0)) {
+    throw namelist::ConfigError(
+        "Numerics.ale.band_ale.closure_catchment_reset_eta must be in (0, 1]");
+  }
+  if (catchment.closure_catchment_support_core_rows < 1) {
+    throw namelist::ConfigError(
+        "Numerics.ale.band_ale.closure_catchment_support_core_rows must be "
+        ">= 1");
+  }
+  if (catchment.closure_catchment_support_taper_rows < 0) {
+    throw namelist::ConfigError(
+        "Numerics.ale.band_ale.closure_catchment_support_taper_rows must be "
+        ">= 0");
+  }
+  if (!(catchment.closure_catchment_accum_frac > 0.0 &&
+        catchment.closure_catchment_accum_frac < 1.0)) {
+    throw namelist::ConfigError(
+        "Numerics.ale.band_ale.closure_catchment_accum_frac must be in (0, 1)");
+  }
+  if (!(catchment.closure_catchment_rearm_drop > 0.0 &&
+        catchment.closure_catchment_rearm_drop < 1.0)) {
+    throw namelist::ConfigError(
+        "Numerics.ale.band_ale.closure_catchment_rearm_drop must be in (0, 1)");
+  }
+  if (!catchment.enabled) {
+    throw namelist::ConfigError(
+        "Numerics.ale.band_ale.closure_catchment_enabled=true requires "
+        "Numerics.ale.band_ale.enabled=true");
+  }
+  if (!ale.conservative_remap_enabled) {
+    throw namelist::ConfigError(
+        "Numerics.ale.band_ale.closure_catchment_enabled=true requires "
+        "Numerics.ale.conservative_remap_enabled=true");
+  }
+}
+
+inline void validate_band_ale_config(const Config& config) {
+  const auto& band_ale = config.numerics.ale.band_ale;
+  if (!band_ale.enabled) {
+    return;
+  }
+  if (!(std::isfinite(band_ale.respace_move_cap_frac) &&
+        band_ale.respace_move_cap_frac > 0.0 &&
+        band_ale.respace_move_cap_frac <= 1.0)) {
+    throw namelist::ValueError(
+        "Numerics.ale.band_ale.respace_move_cap_frac must be finite and in "
+        "(0, 1]");
+  }
+  if (!(std::isfinite(band_ale.estimator_band_hold_mach) &&
+        band_ale.estimator_band_hold_mach >= 0.0)) {
+    throw namelist::ValueError(
+        "Numerics.ale.band_ale.estimator_band_hold_mach must be finite and "
+        ">= 0");
+  }
+}
+
+inline void validate_pole_theta_config(const Config& config) {
+  const auto& pole_theta = config.numerics.ale.band_ale;
+  const std::string& protected_modes =
+      pole_theta.pole_theta_protected_modes;
+  if (!protected_modes.empty()) {
+    std::size_t token_begin = 0U;
+    while (token_begin <= protected_modes.size()) {
+      const std::size_t comma = protected_modes.find(',', token_begin);
+      const std::size_t token_end =
+          comma == std::string::npos ? protected_modes.size() : comma;
+      std::size_t first = protected_modes.find_first_not_of(
+          " \t\n\r\f\v", token_begin);
+      if (first == std::string::npos || first >= token_end) {
+        throw namelist::ConfigError(
+            "Numerics.ale.band_ale.pole_theta_protected_modes must be a "
+            "comma-separated list of integers in [0, 64]");
+      }
+      std::size_t last = token_end;
+      while (last > first &&
+             std::string(" \t\n\r\f\v").find(protected_modes[last - 1U]) !=
+                 std::string::npos) {
+        --last;
+      }
+      if (protected_modes[first] == '+') {
+        ++first;
+      }
+      if (first == last) {
+        throw namelist::ConfigError(
+            "Numerics.ale.band_ale.pole_theta_protected_modes must be a "
+            "comma-separated list of integers in [0, 64]");
+      }
+      int mode = 0;
+      for (std::size_t index = first; index < last; ++index) {
+        const char digit = protected_modes[index];
+        if (digit < '0' || digit > '9') {
+          throw namelist::ConfigError(
+              "Numerics.ale.band_ale.pole_theta_protected_modes must be a "
+              "comma-separated list of integers in [0, 64]");
+        }
+        mode = 10 * mode + static_cast<int>(digit - '0');
+        if (mode > 64) {
+          throw namelist::ConfigError(
+              "Numerics.ale.band_ale.pole_theta_protected_modes must be a "
+              "comma-separated list of integers in [0, 64]");
+        }
+      }
+      if (comma == std::string::npos) {
+        break;
+      }
+      token_begin = comma + 1U;
+    }
+  }
+  if (!pole_theta.pole_theta_enabled) {
+    return;
+  }
+
+  if (pole_theta.pole_theta_fit_order < 2) {
+    throw namelist::ConfigError(
+        "Numerics.ale.band_ale.pole_theta_fit_order must be >= 2");
+  }
+
+  if (!(0 <= pole_theta.pole_theta_phys_lp &&
+        pole_theta.pole_theta_phys_lp < pole_theta.pole_theta_phys_lc &&
+        pole_theta.pole_theta_phys_lc <= 32)) {
+    throw namelist::ConfigError(
+        "Numerics.ale.band_ale pole_theta_phys_lp and "
+        "pole_theta_phys_lc must satisfy 0 <= pole_theta_phys_lp < "
+        "pole_theta_phys_lc <= 32");
+  }
+
+  const auto require_finite = [](const double value, const char* key) {
+    if (!std::isfinite(value)) {
+      throw namelist::ConfigError(
+          std::string("Numerics.ale.band_ale.") + key + " must be finite");
+    }
+  };
+  require_finite(pole_theta.pole_theta_h_arm, "pole_theta_h_arm");
+  require_finite(pole_theta.pole_theta_noise_floor,
+                 "pole_theta_noise_floor");
+  require_finite(pole_theta.pole_theta_noise_ceiling,
+                 "pole_theta_noise_ceiling");
+  require_finite(pole_theta.pole_theta_h_fire, "pole_theta_h_fire");
+  require_finite(pole_theta.pole_theta_h_hard, "pole_theta_h_hard");
+  require_finite(pole_theta.pole_theta_h_release, "pole_theta_h_release");
+  require_finite(pole_theta.pole_theta_kappa_arm, "pole_theta_kappa_arm");
+  require_finite(pole_theta.pole_theta_kappa_fire, "pole_theta_kappa_fire");
+  require_finite(pole_theta.pole_theta_kappa_hard, "pole_theta_kappa_hard");
+  require_finite(pole_theta.pole_theta_alpha, "pole_theta_alpha");
+  require_finite(pole_theta.pole_theta_alpha_hard,
+                 "pole_theta_alpha_hard");
+  require_finite(pole_theta.pole_theta_deadband_frac,
+                 "pole_theta_deadband_frac");
+  require_finite(pole_theta.pole_theta_move_limit_frac,
+                 "pole_theta_move_limit_frac");
+  require_finite(pole_theta.pole_theta_move_limit_hard_frac,
+                 "pole_theta_move_limit_hard_frac");
+  require_finite(pole_theta.pole_theta_cooldown_s,
+                 "pole_theta_cooldown_s");
+  require_finite(pole_theta.pole_theta_cooldown_base_s,
+                 "pole_theta_cooldown_base_s");
+  require_finite(pole_theta.pole_theta_predict_window_s,
+                 "pole_theta_predict_window_s");
+  require_finite(pole_theta.pole_theta_predict_horizon_s,
+                 "pole_theta_predict_horizon_s");
+  require_finite(pole_theta.pole_theta_post_h_floor,
+                 "pole_theta_post_h_floor");
+  require_finite(pole_theta.pole_theta_shock_hold,
+                 "pole_theta_shock_hold");
+
+  if (!(pole_theta.pole_theta_noise_floor > 0.0)) {
+    throw namelist::ConfigError(
+        "Numerics.ale.band_ale.pole_theta_noise_floor must be > 0");
+  }
+  if (!(pole_theta.pole_theta_noise_ceiling >
+        pole_theta.pole_theta_noise_floor)) {
+    throw namelist::ConfigError(
+        "Numerics.ale.band_ale.pole_theta_noise_ceiling must be > "
+        "pole_theta_noise_floor");
+  }
+
+  if (!(0.0 < pole_theta.pole_theta_h_hard &&
+        pole_theta.pole_theta_h_hard < pole_theta.pole_theta_h_fire &&
+        pole_theta.pole_theta_h_fire < pole_theta.pole_theta_h_arm &&
+        pole_theta.pole_theta_h_arm < pole_theta.pole_theta_h_release &&
+        pole_theta.pole_theta_h_release <= 1.0)) {
+    throw namelist::ConfigError(
+        "Numerics.ale.band_ale pole_theta_h_hard, pole_theta_h_fire, "
+        "pole_theta_h_arm, and pole_theta_h_release must satisfy "
+        "0 < pole_theta_h_hard < pole_theta_h_fire < pole_theta_h_arm < "
+        "pole_theta_h_release <= 1");
+  }
+  if (!(1.0 < pole_theta.pole_theta_kappa_arm &&
+        pole_theta.pole_theta_kappa_arm < pole_theta.pole_theta_kappa_fire &&
+        pole_theta.pole_theta_kappa_fire <
+            pole_theta.pole_theta_kappa_hard)) {
+    throw namelist::ConfigError(
+        "Numerics.ale.band_ale pole_theta_kappa_arm, "
+        "pole_theta_kappa_fire, and pole_theta_kappa_hard must satisfy "
+        "1 < pole_theta_kappa_arm < pole_theta_kappa_fire < "
+        "pole_theta_kappa_hard");
+  }
+  if (!(0.0 < pole_theta.pole_theta_alpha &&
+        pole_theta.pole_theta_alpha <= pole_theta.pole_theta_alpha_hard &&
+        pole_theta.pole_theta_alpha_hard <= 1.0)) {
+    throw namelist::ConfigError(
+        "Numerics.ale.band_ale pole_theta_alpha and pole_theta_alpha_hard "
+        "must satisfy 0 < pole_theta_alpha <= pole_theta_alpha_hard <= 1");
+  }
+  if (!(0.0 <= pole_theta.pole_theta_deadband_frac &&
+        pole_theta.pole_theta_deadband_frac <
+            pole_theta.pole_theta_move_limit_frac &&
+        pole_theta.pole_theta_move_limit_frac <=
+            pole_theta.pole_theta_move_limit_hard_frac &&
+        pole_theta.pole_theta_move_limit_hard_frac <= 1.0)) {
+    throw namelist::ConfigError(
+        "Numerics.ale.band_ale pole_theta_deadband_frac, "
+        "pole_theta_move_limit_frac, and pole_theta_move_limit_hard_frac "
+        "must satisfy 0 <= pole_theta_deadband_frac < "
+        "pole_theta_move_limit_frac <= pole_theta_move_limit_hard_frac <= "
+        "1");
+  }
+  if (!(pole_theta.pole_theta_cooldown_s >= 0.0)) {
+    throw namelist::ConfigError(
+        "Numerics.ale.band_ale.pole_theta_cooldown_s must be >= 0");
+  }
+  if (!(pole_theta.pole_theta_cooldown_base_s >= 0.0)) {
+    throw namelist::ConfigError(
+        "Numerics.ale.band_ale.pole_theta_cooldown_base_s must be >= 0");
+  }
+  if (!(pole_theta.pole_theta_predict_window_s > 0.0)) {
+    throw namelist::ConfigError(
+        "Numerics.ale.band_ale.pole_theta_predict_window_s must be > 0");
+  }
+  if (!(pole_theta.pole_theta_predict_horizon_s > 0.0)) {
+    throw namelist::ConfigError(
+        "Numerics.ale.band_ale.pole_theta_predict_horizon_s must be > 0");
+  }
+  if (pole_theta.pole_theta_halo_columns < 0) {
+    throw namelist::ConfigError(
+        "Numerics.ale.band_ale.pole_theta_halo_columns must be >= 0");
+  }
+  if (pole_theta.pole_theta_halo_rows < 0) {
+    throw namelist::ConfigError(
+        "Numerics.ale.band_ale.pole_theta_halo_rows must be >= 0");
+  }
+  if (!(0.0 < pole_theta.pole_theta_post_h_floor &&
+        pole_theta.pole_theta_post_h_floor < 1.0)) {
+    throw namelist::ConfigError(
+        "Numerics.ale.band_ale.pole_theta_post_h_floor must be in (0, 1)");
   }
 }
 

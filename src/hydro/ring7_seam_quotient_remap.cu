@@ -74,7 +74,14 @@ bool ring7_feature_enabled(const core::Config& cfg) {
   bool present = false;
   const bool env_enabled =
       env_flag_value("TENRYU_I1B_RING7_QUOTIENT", &present);
-  return present ? env_enabled : cfg.numerics.hydro.ring7_quotient_enabled;
+  const bool enabled =
+      present ? env_enabled : cfg.numerics.hydro.ring7_quotient_enabled;
+  if (enabled && cfg.mesh.shell_polar_cap_dendrite) {
+    throw core::namelist::ConfigError(
+        "ring-7 seam repair is not supported with "
+        "Mesh.shell_polar_cap_dendrite=true (pending shell-chain generalization)");
+  }
+  return enabled;
 }
 
 bool ring7_diag_due(const core::State& state) {

@@ -16,6 +16,7 @@
 #include "core/field.hpp"
 #include "mesh/boundary_kind.hpp"
 #include "mesh/mesh_geometry_result.hpp"
+#include "mesh/ring_pages.hpp"
 
 namespace tenryu::core {
 struct State;
@@ -116,7 +117,10 @@ enum class BlockRole : std::uint8_t {
   EAST_FAN = 3,
   SOUTH_FAN = 4,
   POLAR_SHELL = 5,
-  PENTAGON_BELT = 6,
+  POLAR_TIER = 6,
+  TRANSITION_BELT = 7,
+  CENTER_FAN = 8,
+  PENTAGON_BELT = 9,
 };
 
 enum class BlockSide : std::uint8_t {
@@ -154,6 +158,14 @@ struct ConeShellTipPort {
   std::vector<std::uint8_t> segment;
 };
 
+struct DendriteBlockRings {
+  std::vector<int> outer_ring;
+  std::vector<int> outer_adjacent_ring;
+  std::vector<int> center_chain;
+  std::vector<int> inner_adjacent_ring;
+  std::vector<int> inner_ring;
+};
+
 struct MultiBlockTopology {
   std::vector<int> cell_block_id;
   std::vector<int> cell_id_stable;
@@ -168,11 +180,35 @@ struct MultiBlockTopology {
   ConeShellTipPort cone_shell_tip_port;
   std::vector<UniqueOrientedFace> unique_internal_faces;
   std::vector<UniqueOrientedFace> boundary_faces;
+  // csw98 phase-line continuation topology (static; independent of
+  // hydro_active). Index space: unique_internal_faces then
+  // boundary_faces. Sentinels: -1 none (true corner), -2 axis mirror,
+  // -3 multi-candidate (see the candidate CSR).
+  std::vector<int> csw_line_edge_n0;
+  std::vector<int> csw_line_edge_n1;
+  std::vector<int> csw_line_prev_edge;
+  std::vector<int> csw_line_next_edge;
+  std::vector<std::int8_t> csw_line_prev_sign;
+  std::vector<std::int8_t> csw_line_next_sign;
+  std::vector<int> csw_line_cand_offsets;
+  std::vector<int> csw_line_cand_edges;
+  std::vector<std::int8_t> csw_line_cand_signs;
+  thrust::device_vector<int> d_csw_line_edge_n0;
+  thrust::device_vector<int> d_csw_line_edge_n1;
+  thrust::device_vector<int> d_csw_line_prev_edge;
+  thrust::device_vector<int> d_csw_line_next_edge;
+  thrust::device_vector<std::int8_t> d_csw_line_prev_sign;
+  thrust::device_vector<std::int8_t> d_csw_line_next_sign;
+  thrust::device_vector<int> d_csw_line_cand_offsets;
+  thrust::device_vector<int> d_csw_line_cand_edges;
+  thrust::device_vector<std::int8_t> d_csw_line_cand_signs;
   thrust::device_vector<int> d_unique_face_cell_a;
   thrust::device_vector<int> d_unique_face_cell_b;
   thrust::device_vector<int> d_unique_face_local_a;
   thrust::device_vector<int> d_unique_face_local_b;
   thrust::device_vector<std::int8_t> d_unique_face_bc_tag;
+  thrust::device_vector<int> d_face_adj_csr_offsets;
+  thrust::device_vector<int> d_face_adj_csr_indices;
   thrust::device_vector<int> d_boundary_face_cell;
   thrust::device_vector<int> d_boundary_face_local;
   thrust::device_vector<std::int8_t> d_boundary_face_bc_tag;
@@ -187,6 +223,13 @@ struct MultiBlockTopology {
   int n_cap = 0;
   int n_cells_cap = 0;
   int n_nodes_cap = 0;
+  bool has_polar_tier = false;
+  double polar_tier_h_r = 0.0;
+  double polar_tier_fan_radius = 0.0;
+  std::vector<int> polar_tier_columns;
+  std::vector<double> polar_tier_transition_radii;
+  std::vector<DendriteBlockRings> dendrite_block_rings;
+  std::vector<int> south_node_of;
 };
 
 struct MeshTopology {
@@ -199,6 +242,7 @@ struct MeshTopology {
 
   // linear indexing: cell(i,j)=i*nz+j, node(i,j)=i*(nz+1)+j.
   std::vector<std::uint8_t> node_flags;
+  bool general_polygonal = false;  // set when a ReALE tessellation is installed: cell/node layouts are CSR-general and structured block indexing is not meaningful
   std::optional<MultiBlockTopology> multiblock;
 
   [[nodiscard]] int cell_index(const int i, const int j) const {
@@ -261,6 +305,10 @@ TENRYU_MESH_HOST_DEVICE inline bool mesh_topo_is_multiblock(
              tenryu::core::TopologyScheme::MULTIBLOCK_HALF_BUTTERFLY_5BLOCK ||
          scheme == tenryu::core::TopologyScheme::
                        MULTIBLOCK_HALF_BUTTERFLY_TRIFAN_CAP_5BLOCK ||
+         scheme ==
+             tenryu::core::TopologyScheme::MULTIBLOCK_POLAR_TIER ||
+         scheme == tenryu::core::TopologyScheme::
+                       MULTIBLOCK_POLAR_TIER_CART_CENTER ||
          scheme == tenryu::core::TopologyScheme::CONE_SHELL_SPINE ||
          scheme == tenryu::core::TopologyScheme::PENTAGON_BELT_SHELL;
 }
@@ -271,8 +319,28 @@ TENRYU_MESH_HOST_DEVICE inline bool mesh_topo_has_trifan_cap(
                        MULTIBLOCK_HALF_BUTTERFLY_TRIFAN_CAP_5BLOCK;
 }
 
+TENRYU_MESH_HOST_DEVICE inline bool mesh_topo_has_polar_tier(
+    const tenryu::core::TopologyScheme scheme) noexcept {
+  return scheme ==
+         tenryu::core::TopologyScheme::MULTIBLOCK_POLAR_TIER;
+}
+
+TENRYU_MESH_HOST_DEVICE inline bool mesh_topo_has_polar_tier_cart_center(
+    const tenryu::core::TopologyScheme scheme) noexcept {
+  return scheme == tenryu::core::TopologyScheme::
+                       MULTIBLOCK_POLAR_TIER_CART_CENTER;
+}
+
+TENRYU_MESH_HOST_DEVICE inline bool mesh_topo_polar_tier_family(
+    const tenryu::core::TopologyScheme scheme) noexcept {
+  return mesh_topo_has_polar_tier(scheme) ||
+         mesh_topo_has_polar_tier_cart_center(scheme);
+}
+
 constexpr int kMeshTopoCellStorageSlots = 4;
 constexpr int kMeshTopoCellStorageSlotsMax = 8;
+// General-polygonal (reale_v2) storage cap; fixed meshes stay at kMeshTopoCellStorageSlotsMax.
+constexpr int kMeshTopoCellStorageSlotsMaxGeneral = 16;
 inline constexpr int kConeShellSpineBlockCount = 11;
 
 /// Active-slot topology contract:
@@ -286,7 +354,7 @@ TENRYU_MESH_HOST_DEVICE inline int mesh_topo_cell_active_nverts(
     const std::uint8_t* cell_nverts,
     const int cell) noexcept {
   if (cell_nverts != nullptr && cell_nverts[cell] >= 3U &&
-      cell_nverts[cell] <= 8U) {
+      cell_nverts[cell] <= kMeshTopoCellStorageSlotsMaxGeneral) {
     return static_cast<int>(cell_nverts[cell]);
   }
   return kMeshTopoCellStorageSlots;
@@ -357,8 +425,9 @@ inline int mesh_topo_cell_active_nverts(
                     static_cast<std::size_t>(cell) < cell_nverts.size(),
                 "cell_nverts lookup cell out of range");
   const std::uint8_t nverts = cell_nverts[static_cast<std::size_t>(cell)];
-  TENRYU_ASSERT(nverts >= 3U && nverts <= 8U,
-                "cell_nverts entries must be in [3, 8]");
+  TENRYU_ASSERT(
+      nverts >= 3U && nverts <= kMeshTopoCellStorageSlotsMaxGeneral,
+      "cell_nverts entries must be in [3, kMeshTopoCellStorageSlotsMaxGeneral]");
   return static_cast<int>(nverts);
 }
 
@@ -377,45 +446,147 @@ inline bool mesh_topo_has_trifan_cap(
   return mesh_topo_has_trifan_cap(cfg.topology_scheme);
 }
 
-inline int mesh_topo_n_cap(const tenryu::core::Config::MeshConfig& cfg) {
-  const int n_c = cfg.multiblock_cart_core_n_c;
+inline bool mesh_topo_has_polar_tier(
+    const tenryu::core::Config::MeshConfig& cfg) noexcept {
+  return mesh_topo_has_polar_tier(cfg.topology_scheme);
+}
+
+inline bool mesh_topo_has_polar_tier_cart_center(
+    const tenryu::core::Config::MeshConfig& cfg) noexcept {
+  return mesh_topo_has_polar_tier_cart_center(cfg.topology_scheme);
+}
+
+inline bool mesh_topo_polar_tier_family(
+    const tenryu::core::Config::MeshConfig& cfg) noexcept {
+  return mesh_topo_polar_tier_family(cfg.topology_scheme);
+}
+
+inline bool mesh_topo_polar_tier_cart_center_has_trifan_cap(
+    const tenryu::core::Config::MeshConfig& cfg) noexcept {
+  return mesh_topo_has_polar_tier_cart_center(cfg) &&
+         cfg.polar_tier_center_kind == "trifan_cap";
+}
+
+inline int mesh_topo_n_kept_polar_nodes(const MultiBlockTopology& mb) {
+  int bridge_count = 0;
+  int kept_polar_nodes = -1;
+  for (const BlockInfo& block : mb.blocks) {
+    if (block.role != BlockRole::BRIDGE) {
+      continue;
+    }
+    if (bridge_count == 0) {
+      kept_polar_nodes = block.owned_node_begin;
+    }
+    ++bridge_count;
+  }
+  TENRYU_ASSERT(
+      bridge_count == 1,
+      "polar-tier cart-center topology requires exactly one BRIDGE block");
+  TENRYU_ASSERT(kept_polar_nodes >= 0,
+                "polar-tier cart-center kept-node prefix must be non-negative");
+  return kept_polar_nodes;
+}
+
+// AW axis discipline covers kept + bridge-owned nodes; the center-block
+// interior is BBSW-or-aggregate territory.
+inline int mesh_topo_n_aw_axis_prefix_nodes(const MultiBlockTopology& mb) {
+  int central_core_count = 0;
+  int aw_axis_prefix_nodes = -1;
+  for (const BlockInfo& block : mb.blocks) {
+    if (block.role != BlockRole::CENTRAL_CORE) {
+      continue;
+    }
+    if (central_core_count == 0) {
+      aw_axis_prefix_nodes = block.owned_node_begin;
+    }
+    ++central_core_count;
+  }
+  TENRYU_ASSERT(
+      central_core_count == 1,
+      "polar-tier cart-center topology requires exactly one CENTRAL_CORE block");
+  TENRYU_ASSERT(aw_axis_prefix_nodes >= 0,
+                "polar-tier cart-center AW-axis prefix must be non-negative");
+  return aw_axis_prefix_nodes;
+}
+
+inline int mesh_topo_n_cap_with_n_c(const int n_c) {
   TENRYU_ASSERT(n_c > 0, "Mesh.multiblock_cart_core_n_c must be positive");
   return n_c;
 }
 
-inline int mesh_topo_n_cells_cap(
-    const tenryu::core::Config::MeshConfig& cfg) {
-  const int n_c = cfg.multiblock_cart_core_n_c;
-  const int n_cap = mesh_topo_n_cap(cfg);
+inline int mesh_topo_n_cap(const tenryu::core::Config::MeshConfig& cfg) {
+  return mesh_topo_n_cap_with_n_c(cfg.multiblock_cart_core_n_c);
+}
+
+inline int mesh_topo_n_cells_cap_with_n_c(const int n_c) {
+  const int n_cap = mesh_topo_n_cap_with_n_c(n_c);
   TENRYU_ASSERT(n_c > 0, "Mesh.multiblock_cart_core_n_c must be positive");
   return mesh_topo_checked_int_count(4LL * n_c * n_cap,
                                      "multiblock cap cell count");
 }
 
-inline int mesh_topo_n_nodes_cap(
+inline int mesh_topo_n_cells_cap(
     const tenryu::core::Config::MeshConfig& cfg) {
-  const int n_c = cfg.multiblock_cart_core_n_c;
-  const int n_cap = mesh_topo_n_cap(cfg);
+  return mesh_topo_n_cells_cap_with_n_c(cfg.multiblock_cart_core_n_c);
+}
+
+inline int mesh_topo_n_nodes_cap_with_n_c(const int n_c) {
+  const int n_cap = mesh_topo_n_cap_with_n_c(n_c);
   TENRYU_ASSERT(n_c > 0, "Mesh.multiblock_cart_core_n_c must be positive");
   return mesh_topo_checked_int_count(
       1LL + static_cast<long long>(n_cap) * (4LL * n_c + 1LL),
       "multiblock cap node count");
 }
 
-inline int mesh_topo_n_cells_core(
+inline int mesh_topo_n_nodes_cap(
     const tenryu::core::Config::MeshConfig& cfg) {
-  if (mesh_topo_has_trifan_cap(cfg)) {
-    return mesh_topo_n_cells_cap(cfg);
+  return mesh_topo_n_nodes_cap_with_n_c(cfg.multiblock_cart_core_n_c);
+}
+
+inline int mesh_topo_n_nodes_cap_not_shared_with_bridge_with_n_c(
+    const int n_c) {
+  const int n_cap = mesh_topo_n_cap_with_n_c(n_c);
+  return mesh_topo_checked_int_count(
+      1LL + static_cast<long long>(n_cap - 1) * (4LL * n_c + 1LL),
+      "multiblock cap non-shared node count");
+}
+
+inline int mesh_topo_n_cells_core_with_n_c(
+    const tenryu::core::Config::MeshConfig& cfg,
+    const int n_c) {
+  if (mesh_topo_has_polar_tier(cfg)) {
+    return cfg.polar_tier_fan_sectors;
   }
-  const int n_c = cfg.multiblock_cart_core_n_c;
+  if (mesh_topo_has_trifan_cap(cfg)) {
+    return mesh_topo_n_cells_cap_with_n_c(n_c);
+  }
+  if (mesh_topo_polar_tier_cart_center_has_trifan_cap(cfg)) {
+    return mesh_topo_n_cells_cap_with_n_c(n_c);
+  }
   TENRYU_ASSERT(n_c > 0, "Mesh.multiblock_cart_core_n_c must be positive");
   return mesh_topo_checked_int_count(2LL * n_c * n_c,
                                      "multiblock core cell count");
 }
 
-inline int mesh_topo_n_cells_bridge(
+inline int mesh_topo_n_cells_core(
     const tenryu::core::Config::MeshConfig& cfg) {
-  const int n_c = cfg.multiblock_cart_core_n_c;
+  return mesh_topo_n_cells_core_with_n_c(
+      cfg, cfg.multiblock_cart_core_n_c);
+}
+
+inline int mesh_topo_n_cells_bridge_with_n_c(
+    const tenryu::core::Config::MeshConfig& cfg,
+    const int n_c) {
+  if (mesh_topo_has_polar_tier(cfg)) {
+    const auto layout = tenryu::core::make_polar_tier_layout(cfg);
+    const long long shell_cells =
+        cfg.shell_polar_cap_dendrite
+            ? layout.shell_n_cells
+            : static_cast<long long>(cfg.nr) * cfg.nz;
+    return mesh_topo_checked_int_count(
+        layout.n_cells - shell_cells - cfg.polar_tier_fan_sectors,
+        "polar-tier tier and belt cell count");
+  }
   const int n_b = cfg.multiblock_cart_core_bridge_layers;
   TENRYU_ASSERT(n_c > 0, "Mesh.multiblock_cart_core_n_c must be positive");
   TENRYU_ASSERT(n_b > 0,
@@ -424,14 +595,37 @@ inline int mesh_topo_n_cells_bridge(
                                      "multiblock bridge cell count");
 }
 
-inline int mesh_topo_n_cells_shell(
+inline int mesh_topo_n_cells_bridge(
     const tenryu::core::Config::MeshConfig& cfg) {
-  const int n_c = cfg.multiblock_cart_core_n_c;
+  return mesh_topo_n_cells_bridge_with_n_c(
+      cfg, cfg.multiblock_cart_core_n_c);
+}
+
+inline int mesh_topo_n_cells_shell_with_n_c(
+    const tenryu::core::Config::MeshConfig& cfg,
+    const int n_c) {
+  if (mesh_topo_has_polar_tier(cfg)) {
+    if (cfg.shell_polar_cap_dendrite) {
+      const auto layout = tenryu::core::make_polar_tier_layout(cfg);
+      return mesh_topo_checked_int_count(
+          layout.shell_n_cells,
+          "polar-tier shell cell count");
+    }
+    return mesh_topo_checked_int_count(
+        static_cast<long long>(cfg.nr) * cfg.nz,
+        "polar-tier shell cell count");
+  }
   TENRYU_ASSERT(cfg.nr > 0, "Mesh.nr must be positive");
   TENRYU_ASSERT(n_c > 0, "Mesh.multiblock_cart_core_n_c must be positive");
   return mesh_topo_checked_int_count(
       static_cast<long long>(cfg.nr) * (4LL * n_c),
       "multiblock shell cell count");
+}
+
+inline int mesh_topo_n_cells_shell(
+    const tenryu::core::Config::MeshConfig& cfg) {
+  return mesh_topo_n_cells_shell_with_n_c(
+      cfg, cfg.multiblock_cart_core_n_c);
 }
 
 inline int mesh_topo_cone_shell_corner_layers(const int face_layers,
@@ -542,6 +736,24 @@ inline int mesh_topo_n_cells_total(
             mesh_topo_cone_shell_tip_fill_cell_count(cfg),
         "cone-shell-spine cell count");
   }
+  if (mesh_topo_has_polar_tier(cfg)) {
+    return mesh_topo_checked_int_count(
+        tenryu::core::make_polar_tier_layout(cfg).n_cells,
+        "polar-tier total cell count");
+  }
+  if (mesh_topo_has_polar_tier_cart_center(cfg)) {
+    tenryu::core::PolarTierTruncation truncation;
+    const auto layout = tenryu::core::make_polar_tier_layout_truncated(
+        cfg, cfg.polar_tier_cart_cut_ring, &truncation);
+    const int n_c = truncation.n_theta_cut / 4;
+    return mesh_topo_checked_int_count(
+        layout.n_cells +
+            static_cast<long long>(
+                mesh_topo_n_cells_core_with_n_c(cfg, n_c)) +
+            static_cast<long long>(
+                mesh_topo_n_cells_bridge_with_n_c(cfg, n_c)),
+        "polar-tier cart-center total cell count");
+  }
   if (cfg.topology_scheme ==
       tenryu::core::TopologyScheme::PENTAGON_BELT_SHELL) {
     long long n_cells = 0;
@@ -561,21 +773,43 @@ inline int mesh_topo_n_cells_total(
   return mesh_topo_checked_int_count(n_cells, "multiblock total cell count");
 }
 
-inline int mesh_topo_n_nodes_core(
-    const tenryu::core::Config::MeshConfig& cfg) {
-  if (mesh_topo_has_trifan_cap(cfg)) {
-    return mesh_topo_n_nodes_cap(cfg);
+inline int mesh_topo_n_nodes_core_with_n_c(
+    const tenryu::core::Config::MeshConfig& cfg,
+    const int n_c) {
+  if (mesh_topo_has_polar_tier(cfg)) {
+    return 1;
   }
-  const int n_c = cfg.multiblock_cart_core_n_c;
+  if (mesh_topo_has_trifan_cap(cfg)) {
+    return mesh_topo_n_nodes_cap_with_n_c(n_c);
+  }
+  if (mesh_topo_polar_tier_cart_center_has_trifan_cap(cfg)) {
+    return mesh_topo_n_nodes_cap_not_shared_with_bridge_with_n_c(n_c);
+  }
   TENRYU_ASSERT(n_c > 0, "Mesh.multiblock_cart_core_n_c must be positive");
   return mesh_topo_checked_int_count(
       (static_cast<long long>(n_c) + 1LL) * (2LL * n_c + 1LL),
       "multiblock core node count");
 }
 
-inline int mesh_topo_n_nodes_bridge_interior(
+inline int mesh_topo_n_nodes_core(
     const tenryu::core::Config::MeshConfig& cfg) {
-  const int n_c = cfg.multiblock_cart_core_n_c;
+  return mesh_topo_n_nodes_core_with_n_c(
+      cfg, cfg.multiblock_cart_core_n_c);
+}
+
+inline int mesh_topo_n_nodes_bridge_interior_with_n_c(
+    const tenryu::core::Config::MeshConfig& cfg,
+    const int n_c) {
+  if (mesh_topo_has_polar_tier(cfg)) {
+    const auto layout = tenryu::core::make_polar_tier_layout(cfg);
+    const long long shell_nodes =
+        cfg.shell_polar_cap_dendrite
+            ? layout.shell_n_nodes
+            : (static_cast<long long>(cfg.nr) + 1LL) * (cfg.nz + 1LL);
+    return mesh_topo_checked_nonnegative_int_count(
+        layout.n_nodes - shell_nodes - 1LL,
+        "polar-tier tier and belt node count");
+  }
   const int n_b = cfg.multiblock_cart_core_bridge_layers;
   TENRYU_ASSERT(n_c > 0, "Mesh.multiblock_cart_core_n_c must be positive");
   TENRYU_ASSERT(n_b > 0,
@@ -585,14 +819,37 @@ inline int mesh_topo_n_nodes_bridge_interior(
       "multiblock bridge interior node count");
 }
 
-inline int mesh_topo_n_nodes_shell(
+inline int mesh_topo_n_nodes_bridge_interior(
     const tenryu::core::Config::MeshConfig& cfg) {
-  const int n_c = cfg.multiblock_cart_core_n_c;
+  return mesh_topo_n_nodes_bridge_interior_with_n_c(
+      cfg, cfg.multiblock_cart_core_n_c);
+}
+
+inline int mesh_topo_n_nodes_shell_with_n_c(
+    const tenryu::core::Config::MeshConfig& cfg,
+    const int n_c) {
+  if (mesh_topo_has_polar_tier(cfg)) {
+    if (cfg.shell_polar_cap_dendrite) {
+      const auto layout = tenryu::core::make_polar_tier_layout(cfg);
+      return mesh_topo_checked_int_count(
+          layout.shell_n_nodes,
+          "polar-tier shell node count");
+    }
+    return mesh_topo_checked_int_count(
+        (static_cast<long long>(cfg.nr) + 1LL) * (cfg.nz + 1LL),
+        "polar-tier shell node count");
+  }
   TENRYU_ASSERT(cfg.nr > 0, "Mesh.nr must be positive");
   TENRYU_ASSERT(n_c > 0, "Mesh.multiblock_cart_core_n_c must be positive");
   return mesh_topo_checked_int_count(
       (static_cast<long long>(cfg.nr) + 1LL) * (4LL * n_c + 1LL),
       "multiblock shell node count");
+}
+
+inline int mesh_topo_n_nodes_shell(
+    const tenryu::core::Config::MeshConfig& cfg) {
+  return mesh_topo_n_nodes_shell_with_n_c(
+      cfg, cfg.multiblock_cart_core_n_c);
 }
 
 inline int mesh_topo_n_nodes_total(
@@ -620,6 +877,29 @@ inline int mesh_topo_n_nodes_total(
                  cfg.cone_shell_exterior_cells) +
             mesh_topo_cone_shell_tip_fill_owned_node_count(cfg),
         "cone-shell-spine node count");
+  }
+  if (mesh_topo_has_polar_tier(cfg)) {
+    return mesh_topo_checked_int_count(
+        tenryu::core::make_polar_tier_layout(cfg).n_nodes,
+        "polar-tier total node count");
+  }
+  if (mesh_topo_has_polar_tier_cart_center(cfg)) {
+    tenryu::core::PolarTierTruncation truncation;
+    const auto layout = tenryu::core::make_polar_tier_layout_truncated(
+        cfg, cfg.polar_tier_cart_cut_ring, &truncation);
+    const int n_c = truncation.n_theta_cut / 4;
+    const long long cap_bridge_inner_ring_nodes =
+        mesh_topo_polar_tier_cart_center_has_trifan_cap(cfg)
+            ? static_cast<long long>(truncation.n_theta_cut) + 1LL
+            : 0LL;
+    return mesh_topo_checked_int_count(
+        layout.n_nodes +
+            static_cast<long long>(
+                mesh_topo_n_nodes_core_with_n_c(cfg, n_c)) +
+            static_cast<long long>(
+                mesh_topo_n_nodes_bridge_interior_with_n_c(cfg, n_c)) +
+            cap_bridge_inner_ring_nodes,
+        "polar-tier cart-center total node count");
   }
   if (cfg.topology_scheme ==
       tenryu::core::TopologyScheme::PENTAGON_BELT_SHELL) {
@@ -651,6 +931,69 @@ inline MultiBlockTopology mesh_topo_make_empty_multiblock_topology(
   if (cfg.topology_scheme ==
       tenryu::core::TopologyScheme::CONE_SHELL_SPINE) {
     mb.block_count = kConeShellSpineBlockCount;
+    return mb;
+  }
+  if (mesh_topo_has_polar_tier(cfg)) {
+    const auto layout = tenryu::core::make_polar_tier_layout(cfg);
+    mb.block_count = layout.block_count;
+    mb.n_cells_core = mesh_topo_n_cells_core(cfg);
+    mb.n_cells_bridge = mesh_topo_n_cells_bridge(cfg);
+    mb.n_cells_shell = mesh_topo_n_cells_shell(cfg);
+    mb.n_nodes_core = mesh_topo_n_nodes_core(cfg);
+    mb.n_nodes_bridge_interior =
+        mesh_topo_n_nodes_bridge_interior(cfg);
+    mb.n_nodes_shell = mesh_topo_n_nodes_shell(cfg);
+    mb.has_polar_tier = true;
+    mb.polar_tier_h_r = layout.h_r;
+    mb.polar_tier_fan_radius = layout.fan_radius;
+    mb.polar_tier_columns = layout.tier_columns;
+    mb.polar_tier_transition_radii = layout.transition_radii;
+    return mb;
+  }
+  if (mesh_topo_has_polar_tier_cart_center(cfg)) {
+    tenryu::core::PolarTierTruncation truncation;
+    const auto layout = tenryu::core::make_polar_tier_layout_truncated(
+        cfg, cfg.polar_tier_cart_cut_ring, &truncation);
+    const int n_c = truncation.n_theta_cut / 4;
+    const int shell_cells =
+        cfg.shell_polar_cap_dendrite
+            ? mesh_topo_checked_int_count(layout.shell_n_cells,
+                                          "hybrid polar-tier shell cells")
+            : mesh_topo_checked_int_count(
+                  static_cast<long long>(cfg.nr) * cfg.nz,
+                  "hybrid polar-tier shell cells");
+    const int shell_nodes =
+        cfg.shell_polar_cap_dendrite
+            ? mesh_topo_checked_int_count(layout.shell_n_nodes,
+                                          "hybrid polar-tier shell nodes")
+            : mesh_topo_checked_int_count(
+                  (static_cast<long long>(cfg.nr) + 1LL) * (cfg.nz + 1LL),
+                  "hybrid polar-tier shell nodes");
+    mb.block_count = layout.block_count + 2;
+    mb.n_cells_core = mesh_topo_n_cells_core_with_n_c(cfg, n_c);
+    mb.n_cells_bridge = mesh_topo_checked_int_count(
+        layout.n_cells - shell_cells +
+            mesh_topo_n_cells_bridge_with_n_c(cfg, n_c),
+        "hybrid polar-tier bridge cells");
+    mb.n_cells_shell = shell_cells;
+    mb.n_nodes_core = mesh_topo_n_nodes_core_with_n_c(cfg, n_c);
+    mb.n_nodes_bridge_interior =
+        mesh_topo_checked_nonnegative_int_count(
+            layout.n_nodes - shell_nodes +
+                mesh_topo_n_nodes_bridge_interior_with_n_c(cfg, n_c) +
+                (mesh_topo_polar_tier_cart_center_has_trifan_cap(cfg)
+                     ? static_cast<long long>(truncation.n_theta_cut) + 1LL
+                     : 0LL),
+            "hybrid polar-tier bridge interior nodes");
+    mb.n_nodes_shell = shell_nodes;
+    mb.has_polar_tier = false;
+    mb.polar_tier_h_r = layout.h_r;
+    mb.polar_tier_fan_radius = layout.fan_radius;
+    mb.polar_tier_columns =
+        cfg.polar_tier_dendrite_enabled
+            ? layout.dendrite_actual_tier_columns
+            : layout.tier_columns;
+    mb.polar_tier_transition_radii = layout.transition_radii;
     return mb;
   }
   if (cfg.topology_scheme ==
@@ -715,7 +1058,89 @@ inline const BlockInfo& mesh_topo_trifan_fan_block(const MultiBlockTopology& mb,
   return mb.blocks.front();
 }
 
-inline const BlockInfo& mesh_topo_multiblock_polar_shell_block(
+inline int mesh_topo_multiblock_polar_shell_block_count(
+    const MultiBlockTopology& mb) {
+  int shell_count = 0;
+  for (const BlockInfo& block : mb.blocks) {
+    if (block.role == BlockRole::POLAR_SHELL) {
+      ++shell_count;
+    }
+  }
+  return shell_count;
+}
+
+inline std::vector<int> mesh_topo_multiblock_ordered_polar_shell_chain(
+    const MultiBlockTopology& mb) {
+  std::vector<int> shell_blocks;
+  for (int block = 0; block < static_cast<int>(mb.blocks.size()); ++block) {
+    if (mb.blocks[static_cast<std::size_t>(block)].role ==
+        BlockRole::POLAR_SHELL) {
+      shell_blocks.push_back(block);
+    }
+  }
+  TENRYU_ASSERT(!shell_blocks.empty(),
+                "multiblock topology requires a POLAR_SHELL block");
+  if (shell_blocks.size() == 1U) {
+    return shell_blocks;
+  }
+
+  TENRYU_ASSERT(mb.has_polar_tier && shell_blocks.front() == 0,
+                "split polar-shell chain must be the polar-tier block prefix");
+  const int first = shell_blocks.front();
+  const int last = shell_blocks.back();
+  std::vector<int> chain;
+  chain.reserve(static_cast<std::size_t>(last - first + 1));
+  TENRYU_ASSERT(mb.dendrite_block_rings.size() == mb.blocks.size(),
+                "split polar-shell chain requires block ring metadata");
+  for (int block = first; block <= last; ++block) {
+    const BlockRole role = mb.blocks[static_cast<std::size_t>(block)].role;
+    TENRYU_ASSERT(role == BlockRole::POLAR_SHELL ||
+                      role == BlockRole::TRANSITION_BELT,
+                  "split polar-shell chain must contain only shell and transition blocks");
+    chain.push_back(block);
+  }
+  for (std::size_t radial = 1; radial < chain.size(); ++radial) {
+    const int inner = chain[radial - 1U];
+    const int outer = chain[radial];
+    const DendriteBlockRings& inner_rings =
+        mb.dendrite_block_rings[static_cast<std::size_t>(inner)];
+    const DendriteBlockRings& outer_rings =
+        mb.dendrite_block_rings[static_cast<std::size_t>(outer)];
+    TENRYU_ASSERT(!inner_rings.outer_ring.empty() &&
+                      inner_rings.outer_ring == outer_rings.inner_ring,
+                  "split polar-shell chain must share exact adjacent ring node IDs");
+    bool joined = false;
+    for (const SeamInfo& seam : mb.seams) {
+      if ((seam.block_a == inner && seam.block_b == outer) ||
+          (seam.block_a == outer && seam.block_b == inner)) {
+        joined = true;
+        break;
+      }
+    }
+    TENRYU_ASSERT(joined,
+                  "split polar-shell chain blocks must be joined by a seam");
+  }
+
+  const BlockInfo& outermost = mb.blocks[static_cast<std::size_t>(last)];
+  int outer_face_count = 0;
+  for (const UniqueOrientedFace& face : mb.boundary_faces) {
+    if (face.bc_tag != static_cast<std::int8_t>(
+                           BoundaryKind::SphericalOuterFree)) {
+      continue;
+    }
+    TENRYU_ASSERT(
+        face.cell_a >= outermost.cell_begin &&
+            face.cell_a < outermost.cell_begin + outermost.cell_count,
+        "outermost POLAR_SHELL block must own every spherical outer boundary face");
+    ++outer_face_count;
+  }
+  TENRYU_ASSERT(
+      outer_face_count == outermost.n_j_cells,
+      "outermost POLAR_SHELL block must own one outer boundary face per angular cell");
+  return chain;
+}
+
+inline const BlockInfo& mesh_topo_multiblock_outermost_polar_shell_block(
     const MultiBlockTopology& mb) {
   const BlockInfo* shell_block = nullptr;
   int shell_count = 0;
@@ -727,40 +1152,116 @@ inline const BlockInfo& mesh_topo_multiblock_polar_shell_block(
   }
   TENRYU_ASSERT(shell_block != nullptr,
                 "multiblock topology requires a POLAR_SHELL block");
-  TENRYU_ASSERT(shell_count == 1,
-                "multiblock topology requires exactly one POLAR_SHELL block");
+  TENRYU_ASSERT(shell_count >= 1,
+                "multiblock topology requires at least one POLAR_SHELL block");
   TENRYU_ASSERT(shell_block->n_i_cells > 0 && shell_block->n_j_cells > 0,
                 "POLAR_SHELL block dimensions must be positive");
   TENRYU_ASSERT(shell_block->cell_count ==
                     shell_block->n_i_cells * shell_block->n_j_cells,
                 "POLAR_SHELL block cell count must match block dimensions");
-  TENRYU_ASSERT(shell_block->owned_node_count ==
-                    (shell_block->n_i_cells + 1) *
-                        (shell_block->n_j_cells + 1),
-                "POLAR_SHELL owned nodes must be contiguous block-grid nodes");
+  if (shell_count == 1) {
+    TENRYU_ASSERT(shell_block->owned_node_count ==
+                      (shell_block->n_i_cells + 1) *
+                          (shell_block->n_j_cells + 1),
+                  "POLAR_SHELL owned nodes must be contiguous block-grid nodes");
+  } else {
+    const std::vector<int> chain =
+        mesh_topo_multiblock_ordered_polar_shell_chain(mb);
+    TENRYU_ASSERT(
+        &mb.blocks[static_cast<std::size_t>(chain.back())] == shell_block,
+        "last split POLAR_SHELL block must own the outer boundary");
+    TENRYU_ASSERT(
+        shell_block->owned_node_count ==
+            shell_block->n_i_cells * (shell_block->n_j_cells + 1),
+        "outermost split POLAR_SHELL owned nodes must exclude only its shared inner ring");
+  }
   return *shell_block;
+}
+
+inline const BlockInfo& mesh_topo_multiblock_polar_shell_block(
+    const MultiBlockTopology& mb) {
+  return mesh_topo_multiblock_outermost_polar_shell_block(mb);
+}
+
+inline int mesh_topo_multiblock_outermost_polar_shell_node_offset(
+    const MultiBlockTopology& mb) {
+  const BlockInfo& shell_block =
+      mesh_topo_multiblock_outermost_polar_shell_block(mb);
+  if (mesh_topo_multiblock_polar_shell_block_count(mb) == 1) {
+    return shell_block.owned_node_begin;
+  }
+
+  const std::vector<int> chain =
+      mesh_topo_multiblock_ordered_polar_shell_chain(mb);
+  const int outermost_block = chain.back();
+  TENRYU_ASSERT(mb.dendrite_block_rings.size() == mb.blocks.size(),
+                "split polar-shell node offset requires block ring metadata");
+  const DendriteBlockRings& rings =
+      mb.dendrite_block_rings[static_cast<std::size_t>(outermost_block)];
+  const int stride = shell_block.n_j_cells + 1;
+  TENRYU_ASSERT(rings.inner_ring.size() == static_cast<std::size_t>(stride) &&
+                    rings.outer_ring.size() == static_cast<std::size_t>(stride),
+                "outermost split POLAR_SHELL requires full inner and outer rings");
+  for (int k = 0; k < stride; ++k) {
+    TENRYU_ASSERT(
+        rings.inner_ring[static_cast<std::size_t>(k)] ==
+                rings.inner_ring.front() + k &&
+            rings.outer_ring[static_cast<std::size_t>(k)] ==
+                rings.outer_ring.front() + k,
+        "outermost split POLAR_SHELL boundary rings must be contiguous");
+  }
+  TENRYU_ASSERT(
+      rings.outer_ring.front() ==
+              rings.inner_ring.front() + shell_block.n_i_cells * stride &&
+          shell_block.owned_node_begin == rings.inner_ring.front() + stride,
+      "outermost split POLAR_SHELL structured rows must run from its shared "
+      "inner ring to the outer boundary");
+  return rings.inner_ring.front();
+}
+
+inline int mesh_topo_multiblock_outermost_polar_shell_node_offset(
+    const MeshTopology& topo) {
+  TENRYU_ASSERT(topo.multiblock.has_value(),
+                "multiblock polar-shell node offset requires topology metadata");
+  return mesh_topo_multiblock_outermost_polar_shell_node_offset(
+      *topo.multiblock);
+}
+
+inline int mesh_topo_multiblock_outermost_polar_shell_nr(
+    const MeshTopology& topo) {
+  TENRYU_ASSERT(topo.multiblock.has_value(),
+                "multiblock polar-shell nr requires topology metadata");
+  const BlockInfo& shell_block =
+      mesh_topo_multiblock_outermost_polar_shell_block(*topo.multiblock);
+  if (mesh_topo_multiblock_polar_shell_block_count(*topo.multiblock) == 1) {
+    TENRYU_ASSERT(topo.nr == shell_block.n_i_cells,
+                  "MeshTopology nr must match POLAR_SHELL radial cells");
+  } else {
+    const std::vector<int> chain =
+        mesh_topo_multiblock_ordered_polar_shell_chain(*topo.multiblock);
+    int chain_rows = 0;
+    for (const int block : chain) {
+      chain_rows += topo.multiblock->blocks[static_cast<std::size_t>(block)]
+                        .n_i_cells;
+    }
+    TENRYU_ASSERT(topo.nr == chain_rows,
+                  "MeshTopology nr must match the split polar-shell radial chain");
+  }
+  return shell_block.n_i_cells;
 }
 
 inline int mesh_topo_multiblock_polar_shell_node_offset(
     const MultiBlockTopology& mb) {
-  return mesh_topo_multiblock_polar_shell_block(mb).owned_node_begin;
+  return mesh_topo_multiblock_outermost_polar_shell_node_offset(mb);
 }
 
 inline int mesh_topo_multiblock_polar_shell_node_offset(
     const MeshTopology& topo) {
-  TENRYU_ASSERT(topo.multiblock.has_value(),
-                "multiblock polar-shell node offset requires topology metadata");
-  return mesh_topo_multiblock_polar_shell_node_offset(*topo.multiblock);
+  return mesh_topo_multiblock_outermost_polar_shell_node_offset(topo);
 }
 
 inline int mesh_topo_multiblock_polar_shell_nr(const MeshTopology& topo) {
-  TENRYU_ASSERT(topo.multiblock.has_value(),
-                "multiblock polar-shell nr requires topology metadata");
-  const BlockInfo& shell_block =
-      mesh_topo_multiblock_polar_shell_block(*topo.multiblock);
-  TENRYU_ASSERT(topo.nr == shell_block.n_i_cells,
-                "MeshTopology nr must match POLAR_SHELL radial cells");
-  return shell_block.n_i_cells;
+  return mesh_topo_multiblock_outermost_polar_shell_nr(topo);
 }
 
 // Trifan-cap fan node id, mirroring the canonical mesh-construction indexing
@@ -817,27 +1318,51 @@ inline int mesh_topo_trifan_fan_node_id(const MultiBlockTopology& mb,
   }
 }
 
-inline int mesh_topo_multiblock_polar_shell_nz(const MeshTopology& topo) {
+inline int mesh_topo_multiblock_outermost_polar_shell_nz(
+    const MeshTopology& topo) {
   TENRYU_ASSERT(topo.multiblock.has_value(),
                 "multiblock polar-shell nz requires topology metadata");
   const BlockInfo& shell_block =
-      mesh_topo_multiblock_polar_shell_block(*topo.multiblock);
+      mesh_topo_multiblock_outermost_polar_shell_block(*topo.multiblock);
   TENRYU_ASSERT(topo.nz == shell_block.n_j_cells,
                 "MeshTopology nz must match POLAR_SHELL angular cells");
   return shell_block.n_j_cells;
 }
 
-inline void mesh_topo_assert_multiblock_polar_shell_outer_boundary(
+inline int mesh_topo_multiblock_polar_shell_nz(const MeshTopology& topo) {
+  return mesh_topo_multiblock_outermost_polar_shell_nz(topo);
+}
+
+inline void mesh_topo_assert_multiblock_outermost_polar_shell_outer_boundary(
     const MeshTopology& topo) {
+  if (topo.general_polygonal) {
+    // General CSR form: every boundary-face node must carry a boundary flag,
+    // and any non-axis boundary node must carry NODE_OUTER_PHYSICAL_BOUNDARY.
+    TENRYU_ASSERT(topo.multiblock.has_value(),
+                  "general-polygonal boundary check requires topology metadata");
+    TENRYU_ASSERT(topo.node_flags.size() ==
+                      static_cast<std::size_t>(topo.n_nodes),
+                  "general-polygonal boundary check requires node_flags");
+    for (std::size_t node = 0; node < topo.node_flags.size(); ++node) {
+      const std::uint8_t flags = topo.node_flags[node];
+      if ((flags & NODE_BOUNDARY) == 0U) {
+        continue;
+      }
+      TENRYU_ASSERT((flags & (NODE_AXIS | NODE_OUTER_PHYSICAL_BOUNDARY)) != 0U,
+                    "general-polygonal boundary node must be axis or outer");
+    }
+    return;
+  }
   TENRYU_ASSERT(topo.multiblock.has_value(),
                 "multiblock polar-shell boundary check requires topology metadata");
   const BlockInfo& shell_block =
-      mesh_topo_multiblock_polar_shell_block(*topo.multiblock);
+      mesh_topo_multiblock_outermost_polar_shell_block(*topo.multiblock);
   TENRYU_ASSERT(topo.node_flags.size() == static_cast<std::size_t>(topo.n_nodes),
                 "multiblock polar-shell boundary check requires node_flags");
   const int stride = shell_block.n_j_cells + 1;
   const int outer_ring_begin =
-      shell_block.owned_node_begin + shell_block.n_i_cells * stride;
+      mesh_topo_multiblock_outermost_polar_shell_node_offset(topo) +
+      shell_block.n_i_cells * stride;
   for (int k = 0; k <= shell_block.n_j_cells; ++k) {
     const int n = outer_ring_begin + k;
     TENRYU_ASSERT(n >= 0 && n < topo.n_nodes,
@@ -846,6 +1371,11 @@ inline void mesh_topo_assert_multiblock_polar_shell_outer_boundary(
                    NODE_OUTER_PHYSICAL_BOUNDARY) != 0U,
                   "POLAR_SHELL outer ring must carry NODE_OUTER_PHYSICAL_BOUNDARY");
   }
+}
+
+inline void mesh_topo_assert_multiblock_polar_shell_outer_boundary(
+    const MeshTopology& topo) {
+  mesh_topo_assert_multiblock_outermost_polar_shell_outer_boundary(topo);
 }
 
 struct MeshTopoCellCornerNodesN {
@@ -1165,12 +1695,18 @@ struct Mesh {
   // Borrowed pointers into State.
   double* node_r = nullptr;
   double* node_z = nullptr;
+  const mesh::RingPageSet* ring_pages = nullptr;
 
   // Owned geometry caches.
   std::vector<double> cell_vol;
   std::vector<double> cell_area;
   std::vector<double> cell_centroid_r;
   tenryu::core::DeviceArray<double> cell_centroid_r_device;
+  tenryu::core::DeviceArray<double> cell_vol_device;
+  tenryu::core::DeviceArray<double> cell_area_device;
+  tenryu::core::DeviceArray<double> cell_centroid_z_device;
+  tenryu::core::DeviceArray<double> cell_Svec_r_device;
+  tenryu::core::DeviceArray<double> cell_Svec_z_device;
   std::vector<double> cell_centroid_z;
   // Area vectors: corner_stride slots per cell.
   int corner_stride = 4;
@@ -1184,6 +1720,18 @@ struct Mesh {
   tenryu::core::DeviceArray<int> multiblock_reverse_csr_node_offsets;
   tenryu::core::DeviceArray<int> multiblock_reverse_csr_node_cells;
   tenryu::core::DeviceArray<int> multiblock_reverse_csr_node_corners;
+  tenryu::core::DeviceArray<int> multiblock_node_edge_csr_offsets;
+  tenryu::core::DeviceArray<int> multiblock_node_edge_csr_edges;
+  tenryu::core::DeviceArray<std::int8_t> multiblock_node_edge_csr_end;
+  tenryu::core::DeviceArray<int> multiblock_cell_edge_csr_offsets;
+  tenryu::core::DeviceArray<int> multiblock_cell_edge_csr_edges;
+  tenryu::core::DeviceArray<std::int8_t> multiblock_cell_edge_csr_side;
+  // Device mirrors of static multiblock topology consumed by
+  // recompute_geometry_checked; refreshed (with topology_serial) at every
+  // canonical topology-(re)build site alongside the CSR mirrors above.
+  tenryu::core::DeviceArray<int> multiblock_cell_orientation_sign_device;
+  tenryu::core::DeviceArray<std::uint8_t> multiblock_cell_nverts_device;
+  std::uint64_t topology_serial = 1;
 
   int dim = 1;
   // W-G: 1D coordinate geometry code (mesh/geometry_1d.cuh Geometry1D);
@@ -1221,6 +1769,16 @@ struct Mesh {
   MeshGeometryResult recompute_geometry_checked(
       const MeshGeometryCheckOptions& opts);
   void recompute_geometry();
+  // w1-B2a: on the multiblock path the host Svec mirrors are LAZY — the
+  // device members are authoritative; call this before any host read.
+  void materialize_host_svec();
+  // w1-B2a: laziness is scoped — only the hydro lagrangian step enables it;
+  // out-of-scope recomputes keep the eager host pulls.
+  void begin_lazy_svec() { svec_lazy_mode_ = true; }
+  void end_lazy_svec() {
+    materialize_host_svec();
+    svec_lazy_mode_ = false;
+  }
   void recompute_geometry_device_only(double* state_vol);
   MeshGeometryResult sync_device_geometry_to_host_checked(
       const double* state_vol,
@@ -1231,10 +1789,31 @@ struct Mesh {
   void ensure_persistent_geometry_buffers_(std::size_t n_cells);
   void release_persistent_geometry_buffers_();
 
+  std::uint64_t geometry_topo_checked_serial_ = 0;
+  bool geometry_use_cell_nverts_cached_ = false;
+  bool host_svec_stale_ = false;
+  bool svec_lazy_mode_ = false;
   double* d_cell_vol_persistent_ = nullptr;
   double* d_cell_centroid_r_persistent_ = nullptr;
   double* d_cell_centroid_z_persistent_ = nullptr;
   std::size_t d_persistent_capacity_ = 0;
+};
+
+void rebuild_multiblock_node_edge_csr(Mesh& mesh);
+void rebuild_multiblock_csw_line_topology(Mesh& mesh);
+
+// RAII scope for Mesh lazy host-Svec mode (return/exception safe).
+class MeshSvecLazyScope {
+ public:
+  explicit MeshSvecLazyScope(Mesh& mesh) : mesh_(mesh) {
+    mesh_.begin_lazy_svec();
+  }
+  ~MeshSvecLazyScope() { mesh_.end_lazy_svec(); }
+  MeshSvecLazyScope(const MeshSvecLazyScope&) = delete;
+  MeshSvecLazyScope& operator=(const MeshSvecLazyScope&) = delete;
+
+ private:
+  Mesh& mesh_;
 };
 
 // Option-C MPI decomposition: restrict host-side geometry validity checks to
@@ -1284,5 +1863,15 @@ Mesh create_cone_shell_mesh(const tenryu::core::Config& cfg,
                             tenryu::core::State& state);
 Mesh create_pentagon_belt_shell_mesh(const tenryu::core::Config& cfg,
                                      tenryu::core::State& state);
+
+// Rebuild every derived topology cache after a runtime cell-connectivity
+// edit (cell-node CSR rows + cell_nverts and, for ReALE, node coordinates/count
+// changed in place; no cells added): reverse node->cell CSR, face adjacency,
+// unique internal
+// faces, boundary faces, BC tags, and all their device payloads -- in the
+// same order and with the same builders the initial mesh construction uses.
+void rebuild_runtime_topology_caches(core::State& state,
+                                     const core::Config& cfg,
+                                     bool rebuild_node_flags = false);
 
 }  // namespace tenryu::mesh

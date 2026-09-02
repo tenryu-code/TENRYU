@@ -9,12 +9,23 @@ env `TENRYU_I1B_CORE_1D_SUBMODEL`、default off)。極性 butterfly シェル
 TMOP 型品質目的 patch rezone / foot+main 整形パルス — いずれも
 ring 4-7 の flow 駆動フォールドに不追随) — 認証済みハイブリッドが
 production 構成である。
+The pooled cap is an endgame device; with
+`central_pseudo_core_activation_time_s > 0`, the center evolves fully resolved
+until that time and the cap pools from the resolved state using the same
+operation as a swap-time build, bounding the pooled-approximation exposure
+window.
 
 ### 13.1 サブモデル本体
 - スキーム: staggered von Neumann–Richtmyer 球対称 (§3 と同族)。
   セル {m_k, e_k, Y_k}、節点 {r_i, u_i}、r_0=0 固定。人工粘性は
   c1·ρ·c_s·|Δu| + c2·ρ·Δu² (c1/c2 は 2D 側と同値既定 0.5/4.0)。
   CFL=0.25 で 2D step 内を subcycle。host 常駐 (GPU コスト零)。
+- **Energy admissibility guard (2026-08-24)**: supported/free 経路は候補
+  dt ごとに compatible ΔU の trial を positivity guard ループ内で評価し、
+  \(e+\Delta U/m \le 64\epsilon\max(|e|,\tfrac12\max u^2,c_s^2)\) なら
+  install せず dt 半減 (受理 step は式恒等で bit 不変・gate_cap22 実証)。
+  \(10^{-22}\) s 割れは `energy_floor` 拒否+dump。無記帳床なし (旧
+  e≥1e-30 clamp は O(1) 残差の隠蔽源だった)。
 - **massless outer face**: 外端フェイスは質量ゼロの運動学拘束
   (V_c 追随)。外殻セル全質量は内側節点へ lump する。質量つき face の
   速度上書きは ±7e4 erg/step 級の slosh 整流注入 (実測)、純力学 face は
@@ -40,8 +51,16 @@ production 構成である。
 
 ### 13.3 エネルギー簿記 (単一所有 pair 契約)
 - 界面仕事は両側が同一の Π·ΔV_c を記帳する (impulse 簿記は正確に
-  半分を計上していた: 実測 W_2d=W_1d/2)。サブモデル内部は
-  U+K vs (injected + piston work) の台帳で ≤~2.5e-4 (通常 1e-5 級)。
+  半分を計上していた: 実測 W_2d=W_1d/2)。
+- **Compatible total-energy update (W4d-7)**: 各セルの
+  \(\Delta U_j=\Delta t\,\sigma_j(A_j\bar u_j-A_{j+1}\bar u_{j+1})\)
+  (\(\sigma=P+q\)、pre-step 面積、\(\bar u\)=kick 中点速度) — 内部面項は
+  節点 K 更新と厳密に telescope。自由外面は \(-\Delta t P_{ext}A_n\bar u_n\)、
+  massless 結合面は \(-\Delta t\,\sigma_{n-1}A_n u_{bc}\)。旧
+  swept-volume 内部エネルギー形は反射衝撃 tail で +9.5% (dt/chunk
+  細分不変 = 古典的 O(1) shock-crossing 欠陥) — compatible 形で
+  サブモデル台帳は丸め誤差まで閉じる (cap21 tail 実測 resid_rel
+  −1.9e-14)。
   1 step = 1 advance (rollback+再前進対は K を漏らす: 実測)。
 - 診断: 吸収ガス部分体積はサブモデル殻から直読 (`pc.core1d_V_gas_c`
   → CR_V)。プール系 fallback はエネルギー分率 `U_gas_frac_c`
@@ -56,22 +75,9 @@ production 構成である。
   q_J=−0.85 の予測反転を正しく検出するが free node 0)。最終行は
   構造バックストップ (structural_max) で吸収不可のため ladder 枯渇
   abort が必然だった。
-- **終端吸収** (`TENRYU_I1B_TERMINAL_ABSORB`, default off): emergency
-  walk が最終行 (structural_max+1) を要求し、かつ rebound 検出
-  (`pc.core1d_V_gas_c > factor × min 履歴`、factor 既定 1.02、env
-  `TENRYU_I1B_TERMINAL_REBOUND_FACTOR`) の時のみ、残存全セルを
-  §13.2 と同一契約 (unit depth ごと 1 殻 + 半径射影 + 明示熱化) で
-  サブモデルへ吸収し、2D メッシュを凍結する。以後 t_end まで
-  **core1d 単独 tail** (chunk 幅 `TENRYU_I1B_TERMINAL_TAIL_DT` 既定
-  1 ps、外圧 = drive テーブル直読、rebound 期は 0) を積分する。
-  2D は再ステップされない。凍結後の HDF5 最終出力は t_abs 時点の
-  メッシュを保持する (時刻ラベルのみ t_end)。
-- **free-outer face**: tail では 2D piston が存在しないため、外端は
-  標準の質量つき VNR 自由面へ切替 (face 質量 = 外殻セルの半分、
-  駆動力 = (P+q)_face − P_ext)。massless→massive の規約切替に伴う
-  K 定義ジャンプは ledger の injected 項へ**明示記帳** (閉包厳密)。
-  従来の実験的 dynamic_outer は外殻セル慣性を 1.5 倍計上する不整合
-  (不安定の有力要因) があり、tail では使用しない。
+- **終端 takeover の廃止**: 2D メッシュを凍結して core1d tail へ移譲する
+  終端吸収機構は廃止された
+  (`docs/design/terminal_takeover_removal_20260827.md`)。
 
 ### 13.5 remap 質量閉包ゲート
 - 全 CSR remap は総質量閉包 (Σm_post−Σm_pre)/Σm_pre を無条件計測する

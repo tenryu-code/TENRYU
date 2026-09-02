@@ -9,20 +9,33 @@
 #include <string>
 #include <vector>
 
+#include "core/cavity_boundary_graph.hpp"
 #include "core/config.hpp"
 #include "core/device_error_flags.cuh"
 #include "core/field.hpp"
 #include "core/namelist/frozen_table.hpp"
+#include "mesh/boundary_carrier.hpp"
 #include "materials/zmoment_device.cuh"
 #include "mesh/mesh.hpp"
+#include "mesh/ring_pages.hpp"
 
 namespace tenryu::core {
 
 template <typename T>
 using DeviceBuffer = DeviceArray<T>;
 
-inline int corner_stride_for_scheme(const TopologyScheme s) {
-  return s == TopologyScheme::PENTAGON_BELT_SHELL ? 8 : 4;
+inline int corner_stride_for_config(const Config& cfg) {
+  if (cfg.numerics.ale.mesh_mode == "reale_v2") {
+    return mesh::kMeshTopoCellStorageSlotsMaxGeneral;
+  }
+  return cfg.mesh.topology_scheme == TopologyScheme::PENTAGON_BELT_SHELL ||
+                 ((cfg.mesh.topology_scheme ==
+                       TopologyScheme::MULTIBLOCK_POLAR_TIER ||
+                   cfg.mesh.topology_scheme == TopologyScheme::
+                                                   MULTIBLOCK_POLAR_TIER_CART_CENTER) &&
+                  cfg.mesh.polar_tier_native_pentagon)
+             ? 8
+             : 4;
 }
 
 struct DispatchCounters {
@@ -169,6 +182,15 @@ struct TriFanCenterPerturbationDiag {
   void reset() noexcept { *this = TriFanCenterPerturbationDiag{}; }
 };
 
+struct PolarTierOriginForceDiag {
+  bool valid = false;
+  int node = -1;
+  double raw_force_r = 0.0;
+  double raw_force_z = 0.0;
+
+  void reset() noexcept { *this = PolarTierOriginForceDiag{}; }
+};
+
 enum class CentralPseudoCoreActiveClass : std::uint8_t {
   ACTIVE_ORDINARY = 0U,
   ACTIVE_MACRO_CORE = 1U,
@@ -238,19 +260,6 @@ struct CentralPseudoCoreState {
   // Published by the stratified 1D core sub-model when active (hydro layer
   // writes, diagnostics reads): shell-resolved gas partial volume [cm^3].
   double core1d_V_gas_c = std::numeric_limits<double>::quiet_NaN();
-  // Running minimum of core1d_V_gas_c (rebound detector for the terminal
-  // absorption: V_gas rising a factor past this minimum marks the post-peak
-  // phase where eating the LAST shell row is legitimate).
-  double core1d_V_gas_min_c = std::numeric_limits<double>::infinity();
-  // Terminal absorption (I1-B-R, env TENRYU_I1B_TERMINAL_ABSORB):
-  // when the rebound-phase emergency walk requests the structurally
-  // unabsorbable LAST shell row, the whole remaining 2D mesh is absorbed
-  // into the stratified 1D sub-model and the run completes as a core1d-only
-  // tail integration. The 2D mesh state is FROZEN at terminal_absorb_t.
-  bool terminal_absorb_pending = false;
-  bool terminal_absorbed = false;
-  double terminal_absorb_t = 0.0;
-  int terminal_absorb_step = -1;
   double Ue_c = 0.0;
   double Ui_c = 0.0;
   bool boundary_work_pending = false;
@@ -347,9 +356,164 @@ struct PoleAngularDerefineState {
   double Ui_ref = std::numeric_limits<double>::quiet_NaN();
 };
 
+enum class EvacContactState : std::uint8_t {
+  kNone = 0,
+  kArmed = 1,
+  kActive = 2,
+  kOpenSpacer = 3,
+};
+
+inline constexpr int kEvacContactMortarRowCapacity = 3;
+
+struct EvacContactSlot {
+  int cell = -1;
+  int axis = 1;                 // 0 = i (radial), 1 = j (axial)
+  int node_a[2] = {-1, -1};    // Low-side face nodes.
+  int node_b[2] = {-1, -1};    // High-side face pair partners.
+  double normal_pair_r[2] = {0.0, 0.0};
+  double normal_pair_z[2] = {1.0, 1.0};
+  double h_perp_ref = 0.0;      // Reference closing thickness [cm].
+  double g0 = 0.0;              // Engaged gap floor [cm].
+  double g_arm = 0.0;           // Arming gap [cm].
+  double gap_pair[2] = {0.0, 0.0};  // Latest per-pair gaps [cm].
+  double gap_prev_pair[2] = {
+      std::numeric_limits<double>::quiet_NaN(),
+      std::numeric_limits<double>::quiet_NaN()};  // Previous per-pair gaps.
+  std::uint8_t pair_engaged[2] = {0U, 0U};  // 1 while the pair holds contact.
+  double gap_at_engagement_pair[2] = {0.0, 0.0};
+  // Controller reference only: intentionally not checkpointed. Restarted
+  // active rows recapture their current gap on the first mortar assembly.
+  double mortar_g_hold[kEvacContactMortarRowCapacity] = {};
+  std::uint8_t mortar_g_hold_valid[kEvacContactMortarRowCapacity] = {};
+  double gap = 0.0;             // Minimum latest per-pair gap [cm].
+  double gap_prev = std::numeric_limits<double>::quiet_NaN();  // Prior minimum.
+  double mass_at_engagement = std::numeric_limits<double>::quiet_NaN();
+  double vol_at_engagement = 0.0;
+  std::uint8_t devolumized = 0U;  // 1 = non-volumetric seam interface owner
+  EvacContactState state = EvacContactState::kNone;  // kActive iff any pair.
+  int tensile_streak_pair[2] = {0, 0};
+  double lambda_last = 0.0;     // Last stage multiplier [dyn].
+  double impact_heat_total = 0.0;  // Ledgered engagement heat [erg].
+  int reproject_count = 0;          // Backstop projections applied.
+  double reproject_heat_total = 0.0;  // Cumulative backstop heat [erg].
+  double commit_project_heat_total = 0.0;  // Stage-commit heat [erg].
+  int reproject_count_last_logged = 0;  // Count at prior hold summary.
+  double reproject_heat_last_logged = 0.0;  // Heat at prior summary [erg].
+  int engage_count = 0;
+  int release_count = 0;
+};
+
+// Owns the contact records (surface-based contact migration). Records keep the
+// legacy EvacContactSlot layout; record_boundary_valid is an observational
+// annotation refreshed by the cavity-boundary rebuild: 1 when all four pair
+// nodes of the record currently lie on the material-void boundary.
+struct ContactGraph {
+  std::vector<EvacContactSlot> records;
+  std::vector<std::uint8_t> record_boundary_valid;
+};
+
+struct EvacuatedCellsState {
+  std::vector<std::uint8_t> inactive_member_mask;
+  DeviceBuffer<std::uint8_t> d_inactive_member_mask;
+  std::vector<double> mass_ref;
+  std::vector<double> vol_ref;
+  std::vector<int> off_streak;
+  int conversions_total = 0;
+  std::vector<int> controller_dwell_remaining;
+  std::vector<int> controller_evaluations_since_conversion;
+  std::vector<double> controller_previous_volume;
+  std::vector<std::array<double, 2>> controller_previous_contact_gap;
+  std::vector<double> x_r_ref;
+  std::vector<double> x_z_ref;
+  std::vector<std::uint8_t> closure_lineage;
+  std::vector<std::uint8_t> contact_active_mask;  // Per cell, 1 = kActive slot.
+  DeviceBuffer<std::uint8_t> d_contact_active_mask;
+  DeviceBuffer<int> d_contact_active_cells;  // Compact list, at most 8 entries.
+  DeviceBuffer<int> d_contact_face_nodes;  // 4 ints/cell: a0,a1,b0,b1.
+  DeviceBuffer<double> d_contact_face_normal_ref;  // 2 doubles/cell.
+  DeviceBuffer<double> d_contact_face_g0;  // One gap floor per active cell [cm].
+  DeviceBuffer<int> d_contact_active_axis;  // Closing axis per active cell.
+  DeviceBuffer<double> d_contact_mortar_g_hold;  // 3 rows per active cell [cm].
+  DeviceBuffer<std::uint8_t> d_contact_mortar_g_hold_valid;
+  DeviceBuffer<int> d_contact_mortar_drift_count;  // [rows, structural, KE reject].
+  DeviceBuffer<double> d_contact_mortar_drift_max_ucorr;  // [cm/s].
+  DeviceBuffer<double> d_contact_active_vol_at_engagement;
+  DeviceBuffer<std::uint8_t> d_contact_active_devolumized;  // per active cell
+  DeviceBuffer<int> d_contact_active_pair_dk_owner;
+  DeviceBuffer<int> d_contact_volume_projection_count;  // [volume, patch].
+  int n_contact_active_cells = 0;
+  DeviceBuffer<int> d_contact_pair_nodes;  // 2 ints per active pair.
+  DeviceBuffer<double> d_contact_pair_normal;  // 2 doubles per pair.
+  DeviceBuffer<double> d_contact_pair_lambda;  // One output per pair.
+  DeviceBuffer<double> d_contact_pair_dk;  // Projection KE loss per pair [erg].
+  std::vector<std::uint8_t> contact_pair_row_covered;
+  DeviceBuffer<std::uint8_t> d_contact_pair_row_covered;
+  int n_active_pairs = 0;  // Engaged pairs, in slot then pair order.
+  DeviceBuffer<int> d_contact_row_nodes;      // 3 per row: slave, seg_a, seg_b
+  DeviceBuffer<double> d_contact_row_xi;      // 1 per row
+  DeviceBuffer<double> d_contact_row_normal;  // 2 per row: (n_r, n_z)
+  DeviceBuffer<double> d_contact_row_dk;      // 1 per row, kinetic energy removed
+  // Transient host staging; rows are rebuilt after restart (not checkpointed).
+  std::vector<int> contact_row_nodes;      // 3 per row (mesh node ids)
+  std::vector<double> contact_row_xi;
+  std::vector<double> contact_row_normal;  // 2 per row
+  int n_contact_rows = 0;
+  double contact_dt_cap_s = std::numeric_limits<double>::infinity();
+  // Axis-edge-collapse topology transaction (stage A: monitor only).
+  std::vector<int> node_axis_alias;          // per node; -1 = no alias, else surviving node id
+  std::vector<std::uint8_t> cell_axis_edge_collapsed;  // per cell; 1 = quad degenerated to triangle
+  DeviceBuffer<std::uint8_t> d_cell_axis_edge_collapsed;  // mirror, uploaded on commit
+  std::vector<std::uint8_t> geometry_policy_exempt_cells;
+  DeviceBuffer<std::uint8_t> d_geometry_policy_exempt_cells;
+  DeviceBuffer<int> d_node_axis_alias;  // full per-node map, -1 = none
+  DeviceBuffer<int> d_node_axis_alias_pairs;  // 2 ints per alias: [aliased, surviving]
+  int n_node_axis_aliases = 0;
+  struct AxisEdgeCollapseMonitor {
+    static constexpr int kRingCapacity = 8;
+    int cell = -1;              // monitored failing cell (axis row)
+    int node_lo = -1;           // axis node at the cell's low-j corner
+    int node_hi = -1;           // axis node at the cell's high-j corner
+    double h_ref = 0.0;         // frozen local reference spacing [cm]
+    double h0[kRingCapacity] = {0.0};       // ring: recent gap samples [cm]
+    double hdot[kRingCapacity] = {0.0};     // ring: recent closing-rate samples [cm/s]
+    double dt_sample[kRingCapacity] = {0.0};  // ring: dt at each sample [s]
+    int n_samples = 0;
+    int ring_head = 0;
+    int last_sample_step = -1;
+    bool armed = false;
+    double repair_gain_baseline_h0 = 0.0;   // h0 just before the last accepted repair
+    double repair_gain = 0.0;               // clearance gained by the last accepted repair
+    int repair_step = -1;                   // step of the last accepted repair
+  };
+  AxisEdgeCollapseMonitor axis_edge_collapse_monitor;
+  struct FlankStripMonitor {
+    static constexpr int kRingCapacity = 8;
+    bool armed = false;
+    int slot_cell = -1;             // seam slot cell anchoring the band
+    int worst_cell = -1;
+    int worst_corner = -1;
+    double worst_quality_ratio = 0.0;   // min q_theta / q_theta_ref over the band
+    double lnq[kRingCapacity] = {0.0};  // ring: ln of the worst ratio
+    double dt_sample[kRingCapacity] = {0.0};
+    int n_samples = 0;
+    int ring_head = 0;
+    int last_sample_step = -1;
+    int release_streak = 0;
+  };
+  FlankStripMonitor flank_strip_monitor;
+  std::vector<double> flank_strip_q_theta_ref;  // per (cell,corner): 4*n_cells, 0 = unset
+  std::vector<double> flank_strip_h_ref;  // per node: epoch along-row interval to the next-j node [cm]; 0 = unset
+};
+
 struct State {
   // --- Mesh ---
   tenryu::mesh::Mesh mesh;
+  mesh::BoundaryCarrier boundary_carrier;
+  mesh::RingPageSet carrier_ring_pages;
+  std::vector<std::uint8_t> carrier_node_class;
+  std::vector<int> carrier_node_edge;
+  std::vector<double> carrier_node_lambda;
+  bool carrier_domain_active = false;
 
   // --- Parallel owned compute range (Option C decomposition) ---
   // Set by the driver from PartitionInfo when n_ranks > 1 (r-slab: owned
@@ -413,6 +577,12 @@ struct State {
   std::vector<std::int8_t> cell_nverts_host;
   bool corner_mass_initialized = false;
   bool corner_mass_is_lagrangian_invariant = false;
+  // Snapshot of Numerics.hydro.corner_mass_convention taken at
+  // State::allocate(cfg). Diagnostic recompute paths that have no Config in
+  // scope (energy-budget uncached KE basis) read this instead of
+  // hard-coding the legacy default; 0 (= bbsw_radial_v0) is kept for
+  // direct-built states that never pass through allocate(cfg).
+  int corner_mass_convention = 0;
   CellField1D corner_volume;
   CellField1D corner_pressure;
   // Phase B Caramana-Shashkov hourglass subzonal masses. These are initialized
@@ -461,9 +631,20 @@ struct State {
   CellField1D ei;
   CellField1D Pe;
   CellField1D Pi;
+  // Host-side design doc §18 C1 refinement-estimator diagnostic field.
+  std::vector<double> refine_error;
+  // §18.2 arm_exit: one-shot host-side request for an immediate
+  // checkpoint at the current step (honored by
+  // OutputManager::should_checkpoint, cleared by the driver after the
+  // output pass). Never set in shadow mode.
+  bool checkpoint_request = false;
   CellField1D Qvisc;
+  // AW mode keeps planar pressure forces for momentum in corner_force_p_* and
+  // true-RZ pressure forces for energy work in corner_force_p_rz_*.
   CellField1D corner_force_p_r;
   CellField1D corner_force_p_z;
+  CellField1D corner_force_p_rz_r;
+  CellField1D corner_force_p_rz_z;
   CellField1D corner_force_sub_r;
   CellField1D corner_force_sub_z;
   CellField1D corner_force_q_r;
@@ -473,6 +654,9 @@ struct State {
   CellField1D work_p_per_cell;
   CellField1D work_sub_per_cell;
   CellField1D work_av_per_cell;
+  // Wake-flux v1 is cell-attached only; remap transport is a §3.4 follow-up.
+  CellField1D wake_heat_flux_eta;
+  CellField1D wake_heat_flux_zeta;
   // 2D Braginskii viscosity corner forces / work tally
   // (docs/design/2d_visc_port_spec.md §2.3; sized n_cells*4 / n_cells,
   // allocated only when plasma_viscosity.enabled).
@@ -501,6 +685,7 @@ struct State {
   double av_cs_at_max = 0.0;
   double av_delta_u_at_max = 0.0;
   int count_edge_compressive_edges_step = 0;
+  int tensor_pc_degenerate = 0;
   double max_corner_density_spread_step = 0.0;
   double max_corner_density_spread_run = 0.0;
   double max_subzonal_merit_step = 0.0;
@@ -521,8 +706,12 @@ struct State {
   int max_corner_density_spread_cell_id = -1;
   int max_corner_density_spread_corner_id = -1;
   TriFanCenterPerturbationDiag tri_fan_center_perturbation_diag{};
+  PolarTierOriginForceDiag polar_tier_origin_force_diag{};
   CentralPseudoCoreState central_pseudo_core{};
   PoleAngularDerefineState pole_angular_derefine{};
+  EvacuatedCellsState evacuated_cells{};
+  CavityBoundaryGraph cavity_boundary{};
+  ContactGraph contact_graph{};
   bool ring7_seam_rezone_requested = false;
   int ring7_seam_rezone_request_cell = -1;
   bool ring7_pole_cap_oracle_requested = false;
@@ -560,12 +749,19 @@ struct State {
   NodeField1D x_r_shock_target;
   NodeField1D x_z_shock_target;
   std::uint64_t reference_epoch = 0;
+  DeviceArray<double> ale_monitor_ref_x_r;
+  DeviceArray<double> ale_monitor_ref_x_z;
+  DeviceArray<double> ale_monitor_ref_corner_fractions;
+  bool ale_monitor_ref_valid = false;
+  bool ale_monitor_ref_post_morph = false;
   DeviceBuffer<double> ref_xi_node;
   DeviceBuffer<double> ref_xi_cell;
   DeviceBuffer<double> ref_dir0_r;
   DeviceBuffer<double> ref_dir0_z;
   NodeField1D v_r;
   NodeField1D v_z;
+  NodeField1D node_accel_r;
+  NodeField1D node_accel_z;
   NodeField1D node_planar_mass;
   std::uint64_t axis_lagrangian_tangential_engaged_count = 0;
   std::uint64_t axis_lagrangian_tangential_ineffective_count = 0;
@@ -835,6 +1031,11 @@ struct State {
   // SN radiation stage, consumed and cleared by the driver retry logic.
   int sn_material_retry_flag = 0;
 
+  // §18.3 diagnostic — net electron-conduction energy rate per volume
+  // (erg/cm3/s), operator-level before/after difference including any
+  // floor/clamp injections.
+  CellField1D conduction_e_rate;
+
   // --- Laser placeholders ---
   CellField1D laser_dep;
   CellField1D ray_density;
@@ -876,6 +1077,7 @@ struct State {
 
   // --- Hydro control ---
   std::vector<std::int8_t> hydro_active;
+  std::vector<std::uint8_t> merge_tombstone;  // permanent topology-transaction tombstones; empty = none; final authority over hydro_active
   // Device mirror of hydro_active (persistent-kernel prep, task #47). Host-side
   // writers must bump hydro_active_host_version (see note_hydro_active_host_write);
   // hydro_active_device_ptr() re-uploads lazily when the versions differ. mutable +
@@ -956,11 +1158,15 @@ struct State {
   double t = 0.0;
   int step = 0;
   double dt = 0.0;
+  // Growth-limiter reference: last step's dt EXCLUDING event-resolution caps
+  // (currently the evacuated-cell contact cap). 0 = unset (fall back to dt).
+  double dt_growth_ref = 0.0;
   double dt_prev_hydro = -1.0;
   bool ale_rezoned = false;
   int ale_rezone_invocations = 0;
   int ale_remaps_applied = 0;
   int ale_last_applied_step = -1;
+  std::uint64_t reale_rezone_skipped = 0;
   // ALE1D min-width-floor retrigger cooldown: remaining steps for which the
   // floor-trigger evaluation is skipped after a rejected floor-triggered
   // attempt. In-memory only (not checkpointed).

@@ -2,6 +2,45 @@
 
 配布スナップショットの更新記録です。日付はスナップショット作成日。
 
+## 2026-09-02
+
+### 機能追加
+
+- **TENRYU Studio に LLM アシスタント統合 (実験的)。** 左ナビの新ビュー
+  「アシスタント」から、同梱の実験的アシスタントハーネス `tools/assist/` を
+  GUI で操作できるようになりました。
+  - **デッキ生成 (LLM)**: 自然言語の仕様から 1D デッキを生成し、サーバーの
+    バイナリでの validate/freeze と lint フィードバックを反復します
+    (`generate-deck` ループ)。モデルが推測せず質問した場合 (UNCERTAIN) は
+    回答して再生成できます。受理デッキはその場で検証・保存・実行可能で、
+    実行は通常の実行履歴に入ります。生成はローカルマシンで実行され
+    (プロバイダ CLI とその認証はローカル前提)、デッキ検証だけを
+    `tools/assist/tenryu_remote.sh` 経由でサーバーに委ねます。既定は無効
+    (assistant.toml で opt-in、`TENRYU_ASSIST_DISABLE=1` が常勝の kill
+    switch)。全 LLM 呼び出しは `~/.tenryu/studio-assist/<stamp>/journal.jsonl`
+    に記録されます。
+  - **詳細 Lint**: 検証パネルから、現在のフォームデッキに対しメッシュ・
+    ゾーニング系 lint (節点単調性・隣接幅比・autozone 質量比・intent ピン)
+    を実行できます。
+  - **実行診断**: 実行履歴の終了 run から、ダイジェスト (履歴系列の縮約・
+    派生指標)・ゾーニング診断 (アブレート帯の質量形 lint)・ゾーニング昇格案
+    を表示できます (サーバー側に python3 と tools/assist を含む
+    チェックアウトが必要。ダイジェストの系列縮約には h5py)。
+  - これに伴い Studio の Tauri shell 許可へ ssh/scp と並んで bash
+    (ローカル実行) が追加されています。GUI マニュアル (gui/manual/) に
+    「アシスタント」章を追加しました。
+- `tools/assist/tenryu_remote.sh` が `TENRYU_REMOTE_SSH_OPTS` /
+  `TENRYU_REMOTE_SCP_OPTS` (および標準の `RSYNC_RSH`) でポート・鍵指定等の
+  接続オプションを受け取れるようになりました。未設定時の挙動は不変です。
+
+### 不具合修正
+
+- **配布物に `gui-common/` が含まれず GUI がビルド不能だった問題を修正。**
+  Studio (gui/) は共有パッケージ `@tenryu-common` (gui-common/) を参照します
+  が、これまでのスナップショットには同梱されていませんでした。今回から
+  `gui-common/` と `ops/gui/` (実行スクリプトの同期テストが参照) を同梱
+  します。
+
 ## 2026-08-31
 
 ### 不具合修正

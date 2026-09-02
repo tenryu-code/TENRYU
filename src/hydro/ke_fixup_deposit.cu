@@ -24,6 +24,7 @@ inline bool cell_inactive(const std::uint8_t* mask, const int cell) {
 
 void finish_node_residual_deposit(int n_cells,
                                   int n_nodes,
+                                  int corner_stride,
                                   const int* cell_node_csr_offsets,
                                   const int* cell_node_csr_indices,
                                   const double* weight_corner_mass,
@@ -38,7 +39,7 @@ void finish_node_residual_deposit(int n_cells,
 
 KeFixupResult compute_ke_fixup_deposit(const KeFixupInput& in) {
   KeFixupResult out;
-  if (in.n_cells <= 0 || in.n_nodes <= 0 ||
+  if (in.n_cells <= 0 || in.n_nodes <= 0 || in.corner_stride <= 0 ||
       in.cell_node_csr_offsets == nullptr ||
       in.cell_node_csr_indices == nullptr ||
       in.corner_mass_frozen == nullptr || in.corner_mass_b_pre == nullptr ||
@@ -61,17 +62,24 @@ KeFixupResult compute_ke_fixup_deposit(const KeFixupInput& in) {
   // of ACTIVE cells only (macro members never receive deposits).
   std::vector<double> W_active(nn, 0.0);
   for (int c = 0; c < in.n_cells; ++c) {
-    const std::size_t off4 = static_cast<std::size_t>(c) * 4U;
+    const std::size_t corner_offset =
+        static_cast<std::size_t>(c) *
+        static_cast<std::size_t>(in.corner_stride);
     const int off = in.cell_node_csr_offsets[c];
+    const int n_corners = std::min(
+        in.corner_stride, in.cell_node_csr_offsets[c + 1] - off);
     const bool inactive = cell_inactive(in.inactive_mask, c);
-    for (int k = 0; k < 4; ++k) {
+    for (int k = 0; k < n_corners; ++k) {
       const int n = in.cell_node_csr_indices[off + k];
       if (n < 0 || n >= in.n_nodes) {
         continue;
       }
-      const double f = in.corner_mass_frozen[off4 + static_cast<std::size_t>(k)];
-      const double bm = in.corner_mass_b_pre[off4 + static_cast<std::size_t>(k)];
-      const double bp = in.corner_mass_b_post[off4 + static_cast<std::size_t>(k)];
+      const double f =
+          in.corner_mass_frozen[corner_offset + static_cast<std::size_t>(k)];
+      const double bm =
+          in.corner_mass_b_pre[corner_offset + static_cast<std::size_t>(k)];
+      const double bp =
+          in.corner_mass_b_post[corner_offset + static_cast<std::size_t>(k)];
       const std::size_t un = static_cast<std::size_t>(n);
       if (std::isfinite(f) && f > 0.0) {
         MF[un] += f;
@@ -84,6 +92,31 @@ KeFixupResult compute_ke_fixup_deposit(const KeFixupInput& in) {
       }
       if (std::isfinite(bp)) {
         MBp[un] += bp;
+      }
+    }
+  }
+
+  std::vector<double> Mpre(nn, 0.0), Mpost(nn, 0.0);
+  if (in.full_ke_residual) {
+    for (int c = 0; c < in.n_cells; ++c) {
+      const int off = in.cell_node_csr_offsets[c];
+      int active_nverts = 4;
+      if (in.cell_nverts != nullptr) {
+        const int nv = static_cast<int>(in.cell_nverts[c]);
+        active_nverts = nv >= 5 ? nv : 4;
+      }
+      const std::size_t base =
+          static_cast<std::size_t>(c) *
+          static_cast<std::size_t>(in.corner_stride);
+      for (int q = 0; q < active_nverts && q < in.corner_stride; ++q) {
+        const int n = in.cell_node_csr_indices[off + q];
+        if (n < 0 || n >= in.n_nodes) continue;
+        const double mp =
+            in.corner_mass_b_pre[base + static_cast<std::size_t>(q)];
+        const double mq =
+            in.corner_mass_b_post[base + static_cast<std::size_t>(q)];
+        if (std::isfinite(mp)) Mpre[static_cast<std::size_t>(n)] += mp;
+        if (std::isfinite(mq)) Mpost[static_cast<std::size_t>(n)] += mq;
       }
     }
   }
@@ -102,9 +135,16 @@ KeFixupResult compute_ke_fixup_deposit(const KeFixupInput& in) {
         !std::isfinite(vzp)) {
       continue;
     }
-    const double dv2 = (vrp * vrp + vzp * vzp) - (vrm * vrm + vzm * vzm);
-    const double m_mismatch = MF[un] - 0.5 * (MBp[un] + MBm[un]);
-    const double r_n = 0.5 * m_mismatch * dv2;
+    double r_n;
+    if (in.full_ke_residual) {
+      r_n = 0.5 * (Mpost[un] * (vrp * vrp + vzp * vzp) -
+                   Mpre[un] * (vrm * vrm + vzm * vzm));
+    } else {
+      const double dv2 =
+          (vrp * vrp + vzp * vzp) - (vrm * vrm + vzm * vzm);
+      const double m_mismatch = MF[un] - 0.5 * (MBp[un] + MBm[un]);
+      r_n = 0.5 * m_mismatch * dv2;
+    }
     if (r_n == 0.0) {
       continue;
     }
@@ -117,7 +157,61 @@ KeFixupResult compute_ke_fixup_deposit(const KeFixupInput& in) {
   out.R_global = static_cast<double>(r_global);
   out.undepositable_abs = static_cast<double>(undepositable);
 
-  finish_node_residual_deposit(in.n_cells, in.n_nodes,
+  if (in.full_ke_residual && in.global_mass_weighted_deposit) {
+    std::vector<double> cell_mass(static_cast<std::size_t>(in.n_cells), 0.0);
+    long double mass_total = 0.0L;
+    for (int c = 0; c < in.n_cells; ++c) {
+      if (cell_inactive(in.inactive_mask, c)) {
+        continue;
+      }
+      const int off = in.cell_node_csr_offsets[c];
+      int active_nverts = 4;
+      if (in.cell_nverts != nullptr) {
+        const int nv = static_cast<int>(in.cell_nverts[c]);
+        active_nverts = nv >= 5 ? nv : 4;
+      }
+      const std::size_t base =
+          static_cast<std::size_t>(c) *
+          static_cast<std::size_t>(in.corner_stride);
+      double mass_c = 0.0;
+      for (int q = 0; q < active_nverts && q < in.corner_stride; ++q) {
+        const int n = in.cell_node_csr_indices[off + q];
+        if (n < 0 || n >= in.n_nodes) continue;
+        const double m =
+            in.corner_mass_frozen[base + static_cast<std::size_t>(q)];
+        if (std::isfinite(m)) mass_c += m;
+      }
+      cell_mass[static_cast<std::size_t>(c)] = mass_c;
+      mass_total += static_cast<long double>(mass_c);
+    }
+
+    if (!(mass_total > 0.0L)) {
+      out.valid = true;
+      out.abandoned = true;
+      return out;
+    }
+
+    out.dU.assign(static_cast<std::size_t>(in.n_cells), 0.0);
+    for (int c = 0; c < in.n_cells; ++c) {
+      if (cell_inactive(in.inactive_mask, c)) {
+        continue;
+      }
+      out.dU[static_cast<std::size_t>(c)] =
+          static_cast<double>(
+              -r_global * static_cast<long double>(
+                              cell_mass[static_cast<std::size_t>(c)]) /
+              mass_total);
+    }
+    out.deposited_total = -static_cast<double>(r_global);
+    out.valid = true;
+    out.clipped_cells = 0;
+    out.redistribution_rounds = 0;
+    out.undepositable_abs = 0.0;
+    out.abandoned = false;
+    return out;
+  }
+
+  finish_node_residual_deposit(in.n_cells, in.n_nodes, in.corner_stride,
                                in.cell_node_csr_offsets,
                                in.cell_node_csr_indices,
                                in.corner_mass_frozen, in.inactive_mask,
@@ -136,6 +230,7 @@ namespace {
 void finish_node_residual_deposit(
     const int n_cells,
     const int n_nodes,
+    const int corner_stride,
     const int* cell_node_csr_offsets,
     const int* cell_node_csr_indices,
     const double* weight_corner_mass,
@@ -153,10 +248,14 @@ void finish_node_residual_deposit(
     if (cell_inactive(inactive_mask, c)) {
       continue;
     }
-    const std::size_t off4 = static_cast<std::size_t>(c) * 4U;
+    const std::size_t corner_offset =
+        static_cast<std::size_t>(c) *
+        static_cast<std::size_t>(corner_stride);
     const int off = cell_node_csr_offsets[c];
+    const int n_corners =
+        std::min(corner_stride, cell_node_csr_offsets[c + 1] - off);
     double du = 0.0;
-    for (int k = 0; k < 4; ++k) {
+    for (int k = 0; k < n_corners; ++k) {
       const int n = cell_node_csr_indices[off + k];
       if (n < 0 || n >= n_nodes) {
         continue;
@@ -165,7 +264,8 @@ void finish_node_residual_deposit(
       if (R[un] == 0.0 || !(W_active[un] > 0.0)) {
         continue;
       }
-      const double f = weight_corner_mass[off4 + static_cast<std::size_t>(k)];
+      const double f =
+          weight_corner_mass[corner_offset + static_cast<std::size_t>(k)];
       if (!(f > 0.0) || !std::isfinite(f)) {
         continue;
       }
@@ -361,7 +461,7 @@ KeFixupResult compute_gap_form_deposit(const GapFormInput& in) {
   out.R_global = static_cast<double>(r_global);
   out.undepositable_abs = static_cast<double>(undepositable);
 
-  finish_node_residual_deposit(in.n_cells, in.n_nodes,
+  finish_node_residual_deposit(in.n_cells, in.n_nodes, 4,
                                in.cell_node_csr_offsets,
                                in.cell_node_csr_indices,
                                in.corner_mass_vp_post, in.inactive_mask,
@@ -391,21 +491,32 @@ void ke_fixup_apply_deposit(core::State& state,
                             const std::vector<double>& corner_mass_b_pre,
                             const std::vector<double>& corner_mass_b_post,
                             const std::vector<double>& v_r_pre,
-                            const std::vector<double>& v_z_pre) {
+                            const std::vector<double>& v_z_pre,
+                            const int corner_stride,
+                            const double chi_override,
+                            const bool full_ke_residual,
+                            const bool global_deposit) {
   const int n_cells = state.mesh.topo.n_cells;
   const int n_nodes = state.mesh.topo.n_nodes;
   if (!state.mesh.topo.multiblock.has_value() || n_cells <= 0 ||
-      n_nodes <= 0 ||
-      state.corner_mass.size() != static_cast<std::size_t>(n_cells) * 4U ||
-      corner_mass_b_pre.size() != static_cast<std::size_t>(n_cells) * 4U ||
-      corner_mass_b_post.size() != static_cast<std::size_t>(n_cells) * 4U ||
+      n_nodes <= 0 || corner_stride <= 0 ||
+      state.corner_mass.size() !=
+          static_cast<std::size_t>(n_cells) *
+              static_cast<std::size_t>(corner_stride) ||
+      corner_mass_b_pre.size() !=
+          static_cast<std::size_t>(n_cells) *
+              static_cast<std::size_t>(corner_stride) ||
+      corner_mass_b_post.size() !=
+          static_cast<std::size_t>(n_cells) *
+              static_cast<std::size_t>(corner_stride) ||
       static_cast<int>(v_r_pre.size()) != n_nodes ||
       static_cast<int>(v_z_pre.size()) != n_nodes) {
     return;
   }
   const auto& mb = *state.mesh.topo.multiblock;
   if (mb.cell_node_csr_indices.size() <
-      static_cast<std::size_t>(n_cells) * 4U) {
+      static_cast<std::size_t>(n_cells) *
+          static_cast<std::size_t>(corner_stride)) {
     return;
   }
 
@@ -455,6 +566,12 @@ void ke_fixup_apply_deposit(core::State& state,
   KeFixupInput in;
   in.n_cells = n_cells;
   in.n_nodes = n_nodes;
+  in.corner_stride = corner_stride;
+  in.full_ke_residual = full_ke_residual;
+  in.global_mass_weighted_deposit = global_deposit;
+  in.cell_nverts = state.mesh.cell_nverts.empty()
+                       ? nullptr
+                       : state.mesh.cell_nverts.data();
   in.cell_node_csr_offsets = mb.cell_node_csr_offsets.data();
   in.cell_node_csr_indices = mb.cell_node_csr_indices.data();
   in.corner_mass_frozen = corner_mass_frozen.data();
@@ -466,7 +583,7 @@ void ke_fixup_apply_deposit(core::State& state,
   in.v_z_post = v_z_post.data();
   in.cell_internal_energy = u_cell.data();
   in.inactive_mask = have_inactive ? inactive.data() : nullptr;
-  in.chi = ke_fixup_deposit_chi();
+  in.chi = chi_override > 0.0 ? chi_override : ke_fixup_deposit_chi();
 
   const KeFixupResult fix = compute_ke_fixup_deposit(in);
   if (!fix.valid) {

@@ -10,6 +10,7 @@
 #include <cuda_runtime.h>
 
 #include "core/axis_tolerance.hpp"
+#include "core/device_scratch.hpp"
 #include "core/error.hpp"
 #include "core/kernel_guard.hpp"
 #include "core/namelist/errors.hpp"
@@ -40,6 +41,23 @@ __global__ void apply_axis_boundary_kernel(double* __restrict__ v_r,
   v_r[idx] = 0.0;
   if (has_physical_rz_axis) {
     x_r[idx] = 0.0;
+  }
+}
+
+__global__ void enforce_node_axis_aliases_kernel(
+    double* __restrict__ x_r,
+    double* __restrict__ x_z,
+    double* __restrict__ v_r,
+    double* __restrict__ v_z,
+    const int* __restrict__ alias_pairs,
+    const int n_pairs) {
+  for (int k = threadIdx.x; k < n_pairs; k += blockDim.x) {
+    const int aliased = alias_pairs[2 * k];
+    const int surviving = alias_pairs[2 * k + 1];
+    x_r[aliased] = x_r[surviving];
+    x_z[aliased] = x_z[surviving];
+    v_r[aliased] = v_r[surviving];
+    v_z[aliased] = v_z[surviving];
   }
 }
 
@@ -246,8 +264,10 @@ __global__ void apply_polar_inner_core_boundary_kernel(double* __restrict__ v_r,
   const double z = x_z[n];
   const double s = hypot(r, z);
   if (!(s > 0.0)) {
+    // Degenerate center node: axisymmetry pins u_r only; the material u_z is
+    // free (Galilean, 756ab3c41) and is unified per column at the boundary
+    // tail below.
     v_r[n] = 0.0;
-    v_z[n] = 0.0;
     return;
   }
   const double e_r = r / s;
@@ -255,6 +275,55 @@ __global__ void apply_polar_inner_core_boundary_kernel(double* __restrict__ v_r,
   const double u_s = v_r[n] * e_r + v_z[n] * e_z;
   v_r[n] -= u_s * e_r;
   v_z[n] -= u_s * e_z;
+}
+
+// The inner-core column nodes n = j (i = 0) that sit exactly at the pinned
+// origin alias one material point. Unify their axial velocity to the
+// equal-weight mirror-paired column mean: an exactly mirror-antisymmetric
+// field cancels bitwise (symmetric flows keep exactly 0) and a uniform
+// boost V0 is restored exactly. Single-thread: the pair order IS the
+// guarantee. Runs after every other polar boundary kernel so all callers
+// (Lagrangian tail and remap-internal boundary) leave one consistent
+// column value.
+__global__ void unify_polar_center_column_velocity_kernel(
+    double* __restrict__ v_r,
+    double* __restrict__ v_z,
+    const double* __restrict__ x_r,
+    const double* __restrict__ x_z,
+    const int nz) {
+  if (blockIdx.x != 0 || threadIdx.x != 0) {
+    return;
+  }
+  constexpr int kMaxCenterColumn = 1024;
+  int centers[kMaxCenterColumn];
+  int count = 0;
+  for (int j = 0; j <= nz; ++j) {
+    const int n = j;
+    if (x_r[n] == 0.0 && x_z[n] == 0.0) {
+      if (count >= kMaxCenterColumn) {
+        return;
+      }
+      centers[count] = n;
+      ++count;
+    }
+  }
+  if (count == 0) {
+    return;
+  }
+  double vz_sum = 0.0;
+  int low = 0;
+  int high = count - 1;
+  for (; low < high; ++low, --high) {
+    vz_sum += v_z[centers[low]] + v_z[centers[high]];
+  }
+  if (low == high) {
+    vz_sum += v_z[centers[low]];
+  }
+  const double vz_mean = vz_sum / static_cast<double>(count);
+  for (int index = 0; index < count; ++index) {
+    v_r[centers[index]] = 0.0;
+    v_z[centers[index]] = vz_mean;
+  }
 }
 
 __global__ void apply_polar_outer_arc_reflect_kernel(
@@ -336,7 +405,7 @@ __device__ inline void apply_r_outer_physical_vector_constraint(
 __global__ void apply_multiblock_axis_reflect_velocity_kernel(
     double* __restrict__ v_r,
     double* __restrict__ v_z,
-    const double* __restrict__ x_r,
+    double* __restrict__ x_r,
     const double* __restrict__ x_z,
     const std::uint8_t* __restrict__ node_flags,
     const int n_nodes,
@@ -349,11 +418,13 @@ __global__ void apply_multiblock_axis_reflect_velocity_kernel(
 
   const std::uint8_t flags = node_flags[n];
   if ((flags & mesh::NODE_CENTER) != 0U) {
+    x_r[n] = 0.0;
     v_r[n] = 0.0;
-    v_z[n] = 0.0;
+    // center keeps u_r=0 (axisymmetry); material u_z is free (Galilean) — the mesh x_z pin lives in the enforce kernel.
     return;
   }
   if ((flags & (mesh::NODE_AXIS | mesh::NODE_POLE_AXIS)) != 0U) {
+    x_r[n] = 0.0;
     v_r[n] = 0.0;
   }
   if ((flags & mesh::NODE_INNER_PHYSICAL_BOUNDARY) != 0U) {
@@ -570,6 +641,9 @@ void apply_boundary_2d_spherical_polar(core::State& state, const core::Config& c
   apply_polar_axis_theta_boundary_kernel<<<blocks_i, 256>>>(
       state.v_r.data(), state.x_r.data(), topo.nr, topo.nz, topo.nz);
 
+  unify_polar_center_column_velocity_kernel<<<1, 1>>>(
+      state.v_r.data(), state.v_z.data(), state.x_r.data(),
+      state.x_z.data(), topo.nz);
   cuda_check(cudaGetLastError(), "apply_boundary_2d spherical-polar kernel launch failed");
   cuda_check(core::debug_kernel_sync(),
              "apply_boundary_2d spherical-polar kernel execution failed");
@@ -597,8 +671,8 @@ void apply_multiblock_boundary_2d_via_node_flags(core::State& state,
   std::uint8_t* d_node_flags = nullptr;
   const std::size_t flag_bytes =
       topo.node_flags.size() * sizeof(std::uint8_t);
-  cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_node_flags), flag_bytes),
-             "apply_boundary_2d multiblock cudaMalloc node_flags failed");
+  d_node_flags = static_cast<std::uint8_t*>(core::device_scratch_acquire(
+      "boundary_2d:node_flags", flag_bytes));
   cuda_check(cudaMemcpy(d_node_flags,
                         topo.node_flags.data(),
                         flag_bytes,
@@ -619,11 +693,30 @@ void apply_multiblock_boundary_2d_via_node_flags(core::State& state,
              "apply_boundary_2d multiblock kernel launch failed");
   cuda_check(core::debug_kernel_sync(),
              "apply_boundary_2d multiblock kernel execution failed");
-  cuda_check(cudaFree(d_node_flags),
-             "apply_boundary_2d multiblock cudaFree node_flags failed");
 }
 
 }  // namespace
+
+void enforce_node_axis_aliases(core::State& state) {
+  const int n_pairs = state.evacuated_cells.n_node_axis_aliases;
+  if (n_pairs <= 0) {
+    return;
+  }
+  TENRYU_ASSERT(
+      state.evacuated_cells.d_node_axis_alias_pairs.size() ==
+          2U * static_cast<std::size_t>(n_pairs),
+      "node-axis alias pair buffer size mismatch");
+  enforce_node_axis_aliases_kernel<<<1, 256>>>(
+      state.x_r.data(),
+      state.x_z.data(),
+      state.v_r.data(),
+      state.v_z.data(),
+      state.evacuated_cells.d_node_axis_alias_pairs.data(),
+      n_pairs);
+  cuda_check(cudaGetLastError(), "node-axis alias kernel launch failed");
+  cuda_check(core::debug_kernel_sync(),
+             "node-axis alias kernel execution failed");
+}
 
 Boundary2DType parse_boundary_2d_type(const std::string& value) {
   if (value == "free") {
@@ -710,10 +803,12 @@ void apply_boundary_2d(core::State& state, const core::Config& cfg, const double
     apply_multiblock_boundary_2d_via_node_flags(
         state, static_cast<int>(r_inner_type), static_cast<int>(r_outer_type));
     maybe_write_multiblock_axis_boundary_diagnostic(state, cfg, t, "after");
+    enforce_node_axis_aliases(state);
     return;
   }
   if (state.mesh.logical == mesh::LogicalMesh2D::SphericalPolarHalfplane) {
     apply_boundary_2d_spherical_polar(state, cfg);
+    enforce_node_axis_aliases(state);
     return;
   }
 
@@ -780,6 +875,7 @@ void apply_boundary_2d(core::State& state, const core::Config& cfg, const double
 
   cuda_check(cudaGetLastError(), "apply_boundary_2d kernel launch failed");
   cuda_check(core::debug_kernel_sync(), "apply_boundary_2d kernel execution failed");
+  enforce_node_axis_aliases(state);
 }
 
 }  // namespace tenryu::hydro

@@ -257,6 +257,14 @@ void OutputManager::set_termination_reason(std::string reason) {
   termination_reason_ = std::move(reason);
 }
 
+int OutputManager::last_checkpoint_step() const {
+  return last_checkpoint_step_;
+}
+
+const std::string& OutputManager::last_checkpoint_path() const {
+  return last_checkpoint_path_;
+}
+
 void OutputManager::write_run_info(const tenryu::core::State& state,
                                    const tenryu::core::Config& cfg) const {
   const std::filesystem::path out_path =
@@ -332,8 +340,10 @@ void OutputManager::write_checkpoint(
   }
   const int file_index = checkpoint_count_++;
   HDF5Writer writer;
-  writer.write_checkpoint(state, cfg, photon_pool, file_index, step, t, checkpoint_dir,
-                          case_name);
+  const std::string checkpoint_path = writer.write_checkpoint(
+      state, cfg, photon_pool, file_index, step, t, checkpoint_dir, case_name);
+  last_checkpoint_step_ = step;
+  last_checkpoint_path_ = checkpoint_path;
   rotate_checkpoints(cfg, case_name, rank);
 }
 
@@ -411,7 +421,7 @@ bool OutputManager::should_checkpoint(const int step,
       (step % cfg.output.checkpoint_every == 0);
   const bool by_time = by_time_interval(cfg.output.checkpoint_every_s,
                                         state.t_next_checkpoint, t);
-  return by_step || by_time;
+  return by_step || by_time || state.checkpoint_request;
 }
 
 }  // namespace tenryu::io

@@ -77,7 +77,7 @@ struct WeightedWinslowParams {
 
 namespace detail {
 
-constexpr int kMaxCellVerts = 4;
+constexpr int kMaxCellVerts = mesh::kMeshTopoCellStorageSlotsMaxGeneral;
 constexpr int kMaxNeighbors = 64;
 
 __host__ __device__ inline double clamp_double(const double x,

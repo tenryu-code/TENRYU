@@ -35,12 +35,25 @@ namespace tenryu::hydro::ale {
 struct KeFixupInput {
   int n_cells = 0;
   int n_nodes = 0;
-  const int* cell_node_csr_offsets = nullptr;  // 4 slots per cell
+  int corner_stride = 4;
+  // false: PR3 reduced midpoint-convection residual (basis-mismatch only).
+  // true: full node-KE deficit encoded in the deposit convention
+  // (deposit = -R): R_n = 0.5*(Mpost*|v+|^2 - Mpre*|v-|^2) with
+  // writer-recipe node masses (legacy band-transaction closure; A368/A369).
+  bool full_ke_residual = false;
+  // With full_ke_residual: distribute the GLOBAL residual sum mass-weighted
+  // over all active cells instead of node-locally (avoids secular
+  // localization at repeatedly-remapped bands; Ledger A371).
+  bool global_mass_weighted_deposit = false;
+  // Active corner counts per cell (nullptr => quads assumed). Used only by
+  // the full_ke_residual mass accumulation (writer-recipe node masses).
+  const std::uint8_t* cell_nverts = nullptr;
+  const int* cell_node_csr_offsets = nullptr;  // corner_stride slots per cell
   const int* cell_node_csr_indices = nullptr;
-  // Frozen subzonal basis (state.corner_mass, n_cells*4): INCLUDES macro
+  // Frozen subzonal basis (state.corner_mass, n_cells*corner_stride): INCLUDES macro
   // member mirrors, exactly as the dynamics' nodal masses do.
   const double* corner_mass_frozen = nullptr;
-  // First-moment basis, n_cells*4 each: pre = host-built on the pre-remap
+  // First-moment basis, n_cells*corner_stride each: pre = host-built on the pre-remap
   // mesh with inactive members EXCLUDED (basis_defect_capture_pre
   // convention); post = the Option-B remap's transported buffer (zeros on
   // inactive members).
@@ -129,6 +142,10 @@ void ke_fixup_apply_deposit(core::State& state,
                             const std::vector<double>& corner_mass_b_pre,
                             const std::vector<double>& corner_mass_b_post,
                             const std::vector<double>& v_r_pre,
-                            const std::vector<double>& v_z_pre);
+                            const std::vector<double>& v_z_pre,
+                            const int corner_stride = 4,
+                            const double chi_override = 0.0,
+                            const bool full_ke_residual = false,
+                            const bool global_deposit = false);
 
 }  // namespace tenryu::hydro::ale

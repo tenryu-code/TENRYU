@@ -102,8 +102,10 @@ struct Core1D {
   // ledger
   double injected_mass = 0.0;
   double injected_energy = 0.0;   // internal + kinetic of injected shells
-  double piston_work = 0.0;       // integral (P+q)_face * A * (-u_face) dt
+  double piston_work = 0.0;       // cumulative discrete outer-boundary work
   long long total_substeps = 0;
+  long long positivity_guard_halvings = 0;
+  int energy_guard_halvings = 0;
   int dt_floor_hits = 0;
   // windowed closure attribution (reset at each ledger print)
   double win_U0 = 0.0;
@@ -162,15 +164,18 @@ double total_kinetic(const Core1D& c) {
   return s;
 }
 
-// One explicit VNR substep. Outer boundary: dynamic_outer=true evolves the
-// outer node under the external-vs-face pressure difference (no velocity
-// override); false is the legacy kinematic piston (bc = piston velocity).
+// One explicit VNR substep with compatible work on the supported paths.
+// Outer boundary: dynamic_outer=true evolves the outer node under the
+// external-vs-face pressure difference (no velocity override); false is the
+// legacy kinematic piston (bc = velocity).
 // Returns the substep dt actually taken (0 on refusal).
 double substep(Core1D& c,
                const double gamma,
                const bool dynamic_outer,
                const double bc,
                const double dt_cap) {
+  static int refuse_dumps = 0;
+  const std::vector<double>* refuse_unew = nullptr;
   const std::size_t n = c.m.size();
   std::vector<double> P(n), q(n), cs(n);
   for (std::size_t j = 0; j < n; ++j) {
@@ -183,6 +188,72 @@ double substep(Core1D& c,
                ? rho * (av_c1() * cs[j] * std::abs(du) + av_c2() * du * du)
                : 0.0;
   }
+  const auto dump_refuse = [&](const char* mode,
+                               const double dt_now,
+                               const int halvings,
+                               const long long cross_i) {
+    if (refuse_dumps >= 12) {
+      return;
+    }
+    ++refuse_dumps;
+    double dr_min = std::numeric_limits<double>::infinity();
+    std::size_t dr_min_j = 0;
+    double e_min = std::numeric_limits<double>::infinity();
+    std::size_t e_min_j = 0;
+    std::size_t e_neg = 0;
+    double P_min = std::numeric_limits<double>::infinity();
+    double P_max = -std::numeric_limits<double>::infinity();
+    double q_max = -std::numeric_limits<double>::infinity();
+    double cs_max = -std::numeric_limits<double>::infinity();
+    for (std::size_t j = 0; j < n; ++j) {
+      const double dr = c.r[j + 1] - c.r[j];
+      if (dr < dr_min) {
+        dr_min = dr;
+        dr_min_j = j;
+      }
+      if (c.e[j] < e_min) {
+        e_min = c.e[j];
+        e_min_j = j;
+      }
+      if (c.e[j] < 0.0) {
+        ++e_neg;
+      }
+      P_min = std::min(P_min, P[j]);
+      P_max = std::max(P_max, P[j]);
+      q_max = std::max(q_max, q[j]);
+      cs_max = std::max(cs_max, cs[j]);
+    }
+    double u_absmax = 0.0;
+    std::size_t u_absmax_i = 0;
+    for (std::size_t i = 0; i <= n; ++i) {
+      const double u_abs = std::abs(c.u[i]);
+      if (u_abs > u_absmax) {
+        u_absmax = u_abs;
+        u_absmax_i = i;
+      }
+    }
+    double unew_absmax = 0.0;
+    std::size_t unew_absmax_i = 0;
+    if (refuse_unew != nullptr) {
+      for (std::size_t i = 0; i <= n; ++i) {
+        const double unew_abs = std::abs((*refuse_unew)[i]);
+        if (unew_abs > unew_absmax) {
+          unew_absmax = unew_abs;
+          unew_absmax_i = i;
+        }
+      }
+    }
+    std::fprintf(
+        stderr,
+        "[core1d_substep_refuse] mode=%s dt_cap=%.6e dt=%.6e n=%zu "
+        "dr_min=%.6e@%zu e_min=%.6e@%zu e_neg=%zu P_min=%.6e "
+        "P_max=%.6e q_max=%.6e cs_max=%.6e u_absmax=%.6e@%zu "
+        "unew_absmax=%.6e@%zu r0=%.6e r_out=%.6e halvings=%d "
+        "cross_i=%lld\n",
+        mode, dt_cap, dt_now, n, dr_min, dr_min_j, e_min, e_min_j, e_neg,
+        P_min, P_max, q_max, cs_max, u_absmax, u_absmax_i, unew_absmax,
+        unew_absmax_i, c.r[0], c.r[n], halvings, cross_i);
+  };
   double dt = dt_cap;
   for (std::size_t j = 0; j < n; ++j) {
     const double dr = c.r[j + 1] - c.r[j];
@@ -191,90 +262,195 @@ double substep(Core1D& c,
     dt = std::min(dt, lim);
   }
   if (!(dt > 0.0) || !std::isfinite(dt)) {
+    dump_refuse("nonfinite_dt", dt, 0, -1);
     return 0.0;
   }
   std::vector<double> unew(n + 1);
-  unew[0] = 0.0;
+  std::vector<double> du;
+  refuse_unew = &unew;
   // MASSLESS outer face (verdict #6 Q3-1, converged after measuring both
   // failure modes): the outer cell's full mass lumps onto its INNER node,
   // so the kinematically driven face moves zero mass — the override does
-  // no work (the slosh pump is gone) while the volume stays tethered to
-  // the 2D boundary (the pure force-driven face un-tethers and freely
-  // expands: measured dV divergence to -7e-3 cm^3 and 386% residual).
-  for (std::size_t i = 1; i < n; ++i) {
-    // Free-outer mode uses the standard half-half node mass everywhere; the
-    // coupled massless-face mode lumps the outer cell's full mass onto its
-    // inner node (the face then moves zero mass). NOTE the legacy
-    // dynamic_outer path keeps the lumped interior AND a half-mass face —
-    // the outer cell's inertia is counted 1.5x, a plausible source of its
-    // measured instability; the free mode is the consistent scheme.
-    const double mn = (i == n - 1 && !c.free_outer)
-                          ? 0.5 * c.m[i - 1] + c.m[i]
-                          : 0.5 * (c.m[i - 1] + c.m[i]);
-    const double A = 4.0 * kPi * c.r[i] * c.r[i];
-    const double f = -((P[i] + q[i]) - (P[i - 1] + q[i - 1])) * A;
-    unew[i] = c.u[i] + dt * f / std::max(mn, 1.0e-300);
-  }
-  if (c.free_outer) {
-    // Terminal free surface: massive face (half the outer cell), driven by
-    // the face-vs-external pressure difference; bc carries P_ext [dyn/cm^2].
-    const double m_out = std::max(0.5 * c.m[n - 1], 1.0e-300);
-    const double A_out = 4.0 * kPi * c.r[n] * c.r[n];
-    const double f_out = ((P[n - 1] + q[n - 1]) - bc) * A_out;
-    unew[n] = c.u[n] + dt * f_out / m_out;
-  } else if (dynamic_outer) {
-    // Experimental force-driven outer node (env; measured unstable —
-    // kept for study only).
-    const double m_out = std::max(0.5 * c.m[n - 1], 1.0e-300);
-    const double A_out = 4.0 * kPi * c.r[n] * c.r[n];
-    const double f_out = -(bc - (P[n - 1] + q[n - 1])) * A_out;
-    unew[n] = c.u[n] + dt * f_out / m_out;
-  } else {
-    unew[n] = bc;  // massless face: pure constraint, no work booking
-  }
-  // positivity: halve dt against the trial motion instead of failing hard
-  for (int guard = 0; guard < 40; ++guard) {
+  // no nodal kinetic work (the slosh pump is gone) while the volume stays
+  // tethered to the 2D boundary (the pure force-driven face un-tethers and
+  // freely expands: measured dV divergence to -7e-3 cm^3 and 386% residual).
+  const auto compute_kick = [&](const double kick_dt) {
+    unew[0] = 0.0;
+    for (std::size_t i = 1; i < n; ++i) {
+      // Free-outer mode uses the standard half-half node mass everywhere; the
+      // coupled massless-face mode lumps the outer cell's full mass onto its
+      // inner node (the face then moves zero mass). NOTE the legacy
+      // dynamic_outer path keeps the lumped interior AND a half-mass face —
+      // the outer cell's inertia is counted 1.5x, a plausible source of its
+      // measured instability; the free mode is the consistent scheme.
+      const double mn = (i == n - 1 && !c.free_outer)
+                            ? 0.5 * c.m[i - 1] + c.m[i]
+                            : 0.5 * (c.m[i - 1] + c.m[i]);
+      const double A = 4.0 * kPi * c.r[i] * c.r[i];
+      const double f = -((P[i] + q[i]) - (P[i - 1] + q[i - 1])) * A;
+      unew[i] = c.u[i] + kick_dt * f / std::max(mn, 1.0e-300);
+    }
+    if (c.free_outer) {
+      // Terminal free surface: massive face (half the outer cell), driven by
+      // the face-vs-external pressure difference; bc carries P_ext [dyn/cm^2].
+      const double m_out = std::max(0.5 * c.m[n - 1], 1.0e-300);
+      const double A_out = 4.0 * kPi * c.r[n] * c.r[n];
+      const double f_out = ((P[n - 1] + q[n - 1]) - bc) * A_out;
+      unew[n] = c.u[n] + kick_dt * f_out / m_out;
+    } else if (dynamic_outer) {
+      // Experimental force-driven outer node (env; measured unstable —
+      // kept for study only). Known inconsistency: total_kinetic() excludes
+      // this kicked face's KE while the lumped inner node retains the outer
+      // cell's full mass. W4d-7 intentionally leaves this unsupported mode's
+      // numerics unchanged.
+      const double m_out = std::max(0.5 * c.m[n - 1], 1.0e-300);
+      const double A_out = 4.0 * kPi * c.r[n] * c.r[n];
+      const double f_out = -(bc - (P[n - 1] + q[n - 1])) * A_out;
+      unew[n] = c.u[n] + kick_dt * f_out / m_out;
+    } else {
+      unew[n] = bc;  // massless face: prescribed constraint velocity
+    }
+  };
+  // Positivity retries recompute the kick from the pre-kick velocities so
+  // momentum, position, compatible work, and piston work share the final dt.
+  bool motion_ok = false;
+  int halvings = 0;
+  long long last_cross_i = -1;
+  for (int guard = 0; guard <= 40; ++guard) {
+    compute_kick(dt);
     bool ok = true;
     double prev = 0.0;
     for (std::size_t i = 0; i <= n; ++i) {
       const double rn = c.r[i] + dt * unew[i];
       if (i > 0 && rn <= prev) {
         ok = false;
+        last_cross_i = static_cast<long long>(i);
         break;
       }
       prev = rn;
     }
+    if (ok && !(dynamic_outer && !c.free_outer)) {
+      du.resize(n);
+      std::vector<double> ubar(n + 1, 0.0);
+      for (std::size_t i = 0; i <= n; ++i) {
+        ubar[i] = 0.5 * (c.u[i] + unew[i]);
+      }
+      if (!c.free_outer) {
+        ubar[n] = bc;
+      }
+      for (std::size_t j = 0; j < n; ++j) {
+        const double A_left = 4.0 * kPi * c.r[j] * c.r[j];
+        const double A_right = 4.0 * kPi * c.r[j + 1] * c.r[j + 1];
+        du[j] = dt * (P[j] + q[j]) *
+                (A_left * ubar[j] - A_right * ubar[j + 1]);
+      }
+      bool energy_ok = true;
+      double worst_deficit = -std::numeric_limits<double>::infinity();
+      long long worst_cell = -1;
+      for (std::size_t j = 0; j < n; ++j) {
+        const double margin =
+            64.0 * std::numeric_limits<double>::epsilon() *
+            std::max({std::abs(c.e[j]),
+                      0.5 * std::max(c.u[j] * c.u[j],
+                                     c.u[j + 1] * c.u[j + 1]),
+                      cs[j] * cs[j]});
+        const double trial_e = c.e[j] + du[j] / c.m[j];
+        if (!(trial_e > margin)) {
+          energy_ok = false;
+          const double deficit = margin - trial_e;
+          if (worst_cell < 0 || deficit > worst_deficit) {
+            worst_deficit = deficit;
+            worst_cell = static_cast<long long>(j);
+          }
+        }
+      }
+      if (!energy_ok) {
+        last_cross_i = worst_cell;
+        if (guard == 40) {
+          break;
+        }
+        dt *= 0.5;
+        ++halvings;
+        ++c.positivity_guard_halvings;
+        ++c.energy_guard_halvings;
+        if (dt < 1.0e-22) {
+          ++c.dt_floor_hits;
+          dump_refuse("energy_floor", dt, halvings, last_cross_i);
+          return 0.0;
+        }
+        continue;
+      }
+    }
     if (ok) {
+      motion_ok = true;
+      break;
+    }
+    if (guard == 40) {
       break;
     }
     dt *= 0.5;
+    ++halvings;
+    ++c.positivity_guard_halvings;
     if (dt < 1.0e-22) {
       ++c.dt_floor_hits;
+      dump_refuse("guard_floor", dt, halvings, last_cross_i);
       return 0.0;
     }
+  }
+  if (!motion_ok) {
+    ++c.dt_floor_hits;
+    dump_refuse("guard_exhaust", dt, 41, last_cross_i);
+    return 0.0;
   }
   std::vector<double> rnew(n + 1);
   for (std::size_t i = 0; i <= n; ++i) {
     rnew[i] = c.r[i] + dt * unew[i];
   }
   rnew[0] = 0.0;
-  for (std::size_t j = 0; j < n; ++j) {
-    const double v0 = cell_volume(c.r[j], c.r[j + 1]);
-    const double v1 = cell_volume(rnew[j], rnew[j + 1]);
-    c.e[j] = std::max(c.e[j] - (P[j] + q[j]) * (v1 - v0) / c.m[j], 1.0e-30);
+  if (dynamic_outer && !c.free_outer) {
+    // Study-only legacy dynamic mode is outside W4d-7 scope.
+    for (std::size_t j = 0; j < n; ++j) {
+      const double v0 = cell_volume(c.r[j], c.r[j + 1]);
+      const double v1 = cell_volume(rnew[j], rnew[j + 1]);
+      c.e[j] =
+          std::max(c.e[j] - (P[j] + q[j]) * (v1 - v0) / c.m[j], 1.0e-30);
+    }
+  } else {
+    // For sigma_j = P_j + q_j, the kick at each massive interior node is
+    //   M_i (u_i^+ - u_i^-) = dt A_i (sigma_{i-1} - sigma_i).
+    // Multiplication by ubar_i = (u_i^- + u_i^+)/2 gives its exact kinetic
+    // work. Attributing the opposite work to the two face-owning cells gives
+    //   dU_j = dt sigma_j (A_j ubar_j - A_{j+1} ubar_{j+1}).
+    // Summing cells cancels every interior face against dK. The center has
+    // A_0 = 0. At the massive free face, ubar_n is the kick midpoint and the
+    // uncancelled external term is -dt P_ext A_n ubar_n. At the massless
+    // coupled face there is no KE: its prescribed velocity bc is the face
+    // velocity, so the uncancelled flux is -dt sigma_{n-1} A_n bc.
+    for (std::size_t j = 0; j < n; ++j) {
+      c.e[j] += du[j] / c.m[j];
+    }
   }
-  // piston work done ON the sub-model by the moving outer face (midpoint
-  // area for a second-order swept-volume integral). Free mode: the external
-  // pressure (bc) is the only outside agent — the face's own (P+q) exchange
-  // with the outer cell is internal (cell U <-> face KE) and must not be
-  // booked as injection.
+  // Piston work done ON the sub-model by the moving outer face. Free mode:
+  // the external pressure (bc) is the only outside agent -- the face's own
+  // (P+q) exchange with the outer cell is internal (cell U <-> face KE) and
+  // must not be booked as injection. Pair the exact external component of
+  // the momentum kick, -bc*A_old, with the kinetic-energy midpoint velocity
+  // and the accepted guard dt that produced both unew and rnew.
   {
-    const double r_mid = 0.5 * (c.r[n] + rnew[n]);
-    const double A = 4.0 * kPi * r_mid * r_mid;
     if (c.free_outer) {
-      c.piston_work += -bc * A * unew[n] * dt;
-    } else {
+      const double A_old = 4.0 * kPi * c.r[n] * c.r[n];
+      const double u_mid = 0.5 * (c.u[n] + unew[n]);
+      c.piston_work += -bc * A_old * u_mid * dt;
+    } else if (dynamic_outer) {
+      // Study-only legacy booking; see the known face-KE exclusion above.
+      const double r_mid = 0.5 * (c.r[n] + rnew[n]);
+      const double A = 4.0 * kPi * r_mid * r_mid;
       c.piston_work += -(P[n - 1] + q[n - 1]) * A * unew[n] * dt;
+    } else {
+      // The prescribed massless-face flux uses the same pre-step area family
+      // as the interior compatible identity and the constraint velocity bc.
+      const double A_old = 4.0 * kPi * c.r[n] * c.r[n];
+      c.piston_work += -(P[n - 1] + q[n - 1]) * A_old * bc * dt;
     }
   }
   c.r.swap(rnew);
@@ -710,6 +886,11 @@ long long substep_count(const void* key) {
   return it != registry().end() ? it->second.total_substeps : 0LL;
 }
 
+long long positivity_guard_halving_count(const void* key) {
+  const auto it = registry().find(key);
+  return it != registry().end() ? it->second.positivity_guard_halvings : 0LL;
+}
+
 double outer_face_pressure(const void* key, const double gamma) {
   const auto it = registry().find(key);
   if (it == registry().end() || !it->second.active) {
@@ -754,6 +935,62 @@ double current_volume(const void* key) {
   return (it != registry().end() && it->second.active)
              ? cell_volume(0.0, it->second.r.back())
              : 0.0;
+}
+
+double internal_energy_total(const void* key) {
+  const auto it = registry().find(key);
+  return (it != registry().end() && it->second.active)
+             ? total_internal(it->second)
+             : 0.0;
+}
+
+double kinetic_energy_total(const void* key) {
+  const auto it = registry().find(key);
+  return (it != registry().end() && it->second.active)
+             ? total_kinetic(it->second)
+             : 0.0;
+}
+
+TailDiagnostics tail_diagnostics(const void* key, const double gamma) {
+  TailDiagnostics out;
+  const auto it = registry().find(key);
+  if (it == registry().end() || !it->second.active ||
+      it->second.m.empty()) {
+    return out;
+  }
+  const Core1D& c = it->second;
+  const std::size_t n = c.m.size();
+  std::vector<double> pressure(n, 0.0);
+  std::vector<double> center(n, 0.0);
+  for (std::size_t j = 0; j < n; ++j) {
+    const double vol = cell_volume(c.r[j], c.r[j + 1]);
+    const double rho = c.m[j] / std::max(vol, 1.0e-300);
+    pressure[j] = (gamma - 1.0) * rho * c.e[j];
+    center[j] = 0.5 * (c.r[j] + c.r[j + 1]);
+    if (!std::isfinite(pressure[j]) || !std::isfinite(center[j])) {
+      return TailDiagnostics{};
+    }
+    out.p_max = std::max(out.p_max, pressure[j]);
+  }
+  std::size_t shock_shell = 0U;
+  double max_abs_dpdr = -1.0;
+  for (std::size_t j = 1; j < n; ++j) {
+    const double dr = center[j] - center[j - 1U];
+    if (!(dr > 0.0)) {
+      return TailDiagnostics{};
+    }
+    const double abs_dpdr =
+        std::abs(pressure[j] - pressure[j - 1U]) / dr;
+    if (abs_dpdr > max_abs_dpdr) {
+      max_abs_dpdr = abs_dpdr;
+      shock_shell = j;
+    }
+  }
+  out.r_shock = c.r[shock_shell + 1U];
+  out.u_outer = c.u.back();
+  out.valid = std::isfinite(out.r_shock) && std::isfinite(out.u_outer) &&
+              std::isfinite(out.p_max);
+  return out;
 }
 
 GasView gas_view(const void* key, const double gamma) {

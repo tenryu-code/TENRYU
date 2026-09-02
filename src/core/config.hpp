@@ -1,13 +1,21 @@
 #pragma once
 
+#include <algorithm>
+#include <array>
+#include <cmath>
 #include <cstdint>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
+#include "core/error.hpp"
+#include "core/namelist/errors.hpp"
 #include "hydro/bc_2d_rz_semantics.hpp"
+#include "hydro/pressure_drive_perturbation.cuh"
 
 namespace tenryu::materials {
 struct EOSTableTriplet;
@@ -29,6 +37,8 @@ enum class TopologyScheme {
   MULTIBLOCK_HALF_BUTTERFLY_TRIFAN_CAP_5BLOCK,
   CONE_SHELL_SPINE,
   PENTAGON_BELT_SHELL,
+  MULTIBLOCK_POLAR_TIER,
+  MULTIBLOCK_POLAR_TIER_CART_CENTER,
 };
 
 enum class MultiblockTransitionScheme {
@@ -56,6 +66,7 @@ enum class AvModel {
   CswEdge,
   CswEdgePlusTensorLimited,
   CswEdgeCsw98,
+  MimeticTensorV1,
 };
 
 enum class CornerMassConvention {
@@ -128,6 +139,8 @@ inline const char* av_model_to_string(const AvModel model) {
       return "csw_edge_plus_tensor_limited";
     case AvModel::CswEdgeCsw98:
       return "csw_edge_csw98";
+    case AvModel::MimeticTensorV1:
+      return "mimetic_tensor_v1";
   }
   return "scalar_vnr_legacy";
 }
@@ -147,6 +160,10 @@ inline bool av_model_from_string(const std::string& value, AvModel& model) {
   }
   if (value == "csw_edge_csw98") {
     model = AvModel::CswEdgeCsw98;
+    return true;
+  }
+  if (value == "mimetic_tensor_v1") {
+    model = AvModel::MimeticTensorV1;
     return true;
   }
   return false;
@@ -401,12 +418,36 @@ struct Config {
     double multiblock_cart_core_r_match = std::numeric_limits<double>::quiet_NaN();
     int multiblock_cart_core_n_c = -1;
     int multiblock_cart_core_bridge_layers = -1;
+    // Outward node-ring counter with the fan first ring at zero; see the
+    // transition_face_indices.push_back() schedule in make_polar_tier_layout().
+    int polar_tier_cart_cut_ring = -1;
+    std::string polar_tier_center_kind = "cart_box";
     std::string multiblock_cart_core_bridge_grading = "uniform";
+    double multiblock_cart_core_bridge_spacing_floor = 0.0;
+    double multiblock_cart_core_bridge_ratio_max = 1.05;
+    double multiblock_theta_cap_widen_factor = 1.0;
     MultiblockTransitionScheme multiblock_transition_scheme =
         MultiblockTransitionScheme::HERMITE_BRIDGE;
     double multiblock_cap_p = 6.0;
     int multiblock_bridge_elliptic_sweeps = 0;
     double multiblock_bridge_elliptic_omega = 0.5;
+    double polar_tier_chi_lo = 0.75;
+    double polar_tier_chi_hi = 1.50;
+    double polar_tier_belt_thickness_frac = 0.0;
+    int polar_tier_belt_rows = 1;
+    // The pole cap is active only when both m and alpha are positive.
+    int polar_tier_pole_cap_m = 0;
+    double polar_tier_pole_cap_alpha = 0.0;
+    bool polar_tier_dendrite_enabled = false;
+    bool polar_tier_native_pentagon = false;
+    bool shell_polar_cap_dendrite = false;
+    int shell_cap_rows_2x = 28;
+    // T1 rows below S_theta on the 8-ladder.
+    int polar_tier_dendrite_s_theta_rows_below = 5;
+    int polar_tier_fan_sectors = 12;
+    int polar_tier_min_tier_columns = 12;
+    double polar_tier_fan_first_ring_radius_cm = 0.0;
+    bool polar_tier_hydro_enabled = false;
     // Outer-shell tangent-balance fix: every-step tangential projection of corner Svec
     // pairs (I1-B S3-T3 G1 constant-state seam GCL closure). Statically
     // load-bearing for the seam-GCL constant-state gates; under strong drive
@@ -1197,6 +1238,16 @@ struct Config {
     };
     PersistentLoopConfig persistent_loop;
 
+    struct ZReflectionConfig {
+      // "off": no action. "audit": measure and log odd-parity defects at
+      // stage boundaries, never modify state. Allowed modes are "off" and
+      // "audit" only.
+      // "enforce" was removed 2026-08-31 (user ruling: no answer-shaping state corrections).
+      // Only legal with an exactly even problem (static eligibility below).
+      std::string mode = "off";
+    };
+    ZReflectionConfig z_reflection;
+
     struct DebugConfig {
       bool trace_mesh_motion = false;
       std::string trace_mesh_node_selector = "outer_equator";
@@ -1224,7 +1275,47 @@ struct Config {
       struct ConservationDiagnosticsConfig {
         bool enabled = false;
       };
+      struct RefinementEstimator {
+        bool enabled = false;
+        int every = 25;              // steps between evaluations
+        double filter_eps = 0.01;    // Lohner ripple filter
+        double detect_cutoff = 0.8;  // front-band membership threshold
+      };
+      struct RefinementAutopilot {
+        bool enabled = false;        // SHADOW mode: observe+log only
+        std::string mode = "shadow";  // "shadow" (log only) | "arm_exit"
+                                      // (request checkpoints in-window,
+                                      // emit decision record, stop run)
+        double ckpt_lead_h = 8.0;     // start checkpoint requests when
+                                      // d_clear_h <= window_hi_h + this
+        double e_on = 0.88;          // detection on-threshold (median column peak E)
+        double e_off = 0.60;         // detection off-threshold
+        double assoc_cut = 0.30;     // component membership cut
+        double strong_cut = 0.60;    // innermost-component peak requirement
+        int gap_bridge = 5;          // stitched-column gap tolerance (block rims)
+        int persist = 3;             // consecutive observations for promotions
+        double n_q_plan = 3.3;       // planning AV-layer width [cells]
+        double chi_design = 0.018;   // design birth-quality target
+        double s_rep_cm = 16.1e-4;   // replacement interface radius
+        double handoff_cm = 4.5e-4;  // 2D->1D handoff radius
+        double window_lo_h = 12.0;   // preferred firing window [parent cells]
+        double window_hi_h = 24.0;
+        int history = 9;             // front-observation ring buffer length
+        double cov_min = 0.5;        // minimum tracked-column fraction
+      };
+      struct EvacuatedCellShadow {
+        bool enabled = false;
+        int every_n_steps = 250;              // >= 1
+        double arm_mass_fraction = 1.0e-6;    // (0,1), > off_mass_fraction
+        double off_mass_fraction = 1.0e-8;    // (0,1)
+        double rho_vacuum_policy_g_per_cc = 1.0e-10;  // > 0
+        double laser_wavelength_nm = 351.0;   // > 0 (n_crit estimate for the gate value)
+        double laser_ne_over_ncrit_max = 1.0e-3;      // > 0 (logged threshold, no action)
+      };
       struct AleProvenanceEmissionConfig {
+        bool enabled = false;
+      };
+      struct ConductionEnergyRateExportConfig {
         bool enabled = false;
       };
       struct ProductionAuditConfig {
@@ -1281,6 +1372,16 @@ struct Config {
         double target_radius_cm = 0.0;  // > 0 required when enabled
         int bins = 192;                 // >= 16 radial bins
         double h_cell_cm = 0.0;         // crossing-time cell size; <= 0 => s_max/bins
+        // W1 (asym arc 2026-07-21): per-sector tracking. 0 = off (legacy
+        // theta-averaged scalar path only). When > 0: that many equal-theta
+        // sectors over [0, pi], each with its own ridge + quadratic tracker;
+        // a solid-angle+confidence-weighted Legendre fit of ln s_f up to
+        // modal_l_max; and the earliest confidence-bounded global morph
+        // deadline (design doc asym_runtime_ale_controller_20260721 §2).
+        int sectors = 0;                  // 0 (off) or >= 4, even
+        int modal_l_max = 4;              // 0..4
+        double sector_confidence_nu = 2.75;   // nu in t_arr - nu*sigma_t
+        double sector_guard_crossings = 9.0;  // N_g in N_g * tau_c
       } shock_approach;
       struct AleVelCoherenceConfig {
         bool enabled = false;
@@ -1293,7 +1394,11 @@ struct Config {
       IcfDiagnosticsConfig icf;
       HotspotGasDiagnosticsConfig hotspot_gas;
       ConservationDiagnosticsConfig conservation;
+      RefinementEstimator refinement_estimator;
+      RefinementAutopilot refinement_autopilot;
+      EvacuatedCellShadow evacuated_cell_shadow;
       AleProvenanceEmissionConfig ale_provenance_emission;
+      ConductionEnergyRateExportConfig conduction_energy_rate_export;
       MeshQualityMinConfig mesh_quality_min;
       AleVelCoherenceConfig ale_velcoherence;
       ProductionAuditConfig production_audit;
@@ -1303,11 +1408,21 @@ struct Config {
     struct DtConfig {
       double initial_s = 1e-15;
       double cfl_hydro = 0.3;
+      // 2D hydro-CFL characteristic length for non-button cells.
+      // "sqrt_area" preserves the legacy path; "min_altitude" is opt-in.
+      std::string cfl_length_2d = "sqrt_area";
+      bool edge_accel_displacement_cfl_enabled = false;
       double cfl_cond = 0.25;
       double f_min_fleck = 0.01;
       double growth_factor = 1.2;
       double max_s = 1e-9;
       double min_s = 1e-20;
+      // Number of CONSECUTIVE steps with dt < min_s required before the
+      // dt-floor abort fires. 1 = abort on the first sub-floor step (legacy
+      // behavior). A genuine finite-time wall produces a monotone sub-floor
+      // run and still dies within K steps; a one-step corner-geometry
+      // transient survives.
+      int min_consecutive_steps = 1;
       // Consecutive committed-step floor-stall detector.
       // 0 = disabled (bit-exact baseline preserved). 32 is the production
       // policy decks may opt into.
@@ -1419,9 +1534,14 @@ struct Config {
           double supply_rho_g_per_cc = 0.0;
           double supply_u_z_cm_per_s = 0.0;
           double supply_T_eV = 0.0;
+          double drive_t_end_s = std::numeric_limits<double>::infinity();
 
           [[nodiscard]] bool is_state_supply() const {
             return type == "state_supply";
+          }
+
+          [[nodiscard]] bool supply_active(const double t) const {
+            return is_state_supply() && t < drive_t_end_s;
           }
         };
 
@@ -1554,6 +1674,14 @@ struct Config {
       std::string axis_node_mass_convention = "corner_subzonal";
       double av_linear = 0.1;
       double av_quadratic = 1.5;
+      double csw98_degenerate_side_floor_rel = 1.0e-2;
+      double csw98_damper_impulse_beta = 0.0;
+      std::string csw98_axisline_av_mode = "off";
+      bool csw98_axisline_d1prime_cfl_enabled = true;
+      bool csw98_limiter_shock_floor_enabled = false;
+      bool csw98_axisline_work_planar_enabled = false;
+      double tensor_av_C1 = 1.0;
+      double tensor_av_C2 = 1.0;
       double av_qcap_over_p = 0.0;
       bool av_qcap_center_band_only = false;
       double av_cfl_coefficient = 0.25;
@@ -1561,6 +1689,31 @@ struct Config {
       double csw_C2 = 2.0;
       std::string csw_limiter = "van_leer";
       bool csw_limiter_enabled = true;
+      bool csw_axis_mirror_limiter = false;
+      bool csw_rz_lift_enabled = false;
+      double csw_rz_lift_guard_ratio = 4.0;
+      bool csw_pole_floor_enabled = false;
+      double csw_pole_floor_sigma0 = 1.0;
+      double csw_pole_floor_theta0_rad = 0.033;
+      double csw_pole_floor_thetaf_rad = 0.033;
+      bool csw_pole_desens_enabled = false;
+      double csw_pole_desens_alpha = 0.25;
+      double csw_pole_desens_theta0_rad = 0.033;
+      double csw_pole_desens_thetaf_rad = 0.033;
+      bool csw_polar_slaving_enabled = false;
+      int csw_polar_slaving_min_columns = 96;
+      int csw_polar_slaving_full_columns = 4;
+      int csw_polar_slaving_outer_columns = 6;
+      double csw_polar_slaving_chi_on = 0.08;
+      double csw_polar_slaving_chi_full = 0.20;
+      double csw_polar_slaving_strength = 1.0;
+      bool csw_polar_slaving_av_stiffness_cfl_enabled = false;
+      double csw_polar_slaving_av_stiffness_sigma = 0.8;
+      bool wake_heat_flux_enabled = false;
+      double wake_heat_flux_CE = 0.10;
+      double wake_heat_flux_theta_a_rad = 0.0327;
+      double wake_heat_flux_theta_b_rad = 0.0982;
+      bool wake_heat_flux_global_theta = false;
       double csw_shock_limiter_floor = 0.65;
       bool csw_zero_uniform_compression = true;
       bool csw_diagnostics = false;
@@ -1591,7 +1744,10 @@ struct Config {
       bool subzonal_mass_lagrangian_invariant_enabled = false;
       double anti_hourglass_kappa = 0.05;
       bool subzonal_pressure_enabled = false;
+      bool pentagon_affine_null_enabled = true;
+      double pentagon_affine_null_kappa = 0.03;
       bool subzonal_dt_limiter_enabled = true;
+      bool aw_compatible_force_work = false;
       std::string subzonal_pressure_mode = "uniform_cell";
       // S-D bridge-band subzonal activation: when "bridge_feather", the
       // subzonal-pressure corner forces (and their compatible-work terms) are
@@ -1617,6 +1773,14 @@ struct Config {
         std::string subzonal_pressure_model = "linearized";
         double max_force_per_node_fraction = 0.2;
       } hourglass;
+      struct AxisProjectionConfig {
+        bool enabled = false;
+        bool shadow_only = true;
+        double q_on = 0.20;
+        double q_floor = 0.05;
+        int patch_halfwidth = 2;
+        int log_every_n_steps = 0;
+      } axis_projection;
       struct AdaptiveAVCoeff {
         double c1 = 0.1;
         double c2 = 1.5;
@@ -1671,6 +1835,25 @@ struct Config {
       int hk_velocity_damper_guard_cells = 25;
       std::string av_heat_to = "ion";
       CallableInfo pressure_drive_1d;
+      struct PressureDrivePerturbationConfig {
+        bool enabled = false;
+        // Resolved at namelist build time (explicit modes + drawn random modes).
+        std::vector<int> mode_l;
+        std::vector<double> mode_a;
+        // Gaussian ring spots (theta0_rad, sigma_rad, amplitude).
+        std::vector<double> spot_theta0;
+        std::vector<double> spot_sigma;
+        std::vector<double> spot_amp;
+        // Random zonal spectrum inputs (kept for provenance/logging).
+        bool random_enabled = false;
+        long long random_seed = 0;
+        int random_l_min = 2;
+        int random_l_max = 8;
+        double random_rms = 0.0;
+        // Computed at build time over the endpoint-inclusive theta grid.
+        double g_min = 1.0;
+        double g_max = 1.0;
+      } pressure_drive_perturbation;
       std::map<std::string, CallableInfo> pressure_drive_2d;
     };
 
@@ -1728,6 +1911,21 @@ struct Config {
       };
 
       bool enabled = false;
+      std::string mesh_mode = "fixed";
+      std::string reale_core = "exact";
+      double rezone_min_dt_s = 1.0e-14;
+      bool tess_gpu_dual = false;
+      bool tess_gpu_restrict = false;
+      int dvclp_solver_rev = 0;
+      int reale_lloyd_max = 4;
+      double reale_short_edge_collapse_rel = 3.0e-2;
+      bool reale_subdomain_rezone = false;
+      double reale_subdomain_frac_max = 0.6;
+      double reale_overlay_additivity_tol = 1.0e-4;
+      bool reale_corner_mass_reset = true;
+      bool reale_velocity_max_principle = false;
+      double reale_dt_trigger_factor = 0.5;
+      int reale_dt_trigger_cooldown = 0;
       bool ale_identity_mode = false;
       bool ale_mover_diag = false;
       bool ale_preserve_lagrangian_velocity_carry = false;
@@ -1774,6 +1972,62 @@ struct Config {
         double max_step_fraction = 0.05;  // per-transaction |dx| cap vs local min incident edge
         int every_n_steps = 1;          // morph transaction cadence (>= 1)
       } button_morph;
+      // W2 (asym arc 2026-07-21): read-only runtime mesh-health monitor.
+      // Evaluates, over the core+bridge (+shell_rows innermost shell rows)
+      // region, the scale-independent corner quality Q_c = 2 J_c /
+      // (|e1|^2 + |e2|^2) normalized by a healthy-reference snapshot, and the
+      // predicted corner-J first-root horizon H_c = t_root / dt_acoustic, and
+      // classifies OFF/WARNING/SOFT/HARD/RECOVERY with hysteresis
+      // (design doc asym_runtime_ale_controller_20260721 §2). Diagnostic only.
+      struct RuntimeControllerConfig {
+        bool monitor_enabled = false;
+        int monitor_every = 1;      // >= 1 evaluation cadence (steps)
+        int shell_rows = 4;         // >= 0 innermost structured shell rows included
+        int controller_shell_rows = 4; // >= 0 innermost shell rows in controller mandate
+        int cap_columns = 2;        // >= 0 theta cells per axis using the radial cap target
+        double q_soft = 0.42;       // (0,1]; entry: Qmin < q_soft
+        double q_hard = 0.22;       // (0,q_soft)
+        double q_recover = 0.60;    // (q_soft,1]
+        double h_soft = 8.0;        // > 0 acoustic steps; entry: Hmin < h_soft
+        double h_hard = 4.0;        // (0,h_soft)
+        double h_recover = 12.0;    // > h_soft
+        int soft_persistence = 2;   // >= 1 consecutive evaluations for a
+                                    // Q-triggered SOFT entry (H-triggered and any
+                                    // HARD entry are immediate)
+        int recover_checks = 3;     // >= 1 consecutive healthy evaluations
+        // W3a target construction (asym_runtime_ale_controller_20260721 §2).
+        int winslow_sweeps = 4;             // 1..16 fixed virtual Jacobi sweeps
+        double winslow_omega = 0.2;         // (0,1] relaxation passed to the smoother
+        double beta_monitor_soft = 0.12;    // [0,1) monitor-target blend weight (soft)
+        double beta_monitor_hard = 0.25;    // [0,1) monitor-target blend weight (hard)
+        double beta_mass = 0.12;            // [0,0.5] rho*s^2 monitor term weight
+        double beta_front = 0.12;           // [0,0.5] front-Gaussian monitor term weight
+        double beta_theta = 0.15;           // [0,0.5] angular equal-angle restoration
+        double g_max = 1.22;                // (1,1.6) adjacent radial spacing ratio cap
+        double front_width_cells = 2.5;     // [1,8] w_f in local radial cells
+        double cap_fraction = 0.05;         // (0,0.2] |dx| <= cap_fraction * h_p
+        double cap_normal_fraction = 0.025; // (0,cap_fraction] shock-band normal cap
+        // W3b controller (motion) — requires monitor_enabled; default off.
+        bool controller_enabled = false;
+        bool commit_rollback_enabled = true;
+        // W3c: the controller is a post-crossing mechanism. Events are allowed
+        // only once the selected sector-front statistic has passed the seam
+        // inward by this many seam spacings (requires the sector detector); when
+        // the detector is off, activation_time_s > 0 gates by time instead
+        // (<=0: controller stays inactive without the detector).
+        std::string activation_front_mode = "min";  // "min" or "mean"
+        double activation_front_margin_hs = 2.0;   // >= 0
+        double activation_time_s = -1.0;
+        int cadence_soft = 2;        // >= 1 steps per rezone event in SOFT
+        int cadence_hard = 1;        // >= 1, <= cadence_soft
+        int cadence_recovery = 4;    // >= cadence_soft
+        bool pre_step_enabled = true;    // run the event BEFORE the hydro step in HARD
+        int failures_hard_force = 4;
+        int failures_big_repair = 8;
+        int escalation_max_failures = 12; // consecutive failed transactions
+                                         // before the controller disengages
+                                         // (dt guard keeps the run safe)
+      } runtime_controller;
       // Phase 9 - Reference-barrier ALE (default-off, opt-in)
       bool reference_barrier_enabled = false;
       std::string reference_target = "none";
@@ -1820,6 +2074,8 @@ struct Config {
       bool safe_backtrack_enabled = false;
       int safe_backtrack_min_exp = 20;
       int safe_backtrack_binary_iters = 8;
+      bool mesh_epoch_enabled = false;  // accumulate accepted pre-hydro mesh repairs into the retry snapshot
+      int mesh_epoch_max_per_step = 16;
       bool corner_cell_aspect_protection_enabled = true;
       double corner_cell_aspect_eta = 0.5;
       std::string rezone_solver = "legacy_winslow";
@@ -1831,6 +2087,7 @@ struct Config {
       double m1_barrier_beta = 1.0e-3;
       struct EulerWindowConfig {
         bool enabled = false;
+        std::string role = "";
         std::string shape = "rectangle";
         double r0 = 0.0;
         double r1 = 0.0;
@@ -1841,7 +2098,237 @@ struct Config {
         double rad_in = 0.0;
         double rad_out = 0.0;
         double transition_width = 0.0;
+        double t_on_s = 0.0;
+        double t_off_s = -1.0;
+        int feather_min_layers = 3;
+        int guard_layers = 1;
+        std::string axis_core_transaction_mode = "static";
+        std::string replay_table_path;
+        double replay_tau_lead = 4.5e-12;
+        double replay_tau_splice = 1.4e-12;
+        double replay_beta = 1.0;
+        bool axis_core_transition_passage_enabled = false;
+        bool axis_core_ring_release_enabled = false;
       } euler_window;
+      std::vector<EulerWindowConfig> euler_windows;
+      struct BandAleConfig {
+        bool enabled = false;
+        double aspect_trigger = 0.25;
+        double release_hysteresis = 1.5;
+        double chi = 0.5;
+        // Per-application node displacement cap for radial respace
+        // targets, as a fraction of the local adjacent ring gap along
+        // the node's spoke. Keeps every remap application sub-cell so
+        // donor sweeps never cross a steep profile in one transaction;
+        // the band re-engages on later steps until converged.
+        double respace_move_cap_frac = 0.5;
+        // Physical compression hold for estimator-band respace
+        // installs: the band holds while any window cell has radial
+        // velocity jump exceeding this Mach fraction of its sound
+        // speed (the same compression measure as the pole-theta and
+        // catchment holds). 0 disables the gate.
+        double estimator_band_hold_mach = 0.30;
+        std::string bands = "belts_axis";
+        bool compose_with_rezone = false;
+        std::string belt_target = "ring_mean";
+        std::string center_target = "line";
+        std::string axis_target = "z_laplacian";
+        int axis_segment_halfwidth = 4;
+        bool axis_shell_block_enabled = false;
+        bool sigma_linesearch_enabled = true;
+        bool transaction_energy_closure_enabled = false;
+        double estimator_band_cut = 0.5;   // row-mean refine_error threshold
+        double estimator_band_shock_hold = 0.90;  // hold the band while any
+                                                  // window row-mean E >= this
+        double estimator_band_front_hold_margin_rows = 16.0;  // §18.5: hold
+        // the estimator band while the tracked front (median shell row) is
+        // within this many rows of the window [first_ring, last_ring].
+        std::string estimator_band_axis = "auto";  // §18.6: lattice axis the
+        // band is layered along on SINGLE-BLOCK meshes. "auto": "i" (radial,
+        // slow index) when Mesh.logical_mesh_2d starts with
+        // "spherical_polar", else "j" (the rectangular laser slab ablates
+        // along z = the fast index). Multiblock ignores it (always the
+        // shell's radial i).
+        int estimator_band_in_rows = 4;    // rows added inside flagged interval
+        int estimator_band_out_rows = 4;   // rows added outside
+        double estimator_band_eta_on = 1.5;   // spacing-nonuniformity engage
+        double estimator_band_eta_off = 1.15; // release
+        bool estimator_band_per_column = false;
+        int estimator_band_pc_filter_halfwidth = 3;
+        double estimator_band_pc_slope_limit = 0.35;
+        double estimator_band_pc_slope_reject = 0.50;
+        double estimator_band_pc_curvature_limit = 0.50;
+        double estimator_band_pc_chi_max = 0.25;
+        double estimator_band_pc_chi_step = 0.10;
+        double estimator_band_pc_sigma_floor = 0.25;
+        double estimator_band_pc_coverage_full = 0.80;
+        double estimator_band_pc_coverage_min = 0.50;
+        int estimator_band_pc_cooldown_events = 2;
+        bool estimator_band_pc_phase_b = false;
+        int estimator_band_pc_tube_dilate_rows = 5;
+        int estimator_band_pc_tube_dilate_cols_extra = 2;
+        double estimator_band_pc_ambiguous_hold_fraction = 0.20;
+        bool closure_catchment_enabled = false;
+        bool closure_catchment_forced_active = false;  // increment 1 only
+        // Full-respace outer radius and outer identity radius [cm].
+        double closure_catchment_s_catch_cm = 6.0e-4;
+        double closure_catchment_s_protect_cm = 1.0e-3;
+        double closure_catchment_spacing_floor_cm = 3.0e-6;
+        double closure_catchment_ratio_max = 1.05;
+        double closure_catchment_nu_max = 0.25;
+        int closure_catchment_max_bites = 1;
+        // Center of the continuous compression-Mach shock attenuation band;
+        // <= 0 disables the factor.
+        double closure_catchment_shock_hold = 0.30;
+        // v2 common-mode lane (consult 2026-08-29). Relative comoving
+        // engagement metrics with EMA collapse-rate forecast; quintic
+        // smoothstep activations; physical-time cadence.
+        double closure_catchment_eta_h_arm = 0.80;
+        double closure_catchment_eta_h_full = 0.65;
+        double closure_catchment_eta_m_arm = 0.75;
+        double closure_catchment_eta_m_full = 0.60;
+        double closure_catchment_reset_eta = 0.90;
+        int closure_catchment_support_core_rows = 4;
+        int closure_catchment_support_taper_rows = 2;
+        double closure_catchment_accum_frac = 0.02;
+        double closure_catchment_rearm_drop = 0.10;
+        // Pole-theta maintenance (consult 2026-08-28): transactional
+        // tangential re-equidistribution of near-pole node rows, triggered
+        // by the target-normalized subzonal angular height H and the
+        // target-relative Jacobian condition number kappa.
+        bool pole_theta_enabled = false;
+        // v2 routine polar lane: low-pass physical-reference band and
+        // noise-normalized activation. The routine correction acts on
+        // the high-pass angular-pitch defect d = ln(dtheta /
+        // dtheta_phys); rows activate when the solid-angle L8 defect
+        // exceeds noise_floor by 2x (full at 4x).
+        // v2 routine polar lane master switch. Measured 2026-08-30: in
+        // every exercised regime the routine lane is either unnecessary
+        // (pre-stagnation stays in the LSB noise band without it) or harmful
+        // (during stagnation it re-equalizes pitches against the physically
+        // draining polar channels and pumps theta asymmetry through its pass
+        // band); the hard lane, catchment, and pool carry all demonstrated
+        // mandates. Kept for future regimes that demonstrate need.
+        bool pole_theta_routine_enabled = false;
+        int pole_theta_phys_lp = 0;
+        int pole_theta_phys_lc = 4;
+        double pole_theta_noise_floor = 1.0e-5;
+        // Structural ceiling of the routine lane: rows whose high-pass
+        // pitch defect exceeds this are treated as real structure (or
+        // hard-lane pathology), not removable noise, and the routine
+        // correction fades to exactly zero (smoothstep down between
+        // 1x and 2x the ceiling).
+        double pole_theta_noise_ceiling = 1.0e-3;
+        double pole_theta_h_arm = 0.70;
+        double pole_theta_h_fire = 0.55;
+        double pole_theta_h_hard = 0.35;
+        double pole_theta_h_release = 0.80;
+        double pole_theta_kappa_arm = 2.5;
+        double pole_theta_kappa_fire = 3.5;
+        double pole_theta_kappa_hard = 6.0;
+        double pole_theta_alpha = 0.30;
+        double pole_theta_alpha_hard = 0.60;
+        double pole_theta_deadband_frac = 0.05;
+        double pole_theta_move_limit_frac = 0.35;
+        double pole_theta_move_limit_hard_frac = 0.75;
+        double pole_theta_cooldown_s = 1.0e-12;
+        // Hard-lane base physical-time cooldown between committed
+        // coupled fires; futility debt doubles it per unit of debt
+        // (consult 7). 0 disables the cooldown/futility control.
+        double pole_theta_cooldown_base_s = 1.0e-12;
+        double pole_theta_predict_window_s = 2.0e-12;
+        double pole_theta_predict_horizon_s = 5.0e-12;
+        int pole_theta_halo_columns = 2;
+        int pole_theta_halo_rows = 2;
+        double pole_theta_post_h_floor = 0.65;
+        // M2 curve-preserving target: reconstruct each node row as a
+        // star-shaped curve s(theta) and move nodes along it. false =
+        // the M1 radius-preserving rotation (spherical-legal).
+        bool pole_theta_curve_preserving = false;
+        // Comma-separated Legendre orders whose row-geometry amplitudes
+        // the reconstruction preserves exactly (deck-seeded drive modes;
+        // l = 0 and 1 are always protected). Empty = only {0, 1}.
+        std::string pole_theta_protected_modes = "";
+        // Legendre fit order of the row reconstruction; clamped at
+        // runtime to floor(ntheta / 4).
+        int pole_theta_fit_order = 12;
+        // Hold a pole's arming/firing while a shock transits its scan half: a
+        // cell's compressive radial velocity jump u_r,inner - u_r,outer above
+        // this threshold times the local sound speed holds the pole.
+        // <= 0 disables the hold.
+        double pole_theta_shock_hold = 0.30;
+        int shell_window_in_rows = 8;
+        int shell_window_out_rows = 4;
+        int shell_boundary_guard_rows = 2;
+        double shell_min_spacing_frac = 0.5;
+        std::string shell_front_metric = "grad_rho";
+        std::string shell_target = "respace";
+        bool axis_repair_enabled = false;
+        double axis_repair_eta_on = 0.85;
+        double axis_repair_eta_off = 0.95;
+        double axis_repair_cap_rel = 0.05;
+      } band_ale;
+      struct EvacuatedCellConfig {
+        struct EvacuatedCellClosureContactConfig {
+          bool enabled = true;
+          double gap_floor_fraction = 0.02;
+          double gap_arm_fraction = 0.04;
+          double live_mass_gate = 0.05;
+          double live_volume_gate = 0.02;
+          double refill_min_mass_fraction = 0.05;
+          double refill_min_density_ratio = 0.2;
+          double release_force_c = 1.0e-3;
+          int release_persistence_stages = 2;
+          double reengage_gap_margin = 0.01;
+          double mortar_position_drift_beta = 0.02;
+          bool surface_engage_enabled = false;
+          bool lcp_apply_enabled = false;
+          struct AxisEdgeCollapseConfig {
+            bool enabled = false;  // default off = bit-inert
+            double ulp_count = 4096.0;
+            double h_ref_fraction = 1.0e-6;
+            double release_hysteresis = 4.0;
+            int persistence_window = 8;
+            int persistence_min_closing = 7;
+            int repair_recurrence_steps = 16;
+            double repair_futility_fraction = 0.25;
+          };
+          AxisEdgeCollapseConfig axis_edge_collapse;
+          struct FlankTangentialStripConfig {
+            bool enabled = false;  // default off = bit-inert
+            bool untangler_enabled = true;
+            int band_layers = 2;           // active strip rows (i = 1..band_layers)
+            int band_halfwidth_j = 6;      // j window half-width around the slot cell
+            double arm_quality_ratio = 0.25;    // q_theta/reference below this arms
+            double release_quality_ratio = 0.60;
+            double min_progress_factor = 10.0;  // accept a trial when the band quality ratio improves by at least this factor
+            int lead_steps = 32;                // predicted steps-to-floor arming
+            int release_persistence_steps = 32;
+            double release_shear_number = 0.02; // dt*max|du_t/dn| release bound
+            double slip_handoff_ratio = 0.5;    // |delta_s|/h_s handoff threshold
+            bool slip_patch_enabled = false;    // default off = bit-inert
+          };
+          FlankTangentialStripConfig flank_tangential_strip;
+          bool seam_interface_owner_enabled = false;  // default off = bit-inert
+        };
+        bool enabled = false;  // action mode; default off = bit-inert
+        int every_n_steps = 50;
+        double arm_mass_fraction = 1.0e-6;
+        double off_mass_fraction = 1.0e-8;
+        double rho_vacuum_policy_g_per_cc = 1.0e-10;
+        int off_hold_evaluations = 2;  // consecutive OFF-eligible evaluations
+        double laser_ne_over_ncrit_max = 1.0e-3;
+        double laser_wavelength_nm = 351.0;
+        double coupling_fraction_max = 1.0e-8;  // coupling energy vs patch energy
+        int max_cells_per_event = 4;  // reject the event if more would convert
+        bool rematerialize_enabled = true;  // part of the policy's correctness
+        int rematerialize_after_evaluations = 10;
+        double rematerialize_volume_fraction = 0.05;  // trigger: vol < frac * V_ref
+        double rematerialize_neighbor_change_max = 5.0e-2;  // per-donor relative clamp
+        int rematerialize_dwell_evaluations = 5;  // no re-conversion for this many evals
+        EvacuatedCellClosureContactConfig closure_contact;
+      };
+      EvacuatedCellConfig evacuated_cell;
       bool rezone_local_admissibility_linesearch = false;
       double rezone_local_j_floor_rel = 1.0e-8;
       int rezone_local_linesearch_max_halves = 8;
@@ -1932,6 +2419,7 @@ struct Config {
       int conservative_remap_lagrangian_bulk_center_node_ring_max = 4;
       bool central_pseudo_core_enabled = false;
       double central_pseudo_core_s_c = 0.0;
+      double central_pseudo_core_activation_time_s = 0.0;
       // Dynamic complete-ring absorption of the central macro cell
       // (NUMERICS Exp1): ladder cap rings -> fan layers -> pure-gas shell
       // rows, with the mass-weighted material guard. The historical
@@ -1974,12 +2462,6 @@ struct Config {
       bool central_pseudo_core_mixed_absorb_enabled = false;
       // Absorption watch-row count [1,8]; env override: TENRYU_I1B_ABSORB_WATCH_ROWS.
       int central_pseudo_core_absorb_watch_rows = 1;
-      // Terminal absorption master switch; env override: TENRYU_I1B_TERMINAL_ABSORB.
-      bool central_pseudo_core_terminal_absorb_enabled = false;
-      // Terminal rebound factor >1; env override: TENRYU_I1B_TERMINAL_REBOUND_FACTOR.
-      double central_pseudo_core_terminal_rebound_factor = 1.02;
-      // Terminal core1d tail chunk dt [s]; env override: TENRYU_I1B_TERMINAL_TAIL_DT.
-      double central_pseudo_core_terminal_tail_dt_s = 1.0e-12;
       // Remap mass-closure rejection tolerance; 0 disables; env override: TENRYU_I1B_REMAP_CLOSURE_REJECT_TOL.
       double remap_mass_closure_reject_tol = 0.0;
       // Rezone closure cooldown steps; env override: TENRYU_I1B_REZONE_CLOSURE_COOLDOWN_STEPS.
@@ -2299,6 +2781,10 @@ struct Config {
     bool plot_every_explicit = false;
     bool history_every_explicit = false;
     bool checkpoint_every_explicit = false;
+    // Write one snapshot at run termination when the last cadence write
+    // did not land on the final step (opt-in; gates that count snapshots
+    // rely on the historical cadence-only behavior).
+    bool write_final_snapshot = false;
     int checkpoint_keep_last = 2;
     std::string compression = "gzip";
     int compression_level = 4;
@@ -2412,5 +2898,1644 @@ struct Config {
   BurnConfig burn;
   MetaConfig meta;
 };
+
+inline hydro::PressureDrivePerturbationParams
+make_pressure_drive_perturbation_params(
+    const Config::NumericsConfig::HydroConfig::
+        PressureDrivePerturbationConfig& config) {
+  hydro::PressureDrivePerturbationParams params;
+  params.n_modes = static_cast<int>(config.mode_l.size());
+  for (int k = 0; k < params.n_modes; ++k) {
+    params.mode_l[k] = config.mode_l[static_cast<std::size_t>(k)];
+    params.mode_a[k] = config.mode_a[static_cast<std::size_t>(k)];
+  }
+  params.n_spots = static_cast<int>(config.spot_theta0.size());
+  for (int m = 0; m < params.n_spots; ++m) {
+    params.spot_theta0[m] =
+        config.spot_theta0[static_cast<std::size_t>(m)];
+    params.spot_sigma[m] =
+        config.spot_sigma[static_cast<std::size_t>(m)];
+    params.spot_amp[m] = config.spot_amp[static_cast<std::size_t>(m)];
+  }
+  return params;
+}
+
+enum class PolarTierJoinKind {
+  ONE_TO_ONE,
+  TWO_TO_ONE,
+};
+
+struct PolarTierJoinDescriptor {
+  PolarTierJoinKind kind = PolarTierJoinKind::ONE_TO_ONE;
+  // Half-open interval-index ranges on the outer and inner rings.
+  int outer_interval_begin = 0;
+  int outer_interval_end = 0;
+  int inner_interval_begin = 0;
+  int inner_interval_end = 0;
+};
+
+enum class PolarTierShellBandKind {
+  SHELL_C2,
+  SHELL_T21,
+  SHELL_FINE,
+};
+
+struct PolarTierShellBandDescriptor {
+  PolarTierShellBandKind kind = PolarTierShellBandKind::SHELL_FINE;
+  // Half-open radial row span in the shell, with row zero at r_match.
+  int row_begin = 0;
+  int row_end = 0;
+  // Coarse-side cap leaf width in master-column units.
+  int cap_leaf_width = 1;
+  int cells_per_row_half = 0;
+  int cells_per_row_full = 0;
+  long long n_cells = 0;
+  // Nodes first owned by this band after shared interface rings are elided.
+  long long n_nodes = 0;
+};
+
+enum class PolarTierEntityKind {
+  SHELL,
+  TIER,
+  TRANSITION,
+  FAN,
+};
+
+struct PolarTierScheduleEntry {
+  PolarTierEntityKind kind = PolarTierEntityKind::FAN;
+  // (kind, in_shell_chain, index) is the unique emitted-block key. Family
+  // tiers/body transitions use their vector index. Shell-chain entries use
+  // their shell_chain position. The plain SHELL and FAN use -1.
+  int index = -1;
+  bool in_shell_chain = false;
+  // Outward canonical node-ring span; cell rows are [ring_begin, ring_end).
+  int ring_begin = 0;
+  int ring_end = 0;
+  // Angular cell count; transitions record the coarse-side count.
+  int columns = 0;
+  // Realized inner/outer node-ring radii [cm]. These are exact for FAN,
+  // TIER, body-TRANSITION, and the plain SHELL. Shell-chain entries use NaN;
+  // truncation cuts are always below the shell and do not need those radii.
+  double r_inner = 0.0;
+  double r_outer = 0.0;
+};
+
+struct PolarTierLayout {
+  double h_r = 0.0;
+  double fan_radius = 0.0;
+  int block_count = 0;
+  long long n_cells = 0;
+  long long n_nodes = 0;
+  std::vector<int> tier_columns;
+  std::vector<int> transition_face_indices;
+  std::vector<double> transition_radii;
+  std::vector<double> transition_chi_fine;
+  std::vector<double> transition_chi_coarse;
+  std::vector<double> transition_outer_radii;
+  std::vector<double> transition_inner_radii;
+  std::vector<std::vector<int>> transition_intermediate_columns;
+  std::vector<std::vector<double>> transition_intermediate_radii;
+  std::vector<int> tier_radial_rows;
+  std::vector<double> tier_outer_radii;
+  std::vector<double> tier_inner_radii;
+  std::vector<double> tier_radial_spacings;
+  // Dendrite-only descriptors. Ring order is T1a, S_theta-inner/T1b,
+  // B1-inner, T2, T3, T4, T5; the legacy shell uses the T1a labels. Transition
+  // order is S_theta, B1, S_theta2, B2, B3, B4. Full-ring labels are stored
+  // because mesh connectivity indexes all C+1 nodes. Geometry construction
+  // evaluates the north half through master label 96 and mirrors the south
+  // half.
+  std::vector<int> dendrite_native_tier_columns;
+  std::vector<int> dendrite_actual_tier_columns;
+  // Structured block rows after transition rows are assigned.
+  std::vector<int> dendrite_tier_radial_rows;
+  std::vector<int> dendrite_ring_interval_counts;
+  std::vector<std::vector<int>> dendrite_master_theta_node_labels;
+  std::vector<std::vector<PolarTierJoinDescriptor>>
+      dendrite_transition_joins;
+  long long shell_n_cells = 0;
+  long long shell_n_nodes = 0;
+  // Shell ring-label order is C2, FINE. The only shell transition is T21.
+  std::vector<std::vector<int>> shell_master_theta_node_labels;
+  std::vector<std::vector<PolarTierJoinDescriptor>> shell_transition_joins;
+  std::vector<PolarTierShellBandDescriptor> shell_chain;
+  std::vector<PolarTierScheduleEntry> schedule;
+};
+
+struct PolarTierEntityCounts {
+  long long n_cells = 0;
+  long long n_nodes = 0;
+  long long n_blocks = 0;
+};
+
+inline PolarTierEntityCounts polar_tier_schedule_entry_counts(
+    const Config::MeshConfig& mesh,
+    const PolarTierLayout& layout,
+    const PolarTierScheduleEntry& entry) {
+  const long long rows =
+      static_cast<long long>(entry.ring_end - entry.ring_begin);
+  TENRYU_ASSERT(rows >= 0 && entry.columns > 0,
+                "polar-tier schedule entry dimensions must be positive");
+  if (entry.in_shell_chain) {
+    TENRYU_ASSERT(mesh.shell_polar_cap_dendrite && entry.index >= 0 &&
+                      static_cast<std::size_t>(entry.index) <
+                          layout.shell_chain.size(),
+                  "polar-tier shell-chain schedule index mismatch");
+    const PolarTierShellBandDescriptor& band =
+        layout.shell_chain[static_cast<std::size_t>(entry.index)];
+    const PolarTierEntityKind expected_kind =
+        band.kind == PolarTierShellBandKind::SHELL_T21
+            ? PolarTierEntityKind::TRANSITION
+            : PolarTierEntityKind::SHELL;
+    TENRYU_ASSERT(entry.kind == expected_kind &&
+                      rows == band.row_end - band.row_begin &&
+                      entry.columns == band.cells_per_row_full,
+                  "polar-tier shell-chain schedule entry mismatch");
+    return PolarTierEntityCounts{band.n_cells, band.n_nodes, 1LL};
+  }
+  if (entry.kind == PolarTierEntityKind::SHELL) {
+    TENRYU_ASSERT(!mesh.shell_polar_cap_dendrite && entry.index == -1 &&
+                      rows == mesh.nr,
+                  "polar-tier shell schedule entry mismatch");
+    return PolarTierEntityCounts{
+        rows * entry.columns,
+        (rows + 1LL) * (static_cast<long long>(entry.columns) + 1LL),
+        1LL};
+  }
+  if (entry.kind == PolarTierEntityKind::TIER) {
+    TENRYU_ASSERT(entry.index >= 0 && rows > 0,
+                  "polar-tier tier schedule entry mismatch");
+    return PolarTierEntityCounts{
+        rows * entry.columns,
+        rows * (static_cast<long long>(entry.columns) + 1LL),
+        1LL};
+  }
+  if (entry.kind == PolarTierEntityKind::FAN) {
+    TENRYU_ASSERT(entry.index == -1 && entry.ring_begin == 0 &&
+                      entry.ring_end == 0,
+                  "polar-tier fan schedule entry mismatch");
+    return PolarTierEntityCounts{entry.columns, 1LL, 1LL};
+  }
+
+  TENRYU_ASSERT(entry.kind == PolarTierEntityKind::TRANSITION &&
+                    entry.index >= 0 && rows > 0,
+                "polar-tier transition schedule entry mismatch");
+  if (mesh.polar_tier_dendrite_enabled) {
+    TENRYU_ASSERT(
+        static_cast<std::size_t>(entry.index) <
+                layout.dendrite_transition_joins.size() &&
+            static_cast<std::size_t>(entry.index + 1) <
+                layout.dendrite_master_theta_node_labels.size(),
+        "polar-tier dendrite transition schedule index mismatch");
+    long long cells = 0;
+    long long centers = 0;
+    for (const PolarTierJoinDescriptor& join :
+         layout.dendrite_transition_joins[
+             static_cast<std::size_t>(entry.index)]) {
+      if (join.kind == PolarTierJoinKind::ONE_TO_ONE) {
+        cells += 1LL;
+      } else {
+        cells += mesh.polar_tier_native_pentagon ? 1LL : 5LL;
+        centers += mesh.polar_tier_native_pentagon ? 0LL : 1LL;
+      }
+    }
+    const long long nodes =
+        static_cast<long long>(
+            layout.dendrite_master_theta_node_labels[
+                static_cast<std::size_t>(entry.index + 1)]
+                .size()) +
+        centers;
+    return PolarTierEntityCounts{cells, nodes, 1LL};
+  }
+
+  const long long coarse = entry.columns;
+  if (rows == 1) {
+    return PolarTierEntityCounts{5LL * coarse,
+                                 2LL * coarse + 1LL, 1LL};
+  }
+  if (rows == 2) {
+    return PolarTierEntityCounts{5LL * coarse,
+                                 5LL * coarse / 2LL + 2LL, 1LL};
+  }
+  TENRYU_ASSERT(rows == 3,
+                "polar-tier plain transition must span one to three rows");
+  return PolarTierEntityCounts{6LL * coarse, 4LL * coarse + 3LL, 1LL};
+}
+
+inline PolarTierEntityCounts polar_tier_schedule_totals(
+    const Config::MeshConfig& mesh,
+    const PolarTierLayout& layout) {
+  PolarTierEntityCounts totals;
+  for (std::size_t entity = 0; entity < layout.schedule.size(); ++entity) {
+    const PolarTierScheduleEntry& entry = layout.schedule[entity];
+    for (std::size_t prior = 0; prior < entity; ++prior) {
+      const PolarTierScheduleEntry& candidate = layout.schedule[prior];
+      TENRYU_ASSERT(candidate.kind != entry.kind ||
+                        candidate.in_shell_chain != entry.in_shell_chain ||
+                        candidate.index != entry.index,
+                    "polar-tier schedule block key must be unique");
+    }
+    const PolarTierEntityCounts counts =
+        polar_tier_schedule_entry_counts(mesh, layout, entry);
+    totals.n_cells += counts.n_cells;
+    totals.n_nodes += counts.n_nodes;
+    totals.n_blocks += counts.n_blocks;
+  }
+  return totals;
+}
+
+struct PolarTierTruncation {
+  int cut_ring = -1;    // Echo of the input.
+  int n_theta_cut = 0;  // Angular cell count of the tier containing the cut.
+  double r_cut = 0.0;   // Realized radius of the cut node ring [cm].
+  long long dropped_cells = 0;
+  // Nodes strictly below the cut ring; cut-ring nodes are kept.
+  long long dropped_nodes = 0;
+  long long dropped_blocks = 0;
+};
+
+inline void validate_polar_tier_dendrite_config(
+    const Config::MeshConfig& mesh) {
+  if (mesh.shell_cap_rows_2x < 12 || mesh.shell_cap_rows_2x > 288 ||
+      mesh.shell_cap_rows_2x == 287) {
+    throw namelist::ConfigError(
+        "Mesh.shell_cap_rows_2x must be in [12, 286] or equal 288");
+  }
+  if (mesh.shell_polar_cap_dendrite &&
+      !mesh.polar_tier_dendrite_enabled) {
+    throw namelist::ConfigError(
+        "Mesh.shell_polar_cap_dendrite=true requires "
+        "Mesh.polar_tier_dendrite_enabled=true");
+  }
+  if (mesh.shell_polar_cap_dendrite &&
+      !mesh.polar_tier_native_pentagon) {
+    throw namelist::ConfigError(
+        "Mesh.shell_polar_cap_dendrite=true requires "
+        "Mesh.polar_tier_native_pentagon=true");
+  }
+  if (mesh.polar_tier_native_pentagon &&
+      !mesh.polar_tier_dendrite_enabled) {
+    throw namelist::ConfigError(
+        "Mesh.polar_tier_native_pentagon=true requires "
+        "Mesh.polar_tier_dendrite_enabled=true");
+  }
+  if (!mesh.polar_tier_dendrite_enabled) {
+    return;
+  }
+  if (mesh.shell_polar_cap_dendrite && mesh.nr != 288) {
+    throw namelist::ConfigError(
+        "Mesh.shell_polar_cap_dendrite=true requires Mesh.nr == 288");
+  }
+  if (mesh.topology_scheme != TopologyScheme::MULTIBLOCK_POLAR_TIER &&
+      mesh.topology_scheme !=
+          TopologyScheme::MULTIBLOCK_POLAR_TIER_CART_CENTER) {
+    throw namelist::ConfigError(
+        "Mesh.polar_tier_dendrite_enabled=true requires "
+        "Mesh.topology_scheme=\"multiblock_polar_tier\" or "
+        "\"multiblock_polar_tier_cart_center\"");
+  }
+  if (mesh.nz != 192) {
+    throw namelist::ConfigError(
+        "Mesh.polar_tier_dendrite_enabled=true requires Mesh.nz "
+        "(Ntheta) == 192");
+  }
+  if (mesh.polar_tier_min_tier_columns != 12) {
+    throw namelist::ConfigError(
+        "Mesh.polar_tier_dendrite_enabled=true requires "
+        "Mesh.polar_tier_min_tier_columns == 12");
+  }
+  if (mesh.polar_tier_fan_sectors != 12) {
+    throw namelist::ConfigError(
+        "Mesh.polar_tier_dendrite_enabled=true requires "
+        "Mesh.polar_tier_fan_sectors == 12");
+  }
+  if (mesh.polar_tier_belt_rows != 1) {
+    throw namelist::ConfigError(
+        "Mesh.polar_tier_dendrite_enabled=true requires "
+        "Mesh.polar_tier_belt_rows == 1");
+  }
+  if (mesh.polar_tier_belt_thickness_frac != 0.0) {
+    throw namelist::ConfigError(
+        "Mesh.polar_tier_dendrite_enabled=true requires "
+        "Mesh.polar_tier_belt_thickness_frac == 0");
+  }
+  if (mesh.polar_tier_pole_cap_m != 0) {
+    throw namelist::ConfigError(
+        "Mesh.polar_tier_dendrite_enabled=true requires the old pole-cap "
+        "map off (Mesh.polar_tier_pole_cap_m == 0)");
+  }
+}
+
+inline PolarTierLayout make_polar_tier_layout(
+    const Config::MeshConfig& mesh) {
+  validate_polar_tier_dendrite_config(mesh);
+  PolarTierLayout layout;
+  constexpr double pi =
+      3.1415926535897932384626433832795028841971693993751058209749;
+  if (mesh.nz <= 0 || mesh.nr <= 0 ||
+      mesh.polar_tier_min_tier_columns <= 0 ||
+      mesh.polar_tier_fan_sectors <= 0 ||
+      (mesh.polar_tier_belt_rows != 1 &&
+       mesh.polar_tier_belt_rows != 2 &&
+       mesh.polar_tier_belt_rows != 3) ||
+      (mesh.polar_tier_pole_cap_m != 0 &&
+       (mesh.polar_tier_pole_cap_m < 4 ||
+        mesh.polar_tier_pole_cap_m > 48)) ||
+      !(std::isfinite(mesh.polar_tier_pole_cap_alpha) &&
+        mesh.polar_tier_pole_cap_alpha >= 0.0 &&
+        mesh.polar_tier_pole_cap_alpha <= 1.0) ||
+      !(std::isfinite(mesh.polar_tier_chi_lo) &&
+        mesh.polar_tier_chi_lo > 0.0) ||
+      !(std::isfinite(mesh.polar_tier_fan_first_ring_radius_cm) &&
+        mesh.polar_tier_fan_first_ring_radius_cm >= 0.0) ||
+      !(std::isfinite(mesh.multiblock_cart_core_r_match) &&
+        std::isfinite(mesh.spherical_polar_s_max) &&
+        mesh.spherical_polar_s_max >
+            mesh.multiblock_cart_core_r_match)) {
+    return layout;
+  }
+
+  int columns = mesh.nz;
+  layout.tier_columns.push_back(columns);
+  while (columns > mesh.polar_tier_min_tier_columns && columns % 2 == 0) {
+    columns /= 2;
+    layout.tier_columns.push_back(columns);
+  }
+  if (layout.tier_columns.back() != mesh.polar_tier_min_tier_columns) {
+    return PolarTierLayout{};
+  }
+  for (std::size_t tier = 1; tier < layout.tier_columns.size(); ++tier) {
+    const int coarse_columns = layout.tier_columns[tier];
+    if ((mesh.polar_tier_belt_rows == 2 && coarse_columns % 4 != 0) ||
+        (mesh.polar_tier_belt_rows == 3 && coarse_columns % 6 != 0)) {
+      return PolarTierLayout{};
+    }
+  }
+
+  const double r_match = mesh.multiblock_cart_core_r_match;
+  // The tier ladder continues the shell's INNERMOST radial spacing inward.
+  // Graded/explicit shell schedules (e.g. an outer ambient staircase) must
+  // not perturb it, so h_r comes from the first shell interval, falling back
+  // to the uniform average only when no schedule is given. The uniform
+  // branch is bit-identical to the historic expression.
+  if (!mesh.explicit_nodes.empty()) {
+    layout.h_r =
+        mesh.explicit_nodes.size() >= 2U
+            ? mesh.explicit_nodes[1] - mesh.explicit_nodes[0]
+            : 0.0;
+  } else if (!mesh.grid_segments.empty()) {
+    const auto& first_segment = mesh.grid_segments.front();
+    layout.h_r =
+        first_segment.nr > 0
+            ? (first_segment.r_end - first_segment.r_start) /
+                  static_cast<double>(first_segment.nr)
+            : 0.0;
+  } else {
+    layout.h_r =
+        (mesh.spherical_polar_s_max - r_match) /
+        static_cast<double>(mesh.nr);
+  }
+  if (!(std::isfinite(layout.h_r) && layout.h_r > 0.0)) {
+    return PolarTierLayout{};
+  }
+
+  layout.fan_radius =
+      mesh.polar_tier_fan_first_ring_radius_cm > 0.0
+          ? mesh.polar_tier_fan_first_ring_radius_cm
+          : layout.h_r /
+                std::sin(pi /
+                         static_cast<double>(
+                             mesh.polar_tier_fan_sectors));
+  if (!(std::isfinite(layout.fan_radius) && layout.fan_radius > 0.0)) {
+    return PolarTierLayout{};
+  }
+
+  const int n_tiers = static_cast<int>(layout.tier_columns.size());
+  layout.transition_face_indices.reserve(
+      static_cast<std::size_t>(std::max(0, n_tiers - 1)));
+  layout.transition_radii.reserve(
+      static_cast<std::size_t>(std::max(0, n_tiers - 1)));
+  layout.transition_chi_fine.reserve(
+      static_cast<std::size_t>(std::max(0, n_tiers - 1)));
+  layout.transition_chi_coarse.reserve(
+      static_cast<std::size_t>(std::max(0, n_tiers - 1)));
+  layout.transition_outer_radii.reserve(
+      static_cast<std::size_t>(std::max(0, n_tiers - 1)));
+  layout.transition_inner_radii.reserve(
+      static_cast<std::size_t>(std::max(0, n_tiers - 1)));
+  layout.transition_intermediate_columns.reserve(
+      static_cast<std::size_t>(std::max(0, n_tiers - 1)));
+  layout.transition_intermediate_radii.reserve(
+      static_cast<std::size_t>(std::max(0, n_tiers - 1)));
+  layout.tier_radial_rows.reserve(static_cast<std::size_t>(n_tiers));
+  layout.tier_outer_radii.reserve(static_cast<std::size_t>(n_tiers));
+  layout.tier_inner_radii.reserve(static_cast<std::size_t>(n_tiers));
+  layout.tier_radial_spacings.reserve(static_cast<std::size_t>(n_tiers));
+
+  double tier_outer_radius = r_match;
+  for (int tier = 0; tier + 1 < n_tiers; ++tier) {
+    const int n_fine =
+        layout.tier_columns[static_cast<std::size_t>(tier)];
+    const double target =
+        mesh.polar_tier_chi_lo * layout.h_r *
+        static_cast<double>(n_fine) / pi;
+    const double face_real =
+        std::round((r_match - target) / layout.h_r);
+    if (!(std::isfinite(target) && std::isfinite(face_real) &&
+          face_real >=
+              static_cast<double>(std::numeric_limits<int>::min()) &&
+          face_real <=
+              static_cast<double>(std::numeric_limits<int>::max()))) {
+      return PolarTierLayout{};
+    }
+    const int face_index = static_cast<int>(face_real);
+    const double radius =
+        r_match - static_cast<double>(face_index) * layout.h_r;
+    const double chi_fine =
+        radius * pi / (layout.h_r * static_cast<double>(n_fine));
+    layout.transition_face_indices.push_back(face_index);
+    layout.transition_radii.push_back(radius);
+    layout.transition_chi_fine.push_back(chi_fine);
+    layout.transition_chi_coarse.push_back(2.0 * chi_fine);
+    const double span = tier_outer_radius - radius;
+    const double rows_real = std::round(span / layout.h_r);
+    if (!(std::isfinite(span) && span > 0.0 &&
+          std::isfinite(rows_real) &&
+          rows_real <=
+              static_cast<double>(std::numeric_limits<int>::max()))) {
+      return PolarTierLayout{};
+    }
+    const int rows =
+        std::max(1, static_cast<int>(rows_real));
+    layout.tier_radial_rows.push_back(rows);
+    layout.tier_outer_radii.push_back(tier_outer_radius);
+    layout.tier_inner_radii.push_back(radius);
+    layout.tier_radial_spacings.push_back(
+        span / static_cast<double>(rows));
+    tier_outer_radius =
+        r_match -
+        (static_cast<double>(face_index) + 1.0) * layout.h_r;
+  }
+  const double innermost_span =
+      tier_outer_radius - layout.fan_radius;
+  const double innermost_rows_real =
+      std::round(innermost_span / layout.h_r);
+  if (!(std::isfinite(innermost_span) && innermost_span > 0.0 &&
+        std::isfinite(innermost_rows_real) &&
+        innermost_rows_real <=
+            static_cast<double>(std::numeric_limits<int>::max()))) {
+    return layout;
+  }
+  const int innermost_rows =
+      std::max(1, static_cast<int>(innermost_rows_real));
+  layout.tier_radial_rows.push_back(innermost_rows);
+  layout.tier_outer_radii.push_back(tier_outer_radius);
+  layout.tier_inner_radii.push_back(layout.fan_radius);
+  layout.tier_radial_spacings.push_back(
+      innermost_span / static_cast<double>(innermost_rows));
+
+  if (mesh.polar_tier_belt_rows > 1) {
+    if (mesh.polar_tier_belt_thickness_frac > 0.0) {
+      return PolarTierLayout{};
+    }
+    for (int tier = 0; tier + 1 < n_tiers; ++tier) {
+      const std::size_t outer_tier = static_cast<std::size_t>(tier);
+      const std::size_t inner_tier = static_cast<std::size_t>(tier + 1);
+      const double legacy_outer_radius =
+          layout.tier_inner_radii[outer_tier];
+      const double legacy_inner_radius =
+          layout.tier_outer_radii[inner_tier];
+      double outer_radius = legacy_outer_radius;
+      double inner_radius = legacy_inner_radius;
+      if (layout.tier_radial_rows[outer_tier] >= 2) {
+        layout.tier_radial_rows[outer_tier] -= 1;
+        layout.tier_inner_radii[outer_tier] +=
+            layout.tier_radial_spacings[outer_tier];
+        outer_radius = layout.tier_inner_radii[outer_tier];
+      }
+      if (layout.tier_radial_rows[inner_tier] >= 2) {
+        layout.tier_radial_rows[inner_tier] -= 1;
+        layout.tier_outer_radii[inner_tier] -=
+            layout.tier_radial_spacings[inner_tier];
+        inner_radius = layout.tier_outer_radii[inner_tier];
+      }
+      if (!(std::isfinite(outer_radius) && std::isfinite(inner_radius) &&
+            outer_radius > inner_radius)) {
+        return PolarTierLayout{};
+      }
+      layout.transition_outer_radii.push_back(outer_radius);
+      layout.transition_inner_radii.push_back(inner_radius);
+
+      const int coarse_columns =
+          layout.tier_columns[static_cast<std::size_t>(tier + 1)];
+      std::vector<int> intermediate_columns;
+      std::vector<double> intermediate_radii;
+      if (mesh.polar_tier_belt_rows == 2) {
+        intermediate_columns.push_back(static_cast<int>(
+            3LL * static_cast<long long>(coarse_columns) / 2LL));
+        intermediate_radii.push_back(
+            0.5 * (outer_radius + inner_radius));
+      } else {
+        const double span = outer_radius - inner_radius;
+        intermediate_columns.push_back(static_cast<int>(
+            5LL * static_cast<long long>(coarse_columns) / 3LL));
+        intermediate_columns.push_back(static_cast<int>(
+            4LL * static_cast<long long>(coarse_columns) / 3LL));
+        intermediate_radii.push_back(outer_radius - span / 3.0);
+        intermediate_radii.push_back(
+            outer_radius - 2.0 * span / 3.0);
+      }
+      layout.transition_intermediate_columns.push_back(
+          std::move(intermediate_columns));
+      layout.transition_intermediate_radii.push_back(
+          std::move(intermediate_radii));
+    }
+  }
+
+  if (mesh.polar_tier_dendrite_enabled) {
+    constexpr int master_columns = 192;
+    constexpr int cap_half_width = 16;
+    const std::vector<int> qualification_native_tier_columns{
+        192, 96, 48, 24, 12};
+    if (layout.tier_columns != qualification_native_tier_columns) {
+      throw namelist::ConfigError(
+          "Mesh.polar_tier_dendrite_enabled=true requires native tier "
+          "columns [192, 96, 48, 24, 12]");
+    }
+    layout.dendrite_native_tier_columns = {192, 192, 96, 48, 24, 12};
+
+    const auto make_master_labels =
+        [&](const int native_columns,
+            const int cap_intervals,
+            const std::vector<int>& explicit_north_cap_labels)
+        -> std::vector<int> {
+      if (native_columns <= 0 || master_columns % native_columns != 0) {
+        throw namelist::ConfigError(
+            "Polar-tier dendrite ladder has a fractional native master "
+            "stride");
+      }
+      const int native_stride = master_columns / native_columns;
+      if (cap_intervals <= 0 ||
+          cap_half_width % native_stride != 0) {
+        throw namelist::ConfigError(
+            "Polar-tier dendrite ladder has a fractional cap master label");
+      }
+      std::vector<int> north_cap_labels = explicit_north_cap_labels;
+      if (north_cap_labels.empty()) {
+        if (cap_half_width % cap_intervals != 0) {
+          throw namelist::ConfigError(
+              "Polar-tier dendrite ladder has a fractional cap master "
+              "label");
+        }
+        const int cap_stride = cap_half_width / cap_intervals;
+        for (int label = 0; label <= cap_half_width;
+             label += cap_stride) {
+          north_cap_labels.push_back(label);
+        }
+      }
+      if (north_cap_labels.size() !=
+              static_cast<std::size_t>(cap_intervals) + 1U ||
+          north_cap_labels.front() != 0 ||
+          north_cap_labels.back() != cap_half_width ||
+          !std::is_sorted(north_cap_labels.begin(),
+                          north_cap_labels.end()) ||
+          std::adjacent_find(north_cap_labels.begin(),
+                             north_cap_labels.end()) !=
+              north_cap_labels.end()) {
+        throw namelist::ConfigError(
+            "Polar-tier dendrite explicit north cap ladder is not a "
+            "strict 0..16 master partition");
+      }
+      std::vector<int> labels;
+      labels.reserve(static_cast<std::size_t>(native_columns) + 1U);
+      for (const int label : north_cap_labels) {
+        labels.push_back(label);
+      }
+      for (int label = cap_half_width + native_stride;
+           label <= master_columns - cap_half_width;
+           label += native_stride) {
+        labels.push_back(label);
+      }
+      for (std::size_t label = north_cap_labels.size() - 1U;
+           label > 0U; --label) {
+        labels.push_back(
+            master_columns - north_cap_labels[label - 1U]);
+      }
+      if (labels.size() < 2U || labels.front() != 0 ||
+          labels.back() != master_columns ||
+          !std::is_sorted(labels.begin(), labels.end()) ||
+          std::adjacent_find(labels.begin(), labels.end()) != labels.end()) {
+        throw namelist::ConfigError(
+            "Polar-tier dendrite ladder is not a strict 0..192 master "
+            "partition");
+      }
+      for (std::size_t label = 0; label < labels.size(); ++label) {
+        if (labels[label] +
+                labels[labels.size() - 1U - label] !=
+            master_columns) {
+          throw namelist::ConfigError(
+              "Polar-tier dendrite ladder is not exactly north/south "
+              "mirrored");
+        }
+      }
+      return labels;
+    };
+
+    if (mesh.shell_polar_cap_dendrite) {
+      constexpr int required_cap_half_width = 16;
+      if (cap_half_width != required_cap_half_width ||
+          cap_half_width % 2 != 0) {
+        throw namelist::ConfigError(
+            "Shell-cap dendrite requires J_W == 16 and J_W mod 2 == 0");
+      }
+      layout.shell_master_theta_node_labels.reserve(2U);
+      layout.shell_master_theta_node_labels.push_back(
+          make_master_labels(master_columns, 8, {}));
+      layout.shell_master_theta_node_labels.push_back(
+          make_master_labels(master_columns, 16, {}));
+      if (layout.shell_master_theta_node_labels[0].size() != 177U ||
+          layout.shell_master_theta_node_labels[1].size() != 193U) {
+        throw namelist::ConfigError(
+            "Shell-cap dendrite must derive 176-column C2 and 192-column "
+            "FINE ring labels");
+      }
+    }
+
+    // S_theta consumes one T1 row between T1a and T1b, while S_theta2
+    // consumes T2's first row. The regular-tier schedule is
+    // [176, 176, 88, 44, 22, 12] with shell-cap dendrite enabled and
+    // [192, 178, 88, 44, 22, 12] otherwise.
+    const std::vector<int> actual_cap_intervals =
+        mesh.shell_polar_cap_dendrite
+            ? std::vector<int>{8, 8, 4, 2, 1, 1}
+            : std::vector<int>{16, 9, 4, 2, 1, 1};
+    layout.dendrite_actual_tier_columns.reserve(
+        layout.dendrite_native_tier_columns.size());
+    for (std::size_t tier = 0;
+         tier < layout.dendrite_native_tier_columns.size(); ++tier) {
+      const int native_columns =
+          layout.dendrite_native_tier_columns[tier];
+      if (master_columns % native_columns != 0) {
+        throw namelist::ConfigError(
+            "Polar-tier dendrite tier has a fractional native master "
+            "stride");
+      }
+      const int native_stride = master_columns / native_columns;
+      if (cap_half_width % native_stride != 0) {
+        throw namelist::ConfigError(
+            "Polar-tier dendrite cap boundary is not a native tier label");
+      }
+      const int native_cap_intervals =
+          cap_half_width / native_stride;
+      const int actual_columns =
+          native_columns -
+          2 * (native_cap_intervals - actual_cap_intervals[tier]);
+      layout.dendrite_actual_tier_columns.push_back(actual_columns);
+    }
+
+    const std::vector<int> ring_native_columns{
+        192, 192, 96, 96, 48, 24, 12};
+    const std::vector<int> ring_cap_intervals =
+        mesh.shell_polar_cap_dendrite
+            ? std::vector<int>{8, 8, 6, 4, 2, 1, 1}
+            : std::vector<int>{16, 9, 6, 4, 2, 1, 1};
+    const std::vector<std::vector<int>> explicit_north_cap_labels =
+        mesh.shell_polar_cap_dendrite
+            ? std::vector<std::vector<int>>{
+                  {},
+                  {},
+                  {0, 2, 4, 8, 12, 14, 16},
+                  {0, 4, 8, 12, 16},
+                  {0, 8, 16},
+                  {},
+                  {},
+              }
+            : std::vector<std::vector<int>>{
+                  {},
+                  {0, 1, 3, 5, 7, 9, 11, 13, 15, 16},
+                  {0, 1, 5, 9, 13, 15, 16},
+                  {0, 1, 9, 15, 16},
+                  {0, 9, 16},
+                  {},
+                  {},
+              };
+    layout.dendrite_master_theta_node_labels.reserve(
+        ring_native_columns.size());
+    layout.dendrite_ring_interval_counts.reserve(
+        ring_native_columns.size());
+    for (std::size_t ring = 0; ring < ring_native_columns.size(); ++ring) {
+      auto labels =
+          mesh.shell_polar_cap_dendrite && ring < 2U
+              ? layout.shell_master_theta_node_labels.front()
+              : make_master_labels(ring_native_columns[ring],
+                                   ring_cap_intervals[ring],
+                                   explicit_north_cap_labels[ring]);
+      layout.dendrite_ring_interval_counts.push_back(
+          static_cast<int>(labels.size()) - 1);
+      layout.dendrite_master_theta_node_labels.push_back(
+          std::move(labels));
+    }
+    if (mesh.shell_polar_cap_dendrite &&
+        (layout.dendrite_master_theta_node_labels[0] !=
+             layout.shell_master_theta_node_labels[0] ||
+         layout.dendrite_master_theta_node_labels[1] !=
+             layout.shell_master_theta_node_labels[0])) {
+      throw namelist::ConfigError(
+          "Shell-cap C2 and both T1 ladders must match exactly");
+    }
+
+    const std::vector<std::size_t> tier_ring_indices{
+        0, 1, 3, 4, 5, 6};
+    for (std::size_t tier = 0; tier < tier_ring_indices.size(); ++tier) {
+      const std::size_t ring = tier_ring_indices[tier];
+      if (ring_native_columns[ring] !=
+              layout.dendrite_native_tier_columns[tier] ||
+          layout.dendrite_ring_interval_counts[ring] !=
+              layout.dendrite_actual_tier_columns[tier]) {
+        throw namelist::ConfigError(
+            "Polar-tier dendrite native/actual tier ladder mismatch");
+      }
+    }
+
+    const auto make_join_descriptors =
+        [](const std::vector<int>& outer_labels,
+           const std::vector<int>& inner_labels)
+        -> std::vector<PolarTierJoinDescriptor> {
+      if (outer_labels.size() < 2U || inner_labels.size() < 2U ||
+          outer_labels.front() != inner_labels.front() ||
+          outer_labels.back() != inner_labels.back()) {
+        throw namelist::ConfigError(
+            "Polar-tier dendrite join endpoints do not match");
+      }
+      std::vector<PolarTierJoinDescriptor> joins;
+      joins.reserve(inner_labels.size() - 1U);
+      int expected_outer_begin = 0;
+      for (std::size_t inner = 0; inner + 1U < inner_labels.size();
+           ++inner) {
+        const auto outer_begin_it =
+            std::lower_bound(outer_labels.begin(), outer_labels.end(),
+                             inner_labels[inner]);
+        const auto outer_end_it =
+            std::lower_bound(outer_labels.begin(), outer_labels.end(),
+                             inner_labels[inner + 1U]);
+        if (outer_begin_it == outer_labels.end() ||
+            outer_end_it == outer_labels.end() ||
+            *outer_begin_it != inner_labels[inner] ||
+            *outer_end_it != inner_labels[inner + 1U]) {
+          throw namelist::ConfigError(
+              "Polar-tier dendrite join has a gap or fractional endpoint");
+        }
+        const int outer_begin = static_cast<int>(
+            std::distance(outer_labels.begin(), outer_begin_it));
+        const int outer_end = static_cast<int>(
+            std::distance(outer_labels.begin(), outer_end_it));
+        const int ratio = outer_end - outer_begin;
+        if (outer_begin != expected_outer_begin) {
+          throw namelist::ConfigError(
+              "Polar-tier dendrite join has an outer interval gap or "
+              "overlap");
+        }
+        if (ratio != 1 && ratio != 2) {
+          throw namelist::ConfigError(
+              "Polar-tier dendrite join interval ratio must be exactly "
+              "1 or 2");
+        }
+        joins.push_back(PolarTierJoinDescriptor{
+            ratio == 1 ? PolarTierJoinKind::ONE_TO_ONE
+                       : PolarTierJoinKind::TWO_TO_ONE,
+            outer_begin,
+            outer_end,
+            static_cast<int>(inner),
+            static_cast<int>(inner + 1U)});
+        expected_outer_begin = outer_end;
+      }
+      if (expected_outer_begin !=
+          static_cast<int>(outer_labels.size()) - 1) {
+        throw namelist::ConfigError(
+            "Polar-tier dendrite join does not consume every outer "
+            "interval");
+      }
+      return joins;
+    };
+
+    if (mesh.shell_polar_cap_dendrite) {
+      constexpr int shell_rows = 288;
+      const bool full_shell_c2 = mesh.shell_cap_rows_2x == shell_rows;
+      const int coarse_cohort_rows = mesh.shell_cap_rows_2x + 1;
+      if (!full_shell_c2 && coarse_cohort_rows >= shell_rows) {
+        throw namelist::ConfigError(
+            "Shell-cap dendrite C2 and T21 rows must leave a FINE cohort");
+      }
+
+      if (!full_shell_c2) {
+        layout.shell_transition_joins.reserve(1U);
+        layout.shell_transition_joins.push_back(
+            make_join_descriptors(
+                layout.shell_master_theta_node_labels[1],
+                layout.shell_master_theta_node_labels[0]));
+
+        const auto join_kind_count =
+            [](const std::vector<PolarTierJoinDescriptor>& joins,
+               const PolarTierJoinKind kind) -> int {
+          return static_cast<int>(std::count_if(
+              joins.begin(), joins.end(),
+              [&](const PolarTierJoinDescriptor& join) {
+                return join.kind == kind;
+              }));
+        };
+        if (layout.shell_transition_joins.size() != 1U ||
+            join_kind_count(layout.shell_transition_joins[0],
+                            PolarTierJoinKind::TWO_TO_ONE) != 16 ||
+            join_kind_count(layout.shell_transition_joins[0],
+                            PolarTierJoinKind::ONE_TO_ONE) != 160) {
+          throw namelist::ConfigError(
+              "Shell-cap dendrite transition joins do not match the "
+              "bilateral cap/interior contract");
+        }
+      }
+
+      const int c2_cells_per_row = static_cast<int>(
+          layout.shell_master_theta_node_labels[0].size()) - 1;
+      const int fine_cells_per_row = static_cast<int>(
+          layout.shell_master_theta_node_labels[1].size()) - 1;
+      const int c2_nodes_per_ring = c2_cells_per_row + 1;
+      const int fine_nodes_per_ring = fine_cells_per_row + 1;
+
+      const auto append_shell_band =
+          [&](const PolarTierShellBandKind kind,
+              const int row_begin,
+              const int row_end,
+              const int cap_leaf_width,
+              const int cells_per_row_full,
+              const long long owned_nodes) {
+        if (row_begin < 0 || row_end <= row_begin ||
+            cells_per_row_full <= 0 || cells_per_row_full % 2 != 0 ||
+            owned_nodes <= 0) {
+          throw namelist::ConfigError(
+              "Shell-cap dendrite band descriptor is invalid");
+        }
+        const long long row_count =
+            static_cast<long long>(row_end - row_begin);
+        layout.shell_chain.push_back(PolarTierShellBandDescriptor{
+            kind,
+            row_begin,
+            row_end,
+            cap_leaf_width,
+            cells_per_row_full / 2,
+            cells_per_row_full,
+            row_count * cells_per_row_full,
+            owned_nodes});
+      };
+
+      int row = 0;
+      append_shell_band(
+          PolarTierShellBandKind::SHELL_C2,
+          row,
+          row + mesh.shell_cap_rows_2x,
+          2,
+          c2_cells_per_row,
+          (static_cast<long long>(mesh.shell_cap_rows_2x) + 1LL) *
+              c2_nodes_per_ring);
+      row += mesh.shell_cap_rows_2x;
+      if (!full_shell_c2) {
+        const int t21_cells_per_row = static_cast<int>(
+            layout.shell_transition_joins[0].size());
+        append_shell_band(
+            PolarTierShellBandKind::SHELL_T21,
+            row,
+            row + 1,
+            2,
+            t21_cells_per_row,
+            fine_nodes_per_ring);
+        row += 1;
+        append_shell_band(
+            PolarTierShellBandKind::SHELL_FINE,
+            row,
+            shell_rows,
+            1,
+            fine_cells_per_row,
+            static_cast<long long>(shell_rows - row) *
+                fine_nodes_per_ring);
+      }
+
+      int expected_row_begin = 0;
+      long long descriptor_cells = 0;
+      long long descriptor_nodes = 0;
+      for (const PolarTierShellBandDescriptor& band : layout.shell_chain) {
+        if (band.row_begin != expected_row_begin) {
+          throw namelist::ConfigError(
+              "Shell-cap dendrite chain has a radial gap or overlap");
+        }
+        expected_row_begin = band.row_end;
+        descriptor_cells += band.n_cells;
+        descriptor_nodes += band.n_nodes;
+      }
+      const std::size_t expected_chain_size = full_shell_c2 ? 1U : 3U;
+      if (layout.shell_chain.size() != expected_chain_size ||
+          expected_row_begin != shell_rows) {
+        throw namelist::ConfigError(
+            "Shell-cap dendrite chain must cover exactly 288 shell rows");
+      }
+      long long expected_cells =
+          static_cast<long long>(mesh.shell_cap_rows_2x) *
+          c2_cells_per_row;
+      long long expected_nodes =
+          (static_cast<long long>(mesh.shell_cap_rows_2x) + 1LL) *
+          c2_nodes_per_ring;
+      if (!full_shell_c2) {
+        const int fine_rows = shell_rows - coarse_cohort_rows;
+        const int t21_cells_per_row = static_cast<int>(
+            layout.shell_transition_joins[0].size());
+        expected_cells +=
+            t21_cells_per_row +
+            static_cast<long long>(fine_rows) * fine_cells_per_row;
+        expected_nodes +=
+            fine_nodes_per_ring +
+            static_cast<long long>(fine_rows) * fine_nodes_per_ring;
+      }
+      layout.shell_n_cells = descriptor_cells;
+      layout.shell_n_nodes = descriptor_nodes;
+      if (layout.shell_n_cells != expected_cells ||
+          layout.shell_n_nodes != expected_nodes) {
+        throw namelist::ConfigError(
+            "Shell-cap dendrite totals do not match descriptor sums");
+      }
+    }
+
+    layout.dendrite_transition_joins.reserve(
+        layout.dendrite_master_theta_node_labels.size() - 1U);
+    for (std::size_t transition = 0;
+         transition + 1U <
+         layout.dendrite_master_theta_node_labels.size();
+         ++transition) {
+      layout.dendrite_transition_joins.push_back(
+          make_join_descriptors(
+              layout.dendrite_master_theta_node_labels[transition],
+              layout.dendrite_master_theta_node_labels[transition + 1U]));
+    }
+    if (layout.dendrite_transition_joins.size() != 6U) {
+      throw namelist::ConfigError(
+          "Polar-tier dendrite must derive exactly six transitions");
+    }
+
+    constexpr int s_theta_rows = 1;
+    const int t1b_rows =
+        mesh.polar_tier_dendrite_s_theta_rows_below;
+    const int t1a_rows = 61 - s_theta_rows - t1b_rows;
+    if (layout.tier_radial_rows.size() != 5U ||
+        layout.tier_radial_rows[0] !=
+            t1a_rows + s_theta_rows + t1b_rows ||
+        layout.tier_radial_rows[1] < 2) {
+      throw namelist::ConfigError(
+          "Polar-tier dendrite requires exactly 61 radial rows in T1 "
+          "and one consumable radial row in T2");
+    }
+    layout.dendrite_tier_radial_rows = layout.tier_radial_rows;
+    layout.dendrite_tier_radial_rows[0] = t1a_rows;
+    layout.dendrite_tier_radial_rows.insert(
+        layout.dendrite_tier_radial_rows.begin() + 1, t1b_rows);
+    layout.dendrite_tier_radial_rows[2] -= 1;
+
+    if (layout.dendrite_actual_tier_columns.back() !=
+        mesh.polar_tier_fan_sectors) {
+      throw namelist::ConfigError(
+          "Polar-tier dendrite innermost ring/fan interval mismatch");
+    }
+
+    constexpr std::array<int, 6> tier_radial_indices =
+        {{0, 0, 1, 2, 3, 4}};
+    std::array<double, 6> dendrite_tier_outer{};
+    std::array<double, 6> dendrite_tier_inner{};
+    std::array<double, 6> dendrite_transition_outer{};
+    std::array<double, 6> dendrite_transition_inner{};
+    dendrite_tier_outer[0] = r_match;
+    dendrite_tier_inner[0] =
+        layout.tier_inner_radii[0] +
+        static_cast<double>(layout.dendrite_tier_radial_rows[1] + 1) *
+            layout.tier_radial_spacings[0];
+    dendrite_transition_outer[0] = dendrite_tier_inner[0];
+    dendrite_transition_inner[0] =
+        layout.tier_inner_radii[0] +
+        static_cast<double>(layout.dendrite_tier_radial_rows[1]) *
+            layout.tier_radial_spacings[0];
+    dendrite_tier_outer[1] = dendrite_transition_inner[0];
+    dendrite_tier_inner[1] = layout.tier_inner_radii[0];
+    dendrite_transition_outer[1] = dendrite_tier_inner[1];
+    dendrite_transition_inner[1] = layout.tier_outer_radii[1];
+    dendrite_transition_outer[2] = dendrite_transition_inner[1];
+    dendrite_transition_inner[2] =
+        layout.tier_outer_radii[1] - layout.tier_radial_spacings[1];
+    dendrite_tier_outer[2] = dendrite_transition_inner[2];
+    dendrite_tier_inner[2] = layout.tier_inner_radii[1];
+    for (int tier = 3; tier < 6; ++tier) {
+      const int radial_index =
+          tier_radial_indices[static_cast<std::size_t>(tier)];
+      const int transition = tier;
+      dendrite_transition_outer[static_cast<std::size_t>(transition)] =
+          dendrite_tier_inner[static_cast<std::size_t>(tier - 1)];
+      dendrite_transition_inner[static_cast<std::size_t>(transition)] =
+          layout.tier_outer_radii[static_cast<std::size_t>(radial_index)];
+      dendrite_tier_outer[static_cast<std::size_t>(tier)] =
+          dendrite_transition_inner[static_cast<std::size_t>(transition)];
+      dendrite_tier_inner[static_cast<std::size_t>(tier)] =
+          layout.tier_inner_radii[static_cast<std::size_t>(radial_index)];
+    }
+
+    int outward_ring = 0;
+    layout.schedule.push_back(PolarTierScheduleEntry{
+        PolarTierEntityKind::FAN,
+        -1,
+        false,
+        0,
+        0,
+        layout.dendrite_actual_tier_columns.back(),
+        0.0,
+        layout.fan_radius});
+    const auto append_dendrite_tier = [&](const int tier) {
+      const int rows =
+          layout.dendrite_tier_radial_rows[static_cast<std::size_t>(tier)];
+      layout.schedule.push_back(PolarTierScheduleEntry{
+          PolarTierEntityKind::TIER,
+          tier,
+          false,
+          outward_ring,
+          outward_ring + rows,
+          layout.dendrite_actual_tier_columns[static_cast<std::size_t>(tier)],
+          dendrite_tier_inner[static_cast<std::size_t>(tier)],
+          dendrite_tier_outer[static_cast<std::size_t>(tier)]});
+      outward_ring += rows;
+    };
+    const auto append_dendrite_transition = [&](const int transition) {
+      layout.schedule.push_back(PolarTierScheduleEntry{
+          PolarTierEntityKind::TRANSITION,
+          transition,
+          false,
+          outward_ring,
+          outward_ring + 1,
+          static_cast<int>(
+              layout.dendrite_transition_joins[
+                  static_cast<std::size_t>(transition)]
+                  .size()),
+          dendrite_transition_inner[static_cast<std::size_t>(transition)],
+          dendrite_transition_outer[static_cast<std::size_t>(transition)]});
+      ++outward_ring;
+    };
+    append_dendrite_tier(5);
+    append_dendrite_transition(5);
+    append_dendrite_tier(4);
+    append_dendrite_transition(4);
+    append_dendrite_tier(3);
+    append_dendrite_transition(3);
+    append_dendrite_tier(2);
+    append_dendrite_transition(2);
+    append_dendrite_transition(1);
+    append_dendrite_tier(1);
+    append_dendrite_transition(0);
+    append_dendrite_tier(0);
+    if (mesh.shell_polar_cap_dendrite) {
+      const int shell_inner_ring = outward_ring;
+      const double nan = std::numeric_limits<double>::quiet_NaN();
+      for (std::size_t band_index = 0;
+           band_index < layout.shell_chain.size(); ++band_index) {
+        const PolarTierShellBandDescriptor& band =
+            layout.shell_chain[band_index];
+        const PolarTierEntityKind kind =
+            band.kind == PolarTierShellBandKind::SHELL_T21
+                ? PolarTierEntityKind::TRANSITION
+                : PolarTierEntityKind::SHELL;
+        layout.schedule.push_back(PolarTierScheduleEntry{
+            kind,
+            static_cast<int>(band_index),
+            true,
+            shell_inner_ring + band.row_begin,
+            shell_inner_ring + band.row_end,
+            band.cells_per_row_full,
+            nan,
+            nan});
+      }
+      outward_ring += mesh.nr;
+    } else {
+      layout.schedule.push_back(PolarTierScheduleEntry{
+          PolarTierEntityKind::SHELL,
+          -1,
+          false,
+          outward_ring,
+          outward_ring + mesh.nr,
+          mesh.nz,
+          r_match,
+          mesh.spherical_polar_s_max});
+      outward_ring += mesh.nr;
+    }
+
+    const int expected_block_count =
+        (mesh.shell_polar_cap_dendrite
+             ? static_cast<int>(layout.shell_chain.size())
+             : 1) +
+        static_cast<int>(layout.dendrite_actual_tier_columns.size()) +
+        static_cast<int>(layout.dendrite_transition_joins.size()) + 1;
+    if (mesh.shell_polar_cap_dendrite &&
+        expected_block_count !=
+            (mesh.shell_cap_rows_2x == mesh.nr ? 14 : 16)) {
+      throw namelist::ConfigError(
+          "Shell-cap polar-tier dendrite structural block count must be "
+          "14 or 16");
+    }
+    TENRYU_ASSERT(layout.schedule.front().kind ==
+                          PolarTierEntityKind::FAN &&
+                      layout.schedule.back().kind ==
+                          PolarTierEntityKind::SHELL,
+                  "polar-tier dendrite schedule endpoints mismatch");
+    int previous_ring_end = 0;
+    for (std::size_t entity = 1; entity < layout.schedule.size(); ++entity) {
+      const PolarTierScheduleEntry& entry = layout.schedule[entity];
+      TENRYU_ASSERT(entry.ring_begin == previous_ring_end &&
+                        entry.ring_end > entry.ring_begin &&
+                        (entry.in_shell_chain
+                             ? (std::isnan(entry.r_inner) &&
+                                std::isnan(entry.r_outer))
+                             : entry.r_outer > entry.r_inner),
+                    "polar-tier dendrite schedule is not contiguous");
+      previous_ring_end = entry.ring_end;
+    }
+    long long expected_n_cells =
+        mesh.shell_polar_cap_dendrite
+            ? layout.shell_n_cells
+            : static_cast<long long>(mesh.nr) * master_columns;
+    long long expected_n_nodes =
+        mesh.shell_polar_cap_dendrite
+            ? layout.shell_n_nodes
+            : (static_cast<long long>(mesh.nr) + 1LL) *
+                  (static_cast<long long>(master_columns) + 1LL);
+    for (std::size_t tier = 0;
+         tier < layout.dendrite_actual_tier_columns.size(); ++tier) {
+      const long long columns = layout.dendrite_actual_tier_columns[tier];
+      const long long rows = layout.dendrite_tier_radial_rows[tier];
+      expected_n_cells += rows * columns;
+      expected_n_nodes += rows * (columns + 1LL);
+    }
+    expected_n_cells += layout.dendrite_actual_tier_columns.back();
+    expected_n_nodes += 1LL;
+    for (const PolarTierScheduleEntry& entry : layout.schedule) {
+      if (entry.kind != PolarTierEntityKind::TRANSITION ||
+          entry.in_shell_chain) {
+        continue;
+      }
+      const PolarTierEntityCounts transition_counts =
+          polar_tier_schedule_entry_counts(mesh, layout, entry);
+      expected_n_cells += transition_counts.n_cells;
+      expected_n_nodes += transition_counts.n_nodes;
+    }
+    const PolarTierEntityCounts schedule_totals =
+        polar_tier_schedule_totals(mesh, layout);
+    layout.block_count = static_cast<int>(schedule_totals.n_blocks);
+    layout.n_cells = schedule_totals.n_cells;
+    layout.n_nodes = schedule_totals.n_nodes;
+    TENRYU_ASSERT(layout.block_count == expected_block_count &&
+                      layout.block_count ==
+                          static_cast<int>(layout.schedule.size()) &&
+                      layout.n_cells == expected_n_cells &&
+                      layout.n_nodes == expected_n_nodes &&
+                      layout.n_cells > 0 && layout.n_nodes > 0,
+                  "polar-tier dendrite schedule totals mismatch");
+    return layout;
+  }
+
+  const int expected_block_count = 2 * n_tiers + 1;
+  long long expected_n_cells =
+      static_cast<long long>(mesh.nr) * layout.tier_columns.front();
+  long long expected_n_nodes =
+      (static_cast<long long>(mesh.nr) + 1LL) *
+      (static_cast<long long>(layout.tier_columns.front()) + 1LL);
+  for (int tier = 0; tier < n_tiers; ++tier) {
+    const long long n_columns =
+        layout.tier_columns[static_cast<std::size_t>(tier)];
+    const long long n_rows =
+        layout.tier_radial_rows[static_cast<std::size_t>(tier)];
+    expected_n_cells += n_rows * n_columns;
+    expected_n_nodes += n_rows * (n_columns + 1LL);
+    if (tier + 1 < n_tiers) {
+      const long long n_coarse =
+          layout.tier_columns[static_cast<std::size_t>(tier + 1)];
+      if (mesh.polar_tier_belt_rows == 1) {
+        expected_n_cells += 5LL * n_coarse;
+        expected_n_nodes += 2LL * n_coarse + 1LL;
+      } else if (mesh.polar_tier_belt_rows == 2) {
+        expected_n_cells += 5LL * n_coarse;
+        expected_n_nodes += 5LL * n_coarse / 2LL + 2LL;
+      } else {
+        expected_n_cells += 6LL * n_coarse;
+        expected_n_nodes += 4LL * n_coarse + 3LL;
+      }
+    }
+  }
+  expected_n_cells += layout.tier_columns.back();
+  expected_n_nodes += 1LL;
+
+  // Zero deliberately uses the legacy expressions verbatim. This
+  // experiment knob is discontinuous as the fraction approaches zero.
+  if (mesh.polar_tier_belt_thickness_frac != 0.0) {
+    for (int tier = 0; tier + 1 < n_tiers; ++tier) {
+      const std::size_t outer_tier = static_cast<std::size_t>(tier);
+      const std::size_t inner_tier = static_cast<std::size_t>(tier + 1);
+      const double legacy_belt_outer_radius =
+          layout.tier_inner_radii[outer_tier];
+      const double legacy_belt_inner_radius =
+          layout.tier_outer_radii[inner_tier];
+      const double legacy_belt_thickness =
+          legacy_belt_outer_radius - legacy_belt_inner_radius;
+      const double dr_local = layout.tier_radial_spacings[inner_tier];
+      const double belt_thickness =
+          mesh.polar_tier_belt_thickness_frac * dr_local;
+      const double adjacent_row_loss =
+          0.5 * (belt_thickness - legacy_belt_thickness);
+      if (adjacent_row_loss >= layout.tier_radial_spacings[outer_tier] ||
+          adjacent_row_loss >= layout.tier_radial_spacings[inner_tier]) {
+        throw namelist::ConfigError(
+            "Numerics/Mesh polar_tier_belt_thickness_frac leaves a "
+            "non-positive adjacent tier row");
+      }
+      const double legacy_belt_center =
+          0.5 * (legacy_belt_outer_radius + legacy_belt_inner_radius);
+      const double adjusted_belt_outer_radius =
+          legacy_belt_center + 0.5 * belt_thickness;
+      const double adjusted_belt_inner_radius =
+          legacy_belt_center - 0.5 * belt_thickness;
+      layout.transition_radii[outer_tier] = adjusted_belt_outer_radius;
+      layout.tier_inner_radii[outer_tier] = adjusted_belt_outer_radius;
+      layout.tier_outer_radii[inner_tier] = adjusted_belt_inner_radius;
+    }
+  }
+
+  int outward_ring = 0;
+  layout.schedule.push_back(PolarTierScheduleEntry{
+      PolarTierEntityKind::FAN,
+      -1,
+      false,
+      0,
+      0,
+      layout.tier_columns.back(),
+      0.0,
+      layout.fan_radius});
+  for (int tier = n_tiers - 1; tier >= 0; --tier) {
+    const std::size_t tier_index = static_cast<std::size_t>(tier);
+    const int rows = layout.tier_radial_rows[tier_index];
+    layout.schedule.push_back(PolarTierScheduleEntry{
+        PolarTierEntityKind::TIER,
+        tier,
+        false,
+        outward_ring,
+        outward_ring + rows,
+        layout.tier_columns[tier_index],
+        layout.tier_inner_radii[tier_index],
+        layout.tier_outer_radii[tier_index]});
+    outward_ring += rows;
+    if (tier > 0) {
+      const int transition = tier - 1;
+      const std::size_t transition_index =
+          static_cast<std::size_t>(transition);
+      const double transition_inner_radius =
+          mesh.polar_tier_belt_rows > 1
+              ? layout.transition_inner_radii[transition_index]
+              : layout.tier_outer_radii[tier_index];
+      const double transition_outer_radius =
+          mesh.polar_tier_belt_rows > 1
+              ? layout.transition_outer_radii[transition_index]
+              : layout.tier_inner_radii[transition_index];
+      layout.schedule.push_back(PolarTierScheduleEntry{
+          PolarTierEntityKind::TRANSITION,
+          transition,
+          false,
+          outward_ring,
+          outward_ring + mesh.polar_tier_belt_rows,
+          layout.tier_columns[tier_index],
+          transition_inner_radius,
+          transition_outer_radius});
+      outward_ring += mesh.polar_tier_belt_rows;
+    }
+  }
+  layout.schedule.push_back(PolarTierScheduleEntry{
+      PolarTierEntityKind::SHELL,
+      -1,
+      false,
+      outward_ring,
+      outward_ring + mesh.nr,
+      layout.tier_columns.front(),
+      r_match,
+      mesh.spherical_polar_s_max});
+
+  TENRYU_ASSERT(layout.schedule.front().kind ==
+                        PolarTierEntityKind::FAN &&
+                    layout.schedule.back().kind ==
+                        PolarTierEntityKind::SHELL,
+                "polar-tier schedule endpoints mismatch");
+  int previous_ring_end = 0;
+  for (std::size_t entity = 1; entity < layout.schedule.size(); ++entity) {
+    const PolarTierScheduleEntry& entry = layout.schedule[entity];
+    TENRYU_ASSERT(entry.ring_begin == previous_ring_end &&
+                      entry.ring_end > entry.ring_begin &&
+                      entry.r_outer > entry.r_inner,
+                  "polar-tier schedule is not contiguous");
+    previous_ring_end = entry.ring_end;
+  }
+  const PolarTierEntityCounts schedule_totals =
+      polar_tier_schedule_totals(mesh, layout);
+  layout.block_count = static_cast<int>(schedule_totals.n_blocks);
+  layout.n_cells = schedule_totals.n_cells;
+  layout.n_nodes = schedule_totals.n_nodes;
+  TENRYU_ASSERT(layout.block_count == expected_block_count &&
+                    layout.block_count ==
+                        static_cast<int>(layout.schedule.size()) &&
+                    layout.n_cells == expected_n_cells &&
+                    layout.n_nodes == expected_n_nodes,
+                "polar-tier schedule totals mismatch");
+  return layout;
+}
+
+inline PolarTierLayout make_polar_tier_layout_truncated(
+    const Config::MeshConfig& mesh,
+    const int cut_ring,
+    PolarTierTruncation* out_info) {
+  const PolarTierLayout full = make_polar_tier_layout(mesh);
+  const std::size_t n_tiers = full.tier_columns.size();
+  const std::size_t n_belts = n_tiers > 0U ? n_tiers - 1U : 0U;
+  if (n_tiers == 0U || full.tier_radial_rows.size() != n_tiers ||
+      full.tier_outer_radii.size() != n_tiers ||
+      full.tier_inner_radii.size() != n_tiers ||
+      full.tier_radial_spacings.size() != n_tiers ||
+      full.transition_face_indices.size() != n_belts ||
+      full.transition_radii.size() != n_belts ||
+      full.transition_chi_fine.size() != n_belts ||
+      full.transition_chi_coarse.size() != n_belts ||
+      full.schedule.empty() ||
+      full.schedule.front().kind != PolarTierEntityKind::FAN ||
+      full.schedule.back().kind != PolarTierEntityKind::SHELL ||
+      (mesh.polar_tier_belt_rows > 1 &&
+       (full.transition_outer_radii.size() != n_belts ||
+        full.transition_inner_radii.size() != n_belts ||
+        full.transition_intermediate_columns.size() != n_belts ||
+        full.transition_intermediate_radii.size() != n_belts))) {
+    throw namelist::ConfigError(
+        "hybrid truncation requires a valid full multiblock_polar_tier "
+        "layout");
+  }
+
+  const auto shell_begin_it = std::find_if(
+      full.schedule.begin(), full.schedule.end(),
+      [](const PolarTierScheduleEntry& entry) {
+        return entry.in_shell_chain ||
+               entry.kind == PolarTierEntityKind::SHELL;
+      });
+  TENRYU_ASSERT(shell_begin_it != full.schedule.end(),
+                "polar-tier schedule has no shell entry");
+  const int shell_inner_ring = shell_begin_it->ring_begin;
+  std::vector<int> admissible_rings;
+  for (const PolarTierScheduleEntry& tier : full.schedule) {
+    if (tier.kind != PolarTierEntityKind::TIER ||
+        tier.columns % 4 != 0) {
+      continue;
+    }
+    for (int ring = tier.ring_begin + 1; ring < tier.ring_end; ++ring) {
+      if (ring <= 0 || ring >= shell_inner_ring) {
+        continue;
+      }
+      bool away_from_belts = true;
+      for (const PolarTierScheduleEntry& transition : full.schedule) {
+        if (transition.kind != PolarTierEntityKind::TRANSITION ||
+            transition.in_shell_chain) {
+          continue;
+        }
+        const int distance =
+            ring < transition.ring_begin
+                ? transition.ring_begin - ring
+                : (ring > transition.ring_end
+                       ? ring - transition.ring_end
+                       : 0);
+        if (distance < 3) {
+          away_from_belts = false;
+          break;
+        }
+      }
+      if (away_from_belts) {
+        admissible_rings.push_back(ring);
+      }
+    }
+  }
+  std::sort(admissible_rings.begin(), admissible_rings.end());
+
+  const auto admissible_it =
+      std::lower_bound(admissible_rings.begin(), admissible_rings.end(),
+                       cut_ring);
+  if (admissible_it == admissible_rings.end() ||
+      *admissible_it != cut_ring) {
+    std::string nearest;
+    if (admissible_it != admissible_rings.begin()) {
+      nearest = std::to_string(*std::prev(admissible_it));
+    }
+    if (admissible_it != admissible_rings.end()) {
+      if (!nearest.empty()) {
+        nearest += ", ";
+      }
+      nearest += std::to_string(*admissible_it);
+    }
+    if (nearest.empty()) {
+      nearest = "none";
+    }
+    throw namelist::ConfigError(
+        "Mesh.polar_tier_cart_cut_ring=" + std::to_string(cut_ring) +
+        " is not an admissible ordinary structured ring; nearest "
+        "admissible ring(s): " + nearest);
+  }
+
+  const PolarTierScheduleEntry* cut_tier_entry = nullptr;
+  for (const PolarTierScheduleEntry& entry : full.schedule) {
+    if (entry.kind == PolarTierEntityKind::TIER &&
+        cut_ring > entry.ring_begin && cut_ring < entry.ring_end) {
+      cut_tier_entry = &entry;
+      break;
+    }
+  }
+  if (cut_tier_entry == nullptr) {
+    throw namelist::ConfigError(
+        "Mesh.polar_tier_cart_cut_ring does not lie in a structured tier");
+  }
+
+  PolarTierLayout truncated = full;
+  const int kept_cut_tier_rows =
+      cut_tier_entry->ring_end - cut_ring;
+  const int dropped_cut_tier_rows =
+      cut_ring - cut_tier_entry->ring_begin;
+  double r_cut = 0.0;
+  if (mesh.polar_tier_dendrite_enabled) {
+    constexpr std::array<int, 6> tier_radial_indices =
+        {{0, 0, 1, 2, 3, 4}};
+    TENRYU_ASSERT(cut_tier_entry->index >= 0 &&
+                      cut_tier_entry->index <
+                          static_cast<int>(tier_radial_indices.size()),
+                  "dendrite truncation cut tier index mismatch");
+    const int dendrite_tier = cut_tier_entry->index;
+    const int radial_index =
+        tier_radial_indices[static_cast<std::size_t>(dendrite_tier)];
+    int inner_row_offset = 0;
+    if (dendrite_tier == 0) {
+      inner_row_offset = full.dendrite_tier_radial_rows[1] + 1;
+    }
+    r_cut =
+        full.tier_inner_radii[static_cast<std::size_t>(radial_index)] +
+        static_cast<double>(dropped_cut_tier_rows + inner_row_offset) *
+            full.tier_radial_spacings[static_cast<std::size_t>(radial_index)];
+  } else {
+    const std::size_t cut_tier =
+        static_cast<std::size_t>(cut_tier_entry->index);
+    const double ladder_inner_radius =
+        mesh.polar_tier_belt_thickness_frac > 0.0 &&
+                cut_tier + 1U < n_tiers
+            ? mesh.multiblock_cart_core_r_match -
+                  static_cast<double>(
+                      full.transition_face_indices[cut_tier]) *
+                      full.h_r
+            : full.tier_inner_radii[cut_tier];
+    r_cut =
+        ladder_inner_radius +
+        static_cast<double>(dropped_cut_tier_rows) *
+            full.tier_radial_spacings[cut_tier];
+  }
+
+  truncated.schedule.clear();
+  for (const PolarTierScheduleEntry& entry : full.schedule) {
+    if (entry.kind == PolarTierEntityKind::FAN) {
+      continue;
+    }
+    if (entry.in_shell_chain) {
+      truncated.schedule.push_back(entry);
+      continue;
+    }
+    if (entry.kind == PolarTierEntityKind::SHELL) {
+      truncated.schedule.push_back(entry);
+      continue;
+    }
+    if (entry.kind == PolarTierEntityKind::TRANSITION) {
+      if (entry.ring_begin >= cut_ring) {
+        truncated.schedule.push_back(entry);
+      }
+      continue;
+    }
+    if (entry.ring_end <= cut_ring) {
+      continue;
+    }
+    PolarTierScheduleEntry kept_entry = entry;
+    if (entry.ring_begin < cut_ring) {
+      kept_entry.ring_begin = cut_ring;
+      kept_entry.r_inner = r_cut;
+    }
+    truncated.schedule.push_back(kept_entry);
+  }
+
+  const auto resize_base_vectors = [&](const std::size_t kept_tiers,
+                                       const std::size_t kept_belts) {
+    truncated.tier_columns.resize(kept_tiers);
+    truncated.tier_radial_rows.resize(kept_tiers);
+    truncated.tier_outer_radii.resize(kept_tiers);
+    truncated.tier_inner_radii.resize(kept_tiers);
+    truncated.tier_radial_spacings.resize(kept_tiers);
+    truncated.transition_face_indices.resize(kept_belts);
+    truncated.transition_radii.resize(kept_belts);
+    truncated.transition_chi_fine.resize(kept_belts);
+    truncated.transition_chi_coarse.resize(kept_belts);
+    truncated.transition_outer_radii.resize(
+        std::min(kept_belts, truncated.transition_outer_radii.size()));
+    truncated.transition_inner_radii.resize(
+        std::min(kept_belts, truncated.transition_inner_radii.size()));
+    truncated.transition_intermediate_columns.resize(
+        std::min(kept_belts,
+                 truncated.transition_intermediate_columns.size()));
+    truncated.transition_intermediate_radii.resize(
+        std::min(kept_belts,
+                 truncated.transition_intermediate_radii.size()));
+  };
+
+  if (mesh.polar_tier_dendrite_enabled) {
+    constexpr std::array<int, 6> tier_radial_indices =
+        {{0, 0, 1, 2, 3, 4}};
+    constexpr std::array<int, 6> tier_ring_indices =
+        {{0, 1, 3, 4, 5, 6}};
+    const int cut_dendrite_tier = cut_tier_entry->index;
+    const int cut_radial_index =
+        tier_radial_indices[static_cast<std::size_t>(cut_dendrite_tier)];
+    const std::size_t kept_base_tiers =
+        static_cast<std::size_t>(cut_radial_index + 1);
+    const std::size_t kept_base_belts =
+        static_cast<std::size_t>(cut_radial_index);
+    resize_base_vectors(kept_base_tiers, kept_base_belts);
+    int kept_base_cut_tier_rows = kept_cut_tier_rows;
+    if (cut_dendrite_tier == 1) {
+      kept_base_cut_tier_rows =
+          full.dendrite_tier_radial_rows[0] + 1 + kept_cut_tier_rows;
+    } else if (cut_dendrite_tier == 2) {
+      kept_base_cut_tier_rows = 1 + kept_cut_tier_rows;
+    }
+    truncated.tier_radial_rows[static_cast<std::size_t>(cut_radial_index)] =
+        kept_base_cut_tier_rows;
+    truncated.tier_inner_radii[static_cast<std::size_t>(cut_radial_index)] =
+        r_cut;
+
+    const std::size_t kept_dendrite_tiers =
+        static_cast<std::size_t>(cut_dendrite_tier + 1);
+    const std::size_t kept_dendrite_transitions =
+        static_cast<std::size_t>(
+            tier_ring_indices[static_cast<std::size_t>(cut_dendrite_tier)]);
+    truncated.dendrite_native_tier_columns.resize(kept_dendrite_tiers);
+    truncated.dendrite_actual_tier_columns.resize(kept_dendrite_tiers);
+    truncated.dendrite_tier_radial_rows.resize(kept_dendrite_tiers);
+    truncated.dendrite_tier_radial_rows[
+        static_cast<std::size_t>(cut_dendrite_tier)] = kept_cut_tier_rows;
+    truncated.dendrite_transition_joins.resize(
+        kept_dendrite_transitions);
+    truncated.dendrite_master_theta_node_labels.resize(
+        kept_dendrite_transitions + 1U);
+    truncated.dendrite_ring_interval_counts.resize(
+        kept_dendrite_transitions + 1U);
+  } else {
+    const std::size_t cut_tier =
+        static_cast<std::size_t>(cut_tier_entry->index);
+    const std::size_t kept_tiers = cut_tier + 1U;
+    const std::size_t kept_belts = cut_tier;
+    resize_base_vectors(kept_tiers, kept_belts);
+    truncated.tier_radial_rows[cut_tier] = kept_cut_tier_rows;
+    truncated.tier_inner_radii[cut_tier] = r_cut;
+  }
+  truncated.fan_radius = 0.0;
+
+  TENRYU_ASSERT(!truncated.schedule.empty() &&
+                    truncated.schedule.front().ring_begin == cut_ring &&
+                    truncated.schedule.back().kind ==
+                        PolarTierEntityKind::SHELL,
+                "truncated polar-tier schedule endpoints mismatch");
+  int previous_ring_end = cut_ring;
+  for (const PolarTierScheduleEntry& entry : truncated.schedule) {
+    TENRYU_ASSERT(entry.ring_begin == previous_ring_end &&
+                      entry.ring_end > entry.ring_begin,
+                  "truncated polar-tier schedule is not contiguous");
+    previous_ring_end = entry.ring_end;
+  }
+  const PolarTierEntityCounts truncated_totals =
+      polar_tier_schedule_totals(mesh, truncated);
+  truncated.block_count = static_cast<int>(truncated_totals.n_blocks);
+  truncated.n_cells = truncated_totals.n_cells;
+  truncated.n_nodes = truncated_totals.n_nodes;
+  TENRYU_ASSERT(truncated.block_count ==
+                    static_cast<int>(truncated.schedule.size()),
+                "truncated polar-tier schedule block count mismatch");
+
+  if (out_info != nullptr) {
+    *out_info = PolarTierTruncation{
+        cut_ring,
+        cut_tier_entry->columns,
+        r_cut,
+        full.n_cells - truncated.n_cells,
+        full.n_nodes - truncated.n_nodes,
+        static_cast<long long>(full.block_count - truncated.block_count)};
+  }
+  return truncated;
+}
 
 }  // namespace tenryu::core

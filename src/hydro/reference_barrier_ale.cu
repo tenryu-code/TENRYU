@@ -1,6 +1,7 @@
 #include "hydro/reference_barrier_ale.hpp"
 
 #include <algorithm>
+#include <cfloat>
 #include <cmath>
 #include <cstdint>
 #include <iomanip>
@@ -10,15 +11,20 @@
 
 #include <cuda_runtime.h>
 
+#include "core/device_scratch.hpp"
 #include "core/error.hpp"
 #include "hydro/ale_remap.cuh"
 #include "hydro/ale_remap_2d_rz.hpp"
 #include "hydro/ale_scaled_reference.cuh"
+#include "hydro/anti_hourglass.cuh"
 #include "hydro/boundary_2d.hpp"
+#include "hydro/button_morph_indexing.hpp"
 #include "hydro/core_freeze_ale.cuh"
 #include "hydro/mesh_motion_trace.hpp"
 #include "hydro/pole_axis_constraints.cuh"
+#include "hydro/rz_corner_mass.cuh"
 #include "mesh/mesh.hpp"
+#include "mesh/multiblock_theta_ladder.hpp"
 
 namespace tenryu::hydro {
 namespace {
@@ -58,11 +64,16 @@ int node_index(const int i, const int j, const int nz) {
   return i * (nz + 1) + j;
 }
 
-double cross2(const double ar, const double az, const double br, const double bz) {
+__host__ __device__ double cross2(const double ar,
+                                  const double az,
+                                  const double br,
+                                  const double bz) {
   return ar * bz - az * br;
 }
 
-void corner_jacobians(const double* r, const double* z, double* j) {
+__host__ __device__ void corner_jacobians(const double* r,
+                                          const double* z,
+                                          double* j) {
   j[0] = cross2(r[1] - r[0], z[1] - z[0], r[3] - r[0], z[3] - z[0]);
   j[1] = cross2(r[1] - r[0], z[1] - z[0], r[2] - r[1], z[2] - z[1]);
   j[2] = cross2(r[2] - r[3], z[2] - z[3], r[2] - r[1], z[2] - z[1]);
@@ -299,6 +310,959 @@ double compute_corner_j_ratio_min_host(const tenryu::core::State& state) {
   return out;
 }
 
+struct QuadAdmissibilityTableValues {
+  double planar_area;
+  double rz_volume;
+  double corner_j[4];
+  double edge_center_area[4];
+  double bbsw_corner_area[4];
+  double tau_a;
+  double tau_v;
+  bool scales_valid;
+};
+
+__device__ QuadAdmissibilityTableValues evaluate_quad_admissibility_table(
+    const double* r_old,
+    const double* z_old,
+    const double* r,
+    const double* z) {
+  QuadAdmissibilityTableValues values{};
+  const double old_area2 = rz::rz_polygon_area2_exact(r_old, z_old, 4);
+  const double orientation_sign = old_area2 > 0.0 ? 1.0 : -1.0;
+
+  double length_scale = 0.0;
+  double r_max = 0.0;
+  for (int k = 0; k < 4; ++k) {
+    length_scale = fmax(length_scale, fmax(fabs(r[k]), fabs(z[k])));
+    r_max = fmax(r_max, fabs(r[k]));
+  }
+  values.tau_a = 64.0 * DBL_EPSILON * length_scale * length_scale;
+  values.tau_v = values.tau_a * r_max;
+  values.scales_valid = rz::finite_double(old_area2) && old_area2 != 0.0 &&
+                        rz::finite_double(values.tau_a) &&
+                        rz::finite_double(values.tau_v);
+
+  values.planar_area =
+      0.5 * orientation_sign * rz::rz_polygon_area2_exact(r, z, 4);
+  values.rz_volume =
+      orientation_sign * rz::rz_polygon_volume_exact(r, z, 4);
+
+  corner_jacobians(r, z, values.corner_j);
+  for (int k = 0; k < 4; ++k) {
+    values.corner_j[k] *= orientation_sign;
+  }
+
+  const double centroid_r = 0.25 * (r[0] + r[1] + r[2] + r[3]);
+  const double centroid_z = 0.25 * (z[0] + z[1] + z[2] + z[3]);
+  for (int k = 0; k < 4; ++k) {
+    const int kp1 = (k + 1) & 3;
+    values.edge_center_area[k] =
+        0.5 * orientation_sign *
+        cross2(r[kp1] - r[k], z[kp1] - z[k],
+               centroid_r - r[k], centroid_z - z[k]);
+  }
+
+  // Contract (A124(b) census follow-up; ruling 2026-08-17): this compare
+  // metric keeps the legacy bbsw-radial corner-area basis on BOTH sides of
+  // the candidate-vs-baseline comparison — the basis choice cancels in the
+  // metric's intended use, and re-basing would silently move recorded
+  // rollback audit values. Deliberately NOT wired to
+  // corner_mass_convention (same frozen shelf as the P-C CFL node mass).
+  const double a12 = values.edge_center_area[0];
+  const double a23 = values.edge_center_area[1];
+  const double a34 = values.edge_center_area[2];
+  const double a41 = values.edge_center_area[3];
+  values.bbsw_corner_area[0] =
+      (5.0 * a41 + 5.0 * a12 + a23 + a34) / 12.0;
+  values.bbsw_corner_area[1] =
+      (a41 + 5.0 * a12 + 5.0 * a23 + a34) / 12.0;
+  values.bbsw_corner_area[2] =
+      (a41 + a12 + 5.0 * a23 + 5.0 * a34) / 12.0;
+  values.bbsw_corner_area[3] =
+      (5.0 * a41 + a12 + a23 + 5.0 * a34) / 12.0;
+  return values;
+}
+
+__device__ bool admissibility_quantity_passes_relative(
+    const double candidate,
+    const double baseline,
+    const double tau) {
+  // Immaterial relative drift on already-violated quantities passes; real
+  // degradation still rejects; bounded cumulative drift is ~1e-6 per event.
+  return rz::finite_double(candidate) &&
+         ((candidate > -tau) ||
+          (candidate >= baseline - fmax(tau, 1.0e-6 * fabs(baseline))));
+}
+
+__device__ bool quad_candidate_passes_admissibility_table(
+    const QuadAdmissibilityTableValues& baseline,
+    const QuadAdmissibilityTableValues& candidate) {
+  if (!candidate.scales_valid ||
+      !admissibility_quantity_passes_relative(
+          candidate.planar_area, baseline.planar_area, candidate.tau_a) ||
+      !admissibility_quantity_passes_relative(
+          candidate.rz_volume, baseline.rz_volume, candidate.tau_v)) {
+    return false;
+  }
+  // This lets the controller improve or work around pre-existing degenerate
+  // slivers instead of deadlocking; crossing the band from healthy to
+  // inadmissible still rejects.
+  for (int k = 0; k < 4; ++k) {
+    if (!admissibility_quantity_passes_relative(
+            candidate.corner_j[k], baseline.corner_j[k], candidate.tau_a) ||
+        !admissibility_quantity_passes_relative(
+            candidate.edge_center_area[k], baseline.edge_center_area[k],
+            candidate.tau_a) ||
+        !admissibility_quantity_passes_relative(
+            candidate.bbsw_corner_area[k], baseline.bbsw_corner_area[k],
+            candidate.tau_a)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+void log_runtime_ale_admissibility_dump(
+    const int cell,
+    const QuadAdmissibilityTableValues& baseline,
+    const QuadAdmissibilityTableValues& candidate) {
+  std::ostringstream oss;
+  oss << std::scientific << std::setprecision(6)
+      << "[runtime-ale-admiss-dump] cell=" << cell;
+  const auto append_quantity = [&oss](const char* name,
+                                      const double baseline_value,
+                                      const double candidate_value,
+                                      const double tau) {
+    oss << " " << name << "=" << baseline_value << "/" << candidate_value
+        << "/" << tau;
+  };
+  append_quantity("A_z", baseline.planar_area, candidate.planar_area,
+                  candidate.tau_a);
+  append_quantity("V_z", baseline.rz_volume, candidate.rz_volume,
+                  candidate.tau_v);
+  for (int k = 0; k < 4; ++k) {
+    const std::string suffix = std::to_string(k);
+    append_quantity(("J_c" + suffix).c_str(), baseline.corner_j[k],
+                    candidate.corner_j[k], candidate.tau_a);
+  }
+  constexpr const char* edge_names[4] = {"A_12", "A_23", "A_34", "A_41"};
+  for (int k = 0; k < 4; ++k) {
+    append_quantity(edge_names[k], baseline.edge_center_area[k],
+                    candidate.edge_center_area[k], candidate.tau_a);
+  }
+  for (int k = 0; k < 4; ++k) {
+    const std::string suffix = std::to_string(k);
+    append_quantity(("Abbsw" + suffix).c_str(), baseline.bbsw_corner_area[k],
+                    candidate.bbsw_corner_area[k], candidate.tau_a);
+  }
+  core::log_info(oss.str());
+}
+
+bool admissibility_quantity_passes_relative_host(const double candidate,
+                                                  const double baseline,
+                                                  const double tau) {
+  // The commit gate rejects catastrophic next-step worsening (healthy sign
+  // flips or order-of-magnitude collapses), not sub-percent Lagrangian drift.
+  return std::isfinite(candidate) &&
+         ((candidate > -tau) ||
+          (candidate >=
+           baseline - std::max(tau, 0.10 * std::abs(baseline))));
+}
+
+struct CommitGateFailure {
+  int cell = std::numeric_limits<int>::max();
+  int corner = -1;
+  const char* quantity = nullptr;
+  double baseline = 0.0;
+  double predicted = 0.0;
+  double tau = 0.0;
+  double dt_predict = 0.0;
+};
+
+struct RuntimeAleRollbackField {
+  double* data = nullptr;
+  std::size_t size = 0;
+  bool captured = false;
+};
+
+template <typename Field>
+RuntimeAleRollbackField capture_runtime_ale_device_field(
+    const Field& field,
+    const char* const tag,
+    const char* const error_message) {
+  RuntimeAleRollbackField snapshot;
+  snapshot.size = field.size();
+  snapshot.captured = true;
+  if (snapshot.size == 0U) {
+    return snapshot;
+  }
+  const std::size_t bytes = snapshot.size * sizeof(double);
+  snapshot.data = static_cast<double*>(
+      core::device_scratch_acquire(tag, bytes));
+  cuda_check(cudaMemcpy(snapshot.data, field.data(), bytes,
+                        cudaMemcpyDeviceToDevice),
+             error_message);
+  return snapshot;
+}
+
+RuntimeAleRollbackField capture_runtime_ale_host_field(
+    const std::vector<double>& field,
+    const char* const tag,
+    const char* const error_message) {
+  RuntimeAleRollbackField snapshot;
+  snapshot.size = field.size();
+  snapshot.captured = true;
+  if (snapshot.size == 0U) {
+    return snapshot;
+  }
+  const std::size_t bytes = snapshot.size * sizeof(double);
+  snapshot.data = static_cast<double*>(
+      core::device_scratch_acquire(tag, bytes));
+  cuda_check(cudaMemcpy(snapshot.data, field.data(), bytes,
+                        cudaMemcpyHostToDevice),
+             error_message);
+  return snapshot;
+}
+
+template <typename Field>
+void restore_runtime_ale_device_field(
+    const RuntimeAleRollbackField& snapshot,
+    Field& field,
+    const char* const error_message) {
+  if (!snapshot.captured) {
+    return;
+  }
+  if (field.size() != snapshot.size) {
+    field.reset(snapshot.size);
+  }
+  if (snapshot.size == 0U) {
+    return;
+  }
+  cuda_check(cudaMemcpy(field.data(), snapshot.data,
+                        snapshot.size * sizeof(double),
+                        cudaMemcpyDeviceToDevice),
+             error_message);
+}
+
+void restore_runtime_ale_host_field(
+    const RuntimeAleRollbackField& snapshot,
+    std::vector<double>& field,
+    const char* const error_message) {
+  if (!snapshot.captured) {
+    return;
+  }
+  field.resize(snapshot.size);
+  if (snapshot.size == 0U) {
+    return;
+  }
+  cuda_check(cudaMemcpy(field.data(), snapshot.data,
+                        snapshot.size * sizeof(double),
+                        cudaMemcpyDeviceToHost),
+             error_message);
+}
+
+struct RuntimeAleRollbackSnapshot {
+  RuntimeAleRollbackField x_r;
+  RuntimeAleRollbackField x_z;
+  RuntimeAleRollbackField x_r_reference;
+  RuntimeAleRollbackField x_z_reference;
+  RuntimeAleRollbackField vol;
+  RuntimeAleRollbackField cell_vol_initial;
+  RuntimeAleRollbackField rho;
+  RuntimeAleRollbackField mass;
+  RuntimeAleRollbackField ee;
+  RuntimeAleRollbackField ei;
+  RuntimeAleRollbackField Te;
+  RuntimeAleRollbackField Ti;
+  RuntimeAleRollbackField Pe;
+  RuntimeAleRollbackField Pi;
+  RuntimeAleRollbackField zbar;
+  RuntimeAleRollbackField Qvisc;
+  RuntimeAleRollbackField v_r;
+  RuntimeAleRollbackField v_z;
+  RuntimeAleRollbackField hllc_mom_z_cell;
+  RuntimeAleRollbackField volFrac;
+  RuntimeAleRollbackField mass_per_material;
+  RuntimeAleRollbackField Ee_per_material;
+  RuntimeAleRollbackField Ei_per_material;
+  RuntimeAleRollbackField rad_E;
+  RuntimeAleRollbackField gas_tracer_Y;
+  RuntimeAleRollbackField burn_Ng;
+  RuntimeAleRollbackField burn_n_host;
+  RuntimeAleRollbackField hot_e_eps_cum_host;
+  RuntimeAleRollbackField burn_eps_cum_host;
+  RuntimeAleRollbackField corner_mass;
+  RuntimeAleRollbackField corner_volume;
+  RuntimeAleRollbackField subzonal_mass_corner0;
+  RuntimeAleRollbackField subzonal_mass_corner1;
+  RuntimeAleRollbackField subzonal_mass_corner2;
+  RuntimeAleRollbackField subzonal_mass_corner3;
+  RuntimeAleRollbackField vol_prev_hydro;
+  bool corner_mass_initialized = false;
+  bool corner_mass_is_lagrangian_invariant = false;
+  bool hllc_mom_z_cell_initialized = false;
+  bool holo_ale_invalidated = false;
+  int ale_remaps_applied = 0;
+  bool captured = false;
+
+  void capture(tenryu::core::State& state,
+               const tenryu::core::Config& cfg,
+               const bool is_multiblock,
+               const int n_cells) {
+    x_r = capture_runtime_ale_device_field(
+        state.x_r, "runtime_ale:rollback:x_r",
+        "runtime ALE rollback x_r snapshot failed");
+    x_z = capture_runtime_ale_device_field(
+        state.x_z, "runtime_ale:rollback:x_z",
+        "runtime ALE rollback x_z snapshot failed");
+    x_r_reference = capture_runtime_ale_device_field(
+        state.x_r_reference, "runtime_ale:rollback:x_r_reference",
+        "runtime ALE rollback x_r_reference snapshot failed");
+    x_z_reference = capture_runtime_ale_device_field(
+        state.x_z_reference, "runtime_ale:rollback:x_z_reference",
+        "runtime ALE rollback x_z_reference snapshot failed");
+    vol = capture_runtime_ale_device_field(
+        state.vol, "runtime_ale:rollback:vol",
+        "runtime ALE rollback vol snapshot failed");
+    cell_vol_initial = capture_runtime_ale_device_field(
+        state.cell_vol_initial, "runtime_ale:rollback:cell_vol_initial",
+        "runtime ALE rollback cell_vol_initial snapshot failed");
+    rho = capture_runtime_ale_device_field(
+        state.rho, "runtime_ale:rollback:rho",
+        "runtime ALE rollback rho snapshot failed");
+    mass = capture_runtime_ale_device_field(
+        state.mass, "runtime_ale:rollback:mass",
+        "runtime ALE rollback mass snapshot failed");
+    ee = capture_runtime_ale_device_field(
+        state.ee, "runtime_ale:rollback:ee",
+        "runtime ALE rollback ee snapshot failed");
+    ei = capture_runtime_ale_device_field(
+        state.ei, "runtime_ale:rollback:ei",
+        "runtime ALE rollback ei snapshot failed");
+    Te = capture_runtime_ale_device_field(
+        state.Te, "runtime_ale:rollback:Te",
+        "runtime ALE rollback Te snapshot failed");
+    Ti = capture_runtime_ale_device_field(
+        state.Ti, "runtime_ale:rollback:Ti",
+        "runtime ALE rollback Ti snapshot failed");
+    Pe = capture_runtime_ale_device_field(
+        state.Pe, "runtime_ale:rollback:Pe",
+        "runtime ALE rollback Pe snapshot failed");
+    Pi = capture_runtime_ale_device_field(
+        state.Pi, "runtime_ale:rollback:Pi",
+        "runtime ALE rollback Pi snapshot failed");
+    zbar = capture_runtime_ale_device_field(
+        state.zbar, "runtime_ale:rollback:zbar",
+        "runtime ALE rollback zbar snapshot failed");
+    Qvisc = capture_runtime_ale_device_field(
+        state.Qvisc, "runtime_ale:rollback:Qvisc",
+        "runtime ALE rollback Qvisc snapshot failed");
+    v_r = capture_runtime_ale_device_field(
+        state.v_r, "runtime_ale:rollback:v_r",
+        "runtime ALE rollback v_r snapshot failed");
+    v_z = capture_runtime_ale_device_field(
+        state.v_z, "runtime_ale:rollback:v_z",
+        "runtime ALE rollback v_z snapshot failed");
+    hllc_mom_z_cell = capture_runtime_ale_device_field(
+        state.hllc_mom_z_cell, "runtime_ale:rollback:hllc_mom_z_cell",
+        "runtime ALE rollback hllc_mom_z_cell snapshot failed");
+    volFrac = capture_runtime_ale_device_field(
+        state.volFrac, "runtime_ale:rollback:volFrac",
+        "runtime ALE rollback volFrac snapshot failed");
+    mass_per_material = capture_runtime_ale_device_field(
+        state.mass_per_material, "runtime_ale:rollback:mass_per_material",
+        "runtime ALE rollback mass_per_material snapshot failed");
+    Ee_per_material = capture_runtime_ale_device_field(
+        state.Ee_per_material, "runtime_ale:rollback:Ee_per_material",
+        "runtime ALE rollback Ee_per_material snapshot failed");
+    Ei_per_material = capture_runtime_ale_device_field(
+        state.Ei_per_material, "runtime_ale:rollback:Ei_per_material",
+        "runtime ALE rollback Ei_per_material snapshot failed");
+    const int n_groups = std::max(cfg.radiation.groups, 1);
+    const std::size_t expected_rad_size =
+        static_cast<std::size_t>(n_cells) *
+        static_cast<std::size_t>(n_groups);
+    const bool remap_radiation =
+        state.rad_E.size() == expected_rad_size &&
+        (!is_multiblock ||
+         cfg.numerics.ale.conservative_remap_radiation_enabled);
+    if (remap_radiation) {
+      rad_E = capture_runtime_ale_device_field(
+          state.rad_E, "runtime_ale:rollback:rad_E",
+          "runtime ALE rollback rad_E snapshot failed");
+    }
+    gas_tracer_Y = capture_runtime_ale_device_field(
+        state.gas_tracer_Y, "runtime_ale:rollback:gas_tracer_Y",
+        "runtime ALE rollback gas_tracer_Y snapshot failed");
+    burn_Ng = capture_runtime_ale_device_field(
+        state.burn_Ng, "runtime_ale:rollback:burn_Ng",
+        "runtime ALE rollback burn_Ng snapshot failed");
+    burn_n_host = capture_runtime_ale_host_field(
+        state.burn_n_host, "runtime_ale:rollback:burn_n_host",
+        "runtime ALE rollback burn_n_host snapshot failed");
+    hot_e_eps_cum_host = capture_runtime_ale_host_field(
+        state.hot_e_eps_cum_host,
+        "runtime_ale:rollback:hot_e_eps_cum_host",
+        "runtime ALE rollback hot_e_eps_cum_host snapshot failed");
+    burn_eps_cum_host = capture_runtime_ale_host_field(
+        state.burn_eps_cum_host,
+        "runtime_ale:rollback:burn_eps_cum_host",
+        "runtime ALE rollback burn_eps_cum_host snapshot failed");
+    corner_mass = capture_runtime_ale_device_field(
+        state.corner_mass, "runtime_ale:rollback:corner_mass",
+        "runtime ALE rollback corner_mass snapshot failed");
+    corner_volume = capture_runtime_ale_device_field(
+        state.corner_volume, "runtime_ale:rollback:corner_volume",
+        "runtime ALE rollback corner_volume snapshot failed");
+    subzonal_mass_corner0 = capture_runtime_ale_device_field(
+        state.subzonal_mass_corner0,
+        "runtime_ale:rollback:subzonal_mass_corner0",
+        "runtime ALE rollback subzonal_mass_corner0 snapshot failed");
+    subzonal_mass_corner1 = capture_runtime_ale_device_field(
+        state.subzonal_mass_corner1,
+        "runtime_ale:rollback:subzonal_mass_corner1",
+        "runtime ALE rollback subzonal_mass_corner1 snapshot failed");
+    subzonal_mass_corner2 = capture_runtime_ale_device_field(
+        state.subzonal_mass_corner2,
+        "runtime_ale:rollback:subzonal_mass_corner2",
+        "runtime ALE rollback subzonal_mass_corner2 snapshot failed");
+    subzonal_mass_corner3 = capture_runtime_ale_device_field(
+        state.subzonal_mass_corner3,
+        "runtime_ale:rollback:subzonal_mass_corner3",
+        "runtime ALE rollback subzonal_mass_corner3 snapshot failed");
+    vol_prev_hydro = capture_runtime_ale_device_field(
+        state.vol_prev_hydro, "runtime_ale:rollback:vol_prev_hydro",
+        "runtime ALE rollback vol_prev_hydro snapshot failed");
+    corner_mass_initialized = state.corner_mass_initialized;
+    corner_mass_is_lagrangian_invariant =
+        state.corner_mass_is_lagrangian_invariant;
+    hllc_mom_z_cell_initialized = state.hllc_mom_z_cell_initialized;
+    holo_ale_invalidated = state.holo_ale_invalidated;
+    ale_remaps_applied = state.ale_remaps_applied;
+    captured = true;
+  }
+
+  void restore(tenryu::core::State& state) const {
+    TENRYU_ASSERT(captured, "runtime ALE rollback snapshot was not captured");
+    restore_runtime_ale_device_field(
+        x_r, state.x_r, "runtime ALE rollback x_r restore failed");
+    restore_runtime_ale_device_field(
+        x_z, state.x_z, "runtime ALE rollback x_z restore failed");
+    restore_runtime_ale_device_field(
+        x_r_reference, state.x_r_reference,
+        "runtime ALE rollback x_r_reference restore failed");
+    restore_runtime_ale_device_field(
+        x_z_reference, state.x_z_reference,
+        "runtime ALE rollback x_z_reference restore failed");
+    restore_runtime_ale_device_field(
+        vol, state.vol, "runtime ALE rollback vol restore failed");
+    restore_runtime_ale_device_field(
+        cell_vol_initial, state.cell_vol_initial,
+        "runtime ALE rollback cell_vol_initial restore failed");
+    restore_runtime_ale_device_field(
+        rho, state.rho, "runtime ALE rollback rho restore failed");
+    restore_runtime_ale_device_field(
+        mass, state.mass, "runtime ALE rollback mass restore failed");
+    restore_runtime_ale_device_field(
+        ee, state.ee, "runtime ALE rollback ee restore failed");
+    restore_runtime_ale_device_field(
+        ei, state.ei, "runtime ALE rollback ei restore failed");
+    restore_runtime_ale_device_field(
+        Te, state.Te, "runtime ALE rollback Te restore failed");
+    restore_runtime_ale_device_field(
+        Ti, state.Ti, "runtime ALE rollback Ti restore failed");
+    restore_runtime_ale_device_field(
+        Pe, state.Pe, "runtime ALE rollback Pe restore failed");
+    restore_runtime_ale_device_field(
+        Pi, state.Pi, "runtime ALE rollback Pi restore failed");
+    restore_runtime_ale_device_field(
+        zbar, state.zbar, "runtime ALE rollback zbar restore failed");
+    restore_runtime_ale_device_field(
+        Qvisc, state.Qvisc, "runtime ALE rollback Qvisc restore failed");
+    restore_runtime_ale_device_field(
+        v_r, state.v_r, "runtime ALE rollback v_r restore failed");
+    restore_runtime_ale_device_field(
+        v_z, state.v_z, "runtime ALE rollback v_z restore failed");
+    restore_runtime_ale_device_field(
+        hllc_mom_z_cell, state.hllc_mom_z_cell,
+        "runtime ALE rollback hllc_mom_z_cell restore failed");
+    restore_runtime_ale_device_field(
+        volFrac, state.volFrac,
+        "runtime ALE rollback volFrac restore failed");
+    restore_runtime_ale_device_field(
+        mass_per_material, state.mass_per_material,
+        "runtime ALE rollback mass_per_material restore failed");
+    restore_runtime_ale_device_field(
+        Ee_per_material, state.Ee_per_material,
+        "runtime ALE rollback Ee_per_material restore failed");
+    restore_runtime_ale_device_field(
+        Ei_per_material, state.Ei_per_material,
+        "runtime ALE rollback Ei_per_material restore failed");
+    restore_runtime_ale_device_field(
+        rad_E, state.rad_E, "runtime ALE rollback rad_E restore failed");
+    restore_runtime_ale_device_field(
+        gas_tracer_Y, state.gas_tracer_Y,
+        "runtime ALE rollback gas_tracer_Y restore failed");
+    restore_runtime_ale_device_field(
+        burn_Ng, state.burn_Ng,
+        "runtime ALE rollback burn_Ng restore failed");
+    restore_runtime_ale_host_field(
+        burn_n_host, state.burn_n_host,
+        "runtime ALE rollback burn_n_host restore failed");
+    restore_runtime_ale_host_field(
+        hot_e_eps_cum_host, state.hot_e_eps_cum_host,
+        "runtime ALE rollback hot_e_eps_cum_host restore failed");
+    restore_runtime_ale_host_field(
+        burn_eps_cum_host, state.burn_eps_cum_host,
+        "runtime ALE rollback burn_eps_cum_host restore failed");
+    restore_runtime_ale_device_field(
+        corner_mass, state.corner_mass,
+        "runtime ALE rollback corner_mass restore failed");
+    restore_runtime_ale_device_field(
+        corner_volume, state.corner_volume,
+        "runtime ALE rollback corner_volume restore failed");
+    restore_runtime_ale_device_field(
+        subzonal_mass_corner0, state.subzonal_mass_corner0,
+        "runtime ALE rollback subzonal_mass_corner0 restore failed");
+    restore_runtime_ale_device_field(
+        subzonal_mass_corner1, state.subzonal_mass_corner1,
+        "runtime ALE rollback subzonal_mass_corner1 restore failed");
+    restore_runtime_ale_device_field(
+        subzonal_mass_corner2, state.subzonal_mass_corner2,
+        "runtime ALE rollback subzonal_mass_corner2 restore failed");
+    restore_runtime_ale_device_field(
+        subzonal_mass_corner3, state.subzonal_mass_corner3,
+        "runtime ALE rollback subzonal_mass_corner3 restore failed");
+    restore_runtime_ale_device_field(
+        vol_prev_hydro, state.vol_prev_hydro,
+        "runtime ALE rollback vol_prev_hydro restore failed");
+    state.corner_mass_initialized = corner_mass_initialized;
+    state.corner_mass_is_lagrangian_invariant =
+        corner_mass_is_lagrangian_invariant;
+    state.hllc_mom_z_cell_initialized = hllc_mom_z_cell_initialized;
+    state.holo_ale_invalidated = holo_ale_invalidated;
+    state.ale_remaps_applied = ale_remaps_applied;
+  }
+};
+
+int runtime_cap_boundary_node_id(
+    const button_morph::ButtonIndexing& idx,
+    const int k) {
+  if (k <= idx.n_c) {
+    return button_morph::core_node_id(idx, k, 2 * idx.n_c);
+  }
+  if (k <= 3 * idx.n_c) {
+    return button_morph::core_node_id(idx, idx.n_c, 3 * idx.n_c - k);
+  }
+  return button_morph::core_node_id(idx, 4 * idx.n_c - k, 0);
+}
+
+int runtime_cap_chain_node_id(const button_morph::ButtonIndexing& idx,
+                              const int row,
+                              const int k) {
+  if (row == 0) {
+    return runtime_cap_boundary_node_id(idx, k);
+  }
+  if (row < idx.n_b) {
+    return button_morph::bridge_interior_node_id(idx, row, k);
+  }
+  return button_morph::shell_node_id(idx, row - idx.n_b, k);
+}
+
+int runtime_cap_chain_cell_id(const button_morph::ButtonIndexing& idx,
+                              const int row,
+                              const int column) {
+  if (row < idx.n_b) {
+    return idx.bridge_cell_offset + row * idx.ntheta + column;
+  }
+  return idx.shell_cell_offset + (row - idx.n_b) * idx.ntheta + column;
+}
+
+void note_commit_gate_failure(const int cell,
+                              const int corner,
+                              const char* const quantity,
+                              const double baseline,
+                              const double predicted,
+                              const double tau,
+                              CommitGateFailure* const failure) {
+  if (cell >= failure->cell) {
+    return;
+  }
+  failure->cell = cell;
+  failure->corner = corner;
+  failure->quantity = quantity;
+  failure->baseline = baseline;
+  failure->predicted = predicted;
+  failure->tau = tau;
+}
+
+CommitGateFailure evaluate_runtime_ale_commit_gate(
+    const tenryu::core::State& state,
+    const tenryu::core::Config& cfg,
+    const ReferenceBarrierScope& scope) {
+  CommitGateFailure failure;
+  if (!scope.runtime_ale || !state.mesh.topo.multiblock.has_value()) {
+    return failure;
+  }
+  const int n_nodes = state.mesh.topo.n_nodes;
+  const int n_cells = state.mesh.topo.n_cells;
+  const auto& mb = *state.mesh.topo.multiblock;
+  TENRYU_ASSERT(mb.cell_node_csr_offsets.size() ==
+                    static_cast<std::size_t>(n_cells) + 1U,
+                "runtime ALE commit gate requires CSR offsets");
+  TENRYU_ASSERT(state.v_r.size() == static_cast<std::size_t>(n_nodes) &&
+                    state.v_z.size() == static_cast<std::size_t>(n_nodes),
+                "runtime ALE commit gate velocity size mismatch");
+
+  double dt_predict = state.dt;
+  if (!(std::isfinite(dt_predict) && dt_predict > 0.0)) {
+    dt_predict = cfg.numerics.dt.max_s;
+  }
+  if (!(std::isfinite(dt_predict) && dt_predict > 0.0)) {
+    return failure;
+  }
+
+  std::vector<double> current_r;
+  std::vector<double> current_z;
+  std::vector<double> velocity_r;
+  std::vector<double> velocity_z;
+  state.x_r.copy_to_host(current_r);
+  state.x_z.copy_to_host(current_z);
+  state.v_r.copy_to_host(velocity_r);
+  state.v_z.copy_to_host(velocity_z);
+  std::vector<double> predicted_r(static_cast<std::size_t>(n_nodes), 0.0);
+  std::vector<double> predicted_z(static_cast<std::size_t>(n_nodes), 0.0);
+  for (int node = 0; node < n_nodes; ++node) {
+    const std::size_t n = static_cast<std::size_t>(node);
+    predicted_r[n] = current_r[n] + dt_predict * velocity_r[n];
+    predicted_z[n] = current_z[n] + dt_predict * velocity_z[n];
+  }
+
+  std::vector<std::uint8_t> active_cell(
+      static_cast<std::size_t>(n_cells), 1U);
+  if (scope.d_active_cell_mask != nullptr) {
+    cuda_check(cudaMemcpy(active_cell.data(), scope.d_active_cell_mask,
+                          active_cell.size() * sizeof(std::uint8_t),
+                          cudaMemcpyDeviceToHost),
+               "runtime ALE commit gate active-cell copy failed");
+  }
+
+  for (int cell = 0; cell < n_cells; ++cell) {
+    if (active_cell[static_cast<std::size_t>(cell)] == 0U) {
+      continue;
+    }
+    const int begin = mb.cell_node_csr_offsets[static_cast<std::size_t>(cell)];
+    const int nverts = state_cell_active_nverts(state, cell, n_cells);
+    if (nverts != 3 && nverts != 4) {
+      continue;
+    }
+    double r_current[4]{};
+    double z_current[4]{};
+    double r_predicted[4]{};
+    double z_predicted[4]{};
+    double length_scale = 0.0;
+    double r_max = 0.0;
+    for (int corner = 0; corner < nverts; ++corner) {
+      const int node = mb.cell_node_csr_indices[
+          static_cast<std::size_t>(begin + corner)];
+      const std::size_t n = static_cast<std::size_t>(node);
+      r_current[corner] = current_r[n];
+      z_current[corner] = current_z[n];
+      r_predicted[corner] = predicted_r[n];
+      z_predicted[corner] = predicted_z[n];
+      length_scale =
+          std::max(length_scale,
+                   std::max(std::abs(r_predicted[corner]),
+                            std::abs(z_predicted[corner])));
+      r_max = std::max(r_max, std::abs(r_predicted[corner]));
+    }
+    const double area2_current =
+        rz::rz_polygon_area2_exact(r_current, z_current, nverts);
+    const double orientation = area2_current > 0.0 ? 1.0 : -1.0;
+    const double tau_a = 64.0 * std::numeric_limits<double>::epsilon() *
+                         length_scale * length_scale;
+    const double tau_v = tau_a * r_max;
+
+    double j_current[4]{};
+    double j_predicted[4]{};
+    if (nverts == 3) {
+      triangle_corner_jacobians(r_current, z_current, j_current);
+      triangle_corner_jacobians(r_predicted, z_predicted, j_predicted);
+    } else {
+      corner_jacobians(r_current, z_current, j_current);
+      corner_jacobians(r_predicted, z_predicted, j_predicted);
+    }
+    for (int corner = 0; corner < nverts; ++corner) {
+      const double baseline = orientation * j_current[corner];
+      const double predicted = orientation * j_predicted[corner];
+      if (!admissibility_quantity_passes_relative_host(
+              predicted, baseline, tau_a)) {
+        note_commit_gate_failure(cell, corner, "corner_J", baseline,
+                                 predicted, tau_a, &failure);
+        break;
+      }
+    }
+
+    const double volume_current =
+        orientation *
+        rz::rz_polygon_volume_exact(r_current, z_current, nverts);
+    const double volume_predicted =
+        orientation *
+        rz::rz_polygon_volume_exact(r_predicted, z_predicted, nverts);
+    if (!admissibility_quantity_passes_relative_host(
+            volume_predicted, volume_current, tau_v)) {
+      note_commit_gate_failure(cell, -1, "V_z", volume_current,
+                               volume_predicted, tau_v, &failure);
+    }
+  }
+
+  const button_morph::ButtonIndexing idx =
+      button_morph::make_button_indexing(cfg.mesh);
+  const int radial_intervals =
+      idx.n_b + cfg.numerics.ale.runtime_controller.controller_shell_rows;
+  for (int axis = 0; axis < 2; ++axis) {
+    for (int ray = 0; ray <= std::min(1, idx.ntheta); ++ray) {
+      const int k = axis == 0 ? ray : idx.ntheta - ray;
+      const int column = axis == 0 ? 0 : idx.ntheta - 1;
+      const double theta = tenryu::mesh::multiblock_theta_node(
+          k, idx.ntheta, cfg.mesh.multiblock_theta_cap_widen_factor);
+      const double ray_r = std::sin(theta);
+      const double ray_z = std::cos(theta);
+      for (int row = 0; row < radial_intervals; ++row) {
+        const int cell = runtime_cap_chain_cell_id(idx, row, column);
+        if (cell < 0 || cell >= n_cells ||
+            active_cell[static_cast<std::size_t>(cell)] == 0U) {
+          continue;
+        }
+        const int inner_node = runtime_cap_chain_node_id(idx, row, k);
+        const int outer_node = runtime_cap_chain_node_id(idx, row + 1, k);
+        const std::size_t inner = static_cast<std::size_t>(inner_node);
+        const std::size_t outer = static_cast<std::size_t>(outer_node);
+        const double gap_current =
+            current_r[outer] * ray_r + current_z[outer] * ray_z -
+            current_r[inner] * ray_r - current_z[inner] * ray_z;
+        const double gap_predicted =
+            predicted_r[outer] * ray_r + predicted_z[outer] * ray_z -
+            predicted_r[inner] * ray_r - predicted_z[inner] * ray_z;
+        const double length_scale =
+            std::max({std::abs(predicted_r[inner]),
+                      std::abs(predicted_z[inner]),
+                      std::abs(predicted_r[outer]),
+                      std::abs(predicted_z[outer])});
+        const double tau_g = 64.0 * std::numeric_limits<double>::epsilon() *
+                             length_scale;
+        if (!admissibility_quantity_passes_relative_host(
+                gap_predicted, gap_current, tau_g)) {
+          note_commit_gate_failure(cell, -1, "radial_gap", gap_current,
+                                   gap_predicted, tau_g, &failure);
+        }
+      }
+    }
+  }
+
+  if (failure.quantity == nullptr) {
+    return failure;
+  }
+  failure.dt_predict = dt_predict;
+  return failure;
+}
+
+void log_runtime_ale_commit_rollback(
+    const CommitGateFailure& failure) {
+  std::ostringstream oss;
+  oss << std::scientific << std::setprecision(6)
+      << "[runtime-ale] commit-rollback cell=" << failure.cell
+      << " quantity=" << failure.quantity;
+  if (failure.corner >= 0) {
+    oss << " corner=" << failure.corner;
+  }
+  oss << " current=" << failure.baseline
+      << " predicted=" << failure.predicted << " tau=" << failure.tau
+      << " dt=" << failure.dt_predict;
+  core::log_warning(oss.str());
+}
+
+__global__ void evaluate_structured_candidate_admissibility_table_kernel(
+    const double* __restrict__ node_r_old,
+    const double* __restrict__ node_z_old,
+    const double* __restrict__ delta_r,
+    const double* __restrict__ delta_z,
+    const double sigma,
+    const int nr,
+    const int nz,
+    const std::uint8_t* __restrict__ cell_nverts,
+    const std::uint8_t* __restrict__ active_cell_mask,
+    const bool button_cell_zero,
+    const bool write_baseline,
+    QuadAdmissibilityTableValues* __restrict__ baseline,
+    int* __restrict__ smallest_bad_cell,
+    const int diagnostic_cell,
+    QuadAdmissibilityTableValues* __restrict__ diagnostic_values) {
+  const int c = blockIdx.x * blockDim.x + threadIdx.x;
+  const int n_cells = nr * nz;
+  if (c >= n_cells) {
+    return;
+  }
+  if ((active_cell_mask != nullptr && active_cell_mask[c] == 0U) ||
+      (button_cell_zero && c == 0) ||
+      mesh::mesh_topo_cell_active_nverts(cell_nverts, c) == 3) {
+    return;
+  }
+
+  const int i = c / nz;
+  const int j = c - i * nz;
+  const int stride = nz + 1;
+  const int n00 = i * stride + j;
+  const int n10 = (i + 1) * stride + j;
+  const int n11 = (i + 1) * stride + (j + 1);
+  const int n01 = i * stride + (j + 1);
+  const double r_old[4] = {
+      node_r_old[n00],
+      node_r_old[n10],
+      node_r_old[n11],
+      node_r_old[n01],
+  };
+  const double z_old[4] = {
+      node_z_old[n00],
+      node_z_old[n10],
+      node_z_old[n11],
+      node_z_old[n01],
+  };
+  const double r[4] = {
+      r_old[0] + sigma * delta_r[n00],
+      r_old[1] + sigma * delta_r[n10],
+      r_old[2] + sigma * delta_r[n11],
+      r_old[3] + sigma * delta_r[n01],
+  };
+  const double z[4] = {
+      z_old[0] + sigma * delta_z[n00],
+      z_old[1] + sigma * delta_z[n10],
+      z_old[2] + sigma * delta_z[n11],
+      z_old[3] + sigma * delta_z[n01],
+  };
+  const QuadAdmissibilityTableValues values =
+      write_baseline
+          ? evaluate_quad_admissibility_table(r_old, z_old, r_old, z_old)
+          : evaluate_quad_admissibility_table(r_old, z_old, r, z);
+  if (diagnostic_values != nullptr && c == diagnostic_cell) {
+    *diagnostic_values = values;
+  }
+  if (write_baseline) {
+    baseline[c] = values;
+    return;
+  }
+  if (smallest_bad_cell != nullptr &&
+      !quad_candidate_passes_admissibility_table(baseline[c], values)) {
+    atomicMin(smallest_bad_cell, c);
+  }
+}
+
+__global__ void evaluate_csr_candidate_admissibility_table_kernel(
+    const double* __restrict__ node_r_old,
+    const double* __restrict__ node_z_old,
+    const double* __restrict__ delta_r,
+    const double* __restrict__ delta_z,
+    const double sigma,
+    const int n_cells,
+    const int* __restrict__ cell_node_csr_offsets,
+    const int* __restrict__ cell_node_csr_indices,
+    const std::uint8_t* __restrict__ cell_nverts,
+    const std::uint8_t* __restrict__ active_cell_mask,
+    const bool button_cell_zero,
+    const bool write_baseline,
+    QuadAdmissibilityTableValues* __restrict__ baseline,
+    int* __restrict__ smallest_bad_cell,
+    const int diagnostic_cell,
+    QuadAdmissibilityTableValues* __restrict__ diagnostic_values) {
+  const int c = blockIdx.x * blockDim.x + threadIdx.x;
+  if (c >= n_cells) {
+    return;
+  }
+  if ((active_cell_mask != nullptr && active_cell_mask[c] == 0U) ||
+      (button_cell_zero && c == 0) ||
+      mesh::mesh_topo_cell_active_nverts(cell_nverts, c) == 3) {
+    return;
+  }
+
+  const int off = cell_node_csr_offsets[c];
+  const int n00 = cell_node_csr_indices[off + 0];
+  const int n10 = cell_node_csr_indices[off + 1];
+  const int n11 = cell_node_csr_indices[off + 2];
+  const int n01 = cell_node_csr_indices[off + 3];
+  const double r_old[4] = {
+      node_r_old[n00],
+      node_r_old[n10],
+      node_r_old[n11],
+      node_r_old[n01],
+  };
+  const double z_old[4] = {
+      node_z_old[n00],
+      node_z_old[n10],
+      node_z_old[n11],
+      node_z_old[n01],
+  };
+  const double r[4] = {
+      r_old[0] + sigma * delta_r[n00],
+      r_old[1] + sigma * delta_r[n10],
+      r_old[2] + sigma * delta_r[n11],
+      r_old[3] + sigma * delta_r[n01],
+  };
+  const double z[4] = {
+      z_old[0] + sigma * delta_z[n00],
+      z_old[1] + sigma * delta_z[n10],
+      z_old[2] + sigma * delta_z[n11],
+      z_old[3] + sigma * delta_z[n01],
+  };
+  const QuadAdmissibilityTableValues values =
+      write_baseline
+          ? evaluate_quad_admissibility_table(r_old, z_old, r_old, z_old)
+          : evaluate_quad_admissibility_table(r_old, z_old, r, z);
+  if (diagnostic_values != nullptr && c == diagnostic_cell) {
+    *diagnostic_values = values;
+  }
+  if (write_baseline) {
+    baseline[c] = values;
+    return;
+  }
+  if (smallest_bad_cell != nullptr &&
+      !quad_candidate_passes_admissibility_table(baseline[c], values)) {
+    atomicMin(smallest_bad_cell, c);
+  }
+}
+
+bool candidate_rejection_is_nonpositive_corner_j(
+    const tenryu::mesh::CandidateMeshQuality& quality) {
+  return quality.kind ==
+             tenryu::mesh::MeshGeometryFailureKind::NonPositiveCellArea &&
+         quality.first_bad_cell >= 0 && quality.first_bad_corner >= 0;
+}
+
+bool candidate_rejection_is_table_covered_corner_j(
+    const tenryu::core::State& state,
+    const std::uint8_t* d_active_cell_mask,
+    const bool button_cell_zero,
+    const tenryu::mesh::CandidateMeshQuality& quality) {
+  if (!candidate_rejection_is_nonpositive_corner_j(quality)) {
+    return false;
+  }
+  const int cell = quality.first_bad_cell;
+  const int n_cells = state.mesh.topo.multiblock.has_value()
+                          ? state.mesh.topo.n_cells
+                          : state.mesh.topo.nr * state.mesh.topo.nz;
+  if (cell >= n_cells || (button_cell_zero && cell == 0) ||
+      state_cell_active_nverts(state, cell, n_cells) != 4) {
+    return false;
+  }
+  if (d_active_cell_mask != nullptr) {
+    std::uint8_t active = 0U;
+    cuda_check(cudaMemcpy(&active, d_active_cell_mask + cell,
+                          sizeof(std::uint8_t), cudaMemcpyDeviceToHost),
+               "reference barrier active-cell mask copy failed");
+    return active != 0U;
+  }
+  return true;
+}
+
 __global__ void build_spherical_equal_angle_kernel(
     const double* __restrict__ r0,
     const double* __restrict__ z0,
@@ -517,6 +1481,165 @@ __global__ void normalize_reference_volfrac_kernel(double* __restrict__ volfrac,
       volfrac[c * n_mat + m] = (m == imax) ? 1.0 : 0.0;
     }
   }
+}
+
+__global__ void recache_structured_corner_mass_kernel(
+    double* __restrict__ corner_mass,
+    const double* __restrict__ mass,
+    const double* __restrict__ x_r,
+    const double* __restrict__ x_z,
+    const std::uint8_t* __restrict__ cell_nverts,
+    const int nr,
+    const int nz,
+    const int button_outer_node_ring) {
+  const int c = blockIdx.x * blockDim.x + threadIdx.x;
+  const int n_cells = nr * nz;
+  if (c >= n_cells) {
+    return;
+  }
+  if (button_outer_node_ring >= 1 && c == 0) {
+    corner_mass[0] = 0.0;
+    corner_mass[1] = 0.0;
+    corner_mass[2] = 0.0;
+    corner_mass[3] = 0.0;
+    return;
+  }
+  double m_corner[4] = {0.0, 0.0, 0.0, 0.0};
+  rz::compute_rz_corner_masses_from_nodes(
+      c, nz, mass[c], x_r, x_z, cell_nverts, m_corner);
+  // Clamped partitions lose exact closure; renormalization restores the hard
+  // invariant sum==m_z while keeping positivity; the distribution quality
+  // degrades gracefully.
+  const double s =
+      m_corner[0] + m_corner[1] + m_corner[2] + m_corner[3];
+  if (s > 0.0 && isfinite(s)) {
+    const double scale = mass[c] / s;
+    m_corner[0] *= scale;
+    m_corner[1] *= scale;
+    m_corner[2] *= scale;
+    m_corner[3] *= scale;
+  } else {
+    m_corner[0] = 0.25 * mass[c];
+    m_corner[1] = 0.25 * mass[c];
+    m_corner[2] = 0.25 * mass[c];
+    m_corner[3] = 0.25 * mass[c];
+  }
+  corner_mass[c * 4 + 0] = m_corner[0];
+  corner_mass[c * 4 + 1] = m_corner[1];
+  corner_mass[c * 4 + 2] = m_corner[2];
+  corner_mass[c * 4 + 3] = m_corner[3];
+}
+
+__global__ void recache_multiblock_corner_mass_kernel(
+    double* __restrict__ corner_mass,
+    const double* __restrict__ mass,
+    const double* __restrict__ x_r,
+    const double* __restrict__ x_z,
+    const int* __restrict__ cell_node_csr_offsets,
+    const int* __restrict__ cell_node_csr_indices,
+    const std::uint8_t* __restrict__ cell_nverts,
+    const int n_cells,
+    const bool partition_normalized) {
+  const int c = blockIdx.x * blockDim.x + threadIdx.x;
+  if (c >= n_cells) {
+    return;
+  }
+
+  const int off = cell_node_csr_offsets[c];
+  const int active_nverts = mesh::mesh_topo_cell_active_nverts(cell_nverts, c);
+  double m_corner[4] = {0.0, 0.0, 0.0, 0.0};
+  if (active_nverts == 3) {
+    const int n0 = cell_node_csr_indices[off + 0];
+    const int n1 = cell_node_csr_indices[off + 1];
+    const int n2 = cell_node_csr_indices[off + 2];
+    rz::compute_triangle_corner_masses_exact(
+        mass[c], x_r[n0], x_z[n0], x_r[n1], x_z[n1], x_r[n2], x_z[n2],
+        m_corner);
+  } else {
+    const int n00 = cell_node_csr_indices[off + 0];
+    const int n10 = cell_node_csr_indices[off + 1];
+    const int n11 = cell_node_csr_indices[off + 2];
+    const int n01 = cell_node_csr_indices[off + 3];
+    // Mirror compute_corner_mass_2d_multiblock_kernel in hydro_2d.cu.
+    if (partition_normalized) {
+      rz::compute_quad_corner_masses_partitioned_subpolygon(
+          mass[c], x_r[n00], x_z[n00], x_r[n10], x_z[n10], x_r[n11],
+          x_z[n11], x_r[n01], x_z[n01], m_corner);
+    } else {
+      rz::compute_quad_corner_masses_exact_subpolygon(
+          mass[c], x_r[n00], x_z[n00], x_r[n10], x_z[n10], x_r[n11],
+          x_z[n11], x_r[n01], x_z[n01], m_corner);
+    }
+  }
+  // Clamped partitions lose exact closure; renormalization restores the hard
+  // invariant sum==m_z while keeping positivity; the distribution quality
+  // degrades gracefully.
+  const double s =
+      m_corner[0] + m_corner[1] + m_corner[2] + m_corner[3];
+  if (s > 0.0 && isfinite(s)) {
+    const double scale = mass[c] / s;
+    m_corner[0] *= scale;
+    m_corner[1] *= scale;
+    m_corner[2] *= scale;
+    m_corner[3] *= scale;
+  } else {
+    m_corner[0] = 0.25 * mass[c];
+    m_corner[1] = 0.25 * mass[c];
+    m_corner[2] = 0.25 * mass[c];
+    m_corner[3] = 0.25 * mass[c];
+  }
+  corner_mass[c * 4 + 0] = m_corner[0];
+  corner_mass[c * 4 + 1] = m_corner[1];
+  corner_mass[c * 4 + 2] = m_corner[2];
+  corner_mass[c * 4 + 3] = m_corner[3];
+}
+
+void recache_corner_mass_after_reference_remap(
+    tenryu::core::State& state,
+    const tenryu::core::Config& cfg,
+    const std::uint8_t* d_cell_nverts) {
+  const int n_cells = static_cast<int>(state.mass.size());
+  const std::size_t expected_size = static_cast<std::size_t>(n_cells) * 4U;
+  if (!state.corner_mass_initialized) {
+    // No compatible corner-mass cache exists on this state (minimal/unit-test
+    // states, or pre-first-hydro-step): the epoch reset is vacuous — any later
+    // cache build starts from the post-remap geometry.
+    return;
+  }
+  TENRYU_ASSERT(state.corner_mass.size() == expected_size,
+                "reference barrier corner-mass recache size mismatch");
+  if (n_cells == 0) {
+    return;
+  }
+
+  const int blocks_cells = (n_cells + 255) / 256;
+  // Recompute with the init-time formula dispatch before enforcing closure.
+  if (state.mesh.topo.multiblock.has_value()) {
+    TENRYU_ASSERT(state.mesh.multiblock_cell_node_csr_offsets.size() ==
+                      static_cast<std::size_t>(n_cells) + 1U,
+                  "reference barrier corner-mass recache requires CSR offsets");
+    TENRYU_ASSERT(state.mesh.multiblock_cell_node_csr_indices.size() ==
+                      expected_size,
+                  "reference barrier corner-mass recache requires CSR indices");
+    recache_multiblock_corner_mass_kernel<<<blocks_cells, 256>>>(
+        state.corner_mass.data(), state.mass.data(), state.x_r.data(),
+        state.x_z.data(), state.mesh.multiblock_cell_node_csr_offsets.data(),
+        state.mesh.multiblock_cell_node_csr_indices.data(), d_cell_nverts,
+        n_cells, corner_mass_lagrangian_invariant_enabled(cfg));
+  } else {
+    const int button_outer_node_ring =
+        (state.mesh.button_center && state.mesh.button_center->enabled)
+            ? state.mesh.button_center->outer_node_ring
+            : -1;
+    recache_structured_corner_mass_kernel<<<blocks_cells, 256>>>(
+        state.corner_mass.data(), state.mass.data(), state.x_r.data(),
+        state.x_z.data(), d_cell_nverts, state.mesh.topo.nr,
+        state.mesh.topo.nz, button_outer_node_ring);
+  }
+  cuda_check(cudaGetLastError(),
+             "reference barrier corner-mass recache kernel launch failed");
+  cuda_check(cudaDeviceSynchronize(),
+             "reference barrier corner-mass recache synchronize failed");
 }
 
 __global__ void project_reference_cell_velocity_to_nodes_kernel(
@@ -967,7 +2090,8 @@ ReferenceBarrierAleResult apply_reference_barrier_rezone(
   ReferenceBarrierAleResult result;
   // The trigger path gates on reference_barrier_enabled alone; the apply path also serves the button morph (S-C), which supplies its own targets.
   if (!cfg.numerics.ale.reference_barrier_enabled &&
-      !cfg.numerics.ale.button_morph.enabled) {
+      !cfg.numerics.ale.button_morph.enabled &&
+      !cfg.numerics.ale.runtime_controller.controller_enabled) {
     return result;
   }
   result.engaged = true;
@@ -1117,7 +2241,11 @@ ReferenceBarrierAleResult apply_reference_barrier_rezone(
   result.linesearch_iters = ls.iters_used;
   result.final_quality = ls.quality;
 
+  RuntimeAleRollbackSnapshot runtime_rollback_snapshot;
   if (ls.sigma_accepted > 0.0) {
+    if (scope != nullptr && scope->runtime_ale) {
+      runtime_rollback_snapshot.capture(state, cfg, is_multiblock, n_cells);
+    }
     if (is_multiblock) {
       const auto remap_result =
           apply_multiblock_csr_reference_remap(state,
@@ -1136,6 +2264,7 @@ ReferenceBarrierAleResult apply_reference_barrier_rezone(
       const bool remap_ok = remap_result.applied;
       result.succeeded = remap_ok;
       if (remap_ok) {
+        recache_corner_mass_after_reference_remap(state, cfg, d_cell_nverts);
         const ConservedSums sums_after = compute_conserved_sums_host(state);
         log_reference_conservation(state.step, sums_before, sums_after);
       }
@@ -1190,7 +2319,11 @@ ReferenceBarrierAleResult apply_reference_barrier_rezone(
                                       nr,
                                       nz,
                                       state.step,
-                                      donor_sign_fixed);
+                                      donor_sign_fixed,
+                                      state.evacuated_cells.d_geometry_policy_exempt_cells.empty()
+                                          ? nullptr
+                                          : state.evacuated_cells
+                                                .d_geometry_policy_exempt_cells.data());
     };
 
     bool remap_ok = remap_scalar(state.rho.data());
@@ -1281,6 +2414,7 @@ ReferenceBarrierAleResult apply_reference_barrier_rezone(
                  "reference barrier velocity projection kernel launch failed");
       cuda_check(cudaDeviceSynchronize(),
                  "reference barrier remap synchronize failed");
+      recache_corner_mass_after_reference_remap(state, cfg, d_cell_nverts);
       const ConservedSums sums_after = compute_conserved_sums_host(state);
       log_reference_conservation(state.step, sums_before, sums_after);
     } else {
@@ -1296,6 +2430,31 @@ ReferenceBarrierAleResult apply_reference_barrier_rezone(
         state, cfg, "s2_post_remap");
     tenryu::hydro::ale::ale_velcoherence::sample(
         state, cfg, "s3_post_velproj");
+  }
+
+  if (result.succeeded && scope != nullptr && scope->runtime_ale) {
+    const CommitGateFailure failure =
+        evaluate_runtime_ale_commit_gate(state, cfg, *scope);
+    if (failure.quantity != nullptr) {
+      if (cfg.numerics.ale.runtime_controller.commit_rollback_enabled) {
+        TENRYU_ASSERT(runtime_rollback_snapshot.captured,
+                      "runtime ALE commit rollback requires a snapshot");
+        runtime_rollback_snapshot.restore(state);
+        state.mesh.node_r = state.x_r.data();
+        state.mesh.node_z = state.x_z.data();
+        state.mesh.recompute_geometry();
+        state.vol = state.mesh.cell_vol;
+        recache_corner_mass_after_reference_remap(state, cfg, d_cell_nverts);
+        result.succeeded = false;
+        result.rolled_back = true;
+        result.last_reject_reason = 3;
+        result.last_reject_cell = failure.cell;
+        result.mass_floor_delta = 0.0;
+        result.E_floor_injected = 0.0;
+        result.E_redistribution_unresolved = 0.0;
+      }
+      log_runtime_ale_commit_rollback(failure);
+    }
   }
 
   if (d_cell_id_stable != nullptr) {

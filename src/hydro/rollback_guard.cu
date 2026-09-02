@@ -52,6 +52,11 @@ std::vector<core::TransactionBufferDesc> replay_device_descs(core::State& s) {
       TENRYU_REPLAY_DESC(x_r_reference),
       TENRYU_REPLAY_DESC(x_z_reference),
       TENRYU_REPLAY_DESC(mesh.cell_centroid_r_device),
+      TENRYU_REPLAY_DESC(mesh.cell_vol_device),
+      TENRYU_REPLAY_DESC(mesh.cell_area_device),
+      TENRYU_REPLAY_DESC(mesh.cell_centroid_z_device),
+      TENRYU_REPLAY_DESC(mesh.cell_Svec_r_device),
+      TENRYU_REPLAY_DESC(mesh.cell_Svec_z_device),
       TENRYU_REPLAY_DESC(v_r),
       TENRYU_REPLAY_DESC(v_z),
       TENRYU_REPLAY_DESC(rad_E),
@@ -100,6 +105,7 @@ void RollbackGuard::capture(core::State& state, const cudaStream_t stream) {
   host_.mesh_cell_area = state.mesh.cell_area;
   host_.mesh_cell_centroid_r = state.mesh.cell_centroid_r;
   host_.mesh_cell_centroid_z = state.mesh.cell_centroid_z;
+  state.mesh.materialize_host_svec();
   host_.mesh_cell_Svec_r = state.mesh.cell_Svec_r;
   host_.mesh_cell_Svec_z = state.mesh.cell_Svec_z;
   host_.corner_mass_initialized = state.corner_mass_initialized;

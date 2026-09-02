@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <sstream>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -138,6 +139,8 @@ void enumerate_snapshot_fields(
   TENRYU_SNAPSHOT_FIELD(hllc_mom_z_cell);
   TENRYU_SNAPSHOT_FIELD(shock_time);
   TENRYU_SNAPSHOT_FIELD(adaptive_av_gate);
+  TENRYU_SNAPSHOT_FIELD(wake_heat_flux_eta);
+  TENRYU_SNAPSHOT_FIELD(wake_heat_flux_zeta);
   TENRYU_SNAPSHOT_FIELD(eta_compatible);
   TENRYU_SNAPSHOT_FIELD(volFrac);
   TENRYU_SNAPSHOT_FIELD(gas_tracer_Y);
@@ -164,6 +167,8 @@ void enumerate_snapshot_fields(
   TENRYU_SNAPSHOT_FIELD(x_z_reference);
   TENRYU_SNAPSHOT_FIELD(v_r);
   TENRYU_SNAPSHOT_FIELD(v_z);
+  TENRYU_SNAPSHOT_FIELD(node_accel_r);
+  TENRYU_SNAPSHOT_FIELD(node_accel_z);
   TENRYU_SNAPSHOT_FIELD(rad_E);
   TENRYU_SNAPSHOT_FIELD(rad_E_old);
   TENRYU_SNAPSHOT_FIELD(rad_dep);
@@ -733,6 +738,13 @@ void restore_driver_retry_snapshot(tenryu::core::State& state,
   // Keep active/void masks as they stand after any retry-local topology update
   // (Emergency-cell-deactivation persistence.)
   if (restore_transient_topology_masks) {
+    if (snap.hydro_active.size() != state.hydro_active.size()) {
+      std::ostringstream log;
+      log << "[snapshot] hydro_active size change on restore: snap="
+          << snap.hydro_active.size()
+          << " state=" << state.hydro_active.size();
+      core::log_warning(log.str());
+    }
     state.hydro_active = snap.hydro_active;
     state.state_supply_mask = snap.state_supply_mask;
     state.cell_is_void = snap.cell_is_void;

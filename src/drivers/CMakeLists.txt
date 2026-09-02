@@ -3,6 +3,7 @@ add_library(tenryu_drivers STATIC
   cmd_run.cpp
   cmd_validate.cpp
   cmd_freeze.cpp
+  cmd_checkpoint_swap_center.cpp
   cmd_verify.cpp
   verify_conduction_eigenmode_1d.cpp
   verify_snb_1d.cpp

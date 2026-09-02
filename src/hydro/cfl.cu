@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
@@ -21,8 +22,11 @@
 #include "hydro/boundary_2d.hpp"
 #include "hydro/central_pseudo_core.cuh"
 #include "hydro/compatible_av_csw.cuh"
+#include "hydro/compatible_av_tensor.cuh"
 #include "hydro/compatible_subzonal_pressure.cuh"
 #include "hydro/corner_j_predict_cfl.hpp"
+#include "hydro/hydro_2d.hpp"
+#include "hydro/pentagon_geometry.cuh"
 #include "hydro/pole_angular_derefine.cuh"
 #include "hydro/pole_axis_bbsw.hpp"
 #include "hydro/rz_corner_mass.cuh"
@@ -49,7 +53,46 @@ bool pole_axis_bbsw_enabled(const core::Config& cfg) {
   static const char* const env = std::getenv(pole_axis_bbsw::kEnvEnable);
   static const bool env_present = env != nullptr && env[0] != '\0';
   static const bool env_enabled = env_present && std::string(env) != "0";
-  return env_present ? env_enabled : cfg.numerics.ale.pole_axis_bbsw_enabled;
+  const bool enabled =
+      env_present ? env_enabled : cfg.numerics.ale.pole_axis_bbsw_enabled;
+  if (enabled && cfg.mesh.shell_polar_cap_dendrite) {
+    throw core::namelist::ConfigError(
+        "pole-axis BBSW is not supported with "
+        "Mesh.shell_polar_cap_dendrite=true (pending shell-chain generalization)");
+  }
+  return enabled;
+}
+
+std::vector<int> pole_axis_bbsw_hybrid_cart_axis_nodes(
+    const core::State& state,
+    const core::Config& cfg,
+    const std::vector<double>& node_r,
+    const std::vector<double>& node_z) {
+  if (!mesh::mesh_topo_has_polar_tier_cart_center(cfg.mesh)) {
+    return {};
+  }
+  TENRYU_ASSERT(state.mesh.topo.multiblock.has_value(),
+                "hybrid pole-axis BBSW CFL requires multiblock topology");
+  const int n_nodes = state.mesh.topo.n_nodes;
+  TENRYU_ASSERT(node_r.size() == static_cast<std::size_t>(n_nodes) &&
+                    node_z.size() == static_cast<std::size_t>(n_nodes),
+                "hybrid pole-axis BBSW CFL requires node-sized coordinates");
+  const int n_aw_axis_prefix_nodes = mesh::mesh_topo_n_aw_axis_prefix_nodes(
+      *state.mesh.topo.multiblock);
+  TENRYU_ASSERT(n_aw_axis_prefix_nodes <= n_nodes,
+                "hybrid pole-axis BBSW CFL AW-axis prefix exceeds node count");
+  std::vector<int> nodes;
+  for (int node = n_aw_axis_prefix_nodes; node < n_nodes; ++node) {
+    if (node_r[static_cast<std::size_t>(node)] == 0.0) {
+      nodes.push_back(node);
+    }
+  }
+  std::sort(nodes.begin(), nodes.end(), [&](const int a, const int b) {
+    const double za = node_z[static_cast<std::size_t>(a)];
+    const double zb = node_z[static_cast<std::size_t>(b)];
+    return za == zb ? a < b : za < zb;
+  });
+  return nodes;
 }
 
 int button_outer_node_ring_or_zero(const mesh::Mesh& mesh) {
@@ -441,6 +484,12 @@ __global__ void rz_cfl_compute_node_activity_2d_kernel(
   node_active[i * stride + (j + 1)] = 1u;
 }
 
+// Frozen bbsw-radial node-mass basis BY CONTRACT (predates the
+// corner_mass_convention epoch). This mass feeds the precise-u_half
+// force-based dt, so wiring the knob here would move dt sequences and break
+// the frozen bitwise baselines; unification is deferred to the next
+// sanctioned golden re-baselining event (A124(b) P-C ruling, 2026-08-15;
+// NUMERICS corner-mass convention section).
 __global__ void rz_cfl_compute_corner_mass_2d_kernel(
     double* __restrict__ corner_mass,
     const double* __restrict__ mass,
@@ -691,7 +740,10 @@ __device__ inline void cfl_1d_kernel_body(
     const double crossing_dt_safety,
     const int art_heat_bound_enabled,
     const double art_heat_c,
-    const double J) {
+    const double J,
+    int* __restrict__ lineage_winner_cell,
+    const int lineage_other_term,
+    const double lineage_target_dt) {
   if (hydro_active != nullptr && hydro_active[i] == 0) {
     return;
   }
@@ -712,7 +764,8 @@ __device__ inline void cfl_1d_kernel_body(
   if (min_dt_crossing != nullptr && crossing_dt_safety > 0.0) {
     const double closing = v_r[i] - v_r[i + 1];
     if (closing > 0.0) {
-      atomic_min_double(min_dt_crossing, crossing_dt_safety * dr / closing);
+      const double crossing_dt = crossing_dt_safety * dr / closing;
+      atomic_min_double(min_dt_crossing, crossing_dt);
     }
   }
 
@@ -774,7 +827,14 @@ __device__ inline void cfl_1d_kernel_body(
       g_sum += area_f * art_heat_c * rho_f * l_f * chi_f;
     }
     if (g_sum > 0.0) {
-      atomic_min_double(min_dt_art_heat, 0.5 * m_i / g_sum);
+      const double art_heat_dt = 0.5 * m_i / g_sum;
+      atomic_min_double(min_dt_art_heat, art_heat_dt);
+      if (lineage_winner_cell != nullptr &&
+          lineage_other_term ==
+              static_cast<int>(HydroMinOtherTerm::ArtificialHeat) &&
+          art_heat_dt == lineage_target_dt) {
+        atomicMin(lineage_winner_cell, i);
+      }
     }
   }
 
@@ -819,7 +879,14 @@ __device__ inline void cfl_1d_kernel_body(
       g_sum += area_f * post_shock_heat_c * rho_f * cs_f * psi_f;
     }
     if (g_sum > 0.0) {
-      atomic_min_double(min_dt_post_shock, 0.5 * m_i / g_sum);
+      const double post_shock_dt = 0.5 * m_i / g_sum;
+      atomic_min_double(min_dt_post_shock, post_shock_dt);
+      if (lineage_winner_cell != nullptr &&
+          lineage_other_term ==
+              static_cast<int>(HydroMinOtherTerm::PostShock) &&
+          post_shock_dt == lineage_target_dt) {
+        atomicMin(lineage_winner_cell, i);
+      }
     }
   }
 }
@@ -853,7 +920,10 @@ __global__ void cfl_1d_kernel(double* __restrict__ min_dt,
                               const double crossing_dt_safety,
                               const int art_heat_bound_enabled,
                               const double art_heat_c,
-                              const double J) {
+                              const double J,
+                              int* __restrict__ lineage_winner_cell,
+                              const int lineage_other_term,
+                              const double lineage_target_dt) {
   const int i = c_begin + blockIdx.x * blockDim.x + threadIdx.x;
   const int tid = threadIdx.x;
   extern __shared__ double shared[];
@@ -868,31 +938,102 @@ __global__ void cfl_1d_kernel(double* __restrict__ min_dt,
                      c2, av_du_mode, post_shock_heat_enabled,
                      post_shock_heat_c, post_shock_heat_decay,
                      crossing_dt_safety, art_heat_bound_enabled, art_heat_c,
-                     J);
+                     J, lineage_winner_cell, lineage_other_term,
+                     lineage_target_dt);
 }
 
-__global__ void cfl_2d_kernel(double* __restrict__ min_dt,
-                              int* __restrict__ have_active,
-                              const double* __restrict__ x_r,
-                              const double* __restrict__ x_z,
-                              const double* __restrict__ v_r,
-                              const double* __restrict__ v_z,
-                              const double* __restrict__ ee,
-                              const double* __restrict__ ei,
-                              const double* __restrict__ cs_arr,
-                              const double* __restrict__ cell_area,
-                              const std::uint8_t* __restrict__ cell_kind,
-                              const std::int8_t* __restrict__ hydro_active,
-                              const std::uint8_t* __restrict__ pseudo_core_member,
-                              const int c_begin,
-                              const int c_end,
-                              const int n_cells,
-                              const int nz,
-                              const int button_outer_node_ring,
-                              const double gamma,
-                              const double c1) {
+__global__ void cfl_1d_lineage_argmin_kernel(
+    int* __restrict__ winner_cell,
+    const int term_class,
+    const double target_dt,
+    const double* __restrict__ x_r,
+    const double* __restrict__ v_r,
+    const double* __restrict__ ee,
+    const double* __restrict__ ei,
+    const double* __restrict__ cs_arr,
+    const std::int8_t* __restrict__ hydro_active,
+    const int c_begin,
+    const int c_end,
+    const int n_cells,
+    const double gamma,
+    const double c1,
+    const double c2,
+    const int use_riemann_av,
+    const double crossing_dt_safety,
+    const double J) {
+  const int i = c_begin + blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= c_end ||
+      (hydro_active != nullptr && hydro_active[i] == 0)) {
+    return;
+  }
+  const double dr = x_r[i + 1] - x_r[i];
+  if (!(dr > 0.0)) {
+    return;
+  }
+  double candidate = INFINITY;
+  if (term_class == static_cast<int>(HydroMinTermClass::EdgeCrossing)) {
+    const double closing = v_r[i] - v_r[i + 1];
+    if (crossing_dt_safety > 0.0 && closing > 0.0) {
+      candidate = crossing_dt_safety * dr / closing;
+    }
+  } else if (term_class ==
+             static_cast<int>(HydroMinTermClass::AcousticCell)) {
+    const double cs = cfl_1d_cell_cs(ee, ei, cs_arr, i, gamma);
+    double denom = cs;
+    if (use_riemann_av != 0) {
+      const double du_left =
+          cfl_riemann_face_du_plus_1d(x_r, v_r, hydro_active, i, n_cells);
+      const double du_right = cfl_riemann_face_du_plus_1d(
+          x_r, v_r, hydro_active, i + 1, n_cells);
+      denom += fmax(du_left, du_right);
+    } else {
+      const double chi = compute_chi_1d(x_r, v_r, i, n_cells, J);
+      const double compression_speed = dr * chi;
+      denom += c1 * cs + c2 * compression_speed;
+    }
+    if (denom > 0.0) {
+      candidate = dr / denom;
+    }
+  }
+  if (candidate == target_dt) {
+    atomicMin(winner_cell, i);
+  }
+}
+
+template <int UseMinAltitude, int RealeMesh>
+__global__ void cfl_2d_kernel(
+    double* __restrict__ min_dt,
+    int* __restrict__ lineage_winner_cell,
+    const double lineage_target_dt,
+    int* __restrict__ have_active,
+    const double* __restrict__ x_r,
+    const double* __restrict__ x_z,
+    const double* __restrict__ v_r,
+    const double* __restrict__ v_z,
+    const double* __restrict__ ee,
+    const double* __restrict__ ei,
+    const double* __restrict__ cs_arr,
+    const double* __restrict__ cell_area,
+    const int* __restrict__ cell_node_csr_offsets,
+    const int* __restrict__ cell_node_csr_indices,
+    const std::uint8_t* __restrict__ cell_nverts,
+    const std::uint8_t* __restrict__ cell_kind,
+    const std::int8_t* __restrict__ hydro_active,
+    const std::uint8_t* __restrict__ geometry_policy_exempt,
+    const std::uint8_t* __restrict__ pseudo_core_member,
+    const int c_begin,
+    const int c_end,
+    const int n_cells,
+    const int nz,
+    const int button_outer_node_ring,
+    const double gamma,
+    const double c1) {
   const int c = c_begin + blockIdx.x * blockDim.x + threadIdx.x;
   if (c >= c_end) {
+    return;
+  }
+  if (geometry_policy_exempt != nullptr &&
+      geometry_policy_exempt[c] != 0U) {
     return;
   }
 
@@ -907,7 +1048,26 @@ __global__ void cfl_2d_kernel(double* __restrict__ min_dt,
   atomicExch(have_active, 1);
 
   double dl = 0.0;
-  if (kind == kCflCellButton && button_outer_node_ring > 0 && c == 0) {
+  const int active_nverts =
+      mesh::mesh_topo_cell_active_nverts(cell_nverts, c);
+  // consult-26: the vertex-0 fan metric reports turn artifacts on chain-bearing
+  // Voronoi polygons; reale meshes use the generic centroid metric (Wave-2
+  // replaces this with the operator-consistent corner/spectral bound).
+  if (RealeMesh == 0 && cell_nverts != nullptr && active_nverts == 5 &&
+      cell_node_csr_offsets != nullptr &&
+      cell_node_csr_indices != nullptr) {
+    const int off = cell_node_csr_offsets[c];
+    PentagonPoint x[5];
+    for (int k = 0; k < 5; ++k) {
+      const int node = cell_node_csr_indices[off + k];
+      x[k] = {x_r[node], x_z[node]};
+    }
+    dl = pentagon_acoustic_length(x);
+    if (!(dl > 0.0) || !isfinite(dl)) {
+      printf("pentagon acoustic length invalid\n");
+      __trap();
+    }
+  } else if (kind == kCflCellButton && button_outer_node_ring > 0 && c == 0) {
     dl = button_polygon_characteristic_length_from_nodes(
         x_r, x_z, button_outer_node_ring, nz);
   } else {
@@ -915,7 +1075,20 @@ __global__ void cfl_2d_kernel(double* __restrict__ min_dt,
     if (area <= 0.0) {
       return;
     }
-    dl = sqrt(area);
+    if constexpr (UseMinAltitude == 1) {
+      if (cell_node_csr_offsets != nullptr &&
+          cell_node_csr_indices != nullptr) {
+        const int off = cell_node_csr_offsets[c];
+        const int nv = active_nverts;
+        dl = detail::csr_polygon_characteristic_length_from_nodes(
+            x_r, x_z, cell_node_csr_indices + off, nv);
+      }
+      if (!(dl > 0.0) || !isfinite(dl)) {
+        dl = sqrt(area);
+      }
+    } else {
+      dl = sqrt(area);
+    }
   }
   if (!(dl > 0.0) || !isfinite(dl)) {
     return;
@@ -944,6 +1117,9 @@ __global__ void cfl_2d_kernel(double* __restrict__ min_dt,
 
   const double dt = dl / denom;
   atomic_min_double(min_dt, dt);
+  if (lineage_winner_cell != nullptr && dt == lineage_target_dt) {
+    atomicMin(lineage_winner_cell, c);
+  }
 }
 
 __global__ void cfl_2d_winner_kernel(int* __restrict__ winner_cell,
@@ -1135,15 +1311,20 @@ __device__ __forceinline__ double cfl_axis_cell_margin(
 }
 
 __global__ void axis_margin_cfl_dt_kernel(double* __restrict__ min_scale,
+                                          int* __restrict__ winner_j,
+                                          const double target_scale,
                                           const double* __restrict__ x_r,
                                           const double* __restrict__ x_z,
                                           const double* __restrict__ v_r,
                                           const double* __restrict__ v_z,
+                                          const std::uint8_t* __restrict__ geometry_policy_exempt,
                                           const int nz,
                                           const double dt_proposed,
                                           const double floor_fraction) {
   const int j = blockIdx.x * blockDim.x + threadIdx.x;
-  if (j >= nz) {
+  if (j >= nz ||
+      (geometry_policy_exempt != nullptr &&
+       geometry_policy_exempt[j] != 0U)) {
     return;
   }
 
@@ -1159,6 +1340,9 @@ __global__ void axis_margin_cfl_dt_kernel(double* __restrict__ min_scale,
                            x_z[n_axis_j], x_z[n_axis_jp1]);
   if (!(current_margin > 0.0) || !isfinite(current_margin)) {
     atomic_min_double(min_scale, 0.0);
+    if (winner_j != nullptr && target_scale == 0.0) {
+      atomicMin(winner_j, j);
+    }
     return;
   }
   const double margin_floor = floor_fraction * current_margin;
@@ -1199,12 +1383,17 @@ __global__ void axis_margin_cfl_dt_kernel(double* __restrict__ min_scale,
     }
   }
   atomic_min_double(min_scale, lo);
+  if (winner_j != nullptr && lo == target_scale) {
+    atomicMin(winner_j, j);
+  }
 }
 
 __global__ void volume_rate_cfl_min_kernel(double* __restrict__ min_dt,
                                            const double* __restrict__ vol_new,
                                            const double* __restrict__ vol_old,
                                            const std::uint8_t* __restrict__ inactive_cell_mask,
+                                           const std::uint8_t* __restrict__ evacuated_cell_mask,
+                                           const std::uint8_t* __restrict__ geometry_policy_exempt,
                                            const int c_begin,
                                            const int c_end,
                                            const int n_cells,
@@ -1214,10 +1403,16 @@ __global__ void volume_rate_cfl_min_kernel(double* __restrict__ min_dt,
   if (c >= c_end) {
     return;
   }
+  if (geometry_policy_exempt != nullptr &&
+      geometry_policy_exempt[c] != 0U) {
+    return;
+  }
   if (inactive_cell_mask != nullptr && inactive_cell_mask[c] != 0U) {
     return;
   }
-
+  if (evacuated_cell_mask != nullptr && evacuated_cell_mask[c] != 0U) {
+    return;
+  }
   const double denom = fmax(vol_old[c], kCflSensorEps);
   const double frac_rate = fabs(vol_new[c] - vol_old[c]) / denom;
   if (!(frac_rate > 0.0) || !isfinite(frac_rate)) {
@@ -1235,6 +1430,7 @@ __global__ void volume_rate_cfl_detail_kernel(int* __restrict__ min_cell,
                                               const double* __restrict__ vol_new,
                                               const double* __restrict__ vol_old,
                                               const std::uint8_t* __restrict__ inactive_cell_mask,
+                                              const std::uint8_t* __restrict__ evacuated_cell_mask,
                                               const int c_begin,
                                               const int c_end,
                                               const int n_cells,
@@ -1246,6 +1442,9 @@ __global__ void volume_rate_cfl_detail_kernel(int* __restrict__ min_cell,
     return;
   }
   if (inactive_cell_mask != nullptr && inactive_cell_mask[c] != 0U) {
+    return;
+  }
+  if (evacuated_cell_mask != nullptr && evacuated_cell_mask[c] != 0U) {
     return;
   }
 
@@ -1265,6 +1464,33 @@ __global__ void volume_rate_cfl_detail_kernel(int* __restrict__ min_cell,
   const int old = atomicMin(min_cell, c);
   if (c < old) {
     *min_frac_rate = frac_rate;
+  }
+}
+
+__global__ void volume_rate_cfl_lineage_winner_kernel(
+    int* __restrict__ winner_cell,
+    const double* __restrict__ vol_new,
+    const double* __restrict__ vol_old,
+    const std::uint8_t* __restrict__ inactive_cell_mask,
+    const int c_begin,
+    const int c_end,
+    const int n_cells,
+    const double dt_used_prev,
+    const double threshold,
+    const double target_dt) {
+  const int c = c_begin + blockIdx.x * blockDim.x + threadIdx.x;
+  if (c >= c_end ||
+      (inactive_cell_mask != nullptr && inactive_cell_mask[c] != 0U)) {
+    return;
+  }
+  const double denom = fmax(vol_old[c], kCflSensorEps);
+  const double frac_rate = fabs(vol_new[c] - vol_old[c]) / denom;
+  if (!(frac_rate > 0.0) || !isfinite(frac_rate)) {
+    return;
+  }
+  const double dt_limit = threshold * dt_used_prev / frac_rate;
+  if (dt_limit == target_dt) {
+    atomicMin(winner_cell, c);
   }
 }
 
@@ -1310,7 +1536,8 @@ std::vector<std::int8_t> make_cfl_central_macro_effective_active(
     const core::State& state,
     const core::Config& cfg) {
   if (!central_pseudo_core::configured(cfg) &&
-      !pole_angular_derefine::configured(cfg)) {
+      !pole_angular_derefine::configured(cfg) &&
+      state.evacuated_cells.inactive_member_mask.empty()) {
     return {};
   }
   core::State& mutable_state = const_cast<core::State&>(state);
@@ -1320,7 +1547,8 @@ std::vector<std::int8_t> make_cfl_central_macro_effective_active(
   pole_angular_derefine::ensure_built(mutable_state, cfg);
   const int n_cells = static_cast<int>(state.rho.size());
   if (!central_pseudo_core::active(mutable_state) &&
-      !pole_angular_derefine::active(mutable_state)) {
+      !pole_angular_derefine::active(mutable_state) &&
+      state.evacuated_cells.inactive_member_mask.empty()) {
     return {};
   }
   std::vector<std::int8_t> active(static_cast<std::size_t>(n_cells), 1);
@@ -1341,6 +1569,7 @@ std::vector<std::int8_t> make_cfl_central_macro_effective_active(
   };
   apply_inactive(mutable_state.central_pseudo_core.inactive_member_mask);
   apply_inactive(mutable_state.pole_angular_derefine.inactive_member_mask);
+  apply_inactive(mutable_state.evacuated_cells.inactive_member_mask);
   return active;
 }
 
@@ -1418,6 +1647,7 @@ bool compute_precise_rz_geometric_u_half(const core::State& state,
   core::NodeField1D force_r;
   core::NodeField1D force_z;
   core::NodeField1D node_mass;
+  const_cast<core::State&>(state).mesh.materialize_host_svec();
   svec_r = state.mesh.cell_Svec_r;
   svec_z = state.mesh.cell_Svec_z;
   corner_mass.reset(static_cast<std::size_t>(n_cells) * 4U);
@@ -1465,23 +1695,31 @@ bool compute_precise_rz_geometric_u_half(const core::State& state,
     TENRYU_ASSERT(state.pressure_drive_1d.has_value(),
                   "RZ geometric CFL precise u_half pressure boundary requires pressure_drive_1d");
     const double p_ext = state.pressure_drive_1d->eval(state.t);
+    const auto& pcfg =
+        cfg.numerics.hydro.pressure_drive_perturbation;
+    PressureDrivePerturbationParams pp{};
+    if (pcfg.enabled) {
+      pp = core::make_pressure_drive_perturbation_params(pcfg);
+    }
     const bool rz_exact_endpoint =
         state.mesh.logical == mesh::LogicalMesh2D::SphericalPolarHalfplane;
     if (mesh::mesh_topo_is_multiblock(cfg.mesh)) {
-      mesh::mesh_topo_assert_multiblock_polar_shell_outer_boundary(
+      mesh::mesh_topo_assert_multiblock_outermost_polar_shell_outer_boundary(
           state.mesh.topo);
       detail::launch_multiblock_polar_shell_pressure_forces(
           force_r.data(), force_z.data(), state.x_r.data(), state.x_z.data(),
-          mesh::mesh_topo_multiblock_polar_shell_node_offset(state.mesh.topo),
-          mesh::mesh_topo_multiblock_polar_shell_nr(state.mesh.topo),
-          mesh::mesh_topo_multiblock_polar_shell_nz(state.mesh.topo), p_ext,
+          mesh::mesh_topo_multiblock_outermost_polar_shell_node_offset(
+              state.mesh.topo),
+          mesh::mesh_topo_multiblock_outermost_polar_shell_nr(state.mesh.topo),
+          mesh::mesh_topo_multiblock_outermost_polar_shell_nz(state.mesh.topo),
+          p_ext,
           rz_exact_endpoint, nullptr,
-          cfg.numerics.hydro.rz_momentum_scheme_id);
+          cfg.numerics.hydro.rz_momentum_scheme_id, pp, pcfg.enabled);
     } else {
       detail::launch_r_outer_boundary_pressure_forces(
           force_r.data(), force_z.data(), state.x_r.data(), state.x_z.data(),
           nr, nz, p_ext, rz_exact_endpoint,
-          cfg.numerics.hydro.rz_momentum_scheme_id);
+          cfg.numerics.hydro.rz_momentum_scheme_id, pp, pcfg.enabled);
     }
   }
 
@@ -1511,7 +1749,11 @@ double compute_axis_margin_cfl_dt(const core::State& state,
                                   const double floor_fraction,
                                   const bool has_physical_rz_axis,
                                   const core::Config& cfg,
-                                  TriFanCenterCflInfo* tri_fan_center_cfl) {
+                                  TriFanCenterCflInfo* tri_fan_center_cfl,
+                                  int* argmin_j) {
+  if (argmin_j != nullptr) {
+    *argmin_j = -1;
+  }
   if (state.mesh.dim != 2 || !(dt_proposed > 0.0) ||
       !std::isfinite(dt_proposed)) {
     return dt_proposed;
@@ -1563,14 +1805,43 @@ double compute_axis_margin_cfl_dt(const core::State& state,
 
   const int blocks = (nz + 255) / 256;
   axis_margin_cfl_dt_kernel<<<blocks, 256>>>(
-      d_min_scale, state.x_r.data(), state.x_z.data(), state.v_r.data(),
-      state.v_z.data(), nz, dt_proposed, floor_fraction);
+      d_min_scale, nullptr, 0.0, state.x_r.data(), state.x_z.data(), state.v_r.data(),
+      state.v_z.data(),
+      state.evacuated_cells.d_geometry_policy_exempt_cells.empty()
+          ? nullptr
+          : state.evacuated_cells.d_geometry_policy_exempt_cells.data(),
+      nz, dt_proposed, floor_fraction);
   cuda_check(cudaGetLastError(), "CFL axis-margin kernel launch failed");
   cuda_check(core::debug_kernel_sync(), "CFL axis-margin kernel execution failed");
 
   double min_scale = 1.0;
   cuda_check(cudaMemcpy(&min_scale, d_min_scale, sizeof(double), cudaMemcpyDeviceToHost),
              "CFL: memcpy axis min_scale failed");
+
+  if (argmin_j != nullptr && std::isfinite(min_scale) && min_scale < 1.0) {
+    int* d_winner_j = static_cast<int*>(core::device_scratch_acquire(
+        "cfl:compute_axis_margin_cfl_dt:d_winner_j", sizeof(int)));
+    cuda_check(cudaMemcpy(d_winner_j, &nz, sizeof(int), cudaMemcpyHostToDevice),
+               "CFL: init axis winner_j failed");
+    axis_margin_cfl_dt_kernel<<<blocks, 256>>>(
+        d_min_scale, d_winner_j, min_scale, state.x_r.data(), state.x_z.data(),
+        state.v_r.data(), state.v_z.data(),
+        state.evacuated_cells.d_geometry_policy_exempt_cells.empty()
+            ? nullptr
+            : state.evacuated_cells.d_geometry_policy_exempt_cells.data(),
+        nz, dt_proposed, floor_fraction);
+    cuda_check(cudaGetLastError(),
+               "CFL axis-margin winner kernel launch failed");
+    cuda_check(core::debug_kernel_sync(),
+               "CFL axis-margin winner kernel execution failed");
+    int winner_j = nz;
+    cuda_check(cudaMemcpy(&winner_j, d_winner_j, sizeof(int),
+                          cudaMemcpyDeviceToHost),
+               "CFL: copy axis winner_j failed");
+    if (winner_j >= 0 && winner_j < nz) {
+      *argmin_j = winner_j;
+    }
+  }
 
   if (!std::isfinite(min_scale)) {
     return 0.0;
@@ -1662,6 +1933,14 @@ TriFanCenterCflInfo compute_tri_fan_center_cfl_dt_legacy(
                         cudaMemcpyDeviceToHost),
              "tri_fan center CFL: memcpy Qvisc failed");
 
+  // Pooled/derefined member cells are not evolved by the integrator; their
+  // (virtual) geometry must not gate dt. Same exclusion the acoustic path
+  // applies via the central-macro effective-active mask.
+  const std::vector<std::int8_t> effective_active =
+      make_cfl_central_macro_effective_active(state, cfg);
+  const std::vector<std::int8_t>& active_source =
+      effective_active.empty() ? state.hydro_active : effective_active;
+
   const auto node = [nz](const int i, const int j) {
     return static_cast<std::size_t>(i * (nz + 1) + j);
   };
@@ -1694,6 +1973,11 @@ TriFanCenterCflInfo compute_tri_fan_center_cfl_dt_legacy(
       }
       const int c = i * nz + j;
       const std::size_t idx = static_cast<std::size_t>(c);
+      if (!active_source.empty() &&
+          static_cast<std::size_t>(c) < active_source.size() &&
+          active_source[static_cast<std::size_t>(c)] == 0) {
+        continue;
+      }
       const double p = Pe[idx] + Pi[idx];
       const double q = Qvisc[idx];
       const double rho_eff = std::max(rho[idx], kCflSensorEps);
@@ -1807,12 +2091,25 @@ TriFanCenterCflInfo compute_centroid_r_center_cfl_dt(
     state.cs.copy_to_host(cs.data());
   }
 
+  // Pooled/derefined member cells are not evolved by the integrator; their
+  // (virtual) geometry must not gate dt. Same exclusion the acoustic path
+  // applies via the central-macro effective-active mask.
+  const std::vector<std::int8_t> effective_active =
+      make_cfl_central_macro_effective_active(state, cfg);
+  const std::vector<std::int8_t>& active_source =
+      effective_active.empty() ? state.hydro_active : effective_active;
+
   const double gamma = cfg.materials.materials.front().ideal_gas_gamma;
   const double safety = cfg.numerics.hydro.tri_fan_center_cfl_safety;
   const double r_match = cfg.mesh.multiblock_cart_core_r_match;
   const bool have_cell_nverts =
       state.mesh.cell_nverts.size() == static_cast<std::size_t>(n_cells);
   for (int c = 0; c < n_cells; ++c) {
+    if (!active_source.empty() &&
+        static_cast<std::size_t>(c) < active_source.size() &&
+        active_source[static_cast<std::size_t>(c)] == 0) {
+      continue;
+    }
     const std::size_t idx = static_cast<std::size_t>(c);
     const double centroid_r = state.mesh.cell_centroid_r[idx];
     if (!(centroid_r <= r_match) || !std::isfinite(centroid_r)) {
@@ -1984,7 +2281,11 @@ double compute_volume_rate_cfl_dt(const core::State& state,
                                   const double dt_in,
                                   const double dt_used_prev,
                                   const double threshold,
-                                  const parallel::Reduction* reduction) {
+                                  const parallel::Reduction* reduction,
+                                  int* exact_argmin_cell) {
+  if (exact_argmin_cell != nullptr) {
+    *exact_argmin_cell = -1;
+  }
   if (state.mesh.dim != 2 || !(dt_in > 0.0) || !std::isfinite(dt_in) ||
       !(dt_used_prev > 0.0) || !std::isfinite(dt_used_prev)) {
     return dt_in;
@@ -2013,11 +2314,20 @@ double compute_volume_rate_cfl_dt(const core::State& state,
   const std::uint8_t* d_inactive_mask_ptr =
       pole_angular_derefine::combined_inactive_mask_device(
           mutable_state, d_inactive_mask);
+  // The evacuated spacer's volume dynamics belong to the contact machinery, not the dt controller (§22-C12a; the V2a threading missed this path).
+  const std::uint8_t* d_evacuated_cell_mask =
+      state.evacuated_cells.d_inactive_member_mask.size() ==
+              static_cast<std::size_t>(n_cells)
+          ? state.evacuated_cells.d_inactive_member_mask.data()
+          : nullptr;
   const core::State::LaunchWindow cw = state.owned_cell_window(n_cells);
   volume_rate_cfl_min_kernel<<<cw.blocks(), 256>>>(
       d_min_dt, state.vol.data(), state.vol_prev_hydro.data(),
-      d_inactive_mask_ptr, cw.begin, cw.end, n_cells,
-      dt_used_prev, threshold);
+      d_inactive_mask_ptr, d_evacuated_cell_mask,
+      state.evacuated_cells.d_geometry_policy_exempt_cells.empty()
+          ? nullptr
+          : state.evacuated_cells.d_geometry_policy_exempt_cells.data(),
+      cw.begin, cw.end, n_cells, dt_used_prev, threshold);
   cuda_check(cudaGetLastError(), "CFL volume-rate kernel launch failed");
   cuda_check(core::debug_kernel_sync(), "CFL volume-rate kernel execution failed");
 
@@ -2029,6 +2339,29 @@ double compute_volume_rate_cfl_dt(const core::State& state,
   }
   if (!std::isfinite(global_limit)) {
     return dt_in;
+  }
+
+  if (exact_argmin_cell != nullptr && local_limit == global_limit) {
+    int* d_winner_cell = static_cast<int*>(core::device_scratch_acquire(
+        "cfl:compute_volume_rate_cfl_dt:d_lineage_winner_cell", sizeof(int)));
+    cuda_check(cudaMemcpy(d_winner_cell, &n_cells, sizeof(int),
+                          cudaMemcpyHostToDevice),
+               "CFL: init volume-rate lineage winner failed");
+    volume_rate_cfl_lineage_winner_kernel<<<cw.blocks(), 256>>>(
+        d_winner_cell, state.vol.data(), state.vol_prev_hydro.data(),
+        d_inactive_mask_ptr, cw.begin, cw.end, n_cells, dt_used_prev,
+        threshold, global_limit);
+    cuda_check(cudaGetLastError(),
+               "CFL volume-rate lineage winner kernel launch failed");
+    cuda_check(core::debug_kernel_sync(),
+               "CFL volume-rate lineage winner kernel execution failed");
+    int winner_cell = n_cells;
+    cuda_check(cudaMemcpy(&winner_cell, d_winner_cell, sizeof(int),
+                          cudaMemcpyDeviceToHost),
+               "CFL: copy volume-rate lineage winner failed");
+    if (winner_cell >= 0 && winner_cell < n_cells) {
+      *exact_argmin_cell = winner_cell;
+    }
   }
 
   const double dt_out = std::min(dt_in, global_limit);
@@ -2048,8 +2381,8 @@ double compute_volume_rate_cfl_dt(const core::State& state,
 
     volume_rate_cfl_detail_kernel<<<cw.blocks(), 256>>>(
         d_min_cell, d_min_frac_rate, state.vol.data(), state.vol_prev_hydro.data(),
-        d_inactive_mask_ptr, cw.begin, cw.end, n_cells, dt_used_prev, threshold,
-        local_limit);
+        d_inactive_mask_ptr, d_evacuated_cell_mask, cw.begin, cw.end, n_cells,
+        dt_used_prev, threshold, local_limit);
     cuda_check(cudaGetLastError(), "CFL volume-rate detail kernel launch failed");
     cuda_check(core::debug_kernel_sync(), "CFL volume-rate detail kernel execution failed");
 
@@ -2166,17 +2499,89 @@ double compute_dt_hydro_acoustic(const core::State& state,
                                             state.mesh);
   const int button_outer_node_ring =
       button_outer_node_ring_or_zero(state.mesh);
+  // The production default remains "sqrt_area"; min-altitude is opt-in, so
+  // default-baseline characteristic lengths are unaffected.
+  const bool use_min_altitude =
+      cfg.numerics.dt.cfl_length_2d == "min_altitude";
+  const bool reale_mesh = (cfg.numerics.ale.mesh_mode == "reale_v2");
+  // corner_stride == 8 exactly identifies native-pentagon-capable meshes.
+  const bool mesh_contains_pentagons = state.corner_stride == 8;
+  const bool have_cell_node_csr =
+      (use_min_altitude || mesh_contains_pentagons) &&
+      state.mesh.topo.multiblock.has_value() &&
+      state.mesh.multiblock_cell_node_csr_offsets.size() ==
+          static_cast<std::size_t>(n_cells) + 1U &&
+      !state.mesh.multiblock_cell_node_csr_indices.empty();
+  const int* d_cell_node_csr_offsets =
+      have_cell_node_csr
+          ? state.mesh.multiblock_cell_node_csr_offsets.data()
+          : nullptr;
+  const int* d_cell_node_csr_indices =
+      have_cell_node_csr
+          ? state.mesh.multiblock_cell_node_csr_indices.data()
+          : nullptr;
+  core::DeviceArray<std::uint8_t> d_cell_nverts;
+  const std::uint8_t* d_cell_nverts_ptr = nullptr;
+  if ((use_min_altitude || mesh_contains_pentagons) &&
+      have_cell_node_csr) {
+    d_cell_nverts_ptr =
+        upload_cell_nverts_if_nonquad(d_cell_nverts, state.mesh, n_cells);
+  }
 
   const core::State::LaunchWindow cw = state.owned_cell_window(n_cells);
   core::DeviceArray<std::uint8_t> d_combined_inactive;
   const std::uint8_t* d_pseudo_core_member =
       pole_angular_derefine::combined_inactive_mask_device(
           mutable_state, d_combined_inactive);
-  cfl_2d_kernel<<<cw.blocks(), 256>>>(
-      d_min_dt, d_have_active, state.x_r.data(), state.x_z.data(),
-      state.v_r.data(), state.v_z.data(), state.ee.data(), ei, cs, d_area,
-      d_cell_kind, d_active, d_pseudo_core_member, cw.begin, cw.end, n_cells,
-      state.mesh.topo.nz, button_outer_node_ring, gamma, av_c1);
+  if (use_min_altitude) {
+    if (reale_mesh) {
+      cfl_2d_kernel<1, 1><<<cw.blocks(), 256>>>(
+          d_min_dt, nullptr, 0.0, d_have_active, state.x_r.data(), state.x_z.data(),
+          state.v_r.data(), state.v_z.data(), state.ee.data(), ei, cs, d_area,
+          d_cell_node_csr_offsets, d_cell_node_csr_indices, d_cell_nverts_ptr,
+          d_cell_kind, d_active,
+          state.evacuated_cells.d_geometry_policy_exempt_cells.empty()
+              ? nullptr
+              : state.evacuated_cells.d_geometry_policy_exempt_cells.data(),
+          d_pseudo_core_member, cw.begin, cw.end, n_cells, state.mesh.topo.nz,
+          button_outer_node_ring, gamma, av_c1);
+    } else {
+      cfl_2d_kernel<1, 0><<<cw.blocks(), 256>>>(
+          d_min_dt, nullptr, 0.0, d_have_active, state.x_r.data(), state.x_z.data(),
+          state.v_r.data(), state.v_z.data(), state.ee.data(), ei, cs, d_area,
+          d_cell_node_csr_offsets, d_cell_node_csr_indices, d_cell_nverts_ptr,
+          d_cell_kind, d_active,
+          state.evacuated_cells.d_geometry_policy_exempt_cells.empty()
+              ? nullptr
+              : state.evacuated_cells.d_geometry_policy_exempt_cells.data(),
+          d_pseudo_core_member, cw.begin, cw.end, n_cells, state.mesh.topo.nz,
+          button_outer_node_ring, gamma, av_c1);
+    }
+  } else {
+    if (reale_mesh) {
+      cfl_2d_kernel<0, 1><<<cw.blocks(), 256>>>(
+          d_min_dt, nullptr, 0.0, d_have_active, state.x_r.data(), state.x_z.data(),
+          state.v_r.data(), state.v_z.data(), state.ee.data(), ei, cs, d_area,
+          d_cell_node_csr_offsets, d_cell_node_csr_indices, d_cell_nverts_ptr,
+          d_cell_kind, d_active,
+          state.evacuated_cells.d_geometry_policy_exempt_cells.empty()
+              ? nullptr
+              : state.evacuated_cells.d_geometry_policy_exempt_cells.data(),
+          d_pseudo_core_member, cw.begin, cw.end, n_cells, state.mesh.topo.nz,
+          button_outer_node_ring, gamma, av_c1);
+    } else {
+      cfl_2d_kernel<0, 0><<<cw.blocks(), 256>>>(
+          d_min_dt, nullptr, 0.0, d_have_active, state.x_r.data(), state.x_z.data(),
+          state.v_r.data(), state.v_z.data(), state.ee.data(), ei, cs, d_area,
+          d_cell_node_csr_offsets, d_cell_node_csr_indices, d_cell_nverts_ptr,
+          d_cell_kind, d_active,
+          state.evacuated_cells.d_geometry_policy_exempt_cells.empty()
+              ? nullptr
+              : state.evacuated_cells.d_geometry_policy_exempt_cells.data(),
+          d_pseudo_core_member, cw.begin, cw.end, n_cells, state.mesh.topo.nz,
+          button_outer_node_ring, gamma, av_c1);
+    }
+  }
   cuda_check(cudaGetLastError(), "CFL acoustic 2D kernel launch failed");
   cuda_check(core::debug_kernel_sync(), "CFL acoustic 2D kernel execution failed");
 
@@ -2257,8 +2662,12 @@ AxisMarginDtArgmin compute_dt_hydro_axis_margin_argmin(
 
   const int blocks = (nz + 255) / 256;
   axis_margin_cfl_dt_kernel<<<blocks, 256>>>(
-      d_min_scale, state.x_r.data(), state.x_z.data(), state.v_r.data(),
-      state.v_z.data(), nz, dt_proposed,
+      d_min_scale, nullptr, 0.0, state.x_r.data(), state.x_z.data(), state.v_r.data(),
+      state.v_z.data(),
+      state.evacuated_cells.d_geometry_policy_exempt_cells.empty()
+          ? nullptr
+          : state.evacuated_cells.d_geometry_policy_exempt_cells.data(),
+      nz, dt_proposed,
       cfg.numerics.hydro.axis_margin_dt_floor_fraction);
   cuda_check(cudaGetLastError(), "CFL diagnostic axis-margin kernel launch failed");
   cuda_check(core::debug_kernel_sync(),
@@ -2278,7 +2687,15 @@ AxisMarginDtArgmin compute_dt_hydro_axis_margin_argmin(
 }
 
 double compute_pole_axis_bbsw_contact_dt(const core::State& state,
-                                         const core::Config& cfg) {
+                                         const core::Config& cfg,
+                                         int* argmin_node0,
+                                         int* argmin_node1) {
+  if (argmin_node0 != nullptr) {
+    *argmin_node0 = -1;
+  }
+  if (argmin_node1 != nullptr) {
+    *argmin_node1 = -1;
+  }
   if (!pole_axis_bbsw_enabled(cfg) || cfg.main.dimension != "2D_RZ" ||
       !state.mesh.topo.multiblock.has_value() || state.x_z.size() != state.v_z.size()) {
     return std::numeric_limits<double>::infinity();
@@ -2293,7 +2710,115 @@ double compute_pole_axis_bbsw_contact_dt(const core::State& state,
   std::vector<double> v_z;
   state.x_z.copy_to_host(z);
   state.v_z.copy_to_host(v_z);
+  // Nodes owned exclusively by pooled/derefined member cells are bookkeeping
+  // (virtual-ladder) geometry, not integrator state: they must not gate dt.
+  // A node is kept if any evolved cell touches it or if it lies on the
+  // pseudo-core boundary ring (the live interface).
+  std::vector<std::uint8_t> non_evolved_node;
+  {
+    const auto& mbt = *state.mesh.topo.multiblock;
+    const int n_cells = state.mesh.topo.n_cells;
+    const auto cell_inactive = [&](const int c) {
+      const std::size_t ci = static_cast<std::size_t>(c);
+      const auto& pcm = state.central_pseudo_core.inactive_member_mask;
+      const auto& pdm = state.pole_angular_derefine.inactive_member_mask;
+      const bool a = ci < pcm.size() && pcm[ci] != 0U;
+      const bool b = ci < pdm.size() && pdm[ci] != 0U;
+      return a || b;
+    };
+    bool any_inactive = false;
+    for (int c = 0; c < n_cells && !any_inactive; ++c) {
+      any_inactive = cell_inactive(c);
+    }
+    if (any_inactive &&
+        mbt.cell_node_csr_offsets.size() ==
+            static_cast<std::size_t>(n_cells) + 1U) {
+      non_evolved_node.assign(z.size(), 0U);
+      const auto mark = [&](const int c, const std::uint8_t v) {
+        const int off = mbt.cell_node_csr_offsets[static_cast<std::size_t>(c)];
+        const int end =
+            mbt.cell_node_csr_offsets[static_cast<std::size_t>(c) + 1U];
+        for (int k = off; k < end; ++k) {
+          const int node =
+              mbt.cell_node_csr_indices[static_cast<std::size_t>(k)];
+          if (node >= 0 && static_cast<std::size_t>(node) < z.size()) {
+            non_evolved_node[static_cast<std::size_t>(node)] = v;
+          }
+        }
+      };
+      for (int c = 0; c < n_cells; ++c) {
+        if (cell_inactive(c)) {
+          mark(c, 1U);
+        }
+      }
+      for (int c = 0; c < n_cells; ++c) {
+        if (!cell_inactive(c)) {
+          mark(c, 0U);
+        }
+      }
+      const auto& bnd = state.central_pseudo_core.boundary_node_mask;
+      if (bnd.size() == z.size()) {
+        for (std::size_t n = 0; n < bnd.size(); ++n) {
+          if (bnd[n] != 0U) {
+            non_evolved_node[n] = 0U;
+          }
+        }
+      }
+    }
+  }
+  const auto node_excluded = [&](const int n) {
+    return !non_evolved_node.empty() &&
+           n >= 0 && static_cast<std::size_t>(n) < non_evolved_node.size() &&
+           non_evolved_node[static_cast<std::size_t>(n)] != 0U;
+  };
   const int n_nodes = static_cast<int>(z.size());
+  if (mesh::mesh_topo_has_polar_tier_cart_center(cfg.mesh)) {
+    std::vector<double> r;
+    state.x_r.copy_to_host(r);
+    const std::vector<int> nodes = pole_axis_bbsw_hybrid_cart_axis_nodes(
+        state, cfg, r, z);
+    std::vector<int> chain;
+    chain.reserve(nodes.size());
+    for (const int n : nodes) {
+      if (!node_excluded(n)) {
+        chain.push_back(n);
+      }
+    }
+    double dt_axis = std::numeric_limits<double>::infinity();
+    for (std::size_t i = 0; i + 1U < chain.size(); ++i) {
+      const int n0 = chain[i];
+      const int n1 = chain[i + 1U];
+      const double z0 = z[static_cast<std::size_t>(n0)];
+      const double z1 = z[static_cast<std::size_t>(n1)];
+      const double u0 = v_z[static_cast<std::size_t>(n0)];
+      const double u1 = v_z[static_cast<std::size_t>(n1)];
+      const double closing = u0 - u1;
+      if (!(closing > 0.0) || !std::isfinite(closing)) {
+        continue;
+      }
+      const double gap = z1 - z0;
+      const double delta = pole_axis_bbsw::hard_gap(z0, z1);
+      const double margin = gap - delta;
+      if (!std::isfinite(margin)) {
+        continue;
+      }
+      const double candidate = pole_axis_bbsw::kAxisContactC *
+                               std::max(0.0, margin) / closing;
+      if (candidate < dt_axis ||
+          (candidate == dt_axis && argmin_node0 != nullptr &&
+           (n0 < *argmin_node0 ||
+            (n0 == *argmin_node0 && n1 < *argmin_node1)))) {
+        if (argmin_node0 != nullptr) {
+          *argmin_node0 = n0;
+        }
+        if (argmin_node1 != nullptr) {
+          *argmin_node1 = n1;
+        }
+      }
+      dt_axis = std::min(dt_axis, candidate);
+    }
+    return dt_axis;
+  }
   const int stride = shell.n_j_cells + 1;
   const auto shell_node = [&](const int q, const int j) {
     return shell.owned_node_begin + q * stride + j;
@@ -2315,6 +2840,9 @@ double compute_pole_axis_bbsw_contact_dt(const core::State& state,
       if (n0 < 0 || n1 < 0 || n0 >= n_nodes || n1 >= n_nodes) {
         continue;
       }
+      if (node_excluded(n0) || node_excluded(n1)) {
+        continue;
+      }
       const double dz0 = z[static_cast<std::size_t>(n0)] - z_c;
       const double dz1 = z[static_cast<std::size_t>(n1)] - z_c;
       const double s0 = std::fabs(dz0);
@@ -2333,9 +2861,20 @@ double compute_pole_axis_bbsw_contact_dt(const core::State& state,
       if (!std::isfinite(margin)) {
         continue;
       }
-      dt_axis = std::min(dt_axis,
-                         pole_axis_bbsw::kAxisContactC *
-                             std::max(0.0, margin) / closing);
+      const double candidate = pole_axis_bbsw::kAxisContactC *
+                               std::max(0.0, margin) / closing;
+      if (candidate < dt_axis ||
+          (candidate == dt_axis && argmin_node0 != nullptr &&
+           (n0 < *argmin_node0 ||
+            (n0 == *argmin_node0 && n1 < *argmin_node1)))) {
+        if (argmin_node0 != nullptr) {
+          *argmin_node0 = n0;
+        }
+        if (argmin_node1 != nullptr) {
+          *argmin_node1 = n1;
+        }
+      }
+      dt_axis = std::min(dt_axis, candidate);
     }
   }
   return dt_axis;
@@ -2396,6 +2935,18 @@ VolumeRateDtArgmin compute_dt_hydro_volume_rate_argmin(
       }
     }
   }
+  if (state.evacuated_cells.inactive_member_mask.size() ==
+      static_cast<std::size_t>(n_cells)) {
+    if (inactive_storage.empty()) {
+      inactive_storage.assign(static_cast<std::size_t>(n_cells), 0U);
+    }
+    for (int c = 0; c < n_cells; ++c) {
+      if (state.evacuated_cells
+              .inactive_member_mask[static_cast<std::size_t>(c)] != 0U) {
+        inactive_storage[static_cast<std::size_t>(c)] = 1U;
+      }
+    }
+  }
   if (!inactive_storage.empty()) {
     inactive_member = &inactive_storage;
   }
@@ -2427,8 +2978,10 @@ VolumeRateDtArgmin compute_dt_hydro_volume_rate_argmin(
   return result;
 }
 
-HydroDtDiagnostics compute_dt_hydro_diagnostics(const core::State& state,
-                                                const core::Config& cfg) {
+HydroDtDiagnostics compute_dt_hydro_diagnostics(
+    const core::State& state,
+    const core::Config& cfg,
+    const bool track_min_contributor) {
   HydroDtDiagnostics result;
   TENRYU_ASSERT(state.x_r.size() == state.v_r.size(),
                 "CFL requires matching node position/velocity arrays");
@@ -2484,6 +3037,9 @@ HydroDtDiagnostics compute_dt_hydro_diagnostics(const core::State& state,
           : (cfg.numerics.hydro.av_type == "riemann_compatible" ? 2 : 0);
   const double* ei = state.ei.empty() ? nullptr : state.ei.data();
   const double* cs = state.cs.empty() ? nullptr : state.cs.data();
+  result.min_contributor.term_class = HydroMinTermClass::AcousticCell;
+  result.min_contributor.term_detail = HydroMinTermDetail::AcousticCell;
+  int lineage_acoustic_winner_cell = -1;
 
   TENRYU_ASSERT(av_limiter_J >= 0.0, "CFL requires av_limiter_J >= 0");
 
@@ -2541,7 +3097,8 @@ HydroDtDiagnostics compute_dt_hydro_diagnostics(const core::State& state,
         cfg.numerics.hydro.post_shock_heat_C,
         cfg.numerics.hydro.post_shock_heat_decay,
         cfg.numerics.hydro.crossing_dt_safety,
-        art_heat_bound_enabled ? 1 : 0, av_heat_bound_c, av_limiter_J);
+        art_heat_bound_enabled ? 1 : 0, av_heat_bound_c, av_limiter_J,
+        nullptr, static_cast<int>(HydroMinOtherTerm::None), 0.0);
     cuda_check(cudaGetLastError(), "CFL 1D kernel launch failed");
     cuda_check(core::debug_kernel_sync(), "CFL 1D kernel execution failed");
   } else {
@@ -2577,24 +3134,166 @@ HydroDtDiagnostics compute_dt_hydro_diagnostics(const core::State& state,
                                               state.mesh);
     const int button_outer_node_ring =
         button_outer_node_ring_or_zero(state.mesh);
-    core::DeviceArray<std::uint8_t> d_cell_nverts;
-    const std::uint8_t* d_cell_nverts_ptr =
-        upload_cell_nverts_if_nonquad(d_cell_nverts, state.mesh, n_cells);
+    const bool use_min_altitude =
+        cfg.numerics.dt.cfl_length_2d == "min_altitude";
+    const bool reale_mesh = (cfg.numerics.ale.mesh_mode == "reale_v2");
+    // corner_stride == 8 exactly identifies native-pentagon-capable meshes.
+    const bool mesh_contains_pentagons = state.corner_stride == 8;
+    const bool have_cell_node_csr =
+        (use_min_altitude || mesh_contains_pentagons) &&
+        state.mesh.topo.multiblock.has_value() &&
+        state.mesh.multiblock_cell_node_csr_offsets.size() ==
+            static_cast<std::size_t>(n_cells) + 1U &&
+        !state.mesh.multiblock_cell_node_csr_indices.empty();
+    const int* d_cell_node_csr_offsets =
+        have_cell_node_csr
+            ? state.mesh.multiblock_cell_node_csr_offsets.data()
+            : nullptr;
+    const int* d_cell_node_csr_indices =
+        have_cell_node_csr
+            ? state.mesh.multiblock_cell_node_csr_indices.data()
+            : nullptr;
+    core::DeviceArray<std::uint8_t> d_cell_nverts{
+        "cfl:compute_dt_hydro_diagnostics:cell_nverts"};
+    const std::uint8_t* d_cell_nverts_ptr = nullptr;
+    if ((use_min_altitude || mesh_contains_pentagons) &&
+        have_cell_node_csr) {
+      d_cell_nverts_ptr =
+          upload_cell_nverts_if_nonquad(d_cell_nverts, state.mesh, n_cells);
+    }
 
     const core::State::LaunchWindow cw = state.owned_cell_window(n_cells);
-    core::DeviceArray<std::uint8_t> d_combined_inactive;
+    core::DeviceArray<std::uint8_t> d_combined_inactive{
+        "cfl:compute_dt_hydro_diagnostics:combined_inactive"};
     const std::uint8_t* d_pseudo_core_member =
         pole_angular_derefine::combined_inactive_mask_device(
             mutable_state, d_combined_inactive);
-    cfl_2d_kernel<<<cw.blocks(), 256>>>(
-        d_min_dt, d_have_active, state.x_r.data(), state.x_z.data(),
-        state.v_r.data(), state.v_z.data(), state.ee.data(), ei, cs, d_area,
-        d_cell_kind, d_active, d_pseudo_core_member, cw.begin, cw.end, n_cells,
-        state.mesh.topo.nz, button_outer_node_ring, gamma, av_c1);
+    if (use_min_altitude) {
+      if (reale_mesh) {
+        cfl_2d_kernel<1, 1><<<cw.blocks(), 256>>>(
+            d_min_dt, nullptr, 0.0, d_have_active, state.x_r.data(), state.x_z.data(),
+            state.v_r.data(), state.v_z.data(), state.ee.data(), ei, cs, d_area,
+            d_cell_node_csr_offsets, d_cell_node_csr_indices,
+            d_cell_nverts_ptr, d_cell_kind, d_active,
+            state.evacuated_cells.d_geometry_policy_exempt_cells.empty()
+                ? nullptr
+                : state.evacuated_cells.d_geometry_policy_exempt_cells.data(),
+            d_pseudo_core_member, cw.begin, cw.end, n_cells, state.mesh.topo.nz,
+            button_outer_node_ring, gamma, av_c1);
+      } else {
+        cfl_2d_kernel<1, 0><<<cw.blocks(), 256>>>(
+            d_min_dt, nullptr, 0.0, d_have_active, state.x_r.data(), state.x_z.data(),
+            state.v_r.data(), state.v_z.data(), state.ee.data(), ei, cs, d_area,
+            d_cell_node_csr_offsets, d_cell_node_csr_indices,
+            d_cell_nverts_ptr, d_cell_kind, d_active,
+            state.evacuated_cells.d_geometry_policy_exempt_cells.empty()
+                ? nullptr
+                : state.evacuated_cells.d_geometry_policy_exempt_cells.data(),
+            d_pseudo_core_member, cw.begin, cw.end, n_cells, state.mesh.topo.nz,
+            button_outer_node_ring, gamma, av_c1);
+      }
+    } else {
+      if (reale_mesh) {
+        cfl_2d_kernel<0, 1><<<cw.blocks(), 256>>>(
+            d_min_dt, nullptr, 0.0, d_have_active, state.x_r.data(), state.x_z.data(),
+            state.v_r.data(), state.v_z.data(), state.ee.data(), ei, cs, d_area,
+            d_cell_node_csr_offsets, d_cell_node_csr_indices,
+            d_cell_nverts_ptr, d_cell_kind, d_active,
+            state.evacuated_cells.d_geometry_policy_exempt_cells.empty()
+                ? nullptr
+                : state.evacuated_cells.d_geometry_policy_exempt_cells.data(),
+            d_pseudo_core_member, cw.begin, cw.end, n_cells, state.mesh.topo.nz,
+            button_outer_node_ring, gamma, av_c1);
+      } else {
+        cfl_2d_kernel<0, 0><<<cw.blocks(), 256>>>(
+            d_min_dt, nullptr, 0.0, d_have_active, state.x_r.data(), state.x_z.data(),
+            state.v_r.data(), state.v_z.data(), state.ee.data(), ei, cs, d_area,
+            d_cell_node_csr_offsets, d_cell_node_csr_indices,
+            d_cell_nverts_ptr, d_cell_kind, d_active,
+            state.evacuated_cells.d_geometry_policy_exempt_cells.empty()
+                ? nullptr
+                : state.evacuated_cells.d_geometry_policy_exempt_cells.data(),
+            d_pseudo_core_member, cw.begin, cw.end, n_cells, state.mesh.topo.nz,
+            button_outer_node_ring, gamma, av_c1);
+      }
+    }
     cuda_check(cudaGetLastError(), "CFL 2D kernel launch failed");
     cuda_check(core::debug_kernel_sync(), "CFL 2D kernel execution failed");
     const double min_local_2d = copy_last_min_dt(d_min_dt);
     if (std::isfinite(min_local_2d)) {
+      if (track_min_contributor) {
+        int* d_lineage_winner_cell =
+            static_cast<int*>(core::device_scratch_acquire(
+                "cfl:compute_dt_hydro_diagnostics:d_lineage_acoustic_winner",
+                sizeof(int)));
+        cuda_check(cudaMemcpy(d_lineage_winner_cell, &n_cells, sizeof(int),
+                              cudaMemcpyHostToDevice),
+                   "CFL lineage: init 2D acoustic winner failed");
+        if (use_min_altitude) {
+          if (reale_mesh) {
+            cfl_2d_kernel<1, 1><<<cw.blocks(), 256>>>(
+                d_min_dt, d_lineage_winner_cell, min_local_2d, d_have_active,
+                state.x_r.data(), state.x_z.data(), state.v_r.data(),
+                state.v_z.data(), state.ee.data(), ei, cs, d_area,
+                d_cell_node_csr_offsets, d_cell_node_csr_indices,
+                d_cell_nverts_ptr, d_cell_kind, d_active,
+                state.evacuated_cells.d_geometry_policy_exempt_cells.empty()
+                    ? nullptr
+                    : state.evacuated_cells.d_geometry_policy_exempt_cells.data(),
+                d_pseudo_core_member, cw.begin, cw.end, n_cells,
+                state.mesh.topo.nz, button_outer_node_ring, gamma, av_c1);
+          } else {
+            cfl_2d_kernel<1, 0><<<cw.blocks(), 256>>>(
+                d_min_dt, d_lineage_winner_cell, min_local_2d, d_have_active,
+                state.x_r.data(), state.x_z.data(), state.v_r.data(),
+                state.v_z.data(), state.ee.data(), ei, cs, d_area,
+                d_cell_node_csr_offsets, d_cell_node_csr_indices,
+                d_cell_nverts_ptr, d_cell_kind, d_active,
+                state.evacuated_cells.d_geometry_policy_exempt_cells.empty()
+                    ? nullptr
+                    : state.evacuated_cells.d_geometry_policy_exempt_cells.data(),
+                d_pseudo_core_member, cw.begin, cw.end, n_cells,
+                state.mesh.topo.nz, button_outer_node_ring, gamma, av_c1);
+          }
+        } else if (reale_mesh) {
+          cfl_2d_kernel<0, 1><<<cw.blocks(), 256>>>(
+              d_min_dt, d_lineage_winner_cell, min_local_2d, d_have_active,
+              state.x_r.data(), state.x_z.data(), state.v_r.data(),
+              state.v_z.data(), state.ee.data(), ei, cs, d_area,
+              d_cell_node_csr_offsets, d_cell_node_csr_indices,
+              d_cell_nverts_ptr, d_cell_kind, d_active,
+              state.evacuated_cells.d_geometry_policy_exempt_cells.empty()
+                  ? nullptr
+                  : state.evacuated_cells.d_geometry_policy_exempt_cells.data(),
+              d_pseudo_core_member, cw.begin, cw.end, n_cells,
+              state.mesh.topo.nz,
+              button_outer_node_ring, gamma, av_c1);
+        } else {
+          cfl_2d_kernel<0, 0><<<cw.blocks(), 256>>>(
+              d_min_dt, d_lineage_winner_cell, min_local_2d, d_have_active,
+              state.x_r.data(), state.x_z.data(), state.v_r.data(),
+              state.v_z.data(), state.ee.data(), ei, cs, d_area,
+              d_cell_node_csr_offsets, d_cell_node_csr_indices,
+              d_cell_nverts_ptr, d_cell_kind, d_active,
+              state.evacuated_cells.d_geometry_policy_exempt_cells.empty()
+                  ? nullptr
+                  : state.evacuated_cells.d_geometry_policy_exempt_cells.data(),
+              d_pseudo_core_member, cw.begin, cw.end, n_cells,
+              state.mesh.topo.nz,
+              button_outer_node_ring, gamma, av_c1);
+        }
+        cuda_check(cudaGetLastError(),
+                   "CFL lineage 2D acoustic winner kernel launch failed");
+        cuda_check(core::debug_kernel_sync(),
+                   "CFL lineage 2D acoustic winner kernel execution failed");
+        int winner_cell = n_cells;
+        cuda_check(cudaMemcpy(&winner_cell, d_lineage_winner_cell, sizeof(int),
+                              cudaMemcpyDeviceToHost),
+                   "CFL lineage: copy 2D acoustic winner failed");
+        if (winner_cell >= 0 && winner_cell < n_cells) {
+          lineage_acoustic_winner_cell = winner_cell;
+        }
+      }
       int* d_winner_cell = nullptr;
       double* d_winner_values = nullptr;
       d_winner_cell = static_cast<int*>(core::device_scratch_acquire(
@@ -2693,9 +3392,12 @@ HydroDtDiagnostics compute_dt_hydro_diagnostics(const core::State& state,
   }
 
   result.acoustic_dt = cfg.numerics.dt.cfl_hydro * min_local;
+  bool central_pseudo_core_acoustic_winner = false;
+  bool pole_angular_derefine_acoustic_winner = false;
   const double pseudo_core_dt =
       central_pseudo_core::acoustic_dt(mutable_state, cfg);
   if (std::isfinite(pseudo_core_dt) && pseudo_core_dt < result.acoustic_dt) {
+    central_pseudo_core_acoustic_winner = true;
     const auto& pc = mutable_state.central_pseudo_core;
     result.acoustic_dt = pseudo_core_dt;
     result.cfl_winner.dt = pseudo_core_dt;
@@ -2725,6 +3427,8 @@ HydroDtDiagnostics compute_dt_hydro_diagnostics(const core::State& state,
   const double pole_macro_dt =
       pole_angular_derefine::acoustic_dt(mutable_state, cfg);
   if (std::isfinite(pole_macro_dt) && pole_macro_dt < result.acoustic_dt) {
+    central_pseudo_core_acoustic_winner = false;
+    pole_angular_derefine_acoustic_winner = true;
     const auto& pc = mutable_state.pole_angular_derefine;
     result.acoustic_dt = pole_macro_dt;
     result.cfl_winner.dt = pole_macro_dt;
@@ -2746,57 +3450,258 @@ HydroDtDiagnostics compute_dt_hydro_diagnostics(const core::State& state,
     result.cfl_winner.u_z_at_cell = 0.0;
   }
   double dt = result.acoustic_dt;
+  if (central_pseudo_core_acoustic_winner ||
+      pole_angular_derefine_acoustic_winner) {
+    result.min_contributor = HydroMinContributor{};
+    result.min_contributor.term_class = HydroMinTermClass::Other;
+    result.min_contributor.other_term = central_pseudo_core_acoustic_winner
+                                            ? HydroMinOtherTerm::CentralPseudoCoreAcoustic
+                                            : HydroMinOtherTerm::PoleAngularDerefineAcoustic;
+    result.min_contributor.cell_id_raw = result.cfl_winner.cell_id;
+    result.min_contributor.cell_id = result.cfl_winner.cell_id;
+  }
+  result.min_contributor.raw_dt = result.acoustic_dt;
   if (std::isfinite(min_local_post_shock)) {
     result.post_shock_dt = min_local_post_shock;
+    if (min_local_post_shock < dt) {
+      result.min_contributor = HydroMinContributor{};
+      result.min_contributor.term_class = HydroMinTermClass::Other;
+      result.min_contributor.other_term = HydroMinOtherTerm::PostShock;
+      result.min_contributor.raw_dt = min_local_post_shock;
+    }
     dt = std::min(dt, min_local_post_shock);
   }
   if (std::isfinite(min_local_crossing)) {
     result.crossing_dt = min_local_crossing;
+    if (min_local_crossing < dt) {
+      result.min_contributor = HydroMinContributor{};
+      result.min_contributor.term_class = HydroMinTermClass::EdgeCrossing;
+      result.min_contributor.other_term = HydroMinOtherTerm::None;
+      result.min_contributor.term_detail = HydroMinTermDetail::EdgeCrossing;
+      result.min_contributor.raw_dt = min_local_crossing;
+    }
     dt = std::min(dt, min_local_crossing);
   }
   if (std::isfinite(min_local_art_heat)) {
     result.art_heat_dt = min_local_art_heat;
+    if (min_local_art_heat < dt) {
+      result.min_contributor = HydroMinContributor{};
+      result.min_contributor.term_class = HydroMinTermClass::Other;
+      result.min_contributor.other_term = HydroMinOtherTerm::ArtificialHeat;
+      result.min_contributor.raw_dt = min_local_art_heat;
+    }
     dt = std::min(dt, min_local_art_heat);
   }
+  compatible::CswEdgeAvCflArgmin csw_argmin;
+  compatible::TensorAvCflArgmin tensor_argmin;
   if (state.mesh.dim == 2 &&
       (cfg.numerics.hydro.av_model == core::AvModel::CswEdge ||
-       cfg.numerics.hydro.av_model == core::AvModel::CswEdgeCsw98)) {
-    const double dt_av = compatible::compute_csw_edge_av_cfl_dt(state, cfg);
+       cfg.numerics.hydro.av_model == core::AvModel::CswEdgeCsw98 ||
+       cfg.numerics.hydro.av_model == core::AvModel::MimeticTensorV1)) {
+    const AwAxisSlaveStructuredLines aw_axis_slave_lines =
+        detect_aw_axis_slave_structured_lines(state, cfg);
+    const double dt_av =
+        cfg.numerics.hydro.av_model == core::AvModel::MimeticTensorV1
+            ? compatible::compute_tensor_av_cfl_dt(
+                  state, cfg, aw_axis_slave_lines.theta0_active,
+                  aw_axis_slave_lines.theta_pi_active,
+                  track_min_contributor ? &tensor_argmin : nullptr)
+            : compatible::compute_csw_edge_av_cfl_dt(
+                  state, cfg, aw_axis_slave_lines.theta0_active,
+                  aw_axis_slave_lines.theta_pi_active,
+                  track_min_contributor ? &csw_argmin : nullptr);
     if (std::isfinite(dt_av)) {
       result.edge_av_dt = dt_av;
+      if (dt_av < dt) {
+        result.min_contributor = HydroMinContributor{};
+        result.min_contributor.raw_dt = dt_av;
+        if (csw_argmin.polar_slaving_stiffness) {
+          result.min_contributor.term_class = HydroMinTermClass::Other;
+          result.min_contributor.other_term =
+              HydroMinOtherTerm::PolarSlavingStiffness;
+          result.min_contributor.other_node = csw_argmin.polar_slaving_node;
+          result.min_contributor.polar_lambda =
+              csw_argmin.polar_slaving_lambda;
+          result.min_contributor.polar_sigma = csw_argmin.polar_slaving_sigma;
+        } else {
+          result.min_contributor.term_class = HydroMinTermClass::EdgeAv;
+          result.min_contributor.other_term = HydroMinOtherTerm::None;
+          if (cfg.numerics.hydro.av_model ==
+              core::AvModel::MimeticTensorV1) {
+            result.min_contributor.term_detail = HydroMinTermDetail::TensorAv;
+            result.min_contributor.cell_id_raw = tensor_argmin.cell_id;
+            result.min_contributor.cell_id = tensor_argmin.cell_id;
+            if (state.mesh.topo.multiblock.has_value() &&
+                tensor_argmin.cell_id >= 0) {
+              const auto& mb = *state.mesh.topo.multiblock;
+              if (mb.cell_id_stable.size() == state.rho.size()) {
+                result.min_contributor.cell_id_raw = tensor_argmin.cell_id;
+                result.min_contributor.cell_id =
+                    mb.cell_id_stable[static_cast<std::size_t>(
+                        tensor_argmin.cell_id)];
+              }
+            }
+            result.min_contributor.length = tensor_argmin.length;
+            result.min_contributor.coefficient = tensor_argmin.coefficient;
+            result.min_contributor.rho = tensor_argmin.rho;
+            result.min_contributor.mu = tensor_argmin.mu;
+          } else {
+            result.min_contributor.term_detail =
+                cfg.numerics.hydro.av_model == core::AvModel::CswEdgeCsw98
+                    ? HydroMinTermDetail::Csw98EdgeAv
+                    : HydroMinTermDetail::CswEdgeAv;
+            result.min_contributor.cell_id_raw = csw_argmin.cell_id;
+            result.min_contributor.cell_id = csw_argmin.cell_id;
+            result.min_contributor.edge_id = csw_argmin.edge_id;
+            result.min_contributor.node0 = csw_argmin.node0;
+            result.min_contributor.node1 = csw_argmin.node1;
+            result.min_contributor.length = csw_argmin.length;
+            result.min_contributor.du = csw_argmin.du;
+            result.min_contributor.coefficient = csw_argmin.coefficient;
+          }
+        }
+      }
       dt = std::min(dt, dt_av);
+    }
+  }
+  if (state.mesh.dim == 2 &&
+      cfg.numerics.dt.edge_accel_displacement_cfl_enabled &&
+      state.node_accel_r.size() == state.v_r.size() &&
+      state.node_accel_z.size() == state.v_z.size()) {
+    compatible::EdgeAccelDisplacementArgmin edge_accel_argmin;
+    const double dt_edge_accel =
+        compatible::compute_edge_accel_displacement_dt(
+            state, cfg,
+            track_min_contributor ? &edge_accel_argmin : nullptr);
+    if (std::isfinite(dt_edge_accel)) {
+      result.edge_accel_dt = dt_edge_accel;
+      if (dt_edge_accel < dt) {
+        result.min_contributor = HydroMinContributor{};
+        result.min_contributor.term_class = HydroMinTermClass::Other;
+        result.min_contributor.other_term =
+            HydroMinOtherTerm::EdgeAccelDisplacement;
+        result.min_contributor.raw_dt = dt_edge_accel;
+        result.min_contributor.cell_id_raw = edge_accel_argmin.cell_id;
+        result.min_contributor.cell_id = edge_accel_argmin.cell_id;
+        result.min_contributor.edge_id = edge_accel_argmin.edge_id;
+        result.min_contributor.node0 = edge_accel_argmin.node0;
+        result.min_contributor.node1 = edge_accel_argmin.node1;
+        result.min_contributor.length = edge_accel_argmin.length;
+        result.min_contributor.du = edge_accel_argmin.c_e;
+        result.min_contributor.acceleration = edge_accel_argmin.a_e;
+        result.min_contributor.coefficient = edge_accel_argmin.coefficient;
+      }
+      dt = std::min(dt, dt_edge_accel);
     }
   }
   if (state.mesh.dim == 2 &&
       cfg.numerics.hydro.subzonal_pressure_enabled &&
       cfg.numerics.hydro.subzonal_dt_limiter_enabled) {
+    SubzonalPressureDtArgmin subzonal_argmin;
     const double dt_subzonal =
-        compute_compatible_subzonal_pressure_dt_2d(state, cfg, d_active);
+        compute_compatible_subzonal_pressure_dt_2d(
+            state, cfg, d_active,
+            track_min_contributor ? &subzonal_argmin : nullptr);
     if (std::isfinite(dt_subzonal)) {
       result.subzonal_pressure_dt = dt_subzonal;
+      if (dt_subzonal < dt) {
+        result.min_contributor = HydroMinContributor{};
+        result.min_contributor.term_class = HydroMinTermClass::Other;
+        result.min_contributor.other_term = HydroMinOtherTerm::SubzonalPressure;
+        result.min_contributor.raw_dt = dt_subzonal;
+        result.min_contributor.cell_id_raw = subzonal_argmin.cell_id;
+        result.min_contributor.cell_id = subzonal_argmin.cell_id;
+        if (state.mesh.topo.multiblock.has_value() &&
+            subzonal_argmin.cell_id >= 0) {
+          const auto& mb = *state.mesh.topo.multiblock;
+          if (mb.cell_id_stable.size() == state.rho.size()) {
+            result.min_contributor.cell_id_raw = subzonal_argmin.cell_id;
+            result.min_contributor.cell_id =
+                mb.cell_id_stable[static_cast<std::size_t>(
+                    subzonal_argmin.cell_id)];
+          }
+        }
+      }
       dt = std::min(dt, dt_subzonal);
     }
   }
-  dt = compute_axis_margin_cfl_dt(
+  const double dt_before_axis_margin = dt;
+  int axis_margin_argmin_j = -1;
+  const double dt_after_axis_margin = compute_axis_margin_cfl_dt(
       state, dt, cfg.numerics.hydro.axis_margin_dt_floor_fraction,
-      cfg.numerics.has_physical_rz_axis, cfg, &result.tri_fan_center_cfl);
+      cfg.numerics.has_physical_rz_axis, cfg, &result.tri_fan_center_cfl,
+      track_min_contributor ? &axis_margin_argmin_j : nullptr);
+  if (dt_after_axis_margin < dt_before_axis_margin) {
+    result.min_contributor = HydroMinContributor{};
+    result.min_contributor.term_class = HydroMinTermClass::Other;
+    result.min_contributor.other_term =
+        dt_after_axis_margin == result.tri_fan_center_cfl.dt
+            ? HydroMinOtherTerm::TriFanCenter
+            : HydroMinOtherTerm::AxisMargin;
+    result.min_contributor.raw_dt = dt_after_axis_margin;
+    if (result.min_contributor.other_term == HydroMinOtherTerm::TriFanCenter) {
+      result.min_contributor.cell_id_raw = result.tri_fan_center_cfl.cell_id;
+      result.min_contributor.cell_id = result.tri_fan_center_cfl.cell_id;
+    } else if (axis_margin_argmin_j >= 0) {
+      result.min_contributor.cell_id_raw = axis_margin_argmin_j;
+      result.min_contributor.cell_id = axis_margin_argmin_j;
+      result.min_contributor.node0 = axis_margin_argmin_j;
+      result.min_contributor.node1 = axis_margin_argmin_j + 1;
+    }
+  }
+  dt = dt_after_axis_margin;
   if (cfg.numerics.hydro.corner_j_predict_cfl_enabled) {
+    CornerJPredictCflArgmin corner_j_argmin;
     result.corner_j_predict_dt =
-        compute_corner_j_predict_cfl_dt(state, cfg);
+        compute_corner_j_predict_cfl_dt(
+            state, cfg,
+            track_min_contributor ? &corner_j_argmin : nullptr);
     result.corner_j_predict_dt = std::max(
         result.corner_j_predict_dt,
         cfg.numerics.hydro.corner_j_predict_floor_frac * result.acoustic_dt);
+    if (result.corner_j_predict_dt < dt) {
+      result.min_contributor = HydroMinContributor{};
+      result.min_contributor.term_class = HydroMinTermClass::Other;
+      result.min_contributor.other_term = HydroMinOtherTerm::CornerJPredict;
+      result.min_contributor.raw_dt = result.corner_j_predict_dt;
+      result.min_contributor.cell_id_raw = corner_j_argmin.cell_id;
+      result.min_contributor.cell_id = corner_j_argmin.cell_id;
+      if (state.mesh.topo.multiblock.has_value() &&
+          corner_j_argmin.cell_id >= 0) {
+        const auto& mb = *state.mesh.topo.multiblock;
+        if (mb.cell_id_stable.size() == state.rho.size()) {
+          result.min_contributor.cell_id_raw = corner_j_argmin.cell_id;
+          result.min_contributor.cell_id =
+              mb.cell_id_stable[static_cast<std::size_t>(
+                  corner_j_argmin.cell_id)];
+        }
+      }
+    }
     dt = std::min(dt, result.corner_j_predict_dt);
   }
   result.axis_margin_dt = dt;
-  const double axis_contact_dt = compute_pole_axis_bbsw_contact_dt(state, cfg);
+  int axis_contact_node0 = -1;
+  int axis_contact_node1 = -1;
+  const double axis_contact_dt = compute_pole_axis_bbsw_contact_dt(
+      state, cfg, track_min_contributor ? &axis_contact_node0 : nullptr,
+      track_min_contributor ? &axis_contact_node1 : nullptr);
   if (std::isfinite(axis_contact_dt)) {
+    if (axis_contact_dt < dt) {
+      result.min_contributor = HydroMinContributor{};
+      result.min_contributor.term_class = HydroMinTermClass::Other;
+      result.min_contributor.other_term = HydroMinOtherTerm::PoleAxisContact;
+      result.min_contributor.raw_dt = axis_contact_dt;
+      result.min_contributor.node0 = axis_contact_node0;
+      result.min_contributor.node1 = axis_contact_node1;
+    }
     dt = std::min(dt, axis_contact_dt);
     result.axis_margin_dt = std::min(result.axis_margin_dt, axis_contact_dt);
   }
   if (cfg.numerics.hydro.rz_geometric_cfl_enabled && state.mesh.dim == 2) {
-    core::NodeField1D predicted_u_half_r;
-    core::NodeField1D predicted_u_half_z;
+    core::NodeField1D predicted_u_half_r{
+        "cfl:compute_dt_hydro_diagnostics:predicted_u_half_r"};
+    core::NodeField1D predicted_u_half_z{
+        "cfl:compute_dt_hydro_diagnostics:predicted_u_half_z"};
     const double* geom_v_r = state.v_r.data();
     const double* geom_v_z = state.v_z.data();
     // Baseline path uses the current state velocity as the geometric
@@ -2811,24 +3716,186 @@ HydroDtDiagnostics compute_dt_hydro_diagnostics(const core::State& state,
       geom_v_r = predicted_u_half_r.data();
       geom_v_z = predicted_u_half_z.data();
     }
-    const double dt_geom =
-        compute_rz_geometric_cfl_dt(state, cfg, dt, geom_v_r, geom_v_z);
+    int geometric_argmin_cell = -1;
+    const double dt_geom = compute_rz_geometric_cfl_dt(
+        state, cfg, dt, geom_v_r, geom_v_z,
+        track_min_contributor ? &geometric_argmin_cell : nullptr);
     if (std::isfinite(dt_geom)) {
+      if (dt_geom < dt) {
+        result.min_contributor = HydroMinContributor{};
+        result.min_contributor.term_class = HydroMinTermClass::Other;
+        result.min_contributor.other_term = HydroMinOtherTerm::RzGeometric;
+        result.min_contributor.raw_dt = dt_geom;
+        result.min_contributor.cell_id_raw = geometric_argmin_cell;
+        result.min_contributor.cell_id = geometric_argmin_cell;
+        if (state.mesh.topo.multiblock.has_value() &&
+            geometric_argmin_cell >= 0) {
+          const auto& mb = *state.mesh.topo.multiblock;
+          if (mb.cell_id_stable.size() == state.rho.size()) {
+            result.min_contributor.cell_id_raw = geometric_argmin_cell;
+            result.min_contributor.cell_id =
+                mb.cell_id_stable[static_cast<std::size_t>(
+                    geometric_argmin_cell)];
+          }
+        }
+      }
       dt = std::min(dt, dt_geom);
       result.rz_geometric_dt = dt;
     }
   }
   if (cfg.numerics.hydro.volume_rate_cfl_enabled) {
     const double dt_before_volume_rate = dt;
+    int volume_rate_exact_argmin_cell = -1;
     dt = compute_volume_rate_cfl_dt(
         state, dt, state.dt_prev_hydro,
         cfg.numerics.hydro.volume_rate_cfl_threshold,
-        nullptr);
+        nullptr,
+        track_min_contributor ? &volume_rate_exact_argmin_cell : nullptr);
     if (dt < dt_before_volume_rate) {
       result.volume_rate_dt = dt;
+      result.min_contributor = HydroMinContributor{};
+      result.min_contributor.term_class = HydroMinTermClass::Other;
+      result.min_contributor.other_term = HydroMinOtherTerm::VolumeRate;
+      result.min_contributor.raw_dt = dt;
+      result.min_contributor.cell_id_raw = volume_rate_exact_argmin_cell;
+      result.min_contributor.cell_id = volume_rate_exact_argmin_cell;
+      if (state.mesh.topo.multiblock.has_value() &&
+          volume_rate_exact_argmin_cell >= 0) {
+        const auto& mb = *state.mesh.topo.multiblock;
+        if (mb.cell_id_stable.size() == state.rho.size()) {
+          result.min_contributor.cell_id_raw = volume_rate_exact_argmin_cell;
+          result.min_contributor.cell_id =
+              mb.cell_id_stable[static_cast<std::size_t>(
+                  volume_rate_exact_argmin_cell)];
+        }
+      }
     }
   }
   result.dt = dt;
+  if (track_min_contributor) {
+    if (result.min_contributor.term_class == HydroMinTermClass::AcousticCell) {
+      result.min_contributor.cell_id_raw = result.cfl_winner.cell_id;
+      result.min_contributor.cell_id = result.cfl_winner.cell_id;
+      result.min_contributor.length = result.cfl_winner.dl_at_cell;
+      result.min_contributor.du = result.cfl_winner.cs_at_cell;
+      result.min_contributor.coefficient = cfg.numerics.dt.cfl_hydro;
+      result.min_contributor.rho = result.cfl_winner.rho_at_cell;
+      if (state.mesh.dim == 2 && lineage_acoustic_winner_cell >= 0 &&
+          cfg.numerics.dt.cfl_hydro * min_local == result.acoustic_dt) {
+        result.min_contributor.cell_id_raw = lineage_acoustic_winner_cell;
+        result.min_contributor.cell_id = lineage_acoustic_winner_cell;
+        if (state.mesh.topo.multiblock.has_value()) {
+          const auto& mb = *state.mesh.topo.multiblock;
+          if (mb.cell_id_stable.size() == state.rho.size()) {
+            result.min_contributor.cell_id_raw = lineage_acoustic_winner_cell;
+            result.min_contributor.cell_id =
+                mb.cell_id_stable[static_cast<std::size_t>(
+                    lineage_acoustic_winner_cell)];
+          }
+        }
+      }
+    }
+    if (state.mesh.dim == 1 &&
+        (result.min_contributor.term_class ==
+             HydroMinTermClass::AcousticCell ||
+         result.min_contributor.term_class ==
+             HydroMinTermClass::EdgeCrossing)) {
+      int* d_winner_cell = static_cast<int*>(core::device_scratch_acquire(
+          "cfl:compute_dt_hydro_diagnostics:d_lineage_winner_cell",
+          sizeof(int)));
+      cuda_check(cudaMemcpy(d_winner_cell, &n_cells, sizeof(int),
+                            cudaMemcpyHostToDevice),
+                 "CFL lineage: init 1D winner cell failed");
+      const double target_dt =
+          result.min_contributor.term_class == HydroMinTermClass::AcousticCell
+              ? min_local
+              : result.min_contributor.raw_dt;
+      const core::State::LaunchWindow cw = state.owned_cell_window(n_cells);
+      cfl_1d_lineage_argmin_kernel<<<cw.blocks(), 256>>>(
+          d_winner_cell,
+          static_cast<int>(result.min_contributor.term_class), target_dt,
+          state.x_r.data(), state.v_r.data(), state.ee.data(), ei, cs, d_active,
+          cw.begin, cw.end, n_cells, gamma, av_c1, av_c2,
+          av_du_mode == 1 ? 1 : 0, cfg.numerics.hydro.crossing_dt_safety,
+          av_limiter_J);
+      cuda_check(cudaGetLastError(),
+                 "CFL lineage 1D winner kernel launch failed");
+      cuda_check(core::debug_kernel_sync(),
+                 "CFL lineage 1D winner kernel execution failed");
+      int winner_cell = n_cells;
+      cuda_check(cudaMemcpy(&winner_cell, d_winner_cell, sizeof(int),
+                            cudaMemcpyDeviceToHost),
+                 "CFL lineage: copy 1D winner cell failed");
+      if (winner_cell >= 0 && winner_cell < n_cells) {
+        double x_pair[2] = {};
+        double v_pair[2] = {};
+        cuda_check(cudaMemcpy(x_pair, state.x_r.data() + winner_cell,
+                              2 * sizeof(double), cudaMemcpyDeviceToHost),
+                   "CFL lineage: copy 1D winner positions failed");
+        cuda_check(cudaMemcpy(v_pair, state.v_r.data() + winner_cell,
+                              2 * sizeof(double), cudaMemcpyDeviceToHost),
+                   "CFL lineage: copy 1D winner velocities failed");
+        result.min_contributor.cell_id_raw = winner_cell;
+        result.min_contributor.cell_id = winner_cell;
+        result.min_contributor.node0 = winner_cell;
+        result.min_contributor.node1 = winner_cell + 1;
+        result.min_contributor.length = x_pair[1] - x_pair[0];
+        cuda_check(cudaMemcpy(&result.min_contributor.rho,
+                              state.rho.data() + winner_cell,
+                              sizeof(double), cudaMemcpyDeviceToHost),
+                   "CFL lineage: copy 1D winner density failed");
+        if (result.min_contributor.term_class ==
+            HydroMinTermClass::EdgeCrossing) {
+          result.min_contributor.edge_id = winner_cell;
+          result.min_contributor.du = v_pair[0] - v_pair[1];
+          result.min_contributor.coefficient =
+              cfg.numerics.hydro.crossing_dt_safety;
+        } else if (target_dt > 0.0) {
+          result.min_contributor.du =
+              result.min_contributor.length / target_dt;
+        }
+      }
+    }
+    if (state.mesh.dim == 1 &&
+        result.min_contributor.term_class == HydroMinTermClass::Other &&
+        (result.min_contributor.other_term == HydroMinOtherTerm::PostShock ||
+         result.min_contributor.other_term ==
+             HydroMinOtherTerm::ArtificialHeat)) {
+      int* d_winner_cell = static_cast<int*>(core::device_scratch_acquire(
+          "cfl:compute_dt_hydro_diagnostics:d_lineage_other_winner_cell",
+          sizeof(int)));
+      cuda_check(cudaMemcpy(d_winner_cell, &n_cells, sizeof(int),
+                            cudaMemcpyHostToDevice),
+                 "CFL lineage: init 1D other winner cell failed");
+      const core::State::LaunchWindow cw = state.owned_cell_window(n_cells);
+      cfl_1d_kernel<<<cw.blocks(), 256>>>(
+          d_min_dt, d_min_dt_post_shock, d_min_dt_crossing, d_min_dt_art_heat,
+          d_have_active, state.x_r.data(), state.v_r.data(), state.ee.data(), ei,
+          cs, state.rho.data(), state.vol.data(), shock_time, d_active, cw.begin,
+          cw.end, n_cells, state.mesh.geometry_code, state.t, gamma, av_c1,
+          av_c2, av_du_mode == 1 ? 1 : 0,
+          post_shock_heat_enabled ? 1 : 0,
+          cfg.numerics.hydro.post_shock_heat_C,
+          cfg.numerics.hydro.post_shock_heat_decay,
+          cfg.numerics.hydro.crossing_dt_safety,
+          art_heat_bound_enabled ? 1 : 0, av_heat_bound_c, av_limiter_J,
+          d_winner_cell,
+          static_cast<int>(result.min_contributor.other_term),
+          result.min_contributor.raw_dt);
+      cuda_check(cudaGetLastError(),
+                 "CFL lineage 1D other winner kernel launch failed");
+      cuda_check(core::debug_kernel_sync(),
+                 "CFL lineage 1D other winner kernel execution failed");
+      int winner_cell = n_cells;
+      cuda_check(cudaMemcpy(&winner_cell, d_winner_cell, sizeof(int),
+                            cudaMemcpyDeviceToHost),
+                 "CFL lineage: copy 1D other winner cell failed");
+      if (winner_cell >= 0 && winner_cell < n_cells) {
+        result.min_contributor.cell_id_raw = winner_cell;
+        result.min_contributor.cell_id = winner_cell;
+      }
+    }
+  }
   return result;
 }
 
@@ -2930,6 +3997,18 @@ HydroDtArgmin compute_dt_hydro_argmin(const core::State& state,
     }
     for (int c = 0; c < n_cells; ++c) {
       if (state.pole_angular_derefine
+              .inactive_member_mask[static_cast<std::size_t>(c)] != 0U) {
+        inactive_storage[static_cast<std::size_t>(c)] = 1U;
+      }
+    }
+  }
+  if (state.evacuated_cells.inactive_member_mask.size() ==
+      static_cast<std::size_t>(n_cells)) {
+    if (inactive_storage.empty()) {
+      inactive_storage.assign(static_cast<std::size_t>(n_cells), 0U);
+    }
+    for (int c = 0; c < n_cells; ++c) {
+      if (state.evacuated_cells
               .inactive_member_mask[static_cast<std::size_t>(c)] != 0U) {
         inactive_storage[static_cast<std::size_t>(c)] = 1U;
       }

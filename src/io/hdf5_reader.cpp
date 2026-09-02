@@ -2,7 +2,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <iomanip>
 #include <limits>
@@ -17,8 +19,13 @@
 
 #include "core/config_validate.hpp"
 #include "core/error.hpp"
+#include "core/namelist/errors.hpp"
 #include "core/namelist/freeze.hpp"
+#include "hydro/axis_edge_collapse.hpp"
+#include "hydro/euler_window_blend.hpp"
+#include "hydro/evacuated_cell_shadow.hpp"
 #include "hydro/oriented_swept_volume.cuh"
+#include "hydro/pole_axis_bbsw.hpp"
 #include "io/frozen_config_probe.hpp"
 #include "mesh/mesh.hpp"
 
@@ -32,6 +39,18 @@ namespace {
 constexpr int kSchemaVersion = 1;
 constexpr const char* kMeshTopologyV2Path = "mesh/topology/v2";
 constexpr const char* kMeshTopologyV3Path = "mesh/topology/v3";
+
+#if TENRYU_ENABLE_HDF5
+bool pole_axis_bbsw_enabled_for_restart(const core::Config& cfg) {
+  static const char* const env =
+      std::getenv(hydro::pole_axis_bbsw::kEnvEnable);
+  static const bool env_present = env != nullptr && env[0] != '\0';
+  static const bool env_enabled =
+      env_present && std::string(env) != "0";
+  return env_present ? env_enabled
+                     : cfg.numerics.ale.pole_axis_bbsw_enabled;
+}
+#endif
 
 std::string format_rank(const int rank) {
   std::ostringstream oss;
@@ -53,6 +72,10 @@ const char* topology_scheme_name(const core::TopologyScheme scheme) {
       return "multiblock_half_butterfly_5block";
     case core::TopologyScheme::MULTIBLOCK_HALF_BUTTERFLY_TRIFAN_CAP_5BLOCK:
       return "multiblock_half_butterfly_trifan_cap_5block";
+    case core::TopologyScheme::MULTIBLOCK_POLAR_TIER:
+      return "multiblock_polar_tier";
+    case core::TopologyScheme::MULTIBLOCK_POLAR_TIER_CART_CENTER:
+      return "multiblock_polar_tier_cart_center";
     case core::TopologyScheme::CONE_SHELL_SPINE:
       return "cone_shell_spine";
     case core::TopologyScheme::PENTAGON_BELT_SHELL:
@@ -76,6 +99,8 @@ int expected_topology_v2_block_count(
     case core::TopologyScheme::SINGLE_BLOCK:
     case core::TopologyScheme::MULTIBLOCK_HALF_BUTTERFLY_5BLOCK:
     case core::TopologyScheme::MULTIBLOCK_HALF_BUTTERFLY_TRIFAN_CAP_5BLOCK:
+    case core::TopologyScheme::MULTIBLOCK_POLAR_TIER:
+    case core::TopologyScheme::MULTIBLOCK_POLAR_TIER_CART_CENTER:
       TENRYU_ASSERT(false,
                     "ConfigError: checkpoint /mesh/topology/v2 is not "
                     "supported for topology_scheme=" +
@@ -85,6 +110,35 @@ int expected_topology_v2_block_count(
   }
   TENRYU_ASSERT(false,
                 "ConfigError: checkpoint /mesh/topology/v2 has an unknown "
+                "topology scheme");
+  return -1;
+}
+
+int expected_topology_v3_block_count(
+    const core::Config::MeshConfig& mesh_cfg) {
+  switch (mesh_cfg.topology_scheme) {
+    case core::TopologyScheme::MULTIBLOCK_HALF_BUTTERFLY_5BLOCK:
+    case core::TopologyScheme::MULTIBLOCK_HALF_BUTTERFLY_TRIFAN_CAP_5BLOCK:
+      return 5;
+    case core::TopologyScheme::MULTIBLOCK_POLAR_TIER:
+      return core::make_polar_tier_layout(mesh_cfg).block_count;
+    case core::TopologyScheme::MULTIBLOCK_POLAR_TIER_CART_CENTER:
+      return core::make_polar_tier_layout_truncated(
+                 mesh_cfg, mesh_cfg.polar_tier_cart_cut_ring, nullptr)
+                 .block_count +
+             2;
+    case core::TopologyScheme::SINGLE_BLOCK:
+    case core::TopologyScheme::MULTIBLOCK_CART_CORE_POLAR_SHELL:
+    case core::TopologyScheme::CONE_SHELL_SPINE:
+      TENRYU_ASSERT(
+          false,
+          "ConfigError: checkpoint /mesh/topology/v3 is not supported for "
+          "topology_scheme=" +
+              std::string(topology_scheme_name(mesh_cfg.topology_scheme)));
+      return -1;
+  }
+  TENRYU_ASSERT(false,
+                "ConfigError: checkpoint /mesh/topology/v3 has an unknown "
                 "topology scheme");
   return -1;
 }
@@ -402,6 +456,38 @@ std::optional<std::int64_t> read_group_attr_i64(const hid_t file,
   return value;
 }
 
+std::optional<std::int8_t> read_group_attr_i8(const hid_t file,
+                                              const std::string& group_path,
+                                              const std::string& name) {
+  if (!link_exists(file, group_path)) {
+    return std::nullopt;
+  }
+
+  const hid_t group = H5Gopen2(file, group_path.c_str(), H5P_DEFAULT);
+  TENRYU_ASSERT(group >= 0,
+                "HDF5 failed to open group for attribute read: " +
+                    group_path);
+  if (H5Aexists(group, name.c_str()) <= 0) {
+    warn_h5_close_failure(
+        H5Gclose(group), "H5Gclose",
+        "HDF5Reader::read_group_attr_i8(group missing attr)");
+    return std::nullopt;
+  }
+
+  const hid_t attr = H5Aopen(group, name.c_str(), H5P_DEFAULT);
+  TENRYU_ASSERT(attr >= 0,
+                "HDF5 failed to open group attribute: " + group_path + "/" +
+                    name);
+  std::int8_t value = 0;
+  TENRYU_ASSERT(H5Aread(attr, H5T_NATIVE_INT8, &value) >= 0,
+                "HDF5 failed to read i8 group attribute: " + group_path +
+                    "/" + name);
+  H5Aclose(attr);
+  warn_h5_close_failure(H5Gclose(group), "H5Gclose",
+                        "HDF5Reader::read_group_attr_i8(group close)");
+  return value;
+}
+
 int checkpoint_corner_stride(const hid_t file) {
   if (!link_exists(file, "mesh/topology/v4")) {
     return mesh::kMeshTopoCellStorageSlots;
@@ -686,6 +772,390 @@ void load_ale_reference_checkpoint_group(const hid_t file,
       "mesh/ale_reference/v1/x_z_shock_target",
       state.x_z_shock_target);
   state.reference_epoch = *reference_epoch;
+}
+
+void load_carrier_checkpoint_group(const hid_t file,
+                                   core::State& state) {
+  constexpr const char* group_path = "mesh/carrier/v1";
+  if (!link_exists(file, group_path)) {
+    return;
+  }
+
+  const auto valid_attr = read_group_attr_i8(file, group_path, "valid");
+  const auto domain_active_attr =
+      read_group_attr_i8(file, group_path, "domain_active");
+  const auto n_masters_attr =
+      read_group_attr_i64(file, group_path, "n_masters");
+  TENRYU_ASSERT(valid_attr.has_value(),
+                "Restart checkpoint missing attribute: mesh/carrier/v1/valid");
+  TENRYU_ASSERT(
+      domain_active_attr.has_value(),
+      "Restart checkpoint missing attribute: mesh/carrier/v1/domain_active");
+  TENRYU_ASSERT(
+      n_masters_attr.has_value(),
+      "Restart checkpoint missing attribute: mesh/carrier/v1/n_masters");
+  TENRYU_ASSERT(*valid_attr == 0 || *valid_attr == 1,
+                "Restart checkpoint mesh/carrier/v1 valid must be 0 or 1");
+  TENRYU_ASSERT(
+      *domain_active_attr == 0 || *domain_active_attr == 1,
+      "Restart checkpoint mesh/carrier/v1 domain_active must be 0 or 1");
+
+  const std::size_t n_masters = checked_i64_to_size(
+      *n_masters_attr, "Restart checkpoint mesh/carrier/v1 n_masters");
+  const std::size_t n_nodes = state.x_r.size();
+  const auto master_stable_id = read_vector_dataset_checked<std::uint64_t>(
+      file, "mesh/carrier/v1/master_stable_id", H5T_NATIVE_UINT64,
+      n_masters);
+  const auto master_mesh_node = read_vector_dataset_checked<std::int32_t>(
+      file, "mesh/carrier/v1/master_mesh_node", H5T_NATIVE_INT32,
+      n_masters);
+  const auto master_bc_class = read_vector_dataset_checked<std::uint8_t>(
+      file, "mesh/carrier/v1/master_bc_class", H5T_NATIVE_UINT8,
+      n_masters);
+  const auto node_class = read_vector_dataset_checked<std::uint8_t>(
+      file, "mesh/carrier/v1/node_class", H5T_NATIVE_UINT8, n_nodes);
+  const auto node_edge = read_vector_dataset_checked<std::int32_t>(
+      file, "mesh/carrier/v1/node_edge", H5T_NATIVE_INT32, n_nodes);
+  const auto node_lambda = read_vector_dataset_checked<double>(
+      file, "mesh/carrier/v1/node_lambda", H5T_NATIVE_DOUBLE, n_nodes);
+
+  const bool valid = *valid_attr != 0;
+  TENRYU_ASSERT(!valid || n_masters >= 3U,
+                "Restart checkpoint valid carrier must have at least three masters");
+  for (std::size_t master_index = 0; master_index < n_masters;
+       ++master_index) {
+    TENRYU_ASSERT(
+        master_mesh_node[master_index] >= 0 &&
+            static_cast<std::size_t>(master_mesh_node[master_index]) < n_nodes,
+        "Restart checkpoint carrier master_mesh_node entry out of range");
+    TENRYU_ASSERT(
+        master_bc_class[master_index] <=
+            static_cast<std::uint8_t>(mesh::CarrierBcClass::kAxis),
+        "Restart checkpoint carrier master_bc_class entry out of range");
+  }
+  for (std::size_t node = 0; node < n_nodes; ++node) {
+    TENRYU_ASSERT(node_class[node] <= 2U,
+                  "Restart checkpoint carrier node_class entry out of range");
+    TENRYU_ASSERT(node_lambda[node] >= 0.0 && node_lambda[node] <= 1.0,
+                  "Restart checkpoint carrier node_lambda entry out of range");
+  }
+
+  state.boundary_carrier.masters.clear();
+  state.boundary_carrier.masters.reserve(n_masters);
+  for (std::size_t master_index = 0; master_index < n_masters;
+       ++master_index) {
+    state.boundary_carrier.masters.push_back(
+        {master_stable_id[master_index],
+         static_cast<int>(master_mesh_node[master_index]),
+         static_cast<mesh::CarrierBcClass>(master_bc_class[master_index])});
+  }
+  state.boundary_carrier.valid = valid;
+  state.carrier_domain_active = *domain_active_attr != 0;
+  state.carrier_node_class = node_class;
+  state.carrier_node_edge.assign(node_edge.begin(), node_edge.end());
+  state.carrier_node_lambda = node_lambda;
+  state.carrier_ring_pages = {};
+  state.mesh.ring_pages = nullptr;
+}
+
+void load_evacuated_cells_checkpoint_group(const hid_t file,
+                                           core::State& state) {
+  constexpr const char* group_path = "evacuated_cells";
+  if (!link_exists(file, group_path)) {
+    // Compatibility: old checkpoints leave the state empty so the first
+    // controller evaluation retains the legacy reference-capture behavior.
+    return;
+  }
+
+  auto& evacuated = state.evacuated_cells;
+  const std::size_t n_cells = state.rho.size();
+  const std::size_t n_nodes = state.x_r.size();
+  evacuated.inactive_member_mask =
+      read_vector_dataset_checked<std::uint8_t>(
+          file, "evacuated_cells/inactive_member_mask", H5T_NATIVE_UINT8,
+          n_cells);
+  evacuated.closure_lineage = read_vector_dataset_checked<std::uint8_t>(
+      file, "evacuated_cells/closure_lineage", H5T_NATIVE_UINT8, n_cells);
+  evacuated.contact_active_mask =
+      read_vector_dataset_checked<std::uint8_t>(
+          file, "evacuated_cells/contact_active_mask", H5T_NATIVE_UINT8,
+          n_cells);
+  evacuated.mass_ref = read_vector_dataset_checked<double>(
+      file, "evacuated_cells/mass_ref", H5T_NATIVE_DOUBLE, n_cells);
+  evacuated.vol_ref = read_vector_dataset_checked<double>(
+      file, "evacuated_cells/vol_ref", H5T_NATIVE_DOUBLE, n_cells);
+  evacuated.x_r_ref = read_vector_dataset_checked<double>(
+      file, "evacuated_cells/x_r_ref", H5T_NATIVE_DOUBLE, n_nodes);
+  evacuated.x_z_ref = read_vector_dataset_checked<double>(
+      file, "evacuated_cells/x_z_ref", H5T_NATIVE_DOUBLE, n_nodes);
+  evacuated.controller_previous_volume =
+      read_vector_dataset_checked<double>(
+          file, "evacuated_cells/controller_previous_volume",
+          H5T_NATIVE_DOUBLE, n_cells);
+  const auto controller_previous_contact_gap =
+      read_vector_dataset_checked<double>(
+          file, "evacuated_cells/controller_previous_contact_gap",
+          H5T_NATIVE_DOUBLE,
+          checked_mul_size(n_cells, 2U,
+                           "evacuated-cell previous contact gap size"));
+  evacuated.controller_previous_contact_gap.resize(n_cells);
+  for (std::size_t cell_index = 0; cell_index < n_cells; ++cell_index) {
+    evacuated.controller_previous_contact_gap[cell_index] = {
+        controller_previous_contact_gap[2U * cell_index],
+        controller_previous_contact_gap[2U * cell_index + 1U]};
+  }
+  evacuated.off_streak = read_vector_dataset_checked<int>(
+      file, "evacuated_cells/off_streak", H5T_NATIVE_INT, n_cells);
+  evacuated.controller_dwell_remaining = read_vector_dataset_checked<int>(
+      file, "evacuated_cells/controller_dwell_remaining", H5T_NATIVE_INT,
+      n_cells);
+  evacuated.controller_evaluations_since_conversion =
+      read_vector_dataset_checked<int>(
+          file,
+          "evacuated_cells/controller_evaluations_since_conversion",
+          H5T_NATIVE_INT, n_cells);
+  if (link_exists(file, "evacuated_cells/cell_axis_edge_collapsed")) {
+    evacuated.cell_axis_edge_collapsed =
+        read_vector_dataset_checked<std::uint8_t>(
+            file, "evacuated_cells/cell_axis_edge_collapsed",
+            H5T_NATIVE_UINT8, n_cells);
+  }
+  if (link_exists(file, "evacuated_cells/node_axis_alias")) {
+    evacuated.node_axis_alias = read_vector_dataset_checked<int>(
+        file, "evacuated_cells/node_axis_alias", H5T_NATIVE_INT, n_nodes);
+  }
+  hydro::rebuild_axis_edge_collapse_device_state(state);
+  TENRYU_ASSERT(link_exists(file, "evacuated_cells/conversions_total"),
+                "Restart checkpoint missing dataset: "
+                "evacuated_cells/conversions_total");
+  evacuated.conversions_total = read_scalar_dataset<int>(
+      file, "evacuated_cells/conversions_total", H5T_NATIVE_INT, 0);
+  TENRYU_ASSERT(link_exists(file, "evacuated_cells/n_slots"),
+                "Restart checkpoint missing dataset: evacuated_cells/n_slots");
+  const int n_slots_value = read_scalar_dataset<int>(
+      file, "evacuated_cells/n_slots", H5T_NATIVE_INT, -1);
+  TENRYU_ASSERT(n_slots_value >= 0,
+                "Restart checkpoint evacuated_cells/n_slots must be >= 0");
+  const std::size_t n_slots = static_cast<std::size_t>(n_slots_value);
+
+  const auto cell = read_vector_dataset_checked<int>(
+      file, "evacuated_cells/cell", H5T_NATIVE_INT, n_slots);
+  const auto axis = read_vector_dataset_checked<int>(
+      file, "evacuated_cells/axis", H5T_NATIVE_INT, n_slots);
+  const auto node_a0 = read_vector_dataset_checked<int>(
+      file, "evacuated_cells/node_a0", H5T_NATIVE_INT, n_slots);
+  const auto node_a1 = read_vector_dataset_checked<int>(
+      file, "evacuated_cells/node_a1", H5T_NATIVE_INT, n_slots);
+  const auto node_b0 = read_vector_dataset_checked<int>(
+      file, "evacuated_cells/node_b0", H5T_NATIVE_INT, n_slots);
+  const auto node_b1 = read_vector_dataset_checked<int>(
+      file, "evacuated_cells/node_b1", H5T_NATIVE_INT, n_slots);
+  std::vector<double> normal_pair_r0(n_slots, 0.0);
+  std::vector<double> normal_pair_z0(n_slots, 1.0);
+  std::vector<double> normal_pair_r1(n_slots, 0.0);
+  std::vector<double> normal_pair_z1(n_slots, 1.0);
+  const bool has_per_pair_normals =
+      link_exists(file, "evacuated_cells/normal_pair_r0") &&
+      link_exists(file, "evacuated_cells/normal_pair_z0") &&
+      link_exists(file, "evacuated_cells/normal_pair_r1") &&
+      link_exists(file, "evacuated_cells/normal_pair_z1");
+  if (has_per_pair_normals) {
+    normal_pair_r0 = read_vector_dataset_checked<double>(
+        file, "evacuated_cells/normal_pair_r0", H5T_NATIVE_DOUBLE, n_slots);
+    normal_pair_z0 = read_vector_dataset_checked<double>(
+        file, "evacuated_cells/normal_pair_z0", H5T_NATIVE_DOUBLE, n_slots);
+    normal_pair_r1 = read_vector_dataset_checked<double>(
+        file, "evacuated_cells/normal_pair_r1", H5T_NATIVE_DOUBLE, n_slots);
+    normal_pair_z1 = read_vector_dataset_checked<double>(
+        file, "evacuated_cells/normal_pair_z1", H5T_NATIVE_DOUBLE, n_slots);
+  } else if (link_exists(file, "evacuated_cells/normal_r") &&
+             link_exists(file, "evacuated_cells/normal_z")) {
+    const auto normal_r = read_vector_dataset_checked<double>(
+        file, "evacuated_cells/normal_r", H5T_NATIVE_DOUBLE, n_slots);
+    const auto normal_z = read_vector_dataset_checked<double>(
+        file, "evacuated_cells/normal_z", H5T_NATIVE_DOUBLE, n_slots);
+    // Pre-C11 checkpoints used one normal for both pairs, so duplicate it.
+    normal_pair_r0 = normal_r;
+    normal_pair_z0 = normal_z;
+    normal_pair_r1 = normal_r;
+    normal_pair_z1 = normal_z;
+  }
+  std::vector<double> gap_at_engagement_pair0(n_slots, 0.0);
+  std::vector<double> gap_at_engagement_pair1(n_slots, 0.0);
+  const bool has_gap_at_engagement_pairs =
+      link_exists(file, "evacuated_cells/gap_at_engagement_pair0") &&
+      link_exists(file, "evacuated_cells/gap_at_engagement_pair1");
+  if (has_gap_at_engagement_pairs) {
+    gap_at_engagement_pair0 = read_vector_dataset_checked<double>(
+        file, "evacuated_cells/gap_at_engagement_pair0", H5T_NATIVE_DOUBLE,
+        n_slots);
+    gap_at_engagement_pair1 = read_vector_dataset_checked<double>(
+        file, "evacuated_cells/gap_at_engagement_pair1", H5T_NATIVE_DOUBLE,
+        n_slots);
+  }
+  const auto h_perp_ref = read_vector_dataset_checked<double>(
+      file, "evacuated_cells/h_perp_ref", H5T_NATIVE_DOUBLE, n_slots);
+  const auto g0 = read_vector_dataset_checked<double>(
+      file, "evacuated_cells/g0", H5T_NATIVE_DOUBLE, n_slots);
+  const auto g_arm = read_vector_dataset_checked<double>(
+      file, "evacuated_cells/g_arm", H5T_NATIVE_DOUBLE, n_slots);
+  const auto gap_pair0 = read_vector_dataset_checked<double>(
+      file, "evacuated_cells/gap_pair0", H5T_NATIVE_DOUBLE, n_slots);
+  const auto gap_pair1 = read_vector_dataset_checked<double>(
+      file, "evacuated_cells/gap_pair1", H5T_NATIVE_DOUBLE, n_slots);
+  const auto gap_prev_pair0 = read_vector_dataset_checked<double>(
+      file, "evacuated_cells/gap_prev_pair0", H5T_NATIVE_DOUBLE, n_slots);
+  const auto gap_prev_pair1 = read_vector_dataset_checked<double>(
+      file, "evacuated_cells/gap_prev_pair1", H5T_NATIVE_DOUBLE, n_slots);
+  const auto pair_engaged0 = read_vector_dataset_checked<std::uint8_t>(
+      file, "evacuated_cells/pair_engaged0", H5T_NATIVE_UINT8, n_slots);
+  const auto pair_engaged1 = read_vector_dataset_checked<std::uint8_t>(
+      file, "evacuated_cells/pair_engaged1", H5T_NATIVE_UINT8, n_slots);
+  const auto tensile_streak_pair0 = read_vector_dataset_checked<int>(
+      file, "evacuated_cells/tensile_streak_pair0", H5T_NATIVE_INT,
+      n_slots);
+  const auto tensile_streak_pair1 = read_vector_dataset_checked<int>(
+      file, "evacuated_cells/tensile_streak_pair1", H5T_NATIVE_INT,
+      n_slots);
+  const auto gap = read_vector_dataset_checked<double>(
+      file, "evacuated_cells/gap", H5T_NATIVE_DOUBLE, n_slots);
+  const auto gap_prev = read_vector_dataset_checked<double>(
+      file, "evacuated_cells/gap_prev", H5T_NATIVE_DOUBLE, n_slots);
+  const auto slot_state = read_vector_dataset_checked<std::uint8_t>(
+      file, "evacuated_cells/state", H5T_NATIVE_UINT8, n_slots);
+  const auto mass_at_engagement = read_vector_dataset_checked<double>(
+      file, "evacuated_cells/mass_at_engagement", H5T_NATIVE_DOUBLE,
+      n_slots);
+  std::vector<double> vol_at_engagement(n_slots, 0.0);
+  if (link_exists(file, "evacuated_cells/vol_at_engagement")) {
+    vol_at_engagement = read_vector_dataset_checked<double>(
+        file, "evacuated_cells/vol_at_engagement", H5T_NATIVE_DOUBLE,
+        n_slots);
+  }
+  std::vector<int> devolumized(n_slots, 0);
+  if (link_exists(file, "evacuated_cells/devolumized")) {
+    devolumized = read_vector_dataset_checked<int>(
+        file, "evacuated_cells/devolumized", H5T_NATIVE_INT, n_slots);
+  }
+  const auto lambda_last = read_vector_dataset_checked<double>(
+      file, "evacuated_cells/lambda_last", H5T_NATIVE_DOUBLE, n_slots);
+  const auto impact_heat_total = read_vector_dataset_checked<double>(
+      file, "evacuated_cells/impact_heat_total", H5T_NATIVE_DOUBLE,
+      n_slots);
+  const auto engage_count = read_vector_dataset_checked<int>(
+      file, "evacuated_cells/engage_count", H5T_NATIVE_INT, n_slots);
+  const auto release_count = read_vector_dataset_checked<int>(
+      file, "evacuated_cells/release_count", H5T_NATIVE_INT, n_slots);
+  const auto reproject_count = read_vector_dataset_checked<int>(
+      file, "evacuated_cells/reproject_count", H5T_NATIVE_INT, n_slots);
+  const auto reproject_heat_total = read_vector_dataset_checked<double>(
+      file, "evacuated_cells/reproject_heat_total", H5T_NATIVE_DOUBLE,
+      n_slots);
+  const auto reproject_count_last_logged =
+      read_vector_dataset_checked<int>(
+          file, "evacuated_cells/reproject_count_last_logged",
+          H5T_NATIVE_INT, n_slots);
+  const auto reproject_heat_last_logged =
+      read_vector_dataset_checked<double>(
+          file, "evacuated_cells/reproject_heat_last_logged",
+          H5T_NATIVE_DOUBLE, n_slots);
+
+  state.contact_graph.records.resize(n_slots);
+  for (std::size_t index = 0; index < n_slots; ++index) {
+    auto& slot = state.contact_graph.records[index];
+    slot.cell = cell[index];
+    slot.axis = axis[index];
+    slot.node_a[0] = node_a0[index];
+    slot.node_a[1] = node_a1[index];
+    slot.node_b[0] = node_b0[index];
+    slot.node_b[1] = node_b1[index];
+    slot.normal_pair_r[0] = normal_pair_r0[index];
+    slot.normal_pair_z[0] = normal_pair_z0[index];
+    slot.normal_pair_r[1] = normal_pair_r1[index];
+    slot.normal_pair_z[1] = normal_pair_z1[index];
+    slot.h_perp_ref = h_perp_ref[index];
+    slot.g0 = g0[index];
+    slot.g_arm = g_arm[index];
+    slot.gap_pair[0] = gap_pair0[index];
+    slot.gap_pair[1] = gap_pair1[index];
+    slot.gap_prev_pair[0] = gap_prev_pair0[index];
+    slot.gap_prev_pair[1] = gap_prev_pair1[index];
+    slot.pair_engaged[0] = pair_engaged0[index];
+    slot.pair_engaged[1] = pair_engaged1[index];
+    slot.gap_at_engagement_pair[0] =
+        has_gap_at_engagement_pairs
+            ? gap_at_engagement_pair0[index]
+            : (slot.pair_engaged[0] != 0U ? slot.g0 : 0.0);
+    slot.gap_at_engagement_pair[1] =
+        has_gap_at_engagement_pairs
+            ? gap_at_engagement_pair1[index]
+            : (slot.pair_engaged[1] != 0U ? slot.g0 : 0.0);
+    slot.tensile_streak_pair[0] = tensile_streak_pair0[index];
+    slot.tensile_streak_pair[1] = tensile_streak_pair1[index];
+    slot.gap = gap[index];
+    slot.gap_prev = gap_prev[index];
+    slot.state = static_cast<core::EvacContactState>(slot_state[index]);
+    slot.mass_at_engagement = mass_at_engagement[index];
+    slot.vol_at_engagement = vol_at_engagement[index];
+    slot.devolumized = static_cast<std::uint8_t>(devolumized[index]);
+    slot.lambda_last = lambda_last[index];
+    slot.impact_heat_total = impact_heat_total[index];
+    slot.engage_count = engage_count[index];
+    slot.release_count = release_count[index];
+    slot.reproject_count = reproject_count[index];
+    slot.reproject_heat_total = reproject_heat_total[index];
+    slot.reproject_count_last_logged = reproject_count_last_logged[index];
+    slot.reproject_heat_last_logged = reproject_heat_last_logged[index];
+  }
+
+  evacuated.d_inactive_member_mask.reset(
+      evacuated.inactive_member_mask.size());
+  evacuated.d_inactive_member_mask.copy_from_host(
+      evacuated.inactive_member_mask);
+  for (const core::EvacContactSlot& slot : state.contact_graph.records) {
+    if (slot.devolumized == 0U) {
+      continue;
+    }
+    if (state.mesh.geometry_exempt_cells.empty()) {
+      state.mesh.geometry_exempt_cells.assign(n_cells, 0U);
+    }
+    state.mesh.geometry_exempt_cells[static_cast<std::size_t>(slot.cell)] =
+        1U;
+  }
+  hydro::rebuild_geometry_policy_exempt(state);
+  hydro::evacuated_cell_upload_contact_device_state(state);
+  evacuated.contact_dt_cap_s = std::numeric_limits<double>::infinity();
+}
+
+void prepare_evolved_reale_node_state(core::State& state) {
+  std::vector<double> node_r;
+  std::vector<double> node_z;
+  state.x_r.copy_to_host(node_r);
+  state.x_z.copy_to_host(node_z);
+
+  // Match coupling/reale_mode.cpp::install_node_fields for runtime-only
+  // node fields. ALE reference fields are restored from their checkpoint group.
+  state.x_r_initial = node_r;
+  state.x_z_initial = node_z;
+  state.node_planar_mass.reset(node_r.size());
+  state.node_planar_mass.fill(0.0);
+  state.ring7_last_failed_v_r.reset(0);
+  state.ring7_last_failed_v_z.reset(0);
+  state.ring7_last_failed_velocity_valid = false;
+  state.ref_xi_node.reset(0);
+  state.ref_xi_cell.reset(0);
+  state.ref_dir0_r.reset(0);
+  state.ref_dir0_z.reset(0);
+  state.ale_monitor_ref_x_r.reset(0);
+  state.ale_monitor_ref_x_z.reset(0);
+  state.ale_monitor_ref_corner_fractions.reset(0);
+  state.ale_monitor_ref_valid = false;
+  state.ale_monitor_ref_post_morph = false;
+  state.trace_mesh_outer_node = -1;
+  state.trace_mesh_outer_cell = -1;
+
+  state.mesh.node_r = state.x_r.data();
+  state.mesh.node_z = state.x_z.data();
 }
 
 std::size_t topology_dataset_size(const hid_t file,
@@ -992,13 +1462,14 @@ void load_mesh_topology_v2_group(const hid_t file,
 void load_mesh_topology_v3_group(const hid_t file,
                                  const core::Config& cfg,
                                  const int corner_stride,
+                                 const int checkpoint_n_nodes,
                                  mesh::MeshTopology& topo) {
   if (!link_exists(file, kMeshTopologyV3Path)) {
     return;
   }
 
   const int n_cells_i = mesh::mesh_topo_n_cells_total(cfg.mesh);
-  const int n_nodes_i = mesh::mesh_topo_n_nodes_total(cfg.mesh);
+  const int initial_n_nodes_i = mesh::mesh_topo_n_nodes_total(cfg.mesh);
   const std::size_t n_cells = static_cast<std::size_t>(n_cells_i);
   const std::size_t n_csr_entries = checked_mul_size(
       n_cells, static_cast<std::size_t>(corner_stride),
@@ -1022,17 +1493,21 @@ void load_mesh_topology_v3_group(const hid_t file,
             std::to_string(expected_block_count) + ", got " +
             std::to_string(mb.block_count) + ")");
   } else {
-    TENRYU_ASSERT(mb.block_count >= 3,
-                  "ConfigError: checkpoint /mesh/topology/v3/block_count must be "
-                  "at least 3 (got " +
-                      std::to_string(mb.block_count) + ")");
+    const int expected_block_count =
+        expected_topology_v3_block_count(cfg.mesh);
+    TENRYU_ASSERT(
+        mb.block_count == expected_block_count,
+        "ConfigError: checkpoint /mesh/topology/v3/block_count mismatch "
+        "(expected " +
+            std::to_string(expected_block_count) + ", got " +
+            std::to_string(mb.block_count) + ")");
   }
 
   load_topology_v3_block_table(file,
                                kMeshTopologyV3Path,
                                mb.block_count,
                                n_cells_i,
-                               n_nodes_i,
+                               initial_n_nodes_i,
                                mb);
   load_topology_v3_seam_table(file, kMeshTopologyV3Path, mb.block_count, mb);
 
@@ -1074,10 +1549,23 @@ void load_mesh_topology_v3_group(const hid_t file,
                        mb.block_count,
                        false,
                        std::string(kMeshTopologyV3Path) + "/cell_block_id");
+  if (std::getenv("TENRYU_RESTART_DEBUG") != nullptr) {
+    const int max_idx = mb.cell_node_csr_indices.empty()
+                            ? -1
+                            : *std::max_element(
+                                  mb.cell_node_csr_indices.begin(),
+                                  mb.cell_node_csr_indices.end());
+    std::fprintf(stderr,
+                 "[restart_dbg] v3 idx validate: upper=%d initial=%d max_idx=%d\n",
+                 checkpoint_n_nodes,
+                 initial_n_nodes_i,
+                 max_idx);
+  }
+  // Staged-CSR convention uses -1 padding for inactive slots.
   validate_index_range(mb.cell_node_csr_indices,
                        0,
-                       n_nodes_i,
-                       false,
+                       checkpoint_n_nodes,
+                       true,
                        std::string(kMeshTopologyV3Path) + "/cell_node_csr_indices");
   validate_index_range(mb.face_adj_csr_indices,
                        0,
@@ -1096,16 +1584,18 @@ void load_mesh_topology_v3_group(const hid_t file,
   topo.nr = cfg.mesh.nr;
   topo.nz = cfg.mesh.nz;
   topo.n_cells = n_cells_i;
-  topo.n_nodes = n_nodes_i;
+  topo.n_nodes = checkpoint_n_nodes;
   topo.multiblock = std::move(mb);
 }
 
 void load_mesh_topology_group(const hid_t file,
                               const core::Config& cfg,
+                              const int checkpoint_n_nodes,
                               mesh::MeshTopology& topo) {
   const int corner_stride = checkpoint_corner_stride(file);
   if (link_exists(file, kMeshTopologyV3Path)) {
-    load_mesh_topology_v3_group(file, cfg, corner_stride, topo);
+    load_mesh_topology_v3_group(
+        file, cfg, corner_stride, checkpoint_n_nodes, topo);
     return;
   }
   load_mesh_topology_v2_group(file, cfg, corner_stride, topo);
@@ -1292,7 +1782,8 @@ void rebuild_ideal_per_material_derived_after_restart(core::State& state,
   state.cs.copy_from_host(cs);
 }
 
-void validate_schema_and_frozen_config(const hid_t file, const core::Config& cfg) {
+int validate_schema_and_frozen_config(const hid_t file,
+                                      const core::Config& cfg) {
   const std::int32_t schema = read_root_attr_i32(file, "schema_version").value_or(0);
   if (schema > kSchemaVersion) {
     TENRYU_ASSERT(false,
@@ -1327,6 +1818,13 @@ void validate_schema_and_frozen_config(const hid_t file, const core::Config& cfg
           cfg.mesh.topology_scheme ==
                   core::TopologyScheme::MULTIBLOCK_HALF_BUTTERFLY_5BLOCK ||
               cfg.mesh.topology_scheme ==
+                  core::TopologyScheme::
+                      MULTIBLOCK_HALF_BUTTERFLY_TRIFAN_CAP_5BLOCK ||
+              cfg.mesh.topology_scheme ==
+                  core::TopologyScheme::MULTIBLOCK_POLAR_TIER ||
+              cfg.mesh.topology_scheme == core::TopologyScheme::
+                                              MULTIBLOCK_POLAR_TIER_CART_CENTER ||
+              cfg.mesh.topology_scheme ==
                   core::TopologyScheme::PENTAGON_BELT_SHELL,
           "ConfigError: checkpoint contains /mesh/topology/v3 "
           "variable-block topology, but namelist topology_scheme is " +
@@ -1344,6 +1842,10 @@ void validate_schema_and_frozen_config(const hid_t file, const core::Config& cfg
               std::string(topology_scheme_name(cfg.mesh.topology_scheme)));
     }
   } else {
+    TENRYU_ASSERT(
+        !cfg.mesh.polar_tier_native_pentagon,
+        "ConfigError: restart support pending for v1 checkpoints with "
+        "Mesh.polar_tier_native_pentagon=true");
     TENRYU_ASSERT(mesh::mesh_topo_is_single_block(cfg.mesh),
                   "ConfigError: checkpoint has no /mesh/topology/v2 or "
                   "/mesh/topology/v3 group and is "
@@ -1375,10 +1877,33 @@ void validate_schema_and_frozen_config(const hid_t file, const core::Config& cfg
     TENRYU_ASSERT(*n_cells_attr == expected_cells,
                   "ConfigError: checkpoint mesh size mismatch");
   }
-  if (n_nodes_attr.has_value()) {
-    TENRYU_ASSERT(*n_nodes_attr == expected_nodes,
+  const bool evolved_reale_v3 =
+      cfg.numerics.ale.mesh_mode == "reale_v2" && has_topology_v3;
+  TENRYU_ASSERT(
+      !evolved_reale_v3 || n_nodes_attr.has_value(),
+      "ConfigError: evolved ReALE checkpoint missing root n_nodes attribute");
+  const std::int64_t checkpoint_nodes =
+      n_nodes_attr.value_or(expected_nodes);
+  TENRYU_ASSERT(
+      checkpoint_nodes > 0 &&
+          checkpoint_nodes <=
+              static_cast<std::int64_t>(std::numeric_limits<int>::max()),
+      "ConfigError: checkpoint root n_nodes must be a positive int");
+  if (!evolved_reale_v3) {
+    TENRYU_ASSERT(checkpoint_nodes == expected_nodes,
                   "ConfigError: checkpoint node count mismatch");
   }
+  TENRYU_ASSERT(link_exists(file, "mesh/x_r"),
+                "Restart checkpoint missing dataset: mesh/x_r");
+  const std::size_t x_r_extent = dataset_size(file, "mesh/x_r");
+  TENRYU_ASSERT(
+      x_r_extent == checked_i64_to_size(
+                          checkpoint_nodes,
+                          "checkpoint root n_nodes"),
+      "ConfigError: checkpoint root n_nodes does not match mesh/x_r extent "
+      "(n_nodes=" +
+          std::to_string(checkpoint_nodes) + ", mesh/x_r=" +
+          std::to_string(x_r_extent) + ")");
   if (n_groups_attr.has_value()) {
     TENRYU_ASSERT(*n_groups_attr == static_cast<std::int64_t>(std::max(cfg.radiation.groups, 1)),
                   "ConfigError: checkpoint n_groups mismatch");
@@ -1455,6 +1980,98 @@ void validate_schema_and_frozen_config(const hid_t file, const core::Config& cfg
     }
   }
 
+  constexpr std::int32_t kPentagonCornerMassPartitionVersion = 2;
+  const bool has_pentagon_corner_mass_partition_version =
+      link_exists(file, "metadata/pentagon_corner_mass_partition_version");
+  const std::int32_t pentagon_corner_mass_partition_version =
+      read_scalar_dataset<std::int32_t>(
+          file,
+          "metadata/pentagon_corner_mass_partition_version",
+          H5T_NATIVE_INT32,
+          0);
+  if (!has_pentagon_corner_mass_partition_version ||
+      pentagon_corner_mass_partition_version !=
+          kPentagonCornerMassPartitionVersion) {
+    const char* forensic =
+        std::getenv("TENRYU_I1B_RESTART_FORENSIC");
+    const bool forensic_mode =
+        forensic != nullptr && std::string_view(forensic) == "1";
+    if (forensic_mode) {
+      core::log_warning(
+          "[restart] FORENSIC MODE: artifact-substrate checkpoint loaded; "
+          "results are NOT production-comparable");
+    } else {
+      throw core::namelist::ConfigError(
+          "checkpoint predates the pentagon corner-mass partition "
+          "fix (physics epoch clean_pentagon_v2); it cannot continue under this "
+          "executable. Set TENRYU_I1B_RESTART_FORENSIC=1 to load it for forensic "
+          "analysis only.");
+    }
+  }
+  constexpr std::int32_t kAleSweptSignEpoch = 2;
+  bool ale_swept_sign_epoch_forensic = false;
+  const bool has_ale_swept_sign_epoch =
+      link_exists(file, "metadata/ale_swept_sign_epoch");
+  const std::int32_t ale_swept_sign_epoch =
+      read_scalar_dataset<std::int32_t>(file,
+                                        "metadata/ale_swept_sign_epoch",
+                                        H5T_NATIVE_INT32,
+                                        0);
+  if (!has_ale_swept_sign_epoch ||
+      ale_swept_sign_epoch != kAleSweptSignEpoch) {
+    const char* forensic = std::getenv("TENRYU_I1B_RESTART_FORENSIC");
+    const bool forensic_mode =
+        forensic != nullptr && std::string_view(forensic) == "1";
+    if (forensic_mode) {
+      ale_swept_sign_epoch_forensic = true;
+      core::log_warning(
+          "[restart] FORENSIC MODE: artifact-substrate checkpoint loaded; "
+          "results are NOT production-comparable");
+    } else {
+      throw core::namelist::ConfigError(
+          "legacy swept-sign epoch checkpoint rejected; regenerate from "
+          "scratch (consult-17 Q3, 2026-08-05)");
+    }
+  }
+  const bool has_axis_core_released_units =
+      link_exists(file, "metadata/axis_core_released_units");
+  const std::int32_t axis_core_released_units =
+      read_scalar_dataset<std::int32_t>(file,
+                                        "metadata/axis_core_released_units",
+                                        H5T_NATIVE_INT32,
+                                        0);
+  if (has_axis_core_released_units) {
+    TENRYU_ASSERT(
+        axis_core_released_units >= 0,
+        "ConfigError: AXIS_CORE_RELEASED_UNITS=" +
+            std::to_string(axis_core_released_units) +
+            " must be non-negative");
+  }
+  if (axis_core_released_units > 0) {
+    if (!hydro::axis_core_ring_release_enabled(cfg)) {
+      const char* forensic = std::getenv("TENRYU_I1B_RESTART_FORENSIC");
+      const bool forensic_mode =
+          forensic != nullptr && std::string_view(forensic) == "1";
+      if (forensic_mode) {
+        core::log_warning(
+            "[restart] FORENSIC MODE: AXIS_CORE_RELEASED_UNITS=" +
+            std::to_string(axis_core_released_units) +
+            " loaded while TENRYU_I1B_RING_RELEASE and "
+            "Numerics.ale.euler_window.axis_core_ring_release_enabled are "
+            "disabled; results are NOT production-comparable");
+      } else {
+        TENRYU_ASSERT(
+            false,
+            "ConfigError: checkpoint AXIS_CORE_RELEASED_UNITS=" +
+                std::to_string(axis_core_released_units) +
+                " requires TENRYU_I1B_RING_RELEASE=1 or "
+                "Numerics.ale.euler_window.axis_core_ring_release_enabled=true; "
+                "set TENRYU_I1B_RESTART_FORENSIC=1 to load it for forensic "
+                "analysis only");
+      }
+    }
+    hydro::axis_core_set_released_units(axis_core_released_units);
+  }
   TENRYU_ASSERT(link_exists(file, "metadata/frozen_config"),
                 "ConfigError: checkpoint missing metadata/frozen_config");
   const std::string frozen_config = read_string_dataset_checked(file, "metadata/frozen_config");
@@ -1499,12 +2116,14 @@ void validate_schema_and_frozen_config(const hid_t file, const core::Config& cfg
         "metadata/swept_volume_contract/plic",
         H5T_NATIVE_UINT8,
         kSweptVolumeContractAbsent);
-    validate_swept_volume_contract(plain_csr,
-                                   conservative_csr,
-                                   option_b,
-                                   axis_band,
-                                   plic,
-                                   config_swept_volume_contract);
+    if (!ale_swept_sign_epoch_forensic) {
+      validate_swept_volume_contract(plain_csr,
+                                     conservative_csr,
+                                     option_b,
+                                     axis_band,
+                                     plic,
+                                     config_swept_volume_contract);
+    }
   } else {
     const auto frozen_swept_volume_sign_fixed =
         tenryu::io::swept_volume_flag_from_frozen_config(frozen_config);
@@ -1512,34 +2131,44 @@ void validate_schema_and_frozen_config(const hid_t file, const core::Config& cfg
       const auto restart_swept_volume_contract =
           hydro::resolve_swept_volume_contract(
               *frozen_swept_volume_sign_fixed);
-      validate_swept_volume_contract(
-          static_cast<std::uint8_t>(restart_swept_volume_contract.plain_csr),
-          static_cast<std::uint8_t>(
-              restart_swept_volume_contract.conservative_csr),
-          static_cast<std::uint8_t>(restart_swept_volume_contract.option_b),
-          static_cast<std::uint8_t>(restart_swept_volume_contract.axis_band),
-          static_cast<std::uint8_t>(restart_swept_volume_contract.plic),
-          config_swept_volume_contract);
+      if (!ale_swept_sign_epoch_forensic) {
+        validate_swept_volume_contract(
+            static_cast<std::uint8_t>(restart_swept_volume_contract.plain_csr),
+            static_cast<std::uint8_t>(
+                restart_swept_volume_contract.conservative_csr),
+            static_cast<std::uint8_t>(restart_swept_volume_contract.option_b),
+            static_cast<std::uint8_t>(restart_swept_volume_contract.axis_band),
+            static_cast<std::uint8_t>(restart_swept_volume_contract.plic),
+            config_swept_volume_contract);
+      }
     } else {
       core::log_warning(
           "restart predates the swept-volume contract; resolved LegacyRawV0 from era "
           "(migration rule)");
       const auto era_contract = hydro::resolve_swept_volume_contract(false);
-      validate_swept_volume_contract(
-          static_cast<std::uint8_t>(era_contract.plain_csr),
-          static_cast<std::uint8_t>(era_contract.conservative_csr),
-          static_cast<std::uint8_t>(era_contract.option_b),
-          static_cast<std::uint8_t>(era_contract.axis_band),
-          static_cast<std::uint8_t>(era_contract.plic),
-          config_swept_volume_contract);
+      if (!ale_swept_sign_epoch_forensic) {
+        validate_swept_volume_contract(
+            static_cast<std::uint8_t>(era_contract.plain_csr),
+            static_cast<std::uint8_t>(era_contract.conservative_csr),
+            static_cast<std::uint8_t>(era_contract.option_b),
+            static_cast<std::uint8_t>(era_contract.axis_band),
+            static_cast<std::uint8_t>(era_contract.plic),
+            config_swept_volume_contract);
+      }
     }
   }
   if (looks_like_json_object(frozen_config)) {
     if (!cfg.meta.frozen_config_json.empty()) {
-      TENRYU_ASSERT(
-          core::namelist::Freeze::configs_equivalent(
-              frozen_config, cfg.meta.frozen_config_json),
-          "ConfigError: checkpoint frozen_config JSON mismatch between checkpoint and namelist");
+      const char* allow_drift = std::getenv("TENRYU_I1B_RESTART_ALLOW_CONFIG_DRIFT");
+      const bool drift_ok = (allow_drift != nullptr && std::string_view(allow_drift) == "1");
+      const bool equivalent = core::namelist::Freeze::configs_equivalent(
+          frozen_config, cfg.meta.frozen_config_json);
+      if (!equivalent && drift_ok) {
+        core::log_warning("[restart] frozen-config mismatch OVERRIDDEN by TENRYU_I1B_RESTART_ALLOW_CONFIG_DRIFT=1 (diagnostic use only; results are NOT production-comparable)");
+      } else {
+        TENRYU_ASSERT(equivalent,
+            "ConfigError: checkpoint frozen_config JSON mismatch between checkpoint and namelist");
+      }
     } else {
       core::log_warning(
           "Restart config warning: checkpoint metadata/frozen_config is JSON, but "
@@ -1562,6 +2191,14 @@ void validate_schema_and_frozen_config(const hid_t file, const core::Config& cfg
                 "ConfigError: Main.seed mismatch between checkpoint and namelist");
 
   core::log_info("Restart config check: fixed items validated");
+  if (std::getenv("TENRYU_RESTART_DEBUG") != nullptr) {
+    std::fprintf(stderr,
+                 "[restart_dbg] schema: checkpoint_nodes=%lld expected=%lld evolved=%d\n",
+                 static_cast<long long>(checkpoint_nodes),
+                 static_cast<long long>(expected_nodes),
+                 evolved_reale_v3 ? 1 : 0);
+  }
+  return static_cast<int>(checkpoint_nodes);
 }
 
 void restore_particles(const hid_t file,
@@ -1863,6 +2500,11 @@ PerMaterialCheckpointReadStatus read_per_material_checkpoint_status(
 CheckpointData HDF5Reader::read_checkpoint(const core::Config& cfg,
                                            const std::string& checkpoint_prefix,
                                            const int rank) const {
+  if (std::getenv("TENRYU_RESTART_DEBUG") != nullptr) {
+    std::fprintf(stderr,
+                 "[restart_dbg] reading checkpoint: %s\n",
+                 checkpoint_prefix.c_str());
+  }
   CheckpointData out{};
 
 #if TENRYU_ENABLE_HDF5
@@ -1871,13 +2513,83 @@ CheckpointData HDF5Reader::read_checkpoint(const core::Config& cfg,
   const hid_t file = H5Fopen(checkpoint_path.string().c_str(), H5F_ACC_RDONLY, H5P_DEFAULT);
   TENRYU_ASSERT(file >= 0, "Failed to open checkpoint file: " + checkpoint_path.string());
 
-  validate_schema_and_frozen_config(file, cfg);
+  if (link_exists(file, "metadata/epoch_swap/v1") &&
+      pole_axis_bbsw_enabled_for_restart(cfg)) {
+    TENRYU_ASSERT(
+        false,
+        "ConfigError: epoch-swap §15 contract violation: swapped articles must never run with pole-axis BBSW");
+  }
+
+  constexpr const char* carrier_group_path = "mesh/carrier/v1";
+  if (cfg.numerics.ale.mesh_mode == "reale_v2" &&
+      !link_exists(file, carrier_group_path)) {
+    warn_h5_close_failure(H5Fclose(file), "H5Fclose",
+                          "HDF5Reader::read_checkpoint(carrier absence)");
+    throw core::namelist::ConfigError(
+        "checkpoint predates carrier IO; restart of a carrier run from this "
+        "file is not representable — rerun from the deck or restart a gen-0 "
+        "checkpoint");
+  }
+
+  const int config_stride = core::corner_stride_for_config(cfg);
+  if (link_exists(file, "mesh/topology/v4")) {
+    const int checkpoint_stride = checkpoint_corner_stride(file);
+    TENRYU_ASSERT(
+        checkpoint_stride == config_stride,
+        "ConfigError: restart checkpoint v4 corner_stride mismatch "
+        "(checkpoint=" +
+            std::to_string(checkpoint_stride) + ", current config=" +
+            std::to_string(config_stride) +
+            "); refusing silent stride mixing");
+  } else {
+    TENRYU_ASSERT(
+        config_stride == 4,
+        "ConfigError: checkpoint predates v4 corner-stride metadata and cannot "
+        "restart a stride-8 (native pentagon / pentagon_belt_shell) "
+        "configuration");
+  }
+
+  const int checkpoint_n_nodes =
+      validate_schema_and_frozen_config(file, cfg);
 
   out.state = core::State::allocate(cfg);
   out.state.mesh = mesh::create_mesh(cfg, out.state);
   out.state.vol = out.state.mesh.cell_vol;
 
-  load_mesh_topology_group(file, cfg, out.state.mesh.topo);
+  const int initial_n_nodes = out.state.mesh.topo.n_nodes;
+  std::vector<int> initial_csr_offsets;
+  std::vector<int> initial_csr_indices;
+  if (out.state.mesh.topo.multiblock.has_value()) {
+    initial_csr_offsets =
+        out.state.mesh.topo.multiblock->cell_node_csr_offsets;
+    initial_csr_indices =
+        out.state.mesh.topo.multiblock->cell_node_csr_indices;
+  }
+  if (checkpoint_n_nodes != initial_n_nodes) {
+    const std::size_t n_nodes =
+        static_cast<std::size_t>(checkpoint_n_nodes);
+    out.state.x_r.reset(n_nodes);
+    out.state.x_z.reset(n_nodes);
+    out.state.x_r_initial.reset(n_nodes);
+    out.state.x_z_initial.reset(n_nodes);
+    out.state.x_r_reference.reset(n_nodes);
+    out.state.x_z_reference.reset(n_nodes);
+    out.state.x_r_shock_target.reset(n_nodes);
+    out.state.x_z_shock_target.reset(n_nodes);
+    out.state.v_r.reset(n_nodes);
+    out.state.v_z.reset(n_nodes);
+  }
+
+  load_mesh_topology_group(
+      file, cfg, checkpoint_n_nodes, out.state.mesh.topo);
+
+  bool cell_node_csr_changed = false;
+  if (out.state.mesh.topo.multiblock.has_value()) {
+    const auto& restored_mb = *out.state.mesh.topo.multiblock;
+    cell_node_csr_changed =
+        restored_mb.cell_node_csr_offsets != initial_csr_offsets ||
+        restored_mb.cell_node_csr_indices != initial_csr_indices;
+  }
 
   copy_required_dataset_to_field(file, "mesh/x_r", out.state.x_r);
   copy_required_dataset_to_field(file, "mesh/v_r", out.state.v_r);
@@ -1886,6 +2598,16 @@ CheckpointData HDF5Reader::read_checkpoint(const core::Config& cfg,
     copy_required_dataset_to_field(file, "mesh/v_z", out.state.v_z);
   }
   load_ale_reference_checkpoint_group(file, out.state);
+  load_carrier_checkpoint_group(file, out.state);
+  load_evacuated_cells_checkpoint_group(file, out.state);
+  const bool restored_evolved_reale_topology =
+      cfg.numerics.ale.mesh_mode == "reale_v2" &&
+      (checkpoint_n_nodes != initial_n_nodes || cell_node_csr_changed ||
+       (out.state.boundary_carrier.valid &&
+        out.state.carrier_domain_active));
+  if (restored_evolved_reale_topology) {
+    prepare_evolved_reale_node_state(out.state);
+  }
 
   copy_required_dataset_to_field(file, "hydro/rho", out.state.rho);
   copy_required_dataset_to_field(file, "hydro/Te", out.state.Te);
@@ -1910,13 +2632,19 @@ CheckpointData HDF5Reader::read_checkpoint(const core::Config& cfg,
            ++cell) {
         const std::int8_t nverts = out.state.cell_nverts_host[cell];
         TENRYU_ASSERT(
-            nverts >= 3 && nverts <= 8,
+            nverts >= 3 && nverts <= out.state.corner_stride,
             "Restart checkpoint mesh/topology/v4/cell_nverts entry must be "
-            "in [3, 8]");
+            "in [3, corner_stride]");
         out.state.mesh.cell_nverts[cell] =
             static_cast<std::uint8_t>(nverts);
       }
     }
+  }
+  if (restored_evolved_reale_topology) {
+    // ReALE install invokes this same helper after replacing cell-node CSR
+    // (coupling/reale_mode.cpp::rezone_step). It rebuilds node flags, reverse
+    // CSR, face topology, and their device mirrors from the restored authority.
+    mesh::rebuild_runtime_topology_caches(out.state, cfg, true);
   }
   if (link_exists(file, "hydro/corner_mass")) {
     const std::size_t expected_corner_mass_size = checked_mul_size(
@@ -2332,11 +3060,30 @@ CheckpointData HDF5Reader::read_checkpoint(const core::Config& cfg,
         read_vector_dataset<std::int8_t>(file, "hydro_flags/hydro_active", H5T_NATIVE_INT8);
     out.state.note_hydro_active_host_write();
   }
+  if (link_exists(file, "metadata/merge_tombstone")) {
+    out.state.merge_tombstone = read_vector_dataset_checked<std::uint8_t>(
+        file, "metadata/merge_tombstone", H5T_NATIVE_UINT8, n_cells);
+    const std::size_t tombstone_count = static_cast<std::size_t>(std::count_if(
+        out.state.merge_tombstone.begin(),
+        out.state.merge_tombstone.end(),
+        [](const std::uint8_t value) { return value != 0U; }));
+    if (tombstone_count != 0U) {
+      core::log_info("[restart] loaded merge_tombstone mask: tombstones=" +
+                     std::to_string(tombstone_count));
+    }
+  }
 
   out.state.t = read_scalar_dataset<double>(file, "time_state/t", H5T_NATIVE_DOUBLE, 0.0);
   out.state.step = static_cast<int>(
       read_scalar_dataset<std::int32_t>(file, "time_state/step", H5T_NATIVE_INT32, 0));
   out.state.dt = read_scalar_dataset<double>(file, "time_state/dt", H5T_NATIVE_DOUBLE, 0.0);
+  out.state.dt_growth_ref =
+      link_exists(file, "time_state/dt_growth_ref")
+          ? read_scalar_dataset<double>(file,
+                                        "time_state/dt_growth_ref",
+                                        H5T_NATIVE_DOUBLE,
+                                        out.state.dt)
+          : out.state.dt;
   out.state.ale_last_applied_step =
       static_cast<int>(read_scalar_dataset<std::int32_t>(
           file, "time_state/ale_last_applied_step", H5T_NATIVE_INT32, -1));

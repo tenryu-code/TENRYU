@@ -15,6 +15,7 @@ enum class AleMode : std::uint8_t {
   CdLocalWinslow,
   InteriorMultiNodeProjection,
   AxisVariationalProjection,
+  FlankTangentialStrip,
 };
 
 struct AleRequest {

@@ -19,6 +19,31 @@ import { isTerminal, parseStatusFile, type RunRecord } from "@tenryu-common/core
 import { joinRemote, shQuotePath } from "@tenryu-common/core/ssh";
 import { toCanonical } from "./core/units";
 import { parseValidateOutput, type ValidateResult } from "./core/validateParse";
+import {
+  buildCancelScript,
+  buildEchoHomeScript,
+  buildGenerateScript,
+  buildLatestOutputDirScript,
+  buildMkdirScript,
+  buildProbeAssistScript,
+  buildRemoteAssistScript,
+  buildRemoteWrapperEnv,
+  buildStatusScript,
+} from "./core/assist/commands";
+import {
+  parseAssistStatus,
+  parseDeckLint,
+  parseDigest,
+  parseGenerateResult,
+  parseJournalTail,
+  parsePromoteZoning,
+  parseZoningReport,
+  type AssistStatusView,
+  type DeckLintView,
+  type DigestView,
+  type PromoteZoningView,
+  type ZoningReportView,
+} from "./core/assist/parse";
 import { setLang, t, type Lang } from "./i18n";
 
 let backendOverride: Backend | null = null;
@@ -27,12 +52,18 @@ export function __setBackendForTest(b: Backend | null): void {
   backendOverride = b;
   homeCache.clear();
   repoRootCache.clear();
+  localHomeCache = null;
+  assistProbeCache.clear();
+  if (assistJournalTimer !== null) {
+    clearInterval(assistJournalTimer);
+    assistJournalTimer = null;
+  }
 }
 function be(): Backend {
   return backendOverride ?? getBackend();
 }
 
-export type View = "form" | "servers" | "history";
+export type View = "form" | "servers" | "history" | "assist";
 export type SectionKey = "presets" | "basic" | "mesh" | "materials" | "physics" | "laser" | "output";
 
 export interface ConnTestResult {
@@ -55,6 +86,9 @@ const MAX_RUN_RECORDS = 50;
 
 const homeCache = new Map<string, string>();
 const repoRootCache = new Map<string, string | null>();
+let localHomeCache: string | null = null;
+const assistProbeCache = new Map<string, boolean>();
+let assistJournalTimer: ReturnType<typeof setInterval> | null = null;
 
 async function resolveHome(profile: ServerProfile): Promise<string> {
   if (profile.transport === "local") return "";
@@ -66,6 +100,17 @@ async function resolveHome(profile: ServerProfile): Promise<string> {
     throw new Error(`リモート HOME を解決できません: ${r.stderr.trim() || `exit=${r.code}`}`);
   }
   homeCache.set(profile.id, home);
+  return home;
+}
+
+async function resolveLocalHome(): Promise<string> {
+  if (localHomeCache !== null) return localHomeCache;
+  const r = await be().execLocal(["bash", "-lc", buildEchoHomeScript()], { timeoutMs: 15000 });
+  const home = r.stdout.trim().split("\n").pop() ?? "";
+  if (r.code !== 0 || !home.startsWith("/")) {
+    throw new Error(`ローカル HOME を解決できません: ${r.stderr.trim() || `exit=${r.code}`}`);
+  }
+  localHomeCache = home;
   return home;
 }
 
@@ -154,6 +199,32 @@ export interface AppState {
   profileLists: Record<string, { status: "loading" | "ready" | "error"; error?: string; paths?: string[] }>;
   profileSnaps: Record<string, { status: "loading" | "ready" | "error"; error?: string; data?: ProfileSnapshot }>;
   starting: boolean;
+  assistLocalRepo: string;
+  assistStatus: { status: "idle" | "loading" | "ready" | "error"; view?: AssistStatusView; raw?: string; error?: string };
+  assistLint: { status: "idle" | "running" | "ready" | "error"; view?: DeckLintView; raw?: string; error?: string; exitOk?: boolean };
+  assistSpec: string;
+  assistUseTemplate: boolean;
+  assistMaxIters: number;
+  assistIntentJson: string;
+  assistGen: {
+    phase: "idle" | "running" | "accepted" | "uncertain" | "error";
+    workdir: string | null;
+    iterations: number;
+    lastKind: string | null;
+    question: string | null;
+    deckText: string | null;
+    deckName: string | null;
+    errorCode: string | null;
+    errorDetail: string | null;
+    resultRaw: string | null;
+    lint: Record<string, unknown> | null;
+  };
+  assistDiag: Record<string, {
+    digest?: { status: "running" | "ready" | "error"; view?: DigestView; raw?: string; error?: string };
+    zoning?: { status: "running" | "ready" | "error"; view?: ZoningReportView; raw?: string; error?: string };
+    promote?: { status: "running" | "ready" | "error"; view?: PromoteZoningView; raw?: string; error?: string };
+  }>;
+  assistDeckValidate: { status: "idle" | "running" | "ready" | "error"; result?: ValidateResult; sentTo?: string | null };
 
   loadInitial(): Promise<void>;
   setView(v: View): void;
@@ -175,7 +246,7 @@ export interface AppState {
   saveDeckToFile(): Promise<boolean>;
   saveTextAs(suggestedName: string, content: string): Promise<boolean>;
   testConnection(p: ServerProfile): Promise<void>;
-  startRun(): Promise<void>;
+  startRun(override?: { deck: string; name: string }): Promise<void>;
   restartRun(runId: string): Promise<void>;
   pollRunOnce(runId: string): Promise<void>;
   pollActiveRuns(): Promise<void>;
@@ -185,6 +256,20 @@ export interface AppState {
   fetchHistory(runId: string): Promise<void>;
   fetchProfileList(runId: string): Promise<void>;
   fetchProfileSnap(runId: string, index: number): Promise<void>;
+  setAssistLocalRepo(path: string): Promise<void>;
+  setAssistSpec(spec: string): void;
+  setAssistUseTemplate(v: boolean): void;
+  setAssistMaxIters(n: number): void;
+  setAssistIntentJson(v: string): void;
+  fetchAssistStatus(): Promise<void>;
+  runAssistLint(): Promise<void>;
+  runAssistDiag(runId: string, verb: "digest" | "zoning" | "promote"): Promise<void>;
+  generateAssistDeck(): Promise<void>;
+  answerAssistClarification(answer: string): Promise<void>;
+  cancelAssistGeneration(): Promise<void>;
+  resetAssistGeneration(): void;
+  validateAssistDeck(): Promise<void>;
+  runAssistGeneratedDeck(): Promise<void>;
 }
 
 export function currentProfile(s: Pick<AppState, "profiles" | "currentProfileId">): ServerProfile | null {
@@ -196,9 +281,84 @@ const initialDerived = deriveDeck(initialForm);
 
 const rateMemo = new Map<string, { step: number; wall: number }>();
 
+const initialAssistGen: AppState["assistGen"] = {
+  phase: "idle",
+  workdir: null,
+  iterations: 0,
+  lastKind: null,
+  question: null,
+  deckText: null,
+  deckName: null,
+  errorCode: null,
+  errorDetail: null,
+  resultRaw: null,
+  lint: null,
+};
+
 export const useApp = create<AppState>()((set, get) => {
   function patchRun(runId: string, patch: Partial<RunRecord>): void {
     set({ runs: get().runs.map((r) => (r.id === runId ? { ...r, ...patch } : r)) });
+  }
+
+  function stopAssistJournalTimer(): void {
+    if (assistJournalTimer !== null) {
+      clearInterval(assistJournalTimer);
+      assistJournalTimer = null;
+    }
+  }
+
+  function failGen(code: string, detail?: string): void {
+    set({
+      assistGen: {
+        ...initialAssistGen,
+        phase: "error",
+        errorCode: code,
+        errorDetail: detail ?? null,
+      },
+    });
+  }
+
+  function errorWithDetail(code: string, detail: string): string {
+    const trimmed = detail.trim();
+    return trimmed.length > 0 ? `${code}: ${trimmed}` : code;
+  }
+
+  async function probeRemoteAssist(profile: ServerProfile, root: string): Promise<boolean> {
+    const key = `${profile.id}\0${root}`;
+    const cached = assistProbeCache.get(key);
+    if (cached !== undefined) return cached;
+    const r = await be().exec(profile, ["bash", "-lc", buildProbeAssistScript(root)], {
+      timeoutMs: 30000,
+    });
+    const ok = r.stdout.includes("ASSIST_OK");
+    assistProbeCache.set(key, ok);
+    return ok;
+  }
+
+  async function validateDeckWith(
+    profile: ServerProfile,
+    root: string | null,
+    deckText: string,
+    name: string,
+  ): Promise<{ result: ValidateResult; sentTo: string | null }> {
+    const remoteDeck = joinRemote(profile.runDir, `validate_scratch/${name}.py`);
+    try {
+      await be().uploadText(profile, remoteDeck, deckText);
+      const r: ExecResult = await be().exec(
+        profile,
+        withRepoEnv(root, [profile.tenryuBin, "validate", remoteDeck]),
+        { timeoutMs: 120000 },
+      );
+      return {
+        result: parseValidateOutput(r.stdout, r.stderr, r.code),
+        sentTo: `${profile.name}:${remoteDeck}`,
+      };
+    } catch (err) {
+      return {
+        result: { ok: false, summary: [], errors: [String(err)], warnings: [], raw: "" },
+        sentTo: null,
+      };
+    }
   }
 
   async function persistRuns(): Promise<void> {
@@ -208,6 +368,7 @@ export const useApp = create<AppState>()((set, get) => {
         lastProfileId: s.currentProfileId ?? undefined,
         runs: s.runs.slice(0, MAX_RUN_RECORDS),
         lang: s.lang,
+        assistLocalRepo: s.assistLocalRepo || undefined,
       });
     } catch {
       /* non-fatal */
@@ -247,6 +408,16 @@ export const useApp = create<AppState>()((set, get) => {
     profileLists: {},
     profileSnaps: {},
     starting: false,
+    assistLocalRepo: "",
+    assistStatus: { status: "idle" },
+    assistLint: { status: "idle" },
+    assistSpec: "",
+    assistUseTemplate: true,
+    assistMaxIters: 10,
+    assistIntentJson: "",
+    assistGen: initialAssistGen,
+    assistDiag: {},
+    assistDeckValidate: { status: "idle" },
 
     async loadInitial() {
       try {
@@ -267,6 +438,7 @@ export const useApp = create<AppState>()((set, get) => {
           loadError: null,
           runs: settings.runs ?? [],
           lang,
+          assistLocalRepo: settings.assistLocalRepo ?? "",
           ...deriveDeck(form),
         });
       } catch (err) {
@@ -292,6 +464,7 @@ export const useApp = create<AppState>()((set, get) => {
           lastProfileId: s.currentProfileId ?? undefined,
           runs: s.runs.slice(0, MAX_RUN_RECORDS),
           lang,
+          assistLocalRepo: s.assistLocalRepo || undefined,
         });
       } catch {
         /* non-fatal */
@@ -311,6 +484,7 @@ export const useApp = create<AppState>()((set, get) => {
       set({ profiles });
       homeCache.delete(p.id);
       repoRootCache.clear();
+      assistProbeCache.clear();
       await be().saveProfiles(profiles);
       if (get().currentProfileId === null) await get().selectProfile(p.id);
     },
@@ -322,6 +496,7 @@ export const useApp = create<AppState>()((set, get) => {
       set({ profiles, currentProfileId, connResult: null });
       homeCache.delete(id);
       repoRootCache.clear();
+      assistProbeCache.clear();
       await be().saveProfiles(profiles);
     },
 
@@ -436,6 +611,558 @@ export const useApp = create<AppState>()((set, get) => {
       return (await be().saveLocalTextFile(suggestedName, content)) !== null;
     },
 
+    async setAssistLocalRepo(path) {
+      set({ assistLocalRepo: path });
+      await persistRuns();
+    },
+
+    setAssistSpec(spec) {
+      set({ assistSpec: spec });
+    },
+
+    setAssistUseTemplate(v) {
+      set({ assistUseTemplate: v });
+    },
+
+    setAssistMaxIters(n) {
+      set({ assistMaxIters: n });
+    },
+
+    setAssistIntentJson(v) {
+      set({ assistIntentJson: v });
+    },
+
+    async fetchAssistStatus() {
+      const repo = get().assistLocalRepo.trim();
+      if (repo === "") {
+        set({ assistStatus: { status: "error", error: "NO_LOCAL_REPO" } });
+        return;
+      }
+      try {
+        set({ assistStatus: { status: "loading" } });
+        const probe = await be().execLocal(
+          ["bash", "-lc", buildProbeAssistScript(repo)],
+          { timeoutMs: 30000 },
+        );
+        if (!probe.stdout.includes("ASSIST_OK")) {
+          set({ assistStatus: { status: "error", error: "NO_LOCAL_ASSIST" } });
+          return;
+        }
+        const r = await be().execLocal(["bash", "-lc", buildStatusScript(repo)], {
+          timeoutMs: 30000,
+        });
+        if (r.code !== 0) {
+          set({
+            assistStatus: {
+              status: "error",
+              error: errorWithDetail("STATUS_FAILED", r.stderr.slice(-400)),
+            },
+          });
+          return;
+        }
+        const parsed = parseAssistStatus(r.stdout);
+        if (parsed.ok) {
+          set({ assistStatus: { status: "ready", view: parsed.data, raw: r.stdout } });
+        } else {
+          set({
+            assistStatus: {
+              status: "error",
+              error: `PARSE: ${parsed.error}`,
+              raw: r.stdout,
+            },
+          });
+        }
+      } catch (err) {
+        set({
+          assistStatus: {
+            status: "error",
+            error: `EXEC_FAILED: ${String(err)}`,
+          },
+        });
+      }
+    },
+
+    async runAssistLint() {
+      const s = get();
+      const profile = currentProfile(s);
+      if (!profile) {
+        set({ assistLint: { status: "error", error: "NO_PROFILE" } });
+        return;
+      }
+      if (profileBinMissing(profile)) {
+        set({ assistLint: { status: "error", error: "NO_BIN" } });
+        return;
+      }
+      if (s.formErrors.length > 0 || s.deck.length === 0) {
+        set({ assistLint: { status: "error", error: "FORM_INVALID" } });
+        return;
+      }
+      try {
+        const root = await resolveRepoRoot(profile);
+        if (root === null) {
+          set({ assistLint: { status: "error", error: "NO_TOOLS" } });
+          return;
+        }
+        if (!(await probeRemoteAssist(profile, root))) {
+          set({ assistLint: { status: "error", error: "NO_ASSIST" } });
+          return;
+        }
+        set({ assistLint: { status: "running" } });
+        const deckPath = await absRemotePath(
+          profile,
+          joinRemote(profile.runDir, `validate_scratch/${s.form.main.name}_assist_lint.py`),
+        );
+        await be().uploadText(profile, deckPath, s.deck);
+        const r = await be().exec(
+          profile,
+          [
+            "bash",
+            "-lc",
+            buildRemoteAssistScript(root, [
+              "lint-deck",
+              deckPath,
+              "--tenryu",
+              profile.tenryuBin,
+            ]),
+          ],
+          { timeoutMs: 630000 },
+        );
+        const parsed = parseDeckLint(r.stdout);
+        if (parsed.ok) {
+          set({
+            assistLint: {
+              status: "ready",
+              view: parsed.data,
+              raw: r.stdout,
+              exitOk: r.code === 0,
+            },
+          });
+        } else if (r.code !== 0) {
+          set({
+            assistLint: {
+              status: "error",
+              error: errorWithDetail("LINT_FAILED", r.stderr.slice(-400)),
+            },
+          });
+        } else {
+          set({
+            assistLint: {
+              status: "error",
+              error: `PARSE: ${parsed.error}`,
+              raw: r.stdout,
+            },
+          });
+        }
+      } catch (err) {
+        set({ assistLint: { status: "error", error: `EXEC_FAILED: ${String(err)}` } });
+      }
+    },
+
+    async runAssistDiag(runId, verb) {
+      const rec = get().runs.find((r) => r.id === runId);
+      if (!rec || rec.runDir === "" || !isTerminal(rec.state)) return;
+
+      function patchDiag(
+        entry:
+          | NonNullable<AppState["assistDiag"][string]["digest"]>
+          | NonNullable<AppState["assistDiag"][string]["zoning"]>
+          | NonNullable<AppState["assistDiag"][string]["promote"]>,
+      ): void {
+        set({
+          assistDiag: {
+            ...get().assistDiag,
+            [runId]: { ...get().assistDiag[runId], [verb]: entry },
+          },
+        });
+      }
+
+      const profile = get().profiles.find((p) => p.id === rec.profileId);
+      if (!profile) {
+        patchDiag({ status: "error", error: "NO_PROFILE" });
+        return;
+      }
+      try {
+        const root = await resolveRepoRoot(profile);
+        if (root === null) {
+          patchDiag({ status: "error", error: "NO_TOOLS" });
+          return;
+        }
+        if (!(await probeRemoteAssist(profile, root))) {
+          patchDiag({ status: "error", error: "NO_ASSIST" });
+          return;
+        }
+        patchDiag({ status: "running" });
+        const latest = await be().exec(
+          profile,
+          ["bash", "-lc", buildLatestOutputDirScript(rec.runDir)],
+          { timeoutMs: 20000 },
+        );
+        const dir = latest.stdout
+          .split("\n")
+          .map((line) => line.trim())
+          .filter((line) => line.length > 0)
+          .pop() ?? "";
+        if (dir === "") {
+          patchDiag({ status: "error", error: "NO_OUTPUTS" });
+          return;
+        }
+        const verbArg = verb === "digest"
+          ? "digest"
+          : verb === "zoning" ? "zoning-report" : "promote-zoning";
+        const r = await be().exec(
+          profile,
+          ["bash", "-lc", buildRemoteAssistScript(root, [verbArg, dir])],
+          { timeoutMs: 180000 },
+        );
+        const failureCode = `${verbArg.toUpperCase().replace("-", "_")}_FAILED`;
+        if (verb === "digest") {
+          const parsed = parseDigest(r.stdout);
+          if (parsed.ok) {
+            patchDiag({ status: "ready", view: parsed.data, raw: r.stdout });
+          } else if (r.code !== 0) {
+            patchDiag({
+              status: "error",
+              error: errorWithDetail(failureCode, r.stderr.slice(-400)),
+            });
+          } else {
+            patchDiag({ status: "error", error: `PARSE: ${parsed.error}`, raw: r.stdout });
+          }
+        } else if (verb === "zoning") {
+          const parsed = parseZoningReport(r.stdout);
+          if (parsed.ok) {
+            patchDiag({ status: "ready", view: parsed.data, raw: r.stdout });
+          } else if (r.code !== 0) {
+            patchDiag({
+              status: "error",
+              error: errorWithDetail(failureCode, r.stderr.slice(-400)),
+            });
+          } else {
+            patchDiag({ status: "error", error: `PARSE: ${parsed.error}`, raw: r.stdout });
+          }
+        } else {
+          const parsed = parsePromoteZoning(r.stdout);
+          if (parsed.ok) {
+            patchDiag({ status: "ready", view: parsed.data, raw: r.stdout });
+          } else if (r.code !== 0) {
+            patchDiag({
+              status: "error",
+              error: errorWithDetail(failureCode, r.stderr.slice(-400)),
+            });
+          } else {
+            patchDiag({ status: "error", error: `PARSE: ${parsed.error}`, raw: r.stdout });
+          }
+        }
+      } catch (err) {
+        patchDiag({ status: "error", error: `EXEC_FAILED: ${String(err)}` });
+      }
+    },
+
+    async generateAssistDeck() {
+      if (get().assistGen.phase === "running") return;
+      const spec = get().assistSpec;
+      if (spec.trim() === "") {
+        failGen("NO_SPEC");
+        return;
+      }
+      const repo = get().assistLocalRepo.trim();
+      if (repo === "") {
+        failGen("NO_LOCAL_REPO");
+        return;
+      }
+
+      let workdir: string | null = null;
+      let launched = false;
+      try {
+        const probe = await be().execLocal(
+          ["bash", "-lc", buildProbeAssistScript(repo)],
+          { timeoutMs: 30000 },
+        );
+        if (!probe.stdout.includes("ASSIST_OK")) {
+          failGen("NO_LOCAL_ASSIST");
+          return;
+        }
+
+        const profile = currentProfile(get());
+        if (!profile) {
+          failGen("NO_PROFILE");
+          return;
+        }
+        if (profileBinMissing(profile)) {
+          failGen("NO_BIN");
+          return;
+        }
+
+        let tenryuArg: string;
+        let env: Record<string, string>;
+        if (profile.transport === "local") {
+          tenryuArg = profile.tenryuBin;
+          env = {};
+        } else {
+          const root = await resolveRepoRoot(profile);
+          if (root === null) {
+            failGen("NO_TOOLS");
+            return;
+          }
+          const binAbs = await absRemotePath(profile, profile.tenryuBin);
+          const wrapper = buildRemoteWrapperEnv(profile, root, binAbs);
+          if (wrapper.error !== null) {
+            failGen(wrapper.error);
+            return;
+          }
+          env = wrapper.env;
+          tenryuArg = "tools/assist/tenryu_remote.sh";
+        }
+
+        const intent = get().assistIntentJson.trim();
+        if (intent !== "") {
+          try {
+            JSON.parse(intent);
+          } catch {
+            failGen("INTENT_JSON_INVALID");
+            return;
+          }
+        }
+
+        const home = await resolveLocalHome();
+        const stamp = nowStamp();
+        workdir = `${home}/.tenryu/studio-assist/${stamp}`;
+        const specPath = `${workdir}/spec.md`;
+        const outDeckPath = `${workdir}/out_deck.py`;
+        await be().execLocal(["bash", "-lc", buildMkdirScript(workdir)], {
+          timeoutMs: 15000,
+        });
+        await be().writeLocalText(specPath, spec);
+
+        let intentPath: string | null = null;
+        if (intent !== "") {
+          intentPath = `${workdir}/intent.json`;
+          await be().writeLocalText(intentPath, intent);
+        }
+
+        let templatePath: string | null = null;
+        if (
+          get().assistUseTemplate &&
+          get().deck.length > 0 &&
+          get().formErrors.length === 0
+        ) {
+          templatePath = `${workdir}/template.py`;
+          await be().writeLocalText(templatePath, get().deck);
+        }
+
+        set({
+          assistGen: {
+            phase: "running",
+            workdir,
+            iterations: 0,
+            lastKind: null,
+            question: null,
+            deckText: null,
+            deckName: `assist_${stamp}`,
+            errorCode: null,
+            errorDetail: null,
+            resultRaw: null,
+            lint: null,
+          },
+        });
+        launched = true;
+
+        stopAssistJournalTimer();
+        assistJournalTimer = setInterval(() => {
+          void be()
+            .readLocalText(`${workdir}/journal.jsonl`, 262144)
+            .then((text) => {
+              const journal = parseJournalTail(text);
+              const cur = get().assistGen;
+              if (cur.phase === "running" && cur.workdir === workdir) {
+                set({
+                  assistGen: {
+                    ...cur,
+                    iterations: journal.iterations,
+                    lastKind: journal.lastKind,
+                  },
+                });
+              }
+            })
+            .catch(() => {});
+        }, 2000);
+
+        const r = await be().execLocal(
+          [
+            "bash",
+            "-lc",
+            buildGenerateScript({
+              localRepo: repo,
+              workdir,
+              specPath,
+              outDeckPath,
+              maxIters: get().assistMaxIters,
+              templatePath,
+              intentPath,
+              tenryuArg,
+              env,
+            }),
+          ],
+          { timeoutMs: 3600000 },
+        );
+        stopAssistJournalTimer();
+
+        const cur = get().assistGen;
+        if (cur.workdir !== workdir || cur.phase !== "running") return;
+        const parsed = parseGenerateResult(r.stdout);
+        if (!parsed.ok) {
+          set({
+            assistGen: {
+              ...cur,
+              phase: "error",
+              errorCode: "RESULT_PARSE",
+              errorDetail: `${parsed.error}; stderr: ${r.stderr.slice(-2000)}`,
+              resultRaw: r.stdout,
+            },
+          });
+          return;
+        }
+
+        if (parsed.data.status === "accepted") {
+          try {
+            const deckText = await be().readLocalText(
+              parsed.data.deckPath ?? outDeckPath,
+              2000000,
+            );
+            set({
+              assistGen: {
+                ...cur,
+                phase: "accepted",
+                deckText,
+                lint: parsed.data.lint,
+                iterations: parsed.data.iterations ?? cur.iterations,
+                resultRaw: r.stdout,
+              },
+            });
+          } catch (err) {
+            set({
+              assistGen: {
+                ...cur,
+                phase: "error",
+                errorCode: "READ_DECK_FAILED",
+                errorDetail: String(err),
+                resultRaw: r.stdout,
+              },
+            });
+          }
+        } else if (parsed.data.status === "uncertain") {
+          set({
+            assistGen: {
+              ...cur,
+              phase: "uncertain",
+              question: parsed.data.question,
+              iterations: parsed.data.iterations ?? cur.iterations,
+              resultRaw: r.stdout,
+            },
+          });
+        } else {
+          set({
+            assistGen: {
+              ...cur,
+              phase: "error",
+              errorCode: `GEN_${parsed.data.status.toUpperCase()}`,
+              errorDetail: parsed.data.error ?? r.stderr.slice(-2000),
+              lint: parsed.data.lint,
+              resultRaw: r.stdout,
+            },
+          });
+        }
+      } catch (err) {
+        stopAssistJournalTimer();
+        if (!launched) {
+          failGen("EXEC_FAILED", String(err));
+          return;
+        }
+        const cur = get().assistGen;
+        if (cur.phase === "running" && cur.workdir === workdir) {
+          failGen("EXEC_FAILED", String(err));
+        }
+      }
+    },
+
+    async answerAssistClarification(answer) {
+      const cur = get().assistGen;
+      if (cur.phase !== "uncertain") return;
+      set({
+        assistSpec:
+          get().assistSpec +
+          `\n\n== CLARIFICATION ==\nQ: ${cur.question ?? ""}\nA: ${answer}\n`,
+      });
+      await get().generateAssistDeck();
+    },
+
+    async cancelAssistGeneration() {
+      const cur = get().assistGen;
+      if (cur.phase !== "running" || cur.workdir === null) return;
+      set({
+        assistGen: {
+          ...cur,
+          phase: "error",
+          errorCode: "CANCELLED",
+          errorDetail: null,
+        },
+      });
+      stopAssistJournalTimer();
+      try {
+        await be().execLocal(["bash", "-lc", buildCancelScript(cur.workdir)], {
+          timeoutMs: 15000,
+        });
+      } catch {
+        /* cancellation is best-effort */
+      }
+    },
+
+    resetAssistGeneration() {
+      set({ assistGen: { ...initialAssistGen }, assistDeckValidate: { status: "idle" } });
+    },
+
+    async validateAssistDeck() {
+      const gen = get().assistGen;
+      if (gen.phase !== "accepted" || gen.deckText === null) return;
+      const profile = currentProfile(get());
+      if (!profile) {
+        set({
+          assistDeckValidate: {
+            status: "error",
+            result: { ok: false, summary: [], errors: ["NO_PROFILE"], warnings: [], raw: "" },
+          },
+        });
+        return;
+      }
+      if (profileBinMissing(profile)) {
+        set({
+          assistDeckValidate: {
+            status: "error",
+            result: { ok: false, summary: [], errors: ["NO_BIN"], warnings: [], raw: "" },
+          },
+        });
+        return;
+      }
+      set({ assistDeckValidate: { status: "running" } });
+      const root = await resolveRepoRoot(profile);
+      const { result, sentTo } = await validateDeckWith(
+        profile,
+        root,
+        gen.deckText,
+        gen.deckName ?? "assist_deck",
+      );
+      set({ assistDeckValidate: { status: "ready", result, sentTo } });
+    },
+
+    async runAssistGeneratedDeck() {
+      const gen = get().assistGen;
+      if (
+        gen.phase !== "accepted" ||
+        gen.deckText === null ||
+        gen.deckName === null
+      ) return;
+      await get().startRun({ deck: gen.deckText, name: gen.deckName });
+    },
+
     async runValidate() {
       const s = get();
       const profile = currentProfile(s);
@@ -476,26 +1203,8 @@ export const useApp = create<AppState>()((set, get) => {
         return;
       }
       set({ validating: true, validateResult: null });
-      const remoteDeck = joinRemote(profile.runDir, `validate_scratch/${s.form.main.name}.py`);
-      try {
-        await be().uploadText(profile, remoteDeck, s.deck);
-        const r: ExecResult = await be().exec(
-          profile,
-          withRepoEnv(root, [profile.tenryuBin, "validate", remoteDeck]),
-          { timeoutMs: 120000 },
-        );
-        set({
-          validateResult: parseValidateOutput(r.stdout, r.stderr, r.code),
-          validateSentTo: `${profile.name}:${remoteDeck}`,
-          validating: false,
-        });
-      } catch (err) {
-        set({
-          validateResult: { ok: false, summary: [], errors: [String(err)], warnings: [], raw: "" },
-          validateSentTo: null,
-          validating: false,
-        });
-      }
+      const { result, sentTo } = await validateDeckWith(profile, root, s.deck, s.form.main.name);
+      set({ validateResult: result, validateSentTo: sentTo, validating: false });
     },
 
     async runMeshPreview() {
@@ -711,16 +1420,25 @@ export const useApp = create<AppState>()((set, get) => {
       }
     },
 
-    async startRun() {
+    async startRun(override) {
       const s = get();
       const profile = currentProfile(s);
-      if (!profile || s.formErrors.length > 0 || s.deck.length === 0 || s.starting) return;
+      if (!profile || s.starting) return;
+      if (override === undefined && (s.formErrors.length > 0 || s.deck.length === 0)) return;
+      if (override !== undefined && override.deck.length === 0) return;
       if (profileBinMissing(profile)) return;
-      const isPib = s.form.main.dimension === "2D_RZ" && s.form.mesh.meshMode2d === "polar_in_box";
       const root = await resolveRepoRoot(profile);
-      if (isPib && root === null) return;
+      if (override === undefined) {
+        const isPib = s.form.main.dimension === "2D_RZ" && s.form.mesh.meshMode2d === "polar_in_box";
+        if (isPib && root === null) return;
+      }
       set({ starting: true, view: "history" });
-      const runName = `${s.form.main.name}_${nowStamp()}`;
+      const deckText = override?.deck ?? s.deck;
+      const runName = `${override?.name ?? s.form.main.name}_${nowStamp()}`;
+      const overrideTEnd = override?.deck.match(/t_end\s*=\s*([0-9][0-9eE+.\-]*)/);
+      const parsedTEnd = overrideTEnd === null || overrideTEnd === undefined
+        ? 0
+        : Number(overrideTEnd[1]);
       const record: RunRecord = {
         id: newId(),
         profileId: profile.id,
@@ -728,8 +1446,10 @@ export const useApp = create<AppState>()((set, get) => {
         name: runName,
         runDir: "",
         statusPath: "",
-        tEnd: toCanonical(s.form.main.tEnd, "time"),
-        maxSteps: s.form.main.maxSteps,
+        tEnd: override === undefined
+          ? toCanonical(s.form.main.tEnd, "time")
+          : Number.isFinite(parsedTEnd) ? parsedTEnd : 0,
+        maxSteps: override === undefined ? s.form.main.maxSteps : 0,
         createdAtIso: new Date().toISOString(),
         state: "launching",
         pid: null,
@@ -746,7 +1466,7 @@ export const useApp = create<AppState>()((set, get) => {
         const deckPath = joinRemote(runDir, "deck.py");
         const scriptPath = joinRemote(runDir, "run_detached.sh");
         patchRun(record.id, { runDir, statusPath: joinRemote(runDir, "status.json") });
-        await be().uploadText(profile, deckPath, s.deck);
+        await be().uploadText(profile, deckPath, deckText);
         await be().uploadText(profile, scriptPath, RUN_DETACHED_SH);
         const r = await be().exec(
           profile,

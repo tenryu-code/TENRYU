@@ -18,6 +18,7 @@
 #include "core/state.hpp"
 #include "hydro/ale_remap.cuh"
 #include "hydro/corner_jacobian_quality.cuh"
+#include "hydro/evacuated_cell_shadow.hpp"
 #include "hydro/hydro_multiblock_topology.cuh"
 #include "mesh/candidate_mesh_admissibility.hpp"
 #include "mesh/mesh.hpp"
@@ -150,15 +151,105 @@ struct AxisRadialBoundResult {
 
 namespace detail {
 
-constexpr double kGauss = 0.577350269189625764509148780501957456;
-constexpr double kJFloor = 1.0e-30;
+using tenryu::hydro::kGauss;
+using tenryu::hydro::kJFloor;
+
 constexpr double kAxisCapFloorFraction = 0.25;
 constexpr double kTinyMotion2 = 1.0e-30;
 constexpr double kPhase9AxisEmergencyFraction = 0.01;
 constexpr double kPhase10SpineFallbackFraction = 0.05;
-constexpr int kBacktrackMaxAttempts = 6;
+// The ladder finds the largest admissible fraction; its old 1/32 floor was
+// arbitrary — measured (A497): near a held contact seam the donor-valid fraction
+// can sit near 1/100, and a too-high floor turned every relief event into a
+// rollback (1,313 consecutive) while the seam neighbor inverted. Rungs below
+// 1/32 only evaluate when all higher rungs failed (previously a guaranteed
+// rollback), so accepted-at-high-lambda behavior is unchanged.
+constexpr int kBacktrackMaxAttempts = 12;
 constexpr double kBacktrackLambdaSchedule[kBacktrackMaxAttempts] = {
-    1.0, 0.5, 0.25, 0.125, 0.0625, 0.03125};
+    1.0,
+    0.5,
+    0.25,
+    0.125,
+    0.0625,
+    0.03125,
+    0.015625,
+    0.0078125,
+    0.00390625,
+    0.001953125,
+    0.0009765625,
+    0.00048828125};
+
+// Near a held interface the displacement cap is scaled by the LOCAL mesh:
+// within this Chebyshev index distance of a frozen contact corner a node
+// may move at most kEvacContactLocalCapFraction of its minimum incident
+// edge length per event. Crushed cells self-limit (donor-valid remap
+// sweeps — no whole-cell advection), healthy cells relieve freely (no
+// starvation of a crushing neighbor), unlike the removed linear-to-zero
+// taper which prevented relief regardless of local scale.
+constexpr int kEvacContactLocalCapCells = 4;
+constexpr double kEvacContactLocalCapFraction = 0.5;
+
+__host__ __device__ inline bool evac_contact_frozen_node(
+    const int node,
+    const int* contact_active_cells,
+    const int n_contact_active_cells,
+    const int nz) {
+  for (int k = 0; k < n_contact_active_cells; ++k) {
+    int corners[4];
+    tenryu::hydro::evacuated_cell_corner_nodes(
+        contact_active_cells[k], 0, nz, corners);
+    for (int q = 0; q < 4; ++q) {
+      if (corners[q] == node) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+__host__ __device__ inline int evac_contact_corner_cheb_distance(
+    const int node,
+    const int* contact_active_cells,
+    const int n_contact_active_cells,
+    const int nz) {
+  const int stride = nz + 1;
+  const int node_i = node / stride;
+  const int node_j = node - node_i * stride;
+  int nearest_distance = kEvacContactLocalCapCells;
+  for (int k = 0; k < n_contact_active_cells; ++k) {
+    int corners[4];
+    tenryu::hydro::evacuated_cell_corner_nodes(
+        contact_active_cells[k], 0, nz, corners);
+    for (int q = 0; q < 4; ++q) {
+      const int corner_i = corners[q] / stride;
+      const int corner_j = corners[q] - corner_i * stride;
+      const int di = node_i >= corner_i ? node_i - corner_i : corner_i - node_i;
+      const int dj = node_j >= corner_j ? node_j - corner_j : corner_j - node_j;
+      const int distance = di >= dj ? di : dj;
+      if (distance < nearest_distance) {
+        nearest_distance = distance;
+      }
+    }
+  }
+  return nearest_distance;
+}
+
+inline bool evacuated_constraint_masks_present(const core::State& state) {
+  return !state.evacuated_cells.inactive_member_mask.empty() ||
+         !state.evacuated_cells.contact_active_mask.empty() ||
+         !state.evacuated_cells.cell_axis_edge_collapsed.empty();
+}
+
+inline bool evacuated_constraint_owned_cell(const core::State& state,
+                                             const int cell) {
+  const std::size_t c = static_cast<std::size_t>(cell);
+  return (c < state.evacuated_cells.inactive_member_mask.size() &&
+          state.evacuated_cells.inactive_member_mask[c] != 0U) ||
+         (c < state.evacuated_cells.contact_active_mask.size() &&
+          state.evacuated_cells.contact_active_mask[c] != 0U) ||
+         (c < state.evacuated_cells.cell_axis_edge_collapsed.size() &&
+          state.evacuated_cells.cell_axis_edge_collapsed[c] != 0U);
+}
 
 __host__ __device__ inline double cross2(const double ar,
                                          const double az,
@@ -465,9 +556,20 @@ static __global__ void axis_margin_min_kernel(double* __restrict__ d_min_margin,
                                               const double* __restrict__ x_r,
                                               const double* __restrict__ x_z,
                                               const int nz,
-                                              const bool has_physical_rz_axis) {
+                                              const bool has_physical_rz_axis,
+                                              const std::uint8_t* __restrict__
+                                                  inactive_member_mask,
+                                              const std::uint8_t* __restrict__
+                                                  contact_active_mask,
+                                              const std::uint8_t* __restrict__
+                                                  geometry_policy_exempt) {
   const int j = blockIdx.x * blockDim.x + threadIdx.x;
   if (!has_physical_rz_axis || j >= nz) {
+    return;
+  }
+  if ((inactive_member_mask != nullptr && inactive_member_mask[j] != 0U) ||
+      (contact_active_mask != nullptr && contact_active_mask[j] != 0U) ||
+      (geometry_policy_exempt != nullptr && geometry_policy_exempt[j] != 0U)) {
     return;
   }
 
@@ -505,7 +607,9 @@ static __global__ void axis_spine_target_kernel(
     const std::uint8_t* __restrict__ node_flags,
     const int nz,
     const double omega,
-    const bool has_physical_rz_axis) {
+    const bool has_physical_rz_axis,
+    const int* __restrict__ contact_active_cells,
+    const int n_contact_active_cells) {
   const int j = blockIdx.x * blockDim.x + threadIdx.x;
   if (!has_physical_rz_axis || j > nz) {
     return;
@@ -514,6 +618,12 @@ static __global__ void axis_spine_target_kernel(
   const int stride = nz + 1;
   const int n_axis = j;
   const int n_inner = stride + j;
+
+  if (evac_contact_frozen_node(
+          n_axis, contact_active_cells, n_contact_active_cells, nz)) {
+    z_axis_target[j] = x_z_old[n_axis];
+    return;
+  }
 
   const std::uint8_t flags = node_flags[n_axis];
   if ((flags & (mesh::NODE_BOUNDARY | mesh::NODE_CENTER)) != 0u) {
@@ -700,12 +810,19 @@ static __global__ void apply_axis_spine_kernel(double* __restrict__ x_r_cand,
                                                double* __restrict__ x_z_cand,
                                                const double* __restrict__ z_axis_target,
                                                const int nz,
-                                               const bool has_physical_rz_axis) {
+                                               const bool has_physical_rz_axis,
+                                               const int* __restrict__ contact_active_cells,
+                                               const int n_contact_active_cells,
+                                               const int nz_cells) {
   const int j = blockIdx.x * blockDim.x + threadIdx.x;
   if (!has_physical_rz_axis || j > nz) {
     return;
   }
   const int n_axis = j;
+  if (evac_contact_frozen_node(
+          n_axis, contact_active_cells, n_contact_active_cells, nz_cells)) {
+    return;
+  }
   x_r_cand[n_axis] = 0.0;
   x_z_cand[n_axis] = z_axis_target[j];
 }
@@ -718,7 +835,10 @@ inline void apply_axis_spine_projection(double* x_r_cand,
                                         const std::vector<std::uint8_t>& axis_flags,
                                         const int nz,
                                         const double dz_init,
-                                        const bool has_physical_rz_axis) {
+                                        const bool has_physical_rz_axis,
+                                        const int* contact_active_cells,
+                                        const int n_contact_active_cells,
+                                        const int nz_cells) {
   if (!has_physical_rz_axis) {
     return;
   }
@@ -734,7 +854,14 @@ inline void apply_axis_spine_projection(double* x_r_cand,
                         cudaMemcpyHostToDevice));
   const int blocks_axis = (axis_nodes + 255) / 256;
   apply_axis_spine_kernel<<<blocks_axis, 256>>>(
-      x_r_cand, x_z_cand, d_z_axis_target, nz, has_physical_rz_axis);
+      x_r_cand,
+      x_z_cand,
+      d_z_axis_target,
+      nz,
+      has_physical_rz_axis,
+      contact_active_cells,
+      n_contact_active_cells,
+      nz_cells);
   CUDA_CHECK(cudaGetLastError());
   CUDA_CHECK(cudaDeviceSynchronize());
 }
@@ -772,10 +899,16 @@ static __global__ void mesh_quality_check_kernel(double* __restrict__ q_cell,
                                                  const int nr,
                                                  const int nz,
                                                  const bool reject_zero_gauss_j,
-                                                 const double zero_gauss_j_floor_rel) {
+                                                 const double zero_gauss_j_floor_rel,
+                                                 const std::uint8_t* __restrict__
+                                                     geometry_policy_exempt) {
   const int c = blockIdx.x * blockDim.x + threadIdx.x;
   const int n_cells = nr * nz;
   if (c >= n_cells) {
+    return;
+  }
+  if (geometry_policy_exempt != nullptr && geometry_policy_exempt[c] != 0U) {
+    q_cell[c] = 1.0;
     return;
   }
 
@@ -1111,10 +1244,19 @@ static __global__ void winslow_jacobi_step_kernel(double* __restrict__ x_r_new,
                                                   const bool corner_cell_aspect_protection_enabled,
                                                   const double corner_cell_aspect_eta,
                                                   const bool z_bottom_state_supply,
-                                                  const bool z_top_state_supply) {
+                                                  const bool z_top_state_supply,
+                                                  const int* __restrict__ contact_active_cells,
+                                                  const int n_contact_active_cells) {
   const int n = blockIdx.x * blockDim.x + threadIdx.x;
   const int n_nodes = (nr + 1) * (nz + 1);
   if (n >= n_nodes) {
+    return;
+  }
+
+  if (evac_contact_frozen_node(
+          n, contact_active_cells, n_contact_active_cells, nz)) {
+    x_r_new[n] = x_r[n];
+    x_z_new[n] = x_z[n];
     return;
   }
 
@@ -1211,7 +1353,24 @@ static __global__ void winslow_jacobi_step_kernel(double* __restrict__ x_r_new,
     const double z_candidate =
         (2.0 * alpha * z_i1 + gamma * (z_jp + z_jm)) / denom;
 
-    const double dz_init_cap = max_displacement_fraction * reference_lmin;
+    double dz_init_cap = max_displacement_fraction * reference_lmin;
+    if (n_contact_active_cells > 0 &&
+        evac_contact_corner_cheb_distance(
+            n, contact_active_cells, n_contact_active_cells, nz) <
+            kEvacContactLocalCapCells) {
+      const double dr_jp = x_r[n_jp] - x_r[n];
+      const double dz_jp = x_z[n_jp] - x_z[n];
+      const double dr_jm = x_r[n_jm] - x_r[n];
+      const double dz_jm = x_z[n_jm] - x_z[n];
+      const double dr_i1 = x_r[n_i1] - x_r[n];
+      const double dz_i1 = x_z[n_i1] - x_z[n];
+      const double min_edge =
+          fmin(sqrt(dr_jp * dr_jp + dz_jp * dz_jp),
+               fmin(sqrt(dr_jm * dr_jm + dz_jm * dz_jm),
+                    sqrt(dr_i1 * dr_i1 + dz_i1 * dz_i1)));
+      dz_init_cap = fmin(
+          dz_init_cap, kEvacContactLocalCapFraction * min_edge);
+    }
     double dz = z_candidate - x_z[n];
     record_rezone_displacement_cap_diag(stats, fabs(dz), dz_init_cap);
     if (fabs(dz) > dz_init_cap) {
@@ -1247,7 +1406,27 @@ static __global__ void winslow_jacobi_step_kernel(double* __restrict__ x_r_new,
   // local-length proxy from neighbor distances to avoid extra area reductions in-kernel.
   const double lmin = fmax(fmin(dr_local, dz_local), 1.0e-30);
   const double cap_floor = (i == 1) ? (kAxisCapFloorFraction * reference_lmin) : 0.0;
-  const double max_disp = max_displacement_fraction * fmax(lmin, cap_floor);
+  double max_disp = max_displacement_fraction * fmax(lmin, cap_floor);
+  if (n_contact_active_cells > 0 &&
+      evac_contact_corner_cheb_distance(
+          n, contact_active_cells, n_contact_active_cells, nz) <
+          kEvacContactLocalCapCells) {
+    const double dr_ip = x_r[n_ip_j] - x_r[n];
+    const double dz_ip = x_z[n_ip_j] - x_z[n];
+    const double dr_im = x_r[n_im_j] - x_r[n];
+    const double dz_im = x_z[n_im_j] - x_z[n];
+    const double dr_jp = x_r[n_i_jp] - x_r[n];
+    const double dz_jp = x_z[n_i_jp] - x_z[n];
+    const double dr_jm = x_r[n_i_jm] - x_r[n];
+    const double dz_jm = x_z[n_i_jm] - x_z[n];
+    const double min_edge =
+        fmin(fmin(sqrt(dr_ip * dr_ip + dz_ip * dz_ip),
+                  sqrt(dr_im * dr_im + dz_im * dz_im)),
+             fmin(sqrt(dr_jp * dr_jp + dz_jp * dz_jp),
+                  sqrt(dr_jm * dr_jm + dz_jm * dz_jm)));
+    max_disp =
+        fmin(max_disp, kEvacContactLocalCapFraction * min_edge);
+  }
 
   if (J <= kJFloor) {
     if (i == 1) {
@@ -1379,34 +1558,6 @@ __device__ inline RzNodeValue load_node_with_axis_mirror(
   const int i_clamped = (i > nr) ? nr : i;
   const int n = i_clamped * stride + j;
   return RzNodeValue{x_r[n], x_z[n]};
-}
-
-__device__ inline double gauss_jacobian_from_quad(const double* rr,
-                                                  const double* zz,
-                                                  const double xi,
-                                                  const double eta) {
-  const double dN1_dxi = -0.25 * (1.0 - eta);
-  const double dN2_dxi = 0.25 * (1.0 - eta);
-  const double dN3_dxi = 0.25 * (1.0 + eta);
-  const double dN4_dxi = -0.25 * (1.0 + eta);
-
-  const double dN1_deta = -0.25 * (1.0 - xi);
-  const double dN2_deta = -0.25 * (1.0 + xi);
-  const double dN3_deta = 0.25 * (1.0 + xi);
-  const double dN4_deta = 0.25 * (1.0 - xi);
-
-  const double dr_dxi =
-      dN1_dxi * rr[0] + dN2_dxi * rr[1] + dN3_dxi * rr[2] + dN4_dxi * rr[3];
-  const double dz_dxi =
-      dN1_dxi * zz[0] + dN2_dxi * zz[1] + dN3_dxi * zz[2] + dN4_dxi * zz[3];
-  const double dr_deta =
-      dN1_deta * rr[0] + dN2_deta * rr[1] + dN3_deta * rr[2] +
-      dN4_deta * rr[3];
-  const double dz_deta =
-      dN1_deta * zz[0] + dN2_deta * zz[1] + dN3_deta * zz[2] +
-      dN4_deta * zz[3];
-
-  return dr_dxi * dz_deta - dr_deta * dz_dxi;
 }
 
 __device__ inline void load_cell_quad_with_trial(const double* __restrict__ x_r,
@@ -1755,7 +1906,9 @@ __device__ inline void enforce_corner_cell_aspect_floor_for_cell(
     const int nz,
     const int cell_i,
     const int cell_j,
-    const double eta) {
+    const double eta,
+    const int* __restrict__ contact_active_cells,
+    const int n_contact_active_cells) {
   const double initial_signed =
       cell_signed_area(x_r_initial, x_z_initial, nr, nz, cell_i, cell_j);
   if (!isfinite(initial_signed) || !(fabs(initial_signed) > 0.0)) {
@@ -1816,8 +1969,12 @@ __device__ inline void enforce_corner_cell_aspect_floor_for_cell(
   const int away_j = bottom_corner_cell ? (edge_j + 1) : (edge_j - 1);
   const int n_a = cell_i * stride + edge_j;
   const int n_b = (cell_i + 1) * stride + edge_j;
-  double projected_a = x_z[n_a] + delta_z;
-  double projected_b = x_z[n_b] + delta_z;
+  const bool frozen_a = evac_contact_frozen_node(
+      n_a, contact_active_cells, n_contact_active_cells, nz);
+  const bool frozen_b = evac_contact_frozen_node(
+      n_b, contact_active_cells, n_contact_active_cells, nz);
+  double projected_a = frozen_a ? x_z[n_a] : (x_z[n_a] + delta_z);
+  double projected_b = frozen_b ? x_z[n_b] : (x_z[n_b] + delta_z);
   if (away_j >= 0 && away_j <= nz) {
     const double neighbor_a = x_z[cell_i * stride + away_j];
     const double neighbor_b = x_z[(cell_i + 1) * stride + away_j];
@@ -1841,6 +1998,9 @@ __device__ inline void enforce_corner_cell_aspect_floor_for_cell(
   zz[edge_slot_b] = projected_b;
   double projected_area = orientation * signed_quad_area(rr, zz);
   for (int edge_node = 0; edge_node < 2 && projected_area < area_floor; ++edge_node) {
+    if ((edge_node == 0 && frozen_a) || (edge_node == 1 && frozen_b)) {
+      continue;
+    }
     const int slot_k = (edge_node == 0) ? edge_slot_a : edge_slot_b;
     double* projected_k = (edge_node == 0) ? &projected_a : &projected_b;
     const int node_i_k = (edge_node == 0) ? cell_i : (cell_i + 1);
@@ -1872,10 +2032,10 @@ __device__ inline void enforce_corner_cell_aspect_floor_for_cell(
     zz[slot_k] = candidate_z;
     projected_area = orientation * signed_quad_area(rr, zz);
   }
-  if (isfinite(projected_a)) {
+  if (!frozen_a && isfinite(projected_a)) {
     x_z[n_a] = projected_a;
   }
-  if (isfinite(projected_b)) {
+  if (!frozen_b && isfinite(projected_b)) {
     x_z[n_b] = projected_b;
   }
 }
@@ -1891,7 +2051,9 @@ static __global__ void enforce_corner_cell_aspect_floor_kernel(
     const bool corner_cell_aspect_protection_enabled,
     const double corner_cell_aspect_eta,
     const bool z_bottom_state_supply,
-    const bool z_top_state_supply) {
+    const bool z_top_state_supply,
+    const int* __restrict__ contact_active_cells,
+    const int n_contact_active_cells) {
   if (blockIdx.x != 0 || threadIdx.x != 0) {
     return;
   }
@@ -1907,11 +2069,31 @@ static __global__ void enforce_corner_cell_aspect_floor_kernel(
     const int cell_i = (radial_side == 0) ? 0 : (nr - 1);
     if (z_bottom_state_supply) {
       enforce_corner_cell_aspect_floor_for_cell(
-          x_z, x_r, x_r_initial, x_z_initial, nr, nz, cell_i, 0, eta);
+          x_z,
+          x_r,
+          x_r_initial,
+          x_z_initial,
+          nr,
+          nz,
+          cell_i,
+          0,
+          eta,
+          contact_active_cells,
+          n_contact_active_cells);
     }
     if (z_top_state_supply) {
       enforce_corner_cell_aspect_floor_for_cell(
-          x_z, x_r, x_r_initial, x_z_initial, nr, nz, cell_i, nz - 1, eta);
+          x_z,
+          x_r,
+          x_r_initial,
+          x_z_initial,
+          nr,
+          nz,
+          cell_i,
+          nz - 1,
+          eta,
+          contact_active_cells,
+          n_contact_active_cells);
     }
   }
 }
@@ -1942,7 +2124,11 @@ inline void enforce_corner_cell_aspect_floor(
       cfg.numerics.ale.corner_cell_aspect_protection_enabled,
       cfg.numerics.ale.corner_cell_aspect_eta,
       cfg.numerics.hydro.boundary_2d.z_bottom_cfg.is_state_supply(),
-      cfg.numerics.hydro.boundary_2d.z_top_cfg.is_state_supply());
+      cfg.numerics.hydro.boundary_2d.z_top_cfg.is_state_supply(),
+      state.evacuated_cells.n_contact_active_cells > 0
+          ? state.evacuated_cells.d_contact_active_cells.data()
+          : nullptr,
+      state.evacuated_cells.n_contact_active_cells);
   CUDA_CHECK(cudaGetLastError());
   CUDA_CHECK(cudaDeviceSynchronize());
 }
@@ -1987,62 +2173,6 @@ inline bool corner_cell_aspect_floor_violated(
         (reduction->allreduce_max(h_violated != 0 ? 1.0 : 0.0) > 0.5) ? 1 : 0;
   }
   return h_violated != 0;
-}
-
-__device__ inline bool trial_cell_admissible(const double* rr,
-                                             const double* zz,
-                                             const int* node_i,
-                                             const double j_floor_rel) {
-  const double xis[2] = {-kGauss, kGauss};
-  const double etas[2] = {-kGauss, kGauss};
-  double J_values[4];
-  double J_max = -1.0e300;
-  int p = 0;
-  for (int a = 0; a < 2; ++a) {
-    for (int b = 0; b < 2; ++b) {
-      const double J = gauss_jacobian_from_quad(rr, zz, xis[a], etas[b]);
-      if (!isfinite(J)) {
-        return false;
-      }
-      J_values[p++] = J;
-      J_max = fmax(J_max, J);
-    }
-  }
-  const double J_max_eff = fmax(J_max, kJFloor);
-  const double J_floor = fmax(j_floor_rel * J_max_eff, kJFloor);
-  for (int k = 0; k < 4; ++k) {
-    if (!(J_values[k] > J_floor)) {
-      return false;
-    }
-  }
-
-  for (int corner = 0; corner < 4; ++corner) {
-    const double J_corner =
-        tenryu::hydro::corner_jacobian_from_quad(rr, zz, corner);
-    if (!isfinite(J_corner) || !(J_corner > J_floor)) {
-      return false;
-    }
-  }
-
-  const double v_rz = detail::rz_signed_quad_volume(
-      rr[0], zz[0], rr[1], zz[1], rr[2], zz[2], rr[3], zz[3]);
-  if (!isfinite(v_rz) || !(v_rz > kJFloor)) {
-    return false;
-  }
-
-  for (int k = 0; k < 4; ++k) {
-    if (!isfinite(rr[k]) || !isfinite(zz[k])) {
-      return false;
-    }
-    if (node_i[k] == 0) {
-      if (!(rr[k] == 0.0)) {
-        return false;
-      }
-    } else if (!(rr[k] >= 0.0)) {
-      return false;
-    }
-  }
-  return true;
 }
 
 __device__ inline bool incident_cells_admissible_with_trial(
@@ -2150,10 +2280,19 @@ static __global__ void winslow_jacobi_step_rz_full_metric_kernel(
     const bool corner_cell_aspect_protection_enabled,
     const double corner_cell_aspect_eta,
     const bool z_bottom_state_supply,
-    const bool z_top_state_supply) {
+    const bool z_top_state_supply,
+    const int* __restrict__ contact_active_cells,
+    const int n_contact_active_cells) {
   const int n = blockIdx.x * blockDim.x + threadIdx.x;
   const int n_nodes = (nr + 1) * (nz + 1);
   if (n >= n_nodes) {
+    return;
+  }
+
+  if (evac_contact_frozen_node(
+          n, contact_active_cells, n_contact_active_cells, nz)) {
+    x_r_new[n] = x_r[n];
+    x_z_new[n] = x_z[n];
     return;
   }
 
@@ -2321,7 +2460,17 @@ static __global__ void winslow_jacobi_step_rz_full_metric_kernel(
   const double lmin = fmax(fmin(fmin(dE, dW), fmin(dN, dS)), 1.0e-30);
   const double cap_floor =
       (i <= 1) ? (kAxisCapFloorFraction * reference_lmin) : 0.0;
-  const double max_disp = max_displacement_fraction * fmax(lmin, cap_floor);
+  double max_disp = max_displacement_fraction * fmax(lmin, cap_floor);
+  if (n_contact_active_cells > 0 &&
+      evac_contact_corner_cheb_distance(
+          n, contact_active_cells, n_contact_active_cells, nz) <
+          kEvacContactLocalCapCells) {
+    const double min_edge =
+        (i == 0) ? fmin(dE, fmin(dN, dS))
+                 : fmin(fmin(dE, dW), fmin(dN, dS));
+    max_disp =
+        fmin(max_disp, kEvacContactLocalCapFraction * min_edge);
+  }
 
   double d_r = candidate.r - center.r;
   double d_z = candidate.z - center.z;
@@ -2515,6 +2664,30 @@ inline void ensure_multiblock_winslow_device_csr(core::State& state) {
         mb.cell_node_csr_indices.size());
     state.mesh.multiblock_cell_node_csr_indices.copy_from_host(
         mb.cell_node_csr_indices);
+  }
+  bool topo_mirrors_refreshed = false;
+  if (state.mesh.multiblock_cell_orientation_sign_device.size() !=
+      mb.cell_orientation_sign.size()) {
+    state.mesh.multiblock_cell_orientation_sign_device.reset(
+        mb.cell_orientation_sign.size());
+    if (!mb.cell_orientation_sign.empty()) {
+      state.mesh.multiblock_cell_orientation_sign_device.copy_from_host(
+          mb.cell_orientation_sign);
+    }
+    topo_mirrors_refreshed = true;
+  }
+  if (state.mesh.multiblock_cell_nverts_device.size() !=
+      state.mesh.cell_nverts.size()) {
+    state.mesh.multiblock_cell_nverts_device.reset(
+        state.mesh.cell_nverts.size());
+    if (!state.mesh.cell_nverts.empty()) {
+      state.mesh.multiblock_cell_nverts_device.copy_from_host(
+          state.mesh.cell_nverts);
+    }
+    topo_mirrors_refreshed = true;
+  }
+  if (topo_mirrors_refreshed) {
+    ++state.mesh.topology_serial;
   }
 
   const bool reverse_offsets_missing =
@@ -3658,6 +3831,126 @@ inline MultiblockWinslowSmoothStats multiblock_winslow_smooth_impl(
   constexpr int threads = 256;
   const int node_blocks = (n_nodes + threads - 1) / threads;
 
+  if (smooth_reference_displacement) {
+    detail::multiblock_winslow_reference_add_kernel<<<node_blocks, threads>>>(
+        cur_coord_r,
+        cur_coord_z,
+        state.x_r_reference.data(),
+        state.x_z_reference.data(),
+        cur_r,
+        cur_z,
+        n_nodes);
+    CUDA_CHECK(cudaGetLastError());
+  }
+  multiblock_winslow_jacobi_kernel<<<node_blocks, threads>>>(
+      nxt_r,
+      nxt_z,
+      cur_r,
+      cur_z,
+      smooth_reference_displacement ? state.x_r_reference.data() : nullptr,
+      smooth_reference_displacement ? state.x_z_reference.data() : nullptr,
+      state.mesh.multiblock_reverse_csr_node_offsets.data(),
+      state.mesh.multiblock_reverse_csr_node_cells.data(),
+      state.mesh.multiblock_reverse_csr_node_corners.data(),
+      state.mesh.multiblock_cell_node_csr_offsets.data(),
+      state.mesh.multiblock_cell_node_csr_indices.data(),
+      d_cell_nverts_ptr,
+      d_cell_block_id.data(),
+      d_face_adj_offsets.data(),
+      d_face_adj_indices.data(),
+      d_face_bc_tags.data(),
+      d_node_flags.data(),
+      d_rezone_active_node_mask,
+      d_backtrack_attempts.data(),
+      n_nodes,
+      omega_initial,
+      smooth_reference_displacement,
+      smooth_cross_seams);
+  CUDA_CHECK(cudaGetLastError());
+  if (smooth_reference_displacement) {
+    detail::multiblock_winslow_reference_add_kernel<<<node_blocks, threads>>>(
+        nxt_coord_r,
+        nxt_coord_z,
+        state.x_r_reference.data(),
+        state.x_z_reference.data(),
+        nxt_r,
+        nxt_z,
+        n_nodes);
+    CUDA_CHECK(cudaGetLastError());
+  }
+  CUDA_CHECK(cudaDeviceSynchronize());
+
+  std::vector<double> entry_r;
+  std::vector<double> entry_z;
+  std::vector<double> candidate_cur_r(static_cast<std::size_t>(n_nodes));
+  std::vector<double> candidate_cur_z(static_cast<std::size_t>(n_nodes));
+  std::vector<double> candidate_nxt_r(static_cast<std::size_t>(n_nodes));
+  std::vector<double> candidate_nxt_z(static_cast<std::size_t>(n_nodes));
+  std::vector<std::uint8_t> active_node_mask;
+  state.x_r.copy_to_host(entry_r);
+  state.x_z.copy_to_host(entry_z);
+  CUDA_CHECK(cudaMemcpy(candidate_cur_r.data(),
+                        cur_coord_r,
+                        static_cast<std::size_t>(n_nodes) * sizeof(double),
+                        cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(candidate_cur_z.data(),
+                        cur_coord_z,
+                        static_cast<std::size_t>(n_nodes) * sizeof(double),
+                        cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(candidate_nxt_r.data(),
+                        nxt_coord_r,
+                        static_cast<std::size_t>(n_nodes) * sizeof(double),
+                        cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(candidate_nxt_z.data(),
+                        nxt_coord_z,
+                        static_cast<std::size_t>(n_nodes) * sizeof(double),
+                        cudaMemcpyDeviceToHost));
+  if (d_rezone_active_node_mask != nullptr) {
+    active_node_mask.resize(static_cast<std::size_t>(n_nodes));
+    CUDA_CHECK(cudaMemcpy(active_node_mask.data(),
+                          d_rezone_active_node_mask,
+                          static_cast<std::size_t>(n_nodes) *
+                              sizeof(std::uint8_t),
+                          cudaMemcpyDeviceToHost));
+  }
+
+  double delta_max = 0.0;
+  double L_domain = 0.0;
+  bool identity_metrics_finite = true;
+  for (int node = 0; node < n_nodes; ++node) {
+    const std::size_t node_index = static_cast<std::size_t>(node);
+    const double domain_radius =
+        std::hypot(entry_r[node_index], entry_z[node_index]);
+    identity_metrics_finite =
+        identity_metrics_finite && std::isfinite(domain_radius);
+    L_domain = std::max(L_domain, domain_radius);
+    if (!active_node_mask.empty() && active_node_mask[node_index] == 0U) {
+      continue;
+    }
+    const double candidate_delta =
+        std::hypot(candidate_nxt_r[node_index] - candidate_cur_r[node_index],
+                   candidate_nxt_z[node_index] - candidate_cur_z[node_index]);
+    identity_metrics_finite =
+        identity_metrics_finite && std::isfinite(candidate_delta);
+    delta_max = std::max(delta_max, candidate_delta);
+  }
+  const double identity_floor =
+      128.0 * std::numeric_limits<double>::epsilon() * L_domain;
+  if (identity_metrics_finite && std::isfinite(identity_floor) &&
+      delta_max <= identity_floor) {
+    static bool identity_early_out_logged = false;
+    if (!identity_early_out_logged) {
+      identity_early_out_logged = true;
+      std::ostringstream message;
+      message << std::scientific << std::setprecision(17)
+              << "[ale-rezone] identity early-out engaged (delta_max="
+              << delta_max << ", floor=" << identity_floor << ")";
+      core::log_info(message.str());
+    }
+    return stats;
+  }
+  CUDA_CHECK(cudaMemset(d_backtrack_attempts.data(), 0, sizeof(int)));
+
   for (int iter = 0; iter < max_iterations; ++iter) {
     ++stats.iterations_attempted;
     if (smooth_reference_displacement) {
@@ -3869,9 +4162,27 @@ inline double compute_min_quality(core::State& state,
                                   bool* mesh_tangle = nullptr,
                                   AleMinQualityCell* min_cell = nullptr,
                                   const bool reject_zero_gauss_j = false,
-                                  const double zero_gauss_j_floor_rel = 1.0e-8) {
+                                  const double zero_gauss_j_floor_rel = 1.0e-8,
+                                  const bool exclude_evacuated_constraint_owned = false) {
   TENRYU_ASSERT(state.mesh.dim == 2, "ALE quality check requires 2D mesh");
   const int n_cells = state.mesh.topo.n_cells;
+  TENRYU_ASSERT(
+      state.evacuated_cells.geometry_policy_exempt_cells.empty() ||
+          state.evacuated_cells.geometry_policy_exempt_cells.size() ==
+              static_cast<std::size_t>(n_cells),
+      "ALE quality scan requires geometry-policy-exempt mask size == n_cells");
+  if (exclude_evacuated_constraint_owned) {
+    TENRYU_ASSERT(
+        state.evacuated_cells.inactive_member_mask.empty() ||
+            state.evacuated_cells.inactive_member_mask.size() ==
+                static_cast<std::size_t>(n_cells),
+        "ALE trigger quality scan requires evacuated inactive mask size == n_cells");
+    TENRYU_ASSERT(
+        state.evacuated_cells.contact_active_mask.empty() ||
+            state.evacuated_cells.contact_active_mask.size() ==
+                static_cast<std::size_t>(n_cells),
+        "ALE trigger quality scan requires contact-active mask size == n_cells");
+  }
   if (min_cell != nullptr) {
     *min_cell = AleMinQualityCell{};
   }
@@ -3940,6 +4251,15 @@ inline double compute_min_quality(core::State& state,
     int worst_cell = -1;
     bool tangled = !quality.admissible();
     for (int c = 0; c < n_cells; ++c) {
+      if (!state.evacuated_cells.geometry_policy_exempt_cells.empty() &&
+          state.evacuated_cells.geometry_policy_exempt_cells[static_cast<std::size_t>(c)] !=
+              0U) {
+        continue;
+      }
+      if (exclude_evacuated_constraint_owned &&
+          detail::evacuated_constraint_owned_cell(state, c)) {
+        continue;
+      }
       const int nverts =
           mesh::mesh_topo_cell_active_nverts(state.mesh.cell_nverts, c);
       const int offset =
@@ -4069,6 +4389,16 @@ inline double compute_min_quality(core::State& state,
                           cudaMemcpyHostToDevice));
   }
 
+  TENRYU_ASSERT(
+      state.evacuated_cells.d_geometry_policy_exempt_cells.empty() ||
+          state.evacuated_cells.d_geometry_policy_exempt_cells.size() ==
+              static_cast<std::size_t>(n_cells),
+      "ALE quality scan requires device geometry-policy-exempt mask size == n_cells");
+  const std::uint8_t* geometry_policy_exempt =
+      state.evacuated_cells.d_geometry_policy_exempt_cells.empty()
+          ? nullptr
+          : state.evacuated_cells.d_geometry_policy_exempt_cells.data();
+
   const int blocks = (n_cells + 255) / 256;
   detail::mesh_quality_check_kernel<<<blocks, 256>>>(d_q,
                                                      state.x_r.data(),
@@ -4078,7 +4408,8 @@ inline double compute_min_quality(core::State& state,
                                                      state.mesh.topo.nr,
                                                      state.mesh.topo.nz,
                                                      reject_zero_gauss_j,
-                                                     zero_gauss_j_floor_rel);
+                                                     zero_gauss_j_floor_rel,
+                                                     geometry_policy_exempt);
   CUDA_CHECK(cudaGetLastError());
   CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -4093,6 +4424,15 @@ inline double compute_min_quality(core::State& state,
 
   double q_min = 1.0;
   for (int c = 0; c < n_cells; ++c) {
+    if (!state.evacuated_cells.geometry_policy_exempt_cells.empty() &&
+        state.evacuated_cells.geometry_policy_exempt_cells[static_cast<std::size_t>(c)] !=
+            0U) {
+      continue;
+    }
+    if (exclude_evacuated_constraint_owned &&
+        detail::evacuated_constraint_owned_cell(state, c)) {
+      continue;
+    }
     const double q = q_host[static_cast<std::size_t>(c)];
     if (q < q_min) {
       q_min = q;
@@ -4109,12 +4449,14 @@ inline double compute_min_quality(core::State& state,
 inline double compute_min_quality(core::State& state,
                                   const core::Config& cfg,
                                   bool* mesh_tangle = nullptr,
-                                  AleMinQualityCell* min_cell = nullptr) {
+                                  AleMinQualityCell* min_cell = nullptr,
+                                  const bool exclude_evacuated_constraint_owned = false) {
   return compute_min_quality(state,
                              mesh_tangle,
                              min_cell,
                              cfg.numerics.ale.reject_zero_gauss_j,
-                             cfg.numerics.ale.zero_gauss_j_floor_rel);
+                             cfg.numerics.ale.zero_gauss_j_floor_rel,
+                             exclude_evacuated_constraint_owned);
 }
 
 inline bool compute_corner_post_tangle(core::State& state,
@@ -4127,6 +4469,11 @@ inline bool compute_corner_post_tangle(core::State& state,
   const int nr = state.mesh.topo.nr;
   const int nz = state.mesh.topo.nz;
   const int n_cells = state.mesh.topo.n_cells;
+  TENRYU_ASSERT(
+      state.evacuated_cells.geometry_policy_exempt_cells.empty() ||
+          state.evacuated_cells.geometry_policy_exempt_cells.size() ==
+              static_cast<std::size_t>(n_cells),
+      "ALE corner-J check requires geometry-policy-exempt mask size == n_cells");
   if (first_corner_fail_cell != nullptr) {
     *first_corner_fail_cell = AleMinQualityCell{};
   }
@@ -4213,6 +4560,11 @@ inline bool compute_corner_post_tangle(core::State& state,
   AleMinQualityCell local_first_fail;
   int local_first_corner = -1;
   for (int c = 0; c < n_cells; ++c) {
+    if (!state.evacuated_cells.geometry_policy_exempt_cells.empty() &&
+        state.evacuated_cells.geometry_policy_exempt_cells[static_cast<std::size_t>(c)] !=
+            0U) {
+      continue;
+    }
     const double cell_min = min_corner_host[static_cast<std::size_t>(c)];
     if (cell_min < local_min_corner_j) {
       local_min_corner_j = cell_min;
@@ -4378,7 +4730,8 @@ inline const char* classify_lambda_sweep(const LambdaSweepResult& result) {
     if (!point.admissible || !(point.lambda > 0.0)) {
       continue;
     }
-    if (point.lambda >= 0.03125) {
+    if (point.lambda >=
+        detail::kBacktrackLambdaSchedule[detail::kBacktrackMaxAttempts - 1]) {
       return "standard_lambda_admissible";
     }
     small_lambda_admissible = true;
@@ -6008,7 +6361,9 @@ inline EmergencyCellDeactivationResult try_emergency_cell_deactivation(
 }
 
 inline AxisMarginResult compute_axis_margin_min(core::State& state,
-                                                const bool has_physical_rz_axis) {
+                                                const bool has_physical_rz_axis,
+                                                const bool exclude_evacuated_constraint_owned =
+                                                    false) {
   if (!has_physical_rz_axis) {
     return AxisMarginResult{};
   }
@@ -6020,6 +6375,48 @@ inline AxisMarginResult compute_axis_margin_min(core::State& state,
   }
   if (mesh::has_tri_fan_center_topology(state.mesh)) {
     return AxisMarginResult{};
+  }
+
+  const std::size_t n_cells = static_cast<std::size_t>(nr) * nz;
+  TENRYU_ASSERT(
+      state.evacuated_cells.d_geometry_policy_exempt_cells.empty() ||
+          state.evacuated_cells.d_geometry_policy_exempt_cells.size() == n_cells,
+      "ALE axis scan requires device geometry-policy-exempt mask size == n_cells");
+  const std::uint8_t* geometry_policy_exempt =
+      state.evacuated_cells.d_geometry_policy_exempt_cells.empty()
+          ? nullptr
+          : state.evacuated_cells.d_geometry_policy_exempt_cells.data();
+
+  const std::uint8_t* inactive_member_mask = nullptr;
+  const std::uint8_t* contact_active_mask = nullptr;
+  if (exclude_evacuated_constraint_owned) {
+    TENRYU_ASSERT(
+        state.evacuated_cells.inactive_member_mask.empty() ||
+            state.evacuated_cells.inactive_member_mask.size() == n_cells,
+        "ALE trigger axis scan requires evacuated inactive mask size == n_cells");
+    TENRYU_ASSERT(
+        state.evacuated_cells.contact_active_mask.empty() ||
+            state.evacuated_cells.contact_active_mask.size() == n_cells,
+        "ALE trigger axis scan requires contact-active mask size == n_cells");
+    const bool has_inactive_member = std::any_of(
+        state.evacuated_cells.inactive_member_mask.begin(),
+        state.evacuated_cells.inactive_member_mask.end(),
+        [](const std::uint8_t value) { return value != 0U; });
+    const bool has_contact_active = std::any_of(
+        state.evacuated_cells.contact_active_mask.begin(),
+        state.evacuated_cells.contact_active_mask.end(),
+        [](const std::uint8_t value) { return value != 0U; });
+    if (has_inactive_member) {
+      TENRYU_ASSERT(state.evacuated_cells.d_inactive_member_mask.size() == n_cells,
+                    "ALE trigger axis scan requires device evacuated inactive mask");
+      inactive_member_mask =
+          state.evacuated_cells.d_inactive_member_mask.data();
+    }
+    if (has_contact_active) {
+      TENRYU_ASSERT(state.evacuated_cells.d_contact_active_mask.size() == n_cells,
+                    "ALE trigger axis scan requires device contact-active mask");
+      contact_active_mask = state.evacuated_cells.d_contact_active_mask.data();
+    }
   }
 
   double* d_min_margin = nullptr;
@@ -6038,7 +6435,8 @@ inline AxisMarginResult compute_axis_margin_min(core::State& state,
   const int blocks = (nz + 255) / 256;
   detail::axis_margin_min_kernel<<<blocks, 256>>>(
       d_min_margin, d_min_j, state.x_r.data(), state.x_z.data(), nz,
-      has_physical_rz_axis);
+      has_physical_rz_axis, inactive_member_mask, contact_active_mask,
+      geometry_policy_exempt);
   CUDA_CHECK(cudaGetLastError());
   CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -6058,8 +6456,10 @@ inline AxisMarginResult compute_axis_margin_min(core::State& state) {
 inline AxisMarginResult compute_axis_margin_min(
     core::State& state,
     const parallel::Reduction* reduction,
-    const bool has_physical_rz_axis) {
-  AxisMarginResult result = compute_axis_margin_min(state, has_physical_rz_axis);
+    const bool has_physical_rz_axis,
+    const bool exclude_evacuated_constraint_owned = false) {
+  AxisMarginResult result = compute_axis_margin_min(
+      state, has_physical_rz_axis, exclude_evacuated_constraint_owned);
   if (reduction != nullptr) {
     result.min_margin = reduction->allreduce_min(result.min_margin);
   }
@@ -6129,6 +6529,9 @@ inline double minimal_axis_z_repair(const core::NodeField1D& d_xr,
                                     core::NodeField1D& d_xz,
                                     const int nr,
                                     const int nz,
+                                    const int* contact_active_cells,
+                                    const int n_contact_active_cells,
+                                    const int nz_cells,
                                     const double alpha = 0.5,
                                     const int max_sweeps = 10,
                                     const double tol_z = 1.0e-12) {
@@ -6148,6 +6551,18 @@ inline double minimal_axis_z_repair(const core::NodeField1D& d_xr,
 
   std::vector<double> xz_axis_h(static_cast<std::size_t>(stride), 0.0);
   std::vector<double> xz_inner_row_h(static_cast<std::size_t>(stride), 0.0);
+  std::vector<int> contact_active_cells_h;
+  const int* contact_active_cells_host = nullptr;
+  if (n_contact_active_cells > 0) {
+    contact_active_cells_h.resize(
+        static_cast<std::size_t>(n_contact_active_cells));
+    CUDA_CHECK(cudaMemcpy(contact_active_cells_h.data(),
+                          contact_active_cells,
+                          static_cast<std::size_t>(n_contact_active_cells) *
+                              sizeof(int),
+                          cudaMemcpyDeviceToHost));
+    contact_active_cells_host = contact_active_cells_h.data();
+  }
 
   CUDA_CHECK(cudaMemcpy(xz_axis_h.data(),
                         d_xz.data(),
@@ -6162,6 +6577,12 @@ inline double minimal_axis_z_repair(const core::NodeField1D& d_xr,
   for (int sweep = 0; sweep < max_sweeps; ++sweep) {
     double sweep_max_dz = 0.0;
     for (int j = 0; j < stride; ++j) {
+      if (detail::evac_contact_frozen_node(j,
+                                           contact_active_cells_host,
+                                           n_contact_active_cells,
+                                           nz_cells)) {
+        continue;
+      }
       const std::size_t idx = static_cast<std::size_t>(j);
       const double z_old = xz_axis_h[idx];
       const double z_new = alpha * z_old + (1.0 - alpha) * xz_inner_row_h[idx];
@@ -6202,13 +6623,13 @@ inline bool axis_feasibility_guard_trigger(core::State& state,
   }
 
   if (state.axis_margin_initial < 0.0) {
-    const AxisMarginResult initial =
-        compute_axis_margin_min(state, reduction, cfg.numerics.has_physical_rz_axis);
+    const AxisMarginResult initial = compute_axis_margin_min(
+        state, reduction, cfg.numerics.has_physical_rz_axis, true);
     state.axis_margin_initial = (initial.min_margin > 0.0) ? initial.min_margin : 1.0;
   }
 
-  const AxisMarginResult current =
-      compute_axis_margin_min(state, reduction, cfg.numerics.has_physical_rz_axis);
+  const AxisMarginResult current = compute_axis_margin_min(
+      state, reduction, cfg.numerics.has_physical_rz_axis, true);
   const double trigger_threshold = guard_fraction * state.axis_margin_initial;
   if (current_margin != nullptr) {
     *current_margin = current;
@@ -6225,11 +6646,15 @@ inline RezoneResult run_winslow_rezone(core::State& state,
   RezoneResult out;
   out.min_quality =
       compute_min_quality(state, cfg, &out.mesh_tangle, &out.min_quality_cell_pre);
+  double trigger_min_quality = out.min_quality;
+  if (detail::evacuated_constraint_masks_present(state)) {
+    trigger_min_quality = compute_min_quality(state, cfg, nullptr, nullptr, true);
+  }
 
   const bool corner_floor_violated =
       detail::corner_cell_aspect_floor_violated(state, cfg);
   if (!force_rezone && !corner_floor_violated &&
-      out.min_quality >= cfg.numerics.ale.quality_threshold) {
+      trigger_min_quality >= cfg.numerics.ale.quality_threshold) {
     return out;
   }
 
@@ -6237,6 +6662,12 @@ inline RezoneResult run_winslow_rezone(core::State& state,
   const int nr = state.mesh.topo.nr;
   const int nz = state.mesh.topo.nz;
   const int n_nodes = state.mesh.topo.n_nodes;
+  const int n_contact_active_cells =
+      state.evacuated_cells.n_contact_active_cells;
+  const int* contact_active_cells =
+      n_contact_active_cells > 0
+          ? state.evacuated_cells.d_contact_active_cells.data()
+          : nullptr;
 
   std::vector<std::uint8_t> node_flags = state.mesh.topo.node_flags;
   std::uint8_t* d_node_flags = nullptr;
@@ -6371,7 +6802,9 @@ inline RezoneResult run_winslow_rezone(core::State& state,
           cfg.numerics.ale.corner_cell_aspect_protection_enabled,
           cfg.numerics.ale.corner_cell_aspect_eta,
           cfg.numerics.hydro.boundary_2d.z_bottom_cfg.is_state_supply(),
-          cfg.numerics.hydro.boundary_2d.z_top_cfg.is_state_supply());
+          cfg.numerics.hydro.boundary_2d.z_top_cfg.is_state_supply(),
+          contact_active_cells,
+          n_contact_active_cells);
     } else {
       detail::winslow_jacobi_step_kernel<<<blocks, 256>>>(
           nxt_r,
@@ -6402,7 +6835,9 @@ inline RezoneResult run_winslow_rezone(core::State& state,
           cfg.numerics.ale.corner_cell_aspect_protection_enabled,
           cfg.numerics.ale.corner_cell_aspect_eta,
           cfg.numerics.hydro.boundary_2d.z_bottom_cfg.is_state_supply(),
-          cfg.numerics.hydro.boundary_2d.z_top_cfg.is_state_supply());
+          cfg.numerics.hydro.boundary_2d.z_top_cfg.is_state_supply(),
+          contact_active_cells,
+          n_contact_active_cells);
     }
     CUDA_CHECK(cudaGetLastError());
 
@@ -6415,7 +6850,10 @@ inline RezoneResult run_winslow_rezone(core::State& state,
                                           axis_flags_h,
                                           nz,
                                           dz_init,
-                                          cfg.numerics.has_physical_rz_axis);
+                                          cfg.numerics.has_physical_rz_axis,
+                                          contact_active_cells,
+                                          n_contact_active_cells,
+                                          nz);
       const AxisRadialBoundResult bound = check_axis_radial_bound(
           nxt_r, d_xr_a, nr, nz, cfg.numerics.ale.winslow_axis_kappa);
       if (!bound.passed) {

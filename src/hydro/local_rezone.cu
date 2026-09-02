@@ -4,7 +4,9 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <iomanip>
 #include <limits>
+#include <sstream>
 #include <vector>
 
 #include "core/error.hpp"
@@ -23,7 +25,6 @@ struct CellPatch {
   int j1 = 0;
 };
 
-constexpr double kAxisVariationalAlpha = 0.5;
 constexpr int kAxisVariationalMaxPicardPasses = 3;
 constexpr int kAxisVariationalMaxFeasibilityIterations = 600;
 constexpr double kAxisVariationalFloorEps = 1.0e-30;
@@ -690,6 +691,9 @@ RezoneResult finish_projection(core::State& state,
   bool post_tangle = false;
   out.min_quality =
       compute_min_quality(state, cfg, &post_tangle, &out.min_quality_cell_post);
+  if (detail::evacuated_constraint_masks_present(state)) {
+    out.min_quality = compute_min_quality(state, cfg, nullptr, nullptr, true);
+  }
   out.mesh_tangle = post_tangle;
   out.final_axis_margin =
       compute_axis_margin_min(state, cfg.numerics.has_physical_rz_axis).min_margin;
@@ -737,6 +741,11 @@ RezoneResult run_axis_spine_plus_local_rezone(
     max_dz = minimal_axis_z_repair(state.x_r,
                                    state.x_z,
                                    nr,
+                                   nz,
+                                   state.evacuated_cells.n_contact_active_cells > 0
+                                       ? state.evacuated_cells.d_contact_active_cells.data()
+                                       : nullptr,
+                                   state.evacuated_cells.n_contact_active_cells,
                                    nz,
                                    kAxisSpineRepairAlpha,
                                    1,
@@ -808,6 +817,11 @@ RezoneResult run_axis_variational_projection(
                                    state.x_z,
                                    nr,
                                    nz,
+                                   state.evacuated_cells.n_contact_active_cells > 0
+                                       ? state.evacuated_cells.d_contact_active_cells.data()
+                                       : nullptr,
+                                   state.evacuated_cells.n_contact_active_cells,
+                                   nz,
                                    kAxisSpineRepairAlpha,
                                    1,
                                    kAxisSpineRepairTolZ);
@@ -826,6 +840,25 @@ RezoneResult run_axis_variational_projection(
                 "axis variational projection node field size is smaller than mesh");
   for (int j = 0; j <= nz; ++j) {
     r_lag[static_cast<std::size_t>(node_index(0, j, nz))] = 0.0;
+  }
+
+  std::vector<std::uint8_t> contact_frozen_nodes(r_lag.size(), 0U);
+  for (const core::EvacContactSlot& slot : state.contact_graph.records) {
+    if (slot.state != core::EvacContactState::kActive) {
+      continue;
+    }
+    for (int p = 0; p < 2; ++p) {
+      if (slot.pair_engaged[p] == 0U) {
+        continue;
+      }
+      const int pair_nodes[2] = {slot.node_a[p], slot.node_b[p]};
+      for (const int node : pair_nodes) {
+        if (node >= 0 &&
+            node < static_cast<int>(contact_frozen_nodes.size())) {
+          contact_frozen_nodes[static_cast<std::size_t>(node)] = 1U;
+        }
+      }
+    }
   }
 
   CellPatch patch = patch_from_focus(request.focus_cell,
@@ -861,6 +894,9 @@ RezoneResult run_axis_variational_projection(
         continue;
       }
       const int id = node_index(i, j, nz);
+      if (contact_frozen_nodes[static_cast<std::size_t>(id)] != 0U) {
+        continue;
+      }
       ctx.r_dof[static_cast<std::size_t>(id)] =
           static_cast<int>(ctx.dofs.size());
       ctx.dofs.push_back(AxisVariationalDof{id, i, j, true});
@@ -870,12 +906,25 @@ RezoneResult run_axis_variational_projection(
     }
   }
 
+  const std::vector<std::uint8_t>& contact_active_mask =
+      state.evacuated_cells.contact_active_mask;
+  const std::vector<std::uint8_t>& axis_edge_collapsed =
+      state.evacuated_cells.cell_axis_edge_collapsed;
   for (int ci = ctx.affected_i0; ci <= ctx.affected_i1; ++ci) {
     for (int cj = ctx.affected_j0; cj <= ctx.affected_j1; ++cj) {
       if (ci < 0 || ci >= nr || cj < 0 || cj >= nz) {
         continue;
       }
-      ctx.affected_cells.push_back(ci * nz + cj);
+      const int cell = ci * nz + cj;
+      if (cell < static_cast<int>(contact_active_mask.size()) &&
+          contact_active_mask[static_cast<std::size_t>(cell)] != 0U) {
+        continue;
+      }
+      if (cell < static_cast<int>(axis_edge_collapsed.size()) &&
+          axis_edge_collapsed[static_cast<std::size_t>(cell)] != 0U) {
+        continue;
+      }
+      ctx.affected_cells.push_back(cell);
     }
   }
 
@@ -894,11 +943,8 @@ RezoneResult run_axis_variational_projection(
     const AxisVariationalDof& dof = ctx.dofs[static_cast<std::size_t>(d)];
     const double lag = dof.is_r ? ctx.r_base[static_cast<std::size_t>(dof.node)]
                                 : ctx.z_base[static_cast<std::size_t>(dof.node)];
-    const double ref = dof.is_r ? reference_r(cfg, dof.i, nr)
-                                : reference_z(cfg, dof.j, nz);
     x_lag[static_cast<std::size_t>(d)] = lag;
-    x_target[static_cast<std::size_t>(d)] =
-        (1.0 - kAxisVariationalAlpha) * ref + kAxisVariationalAlpha * lag;
+    x_target[static_cast<std::size_t>(d)] = lag;
   }
   ctx.j_floor = compute_axis_variational_j_floor(cfg, ctx, x_lag);
 

@@ -11,8 +11,11 @@ namespace tenryu::hydro {
 struct ReferenceBarrierAleResult {
   bool engaged = false;
   bool succeeded = false;
+  bool rolled_back = false;
   double lambda_accepted = 0.0;
   int linesearch_iters = 0;
+  int last_reject_reason = 0;  // 0=none, 1=corner_j, 2=admissibility table, 3=other
+  int last_reject_cell = -1;
   tenryu::mesh::CandidateMeshQuality final_quality{};
   std::uint64_t trigger_reason_mask = 0;
   double mass_floor_delta = 0.0;
@@ -28,6 +31,7 @@ struct ReferenceBarrierAleResult {
 struct ReferenceBarrierScope {
   const std::uint8_t* d_active_cell_mask = nullptr;   // 1 = participates
   const std::uint8_t* d_frozen_velocity_node_mask = nullptr;  // 1 = frozen
+  bool runtime_ale = false;  // enables the runtime post-remap rollback gate
 };
 
 std::uint64_t evaluate_reference_barrier_trigger(

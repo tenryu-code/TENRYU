@@ -1,3 +1,4 @@
+#include <cstdint>
 #include <cstdlib>
 #include "hydro/boundary_pressure_force.cuh"
 
@@ -32,7 +33,9 @@ __global__ void add_r_outer_boundary_pressure_forces_kernel(
     const int nr,
     const int nz,
     const double p_ext,
-    const bool rz_exact_endpoint) {
+    const bool rz_exact_endpoint,
+    const PressureDrivePerturbationParams drive_pert,
+    const bool drive_pert_enabled) {
   const int j = blockIdx.x * blockDim.x + threadIdx.x;
   if (j >= nz) {
     return;
@@ -41,33 +44,39 @@ __global__ void add_r_outer_boundary_pressure_forces_kernel(
   const int stride = nz + 1;
   const int n0 = nr * stride + j;
   const int n1 = nr * stride + (j + 1);
+  double p_seg = p_ext;
+  if (drive_pert_enabled) {
+    const double rm = 0.5 * (x_r[n0] + x_r[n1]);
+    const double zm = 0.5 * (x_z[n0] + x_z[n1]);
+    p_seg = p_ext * pressure_drive_perturbation_g(drive_pert, rm, zm);
+  }
   if constexpr (RZ_SCHEME == 1) {
     const RzBoundaryPressureEndpointAreaVectors areas =
         r_outer_boundary_planar_pressure_endpoint_area_vectors(
             x_r, x_z, nr, nz, j);
-    pressure_atomic_add_double(force_r + n0, -p_ext * areas.node0.r);
-    pressure_atomic_add_double(force_r + n1, -p_ext * areas.node1.r);
-    pressure_atomic_add_double(force_z + n0, -p_ext * areas.node0.z);
-    pressure_atomic_add_double(force_z + n1, -p_ext * areas.node1.z);
+    pressure_atomic_add_double(force_r + n0, -p_seg * areas.node0.r);
+    pressure_atomic_add_double(force_r + n1, -p_seg * areas.node1.r);
+    pressure_atomic_add_double(force_z + n0, -p_seg * areas.node0.z);
+    pressure_atomic_add_double(force_z + n1, -p_seg * areas.node1.z);
     return;
   }
   if (rz_exact_endpoint) {
     const RzBoundaryPressureEndpointAreaVectors areas =
         r_outer_boundary_pressure_endpoint_area_vectors(x_r, x_z, nr, nz, j);
-    pressure_atomic_add_double(force_r + n0, -p_ext * areas.node0.r);
-    pressure_atomic_add_double(force_r + n1, -p_ext * areas.node1.r);
-    pressure_atomic_add_double(force_z + n0, -p_ext * areas.node0.z);
-    pressure_atomic_add_double(force_z + n1, -p_ext * areas.node1.z);
+    pressure_atomic_add_double(force_r + n0, -p_seg * areas.node0.r);
+    pressure_atomic_add_double(force_r + n1, -p_seg * areas.node1.r);
+    pressure_atomic_add_double(force_z + n0, -p_seg * areas.node0.z);
+    pressure_atomic_add_double(force_z + n1, -p_seg * areas.node1.z);
     return;
   }
 
   const RzBoundaryPressureFaceAreaVector area =
       r_outer_boundary_pressure_area_vector(x_r, x_z, nr, nz, j);
 
-  pressure_atomic_add_double(force_r + n0, -p_ext * area.r);
-  pressure_atomic_add_double(force_r + n1, -p_ext * area.r);
-  pressure_atomic_add_double(force_z + n0, -p_ext * area.z);
-  pressure_atomic_add_double(force_z + n1, -p_ext * area.z);
+  pressure_atomic_add_double(force_r + n0, -p_seg * area.r);
+  pressure_atomic_add_double(force_r + n1, -p_seg * area.r);
+  pressure_atomic_add_double(force_z + n0, -p_seg * area.z);
+  pressure_atomic_add_double(force_z + n1, -p_seg * area.z);
 }
 
 // Mirror-ghost closure — the ghost cell carries the interior cell's full
@@ -124,9 +133,8 @@ __global__ void add_r_outer_boundary_mirror_forces_kernel(
 }
 
 template <int RZ_SCHEME>
-__global__ void add_multiblock_polar_shell_pressure_forces_kernel(
-    double* __restrict__ force_r,
-    double* __restrict__ force_z,
+__device__ inline RzBoundaryPressureFaceAreaVector
+multiblock_polar_shell_pressure_force_contribution(
     const double* __restrict__ x_r,
     const double* __restrict__ x_z,
     const double* __restrict__ node_mass,
@@ -136,12 +144,11 @@ __global__ void add_multiblock_polar_shell_pressure_forces_kernel(
     const double p_ext,
     const bool rz_exact_endpoint,
     const bool mass_proportional_split,
-    const int split_mode) {
-  const int j = blockIdx.x * blockDim.x + threadIdx.x;
-  if (j >= nz_polar) {
-    return;
-  }
-
+    const int split_mode,
+    const PressureDrivePerturbationParams drive_pert,
+    const bool drive_pert_enabled,
+    const int j,
+    const std::int8_t end) {
   const int stride = nz_polar + 1;
   const int n0_local = nr_shell * stride + j;
   const int n1_local = nr_shell * stride + (j + 1);
@@ -149,17 +156,22 @@ __global__ void add_multiblock_polar_shell_pressure_forces_kernel(
   const int n1 = polar_shell_node_begin + n1_local;
   const double* const x_shell_r = x_r + polar_shell_node_begin;
   const double* const x_shell_z = x_z + polar_shell_node_begin;
+  double p_seg = p_ext;
+  if (drive_pert_enabled) {
+    const double rm = 0.5 * (x_r[n0] + x_r[n1]);
+    const double zm = 0.5 * (x_z[n0] + x_z[n1]);
+    p_seg = p_ext * pressure_drive_perturbation_g(drive_pert, rm, zm);
+  }
   if constexpr (RZ_SCHEME == 1) {
     // The I1-B environment split modes are scheme-0-only; the planar
     // convention gives each endpoint P * 0.5 * L * n_hat directly.
     const RzBoundaryPressureEndpointAreaVectors areas =
         r_outer_boundary_planar_pressure_endpoint_area_vectors(
             x_shell_r, x_shell_z, nr_shell, nz_polar, j);
-    pressure_atomic_add_double(force_r + n0, -p_ext * areas.node0.r);
-    pressure_atomic_add_double(force_r + n1, -p_ext * areas.node1.r);
-    pressure_atomic_add_double(force_z + n0, -p_ext * areas.node0.z);
-    pressure_atomic_add_double(force_z + n1, -p_ext * areas.node1.z);
-    return;
+    if (end == 0) {
+      return {-p_seg * areas.node0.r, -p_seg * areas.node0.z};
+    }
+    return {-p_seg * areas.node1.r, -p_seg * areas.node1.z};
   }
   if (rz_exact_endpoint) {
     const RzBoundaryPressureEndpointAreaVectors areas =
@@ -178,11 +190,10 @@ __global__ void add_multiblock_polar_shell_pressure_forces_kernel(
       const double msum = m0 + m1;
       const double w0 = msum > 0.0 ? m0 / msum : 0.5;
       const double w1 = 1.0 - w0;
-      pressure_atomic_add_double(force_r + n0, -p_ext * tot_r * w0);
-      pressure_atomic_add_double(force_r + n1, -p_ext * tot_r * w1);
-      pressure_atomic_add_double(force_z + n0, -p_ext * tot_z * w0);
-      pressure_atomic_add_double(force_z + n1, -p_ext * tot_z * w1);
-      return;
+      if (end == 0) {
+        return {-p_seg * tot_r * w0, -p_seg * tot_z * w0};
+      }
+      return {-p_seg * tot_r * w1, -p_seg * tot_z * w1};
     }
     if (mass_proportional_split && split_mode == 1) {
       // Acceleration-consistent POLE lumping (I1-B-W, Benson 2.4.3 remedy
@@ -208,28 +219,70 @@ __global__ void add_multiblock_polar_shell_pressure_forces_kernel(
         const double tot_z = areas.node0.z + areas.node1.z;
         const double w0 = pole0 ? 0.25 : 0.75;
         const double w1 = 1.0 - w0;
-        pressure_atomic_add_double(force_r + n0, -p_ext * tot_r * w0);
-        pressure_atomic_add_double(force_r + n1, -p_ext * tot_r * w1);
-        pressure_atomic_add_double(force_z + n0, -p_ext * tot_z * w0);
-        pressure_atomic_add_double(force_z + n1, -p_ext * tot_z * w1);
-        return;
+        if (end == 0) {
+          return {-p_seg * tot_r * w0, -p_seg * tot_z * w0};
+        }
+        return {-p_seg * tot_r * w1, -p_seg * tot_z * w1};
       }
     }
-    pressure_atomic_add_double(force_r + n0, -p_ext * areas.node0.r);
-    pressure_atomic_add_double(force_r + n1, -p_ext * areas.node1.r);
-    pressure_atomic_add_double(force_z + n0, -p_ext * areas.node0.z);
-    pressure_atomic_add_double(force_z + n1, -p_ext * areas.node1.z);
-    return;
+    if (end == 0) {
+      return {-p_seg * areas.node0.r, -p_seg * areas.node0.z};
+    }
+    return {-p_seg * areas.node1.r, -p_seg * areas.node1.z};
   }
 
   const RzBoundaryPressureFaceAreaVector area =
       r_outer_boundary_pressure_area_vector(
           x_shell_r, x_shell_z, nr_shell, nz_polar, j);
 
-  pressure_atomic_add_double(force_r + n0, -p_ext * area.r);
-  pressure_atomic_add_double(force_r + n1, -p_ext * area.r);
-  pressure_atomic_add_double(force_z + n0, -p_ext * area.z);
-  pressure_atomic_add_double(force_z + n1, -p_ext * area.z);
+  return {-p_seg * area.r, -p_seg * area.z};
+}
+
+template <int RZ_SCHEME>
+__global__ void add_multiblock_polar_shell_pressure_forces_kernel(
+    double* __restrict__ force_r,
+    double* __restrict__ force_z,
+    const double* __restrict__ x_r,
+    const double* __restrict__ x_z,
+    const double* __restrict__ node_mass,
+    const int polar_shell_node_begin,
+    const int nr_shell,
+    const int nz_polar,
+    const double p_ext,
+    const bool rz_exact_endpoint,
+    const bool mass_proportional_split,
+    const int split_mode,
+    const PressureDrivePerturbationParams drive_pert,
+    const bool drive_pert_enabled) {
+  const int j_node = blockIdx.x * blockDim.x + threadIdx.x;
+  if (j_node > nz_polar) {
+    return;
+  }
+
+  RzBoundaryPressureFaceAreaVector force{0.0, 0.0};
+  if (j_node > 0) {
+    const RzBoundaryPressureFaceAreaVector contribution =
+        multiblock_polar_shell_pressure_force_contribution<RZ_SCHEME>(
+            x_r, x_z, node_mass, polar_shell_node_begin, nr_shell, nz_polar,
+            p_ext, rz_exact_endpoint, mass_proportional_split, split_mode,
+            drive_pert, drive_pert_enabled, j_node - 1, 1);
+    force.r += contribution.r;
+    force.z += contribution.z;
+  }
+  if (j_node < nz_polar) {
+    const RzBoundaryPressureFaceAreaVector contribution =
+        multiblock_polar_shell_pressure_force_contribution<RZ_SCHEME>(
+            x_r, x_z, node_mass, polar_shell_node_begin, nr_shell, nz_polar,
+            p_ext, rz_exact_endpoint, mass_proportional_split, split_mode,
+            drive_pert, drive_pert_enabled, j_node, 0);
+    force.r += contribution.r;
+    force.z += contribution.z;
+  }
+
+  const int n = polar_shell_node_begin +
+                nr_shell * (nz_polar + 1) + j_node;
+  force_r[n] = force_r[n] + force.r;
+  force_z[n] = force_z[n] + force.z;
 }
 
 }  // namespace
@@ -242,7 +295,9 @@ void launch_r_outer_boundary_pressure_forces(double* force_r,
                                              const int nz,
                                              const double p_ext,
                                              const bool rz_exact_endpoint,
-                                             const int rz_scheme) {
+                                             const int rz_scheme,
+                                             const PressureDrivePerturbationParams& drive_pert,
+                                             const bool drive_pert_enabled) {
   if (nr <= 0 || nz <= 0) {
     return;
   }
@@ -250,11 +305,13 @@ void launch_r_outer_boundary_pressure_forces(double* force_r,
   switch (rz_scheme) {
     case 0:
       add_r_outer_boundary_pressure_forces_kernel<0><<<blocks_j, 256>>>(
-          force_r, force_z, x_r, x_z, nr, nz, p_ext, rz_exact_endpoint);
+          force_r, force_z, x_r, x_z, nr, nz, p_ext, rz_exact_endpoint,
+          drive_pert, drive_pert_enabled);
       break;
     case 1:
       add_r_outer_boundary_pressure_forces_kernel<1><<<blocks_j, 256>>>(
-          force_r, force_z, x_r, x_z, nr, nz, p_ext, rz_exact_endpoint);
+          force_r, force_z, x_r, x_z, nr, nz, p_ext, rz_exact_endpoint,
+          drive_pert, drive_pert_enabled);
       break;
     default:
       std::abort();
@@ -299,7 +356,9 @@ void launch_multiblock_polar_shell_pressure_forces(
     const double p_ext,
     const bool rz_exact_endpoint,
     const double* node_mass,
-    const int rz_scheme) {
+    const int rz_scheme,
+    const PressureDrivePerturbationParams& drive_pert,
+    const bool drive_pert_enabled) {
   if (polar_shell_node_begin < 0 || nr_shell <= 0 || nz_polar <= 0) {
     return;
   }
@@ -316,19 +375,19 @@ void launch_multiblock_polar_shell_pressure_forces(
     const int v = std::atoi(raw);
     return v >= 1 && v <= 2 ? v : 1;
   }();
-  const int blocks_j = (nz_polar + 255) / 256;
+  const int blocks_j = (nz_polar + 256) / 256;
   switch (rz_scheme) {
     case 0:
       add_multiblock_polar_shell_pressure_forces_kernel<0><<<blocks_j, 256>>>(
           force_r, force_z, x_r, x_z, node_mass, polar_shell_node_begin,
           nr_shell, nz_polar, p_ext, rz_exact_endpoint, split_mode != 0,
-          split_mode);
+          split_mode, drive_pert, drive_pert_enabled);
       break;
     case 1:
       add_multiblock_polar_shell_pressure_forces_kernel<1><<<blocks_j, 256>>>(
           force_r, force_z, x_r, x_z, node_mass, polar_shell_node_begin,
           nr_shell, nz_polar, p_ext, rz_exact_endpoint, split_mode != 0,
-          split_mode);
+          split_mode, drive_pert, drive_pert_enabled);
       break;
     default:
       std::abort();

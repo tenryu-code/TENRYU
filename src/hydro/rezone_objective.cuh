@@ -5,6 +5,8 @@
 #include <cstddef>
 #include <cstdio>
 #include <cstdint>
+#include <string>
+#include <utility>
 #include <vector>
 
 #include <cuda_runtime.h>
@@ -69,6 +71,8 @@ struct RezoneMeshView {
   // containing that node (center, left neighbor, or right neighbor).
   const int* theta_left = nullptr;
   const int* theta_right = nullptr;
+  // Fraction of the left-to-right target at each center; nullptr means 0.5.
+  const double* theta_frac = nullptr;
   const int* theta_touch_offsets = nullptr;
   const int* theta_touch_centers = nullptr;
 };
@@ -141,15 +145,114 @@ struct RezoneSweepResult {
 struct RezoneRingNeighborPairs {
   std::vector<int> left;
   std::vector<int> right;
+  std::vector<double> frac;
   std::vector<int> touch_offsets;
   std::vector<int> touch_centers;
 };
 
 namespace ring_detail {
 
+struct BlockCornerRoles {
+  int in_lo = -1;   // Inner-ring, lower-theta corner slot.
+  int in_hi = -1;   // Inner-ring, higher-theta corner slot.
+  int out_lo = -1;  // Outer-ring, lower-theta corner slot.
+  int out_hi = -1;  // Outer-ring, higher-theta corner slot.
+  bool valid = false;
+};
+
+inline BlockCornerRoles detect_block_corner_roles(
+    const mesh::MultiBlockTopology& mb,
+    const mesh::BlockInfo& block) {
+  BlockCornerRoles roles;
+  if (block.n_j_cells < 2 || block.n_i_cells < 2) {
+    return roles;
+  }
+
+  const int cell_a = block.cell_begin;
+  const int cell_b = cell_a + 1;
+  const int cell_c = cell_a + block.n_j_cells;
+  int nodes_a[4];
+  int nodes_b[4];
+  int nodes_c[4];
+  const auto read_quad_slots = [&mb](const int cell, int (&nodes)[4]) {
+    const int begin =
+        mb.cell_node_csr_offsets[static_cast<std::size_t>(cell)];
+    for (int slot = 0; slot < 4; ++slot) {
+      nodes[slot] = mb.cell_node_csr_indices[
+          static_cast<std::size_t>(begin + slot)];
+    }
+  };
+  read_quad_slots(cell_a, nodes_a);
+  read_quad_slots(cell_b, nodes_b);
+  read_quad_slots(cell_c, nodes_c);
+
+  bool hi_edge[4] = {false, false, false, false};
+  bool out_edge[4] = {false, false, false, false};
+  int hi_count = 0;
+  int out_count = 0;
+  for (int slot_a = 0; slot_a < 4; ++slot_a) {
+    for (int slot_b = 0; slot_b < 4; ++slot_b) {
+      if (nodes_a[slot_a] == nodes_b[slot_b]) {
+        hi_edge[slot_a] = true;
+      }
+      if (nodes_a[slot_a] == nodes_c[slot_b]) {
+        out_edge[slot_a] = true;
+      }
+    }
+    hi_count += hi_edge[slot_a] ? 1 : 0;
+    out_count += out_edge[slot_a] ? 1 : 0;
+  }
+  if (hi_count != 2 || out_count != 2) {
+    return roles;
+  }
+
+  for (int slot = 0; slot < 4; ++slot) {
+    int* role = nullptr;
+    if (hi_edge[slot] && out_edge[slot]) {
+      role = &roles.out_hi;
+    } else if (hi_edge[slot]) {
+      role = &roles.in_hi;
+    } else if (out_edge[slot]) {
+      role = &roles.out_lo;
+    } else {
+      role = &roles.in_lo;
+    }
+    if (*role >= 0) {
+      return BlockCornerRoles{};
+    }
+    *role = slot;
+  }
+  if (roles.in_lo < 0 || roles.in_hi < 0 ||
+      roles.out_lo < 0 || roles.out_hi < 0) {
+    return BlockCornerRoles{};
+  }
+
+  const int next_cell_a = block.cell_begin + 1;
+  const int next_cell_b = next_cell_a + 1;
+  int next_nodes_a[4];
+  int next_nodes_b[4];
+  read_quad_slots(next_cell_a, next_nodes_a);
+  read_quad_slots(next_cell_b, next_nodes_b);
+  bool next_hi_edge[4] = {false, false, false, false};
+  for (int slot_a = 0; slot_a < 4; ++slot_a) {
+    for (int slot_b = 0; slot_b < 4; ++slot_b) {
+      if (next_nodes_a[slot_a] == next_nodes_b[slot_b]) {
+        next_hi_edge[slot_a] = true;
+      }
+    }
+    if (next_hi_edge[slot_a] != hi_edge[slot_a]) {
+      return BlockCornerRoles{};
+    }
+  }
+
+  roles.valid = true;
+  return roles;
+}
+
 inline void add_ring_neighbor_terms(
     RezoneRingNeighborPairs& pairs,
-    const std::vector<int>& ring) {
+    const std::vector<int>& ring,
+    int* const poison_count) {
   if (ring.size() < 3U) {
     return;
   }
@@ -164,14 +267,22 @@ inline void add_ring_neighbor_terms(
                       right >= 0 &&
                       right < static_cast<int>(pairs.left.size()),
                   "M1 ring-neighbor node id out of range");
-    TENRYU_ASSERT(
-        (pairs.left[static_cast<std::size_t>(center)] < 0 &&
-         pairs.right[static_cast<std::size_t>(center)] < 0) ||
-            (pairs.left[static_cast<std::size_t>(center)] == left &&
-             pairs.right[static_cast<std::size_t>(center)] == right),
-        "M1 ring-neighbor center has inconsistent within-block neighbors");
-    pairs.left[static_cast<std::size_t>(center)] = left;
-    pairs.right[static_cast<std::size_t>(center)] = right;
+    const std::size_t center_index = static_cast<std::size_t>(center);
+    if (pairs.left[center_index] == -2 || pairs.right[center_index] == -2) {
+      continue;
+    }
+    if (pairs.left[center_index] < 0 && pairs.right[center_index] < 0) {
+      pairs.left[center_index] = left;
+      pairs.right[center_index] = right;
+      continue;
+    }
+    if (pairs.left[center_index] == left &&
+        pairs.right[center_index] == right) {
+      continue;
+    }
+    pairs.left[center_index] = -2;
+    pairs.right[center_index] = -2;
+    ++(*poison_count);
   }
 }
 
@@ -227,6 +338,108 @@ inline std::vector<int> block_cell_ring(
   return ring;
 }
 
+inline std::vector<int> block_cell_ring_roles(
+    const mesh::MultiBlockTopology& mb,
+    const mesh::BlockInfo& block,
+    const BlockCornerRoles& roles,
+    const int row,
+    const bool upper) {
+  std::vector<int> ring;
+  const int first_cell =
+      block.cell_begin + row * block.n_j_cells;
+  for (int j = 0; j < block.n_j_cells; ++j) {
+    const int cell = first_cell + j;
+    TENRYU_ASSERT(
+        j == 0 ||
+            mb.cell_id_stable[static_cast<std::size_t>(cell)] ==
+                mb.cell_id_stable[static_cast<std::size_t>(cell - 1)] + 1,
+        "M1 ring-neighbor block row requires consecutive stable cell ids");
+    const int begin =
+        mb.cell_node_csr_offsets[static_cast<std::size_t>(cell)];
+    if (!upper) {
+      ring.push_back(mb.cell_node_csr_indices[
+          static_cast<std::size_t>(begin + roles.in_lo)]);
+      if (j + 1 == block.n_j_cells) {
+        ring.push_back(mb.cell_node_csr_indices[
+            static_cast<std::size_t>(begin + roles.in_hi)]);
+      }
+      continue;
+    }
+    ring.push_back(mb.cell_node_csr_indices[
+        static_cast<std::size_t>(begin + roles.out_lo)]);
+    if (j + 1 == block.n_j_cells) {
+      ring.push_back(mb.cell_node_csr_indices[
+          static_cast<std::size_t>(begin + roles.out_hi)]);
+    }
+  }
+  return ring;
+}
+
+inline std::vector<std::vector<int>> transition_belt_interior_rings(
+    const mesh::BlockInfo& block) {
+  TENRYU_ASSERT(block.n_j_cells > 0,
+                "M1 theta transition belt must contain cells");
+  std::vector<std::vector<int>> rings;
+  if (block.n_i_cells == 1) {
+    TENRYU_ASSERT(
+        block.n_j_cells % 5 == 0,
+        "M1 one-row theta transition belt must use five-triangle sectors");
+    const int coarse_columns = block.n_j_cells / 5;
+    TENRYU_ASSERT(
+        block.owned_node_count == 2 * coarse_columns + 1,
+        "M1 one-row theta transition belt must own one coarse ring and "
+        "one center chain");
+    const int center_begin =
+        block.owned_node_begin + coarse_columns + 1;
+    std::vector<int> ring;
+    ring.reserve(static_cast<std::size_t>(coarse_columns));
+    for (int sector = 0; sector < coarse_columns; ++sector) {
+      ring.push_back(center_begin + sector);
+    }
+    rings.push_back(std::move(ring));
+    return rings;
+  }
+  if (block.n_i_cells == 2) {
+    TENRYU_ASSERT(
+        block.n_j_cells % 5 == 0,
+        "M1 two-row theta transition belt must use the 4-3-2 template");
+    const int coarse_columns = 2 * (block.n_j_cells / 5);
+    const int intermediate_columns = 3 * coarse_columns / 2;
+    TENRYU_ASSERT(
+        coarse_columns % 4 == 0 &&
+            block.owned_node_count == 5 * coarse_columns / 2 + 2,
+        "M1 two-row theta transition belt ownership mismatch");
+    std::vector<int> ring;
+    ring.reserve(static_cast<std::size_t>(intermediate_columns + 1));
+    for (int k = 0; k <= intermediate_columns; ++k) {
+      ring.push_back(block.owned_node_begin + k);
+    }
+    rings.push_back(std::move(ring));
+    return rings;
+  }
+  TENRYU_ASSERT(
+      block.n_i_cells == 3 && block.n_j_cells % 2 == 0,
+      "M1 multi-row theta transition belt must use a supported template");
+  const int coarse_columns = block.n_j_cells / 2;
+  const int first_columns = 5 * coarse_columns / 3;
+  const int second_columns = 4 * coarse_columns / 3;
+  TENRYU_ASSERT(
+      coarse_columns % 6 == 0 &&
+          block.owned_node_count == 4 * coarse_columns + 3,
+      "M1 three-row theta transition belt ownership mismatch");
+  int ring_begin = block.owned_node_begin;
+  for (const int columns : {first_columns, second_columns}) {
+    std::vector<int> ring;
+    ring.reserve(static_cast<std::size_t>(columns + 1));
+    for (int k = 0; k <= columns; ++k) {
+      ring.push_back(ring_begin + k);
+    }
+    rings.push_back(std::move(ring));
+    ring_begin += columns + 1;
+  }
+  return rings;
+}
+
 inline void build_touch_csr(RezoneRingNeighborPairs& pairs) {
   const int n_nodes = static_cast<int>(pairs.left.size());
   std::vector<std::vector<int>> touching(
@@ -265,6 +478,8 @@ inline RezoneRingNeighborPairs rezone_build_ring_neighbor_pairs(
   RezoneRingNeighborPairs pairs;
   pairs.left.assign(static_cast<std::size_t>(topology.n_nodes), -1);
   pairs.right.assign(static_cast<std::size_t>(topology.n_nodes), -1);
+  pairs.frac.assign(static_cast<std::size_t>(topology.n_nodes), 0.5);
+  int poison_count = 0;
 
   if (!topology.multiblock.has_value()) {
     TENRYU_ASSERT(
@@ -276,7 +491,7 @@ inline RezoneRingNeighborPairs rezone_build_ring_neighbor_pairs(
       for (int j = 0; j <= topology.nz; ++j) {
         ring.push_back(topology.node_index(i, j));
       }
-      ring_detail::add_ring_neighbor_terms(pairs, ring);
+      ring_detail::add_ring_neighbor_terms(pairs, ring, &poison_count);
     }
     ring_detail::build_touch_csr(pairs);
     return pairs;
@@ -286,22 +501,68 @@ inline RezoneRingNeighborPairs rezone_build_ring_neighbor_pairs(
   TENRYU_ASSERT(mb.cell_id_stable.size() ==
                     static_cast<std::size_t>(topology.n_cells),
                 "M1 ring-neighbor builder requires stable cell ids");
+  int skipped_blocks = 0;
   for (const mesh::BlockInfo& block : mb.blocks) {
-    if (block.role != mesh::BlockRole::POLAR_SHELL &&
-        block.role != mesh::BlockRole::PENTAGON_BELT) {
+    if (block.role == mesh::BlockRole::TRANSITION_BELT) {
+      for (const auto& ring :
+           ring_detail::transition_belt_interior_rings(block)) {
+        ring_detail::add_ring_neighbor_terms(
+            pairs, ring, &poison_count);
+      }
       continue;
     }
+    if (block.role == mesh::BlockRole::PENTAGON_BELT) {
+      for (int row = 0; row < block.n_i_cells; ++row) {
+        ring_detail::add_ring_neighbor_terms(
+            pairs,
+            ring_detail::block_cell_ring(
+                mb, cell_nverts, topology_stride, block, row, false),
+            &poison_count);
+        ring_detail::add_ring_neighbor_terms(
+            pairs,
+            ring_detail::block_cell_ring(
+                mb, cell_nverts, topology_stride, block, row, true),
+            &poison_count);
+      }
+      continue;
+    }
+    if (block.role != mesh::BlockRole::POLAR_SHELL &&
+        block.role != mesh::BlockRole::POLAR_TIER) {
+      continue;
+    }
+    const ring_detail::BlockCornerRoles roles =
+        ring_detail::detect_block_corner_roles(mb, block);
+    if (!roles.valid) {
+      ++skipped_blocks;
+      continue;
+    }
+    // Structured cells detect in_lo=0, out_lo=1, out_hi=2, and in_hi=3,
+    // so the role-based rings are identical to the legacy slot picks.
     for (int row = 0; row < block.n_i_cells; ++row) {
       ring_detail::add_ring_neighbor_terms(
           pairs,
-          ring_detail::block_cell_ring(
-              mb, cell_nverts, topology_stride, block, row, false));
+          ring_detail::block_cell_ring_roles(
+              mb, block, roles, row, false),
+          &poison_count);
       ring_detail::add_ring_neighbor_terms(
           pairs,
-          ring_detail::block_cell_ring(
-              mb, cell_nverts, topology_stride, block, row, true));
+          ring_detail::block_cell_ring_roles(
+              mb, block, roles, row, true),
+          &poison_count);
     }
   }
+  int paired = 0;
+  for (const int left : pairs.left) {
+    paired += left >= 0 ? 1 : 0;
+  }
+  if (poison_count > 0 || skipped_blocks > 0) {
+    core::log_info("[m1-theta-rings] paired=" + std::to_string(paired) +
+                   " poison=" + std::to_string(poison_count) +
+                   " skipped_blocks=" + std::to_string(skipped_blocks));
+  }
+  TENRYU_ASSERT(
+      poison_count * 5 <= paired + 1,
+      "M1 theta-ring poison count exceeds gross-sanity bound");
   ring_detail::build_touch_csr(pairs);
   return pairs;
 }
@@ -517,7 +778,12 @@ __host__ __device__ inline ThetaEvaluation evaluate_theta_term(
   }
 
   const double difference = d_left - d_right;
-  out.ratio = difference / sum;
+  if (view.theta_frac == nullptr || view.theta_frac[center] == 0.5) {
+    out.ratio = difference / sum;
+  } else {
+    const double target_ratio = 2.0 * view.theta_frac[center] - 1.0;
+    out.ratio = difference / sum - target_ratio;
+  }
   out.penalty = out.ratio * out.ratio;
   if (moved_node >= 0) {
     double grad_left_r = 0.0;

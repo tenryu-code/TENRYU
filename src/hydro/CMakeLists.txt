@@ -5,6 +5,24 @@ add_library(tenryu_hydro STATIC
   anti_hourglass.cuh
   ale_align_monitor.cpp
   ale_align_monitor.hpp
+  refinement_estimator.cpp
+  refinement_estimator.hpp
+  refinement_tracker.cpp
+  refinement_tracker.hpp
+  evacuated_cell_shadow.cpp
+  intersection_remap_patch.cpp
+  flank_slip_patch.cpp
+  axis_edge_collapse.cpp
+  cavity_boundary_graph.cpp
+  cavity_boundary_shadow_detect.cpp
+  cavity_boundary_shadow_detect.hpp
+  cavity_contact_shadow_solve.cpp
+  cavity_contact_shadow_solve.hpp
+  flank_tangential_strip.cpp
+  ale_state_monitor.cu
+  ale_state_monitor.hpp
+  runtime_ale_targets.cu
+  runtime_ale_targets.hpp
   ale_align_rezone.cpp
   ale_align_rezone.hpp
   ale_axis_band_controller.cu
@@ -20,6 +38,8 @@ add_library(tenryu_hydro STATIC
   braginskii_viscosity.cuh
   compatible_av_csw.cu
   compatible_av_csw.cuh
+  compatible_av_tensor.cu
+  compatible_av_tensor.cuh
   compatible_force_work_2d.cu
   compatible_force_work_2d.cuh
   compatible_subzonal_pressure.cu
@@ -42,6 +62,15 @@ add_library(tenryu_hydro STATIC
   corner_j_predict_cfl.cu
   corner_j_predict_cfl.hpp
   ring7_seam_quotient_remap.cu
+  reale_dvclp.cpp
+  reale_remap.cpp
+  carrier_constraint.cpp
+  carrier_constraint_adapter.cpp
+  carrier_constraint_adapter.hpp
+  reale_remap.hpp
+  carrier_projection.cpp
+  carrier_projection.hpp
+  row_merge.cu
   cfl.cu
   conduction.cu
   conduction_snb_1d.cu
@@ -49,11 +78,31 @@ add_library(tenryu_hydro STATIC
   conduction_snb_2d.cu
   cd_local_rezone.cu
   eos_context.cu
+  band_ale.cu
+  axis_projection.cu
   euler_window_blend.cu
+  axis_cell_ledger.cu
+  axis_cell_ledger.hpp
+  corner_collapse_ledger.cu
+  corner_collapse_ledger.hpp
+  core_clearance_controller.cu
+  core_clearance_controller.hpp
+  shadow_homothety_diag.cu
+  shadow_homothety_diag.hpp
+  entropy_stage_ledger.cu
+  entropy_stage_ledger.hpp
+  stripe_gate.cu
+  stripe_gate.hpp
+  phase_audit.cpp
+  phase_audit.hpp
+  wake_angular_heat_flux.cu
+  wake_angular_heat_flux.hpp
   ale_gcl.cu
   ale_identity_diag.cu
   ale_driver.cu
   ale_remap_2d_rz.cu
+  remap_corner_distribution.cpp
+  remap_corner_distribution.hpp
   corner_mass_remap_audit.cu
   ke_fixup_deposit.cu
   local_rezone.cu
@@ -77,6 +126,7 @@ add_library(tenryu_hydro STATIC
   ale_rezone.cuh
   ale_scaled_reference.cuh
   ale_mode.hpp
+  band_ale.hpp
   cd_local_rezone.cuh
   local_rezone.cuh
   ale_remap.cuh
@@ -106,6 +156,7 @@ add_library(tenryu_hydro STATIC
   rz_corner_mass.cuh
   rz_corner_kinetic.cuh
   ring7_seam_quotient_remap.cuh
+  row_merge.cuh
   rz_geometric_cfl.cu
   shock_tracker.cu
   state_supply_bc.cu
@@ -134,4 +185,12 @@ tenryu_attach_config_state_abi_deps(tenryu_hydro)
 
 target_sources(tenryu_hydro PRIVATE
   rollback_guard.cu
+)
+
+add_executable(phase_audit_replay
+  ${PROJECT_SOURCE_DIR}/tools/phase_audit_replay.cpp
+)
+
+target_link_libraries(phase_audit_replay PRIVATE
+  tenryu_hydro
 )

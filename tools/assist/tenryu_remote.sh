@@ -19,6 +19,11 @@ TMPDIR="${TENRYU_REMOTE_TMPDIR:-/tmp}"
 SSH_CMD="${TENRYU_REMOTE_SSH:-ssh}"
 SCP_CMD="${TENRYU_REMOTE_SCP:-scp}"
 RSYNC_CMD="${TENRYU_REMOTE_RSYNC:-rsync}"
+SSH_OPTS="${TENRYU_REMOTE_SSH_OPTS:-}"
+SCP_OPTS="${TENRYU_REMOTE_SCP_OPTS:-}"
+
+# SSH_OPTS/SCP_OPTS are intentionally word-split; option values must not contain
+# spaces, matching the argument guard character policy.
 
 RDECK=""
 ROUT=""
@@ -26,13 +31,13 @@ RDIR=""
 
 cleanup() {
   if [[ -n "$RDECK" ]]; then
-    "$SSH_CMD" "$HOST" "rm -f $RDECK" >/dev/null
+    "$SSH_CMD" $SSH_OPTS "$HOST" "rm -f $RDECK" >/dev/null
   fi
   if [[ -n "$ROUT" ]]; then
-    "$SSH_CMD" "$HOST" "rm -f $ROUT" >/dev/null
+    "$SSH_CMD" $SSH_OPTS "$HOST" "rm -f $ROUT" >/dev/null
   fi
   if [[ -n "$RDIR" ]]; then
-    "$SSH_CMD" "$HOST" "rm -rf $RDIR" >/dev/null
+    "$SSH_CMD" $SSH_OPTS "$HOST" "rm -rf $RDIR" >/dev/null
   fi
 }
 
@@ -51,7 +56,7 @@ make_remote_temp() {
   local path
   local status
 
-  path=$("$SSH_CMD" "$HOST" "mktemp $template")
+  path=$("$SSH_CMD" $SSH_OPTS "$HOST" "mktemp $template")
   status=$?
   if [[ $status -ne 0 ]]; then
     return "$status"
@@ -68,7 +73,7 @@ upload_deck() {
   if [[ $status -ne 0 ]]; then
     exit "$status"
   fi
-  "$SCP_CMD" "$local_deck" "$HOST:$RDECK" 1>&2
+  "$SCP_CMD" $SCP_OPTS "$local_deck" "$HOST:$RDECK" 1>&2
   status=$?
   if [[ $status -ne 0 ]]; then
     echo "assist remote: failed to copy deck to remote host" >&2
@@ -102,7 +107,7 @@ case "$subcommand" in
     for argument in "$@"; do
       command="$command $argument"
     done
-    "$SSH_CMD" "$HOST" "$command"
+    "$SSH_CMD" $SSH_OPTS "$HOST" "$command"
     status=$?
     exit "$status"
     ;;
@@ -123,12 +128,12 @@ case "$subcommand" in
     if [[ $status -ne 0 ]]; then
       exit "$status"
     fi
-    "$SSH_CMD" "$HOST" "cd $REPO && $BIN freeze $RDECK -o $ROUT"
+    "$SSH_CMD" $SSH_OPTS "$HOST" "cd $REPO && $BIN freeze $RDECK -o $ROUT"
     status=$?
     if [[ $status -ne 0 ]]; then
       exit "$status"
     fi
-    "$SCP_CMD" "$HOST:$ROUT" "$local_out" 1>&2
+    "$SCP_CMD" $SCP_OPTS "$HOST:$ROUT" "$local_out" 1>&2
     status=$?
     if [[ $status -ne 0 ]]; then
       echo "assist remote: failed to copy frozen output from remote host" >&2
@@ -166,13 +171,13 @@ case "$subcommand" in
     done
 
     upload_deck "$local_deck"
-    RDIR=$("$SSH_CMD" "$HOST" "mktemp -d $TMPDIR/assist_remote_out_XXXXXX")
+    RDIR=$("$SSH_CMD" $SSH_OPTS "$HOST" "mktemp -d $TMPDIR/assist_remote_out_XXXXXX")
     status=$?
     if [[ $status -ne 0 ]]; then
       exit "$status"
     fi
     command="cd $REPO && $BIN run $RDECK --output-dir $RDIR/out$forwarded_args"
-    "$SSH_CMD" "$HOST" "$command"
+    "$SSH_CMD" $SSH_OPTS "$HOST" "$command"
     status=$?
     if [[ $status -ne 0 ]]; then
       exit "$status"
@@ -193,7 +198,7 @@ case "$subcommand" in
     ;;
 
   --version)
-    "$SSH_CMD" "$HOST" "cd $REPO && $BIN --version"
+    "$SSH_CMD" $SSH_OPTS "$HOST" "cd $REPO && $BIN --version"
     status=$?
     exit "$status"
     ;;

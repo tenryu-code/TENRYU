@@ -136,6 +136,49 @@ __host__ __device__ inline double rz_polygon_area2_exact(const double* r,
   return sum;
 }
 
+// The 8*n*eps*magnitude bound dominates per-term rounding, length-n
+// accumulation, and cross-TU FMA-contraction variance of the token-identical
+// formulas in mesh.cu and this header; true certifies every faithful double
+// evaluation as strictly positive, including install-time geometry, with no
+// fitted constants.
+__host__ __device__ inline bool rz_polygon_volume_certified_positive(
+    const double* r,
+    const double* z,
+    const int nverts) {
+  constexpr double pi_over_three =
+      1.0471975511965977461542144610931676280657231331250352736615;
+  constexpr double eps = 2.220446049250313080847e-16;
+  double sum = 0.0;
+  double magnitude = 0.0;
+  for (int k = 0; k < nverts; ++k) {
+    const int kp = (k + 1 == nverts) ? 0 : (k + 1);
+    sum += (r[k] * z[kp] - r[kp] * z[k]) * (r[k] + r[kp]);
+    magnitude += (fabs(r[k] * z[kp]) + fabs(r[kp] * z[k])) *
+                 (fabs(r[k]) + fabs(r[kp]));
+  }
+  const double volume = pi_over_three * sum;
+  const double bound =
+      pi_over_three * 8.0 * static_cast<double>(nverts) * eps * magnitude;
+  return finite_double(volume) && finite_double(bound) && volume > bound;
+}
+
+__host__ __device__ inline bool rz_polygon_area2_certified_positive(
+    const double* r,
+    const double* z,
+    const int nverts) {
+  constexpr double eps = 2.220446049250313080847e-16;
+  double sum = 0.0;
+  double magnitude = 0.0;
+  for (int k = 0; k < nverts; ++k) {
+    const int kp = (k + 1 == nverts) ? 0 : (k + 1);
+    sum += r[k] * z[kp] - r[kp] * z[k];
+    magnitude += fabs(r[k] * z[kp]) + fabs(r[kp] * z[k]);
+  }
+  const double bound =
+      8.0 * static_cast<double>(nverts) * eps * magnitude;
+  return finite_double(sum) && finite_double(bound) && sum > bound;
+}
+
 __host__ __device__ inline int button_seam_node_index(const int outer_ring,
                                                       const int j,
                                                       const int nz) {
@@ -576,7 +619,7 @@ __host__ __device__ inline void compute_quad_corner_signed_volumes_subpolygon(
   v_corner[3] = rz_polygon_volume_exact(r_sub3, z_sub3, 4);
 }
 
-__host__ __device__ inline void compute_quad_corner_volumes_exact_subpolygon(
+__host__ __device__ inline void compute_quad_corner_signed_volumes_exact_subpolygon(
     const double r00,
     const double z00,
     const double r10,
@@ -606,10 +649,61 @@ __host__ __device__ inline void compute_quad_corner_volumes_exact_subpolygon(
   const double r_sub3[4] = {r30m, rc, r23m, r01};
   const double z_sub3[4] = {z30m, zc, z23m, z01};
 
-  v_corner[0] = fabs(rz_polygon_volume_exact(r_sub0, z_sub0, 4));
-  v_corner[1] = fabs(rz_polygon_volume_exact(r_sub1, z_sub1, 4));
-  v_corner[2] = fabs(rz_polygon_volume_exact(r_sub2, z_sub2, 4));
-  v_corner[3] = fabs(rz_polygon_volume_exact(r_sub3, z_sub3, 4));
+  v_corner[0] = rz_polygon_volume_exact(r_sub0, z_sub0, 4);
+  v_corner[1] = rz_polygon_volume_exact(r_sub1, z_sub1, 4);
+  v_corner[2] = rz_polygon_volume_exact(r_sub2, z_sub2, 4);
+  v_corner[3] = rz_polygon_volume_exact(r_sub3, z_sub3, 4);
+}
+
+__host__ __device__ inline void compute_quad_corner_volumes_exact_subpolygon(
+    const double r00,
+    const double z00,
+    const double r10,
+    const double z10,
+    const double r11,
+    const double z11,
+    const double r01,
+    const double z01,
+    double* v_corner) {
+  compute_quad_corner_signed_volumes_exact_subpolygon(
+      r00, z00, r10, z10, r11, z11, r01, z01, v_corner);
+  v_corner[0] = fabs(v_corner[0]);
+  v_corner[1] = fabs(v_corner[1]);
+  v_corner[2] = fabs(v_corner[2]);
+  v_corner[3] = fabs(v_corner[3]);
+}
+
+// True when the quad's corner-mass partition is exact (no clamping):
+// all four subpolygon areas used by
+// compute_quad_corner_masses_partitioned_subpolygon /
+// _exact_subpolygon are non-negative within a relative roundoff band for this
+// geometry after normalizing by the quad's node-order orientation.
+__host__ __device__ inline bool quad_corner_mass_partition_exact(
+    const double r00,
+    const double z00,
+    const double r10,
+    const double z10,
+    const double r11,
+    const double z11,
+    const double r01,
+    const double z01) {
+  double v_corner[4] = {0.0, 0.0, 0.0, 0.0};
+  compute_quad_corner_signed_volumes_exact_subpolygon(
+      r00, z00, r10, z10, r11, z11, r01, z01, v_corner);
+  constexpr double eps_rel = 1.0e-12;
+  const double scale =
+      fmax(fmax(fabs(v_corner[0]), fabs(v_corner[1])),
+           fmax(fabs(v_corner[2]), fabs(v_corner[3])));
+  const double tolerance = eps_rel * scale;
+  // Tolerates structural zeros at the axis and FP flicker; a genuinely
+  // inverting partition is far beyond this band.
+  const bool all_positive =
+      v_corner[0] > -tolerance && v_corner[1] > -tolerance &&
+      v_corner[2] > -tolerance && v_corner[3] > -tolerance;
+  const bool all_negative =
+      v_corner[0] < tolerance && v_corner[1] < tolerance &&
+      v_corner[2] < tolerance && v_corner[3] < tolerance;
+  return all_positive || all_negative;
 }
 
 __host__ __device__ inline void compute_quad_corner_pressure_force_subpolygon(
@@ -819,6 +913,53 @@ __host__ __device__ inline void compute_triangle_corner_masses_exact(
   m_corner[3] = 0.0;
 }
 
+__host__ __device__ inline void
+compute_triangle_corner_volumes_equal_planar_area(
+    const double r0,
+    const double z0,
+    const double r1,
+    const double z1,
+    const double r2,
+    const double z2,
+    double* v_corner) {
+  constexpr double pi_over_three =
+      1.0471975511965977461542144610931676280657231331250352736615;
+  const double area2 =
+      fabs((r1 - r0) * (z2 - z0) - (z1 - z0) * (r2 - r0));
+  v_corner[0] = pi_over_three * r0 * area2;
+  v_corner[1] = pi_over_three * r1 * area2;
+  v_corner[2] = pi_over_three * r2 * area2;
+  v_corner[3] = 0.0;
+}
+
+__host__ __device__ inline void
+compute_triangle_corner_masses_equal_planar_area(
+    const double m_cell,
+    const double r0,
+    const double z0,
+    const double r1,
+    const double z1,
+    const double r2,
+    const double z2,
+    double* m_corner) {
+  double v_corner[4] = {0.0, 0.0, 0.0, 0.0};
+  compute_triangle_corner_volumes_equal_planar_area(
+      r0, z0, r1, z1, r2, z2, v_corner);
+  const double v_sum = v_corner[0] + v_corner[1] + v_corner[2];
+  if (!(v_sum > 0.0) || !finite_double(v_sum)) {
+    const double m_third = m_cell / 3.0;
+    m_corner[0] = m_third;
+    m_corner[1] = m_third;
+    m_corner[2] = m_third;
+    m_corner[3] = 0.0;
+    return;
+  }
+  m_corner[0] = m_cell * (v_corner[0] / v_sum);
+  m_corner[1] = m_cell * (v_corner[1] / v_sum);
+  m_corner[2] = m_cell * (v_corner[2] / v_sum);
+  m_corner[3] = 0.0;
+}
+
 __host__ __device__ inline void compute_rz_corner_masses_from_nodes(
     const int c,
     const int nz,
@@ -888,15 +1029,36 @@ __host__ __device__ inline void compute_rz_corner_masses_for_cell(
     const double* x_r,
     const double* x_z,
     const std::uint8_t* cell_nverts,
+    const bool aw_compatible_force_work,
     double* corner_mass,
     const int corner_stride,
     CornerMassFallbackProbe* probe = nullptr,
     const int corner_mass_convention =
         kCornerMassConventionBbswRadialV0) {
   double m_corner[4] = {0.0, 0.0, 0.0, 0.0};
-  compute_rz_corner_masses_from_nodes(
-      c, nz, m_cell, x_r, x_z, cell_nverts, m_corner, probe,
-      corner_mass_convention);
+  if (aw_compatible_force_work &&
+      tenryu::mesh::mesh_topo_cell_active_nverts(cell_nverts, c) != 3) {
+    const int i = c / nz;
+    const int j = c - i * nz;
+    const int n00 = node_index(i, j, nz);
+    const int n10 = node_index(i + 1, j, nz);
+    const int n11 = node_index(i + 1, j + 1, nz);
+    const int n01 = node_index(i, j + 1, nz);
+    compute_quad_corner_masses_partitioned_subpolygon(m_cell,
+                                                      x_r[n00],
+                                                      x_z[n00],
+                                                      x_r[n10],
+                                                      x_z[n10],
+                                                      x_r[n11],
+                                                      x_z[n11],
+                                                      x_r[n01],
+                                                      x_z[n01],
+                                                      m_corner);
+  } else {
+    compute_rz_corner_masses_from_nodes(
+        c, nz, m_cell, x_r, x_z, cell_nverts, m_corner, probe,
+        corner_mass_convention);
+  }
   corner_mass[c * corner_stride + 0] = m_corner[0];
   corner_mass[c * corner_stride + 1] = m_corner[1];
   corner_mass[c * corner_stride + 2] = m_corner[2];
@@ -908,22 +1070,17 @@ __host__ __device__ inline void compute_rz_corner_masses_for_cell(
     const int nz,
     const double m_cell,
     const double* x_r,
+    const double* x_z,
+    const std::uint8_t* cell_nverts,
     double* corner_mass,
     const int corner_stride,
-    CornerMassFallbackProbe* probe = nullptr) {
-  const int i = c / nz;
-  const int j = c - i * nz;
-  const int n00 = node_index(i, j, nz);
-  const int n10 = node_index(i + 1, j, nz);
-  const int n11 = node_index(i + 1, j + 1, nz);
-  const int n01 = node_index(i, j + 1, nz);
-  double m_corner[4] = {0.0, 0.0, 0.0, 0.0};
-  compute_quad_corner_masses_bbsw(
-      m_cell, x_r[n00], x_r[n10], x_r[n11], x_r[n01], m_corner, probe);
-  corner_mass[c * corner_stride + 0] = m_corner[0];
-  corner_mass[c * corner_stride + 1] = m_corner[1];
-  corner_mass[c * corner_stride + 2] = m_corner[2];
-  corner_mass[c * corner_stride + 3] = m_corner[3];
+    CornerMassFallbackProbe* probe = nullptr,
+    const int corner_mass_convention =
+        kCornerMassConventionBbswRadialV0) {
+  compute_rz_corner_masses_for_cell(
+      c, nz, m_cell, x_r, x_z, cell_nverts,
+      /*aw_compatible_force_work=*/false, corner_mass, corner_stride, probe,
+      corner_mass_convention);
 }
 
 }  // namespace tenryu::hydro::rz

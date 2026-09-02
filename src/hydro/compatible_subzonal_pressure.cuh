@@ -2,6 +2,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <vector>
 
 #include "core/config.hpp"
 #include "core/state.hpp"
@@ -15,7 +16,28 @@
 
 namespace tenryu::hydro {
 
+struct SubzonalPressureDtArgmin {
+  int cell_id = -1;
+  double dt = 0.0;
+};
+
 struct HydroEOSContext;
+
+struct SubzonalPressureProjectionDebugBuffers {
+  // Pair fields use [2 * cell + {inner, outer}].
+  double* rho_axis_raw = nullptr;
+  double* rho_partner_raw = nullptr;
+  double* rho_projected = nullptr;
+  double* merit = nullptr;
+  double* x_merit = nullptr;
+};
+
+struct SubzonalPressureShadowReplay {
+  std::vector<double> axis_source_force_r;
+  std::vector<double> axis_source_force_z;
+  std::vector<double> offaxis_source_force_r;
+  std::vector<double> offaxis_source_force_z;
+};
 
 enum class SubzonalMeritMode : int {
   CaramanaAuto = 0,
@@ -77,7 +99,8 @@ __host__ __device__ inline void compatible_subzonal_pressure_work_split_fraction
 double compute_compatible_subzonal_pressure_dt_2d(
     const core::State& state,
     const core::Config& cfg,
-    const std::int8_t* d_hydro_active);
+    const std::int8_t* d_hydro_active,
+    SubzonalPressureDtArgmin* argmin = nullptr);
 
 void update_compatible_subzonal_pressure_observability_2d(
     core::State& state,
@@ -87,6 +110,18 @@ void compute_compatible_subzonal_pressure_force_2d(
     core::State& state,
     const core::Config& cfg,
     const HydroEOSContext* eos_ctx,
-    const std::int8_t* d_hydro_active);
+    const std::int8_t* d_hydro_active,
+    bool aw_axis_slave_theta0_active = false,
+    bool aw_axis_slave_theta_pi_active = false,
+    const SubzonalPressureProjectionDebugBuffers* projection_debug = nullptr);
+
+SubzonalPressureShadowReplay
+compute_compatible_subzonal_pressure_shadow_replay_2d(
+    core::State& state,
+    const core::Config& cfg,
+    const HydroEOSContext* eos_ctx,
+    const std::int8_t* d_hydro_active,
+    bool aw_axis_slave_theta0_active,
+    bool aw_axis_slave_theta_pi_active);
 
 }  // namespace tenryu::hydro

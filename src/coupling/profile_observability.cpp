@@ -11,6 +11,7 @@
 
 #include "core/config_validate.hpp"
 #include "core/state.hpp"
+#include "mesh/candidate_mesh_admissibility.hpp"
 #include "parallel/reduction.hpp"
 
 namespace tenryu::core {
@@ -245,15 +246,83 @@ std::uint64_t saturating_add_u64(const std::uint64_t lhs,
 
 }  // namespace
 
+CsrMeshQualityMinSample sample_csr_mesh_quality_min(
+    const int* cell_node_csr_offsets,
+    const int* cell_node_csr_indices,
+    const std::uint8_t* cell_nverts,
+    const int* cell_orientation_sign,
+    const int n_cells,
+    const int n_nodes,
+    const double* node_r_reference,
+    const double* node_z_reference,
+    const double* node_r_current,
+    const double* node_z_current) {
+  CsrMeshQualityMinSample sample;
+  sample.sampled = n_cells > 0;
+  for (int c = 0; c < n_cells; ++c) {
+    const int n = static_cast<int>(cell_nverts[c]);
+    if (n < 3 || n > mesh::kMeshTopoCellStorageSlotsMaxGeneral) {
+      continue;
+    }
+    const int off = cell_node_csr_offsets[c];
+    TENRYU_ASSERT(cell_node_csr_offsets[c + 1] - off >= n,
+                  "csr row shorter than cell_nverts");
+
+    double r0[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {};
+    double z0[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {};
+    double r1[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {};
+    double z1[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {};
+    for (int k = 0; k < n; ++k) {
+      const int node = cell_node_csr_indices[off + k];
+      TENRYU_ASSERT(node >= 0 && node < n_nodes,
+                    "csr node id out of range");
+      r0[k] = node_r_reference[node];
+      z0[k] = node_z_reference[node];
+      r1[k] = node_r_current[node];
+      z1[k] = node_z_current[node];
+    }
+    const double s = static_cast<double>(cell_orientation_sign[c]);
+
+    double j0[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {};
+    double j1[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {};
+    mesh::host_polygon_corner_jacobians(r0, z0, n, j0);
+    mesh::host_polygon_corner_jacobians(r1, z1, n, j1);
+    for (int k = 0; k < n; ++k) {
+      accumulate_finite_min(signed_ratio(s * j1[k], s * j0[k]),
+                            sample.min_corner_j_rel,
+                            sample.corner_observed);
+    }
+
+    const double v0 = s * mesh::host_rz_polygon_volume_exact(r0, z0, n);
+    const double v1 = s * mesh::host_rz_polygon_volume_exact(r1, z1, n);
+    accumulate_finite_min(signed_ratio(v1, v0),
+                          sample.min_rz_volume_rel,
+                          sample.volume_observed);
+    if (!std::isfinite(v1) || v1 <= 0.0) {
+      ++sample.negative_rz_volume_count;
+    }
+
+    double e0 = std::numeric_limits<double>::infinity();
+    double e1 = std::numeric_limits<double>::infinity();
+    for (int k = 0; k < n; ++k) {
+      const int kp = (k + 1) % n;
+      const double dr0 = r0[kp] - r0[k];
+      const double dz0 = z0[kp] - z0[k];
+      const double dr1 = r1[kp] - r1[k];
+      const double dz1 = z1[kp] - z1[k];
+      e0 = std::min(e0, std::sqrt(dr0 * dr0 + dz0 * dz0));
+      e1 = std::min(e1, std::sqrt(dr1 * dr1 + dz1 * dz1));
+    }
+    accumulate_finite_min(signed_ratio(e1, e0),
+                          sample.min_edge_length_rel,
+                          sample.edge_length_observed);
+  }
+  return sample;
+}
+
 void ProfileObservability::note_committed_mesh_quality_min(
     const tenryu::core::State& state,
     const tenryu::parallel::Reduction* reduction) {
-  if (state.corner_stride != 4) {
-    tenryu::core::log_warning(
-        "pentagon-belt: mesh-quality-min diagnostic is staged (quad accessor); "
-        "skipped");
-    return;
-  }
   const int nr = state.mesh.topo.nr;
   const int nz = state.mesh.topo.nz;
   const bool multiblock_topology = state.mesh.topo.multiblock.has_value();
@@ -268,6 +337,7 @@ void ProfileObservability::note_committed_mesh_quality_min(
       state.x_r_initial.size() == expected_nodes &&
       state.x_z_initial.size() == expected_nodes;
 
+  bool quad_metrics_expected = true;
   double local_min_corner = std::numeric_limits<double>::infinity();
   double local_min_gauss = std::numeric_limits<double>::infinity();
   double local_min_volume = std::numeric_limits<double>::infinity();
@@ -283,7 +353,33 @@ void ProfileObservability::note_committed_mesh_quality_min(
   bool local_sampled = false;
   std::uint64_t local_negative_volume_count = 0;
 
-  if (fields_available) {
+  if (state.corner_stride != 4) {
+    const bool csr_general_available =
+        state.mesh.dim == 2 && state.mesh.topo.multiblock.has_value() &&
+        state.mesh.topo.n_cells > 0 && state.mesh.topo.n_nodes > 0 &&
+        static_cast<int>(state.cell_nverts_host.size()) ==
+            state.mesh.topo.n_cells &&
+        state.x_r.size() ==
+            static_cast<std::size_t>(state.mesh.topo.n_nodes) &&
+        state.x_z.size() == state.x_r.size() &&
+        state.x_r_initial.size() == state.x_r.size() &&
+        state.x_z_initial.size() == state.x_r.size() &&
+        state.mesh.topo.multiblock->cell_node_csr_offsets.size() ==
+            static_cast<std::size_t>(state.mesh.topo.n_cells) + 1U &&
+        state.mesh.topo.multiblock->cell_orientation_sign.size() ==
+            static_cast<std::size_t>(state.mesh.topo.n_cells);
+    if (!csr_general_available) {
+      static bool warned = false;
+      if (!warned) {
+        tenryu::core::log_warning(
+            "mesh-quality-min: unsupported topology for corner_stride != 4 "
+            "(no CSR multiblock view); skipped");
+        warned = true;
+      }
+      return;
+    }
+
+    quad_metrics_expected = false;
     std::vector<double> r_current;
     std::vector<double> z_current;
     std::vector<double> r_initial;
@@ -293,101 +389,35 @@ void ProfileObservability::note_committed_mesh_quality_min(
     state.x_r_initial.copy_to_host(r_initial);
     state.x_z_initial.copy_to_host(z_initial);
 
-    local_sampled = true;
-    const double gauss_xi[4] = {-kGauss, kGauss, kGauss, -kGauss};
-    const double gauss_eta[4] = {-kGauss, -kGauss, kGauss, kGauss};
-    const int stride = nz + 1;
-    for (int i = 0; i < nr; ++i) {
-      for (int j = 0; j < nz; ++j) {
-        const int nodes[4] = {
-            i * stride + j,
-            (i + 1) * stride + j,
-            (i + 1) * stride + (j + 1),
-            i * stride + (j + 1),
-        };
-        std::array<double, 4> r0{};
-        std::array<double, 4> z0{};
-        std::array<double, 4> r1{};
-        std::array<double, 4> z1{};
-        for (int k = 0; k < 4; ++k) {
-          const auto n = static_cast<std::size_t>(nodes[k]);
-          r0[static_cast<std::size_t>(k)] = r_initial[n];
-          z0[static_cast<std::size_t>(k)] = z_initial[n];
-          r1[static_cast<std::size_t>(k)] = r_current[n];
-          z1[static_cast<std::size_t>(k)] = z_current[n];
-        }
-
-        for (int corner = 0; corner < 4; ++corner) {
-          const double j0 = corner_jacobian_from_quad(r0, z0, corner);
-          const double j1 = corner_jacobian_from_quad(r1, z1, corner);
-          accumulate_finite_min(signed_ratio(j1, j0),
-                                local_min_corner,
-                                corner_observed);
-        }
-
-        for (int q = 0; q < 4; ++q) {
-          const double j0 =
-              gauss_jacobian_from_quad(r0, z0, gauss_xi[q], gauss_eta[q]);
-          const double j1 =
-              gauss_jacobian_from_quad(r1, z1, gauss_xi[q], gauss_eta[q]);
-          accumulate_finite_min(signed_ratio(j1, j0),
-                                local_min_gauss,
-                                gauss_observed);
-
-          double dr_dxi = 0.0;
-          double dz_dxi = 0.0;
-          double dr_deta = 0.0;
-          double dz_deta = 0.0;
-          gauss_jacobian_matrix_from_quad(r1,
-                                          z1,
-                                          gauss_xi[q],
-                                          gauss_eta[q],
-                                          dr_dxi,
-                                          dz_dxi,
-                                          dr_deta,
-                                          dz_deta);
-          accumulate_non_nan_max(
-              condition_number_2x2(dr_dxi, dr_deta, dz_dxi, dz_deta),
-              local_max_condition,
-              condition_observed);
-        }
-
-        const double v0 = rz_quad_volume_exact(r0, z0);
-        const double v1 = rz_quad_volume_exact(r1, z1);
-        accumulate_finite_min(signed_ratio(v1, v0),
-                              local_min_volume,
-                              volume_observed);
-        accumulate_finite_min(
-            signed_ratio(min_edge_length_from_quad(r1, z1),
-                         min_edge_length_from_quad(r0, z0)),
-            local_min_edge_length,
-            edge_length_observed);
-        accumulate_finite_min(
-            signed_ratio(min_altitude_from_quad(r1, z1),
-                         min_altitude_from_quad(r0, z0)),
-            local_min_altitude,
-            altitude_observed);
-        if (!std::isfinite(v1) || v1 <= 0.0) {
-          ++local_negative_volume_count;
-        }
-      }
+    const int n_cells = state.mesh.topo.n_cells;
+    std::vector<std::uint8_t> nverts_u8(static_cast<std::size_t>(n_cells));
+    for (int c = 0; c < n_cells; ++c) {
+      const int n = static_cast<int>(
+          state.cell_nverts_host[static_cast<std::size_t>(c)]);
+      nverts_u8[static_cast<std::size_t>(c)] =
+          n >= 3 && n <= 16 ? static_cast<std::uint8_t>(n) : 0U;
     }
-  } else if (multiblock_topology) {
-    const int n_cells_total = state.mesh.topo.n_cells;
-    const std::size_t expected_multiblock_nodes =
-        state.mesh.topo.n_nodes > 0
-            ? static_cast<std::size_t>(state.mesh.topo.n_nodes)
-            : 0U;
-    const auto& multiblock = *state.mesh.topo.multiblock;
-    const bool multiblock_fields_available =
-        state.mesh.dim == 2 && n_cells_total > 0 &&
-        state.x_r.size() == expected_multiblock_nodes &&
-        state.x_z.size() == expected_multiblock_nodes &&
-        state.x_r_initial.size() == expected_multiblock_nodes &&
-        state.x_z_initial.size() == expected_multiblock_nodes &&
-        multiblock.cell_orientation_sign.size() ==
-            static_cast<std::size_t>(n_cells_total);
-    if (multiblock_fields_available) {
+    const auto sample = sample_csr_mesh_quality_min(
+        state.mesh.topo.multiblock->cell_node_csr_offsets.data(),
+        state.mesh.topo.multiblock->cell_node_csr_indices.data(),
+        nverts_u8.data(),
+        state.mesh.topo.multiblock->cell_orientation_sign.data(),
+        state.mesh.topo.n_cells,
+        state.mesh.topo.n_nodes,
+        r_initial.data(),
+        z_initial.data(),
+        r_current.data(),
+        z_current.data());
+    local_sampled = sample.sampled;
+    local_min_corner = sample.min_corner_j_rel;
+    corner_observed = sample.corner_observed;
+    local_min_volume = sample.min_rz_volume_rel;
+    volume_observed = sample.volume_observed;
+    local_min_edge_length = sample.min_edge_length_rel;
+    edge_length_observed = sample.edge_length_observed;
+    local_negative_volume_count = sample.negative_rz_volume_count;
+  } else {
+    if (fields_available) {
       std::vector<double> r_current;
       std::vector<double> z_current;
       std::vector<double> r_initial;
@@ -400,83 +430,188 @@ void ProfileObservability::note_committed_mesh_quality_min(
       local_sampled = true;
       const double gauss_xi[4] = {-kGauss, kGauss, kGauss, -kGauss};
       const double gauss_eta[4] = {-kGauss, -kGauss, kGauss, kGauss};
-      tenryu::core::Config::MeshConfig multiblock_mesh_cfg;
-      multiblock_mesh_cfg.topology_scheme =
-          tenryu::core::TopologyScheme::MULTIBLOCK_CART_CORE_POLAR_SHELL;
-      for (int c = 0; c < n_cells_total; ++c) {
-        const auto nodes = tenryu::mesh::mesh_topo_cell_corner_nodes(
-            state.mesh.topo, c, multiblock_mesh_cfg);
-        const double orientation_sign = static_cast<double>(
-            multiblock.cell_orientation_sign[static_cast<std::size_t>(c)]);
-        std::array<double, 4> r0{};
-        std::array<double, 4> z0{};
-        std::array<double, 4> r1{};
-        std::array<double, 4> z1{};
-        for (int k = 0; k < 4; ++k) {
-          const auto n =
-              static_cast<std::size_t>(nodes[static_cast<std::size_t>(k)]);
-          r0[static_cast<std::size_t>(k)] = r_initial[n];
-          z0[static_cast<std::size_t>(k)] = z_initial[n];
-          r1[static_cast<std::size_t>(k)] = r_current[n];
-          z1[static_cast<std::size_t>(k)] = z_current[n];
+      const int stride = nz + 1;
+      for (int i = 0; i < nr; ++i) {
+        for (int j = 0; j < nz; ++j) {
+          const int nodes[4] = {
+              i * stride + j,
+              (i + 1) * stride + j,
+              (i + 1) * stride + (j + 1),
+              i * stride + (j + 1),
+          };
+          std::array<double, 4> r0{};
+          std::array<double, 4> z0{};
+          std::array<double, 4> r1{};
+          std::array<double, 4> z1{};
+          for (int k = 0; k < 4; ++k) {
+            const auto n = static_cast<std::size_t>(nodes[k]);
+            r0[static_cast<std::size_t>(k)] = r_initial[n];
+            z0[static_cast<std::size_t>(k)] = z_initial[n];
+            r1[static_cast<std::size_t>(k)] = r_current[n];
+            z1[static_cast<std::size_t>(k)] = z_current[n];
+          }
+
+          for (int corner = 0; corner < 4; ++corner) {
+            const double j0 = corner_jacobian_from_quad(r0, z0, corner);
+            const double j1 = corner_jacobian_from_quad(r1, z1, corner);
+            accumulate_finite_min(signed_ratio(j1, j0),
+                                  local_min_corner,
+                                  corner_observed);
+          }
+
+          for (int q = 0; q < 4; ++q) {
+            const double j0 =
+                gauss_jacobian_from_quad(r0, z0, gauss_xi[q], gauss_eta[q]);
+            const double j1 =
+                gauss_jacobian_from_quad(r1, z1, gauss_xi[q], gauss_eta[q]);
+            accumulate_finite_min(signed_ratio(j1, j0),
+                                  local_min_gauss,
+                                  gauss_observed);
+
+            double dr_dxi = 0.0;
+            double dz_dxi = 0.0;
+            double dr_deta = 0.0;
+            double dz_deta = 0.0;
+            gauss_jacobian_matrix_from_quad(r1,
+                                            z1,
+                                            gauss_xi[q],
+                                            gauss_eta[q],
+                                            dr_dxi,
+                                            dz_dxi,
+                                            dr_deta,
+                                            dz_deta);
+            accumulate_non_nan_max(
+                condition_number_2x2(dr_dxi, dr_deta, dz_dxi, dz_deta),
+                local_max_condition,
+                condition_observed);
+          }
+
+          const double v0 = rz_quad_volume_exact(r0, z0);
+          const double v1 = rz_quad_volume_exact(r1, z1);
+          accumulate_finite_min(signed_ratio(v1, v0),
+                                local_min_volume,
+                                volume_observed);
+          accumulate_finite_min(
+              signed_ratio(min_edge_length_from_quad(r1, z1),
+                           min_edge_length_from_quad(r0, z0)),
+              local_min_edge_length,
+              edge_length_observed);
+          accumulate_finite_min(
+              signed_ratio(min_altitude_from_quad(r1, z1),
+                           min_altitude_from_quad(r0, z0)),
+              local_min_altitude,
+              altitude_observed);
+          if (!std::isfinite(v1) || v1 <= 0.0) {
+            ++local_negative_volume_count;
+          }
         }
+      }
+    } else if (multiblock_topology) {
+      const int n_cells_total = state.mesh.topo.n_cells;
+      const std::size_t expected_multiblock_nodes =
+          state.mesh.topo.n_nodes > 0
+              ? static_cast<std::size_t>(state.mesh.topo.n_nodes)
+              : 0U;
+      const auto& multiblock = *state.mesh.topo.multiblock;
+      const bool multiblock_fields_available =
+          state.mesh.dim == 2 && n_cells_total > 0 &&
+          state.x_r.size() == expected_multiblock_nodes &&
+          state.x_z.size() == expected_multiblock_nodes &&
+          state.x_r_initial.size() == expected_multiblock_nodes &&
+          state.x_z_initial.size() == expected_multiblock_nodes &&
+          multiblock.cell_orientation_sign.size() ==
+              static_cast<std::size_t>(n_cells_total);
+      if (multiblock_fields_available) {
+        std::vector<double> r_current;
+        std::vector<double> z_current;
+        std::vector<double> r_initial;
+        std::vector<double> z_initial;
+        state.x_r.copy_to_host(r_current);
+        state.x_z.copy_to_host(z_current);
+        state.x_r_initial.copy_to_host(r_initial);
+        state.x_z_initial.copy_to_host(z_initial);
 
-        for (int corner = 0; corner < 4; ++corner) {
-          const double j0 =
-              orientation_sign * corner_jacobian_from_quad(r0, z0, corner);
-          const double j1 =
-              orientation_sign * corner_jacobian_from_quad(r1, z1, corner);
-          accumulate_finite_min(signed_ratio(j1, j0),
-                                local_min_corner,
-                                corner_observed);
-        }
+        local_sampled = true;
+        const double gauss_xi[4] = {-kGauss, kGauss, kGauss, -kGauss};
+        const double gauss_eta[4] = {-kGauss, -kGauss, kGauss, kGauss};
+        tenryu::core::Config::MeshConfig multiblock_mesh_cfg;
+        multiblock_mesh_cfg.topology_scheme =
+            tenryu::core::TopologyScheme::MULTIBLOCK_CART_CORE_POLAR_SHELL;
+        for (int c = 0; c < n_cells_total; ++c) {
+          const auto nodes = tenryu::mesh::mesh_topo_cell_corner_nodes(
+              state.mesh.topo, c, multiblock_mesh_cfg);
+          const double orientation_sign = static_cast<double>(
+              multiblock.cell_orientation_sign[static_cast<std::size_t>(c)]);
+          std::array<double, 4> r0{};
+          std::array<double, 4> z0{};
+          std::array<double, 4> r1{};
+          std::array<double, 4> z1{};
+          for (int k = 0; k < 4; ++k) {
+            const auto n =
+                static_cast<std::size_t>(nodes[static_cast<std::size_t>(k)]);
+            r0[static_cast<std::size_t>(k)] = r_initial[n];
+            z0[static_cast<std::size_t>(k)] = z_initial[n];
+            r1[static_cast<std::size_t>(k)] = r_current[n];
+            z1[static_cast<std::size_t>(k)] = z_current[n];
+          }
 
-        for (int q = 0; q < 4; ++q) {
-          const double j0 =
-              orientation_sign *
-              gauss_jacobian_from_quad(r0, z0, gauss_xi[q], gauss_eta[q]);
-          const double j1 =
-              orientation_sign *
-              gauss_jacobian_from_quad(r1, z1, gauss_xi[q], gauss_eta[q]);
-          accumulate_finite_min(signed_ratio(j1, j0),
-                                local_min_gauss,
-                                gauss_observed);
+          for (int corner = 0; corner < 4; ++corner) {
+            const double j0 =
+                orientation_sign * corner_jacobian_from_quad(r0, z0, corner);
+            const double j1 =
+                orientation_sign * corner_jacobian_from_quad(r1, z1, corner);
+            accumulate_finite_min(signed_ratio(j1, j0),
+                                  local_min_corner,
+                                  corner_observed);
+          }
 
-          double dr_dxi = 0.0;
-          double dz_dxi = 0.0;
-          double dr_deta = 0.0;
-          double dz_deta = 0.0;
-          gauss_jacobian_matrix_from_quad(r1,
-                                          z1,
-                                          gauss_xi[q],
-                                          gauss_eta[q],
-                                          dr_dxi,
-                                          dz_dxi,
-                                          dr_deta,
-                                          dz_deta);
-          accumulate_non_nan_max(
-              condition_number_2x2(dr_dxi, dr_deta, dz_dxi, dz_deta),
-              local_max_condition,
-              condition_observed);
-        }
+          for (int q = 0; q < 4; ++q) {
+            const double j0 =
+                orientation_sign *
+                gauss_jacobian_from_quad(r0, z0, gauss_xi[q], gauss_eta[q]);
+            const double j1 =
+                orientation_sign *
+                gauss_jacobian_from_quad(r1, z1, gauss_xi[q], gauss_eta[q]);
+            accumulate_finite_min(signed_ratio(j1, j0),
+                                  local_min_gauss,
+                                  gauss_observed);
 
-        const double v0 = orientation_sign * rz_quad_volume_exact(r0, z0);
-        const double v1 = orientation_sign * rz_quad_volume_exact(r1, z1);
-        accumulate_finite_min(signed_ratio(v1, v0),
-                              local_min_volume,
-                              volume_observed);
-        accumulate_finite_min(
-            signed_ratio(min_edge_length_from_quad(r1, z1),
-                         min_edge_length_from_quad(r0, z0)),
-            local_min_edge_length,
-            edge_length_observed);
-        accumulate_finite_min(
-            signed_ratio(min_altitude_from_quad(r1, z1),
-                         min_altitude_from_quad(r0, z0)),
-            local_min_altitude,
-            altitude_observed);
-        if (!std::isfinite(v1) || v1 <= 0.0) {
-          ++local_negative_volume_count;
+            double dr_dxi = 0.0;
+            double dz_dxi = 0.0;
+            double dr_deta = 0.0;
+            double dz_deta = 0.0;
+            gauss_jacobian_matrix_from_quad(r1,
+                                            z1,
+                                            gauss_xi[q],
+                                            gauss_eta[q],
+                                            dr_dxi,
+                                            dz_dxi,
+                                            dr_deta,
+                                            dz_deta);
+            accumulate_non_nan_max(
+                condition_number_2x2(dr_dxi, dr_deta, dz_dxi, dz_deta),
+                local_max_condition,
+                condition_observed);
+          }
+
+          const double v0 = orientation_sign * rz_quad_volume_exact(r0, z0);
+          const double v1 = orientation_sign * rz_quad_volume_exact(r1, z1);
+          accumulate_finite_min(signed_ratio(v1, v0),
+                                local_min_volume,
+                                volume_observed);
+          accumulate_finite_min(
+              signed_ratio(min_edge_length_from_quad(r1, z1),
+                           min_edge_length_from_quad(r0, z0)),
+              local_min_edge_length,
+              edge_length_observed);
+          accumulate_finite_min(
+              signed_ratio(min_altitude_from_quad(r1, z1),
+                           min_altitude_from_quad(r0, z0)),
+              local_min_altitude,
+              altitude_observed);
+          if (!std::isfinite(v1) || v1 <= 0.0) {
+            ++local_negative_volume_count;
+          }
         }
       }
     }
@@ -485,7 +620,7 @@ void ProfileObservability::note_committed_mesh_quality_min(
   if (local_sampled && !corner_observed) {
     local_min_corner = -std::numeric_limits<double>::infinity();
   }
-  if (local_sampled && !gauss_observed) {
+  if (quad_metrics_expected && local_sampled && !gauss_observed) {
     local_min_gauss = -std::numeric_limits<double>::infinity();
   }
   if (local_sampled && !volume_observed) {
@@ -494,10 +629,10 @@ void ProfileObservability::note_committed_mesh_quality_min(
   if (local_sampled && !edge_length_observed) {
     local_min_edge_length = -std::numeric_limits<double>::infinity();
   }
-  if (local_sampled && !altitude_observed) {
+  if (quad_metrics_expected && local_sampled && !altitude_observed) {
     local_min_altitude = -std::numeric_limits<double>::infinity();
   }
-  if (local_sampled && !condition_observed) {
+  if (quad_metrics_expected && local_sampled && !condition_observed) {
     local_max_condition = std::numeric_limits<double>::infinity();
   }
 

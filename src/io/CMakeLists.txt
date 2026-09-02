@@ -9,6 +9,7 @@ target_include_directories(tenryu_io PUBLIC ${PROJECT_SOURCE_DIR}/src)
 target_link_libraries(tenryu_io PUBLIC
   tenryu_core
   tenryu_diagnostics
+  tenryu_hydro
   tenryu_parallel
 )
 

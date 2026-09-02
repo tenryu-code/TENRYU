@@ -26,6 +26,8 @@ class FakeBackend implements Backend {
   writeCalls: Array<{ path: string; content: string }> = [];
   repoRootStdout = "";
   localTextFile: { name: string; path: string | null; content: string } | null = null;
+  localExecLog: string[][] = [];
+  localTextFiles: Record<string, string> = {};
 
   async listProfiles() {
     return this.profiles;
@@ -50,6 +52,18 @@ class FakeBackend implements Backend {
   }
   async readBinary(): Promise<Uint8Array> {
     return new Uint8Array();
+  }
+  async execLocal(argv: string[]): Promise<ExecResult> {
+    this.localExecLog.push(argv);
+    return { code: 0, stdout: "", stderr: "", timedOut: false };
+  }
+  async readLocalText(path: string): Promise<string> {
+    const c = this.localTextFiles[path];
+    if (c === undefined) throw new Error(`fake readLocalText: no file ${path}`);
+    return c;
+  }
+  async writeLocalText(path: string, content: string): Promise<void> {
+    this.localTextFiles[path] = content;
   }
   async exec(_profile: ServerProfile, argv: string[]): Promise<ExecResult> {
     this.execs.push(argv);

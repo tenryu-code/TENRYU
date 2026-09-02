@@ -2,6 +2,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <limits>
 
 #ifndef __host__
 #define __host__
@@ -16,7 +17,8 @@
 
 namespace tenryu::hydro::compatible {
 
-inline constexpr int kCsw98MaxSideVecs = 8;
+inline constexpr int kCsw98MaxSideVecs =
+    mesh::kMeshTopoCellStorageSlotsMaxGeneral;
 
 // --- csw_edge_csw98 median-mesh geometry (CSW98 Eq. 16; I1-B Stage-G W1) ---
 // For a cell side traversed p_a -> p_b (the caller's canonical edge
@@ -165,12 +167,28 @@ __host__ __device__ inline void csw98_rz_corner_gradients(
   }
 }
 
+__host__ __device__ inline void csw98_planar_corner_gradients(
+    const double* r,
+    const double* z,
+    const int nverts,
+    double* a_r,
+    double* a_z) {
+  const double orientation = csw98_winding_orientation(r, z, nverts);
+  for (int k = 0; k < nverts; ++k) {
+    const int km = (k + nverts - 1) % nverts;
+    const int kp = (k + 1) % nverts;
+    a_r[k] = 0.5 * orientation * (z[kp] - z[km]);
+    a_z[k] = 0.5 * orientation * (r[km] - r[kp]);
+  }
+}
+
 __host__ __device__ inline void csw98_c2_side_svecs(
     const double* r,
     const double* z,
     const int nverts,
     double* s_r,
-    double* s_z) {
+    double* s_z,
+    const bool aw_planar = false) {
   if (!(nverts >= 3 && nverts <= kCsw98MaxSideVecs)) {
   #ifdef __CUDA_ARCH__
     __trap();  // unsupported vertex count reached C2 geometry: fail loud (kernel abort -> CUDA_CHECK)
@@ -184,7 +202,11 @@ __host__ __device__ inline void csw98_c2_side_svecs(
   }
   double a_r[kCsw98MaxSideVecs];
   double a_z[kCsw98MaxSideVecs];
-  csw98_rz_corner_gradients(r, z, nverts, a_r, a_z);
+  if (aw_planar) {
+    csw98_planar_corner_gradients(r, z, nverts, a_r, a_z);
+  } else {
+    csw98_rz_corner_gradients(r, z, nverts, a_r, a_z);
+  }
   double mean_r = 0.0;
   double mean_z = 0.0;
   for (int k = 0; k < nverts; ++k) {
@@ -220,7 +242,8 @@ __host__ __device__ inline bool csw98_c2_svec_for_side(
     const int ca,
     const int cb,
     double* out_r,
-    double* out_z) {
+    double* out_z,
+    const bool aw_planar = false) {
   if (!(nverts >= 3 && nverts <= kCsw98MaxSideVecs)) {
   #ifdef __CUDA_ARCH__
     __trap();  // unsupported vertex count reached C2 geometry: fail loud (kernel abort -> CUDA_CHECK)
@@ -234,7 +257,7 @@ __host__ __device__ inline bool csw98_c2_svec_for_side(
   }
   double s_r[kCsw98MaxSideVecs];
   double s_z[kCsw98MaxSideVecs];
-  csw98_c2_side_svecs(r, z, nverts, s_r, s_z);
+  csw98_c2_side_svecs(r, z, nverts, s_r, s_z, aw_planar);
   if (cb == ((ca + 1) % nverts)) {
     *out_r = s_r[ca];
     *out_z = s_z[ca];
@@ -255,14 +278,55 @@ struct CswEdgeAvDiagnostics {
   int clipped_negative_work_count = 0;
 };
 
+struct CswEdgeAvCflArgmin {
+  double dt = std::numeric_limits<double>::infinity();
+  int edge_id = -1;
+  int cell_id = -1;
+  int node0 = -1;
+  int node1 = -1;
+  double length = 0.0;
+  double du = 0.0;
+  double coefficient = 0.0;
+  bool polar_slaving_stiffness = false;
+  int polar_slaving_node = -1;
+  double polar_slaving_lambda = 0.0;
+  double polar_slaving_sigma = 0.0;
+};
+
+struct EdgeAccelDisplacementArgmin {
+  double dt = std::numeric_limits<double>::infinity();
+  int edge_id = -1;
+  int cell_id = -1;
+  int node0 = -1;
+  int node1 = -1;
+  double length = 0.0;
+  double c_e = 0.0;
+  double a_e = 0.0;
+  double coefficient = 0.0;
+};
+
+void destroy_csw_polar_slaving_runtime();
+
 void launch_compute_csw_edge_av_2d(core::State& state,
                                    const core::Config& cfg,
                                    const core::CellField1D& cell_cs,
                                    const double* v_r,
                                    const double* v_z,
-                                   const std::int8_t* hydro_active);
+                                   const std::int8_t* hydro_active,
+                                   bool aw_axis_slave_theta0_active = false,
+                                   bool aw_axis_slave_theta_pi_active = false,
+                                   const double* node_mass = nullptr,
+                                   const double dt = 0.0);
 
 double compute_csw_edge_av_cfl_dt(const core::State& state,
-                                  const core::Config& cfg);
+                                  const core::Config& cfg,
+                                  bool aw_axis_slave_theta0_active = false,
+                                  bool aw_axis_slave_theta_pi_active = false,
+                                  CswEdgeAvCflArgmin* argmin = nullptr);
+
+double compute_edge_accel_displacement_dt(
+    const core::State& state,
+    const core::Config& cfg,
+    EdgeAccelDisplacementArgmin* argmin = nullptr);
 
 }  // namespace tenryu::hydro::compatible

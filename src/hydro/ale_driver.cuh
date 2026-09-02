@@ -13,6 +13,7 @@
 #include "hydro/ale_mode.hpp"
 #include "hydro/cap_energy_audit.hpp"
 #include "hydro/mesh_regime.hpp"
+#include "mesh/mesh_geometry_result.hpp"
 #include "parallel/partition.hpp"
 
 namespace tenryu::parallel {
@@ -54,6 +55,7 @@ enum class AleStatus {
   // cell and a central pseudo-core ring-absorption request was armed; the
   // driver must restore the full-step retry snapshot and retry the step.
   CenterPatchInadmissibleAbsorbRetry,
+  MandatoryWindowTransactionRejected,
 };
 
 struct SafeBacktrackSearchResult {
@@ -109,6 +111,25 @@ struct AleStepResult {
   // rezone was accepted.
   AleMode effective_mode_executed = AleMode::ScheduledDefault;
   AleStatus status = AleStatus::Ok;
+  int first_failing_cell = -1;
+  mesh::MeshGeometryFailureKind geometry_failure_kind =
+      mesh::MeshGeometryFailureKind::None;
+  int first_failing_corner = -1;
+  int first_failing_stable_cell = -1;
+  // Signed predicate value; volume failures carry the RZ volume here.
+  double failing_cell_area = 0.0;
+  bool fails_without_target = false;
+  static constexpr int kMaxRejectionCorners =
+      mesh::kMeshTopoCellStorageSlotsMaxGeneral;
+  // Candidate coordinates are captured with the predicate result. The driver
+  // fetches post-Lagrange coordinates from State at the terminal abort.
+  int rejection_corner_count = 0;
+  std::array<int, kMaxRejectionCorners> rejection_corner_nodes{};
+  std::array<double, kMaxRejectionCorners> rejection_corner_candidate_r{};
+  std::array<double, kMaxRejectionCorners> rejection_corner_candidate_z{};
+  double min_V = 0.0;
+  double min_J = 0.0;
+  double max_target_displacement = 0.0;
 };
 
 // Rezone closure cooldown: armed by the driver when a committed rezone's
@@ -313,6 +334,15 @@ AleStepResult apply_pole_axis_radial_order_repair(
     const parallel::Reduction* reduction = nullptr,
     const HydroEOSContext* eos_ctx = nullptr,
     double dt_hydro_used = 0.0);
+
+AleStepResult apply_maxmin_untangle_repair(
+    core::State& state,
+    const core::Config& cfg,
+    const parallel::PartitionInfo& part,
+    const parallel::Reduction* reduction,
+    const HydroEOSContext* eos_ctx,
+    double dt_hydro_used,
+    int failing_cell);
 
 ShellProtectedRezoneResult shell_protected_rezone(
     core::State& state,

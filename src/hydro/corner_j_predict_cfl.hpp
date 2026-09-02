@@ -6,12 +6,23 @@
 
 #include "core/error.hpp"
 
+#if defined(__CUDACC__)
+#define TENRYU_CJP_HOST_DEVICE __host__ __device__
+#else
+#define TENRYU_CJP_HOST_DEVICE
+#endif
+
 namespace tenryu::core {
 struct Config;
 struct State;
 }
 
 namespace tenryu::hydro {
+
+struct CornerJPredictCflArgmin {
+  double dt = std::numeric_limits<double>::infinity();
+  int cell_id = -1;
+};
 
 // For quad corner k, extrapolate node positions as x(dt) = x + dt*v and set
 //   e1 = x[k+1] - x[k],  e2 = x[k-1] - x[k],
@@ -32,14 +43,14 @@ namespace tenryu::hydro {
 
 namespace detail {
 
-inline double corner_j_predict_cross2(const double ar,
+TENRYU_CJP_HOST_DEVICE inline double corner_j_predict_cross2(const double ar,
                                       const double az,
                                       const double br,
                                       const double bz) {
   return ar * bz - az * br;
 }
 
-inline double corner_j_predict_smallest_positive_root(const double a,
+TENRYU_CJP_HOST_DEVICE inline double corner_j_predict_smallest_positive_root(const double a,
                                                       const double b,
                                                       const double c) {
   const double inf = std::numeric_limits<double>::infinity();
@@ -124,6 +135,9 @@ inline double corner_j_predict_dt_max(const double xr[4],
 }
 
 double compute_corner_j_predict_cfl_dt(const core::State& state,
-                                       const core::Config& cfg);
+                                       const core::Config& cfg,
+                                       CornerJPredictCflArgmin* argmin = nullptr);
 
 }  // namespace tenryu::hydro
+
+#undef TENRYU_CJP_HOST_DEVICE

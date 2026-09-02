@@ -1,14 +1,19 @@
 #include "drivers/cli.hpp"
 
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <iostream>
+#include <limits>
+#include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
 #include <CLI/CLI.hpp>
 
 #include "core/version.hpp"
+#include "drivers/cmd_checkpoint_swap_center.hpp"
 
 #if TENRYU_ENABLE_MPI
 #include <cuda_runtime.h>
@@ -109,6 +114,48 @@ class MpiSession {
 };
 #endif
 
+std::optional<int> parse_optional_int(const std::string& text,
+                                      const char* flag) {
+  if (text.empty()) {
+    return std::nullopt;
+  }
+  std::size_t consumed = 0;
+  long long value = 0;
+  try {
+    value = std::stoll(text, &consumed);
+  } catch (const std::exception&) {
+    throw std::invalid_argument(std::string(flag) +
+                                " requires an integer value");
+  }
+  if (consumed != text.size() ||
+      value < std::numeric_limits<int>::min() ||
+      value > std::numeric_limits<int>::max()) {
+    throw std::invalid_argument(std::string(flag) +
+                                " requires an in-range integer value");
+  }
+  return static_cast<int>(value);
+}
+
+std::optional<double> parse_optional_double(const std::string& text,
+                                            const char* flag) {
+  if (text.empty()) {
+    return std::nullopt;
+  }
+  std::size_t consumed = 0;
+  double value = 0.0;
+  try {
+    value = std::stod(text, &consumed);
+  } catch (const std::exception&) {
+    throw std::invalid_argument(std::string(flag) +
+                                " requires a floating-point value");
+  }
+  if (consumed != text.size() || !std::isfinite(value)) {
+    throw std::invalid_argument(std::string(flag) +
+                                " requires a finite floating-point value");
+  }
+  return value;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -175,6 +222,75 @@ int main(int argc, char** argv) {
       ->required();
   freeze_cmd->add_option("-o,--output", freeze_output, "Path to output JSON");
 
+  tenryu::drivers::CheckpointSwapCenterOptions swap_options;
+  std::string swap_cut_ring;
+  std::string swap_r_c;
+  std::string swap_core_cells;
+  std::string swap_bridge_layers;
+  std::string swap_max_speed;
+  std::string swap_max_mach;
+  std::string swap_max_rho_relative;
+  std::string swap_max_temperature_relative;
+  std::string swap_seam_displacement_floor_cm;
+  std::string swap_mirror_z_floor_cm;
+  std::string swap_mirror_v_floor_cm_s;
+  std::string swap_mirror_tolerance;
+  std::string swap_legendre_tolerance;
+  std::string swap_ledger_kappa;
+  std::string swap_conservation_v_floor_cm_s;
+  auto* swap_cmd = app.add_subcommand(
+      "checkpoint-swap-center",
+      "Replace a quiescent polar-tier center and write a segment-2 checkpoint");
+  swap_cmd->add_option("namelist.py", swap_options.namelist_path,
+                       "Segment-2 namelist (configuration authority)")
+      ->required();
+  swap_cmd->add_option("checkpoint-a", swap_options.input_checkpoint,
+                       "Parent polar-tier checkpoint prefix or .h5 file")
+      ->required();
+  swap_cmd->add_option("-o,--output", swap_options.output_checkpoint,
+                       "Output checkpoint B .h5 path")
+      ->required();
+  swap_cmd->add_option("--cut-ring", swap_cut_ring,
+                       "Assert the deck's polar-tier cut ring");
+  swap_cmd->add_option("--r-c", swap_r_c,
+                       "Assert the deck's Cartesian-core half-width [cm]");
+  swap_cmd->add_option("--core-cells", swap_core_cells,
+                       "Assert the derived Cartesian half-core cell count");
+  swap_cmd->add_option("--bridge-layers", swap_bridge_layers,
+                       "Assert the deck's bridge layer count");
+  swap_cmd->add_option("--max-speed", swap_max_speed,
+                       "Maximum replaced-region speed [cm/s]");
+  swap_cmd->add_option("--max-mach", swap_max_mach,
+                       "Maximum replaced-region Mach number");
+  swap_cmd->add_option("--max-rho-rel", swap_max_rho_relative,
+                       "Maximum replaced-region relative density departure");
+  swap_cmd->add_option(
+      "--max-temperature-rel",
+      swap_max_temperature_relative,
+      "Maximum replaced-region relative Te/Ti departure");
+  swap_cmd->add_option(
+      "--seam-displacement-floor-cm",
+      swap_seam_displacement_floor_cm,
+      "Maximum seam displacement from construction coordinates [cm]");
+  swap_cmd->add_option("--mirror-z-floor-cm", swap_mirror_z_floor_cm,
+                       "Absolute floor for mirror z comparisons [cm]");
+  swap_cmd->add_option("--mirror-v-floor-cm-s", swap_mirror_v_floor_cm_s,
+                       "Absolute floor for mirror velocity comparisons [cm/s]");
+  swap_cmd->add_option("--mirror-tol", swap_mirror_tolerance,
+                       "North/south mirror relative tolerance");
+  swap_cmd->add_option("--legendre-tol", swap_legendre_tolerance,
+                       "Maximum normalized Legendre moment");
+  swap_cmd->add_option("--ledger-kappa", swap_ledger_kappa,
+                       "Multiplier on gamma_d conservation bounds");
+  swap_cmd->add_option(
+      "--conservation-v-floor-cm-s",
+      swap_conservation_v_floor_cm_s,
+      "Velocity floor for momentum conservation bounds [cm/s]");
+  swap_cmd->add_flag("--dry-run", swap_options.dry_run,
+                     "Run construction and all gates without writing checkpoint B");
+  swap_cmd->add_flag("--identity-noop", swap_options.identity_noop,
+                     "Test-only byte-preserving hybrid-to-identical-hybrid copy");
+
   try {
     app.parse(argc, argv);
   } catch (const CLI::ParseError& e) {
@@ -202,6 +318,63 @@ int main(int argc, char** argv) {
   }
   if (freeze_cmd->parsed()) {
     return tenryu::drivers::cmd_freeze(freeze_input, freeze_output);
+  }
+  if (swap_cmd->parsed()) {
+    try {
+      swap_options.assert_cut_ring =
+          parse_optional_int(swap_cut_ring, "--cut-ring");
+      swap_options.assert_r_c_cm =
+          parse_optional_double(swap_r_c, "--r-c");
+      swap_options.assert_core_cells_per_half =
+          parse_optional_int(swap_core_cells, "--core-cells");
+      swap_options.assert_bridge_layers =
+          parse_optional_int(swap_bridge_layers, "--bridge-layers");
+      const auto apply_double = [](const std::string& text,
+                                   const char* flag,
+                                   double& destination) {
+        if (const auto value = parse_optional_double(text, flag)) {
+          destination = *value;
+        }
+      };
+      apply_double(swap_max_speed,
+                   "--max-speed",
+                   swap_options.thresholds.max_speed_cm_s);
+      apply_double(swap_max_mach,
+                   "--max-mach",
+                   swap_options.thresholds.max_mach);
+      apply_double(swap_max_rho_relative,
+                   "--max-rho-rel",
+                   swap_options.thresholds.max_rho_relative);
+      apply_double(swap_max_temperature_relative,
+                   "--max-temperature-rel",
+                   swap_options.thresholds.max_temperature_relative);
+      apply_double(swap_seam_displacement_floor_cm,
+                   "--seam-displacement-floor-cm",
+                   swap_options.thresholds.seam_displacement_floor_cm);
+      apply_double(swap_mirror_z_floor_cm,
+                   "--mirror-z-floor-cm",
+                   swap_options.thresholds.mirror_z_floor_cm);
+      apply_double(swap_mirror_v_floor_cm_s,
+                   "--mirror-v-floor-cm-s",
+                   swap_options.thresholds.mirror_v_floor_cm_s);
+      apply_double(swap_mirror_tolerance,
+                   "--mirror-tol",
+                   swap_options.thresholds.mirror_tolerance);
+      apply_double(swap_legendre_tolerance,
+                   "--legendre-tol",
+                   swap_options.thresholds.legendre_tolerance);
+      apply_double(swap_ledger_kappa,
+                   "--ledger-kappa",
+                   swap_options.thresholds.ledger_kappa);
+      apply_double(swap_conservation_v_floor_cm_s,
+                   "--conservation-v-floor-cm-s",
+                   swap_options.thresholds.conservation_v_floor_cm_s);
+    } catch (const std::exception& error) {
+      std::cerr << "TENRYU ERROR [checkpoint-swap-center]: " << error.what()
+                << '\n';
+      return 2;
+    }
+    return tenryu::drivers::cmd_checkpoint_swap_center(swap_options);
   }
 
   std::cout << app.help() << '\n';
