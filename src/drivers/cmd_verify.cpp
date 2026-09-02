@@ -5334,6 +5334,55 @@ bool run_2d_rz_aux_a1_ale_forced_verify() {
   return pass;
 }
 
+bool run_2d_rz_reale_freestream_verify() {
+  if (!verify_cuda_available("2d_rz_reale_freestream")) {
+    return true;
+  }
+
+  core::Config cfg;
+  auto state = load_state_from_namelist(
+      "examples/verification/2d_rz_reale_freestream.py", cfg);
+  initialize_thermo_from_temperature(state, cfg);
+  const auto energy_initial = diagnostics::compute_energy_budget_2d(state);
+
+  coupling::Driver driver;
+  driver.run(state, cfg);
+
+  const auto v_r = copy_field_to_host(state.v_r);
+  const auto v_z = copy_field_to_host(state.v_z);
+  const auto rho = copy_field_to_host(state.rho);
+  const auto energy_final = diagnostics::compute_energy_budget_2d(state);
+
+  double v_max = 0.0;
+  for (std::size_t n = 0; n < v_r.size(); ++n) {
+    v_max = std::max(v_max, std::hypot(v_r[n], v_z[n]));
+  }
+
+  double drho_max = 0.0;
+  for (const double rho_cell : rho) {
+    drho_max = std::max(drho_max, std::abs(rho_cell - 0.25) / 0.25);
+  }
+
+  const double e_drift =
+      diagnostics::relative_total_energy_error(energy_initial, energy_final);
+
+  core::log_info("[verify:2d_rz_reale_freestream] v_max=" +
+                 format_double(v_max));
+  core::log_info("[verify:2d_rz_reale_freestream] drho_max=" +
+                 format_double(drho_max));
+  core::log_info("[verify:2d_rz_reale_freestream] e_drift=" +
+                 format_double(e_drift));
+
+  const bool pass =
+      v_max <= 1.0e2 && drho_max <= 1.0e-10 && e_drift <= 1.0e-9;
+  if (!pass) {
+    core::log_error("[verify:2d_rz_reale_freestream] FAILED");
+  } else {
+    core::log_info("[verify:2d_rz_reale_freestream] PASSED");
+  }
+  return pass;
+}
+
 double compute_total_system_energy_1d(const core::State& state, int n_groups);
 double compute_total_material_energy_1d(const core::State& state);
 
@@ -10263,6 +10312,9 @@ int cmd_verify(const std::string& test_name, const bool generate_golden) {
     }
     if (test_name == "2d_rz_aux_a1_ale_forced") {
       return run_2d_rz_aux_a1_ale_forced_verify() ? 0 : 1;
+    }
+    if (test_name == "2d_rz_reale_freestream") {
+      return run_2d_rz_reale_freestream_verify() ? 0 : 1;
     }
     if (test_name == "su_olson") {
       return run_su_olson_verify() ? 0 : 1;

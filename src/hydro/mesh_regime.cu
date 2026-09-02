@@ -560,18 +560,38 @@ void classify_mesh_regimes(const core::State& state,
   d_void = static_cast<std::uint8_t*>(core::device_scratch_acquire(
       "mregime:cell_is_void",
       state.cell_is_void.size() * sizeof(std::uint8_t)));
-  cuda_check(cudaMemcpy(d_area, state.mesh.cell_area.data(),
-                        state.mesh.cell_area.size() * sizeof(double),
-                        cudaMemcpyHostToDevice),
-             "mesh regime: copy cell_area failed");
-  cuda_check(cudaMemcpy(d_svec_r, state.mesh.cell_Svec_r.data(),
-                        state.mesh.cell_Svec_r.size() * sizeof(double),
-                        cudaMemcpyHostToDevice),
-             "mesh regime: copy Svec_r failed");
-  cuda_check(cudaMemcpy(d_svec_z, state.mesh.cell_Svec_z.data(),
-                        state.mesh.cell_Svec_z.size() * sizeof(double),
-                        cudaMemcpyHostToDevice),
-             "mesh regime: copy Svec_z failed");
+  const bool geom_mirror_ok =
+      state.mesh.cell_area_device.size() == state.mesh.cell_area.size() &&
+      state.mesh.cell_Svec_r_device.size() == state.mesh.cell_Svec_r.size() &&
+      state.mesh.cell_Svec_z_device.size() == state.mesh.cell_Svec_z.size();
+  if (geom_mirror_ok) {
+    cuda_check(cudaMemcpy(d_area, state.mesh.cell_area_device.data(),
+                          state.mesh.cell_area.size() * sizeof(double),
+                          cudaMemcpyDeviceToDevice),
+               "mesh regime: copy cell_area failed");
+    cuda_check(cudaMemcpy(d_svec_r, state.mesh.cell_Svec_r_device.data(),
+                          state.mesh.cell_Svec_r.size() * sizeof(double),
+                          cudaMemcpyDeviceToDevice),
+               "mesh regime: copy Svec_r failed");
+    cuda_check(cudaMemcpy(d_svec_z, state.mesh.cell_Svec_z_device.data(),
+                          state.mesh.cell_Svec_z.size() * sizeof(double),
+                          cudaMemcpyDeviceToDevice),
+               "mesh regime: copy Svec_z failed");
+  } else {
+    const_cast<core::State&>(state).mesh.materialize_host_svec();
+    cuda_check(cudaMemcpy(d_area, state.mesh.cell_area.data(),
+                          state.mesh.cell_area.size() * sizeof(double),
+                          cudaMemcpyHostToDevice),
+               "mesh regime: copy cell_area failed");
+    cuda_check(cudaMemcpy(d_svec_r, state.mesh.cell_Svec_r.data(),
+                          state.mesh.cell_Svec_r.size() * sizeof(double),
+                          cudaMemcpyHostToDevice),
+               "mesh regime: copy Svec_r failed");
+    cuda_check(cudaMemcpy(d_svec_z, state.mesh.cell_Svec_z.data(),
+                          state.mesh.cell_Svec_z.size() * sizeof(double),
+                          cudaMemcpyHostToDevice),
+               "mesh regime: copy Svec_z failed");
+  }
   cuda_check(cudaMemcpy(d_void, state.cell_is_void.data(),
                         state.cell_is_void.size() * sizeof(std::uint8_t),
                         cudaMemcpyHostToDevice),

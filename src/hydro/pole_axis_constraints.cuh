@@ -92,8 +92,8 @@ __host__ __device__ inline void apply_2d_boundary_vector_constraints(
   }
 
   if (has_flag(node_flags, n, kNodeCenterFlag)) {
+    // Center keeps u_r=0 (axisymmetry); u_z is material and free (Galilean); the mesh-position pin lives in the position-update kernels.
     value_r = 0.0;
-    value_z = 0.0;
   }
 }
 

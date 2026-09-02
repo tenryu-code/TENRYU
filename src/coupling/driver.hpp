@@ -88,6 +88,7 @@ struct DtLineage {
   int cycle = 0;
   double t_s = 0.0;
   double dt_chosen = 0.0;
+  double dt_uncapped_by_contact = 0.0;
   // Set instead of asserting when dt collapses below Numerics.dt.min_s and
   // the caller passed defer_dt_floor_abort: the caller must either rescue
   // (e.g. central pseudo-core ring absorption) or re-raise the abort.
@@ -111,9 +112,36 @@ struct DtLineage {
   double hydro_argmin_dt_at_cell = std::numeric_limits<double>::infinity();
   double hydro_argmin_rho = 0.0;
   double hydro_argmin_u_z = 0.0;
+  std::string hydro_min_term = "other";
+  std::string hydro_min_term_detail = "unknown";
+  std::string hydro_min_other_term = "none";
+  int hydro_min_cell = -1;
+  int hydro_min_edge = -1;
+  int hydro_min_node0 = -1;
+  int hydro_min_node1 = -1;
+  int hydro_min_other_node = -1;
+  double hydro_min_L = 0.0;
+  double hydro_min_du = 0.0;
+  double hydro_min_accel = 0.0;
+  double hydro_min_coefficient = 0.0;
+  double hydro_min_raw_dt = std::numeric_limits<double>::infinity();
+  double hydro_min_rho = 0.0;
+  double hydro_min_mu = 0.0;
+  double hydro_min_polar_lambda = 0.0;
+  double hydro_min_polar_sigma = 0.0;
+  double hydro_min_csw98_du_eff = 0.0;
+  double hydro_min_tensor_rho = 0.0;
+  double hydro_min_tensor_L = 0.0;
+  double hydro_min_tensor_mu = 0.0;
+  double hydro_min_crossing_dr = 0.0;
+  double hydro_min_crossing_closing = 0.0;
+  double hydro_min_crossing_safety = 0.0;
   double dt_hydro_acoustic = std::numeric_limits<double>::infinity();
   double dt_hydro_post_shock = std::numeric_limits<double>::infinity();
   double dt_hydro_edge_av = std::numeric_limits<double>::infinity();
+  double dt_hydro_subzonal = std::numeric_limits<double>::infinity();
+  int hydro_min_cell_raw = -1;
+  double dt_hydro_edge_accel = std::numeric_limits<double>::infinity();
   double dt_hydro_axis_margin = std::numeric_limits<double>::infinity();
   double dt_hydro_volume_rate = std::numeric_limits<double>::infinity();
   double dt_hydro_tri_fan_center = std::numeric_limits<double>::infinity();
@@ -181,12 +209,21 @@ struct DtLineage {
   double retry_margin_rel = 0.0;
 };
 
+// P1 ladder re-anchor state (fix47/fix49): owned by the driver loop,
+// applied inside compute_dt_lineage so the lineage jsonl records the
+// post-re-anchor truth. Null pointer = no re-anchor (retry paths).
+struct DtReanchorState {
+  bool pending = false;
+  double pre_spike_dt_chosen = -1.0;
+};
+
 DtLineage compute_dt_lineage(const tenryu::core::State& state,
                              const tenryu::core::Config& cfg,
                              double t_end,
                              const char* phase = "primary",
                              const tenryu::hydro::HydroEOSContext* eos_ctx = nullptr,
-                             bool defer_dt_floor_abort = false);
+                             bool defer_dt_floor_abort = false,
+                             DtReanchorState* reanchor = nullptr);
 
 inline bool retry_active_mesh_repair_should_force(
     const bool active_mesh_repair_enabled,

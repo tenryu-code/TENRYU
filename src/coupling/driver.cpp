@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdio>
 #include <cstdint>
 #include <cmath>
 #include <cctype>
@@ -37,6 +38,7 @@
 #include "coupling/driver_reclose.hpp"
 #include "coupling/driver_safety_audit.hpp"
 #include "coupling/persistent_loop.hpp"
+#include "coupling/reale_mode.hpp"
 #include "coupling/source_terms.hpp"
 #include "diagnostics/diagnostics.hpp"
 #include "diagnostics/energy_budget.hpp"
@@ -56,25 +58,47 @@
 #include "hydro/ale_driver.cuh"
 #include "hydro/ale_mode.hpp"
 #include "hydro/ale_remap_2d_rz.hpp"
+#include "hydro/ale_state_monitor.hpp"
 #include "hydro/anti_hourglass.cuh"
+#include "hydro/axis_edge_collapse.hpp"
+#include "hydro/axis_projection.hpp"
+#include "hydro/band_ale.hpp"
 #include "hydro/boundary.hpp"
 #include "hydro/boundary_2d.hpp"
 #include "hydro/boundary_pressure_force.cuh"
+#include "hydro/button_morph_indexing.hpp"
+#include "hydro/cavity_boundary_graph.hpp"
 #include "hydro/cap_energy_audit.hpp"
 #include "hydro/conduction.cuh"
 #include "hydro/braginskii_viscosity.cuh"
 #include "coupling/rad_gamma_coupling.cuh"
+#include "hydro/compatible_av_csw.cuh"
 #include "hydro/corner_jacobian_quality.cuh"
 #include "hydro/central_pseudo_core.cuh"
 #include "hydro/cfl.hpp"
 #include "hydro/compatible_force_work_2d.cuh"
+#include "hydro/flank_tangential_strip.hpp"
+#include "hydro/flank_tangential_strip_detail.hpp"
 #include "hydro/hydro_1d.hpp"
 #include "hydro/hydro_2d.hpp"
+#include "hydro/wake_angular_heat_flux.hpp"
 #include "hydro/eos_context.hpp"
+#include "hydro/euler_window_blend.hpp"
+#include "hydro/axis_cell_ledger.hpp"
+#include "hydro/corner_collapse_ledger.hpp"
+#include "hydro/core_clearance_controller.hpp"
+#include "hydro/shadow_homothety_diag.hpp"
+#include "hydro/entropy_stage_ledger.hpp"
+#include "hydro/stripe_gate.hpp"
 #include "hydro/mesh_regime.cuh"
 #include "hydro/pole_angular_derefine.cuh"
 #include "hydro/reference_barrier_ale.hpp"
+#include "hydro/refinement_estimator.hpp"
+#include "hydro/refinement_tracker.hpp"
+#include "hydro/evacuated_cell_shadow.hpp"
 #include "hydro/ring7_seam_quotient_remap.cuh"
+#include "hydro/row_merge.cuh"
+#include "hydro/runtime_ale_targets.hpp"
 #include "hydro/rz_corner_mass.cuh"
 #include "hydro/state_supply_bc.hpp"
 #include "io/output_manager.hpp"
@@ -85,6 +109,7 @@
 #include "materials/zbar_tf.hpp"
 #include "materials/zmoment_state.cuh"
 #include "mesh/mesh.hpp"
+#include "mesh/z_reflection.hpp"
 #include "parallel/partition.hpp"
 #include "radiation/fleck.cuh"
 #include "radiation/fld_2d_rz_gpu.cuh"
@@ -208,6 +233,7 @@ namespace {
 constexpr int kPathSourceActiveFineChild = 1;
 constexpr int kPathMetricEdgeCross = 1;
 bool ring7_quotient_effective_enabled(const core::Config& cfg);
+std::string format_sci(double value);
 }  // namespace
 
 bool is_multiblock_path_admissibility_failure(const HydroStepResult& result) {
@@ -229,6 +255,21 @@ bool is_pole_axis_radial_order_inversion_failure(
   return reason == "pole_axis_radial_order_inversion";
 }
 
+const char* path_guard_stage_name(const HydroFailureStage stage) {
+  switch (stage) {
+    case HydroFailureStage::PredictorCommit:
+      return "predictor";
+    case HydroFailureStage::PostCorrector:
+      return "corrector";
+    case HydroFailureStage::Default:
+    case HydroFailureStage::StepStart:
+    case HydroFailureStage::PostPredictor:
+    case HydroFailureStage::RetryRestoreValidate:
+      return "unknown";
+  }
+  return "unknown";
+}
+
 double compute_retry_dt(const HydroStepResult& result,
                         const tenryu::core::Config& cfg,
                         const double failed_dt) {
@@ -242,13 +283,24 @@ double compute_retry_dt(const HydroStepResult& result,
       reason == "mesh_quality_corner_j" ||
       reason == "mesh_quality_gauss_j" ||
       reason == "mesh_quality_rz_volume" ||
+      reason == "mesh_quality_planar_area" ||
       reason == "mesh_quality_axis_margin" ||
       reason == "in_hydro_corner_j" ||
       reason == "in_hydro_gauss_j" ||
       reason == "in_hydro_rz_volume" ||
+      reason == "corner_j" ||
+      reason == "trial_volume_cfl" ||
       reason == "multiblock_path_admissibility";
   if (is_geometric_failure && result.suggested_dt > 0.0 &&
       std::isfinite(result.suggested_dt) && result.suggested_dt < failed_dt) {
+    if (result.suggested_dt < cfg.numerics.dt.min_s) {
+      core::log_warning(
+          "[driver-retry] required dt " + format_sci(result.suggested_dt) +
+          " is below Numerics.dt.min_s " +
+          format_sci(cfg.numerics.dt.min_s) + " for reason=" + reason +
+          " — geometric defect not curable by dt descent (structural mesh "
+          "action required); attempting once at the floor");
+    }
     return std::max(cfg.numerics.dt.min_s, result.suggested_dt);
   }
 
@@ -276,6 +328,7 @@ bool is_mesh_quality_failure(const HydroStepResult& result) {
          reason == "mesh_quality_gauss_j" ||
          reason == "mesh_quality_volume" ||
          reason == "mesh_quality_rz_volume" ||
+         reason == "mesh_quality_planar_area" ||
          reason == "mesh_quality_axis_margin" ||
          reason == "in_hydro_corner_j" ||
          reason == "in_hydro_gauss_j" ||
@@ -877,6 +930,18 @@ void update_hydro_active(core::State& state, const core::Config&) {
       }
     }
   }
+  if (!state.merge_tombstone.empty()) {
+    TENRYU_ASSERT(state.merge_tombstone.size() == state.hydro_active.size(),
+                  "merge_tombstone/hydro_active size mismatch");
+    for (std::size_t i = 0; i < state.hydro_active.size(); ++i) {
+      if (state.merge_tombstone[i] != 0U) {
+        if (state.hydro_active[i] != 0) {
+          changed = true;
+        }
+        state.hydro_active[i] = 0;
+      }
+    }
+  }
   if (changed) {
     state.note_hydro_active_host_write();
   }
@@ -1073,6 +1138,416 @@ std::string format_sci(const double value) {
   return oss.str();
 }
 
+static std::optional<hydro::AleStateMachine> ale_monitor_machine;
+static double ale_monitor_last_t = -std::numeric_limits<double>::infinity();
+static int ale_monitor_evaluation_count = 0;
+static int last_event_step;
+static int consecutive_failures;
+static bool controller_disengaged;
+static bool controller_activated;
+static double controller_activation_h_s;
+static bool morph_window_suppression_logged;
+static std::vector<double> latest_sector_front;
+
+void reset_runtime_ale_monitor_state(const core::Config& cfg) {
+  ale_monitor_machine.emplace(cfg.numerics.ale.runtime_controller);
+  ale_monitor_evaluation_count = 0;
+  last_event_step = 0;
+  consecutive_failures = 0;
+  controller_disengaged = false;
+  controller_activated = false;
+  controller_activation_h_s = std::numeric_limits<double>::quiet_NaN();
+  morph_window_suppression_logged = false;
+  latest_sector_front.clear();
+}
+
+bool runtime_ale_controller_suppressed_by_morph_window(
+    const core::State& state,
+    const core::Config& cfg) {
+  const bool suppressed = cfg.numerics.ale.button_morph.enabled &&
+                          state.t < cfg.numerics.ale.button_morph.t_end_s;
+  if (suppressed && !morph_window_suppression_logged) {
+    core::log_info("[runtime-ale] suppressed_morph_window=1");
+    morph_window_suppression_logged = true;
+  }
+  return suppressed;
+}
+
+const double* runtime_ale_sector_front_or_null(const core::State& state) {
+  const int ntheta = state.mesh.topo.nz;
+  if (ntheta <= 0 ||
+      latest_sector_front.size() != static_cast<std::size_t>(ntheta)) {
+    return nullptr;
+  }
+  const bool any_valid = std::any_of(
+      latest_sector_front.begin(), latest_sector_front.end(),
+      [](const double value) { return value > 0.0; });
+  return any_valid ? latest_sector_front.data() : nullptr;
+}
+
+bool runtime_ale_controller_activation_reached(const core::State& state,
+                                               const core::Config& cfg) {
+  if (controller_activated) {
+    return true;
+  }
+
+  const int ntheta = state.mesh.topo.nz;
+  const auto& runtime = cfg.numerics.ale.runtime_controller;
+  double activation_front =
+      runtime.activation_front_mode == "mean"
+          ? 0.0
+          : std::numeric_limits<double>::infinity();
+  int valid_fronts = 0;
+  if (ntheta > 0 &&
+      latest_sector_front.size() == static_cast<std::size_t>(ntheta)) {
+    for (const double value : latest_sector_front) {
+      if (std::isfinite(value) && value > 0.0) {
+        if (runtime.activation_front_mode == "mean") {
+          activation_front += value;
+        } else {
+          activation_front = std::min(activation_front, value);
+        }
+        ++valid_fronts;
+      }
+    }
+  }
+
+  if (valid_fronts > 0) {
+    if (runtime.activation_front_mode == "mean") {
+      activation_front /= static_cast<double>(valid_fronts);
+    }
+    const auto idx = hydro::button_morph::make_button_indexing(cfg.mesh);
+    if (!std::isfinite(controller_activation_h_s)) {
+      TENRYU_ASSERT(state.x_r_initial.size() ==
+                        static_cast<std::size_t>(idx.n_nodes_total) &&
+                        state.x_z_initial.size() ==
+                            static_cast<std::size_t>(idx.n_nodes_total),
+                    "runtime ALE activation requires initial node coordinates");
+      std::vector<double> initial_r;
+      std::vector<double> initial_z;
+      state.x_r_initial.copy_to_host(initial_r);
+      state.x_z_initial.copy_to_host(initial_z);
+      const int seam_node = hydro::button_morph::shell_node_id(idx, 0, 0);
+      const int first_shell_node =
+          hydro::button_morph::shell_node_id(idx, 1, 0);
+      controller_activation_h_s =
+          std::hypot(initial_r[static_cast<std::size_t>(first_shell_node)],
+                     initial_z[static_cast<std::size_t>(first_shell_node)]) -
+          std::hypot(initial_r[static_cast<std::size_t>(seam_node)],
+                     initial_z[static_cast<std::size_t>(seam_node)]);
+    }
+    TENRYU_ASSERT(std::isfinite(controller_activation_h_s) &&
+                      controller_activation_h_s > 0.0,
+                  "runtime ALE activation shell first-row spacing must be positive and finite");
+    const double bridge_inner_radius = idx.r_c;
+    const double front_margin =
+        runtime.activation_front_margin_hs * controller_activation_h_s;
+    const double front_threshold = bridge_inner_radius + front_margin;
+    if (!(activation_front < front_threshold)) {
+      return false;
+    }
+    controller_activated = true;
+    core::log_info("[runtime-ale] activated step=" +
+                   std::to_string(state.step) + " t=" + format_sci(state.t) +
+                   " gate=front " + runtime.activation_front_mode +
+                   "_front=" + format_sci(activation_front) +
+                   " threshold=" + format_sci(front_threshold) +
+                   " bridge_inner_radius=" +
+                   format_sci(bridge_inner_radius) +
+                   " front_margin=" + format_sci(front_margin));
+    return true;
+  }
+
+  if (!(runtime.activation_time_s > 0.0 &&
+        state.t >= runtime.activation_time_s)) {
+    return false;
+  }
+  controller_activated = true;
+  core::log_info("[runtime-ale] activated step=" + std::to_string(state.step) +
+                 " t=" + format_sci(state.t) +
+                 " gate=time activation_time_s=" +
+                 format_sci(runtime.activation_time_s));
+  return true;
+}
+
+const char* ale_monitor_state_name(const hydro::AleMonitorState state) {
+  switch (state) {
+    case hydro::AleMonitorState::kOff:
+      return "OFF";
+    case hydro::AleMonitorState::kWarning:
+      return "WARNING";
+    case hydro::AleMonitorState::kSoft:
+      return "SOFT";
+    case hydro::AleMonitorState::kHard:
+      return "HARD";
+    case hydro::AleMonitorState::kRecovery:
+      return "RECOVERY";
+  }
+  return "OFF";
+}
+
+const char* runtime_ale_mode_name(const hydro::AleMonitorState state) {
+  switch (state) {
+    case hydro::AleMonitorState::kSoft:
+      return "soft";
+    case hydro::AleMonitorState::kHard:
+      return "hard";
+    case hydro::AleMonitorState::kRecovery:
+      return "recovery";
+    case hydro::AleMonitorState::kOff:
+    case hydro::AleMonitorState::kWarning:
+      return "off";
+  }
+  return "off";
+}
+
+void log_runtime_ale_reject_geometry(const core::State& state,
+                                     const int cell) {
+  TENRYU_ASSERT(state.mesh.topo.multiblock.has_value(),
+                "runtime ALE rejection geometry requires CSR topology");
+  const auto& mb = *state.mesh.topo.multiblock;
+  TENRYU_ASSERT(cell >= 0 && cell < state.mesh.topo.n_cells,
+                "runtime ALE rejection geometry cell out of range");
+  TENRYU_ASSERT(mb.cell_node_csr_offsets.size() ==
+                    static_cast<std::size_t>(state.mesh.topo.n_cells) + 1U,
+                "runtime ALE rejection geometry requires CSR offsets");
+  const int begin = mb.cell_node_csr_offsets[static_cast<std::size_t>(cell)];
+  const int end =
+      mb.cell_node_csr_offsets[static_cast<std::size_t>(cell) + 1U];
+  TENRYU_ASSERT(begin >= 0 && end - begin == 4 &&
+                    static_cast<std::size_t>(end) <=
+                        mb.cell_node_csr_indices.size(),
+                "runtime ALE rejection geometry requires four CSR nodes");
+
+  std::array<int, 4> nodes{};
+  for (std::size_t k = 0; k < nodes.size(); ++k) {
+    nodes[k] =
+        mb.cell_node_csr_indices[static_cast<std::size_t>(begin) + k];
+  }
+  std::vector<double> host_r;
+  std::vector<double> host_z;
+  state.x_r.copy_to_host(host_r);
+  state.x_z.copy_to_host(host_z);
+  std::array<double, 4> node_r{};
+  std::array<double, 4> node_z{};
+  for (std::size_t k = 0; k < nodes.size(); ++k) {
+    const int node = nodes[k];
+    TENRYU_ASSERT(node >= 0 && node < state.mesh.topo.n_nodes,
+                  "runtime ALE rejection geometry node out of range");
+    node_r[k] = host_r[static_cast<std::size_t>(node)];
+    node_z[k] = host_z[static_cast<std::size_t>(node)];
+  }
+
+  std::ostringstream os;
+  os << "[runtime-ale-reject-geom] cell=" << cell;
+  for (std::size_t k = 0; k < nodes.size(); ++k) {
+    os << " n" << k << "=" << nodes[k] << ":(" << format_sci(node_r[k])
+       << "," << format_sci(node_z[k]) << ")";
+  }
+  core::log_info(os.str());
+}
+
+void run_runtime_ale_controller_event_if_due(
+    core::State& state,
+    const core::Config& cfg,
+    const hydro::AleMonitorState monitor_state) {
+  const auto& runtime = cfg.numerics.ale.runtime_controller;
+  if (!runtime.controller_enabled || controller_disengaged) {
+    return;
+  }
+  if (runtime_ale_controller_suppressed_by_morph_window(state, cfg)) {
+    return;
+  }
+  if (!runtime_ale_controller_activation_reached(state, cfg)) {
+    return;
+  }
+  const int cadence = hydro::runtime_ale_cadence(
+      monitor_state, runtime.cadence_soft, runtime.cadence_hard,
+      runtime.cadence_recovery);
+  if (cadence == 0 || state.step - last_event_step < cadence) {
+    return;
+  }
+
+  hydro::RuntimeAleEscalation escalation;
+  int escalation_level = 0;
+  if (consecutive_failures >= runtime.failures_big_repair) {
+    escalation.cap_scale = 2.0;
+    escalation.sweep_scale = 2;
+    escalation.force_hard = true;
+    escalation_level = 2;
+  } else if (consecutive_failures >= runtime.failures_hard_force) {
+    escalation.force_hard = true;
+    escalation_level = 1;
+  }
+  const hydro::RuntimeAleEventResult event = hydro::run_runtime_ale_event(
+      state, cfg, monitor_state == hydro::AleMonitorState::kHard,
+      escalation, runtime_ale_sector_front_or_null(state));
+  last_event_step = state.step;
+  if (event.succeeded) {
+    consecutive_failures = 0;
+  } else if (event.attempted) {
+    ++consecutive_failures;
+  }
+
+  std::ostringstream os;
+  os << "[runtime-ale] step=" << state.step
+     << " t=" << format_sci(state.t)
+     << " mode=" << runtime_ale_mode_name(monitor_state)
+     << " esc=" << escalation_level
+     << " attempted=" << (event.attempted ? 1 : 0)
+     << " succeeded=" << (event.succeeded ? 1 : 0)
+     << " rolled_back=" << (event.rolled_back ? 1 : 0)
+     << " lambda=" << format_sci(event.lambda_accepted)
+     << " iters=" << event.linesearch_iters
+     << " max_disp=" << format_sci(event.max_displacement)
+     << " capped=" << event.capped_nodes
+     << " rclamp=" << event.half_plane_clamped_nodes
+     << " capproj=" << event.cap_projected_nodes
+     << " ordproj=" << event.ordinary_projected_nodes
+     << " capinf=" << event.cap_infeasible_events
+     << " patch_escalations=" << event.patch_escalations
+     << " patch_nodes_max=" << event.patch_nodes_max
+     << " patch_oversize_skips=" << event.patch_oversize_skips
+     << " cm_cell=" << format_sci(event.corner_mass_cell_residual)
+     << " failures=" << consecutive_failures;
+  if (!event.succeeded) {
+    os << " rej=" << event.last_reject_reason << ":"
+       << event.last_reject_cell;
+  }
+  core::log_info(os.str());
+  if (!event.succeeded && event.last_reject_cell >= 0) {
+    log_runtime_ale_reject_geometry(state, event.last_reject_cell);
+  }
+
+  if (consecutive_failures >= runtime.escalation_max_failures) {
+    controller_disengaged = true;
+    core::log_warning(
+        "[runtime-ale] DISENGAGED step=" + std::to_string(state.step) +
+        " t=" + format_sci(state.t) +
+        " failures=" + std::to_string(consecutive_failures));
+  }
+}
+
+void emit_polar_tier_origin_force_diag(const core::State& state,
+                                       const core::Config& cfg) {
+  if (!hydro::polar_tier_fo_diag_enabled() || !cfg.diagnostics.enabled ||
+      cfg.diagnostics.every < 1 ||
+      state.step % cfg.diagnostics.every != 0) {
+    return;
+  }
+  const auto& diag = state.polar_tier_origin_force_diag;
+  if (!diag.valid) {
+    return;
+  }
+  std::ostringstream os;
+  os << std::scientific << std::setprecision(17)
+     << "[polar-tier-FO] step=" << state.step
+     << " t=" << state.t
+     << " node=" << diag.node
+     << " F_r=" << diag.raw_force_r
+     << " F_z=" << diag.raw_force_z
+     << " norm=" << std::hypot(diag.raw_force_r, diag.raw_force_z);
+  core::log_info(os.str());
+}
+
+void run_ale_state_monitor(core::State& state,
+                           const core::Config& cfg,
+                           const double dt_acoustic_last,
+                           ProfileObservability& observability) {
+  const auto& runtime = cfg.numerics.ale.runtime_controller;
+  if (!runtime.monitor_enabled || state.step % runtime.monitor_every != 0) {
+    return;
+  }
+
+  if (!ale_monitor_machine.has_value() || state.t <= ale_monitor_last_t) {
+    reset_runtime_ale_monitor_state(cfg);
+  }
+  ale_monitor_last_t = state.t;
+
+  if (!state.ale_monitor_ref_valid) {
+    hydro::capture_ale_monitor_reference(state, false);
+  }
+  if (cfg.numerics.ale.button_morph.enabled &&
+      !state.ale_monitor_ref_post_morph &&
+      state.t >= cfg.numerics.ale.button_morph.t_end_s) {
+    hydro::capture_ale_monitor_reference(state, true);
+  }
+
+  const hydro::AleMonitorResult result =
+      hydro::evaluate_ale_monitor(state, cfg, dt_acoustic_last);
+  if (!result.valid) {
+    return;
+  }
+
+  const hydro::AleMonitorState previous = ale_monitor_machine->state();
+  const hydro::AleMonitorState current =
+      ale_monitor_machine->update(result.q_min, result.h_min);
+  ++ale_monitor_evaluation_count;
+
+  if (current != previous &&
+      (current == hydro::AleMonitorState::kRecovery ||
+       current == hydro::AleMonitorState::kOff)) {
+    consecutive_failures = 0;
+    if (controller_disengaged) {
+      core::log_info("[runtime-ale] RE-ENGAGED step=" +
+                     std::to_string(state.step) +
+                     " t=" + format_sci(state.t) +
+                     " state=" + ale_monitor_state_name(current));
+    }
+    controller_disengaged = false;
+  }
+
+  observability.ale_monitor_observed = true;
+  observability.ale_monitor_state = static_cast<int>(current);
+  observability.ale_monitor_q_min = result.q_min;
+  observability.ale_monitor_h_min = result.h_min;
+  observability.ale_monitor_q_min_cell = result.q_min_cell;
+  observability.ale_monitor_h_min_cell = result.h_min_cell;
+
+  if (hydro::fold_diag_enabled()) {
+    std::ostringstream os;
+    os << "[fold-diag] step=" << state.step
+       << " t=" << format_sci(state.t)
+       << " rz_max=" << format_sci(result.r_z_max) << "@"
+       << result.r_z_max_cell
+       << " uth=" << format_sci(result.r_z_max_u_theta)
+       << " suth=" << format_sci(result.r_z_max_s_u_theta)
+       << " Hz_max=" << format_sci(result.h_metric_max) << "@"
+       << result.h_metric_max_cell
+       << " uth_h=" << format_sci(result.h_metric_max_u_theta);
+    core::log_info(os.str());
+
+    for (const hydro::AleMonitorTrackedCellResult& cell :
+         result.tracked_cells) {
+      std::ostringstream cell_os;
+      cell_os << "[fold-cell] step=" << state.step
+              << " t=" << format_sci(state.t)
+              << " cell=" << cell.cell
+              << " q=" << format_sci(cell.q)
+              << " rz=" << format_sci(cell.r_z)
+              << " Hz=" << format_sci(cell.h_metric)
+              << " uth=" << format_sci(cell.u_theta)
+              << " suth=" << format_sci(cell.s_u_theta)
+              << " alt_min=" << format_sci(cell.alt_min);
+      core::log_info(cell_os.str());
+    }
+  }
+
+  if (current != previous || ale_monitor_evaluation_count % 50 == 0) {
+    std::ostringstream os;
+    os << "[ale-state] step=" << state.step
+       << " t=" << format_sci(state.t)
+       << " state=" << ale_monitor_state_name(current)
+       << " q_min=" << format_sci(result.q_min)
+       << " q_cell=" << result.q_min_cell
+       << " h_min=" << format_sci(result.h_min)
+       << " h_cell=" << result.h_min_cell
+       << " eval_cells=" << result.evaluated_cells;
+    core::log_info(os.str());
+  }
+  run_runtime_ale_controller_event_if_due(state, cfg, current);
+}
+
 void run_shock_approach_diag(const core::State& state, const core::Config& cfg) {
   const auto& sa = cfg.numerics.diagnostics.shock_approach;
   if (!sa.enabled || sa.every <= 0 || state.step % sa.every != 0) {
@@ -1142,6 +1617,216 @@ void run_shock_approach_diag(const core::State& state, const core::Config& cfg) 
      << " t_arrival=" << (have_arr ? format_sci(t_arr) : "n/a")
      << " n_lead=" << (have_lead ? format_sci(n_lead) : "n/a");
   core::log_info(os.str());
+
+  if (sa.sectors > 0) {
+    static tenryu::diagnostics::SectorShockState sectors_state(sa.sectors);
+    if (sectors_state.n_sec != sa.sectors ||
+        state.t <= sectors_state.last_call_t) {
+      sectors_state =
+          tenryu::diagnostics::SectorShockState(sa.sectors);
+    }
+
+    const int n_sec = sa.sectors;
+    const double pi_value = std::acos(-1.0);
+    const double dt_scan = sectors_state.last_call_t > 0.0
+                               ? state.t - sectors_state.last_call_t
+                               : 0.0;
+    std::vector<double> sector_sum_p(
+        static_cast<std::size_t>(n_sec * nb), 0.0);
+    std::vector<int> sector_cnt(static_cast<std::size_t>(n_sec * nb), 0);
+    for (int c = 0; c < n_cells; ++c) {
+      const double s = std::hypot(cr[c], cz[c]);
+      if (!std::isfinite(s)) continue;
+      const double theta = std::atan2(cr[c], cz[c]);
+      int k = static_cast<int>(theta / pi_value * n_sec);
+      k = std::clamp(k, 0, n_sec - 1);
+      int b = static_cast<int>(s / s_max * nb);
+      if (b >= nb) b = nb - 1;
+      const std::size_t index = static_cast<std::size_t>(k * nb + b);
+      sector_sum_p[index] += pe[c] + pi[c];
+      ++sector_cnt[index];
+    }
+
+    std::vector<tenryu::diagnostics::SectorFrontSample> front_samples(
+        static_cast<std::size_t>(n_sec),
+        tenryu::diagnostics::SectorFrontSample{0.0, false});
+    std::vector<double> sector_sb;
+    std::vector<double> sector_pb;
+    sector_sb.reserve(static_cast<std::size_t>(nb));
+    sector_pb.reserve(static_cast<std::size_t>(nb));
+    for (int k = 0; k < n_sec; ++k) {
+      sector_sb.clear();
+      sector_pb.clear();
+      for (int b = 0; b < nb; ++b) {
+        const std::size_t index = static_cast<std::size_t>(k * nb + b);
+        if (sector_cnt[index] < 2) continue;
+        const double p_mean = sector_sum_p[index] / sector_cnt[index];
+        if (!std::isfinite(p_mean) || !(p_mean > 0.0)) continue;
+        sector_sb.push_back((b + 0.5) * s_max / nb);
+        sector_pb.push_back(p_mean);
+      }
+      if (static_cast<int>(sector_sb.size()) < 8) continue;
+      front_samples[static_cast<std::size_t>(k)].s_ridge =
+          tenryu::diagnostics::shock_ridge_radius(
+              sector_sb.data(),
+              sector_pb.data(),
+              static_cast<int>(sector_sb.size()));
+      front_samples[static_cast<std::size_t>(k)].valid = true;
+    }
+
+    if (cfg.numerics.ale.runtime_controller.controller_enabled) {
+      const int ntheta = state.mesh.topo.nz;
+      latest_sector_front.assign(
+          static_cast<std::size_t>(std::max(ntheta, 0)), -1.0);
+      for (int j = 0; j < ntheta; ++j) {
+        const int sector = std::clamp(
+            static_cast<int>((static_cast<double>(j) + 0.5) * n_sec /
+                             static_cast<double>(ntheta)),
+            0, n_sec - 1);
+        const auto& sample = front_samples[static_cast<std::size_t>(sector)];
+        if (sample.valid) {
+          latest_sector_front[static_cast<std::size_t>(j)] = sample.s_ridge;
+        }
+      }
+    }
+
+    std::vector<double> v_inward(static_cast<std::size_t>(n_sec), 0.0);
+    std::vector<double> t_arrival(static_cast<std::size_t>(n_sec), 0.0);
+    std::vector<int> have_v(static_cast<std::size_t>(n_sec), 0);
+    std::vector<int> have_arrival(static_cast<std::size_t>(n_sec), 0);
+    std::unique_ptr<bool[]> deadline_valid(new bool[n_sec]);
+    int max_tracker_size = 0;
+    for (int k = 0; k < n_sec; ++k) {
+      deadline_valid[k] = false;
+      const auto& sample = front_samples[static_cast<std::size_t>(k)];
+      auto& sector_tracker =
+          sectors_state.trackers[static_cast<std::size_t>(k)];
+      if (sample.valid && state.t > sectors_state.last_call_t) {
+        sector_tracker.push(state.t, sample.s_ridge);
+      }
+      have_v[static_cast<std::size_t>(k)] =
+          sector_tracker.speed(&v_inward[static_cast<std::size_t>(k)]);
+      have_arrival[static_cast<std::size_t>(k)] =
+          (sa.target_radius_cm > 0.0) &&
+          sector_tracker.predict_arrival(
+              sa.target_radius_cm,
+              &t_arrival[static_cast<std::size_t>(k)]);
+      double residual_rms = 0.0;
+      const bool have_residual = sector_tracker.fit_residual_rms(&residual_rms);
+      if (have_v[static_cast<std::size_t>(k)] && have_residual) {
+        sectors_state.last_sigma_t[static_cast<std::size_t>(k)] =
+            residual_rms /
+            std::max(std::abs(v_inward[static_cast<std::size_t>(k)]),
+                     1.0e-30);
+      }
+      deadline_valid[k] = sample.valid &&
+                          have_v[static_cast<std::size_t>(k)] &&
+                          have_arrival[static_cast<std::size_t>(k)] &&
+                          have_residual;
+      if (deadline_valid[k]) {
+        max_tracker_size = std::max(max_tracker_size, sector_tracker.size());
+      }
+    }
+
+    std::vector<double> modal_mu(static_cast<std::size_t>(n_sec), 0.0);
+    std::vector<double> modal_y(static_cast<std::size_t>(n_sec), 0.0);
+    std::vector<double> modal_w(static_cast<std::size_t>(n_sec), 0.0);
+    int valid_count = 0;
+    double s_f_min = std::numeric_limits<double>::infinity();
+    double s_f_max = -std::numeric_limits<double>::infinity();
+    double s_f_sum = 0.0;
+    for (int k = 0; k < n_sec; ++k) {
+      const double theta_center =
+          (static_cast<double>(k) + 0.5) * pi_value / n_sec;
+      modal_mu[static_cast<std::size_t>(k)] = std::cos(theta_center);
+      const auto& sample = front_samples[static_cast<std::size_t>(k)];
+      if (!sample.valid) continue;
+      ++valid_count;
+      s_f_min = std::min(s_f_min, sample.s_ridge);
+      s_f_max = std::max(s_f_max, sample.s_ridge);
+      s_f_sum += sample.s_ridge;
+      modal_y[static_cast<std::size_t>(k)] = std::log(sample.s_ridge);
+      modal_w[static_cast<std::size_t>(k)] =
+          std::cos(static_cast<double>(k) * pi_value / n_sec) -
+          std::cos(static_cast<double>(k + 1) * pi_value / n_sec);
+    }
+    std::array<double, 5> modal_b{};
+    tenryu::diagnostics::legendre_fit(
+        modal_mu.data(),
+        modal_y.data(),
+        modal_w.data(),
+        n_sec,
+        sa.modal_l_max,
+        modal_b.data());
+
+    double new_deadline = 0.0;
+    const bool have_new_deadline =
+        tenryu::diagnostics::earliest_confidence_deadline(
+            t_arrival.data(),
+            sectors_state.last_sigma_t.data(),
+            v_inward.data(),
+            deadline_valid.get(),
+            n_sec,
+            sa.sector_confidence_nu,
+            sa.sector_guard_crossings,
+            h_cell,
+            dt_scan,
+            &new_deadline);
+    bool deadline_held = false;
+    const bool deadline_immature =
+        have_new_deadline &&
+        !(new_deadline > state.t && max_tracker_size >= 8);
+    if (have_new_deadline) {
+      tenryu::diagnostics::commit_sector_deadline(
+          &sectors_state.committed_deadline_s,
+          new_deadline,
+          state.t,
+          max_tracker_size,
+          &deadline_held);
+    }
+    sectors_state.last_call_t = state.t;
+
+    std::ostringstream sector_os;
+    sector_os << "[shock_sectors] step=" << state.step
+              << " t=" << format_sci(state.t)
+              << " valid=" << valid_count << "/" << n_sec
+              << " s_f_min="
+              << (valid_count > 0 ? format_sci(s_f_min) : "n/a")
+              << " s_f_max="
+              << (valid_count > 0 ? format_sci(s_f_max) : "n/a")
+              << " s_f_mean="
+              << (valid_count > 0
+                      ? format_sci(s_f_sum / static_cast<double>(valid_count))
+                      : "n/a")
+              << " b0=" << format_sci(modal_b[0])
+              << " b1=" << format_sci(modal_b[1])
+              << " b2=" << format_sci(modal_b[2])
+              << " b3=" << format_sci(modal_b[3])
+              << " b4=" << format_sci(modal_b[4])
+              << " t_end="
+              << (std::isfinite(sectors_state.committed_deadline_s)
+                      ? format_sci(sectors_state.committed_deadline_s)
+                      : "n/a")
+              << " deadline_held=" << (deadline_held ? 1 : 0)
+              << " deadline_immature=" << (deadline_immature ? 1 : 0)
+              << " sectors=";
+    bool first_sector = true;
+    for (int k = 0; k < n_sec; ++k) {
+      const auto& sample = front_samples[static_cast<std::size_t>(k)];
+      if (!sample.valid) continue;
+      if (!first_sector) sector_os << ",";
+      first_sector = false;
+      sector_os << k << ":" << format_sci(sample.s_ridge) << ":"
+                << (have_v[static_cast<std::size_t>(k)]
+                        ? format_sci(v_inward[static_cast<std::size_t>(k)])
+                        : "n/a")
+                << ":"
+                << (have_arrival[static_cast<std::size_t>(k)]
+                        ? format_sci(t_arrival[static_cast<std::size_t>(k)])
+                        : "n/a");
+    }
+    core::log_info(sector_os.str());
+  }
 }
 
 void insert_i1b_sensor_top(
@@ -1557,6 +2242,13 @@ void assert_driver_retry_supported(const core::Config& cfg) {
                   "Numerics.hydro.driver_full_step_retry_enabled does not support "
                   "RadiationMode::ImcDdmc (v1 scope: deterministic FLD/SN only). "
                   "Set retry_enabled=false or change radiation.mode.");
+  }
+  if (hydro::i1b_path_guard_enabled() &&
+      cfg.radiation.mode == core::RadiationMode::ImcDdmc) {
+    TENRYU_ASSERT(false,
+                  "TENRYU_I1B_PATH_GUARD does not support RadiationMode::ImcDdmc "
+                  "because its full-step snapshot retry is deterministic FLD/SN only. "
+                  "Disable the path guard or change radiation.mode.");
   }
 }
 
@@ -2490,6 +3182,10 @@ double env_positive_double(const char* name, const double fallback) {
   return value;
 }
 
+double i1b_fixed_dt() {
+  return env_positive_double("TENRYU_I1B_FIXED_DT", 0.0);
+}
+
 std::string rank_suffix(const int rank) {
   std::ostringstream oss;
   oss << "rank" << std::setw(4) << std::setfill('0') << rank;
@@ -3083,6 +3779,7 @@ double remap_closure_reject_tol(const core::Config& cfg) {
 double boundary_pressure_drive(const core::State& state, const double eval_time) {
   TENRYU_ASSERT(state.pressure_drive_1d.has_value(),
                 "pressure boundary requires initialized pressure_drive_1d table");
+  // The pooled-cap scalar remains the perturbed drive's exact l=0 angular mean by Legendre orthogonality.
   return state.pressure_drive_1d->eval(eval_time);
 }
 
@@ -3124,87 +3821,6 @@ double compute_boundary_pdv_work_1d(const core::State& state,
       cylindrical_1d ? 2.0 * kPi * r_outer : 4.0 * kPi * r_outer * r_outer;
   const double v_outer = outer_node_v;
   return p_outer * area_outer * v_outer * dt_op;
-}
-
-double boundary_pressure_2d(const hydro::Boundary2DType bc_type,
-                            const core::State& state,
-                            const double eval_time) {
-  if (bc_type == hydro::Boundary2DType::PRESSURE) {
-    return boundary_pressure_drive(state, eval_time);
-  }
-  return 0.0;
-}
-
-double compute_boundary_pdv_work_2d(const core::State& state,
-                                    const core::Config& cfg,
-                                    const double dt_op,
-                                    const double t_op) {
-  if (state.mesh.dim != 2 || dt_op <= 0.0) {
-    return 0.0;
-  }
-
-  const int nr = state.mesh.topo.nr;
-  const int nz = state.mesh.topo.nz;
-  if (nr <= 0 || nz <= 0) {
-    return 0.0;
-  }
-
-  const std::size_t expected_nodes =
-      static_cast<std::size_t>(nr + 1) * static_cast<std::size_t>(nz + 1);
-  if (state.x_r.size() != expected_nodes || state.x_z.size() != expected_nodes ||
-      state.v_r.size() != expected_nodes || state.v_z.size() != expected_nodes) {
-    return 0.0;
-  }
-
-  const auto x_r = copy_field_to_host(state.x_r);
-  const auto x_z = copy_field_to_host(state.x_z);
-  const auto v_r = copy_field_to_host(state.v_r);
-  const auto v_z = copy_field_to_host(state.v_z);
-
-  const auto r_outer_type =
-      hydro::parse_boundary_2d_type(cfg.numerics.hydro.boundary_2d.r_outer);
-  const auto z_bottom_type =
-      hydro::parse_boundary_2d_type(cfg.numerics.hydro.boundary_2d.z_bottom);
-  const auto z_top_type =
-      hydro::parse_boundary_2d_type(cfg.numerics.hydro.boundary_2d.z_top);
-  const bool skip_z_face_pdv =
-      z_bottom_type == hydro::Boundary2DType::PRESSURE ||
-      z_top_type == hydro::Boundary2DType::PRESSURE;
-
-  const double eval_time = t_op + 0.5 * dt_op;
-  const double p_r_outer = boundary_pressure_2d(r_outer_type, state, eval_time);
-  if (skip_z_face_pdv) {
-    // Match Hydro2D validate_boundary_2d: z_bottom/z_top='pressure' is rejected,
-    // so coupling skips any z-face PdV contribution.
-  }
-
-  const int stride = nz + 1;
-  double e_pdv = 0.0;
-
-  if (p_r_outer != 0.0) {
-    const int i = nr;
-    for (int j = 0; j < nz; ++j) {
-      const std::size_t n0 = static_cast<std::size_t>(i * stride + j);
-      const std::size_t n1 = n0 + 1;
-      const double r_face = std::max(0.5 * (x_r[n0] + x_r[n1]), 0.0);
-      const double dz = std::abs(x_z[n1] - x_z[n0]);
-      const double area_face = 2.0 * kPi * r_face * dz;
-      const double v_n = 0.5 * (v_r[n0] + v_r[n1]);
-      e_pdv += p_r_outer * area_face * v_n * dt_op;
-    }
-  }
-
-  return e_pdv;
-}
-
-double compute_boundary_pdv_work(const core::State& state,
-                                 const core::Config& cfg,
-                                 const double dt_op,
-                                 const double t_op) {
-  if (cfg.main.dimension == "2D_RZ") {
-    return compute_boundary_pdv_work_2d(state, cfg, dt_op, t_op);
-  }
-  return compute_boundary_pdv_work_1d(state, cfg, dt_op, t_op);
 }
 
 diagnostics::EnergyTotals compute_energy_totals_for_state(const core::State& state,
@@ -3779,12 +4395,16 @@ EnergyAuditDriveWork compute_energy_audit_drive_work_local(
       state.mesh.logical == mesh::LogicalMesh2D::SphericalPolarHalfplane;
   if (state.mesh.topo.multiblock.has_value()) {
     const mesh::BlockInfo& shell =
-        mesh::mesh_topo_multiblock_polar_shell_block(*state.mesh.topo.multiblock);
+        mesh::mesh_topo_multiblock_outermost_polar_shell_block(
+            *state.mesh.topo.multiblock);
+    const int shell_node_begin =
+        mesh::mesh_topo_multiblock_outermost_polar_shell_node_offset(
+            state.mesh.topo);
     energy_audit_accumulate_drive_faces(r_before,
                                         z_before,
                                         r_after,
                                         z_after,
-                                        shell.owned_node_begin,
+                                        shell_node_begin,
                                         shell.n_i_cells,
                                         shell.n_j_cells,
                                         p_ext,
@@ -3873,7 +4493,34 @@ void emit_config_fingerprint_step0(const core::State& state,
       << (state.pressure_drive_1d.has_value() ? 1 : 0)
       << " radiation_enabled=" << (cfg.radiation.enabled ? 1 : 0)
       << " radiation_mode=" << radiation_mode_name(cfg.radiation.mode);
+  const auto& pcfg =
+      cfg.numerics.hydro.pressure_drive_perturbation;
+  if (pcfg.enabled) {
+    char drive_pert_fingerprint[192];
+    std::snprintf(drive_pert_fingerprint,
+                  sizeof(drive_pert_fingerprint),
+                  " drive_pert=1 g_min=%.6e g_max=%.6e n_modes=%d n_spots=%d",
+                  pcfg.g_min,
+                  pcfg.g_max,
+                  static_cast<int>(pcfg.mode_l.size()),
+                  static_cast<int>(pcfg.spot_theta0.size()));
+    oss << drive_pert_fingerprint;
+  }
   core::log_info(oss.str());
+  // AvModel::CswEdgePlusTensorLimited is rejected at config validation
+  // (Stage G unimplemented), so these two checks cover every reachable
+  // edge-AV model.
+  if (cfg.numerics.hydro.av_model == core::AvModel::CswEdge ||
+      cfg.numerics.hydro.av_model == core::AvModel::CswEdgeCsw98) {
+    core::log_warning(
+        "[av_diag] av_model is an edge-AV model: hydro/Qvisc frames and the "
+        "diagnostics/av_max history group are populated only by the legacy scalar-vNR "
+        "path and will read zero for this entire run. They are NOT evidence that the "
+        "artificial viscosity is inactive. Use TENRYU_I1B_AV_ACTIVITY_LOG_EVERY=<n> for "
+        "per-step edge-AV work and fire counts (judge activity by the work term: "
+        "quiescent cells fire on roundoff-level velocity noise, so raw fire counts "
+        "overstate activity), or TENRYU_DRIVE_LAYER_DIAG=<n> for the per-cell wav term.");
+  }
 }
 
 void maybe_emit_i1b_energy_audit_step(
@@ -4636,6 +5283,11 @@ void write_dt_lineage_jsonl(const core::State& state, const DtLineage& lineage) 
   write_json_number(os, "hydro_argmin_u_z", lineage.hydro_argmin_u_z);
   write_json_number(os, "dt_hydro_acoustic", lineage.dt_hydro_acoustic);
   write_json_number(os, "dt_hydro_post_shock", lineage.dt_hydro_post_shock);
+  write_json_number(os, "dt_hydro_edge_av", lineage.dt_hydro_edge_av);
+  write_json_number(os, "dt_hydro_subzonal", lineage.dt_hydro_subzonal);
+  write_json_number(os,
+                    "dt_hydro_edge_accel",
+                    lineage.dt_hydro_edge_accel);
   write_json_number(os, "dt_hydro_axis_margin", lineage.dt_hydro_axis_margin);
   write_json_number(os, "dt_hydro_volume_rate", lineage.dt_hydro_volume_rate);
   write_json_number(os,
@@ -4737,7 +5389,159 @@ void write_dt_lineage_jsonl(const core::State& state, const DtLineage& lineage) 
     write_json_number(os, "retry_dt_star_est", lineage.retry_dt_star_est);
     write_json_number(os, "retry_margin_rel", lineage.retry_margin_rel);
   }
+  os << ",\"hydro_min_term\":\"" << json_escape(lineage.hydro_min_term)
+     << "\"";
+  os << ",\"hydro_min_term_detail\":\""
+     << json_escape(lineage.hydro_min_term_detail) << "\"";
+  os << ",\"hydro_min_other_term\":\""
+     << json_escape(lineage.hydro_min_other_term) << "\"";
+  os << ",\"hydro_min_cell\":" << lineage.hydro_min_cell;
+  os << ",\"hydro_min_cell_raw\":" << lineage.hydro_min_cell_raw;
+  os << ",\"hydro_min_edge\":" << lineage.hydro_min_edge;
+  os << ",\"hydro_min_nodes\":[" << lineage.hydro_min_node0 << ","
+     << lineage.hydro_min_node1 << "]";
+  os << ",\"hydro_min_other_node\":" << lineage.hydro_min_other_node;
+  write_json_number(os, "hydro_min_L", lineage.hydro_min_L);
+  write_json_number(os, "hydro_min_du", lineage.hydro_min_du);
+  write_json_number(os, "hydro_min_accel", lineage.hydro_min_accel);
+  write_json_number(os,
+                    "hydro_min_coefficient",
+                    lineage.hydro_min_coefficient);
+  write_json_number(os, "hydro_min_raw_dt", lineage.hydro_min_raw_dt);
+  write_json_number(os, "hydro_min_rho", lineage.hydro_min_rho);
+  write_json_number(os, "hydro_min_mu", lineage.hydro_min_mu);
+  write_json_number(os,
+                    "hydro_min_polar_lambda",
+                    lineage.hydro_min_polar_lambda);
+  write_json_number(os,
+                    "hydro_min_polar_sigma",
+                    lineage.hydro_min_polar_sigma);
+  write_json_number(os,
+                    "hydro_min_csw98_du_eff",
+                    lineage.hydro_min_csw98_du_eff);
+  write_json_number(os,
+                    "hydro_min_tensor_rho",
+                    lineage.hydro_min_tensor_rho);
+  write_json_number(os,
+                    "hydro_min_tensor_L",
+                    lineage.hydro_min_tensor_L);
+  write_json_number(os,
+                    "hydro_min_tensor_mu",
+                    lineage.hydro_min_tensor_mu);
+  write_json_number(os,
+                    "hydro_min_crossing_dr",
+                    lineage.hydro_min_crossing_dr);
+  write_json_number(os,
+                    "hydro_min_crossing_closing",
+                    lineage.hydro_min_crossing_closing);
+  write_json_number(os,
+                    "hydro_min_crossing_safety",
+                    lineage.hydro_min_crossing_safety);
   os << "}\n";
+}
+
+const char* hydro_min_term_name(const hydro::HydroMinTermClass term) {
+  switch (term) {
+    case hydro::HydroMinTermClass::AcousticCell:
+      return "acoustic_cell";
+    case hydro::HydroMinTermClass::EdgeAv:
+      return "edge_av";
+    case hydro::HydroMinTermClass::EdgeCrossing:
+      return "edge_crossing";
+    case hydro::HydroMinTermClass::Other:
+      return "other";
+  }
+  return "other";
+}
+
+const char* hydro_min_other_term_name(const hydro::HydroMinOtherTerm term) {
+  switch (term) {
+    case hydro::HydroMinOtherTerm::None:
+      return "none";
+    case hydro::HydroMinOtherTerm::PostShock:
+      return "post_shock";
+    case hydro::HydroMinOtherTerm::ArtificialHeat:
+      return "artificial_heat";
+    case hydro::HydroMinOtherTerm::SubzonalPressure:
+      return "subzonal_pressure";
+    case hydro::HydroMinOtherTerm::AxisMargin:
+      return "axis_margin";
+    case hydro::HydroMinOtherTerm::TriFanCenter:
+      return "tri_fan_center";
+    case hydro::HydroMinOtherTerm::CornerJPredict:
+      return "corner_j_predict";
+    case hydro::HydroMinOtherTerm::PoleAxisContact:
+      return "pole_axis_contact";
+    case hydro::HydroMinOtherTerm::RzGeometric:
+      return "rz_geometric";
+    case hydro::HydroMinOtherTerm::VolumeRate:
+      return "volume_rate";
+    case hydro::HydroMinOtherTerm::PolarSlavingStiffness:
+      return "polar_slaving_stiffness";
+    case hydro::HydroMinOtherTerm::CentralPseudoCoreAcoustic:
+      return "central_pseudo_core_acoustic";
+    case hydro::HydroMinOtherTerm::PoleAngularDerefineAcoustic:
+      return "pole_angular_derefine_acoustic";
+    case hydro::HydroMinOtherTerm::EdgeAccelDisplacement:
+      return "edge_accel_displacement";
+  }
+  return "none";
+}
+
+const char* hydro_min_term_detail_name(const hydro::HydroMinTermDetail detail) {
+  switch (detail) {
+    case hydro::HydroMinTermDetail::Unknown:
+      return "unknown";
+    case hydro::HydroMinTermDetail::AcousticCell:
+      return "acoustic_cell";
+    case hydro::HydroMinTermDetail::CswEdgeAv:
+      return "csw_edge_av";
+    case hydro::HydroMinTermDetail::Csw98EdgeAv:
+      return "csw98_edge_av_du_eff";
+    case hydro::HydroMinTermDetail::TensorAv:
+      return "mimetic_tensor_av";
+    case hydro::HydroMinTermDetail::EdgeCrossing:
+      return "node_crossing";
+  }
+  return "unknown";
+}
+
+void copy_hydro_min_contributor(
+    const hydro::HydroMinContributor& contributor,
+    DtLineage& lineage) {
+  lineage.hydro_min_term = hydro_min_term_name(contributor.term_class);
+  lineage.hydro_min_term_detail =
+      hydro_min_term_detail_name(contributor.term_detail);
+  lineage.hydro_min_other_term =
+      hydro_min_other_term_name(contributor.other_term);
+  lineage.hydro_min_cell = contributor.cell_id;
+  lineage.hydro_min_cell_raw = contributor.cell_id_raw;
+  lineage.hydro_min_edge = contributor.edge_id;
+  lineage.hydro_min_node0 = contributor.node0;
+  lineage.hydro_min_node1 = contributor.node1;
+  lineage.hydro_min_other_node = contributor.other_node;
+  lineage.hydro_min_L = contributor.length;
+  lineage.hydro_min_du = contributor.du;
+  lineage.hydro_min_accel = contributor.acceleration;
+  lineage.hydro_min_coefficient = contributor.coefficient;
+  lineage.hydro_min_raw_dt = contributor.raw_dt;
+  lineage.hydro_min_rho = contributor.rho;
+  lineage.hydro_min_mu = contributor.mu;
+  lineage.hydro_min_polar_lambda = contributor.polar_lambda;
+  lineage.hydro_min_polar_sigma = contributor.polar_sigma;
+  if (contributor.term_detail == hydro::HydroMinTermDetail::Csw98EdgeAv) {
+    lineage.hydro_min_csw98_du_eff = contributor.du;
+  }
+  if (contributor.term_detail == hydro::HydroMinTermDetail::TensorAv) {
+    lineage.hydro_min_tensor_rho = contributor.rho;
+    lineage.hydro_min_tensor_L = contributor.length;
+    lineage.hydro_min_tensor_mu = contributor.mu;
+  }
+  if (contributor.term_detail == hydro::HydroMinTermDetail::EdgeCrossing) {
+    lineage.hydro_min_crossing_dr = contributor.length;
+    lineage.hydro_min_crossing_closing = contributor.du;
+    lineage.hydro_min_crossing_safety = contributor.coefficient;
+  }
 }
 
 bool dt_values_match(const double a, const double b) {
@@ -4875,7 +5679,8 @@ DtLineage compute_dt_lineage(const core::State& state,
                              const double t_end,
                              const char* phase,
                              const hydro::HydroEOSContext* eos_ctx,
-                             const bool defer_dt_floor_abort) {
+                             const bool defer_dt_floor_abort,
+                             DtReanchorState* reanchor) {
   DtLineage lineage;
   lineage.cycle = state.step;
   lineage.t_s = state.t;
@@ -4936,6 +5741,7 @@ DtLineage compute_dt_lineage(const core::State& state,
   double dt_new = cfg.numerics.dt.max_s;
   double dt_hydro = std::numeric_limits<double>::infinity();
   double dt_cond = std::numeric_limits<double>::infinity();
+  double dt_brag = std::numeric_limits<double>::infinity();
   double dt_rad_val = std::numeric_limits<double>::infinity();
   double dt_growth = std::numeric_limits<double>::infinity();
   radiation::DtRadDiagnostics dt_rad_diag{};
@@ -4979,6 +5785,8 @@ DtLineage compute_dt_lineage(const core::State& state,
       lineage.dt_hydro_acoustic = hydro_dt.acoustic_dt;
       lineage.dt_hydro_post_shock = hydro_dt.post_shock_dt;
       lineage.dt_hydro_edge_av = hydro_dt.edge_av_dt;
+      lineage.dt_hydro_subzonal = hydro_dt.subzonal_pressure_dt;
+      lineage.dt_hydro_edge_accel = hydro_dt.edge_accel_dt;
       lineage.dt_hydro_axis_margin = hydro_dt.axis_margin_dt;
       lineage.dt_hydro_volume_rate = hydro_dt.volume_rate_dt;
       lineage.dt_hydro_tri_fan_center = hydro_dt.tri_fan_center_cfl.dt;
@@ -5020,8 +5828,7 @@ DtLineage compute_dt_lineage(const core::State& state,
     {
       // Braginskii viscosity explicit stability limit (config-gated,
       // with env diagnostic overrides; disabled => +inf/no effect).
-      const double dt_brag =
-          hydro::braginskii::compute_dt_braginskii(state, cfg);
+      dt_brag = hydro::braginskii::compute_dt_braginskii(state, cfg);
       lineage.dt_visc = dt_brag;
       dt_new = std::min(dt_new, dt_brag);
     }
@@ -5040,11 +5847,19 @@ DtLineage compute_dt_lineage(const core::State& state,
   dt_new = std::min(dt_new, dt_hot_e);
 
   if (state.step > 0 || state.dt > 0.0) {
-    dt_growth = cfg.numerics.dt.growth_factor * state.dt;
+    const double growth_base =
+        (state.dt_growth_ref > 0.0) ? state.dt_growth_ref : state.dt;
+    dt_growth = cfg.numerics.dt.growth_factor * growth_base;
     dt_new = std::min(dt_new, dt_growth);
   }
 
+  double dt_uncapped = dt_new;
+  if (std::isfinite(state.evacuated_cells.contact_dt_cap_s)) {
+    dt_new = std::min(dt_new, state.evacuated_cells.contact_dt_cap_s);
+  }
+
   dt_new = std::min(dt_new, cfg.numerics.dt.max_s);
+  dt_uncapped = std::min(dt_uncapped, cfg.numerics.dt.max_s);
 
   double dt_output = std::numeric_limits<double>::infinity();
   auto output_gap = [&](const double t_next, const double every_s) {
@@ -5073,14 +5888,45 @@ DtLineage compute_dt_lineage(const core::State& state,
         output_gap(state.t_next_checkpoint, cfg.output.checkpoint_every_s));
   }
   dt_new = std::min(dt_new, dt_output);
+  dt_uncapped = std::min(dt_uncapped, dt_output);
 
   dt_new = std::min(dt_new, t_end - state.t);
+  dt_uncapped = std::min(dt_uncapped, t_end - state.t);
   const bool retry_dt_forced =
       !g_dt_lineage_context.retry_phase.empty() &&
       g_dt_lineage_context.retry_dt_after > 0.0;
   if (retry_dt_forced) {
     dt_new = g_dt_lineage_context.retry_dt_after;
+    dt_uncapped = dt_new;
   }
+  const double fixed_dt = i1b_fixed_dt();
+  if (fixed_dt > 0.0) {
+    dt_new = std::min(fixed_dt, t_end - state.t);
+    dt_uncapped = dt_new;
+  }
+  static std::uint64_t dt_forensic_calls_since_log = 100;
+  if (dt_forensic_calls_since_log < 100) {
+    ++dt_forensic_calls_since_log;
+  }
+  if (dt_new < 1.0e-18 && dt_forensic_calls_since_log >= 100) {
+    core::log_warning(
+        "[dt-forensic] step=" + std::to_string(state.step) +
+        " dt_new=" + format_sci17(dt_new) +
+        " dt_hydro=" + format_sci17(dt_hydro) +
+        " dt_cond=" + format_sci17(dt_cond) +
+        " dt_brag=" + format_sci17(dt_brag) +
+        " dt_rad=" + format_sci17(dt_rad_val) +
+        " dt_burn=" + format_sci17(dt_burn) +
+        " dt_hot_e=" + format_sci17(dt_hot_e) +
+        " dt_growth=" + format_sci17(dt_growth) +
+        " max_s=" + format_sci17(cfg.numerics.dt.max_s) +
+        " contact_cap=" +
+        format_sci17(state.evacuated_cells.contact_dt_cap_s) +
+        " dt_output=" + format_sci17(dt_output) +
+        " dt_uncapped=" + format_sci17(dt_uncapped));
+    dt_forensic_calls_since_log = 0;
+  }
+  lineage.dt_uncapped_by_contact = dt_uncapped;
   double dt_chosen = dt_new;
   lineage.dt_chosen = dt_chosen;
   lineage.dt_hydro = dt_hydro;
@@ -5123,7 +5969,8 @@ DtLineage compute_dt_lineage(const core::State& state,
     const char* v = std::getenv("TENRYU_DT_CONTROLLER_CHECK");
     return v != nullptr && std::string(v) == "1";
   }();
-  if (dt_ctrl_check_enabled && !retry_dt_forced && state.step > 0 &&
+  if (dt_ctrl_check_enabled && !retry_dt_forced && fixed_dt <= 0.0 &&
+      state.step > 0 &&
       cfg.main.dimension == "1D_SPH" &&
       !cfg.numerics.hydro.volume_rate_cfl_enabled &&
       !hydro::central_pseudo_core::configured(cfg)) {
@@ -5184,6 +6031,10 @@ DtLineage compute_dt_lineage(const core::State& state,
         (cfg.main.dimension == "1D_SPH" || cfg.main.dimension == "1D_CYL" ||
          cfg.main.dimension == "2D_RZ") &&
         state.mesh.node_r != nullptr) {
+      const hydro::HydroDtDiagnostics hydro_min_diag =
+          hydro::compute_dt_hydro_diagnostics(state, cfg, true);
+      copy_hydro_min_contributor(hydro_min_diag.min_contributor, lineage);
+      lineage.dt_hydro_subzonal = hydro_min_diag.subzonal_pressure_dt;
       const hydro::HydroDtArgmin hydro_argmin =
           hydro::compute_dt_hydro_argmin(state, cfg);
       lineage.hydro_argmin_cell = hydro_argmin.argmin_cell;
@@ -5268,7 +6119,14 @@ DtLineage compute_dt_lineage(const core::State& state,
                         format_sci(lineage.dt_hydro_tri_fan_center) +
                         " dt_hydro_corner_j_predict=" +
                         format_sci(lineage.dt_hydro_corner_j_predict) +
-                        " dt_chosen=" + format_sci(dt_chosen));
+                        " dt_chosen=" + format_sci(dt_chosen) +
+                        " hydro_min_term=" + lineage.hydro_min_other_term +
+                        " hydro_min_cell=" +
+                        std::to_string(lineage.hydro_min_cell) +
+                        " hydro_min_cell_raw=" +
+                        std::to_string(lineage.hydro_min_cell_raw) +
+                        " hydro_min_raw_dt=" +
+                        format_sci(lineage.hydro_min_raw_dt));
       core::log_warning("[dt_floor_abort_hydro_detail] cell=" +
                         std::to_string(lineage.hydro_argmin_cell) +
                         " i=" + std::to_string(lineage.hydro_argmin_i) +
@@ -5284,6 +6142,10 @@ DtLineage compute_dt_lineage(const core::State& state,
                         format_sci(lineage.dt_hydro_post_shock) +
                         " dt_hydro_edge_av=" +
                         format_sci(lineage.dt_hydro_edge_av) +
+                        " dt_hydro_edge_accel=" +
+                        format_sci(lineage.dt_hydro_edge_accel) +
+                        " dt_hydro_subzonal=" +
+                        format_sci(lineage.dt_hydro_subzonal) +
                         " dt_hydro_axis_margin=" +
                         format_sci(lineage.dt_hydro_axis_margin) +
                         " dt_hydro_volume_rate=" +
@@ -5408,6 +6270,37 @@ DtLineage compute_dt_lineage(const core::State& state,
     }
   }
 
+  if (reanchor != nullptr) {
+    if (reanchor->pending) {
+      reanchor->pending = false;
+      double candidate = lineage.dt_hydro;
+      const double other_bounds[] = {
+          lineage.dt_cond,     lineage.dt_burn,  lineage.dt_hot_e,
+          lineage.dt_visc,     lineage.dt_rad,   lineage.dt_output,
+          lineage.dt_remaining, lineage.dt_max_namelist};
+      for (const double bound : other_bounds) {
+        if (bound > 0.0 && std::isfinite(bound) && bound < candidate) {
+          candidate = bound;
+        }
+      }
+      if (reanchor->pre_spike_dt_chosen > 0.0 &&
+          reanchor->pre_spike_dt_chosen < candidate) {
+        candidate = reanchor->pre_spike_dt_chosen;
+      }
+      if (std::isfinite(candidate) && candidate > 0.0 &&
+          candidate > lineage.dt_chosen) {
+        lineage.dt_chosen = candidate;
+        lineage.dt_uncapped_by_contact =
+            std::max(lineage.dt_uncapped_by_contact, candidate);
+        lineage.limiter = "rezone_reanchor";
+      }
+    }
+    if (lineage.limiter != "hydro" && std::isfinite(lineage.dt_chosen) &&
+        lineage.dt_chosen > 0.0) {
+      reanchor->pre_spike_dt_chosen = lineage.dt_chosen;
+    }
+  }
+
   if (dt_lineage_enabled) {
     write_dt_lineage_jsonl(state, lineage);
   }
@@ -5449,6 +6342,11 @@ void Driver::run(core::State& state,
   core::Config cfg = cfg_input;
   resolve_temperature_model(cfg, state);
   assert_driver_retry_supported(cfg);
+  const double fixed_dt = i1b_fixed_dt();
+  if (fixed_dt > 0.0 && fixed_dt < cfg.numerics.dt.min_s) {
+    throw core::namelist::ConfigError(
+        "TENRYU_I1B_FIXED_DT must be >= Numerics.dt.min_s");
+  }
 
   const bool dim_ok =
       (cfg.main.dimension == "1D_SPH" && cfg.main.dim == 1) ||
@@ -5464,6 +6362,12 @@ void Driver::run(core::State& state,
       cfg.main.dimension == "2D_RZ" && cfg.numerics.hydro.enabled;
   if (f09_corner_mass_fallback_enabled) {
     hydro::rz::corner_mass_fallback_run_start();
+  }
+  hydro::build_axis_core_disk(state, cfg);
+  // Restart intentionally re-baselines band-ALE A0 and runtime state from checkpoint geometry.
+  hydro::band_ale::run_start(state, cfg);
+  if (cfg.numerics.hydro.axis_projection.enabled) {
+    hydro::axis_projection::run_start(cfg);
   }
 
   profile_observability_.reset_at_run_start(cfg);
@@ -5486,11 +6390,22 @@ void Driver::run(core::State& state,
       core::effective_diagnostics_hotspot_gas_enabled(cfg);
   const bool mesh_quality_min_enabled =
       cfg.numerics.diagnostics.mesh_quality_min.enabled;
+  const bool ale_state_monitor_enabled =
+      cfg.numerics.ale.runtime_controller.monitor_enabled;
+  if (ale_state_monitor_enabled && ale_monitor_machine.has_value() &&
+      state.t <= ale_monitor_last_t) {
+    reset_runtime_ale_monitor_state(cfg);
+  }
   if (cfg.numerics.profile.icf_standard_ale.enabled) {
     core::validate_icf_standard_ale_profile_config(cfg, profile_observability);
     log_profile_observability(*profile_observability, "run_start");
   }
   const auto finalize_profile_before_fatal = [&]() {
+    hydro::corner_collapse_ledger_flush();
+    hydro::ale::remap_dispatch_audit_flush();
+    hydro::ale::gcl_audit_flush();
+    hydro::core_clearance_controller_flush();
+    hydro::shadow_homothety_flush();
     if (cfg.numerics.profile.icf_standard_ale.enabled) {
       log_profile_observability(*profile_observability, "before_fatal_abort");
       profile_observability->finalize_at_run_end(cfg, false);
@@ -5641,6 +6556,7 @@ void Driver::run(core::State& state,
       cfg.parallel.decomposition.method,
       decomposition_dims,
       cfg.parallel.decomposition.min_cells_per_rank);
+  reale_mode::validate_runtime_scope(cfg, part_info.n_ranks);
   if (part_info.n_ranks > 1) {
     const int nz_stride = std::max(part_info.global_nz, 1);
     state.owned_cell_begin = part_info.local_cell_range[0][0] * nz_stride;
@@ -5658,6 +6574,29 @@ void Driver::run(core::State& state,
         std::min(n_cells_total, state.owned_cell_end + ghost_span));
   }
   parallel::Reduction reducer(part_info.n_ranks);
+  mesh::ZReflectionMaps z_reflection_maps;
+  bool z_reflection_audit_active = false;
+  if (cfg.numerics.z_reflection.mode == "audit") {
+    if (!state.mesh.topo.multiblock.has_value()) {
+      z_reflection_maps.failure =
+          "initial mesh has no MultiBlockTopology";
+    } else {
+      const auto initial_node_r = copy_field_to_host(state.x_r);
+      const auto initial_node_z = copy_field_to_host(state.x_z);
+      z_reflection_maps = mesh::build_z_reflection_maps(
+          *state.mesh.topo.multiblock, initial_node_r, initial_node_z);
+    }
+    z_reflection_audit_active = z_reflection_maps.valid;
+    if (!z_reflection_audit_active && part_info.rank == 0) {
+      core::log_warning("[z-reflection] " + cfg.numerics.z_reflection.mode +
+                        " unavailable: " +
+                        z_reflection_maps.failure);
+    }
+  }
+  hydro::ale::remap_dispatch_audit_run_start(state, &reducer, part_info.rank);
+  hydro::ale::gcl_audit_run_start(&reducer, part_info.rank);
+  hydro::core_clearance_controller_run_start(state, cfg, part_info.rank);
+  hydro::shadow_homothety_run_start(state, cfg, part_info.rank);
   parallel::CommBuffers comm_buffers;
   comm_buffers.gpu_aware_mpi = parallel::detect_gpu_aware_mpi();
   bool persistent_loop_active = cfg.numerics.persistent_loop.enabled;
@@ -5799,7 +6738,10 @@ void Driver::run(core::State& state,
   DriverRecloseContext reclose_ctx;
   eos_ctx.initialize(cfg);
   const std::size_t n = state.rho.size();
-  if (eos_ctx.any_table || (!cfg.main.two_temperature && n > 0)) {
+  if (eos_ctx.any_table ||
+      ((!cfg.main.two_temperature ||
+        cfg.numerics.hydro.wake_heat_flux_enabled) &&
+       n > 0)) {
     if (state.cv_e.empty() && n > 0) {
       state.cv_e.reset(n);
     }
@@ -6136,6 +7078,8 @@ void Driver::run(core::State& state,
     }
   };
 
+  int last_plot_step = -1;
+
   // Write initial snapshot (t=0) before main loop
   if (state.step == 0 && part_info.rank == 0) {
     out.write_snapshot(state, cfg, state.step, state.t, case_name, part_info.rank);
@@ -6178,6 +7122,7 @@ void Driver::run(core::State& state,
     if (out.should_plot(state.step, state.t, state, cfg)) {
       if (part_info.rank == 0) {
         out.write_snapshot(state, cfg, state.step, state.t, case_name, part_info.rank);
+        last_plot_step = state.step;
         out.write_run_info(state, cfg);
         core::log_info("[output] wrote snapshot (step=" +
                        std::to_string(state.step) +
@@ -6227,6 +7172,7 @@ void Driver::run(core::State& state,
     const bool trace = persistent_loop_trace;
     if (state.step == 0 && cfg.numerics.dt.initial_s > 0.0) {
       state.dt = cfg.numerics.dt.initial_s / cfg.numerics.dt.growth_factor;
+      state.dt_growth_ref = state.dt;
     }
     while ((cfg.main.t_end - state.t) >
                1.0e-14 * std::max(std::abs(state.t),
@@ -6313,10 +7259,12 @@ void Driver::run(core::State& state,
                          compatible_gate_initial.E_kin;
   }
 
+  int dt_floor_consecutive = 0;
   int dt_floor_stall_count = 0;
   tenryu::diagnostics::MeshDegeneracyForensicsState
       mesh_degeneracy_forensics_state;
   int ring7_seam_proactive_next_allowed_step = 0;
+  DtReanchorState dt_reanchor;
   const auto mark_ring7_seam_rezone_request_step = [&](const int request_step) {
     const int cooldown_steps =
         env_nonnegative_int("TENRYU_I1B_RING7_REZONE_COOLDOWN_STEPS", 3);
@@ -6326,7 +7274,96 @@ void Driver::run(core::State& state,
   };
 
   h1d_dump7("d1");
+  bool fixed_dt_logged = false;
+  bool autopilot_fire_stop = false;
   while (state.t < cfg.main.t_end && state.step < cfg.main.max_steps) {
+    static const std::pair<int, int> forced_ring_release = [] {
+      const char* raw = std::getenv("TENRYU_I1B_RING_RELEASE_FORCE");
+      if (raw == nullptr) {
+        return std::pair<int, int>{0, 0};
+      }
+      const std::string value(raw);
+      const std::size_t colon = value.find(':');
+      const bool valid_shape =
+          colon != std::string::npos && colon > 0 && colon + 1 < value.size() &&
+          value.find(':', colon + 1) == std::string::npos;
+      if (!valid_shape) {
+        TENRYU_ASSERT(
+            false,
+            "TENRYU_I1B_RING_RELEASE_FORCE must be '<step>:<count>' with "
+            "two positive integers");
+        return std::pair<int, int>{0, 0};
+      }
+      const auto parse_positive_int = [](const std::string& token,
+                                         int& parsed) {
+        int result = 0;
+        for (const char ch : token) {
+          if (ch < '0' || ch > '9') {
+            return false;
+          }
+          const int digit = ch - '0';
+          if (result > (std::numeric_limits<int>::max() - digit) / 10) {
+            return false;
+          }
+          result = result * 10 + digit;
+        }
+        if (result <= 0) {
+          return false;
+        }
+        parsed = result;
+        return true;
+      };
+      int step = 0;
+      int count = 0;
+      if (!parse_positive_int(value.substr(0, colon), step) ||
+          !parse_positive_int(value.substr(colon + 1), count)) {
+        TENRYU_ASSERT(
+            false,
+            "TENRYU_I1B_RING_RELEASE_FORCE must be '<step>:<count>' with "
+            "two positive integers in the range [1, INT_MAX]");
+        return std::pair<int, int>{0, 0};
+      }
+      return std::pair<int, int>{step, count};
+    }();
+    static bool forced_ring_release_fired = false;
+    if (forced_ring_release.first > 0 && !forced_ring_release_fired &&
+        state.step == forced_ring_release.first) {
+      forced_ring_release_fired = true;
+      int performed = 0;
+      while (performed < forced_ring_release.second &&
+             hydro::axis_core_disk_release_one_unit(state, cfg)) {
+        ++performed;
+      }
+      core::log_info("[ring-release] FORCED step=" +
+                     std::to_string(forced_ring_release.first) +
+                     " requested=" +
+                     std::to_string(forced_ring_release.second) +
+                     " performed=" + std::to_string(performed));
+    }
+    const bool step_snapshot_wanted =
+        cfg.numerics.hydro.driver_full_step_retry_enabled ||
+        hydro::i1b_path_guard_enabled();
+    const bool g31_transactional =
+        hydro::core_clearance_controller_g31_active();
+    if (step_snapshot_wanted && g31_transactional) {
+      capture_driver_retry_snapshot(retry_snapshot_, state, cfg, nullptr);
+    }
+    hydro::core_clearance_controller_pre_lagrange_rezone(state, cfg);
+    if (g31_transactional &&
+        hydro::core_clearance_controller_g31_take_trial_reject()) {
+      TENRYU_ASSERT(step_snapshot_wanted,
+                    "G3.1 trial reject requires the step retry snapshot");
+      restore_driver_retry_snapshot(state, cfg, retry_snapshot_, false, true,
+                                    nullptr);
+      core::log_warning("[g31] step=" + std::to_string(state.step) +
+                        " trial remap rejected; pre-rezone state restored");
+    }
+    if (!fixed_dt_logged && fixed_dt > 0.0) {
+      if (part_info.rank == 0) {
+        core::log_info("[fixed-dt] forcing dt=" + format_sci(fixed_dt));
+      }
+      fixed_dt_logged = true;
+    }
     if (state.mesh.logical == mesh::LogicalMesh2D::ConeShell) {
       throw core::namelist::ConfigError(
           "cone_shell stepping lands with a later stage; Stage C2 supports mesh build/init/output only");
@@ -6339,6 +7376,7 @@ void Driver::run(core::State& state,
           "polar_in_box stepping is not yet supported (pending the BC refactor); the current scope supports mesh build/init/output only");
     }
     int retry_attempts = 0;
+    int mesh_epoch_commits_this_step = 0;
     HydroStepResult last_hydro_result{};
     bool conduction_retry_requested = false;
     hydro::ConductionResult conduction_retry_result{};
@@ -6348,6 +7386,12 @@ void Driver::run(core::State& state,
     GeometricRetryStagnationState geometric_retry_stagnation_state;
     double retry_dt_before = 0.0;
     double retry_dt_after = 0.0;
+    double bcr_ladder_original_dt =
+        std::numeric_limits<double>::quiet_NaN();
+    double bcr_ladder_retry_dt =
+        std::numeric_limits<double>::quiet_NaN();
+    int bcr_ladder_path_guard_failures = 0;
+    bool bcr_ladder_seed_retry_issued = false;
     std::optional<hydro::ale::RepairPlan> pending_repair_plan;
     int stage24_repair_generation = 0;
     int stage24_rung_reached = 0;
@@ -6356,6 +7400,9 @@ void Driver::run(core::State& state,
     std::string stage24_axis_variational_projection_engaged_via;
     bool stage24_axis_repair_tried_at_current_state = false;
     int stage24_repair_generation_this_step = 0;
+    int measured_corner_j_last_failing_cell = -1;
+    int measured_corner_j_last_failing_corner = -1;
+    int measured_corner_j_same_failure_count = 0;
     bool stage24_pending_repair_state_sensitive = false;
     bool stage24_state_sensitive_repair_executed_this_step = false;
     bool stage24_repair_generation_cap_hit_logged = false;
@@ -6376,29 +7423,15 @@ void Driver::run(core::State& state,
     bool shell_subcycle_committed_this_step = false;
     bool energy_audit_identity_skip_this_step = false;
     bool energy_audit_ale_fallback_this_step = false;
+    static int maxmin_step = -1;
+    static int maxmin_attempts_this_step = 0;
 
-    if (cfg.numerics.hydro.driver_full_step_retry_enabled) {
+    if (step_snapshot_wanted && !g31_transactional) {
       capture_driver_retry_snapshot(retry_snapshot_, state, cfg, nullptr);
     }
 
     while (true) {
-      // I1-B-R terminal absorption: a granted request executes on
-      // the restored pre-step state (ALL remaining cells become stratified
-      // 1D shells), then the run completes as a core1d-only tail — the 2D
-      // mesh is frozen and never stepped again.
-      if (hydro::central_pseudo_core::terminal_absorb_pending(state)) {
-        hydro::central_pseudo_core::execute_terminal_absorption(state, cfg);
-        if (state.central_pseudo_core.terminal_absorbed) {
-          const bool tail_ok =
-              hydro::central_pseudo_core::run_terminal_core1d_tail(
-                  state, cfg, &boundary_pressure_drive);
-          TENRYU_ASSERT(tail_ok,
-                        "terminal core1d tail stalled before t_end");
-          break;
-        }
-        // Execution preconditions were lost: fall through to the normal
-        // attempt so the original failure re-raises honestly.
-      }
+      hydro::entropy_ledger_step_begin(state, cfg);
       clear_i1_operator_profile_attempt(i1_operator_profile_dump);
       reset_dt_lineage_ale_context();
     g_dt_lineage_context.axis_variational_projection_engaged_via =
@@ -6456,7 +7489,10 @@ void Driver::run(core::State& state,
       active_repair_balance = hydro::evaluate_corner_balance(
           state,
           cfg.numerics.hydro.driver_retry_corner_balance_threshold,
-          &reducer);
+          &reducer,
+          state.evacuated_cells.d_geometry_policy_exempt_cells.empty()
+              ? nullptr
+              : state.evacuated_cells.d_geometry_policy_exempt_cells.data());
       g_dt_lineage_context.retry_active_repair_enabled = true;
       g_dt_lineage_context.retry_active_repair_q_balance =
           active_repair_balance.min_q_balance;
@@ -6492,26 +7528,36 @@ void Driver::run(core::State& state,
         cfg.main.t_end,
         "primary",
         &eos_ctx,
-        /*defer_dt_floor_abort=*/true);
+        /*defer_dt_floor_abort=*/true,
+        &dt_reanchor);
     if (step_dt_lineage.dt_floor_abort_pending) {
+      ++dt_floor_consecutive;
       // dt collapsed below Numerics.dt.min_s mid-run. If the collapse is
       // driven by an absorbable active central-core ring cell, arm a ring
       // absorption (executed at the start of this step's Lagrangian phase)
       // and run this one step at the dt floor; otherwise re-raise the abort.
+      const int retry_target_cell =
+          step_dt_lineage.hydro_min_cell_raw >= 0
+              ? step_dt_lineage.hydro_min_cell_raw
+              : step_dt_lineage.hydro_argmin_cell;
       if (hydro::central_pseudo_core::request_ring_absorption(
-              state, cfg, step_dt_lineage.hydro_argmin_cell)) {
+              state, cfg, retry_target_cell)) {
         core::log_warning(
-            "[driver-retry] dt-floor collapse at hydro argmin cell=" +
+            "[driver-retry] dt-floor collapse binding cell=" +
+            std::to_string(retry_target_cell) + " (term=" +
+            step_dt_lineage.hydro_min_other_term + ") acoustic_argmin=" +
             std::to_string(step_dt_lineage.hydro_argmin_cell) +
             "; ring absorption requested, clamping dt to dt.min_s for the "
             "absorption step");
         step_dt_lineage.dt_chosen =
             std::max(step_dt_lineage.dt_chosen, cfg.numerics.dt.min_s);
+        step_dt_lineage.dt_uncapped_by_contact =
+            std::max(step_dt_lineage.dt_uncapped_by_contact,
+                     cfg.numerics.dt.min_s);
         step_dt_lineage.dt_floor_abort_pending = false;
       } else if (state.central_pseudo_core.built &&
-                 (state.central_pseudo_core.min_member_ring_count >
-                      state.central_pseudo_core.member_ring_count ||
-                  state.central_pseudo_core.terminal_absorb_pending)) {
+                 state.central_pseudo_core.min_member_ring_count >
+                     state.central_pseudo_core.member_ring_count) {
         // An absorption is ARMED but not yet executed (it runs at the start
         // of this step's Lagrangian phase via
         // maybe_absorb_first_active_ring). The repeat-pending guard makes
@@ -6531,6 +7577,9 @@ void Driver::run(core::State& state,
             "); clamping dt to dt.min_s for the absorption step");
         step_dt_lineage.dt_chosen =
             std::max(step_dt_lineage.dt_chosen, cfg.numerics.dt.min_s);
+        step_dt_lineage.dt_uncapped_by_contact =
+            std::max(step_dt_lineage.dt_uncapped_by_contact,
+                     cfg.numerics.dt.min_s);
         step_dt_lineage.dt_floor_abort_pending = false;
       } else if (step_dt_lineage.limiter == "growth" &&
                  step_dt_lineage.dt_hydro >= cfg.numerics.dt.min_s) {
@@ -6539,17 +7588,39 @@ void Driver::run(core::State& state,
         // grow back over the following steps.
         step_dt_lineage.dt_chosen =
             std::max(step_dt_lineage.dt_chosen, cfg.numerics.dt.min_s);
+        step_dt_lineage.dt_uncapped_by_contact =
+            std::max(step_dt_lineage.dt_uncapped_by_contact,
+                     cfg.numerics.dt.min_s);
         step_dt_lineage.dt_floor_abort_pending = false;
       } else {
-        history_writer.flush_pending();
-        TENRYU_ASSERT(false, "dt dropped below Numerics.dt.min_s");
+        if (dt_floor_consecutive >=
+            cfg.numerics.dt.min_consecutive_steps) {
+          history_writer.flush_pending();
+          TENRYU_ASSERT(false, "dt dropped below Numerics.dt.min_s");
+        }
+        core::log_warning(
+            "[dt_floor_transient] step=" + std::to_string(state.step) +
+            " t=" + format_sci(state.t) +
+            " dt=" + format_sci(step_dt_lineage.dt_chosen) +
+            " consecutive=" + std::to_string(dt_floor_consecutive) + "/" +
+            std::to_string(cfg.numerics.dt.min_consecutive_steps));
+        step_dt_lineage.dt_chosen =
+            std::max(step_dt_lineage.dt_chosen, cfg.numerics.dt.min_s);
+        step_dt_lineage.dt_floor_abort_pending = false;
       }
+    } else if (step_dt_lineage.dt_chosen >= cfg.numerics.dt.min_s) {
+      dt_floor_consecutive = 0;
     }
     double dt = reducer.allreduce_min(step_dt_lineage.dt_chosen);
+    double dt_ref =
+        reducer.allreduce_min(step_dt_lineage.dt_uncapped_by_contact);
     if (verbose_phase_timing) {
       step_dt_ms += ms(t_dt_start, Clock::now());
     }
     TENRYU_ASSERT(dt > 0.0, "Driver produced non-positive dt");
+    if (!std::isfinite(bcr_ladder_original_dt)) {
+      bcr_ladder_original_dt = dt;
+    }
     if (cfg.numerics.hydro.regime_aware_corner_j_guard_enabled) {
       mesh_regime_cache.invalidate();
     }
@@ -6628,6 +7699,8 @@ void Driver::run(core::State& state,
                                      : "post_axis_band_managed_remap",
                                  &eos_ctx);
           dt = reducer.allreduce_min(step_dt_lineage.dt_chosen);
+          dt_ref =
+              reducer.allreduce_min(step_dt_lineage.dt_uncapped_by_contact);
           if (verbose_phase_timing) {
             step_dt_ms += ms(t_dt_axis_band_start, Clock::now());
           }
@@ -7391,6 +8464,79 @@ void Driver::run(core::State& state,
                                        cfg.numerics.has_physical_rz_axis);
           return mesh_regime_cache.current();
         };
+    const auto compute_corner_scale_for_ale_trigger =
+        [&](const hydro::CellRegime* d_cell_regime) {
+          const std::size_t n_cells =
+              static_cast<std::size_t>(state.mesh.topo.nr) *
+              static_cast<std::size_t>(state.mesh.topo.nz);
+          const auto& inactive_mask =
+              state.evacuated_cells.inactive_member_mask;
+          const auto& contact_active_mask =
+              state.evacuated_cells.contact_active_mask;
+          TENRYU_ASSERT(inactive_mask.empty() || inactive_mask.size() == n_cells,
+                        "corner-J ALE trigger requires evacuated inactive mask "
+                        "size == n_cells");
+          TENRYU_ASSERT(contact_active_mask.empty() ||
+                            contact_active_mask.size() == n_cells,
+                        "corner-J ALE trigger requires contact-active mask "
+                        "size == n_cells");
+
+          bool any_constraint_owned = false;
+          for (std::size_t c = 0; c < n_cells; ++c) {
+            if ((!inactive_mask.empty() && inactive_mask[c] != 0U) ||
+                (!contact_active_mask.empty() &&
+                 contact_active_mask[c] != 0U)) {
+              any_constraint_owned = true;
+              break;
+            }
+          }
+          const auto evaluate = [&]() {
+            return hydro::compute_corner_jacobian_trial_scale(
+                state,
+                dt,
+                cfg.numerics.hydro.corner_jacobian_floor_eps,
+                &reducer,
+                d_cell_regime,
+                cfg.numerics.hydro.regime_aware_corner_j_guard_enabled,
+                cfg.numerics.hydro.axis_margin_guard_enabled,
+                cfg.numerics.hydro.corner_jacobian_ale_trigger_scale,
+                cfg.numerics.has_physical_rz_axis,
+                !state.evacuated_cells.d_cell_axis_edge_collapsed.empty()
+                    ? state.evacuated_cells.d_cell_axis_edge_collapsed.data()
+                    : nullptr,
+                !state.evacuated_cells.d_geometry_policy_exempt_cells.empty()
+                    ? state.evacuated_cells.d_geometry_policy_exempt_cells.data()
+                    : nullptr);
+          };
+          if (!any_constraint_owned) {
+            return evaluate();
+          }
+
+          TENRYU_ASSERT(state.hydro_active.empty() ||
+                            state.hydro_active.size() == n_cells,
+                        "corner-J ALE trigger requires hydro_active size == n_cells");
+          std::vector<std::int8_t> trigger_active = state.hydro_active.empty()
+                                                        ? std::vector<std::int8_t>(
+                                                              n_cells, 1)
+                                                        : state.hydro_active;
+          for (std::size_t c = 0; c < n_cells; ++c) {
+            if ((!inactive_mask.empty() && inactive_mask[c] != 0U) ||
+                (!contact_active_mask.empty() &&
+                 contact_active_mask[c] != 0U)) {
+              trigger_active[c] = 0;
+            }
+          }
+
+          state.hydro_active.swap(trigger_active);
+          try {
+            auto result = evaluate();
+            state.hydro_active.swap(trigger_active);
+            return result;
+          } catch (...) {
+            state.hydro_active.swap(trigger_active);
+            throw;
+          }
+        };
     if (corner_j_ale_trigger_possible || active_repair_possible ||
         pending_repair_possible) {
       hydro::CornerJacobianScaleResult corner_scale{};
@@ -7398,16 +8544,7 @@ void Driver::run(core::State& state,
       if (corner_j_ale_trigger_possible) {
         const hydro::CellRegime* d_cell_regime =
             refresh_mesh_regime_cache_for_corner_guard();
-        corner_scale = hydro::compute_corner_jacobian_trial_scale(
-            state,
-            dt,
-            cfg.numerics.hydro.corner_jacobian_floor_eps,
-            &reducer,
-            d_cell_regime,
-            cfg.numerics.hydro.regime_aware_corner_j_guard_enabled,
-            cfg.numerics.hydro.axis_margin_guard_enabled,
-            cfg.numerics.hydro.corner_jacobian_ale_trigger_scale,
-            cfg.numerics.has_physical_rz_axis);
+        corner_scale = compute_corner_scale_for_ale_trigger(d_cell_regime);
         dt_predicate_fired =
             cfg.numerics.hydro.regime_aware_corner_j_guard_enabled ||
                     cfg.numerics.hydro.axis_margin_guard_enabled
@@ -7524,6 +8661,9 @@ void Driver::run(core::State& state,
         }
         const hydro::ale::AleDriverRetryContext* retry_context_ptr =
             retry_context.active ? &retry_context : nullptr;
+        hydro::entropy_ledger_begin(
+            state, cfg, hydro::EntropyLedgerStage::Ale);
+        state.mesh.materialize_host_svec();
         const auto ale_out = hydro::ale::apply_ale_with_request(
             state,
             cfg,
@@ -7542,6 +8682,8 @@ void Driver::run(core::State& state,
                        : "corner-J predicted trial scale below trigger threshold"),
             profile_observability,
             retry_context_ptr);
+        hydro::entropy_ledger_end(
+            state, cfg, hydro::EntropyLedgerStage::Ale);
         energy_audit_identity_skip_this_step =
             energy_audit_identity_skip_this_step ||
             ale_out.energy_audit_identity_skip;
@@ -7639,20 +8781,12 @@ void Driver::run(core::State& state,
                                std::max(ale_out.E_floor_injected, 0.0) +
                                    ale_out.E_redistribution_unresolved);
         log_ale_remap_floor_closure("pre_hydro", ale_out);
+        hydro::CornerJacobianScaleResult post_ale_corner_scale{};
         if (corner_j_ale_trigger_possible) {
           const hydro::CellRegime* d_cell_regime =
               refresh_mesh_regime_cache_for_corner_guard();
-          const auto post_ale_corner_scale =
-              hydro::compute_corner_jacobian_trial_scale(
-                  state,
-                  dt,
-                  cfg.numerics.hydro.corner_jacobian_floor_eps,
-                  &reducer,
-                  d_cell_regime,
-                  cfg.numerics.hydro.regime_aware_corner_j_guard_enabled,
-                  cfg.numerics.hydro.axis_margin_guard_enabled,
-                  cfg.numerics.hydro.corner_jacobian_ale_trigger_scale,
-                  cfg.numerics.has_physical_rz_axis);
+          post_ale_corner_scale =
+              compute_corner_scale_for_ale_trigger(d_cell_regime);
           g_dt_lineage_context.post_ale_corner_trial_scale =
               post_ale_corner_scale.scale;
           g_dt_lineage_context.post_ale_first_failing_cell =
@@ -7681,11 +8815,15 @@ void Driver::run(core::State& state,
                                    : post_ale_corner_scale.first_failing_corner));
           }
         }
+        hydro::CornerBalanceResult post_ale_balance{};
         if (active_repair_possible) {
-          const auto post_ale_balance = hydro::evaluate_corner_balance(
+          post_ale_balance = hydro::evaluate_corner_balance(
               state,
               cfg.numerics.hydro.driver_retry_corner_balance_threshold,
-              &reducer);
+              &reducer,
+              state.evacuated_cells.d_geometry_policy_exempt_cells.empty()
+                  ? nullptr
+                  : state.evacuated_cells.d_geometry_policy_exempt_cells.data());
           g_dt_lineage_context.retry_active_repair_post_ale_q_balance =
               post_ale_balance.min_q_balance;
           g_dt_lineage_context.retry_active_repair_post_ale_still_bad =
@@ -7701,6 +8839,28 @@ void Driver::run(core::State& state,
                 std::to_string(post_ale_balance.first_failing_corner));
           }
         }
+        if (cfg.numerics.ale.mesh_epoch_enabled && ale_out.applied &&
+            mesh_epoch_commits_this_step <
+                cfg.numerics.ale.mesh_epoch_max_per_step) {
+          bool quality_improved = false;
+          if (corner_j_ale_trigger_possible) {
+            quality_improved =
+                post_ale_corner_scale.scale > corner_scale.scale;
+          } else if (active_repair_possible) {
+            quality_improved = post_ale_balance.min_q_balance >
+                               active_repair_balance.min_q_balance;
+          }
+          if (quality_improved) {
+            capture_driver_retry_snapshot(retry_snapshot_, state, cfg, nullptr);
+            ++mesh_epoch_commits_this_step;
+            core::log_warning(
+                "[mesh-epoch] committed k=" +
+                std::to_string(mesh_epoch_commits_this_step) + "/" +
+                std::to_string(cfg.numerics.ale.mesh_epoch_max_per_step) +
+                " at step=" + std::to_string(state.step) +
+                " (pre-hydro repair accumulated into the retry snapshot)");
+          }
+        }
         const auto t_dt_retry_start =
             verbose_phase_timing ? Clock::now() : Clock::time_point{};
         step_dt_lineage =
@@ -7712,11 +8872,23 @@ void Driver::run(core::State& state,
                                    : "post_corner_j_ale",
                                &eos_ctx);
         dt = reducer.allreduce_min(step_dt_lineage.dt_chosen);
+        dt_ref =
+            reducer.allreduce_min(step_dt_lineage.dt_uncapped_by_contact);
         if (verbose_phase_timing) {
           step_dt_ms += ms(t_dt_retry_start, Clock::now());
         }
         TENRYU_ASSERT(dt > 0.0, "Driver produced non-positive dt after pre-hydro ALE");
       }
+    }
+    const auto& runtime_ale_cfg = cfg.numerics.ale.runtime_controller;
+    if (runtime_ale_cfg.pre_step_enabled &&
+        runtime_ale_cfg.controller_enabled && !controller_disengaged &&
+        ale_monitor_machine.has_value() &&
+        ale_monitor_machine->state() == hydro::AleMonitorState::kHard &&
+        !runtime_ale_controller_suppressed_by_morph_window(state, cfg) &&
+        runtime_ale_controller_activation_reached(state, cfg)) {
+      run_runtime_ale_controller_event_if_due(
+          state, cfg, hydro::AleMonitorState::kHard);
     }
     const char* lm_invariant_dump_env =
         std::getenv("TENRYU_LM_INVARIANT_DUMP");
@@ -8211,13 +9383,24 @@ void Driver::run(core::State& state,
         const std::vector<double>* hk_sigma_R_max_ptr =
             (hk_sigma_R_max.size() == state.rho.size()) ? &hk_sigma_R_max : nullptr;
         h1d_dump7("d2");
+        hydro::entropy_ledger_begin(
+            state, cfg, hydro::EntropyLedgerStage::Hydro);
+        hydro::stripe_gate_begin(state, cfg);
         res = hydro_1d.lagrangian_step(
             state, dt_op, cfg, t_op, &hydro_E_floor, &hydro_clamp_count,
             &hydro_rho_clamp_count, part_info, &comm_buffers, nullptr, &eos_ctx,
             hk_sigma_R_max_ptr,
             rad_gamma43_coupling_on ? &rad_gamma43_p_r : nullptr,
             rad_gamma43_coupling_on ? &rad_gamma43_W_r : nullptr);
+        hydro::stripe_gate_end(state, cfg, dt_op, t_op + dt_op);
+        hydro::entropy_ledger_end(
+            state, cfg, hydro::EntropyLedgerStage::Hydro);
+        hydro::entropy_ledger_accumulate_work_buckets(state, cfg, dt_op);
       } else {
+        hydro::entropy_ledger_begin(
+            state, cfg, hydro::EntropyLedgerStage::Hydro);
+        hydro::stripe_gate_begin(state, cfg);
+        hydro::axis_cell_ledger_step_begin(state, cfg);
         res = hydro_2d.lagrangian_step(
             state, dt_op, cfg, t_op, &hydro_E_floor, &hydro_clamp_count,
             &hydro_rho_clamp_count, part_info, &comm_buffers, nullptr, hydro_half,
@@ -8225,6 +9408,11 @@ void Driver::run(core::State& state,
             r_momentum_source_audit_active
                 ? &hydro_r_momentum_source_impulse
                 : nullptr);
+        state.mesh.materialize_host_svec();
+        hydro::stripe_gate_end(state, cfg, dt_op, t_op + dt_op);
+        hydro::entropy_ledger_end(
+            state, cfg, hydro::EntropyLedgerStage::Hydro);
+        hydro::entropy_ledger_accumulate_work_buckets(state, cfg, dt_op);
       }
       uniformize_hydro_step_result(res);
       last_hydro_result = res;
@@ -8238,6 +9426,18 @@ void Driver::run(core::State& state,
         }
         log_phase_energy("hydro_callback_retry", e_before_phase);
         return res;
+      }
+      if (is_2d) {
+        hydro::corner_collapse_ledger_capture(
+            state, state.step + 1, t_op + dt_op, dt_op,
+            hydro::CornerCollapseLedgerTrial::Accepted);
+      }
+      if (cfg.numerics.hydro.wake_heat_flux_enabled && is_2d &&
+          hydro::wake_angular_heat_flux::apply(state, cfg, dt_op)) {
+        hydro_2d.reclose_after_energy_edit(state, cfg, &eos_ctx);
+      }
+      if (is_2d) {
+        hydro::axis_cell_ledger_step_end(state, cfg, dt_op);
       }
       if (r_momentum_source_audit_active) {
         r_momentum_source_impulse_step += hydro_r_momentum_source_impulse;
@@ -8266,8 +9466,10 @@ void Driver::run(core::State& state,
       step_clamp_count += std::max(hydro_clamp_count, 0);
       step_clamp_count += std::max(hydro_rho_clamp_count, 0);
       const double hydro_pdv_work =
-          compute_boundary_pdv_work(state, cfg, dt_op, t_op);
-      step_E_pdV_bdry += hydro_pdv_work;
+          is_2d ? res.pressure_boundary_work_step
+                : compute_boundary_pdv_work_1d(state, cfg, dt_op, t_op);
+      // Legacy ledger convention: E_pdV_bdry is outward pdV flux, not work on the gas.
+      step_E_pdV_bdry += is_2d ? -hydro_pdv_work : hydro_pdv_work;
       const std::string hydro_operator_name =
           hydro_half != nullptr ? std::string("hydro_") + hydro_half
                                 : std::string("hydro");
@@ -8319,6 +9521,8 @@ void Driver::run(core::State& state,
 	      if (is_2d && cfg.mesh.motion == "ale" && cfg.numerics.ale.enabled &&
 	          !hydro::ale::ale_identity_mode_enabled(cfg) &&
 	          cfg.numerics.ale.conservative_remap_enabled &&
+          // Band-ALE mode is transaction-only — the flow stays Lagrangian between band engagements, mirroring the multiblock arrangement (§18.6).
+          !cfg.numerics.ale.band_ale.enabled &&
           !tenryu::mesh::mesh_topo_is_multiblock(cfg.mesh) &&
           !cfg.numerics.hydro.hllc_z_flux_2d_rz) {
         const bool dump_operator_profile_this_step =
@@ -8343,8 +9547,12 @@ void Driver::run(core::State& state,
             diagnostics::RadialFourierStageId::Remap,
             diagnostics::RadialFourierStagePhase::Before,
             t_op + dt_op);
+        hydro::entropy_ledger_begin(
+            state, cfg, hydro::EntropyLedgerStage::Ale);
         const auto remap_out =
             hydro::ale::ale_remap_2d_rz(state, cfg, &eos_ctx, dt_op);
+        hydro::entropy_ledger_end(
+            state, cfg, hydro::EntropyLedgerStage::Ale);
         emit_radial_fourier_audit(
             diagnostics::RadialFourierStageId::Remap,
             diagnostics::RadialFourierStagePhase::After,
@@ -8429,11 +9637,15 @@ void Driver::run(core::State& state,
 	          !hydro::ale::ale_identity_mode_enabled(cfg) &&
 	          cfg.numerics.ale.axis_band_managed_remap_every_hydro_half_step &&
           !axis_band_applied_this_half_step) {
+        hydro::entropy_ledger_begin(
+            state, cfg, hydro::EntropyLedgerStage::Ale);
         const auto axis_result = run_axis_band_controller(
             true,
             cfg.numerics.ale.axis_band_managed_remap_width,
             false,
             nullptr);
+        hydro::entropy_ledger_end(
+            state, cfg, hydro::EntropyLedgerStage::Ale);
         axis_band_applied_this_half_step = axis_result.remap_succeeded;
       }
       if (verbose_phase_timing) {
@@ -8498,6 +9710,10 @@ void Driver::run(core::State& state,
       const WjOpAuditSnapshot wj_b_cond =
           wj_op_audit_active ? wj_audit_capture() : WjOpAuditSnapshot{};
       cudaStream_t cond_stream = nullptr;
+      std::vector<double> conduction_ee_before;
+      if (cfg.numerics.diagnostics.conduction_energy_rate_export.enabled) {
+        conduction_ee_before = copy_field_to_host(state.ee);
+      }
       const hydro::ConductionResult conduction_result =
           hydro::conduction_step(
               state, dt_op, cfg, part_info, &comm_buffers, cond_stream, &eos_ctx);
@@ -8563,6 +9779,20 @@ void Driver::run(core::State& state,
                                           cond_cv_old);
       } else {
         sync_ee_from_Te_table(state, cfg);
+      }
+      if (cfg.numerics.diagnostics.conduction_energy_rate_export.enabled) {
+        const std::vector<double> conduction_ee_after =
+            copy_field_to_host(state.ee);
+        const std::vector<double> conduction_rho_after =
+            copy_field_to_host(state.rho);
+        std::vector<double> conduction_e_rate(
+            conduction_ee_before.size(), 0.0);
+        for (std::size_t c = 0; c < conduction_e_rate.size(); ++c) {
+          conduction_e_rate[c] =
+              (conduction_ee_after[c] - conduction_ee_before[c]) *
+              conduction_rho_after[c] / dt_op;
+        }
+        state.conduction_e_rate.copy_from_host(conduction_e_rate);
       }
       if (cond_ebal_enabled) {
         const double cond_ebal_U2 =
@@ -9801,6 +11031,8 @@ void Driver::run(core::State& state,
           return;
         }
       }
+      hydro::entropy_ledger_begin(
+          state, cfg, hydro::EntropyLedgerStage::Radiation);
       const PhaseEnergySnapshot e_before_phase = capture_phase_energy();
       const auto t_phase_start =
           verbose_phase_timing ? Clock::now() : Clock::time_point{};
@@ -10495,6 +11727,8 @@ void Driver::run(core::State& state,
       }
       wj_audit_log("radiation", wj_b_rad);
       log_phase_energy("radiation_callback", e_before_phase);
+      hydro::entropy_ledger_end(
+          state, cfg, hydro::EntropyLedgerStage::Radiation);
     };
 
     if (state.mesh.dim == 1) {
@@ -10638,7 +11872,337 @@ void Driver::run(core::State& state,
     }
 
     if (last_hydro_result.retry_required &&
-        !cfg.numerics.hydro.driver_full_step_retry_enabled) {
+        last_hydro_result.geometry_soft_failure.valid) {
+      const auto& failure = last_hydro_result.geometry_soft_failure;
+      hydro::core_clearance_controller_note_event(
+          hydro::CoreClearanceControllerEventKind::GEOMETRY_RETRY);
+      const int retry_limit =
+          cfg.numerics.hydro.driver_full_step_retry_max_attempts;
+      const double dt_new = 0.5 * failure.sigma_safe * dt;
+      char path_guard_log[384];
+      std::snprintf(
+          path_guard_log,
+          sizeof(path_guard_log),
+          "[path-guard] step=%d stage=%s cell=%d k=%d predicate=%s "
+          "min=%.6e sigma_safe=%.4f dt_new=%.6e",
+          state.step,
+          path_guard_stage_name(last_hydro_result.stage),
+          failure.cell,
+          failure.corner_or_slot,
+          failure.predicate != nullptr ? failure.predicate : "",
+          failure.min_value,
+          failure.sigma_safe,
+          dt_new);
+      core::log_warning(path_guard_log);
+      const bool witness_valid =
+          failure.cell >= 0 && failure.predicate != nullptr &&
+          failure.predicate[0] != '\0' &&
+          std::isfinite(failure.min_value) &&
+          std::isfinite(failure.sigma_safe) &&
+          failure.sigma_safe >= 0.0 && failure.sigma_safe <= 1.0;
+      const bool dt_valid =
+          std::isfinite(dt_new) && dt_new > cfg.numerics.dt.min_s &&
+          dt_new < dt;
+      const bool bcr_ladder_active =
+          hydro::core_clearance_controller_bcr_rezone_active();
+      const bool bcr_ladder_terminal_failure =
+          bcr_ladder_active && bcr_ladder_seed_retry_issued;
+      if (bcr_ladder_terminal_failure) {
+        core::log_warning(
+            "[bcr-ladder] step=" + std::to_string(state.step) +
+            " rung=5 cell=" + std::to_string(failure.cell) +
+            " action=fail_closed");
+      }
+      static const bool maxmin_enabled = [] {
+        const char* raw = std::getenv("TENRYU_I1B_MAXMIN_REZONE");
+        return raw != nullptr && raw[0] != '\0' && raw[0] != '0';
+      }();
+      if (maxmin_step != state.step) {
+        maxmin_step = state.step;
+        maxmin_attempts_this_step = 0;
+      }
+      const bool maxmin_witness_ok =
+          failure.cell >= 0 && failure.predicate != nullptr &&
+          failure.predicate[0] != '\0' &&
+          std::isfinite(failure.min_value);
+      if (maxmin_enabled && maxmin_witness_ok &&
+          maxmin_attempts_this_step < 4 &&
+          (cfg.numerics.hydro.driver_full_step_retry_enabled ||
+           hydro::i1b_path_guard_enabled()) &&
+          retry_attempts <
+              cfg.numerics.hydro.driver_full_step_retry_max_attempts) {
+        ++maxmin_attempts_this_step;
+        restore_driver_retry_snapshot(
+            state, cfg, retry_snapshot_, false, true, nullptr);
+        axis_band_applied_this_attempt = false;
+        hydro::ale::reset_remap_mass_closure_step_max();
+        const auto repair = hydro::ale::apply_maxmin_untangle_repair(
+            state, cfg, part_info, &reducer, &eos_ctx, dt, failure.cell);
+        if (repair.applied) {
+          retry_trigger_result = last_hydro_result;
+          retry_trigger_result.reason = "maxmin_rezone_retry";
+          retry_dt_before = dt;
+          retry_dt_after = dt;
+          core::log_warning(
+              "[driver-retry] step=" + std::to_string(state.step) +
+              " attempt=" + std::to_string(retry_attempts) + "/" +
+              std::to_string(
+                  cfg.numerics.hydro.driver_full_step_retry_max_attempts) +
+              " reason=maxmin_rezone attempt_in_step=" +
+              std::to_string(maxmin_attempts_this_step) + " cell=" +
+              std::to_string(failure.cell));
+          continue;
+        }
+        // The repair either left state untouched or restored its transaction;
+        // fall through to ring release and the existing dt ladder.
+      }
+      const bool ring_release_available =
+          hydro::axis_core_ring_release_enabled(cfg) &&
+          cfg.numerics.ale.euler_window.enabled &&
+          cfg.numerics.ale.euler_window.role == "axis_survival_core";
+      if (ring_release_available && witness_valid &&
+          (cfg.numerics.hydro.driver_full_step_retry_enabled ||
+           hydro::i1b_path_guard_enabled()) &&
+          retry_attempts <
+              cfg.numerics.hydro.driver_full_step_retry_max_attempts) {
+        restore_driver_retry_snapshot(
+            state, cfg, retry_snapshot_, false, true, nullptr);
+        axis_band_applied_this_attempt = false;
+        if (hydro::axis_core_disk_release_one_unit(state, cfg)) {
+          ++retry_attempts;
+          retry_trigger_result = last_hydro_result;
+          retry_trigger_result.reason = "ring_release_retry";
+          retry_dt_before = dt;
+          // guard-suggested dt: the release needs subsequent steps to yield; the current step is cured by the guard dt law
+          retry_dt_after = dt_new;
+          core::log_warning(
+              "[driver-retry] step=" + std::to_string(state.step) +
+              " attempt=" + std::to_string(retry_attempts) + "/" +
+              std::to_string(
+                  cfg.numerics.hydro.driver_full_step_retry_max_attempts) +
+              " reason=ring_release first_cell=" +
+              std::to_string(last_hydro_result.first_failing_cell) +
+              " dt: " + format_sci(dt) + " -> " + format_sci(dt_new));
+          dt = dt_new;
+          dt_ref = dt;
+          continue;
+        }
+        // Exhausted: fall through to the existing fail-closed / ladder / dt
+        // logic on the restored state (subsequent restores of the same
+        // snapshot are idempotent — do not restructure the existing code).
+      }
+      static int row_merge_step = -1;
+      static int row_merge_attempts_this_step = 0;
+      if (row_merge_step != state.step) { row_merge_step = state.step; row_merge_attempts_this_step = 0; }
+      const bool merge_witness_ok =
+          failure.cell >= 0 && failure.predicate != nullptr &&
+          failure.predicate[0] != '\0' && std::isfinite(failure.min_value);
+      if (hydro::row_merge_enabled() && merge_witness_ok &&
+          row_merge_attempts_this_step < 1 &&
+          (retry_attempts >= cfg.numerics.hydro.driver_full_step_retry_max_attempts - 1 || !dt_valid) &&
+          (cfg.numerics.hydro.driver_full_step_retry_enabled ||
+           hydro::i1b_path_guard_enabled())) {
+        ++row_merge_attempts_this_step;
+        restore_driver_retry_snapshot(state, cfg, retry_snapshot_, false, true, nullptr);
+        axis_band_applied_this_attempt = false;
+        auto merge = hydro::apply_tier_row_merge(state, cfg, failure.cell);
+        if (!merge.committed && merge.reject_reason != nullptr &&
+            std::strcmp(merge.reject_reason, "split_infeasible") == 0) {
+          int repair_seed =
+              (merge.first_bad_cell >= 0) ? merge.first_bad_cell : failure.cell;
+          for (int round = 0; round < 2 && !merge.committed; ++round) {
+            hydro::ale::reset_remap_mass_closure_step_max();
+            const auto repair = hydro::ale::apply_maxmin_untangle_repair(
+                state, cfg, part_info, &reducer, &eos_ctx, dt, repair_seed);
+            if (!repair.applied) {
+              core::log_warning(
+                  "[row-merge] composed position repair failed seed=" +
+                  std::to_string(repair_seed));
+              break;
+            }
+            merge = hydro::apply_tier_row_merge(state, cfg, failure.cell);
+            if (merge.committed) {
+              core::log_warning(
+                  "[row-merge] composed repair+merge committed round=" +
+                  std::to_string(round + 1));
+              break;
+            }
+            core::log_warning(
+                std::string("[row-merge] composed merge failed: ") +
+                (merge.reject_reason != nullptr ? merge.reject_reason
+                                                : "(none)") +
+                " cell=" + std::to_string(merge.first_bad_cell) +
+                " round=" + std::to_string(round + 1));
+            const int next_seed =
+                (merge.first_bad_cell >= 0) ? merge.first_bad_cell : -1;
+            if (next_seed < 0 || next_seed == repair_seed ||
+                merge.reject_reason == nullptr ||
+                std::strcmp(merge.reject_reason, "split_infeasible") != 0) {
+              break;  // no new information — stop composing
+            }
+            repair_seed = next_seed;
+          }
+        }
+        if (merge.committed) {
+          capture_driver_retry_snapshot(retry_snapshot_, state, cfg, nullptr);  // the merged topology is the new step baseline
+          retry_attempts = 0;  // topology changed: a fresh retry budget for the new discrete system
+          maxmin_step = -1;  // topology changed: re-arm the max-min repair for the new discrete system
+          retry_trigger_result = last_hydro_result;
+          retry_trigger_result.reason = "row_merge_retry";
+          retry_dt_before = dt;
+          retry_dt_after = dt;
+          core::log_warning("[driver-retry] step=" + std::to_string(state.step) +
+              " reason=row_merge pairs=" + std::to_string(merge.merged_pairs) +
+              " cell=" + std::to_string(failure.cell));
+          continue;
+        }
+        core::log_warning(std::string("[driver-retry] row_merge rejected: ") +
+            (merge.reject_reason != nullptr ? merge.reject_reason : "(none)") +
+            " cell=" + std::to_string(merge.first_bad_cell));
+        // fall through to fail-closed on the restored state
+      }
+      if (!witness_valid || bcr_ladder_terminal_failure ||
+          (!bcr_ladder_active &&
+           (retry_attempts >= retry_limit || !dt_valid))) {
+        std::ostringstream oss;
+        oss << "path-guard full-step retry failed closed"
+            << " at step=" << state.step
+            << " t=" << format_sci(state.t)
+            << " stage=" << static_cast<int>(last_hydro_result.stage)
+            << " cell=" << failure.cell
+            << " k=" << failure.corner_or_slot
+            << " predicate="
+            << (failure.predicate != nullptr ? failure.predicate : "")
+            << " min_value=" << format_sci(failure.min_value)
+            << " sigma_safe=" << format_sci(failure.sigma_safe)
+            << " dt_failed=" << format_sci(dt)
+            << " dt_new=" << format_sci(dt_new)
+            << " retry_attempts=" << retry_attempts
+            << " retry_limit=" << retry_limit
+            << " witness_valid=" << (witness_valid ? 1 : 0)
+            << " dt_valid=" << (dt_valid ? 1 : 0);
+        finalize_profile_before_fatal();
+        TENRYU_ASSERT(false, oss.str());
+      }
+
+      restore_driver_retry_snapshot(
+          state, cfg, retry_snapshot_, false, true, nullptr);
+      axis_band_applied_this_attempt = false;
+      retry_dt_before = dt;
+      ++retry_attempts;
+      retry_trigger_result = last_hydro_result;
+      pending_repair_plan.reset();
+      stage24_pending_repair_state_sensitive = false;
+
+      if (bcr_ladder_active) {
+        if (!std::isfinite(bcr_ladder_original_dt)) {
+          bcr_ladder_original_dt = dt;
+        }
+        if (!std::isfinite(bcr_ladder_retry_dt)) {
+          bcr_ladder_retry_dt = dt;
+        }
+        ++bcr_ladder_path_guard_failures;
+
+        bool bcr_action_available = false;
+        if (bcr_ladder_path_guard_failures == 1) {
+          bcr_action_available =
+              hydro::core_clearance_controller_promote_cell(failure.cell);
+          retry_dt_after = dt;
+          core::log_warning(
+              "[bcr-ladder] step=" + std::to_string(state.step) +
+              " rung=1 cell=" + std::to_string(failure.cell) +
+              " action=promote_constraint");
+          core::log_warning(
+              "[bcr-ladder] step=" + std::to_string(state.step) +
+              " rung=2 cell=" + std::to_string(failure.cell) +
+              " action=same_dt_rezone_retry");
+        } else {
+          const double bcr_dt_new =
+              0.5 * failure.sigma_safe * bcr_ladder_retry_dt;
+          const bool bcr_dt_valid =
+              std::isfinite(bcr_dt_new) &&
+              bcr_dt_new > cfg.numerics.dt.min_s &&
+              bcr_dt_new < bcr_ladder_retry_dt;
+          const bool dt_collapsed =
+              bcr_dt_new < 1.0e-4 * bcr_ladder_original_dt;
+          if (dt_collapsed) {
+            bcr_action_available =
+                hydro::core_clearance_controller_request_feasible_seed(
+                    failure.cell);
+            bcr_ladder_seed_retry_issued = true;
+            retry_dt_after = bcr_ladder_retry_dt;
+            core::log_warning(
+                "[bcr-ladder] step=" + std::to_string(state.step) +
+                " rung=4 cell=" + std::to_string(failure.cell) +
+                " action=direct_feasible_seed_rezone_retry");
+          } else if (bcr_dt_valid) {
+            bcr_action_available =
+                hydro::core_clearance_controller_promote_cell(failure.cell);
+            bcr_ladder_retry_dt = bcr_dt_new;
+            retry_dt_after = bcr_ladder_retry_dt;
+            core::log_warning(
+                "[bcr-ladder] step=" + std::to_string(state.step) +
+                " rung=3 cell=" + std::to_string(failure.cell) +
+                " action=reduce_dt_rezone_retry");
+          }
+        }
+
+        if (!bcr_action_available) {
+          core::log_warning(
+              "[bcr-ladder] step=" + std::to_string(state.step) +
+              " rung=5 cell=" + std::to_string(failure.cell) +
+              " action=fail_closed");
+          std::ostringstream oss;
+          oss << "path-guard BCR ladder failed closed"
+              << " at step=" << state.step
+              << " t=" << format_sci(state.t)
+              << " stage=" << static_cast<int>(last_hydro_result.stage)
+              << " cell=" << failure.cell
+              << " k=" << failure.corner_or_slot
+              << " predicate="
+              << (failure.predicate != nullptr ? failure.predicate : "")
+              << " min_value=" << format_sci(failure.min_value)
+              << " sigma_safe=" << format_sci(failure.sigma_safe)
+              << " dt_failed=" << format_sci(dt)
+              << " dt_new=" << format_sci(dt_new)
+              << " dt_original=" << format_sci(bcr_ladder_original_dt)
+              << " retry_attempts=" << retry_attempts
+              << " witness_valid=" << (witness_valid ? 1 : 0)
+              << " dt_valid=" << (dt_valid ? 1 : 0);
+          finalize_profile_before_fatal();
+          TENRYU_ASSERT(false, oss.str());
+        }
+        hydro::core_clearance_controller_pre_lagrange_rezone(state, cfg);
+        if (hydro::core_clearance_controller_g31_take_trial_reject()) {
+          restore_driver_retry_snapshot(state, cfg, retry_snapshot_, false,
+                                        true, nullptr);
+          core::log_warning(
+              "[g31] step=" + std::to_string(state.step) +
+              " ladder trial remap rejected; snapshot restored");
+        }
+      } else {
+        retry_dt_after = dt_new;
+      }
+
+      core::log_warning(
+          "[driver-retry] step=" + std::to_string(state.step) +
+          " attempt=" + std::to_string(retry_attempts) + "/" +
+          std::to_string(retry_limit) + " reason=path_guard cell=" +
+          std::to_string(failure.cell) + " k=" +
+          std::to_string(failure.corner_or_slot) + " predicate=" +
+          failure.predicate + " dt: " + format_sci(retry_dt_before) +
+          " -> " + format_sci(retry_dt_after));
+      continue;
+    }
+
+    const bool path_guard_geometry_safety_retry =
+        hydro::i1b_path_guard_enabled() &&
+        std::string(last_hydro_result.reason != nullptr
+                        ? last_hydro_result.reason
+                        : "") == "mesh_geometry";
+    if (last_hydro_result.retry_required &&
+        !cfg.numerics.hydro.driver_full_step_retry_enabled &&
+        !path_guard_geometry_safety_retry) {
       std::ostringstream oss;
       oss << "Hydro soft failure requires driver_full_step_retry_enabled=true"
           << " at step=" << state.step
@@ -10663,7 +12227,8 @@ void Driver::run(core::State& state,
     }
 
     if (last_hydro_result.retry_required &&
-        cfg.numerics.hydro.driver_full_step_retry_enabled) {
+        (cfg.numerics.hydro.driver_full_step_retry_enabled ||
+         path_guard_geometry_safety_retry)) {
       same_dt_strategy_retry_pending_success = false;
       observe_geometric_retry_failure(geometric_retry_stagnation_state,
                                       last_hydro_result,
@@ -11109,6 +12674,84 @@ void Driver::run(core::State& state,
             << " reason="
             << (last_hydro_result.reason != nullptr ? last_hydro_result.reason : "")
             << " retry_limit=" << retry_limit;
+        int contact_front_center_j = last_hydro_result.first_failing_j;
+        if (contact_front_center_j < 0 &&
+            last_hydro_result.first_failing_cell >= 0 &&
+            state.mesh.topo.nz > 0) {
+          contact_front_center_j =
+              last_hydro_result.first_failing_cell % state.mesh.topo.nz;
+        }
+        const int contact_front_j_begin =
+            std::max(0, contact_front_center_j - 8);
+        const int contact_front_j_end =
+            std::min(state.mesh.topo.nz - 1, contact_front_center_j + 8);
+        std::vector<double> contact_front_r;
+        std::vector<double> contact_front_z;
+        state.x_r.copy_to_host(contact_front_r);
+        state.x_z.copy_to_host(contact_front_z);
+        const int contact_front_node_stride = state.mesh.topo.nz + 1;
+        for (int j = contact_front_j_begin; j <= contact_front_j_end; ++j) {
+          double phi = std::numeric_limits<double>::quiet_NaN();
+          bool engaged = false;
+          const core::EvacContactSlot* closest_slot = nullptr;
+          int closest_pair = -1;
+          int closest_row = std::numeric_limits<int>::max();
+          for (const core::EvacContactSlot& slot :
+               state.contact_graph.records) {
+            if (slot.state != core::EvacContactState::kActive ||
+                slot.cell < 0 || slot.cell % state.mesh.topo.nz != j) {
+              continue;
+            }
+            for (int pair = 0; pair < 2; ++pair) {
+              const int pair_row =
+                  std::min(slot.node_a[pair] / contact_front_node_stride,
+                           slot.node_b[pair] / contact_front_node_stride);
+              if (pair_row < closest_row) {
+                closest_slot = &slot;
+                closest_pair = pair;
+                closest_row = pair_row;
+              }
+            }
+          }
+          if (closest_slot != nullptr) {
+            phi = closest_slot->gap_pair[closest_pair];
+            engaged = closest_slot->pair_engaged[closest_pair] != 0U;
+          } else {
+            const int row_zero_node = state.mesh.topo.node_index(0, j);
+            int counterpart = -1;
+            for (const core::EvacContactSlot& slot :
+                 state.contact_graph.records) {
+              for (int pair = 0; pair < 2; ++pair) {
+                if (slot.node_a[pair] == row_zero_node) {
+                  counterpart = slot.node_b[pair];
+                } else if (slot.node_b[pair] == row_zero_node) {
+                  counterpart = slot.node_a[pair];
+                } else {
+                  continue;
+                }
+                engaged = slot.pair_engaged[pair] != 0U;
+                break;
+              }
+              if (counterpart >= 0) {
+                break;
+              }
+            }
+            if (counterpart >= 0 &&
+                counterpart < static_cast<int>(contact_front_r.size()) &&
+                counterpart < static_cast<int>(contact_front_z.size())) {
+              phi = std::hypot(
+                  contact_front_r[static_cast<std::size_t>(counterpart)] -
+                      contact_front_r[static_cast<std::size_t>(row_zero_node)],
+                  contact_front_z[static_cast<std::size_t>(counterpart)] -
+                      contact_front_z[static_cast<std::size_t>(row_zero_node)]);
+            } else {
+              engaged = false;
+            }
+          }
+          core::log_warning("[contact-front] j=" + std::to_string(j) +
+                            " phi=" + format_sci(phi) + " engaged=" +
+                            std::to_string(engaged ? 1 : 0));
+        }
         finalize_profile_before_fatal();
         TENRYU_ASSERT(false, oss.str());
       }
@@ -11227,6 +12870,7 @@ void Driver::run(core::State& state,
         retry_dt_before = dt_before_bprime;
         retry_dt_after = dt_after_bprime;
         dt = dt_after_bprime;
+        dt_ref = dt;
         retry_attempts += 1;
         retry_trigger_result = last_hydro_result;
         pending_repair_plan.reset();
@@ -11261,9 +12905,11 @@ void Driver::run(core::State& state,
 
       hydro::ale::RepairPlan repair_plan;
       bool wave1_decision_applied = false;
+      bool measured_state_sensitive_repair = false;
       DispatchDecisionKind wave1_decision_kind =
           DispatchDecisionKind::FallThrough;
-      if (cfg.numerics.hydro.dispatcher_state_sensitive_bypass_enabled) {
+      if (!wave1_decision_applied &&
+          cfg.numerics.hydro.dispatcher_state_sensitive_bypass_enabled) {
         DispatchInputs in;
         in.last_hydro_result = last_hydro_result;
         in.feature_enabled = true;
@@ -11337,9 +12983,79 @@ void Driver::run(core::State& state,
         }
       }
       if (!wave1_decision_applied) {
-        repair_plan =
-            choose_repair_plan(last_hydro_result, state, cfg, dt, retry_attempts);
-        stage24_pending_repair_state_sensitive = false;
+        const std::string measured_corner_j_reason =
+            last_hydro_result.reason != nullptr ? last_hydro_result.reason : "";
+        const bool measured_corner_j_failure =
+            measured_corner_j_reason == "corner_j" ||
+            measured_corner_j_reason == "mesh_quality_corner_j" ||
+            measured_corner_j_reason == "in_hydro_corner_j";
+        const bool measured_corner_j_same_failure =
+            measured_corner_j_failure &&
+            last_hydro_result.first_failing_cell ==
+                measured_corner_j_last_failing_cell &&
+            last_hydro_result.first_failing_corner ==
+                measured_corner_j_last_failing_corner;
+        const int measured_corner_j_prior_same_failure_count =
+            measured_corner_j_same_failure
+                ? measured_corner_j_same_failure_count
+                : 0;
+        if (measured_corner_j_same_failure) {
+          measured_corner_j_same_failure_count += 1;
+        } else if (measured_corner_j_failure) {
+          measured_corner_j_last_failing_cell =
+              last_hydro_result.first_failing_cell;
+          measured_corner_j_last_failing_corner =
+              last_hydro_result.first_failing_corner;
+          measured_corner_j_same_failure_count = 1;
+        } else {
+          measured_corner_j_last_failing_cell = -1;
+          measured_corner_j_last_failing_corner = -1;
+          measured_corner_j_same_failure_count = 0;
+        }
+        const bool measured_corner_j_state_sensitive =
+            measured_corner_j_failure &&
+            last_hydro_result.first_failing_i >= 0 &&
+            last_hydro_result.first_failing_i <=
+                cfg.numerics.hydro.axis_guard_band_cells &&
+            measured_corner_j_prior_same_failure_count >= 2 &&
+            !stage24_axis_repair_tried_at_current_state &&
+            stage24_repair_generation_this_step == 0 &&
+            stage24_repair_generation_this_step <
+                cfg.numerics.hydro
+                    .dispatcher_state_sensitive_repair_cap_per_step;
+        if (measured_corner_j_state_sensitive) {
+          if (cfg.numerics.ale.axis_band_managed_remap_enabled) {
+            pending_axis_band.active = true;
+            pending_axis_band.kind =
+                core::TransactionClientKind::kAxisBandRemap;
+            pending_axis_band.severity =
+                core::TriggerSeverity::kHardAdmissibility;
+            pending_axis_band.state_epoch =
+                static_cast<std::uint64_t>(state.step);
+            pending_axis_band.reason_code = static_cast<std::int32_t>(
+                DispatchDecisionKind::RepairSameDt);
+            pending_axis_band.requested_k =
+                cfg.numerics.ale.axis_band_managed_remap_width;
+            pending_repair_plan.reset();
+            repair_plan.ale_mode = hydro::ale::AleMode::ScheduledDefault;
+            repair_plan.dt_retry = dt;
+            repair_plan.retry_attempt = retry_attempts + 1;
+          } else {
+            repair_plan = choose_repair_plan(
+                last_hydro_result, state, cfg, dt, retry_attempts);
+            repair_plan.ale_mode = hydro::ale::AleMode::AxisSpinePlusLocal;
+            repair_plan.dt_retry = dt;
+          }
+          wave1_decision_applied = true;
+          measured_state_sensitive_repair = true;
+          stage24_axis_repair_tried_at_current_state = true;
+          stage24_repair_generation_this_step += 1;
+          stage24_pending_repair_state_sensitive = true;
+        } else {
+          repair_plan = choose_repair_plan(
+              last_hydro_result, state, cfg, dt, retry_attempts);
+          stage24_pending_repair_state_sensitive = false;
+        }
       }
       if (stage24_telemetry_enabled()) {
         const bool axis_regime =
@@ -11444,6 +13160,121 @@ void Driver::run(core::State& state,
       }
       const std::string retry_reason =
           last_hydro_result.reason != nullptr ? last_hydro_result.reason : "";
+      if (retry_reason == "corner_j" &&
+          cfg.numerics.ale.evacuated_cell.closure_contact
+              .flank_tangential_strip.enabled) {
+        const auto flank_strip =
+            hydro::flank_strip_update_and_evaluate(state, cfg, dt);
+        std::ostringstream oss;
+        oss << std::scientific << std::setprecision(3)
+            << "[flank-strip] step=" << state.step
+            << " armed=" << static_cast<int>(flank_strip.armed_now)
+            << " fire=" << static_cast<int>(flank_strip.would_fire)
+            << " worst_ratio=" << flank_strip.worst_ratio
+            << " cell=" << flank_strip.worst_cell
+            << " corner=" << flank_strip.worst_corner
+            << " n_pred=" << flank_strip.n_sliver_pred;
+        core::log_warning(oss.str());
+        const int failing_cell = last_hydro_result.first_failing_cell;
+        const int failing_i = failing_cell >= 0
+                                  ? failing_cell / state.mesh.topo.nz
+                                  : -1;
+        const int failing_j = failing_cell >= 0
+                                  ? failing_cell % state.mesh.topo.nz
+                                  : -1;
+        const auto& strip_cfg =
+            cfg.numerics.ale.evacuated_cell.closure_contact
+                .flank_tangential_strip;
+        const int slot_cell =
+            hydro::detail::active_flank_strip_slot_cell(state);
+        int j_first = -1;
+        int j_last = -1;
+        if (slot_cell >= 0) {
+          hydro::detail::flank_strip_seam_window(
+              state,
+              slot_cell,
+              strip_cfg.band_halfwidth_j,
+              state.mesh.topo.nz,
+              j_first,
+              j_last,
+              failing_j);
+        }
+        const bool failing_cell_in_band =
+            failing_i >= 1 && failing_i <= strip_cfg.band_layers + 1 &&
+            slot_cell >= 0 && failing_j >= j_first && failing_j <= j_last;
+        if (flank_strip.would_fire && failing_cell_in_band) {
+          const int displaced_mode = pending_repair_plan.has_value()
+                                         ? static_cast<int>(
+                                               pending_repair_plan->ale_mode)
+                                         : -1;
+          pending_repair_plan = hydro::ale::RepairPlan{};
+          pending_repair_plan->ale_mode =
+              hydro::ale::AleMode::FlankTangentialStrip;
+          pending_repair_plan->focus_cell =
+              last_hydro_result.first_failing_cell;
+          pending_repair_plan->retry_attempt = retry_attempts;
+          pending_repair_plan->dt_retry = retry_dt_after;
+          pending_repair_plan->is_same_dt_strategy_retry = false;
+          core::log_warning(
+              "[flank-strip] plan queued cell=" +
+              std::to_string(last_hydro_result.first_failing_cell) +
+              " attempt=" + std::to_string(retry_attempts) +
+              " displaced_mode=" + std::to_string(displaced_mode));
+        }
+      }
+      if ((retry_reason == "corner_j" ||
+           retry_reason == "geometry_inversion" ||
+           retry_reason == "mesh_geometry") &&
+          last_hydro_result.first_failing_i == 0) {
+        const auto collapse =
+            hydro::axis_edge_collapse_update_and_evaluate(
+                state,
+                cfg,
+                last_hydro_result.first_failing_cell,
+                retry_dt_after,
+                cfg.numerics.dt.min_s);
+        std::ostringstream oss;
+        oss << std::scientific << std::setprecision(3)
+            << "[axis-edge-collapse] step=" << state.step
+            << " cell=" << last_hydro_result.first_failing_cell
+            << " h0=" << collapse.h0
+            << " hdot=" << collapse.hdot
+            << " h_retire=" << collapse.h_retire
+            << " h_min_pred=" << collapse.h_min_pred
+            << " closing=" << collapse.closing_count << "/"
+            << collapse.window
+            << " would_fire=" << static_cast<int>(collapse.would_fire)
+            << " waiver=" << static_cast<int>(collapse.terminal_waiver);
+        if (!collapse.eligible) {
+          oss << " inel=" << collapse.ineligible_reason;
+        }
+        core::log_warning(oss.str());
+        if (collapse.would_fire || collapse.terminal_waiver) {
+          const auto transaction = hydro::axis_edge_collapse_execute(
+              state, cfg, last_hydro_result.first_failing_cell);
+          std::ostringstream commit_log;
+          commit_log << std::scientific << std::setprecision(3)
+                     << "[axis-edge-collapse-commit] step=" << state.step
+                     << " cell=" << last_hydro_result.first_failing_cell
+                     << " committed="
+                     << static_cast<int>(transaction.committed)
+                     << " reason=" << transaction.reject_reason
+                     << " q_node=" << transaction.q_node
+                     << " tri_vol=" << transaction.tri_volume
+                     << " min_offaxis_j="
+                     << transaction.min_offaxis_corner_j;
+          core::log_warning(commit_log.str());
+          if (transaction.committed) {
+            capture_driver_retry_snapshot(
+                retry_snapshot_, state, cfg, nullptr);
+            retry_dt_before = dt;
+            retry_dt_after = dt;
+            pending_repair_plan.reset();
+            stage24_pending_repair_state_sensitive = false;
+            continue;
+          }
+        }
+      }
       core::log_warning(
           "[driver-retry] step=" + std::to_string(state.step) +
           " attempt=" + std::to_string(retry_attempts) + "/" +
@@ -11459,10 +13290,12 @@ void Driver::run(core::State& state,
           (repair_plan.is_same_dt_strategy_retry
                ? " same_dt_strategy_retry=true"
                : "") +
-          (cfg.numerics.hydro.dispatcher_state_sensitive_bypass_enabled
-               ? " kind=" +
-                     std::string(dispatch_decision_kind_name(wave1_decision_kind))
-               : ""));
+          (measured_state_sensitive_repair
+               ? " kind=measured_state_sensitive_repair"
+               : (cfg.numerics.hydro.dispatcher_state_sensitive_bypass_enabled
+                      ? " kind=" + std::string(dispatch_decision_kind_name(
+                                        wave1_decision_kind))
+                      : "")));
       continue;
     }
 
@@ -11528,7 +13361,11 @@ void Driver::run(core::State& state,
     if (is_1d && cfg.numerics.hydro.enabled && cfg.numerics.ale1d.enabled) {
       // 1D V3 ALE is a conservative remap between hydro steps. Unlike the
       // pure Lagrangian 1D hydro update, state.mass may change after this call.
+      hydro::entropy_ledger_begin(
+          state, cfg, hydro::EntropyLedgerStage::Ale);
       const auto ale1d_out = hydro::ale1d::apply_ale_1d(state, cfg, &eos_ctx);
+      hydro::entropy_ledger_end(
+          state, cfg, hydro::EntropyLedgerStage::Ale);
       static int ale1d_reject_logged = 0;
       if ((ale1d_out.cadence_triggered || ale1d_out.quality_triggered ||
            ale1d_out.floor_triggered) &&
@@ -11562,12 +13399,13 @@ void Driver::run(core::State& state,
 	               cfg.mesh.motion == "ale" && cfg.numerics.ale.enabled &&
 	               cfg.numerics.ale.conservative_remap_enabled &&
 	               !hydro::ale::ale_identity_mode_enabled(cfg) &&
+	               !cfg.numerics.ale.band_ale.enabled &&
 	               !tenryu::mesh::mesh_topo_is_multiblock(cfg.mesh) &&
 	               !cfg.numerics.hydro.hllc_z_flux_2d_rz &&
 	               !periodic_force_rezone) {
       // Single-block conservative reference remap is applied immediately after
-      // each 2D Lagrangian hydro update. Multiblock ALE falls through to
-      // apply_ale(), where apply_multiblock_csr_ale_step enforces cadence.
+      // each 2D Lagrangian hydro update. Multiblock and band-ALE flow instead
+      // fall through to the transaction-managed apply_ale() path.
 	    } else if (is_2d && cfg.numerics.hydro.enabled &&
 	        cfg.mesh.motion == "ale" && cfg.numerics.ale.enabled &&
 	        !hydro::ale::ale_identity_mode_enabled(cfg) &&
@@ -11588,6 +13426,11 @@ void Driver::run(core::State& state,
           diagnostics::RadialFourierStageId::Winslow,
           diagnostics::RadialFourierStagePhase::Before,
           state.t + dt);
+      hydro::entropy_ledger_begin(
+          state, cfg, hydro::EntropyLedgerStage::Ale);
+      hydro::shadow_homothety_record_post_lagrange(
+          state, state.step + 1, state.t + dt);
+      state.mesh.materialize_host_svec();
       const auto ale_out =
           hydro::ale::apply_ale(state,
                                 cfg,
@@ -11600,6 +13443,8 @@ void Driver::run(core::State& state,
                                 periodic_force_rezone ? "periodic_force_rezone"
                                                       : nullptr,
                                 profile_observability);
+      hydro::entropy_ledger_end(
+          state, cfg, hydro::EntropyLedgerStage::Ale);
       if (ale_out.status ==
           hydro::ale::AleStatus::CenterPatchInadmissibleAbsorbRetry) {
         // A central pseudo-core ring-absorption request was armed inside the
@@ -11609,17 +13454,14 @@ void Driver::run(core::State& state,
         // retried attempt executes the absorption at step start on the
         // restored pre-step state.
         if (state.central_pseudo_core.min_member_ring_count >
-                state.central_pseudo_core.member_ring_count ||
-            state.central_pseudo_core.terminal_absorb_pending) {
+            state.central_pseudo_core.member_ring_count) {
           // Progress-based retry budget: an absorb-retry with a pending
           // absorption EXECUTES it at the start of the retried attempt
           // (members grow monotonically, bounded by the structural
           // backstop), so it is a cure in progress, not a futile retry.
           // Observed: the emergency walk needs one retry per row, and a
           // failing cell at depth 26 against members 19 exhausted the
-          // 8-attempt budget two rows into the walk. A pending TERMINAL
-          // absorption is likewise a cure in progress (it completes the
-          // run as the core1d tail).
+          // 8-attempt budget two rows into the walk.
           retry_attempts = 0;
         }
         TENRYU_ASSERT(
@@ -11637,6 +13479,198 @@ void Driver::run(core::State& state,
             state, cfg, retry_snapshot_, false, true, nullptr);
         axis_band_applied_this_attempt = false;
         continue;
+      }
+      const auto& axis_core_window = cfg.numerics.ale.euler_window;
+      const bool axis_core_window_active =
+          axis_core_window.enabled &&
+          axis_core_window.role == "axis_survival_core" &&
+          state.t >= axis_core_window.t_on_s &&
+          (axis_core_window.t_off_s < 0.0 ||
+           state.t < axis_core_window.t_off_s);
+      if (axis_core_window_active &&
+          ale_out.status ==
+              hydro::ale::AleStatus::MandatoryWindowTransactionRejected) {
+        // The ALE candidate coordinates are private to apply_ale() and are
+        // never installed on rejection. Capture the live post-Lagrange state
+        // before the driver retry restore; AleStepResult retains the candidate
+        // corner coordinates needed by the terminal diagnostic.
+        hydro::corner_collapse_ledger_capture(
+            state, state.step + 1, state.t + dt, dt,
+            hydro::CornerCollapseLedgerTrial::RejectedPostrestore);
+        const bool ring_release_available =
+            hydro::axis_core_ring_release_enabled(cfg) &&
+            cfg.numerics.ale.euler_window.enabled &&
+            cfg.numerics.ale.euler_window.role == "axis_survival_core";
+        if (ring_release_available &&
+            retry_attempts <
+                cfg.numerics.hydro.driver_full_step_retry_max_attempts &&
+            (cfg.numerics.hydro.driver_full_step_retry_enabled ||
+             hydro::i1b_path_guard_enabled())) {
+          restore_driver_retry_snapshot(
+              state, cfg, retry_snapshot_, false, true, nullptr);
+          axis_band_applied_this_attempt = false;
+          if (hydro::axis_core_disk_release_one_unit(state, cfg)) {
+            ++retry_attempts;
+            retry_trigger_result = HydroStepResult{};
+            retry_trigger_result.reason = "ring_release_retry";
+            retry_trigger_result.first_failing_cell =
+                ale_out.first_failing_cell;
+            retry_dt_before = dt;
+            retry_dt_after = dt;  // SAME dt — release addresses capacity,
+                                  // not stiffness
+            core::log_warning(
+                "[driver-retry] step=" + std::to_string(state.step) +
+                " attempt=" + std::to_string(retry_attempts) + "/" +
+                std::to_string(
+                    cfg.numerics.hydro.driver_full_step_retry_max_attempts) +
+                " reason=ring_release first_cell=" +
+                std::to_string(ale_out.first_failing_cell));
+            continue;
+          }
+          // Release exhausted: fall through to the existing dt/2 logic on the
+          // already-restored state. Its repeated snapshot restore is harmless.
+        }
+        static int row_merge_step = -1;
+        static int row_merge_attempts_this_step = 0;
+        if (row_merge_step != state.step) { row_merge_step = state.step; row_merge_attempts_this_step = 0; }
+        if (hydro::row_merge_enabled() &&
+            row_merge_attempts_this_step < 1 &&
+            (retry_attempts >= cfg.numerics.hydro.driver_full_step_retry_max_attempts - 1 ||
+             !(0.5 * dt > cfg.numerics.dt.min_s)) &&
+            (cfg.numerics.hydro.driver_full_step_retry_enabled ||
+             hydro::i1b_path_guard_enabled())) {
+          ++row_merge_attempts_this_step;
+          restore_driver_retry_snapshot(state, cfg, retry_snapshot_, false, true, nullptr);
+          axis_band_applied_this_attempt = false;
+          const auto merge = hydro::apply_tier_row_merge(
+              state, cfg, ale_out.first_failing_cell);
+          if (merge.committed) {
+            capture_driver_retry_snapshot(retry_snapshot_, state, cfg, nullptr);  // the merged topology is the new step baseline
+            retry_attempts = 0;  // topology changed: a fresh retry budget for the new discrete system
+            maxmin_step = -1;  // topology changed: re-arm the max-min repair for the new discrete system
+            retry_trigger_result = HydroStepResult{};
+            retry_trigger_result.reason = "row_merge_retry";
+            retry_trigger_result.first_failing_cell =
+                ale_out.first_failing_cell;
+            retry_dt_before = dt;
+            retry_dt_after = dt;
+            core::log_warning("[driver-retry] step=" + std::to_string(state.step) +
+                " reason=row_merge pairs=" + std::to_string(merge.merged_pairs) +
+                " cell=" + std::to_string(ale_out.first_failing_cell));
+            continue;
+          }
+          core::log_warning(std::string("[driver-retry] row_merge rejected: ") +
+              (merge.reject_reason != nullptr ? merge.reject_reason : "(none)") +
+              " cell=" + std::to_string(merge.first_bad_cell));
+          // fall through to the existing dt/2 logic on the restored state
+        }
+        const bool can_retry =
+            cfg.numerics.hydro.driver_full_step_retry_enabled &&
+            retry_attempts <
+                cfg.numerics.hydro.driver_full_step_retry_max_attempts &&
+            0.5 * dt > cfg.numerics.dt.min_s;
+        if (can_retry) {
+          ++retry_attempts;
+          retry_trigger_result = HydroStepResult{};
+          retry_trigger_result.reason =
+              "mandatory_euler_window_transaction_rejected";
+          retry_trigger_result.first_failing_cell =
+              ale_out.first_failing_cell;
+          retry_trigger_result.min_metric =
+              std::min(ale_out.min_V, ale_out.min_J);
+          retry_trigger_result.failing_value =
+              ale_out.max_target_displacement;
+          retry_dt_before = dt;
+          retry_dt_after = 0.5 * dt;
+          core::log_warning(
+              "[driver-retry] mandatory axis-core Euler-window transaction "
+              "rejected; restoring snapshot and retrying at dt/2, attempt=" +
+              std::to_string(retry_attempts) + "/" +
+              std::to_string(
+                  cfg.numerics.hydro.driver_full_step_retry_max_attempts) +
+              " first_failing_cell=" +
+              std::to_string(ale_out.first_failing_cell) +
+              " kind=" +
+              std::string(mesh::mesh_geometry_failure_kind_name(
+                  ale_out.geometry_failure_kind)) +
+              " corner=" +
+              std::to_string(ale_out.first_failing_corner) +
+              " stable_cell=" +
+              std::to_string(ale_out.first_failing_stable_cell) +
+              " min_V=" + format_sci(ale_out.min_V) +
+              " min_J=" + format_sci(ale_out.min_J) +
+              " max_target_displacement=" +
+              format_sci(ale_out.max_target_displacement));
+          restore_driver_retry_snapshot(
+              state, cfg, retry_snapshot_, false, true, nullptr);
+          axis_band_applied_this_attempt = false;
+          continue;
+        }
+        std::ostringstream oss;
+        oss << "mandatory axis-core Euler-window transaction rejection "
+               "exhausted the driver retry path"
+            << " at step=" << state.step
+            << " t=" << format_sci(state.t)
+            << " first_failing_cell=" << ale_out.first_failing_cell
+            << " kind=" << mesh::mesh_geometry_failure_kind_name(
+                              ale_out.geometry_failure_kind)
+            << " corner=" << ale_out.first_failing_corner
+            << " stable_cell=" << ale_out.first_failing_stable_cell
+            << " predicate_scope=full"
+            << " failing_cell_area="
+            << format_sci(ale_out.failing_cell_area)
+            << " failing_state="
+            << (ale_out.fails_without_target ? "post_lagrange"
+                                             : "candidate")
+            << " fails_without_target="
+            << (ale_out.fails_without_target ? 1 : 0)
+            << " min_V=" << format_sci(ale_out.min_V)
+            << " min_J=" << format_sci(ale_out.min_J)
+            << " max_target_displacement="
+            << format_sci(ale_out.max_target_displacement);
+        std::vector<double> rejection_postlag_r;
+        std::vector<double> rejection_postlag_z;
+        state.x_r.copy_to_host(rejection_postlag_r);
+        state.x_z.copy_to_host(rejection_postlag_z);
+        if (ale_out.rejection_corner_count == 0) {
+          std::fprintf(stderr,
+                       "[reject-corner] unavailable cell=%d recorded_count=0\n",
+                       ale_out.first_failing_cell);
+        }
+        for (int corner = 0; corner < ale_out.rejection_corner_count;
+             ++corner) {
+          const std::size_t corner_index = static_cast<std::size_t>(corner);
+          const int node = ale_out.rejection_corner_nodes[corner_index];
+          if (node < 0 ||
+              static_cast<std::size_t>(node) >= rejection_postlag_r.size() ||
+              static_cast<std::size_t>(node) >= rejection_postlag_z.size()) {
+            std::fprintf(
+                stderr,
+                "[reject-corner] node=%d postlag=(unavailable) "
+                "candidate=(%.9e,%.9e)\n",
+                node, ale_out.rejection_corner_candidate_r[corner_index],
+                ale_out.rejection_corner_candidate_z[corner_index]);
+            continue;
+          }
+          const std::size_t node_index = static_cast<std::size_t>(node);
+          const double dr =
+              ale_out.rejection_corner_candidate_r[corner_index] -
+              rejection_postlag_r[node_index];
+          const double dz =
+              ale_out.rejection_corner_candidate_z[corner_index] -
+              rejection_postlag_z[node_index];
+          std::fprintf(
+              stderr,
+              "[reject-corner] node=%d postlag=(%.9e,%.9e) "
+              "candidate=(%.9e,%.9e) dr=(%.3e,%.3e)\n",
+              node, rejection_postlag_r[node_index],
+              rejection_postlag_z[node_index],
+              ale_out.rejection_corner_candidate_r[corner_index],
+              ale_out.rejection_corner_candidate_z[corner_index], dr, dz);
+        }
+        std::fflush(stderr);
+        finalize_profile_before_fatal();
+        TENRYU_ASSERT(false, oss.str());
       }
       // Remap total-mass closure gate (env TENRYU_I1B_REMAP_CLOSURE_REJECT_TOL,
       // 0 = off): a committed rezone+remap that fabricates mass (measured:
@@ -11763,6 +13797,10 @@ void Driver::run(core::State& state,
       state.ale_rezoned = true;
     } else {
       state.ale_rezoned = false;
+    }
+
+    if (is_2d) {
+      state.mesh.materialize_host_svec();
     }
 
     if (cfg.main.two_temperature && !warned_2t_collapse &&
@@ -12383,6 +14421,168 @@ void Driver::run(core::State& state,
     state.t += dt;
     state.step += 1;
     state.dt = dt;
+    state.dt_growth_ref = dt_ref;
+    if (reale_mode::rezone_step(state, cfg, dt, step_dt_lineage.dt_hydro)) {
+      hydro_2d.reclose_after_energy_edit(state, cfg, &eos_ctx);
+      dt_reanchor.pending = true;
+    }
+    static const int state_hash_every = [] {
+      const char* s = std::getenv("TENRYU_STATE_HASH_EVERY");
+      return s != nullptr ? std::atoi(s) : 0;
+    }();
+    if (state_hash_every > 0 && state.step % state_hash_every == 0 &&
+        part_info.rank == 0) {
+      const auto fnv1a = [](const void* data,
+                            const std::size_t size) -> std::uint64_t {
+        constexpr std::uint64_t offset_basis = 14695981039346656037ULL;
+        constexpr std::uint64_t prime = 1099511628211ULL;
+        const auto* bytes = static_cast<const unsigned char*>(data);
+        std::uint64_t hash = offset_basis;
+        for (std::size_t i = 0; i < size; ++i) {
+          hash ^= static_cast<std::uint64_t>(bytes[i]);
+          hash *= prime;
+        }
+        return hash;
+      };
+
+      const auto x_r = copy_field_to_host(state.x_r);
+      const auto x_z = copy_field_to_host(state.x_z);
+      const auto v_r = copy_field_to_host(state.v_r);
+      const auto v_z = copy_field_to_host(state.v_z);
+      const auto mass = copy_field_to_host(state.mass);
+      const auto vol = copy_field_to_host(state.vol);
+      const auto rho = copy_field_to_host(state.rho);
+      const auto ee = copy_field_to_host(state.ee);
+      const auto ei = copy_field_to_host(state.ei);
+      const auto corner_mass = copy_field_to_host(state.corner_mass);
+
+      std::ostringstream line;
+      line << std::scientific << std::setprecision(17)
+           << "[state-hash] step=" << state.step << " t=" << state.t
+           << std::hex << std::setfill('0')
+           << " x_r=" << std::setw(16)
+           << fnv1a(x_r.data(), x_r.size() * sizeof(double))
+           << " x_z=" << std::setw(16)
+           << fnv1a(x_z.data(), x_z.size() * sizeof(double))
+           << " v_r=" << std::setw(16)
+           << fnv1a(v_r.data(), v_r.size() * sizeof(double))
+           << " v_z=" << std::setw(16)
+           << fnv1a(v_z.data(), v_z.size() * sizeof(double))
+           << " mass=" << std::setw(16)
+           << fnv1a(mass.data(), mass.size() * sizeof(double))
+           << " vol=" << std::setw(16)
+           << fnv1a(vol.data(), vol.size() * sizeof(double))
+           << " rho=" << std::setw(16)
+           << fnv1a(rho.data(), rho.size() * sizeof(double))
+           << " ee=" << std::setw(16)
+           << fnv1a(ee.data(), ee.size() * sizeof(double))
+           << " ei=" << std::setw(16)
+           << fnv1a(ei.data(), ei.size() * sizeof(double))
+           << " cm=" << std::setw(16)
+           << fnv1a(corner_mass.data(), corner_mass.size() * sizeof(double))
+           << std::dec << " dt=" << dt;
+      core::log_info(line.str());
+    }
+    const bool z_reflection_audit_due =
+        z_reflection_audit_active && part_info.rank == 0 &&
+        state.step % 200 == 0;
+    if (z_reflection_audit_due) {
+      auto mass = copy_field_to_host(state.mass);
+      auto ee = copy_field_to_host(state.ee);
+      auto ei = copy_field_to_host(state.ei);
+      auto velocity_r = copy_field_to_host(state.v_r);
+      auto velocity_z = copy_field_to_host(state.v_z);
+      auto node_r = copy_field_to_host(state.x_r);
+      auto node_z = copy_field_to_host(state.x_z);
+      const auto corner_mass = copy_field_to_host(state.corner_mass);
+
+      const auto& topology = *state.mesh.topo.multiblock;
+      const int n_cells = static_cast<int>(mass.size());
+      const int n_nodes = static_cast<int>(node_r.size());
+      const int corner_stride = state.corner_stride;
+      std::vector<double> node_mass(node_r.size(), 0.0);
+      bool node_mass_valid =
+          node_z.size() == node_r.size() &&
+          velocity_r.size() == node_r.size() &&
+          velocity_z.size() == node_r.size() &&
+          topology.cell_node_csr_offsets.size() == mass.size() + 1U &&
+          corner_stride > 0 &&
+          corner_mass.size() >=
+              mass.size() * static_cast<std::size_t>(corner_stride);
+      for (int c = 0; c < n_cells && node_mass_valid; ++c) {
+        const int offset =
+            topology.cell_node_csr_offsets[static_cast<std::size_t>(c)];
+        const int end =
+            topology.cell_node_csr_offsets[static_cast<std::size_t>(c) + 1U];
+        const int nverts =
+            state.mesh.cell_nverts.size() == mass.size()
+                ? mesh::mesh_topo_cell_active_nverts(
+                      state.mesh.cell_nverts, c)
+                : end - offset;
+        if (offset < 0 || end < offset || nverts < 0 ||
+            offset + nverts > end || nverts > corner_stride ||
+            static_cast<std::size_t>(end) >
+                topology.cell_node_csr_indices.size()) {
+          node_mass_valid = false;
+          break;
+        }
+        for (int k = 0; k < nverts; ++k) {
+          const int node = topology.cell_node_csr_indices[
+              static_cast<std::size_t>(offset + k)];
+          if (node < 0 || node >= n_nodes) {
+            node_mass_valid = false;
+            break;
+          }
+          node_mass[static_cast<std::size_t>(node)] +=
+              corner_mass[static_cast<std::size_t>(c) *
+                              static_cast<std::size_t>(corner_stride) +
+                          static_cast<std::size_t>(k)];
+        }
+      }
+
+      if (z_reflection_audit_due) {
+        std::vector<double> energy;
+        if (ee.size() == mass.size() &&
+            (ei.empty() || ei.size() == mass.size())) {
+          energy.resize(mass.size(), 0.0);
+          for (std::size_t c = 0; c < mass.size(); ++c) {
+            energy[c] = mass[c] * (ee[c] + (ei.empty() ? 0.0 : ei[c]));
+          }
+        }
+
+        std::vector<double> momentum_r;
+        std::vector<double> momentum_z;
+        if (node_mass_valid) {
+          momentum_r.resize(node_r.size(), 0.0);
+          momentum_z.resize(node_r.size(), 0.0);
+          for (std::size_t n = 0; n < node_r.size(); ++n) {
+            momentum_r[n] = node_mass[n] * velocity_r[n];
+            momentum_z[n] = node_mass[n] * velocity_z[n];
+          }
+        }
+
+        const mesh::ZReflectionAudit audit = mesh::audit_z_reflection(
+            z_reflection_maps, mass, momentum_r, momentum_z, energy,
+            node_r, node_z);
+        std::ostringstream line;
+        line << std::scientific << std::setprecision(3)
+             << "[z-reflection] audit step=" << state.step
+             << " t=" << state.t
+             << " odd_mass=" << audit.odd_mass
+             << " odd_mom_z=" << audit.odd_mom_z
+             << " odd_energy=" << audit.odd_energy
+             << " odd_node_z=" << audit.odd_node_z;
+        core::log_info(line.str());
+      }
+    }
+    tenryu::hydro::evacuated_cell_contact_probe(state, cfg, "post_ale");
+    tenryu::hydro::evacuated_cell_controller_step(state, cfg);
+    tenryu::hydro::evacuated_cell_contact_probe(state, cfg, "pre_monitor");
+    tenryu::hydro::evacuated_cell_contact_step(state, cfg);
+    tenryu::hydro::evacuated_cell_contact_probe(state, cfg, "post_monitor");
+    tenryu::hydro::rebuild_cavity_boundary_graph(state, cfg);
+    hydro::entropy_ledger_log(state, cfg);
+    emit_polar_tier_origin_force_diag(state, cfg);
     if (cfg.numerics.ale.multiblock_path_admissibility_enabled &&
         is_2d && tenryu::mesh::mesh_topo_is_multiblock(cfg.mesh)) {
       state.multiblock_path_dt_min_accepted =
@@ -12390,6 +14590,12 @@ void Driver::run(core::State& state,
     }
     if (mesh_quality_min_enabled) {
       profile_observability_.note_committed_mesh_quality_min(state, &reducer);
+    }
+    if (ale_state_monitor_enabled) {
+      run_ale_state_monitor(state,
+                            cfg,
+                            step_dt_lineage.dt_hydro_acoustic,
+                            profile_observability_);
     }
     emit_radial_fourier_audit_for_cycle(
         diagnostics::RadialFourierStageId::DtController,
@@ -12494,11 +14700,19 @@ void Driver::run(core::State& state,
         state.t,
         static_cast<std::uint64_t>(state.step));
 
+    if (is_2d) {
+      state.mesh.materialize_host_svec();
+    }
     const auto t_diag_start =
         verbose_phase_timing ? Clock::now() : Clock::time_point{};
     diagnostics::log_energy_budget_step(step_budget, cfg, state.step, state.t);
     diagnostics::log_ale_closure_audit_step(
         ale_closure_audit, step_budget, cfg, state.step, state.t);
+    if (cfg.main.dim == 2) {
+      tenryu::hydro::refinement_estimator_step(state, cfg);
+      tenryu::hydro::refinement_tracker_step(state, cfg);
+      tenryu::hydro::evacuated_cell_shadow_step(state, cfg);
+    }
 
     emit_due_outputs([&](diagnostics::HistorySnapshot& snapshot) {
       if (cfg.numerics.diagnostics.dt_breakdown_history_enabled) {
@@ -12649,13 +14863,91 @@ void Driver::run(core::State& state,
         snapshot.hotspot_gas =
             diagnostics::compute_hotspot_gas_diagnostics(state, cfg);
       }
-      if (ale_provenance_history_enabled || mesh_quality_min_enabled) {
+      if (ale_provenance_history_enabled || mesh_quality_min_enabled ||
+          ale_state_monitor_enabled) {
         snapshot.ale_provenance = &profile_observability_;
       }
       if (conservation_history_enabled) {
         snapshot.operator_residuals = operator_energy_tracker.entries();
       }
     });
+    state.checkpoint_request = false;
+    if (cfg.main.dim == 2 &&
+        cfg.numerics.diagnostics.refinement_autopilot.mode == "arm_exit") {
+      const auto* fire =
+          tenryu::hydro::refinement_tracker_pending_fire();
+      if (fire != nullptr) {
+        if (out.last_checkpoint_step() == state.step) {
+          if (part_info.rank == 0) {
+            const auto& autopilot =
+                cfg.numerics.diagnostics.refinement_autopilot;
+            const std::filesystem::path decision_path =
+                std::filesystem::path(out.output_dir) /
+                "autopilot_decision.json";
+            std::ostringstream decision_record;
+            decision_record << std::scientific << std::setprecision(17);
+            decision_record << "{\n";
+            decision_record << "  \"checkpoint_path\": \""
+                            << json_escape(out.last_checkpoint_path())
+                            << "\",\n";
+            decision_record << "  \"checkpoint_step\": " << fire->step
+                            << ",\n";
+            decision_record << "  \"t\": " << fire->t << ",\n";
+            decision_record << "  \"s50_cm\": " << fire->s50_cm << ",\n";
+            decision_record << "  \"s_lead_cm\": " << fire->s_lead_cm
+                            << ",\n";
+            decision_record << "  \"d_clear_h\": " << fire->d_clear_h
+                            << ",\n";
+            decision_record << "  \"a_old\": " << fire->a_old << ",\n";
+            decision_record << "  \"dt_arrival_early_s\": "
+                            << fire->dt_arrival_early_s << ",\n";
+            decision_record << "  \"q99_e\": " << fire->q99_e << ",\n";
+            decision_record << "  \"e_on\": " << autopilot.e_on << ",\n";
+            decision_record << "  \"e_off\": " << autopilot.e_off << ",\n";
+            decision_record << "  \"n_q_plan\": " << autopilot.n_q_plan
+                            << ",\n";
+            decision_record << "  \"chi_design\": "
+                            << autopilot.chi_design << ",\n";
+            decision_record << "  \"s_rep_cm\": " << autopilot.s_rep_cm
+                            << ",\n";
+            decision_record << "  \"handoff_cm\": "
+                            << autopilot.handoff_cm << ",\n";
+            decision_record << "  \"window_lo_h\": "
+                            << autopilot.window_lo_h << ",\n";
+            decision_record << "  \"window_hi_h\": "
+                            << autopilot.window_hi_h << "\n";
+            decision_record << "}\n";
+
+            std::ofstream decision_file(
+                decision_path, std::ios::binary | std::ios::trunc);
+            TENRYU_ASSERT(
+                decision_file.good(),
+                "Failed to open autopilot_decision.json for writing");
+            decision_file << decision_record.str();
+            TENRYU_ASSERT(
+                decision_file.good(),
+                "Failed while writing autopilot_decision.json");
+            decision_file.flush();
+            TENRYU_ASSERT(
+                decision_file.good(),
+                "Failed to flush autopilot_decision.json");
+            decision_file.close();
+            TENRYU_ASSERT(
+                !decision_file.fail(),
+                "Failed to close autopilot_decision.json");
+          }
+          core::log_info(std::string("[refine_apilot] FIRE checkpoint=") +
+                         out.last_checkpoint_path());
+          tenryu::hydro::refinement_tracker_clear_fire();
+          autopilot_fire_stop = true;
+        } else {
+          core::log_warning(
+              "[refine_apilot] fire pending but no checkpoint was written "
+              "this step; holding (fail-closed)");
+          tenryu::hydro::refinement_tracker_clear_fire();
+        }
+      }
+    }
     run_shock_approach_diag(state, cfg);
     log_progress_if_needed(state, cfg, reducer);
     if (cfg.main.verbosity == "verbose" &&
@@ -12693,11 +14985,31 @@ void Driver::run(core::State& state,
     hydro::suppress_tangential_velocity(state, state.t);
     hydro::accumulate_drive_work_ledger(
         state, cfg, state.dt, state.t - 0.5 * state.dt);
+    hydro::core_clearance_controller_record_step(
+        state, state.step, state.t);
+    hydro::shadow_homothety_record_step(state, state.step, state.t);
     break;
+    }
+    if (autopilot_fire_stop) {
+      break;
     }
   }
 
-  if (state.t >= cfg.main.t_end) {
+  hydro::stripe_gate_finalize();
+
+  if (cfg.output.write_final_snapshot && part_info.rank == 0 &&
+      last_plot_step != state.step) {
+    out.write_snapshot(state, cfg, state.step, state.t, case_name,
+                       part_info.rank);
+    out.write_run_info(state, cfg);
+    core::log_info("[output] wrote final snapshot (step=" +
+                   std::to_string(state.step) +
+                   ", t=" + format_sci(state.t) + ")");
+  }
+
+  if (autopilot_fire_stop) {
+    out.set_termination_reason("autopilot_fire");
+  } else if (state.t >= cfg.main.t_end) {
     out.set_termination_reason("t_end_reached");
   } else if (state.step >= cfg.main.max_steps) {
     out.set_termination_reason("max_steps_reached");
@@ -12742,15 +15054,29 @@ void Driver::run(core::State& state,
           f09_fallback_line("[f09-fallback] run total:", recorder));
     }
   }
+  hydro::corner_collapse_ledger_flush();
+  hydro::ale::remap_dispatch_audit_flush();
+  hydro::ale::gcl_audit_flush();
+  hydro::core_clearance_controller_flush();
+  hydro::shadow_homothety_flush();
+  if (cfg.numerics.hydro.axis_projection.enabled) {
+    hydro::axis_projection::run_end(cfg, part_info.rank);
+  }
+  hydro::band_ale::run_end(cfg, part_info.rank);
+  hydro::destroy_axis_core_disk();
+  hydro::compatible::destroy_csw_polar_slaving_runtime();
+  hydro::wake_angular_heat_flux::destroy();
   if (cfg.numerics.profile.icf_standard_ale.enabled ||
       ale_provenance_history_enabled ||
-      mesh_quality_min_enabled) {
+      mesh_quality_min_enabled ||
+      ale_state_monitor_enabled) {
     profile_observability_.finalize_at_run_end(cfg, state.t >= cfg.main.t_end);
     if (cfg.numerics.profile.icf_standard_ale.enabled) {
       log_profile_observability(profile_observability_, "run_end");
     }
 #if TENRYU_ENABLE_HDF5
-    if ((ale_provenance_history_enabled || mesh_quality_min_enabled) &&
+    if ((ale_provenance_history_enabled || mesh_quality_min_enabled ||
+         ale_state_monitor_enabled) &&
         history_writer.enabled() &&
         part_info.rank == 0) {
       history_writer.flush_pending();

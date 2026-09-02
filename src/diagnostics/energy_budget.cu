@@ -116,6 +116,7 @@ __global__ void compute_energy_contrib_2d_kernel(
     const double* __restrict__ x_r,
     const double* __restrict__ x_z,
     const std::uint8_t* __restrict__ cell_nverts,
+    const int corner_mass_convention,
     const double* __restrict__ v_r,
     const double* __restrict__ v_z,
     const int nr,
@@ -177,7 +178,9 @@ __global__ void compute_energy_contrib_2d_kernel(
     m_corner[3] = fmax(cached_corner_mass[base + 3], 0.0);
   } else {
     hydro::rz::compute_rz_corner_masses_from_nodes(c, nz, m_cell, x_r, x_z,
-                                                   cell_nverts, m_corner);
+                                                   cell_nverts, m_corner,
+                                                   nullptr,
+                                                   corner_mass_convention);
   }
   const double m00 = m_corner[0];
   const double m10 = m_corner[1];
@@ -630,6 +633,7 @@ bool compute_energy_totals_2d_contrib(const core::State& state,
         state.x_r.data(),
         state.x_z.data(),
         d_cell_nverts,
+        state.corner_mass_convention,
         state.v_r.data(),
         state.v_z.data(),
         state.mesh.topo.nr,

@@ -8,6 +8,7 @@ import CommandPalette from "./ui/CommandPalette";
 import DeckPreview from "./ui/DeckPreview";
 import DeckView from "./ui/DeckView";
 import HistoryView from "./ui/HistoryView";
+import AssistantView from "./ui/AssistantView";
 import ServersView from "./ui/ServersView";
 import ValidatePanel from "./ui/ValidatePanel";
 import { Button, Select } from "@tenryu-common/ui/kit";
@@ -242,10 +243,20 @@ export default function App() {
             >
               {m.nav.servers}
             </button>
+            <button
+              onClick={() => setView("assist")}
+              className="w-full rounded px-2 py-1 text-left"
+              style={{
+                color: view === "assist" ? "var(--fg)" : "var(--fg-secondary)",
+                background: view === "assist" ? "var(--bg-inset)" : "transparent",
+              }}
+            >
+              {m.nav.assist}
+            </button>
           </div>
         </nav>
         <main className="min-h-0 min-w-0 overflow-auto p-4">
-          {view === "servers" ? <ServersView /> : view === "history" ? <HistoryView /> : <DeckView />}
+          {view === "servers" ? <ServersView /> : view === "assist" ? <AssistantView /> : view === "history" ? <HistoryView /> : <DeckView />}
         </main>
         {(view === "form" || (view === "history" && historyDeckOpen)) && (
           <aside
@@ -310,6 +321,7 @@ export default function App() {
           })),
           { id: "history", label: m.nav.history, run: () => setView("history") },
           { id: "servers", label: m.nav.servers, run: () => setView("servers") },
+          { id: "assist", label: m.nav.assist, run: () => setView("assist") },
           { id: "validate", label: m.validate.run, hint: "⌘⏎", run: () => void runValidate() },
           { id: "run", label: m.run.run, hint: "⇧⌘⏎", run: () => { if (!pibBlocked && !binMissing) void startRun(); } },
           { id: "save", label: m.deckIo.menuSave, hint: "⌘S", run: () => void saveNamelist() },

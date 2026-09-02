@@ -7,8 +7,11 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <iomanip>
+#include <limits>
 #include <sstream>
+#include <type_traits>
 #include <unordered_map>
 #include <string>
 #include <vector>
@@ -41,14 +44,434 @@
 #include "hydro/mesh_motion_trace.hpp"
 #include "hydro/optionb_velocity_remap.cuh"
 #include "hydro/oriented_swept_volume.cuh"
+#include "hydro/pentagon_geometry.cuh"
 #include "hydro/pole_axis_constraints.cuh"
 #include "hydro/pole_angular_derefine.cuh"
+#include "hydro/remap_eos_closure.cuh"
 #include "hydro/rz_corner_mass.cuh"
+#include "hydro/remap_corner_distribution.hpp"
 #include "mesh/mesh.hpp"
 #include "mesh/rz_moments.cuh"
 #include "parallel/reduction.hpp"
 
 namespace tenryu::hydro::ale {
+
+namespace {
+
+constexpr int kRemapDispatchAuditCounterCount =
+    static_cast<int>(RemapDispatchAuditCounter::Count);
+constexpr double kRemapDispatchAuditFeatherRadiusMin = 1.0e-3;
+constexpr double kRemapDispatchAuditFeatherRadiusMax = 2.5e-3;
+constexpr double kAwTwoPi =
+    6.283185307179586476925286766559005768394338798750211641949;
+
+bool csr_corner_distribution_same_bits(const double& a, const double& b) {
+  return std::memcmp(&a, &b, sizeof(double)) == 0;
+}
+
+void csr_corner_distribution_subpolygon(
+    const double* const r,
+    const double* const z,
+    const int nverts,
+    const int corner,
+    double* const sub_r,
+    double* const sub_z) {
+  double center_r = 0.0;
+  double center_z = 0.0;
+  for (int k = 0; k < nverts; ++k) {
+    center_r += r[k];
+    center_z += z[k];
+  }
+  center_r /= static_cast<double>(nverts);
+  center_z /= static_cast<double>(nverts);
+  const int next = (corner + 1 == nverts) ? 0 : corner + 1;
+  const int previous = (corner == 0) ? nverts - 1 : corner - 1;
+  sub_r[0] = r[corner];
+  sub_z[0] = z[corner];
+  sub_r[1] = 0.5 * (r[corner] + r[next]);
+  sub_z[1] = 0.5 * (z[corner] + z[next]);
+  sub_r[2] = center_r;
+  sub_z[2] = center_z;
+  sub_r[3] = 0.5 * (r[previous] + r[corner]);
+  sub_z[3] = 0.5 * (z[previous] + z[corner]);
+}
+
+void csr_corner_distribution_cell_geometry(
+    const double* const r,
+    const double* const z,
+    const int nverts,
+    double* const corner_volume,
+    double* const corner_centroid_r,
+    double* const corner_centroid_z) {
+  TENRYU_ASSERT(nverts == 3 || nverts == 4 || nverts == 5,
+                "CSR corner distribution requires triangle, quad, or "
+                "pentagon cells");
+  if (nverts == 3) {
+    for (int k = 0; k < 3; ++k) {
+      double sub_r[4] = {};
+      double sub_z[4] = {};
+      csr_corner_distribution_subpolygon(
+          r, z, nverts, k, sub_r, sub_z);
+      corner_volume[k] =
+          std::fabs(rz::rz_polygon_volume_exact(sub_r, sub_z, 4));
+    }
+  } else if (nverts == 4) {
+    rz::compute_quad_corner_volumes_exact_subpolygon(
+        r[0], z[0], r[1], z[1], r[2], z[2], r[3], z[3], corner_volume);
+  } else {
+    PentagonPoint points[5];
+    for (int k = 0; k < 5; ++k) {
+      points[k] = {r[k], z[k]};
+    }
+    pentagon_corner_rz_volumes(points, corner_volume);
+    for (int k = 0; k < 5; ++k) {
+      corner_volume[k] = std::fabs(corner_volume[k]);
+    }
+  }
+  for (int k = 0; k < nverts; ++k) {
+    double sub_r[4] = {};
+    double sub_z[4] = {};
+    csr_corner_distribution_subpolygon(
+        r, z, nverts, k, sub_r, sub_z);
+    rz::rz_polygon_area_centroid_exact(
+        sub_r, sub_z, 4, corner_centroid_r + k, corner_centroid_z + k);
+  }
+}
+
+void csr_aw_barlow_corner_area_partition(
+    const double* const r,
+    const double* const z,
+    const int nverts,
+    double* const corner_area) {
+  TENRYU_ASSERT(nverts >= 3 &&
+                    nverts <= mesh::kMeshTopoCellStorageSlotsMaxGeneral,
+                "AW Barlow corner-area partition requires a supported "
+                "general-N cell");
+  const double cell_area =
+      0.5 * std::abs(rz::rz_polygon_area2_exact(r, z, nverts));
+  TENRYU_ASSERT(cell_area > 0.0 && std::isfinite(cell_area),
+                "AW planar cell area must be positive and finite");
+
+  double centroid_r = 0.0;
+  double centroid_z = 0.0;
+  for (int k = 0; k < nverts; ++k) {
+    centroid_r += r[k];
+    centroid_z += z[k];
+  }
+  const double inv_nverts = 1.0 / static_cast<double>(nverts);
+  centroid_r *= inv_nverts;
+  centroid_z *= inv_nverts;
+
+  double edge_triangle_area[
+      mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {};
+  double edge_area_sum = 0.0;
+  for (int k = 0; k < nverts; ++k) {
+    const int next = (k + 1) % nverts;
+    const double triangle_r[3] = {r[k], r[next], centroid_r};
+    const double triangle_z[3] = {z[k], z[next], centroid_z};
+    edge_triangle_area[k] =
+        0.5 * std::abs(
+                  rz::rz_polygon_area2_exact(triangle_r, triangle_z, 3));
+    edge_area_sum += edge_triangle_area[k];
+  }
+  TENRYU_ASSERT(
+      std::abs(edge_area_sum - cell_area) <= 1.0e-12 * cell_area,
+      "AW Barlow edge-triangle areas must sum to the cell area");
+
+  const double shared_area = edge_area_sum * inv_nverts / 3.0;
+  for (int k = 0; k < nverts; ++k) {
+    const int prev = (k + nverts - 1) % nverts;
+    corner_area[k] =
+        (edge_triangle_area[prev] + edge_triangle_area[k]) / 3.0 +
+        shared_area;
+  }
+}
+
+struct RemapDispatchAuditRuntime {
+  bool initialized = false;
+  bool flushed = false;
+  int rank = 0;
+  int n_cells = 0;
+  const parallel::Reduction* reduction = nullptr;
+  core::DeviceArray<int> counters{"remap_dispatch_audit:counters"};
+  core::DeviceArray<std::uint8_t> feather_mask{
+      "remap_dispatch_audit:feather_mask"};
+};
+
+struct GclAuditTransactionSummary {
+  int step = -1;
+  double max_abs_R = 0.0;
+  double max_rel_R = 0.0;
+  double sum_R = 0.0;
+  double sum_rel = 0.0;
+  int n_cells_active = 0;
+};
+
+struct GclAuditRuntime {
+  bool initialized = false;
+  bool flushed = false;
+  bool manifest_emitted = false;
+  bool has_transaction = false;
+  int rank = 0;
+  int transaction_count = 0;
+  const parallel::Reduction* reduction = nullptr;
+  GclAuditTransactionSummary worst;
+};
+
+RemapDispatchAuditRuntime& remap_dispatch_audit_runtime() {
+  static RemapDispatchAuditRuntime runtime;
+  return runtime;
+}
+
+GclAuditRuntime& gcl_audit_runtime() {
+  static GclAuditRuntime runtime;
+  return runtime;
+}
+
+bool gcl_audit_env_enabled() {
+  static const bool enabled = [] {
+    const char* raw = std::getenv("TENRYU_I1B_GCL_AUDIT");
+    return raw != nullptr && raw[0] != '\0' && raw[0] != '0';
+  }();
+  return enabled;
+}
+
+const char* remap_dispatch_audit_counter_name(const int index) {
+  static constexpr std::array<const char*, kRemapDispatchAuditCounterCount>
+      names = {"exact_swept_moment",
+               "legacy_swept_volume",
+               "first_order_donor_fallback",
+               "limiter_activation",
+               "momentum_packet_fallback",
+               "boundary_one_sided",
+               "swept_centroid_average_fallback",
+               "ms2_degenerate_gradient_fallback",
+               "csr_gradient_zero_fallback",
+               "reconstruction_nonfinite_fallback",
+               "momentum_expanded_failure_fallback",
+               "momentum_invalid_input_fallback",
+               "projection_gradient_condition_fallback"};
+  return names[static_cast<std::size_t>(index)];
+}
+
+}  // namespace
+
+bool remap_dispatch_audit_env_enabled() {
+  static const bool enabled = [] {
+    const char* raw = std::getenv("TENRYU_I1B_REMAP_DISPATCH_AUDIT");
+    return raw != nullptr && raw[0] != '\0' && raw[0] != '0';
+  }();
+  return enabled;
+}
+
+void remap_dispatch_audit_run_start(
+    const core::State& state,
+    const parallel::Reduction* reduction,
+    const int rank) {
+  if (!remap_dispatch_audit_env_enabled()) {
+    return;
+  }
+  RemapDispatchAuditRuntime& runtime = remap_dispatch_audit_runtime();
+  runtime.initialized = true;
+  runtime.flushed = false;
+  runtime.rank = rank;
+  runtime.reduction = reduction;
+  runtime.n_cells = state.mesh.topo.n_cells;
+  runtime.counters.reset(
+      static_cast<std::size_t>(2 * kRemapDispatchAuditCounterCount));
+  CUDA_CHECK(cudaMemset(runtime.counters.data(),
+                        0,
+                        runtime.counters.size() * sizeof(int)));
+
+  runtime.feather_mask.reset(static_cast<std::size_t>(runtime.n_cells));
+  std::vector<std::uint8_t> feather_mask(
+      static_cast<std::size_t>(runtime.n_cells), 0U);
+  if (state.mesh.dim == 2 && runtime.n_cells > 0) {
+    TENRYU_ASSERT(state.x_r_initial.size() == state.x_r.size() &&
+                      state.x_z_initial.size() == state.x_z.size(),
+                  "remap dispatch audit requires initial node coordinates");
+    std::vector<double> initial_r;
+    std::vector<double> initial_z;
+    state.x_r_initial.copy_to_host(initial_r);
+    state.x_z_initial.copy_to_host(initial_z);
+    const auto& cell_nverts = state.mesh.cell_nverts;
+    const auto& mb = state.mesh.topo.multiblock;
+    for (int c = 0; c < runtime.n_cells; ++c) {
+      double center_r = 0.0;
+      double center_z = 0.0;
+      const int nverts =
+          mesh::mesh_topo_cell_active_nverts(cell_nverts, c);
+      if (mb.has_value()) {
+        const int off = mb->cell_node_csr_offsets[static_cast<std::size_t>(c)];
+        for (int k = 0; k < nverts; ++k) {
+          const int node = mb->cell_node_csr_indices[
+              static_cast<std::size_t>(off + k)];
+          center_r += initial_r[static_cast<std::size_t>(node)];
+          center_z += initial_z[static_cast<std::size_t>(node)];
+        }
+      } else {
+        TENRYU_ASSERT(nverts == 4,
+                      "structured remap dispatch audit cells must be quads");
+        const int nz = state.mesh.topo.nz;
+        const int i = c / nz;
+        const int j = c - i * nz;
+        const int node[4] = {i * (nz + 1) + j,
+                             (i + 1) * (nz + 1) + j,
+                             (i + 1) * (nz + 1) + j + 1,
+                             i * (nz + 1) + j + 1};
+        for (int k = 0; k < nverts; ++k) {
+          center_r += initial_r[static_cast<std::size_t>(node[k])];
+          center_z += initial_z[static_cast<std::size_t>(node[k])];
+        }
+      }
+      center_r /= static_cast<double>(nverts);
+      center_z /= static_cast<double>(nverts);
+      const double radius = std::hypot(center_r, center_z);
+      feather_mask[static_cast<std::size_t>(c)] =
+          (radius >= kRemapDispatchAuditFeatherRadiusMin &&
+           radius <= kRemapDispatchAuditFeatherRadiusMax)
+              ? 1U
+              : 0U;
+    }
+  }
+  runtime.feather_mask.copy_from_host(feather_mask);
+}
+
+RemapDispatchAuditDeviceView remap_dispatch_audit_device_view() {
+  RemapDispatchAuditRuntime& runtime = remap_dispatch_audit_runtime();
+  if (!remap_dispatch_audit_env_enabled() || !runtime.initialized ||
+      runtime.flushed) {
+    return {};
+  }
+  return {runtime.counters.data(),
+          runtime.feather_mask.data(),
+          runtime.n_cells};
+}
+
+void remap_dispatch_audit_flush() {
+  if (!remap_dispatch_audit_env_enabled()) {
+    return;
+  }
+  RemapDispatchAuditRuntime& runtime = remap_dispatch_audit_runtime();
+  if (!runtime.initialized || runtime.flushed) {
+    return;
+  }
+  runtime.flushed = true;
+  std::vector<int> local_counts;
+  runtime.counters.copy_to_host(local_counts);
+  std::vector<double> counts(local_counts.size(), 0.0);
+  for (std::size_t i = 0; i < local_counts.size(); ++i) {
+    counts[i] = static_cast<double>(local_counts[i]);
+  }
+  if (runtime.reduction != nullptr) {
+    runtime.reduction->allreduce_sum(counts.data(),
+                                     static_cast<int>(counts.size()));
+  }
+  if (runtime.rank != 0) {
+    return;
+  }
+  std::ostringstream oss;
+  oss << "[remap-audit]";
+  for (int i = 0; i < kRemapDispatchAuditCounterCount; ++i) {
+    oss << " " << remap_dispatch_audit_counter_name(i) << "="
+        << static_cast<long long>(counts[static_cast<std::size_t>(i)]);
+  }
+  // Centroid-outside is only an expanded-stencil reason classification;
+  // there is no distinct centroid-outside-to-donor-fallback branch.
+  oss << " donor_centroid_outside_fallback=not_distinct";
+  for (int i = 0; i < kRemapDispatchAuditCounterCount; ++i) {
+    oss << " feather_" << remap_dispatch_audit_counter_name(i) << "="
+        << static_cast<long long>(counts[static_cast<std::size_t>(
+               kRemapDispatchAuditCounterCount + i)]);
+  }
+  oss << " feather_donor_centroid_outside_fallback=not_distinct";
+  core::log_info(oss.str());
+}
+
+void gcl_audit_run_start(
+    const parallel::Reduction* const reduction,
+    const int rank) {
+  if (!gcl_audit_env_enabled()) {
+    return;
+  }
+  GclAuditRuntime& runtime = gcl_audit_runtime();
+  runtime = {};
+  runtime.initialized = true;
+  runtime.rank = rank;
+  runtime.reduction = reduction;
+}
+
+void gcl_audit_flush() {
+  if (!gcl_audit_env_enabled()) {
+    return;
+  }
+  GclAuditRuntime& runtime = gcl_audit_runtime();
+  if (!runtime.initialized || runtime.flushed) {
+    return;
+  }
+  runtime.flushed = true;
+  if (runtime.rank != 0) {
+    return;
+  }
+  const GclAuditTransactionSummary& worst = runtime.worst;
+  std::ostringstream oss;
+  oss << std::scientific << std::setprecision(17)
+      << "[gcl-audit] FINAL worst_step=" << worst.step
+      << " max_abs_R=" << worst.max_abs_R
+      << " max_rel_R=" << worst.max_rel_R
+      << " sum_R=" << worst.sum_R
+      << " sum_rel=" << worst.sum_rel
+      << " n_cells_active=" << worst.n_cells_active
+      << " n_transactions=" << runtime.transaction_count;
+  core::log_info(oss.str());
+}
+
+__host__ __device__ inline void csr_compute_pentagon_qk_corner_masses(
+    const double m_cell,
+    const double* const r,
+    const double* const z,
+    double* const m_corner) {
+  PentagonPoint x[5];
+  for (int k = 0; k < 5; ++k) {
+    x[k] = {r[k], z[k]};
+  }
+  double v_sub[5] = {};
+  pentagon_corner_rz_volumes(x, v_sub);
+  double v_sum = 0.0;
+  for (int k = 0; k < 5; ++k) {
+    const bool valid = v_sub[k] > 0.0 &&
+                       pentagon_geometry_detail::finite_double(v_sub[k]);
+#if defined(__CUDA_ARCH__)
+    if (!valid) {
+      printf("CSR remap pentagon Q_k corner volume invalid\n");
+      __trap();
+    }
+#else
+    TENRYU_ASSERT(
+        valid,
+        "CSR remap pentagon Q_k corner volume must be positive and finite");
+#endif
+    v_sum += v_sub[k];
+  }
+  const bool valid_sum =
+      v_sum > 0.0 && pentagon_geometry_detail::finite_double(v_sum);
+#if defined(__CUDA_ARCH__)
+  if (!valid_sum) {
+    printf("CSR remap pentagon Q_k corner volume sum invalid\n");
+    __trap();
+  }
+#else
+  TENRYU_ASSERT(
+      valid_sum,
+      "CSR remap pentagon Q_k corner volume sum must be positive and finite");
+#endif
+  // Pentagon corner masses follow the Q_k subzonal convention (NUMERICS §3.2.4).
+  for (int k = 0; k < 5; ++k) {
+    m_corner[k] = m_cell * (v_sub[k] / v_sum);
+  }
+  m_corner[2] =
+      m_cell - ((m_corner[0] + m_corner[1]) + (m_corner[3] + m_corner[4]));
+}
 
 __global__ void compute_cell_velocity_from_nodes_kernel(
     double* __restrict__ v_r_cell,
@@ -387,6 +810,8 @@ namespace {
 CsrConsAuditContext g_csr_cons_audit_context{};
 
 constexpr double kTinyVolume = 1.0e-300;
+// Keep aligned with the standard-step donor-mass oracle in ale_driver.cu.
+constexpr double kRemapMassClosureRejectFraction = 0.1;
 constexpr int kCentralMacroRemapAuditMass = 0;
 constexpr int kCentralMacroRemapAuditEnergy = 1;
 constexpr int kCentralMacroRemapAuditTracer = 2;
@@ -738,6 +1163,55 @@ __global__ void project_cell_velocity_to_nodes_button_kernel(
       z_bottom_bc_mode,
       z_top_bc_mode,
       false);
+}
+
+// The remap never moves the pinned center point, so the degenerate center
+// column's material velocity is remap-invariant: snapshot it before the
+// cell-to-node projection and restore it afterwards. Deriving it from the
+// neighborhood projection instead would overwrite the column with a
+// legitimately nonzero field mean that is NOT the center's material
+// velocity. Single-thread; both kernels walk the flags in the same
+// ascending order, so slot k pairs with the same node in save and restore.
+__global__ void save_center_column_velocity_kernel(
+    double* __restrict__ saved_vr,
+    double* __restrict__ saved_vz,
+    const double* __restrict__ v_r_node,
+    const double* __restrict__ v_z_node,
+    const std::uint8_t* __restrict__ node_flags,
+    const int n_nodes) {
+  if (blockIdx.x != 0 || threadIdx.x != 0) {
+    return;
+  }
+  constexpr int kMaxCenterColumn = 1024;
+  int count = 0;
+  for (int n = 0; n < n_nodes && count < kMaxCenterColumn; ++n) {
+    if ((node_flags[n] & pole_axis::kNodeCenterFlag) != 0U) {
+      saved_vr[count] = v_r_node[n];
+      saved_vz[count] = v_z_node[n];
+      ++count;
+    }
+  }
+}
+
+__global__ void restore_center_column_velocity_kernel(
+    double* __restrict__ v_r_node,
+    double* __restrict__ v_z_node,
+    const double* __restrict__ saved_vr,
+    const double* __restrict__ saved_vz,
+    const std::uint8_t* __restrict__ node_flags,
+    const int n_nodes) {
+  if (blockIdx.x != 0 || threadIdx.x != 0) {
+    return;
+  }
+  constexpr int kMaxCenterColumn = 1024;
+  int count = 0;
+  for (int n = 0; n < n_nodes && count < kMaxCenterColumn; ++n) {
+    if ((node_flags[n] & pole_axis::kNodeCenterFlag) != 0U) {
+      v_r_node[n] = saved_vr[count];
+      v_z_node[n] = saved_vz[count];
+      ++count;
+    }
+  }
 }
 
 __global__ void state_supply_boundary_donor_radial_avg_kernel(
@@ -3121,6 +3595,7 @@ __device__ inline void apply_radiation_face_flux_second_order_z(
   energy += sign * dV * fmax(e_f, 0.0);
 }
 
+template <bool ClampNonnegative>
 __global__ void ale_remap_2d_rz_radiation_kernel(
     const double* __restrict__ e_rad_lag,
     const double* __restrict__ vol_lag,
@@ -3217,9 +3692,14 @@ __global__ void ale_remap_2d_rz_radiation_kernel(
 	    }
 	  }
 
-  e_rad_new[c] = fmax(energy / fmax(vol_ref[c], kTinyVolume), 0.0);
+  if constexpr (ClampNonnegative) {
+    e_rad_new[c] = fmax(energy / fmax(vol_ref[c], kTinyVolume), 0.0);
+  } else {
+    e_rad_new[c] = energy / fmax(vol_ref[c], kTinyVolume);
+  }
 }
 
+template <bool ClampNonnegative>
 __global__ void ale_remap_2d_rz_radiation_second_order_kernel(
     const double* __restrict__ e_rad_lag,
     const double* __restrict__ vol_lag,
@@ -3408,7 +3888,36 @@ __global__ void ale_remap_2d_rz_radiation_second_order_kernel(
 	  }
 	  }
 
-	  e_rad_new[c] = fmax(energy / fmax(vol_ref[c], kTinyVolume), 0.0);
+	  if constexpr (ClampNonnegative) {
+	    e_rad_new[c] = fmax(energy / fmax(vol_ref[c], kTinyVolume), 0.0);
+	  } else {
+	    e_rad_new[c] = energy / fmax(vol_ref[c], kTinyVolume);
+	  }
+}
+
+__global__ void ale_remap_2d_rz_mass_preflight_check_kernel(
+    int* __restrict__ first_rejected_cell,
+    const double* __restrict__ predicted_rho,
+    const double* __restrict__ pre_rho,
+    const double* __restrict__ vol_new,
+    const double* __restrict__ vol_old,
+    const double* __restrict__ veto_floor,
+    const int n_cells,
+    const double reject_fraction) {
+  const int c = blockIdx.x * blockDim.x + threadIdx.x;
+  if (c >= n_cells) {
+    return;
+  }
+  const double predicted_mass = predicted_rho[c] * vol_new[c];
+  const double pre_mass = pre_rho[c] * vol_old[c];
+  const double veto_mass = veto_floor != nullptr ? veto_floor[c] : 0.0;
+  // A floor-band cell's clamp is the floor closure's normal job (healthy band
+  // ~1e-16 fractions); only material cells may veto a remap — measured:
+  // floor-band vetoes starved all relief for 1,313 consecutive events while
+  // the seam neighbor inverted (A497).
+  if (predicted_mass < -reject_fraction * fmax(pre_mass, veto_mass)) {
+    atomicMin(first_rejected_cell, c);
+  }
 }
 
 __global__ void gather_group_field_kernel(double* __restrict__ out,
@@ -3677,6 +4186,105 @@ __global__ void eos_reclosure_ideal_gas_kernel(
   }
 }
 
+// §19 W1: table-EOS twin of eos_reclosure_ideal_gas_kernel. Energy-authoritative
+// (design §19 item 1). NOT yet launched from any path — integration is §19-W2.
+__global__ void eos_reclosure_table_lte_kernel(
+    double* __restrict__ Te,
+    double* __restrict__ Ti,
+    double* __restrict__ Pe,
+    double* __restrict__ Pi,
+    double* __restrict__ ee,
+    double* __restrict__ ei,
+    const double* __restrict__ rho,
+    const double* __restrict__ mass,
+    const double* __restrict__ zbar,
+    const int n_cells,
+    const int nz,
+    const int button_outer_node_ring,
+    const std::uint8_t* __restrict__ inactive_cell_mask,
+    const int two_temperature,
+    const double A,
+    const double rho_floor,
+    const double te_floor,
+    const double ti_floor,
+    const tenryu::materials::DeviceEOSTableView tab_ion,
+    const tenryu::materials::DeviceEOSTableView tab_ele,
+    const tenryu::materials::DeviceEOSTableView tab_total,
+    const int low_density_extrap,
+    double* __restrict__ d_de_floor,        // length-1 accumulator; may be nullptr
+    int* __restrict__ d_closure_status) {   // per-cell; may be nullptr
+  const int c = blockIdx.x * blockDim.x + threadIdx.x;
+  if (c >= n_cells) {
+    return;
+  }
+
+  if (button_outer_node_ring > 0 && c != 0) {
+    const int i = c / nz;
+    if (i < button_outer_node_ring) {
+      return;
+    }
+  }
+  if (csr_inactive_cell(inactive_cell_mask, c)) {
+    return;
+  }
+
+  const double rho_c = fmax(rho[c], rho_floor);
+  const double m_c = mass[c];
+  const double z = (zbar != nullptr) ? fmax(zbar[c], 0.0) : 1.0;
+  double ledger = 0.0;
+  int status = 0;
+
+  if (two_temperature == 1) {
+    const auto ion = remap_eos::close_species_energy_authoritative(
+        tab_ion,
+        rho_c,
+        m_c,
+        &ei[c],
+        ti_floor,
+        1.0,
+        A,
+        low_density_extrap != 0,
+        &ledger);
+    const auto ele = remap_eos::close_species_energy_authoritative(
+        tab_ele,
+        rho_c,
+        m_c,
+        &ee[c],
+        te_floor,
+        z,
+        A,
+        low_density_extrap != 0,
+        &ledger);
+    Ti[c] = ion.T;
+    Te[c] = ele.T;
+    Pi[c] = ion.P;
+    Pe[c] = ele.P;
+    status = ion.status | ele.status;
+  } else {
+    const auto total = remap_eos::close_total_1t_energy_authoritative(
+        tab_total,
+        rho_c,
+        m_c,
+        &ee[c],
+        te_floor,
+        z,
+        A,
+        low_density_extrap != 0,
+        &ledger);
+    Te[c] = Ti[c] = total.T;
+    Pe[c] = total.P;
+    Pi[c] = 0.0;
+    status = total.status;
+  }
+
+  if (d_closure_status != nullptr) {
+    d_closure_status[c] = status;
+  }
+  if (d_de_floor != nullptr && ledger != 0.0) {
+    atomicAdd(&d_de_floor[0], ledger);
+  }
+}
+
 __global__ void zero_button_dormant_hydro_state_kernel(
     double* __restrict__ rho,
     double* __restrict__ mass,
@@ -3746,6 +4354,58 @@ __global__ void zero_button_dormant_group_state_kernel(
   for (int g = 0; g < n_groups; ++g) {
     field[c * n_groups + g] = 0.0;
   }
+}
+
+__global__ void accumulate_max_abs_kernel(
+    const double* __restrict__ values,
+    const int count,
+    double* __restrict__ maximum) {
+  if (blockIdx.x != 0 || threadIdx.x != 0 || values == nullptr ||
+      maximum == nullptr) {
+    return;
+  }
+  double value_max = maximum[0];
+  for (int i = 0; i < count; ++i) {
+    value_max = fmax(value_max, fabs(values[i]));
+  }
+  maximum[0] = value_max;
+}
+
+void accumulate_device_array_max_abs(const double* const values,
+                                     const int count,
+                                     double* const maximum) {
+  if (values == nullptr || count <= 0 || maximum == nullptr) {
+    return;
+  }
+  accumulate_max_abs_kernel<<<1, 1>>>(values, count, maximum);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+double* snapshot_device_array(const char* const tag,
+                              const double* const source,
+                              const std::size_t count) {
+  if (source == nullptr || count == 0U) {
+    return nullptr;
+  }
+  double* const snapshot = static_cast<double*>(
+      core::device_scratch_acquire(tag, count * sizeof(double)));
+  CUDA_CHECK(cudaMemcpy(snapshot,
+                        source,
+                        count * sizeof(double),
+                        cudaMemcpyDeviceToDevice));
+  return snapshot;
+}
+
+void restore_device_array(double* const destination,
+                          const double* const snapshot,
+                          const std::size_t count) {
+  if (destination == nullptr || snapshot == nullptr || count == 0U) {
+    return;
+  }
+  CUDA_CHECK(cudaMemcpy(destination,
+                        snapshot,
+                        count * sizeof(double),
+                        cudaMemcpyDeviceToDevice));
 }
 
 double sum_device_array(const double* d_values, const int n) {
@@ -4277,6 +4937,85 @@ double env_double_value(const char* const name, const double fallback) {
   return parsed;
 }
 
+enum class P3OracleMode {
+  Disabled,
+  Vcell,
+  Vnode,
+  Energy,
+  Combined,
+};
+
+struct P3OracleConfig {
+  P3OracleMode mode = P3OracleMode::Disabled;
+  double H = 5.0e4;
+  double rho0 = 1.0;
+  double pe0 = 1.0e10;
+  double pi0 = 1.0e10;
+  double gamma = 5.0 / 3.0;
+};
+
+const P3OracleConfig& p3_oracle_config() {
+  static const P3OracleConfig config = [] {
+    P3OracleConfig value;
+    const char* const raw = std::getenv("TENRYU_I1B_P3_ORACLE");
+    if (raw == nullptr || raw[0] == '\0') {
+      return value;
+    }
+    const std::string mode(raw);
+    if (mode == "vcell") {
+      value.mode = P3OracleMode::Vcell;
+    } else if (mode == "vnode") {
+      value.mode = P3OracleMode::Vnode;
+    } else if (mode == "e") {
+      value.mode = P3OracleMode::Energy;
+    } else if (mode == "combined") {
+      value.mode = P3OracleMode::Combined;
+    } else {
+      TENRYU_ASSERT(false,
+                    "TENRYU_I1B_P3_ORACLE must be one of "
+                    "{vcell, vnode, e, combined}");
+    }
+    value.H = env_double_value("TENRYU_I1B_P3_ORACLE_H", 5.0e4);
+    value.rho0 = env_double_value("TENRYU_I1B_P3_ORACLE_RHO0", 1.0);
+    value.pe0 = env_double_value("TENRYU_I1B_P3_ORACLE_PE0", 1.0e10);
+    value.pi0 = env_double_value("TENRYU_I1B_P3_ORACLE_PI0", 1.0e10);
+    value.gamma =
+        env_double_value("TENRYU_I1B_P3_ORACLE_GAMMA", 5.0 / 3.0);
+    return value;
+  }();
+  return config;
+}
+
+const char* p3_oracle_mode_name(const P3OracleMode mode) {
+  switch (mode) {
+    case P3OracleMode::Vcell:
+      return "vcell";
+    case P3OracleMode::Vnode:
+      return "vnode";
+    case P3OracleMode::Energy:
+      return "e";
+    case P3OracleMode::Combined:
+      return "combined";
+    case P3OracleMode::Disabled:
+      return "disabled";
+  }
+  return "disabled";
+}
+
+void p3_oracle_log_once(const P3OracleConfig& config,
+                        const char* const station) {
+  static bool emitted = false;
+  if (emitted) {
+    return;
+  }
+  emitted = true;
+  std::ostringstream oss;
+  oss << std::scientific << std::setprecision(16)
+      << "[p3-oracle] mode=" << p3_oracle_mode_name(config.mode)
+      << " H=" << config.H << " applied_at=" << station;
+  core::log_info(oss.str());
+}
+
 bool optionb_macroboundary_audit_env_enabled() {
   const char* const raw = std::getenv("TENRYU_I1B_OPTIONB_MACROBOUNDARY_AUDIT");
   if (raw == nullptr) {
@@ -4366,6 +5105,83 @@ void copy_device_pointer_to_host(const T* const d_values,
                         d_values,
                         static_cast<std::size_t>(n) * sizeof(T),
                         cudaMemcpyDeviceToHost));
+}
+
+void record_gcl_audit_transaction(
+    const int step,
+    const bool configured_swept_volume_sign_fixed,
+    const bool active_swept_volume_sign_fixed,
+    const bool mass_flux_limited,
+    const std::vector<double>& residual,
+    const std::vector<double>& scale,
+    const std::vector<std::uint8_t>& inactive_cell_mask) {
+  GclAuditRuntime& runtime = gcl_audit_runtime();
+  if (!runtime.initialized) {
+    runtime.initialized = true;
+  }
+  double local_max_abs_R = 0.0;
+  double local_scale = 0.0;
+  double local_sum_R = 0.0;
+  double local_sum_scale = 0.0;
+  double local_active = 0.0;
+  for (std::size_t c = 0; c < residual.size(); ++c) {
+    if (!inactive_cell_mask.empty() && inactive_cell_mask[c] != 0U) {
+      continue;
+    }
+    local_max_abs_R = std::max(local_max_abs_R, std::abs(residual[c]));
+    local_scale = std::max(local_scale, scale[c]);
+    local_sum_R += residual[c];
+    local_sum_scale += scale[c];
+    local_active += 1.0;
+  }
+  double maxima[2] = {local_max_abs_R, local_scale};
+  double sums[3] = {local_sum_R, local_sum_scale, local_active};
+  if (runtime.reduction != nullptr) {
+    runtime.reduction->allreduce_max(maxima, 2);
+    runtime.reduction->allreduce_sum(sums, 3);
+  }
+
+  GclAuditTransactionSummary summary;
+  summary.step = step;
+  summary.max_abs_R = maxima[0];
+  summary.max_rel_R = maxima[1] > 0.0 ? maxima[0] / maxima[1] : 0.0;
+  summary.sum_R = sums[0];
+  summary.sum_rel = sums[1] > 0.0 ? std::abs(sums[0]) / sums[1] : 0.0;
+  summary.n_cells_active = static_cast<int>(std::llround(sums[2]));
+
+  if (!runtime.manifest_emitted && runtime.rank == 0) {
+    runtime.manifest_emitted = true;
+    std::ostringstream manifest;
+    manifest << std::boolalpha
+             << "[gcl-audit] manifest cfg.numerics.ale."
+                "swept_volume_sign_fixed="
+             << configured_swept_volume_sign_fixed
+             << " active_swept_volume_sign_fixed="
+             << active_swept_volume_sign_fixed
+             << " audited_pass=primary_hydro"
+             << " consumed_swept_set="
+             << (mass_flux_limited ? "mass_flux_limited" : "raw_geometric");
+    core::log_info(manifest.str());
+  }
+  if (runtime.rank == 0) {
+    std::ostringstream oss;
+    oss << std::scientific << std::setprecision(17)
+        << "[gcl-audit] step=" << summary.step
+        << " max_abs_R=" << summary.max_abs_R
+        << " max_rel_R=" << summary.max_rel_R
+        << " sum_R=" << summary.sum_R
+        << " sum_rel=" << summary.sum_rel
+        << " n_cells_active=" << summary.n_cells_active;
+    core::log_info(oss.str());
+  }
+  ++runtime.transaction_count;
+  if (!runtime.has_transaction ||
+      summary.max_rel_R > runtime.worst.max_rel_R ||
+      (summary.max_rel_R == runtime.worst.max_rel_R &&
+       summary.max_abs_R > runtime.worst.max_abs_R)) {
+    runtime.worst = summary;
+    runtime.has_transaction = true;
+  }
 }
 
 bool csr_swept_audit_valid_cell_face(
@@ -4762,7 +5578,9 @@ void csr_remap_energy_audit_corner_masses_host(
     const std::vector<double>& x_z,
     const std::vector<int>& cell_node_offsets,
     const std::vector<int>& cell_node_indices,
-    const std::vector<std::uint8_t>& cell_nverts);
+    const std::vector<std::uint8_t>& cell_nverts,
+    const bool partition_normalized,
+    const bool polar_tier_equal_planar_area);
 
 void csr_remap_energy_audit_physical_corner_masses_host(
     double* m_corner,
@@ -4771,7 +5589,8 @@ void csr_remap_energy_audit_physical_corner_masses_host(
     const std::vector<double>& mass,
     const std::vector<double>& x_r,
     const std::vector<double>& x_z,
-    const std::vector<std::uint8_t>& cell_nverts);
+    const std::vector<std::uint8_t>& cell_nverts,
+    const int corner_mass_convention);
 
 void csr_remap_energy_audit_physical_cell_nodes(int* nodes, int c, int nz);
 
@@ -5082,7 +5901,7 @@ CsrConsAuditRepairSummary csr_cons_audit_repair_summary(
   std::array<CsrConsAuditTopCell, 3> local_top{};
   const int nz = state.mesh.topo.nz;
   for (int c = 0; c < n_cells; ++c) {
-    double m_corner[mesh::kMeshTopoCellStorageSlotsMax] = {};
+    double m_corner[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {};
     if (optionb_velocity_authority &&
         optionb_corner_mass.size() == static_cast<std::size_t>(n_cells) * 4U) {
       const int base = 4 * c;
@@ -5091,7 +5910,8 @@ CsrConsAuditRepairSummary csr_cons_audit_repair_summary(
       }
     } else if (physical_ke_remap) {
       csr_remap_energy_audit_physical_corner_masses_host(
-          m_corner, c, nz, mass, x_r, x_z, state.mesh.cell_nverts);
+          m_corner, c, nz, mass, x_r, x_z, state.mesh.cell_nverts,
+          static_cast<int>(cfg.numerics.hydro.corner_mass_convention));
     } else {
       csr_remap_energy_audit_corner_masses_host(m_corner,
                                                 c,
@@ -5100,7 +5920,9 @@ CsrConsAuditRepairSummary csr_cons_audit_repair_summary(
                                                 x_z,
                                                 cell_node_offsets,
                                                 cell_node_indices,
-                                                state.mesh.cell_nverts);
+                                                state.mesh.cell_nverts,
+                                                corner_mass_lagrangian_invariant_enabled(cfg),
+                                                mesh::mesh_topo_polar_tier_family(cfg.mesh));
     }
     const int active_nverts =
         mesh::mesh_topo_cell_active_nverts(
@@ -5109,7 +5931,7 @@ CsrConsAuditRepairSummary csr_cons_audit_repair_summary(
     const int off = physical_ke_remap
                         ? 0
                         : cell_node_offsets[static_cast<std::size_t>(c)];
-    int physical_nodes[mesh::kMeshTopoCellStorageSlotsMax] = {};
+    int physical_nodes[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {};
     if (physical_ke_remap) {
       csr_remap_energy_audit_physical_cell_nodes(physical_nodes, c, nz);
     }
@@ -5393,7 +6215,9 @@ void csr_remap_energy_audit_corner_masses_host(
     const std::vector<double>& x_z,
     const std::vector<int>& cell_node_offsets,
     const std::vector<int>& cell_node_indices,
-    const std::vector<std::uint8_t>& cell_nverts) {
+    const std::vector<std::uint8_t>& cell_nverts,
+    const bool partition_normalized,
+    const bool polar_tier_equal_planar_area) {
   for (int k = 0; k < mesh::kMeshTopoCellStorageSlotsMax; ++k) {
     m_corner[k] = 0.0;
   }
@@ -5405,22 +6229,38 @@ void csr_remap_energy_audit_corner_masses_host(
        std::isfinite(mass[static_cast<std::size_t>(c)]))
           ? mass[static_cast<std::size_t>(c)]
           : 0.0;
-  double r[mesh::kMeshTopoCellStorageSlotsMax] = {};
-  double z[mesh::kMeshTopoCellStorageSlotsMax] = {};
+  double r[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {};
+  double z[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {};
   for (int k = 0; k < active_nverts; ++k) {
     const int n = cell_node_indices[static_cast<std::size_t>(off + k)];
     r[k] = x_r[static_cast<std::size_t>(n)];
     z[k] = x_z[static_cast<std::size_t>(n)];
   }
+  // Audit basis == dynamical basis: the tri and quad legs mirror the
+  // partition selection of compute_corner_mass_2d_multiblock_kernel
+  // (hydro_2d.cu). Pentagon and star-P1 legs are deliberately unchanged
+  // (A124(b) P-A ruling, 2026-08-15).
   if (active_nverts == 3) {
-    rz::compute_triangle_corner_masses_exact(
-        m_cell, r[0], z[0], r[1], z[1], r[2], z[2], m_corner);
+    if (polar_tier_equal_planar_area) {
+      rz::compute_triangle_corner_masses_equal_planar_area(
+          m_cell, r[0], z[0], r[1], z[1], r[2], z[2], m_corner);
+    } else {
+      rz::compute_triangle_corner_masses_exact(
+          m_cell, r[0], z[0], r[1], z[1], r[2], z[2], m_corner);
+    }
   } else if (active_nverts == 4) {
-    rz::compute_quad_corner_masses_bbsw(
-        m_cell, r[0], r[1], r[2], r[3], m_corner);
-  } else if (active_nverts >= 5 &&
+    if (partition_normalized) {
+      rz::compute_quad_corner_masses_partitioned_subpolygon(
+          m_cell, r[0], z[0], r[1], z[1], r[2], z[2], r[3], z[3], m_corner);
+    } else {
+      rz::compute_quad_corner_masses_exact_subpolygon(
+          m_cell, r[0], z[0], r[1], z[1], r[2], z[2], r[3], z[3], m_corner);
+    }
+  } else if (active_nverts == 5) {
+    csr_compute_pentagon_qk_corner_masses(m_cell, r, z, m_corner);
+  } else if (active_nverts >= 6 &&
              active_nverts <= mesh::kMeshTopoCellStorageSlotsMax) {
-    double w[mesh::kMeshTopoCellStorageSlotsMax] = {};
+    double w[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {};
     mesh::moments::star_p1_vertex_r_moments(r, z, active_nverts, w);
     double W = 0.0;
     bool finite_weights = true;
@@ -5448,7 +6288,8 @@ void csr_remap_energy_audit_physical_corner_masses_host(
     const std::vector<double>& mass,
     const std::vector<double>& x_r,
     const std::vector<double>& x_z,
-    const std::vector<std::uint8_t>& cell_nverts) {
+    const std::vector<std::uint8_t>& cell_nverts,
+    const int corner_mass_convention) {
   for (int k = 0; k < mesh::kMeshTopoCellStorageSlotsMax; ++k) {
     m_corner[k] = 0.0;
   }
@@ -5467,7 +6308,9 @@ void csr_remap_energy_audit_physical_corner_masses_host(
       x_r.data(),
       x_z.data(),
       cell_nverts.empty() ? nullptr : cell_nverts.data(),
-      m_corner);
+      m_corner,
+      nullptr,
+      corner_mass_convention);
 }
 
 void csr_remap_energy_audit_physical_cell_nodes(int* const nodes,
@@ -5571,7 +6414,7 @@ void csr_remap_energy_audit_emit(
   long double macro_dEfloor = 0.0L;
   for (int c = 0; c < n_cells; ++c) {
     const bool inactive = remap_energy_audit_inactive(audit.inactive_mask, c);
-    double m_corner[mesh::kMeshTopoCellStorageSlotsMax] = {};
+    double m_corner[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {};
     if (optionb_velocity_authority &&
         optionb_corner_mass.size() == static_cast<std::size_t>(n_cells) * 4U) {
       const int base = 4 * c;
@@ -5580,7 +6423,8 @@ void csr_remap_energy_audit_emit(
       }
     } else if (physical_ke_remap) {
       csr_remap_energy_audit_physical_corner_masses_host(
-          m_corner, c, nz, mass, x_r, x_z, state.mesh.cell_nverts);
+          m_corner, c, nz, mass, x_r, x_z, state.mesh.cell_nverts,
+          static_cast<int>(cfg.numerics.hydro.corner_mass_convention));
     } else {
       csr_remap_energy_audit_corner_masses_host(m_corner,
                                                 c,
@@ -5589,14 +6433,16 @@ void csr_remap_energy_audit_emit(
                                                 x_z,
                                                 cell_node_offsets,
                                                 cell_node_indices,
-                                                state.mesh.cell_nverts);
+                                                state.mesh.cell_nverts,
+                                                corner_mass_lagrangian_invariant_enabled(cfg),
+                                                mesh::mesh_topo_polar_tier_family(cfg.mesh));
     }
     const int active_nverts =
         tenryu::mesh::mesh_topo_cell_active_nverts(
             state.mesh.cell_nverts.empty() ? nullptr : state.mesh.cell_nverts.data(),
             c);
     const int off = cell_node_offsets[static_cast<std::size_t>(c)];
-    int physical_nodes[mesh::kMeshTopoCellStorageSlotsMax] = {};
+    int physical_nodes[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {};
     if (physical_ke_remap) {
       csr_remap_energy_audit_physical_cell_nodes(physical_nodes, c, nz);
     }
@@ -5797,7 +6643,7 @@ struct alignas(8) CsrNearVacuumRecord {
   int index0 = -1;
   int index1 = -1;
   int active_nverts = 0;
-  int node_id[mesh::kMeshTopoCellStorageSlotsMax] = {};
+  int node_id[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {};
   double centroid_r = 0.0;
   double centroid_z = 0.0;
   double centroid_rr = 0.0;
@@ -5822,12 +6668,12 @@ struct alignas(8) CsrNearVacuumRecord {
   double recovered_internal = 0.0;
   double internal_from_remapped_total = 0.0;
   double post_projection_ke = 0.0;
-  double node_r[mesh::kMeshTopoCellStorageSlotsMax] = {};
-  double node_z[mesh::kMeshTopoCellStorageSlotsMax] = {};
-  double node_vr_pre[mesh::kMeshTopoCellStorageSlotsMax] = {};
-  double node_vz_pre[mesh::kMeshTopoCellStorageSlotsMax] = {};
-  double node_vr_post[mesh::kMeshTopoCellStorageSlotsMax] = {};
-  double node_vz_post[mesh::kMeshTopoCellStorageSlotsMax] = {};
+  double node_r[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {};
+  double node_z[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {};
+  double node_vr_pre[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {};
+  double node_vz_pre[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {};
+  double node_vr_post[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {};
+  double node_vz_post[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {};
   double mass_flux_sum = 0.0;
   CsrNearVacuumFaceRecord top_faces[kCsrNearVacuumTopFaces];
 };
@@ -6293,13 +7139,14 @@ std::uint8_t* upload_node_flags_if_needed(const core::State& state,
 __host__ __device__ inline int csr_internal_flux_donor(
     const int cell_a,
     const int cell_b,
-    const double dV_a,
-    const bool swept_volume_sign_fixed) {
+    const double dV_a) {
+  // dV_a is gain-positive for cell_a.  Therefore positive flux comes from
+  // cell_b, while negative flux comes from cell_a.
   return make_oriented_swept_volume(
              cell_a,
              cell_b,
              dV_a,
-             swept_volume_convention_from_flag(swept_volume_sign_fixed))
+             SweptVolumeConvention::OrientedLowToHighV1)
       .donor;
 }
 
@@ -6333,6 +7180,417 @@ __device__ inline double csr_face_swept_volume_outward(
                                                cell_nverts);
 }
 
+__device__ inline double csr_face_swept_raw_moments_outward(
+    const double* __restrict__ x_r_old,
+    const double* __restrict__ x_z_old,
+    const double* __restrict__ x_r_new,
+    const double* __restrict__ x_z_new,
+    const int* __restrict__ cell_node_csr_offsets,
+    const int* __restrict__ cell_node_csr_indices,
+    const int* __restrict__ cell_orientation_sign,
+    const int cell,
+    const int local_face,
+    const std::uint8_t* __restrict__ cell_nverts,
+    double* const dMr,
+    double* const dMz) {
+  *dMr = 0.0;
+  *dMz = 0.0;
+  int na = -1;
+  int nb = -1;
+  if (!detail::csr_face_swept_node_indices(cell_node_csr_offsets,
+                                           cell_node_csr_indices,
+                                           cell_nverts,
+                                           cell,
+                                           local_face,
+                                           &na,
+                                           &nb)) {
+    return 0.0;
+  }
+  if (x_r_old[na] == x_r_new[na] && x_z_old[na] == x_z_new[na] &&
+      x_r_old[nb] == x_r_new[nb] && x_z_old[nb] == x_z_new[nb]) {
+    return 0.0;
+  }
+
+  const double r0 = x_r_old[na];
+  const double z0 = x_z_old[na];
+  const double r1 = x_r_old[nb];
+  const double z1 = x_z_old[nb];
+  const double r2 = x_r_new[nb];
+  const double z2 = x_z_new[nb];
+  const double r3 = x_r_new[na];
+  const double z3 = x_z_new[na];
+
+  // Q=(a_old,b_old,b_new,a_new) is clockwise when an outward-moving face
+  // enlarges a positively oriented cell.  The common -orientation factor
+  // therefore makes dV, dMr, and dMz positive for volume gained by cell.
+  // Applying the same factor to all three preserves the swept centroid.
+  const double gain_sign =
+      -detail::csr_cell_orientation_sign(cell, cell_orientation_sign);
+  *dMr = gain_sign *
+         detail::rz_signed_quad_moment_r(r0, z0, r1, z1, r2, z2, r3, z3);
+  *dMz = gain_sign *
+         detail::rz_signed_quad_moment_z(r0, z0, r1, z1, r2, z2, r3, z3);
+  return gain_sign *
+         detail::rz_signed_quad_volume(r0, z0, r1, z1, r2, z2, r3, z3);
+}
+
+__device__ inline double csr_clamped_flux_scale(
+    const double* __restrict__ mass_flux_scale,
+    const int losing_cell) {
+  if (mass_flux_scale == nullptr) {
+    return 1.0;
+  }
+  double scale = mass_flux_scale[losing_cell];
+  if (!isfinite(scale)) {
+    scale = 0.0;
+  }
+  return fmin(1.0, fmax(0.0, scale));
+}
+
+__device__ inline double csr_barth_jespersen_face_alpha(
+    const double* __restrict__ field,
+    const double q_face,
+    const int cell,
+    const int n_cells,
+    const int* __restrict__ face_adj_csr_offsets,
+    const int* __restrict__ face_adj_csr_indices,
+    const std::uint8_t* __restrict__ cell_nverts,
+    const std::uint8_t* __restrict__ inactive_cell_mask,
+    const RemapDispatchAuditDeviceView remap_dispatch_audit) {
+  const double q_c = field[cell];
+  double q_min = q_c;
+  double q_max = q_c;
+  const int off = face_adj_csr_offsets[cell];
+  const int end = face_adj_csr_offsets[cell + 1];
+  const int active_nverts =
+      tenryu::mesh::mesh_topo_cell_active_nverts(cell_nverts, cell);
+  for (int p = off; p < end; ++p) {
+    const int local = p - off;
+    if (!tenryu::mesh::mesh_topo_local_face_is_active(active_nverts, local)) {
+      continue;
+    }
+    const int neighbor = face_adj_csr_indices[p];
+    if (neighbor < 0 || neighbor >= n_cells ||
+        csr_inactive_cell(inactive_cell_mask, neighbor)) {
+      continue;
+    }
+    q_min = fmin(q_min, field[neighbor]);
+    q_max = fmax(q_max, field[neighbor]);
+  }
+
+  if (!isfinite(q_face)) {
+    remap_dispatch_audit_count(
+        remap_dispatch_audit,
+        RemapDispatchAuditCounter::ReconstructionNonfiniteFallback,
+        cell);
+    return 0.0;
+  }
+  const double alpha = detail::csr_barth_jespersen_limiter_ratio(
+      q_c, q_min, q_max, q_face);
+  if (alpha < 1.0) {
+    remap_dispatch_audit_count(remap_dispatch_audit,
+                               RemapDispatchAuditCounter::LimiterActivation,
+                               cell);
+  }
+  return alpha;
+}
+
+__global__ void csr_compute_old_rz_volume_centroids_kernel(
+    double* __restrict__ centroid_r,
+    double* __restrict__ centroid_z,
+    const double* __restrict__ x_r_old,
+    const double* __restrict__ x_z_old,
+    const int* __restrict__ cell_node_csr_offsets,
+    const int* __restrict__ cell_node_csr_indices,
+    const int* __restrict__ cell_orientation_sign,
+    const std::uint8_t* __restrict__ cell_nverts,
+    const std::uint8_t* __restrict__ inactive_cell_mask,
+    const int n_cells,
+    const RemapDispatchAuditDeviceView remap_dispatch_audit) {
+  const int c = blockIdx.x * blockDim.x + threadIdx.x;
+  if (c >= n_cells) {
+    return;
+  }
+  if (csr_inactive_cell(inactive_cell_mask, c)) {
+    centroid_r[c] = 0.0;
+    centroid_z[c] = 0.0;
+    return;
+  }
+
+  const int active_nverts =
+      tenryu::mesh::mesh_topo_cell_active_nverts(cell_nverts, c);
+  const int off = cell_node_csr_offsets[c];
+  double r[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {};
+  double z[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {};
+  for (int k = 0; k < active_nverts; ++k) {
+    const int n = cell_node_csr_indices[off + k];
+    r[k] = x_r_old[n];
+    z[k] = x_z_old[n];
+  }
+
+  const mesh::moments::PolyRZMoments moments =
+      mesh::moments::poly_rz_moments_fan(r, z, active_nverts);
+  const double orientation =
+      detail::csr_cell_orientation_sign(c, cell_orientation_sign);
+  const double Mr = orientation * moments.mr;
+  const double Mrr = orientation * moments.mrr;
+  const double Mrz = orientation * moments.mrz;
+  if (Mr > 0.0 && isfinite(Mr) && isfinite(Mrr) && isfinite(Mrz)) {
+    const double c_r = Mrr / Mr;
+    const double c_z = Mrz / Mr;
+    if (isfinite(c_r) && isfinite(c_z)) {
+      centroid_r[c] = c_r;
+      centroid_z[c] = c_z;
+      return;
+    }
+  }
+
+  mesh::moments::poly_vertex_mean(
+      r, z, active_nverts, centroid_r[c], centroid_z[c]);
+  remap_dispatch_audit_count(
+      remap_dispatch_audit,
+      RemapDispatchAuditCounter::SweptCentroidAverageFallback,
+      c);
+}
+
+// DIAGNOSTIC ORACLES (consult-17 §3.3), not physics.
+__global__ void p3_oracle_overwrite_cell_velocity_kernel(
+    double* __restrict__ v_r_cell,
+    double* __restrict__ v_z_cell,
+    const double* __restrict__ centroid_r,
+    const double* __restrict__ centroid_z,
+    const std::uint8_t* __restrict__ inactive_cell_mask,
+    const int n_cells,
+    const double H) {
+  const int c = blockIdx.x * blockDim.x + threadIdx.x;
+  if (c >= n_cells || csr_inactive_cell(inactive_cell_mask, c)) {
+    return;
+  }
+  v_r_cell[c] = -H * centroid_r[c];
+  v_z_cell[c] = -H * centroid_z[c];
+}
+
+// DIAGNOSTIC ORACLES (consult-17 §3.3), not physics.
+__global__ void p3_oracle_overwrite_node_velocity_kernel(
+    double* __restrict__ v_r,
+    double* __restrict__ v_z,
+    const double* __restrict__ x_r,
+    const double* __restrict__ x_z,
+    const std::uint8_t* __restrict__ active_node_mask,
+    const int n_nodes,
+    const double H) {
+  const int n = blockIdx.x * blockDim.x + threadIdx.x;
+  if (n >= n_nodes ||
+      (active_node_mask != nullptr && active_node_mask[n] == 0U)) {
+    return;
+  }
+  v_r[n] = -H * x_r[n];
+  v_z[n] = -H * x_z[n];
+}
+
+// DIAGNOSTIC ORACLES (consult-17 §3.3), not physics.
+__global__ void p3_oracle_overwrite_energy_kernel(
+    double* __restrict__ ee,
+    double* __restrict__ ei,
+    const double* __restrict__ rho,
+    const std::uint8_t* __restrict__ inactive_cell_mask,
+    const int n_cells,
+    const double pressure_e,
+    const double pressure_i,
+    const double gamma) {
+  const int c = blockIdx.x * blockDim.x + threadIdx.x;
+  if (c >= n_cells || csr_inactive_cell(inactive_cell_mask, c)) {
+    return;
+  }
+  const double gm1_rho = (gamma - 1.0) * rho[c];
+  ee[c] = pressure_e / gm1_rho;
+  ei[c] = pressure_i / gm1_rho;
+}
+
+__device__ inline double csr_moments_direct_field_integral(
+    const double* __restrict__ field,
+    const double* __restrict__ grad_r,
+    const double* __restrict__ grad_z,
+    const double* __restrict__ old_centroid_r,
+    const double* __restrict__ old_centroid_z,
+    const double* __restrict__ x_r_old,
+    const double* __restrict__ x_z_old,
+    const int* __restrict__ face_adj_csr_offsets,
+    const int* __restrict__ face_adj_csr_indices,
+    const int* __restrict__ cell_node_csr_offsets,
+    const int* __restrict__ cell_node_csr_indices,
+    const std::uint8_t* __restrict__ cell_nverts,
+    const std::uint8_t* __restrict__ inactive_cell_mask,
+    const double donor_volume,
+    const int donor,
+    const int n_cells,
+    const double dV,
+    const double dMr,
+    const double dMz,
+    const bool no_face_clip,
+    const RemapDispatchAuditDeviceView remap_dispatch_audit) {
+  const double q_bar = field[donor];
+  if (grad_r == nullptr || grad_z == nullptr) {
+    return q_bar * dV;
+  }
+  const double r_bar = old_centroid_r[donor];
+  const double z_bar = old_centroid_z[donor];
+  const double dMr_centered = dMr - r_bar * dV;
+  const double dMz_centered = dMz - z_bar * dV;
+  const double gradient_integral = grad_r[donor] * dMr_centered +
+                                   grad_z[donor] * dMz_centered;
+  double integral = q_bar * dV + gradient_integral;
+
+  const bool nondegenerate =
+      isfinite(donor_volume) && donor_volume > 0.0 &&
+      fabs(dV) >= 1.0e-12 * donor_volume;
+  if (!no_face_clip && nondegenerate) {
+    const double r_face = dMr / dV;
+    const double z_face = dMz / dV;
+    const double q_face = q_bar + grad_r[donor] * (r_face - r_bar) +
+                          grad_z[donor] * (z_face - z_bar);
+    const double alpha = csr_barth_jespersen_face_alpha(
+        field,
+        q_face,
+        donor,
+        n_cells,
+        face_adj_csr_offsets,
+        face_adj_csr_indices,
+        cell_nverts,
+        inactive_cell_mask,
+        remap_dispatch_audit);
+    integral = q_bar * dV + alpha * gradient_integral;
+  }
+  if (!isfinite(integral)) {
+    remap_dispatch_audit_count(
+        remap_dispatch_audit,
+        RemapDispatchAuditCounter::ReconstructionNonfiniteFallback,
+        donor);
+    integral = q_bar * dV;
+  }
+  return integral;
+}
+
+struct CsrGclAuditDeviceView {
+  double* internal_face_dV_to_cell_a = nullptr;
+  double* boundary_face_dV_to_cell = nullptr;
+};
+
+template <bool GclAudit>
+__device__ inline void csr_gcl_audit_store_internal_face(
+    const CsrGclAuditDeviceView audit,
+    const int face,
+    const double dV_to_cell_a) {
+  if constexpr (GclAudit) {
+    audit.internal_face_dV_to_cell_a[face] =
+        finite_nonzero(dV_to_cell_a) ? dV_to_cell_a : 0.0;
+  }
+}
+
+template <bool GclAudit>
+__device__ inline void csr_gcl_audit_store_boundary_face(
+    const CsrGclAuditDeviceView audit,
+    const int face,
+    const double dV_to_cell) {
+  if constexpr (GclAudit) {
+    audit.boundary_face_dV_to_cell[face] =
+        finite_nonzero(dV_to_cell) ? dV_to_cell : 0.0;
+  }
+}
+
+__global__ void csr_gcl_audit_accumulate_internal_faces_kernel(
+    double* __restrict__ outward_swept_sum,
+    double* __restrict__ swept_abs_sum,
+    const double* __restrict__ internal_face_dV_to_cell_a,
+    const int* __restrict__ unique_cell_a,
+    const int* __restrict__ unique_cell_b,
+    const int n_faces) {
+  const int f = blockIdx.x * blockDim.x + threadIdx.x;
+  if (f >= n_faces) {
+    return;
+  }
+  const double dV_to_cell_a = internal_face_dV_to_cell_a[f];
+  if (!finite_nonzero(dV_to_cell_a)) {
+    return;
+  }
+  const int cell_a = unique_cell_a[f];
+  const int cell_b = unique_cell_b[f];
+  // The remap update adds dV_to_cell_a to cell A and its opposite to cell B.
+  // Consult-16 defines positive swept volume as outward from the cell, hence
+  // the sign reversal used by the GCL residual.
+  atomicAdd(outward_swept_sum + cell_a, -dV_to_cell_a);
+  atomicAdd(outward_swept_sum + cell_b, dV_to_cell_a);
+  const double abs_dV = fabs(dV_to_cell_a);
+  atomicAdd(swept_abs_sum + cell_a, abs_dV);
+  atomicAdd(swept_abs_sum + cell_b, abs_dV);
+}
+
+__global__ void csr_gcl_audit_accumulate_boundary_faces_kernel(
+    double* __restrict__ outward_swept_sum,
+    double* __restrict__ swept_abs_sum,
+    const double* __restrict__ boundary_face_dV_to_cell,
+    const int* __restrict__ boundary_cell,
+    const int n_faces) {
+  const int f = blockIdx.x * blockDim.x + threadIdx.x;
+  if (f >= n_faces) {
+    return;
+  }
+  const double dV_to_cell = boundary_face_dV_to_cell[f];
+  if (!finite_nonzero(dV_to_cell)) {
+    return;
+  }
+  const int cell = boundary_cell[f];
+  atomicAdd(outward_swept_sum + cell, -dV_to_cell);
+  atomicAdd(swept_abs_sum + cell, fabs(dV_to_cell));
+}
+
+__global__ void csr_gcl_audit_finalize_cells_kernel(
+    double* __restrict__ residual,
+    double* __restrict__ scale,
+    const double* __restrict__ outward_swept_sum,
+    const double* __restrict__ swept_abs_sum,
+    const double* __restrict__ x_r_old,
+    const double* __restrict__ x_z_old,
+    const double* __restrict__ x_r_new,
+    const double* __restrict__ x_z_new,
+    const int* __restrict__ cell_node_csr_offsets,
+    const int* __restrict__ cell_node_csr_indices,
+    const int* __restrict__ cell_orientation_sign,
+    const std::uint8_t* __restrict__ cell_nverts,
+    const std::uint8_t* __restrict__ inactive_cell_mask,
+    const int n_cells) {
+  const int c = blockIdx.x * blockDim.x + threadIdx.x;
+  if (c >= n_cells) {
+    return;
+  }
+  if (csr_inactive_cell(inactive_cell_mask, c)) {
+    residual[c] = 0.0;
+    scale[c] = 0.0;
+    return;
+  }
+  const int offset = cell_node_csr_offsets[c];
+  const int nverts =
+      tenryu::mesh::mesh_topo_cell_active_nverts(cell_nverts, c);
+  double r_old[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {};
+  double z_old[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {};
+  double r_new[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {};
+  double z_new[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {};
+  for (int k = 0; k < nverts; ++k) {
+    const int node = cell_node_csr_indices[offset + k];
+    r_old[k] = x_r_old[node];
+    z_old[k] = x_z_old[node];
+    r_new[k] = x_r_new[node];
+    z_new[k] = x_z_new[node];
+  }
+  const double orientation = static_cast<double>(cell_orientation_sign[c]);
+  const double V_L =
+      orientation * rz::rz_polygon_volume_exact(r_old, z_old, nverts);
+  const double V_R =
+      orientation * rz::rz_polygon_volume_exact(r_new, z_new, nverts);
+  residual[c] = V_R - V_L + outward_swept_sum[c];
+  scale[c] = fabs(V_L) + fabs(V_R) + swept_abs_sum[c];
+}
+
 __device__ inline double csr_face_swept_moments_outward(
     const double* __restrict__ x_r_old,
     const double* __restrict__ x_z_old,
@@ -6346,7 +7604,8 @@ __device__ inline double csr_face_swept_moments_outward(
     const std::uint8_t* __restrict__ cell_nverts,
     double* rq,
     double* zq,
-    detail::CsrFaceSweptMomentsStatus* status) {
+    detail::CsrFaceSweptMomentsStatus* status,
+    bool* exact_moments = nullptr) {
   return detail::csr_face_swept_moments_outward(x_r_old,
                                                 x_z_old,
                                                 x_r_new,
@@ -6359,7 +7618,8 @@ __device__ inline double csr_face_swept_moments_outward(
                                                 cell_nverts,
                                                 rq,
                                                 zq,
-                                                status);
+                                                status,
+                                                exact_moments);
 }
 
 constexpr int kCsrOptionBDiagFallback = 0;
@@ -7738,9 +8998,9 @@ __global__ void csr_optionb_apply_internal_packets_color_kernel(
     const double* __restrict__ mass_flux_scale,
     const int* __restrict__ face_color,
     const int active_color,
-    const bool swept_volume_sign_fixed,
     const int n_faces,
     const std::uint8_t* __restrict__ inactive_cell_mask,
+    const std::uint8_t* __restrict__ donor_fallback_cell_mask,
     const std::uint8_t* __restrict__ discard_reference_inactive_cell_mask,
     double* __restrict__ discard_ledger,
     // Basis-coherent transport: pre-remap basis corner masses
@@ -7765,7 +9025,8 @@ __global__ void csr_optionb_apply_internal_packets_color_kernel(
     int* __restrict__ ring5_face_cell_a,
     int* __restrict__ ring5_face_cell_b,
     int* __restrict__ ring5_face_donor,
-    int* __restrict__ ring5_face_receiver) {
+    int* __restrict__ ring5_face_receiver,
+    const RemapDispatchAuditDeviceView remap_dispatch_audit) {
   const int f = blockIdx.x * blockDim.x + threadIdx.x;
   if (f >= n_faces || face_color[f] != active_color) {
     return;
@@ -7806,6 +9067,7 @@ __global__ void csr_optionb_apply_internal_packets_color_kernel(
   double zq = 0.0;
   detail::CsrFaceSweptMomentsStatus moment_status =
       detail::CsrFaceSweptMomentsStatus::SKIP;
+  bool exact_moments = false;
   const double dV_a =
       ::tenryu::hydro::ale::csr_face_swept_moments_outward(
           x_r_old,
@@ -7820,7 +9082,8 @@ __global__ void csr_optionb_apply_internal_packets_color_kernel(
           cell_nverts,
           &rq,
           &zq,
-          &moment_status);
+          &moment_status,
+          &exact_moments);
   if (moment_status != detail::CsrFaceSweptMomentsStatus::OK ||
       !finite_nonzero(dV_a)) {
     if (diagnostics != nullptr) {
@@ -7849,8 +9112,7 @@ __global__ void csr_optionb_apply_internal_packets_color_kernel(
     return;
   }
 
-  const int donor =
-      csr_internal_flux_donor(cell_a, cell_b, dV_a, swept_volume_sign_fixed);
+  const int donor = csr_internal_flux_donor(cell_a, cell_b, dV_a);
   const int receiver = (donor == cell_a) ? cell_b : cell_a;
   const int losing_cell = csr_internal_flux_losing_cell(cell_a, cell_b, dV_a);
   double dV_limited = dV_a;
@@ -7888,6 +9150,12 @@ __global__ void csr_optionb_apply_internal_packets_color_kernel(
                                        ring5_face_receiver);
     return;
   }
+  remap_dispatch_audit_count(
+      remap_dispatch_audit,
+      exact_moments
+          ? RemapDispatchAuditCounter::ExactSweptMoment
+          : RemapDispatchAuditCounter::SweptCentroidAverageFallback,
+      donor);
 
   const int donor_nverts =
       tenryu::mesh::mesh_topo_cell_active_nverts(cell_nverts, donor);
@@ -7979,6 +9247,73 @@ __global__ void csr_optionb_apply_internal_packets_color_kernel(
                                                   rq,
                                                   zq)
                  : 0;
+  if (donor_fallback_cell_mask != nullptr &&
+      donor_fallback_cell_mask[donor] != 0U) {
+    remap_dispatch_audit_count(
+        remap_dispatch_audit,
+        RemapDispatchAuditCounter::FirstOrderDonorFallback,
+        donor);
+    remap_dispatch_audit_count(
+        remap_dispatch_audit,
+        RemapDispatchAuditCounter::MomentumPacketFallback,
+        donor);
+    double donor_ur_mean = 0.0;
+    double donor_uz_mean = 0.0;
+    csr_optionb_live_cell_mean_velocity(donor_m,
+                                        donor_pr,
+                                        donor_pz,
+                                        donor_nverts,
+                                        &donor_ur_mean,
+                                        &donor_uz_mean);
+    csr_optionb_store_ring5_face_trace(
+        trace_face,
+        f,
+        kCsrOptionBRing5FaceStatusFallback,
+        centroid_class_for_trace,
+        cell_a,
+        cell_b,
+        donor,
+        receiver,
+        dm_q,
+        donor_ur_mean,
+        donor_uz_mean,
+        ring5_face_p,
+        ring5_face_dm,
+        ring5_face_u,
+        ring5_face_status,
+        ring5_face_centroid_class,
+        ring5_face_cell_a,
+        ring5_face_cell_b,
+        ring5_face_donor,
+        ring5_face_receiver);
+    csr_optionb_note_discarded_dual_flux(
+        cell_a,
+        cell_b,
+        donor,
+        receiver,
+        dm_q,
+        donor_ur_mean,
+        donor_uz_mean,
+        discard_reference_inactive_cell_mask,
+        discard_ledger);
+    csr_optionb_atomic_min_double(
+        diagnostics_real != nullptr
+            ? diagnostics_real + kCsrOptionBDiagRealAlphaMin
+            : nullptr,
+        1.0);
+    csr_optionb_apply_first_order_packet(dm_q,
+                                         receiver_r,
+                                         receiver_z,
+                                         donor_nverts,
+                                         receiver_nverts,
+                                         donor_m,
+                                         donor_pr,
+                                         donor_pz,
+                                         receiver_m,
+                                         receiver_pr,
+                                         receiver_pz);
+    return;
+  }
   const auto packet_result =
       tenryu::hydro::optionb::remap_velocity_momentum_packet_fct(
           dm_q,
@@ -8008,6 +9343,12 @@ __global__ void csr_optionb_apply_internal_packets_color_kernel(
           donor_sigma_ptr);
   if (packet_result.status ==
       tenryu::hydro::optionb::VelocityRemapStatus::OK) {
+    if (packet_result.alpha < 1.0) {
+      remap_dispatch_audit_count(
+          remap_dispatch_audit,
+          RemapDispatchAuditCounter::LimiterActivation,
+          donor);
+    }
     double u_q_r = 0.0;
     double u_q_z = 0.0;
     for (int a = 0; a < donor_nverts; ++a) {
@@ -8146,6 +9487,12 @@ __global__ void csr_optionb_apply_internal_packets_color_kernel(
                                               donor_sigma_ptr);
     if (expanded_result.status ==
         tenryu::hydro::optionb::VelocityRemapStatus::OK) {
+      if (expanded_result.alpha < 1.0) {
+        remap_dispatch_audit_count(
+            remap_dispatch_audit,
+            RemapDispatchAuditCounter::LimiterActivation,
+            donor);
+      }
       double u_q_r = 0.0;
       double u_q_z = 0.0;
       double lambda_sum = 0.0;
@@ -8217,13 +9564,40 @@ __global__ void csr_optionb_apply_internal_packets_color_kernel(
         atomicAdd(diagnostics + kCsrOptionBDiagInvalid, 1);
       }
     }
+    remap_dispatch_audit_count(
+        remap_dispatch_audit,
+        RemapDispatchAuditCounter::MomentumExpandedFailureFallback,
+        donor);
+    if (expanded_result.status ==
+        tenryu::hydro::optionb::VelocityRemapStatus::INVALID_INPUT) {
+      remap_dispatch_audit_count(
+          remap_dispatch_audit,
+          RemapDispatchAuditCounter::MomentumInvalidInputFallback,
+          donor);
+    }
   } else if (diagnostics != nullptr) {
     atomicAdd(diagnostics + kCsrOptionBDiagInvalid, 1);
+  }
+
+  if (packet_result.status ==
+      tenryu::hydro::optionb::VelocityRemapStatus::INVALID_INPUT) {
+    remap_dispatch_audit_count(
+        remap_dispatch_audit,
+        RemapDispatchAuditCounter::MomentumInvalidInputFallback,
+        donor);
   }
 
   if (diagnostics != nullptr) {
     atomicAdd(diagnostics + kCsrOptionBDiagFallback, 1);
   }
+  remap_dispatch_audit_count(
+      remap_dispatch_audit,
+      RemapDispatchAuditCounter::FirstOrderDonorFallback,
+      donor);
+  remap_dispatch_audit_count(
+      remap_dispatch_audit,
+      RemapDispatchAuditCounter::MomentumPacketFallback,
+      donor);
   double fallback_ur = 0.0;
   double fallback_uz = 0.0;
   csr_optionb_live_cell_mean_velocity(
@@ -8413,9 +9787,9 @@ __global__ void csr_optionb_compute_internal_face_flux_kernel(
     const std::uint8_t* __restrict__ cell_nverts,
     const std::uint8_t* __restrict__ node_flags,
     const double* __restrict__ mass_flux_scale,
-    const bool swept_volume_sign_fixed,
     const int n_faces,
     const std::uint8_t* __restrict__ inactive_cell_mask,
+    const std::uint8_t* __restrict__ donor_fallback_cell_mask,
     const std::uint8_t* __restrict__ discard_reference_inactive_cell_mask,
     double* __restrict__ discard_ledger,
     const double* __restrict__ basis_corner_mass,
@@ -8436,7 +9810,8 @@ __global__ void csr_optionb_compute_internal_face_flux_kernel(
     int* __restrict__ ring5_face_cell_a,
     int* __restrict__ ring5_face_cell_b,
     int* __restrict__ ring5_face_donor,
-    int* __restrict__ ring5_face_receiver) {
+    int* __restrict__ ring5_face_receiver,
+    const RemapDispatchAuditDeviceView remap_dispatch_audit) {
   const int f = blockIdx.x * blockDim.x + threadIdx.x;
   if (f >= n_faces) {
     return;
@@ -8477,6 +9852,7 @@ __global__ void csr_optionb_compute_internal_face_flux_kernel(
   double zq = 0.0;
   detail::CsrFaceSweptMomentsStatus moment_status =
       detail::CsrFaceSweptMomentsStatus::SKIP;
+  bool exact_moments = false;
   const double dV_a =
       ::tenryu::hydro::ale::csr_face_swept_moments_outward(
           x_r_old,
@@ -8491,7 +9867,8 @@ __global__ void csr_optionb_compute_internal_face_flux_kernel(
           cell_nverts,
           &rq,
           &zq,
-          &moment_status);
+          &moment_status,
+          &exact_moments);
   if (moment_status != detail::CsrFaceSweptMomentsStatus::OK ||
       !finite_nonzero(dV_a)) {
     if (diagnostics != nullptr) {
@@ -8520,8 +9897,7 @@ __global__ void csr_optionb_compute_internal_face_flux_kernel(
     return;
   }
 
-  const int donor =
-      csr_internal_flux_donor(cell_a, cell_b, dV_a, swept_volume_sign_fixed);
+  const int donor = csr_internal_flux_donor(cell_a, cell_b, dV_a);
   const int receiver = (donor == cell_a) ? cell_b : cell_a;
   const int losing_cell = csr_internal_flux_losing_cell(cell_a, cell_b, dV_a);
   double dV_limited = dV_a;
@@ -8559,6 +9935,12 @@ __global__ void csr_optionb_compute_internal_face_flux_kernel(
                                        ring5_face_receiver);
     return;
   }
+  remap_dispatch_audit_count(
+      remap_dispatch_audit,
+      exact_moments
+          ? RemapDispatchAuditCounter::ExactSweptMoment
+          : RemapDispatchAuditCounter::SweptCentroidAverageFallback,
+      donor);
 
   const int donor_nverts =
       tenryu::mesh::mesh_topo_cell_active_nverts(cell_nverts, donor);
@@ -8621,8 +10003,28 @@ __global__ void csr_optionb_compute_internal_face_flux_kernel(
                                                   rq,
                                                   zq)
                  : 0;
+  const bool donor_fallback =
+      donor_fallback_cell_mask != nullptr &&
+      donor_fallback_cell_mask[donor] != 0U;
   bool have_vhat = false;
-  if (csr_optionb_face_weights_usable(packet_weight_status)) {
+  if (donor_fallback) {
+    remap_dispatch_audit_count(
+        remap_dispatch_audit,
+        RemapDispatchAuditCounter::FirstOrderDonorFallback,
+        donor);
+    remap_dispatch_audit_count(
+        remap_dispatch_audit,
+        RemapDispatchAuditCounter::MomentumPacketFallback,
+        donor);
+    csr_optionb_live_cell_mean_velocity(optionb_m_corner + donor * 4,
+                                        optionb_p_r + donor * 4,
+                                        optionb_p_z + donor * 4,
+                                        donor_nverts,
+                                        &uhat_r,
+                                        &uhat_z);
+    face_status = kCsrOptionBRing5FaceStatusFallback;
+    have_vhat = isfinite(uhat_r) && isfinite(uhat_z);
+  } else if (csr_optionb_face_weights_usable(packet_weight_status)) {
     csr_optionb_normalize_face_weights(packet_w, donor_nverts);
     csr_optionb_velocity_from_face_weights(donor_ur,
                                            donor_uz,
@@ -8741,6 +10143,25 @@ __global__ void csr_optionb_compute_internal_face_flux_kernel(
         }
       }
     } else {
+      remap_dispatch_audit_count(
+          remap_dispatch_audit,
+          RemapDispatchAuditCounter::FirstOrderDonorFallback,
+          donor);
+      remap_dispatch_audit_count(
+          remap_dispatch_audit,
+          RemapDispatchAuditCounter::MomentumPacketFallback,
+          donor);
+      remap_dispatch_audit_count(
+          remap_dispatch_audit,
+          RemapDispatchAuditCounter::MomentumExpandedFailureFallback,
+          donor);
+      if (packet_weight_status ==
+          CsrOptionBPacketCentroidWeightsStatus::INVALID_INPUT) {
+        remap_dispatch_audit_count(
+            remap_dispatch_audit,
+            RemapDispatchAuditCounter::MomentumInvalidInputFallback,
+            donor);
+      }
       if (diagnostics != nullptr) {
         atomicAdd(diagnostics + kCsrOptionBDiagExpandedFailed, 1);
         atomicAdd(diagnostics + kCsrOptionBDiagFallback, 1);
@@ -8816,8 +10237,12 @@ __global__ void csr_optionb_compute_internal_face_flux_kernel(
       1.0);
 
   double donor_w[4] = {0.0, 0.0, 0.0, 0.0};
-  if (!csr_optionb_basis_face_weights(
-          basis_corner_mass, donor, donor_nverts, donor_w)) {
+  if (donor_fallback) {
+    for (int k = 0; k < donor_nverts; ++k) {
+      donor_w[k] = optionb_m_corner[donor * 4 + k];
+    }
+  } else if (!csr_optionb_basis_face_weights(
+                 basis_corner_mass, donor, donor_nverts, donor_w)) {
     if (csr_optionb_face_weights_usable(packet_weight_status)) {
       for (int k = 0; k < donor_nverts; ++k) {
         donor_w[k] = packet_w[k];
@@ -8828,14 +10253,16 @@ __global__ void csr_optionb_compute_internal_face_flux_kernel(
   }
   csr_optionb_normalize_face_weights(donor_w, donor_nverts);
   double receiver_w[4] = {0.0, 0.0, 0.0, 0.0};
-  const auto receiver_weight_status =
-      csr_optionb_packet_centroid_weights(receiver_r,
-                                          receiver_z,
-                                          receiver_nverts,
-                                          rq,
-                                          zq,
-                                          receiver_w);
-  if (!csr_optionb_face_weights_usable(receiver_weight_status)) {
+  const auto receiver_weight_status = donor_fallback
+      ? CsrOptionBPacketCentroidWeightsStatus::INVALID_INPUT
+      : csr_optionb_packet_centroid_weights(receiver_r,
+                                            receiver_z,
+                                            receiver_nverts,
+                                            rq,
+                                            zq,
+                                            receiver_w);
+  if (donor_fallback ||
+      !csr_optionb_face_weights_usable(receiver_weight_status)) {
     csr_optionb_unit_corner_weights(
         receiver_r, receiver_z, receiver_nverts, receiver_w);
   }
@@ -8928,7 +10355,8 @@ __global__ void csr_optionb_apply_boundary_packets_serial_kernel(
     const double* __restrict__ mass_flux_scale,
     const int n_faces,
     const std::uint8_t* __restrict__ inactive_cell_mask,
-    int* __restrict__ diagnostics) {
+    int* __restrict__ diagnostics,
+    const RemapDispatchAuditDeviceView remap_dispatch_audit) {
   if (blockIdx.x != 0 || threadIdx.x != 0) {
     return;
   }
@@ -8945,6 +10373,7 @@ __global__ void csr_optionb_apply_boundary_packets_serial_kernel(
     double zq = 0.0;
     detail::CsrFaceSweptMomentsStatus moment_status =
         detail::CsrFaceSweptMomentsStatus::SKIP;
+    bool exact_moments = false;
     const double dV =
         ::tenryu::hydro::ale::csr_face_swept_moments_outward(
             x_r_old,
@@ -8959,7 +10388,8 @@ __global__ void csr_optionb_apply_boundary_packets_serial_kernel(
             cell_nverts,
             &rq,
             &zq,
-            &moment_status);
+            &moment_status,
+            &exact_moments);
     (void)rq;
     (void)zq;
     if (moment_status != detail::CsrFaceSweptMomentsStatus::OK ||
@@ -8981,6 +10411,16 @@ __global__ void csr_optionb_apply_boundary_packets_serial_kernel(
     if (!finite_nonzero(dm_signed)) {
       continue;
     }
+    remap_dispatch_audit_count(
+        remap_dispatch_audit,
+        exact_moments
+            ? RemapDispatchAuditCounter::ExactSweptMoment
+            : RemapDispatchAuditCounter::SweptCentroidAverageFallback,
+        cell);
+    remap_dispatch_audit_count(
+        remap_dispatch_audit,
+        RemapDispatchAuditCounter::BoundaryOneSided,
+        cell);
     const int nverts =
         tenryu::mesh::mesh_topo_cell_active_nverts(cell_nverts, cell);
     double target_r[kCsrOptionBFaceCornerSlots] = {};
@@ -10396,7 +11836,6 @@ void csr_optionb_emit_macroboundary_actual_audit(
 void csr_optionb_emit_macroboundary_manufactured_audit(
     const core::State& state,
     const core::Config& cfg,
-    const bool force_swept_volume_sign_fixed,
     const double* const target_cell_mass,
     const bool disable_limiters_for_audit) {
   const int n_cells = state.mesh.topo.n_cells;
@@ -10440,7 +11879,6 @@ void csr_optionb_emit_macroboundary_manufactured_audit(
       cfg,
       audit_buffers,
       true,
-      force_swept_volume_sign_fixed,
       target_cell_mass,
       d_affine_v_r.data(),
       d_affine_v_z.data(),
@@ -10675,14 +12113,155 @@ __global__ void csr_initialize_burn_species_remap_kernel(
   }
 }
 
+struct CsrHydroFluxStageDeviceView {
+  double* mass = nullptr;
+  double* mom_r = nullptr;
+  double* mom_z = nullptr;
+  double* energy_e = nullptr;
+  double* energy_i = nullptr;
+  double* total_energy = nullptr;
+  double* ye_mass = nullptr;
+  double* corner_fraction_mass = nullptr;
+  double* gas_tracer_mass = nullptr;
+  double* burn_species_mass = nullptr;
+  double* hot_e_eps_mass = nullptr;
+  double* burn_eps_mass = nullptr;
+  std::size_t n_face_sides = 0U;
+  int corner_stride = 4;
+};
+
+struct CsrHydroFluxAccumulatorDeviceView {
+  double* mass = nullptr;
+  double* mom_r = nullptr;
+  double* mom_z = nullptr;
+  double* energy_e = nullptr;
+  double* energy_i = nullptr;
+  double* total_energy = nullptr;
+  double* ye_mass = nullptr;
+  double* corner_fraction_mass = nullptr;
+  double* gas_tracer_mass = nullptr;
+  double* burn_species_mass = nullptr;
+  double* hot_e_eps_mass = nullptr;
+  double* burn_eps_mass = nullptr;
+};
+
+__global__ void csr_gather_hydro_flux_stage_kernel(
+    const CsrHydroFluxAccumulatorDeviceView accumulator,
+    const CsrHydroFluxStageDeviceView stage,
+    const int* __restrict__ cell_edge_csr_offsets,
+    const int* __restrict__ cell_edge_csr_edges,
+    const std::int8_t* __restrict__ cell_edge_csr_side,
+    const int n_cells) {
+  const int c = blockIdx.x * blockDim.x + threadIdx.x;
+  if (c >= n_cells) {
+    return;
+  }
+  double mass = 0.0;
+  double mom_r = 0.0;
+  double mom_z = 0.0;
+  double energy_e = 0.0;
+  double energy_i = 0.0;
+  double total_energy = 0.0;
+  double ye_mass = 0.0;
+  double corner_fraction_mass[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {};
+  double gas_tracer_mass = 0.0;
+  double burn_species_mass[tenryu::burn::kNumSpecies] = {};
+  double hot_e_eps_mass = 0.0;
+  double burn_eps_mass = 0.0;
+  for (int k = cell_edge_csr_offsets[c]; k < cell_edge_csr_offsets[c + 1];
+       ++k) {
+    const int edge = cell_edge_csr_edges[k];
+    const int side = static_cast<int>(cell_edge_csr_side[k]);
+    const int slot = 2 * edge + side;
+    mass += stage.mass[slot];
+    mom_r += stage.mom_r[slot];
+    mom_z += stage.mom_z[slot];
+    if (stage.total_energy != nullptr) {
+      total_energy += stage.total_energy[slot];
+      ye_mass += stage.ye_mass[slot];
+    } else {
+      energy_e += stage.energy_e[slot];
+      energy_i += stage.energy_i[slot];
+    }
+    if (stage.corner_fraction_mass != nullptr) {
+      for (int corner = 0; corner < stage.corner_stride; ++corner) {
+        corner_fraction_mass[corner] +=
+            stage.corner_fraction_mass[corner * stage.n_face_sides + slot];
+      }
+    }
+    if (stage.gas_tracer_mass != nullptr) {
+      gas_tracer_mass += stage.gas_tracer_mass[slot];
+    }
+    if (stage.burn_species_mass != nullptr) {
+      for (int species = 0; species < tenryu::burn::kNumSpecies; ++species) {
+        burn_species_mass[species] +=
+            stage.burn_species_mass[species * stage.n_face_sides + slot];
+      }
+    }
+    if (stage.hot_e_eps_mass != nullptr) {
+      hot_e_eps_mass += stage.hot_e_eps_mass[slot];
+    }
+    if (stage.burn_eps_mass != nullptr) {
+      burn_eps_mass += stage.burn_eps_mass[slot];
+    }
+  }
+  accumulator.mass[c] += mass;
+  accumulator.mom_r[c] += mom_r;
+  accumulator.mom_z[c] += mom_z;
+  if (stage.total_energy != nullptr) {
+    accumulator.total_energy[c] += total_energy;
+    accumulator.ye_mass[c] += ye_mass;
+  } else {
+    accumulator.energy_e[c] += energy_e;
+    accumulator.energy_i[c] += energy_i;
+  }
+  if (stage.corner_fraction_mass != nullptr) {
+    for (int corner = 0; corner < stage.corner_stride; ++corner) {
+      accumulator.corner_fraction_mass[corner * n_cells + c] +=
+          corner_fraction_mass[corner];
+    }
+  }
+  if (stage.gas_tracer_mass != nullptr) {
+    accumulator.gas_tracer_mass[c] += gas_tracer_mass;
+  }
+  if (stage.burn_species_mass != nullptr) {
+    for (int species = 0; species < tenryu::burn::kNumSpecies; ++species) {
+      accumulator.burn_species_mass[
+          c * tenryu::burn::kNumSpecies + species] +=
+          burn_species_mass[species];
+    }
+  }
+  if (stage.hot_e_eps_mass != nullptr) {
+    accumulator.hot_e_eps_mass[c] += hot_e_eps_mass;
+  }
+  if (stage.burn_eps_mass != nullptr) {
+    accumulator.burn_eps_mass[c] += burn_eps_mass;
+  }
+}
+
+__global__ void csr_gather_face_side_scalar_stage_kernel(
+    double* __restrict__ accumulator,
+    const double* __restrict__ stage,
+    const int* __restrict__ cell_edge_csr_offsets,
+    const int* __restrict__ cell_edge_csr_edges,
+    const std::int8_t* __restrict__ cell_edge_csr_side,
+    const int n_cells) {
+  const int c = blockIdx.x * blockDim.x + threadIdx.x;
+  if (c >= n_cells) {
+    return;
+  }
+  double total = 0.0;
+  for (int k = cell_edge_csr_offsets[c]; k < cell_edge_csr_offsets[c + 1];
+       ++k) {
+    const int edge = cell_edge_csr_edges[k];
+    const int side = static_cast<int>(cell_edge_csr_side[k]);
+    total += stage[2 * edge + side];
+  }
+  accumulator[c] += total;
+}
+
 __device__ inline void csr_apply_hydro_flux(
-    double* __restrict__ mass_new,
-    double* __restrict__ mom_r_new,
-    double* __restrict__ mom_z_new,
-    double* __restrict__ energy_e_new,
-    double* __restrict__ energy_i_new,
-    double* __restrict__ total_energy_new,
-    double* __restrict__ ye_mass_new,
+    const CsrHydroFluxStageDeviceView stage,
     const double* __restrict__ rho_lag,
     const double* __restrict__ v_r_cell,
     const double* __restrict__ v_z_cell,
@@ -10690,75 +12269,66 @@ __device__ inline void csr_apply_hydro_flux(
     const double* __restrict__ e_i_lag,
     const double* __restrict__ e_tot_lag,
     const double* __restrict__ ye_int_lag,
-    double* __restrict__ corner_fraction_mass_new,
     const double* __restrict__ corner_fraction_lag,
-    double* __restrict__ gas_tracer_mass_new,
     const double* __restrict__ gas_tracer_lag,
-    double* __restrict__ burn_species_mass_new,
     const double* __restrict__ burn_species_Y_lag,
-    double* __restrict__ hot_e_eps_mass_new,
     const double* __restrict__ hot_e_eps_lag,
-    double* __restrict__ burn_eps_mass_new,
     const double* __restrict__ burn_eps_lag,
     const std::uint8_t* __restrict__ cell_nverts,
     const int cell,
     const int donor,
     const int n_cells,
+    const int stage_slot,
     const double signed_volume) {
   if (!finite_nonzero(signed_volume)) {
     return;
   }
   const double dm = fmax(rho_lag[donor], 0.0) * signed_volume;
-  atomicAdd(mass_new + cell, dm);
-  atomicAdd(mom_r_new + cell, dm * v_r_cell[donor]);
-  atomicAdd(mom_z_new + cell, dm * v_z_cell[donor]);
-  if (total_energy_new != nullptr && ye_mass_new != nullptr &&
+  stage.mass[stage_slot] += dm;
+  stage.mom_r[stage_slot] += dm * v_r_cell[donor];
+  stage.mom_z[stage_slot] += dm * v_z_cell[donor];
+  if (stage.total_energy != nullptr && stage.ye_mass != nullptr &&
       e_tot_lag != nullptr && ye_int_lag != nullptr) {
-    atomicAdd(total_energy_new + cell, dm * fmax(e_tot_lag[donor], 0.0));
-    atomicAdd(ye_mass_new + cell, dm * clamp01_device(ye_int_lag[donor]));
+    stage.total_energy[stage_slot] += dm * fmax(e_tot_lag[donor], 0.0);
+    stage.ye_mass[stage_slot] += dm * clamp01_device(ye_int_lag[donor]);
   } else {
-    atomicAdd(energy_e_new + cell, dm * fmax(e_e_lag[donor], 0.0));
-    atomicAdd(energy_i_new + cell, dm * fmax(e_i_lag[donor], 0.0));
+    stage.energy_e[stage_slot] += dm * fmax(e_e_lag[donor], 0.0);
+    stage.energy_i[stage_slot] += dm * fmax(e_i_lag[donor], 0.0);
   }
-  if (corner_fraction_mass_new != nullptr && corner_fraction_lag != nullptr) {
+  if (stage.corner_fraction_mass != nullptr &&
+      corner_fraction_lag != nullptr) {
     const int active_nverts =
         tenryu::mesh::mesh_topo_cell_active_nverts(cell_nverts, cell);
     for (int k = 0; k < active_nverts; ++k) {
       const double raw = corner_fraction_lag[k * n_cells + donor];
       const double f = (raw > 0.0 && isfinite(raw)) ? raw : 0.0;
-      atomicAdd(corner_fraction_mass_new + k * n_cells + cell, dm * f);
+      stage.corner_fraction_mass[k * stage.n_face_sides + stage_slot] +=
+          dm * f;
     }
   }
-  if (gas_tracer_mass_new != nullptr && gas_tracer_lag != nullptr) {
-    atomicAdd(gas_tracer_mass_new + cell,
-              dm * clamp01_device(gas_tracer_lag[donor]));
+  if (stage.gas_tracer_mass != nullptr && gas_tracer_lag != nullptr) {
+    stage.gas_tracer_mass[stage_slot] +=
+        dm * clamp01_device(gas_tracer_lag[donor]);
   }
-  if (burn_species_mass_new != nullptr && burn_species_Y_lag != nullptr) {
+  if (stage.burn_species_mass != nullptr && burn_species_Y_lag != nullptr) {
     for (int s = 0; s < tenryu::burn::kNumSpecies; ++s) {
-      atomicAdd(burn_species_mass_new +
-                    cell * tenryu::burn::kNumSpecies + s,
-                dm * burn_species_Y_lag[
-                         donor * tenryu::burn::kNumSpecies + s]);
+      stage.burn_species_mass[s * stage.n_face_sides + stage_slot] +=
+          dm * burn_species_Y_lag[donor * tenryu::burn::kNumSpecies + s];
     }
   }
-  if (hot_e_eps_mass_new != nullptr && hot_e_eps_lag != nullptr) {
-    atomicAdd(hot_e_eps_mass_new + cell,
-              dm * fmax(hot_e_eps_lag[donor], 0.0));
+  if (stage.hot_e_eps_mass != nullptr && hot_e_eps_lag != nullptr) {
+    stage.hot_e_eps_mass[stage_slot] +=
+        dm * fmax(hot_e_eps_lag[donor], 0.0);
   }
-  if (burn_eps_mass_new != nullptr && burn_eps_lag != nullptr) {
-    atomicAdd(burn_eps_mass_new + cell,
-              dm * fmax(burn_eps_lag[donor], 0.0));
+  if (stage.burn_eps_mass != nullptr && burn_eps_lag != nullptr) {
+    stage.burn_eps_mass[stage_slot] +=
+        dm * fmax(burn_eps_lag[donor], 0.0);
   }
 }
 
+template <bool GclAudit>
 __global__ void csr_apply_internal_hydro_flux_kernel(
-    double* __restrict__ mass_new,
-    double* __restrict__ mom_r_new,
-    double* __restrict__ mom_z_new,
-    double* __restrict__ energy_e_new,
-    double* __restrict__ energy_i_new,
-    double* __restrict__ total_energy_new,
-    double* __restrict__ ye_mass_new,
+    const CsrHydroFluxStageDeviceView stage,
     const double* __restrict__ rho_lag,
     const double* __restrict__ v_r_cell,
     const double* __restrict__ v_z_cell,
@@ -10766,15 +12336,10 @@ __global__ void csr_apply_internal_hydro_flux_kernel(
     const double* __restrict__ e_i_lag,
     const double* __restrict__ e_tot_lag,
     const double* __restrict__ ye_int_lag,
-    double* __restrict__ corner_fraction_mass_new,
     const double* __restrict__ corner_fraction_lag,
-    double* __restrict__ gas_tracer_mass_new,
     const double* __restrict__ gas_tracer_lag,
-    double* __restrict__ burn_species_mass_new,
     const double* __restrict__ burn_species_Y_lag,
-    double* __restrict__ hot_e_eps_mass_new,
     const double* __restrict__ hot_e_eps_lag,
-    double* __restrict__ burn_eps_mass_new,
     const double* __restrict__ burn_eps_lag,
     const double* __restrict__ x_r_old,
     const double* __restrict__ x_z_old,
@@ -10790,9 +12355,10 @@ __global__ void csr_apply_internal_hydro_flux_kernel(
     const double* __restrict__ mass_flux_scale,
     const std::uint8_t* __restrict__ inactive_cell_mask,
     double* __restrict__ macro_flux_audit,
-    const bool swept_volume_sign_fixed,
     const int n_faces,
-    const int n_cells) {
+    const int n_cells,
+    const RemapDispatchAuditDeviceView remap_dispatch_audit,
+    const CsrGclAuditDeviceView gcl_audit) {
   const int f = blockIdx.x * blockDim.x + threadIdx.x;
   if (f >= n_faces) {
     return;
@@ -10814,8 +12380,7 @@ __global__ void csr_apply_internal_hydro_flux_kernel(
                                                     cell_a,
                                                     local_a,
                                                     cell_nverts);
-  const int donor =
-      csr_internal_flux_donor(cell_a, cell_b, dV_a, swept_volume_sign_fixed);
+  const int donor = csr_internal_flux_donor(cell_a, cell_b, dV_a);
   const int losing_cell = csr_internal_flux_losing_cell(cell_a, cell_b, dV_a);
   double dV_limited = dV_a;
   if (mass_flux_scale != nullptr && finite_nonzero(dV_a)) {
@@ -10826,13 +12391,13 @@ __global__ void csr_apply_internal_hydro_flux_kernel(
     s = fmin(1.0, fmax(0.0, s));
     dV_limited = dV_a * s;
   }
-  csr_apply_hydro_flux(mass_new,
-                       mom_r_new,
-                       mom_z_new,
-                       energy_e_new,
-                       energy_i_new,
-                       total_energy_new,
-                       ye_mass_new,
+  if (finite_nonzero(dV_limited)) {
+    remap_dispatch_audit_count(
+        remap_dispatch_audit,
+        RemapDispatchAuditCounter::LegacySweptVolume,
+        donor);
+  }
+  csr_apply_hydro_flux(stage,
                        rho_lag,
                        v_r_cell,
                        v_z_cell,
@@ -10840,28 +12405,18 @@ __global__ void csr_apply_internal_hydro_flux_kernel(
                        e_i_lag,
                        e_tot_lag,
                        ye_int_lag,
-                       corner_fraction_mass_new,
                        corner_fraction_lag,
-                       gas_tracer_mass_new,
                        gas_tracer_lag,
-                       burn_species_mass_new,
                        burn_species_Y_lag,
-                       hot_e_eps_mass_new,
                        hot_e_eps_lag,
-                       burn_eps_mass_new,
                        burn_eps_lag,
                        cell_nverts,
                        cell_a,
                        donor,
                        n_cells,
+                       2 * f,
                        dV_limited);
-  csr_apply_hydro_flux(mass_new,
-                       mom_r_new,
-                       mom_z_new,
-                       energy_e_new,
-                       energy_i_new,
-                       total_energy_new,
-                       ye_mass_new,
+  csr_apply_hydro_flux(stage,
                        rho_lag,
                        v_r_cell,
                        v_z_cell,
@@ -10869,31 +12424,23 @@ __global__ void csr_apply_internal_hydro_flux_kernel(
                        e_i_lag,
                        e_tot_lag,
                        ye_int_lag,
-                       corner_fraction_mass_new,
                        corner_fraction_lag,
-                       gas_tracer_mass_new,
                        gas_tracer_lag,
-                       burn_species_mass_new,
                        burn_species_Y_lag,
-                       hot_e_eps_mass_new,
                        hot_e_eps_lag,
-                       burn_eps_mass_new,
                        burn_eps_lag,
                        cell_nverts,
                        cell_b,
                        donor,
                        n_cells,
+                       2 * f + 1,
                        -dV_limited);
+  csr_gcl_audit_store_internal_face<GclAudit>(gcl_audit, f, dV_limited);
 }
 
+template <bool GclAudit>
 __global__ void csr_apply_boundary_hydro_flux_kernel(
-    double* __restrict__ mass_new,
-    double* __restrict__ mom_r_new,
-    double* __restrict__ mom_z_new,
-    double* __restrict__ energy_e_new,
-    double* __restrict__ energy_i_new,
-    double* __restrict__ total_energy_new,
-    double* __restrict__ ye_mass_new,
+    const CsrHydroFluxStageDeviceView stage,
     const double* __restrict__ rho_lag,
     const double* __restrict__ v_r_cell,
     const double* __restrict__ v_z_cell,
@@ -10901,15 +12448,10 @@ __global__ void csr_apply_boundary_hydro_flux_kernel(
     const double* __restrict__ e_i_lag,
     const double* __restrict__ e_tot_lag,
     const double* __restrict__ ye_int_lag,
-    double* __restrict__ corner_fraction_mass_new,
     const double* __restrict__ corner_fraction_lag,
-    double* __restrict__ gas_tracer_mass_new,
     const double* __restrict__ gas_tracer_lag,
-    double* __restrict__ burn_species_mass_new,
     const double* __restrict__ burn_species_Y_lag,
-    double* __restrict__ hot_e_eps_mass_new,
     const double* __restrict__ hot_e_eps_lag,
-    double* __restrict__ burn_eps_mass_new,
     const double* __restrict__ burn_eps_lag,
     const double* __restrict__ x_r_old,
     const double* __restrict__ x_z_old,
@@ -10924,8 +12466,11 @@ __global__ void csr_apply_boundary_hydro_flux_kernel(
     const double* __restrict__ mass_flux_scale,
     const std::uint8_t* __restrict__ inactive_cell_mask,
     double* __restrict__ macro_flux_audit,
+    const int edge_offset,
     const int n_faces,
-    const int n_cells) {
+    const int n_cells,
+    const RemapDispatchAuditDeviceView remap_dispatch_audit,
+    const CsrGclAuditDeviceView gcl_audit) {
   const int f = blockIdx.x * blockDim.x + threadIdx.x;
   if (f >= n_faces) {
     return;
@@ -10955,13 +12500,17 @@ __global__ void csr_apply_boundary_hydro_flux_kernel(
     s = fmin(1.0, fmax(0.0, s));
     dV_limited = dV * s;
   }
-  csr_apply_hydro_flux(mass_new,
-                       mom_r_new,
-                       mom_z_new,
-                       energy_e_new,
-                       energy_i_new,
-                       total_energy_new,
-                       ye_mass_new,
+  if (finite_nonzero(dV_limited)) {
+    remap_dispatch_audit_count(
+        remap_dispatch_audit,
+        RemapDispatchAuditCounter::LegacySweptVolume,
+        cell);
+    remap_dispatch_audit_count(
+        remap_dispatch_audit,
+        RemapDispatchAuditCounter::BoundaryOneSided,
+        cell);
+  }
+  csr_apply_hydro_flux(stage,
                        rho_lag,
                        v_r_cell,
                        v_z_cell,
@@ -10969,31 +12518,22 @@ __global__ void csr_apply_boundary_hydro_flux_kernel(
                        e_i_lag,
                        e_tot_lag,
                        ye_int_lag,
-                       corner_fraction_mass_new,
                        corner_fraction_lag,
-                       gas_tracer_mass_new,
                        gas_tracer_lag,
-                       burn_species_mass_new,
                        burn_species_Y_lag,
-                       hot_e_eps_mass_new,
                        hot_e_eps_lag,
-                       burn_eps_mass_new,
                        burn_eps_lag,
                        cell_nverts,
                        cell,
                        cell,
                        n_cells,
+                       2 * (edge_offset + f),
                        dV_limited);
+  csr_gcl_audit_store_boundary_face<GclAudit>(gcl_audit, f, dV_limited);
 }
 
-__device__ inline void csr_apply_hydro_flux_second_order(
-    double* __restrict__ mass_new,
-    double* __restrict__ mom_r_new,
-    double* __restrict__ mom_z_new,
-    double* __restrict__ energy_e_new,
-    double* __restrict__ energy_i_new,
-    double* __restrict__ total_energy_new,
-    double* __restrict__ ye_mass_new,
+__device__ inline double csr_apply_hydro_flux_second_order(
+    const CsrHydroFluxStageDeviceView stage,
     const double* __restrict__ rho_lag,
     const double* __restrict__ rho_grad_r,
     const double* __restrict__ rho_grad_z,
@@ -11003,60 +12543,74 @@ __device__ inline void csr_apply_hydro_flux_second_order(
     const double* __restrict__ e_i_lag,
     const double* __restrict__ e_tot_lag,
     const double* __restrict__ ye_int_lag,
-    double* __restrict__ corner_fraction_mass_new,
     const double* __restrict__ corner_fraction_lag,
     const double* __restrict__ corner_fraction_grad_r,
     const double* __restrict__ corner_fraction_grad_z,
-    double* __restrict__ gas_tracer_mass_new,
     const double* __restrict__ gas_tracer_lag,
-    double* __restrict__ burn_species_mass_new,
     const double* __restrict__ burn_species_Y_lag,
-    double* __restrict__ hot_e_eps_mass_new,
     const double* __restrict__ hot_e_eps_lag,
-    double* __restrict__ burn_eps_mass_new,
     const double* __restrict__ burn_eps_lag,
     const double* __restrict__ gas_tracer_grad_r,
     const double* __restrict__ gas_tracer_grad_z,
+    const double* __restrict__ vol_lag,
+    const double* __restrict__ old_centroid_r,
+    const double* __restrict__ old_centroid_z,
     const std::uint8_t* __restrict__ cell_nverts,
     const double* __restrict__ x_r_old,
     const double* __restrict__ x_z_old,
+    const int* __restrict__ face_adj_csr_offsets,
+    const int* __restrict__ face_adj_csr_indices,
     const int* __restrict__ cell_node_csr_offsets,
     const int* __restrict__ cell_node_csr_indices,
+    const std::uint8_t* __restrict__ inactive_cell_mask,
     const int cell,
     const int donor,
     const int n_cells,
-    const double r_face,
-    const double z_face,
-    const double signed_volume) {
-  if (!finite_nonzero(signed_volume)) {
-    return;
+    const int stage_slot,
+    const double dV,
+    const double dMr,
+    const double dMz,
+    const double flux_scale,
+    const bool no_face_clip,
+    const RemapDispatchAuditDeviceView remap_dispatch_audit) {
+  if (!finite_nonzero(dV)) {
+    return 0.0;
   }
-  const double rho_face =
-      detail::csr_limited_reconstruction(rho_lag,
-                                         rho_grad_r,
-                                         rho_grad_z,
-                                         x_r_old,
-                                         x_z_old,
-                                         cell_node_csr_offsets,
-                                         cell_node_csr_indices,
-                                         donor,
-                                         r_face,
-                                         z_face,
-                                         0.0,
-                                         cell_nverts);
-  const double dm = fmax(rho_face, 0.0) * signed_volume;
-  atomicAdd(mass_new + cell, dm);
-  atomicAdd(mom_r_new + cell, dm * v_r_cell[donor]);
-  atomicAdd(mom_z_new + cell, dm * v_z_cell[donor]);
-  if (total_energy_new != nullptr && ye_mass_new != nullptr &&
+  const double rho_integral = csr_moments_direct_field_integral(
+      rho_lag,
+      rho_grad_r,
+      rho_grad_z,
+      old_centroid_r,
+      old_centroid_z,
+      x_r_old,
+      x_z_old,
+      face_adj_csr_offsets,
+      face_adj_csr_indices,
+      cell_node_csr_offsets,
+      cell_node_csr_indices,
+      cell_nverts,
+      inactive_cell_mask,
+      vol_lag[donor],
+      donor,
+      n_cells,
+      dV,
+      dMr,
+      dMz,
+      no_face_clip,
+      remap_dispatch_audit);
+  const double dm = flux_scale * rho_integral;
+  stage.mass[stage_slot] += dm;
+  stage.mom_r[stage_slot] += dm * v_r_cell[donor];
+  stage.mom_z[stage_slot] += dm * v_z_cell[donor];
+  if (stage.total_energy != nullptr && stage.ye_mass != nullptr &&
       e_tot_lag != nullptr && ye_int_lag != nullptr) {
-    atomicAdd(total_energy_new + cell, dm * fmax(e_tot_lag[donor], 0.0));
-    atomicAdd(ye_mass_new + cell, dm * clamp01_device(ye_int_lag[donor]));
+    stage.total_energy[stage_slot] += dm * fmax(e_tot_lag[donor], 0.0);
+    stage.ye_mass[stage_slot] += dm * clamp01_device(ye_int_lag[donor]);
   } else {
-    atomicAdd(energy_e_new + cell, dm * fmax(e_e_lag[donor], 0.0));
-    atomicAdd(energy_i_new + cell, dm * fmax(e_i_lag[donor], 0.0));
+    stage.energy_e[stage_slot] += dm * fmax(e_e_lag[donor], 0.0);
+    stage.energy_i[stage_slot] += dm * fmax(e_i_lag[donor], 0.0);
   }
-  if (corner_fraction_mass_new != nullptr && corner_fraction_lag != nullptr &&
+  if (stage.corner_fraction_mass != nullptr && corner_fraction_lag != nullptr &&
       corner_fraction_grad_r != nullptr && corner_fraction_grad_z != nullptr) {
     const int active_nverts =
         tenryu::mesh::mesh_topo_cell_active_nverts(cell_nverts, cell);
@@ -11064,86 +12618,104 @@ __device__ inline void csr_apply_hydro_flux_second_order(
       const double* f_lag = corner_fraction_lag + k * n_cells;
       const double* f_grad_r = corner_fraction_grad_r + k * n_cells;
       const double* f_grad_z = corner_fraction_grad_z + k * n_cells;
-      const double raw =
-          detail::csr_limited_reconstruction(f_lag,
-                                             f_grad_r,
-                                             f_grad_z,
-                                             x_r_old,
-                                             x_z_old,
-                                             cell_node_csr_offsets,
-                                             cell_node_csr_indices,
-                                             donor,
-                                             r_face,
-                                             z_face,
-                                             0.0,
-                                             cell_nverts);
-      const double f = (raw > 0.0 && isfinite(raw)) ? raw : 0.0;
-      atomicAdd(corner_fraction_mass_new + k * n_cells + cell, dm * f);
+      const double f_integral = csr_moments_direct_field_integral(
+          f_lag,
+          f_grad_r,
+          f_grad_z,
+          old_centroid_r,
+          old_centroid_z,
+          x_r_old,
+          x_z_old,
+          face_adj_csr_offsets,
+          face_adj_csr_indices,
+          cell_node_csr_offsets,
+          cell_node_csr_indices,
+          cell_nverts,
+          inactive_cell_mask,
+          vol_lag[donor],
+          donor,
+          n_cells,
+          dV,
+          dMr,
+          dMz,
+          no_face_clip,
+          remap_dispatch_audit);
+      const double f_bar = f_lag[donor];
+      const double product_integral =
+          f_bar * rho_integral +
+          rho_lag[donor] * (f_integral - f_bar * dV);
+      stage.corner_fraction_mass[k * stage.n_face_sides + stage_slot] +=
+          flux_scale * product_integral;
     }
   }
-  if (gas_tracer_mass_new != nullptr && gas_tracer_lag != nullptr &&
+  if (stage.gas_tracer_mass != nullptr && gas_tracer_lag != nullptr &&
       gas_tracer_grad_r != nullptr && gas_tracer_grad_z != nullptr) {
-    const double raw =
-        detail::csr_limited_reconstruction(gas_tracer_lag,
-                                           gas_tracer_grad_r,
-                                           gas_tracer_grad_z,
-                                           x_r_old,
-                                           x_z_old,
-                                           cell_node_csr_offsets,
-                                           cell_node_csr_indices,
-                                           donor,
-                                           r_face,
-                                           z_face,
-                                           0.0,
-                                           cell_nverts);
-    atomicAdd(gas_tracer_mass_new + cell, dm * clamp01_device(raw));
+    const double tracer_integral = csr_moments_direct_field_integral(
+        gas_tracer_lag,
+        gas_tracer_grad_r,
+        gas_tracer_grad_z,
+        old_centroid_r,
+        old_centroid_z,
+        x_r_old,
+        x_z_old,
+        face_adj_csr_offsets,
+        face_adj_csr_indices,
+        cell_node_csr_offsets,
+        cell_node_csr_indices,
+        cell_nverts,
+        inactive_cell_mask,
+        vol_lag[donor],
+        donor,
+        n_cells,
+        dV,
+        dMr,
+        dMz,
+        no_face_clip,
+        remap_dispatch_audit);
+    const double tracer_bar = gas_tracer_lag[donor];
+    const double product_integral =
+        tracer_bar * rho_integral +
+        rho_lag[donor] * (tracer_integral - tracer_bar * dV);
+    stage.gas_tracer_mass[stage_slot] += flux_scale * product_integral;
   }
-  if (burn_species_mass_new != nullptr && burn_species_Y_lag != nullptr) {
+  if (stage.burn_species_mass != nullptr && burn_species_Y_lag != nullptr) {
     for (int s = 0; s < tenryu::burn::kNumSpecies; ++s) {
-      atomicAdd(burn_species_mass_new +
-                    cell * tenryu::burn::kNumSpecies + s,
-                dm * burn_species_Y_lag[
-                         donor * tenryu::burn::kNumSpecies + s]);
+      stage.burn_species_mass[s * stage.n_face_sides + stage_slot] +=
+          dm * burn_species_Y_lag[donor * tenryu::burn::kNumSpecies + s];
     }
   }
-  if (hot_e_eps_mass_new != nullptr && hot_e_eps_lag != nullptr) {
-    atomicAdd(hot_e_eps_mass_new + cell,
-              dm * fmax(hot_e_eps_lag[donor], 0.0));
+  if (stage.hot_e_eps_mass != nullptr && hot_e_eps_lag != nullptr) {
+    stage.hot_e_eps_mass[stage_slot] +=
+        dm * fmax(hot_e_eps_lag[donor], 0.0);
   }
-  if (burn_eps_mass_new != nullptr && burn_eps_lag != nullptr) {
-    atomicAdd(burn_eps_mass_new + cell,
-              dm * fmax(burn_eps_lag[donor], 0.0));
+  if (stage.burn_eps_mass != nullptr && burn_eps_lag != nullptr) {
+    stage.burn_eps_mass[stage_slot] +=
+        dm * fmax(burn_eps_lag[donor], 0.0);
   }
+  return dm;
 }
 
+template <bool GclAudit>
 __global__ void csr_apply_internal_hydro_flux_second_order_kernel(
-    double* __restrict__ mass_new,
-    double* __restrict__ mom_r_new,
-    double* __restrict__ mom_z_new,
-    double* __restrict__ energy_e_new,
-    double* __restrict__ energy_i_new,
-    double* __restrict__ total_energy_new,
-    double* __restrict__ ye_mass_new,
+    const CsrHydroFluxStageDeviceView stage,
     const double* __restrict__ rho_lag,
     const double* __restrict__ rho_grad_r,
     const double* __restrict__ rho_grad_z,
+    const double* __restrict__ vol_lag,
+    const double* __restrict__ old_centroid_r,
+    const double* __restrict__ old_centroid_z,
     const double* __restrict__ v_r_cell,
     const double* __restrict__ v_z_cell,
     const double* __restrict__ e_e_lag,
     const double* __restrict__ e_i_lag,
     const double* __restrict__ e_tot_lag,
     const double* __restrict__ ye_int_lag,
-    double* __restrict__ corner_fraction_mass_new,
     const double* __restrict__ corner_fraction_lag,
     const double* __restrict__ corner_fraction_grad_r,
     const double* __restrict__ corner_fraction_grad_z,
-    double* __restrict__ gas_tracer_mass_new,
     const double* __restrict__ gas_tracer_lag,
-    double* __restrict__ burn_species_mass_new,
     const double* __restrict__ burn_species_Y_lag,
-    double* __restrict__ hot_e_eps_mass_new,
     const double* __restrict__ hot_e_eps_lag,
-    double* __restrict__ burn_eps_mass_new,
     const double* __restrict__ burn_eps_lag,
     const double* __restrict__ gas_tracer_grad_r,
     const double* __restrict__ gas_tracer_grad_z,
@@ -11151,6 +12723,8 @@ __global__ void csr_apply_internal_hydro_flux_second_order_kernel(
     const double* __restrict__ x_z_old,
     const double* __restrict__ x_r_new,
     const double* __restrict__ x_z_new,
+    const int* __restrict__ face_adj_csr_offsets,
+    const int* __restrict__ face_adj_csr_indices,
     const int* __restrict__ cell_node_csr_offsets,
     const int* __restrict__ cell_node_csr_indices,
     const int* __restrict__ unique_cell_a,
@@ -11161,9 +12735,12 @@ __global__ void csr_apply_internal_hydro_flux_second_order_kernel(
     const double* __restrict__ mass_flux_scale,
     const std::uint8_t* __restrict__ inactive_cell_mask,
     double* __restrict__ macro_flux_audit,
-    const bool swept_volume_sign_fixed,
     const int n_faces,
-    const int n_cells) {
+    const int n_cells,
+    const bool no_face_clip,
+    const int watch_cell,
+    const RemapDispatchAuditDeviceView remap_dispatch_audit,
+    const CsrGclAuditDeviceView gcl_audit) {
   const int f = blockIdx.x * blockDim.x + threadIdx.x;
   if (f >= n_faces) {
     return;
@@ -11175,46 +12752,34 @@ __global__ void csr_apply_internal_hydro_flux_second_order_kernel(
     return;
   }
   const int local_a = unique_local_a[f];
-  double r_face = 0.0;
-  double z_face = 0.0;
-  detail::csr_face_center(x_r_old,
-                          x_z_old,
-                          cell_node_csr_offsets,
-                          cell_node_csr_indices,
-                          cell_a,
-                          local_a,
-                          r_face,
-                          z_face,
-                          cell_nverts);
-  const double dV_a = csr_face_swept_volume_outward(x_r_old,
-                                                    x_z_old,
-                                                    x_r_new,
-                                                    x_z_new,
-                                                    cell_node_csr_offsets,
-                                                    cell_node_csr_indices,
-                                                    cell_orientation_sign,
-                                                    cell_a,
-                                                    local_a,
-                                                    cell_nverts);
-  const int donor =
-      csr_internal_flux_donor(cell_a, cell_b, dV_a, swept_volume_sign_fixed);
+  double dMr = 0.0;
+  double dMz = 0.0;
+  const double dV_a = csr_face_swept_raw_moments_outward(
+      x_r_old,
+      x_z_old,
+      x_r_new,
+      x_z_new,
+      cell_node_csr_offsets,
+      cell_node_csr_indices,
+      cell_orientation_sign,
+      cell_a,
+      local_a,
+      cell_nverts,
+      &dMr,
+      &dMz);
+  const int donor = csr_internal_flux_donor(cell_a, cell_b, dV_a);
   const int losing_cell = csr_internal_flux_losing_cell(cell_a, cell_b, dV_a);
-  double dV_limited = dV_a;
-  if (mass_flux_scale != nullptr && finite_nonzero(dV_a)) {
-    double s = mass_flux_scale[losing_cell];
-    if (!isfinite(s)) {
-      s = 0.0;
-    }
-    s = fmin(1.0, fmax(0.0, s));
-    dV_limited = dV_a * s;
+  const double flux_scale =
+      csr_clamped_flux_scale(mass_flux_scale, losing_cell);
+  const double dV_limited = flux_scale * dV_a;
+  if (finite_nonzero(dV_a)) {
+    remap_dispatch_audit_count(
+        remap_dispatch_audit,
+        RemapDispatchAuditCounter::ExactSweptMoment,
+        donor);
   }
-  csr_apply_hydro_flux_second_order(mass_new,
-                                    mom_r_new,
-                                    mom_z_new,
-                                    energy_e_new,
-                                    energy_i_new,
-                                    total_energy_new,
-                                    ye_mass_new,
+  const double Fmass =
+      csr_apply_hydro_flux_second_order(stage,
                                     rho_lag,
                                     rho_grad_r,
                                     rho_grad_z,
@@ -11224,38 +12789,37 @@ __global__ void csr_apply_internal_hydro_flux_second_order_kernel(
                                     e_i_lag,
                                     e_tot_lag,
                                     ye_int_lag,
-                                    corner_fraction_mass_new,
                                     corner_fraction_lag,
                                     corner_fraction_grad_r,
                                     corner_fraction_grad_z,
-                                    gas_tracer_mass_new,
                                     gas_tracer_lag,
-                                    burn_species_mass_new,
                                     burn_species_Y_lag,
-                                    hot_e_eps_mass_new,
                                     hot_e_eps_lag,
-                                    burn_eps_mass_new,
                                     burn_eps_lag,
                                     gas_tracer_grad_r,
                                     gas_tracer_grad_z,
+                                    vol_lag,
+                                    old_centroid_r,
+                                    old_centroid_z,
                                     cell_nverts,
                                     x_r_old,
                                     x_z_old,
+                                    face_adj_csr_offsets,
+                                    face_adj_csr_indices,
                                     cell_node_csr_offsets,
                                     cell_node_csr_indices,
+                                    inactive_cell_mask,
                                     cell_a,
                                     donor,
                                     n_cells,
-                                    r_face,
-                                    z_face,
-                                    dV_limited);
-  csr_apply_hydro_flux_second_order(mass_new,
-                                    mom_r_new,
-                                    mom_z_new,
-                                    energy_e_new,
-                                    energy_i_new,
-                                    total_energy_new,
-                                    ye_mass_new,
+                                    2 * f,
+                                    dV_a,
+                                    dMr,
+                                    dMz,
+                                    flux_scale,
+                                    no_face_clip,
+                                    remap_dispatch_audit);
+  csr_apply_hydro_flux_second_order(stage,
                                     rho_lag,
                                     rho_grad_r,
                                     rho_grad_z,
@@ -11265,61 +12829,102 @@ __global__ void csr_apply_internal_hydro_flux_second_order_kernel(
                                     e_i_lag,
                                     e_tot_lag,
                                     ye_int_lag,
-                                    corner_fraction_mass_new,
                                     corner_fraction_lag,
                                     corner_fraction_grad_r,
                                     corner_fraction_grad_z,
-                                    gas_tracer_mass_new,
                                     gas_tracer_lag,
-                                    burn_species_mass_new,
                                     burn_species_Y_lag,
-                                    hot_e_eps_mass_new,
                                     hot_e_eps_lag,
-                                    burn_eps_mass_new,
                                     burn_eps_lag,
                                     gas_tracer_grad_r,
                                     gas_tracer_grad_z,
+                                    vol_lag,
+                                    old_centroid_r,
+                                    old_centroid_z,
                                     cell_nverts,
                                     x_r_old,
                                     x_z_old,
+                                    face_adj_csr_offsets,
+                                    face_adj_csr_indices,
                                     cell_node_csr_offsets,
                                     cell_node_csr_indices,
+                                    inactive_cell_mask,
                                     cell_b,
                                     donor,
                                     n_cells,
-                                    r_face,
-                                    z_face,
-                                    -dV_limited);
+                                    2 * f + 1,
+                                    -dV_a,
+                                    -dMr,
+                                    -dMz,
+                                    flux_scale,
+                                    no_face_clip,
+                                    remap_dispatch_audit);
+  if (cell_a == watch_cell || cell_b == watch_cell) {
+    int node_a = -1;
+    int node_b = -1;
+    if (detail::csr_face_swept_node_indices(cell_node_csr_offsets,
+                                             cell_node_csr_indices,
+                                             cell_nverts,
+                                             cell_a,
+                                             local_a,
+                                             &node_a,
+                                             &node_b)) {
+      printf("[watchface] f=%d cellA=%d cellB=%d nA=%d nB=%d "
+             "oldA=(%.17e,%.17e) oldB=(%.17e,%.17e) "
+             "newA=(%.17e,%.17e) newB=(%.17e,%.17e) "
+             "dVq=%.17e dMr=%.17e dMz=%.17e s=%.6e donor=%d "
+             "Fmass=%.17e qbar=%.17e gradR=%.17e gradZ=%.17e "
+             "cbarR=%.17e cbarZ=%.17e\n",
+             f,
+             cell_a,
+             cell_b,
+             node_a,
+             node_b,
+             x_r_old[node_a],
+             x_z_old[node_a],
+             x_r_old[node_b],
+             x_z_old[node_b],
+             x_r_new[node_a],
+             x_z_new[node_a],
+             x_r_new[node_b],
+             x_z_new[node_b],
+             dV_a,
+             dMr,
+             dMz,
+             flux_scale,
+             donor,
+             Fmass,
+             rho_lag[donor],
+             rho_grad_r[donor],
+             rho_grad_z[donor],
+             old_centroid_r[donor],
+             old_centroid_z[donor]);
+    }
+  }
+  csr_gcl_audit_store_internal_face<GclAudit>(gcl_audit, f, dV_limited);
 }
 
+template <bool GclAudit>
 __global__ void csr_apply_boundary_hydro_flux_second_order_kernel(
-    double* __restrict__ mass_new,
-    double* __restrict__ mom_r_new,
-    double* __restrict__ mom_z_new,
-    double* __restrict__ energy_e_new,
-    double* __restrict__ energy_i_new,
-    double* __restrict__ total_energy_new,
-    double* __restrict__ ye_mass_new,
+    const CsrHydroFluxStageDeviceView stage,
     const double* __restrict__ rho_lag,
     const double* __restrict__ rho_grad_r,
     const double* __restrict__ rho_grad_z,
+    const double* __restrict__ vol_lag,
+    const double* __restrict__ old_centroid_r,
+    const double* __restrict__ old_centroid_z,
     const double* __restrict__ v_r_cell,
     const double* __restrict__ v_z_cell,
     const double* __restrict__ e_e_lag,
     const double* __restrict__ e_i_lag,
     const double* __restrict__ e_tot_lag,
     const double* __restrict__ ye_int_lag,
-    double* __restrict__ corner_fraction_mass_new,
     const double* __restrict__ corner_fraction_lag,
     const double* __restrict__ corner_fraction_grad_r,
     const double* __restrict__ corner_fraction_grad_z,
-    double* __restrict__ gas_tracer_mass_new,
     const double* __restrict__ gas_tracer_lag,
-    double* __restrict__ burn_species_mass_new,
     const double* __restrict__ burn_species_Y_lag,
-    double* __restrict__ hot_e_eps_mass_new,
     const double* __restrict__ hot_e_eps_lag,
-    double* __restrict__ burn_eps_mass_new,
     const double* __restrict__ burn_eps_lag,
     const double* __restrict__ gas_tracer_grad_r,
     const double* __restrict__ gas_tracer_grad_z,
@@ -11327,6 +12932,8 @@ __global__ void csr_apply_boundary_hydro_flux_second_order_kernel(
     const double* __restrict__ x_z_old,
     const double* __restrict__ x_r_new,
     const double* __restrict__ x_z_new,
+    const int* __restrict__ face_adj_csr_offsets,
+    const int* __restrict__ face_adj_csr_indices,
     const int* __restrict__ cell_node_csr_offsets,
     const int* __restrict__ cell_node_csr_indices,
     const int* __restrict__ boundary_cell,
@@ -11336,8 +12943,13 @@ __global__ void csr_apply_boundary_hydro_flux_second_order_kernel(
     const double* __restrict__ mass_flux_scale,
     const std::uint8_t* __restrict__ inactive_cell_mask,
     double* __restrict__ macro_flux_audit,
+    const int edge_offset,
     const int n_faces,
-    const int n_cells) {
+    const int n_cells,
+    const bool no_face_clip,
+    const int watch_cell,
+    const RemapDispatchAuditDeviceView remap_dispatch_audit,
+    const CsrGclAuditDeviceView gcl_audit) {
   const int f = blockIdx.x * blockDim.x + threadIdx.x;
   if (f >= n_faces) {
     return;
@@ -11348,43 +12960,38 @@ __global__ void csr_apply_boundary_hydro_flux_second_order_kernel(
     return;
   }
   const int local = boundary_local[f];
-  double r_face = 0.0;
-  double z_face = 0.0;
-  detail::csr_face_center(x_r_old,
-                          x_z_old,
-                          cell_node_csr_offsets,
-                          cell_node_csr_indices,
-                          cell,
-                          local,
-                          r_face,
-                          z_face,
-                          cell_nverts);
-  const double dV = csr_face_swept_volume_outward(x_r_old,
-                                                  x_z_old,
-                                                  x_r_new,
-                                                  x_z_new,
-                                                  cell_node_csr_offsets,
-                                                  cell_node_csr_indices,
-                                                  cell_orientation_sign,
-                                                  cell,
-                                                  local,
-                                                  cell_nverts);
-  double dV_limited = dV;
-  if (mass_flux_scale != nullptr && dV < 0.0 && finite_nonzero(dV)) {
-    double s = mass_flux_scale[cell];
-    if (!isfinite(s)) {
-      s = 0.0;
-    }
-    s = fmin(1.0, fmax(0.0, s));
-    dV_limited = dV * s;
+  double dMr = 0.0;
+  double dMz = 0.0;
+  const double dV = csr_face_swept_raw_moments_outward(
+      x_r_old,
+      x_z_old,
+      x_r_new,
+      x_z_new,
+      cell_node_csr_offsets,
+      cell_node_csr_indices,
+      cell_orientation_sign,
+      cell,
+      local,
+      cell_nverts,
+      &dMr,
+      &dMz);
+  const double flux_scale =
+      dV < 0.0 ? csr_clamped_flux_scale(mass_flux_scale, cell) : 1.0;
+  const double dV_limited = flux_scale * dV;
+  if (finite_nonzero(dV)) {
+    remap_dispatch_audit_count(
+        remap_dispatch_audit,
+        RemapDispatchAuditCounter::ExactSweptMoment,
+        cell);
   }
-  csr_apply_hydro_flux_second_order(mass_new,
-                                    mom_r_new,
-                                    mom_z_new,
-                                    energy_e_new,
-                                    energy_i_new,
-                                    total_energy_new,
-                                    ye_mass_new,
+  if (finite_nonzero(dV_limited)) {
+    remap_dispatch_audit_count(
+        remap_dispatch_audit,
+        RemapDispatchAuditCounter::BoundaryOneSided,
+        cell);
+  }
+  const double Fmass =
+      csr_apply_hydro_flux_second_order(stage,
                                     rho_lag,
                                     rho_grad_r,
                                     rho_grad_z,
@@ -11394,31 +13001,79 @@ __global__ void csr_apply_boundary_hydro_flux_second_order_kernel(
                                     e_i_lag,
                                     e_tot_lag,
                                     ye_int_lag,
-                                    corner_fraction_mass_new,
                                     corner_fraction_lag,
                                     corner_fraction_grad_r,
                                     corner_fraction_grad_z,
-                                    gas_tracer_mass_new,
                                     gas_tracer_lag,
-                                    burn_species_mass_new,
                                     burn_species_Y_lag,
-                                    hot_e_eps_mass_new,
                                     hot_e_eps_lag,
-                                    burn_eps_mass_new,
                                     burn_eps_lag,
                                     gas_tracer_grad_r,
                                     gas_tracer_grad_z,
+                                    vol_lag,
+                                    old_centroid_r,
+                                    old_centroid_z,
                                     cell_nverts,
                                     x_r_old,
                                     x_z_old,
+                                    face_adj_csr_offsets,
+                                    face_adj_csr_indices,
                                     cell_node_csr_offsets,
                                     cell_node_csr_indices,
+                                    inactive_cell_mask,
                                     cell,
                                     cell,
                                     n_cells,
-                                    r_face,
-                                    z_face,
-                                    dV_limited);
+                                    2 * (edge_offset + f),
+                                    dV,
+                                    dMr,
+                                    dMz,
+                                    flux_scale,
+                                    no_face_clip,
+                                    remap_dispatch_audit);
+  if (cell == watch_cell) {
+    int node_a = -1;
+    int node_b = -1;
+    if (detail::csr_face_swept_node_indices(cell_node_csr_offsets,
+                                             cell_node_csr_indices,
+                                             cell_nverts,
+                                             cell,
+                                             local,
+                                             &node_a,
+                                             &node_b)) {
+      printf("[watchface] f=%d cellA=%d cellB=%d nA=%d nB=%d "
+             "oldA=(%.17e,%.17e) oldB=(%.17e,%.17e) "
+             "newA=(%.17e,%.17e) newB=(%.17e,%.17e) "
+             "dVq=%.17e dMr=%.17e dMz=%.17e s=%.6e donor=%d "
+             "Fmass=%.17e qbar=%.17e gradR=%.17e gradZ=%.17e "
+             "cbarR=%.17e cbarZ=%.17e\n",
+             f,
+             cell,
+             -1,
+             node_a,
+             node_b,
+             x_r_old[node_a],
+             x_z_old[node_a],
+             x_r_old[node_b],
+             x_z_old[node_b],
+             x_r_new[node_a],
+             x_z_new[node_a],
+             x_r_new[node_b],
+             x_z_new[node_b],
+             dV,
+             dMr,
+             dMz,
+             flux_scale,
+             cell,
+             Fmass,
+             rho_lag[cell],
+             rho_grad_r[cell],
+             rho_grad_z[cell],
+             old_centroid_r[cell],
+             old_centroid_z[cell]);
+    }
+  }
+  csr_gcl_audit_store_boundary_face<GclAudit>(gcl_audit, f, dV_limited);
 }
 
 __global__ void csr_eta_contact_hotspot_volume_kernel(
@@ -11443,6 +13098,7 @@ __global__ void csr_eta_contact_hotspot_volume_kernel(
 
 __global__ void csr_eta_contact_swept_volume_kernel(
     double* __restrict__ eta_contact_diag,
+    const bool second_order,
     const double* __restrict__ gas_tracer_Y,
     const double* __restrict__ x_r_old,
     const double* __restrict__ x_z_old,
@@ -11473,42 +13129,57 @@ __global__ void csr_eta_contact_swept_volume_kernel(
     return;
   }
   const int local_a = unique_local_a[f];
-  const double dV_a = csr_face_swept_volume_outward(x_r_old,
-                                                    x_z_old,
-                                                    x_r_new,
-                                                    x_z_new,
-                                                    cell_node_csr_offsets,
-                                                    cell_node_csr_indices,
-                                                    cell_orientation_sign,
-                                                    cell_a,
-                                                    local_a,
-                                                    cell_nverts);
+  double dMr = 0.0;
+  double dMz = 0.0;
+  const double dV_a = second_order
+                          ? csr_face_swept_raw_moments_outward(
+                                x_r_old,
+                                x_z_old,
+                                x_r_new,
+                                x_z_new,
+                                cell_node_csr_offsets,
+                                cell_node_csr_indices,
+                                cell_orientation_sign,
+                                cell_a,
+                                local_a,
+                                cell_nverts,
+                                &dMr,
+                                &dMz)
+                          : csr_face_swept_volume_outward(
+                                x_r_old,
+                                x_z_old,
+                                x_r_new,
+                                x_z_new,
+                                cell_node_csr_offsets,
+                                cell_node_csr_indices,
+                                cell_orientation_sign,
+                                cell_a,
+                                local_a,
+                                cell_nverts);
   if (!finite_nonzero(dV_a)) {
     return;
   }
   const int losing_cell = csr_internal_flux_losing_cell(cell_a, cell_b, dV_a);
-  double dV_limited = dV_a;
-  if (mass_flux_scale != nullptr) {
-    double s = mass_flux_scale[losing_cell];
-    if (!isfinite(s)) {
-      s = 0.0;
-    }
-    s = fmin(1.0, fmax(0.0, s));
-    dV_limited = dV_a * s;
-  }
+  const double dV_limited =
+      dV_a * csr_clamped_flux_scale(mass_flux_scale, losing_cell);
   atomicAdd(eta_contact_diag, fabs(dV_limited));
 }
 
 __global__ void csr_accumulate_internal_hydro_outgoing_mass_kernel(
-    double* __restrict__ outgoing_mass,
+    double* __restrict__ outgoing_mass_stage,
     const bool second_order,
     const double* __restrict__ rho_lag,
     const double* __restrict__ rho_grad_r,
     const double* __restrict__ rho_grad_z,
+    const double* __restrict__ vol_lag,
+    const double* __restrict__ old_centroid_r,
+    const double* __restrict__ old_centroid_z,
     const double* __restrict__ x_r_old,
     const double* __restrict__ x_z_old,
     const double* __restrict__ x_r_new,
     const double* __restrict__ x_z_new,
+    const int* __restrict__ face_adj_csr_offsets,
+    const int* __restrict__ face_adj_csr_indices,
     const int* __restrict__ cell_node_csr_offsets,
     const int* __restrict__ cell_node_csr_indices,
     const int* __restrict__ unique_cell_a,
@@ -11517,8 +13188,8 @@ __global__ void csr_accumulate_internal_hydro_outgoing_mass_kernel(
     const int* __restrict__ cell_orientation_sign,
     const std::uint8_t* __restrict__ cell_nverts,
     const std::uint8_t* __restrict__ inactive_cell_mask,
-    const bool swept_volume_sign_fixed,
-    const int n_faces) {
+    const int n_faces,
+    const int n_cells) {
   const int f = blockIdx.x * blockDim.x + threadIdx.x;
   if (f >= n_faces) {
     return;
@@ -11529,65 +13200,89 @@ __global__ void csr_accumulate_internal_hydro_outgoing_mass_kernel(
     return;
   }
   const int local_a = unique_local_a[f];
-  const double dV_a = csr_face_swept_volume_outward(x_r_old,
-                                                    x_z_old,
-                                                    x_r_new,
-                                                    x_z_new,
-                                                    cell_node_csr_offsets,
-                                                    cell_node_csr_indices,
-                                                    cell_orientation_sign,
-                                                    cell_a,
-                                                    local_a,
-                                                    cell_nverts);
+  double dMr = 0.0;
+  double dMz = 0.0;
+  const double dV_a = second_order
+                          ? csr_face_swept_raw_moments_outward(
+                                x_r_old,
+                                x_z_old,
+                                x_r_new,
+                                x_z_new,
+                                cell_node_csr_offsets,
+                                cell_node_csr_indices,
+                                cell_orientation_sign,
+                                cell_a,
+                                local_a,
+                                cell_nverts,
+                                &dMr,
+                                &dMz)
+                          : csr_face_swept_volume_outward(
+                                x_r_old,
+                                x_z_old,
+                                x_r_new,
+                                x_z_new,
+                                cell_node_csr_offsets,
+                                cell_node_csr_indices,
+                                cell_orientation_sign,
+                                cell_a,
+                                local_a,
+                                cell_nverts);
   if (!finite_nonzero(dV_a)) {
     return;
   }
-  const int donor =
-      csr_internal_flux_donor(cell_a, cell_b, dV_a, swept_volume_sign_fixed);
+  const int donor = csr_internal_flux_donor(cell_a, cell_b, dV_a);
   const int losing_cell = csr_internal_flux_losing_cell(cell_a, cell_b, dV_a);
-  double rho_face = rho_lag[donor];
-  if (second_order && rho_grad_r != nullptr && rho_grad_z != nullptr) {
-    double r_face = 0.0;
-    double z_face = 0.0;
-    detail::csr_face_center(x_r_old,
-                            x_z_old,
-                            cell_node_csr_offsets,
-                            cell_node_csr_indices,
-                            cell_a,
-                            local_a,
-                            r_face,
-                            z_face,
-                            cell_nverts);
-    rho_face = detail::csr_limited_reconstruction(rho_lag,
-                                                  rho_grad_r,
-                                                  rho_grad_z,
-                                                  x_r_old,
-                                                  x_z_old,
-                                                  cell_node_csr_offsets,
-                                                  cell_node_csr_indices,
-                                                  donor,
-                                                  r_face,
-                                                  z_face,
-                                                  0.0,
-                                                  cell_nverts);
+  double dm_out = 0.0;
+  if (second_order) {
+    const double rho_integral = csr_moments_direct_field_integral(
+        rho_lag,
+        rho_grad_r,
+        rho_grad_z,
+        old_centroid_r,
+        old_centroid_z,
+        x_r_old,
+        x_z_old,
+        face_adj_csr_offsets,
+        face_adj_csr_indices,
+        cell_node_csr_offsets,
+        cell_node_csr_indices,
+        cell_nverts,
+        inactive_cell_mask,
+        vol_lag[donor],
+        donor,
+        n_cells,
+        dV_a,
+        dMr,
+        dMz,
+        false,
+        {});
+    dm_out = fabs(rho_integral);
+  } else {
+    double rho_face = rho_lag[donor];
+    rho_face = (rho_face > 0.0 && isfinite(rho_face)) ? rho_face : 0.0;
+    dm_out = rho_face * fabs(dV_a);
   }
-  rho_face = (rho_face > 0.0 && isfinite(rho_face)) ? rho_face : 0.0;
-  const double dm_out = rho_face * fabs(dV_a);
   if (dm_out > 0.0 && isfinite(dm_out)) {
-    atomicAdd(outgoing_mass + losing_cell, dm_out);
+    const int side = losing_cell == cell_a ? 0 : 1;
+    outgoing_mass_stage[2 * f + side] += dm_out;
   }
 }
 
 __global__ void csr_accumulate_boundary_hydro_outgoing_mass_kernel(
-    double* __restrict__ outgoing_mass,
+    double* __restrict__ outgoing_mass_stage,
     const bool second_order,
     const double* __restrict__ rho_lag,
     const double* __restrict__ rho_grad_r,
     const double* __restrict__ rho_grad_z,
+    const double* __restrict__ vol_lag,
+    const double* __restrict__ old_centroid_r,
+    const double* __restrict__ old_centroid_z,
     const double* __restrict__ x_r_old,
     const double* __restrict__ x_z_old,
     const double* __restrict__ x_r_new,
     const double* __restrict__ x_z_new,
+    const int* __restrict__ face_adj_csr_offsets,
+    const int* __restrict__ face_adj_csr_indices,
     const int* __restrict__ cell_node_csr_offsets,
     const int* __restrict__ cell_node_csr_indices,
     const int* __restrict__ boundary_cell,
@@ -11595,7 +13290,9 @@ __global__ void csr_accumulate_boundary_hydro_outgoing_mass_kernel(
     const int* __restrict__ cell_orientation_sign,
     const std::uint8_t* __restrict__ cell_nverts,
     const std::uint8_t* __restrict__ inactive_cell_mask,
-    const int n_faces) {
+    const int edge_offset,
+    const int n_faces,
+    const int n_cells) {
   const int f = blockIdx.x * blockDim.x + threadIdx.x;
   if (f >= n_faces) {
     return;
@@ -11605,49 +13302,68 @@ __global__ void csr_accumulate_boundary_hydro_outgoing_mass_kernel(
     return;
   }
   const int local = boundary_local[f];
-  const double dV = csr_face_swept_volume_outward(x_r_old,
-                                                  x_z_old,
-                                                  x_r_new,
-                                                  x_z_new,
-                                                  cell_node_csr_offsets,
-                                                  cell_node_csr_indices,
-                                                  cell_orientation_sign,
-                                                  cell,
-                                                  local,
-                                                  cell_nverts);
+  double dMr = 0.0;
+  double dMz = 0.0;
+  const double dV = second_order
+                        ? csr_face_swept_raw_moments_outward(
+                              x_r_old,
+                              x_z_old,
+                              x_r_new,
+                              x_z_new,
+                              cell_node_csr_offsets,
+                              cell_node_csr_indices,
+                              cell_orientation_sign,
+                              cell,
+                              local,
+                              cell_nverts,
+                              &dMr,
+                              &dMz)
+                        : csr_face_swept_volume_outward(
+                              x_r_old,
+                              x_z_old,
+                              x_r_new,
+                              x_z_new,
+                              cell_node_csr_offsets,
+                              cell_node_csr_indices,
+                              cell_orientation_sign,
+                              cell,
+                              local,
+                              cell_nverts);
   if (!(dV < 0.0) || !finite_nonzero(dV)) {
     return;
   }
-  double rho_face = rho_lag[cell];
-  if (second_order && rho_grad_r != nullptr && rho_grad_z != nullptr) {
-    double r_face = 0.0;
-    double z_face = 0.0;
-    detail::csr_face_center(x_r_old,
-                            x_z_old,
-                            cell_node_csr_offsets,
-                            cell_node_csr_indices,
-                            cell,
-                            local,
-                            r_face,
-                            z_face,
-                            cell_nverts);
-    rho_face = detail::csr_limited_reconstruction(rho_lag,
-                                                  rho_grad_r,
-                                                  rho_grad_z,
-                                                  x_r_old,
-                                                  x_z_old,
-                                                  cell_node_csr_offsets,
-                                                  cell_node_csr_indices,
-                                                  cell,
-                                                  r_face,
-                                                  z_face,
-                                                  0.0,
-                                                  cell_nverts);
+  double dm_out = 0.0;
+  if (second_order) {
+    const double rho_integral = csr_moments_direct_field_integral(
+        rho_lag,
+        rho_grad_r,
+        rho_grad_z,
+        old_centroid_r,
+        old_centroid_z,
+        x_r_old,
+        x_z_old,
+        face_adj_csr_offsets,
+        face_adj_csr_indices,
+        cell_node_csr_offsets,
+        cell_node_csr_indices,
+        cell_nverts,
+        inactive_cell_mask,
+        vol_lag[cell],
+        cell,
+        n_cells,
+        dV,
+        dMr,
+        dMz,
+        false,
+        {});
+    dm_out = fabs(rho_integral);
+  } else {
+    double rho_face = rho_lag[cell];
+    rho_face = (rho_face > 0.0 && isfinite(rho_face)) ? rho_face : 0.0;
+    dm_out = rho_face * (-dV);
   }
-  rho_face = (rho_face > 0.0 && isfinite(rho_face)) ? rho_face : 0.0;
-  const double dm_out = rho_face * (-dV);
   if (dm_out > 0.0 && isfinite(dm_out)) {
-    atomicAdd(outgoing_mass + cell, dm_out);
+    outgoing_mass_stage[2 * (edge_offset + f)] += dm_out;
   }
 }
 
@@ -11660,7 +13376,8 @@ __global__ void csr_compute_hydro_mass_flux_scale_kernel(
     const double* __restrict__ vol_new,
     const std::uint8_t* __restrict__ inactive_cell_mask,
     const int n_cells,
-    const double rho_floor) {
+    const double rho_floor,
+    const RemapDispatchAuditDeviceView remap_dispatch_audit) {
   const int c = blockIdx.x * blockDim.x + threadIdx.x;
   if (c >= n_cells) {
     return;
@@ -11680,6 +13397,10 @@ __global__ void csr_compute_hydro_mass_flux_scale_kernel(
       (outgoing_mass[c] > 0.0 && isfinite(outgoing_mass[c])) ? outgoing_mass[c] : 0.0;
   double scale = 1.0;
   if (outgoing > available && outgoing > 0.0) {
+    remap_dispatch_audit_count(
+        remap_dispatch_audit,
+        RemapDispatchAuditCounter::LimiterActivation,
+        c);
     const double guarded_available = available * (1.0 - 1.0e-12);
     scale = fmax(guarded_available, 0.0) / outgoing;
   }
@@ -11690,15 +13411,18 @@ __global__ void csr_compute_lsq_gradients_inactive_masked_kernel(
     double* __restrict__ grad_r,
     double* __restrict__ grad_z,
     const double* __restrict__ field,
-    const double* __restrict__ x_r,
-    const double* __restrict__ x_z,
+    const double* __restrict__ old_centroid_r,
+    const double* __restrict__ old_centroid_z,
     const int* __restrict__ face_adj_csr_offsets,
     const int* __restrict__ face_adj_csr_indices,
-    const int* __restrict__ cell_node_csr_offsets,
-    const int* __restrict__ cell_node_csr_indices,
     const std::uint8_t* __restrict__ cell_nverts,
     const std::uint8_t* __restrict__ inactive_cell_mask,
-    const int n_cells) {
+    const std::uint8_t* __restrict__ donor_fallback_cell_mask,
+    const int n_cells,
+    const RemapDispatchAuditDeviceView remap_dispatch_audit,
+    const double condition_floor = 0.0,
+    const double* __restrict__ screen_mass = nullptr,
+    const double mass_floor = 0.0) {
   const int c = blockIdx.x * blockDim.x + threadIdx.x;
   if (c >= n_cells) {
     return;
@@ -11708,14 +13432,31 @@ __global__ void csr_compute_lsq_gradients_inactive_masked_kernel(
     grad_z[c] = 0.0;
     return;
   }
+  if (donor_fallback_cell_mask != nullptr &&
+      donor_fallback_cell_mask[c] != 0U) {
+    remap_dispatch_audit_count(
+        remap_dispatch_audit,
+        RemapDispatchAuditCounter::FirstOrderDonorFallback,
+        c);
+    grad_r[c] = 0.0;
+    grad_z[c] = 0.0;
+    return;
+  }
+  if (screen_mass != nullptr &&
+      (screen_mass[c] <= mass_floor || !isfinite(screen_mass[c]) ||
+       !isfinite(field[c]))) {
+    remap_dispatch_audit_count(
+        remap_dispatch_audit,
+        RemapDispatchAuditCounter::ProjectionGradientConditionFallback,
+        c);
+    grad_r[c] = 0.0;
+    grad_z[c] = 0.0;
+    return;
+  }
 
   const double q_c = field[c];
-  const double r_c =
-      detail::csr_cell_center_r(
-          x_r, cell_node_csr_offsets, cell_node_csr_indices, c, cell_nverts);
-  const double z_c =
-      detail::csr_cell_center_z(
-          x_z, cell_node_csr_offsets, cell_node_csr_indices, c, cell_nverts);
+  const double r_c = old_centroid_r[c];
+  const double z_c = old_centroid_z[c];
 
   double a00 = 0.0;
   double a01 = 0.0;
@@ -11737,14 +13478,13 @@ __global__ void csr_compute_lsq_gradients_inactive_masked_kernel(
     if (nb < 0 || nb >= n_cells || csr_inactive_cell(inactive_cell_mask, nb)) {
       continue;
     }
-    const double dr =
-        detail::csr_cell_center_r(
-            x_r, cell_node_csr_offsets, cell_node_csr_indices, nb, cell_nverts) -
-        r_c;
-    const double dz =
-        detail::csr_cell_center_z(
-            x_z, cell_node_csr_offsets, cell_node_csr_indices, nb, cell_nverts) -
-        z_c;
+    if (screen_mass != nullptr &&
+        (screen_mass[nb] <= mass_floor || !isfinite(screen_mass[nb]) ||
+         !isfinite(field[nb]))) {
+      continue;
+    }
+    const double dr = old_centroid_r[nb] - r_c;
+    const double dz = old_centroid_z[nb] - z_c;
     const double dist2 = dr * dr + dz * dz;
     if (!(dist2 > 1.0e-300) || !isfinite(dist2)) {
       continue;
@@ -11760,6 +13500,10 @@ __global__ void csr_compute_lsq_gradients_inactive_masked_kernel(
   }
 
   if (valid_neighbors < 2) {
+    remap_dispatch_audit_count(
+        remap_dispatch_audit,
+        RemapDispatchAuditCounter::CsrGradientZeroFallback,
+        c);
     grad_r[c] = 0.0;
     grad_z[c] = 0.0;
     return;
@@ -11767,10 +13511,20 @@ __global__ void csr_compute_lsq_gradients_inactive_masked_kernel(
 
   const double det = a00 * a11 - a01 * a01;
   const double scale = fabs(a00 * a11) + fabs(a01 * a01) + 1.0e-300;
-  if (fabs(det) > 1.0e-24 * scale && isfinite(det)) {
+  const bool condition_accepted =
+      condition_floor > 0.0
+          ? det > condition_floor * (a00 + a11) * (a00 + a11)
+          : fabs(det) > 1.0e-24 * scale;
+  if (condition_accepted && isfinite(det)) {
     grad_r[c] = (a11 * b0 - a01 * b1) / det;
     grad_z[c] = (-a01 * b0 + a00 * b1) / det;
   } else {
+    remap_dispatch_audit_count(
+        remap_dispatch_audit,
+        condition_floor > 0.0
+            ? RemapDispatchAuditCounter::ProjectionGradientConditionFallback
+            : RemapDispatchAuditCounter::CsrGradientZeroFallback,
+        c);
     grad_r[c] = 0.0;
     grad_z[c] = 0.0;
   }
@@ -11780,6 +13534,8 @@ __global__ void csr_apply_barth_jespersen_limiter_inactive_masked_kernel(
     double* __restrict__ grad_r,
     double* __restrict__ grad_z,
     const double* __restrict__ field,
+    const double* __restrict__ old_centroid_r,
+    const double* __restrict__ old_centroid_z,
     const double* __restrict__ x_r,
     const double* __restrict__ x_z,
     const int* __restrict__ face_adj_csr_offsets,
@@ -11788,12 +13544,16 @@ __global__ void csr_apply_barth_jespersen_limiter_inactive_masked_kernel(
     const int* __restrict__ cell_node_csr_indices,
     const std::uint8_t* __restrict__ cell_nverts,
     const std::uint8_t* __restrict__ inactive_cell_mask,
-    const int n_cells) {
+    const std::uint8_t* __restrict__ donor_fallback_cell_mask,
+    const int n_cells,
+    const RemapDispatchAuditDeviceView remap_dispatch_audit) {
   const int c = blockIdx.x * blockDim.x + threadIdx.x;
   if (c >= n_cells) {
     return;
   }
-  if (csr_inactive_cell(inactive_cell_mask, c)) {
+  if (csr_inactive_cell(inactive_cell_mask, c) ||
+      (donor_fallback_cell_mask != nullptr &&
+       donor_fallback_cell_mask[c] != 0U)) {
     grad_r[c] = 0.0;
     grad_z[c] = 0.0;
     return;
@@ -11821,17 +13581,17 @@ __global__ void csr_apply_barth_jespersen_limiter_inactive_masked_kernel(
   }
 
   if (!(q_max > q_min) || !isfinite(grad_r[c]) || !isfinite(grad_z[c])) {
+    remap_dispatch_audit_count(
+        remap_dispatch_audit,
+        RemapDispatchAuditCounter::CsrGradientZeroFallback,
+        c);
     grad_r[c] = 0.0;
     grad_z[c] = 0.0;
     return;
   }
 
-  const double r_c =
-      detail::csr_cell_center_r(
-          x_r, cell_node_csr_offsets, cell_node_csr_indices, c, cell_nverts);
-  const double z_c =
-      detail::csr_cell_center_z(
-          x_z, cell_node_csr_offsets, cell_node_csr_indices, c, cell_nverts);
+  const double r_c = old_centroid_r[c];
+  const double z_c = old_centroid_z[c];
   double alpha = 1.0;
   for (int local = 0; local < active_nverts; ++local) {
     double r_f = 0.0;
@@ -11858,6 +13618,12 @@ __global__ void csr_apply_barth_jespersen_limiter_inactive_masked_kernel(
     alpha = 0.0;
   }
   alpha = fmin(1.0, fmax(0.0, alpha));
+  if (alpha < 1.0) {
+    remap_dispatch_audit_count(
+        remap_dispatch_audit,
+        RemapDispatchAuditCounter::LimiterActivation,
+        c);
+  }
   grad_r[c] *= alpha;
   grad_z[c] *= alpha;
 }
@@ -12009,7 +13775,7 @@ __global__ void csr_finish_corner_fraction_remap_kernel(
   }
   const int active_nverts =
       tenryu::mesh::mesh_topo_cell_active_nverts(cell_nverts, c);
-  double f[mesh::kMeshTopoCellStorageSlotsMax] = {};
+  double f[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {};
   if (m > 0.0) {
     for (int k = 0; k < active_nverts; ++k) {
       const double raw = corner_fraction_mass_new[k * n_cells + c] / m;
@@ -12020,7 +13786,7 @@ __global__ void csr_finish_corner_fraction_remap_kernel(
   for (int k = 0; k < active_nverts; ++k) {
     sum += f[k];
   }
-  double cm[mesh::kMeshTopoCellStorageSlotsMax] = {};
+  double cm[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {};
   if (sum > 1.0e-300 && isfinite(sum)) {
     const double inv_sum = 1.0 / sum;
     double partial = 0.0;
@@ -12149,19 +13915,20 @@ __global__ void csr_initialize_volume_scalar_extents_kernel(
 }
 
 __device__ inline void csr_apply_volume_scalar_flux(
-    double* __restrict__ scalar_ext_new,
+    double* __restrict__ scalar_ext_stage,
     const double* __restrict__ scalar_lag,
-    const int cell,
     const int donor,
+    const int stage_slot,
     const double signed_volume) {
   if (!finite_nonzero(signed_volume)) {
     return;
   }
-  atomicAdd(scalar_ext_new + cell, fmax(scalar_lag[donor], 0.0) * signed_volume);
+  scalar_ext_stage[stage_slot] +=
+      fmax(scalar_lag[donor], 0.0) * signed_volume;
 }
 
 __global__ void csr_apply_internal_volume_scalar_flux_kernel(
-    double* __restrict__ scalar_ext_new,
+    double* __restrict__ scalar_ext_stage,
     const double* __restrict__ scalar_lag,
     const double* __restrict__ x_r_old,
     const double* __restrict__ x_z_old,
@@ -12177,7 +13944,7 @@ __global__ void csr_apply_internal_volume_scalar_flux_kernel(
     const std::uint8_t* __restrict__ cell_nverts,
     const std::uint8_t* __restrict__ inactive_cell_mask,
     double* __restrict__ macro_flux_audit,
-    const bool swept_volume_sign_fixed) {
+    const RemapDispatchAuditDeviceView remap_dispatch_audit) {
   const int f = blockIdx.x * blockDim.x + threadIdx.x;
   if (f >= n_faces) {
     return;
@@ -12198,14 +13965,20 @@ __global__ void csr_apply_internal_volume_scalar_flux_kernel(
                                                     cell_a,
                                                     unique_local_a[f],
                                                     cell_nverts);
-  const int donor =
-      csr_internal_flux_donor(cell_a, cell_b, dV_a, swept_volume_sign_fixed);
-  csr_apply_volume_scalar_flux(scalar_ext_new, scalar_lag, cell_a, donor, dV_a);
-  csr_apply_volume_scalar_flux(scalar_ext_new, scalar_lag, cell_b, donor, -dV_a);
+  const int donor = csr_internal_flux_donor(cell_a, cell_b, dV_a);
+  if (finite_nonzero(dV_a)) {
+    remap_dispatch_audit_count(
+        remap_dispatch_audit,
+        RemapDispatchAuditCounter::LegacySweptVolume,
+        donor);
+  }
+  csr_apply_volume_scalar_flux(scalar_ext_stage, scalar_lag, donor, 2 * f, dV_a);
+  csr_apply_volume_scalar_flux(
+      scalar_ext_stage, scalar_lag, donor, 2 * f + 1, -dV_a);
 }
 
 __global__ void csr_apply_boundary_volume_scalar_flux_kernel(
-    double* __restrict__ scalar_ext_new,
+    double* __restrict__ scalar_ext_stage,
     const double* __restrict__ scalar_lag,
     const double* __restrict__ x_r_old,
     const double* __restrict__ x_z_old,
@@ -12215,11 +13988,13 @@ __global__ void csr_apply_boundary_volume_scalar_flux_kernel(
     const int* __restrict__ cell_node_csr_indices,
     const int* __restrict__ boundary_cell,
     const int* __restrict__ boundary_local,
+    const int edge_offset,
     const int n_faces,
     const int* __restrict__ cell_orientation_sign,
     const std::uint8_t* __restrict__ cell_nverts,
     const std::uint8_t* __restrict__ inactive_cell_mask,
-    double* __restrict__ macro_flux_audit) {
+    double* __restrict__ macro_flux_audit,
+    const RemapDispatchAuditDeviceView remap_dispatch_audit) {
   const int f = blockIdx.x * blockDim.x + threadIdx.x;
   if (f >= n_faces) {
     return;
@@ -12239,48 +14014,80 @@ __global__ void csr_apply_boundary_volume_scalar_flux_kernel(
                                                   cell,
                                                   boundary_local[f],
                                                   cell_nverts);
-  csr_apply_volume_scalar_flux(scalar_ext_new, scalar_lag, cell, cell, dV);
+  if (finite_nonzero(dV)) {
+    remap_dispatch_audit_count(
+        remap_dispatch_audit,
+        RemapDispatchAuditCounter::LegacySweptVolume,
+        cell);
+    remap_dispatch_audit_count(
+        remap_dispatch_audit,
+        RemapDispatchAuditCounter::BoundaryOneSided,
+        cell);
+  }
+  csr_apply_volume_scalar_flux(
+      scalar_ext_stage, scalar_lag, cell, 2 * (edge_offset + f), dV);
 }
 
 __device__ inline void csr_apply_volume_scalar_flux_second_order(
-    double* __restrict__ scalar_ext_new,
+    double* __restrict__ scalar_ext_stage,
     const double* __restrict__ scalar_lag,
     const double* __restrict__ scalar_grad_r,
     const double* __restrict__ scalar_grad_z,
+    const double* __restrict__ vol_lag,
+    const double* __restrict__ old_centroid_r,
+    const double* __restrict__ old_centroid_z,
     const double* __restrict__ x_r_old,
     const double* __restrict__ x_z_old,
+    const int* __restrict__ face_adj_csr_offsets,
+    const int* __restrict__ face_adj_csr_indices,
     const int* __restrict__ cell_node_csr_offsets,
     const int* __restrict__ cell_node_csr_indices,
     const std::uint8_t* __restrict__ cell_nverts,
-    const int cell,
+    const std::uint8_t* __restrict__ inactive_cell_mask,
     const int donor,
-    const double r_face,
-    const double z_face,
-    const double signed_volume) {
-  if (!finite_nonzero(signed_volume)) {
+    const int n_cells,
+    const int stage_slot,
+    const double dV,
+    const double dMr,
+    const double dMz,
+    const double flux_scale,
+    const RemapDispatchAuditDeviceView remap_dispatch_audit) {
+  if (!finite_nonzero(dV)) {
     return;
   }
-  const double scalar_face =
-      detail::csr_limited_reconstruction(scalar_lag,
-                                         scalar_grad_r,
-                                         scalar_grad_z,
-                                         x_r_old,
-                                         x_z_old,
-                                         cell_node_csr_offsets,
-                                         cell_node_csr_indices,
-                                         donor,
-                                         r_face,
-                                         z_face,
-                                         0.0,
-                                         cell_nverts);
-  atomicAdd(scalar_ext_new + cell, fmax(scalar_face, 0.0) * signed_volume);
+  const double scalar_integral = csr_moments_direct_field_integral(
+      scalar_lag,
+      scalar_grad_r,
+      scalar_grad_z,
+      old_centroid_r,
+      old_centroid_z,
+      x_r_old,
+      x_z_old,
+      face_adj_csr_offsets,
+      face_adj_csr_indices,
+      cell_node_csr_offsets,
+      cell_node_csr_indices,
+      cell_nverts,
+      inactive_cell_mask,
+      vol_lag[donor],
+      donor,
+      n_cells,
+      dV,
+      dMr,
+      dMz,
+      false,
+      remap_dispatch_audit);
+  scalar_ext_stage[stage_slot] += flux_scale * scalar_integral;
 }
 
 __global__ void csr_apply_internal_volume_scalar_flux_second_order_kernel(
-    double* __restrict__ scalar_ext_new,
+    double* __restrict__ scalar_ext_stage,
     const double* __restrict__ scalar_lag,
     const double* __restrict__ scalar_grad_r,
     const double* __restrict__ scalar_grad_z,
+    const double* __restrict__ vol_lag,
+    const double* __restrict__ old_centroid_r,
+    const double* __restrict__ old_centroid_z,
     const double* __restrict__ x_r_old,
     const double* __restrict__ x_z_old,
     const double* __restrict__ x_r_new,
@@ -12291,11 +14098,15 @@ __global__ void csr_apply_internal_volume_scalar_flux_second_order_kernel(
     const int* __restrict__ unique_cell_b,
     const int* __restrict__ unique_local_a,
     const int n_faces,
+    const int n_cells,
+    const int* __restrict__ face_adj_csr_offsets,
+    const int* __restrict__ face_adj_csr_indices,
     const int* __restrict__ cell_orientation_sign,
     const std::uint8_t* __restrict__ cell_nverts,
+    const double* __restrict__ mass_flux_scale,
     const std::uint8_t* __restrict__ inactive_cell_mask,
     double* __restrict__ macro_flux_audit,
-    const bool swept_volume_sign_fixed) {
+    const RemapDispatchAuditDeviceView remap_dispatch_audit) {
   const int f = blockIdx.x * blockDim.x + threadIdx.x;
   if (f >= n_faces) {
     return;
@@ -12307,64 +14118,87 @@ __global__ void csr_apply_internal_volume_scalar_flux_second_order_kernel(
     return;
   }
   const int local_a = unique_local_a[f];
-  double r_face = 0.0;
-  double z_face = 0.0;
-  detail::csr_face_center(x_r_old,
-                          x_z_old,
-                          cell_node_csr_offsets,
-                          cell_node_csr_indices,
-                          cell_a,
-                          local_a,
-                          r_face,
-                          z_face,
-                          cell_nverts);
-  const double dV_a = csr_face_swept_volume_outward(x_r_old,
-                                                    x_z_old,
-                                                    x_r_new,
-                                                    x_z_new,
-                                                    cell_node_csr_offsets,
-                                                    cell_node_csr_indices,
-                                                    cell_orientation_sign,
-                                                    cell_a,
-                                                    local_a,
-                                                    cell_nverts);
-  const int donor =
-      csr_internal_flux_donor(cell_a, cell_b, dV_a, swept_volume_sign_fixed);
-  csr_apply_volume_scalar_flux_second_order(scalar_ext_new,
+  double dMr = 0.0;
+  double dMz = 0.0;
+  const double dV_a = csr_face_swept_raw_moments_outward(
+      x_r_old,
+      x_z_old,
+      x_r_new,
+      x_z_new,
+      cell_node_csr_offsets,
+      cell_node_csr_indices,
+      cell_orientation_sign,
+      cell_a,
+      local_a,
+      cell_nverts,
+      &dMr,
+      &dMz);
+  const int donor = csr_internal_flux_donor(cell_a, cell_b, dV_a);
+  const int losing_cell = csr_internal_flux_losing_cell(cell_a, cell_b, dV_a);
+  const double flux_scale =
+      csr_clamped_flux_scale(mass_flux_scale, losing_cell);
+  if (finite_nonzero(dV_a)) {
+    remap_dispatch_audit_count(
+        remap_dispatch_audit,
+        RemapDispatchAuditCounter::ExactSweptMoment,
+        donor);
+  }
+  csr_apply_volume_scalar_flux_second_order(scalar_ext_stage,
                                             scalar_lag,
                                             scalar_grad_r,
                                             scalar_grad_z,
+                                            vol_lag,
+                                            old_centroid_r,
+                                            old_centroid_z,
                                             x_r_old,
                                             x_z_old,
+                                            face_adj_csr_offsets,
+                                            face_adj_csr_indices,
                                             cell_node_csr_offsets,
                                             cell_node_csr_indices,
                                             cell_nverts,
-                                            cell_a,
+                                            inactive_cell_mask,
                                             donor,
-                                            r_face,
-                                            z_face,
-                                            dV_a);
-  csr_apply_volume_scalar_flux_second_order(scalar_ext_new,
+                                            n_cells,
+                                            2 * f,
+                                            dV_a,
+                                            dMr,
+                                            dMz,
+                                            flux_scale,
+                                            remap_dispatch_audit);
+  csr_apply_volume_scalar_flux_second_order(scalar_ext_stage,
                                             scalar_lag,
                                             scalar_grad_r,
                                             scalar_grad_z,
+                                            vol_lag,
+                                            old_centroid_r,
+                                            old_centroid_z,
                                             x_r_old,
                                             x_z_old,
+                                            face_adj_csr_offsets,
+                                            face_adj_csr_indices,
                                             cell_node_csr_offsets,
                                             cell_node_csr_indices,
                                             cell_nverts,
-                                            cell_b,
+                                            inactive_cell_mask,
                                             donor,
-                                            r_face,
-                                            z_face,
-                                            -dV_a);
+                                            n_cells,
+                                            2 * f + 1,
+                                            -dV_a,
+                                            -dMr,
+                                            -dMz,
+                                            flux_scale,
+                                            remap_dispatch_audit);
 }
 
 __global__ void csr_apply_boundary_volume_scalar_flux_second_order_kernel(
-    double* __restrict__ scalar_ext_new,
+    double* __restrict__ scalar_ext_stage,
     const double* __restrict__ scalar_lag,
     const double* __restrict__ scalar_grad_r,
     const double* __restrict__ scalar_grad_z,
+    const double* __restrict__ vol_lag,
+    const double* __restrict__ old_centroid_r,
+    const double* __restrict__ old_centroid_z,
     const double* __restrict__ x_r_old,
     const double* __restrict__ x_z_old,
     const double* __restrict__ x_r_new,
@@ -12373,11 +14207,17 @@ __global__ void csr_apply_boundary_volume_scalar_flux_second_order_kernel(
     const int* __restrict__ cell_node_csr_indices,
     const int* __restrict__ boundary_cell,
     const int* __restrict__ boundary_local,
+    const int edge_offset,
     const int n_faces,
+    const int n_cells,
+    const int* __restrict__ face_adj_csr_offsets,
+    const int* __restrict__ face_adj_csr_indices,
     const int* __restrict__ cell_orientation_sign,
     const std::uint8_t* __restrict__ cell_nverts,
+    const double* __restrict__ mass_flux_scale,
     const std::uint8_t* __restrict__ inactive_cell_mask,
-    double* __restrict__ macro_flux_audit) {
+    double* __restrict__ macro_flux_audit,
+    const RemapDispatchAuditDeviceView remap_dispatch_audit) {
   const int f = blockIdx.x * blockDim.x + threadIdx.x;
   if (f >= n_faces) {
     return;
@@ -12388,41 +14228,58 @@ __global__ void csr_apply_boundary_volume_scalar_flux_second_order_kernel(
     return;
   }
   const int local = boundary_local[f];
-  double r_face = 0.0;
-  double z_face = 0.0;
-  detail::csr_face_center(x_r_old,
-                          x_z_old,
-                          cell_node_csr_offsets,
-                          cell_node_csr_indices,
-                          cell,
-                          local,
-                          r_face,
-                          z_face,
-                          cell_nverts);
-  const double dV = csr_face_swept_volume_outward(x_r_old,
-                                                  x_z_old,
-                                                  x_r_new,
-                                                  x_z_new,
-                                                  cell_node_csr_offsets,
-                                                  cell_node_csr_indices,
-                                                  cell_orientation_sign,
-                                                  cell,
-                                                  local,
-                                                  cell_nverts);
-  csr_apply_volume_scalar_flux_second_order(scalar_ext_new,
+  double dMr = 0.0;
+  double dMz = 0.0;
+  const double dV = csr_face_swept_raw_moments_outward(
+      x_r_old,
+      x_z_old,
+      x_r_new,
+      x_z_new,
+      cell_node_csr_offsets,
+      cell_node_csr_indices,
+      cell_orientation_sign,
+      cell,
+      local,
+      cell_nverts,
+      &dMr,
+      &dMz);
+  const double flux_scale =
+      dV < 0.0 ? csr_clamped_flux_scale(mass_flux_scale, cell) : 1.0;
+  if (finite_nonzero(dV)) {
+    remap_dispatch_audit_count(
+        remap_dispatch_audit,
+        RemapDispatchAuditCounter::ExactSweptMoment,
+        cell);
+  }
+  if (finite_nonzero(flux_scale * dV)) {
+    remap_dispatch_audit_count(
+        remap_dispatch_audit,
+        RemapDispatchAuditCounter::BoundaryOneSided,
+        cell);
+  }
+  csr_apply_volume_scalar_flux_second_order(scalar_ext_stage,
                                             scalar_lag,
                                             scalar_grad_r,
                                             scalar_grad_z,
+                                            vol_lag,
+                                            old_centroid_r,
+                                            old_centroid_z,
                                             x_r_old,
                                             x_z_old,
+                                            face_adj_csr_offsets,
+                                            face_adj_csr_indices,
                                             cell_node_csr_offsets,
                                             cell_node_csr_indices,
                                             cell_nverts,
+                                            inactive_cell_mask,
                                             cell,
-                                            cell,
-                                            r_face,
-                                            z_face,
-                                            dV);
+                                            n_cells,
+                                            2 * (edge_offset + f),
+                                            dV,
+                                            dMr,
+                                            dMz,
+                                            flux_scale,
+                                            remap_dispatch_audit);
 }
 
 __global__ void csr_finish_volume_scalar_remap_kernel(
@@ -12570,8 +14427,8 @@ __device__ inline void csr_compute_cell_corner_masses(
   const int off = cell_node_csr_offsets[c];
   const double m_cell =
       (mass != nullptr && mass[c] > 0.0 && isfinite(mass[c])) ? mass[c] : 0.0;
-  double r[mesh::kMeshTopoCellStorageSlotsMax] = {};
-  double z[mesh::kMeshTopoCellStorageSlotsMax] = {};
+  double r[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {};
+  double z[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {};
   for (int k = 0; k < active_nverts; ++k) {
     const int n = cell_node_csr_indices[off + k];
     r[k] = x_r[n];
@@ -12606,9 +14463,11 @@ __device__ inline void csr_compute_cell_corner_masses(
       rz::compute_quad_corner_masses_bbsw(
           m_cell, r[0], r[1], r[2], r[3], m_corner, &probe);
     }
-  } else if (active_nverts >= 5 &&
+  } else if (active_nverts == 5) {
+    csr_compute_pentagon_qk_corner_masses(m_cell, r, z, m_corner);
+  } else if (active_nverts >= 6 &&
              active_nverts <= mesh::kMeshTopoCellStorageSlotsMax) {
-    double w[mesh::kMeshTopoCellStorageSlotsMax] = {};
+    double w[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {};
     mesh::moments::star_p1_vertex_r_moments(r, z, active_nverts, w);
     double W = 0.0;
     bool finite_weights = true;
@@ -12652,22 +14511,26 @@ __device__ inline void csr_optionb_compute_first_moment_corner_masses(
     const int* __restrict__ cell_node_csr_offsets,
     const int* __restrict__ cell_node_csr_indices,
     const std::uint8_t* __restrict__ cell_nverts) {
-  for (int k = 0; k < 4; ++k) {
+  for (int k = 0; k < mesh::kMeshTopoCellStorageSlotsMax; ++k) {
     m_corner[k] = 0.0;
   }
   const int active_nverts = csr_active_nverts_for_cell(c, cell_nverts);
   const int off = cell_node_csr_offsets[c];
   const double m_cell =
       (mass != nullptr && mass[c] > 0.0 && isfinite(mass[c])) ? mass[c] : 0.0;
-  double r[4] = {0.0, 0.0, 0.0, 0.0};
-  double z[4] = {0.0, 0.0, 0.0, 0.0};
+  double r[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {};
+  double z[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {};
   for (int k = 0; k < active_nverts; ++k) {
     const int n = cell_node_csr_indices[off + k];
     r[k] = x_r[n];
     z[k] = x_z[n];
   }
-  tenryu::hydro::optionb::first_moment_corner_masses(
-      m_cell, r, z, active_nverts, m_corner);
+  if (active_nverts == 5) {
+    csr_compute_pentagon_qk_corner_masses(m_cell, r, z, m_corner);
+  } else {
+    tenryu::hydro::optionb::first_moment_corner_masses(
+        m_cell, r, z, active_nverts, m_corner);
+  }
 }
 
 __device__ inline double csr_optionb_corner_kinetic_for_cell_from_masses(
@@ -12709,7 +14572,7 @@ __device__ inline double csr_optionb_first_moment_corner_kinetic_for_cell(
     const std::uint8_t* __restrict__ cell_nverts) {
   const int active_nverts = csr_active_nverts_for_cell(c, cell_nverts);
   const int off = cell_node_csr_offsets[c];
-  double m_corner[4] = {0.0, 0.0, 0.0, 0.0};
+  double m_corner[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {};
   csr_optionb_compute_first_moment_corner_masses(m_corner,
                                                  c,
                                                  mass,
@@ -12741,19 +14604,20 @@ __global__ void csr_optionb_build_first_moment_corner_mass_kernel(
     const int* __restrict__ cell_node_csr_indices,
     const std::uint8_t* __restrict__ cell_nverts,
     const std::uint8_t* __restrict__ inactive_cell_mask,
+    const int corner_stride,
     const int n_cells) {
   const int c = blockIdx.x * blockDim.x + threadIdx.x;
   if (c >= n_cells) {
     return;
   }
-  const int base = 4 * c;
+  const int base = corner_stride * c;
   if (csr_inactive_cell(inactive_cell_mask, c)) {
-    for (int k = 0; k < 4; ++k) {
+    for (int k = 0; k < corner_stride; ++k) {
       corner_mass[base + k] = 0.0;
     }
     return;
   }
-  double m_corner[4] = {0.0, 0.0, 0.0, 0.0};
+  double m_corner[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {};
   csr_optionb_compute_first_moment_corner_masses(m_corner,
                                                  c,
                                                  mass,
@@ -12762,7 +14626,7 @@ __global__ void csr_optionb_build_first_moment_corner_mass_kernel(
                                                  cell_node_csr_offsets,
                                                  cell_node_csr_indices,
                                                  cell_nverts);
-  for (int k = 0; k < 4; ++k) {
+  for (int k = 0; k < corner_stride; ++k) {
     corner_mass[base + k] = m_corner[k];
   }
 }
@@ -13244,6 +15108,79 @@ __global__ void csr_project_cell_velocity_to_nodes_kernel(
   }
 }
 
+__global__ void csr_project_cell_velocity_to_nodes_gradient_kernel(
+    double* __restrict__ v_r_node,
+    double* __restrict__ v_z_node,
+    const double* __restrict__ v_r_cell,
+    const double* __restrict__ v_z_cell,
+    const double* __restrict__ v_r_grad_r,
+    const double* __restrict__ v_r_grad_z,
+    const double* __restrict__ v_z_grad_r,
+    const double* __restrict__ v_z_grad_z,
+    const double* __restrict__ centroid_r,
+    const double* __restrict__ centroid_z,
+    const double* __restrict__ x_r,
+    const double* __restrict__ x_z,
+    const double* __restrict__ mass_cell,
+    const int* __restrict__ reverse_csr_node_offsets,
+    const int* __restrict__ reverse_csr_node_cells,
+    const std::uint8_t* __restrict__ cell_nverts,
+    const std::uint8_t* __restrict__ frozen_node_mask,
+    const std::uint8_t* __restrict__ inactive_cell_mask,
+    const int n_nodes) {
+  const int n = blockIdx.x * blockDim.x + threadIdx.x;
+  if (n >= n_nodes) {
+    return;
+  }
+  if (frozen_node_mask != nullptr && frozen_node_mask[n] != 0U) {
+    return;
+  }
+  const int off = reverse_csr_node_offsets[n];
+  const int end = reverse_csr_node_offsets[n + 1];
+  bool apply_gradient = true;
+  for (int p = off; p < end; ++p) {
+    const int c = reverse_csr_node_cells[p];
+    if (cell_nverts != nullptr &&
+        tenryu::mesh::mesh_topo_cell_active_nverts(cell_nverts, c) != 4) {
+      apply_gradient = false;
+      break;
+    }
+  }
+  double m_sum = 0.0;
+  double pr = 0.0;
+  double pz = 0.0;
+  for (int p = off; p < end; ++p) {
+    const int c = reverse_csr_node_cells[p];
+    if (csr_inactive_cell(inactive_cell_mask, c)) {
+      continue;
+    }
+    double m = 0.25 * fmax(mass_cell[c], 0.0);
+    if (cell_nverts != nullptr) {
+      const int active_nverts =
+          tenryu::mesh::mesh_topo_cell_active_nverts(cell_nverts, c);
+      m = fmax(mass_cell[c], 0.0) / static_cast<double>(active_nverts);
+    }
+    double vr = v_r_cell[c];
+    double vz = v_z_cell[c];
+    if (apply_gradient) {
+      const double dr = x_r[n] - centroid_r[c];
+      const double dz = x_z[n] - centroid_z[c];
+      vr += v_r_grad_r[c] * dr + v_r_grad_z[c] * dz;
+      vz += v_z_grad_r[c] * dr + v_z_grad_z[c] * dz;
+    }
+    m_sum += m;
+    pr += m * vr;
+    pz += m * vz;
+  }
+  if (m_sum > 0.0 && isfinite(m_sum)) {
+    v_r_node[n] = pr / m_sum;
+    v_z_node[n] = pz / m_sum;
+  } else {
+    v_r_node[n] = 0.0;
+    v_z_node[n] = 0.0;
+  }
+}
+
 __global__ void csr_project_cell_velocity_to_nodes_corner_mass_kernel(
     double* __restrict__ v_r_node,
     double* __restrict__ v_z_node,
@@ -13286,7 +15223,7 @@ __global__ void csr_project_cell_velocity_to_nodes_corner_mass_kernel(
     if (corner < 0 || corner >= active_nverts) {
       continue;
     }
-    double m_corner[mesh::kMeshTopoCellStorageSlotsMax] = {};
+    double m_corner[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {};
     csr_compute_cell_corner_masses(m_corner,
                                    c,
                                    mass_cell,
@@ -13308,6 +15245,102 @@ __global__ void csr_project_cell_velocity_to_nodes_corner_mass_kernel(
     m_sum += m;
     pr += m * v_r_cell[c];
     pz += m * v_z_cell[c];
+  }
+  if (m_sum > 0.0 && isfinite(m_sum)) {
+    v_r_node[n] = pr / m_sum;
+    v_z_node[n] = pz / m_sum;
+  } else {
+    v_r_node[n] = 0.0;
+    v_z_node[n] = 0.0;
+  }
+}
+
+__global__ void csr_project_cell_velocity_to_nodes_corner_mass_gradient_kernel(
+    double* __restrict__ v_r_node,
+    double* __restrict__ v_z_node,
+    const double* __restrict__ v_r_cell,
+    const double* __restrict__ v_z_cell,
+    const double* __restrict__ v_r_grad_r,
+    const double* __restrict__ v_r_grad_z,
+    const double* __restrict__ v_z_grad_r,
+    const double* __restrict__ v_z_grad_z,
+    const double* __restrict__ centroid_r,
+    const double* __restrict__ centroid_z,
+    const double* __restrict__ mass_cell,
+    const double* __restrict__ x_r,
+    const double* __restrict__ x_z,
+    const int* __restrict__ reverse_csr_node_offsets,
+    const int* __restrict__ reverse_csr_node_cells,
+    const int* __restrict__ reverse_csr_node_corners,
+    const int* __restrict__ cell_node_csr_offsets,
+    const int* __restrict__ cell_node_csr_indices,
+    const std::uint8_t* __restrict__ cell_nverts,
+    const std::uint8_t* __restrict__ frozen_node_mask,
+    const std::uint8_t* __restrict__ inactive_cell_mask,
+    const int* __restrict__ cell_orientation_sign,
+    rz::CornerMassFallbackRecorder* fallback_recorder,
+    const int corner_mass_convention,
+    const int n_nodes) {
+  const int n = blockIdx.x * blockDim.x + threadIdx.x;
+  if (n >= n_nodes) {
+    return;
+  }
+  if (frozen_node_mask != nullptr && frozen_node_mask[n] != 0U) {
+    return;
+  }
+  const int off = reverse_csr_node_offsets[n];
+  const int end = reverse_csr_node_offsets[n + 1];
+  bool apply_gradient = true;
+  for (int p = off; p < end; ++p) {
+    const int c = reverse_csr_node_cells[p];
+    if (csr_active_nverts_for_cell(c, cell_nverts) != 4) {
+      apply_gradient = false;
+      break;
+    }
+  }
+  double m_sum = 0.0;
+  double pr = 0.0;
+  double pz = 0.0;
+  for (int p = off; p < end; ++p) {
+    const int c = reverse_csr_node_cells[p];
+    if (csr_inactive_cell(inactive_cell_mask, c)) {
+      continue;
+    }
+    const int corner = reverse_csr_node_corners[p];
+    const int active_nverts = csr_active_nverts_for_cell(c, cell_nverts);
+    if (corner < 0 || corner >= active_nverts) {
+      continue;
+    }
+    double m_corner[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {};
+    csr_compute_cell_corner_masses(m_corner,
+                                   c,
+                                   mass_cell,
+                                   x_r,
+                                   x_z,
+                                   cell_node_csr_offsets,
+                                   cell_node_csr_indices,
+                                   cell_nverts,
+                                   corner_mass_convention,
+                                   fallback_recorder,
+                                   rz::kCornerMassFallbackStageCsrNodeProjection,
+                                   cell_orientation_sign != nullptr
+                                       ? cell_orientation_sign[c]
+                                       : -2);
+    const double m =
+        (m_corner[corner] > 0.0 && isfinite(m_corner[corner]))
+            ? m_corner[corner]
+            : 0.0;
+    double vr = v_r_cell[c];
+    double vz = v_z_cell[c];
+    if (apply_gradient) {
+      const double dr = x_r[n] - centroid_r[c];
+      const double dz = x_z[n] - centroid_z[c];
+      vr += v_r_grad_r[c] * dr + v_r_grad_z[c] * dz;
+      vz += v_z_grad_r[c] * dr + v_z_grad_z[c] * dz;
+    }
+    m_sum += m;
+    pr += m * vr;
+    pz += m * vz;
   }
   if (m_sum > 0.0 && isfinite(m_sum)) {
     v_r_node[n] = pr / m_sum;
@@ -13678,7 +15711,7 @@ __device__ inline double csr_corner_kinetic_for_cell(
   const int active_nverts = csr_active_nverts_for_cell(c, cell_nverts);
   const int off = cell_node_csr_offsets[c];
   double total = 0.0;
-  double m_corner[mesh::kMeshTopoCellStorageSlotsMax] = {};
+  double m_corner[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {};
   csr_compute_cell_corner_masses(m_corner,
                                  c,
                                  mass,
@@ -14511,8 +16544,8 @@ __global__ void csr_capture_near_vacuum_pre_kernel(
   const int active_nverts = csr_active_nverts_for_cell(cell, cell_nverts);
   record->active_nverts = active_nverts;
   const int off = cell_node_csr_offsets[cell];
-  double r_ref[mesh::kMeshTopoCellStorageSlotsMax] = {};
-  double z_ref[mesh::kMeshTopoCellStorageSlotsMax] = {};
+  double r_ref[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {};
+  double z_ref[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {};
   for (int k = 0; k < active_nverts; ++k) {
     const int n = cell_node_csr_indices[off + k];
     record->node_id[k] = n;
@@ -14562,54 +16595,65 @@ __global__ void csr_capture_near_vacuum_pre_kernel(
 
 __device__ inline double csr_near_vacuum_face_dm_to_cell(
     const bool second_order,
-    const int target_cell,
     const int donor_cell,
-    const int flux_owner_cell,
-    const int flux_owner_local_face,
-    const double signed_volume_to_cell,
+    const double dV_to_cell,
+    const double dMr_to_cell,
+    const double dMz_to_cell,
+    const double flux_scale,
     const double* __restrict__ rho_lag,
     const double* __restrict__ rho_grad_r,
     const double* __restrict__ rho_grad_z,
+    const double* __restrict__ vol_lag,
+    const double* __restrict__ old_centroid_r,
+    const double* __restrict__ old_centroid_z,
     const double* __restrict__ x_r_old,
     const double* __restrict__ x_z_old,
+    const int* __restrict__ face_adj_csr_offsets,
+    const int* __restrict__ face_adj_csr_indices,
     const int* __restrict__ cell_node_csr_offsets,
     const int* __restrict__ cell_node_csr_indices,
     const std::uint8_t* __restrict__ cell_nverts,
+    const std::uint8_t* __restrict__ inactive_cell_mask,
+    const int n_cells,
     double* const rho_face_out) {
-  (void)target_cell;
-  if (!finite_nonzero(signed_volume_to_cell)) {
+  if (!finite_nonzero(dV_to_cell)) {
     *rho_face_out = 0.0;
     return 0.0;
   }
-  double rho_face = rho_lag[donor_cell];
-  if (second_order && rho_grad_r != nullptr && rho_grad_z != nullptr) {
-    double r_face = 0.0;
-    double z_face = 0.0;
-    detail::csr_face_center(x_r_old,
-                            x_z_old,
-                            cell_node_csr_offsets,
-                            cell_node_csr_indices,
-                            flux_owner_cell,
-                            flux_owner_local_face,
-                            r_face,
-                            z_face,
-                            cell_nverts);
-    rho_face = detail::csr_limited_reconstruction(rho_lag,
-                                                  rho_grad_r,
-                                                  rho_grad_z,
-                                                  x_r_old,
-                                                  x_z_old,
-                                                  cell_node_csr_offsets,
-                                                  cell_node_csr_indices,
-                                                  donor_cell,
-                                                  r_face,
-                                                  z_face,
-                                                  0.0,
-                                                  cell_nverts);
+  if (second_order) {
+    const double rho_integral = csr_moments_direct_field_integral(
+        rho_lag,
+        rho_grad_r,
+        rho_grad_z,
+        old_centroid_r,
+        old_centroid_z,
+        x_r_old,
+        x_z_old,
+        face_adj_csr_offsets,
+        face_adj_csr_indices,
+        cell_node_csr_offsets,
+        cell_node_csr_indices,
+        cell_nverts,
+        inactive_cell_mask,
+        vol_lag[donor_cell],
+        donor_cell,
+        n_cells,
+        dV_to_cell,
+        dMr_to_cell,
+        dMz_to_cell,
+        false,
+        {});
+    const bool nondegenerate =
+        vol_lag[donor_cell] > 0.0 &&
+        fabs(dV_to_cell) >= 1.0e-12 * vol_lag[donor_cell];
+    *rho_face_out = nondegenerate ? rho_integral / dV_to_cell
+                                  : rho_lag[donor_cell];
+    return flux_scale * rho_integral;
   }
+  double rho_face = rho_lag[donor_cell];
   rho_face = fmax(rho_face, 0.0);
   *rho_face_out = rho_face;
-  return rho_face * signed_volume_to_cell;
+  return flux_scale * rho_face * dV_to_cell;
 }
 
 __global__ void csr_capture_near_vacuum_flux_kernel(
@@ -14618,10 +16662,15 @@ __global__ void csr_capture_near_vacuum_flux_kernel(
     const double* __restrict__ rho_lag,
     const double* __restrict__ rho_grad_r,
     const double* __restrict__ rho_grad_z,
+    const double* __restrict__ vol_lag,
+    const double* __restrict__ old_centroid_r,
+    const double* __restrict__ old_centroid_z,
     const double* __restrict__ x_r_old,
     const double* __restrict__ x_z_old,
     const double* __restrict__ x_r_ref,
     const double* __restrict__ x_z_ref,
+    const int* __restrict__ face_adj_csr_offsets,
+    const int* __restrict__ face_adj_csr_indices,
     const int* __restrict__ cell_node_csr_offsets,
     const int* __restrict__ cell_node_csr_indices,
     const int* __restrict__ unique_cell_a,
@@ -14632,7 +16681,8 @@ __global__ void csr_capture_near_vacuum_flux_kernel(
     const int* __restrict__ cell_orientation_sign,
     const std::uint8_t* __restrict__ cell_nverts,
     const double* __restrict__ mass_flux_scale,
-    const bool swept_volume_sign_fixed,
+    const std::uint8_t* __restrict__ inactive_cell_mask,
+    const int n_cells,
     const int n_internal_faces,
     const int n_boundary_faces) {
   if (blockIdx.x != 0 || threadIdx.x != 0 || record->found == 0) {
@@ -14650,45 +16700,61 @@ __global__ void csr_capture_near_vacuum_flux_kernel(
       continue;
     }
     const int local_a = unique_local_a[f];
-    const double dV_a = csr_face_swept_volume_outward(x_r_old,
-                                                      x_z_old,
-                                                      x_r_ref,
-                                                      x_z_ref,
-                                                      cell_node_csr_offsets,
-                                                      cell_node_csr_indices,
-                                                      cell_orientation_sign,
-                                                      cell_a,
-                                                      local_a,
-                                                      cell_nverts);
-    const int donor =
-        csr_internal_flux_donor(cell_a, cell_b, dV_a, swept_volume_sign_fixed);
+    double dMr = 0.0;
+    double dMz = 0.0;
+    const double dV_a = second_order
+                            ? csr_face_swept_raw_moments_outward(
+                                  x_r_old,
+                                  x_z_old,
+                                  x_r_ref,
+                                  x_z_ref,
+                                  cell_node_csr_offsets,
+                                  cell_node_csr_indices,
+                                  cell_orientation_sign,
+                                  cell_a,
+                                  local_a,
+                                  cell_nverts,
+                                  &dMr,
+                                  &dMz)
+                            : csr_face_swept_volume_outward(
+                                  x_r_old,
+                                  x_z_old,
+                                  x_r_ref,
+                                  x_z_ref,
+                                  cell_node_csr_offsets,
+                                  cell_node_csr_indices,
+                                  cell_orientation_sign,
+                                  cell_a,
+                                  local_a,
+                                  cell_nverts);
+    const int donor = csr_internal_flux_donor(cell_a, cell_b, dV_a);
     const int losing_cell = csr_internal_flux_losing_cell(cell_a, cell_b, dV_a);
-    double dV_limited = dV_a;
-    if (mass_flux_scale != nullptr && finite_nonzero(dV_a)) {
-      double s = mass_flux_scale[losing_cell];
-      if (!isfinite(s)) {
-        s = 0.0;
-      }
-      s = fmin(1.0, fmax(0.0, s));
-      dV_limited = dV_a * s;
-    }
-    const double signed_volume_to_cell =
-        (target == cell_a) ? dV_limited : -dV_limited;
+    const double flux_scale =
+        csr_clamped_flux_scale(mass_flux_scale, losing_cell);
+    const double sign_to_cell = target == cell_a ? 1.0 : -1.0;
+    const double signed_volume_to_cell = sign_to_cell * flux_scale * dV_a;
     double rho_face = 0.0;
     const double dm = csr_near_vacuum_face_dm_to_cell(second_order,
-                                                      target,
                                                       donor,
-                                                      cell_a,
-                                                      local_a,
-                                                      signed_volume_to_cell,
+                                                      sign_to_cell * dV_a,
+                                                      sign_to_cell * dMr,
+                                                      sign_to_cell * dMz,
+                                                      flux_scale,
                                                       rho_lag,
                                                       rho_grad_r,
                                                       rho_grad_z,
+                                                      vol_lag,
+                                                      old_centroid_r,
+                                                      old_centroid_z,
                                                       x_r_old,
                                                       x_z_old,
+                                                      face_adj_csr_offsets,
+                                                      face_adj_csr_indices,
                                                       cell_node_csr_offsets,
                                                       cell_node_csr_indices,
                                                       cell_nverts,
+                                                      inactive_cell_mask,
+                                                      n_cells,
                                                       &rho_face);
     record->mass_flux_sum += dm;
     CsrNearVacuumFaceRecord face;
@@ -14710,40 +16776,58 @@ __global__ void csr_capture_near_vacuum_flux_kernel(
       continue;
     }
     const int local = boundary_local[f];
-    const double dV = csr_face_swept_volume_outward(x_r_old,
-                                                    x_z_old,
-                                                    x_r_ref,
-                                                    x_z_ref,
-                                                    cell_node_csr_offsets,
-                                                    cell_node_csr_indices,
-                                                    cell_orientation_sign,
-                                                    cell,
-                                                    local,
-                                                    cell_nverts);
+    double dMr = 0.0;
+    double dMz = 0.0;
+    const double dV = second_order
+                          ? csr_face_swept_raw_moments_outward(
+                                x_r_old,
+                                x_z_old,
+                                x_r_ref,
+                                x_z_ref,
+                                cell_node_csr_offsets,
+                                cell_node_csr_indices,
+                                cell_orientation_sign,
+                                cell,
+                                local,
+                                cell_nverts,
+                                &dMr,
+                                &dMz)
+                          : csr_face_swept_volume_outward(
+                                x_r_old,
+                                x_z_old,
+                                x_r_ref,
+                                x_z_ref,
+                                cell_node_csr_offsets,
+                                cell_node_csr_indices,
+                                cell_orientation_sign,
+                                cell,
+                                local,
+                                cell_nverts);
     double rho_face = 0.0;
-    double dV_limited = dV;
-    if (mass_flux_scale != nullptr && dV < 0.0 && finite_nonzero(dV)) {
-      double s = mass_flux_scale[cell];
-      if (!isfinite(s)) {
-        s = 0.0;
-      }
-      s = fmin(1.0, fmax(0.0, s));
-      dV_limited = dV * s;
-    }
+    const double flux_scale =
+        dV < 0.0 ? csr_clamped_flux_scale(mass_flux_scale, cell) : 1.0;
+    const double dV_limited = flux_scale * dV;
     const double dm = csr_near_vacuum_face_dm_to_cell(second_order,
-                                                      target,
                                                       cell,
-                                                      cell,
-                                                      local,
-                                                      dV_limited,
+                                                      dV,
+                                                      dMr,
+                                                      dMz,
+                                                      flux_scale,
                                                       rho_lag,
                                                       rho_grad_r,
                                                       rho_grad_z,
+                                                      vol_lag,
+                                                      old_centroid_r,
+                                                      old_centroid_z,
                                                       x_r_old,
                                                       x_z_old,
+                                                      face_adj_csr_offsets,
+                                                      face_adj_csr_indices,
                                                       cell_node_csr_offsets,
                                                       cell_node_csr_indices,
                                                       cell_nverts,
+                                                      inactive_cell_mask,
+                                                      n_cells,
                                                       &rho_face);
     record->mass_flux_sum += dm;
     CsrNearVacuumFaceRecord face;
@@ -14919,7 +17003,7 @@ AleRemap2DRZResult conservative_remap_csr(
     const double dt,
     const std::uint8_t* core_freeze_frozen_node_mask,
     const AleRemap2DRZOverrides& overrides) {
-  (void)dt;
+  (void)core_freeze_frozen_node_mask;
   AleRemap2DRZResult result;
   if (!cfg.numerics.ale.conservative_remap_enabled) {
     return result;
@@ -14963,6 +17047,8 @@ AleRemap2DRZResult conservative_remap_csr(
     const char* raw = std::getenv("TENRYU_I1B_CSR_WATCH_CELL");
     return raw != nullptr && raw[0] != '\0' ? std::atoi(raw) : -1;
   }();
+  static const int remap_watch_cell =
+      env_int_value("TENRYU_I1B_REMAP_WATCH_CELL", -1);
   const int n_cells_watch = state.mesh.topo.n_cells;
   const auto csr_watch_dump = [&](const char* tag, const double* d_field) {
     if (csr_watch_cell < 0 || csr_watch_cell >= n_cells_watch ||
@@ -15026,9 +17112,146 @@ AleRemap2DRZResult conservative_remap_csr(
   const int n_cells = state.mesh.topo.n_cells;
   const int nz = state.mesh.topo.nz;
   const int n_nodes = state.mesh.topo.n_nodes;
+  const RemapDispatchAuditDeviceView remap_dispatch_audit =
+      remap_dispatch_audit_device_view();
   if (n_cells <= 0 || n_nodes <= 0) {
     return result;
   }
+  static const bool txn_vth_sub_diag = [] {
+    const char* raw = std::getenv("TENRYU_ALE_TXN_VTH_DIAG");
+    return raw != nullptr && raw[0] != '\0' && raw[0] != '0';
+  }();
+  const auto txn_vth_sub_cell =
+      [&](const char* stage,
+          const std::vector<double>& node_r,
+          const std::vector<double>& node_z,
+          const std::vector<double>& cell_mass,
+          const std::vector<double>& cell_momentum_r,
+          const std::vector<double>& cell_momentum_z) {
+        if (!txn_vth_sub_diag) {
+          return;
+        }
+        double max_abs_u_theta = 0.0;
+        double max_theta_deg = 0.0;
+        int max_cell = -1;
+        for (int cell = 0; cell < n_cells; ++cell) {
+          const int begin =
+              mb.cell_node_csr_offsets[static_cast<std::size_t>(cell)];
+          const int nverts =
+              state.mesh.cell_nverts.empty()
+                  ? 4
+                  : mesh::mesh_topo_cell_active_nverts(
+                        state.mesh.cell_nverts, cell);
+          double cell_r[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {};
+          double cell_z[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {};
+          for (int k = 0; k < nverts; ++k) {
+            const int node = mb.cell_node_csr_indices[
+                static_cast<std::size_t>(begin + k)];
+            cell_r[k] = node_r[static_cast<std::size_t>(node)];
+            cell_z[k] = node_z[static_cast<std::size_t>(node)];
+          }
+          double centroid_r = 0.0;
+          double centroid_z = 0.0;
+          rz::rz_polygon_area_centroid_exact(
+              cell_r, cell_z, nverts, &centroid_r, &centroid_z);
+          const double radius = std::hypot(centroid_r, centroid_z);
+          if (!(radius > 3.0e-5 && radius < 1.5e-3)) {
+            continue;
+          }
+          const std::size_t index = static_cast<std::size_t>(cell);
+          const double u_r = cell_momentum_r[index] / cell_mass[index];
+          const double u_z = cell_momentum_z[index] / cell_mass[index];
+          const double u_theta =
+              (u_r * centroid_z - u_z * centroid_r) / radius;
+          const double abs_u_theta = std::abs(u_theta);
+          if (max_cell < 0 || abs_u_theta > max_abs_u_theta) {
+            max_abs_u_theta = abs_u_theta;
+            max_cell = cell;
+            max_theta_deg =
+                std::atan2(centroid_r, centroid_z) * 180.0 /
+                3.14159265358979323846;
+          }
+        }
+        std::fprintf(stderr,
+                     "[txn_vth_sub] stage=%s max_abs_u_theta=%.17e "
+                     "cell=%d theta_deg=%.17e\n",
+                     stage,
+                     max_abs_u_theta,
+                     max_cell,
+                     max_theta_deg);
+      };
+  const auto txn_vth_sub_node =
+      [&](const char* stage,
+          const std::vector<double>& node_r,
+          const std::vector<double>& node_z,
+          const std::vector<double>& node_velocity_r,
+          const std::vector<double>& node_velocity_z) {
+        if (!txn_vth_sub_diag) {
+          return;
+        }
+        double max_abs_u_theta = 0.0;
+        double max_theta_deg = 0.0;
+        int max_node = -1;
+        for (int node = 0; node < n_nodes; ++node) {
+          const std::size_t index = static_cast<std::size_t>(node);
+          const double radius = std::hypot(node_r[index], node_z[index]);
+          if (!(radius > 3.0e-5 && radius < 1.5e-3)) {
+            continue;
+          }
+          const double u_theta =
+              (node_velocity_r[index] * node_z[index] -
+               node_velocity_z[index] * node_r[index]) /
+              radius;
+          const double abs_u_theta = std::abs(u_theta);
+          if (max_node < 0 || abs_u_theta > max_abs_u_theta) {
+            max_abs_u_theta = abs_u_theta;
+            max_node = node;
+            max_theta_deg =
+                std::atan2(node_r[index], node_z[index]) * 180.0 /
+                3.14159265358979323846;
+          }
+        }
+        std::fprintf(stderr,
+                     "[txn_vth_sub] stage=%s max_abs_u_theta=%.17e "
+                     "node=%d theta_deg=%.17e\n",
+                     stage,
+                     max_abs_u_theta,
+                     max_node,
+                     max_theta_deg);
+      };
+  const std::size_t node_bytes =
+      static_cast<std::size_t>(n_nodes) * sizeof(double);
+  // Unconditional velocity-authority bound: nodes outside the caller's
+  // active_node_velocity_mask must exit this function with bitwise the
+  // velocities they entered with. Snapshot at entry; restore before
+  // every return past this point. The corner-distribution phase writes only
+  // changed nodes, so this remains defense in depth.
+  core::DeviceArray<double> d_velocity_bound_vr;
+  core::DeviceArray<double> d_velocity_bound_vz;
+  if (overrides.active_node_velocity_mask != nullptr) {
+    d_velocity_bound_vr.reset(static_cast<std::size_t>(n_nodes));
+    d_velocity_bound_vz.reset(static_cast<std::size_t>(n_nodes));
+    CUDA_CHECK(cudaMemcpy(d_velocity_bound_vr.data(), state.v_r.data(),
+                          node_bytes, cudaMemcpyDeviceToDevice));
+    CUDA_CHECK(cudaMemcpy(d_velocity_bound_vz.data(), state.v_z.data(),
+                          node_bytes, cudaMemcpyDeviceToDevice));
+  }
+  const auto restore_out_of_mask_velocities = [&]() {
+    if (overrides.active_node_velocity_mask == nullptr ||
+        d_velocity_bound_vr.size() == 0U) {
+      return;
+    }
+    const int blocks_nodes = (n_nodes + 255) / 256;
+    csr_restore_unmasked_node_velocity_kernel<<<blocks_nodes, 256>>>(
+        state.v_r.data(),
+        state.v_z.data(),
+        d_velocity_bound_vr.data(),
+        d_velocity_bound_vz.data(),
+        overrides.active_node_velocity_mask,
+        n_nodes);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(core::debug_kernel_sync());
+  };
   pole_angular_derefine::ensure_built(state, cfg);
   const bool polar_shell_derefine_active =
       pole_angular_derefine::active(state);
@@ -15056,6 +17279,7 @@ AleRemap2DRZResult conservative_remap_csr(
   if (!evaluate_csr_swept_face_audit(
           state, mb, cfg.numerics.ale.dgcl_commit_gate,
           cfg.numerics.ale.dgcl_commit_rtol)) {
+    restore_out_of_mask_velocities();
     return result;
   }
   mesh_trace::trace_cell0_geometry(state, cfg, "csr_remap_pre");
@@ -15086,24 +17310,37 @@ AleRemap2DRZResult conservative_remap_csr(
   const int blocks_nodes = (n_nodes + 255) / 256;
   const int n_internal_faces = static_cast<int>(mb.unique_internal_faces.size());
   const int n_boundary_faces = static_cast<int>(mb.boundary_faces.size());
+  const int n_edges = n_internal_faces + n_boundary_faces;
+  const std::size_t cell_edge_incidence_count =
+      2U * static_cast<std::size_t>(n_internal_faces) +
+      static_cast<std::size_t>(n_boundary_faces);
+  TENRYU_ASSERT(state.mesh.multiblock_cell_edge_csr_offsets.size() ==
+                    static_cast<std::size_t>(n_cells) + 1U,
+                "CSR remap requires cell-edge CSR offsets");
+  TENRYU_ASSERT(state.mesh.multiblock_cell_edge_csr_edges.size() ==
+                        cell_edge_incidence_count &&
+                    state.mesh.multiblock_cell_edge_csr_side.size() ==
+                        cell_edge_incidence_count,
+                "CSR remap requires cell-edge CSR entries");
   const int blocks_internal = (n_internal_faces + 255) / 256;
   const int blocks_boundary = (n_boundary_faces + 255) / 256;
   const auto& mat = cfg.materials.materials.front();
   const double gamma = mat.ideal_gas_gamma;
   const double A = mat.A > 0.0 ? mat.A : 1.0;
+  const P3OracleConfig& p3_oracle = p3_oracle_config();
   const bool second_order_remap =
       cfg.numerics.ale.conservative_remap_order == "second_order_van_leer";
+  static const bool no_face_clip = [] {
+    const char* raw = std::getenv("TENRYU_I1B_REMAP_NO_FACE_CLIP");
+    return raw != nullptr && raw[0] != '\0' && raw[0] != '0';
+  }();
   const bool cap_energy_audit = tenryu::hydro::cap_energy_audit_enabled();
   const bool i1b_spurious_sensor =
       tenryu::hydro::i1b_spurious_sensor_enabled();
   const bool collect_replay_diagnostics = overrides.collect_replay_diagnostics;
   const bool ke_projection_audit = cap_energy_audit || i1b_spurious_sensor;
-  const bool csr_swept_volume_sign_fixed =
-      cfg.numerics.ale.swept_volume_sign_fixed || total_energy_remap ||
-      optionb_velocity_authority;
   core::DeviceArray<std::uint8_t> d_combined_inactive_cell_mask("ale_remap:conservative_remap_csr:d_combined_inactive_cell_mask");
   core::DeviceArray<std::uint8_t> d_replay_inactive_cell_mask("ale_remap:conservative_remap_csr:d_replay_inactive_cell_mask");
-  core::DeviceArray<std::uint8_t> d_optionb_inactive_cell_mask("ale_remap:conservative_remap_csr:d_optionb_inactive_cell_mask");
   core::DeviceArray<std::uint8_t> d_energy_closure_inactive_cell_mask("ale_remap:conservative_remap_csr:d_energy_closure_inactive_cell_mask");
   const std::uint8_t* d_base_inactive_cell_mask =
       pole_angular_derefine::combined_inactive_mask_device(
@@ -15121,19 +17358,6 @@ AleRemap2DRZResult conservative_remap_csr(
     CUDA_CHECK(cudaGetLastError());
     d_inactive_cell_mask = d_replay_inactive_cell_mask.data();
   }
-  const std::uint8_t* d_optionb_transport_inactive_cell_mask =
-      d_inactive_cell_mask;
-  if (optionb_allowed && overrides.corner_transport_cell_mask != nullptr) {
-    d_optionb_inactive_cell_mask.reset(static_cast<std::size_t>(n_cells));
-    csr_combine_inactive_with_active_mask_kernel<<<blocks_cells, 256>>>(
-        d_optionb_inactive_cell_mask.data(),
-        d_base_inactive_cell_mask,
-        overrides.corner_transport_cell_mask,
-        n_cells);
-    CUDA_CHECK(cudaGetLastError());
-    d_optionb_transport_inactive_cell_mask =
-        d_optionb_inactive_cell_mask.data();
-  }
   const bool support_closed_energy_closure =
       optionb_allowed && overrides.energy_closure_cell_mask != nullptr;
   const std::uint8_t* d_energy_inactive_cell_mask = d_inactive_cell_mask;
@@ -15148,18 +17372,6 @@ AleRemap2DRZResult conservative_remap_csr(
     CUDA_CHECK(cudaGetLastError());
     d_energy_inactive_cell_mask =
         d_energy_closure_inactive_cell_mask.data();
-  }
-  const std::uint8_t* velocity_projection_frozen_node_mask =
-      cfg.numerics.ale.core_freeze_enabled &&
-              cfg.numerics.ale.core_freeze_skip_velocity_projection
-          ? core_freeze_frozen_node_mask
-          : nullptr;
-  if (overrides.velocity_projection_frozen_node_mask != nullptr) {
-    TENRYU_ASSERT(velocity_projection_frozen_node_mask == nullptr,
-                  "override velocity freeze mask is mutually exclusive with "
-                  "the core_freeze velocity mask (v1)");
-    velocity_projection_frozen_node_mask =
-        overrides.velocity_projection_frozen_node_mask;
   }
   static bool near_vacuum_forensics_emitted = false;
   const bool near_vacuum_forensics =
@@ -15183,8 +17395,6 @@ AleRemap2DRZResult conservative_remap_csr(
 
   double* d_vr_cell = nullptr;
   double* d_vz_cell = nullptr;
-  double* d_vr_lagrangian_carry = nullptr;
-  double* d_vz_lagrangian_carry = nullptr;
   double* d_vr_new = nullptr;
   double* d_vz_new = nullptr;
   double* d_mass_new = nullptr;
@@ -15225,6 +17435,8 @@ AleRemap2DRZResult conservative_remap_csr(
   double* d_rad_old = nullptr;
   double* d_rho_grad_r = nullptr;
   double* d_rho_grad_z = nullptr;
+  double* d_old_centroid_r = nullptr;
+  double* d_old_centroid_z = nullptr;
   double* d_ke_density_lag = nullptr;
   double* d_ke_ext_new = nullptr;
   double* d_ke_grad_r = nullptr;
@@ -15243,19 +17455,22 @@ AleRemap2DRZResult conservative_remap_csr(
 
   const std::size_t cell_bytes =
       static_cast<std::size_t>(n_cells) * sizeof(double);
-  const std::size_t node_bytes =
-      static_cast<std::size_t>(n_nodes) * sizeof(double);
   const std::size_t corner_bytes =
       static_cast<std::size_t>(state.corner_stride) * cell_bytes;
   const std::size_t burn_species_bytes =
       static_cast<std::size_t>(n_cells) * tenryu::burn::kNumSpecies *
       sizeof(double);
-  const bool preserve_lagrangian_velocity_carry =
-      cfg.numerics.ale.ale_preserve_lagrangian_velocity_carry &&
-      !optionb_velocity_authority;
-  const bool remap_compatible_corner_mass =
-      compatible::compatible_force_work_enabled(cfg) &&
-      mesh::mesh_topo_is_multiblock(cfg.mesh);
+  const bool remap_corner_mass = true;
+  const std::size_t expected_corner_mass_size =
+      static_cast<std::size_t>(n_cells) *
+      static_cast<std::size_t>(state.corner_stride);
+  if (!state.corner_mass_initialized ||
+      state.corner_mass.size() != expected_corner_mass_size) {
+    tenryu::hydro::ensure_hourglass_subzonal_masses_2d(state, cfg, true);
+  }
+  TENRYU_ASSERT(state.corner_mass_initialized &&
+                    state.corner_mass.size() == expected_corner_mass_size,
+                "CSR corner distribution requires initialized corner mass");
   const bool remap_hotspot_gas_tracer =
       cfg.numerics.diagnostics.hotspot_gas.enabled &&
       !state.gas_tracer_Y.empty() &&
@@ -15281,6 +17496,48 @@ AleRemap2DRZResult conservative_remap_csr(
   if (eta_contact_diag_enabled) {
     d_eta_contact_diag.reset(2U);
   }
+  const bool gcl_audit_active = gcl_audit_env_enabled();
+  double* d_gcl_internal_face_dV_to_cell_a = nullptr;
+  double* d_gcl_boundary_face_dV_to_cell = nullptr;
+  double* d_gcl_outward_swept_sum = nullptr;
+  double* d_gcl_swept_abs_sum = nullptr;
+  double* d_gcl_residual = nullptr;
+  double* d_gcl_scale = nullptr;
+  CsrGclAuditDeviceView gcl_audit_device;
+  if (gcl_audit_active) {
+    if (n_internal_faces > 0) {
+      const std::size_t bytes =
+          static_cast<std::size_t>(n_internal_faces) * sizeof(double);
+      d_gcl_internal_face_dV_to_cell_a = static_cast<double*>(
+          core::device_scratch_acquire(
+              "ale_remap:csr:d_gcl_internal_face_dV_to_cell_a", bytes));
+      CUDA_CHECK(cudaMemset(d_gcl_internal_face_dV_to_cell_a, 0, bytes));
+    }
+    if (n_boundary_faces > 0) {
+      const std::size_t bytes =
+          static_cast<std::size_t>(n_boundary_faces) * sizeof(double);
+      d_gcl_boundary_face_dV_to_cell = static_cast<double*>(
+          core::device_scratch_acquire(
+              "ale_remap:csr:d_gcl_boundary_face_dV_to_cell", bytes));
+      CUDA_CHECK(cudaMemset(d_gcl_boundary_face_dV_to_cell, 0, bytes));
+    }
+    d_gcl_outward_swept_sum = static_cast<double*>(
+        core::device_scratch_acquire(
+            "ale_remap:csr:d_gcl_outward_swept_sum", cell_bytes));
+    d_gcl_swept_abs_sum = static_cast<double*>(
+        core::device_scratch_acquire(
+            "ale_remap:csr:d_gcl_swept_abs_sum", cell_bytes));
+    d_gcl_residual = static_cast<double*>(core::device_scratch_acquire(
+        "ale_remap:csr:d_gcl_residual", cell_bytes));
+    d_gcl_scale = static_cast<double*>(core::device_scratch_acquire(
+        "ale_remap:csr:d_gcl_scale", cell_bytes));
+    CUDA_CHECK(cudaMemset(d_gcl_outward_swept_sum, 0, cell_bytes));
+    CUDA_CHECK(cudaMemset(d_gcl_swept_abs_sum, 0, cell_bytes));
+    gcl_audit_device.internal_face_dV_to_cell_a =
+        d_gcl_internal_face_dV_to_cell_a;
+    gcl_audit_device.boundary_face_dV_to_cell =
+        d_gcl_boundary_face_dV_to_cell;
+  }
   core::DeviceArray<double> d_central_macro_remap_audit("ale_remap:conservative_remap_csr:d_central_macro_remap_audit");
   double* d_central_macro_remap_audit_ptr = nullptr;
   if (central_macro_remap_mask_active) {
@@ -15294,22 +17551,6 @@ AleRemap2DRZResult conservative_remap_csr(
       core::device_scratch_acquire("ale_remap:csr:d_vr_cell", cell_bytes));
   d_vz_cell = static_cast<double*>(
       core::device_scratch_acquire("ale_remap:csr:d_vz_cell", cell_bytes));
-  if (preserve_lagrangian_velocity_carry) {
-    d_vr_lagrangian_carry = static_cast<double*>(
-        core::device_scratch_acquire("ale_remap:csr:d_vr_lagrangian_carry",
-                                     node_bytes));
-    d_vz_lagrangian_carry = static_cast<double*>(
-        core::device_scratch_acquire("ale_remap:csr:d_vz_lagrangian_carry",
-                                     node_bytes));
-    CUDA_CHECK(cudaMemcpy(d_vr_lagrangian_carry,
-                          state.v_r.data(),
-                          node_bytes,
-                          cudaMemcpyDeviceToDevice));
-    CUDA_CHECK(cudaMemcpy(d_vz_lagrangian_carry,
-                          state.v_z.data(),
-                          node_bytes,
-                          cudaMemcpyDeviceToDevice));
-  }
   d_vr_new = static_cast<double*>(
       core::device_scratch_acquire("ale_remap:csr:d_vr_new", cell_bytes));
   d_vz_new = static_cast<double*>(
@@ -15320,14 +17561,12 @@ AleRemap2DRZResult conservative_remap_csr(
       core::device_scratch_acquire("ale_remap:csr:d_mom_r_new", cell_bytes));
   d_mom_z_new = static_cast<double*>(
       core::device_scratch_acquire("ale_remap:csr:d_mom_z_new", cell_bytes));
-  if (csr_swept_volume_sign_fixed) {
-    d_outgoing_mass_flux = static_cast<double*>(
-        core::device_scratch_acquire("ale_remap:csr:d_outgoing_mass_flux",
-                                     cell_bytes));
-    d_mass_flux_scale = static_cast<double*>(
-        core::device_scratch_acquire("ale_remap:csr:d_mass_flux_scale",
-                                     cell_bytes));
-  }
+  d_outgoing_mass_flux = static_cast<double*>(
+      core::device_scratch_acquire("ale_remap:csr:d_outgoing_mass_flux",
+                                   cell_bytes));
+  d_mass_flux_scale = static_cast<double*>(
+      core::device_scratch_acquire("ale_remap:csr:d_mass_flux_scale",
+                                   cell_bytes));
   d_energy_e_new = static_cast<double*>(
       core::device_scratch_acquire("ale_remap:csr:d_energy_e_new", cell_bytes));
   d_energy_i_new = static_cast<double*>(
@@ -15450,13 +17689,7 @@ AleRemap2DRZResult conservative_remap_csr(
                         mb.cell_orientation_sign.data(),
                         static_cast<std::size_t>(n_cells) * sizeof(int),
                         cudaMemcpyHostToDevice));
-  if (remap_compatible_corner_mass) {
-    const std::size_t expected_corner_mass_size =
-        static_cast<std::size_t>(n_cells) *
-        static_cast<std::size_t>(state.corner_stride);
-    TENRYU_ASSERT(state.corner_mass_initialized &&
-                      state.corner_mass.size() == expected_corner_mass_size,
-                  "CSR compatible subzonal remap requires initialized corner_mass");
+  if (remap_corner_mass) {
     d_corner_fraction_lag = static_cast<double*>(
         core::device_scratch_acquire("ale_remap:csr:d_corner_fraction_lag",
                                      corner_bytes));
@@ -15487,6 +17720,10 @@ AleRemap2DRZResult conservative_remap_csr(
         core::device_scratch_acquire("ale_remap:csr:d_rho_grad_r", cell_bytes));
     d_rho_grad_z = static_cast<double*>(
         core::device_scratch_acquire("ale_remap:csr:d_rho_grad_z", cell_bytes));
+    d_old_centroid_r = static_cast<double*>(core::device_scratch_acquire(
+        "ale_remap:csr:d_old_centroid_r", cell_bytes));
+    d_old_centroid_z = static_cast<double*>(core::device_scratch_acquire(
+        "ale_remap:csr:d_old_centroid_z", cell_bytes));
     d_face_adj_offsets = static_cast<int*>(
         core::device_scratch_acquire("ale_remap:csr:d_face_adj_offsets",
                                      mb.face_adj_csr_offsets.size() * sizeof(int)));
@@ -15517,6 +17754,117 @@ AleRemap2DRZResult conservative_remap_csr(
       thrust::raw_pointer_cast(mb.d_boundary_face_cell.data());
   const int* d_boundary_local =
       thrust::raw_pointer_cast(mb.d_boundary_face_local.data());
+  const int* d_cell_edge_offsets =
+      state.mesh.multiblock_cell_edge_csr_offsets.data();
+  const int* d_cell_edge_edges =
+      state.mesh.multiblock_cell_edge_csr_edges.data();
+  const std::int8_t* d_cell_edge_side =
+      state.mesh.multiblock_cell_edge_csr_side.data();
+
+  const std::size_t n_face_sides =
+      2U * static_cast<std::size_t>(n_edges);
+  std::size_t hydro_stage_quantity_count = 5U;
+  if (remap_corner_mass) {
+    hydro_stage_quantity_count += static_cast<std::size_t>(state.corner_stride);
+  }
+  if (remap_hotspot_gas_tracer) {
+    hydro_stage_quantity_count += 1U;
+  }
+  if (remap_burn_species) {
+    hydro_stage_quantity_count +=
+        static_cast<std::size_t>(tenryu::burn::kNumSpecies);
+  }
+  if (remap_hot_e_eps) {
+    hydro_stage_quantity_count += 1U;
+  }
+  if (remap_burn_eps) {
+    hydro_stage_quantity_count += 1U;
+  }
+  core::DeviceArray<double> d_hydro_flux_stage(
+      "ale_remap:conservative_remap_csr:d_hydro_flux_stage");
+  d_hydro_flux_stage.reset(hydro_stage_quantity_count * n_face_sides);
+  core::DeviceArray<double> d_outgoing_mass_flux_stage(
+      "ale_remap:conservative_remap_csr:d_outgoing_mass_flux_stage");
+  d_outgoing_mass_flux_stage.reset(n_face_sides);
+  core::DeviceArray<double> d_scalar_ext_flux_stage(
+      "ale_remap:conservative_remap_csr:d_scalar_ext_flux_stage");
+  d_scalar_ext_flux_stage.reset(n_face_sides);
+
+  CsrHydroFluxStageDeviceView hydro_flux_stage;
+  hydro_flux_stage.n_face_sides = n_face_sides;
+  hydro_flux_stage.corner_stride = state.corner_stride;
+  std::size_t hydro_stage_offset = 0U;
+  const auto take_hydro_stage = [&](const std::size_t quantity_count) {
+    double* const result = n_face_sides > 0U
+                               ? d_hydro_flux_stage.data() +
+                                     hydro_stage_offset * n_face_sides
+                               : nullptr;
+    hydro_stage_offset += quantity_count;
+    return result;
+  };
+  hydro_flux_stage.mass = take_hydro_stage(1U);
+  hydro_flux_stage.mom_r = take_hydro_stage(1U);
+  hydro_flux_stage.mom_z = take_hydro_stage(1U);
+  if (total_energy_remap) {
+    hydro_flux_stage.total_energy = take_hydro_stage(1U);
+    hydro_flux_stage.ye_mass = take_hydro_stage(1U);
+  } else {
+    hydro_flux_stage.energy_e = take_hydro_stage(1U);
+    hydro_flux_stage.energy_i = take_hydro_stage(1U);
+  }
+  if (remap_corner_mass) {
+    hydro_flux_stage.corner_fraction_mass =
+        take_hydro_stage(static_cast<std::size_t>(state.corner_stride));
+  }
+  if (remap_hotspot_gas_tracer) {
+    hydro_flux_stage.gas_tracer_mass = take_hydro_stage(1U);
+  }
+  if (remap_burn_species) {
+    hydro_flux_stage.burn_species_mass = take_hydro_stage(
+        static_cast<std::size_t>(tenryu::burn::kNumSpecies));
+  }
+  if (remap_hot_e_eps) {
+    hydro_flux_stage.hot_e_eps_mass = take_hydro_stage(1U);
+  }
+  if (remap_burn_eps) {
+    hydro_flux_stage.burn_eps_mass = take_hydro_stage(1U);
+  }
+  TENRYU_ASSERT(hydro_stage_offset == hydro_stage_quantity_count,
+                "CSR hydro flux stage layout mismatch");
+
+  CsrHydroFluxAccumulatorDeviceView hydro_flux_accumulator;
+  hydro_flux_accumulator.mass = d_mass_new;
+  hydro_flux_accumulator.mom_r = d_mom_r_new;
+  hydro_flux_accumulator.mom_z = d_mom_z_new;
+  if (total_energy_remap) {
+    hydro_flux_accumulator.total_energy = d_total_energy_new;
+    hydro_flux_accumulator.ye_mass = d_ye_int_new;
+  } else {
+    hydro_flux_accumulator.energy_e = d_energy_e_new;
+    hydro_flux_accumulator.energy_i = d_energy_i_new;
+  }
+  hydro_flux_accumulator.corner_fraction_mass =
+      d_corner_fraction_mass_new;
+  hydro_flux_accumulator.gas_tracer_mass = d_gas_tracer_mass_new;
+  hydro_flux_accumulator.burn_species_mass = d_burn_species_mass_new;
+  hydro_flux_accumulator.hot_e_eps_mass = d_hot_e_eps_mass_new;
+  hydro_flux_accumulator.burn_eps_mass = d_burn_eps_mass_new;
+
+  if (second_order_remap) {
+    csr_compute_old_rz_volume_centroids_kernel<<<blocks_cells, 256>>>(
+        d_old_centroid_r,
+        d_old_centroid_z,
+        state.x_r.data(),
+        state.x_z.data(),
+        d_cell_node_offsets,
+        d_cell_node_indices,
+        d_cell_orientation_sign,
+        d_cell_nverts,
+        d_inactive_cell_mask,
+        n_cells,
+        remap_dispatch_audit);
+    CUDA_CHECK(cudaGetLastError());
+  }
 
   csr_compute_cell_velocity_from_nodes_kernel<<<blocks_cells, 256>>>(
       d_vr_cell,
@@ -15573,6 +17921,93 @@ AleRemap2DRZResult conservative_remap_csr(
       ter_frozen_ke_basis_env_enabled() &&
       state.corner_mass_initialized &&
       state.corner_mass.size() == static_cast<std::size_t>(n_cells) * 4U;
+  std::vector<double> old_node_r;
+  std::vector<double> old_node_z;
+  std::vector<double> old_node_vr;
+  std::vector<double> old_node_vz;
+  state.x_r.copy_to_host(old_node_r);
+  state.x_z.copy_to_host(old_node_z);
+  state.v_r.copy_to_host(old_node_vr);
+  state.v_z.copy_to_host(old_node_vz);
+  const auto active_nverts = [&](const int cell) {
+    return state.mesh.cell_nverts.empty()
+               ? 4
+               : mesh::mesh_topo_cell_active_nverts(
+                     state.mesh.cell_nverts, cell);
+  };
+  // Seed the swept remap with the same AW corner quadrature used by the
+  // target-side distribution, evaluated on the source geometry.
+  const auto synchronize_source_momentum_aw = [&]() {
+    std::vector<double> source_cell_mass;
+    std::vector<double> source_cell_momentum_r;
+    std::vector<double> source_cell_momentum_z;
+    copy_device_pointer_to_host(d_mass_new, n_cells, source_cell_mass);
+    copy_device_pointer_to_host(
+        d_mom_r_new, n_cells, source_cell_momentum_r);
+    copy_device_pointer_to_host(
+        d_mom_z_new, n_cells, source_cell_momentum_z);
+    for (int c = 0; c < n_cells; ++c) {
+      const double cell_mass =
+          source_cell_mass[static_cast<std::size_t>(c)];
+      const int begin =
+          mb.cell_node_csr_offsets[static_cast<std::size_t>(c)];
+      const int nverts = active_nverts(c);
+      double source_r[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {};
+      double source_z[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {};
+      for (int k = 0; k < nverts; ++k) {
+        const int node = mb.cell_node_csr_indices[
+            static_cast<std::size_t>(begin + k)];
+        source_r[k] = old_node_r[static_cast<std::size_t>(node)];
+        source_z[k] = old_node_z[static_cast<std::size_t>(node)];
+      }
+      const double source_volume_per_radian =
+          std::abs(rz::rz_polygon_volume_exact(
+                       source_r, source_z, nverts)) /
+          kAwTwoPi;
+      if (!(cell_mass > 0.0) || !std::isfinite(cell_mass) ||
+          !(source_volume_per_radian > 0.0) ||
+          !std::isfinite(source_volume_per_radian)) {
+        continue;
+      }
+
+      double corner_area[
+          mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {};
+      csr_aw_barlow_corner_area_partition(
+          source_r, source_z, nverts, corner_area);
+      double first_moment_area = 0.0;
+      for (int k = 0; k < nverts; ++k) {
+        first_moment_area += source_r[k] * corner_area[k];
+      }
+      TENRYU_ASSERT(
+          std::abs(first_moment_area - source_volume_per_radian) <=
+              1.0e-12 * source_volume_per_radian,
+          "AW source Barlow first-moment identity failed");
+
+      const double cell_density = cell_mass / source_volume_per_radian;
+      double momentum_r = 0.0;
+      double momentum_z = 0.0;
+      for (int k = 0; k < nverts; ++k) {
+        const int node = mb.cell_node_csr_indices[
+            static_cast<std::size_t>(begin + k)];
+        const double corner_inertia = cell_density * corner_area[k];
+        const double paired_mass = source_r[k] * corner_inertia;
+        momentum_r +=
+            paired_mass * old_node_vr[static_cast<std::size_t>(node)];
+        momentum_z +=
+            paired_mass * old_node_vz[static_cast<std::size_t>(node)];
+      }
+      source_cell_momentum_r[static_cast<std::size_t>(c)] = momentum_r;
+      source_cell_momentum_z[static_cast<std::size_t>(c)] = momentum_z;
+    }
+    CUDA_CHECK(cudaMemcpy(d_mom_r_new,
+                          source_cell_momentum_r.data(),
+                          cell_bytes,
+                          cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_mom_z_new,
+                          source_cell_momentum_z.data(),
+                          cell_bytes,
+                          cudaMemcpyHostToDevice));
+  };
   if (total_energy_remap) {
     if (optionb_energy_coupling) {
       csr_build_total_energy_remap_state_optionb_kernel<<<blocks_cells, 256>>>(
@@ -15653,6 +18088,7 @@ AleRemap2DRZResult conservative_remap_csr(
         state.vol.data(),
         n_cells);
     CUDA_CHECK(cudaGetLastError());
+    synchronize_source_momentum_aw();
     csr_remap_energy_audit_capture_pre(remap_energy_audit,
                                        state,
                                        d_total_energy_new,
@@ -15682,9 +18118,10 @@ AleRemap2DRZResult conservative_remap_csr(
         state.vol.data(),
         n_cells);
     CUDA_CHECK(cudaGetLastError());
+    synchronize_source_momentum_aw();
   }
 
-  if (remap_compatible_corner_mass) {
+  if (remap_corner_mass) {
     csr_initialize_corner_fraction_remap_kernel<<<blocks_cells, 256>>>(
         d_corner_fraction_lag,
         d_corner_fraction_mass_new,
@@ -15743,58 +18180,34 @@ AleRemap2DRZResult conservative_remap_csr(
         d_rho_grad_r,
         d_rho_grad_z,
         state.rho.data(),
-        state.x_r.data(),
-        state.x_z.data(),
+        d_old_centroid_r,
+        d_old_centroid_z,
         d_face_adj_offsets,
         d_face_adj_indices,
-        d_cell_node_offsets,
-        d_cell_node_indices,
         d_cell_nverts,
         d_inactive_cell_mask,
-        n_cells);
+        overrides.donor_fallback_cell_mask,
+        n_cells,
+        remap_dispatch_audit);
     CUDA_CHECK(cudaGetLastError());
-    csr_apply_barth_jespersen_limiter_inactive_masked_kernel<<<blocks_cells, 256>>>(
-        d_rho_grad_r,
-        d_rho_grad_z,
-        state.rho.data(),
-        state.x_r.data(),
-        state.x_z.data(),
-        d_face_adj_offsets,
-        d_face_adj_indices,
-        d_cell_node_offsets,
-        d_cell_node_indices,
-        d_cell_nverts,
-        d_inactive_cell_mask,
-        n_cells);
-    CUDA_CHECK(cudaGetLastError());
+    // The cell-node-point BJ clip limits exact affine slopes on one-sided
+    // axis-adjacent stencils (alpha = 0.684 on affine data). The per-face clip
+    // at the swept-region centroid in csr_moments_direct_field_integral
+    // enforces boundedness with Kucharik-style linearity preservation.
     if (ke_projection_audit) {
       csr_compute_lsq_gradients_inactive_masked_kernel<<<blocks_cells, 256>>>(
           d_ke_grad_r,
           d_ke_grad_z,
           d_ke_density_lag,
-          state.x_r.data(),
-          state.x_z.data(),
+          d_old_centroid_r,
+          d_old_centroid_z,
           d_face_adj_offsets,
           d_face_adj_indices,
-          d_cell_node_offsets,
-          d_cell_node_indices,
           d_cell_nverts,
           d_inactive_cell_mask,
-          n_cells);
-      CUDA_CHECK(cudaGetLastError());
-      csr_apply_barth_jespersen_limiter_inactive_masked_kernel<<<blocks_cells, 256>>>(
-          d_ke_grad_r,
-          d_ke_grad_z,
-          d_ke_density_lag,
-          state.x_r.data(),
-          state.x_z.data(),
-          d_face_adj_offsets,
-          d_face_adj_indices,
-          d_cell_node_offsets,
-          d_cell_node_indices,
-          d_cell_nverts,
-          d_inactive_cell_mask,
-          n_cells);
+          overrides.donor_fallback_cell_mask,
+          n_cells,
+          remap_dispatch_audit);
       CUDA_CHECK(cudaGetLastError());
     }
     if (remap_hotspot_gas_tracer) {
@@ -15802,33 +18215,19 @@ AleRemap2DRZResult conservative_remap_csr(
           d_gas_tracer_grad_r,
           d_gas_tracer_grad_z,
           state.gas_tracer_Y.data(),
-          state.x_r.data(),
-          state.x_z.data(),
+          d_old_centroid_r,
+          d_old_centroid_z,
           d_face_adj_offsets,
           d_face_adj_indices,
-          d_cell_node_offsets,
-          d_cell_node_indices,
           d_cell_nverts,
           d_inactive_cell_mask,
-          n_cells);
-      CUDA_CHECK(cudaGetLastError());
-      csr_apply_barth_jespersen_limiter_inactive_masked_kernel<<<blocks_cells, 256>>>(
-          d_gas_tracer_grad_r,
-          d_gas_tracer_grad_z,
-          state.gas_tracer_Y.data(),
-          state.x_r.data(),
-          state.x_z.data(),
-          d_face_adj_offsets,
-          d_face_adj_indices,
-          d_cell_node_offsets,
-          d_cell_node_indices,
-          d_cell_nverts,
-          d_inactive_cell_mask,
-          n_cells);
+          overrides.donor_fallback_cell_mask,
+          n_cells,
+          remap_dispatch_audit);
       CUDA_CHECK(cudaGetLastError());
     }
   }
-  if (remap_compatible_corner_mass && second_order_remap) {
+  if (remap_corner_mass && second_order_remap) {
     for (int k = 0; k < state.corner_stride; ++k) {
       double* const fraction = d_corner_fraction_lag + k * n_cells;
       double* const grad_r = d_corner_fraction_grad_r + k * n_cells;
@@ -15837,91 +18236,103 @@ AleRemap2DRZResult conservative_remap_csr(
           grad_r,
           grad_z,
           fraction,
-          state.x_r.data(),
-          state.x_z.data(),
+          d_old_centroid_r,
+          d_old_centroid_z,
           d_face_adj_offsets,
           d_face_adj_indices,
-          d_cell_node_offsets,
-          d_cell_node_indices,
           d_cell_nverts,
           d_inactive_cell_mask,
-          n_cells);
-      CUDA_CHECK(cudaGetLastError());
-      csr_apply_barth_jespersen_limiter_inactive_masked_kernel<<<blocks_cells, 256>>>(
-          grad_r,
-          grad_z,
-          fraction,
-          state.x_r.data(),
-          state.x_z.data(),
-          d_face_adj_offsets,
-          d_face_adj_indices,
-          d_cell_node_offsets,
-          d_cell_node_indices,
-          d_cell_nverts,
-          d_inactive_cell_mask,
-          n_cells);
+          overrides.donor_fallback_cell_mask,
+          n_cells,
+          remap_dispatch_audit);
       CUDA_CHECK(cudaGetLastError());
     }
   }
 
-  if (csr_swept_volume_sign_fixed) {
-    memset_zero(d_outgoing_mass_flux, n_cells);
-    if (n_internal_faces > 0) {
-      csr_accumulate_internal_hydro_outgoing_mass_kernel<<<blocks_internal, 256>>>(
-          d_outgoing_mass_flux,
-          second_order_remap,
-          state.rho.data(),
-          second_order_remap ? d_rho_grad_r : nullptr,
-          second_order_remap ? d_rho_grad_z : nullptr,
-          state.x_r.data(),
-          state.x_z.data(),
-          state.x_r_reference.data(),
-          state.x_z_reference.data(),
-          d_cell_node_offsets,
-          d_cell_node_indices,
-          d_unique_cell_a,
-          d_unique_cell_b,
-          d_unique_local_a,
-          d_cell_orientation_sign,
-          d_cell_nverts,
-          d_inactive_cell_mask,
-          csr_swept_volume_sign_fixed,
-          n_internal_faces);
-      CUDA_CHECK(cudaGetLastError());
-    }
-    if (n_boundary_faces > 0) {
-      csr_accumulate_boundary_hydro_outgoing_mass_kernel<<<blocks_boundary, 256>>>(
-          d_outgoing_mass_flux,
-          second_order_remap,
-          state.rho.data(),
-          second_order_remap ? d_rho_grad_r : nullptr,
-          second_order_remap ? d_rho_grad_z : nullptr,
-          state.x_r.data(),
-          state.x_z.data(),
-          state.x_r_reference.data(),
-          state.x_z_reference.data(),
-          d_cell_node_offsets,
-          d_cell_node_indices,
-          d_boundary_cell,
-          d_boundary_local,
-          d_cell_orientation_sign,
-          d_cell_nverts,
-          d_inactive_cell_mask,
-          n_boundary_faces);
-      CUDA_CHECK(cudaGetLastError());
-    }
-    csr_compute_hydro_mass_flux_scale_kernel<<<blocks_cells, 256>>>(
-        d_mass_flux_scale,
-        d_outgoing_mass_flux,
-        state.mass.data(),
+  memset_zero(d_outgoing_mass_flux, n_cells);
+  if (n_edges > 0) {
+    CUDA_CHECK(cudaMemset(d_outgoing_mass_flux_stage.data(),
+                          0,
+                          n_face_sides * sizeof(double)));
+  }
+  if (n_internal_faces > 0) {
+    csr_accumulate_internal_hydro_outgoing_mass_kernel<<<blocks_internal, 256>>>(
+        d_outgoing_mass_flux_stage.data(),
+        second_order_remap,
         state.rho.data(),
+        second_order_remap ? d_rho_grad_r : nullptr,
+        second_order_remap ? d_rho_grad_z : nullptr,
         state.vol.data(),
-        state.cell_vol_initial.data(),
+        d_old_centroid_r,
+        d_old_centroid_z,
+        state.x_r.data(),
+        state.x_z.data(),
+        state.x_r_reference.data(),
+        state.x_z_reference.data(),
+        d_face_adj_offsets,
+        d_face_adj_indices,
+        d_cell_node_offsets,
+        d_cell_node_indices,
+        d_unique_cell_a,
+        d_unique_cell_b,
+        d_unique_local_a,
+        d_cell_orientation_sign,
+        d_cell_nverts,
         d_inactive_cell_mask,
-        n_cells,
-        cfg.numerics.floors.rho);
+        n_internal_faces,
+        n_cells);
     CUDA_CHECK(cudaGetLastError());
   }
+  if (n_boundary_faces > 0) {
+    csr_accumulate_boundary_hydro_outgoing_mass_kernel<<<blocks_boundary, 256>>>(
+        d_outgoing_mass_flux_stage.data(),
+        second_order_remap,
+        state.rho.data(),
+        second_order_remap ? d_rho_grad_r : nullptr,
+        second_order_remap ? d_rho_grad_z : nullptr,
+        state.vol.data(),
+        d_old_centroid_r,
+        d_old_centroid_z,
+        state.x_r.data(),
+        state.x_z.data(),
+        state.x_r_reference.data(),
+        state.x_z_reference.data(),
+        d_face_adj_offsets,
+        d_face_adj_indices,
+        d_cell_node_offsets,
+        d_cell_node_indices,
+        d_boundary_cell,
+        d_boundary_local,
+        d_cell_orientation_sign,
+        d_cell_nverts,
+        d_inactive_cell_mask,
+        n_internal_faces,
+        n_boundary_faces,
+        n_cells);
+    CUDA_CHECK(cudaGetLastError());
+  }
+  if (n_edges > 0) {
+    csr_gather_face_side_scalar_stage_kernel<<<blocks_cells, 256>>>(
+        d_outgoing_mass_flux,
+        d_outgoing_mass_flux_stage.data(),
+        d_cell_edge_offsets,
+        d_cell_edge_edges,
+        d_cell_edge_side,
+        n_cells);
+    CUDA_CHECK(cudaGetLastError());
+  }
+  csr_compute_hydro_mass_flux_scale_kernel<<<blocks_cells, 256>>>(
+      d_mass_flux_scale,
+      d_outgoing_mass_flux,
+      state.mass.data(),
+      state.rho.data(),
+      state.vol.data(),
+      state.cell_vol_initial.data(),
+      d_inactive_cell_mask,
+      n_cells,
+      cfg.numerics.floors.rho,
+      remap_dispatch_audit);
+  CUDA_CHECK(cudaGetLastError());
 
   if (eta_contact_diag_enabled) {
     csr_eta_contact_hotspot_volume_kernel<<<blocks_cells, 256>>>(
@@ -15934,6 +18345,7 @@ AleRemap2DRZResult conservative_remap_csr(
     if (n_internal_faces > 0) {
       csr_eta_contact_swept_volume_kernel<<<blocks_internal, 256>>>(
           d_eta_contact_diag.data(),
+          second_order_remap,
           state.gas_tracer_Y.data(),
           state.x_r.data(),
           state.x_z.data(),
@@ -15973,36 +18385,41 @@ AleRemap2DRZResult conservative_remap_csr(
   }
 
   csr_watch_dump("staged_post_init", d_mass_new);
-  if (n_internal_faces > 0) {
+  if (n_edges > 0) {
+    CUDA_CHECK(cudaMemset(d_hydro_flux_stage.data(),
+                          0,
+                          hydro_stage_quantity_count * n_face_sides *
+                              sizeof(double)));
+    if (ke_projection_audit) {
+      CUDA_CHECK(cudaMemset(d_scalar_ext_flux_stage.data(),
+                            0,
+                            n_face_sides * sizeof(double)));
+    }
+  }
+  const auto launch_internal_hydro_flux = [&](const auto gcl_audit_tag) {
+    constexpr bool kGclAudit = decltype(gcl_audit_tag)::value;
     if (second_order_remap) {
-      csr_apply_internal_hydro_flux_second_order_kernel<<<blocks_internal, 256>>>(
-          d_mass_new,
-          d_mom_r_new,
-          d_mom_z_new,
-          d_energy_e_new,
-          d_energy_i_new,
-          total_energy_remap ? d_total_energy_new : nullptr,
-          total_energy_remap ? d_ye_int_new : nullptr,
+      csr_apply_internal_hydro_flux_second_order_kernel<kGclAudit>
+          <<<blocks_internal, 256>>>(
+          hydro_flux_stage,
           state.rho.data(),
           d_rho_grad_r,
           d_rho_grad_z,
+          state.vol.data(),
+          d_old_centroid_r,
+          d_old_centroid_z,
           d_vr_cell,
           d_vz_cell,
           state.ee.data(),
           state.ei.data(),
           total_energy_remap ? d_total_energy_lag : nullptr,
           total_energy_remap ? d_ye_int_lag : nullptr,
-          remap_compatible_corner_mass ? d_corner_fraction_mass_new : nullptr,
-          remap_compatible_corner_mass ? d_corner_fraction_lag : nullptr,
-          remap_compatible_corner_mass ? d_corner_fraction_grad_r : nullptr,
-          remap_compatible_corner_mass ? d_corner_fraction_grad_z : nullptr,
-          remap_hotspot_gas_tracer ? d_gas_tracer_mass_new : nullptr,
+          remap_corner_mass ? d_corner_fraction_lag : nullptr,
+          remap_corner_mass ? d_corner_fraction_grad_r : nullptr,
+          remap_corner_mass ? d_corner_fraction_grad_z : nullptr,
           remap_hotspot_gas_tracer ? state.gas_tracer_Y.data() : nullptr,
-          remap_burn_species ? d_burn_species_mass_new : nullptr,
           remap_burn_species ? d_burn_species_Y_lag : nullptr,
-          remap_hot_e_eps ? d_hot_e_eps_mass_new : nullptr,
           remap_hot_e_eps ? d_hot_e_eps_lag : nullptr,
-          remap_burn_eps ? d_burn_eps_mass_new : nullptr,
           remap_burn_eps ? d_burn_eps_lag : nullptr,
           remap_hotspot_gas_tracer ? d_gas_tracer_grad_r : nullptr,
           remap_hotspot_gas_tracer ? d_gas_tracer_grad_z : nullptr,
@@ -16010,6 +18427,8 @@ AleRemap2DRZResult conservative_remap_csr(
           state.x_z.data(),
           state.x_r_reference.data(),
           state.x_z_reference.data(),
+          d_face_adj_offsets,
+          d_face_adj_indices,
           d_cell_node_offsets,
           d_cell_node_indices,
           d_unique_cell_a,
@@ -16020,18 +18439,16 @@ AleRemap2DRZResult conservative_remap_csr(
           d_mass_flux_scale,
           d_inactive_cell_mask,
           d_central_macro_remap_audit_ptr,
-          csr_swept_volume_sign_fixed,
           n_internal_faces,
-          n_cells);
+          n_cells,
+          no_face_clip,
+          remap_watch_cell,
+          remap_dispatch_audit,
+          gcl_audit_device);
     } else {
-      csr_apply_internal_hydro_flux_kernel<<<blocks_internal, 256>>>(
-          d_mass_new,
-          d_mom_r_new,
-          d_mom_z_new,
-          d_energy_e_new,
-          d_energy_i_new,
-          total_energy_remap ? d_total_energy_new : nullptr,
-          total_energy_remap ? d_ye_int_new : nullptr,
+      csr_apply_internal_hydro_flux_kernel<kGclAudit>
+          <<<blocks_internal, 256>>>(
+          hydro_flux_stage,
           state.rho.data(),
           d_vr_cell,
           d_vz_cell,
@@ -16039,15 +18456,10 @@ AleRemap2DRZResult conservative_remap_csr(
           state.ei.data(),
           total_energy_remap ? d_total_energy_lag : nullptr,
           total_energy_remap ? d_ye_int_lag : nullptr,
-          remap_compatible_corner_mass ? d_corner_fraction_mass_new : nullptr,
-          remap_compatible_corner_mass ? d_corner_fraction_lag : nullptr,
-          remap_hotspot_gas_tracer ? d_gas_tracer_mass_new : nullptr,
+          remap_corner_mass ? d_corner_fraction_lag : nullptr,
           remap_hotspot_gas_tracer ? state.gas_tracer_Y.data() : nullptr,
-          remap_burn_species ? d_burn_species_mass_new : nullptr,
           remap_burn_species ? d_burn_species_Y_lag : nullptr,
-          remap_hot_e_eps ? d_hot_e_eps_mass_new : nullptr,
           remap_hot_e_eps ? d_hot_e_eps_lag : nullptr,
-          remap_burn_eps ? d_burn_eps_mass_new : nullptr,
           remap_burn_eps ? d_burn_eps_lag : nullptr,
           state.x_r.data(),
           state.x_z.data(),
@@ -16063,18 +18475,29 @@ AleRemap2DRZResult conservative_remap_csr(
           d_mass_flux_scale,
           d_inactive_cell_mask,
           d_central_macro_remap_audit_ptr,
-          csr_swept_volume_sign_fixed,
           n_internal_faces,
-          n_cells);
+          n_cells,
+          remap_dispatch_audit,
+          gcl_audit_device);
+    }
+  };
+  if (n_internal_faces > 0) {
+    if (gcl_audit_active) {
+      launch_internal_hydro_flux(std::true_type{});
+    } else {
+      launch_internal_hydro_flux(std::false_type{});
     }
     CUDA_CHECK(cudaGetLastError());
     if (ke_projection_audit) {
       if (second_order_remap) {
         csr_apply_internal_volume_scalar_flux_second_order_kernel<<<blocks_internal, 256>>>(
-            d_ke_ext_new,
+            d_scalar_ext_flux_stage.data(),
             d_ke_density_lag,
             d_ke_grad_r,
             d_ke_grad_z,
+            state.vol.data(),
+            d_old_centroid_r,
+            d_old_centroid_z,
             state.x_r.data(),
             state.x_z.data(),
             state.x_r_reference.data(),
@@ -16085,14 +18508,18 @@ AleRemap2DRZResult conservative_remap_csr(
             d_unique_cell_b,
             d_unique_local_a,
             n_internal_faces,
+            n_cells,
+            d_face_adj_offsets,
+            d_face_adj_indices,
             d_cell_orientation_sign,
             d_cell_nverts,
+            d_mass_flux_scale,
             d_inactive_cell_mask,
             d_central_macro_remap_audit_ptr,
-            csr_swept_volume_sign_fixed);
+            remap_dispatch_audit);
       } else {
         csr_apply_internal_volume_scalar_flux_kernel<<<blocks_internal, 256>>>(
-            d_ke_ext_new,
+            d_scalar_ext_flux_stage.data(),
             d_ke_density_lag,
             state.x_r.data(),
             state.x_z.data(),
@@ -16108,42 +18535,35 @@ AleRemap2DRZResult conservative_remap_csr(
             d_cell_nverts,
             d_inactive_cell_mask,
             d_central_macro_remap_audit_ptr,
-            csr_swept_volume_sign_fixed);
+            remap_dispatch_audit);
       }
       CUDA_CHECK(cudaGetLastError());
     }
   }
-  csr_watch_dump("staged_post_internal_flux", d_mass_new);
-  if (n_boundary_faces > 0) {
+  const auto launch_boundary_hydro_flux = [&](const auto gcl_audit_tag) {
+    constexpr bool kGclAudit = decltype(gcl_audit_tag)::value;
     if (second_order_remap) {
-      csr_apply_boundary_hydro_flux_second_order_kernel<<<blocks_boundary, 256>>>(
-          d_mass_new,
-          d_mom_r_new,
-          d_mom_z_new,
-          d_energy_e_new,
-          d_energy_i_new,
-          total_energy_remap ? d_total_energy_new : nullptr,
-          total_energy_remap ? d_ye_int_new : nullptr,
+      csr_apply_boundary_hydro_flux_second_order_kernel<kGclAudit>
+          <<<blocks_boundary, 256>>>(
+          hydro_flux_stage,
           state.rho.data(),
           d_rho_grad_r,
           d_rho_grad_z,
+          state.vol.data(),
+          d_old_centroid_r,
+          d_old_centroid_z,
           d_vr_cell,
           d_vz_cell,
           state.ee.data(),
           state.ei.data(),
           total_energy_remap ? d_total_energy_lag : nullptr,
           total_energy_remap ? d_ye_int_lag : nullptr,
-          remap_compatible_corner_mass ? d_corner_fraction_mass_new : nullptr,
-          remap_compatible_corner_mass ? d_corner_fraction_lag : nullptr,
-          remap_compatible_corner_mass ? d_corner_fraction_grad_r : nullptr,
-          remap_compatible_corner_mass ? d_corner_fraction_grad_z : nullptr,
-          remap_hotspot_gas_tracer ? d_gas_tracer_mass_new : nullptr,
+          remap_corner_mass ? d_corner_fraction_lag : nullptr,
+          remap_corner_mass ? d_corner_fraction_grad_r : nullptr,
+          remap_corner_mass ? d_corner_fraction_grad_z : nullptr,
           remap_hotspot_gas_tracer ? state.gas_tracer_Y.data() : nullptr,
-          remap_burn_species ? d_burn_species_mass_new : nullptr,
           remap_burn_species ? d_burn_species_Y_lag : nullptr,
-          remap_hot_e_eps ? d_hot_e_eps_mass_new : nullptr,
           remap_hot_e_eps ? d_hot_e_eps_lag : nullptr,
-          remap_burn_eps ? d_burn_eps_mass_new : nullptr,
           remap_burn_eps ? d_burn_eps_lag : nullptr,
           remap_hotspot_gas_tracer ? d_gas_tracer_grad_r : nullptr,
           remap_hotspot_gas_tracer ? d_gas_tracer_grad_z : nullptr,
@@ -16151,6 +18571,8 @@ AleRemap2DRZResult conservative_remap_csr(
           state.x_z.data(),
           state.x_r_reference.data(),
           state.x_z_reference.data(),
+          d_face_adj_offsets,
+          d_face_adj_indices,
           d_cell_node_offsets,
           d_cell_node_indices,
           d_boundary_cell,
@@ -16160,17 +18582,17 @@ AleRemap2DRZResult conservative_remap_csr(
           d_mass_flux_scale,
           d_inactive_cell_mask,
           d_central_macro_remap_audit_ptr,
+          n_internal_faces,
           n_boundary_faces,
-          n_cells);
+          n_cells,
+          no_face_clip,
+          remap_watch_cell,
+          remap_dispatch_audit,
+          gcl_audit_device);
     } else {
-      csr_apply_boundary_hydro_flux_kernel<<<blocks_boundary, 256>>>(
-          d_mass_new,
-          d_mom_r_new,
-          d_mom_z_new,
-          d_energy_e_new,
-          d_energy_i_new,
-          total_energy_remap ? d_total_energy_new : nullptr,
-          total_energy_remap ? d_ye_int_new : nullptr,
+      csr_apply_boundary_hydro_flux_kernel<kGclAudit>
+          <<<blocks_boundary, 256>>>(
+          hydro_flux_stage,
           state.rho.data(),
           d_vr_cell,
           d_vz_cell,
@@ -16178,15 +18600,10 @@ AleRemap2DRZResult conservative_remap_csr(
           state.ei.data(),
           total_energy_remap ? d_total_energy_lag : nullptr,
           total_energy_remap ? d_ye_int_lag : nullptr,
-          remap_compatible_corner_mass ? d_corner_fraction_mass_new : nullptr,
-          remap_compatible_corner_mass ? d_corner_fraction_lag : nullptr,
-          remap_hotspot_gas_tracer ? d_gas_tracer_mass_new : nullptr,
+          remap_corner_mass ? d_corner_fraction_lag : nullptr,
           remap_hotspot_gas_tracer ? state.gas_tracer_Y.data() : nullptr,
-          remap_burn_species ? d_burn_species_mass_new : nullptr,
           remap_burn_species ? d_burn_species_Y_lag : nullptr,
-          remap_hot_e_eps ? d_hot_e_eps_mass_new : nullptr,
           remap_hot_e_eps ? d_hot_e_eps_lag : nullptr,
-          remap_burn_eps ? d_burn_eps_mass_new : nullptr,
           remap_burn_eps ? d_burn_eps_lag : nullptr,
           state.x_r.data(),
           state.x_z.data(),
@@ -16201,17 +18618,30 @@ AleRemap2DRZResult conservative_remap_csr(
           d_mass_flux_scale,
           d_inactive_cell_mask,
           d_central_macro_remap_audit_ptr,
+          n_internal_faces,
           n_boundary_faces,
-          n_cells);
+          n_cells,
+          remap_dispatch_audit,
+          gcl_audit_device);
+    }
+  };
+  if (n_boundary_faces > 0) {
+    if (gcl_audit_active) {
+      launch_boundary_hydro_flux(std::true_type{});
+    } else {
+      launch_boundary_hydro_flux(std::false_type{});
     }
     CUDA_CHECK(cudaGetLastError());
     if (ke_projection_audit) {
       if (second_order_remap) {
         csr_apply_boundary_volume_scalar_flux_second_order_kernel<<<blocks_boundary, 256>>>(
-            d_ke_ext_new,
+            d_scalar_ext_flux_stage.data(),
             d_ke_density_lag,
             d_ke_grad_r,
             d_ke_grad_z,
+            state.vol.data(),
+            d_old_centroid_r,
+            d_old_centroid_z,
             state.x_r.data(),
             state.x_z.data(),
             state.x_r_reference.data(),
@@ -16220,14 +18650,20 @@ AleRemap2DRZResult conservative_remap_csr(
             d_cell_node_indices,
             d_boundary_cell,
             d_boundary_local,
+            n_internal_faces,
             n_boundary_faces,
+            n_cells,
+            d_face_adj_offsets,
+            d_face_adj_indices,
             d_cell_orientation_sign,
             d_cell_nverts,
+            d_mass_flux_scale,
             d_inactive_cell_mask,
-            d_central_macro_remap_audit_ptr);
+            d_central_macro_remap_audit_ptr,
+            remap_dispatch_audit);
       } else {
         csr_apply_boundary_volume_scalar_flux_kernel<<<blocks_boundary, 256>>>(
-            d_ke_ext_new,
+            d_scalar_ext_flux_stage.data(),
             d_ke_density_lag,
             state.x_r.data(),
             state.x_z.data(),
@@ -16237,14 +18673,113 @@ AleRemap2DRZResult conservative_remap_csr(
             d_cell_node_indices,
             d_boundary_cell,
             d_boundary_local,
+            n_internal_faces,
             n_boundary_faces,
             d_cell_orientation_sign,
             d_cell_nverts,
             d_inactive_cell_mask,
-            d_central_macro_remap_audit_ptr);
+            d_central_macro_remap_audit_ptr,
+            remap_dispatch_audit);
       }
       CUDA_CHECK(cudaGetLastError());
     }
+  }
+  if (n_edges > 0) {
+    csr_gather_hydro_flux_stage_kernel<<<blocks_cells, 256>>>(
+        hydro_flux_accumulator,
+        hydro_flux_stage,
+        d_cell_edge_offsets,
+        d_cell_edge_edges,
+        d_cell_edge_side,
+        n_cells);
+    CUDA_CHECK(cudaGetLastError());
+    if (ke_projection_audit) {
+      csr_gather_face_side_scalar_stage_kernel<<<blocks_cells, 256>>>(
+          d_ke_ext_new,
+          d_scalar_ext_flux_stage.data(),
+          d_cell_edge_offsets,
+          d_cell_edge_edges,
+          d_cell_edge_side,
+          n_cells);
+      CUDA_CHECK(cudaGetLastError());
+    }
+  }
+  csr_watch_dump("staged_post_flux_gather", d_mass_new);
+  if (txn_vth_sub_diag) {
+    std::vector<double> current_node_r;
+    std::vector<double> current_node_z;
+    std::vector<double> post_sweep_cell_mass;
+    std::vector<double> post_sweep_cell_momentum_r;
+    std::vector<double> post_sweep_cell_momentum_z;
+    state.x_r.copy_to_host(current_node_r);
+    state.x_z.copy_to_host(current_node_z);
+    copy_device_pointer_to_host(
+        d_mass_new, n_cells, post_sweep_cell_mass);
+    copy_device_pointer_to_host(
+        d_mom_r_new, n_cells, post_sweep_cell_momentum_r);
+    copy_device_pointer_to_host(
+        d_mom_z_new, n_cells, post_sweep_cell_momentum_z);
+    txn_vth_sub_cell("post_sweep_zonal",
+                     current_node_r,
+                     current_node_z,
+                     post_sweep_cell_mass,
+                     post_sweep_cell_momentum_r,
+                     post_sweep_cell_momentum_z);
+  }
+
+  if (gcl_audit_active) {
+    if (n_internal_faces > 0) {
+      csr_gcl_audit_accumulate_internal_faces_kernel<<<blocks_internal, 256>>>(
+          d_gcl_outward_swept_sum,
+          d_gcl_swept_abs_sum,
+          d_gcl_internal_face_dV_to_cell_a,
+          d_unique_cell_a,
+          d_unique_cell_b,
+          n_internal_faces);
+      CUDA_CHECK(cudaGetLastError());
+    }
+    if (n_boundary_faces > 0) {
+      csr_gcl_audit_accumulate_boundary_faces_kernel<<<blocks_boundary, 256>>>(
+          d_gcl_outward_swept_sum,
+          d_gcl_swept_abs_sum,
+          d_gcl_boundary_face_dV_to_cell,
+          d_boundary_cell,
+          n_boundary_faces);
+      CUDA_CHECK(cudaGetLastError());
+    }
+    csr_gcl_audit_finalize_cells_kernel<<<blocks_cells, 256>>>(
+        d_gcl_residual,
+        d_gcl_scale,
+        d_gcl_outward_swept_sum,
+        d_gcl_swept_abs_sum,
+        state.x_r.data(),
+        state.x_z.data(),
+        state.x_r_reference.data(),
+        state.x_z_reference.data(),
+        d_cell_node_offsets,
+        d_cell_node_indices,
+        d_cell_orientation_sign,
+        d_cell_nverts,
+        d_inactive_cell_mask,
+        n_cells);
+    CUDA_CHECK(cudaGetLastError());
+    std::vector<double> gcl_residual;
+    std::vector<double> gcl_scale;
+    std::vector<std::uint8_t> gcl_inactive_cell_mask;
+    copy_device_pointer_to_host(d_gcl_residual, n_cells, gcl_residual);
+    copy_device_pointer_to_host(d_gcl_scale, n_cells, gcl_scale);
+    if (d_inactive_cell_mask != nullptr) {
+      copy_device_pointer_to_host(
+          d_inactive_cell_mask, n_cells, gcl_inactive_cell_mask);
+    }
+    record_gcl_audit_transaction(
+        state.step,
+        cfg.numerics.ale.swept_volume_sign_fixed,
+        true,
+        d_mass_flux_scale != nullptr,
+        gcl_residual,
+        gcl_scale,
+        gcl_inactive_cell_mask);
   }
 
   csr_remap_energy_audit_capture_swept(
@@ -16318,10 +18853,15 @@ AleRemap2DRZResult conservative_remap_csr(
           state.rho.data(),
           second_order_remap ? d_rho_grad_r : nullptr,
           second_order_remap ? d_rho_grad_z : nullptr,
+          state.vol.data(),
+          d_old_centroid_r,
+          d_old_centroid_z,
           state.x_r.data(),
           state.x_z.data(),
           state.x_r_reference.data(),
           state.x_z_reference.data(),
+          d_face_adj_offsets,
+          d_face_adj_indices,
           d_cell_node_offsets,
           d_cell_node_indices,
           d_unique_cell_a,
@@ -16332,7 +18872,8 @@ AleRemap2DRZResult conservative_remap_csr(
           d_cell_orientation_sign,
           d_cell_nverts,
           d_mass_flux_scale,
-          csr_swept_volume_sign_fixed,
+          d_inactive_cell_mask,
+          n_cells,
           n_internal_faces,
           n_boundary_faces);
       CUDA_CHECK(cudaGetLastError());
@@ -16473,38 +19014,32 @@ AleRemap2DRZResult conservative_remap_csr(
             d_rho_grad_r,
             d_rho_grad_z,
             d_rad_old,
-            state.x_r.data(),
-            state.x_z.data(),
+            d_old_centroid_r,
+            d_old_centroid_z,
             d_face_adj_offsets,
             d_face_adj_indices,
-            d_cell_node_offsets,
-            d_cell_node_indices,
             d_cell_nverts,
             d_inactive_cell_mask,
-            n_cells);
+            overrides.donor_fallback_cell_mask,
+            n_cells,
+            remap_dispatch_audit);
         CUDA_CHECK(cudaGetLastError());
-        csr_apply_barth_jespersen_limiter_inactive_masked_kernel<<<blocks_cells, 256>>>(
-            d_rho_grad_r,
-            d_rho_grad_z,
-            d_rad_old,
-            state.x_r.data(),
-            state.x_z.data(),
-            d_face_adj_offsets,
-            d_face_adj_indices,
-            d_cell_node_offsets,
-            d_cell_node_indices,
-            d_cell_nverts,
-            d_inactive_cell_mask,
-            n_cells);
-        CUDA_CHECK(cudaGetLastError());
+      }
+      if (n_edges > 0) {
+        CUDA_CHECK(cudaMemset(d_scalar_ext_flux_stage.data(),
+                              0,
+                              n_face_sides * sizeof(double)));
       }
       if (n_internal_faces > 0) {
         if (second_order_remap) {
           csr_apply_internal_volume_scalar_flux_second_order_kernel<<<blocks_internal, 256>>>(
-              d_rad_ext_new,
+              d_scalar_ext_flux_stage.data(),
               d_rad_old,
               d_rho_grad_r,
               d_rho_grad_z,
+              state.vol.data(),
+              d_old_centroid_r,
+              d_old_centroid_z,
               state.x_r.data(),
               state.x_z.data(),
               state.x_r_reference.data(),
@@ -16515,14 +19050,18 @@ AleRemap2DRZResult conservative_remap_csr(
               d_unique_cell_b,
               d_unique_local_a,
               n_internal_faces,
+              n_cells,
+              d_face_adj_offsets,
+              d_face_adj_indices,
               d_cell_orientation_sign,
               d_cell_nverts,
+              d_mass_flux_scale,
               d_inactive_cell_mask,
               d_central_macro_remap_audit_ptr,
-              csr_swept_volume_sign_fixed);
+              remap_dispatch_audit);
         } else {
           csr_apply_internal_volume_scalar_flux_kernel<<<blocks_internal, 256>>>(
-              d_rad_ext_new,
+              d_scalar_ext_flux_stage.data(),
               d_rad_old,
               state.x_r.data(),
               state.x_z.data(),
@@ -16538,17 +19077,20 @@ AleRemap2DRZResult conservative_remap_csr(
               d_cell_nverts,
               d_inactive_cell_mask,
               d_central_macro_remap_audit_ptr,
-              csr_swept_volume_sign_fixed);
+              remap_dispatch_audit);
         }
         CUDA_CHECK(cudaGetLastError());
       }
       if (n_boundary_faces > 0) {
         if (second_order_remap) {
           csr_apply_boundary_volume_scalar_flux_second_order_kernel<<<blocks_boundary, 256>>>(
-              d_rad_ext_new,
+              d_scalar_ext_flux_stage.data(),
               d_rad_old,
               d_rho_grad_r,
               d_rho_grad_z,
+              state.vol.data(),
+              d_old_centroid_r,
+              d_old_centroid_z,
               state.x_r.data(),
               state.x_z.data(),
               state.x_r_reference.data(),
@@ -16557,14 +19099,20 @@ AleRemap2DRZResult conservative_remap_csr(
               d_cell_node_indices,
               d_boundary_cell,
               d_boundary_local,
+              n_internal_faces,
               n_boundary_faces,
+              n_cells,
+              d_face_adj_offsets,
+              d_face_adj_indices,
               d_cell_orientation_sign,
               d_cell_nverts,
+              d_mass_flux_scale,
               d_inactive_cell_mask,
-              d_central_macro_remap_audit_ptr);
+              d_central_macro_remap_audit_ptr,
+              remap_dispatch_audit);
         } else {
           csr_apply_boundary_volume_scalar_flux_kernel<<<blocks_boundary, 256>>>(
-              d_rad_ext_new,
+              d_scalar_ext_flux_stage.data(),
               d_rad_old,
               state.x_r.data(),
               state.x_z.data(),
@@ -16574,12 +19122,24 @@ AleRemap2DRZResult conservative_remap_csr(
               d_cell_node_indices,
               d_boundary_cell,
               d_boundary_local,
+              n_internal_faces,
               n_boundary_faces,
               d_cell_orientation_sign,
               d_cell_nverts,
               d_inactive_cell_mask,
-              d_central_macro_remap_audit_ptr);
+              d_central_macro_remap_audit_ptr,
+              remap_dispatch_audit);
         }
+        CUDA_CHECK(cudaGetLastError());
+      }
+      if (n_edges > 0) {
+        csr_gather_face_side_scalar_stage_kernel<<<blocks_cells, 256>>>(
+            d_rad_ext_new,
+            d_scalar_ext_flux_stage.data(),
+            d_cell_edge_offsets,
+            d_cell_edge_edges,
+            d_cell_edge_side,
+            n_cells);
         CUDA_CHECK(cudaGetLastError());
       }
       csr_finish_volume_scalar_remap_kernel<<<blocks_cells, 256>>>(
@@ -16595,230 +19155,702 @@ AleRemap2DRZResult conservative_remap_csr(
     }
   }
 
-  CsrOptionBCornerVelocityRemapBuffers optionb_velocity_buffers;
-  CsrOptionBCornerVelocityRemapResult optionb_velocity_result;
-  if (optionb_velocity_authority) {
-    const bool macroboundary_audit =
-        optionb_macroboundary_audit_env_enabled();
-    const int macroboundary_audit_mode =
-        macroboundary_audit ? optionb_macroboundary_audit_mode() : 0;
-    if (macroboundary_audit &&
-        (macroboundary_audit_mode == 2 || macroboundary_audit_mode == 3)) {
-      csr_optionb_emit_macroboundary_manufactured_audit(
-          state,
-          cfg,
-          csr_swept_volume_sign_fixed,
-          d_mass_new,
-          false);
-      csr_optionb_emit_macroboundary_manufactured_audit(
-          state,
-          cfg,
-          csr_swept_volume_sign_fixed,
-          d_mass_new,
-          true);
-    }
-    const bool rim_ke_audit = rim_ke_audit_env_enabled();
-    const double rim_ke_pre =
-        rim_ke_audit ? compute_macro_rim_member_ke(state) : 0.0;
-    const int bd_every = basis_defect_audit_every();
-    const bool bd_audit =
-        bd_every > 0 && (state.step % bd_every) == 0;
-    // One shared pre-remap capture (velocities + the inactive-excluded
-    // first-moment basis on the pre-remap mesh) feeds the basis-defect
-    // audit, the PR3 KE-fixup deposit, and the F-basis momentum
-    // projection.
-    // Under the coherent transport the PR3 deposit and the F-basis
-    // projection interventions are superseded (the TER chain owns the
-    // energy bookkeeping; a second post-hoc velocity rescale would undo
-    // the momentum-conserving re-recover). The audit INSTRUMENTS stay
-    // live, fed the pre-projection transported ledger.
-    const bool ke_fixup = ke_fixup_deposit_enabled() && !optionb_coherent;
-    const bool fproj = fbasis_projection_env_enabled() && !optionb_coherent;
-    const int gap_mode_raw = gap_form_compensation_mode();
-    const int gap_mode =
-        (optionb_coherent && gap_mode_raw == 2) ? 1 : gap_mode_raw;
-    const bool gap_comp =
-        gap_mode > 0 && vpaired_corner_mass_install_enabled(cfg);
-    if (optionb_coherent &&
-        (ke_fixup_deposit_enabled() || fbasis_projection_env_enabled() ||
-         gap_mode_raw == 2)) {
-      static bool warned_superseded = false;
-      if (!warned_superseded) {
-        warned_superseded = true;
-        core::log_warning(
-            "[optionb_coherent] KE-fixup deposit / F-basis projection / "
-            "gap-form deposit are superseded by the coherent transport "
-            "(audit modes stay live on the transported ledger)");
-      }
-    }
-    BasisDefectPre bd_pre;
-    if (bd_audit || ke_fixup || fproj || gap_comp) {
-      basis_defect_capture_pre(state, &bd_pre);
-    }
-    // Gap-form compensation additionally needs the V-paired basis being
-    // REPLACED (state.corner_mass at remap start, mirror-inclusive).
-    std::vector<double> gap_vp_pre;
-    if (gap_comp) {
-      state.corner_mass.copy_to_host(gap_vp_pre);
-    }
-    optionb_velocity_result = csr_optionb_corner_velocity_remap_component(
-        state,
-        cfg,
-        optionb_velocity_buffers,
-        true,
-        csr_swept_volume_sign_fixed,
-        d_mass_new,
-        nullptr,
-        nullptr,
-        false,
-        overrides.allow_polar_shell_derefine,
-        overrides.force_optionb_coherent,
-        overrides.force_optionb_coherent_transport,
-        overrides.force_optionb_coherent_rerecover,
-        collect_replay_diagnostics,
-        overrides.near_massless_velocity_mass_floor,
-        d_optionb_transport_inactive_cell_mask,
-        overrides.energy_closure_cell_mask,
-        overrides.active_node_velocity_mask,
-        overrides.active_cell_mask,
-        overrides.corner_transport_cell_mask != nullptr ? d_inactive_cell_mask
-                                                        : nullptr);
-    TENRYU_ASSERT(optionb_velocity_result.applied,
-                  "CSR Option B velocity authority remap did not apply");
-    result.replay_transport_momentum_valid =
-        optionb_velocity_result.replay_transport_momentum_valid;
-    result.replay_transport_pr = optionb_velocity_result.replay_transport_pr;
-    result.replay_transport_pz = optionb_velocity_result.replay_transport_pz;
-    result.replay_raw_pi0_r = optionb_velocity_result.replay_raw_pi0_r;
-    result.replay_raw_pi0_z = optionb_velocity_result.replay_raw_pi0_z;
-    result.replay_raw_pi1_r = optionb_velocity_result.replay_raw_pi1_r;
-    result.replay_raw_pi1_z = optionb_velocity_result.replay_raw_pi1_z;
-    result.replay_assm_residual_r =
-        optionb_velocity_result.replay_assm_residual_r;
-    result.replay_assm_residual_z =
-        optionb_velocity_result.replay_assm_residual_z;
-    result.replay_rec_residual_r =
-        optionb_velocity_result.replay_rec_residual_r;
-    result.replay_rec_residual_z =
-        optionb_velocity_result.replay_rec_residual_z;
-    result.replay_discarded_dual_faces =
-        optionb_velocity_result.replay_discarded_dual_faces;
-    result.replay_discarded_dual_mass =
-        optionb_velocity_result.replay_discarded_dual_mass;
-    result.replay_discarded_dual_pi_r =
-        optionb_velocity_result.replay_discarded_dual_pi_r;
-    result.replay_discarded_dual_pi_z =
-        optionb_velocity_result.replay_discarded_dual_pi_z;
-    if (fproj) {
-      // Experiment D (basis-contract verdict Q2, convection-compensated
-      // form): the dynamics' next momentum update divides by the FROZEN
-      // nodal masses, so rescale the remap's velocity CHANGES by the
-      // basis ratio, v_corr = v- + (M^B_mid/M^F)(v+ - v-), making the
-      // frozen-basis impulse equal the remap-owned NON-CONVECTIVE
-      // impulse. (The verdict's literal v- + dP^B/M^F kicks nodes by
-      // pure transported-mass changes and violates uniform-flow
-      // preservation — the same trap PR3's residual reduction closed.)
-      apply_fbasis_momentum_projection(
-          state, optionb_velocity_buffers.corner_mass, bd_pre);
-    }
-    if (rim_ke_audit) {
-      const double rim_ke_post = compute_macro_rim_member_ke(state);
-      std::ostringstream rim_oss;
-      rim_oss << "[rim_ke_audit] step=" << state.step
-              << " rim_KE_pre=" << format_ale_velcoherence_value(rim_ke_pre)
-              << " rim_KE_post="
-              << format_ale_velcoherence_value(rim_ke_post)
-              << " d_rim_KE="
-              << format_ale_velcoherence_value(rim_ke_post - rim_ke_pre);
-      core::log_info(rim_oss.str());
-    }
-    if (bd_audit) {
-      basis_defect_emit(state,
-                        optionb_coherent
-                            ? optionb_velocity_buffers.corner_mass_transported
-                            : optionb_velocity_buffers.corner_mass,
-                        bd_pre);
-    }
-    if (ke_fixup) {
-      std::vector<double> ke_fixup_b_post;
-      optionb_velocity_buffers.corner_mass.copy_to_host(ke_fixup_b_post);
-      ke_fixup_apply_deposit(state,
-                             bd_pre.corner_mass_b,
-                             ke_fixup_b_post,
-                             bd_pre.v_r,
-                             bd_pre.v_z);
-    }
-    if (gap_comp) {
-      std::vector<double> gap_fm_post;
-      if (optionb_coherent) {
-        optionb_velocity_buffers.corner_mass_transported.copy_to_host(
-            gap_fm_post);
-      } else {
-        optionb_velocity_buffers.corner_mass.copy_to_host(gap_fm_post);
-      }
-      std::vector<double> gap_mass_new(
-          static_cast<std::size_t>(state.mesh.topo.n_cells), 0.0);
-      CUDA_CHECK(cudaMemcpy(gap_mass_new.data(), d_mass_new,
-                            gap_mass_new.size() * sizeof(double),
-                            cudaMemcpyDeviceToHost));
-      gap_form_compensation_bracket(state, gap_vp_pre, bd_pre.corner_mass_b,
-                                    bd_pre.v_r, bd_pre.v_z, gap_fm_post,
-                                    gap_mass_new, gap_mode == 2);
-    }
-    if (macroboundary_audit &&
-        (macroboundary_audit_mode == 1 || macroboundary_audit_mode == 3)) {
-      csr_optionb_emit_macroboundary_actual_audit(
-          state, optionb_velocity_buffers, optionb_velocity_result);
-    }
-    if (env_flag_enabled("TENRYU_I1B_OPTIONB_VELREMAP_DIAG")) {
-      const long long faces =
-          optionb_velocity_result.total_internal_face_packets;
-      const double fb_frac =
-          static_cast<double>(optionb_velocity_result.fallback_packets) /
-          static_cast<double>(faces > 0 ? faces : 1);
-      std::ostringstream oss;
-      oss << "[optionb_diag] step=" << state.step
-          << " faces=" << faces
-          << " fallback=" << optionb_velocity_result.fallback_packets
-          << " (" << fb_frac << ")"
-          << " expanded=" << optionb_velocity_result.expanded_stencil_packets
-          << " ring1=" << optionb_velocity_result.expanded_ring1_packets
-          << " ring2=" << optionb_velocity_result.expanded_ring2_packets
-          << " exp_fail=" << optionb_velocity_result.expanded_failed_packets
-          << " centroid_out="
-          << optionb_velocity_result.centroid_out_of_donor_packets
-          << " centroid_on_boundary="
-          << optionb_velocity_result.centroid_on_boundary_packets
-          << " centroid_far=" << optionb_velocity_result.centroid_far_packets
-          << " receiver_vertex_out="
-          << optionb_velocity_result.receiver_vertex_out_of_donor_packets
-          << " alpha_min=" << optionb_velocity_result.alpha_min
-          << " invalid=" << optionb_velocity_result.invalid_input_packets
-          << " skipped=" << optionb_velocity_result.skipped_packets
-          << " filt_inval=" << optionb_velocity_result.filter_invalid_cells
-          << " filt_degen=" << optionb_velocity_result.filter_degenerate_cells
-          << " filt_cells=" << optionb_velocity_result.total_filter_cells;
-      core::log_info(oss.str());
-    }
-    if (optionb_coherent) {
-      // Export the projected (V-paired) ledger so the corner-mass install
-      // writes literally the numbers the velocity re-recover divided by.
-      optionb_velocity_buffers.corner_mass.copy_to_host(
-          result.optionb_coherent_corner_mass);
-    }
-  }
-  if (optionb_velocity_authority &&
-      overrides.corner_transport_cell_mask != nullptr) {
-    csr_install_masked_cell_mass_from_optionb_kernel<<<blocks_cells, 256>>>(
-        d_mass_new,
-        d_rho_new,
-        optionb_velocity_buffers.cell_mass.data(),
-        state.cell_vol_initial.data(),
-        overrides.corner_transport_cell_mask,
-        n_cells);
-    CUDA_CHECK(cudaGetLastError());
+  // Qualification-scale host phase: download each required field once, then
+  // traverse cells and nodes in ascending order. Same-connectivity remaps do
+  // not need a corner-containment walk.
+  TENRYU_ASSERT(mb.face_adj_csr_offsets.size() ==
+                    static_cast<std::size_t>(n_cells) + 1U,
+                "CSR corner distribution requires face-adjacency offsets");
+  TENRYU_ASSERT(mb.face_adj_csr_indices.size() ==
+                    static_cast<std::size_t>(n_cells) *
+                        static_cast<std::size_t>(state.corner_stride),
+                "CSR corner distribution requires face-adjacency indices");
+  std::vector<double> target_node_r;
+  std::vector<double> target_node_z;
+  std::vector<double> old_corner_mass;
+  std::vector<double> transported_corner_mass;
+  std::vector<double> remapped_cell_mass;
+  std::vector<double> remapped_cell_momentum_r;
+  std::vector<double> remapped_cell_momentum_z;
+  std::vector<std::uint8_t> inactive_cell_mask;
+  state.x_r_reference.copy_to_host(target_node_r);
+  state.x_z_reference.copy_to_host(target_node_z);
+  state.corner_mass.copy_to_host(old_corner_mass);
+  copy_device_pointer_to_host(
+      d_corner_fraction_mass_new,
+      n_cells * state.corner_stride,
+      transported_corner_mass);
+  copy_device_pointer_to_host(d_mass_new, n_cells, remapped_cell_mass);
+  copy_device_pointer_to_host(
+      d_mom_r_new, n_cells, remapped_cell_momentum_r);
+  copy_device_pointer_to_host(
+      d_mom_z_new, n_cells, remapped_cell_momentum_z);
+  if (d_inactive_cell_mask != nullptr) {
+    copy_device_pointer_to_host(
+        d_inactive_cell_mask, n_cells, inactive_cell_mask);
   }
 
+  std::vector<std::vector<int>> node_cells(
+      static_cast<std::size_t>(n_nodes));
+  std::vector<std::vector<int>> node_corners(
+      static_cast<std::size_t>(n_nodes));
+  std::vector<std::uint8_t> changed_cell(
+      static_cast<std::size_t>(n_cells), 0U);
+  std::vector<std::uint8_t> changed_node(
+      static_cast<std::size_t>(n_nodes), 0U);
+  std::vector<int> changed_cells;
+  std::vector<int> changed_nodes;
+  for (int c = 0; c < n_cells; ++c) {
+    const int begin = mb.cell_node_csr_offsets[static_cast<std::size_t>(c)];
+    const int nverts = active_nverts(c);
+    bool moved = false;
+    for (int k = 0; k < nverts; ++k) {
+      const int node =
+          mb.cell_node_csr_indices[static_cast<std::size_t>(begin + k)];
+      TENRYU_ASSERT(node >= 0 && node < n_nodes,
+                    "CSR corner distribution cell node is out of range");
+      node_cells[static_cast<std::size_t>(node)].push_back(c);
+      node_corners[static_cast<std::size_t>(node)].push_back(
+          c * state.corner_stride + k);
+      moved =
+          moved ||
+          !csr_corner_distribution_same_bits(
+              old_node_r[static_cast<std::size_t>(node)],
+              target_node_r[static_cast<std::size_t>(node)]) ||
+          !csr_corner_distribution_same_bits(
+              old_node_z[static_cast<std::size_t>(node)],
+              target_node_z[static_cast<std::size_t>(node)]);
+    }
+    if (moved) {
+      changed_cell[static_cast<std::size_t>(c)] = 1U;
+      changed_cells.push_back(c);
+    }
+  }
+  for (int node = 0; node < n_nodes; ++node) {
+    for (const int cell : node_cells[static_cast<std::size_t>(node)]) {
+      if (changed_cell[static_cast<std::size_t>(cell)] != 0U) {
+        changed_nodes.push_back(node);
+        break;
+      }
+    }
+  }
+  for (const int node : changed_nodes) {
+    changed_node[static_cast<std::size_t>(node)] = 1U;
+  }
+
+  const std::size_t corner_count =
+      static_cast<std::size_t>(n_cells) *
+      static_cast<std::size_t>(state.corner_stride);
+  std::vector<double> omega_node = target_node_r;
+  std::vector<std::uint8_t> node_axis_mask(
+      static_cast<std::size_t>(n_nodes), 0U);
+  for (int node = 0; node < n_nodes; ++node) {
+    node_axis_mask[static_cast<std::size_t>(node)] =
+        omega_node[static_cast<std::size_t>(node)] == 0.0 ? 1U : 0U;
+  }
+  std::vector<double> old_corner_volume(corner_count, 0.0);
+  std::vector<double> target_corner_volume(corner_count, 0.0);
+  std::vector<double> mu_corner(corner_count, 0.0);
+  std::vector<double> aw_paired_corner_mass(corner_count, 0.0);
+  for (int c = 0; c < n_cells; ++c) {
+    const int begin = mb.cell_node_csr_offsets[static_cast<std::size_t>(c)];
+    const int nverts = active_nverts(c);
+    double old_r[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {};
+    double old_z[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {};
+    double target_r[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {};
+    double target_z[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {};
+    for (int k = 0; k < nverts; ++k) {
+      const int node =
+          mb.cell_node_csr_indices[static_cast<std::size_t>(begin + k)];
+      old_r[k] = old_node_r[static_cast<std::size_t>(node)];
+      old_z[k] = old_node_z[static_cast<std::size_t>(node)];
+      target_r[k] = target_node_r[static_cast<std::size_t>(node)];
+      target_z[k] = target_node_z[static_cast<std::size_t>(node)];
+    }
+    const int base = c * state.corner_stride;
+    double unused_centroid_r[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {};
+    double unused_centroid_z[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {};
+    csr_corner_distribution_cell_geometry(
+        old_r,
+        old_z,
+        nverts,
+        old_corner_volume.data() + base,
+        unused_centroid_r,
+        unused_centroid_z);
+    csr_corner_distribution_cell_geometry(
+        target_r,
+        target_z,
+        nverts,
+        target_corner_volume.data() + base,
+        unused_centroid_r,
+        unused_centroid_z);
+
+    double corner_area[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {};
+    csr_aw_barlow_corner_area_partition(
+        target_r, target_z, nverts, corner_area);
+
+    const double target_volume_per_radian =
+        std::abs(rz::rz_polygon_volume_exact(
+                     target_r, target_z, nverts)) /
+        kAwTwoPi;
+    TENRYU_ASSERT(
+        target_volume_per_radian > 0.0 &&
+            std::isfinite(target_volume_per_radian),
+        "AW target RZ polygon volume per radian must be positive and finite");
+    double first_moment_area = 0.0;
+    for (int k = 0; k < nverts; ++k) {
+      first_moment_area += target_r[k] * corner_area[k];
+    }
+    TENRYU_ASSERT(
+        std::abs(first_moment_area - target_volume_per_radian) <=
+            1.0e-12 * target_volume_per_radian,
+        "AW Barlow first-moment identity failed");
+    const double cell_mass =
+        remapped_cell_mass[static_cast<std::size_t>(c)];
+    const double cell_density = cell_mass / target_volume_per_radian;
+    double paired_mass_sum = 0.0;
+    for (int k = 0; k < nverts; ++k) {
+      const int node =
+          mb.cell_node_csr_indices[static_cast<std::size_t>(begin + k)];
+      const std::size_t corner = static_cast<std::size_t>(base + k);
+      mu_corner[corner] = cell_density * corner_area[k];
+      aw_paired_corner_mass[corner] =
+          omega_node[static_cast<std::size_t>(node)] * mu_corner[corner];
+      paired_mass_sum += aw_paired_corner_mass[corner];
+    }
+    if (changed_cell[static_cast<std::size_t>(c)] != 0U) {
+      TENRYU_ASSERT(
+          std::abs(paired_mass_sum - cell_mass) <= 1.0e-10 * cell_mass,
+          "AW paired corner masses must sum to the remapped cell mass");
+    }
+  }
+
+  std::vector<double> distributed_corner_mass = old_corner_mass;
+  for (int c = 0; c < n_cells; ++c) {
+    if (!inactive_cell_mask.empty() &&
+        inactive_cell_mask[static_cast<std::size_t>(c)] != 0U) {
+      continue;
+    }
+    const int nverts = active_nverts(c);
+    const int base = c * state.corner_stride;
+    const double cell_mass =
+        remapped_cell_mass[static_cast<std::size_t>(c)];
+    double transported_sum = 0.0;
+    for (int k = 0; k < nverts; ++k) {
+      const double value =
+          transported_corner_mass[static_cast<std::size_t>(k) *
+                                      static_cast<std::size_t>(n_cells) +
+                                  static_cast<std::size_t>(c)];
+      if (value > 0.0 && std::isfinite(value)) {
+        transported_sum += value;
+      }
+    }
+    if (transported_sum > 1.0e-300 && std::isfinite(transported_sum)) {
+      double partial = 0.0;
+      for (int k = 0; k + 1 < nverts; ++k) {
+        const double value =
+            transported_corner_mass[static_cast<std::size_t>(k) *
+                                        static_cast<std::size_t>(n_cells) +
+                                    static_cast<std::size_t>(c)];
+        distributed_corner_mass[static_cast<std::size_t>(base + k)] =
+            (value > 0.0 && std::isfinite(value))
+                ? cell_mass * value / transported_sum
+                : 0.0;
+        partial +=
+            distributed_corner_mass[static_cast<std::size_t>(base + k)];
+      }
+      distributed_corner_mass[
+          static_cast<std::size_t>(base + nverts - 1)] =
+          cell_mass - partial;
+    } else {
+      const double uniform = cell_mass / static_cast<double>(nverts);
+      double partial = 0.0;
+      for (int k = 0; k + 1 < nverts; ++k) {
+        distributed_corner_mass[static_cast<std::size_t>(base + k)] =
+            uniform;
+        partial += uniform;
+      }
+      distributed_corner_mass[
+          static_cast<std::size_t>(base + nverts - 1)] =
+          cell_mass - partial;
+    }
+    for (int k = nverts; k < state.corner_stride; ++k) {
+      distributed_corner_mass[static_cast<std::size_t>(base + k)] = 0.0;
+    }
+  }
+
+  const auto edge_stencil = [&](const int cell) {
+    std::vector<int> stencil{cell};
+    const int begin =
+        mb.face_adj_csr_offsets[static_cast<std::size_t>(cell)];
+    const int end =
+        mb.face_adj_csr_offsets[static_cast<std::size_t>(cell) + 1U];
+    for (int entry = begin; entry < end; ++entry) {
+      const int adjacent =
+          mb.face_adj_csr_indices[static_cast<std::size_t>(entry)];
+      if (adjacent >= 0 && adjacent < n_cells) {
+        stencil.push_back(adjacent);
+      }
+    }
+    std::sort(stencil.begin(), stencil.end());
+    stencil.erase(std::unique(stencil.begin(), stencil.end()), stencil.end());
+    return stencil;
+  };
+
+  using tenryu::hydro::corner_distribution::AwAggregateProjectionInputs;
+  using tenryu::hydro::corner_distribution::OldMeshView;
+  const OldMeshView old_mesh{
+      old_node_r.data(),
+      old_node_z.data(),
+      n_nodes,
+      mb.cell_node_csr_offsets.data(),
+      mb.cell_node_csr_indices.data(),
+      n_cells,
+      old_node_vr.data(),
+      old_node_vz.data()};
+  std::vector<double> u_ref_r = old_node_vr;
+  std::vector<double> u_ref_z = old_node_vz;
+  const std::size_t changed_node_count = changed_nodes.size();
+  std::vector<int> changed_node_compact_index(
+      static_cast<std::size_t>(n_nodes), -1);
+  std::vector<double> u_ref_s(changed_node_count, 0.0);
+  std::vector<double> u_ref_t(changed_node_count, 0.0);
+  std::vector<double> s_min(changed_node_count, 0.0);
+  std::vector<double> s_max(changed_node_count, 0.0);
+  std::vector<double> t_min(changed_node_count, 0.0);
+  std::vector<double> t_max(changed_node_count, 0.0);
+  std::vector<double> basis_s_r(changed_node_count, 0.0);
+  std::vector<double> basis_s_z(changed_node_count, 0.0);
+  std::vector<double> basis_t_r(changed_node_count, 0.0);
+  std::vector<double> basis_t_z(changed_node_count, 0.0);
+  std::vector<std::uint8_t> compact_axis_mask(changed_node_count, 0U);
+  for (std::size_t compact = 0; compact < changed_node_count; ++compact) {
+    const int node = changed_nodes[compact];
+    changed_node_compact_index[static_cast<std::size_t>(node)] =
+        static_cast<int>(compact);
+    const double target_r = target_node_r[static_cast<std::size_t>(node)];
+    const double target_z = target_node_z[static_cast<std::size_t>(node)];
+    const double target_s = std::hypot(target_r, target_z);
+    TENRYU_ASSERT(std::isfinite(target_s),
+                  "AW changed-node target radius must be finite");
+    if (target_s > 0.0) {
+      basis_s_r[compact] = target_r / target_s;
+      basis_s_z[compact] = target_z / target_s;
+      basis_t_r[compact] = target_z / target_s;
+      basis_t_z[compact] = -target_r / target_s;
+    } else {
+      // Origin node: continuous +z-axis limit of the spherical basis.
+      // r == 0 puts the node on the axis mask below, which zeroes the
+      // tangential scalar and its bounds, so u_r = 0 binds exactly here.
+      basis_s_r[compact] = 0.0;
+      basis_s_z[compact] = 1.0;
+      basis_t_r[compact] = 1.0;
+      basis_t_z[compact] = 0.0;
+    }
+    compact_axis_mask[compact] =
+        node_axis_mask[static_cast<std::size_t>(node)];
+    tenryu::hydro::corner_distribution::reference_velocity_at(
+        old_mesh,
+        node_cells,
+        node,
+        target_r,
+        target_z,
+        &u_ref_r[static_cast<std::size_t>(node)],
+        &u_ref_z[static_cast<std::size_t>(node)],
+        &u_ref_s[compact],
+        &u_ref_t[compact],
+        &s_min[compact],
+        &s_max[compact],
+        &t_min[compact],
+        &t_max[compact]);
+    if (compact_axis_mask[compact] != 0U) {
+      u_ref_t[compact] = 0.0;
+      t_min[compact] = 0.0;
+      t_max[compact] = 0.0;
+    }
+    u_ref_r[static_cast<std::size_t>(node)] =
+        u_ref_s[compact] * basis_s_r[compact] +
+        u_ref_t[compact] * basis_t_r[compact];
+    u_ref_z[static_cast<std::size_t>(node)] =
+        u_ref_s[compact] * basis_s_z[compact] +
+        u_ref_t[compact] * basis_t_z[compact];
+  }
+
+  const std::vector<double> predictor_cell_momentum_r =
+      remapped_cell_momentum_r;
+  const std::vector<double> predictor_cell_momentum_z =
+      remapped_cell_momentum_z;
+  std::vector<double> a_node(changed_node_count, 0.0);
+  std::vector<double> mu_node_region(changed_node_count, 0.0);
+  double predictor_momentum_sum_r = 0.0;
+  double predictor_momentum_sum_z = 0.0;
+  for (const int c : changed_cells) {
+    predictor_momentum_sum_r +=
+        predictor_cell_momentum_r[static_cast<std::size_t>(c)];
+    predictor_momentum_sum_z +=
+        predictor_cell_momentum_z[static_cast<std::size_t>(c)];
+    const int begin = mb.cell_node_csr_offsets[static_cast<std::size_t>(c)];
+    const int nverts = active_nverts(c);
+    const int base = c * state.corner_stride;
+    for (int k = 0; k < nverts; ++k) {
+      const int node =
+          mb.cell_node_csr_indices[static_cast<std::size_t>(begin + k)];
+      const int compact =
+          changed_node_compact_index[static_cast<std::size_t>(node)];
+      TENRYU_ASSERT(compact >= 0,
+                    "AW changed-cell node is absent from compact node set");
+      const double mu =
+          mu_corner[static_cast<std::size_t>(base + k)];
+      mu_node_region[static_cast<std::size_t>(compact)] += mu;
+      a_node[static_cast<std::size_t>(compact)] +=
+          omega_node[static_cast<std::size_t>(node)] * mu;
+    }
+  }
+
+  double reference_momentum_sum_r = 0.0;
+  double reference_momentum_sum_z = 0.0;
+  double reference_momentum_scale_r = 0.0;
+  double reference_momentum_scale_z = 0.0;
+  for (std::size_t compact = 0; compact < changed_node_count; ++compact) {
+    const int node = changed_nodes[compact];
+    const double contribution_r =
+        a_node[compact] * u_ref_r[static_cast<std::size_t>(node)];
+    const double contribution_z =
+        a_node[compact] * u_ref_z[static_cast<std::size_t>(node)];
+    reference_momentum_sum_r += contribution_r;
+    reference_momentum_sum_z += contribution_z;
+    reference_momentum_scale_r += std::abs(contribution_r);
+    reference_momentum_scale_z += std::abs(contribution_z);
+  }
+  const double aggregate_tolerance_r =
+      64.0 * std::numeric_limits<double>::epsilon() *
+      (std::abs(predictor_momentum_sum_r) + reference_momentum_scale_r);
+  const double aggregate_tolerance_z =
+      64.0 * std::numeric_limits<double>::epsilon() *
+      (std::abs(predictor_momentum_sum_z) + reference_momentum_scale_z);
+  const bool aggregate_exact =
+      std::abs(reference_momentum_sum_r - predictor_momentum_sum_r) <=
+          aggregate_tolerance_r &&
+      std::abs(reference_momentum_sum_z - predictor_momentum_sum_z) <=
+          aggregate_tolerance_z;
+  std::vector<double> u_star_s = u_ref_s;
+  std::vector<double> u_star_t = u_ref_t;
+  if (!aggregate_exact) {
+    AwAggregateProjectionInputs projection_inputs;
+    projection_inputs.u_ref_s = u_ref_s.data();
+    projection_inputs.u_ref_t = u_ref_t.data();
+    projection_inputs.basis_s_r = basis_s_r.data();
+    projection_inputs.basis_s_z = basis_s_z.data();
+    projection_inputs.basis_t_r = basis_t_r.data();
+    projection_inputs.basis_t_z = basis_t_z.data();
+    projection_inputs.mu_node = mu_node_region.data();
+    projection_inputs.a_node = a_node.data();
+    projection_inputs.s_min = s_min.data();
+    projection_inputs.s_max = s_max.data();
+    projection_inputs.t_min = t_min.data();
+    projection_inputs.t_max = t_max.data();
+    projection_inputs.axis_mask = compact_axis_mask.data();
+    projection_inputs.n_nodes = static_cast<int>(changed_node_count);
+    projection_inputs.target_r = predictor_momentum_sum_r;
+    projection_inputs.target_z = predictor_momentum_sum_z;
+    const auto projection_result =
+        tenryu::hydro::corner_distribution::project_aggregate_target_state(
+            projection_inputs, u_star_s.data(), u_star_t.data());
+    if (projection_result.infeasible) {
+      cleanup();
+      restore_out_of_mask_velocities();
+      return result;
+    }
+    for (std::size_t compact = 0; compact < changed_node_count; ++compact) {
+      const int node = changed_nodes[compact];
+      u_ref_r[static_cast<std::size_t>(node)] =
+          u_star_s[compact] * basis_s_r[compact] +
+          u_star_t[compact] * basis_t_r[compact];
+      u_ref_z[static_cast<std::size_t>(node)] =
+          u_star_s[compact] * basis_s_z[compact] +
+          u_star_t[compact] * basis_t_z[compact];
+    }
+  }
+
+  double residual_norm_sum = 0.0;
+  double residual_norm_max = 0.0;
+  for (const int c : changed_cells) {
+    const int begin = mb.cell_node_csr_offsets[static_cast<std::size_t>(c)];
+    const int nverts = active_nverts(c);
+    const int base = c * state.corner_stride;
+    double target_momentum_r = 0.0;
+    double target_momentum_z = 0.0;
+    for (int k = 0; k < nverts; ++k) {
+      const int node =
+          mb.cell_node_csr_indices[static_cast<std::size_t>(begin + k)];
+      const double a_cp =
+          omega_node[static_cast<std::size_t>(node)] *
+          mu_corner[static_cast<std::size_t>(base + k)];
+      target_momentum_r +=
+          a_cp * u_ref_r[static_cast<std::size_t>(node)];
+      target_momentum_z +=
+          a_cp * u_ref_z[static_cast<std::size_t>(node)];
+    }
+    const double residual_r = target_momentum_r -
+        predictor_cell_momentum_r[static_cast<std::size_t>(c)];
+    const double residual_z = target_momentum_z -
+        predictor_cell_momentum_z[static_cast<std::size_t>(c)];
+    const double residual_norm = std::hypot(residual_r, residual_z);
+    residual_norm_sum += residual_norm;
+    residual_norm_max = std::max(residual_norm_max, residual_norm);
+    remapped_cell_momentum_r[static_cast<std::size_t>(c)] =
+        target_momentum_r;
+    remapped_cell_momentum_z[static_cast<std::size_t>(c)] =
+        target_momentum_z;
+  }
+  if (txn_vth_sub_diag) {
+    std::fprintf(stderr,
+                 "[aw_commute] cells=%d nodes=%d aggregate_exact=%d "
+                 "sum|R|=%.3e max|R|=%.3e\n",
+                 static_cast<int>(changed_cells.size()),
+                 static_cast<int>(changed_nodes.size()),
+                 aggregate_exact ? 1 : 0,
+                 residual_norm_sum,
+                 residual_norm_max);
+  }
+  std::vector<double> corner_pi_r(corner_count, 0.0);
+  std::vector<double> corner_pi_z(corner_count, 0.0);
+  std::vector<double> corner_momentum_r(corner_count, 0.0);
+  std::vector<double> corner_momentum_z(corner_count, 0.0);
+  for (int c = 0; c < n_cells; ++c) {
+    const int begin = mb.cell_node_csr_offsets[static_cast<std::size_t>(c)];
+    const int nverts = active_nverts(c);
+    const int base = c * state.corner_stride;
+    for (int k = 0; k < nverts; ++k) {
+      const int node =
+          mb.cell_node_csr_indices[static_cast<std::size_t>(begin + k)];
+      const std::size_t corner = static_cast<std::size_t>(base + k);
+      corner_pi_r[corner] =
+          mu_corner[corner] * old_node_vr[static_cast<std::size_t>(node)];
+      corner_pi_z[corner] =
+          mu_corner[corner] * old_node_vz[static_cast<std::size_t>(node)];
+      corner_momentum_r[corner] =
+          omega_node[static_cast<std::size_t>(node)] * corner_pi_r[corner];
+      corner_momentum_z[corner] =
+          omega_node[static_cast<std::size_t>(node)] * corner_pi_z[corner];
+    }
+  }
+
+  for (const int c : changed_cells) {
+    const int begin = mb.cell_node_csr_offsets[static_cast<std::size_t>(c)];
+    const int nverts = active_nverts(c);
+    const int base = c * state.corner_stride;
+    const std::vector<int> stencil = edge_stencil(c);
+
+    double density_min = std::numeric_limits<double>::infinity();
+    double density_max = -std::numeric_limits<double>::infinity();
+    for (const int stencil_cell : stencil) {
+      const int stencil_nverts = active_nverts(stencil_cell);
+      const int stencil_base = stencil_cell * state.corner_stride;
+      for (int k = 0; k < stencil_nverts; ++k) {
+        const double volume =
+            old_corner_volume[static_cast<std::size_t>(stencil_base + k)];
+        const double mass =
+            old_corner_mass[static_cast<std::size_t>(stencil_base + k)];
+        if (volume > 0.0 && std::isfinite(volume) &&
+            std::isfinite(mass)) {
+          const double density = mass / volume;
+          density_min = std::min(density_min, density);
+          density_max = std::max(density_max, density);
+        }
+      }
+    }
+    TENRYU_ASSERT(
+        std::isfinite(density_min) && std::isfinite(density_max),
+        "CSR corner distribution density bounds must be finite");
+
+    double reference_corner_mass[
+        mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {};
+    double density_lower[
+        mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {};
+    double density_upper[
+        mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {};
+    for (int k = 0; k < nverts; ++k) {
+      reference_corner_mass[k] =
+          transported_corner_mass[static_cast<std::size_t>(k) *
+                                      static_cast<std::size_t>(n_cells) +
+                                  static_cast<std::size_t>(c)];
+      density_lower[k] = density_min;
+      density_upper[k] = density_max;
+    }
+
+    tenryu::hydro::corner_distribution::distribute_cell_mass_scaling(
+        remapped_cell_mass[static_cast<std::size_t>(c)],
+        target_corner_volume.data() + base,
+        reference_corner_mass,
+        density_lower,
+        density_upper,
+        nverts,
+        distributed_corner_mass.data() + base);
+    double corner_momentum_sum_r = 0.0;
+    double corner_momentum_sum_z = 0.0;
+    double corner_momentum_scale_r = 0.0;
+    double corner_momentum_scale_z = 0.0;
+    for (int k = 0; k < nverts; ++k) {
+      const int node =
+          mb.cell_node_csr_indices[static_cast<std::size_t>(begin + k)];
+      const std::size_t corner = static_cast<std::size_t>(base + k);
+      corner_pi_r[corner] =
+          mu_corner[corner] * u_ref_r[static_cast<std::size_t>(node)];
+      corner_pi_z[corner] =
+          mu_corner[corner] * u_ref_z[static_cast<std::size_t>(node)];
+      corner_momentum_r[corner] =
+          omega_node[static_cast<std::size_t>(node)] * corner_pi_r[corner];
+      corner_momentum_z[corner] =
+          omega_node[static_cast<std::size_t>(node)] * corner_pi_z[corner];
+      corner_momentum_sum_r += corner_momentum_r[corner];
+      corner_momentum_sum_z += corner_momentum_z[corner];
+      corner_momentum_scale_r += std::abs(corner_momentum_r[corner]);
+      corner_momentum_scale_z += std::abs(corner_momentum_z[corner]);
+    }
+    const double target_momentum_r =
+        remapped_cell_momentum_r[static_cast<std::size_t>(c)];
+    const double target_momentum_z =
+        remapped_cell_momentum_z[static_cast<std::size_t>(c)];
+    const double tolerance_r =
+        256.0 * std::numeric_limits<double>::epsilon() *
+        (std::abs(target_momentum_r) + corner_momentum_scale_r);
+    const double tolerance_z =
+        256.0 * std::numeric_limits<double>::epsilon() *
+        (std::abs(target_momentum_z) + corner_momentum_scale_z);
+    TENRYU_ASSERT(
+        std::abs(corner_momentum_sum_r - target_momentum_r) <= tolerance_r &&
+            std::abs(corner_momentum_sum_z - target_momentum_z) <= tolerance_z,
+        "AW commuting corner pass-through must reproduce target cell momentum");
+  }
+  if (txn_vth_sub_diag) {
+    std::vector<double> distributed_cell_momentum_r(
+        static_cast<std::size_t>(n_cells), 0.0);
+    std::vector<double> distributed_cell_momentum_z(
+        static_cast<std::size_t>(n_cells), 0.0);
+    for (int c = 0; c < n_cells; ++c) {
+      const int nverts = active_nverts(c);
+      const int base = c * state.corner_stride;
+      for (int k = 0; k < nverts; ++k) {
+        distributed_cell_momentum_r[static_cast<std::size_t>(c)] +=
+            corner_momentum_r[static_cast<std::size_t>(base + k)];
+        distributed_cell_momentum_z[static_cast<std::size_t>(c)] +=
+            corner_momentum_z[static_cast<std::size_t>(base + k)];
+      }
+    }
+    txn_vth_sub_cell("post_distribution",
+                     old_node_r,
+                     old_node_z,
+                     remapped_cell_mass,
+                     distributed_cell_momentum_r,
+                     distributed_cell_momentum_z);
+  }
+  std::vector<int> node_corner_offsets(
+      static_cast<std::size_t>(n_nodes) + 1U, 0);
+  std::vector<int> node_corner_indices;
+  for (int node = 0; node < n_nodes; ++node) {
+    node_corner_offsets[static_cast<std::size_t>(node)] =
+        static_cast<int>(node_corner_indices.size());
+    node_corner_indices.insert(
+        node_corner_indices.end(),
+        node_corners[static_cast<std::size_t>(node)].begin(),
+        node_corners[static_cast<std::size_t>(node)].end());
+  }
+  node_corner_offsets[static_cast<std::size_t>(n_nodes)] =
+      static_cast<int>(node_corner_indices.size());
+
+  std::vector<double> recovered_node_mu(static_cast<std::size_t>(n_nodes));
+  std::vector<double> recovered_node_mass_rz(
+      static_cast<std::size_t>(n_nodes));
+  std::vector<double> recovered_node_momentum_rz_r(
+      static_cast<std::size_t>(n_nodes));
+  std::vector<double> recovered_node_momentum_rz_z(
+      static_cast<std::size_t>(n_nodes));
+  std::vector<double> recovered_node_velocity_r(
+      static_cast<std::size_t>(n_nodes));
+  std::vector<double> recovered_node_velocity_z(
+      static_cast<std::size_t>(n_nodes));
+  tenryu::hydro::corner_distribution::recover_nodal_velocity_aw(
+      node_corner_offsets.data(),
+      node_corner_indices.data(),
+      n_nodes,
+      mu_corner.data(),
+      corner_pi_r.data(),
+      corner_pi_z.data(),
+      u_ref_r.data(),
+      u_ref_z.data(),
+      omega_node.data(),
+      node_axis_mask.data(),
+      recovered_node_mu.data(),
+      recovered_node_velocity_r.data(),
+      recovered_node_velocity_z.data(),
+      recovered_node_mass_rz.data(),
+      recovered_node_momentum_rz_r.data(),
+      recovered_node_momentum_rz_z.data());
+  txn_vth_sub_node("post_recovery",
+                   old_node_r,
+                   old_node_z,
+                   recovered_node_velocity_r,
+                   recovered_node_velocity_z);
+
+  core::DeviceArray<double> d_distribution_velocity_r(
+      "ale_remap:conservative_remap_csr:d_distribution_velocity_r");
+  core::DeviceArray<double> d_distribution_velocity_z(
+      "ale_remap:conservative_remap_csr:d_distribution_velocity_z");
+  core::DeviceArray<std::uint8_t> d_changed_node_mask(
+      "ale_remap:conservative_remap_csr:d_changed_node_mask");
+  d_distribution_velocity_r.reset(static_cast<std::size_t>(n_nodes));
+  d_distribution_velocity_z.reset(static_cast<std::size_t>(n_nodes));
+  d_changed_node_mask.reset(static_cast<std::size_t>(n_nodes));
+  d_distribution_velocity_r.copy_from_host(recovered_node_velocity_r);
+  d_distribution_velocity_z.copy_from_host(recovered_node_velocity_z);
+  d_changed_node_mask.copy_from_host(changed_node);
+  csr_copy_masked_node_velocity_kernel<<<blocks_nodes, 256>>>(
+      state.v_r.data(),
+      state.v_z.data(),
+      d_distribution_velocity_r.data(),
+      d_distribution_velocity_z.data(),
+      d_changed_node_mask.data(),
+      n_nodes);
+  CUDA_CHECK(cudaGetLastError());
+  CUDA_CHECK(core::debug_kernel_sync());
+
+  std::vector<double> aw_paired_corner_mass_packed(
+      static_cast<std::size_t>(n_cells) * 4U, 0.0);
+  for (int c = 0; c < n_cells; ++c) {
+    const int nverts = active_nverts(c);
+    const int base = c * state.corner_stride;
+    for (int k = 0; k < nverts; ++k) {
+      aw_paired_corner_mass_packed[static_cast<std::size_t>(4 * c + k)] =
+          aw_paired_corner_mass[static_cast<std::size_t>(base + k)];
+    }
+  }
+  core::DeviceArray<double> d_aw_paired_corner_mass(
+      "ale_remap:conservative_remap_csr:d_aw_paired_corner_mass");
+  d_aw_paired_corner_mass.reset(aw_paired_corner_mass_packed.size());
+  d_aw_paired_corner_mass.copy_from_host(aw_paired_corner_mass_packed);
+
+  CsrOptionBCornerVelocityRemapBuffers optionb_velocity_buffers;
+  if (optionb_velocity_authority) {
+    TENRYU_ASSERT(state.corner_stride == 4,
+                  "CSR Option-B energy coupling requires corner stride 4");
+    optionb_velocity_buffers.reset(n_cells, n_nodes);
+    optionb_velocity_buffers.corner_mass.copy_from_host(
+        aw_paired_corner_mass);
+    optionb_velocity_buffers.corner_p_r.copy_from_host(corner_momentum_r);
+    optionb_velocity_buffers.corner_p_z.copy_from_host(corner_momentum_z);
+    optionb_velocity_buffers.node_mass.copy_from_host(recovered_node_mass_rz);
+    optionb_velocity_buffers.node_p_r.copy_from_host(
+        recovered_node_momentum_rz_r);
+    optionb_velocity_buffers.node_p_z.copy_from_host(
+        recovered_node_momentum_rz_z);
+    optionb_velocity_buffers.v_r.copy_from_host(recovered_node_velocity_r);
+    optionb_velocity_buffers.v_z.copy_from_host(recovered_node_velocity_z);
+    optionb_velocity_buffers.cell_mass.copy_from_host(remapped_cell_mass);
+    if (optionb_coherent) {
+      result.optionb_coherent_corner_mass = distributed_corner_mass;
+    }
+  }
   CUDA_CHECK(cudaMemcpy(state.rho.data(),
                         d_rho_new,
                         cell_bytes,
@@ -16849,94 +19881,6 @@ AleRemap2DRZResult conservative_remap_csr(
                         cudaMemcpyDeviceToDevice));
 
   ale_velcoherence::sample(state, cfg, "s2_post_remap");
-
-  if (optionb_velocity_authority) {
-    if (overrides.active_node_velocity_mask != nullptr) {
-      csr_copy_masked_node_velocity_kernel<<<blocks_nodes, 256>>>(
-          state.v_r.data(),
-          state.v_z.data(),
-          optionb_velocity_buffers.v_r.data(),
-          optionb_velocity_buffers.v_z.data(),
-          overrides.active_node_velocity_mask,
-          n_nodes);
-      CUDA_CHECK(cudaGetLastError());
-    } else {
-      CUDA_CHECK(cudaMemcpy(state.v_r.data(),
-                            optionb_velocity_buffers.v_r.data(),
-                            node_bytes,
-                            cudaMemcpyDeviceToDevice));
-      CUDA_CHECK(cudaMemcpy(state.v_z.data(),
-                            optionb_velocity_buffers.v_z.data(),
-                            node_bytes,
-                            cudaMemcpyDeviceToDevice));
-    }
-  } else {
-    if (total_energy_remap) {
-      csr_project_cell_velocity_to_nodes_corner_mass_kernel<<<blocks_nodes, 256>>>(
-          state.v_r.data(),
-          state.v_z.data(),
-          d_vr_new,
-          d_vz_new,
-          d_mass_new,
-          state.x_r.data(),
-          state.x_z.data(),
-          state.mesh.multiblock_reverse_csr_node_offsets.data(),
-          state.mesh.multiblock_reverse_csr_node_cells.data(),
-          state.mesh.multiblock_reverse_csr_node_corners.data(),
-          d_cell_node_offsets,
-          d_cell_node_indices,
-          d_cell_nverts,
-          velocity_projection_frozen_node_mask,
-          d_inactive_cell_mask,
-          d_cell_orientation_sign,
-          rz::corner_mass_fallback_device_recorder(),
-          corner_mass_convention,
-          n_nodes);
-    } else {
-      csr_project_cell_velocity_to_nodes_kernel<<<blocks_nodes, 256>>>(
-          state.v_r.data(),
-          state.v_z.data(),
-          d_vr_new,
-          d_vz_new,
-          d_mass_new,
-          state.mesh.multiblock_reverse_csr_node_offsets.data(),
-          state.mesh.multiblock_reverse_csr_node_cells.data(),
-          d_cell_nverts,
-          velocity_projection_frozen_node_mask,
-          d_inactive_cell_mask,
-          n_nodes);
-    }
-    CUDA_CHECK(cudaGetLastError());
-  }
-  CUDA_CHECK(core::debug_kernel_sync());
-  core::DeviceArray<double> d_pre_boundary_vr("ale_remap:conservative_remap_csr:d_pre_boundary_vr");
-  core::DeviceArray<double> d_pre_boundary_vz("ale_remap:conservative_remap_csr:d_pre_boundary_vz");
-  if (optionb_velocity_authority &&
-      overrides.active_node_velocity_mask != nullptr) {
-    d_pre_boundary_vr.reset(static_cast<std::size_t>(n_nodes));
-    d_pre_boundary_vz.reset(static_cast<std::size_t>(n_nodes));
-    CUDA_CHECK(cudaMemcpy(d_pre_boundary_vr.data(),
-                          state.v_r.data(),
-                          node_bytes,
-                          cudaMemcpyDeviceToDevice));
-    CUDA_CHECK(cudaMemcpy(d_pre_boundary_vz.data(),
-                          state.v_z.data(),
-                          node_bytes,
-                          cudaMemcpyDeviceToDevice));
-  }
-  tenryu::hydro::apply_boundary_2d(state, cfg, 0.0);
-  if (optionb_velocity_authority &&
-      overrides.active_node_velocity_mask != nullptr) {
-    csr_restore_unmasked_node_velocity_kernel<<<blocks_nodes, 256>>>(
-        state.v_r.data(),
-        state.v_z.data(),
-        d_pre_boundary_vr.data(),
-        d_pre_boundary_vz.data(),
-        overrides.active_node_velocity_mask,
-        n_nodes);
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(core::debug_kernel_sync());
-  }
   if (optionb_velocity_authority &&
       optionb_ring5_momentum_trace_enabled_for_state(state)) {
     int ring5_cell_start = optionb_macroboundary_ring_start();
@@ -16960,7 +19904,7 @@ AleRemap2DRZResult conservative_remap_csr(
                           cudaMemcpyDeviceToDevice));
     csr_optionb_emit_ring5_momentum_trace(
         state,
-        "s6_post_boundary_constraints",
+        "s6_post_aw_recovery",
         ring5_cell_start,
         ring5_cell_end,
         &optionb_velocity_buffers.corner_mass,
@@ -16980,7 +19924,7 @@ AleRemap2DRZResult conservative_remap_csr(
       csr_support_closed_redistribute_total_energy_optionb_kernel<<<1, 1>>>(
           d_total_energy_new,
           state.mass.data(),
-          optionb_velocity_buffers.corner_mass.data(),
+          d_aw_paired_corner_mass.data(),
           state.v_r.data(),
           state.v_z.data(),
           state.zbar.empty() ? nullptr : state.zbar.data(),
@@ -16997,69 +19941,23 @@ AleRemap2DRZResult conservative_remap_csr(
           d_n_eint_floor_hits);
       CUDA_CHECK(cudaGetLastError());
     } else {
-      if (optionb_energy_coupling) {
-        csr_compute_total_energy_ke_cell_scale_optionb_kernel<<<blocks_cells, 256>>>(
-            d_ke_cell_scale,
-            d_total_energy_new,
-            state.mass.data(),
-            ter_frozen_ke_basis ? state.corner_mass.data()
-                                : optionb_velocity_buffers.corner_mass.data(),
-            state.v_r.data(),
-            state.v_z.data(),
-            state.zbar.empty() ? nullptr : state.zbar.data(),
-            d_cell_node_offsets,
-            d_cell_node_indices,
-            d_cell_nverts,
-            d_energy_inactive_cell_mask,
-            n_cells,
-            gamma,
-            A,
-            cfg.numerics.floors.Te,
-            ti_floor_remap);
-      } else if (physical_ke_remap) {
-        csr_compute_total_energy_ke_cell_scale_physical_ke_kernel<<<blocks_cells, 256>>>(
-            d_ke_cell_scale,
-            d_total_energy_new,
-            state.mass.data(),
-            state.x_r.data(),
-            state.x_z.data(),
-            state.v_r.data(),
-            state.v_z.data(),
-            state.zbar.empty() ? nullptr : state.zbar.data(),
-            d_cell_nverts,
-            d_energy_inactive_cell_mask,
-            d_cell_orientation_sign,
-            rz::corner_mass_fallback_device_recorder(),
-            corner_mass_convention,
-            n_cells,
-            nz,
-            gamma,
-            A,
-            cfg.numerics.floors.Te,
-            ti_floor_remap);
-      } else {
-        csr_compute_total_energy_ke_cell_scale_kernel<<<blocks_cells, 256>>>(
-            d_ke_cell_scale,
-            d_total_energy_new,
-            state.mass.data(),
-            state.x_r.data(),
-            state.x_z.data(),
-            state.v_r.data(),
-            state.v_z.data(),
-            state.zbar.empty() ? nullptr : state.zbar.data(),
-            d_cell_node_offsets,
-            d_cell_node_indices,
-            d_cell_nverts,
-            d_energy_inactive_cell_mask,
-            d_cell_orientation_sign,
-            rz::corner_mass_fallback_device_recorder(),
-            corner_mass_convention,
-            n_cells,
-            gamma,
-            A,
-            cfg.numerics.floors.Te,
-            ti_floor_remap);
-      }
+      csr_compute_total_energy_ke_cell_scale_optionb_kernel<<<blocks_cells, 256>>>(
+          d_ke_cell_scale,
+          d_total_energy_new,
+          state.mass.data(),
+          d_aw_paired_corner_mass.data(),
+          state.v_r.data(),
+          state.v_z.data(),
+          state.zbar.empty() ? nullptr : state.zbar.data(),
+          d_cell_node_offsets,
+          d_cell_node_indices,
+          d_cell_nverts,
+          d_energy_inactive_cell_mask,
+          n_cells,
+          gamma,
+          A,
+          cfg.numerics.floors.Te,
+          ti_floor_remap);
       CUDA_CHECK(cudaGetLastError());
       if (physical_ke_remap) {
         csr_compute_total_energy_ke_node_scale_physical_ke_kernel<<<blocks_nodes, 256>>>(
@@ -17090,81 +19988,27 @@ AleRemap2DRZResult conservative_remap_csr(
           n_nodes);
       CUDA_CHECK(cudaGetLastError());
     }
-    if (optionb_energy_coupling) {
-      csr_recover_internal_from_total_energy_remap_optionb_kernel<<<blocks_cells, 256>>>(
-          state.ee.data(),
-          state.ei.data(),
-          d_total_energy_new,
-          d_ye_int_new,
-          state.mass.data(),
-          ter_frozen_ke_basis ? state.corner_mass.data()
-                              : optionb_velocity_buffers.corner_mass.data(),
-          state.v_r.data(),
-          state.v_z.data(),
-          state.zbar.empty() ? nullptr : state.zbar.data(),
-          d_E_floor_injected,
-          d_n_eint_floor_hits,
-          d_cell_node_offsets,
-          d_cell_node_indices,
-          d_cell_nverts,
-          d_energy_inactive_cell_mask,
-          n_cells,
-          gamma,
-          A,
-          cfg.numerics.floors.Te,
-          ti_floor_remap);
-    } else if (physical_ke_remap) {
-      csr_recover_internal_from_total_energy_remap_physical_ke_kernel<<<blocks_cells, 256>>>(
-          state.ee.data(),
-          state.ei.data(),
-          d_total_energy_new,
-          d_ye_int_new,
-          state.mass.data(),
-          state.x_r.data(),
-          state.x_z.data(),
-          state.v_r.data(),
-          state.v_z.data(),
-          state.zbar.empty() ? nullptr : state.zbar.data(),
-          d_E_floor_injected,
-          d_n_eint_floor_hits,
-          d_cell_nverts,
-          d_energy_inactive_cell_mask,
-          d_cell_orientation_sign,
-          rz::corner_mass_fallback_device_recorder(),
-          corner_mass_convention,
-          n_cells,
-          nz,
-          gamma,
-          A,
-          cfg.numerics.floors.Te,
-          ti_floor_remap);
-    } else {
-      csr_recover_internal_from_total_energy_remap_kernel<<<blocks_cells, 256>>>(
-          state.ee.data(),
-          state.ei.data(),
-          d_total_energy_new,
-          d_ye_int_new,
-          state.mass.data(),
-          state.x_r.data(),
-          state.x_z.data(),
-          state.v_r.data(),
-          state.v_z.data(),
-          state.zbar.empty() ? nullptr : state.zbar.data(),
-          d_E_floor_injected,
-          d_n_eint_floor_hits,
-          d_cell_node_offsets,
-          d_cell_node_indices,
-          d_cell_nverts,
-          d_energy_inactive_cell_mask,
-          d_cell_orientation_sign,
-          rz::corner_mass_fallback_device_recorder(),
-          corner_mass_convention,
-          n_cells,
-          gamma,
-          A,
-          cfg.numerics.floors.Te,
-          ti_floor_remap);
-    }
+    csr_recover_internal_from_total_energy_remap_optionb_kernel<<<blocks_cells, 256>>>(
+        state.ee.data(),
+        state.ei.data(),
+        d_total_energy_new,
+        d_ye_int_new,
+        state.mass.data(),
+        d_aw_paired_corner_mass.data(),
+        state.v_r.data(),
+        state.v_z.data(),
+        state.zbar.empty() ? nullptr : state.zbar.data(),
+        d_E_floor_injected,
+        d_n_eint_floor_hits,
+        d_cell_node_offsets,
+        d_cell_node_indices,
+        d_cell_nverts,
+        d_energy_inactive_cell_mask,
+        n_cells,
+        gamma,
+        A,
+        cfg.numerics.floors.Te,
+        ti_floor_remap);
     CUDA_CHECK(cudaGetLastError());
     if (csr_cons_ledger.active) {
       CUDA_CHECK(cudaDeviceSynchronize());
@@ -17178,10 +20022,9 @@ AleRemap2DRZResult conservative_remap_csr(
           csr_cons_ledger.cell_D,
           gamma,
           A,
-          optionb_energy_coupling ? optionb_velocity_buffers.corner_mass.data()
-                                  : nullptr,
-          optionb_velocity_authority,
-          physical_ke_remap,
+          d_aw_paired_corner_mass.data(),
+          true,
+          false,
           csr_cons_context.reduction);
     }
     csr_remap_energy_audit_emit(
@@ -17190,12 +20033,11 @@ AleRemap2DRZResult conservative_remap_csr(
         cfg,
         gamma,
         A,
-        optionb_energy_coupling ? optionb_velocity_buffers.corner_mass.data()
-                                : nullptr,
+        d_aw_paired_corner_mass.data(),
         optionb_velocity_authority ? optionb_velocity_buffers.node_mass.data()
                                    : nullptr,
-        optionb_velocity_authority,
-        physical_ke_remap);
+        true,
+        false);
     if (near_vacuum_forensics_triggered) {
       csr_capture_near_vacuum_post_kernel<<<1, 1>>>(
           d_near_vacuum_record,
@@ -17248,17 +20090,6 @@ AleRemap2DRZResult conservative_remap_csr(
                                           nullptr);
   }
 
-  if (preserve_lagrangian_velocity_carry) {
-    CUDA_CHECK(cudaMemcpy(state.v_r.data(),
-                          d_vr_lagrangian_carry,
-                          node_bytes,
-                          cudaMemcpyDeviceToDevice));
-    CUDA_CHECK(cudaMemcpy(state.v_z.data(),
-                          d_vz_lagrangian_carry,
-                          node_bytes,
-                          cudaMemcpyDeviceToDevice));
-    CUDA_CHECK(cudaDeviceSynchronize());
-  }
   tenryu::hydro::ale_diag::emit_mover_post_projection(state, cfg, dt, state.t + dt);
 
   // 1T runs keep the total internal energy in ee with ei == 0 by convention;
@@ -17315,89 +20146,76 @@ AleRemap2DRZResult conservative_remap_csr(
       trace_mesh_motion
           ? tenryu::hydro::mesh_trace::coordinate_hash(state)
           : 0ULL;
-  // Two distinct operations historically shared one env: (a) the per-step
-  // geometry-recomputed canonicalize (csr_optionb_canonicalize_corner_mass
-  // _basis, physics-altering — see its warning comment) and (b) THIS
-  // remap-time install of the velocity remap's TRANSPORTED corner masses.
-  // (b) is the candidate fix for the mixed-core budget-basis staleness
-  // (the frozen init basis no longer represents the transported mass
-  // distribution after remaps move mass between cells), so it gets its own
-  // env for an unconfounded experiment.
-  const bool optionb_install_fm_corner_mass =
-      optionb_allowed &&
-      (overrides.force_optionb_corner_mass_install ||
-       env_flag_enabled("TENRYU_I1B_OPTIONB_CANONICALIZE") ||
-       env_flag_enabled("TENRYU_I1B_OPTIONB_INSTALL_REMAPPED_CORNER_MASS"));
-  if (optionb_energy_coupling && optionb_install_fm_corner_mass) {
-    const std::size_t expected_corner_mass_size =
-        static_cast<std::size_t>(n_cells) * 4U;
-    if (state.corner_mass.size() != expected_corner_mass_size) {
-      state.corner_mass.reset(expected_corner_mass_size);
+  // The host distribution phase consumed the transported corner masses before
+  // any write-back and replaced changed-cell entries in this authoritative
+  // AoS ledger. Install that exact ledger once after geometry commit.
+  state.corner_mass.copy_from_host(distributed_corner_mass);
+  state.corner_mass_initialized = true;
+  state.corner_mass_is_lagrangian_invariant =
+      tenryu::hydro::corner_mass_lagrangian_invariant_enabled(cfg);
+  if (ke_projection_audit || txn_vth_sub_diag) {
+    std::vector<double> final_node_velocity_r;
+    std::vector<double> final_node_velocity_z;
+    state.v_r.copy_to_host(final_node_velocity_r);
+    state.v_z.copy_to_host(final_node_velocity_z);
+    std::vector<double> aw_kinetic_total(
+        static_cast<std::size_t>(n_cells), 0.0);
+    double commuting_ke_exchange = 0.0;
+    for (int c = 0; c < n_cells; ++c) {
+      if (!inactive_cell_mask.empty() &&
+          inactive_cell_mask[static_cast<std::size_t>(c)] != 0U) {
+        continue;
+      }
+      const int begin =
+          mb.cell_node_csr_offsets[static_cast<std::size_t>(c)];
+      const int nverts = active_nverts(c);
+      const int base = c * state.corner_stride;
+      double kinetic = 0.0;
+      for (int k = 0; k < nverts; ++k) {
+        const int node = mb.cell_node_csr_indices[
+            static_cast<std::size_t>(begin + k)];
+        const double vr =
+            final_node_velocity_r[static_cast<std::size_t>(node)];
+        const double vz =
+            final_node_velocity_z[static_cast<std::size_t>(node)];
+        kinetic += 0.5 *
+                   aw_paired_corner_mass[
+                       static_cast<std::size_t>(base + k)] *
+                   (vr * vr + vz * vz);
+      }
+      aw_kinetic_total[static_cast<std::size_t>(c)] = kinetic;
+      if (changed_cell[static_cast<std::size_t>(c)] != 0U) {
+        const double predictor_momentum_r =
+            predictor_cell_momentum_r[static_cast<std::size_t>(c)];
+        const double predictor_momentum_z =
+            predictor_cell_momentum_z[static_cast<std::size_t>(c)];
+        const double predictor_kinetic =
+            0.5 * (predictor_momentum_r * predictor_momentum_r +
+                   predictor_momentum_z * predictor_momentum_z) /
+            remapped_cell_mass[static_cast<std::size_t>(c)];
+        commuting_ke_exchange += predictor_kinetic - kinetic;
+      }
     }
-    const std::uint8_t* const corner_install_mask =
-        overrides.corner_transport_cell_mask != nullptr
-            ? overrides.corner_transport_cell_mask
-            : overrides.active_cell_mask;
-    if (corner_install_mask != nullptr) {
-      csr_install_masked_corner_mass_kernel<<<blocks_cells, 256>>>(
-          state.corner_mass.data(),
-          optionb_velocity_buffers.corner_mass.data(),
-          corner_install_mask,
-          n_cells);
-      CUDA_CHECK(cudaGetLastError());
-    } else {
-      CUDA_CHECK(cudaMemcpy(state.corner_mass.data(),
-                            optionb_velocity_buffers.corner_mass.data(),
-                            corner_bytes,
-                            cudaMemcpyDeviceToDevice));
+    if (txn_vth_sub_diag) {
+      std::fprintf(stderr,
+                   "[aw_commute] ke_exchange=%.6e\n",
+                   commuting_ke_exchange);
     }
-    CUDA_CHECK(cudaDeviceSynchronize());
-    state.corner_mass_initialized = true;
-    state.corner_mass_is_lagrangian_invariant = false;
-  } else if (remap_compatible_corner_mass) {
-    csr_finish_corner_fraction_remap_kernel<<<blocks_cells, 256>>>(
-        state.corner_mass.data(),
-        d_corner_fraction_mass_new,
-        d_mass_new,
-        d_cell_nverts,
-        d_inactive_cell_mask,
-        state.corner_stride,
-        n_cells);
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(core::debug_kernel_sync());
-    state.corner_mass_initialized = true;
-    state.corner_mass_is_lagrangian_invariant =
-        tenryu::hydro::corner_mass_lagrangian_invariant_enabled(cfg);
-  } else {
-    tenryu::hydro::ensure_hourglass_subzonal_masses_2d(state, cfg, true);
-  }
-  if (ke_projection_audit) {
-    csr_compute_corner_kinetic_total_kernel<<<blocks_cells, 256>>>(
-        d_ke_actual,
-        state.mass.data(),
-        state.x_r.data(),
-        state.x_z.data(),
-        state.v_r.data(),
-        state.v_z.data(),
-        d_cell_node_offsets,
-        d_cell_node_indices,
-        d_cell_nverts,
-        d_inactive_cell_mask,
-        d_cell_orientation_sign,
-        rz::corner_mass_fallback_device_recorder(),
-        corner_mass_convention,
-        n_cells);
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(core::debug_kernel_sync());
-    if (cap_energy_audit) {
-      const double K_cons = sum_device_array(d_ke_ext_new, n_cells);
-      const double K_act = sum_device_array(d_ke_actual, n_cells);
-      result.cap_energy_audit_D_K = K_cons - K_act;
-    }
-    if (i1b_spurious_sensor) {
-      result.i1b_ale_ke_sensor = reduce_ale_ke_projection_sensor(
-          d_ke_ext_new, d_ke_actual, d_cell_nverts, n_cells,
-          tenryu::hydro::i1b_spurious_sensor_top_k());
+    if (ke_projection_audit) {
+      CUDA_CHECK(cudaMemcpy(d_ke_actual,
+                            aw_kinetic_total.data(),
+                            static_cast<std::size_t>(n_cells) * sizeof(double),
+                            cudaMemcpyHostToDevice));
+      if (cap_energy_audit) {
+        const double K_cons = sum_device_array(d_ke_ext_new, n_cells);
+        const double K_act = sum_device_array(d_ke_actual, n_cells);
+        result.cap_energy_audit_D_K = K_cons - K_act;
+      }
+      if (i1b_spurious_sensor) {
+        result.i1b_ale_ke_sensor = reduce_ale_ke_projection_sensor(
+            d_ke_ext_new, d_ke_actual, d_cell_nverts, n_cells,
+            tenryu::hydro::i1b_spurious_sensor_top_k());
+      }
     }
   }
   mesh_trace::trace_cell0_geometry(state, cfg, "csr_remap_post_corner_mass");
@@ -17577,7 +20395,79 @@ AleRemap2DRZResult conservative_remap_csr(
   }
   result.applied = true;
   conservation_audit::emit_stage(state, "ale_csr_swept_remap_post");
+  if (p3_oracle.mode == P3OracleMode::Vnode ||
+      p3_oracle.mode == P3OracleMode::Combined) {
+    p3_oracle_overwrite_node_velocity_kernel<<<blocks_nodes, 256>>>(
+        state.v_r.data(),
+        state.v_z.data(),
+        state.x_r.data(),
+        state.x_z.data(),
+        overrides.active_node_velocity_mask,
+        n_nodes,
+        p3_oracle.H);
+    CUDA_CHECK(cudaGetLastError());
+  }
+  if (p3_oracle.mode == P3OracleMode::Energy ||
+      p3_oracle.mode == P3OracleMode::Combined) {
+    const double oracle_time = state.t + dt;
+    const double one_minus_Ht = 1.0 - p3_oracle.H * oracle_time;
+    const double rho_analytic =
+        p3_oracle.rho0 /
+        (one_minus_Ht * one_minus_Ht * one_minus_Ht);
+    const double rho_ratio = rho_analytic / p3_oracle.rho0;
+    const double pressure_e =
+        p3_oracle.pe0 * std::pow(rho_ratio, p3_oracle.gamma);
+    const double pressure_i =
+        p3_oracle.pi0 * std::pow(rho_ratio, p3_oracle.gamma);
+    const std::uint8_t* const oracle_inactive_cell_mask =
+        support_closed_energy_closure ? d_energy_inactive_cell_mask
+                                      : d_inactive_cell_mask;
+    p3_oracle_overwrite_energy_kernel<<<blocks_cells, 256>>>(
+        state.ee.data(),
+        state.ei.data(),
+        state.rho.data(),
+        oracle_inactive_cell_mask,
+        n_cells,
+        pressure_e,
+        pressure_i,
+        p3_oracle.gamma);
+    CUDA_CHECK(cudaGetLastError());
+    eos_reclosure_ideal_gas_kernel<<<blocks_cells, 256>>>(
+        state.Te.data(),
+        state.Ti.data(),
+        state.Pe.data(),
+        state.Pi.data(),
+        state.ee.data(),
+        state.ei.data(),
+        state.rho.data(),
+        state.zbar.empty() ? nullptr : state.zbar.data(),
+        n_cells,
+        nz,
+        0,
+        oracle_inactive_cell_mask,
+        cfg.main.two_temperature ? 1 : 0,
+        p3_oracle.gamma,
+        A,
+        cfg.numerics.floors.rho,
+        cfg.numerics.floors.Te,
+        ti_floor_remap);
+    CUDA_CHECK(cudaGetLastError());
+  }
+  if (p3_oracle.mode == P3OracleMode::Vnode) {
+    p3_oracle_log_once(p3_oracle, "remap_exit_vnode");
+  } else if (p3_oracle.mode == P3OracleMode::Energy) {
+    p3_oracle_log_once(p3_oracle, "remap_exit_eos_reclosure");
+  } else if (p3_oracle.mode == P3OracleMode::Combined) {
+    p3_oracle_log_once(p3_oracle,
+                       "remap_exit_vnode+eos_reclosure");
+  }
+  if (p3_oracle.mode == P3OracleMode::Vnode ||
+      p3_oracle.mode == P3OracleMode::Energy ||
+      p3_oracle.mode == P3OracleMode::Combined) {
+    CUDA_CHECK(cudaDeviceSynchronize());
+  }
   cleanup();
+  restore_out_of_mask_velocities();
   return result;
 }
 
@@ -17783,7 +20673,7 @@ void emit_coherent_projection_impulse_ledger(
 
 void csr_optionb_canonicalize_corner_mass_basis(core::State& state,
                                                 const core::Config& cfg) {
-  if (state.corner_stride != 4 ||
+  if ((state.corner_stride != 4 && state.corner_stride != 8) ||
       !csr_optionb_velocity_authority_enabled(cfg)) {
     return;
   }
@@ -17806,7 +20696,8 @@ void csr_optionb_canonicalize_corner_mass_basis(core::State& state,
     return;
   }
   const std::size_t expected_corner_mass_size =
-      static_cast<std::size_t>(n_cells) * 4U;
+      static_cast<std::size_t>(n_cells) *
+      static_cast<std::size_t>(state.corner_stride);
   TENRYU_ASSERT(state.mass.size() == static_cast<std::size_t>(n_cells),
                 "Option-B corner-mass canonicalization requires cell mass");
   TENRYU_ASSERT(state.x_r.size() ==
@@ -17839,6 +20730,7 @@ void csr_optionb_canonicalize_corner_mass_basis(core::State& state,
       state.mesh.multiblock_cell_node_csr_indices.data(),
       d_cell_nverts,
       d_inactive_cell_mask,
+      state.corner_stride,
       n_cells);
   CUDA_CHECK(cudaGetLastError());
   CUDA_CHECK(core::debug_kernel_sync());
@@ -18085,7 +20977,6 @@ csr_optionb_corner_velocity_remap_component(
     const core::Config& cfg,
     CsrOptionBCornerVelocityRemapBuffers& buffers,
     const bool force_apply,
-    const bool force_swept_volume_sign_fixed,
     const double* const target_cell_mass,
     const double* const source_v_r_override,
     const double* const source_v_z_override,
@@ -18100,7 +20991,8 @@ csr_optionb_corner_velocity_remap_component(
     const std::uint8_t* const assembly_cell_mask,
     const std::uint8_t* const active_node_velocity_mask,
     const std::uint8_t* const target_cell_mass_mask,
-    const std::uint8_t* const discard_reference_inactive_cell_mask) {
+    const std::uint8_t* const discard_reference_inactive_cell_mask,
+    const std::uint8_t* const donor_fallback_cell_mask) {
   CsrOptionBCornerVelocityRemapResult result;
   if (state.corner_stride != 4) {
     return result;
@@ -18117,6 +21009,8 @@ csr_optionb_corner_velocity_remap_component(
   const auto& mb = *state.mesh.topo.multiblock;
   const int n_cells = state.mesh.topo.n_cells;
   const int n_nodes = state.mesh.topo.n_nodes;
+  const RemapDispatchAuditDeviceView remap_dispatch_audit =
+      remap_dispatch_audit_device_view();
   TENRYU_ASSERT(n_cells > 0 && n_nodes > 0,
                 "CSR Option B velocity remap component requires non-empty mesh");
   TENRYU_ASSERT(state.mass.size() == static_cast<std::size_t>(n_cells) &&
@@ -18184,6 +21078,18 @@ csr_optionb_corner_velocity_remap_component(
   const int n_internal_faces =
       static_cast<int>(mb.unique_internal_faces.size());
   const int n_boundary_faces = static_cast<int>(mb.boundary_faces.size());
+  const int n_edges = n_internal_faces + n_boundary_faces;
+  const std::size_t cell_edge_incidence_count =
+      2U * static_cast<std::size_t>(n_internal_faces) +
+      static_cast<std::size_t>(n_boundary_faces);
+  TENRYU_ASSERT(state.mesh.multiblock_cell_edge_csr_offsets.size() ==
+                    static_cast<std::size_t>(n_cells) + 1U,
+                "CSR Option B outgoing mass requires cell-edge CSR offsets");
+  TENRYU_ASSERT(state.mesh.multiblock_cell_edge_csr_edges.size() ==
+                        cell_edge_incidence_count &&
+                    state.mesh.multiblock_cell_edge_csr_side.size() ==
+                        cell_edge_incidence_count,
+                "CSR Option B outgoing mass requires cell-edge CSR entries");
   result.n_internal_faces = n_internal_faces;
   result.total_internal_face_packets =
       static_cast<long long>(n_internal_faces);
@@ -18254,6 +21160,9 @@ csr_optionb_corner_velocity_remap_component(
 
   core::DeviceArray<double> d_outgoing_mass("ale_remap:csr_optionb_corner_velocity_remap_component:d_outgoing_mass");
   d_outgoing_mass.reset(static_cast<std::size_t>(n_cells));
+  core::DeviceArray<double> d_outgoing_mass_stage(
+      "ale_remap:csr_optionb_corner_velocity_remap_component:d_outgoing_mass_stage");
+  d_outgoing_mass_stage.reset(2U * static_cast<std::size_t>(n_edges));
   core::DeviceArray<double> d_mass_flux_scale("ale_remap:csr_optionb_corner_velocity_remap_component:d_mass_flux_scale");
   d_mass_flux_scale.reset(static_cast<std::size_t>(n_cells));
   core::DeviceArray<int> d_diagnostics("ale_remap:csr_optionb_corner_velocity_remap_component:d_diagnostics");
@@ -18297,6 +21206,12 @@ csr_optionb_corner_velocity_remap_component(
       state.mesh.multiblock_cell_node_csr_offsets.data();
   const int* d_cell_node_indices =
       state.mesh.multiblock_cell_node_csr_indices.data();
+  const int* d_cell_edge_offsets =
+      state.mesh.multiblock_cell_edge_csr_offsets.data();
+  const int* d_cell_edge_edges =
+      state.mesh.multiblock_cell_edge_csr_edges.data();
+  const std::int8_t* d_cell_edge_side =
+      state.mesh.multiblock_cell_edge_csr_side.data();
   const int* d_unique_cell_a =
       n_internal_faces > 0
           ? thrust::raw_pointer_cast(mb.d_unique_face_cell_a.data())
@@ -18321,9 +21236,6 @@ csr_optionb_corner_velocity_remap_component(
       state.cell_vol_initial.size() == static_cast<std::size_t>(n_cells)
           ? state.cell_vol_initial.data()
           : state.vol.data();
-  const bool swept_volume_sign_fixed =
-      cfg.numerics.ale.swept_volume_sign_fixed ||
-      force_swept_volume_sign_fixed;
   const bool optionb_diag_enabled =
       env_flag_enabled("TENRYU_I1B_OPTIONB_VELREMAP_DIAG");
   const bool support_closed_replay =
@@ -18405,17 +21317,28 @@ csr_optionb_corner_velocity_remap_component(
                                           nullptr);
   }
 
+  if (n_edges > 0) {
+    CUDA_CHECK(cudaMemset(d_outgoing_mass_stage.data(),
+                          0,
+                          2U * static_cast<std::size_t>(n_edges) *
+                              sizeof(double)));
+  }
   if (n_internal_faces > 0) {
     csr_accumulate_internal_hydro_outgoing_mass_kernel<<<blocks_internal, 256>>>(
-        d_outgoing_mass.data(),
+        d_outgoing_mass_stage.data(),
         false,
         state.rho.data(),
+        nullptr,
+        nullptr,
+        nullptr,
         nullptr,
         nullptr,
         state.x_r.data(),
         state.x_z.data(),
         state.x_r_reference.data(),
         state.x_z_reference.data(),
+        nullptr,
+        nullptr,
         d_cell_node_offsets,
         d_cell_node_indices,
         d_unique_cell_a,
@@ -18424,22 +21347,27 @@ csr_optionb_corner_velocity_remap_component(
         d_cell_orientation_sign.data(),
         d_cell_nverts,
         inactive_cell_mask,
-        swept_volume_sign_fixed,
-        n_internal_faces);
+        n_internal_faces,
+        n_cells);
     CUDA_CHECK(cudaGetLastError());
   }
   if (n_boundary_faces > 0) {
     const int blocks_boundary = (n_boundary_faces + 255) / 256;
     csr_accumulate_boundary_hydro_outgoing_mass_kernel<<<blocks_boundary, 256>>>(
-        d_outgoing_mass.data(),
+        d_outgoing_mass_stage.data(),
         false,
         state.rho.data(),
+        nullptr,
+        nullptr,
+        nullptr,
         nullptr,
         nullptr,
         state.x_r.data(),
         state.x_z.data(),
         state.x_r_reference.data(),
         state.x_z_reference.data(),
+        nullptr,
+        nullptr,
         d_cell_node_offsets,
         d_cell_node_indices,
         d_boundary_cell,
@@ -18447,7 +21375,19 @@ csr_optionb_corner_velocity_remap_component(
         d_cell_orientation_sign.data(),
         d_cell_nverts,
         inactive_cell_mask,
-        n_boundary_faces);
+        n_internal_faces,
+        n_boundary_faces,
+        n_cells);
+    CUDA_CHECK(cudaGetLastError());
+  }
+  if (n_edges > 0) {
+    csr_gather_face_side_scalar_stage_kernel<<<blocks_cells, 256>>>(
+        d_outgoing_mass.data(),
+        d_outgoing_mass_stage.data(),
+        d_cell_edge_offsets,
+        d_cell_edge_edges,
+        d_cell_edge_side,
+        n_cells);
     CUDA_CHECK(cudaGetLastError());
   }
   csr_compute_hydro_mass_flux_scale_kernel<<<blocks_cells, 256>>>(
@@ -18459,7 +21399,8 @@ csr_optionb_corner_velocity_remap_component(
       d_vol_new,
       inactive_cell_mask,
       n_cells,
-      cfg.numerics.floors.rho);
+      cfg.numerics.floors.rho,
+      remap_dispatch_audit);
   CUDA_CHECK(cudaGetLastError());
 
   if (support_closed_replay && n_internal_faces > 0) {
@@ -18498,9 +21439,9 @@ csr_optionb_corner_velocity_remap_component(
         d_cell_nverts,
         d_node_flags,
         d_mass_flux_scale.data(),
-        swept_volume_sign_fixed,
         n_internal_faces,
         inactive_cell_mask,
+        donor_fallback_cell_mask,
         discard_reference_inactive_cell_mask,
         d_discard_ledger.empty() ? nullptr : d_discard_ledger.data(),
         coherent_transport ? state.corner_mass.data() : nullptr,
@@ -18521,7 +21462,8 @@ csr_optionb_corner_velocity_remap_component(
         ring5_trace_enabled ? d_ring5_face_cell_a.data() : nullptr,
         ring5_trace_enabled ? d_ring5_face_cell_b.data() : nullptr,
         ring5_trace_enabled ? d_ring5_face_donor.data() : nullptr,
-        ring5_trace_enabled ? d_ring5_face_receiver.data() : nullptr);
+        ring5_trace_enabled ? d_ring5_face_receiver.data() : nullptr,
+        remap_dispatch_audit);
     CUDA_CHECK(cudaGetLastError());
     csr_optionb_gather_internal_face_fluxes_kernel<<<blocks_cells, 256>>>(
         buffers.corner_mass.data(),
@@ -18561,9 +21503,9 @@ csr_optionb_corner_velocity_remap_component(
           d_mass_flux_scale.data(),
           d_face_color.data(),
           color,
-          swept_volume_sign_fixed,
           n_internal_faces,
           inactive_cell_mask,
+          donor_fallback_cell_mask,
           discard_reference_inactive_cell_mask,
           d_discard_ledger.empty() ? nullptr : d_discard_ledger.data(),
           coherent_transport ? state.corner_mass.data() : nullptr,
@@ -18585,7 +21527,8 @@ csr_optionb_corner_velocity_remap_component(
           ring5_trace_enabled ? d_ring5_face_cell_a.data() : nullptr,
           ring5_trace_enabled ? d_ring5_face_cell_b.data() : nullptr,
           ring5_trace_enabled ? d_ring5_face_donor.data() : nullptr,
-          ring5_trace_enabled ? d_ring5_face_receiver.data() : nullptr);
+          ring5_trace_enabled ? d_ring5_face_receiver.data() : nullptr,
+          remap_dispatch_audit);
       CUDA_CHECK(cudaGetLastError());
     }
   }
@@ -18609,7 +21552,8 @@ csr_optionb_corner_velocity_remap_component(
         d_mass_flux_scale.data(),
         n_boundary_faces,
         inactive_cell_mask,
-        d_diagnostics.data());
+        d_diagnostics.data(),
+        remap_dispatch_audit);
     CUDA_CHECK(cudaGetLastError());
   }
   CsrOptionBRing5FaceSummary ring5_face_summary;
@@ -19147,9 +22091,18 @@ AleRemap2DRZResult ale_remap_2d_rz(core::State& state,
                                    const std::uint8_t* core_freeze_frozen_node_mask,
                                    const AleRemap2DRZOverrides& overrides) {
   AleRemap2DRZResult result;
+  std::ostringstream corner_stride_assert_message;
+  corner_stride_assert_message
+      << "corner_stride must be 4 or 8; stride-8 belt remap is enabled by ALE P4"
+      << " [state.corner_stride=" << state.corner_stride
+      << ", state.mesh.corner_stride=" << state.mesh.corner_stride
+      << ", state.mesh.topo.n_cells=" << state.mesh.topo.n_cells
+      << ", state.corner_mass.size()=" << state.corner_mass.size()
+      << ", state.mesh.topo.multiblock.has_value()="
+      << (state.mesh.topo.multiblock.has_value() ? "true" : "false") << "]";
   TENRYU_ASSERT(
       state.corner_stride == 4 || state.corner_stride == 8,
-      "corner_stride must be 4 or 8; stride-8 belt remap is enabled by ALE P4");
+      corner_stride_assert_message.str());
   if (ale_identity_mode_enabled(cfg)) {
     return result;
   }
@@ -19207,9 +22160,15 @@ AleRemap2DRZResult ale_remap_2d_rz(core::State& state,
   TENRYU_ASSERT(dt >= 0.0, "conservative RZ remap requires non-negative dt");
   TENRYU_ASSERT(state.mesh.dim == 2, "conservative RZ remap requires 2D mesh");
   if (eos_ctx != nullptr && eos_ctx->any_table) {
-    TENRYU_ASSERT(false,
-                  "conservative RZ remap currently supports ideal-gas EOS only");
+    TENRYU_ASSERT(overrides.allow_table_eos_closure,
+                  "conservative RZ remap with table EOS is transaction-only (§19 v1); "
+                  "the per-step conservative remap path remains ideal-gas only");
+    TENRYU_ASSERT(eos_ctx->n_materials == 1,
+                  "§19 v1: table-EOS conservative remap supports one material");
   }
+  const bool table_closure_mode =
+      eos_ctx != nullptr && eos_ctx->any_table &&
+      overrides.allow_table_eos_closure;
   if (cfg.numerics.materials.per_material_conservation_enabled) {
     TENRYU_ASSERT(false,
                   "conservative RZ remap currently supports cell-mixture "
@@ -19259,6 +22218,10 @@ AleRemap2DRZResult ale_remap_2d_rz(core::State& state,
   const bool second_order_remap =
       cfg.numerics.ale.conservative_remap_order == "second_order_van_leer";
   const bool total_energy_remap = cfg.numerics.hydro.total_energy_remap_2d_rz;
+  if (table_closure_mode) {
+    TENRYU_ASSERT(!total_energy_remap,
+                  "§19 v1: table-EOS conservative remap excludes total-energy modes");
+  }
   const bool remap_burn_species =
       cfg.burn.enabled && !total_energy_remap &&
       state.burn_n_host.size() ==
@@ -19314,6 +22277,34 @@ AleRemap2DRZResult ale_remap_2d_rz(core::State& state,
   double* d_state_supply_donor_avg = nullptr;
   double* d_ke_before_projection = nullptr;
   double* d_ke_after_projection = nullptr;
+  double* d_table_snapshot_rho = nullptr;
+  double* d_table_snapshot_mass = nullptr;
+  double* d_table_snapshot_ee = nullptr;
+  double* d_table_snapshot_ei = nullptr;
+  double* d_table_snapshot_Te = nullptr;
+  double* d_table_snapshot_Ti = nullptr;
+  double* d_table_snapshot_Pe = nullptr;
+  double* d_table_snapshot_Pi = nullptr;
+  double* d_table_snapshot_v_r = nullptr;
+  double* d_table_snapshot_v_z = nullptr;
+  double* d_table_snapshot_corner_mass = nullptr;
+  double* d_table_snapshot_corner_volume = nullptr;
+  double* d_table_snapshot_subzonal_mass_corner0 = nullptr;
+  double* d_table_snapshot_subzonal_mass_corner1 = nullptr;
+  double* d_table_snapshot_subzonal_mass_corner2 = nullptr;
+  double* d_table_snapshot_subzonal_mass_corner3 = nullptr;
+  double* d_table_snapshot_rad_E = nullptr;
+  double* d_table_snapshot_burn_species = nullptr;
+  double* d_table_snapshot_hot_e_eps = nullptr;
+  double* d_table_snapshot_burn_eps = nullptr;
+  double* d_table_snapshot_burn_Ng = nullptr;
+  double* d_table_snapshot_burn_Ng_work = nullptr;
+  double* d_table_snapshot_Qvisc = nullptr;
+  double* d_table_snapshot_zbar = nullptr;
+  double* d_table_snapshot_hllc_mom_z_cell = nullptr;
+  int* d_table_closure_status = nullptr;
+  double* d_table_boundary_max_abs = nullptr;
+  std::size_t table_snapshot_burn_Ng_work_size = 0U;
   std::uint8_t* d_cell_nverts = nullptr;
   std::uint8_t* d_node_flags = nullptr;
 
@@ -19504,6 +22495,130 @@ AleRemap2DRZResult ale_remap_2d_rz(core::State& state,
   memset_zero(d_brad_bot, static_cast<std::size_t>(nr));
   memset_zero(d_brad_top, static_cast<std::size_t>(nr));
 
+  if (table_closure_mode) {
+    d_table_snapshot_rho = snapshot_device_array(
+        "ale_remap:structured:table_snapshot_rho",
+        state.rho.data(),
+        state.rho.size());
+    d_table_snapshot_mass = snapshot_device_array(
+        "ale_remap:structured:table_snapshot_mass",
+        state.mass.data(),
+        state.mass.size());
+    d_table_snapshot_ee = snapshot_device_array(
+        "ale_remap:structured:table_snapshot_ee",
+        state.ee.data(),
+        state.ee.size());
+    d_table_snapshot_ei = snapshot_device_array(
+        "ale_remap:structured:table_snapshot_ei",
+        state.ei.data(),
+        state.ei.size());
+    d_table_snapshot_Te = snapshot_device_array(
+        "ale_remap:structured:table_snapshot_Te",
+        state.Te.data(),
+        state.Te.size());
+    d_table_snapshot_Ti = snapshot_device_array(
+        "ale_remap:structured:table_snapshot_Ti",
+        state.Ti.data(),
+        state.Ti.size());
+    d_table_snapshot_Pe = snapshot_device_array(
+        "ale_remap:structured:table_snapshot_Pe",
+        state.Pe.data(),
+        state.Pe.size());
+    d_table_snapshot_Pi = snapshot_device_array(
+        "ale_remap:structured:table_snapshot_Pi",
+        state.Pi.data(),
+        state.Pi.size());
+    d_table_snapshot_v_r = snapshot_device_array(
+        "ale_remap:structured:table_snapshot_v_r",
+        state.v_r.data(),
+        state.v_r.size());
+    d_table_snapshot_v_z = snapshot_device_array(
+        "ale_remap:structured:table_snapshot_v_z",
+        state.v_z.data(),
+        state.v_z.size());
+    d_table_snapshot_corner_mass = snapshot_device_array(
+        "ale_remap:structured:table_snapshot_corner_mass",
+        state.corner_mass.data(),
+        state.corner_mass.size());
+    d_table_snapshot_corner_volume = snapshot_device_array(
+        "ale_remap:structured:table_snapshot_corner_volume",
+        state.corner_volume.data(),
+        state.corner_volume.size());
+    d_table_snapshot_subzonal_mass_corner0 = snapshot_device_array(
+        "ale_remap:structured:table_snapshot_subzonal_mass_corner0",
+        state.subzonal_mass_corner0.data(),
+        state.subzonal_mass_corner0.size());
+    d_table_snapshot_subzonal_mass_corner1 = snapshot_device_array(
+        "ale_remap:structured:table_snapshot_subzonal_mass_corner1",
+        state.subzonal_mass_corner1.data(),
+        state.subzonal_mass_corner1.size());
+    d_table_snapshot_subzonal_mass_corner2 = snapshot_device_array(
+        "ale_remap:structured:table_snapshot_subzonal_mass_corner2",
+        state.subzonal_mass_corner2.data(),
+        state.subzonal_mass_corner2.size());
+    d_table_snapshot_subzonal_mass_corner3 = snapshot_device_array(
+        "ale_remap:structured:table_snapshot_subzonal_mass_corner3",
+        state.subzonal_mass_corner3.data(),
+        state.subzonal_mass_corner3.size());
+    d_table_snapshot_rad_E = snapshot_device_array(
+        "ale_remap:structured:table_snapshot_rad_E",
+        state.rad_E.data(),
+        state.rad_E.size());
+    if (remap_burn_species) {
+      d_table_snapshot_burn_species = snapshot_device_array(
+          "ale_remap:structured:table_snapshot_burn_species",
+          d_burn_species_Y_lag,
+          state.burn_n_host.size());
+    }
+    if (remap_hot_e_eps) {
+      d_table_snapshot_hot_e_eps = snapshot_device_array(
+          "ale_remap:structured:table_snapshot_hot_e_eps",
+          d_hot_e_eps_lag,
+          state.hot_e_eps_cum_host.size());
+    }
+    if (remap_burn_eps) {
+      d_table_snapshot_burn_eps = snapshot_device_array(
+          "ale_remap:structured:table_snapshot_burn_eps",
+          d_burn_eps_lag,
+          state.burn_eps_cum_host.size());
+    }
+    if (remap_burn_spectrum) {
+      d_table_snapshot_burn_Ng = snapshot_device_array(
+          "ale_remap:structured:table_snapshot_burn_Ng",
+          state.burn_Ng.data(),
+          state.burn_Ng.size());
+      table_snapshot_burn_Ng_work_size = state.burn_Ng_work.size();
+      d_table_snapshot_burn_Ng_work = snapshot_device_array(
+          "ale_remap:structured:table_snapshot_burn_Ng_work",
+          state.burn_Ng_work.data(),
+          table_snapshot_burn_Ng_work_size);
+    }
+    if (button_outer_node_ring > 0) {
+      d_table_snapshot_Qvisc = snapshot_device_array(
+          "ale_remap:structured:table_snapshot_Qvisc",
+          state.Qvisc.data(),
+          state.Qvisc.size());
+      d_table_snapshot_zbar = snapshot_device_array(
+          "ale_remap:structured:table_snapshot_zbar",
+          state.zbar.data(),
+          state.zbar.size());
+      d_table_snapshot_hllc_mom_z_cell = snapshot_device_array(
+          "ale_remap:structured:table_snapshot_hllc_mom_z_cell",
+          state.hllc_mom_z_cell.data(),
+          state.hllc_mom_z_cell.size());
+    }
+    d_table_closure_status = static_cast<int*>(core::device_scratch_acquire(
+        "ale_remap:structured:table_closure_status",
+        static_cast<std::size_t>(n_cells) * sizeof(int)));
+    d_table_boundary_max_abs = static_cast<double*>(
+        core::device_scratch_acquire(
+            "ale_remap:structured:table_boundary_max_abs",
+            sizeof(double)));
+    memset_zero_int(d_table_closure_status,
+                    static_cast<std::size_t>(n_cells));
+    memset_zero(d_table_boundary_max_abs, 1U);
+  }
+
 	  compute_cell_velocity_from_nodes_kernel<<<blocks_cells, 256>>>(
 	      d_vr_cell,
 	      d_vz_cell,
@@ -19561,8 +22676,8 @@ AleRemap2DRZResult ale_remap_2d_rz(core::State& state,
 	  }
 
   const auto& bc = cfg.numerics.hydro.boundary_2d;
-  const bool bottom_active = bc.z_bottom_cfg.is_state_supply();
-  const bool top_active = bc.z_top_cfg.is_state_supply();
+  const bool bottom_active = bc.z_bottom_cfg.supply_active(state.t);
+  const bool top_active = bc.z_top_cfg.supply_active(state.t);
   const bool use_state_supply_radial_avg =
       bc.state_supply_donor_mode == "interior_radial_average";
   const double e_bottom =
@@ -19635,6 +22750,14 @@ AleRemap2DRZResult ale_remap_2d_rz(core::State& state,
       d_state_supply_donor_avg != nullptr ? d_state_supply_donor_avg + 8 : nullptr,
       d_state_supply_donor_avg != nullptr ? d_state_supply_donor_avg + 9 : nullptr);
   CUDA_CHECK(cudaGetLastError());
+  if (table_closure_mode) {
+    accumulate_device_array_max_abs(d_bm_bot, nr, d_table_boundary_max_abs);
+    accumulate_device_array_max_abs(d_bm_top, nr, d_table_boundary_max_abs);
+    accumulate_device_array_max_abs(d_bpz_bot, nr, d_table_boundary_max_abs);
+    accumulate_device_array_max_abs(d_bpz_top, nr, d_table_boundary_max_abs);
+    accumulate_device_array_max_abs(d_be_bot, nr, d_table_boundary_max_abs);
+    accumulate_device_array_max_abs(d_be_top, nr, d_table_boundary_max_abs);
+  }
   if (total_energy_remap) {
     promote_boundary_energy_flux_to_total_kernel<<<blocks_r, 256>>>(
         d_be_bot, d_be_top, d_bm_bot, d_bm_top, d_bpz_bot, d_bpz_top, nr);
@@ -19796,6 +22919,133 @@ AleRemap2DRZResult ale_remap_2d_rz(core::State& state,
   }
   CUDA_CHECK(cudaGetLastError());
 
+  double* const d_rho_mass_preflight_lag = static_cast<double*>(
+      core::device_scratch_acquire(
+          "ale_remap:structured:d_rho_mass_preflight_lag",
+          static_cast<std::size_t>(n_cells) * sizeof(double)));
+  double* const d_rho_mass_preflight_new = static_cast<double*>(
+      core::device_scratch_acquire(
+          "ale_remap:structured:d_rho_mass_preflight_new",
+          static_cast<std::size_t>(n_cells) * sizeof(double)));
+  int* const d_mass_preflight_first_rejected_cell = static_cast<int*>(
+      core::device_scratch_acquire(
+          "ale_remap:structured:d_mass_preflight_first_rejected_cell",
+          sizeof(int)));
+  double* d_remap_mass_veto_floor = nullptr;
+  if (!state.evacuated_cells.mass_ref.empty()) {
+    TENRYU_ASSERT(
+        state.evacuated_cells.mass_ref.size() ==
+            static_cast<std::size_t>(n_cells),
+        "ALE remap mass veto floor requires one reference mass per cell");
+    std::vector<double> remap_mass_veto_floor(static_cast<std::size_t>(n_cells));
+    for (int c = 0; c < n_cells; ++c) {
+      remap_mass_veto_floor[static_cast<std::size_t>(c)] =
+          cfg.numerics.ale.evacuated_cell.off_mass_fraction *
+          state.evacuated_cells.mass_ref[static_cast<std::size_t>(c)];
+    }
+    d_remap_mass_veto_floor = static_cast<double*>(core::device_scratch_acquire(
+        "ale_remap:structured:d_remap_mass_veto_floor",
+        static_cast<std::size_t>(n_cells) * sizeof(double)));
+    CUDA_CHECK(cudaMemcpy(d_remap_mass_veto_floor,
+                          remap_mass_veto_floor.data(),
+                          static_cast<std::size_t>(n_cells) * sizeof(double),
+                          cudaMemcpyHostToDevice));
+  }
+  CUDA_CHECK(cudaMemcpy(d_rho_mass_preflight_lag,
+                        state.rho.data(),
+                        static_cast<std::size_t>(n_cells) * sizeof(double),
+                        cudaMemcpyDeviceToDevice));
+  if (second_order_remap) {
+    ale_remap_2d_rz_radiation_second_order_kernel<false>
+        <<<blocks_cells, 256>>>(
+        d_rho_mass_preflight_lag,
+        state.vol.data(),
+        state.x_r.data(),
+        state.x_z.data(),
+        state.x_r_reference.data(),
+        state.x_z_reference.data(),
+        state.cell_vol_initial.data(),
+        d_cell_nverts,
+        d_bm_bot,
+        d_bm_top,
+        d_rho_mass_preflight_new,
+        nr,
+        nz,
+        button_outer_node_ring);
+  } else {
+    ale_remap_2d_rz_radiation_kernel<false><<<blocks_cells, 256>>>(
+        d_rho_mass_preflight_lag,
+        state.vol.data(),
+        state.x_r.data(),
+        state.x_z.data(),
+        state.x_r_reference.data(),
+        state.x_z_reference.data(),
+        state.cell_vol_initial.data(),
+        d_cell_nverts,
+        d_bm_bot,
+        d_bm_top,
+        d_rho_mass_preflight_new,
+        nr,
+        nz,
+        button_outer_node_ring);
+  }
+  CUDA_CHECK(cudaGetLastError());
+  CUDA_CHECK(cudaMemcpy(d_mass_preflight_first_rejected_cell,
+                        &n_cells,
+                        sizeof(int),
+                        cudaMemcpyHostToDevice));
+  ale_remap_2d_rz_mass_preflight_check_kernel<<<blocks_cells, 256>>>(
+      d_mass_preflight_first_rejected_cell,
+      d_rho_mass_preflight_new,
+      state.rho.data(),
+      state.cell_vol_initial.data(),
+      state.vol.data(),
+      d_remap_mass_veto_floor,
+      n_cells,
+      kRemapMassClosureRejectFraction);
+  CUDA_CHECK(cudaGetLastError());
+  CUDA_CHECK(core::debug_kernel_sync());
+  int mass_preflight_first_rejected_cell = n_cells;
+  CUDA_CHECK(cudaMemcpy(&mass_preflight_first_rejected_cell,
+                        d_mass_preflight_first_rejected_cell,
+                        sizeof(int),
+                        cudaMemcpyDeviceToHost));
+  if (mass_preflight_first_rejected_cell >= 0 &&
+      mass_preflight_first_rejected_cell < n_cells) {
+    double predicted_rho = 0.0;
+    double pre_rho = 0.0;
+    double vol_new = 0.0;
+    double vol_old = 0.0;
+    CUDA_CHECK(cudaMemcpy(
+        &predicted_rho,
+        d_rho_mass_preflight_new + mass_preflight_first_rejected_cell,
+        sizeof(double),
+        cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(
+        &pre_rho,
+        state.rho.data() + mass_preflight_first_rejected_cell,
+        sizeof(double),
+        cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(
+        &vol_new,
+        state.cell_vol_initial.data() + mass_preflight_first_rejected_cell,
+        sizeof(double),
+        cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(
+        &vol_old,
+        state.vol.data() + mass_preflight_first_rejected_cell,
+        sizeof(double),
+        cudaMemcpyDeviceToHost));
+    core::log_warning(
+        std::string("[ale-remap-mass-preflight-2drz] REJECTED cell=") +
+        std::to_string(mass_preflight_first_rejected_cell) +
+        " predicted=" +
+        format_ale_velcoherence_value(predicted_rho * vol_new) +
+        " pre=" + format_ale_velcoherence_value(pre_rho * vol_old));
+    cleanup();
+    return result;
+  }
+
   const int n_groups = std::max(cfg.radiation.groups, 1);
   const std::size_t expected_rad_size =
       static_cast<std::size_t>(n_cells) * static_cast<std::size_t>(n_groups);
@@ -19879,8 +23129,15 @@ AleRemap2DRZResult ale_remap_2d_rz(core::State& state,
           d_state_supply_donor_avg != nullptr ? d_state_supply_donor_avg + 8 : nullptr,
           d_state_supply_donor_avg != nullptr ? d_state_supply_donor_avg + 9 : nullptr);
       CUDA_CHECK(cudaGetLastError());
+      if (table_closure_mode) {
+        accumulate_device_array_max_abs(
+            d_brad_bot, nr, d_table_boundary_max_abs);
+        accumulate_device_array_max_abs(
+            d_brad_top, nr, d_table_boundary_max_abs);
+      }
       if (second_order_remap) {
-        ale_remap_2d_rz_radiation_second_order_kernel<<<blocks_cells, 256>>>(
+        ale_remap_2d_rz_radiation_second_order_kernel<true>
+            <<<blocks_cells, 256>>>(
             d_rad_old,
             state.vol.data(),
             state.x_r.data(),
@@ -19896,7 +23153,7 @@ AleRemap2DRZResult ale_remap_2d_rz(core::State& state,
 	            nz,
 	            button_outer_node_ring);
       } else {
-        ale_remap_2d_rz_radiation_kernel<<<blocks_cells, 256>>>(
+        ale_remap_2d_rz_radiation_kernel<true><<<blocks_cells, 256>>>(
             d_rad_old,
             state.vol.data(),
             state.x_r.data(),
@@ -19978,7 +23235,8 @@ AleRemap2DRZResult ale_remap_2d_rz(core::State& state,
       double* const plane =
           state.burn_Ng_work.data() + p * static_cast<std::size_t>(n_cells);
       if (second_order_remap) {
-        ale_remap_2d_rz_radiation_second_order_kernel<<<blocks_cells, 256>>>(
+        ale_remap_2d_rz_radiation_second_order_kernel<true>
+            <<<blocks_cells, 256>>>(
             plane,
             state.vol.data(),
             state.x_r.data(),
@@ -19994,7 +23252,7 @@ AleRemap2DRZResult ale_remap_2d_rz(core::State& state,
             nz,
             button_outer_node_ring);
       } else {
-        ale_remap_2d_rz_radiation_kernel<<<blocks_cells, 256>>>(
+        ale_remap_2d_rz_radiation_kernel<true><<<blocks_cells, 256>>>(
             plane,
             state.vol.data(),
             state.x_r.data(),
@@ -20032,6 +23290,17 @@ AleRemap2DRZResult ale_remap_2d_rz(core::State& state,
                         static_cast<std::size_t>(n_nodes) * sizeof(double),
                         cudaMemcpyDeviceToDevice));
 
+  core::DeviceArray<double> d_center_saved_v(
+      "ale_remap:structured_remap:d_center_saved_v");
+  if (d_node_flags != nullptr) {
+    d_center_saved_v.reset(2048U);
+    save_center_column_velocity_kernel<<<1, 1>>>(
+        d_center_saved_v.data(), d_center_saved_v.data() + 1024,
+        state.v_r.data(), state.v_z.data(), d_node_flags,
+        (nr + 1) * (nz + 1));
+    CUDA_CHECK(cudaGetLastError());
+  }
+
   const auto r_outer_type = parse_boundary_2d_type(cfg.numerics.hydro.boundary_2d.r_outer);
   const auto z_bottom_type = parse_boundary_2d_type(cfg.numerics.hydro.boundary_2d.z_bottom);
   const auto z_top_type = parse_boundary_2d_type(cfg.numerics.hydro.boundary_2d.z_top);
@@ -20066,6 +23335,14 @@ AleRemap2DRZResult ale_remap_2d_rz(core::State& state,
         velocity_bc_mode_local(z_top_type));
   }
   CUDA_CHECK(cudaGetLastError());
+
+  if (d_node_flags != nullptr) {
+    restore_center_column_velocity_kernel<<<1, 1>>>(
+        state.v_r.data(), state.v_z.data(), d_center_saved_v.data(),
+        d_center_saved_v.data() + 1024, d_node_flags,
+        (nr + 1) * (nz + 1));
+    CUDA_CHECK(cudaGetLastError());
+  }
 
   if (i1b_spurious_sensor) {
     ale_cell_kinetic_from_velocity_kernel<<<blocks_cells, 256>>>(
@@ -20151,6 +23428,34 @@ AleRemap2DRZResult ale_remap_2d_rz(core::State& state,
   // 1T runs keep the total internal energy in ee with ei == 0 by convention;
   // flooring ei at cv_i*Ti_floor would fabricate unledgered energy that the
   // next 1T projection folds into ee (a compounding per-remap pump).
+  if (table_closure_mode) {
+    eos_reclosure_table_lte_kernel<<<blocks_cells, 256>>>(
+        state.Te.data(),
+        state.Ti.data(),
+        state.Pe.data(),
+        state.Pi.data(),
+        state.ee.data(),
+        state.ei.data(),
+        state.rho.data(),
+        state.mass.data(),
+        state.zbar.empty() ? nullptr : state.zbar.data(),
+        n_cells,
+        nz,
+        button_outer_node_ring,
+        nullptr,
+        cfg.main.two_temperature ? 1 : 0,
+        A,
+        cfg.numerics.floors.rho,
+        cfg.numerics.floors.Te,
+        ti_floor_remap,
+        eos_ctx->ion_view(0),
+        eos_ctx->electron_view(0),
+        eos_ctx->total_view(0),
+        cfg.materials.low_density_extrapolation ? 1 : 0,
+        d_de_floor,
+        d_table_closure_status);
+  }
+  if (!table_closure_mode) {
   eos_reclosure_ideal_gas_kernel<<<blocks_cells, 256>>>(
       state.Te.data(),
       state.Ti.data(),
@@ -20170,7 +23475,127 @@ AleRemap2DRZResult ale_remap_2d_rz(core::State& state,
       cfg.numerics.floors.rho,
       cfg.numerics.floors.Te,
       ti_floor_remap);
+  }
   CUDA_CHECK(cudaGetLastError());
+  if (table_closure_mode) {
+    std::vector<int> closure_status(static_cast<std::size_t>(n_cells), 0);
+    CUDA_CHECK(cudaMemcpy(closure_status.data(),
+                          d_table_closure_status,
+                          static_cast<std::size_t>(n_cells) * sizeof(int),
+                          cudaMemcpyDeviceToHost));
+    int bad_cells = 0;
+    int first_status = 0;
+    for (const int status : closure_status) {
+      if (status != 0) {
+        if (bad_cells == 0) {
+          first_status = status;
+        }
+        ++bad_cells;
+      }
+    }
+    double boundary_max_abs = 0.0;
+    CUDA_CHECK(cudaMemcpy(&boundary_max_abs,
+                          d_table_boundary_max_abs,
+                          sizeof(double),
+                          cudaMemcpyDeviceToHost));
+    const bool boundary_guard_fired = boundary_max_abs > 0.0;
+    if (bad_cells > 0 || boundary_guard_fired) {
+      restore_device_array(
+          state.rho.data(), d_table_snapshot_rho, state.rho.size());
+      restore_device_array(
+          state.mass.data(), d_table_snapshot_mass, state.mass.size());
+      restore_device_array(
+          state.ee.data(), d_table_snapshot_ee, state.ee.size());
+      restore_device_array(
+          state.ei.data(), d_table_snapshot_ei, state.ei.size());
+      restore_device_array(
+          state.Te.data(), d_table_snapshot_Te, state.Te.size());
+      restore_device_array(
+          state.Ti.data(), d_table_snapshot_Ti, state.Ti.size());
+      restore_device_array(
+          state.Pe.data(), d_table_snapshot_Pe, state.Pe.size());
+      restore_device_array(
+          state.Pi.data(), d_table_snapshot_Pi, state.Pi.size());
+      restore_device_array(
+          state.v_r.data(), d_table_snapshot_v_r, state.v_r.size());
+      restore_device_array(
+          state.v_z.data(), d_table_snapshot_v_z, state.v_z.size());
+      restore_device_array(state.corner_mass.data(),
+                           d_table_snapshot_corner_mass,
+                           state.corner_mass.size());
+      restore_device_array(state.corner_volume.data(),
+                           d_table_snapshot_corner_volume,
+                           state.corner_volume.size());
+      restore_device_array(state.subzonal_mass_corner0.data(),
+                           d_table_snapshot_subzonal_mass_corner0,
+                           state.subzonal_mass_corner0.size());
+      restore_device_array(state.subzonal_mass_corner1.data(),
+                           d_table_snapshot_subzonal_mass_corner1,
+                           state.subzonal_mass_corner1.size());
+      restore_device_array(state.subzonal_mass_corner2.data(),
+                           d_table_snapshot_subzonal_mass_corner2,
+                           state.subzonal_mass_corner2.size());
+      restore_device_array(state.subzonal_mass_corner3.data(),
+                           d_table_snapshot_subzonal_mass_corner3,
+                           state.subzonal_mass_corner3.size());
+      restore_device_array(
+          state.rad_E.data(), d_table_snapshot_rad_E, state.rad_E.size());
+      if (remap_burn_species) {
+        CUDA_CHECK(cudaMemcpy(
+            state.burn_n_host.data(),
+            d_table_snapshot_burn_species,
+            state.burn_n_host.size() * sizeof(double),
+            cudaMemcpyDeviceToHost));
+      }
+      if (remap_hot_e_eps) {
+        CUDA_CHECK(cudaMemcpy(
+            state.hot_e_eps_cum_host.data(),
+            d_table_snapshot_hot_e_eps,
+            state.hot_e_eps_cum_host.size() * sizeof(double),
+            cudaMemcpyDeviceToHost));
+      }
+      if (remap_burn_eps) {
+        CUDA_CHECK(cudaMemcpy(
+            state.burn_eps_cum_host.data(),
+            d_table_snapshot_burn_eps,
+            state.burn_eps_cum_host.size() * sizeof(double),
+            cudaMemcpyDeviceToHost));
+      }
+      if (remap_burn_spectrum) {
+        restore_device_array(state.burn_Ng.data(),
+                             d_table_snapshot_burn_Ng,
+                             state.burn_Ng.size());
+        state.burn_Ng_work.reset(table_snapshot_burn_Ng_work_size);
+        restore_device_array(state.burn_Ng_work.data(),
+                             d_table_snapshot_burn_Ng_work,
+                             table_snapshot_burn_Ng_work_size);
+      }
+      if (button_outer_node_ring > 0) {
+        restore_device_array(state.Qvisc.data(),
+                             d_table_snapshot_Qvisc,
+                             state.Qvisc.size());
+        restore_device_array(state.zbar.data(),
+                             d_table_snapshot_zbar,
+                             state.zbar.size());
+        restore_device_array(state.hllc_mom_z_cell.data(),
+                             d_table_snapshot_hllc_mom_z_cell,
+                             state.hllc_mom_z_cell.size());
+      }
+      result = AleRemap2DRZResult{};
+      result.applied = false;
+      result.table_closure_rejected = true;
+      result.table_closure_bad_cells = bad_cells;
+      result.table_closure_first_status =
+          bad_cells > 0 ? first_status : -1;
+      core::log_info(
+          std::string("[remap-table-eos] rejected bad_cells=") +
+          std::to_string(bad_cells) + " first_status=" +
+          std::to_string(result.table_closure_first_status) + " boundary=" +
+          std::to_string(boundary_guard_fired ? 1 : 0));
+      cleanup();
+      return result;
+    }
+  }
   if (button_outer_node_ring > 0) {
     zero_button_dormant_hydro_state_kernel<<<blocks_cells, 256>>>(
         state.rho.data(),
@@ -20260,6 +23685,13 @@ AleRemap2DRZResult ale_remap_2d_rz(core::State& state,
           std::string("[total_energy_remap_2d_rz] floor energy injected=") +
           std::to_string(dE_floor) + " erg");
     }
+  }
+  if (table_closure_mode) {
+    const double dE_floor = sum_device_array(d_de_floor, 1);
+    result.E_floor_injected = (dE_floor > 0.0 && std::isfinite(dE_floor))
+                                  ? dE_floor
+                                  : 0.0;
+    result.E_eint_floor_deposit = result.E_floor_injected;
   }
 
   result.applied = true;

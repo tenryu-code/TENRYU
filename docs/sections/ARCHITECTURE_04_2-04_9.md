@@ -240,15 +240,16 @@ electron/ion internal-energy remap and legacy cell-to-node velocity projection.
 With `total_energy_remap_2d_rz=true` on
 `topology_scheme="multiblock_half_butterfly_trifan_cap_5block"`, it builds and
 remaps the extensive material total energy, remaps \(mY_e^{int}\), uses the
-effective swept-volume convention
-`Numerics.ale.swept_volume_sign_fixed || total_energy_remap_2d_rz`, applies the
-CSR hydro mass-positivity face-flux limiter, projects cell velocity to nodes with
+corrected swept-volume convention, applies the CSR hydro mass-positivity
+face-flux limiter, projects cell velocity to nodes with
 RZ corner-mass weights, applies the KE-realizability nodal velocity limiter, and
 recovers \(e_e/e_i\) from remapped total energy minus the actual post-limiter
 corner kinetic energy. Floor energy from the total-energy recovery is reported
 through `AleRemap2DRZResult::E_floor_injected`, then
 `AleStepResult::E_floor_injected`, and finally the driver energy budget; it is
 distinct from the CSR mass-floor closure term `E_redistribution_unresolved`.
+`Numerics.ale.swept_volume_sign_fixed` is corrected-only since epoch 2
+(2026-08-05); the legacy convention has been removed.
 The default/off path is kept byte-identical. Stage 4b adds a default-off CSR
 Option B corner-velocity remap component in
 `hydro::ale::csr_optionb_corner_velocity_remap_component`

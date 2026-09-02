@@ -489,7 +489,8 @@ __host__ __device__ inline void observe_metric_with_oriented_root(
   }
 }
 
-template <bool TrackAnatomy>
+template <bool TrackAnatomy,
+          int SlotCap = kMeshTopoCellStorageSlotsMax>
 __host__ __device__ inline PathAdmissibilityResult evaluate_cell_path_local(
     const int cell,
     const double rr0[4],
@@ -511,6 +512,15 @@ __host__ __device__ inline PathAdmissibilityResult evaluate_cell_path_local(
     // at r <= 0 are skipped (axis-pinned or degenerate — the volume metrics
     // own those).
     const bool r_guard = false) {
+  if (active_nverts > SlotCap) {
+#ifdef __CUDA_ARCH__
+    __trap();  // cell exceeds slot cap
+#else
+    ::tenryu::core::tenryu_abort("active_nverts <= SlotCap",
+                                 "cell exceeds slot cap",
+                                 __FILE__, __LINE__);
+#endif
+  }
   PathAdmissibilityResult out;
   out.min_margin_cell = cell;
   out.first_failing_cell = cell;
@@ -543,7 +553,7 @@ __host__ __device__ inline PathAdmissibilityResult evaluate_cell_path_local(
           min_margin, first_failing_lambda, min_margin_metric_kind,
           first_failing_metric_kind, old_geometry_inadmissible);
     }
-  } else {
+  } else if (active_nverts == 4) {
     edge_cross_coefficients(rr0, zz0, drr, dzz, 0, 1, 0, 3, q0, q1, q2);
     observe_metric_with_oriented_root<TrackAnatomy>(
         q0, q1, q2, no_reference, orientation_sign, floor_rel,
@@ -610,13 +620,41 @@ __host__ __device__ inline PathAdmissibilityResult evaluate_cell_path_local(
         static_cast<int>(PathAdmissibilityMetricKind::GAUSS_J),
         min_margin, first_failing_lambda, min_margin_metric_kind,
         first_failing_metric_kind, old_geometry_inadmissible);
+  } else if (active_nverts == 5) {
+    double corner_q0[5];
+    double corner_q1[5];
+    double corner_q2[5];
+    double corner_scale = 0.0;
+    for (int k = 0; k < active_nverts; ++k) {
+      const int kp = (k + 1) % active_nverts;
+      const int km = (k + active_nverts - 1) % active_nverts;
+      edge_cross_coefficients(rr0, zz0, drr, dzz, k, kp, k, km,
+                              corner_q0[k], corner_q1[k], corner_q2[k]);
+      corner_scale = fmax(corner_scale, fabs(corner_q0[k]));
+    }
+    for (int k = 0; k < active_nverts; ++k) {
+      if (corner_scale > 0.0 &&
+          fabs(corner_q0[k]) <= 1.0e-9 * corner_scale) {
+        continue;
+      }
+      observe_metric_with_oriented_root<TrackAnatomy>(
+          corner_q0[k], corner_q1[k], corner_q2[k], no_reference,
+          orientation_sign, floor_rel,
+          static_cast<int>(PathAdmissibilityMetricKind::EDGE_CROSS),
+          min_margin, first_failing_lambda, min_margin_metric_kind,
+          first_failing_metric_kind, old_geometry_inadmissible);
+    }
+  } else {
+    min_margin = -HUGE_VAL;
+    first_failing_lambda = 0.0;
+    old_geometry_inadmissible = 1;
   }
 
   double area0 = 0.0;
   double area1 = 0.0;
   double area2 = 0.0;
   double area_reference = 0.0;
-  const double zero[4] = {0.0, 0.0, 0.0, 0.0};
+  const double zero[SlotCap] = {0.0};
   for (int k = 0; k < active_nverts; ++k) {
     const int n = (k + 1) % active_nverts;
     point_cross_coefficients(rr0, zz0, drr, dzz, k, n, q0, q1, q2);
@@ -662,7 +700,8 @@ __host__ __device__ inline PathAdmissibilityResult evaluate_cell_path_local(
   return out;
 }
 
-template <bool TrackAnatomy>
+template <bool TrackAnatomy,
+          int SlotCap = kMeshTopoCellStorageSlotsMax>
 __device__ inline PathAdmissibilityResult evaluate_cell_path(
     const int cell,
     const int* __restrict__ cell_node_offsets,
@@ -686,20 +725,31 @@ __device__ inline PathAdmissibilityResult evaluate_cell_path(
   const int off = cell_node_offsets[cell];
   const int next = cell_node_offsets[cell + 1];
   const int active_nverts = mesh_topo_cell_active_nverts(cell_nverts, cell);
+  if (active_nverts > SlotCap) {
+#ifdef __CUDA_ARCH__
+    __trap();  // cell exceeds slot cap
+#else
+    ::tenryu::core::tenryu_abort("active_nverts <= SlotCap",
+                                 "cell exceeds slot cap",
+                                 __FILE__, __LINE__);
+#endif
+  }
   if (next - off != topology_stride || off < 0) {
     out.min_margin = -HUGE_VAL;
     out.first_failing_lambda = 0.0;
     return out;
   }
 
-  int nodes[kMeshTopoCellStorageSlotsMax] =
-      {-1, -1, -1, -1, -1, -1, -1, -1};
-  double rr0[kMeshTopoCellStorageSlotsMax] = {0.0};
-  double zz0[kMeshTopoCellStorageSlotsMax] = {0.0};
-  double drr[kMeshTopoCellStorageSlotsMax] = {0.0};
-  double dzz[kMeshTopoCellStorageSlotsMax] = {0.0};
-  double rr_reference[kMeshTopoCellStorageSlotsMax] = {0.0};
-  double zz_reference[kMeshTopoCellStorageSlotsMax] = {0.0};
+  int nodes[SlotCap] = {};
+  for (int k = 0; k < SlotCap; ++k) {
+    nodes[k] = -1;
+  }
+  double rr0[SlotCap] = {0.0};
+  double zz0[SlotCap] = {0.0};
+  double drr[SlotCap] = {0.0};
+  double dzz[SlotCap] = {0.0};
+  double rr_reference[SlotCap] = {0.0};
+  double zz_reference[SlotCap] = {0.0};
   const bool reference_available =
       floor_rel > 0.0 && xr_reference != nullptr && xz_reference != nullptr;
   for (int k = 0; k < active_nverts; ++k) {
@@ -729,14 +779,15 @@ __device__ inline PathAdmissibilityResult evaluate_cell_path(
       (cell_orientation_sign != nullptr)
           ? (cell_orientation_sign[cell] < 0 ? -1.0 : 1.0)
           : 0.0;
-  return evaluate_cell_path_local<TrackAnatomy>(
+  return evaluate_cell_path_local<TrackAnatomy, SlotCap>(
       cell, rr0, zz0, drr, dzz, active_nverts,
       reference_available ? rr_reference : nullptr,
       reference_available ? zz_reference : nullptr, floor_rel,
       orientation_sign, r_guard);
 }
 
-template <bool TrackAnatomy>
+template <bool TrackAnatomy,
+          int SlotCap = kMeshTopoCellStorageSlotsMax>
 __device__ inline PathAdmissibilityResult evaluate_cell_path(
     const int cell,
     const int* __restrict__ cell_node_offsets,
@@ -761,20 +812,31 @@ __device__ inline PathAdmissibilityResult evaluate_cell_path(
   const int off = cell_node_offsets[cell];
   const int next = cell_node_offsets[cell + 1];
   const int active_nverts = mesh_topo_cell_active_nverts(cell_nverts, cell);
+  if (active_nverts > SlotCap) {
+#ifdef __CUDA_ARCH__
+    __trap();  // cell exceeds slot cap
+#else
+    ::tenryu::core::tenryu_abort("active_nverts <= SlotCap",
+                                 "cell exceeds slot cap",
+                                 __FILE__, __LINE__);
+#endif
+  }
   if (next - off != topology_stride || off < 0 || !isfinite(dt)) {
     out.min_margin = -HUGE_VAL;
     out.first_failing_lambda = 0.0;
     return out;
   }
 
-  int nodes[kMeshTopoCellStorageSlotsMax] =
-      {-1, -1, -1, -1, -1, -1, -1, -1};
-  double rr0[kMeshTopoCellStorageSlotsMax] = {0.0};
-  double zz0[kMeshTopoCellStorageSlotsMax] = {0.0};
-  double drr[kMeshTopoCellStorageSlotsMax] = {0.0};
-  double dzz[kMeshTopoCellStorageSlotsMax] = {0.0};
-  double rr_reference[kMeshTopoCellStorageSlotsMax] = {0.0};
-  double zz_reference[kMeshTopoCellStorageSlotsMax] = {0.0};
+  int nodes[SlotCap] = {};
+  for (int k = 0; k < SlotCap; ++k) {
+    nodes[k] = -1;
+  }
+  double rr0[SlotCap] = {0.0};
+  double zz0[SlotCap] = {0.0};
+  double drr[SlotCap] = {0.0};
+  double dzz[SlotCap] = {0.0};
+  double rr_reference[SlotCap] = {0.0};
+  double zz_reference[SlotCap] = {0.0};
   const bool reference_available =
       floor_rel > 0.0 && xr_reference != nullptr && xz_reference != nullptr;
   for (int k = 0; k < active_nverts; ++k) {
@@ -804,14 +866,15 @@ __device__ inline PathAdmissibilityResult evaluate_cell_path(
       (cell_orientation_sign != nullptr)
           ? (cell_orientation_sign[cell] < 0 ? -1.0 : 1.0)
           : 0.0;
-  return evaluate_cell_path_local<TrackAnatomy>(
+  return evaluate_cell_path_local<TrackAnatomy, SlotCap>(
       cell, rr0, zz0, drr, dzz, active_nverts,
       reference_available ? rr_reference : nullptr,
       reference_available ? zz_reference : nullptr, floor_rel,
       orientation_sign, r_guard);
 }
 
-template <bool TrackAnatomy>
+template <bool TrackAnatomy,
+          int SlotCap = kMeshTopoCellStorageSlotsMax>
 static __global__ void evaluate_path_admissibility_csr_kernel(
     PathAdmissibilityResult* __restrict__ results,
     const int n_cells,
@@ -837,7 +900,7 @@ static __global__ void evaluate_path_admissibility_csr_kernel(
     results[cell] = PathAdmissibilityResult{};
     return;
   }
-  results[cell] = evaluate_cell_path<TrackAnatomy>(cell,
+  results[cell] = evaluate_cell_path<TrackAnatomy, SlotCap>(cell,
                                                    cell_node_offsets,
                                                    cell_node_indices,
                                                    xr_old,
@@ -853,7 +916,8 @@ static __global__ void evaluate_path_admissibility_csr_kernel(
                                                    r_guard);
 }
 
-template <bool TrackAnatomy>
+template <bool TrackAnatomy,
+          int SlotCap = kMeshTopoCellStorageSlotsMax>
 static __global__ void evaluate_path_admissibility_csr_velocity_kernel(
     PathAdmissibilityResult* __restrict__ results,
     const int n_cells,
@@ -880,7 +944,7 @@ static __global__ void evaluate_path_admissibility_csr_velocity_kernel(
     results[cell] = PathAdmissibilityResult{};
     return;
   }
-  results[cell] = evaluate_cell_path<TrackAnatomy>(cell,
+  results[cell] = evaluate_cell_path<TrackAnatomy, SlotCap>(cell,
                                                    cell_node_offsets,
                                                    cell_node_indices,
                                                    xr_old,
@@ -1083,14 +1147,15 @@ inline void cuda_check(const cudaError_t err, const char* message) {
   TENRYU_ASSERT(err == cudaSuccess, message);
 }
 
-inline bool has_tri_cell_nverts(const std::vector<std::uint8_t>& cell_nverts,
-                                const int n_cells) {
+inline bool has_nonquad_cell_nverts(
+    const std::vector<std::uint8_t>& cell_nverts,
+    const int n_cells) {
   if (cell_nverts.size() != static_cast<std::size_t>(n_cells)) {
     return false;
   }
   return std::any_of(cell_nverts.begin(), cell_nverts.end(),
                      [](const std::uint8_t nverts) {
-                       return nverts == 3U;
+                       return nverts == 3U || nverts == 5U;
                      });
 }
 
@@ -3374,6 +3439,7 @@ inline void mesh_forecast_shell_order_q(
   q_phi = std::min(angular_q(n00, n01), angular_q(n10, n11));
 }
 
+template <int SlotCap = kMeshTopoCellStorageSlotsMax>
 inline MeshForecastComponents mesh_forecast_cell_components(
     const tenryu::core::State& state,
     const std::vector<double>& xr_old,
@@ -3405,16 +3471,17 @@ inline MeshForecastComponents mesh_forecast_cell_components(
           ? state.mesh.cell_nverts.data()
           : nullptr;
   const int active_nverts = mesh_topo_cell_active_nverts(nverts_ptr, cell);
+  TENRYU_ASSERT(active_nverts <= SlotCap, "cell exceeds slot cap");
   if (next - off != state.mesh.corner_stride || off < 0) {
     q.q_J = -HUGE_VAL;
     q.q_V = -HUGE_VAL;
     q.q_edge = -HUGE_VAL;
     return q;
   }
-  double rr0[kMeshTopoCellStorageSlotsMax] = {0.0};
-  double zz0[kMeshTopoCellStorageSlotsMax] = {0.0};
-  double drr[kMeshTopoCellStorageSlotsMax] = {0.0};
-  double dzz[kMeshTopoCellStorageSlotsMax] = {0.0};
+  double rr0[SlotCap] = {0.0};
+  double zz0[SlotCap] = {0.0};
+  double drr[SlotCap] = {0.0};
+  double dzz[SlotCap] = {0.0};
   for (int k = 0; k < active_nverts; ++k) {
     const int node = mb.cell_node_csr_indices[static_cast<std::size_t>(off + k)];
     if (node < 0 || static_cast<std::size_t>(node) >= xr_old.size() ||
@@ -3834,8 +3901,8 @@ inline PathAdmissibilityResult evaluate_path_admissibility(
   }
   tenryu::core::DeviceArray<std::uint8_t> d_cell_nverts;
   const std::uint8_t* d_cell_nverts_ptr = nullptr;
-  if (path_admissibility_detail::has_tri_cell_nverts(state.mesh.cell_nverts,
-                                                     n_cells)) {
+  if (path_admissibility_detail::has_nonquad_cell_nverts(
+          state.mesh.cell_nverts, n_cells)) {
     d_cell_nverts.reset(static_cast<std::size_t>(n_cells));
     d_cell_nverts.copy_from_host(state.mesh.cell_nverts);
     d_cell_nverts_ptr = d_cell_nverts.data();
@@ -3893,43 +3960,87 @@ inline PathAdmissibilityResult evaluate_path_admissibility(
   const bool anatomy =
       path_admissibility_detail::path_admissibility_anatomy_enabled();
   if (anatomy) {
-    path_admissibility_detail::evaluate_path_admissibility_csr_kernel<true>
-        <<<blocks, 256>>>(d_results.data(),
-                          n_cells,
-                          state.mesh.corner_stride,
-                          state.mesh.multiblock_cell_node_csr_offsets.data(),
-                          state.mesh.multiblock_cell_node_csr_indices.data(),
-                          d_xr_old,
-                          d_xz_old,
-                          d_xr_new,
-                          d_xz_new,
-                          d_xr_reference,
-                          d_xz_reference,
-                          d_cell_nverts_ptr,
-                          d_cell_orientation_sign_ptr,
-                          d_inactive_mask_ptr,
-                          std::max(0.0, J_floor),
-                          path_admissibility_detail::
-                              path_admissibility_r_guard_enabled());
+    if (state.mesh.corner_stride <= kMeshTopoCellStorageSlotsMax) {
+      path_admissibility_detail::evaluate_path_admissibility_csr_kernel<true>
+          <<<blocks, 256>>>(d_results.data(),
+                            n_cells,
+                            state.mesh.corner_stride,
+                            state.mesh.multiblock_cell_node_csr_offsets.data(),
+                            state.mesh.multiblock_cell_node_csr_indices.data(),
+                            d_xr_old,
+                            d_xz_old,
+                            d_xr_new,
+                            d_xz_new,
+                            d_xr_reference,
+                            d_xz_reference,
+                            d_cell_nverts_ptr,
+                            d_cell_orientation_sign_ptr,
+                            d_inactive_mask_ptr,
+                            std::max(0.0, J_floor),
+                            path_admissibility_detail::
+                                path_admissibility_r_guard_enabled());
+    } else {
+      path_admissibility_detail::evaluate_path_admissibility_csr_kernel<
+          true, kMeshTopoCellStorageSlotsMaxGeneral>
+          <<<blocks, 256>>>(d_results.data(),
+                            n_cells,
+                            state.mesh.corner_stride,
+                            state.mesh.multiblock_cell_node_csr_offsets.data(),
+                            state.mesh.multiblock_cell_node_csr_indices.data(),
+                            d_xr_old,
+                            d_xz_old,
+                            d_xr_new,
+                            d_xz_new,
+                            d_xr_reference,
+                            d_xz_reference,
+                            d_cell_nverts_ptr,
+                            d_cell_orientation_sign_ptr,
+                            d_inactive_mask_ptr,
+                            std::max(0.0, J_floor),
+                            path_admissibility_detail::
+                                path_admissibility_r_guard_enabled());
+    }
   } else {
-    path_admissibility_detail::evaluate_path_admissibility_csr_kernel<false>
-        <<<blocks, 256>>>(d_results.data(),
-                          n_cells,
-                          state.mesh.corner_stride,
-                          state.mesh.multiblock_cell_node_csr_offsets.data(),
-                          state.mesh.multiblock_cell_node_csr_indices.data(),
-                          d_xr_old,
-                          d_xz_old,
-                          d_xr_new,
-                          d_xz_new,
-                          d_xr_reference,
-                          d_xz_reference,
-                          d_cell_nverts_ptr,
-                          d_cell_orientation_sign_ptr,
-                          d_inactive_mask_ptr,
-                          std::max(0.0, J_floor),
-                          path_admissibility_detail::
-                              path_admissibility_r_guard_enabled());
+    if (state.mesh.corner_stride <= kMeshTopoCellStorageSlotsMax) {
+      path_admissibility_detail::evaluate_path_admissibility_csr_kernel<false>
+          <<<blocks, 256>>>(d_results.data(),
+                            n_cells,
+                            state.mesh.corner_stride,
+                            state.mesh.multiblock_cell_node_csr_offsets.data(),
+                            state.mesh.multiblock_cell_node_csr_indices.data(),
+                            d_xr_old,
+                            d_xz_old,
+                            d_xr_new,
+                            d_xz_new,
+                            d_xr_reference,
+                            d_xz_reference,
+                            d_cell_nverts_ptr,
+                            d_cell_orientation_sign_ptr,
+                            d_inactive_mask_ptr,
+                            std::max(0.0, J_floor),
+                            path_admissibility_detail::
+                                path_admissibility_r_guard_enabled());
+    } else {
+      path_admissibility_detail::evaluate_path_admissibility_csr_kernel<
+          false, kMeshTopoCellStorageSlotsMaxGeneral>
+          <<<blocks, 256>>>(d_results.data(),
+                            n_cells,
+                            state.mesh.corner_stride,
+                            state.mesh.multiblock_cell_node_csr_offsets.data(),
+                            state.mesh.multiblock_cell_node_csr_indices.data(),
+                            d_xr_old,
+                            d_xz_old,
+                            d_xr_new,
+                            d_xz_new,
+                            d_xr_reference,
+                            d_xz_reference,
+                            d_cell_nverts_ptr,
+                            d_cell_orientation_sign_ptr,
+                            d_inactive_mask_ptr,
+                            std::max(0.0, J_floor),
+                            path_admissibility_detail::
+                                path_admissibility_r_guard_enabled());
+    }
   }
   path_admissibility_detail::cuda_check(
       cudaGetLastError(),
@@ -4085,8 +4196,8 @@ inline PathAdmissibilityResult evaluate_path_admissibility(
   }
   tenryu::core::DeviceArray<std::uint8_t> d_cell_nverts;
   const std::uint8_t* d_cell_nverts_ptr = nullptr;
-  if (path_admissibility_detail::has_tri_cell_nverts(state.mesh.cell_nverts,
-                                                     n_cells)) {
+  if (path_admissibility_detail::has_nonquad_cell_nverts(
+          state.mesh.cell_nverts, n_cells)) {
     d_cell_nverts.reset(static_cast<std::size_t>(n_cells));
     d_cell_nverts.copy_from_host(state.mesh.cell_nverts);
     d_cell_nverts_ptr = d_cell_nverts.data();
@@ -4144,47 +4255,95 @@ inline PathAdmissibilityResult evaluate_path_admissibility(
   const bool anatomy =
       path_admissibility_detail::path_admissibility_anatomy_enabled();
   if (anatomy) {
-    path_admissibility_detail::
-        evaluate_path_admissibility_csr_velocity_kernel<true>
-            <<<blocks, 256>>>(
-                d_results.data(),
-                n_cells,
-                state.mesh.corner_stride,
-                state.mesh.multiblock_cell_node_csr_offsets.data(),
-                state.mesh.multiblock_cell_node_csr_indices.data(),
-                d_xr_old,
-                d_xz_old,
-                d_v_r,
-                d_v_z,
-                dt,
-                d_xr_reference,
-                d_xz_reference,
-                d_cell_nverts_ptr,
-                d_cell_orientation_sign_ptr,
-                d_inactive_mask_ptr,
-                std::max(0.0, J_floor),
-                path_admissibility_detail::path_admissibility_r_guard_enabled());
+    if (state.mesh.corner_stride <= kMeshTopoCellStorageSlotsMax) {
+      path_admissibility_detail::
+          evaluate_path_admissibility_csr_velocity_kernel<true>
+              <<<blocks, 256>>>(
+                  d_results.data(),
+                  n_cells,
+                  state.mesh.corner_stride,
+                  state.mesh.multiblock_cell_node_csr_offsets.data(),
+                  state.mesh.multiblock_cell_node_csr_indices.data(),
+                  d_xr_old,
+                  d_xz_old,
+                  d_v_r,
+                  d_v_z,
+                  dt,
+                  d_xr_reference,
+                  d_xz_reference,
+                  d_cell_nverts_ptr,
+                  d_cell_orientation_sign_ptr,
+                  d_inactive_mask_ptr,
+                  std::max(0.0, J_floor),
+                  path_admissibility_detail::path_admissibility_r_guard_enabled());
+    } else {
+      path_admissibility_detail::
+          evaluate_path_admissibility_csr_velocity_kernel<
+              true, kMeshTopoCellStorageSlotsMaxGeneral>
+              <<<blocks, 256>>>(
+                  d_results.data(),
+                  n_cells,
+                  state.mesh.corner_stride,
+                  state.mesh.multiblock_cell_node_csr_offsets.data(),
+                  state.mesh.multiblock_cell_node_csr_indices.data(),
+                  d_xr_old,
+                  d_xz_old,
+                  d_v_r,
+                  d_v_z,
+                  dt,
+                  d_xr_reference,
+                  d_xz_reference,
+                  d_cell_nverts_ptr,
+                  d_cell_orientation_sign_ptr,
+                  d_inactive_mask_ptr,
+                  std::max(0.0, J_floor),
+                  path_admissibility_detail::path_admissibility_r_guard_enabled());
+    }
   } else {
-    path_admissibility_detail::
-        evaluate_path_admissibility_csr_velocity_kernel<false>
-            <<<blocks, 256>>>(
-                d_results.data(),
-                n_cells,
-                state.mesh.corner_stride,
-                state.mesh.multiblock_cell_node_csr_offsets.data(),
-                state.mesh.multiblock_cell_node_csr_indices.data(),
-                d_xr_old,
-                d_xz_old,
-                d_v_r,
-                d_v_z,
-                dt,
-                d_xr_reference,
-                d_xz_reference,
-                d_cell_nverts_ptr,
-                d_cell_orientation_sign_ptr,
-                d_inactive_mask_ptr,
-                std::max(0.0, J_floor),
-                path_admissibility_detail::path_admissibility_r_guard_enabled());
+    if (state.mesh.corner_stride <= kMeshTopoCellStorageSlotsMax) {
+      path_admissibility_detail::
+          evaluate_path_admissibility_csr_velocity_kernel<false>
+              <<<blocks, 256>>>(
+                  d_results.data(),
+                  n_cells,
+                  state.mesh.corner_stride,
+                  state.mesh.multiblock_cell_node_csr_offsets.data(),
+                  state.mesh.multiblock_cell_node_csr_indices.data(),
+                  d_xr_old,
+                  d_xz_old,
+                  d_v_r,
+                  d_v_z,
+                  dt,
+                  d_xr_reference,
+                  d_xz_reference,
+                  d_cell_nverts_ptr,
+                  d_cell_orientation_sign_ptr,
+                  d_inactive_mask_ptr,
+                  std::max(0.0, J_floor),
+                  path_admissibility_detail::path_admissibility_r_guard_enabled());
+    } else {
+      path_admissibility_detail::
+          evaluate_path_admissibility_csr_velocity_kernel<
+              false, kMeshTopoCellStorageSlotsMaxGeneral>
+              <<<blocks, 256>>>(
+                  d_results.data(),
+                  n_cells,
+                  state.mesh.corner_stride,
+                  state.mesh.multiblock_cell_node_csr_offsets.data(),
+                  state.mesh.multiblock_cell_node_csr_indices.data(),
+                  d_xr_old,
+                  d_xz_old,
+                  d_v_r,
+                  d_v_z,
+                  dt,
+                  d_xr_reference,
+                  d_xz_reference,
+                  d_cell_nverts_ptr,
+                  d_cell_orientation_sign_ptr,
+                  d_inactive_mask_ptr,
+                  std::max(0.0, J_floor),
+                  path_admissibility_detail::path_admissibility_r_guard_enabled());
+    }
   }
   path_admissibility_detail::cuda_check(
       cudaGetLastError(),

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <vector>
 
 #include <cuda_runtime.h>
 
@@ -46,6 +47,125 @@ void validate_geometry_after_retry_restore(core::State& state,
 
 double compute_node_r_momentum_2d(const core::State& state,
                                   const core::Config& cfg);
+
+void launch_apply_compatible_energy_work_2d(
+    core::State& state,
+    const core::Config& cfg,
+    const core::CellField1D& Pe_half,
+    const core::CellField1D& Pi_half,
+    bool use_two_temp,
+    double dt,
+    const std::int8_t* hydro_active,
+    double* E_floor_injected,
+    int* clamp_count,
+    bool force_enabled = false);
+
+void launch_update_node_velocity_2d(
+    double* v_r,
+    double* v_z,
+    const double* old_v_r,
+    const double* old_v_z,
+    const double* a_r,
+    const double* a_z,
+    const std::uint8_t* node_active,
+    const std::uint8_t* node_flags,
+    int n_nodes,
+    double scale_dt,
+    core::State& state,
+    const core::Config& cfg);
+
+void launch_evac_contact_row_hold_sweep_for_test(
+    double* d_v_r,
+    double* d_v_z,
+    const double* d_node_mass,
+    const int* d_row_nodes,
+    const double* d_row_xi,
+    const double* d_row_normal,
+    double* d_row_dk,
+    int n_rows);
+
+void launch_evac_contact_union_velocity_sweep_for_test(
+    double* d_v_r,
+    double* d_v_z,
+    const double* d_node_mass,
+    const int* d_pair_nodes,
+    const double* d_pair_normal,
+    const std::uint8_t* d_pair_row_covered,
+    double* d_pair_dk,
+    int n_pairs,
+    const int* d_row_nodes,
+    const double* d_row_xi,
+    const double* d_row_normal,
+    double* d_row_dk,
+    int n_rows);
+
+void launch_apply_aw_axis_velocity_slave_2d(
+    double* v_r,
+    double* v_z,
+    const double* x_r,
+    const double* x_z,
+    double* kappa_saved,
+    int nr,
+    int nz,
+    int first_axis_i,
+    bool theta0_axis_active,
+    bool theta_pi_axis_active,
+    bool capture_kappa);
+
+void launch_snap_aw_axis_coordinates_2d(
+    double* x_r,
+    double* x_z,
+    const double* kappa_saved,
+    int nr,
+    int nz,
+    int first_axis_i,
+    bool theta0_axis_active,
+    bool theta_pi_axis_active);
+
+struct AwAxisSlaveMasterList {
+  std::vector<int> p;
+  std::vector<int> q;
+};
+
+struct AwAxisSlaveStructuredLines {
+  bool theta0_active = false;
+  bool theta_pi_active = false;
+};
+
+AwAxisSlaveStructuredLines detect_aw_axis_slave_structured_lines(
+    const core::State& state,
+    const core::Config& cfg);
+
+// Use the topology-appropriate nodal-mass assembly for the D1-prime AV-CFL bound.
+void launch_compute_node_mass_for_cfl_2d(
+    double* node_mass,
+    const core::State& state,
+    const core::Config& cfg,
+    const std::uint8_t* d_cell_nverts,
+    const std::int8_t* d_hydro_active);
+
+AwAxisSlaveMasterList build_aw_axis_slave_master_list_multiblock(
+    const core::State& state,
+    const core::Config& cfg);
+
+void launch_apply_aw_axis_velocity_slave_2d_multiblock(
+    double* v_r,
+    double* v_z,
+    const double* x_r,
+    const double* x_z,
+    double* kappa_saved,
+    const int* axis_slave_p,
+    const int* axis_slave_q,
+    int pair_count,
+    bool capture_kappa);
+
+void launch_snap_aw_axis_coordinates_2d_multiblock(
+    double* x_r,
+    double* x_z,
+    const double* kappa_saved,
+    const int* axis_slave_p,
+    const int* axis_slave_q,
+    int pair_count);
 
 namespace detail {
 
@@ -111,6 +231,8 @@ void accumulate_drive_work_ledger(const core::State& state,
                                   double dt,
                                   double t_mid);
 
+bool polar_tier_fo_diag_enabled();
+
 class Hydro2D {
  public:
   void prepare_initial_sound_speed(core::State& state,
@@ -130,6 +252,10 @@ class Hydro2D {
                                    const core::Config& cfg,
                                    const HydroEOSContext* eos_ctx = nullptr,
                                    bool accumulate_tally = true) const;
+
+  void reclose_after_energy_edit(core::State& state,
+                                 const core::Config& cfg,
+                                 const HydroEOSContext* eos_ctx = nullptr) const;
 
   tenryu::coupling::HydroStepResult lagrangian_step(
       core::State& state,
@@ -158,6 +284,17 @@ class Hydro2D {
       MeshRegimeDeviceCache* mesh_regime_cache = nullptr,
       tenryu::coupling::ProfileObservability* observability = nullptr,
       double* r_momentum_source_impulse = nullptr) const;
+
+ private:
+  mutable bool aw_axis_slave_theta0_active_ = false;
+  mutable bool aw_axis_slave_theta_pi_active_ = false;
+  mutable core::NodeField1D aw_axis_slave_kappa_saved_;
+  mutable const mesh::MultiBlockTopology*
+      aw_axis_slave_multiblock_topology_ = nullptr;
+  mutable core::DeviceBuffer<int> aw_axis_slave_p_;
+  mutable core::DeviceBuffer<int> aw_axis_slave_q_;
+  mutable core::DeviceBuffer<double>
+      aw_axis_slave_multiblock_kappa_saved_;
 };
 
 }  // namespace tenryu::hydro

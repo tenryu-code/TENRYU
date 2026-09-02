@@ -255,6 +255,12 @@ class HistoryWriter {
     double achieved_min_altitude_rel = std::numeric_limits<double>::infinity();
     double achieved_max_condition_number = 0.0;
     std::uint64_t negative_rz_volume_count_total = 0;
+    bool ale_monitor_observed = false;
+    int ale_monitor_state = 0;
+    double ale_monitor_q_min = 1.0;
+    double ale_monitor_h_min = std::numeric_limits<double>::infinity();
+    int ale_monitor_q_min_cell = -1;
+    int ale_monitor_h_min_cell = -1;
   };
 
   struct PendingHistoryRecord {
@@ -271,6 +277,7 @@ class HistoryWriter {
     bool ale_provenance_enabled = false;
     bool hotspot_gas_enabled = false;
     bool mesh_quality_min_enabled = false;
+    bool ale_state_enabled = false;
     bool conservation_enabled = false;
     bool dt_breakdown_history_enabled = true;
     bool center_perturbation_enabled = false;
@@ -395,6 +402,11 @@ class HistoryWriter {
       const AleProvenanceValues& values,
       double time,
       std::int64_t step) const;
+  void write_ale_state_history(
+      hid_t file,
+      const AleProvenanceValues& values,
+      double time,
+      std::int64_t step) const;
 #endif
 
   bool enabled_ = false;
@@ -408,6 +420,7 @@ class HistoryWriter {
   bool ale_provenance_enabled_ = false;
   bool hotspot_gas_enabled_ = false;
   bool mesh_quality_min_enabled_ = false;
+  bool ale_state_enabled_ = false;
   bool conservation_enabled_ = false;
   bool dt_breakdown_history_enabled_ = true;
   bool center_perturbation_enabled_ = false;

@@ -18,3 +18,18 @@ npm test               # vitest (deck 生成器 golden 含む)
 npm run bridge &       # dev ブリッジ (127.0.0.1:5175)
 npm run dev            # Vite (http://localhost:5173, /api を bridge へ proxy)
 ```
+
+## アシスタント (実験的)
+
+左ナビ「アシスタント」から tools/assist (リポジトリ同梱の LLM ハーネス) を GUI で操作できる。
+
+- 決定論 verb (詳細 Lint / ダイジェスト / ゾーニング診断) はサーバープロファイル上で
+  `python3 tools/assist/assist.py …` を実行する (サーバー側チェックアウトに tools/assist が必要)。
+- LLM 生成 (generate-deck) はローカルで実行し、デッキ検証だけ
+  `tools/assist/tenryu_remote.sh` 経由でサーバーのバイナリに委ねる。プロバイダ CLI と
+  その認証はローカル前提。設定は assistant.toml (既定 OFF・TENRYU_ASSIST_DISABLE が
+  kill switch)。作業ディレクトリは `~/.tenryu/studio-assist/<stamp>/`。
+- このために Tauri shell 許可に bash が追加されている (ssh/scp と同格のローカル実行
+  権限。webview は同梱コードのみを実行する)。
+
+設計: docs/design/gui_assistant_integration_20260902.md

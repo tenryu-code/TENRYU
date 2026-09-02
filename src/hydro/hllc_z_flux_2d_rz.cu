@@ -273,6 +273,10 @@ __global__ void compute_hllc_corner_mass_kernel(double* __restrict__ corner_mass
     return;
   }
   rz::CornerMassFallbackProbe probe{};
+  // cell_nverts == nullptr (pure quad partition) is contract-correct: every
+  // tri-bearing topology is unreachable here (validation rejects tri_fan and
+  // pentagon-belt with HLLC; the entry assert excludes multiblock) —
+  // A124(b) P-B ruling, 2026-08-15.
   rz::compute_rz_corner_masses_for_cell(
       c, nz, mass[c], x_r, x_z, nullptr, corner_mass, 4, &probe,
       corner_mass_convention);
@@ -805,6 +809,15 @@ HllcZFlux2DRZResult apply_hllc_z_flux_2d_rz(
     const std::int8_t* d_hydro_active,
     const int rank,
     const char* hydro_half) {
+  // A124(b) P-B (2026-08-15): the HLLC z sweep assumes a structured
+  // single-block quad grid — corner-mass partition (quad, cell_nverts
+  // == nullptr) and (nr+1)x(nz+1) node indexing alike. Tri-bearing
+  // structured meshes (tri_fan) and pentagon-belt are already rejected
+  // with HLLC at namelist validation; generic multiblock is not, so make
+  // the contract loud here.
+  TENRYU_ASSERT(!state.mesh.topo.multiblock.has_value(),
+                "HLLC z flux requires a structured single-block topology "
+                "(multiblock corner-mass/node contracts are staged)");
   HllcZFlux2DRZResult result;
   result.applied = true;
   TENRYU_ASSERT(
@@ -920,10 +933,22 @@ HllcZFlux2DRZResult apply_hllc_z_flux_2d_rz(
                    "HLLC z flux init stats failed");
 
   const auto& bc = cfg.numerics.hydro.boundary_2d;
-  const auto bottom_kind = static_cast<int>(parse_boundary_2d_type(bc.z_bottom));
-  const auto top_kind = static_cast<int>(parse_boundary_2d_type(bc.z_top));
-  const int bottom_supply = bc.z_bottom_cfg.is_state_supply() ? 1 : 0;
-  const int top_supply = bc.z_top_cfg.is_state_supply() ? 1 : 0;
+  const auto resolve_z_kind = [&](const auto& face,
+                                  const std::string& configured_kind) {
+    if (face.is_state_supply() && !face.supply_active(state.t)) {
+      // Post-window the face is a rigid wall; the reflect ghost is the
+      // consistent Riemann state, while an interior copy would advect
+      // material through a pinned wall.
+      return Boundary2DType::REFLECT;
+    }
+    return parse_boundary_2d_type(configured_kind);
+  };
+  const auto bottom_kind =
+      static_cast<int>(resolve_z_kind(bc.z_bottom_cfg, bc.z_bottom));
+  const auto top_kind =
+      static_cast<int>(resolve_z_kind(bc.z_top_cfg, bc.z_top));
+  const int bottom_supply = bc.z_bottom_cfg.supply_active(state.t) ? 1 : 0;
+  const int top_supply = bc.z_top_cfg.supply_active(state.t) ? 1 : 0;
   const double e_bottom = (cv_i + cv_e) * std::max(bc.z_bottom_cfg.supply_T_eV, 0.0);
   const double e_top = (cv_i + cv_e) * std::max(bc.z_top_cfg.supply_T_eV, 0.0);
 

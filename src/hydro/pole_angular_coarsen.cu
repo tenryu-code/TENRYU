@@ -117,6 +117,11 @@ Overlay build_overlay_impl(const core::State& state,
                            const bool enabled,
                            const bool skip_fine_child_paths) {
   Overlay overlay;
+  if (enabled && cfg.mesh.shell_polar_cap_dendrite) {
+    throw core::namelist::ConfigError(
+        "pole angular coarsen/motion pilot is not supported with "
+        "Mesh.shell_polar_cap_dendrite=true (pending shell-chain generalization)");
+  }
   if (!enabled || !mesh::mesh_topo_is_multiblock(cfg.mesh) ||
       !state.mesh.topo.multiblock.has_value() ||
       state.mesh.topo.n_cells <= 0) {

@@ -469,6 +469,10 @@ void upload_unique_face_payload(MultiBlockTopology& mb) {
                                   boundary_local.end());
   mb.d_boundary_face_bc_tag.assign(boundary_bc_tag.begin(),
                                    boundary_bc_tag.end());
+  mb.d_face_adj_csr_offsets.assign(mb.face_adj_csr_offsets.begin(),
+                                   mb.face_adj_csr_offsets.end());
+  mb.d_face_adj_csr_indices.assign(mb.face_adj_csr_indices.begin(),
+                                   mb.face_adj_csr_indices.end());
 }
 
 bool is_belt_layer(const tenryu::core::Config::MeshConfig& cfg,
@@ -494,7 +498,7 @@ Mesh create_pentagon_belt_shell_mesh(const tenryu::core::Config& cfg,
 
   Mesh mesh;
   mesh.corner_stride =
-      tenryu::core::corner_stride_for_scheme(mesh_cfg.topology_scheme);
+      tenryu::core::corner_stride_for_config(cfg);
   TENRYU_ASSERT(mesh.corner_stride == 8,
                 "pentagon-belt corner stride must be 8");
   TENRYU_ASSERT(mesh.corner_stride == state.corner_stride,
@@ -923,6 +927,17 @@ Mesh create_pentagon_belt_shell_mesh(const tenryu::core::Config& cfg,
       mb.cell_node_csr_indices.size());
   mesh.multiblock_cell_node_csr_indices.copy_from_host(
       mb.cell_node_csr_indices);
+  mesh.multiblock_cell_orientation_sign_device.reset(
+      mb.cell_orientation_sign.size());
+  if (!mb.cell_orientation_sign.empty()) {
+    mesh.multiblock_cell_orientation_sign_device.copy_from_host(
+        mb.cell_orientation_sign);
+  }
+  mesh.multiblock_cell_nverts_device.reset(mesh.cell_nverts.size());
+  if (!mesh.cell_nverts.empty()) {
+    mesh.multiblock_cell_nverts_device.copy_from_host(mesh.cell_nverts);
+  }
+  ++mesh.topology_serial;
   const tenryu::hydro::ReverseCellNodeCSR reverse_csr =
       tenryu::hydro::build_reverse_cell_node_csr(
           mb, mesh.topo.n_nodes, &mesh.cell_nverts, stride);
@@ -938,6 +953,8 @@ Mesh create_pentagon_belt_shell_mesh(const tenryu::core::Config& cfg,
       reverse_csr.node_corners.size());
   mesh.multiblock_reverse_csr_node_corners.copy_from_host(
       reverse_csr.node_corners);
+  rebuild_multiblock_node_edge_csr(mesh);
+  rebuild_multiblock_csw_line_topology(mesh);
 
   state.x_r.copy_from_host(host_x_r.data());
   state.x_z.copy_from_host(host_x_z.data());

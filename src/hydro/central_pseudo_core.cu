@@ -47,8 +47,18 @@ inline bool is_supported_topology(const core::Config& cfg) {
          (cfg.mesh.topology_scheme ==
               core::TopologyScheme::MULTIBLOCK_HALF_BUTTERFLY_5BLOCK ||
           cfg.mesh.topology_scheme ==
-              core::TopologyScheme::MULTIBLOCK_HALF_BUTTERFLY_TRIFAN_CAP_5BLOCK);
+              core::TopologyScheme::MULTIBLOCK_HALF_BUTTERFLY_TRIFAN_CAP_5BLOCK ||
+          (cfg.mesh.topology_scheme ==
+               core::TopologyScheme::MULTIBLOCK_POLAR_TIER_CART_CENTER &&
+           cfg.mesh.polar_tier_center_kind == "trifan_cap"));
 }
+
+struct CapTopoView {
+  bool has_cap = false;  // Pseudo-core-admissible cap exists.
+  bool hybrid = false;   // Cap-center hybrid (BRIDGE-row growth).
+  int n_cap = 0;         // Cap ring count.
+  int ntheta = 0;        // Angular cells (== 4*n_cap, asserted).
+};
 
 int active_nverts(const mesh::Mesh& mesh, const int c) {
   if (mesh.cell_nverts.size() == static_cast<std::size_t>(mesh.topo.n_cells)) {
@@ -72,12 +82,159 @@ int central_core_block_id(const mesh::MultiBlockTopology& mb) {
   return block_id;
 }
 
+CapTopoView make_cap_topo_view(const core::Config& cfg,
+                               const mesh::MultiBlockTopology& mb) {
+  if (mb.has_trifan_cap) {
+    return {true, false, mb.n_cap, 4 * mb.n_cap};
+  }
+  if (cfg.mesh.topology_scheme ==
+          core::TopologyScheme::MULTIBLOCK_POLAR_TIER_CART_CENTER &&
+      cfg.mesh.polar_tier_center_kind == "trifan_cap") {
+    const int block_id = central_core_block_id(mb);
+    const auto& block = mb.blocks[static_cast<std::size_t>(block_id)];
+    TENRYU_ASSERT(block.n_j_cells == 4 * block.n_i_cells,
+                  "central pseudo-core hybrid cap angular count mismatch");
+    return {true, true, block.n_i_cells, block.n_j_cells};
+  }
+  return {};
+}
+
 int block_cell_id(const mesh::BlockInfo& block, const int i, const int j) {
   TENRYU_ASSERT(i >= 0 && i < block.n_i_cells,
                 "central pseudo-core block i index out of range");
   TENRYU_ASSERT(j >= 0 && j < block.n_j_cells,
                 "central pseudo-core block j index out of range");
   return block.cell_begin + i * block.n_j_cells + j;
+}
+
+const mesh::BlockInfo& hybrid_bridge_block(
+    const mesh::MultiBlockTopology& mb,
+    const CapTopoView& view) {
+  TENRYU_ASSERT(view.hybrid,
+                "central pseudo-core hybrid bridge requires hybrid cap");
+  const mesh::BlockInfo* bridge = nullptr;
+  for (const auto& block : mb.blocks) {
+    if (block.role == mesh::BlockRole::BRIDGE) {
+      TENRYU_ASSERT(bridge == nullptr,
+                    "central pseudo-core found multiple hybrid bridge blocks");
+      bridge = &block;
+    }
+  }
+  TENRYU_ASSERT(bridge != nullptr && bridge->n_i_cells > 0 &&
+                    bridge->n_j_cells == view.ntheta &&
+                    bridge->cell_count ==
+                        bridge->n_i_cells * bridge->n_j_cells &&
+                    bridge->owned_node_count ==
+                        bridge->n_i_cells * (view.ntheta + 1),
+                "central pseudo-core hybrid bridge layout mismatch");
+  return *bridge;
+}
+
+double bridge_row_mean_node_radius(
+    const mesh::MultiBlockTopology& mb,
+    const mesh::BlockInfo& bridge,
+    const std::vector<double>& node_r,
+    const std::vector<double>& node_z,
+    const int row) {
+  TENRYU_ASSERT(row >= 0 && row < bridge.n_i_cells,
+                "central pseudo-core hybrid bridge row out of range");
+  long double radius_sum = 0.0L;
+  int count = 0;
+  for (int j = 0; j < bridge.n_j_cells; ++j) {
+    const int c = block_cell_id(bridge, row, j);
+    const int off = mb.cell_node_csr_offsets[static_cast<std::size_t>(c)];
+    for (int k = 0; k < mesh::kMeshTopoCellStorageSlots; ++k) {
+      const int n =
+          mb.cell_node_csr_indices[static_cast<std::size_t>(off + k)];
+      TENRYU_ASSERT(n >= 0 && static_cast<std::size_t>(n) < node_r.size() &&
+                        static_cast<std::size_t>(n) < node_z.size(),
+                    "central pseudo-core hybrid bridge node out of range");
+      const double radius =
+          std::hypot(node_r[static_cast<std::size_t>(n)],
+                     node_z[static_cast<std::size_t>(n)]);
+      TENRYU_ASSERT(std::isfinite(radius),
+                    "central pseudo-core hybrid bridge radius must be finite");
+      radius_sum += static_cast<long double>(radius);
+      ++count;
+    }
+  }
+  TENRYU_ASSERT(count > 0,
+                "central pseudo-core hybrid bridge row must contain nodes");
+  return static_cast<double>(radius_sum / static_cast<long double>(count));
+}
+
+bool hybrid_bridge_row_zero_is_inner(
+    const mesh::MultiBlockTopology& mb,
+    const mesh::BlockInfo& bridge,
+    const std::vector<double>& node_r,
+    const std::vector<double>& node_z) {
+  const double row_zero =
+      bridge_row_mean_node_radius(mb, bridge, node_r, node_z, 0);
+  const double row_last = bridge_row_mean_node_radius(
+      mb, bridge, node_r, node_z, bridge.n_i_cells - 1);
+  // Fixed tiebreak: row 0 is the inner row when the means are equal.
+  return row_zero <= row_last;
+}
+
+int hybrid_bridge_storage_row(const mesh::BlockInfo& bridge,
+                              const int radial_row,
+                              const bool row_zero_is_inner) {
+  TENRYU_ASSERT(radial_row >= 0 && radial_row < bridge.n_i_cells,
+                "central pseudo-core hybrid bridge radial row out of range");
+  return row_zero_is_inner ? radial_row
+                           : bridge.n_i_cells - 1 - radial_row;
+}
+
+int hybrid_bridge_radial_row(const mesh::BlockInfo& bridge,
+                             const int storage_row,
+                             const bool row_zero_is_inner) {
+  TENRYU_ASSERT(storage_row >= 0 && storage_row < bridge.n_i_cells,
+                "central pseudo-core hybrid bridge storage row out of range");
+  return row_zero_is_inner ? storage_row
+                           : bridge.n_i_cells - 1 - storage_row;
+}
+
+int hybrid_bridge_boundary_node_row_index(
+    const mesh::MultiBlockTopology& mb,
+    const mesh::BlockInfo& bridge,
+    const int absorbed_rows,
+    const bool row_zero_is_inner) {
+  TENRYU_ASSERT(absorbed_rows > 0 && absorbed_rows <= bridge.n_i_cells,
+                "central pseudo-core hybrid bridge boundary depth out of range");
+  const int cell_row = hybrid_bridge_storage_row(
+      bridge, absorbed_rows - 1, row_zero_is_inner);
+  const int first_cell = block_cell_id(bridge, cell_row, 0);
+  const int first_off =
+      mb.cell_node_csr_offsets[static_cast<std::size_t>(first_cell)];
+  const int first_slot = row_zero_is_inner ? 3 : 0;
+  const int last_slot = row_zero_is_inner ? 2 : 1;
+  const int first_node = mb.cell_node_csr_indices[
+      static_cast<std::size_t>(first_off + first_slot)];
+  const int stride = bridge.n_j_cells + 1;
+  const int row_node_index =
+      row_zero_is_inner ? bridge.n_i_cells - 1 - absorbed_rows
+                        : absorbed_rows - 1;
+  const int expected_begin =
+      bridge.owned_node_begin + row_node_index * stride;
+  TENRYU_ASSERT(first_node == expected_begin,
+                "central pseudo-core hybrid bridge node-row orientation mismatch");
+  for (int g = 0; g < bridge.n_j_cells; ++g) {
+    const int c = block_cell_id(bridge, cell_row, g);
+    const int off = mb.cell_node_csr_offsets[static_cast<std::size_t>(c)];
+    TENRYU_ASSERT(
+        mb.cell_node_csr_indices[static_cast<std::size_t>(off + first_slot)] ==
+            expected_begin + g,
+        "central pseudo-core hybrid bridge boundary row stride mismatch");
+  }
+  const int last_cell =
+      block_cell_id(bridge, cell_row, bridge.n_j_cells - 1);
+  const int last_off =
+      mb.cell_node_csr_offsets[static_cast<std::size_t>(last_cell)];
+  TENRYU_ASSERT(
+      mb.cell_node_csr_indices[static_cast<std::size_t>(last_off + last_slot)] ==
+          expected_begin + bridge.n_j_cells,
+      "central pseudo-core hybrid bridge boundary row end mismatch");
+  return row_node_index;
 }
 
 double cell_max_node_s(const mesh::Mesh& mesh,
@@ -117,6 +274,7 @@ void mark_block_cell(const mesh::MultiBlockTopology& mb,
 
 int select_trifan_cap_core_rings(const mesh::Mesh& mesh,
                                  const mesh::MultiBlockTopology& mb,
+                                 const CapTopoView& view,
                                  const int block_id,
                                  const std::vector<double>& node_r,
                                  const std::vector<double>& node_z,
@@ -126,8 +284,9 @@ int select_trifan_cap_core_rings(const mesh::Mesh& mesh,
   const auto& block = mb.blocks[static_cast<std::size_t>(block_id)];
   TENRYU_ASSERT(block.role == mesh::BlockRole::CENTRAL_CORE,
                 "central pseudo-core ring selection requires central core");
-  TENRYU_ASSERT(block.n_i_cells == mb.n_cap &&
-                    block.n_j_cells > 0,
+  TENRYU_ASSERT(block.n_i_cells == view.n_cap &&
+                    block.n_j_cells == view.ntheta &&
+                    view.ntheta == 4 * view.n_cap,
                 "central pseudo-core trifan cap block dimensions mismatch");
   const double s_limit =
       std::nextafter(s_c, std::numeric_limits<double>::infinity());
@@ -163,13 +322,34 @@ int select_trifan_cap_core_rings(const mesh::Mesh& mesh,
     }
   }
   int depth = selected_rings;
-  // Once every cap ring is absorbed, deeper absorption requests grow into
-  // complete FAN LAYERS (the union of layer l across the three fan blocks)
-  // and then into PURE-GAS polar-shell rows. The material guard lives at the
-  // request/trigger decision sites (absorbable_shell_row_count), so the
-  // requested depth is trusted here.
+  // Once every cap ring is absorbed, hybrid requests grow through complete
+  // BRIDGE rows; non-hybrid requests grow through complete FAN LAYERS and
+  // then PURE-GAS polar-shell rows. The material guard lives at the request/
+  // trigger decision sites (absorbable_shell_row_count), so the requested
+  // depth is trusted here.
   if (selected_rings == block.n_i_cells &&
       min_ring_count > block.n_i_cells) {
+    if (view.hybrid) {
+      const auto& bridge = hybrid_bridge_block(mb, view);
+      const bool row_zero_is_inner = hybrid_bridge_row_zero_is_inner(
+          mb, bridge, node_r, node_z);
+      const int bridge_rows = std::min(
+          min_ring_count - block.n_i_cells, bridge.n_i_cells);
+      const int bridge_block_id =
+          static_cast<int>(&bridge - mb.blocks.data());
+      for (int q = 0; q < bridge_rows; ++q) {
+        const int row =
+            hybrid_bridge_storage_row(bridge, q, row_zero_is_inner);
+        for (int j = 0; j < bridge.n_j_cells; ++j) {
+          mark_block_cell(mb,
+                          bridge_block_id,
+                          block_cell_id(bridge, row, j),
+                          member_mask);
+        }
+      }
+      depth += bridge_rows;
+      return depth;
+    }
     const auto& north =
         mesh::mesh_topo_trifan_fan_block(mb, mesh::BlockRole::NORTH_FAN);
     const int fan_layers = std::min(min_ring_count - block.n_i_cells,
@@ -272,15 +452,17 @@ int select_centered_core_rings(const mesh::Mesh& mesh,
 
 int select_ring_conforming_members(const mesh::Mesh& mesh,
                                    const mesh::MultiBlockTopology& mb,
+                                   const CapTopoView& view,
                                    const std::vector<double>& node_r,
                                    const std::vector<double>& node_z,
                                    const double s_c,
                                    const int min_ring_count,
                                    std::vector<std::uint8_t>& member_mask) {
   const int block_id = central_core_block_id(mb);
-  if (mb.has_trifan_cap) {
+  if (view.has_cap) {
     return select_trifan_cap_core_rings(
-        mesh, mb, block_id, node_r, node_z, s_c, min_ring_count, member_mask);
+        mesh, mb, view, block_id, node_r, node_z, s_c, min_ring_count,
+        member_mask);
   }
   return select_centered_core_rings(
       mesh, mb, block_id, node_r, node_z, s_c, min_ring_count, member_mask);
@@ -397,15 +579,61 @@ double boundary_loop_volume(const core::CentralPseudoCoreState& pc,
   return volume;
 }
 
+int cap_apex_node_id(const mesh::MultiBlockTopology& mb,
+                     const CapTopoView& view) {
+  if (!view.hybrid) {
+    return mesh::mesh_topo_cap_apex_node_id(mb);
+  }
+  const int block_id = central_core_block_id(mb);
+  const auto& block = mb.blocks[static_cast<std::size_t>(block_id)];
+  const int cell = block_cell_id(block, 0, 0);
+  const int off = mb.cell_node_csr_offsets[static_cast<std::size_t>(cell)];
+  TENRYU_ASSERT(mb.cell_block_id[static_cast<std::size_t>(cell)] == block_id,
+                "central pseudo-core hybrid cap apex cell mapping mismatch");
+  return mb.cell_node_csr_indices[static_cast<std::size_t>(off)];
+}
+
+int cap_ring_node_id(const mesh::MultiBlockTopology& mb,
+                     const CapTopoView& view,
+                     const int l,
+                     const int k) {
+  if (!view.hybrid) {
+    return mesh::mesh_topo_cap_ring_node_id(mb, l, k);
+  }
+  TENRYU_ASSERT(l >= 1 && l <= view.n_cap,
+                "central pseudo-core hybrid cap ring layer out of range");
+  TENRYU_ASSERT(k >= 0 && k <= view.ntheta,
+                "central pseudo-core hybrid cap angle out of range");
+  const int block_id = central_core_block_id(mb);
+  const auto& block = mb.blocks[static_cast<std::size_t>(block_id)];
+  const int cell_k = k < view.ntheta ? k : view.ntheta - 1;
+  const int cell = block_cell_id(block, l - 1, cell_k);
+  const int off = mb.cell_node_csr_offsets[static_cast<std::size_t>(cell)];
+  TENRYU_ASSERT(mb.cell_block_id[static_cast<std::size_t>(cell)] == block_id,
+                "central pseudo-core hybrid cap ring cell mapping mismatch");
+  const int outer_slot = l == 1 ? (k < view.ntheta ? 2 : 1)
+                                : (k < view.ntheta ? 3 : 2);
+  return mb.cell_node_csr_indices[
+      static_cast<std::size_t>(off + outer_slot)];
+}
+
 int trifan_member_ring_count(const core::CentralPseudoCoreState& pc,
-                             const mesh::MultiBlockTopology& mb) {
-  TENRYU_ASSERT(mb.has_trifan_cap,
+                             const mesh::MultiBlockTopology& mb,
+                             const CapTopoView& view,
+                             const std::vector<double>& node_r,
+                             const std::vector<double>& node_z,
+                             const mesh::BlockInfo** hybrid_bridge_out,
+                             bool* bridge_zero_is_inner_out) {
+  TENRYU_ASSERT(view.has_cap,
                 "central pseudo-core virtual star-map requires trifan cap topology");
+  *hybrid_bridge_out = nullptr;
+  *bridge_zero_is_inner_out = true;
   const int block_id = central_core_block_id(mb);
   const auto& block = mb.blocks[static_cast<std::size_t>(block_id)];
   TENRYU_ASSERT(block.role == mesh::BlockRole::CENTRAL_CORE &&
-                    block.n_i_cells == mb.n_cap &&
-                    block.n_j_cells > 0,
+                    block.n_i_cells == view.n_cap &&
+                    block.n_j_cells == view.ntheta &&
+                    view.ntheta == 4 * view.n_cap,
                 "central pseudo-core trifan cap block dimensions mismatch");
 
   int selected_rings = 0;
@@ -431,10 +659,50 @@ int trifan_member_ring_count(const core::CentralPseudoCoreState& pc,
     TENRYU_ASSERT(!any_ring,
                   "central pseudo-core trifan members must be full prefix rings");
   }
-  TENRYU_ASSERT(selected_rings > 0 && selected_rings <= mb.n_cap,
+  TENRYU_ASSERT(selected_rings > 0 && selected_rings <= view.n_cap,
                 "central pseudo-core trifan member ring count out of range");
   std::size_t expected_members =
       static_cast<std::size_t>(selected_rings * block.n_j_cells);
+  if (view.hybrid) {
+    int bridge_rows = 0;
+    if (selected_rings == block.n_i_cells &&
+        pc.member_cells.size() > expected_members) {
+      const auto& bridge = hybrid_bridge_block(mb, view);
+      const bool row_zero_is_inner = hybrid_bridge_row_zero_is_inner(
+          mb, bridge, node_r, node_z);
+      *hybrid_bridge_out = &bridge;
+      *bridge_zero_is_inner_out = row_zero_is_inner;
+      bool seen_open_row = false;
+      for (int q = 0; q < bridge.n_i_cells; ++q) {
+        const int row =
+            hybrid_bridge_storage_row(bridge, q, row_zero_is_inner);
+        bool full_row = true;
+        bool any_row = false;
+        for (int j = 0; j < bridge.n_j_cells; ++j) {
+          const int c = block_cell_id(bridge, row, j);
+          TENRYU_ASSERT(c >= 0 && static_cast<std::size_t>(c) <
+                                      pc.member_mask.size(),
+                        "central pseudo-core bridge member cell out of range");
+          const bool is_member =
+              pc.member_mask[static_cast<std::size_t>(c)] != 0U;
+          full_row = full_row && is_member;
+          any_row = any_row || is_member;
+        }
+        if (full_row && !seen_open_row) {
+          ++bridge_rows;
+          expected_members += static_cast<std::size_t>(bridge.n_j_cells);
+          continue;
+        }
+        seen_open_row = true;
+        TENRYU_ASSERT(
+            !any_row,
+            "central pseudo-core bridge members must be full radial-prefix rows");
+      }
+    }
+    TENRYU_ASSERT(pc.member_cells.size() == expected_members,
+                  "central pseudo-core hybrid member count does not match depth");
+    return selected_rings + bridge_rows;
+  }
   // Beyond the cap, membership grows by complete fan LAYERS (the union of
   // layer l across the three fan blocks); count the contiguous full-layer
   // prefix the same way.
@@ -510,32 +778,44 @@ int trifan_member_ring_count(const core::CentralPseudoCoreState& pc,
 bool rebuild_trifan_virtual_member_geometry_host(
     const core::CentralPseudoCoreState& pc,
     const mesh::MultiBlockTopology& mb,
+    const CapTopoView& view,
     std::vector<double>& node_r,
     std::vector<double>& node_z) {
-  if (!mb.has_trifan_cap) {
+  if (!view.has_cap) {
     return false;
   }
-  // Total absorption depth D = full cap rings + full fan layers; the member
-  // boundary is the cap ring D (no fan layers) or the fan layer L = D - n_cap
-  // edge across the three fan blocks. The interior radial ladder is
-  // m = 1 .. D-1 (cap rings first, then fan rows; the cap outer ring and the
-  // fan row 0 are the same physical nodes).
-  const int D = trifan_member_ring_count(pc, mb);
-  const int n_cap = mb.n_cap;
+  // Total absorption depth D = full cap rings followed by hybrid bridge rows,
+  // or by non-hybrid fan layers and shell rows. The interior radial ladder is
+  // m = 1 .. D-1, with the cap outer ring shared by the first outward block.
+  const mesh::BlockInfo* bridge = nullptr;
+  bool bridge_zero_is_inner = true;
+  const int D = trifan_member_ring_count(
+      pc, mb, view, node_r, node_z, &bridge, &bridge_zero_is_inner);
+  const int n_cap = view.n_cap;
+  const int B = view.hybrid ? std::max(0, D - n_cap) : 0;
+  if (B > 0) {
+    TENRYU_ASSERT(bridge != nullptr && B <= bridge->n_i_cells,
+                  "central pseudo-core hybrid bridge depth out of range");
+  }
   const int n_b =
-      mesh::mesh_topo_trifan_fan_block(mb, mesh::BlockRole::NORTH_FAN)
-          .n_i_cells;
+      view.hybrid
+          ? 0
+          : mesh::mesh_topo_trifan_fan_block(
+                mb, mesh::BlockRole::NORTH_FAN).n_i_cells;
   // Fan rows absorbed (capped at n_b) and shell rows absorbed beyond them.
   const int L = std::min(std::max(0, D - n_cap), n_b);
   const int S = std::max(0, D - n_cap - n_b);
-  const int ntheta = mb.blocks[static_cast<std::size_t>(
-      central_core_block_id(mb))].n_j_cells;
+  const int ntheta = view.ntheta;
   TENRYU_ASSERT(ntheta == 4 * n_cap,
                 "central pseudo-core trifan angular count mismatch");
   TENRYU_ASSERT(node_r.size() == node_z.size(),
                 "central pseudo-core trifan node arrays are inconsistent");
+  const int bridge_boundary_row_index =
+      B > 0 ? hybrid_bridge_boundary_node_row_index(
+                  mb, *bridge, B, bridge_zero_is_inner)
+            : 0;
 
-  const int apex = mesh::mesh_topo_cap_apex_node_id(mb);
+  const int apex = cap_apex_node_id(mb, view);
   const double r0 = node_r[static_cast<std::size_t>(apex)];
   const double z0 = node_z[static_cast<std::size_t>(apex)];
   TENRYU_ASSERT(std::isfinite(r0) && std::isfinite(z0),
@@ -543,6 +823,10 @@ bool rebuild_trifan_virtual_member_geometry_host(
 
   // Member-boundary node at global angle g in [0, ntheta].
   const auto boundary_node = [&](const int g) -> int {
+    if (B > 0) {
+      return bridge->owned_node_begin +
+             bridge_boundary_row_index * (ntheta + 1) + g;
+    }
     if (S > 0) {
       const auto& shell = mesh::mesh_topo_multiblock_polar_shell_block(mb);
       TENRYU_ASSERT(shell.n_j_cells == ntheta,
@@ -550,7 +834,7 @@ bool rebuild_trifan_virtual_member_geometry_host(
       return shell.owned_node_begin + S * (ntheta + 1) + g;
     }
     if (L == 0) {
-      return mesh::mesh_topo_cap_ring_node_id(mb, D, g);
+      return cap_ring_node_id(mb, view, D, g);
     }
     if (g <= n_cap) {
       return mesh::mesh_topo_trifan_fan_node_id(
@@ -564,15 +848,72 @@ bool rebuild_trifan_virtual_member_geometry_host(
         mb, mesh::BlockRole::SOUTH_FAN, L, g - 3 * n_cap);
   };
 
+  // Fold guard: the interior star map is valid only if the boundary
+  // anchors are angularly monotone around the apex. Real boundary nodes
+  // are live DOF and stay untouched; when their apex-relative angles are
+  // non-monotone (violent aspherical interfaces), the DECORATIVE interior
+  // uses a minimally repaired anchor fan (deterministic forward
+  // projection, radius per anchor preserved). Monotone inputs reproduce
+  // the original anchors bit-exactly.
+  std::vector<double> anchor_r(static_cast<std::size_t>(ntheta) + 1U);
+  std::vector<double> anchor_z(static_cast<std::size_t>(ntheta) + 1U);
+  {
+    std::vector<double> phi(static_cast<std::size_t>(ntheta) + 1U);
+    std::vector<double> rad(static_cast<std::size_t>(ntheta) + 1U);
+    for (int g = 0; g <= ntheta; ++g) {
+      const int nb = boundary_node(g);
+      const double dr = node_r[static_cast<std::size_t>(nb)] - r0;
+      const double dz = node_z[static_cast<std::size_t>(nb)] - z0;
+      anchor_r[static_cast<std::size_t>(g)] =
+          node_r[static_cast<std::size_t>(nb)];
+      anchor_z[static_cast<std::size_t>(g)] =
+          node_z[static_cast<std::size_t>(nb)];
+      phi[static_cast<std::size_t>(g)] = std::atan2(std::max(dr, 0.0), dz);
+      rad[static_cast<std::size_t>(g)] = std::hypot(dr, dz);
+    }
+    bool monotone = true;
+    for (int g = 1; g <= ntheta; ++g) {
+      if (!(phi[static_cast<std::size_t>(g)] >
+            phi[static_cast<std::size_t>(g - 1)])) {
+        monotone = false;
+        break;
+      }
+    }
+    if (!monotone) {
+      const double eps =
+          0.02 * (3.14159265358979323846 / static_cast<double>(ntheta));
+      int repaired = 0;
+      double max_shift = 0.0;
+      for (int g = 1; g <= ntheta; ++g) {
+        const double lower = phi[static_cast<std::size_t>(g - 1)] + eps;
+        if (phi[static_cast<std::size_t>(g)] < lower) {
+          max_shift =
+              std::max(max_shift, lower - phi[static_cast<std::size_t>(g)]);
+          phi[static_cast<std::size_t>(g)] = lower;
+          ++repaired;
+        }
+      }
+      for (int g = 1; g <= ntheta; ++g) {
+        const std::size_t gi = static_cast<std::size_t>(g);
+        anchor_r[gi] = r0 + rad[gi] * std::sin(phi[gi]);
+        anchor_z[gi] = z0 + rad[gi] * std::cos(phi[gi]);
+      }
+      std::fprintf(stderr,
+                   "[central_pseudo_core] star-map anchor fold repair "
+                   "anchors=%d max_dphi=%.3e\n",
+                   repaired, max_shift);
+    }
+  }
+
   bool changed = false;
   const auto map_node = [&](const int n_inner, const int g, const double psi) {
-    const int n_boundary = boundary_node(g);
-    TENRYU_ASSERT(n_inner >= 0 && n_boundary >= 0 &&
+    TENRYU_ASSERT(n_inner >= 0 && g >= 0 &&
                       static_cast<std::size_t>(n_inner) < node_r.size() &&
-                      static_cast<std::size_t>(n_boundary) < node_r.size(),
+                      static_cast<std::size_t>(g) < anchor_r.size() &&
+                      static_cast<std::size_t>(g) < anchor_z.size(),
                   "central pseudo-core trifan star-map node out of range");
-    const double rb = node_r[static_cast<std::size_t>(n_boundary)];
-    const double zb = node_z[static_cast<std::size_t>(n_boundary)];
+    const double rb = anchor_r[static_cast<std::size_t>(g)];
+    const double zb = anchor_z[static_cast<std::size_t>(g)];
     TENRYU_ASSERT(std::isfinite(rb) && std::isfinite(zb),
                   "central pseudo-core trifan boundary node must be finite");
     const double r_new = r0 + psi * (rb - r0);
@@ -592,7 +933,7 @@ bool rebuild_trifan_virtual_member_geometry_host(
     const double psi =
         std::cbrt(static_cast<double>(m) / static_cast<double>(D));
     for (int k = 0; k <= ntheta; ++k) {
-      map_node(mesh::mesh_topo_cap_ring_node_id(mb, m, k), k, psi);
+      map_node(cap_ring_node_id(mb, view, m, k), k, psi);
     }
   }
   // Interior fan rows: l = 1 .. L-1 while the boundary is a fan edge, or all
@@ -618,8 +959,25 @@ bool rebuild_trifan_virtual_member_geometry_host(
       }
     }
   }
+  // Interior hybrid bridge node-rows q = 1 .. B-1. The same idealized
+  // volume-uniform radial ladder used by the shell branch continues outward
+  // from the cap.
+  if (B > 1) {
+    for (int q = 1; q < B; ++q) {
+      const double psi = std::cbrt(static_cast<double>(n_cap + q) /
+                                   static_cast<double>(D));
+      const int row_node_index = hybrid_bridge_boundary_node_row_index(
+          mb, *bridge, q, bridge_zero_is_inner);
+      for (int g = 0; g <= ntheta; ++g) {
+        map_node(bridge->owned_node_begin +
+                     row_node_index * (ntheta + 1) + g,
+                 g,
+                 psi);
+      }
+    }
+  }
   // Interior shell rows q = 1 .. S-1.
-  if (S > 1) {
+  if (!view.hybrid && S > 1) {
     const auto& shell = mesh::mesh_topo_multiblock_polar_shell_block(mb);
     for (int q = 1; q < S; ++q) {
       const double psi = std::cbrt(static_cast<double>(n_cap + n_b + q) /
@@ -882,7 +1240,7 @@ double macro_core_pressure(const core::CentralPseudoCoreState& pc,
                 "central pseudo-core macro pressure requires a material");
   const auto& mat = cfg.materials.materials.front();
   TENRYU_ASSERT(mat.eos_model == "ideal_gas" && mat.eos_tables == nullptr,
-                "central pseudo-core Phase1 macro pressure requires ideal_gas EOS");
+                "central pseudo-core Phase1 requires ideal_gas EOS");
   TENRYU_ASSERT(pc.M_c > 0.0 && pc.V_c > 0.0,
                 "central pseudo-core macro pressure requires positive mass/volume");
   // Stratified 1D sub-model override: the boundary force consumes the
@@ -1365,11 +1723,14 @@ __global__ void zero_member_compatible_cell_buffers_kernel(
     double* __restrict__ corner_force_p_z,
     double* __restrict__ corner_force_sub_r,
     double* __restrict__ corner_force_sub_z,
+    double* __restrict__ corner_force_q_r,
+    double* __restrict__ corner_force_q_z,
     double* __restrict__ work_p,
     double* __restrict__ work_sub,
     double* __restrict__ work_av,
     const std::uint8_t* __restrict__ member_mask,
-    const int n_cells) {
+    const int n_cells,
+    const int corner_stride) {
   const int c = blockIdx.x * blockDim.x + threadIdx.x;
   if (c >= n_cells || member_mask == nullptr || member_mask[c] == 0U) {
     return;
@@ -1380,6 +1741,13 @@ __global__ void zero_member_compatible_cell_buffers_kernel(
     corner_force_p_z[base + k] = 0.0;
     corner_force_sub_r[base + k] = 0.0;
     corner_force_sub_z[base + k] = 0.0;
+  }
+  if (corner_force_q_r != nullptr) {
+    const int q_base = c * corner_stride;
+    for (int k = 0; k < corner_stride; ++k) {
+      corner_force_q_r[q_base + k] = 0.0;
+      corner_force_q_z[q_base + k] = 0.0;
+    }
   }
   work_p[c] = 0.0;
   work_sub[c] = 0.0;
@@ -1398,6 +1766,22 @@ __global__ void zero_member_work_kernel(double* __restrict__ work_p,
   work_p[c] = 0.0;
   work_sub[c] = 0.0;
   work_av[c] = 0.0;
+}
+
+__global__ void zero_member_aw_pressure_work_force_kernel(
+    double* __restrict__ corner_force_p_rz_r,
+    double* __restrict__ corner_force_p_rz_z,
+    const std::uint8_t* __restrict__ member_mask,
+    const int n_cells) {
+  const int c = blockIdx.x * blockDim.x + threadIdx.x;
+  if (c >= n_cells || member_mask == nullptr || member_mask[c] == 0U) {
+    return;
+  }
+  const int base = 4 * c;
+  for (int k = 0; k < 4; ++k) {
+    corner_force_p_rz_r[base + k] = 0.0;
+    corner_force_p_rz_z[base + k] = 0.0;
+  }
 }
 
 __global__ void zero_internal_member_edge_forces_kernel(
@@ -1448,9 +1832,36 @@ __global__ void boundary_pressure_force_kernel(
     const double* __restrict__ x_r,
     const double* __restrict__ x_z,
     const double pressure,
-    const double impulse_dt) {
+    const double impulse_dt,
+    const int rz_scheme_id) {
   const int k = blockIdx.x * blockDim.x + threadIdx.x;
   if (k >= n_boundary_nodes) {
+    return;
+  }
+  if (rz_scheme_id == 1) {
+    // Closed-loop contract per order_boundary_nodes; on-axis segment area vectors
+    // are physically inert for r-forces via the axis projector.
+    const int km1 = (k + n_boundary_nodes - 1) % n_boundary_nodes;
+    const int kp1 = (k + 1) % n_boundary_nodes;
+    const int nm1 = boundary_nodes[km1];
+    const int n = boundary_nodes[k];
+    const int np1 = boundary_nodes[kp1];
+    double sr = 0.0;
+    double sz = 0.0;
+    const auto area_m = detail::planar_boundary_pressure_segment_area_vector(
+        x_r[nm1], x_z[nm1], x_r[n], x_z[n]);
+    sr += area_m.r;
+    sz += area_m.z;
+    const auto area_p = detail::planar_boundary_pressure_segment_area_vector(
+        x_r[n], x_z[n], x_r[np1], x_z[np1]);
+    sr += area_p.r;
+    sz += area_p.z;
+    const double fr = pressure * sr;
+    const double fz = pressure * sz;
+    atomicAdd(force_r + n, fr);
+    atomicAdd(force_z + n, fz);
+    boundary_impulse_r[k] = impulse_dt * fr;
+    boundary_impulse_z[k] = impulse_dt * fz;
     return;
   }
   const int km1 = (k + n_boundary_nodes - 1) % n_boundary_nodes;
@@ -1506,10 +1917,12 @@ void rebuild_virtual_member_geometry(core::State& state,
   }
   TENRYU_ASSERT(state.mesh.topo.multiblock.has_value(),
                 "central pseudo-core virtual star-map requires multiblock topology");
+  const auto& mb = *state.mesh.topo.multiblock;
+  const CapTopoView view = make_cap_topo_view(cfg, mb);
   std::vector<double> node_r = copy_field(state.x_r);
   std::vector<double> node_z = copy_field(state.x_z);
   if (!rebuild_trifan_virtual_member_geometry_host(
-          state.central_pseudo_core, *state.mesh.topo.multiblock, node_r, node_z)) {
+          state.central_pseudo_core, mb, view, node_r, node_z)) {
     return;
   }
   state.x_r.copy_from_host(node_r);
@@ -1522,10 +1935,15 @@ void rebuild_virtual_member_geometry(core::State& state,
 
 void ensure_built(core::State& state, const core::Config& cfg) {
   auto& pc = state.central_pseudo_core;
-  if (!configured(cfg)) {
+  if (pc.built) {
     return;
   }
-  if (pc.built) {
+  if (cfg.numerics.ale.central_pseudo_core_activation_time_s > 0.0 &&
+      state.t < cfg.numerics.ale.central_pseudo_core_activation_time_s &&
+      !state.central_pseudo_core.built) {
+    return;
+  }
+  if (!configured(cfg)) {
     return;
   }
   core1d::Core1DParams core1d_params;
@@ -1546,15 +1964,28 @@ void ensure_built(core::State& state, const core::Config& cfg) {
       cfg.numerics.ale.central_pseudo_core_core1d_dist_append;
   core1d::set_params(core1d_params);
   TENRYU_ASSERT(is_supported_topology(cfg),
-                "central pseudo-core Exp1 requires 2D_RZ 5-block multiblock topology");
+                "central pseudo-core Exp1 requires a 2D_RZ 5-block multiblock "
+                "or polar-tier cart-center trifan_cap topology");
   TENRYU_ASSERT(!cfg.numerics.materials.per_material_conservation_enabled,
-                "central pseudo-core Exp1 does not support per-material conservation");
+                "central pseudo-core Exp1 does not support per-material "
+                "conservation");
   TENRYU_ASSERT(cfg.numerics.ale.central_pseudo_core_s_c > 0.0,
                 "central pseudo-core requires central_pseudo_core_s_c > 0");
   TENRYU_ASSERT(state.mesh.topo.multiblock.has_value(),
                 "central pseudo-core requires initialized multiblock topology");
 
   const auto& mb = *state.mesh.topo.multiblock;
+  const CapTopoView view = make_cap_topo_view(cfg, mb);
+  if (view.hybrid &&
+      cfg.numerics.ale.central_pseudo_core_s_c >
+          cfg.mesh.multiblock_cart_core_r_c) {
+    std::ostringstream msg;
+    msg << "central pseudo-core hybrid requires central_pseudo_core_s_c="
+        << cfg.numerics.ale.central_pseudo_core_s_c
+        << " <= multiblock_cart_core_r_c="
+        << cfg.mesh.multiblock_cart_core_r_c;
+    TENRYU_ASSERT(false, msg.str());
+  }
   const int n_cells = state.mesh.topo.n_cells;
   pc.configured = true;
   pc.s_c = cfg.numerics.ale.central_pseudo_core_s_c;
@@ -1584,6 +2015,7 @@ void ensure_built(core::State& state, const core::Config& cfg) {
   const int member_ring_count =
       select_ring_conforming_members(state.mesh,
                                      mb,
+                                     view,
                                      node_r,
                                      node_z,
                                      pc.s_c,
@@ -1598,6 +2030,20 @@ void ensure_built(core::State& state, const core::Config& cfg) {
   }
   TENRYU_ASSERT(!pc.member_cells.empty(),
                 "central pseudo-core selected no member cells");
+  if (view.hybrid) {
+    const int block_id = central_core_block_id(mb);
+    const auto& bridge = hybrid_bridge_block(mb, view);
+    const int bridge_block_id =
+        static_cast<int>(&bridge - mb.blocks.data());
+    for (const int c : pc.member_cells) {
+      const int member_block_id =
+          mb.cell_block_id[static_cast<std::size_t>(c)];
+      TENRYU_ASSERT(member_block_id == block_id ||
+                        member_block_id == bridge_block_id,
+                    "central pseudo-core hybrid members must stay in the "
+                    "central-core or bridge block");
+    }
+  }
   pc.representative_cell = pc.member_cells.front();
   for (const int c : pc.member_cells) {
     const std::size_t idx = static_cast<std::size_t>(c);
@@ -1729,14 +2175,46 @@ int ring_absorption_max_rings(const core::Config& cfg) {
   return v > 0 ? v : std::numeric_limits<int>::max();
 }
 
-// Count the contiguous prefix of polar-shell rows that are PURE GAS (min
-// gas tracer over the row above the threshold). The material interface must
-// never be absorbed into the macro CV, so this is the binding limit for
-// shell-row absorption; with no tracer field the limit is zero (refuse).
+// Count absorbable PURE-GAS rows. For a hybrid cap this is the contiguous
+// radial BRIDGE prefix beyond the current membership, and an absent tracer
+// accepts every remaining row. Non-hybrid shell behavior is unchanged: it
+// returns the full shell prefix and requires a tracer field.
 int absorbable_shell_row_count(core::State& state,
                                const core::Config& cfg,
-                               const mesh::MultiBlockTopology& mb) {
-  if (!mb.has_trifan_cap || state.gas_tracer_Y.empty()) {
+                               const mesh::MultiBlockTopology& mb,
+                               const mesh::BlockInfo* bridge_hint = nullptr,
+                               const bool* bridge_zero_is_inner_hint = nullptr) {
+  const CapTopoView view = make_cap_topo_view(cfg, mb);
+  if (!view.has_cap) {
+    return 0;
+  }
+  const mesh::BlockInfo* hybrid_bridge = nullptr;
+  bool bridge_zero_is_inner = true;
+  int first_bridge_row = 0;
+  if (view.hybrid) {
+    if (bridge_hint != nullptr) {
+      TENRYU_ASSERT(bridge_zero_is_inner_hint != nullptr &&
+                        bridge_hint == &hybrid_bridge_block(mb, view),
+                    "central pseudo-core hybrid bridge orientation hint mismatch");
+      hybrid_bridge = bridge_hint;
+      bridge_zero_is_inner = *bridge_zero_is_inner_hint;
+    } else {
+      TENRYU_ASSERT(bridge_zero_is_inner_hint == nullptr,
+                    "central pseudo-core hybrid bridge hint is incomplete");
+      hybrid_bridge = &hybrid_bridge_block(mb, view);
+      std::vector<double> node_r = copy_field(state.x_r);
+      std::vector<double> node_z = copy_field(state.x_z);
+      bridge_zero_is_inner = hybrid_bridge_row_zero_is_inner(
+          mb, *hybrid_bridge, node_r, node_z);
+    }
+    first_bridge_row =
+        std::max(0, state.central_pseudo_core.member_ring_count - view.n_cap);
+    TENRYU_ASSERT(first_bridge_row <= hybrid_bridge->n_i_cells,
+                  "central pseudo-core hybrid bridge membership depth out of range");
+    if (state.gas_tracer_Y.empty()) {
+      return hybrid_bridge->n_i_cells - first_bridge_row;
+    }
+  } else if (state.gas_tracer_Y.empty()) {
     return 0;
   }
   // The binding statistic is the MASS-WEIGHTED row tracer fraction: a
@@ -1766,6 +2244,37 @@ int absorbable_shell_row_count(core::State& state,
           ? env_cell_floor
           : cfg.numerics.ale
                 .central_pseudo_core_ring_absorption_gas_tracer_cell_min;
+  if (view.hybrid) {
+    const std::vector<double> tracer = copy_field(state.gas_tracer_Y);
+    const std::vector<double> mass = copy_field(state.mass);
+    int rows = 0;
+    for (int q = first_bridge_row; q < hybrid_bridge->n_i_cells; ++q) {
+      const int row = hybrid_bridge_storage_row(
+          *hybrid_bridge, q, bridge_zero_is_inner);
+      double row_min = std::numeric_limits<double>::infinity();
+      double mass_sum = 0.0;
+      double mass_tracer_sum = 0.0;
+      for (int j = 0; j < hybrid_bridge->n_j_cells; ++j) {
+        const int c = block_cell_id(*hybrid_bridge, row, j);
+        TENRYU_ASSERT(c >= 0 &&
+                          static_cast<std::size_t>(c) < tracer.size() &&
+                          static_cast<std::size_t>(c) < mass.size(),
+                      "central pseudo-core bridge tracer cell out of range");
+        const double y = tracer[static_cast<std::size_t>(c)];
+        const double m = mass[static_cast<std::size_t>(c)];
+        row_min = std::min(row_min, y);
+        mass_sum += m;
+        mass_tracer_sum += m * y;
+      }
+      const double weighted =
+          mass_sum > 0.0 ? mass_tracer_sum / mass_sum : 0.0;
+      if (!(weighted >= tracer_floor) || !(row_min >= cell_floor)) {
+        break;
+      }
+      ++rows;
+    }
+    return rows;
+  }
   const auto& shell = mesh::mesh_topo_multiblock_polar_shell_block(mb);
   const std::vector<double> tracer = copy_field(state.gas_tracer_Y);
   const std::vector<double> mass = copy_field(state.mass);
@@ -1818,27 +2327,6 @@ bool mixed_absorption_enabled(const core::Config& cfg) {
   return cfg.numerics.ale.central_pseudo_core_mixed_absorb_enabled;
 }
 
-// Terminal absorption (I1-B-R): opt-in master switch, and the
-// rebound detector threshold — the terminal grant requires the shell-resolved
-// gas volume to have risen past factor*min (the capsule is re-expanding, so
-// the LAST shell row is fold-doomed exhaust, not load-bearing physics).
-bool terminal_absorption_enabled(const core::Config& cfg) {
-  static const char* raw = std::getenv("TENRYU_I1B_TERMINAL_ABSORB");
-  if (raw != nullptr && raw[0] != '\0') {
-    return raw[0] != '0';
-  }
-  return cfg.numerics.ale.central_pseudo_core_terminal_absorb_enabled;
-}
-
-double terminal_rebound_factor(const core::Config& cfg) {
-  static const char* raw = std::getenv("TENRYU_I1B_TERMINAL_REBOUND_FACTOR");
-  if (raw != nullptr && raw[0] != '\0') {
-    const double x = std::atof(raw);
-    return (std::isfinite(x) && x > 1.0) ? x : 1.02;
-  }
-  return cfg.numerics.ale.central_pseudo_core_terminal_rebound_factor;
-}
-
 int absorb_watch_rows(const core::Config& cfg) {
   static const char* raw = std::getenv("TENRYU_I1B_ABSORB_WATCH_ROWS");
   if (raw != nullptr && raw[0] != '\0') {
@@ -1881,6 +2369,7 @@ bool spherical_absorb_gasfront(const core::Config& cfg) {
 // but volume and simplicity are evaluated at the CURRENT committed node
 // positions — the question is whether today's mesh can host the new loop.
 bool hypothetical_boundary_loop_admissible(core::State& state,
+                                           const CapTopoView& view,
                                            const int target_rings,
                                            double* v_out,
                                            int* simple_out) {
@@ -1899,7 +2388,8 @@ bool hypothetical_boundary_loop_admissible(core::State& state,
   }
   std::vector<std::uint8_t> mask(static_cast<std::size_t>(n_cells), 0U);
   const int got_rings = select_ring_conforming_members(
-      state.mesh, mb, node_r_sel, node_z_sel, pc.s_c, target_rings, mask);
+      state.mesh, mb, view, node_r_sel, node_z_sel, pc.s_c, target_rings,
+      mask);
   if (got_rings < target_rings) {
     return false;
   }
@@ -2240,17 +2730,37 @@ void execute_ring_absorption(core::State& state,
     std::vector<double> nr_h = copy_field(state.x_r);
     std::vector<double> nz_h = copy_field(state.x_z);
     const auto& mb1d = *state.mesh.topo.multiblock;
+    const CapTopoView view1d = make_cap_topo_view(cfg, mb1d);
     // Verdict #6 Q3: ONE 1D shell per absorption UNIT (radial order), not
     // one pooled shell per event — a cascade otherwise destroys the radial
     // stratification. Unit depth uses the same mapping arithmetic as
     // request_ring_absorption.
     const int cb_id = central_core_block_id(mb1d);
     const auto& cb = mb1d.blocks[static_cast<std::size_t>(cb_id)];
+    const mesh::BlockInfo* bridge1d = nullptr;
+    bool bridge_zero_is_inner = true;
+    if (view1d.hybrid) {
+      bridge1d = &hybrid_bridge_block(mb1d, view1d);
+      bridge_zero_is_inner = hybrid_bridge_row_zero_is_inner(
+          mb1d, *bridge1d, nr_h, nz_h);
+    }
     const auto depth_of = [&](const int c) -> int {
       if (c >= cb.cell_begin && c < cb.cell_begin + cb.cell_count) {
         return (c - cb.cell_begin) / cb.n_j_cells;
       }
-      if (mb1d.has_trifan_cap) {
+      if (view1d.has_cap) {
+        if (view1d.hybrid) {
+          if (c >= bridge1d->cell_begin &&
+              c < bridge1d->cell_begin + bridge1d->cell_count) {
+            const int storage_row =
+                (c - bridge1d->cell_begin) / bridge1d->n_j_cells;
+            return cb.n_i_cells + hybrid_bridge_radial_row(
+                                      *bridge1d,
+                                      storage_row,
+                                      bridge_zero_is_inner);
+          }
+          return -1;
+        }
         for (const mesh::BlockRole fan : {mesh::BlockRole::NORTH_FAN,
                                           mesh::BlockRole::EAST_FAN,
                                           mesh::BlockRole::SOUTH_FAN}) {
@@ -2366,10 +2876,21 @@ bool request_ring_absorption(core::State& state,
     return false;
   }
   const auto& mb = *state.mesh.topo.multiblock;
+  const CapTopoView view = make_cap_topo_view(cfg, mb);
   const int block_id = central_core_block_id(mb);
   const auto& block = mb.blocks[static_cast<std::size_t>(block_id)];
+  const mesh::BlockInfo* hybrid_bridge = nullptr;
+  bool bridge_zero_is_inner = true;
+  if (view.hybrid) {
+    hybrid_bridge = &hybrid_bridge_block(mb, view);
+    std::vector<double> node_r = copy_field(state.x_r);
+    std::vector<double> node_z = copy_field(state.x_z);
+    bridge_zero_is_inner = hybrid_bridge_row_zero_is_inner(
+        mb, *hybrid_bridge, node_r, node_z);
+  }
   // Map the failing cell to an absorption depth: core ring i -> depth i;
-  // fan layer l (trifan only) -> depth n_cap + l.
+  // a hybrid bridge row in increasing-radius order -> depth n_cap + q;
+  // fan layer l (non-hybrid trifan only) -> depth n_cap + l.
   int depth = -1;
   int max_depth = block.n_i_cells - 1;
   if (failing_cell == mesh::kCentralMacroCoreSentinelCell) {
@@ -2380,36 +2901,59 @@ bool request_ring_absorption(core::State& state,
   } else if (failing_cell >= block.cell_begin &&
              failing_cell < block.cell_begin + block.cell_count) {
     depth = (failing_cell - block.cell_begin) / block.n_j_cells;
-  } else if (mb.has_trifan_cap) {
-    for (const mesh::BlockRole fan : {mesh::BlockRole::NORTH_FAN,
-                                      mesh::BlockRole::EAST_FAN,
-                                      mesh::BlockRole::SOUTH_FAN}) {
-      const auto& fan_block = mesh::mesh_topo_trifan_fan_block(mb, fan);
-      if (failing_cell >= fan_block.cell_begin &&
-          failing_cell < fan_block.cell_begin + fan_block.cell_count) {
-        depth = block.n_i_cells +
-                (failing_cell - fan_block.cell_begin) / fan_block.n_j_cells;
-        break;
+  } else if (view.has_cap) {
+    if (view.hybrid) {
+      if (failing_cell >= hybrid_bridge->cell_begin &&
+          failing_cell <
+              hybrid_bridge->cell_begin + hybrid_bridge->cell_count) {
+        const int storage_row =
+            (failing_cell - hybrid_bridge->cell_begin) /
+            hybrid_bridge->n_j_cells;
+        depth = block.n_i_cells + hybrid_bridge_radial_row(
+                                      *hybrid_bridge,
+                                      storage_row,
+                                      bridge_zero_is_inner);
       }
-    }
-    if (depth < 0) {
-      const auto& shell = mesh::mesh_topo_multiblock_polar_shell_block(mb);
-      if (failing_cell >= shell.cell_begin &&
-          failing_cell < shell.cell_begin + shell.cell_count) {
-        const auto& north = mesh::mesh_topo_trifan_fan_block(
-            mb, mesh::BlockRole::NORTH_FAN);
-        depth = block.n_i_cells + north.n_i_cells +
-                (failing_cell - shell.cell_begin) / shell.n_j_cells;
+    } else {
+      for (const mesh::BlockRole fan : {mesh::BlockRole::NORTH_FAN,
+                                        mesh::BlockRole::EAST_FAN,
+                                        mesh::BlockRole::SOUTH_FAN}) {
+        const auto& fan_block = mesh::mesh_topo_trifan_fan_block(mb, fan);
+        if (failing_cell >= fan_block.cell_begin &&
+            failing_cell < fan_block.cell_begin + fan_block.cell_count) {
+          depth = block.n_i_cells +
+                  (failing_cell - fan_block.cell_begin) /
+                      fan_block.n_j_cells;
+          break;
+        }
+      }
+      if (depth < 0) {
+        const auto& shell = mesh::mesh_topo_multiblock_polar_shell_block(mb);
+        if (failing_cell >= shell.cell_begin &&
+            failing_cell < shell.cell_begin + shell.cell_count) {
+          const auto& north = mesh::mesh_topo_trifan_fan_block(
+              mb, mesh::BlockRole::NORTH_FAN);
+          depth = block.n_i_cells + north.n_i_cells +
+                  (failing_cell - shell.cell_begin) / shell.n_j_cells;
+        }
       }
     }
   }
-  if (mb.has_trifan_cap) {
-    const auto& north =
-        mesh::mesh_topo_trifan_fan_block(mb, mesh::BlockRole::NORTH_FAN);
-    // Shell-row absorption is bounded by the pure-gas prefix: the material
-    // interface must never be absorbed into the macro CV.
-    max_depth = block.n_i_cells + north.n_i_cells +
-                absorbable_shell_row_count(state, cfg, mb);
+  if (view.has_cap) {
+    if (view.hybrid) {
+      const int absorbed_bridge_rows =
+          std::max(0, pc.member_ring_count - view.n_cap);
+      max_depth = view.n_cap + absorbed_bridge_rows +
+                  absorbable_shell_row_count(
+                      state, cfg, mb, hybrid_bridge, &bridge_zero_is_inner);
+    } else {
+      const auto& north =
+          mesh::mesh_topo_trifan_fan_block(mb, mesh::BlockRole::NORTH_FAN);
+      // Shell-row absorption is bounded by the pure-gas prefix: the material
+      // interface must never be absorbed into the macro CV.
+      max_depth = block.n_i_cells + north.n_i_cells +
+                  absorbable_shell_row_count(state, cfg, mb);
+    }
   }
   if (depth < 0) {
     std::fprintf(stderr,
@@ -2445,29 +2989,40 @@ bool request_ring_absorption(core::State& state,
     // the would-be new outer boundary on today's mesh; the structural
     // backstop and the max_rings cap still bind.
     const int emergency_target = pc.member_ring_count + 1;
-    if (mixed_absorption_enabled(cfg) && mb.has_trifan_cap &&
+    if (mixed_absorption_enabled(cfg) && view.has_cap &&
         depth >= pc.member_ring_count &&
         emergency_target <= ring_absorption_max_rings(cfg) &&
         pc.min_member_ring_count < emergency_target) {
-      const auto& north_fan =
-          mesh::mesh_topo_trifan_fan_block(mb, mesh::BlockRole::NORTH_FAN);
-      const auto& shell_blk =
-          mesh::mesh_topo_multiblock_polar_shell_block(mb);
-      // Matches the membership selector's topology backstop: the LAST shell
-      // row is never absorbable (at least one active shell row remains).
-      const int structural_max =
-          block.n_i_cells + north_fan.n_i_cells + (shell_blk.n_i_cells - 1);
+      const mesh::BlockInfo* north_fan = nullptr;
+      int structural_max = view.n_cap;
+      if (view.hybrid) {
+        structural_max = view.n_cap + hybrid_bridge->n_i_cells;
+      } else {
+        north_fan = &mesh::mesh_topo_trifan_fan_block(
+            mb, mesh::BlockRole::NORTH_FAN);
+        const auto& shell_blk =
+            mesh::mesh_topo_multiblock_polar_shell_block(mb);
+        // Matches the membership selector's topology backstop: the LAST shell
+        // row is never absorbable (at least one active shell row remains).
+        structural_max = block.n_i_cells + north_fan->n_i_cells +
+                         (shell_blk.n_i_cells - 1);
+      }
       if (emergency_target <= structural_max) {
         double v_new_loop = 0.0;
         int new_loop_simple = 0;
         const bool new_loop_ok = hypothetical_boundary_loop_admissible(
-            state, emergency_target, &v_new_loop, &new_loop_simple);
+            state, view, emergency_target, &v_new_loop, &new_loop_simple);
         const int q_row =
-            emergency_target - 1 - block.n_i_cells - north_fan.n_i_cells;
+            view.hybrid
+                ? -1
+                : emergency_target - 1 - block.n_i_cells -
+                      north_fan->n_i_cells;
         double row_mass = 0.0;
         double row_weighted_y = 0.0;
-        shell_row_material_stats(state, mb, q_row, &row_mass,
-                                 &row_weighted_y);
+        if (!view.hybrid) {
+          shell_row_material_stats(state, mb, q_row, &row_mass,
+                                   &row_weighted_y);
+        }
         if (new_loop_ok) {
           pc.min_member_ring_count = emergency_target;
           // Only rows past the gas prefix are MIXED; an emergency walk
@@ -2535,35 +3090,6 @@ bool request_ring_absorption(core::State& state,
                          state.step);
           }
         }
-      } else if (terminal_absorption_enabled(cfg) && !pc.terminal_absorbed &&
-                 !pc.terminal_absorb_pending && core1d::enabled() &&
-                 core1d::built(&pc) &&
-                 std::isfinite(pc.core1d_V_gas_c) &&
-                 std::isfinite(pc.core1d_V_gas_min_c) &&
-                 pc.core1d_V_gas_min_c > 0.0 &&
-                 pc.core1d_V_gas_c >
-                     terminal_rebound_factor(cfg) * pc.core1d_V_gas_min_c) {
-        // I1-B-R terminal phase: the walk wants the LAST shell row — structurally
-        // unabsorbable in the 2D framework (a one-row shell has every node
-        // pinned by the boundary contracts, measured zero repair DOF) — and
-        // the capsule is measurably re-expanding (V_gas past minimum by the
-        // rebound factor), so the remaining 2D mesh is fold-doomed exhaust.
-        // Grant the TERMINAL absorption: the driver executes it on the
-        // restored pre-step state and completes the run as a stratified-1D
-        // tail integration.
-        pc.terminal_absorb_pending = true;
-        std::fprintf(stderr,
-                     "[central_pseudo_core] TERMINAL absorption armed: "
-                     "failing_cell=%d emergency_target=%d structural_max=%d "
-                     "V_gas=%.6e V_gas_min=%.6e ratio=%.4f step=%d\n",
-                     failing_cell,
-                     emergency_target,
-                     structural_max,
-                     pc.core1d_V_gas_c,
-                     pc.core1d_V_gas_min_c,
-                     pc.core1d_V_gas_c / pc.core1d_V_gas_min_c,
-                     state.step);
-        return true;
       }
     }
     std::fprintf(stderr,
@@ -2612,266 +3138,6 @@ bool request_macro_boundary_absorption(core::State& state,
                                  mesh::kCentralMacroCoreSentinelCell);
 }
 
-bool terminal_absorb_pending(const core::State& state) {
-  return state.central_pseudo_core.terminal_absorb_pending &&
-         !state.central_pseudo_core.terminal_absorbed;
-}
-
-void execute_terminal_absorption(core::State& state, const core::Config& cfg) {
-  auto& pc = state.central_pseudo_core;
-  if (!pc.terminal_absorb_pending || pc.terminal_absorbed) {
-    return;
-  }
-  pc.terminal_absorb_pending = false;
-  if (!pc.built || !pc.valid || !state.mesh.topo.multiblock.has_value() ||
-      !core1d::enabled() || !core1d::built(&pc) ||
-      cfg.materials.materials.empty() ||
-      cfg.materials.materials.front().eos_model != "ideal_gas") {
-    std::fprintf(stderr,
-                 "[central_pseudo_core] TERMINAL absorption refused at "
-                 "execution: preconditions lost (built=%d valid=%d "
-                 "core1d=%d) step=%d\n",
-                 pc.built ? 1 : 0,
-                 pc.valid ? 1 : 0,
-                 core1d::built(&pc) ? 1 : 0,
-                 state.step);
-    return;
-  }
-  const double gamma1d = cfg.materials.materials.front().ideal_gas_gamma;
-  emit_boundary_asphericity(state, "pre_terminal");
-  // Mirror of execute_ring_absorption's core1d delta feed, applied to EVERY
-  // remaining non-member cell: one 1D shell per absorption-unit depth,
-  // radial-momentum projection, angular remainder thermalized on append.
-  const int n_cells = state.mesh.topo.n_cells;
-  std::vector<double> mass_h = copy_field(state.mass);
-  std::vector<double> vol_h = copy_field(state.vol);
-  std::vector<double> ee_h = copy_field(state.ee);
-  std::vector<double> ei_h =
-      state.ei.empty() ? std::vector<double>{} : copy_field(state.ei);
-  std::vector<double> tr_h = state.gas_tracer_Y.empty()
-                                 ? std::vector<double>{}
-                                 : copy_field(state.gas_tracer_Y);
-  std::vector<double> vr_h = copy_field(state.v_r);
-  std::vector<double> vz_h = copy_field(state.v_z);
-  std::vector<double> nr_h = copy_field(state.x_r);
-  std::vector<double> nz_h = copy_field(state.x_z);
-  const auto& mb = *state.mesh.topo.multiblock;
-  const int cb_id = central_core_block_id(mb);
-  const auto& cb = mb.blocks[static_cast<std::size_t>(cb_id)];
-  const auto depth_of = [&](const int c) -> int {
-    if (c >= cb.cell_begin && c < cb.cell_begin + cb.cell_count) {
-      return (c - cb.cell_begin) / cb.n_j_cells;
-    }
-    if (mb.has_trifan_cap) {
-      for (const mesh::BlockRole fan : {mesh::BlockRole::NORTH_FAN,
-                                        mesh::BlockRole::EAST_FAN,
-                                        mesh::BlockRole::SOUTH_FAN}) {
-        const auto& fb = mesh::mesh_topo_trifan_fan_block(mb, fan);
-        if (c >= fb.cell_begin && c < fb.cell_begin + fb.cell_count) {
-          return cb.n_i_cells + (c - fb.cell_begin) / fb.n_j_cells;
-        }
-      }
-      const auto& sh = mesh::mesh_topo_multiblock_polar_shell_block(mb);
-      if (c >= sh.cell_begin && c < sh.cell_begin + sh.cell_count) {
-        const auto& north =
-            mesh::mesh_topo_trifan_fan_block(mb, mesh::BlockRole::NORTH_FAN);
-        return cb.n_i_cells + north.n_i_cells +
-               (c - sh.cell_begin) / sh.n_j_cells;
-      }
-    }
-    return -1;
-  };
-  std::map<int, std::vector<core1d::ShellSample>> terminal_group_samples;
-  struct TerminalGroup {
-    double M = 0.0;
-    double U = 0.0;
-    double Pr = 0.0;
-    double Kfull = 0.0;
-    double MY = 0.0;
-    double V = 0.0;
-    int cells = 0;
-  };
-  std::map<int, TerminalGroup> groups;
-  int unmapped = 0;
-  for (int c = 0; c < n_cells; ++c) {
-    const std::size_t ci = static_cast<std::size_t>(c);
-    if (ci < pc.member_mask.size() && pc.member_mask[ci] != 0U) {
-      continue;
-    }
-    const int d = depth_of(c);
-    if (d < 0) {
-      ++unmapped;
-      continue;
-    }
-    const double m = mass_h[ci];
-    const double e = ee_h[ci] + (ei_h.empty() ? 0.0 : ei_h[ci]);
-    const double Y = tr_h.empty() ? 0.0 : tr_h[ci];
-    const auto nodes = multiblock_cell_nodes(mb, c);
-    double vr_bar = 0.0, vz_bar = 0.0, rc = 0.0, zc = 0.0;
-    for (const int nn : nodes) {
-      const std::size_t ni = static_cast<std::size_t>(nn);
-      vr_bar += vr_h[ni];
-      vz_bar += vz_h[ni];
-      rc += nr_h[ni];
-      zc += nz_h[ni];
-    }
-    vr_bar *= 0.25;
-    vz_bar *= 0.25;
-    rc *= 0.25;
-    zc *= 0.25;
-    const double s = std::hypot(rc, zc);
-    const double ur = s > 0.0 ? (vr_bar * rc + vz_bar * zc) / s : 0.0;
-    TerminalGroup& g = groups[d];
-    g.M += m;
-    g.U += m * e;
-    g.Pr += m * ur;
-    g.Kfull += 0.5 * m * (vr_bar * vr_bar + vz_bar * vz_bar);
-    g.MY += m * Y;
-    g.V += vol_h[ci];
-    g.cells += 1;
-    if (core1d::dist_append_enabled() && m > 0.0) {
-      core1d::ShellSample sample;
-      sample.m = m;
-      sample.e = e + std::max(0.5 * (vr_bar * vr_bar + vz_bar * vz_bar) -
-                                  0.5 * ur * ur,
-                              0.0);
-      sample.u_r = ur;
-      sample.Y = Y;
-      sample.V = vol_h[ci];
-      terminal_group_samples[d].push_back(sample);
-    }
-  }
-  double m_total = 0.0, e_total = 0.0;
-  int cells_total = 0;
-  for (const auto& kv : groups) {
-    const TerminalGroup& g = kv.second;
-    if (!(g.M > 0.0) || !(g.V > 0.0)) {
-      continue;
-    }
-    const double Kr = g.Pr * g.Pr / (2.0 * g.M);
-    const double e_spec = (g.U + std::max(g.Kfull - Kr, 0.0)) / g.M;
-    auto it_s = terminal_group_samples.find(kv.first);
-    if (core1d::dist_append_enabled() && it_s != terminal_group_samples.end() &&
-        !it_s->second.empty()) {
-      core1d::absorb_event_distribution(&pc, std::move(it_s->second));
-    } else {
-      core1d::absorb_event(&pc, g.M, e_spec, g.Pr / g.M, g.MY / g.M, g.V);
-    }
-    m_total += g.M;
-    e_total += g.U + g.Kfull;
-    cells_total += g.cells;
-  }
-  core1d::set_free_outer(&pc, gamma1d);
-  pc.terminal_absorbed = true;
-  pc.terminal_absorb_t = state.t;
-  pc.terminal_absorb_step = state.step;
-  pc.mixed_absorbed_row_count += static_cast<int>(groups.size());
-  const core1d::GasView g1d = core1d::gas_view(&pc, gamma1d);
-  if (g1d.valid && g1d.V_gas > 0.0) {
-    pc.core1d_V_gas_c = g1d.V_gas;
-    pc.core1d_V_gas_min_c = std::min(pc.core1d_V_gas_min_c, g1d.V_gas);
-  }
-  core1d::emit_ledger(&pc, state.step, state.t, gamma1d);
-  std::fprintf(stderr,
-               "[central_pseudo_core] TERMINAL absorption executed: "
-               "groups=%zu cells=%d unmapped=%d M=%.6e E=%.6e t=%.6e "
-               "step=%d — 2D mesh frozen, core1d tail owns the rebound\n",
-               groups.size(),
-               cells_total,
-               unmapped,
-               m_total,
-               e_total,
-               state.t,
-               state.step);
-}
-
-bool run_terminal_core1d_tail(core::State& state,
-                              const core::Config& cfg,
-                              double (*p_drive)(const core::State&, double)) {
-  auto& pc = state.central_pseudo_core;
-  if (!pc.terminal_absorbed || !core1d::built(&pc) ||
-      cfg.materials.materials.empty() ||
-      cfg.materials.materials.front().eos_model != "ideal_gas") {
-    return false;
-  }
-  const double gamma1d = cfg.materials.materials.front().ideal_gas_gamma;
-  static const char* tail_dt_raw =
-      std::getenv("TENRYU_I1B_TERMINAL_TAIL_DT");
-  const double tail_dt = [&] {
-    if (tail_dt_raw != nullptr) {
-      const double v = std::atof(tail_dt_raw);
-      return (std::isfinite(v) && v > 0.0) ? v : 1.0e-12;
-    }
-    return cfg.numerics.ale.central_pseudo_core_terminal_tail_dt_s;
-  }();
-  static const int log_every = [] {
-    const char* raw = std::getenv("TENRYU_I1B_TERMINAL_TAIL_LOG_EVERY");
-    const int v = raw != nullptr ? std::atoi(raw) : 0;
-    return v > 0 ? v : 200;
-  }();
-  std::fprintf(stderr,
-               "[core1d_tail] START t=%.6e t_end=%.6e dt_chunk=%.3e "
-               "step=%d\n",
-               state.t,
-               cfg.main.t_end,
-               tail_dt,
-               state.step);
-  int stall_chunks = 0;
-  while (state.t < cfg.main.t_end) {
-    const double dt = std::min(tail_dt, cfg.main.t_end - state.t);
-    const double p_ext =
-        std::max(p_drive != nullptr
-                     ? p_drive(state, state.t + 0.5 * dt)
-                     : 0.0,
-                 0.0);
-    const long long s0 = core1d::substep_count(&pc);
-    core1d::advance_dynamic(&pc, p_ext, dt, gamma1d);
-    if (core1d::substep_count(&pc) == s0) {
-      ++stall_chunks;
-      if (stall_chunks >= 3) {
-        std::fprintf(stderr,
-                     "[core1d_tail] STALLED: no substep progress for %d "
-                     "chunks at t=%.6e — aborting tail\n",
-                     stall_chunks,
-                     state.t);
-        return false;
-      }
-      continue;
-    }
-    stall_chunks = 0;
-    state.t += dt;
-    state.step += 1;
-    if (state.step % log_every == 0 || state.t >= cfg.main.t_end) {
-      const core1d::GasView gv = core1d::gas_view(&pc, gamma1d);
-      if (gv.valid && gv.V_gas > 0.0) {
-        pc.core1d_V_gas_c = gv.V_gas;
-        pc.core1d_V_gas_min_c = std::min(pc.core1d_V_gas_min_c, gv.V_gas);
-      }
-      core1d::emit_ledger(&pc, state.step, state.t, gamma1d);
-      std::fprintf(stderr,
-                   "[core1d_tail] step=%d t=%.6e V_gas=%.6e r_gas=%.6e "
-                   "p_center=%.6e M_gas=%.6e rhoR_gas=%.6e P_ext=%.3e\n",
-                   state.step,
-                   state.t,
-                   gv.valid ? gv.V_gas : -1.0,
-                   gv.valid ? gv.r_gas_outer : -1.0,
-                   gv.valid ? gv.p_center : -1.0,
-                   gv.valid ? gv.M_gas : -1.0,
-                   gv.valid ? gv.rhoR_gas : -1.0,
-                   p_ext);
-    }
-  }
-  std::fprintf(stderr,
-               "[core1d_tail] COMPLETE t=%.6e step=%d substeps=%lld "
-               "(terminal at t=%.6e step=%d)\n",
-               state.t,
-               state.step,
-               core1d::substep_count(&pc),
-               pc.terminal_absorb_t,
-               pc.terminal_absorb_step);
-  return true;
-}
-
 void detect_and_repair_stale_core_reference(core::State& state) {
   detect_and_repair_stale_core_reference_impl(state);
 }
@@ -2903,12 +3169,13 @@ void maybe_absorb_first_active_ring(core::State& state,
           ? env_tau
           : cfg.numerics.ale.central_pseudo_core_ring_absorption_tau;
   const auto& mb = *state.mesh.topo.multiblock;
+  const CapTopoView view = make_cap_topo_view(cfg, mb);
   const int block_id = central_core_block_id(mb);
   const auto& block = mb.blocks[static_cast<std::size_t>(block_id)];
   // Watch the first W ACTIVE absorption units starting at depth D = member
-  // depth: a core ring for D < n_cap, otherwise fan layer D - n_cap across
-  // the three fan blocks, otherwise a polar-shell row. W defaults to 1 (the
-  // historical single-ring watch); a wider window is the terminal-phase verdict's
+  // depth: a core ring for D < n_cap, then a hybrid bridge row or a non-hybrid
+  // fan layer, and finally a non-hybrid polar-shell row. W defaults to 1 (the
+  // historical single-ring watch); a wider window is the endgame verdict's
   // PRE-trigger — a row beyond the first active unit can collapse to a
   // committed-degenerate volume within one accepted step (observed:
   // cell=1023 vol=-0.0 hard assert at t=2.78 ns while the single-ring
@@ -2916,7 +3183,22 @@ void maybe_absorb_first_active_ring(core::State& state,
   const int watch_rows = absorb_watch_rows(cfg);
   int max_depth = block.n_i_cells - 1;
   int n_fan_layers = 0;
-  if (mb.has_trifan_cap) {
+  const mesh::BlockInfo* hybrid_bridge = nullptr;
+  bool bridge_zero_is_inner = true;
+  if (view.hybrid) {
+    hybrid_bridge = &hybrid_bridge_block(mb, view);
+    std::vector<double> node_r = copy_field(state.x_r);
+    std::vector<double> node_z = copy_field(state.x_z);
+    bridge_zero_is_inner = hybrid_bridge_row_zero_is_inner(
+        mb, *hybrid_bridge, node_r, node_z);
+    const int absorbed_bridge_rows =
+        std::max(0, pc.member_ring_count - view.n_cap);
+    const int absorbable_bridge_rows =
+        absorbed_bridge_rows +
+        absorbable_shell_row_count(
+            state, cfg, mb, hybrid_bridge, &bridge_zero_is_inner);
+    max_depth = view.n_cap + absorbable_bridge_rows - 1;
+  } else if (view.has_cap) {
     const auto& north =
         mesh::mesh_topo_trifan_fan_block(mb, mesh::BlockRole::NORTH_FAN);
     n_fan_layers = north.n_i_cells;
@@ -2963,6 +3245,12 @@ void maybe_absorb_first_active_ring(core::State& state,
     };
     if (depth < block.n_i_cells) {
       accumulate_unit(block, depth);
+    } else if (view.hybrid) {
+      const int radial_row = depth - block.n_i_cells;
+      accumulate_unit(
+          *hybrid_bridge,
+          hybrid_bridge_storage_row(
+              *hybrid_bridge, radial_row, bridge_zero_is_inner));
     } else if (depth < block.n_i_cells + n_fan_layers) {
       const int fan_layer = depth - block.n_i_cells;
       for (const mesh::BlockRole fan : {mesh::BlockRole::NORTH_FAN,
@@ -3058,6 +3346,12 @@ void maybe_absorb_first_active_ring(core::State& state,
       };
       if (depth < block.n_i_cells) {
         accumulate_unit_sph(block, depth);
+      } else if (view.hybrid) {
+        const int radial_row = depth - block.n_i_cells;
+        accumulate_unit_sph(
+            *hybrid_bridge,
+            hybrid_bridge_storage_row(
+                *hybrid_bridge, radial_row, bridge_zero_is_inner));
       } else if (depth < block.n_i_cells + n_fan_layers) {
         for (const mesh::BlockRole fan : {mesh::BlockRole::NORTH_FAN,
                                           mesh::BlockRole::EAST_FAN,
@@ -3233,7 +3527,8 @@ void aggregate_state(core::State& state,
     }
   }
   TENRYU_ASSERT(!cfg.numerics.materials.per_material_conservation_enabled,
-                "central pseudo-core Exp1 does not aggregate per-material arrays");
+                "central pseudo-core Exp1 does not aggregate per-material "
+                "arrays");
 
   std::vector<double> mass = copy_field(state.mass);
   std::vector<double> vol = copy_field(state.vol);
@@ -3261,11 +3556,9 @@ void aggregate_state(core::State& state,
     const double gamma1d = cfg.materials.materials.front().ideal_gas_gamma;
     if (core1d::begin_step(&pc, state.step)) {
       const double dt2d = state.dt > 0.0 ? state.dt : 1.0e-13;
-      // A6 pairing audit (diagnostic-first): compare the three candidate
-      // interface-work books for the same step — the sub-model's internal
-      // piston integral, the shared-Pi times shared-dV_c pairing the
-      // verdict prescribes, and the 2D-side pooled booking — to localize
-      // the hybrid-run total-energy drift before unifying ownership.
+      // A6 pairing audit: compare the sub-model's internal piston integral,
+      // Pi times the shared volume change, and the 2D conjugate-impulse
+      // booking for the same step.
       static const int pair_every = [] {
         const char* raw = std::getenv("TENRYU_I1B_CORE_1D_LEDGER_EVERY");
         return raw != nullptr && raw[0] != '\0' ? std::atoi(raw) : 0;
@@ -3354,10 +3647,6 @@ void aggregate_state(core::State& state,
       pc.core1d_V_gas_c = (g1d.valid && g1d.V_gas > 0.0)
                               ? g1d.V_gas
                               : std::numeric_limits<double>::quiet_NaN();
-      if (std::isfinite(pc.core1d_V_gas_c)) {
-        pc.core1d_V_gas_min_c =
-            std::min(pc.core1d_V_gas_min_c, pc.core1d_V_gas_c);
-      }
       emit_boundary_asphericity(state, nullptr);
     }
   }
@@ -3622,20 +3911,41 @@ void zero_member_compatible_cell_buffers(core::State& state) {
     return;
   }
   const int blocks = (n_cells + 255) / 256;
+  const std::size_t n_corners =
+      static_cast<std::size_t>(n_cells) *
+      static_cast<std::size_t>(state.corner_stride);
+  const bool has_corner_q = state.corner_force_q_r.size() == n_corners &&
+                            state.corner_force_q_z.size() == n_corners;
   zero_member_compatible_cell_buffers_kernel<<<blocks, 256>>>(
       state.corner_force_p_r.data(),
       state.corner_force_p_z.data(),
       state.corner_force_sub_r.data(),
       state.corner_force_sub_z.data(),
+      has_corner_q ? state.corner_force_q_r.data() : nullptr,
+      has_corner_q ? state.corner_force_q_z.data() : nullptr,
       state.work_p_per_cell.data(),
       state.work_sub_per_cell.data(),
       state.work_av_per_cell.data(),
       state.central_pseudo_core.d_member_mask.data(),
-      n_cells);
+      n_cells,
+      state.corner_stride);
   cuda_check(cudaGetLastError(),
              "central pseudo-core zero member compatible cell buffers launch failed");
   cuda_check(cudaDeviceSynchronize(),
              "central pseudo-core zero member compatible cell buffers failed");
+  if (!state.corner_force_p_rz_r.empty()) {
+    zero_member_aw_pressure_work_force_kernel<<<blocks, 256>>>(
+        state.corner_force_p_rz_r.data(),
+        state.corner_force_p_rz_z.data(),
+        state.central_pseudo_core.d_member_mask.data(),
+        n_cells);
+    cuda_check(
+        cudaGetLastError(),
+        "central pseudo-core zero member AW pressure work force launch failed");
+    cuda_check(
+        cudaDeviceSynchronize(),
+        "central pseudo-core zero member AW pressure work force failed");
+  }
 }
 
 void zero_member_edge_av_forces(core::State& state) {
@@ -3679,7 +3989,16 @@ void add_boundary_pressure_force(core::State& state,
                                  const core::CellField1D& cell_pressure,
                                  double* force_r,
                                  double* force_z,
-                                 const double impulse_dt) {
+                                 const double impulse_dt,
+                                 const char* diag_tag) {
+  static const bool node_diag =
+      std::getenv("TENRYU_PSC_BFORCE_NODE_DIAG") != nullptr;
+  static const bool node_diag_every =
+      std::getenv("TENRYU_PSC_BFORCE_NODE_DIAG_EVERY") != nullptr;
+  static long long g_bforce_calls = 0;
+  ++g_bforce_calls;
+  const bool sample =
+      node_diag_every || g_bforce_calls <= 64 || g_bforce_calls % 200 == 1;
   if (!configured(cfg)) {
     return;
   }
@@ -3700,6 +4019,45 @@ void add_boundary_pressure_force(core::State& state,
     pc.d_boundary_impulse_r.reset(pc.boundary_nodes_ordered.size());
     pc.d_boundary_impulse_z.reset(pc.boundary_nodes_ordered.size());
   }
+  double Fpre_out = 0.0;
+  double fpre_nodemax = 0.0;
+  int k_max = 0;
+  std::vector<double> pre_force_r;
+  std::vector<double> pre_force_z;
+  if (sample) {
+    cuda_check(cudaDeviceSynchronize(),
+               "central pseudo-core boundary pressure force pre-sample sync failed");
+    const std::size_t n_nodes = state.x_r.size();
+    const std::vector<double> node_r = copy_field(state.x_r);
+    const std::vector<double> node_z = copy_field(state.x_z);
+    std::vector<double> force_r_h(n_nodes);
+    std::vector<double> force_z_h(n_nodes);
+    cuda_check(cudaMemcpy(force_r_h.data(), force_r,
+                          n_nodes * sizeof(double), cudaMemcpyDeviceToHost),
+               "central pseudo-core boundary pressure force pre-sample copy r failed");
+    cuda_check(cudaMemcpy(force_z_h.data(), force_z,
+                          n_nodes * sizeof(double), cudaMemcpyDeviceToHost),
+               "central pseudo-core boundary pressure force pre-sample copy z failed");
+    if (node_diag) {
+      pre_force_r = force_r_h;
+      pre_force_z = force_z_h;
+    }
+    for (int k = 0; k < n_boundary; ++k) {
+      const int n = pc.boundary_nodes_ordered[static_cast<std::size_t>(k)];
+      const double xr_n = node_r[static_cast<std::size_t>(n)];
+      const double xz_n = node_z[static_cast<std::size_t>(n)];
+      const double s_n = std::hypot(xr_n, xz_n);
+      const double fpre_out =
+          (force_r_h[static_cast<std::size_t>(n)] * xr_n +
+           force_z_h[static_cast<std::size_t>(n)] * xz_n) /
+          std::max(s_n, 1.0e-300);
+      Fpre_out += fpre_out;
+      if (std::abs(fpre_out) > fpre_nodemax) {
+        fpre_nodemax = std::abs(fpre_out);
+        k_max = k;
+      }
+    }
+  }
   const int blocks = (n_boundary + 255) / 256;
   boundary_pressure_force_kernel<<<blocks, 256>>>(
       force_r,
@@ -3711,16 +4069,83 @@ void add_boundary_pressure_force(core::State& state,
       state.x_r.data(),
       state.x_z.data(),
       p_c,
-      impulse_dt);
+      impulse_dt,
+      cfg.numerics.hydro.rz_momentum_scheme_id);
   cuda_check(cudaGetLastError(),
              "central pseudo-core boundary pressure force launch failed");
   cuda_check(cudaDeviceSynchronize(),
              "central pseudo-core boundary pressure force failed");
+
+  if (sample) {
+    const std::size_t n_nodes = state.x_r.size();
+    const std::vector<double> node_r = copy_field(state.x_r);
+    const std::vector<double> node_z = copy_field(state.x_z);
+    std::vector<double> force_r_h(n_nodes);
+    std::vector<double> force_z_h(n_nodes);
+    cuda_check(cudaMemcpy(force_r_h.data(), force_r,
+                          n_nodes * sizeof(double), cudaMemcpyDeviceToHost),
+               "central pseudo-core boundary pressure force post-sample copy r failed");
+    cuda_check(cudaMemcpy(force_z_h.data(), force_z,
+                          n_nodes * sizeof(double), cudaMemcpyDeviceToHost),
+               "central pseudo-core boundary pressure force post-sample copy z failed");
+    if (node_diag) {
+      if (!pre_force_r.empty() && !pre_force_z.empty()) {
+        for (int k = 0; k < n_boundary; ++k) {
+          const int n = pc.boundary_nodes_ordered[static_cast<std::size_t>(k)];
+          const double f_r = force_r_h[static_cast<std::size_t>(n)] -
+                             pre_force_r[static_cast<std::size_t>(n)];
+          const double f_z = force_z_h[static_cast<std::size_t>(n)] -
+                             pre_force_z[static_cast<std::size_t>(n)];
+          std::fprintf(
+              stderr,
+              "[psc_bforce_node] call=%lld k=%d n=%d R=%.17e Z=%.17e "
+              "fR=%.17e fZ=%.17e\n",
+              g_bforce_calls, k, n, node_r[static_cast<std::size_t>(n)],
+              node_z[static_cast<std::size_t>(n)], f_r, f_z);
+        }
+      }
+    }
+    const std::vector<double> velocity_r = copy_field(state.v_r);
+    const std::vector<double> velocity_z = copy_field(state.v_z);
+    double r_mean = 0.0;
+    double Fpost_out = 0.0;
+    double ur_ring_mean = 0.0;
+    for (int k = 0; k < n_boundary; ++k) {
+      const int n = pc.boundary_nodes_ordered[static_cast<std::size_t>(k)];
+      const double xr_n = node_r[static_cast<std::size_t>(n)];
+      const double xz_n = node_z[static_cast<std::size_t>(n)];
+      const double s_n = std::hypot(xr_n, xz_n);
+      r_mean += s_n;
+      Fpost_out +=
+          (force_r_h[static_cast<std::size_t>(n)] * xr_n +
+           force_z_h[static_cast<std::size_t>(n)] * xz_n) /
+          std::max(s_n, 1.0e-300);
+      ur_ring_mean +=
+          (velocity_r[static_cast<std::size_t>(n)] * xr_n +
+           velocity_z[static_cast<std::size_t>(n)] * xz_n) /
+          std::max(s_n, 1.0e-300);
+    }
+    r_mean /= static_cast<double>(n_boundary);
+    ur_ring_mean /= static_cast<double>(n_boundary);
+    const double p1d = core1d::outer_face_pressure(
+        &pc, cfg.materials.materials.front().ideal_gas_gamma);
+    const double U_pool = pc.Ue_c + pc.Ui_c;
+    std::fprintf(
+        stderr,
+        "[psc_bforce] call=%lld tag=%s p_used=%.6e p1d_outer=%.6e U_pool=%.6e "
+        "V_c=%.6e n_b=%d r_ring_mean=%.6e Fpre_out=%.6e "
+        "Fpre_nodemax=%.3e@%d Fpost_out=%.6e ur_ring=%.6e "
+        "impulse_dt=%.3e\n",
+        g_bforce_calls, diag_tag, p_c, p1d, U_pool, pc.V_c, n_boundary,
+        r_mean, Fpre_out, fpre_nodemax, k_max, Fpost_out, ur_ring_mean,
+        impulse_dt);
+  }
 }
 
 void set_boundary_pressure_work(core::State& state,
                                 const core::Config& cfg,
                                 const double dt,
+                                const core::NodeField1D& node_mass,
                                 const double* old_velocity_r,
                                 const double* old_velocity_z,
                                 const double* new_velocity_r,
@@ -3764,6 +4189,8 @@ void set_boundary_pressure_work(core::State& state,
   std::vector<double> old_z(static_cast<std::size_t>(n_nodes));
   std::vector<double> new_r(static_cast<std::size_t>(n_nodes));
   std::vector<double> new_z(static_cast<std::size_t>(n_nodes));
+  std::vector<double> rz_mass;
+  std::vector<double> planar_mass;
   pc.d_boundary_impulse_r.copy_to_host(impulse_r);
   pc.d_boundary_impulse_z.copy_to_host(impulse_z);
   TENRYU_ASSERT(impulse_r.size() == static_cast<std::size_t>(n_boundary) &&
@@ -3785,6 +4212,22 @@ void set_boundary_pressure_work(core::State& state,
                         static_cast<std::size_t>(n_nodes) * sizeof(double),
                         cudaMemcpyDeviceToHost),
              "central pseudo-core boundary work copy new vz failed");
+  switch (cfg.numerics.hydro.rz_momentum_scheme_id) {
+    case 0:
+      break;
+    case 1:
+      TENRYU_ASSERT(node_mass.size() == static_cast<std::size_t>(n_nodes),
+                    "central pseudo-core AWS boundary work requires RZ node mass");
+      TENRYU_ASSERT(state.node_planar_mass.size() ==
+                        static_cast<std::size_t>(n_nodes),
+                    "central pseudo-core AWS boundary work requires planar node mass");
+      rz_mass = copy_field(node_mass);
+      planar_mass = copy_field(state.node_planar_mass);
+      break;
+    default:
+      TENRYU_ASSERT(false,
+                    "central pseudo-core boundary work has invalid RZ momentum scheme");
+  }
 
   long double dot_old = 0.0L;
   long double dot_new = 0.0L;
@@ -3795,17 +4238,32 @@ void set_boundary_pressure_work(core::State& state,
         static_cast<long double>(impulse_r[static_cast<std::size_t>(k)]);
     const long double Iz =
         static_cast<long double>(impulse_z[static_cast<std::size_t>(k)]);
+    long double conjugate_scale = 1.0L;
+    if (cfg.numerics.hydro.rz_momentum_scheme_id == 1) {
+      const double mass_a = planar_mass[static_cast<std::size_t>(n)];
+      conjugate_scale =
+          mass_a > 0.0
+              ? static_cast<long double>(rz_mass[static_cast<std::size_t>(n)]) /
+                    static_cast<long double>(mass_a)
+              : 0.0L;
+    }
     const long double old_dot =
-        Ir * static_cast<long double>(old_r[static_cast<std::size_t>(n)]) +
-        Iz * static_cast<long double>(old_z[static_cast<std::size_t>(n)]);
+        conjugate_scale *
+        (Ir * static_cast<long double>(old_r[static_cast<std::size_t>(n)]) +
+         Iz * static_cast<long double>(old_z[static_cast<std::size_t>(n)]));
     const long double new_dot =
-        Ir * static_cast<long double>(new_r[static_cast<std::size_t>(n)]) +
-        Iz * static_cast<long double>(new_z[static_cast<std::size_t>(n)]);
+        conjugate_scale *
+        (Ir * static_cast<long double>(new_r[static_cast<std::size_t>(n)]) +
+         Iz * static_cast<long double>(new_z[static_cast<std::size_t>(n)]));
     dot_old += old_dot;
     dot_new += new_dot;
     dot_mid += 0.5L * (old_dot + new_dot);
   }
 
+  // Book W_conj = -sum_k alpha_k I_k . u_mid,k, with alpha=1 for the
+  // volume-weighted scheme and alpha=M_RZ/M_A for AWS.  AWS advances with
+  // delta-u=I_A/M_A while global nodal KE uses M_RZ, so this is exactly the
+  // negative macro-impulse contribution to the global KE change.
   pc.boundary_work_W_old = static_cast<double>(-dot_old);
   pc.boundary_work_W_new = static_cast<double>(-dot_new);
   pc.boundary_work_W_mid = static_cast<double>(-dot_mid);
@@ -3848,23 +4306,6 @@ void apply_boundary_pressure_work(core::State& state,
   TENRYU_ASSERT(sums.M > 0.0L,
                 "central pseudo-core pressure work requires positive mass");
   const double V_boundary = boundary_loop_volume(pc, node_r, node_z);
-
-  // Single-owner interface work pair (verdict #6 Q5): with the stratified
-  // 1D sub-model active, the 2D books the SAME Pi x dV_c the sub-model's
-  // piston integrates. The impulse-based booking was measured to be
-  // EXACTLY HALF the pair value at every dyncore16 pairing sample
-  // (W_2d = W_1d/2 = Pi dV/2), draining E_total and over-driving the core
-  // (peak CR_V 11.8 vs the 7.9 1D reference).
-  if (core1d::enabled() && core1d::built(&pc) &&
-      !cfg.materials.materials.empty() &&
-      cfg.materials.materials.front().eos_model == "ideal_gas") {
-    const double pi_face = core1d::outer_face_pressure(
-        &pc, cfg.materials.materials.front().ideal_gas_gamma);
-    const double v_sub = core1d::current_volume(&pc);
-    if (pi_face > 0.0 && v_sub > 0.0 && std::isfinite(V_boundary)) {
-      pc.boundary_work_dU = -pi_face * (V_boundary - v_sub);
-    }
-  }
   update_u_gas_energy_fraction(pc, sums);
   pc.M_c = static_cast<double>(sums.M);
   pc.M_Y_c = static_cast<double>(sums.MY);

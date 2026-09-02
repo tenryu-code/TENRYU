@@ -1,0 +1,142 @@
+/* TENRYU GUI family — single source of truth for design tokens (Studio + Scope).
+   Theme is system-only (prefers-color-scheme); manual override wiring was removed
+   by council decision 2026-07-25. */
+:root {
+  color-scheme: light dark;
+
+  /* surfaces */
+  --bg: #f5f5f7;
+  --bg-panel: #ffffff;
+  --bg-inset: #ececee;
+  --bg-raised: #ffffff;
+
+  /* foreground */
+  --fg: #1d1d1f;
+  --fg-secondary: #6e6e73;
+
+  /* separators (two tiers; --separator kept as legacy alias of subtle) */
+  --separator: rgba(0, 0, 0, 0.12);
+  --separator-subtle: rgba(0, 0, 0, 0.12);
+  --separator-strong: rgba(0, 0, 0, 0.42);
+
+  /* accent vs filled action vs selection (semantic split) */
+  --accent: #0a84ff;
+  --accent-fg: #ffffff;
+  --action-primary-bg: #0071e3;
+  --action-primary-fg: #ffffff;
+  --selected-bg: rgba(10, 132, 255, 0.12);
+  --selected-fg: #0064d0;
+
+  /* state colors + tinted backgrounds */
+  --ok: #34c759;
+  --warn: #ff9f0a;
+  --err: #ff3b30;
+  --ok-bg: rgba(52, 199, 89, 0.12);
+  --warn-bg: rgba(255, 159, 10, 0.14);
+  --err-bg: rgba(255, 59, 48, 0.12);
+
+  /* typography */
+  --font-ui: -apple-system, BlinkMacSystemFont, "Hiragino Sans", "Noto Sans CJK JP", "Segoe UI", sans-serif;
+  --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  --fs-label: 11px;
+  --fs-body: 13px;
+  --fs-mono-data: 12px;
+  --fs-chart-tick: 11px;
+  --fs-chart-axis: 12px;
+
+  /* spacing / radius / control metrics */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 20px;
+  --sp-6: 24px;
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --control-h-sm: 22px;
+  --control-h: 28px;
+  --control-h-lg: 32px;
+  --label-track: 8rem;
+  --control-track: 16.25rem;
+  --control-track-compact: 8.5rem;
+
+  /* focus */
+  --focus-ring: 0 0 0 2px var(--bg-panel), 0 0 0 4px var(--accent);
+
+  /* categorical series (Apple system palette, light) */
+  --series-1: #007aff;
+  --series-2: #ff3b30;
+  --series-3: #34c759;
+  --series-4: #ff9500;
+  --series-5: #af52de;
+  --series-6: #30b0c7;
+  --series-7: #ff2d55;
+  --series-8: #5856d6;
+
+  /* plot metrics + on-canvas colors */
+  --plot-gutter-left: 72px;
+  --plot-canvas-bg: #141417;
+  --on-plot-canvas: #f5f5f7;
+  --grid-line: var(--separator-subtle);
+  --axis-line: var(--separator-strong);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #1e1e20;
+    --bg-panel: #28282a;
+    --bg-inset: #1a1a1c;
+    --bg-raised: #323236;
+    --fg: #f5f5f7;
+    --fg-secondary: #98989d;
+    --separator: rgba(255, 255, 255, 0.14);
+    --separator-subtle: rgba(255, 255, 255, 0.14);
+    --separator-strong: rgba(255, 255, 255, 0.34);
+    --selected-bg: rgba(10, 132, 255, 0.18);
+    --selected-fg: #66b3ff;
+    --ok-bg: rgba(48, 209, 88, 0.18);
+    --warn-bg: rgba(255, 159, 10, 0.2);
+    --err-bg: rgba(255, 69, 58, 0.18);
+    --series-1: #0a84ff;
+    --series-2: #ff453a;
+    --series-3: #30d158;
+    --series-4: #ff9f0a;
+    --series-5: #bf5af2;
+    --series-6: #40c8e0;
+    --series-7: #ff375f;
+    --series-8: #5e5ce6;
+  }
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+body {
+  margin: 0;
+  font-family: var(--font-ui);
+  font-size: 13px;
+  background: var(--bg);
+  color: var(--fg);
+  -webkit-font-smoothing: antialiased;
+  font-variant-numeric: tabular-nums;
+}
+:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+.form-surface {
+  container-type: inline-size;
+}
+.field-group-grid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: var(--sp-3);
+  align-items: start;
+}
+@container (min-width: 856px) {
+  .field-group-grid {
+    grid-template-columns: 1fr 1fr;
+  }
+}

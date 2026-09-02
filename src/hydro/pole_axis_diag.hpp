@@ -51,7 +51,15 @@ inline int every() {
 }
 
 inline bool due(const core::State& state) {
-  return enabled() && every() > 0 && state.step % every() == 0 &&
+  const bool diagnostics_enabled = enabled();
+  if (diagnostics_enabled && state.mesh.topo.multiblock.has_value() &&
+      mesh::mesh_topo_multiblock_polar_shell_block_count(
+          *state.mesh.topo.multiblock) > 1) {
+    throw core::namelist::ConfigError(
+        "pole-axis diagnostics are not supported with the split polar shell "
+        "(pending shell-chain generalization)");
+  }
+  return diagnostics_enabled && every() > 0 && state.step % every() == 0 &&
          state.mesh.topo.multiblock.has_value();
 }
 

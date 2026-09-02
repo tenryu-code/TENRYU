@@ -382,7 +382,10 @@ AleVolClosureReference capture_ale_vol_closure_reference(
     const auto& mb = *state.mesh.topo.multiblock;
     const int corner_stride = state.mesh.corner_stride;
     TENRYU_ASSERT(corner_stride == 4 || corner_stride == 8,
-                  "ALE volume-closure reference requires multiblock stride 4 or 8");
+                  "ALE volume-closure reference requires multiblock stride 4 "
+                  "or 8 (legacy ALE lane only; reale_v2 stride-16 runs are "
+                  "excluded at config validation and never reach this "
+                  "capture)");
     TENRYU_ASSERT(mb.cell_node_csr_offsets.size() ==
                       static_cast<std::size_t>(reference.n_cells) + 1U,
                   "ALE volume-closure reference requires multiblock cell-node CSR offsets");

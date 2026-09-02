@@ -120,6 +120,8 @@ void set_free_outer(const void* key, double gamma);
 bool free_outer(const void* key);
 // Total explicit substeps taken so far (tail progress watchdog).
 long long substep_count(const void* key);
+// Total positivity-guard dt halvings (host-testable guard observability).
+long long positivity_guard_halving_count(const void* key);
 
 double outer_face_pressure(const void* key, double gamma);
 // Diagnostic split of the outer-face stress: static pressure only (the
@@ -127,10 +129,22 @@ double outer_face_pressure(const void* key, double gamma);
 // compare like with like against the 2D static-pressure average.
 double outer_face_pressure_static(const void* key, double gamma);
 
-// A6 pairing-audit accessors: the sub-model's cumulative piston work and
-// its current discrete volume (4pi/3 r_out^3).
+// Read-only conservation accessors used by the pairing and terminal-tail
+// diagnostics.
 double piston_work_total(const void* key);
 double current_volume(const void* key);
+double internal_energy_total(const void* key);
+double kinetic_energy_total(const void* key);
+
+struct TailDiagnostics {
+  bool valid = false;
+  // Outer-face radius of the outer shell in the adjacent-center pressure
+  // pair with maximum |dp/dr|.
+  double r_shock = 0.0;
+  double u_outer = 0.0;
+  double p_max = 0.0;
+};
+TailDiagnostics tail_diagnostics(const void* key, double gamma);
 
 struct GasView {
   bool valid = false;

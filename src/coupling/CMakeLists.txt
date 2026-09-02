@@ -4,12 +4,15 @@ add_library(tenryu_coupling STATIC
   persistent_loop.cu
   driver.cpp
   driver_fld_energy.cu
+  reale_trigger.cu
   rad_gamma_coupling.cu
   rad_gamma_coupling.cuh
   driver_reclose.cu
   driver_retry_snapshot.cu
   driver_safety_audit.cu
   profile_observability.cpp
+  reale_mode.cpp
+  staged_dt_gate.cpp
   source_terms.cu
 )
 

@@ -91,6 +91,36 @@ struct EscapeValveEvent {
   CellState after_state;
 };
 
+// Committed-mesh quality-min sample over a general CSR polygon mesh
+// (corner_stride != 4: ReALE v2 / pentagon-belt / native-pentagon polar
+// tier). Metrics are current-vs-reference ratios with the same primitives
+// as the candidate-mesh admissibility gate (polygon corner Jacobians, exact
+// revolved RZ polygon volume); edge length is the plain minimum polygon
+// edge length. Gauss-point, altitude, and condition-number diagnostics are
+// quad-only and intentionally absent here.
+struct CsrMeshQualityMinSample {
+  double min_corner_j_rel = std::numeric_limits<double>::infinity();
+  double min_rz_volume_rel = std::numeric_limits<double>::infinity();
+  double min_edge_length_rel = std::numeric_limits<double>::infinity();
+  std::uint64_t negative_rz_volume_count = 0;
+  bool corner_observed = false;
+  bool volume_observed = false;
+  bool edge_length_observed = false;
+  bool sampled = false;
+};
+
+CsrMeshQualityMinSample sample_csr_mesh_quality_min(
+    const int* cell_node_csr_offsets,   // size n_cells + 1
+    const int* cell_node_csr_indices,
+    const std::uint8_t* cell_nverts,    // size n_cells, each in [3, 16]
+    const int* cell_orientation_sign,   // size n_cells, +1/-1
+    int n_cells,
+    int n_nodes,
+    const double* node_r_reference,     // size n_nodes
+    const double* node_z_reference,
+    const double* node_r_current,
+    const double* node_z_current);
+
 struct ProfileObservability {
   bool profile_enabled = false;
   ClaimLevel claim_level = ClaimLevel::Characterization;
@@ -150,6 +180,12 @@ struct ProfileObservability {
   double achieved_min_altitude_rel = std::numeric_limits<double>::infinity();
   double achieved_max_condition_number = 0.0;
   std::uint64_t negative_rz_volume_count_total = 0;
+  bool ale_monitor_observed = false;
+  int ale_monitor_state = 0;
+  double ale_monitor_q_min = 1.0;
+  double ale_monitor_h_min = std::numeric_limits<double>::infinity();
+  int ale_monitor_q_min_cell = -1;
+  int ale_monitor_h_min_cell = -1;
 
   bool reached_t_end = false;
   double R_shell_initial_cm = -1.0;
@@ -193,6 +229,12 @@ struct ProfileObservability {
     achieved_min_altitude_rel = std::numeric_limits<double>::infinity();
     achieved_max_condition_number = 0.0;
     negative_rz_volume_count_total = 0;
+    ale_monitor_observed = false;
+    ale_monitor_state = 0;
+    ale_monitor_q_min = 1.0;
+    ale_monitor_h_min = std::numeric_limits<double>::infinity();
+    ale_monitor_q_min_cell = -1;
+    ale_monitor_h_min_cell = -1;
     reached_t_end = false;
     R_shell_initial_cm = -1.0;
     escape_valve_events.clear();

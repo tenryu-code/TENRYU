@@ -31,6 +31,15 @@ enum class RetryActionHint : std::uint8_t {
   ForceFullWinslow,
 };
 
+struct GeometrySoftFailure {
+  bool valid = false;
+  int cell = -1;
+  int corner_or_slot = -1;
+  const char* predicate = "";
+  double min_value = std::numeric_limits<double>::infinity();
+  double sigma_safe = 1.0;
+};
+
 // Result returned from a hydro half-step. Default construction preserves the
 // baseline path when driver-level retry is not wired.
 struct HydroStepResult {
@@ -64,6 +73,7 @@ struct HydroStepResult {
   // producers keep their current meaning, e.g. trial-volume ratio or corner-J.
   double min_metric = 0.0;
   double suggested_dt = 0.0;
+  GeometrySoftFailure geometry_soft_failure{};
 
   HydroFailureStage stage = HydroFailureStage::Default;
   tenryu::hydro::MeshFailureRegime regime =
@@ -113,6 +123,8 @@ struct HydroStepResult {
   int forecast_local_j = -1;
   std::vector<std::uint8_t> forecast_seed_mask;
   bool shell_subcycle_committed = false;
+  // Rank-local external-pressure work done on the gas; compression is positive.
+  double pressure_boundary_work_step = 0.0;
   double cap_energy_audit_W_ext_step = 0.0;
   double cap_energy_audit_W_pq = 0.0;
   double cap_energy_audit_W_uF = 0.0;

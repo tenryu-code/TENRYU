@@ -61,14 +61,15 @@ class HDF5Writer {
                       const std::string& case_name,
                       int rank = 0) const;
 
-  void write_checkpoint(const tenryu::core::State& state,
-                        const tenryu::core::Config& cfg,
-                        const tenryu::radiation::PhotonPool& photon_pool,
-                        int file_index,
-                        int step,
-                        double t,
-                        const std::string& output_dir,
-                        const std::string& case_name) const;
+  std::string write_checkpoint(
+      const tenryu::core::State& state,
+      const tenryu::core::Config& cfg,
+      const tenryu::radiation::PhotonPool& photon_pool,
+      int file_index,
+      int step,
+      double t,
+      const std::string& output_dir,
+      const std::string& case_name) const;
 };
 
 }  // namespace tenryu::io

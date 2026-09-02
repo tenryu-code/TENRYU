@@ -9,6 +9,8 @@ import { __setBackendForTest, useApp } from "../src/store";
 class FakeBackend implements Backend {
   readonly kind = "devbridge" as const;
   readBinaryCalls: Array<{ path: string; maxBytes?: number }> = [];
+  localExecLog: string[][] = [];
+  localTextFiles: Record<string, string> = {};
 
   async listProfiles(): Promise<ServerProfile[]> {
     return [];
@@ -39,6 +41,18 @@ class FakeBackend implements Backend {
   ): Promise<Uint8Array> {
     this.readBinaryCalls.push({ path: remotePath, maxBytes });
     return new Uint8Array(8);
+  }
+  async execLocal(argv: string[]): Promise<ExecResult> {
+    this.localExecLog.push(argv);
+    return { code: 0, stdout: "", stderr: "", timedOut: false };
+  }
+  async readLocalText(path: string): Promise<string> {
+    const c = this.localTextFiles[path];
+    if (c === undefined) throw new Error(`fake readLocalText: no file ${path}`);
+    return c;
+  }
+  async writeLocalText(path: string, content: string): Promise<void> {
+    this.localTextFiles[path] = content;
   }
 }
 

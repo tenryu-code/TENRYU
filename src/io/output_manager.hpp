@@ -25,6 +25,8 @@ class OutputManager {
   // per-rank directory-index race (run_p2 vs run_p2_001).
   void init(const tenryu::core::Config& cfg, int rank = 0);
   void set_termination_reason(std::string reason);
+  int last_checkpoint_step() const;
+  const std::string& last_checkpoint_path() const;
 
   void write_run_info(const tenryu::core::State& state,
                       const tenryu::core::Config& cfg) const;
@@ -64,6 +66,8 @@ class OutputManager {
   std::string termination_reason_ = "running";
   int snapshot_count_ = 0;
   int checkpoint_count_ = 0;
+  int last_checkpoint_step_ = -1;
+  std::string last_checkpoint_path_;
 };
 
 }  // namespace tenryu::io

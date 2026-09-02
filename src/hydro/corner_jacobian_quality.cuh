@@ -19,6 +19,9 @@ namespace tenryu::hydro {
 
 struct CellRegime;
 
+constexpr double kGauss = 0.577350269189625764509148780501957456;
+constexpr double kJFloor = 1.0e-30;
+
 struct CornerJacobianQualityResult {
   bool admissible = true;
   double min_current_j = std::numeric_limits<double>::infinity();
@@ -65,6 +68,7 @@ enum class MeshQualityFailingMetric : std::uint8_t {
   GaussJ,
   RzVolume,
   AxisMargin,
+  PlanarArea,
   None,
 };
 
@@ -72,6 +76,7 @@ struct MeshQualityDtLimit {
   bool admissible = true;
   double sigma_safe = 1.0;
   double suggested_dt = 0.0;
+  double min_value = std::numeric_limits<double>::infinity();
   int first_cell = -1;
   int first_corner_or_gauss = -1;
   MeshQualityFailingMetric metric = MeshQualityFailingMetric::None;
@@ -87,6 +92,9 @@ struct MeshQualityRzVolumeCellMargin {
 };
 
 const char* mesh_quality_metric_string(MeshQualityFailingMetric metric);
+const char* mesh_quality_predicate_string(MeshQualityFailingMetric metric);
+
+bool i1b_path_guard_enabled();
 
 inline double sanitize_in_hydro_reduced_min_metric(
     const double global_min_metric,
@@ -145,12 +153,32 @@ __host__ __device__ inline double corner_jacobian_from_quad(const double* rr,
                                 rr[km] - rr[corner], zz[km] - zz[corner]);
 }
 
-__host__ __device__ inline double in_hydro_trial_quadratic_at_sigma(
-    const double q0,
-    const double q1,
-    const double q2,
-    const double sigma) {
-  return q0 + sigma * q1 + sigma * sigma * q2;
+__host__ __device__ inline double gauss_jacobian_from_quad(const double* rr,
+                                                           const double* zz,
+                                                           const double xi,
+                                                           const double eta) {
+  const double dN1_dxi = -0.25 * (1.0 - eta);
+  const double dN2_dxi = 0.25 * (1.0 - eta);
+  const double dN3_dxi = 0.25 * (1.0 + eta);
+  const double dN4_dxi = -0.25 * (1.0 + eta);
+
+  const double dN1_deta = -0.25 * (1.0 - xi);
+  const double dN2_deta = -0.25 * (1.0 + xi);
+  const double dN3_deta = 0.25 * (1.0 + xi);
+  const double dN4_deta = 0.25 * (1.0 - xi);
+
+  const double dr_dxi =
+      dN1_dxi * rr[0] + dN2_dxi * rr[1] + dN3_dxi * rr[2] + dN4_dxi * rr[3];
+  const double dz_dxi =
+      dN1_dxi * zz[0] + dN2_dxi * zz[1] + dN3_dxi * zz[2] + dN4_dxi * zz[3];
+  const double dr_deta =
+      dN1_deta * rr[0] + dN2_deta * rr[1] + dN3_deta * rr[2] +
+      dN4_deta * rr[3];
+  const double dz_deta =
+      dN1_deta * zz[0] + dN2_deta * zz[1] + dN3_deta * zz[2] +
+      dN4_deta * zz[3];
+
+  return dr_dxi * dz_deta - dr_deta * dz_dxi;
 }
 
 __host__ __device__ inline bool in_hydro_isfinite(const double value) {
@@ -159,6 +187,71 @@ __host__ __device__ inline bool in_hydro_isfinite(const double value) {
 #else
   return std::isfinite(value);
 #endif
+}
+
+__host__ __device__ inline bool trial_cell_admissible(
+    const double* rr,
+    const double* zz,
+    const int* node_i,
+    const double j_floor_rel) {
+  const double xis[2] = {-kGauss, kGauss};
+  const double etas[2] = {-kGauss, kGauss};
+  double J_values[4];
+  double J_max = -1.0e300;
+  int p = 0;
+  for (int a = 0; a < 2; ++a) {
+    for (int b = 0; b < 2; ++b) {
+      const double J = gauss_jacobian_from_quad(rr, zz, xis[a], etas[b]);
+      if (!in_hydro_isfinite(J)) {
+        return false;
+      }
+      J_values[p++] = J;
+      J_max = fmax(J_max, J);
+    }
+  }
+  const double J_max_eff = fmax(J_max, kJFloor);
+  const double J_floor = fmax(j_floor_rel * J_max_eff, kJFloor);
+  for (int k = 0; k < 4; ++k) {
+    if (!(J_values[k] > J_floor)) {
+      return false;
+    }
+  }
+
+  for (int corner = 0; corner < 4; ++corner) {
+    const double J_corner =
+        tenryu::hydro::corner_jacobian_from_quad(rr, zz, corner);
+    if (!in_hydro_isfinite(J_corner) || !(J_corner > J_floor)) {
+      return false;
+    }
+  }
+
+  const double v_rz = ale::detail::rz_signed_quad_volume(
+      rr[0], zz[0], rr[1], zz[1], rr[2], zz[2], rr[3], zz[3]);
+  if (!in_hydro_isfinite(v_rz) || !(v_rz > kJFloor)) {
+    return false;
+  }
+
+  for (int k = 0; k < 4; ++k) {
+    if (!in_hydro_isfinite(rr[k]) || !in_hydro_isfinite(zz[k])) {
+      return false;
+    }
+    if (node_i[k] == 0) {
+      if (!(rr[k] == 0.0)) {
+        return false;
+      }
+    } else if (!(rr[k] >= 0.0)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+__host__ __device__ inline double in_hydro_trial_quadratic_at_sigma(
+    const double q0,
+    const double q1,
+    const double q2,
+    const double sigma) {
+  return q0 + sigma * q1 + sigma * sigma * q2;
 }
 
 __host__ __device__ inline double in_hydro_trial_quadratic_min_on_unit_interval(
@@ -374,7 +467,9 @@ CornerJacobianQualityResult check_trial_lagrangian_corner_jacobian_host(
     const parallel::Reduction* reduction,
     const std::vector<std::int8_t>& hydro_active = {},
     bool axis_margin_guard_enabled = false,
-    bool has_physical_rz_axis = true);
+    bool has_physical_rz_axis = true,
+    const std::vector<std::uint8_t>* axis_edge_collapsed = nullptr,
+    const std::vector<std::uint8_t>* geometry_policy_exempt = nullptr);
 
 CornerJacobianQualityResult check_trial_lagrangian_corner_jacobian_fields(
     int nr,
@@ -388,7 +483,9 @@ CornerJacobianQualityResult check_trial_lagrangian_corner_jacobian_fields(
     const parallel::Reduction* reduction,
     const std::vector<std::int8_t>& hydro_active = {},
     bool axis_margin_guard_enabled = false,
-    bool has_physical_rz_axis = true);
+    bool has_physical_rz_axis = true,
+    const std::vector<std::uint8_t>* axis_edge_collapsed = nullptr,
+    const std::vector<std::uint8_t>* geometry_policy_exempt = nullptr);
 
 CornerJacobianScaleResult compute_corner_jacobian_trial_scale(
     const core::State& state,
@@ -399,7 +496,9 @@ CornerJacobianScaleResult compute_corner_jacobian_trial_scale(
     bool regime_aware_corner_j_guard_enabled = false,
     bool axis_margin_guard_enabled = false,
     double legacy_trigger_scale = 0.5,
-    bool has_physical_rz_axis = true);
+    bool has_physical_rz_axis = true,
+    const std::uint8_t* d_axis_edge_collapsed = nullptr,
+    const std::uint8_t* d_geometry_policy_exempt = nullptr);
 
 tenryu::coupling::HydroStepResult compute_in_hydro_candidate_mesh_guard(
     const core::State& state,
@@ -422,7 +521,8 @@ MeshQualityDtLimit compute_mesh_quality_dt_limit(
     const double* d_v_r_half,
     const double* d_v_z_half,
     double dt,
-    const parallel::Reduction* reduction);
+    const parallel::Reduction* reduction,
+    bool force_path_guard = false);
 
 std::vector<MeshQualityRzVolumeCellMargin>
 compute_multiblock_mesh_quality_rz_volume_cell_margins(
@@ -450,6 +550,7 @@ compute_multiblock_mesh_quality_rz_volume_cell_margins_with_volume(
 CornerBalanceResult evaluate_corner_balance(
     const core::State& state,
     double balance_threshold,
-    const parallel::Reduction* reduction);
+    const parallel::Reduction* reduction,
+    const std::uint8_t* geometry_policy_exempt);
 
 }  // namespace tenryu::hydro

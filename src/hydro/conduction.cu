@@ -23,6 +23,7 @@
 #include "hydro/conduction_bodies.cuh"
 #include "hydro/conduction_snb_1d.cuh"
 #include "hydro/eos_context.hpp"
+#include "hydro/evacuated_cell_shadow.hpp"
 #include "hydro/kershaw_boundary.cuh"
 #include "hydro/kershaw_geometry.cuh"
 #include "hydro/kershaw_stencil.cuh"
@@ -1051,6 +1052,7 @@ __global__ void compute_spitzer_deff_2d_kernel_per_material(
     const int nz,
     const int n_mat,
     const std::uint8_t* __restrict__ cell_is_void,
+    const std::uint8_t* __restrict__ evacuated_cell_mask,
     const double f_lim,
     const double test_kappa,
     const double mfp_limiter_C,
@@ -1074,7 +1076,12 @@ __global__ void compute_spitzer_deff_2d_kernel_per_material(
   if (rho_cv_e != nullptr) {
     rho_cv_e[c] = rho_cv;
   }
-  if (cell_is_void != nullptr && cell_is_void[c] != static_cast<std::uint8_t>(0)) {
+  if ((cell_is_void != nullptr &&
+       cell_is_void[c] != static_cast<std::uint8_t>(0)) ||
+      (evacuated_cell_mask != nullptr &&
+       evacuated_cell_mask[c] != static_cast<std::uint8_t>(0))) {
+    // Exact zero cell conductivity makes every incident Kershaw harmonic
+    // face coefficient exactly zero, including every per-material stencil.
     if (kappa_eff_out != nullptr) {
       kappa_eff_out[c] = 0.0;
     }
@@ -1255,6 +1262,7 @@ __global__ void compute_spitzer_deff_2d_kernel(
     const double* __restrict__ gamma_eff,
     const double* __restrict__ A_eff,
     const std::uint8_t* __restrict__ cell_is_void,
+    const std::uint8_t* __restrict__ evacuated_cell_mask,
     const double f_lim,
     const double test_kappa,
     const double mfp_limiter_C,
@@ -1287,7 +1295,12 @@ __global__ void compute_spitzer_deff_2d_kernel(
     rho_cv_e[c] = rho_cv;
   }
 
-  if (cell_is_void != nullptr && cell_is_void[c] != static_cast<std::uint8_t>(0)) {
+  if ((cell_is_void != nullptr &&
+       cell_is_void[c] != static_cast<std::uint8_t>(0)) ||
+      (evacuated_cell_mask != nullptr &&
+       evacuated_cell_mask[c] != static_cast<std::uint8_t>(0))) {
+    // Exact zero cell conductivity makes every incident Kershaw harmonic
+    // face coefficient exactly zero.
     if (kappa_eff_out != nullptr) {
       kappa_eff_out[c] = 0.0;
     }
@@ -1363,6 +1376,21 @@ __global__ void compute_spitzer_deff_2d_kernel(
     if (max_deff != nullptr) {
       atomic_max_double(max_deff, D_eff);
     }
+  }
+}
+
+__global__ void set_evac_contact_junction_deff_kernel(
+    double* deff,
+    const int* contact_cells,
+    const int n_contact_cells,
+    const int nr,
+    const int nz) {
+  if (blockIdx.x != 0 || threadIdx.x != 0) {
+    return;
+  }
+  for (int index = 0; index < n_contact_cells; ++index) {
+    const int cell = contact_cells[index];
+    deff[cell] = evacuated_cell_contact_junction_deff(deff, cell, nr, nz);
   }
 }
 
@@ -3106,6 +3134,11 @@ ConductionDiagnostics compute_per_material_2d_operator(
   const auto* d_electron_views =
       (eos_ctx != nullptr && eos_ctx->n_materials >= n_mat) ? eos_ctx->d_electron_views
                                                             : nullptr;
+  const std::uint8_t* evacuated_cell_mask =
+      state.evacuated_cells.d_inactive_member_mask.size() ==
+              static_cast<std::size_t>(n_cells)
+          ? state.evacuated_cells.d_inactive_member_mask.data()
+          : nullptr;
   compute_spitzer_deff_2d_kernel_per_material<<<cw.blocks(), kBlockSize>>>(
       d_kappa_eff,
       d_kappa_eff_per_material,
@@ -3125,6 +3158,7 @@ ConductionDiagnostics compute_per_material_2d_operator(
       nz,
       n_mat,
       d_cell_is_void,
+      evacuated_cell_mask,
       cfg.numerics.conduction.f_lim,
       cfg.numerics.conduction.test_kappa,
       cfg.numerics.conduction.mfp_limiter_C,
@@ -3134,6 +3168,33 @@ ConductionDiagnostics compute_per_material_2d_operator(
       cw.begin,
       cw.end);
   cuda_check(cudaGetLastError(), "Conduction: per-material 2D Spitzer launch failed");
+  if (state.evacuated_cells.n_contact_active_cells > 0) {
+    const int* const contact_cells =
+        state.evacuated_cells.d_contact_active_cells.data();
+    const int n_contact_cells =
+        state.evacuated_cells.n_contact_active_cells;
+    // dt-only nullptr callers at conduction.cu:5870/:5970 require this array gate.
+    if (d_kappa_eff != nullptr) {
+      set_evac_contact_junction_deff_kernel<<<1, 1>>>(
+          d_kappa_eff, contact_cells, n_contact_cells, nr, nz);
+      cuda_check(cudaGetLastError(),
+                 "Conduction: per-material 2D aggregate contact junction launch failed");
+    }
+    // dt-only nullptr callers at conduction.cu:5870/:5970 require this array gate.
+    if (d_kappa_eff_per_material != nullptr) {
+      for (int m = 0; m < n_mat; ++m) {
+        set_evac_contact_junction_deff_kernel<<<1, 1>>>(
+            d_kappa_eff_per_material +
+                static_cast<std::size_t>(m) * n_cells,
+            contact_cells,
+            n_contact_cells,
+            nr,
+            nz);
+        cuda_check(cudaGetLastError(),
+                   "Conduction: per-material 2D contact junction launch failed");
+      }
+    }
+  }
   cuda_check(core::debug_kernel_sync(), "Conduction: per-material 2D Spitzer failed");
   const_cast<core::State&>(state).dispatch_counters.per_material_kernel_call_count.fetch_add(
       1, std::memory_order_relaxed);
@@ -3296,6 +3357,11 @@ ConductionDiagnostics compute_conduction_diagnostics_impl(const core::State& sta
 
   const core::State::LaunchWindow cw = state.owned_cell_window_ghost(n_cells, 1);  // alpha/deff: ghost-extended (interface faces; min/max atomics idempotent)
   const double* state_cv_e = state.cv_e.empty() ? nullptr : state.cv_e.data();
+  const std::uint8_t* evacuated_cell_mask =
+      state.evacuated_cells.d_inactive_member_mask.size() ==
+              static_cast<std::size_t>(n_cells)
+          ? state.evacuated_cells.d_inactive_member_mask.data()
+          : nullptr;
   // W-G2 nlheat verify hook (default-inert): TENRYU_CONDUCTION_TEST_KAPPA_POWER=p
   // switches the 1D test_kappa constant to kappa = test_kappa * Te^p via a
   // dedicated kernel. The historic kernel and its launch below stay byte-
@@ -3398,6 +3464,7 @@ ConductionDiagnostics compute_conduction_diagnostics_impl(const core::State& sta
         d_gamma_eff,
         d_A_eff,
         d_cell_is_void,
+        evacuated_cell_mask,
         cfg.numerics.conduction.f_lim,
         cfg.numerics.conduction.test_kappa,
         cfg.numerics.conduction.mfp_limiter_C,
@@ -3406,6 +3473,19 @@ ConductionDiagnostics compute_conduction_diagnostics_impl(const core::State& sta
         cw.end);
   }
   cuda_check(cudaGetLastError(), "Conduction: compute_spitzer_deff launch failed");
+  // dt-only nullptr callers at conduction.cu:5870/:5970 require this array gate.
+  if (state.mesh.dim == 2 &&
+      state.evacuated_cells.n_contact_active_cells > 0 &&
+      d_diffusion != nullptr) {
+    set_evac_contact_junction_deff_kernel<<<1, 1>>>(
+        d_diffusion,
+        state.evacuated_cells.d_contact_active_cells.data(),
+        state.evacuated_cells.n_contact_active_cells,
+        state.mesh.topo.nr,
+        state.mesh.topo.nz);
+    cuda_check(cudaGetLastError(),
+               "Conduction: contact junction deff launch failed");
+  }
   cuda_check(core::debug_kernel_sync(), "Conduction: compute_spitzer_deff failed");
 
   // W-G2 kirchhoff face_kappa_policy (env bridge until the namelist lands;
@@ -3632,8 +3712,8 @@ void accumulate_state_supply_conduction_bc(core::State& state,
     return;
   }
   const auto& b = cfg.numerics.hydro.boundary_2d;
-  const int z_bottom_source = b.z_bottom_cfg.is_state_supply() ? 1 : 0;
-  const int z_top_source = b.z_top_cfg.is_state_supply() ? 1 : 0;
+  const int z_bottom_source = b.z_bottom_cfg.supply_active(state.t) ? 1 : 0;
+  const int z_top_source = b.z_top_cfg.supply_active(state.t) ? 1 : 0;
   if (z_bottom_source == 0 && z_top_source == 0) {
     return;
   }

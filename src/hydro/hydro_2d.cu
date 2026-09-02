@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -33,23 +34,28 @@
 #include "hydro/ale_driver.cuh"
 #include "hydro/ale_remap_2d_rz.hpp"
 #include "hydro/artificial_viscosity.hpp"
+#include "hydro/axis_projection.hpp"
 #include "hydro/braginskii_viscosity.cuh"
 #include "hydro/boundary_pressure_force.cuh"
 #include "hydro/boundary_2d.hpp"
 #include "hydro/cap_energy_audit.hpp"
+#include "hydro/carrier_constraint_adapter.hpp"
 #include "hydro/central_pseudo_core.cuh"
 #include "hydro/compatible_av_csw.cuh"
+#include "hydro/compatible_av_tensor.cuh"
 #include "hydro/compatible_force_work_2d.cuh"
 #include "hydro/compatible_subzonal_pressure.cuh"
 #include "hydro/conservation_audit.hpp"
 #include "hydro/corner_jacobian_quality.cuh"
 #include "hydro/eos_context.hpp"
+#include "hydro/evacuated_cell_shadow.hpp"
 #include "hydro/hllc_z_flux_2d_rz.hpp"
 #include "hydro/hydro_multiblock_topology.cuh"
 #include "hydro/mesh_motion_trace.hpp"
 #include "hydro/mesh_regime.cuh"
 #include "hydro/per_material_eos_accessors.cuh"
 #include "hydro/per_material_eos_project.cuh"
+#include "hydro/pentagon_geometry.cuh"
 #include "hydro/pole_angular_derefine.cuh"
 #include "hydro/pole_angular_coarsen.cuh"
 #include "hydro/pole_axis_bbsw.hpp"
@@ -89,7 +95,101 @@ void launch_compute_node_mass_2d_multiblock(
 }
 
 namespace tenryu::hydro {
+
+bool polar_tier_fo_diag_enabled() {
+  static const bool enabled = []() {
+    const char* value = std::getenv("TENRYU_POLAR_TIER_FO");
+    return value != nullptr && value[0] != '\0' &&
+           std::string(value) != "0";
+  }();
+  return enabled;
+}
+
+static bool aw_axis_slave_enabled() {
+  static const bool enabled = [] {
+    const char* const raw = std::getenv("TENRYU_AW_AXIS_SLAVE");
+    return raw == nullptr || std::string(raw) != "0";
+  }();
+  return enabled;
+}
+
+AwAxisSlaveStructuredLines detect_aw_axis_slave_structured_lines(
+    const core::State& state,
+    const core::Config& cfg) {
+  AwAxisSlaveStructuredLines lines;
+  if (!aw_axis_slave_enabled() ||
+      !cfg.numerics.hydro.aw_compatible_force_work ||
+      state.mesh.topo.multiblock.has_value() || state.mesh.topo.nz < 2 ||
+      state.mesh.topo.node_flags.size() != state.x_r.size()) {
+    return lines;
+  }
+  const auto axis_line_is_pole = [&](const int j) {
+    for (int i = 1; i <= state.mesh.topo.nr; ++i) {
+      const int n = state.mesh.topo.node_index(i, j);
+      if ((state.mesh.topo.node_flags[static_cast<std::size_t>(n)] &
+           mesh::NODE_POLE_AXIS) == 0U) {
+        return false;
+      }
+    }
+    return state.mesh.topo.nr > 0;
+  };
+  lines.theta0_active = axis_line_is_pole(0);
+  lines.theta_pi_active = axis_line_is_pole(state.mesh.topo.nz);
+  return lines;
+}
+
 namespace {
+
+struct BandWorkAudit {
+  bool enabled = false;
+  bool parsed = false;
+  double s_lo = 0.0, s_hi = 0.0, t_lo = 0.0, t_hi = 0.0;
+  std::string path;
+  std::vector<int> cells;          // capture set (fixed at first active step)
+  std::vector<double> s_capture;   // centroid radius at capture time [cm]
+  bool captured = false;
+  long call_seq = 0;
+  FILE* fp = nullptr;
+};
+
+BandWorkAudit& band_work_audit() {
+  static BandWorkAudit a;
+  if (!a.parsed) {
+    a.parsed = true;
+    const char* raw = std::getenv("TENRYU_HYDRO_BAND_WORK_AUDIT");
+    if (raw != nullptr) {
+      double v[4] = {0, 0, 0, 0};
+      std::string s(raw);
+      std::array<std::string, 5> tok;
+      std::size_t pos = 0;
+      bool ok = true;
+      for (int k = 0; k < 4; ++k) {
+        const std::size_t next = s.find(':', pos);
+        if (next == std::string::npos) { ok = false; break; }
+        tok[k] = s.substr(pos, next - pos);
+        pos = next + 1;
+      }
+      if (ok) {
+        tok[4] = s.substr(pos);
+        char* end = nullptr;
+        for (int k = 0; k < 4; ++k) {
+          v[k] = std::strtod(tok[k].c_str(), &end);
+          if (end == tok[k].c_str()) { ok = false; break; }
+        }
+      }
+      if (ok && !tok[4].empty() && v[1] > v[0] && v[3] > v[2]) {
+        a.s_lo = v[0]; a.s_hi = v[1]; a.t_lo = v[2]; a.t_hi = v[3];
+        a.path = tok[4];
+        a.enabled = true;
+      } else {
+        core::log_warning(
+            "TENRYU_HYDRO_BAND_WORK_AUDIT malformed; expected "
+            "s_lo:s_hi:t_lo:t_hi:path — audit disabled");
+      }
+    }
+  }
+  return a;
+}
 
 constexpr double kEvToErg = 1.6022e-12;
 constexpr double kProtonMass = tenryu::core::constants::proton_mass;
@@ -156,6 +256,80 @@ inline void sync_kernel(const char* message) {
   if (core::sync_every_kernel_enabled()) {
     cuda_check(cudaDeviceSynchronize(), message);
   }
+}
+
+bool origin_trace_enabled() {
+  static const bool enabled = [] {
+    const char* const raw = std::getenv("TENRYU_I1B_ORIGIN_TRACE");
+    return raw != nullptr && raw[0] != '\0' && std::string(raw) != "0";
+  }();
+  return enabled;
+}
+
+int origin_trace_node(const core::State& state) {
+  static const int node = [&state] {
+    const auto& node_flags = state.mesh.topo.node_flags;
+    const auto it = std::find_if(
+        node_flags.begin(), node_flags.end(), [](const std::uint8_t flags) {
+          return (flags & kNodeCenterFlag) != 0U;
+        });
+    const int resolved = it == node_flags.end()
+                             ? -1
+                             : static_cast<int>(it - node_flags.begin());
+    std::ostringstream os;
+    os << "[origin-trace] node=" << resolved;
+    core::log_info(os.str());
+    return resolved;
+  }();
+  return node;
+}
+
+double copy_origin_trace_value(const double* const values, const int node) {
+  double value = 0.0;
+  cuda_check(cudaDeviceSynchronize(),
+             "Hydro2D origin trace synchronize failed");
+  cuda_check(cudaMemcpy(&value, values + node, sizeof(double),
+                        cudaMemcpyDeviceToHost),
+             "Hydro2D origin trace copy failed");
+  return value;
+}
+
+void emit_origin_trace(const core::State& state,
+                       const char* const stage,
+                       const double* const values) {
+  if (!origin_trace_enabled()) {
+    return;
+  }
+  const int node = origin_trace_node(state);
+  if (node < 0 || node >= static_cast<int>(state.v_z.size())) {
+    return;
+  }
+  const double value = copy_origin_trace_value(values, node);
+  std::ostringstream os;
+  os << std::setprecision(17)
+     << "[origin-trace] step=" << state.step
+     << " stage=" << stage
+     << " v_z=" << value;
+  core::log_info(os.str());
+}
+
+void emit_origin_trace_step_begin(const core::State& state,
+                                  const double* const uz_old) {
+  if (!origin_trace_enabled()) {
+    return;
+  }
+  const int node = origin_trace_node(state);
+  if (node < 0 || node >= static_cast<int>(state.v_z.size())) {
+    return;
+  }
+  const double old_value = copy_origin_trace_value(uz_old, node);
+  const double state_value = copy_origin_trace_value(state.v_z.data(), node);
+  std::ostringstream os;
+  os << std::setprecision(17)
+     << "[origin-trace] step=" << state.step
+     << " stage=step_begin uz_old=" << old_value
+     << " v_z=" << state_value;
+  core::log_info(os.str());
 }
 
 void clear_av_max_diagnostic(core::State& state) {
@@ -282,8 +456,18 @@ void update_av_max_diagnostic(core::State& state,
 
   const int nz = state.mesh.topo.nz;
   state.av_max_cell_id = c_max;
-  state.av_max_i = c_max / nz;
-  state.av_max_j = c_max - state.av_max_i * nz;
+  const bool split_polar_shell =
+      state.mesh.topo.multiblock.has_value() &&
+      mesh::mesh_topo_multiblock_polar_shell_block_count(
+          *state.mesh.topo.multiblock) > 1;
+  if (split_polar_shell) {
+    // The raw cell id remains valid; -1 marks structured i/j as unavailable.
+    state.av_max_i = -1;
+    state.av_max_j = -1;
+  } else {
+    state.av_max_i = c_max / nz;
+    state.av_max_j = c_max - state.av_max_i * nz;
+  }
   state.av_q_visc_max = host_out.q;
   state.av_rho_at_max = host_out.rho;
   state.av_cs_at_max = host_out.cs;
@@ -386,10 +570,41 @@ int button_outer_node_ring_or_disabled(const core::State& state) {
              : -1;
 }
 
+struct FloorClampExclusionMasks {
+  const std::uint8_t* central_member = nullptr;
+  const std::uint8_t* central_passive = nullptr;
+  const std::uint8_t* pole_member = nullptr;
+};
+
+FloorClampExclusionMasks floor_clamp_exclusion_masks(core::State& state) {
+  FloorClampExclusionMasks masks;
+  if (central_pseudo_core::active(state)) {
+    masks.central_member = state.central_pseudo_core.d_member_mask.data();
+    masks.central_passive = state.central_pseudo_core.d_passive_mask.data();
+  }
+  if (pole_angular_derefine::active(state)) {
+    masks.pole_member = state.pole_angular_derefine.d_member_mask.data();
+  }
+  return masks;
+}
+
+__device__ inline bool floor_clamp_excluded(
+    const int c,
+    const std::uint8_t* __restrict__ central_member_mask,
+    const std::uint8_t* __restrict__ central_passive_mask,
+    const std::uint8_t* __restrict__ pole_member_mask) {
+  return (central_member_mask != nullptr && central_member_mask[c] != 0U) ||
+         (central_passive_mask != nullptr && central_passive_mask[c] != 0U) ||
+         (pole_member_mask != nullptr && pole_member_mask[c] != 0U);
+}
+
 __global__ void compute_density_kernel(double* __restrict__ rho,
                                        const double* __restrict__ mass,
                                        const double* __restrict__ vol,
                                        const std::uint8_t* __restrict__ cell_is_void,
+                                       const std::uint8_t* __restrict__ central_member_mask,
+                                       const std::uint8_t* __restrict__ central_passive_mask,
+                                       const std::uint8_t* __restrict__ pole_member_mask,
                                        const int c_begin,
                                        const int c_end,
                                        const int own_begin,
@@ -399,6 +614,10 @@ __global__ void compute_density_kernel(double* __restrict__ rho,
                                        int* __restrict__ rho_clamp_count) {
   const int c = c_begin + blockIdx.x * blockDim.x + threadIdx.x;
   if (c >= c_end) {
+    return;
+  }
+  if (floor_clamp_excluded(c, central_member_mask, central_passive_mask,
+                           pole_member_mask)) {
     return;
   }
   const double rho_raw = (vol[c] > 0.0) ? (mass[c] / vol[c]) : 0.0;
@@ -716,7 +935,9 @@ __global__ void state_supply_energy_from_temperature_kernel(
     const double* __restrict__ Ti,
     const int c_begin,
     const int c_end,
-    const int n_cells,
+    const int nz,
+    const int bottom_active,
+    const int top_active,
     const double gamma,
     const double A,
     const double fallback_z,
@@ -728,6 +949,12 @@ __global__ void state_supply_energy_from_temperature_kernel(
     const bool use_two_temp) {
   const int c = c_begin + blockIdx.x * blockDim.x + threadIdx.x;
   if (c >= c_end || state_supply_mask == nullptr || state_supply_mask[c] == 0) {
+    return;
+  }
+  const int i = c / nz;
+  const int j = c - i * nz;
+  if ((bottom_active == 0 || j != 0) &&
+      (top_active == 0 || j != nz - 1)) {
     return;
   }
 
@@ -956,6 +1183,7 @@ __global__ void compute_corner_mass_2d_kernel(double* __restrict__ corner_mass,
                                               const int c_end,
                                               const int nr,
                                               const int nz,
+                                              const bool aw_compatible_force_work,
                                               const int button_outer_node_ring,
                                               const int corner_stride) {
   const int c = c_begin + blockIdx.x * blockDim.x + threadIdx.x;
@@ -999,7 +1227,8 @@ __global__ void compute_corner_mass_2d_kernel(double* __restrict__ corner_mass,
 
   rz::CornerMassFallbackProbe probe{};
   rz::compute_rz_corner_masses_for_cell(c, nz, m_cell, x_r, x_z, cell_nverts,
-                                        corner_mass, corner_stride, &probe,
+                                        aw_compatible_force_work, corner_mass,
+                                        corner_stride, &probe,
                                         corner_mass_convention);
   if (probe.fired == 1) {
     rz::record_corner_mass_fallback(
@@ -1025,6 +1254,7 @@ __global__ void compute_corner_mass_2d_multiblock_kernel(
     const int c_end,
     const int n_cells_total,
     const bool partition_normalized,
+    const bool polar_tier_equal_planar_area,
     const int corner_stride) {
   const int c = c_begin + blockIdx.x * blockDim.x + threadIdx.x;
   if (c >= c_end) {
@@ -1034,19 +1264,25 @@ __global__ void compute_corner_mass_2d_multiblock_kernel(
   const double m_cell = mass[c];
   const int off = cell_node_csr_offsets[c];
   const int active_nverts = mesh::mesh_topo_cell_active_nverts(cell_nverts, c);
-  double m_corner[mesh::kMeshTopoCellStorageSlotsMax] = {};
+  double m_corner[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {};
   if (active_nverts == 3) {
     const int n0 = cell_node_csr_indices[off + 0];
     const int n1 = cell_node_csr_indices[off + 1];
     const int n2 = cell_node_csr_indices[off + 2];
-    rz::compute_triangle_corner_masses_exact(m_cell,
-                                             x_r[n0],
-                                             x_z[n0],
-                                             x_r[n1],
-                                             x_z[n1],
-                                             x_r[n2],
-                                             x_z[n2],
-                                             m_corner);
+    if (polar_tier_equal_planar_area) {
+      rz::compute_triangle_corner_masses_equal_planar_area(
+          m_cell, x_r[n0], x_z[n0], x_r[n1], x_z[n1], x_r[n2], x_z[n2],
+          m_corner);
+    } else {
+      rz::compute_triangle_corner_masses_exact(m_cell,
+                                               x_r[n0],
+                                               x_z[n0],
+                                               x_r[n1],
+                                               x_z[n1],
+                                               x_r[n2],
+                                               x_z[n2],
+                                               m_corner);
+    }
   } else if (active_nverts == 4) {
     const int n00 = cell_node_csr_indices[off + 0];
     const int n10 = cell_node_csr_indices[off + 1];
@@ -1087,29 +1323,69 @@ __global__ void compute_corner_mass_2d_multiblock_kernel(
       }
     }
   } else if (active_nverts >= 5 &&
-             active_nverts <= mesh::kMeshTopoCellStorageSlotsMax) {
-    double r[mesh::kMeshTopoCellStorageSlotsMax] = {};
-    double z[mesh::kMeshTopoCellStorageSlotsMax] = {};
-    double w[mesh::kMeshTopoCellStorageSlotsMax] = {};
-    for (int v = 0; v < active_nverts; ++v) {
-      const int n = cell_node_csr_indices[off + v];
-      r[v] = x_r[n];
-      z[v] = x_z[n];
+             active_nverts <= mesh::kMeshTopoCellStorageSlotsMaxGeneral) {
+    double v_corner[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {};
+    if (active_nverts == 5) {
+      PentagonPoint x[5];
+      for (int v = 0; v < 5; ++v) {
+        const int n = cell_node_csr_indices[off + v];
+        x[v] = {x_r[n], x_z[n]};
+      }
+      pentagon_corner_rz_volumes(x, v_corner);
+    } else {
+      // Shapes above five vertices keep star-P1; no runtime subzonal mismatch was measured.
+      double r[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {};
+      double z[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {};
+      for (int v = 0; v < active_nverts; ++v) {
+        const int n = cell_node_csr_indices[off + v];
+        r[v] = x_r[n];
+        z[v] = x_z[n];
+      }
+      mesh::moments::star_p1_vertex_r_moments(
+          r, z, active_nverts, v_corner);
     }
-    mesh::moments::star_p1_vertex_r_moments(r, z, active_nverts, w);
     double W = 0.0;
     bool finite_weights = true;
+    double weight_scale = 0.0;
     for (int v = 0; v < active_nverts; ++v) {
-      W += w[v];
-      finite_weights = finite_weights && rz::finite_double(w[v]);
+      W += v_corner[v];
+      finite_weights = finite_weights && rz::finite_double(v_corner[v]);
+      weight_scale = fmax(weight_scale, fabs(v_corner[v]));
+    }
+    // A124(b) fail-loud: the pentagon/star-P1 vertex-moment partition
+    // preconditions same-sign per-vertex weights (star-visible polygon in
+    // either orientation); finite mixed-sign weights beyond roundoff are a
+    // contract violation, not a fallback state (NUMERICS §3.2.4; precedent:
+    // csr_compute_pentagon_qk_corner_masses). Uniform-sign negative sets
+    // keep the pre-existing W<=0 fallback path unchanged.
+    if (finite_weights) {
+      constexpr double weight_eps_rel = 1.0e-12;
+      const double weight_tol = weight_eps_rel * weight_scale;
+      bool any_positive = false;
+      bool any_negative = false;
+      for (int v = 0; v < active_nverts; ++v) {
+        any_positive = any_positive || v_corner[v] > weight_tol;
+        any_negative = any_negative || v_corner[v] < -weight_tol;
+      }
+      if (any_positive && any_negative) {
+#ifdef __CUDA_ARCH__
+        printf("corner mass: mixed-sign pentagon/star-P1 vertex weights\n");
+        __trap();
+#else
+        ::tenryu::core::tenryu_abort(
+            "uniform-sign vertex weights",
+            "corner mass: mixed-sign pentagon/star-P1 vertex weights (A124b)",
+            __FILE__, __LINE__);
+#endif
+      }
     }
     if (!(W > 0.0) || !finite_weights) {
       rz::CornerMassFallbackProbe probe{};
       probe.fired = 1;
-      probe.vals[0] = w[0];
-      probe.vals[1] = w[1];
-      probe.vals[2] = w[2];
-      probe.vals[3] = w[3];
+      probe.vals[0] = v_corner[0];
+      probe.vals[1] = v_corner[1];
+      probe.vals[2] = v_corner[2];
+      probe.vals[3] = v_corner[3];
       probe.vals[4] = W;
       const double m_equal = m_cell / static_cast<double>(active_nverts);
       for (int v = 0; v < active_nverts; ++v) {
@@ -1126,9 +1402,18 @@ __global__ void compute_corner_mass_2d_multiblock_kernel(
       }
     } else {
       for (int v = 0; v < active_nverts; ++v) {
-        m_corner[v] = m_cell * (w[v] / W);
+        m_corner[v] = m_cell * (v_corner[v] / W);
       }
     }
+  } else {
+#ifdef __CUDA_ARCH__
+    __trap();
+#else
+    ::tenryu::core::tenryu_abort(
+        "active_nverts <= mesh::kMeshTopoCellStorageSlotsMaxGeneral",
+        "corner mass: cell valence exceeds general slot capacity",
+        __FILE__, __LINE__);
+#endif
   }
   corner_mass[c * corner_stride + 0] = m_corner[0];
   corner_mass[c * corner_stride + 1] = m_corner[1];
@@ -1240,6 +1525,7 @@ __global__ void compute_node_planar_mass_2d_kernel(
   atomic_add_double(node_planar_mass + n01, rho_cell * area[3]);
 }
 
+template <int SlotCap = mesh::kMeshTopoCellStorageSlotsMax>
 __global__ void compute_node_planar_mass_2d_multiblock_kernel(
     double* __restrict__ node_planar_mass,
     const double* __restrict__ rho,
@@ -1250,6 +1536,7 @@ __global__ void compute_node_planar_mass_2d_multiblock_kernel(
     const int* __restrict__ reverse_csr_node_corners,
     const int* __restrict__ cell_node_csr_offsets,
     const int* __restrict__ cell_node_csr_indices,
+    const std::uint8_t* __restrict__ cell_nverts,
     const std::int8_t* __restrict__ hydro_active,
     const int n_nodes_total) {
   const int n = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1257,10 +1544,10 @@ __global__ void compute_node_planar_mass_2d_multiblock_kernel(
     return;
   }
 
-  node_planar_mass[n] = rz::aw_csr_node_planar_mass(
+  node_planar_mass[n] = rz::aw_csr_node_planar_mass<SlotCap>(
       rho, x_r, x_z, reverse_csr_node_offsets, reverse_csr_node_cells,
       reverse_csr_node_corners, cell_node_csr_offsets,
-      cell_node_csr_indices, hydro_active, n);
+      cell_node_csr_indices, cell_nverts, hydro_active, n);
 }
 
 __global__ void compute_node_activity_2d_multiblock_kernel(
@@ -1812,16 +2099,22 @@ __global__ void compute_accel_from_force_kernel(
   }
 
   if constexpr (RZ_SCHEME == 1) {
-    if ((node_flags != nullptr && (node_flags[n] & kNodeCenterFlag) != 0U) ||
-        node_active[n] == 0u || node_planar_mass[n] <= 0.0) {
+    if (node_active[n] == 0u || node_planar_mass[n] <= 0.0) {
       accel_r[n] = 0.0;
       accel_z[n] = 0.0;
+      return;
+    }
+    if (node_flags != nullptr && (node_flags[n] & kNodeCenterFlag) != 0U) {
+      accel_r[n] = 0.0;
+      accel_z[n] = force_z[n] / node_planar_mass[n];
       return;
     }
 
     accel_r[n] = force_r[n] / node_planar_mass[n];
     accel_z[n] = force_z[n] / node_planar_mass[n];
   } else {
+    // Volumetric nodal mass degenerates at the axis, so the center remains
+    // fully constrained on this legacy path.
     if ((node_flags != nullptr && (node_flags[n] & kNodeCenterFlag) != 0U) ||
         node_active[n] == 0u || node_mass[n] <= 0.0) {
       accel_r[n] = 0.0;
@@ -1831,6 +2124,507 @@ __global__ void compute_accel_from_force_kernel(
 
     accel_r[n] = force_r[n] / node_mass[n];
     accel_z[n] = force_z[n] / node_mass[n];
+  }
+}
+
+// The degenerate polar-center column is one material point: every
+// NODE_CENTER node aliases (R,Z)=(0,0), so integrating each node's own
+// F_z/m lets O(1) per-node discrete residuals drift the shared material
+// velocity even in symmetric flows. Aggregate instead: one axial
+// acceleration (sum F_z)/(sum m_planar) over the column, applied to every
+// center node. Summation is mirror-paired (first+last inward) over the
+// ascending node order, so an exactly mirror-antisymmetric force field
+// cancels bitwise and symmetric flows keep A_z == 0.0 exactly; a uniform
+// boost has F == 0 and v_z is preserved by integration (Galilean).
+// Single-thread on purpose: the pair order is the determinism and the
+// exact-cancellation guarantee; the column has O(n_theta) nodes.
+__global__ void aggregate_center_axial_accel_kernel(
+    double* __restrict__ accel_r,
+    double* __restrict__ accel_z,
+    const double* __restrict__ force_z,
+    const double* __restrict__ node_planar_mass,
+    const std::uint8_t* __restrict__ node_flags,
+    const std::uint8_t* __restrict__ node_active,
+    const int begin,
+    const int end) {
+  if (blockIdx.x != 0 || threadIdx.x != 0) {
+    return;
+  }
+  // Documented capacity: covers every production ladder (n_theta <= 192).
+  // A larger column falls back to the per-node integration unchanged.
+  constexpr int kMaxCenterColumn = 1024;
+  int centers[kMaxCenterColumn];
+  int count = 0;
+  for (int n = begin; n < end; ++n) {
+    if ((node_flags[n] & kNodeCenterFlag) != 0U && node_active[n] != 0u &&
+        node_planar_mass[n] > 0.0) {
+      if (count >= kMaxCenterColumn) {
+        return;
+      }
+      centers[count] = n;
+      ++count;
+    }
+  }
+  if (count == 0) {
+    return;
+  }
+  double force_sum = 0.0;
+  double mass_sum = 0.0;
+  int low = 0;
+  int high = count - 1;
+  for (; low < high; ++low, --high) {
+    force_sum += force_z[centers[low]] + force_z[centers[high]];
+    mass_sum += node_planar_mass[centers[low]] +
+                node_planar_mass[centers[high]];
+  }
+  if (low == high) {
+    force_sum += force_z[centers[low]];
+    mass_sum += node_planar_mass[centers[low]];
+  }
+  const double accel = mass_sum > 0.0 ? force_sum / mass_sum : 0.0;
+  for (int index = 0; index < count; ++index) {
+    accel_r[centers[index]] = 0.0;
+    accel_z[centers[index]] = accel;
+  }
+}
+
+__global__ void apply_evac_contact_accel_constraints_kernel(
+    double* accel_r,
+    double* accel_z,
+    const double* node_mass_resolved,
+    const int* pair_nodes,
+    const double* pair_normal,
+    double* pair_lambda,
+    const int n_pairs) {
+  if (blockIdx.x != 0 || threadIdx.x != 0) {
+    return;
+  }
+  for (int pair = 0; pair < n_pairs; ++pair) {
+    const int node_a = pair_nodes[2 * pair];
+    const int node_b = pair_nodes[2 * pair + 1];
+    const double normal_r = pair_normal[2 * pair];
+    const double normal_z = pair_normal[2 * pair + 1];
+    const double mA = node_mass_resolved[node_a];
+    const double mB = node_mass_resolved[node_b];
+    if (!(mA > 0.0) || !(mB > 0.0)) {
+      pair_lambda[pair] = 0.0;
+      continue;
+    }
+    const double aA_n =
+        accel_r[node_a] * normal_r + accel_z[node_a] * normal_z;
+    const double aB_n =
+        accel_r[node_b] * normal_r + accel_z[node_b] * normal_z;
+    // evacuated_cell_shadow.hpp is the source of truth for these two
+    // contact multiplier/common-acceleration formulas.
+    pair_lambda[pair] = (aA_n - aB_n) * (mA * mB / (mA + mB));
+    const double common_accel =
+        (mA * aA_n + mB * aB_n) / (mA + mB);
+    accel_r[node_a] += (common_accel - aA_n) * normal_r;
+    accel_z[node_a] += (common_accel - aA_n) * normal_z;
+    accel_r[node_b] += (common_accel - aB_n) * normal_r;
+    accel_z[node_b] += (common_accel - aB_n) * normal_z;
+  }
+}
+
+__device__ inline void accumulate_evac_contact_mortar_row_scale(
+    const int neighbor,
+    const int n_cells,
+    const int shared0,
+    const int shared1,
+    const int outer0,
+    const int outer1,
+    const double xi,
+    const double normal_r,
+    const double normal_z,
+    const double* const x_r,
+    const double* const x_z,
+    const double* const cell_sound_speed,
+    const std::uint8_t* const inactive_member_mask,
+    const std::int8_t* const hydro_active,
+    double* const h_n,
+    double* const c_contact) {
+  if (neighbor < 0 || neighbor >= n_cells ||
+      inactive_member_mask[neighbor] != 0U ||
+      (hydro_active != nullptr && hydro_active[neighbor] == 0)) {
+    return;
+  }
+  const double shared_r =
+      (1.0 - xi) * x_r[shared0] + xi * x_r[shared1];
+  const double shared_z =
+      (1.0 - xi) * x_z[shared0] + xi * x_z[shared1];
+  const double outer_r =
+      (1.0 - xi) * x_r[outer0] + xi * x_r[outer1];
+  const double outer_z =
+      (1.0 - xi) * x_z[outer0] + xi * x_z[outer1];
+  const double altitude =
+      fabs((shared_r - outer_r) * normal_r +
+           (shared_z - outer_z) * normal_z);
+  if (isfinite(altitude) && altitude > 0.0) {
+    *h_n = fmin(*h_n, altitude);
+  }
+  const double sound_speed = cell_sound_speed[neighbor];
+  if (isfinite(sound_speed) && sound_speed > 0.0) {
+    *c_contact = fmin(*c_contact, sound_speed);
+  }
+}
+
+__device__ inline void evac_contact_row_hold_sweep(
+    double* v_r,
+    double* v_z,
+    const double* node_mass_resolved,
+    const int* row_nodes,
+    const double* row_xi,
+    const double* row_normal,
+    double* row_dk,
+    int n_rows) {
+  for (int r = 0; r < n_rows; ++r) {
+    const int ns = row_nodes[3*r], na = row_nodes[3*r+1], nb = row_nodes[3*r+2];
+    const double xi = row_xi[r];
+    const double nrm_r = row_normal[2*r], nrm_z = row_normal[2*r+1];
+    const double ms = node_mass_resolved[ns], ma = node_mass_resolved[na],
+                 mb = node_mass_resolved[nb];
+    if (!(ms > 0.0) || !(ma > 0.0) || !(mb > 0.0)) continue;
+    // G v = n·v_s - (1-xi) n·v_a - xi n·v_b ; closing when G v < 0.
+    const double vs_n = v_r[ns]*nrm_r + v_z[ns]*nrm_z;
+    const double va_n = v_r[na]*nrm_r + v_z[na]*nrm_z;
+    const double vb_n = v_r[nb]*nrm_r + v_z[nb]*nrm_z;
+    const double gv = vs_n - (1.0 - xi)*va_n - xi*vb_n;
+    if (!(gv < 0.0)) continue;               // unilateral: only closing rows push
+    const double w_row = 1.0/ms + (1.0 - xi)*(1.0 - xi)/ma + xi*xi/mb;
+    const double lambda = -gv / w_row;       // impulse enforcing G v = 0
+    const double kinetic_before =
+        0.5*ms*vs_n*vs_n + 0.5*ma*va_n*va_n + 0.5*mb*vb_n*vb_n;
+    v_r[ns] += (lambda/ms)*nrm_r;            v_z[ns] += (lambda/ms)*nrm_z;
+    v_r[na] -= ((1.0 - xi)*lambda/ma)*nrm_r; v_z[na] -= ((1.0 - xi)*lambda/ma)*nrm_z;
+    v_r[nb] -= (xi*lambda/mb)*nrm_r;         v_z[nb] -= (xi*lambda/mb)*nrm_z;
+    const double vs_n2 = v_r[ns]*nrm_r + v_z[ns]*nrm_z;
+    const double va_n2 = v_r[na]*nrm_r + v_z[na]*nrm_z;
+    const double vb_n2 = v_r[nb]*nrm_r + v_z[nb]*nrm_z;
+    const double kinetic_after =
+        0.5*ms*vs_n2*vs_n2 + 0.5*ma*va_n2*va_n2 + 0.5*mb*vb_n2*vb_n2;
+    if (row_dk != nullptr) row_dk[r] += kinetic_before - kinetic_after;
+  }
+}
+
+__device__ inline void evac_contact_union_velocity_sweep(
+    double* v_r,
+    double* v_z,
+    const double* node_mass_resolved,
+    const int* pair_nodes,
+    const double* pair_normal,
+    const std::uint8_t* __restrict__ pair_row_covered,
+    double* pair_dk_accum,
+    const int n_pairs,
+    const int* row_nodes,
+    const double* row_xi,
+    const double* row_normal,
+    double* row_dk,
+    const int n_rows) {
+  if (n_rows > 0) {
+    evac_contact_row_hold_sweep(
+        v_r, v_z, node_mass_resolved, row_nodes, row_xi, row_normal, row_dk,
+        n_rows);
+  }
+  for (int p = 0; p < n_pairs; ++p) {
+    if (n_rows > 0 && pair_row_covered != nullptr &&
+        pair_row_covered[p] != 0U) {
+      continue;
+    }
+    const int na = pair_nodes[2*p], nb = pair_nodes[2*p+1];
+    const double nr = pair_normal[2*p], nz = pair_normal[2*p+1];
+    const double ma = node_mass_resolved[na], mb = node_mass_resolved[nb];
+    if (!(ma > 0.0) || !(mb > 0.0)) continue;
+    const double van = v_r[na]*nr + v_z[na]*nz;
+    const double vbn = v_r[nb]*nr + v_z[nb]*nz;
+    const double uc = van - vbn;
+    if (!(uc > 0.0)) continue;               // unilateral: only closing
+    const double meff = ma*mb/(ma+mb);
+    const double common = (ma*van + mb*vbn)/(ma+mb);
+    v_r[na] += (common - van)*nr;  v_z[na] += (common - van)*nz;
+    v_r[nb] += (common - vbn)*nr;  v_z[nb] += (common - vbn)*nz;
+    if (pair_dk_accum != nullptr) {
+      pair_dk_accum[p] += 0.5*meff*uc*uc;
+    }
+  }
+}
+
+__global__ void apply_evac_contact_velocity_constraints_kernel(
+    double* v_r, double* v_z,
+    const double* node_mass_resolved,
+    const double* x_r,
+    const double* x_z,
+    const double* cell_sound_speed,
+    const std::uint8_t* inactive_member_mask,
+    const std::int8_t* hydro_active,
+    const int* pair_nodes,
+    const double* pair_normal,
+    const std::uint8_t* __restrict__ pair_row_covered,
+    double* pair_dk_accum,
+    const int n_pairs,
+    const double dt,
+    const int* active_cells,
+    const int* active_axis,
+    const int* active_face_nodes,
+    const double* active_face_normal_ref,
+    const double* active_face_g0,
+    const double* active_vol_at_engagement,
+    const std::uint8_t* active_devolumized,
+    const int* active_pair_dk_owner,
+    double* mortar_g_hold,
+    std::uint8_t* mortar_g_hold_valid,
+    const double mortar_position_drift_beta,
+    int* mortar_drift_count,
+    double* mortar_drift_max_ucorr,
+    int* projection_count,
+    const int n_active_cells,
+    const int nr_cells,
+    const int nz_cells,
+    const int* __restrict__ node_axis_alias,
+    const int* __restrict__ row_nodes,
+    const double* __restrict__ row_xi,
+    const double* __restrict__ row_normal,
+    double* row_dk,
+    const int n_rows) {
+  if (blockIdx.x != 0 || threadIdx.x != 0) return;
+  evac_contact_union_velocity_sweep(
+      v_r, v_z, node_mass_resolved, pair_nodes, pair_normal,
+      pair_row_covered, pair_dk_accum, n_pairs, row_nodes, row_xi,
+      row_normal, row_dk, n_rows);
+  for (int active = 0; active < n_active_cells; ++active) {
+    const int pair_begin = active_pair_dk_owner[active];
+    const int pair_end = active + 1 < n_active_cells
+                             ? active_pair_dk_owner[active + 1]
+                             : n_pairs;
+    const int active_cell_pair_count = pair_end - pair_begin;
+    const int active_cell = active_cells[active];
+
+    const int face_nodes[4] = {
+        active_face_nodes[4 * active],
+        active_face_nodes[4 * active + 1],
+        active_face_nodes[4 * active + 2],
+        active_face_nodes[4 * active + 3]};
+    double face_r[4] = {};
+    double face_z[4] = {};
+    double face_mass[4] = {};
+    double face_v_r[4] = {};
+    double face_v_z[4] = {};
+    for (int k = 0; k < 4; ++k) {
+      const int node = face_nodes[k];
+      face_r[k] = x_r[node];
+      face_z[k] = x_z[node];
+      face_mass[k] = node_mass_resolved[node];
+      face_v_r[k] = v_r[node];
+      face_v_z[k] = v_z[node];
+    }
+    double tangent[2] = {};
+    double normal[2] = {};
+    evacuated_cell_contact_common_frame(
+        face_r[0], face_z[0], face_r[1], face_z[1],
+        face_r[2], face_z[2], face_r[3], face_z[3],
+        active_face_normal_ref[2 * active],
+        active_face_normal_ref[2 * active + 1], tangent, normal);
+    const double gap0 = (face_r[2] - face_r[0]) * normal[0] +
+                        (face_z[2] - face_z[0]) * normal[1];
+    const double gap1 = (face_r[3] - face_r[1]) * normal[0] +
+                        (face_z[3] - face_z[1]) * normal[1];
+    const double chi = evacuated_cell_contact_patch_fraction(
+        gap0, gap1, active_face_g0[active]);
+    if (chi > 0.0) {
+      double row_r[kEvacContactMortarQuadCount][4];
+      double row_z[kEvacContactMortarQuadCount][4];
+      double area_q[kEvacContactMortarQuadCount];
+      double phi_q[kEvacContactMortarQuadCount];
+      const int n_rows = evacuated_cell_contact_mortar_rows(
+          face_r, face_z, normal, chi, gap0, gap1, active_face_g0[active],
+          row_r, row_z, area_q, phi_q);
+      if (n_rows > 0) {
+        // Rate form: the held seam's equilibrium gap sits below g0 by the
+        // hold-floor rule, so the position-level shifted gap would fight the
+        // hold every step; the complementarity acts on approach rates only.
+        double phi_rate[kEvacContactMortarQuadCount] = {};
+        double correction_velocity[kEvacContactMortarQuadCount] = {};
+        bool has_position_correction = false;
+        if (mortar_position_drift_beta > 0.0) {
+          constexpr double gauss_x[kEvacContactMortarQuadCount] = {
+              0.5 * (1.0 - kEvacContactGaussAbscissa),
+              0.5,
+              0.5 * (1.0 + kEvacContactGaussAbscissa)};
+          const double mid0_r = 0.5 * (face_r[0] + face_r[2]);
+          const double mid0_z = 0.5 * (face_z[0] + face_z[2]);
+          const double mid1_r = 0.5 * (face_r[1] + face_r[3]);
+          const double mid1_z = 0.5 * (face_z[1] + face_z[3]);
+          const double face_dr = mid1_r - mid0_r;
+          const double face_dz = mid1_z - mid0_z;
+          const double face_length = sqrt(face_dr * face_dr + face_dz * face_dz);
+          const int cell_i = active_cell / nz_cells;
+          const int cell_j = active_cell - cell_i * nz_cells;
+          const int stride = nz_cells + 1;
+          for (int q = 0; q < n_rows; ++q) {
+            const int hold_index =
+                active * core::kEvacContactMortarRowCapacity + q;
+            const double g_q = phi_q[q] + active_face_g0[active];
+            if (mortar_g_hold_valid[hold_index] == 0U) {
+              mortar_g_hold[hold_index] = g_q;
+              mortar_g_hold_valid[hold_index] = 1U;
+            }
+            const double phi = g_q - mortar_g_hold[hold_index];
+            const double xi = chi * gauss_x[q];
+            double h_n = INFINITY;
+            double c_contact = INFINITY;
+            if (active_axis[active] == 1) {
+              if (cell_j > 0) {
+                accumulate_evac_contact_mortar_row_scale(
+                    cell_i * nz_cells + cell_j - 1,
+                    nr_cells * nz_cells,
+                    face_nodes[0], face_nodes[1],
+                    cell_i * stride + cell_j - 1,
+                    (cell_i + 1) * stride + cell_j - 1,
+                    xi, normal[0], normal[1], x_r, x_z, cell_sound_speed,
+                    inactive_member_mask, hydro_active, &h_n, &c_contact);
+              }
+              if (cell_j + 1 < nz_cells) {
+                accumulate_evac_contact_mortar_row_scale(
+                    cell_i * nz_cells + cell_j + 1,
+                    nr_cells * nz_cells,
+                    face_nodes[2], face_nodes[3],
+                    cell_i * stride + cell_j + 2,
+                    (cell_i + 1) * stride + cell_j + 2,
+                    xi, normal[0], normal[1], x_r, x_z, cell_sound_speed,
+                    inactive_member_mask, hydro_active, &h_n, &c_contact);
+              }
+            } else {
+              if (cell_i > 0) {
+                accumulate_evac_contact_mortar_row_scale(
+                    (cell_i - 1) * nz_cells + cell_j,
+                    nr_cells * nz_cells,
+                    face_nodes[0], face_nodes[1],
+                    (cell_i - 1) * stride + cell_j,
+                    (cell_i - 1) * stride + cell_j + 1,
+                    xi, normal[0], normal[1], x_r, x_z, cell_sound_speed,
+                    inactive_member_mask, hydro_active, &h_n, &c_contact);
+              }
+              if (cell_i + 1 < nr_cells) {
+                accumulate_evac_contact_mortar_row_scale(
+                    (cell_i + 1) * nz_cells + cell_j,
+                    nr_cells * nz_cells,
+                    face_nodes[2], face_nodes[3],
+                    (cell_i + 2) * stride + cell_j,
+                    (cell_i + 2) * stride + cell_j + 1,
+                    xi, normal[0], normal[1], x_r, x_z, cell_sound_speed,
+                    inactive_member_mask, hydro_active, &h_n, &c_contact);
+              }
+            }
+            if (!isfinite(h_n) || !(h_n > 0.0)) {
+              h_n = face_length;
+            }
+            const double phi_soft = 0.05 * h_n;
+            if (phi < -phi_soft) {
+              ++mortar_drift_count[1];
+              continue;
+            }
+            if (!isfinite(c_contact) || !(c_contact > 0.0)) {
+              continue;
+            }
+            double u_corr =
+                (mortar_position_drift_beta / dt) * fmax(-phi, 0.0);
+            u_corr = fmin(u_corr, 0.05 * c_contact);
+            u_corr = fmin(u_corr, 0.05 * h_n / dt);
+            if (u_corr > 0.0) {
+              correction_velocity[q] = u_corr;
+              has_position_correction = true;
+              ++mortar_drift_count[0];
+              mortar_drift_max_ucorr[0] =
+                  fmax(mortar_drift_max_ucorr[0], u_corr);
+            }
+          }
+        }
+        double j_q[kEvacContactMortarQuadCount];
+        double mortar_kinetic_energy_loss = 0.0;
+        bool projected = false;
+        if (has_position_correction) {
+          projected = evacuated_cell_contact_mortar_project(
+              face_mass, face_nodes,
+              pair_nodes + 2 * pair_begin, pair_normal + 2 * pair_begin,
+              active_cell_pair_count, row_r, row_z, area_q, phi_rate,
+              n_rows, dt, face_v_r, face_v_z,
+              &mortar_kinetic_energy_loss, j_q, correction_velocity);
+          if (!projected) {
+            ++mortar_drift_count[2];
+            mortar_kinetic_energy_loss = 0.0;
+            projected = evacuated_cell_contact_mortar_project(
+                face_mass, face_nodes,
+                pair_nodes + 2 * pair_begin, pair_normal + 2 * pair_begin,
+                active_cell_pair_count, row_r, row_z, area_q, phi_rate,
+                n_rows, dt, face_v_r, face_v_z,
+                &mortar_kinetic_energy_loss, j_q);
+          }
+        } else {
+          projected = evacuated_cell_contact_mortar_project(
+              face_mass, face_nodes,
+              pair_nodes + 2 * pair_begin, pair_normal + 2 * pair_begin,
+              active_cell_pair_count, row_r, row_z, area_q, phi_rate,
+              n_rows, dt, face_v_r, face_v_z,
+              &mortar_kinetic_energy_loss, j_q);
+        }
+        if (projected) {
+          for (int k = 0; k < 4; ++k) {
+            const int node = face_nodes[k];
+            v_r[node] = face_v_r[k];
+            v_z[node] = face_v_z[k];
+          }
+          if (pair_dk_accum != nullptr) {
+            pair_dk_accum[active_pair_dk_owner[active]] +=
+                mortar_kinetic_energy_loss;
+            ++projection_count[1];
+          }
+        }
+      }
+    }
+
+    int corners[4] = {};
+    evacuated_cell_corner_nodes(
+        active_cells[active], nr_cells, nz_cells, corners);
+    int nodes[4] = {corners[0], corners[1], corners[3], corners[2]};
+    for (int k = 0; k < 4; ++k) {
+      const int raw = nodes[k];
+      nodes[k] = (node_axis_alias != nullptr && node_axis_alias[raw] >= 0)
+                     ? node_axis_alias[raw]
+                     : raw;
+    }
+    double r[4] = {};
+    double z[4] = {};
+    double mass[4] = {};
+    double local_v_r[4] = {};
+    double local_v_z[4] = {};
+    for (int k = 0; k < 4; ++k) {
+      const int node = nodes[k];
+      r[k] = x_r[node];
+      z[k] = x_z[node];
+      mass[k] = node_mass_resolved[node];
+      local_v_r[k] = v_r[node];
+      local_v_z[k] = v_z[node];
+    }
+    double kinetic_energy_loss = 0.0;
+    if (active_devolumized != nullptr &&
+        active_devolumized[active] != 0U) {
+      continue;
+    }
+    if (!evacuated_cell_contact_volume_floor_project(
+            r, z, mass, nodes, pair_nodes + 2 * pair_begin,
+            pair_normal + 2 * pair_begin, active_cell_pair_count,
+            active_vol_at_engagement[active],
+            local_v_r, local_v_z, &kinetic_energy_loss)) {
+      continue;
+    }
+    for (int k = 0; k < 4; ++k) {
+      const int node = nodes[k];
+      v_r[node] = local_v_r[k];
+      v_z[node] = local_v_z[k];
+    }
+    if (pair_dk_accum != nullptr) {
+      pair_dk_accum[active_pair_dk_owner[active]] += kinetic_energy_loss;
+      ++projection_count[0];
+    }
   }
 }
 
@@ -1980,7 +2774,6 @@ __global__ void apply_boundary_accel_constraints_multiblock_kernel(
   const std::uint8_t flags = node_flags[n];
   if ((flags & kNodeCenterFlag) != 0U) {
     accel_r[n] = 0.0;
-    accel_z[n] = 0.0;
     return;
   }
 
@@ -2026,20 +2819,176 @@ __global__ void update_node_velocity_2d_kernel(double* __restrict__ v_r,
                                                const int n_begin,
                                                const int n_end,
                                                const int n_nodes,
-                                               const double scale_dt) {
+                                               const double scale_dt,
+                                               double* __restrict__ node_accel_r,
+                                               double* __restrict__ node_accel_z) {
   const int n = n_begin + blockIdx.x * blockDim.x + threadIdx.x;
   if (n >= n_end) {
     return;
   }
-  if (node_flags != nullptr && (node_flags[n] & kNodeCenterFlag) != 0U) {
+  const std::uint8_t flags =
+      node_flags != nullptr ? node_flags[n] : 0U;
+  if ((flags & kNodeCenterFlag) != 0U) {
     v_r[n] = 0.0;
-    v_z[n] = 0.0;
+    v_z[n] = old_v_z[n] + scale_dt * a_z[n];
   } else if (node_active[n] != 0u) {
     v_r[n] = old_v_r[n] + scale_dt * a_r[n];
     v_z[n] = old_v_z[n] + scale_dt * a_z[n];
   } else {
     v_r[n] = old_v_r[n];
     v_z[n] = old_v_z[n];
+  }
+  if ((flags & (mesh::NODE_AXIS | kNodePoleAxisFlag)) != 0U) {
+    v_r[n] = 0.0;
+  }
+  if (node_accel_r != nullptr && node_accel_z != nullptr) {
+    if (scale_dt > 0.0) {
+      node_accel_r[n] = (v_r[n] - old_v_r[n]) / scale_dt;
+      node_accel_z[n] = (v_z[n] - old_v_z[n]) / scale_dt;
+    } else {
+      node_accel_r[n] = 0.0;
+      node_accel_z[n] = 0.0;
+    }
+  }
+}
+
+__device__ inline void apply_aw_axis_velocity_slave_node(
+    double* __restrict__ v_r,
+    double* __restrict__ v_z,
+    const double* __restrict__ x_r,
+    const double* __restrict__ x_z,
+    double* __restrict__ kappa_saved,
+    const int p,
+    const int q,
+    const bool capture_kappa) {
+  constexpr double kDrTolerance = 1.0e-300;
+  if (capture_kappa) {
+    const double dr = x_r[q] - x_r[p];
+    kappa_saved[p] =
+        fabs(dr) <= kDrTolerance
+            ? nan("")
+            : (x_z[q] - x_z[p]) / dr;
+  }
+  v_r[p] = 0.0;
+  const double kappa = kappa_saved[p];
+  if (!isnan(kappa)) {
+    v_z[p] = v_z[q] - kappa * v_r[q];
+  }
+}
+
+__global__ void apply_aw_axis_velocity_slave_2d_kernel(
+    double* __restrict__ v_r,
+    double* __restrict__ v_z,
+    const double* __restrict__ x_r,
+    const double* __restrict__ x_z,
+    double* __restrict__ kappa_saved,
+    const int nr,
+    const int nz,
+    const int first_axis_i,
+    const bool theta0_axis_active,
+    const bool theta_pi_axis_active,
+    const bool capture_kappa) {
+  const int i =
+      blockIdx.x * blockDim.x + threadIdx.x + first_axis_i;
+  if (i > nr) {
+    return;
+  }
+  const int stride = nz + 1;
+  if (theta0_axis_active) {
+    const int p = i * stride;
+    apply_aw_axis_velocity_slave_node(
+        v_r, v_z, x_r, x_z, kappa_saved, p, p + 1, capture_kappa);
+  }
+  if (theta_pi_axis_active) {
+    const int p = i * stride + nz;
+    apply_aw_axis_velocity_slave_node(
+        v_r, v_z, x_r, x_z, kappa_saved, p, p - 1, capture_kappa);
+  }
+}
+
+__global__ void snap_aw_axis_coordinates_2d_kernel(
+    double* __restrict__ x_r,
+    double* __restrict__ x_z,
+    const double* __restrict__ kappa_saved,
+    const int nr,
+    const int nz,
+    const int first_axis_i,
+    const bool theta0_axis_active,
+    const bool theta_pi_axis_active) {
+  const int i =
+      blockIdx.x * blockDim.x + threadIdx.x + first_axis_i;
+  if (i > nr) {
+    return;
+  }
+  const int stride = nz + 1;
+  if (theta0_axis_active) {
+    const int p = i * stride;
+    const int q = p + 1;
+    x_r[p] = 0.0;
+    const double kappa = kappa_saved[p];
+    if (!isnan(kappa)) {
+      x_z[p] = x_z[q] - kappa * x_r[q];
+    }
+  }
+  if (theta_pi_axis_active) {
+    const int p = i * stride + nz;
+    const int q = p - 1;
+    x_r[p] = 0.0;
+    const double kappa = kappa_saved[p];
+    if (!isnan(kappa)) {
+      x_z[p] = x_z[q] - kappa * x_r[q];
+    }
+  }
+}
+
+__global__ void apply_aw_axis_velocity_slave_2d_multiblock_kernel(
+    double* __restrict__ v_r,
+    double* __restrict__ v_z,
+    const double* __restrict__ x_r,
+    const double* __restrict__ x_z,
+    double* __restrict__ kappa_saved,
+    const int* __restrict__ axis_slave_p,
+    const int* __restrict__ axis_slave_q,
+    const int pair_count,
+    const bool capture_kappa) {
+  const int pair = blockIdx.x * blockDim.x + threadIdx.x;
+  if (pair >= pair_count) {
+    return;
+  }
+  constexpr double kDrTolerance = 1.0e-300;
+  const int p = axis_slave_p[pair];
+  const int q = axis_slave_q[pair];
+  if (capture_kappa) {
+    const double dr = x_r[q] - x_r[p];
+    kappa_saved[pair] =
+        fabs(dr) <= kDrTolerance
+            ? nan("")
+            : (x_z[q] - x_z[p]) / dr;
+  }
+  v_r[p] = 0.0;
+  const double kappa = kappa_saved[pair];
+  if (!isnan(kappa)) {
+    v_z[p] = v_z[q] - kappa * v_r[q];
+  }
+}
+
+__global__ void snap_aw_axis_coordinates_2d_multiblock_kernel(
+    double* __restrict__ x_r,
+    double* __restrict__ x_z,
+    const double* __restrict__ kappa_saved,
+    const int* __restrict__ axis_slave_p,
+    const int* __restrict__ axis_slave_q,
+    const int pair_count) {
+  const int pair = blockIdx.x * blockDim.x + threadIdx.x;
+  if (pair >= pair_count) {
+    return;
+  }
+  const int p = axis_slave_p[pair];
+  const int q = axis_slave_q[pair];
+  x_r[p] = 0.0;
+  const double kappa = kappa_saved[pair];
+  if (!isnan(kappa)) {
+    x_z[p] = x_z[q] - kappa * x_r[q];
   }
 }
 
@@ -2059,7 +3008,10 @@ __global__ void commit_position_2d_kernel(double* __restrict__ x_r,
   if (n >= n_end) {
     return;
   }
-  if (node_flags != nullptr && (node_flags[n] & kNodeCenterFlag) != 0U) {
+  const std::uint8_t flags =
+      node_flags != nullptr ? node_flags[n] : 0U;
+  if ((flags & kNodeCenterFlag) != 0U) {
+    // The center pin is mesh-only (w=0) and does not constrain material velocity.
     x_r[n] = 0.0;
     x_z[n] = 0.0;
   } else if (node_active[n] != 0u) {
@@ -2068,6 +3020,9 @@ __global__ void commit_position_2d_kernel(double* __restrict__ x_r,
   } else {
     x_r[n] = r_old[n];
     x_z[n] = z_old[n];
+  }
+  if ((flags & (mesh::NODE_AXIS | kNodePoleAxisFlag)) != 0U) {
+    x_r[n] = 0.0;
   }
 }
 
@@ -2178,23 +3133,28 @@ void apply_axis_contact_guard(const char* phase,
   }
 }
 
-__global__ void pin_node_center_state_kernel(double* __restrict__ x_r,
-                                             double* __restrict__ x_z,
-                                             double* __restrict__ v_r,
-                                             double* __restrict__ v_z,
-                                             const std::uint8_t* __restrict__ node_flags,
-                                             const int n_begin,
-                                             const int n_end,
-                                             const int n_nodes) {
+__global__ void enforce_node_axis_state_kernel(
+    double* __restrict__ x_r,
+    double* __restrict__ x_z,
+    double* __restrict__ v_r,
+    double* __restrict__ v_z,
+    const std::uint8_t* __restrict__ node_flags,
+    const int n_begin,
+    const int n_end,
+    const int n_nodes) {
   const int n = n_begin + blockIdx.x * blockDim.x + threadIdx.x;
-  if (n >= n_end || node_flags == nullptr ||
-      (node_flags[n] & kNodeCenterFlag) == 0U) {
+  if (n >= n_end || node_flags == nullptr) {
     return;
   }
-  x_r[n] = 0.0;
-  x_z[n] = 0.0;
-  v_r[n] = 0.0;
-  v_z[n] = 0.0;
+  const std::uint8_t flags = node_flags[n];
+  if ((flags & kNodeCenterFlag) != 0U) {
+    x_r[n] = 0.0;
+    x_z[n] = 0.0;
+    v_r[n] = 0.0;
+  } else if ((flags & (mesh::NODE_AXIS | kNodePoleAxisFlag)) != 0U) {
+    x_r[n] = 0.0;
+    v_r[n] = 0.0;
+  }
 }
 
 __global__ void zero_axis_z_position_velocity_kernel(double* __restrict__ pos_v_z,
@@ -2390,6 +3350,9 @@ __global__ void apply_compatible_energy_work_kernel(
     const double* __restrict__ visc_heat_i,
     const double* __restrict__ visc_heat_e,
     const std::int8_t* __restrict__ hydro_active,
+    const std::uint8_t* __restrict__ central_member_mask,
+    const std::uint8_t* __restrict__ central_passive_mask,
+    const std::uint8_t* __restrict__ pole_member_mask,
     const int c_begin,
     const int c_end,
     const int n_cells,
@@ -2400,6 +3363,10 @@ __global__ void apply_compatible_energy_work_kernel(
     int* __restrict__ cold_fallback_cell) {
   const int c = c_begin + blockIdx.x * blockDim.x + threadIdx.x;
   if (c >= c_end) {
+    return;
+  }
+  if (floor_clamp_excluded(c, central_member_mask, central_passive_mask,
+                           pole_member_mask)) {
     return;
   }
   if (hydro_active != nullptr && hydro_active[c] == 0) {
@@ -2537,6 +3504,9 @@ __global__ void energy_update_with_old_volume_kernel(
     const double* __restrict__ P_half,
     const double* __restrict__ Q_half,
     const std::int8_t* __restrict__ hydro_active,
+    const std::uint8_t* __restrict__ central_member_mask,
+    const std::uint8_t* __restrict__ central_passive_mask,
+    const std::uint8_t* __restrict__ pole_member_mask,
     const int c_begin,
     const int c_end,
     const int n_cells,
@@ -2544,6 +3514,10 @@ __global__ void energy_update_with_old_volume_kernel(
     int* __restrict__ clamp_count) {
   const int c = c_begin + blockIdx.x * blockDim.x + threadIdx.x;
   if (c >= c_end) {
+    return;
+  }
+  if (floor_clamp_excluded(c, central_member_mask, central_passive_mask,
+                           pole_member_mask)) {
     return;
   }
 
@@ -2589,6 +3563,9 @@ __global__ void energy_update_with_old_volume_2t_kernel(
     const double* __restrict__ Q_half,
     const double* __restrict__ zbar,
     const std::int8_t* __restrict__ hydro_active,
+    const std::uint8_t* __restrict__ central_member_mask,
+    const std::uint8_t* __restrict__ central_passive_mask,
+    const std::uint8_t* __restrict__ pole_member_mask,
     const int c_begin,
     const int c_end,
     const int n_cells,
@@ -2606,6 +3583,10 @@ __global__ void energy_update_with_old_volume_2t_kernel(
     int* __restrict__ clamp_count) {
   const int c = c_begin + blockIdx.x * blockDim.x + threadIdx.x;
   if (c >= c_end) {
+    return;
+  }
+  if (floor_clamp_excluded(c, central_member_mask, central_passive_mask,
+                           pole_member_mask)) {
     return;
   }
 
@@ -2727,6 +3708,8 @@ void apply_compatible_energy_work_2d(core::State& state,
              "Hydro2D compatible energy init cold fallback cell failed");
 
   const core::State::LaunchWindow cw = state.owned_cell_window(n_cells);
+  const FloorClampExclusionMasks exclusion_masks =
+      floor_clamp_exclusion_masks(state);
   if (visc_split) {
     apply_compatible_energy_work_kernel<1><<<cw.blocks(), 256>>>(
         state.ee.data(),
@@ -2741,6 +3724,9 @@ void apply_compatible_energy_work_2d(core::State& state,
         state.visc_heat_rate_per_cell.data(),
         state.visc_heat_rate_e_per_cell.data(),
         d_hydro_active,
+        exclusion_masks.central_member,
+        exclusion_masks.central_passive,
+        exclusion_masks.pole_member,
         cw.begin,
         cw.end,
         n_cells,
@@ -2763,6 +3749,9 @@ void apply_compatible_energy_work_2d(core::State& state,
         nullptr,
         nullptr,
         d_hydro_active,
+        exclusion_masks.central_member,
+        exclusion_masks.central_passive,
+        exclusion_masks.pole_member,
         cw.begin,
         cw.end,
         n_cells,
@@ -2785,6 +3774,95 @@ void apply_compatible_energy_work_2d(core::State& state,
                     std::to_string(cold_fallback_cell) + " step=" +
                     std::to_string(state.step));
   }
+  {
+    BandWorkAudit& audit = band_work_audit();
+    const double t_now = state.t;
+    if (audit.enabled && t_now >= audit.t_lo && t_now <= audit.t_hi) {
+      const int n_nodes = static_cast<int>(state.x_r.size());
+      std::vector<double> h_xr(static_cast<std::size_t>(n_nodes));
+      std::vector<double> h_xz(static_cast<std::size_t>(n_nodes));
+      if (!audit.captured) {
+        cuda_check(cudaMemcpy(h_xr.data(), state.x_r.data(),
+                              sizeof(double) * h_xr.size(),
+                              cudaMemcpyDeviceToHost),
+                   "band work audit: x_r D2H failed");
+        cuda_check(cudaMemcpy(h_xz.data(), state.x_z.data(),
+                              sizeof(double) * h_xz.size(),
+                              cudaMemcpyDeviceToHost),
+                   "band work audit: x_z D2H failed");
+        TENRYU_ASSERT(state.mesh.topo.multiblock.has_value(),
+                      "band work audit requires multiblock topology");
+        const auto& mb = *state.mesh.topo.multiblock;
+        for (int c = 0; c < n_cells; ++c) {
+          const int off = mb.cell_node_csr_offsets[static_cast<std::size_t>(c)];
+          const int end =
+              mb.cell_node_csr_offsets[static_cast<std::size_t>(c) + 1];
+          double cr = 0.0;
+          double cz = 0.0;
+          for (int p = off; p < end; ++p) {
+            const int n = mb.cell_node_csr_indices[static_cast<std::size_t>(p)];
+            cr += h_xr[static_cast<std::size_t>(n)];
+            cz += h_xz[static_cast<std::size_t>(n)];
+          }
+          const double inv = 1.0 / static_cast<double>(end - off);
+          const double s_c = std::hypot(cr * inv, cz * inv);
+          if (s_c >= audit.s_lo && s_c <= audit.s_hi) {
+            audit.cells.push_back(c);
+            audit.s_capture.push_back(s_c);
+          }
+        }
+        audit.captured = true;
+        audit.fp = std::fopen(audit.path.c_str(), "w");
+        if (audit.fp == nullptr) {
+          core::log_warning("band work audit: cannot open output path; "
+                            "audit disabled");
+          audit.enabled = false;
+        } else {
+          std::fprintf(audit.fp,
+                       "# call_seq step t dt cell s_capture_cm work_p "
+                       "work_sub work_av rho\n");
+          core::log_info("band work audit: captured " +
+                         std::to_string(audit.cells.size()) +
+                         " cells in band");
+        }
+      }
+      if (audit.enabled && !audit.cells.empty()) {
+        std::vector<double> h_wp(static_cast<std::size_t>(n_cells));
+        std::vector<double> h_ws(static_cast<std::size_t>(n_cells));
+        std::vector<double> h_wa(static_cast<std::size_t>(n_cells));
+        std::vector<double> h_rho(static_cast<std::size_t>(n_cells));
+        cuda_check(cudaMemcpy(h_wp.data(), state.work_p_per_cell.data(),
+                              sizeof(double) * h_wp.size(),
+                              cudaMemcpyDeviceToHost),
+                   "band work audit: work_p D2H failed");
+        cuda_check(cudaMemcpy(h_ws.data(), state.work_sub_per_cell.data(),
+                              sizeof(double) * h_ws.size(),
+                              cudaMemcpyDeviceToHost),
+                   "band work audit: work_sub D2H failed");
+        cuda_check(cudaMemcpy(h_wa.data(), state.work_av_per_cell.data(),
+                              sizeof(double) * h_wa.size(),
+                              cudaMemcpyDeviceToHost),
+                   "band work audit: work_av D2H failed");
+        cuda_check(cudaMemcpy(h_rho.data(), state.rho.data(),
+                              sizeof(double) * h_rho.size(),
+                              cudaMemcpyDeviceToHost),
+                   "band work audit: rho D2H failed");
+        audit.call_seq += 1;
+        for (std::size_t k = 0; k < audit.cells.size(); ++k) {
+          const int c = audit.cells[k];
+          std::fprintf(audit.fp,
+                       "%ld %d %.17e %.9e %d %.9e %.9e %.9e %.9e %.9e\n",
+                       audit.call_seq, state.step, t_now, dt, c,
+                       audit.s_capture[k],
+                       h_wp[static_cast<std::size_t>(c)],
+                       h_ws[static_cast<std::size_t>(c)],
+                       h_wa[static_cast<std::size_t>(c)],
+                       h_rho[static_cast<std::size_t>(c)]);
+        }
+        std::fflush(audit.fp);
+      }
+    }
+  }
 }
 
 __global__ void energy_update_with_old_volume_2t_per_material_kernel(
@@ -2805,6 +3883,9 @@ __global__ void energy_update_with_old_volume_2t_per_material_kernel(
     const tenryu::materials::DeviceEOSTableView* __restrict__ ion_views,
     const Hydro2DMaterialParams* __restrict__ params,
     const std::int8_t* __restrict__ hydro_active,
+    const std::uint8_t* __restrict__ central_member_mask,
+    const std::uint8_t* __restrict__ central_passive_mask,
+    const std::uint8_t* __restrict__ pole_member_mask,
     const int n_cells,
     const int n_mat,
     const double te_floor,
@@ -2824,6 +3905,10 @@ __global__ void energy_update_with_old_volume_2t_per_material_kernel(
 
   const int c = idx / n_mat;
   const int m = idx - c * n_mat;
+  if (floor_clamp_excluded(c, central_member_mask, central_passive_mask,
+                           pole_member_mask)) {
+    return;
+  }
   if (hydro_active != nullptr && hydro_active[c] == 0) {
     return;
   }
@@ -3220,6 +4305,295 @@ std::vector<double> copy_field_to_vector(const Field& field) {
   return host;
 }
 
+struct StructuredAwShadowProjectionStorage {
+  core::DeviceArray<double> rho_axis_raw;
+  core::DeviceArray<double> rho_partner_raw;
+  core::DeviceArray<double> rho_projected;
+  core::DeviceArray<double> merit;
+  core::DeviceArray<double> x_merit;
+
+  void reset(const std::size_t n_cells) {
+    rho_axis_raw.reset(2U * n_cells);
+    rho_partner_raw.reset(2U * n_cells);
+    rho_projected.reset(2U * n_cells);
+    merit.reset(n_cells);
+    x_merit.reset(n_cells);
+  }
+
+  SubzonalPressureProjectionDebugBuffers device_buffers() {
+    return SubzonalPressureProjectionDebugBuffers{
+        rho_axis_raw.data(),
+        rho_partner_raw.data(),
+        rho_projected.data(),
+        merit.data(),
+        x_merit.data(),
+    };
+  }
+};
+
+bool emit_structured_aw_shadow_replay(
+    core::State& state,
+    const core::Config& cfg,
+    const HydroEOSContext* const eos_ctx,
+    const std::int8_t* const d_hydro_active,
+    const bool aw_axis_slave_theta0_active,
+    const bool aw_axis_slave_theta_pi_active,
+    const StructuredAwShadowProjectionStorage& projection_storage) {
+  constexpr double pi =
+      3.141592653589793238462643383279502884;
+  const int nr = state.mesh.topo.nr;
+  const int nz = state.mesh.topo.nz;
+  const int n_radial = nr * (nz + 1);
+  const int n_edges = n_radial + (nr + 1) * nz;
+  const std::size_t n_cells =
+      static_cast<std::size_t>(nr) * static_cast<std::size_t>(nz);
+  const std::size_t n_nodes =
+      static_cast<std::size_t>(nr + 1) *
+      static_cast<std::size_t>(nz + 1);
+  if (nr <= 0 || nz <= 0 || state.rho.size() != n_cells ||
+      state.x_r.size() != n_nodes || state.v_r.size() != n_nodes ||
+      state.v_z.size() != n_nodes ||
+      state.edge_force_av_r.size() != static_cast<std::size_t>(n_edges) ||
+      state.edge_force_av_z.size() != static_cast<std::size_t>(n_edges) ||
+      state.mass.size() != n_cells ||
+      state.work_p_per_cell.size() != n_cells ||
+      state.work_sub_per_cell.size() != n_cells ||
+      state.work_av_per_cell.size() != n_cells) {
+    core::log_warning(
+        "[shadow-replay] skipped=invalid-structured-compatible-layout");
+    return false;
+  }
+
+  sync_kernel("Hydro2D structured AW shadow replay pre-copy failed");
+  const std::vector<double> edge_force_r =
+      copy_field_to_vector(state.edge_force_av_r);
+  const std::vector<double> edge_force_z =
+      copy_field_to_vector(state.edge_force_av_z);
+  const std::vector<double> velocity_r =
+      copy_field_to_vector(state.v_r);
+  const std::vector<double> velocity_z =
+      copy_field_to_vector(state.v_z);
+  const std::vector<double> x_r = copy_field_to_vector(state.x_r);
+  const std::vector<double> cell_mass =
+      copy_field_to_vector(state.mass);
+  const std::vector<double> work_p =
+      copy_field_to_vector(state.work_p_per_cell);
+  const std::vector<double> work_sub =
+      copy_field_to_vector(state.work_sub_per_cell);
+  const std::vector<double> work_av =
+      copy_field_to_vector(state.work_av_per_cell);
+
+  struct AvClassAccum {
+    std::size_t n_edges = 0U;
+    long double sum_force_magnitude = 0.0L;
+    long double edot_rz = 0.0L;
+  };
+  enum AvClass : int {
+    Axisline = 0,
+    Pq = 1,
+    QqRadial = 2,
+    Other = 3,
+  };
+  const std::array<const char*, 4> class_name = {
+      "AXISLINE", "PQ", "QQ_RADIAL", "OTHER"};
+  std::array<AvClassAccum, 4> av_class{};
+  const int node_stride = nz + 1;
+  for (int e = 0; e < n_edges; ++e) {
+    int n0 = -1;
+    int n1 = -1;
+    AvClass edge_class = Other;
+    if (e < n_radial) {
+      const int i = e / (nz + 1);
+      const int j = e - i * (nz + 1);
+      n0 = i * node_stride + j;
+      n1 = (i + 1) * node_stride + j;
+      if ((aw_axis_slave_theta0_active && j == 0) ||
+          (aw_axis_slave_theta_pi_active && j == nz)) {
+        edge_class = Axisline;
+      } else if (j == 1 || j == nz - 1) {
+        edge_class = QqRadial;
+      }
+    } else {
+      const int angular_edge = e - n_radial;
+      const int i = angular_edge / nz;
+      const int j = angular_edge - i * nz;
+      n0 = i * node_stride + j;
+      n1 = i * node_stride + j + 1;
+      if (j == 0 || j == nz - 1) {
+        edge_class = Pq;
+      }
+    }
+
+    const double fr = edge_force_r[static_cast<std::size_t>(e)];
+    const double fz = edge_force_z[static_cast<std::size_t>(e)];
+    const double w0r =
+        2.0 * pi * x_r[static_cast<std::size_t>(n0)];
+    const double w1r =
+        2.0 * pi * x_r[static_cast<std::size_t>(n1)];
+    const double dv_r =
+        w1r * velocity_r[static_cast<std::size_t>(n1)] -
+        w0r * velocity_r[static_cast<std::size_t>(n0)];
+    const double dv_z =
+        w1r * velocity_z[static_cast<std::size_t>(n1)] -
+        w0r * velocity_z[static_cast<std::size_t>(n0)];
+    const double edge_edot = -(fr * dv_r + fz * dv_z);
+    AvClassAccum& accum = av_class[static_cast<std::size_t>(edge_class)];
+    ++accum.n_edges;
+    accum.sum_force_magnitude +=
+        static_cast<long double>(std::hypot(fr, fz));
+    accum.edot_rz += static_cast<long double>(edge_edot);
+  }
+  for (std::size_t k = 0; k < av_class.size(); ++k) {
+    std::ostringstream os;
+    os << "[shadow-av] class=" << class_name[k]
+       << " n_edges=" << av_class[k].n_edges
+       << " sum|f|="
+       << format_scientific(
+              static_cast<double>(av_class[k].sum_force_magnitude))
+       << " Edot_rz="
+       << format_scientific(static_cast<double>(av_class[k].edot_rz));
+    core::log_info(os.str());
+  }
+  core::log_info(
+      "[shadow-av-identity] Edot_axisline=" +
+      format_scientific(
+          static_cast<double>(av_class[Axisline].edot_rz)));
+
+  const std::array<int, 6> requested_columns = {
+      0, 1, 2, nz - 3, nz - 2, nz - 1};
+  std::vector<int> wedge_columns;
+  for (const int j : requested_columns) {
+    if (j >= 0 && j < nz &&
+        std::find(wedge_columns.begin(), wedge_columns.end(), j) ==
+            wedge_columns.end()) {
+      wedge_columns.push_back(j);
+    }
+  }
+  for (int i = std::max(0, nr - 3); i < nr; ++i) {
+    for (const int j : wedge_columns) {
+      const std::size_t c =
+          static_cast<std::size_t>(i * nz + j);
+      const double mass = cell_mass[c];
+      const double inv_mass =
+          mass != 0.0
+              ? 1.0 / mass
+              : std::numeric_limits<double>::quiet_NaN();
+      std::ostringstream os;
+      os << "[shadow-wedge] i=" << i
+         << " j=" << j
+         << " m_rz=" << format_scientific(mass)
+         << " work_av=" << format_scientific(work_av[c])
+         << " work_sub=" << format_scientific(work_sub[c])
+         << " work_p=" << format_scientific(work_p[c])
+         << " edot_av=" << format_scientific(work_av[c] * inv_mass)
+         << " edot_sub=" << format_scientific(work_sub[c] * inv_mass)
+         << " edot_p=" << format_scientific(work_p[c] * inv_mass);
+      core::log_info(os.str());
+    }
+  }
+
+  const SubzonalPressureShadowReplay subzonal_replay =
+      compute_compatible_subzonal_pressure_shadow_replay_2d(
+          state,
+          cfg,
+          eos_ctx,
+          d_hydro_active,
+          aw_axis_slave_theta0_active,
+          aw_axis_slave_theta_pi_active);
+  const auto subzonal_edot =
+      [&](const int c,
+          const std::vector<double>& force_r,
+          const std::vector<double>& force_z) {
+        const int i = c / nz;
+        const int j = c - i * nz;
+        const int nodes[4] = {
+            i * node_stride + j,
+            (i + 1) * node_stride + j,
+            (i + 1) * node_stride + j + 1,
+            i * node_stride + j + 1,
+        };
+        long double edot = 0.0L;
+        for (int k = 0; k < 4; ++k) {
+          const std::size_t corner =
+              static_cast<std::size_t>(4 * c + k);
+          const std::size_t node =
+              static_cast<std::size_t>(nodes[k]);
+          edot -=
+              static_cast<long double>(2.0 * pi * x_r[node]) *
+              static_cast<long double>(
+                  force_r[corner] * velocity_r[node] +
+                  force_z[corner] * velocity_z[node]);
+        }
+        return static_cast<double>(edot);
+      };
+  const std::array<int, 2> shadow_wedge_columns = {0, nz - 1};
+  for (int i = 0; i < nr; ++i) {
+    for (int pole = 0; pole < 2; ++pole) {
+      const int j = shadow_wedge_columns[static_cast<std::size_t>(pole)];
+      if (pole == 1 && j == shadow_wedge_columns[0]) {
+        continue;
+      }
+      const int c = i * nz + j;
+      const double axis_source_edot =
+          subzonal_edot(c,
+                        subzonal_replay.axis_source_force_r,
+                        subzonal_replay.axis_source_force_z);
+      const double offaxis_source_edot =
+          subzonal_edot(c,
+                        subzonal_replay.offaxis_source_force_r,
+                        subzonal_replay.offaxis_source_force_z);
+      std::ostringstream os;
+      os << "[shadow-sz] i=" << i
+         << " j=" << j
+         << " Edot_axis_source="
+         << format_scientific(axis_source_edot)
+         << " Edot_offaxis_source="
+         << format_scientific(offaxis_source_edot);
+      core::log_info(os.str());
+    }
+  }
+
+  std::vector<double> rho_axis_raw;
+  std::vector<double> rho_partner_raw;
+  std::vector<double> rho_projected;
+  std::vector<double> merit;
+  std::vector<double> x_merit;
+  projection_storage.rho_axis_raw.copy_to_host(rho_axis_raw);
+  projection_storage.rho_partner_raw.copy_to_host(rho_partner_raw);
+  projection_storage.rho_projected.copy_to_host(rho_projected);
+  projection_storage.merit.copy_to_host(merit);
+  projection_storage.x_merit.copy_to_host(x_merit);
+  const std::array<const char*, 2> pair_name = {"inner", "outer"};
+  for (int i = 0; i < nr; ++i) {
+    for (int pole = 0; pole < 2; ++pole) {
+      const int j = shadow_wedge_columns[static_cast<std::size_t>(pole)];
+      if (pole == 1 && j == shadow_wedge_columns[0]) {
+        continue;
+      }
+      const std::size_t c =
+          static_cast<std::size_t>(i * nz + j);
+      for (int pair = 0; pair < 2; ++pair) {
+        const std::size_t pair_index = 2U * c +
+            static_cast<std::size_t>(pair);
+        std::ostringstream os;
+        os << "[shadow-rho] i=" << i
+           << " j=" << j
+           << " rho_axis_raw="
+           << format_scientific(rho_axis_raw[pair_index])
+           << " rho_partner_raw="
+           << format_scientific(rho_partner_raw[pair_index])
+           << " rho_projected="
+           << format_scientific(rho_projected[pair_index])
+           << " merit=" << format_scientific(merit[c])
+           << " x_merit=" << format_scientific(x_merit[c])
+           << " pair=" << pair_name[static_cast<std::size_t>(pair)];
+        core::log_info(os.str());
+      }
+    }
+  }
+  return true;
+}
+
 bool shell_drive_sym_diag_env_flag_enabled(const char* const name) {
   const char* const raw = std::getenv(name);
   if (raw == nullptr) {
@@ -3496,7 +4870,7 @@ ShellDriveSymNodeRow shell_drive_sym_outer_node_row(
       return row;
     }
     const mesh::BlockInfo& shell =
-        mesh::mesh_topo_multiblock_polar_shell_block(
+        mesh::mesh_topo_multiblock_outermost_polar_shell_block(
             *state.mesh.topo.multiblock);
     if (shell.owned_node_begin < 0 || shell.n_i_cells <= 0 ||
         shell.n_j_cells <= 0) {
@@ -3504,7 +4878,9 @@ ShellDriveSymNodeRow shell_drive_sym_outer_node_row(
     }
     row.valid = true;
     row.multiblock = true;
-    row.node_begin = shell.owned_node_begin;
+    row.node_begin =
+        mesh::mesh_topo_multiblock_outermost_polar_shell_node_offset(
+            state.mesh.topo);
     row.stride = shell.n_j_cells + 1;
     row.local_i = shell.n_i_cells;
     row.n_j = shell.n_j_cells;
@@ -3561,10 +4937,16 @@ void assemble_shell_drive_force_2d(core::NodeField1D& force_r,
   if (p_ext_out != nullptr) {
     *p_ext_out = p_ext;
   }
+  const auto& pcfg =
+      cfg.numerics.hydro.pressure_drive_perturbation;
+  PressureDrivePerturbationParams pp{};
+  if (pcfg.enabled) {
+    pp = core::make_pressure_drive_perturbation_params(pcfg);
+  }
   const bool rz_exact_endpoint =
       state.mesh.logical == mesh::LogicalMesh2D::SphericalPolarHalfplane;
   if (mesh::mesh_topo_is_multiblock(cfg.mesh)) {
-    mesh::mesh_topo_assert_multiblock_polar_shell_outer_boundary(
+    mesh::mesh_topo_assert_multiblock_outermost_polar_shell_outer_boundary(
         state.mesh.topo);
     core::NodeField1D diag_node_mass;
     if (state.corner_mass_initialized &&
@@ -3588,13 +4970,16 @@ void assemble_shell_drive_force_2d(core::NodeField1D& force_r,
         force_z.data(),
         state.x_r.data(),
         state.x_z.data(),
-        mesh::mesh_topo_multiblock_polar_shell_node_offset(state.mesh.topo),
-        mesh::mesh_topo_multiblock_polar_shell_nr(state.mesh.topo),
-        mesh::mesh_topo_multiblock_polar_shell_nz(state.mesh.topo),
+        mesh::mesh_topo_multiblock_outermost_polar_shell_node_offset(
+            state.mesh.topo),
+        mesh::mesh_topo_multiblock_outermost_polar_shell_nr(state.mesh.topo),
+        mesh::mesh_topo_multiblock_outermost_polar_shell_nz(state.mesh.topo),
         p_ext,
         rz_exact_endpoint,
         diag_node_mass.empty() ? nullptr : diag_node_mass.data(),
-        cfg.numerics.hydro.rz_momentum_scheme_id);
+        cfg.numerics.hydro.rz_momentum_scheme_id,
+        pp,
+        pcfg.enabled);
   } else {
     detail::launch_r_outer_boundary_pressure_forces(
         force_r.data(),
@@ -3605,12 +4990,452 @@ void assemble_shell_drive_force_2d(core::NodeField1D& force_r,
         state.mesh.topo.nz,
         p_ext,
         rz_exact_endpoint,
-        cfg.numerics.hydro.rz_momentum_scheme_id);
+        cfg.numerics.hydro.rz_momentum_scheme_id,
+        pp,
+        pcfg.enabled);
   }
   sync_kernel("Hydro2D shell_drive_sym drive-force assembly failed");
 }
 
 }  // namespace
+
+__global__ void evac_contact_row_hold_sweep_test_kernel(
+    double* v_r,
+    double* v_z,
+    const double* node_mass_resolved,
+    const int* row_nodes,
+    const double* row_xi,
+    const double* row_normal,
+    double* row_dk,
+    int n_rows) {
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    evac_contact_row_hold_sweep(
+        v_r, v_z, node_mass_resolved, row_nodes, row_xi, row_normal, row_dk,
+        n_rows);
+  }
+}
+
+void launch_evac_contact_row_hold_sweep_for_test(
+    double* const d_v_r,
+    double* const d_v_z,
+    const double* const d_node_mass,
+    const int* const d_row_nodes,
+    const double* const d_row_xi,
+    const double* const d_row_normal,
+    double* const d_row_dk,
+    const int n_rows) {
+  evac_contact_row_hold_sweep_test_kernel<<<1, 1>>>(
+      d_v_r, d_v_z, d_node_mass, d_row_nodes, d_row_xi, d_row_normal,
+      d_row_dk, n_rows);
+  cuda_check(cudaDeviceSynchronize(),
+             "Hydro2D evacuated contact row-hold test kernel failed");
+}
+
+__global__ void evac_contact_union_velocity_sweep_test_kernel(
+    double* v_r,
+    double* v_z,
+    const double* node_mass_resolved,
+    const int* pair_nodes,
+    const double* pair_normal,
+    const std::uint8_t* pair_row_covered,
+    double* pair_dk,
+    int n_pairs,
+    const int* row_nodes,
+    const double* row_xi,
+    const double* row_normal,
+    double* row_dk,
+    int n_rows) {
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    evac_contact_union_velocity_sweep(
+        v_r, v_z, node_mass_resolved, pair_nodes, pair_normal,
+        pair_row_covered, pair_dk, n_pairs, row_nodes, row_xi, row_normal,
+        row_dk, n_rows);
+  }
+}
+
+void launch_evac_contact_union_velocity_sweep_for_test(
+    double* const d_v_r,
+    double* const d_v_z,
+    const double* const d_node_mass,
+    const int* const d_pair_nodes,
+    const double* const d_pair_normal,
+    const std::uint8_t* const d_pair_row_covered,
+    double* const d_pair_dk,
+    const int n_pairs,
+    const int* const d_row_nodes,
+    const double* const d_row_xi,
+    const double* const d_row_normal,
+    double* const d_row_dk,
+    const int n_rows) {
+  evac_contact_union_velocity_sweep_test_kernel<<<1, 1>>>(
+      d_v_r, d_v_z, d_node_mass, d_pair_nodes, d_pair_normal,
+      d_pair_row_covered, d_pair_dk, n_pairs, d_row_nodes, d_row_xi,
+      d_row_normal, d_row_dk, n_rows);
+  cuda_check(cudaDeviceSynchronize(),
+             "Hydro2D evacuated contact union test kernel failed");
+}
+
+void launch_apply_compatible_energy_work_2d(
+    core::State& state,
+    const core::Config& cfg,
+    const core::CellField1D& Pe_half,
+    const core::CellField1D& Pi_half,
+    const bool use_two_temp,
+    const double dt,
+    const std::int8_t* const hydro_active,
+    double* const E_floor_injected,
+    int* const clamp_count,
+    const bool force_enabled) {
+  apply_compatible_energy_work_2d(
+      state, cfg, force_enabled, Pe_half, Pi_half, use_two_temp, dt, hydro_active,
+      E_floor_injected, clamp_count);
+}
+
+void launch_update_node_velocity_2d(
+    double* const v_r,
+    double* const v_z,
+    const double* const old_v_r,
+    const double* const old_v_z,
+    const double* const a_r,
+    const double* const a_z,
+    const std::uint8_t* const node_active,
+    const std::uint8_t* const node_flags,
+    const int n_nodes,
+    const double scale_dt,
+    core::State& state,
+    const core::Config& cfg) {
+  double* node_accel_r = nullptr;
+  double* node_accel_z = nullptr;
+  if (cfg.numerics.dt.edge_accel_displacement_cfl_enabled) {
+    const std::size_t node_count = state.v_r.size();
+    if (state.node_accel_r.size() != node_count ||
+        state.node_accel_z.size() != node_count) {
+      state.node_accel_r.reset(node_count);
+      state.node_accel_z.reset(node_count);
+      state.node_accel_r.fill(0.0);
+      state.node_accel_z.fill(0.0);
+      // The first initialized state is zero, so before an acceleration sample
+      // is stored the guard reduces to its velocity-only displacement bound.
+    }
+    node_accel_r = state.node_accel_r.data();
+    node_accel_z = state.node_accel_z.data();
+  }
+  const core::State::LaunchWindow nw = state.owned_node_window(n_nodes);
+  update_node_velocity_2d_kernel<<<nw.blocks(), 256>>>(
+      v_r, v_z, old_v_r, old_v_z, a_r, a_z, node_active, node_flags, nw.begin,
+      nw.end, n_nodes, scale_dt, node_accel_r, node_accel_z);
+}
+
+void launch_apply_aw_axis_velocity_slave_2d(
+    double* const v_r,
+    double* const v_z,
+    const double* const x_r,
+    const double* const x_z,
+    double* const kappa_saved,
+    const int nr,
+    const int nz,
+    const int first_axis_i,
+    const bool theta0_axis_active,
+    const bool theta_pi_axis_active,
+    const bool capture_kappa) {
+  if (first_axis_i < 0 || first_axis_i > nr || nz < 2 ||
+      (!theta0_axis_active && !theta_pi_axis_active)) {
+    return;
+  }
+  const int axis_node_count = nr - first_axis_i + 1;
+  const int blocks = (axis_node_count + 255) / 256;
+  apply_aw_axis_velocity_slave_2d_kernel<<<blocks, 256>>>(
+      v_r, v_z, x_r, x_z, kappa_saved, nr, nz, first_axis_i,
+      theta0_axis_active, theta_pi_axis_active, capture_kappa);
+}
+
+void launch_snap_aw_axis_coordinates_2d(
+    double* const x_r,
+    double* const x_z,
+    const double* const kappa_saved,
+    const int nr,
+    const int nz,
+    const int first_axis_i,
+    const bool theta0_axis_active,
+    const bool theta_pi_axis_active) {
+  if (first_axis_i < 0 || first_axis_i > nr || nz < 2 ||
+      (!theta0_axis_active && !theta_pi_axis_active)) {
+    return;
+  }
+  const int axis_node_count = nr - first_axis_i + 1;
+  const int blocks = (axis_node_count + 255) / 256;
+  snap_aw_axis_coordinates_2d_kernel<<<blocks, 256>>>(
+      x_r, x_z, kappa_saved, nr, nz, first_axis_i, theta0_axis_active,
+      theta_pi_axis_active);
+}
+
+AwAxisSlaveMasterList build_aw_axis_slave_master_list_multiblock(
+    const core::State& state,
+    const core::Config& cfg) {
+  AwAxisSlaveMasterList master;
+  if (!state.mesh.topo.multiblock.has_value() ||
+      !mesh::mesh_topo_polar_tier_family(cfg.mesh)) {
+    return master;
+  }
+
+  const mesh::MultiBlockTopology& mb = *state.mesh.topo.multiblock;
+  const int n_nodes = state.mesh.topo.n_nodes;
+  const int n_aw_axis_prefix_nodes =
+      mesh::mesh_topo_has_polar_tier_cart_center(cfg.mesh)
+          ? mesh::mesh_topo_n_aw_axis_prefix_nodes(mb)
+          : n_nodes;
+  const int n_cells = state.mesh.topo.n_cells;
+  const int corner_stride = state.corner_stride;
+  TENRYU_ASSERT(n_nodes >= 0 && n_cells >= 0,
+                "AW axis master list requires non-negative topology sizes");
+  TENRYU_ASSERT(state.mesh.topo.node_flags.size() ==
+                    static_cast<std::size_t>(n_nodes),
+                "AW axis master list requires node flags");
+  TENRYU_ASSERT(state.x_r_initial.size() ==
+                    static_cast<std::size_t>(n_nodes),
+                "AW axis master list requires all initial node coordinates");
+  TENRYU_ASSERT(state.corner_mass_initialized &&
+                    state.corner_mass.size() ==
+                        static_cast<std::size_t>(n_cells) *
+                            static_cast<std::size_t>(corner_stride),
+                "AW axis master list requires initialized corner masses");
+  TENRYU_ASSERT(mb.cell_node_csr_offsets.size() ==
+                    static_cast<std::size_t>(n_cells) + 1U &&
+                    mb.cell_node_csr_indices.size() ==
+                        static_cast<std::size_t>(n_cells) *
+                            static_cast<std::size_t>(corner_stride),
+                "AW axis master list requires stride-sized cell-node CSR");
+
+  std::vector<double> host_initial_r(
+      static_cast<std::size_t>(n_nodes), 0.0);
+  std::vector<double> corner_mass(
+      static_cast<std::size_t>(n_cells) *
+          static_cast<std::size_t>(corner_stride),
+      0.0);
+  state.x_r_initial.copy_to_host(host_initial_r.data());
+  state.corner_mass.copy_to_host(corner_mass.data());
+
+  std::vector<double> planar_mass(static_cast<std::size_t>(n_nodes), 0.0);
+  for (int c = 0; c < n_cells; ++c) {
+    const int off = mb.cell_node_csr_offsets[static_cast<std::size_t>(c)];
+    const int nverts =
+        mesh::mesh_topo_cell_active_nverts(state.mesh.cell_nverts, c);
+    for (int corner = 0; corner < nverts; ++corner) {
+      const int node =
+          mb.cell_node_csr_indices[static_cast<std::size_t>(off + corner)];
+      const double contribution =
+          corner_mass[static_cast<std::size_t>(c) *
+                          static_cast<std::size_t>(corner_stride) +
+                      static_cast<std::size_t>(corner)];
+      TENRYU_ASSERT(node >= 0 && node < n_nodes,
+                    "AW axis master list CSR node out of range");
+      TENRYU_ASSERT(std::isfinite(contribution) && contribution >= 0.0,
+                    "AW axis master list corner mass must be finite non-negative");
+      planar_mass[static_cast<std::size_t>(node)] += contribution;
+    }
+  }
+
+  std::vector<std::vector<int>> candidates(
+      static_cast<std::size_t>(n_nodes));
+  const auto add_candidate = [&](const int p, const int q) {
+    TENRYU_ASSERT(p >= 0 && p < n_nodes && q >= 0 && q < n_nodes,
+                  "AW axis master candidate node out of range");
+    if (p >= n_aw_axis_prefix_nodes) {
+      return;
+    }
+    const std::uint8_t flags =
+        state.mesh.topo.node_flags[static_cast<std::size_t>(p)];
+    if ((flags & mesh::NODE_POLE_AXIS) == 0U ||
+        (flags & mesh::NODE_CENTER) != 0U ||
+        host_initial_r[static_cast<std::size_t>(p)] != 0.0) {
+      return;
+    }
+    TENRYU_ASSERT(host_initial_r[static_cast<std::size_t>(q)] > 0.0,
+                  "AW axis master candidate must be first off-axis node");
+    candidates[static_cast<std::size_t>(p)].push_back(q);
+  };
+
+  for (const mesh::BlockInfo& block : mb.blocks) {
+    if (block.role != mesh::BlockRole::POLAR_SHELL &&
+        block.role != mesh::BlockRole::POLAR_TIER) {
+      continue;
+    }
+    TENRYU_ASSERT(block.n_i_cells > 0 && block.n_j_cells >= 2 &&
+                      block.cell_count ==
+                          block.n_i_cells * block.n_j_cells,
+                  "AW axis master list requires structured polar block dimensions");
+    for (int i = 0; i < block.n_i_cells; ++i) {
+      const int north_cell =
+          block.cell_begin + i * block.n_j_cells;
+      const int south_cell =
+          north_cell + block.n_j_cells - 1;
+      const int north_off =
+          mb.cell_node_csr_offsets[static_cast<std::size_t>(north_cell)];
+      const int south_off =
+          mb.cell_node_csr_offsets[static_cast<std::size_t>(south_cell)];
+      const auto north = [&](const int corner) {
+        return mb.cell_node_csr_indices[
+            static_cast<std::size_t>(north_off + corner)];
+      };
+      const auto south = [&](const int corner) {
+        return mb.cell_node_csr_indices[
+            static_cast<std::size_t>(south_off + corner)];
+      };
+      add_candidate(north(0), north(1));
+      add_candidate(north(3), north(2));
+      add_candidate(south(1), south(0));
+      add_candidate(south(2), south(3));
+    }
+  }
+
+  for (std::size_t block_id = 0; block_id < mb.blocks.size(); ++block_id) {
+    const mesh::BlockInfo& block = mb.blocks[block_id];
+    if ((block.role != mesh::BlockRole::TRANSITION_BELT &&
+         block.role != mesh::BlockRole::BRIDGE) ||
+        (block.role == mesh::BlockRole::TRANSITION_BELT &&
+         block.n_i_cells < 2)) {
+      continue;
+    }
+    for (int cell = block.cell_begin;
+         cell < block.cell_begin + block.cell_count; ++cell) {
+      const int nverts =
+          mesh::mesh_topo_cell_active_nverts(state.mesh.cell_nverts, cell);
+      const int off =
+          mb.cell_node_csr_offsets[static_cast<std::size_t>(cell)];
+      for (int k = 0; k < nverts; ++k) {
+        const int p =
+            mb.cell_node_csr_indices[static_cast<std::size_t>(off + k)];
+        if (host_initial_r[static_cast<std::size_t>(p)] != 0.0) {
+          continue;
+        }
+        // For a structured quad with its theta=0 edge on the axis, winding
+        // adjacency reproduces exactly (0,1)/(3,2) north and (1,0)/(2,3)
+        // south pairs, extending the same geometric rule to belt polygons.
+        const int next =
+            mb.cell_node_csr_indices[
+                static_cast<std::size_t>(off + (k + 1) % nverts)];
+        if (host_initial_r[static_cast<std::size_t>(next)] > 0.0) {
+          add_candidate(p, next);
+        }
+        const int prev =
+            mb.cell_node_csr_indices[static_cast<std::size_t>(
+                off + (k - 1 + nverts) % nverts)];
+        if (host_initial_r[static_cast<std::size_t>(prev)] > 0.0) {
+          add_candidate(p, prev);
+        }
+      }
+    }
+  }
+
+  std::vector<int> fallback_axis_nodes;
+  for (int p = 0; p < n_aw_axis_prefix_nodes; ++p) {
+    const std::uint8_t flags =
+        state.mesh.topo.node_flags[static_cast<std::size_t>(p)];
+    if ((flags & mesh::NODE_POLE_AXIS) != 0U &&
+        (flags & mesh::NODE_CENTER) == 0U &&
+        host_initial_r[static_cast<std::size_t>(p)] == 0.0 &&
+        candidates[static_cast<std::size_t>(p)].empty()) {
+      fallback_axis_nodes.push_back(p);
+    }
+  }
+
+  for (std::size_t block_id = 0; block_id < mb.blocks.size(); ++block_id) {
+    const mesh::BlockInfo& block = mb.blocks[block_id];
+    if (block.role != mesh::BlockRole::TRANSITION_BELT ||
+        block.n_i_cells != 1) {
+      continue;
+    }
+    for (int cell = block.cell_begin;
+         cell < block.cell_begin + block.cell_count; ++cell) {
+      const int nverts =
+          mesh::mesh_topo_cell_active_nverts(state.mesh.cell_nverts, cell);
+      const int off =
+          mb.cell_node_csr_offsets[static_cast<std::size_t>(cell)];
+      for (int k = 0; k < nverts; ++k) {
+        const int p =
+            mb.cell_node_csr_indices[static_cast<std::size_t>(off + k)];
+        if (host_initial_r[static_cast<std::size_t>(p)] != 0.0 ||
+            !std::binary_search(fallback_axis_nodes.begin(),
+                                fallback_axis_nodes.end(), p)) {
+          continue;
+        }
+        const int next =
+            mb.cell_node_csr_indices[
+                static_cast<std::size_t>(off + (k + 1) % nverts)];
+        if (host_initial_r[static_cast<std::size_t>(next)] > 0.0) {
+          add_candidate(p, next);
+        }
+        const int prev =
+            mb.cell_node_csr_indices[static_cast<std::size_t>(
+                off + (k - 1 + nverts) % nverts)];
+        if (host_initial_r[static_cast<std::size_t>(prev)] > 0.0) {
+          add_candidate(p, prev);
+        }
+      }
+    }
+  }
+
+  for (int p = 0; p < n_aw_axis_prefix_nodes; ++p) {
+    const std::uint8_t flags =
+        state.mesh.topo.node_flags[static_cast<std::size_t>(p)];
+    if ((flags & mesh::NODE_POLE_AXIS) == 0U ||
+        (flags & mesh::NODE_CENTER) != 0U ||
+        host_initial_r[static_cast<std::size_t>(p)] != 0.0) {
+      continue;
+    }
+    std::vector<int>& peer = candidates[static_cast<std::size_t>(p)];
+    std::sort(peer.begin(), peer.end());
+    peer.erase(std::unique(peer.begin(), peer.end()), peer.end());
+    TENRYU_ASSERT(!peer.empty(),
+                  "AW axis master list found axis node without angular peer");
+    int best_q = peer.front();
+    double best_mass = planar_mass[static_cast<std::size_t>(best_q)];
+    for (const int q : peer) {
+      const double mass = planar_mass[static_cast<std::size_t>(q)];
+      if (mass > best_mass || (mass == best_mass && q < best_q)) {
+        best_q = q;
+        best_mass = mass;
+      }
+    }
+    master.p.push_back(p);
+    master.q.push_back(best_q);
+  }
+  return master;
+}
+
+void launch_apply_aw_axis_velocity_slave_2d_multiblock(
+    double* const v_r,
+    double* const v_z,
+    const double* const x_r,
+    const double* const x_z,
+    double* const kappa_saved,
+    const int* const axis_slave_p,
+    const int* const axis_slave_q,
+    const int pair_count,
+    const bool capture_kappa) {
+  if (pair_count <= 0) {
+    return;
+  }
+  const int blocks = (pair_count + 255) / 256;
+  apply_aw_axis_velocity_slave_2d_multiblock_kernel<<<blocks, 256>>>(
+      v_r, v_z, x_r, x_z, kappa_saved, axis_slave_p, axis_slave_q,
+      pair_count, capture_kappa);
+}
+
+void launch_snap_aw_axis_coordinates_2d_multiblock(
+    double* const x_r,
+    double* const x_z,
+    const double* const kappa_saved,
+    const int* const axis_slave_p,
+    const int* const axis_slave_q,
+    const int pair_count) {
+  if (pair_count <= 0) {
+    return;
+  }
+  const int blocks = (pair_count + 255) / 256;
+  snap_aw_axis_coordinates_2d_multiblock_kernel<<<blocks, 256>>>(
+      x_r, x_z, kappa_saved, axis_slave_p, axis_slave_q, pair_count);
+}
 
 // Verdict-#7 E2: one-step pressure-force / geometry audit. On the CURRENT
 // mesh, assemble the drive force at a plateau pressure and test the
@@ -3913,11 +5738,12 @@ void accumulate_drive_work_ledger(const core::State& state,
   if (theta_enabled) {
     if (mesh::mesh_topo_is_multiblock(cfg.mesh)) {
       const int begin =
-          mesh::mesh_topo_multiblock_polar_shell_node_offset(state.mesh.topo);
+          mesh::mesh_topo_multiblock_outermost_polar_shell_node_offset(
+              state.mesh.topo);
       const int nr_shell =
-          mesh::mesh_topo_multiblock_polar_shell_nr(state.mesh.topo);
+          mesh::mesh_topo_multiblock_outermost_polar_shell_nr(state.mesh.topo);
       const int nz_polar =
-          mesh::mesh_topo_multiblock_polar_shell_nz(state.mesh.topo);
+          mesh::mesh_topo_multiblock_outermost_polar_shell_nz(state.mesh.topo);
       theta_base = static_cast<long long>(begin) +
                    static_cast<long long>(nr_shell) * (nz_polar + 1);
       theta_cols = nz_polar + 1;
@@ -4244,11 +6070,37 @@ double finite_signed_ratio_or_zero(const double current, const double reference)
   return std::isfinite(ratio) ? ratio : 0.0;
 }
 
+// Sign of the planar signed area of cell c's quad, read from the BASE
+// coordinates. The trial volume below is shoelace-family and flips sign
+// with the node winding (spherical-polar meshes are clockwise-wound); the
+// base-quad orientation is applied to every trial volume so that a winding
+// flip during the trial step still reads as a collapsed cell and is
+// rejected, matching rz_geometric_cfl. On positive-winding meshes the
+// factor is exactly 1.0 and the limiter is bit-identical.
+double quad_winding_orientation_from_nodes(const std::vector<double>& r,
+                                           const std::vector<double>& z,
+                                           const int nz,
+                                           const int c) {
+  const int i = c / nz;
+  const int j = c - i * nz;
+  const int stride = nz + 1;
+  const int n[4] = {i * stride + j, (i + 1) * stride + j,
+                    (i + 1) * stride + (j + 1), i * stride + (j + 1)};
+  double a2 = 0.0;
+  for (int k = 0; k < 4; ++k) {
+    const int kp = (k + 1) & 3;
+    a2 += r[static_cast<std::size_t>(n[k])] * z[static_cast<std::size_t>(n[kp])] -
+          r[static_cast<std::size_t>(n[kp])] * z[static_cast<std::size_t>(n[k])];
+  }
+  return (a2 >= 0.0) ? 1.0 : -1.0;
+}
+
 double rz_quad_volume_from_nodes(const std::vector<double>& r,
                                  const std::vector<double>& z,
                                  const int nr,
                                  const int nz,
-                                 const int c) {
+                                 const int c,
+                                 const double orientation) {
   (void)nr;
   const int i = c / nz;
   const int j = c - i * nz;
@@ -4277,7 +6129,7 @@ double rz_quad_volume_from_nodes(const std::vector<double>& r,
 
   constexpr double pi_over_three =
       1.0471975511965977461542144610931676280657231331250352736615;
-  return pi_over_three * vol_sum;
+  return orientation * (pi_over_three * vol_sum);
 }
 
 struct WorkSplitRowSummary {
@@ -4837,7 +6689,10 @@ TrialVolumeCflResult check_trial_lagrangian_volume_cfl_host(
         (*hydro_active)[static_cast<std::size_t>(c)] == 0) {
       continue;
     }
-    const double vol_trial = rz_quad_volume_from_nodes(r_trial, z_trial, nr, nz, c);
+    const double orientation =
+        quad_winding_orientation_from_nodes(r_base, z_base, nz, c);
+    const double vol_trial =
+        rz_quad_volume_from_nodes(r_trial, z_trial, nr, nz, c, orientation);
     const double denom = std::max(vol_current[static_cast<std::size_t>(c)], 1.0e-300);
     const double ratio = vol_trial / denom;
     local_min_ratio = std::min(local_min_ratio, ratio);
@@ -4903,7 +6758,8 @@ std::int8_t* upload_hydro_active(const char* pool_tag,
 std::vector<std::int8_t> make_central_macro_effective_active(
     const core::State& state) {
   if (!central_pseudo_core::active(state) &&
-      !pole_angular_derefine::active(state)) {
+      !pole_angular_derefine::active(state) &&
+      state.evacuated_cells.inactive_member_mask.empty()) {
     return {};
   }
   const int n_cells = static_cast<int>(state.rho.size());
@@ -4925,6 +6781,7 @@ std::vector<std::int8_t> make_central_macro_effective_active(
   };
   apply_inactive(state.central_pseudo_core.inactive_member_mask);
   apply_inactive(state.pole_angular_derefine.inactive_member_mask);
+  apply_inactive(state.evacuated_cells.inactive_member_mask);
   if (effective == state.hydro_active && state.hydro_active.empty()) {
     return {};
   }
@@ -4993,17 +6850,17 @@ std::uint8_t* upload_node_flags_if_constraints(const char* pool_tag,
                          : nullptr;
 }
 
-void pin_node_center_state(core::State& state,
-                           const std::uint8_t* d_node_flags) {
+void enforce_node_axis_state(core::State& state,
+                             const std::uint8_t* d_node_flags) {
   if (d_node_flags == nullptr) {
     return;
   }
   const int n_nodes = static_cast<int>(state.x_r.size());
   const core::State::LaunchWindow nw = state.owned_node_window(n_nodes);
-  pin_node_center_state_kernel<<<nw.blocks(), 256>>>(
+  enforce_node_axis_state_kernel<<<nw.blocks(), 256>>>(
       state.x_r.data(), state.x_z.data(), state.v_r.data(), state.v_z.data(),
       d_node_flags, nw.begin, nw.end, n_nodes);
-  sync_kernel("Hydro2D pin NODE_CENTER state kernel failed");
+  sync_kernel("Hydro2D enforce node axis state kernel failed");
 }
 
 void sync_state_supply_energy_from_temperature(core::State& state,
@@ -5013,6 +6870,12 @@ void sync_state_supply_energy_from_temperature(core::State& state,
   if (!has_state_supply_bc(cfg) || state.state_supply_mask.empty()) {
     return;
   }
+  const auto& b = cfg.numerics.hydro.boundary_2d;
+  const int bottom_active = b.z_bottom_cfg.supply_active(state.t) ? 1 : 0;
+  const int top_active = b.z_top_cfg.supply_active(state.t) ? 1 : 0;
+  if (bottom_active == 0 && top_active == 0) {
+    return;
+  }
   std::int8_t* d_mask = upload_hydro_active("h2d:state_supply_energy_mask",
                                             state.state_supply_mask);
   const int n_cells = static_cast<int>(state.rho.size());
@@ -5020,7 +6883,8 @@ void sync_state_supply_energy_from_temperature(core::State& state,
   const auto& mat = cfg.materials.materials.front();
   state_supply_energy_from_temperature_kernel<<<cw.blocks(), 256>>>(
       d_mask, state.ee.data(), state.ei.data(), state.rho.data(), state.zbar.data(),
-      state.Te.data(), state.Ti.data(), cw.begin, cw.end, n_cells,
+      state.Te.data(), state.Ti.data(), cw.begin, cw.end, state.mesh.topo.nz,
+      bottom_active, top_active,
       mat.ideal_gas_gamma, mat.A, mat.Z, cfg.numerics.floors.Te,
       cfg.numerics.floors.Ti,
       eos_views.tab_ion, eos_views.tab_ele, eos_views.tab_total, use_two_temp);
@@ -5036,9 +6900,86 @@ void upload_mesh_cache(const core::State& state, MeshDeviceCache& cache) {
   TENRYU_ASSERT(state.mesh.cell_Svec_r.size() == expected_svec_size &&
                     state.mesh.cell_Svec_z.size() == expected_svec_size,
                 "Hydro2D mesh cache Svec size mismatch");
-  cache.Svec_r = state.mesh.cell_Svec_r;
-  cache.Svec_z = state.mesh.cell_Svec_z;
-  cache.area = state.mesh.cell_area;
+  cache.Svec_r.reset(expected_svec_size);
+  cache.Svec_z.reset(expected_svec_size);
+  cache.area.reset(state.rho.size());
+  TENRYU_ASSERT(
+      state.mesh.cell_Svec_r_device.size() == expected_svec_size &&
+          state.mesh.cell_Svec_z_device.size() == expected_svec_size &&
+          state.mesh.cell_area_device.size() == state.rho.size(),
+      "Hydro2D mesh cache: device geometry size mismatch");
+  static const bool b1_diag = std::getenv("TENRYU_B1_DIAG") != nullptr;
+  if (b1_diag) {
+    const_cast<core::State&>(state).mesh.materialize_host_svec();
+    static int b1_diag_calls = 0;
+    ++b1_diag_calls;
+    std::vector<double> dev_svec_r(expected_svec_size);
+    std::vector<double> dev_svec_z(expected_svec_size);
+    std::vector<double> dev_area(state.rho.size());
+    cuda_check(cudaMemcpy(dev_svec_r.data(),
+                          state.mesh.cell_Svec_r_device.data(),
+                          expected_svec_size * sizeof(double),
+                          cudaMemcpyDeviceToHost),
+               "b1diag svec_r pull failed");
+    cuda_check(cudaMemcpy(dev_svec_z.data(),
+                          state.mesh.cell_Svec_z_device.data(),
+                          expected_svec_size * sizeof(double),
+                          cudaMemcpyDeviceToHost),
+               "b1diag svec_z pull failed");
+    cuda_check(cudaMemcpy(dev_area.data(),
+                          state.mesh.cell_area_device.data(),
+                          state.rho.size() * sizeof(double),
+                          cudaMemcpyDeviceToHost),
+               "b1diag area pull failed");
+    std::size_t n_diff_r = 0, n_diff_z = 0, n_diff_a = 0;
+    std::size_t first_r = 0, first_z = 0, first_a = 0;
+    for (std::size_t i = 0; i < expected_svec_size; ++i) {
+      if (dev_svec_r[i] != state.mesh.cell_Svec_r[i]) {
+        if (n_diff_r == 0) first_r = i;
+        ++n_diff_r;
+      }
+      if (dev_svec_z[i] != state.mesh.cell_Svec_z[i]) {
+        if (n_diff_z == 0) first_z = i;
+        ++n_diff_z;
+      }
+    }
+    for (std::size_t i = 0; i < dev_area.size(); ++i) {
+      if (dev_area[i] != state.mesh.cell_area[i]) {
+        if (n_diff_a == 0) first_a = i;
+        ++n_diff_a;
+      }
+    }
+    if (n_diff_r != 0 || n_diff_z != 0 || n_diff_a != 0) {
+      const int stride = state.mesh.corner_stride;
+      std::ostringstream os;
+      os << "[b1diag] call=" << b1_diag_calls
+         << " DIVERGED svec_r=" << n_diff_r << " (first idx " << first_r
+         << " cell " << (first_r / static_cast<std::size_t>(stride))
+         << " slot " << (first_r % static_cast<std::size_t>(stride))
+         << " dev=" << std::setprecision(17) << dev_svec_r[first_r]
+         << " host=" << state.mesh.cell_Svec_r[first_r] << ")"
+         << " svec_z=" << n_diff_z << " area=" << n_diff_a;
+      tenryu::core::log_warning(os.str());
+    } else {
+      tenryu::core::log_warning("[b1diag] call=" +
+                                std::to_string(b1_diag_calls) + " identical");
+    }
+  }
+  cuda_check(cudaMemcpy(cache.Svec_r.data(),
+                        state.mesh.cell_Svec_r_device.data(),
+                        expected_svec_size * sizeof(double),
+                        cudaMemcpyDeviceToDevice),
+             "Hydro2D mesh cache Svec_r D2D failed");
+  cuda_check(cudaMemcpy(cache.Svec_z.data(),
+                        state.mesh.cell_Svec_z_device.data(),
+                        expected_svec_size * sizeof(double),
+                        cudaMemcpyDeviceToDevice),
+             "Hydro2D mesh cache Svec_z D2D failed");
+  cuda_check(cudaMemcpy(cache.area.data(),
+                        state.mesh.cell_area_device.data(),
+                        state.rho.size() * sizeof(double),
+                        cudaMemcpyDeviceToDevice),
+             "Hydro2D mesh cache area D2D failed");
 }
 
 void apply_axis_motion_preflight(core::NodeField1D& v_r,
@@ -5267,13 +7208,41 @@ void populate_mesh_quality_dt_failure(
   result.failing_value = limit.sigma_safe;
   result.trial_scale = limit.sigma_safe;
   result.suggested_dt = std::max(cfg.numerics.dt.min_s, limit.suggested_dt);
+  int band = cfg.numerics.hydro.axis_guard_band_cells;
+  bool in_band = result.first_failing_i >= 0 && result.first_failing_i <= band;
   result.retry_action =
-      result.first_failing_i == 0
+      in_band
           ? tenryu::coupling::RetryActionHint::ForceAxisSpinePlusLocalAle
           : tenryu::coupling::RetryActionHint::ReduceDtOnly;
   if (result.first_failing_i == 0) {
     result.regime = MeshFailureRegime::AxisFace;
+  } else if (in_band) {
+    result.regime = MeshFailureRegime::AxisBand;
   }
+}
+
+void populate_path_guard_failure(
+    tenryu::coupling::HydroStepResult& result,
+    const core::State& state,
+    const core::Config& cfg,
+    const MeshQualityDtLimit& limit,
+    const tenryu::coupling::HydroFailureStage failure_stage,
+    const double full_step_dt) {
+  populate_mesh_quality_dt_failure(
+      result, state, cfg, limit, failure_stage);
+  const double dt_new = 0.5 * limit.sigma_safe * full_step_dt;
+  result.min_metric = limit.min_value;
+  result.failing_value = limit.min_value;
+  result.suggested_dt = dt_new;
+  result.retry_action = tenryu::coupling::RetryActionHint::ReduceDtOnly;
+  result.geometry_soft_failure.valid = true;
+  result.geometry_soft_failure.cell = limit.first_cell;
+  result.geometry_soft_failure.corner_or_slot =
+      limit.first_corner_or_gauss;
+  result.geometry_soft_failure.predicate =
+      mesh_quality_predicate_string(limit.metric);
+  result.geometry_soft_failure.min_value = limit.min_value;
+  result.geometry_soft_failure.sigma_safe = limit.sigma_safe;
 }
 
 bool multiblock_path_admissibility_precommit_enabled(
@@ -6065,7 +8034,8 @@ tenryu::coupling::HydroStepResult refresh_geometry_and_density_impl(
   tenryu::coupling::HydroStepResult result{};
   const bool retry_can_handle_geometry =
       cfg.numerics.hydro.driver_full_step_retry_enabled ||
-      tenryu::core::effective_mesh_geometry_soft_fail(cfg);
+      tenryu::core::effective_mesh_geometry_soft_fail(cfg) ||
+      i1b_path_guard_enabled();
   tenryu::mesh::MeshGeometryCheckOptions opts{};
   opts.policy = retry_can_handle_geometry
                     ? tenryu::mesh::MeshGeometryFailurePolicy::SoftReturn
@@ -6090,6 +8060,11 @@ tenryu::coupling::HydroStepResult refresh_geometry_and_density_impl(
       };
   combine_inactive_mask(state.central_pseudo_core.inactive_member_mask);
   combine_inactive_mask(state.pole_angular_derefine.inactive_member_mask);
+  // Evacuated cells stay SUBJECT to the geometry admissibility check (signed
+  // volume / inversion). Consultation #21 §7.1 exempts them only from QUALITY
+  // penalties, handled via the d_hydro_force_active channel. Measured incident:
+  // the inactive spacer at (0,283) was winslow-inverted when this check skipped
+  // it (ledger A474).
   if (!inactive_cell_mask.empty()) {
     opts.inactive_cell_mask = inactive_cell_mask.data();
   }
@@ -6107,7 +8082,18 @@ tenryu::coupling::HydroStepResult refresh_geometry_and_density_impl(
     }
     return result;
   }
-  state.vol = state.mesh.cell_vol;
+  if (state.vol.size() == 0) {
+    state.vol = state.mesh.cell_vol;  // one-time init sizing path
+  } else {
+    TENRYU_ASSERT(
+        state.mesh.cell_vol_device.size() == state.vol.size(),
+        "Hydro2D refresh: cell_vol_device/state.vol size mismatch");
+    cuda_check(cudaMemcpy(state.vol.data(),
+                          state.mesh.cell_vol_device.data(),
+                          state.vol.size() * sizeof(double),
+                          cudaMemcpyDeviceToDevice),
+               "Hydro2D refresh: cell_vol D2D failed");
+  }
 
   TENRYU_ASSERT(state.mass.size() == state.vol.size(),
                 "Hydro2D requires mass/volume size consistency");
@@ -6131,8 +8117,12 @@ tenryu::coupling::HydroStepResult refresh_geometry_and_density_impl(
                         static_cast<std::size_t>(n_cells) * sizeof(std::uint8_t),
                         cudaMemcpyHostToDevice),
              "Hydro2D: cudaMemcpy cell_is_void failed");
+  const FloorClampExclusionMasks exclusion_masks =
+      floor_clamp_exclusion_masks(state);
   compute_density_kernel<<<dw.blocks(), 256>>>(
       state.rho.data(), state.mass.data(), state.vol.data(), d_cell_is_void,
+      exclusion_masks.central_member, exclusion_masks.central_passive,
+      exclusion_masks.pole_member,
       dw.begin, dw.end, cw.begin, cw.end, n_cells, cfg.numerics.floors.rho,
       rho_clamp_count);
   sync_kernel("Hydro2D compute_density kernel failed");
@@ -6149,7 +8139,9 @@ void ensure_corner_mass_2d(core::State& state,
                            const int corner_mass_convention,
                            const bool canonical_subzonal_partition,
                            const bool force_recompute,
-                           const bool lagrangian_invariant) {
+                           const bool lagrangian_invariant,
+                           const bool aw_compatible_force_work,
+                           const bool polar_tier_equal_planar_area) {
   const int n_cells = static_cast<int>(state.mass.size());
   const std::size_t expected_size =
       static_cast<std::size_t>(n_cells) *
@@ -6190,9 +8182,18 @@ void ensure_corner_mass_2d(core::State& state,
         state.x_z.data(), state.mesh.multiblock_cell_node_csr_offsets.data(),
         state.mesh.multiblock_cell_node_csr_indices.data(), d_cell_nverts,
         rz::corner_mass_fallback_device_recorder(), cw.begin, cw.end,
-        n_cells, lagrangian_invariant, state.corner_stride);
+        n_cells, lagrangian_invariant, polar_tier_equal_planar_area,
+        state.corner_stride);
     sync_kernel("Hydro2D compute_corner_mass_multiblock kernel failed");
   } else {
+    // A124(b) contract: SPEC §6.4 makes aw_compatible_force_work imply the
+    // canonical subzonal partition (P1), so a structured corner-mass request
+    // carrying the AW flag without it can only come from a direct-built
+    // config that bypassed namelist validation — and would select a
+    // partition no validated deck can reach. Fail loudly instead.
+    TENRYU_ASSERT(!aw_compatible_force_work || canonical_subzonal_partition,
+                  "Hydro2D structured corner mass: aw_compatible_force_work "
+                  "requires the canonical subzonal partition (A124b)");
     // Option C: cache corner masses for the ghost i-planes too — the
     // interface node-mass scatter reads them, and for the Lagrangian-
     // invariant cache the ghost copies stay exactly equal to the
@@ -6209,7 +8210,8 @@ void ensure_corner_mass_2d(core::State& state,
         d_cell_nverts, rz::corner_mass_fallback_device_recorder(),
         corner_mass_convention, canonical_subzonal_partition, fw.begin,
         fw.end, state.mesh.topo.nr, state.mesh.topo.nz,
-        button_outer_node_ring, state.corner_stride);
+        aw_compatible_force_work, button_outer_node_ring,
+        state.corner_stride);
     sync_kernel("Hydro2D compute_corner_mass kernel failed");
   }
   state.corner_mass_initialized = true;
@@ -6301,6 +8303,7 @@ void launch_compute_node_mass_2d(double* const node_mass,
 
 void launch_compute_node_planar_mass_2d(
     core::State& state,
+    const std::uint8_t* const d_cell_nverts,
     const std::int8_t* const d_hydro_active,
     const int blocks_cells) {
   state.node_planar_mass.reset(state.x_r.size());
@@ -6308,22 +8311,30 @@ void launch_compute_node_planar_mass_2d(
                         state.node_planar_mass.size() * sizeof(double)),
              "Hydro2D zero node planar mass failed");
   if (state.mesh.topo.multiblock.has_value()) {
-    TENRYU_ASSERT(
-        std::all_of(state.mesh.cell_nverts.begin(),
-                    state.mesh.cell_nverts.end(),
-                    [](const std::uint8_t nverts) { return nverts == 4U; }),
-        "area_weighted_symmetric v1 requires all-quad meshes (tri-fan caps unsupported)");
     const int n_nodes = static_cast<int>(state.x_r.size());
     const int blocks_nodes = (n_nodes + 255) / 256;
-    compute_node_planar_mass_2d_multiblock_kernel<<<blocks_nodes, 256>>>(
-        state.node_planar_mass.data(), state.rho.data(), state.x_r.data(),
-        state.x_z.data(),
-        state.mesh.multiblock_reverse_csr_node_offsets.data(),
-        state.mesh.multiblock_reverse_csr_node_cells.data(),
-        state.mesh.multiblock_reverse_csr_node_corners.data(),
-        state.mesh.multiblock_cell_node_csr_offsets.data(),
-        state.mesh.multiblock_cell_node_csr_indices.data(), d_hydro_active,
-        n_nodes);
+    if (state.mesh.corner_stride <= mesh::kMeshTopoCellStorageSlotsMax) {
+      compute_node_planar_mass_2d_multiblock_kernel<<<blocks_nodes, 256>>>(
+          state.node_planar_mass.data(), state.rho.data(), state.x_r.data(),
+          state.x_z.data(),
+          state.mesh.multiblock_reverse_csr_node_offsets.data(),
+          state.mesh.multiblock_reverse_csr_node_cells.data(),
+          state.mesh.multiblock_reverse_csr_node_corners.data(),
+          state.mesh.multiblock_cell_node_csr_offsets.data(),
+          state.mesh.multiblock_cell_node_csr_indices.data(), d_cell_nverts,
+          d_hydro_active, n_nodes);
+    } else {
+      compute_node_planar_mass_2d_multiblock_kernel<
+          mesh::kMeshTopoCellStorageSlotsMaxGeneral><<<blocks_nodes, 256>>>(
+          state.node_planar_mass.data(), state.rho.data(), state.x_r.data(),
+          state.x_z.data(),
+          state.mesh.multiblock_reverse_csr_node_offsets.data(),
+          state.mesh.multiblock_reverse_csr_node_cells.data(),
+          state.mesh.multiblock_reverse_csr_node_corners.data(),
+          state.mesh.multiblock_cell_node_csr_offsets.data(),
+          state.mesh.multiblock_cell_node_csr_indices.data(), d_cell_nverts,
+          d_hydro_active, n_nodes);
+    }
   } else {
     compute_node_planar_mass_2d_kernel<<<blocks_cells, 256>>>(
         state.node_planar_mass.data(), state.rho.data(), state.x_r.data(),
@@ -6358,6 +8369,11 @@ void launch_compute_accel_from_force_2d(
           accel_r, accel_z, force_r, force_z, node_mass.data(),
           state.node_planar_mass.data(), d_node_active, d_node_flags, nw.begin,
           nw.end, n_nodes);
+      if (d_node_flags != nullptr) {
+        aggregate_center_axial_accel_kernel<<<1, 1>>>(
+            accel_r, accel_z, force_z, state.node_planar_mass.data(),
+            d_node_flags, d_node_active, nw.begin, nw.end);
+      }
       break;
     default:
       TENRYU_ASSERT(false, "Hydro2D invalid resolved RZ momentum scheme");
@@ -6403,6 +8419,150 @@ void launch_apply_boundary_accel_constraints(
         static_cast<int>(z_top_type));
   }
 }
+
+void launch_apply_evac_contact_accel_constraints(
+    core::State& state,
+    double* const accel_r,
+    double* const accel_z,
+    const double* const node_mass_resolved) {
+  const int n_pairs = state.evacuated_cells.n_active_pairs;
+  if (n_pairs <= 0) {
+    return;
+  }
+  apply_evac_contact_accel_constraints_kernel<<<1, 1>>>(
+      accel_r,
+      accel_z,
+      node_mass_resolved,
+      state.evacuated_cells.d_contact_pair_nodes.data(),
+      state.evacuated_cells.d_contact_pair_normal.data(),
+      state.evacuated_cells.d_contact_pair_lambda.data(),
+      n_pairs);
+}
+
+void launch_apply_evac_contact_velocity_constraints(
+    core::State& state,
+    double* const v_r,
+    double* const v_z,
+    const double* const node_mass_resolved,
+    const double* const x_r,
+    const double* const x_z,
+    const double* const cell_sound_speed,
+    const std::int8_t* const hydro_active,
+    const double dt,
+    double* const pair_dk_accum,
+    const double mortar_position_drift_beta) {
+  const int n_pairs = state.evacuated_cells.n_active_pairs;
+  const int n_rows = state.evacuated_cells.n_contact_rows;
+  if (n_pairs <= 0 && n_rows <= 0) {
+    return;
+  }
+  const int n_active_cells =
+      state.evacuated_cells.n_contact_active_cells;
+  TENRYU_ASSERT(
+      (n_pairs <= 0 && n_active_cells == 0) ||
+          (n_active_cells > 0 && cell_sound_speed != nullptr &&
+           state.evacuated_cells.d_inactive_member_mask.size() ==
+               static_cast<std::size_t>(state.mesh.topo.n_cells) &&
+           state.evacuated_cells.d_contact_active_cells.size() ==
+               static_cast<std::size_t>(n_active_cells) &&
+           state.evacuated_cells.d_contact_active_axis.size() ==
+               static_cast<std::size_t>(n_active_cells) &&
+           state.evacuated_cells.d_contact_face_nodes.size() ==
+               4U * static_cast<std::size_t>(n_active_cells) &&
+           state.evacuated_cells.d_contact_face_normal_ref.size() ==
+               2U * static_cast<std::size_t>(n_active_cells) &&
+           state.evacuated_cells.d_contact_face_g0.size() ==
+               static_cast<std::size_t>(n_active_cells) &&
+           state.evacuated_cells.d_contact_mortar_g_hold.size() ==
+               core::kEvacContactMortarRowCapacity *
+                   static_cast<std::size_t>(n_active_cells) &&
+           state.evacuated_cells.d_contact_mortar_g_hold_valid.size() ==
+               core::kEvacContactMortarRowCapacity *
+                   static_cast<std::size_t>(n_active_cells) &&
+           state.evacuated_cells.d_contact_mortar_drift_count.size() == 3U &&
+           state.evacuated_cells.d_contact_mortar_drift_max_ucorr.size() == 1U &&
+           state.evacuated_cells.d_contact_active_vol_at_engagement.size() ==
+               static_cast<std::size_t>(n_active_cells) &&
+           (state.evacuated_cells.d_contact_active_devolumized.size() == 0U ||
+            state.evacuated_cells.d_contact_active_devolumized.size() ==
+                static_cast<std::size_t>(n_active_cells)) &&
+           state.evacuated_cells.d_contact_active_pair_dk_owner.size() ==
+               static_cast<std::size_t>(n_active_cells) &&
+           state.evacuated_cells.d_contact_volume_projection_count.size() ==
+               2U),
+      "Hydro2D evacuated-cell contact active device state mismatch");
+  TENRYU_ASSERT(
+      n_rows <= 0 ||
+          (state.evacuated_cells.d_contact_row_nodes.size() ==
+               3U * static_cast<std::size_t>(n_rows) &&
+           state.evacuated_cells.d_contact_row_xi.size() ==
+               static_cast<std::size_t>(n_rows) &&
+           state.evacuated_cells.d_contact_row_normal.size() ==
+               2U * static_cast<std::size_t>(n_rows) &&
+           state.evacuated_cells.d_contact_row_dk.size() ==
+               static_cast<std::size_t>(n_rows)),
+      "Hydro2D evacuated-cell contact row device state mismatch");
+  TENRYU_ASSERT(
+      state.evacuated_cells.d_node_axis_alias.size() == 0U ||
+          state.evacuated_cells.d_node_axis_alias.size() ==
+              static_cast<std::size_t>(state.mesh.topo.n_nodes),
+      "Hydro2D evacuated-cell node axis alias device state mismatch");
+  apply_evac_contact_velocity_constraints_kernel<<<1, 1>>>(
+      v_r,
+      v_z,
+      node_mass_resolved,
+      x_r,
+      x_z,
+      cell_sound_speed,
+      state.evacuated_cells.d_inactive_member_mask.data(),
+      hydro_active,
+      n_pairs > 0 ? state.evacuated_cells.d_contact_pair_nodes.data()
+                  : nullptr,
+      n_pairs > 0 ? state.evacuated_cells.d_contact_pair_normal.data()
+                  : nullptr,
+      state.evacuated_cells.d_contact_pair_row_covered.size() ==
+              static_cast<std::size_t>(n_pairs)
+          ? state.evacuated_cells.d_contact_pair_row_covered.data()
+          : nullptr,
+      n_pairs > 0 ? pair_dk_accum : nullptr,
+      n_pairs,
+      dt,
+      state.evacuated_cells.d_contact_active_cells.data(),
+      state.evacuated_cells.d_contact_active_axis.data(),
+      state.evacuated_cells.d_contact_face_nodes.data(),
+      state.evacuated_cells.d_contact_face_normal_ref.data(),
+      state.evacuated_cells.d_contact_face_g0.data(),
+      state.evacuated_cells.d_contact_active_vol_at_engagement.data(),
+      state.evacuated_cells.d_contact_active_devolumized.size() != 0U
+          ? state.evacuated_cells.d_contact_active_devolumized.data()
+          : nullptr,
+      state.evacuated_cells.d_contact_active_pair_dk_owner.data(),
+      state.evacuated_cells.d_contact_mortar_g_hold.data(),
+      state.evacuated_cells.d_contact_mortar_g_hold_valid.data(),
+      mortar_position_drift_beta,
+      state.evacuated_cells.d_contact_mortar_drift_count.data(),
+      state.evacuated_cells.d_contact_mortar_drift_max_ucorr.data(),
+      state.evacuated_cells.d_contact_volume_projection_count.data(),
+      n_active_cells,
+      state.mesh.topo.nr,
+      state.mesh.topo.nz,
+      state.evacuated_cells.d_node_axis_alias.size() != 0U
+          ? state.evacuated_cells.d_node_axis_alias.data()
+          : nullptr,
+      n_rows > 0 ? state.evacuated_cells.d_contact_row_nodes.data()
+                 : nullptr,
+      n_rows > 0 ? state.evacuated_cells.d_contact_row_xi.data() : nullptr,
+      n_rows > 0 ? state.evacuated_cells.d_contact_row_normal.data()
+                 : nullptr,
+      n_rows > 0 ? state.evacuated_cells.d_contact_row_dk.data() : nullptr,
+      n_rows > 0 ? n_rows : 0);
+  // The constraint kernel writes the resolved surviving node only, so re-synchronize fused pair velocities before subsequent position integration.
+  enforce_node_axis_aliases(state);
+}
+
+}  // namespace
+
+namespace {
 
 void enforce_1t_closure(
     core::State& state,
@@ -6598,6 +8758,677 @@ bool trace_cell_nodes(const core::State& state,
   return true;
 }
 
+struct AxisWallCornerRef {
+  int cell = -1;
+  int index = -1;
+};
+
+struct AxisWallEdgeRef {
+  int edge = -1;
+  int cell_a = -1;
+  int cell_b = -1;
+  double sign = 0.0;
+};
+
+struct AxisWallNodeScatter {
+  int node = -1;
+  std::vector<AxisWallCornerRef> corners;
+  std::vector<AxisWallEdgeRef> edges;
+};
+
+struct AxisWallWatch {
+  int cell = -1;
+  int active_nverts = 0;
+  std::array<AxisWallNodeScatter, 4> nodes;
+  bool topology_ready = false;
+  bool initial_area_set = false;
+  double initial_area = 0.0;
+};
+
+const std::vector<int>& axiswall_diag_cell_ids() {
+  static const std::vector<int> cells = [] {
+    std::vector<int> parsed;
+    const char* const raw = std::getenv("TENRYU_AXISWALL_DIAG");
+    if (raw == nullptr || raw[0] == '\0') {
+      return parsed;
+    }
+    const char* token = raw;
+    while (*token != '\0') {
+      const char* token_end = token;
+      while (*token_end != '\0' && *token_end != ',') {
+        ++token_end;
+      }
+      char* parsed_end = nullptr;
+      const long value = std::strtol(token, &parsed_end, 10);
+      const char* trailing = parsed_end;
+      while (trailing < token_end &&
+             std::isspace(static_cast<unsigned char>(*trailing)) != 0) {
+        ++trailing;
+      }
+      if (parsed_end != token && trailing == token_end && value >= 0 &&
+          value <= std::numeric_limits<int>::max()) {
+        const int cell = static_cast<int>(value);
+        if (std::find(parsed.begin(), parsed.end(), cell) == parsed.end()) {
+          parsed.push_back(cell);
+        }
+      }
+      token = (*token_end == ',') ? token_end + 1 : token_end;
+    }
+    return parsed;
+  }();
+  return cells;
+}
+
+int axiswall_diag_every() {
+  static const int every = [] {
+    const char* const raw = std::getenv("TENRYU_AXISWALL_DIAG_EVERY");
+    if (raw == nullptr || raw[0] == '\0') {
+      return 100;
+    }
+    char* end = nullptr;
+    const long value = std::strtol(raw, &end, 10);
+    return end != raw && *end == '\0' && value > 0 &&
+                   value <= std::numeric_limits<int>::max()
+               ? static_cast<int>(value)
+               : 100;
+  }();
+  return every;
+}
+
+std::vector<AxisWallWatch>& axiswall_diag_watches() {
+  static std::vector<AxisWallWatch> watches = [] {
+    std::vector<AxisWallWatch> out;
+    for (const int cell : axiswall_diag_cell_ids()) {
+      AxisWallWatch watch;
+      watch.cell = cell;
+      out.push_back(std::move(watch));
+    }
+    return out;
+  }();
+  return watches;
+}
+
+bool axiswall_cell_active(const std::vector<std::int8_t>& hydro_active,
+                          const int cell) {
+  return cell >= 0 &&
+         (hydro_active.empty() ||
+          (static_cast<std::size_t>(cell) < hydro_active.size() &&
+           hydro_active[static_cast<std::size_t>(cell)] != 0));
+}
+
+bool axiswall_multiblock_face_nodes(const core::State& state,
+                                    const mesh::UniqueOrientedFace& face,
+                                    int* node0,
+                                    int* node1) {
+  if (!state.mesh.topo.multiblock.has_value() || face.cell_a < 0 ||
+      face.cell_a >= static_cast<int>(state.rho.size())) {
+    return false;
+  }
+  const auto& mb = *state.mesh.topo.multiblock;
+  const int active_nverts =
+      mesh::mesh_topo_cell_active_nverts(state.mesh.cell_nverts, face.cell_a);
+  int corner0 = -1;
+  int corner1 = -1;
+  if (active_nverts == 4) {
+    if (face.local_a == 0) {
+      corner0 = 0;
+      corner1 = 3;
+    } else if (face.local_a == 1) {
+      corner0 = 1;
+      corner1 = 2;
+    } else if (face.local_a == 2) {
+      corner0 = 0;
+      corner1 = 1;
+    } else if (face.local_a == 3) {
+      corner0 = 3;
+      corner1 = 2;
+    } else {
+      return false;
+    }
+  } else if (!mesh::mesh_topo_active_local_face_corners(
+                 active_nverts, face.local_a, &corner0, &corner1)) {
+    return false;
+  }
+  if (mb.cell_node_csr_offsets.size() <
+      static_cast<std::size_t>(face.cell_a + 2)) {
+    return false;
+  }
+  const int off =
+      mb.cell_node_csr_offsets[static_cast<std::size_t>(face.cell_a)];
+  if (off < 0 ||
+      static_cast<std::size_t>(off + std::max(corner0, corner1)) >=
+          mb.cell_node_csr_indices.size()) {
+    return false;
+  }
+  *node0 =
+      mb.cell_node_csr_indices[static_cast<std::size_t>(off + corner0)];
+  *node1 =
+      mb.cell_node_csr_indices[static_cast<std::size_t>(off + corner1)];
+  return true;
+}
+
+void axiswall_add_edge_ref(AxisWallWatch& watch,
+                           const int edge,
+                           const int node0,
+                           const int node1,
+                           const int cell_a,
+                           const int cell_b) {
+  for (int k = 0; k < watch.active_nverts; ++k) {
+    auto& node = watch.nodes[static_cast<std::size_t>(k)];
+    if (node.node == node0) {
+      node.edges.push_back(AxisWallEdgeRef{edge, cell_a, cell_b, -1.0});
+    } else if (node.node == node1) {
+      node.edges.push_back(AxisWallEdgeRef{edge, cell_a, cell_b, 1.0});
+    }
+  }
+}
+
+void initialize_axiswall_watch_topology(AxisWallWatch& watch,
+                                        const core::State& state) {
+  int nodes[4] = {-1, -1, -1, -1};
+  int active_nverts = 0;
+  TENRYU_ASSERT(trace_cell_nodes(state, watch.cell, nodes, &active_nverts),
+                "TENRYU_AXISWALL_DIAG watched cell is out of range");
+  TENRYU_ASSERT(active_nverts == 3 || active_nverts == 4,
+                "TENRYU_AXISWALL_DIAG supports triangle/quad watched cells");
+  watch.active_nverts = active_nverts;
+  for (int k = 0; k < active_nverts; ++k) {
+    watch.nodes[static_cast<std::size_t>(k)].node = nodes[k];
+  }
+
+  const int n_cells = static_cast<int>(state.rho.size());
+  if (state.mesh.topo.multiblock.has_value()) {
+    const auto& mb = *state.mesh.topo.multiblock;
+    TENRYU_ASSERT(mb.cell_node_csr_offsets.size() ==
+                      static_cast<std::size_t>(n_cells) + 1U,
+                  "TENRYU_AXISWALL_DIAG requires multiblock cell-node CSR");
+    for (int cell = 0; cell < n_cells; ++cell) {
+      const int off =
+          mb.cell_node_csr_offsets[static_cast<std::size_t>(cell)];
+      const int nverts =
+          mesh::mesh_topo_cell_active_nverts(state.mesh.cell_nverts, cell);
+      TENRYU_ASSERT(off >= 0 &&
+                        static_cast<std::size_t>(off + nverts) <=
+                            mb.cell_node_csr_indices.size(),
+                    "TENRYU_AXISWALL_DIAG invalid multiblock cell-node CSR");
+      for (int corner = 0; corner < nverts; ++corner) {
+        const int node =
+            mb.cell_node_csr_indices[static_cast<std::size_t>(off + corner)];
+        for (int k = 0; k < active_nverts; ++k) {
+          if (watch.nodes[static_cast<std::size_t>(k)].node == node) {
+            watch.nodes[static_cast<std::size_t>(k)].corners.push_back(
+                AxisWallCornerRef{
+                    cell, cell * state.corner_stride + corner});
+          }
+        }
+      }
+    }
+    int edge = 0;
+    for (const auto& face : mb.unique_internal_faces) {
+      int node0 = -1;
+      int node1 = -1;
+      TENRYU_ASSERT(
+          axiswall_multiblock_face_nodes(state, face, &node0, &node1),
+          "TENRYU_AXISWALL_DIAG invalid multiblock internal face");
+      axiswall_add_edge_ref(
+          watch, edge, node0, node1, face.cell_a, face.cell_b);
+      ++edge;
+    }
+    for (const auto& face : mb.boundary_faces) {
+      int node0 = -1;
+      int node1 = -1;
+      TENRYU_ASSERT(
+          axiswall_multiblock_face_nodes(state, face, &node0, &node1),
+          "TENRYU_AXISWALL_DIAG invalid multiblock boundary face");
+      axiswall_add_edge_ref(watch, edge, node0, node1, face.cell_a, -1);
+      ++edge;
+    }
+  } else {
+    const int nr = state.mesh.topo.nr;
+    const int nz = state.mesh.topo.nz;
+    const int stride = nz + 1;
+    for (int cell = 0; cell < n_cells; ++cell) {
+      const int i = cell / nz;
+      const int j = cell - i * nz;
+      const int cell_nodes[4] = {
+          i * stride + j,
+          (i + 1) * stride + j,
+          (i + 1) * stride + (j + 1),
+          i * stride + (j + 1),
+      };
+      for (int corner = 0; corner < 4; ++corner) {
+        for (int k = 0; k < active_nverts; ++k) {
+          if (watch.nodes[static_cast<std::size_t>(k)].node ==
+              cell_nodes[corner]) {
+            watch.nodes[static_cast<std::size_t>(k)].corners.push_back(
+                AxisWallCornerRef{
+                    cell, cell * state.corner_stride + corner});
+          }
+        }
+      }
+    }
+    const int n_radial = nr * (nz + 1);
+    const int n_edges = n_radial + (nr + 1) * nz;
+    for (int edge = 0; edge < n_edges; ++edge) {
+      int node0 = -1;
+      int node1 = -1;
+      int cell_a = -1;
+      int cell_b = -1;
+      if (edge < n_radial) {
+        const int i = edge / (nz + 1);
+        const int j = edge - i * (nz + 1);
+        node0 = i * stride + j;
+        node1 = (i + 1) * stride + j;
+        if (j > 0) {
+          cell_a = i * nz + (j - 1);
+        }
+        if (j < nz) {
+          cell_b = i * nz + j;
+        }
+      } else {
+        const int angular = edge - n_radial;
+        const int i = angular / nz;
+        const int j = angular - i * nz;
+        node0 = i * stride + j;
+        node1 = i * stride + (j + 1);
+        if (i > 0) {
+          cell_a = (i - 1) * nz + j;
+        }
+        if (i < nr) {
+          cell_b = i * nz + j;
+        }
+      }
+      axiswall_add_edge_ref(
+          watch, edge, node0, node1, cell_a, cell_b);
+    }
+  }
+  watch.topology_ready = true;
+}
+
+std::uint8_t axiswall_copy_node_active(const std::uint8_t* values,
+                                       const int node) {
+  std::uint8_t out = 0U;
+  cuda_check(cudaMemcpy(&out,
+                        values + node,
+                        sizeof(std::uint8_t),
+                        cudaMemcpyDeviceToHost),
+             "Hydro2D axiswall copy node_active failed");
+  return out;
+}
+
+int axiswall_velocity_bc_mode(const Boundary2DType type) {
+  if (type == Boundary2DType::FIXED) {
+    return pole_axis::kVelocityBcFixed;
+  }
+  if (type == Boundary2DType::REFLECT) {
+    return pole_axis::kVelocityBcReflect;
+  }
+  if (type == Boundary2DType::STATE_SUPPLY) {
+    return pole_axis::kVelocityBcStateSupply;
+  }
+  return pole_axis::kVelocityBcFree;
+}
+
+void axiswall_remove_spherical_normal(double* vector_r,
+                                      double* vector_z,
+                                      const double r,
+                                      const double z) {
+  const double s = std::sqrt(r * r + z * z);
+  if (s > 0.0) {
+    const double inv_s = 1.0 / s;
+    const double normal_r = r * inv_s;
+    const double normal_z = z * inv_s;
+    const double normal_component =
+        *vector_r * normal_r + *vector_z * normal_z;
+    *vector_r -= normal_component * normal_r;
+    *vector_z -= normal_component * normal_z;
+  }
+}
+
+void axiswall_apply_multiblock_constraint(const core::State& state,
+                                          const core::Config& cfg,
+                                          const int node,
+                                          const double r,
+                                          const double z,
+                                          double* accel_r,
+                                          double* accel_z) {
+  if (state.mesh.topo.node_flags.size() <= static_cast<std::size_t>(node)) {
+    return;
+  }
+  const std::uint8_t flags =
+      state.mesh.topo.node_flags[static_cast<std::size_t>(node)];
+  if ((flags & kNodeCenterFlag) != 0U) {
+    *accel_r = 0.0;
+    *accel_z = 0.0;
+    return;
+  }
+  if ((flags & (mesh::NODE_AXIS | kNodePoleAxisFlag)) != 0U) {
+    *accel_r = 0.0;
+  }
+  if ((flags & mesh::NODE_INNER_PHYSICAL_BOUNDARY) != 0U) {
+    const Boundary2DType inner =
+        parse_boundary_2d_type(cfg.numerics.hydro.boundary_2d.r_inner);
+    if (inner == Boundary2DType::PINNED) {
+      *accel_r = 0.0;
+      *accel_z = 0.0;
+      return;
+    }
+    if (inner == Boundary2DType::AXIS) {
+      axiswall_remove_spherical_normal(accel_r, accel_z, r, z);
+      return;
+    }
+  }
+  if ((flags & mesh::NODE_OUTER_PHYSICAL_BOUNDARY) != 0U) {
+    const Boundary2DType outer =
+        parse_boundary_2d_type(cfg.numerics.hydro.boundary_2d.r_outer);
+    if (outer == Boundary2DType::FIXED) {
+      *accel_r = 0.0;
+      *accel_z = 0.0;
+    } else if (outer == Boundary2DType::REFLECT ||
+               outer == Boundary2DType::STATE_SUPPLY ||
+               (outer != Boundary2DType::FREE &&
+                outer != Boundary2DType::PRESSURE)) {
+      axiswall_remove_spherical_normal(accel_r, accel_z, r, z);
+    }
+  }
+}
+
+void axiswall_force_to_accel(const core::State& state,
+                             const core::Config& cfg,
+                             const int node,
+                             const bool node_active,
+                             const double node_mass,
+                             const double r,
+                             const double z,
+                             const double force_r,
+                             const double force_z,
+                             double* accel_r,
+                             double* accel_z) {
+  const std::uint8_t flags =
+      state.mesh.topo.node_flags.size() > static_cast<std::size_t>(node)
+          ? state.mesh.topo.node_flags[static_cast<std::size_t>(node)]
+          : 0U;
+  if (!node_active || !(node_mass > 0.0) ||
+      (flags & kNodeCenterFlag) != 0U) {
+    *accel_r = 0.0;
+    *accel_z = 0.0;
+    return;
+  }
+  *accel_r = force_r / node_mass;
+  *accel_z = force_z / node_mass;
+  if (state.mesh.topo.multiblock.has_value()) {
+    axiswall_apply_multiblock_constraint(
+        state, cfg, node, r, z, accel_r, accel_z);
+    return;
+  }
+  const int nz = state.mesh.topo.nz;
+  const int i = node / (nz + 1);
+  const int j = node - i * (nz + 1);
+  const std::uint8_t* node_flags =
+      state.mesh.topo.node_flags.empty()
+          ? nullptr
+          : state.mesh.topo.node_flags.data();
+  pole_axis::apply_2d_boundary_vector_constraints(
+      *accel_r,
+      *accel_z,
+      node_flags,
+      node,
+      i,
+      j,
+      state.mesh.topo.nr,
+      nz,
+      axiswall_velocity_bc_mode(
+          parse_boundary_2d_type(cfg.numerics.hydro.boundary_2d.r_outer)),
+      axiswall_velocity_bc_mode(
+          parse_boundary_2d_type(cfg.numerics.hydro.boundary_2d.z_bottom)),
+      axiswall_velocity_bc_mode(
+          parse_boundary_2d_type(cfg.numerics.hydro.boundary_2d.z_top)),
+      true);
+}
+
+double axiswall_signed_area(const std::array<double, 4>& r,
+                            const std::array<double, 4>& z,
+                            const int nverts) {
+  double twice_area = 0.0;
+  for (int k = 0; k < nverts; ++k) {
+    const int next = (k + 1) % nverts;
+    twice_area += r[static_cast<std::size_t>(k)] *
+                      z[static_cast<std::size_t>(next)] -
+                  r[static_cast<std::size_t>(next)] *
+                      z[static_cast<std::size_t>(k)];
+  }
+  return 0.5 * twice_area;
+}
+
+double axiswall_area_rate(const std::array<double, 4>& r,
+                          const std::array<double, 4>& z,
+                          const std::array<double, 4>& velocity_r,
+                          const std::array<double, 4>& velocity_z,
+                          const int nverts) {
+  double twice_rate = 0.0;
+  for (int k = 0; k < nverts; ++k) {
+    const int prev = (k + nverts - 1) % nverts;
+    const int next = (k + 1) % nverts;
+    twice_rate +=
+        velocity_r[static_cast<std::size_t>(k)] *
+            (z[static_cast<std::size_t>(next)] -
+             z[static_cast<std::size_t>(prev)]) +
+        velocity_z[static_cast<std::size_t>(k)] *
+            (r[static_cast<std::size_t>(prev)] -
+             r[static_cast<std::size_t>(next)]);
+  }
+  return 0.5 * twice_rate;
+}
+
+void emit_axiswall_diag(const core::State& state,
+                        const core::Config& cfg,
+                        const double eval_time,
+                        const double dt,
+                        const core::NodeField1D& r,
+                        const core::NodeField1D& z,
+                        const core::NodeField1D& velocity_r,
+                        const core::NodeField1D& velocity_z,
+                        const core::NodeField1D& node_mass,
+                        const std::uint8_t* d_node_active,
+                        const std::vector<std::int8_t>& hydro_active) {
+  const int n_cells = static_cast<int>(state.rho.size());
+  const int n_nodes = static_cast<int>(state.x_r.size());
+  const std::size_t n_corners =
+      static_cast<std::size_t>(n_cells) *
+      static_cast<std::size_t>(state.corner_stride);
+  TENRYU_ASSERT(d_node_active != nullptr,
+                "TENRYU_AXISWALL_DIAG requires node activity");
+  TENRYU_ASSERT(state.corner_force_p_r.size() == n_corners &&
+                    state.corner_force_p_z.size() == n_corners &&
+                    state.corner_force_sub_r.size() == n_corners &&
+                    state.corner_force_sub_z.size() == n_corners,
+                "TENRYU_AXISWALL_DIAG requires compatible corner-force buffers");
+  TENRYU_ASSERT(
+      cfg.numerics.hydro.av_model == core::AvModel::CswEdge ||
+          cfg.numerics.hydro.av_model == core::AvModel::CswEdgeCsw98,
+      "TENRYU_AXISWALL_DIAG requires CSW edge artificial viscosity");
+  TENRYU_ASSERT(state.edge_force_av_r.size() ==
+                        state.edge_force_av_z.size() &&
+                    node_mass.size() == static_cast<std::size_t>(n_nodes),
+                "TENRYU_AXISWALL_DIAG force/mass buffer size mismatch");
+
+  bool emitted = false;
+  for (auto& watch : axiswall_diag_watches()) {
+    if (!watch.topology_ready) {
+      initialize_axiswall_watch_topology(watch, state);
+    }
+    std::array<double, 4> node_r{};
+    std::array<double, 4> node_z{};
+    std::array<double, 4> node_velocity_r{};
+    std::array<double, 4> node_velocity_z{};
+    std::array<double, 4> accel_p_r{};
+    std::array<double, 4> accel_p_z{};
+    std::array<double, 4> accel_q_r{};
+    std::array<double, 4> accel_q_z{};
+    std::array<double, 4> accel_sz_r{};
+    std::array<double, 4> accel_sz_z{};
+
+    for (int k = 0; k < watch.active_nverts; ++k) {
+      const AxisWallNodeScatter& scatter =
+          watch.nodes[static_cast<std::size_t>(k)];
+      const int node = scatter.node;
+      TENRYU_ASSERT(node >= 0 && node < n_nodes,
+                    "TENRYU_AXISWALL_DIAG watched node is out of range");
+      node_r[static_cast<std::size_t>(k)] = copy_device_double_at(
+          r.data(), node, "Hydro2D axiswall copy node r failed");
+      node_z[static_cast<std::size_t>(k)] = copy_device_double_at(
+          z.data(), node, "Hydro2D axiswall copy node z failed");
+      node_velocity_r[static_cast<std::size_t>(k)] =
+          copy_device_double_at(
+              velocity_r.data(),
+              node,
+              "Hydro2D axiswall copy node velocity_r failed");
+      node_velocity_z[static_cast<std::size_t>(k)] =
+          copy_device_double_at(
+              velocity_z.data(),
+              node,
+              "Hydro2D axiswall copy node velocity_z failed");
+      const double mass = copy_device_double_at(
+          node_mass.data(), node, "Hydro2D axiswall copy node mass failed");
+      const bool active =
+          axiswall_copy_node_active(d_node_active, node) != 0U;
+
+      double force_p_r = 0.0;
+      double force_p_z = 0.0;
+      double force_sz_r = 0.0;
+      double force_sz_z = 0.0;
+      for (const AxisWallCornerRef& corner : scatter.corners) {
+        if (!axiswall_cell_active(hydro_active, corner.cell)) {
+          continue;
+        }
+        force_p_r += copy_device_double_at(
+            state.corner_force_p_r.data(),
+            corner.index,
+            "Hydro2D axiswall copy pressure corner force_r failed");
+        force_p_z += copy_device_double_at(
+            state.corner_force_p_z.data(),
+            corner.index,
+            "Hydro2D axiswall copy pressure corner force_z failed");
+        force_sz_r += copy_device_double_at(
+            state.corner_force_sub_r.data(),
+            corner.index,
+            "Hydro2D axiswall copy subzonal corner force_r failed");
+        force_sz_z += copy_device_double_at(
+            state.corner_force_sub_z.data(),
+            corner.index,
+            "Hydro2D axiswall copy subzonal corner force_z failed");
+      }
+
+      double force_q_r = 0.0;
+      double force_q_z = 0.0;
+      for (const AxisWallEdgeRef& edge : scatter.edges) {
+        if (!axiswall_cell_active(hydro_active, edge.cell_a) &&
+            !axiswall_cell_active(hydro_active, edge.cell_b)) {
+          continue;
+        }
+        force_q_r +=
+            edge.sign *
+            copy_device_double_at(
+                state.edge_force_av_r.data(),
+                edge.edge,
+                "Hydro2D axiswall copy edge AV force_r failed");
+        force_q_z +=
+            edge.sign *
+            copy_device_double_at(
+                state.edge_force_av_z.data(),
+                edge.edge,
+                "Hydro2D axiswall copy edge AV force_z failed");
+      }
+
+      axiswall_force_to_accel(
+          state,
+          cfg,
+          node,
+          active,
+          mass,
+          node_r[static_cast<std::size_t>(k)],
+          node_z[static_cast<std::size_t>(k)],
+          force_p_r,
+          force_p_z,
+          &accel_p_r[static_cast<std::size_t>(k)],
+          &accel_p_z[static_cast<std::size_t>(k)]);
+      axiswall_force_to_accel(
+          state,
+          cfg,
+          node,
+          active,
+          mass,
+          node_r[static_cast<std::size_t>(k)],
+          node_z[static_cast<std::size_t>(k)],
+          force_q_r,
+          force_q_z,
+          &accel_q_r[static_cast<std::size_t>(k)],
+          &accel_q_z[static_cast<std::size_t>(k)]);
+      axiswall_force_to_accel(
+          state,
+          cfg,
+          node,
+          active,
+          mass,
+          node_r[static_cast<std::size_t>(k)],
+          node_z[static_cast<std::size_t>(k)],
+          force_sz_r,
+          force_sz_z,
+          &accel_sz_r[static_cast<std::size_t>(k)],
+          &accel_sz_z[static_cast<std::size_t>(k)]);
+    }
+
+    const double area =
+        axiswall_signed_area(node_r, node_z, watch.active_nverts);
+    if (!watch.initial_area_set) {
+      watch.initial_area = area;
+      watch.initial_area_set = true;
+    }
+    const double dA_u =
+        dt * axiswall_area_rate(
+                 node_r,
+                 node_z,
+                 node_velocity_r,
+                 node_velocity_z,
+                 watch.active_nverts);
+    const double half_dt_squared = 0.5 * dt * dt;
+    const double dA_p =
+        half_dt_squared *
+        axiswall_area_rate(
+            node_r, node_z, accel_p_r, accel_p_z, watch.active_nverts);
+    const double dA_q =
+        half_dt_squared *
+        axiswall_area_rate(
+            node_r, node_z, accel_q_r, accel_q_z, watch.active_nverts);
+    const double dA_sz =
+        half_dt_squared *
+        axiswall_area_rate(
+            node_r, node_z, accel_sz_r, accel_sz_z, watch.active_nverts);
+    const double area_ratio =
+        watch.initial_area != 0.0
+            ? area / watch.initial_area
+            : std::numeric_limits<double>::infinity();
+    if (area_ratio < 0.5 || state.step % axiswall_diag_every() == 0) {
+      std::fprintf(stderr,
+                   "[axiswall] step=%d t=%.6e cell=%d A=%.6e A0=%.6e "
+                   "dA_u=%.3e dA_p=%.3e dA_q=%.3e dA_sz=%.3e\n",
+                   state.step,
+                   eval_time,
+                   watch.cell,
+                   area,
+                   watch.initial_area,
+                   dA_u,
+                   dA_p,
+                   dA_q,
+                   dA_sz);
+      emitted = true;
+    }
+  }
+  if (emitted) {
+    std::fflush(stderr);
+  }
+}
+
 bool pole_axis_planar_diag_enabled() {
   const char* env = std::getenv("TENRYU_I1B_POLE_AXIS_DIAG");
   return env != nullptr && env[0] != '\0' && std::string(env) != "0";
@@ -6607,7 +9438,46 @@ bool pole_axis_bbsw_enabled(const core::Config& cfg) {
   static const char* const env = std::getenv(pole_axis_bbsw::kEnvEnable);
   static const bool env_present = env != nullptr && env[0] != '\0';
   static const bool env_enabled = env_present && std::string(env) != "0";
-  return env_present ? env_enabled : cfg.numerics.ale.pole_axis_bbsw_enabled;
+  const bool enabled =
+      env_present ? env_enabled : cfg.numerics.ale.pole_axis_bbsw_enabled;
+  if (enabled && cfg.mesh.shell_polar_cap_dendrite) {
+    throw core::namelist::ConfigError(
+        "pole-axis BBSW is not supported with "
+        "Mesh.shell_polar_cap_dendrite=true (pending shell-chain generalization)");
+  }
+  return enabled;
+}
+
+std::vector<int> pole_axis_bbsw_hybrid_cart_axis_nodes(
+    const core::State& state,
+    const core::Config& cfg,
+    const std::vector<double>& node_r,
+    const std::vector<double>& node_z) {
+  if (!mesh::mesh_topo_has_polar_tier_cart_center(cfg.mesh)) {
+    return {};
+  }
+  TENRYU_ASSERT(state.mesh.topo.multiblock.has_value(),
+                "hybrid pole-axis BBSW requires multiblock topology");
+  const int n_nodes = state.mesh.topo.n_nodes;
+  TENRYU_ASSERT(node_r.size() == static_cast<std::size_t>(n_nodes) &&
+                    node_z.size() == static_cast<std::size_t>(n_nodes),
+                "hybrid pole-axis BBSW requires node-sized coordinates");
+  const int n_aw_axis_prefix_nodes = mesh::mesh_topo_n_aw_axis_prefix_nodes(
+      *state.mesh.topo.multiblock);
+  TENRYU_ASSERT(n_aw_axis_prefix_nodes <= n_nodes,
+                "hybrid pole-axis BBSW AW-axis prefix exceeds node count");
+  std::vector<int> nodes;
+  for (int node = n_aw_axis_prefix_nodes; node < n_nodes; ++node) {
+    if (node_r[static_cast<std::size_t>(node)] == 0.0) {
+      nodes.push_back(node);
+    }
+  }
+  std::sort(nodes.begin(), nodes.end(), [&](const int a, const int b) {
+    const double za = node_z[static_cast<std::size_t>(a)];
+    const double zb = node_z[static_cast<std::size_t>(b)];
+    return za == zb ? a < b : za < zb;
+  });
+  return nodes;
 }
 
 int pole_axis_planar_diag_every() {
@@ -6618,10 +9488,17 @@ int pole_axis_planar_diag_every() {
   return std::max(1, std::atoi(env));
 }
 
-bool pole_axis_planar_diag_due(const core::State& state) {
+bool pole_axis_planar_diag_due(const core::State& state,
+                               const core::Config& cfg) {
   const int every = pole_axis_planar_diag_every();
-  return pole_axis_planar_diag_enabled() && every > 0 &&
-         state.step % every == 0 && state.mesh.topo.multiblock.has_value();
+  const bool enabled = pole_axis_planar_diag_enabled();
+  if (enabled && cfg.mesh.shell_polar_cap_dendrite) {
+    throw core::namelist::ConfigError(
+        "pole-axis planar diagnostics are not supported with "
+        "Mesh.shell_polar_cap_dendrite=true (pending shell-chain generalization)");
+  }
+  return enabled && every > 0 && state.step % every == 0 &&
+         state.mesh.topo.multiblock.has_value();
 }
 
 double planar_diag_at_or_nan(const std::vector<double>& values, const int n) {
@@ -6996,6 +9873,12 @@ void add_outer_pressure_planar_axis_force(
   }
 
   const double p_ext = state.pressure_drive_1d->eval(eval_time);
+  const auto& pcfg =
+      cfg.numerics.hydro.pressure_drive_perturbation;
+  PressureDrivePerturbationParams pp{};
+  if (pcfg.enabled) {
+    pp = core::make_pressure_drive_perturbation_params(pcfg);
+  }
   const double* shell_r = node_r.data() + shell.owned_node_begin;
   const double* shell_z = node_z.data() + shell.owned_node_begin;
   for (int j = 0; j < shell.n_j_cells; ++j) {
@@ -7004,14 +9887,23 @@ void add_outer_pressure_planar_axis_force(
     if (n0 < 0 || n1 < 0 || n0 >= n_nodes || n1 >= n_nodes) {
       continue;
     }
+    double p_seg = p_ext;
+    if (pcfg.enabled) {
+      const int shell_n0 = shell.n_i_cells * stride + j;
+      const int shell_n1 = shell_n0 + 1;
+      const double rm = 0.5 * (shell_r[shell_n0] + shell_r[shell_n1]);
+      const double zm = 0.5 * (shell_z[shell_n0] + shell_z[shell_n1]);
+      // Host/device g evaluations may differ in the last ULP; this path has no parity contract.
+      p_seg = p_ext * pressure_drive_perturbation_g(pp, rm, zm);
+    }
     const pole_axis_bbsw::PlanarEndpointAreaVectors areas =
         pole_axis_bbsw::outer_boundary_endpoint_area_vectors(
             shell_r, shell_z, shell.n_i_cells, shell.n_j_cells, j);
     accum[static_cast<std::size_t>(n0)].fhat_z +=
-        -static_cast<long double>(p_ext) *
+        -static_cast<long double>(p_seg) *
         static_cast<long double>(areas.node0.z);
     accum[static_cast<std::size_t>(n1)].fhat_z +=
-        -static_cast<long double>(p_ext) *
+        -static_cast<long double>(p_seg) *
         static_cast<long double>(areas.node1.z);
   }
 }
@@ -7027,7 +9919,7 @@ void emit_pole_axis_planar_diag(const core::State& state,
                                 const std::uint8_t* d_node_active,
                                 const bool compatible_mode,
                                 const bool selected_dynamics_call) {
-  if (!selected_dynamics_call || !pole_axis_planar_diag_due(state)) {
+  if (!selected_dynamics_call || !pole_axis_planar_diag_due(state, cfg)) {
     return;
   }
   TENRYU_ASSERT(state.mesh.topo.multiblock.has_value(),
@@ -7514,11 +10406,10 @@ void apply_pole_axis_bbsw_acceleration(
       static_cast<int>(az.size()) != n_nodes) {
     return;
   }
-  const int stride = shell.n_j_cells + 1;
-  const int columns[2] = {0, shell.n_j_cells};
-  for (const int j : columns) {
-    for (int q = 0; q <= shell.n_i_cells; ++q) {
-      const int n = shell.owned_node_begin + q * stride + j;
+  if (mesh::mesh_topo_has_polar_tier_cart_center(cfg.mesh)) {
+    const std::vector<int> nodes = pole_axis_bbsw_hybrid_cart_axis_nodes(
+        state, cfg, node_r, node_z);
+    for (const int n : nodes) {
       if (n < 0 || n >= n_nodes) {
         continue;
       }
@@ -7534,6 +10425,29 @@ void apply_pole_axis_bbsw_acceleration(
       }
       ar[static_cast<std::size_t>(n)] = 0.0;
       az[static_cast<std::size_t>(n)] = fhat_z / mhat;
+    }
+  } else {
+    const int stride = shell.n_j_cells + 1;
+    const int columns[2] = {0, shell.n_j_cells};
+    for (const int j : columns) {
+      for (int q = 0; q <= shell.n_i_cells; ++q) {
+        const int n = shell.owned_node_begin + q * stride + j;
+        if (n < 0 || n >= n_nodes) {
+          continue;
+        }
+        if (!node_active.empty() &&
+            node_active[static_cast<std::size_t>(n)] == 0U) {
+          continue;
+        }
+        const auto& a = accum[static_cast<std::size_t>(n)];
+        const double mhat = static_cast<double>(a.mhat);
+        const double fhat_z = static_cast<double>(a.fhat_z);
+        if (!(std::isfinite(mhat) && mhat > 0.0 && std::isfinite(fhat_z))) {
+          continue;
+        }
+        ar[static_cast<std::size_t>(n)] = 0.0;
+        az[static_cast<std::size_t>(n)] = fhat_z / mhat;
+      }
     }
   }
   accel_r.copy_from_host(ar.data());
@@ -7612,6 +10526,94 @@ void apply_pole_axis_bbsw_order_constraint(
   if (static_cast<int>(z_old.size()) != n_nodes ||
       static_cast<int>(pos_r.size()) != n_nodes ||
       static_cast<int>(pos_z.size()) != n_nodes) {
+    return;
+  }
+
+  if (mesh::mesh_topo_has_polar_tier_cart_center(cfg.mesh)) {
+    const std::vector<int> nodes = pole_axis_bbsw_hybrid_cart_axis_nodes(
+        state, cfg, node_r, z_old);
+    const int n_axis = static_cast<int>(nodes.size());
+    if (n_axis <= 0) {
+      return;
+    }
+    std::vector<double> z_hat(static_cast<std::size_t>(n_axis), 0.0);
+    std::vector<double> weight(static_cast<std::size_t>(n_axis), 1.0e-300);
+    std::vector<double> delta(
+        static_cast<std::size_t>(std::max(0, n_axis - 1)), 0.0);
+    for (int q = 0; q < n_axis; ++q) {
+      const int n = nodes[static_cast<std::size_t>(q)];
+      if (!node_active.empty() &&
+          node_active[static_cast<std::size_t>(n)] == 0U) {
+        return;
+      }
+      z_hat[static_cast<std::size_t>(q)] =
+          z_old[static_cast<std::size_t>(n)] +
+          dt * pos_z[static_cast<std::size_t>(n)];
+      const double mhat =
+          static_cast<double>(accum[static_cast<std::size_t>(n)].mhat);
+      weight[static_cast<std::size_t>(q)] =
+          (std::isfinite(mhat) && mhat > 0.0) ? mhat : 1.0e-300;
+    }
+    for (int q = 0; q + 1 < n_axis; ++q) {
+      const int n0 = nodes[static_cast<std::size_t>(q)];
+      const int n1 = nodes[static_cast<std::size_t>(q + 1)];
+      delta[static_cast<std::size_t>(q)] = pole_axis_bbsw::hard_gap(
+          z_old[static_cast<std::size_t>(n0)],
+          z_old[static_cast<std::size_t>(n1)]);
+    }
+    const std::vector<double> z_proj =
+        pole_axis_bbsw::project_axis_positions_with_hard_gaps(
+            z_hat, weight, delta);
+    bool changed = false;
+    for (int q = 0; q < n_axis; ++q) {
+      const int n = nodes[static_cast<std::size_t>(q)];
+      const double u_mid =
+          (z_proj[static_cast<std::size_t>(q)] -
+           z_old[static_cast<std::size_t>(n)]) /
+          dt;
+      if (!std::isfinite(u_mid)) {
+        continue;
+      }
+      pos_r[static_cast<std::size_t>(n)] = 0.0;
+      pos_z[static_cast<std::size_t>(n)] = u_mid;
+      if (!mid_r.empty()) {
+        mid_r[static_cast<std::size_t>(n)] = 0.0;
+      }
+      if (!mid_z.empty()) {
+        mid_z[static_cast<std::size_t>(n)] = u_mid;
+      }
+      if (!fin_r.empty()) {
+        fin_r[static_cast<std::size_t>(n)] = 0.0;
+      }
+      if (!fin_z.empty()) {
+        const double old_u =
+            (!old_z_vel.empty() &&
+             static_cast<std::size_t>(n) < old_z_vel.size())
+                ? old_z_vel[static_cast<std::size_t>(n)]
+                : 0.0;
+        fin_z[static_cast<std::size_t>(n)] = 2.0 * u_mid - old_u;
+      }
+      changed = true;
+    }
+    if (!changed) {
+      return;
+    }
+    pos_v_r.copy_from_host(pos_r.data());
+    pos_v_z.copy_from_host(pos_z.data());
+    if (midpoint_v_r != nullptr && midpoint_v_r->data() != pos_v_r.data() &&
+        !mid_r.empty()) {
+      midpoint_v_r->copy_from_host(mid_r.data());
+    }
+    if (midpoint_v_z != nullptr && midpoint_v_z->data() != pos_v_z.data() &&
+        !mid_z.empty()) {
+      midpoint_v_z->copy_from_host(mid_z.data());
+    }
+    if (final_v_r != nullptr && !fin_r.empty()) {
+      final_v_r->copy_from_host(fin_r.data());
+    }
+    if (final_v_z != nullptr && !fin_z.empty()) {
+      final_v_z->copy_from_host(fin_z.data());
+    }
     return;
   }
 
@@ -7815,95 +10817,105 @@ void apply_pole_axis_bbsw_work_correction(
     return;
   }
 
-  const int stride = shell.n_j_cells + 1;
-  const int columns[2] = {0, shell.n_j_cells};
-  bool changed = false;
-  for (const int j : columns) {
-    for (int q = 0; q <= shell.n_i_cells; ++q) {
-      const int n = shell.owned_node_begin + q * stride + j;
-      if (n < 0 || n >= n_nodes ||
-          (!node_active.empty() &&
-           node_active[static_cast<std::size_t>(n)] == 0U)) {
-        continue;
+  std::vector<int> owned_axis_nodes;
+  if (mesh::mesh_topo_has_polar_tier_cart_center(cfg.mesh)) {
+    owned_axis_nodes = pole_axis_bbsw_hybrid_cart_axis_nodes(
+        state, cfg, node_r, node_z);
+  } else {
+    const int stride = shell.n_j_cells + 1;
+    const int columns[2] = {0, shell.n_j_cells};
+    owned_axis_nodes.reserve(
+        static_cast<std::size_t>(2 * (shell.n_i_cells + 1)));
+    for (const int j : columns) {
+      for (int q = 0; q <= shell.n_i_cells; ++q) {
+        owned_axis_nodes.push_back(shell.owned_node_begin + q * stride + j);
       }
-      const double m_node = mass_node[static_cast<std::size_t>(n)];
-      const double v_old = old_v[static_cast<std::size_t>(n)];
-      const double v_new = new_v[static_cast<std::size_t>(n)];
-      const double f_true = force_true[static_cast<std::size_t>(n)];
-      if (!(std::isfinite(m_node) && m_node > 0.0 && std::isfinite(v_old) &&
-            std::isfinite(v_new) && std::isfinite(f_true))) {
-        continue;
-      }
-      const double f_eff = m_node * (v_new - v_old) / dt;
-      const double u_mid = 0.5 * (v_old + v_new);
-      const double work_rate = -u_mid * (f_eff - f_true);
-      if (!std::isfinite(work_rate) || work_rate == 0.0) {
-        continue;
-      }
-
-      struct IncidentWeight {
-        int cell = -1;
-        double weight = 0.0;
-      };
-      std::vector<IncidentWeight> incident;
-      const int off = reverse_offsets[static_cast<std::size_t>(n)];
-      const int end = reverse_offsets[static_cast<std::size_t>(n + 1)];
-      double weight_sum = 0.0;
-      for (int p = off; p < end; ++p) {
-        if (p < 0 || static_cast<std::size_t>(p) >= reverse_cells.size() ||
-            static_cast<std::size_t>(p) >= reverse_corners.size()) {
-          continue;
-        }
-        const int c = reverse_cells[static_cast<std::size_t>(p)];
-        const int corner = reverse_corners[static_cast<std::size_t>(p)];
-        if (c < 0 || c >= n_cells || !cell_active(c)) {
-          continue;
-        }
-        int nodes[4] = {-1, -1, -1, -1};
-        int active_nverts = mesh::kMeshTopoCellStorageSlots;
-        if (!trace_cell_nodes(state, c, nodes, &active_nverts) ||
-            corner < 0 || corner >= active_nverts) {
-          continue;
-        }
-        double r[4] = {0.0, 0.0, 0.0, 0.0};
-        double z[4] = {0.0, 0.0, 0.0, 0.0};
-        for (int k = 0; k < active_nverts; ++k) {
-          r[k] = planar_diag_at_or_nan(node_r, nodes[k]);
-          z[k] = planar_diag_at_or_nan(node_z, nodes[k]);
-        }
-        double area[4] = {0.0, 0.0, 0.0, 0.0};
-        planar_diag_corner_areas(r,
-                                 z,
-                                 active_nverts,
-                                 planar_diag_cell_orientation_sign(state, c),
-                                 area);
-        const double density =
-            planar_diag_corner_density(rho,
-                                       cell_mass,
-                                       vol,
-                                       corner_mass,
-                                       c,
-                                       corner,
-                                       active_nverts,
-                                       state.corner_stride,
-                                       r,
-                                       z);
-        double weight = density * area[corner];
-        if (!(std::isfinite(weight) && weight > 0.0)) {
-          weight = 1.0;
-        }
-        incident.push_back(IncidentWeight{c, weight});
-        weight_sum += weight;
-      }
-      if (!(weight_sum > 0.0) || incident.empty()) {
-        continue;
-      }
-      for (const IncidentWeight entry : incident) {
-        work_p[static_cast<std::size_t>(entry.cell)] +=
-            work_rate * entry.weight / weight_sum;
-      }
-      changed = true;
     }
+  }
+  bool changed = false;
+  for (const int n : owned_axis_nodes) {
+    if (n < 0 || n >= n_nodes ||
+        (!node_active.empty() &&
+         node_active[static_cast<std::size_t>(n)] == 0U)) {
+      continue;
+    }
+    const double m_node = mass_node[static_cast<std::size_t>(n)];
+    const double v_old = old_v[static_cast<std::size_t>(n)];
+    const double v_new = new_v[static_cast<std::size_t>(n)];
+    const double f_true = force_true[static_cast<std::size_t>(n)];
+    if (!(std::isfinite(m_node) && m_node > 0.0 && std::isfinite(v_old) &&
+          std::isfinite(v_new) && std::isfinite(f_true))) {
+      continue;
+    }
+    const double f_eff = m_node * (v_new - v_old) / dt;
+    const double u_mid = 0.5 * (v_old + v_new);
+    const double work_rate = -u_mid * (f_eff - f_true);
+    if (!std::isfinite(work_rate) || work_rate == 0.0) {
+      continue;
+    }
+
+    struct IncidentWeight {
+      int cell = -1;
+      double weight = 0.0;
+    };
+    std::vector<IncidentWeight> incident;
+    const int off = reverse_offsets[static_cast<std::size_t>(n)];
+    const int end = reverse_offsets[static_cast<std::size_t>(n + 1)];
+    double weight_sum = 0.0;
+    for (int p = off; p < end; ++p) {
+      if (p < 0 || static_cast<std::size_t>(p) >= reverse_cells.size() ||
+          static_cast<std::size_t>(p) >= reverse_corners.size()) {
+        continue;
+      }
+      const int c = reverse_cells[static_cast<std::size_t>(p)];
+      const int corner = reverse_corners[static_cast<std::size_t>(p)];
+      if (c < 0 || c >= n_cells || !cell_active(c)) {
+        continue;
+      }
+      int nodes[4] = {-1, -1, -1, -1};
+      int active_nverts = mesh::kMeshTopoCellStorageSlots;
+      if (!trace_cell_nodes(state, c, nodes, &active_nverts) ||
+          corner < 0 || corner >= active_nverts) {
+        continue;
+      }
+      double r[4] = {0.0, 0.0, 0.0, 0.0};
+      double z[4] = {0.0, 0.0, 0.0, 0.0};
+      for (int k = 0; k < active_nverts; ++k) {
+        r[k] = planar_diag_at_or_nan(node_r, nodes[k]);
+        z[k] = planar_diag_at_or_nan(node_z, nodes[k]);
+      }
+      double area[4] = {0.0, 0.0, 0.0, 0.0};
+      planar_diag_corner_areas(r,
+                               z,
+                               active_nverts,
+                               planar_diag_cell_orientation_sign(state, c),
+                               area);
+      const double density =
+          planar_diag_corner_density(rho,
+                                     cell_mass,
+                                     vol,
+                                     corner_mass,
+                                     c,
+                                     corner,
+                                     active_nverts,
+                                     state.corner_stride,
+                                     r,
+                                     z);
+      double weight = density * area[corner];
+      if (!(std::isfinite(weight) && weight > 0.0)) {
+        weight = 1.0;
+      }
+      incident.push_back(IncidentWeight{c, weight});
+      weight_sum += weight;
+    }
+    if (!(weight_sum > 0.0) || incident.empty()) {
+      continue;
+    }
+    for (const IncidentWeight entry : incident) {
+      work_p[static_cast<std::size_t>(entry.cell)] +=
+          work_rate * entry.weight / weight_sum;
+    }
+    changed = true;
   }
   if (changed) {
     state.work_p_per_cell.copy_from_host(work_p.data());
@@ -8043,6 +11055,586 @@ void trace_compatible_force_diag(const core::State& state,
   std::fflush(stderr);
 }
 
+enum class CompatibleForceDumpStage {
+  Pressure,
+  Subzonal,
+  Av,
+};
+
+struct CompatibleForceDumpCornerRef {
+  int cell = -1;
+  int index = -1;
+};
+
+struct CompatibleForceDumpEdgeRef {
+  int edge = -1;
+  int cell_a = -1;
+  int cell_b = -1;
+  int node0 = -1;
+  int node1 = -1;
+};
+
+struct CompatibleForceDumpNode {
+  int node = -1;
+  std::vector<CompatibleForceDumpCornerRef> corners;
+  std::vector<CompatibleForceDumpEdgeRef> edges;
+};
+
+struct CompatibleForceDumpContext {
+  std::vector<CompatibleForceDumpNode> nodes;
+  bool topology_ready = false;
+  int n_cells = 0;
+  int n_nodes = 0;
+  int corner_stride = 0;
+};
+
+const std::vector<int>& compatible_force_dump_node_ids() {
+  static const std::vector<int> nodes = [] {
+    std::vector<int> parsed;
+    const char* const raw = std::getenv("TENRYU_I1B_FORCE_DUMP");
+    if (raw == nullptr || raw[0] == '\0') {
+      return parsed;
+    }
+    const char* token = raw;
+    while (*token != '\0') {
+      const char* token_end = token;
+      while (*token_end != '\0' && *token_end != ',') {
+        ++token_end;
+      }
+      char* parsed_end = nullptr;
+      const long value = std::strtol(token, &parsed_end, 10);
+      const char* trailing = parsed_end;
+      while (trailing < token_end &&
+             std::isspace(static_cast<unsigned char>(*trailing)) != 0) {
+        ++trailing;
+      }
+      if (parsed_end != token && trailing == token_end && value >= 0 &&
+          value <= std::numeric_limits<int>::max()) {
+        const int node = static_cast<int>(value);
+        if (std::find(parsed.begin(), parsed.end(), node) == parsed.end()) {
+          parsed.push_back(node);
+        }
+      }
+      token = (*token_end == ',') ? token_end + 1 : token_end;
+    }
+    return parsed;
+  }();
+  return nodes;
+}
+
+CompatibleForceDumpContext& compatible_force_dump_context() {
+  static CompatibleForceDumpContext context = [] {
+    CompatibleForceDumpContext out;
+    for (const int node : compatible_force_dump_node_ids()) {
+      CompatibleForceDumpNode watch;
+      watch.node = node;
+      out.nodes.push_back(std::move(watch));
+    }
+    return out;
+  }();
+  return context;
+}
+
+void initialize_compatible_force_dump_topology(
+    CompatibleForceDumpContext& context,
+    const core::State& state) {
+  TENRYU_ASSERT(state.mesh.topo.multiblock.has_value(),
+                "TENRYU_I1B_FORCE_DUMP requires a multiblock mesh");
+  context.n_cells = static_cast<int>(state.rho.size());
+  context.n_nodes = static_cast<int>(state.x_r.size());
+  context.corner_stride = state.corner_stride;
+  TENRYU_ASSERT(state.mesh.multiblock_reverse_csr_node_offsets.size() ==
+                    static_cast<std::size_t>(context.n_nodes) + 1U,
+                "TENRYU_I1B_FORCE_DUMP requires reverse CSR node offsets");
+  TENRYU_ASSERT(state.mesh.multiblock_reverse_csr_node_cells.size() ==
+                    state.mesh.multiblock_reverse_csr_node_corners.size(),
+                "TENRYU_I1B_FORCE_DUMP reverse CSR payload mismatch");
+
+  std::vector<int> reverse_offsets;
+  std::vector<int> reverse_cells;
+  std::vector<int> reverse_corners;
+  state.mesh.multiblock_reverse_csr_node_offsets.copy_to_host(reverse_offsets);
+  state.mesh.multiblock_reverse_csr_node_cells.copy_to_host(reverse_cells);
+  state.mesh.multiblock_reverse_csr_node_corners.copy_to_host(reverse_corners);
+  for (CompatibleForceDumpNode& watch : context.nodes) {
+    TENRYU_ASSERT(watch.node >= 0 && watch.node < context.n_nodes,
+                  "TENRYU_I1B_FORCE_DUMP watched node is out of range");
+    const int off = reverse_offsets[static_cast<std::size_t>(watch.node)];
+    const int end = reverse_offsets[static_cast<std::size_t>(watch.node + 1)];
+    TENRYU_ASSERT(off >= 0 && end >= off &&
+                      static_cast<std::size_t>(end) <= reverse_cells.size(),
+                  "TENRYU_I1B_FORCE_DUMP invalid reverse CSR node slice");
+    for (int p = off; p < end; ++p) {
+      const int cell = reverse_cells[static_cast<std::size_t>(p)];
+      const int corner = reverse_corners[static_cast<std::size_t>(p)];
+      TENRYU_ASSERT(cell >= 0 && cell < context.n_cells && corner >= 0 &&
+                        corner < context.corner_stride,
+                    "TENRYU_I1B_FORCE_DUMP invalid reverse CSR entry");
+      watch.corners.push_back(CompatibleForceDumpCornerRef{
+          cell, cell * context.corner_stride + corner});
+    }
+  }
+
+  const auto& mb = *state.mesh.topo.multiblock;
+  const auto add_edge = [&](const int edge,
+                            const mesh::UniqueOrientedFace& face,
+                            const int cell_b) {
+    int node0 = -1;
+    int node1 = -1;
+    TENRYU_ASSERT(axiswall_multiblock_face_nodes(
+                      state, face, &node0, &node1),
+                  "TENRYU_I1B_FORCE_DUMP invalid multiblock face");
+    for (CompatibleForceDumpNode& watch : context.nodes) {
+      if (watch.node == node0 || watch.node == node1) {
+        watch.edges.push_back(CompatibleForceDumpEdgeRef{
+            edge, face.cell_a, cell_b, node0, node1});
+      }
+    }
+  };
+  int edge = 0;
+  for (const mesh::UniqueOrientedFace& face : mb.unique_internal_faces) {
+    add_edge(edge, face, face.cell_b);
+    ++edge;
+  }
+  for (const mesh::UniqueOrientedFace& face : mb.boundary_faces) {
+    add_edge(edge, face, -1);
+    ++edge;
+  }
+  context.topology_ready = true;
+}
+
+bool compatible_force_dump_cell_active(
+    const std::vector<std::int8_t>& hydro_active,
+    const int cell) {
+  return cell >= 0 &&
+         (hydro_active.empty() ||
+          (static_cast<std::size_t>(cell) < hydro_active.size() &&
+           hydro_active[static_cast<std::size_t>(cell)] != 0));
+}
+
+void compatible_force_dump_edge_lift_alpha(const core::Config& cfg,
+                                           const double r0,
+                                           const double r1,
+                                           double* alpha0,
+                                           double* alpha1) {
+  *alpha0 = 1.0;
+  *alpha1 = 1.0;
+  if (!cfg.numerics.hydro.csw_rz_lift_enabled ||
+      !cfg.numerics.hydro.aw_compatible_force_work || !(r0 > 0.0) ||
+      !(r1 > 0.0)) {
+    return;
+  }
+  const double rbar = 0.5 * (r0 + r1);
+  if (!(rbar <= cfg.numerics.hydro.csw_rz_lift_guard_ratio *
+                    std::fmin(r0, r1))) {
+    return;
+  }
+  *alpha0 = rbar / r0;
+  *alpha1 = rbar / r1;
+}
+
+std::vector<double> compatible_force_dump_corner_densities(
+    const core::State& state,
+    const core::Config& cfg,
+    const int cell) {
+  int nodes[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {};
+  int active_nverts = mesh::kMeshTopoCellStorageSlots;
+  TENRYU_ASSERT(trace_cell_nodes(state, cell, nodes, &active_nverts) &&
+                    (active_nverts == 3 || active_nverts == 4 ||
+                     active_nverts == 5),
+                "TENRYU_I1B_FORCE_DUMP invalid adjacent cell topology");
+
+  double r[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {};
+  double z[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {};
+  double corner_mass[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {};
+  for (int k = 0; k < active_nverts; ++k) {
+    r[k] = copy_device_double_at(
+        state.x_r.data(), nodes[k],
+        "TENRYU_I1B_FORCE_DUMP copy corner node r failed");
+    z[k] = copy_device_double_at(
+        state.x_z.data(), nodes[k],
+        "TENRYU_I1B_FORCE_DUMP copy corner node z failed");
+    corner_mass[k] = copy_device_double_at(
+        state.corner_mass.data(), cell * state.corner_stride + k,
+        "TENRYU_I1B_FORCE_DUMP copy corner mass failed");
+  }
+
+  double corner_volume[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {};
+  if (active_nverts == 3) {
+    if (mesh::mesh_topo_polar_tier_family(cfg.mesh)) {
+      rz::compute_triangle_corner_volumes_equal_planar_area(
+          r[0], z[0], r[1], z[1], r[2], z[2], corner_volume);
+    } else {
+      const double rc = (r[0] + r[1] + r[2]) / 3.0;
+      const double zc = (z[0] + z[1] + z[2]) / 3.0;
+      for (int k = 0; k < 3; ++k) {
+        const int kp = (k + 1) % 3;
+        const int km = (k + 2) % 3;
+        const double r_sub[4] = {
+            r[k], 0.5 * (r[k] + r[kp]), rc, 0.5 * (r[km] + r[k])};
+        const double z_sub[4] = {
+            z[k], 0.5 * (z[k] + z[kp]), zc, 0.5 * (z[km] + z[k])};
+        corner_volume[k] =
+            std::fabs(rz::rz_polygon_volume_exact(r_sub, z_sub, 4));
+      }
+    }
+  } else if (active_nverts == 5) {
+    PentagonPoint x[5];
+    for (int k = 0; k < 5; ++k) {
+      x[k] = {r[k], z[k]};
+    }
+    pentagon_corner_rz_volumes(x, corner_volume);
+  } else {
+    rz::compute_quad_corner_volumes_exact_subpolygon(
+        r[0], z[0], r[1], z[1], r[2], z[2], r[3], z[3], corner_volume);
+  }
+
+  std::vector<double> density(static_cast<std::size_t>(active_nverts), 0.0);
+  int origin_corner = -1;
+  if (active_nverts == 3 &&
+      mesh::mesh_topo_polar_tier_family(cfg.mesh)) {
+    for (int k = 0; k < 3; ++k) {
+      if (r[k] == 0.0 && z[k] == 0.0) {
+        origin_corner = k;
+        break;
+      }
+    }
+  }
+  for (int k = 0; k < active_nverts; ++k) {
+    if (k == origin_corner) {
+      continue;
+    }
+    density[static_cast<std::size_t>(k)] =
+        (active_nverts == 5 ? corner_mass[k] : std::fmax(corner_mass[k], 0.0)) /
+        corner_volume[k];
+  }
+  return density;
+}
+
+void dump_compatible_stage_forces(const core::State& state,
+                                  const core::Config& cfg,
+                                  const std::int8_t* d_hydro_active,
+                                  const CompatibleForceDumpStage stage) {
+  CompatibleForceDumpContext& context = compatible_force_dump_context();
+  if (context.nodes.empty()) {
+    return;
+  }
+  cuda_check(cudaDeviceSynchronize(),
+             "TENRYU_I1B_FORCE_DUMP stage synchronization failed");
+  if (!context.topology_ready) {
+    initialize_compatible_force_dump_topology(context, state);
+  }
+  TENRYU_ASSERT(context.n_cells == static_cast<int>(state.rho.size()) &&
+                    context.n_nodes == static_cast<int>(state.x_r.size()) &&
+                    context.corner_stride == state.corner_stride,
+                "TENRYU_I1B_FORCE_DUMP topology changed after initialization");
+
+  std::vector<std::int8_t> hydro_active;
+  if (d_hydro_active != nullptr && context.n_cells > 0) {
+    hydro_active.resize(static_cast<std::size_t>(context.n_cells), 0);
+    cuda_check(cudaMemcpy(hydro_active.data(),
+                          d_hydro_active,
+                          hydro_active.size() * sizeof(std::int8_t),
+                          cudaMemcpyDeviceToHost),
+               "TENRYU_I1B_FORCE_DUMP copy hydro_active failed");
+  }
+
+  std::vector<double> first_r;
+  std::vector<double> first_z;
+  std::vector<double> second_r;
+  std::vector<double> second_z;
+  std::vector<double> av_r;
+  std::vector<double> av_z;
+  std::vector<double> node_r;
+  const bool corner_av =
+      cfg.numerics.hydro.av_model == core::AvModel::MimeticTensorV1 ||
+      cfg.numerics.hydro.av_model == core::AvModel::ScalarVnrLegacy;
+  state.corner_force_p_r.copy_to_host(first_r);
+  state.corner_force_p_z.copy_to_host(first_z);
+  if (stage != CompatibleForceDumpStage::Pressure) {
+    state.corner_force_sub_r.copy_to_host(second_r);
+    state.corner_force_sub_z.copy_to_host(second_z);
+  }
+  if (stage == CompatibleForceDumpStage::Av && corner_av) {
+    state.corner_force_q_r.copy_to_host(av_r);
+    state.corner_force_q_z.copy_to_host(av_z);
+  } else if (stage == CompatibleForceDumpStage::Av) {
+    state.edge_force_av_r.copy_to_host(av_r);
+    state.edge_force_av_z.copy_to_host(av_z);
+    if (cfg.numerics.hydro.csw_rz_lift_enabled &&
+        cfg.numerics.hydro.aw_compatible_force_work) {
+      state.x_r.copy_to_host(node_r);
+    }
+  }
+
+  const char* const stage_name =
+      stage == CompatibleForceDumpStage::Pressure
+          ? "pressure"
+          : (stage == CompatibleForceDumpStage::Subzonal ? "subzonal" : "av");
+  for (const CompatibleForceDumpNode& watch : context.nodes) {
+    double force_r = 0.0;
+    double force_z = 0.0;
+    for (const CompatibleForceDumpCornerRef& corner : watch.corners) {
+      if (!compatible_force_dump_cell_active(hydro_active, corner.cell)) {
+        continue;
+      }
+      if (stage == CompatibleForceDumpStage::Pressure) {
+        force_r += first_r[static_cast<std::size_t>(corner.index)];
+        force_z += first_z[static_cast<std::size_t>(corner.index)];
+      } else {
+        force_r += first_r[static_cast<std::size_t>(corner.index)] +
+                   second_r[static_cast<std::size_t>(corner.index)];
+        force_z += first_z[static_cast<std::size_t>(corner.index)] +
+                   second_z[static_cast<std::size_t>(corner.index)];
+      }
+    }
+    if (stage == CompatibleForceDumpStage::Av && corner_av) {
+      double force_av_r = 0.0;
+      double force_av_z = 0.0;
+      for (const CompatibleForceDumpCornerRef& corner : watch.corners) {
+        if (!compatible_force_dump_cell_active(hydro_active, corner.cell)) {
+          continue;
+        }
+        force_av_r += av_r[static_cast<std::size_t>(corner.index)];
+        force_av_z += av_z[static_cast<std::size_t>(corner.index)];
+      }
+      force_r += force_av_r;
+      force_z += force_av_z;
+    } else if (stage == CompatibleForceDumpStage::Av) {
+      for (const CompatibleForceDumpEdgeRef& edge : watch.edges) {
+        if (!compatible_force_dump_cell_active(hydro_active, edge.cell_a) &&
+            !compatible_force_dump_cell_active(hydro_active, edge.cell_b)) {
+          continue;
+        }
+        double alpha0 = 1.0;
+        double alpha1 = 1.0;
+        if (!node_r.empty()) {
+          compatible_force_dump_edge_lift_alpha(
+              cfg,
+              node_r[static_cast<std::size_t>(edge.node0)],
+              node_r[static_cast<std::size_t>(edge.node1)],
+              &alpha0,
+              &alpha1);
+        }
+        const double weight = watch.node == edge.node0 ? -alpha0 : alpha1;
+        force_r += weight * av_r[static_cast<std::size_t>(edge.edge)];
+        force_z += weight * av_z[static_cast<std::size_t>(edge.edge)];
+      }
+    }
+    std::fprintf(stderr,
+                 "[force-dump] step=%d stage=%s node=%d F_r=%.17e F_z=%.17e\n",
+                 state.step,
+                 stage_name,
+                 watch.node,
+                 force_r,
+                 force_z);
+  }
+  if (stage == CompatibleForceDumpStage::Subzonal) {
+    std::fprintf(
+        stderr,
+        "[force-dump] step=%d corner_rho_spread_max=%.17e cell=%d corner=%d\n",
+        state.step,
+        state.max_corner_density_spread_step,
+        state.max_corner_density_spread_cell_id,
+        state.max_corner_density_spread_corner_id);
+    // Goal: confirm/refute a ~1e-4 uniform-density mismatch between cached
+    // initialization corner masses and runtime corner volumes at junction rings.
+    for (const CompatibleForceDumpNode& watch : context.nodes) {
+      for (const CompatibleForceDumpCornerRef& corner : watch.corners) {
+        const double rho_zonal = copy_device_double_at(
+            state.rho.data(), corner.cell,
+            "TENRYU_I1B_FORCE_DUMP copy zonal density failed");
+        const std::vector<double> corner_density =
+            compatible_force_dump_corner_densities(state, cfg, corner.cell);
+        std::fprintf(stderr,
+                     "[force-dump] step=%d node=%d cell=%d rho_zonal=%.17e "
+                     "corner_rho=",
+                     state.step,
+                     watch.node,
+                     corner.cell,
+                     rho_zonal);
+        for (std::size_t k = 0; k < corner_density.size(); ++k) {
+          std::fprintf(stderr, "%s%.17e", k == 0U ? "" : ",",
+                       corner_density[k]);
+        }
+        std::fprintf(stderr, "\n");
+      }
+    }
+  }
+  std::fflush(stderr);
+}
+
+void emit_drive_layer_diag(const core::State& state,
+                           const double eval_time,
+                           const core::NodeField1D& force_r,
+                           const core::NodeField1D& force_z) {
+  if (state.mesh.topo.multiblock.has_value()) {
+    std::ostringstream os;
+    os << "[drive-layer] step=" << state.step
+       << " t=" << format_scientific(eval_time)
+       << " skipped=multiblock";
+    core::log_info(os.str());
+    return;
+  }
+
+  const int nr = state.mesh.topo.nr;
+  const int nz = state.mesh.topo.nz;
+  const std::size_t n_cells =
+      static_cast<std::size_t>(nr) * static_cast<std::size_t>(nz);
+  const std::size_t n_nodes =
+      static_cast<std::size_t>(nr + 1) * static_cast<std::size_t>(nz + 1);
+  if (nr < 3 || nz < 1 || state.rho.size() != n_cells ||
+      state.work_p_per_cell.size() != n_cells ||
+      state.work_sub_per_cell.size() != n_cells ||
+      state.work_av_per_cell.size() != n_cells ||
+      state.v_r.size() != n_nodes || state.v_z.size() != n_nodes ||
+      state.x_r.size() != n_nodes || state.x_z.size() != n_nodes ||
+      force_r.size() != n_nodes || force_z.size() != n_nodes) {
+    std::ostringstream os;
+    os << "[drive-layer] step=" << state.step
+       << " t=" << format_scientific(eval_time)
+       << " skipped=invalid-structured-layout";
+    core::log_info(os.str());
+    return;
+  }
+
+  sync_kernel("Hydro2D drive-layer diagnostic pre-copy failed");
+  const std::vector<double> rho = copy_field_to_vector(state.rho);
+  const std::vector<double> work_p =
+      copy_field_to_vector(state.work_p_per_cell);
+  const std::vector<double> work_sub =
+      copy_field_to_vector(state.work_sub_per_cell);
+  const std::vector<double> work_av =
+      copy_field_to_vector(state.work_av_per_cell);
+  const std::vector<double> velocity_r = copy_field_to_vector(state.v_r);
+  const std::vector<double> velocity_z = copy_field_to_vector(state.v_z);
+  const std::vector<double> x_r = copy_field_to_vector(state.x_r);
+  const std::vector<double> x_z = copy_field_to_vector(state.x_z);
+  const std::vector<double> total_force_r = copy_field_to_vector(force_r);
+  const std::vector<double> total_force_z = copy_field_to_vector(force_z);
+  const std::vector<double> planar_mass =
+      state.node_planar_mass.size() == n_nodes
+          ? copy_field_to_vector(state.node_planar_mass)
+          : std::vector<double>{};
+
+  const int outer_row = nr - 1;
+  int j_star = 0;
+  double max_abs_work_av =
+      std::abs(work_av[static_cast<std::size_t>(outer_row * nz)]);
+  long double sum_wp = 0.0L;
+  long double sum_ws = 0.0L;
+  long double sum_wav = 0.0L;
+  long double sum_abs_wav = 0.0L;
+  for (int j = 0; j < nz; ++j) {
+    const std::size_t c =
+        static_cast<std::size_t>(outer_row * nz + j);
+    const double abs_work_av = std::abs(work_av[c]);
+    if (abs_work_av > max_abs_work_av) {
+      max_abs_work_av = abs_work_av;
+      j_star = j;
+    }
+    sum_wp += static_cast<long double>(work_p[c]);
+    sum_ws += static_cast<long double>(work_sub[c]);
+    sum_wav += static_cast<long double>(work_av[c]);
+    sum_abs_wav += static_cast<long double>(abs_work_av);
+  }
+
+  const std::array<int, 4> candidates = {j_star, 0, nz / 2, nz - 1};
+  std::vector<int> columns;
+  columns.reserve(candidates.size());
+  for (const int j : candidates) {
+    if (std::find(columns.begin(), columns.end(), j) == columns.end()) {
+      columns.push_back(j);
+    }
+  }
+
+  const int node_stride = nz + 1;
+  for (const int j : columns) {
+    for (int i = nr - 3; i < nr; ++i) {
+      const std::size_t c = static_cast<std::size_t>(i * nz + j);
+      const std::size_t node_lo =
+          static_cast<std::size_t>(i * node_stride + j);
+      const std::size_t node_hi =
+          static_cast<std::size_t>((i + 1) * node_stride + j);
+      const double dr = std::hypot(x_r[node_hi] - x_r[node_lo],
+                                   x_z[node_hi] - x_z[node_lo]);
+      std::ostringstream os;
+      os << "[drive-layer] step=" << state.step
+         << " t=" << format_scientific(eval_time)
+         << " i=" << i
+         << " j=" << j
+         << " rho=" << format_scientific(rho[c])
+         << " wp=" << format_scientific(work_p[c])
+         << " ws=" << format_scientific(work_sub[c])
+         << " wav=" << format_scientific(work_av[c])
+         << " ur_lo=" << format_scientific(velocity_r[node_lo])
+         << " ur_hi=" << format_scientific(velocity_r[node_hi])
+         << " uz_lo=" << format_scientific(velocity_z[node_lo])
+         << " uz_hi=" << format_scientific(velocity_z[node_hi])
+         << " dr=" << format_scientific(dr);
+      core::log_info(os.str());
+    }
+    const std::size_t boundary_node =
+        static_cast<std::size_t>(nr * node_stride + j);
+    std::ostringstream boundary;
+    boundary << "[drive-layer-bnode] step=" << state.step
+             << " j=" << j
+             << " ur=" << format_scientific(velocity_r[boundary_node])
+             << " uz=" << format_scientific(velocity_z[boundary_node])
+             << " r=" << format_scientific(x_r[boundary_node])
+             << " z=" << format_scientific(x_z[boundary_node]);
+    core::log_info(boundary.str());
+  }
+
+  const double mean_abs_wav =
+      static_cast<double>(sum_abs_wav / static_cast<long double>(nz));
+  const double max_row_ratio_wav =
+      mean_abs_wav > 0.0 ? max_abs_work_av / mean_abs_wav : 0.0;
+  std::ostringstream summary;
+  summary << "[drive-layer-sum] step=" << state.step
+          << " row=" << outer_row
+          << " sum_wp=" << format_scientific(static_cast<double>(sum_wp))
+          << " sum_ws=" << format_scientific(static_cast<double>(sum_ws))
+          << " sum_wav=" << format_scientific(static_cast<double>(sum_wav))
+          << " max_row_ratio_wav="
+          << format_scientific(max_row_ratio_wav);
+  core::log_info(summary.str());
+
+  if (!planar_mass.empty() && nz >= 2) {
+    const std::array<int, 2> pole_j = {0, nz};
+    const std::array<int, 2> peer_j = {1, nz - 1};
+    const std::array<const char*, 2> pole_name = {"theta0", "theta_pi"};
+    for (int pole = 0; pole < 2; ++pole) {
+      const std::size_t p =
+          static_cast<std::size_t>(nr * node_stride + pole_j[pole]);
+      const std::size_t q =
+          static_cast<std::size_t>(nr * node_stride + peer_j[pole]);
+      if (state.mesh.topo.node_flags.size() != n_nodes ||
+          (state.mesh.topo.node_flags[p] & mesh::NODE_POLE_AXIS) == 0U) {
+        continue;
+      }
+      const double mass_p = planar_mass[p];
+      const double mass_q = planar_mass[q];
+      const double eta_m =
+          mass_p != 0.0
+              ? mass_q / (2.0 * mass_p)
+              : std::numeric_limits<double>::quiet_NaN();
+      std::ostringstream mass_diag;
+      mass_diag << "[drive-layer-axis-mass] step=" << state.step
+                << " pole=" << pole_name[pole]
+                << " P=" << p
+                << " Q=" << q
+                << " M_A_P=" << format_scientific(mass_p)
+                << " M_A_Q=" << format_scientific(mass_q)
+                << " eta_M=" << format_scientific(eta_m);
+      core::log_info(mass_diag.str());
+    }
+  }
+
+  (void)total_force_r;
+  (void)total_force_z;
+}
+
 void assert_compatible_pre_accel_inputs(const double* force_r,
                                         const double* force_z,
                                         const double* node_mass,
@@ -8098,6 +11690,59 @@ void assert_compatible_pre_accel_inputs(const double* force_r,
   }
 }
 
+void capture_and_zero_polar_tier_origin_force(
+    core::State& state,
+    const core::Config& cfg,
+    double* const force_r,
+    double* const force_z) {
+  // Deliberately scheme-exact: the hybrid has no CENTER_FAN origin to capture.
+  if (cfg.mesh.topology_scheme !=
+      core::TopologyScheme::MULTIBLOCK_POLAR_TIER) {
+    return;
+  }
+  // The installed ReALE tessellation has no NODE_CENTER origin to capture or pin.
+  if (state.mesh.topo.general_polygonal) {
+    return;
+  }
+
+  TENRYU_ASSERT(state.mesh.topo.node_flags.size() ==
+                    static_cast<std::size_t>(state.mesh.topo.n_nodes),
+                "polar-tier topology requires node flags for every node");
+  int origin_node = -1;
+  for (int n = 0; n < state.mesh.topo.n_nodes; ++n) {
+    const std::uint8_t flags =
+        state.mesh.topo.node_flags[static_cast<std::size_t>(n)];
+    if ((flags & mesh::NODE_CENTER) == 0U) {
+      continue;
+    }
+    TENRYU_ASSERT(origin_node < 0,
+                  "polar-tier topology must have exactly one NODE_CENTER");
+    origin_node = n;
+  }
+  TENRYU_ASSERT(origin_node >= 0,
+                "polar-tier topology requires a NODE_CENTER origin");
+
+  auto& diag = state.polar_tier_origin_force_diag;
+  diag.reset();
+  diag.node = origin_node;
+  cuda_check(cudaMemcpy(&diag.raw_force_r,
+                        force_r + origin_node,
+                        sizeof(double),
+                        cudaMemcpyDeviceToHost),
+             "Hydro2D polar-tier origin force_r capture failed");
+  cuda_check(cudaMemcpy(&diag.raw_force_z,
+                        force_z + origin_node,
+                        sizeof(double),
+                        cudaMemcpyDeviceToHost),
+             "Hydro2D polar-tier origin force_z capture failed");
+  diag.valid = true;
+
+  cuda_check(cudaMemset(force_r + origin_node, 0, sizeof(double)),
+             "Hydro2D polar-tier origin force_r zero failed");
+  cuda_check(cudaMemset(force_z + origin_node, 0, sizeof(double)),
+             "Hydro2D polar-tier origin force_z zero failed");
+}
+
 void compute_acceleration_2d(core::NodeField1D& accel_r,
                              core::NodeField1D& accel_z,
                              core::State& state,
@@ -8122,9 +11767,14 @@ void compute_acceleration_2d(core::NodeField1D& accel_r,
                              core::NodeField1D* pole_axis_bbsw_true_force_z =
                                  nullptr,
                              const bool include_plasma_viscosity = true,
+                             const bool aw_axis_slave_theta0_active = false,
+                             const bool aw_axis_slave_theta_pi_active = false,
+                             const SubzonalPressureProjectionDebugBuffers*
+                                 subzonal_projection_debug = nullptr,
                              double* r_momentum_source_force_sum = nullptr,
                              const bool force_midpoint_compatible = false,
-                             const core::CellField1D* midpoint_scalar_q = nullptr) {
+                             const core::CellField1D* midpoint_scalar_q = nullptr,
+                             const char* psc_diag_tag = "untagged") {
   const int n_nodes = static_cast<int>(state.x_r.size());
   const core::State::LaunchWindow nw = state.owned_node_window(n_nodes);
 
@@ -8143,8 +11793,15 @@ void compute_acceleration_2d(core::NodeField1D& accel_r,
       (force_midpoint_compatible ||
        compatible::compatible_force_work_enabled(cfg));
   if (compatible_mode) {
+    const bool force_dump_enabled =
+        !compatible_force_dump_node_ids().empty();
     compatible::launch_assemble_pressure_corner_forces_2d(
-        state, cell_pq, mesh_cache.Svec_r, mesh_cache.Svec_z, d_hydro_active);
+        state, cell_pq, mesh_cache.Svec_r, mesh_cache.Svec_z, d_hydro_active,
+        cfg);
+    if (force_dump_enabled) {
+      dump_compatible_stage_forces(
+          state, cfg, d_hydro_active, CompatibleForceDumpStage::Pressure);
+    }
     if (force_midpoint_compatible &&
         cfg.numerics.hydro.av_model == core::AvModel::ScalarVnrLegacy) {
       TENRYU_ASSERT(midpoint_scalar_q != nullptr,
@@ -8152,21 +11809,45 @@ void compute_acceleration_2d(core::NodeField1D& accel_r,
       compatible::launch_assemble_scalar_av_corner_forces_2d(
           state, *midpoint_scalar_q, mesh_cache.Svec_r, mesh_cache.Svec_z,
           d_hydro_active);
+      if (force_dump_enabled) {
+        dump_compatible_stage_forces(
+            state, cfg, d_hydro_active, CompatibleForceDumpStage::Av);
+      }
     }
-    compute_compatible_subzonal_pressure_force_2d(state, cfg, eos_ctx,
-                                                  d_hydro_active);
+    compute_compatible_subzonal_pressure_force_2d(
+        state, cfg, eos_ctx, d_hydro_active, aw_axis_slave_theta0_active,
+        aw_axis_slave_theta_pi_active, subzonal_projection_debug);
+    if (force_dump_enabled) {
+      dump_compatible_stage_forces(
+          state, cfg, d_hydro_active, CompatibleForceDumpStage::Subzonal);
+    }
     central_pseudo_core::zero_member_compatible_cell_buffers(state);
     pole_angular_derefine::zero_member_compatible_cell_buffers(state);
     compatible::launch_compute_compatible_work_2d(
         state, cfg, state.v_r.data(), state.v_z.data(), d_hydro_active);
     update_compatible_subzonal_pressure_observability_2d(state, cfg);
-    if (include_compatible_av &&
-        cfg.numerics.hydro.av_model != core::AvModel::ScalarVnrLegacy) {
+    if (include_compatible_av) {
       const core::CellField1D& av_cs =
           (cs_for_av != nullptr && !cs_for_av->empty()) ? *cs_for_av : state.cs;
-      compatible::launch_compute_csw_edge_av_2d(
-          state, cfg, av_cs, state.v_r.data(), state.v_z.data(),
-          d_hydro_active);
+      if (cfg.numerics.hydro.av_model ==
+          core::AvModel::MimeticTensorV1) {
+        compatible::launch_compute_tensor_av_2d(
+            state, cfg, av_cs, state.v_r.data(), state.v_z.data(),
+            d_hydro_active, aw_axis_slave_theta0_active,
+            aw_axis_slave_theta_pi_active);
+        central_pseudo_core::zero_member_compatible_cell_buffers(state);
+        pole_angular_derefine::zero_member_compatible_cell_buffers(state);
+      } else {
+        compatible::launch_compute_csw_edge_av_2d(
+            state, cfg, av_cs, state.v_r.data(), state.v_z.data(),
+            d_hydro_active, aw_axis_slave_theta0_active,
+            aw_axis_slave_theta_pi_active, node_mass.data(), state.dt);
+      }
+      if (force_dump_enabled &&
+          cfg.numerics.hydro.av_model != core::AvModel::ScalarVnrLegacy) {
+        dump_compatible_stage_forces(
+            state, cfg, d_hydro_active, CompatibleForceDumpStage::Av);
+      }
       central_pseudo_core::zero_member_edge_av_forces(state);
       pole_angular_derefine::zero_member_edge_av_forces(state);
     }
@@ -8176,6 +11857,12 @@ void compute_acceleration_2d(core::NodeField1D& accel_r,
     }
     compatible::launch_sum_compatible_forces_to_nodes_2d(
         force_r.data(), force_z.data(), d_hydro_active, state, cfg);
+    if (include_compatible_av &&
+        cfg.numerics.hydro.av_model ==
+        core::AvModel::MimeticTensorV1) {
+      compatible::launch_sum_tensor_av_corner_forces_to_nodes_2d(
+          force_r.data(), force_z.data(), d_hydro_active, state);
+    }
     if (force_midpoint_compatible &&
         cfg.numerics.hydro.av_model == core::AvModel::ScalarVnrLegacy) {
       compatible::launch_sum_scalar_av_corner_forces_to_nodes_2d(
@@ -8184,7 +11871,7 @@ void compute_acceleration_2d(core::NodeField1D& accel_r,
     if (include_boundary_pressure) {
       central_pseudo_core::add_boundary_pressure_force(
           state, cfg, cell_pq, force_r.data(), force_z.data(),
-          central_pseudo_core_impulse_dt);
+          central_pseudo_core_impulse_dt, psc_diag_tag);
       pole_angular_derefine::add_boundary_pressure_force(
           state, cfg, cell_pq, force_r.data(), force_z.data(),
           central_pseudo_core_impulse_dt);
@@ -8213,7 +11900,8 @@ void compute_acceleration_2d(core::NodeField1D& accel_r,
                                        visc_params.species != 0);
     braginskii::zero_visc_buffers_2d(state);
     braginskii::Topo2D visc_topo;
-    core::DeviceArray<std::uint8_t> d_visc_cell_nverts;
+    core::DeviceArray<std::uint8_t> d_visc_cell_nverts{
+        "h2d:accel:visc_cell_nverts"};
     if (mesh::mesh_topo_is_multiblock(cfg.mesh)) {
       visc_topo.multiblock = true;
       visc_topo.n_cells = n_cells_visc;
@@ -8275,21 +11963,29 @@ void compute_acceleration_2d(core::NodeField1D& accel_r,
     TENRYU_ASSERT(state.pressure_drive_1d.has_value(),
                   "2D pressure boundary requires pressure_drive_1d table");
     const double p_ext = state.pressure_drive_1d->eval(eval_time);
+    const auto& pcfg =
+        cfg.numerics.hydro.pressure_drive_perturbation;
+    PressureDrivePerturbationParams pp{};
+    if (pcfg.enabled) {
+      pp = core::make_pressure_drive_perturbation_params(pcfg);
+    }
     const bool rz_exact_endpoint =
         state.mesh.logical == mesh::LogicalMesh2D::SphericalPolarHalfplane;
     if (mesh::mesh_topo_is_multiblock(cfg.mesh)) {
-      mesh::mesh_topo_assert_multiblock_polar_shell_outer_boundary(
+      mesh::mesh_topo_assert_multiblock_outermost_polar_shell_outer_boundary(
           state.mesh.topo);
       const int shell_node_begin =
-          mesh::mesh_topo_multiblock_polar_shell_node_offset(state.mesh.topo);
+          mesh::mesh_topo_multiblock_outermost_polar_shell_node_offset(
+              state.mesh.topo);
       const int nr_shell =
-          mesh::mesh_topo_multiblock_polar_shell_nr(state.mesh.topo);
+          mesh::mesh_topo_multiblock_outermost_polar_shell_nr(state.mesh.topo);
       const int nz_polar =
-          mesh::mesh_topo_multiblock_polar_shell_nz(state.mesh.topo);
+          mesh::mesh_topo_multiblock_outermost_polar_shell_nz(state.mesh.topo);
       detail::launch_multiblock_polar_shell_pressure_forces(
           force_r.data(), force_z.data(), state.x_r.data(), state.x_z.data(),
           shell_node_begin, nr_shell, nz_polar, p_ext, rz_exact_endpoint,
-          node_mass.data(), cfg.numerics.hydro.rz_momentum_scheme_id);
+          node_mass.data(), cfg.numerics.hydro.rz_momentum_scheme_id, pp,
+          pcfg.enabled);
       if (trace_pressure_bc && mesh_trace::enabled(state, cfg)) {
         core::NodeField1D bc_force_r{"h2d:accel:bc_force_r_a"};
         core::NodeField1D bc_force_z{"h2d:accel:bc_force_z_a"};
@@ -8306,7 +12002,9 @@ void compute_acceleration_2d(core::NodeField1D& accel_r,
             p_ext,
             rz_exact_endpoint,
             node_mass.data(),
-            cfg.numerics.hydro.rz_momentum_scheme_id);
+            cfg.numerics.hydro.rz_momentum_scheme_id,
+            pp,
+            pcfg.enabled);
         sync_kernel("Hydro2D trace pressure BC multiblock force failed");
         mesh_trace::trace_pressure_bc(state,
                                       cfg,
@@ -8319,7 +12017,7 @@ void compute_acceleration_2d(core::NodeField1D& accel_r,
       detail::launch_r_outer_boundary_pressure_forces(
           force_r.data(), force_z.data(), state.x_r.data(), state.x_z.data(),
           state.mesh.topo.nr, state.mesh.topo.nz, p_ext, rz_exact_endpoint,
-          cfg.numerics.hydro.rz_momentum_scheme_id);
+          cfg.numerics.hydro.rz_momentum_scheme_id, pp, pcfg.enabled);
       if (trace_pressure_bc && mesh_trace::enabled(state, cfg)) {
         core::NodeField1D bc_force_r{"h2d:accel:bc_force_r_b"};
         core::NodeField1D bc_force_z{"h2d:accel:bc_force_z_b"};
@@ -8334,7 +12032,9 @@ void compute_acceleration_2d(core::NodeField1D& accel_r,
             state.mesh.topo.nz,
             p_ext,
             rz_exact_endpoint,
-            cfg.numerics.hydro.rz_momentum_scheme_id);
+            cfg.numerics.hydro.rz_momentum_scheme_id,
+            pp,
+            pcfg.enabled);
         sync_kernel("Hydro2D trace pressure BC force failed");
         mesh_trace::trace_pressure_bc(state,
                                       cfg,
@@ -8371,6 +12071,25 @@ void compute_acceleration_2d(core::NodeField1D& accel_r,
         mirror_pq, state.mesh.topo.nr, state.mesh.topo.nz, true,
         cfg.numerics.hydro.rz_momentum_scheme_id);
   }
+
+  static const int drive_layer_diag_every = [] {
+    const char* const raw = std::getenv("TENRYU_DRIVE_LAYER_DIAG");
+    const int value =
+        raw != nullptr && raw[0] != '\0' ? std::atoi(raw) : 0;
+    return value > 0 ? value : 0;
+  }();
+  if (drive_layer_diag_every > 0 && compatible_mode &&
+      state.step % drive_layer_diag_every == 0) {
+    static int last_drive_layer_diag_step =
+        std::numeric_limits<int>::min();
+    if (last_drive_layer_diag_step != state.step) {
+      last_drive_layer_diag_step = state.step;
+      emit_drive_layer_diag(state, eval_time, force_r, force_z);
+    }
+  }
+
+  capture_and_zero_polar_tier_origin_force(
+      state, cfg, force_r.data(), force_z.data());
 
   if (compatible_mode) {
     constexpr double kCompatibleNodeMassFloor = 1.0e-300;
@@ -8448,6 +12167,14 @@ void compute_acceleration_2d(core::NodeField1D& accel_r,
       r_outer_type,
       parse_boundary_2d_type(cfg.numerics.hydro.boundary_2d.z_bottom),
       parse_boundary_2d_type(cfg.numerics.hydro.boundary_2d.z_top));
+  if (!state.mesh.topo.multiblock.has_value()) {
+    const double* const resolved_node_mass =
+        cfg.numerics.hydro.rz_momentum_scheme_id == 0
+            ? node_mass.data()
+            : state.node_planar_mass.data();
+    launch_apply_evac_contact_accel_constraints(
+        state, accel_r.data(), accel_z.data(), resolved_node_mass);
+  }
 
   sync_kernel("Hydro2D compute_acceleration_2d kernels failed");
   if (const char* adbg = std::getenv("TENRYU_H2D_DEBUG_ACCEL")) {
@@ -8527,12 +12254,15 @@ void recompute_midpoint_corner_work_2d(
   sync_kernel("Hydro2D midpoint compatible work recompute failed");
 }
 
+template <int RZ_SCHEME>
 __global__ void pressure_boundary_work_dot_kernel(
     double* __restrict__ work,
     const double* __restrict__ force_r,
     const double* __restrict__ force_z,
     const double* __restrict__ velocity_r,
     const double* __restrict__ velocity_z,
+    const double* __restrict__ node_mass,
+    const double* __restrict__ node_planar_mass,
     const int n_begin,
     const int n_end,
     const int n_nodes) {
@@ -8540,7 +12270,16 @@ __global__ void pressure_boundary_work_dot_kernel(
   if (n >= n_end) {
     return;
   }
-  work[n] = force_r[n] * velocity_r[n] + force_z[n] * velocity_z[n];
+  double conjugate_scale = 1.0;
+  if constexpr (RZ_SCHEME == 1) {
+    // AWS advances velocity with F_A / M_A, while E_total measures nodal
+    // kinetic energy with M_RZ.  Therefore the force conjugate to that
+    // kinetic-energy basis is (M_RZ / M_A) F_A.
+    const double planar_mass = node_planar_mass[n];
+    conjugate_scale = planar_mass > 0.0 ? node_mass[n] / planar_mass : 0.0;
+  }
+  work[n] = conjugate_scale *
+            (force_r[n] * velocity_r[n] + force_z[n] * velocity_z[n]);
 }
 
 double compute_pressure_boundary_work_step_2d(
@@ -8574,32 +12313,56 @@ double compute_pressure_boundary_work_step_2d(
   work.reset(state.x_r.size());
 
   const double p_ext = state.pressure_drive_1d->eval(eval_time);
+  const auto& pcfg =
+      cfg.numerics.hydro.pressure_drive_perturbation;
+  PressureDrivePerturbationParams pp{};
+  if (pcfg.enabled) {
+    pp = core::make_pressure_drive_perturbation_params(pcfg);
+  }
   const bool rz_exact_endpoint =
       state.mesh.logical == mesh::LogicalMesh2D::SphericalPolarHalfplane;
   if (mesh::mesh_topo_is_multiblock(cfg.mesh)) {
-    mesh::mesh_topo_assert_multiblock_polar_shell_outer_boundary(
+    mesh::mesh_topo_assert_multiblock_outermost_polar_shell_outer_boundary(
         state.mesh.topo);
     const int shell_node_begin =
-        mesh::mesh_topo_multiblock_polar_shell_node_offset(state.mesh.topo);
+        mesh::mesh_topo_multiblock_outermost_polar_shell_node_offset(
+            state.mesh.topo);
     const int nr_shell =
-        mesh::mesh_topo_multiblock_polar_shell_nr(state.mesh.topo);
+        mesh::mesh_topo_multiblock_outermost_polar_shell_nr(state.mesh.topo);
     const int nz_polar =
-        mesh::mesh_topo_multiblock_polar_shell_nz(state.mesh.topo);
+        mesh::mesh_topo_multiblock_outermost_polar_shell_nz(state.mesh.topo);
     detail::launch_multiblock_polar_shell_pressure_forces(
         force_r.data(), force_z.data(), state.x_r.data(), state.x_z.data(),
         shell_node_begin, nr_shell, nz_polar, p_ext, rz_exact_endpoint,
-        node_mass.data(), cfg.numerics.hydro.rz_momentum_scheme_id);
+        node_mass.data(), cfg.numerics.hydro.rz_momentum_scheme_id, pp,
+        pcfg.enabled);
   } else {
     detail::launch_r_outer_boundary_pressure_forces(
         force_r.data(), force_z.data(), state.x_r.data(), state.x_z.data(),
         state.mesh.topo.nr, state.mesh.topo.nz, p_ext, rz_exact_endpoint,
-        cfg.numerics.hydro.rz_momentum_scheme_id);
+        cfg.numerics.hydro.rz_momentum_scheme_id, pp, pcfg.enabled);
   }
 
   const core::State::LaunchWindow nw = state.owned_node_window(n_nodes);
-  pressure_boundary_work_dot_kernel<<<nw.blocks(), 256>>>(
-      work.data(), force_r.data(), force_z.data(), velocity_r.data(),
-      velocity_z.data(), nw.begin, nw.end, n_nodes);
+  switch (cfg.numerics.hydro.rz_momentum_scheme_id) {
+    case 0:
+      pressure_boundary_work_dot_kernel<0><<<nw.blocks(), 256>>>(
+          work.data(), force_r.data(), force_z.data(), velocity_r.data(),
+          velocity_z.data(), node_mass.data(), nullptr, nw.begin, nw.end,
+          n_nodes);
+      break;
+    case 1:
+      TENRYU_ASSERT(state.node_planar_mass.size() ==
+                        static_cast<std::size_t>(n_nodes),
+                    "Hydro2D AWS boundary work requires node planar mass");
+      pressure_boundary_work_dot_kernel<1><<<nw.blocks(), 256>>>(
+          work.data(), force_r.data(), force_z.data(), velocity_r.data(),
+          velocity_z.data(), node_mass.data(), state.node_planar_mass.data(),
+          nw.begin, nw.end, n_nodes);
+      break;
+    default:
+      TENRYU_ASSERT(false, "Hydro2D invalid resolved RZ momentum scheme");
+  }
   sync_kernel("Hydro2D pressure-boundary work audit failed");
 
   std::vector<double> work_host;
@@ -8647,18 +12410,51 @@ void populate_mesh_forensics_sample(
   const int cell = result.first_failing_cell;
   const int nr = state.mesh.topo.nr;
   const int nz = state.mesh.topo.nz;
-  if (cell < 0 || nr <= 0 || nz <= 0 || cell >= nr * nz) {
-    return;
+  const bool split_polar_shell =
+      state.mesh.topo.multiblock.has_value() &&
+      mesh::mesh_topo_multiblock_polar_shell_block_count(
+          *state.mesh.topo.multiblock) > 1;
+  int nodes[4] = {-1, -1, -1, -1};
+  int sample_count = 4;
+  if (split_polar_shell) {
+    if (cell < 0 || cell >= state.mesh.topo.n_cells) {
+      return;
+    }
+    const mesh::MultiBlockTopology& mb = *state.mesh.topo.multiblock;
+    if (mb.cell_node_csr_offsets.size() !=
+            static_cast<std::size_t>(state.mesh.topo.n_cells) + 1U ||
+        mb.cell_node_csr_indices.empty()) {
+      return;
+    }
+    const int off =
+        mb.cell_node_csr_offsets[static_cast<std::size_t>(cell)];
+    const int nverts =
+        mesh::mesh_topo_cell_active_nverts(state.mesh.cell_nverts, cell);
+    sample_count = std::min(4, nverts);
+    if (off < 0 || sample_count <= 0 ||
+        static_cast<std::size_t>(off + sample_count) >
+            mb.cell_node_csr_indices.size()) {
+      return;
+    }
+    for (int k = 0; k < sample_count; ++k) {
+      nodes[k] =
+          mb.cell_node_csr_indices[static_cast<std::size_t>(off + k)];
+      if (nodes[k] < 0 || nodes[k] >= state.mesh.topo.n_nodes) {
+        return;
+      }
+    }
+  } else {
+    if (cell < 0 || nr <= 0 || nz <= 0 || cell >= nr * nz) {
+      return;
+    }
+    const int i = cell / nz;
+    const int j = cell - i * nz;
+    nodes[0] = rz_node_index_2d(i, j, nz);
+    nodes[1] = rz_node_index_2d(i + 1, j, nz);
+    nodes[2] = rz_node_index_2d(i + 1, j + 1, nz);
+    nodes[3] = rz_node_index_2d(i, j + 1, nz);
   }
-  const int i = cell / nz;
-  const int j = cell - i * nz;
-  const int nodes[4] = {
-      rz_node_index_2d(i, j, nz),
-      rz_node_index_2d(i + 1, j, nz),
-      rz_node_index_2d(i + 1, j + 1, nz),
-      rz_node_index_2d(i, j + 1, nz),
-  };
-  for (int k = 0; k < 4; ++k) {
+  for (int k = 0; k < sample_count; ++k) {
     auto& out = result.mesh_forensics_nodes[static_cast<std::size_t>(k)];
     const int n = nodes[k];
     out.r_old = copy_node_scalar(r_old.data(), n);
@@ -8692,6 +12488,32 @@ void populate_mesh_forensics_sample(
 }
 
 }  // namespace
+
+void launch_compute_node_mass_for_cfl_2d(
+    double* const node_mass,
+    const core::State& state,
+    const core::Config& cfg,
+    const std::uint8_t* const d_cell_nverts,
+    const std::int8_t* const d_hydro_active) {
+  if (state.mesh.topo.multiblock.has_value() &&
+      !state.mesh.multiblock_reverse_csr_node_offsets.empty()) {
+    detail::launch_compute_node_mass_2d_multiblock(
+        node_mass,
+        state.corner_mass.data(),
+        state.mass.data(),
+        state.x_r.data(),
+        state.mesh.multiblock_reverse_csr_node_offsets.data(),
+        state.mesh.multiblock_reverse_csr_node_cells.data(),
+        state.mesh.multiblock_reverse_csr_node_corners.data(),
+        static_cast<int>(state.x_r.size()),
+        equal_split_node_mass_mode(
+            cfg.numerics.hydro.axis_node_mass_convention),
+        state.corner_stride);
+  } else {
+    launch_compute_node_mass_2d(node_mass, state, cfg, d_cell_nverts,
+                                d_hydro_active);
+  }
+}
 
 double compute_node_r_momentum_2d(const core::State& state,
                                   const core::Config& cfg) {
@@ -9206,7 +13028,9 @@ void compute_hydro_2d_force_work_audit_fields(
                             cfg.numerics.hydro.corner_mass_convention),
                         cfg.numerics.hydro.subzonal_pressure_enabled,
                         recompute_corner_mass_each_step(cfg),
-                        corner_mass_lagrangian_invariant_enabled(cfg));
+                        corner_mass_lagrangian_invariant_enabled(cfg),
+                        cfg.numerics.hydro.aw_compatible_force_work,
+                        mesh::mesh_topo_polar_tier_family(cfg.mesh));
   ensure_hourglass_subzonal_masses_2d(state, cfg, false);
   pole_angular_derefine::ensure_built(state, cfg);
   ale::csr_optionb_canonicalize_corner_mass_basis(state, cfg);
@@ -9236,10 +13060,11 @@ void compute_hydro_2d_force_work_audit_fields(
   launch_compute_node_mass_2d(
       node_mass.data(), state, cfg, d_cell_nverts, d_hydro_force_active);
   sync_kernel("Hydro2D force/work audit compute_node_mass failed");
+  const int blocks_cells = (n_cells + 255) / 256;
   if (cfg.numerics.hydro.rz_momentum_scheme_id == 1) {
     const int blocks_cells = (n_cells + 255) / 256;
     launch_compute_node_planar_mass_2d(
-        state, d_hydro_force_active, blocks_cells);
+        state, d_cell_nverts, d_hydro_force_active, blocks_cells);
     sync_kernel("Hydro2D force/work audit compute_node_planar_mass failed");
   }
 
@@ -9296,9 +13121,45 @@ void compute_hydro_2d_force_work_audit_fields(
   force_z.reset(static_cast<std::size_t>(n_nodes));
   accel_r.reset(static_cast<std::size_t>(n_nodes));
   accel_z.reset(static_cast<std::size_t>(n_nodes));
+  if (cfg.numerics.hydro.aw_compatible_force_work) {
+    const AwAxisSlaveStructuredLines aw_axis_slave_lines =
+        detect_aw_axis_slave_structured_lines(state, cfg);
+    compute_acceleration_2d(
+        accel_r, accel_z, state, cfg, eval_time, mesh_cache, cell_pq,
+        d_node_active, d_node_flags, node_mass, d_hydro_force_active, nullptr,
+        true, false, true, &cs, true, &force_r, &force_z, 0.0, false, nullptr,
+        true, aw_axis_slave_lines.theta0_active,
+        aw_axis_slave_lines.theta_pi_active, nullptr, nullptr, false, nullptr,
+        "force_work_audit");
+    // Same rationale as the fall-through path below: the force umbrella runs
+    // the compatible-work corrector BEFORE the csw edge-AV assembly, whose
+    // apply re-zeroes work_av_per_cell and leaves planar assembly-stage
+    // estimates. Re-run the corrector so the audit fields expose the
+    // corrector-final exact RZ work from the fully assembled forces.
+    if (compatible::compatible_force_work_enabled(cfg) &&
+        !(state.mesh.button_center && state.mesh.button_center->enabled)) {
+      compatible::launch_compute_compatible_work_2d(
+          state, cfg, state.v_r.data(), state.v_z.data(), d_hydro_active);
+    }
+    cleanup();
+    return;
+  }
+
   launch_compute_force_from_cells_2d(
       force_r.data(), force_z.data(), cell_pq.data(), mesh_cache.Svec_r.data(),
       mesh_cache.Svec_z.data(), d_hydro_force_active, state, cfg);
+
+  // The force umbrella runs the compatible-work corrector BEFORE the csw
+  // edge-AV assembly, whose apply then re-zeroes work_av_per_cell and leaves
+  // planar assembly-stage estimates in the ledger (production instead
+  // consumes the midpoint corrector stage downstream). Re-run the corrector
+  // here so the audit fields expose the corrector-final exact RZ work,
+  // recomputed from the fully assembled forces, for all three terms.
+  if (compatible::compatible_force_work_enabled(cfg) &&
+      !(state.mesh.button_center && state.mesh.button_center->enabled)) {
+    compatible::launch_compute_compatible_work_2d(
+        state, cfg, state.v_r.data(), state.v_z.data(), d_hydro_active);
+  }
 
   const auto r_outer_type =
       parse_boundary_2d_type(cfg.numerics.hydro.boundary_2d.r_outer);
@@ -9306,23 +13167,31 @@ void compute_hydro_2d_force_work_audit_fields(
     TENRYU_ASSERT(state.pressure_drive_1d.has_value(),
                   "Hydro2D force/work audit pressure boundary requires table");
     const double p_ext = state.pressure_drive_1d->eval(eval_time);
+    const auto& pcfg =
+        cfg.numerics.hydro.pressure_drive_perturbation;
+    PressureDrivePerturbationParams pp{};
+    if (pcfg.enabled) {
+      pp = core::make_pressure_drive_perturbation_params(pcfg);
+    }
     const bool rz_exact_endpoint =
         state.mesh.logical == mesh::LogicalMesh2D::SphericalPolarHalfplane;
     if (mesh::mesh_topo_is_multiblock(cfg.mesh)) {
-      mesh::mesh_topo_assert_multiblock_polar_shell_outer_boundary(
+      mesh::mesh_topo_assert_multiblock_outermost_polar_shell_outer_boundary(
           state.mesh.topo);
       launch_multiblock_polar_shell_pressure_forces(
           force_r.data(), force_z.data(), state.x_r.data(), state.x_z.data(),
-          mesh::mesh_topo_multiblock_polar_shell_node_offset(state.mesh.topo),
-          mesh::mesh_topo_multiblock_polar_shell_nr(state.mesh.topo),
-          mesh::mesh_topo_multiblock_polar_shell_nz(state.mesh.topo), p_ext,
+          mesh::mesh_topo_multiblock_outermost_polar_shell_node_offset(
+              state.mesh.topo),
+          mesh::mesh_topo_multiblock_outermost_polar_shell_nr(state.mesh.topo),
+          mesh::mesh_topo_multiblock_outermost_polar_shell_nz(state.mesh.topo),
+          p_ext,
           rz_exact_endpoint, node_mass.data(),
-          cfg.numerics.hydro.rz_momentum_scheme_id);
+          cfg.numerics.hydro.rz_momentum_scheme_id, pp, pcfg.enabled);
     } else {
       launch_r_outer_boundary_pressure_forces(
           force_r.data(), force_z.data(), state.x_r.data(), state.x_z.data(),
           state.mesh.topo.nr, state.mesh.topo.nz, p_ext, rz_exact_endpoint,
-          cfg.numerics.hydro.rz_momentum_scheme_id);
+          cfg.numerics.hydro.rz_momentum_scheme_id, pp, pcfg.enabled);
     }
   }
 
@@ -9339,6 +13208,14 @@ void compute_hydro_2d_force_work_audit_fields(
       r_outer_type,
       parse_boundary_2d_type(cfg.numerics.hydro.boundary_2d.z_bottom),
       parse_boundary_2d_type(cfg.numerics.hydro.boundary_2d.z_top));
+  if (!state.mesh.topo.multiblock.has_value()) {
+    const double* const resolved_node_mass =
+        cfg.numerics.hydro.rz_momentum_scheme_id == 0
+            ? node_mass.data()
+            : state.node_planar_mass.data();
+    launch_apply_evac_contact_accel_constraints(
+        state, accel_r.data(), accel_z.data(), resolved_node_mass);
+  }
 
   sync_kernel("Hydro2D force/work audit force/accel failed");
   cleanup();
@@ -9744,11 +13621,11 @@ void accumulate_centroid_r_innermost_bins_perturbation_diag(
         have_cell_nverts
             ? mesh::mesh_topo_cell_active_nverts(state.mesh.cell_nverts, c)
             : mesh::kMeshTopoCellStorageSlots;
-    int nodes[mesh::kMeshTopoCellStorageSlotsMax];
-    double rr0[mesh::kMeshTopoCellStorageSlotsMax];
-    double zz0[mesh::kMeshTopoCellStorageSlotsMax];
-    double rr1[mesh::kMeshTopoCellStorageSlotsMax];
-    double zz1[mesh::kMeshTopoCellStorageSlotsMax];
+    int nodes[mesh::kMeshTopoCellStorageSlotsMaxGeneral];
+    double rr0[mesh::kMeshTopoCellStorageSlotsMaxGeneral];
+    double zz0[mesh::kMeshTopoCellStorageSlotsMaxGeneral];
+    double rr1[mesh::kMeshTopoCellStorageSlotsMaxGeneral];
+    double zz1[mesh::kMeshTopoCellStorageSlotsMaxGeneral];
     for (int k = 0; k < active_nverts; ++k) {
       nodes[k] = mb.cell_node_csr_indices[static_cast<std::size_t>(off + k)];
       const auto nidx = static_cast<std::size_t>(nodes[k]);
@@ -9868,12 +13745,31 @@ void Hydro2D::prepare_initial_corner_mass(core::State& state,
                             cfg.numerics.hydro.corner_mass_convention),
                         cfg.numerics.hydro.subzonal_pressure_enabled,
                         recompute_corner_mass_each_step(cfg),
-                        corner_mass_lagrangian_invariant_enabled(cfg));
+                        corner_mass_lagrangian_invariant_enabled(cfg),
+                        cfg.numerics.hydro.aw_compatible_force_work,
+                        mesh::mesh_topo_polar_tier_family(cfg.mesh));
   if (d_cell_nverts != nullptr) {
     cuda_check(cudaFree(d_cell_nverts),
                "Hydro2D: cudaFree cell_nverts failed");
     d_cell_nverts = nullptr;
   }
+}
+
+void Hydro2D::reclose_after_energy_edit(
+    core::State& state,
+    const core::Config& cfg,
+    const HydroEOSContext* eos_ctx) const {
+  if (state.rho.empty()) {
+    return;
+  }
+  const HydroTableViews eos_views = select_hydro_table_views(eos_ctx);
+  const bool use_two_temp = cfg.main.two_temperature;
+  const std::int8_t* hydro_active = state.hydro_active_device_ptr();
+  enforce_eos_closure(state, cfg, use_two_temp, eos_views, hydro_active);
+  core::CellField1D cs_new;
+  compute_cell_sound_speed(cs_new, state, cfg, use_two_temp, eos_views,
+                           hydro_active);
+  state.cs = std::move(cs_new);
 }
 
 void Hydro2D::apply_state_supply_boundary(core::State& state,
@@ -9934,6 +13830,7 @@ tenryu::coupling::HydroStepResult Hydro2D::lagrangian_step(
   const std::string& av_heat_to = cfg.numerics.hydro.av_heat_to;
   TENRYU_ASSERT(av_heat_to == "ion" || av_heat_to == "electron",
                 "Numerics.hydro.av_heat_to must be \"ion\" or \"electron\" in v1.0");
+  mesh::MeshSvecLazyScope svec_lazy_scope(state.mesh);
   const int q_heat_to_electron = (av_heat_to == "electron") ? 1 : 0;
   double local_E_floor = 0.0;
   int local_clamp_count = 0;
@@ -9978,6 +13875,14 @@ tenryu::coupling::HydroStepResult Hydro2D::lagrangian_step(
 
   const int n_cells = static_cast<int>(state.rho.size());
   const int n_nodes = static_cast<int>(state.x_r.size());
+  std::unique_ptr<CarrierHookContext> carrier_hook_context;
+  const auto ensure_carrier_hook_context = [&]() -> CarrierHookContext& {
+    if (!carrier_hook_context) {
+      carrier_hook_context = std::make_unique<CarrierHookContext>(state);
+    }
+    return *carrier_hook_context;
+  };
+  const bool path_guard_enabled = i1b_path_guard_enabled();
   const int blocks_cells = (n_cells + 255) / 256;
   const int blocks_nodes = (n_nodes + 255) / 256;
   const core::State::LaunchWindow cw = state.owned_cell_window(n_cells);
@@ -9987,6 +13892,53 @@ tenryu::coupling::HydroStepResult Hydro2D::lagrangian_step(
   const bool axis_lagrangian_tangential =
       cfg.numerics.ale.axis_z_motion == "lagrangian_tangential";
   const bool state_supply_active = has_state_supply_bc(cfg);
+  static const bool aw_axis_snap_env_enabled = [] {
+    const char* const raw = std::getenv("TENRYU_AW_AXIS_SNAP");
+    return raw == nullptr || std::string(raw) != "0";
+  }();
+  static const int drive_layer_diag_every = [] {
+    const char* const raw = std::getenv("TENRYU_DRIVE_LAYER_DIAG");
+    const int value =
+        raw != nullptr && raw[0] != '\0' ? std::atoi(raw) : 0;
+    return value > 0 ? value : 0;
+  }();
+  static const int shadow_replay_step = [] {
+    const char* const raw = std::getenv("TENRYU_SHADOW_REPLAY");
+    if (raw == nullptr || raw[0] == '\0') {
+      return -1;
+    }
+    char* end = nullptr;
+    const long parsed = std::strtol(raw, &end, 10);
+    if (end == raw || *end != '\0' || parsed < 0 ||
+        parsed > std::numeric_limits<int>::max()) {
+      return -1;
+    }
+    return static_cast<int>(parsed);
+  }();
+  static bool shadow_replay_printed = false;
+  const AwAxisSlaveStructuredLines aw_axis_slave_lines =
+      detect_aw_axis_slave_structured_lines(state, cfg);
+  aw_axis_slave_theta0_active_ = aw_axis_slave_lines.theta0_active;
+  aw_axis_slave_theta_pi_active_ = aw_axis_slave_lines.theta_pi_active;
+  const bool aw_axis_slave_active =
+      aw_axis_slave_theta0_active_ || aw_axis_slave_theta_pi_active_;
+  const bool aw_axis_slave_multiblock_candidate =
+      aw_axis_slave_enabled() &&
+      cfg.numerics.hydro.aw_compatible_force_work &&
+      state.mesh.topo.multiblock.has_value() &&
+      mesh::mesh_topo_polar_tier_family(cfg.mesh);
+  bool aw_axis_slave_multiblock_active = false;
+  const int aw_axis_slave_first_i =
+      aw_axis_slave_active &&
+              (state.mesh.topo.node_flags[static_cast<std::size_t>(
+                   state.mesh.topo.node_index(0, 0))] &
+               mesh::NODE_CENTER) != 0U
+          ? 1
+          : 0;
+  if (aw_axis_slave_active &&
+      aw_axis_slave_kappa_saved_.size() != state.x_r.size()) {
+    aw_axis_slave_kappa_saved_.reset(state.x_r.size());
+  }
   mesh_trace::trace_start(state, cfg, dt);
   mesh_trace::trace_cell0_geometry(state, cfg, "start");
 
@@ -10127,7 +14079,26 @@ tenryu::coupling::HydroStepResult Hydro2D::lagrangian_step(
                             cfg.numerics.hydro.corner_mass_convention),
                         cfg.numerics.hydro.subzonal_pressure_enabled,
                         recompute_corner_mass_each_step(cfg),
-                        corner_mass_lagrangian_invariant_enabled(cfg));
+                        corner_mass_lagrangian_invariant_enabled(cfg),
+                        cfg.numerics.hydro.aw_compatible_force_work,
+                        mesh::mesh_topo_polar_tier_family(cfg.mesh));
+  if (aw_axis_slave_multiblock_candidate) {
+    const mesh::MultiBlockTopology* const topology =
+        &*state.mesh.topo.multiblock;
+    if (aw_axis_slave_multiblock_topology_ != topology) {
+      const AwAxisSlaveMasterList master =
+          build_aw_axis_slave_master_list_multiblock(state, cfg);
+      TENRYU_ASSERT(master.p.size() == master.q.size(),
+                    "AW axis multiblock master list size mismatch");
+      aw_axis_slave_p_.reset(master.p.size());
+      aw_axis_slave_q_.reset(master.q.size());
+      aw_axis_slave_multiblock_kappa_saved_.reset(master.p.size());
+      aw_axis_slave_p_.copy_from_host(master.p);
+      aw_axis_slave_q_.copy_from_host(master.q);
+      aw_axis_slave_multiblock_topology_ = topology;
+    }
+    aw_axis_slave_multiblock_active = !aw_axis_slave_p_.empty();
+  }
   central_pseudo_core::maybe_absorb_first_active_ring(state, cfg);
   pole_angular_derefine::ensure_built(state, cfg);
   ale::csr_optionb_canonicalize_corner_mass_basis(state, cfg);
@@ -10386,7 +14357,7 @@ tenryu::coupling::HydroStepResult Hydro2D::lagrangian_step(
   sync_kernel("Hydro2D compute_node_mass kernel failed");
   if (cfg.numerics.hydro.rz_momentum_scheme_id == 1) {
     launch_compute_node_planar_mass_2d(
-        state, d_hydro_force_active, blocks_cells);
+        state, d_cell_nverts, d_hydro_force_active, blocks_cells);
     sync_kernel("Hydro2D compute_node_planar_mass kernel failed");
   }
   mesh_trace::trace_activity(state,
@@ -10515,6 +14486,7 @@ tenryu::coupling::HydroStepResult Hydro2D::lagrangian_step(
   cuda_check(cudaMemcpy(uz_old.data(), state.v_z.data(), n_nodes * sizeof(double),
                         cudaMemcpyDeviceToDevice),
              "Hydro2D: copy uz_old failed");
+  emit_origin_trace_step_begin(state, uz_old.data());
   cuda_check(cudaMemcpy(V_old.data(), state.vol.data(), n_cells * sizeof(double),
                         cudaMemcpyDeviceToDevice),
              "Hydro2D: copy V_old failed");
@@ -10558,8 +14530,35 @@ tenryu::coupling::HydroStepResult Hydro2D::lagrangian_step(
   compute_acceleration_2d(a_n_r, a_n_z, state, cfg, t_op, mesh_cache, pq_n,
                           d_node_active, d_node_flags, node_mass, d_hydro_force_active,
                           eos_ctx, true, true, true, &cs_n, true, nullptr, nullptr,
-                          0.0, false, nullptr, true, nullptr, midpoint_v1,
-                          midpoint_v1 ? &state.Qvisc : nullptr);
+                          0.0, false, nullptr, true,
+                          aw_axis_slave_theta0_active_,
+                          aw_axis_slave_theta_pi_active_, nullptr, nullptr,
+                          midpoint_v1,
+                          midpoint_v1 ? &state.Qvisc : nullptr, "dyn_a");
+  static const bool axiswall_diag_enabled = [] {
+    const char* const raw = std::getenv("TENRYU_AXISWALL_DIAG");
+    return raw != nullptr && raw[0] != '\0';
+  }();
+  if (axiswall_diag_enabled) {
+    TENRYU_ASSERT(
+        compatible_energy_mode,
+        "TENRYU_AXISWALL_DIAG requires compatible force/work assembly");
+    const core::NodeField1D& axiswall_node_mass =
+        cfg.numerics.hydro.rz_momentum_scheme_id == 1
+            ? state.node_planar_mass
+            : node_mass;
+    emit_axiswall_diag(state,
+                       cfg,
+                       t_op,
+                       dt,
+                       r_old,
+                       z_old,
+                       ur_old,
+                       uz_old,
+                       axiswall_node_mass,
+                       d_node_active,
+                       *hydro_force_active_host);
+  }
   mesh_trace::trace_post_pressure_accel(state,
                                         cfg,
                                         a_n_r,
@@ -10608,8 +14607,25 @@ tenryu::coupling::HydroStepResult Hydro2D::lagrangian_step(
                                     d_hydro_force_active,
                                     dt);
     add_hourglass_acceleration_2d(a_n_r, a_n_z, a_hg_n_r, a_hg_n_z);
+    // §22 contact must be last; hourglass leaked ~0.04 nm/step into the held gap.
+    launch_apply_evac_contact_accel_constraints(
+        state,
+        a_n_r.data(),
+        a_n_z.data(),
+        cfg.numerics.hydro.rz_momentum_scheme_id == 0
+            ? node_mass.data()
+            : state.node_planar_mass.data());
   }
   mesh_trace::trace_post_total_accel(state, cfg, a_n_r, a_n_z);
+  if (!state.carrier_domain_active || !state.boundary_carrier.valid ||
+      state.carrier_node_class.empty()) { /* skip */
+  } else {
+    ensure_carrier_hook_context().apply_condensation(
+        a_n_r.data(), a_n_z.data(),
+        cfg.numerics.hydro.rz_momentum_scheme_id == 1
+            ? state.node_planar_mass.data()
+            : node_mass.data());
+  }
   core::NodeField1D u_half_r{"h2d:step:u_half_r"};
   core::NodeField1D u_half_z{"h2d:step:u_half_z"};
   core::NodeField1D predictor_work_v_r{"h2d:step:predictor_work_v_r"};
@@ -10618,10 +14634,20 @@ tenryu::coupling::HydroStepResult Hydro2D::lagrangian_step(
   if (midpoint_v1) {
     u_half_r.reset(n_nodes);
     u_half_z.reset(n_nodes);
-    update_node_velocity_2d_kernel<<<blocks_nodes, 256>>>(
+    // §22: the constraint must hold at consumption; modifier-chasing is insufficient.
+    launch_apply_evac_contact_accel_constraints(
+        state,
+        a_n_r.data(),
+        a_n_z.data(),
+        cfg.numerics.hydro.rz_momentum_scheme_id == 0
+            ? node_mass.data()
+            : state.node_planar_mass.data());
+    launch_update_node_velocity_2d(
         u_half_r.data(), u_half_z.data(), ur_old.data(), uz_old.data(),
-        a_n_r.data(), a_n_z.data(), d_node_active, d_node_flags, nw.begin,
-        nw.end, n_nodes, 0.5 * dt);
+        a_n_r.data(), a_n_z.data(), d_node_active, d_node_flags, n_nodes,
+        0.5 * dt, state, cfg);
+    evacuated_cell_contact_probe(state, cfg, "post_vel_kernel");
+    emit_origin_trace(state, "post_predictor_uhalf", u_half_z.data());
     predictor_work_v_r.reset(n_nodes);
     predictor_work_v_z.reset(n_nodes);
     average_arrays_kernel<<<blocks_nodes, 256>>>(
@@ -10701,12 +14727,16 @@ tenryu::coupling::HydroStepResult Hydro2D::lagrangian_step(
                             mesh_cache, attr_pressure_n, d_node_active, d_node_flags,
                             node_mass, d_hydro_force_active, eos_ctx, true, false, true,
                             &cs_n, false, nullptr, nullptr, 0.0, false, nullptr,
-                            false);
+                            false, aw_axis_slave_theta0_active_,
+                            aw_axis_slave_theta_pi_active_, nullptr, nullptr,
+                            false, nullptr, "attr_p");
     compute_acceleration_2d(attr_q_n_r, attr_q_n_z, state, cfg, t_op, mesh_cache,
                             attr_q_n, d_node_active, d_node_flags, node_mass,
                             d_hydro_force_active, eos_ctx, false, false, false,
                             nullptr, true, nullptr, nullptr, 0.0, false, nullptr,
-                            false);
+                            false, aw_axis_slave_theta0_active_,
+                            aw_axis_slave_theta_pi_active_, nullptr, nullptr,
+                            false, nullptr, "attr_q");
   }
   if (center_perturbation_active) {
     if (center_perturbation_scope ==
@@ -10758,10 +14788,20 @@ tenryu::coupling::HydroStepResult Hydro2D::lagrangian_step(
   if (!midpoint_v1) {
     u_half_r.reset(n_nodes);
     u_half_z.reset(n_nodes);
-    update_node_velocity_2d_kernel<<<nw.blocks(), 256>>>(
+    // §22: the constraint must hold at consumption; modifier-chasing is insufficient.
+    launch_apply_evac_contact_accel_constraints(
+        state,
+        a_n_r.data(),
+        a_n_z.data(),
+        cfg.numerics.hydro.rz_momentum_scheme_id == 0
+            ? node_mass.data()
+            : state.node_planar_mass.data());
+    launch_update_node_velocity_2d(
         u_half_r.data(), u_half_z.data(), ur_old.data(), uz_old.data(),
         a_n_r.data(), a_n_z.data(), d_node_active, d_node_flags,
-        nw.begin, nw.end, n_nodes, 0.5 * dt);
+        n_nodes, 0.5 * dt, state, cfg);
+    evacuated_cell_contact_probe(state, cfg, "post_vel_kernel");
+    emit_origin_trace(state, "post_predictor_uhalf", u_half_z.data());
   }
   core::NodeField1D& predictor_base_r =
       midpoint_v1 ? predictor_work_v_r : u_half_r;
@@ -10837,18 +14877,214 @@ tenryu::coupling::HydroStepResult Hydro2D::lagrangian_step(
                                         nullptr,
                                         nullptr,
                                         0.5 * dt);
+  if (aw_axis_slave_active) {
+    launch_apply_aw_axis_velocity_slave_2d(
+        u_half_r.data(),
+        u_half_z.data(),
+        state.x_r.data(),
+        state.x_z.data(),
+        aw_axis_slave_kappa_saved_.data(),
+        state.mesh.topo.nr,
+        state.mesh.topo.nz,
+        aw_axis_slave_first_i,
+        aw_axis_slave_theta0_active_,
+        aw_axis_slave_theta_pi_active_,
+        true);
+    if (drive_layer_diag_every > 0 && state.step <= 10) {
+      const int i = state.mesh.topo.nr;
+      const int stride = state.mesh.topo.nz + 1;
+      const auto emit_axis_slave_dbg =
+          [&](const char* const pole, const int p, const int q) {
+            double uz_p = 0.0;
+            double ur_q = 0.0;
+            double uz_q = 0.0;
+            double kappa = 0.0;
+            cuda_check(cudaMemcpy(&uz_p,
+                                  u_half_z.data() + p,
+                                  sizeof(double),
+                                  cudaMemcpyDeviceToHost),
+                       "Hydro2D axis slave dbg copy uzP failed");
+            cuda_check(cudaMemcpy(&ur_q,
+                                  u_half_r.data() + q,
+                                  sizeof(double),
+                                  cudaMemcpyDeviceToHost),
+                       "Hydro2D axis slave dbg copy urQ failed");
+            cuda_check(cudaMemcpy(&uz_q,
+                                  u_half_z.data() + q,
+                                  sizeof(double),
+                                  cudaMemcpyDeviceToHost),
+                       "Hydro2D axis slave dbg copy uzQ failed");
+            cuda_check(cudaMemcpy(&kappa,
+                                  aw_axis_slave_kappa_saved_.data() + p,
+                                  sizeof(double),
+                                  cudaMemcpyDeviceToHost),
+                       "Hydro2D axis slave dbg copy kappa failed");
+            std::ostringstream os;
+            os << "[axis-slave-dbg] step=" << state.step
+               << " pole=" << pole
+               << " i=" << i
+               << " P=" << p
+               << " uzP=" << uz_p
+               << " Q=" << q
+               << " urQ=" << ur_q
+               << " uzQ=" << uz_q
+               << " kappa=" << kappa;
+            core::log_info(os.str());
+          };
+      if (aw_axis_slave_theta0_active_) {
+        const int p = i * stride;
+        emit_axis_slave_dbg("theta0", p, p + 1);
+      }
+      if (aw_axis_slave_theta_pi_active_) {
+        const int p = i * stride + state.mesh.topo.nz;
+        emit_axis_slave_dbg("theta_pi", p, p - 1);
+      }
+    }
+    if (predictor_pos_r_field->data() != u_half_r.data() ||
+        predictor_pos_z_field->data() != u_half_z.data()) {
+      launch_apply_aw_axis_velocity_slave_2d(
+          predictor_pos_r_field->data(),
+          predictor_pos_z_field->data(),
+          state.x_r.data(),
+          state.x_z.data(),
+          aw_axis_slave_kappa_saved_.data(),
+          state.mesh.topo.nr,
+          state.mesh.topo.nz,
+          aw_axis_slave_first_i,
+          aw_axis_slave_theta0_active_,
+          aw_axis_slave_theta_pi_active_,
+          false);
+    }
+    sync_kernel("Hydro2D predictor AW axis velocity slave failed");
+  }
+  if (aw_axis_slave_multiblock_active) {
+    launch_apply_aw_axis_velocity_slave_2d_multiblock(
+        u_half_r.data(),
+        u_half_z.data(),
+        state.x_r.data(),
+        state.x_z.data(),
+        aw_axis_slave_multiblock_kappa_saved_.data(),
+        aw_axis_slave_p_.data(),
+        aw_axis_slave_q_.data(),
+        static_cast<int>(aw_axis_slave_p_.size()),
+        true);
+    if (predictor_pos_r_field->data() != u_half_r.data() ||
+        predictor_pos_z_field->data() != u_half_z.data()) {
+      launch_apply_aw_axis_velocity_slave_2d_multiblock(
+          predictor_pos_r_field->data(),
+          predictor_pos_z_field->data(),
+          state.x_r.data(),
+          state.x_z.data(),
+          aw_axis_slave_multiblock_kappa_saved_.data(),
+          aw_axis_slave_p_.data(),
+          aw_axis_slave_q_.data(),
+          static_cast<int>(aw_axis_slave_p_.size()),
+          false);
+    }
+    sync_kernel("Hydro2D predictor multiblock AW axis velocity slave failed");
+  }
   conservation_audit::emit_stage(state, "bbsw_predictor_constraint");
   predictor_pos_r = predictor_pos_r_field->data();
   predictor_pos_z = predictor_pos_z_field->data();
+  // Trial-stage projection; heat is owned by the post-boundary finalizer (consultation #23 §7.4).
+  const double* const predictor_commit_node_mass =
+      cfg.numerics.hydro.rz_momentum_scheme_id == 0
+          ? node_mass.data()
+          : state.node_planar_mass.data();
+  launch_apply_evac_contact_velocity_constraints(
+      state, u_half_r.data(), u_half_z.data(), predictor_commit_node_mass,
+      state.x_r.data(), state.x_z.data(), cs_n.data(),
+      d_hydro_force_active,
+      dt,
+      nullptr,
+      cfg.numerics.ale.evacuated_cell.closure_contact
+          .mortar_position_drift_beta);
   copy_array_kernel<<<nw.blocks(), 256>>>(state.v_r.data() + nw.begin,
                                           u_half_r.data() + nw.begin,
                                           nw.count());
   copy_array_kernel<<<nw.blocks(), 256>>>(state.v_z.data() + nw.begin,
                                           u_half_z.data() + nw.begin,
                                           nw.count());
+  evacuated_cell_contact_probe(state, cfg, "post_vcopy");
   apply_axis_contact_guard("predictor", cfg, r_old, predictor_pos_r, node_mass,
                            d_node_active, d_node_flags, n_nodes, nw,
                            0.5 * dt, state.step);
+  if (aw_axis_slave_active) {
+    launch_apply_aw_axis_velocity_slave_2d(
+        u_half_r.data(),
+        u_half_z.data(),
+        state.x_r.data(),
+        state.x_z.data(),
+        aw_axis_slave_kappa_saved_.data(),
+        state.mesh.topo.nr,
+        state.mesh.topo.nz,
+        aw_axis_slave_first_i,
+        aw_axis_slave_theta0_active_,
+        aw_axis_slave_theta_pi_active_,
+        false);
+    if (predictor_pos_r_field->data() != u_half_r.data() ||
+        predictor_pos_z_field->data() != u_half_z.data()) {
+      launch_apply_aw_axis_velocity_slave_2d(
+          predictor_pos_r,
+          predictor_pos_z,
+          state.x_r.data(),
+          state.x_z.data(),
+          aw_axis_slave_kappa_saved_.data(),
+          state.mesh.topo.nr,
+          state.mesh.topo.nz,
+          aw_axis_slave_first_i,
+          aw_axis_slave_theta0_active_,
+          aw_axis_slave_theta_pi_active_,
+          false);
+    }
+    copy_array_kernel<<<blocks_nodes, 256>>>(
+        state.v_r.data(), u_half_r.data(), n_nodes);
+    copy_array_kernel<<<blocks_nodes, 256>>>(
+        state.v_z.data(), u_half_z.data(), n_nodes);
+    sync_kernel("Hydro2D predictor AW axis velocity re-slave failed");
+  }
+  if (aw_axis_slave_multiblock_active) {
+    launch_apply_aw_axis_velocity_slave_2d_multiblock(
+        u_half_r.data(),
+        u_half_z.data(),
+        state.x_r.data(),
+        state.x_z.data(),
+        aw_axis_slave_multiblock_kappa_saved_.data(),
+        aw_axis_slave_p_.data(),
+        aw_axis_slave_q_.data(),
+        static_cast<int>(aw_axis_slave_p_.size()),
+        false);
+    if (predictor_pos_r_field->data() != u_half_r.data() ||
+        predictor_pos_z_field->data() != u_half_z.data()) {
+      launch_apply_aw_axis_velocity_slave_2d_multiblock(
+          predictor_pos_r,
+          predictor_pos_z,
+          state.x_r.data(),
+          state.x_z.data(),
+          aw_axis_slave_multiblock_kappa_saved_.data(),
+          aw_axis_slave_p_.data(),
+          aw_axis_slave_q_.data(),
+          static_cast<int>(aw_axis_slave_p_.size()),
+          false);
+    }
+    copy_array_kernel<<<blocks_nodes, 256>>>(
+        state.v_r.data(), u_half_r.data(), n_nodes);
+    copy_array_kernel<<<blocks_nodes, 256>>>(
+        state.v_z.data(), u_half_z.data(), n_nodes);
+    sync_kernel(
+        "Hydro2D predictor multiblock AW axis velocity re-slave failed");
+  }
+  if (!state.carrier_domain_active || !state.boundary_carrier.valid ||
+      state.carrier_node_class.empty()) { /* skip */
+  } else {
+    auto& carrier = ensure_carrier_hook_context();
+    carrier.apply_reconstruct(nullptr, nullptr, u_half_r.data(), u_half_z.data());
+    if (predictor_pos_r_field->data() != u_half_r.data() ||
+        predictor_pos_z_field->data() != u_half_z.data()) {
+      carrier.apply_reconstruct(nullptr, nullptr, predictor_pos_r, predictor_pos_z);
+    }
+    carrier.apply_reconstruct(nullptr, nullptr, state.v_r.data(), state.v_z.data());
+  }
   emit_ring7_seam_scaffold_diagnostics(state,
                                         cfg,
                                         r_old.data(),
@@ -10858,7 +15094,7 @@ tenryu::coupling::HydroStepResult Hydro2D::lagrangian_step(
                                         0.5 * dt,
                                         reduction,
                                         "predictor");
-  if (cfg.numerics.hydro.mesh_quality_dt_cfl_enabled) {
+  if (cfg.numerics.hydro.mesh_quality_dt_cfl_enabled || path_guard_enabled) {
     const MeshQualityDtLimit pred_limit = compute_mesh_quality_dt_limit(
         state,
         cfg,
@@ -10867,20 +15103,32 @@ tenryu::coupling::HydroStepResult Hydro2D::lagrangian_step(
         predictor_pos_r,
         predictor_pos_z,
         0.5 * dt,
-        reduction);
+        reduction,
+        path_guard_enabled);
     emit_ring7_pole_cap_recomputed_limiter_validation(state,
                                                       cfg,
                                                       pred_limit,
                                                       0.5 * dt,
                                                       "predictor");
     if (!pred_limit.admissible) {
-      populate_mesh_quality_dt_failure(
-          result,
-          state,
-          cfg,
-          pred_limit,
-          tenryu::coupling::HydroFailureStage::PredictorCommit);
-      if (pred_limit.metric == MeshQualityFailingMetric::RzVolume) {
+      if (path_guard_enabled) {
+        populate_path_guard_failure(
+            result,
+            state,
+            cfg,
+            pred_limit,
+            tenryu::coupling::HydroFailureStage::PredictorCommit,
+            dt);
+      } else {
+        populate_mesh_quality_dt_failure(
+            result,
+            state,
+            cfg,
+            pred_limit,
+            tenryu::coupling::HydroFailureStage::PredictorCommit);
+      }
+      if (!path_guard_enabled &&
+          pred_limit.metric == MeshQualityFailingMetric::RzVolume) {
         record_ring7_failed_mesh_velocity(state,
                                           cfg,
                                           pred_limit.first_cell,
@@ -10919,15 +15167,17 @@ tenryu::coupling::HydroStepResult Hydro2D::lagrangian_step(
                                        a_hg_n_z,
                                        node_mass);
       }
-      tenryu::core::log_warning(
-          "Hydro2D mesh-quality dt CFL rejected predictor trial at step=" +
-          std::to_string(state.step) + ", reason=" +
-          std::string(result.reason != nullptr ? result.reason : "") +
-          ", first_cell=" + std::to_string(result.first_failing_cell) +
-          ", first_corner_or_gauss=" +
-          std::to_string(result.first_failing_corner) +
-          ", sigma_safe=" + format_scientific(pred_limit.sigma_safe) +
-          ", suggested_dt=" + format_scientific(result.suggested_dt));
+      if (!path_guard_enabled) {
+        tenryu::core::log_warning(
+            "Hydro2D mesh-quality dt CFL rejected predictor trial at step=" +
+            std::to_string(state.step) + ", reason=" +
+            std::string(result.reason != nullptr ? result.reason : "") +
+            ", first_cell=" + std::to_string(result.first_failing_cell) +
+            ", first_corner_or_gauss=" +
+            std::to_string(result.first_failing_corner) +
+            ", sigma_safe=" + format_scientific(pred_limit.sigma_safe) +
+            ", suggested_dt=" + format_scientific(result.suggested_dt));
+      }
       cleanup_precommit_retry_buffers();
       return result;
     }
@@ -11053,7 +15303,88 @@ tenryu::coupling::HydroStepResult Hydro2D::lagrangian_step(
   if (state_supply_active) {
     restore_state_supply_material_velocity(state, cfg);
   }
-  pin_node_center_state(state, d_node_flags);
+  enforce_node_axis_state(state, d_node_flags);
+  if (aw_axis_slave_active) {
+    launch_apply_aw_axis_velocity_slave_2d(
+        state.v_r.data(),
+        state.v_z.data(),
+        state.x_r.data(),
+        state.x_z.data(),
+        aw_axis_slave_kappa_saved_.data(),
+        state.mesh.topo.nr,
+        state.mesh.topo.nz,
+        aw_axis_slave_first_i,
+        aw_axis_slave_theta0_active_,
+        aw_axis_slave_theta_pi_active_,
+        false);
+    if (aw_axis_snap_env_enabled) {
+      launch_snap_aw_axis_coordinates_2d(
+          state.x_r.data(),
+          state.x_z.data(),
+          aw_axis_slave_kappa_saved_.data(),
+          state.mesh.topo.nr,
+          state.mesh.topo.nz,
+          aw_axis_slave_first_i,
+          aw_axis_slave_theta0_active_,
+          aw_axis_slave_theta_pi_active_);
+    }
+    copy_array_kernel<<<blocks_nodes, 256>>>(
+        u_half_r.data(), state.v_r.data(), n_nodes);
+    copy_array_kernel<<<blocks_nodes, 256>>>(
+        u_half_z.data(), state.v_z.data(), n_nodes);
+    sync_kernel("Hydro2D post-boundary predictor AW axis closure failed");
+  }
+  if (aw_axis_slave_multiblock_active) {
+    launch_apply_aw_axis_velocity_slave_2d_multiblock(
+        state.v_r.data(),
+        state.v_z.data(),
+        state.x_r.data(),
+        state.x_z.data(),
+        aw_axis_slave_multiblock_kappa_saved_.data(),
+        aw_axis_slave_p_.data(),
+        aw_axis_slave_q_.data(),
+        static_cast<int>(aw_axis_slave_p_.size()),
+        false);
+    if (aw_axis_snap_env_enabled) {
+      launch_snap_aw_axis_coordinates_2d_multiblock(
+          state.x_r.data(),
+          state.x_z.data(),
+          aw_axis_slave_multiblock_kappa_saved_.data(),
+          aw_axis_slave_p_.data(),
+          aw_axis_slave_q_.data(),
+          static_cast<int>(aw_axis_slave_p_.size()));
+    }
+    copy_array_kernel<<<blocks_nodes, 256>>>(
+        u_half_r.data(), state.v_r.data(), n_nodes);
+    copy_array_kernel<<<blocks_nodes, 256>>>(
+        u_half_z.data(), state.v_z.data(), n_nodes);
+    sync_kernel(
+        "Hydro2D post-boundary predictor multiblock AW axis closure failed");
+  }
+  if (!state.carrier_domain_active || !state.boundary_carrier.valid ||
+      state.carrier_node_class.empty()) { /* skip */
+  } else {
+    auto& carrier = ensure_carrier_hook_context();
+    carrier.apply_reconstruct(state.x_r.data(), state.x_z.data(),
+                              state.v_r.data(), state.v_z.data());
+    carrier.apply_reconstruct(nullptr, nullptr, u_half_r.data(), u_half_z.data());
+  }
+  // Consultation #23 §11.4: finalize contact after the last stage-velocity writer.
+  launch_apply_evac_contact_velocity_constraints(
+      state, state.v_r.data(), state.v_z.data(),
+      cfg.numerics.hydro.rz_momentum_scheme_id == 0
+          ? node_mass.data()
+          : state.node_planar_mass.data(),
+      state.x_r.data(), state.x_z.data(),
+      cs_n.data(),
+      d_hydro_force_active,
+      dt,
+      state.evacuated_cells.d_contact_pair_dk.data(),
+      cfg.numerics.ale.evacuated_cell.closure_contact
+          .mortar_position_drift_beta);
+  if (!midpoint_v1) {
+    evacuated_cell_contact_probe(state, cfg, "post_vel_predictor");
+  }
   central_pseudo_core::rebuild_virtual_member_geometry(
       state, cfg, "post_predictor");
   // OPEN-HYDRO-CORNER: ghost node coords must be refreshed BEFORE the
@@ -11284,12 +15615,18 @@ tenryu::coupling::HydroStepResult Hydro2D::lagrangian_step(
                             cfg, t_op + 0.5 * dt, mesh_cache,
                             attr_pressure_half, d_node_active, d_node_flags, node_mass,
                             d_hydro_force_active, eos_ctx, true, false, true, &cs_half,
-                            false, nullptr, nullptr, 0.0, false, nullptr, false);
+                            false, nullptr, nullptr, 0.0, false, nullptr, false,
+                            aw_axis_slave_theta0_active_,
+                            aw_axis_slave_theta_pi_active_, nullptr, nullptr,
+                            false, nullptr, "attr_p_half");
     compute_acceleration_2d(attr_q_half_r, attr_q_half_z, state, cfg,
                             t_op + 0.5 * dt, mesh_cache, attr_q_half,
                             d_node_active, d_node_flags, node_mass, d_hydro_force_active,
                             eos_ctx, false, false, false, nullptr, true, nullptr,
-                            nullptr, 0.0, false, nullptr, false);
+                            nullptr, 0.0, false, nullptr, false,
+                            aw_axis_slave_theta0_active_,
+                            aw_axis_slave_theta_pi_active_, nullptr, nullptr,
+                            false, nullptr, "attr_q_half");
   }
 
   core::NodeField1D a_half_r{"h2d:step:a_half_r"};
@@ -11300,6 +15637,21 @@ tenryu::coupling::HydroStepResult Hydro2D::lagrangian_step(
   double r_momentum_source_force_sum = 0.0;
   a_half_r.reset(n_nodes);
   a_half_z.reset(n_nodes);
+  const bool shadow_replay_due =
+      shadow_replay_step >= 0 && !shadow_replay_printed &&
+      state.step == shadow_replay_step && compatible_energy_mode &&
+      cfg.numerics.hydro.aw_compatible_force_work &&
+      cfg.numerics.hydro.subzonal_pressure_enabled &&
+      !state.mesh.topo.multiblock.has_value();
+  StructuredAwShadowProjectionStorage shadow_projection_storage;
+  SubzonalPressureProjectionDebugBuffers shadow_projection_debug{};
+  const SubzonalPressureProjectionDebugBuffers* shadow_projection_debug_ptr =
+      nullptr;
+  if (shadow_replay_due) {
+    shadow_projection_storage.reset(static_cast<std::size_t>(n_cells));
+    shadow_projection_debug = shadow_projection_storage.device_buffers();
+    shadow_projection_debug_ptr = &shadow_projection_debug;
+  }
   compute_acceleration_2d(a_half_r, a_half_z, state, cfg, t_op + 0.5 * dt,
                           mesh_cache, pq_half, d_node_active, d_node_flags, node_mass,
                           d_hydro_force_active, eos_ctx, true, false, true, &cs_half,
@@ -11314,13 +15666,26 @@ tenryu::coupling::HydroStepResult Hydro2D::lagrangian_step(
                           true,
                           &pole_axis_bbsw_true_force_half_z,
                           true,
+                          aw_axis_slave_theta0_active_,
+                          aw_axis_slave_theta_pi_active_,
+                          shadow_projection_debug_ptr,
                           (!midpoint_v1 && r_momentum_source_impulse != nullptr)
                               ? &r_momentum_source_force_sum
                               : nullptr,
                           midpoint_v1,
-                          midpoint_v1 ? &state.Qvisc : nullptr);
+                          midpoint_v1 ? &state.Qvisc : nullptr, "dyn_half");
   if (!midpoint_v1 && r_momentum_source_impulse != nullptr) {
     *r_momentum_source_impulse = dt * r_momentum_source_force_sum;
+  }
+  if (shadow_replay_due) {
+    shadow_replay_printed = emit_structured_aw_shadow_replay(
+        state,
+        cfg,
+        eos_ctx,
+        d_hydro_force_active,
+        aw_axis_slave_theta0_active_,
+        aw_axis_slave_theta_pi_active_,
+        shadow_projection_storage);
   }
   ShellDriveSymDiagSnapshot shell_drive_sym_snapshot{};
   if (shell_drive_sym_diag_active) {
@@ -11368,6 +15733,24 @@ tenryu::coupling::HydroStepResult Hydro2D::lagrangian_step(
         cfg.numerics.hydro.hourglass.compatible_work_enabled,
         d_node_flags);
     add_hourglass_acceleration_2d(a_half_r, a_half_z, a_hg_half_r, a_hg_half_z);
+    // §22 contact must be last; hourglass leaked ~0.04 nm/step into the held gap.
+    launch_apply_evac_contact_accel_constraints(
+        state,
+        a_half_r.data(),
+        a_half_z.data(),
+        cfg.numerics.hydro.rz_momentum_scheme_id == 0
+            ? node_mass.data()
+            : state.node_planar_mass.data());
+  }
+
+  if (!state.carrier_domain_active || !state.boundary_carrier.valid ||
+      state.carrier_node_class.empty()) { /* skip */
+  } else {
+    ensure_carrier_hook_context().apply_condensation(
+        a_half_r.data(), a_half_z.data(),
+        cfg.numerics.hydro.rz_momentum_scheme_id == 1
+            ? state.node_planar_mass.data()
+            : node_mass.data());
   }
 
   if (midpoint_v1) {
@@ -11383,10 +15766,10 @@ tenryu::coupling::HydroStepResult Hydro2D::lagrangian_step(
     ubar_provisional_z.reset(n_nodes);
     x_provisional_r.reset(n_nodes);
     x_provisional_z.reset(n_nodes);
-    update_node_velocity_2d_kernel<<<blocks_nodes, 256>>>(
+    launch_update_node_velocity_2d(
         u_provisional_r.data(), u_provisional_z.data(), ur_old.data(),
         uz_old.data(), a_half_r.data(), a_half_z.data(), d_node_active,
-        d_node_flags, nw.begin, nw.end, n_nodes, dt);
+        d_node_flags, n_nodes, dt, state, cfg);
     average_arrays_kernel<<<blocks_nodes, 256>>>(
         ubar_provisional_r.data() + nw.begin, ur_old.data() + nw.begin,
         u_provisional_r.data() + nw.begin, nw.count());
@@ -11414,6 +15797,19 @@ tenryu::coupling::HydroStepResult Hydro2D::lagrangian_step(
             state, cfg, provisional_position_v_z, r_old, z_old, dt, false);
       }
       provisional_position_v_z_ptr = provisional_position_v_z.data();
+    }
+    if (!state.carrier_domain_active || !state.boundary_carrier.valid ||
+        state.carrier_node_class.empty()) { /* skip */
+    } else {
+      auto& carrier = ensure_carrier_hook_context();
+      carrier.apply_reconstruct(nullptr, nullptr, u_provisional_r.data(),
+                                u_provisional_z.data());
+      carrier.apply_reconstruct(nullptr, nullptr, ubar_provisional_r.data(),
+                                ubar_provisional_z.data());
+      if (!provisional_position_v_z.empty()) {
+        carrier.apply_reconstruct(nullptr, nullptr, nullptr,
+                                  provisional_position_v_z.data());
+      }
     }
     commit_position_2d_kernel<<<blocks_nodes, 256>>>(
         x_provisional_r.data(), x_provisional_z.data(), r_old.data(),
@@ -11452,20 +15848,39 @@ tenryu::coupling::HydroStepResult Hydro2D::lagrangian_step(
       }
     });
 
-    update_node_velocity_2d_kernel<<<blocks_nodes, 256>>>(
+    launch_update_node_velocity_2d(
         u_half_r.data(), u_half_z.data(), ur_old.data(), uz_old.data(),
-        a_half_r.data(), a_half_z.data(), d_node_active, d_node_flags, nw.begin,
-        nw.end, n_nodes, 0.5 * dt);
+        a_half_r.data(), a_half_z.data(), d_node_active, d_node_flags, n_nodes,
+        0.5 * dt, state, cfg);
     average_arrays_kernel<<<blocks_nodes, 256>>>(
         predictor_work_v_r.data() + nw.begin, ur_old.data() + nw.begin,
         u_half_r.data() + nw.begin, nw.count());
     average_arrays_kernel<<<blocks_nodes, 256>>>(
         predictor_work_v_z.data() + nw.begin, uz_old.data() + nw.begin,
         u_half_z.data() + nw.begin, nw.count());
+    // Trial-stage projection; heat is owned by the post-boundary finalizer (consultation #23 §7.4).
+    const double* const corrected_half_commit_node_mass =
+        cfg.numerics.hydro.rz_momentum_scheme_id == 0
+            ? node_mass.data()
+            : state.node_planar_mass.data();
+    launch_apply_evac_contact_velocity_constraints(
+        state,
+        u_half_r.data(),
+        u_half_z.data(),
+        corrected_half_commit_node_mass,
+        state.x_r.data(),
+        state.x_z.data(),
+        cs_half.data(),
+        d_hydro_force_active,
+        dt,
+        nullptr,
+        cfg.numerics.ale.evacuated_cell.closure_contact
+            .mortar_position_drift_beta);
     copy_array_kernel<<<blocks_nodes, 256>>>(
         state.v_r.data(), u_half_r.data(), n_nodes);
     copy_array_kernel<<<blocks_nodes, 256>>>(
         state.v_z.data(), u_half_z.data(), n_nodes);
+    evacuated_cell_contact_probe(state, cfg, "post_vcopy");
     sync_kernel("Hydro2D midpoint corrected-half kinematics failed");
 
     recompute_midpoint_corner_work_2d(
@@ -11506,11 +15921,37 @@ tenryu::coupling::HydroStepResult Hydro2D::lagrangian_step(
         state.x_z.data() + nw.begin, z_old.data() + nw.begin,
         x_provisional_z.data() + nw.begin, nw.count());
     sync_kernel("Hydro2D midpoint corrected-half geometry failed");
+    evacuated_cell_contact_probe(state, cfg, "pre_apply_boundary");
     apply_boundary_2d(state, cfg, t_op + 0.5 * dt);
+    evacuated_cell_contact_probe(state, cfg, "post_apply_boundary");
     if (state_supply_active) {
       restore_state_supply_material_velocity(state, cfg);
     }
-    pin_node_center_state(state, d_node_flags);
+    enforce_node_axis_state(state, d_node_flags);
+    evacuated_cell_contact_probe(state, cfg, "post_axis_enforce");
+    if (!state.carrier_domain_active || !state.boundary_carrier.valid ||
+        state.carrier_node_class.empty()) { /* skip */
+    } else {
+      auto& carrier = ensure_carrier_hook_context();
+      carrier.apply_reconstruct(state.x_r.data(), state.x_z.data(),
+                                state.v_r.data(), state.v_z.data());
+      carrier.apply_reconstruct(nullptr, nullptr, u_half_r.data(), u_half_z.data());
+    }
+    // Consultation #23 §11.4: finalize contact after the last stage-velocity writer.
+    launch_apply_evac_contact_velocity_constraints(
+        state, state.v_r.data(), state.v_z.data(),
+        cfg.numerics.hydro.rz_momentum_scheme_id == 0
+            ? node_mass.data()
+            : state.node_planar_mass.data(),
+        state.x_r.data(), state.x_z.data(),
+        cs_half.data(),
+        d_hydro_force_active,
+        dt,
+        state.evacuated_cells.d_contact_pair_dk.data(),
+        cfg.numerics.ale.evacuated_cell.closure_contact
+            .mortar_position_drift_beta);
+    evacuated_cell_contact_probe(state, cfg, "post_carrier");
+    evacuated_cell_contact_probe(state, cfg, "post_vel_predictor");
     result = refresh_geometry_and_density(
         state, cfg, tenryu::coupling::HydroFailureStage::PostPredictor,
         nullptr, observability);
@@ -11578,9 +16019,10 @@ tenryu::coupling::HydroStepResult Hydro2D::lagrangian_step(
             ? &cap_energy_audit_force_half_z
             : nullptr,
         dt, true, &pole_axis_bbsw_true_force_half_z, true,
+        aw_axis_slave_theta0_active_, aw_axis_slave_theta_pi_active_, nullptr,
         r_momentum_source_impulse != nullptr ? &r_momentum_source_force_sum
                                              : nullptr,
-        true, &state.Qvisc);
+        true, &state.Qvisc, "dyn_half_corrected");
     if (r_momentum_source_impulse != nullptr) {
       *r_momentum_source_impulse = dt * r_momentum_source_force_sum;
     }
@@ -11610,26 +16052,57 @@ tenryu::coupling::HydroStepResult Hydro2D::lagrangian_step(
           d_hydro_force_active, dt, false, d_node_flags);
       add_hourglass_acceleration_2d(
           a_half_r, a_half_z, a_hg_half_r, a_hg_half_z);
+      // §22 contact must be last; hourglass leaked ~0.04 nm/step into the held gap.
+      launch_apply_evac_contact_accel_constraints(
+          state,
+          a_half_r.data(),
+          a_half_z.data(),
+          cfg.numerics.hydro.rz_momentum_scheme_id == 0
+              ? node_mass.data()
+              : state.node_planar_mass.data());
+    }
+    if (!state.carrier_domain_active || !state.boundary_carrier.valid ||
+        state.carrier_node_class.empty()) { /* skip */
+    } else {
+      ensure_carrier_hook_context().apply_condensation(
+          a_half_r.data(), a_half_z.data(),
+          cfg.numerics.hydro.rz_momentum_scheme_id == 1
+              ? state.node_planar_mass.data()
+              : node_mass.data());
     }
   }
 
-  update_node_velocity_2d_kernel<<<nw.blocks(), 256>>>(
+  // §22: the constraint must hold at consumption; modifier-chasing is insufficient.
+  launch_apply_evac_contact_accel_constraints(
+      state,
+      a_half_r.data(),
+      a_half_z.data(),
+      cfg.numerics.hydro.rz_momentum_scheme_id == 0
+          ? node_mass.data()
+          : state.node_planar_mass.data());
+  launch_update_node_velocity_2d(
       state.v_r.data(), state.v_z.data(), ur_old.data(), uz_old.data(),
       a_half_r.data(), a_half_z.data(), d_node_active, d_node_flags,
-      nw.begin, nw.end, n_nodes, dt);
+      n_nodes, dt, state, cfg);
+  evacuated_cell_contact_probe(state, cfg, "post_vel_kernel_corr");
+  emit_origin_trace(state, "c1_update_v", state.v_z.data());
+  emit_origin_trace(state, "post_corrector_v", state.v_z.data());
   if (midpoint_v1) {
     average_arrays_kernel<<<blocks_nodes, 256>>>(
         u_half_r.data() + nw.begin, ur_old.data() + nw.begin,
         state.v_r.data() + nw.begin, nw.count());
+    emit_origin_trace(state, "c2_avg_r", state.v_z.data());
     average_arrays_kernel<<<blocks_nodes, 256>>>(
         u_half_z.data() + nw.begin, uz_old.data() + nw.begin,
         state.v_z.data() + nw.begin, nw.count());
+    emit_origin_trace(state, "c3_avg_z", state.v_z.data());
   }
   pole_axis_diag::capture_post_accel_velocity(state);
   mesh_trace::trace_post_velocity(state, cfg);
   apply_axis_motion_preflight(u_half_r, state.v_r.data(), r_old, z_old, u_half_z,
                               state.mesh.topo.nr, state.mesh.topo.nz, dt,
                               cfg.numerics.hydro.axis_motion_floor_fraction);
+  emit_origin_trace(state, "c4_axis_preflight", state.v_z.data());
   const auto corrector_pole_motion_overlay =
       tenryu::hydro::pole_angular_coarsen::build_motion_overlay(state, cfg);
   core::NodeField1D pos_corrector_r{"h2d:step:pos_corrector_r"};
@@ -11640,6 +16113,7 @@ tenryu::coupling::HydroStepResult Hydro2D::lagrangian_step(
                           static_cast<std::size_t>(n_nodes) * sizeof(double),
                           cudaMemcpyDeviceToDevice),
                "Hydro2D: copy corrector position r velocity failed");
+    emit_origin_trace(state, "c5_copy_pos_r", state.v_z.data());
     corrector_pos_r_ptr = &pos_corrector_r;
   }
   core::NodeField1D pos_corrector_z{"h2d:step:pos_corrector_z"};
@@ -11651,13 +16125,16 @@ tenryu::coupling::HydroStepResult Hydro2D::lagrangian_step(
                           static_cast<std::size_t>(n_nodes) * sizeof(double),
                           cudaMemcpyDeviceToDevice),
                "Hydro2D: copy corrector position z velocity failed");
+    emit_origin_trace(state, "c6_copy_pos_z", state.v_z.data());
     if (state_supply_active) {
       zero_state_supply_z_position_velocity(pos_corrector_z, cfg, state.mesh.topo.nr,
                                             state.mesh.topo.nz);
+      emit_origin_trace(state, "c7_supply_pos_z", state.v_z.data());
     }
     if (axis_lagrangian_tangential) {
       constrain_axis_z_position_velocity(state, cfg, pos_corrector_z, r_old, z_old,
                                          dt, false);
+      emit_origin_trace(state, "c8_phase8b_axis_z", state.v_z.data());
     }
     corrector_pos_z_ptr = &pos_corrector_z;
   }
@@ -11672,6 +16149,7 @@ tenryu::coupling::HydroStepResult Hydro2D::lagrangian_step(
         *corrector_pos_z_ptr,
         dt,
         "corrector");
+    emit_origin_trace(state, "c9_pole_motion", state.v_z.data());
   }
   apply_pole_axis_bbsw_order_constraint(state,
                                         cfg,
@@ -11689,8 +16167,78 @@ tenryu::coupling::HydroStepResult Hydro2D::lagrangian_step(
                                         &state.v_z,
                                         &uz_old,
                                         dt);
+  emit_origin_trace(state, "c10_bbsw_constraint", state.v_z.data());
+  if (aw_axis_slave_active) {
+    launch_apply_aw_axis_velocity_slave_2d(
+        state.v_r.data(),
+        state.v_z.data(),
+        state.x_r.data(),
+        state.x_z.data(),
+        aw_axis_slave_kappa_saved_.data(),
+        state.mesh.topo.nr,
+        state.mesh.topo.nz,
+        aw_axis_slave_first_i,
+        aw_axis_slave_theta0_active_,
+        aw_axis_slave_theta_pi_active_,
+        true);
+    emit_origin_trace(state, "c11_aw_struct_v", state.v_z.data());
+    launch_apply_aw_axis_velocity_slave_2d(
+        corrector_pos_r_ptr->data(),
+        corrector_pos_z_ptr->data(),
+        state.x_r.data(),
+        state.x_z.data(),
+        aw_axis_slave_kappa_saved_.data(),
+        state.mesh.topo.nr,
+        state.mesh.topo.nz,
+        aw_axis_slave_first_i,
+        aw_axis_slave_theta0_active_,
+        aw_axis_slave_theta_pi_active_,
+        false);
+    emit_origin_trace(state, "c12_aw_struct_pos", state.v_z.data());
+    sync_kernel("Hydro2D corrector AW axis velocity slave failed");
+  }
+  if (aw_axis_slave_multiblock_active) {
+    launch_apply_aw_axis_velocity_slave_2d_multiblock(
+        state.v_r.data(),
+        state.v_z.data(),
+        state.x_r.data(),
+        state.x_z.data(),
+        aw_axis_slave_multiblock_kappa_saved_.data(),
+        aw_axis_slave_p_.data(),
+        aw_axis_slave_q_.data(),
+        static_cast<int>(aw_axis_slave_p_.size()),
+        true);
+    emit_origin_trace(state, "c13_aw_mb_v", state.v_z.data());
+    launch_apply_aw_axis_velocity_slave_2d_multiblock(
+        corrector_pos_r_ptr->data(),
+        corrector_pos_z_ptr->data(),
+        state.x_r.data(),
+        state.x_z.data(),
+        aw_axis_slave_multiblock_kappa_saved_.data(),
+        aw_axis_slave_p_.data(),
+        aw_axis_slave_q_.data(),
+        static_cast<int>(aw_axis_slave_p_.size()),
+        false);
+    emit_origin_trace(state, "c14_aw_mb_pos", state.v_z.data());
+    sync_kernel("Hydro2D corrector multiblock AW axis velocity slave failed");
+    emit_origin_trace(state, "post_aw_slave", state.v_z.data());
+  }
+  if (!state.carrier_domain_active || !state.boundary_carrier.valid ||
+      state.carrier_node_class.empty()) { /* skip */
+  } else {
+    auto& carrier = ensure_carrier_hook_context();
+    carrier.apply_reconstruct(nullptr, nullptr, state.v_r.data(), state.v_z.data());
+    carrier.apply_reconstruct(nullptr, nullptr, u_half_r.data(), u_half_z.data());
+    if (corrector_pos_r_ptr->data() != u_half_r.data() ||
+        corrector_pos_z_ptr->data() != u_half_z.data()) {
+      carrier.apply_reconstruct(nullptr, nullptr, corrector_pos_r_ptr->data(),
+                                corrector_pos_z_ptr->data());
+    }
+  }
   conservation_audit::emit_stage(state, "bbsw_corrector_constraint");
-  if (total_energy_identity_check || midpoint_v1) {
+  if (total_energy_identity_check || midpoint_v1 ||
+      parse_boundary_2d_type(cfg.numerics.hydro.boundary_2d.r_outer) ==
+          Boundary2DType::PRESSURE) {
     core::NodeField1D identity_work_v_r{
         "h2d:step:identity_work_v_r"};
     core::NodeField1D identity_work_v_z{
@@ -11700,9 +16248,11 @@ tenryu::coupling::HydroStepResult Hydro2D::lagrangian_step(
     average_arrays_kernel<<<blocks_nodes, 256>>>(
         identity_work_v_r.data() + nw.begin, ur_old.data() + nw.begin,
         state.v_r.data() + nw.begin, nw.count());
+    emit_origin_trace(state, "c15_identity_avg_r", state.v_z.data());
     average_arrays_kernel<<<blocks_nodes, 256>>>(
         identity_work_v_z.data() + nw.begin, uz_old.data() + nw.begin,
         state.v_z.data() + nw.begin, nw.count());
+    emit_origin_trace(state, "c16_identity_avg_z", state.v_z.data());
     total_energy_identity_W_ext = compute_pressure_boundary_work_step_2d(
         state, cfg, dt, t_op + 0.5 * dt, identity_work_v_r,
         identity_work_v_z, node_mass);
@@ -11728,8 +16278,64 @@ tenryu::coupling::HydroStepResult Hydro2D::lagrangian_step(
   apply_axis_contact_guard("corrector", cfg, r_old, corrector_pos_r_ptr->data(),
                            node_mass, d_node_active, d_node_flags, n_nodes,
                            nw, dt, state.step);
-  const core::NodeField1D& corrector_pos_r = *corrector_pos_r_ptr;
-  const core::NodeField1D& corrector_pos_z = *corrector_pos_z_ptr;
+  emit_origin_trace(state, "c17_contact_guard", state.v_z.data());
+  if (aw_axis_slave_active) {
+    launch_apply_aw_axis_velocity_slave_2d(
+        state.v_r.data(),
+        state.v_z.data(),
+        state.x_r.data(),
+        state.x_z.data(),
+        aw_axis_slave_kappa_saved_.data(),
+        state.mesh.topo.nr,
+        state.mesh.topo.nz,
+        aw_axis_slave_first_i,
+        aw_axis_slave_theta0_active_,
+        aw_axis_slave_theta_pi_active_,
+        false);
+    emit_origin_trace(state, "c18_aw_struct_reslave_v", state.v_z.data());
+    launch_apply_aw_axis_velocity_slave_2d(
+        corrector_pos_r_ptr->data(),
+        corrector_pos_z_ptr->data(),
+        state.x_r.data(),
+        state.x_z.data(),
+        aw_axis_slave_kappa_saved_.data(),
+        state.mesh.topo.nr,
+        state.mesh.topo.nz,
+        aw_axis_slave_first_i,
+        aw_axis_slave_theta0_active_,
+        aw_axis_slave_theta_pi_active_,
+        false);
+    emit_origin_trace(state, "c19_aw_struct_reslave_pos", state.v_z.data());
+    sync_kernel("Hydro2D corrector AW axis velocity re-slave failed");
+  }
+  if (aw_axis_slave_multiblock_active) {
+    launch_apply_aw_axis_velocity_slave_2d_multiblock(
+        state.v_r.data(),
+        state.v_z.data(),
+        state.x_r.data(),
+        state.x_z.data(),
+        aw_axis_slave_multiblock_kappa_saved_.data(),
+        aw_axis_slave_p_.data(),
+        aw_axis_slave_q_.data(),
+        static_cast<int>(aw_axis_slave_p_.size()),
+        false);
+    emit_origin_trace(state, "c20_aw_mb_reslave_v", state.v_z.data());
+    launch_apply_aw_axis_velocity_slave_2d_multiblock(
+        corrector_pos_r_ptr->data(),
+        corrector_pos_z_ptr->data(),
+        state.x_r.data(),
+        state.x_z.data(),
+        aw_axis_slave_multiblock_kappa_saved_.data(),
+        aw_axis_slave_p_.data(),
+        aw_axis_slave_q_.data(),
+        static_cast<int>(aw_axis_slave_p_.size()),
+        false);
+    emit_origin_trace(state, "c21_aw_mb_reslave_pos", state.v_z.data());
+    sync_kernel(
+        "Hydro2D corrector multiblock AW axis velocity re-slave failed");
+  }
+  core::NodeField1D& corrector_pos_r = *corrector_pos_r_ptr;
+  core::NodeField1D& corrector_pos_z = *corrector_pos_z_ptr;
   emit_ring7_seam_scaffold_diagnostics(state,
                                         cfg,
                                         r_old.data(),
@@ -11764,10 +16370,11 @@ tenryu::coupling::HydroStepResult Hydro2D::lagrangian_step(
             candidate_r.data(), candidate_z.data(), r_old.data(), z_old.data(),
             corrector_pos_r.data(), corrector_pos_z.data(), d_node_active, d_node_flags,
             nw.begin, nw.end, n_nodes, dt);
+        emit_origin_trace(state, "c22_attr_candidate_commit", state.v_z.data());
         sync_kernel("Hydro2D mesh attribution corrector candidate failed");
         emit_mesh_attr_failure(failure, candidate_r.data(), candidate_z.data());
       };
-  if (cfg.numerics.hydro.mesh_quality_dt_cfl_enabled) {
+  if (cfg.numerics.hydro.mesh_quality_dt_cfl_enabled || path_guard_enabled) {
     const MeshQualityDtLimit limit = compute_mesh_quality_dt_limit(
         state,
         cfg,
@@ -11776,20 +16383,32 @@ tenryu::coupling::HydroStepResult Hydro2D::lagrangian_step(
         corrector_pos_r.data(),
         corrector_pos_z.data(),
         dt,
-        reduction);
+        reduction,
+        path_guard_enabled);
     emit_ring7_pole_cap_recomputed_limiter_validation(state,
                                                       cfg,
                                                       limit,
                                                       dt,
                                                       "corrector");
     if (!limit.admissible) {
-      populate_mesh_quality_dt_failure(
-          result,
-          state,
-          cfg,
-          limit,
-          tenryu::coupling::HydroFailureStage::PostCorrector);
-      if (limit.metric == MeshQualityFailingMetric::RzVolume) {
+      if (path_guard_enabled) {
+        populate_path_guard_failure(
+            result,
+            state,
+            cfg,
+            limit,
+            tenryu::coupling::HydroFailureStage::PostCorrector,
+            dt);
+      } else {
+        populate_mesh_quality_dt_failure(
+            result,
+            state,
+            cfg,
+            limit,
+            tenryu::coupling::HydroFailureStage::PostCorrector);
+      }
+      if (!path_guard_enabled &&
+          limit.metric == MeshQualityFailingMetric::RzVolume) {
         record_ring7_failed_mesh_velocity(state,
                                           cfg,
                                           limit.first_cell,
@@ -11807,6 +16426,7 @@ tenryu::coupling::HydroStepResult Hydro2D::lagrangian_step(
             candidate_r.data(), candidate_z.data(), r_old.data(), z_old.data(),
             corrector_pos_r.data(), corrector_pos_z.data(), d_node_active, d_node_flags,
             nw.begin, nw.end, n_nodes, dt);
+        emit_origin_trace(state, "c23_quality_candidate_commit", state.v_z.data());
         sync_kernel("Hydro2D mesh forensics corrector candidate failed");
         populate_mesh_forensics_sample(result,
                                        state,
@@ -11828,15 +16448,17 @@ tenryu::coupling::HydroStepResult Hydro2D::lagrangian_step(
                                        a_hg_half_z,
                                        node_mass);
       }
-      tenryu::core::log_warning(
-          "Hydro2D mesh-quality dt CFL rejected corrector trial at step=" +
-          std::to_string(state.step) + ", reason=" +
-          std::string(result.reason != nullptr ? result.reason : "") +
-          ", first_cell=" + std::to_string(result.first_failing_cell) +
-          ", first_corner_or_gauss=" +
-          std::to_string(result.first_failing_corner) +
-          ", sigma_safe=" + format_scientific(limit.sigma_safe) +
-          ", suggested_dt=" + format_scientific(result.suggested_dt));
+      if (!path_guard_enabled) {
+        tenryu::core::log_warning(
+            "Hydro2D mesh-quality dt CFL rejected corrector trial at step=" +
+            std::to_string(state.step) + ", reason=" +
+            std::string(result.reason != nullptr ? result.reason : "") +
+            ", first_cell=" + std::to_string(result.first_failing_cell) +
+            ", first_corner_or_gauss=" +
+            std::to_string(result.first_failing_corner) +
+            ", sigma_safe=" + format_scientific(limit.sigma_safe) +
+            ", suggested_dt=" + format_scientific(result.suggested_dt));
+      }
       emit_mesh_attr_corrector_trial_failure(result);
       cleanup_precommit_retry_buffers();
       return result;
@@ -11911,6 +16533,7 @@ tenryu::coupling::HydroStepResult Hydro2D::lagrangian_step(
             candidate_r.data(), candidate_z.data(), r_old.data(), z_old.data(),
             corrector_pos_r.data(), corrector_pos_z.data(), d_node_active, d_node_flags,
             nw.begin, nw.end, n_nodes, dt);
+        emit_origin_trace(state, "c24_path_candidate_commit", state.v_z.data());
         sync_kernel("Hydro2D mesh forensics corrector path candidate failed");
         populate_mesh_forensics_sample(result,
                                        state,
@@ -11983,6 +16606,14 @@ tenryu::coupling::HydroStepResult Hydro2D::lagrangian_step(
         result.reason = "trial_volume_cfl";
         result.first_failing_cell = trial.first_failing_cell;
         result.first_failing_corner = -1;
+        result.first_failing_i =
+            trial.first_failing_cell < 0
+                ? -1
+                : trial.first_failing_cell / state.mesh.topo.nz;
+        result.first_failing_j =
+            trial.first_failing_cell < 0
+                ? -1
+                : trial.first_failing_cell % state.mesh.topo.nz;
         result.min_metric = trial.min_trial_vol_ratio;
         result.suggested_dt = suggested_dt;
         emit_mesh_attr_corrector_trial_failure(result);
@@ -12004,8 +16635,142 @@ tenryu::coupling::HydroStepResult Hydro2D::lagrangian_step(
         state.mesh.topo.nr, state.mesh.topo.nz, r_old, z_old, corrector_pos_r, corrector_pos_z,
         dt, cfg.numerics.hydro.corner_jacobian_floor_eps, reduction,
         *hydro_force_active_host, cfg.numerics.hydro.axis_margin_guard_enabled,
-        cfg.numerics.has_physical_rz_axis);
+        cfg.numerics.has_physical_rz_axis,
+        state.evacuated_cells.cell_axis_edge_collapsed.empty()
+            ? nullptr
+            : &state.evacuated_cells.cell_axis_edge_collapsed,
+        state.evacuated_cells.geometry_policy_exempt_cells.empty()
+            ? nullptr
+            : &state.evacuated_cells.geometry_policy_exempt_cells);
     if (!corner_trial.admissible) {
+      double jdot = std::numeric_limits<double>::quiet_NaN();
+      double jdot_n = std::numeric_limits<double>::quiet_NaN();
+      double jdot_t = std::numeric_limits<double>::quiet_NaN();
+      double chi_t = std::numeric_limits<double>::quiet_NaN();
+      const int failing_cell = corner_trial.first_failing_cell;
+      const int failing_corner = corner_trial.first_failing_corner;
+      if (failing_cell >= 0 &&
+          failing_cell < state.mesh.topo.nr * state.mesh.topo.nz &&
+          failing_corner >= 0 && failing_corner < 4) {
+        const int failing_i = failing_cell / state.mesh.topo.nz;
+        const int failing_j = failing_cell % state.mesh.topo.nz;
+        const int cell_nodes[4] = {
+            state.mesh.topo.node_index(failing_i, failing_j),
+            state.mesh.topo.node_index(failing_i + 1, failing_j),
+            state.mesh.topo.node_index(failing_i + 1, failing_j + 1),
+            state.mesh.topo.node_index(failing_i, failing_j + 1)};
+        double node_r[4] = {};
+        double node_z[4] = {};
+        double node_v_r[4] = {};
+        double node_v_z[4] = {};
+        for (int k = 0; k < 4; ++k) {
+          cuda_check(cudaMemcpy(&node_r[k],
+                                r_old.data() + cell_nodes[k],
+                                sizeof(double),
+                                cudaMemcpyDeviceToHost),
+                     "corner-J shear telemetry: copy node r failed");
+          cuda_check(cudaMemcpy(&node_z[k],
+                                z_old.data() + cell_nodes[k],
+                                sizeof(double),
+                                cudaMemcpyDeviceToHost),
+                     "corner-J shear telemetry: copy node z failed");
+          cuda_check(cudaMemcpy(&node_v_r[k],
+                                state.v_r.data() + cell_nodes[k],
+                                sizeof(double),
+                                cudaMemcpyDeviceToHost),
+                     "corner-J shear telemetry: copy node v_r failed");
+          cuda_check(cudaMemcpy(&node_v_z[k],
+                                state.v_z.data() + cell_nodes[k],
+                                sizeof(double),
+                                cudaMemcpyDeviceToHost),
+                     "corner-J shear telemetry: copy node v_z failed");
+        }
+
+        const int seam_node_0 = state.mesh.topo.node_index(0, failing_j);
+        const int seam_node_1 = state.mesh.topo.node_index(0, failing_j + 1);
+        double seam_r[2] = {};
+        double seam_z[2] = {};
+        cuda_check(cudaMemcpy(&seam_r[0],
+                              r_old.data() + seam_node_0,
+                              sizeof(double),
+                              cudaMemcpyDeviceToHost),
+                   "corner-J shear telemetry: copy seam r0 failed");
+        cuda_check(cudaMemcpy(&seam_z[0],
+                              z_old.data() + seam_node_0,
+                              sizeof(double),
+                              cudaMemcpyDeviceToHost),
+                   "corner-J shear telemetry: copy seam z0 failed");
+        cuda_check(cudaMemcpy(&seam_r[1],
+                              r_old.data() + seam_node_1,
+                              sizeof(double),
+                              cudaMemcpyDeviceToHost),
+                   "corner-J shear telemetry: copy seam r1 failed");
+        cuda_check(cudaMemcpy(&seam_z[1],
+                              z_old.data() + seam_node_1,
+                              sizeof(double),
+                              cudaMemcpyDeviceToHost),
+                   "corner-J shear telemetry: copy seam z1 failed");
+
+        const double tangent_r = seam_r[1] - seam_r[0];
+        const double tangent_z = seam_z[1] - seam_z[0];
+        const double tangent_norm = std::hypot(tangent_r, tangent_z);
+        if (tangent_norm > 0.0 && std::isfinite(tangent_norm)) {
+          const double t_hat_r = tangent_r / tangent_norm;
+          const double t_hat_z = tangent_z / tangent_norm;
+          const double n_hat_r = -t_hat_z;
+          const double n_hat_z = t_hat_r;
+          const int previous = (failing_corner + 3) & 3;
+          const int next = (failing_corner + 1) & 3;
+          const double e_minus_r = node_r[previous] - node_r[failing_corner];
+          const double e_minus_z = node_z[previous] - node_z[failing_corner];
+          const double e_plus_r = node_r[next] - node_r[failing_corner];
+          const double e_plus_z = node_z[next] - node_z[failing_corner];
+          const double dv_next_r = node_v_r[next] - node_v_r[failing_corner];
+          const double dv_next_z = node_v_z[next] - node_v_z[failing_corner];
+          const double dv_previous_r =
+              node_v_r[previous] - node_v_r[failing_corner];
+          const double dv_previous_z =
+              node_v_z[previous] - node_v_z[failing_corner];
+          const auto cross = [](const double a_r,
+                                const double a_z,
+                                const double b_r,
+                                const double b_z) {
+            return a_r * b_z - a_z * b_r;
+          };
+          jdot = cross(dv_next_r, dv_next_z, e_minus_r, e_minus_z) +
+                 cross(e_plus_r,
+                       e_plus_z,
+                       dv_previous_r,
+                       dv_previous_z);
+          const auto projected_jdot = [&](const double direction_r,
+                                          const double direction_z) {
+            const double next_projection =
+                dv_next_r * direction_r + dv_next_z * direction_z;
+            const double previous_projection =
+                dv_previous_r * direction_r +
+                dv_previous_z * direction_z;
+            return cross(next_projection * direction_r,
+                         next_projection * direction_z,
+                         e_minus_r,
+                         e_minus_z) +
+                   cross(e_plus_r,
+                         e_plus_z,
+                         previous_projection * direction_r,
+                         previous_projection * direction_z);
+          };
+          jdot_t = projected_jdot(t_hat_r, t_hat_z);
+          jdot_n = projected_jdot(n_hat_r, n_hat_z);
+          chi_t = std::max(-jdot_t, 0.0) /
+                  (std::max(-jdot, 0.0) + 1.0e-300);
+        }
+      }
+      char corner_rate_telemetry[160];
+      std::snprintf(corner_rate_telemetry,
+                    sizeof(corner_rate_telemetry),
+                    " chi_t=%.3f Jdot_n=%.3e Jdot_t=%.3e",
+                    chi_t,
+                    jdot_n,
+                    jdot_t);
       tenryu::core::log_warning(
           "Hydro2D corner-J guard detected inadmissible corrector trial at step=" +
           std::to_string(state.step) + ", first_cell=" +
@@ -12014,7 +16779,7 @@ tenryu::coupling::HydroStepResult Hydro2D::lagrangian_step(
           format_scientific(corner_trial.min_current_j) + ", min_trial_J=" +
           format_scientific(corner_trial.min_trial_j) + ", min_trial_ratio=" +
           format_scientific(corner_trial.min_trial_ratio) + ", suggested_dt=" +
-          format_scientific(corner_trial.suggested_dt) +
+          format_scientific(corner_trial.suggested_dt) + corner_rate_telemetry +
           (cfg.numerics.hydro.driver_full_step_retry_enabled
                ? " (driver retry requested)"
                : " (diagnostic-only: driver step retry is disabled)"));
@@ -12024,6 +16789,26 @@ tenryu::coupling::HydroStepResult Hydro2D::lagrangian_step(
         result.reason = "corner_j";
         result.first_failing_cell = corner_trial.first_failing_cell;
         result.first_failing_corner = corner_trial.first_failing_corner;
+        result.first_failing_i =
+            corner_trial.first_failing_cell < 0
+                ? -1
+                : corner_trial.first_failing_cell / state.mesh.topo.nz;
+        result.first_failing_j =
+            corner_trial.first_failing_cell < 0
+                ? -1
+                : corner_trial.first_failing_cell % state.mesh.topo.nz;
+        int band = cfg.numerics.hydro.axis_guard_band_cells;
+        bool in_band =
+            result.first_failing_i >= 0 && result.first_failing_i <= band;
+        result.retry_action =
+            in_band
+                ? tenryu::coupling::RetryActionHint::ForceAxisSpinePlusLocalAle
+                : tenryu::coupling::RetryActionHint::ReduceDtOnly;
+        if (result.first_failing_i == 0) {
+          result.regime = MeshFailureRegime::AxisFace;
+        } else if (in_band) {
+          result.regime = MeshFailureRegime::AxisBand;
+        }
         result.min_metric =
             std::min(corner_trial.min_trial_j, corner_trial.min_current_j);
         result.suggested_dt = corner_trial.suggested_dt;
@@ -12033,17 +16818,104 @@ tenryu::coupling::HydroStepResult Hydro2D::lagrangian_step(
       }
     }
   }
+  if (cfg.numerics.hydro.axis_projection.enabled) {
+    axis_projection::observe_precommit(
+        state,
+        cfg,
+        r_old.data(),
+        z_old.data(),
+        corrector_pos_r.data(),
+        corrector_pos_z.data(),
+        use_two_temp ? ei_old.data() : e_old.data(),
+        dt,
+        t_op + dt,
+        reduction,
+        part.rank);
+  }
   commit_position_2d_kernel<<<nw.blocks(), 256>>>(
       state.x_r.data(), state.x_z.data(), r_old.data(), z_old.data(),
       corrector_pos_r.data(), corrector_pos_z.data(), d_node_active, d_node_flags,
       nw.begin, nw.end, n_nodes, dt);
+  emit_origin_trace(state, "c25_commit_pos", state.v_z.data());
   sync_kernel("Hydro2D corrector_update kernel failed");
-
   apply_boundary_2d(state, cfg, t_op + dt);
+  emit_origin_trace(state, "c26_boundary", state.v_z.data());
   if (state_supply_active) {
     restore_state_supply_material_velocity(state, cfg);
+    emit_origin_trace(state, "c27_supply_restore", state.v_z.data());
   }
-  pin_node_center_state(state, d_node_flags);
+  enforce_node_axis_state(state, d_node_flags);
+  emit_origin_trace(state, "c28_enforce_axis", state.v_z.data());
+  emit_origin_trace(state, "post_enforce", state.v_z.data());
+  if (aw_axis_slave_active) {
+    launch_apply_aw_axis_velocity_slave_2d(
+        state.v_r.data(),
+        state.v_z.data(),
+        state.x_r.data(),
+        state.x_z.data(),
+        aw_axis_slave_kappa_saved_.data(),
+        state.mesh.topo.nr,
+        state.mesh.topo.nz,
+        aw_axis_slave_first_i,
+        aw_axis_slave_theta0_active_,
+        aw_axis_slave_theta_pi_active_,
+        false);
+    if (aw_axis_snap_env_enabled) {
+      launch_snap_aw_axis_coordinates_2d(
+          state.x_r.data(),
+          state.x_z.data(),
+          aw_axis_slave_kappa_saved_.data(),
+          state.mesh.topo.nr,
+          state.mesh.topo.nz,
+          aw_axis_slave_first_i,
+          aw_axis_slave_theta0_active_,
+          aw_axis_slave_theta_pi_active_);
+    }
+    sync_kernel("Hydro2D post-boundary corrector AW axis closure failed");
+  }
+  if (aw_axis_slave_multiblock_active) {
+    launch_apply_aw_axis_velocity_slave_2d_multiblock(
+        state.v_r.data(),
+        state.v_z.data(),
+        state.x_r.data(),
+        state.x_z.data(),
+        aw_axis_slave_multiblock_kappa_saved_.data(),
+        aw_axis_slave_p_.data(),
+        aw_axis_slave_q_.data(),
+        static_cast<int>(aw_axis_slave_p_.size()),
+        false);
+    if (aw_axis_snap_env_enabled) {
+      launch_snap_aw_axis_coordinates_2d_multiblock(
+          state.x_r.data(),
+          state.x_z.data(),
+          aw_axis_slave_multiblock_kappa_saved_.data(),
+          aw_axis_slave_p_.data(),
+          aw_axis_slave_q_.data(),
+          static_cast<int>(aw_axis_slave_p_.size()));
+    }
+    sync_kernel(
+        "Hydro2D post-boundary corrector multiblock AW axis closure failed");
+  }
+  if (!state.carrier_domain_active || !state.boundary_carrier.valid ||
+      state.carrier_node_class.empty()) { /* skip */
+  } else {
+    ensure_carrier_hook_context().apply_reconstruct(
+        state.x_r.data(), state.x_z.data(), state.v_r.data(), state.v_z.data());
+  }
+  // Consultation #23 §11.4: finalize contact after the last stage-velocity writer.
+  launch_apply_evac_contact_velocity_constraints(
+      state, state.v_r.data(), state.v_z.data(),
+      cfg.numerics.hydro.rz_momentum_scheme_id == 0
+          ? node_mass.data()
+          : state.node_planar_mass.data(),
+      state.x_r.data(), state.x_z.data(),
+      cs_half.data(),
+      d_hydro_force_active,
+      dt,
+      state.evacuated_cells.d_contact_pair_dk.data(),
+      cfg.numerics.ale.evacuated_cell.closure_contact
+          .mortar_position_drift_beta);
+  evacuated_cell_contact_probe(state, cfg, "post_vel_corrector");
   central_pseudo_core::rebuild_virtual_member_geometry(
       state, cfg, "post_corrector");
   // OPEN-HYDRO-CORNER: same as the predictor — exchange ghost node coords
@@ -12229,6 +17101,7 @@ tenryu::coupling::HydroStepResult Hydro2D::lagrangian_step(
         state,
         cfg,
         dt,
+        node_mass,
         ur_old.data(),
         uz_old.data(),
         state.v_r.data(),
@@ -12287,6 +17160,8 @@ tenryu::coupling::HydroStepResult Hydro2D::lagrangian_step(
       compatible_energy_mode ? compatible_zero_energy_source : Pi_half;
   const core::CellField1D& Q_energy_half =
       compatible_energy_mode ? compatible_zero_energy_source : Q_half;
+  const FloorClampExclusionMasks exclusion_masks =
+      floor_clamp_exclusion_masks(state);
 
   if (use_two_temp && per_material_hydro_enabled) {
     Hydro2DMaterialParams* d_params = nullptr;
@@ -12362,6 +17237,9 @@ tenryu::coupling::HydroStepResult Hydro2D::lagrangian_step(
         d_ion_views,
         d_params,
         d_hydro_active,
+        exclusion_masks.central_member,
+        exclusion_masks.central_passive,
+        exclusion_masks.pole_member,
         n_cells,
         n_mat,
         cfg.numerics.floors.Te,
@@ -12433,7 +17311,9 @@ tenryu::coupling::HydroStepResult Hydro2D::lagrangian_step(
         qei_Te, qei_Ti, state.vol.data(), V_old.data(),
         state.mass.data(), Pe_energy_half.data(), Pi_energy_half.data(),
         Q_energy_half.data(),
-        state.zbar.data(), d_hydro_force_active, cw.begin, cw.end, n_cells, dt,
+        state.zbar.data(), d_hydro_force_active, exclusion_masks.central_member,
+        exclusion_masks.central_passive, exclusion_masks.pole_member, cw.begin,
+        cw.end, n_cells, dt,
         mat.ideal_gas_gamma, mat.A, mat.Z, cfg.numerics.hydro.qei_multiplier,
         eos_views.tab_ion, eos_views.tab_ele,
         cv_e_ptr, cv_i_ptr, q_heat_to_electron, d_hydro_floor, d_hydro_clamp_count);
@@ -12441,8 +17321,9 @@ tenryu::coupling::HydroStepResult Hydro2D::lagrangian_step(
     energy_update_with_old_volume_kernel<<<cw.blocks(), 256>>>(
         state.ee.data(), e_old.data(), state.vol.data(), V_old.data(),
         state.mass.data(), Pe_energy_half.data(), Q_energy_half.data(),
-        d_hydro_force_active, cw.begin, cw.end, n_cells, d_hydro_floor,
-        d_hydro_clamp_count);
+        d_hydro_force_active, exclusion_masks.central_member,
+        exclusion_masks.central_passive, exclusion_masks.pole_member, cw.begin,
+        cw.end, n_cells, d_hydro_floor, d_hydro_clamp_count);
   }
   if (!(use_two_temp && per_material_hydro_enabled)) {
     sync_kernel("Hydro2D energy_update kernel failed");
@@ -12477,16 +17358,16 @@ tenryu::coupling::HydroStepResult Hydro2D::lagrangian_step(
       }
     }
   }
-  apply_compatible_energy_work_2d(state,
-                                  cfg,
-                                  midpoint_v1,
-                                  P_half,
-                                  Pi_half,
-                                  use_two_temp,
-                                  dt,
-                                  d_hydro_force_active,
-                                  d_hydro_floor,
-                                  d_hydro_clamp_count);
+  launch_apply_compatible_energy_work_2d(state,
+                                         cfg,
+                                         P_half,
+                                         Pi_half,
+                                         use_two_temp,
+                                         dt,
+                                         d_hydro_force_active,
+                                         d_hydro_floor,
+                                         d_hydro_clamp_count,
+                                         midpoint_v1);
   if (subzonal_hourglass_enabled(cfg) &&
       cfg.numerics.hydro.hourglass.compatible_work_enabled) {
     apply_hourglass_work_2d(state,
@@ -12790,7 +17671,9 @@ tenryu::coupling::HydroStepResult Hydro2D::lagrangian_step(
   if (mesh_attr_active) {
     diagnostics::mesh_attribution::end_step_success(state, cfg);
   }
+  result.pressure_boundary_work_step = total_energy_identity_W_ext;
   restore_hydro_active();
+  emit_origin_trace(state, "step_end", state.v_z.data());
   return result;
 }
 

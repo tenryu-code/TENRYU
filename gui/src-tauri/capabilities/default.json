@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "TENRYU Studio main window: system ssh/scp execution, profile store, file dialogs",
+  "description": "TENRYU Studio main window: system ssh/scp execution, profile store, file dialogs, local bash for the experimental assistant harness",
   "windows": ["main"],
   "permissions": [
     "core:default",
@@ -26,7 +26,8 @@
       "identifier": "shell:allow-execute",
       "allow": [
         { "name": "ssh", "cmd": "ssh", "args": true, "sidecar": false },
-        { "name": "scp", "cmd": "scp", "args": true, "sidecar": false }
+        { "name": "scp", "cmd": "scp", "args": true, "sidecar": false },
+        { "name": "bash", "cmd": "bash", "args": true, "sidecar": false }
       ]
     }
   ]

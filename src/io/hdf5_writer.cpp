@@ -19,6 +19,7 @@
 
 #include "core/error.hpp"
 #include "diagnostics/diagnostics.hpp"
+#include "hydro/euler_window_blend.hpp"
 #include "hydro/oriented_swept_volume.cuh"
 #include "hydro/rz_corner_mass.cuh"
 #include "mesh/mesh.hpp"
@@ -148,6 +149,9 @@ void write_string_attribute(hid_t object,
 void write_scalar_attribute_i32(hid_t object,
                                 const std::string& name,
                                 std::int32_t value);
+void write_scalar_attribute_i8(hid_t object,
+                               const std::string& name,
+                               std::int8_t value);
 void write_scalar_attribute_u8(hid_t object,
                                const std::string& name,
                                std::uint8_t value);
@@ -374,9 +378,10 @@ std::vector<double> compute_node_mass_for_output(const core::State& state,
         continue;
       }
       double m_corner[4] = {0.0, 0.0, 0.0, 0.0};
-      hydro::rz::compute_rz_corner_masses_from_nodes(c, nz, m_cell,
-                                                     x_r.data(), x_z.data(),
-                                                     cell_nverts, m_corner);
+      hydro::rz::compute_rz_corner_masses_from_nodes(
+          c, nz, m_cell, x_r.data(), x_z.data(), cell_nverts, m_corner,
+          nullptr,
+          static_cast<int>(cfg.numerics.hydro.corner_mass_convention));
       accumulate_node_mass_corner(node_mass, c, m_corner[0], m_corner[1],
                                   m_corner[2], m_corner[3], nz);
     }
@@ -923,6 +928,21 @@ void write_scalar_attribute_i32(const hid_t object,
                         "HDF5Writer::write_scalar_attribute_i32(space)");
 }
 
+void write_scalar_attribute_i8(const hid_t object,
+                               const std::string& name,
+                               const std::int8_t value) {
+  const hid_t space = H5Screate(H5S_SCALAR);
+  TENRYU_ASSERT(space >= 0, "HDF5 H5Screate scalar i8 attribute failed");
+  const hid_t attr =
+      H5Acreate2(object, name.c_str(), H5T_NATIVE_INT8, space, H5P_DEFAULT, H5P_DEFAULT);
+  TENRYU_ASSERT(attr >= 0, "HDF5 H5Acreate2 i8 attribute failed: " + name);
+  TENRYU_ASSERT(H5Awrite(attr, H5T_NATIVE_INT8, &value) >= 0,
+                "HDF5 H5Awrite i8 attribute failed: " + name);
+  H5Aclose(attr);
+  warn_h5_close_failure(H5Sclose(space), "H5Sclose",
+                        "HDF5Writer::write_scalar_attribute_i8(space)");
+}
+
 void write_scalar_attribute_u64(const hid_t object,
                                 const std::string& name,
                                 const std::uint64_t value) {
@@ -1029,12 +1049,13 @@ hid_t make_dcpl(const core::Config& cfg,
   const hid_t dcpl = H5Pcreate(H5P_DATASET_CREATE);
   TENRYU_ASSERT(dcpl >= 0, "HDF5 H5Pcreate dataset create failed");
 
-  const bool skip_filters_for_empty_belt =
-      cfg.mesh.topology_scheme ==
-          core::TopologyScheme::PENTAGON_BELT_SHELL &&
+  const bool skip_filters_for_empty_dataset =
+      (cfg.mesh.topology_scheme ==
+           core::TopologyScheme::PENTAGON_BELT_SHELL ||
+       cfg.numerics.ale.mesh_mode == "reale_v2") &&
       std::any_of(dims.begin(), dims.end(),
                   [](const hsize_t dim) { return dim == 0; });
-  if (rank > 0 && !skip_filters_for_empty_belt) {
+  if (rank > 0 && !skip_filters_for_empty_dataset) {
     std::vector<hsize_t> chunk(static_cast<std::size_t>(rank), 1);
     for (int i = 0; i < rank; ++i) {
       chunk[static_cast<std::size_t>(i)] = std::max<hsize_t>(1, dims[static_cast<std::size_t>(i)]);
@@ -1045,7 +1066,7 @@ hid_t make_dcpl(const core::Config& cfg,
 
   if (cfg.output.compression == "gzip" &&
       cfg.output.compression_level > 0 && rank > 0 &&
-      !skip_filters_for_empty_belt) {
+      !skip_filters_for_empty_dataset) {
     const int level = std::clamp(cfg.output.compression_level, 0, 9);
     TENRYU_ASSERT(H5Pset_deflate(dcpl, static_cast<unsigned int>(level)) >= 0,
                   "HDF5 H5Pset_deflate failed");
@@ -1155,7 +1176,7 @@ void write_root_attributes(const hid_t file,
 }
 
 void write_metadata_group(const hid_t file,
-                          const core::State&,
+                          const core::State& state,
                           const core::Config& cfg,
                           const std::string& output_dir,
                           const std::string& case_name) {
@@ -1178,6 +1199,47 @@ void write_metadata_group(const hid_t file,
     }
   }
   write_string_dataset(file, "metadata", "frozen_config", frozen);
+  const std::int32_t pentagon_corner_mass_partition_version = 2;
+  write_numeric_dataset(file,
+                        "metadata",
+                        "pentagon_corner_mass_partition_version",
+                        H5T_NATIVE_INT32,
+                        {},
+                        &pentagon_corner_mass_partition_version,
+                        "",
+                        cfg);
+  const std::int32_t ale_swept_sign_epoch = 2;
+  write_numeric_dataset(file,
+                        "metadata",
+                        "ale_swept_sign_epoch",
+                        H5T_NATIVE_INT32,
+                        {},
+                        &ale_swept_sign_epoch,
+                        "",
+                        cfg);
+  const std::int32_t axis_core_released_units =
+      hydro::axis_core_released_units();
+  write_numeric_dataset(file,
+                        "metadata",
+                        "axis_core_released_units",
+                        H5T_NATIVE_INT32,
+                        {},
+                        &axis_core_released_units,
+                        "",
+                        cfg);
+  if (std::any_of(state.merge_tombstone.begin(),
+                  state.merge_tombstone.end(),
+                  [](const std::uint8_t value) { return value != 0U; })) {
+    write_numeric_dataset(
+        file,
+        "metadata",
+        "merge_tombstone",
+        H5T_NATIVE_UINT8,
+        {static_cast<hsize_t>(state.merge_tombstone.size())},
+        state.merge_tombstone.data(),
+        "",
+        cfg);
+  }
   const auto swept_volume_contract = hydro::resolve_swept_volume_contract(
       cfg.numerics.ale.swept_volume_sign_fixed);
   const auto write_swept_volume_convention =
@@ -1772,6 +1834,9 @@ void write_multiblock_topology_group(const hid_t file,
   if (cfg.mesh.topology_scheme ==
           core::TopologyScheme::MULTIBLOCK_HALF_BUTTERFLY_5BLOCK ||
       mesh::mesh_topo_has_trifan_cap(cfg.mesh) ||
+      mesh::mesh_topo_has_polar_tier(cfg.mesh) ||
+      cfg.mesh.topology_scheme ==
+          core::TopologyScheme::MULTIBLOCK_POLAR_TIER_CART_CENTER ||
       cfg.mesh.topology_scheme ==
           core::TopologyScheme::PENTAGON_BELT_SHELL) {
     write_multiblock_topology_v3_group(file, state, cfg);
@@ -1985,6 +2050,339 @@ void write_ale_reference_checkpoint_group(const hid_t file,
                         cfg);
 }
 
+void write_carrier_checkpoint_group(const hid_t file,
+                                    const core::State& state,
+                                    const core::Config& cfg) {
+  if (cfg.numerics.ale.mesh_mode != "reale_v2") {
+    return;
+  }
+
+  constexpr const char* group_path = "mesh/carrier/v1";
+  const std::size_t n_nodes = state.x_r.size();
+  const std::size_t n_masters = state.boundary_carrier.masters.size();
+  TENRYU_ASSERT(
+      n_masters <=
+          static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max()),
+      "HDF5 write: carrier master count exceeds int64 range");
+  TENRYU_ASSERT(!state.boundary_carrier.valid || n_masters >= 3U,
+                "HDF5 write: valid carrier must have at least three masters");
+
+  std::vector<std::uint64_t> master_stable_id(n_masters, 0);
+  std::vector<std::int32_t> master_mesh_node(n_masters, -1);
+  std::vector<std::uint8_t> master_bc_class(n_masters, 0);
+  for (std::size_t master_index = 0; master_index < n_masters;
+       ++master_index) {
+    const auto& master = state.boundary_carrier.masters[master_index];
+    TENRYU_ASSERT(master.mesh_node >= 0 &&
+                      static_cast<std::size_t>(master.mesh_node) < n_nodes,
+                  "HDF5 write: carrier master mesh node out of range");
+    const std::uint8_t bc_class =
+        static_cast<std::uint8_t>(master.bc_class);
+    TENRYU_ASSERT(
+        bc_class <= static_cast<std::uint8_t>(mesh::CarrierBcClass::kAxis),
+        "HDF5 write: carrier master boundary class out of range");
+    master_stable_id[master_index] = master.stable_id;
+    master_mesh_node[master_index] =
+        static_cast<std::int32_t>(master.mesh_node);
+    master_bc_class[master_index] = bc_class;
+  }
+
+  std::vector<std::uint8_t> node_class = state.carrier_node_class;
+  std::vector<int> node_edge = state.carrier_node_edge;
+  std::vector<double> node_lambda = state.carrier_node_lambda;
+  const bool empty_generation_zero = !state.boundary_carrier.valid &&
+                                     node_class.empty() && node_edge.empty() &&
+                                     node_lambda.empty();
+  if (empty_generation_zero) {
+    node_class.assign(n_nodes, 0U);
+    node_edge.assign(n_nodes, -1);
+    node_lambda.assign(n_nodes, 0.0);
+  }
+  TENRYU_ASSERT(node_class.size() == n_nodes && node_edge.size() == n_nodes &&
+                    node_lambda.size() == n_nodes,
+                "HDF5 write: carrier node arrays must match node count");
+
+  std::vector<std::int32_t> node_edge_i32(n_nodes, -1);
+  for (std::size_t node = 0; node < n_nodes; ++node) {
+    TENRYU_ASSERT(node_class[node] <= 2U,
+                  "HDF5 write: carrier node class out of range");
+    TENRYU_ASSERT(node_lambda[node] >= 0.0 && node_lambda[node] <= 1.0,
+                  "HDF5 write: carrier node lambda out of range");
+    TENRYU_ASSERT(
+        node_edge[node] >= std::numeric_limits<std::int32_t>::min() &&
+            node_edge[node] <= std::numeric_limits<std::int32_t>::max(),
+        "HDF5 write: carrier node edge exceeds int32 range");
+    node_edge_i32[node] = static_cast<std::int32_t>(node_edge[node]);
+  }
+
+  const hid_t group = ensure_group(file, group_path);
+  TENRYU_ASSERT(group >= 0,
+                "HDF5 failed to open mesh/carrier/v1 group");
+  write_scalar_attribute_i8(
+      group, "valid",
+      static_cast<std::int8_t>(state.boundary_carrier.valid ? 1 : 0));
+  write_scalar_attribute_i8(
+      group, "domain_active",
+      static_cast<std::int8_t>(state.carrier_domain_active ? 1 : 0));
+  write_scalar_attribute_i64(
+      group, "n_masters", static_cast<std::int64_t>(n_masters));
+  warn_h5_close_failure(
+      H5Gclose(group), "H5Gclose",
+      "HDF5Writer::write_carrier_checkpoint_group(group)");
+
+  const std::vector<hsize_t> master_dims = {
+      static_cast<hsize_t>(n_masters)};
+  const std::vector<hsize_t> node_dims = {static_cast<hsize_t>(n_nodes)};
+  write_numeric_dataset(file, group_path, "master_stable_id",
+                        H5T_NATIVE_UINT64, master_dims,
+                        master_stable_id.data(), "index", cfg);
+  write_numeric_dataset(file, group_path, "master_mesh_node",
+                        H5T_NATIVE_INT32, master_dims,
+                        master_mesh_node.data(), "index", cfg);
+  write_numeric_dataset(file, group_path, "master_bc_class",
+                        H5T_NATIVE_UINT8, master_dims,
+                        master_bc_class.data(), "enum", cfg);
+  write_numeric_dataset(file, group_path, "node_class", H5T_NATIVE_UINT8,
+                        node_dims, node_class.data(), "enum", cfg);
+  write_numeric_dataset(file, group_path, "node_edge", H5T_NATIVE_INT32,
+                        node_dims, node_edge_i32.data(), "index", cfg);
+  write_numeric_dataset(file, group_path, "node_lambda", H5T_NATIVE_DOUBLE,
+                        node_dims, node_lambda.data(), "dimensionless", cfg);
+}
+
+void write_evacuated_cells_checkpoint_group(const hid_t file,
+                                            const core::State& state,
+                                            const core::Config& cfg) {
+  const auto& evacuated = state.evacuated_cells;
+  if (evacuated.mass_ref.empty()) {
+    return;
+  }
+
+  constexpr const char* group_path = "evacuated_cells";
+  const std::size_t n_cells = evacuated.mass_ref.size();
+  TENRYU_ASSERT(
+      n_cells == state.rho.size() &&
+          evacuated.inactive_member_mask.size() == n_cells &&
+          evacuated.closure_lineage.size() == n_cells &&
+          evacuated.contact_active_mask.size() == n_cells &&
+          evacuated.vol_ref.size() == n_cells &&
+          evacuated.x_r_ref.size() == state.x_r.size() &&
+          evacuated.x_z_ref.size() == state.x_z.size() &&
+          evacuated.off_streak.size() == n_cells &&
+          evacuated.controller_dwell_remaining.size() == n_cells &&
+          evacuated.controller_evaluations_since_conversion.size() ==
+              n_cells &&
+          evacuated.controller_previous_volume.size() == n_cells &&
+          evacuated.controller_previous_contact_gap.size() == n_cells,
+      "HDF5 write: evacuated-cell arrays must match cell count");
+
+  std::vector<double> controller_previous_contact_gap(2U * n_cells, 0.0);
+  for (std::size_t cell = 0; cell < n_cells; ++cell) {
+    controller_previous_contact_gap[2U * cell] =
+        evacuated.controller_previous_contact_gap[cell][0];
+    controller_previous_contact_gap[2U * cell + 1U] =
+        evacuated.controller_previous_contact_gap[cell][1];
+  }
+
+  const std::size_t n_slots_size = state.contact_graph.records.size();
+  TENRYU_ASSERT(
+      n_slots_size <= static_cast<std::size_t>(std::numeric_limits<int>::max()),
+      "HDF5 write: evacuated-cell contact slot count exceeds int range");
+  const int n_slots = static_cast<int>(n_slots_size);
+  std::vector<int> cell(n_slots_size, -1);
+  std::vector<int> axis(n_slots_size, 1);
+  std::vector<int> node_a0(n_slots_size, -1);
+  std::vector<int> node_a1(n_slots_size, -1);
+  std::vector<int> node_b0(n_slots_size, -1);
+  std::vector<int> node_b1(n_slots_size, -1);
+  std::vector<double> normal_pair_r0(n_slots_size, 0.0);
+  std::vector<double> normal_pair_z0(n_slots_size, 0.0);
+  std::vector<double> normal_pair_r1(n_slots_size, 0.0);
+  std::vector<double> normal_pair_z1(n_slots_size, 0.0);
+  std::vector<double> gap_at_engagement_pair0(n_slots_size, 0.0);
+  std::vector<double> gap_at_engagement_pair1(n_slots_size, 0.0);
+  std::vector<double> h_perp_ref(n_slots_size, 0.0);
+  std::vector<double> g0(n_slots_size, 0.0);
+  std::vector<double> g_arm(n_slots_size, 0.0);
+  std::vector<double> gap_pair0(n_slots_size, 0.0);
+  std::vector<double> gap_pair1(n_slots_size, 0.0);
+  std::vector<double> gap_prev_pair0(n_slots_size, 0.0);
+  std::vector<double> gap_prev_pair1(n_slots_size, 0.0);
+  std::vector<std::uint8_t> pair_engaged0(n_slots_size, 0U);
+  std::vector<std::uint8_t> pair_engaged1(n_slots_size, 0U);
+  std::vector<int> tensile_streak_pair0(n_slots_size, 0);
+  std::vector<int> tensile_streak_pair1(n_slots_size, 0);
+  std::vector<double> gap(n_slots_size, 0.0);
+  std::vector<double> gap_prev(n_slots_size, 0.0);
+  std::vector<std::uint8_t> slot_state(n_slots_size, 0U);
+  std::vector<double> mass_at_engagement(n_slots_size, 0.0);
+  std::vector<double> vol_at_engagement(n_slots_size, 0.0);
+  std::vector<int> devolumized(n_slots_size, 0);
+  std::vector<double> lambda_last(n_slots_size, 0.0);
+  std::vector<double> impact_heat_total(n_slots_size, 0.0);
+  std::vector<int> engage_count(n_slots_size, 0);
+  std::vector<int> release_count(n_slots_size, 0);
+  std::vector<int> reproject_count(n_slots_size, 0);
+  std::vector<double> reproject_heat_total(n_slots_size, 0.0);
+  std::vector<int> reproject_count_last_logged(n_slots_size, 0);
+  std::vector<double> reproject_heat_last_logged(n_slots_size, 0.0);
+  for (std::size_t index = 0; index < n_slots_size; ++index) {
+    const auto& slot = state.contact_graph.records[index];
+    cell[index] = slot.cell;
+    axis[index] = slot.axis;
+    node_a0[index] = slot.node_a[0];
+    node_a1[index] = slot.node_a[1];
+    node_b0[index] = slot.node_b[0];
+    node_b1[index] = slot.node_b[1];
+    normal_pair_r0[index] = slot.normal_pair_r[0];
+    normal_pair_z0[index] = slot.normal_pair_z[0];
+    normal_pair_r1[index] = slot.normal_pair_r[1];
+    normal_pair_z1[index] = slot.normal_pair_z[1];
+    gap_at_engagement_pair0[index] = slot.gap_at_engagement_pair[0];
+    gap_at_engagement_pair1[index] = slot.gap_at_engagement_pair[1];
+    h_perp_ref[index] = slot.h_perp_ref;
+    g0[index] = slot.g0;
+    g_arm[index] = slot.g_arm;
+    gap_pair0[index] = slot.gap_pair[0];
+    gap_pair1[index] = slot.gap_pair[1];
+    gap_prev_pair0[index] = slot.gap_prev_pair[0];
+    gap_prev_pair1[index] = slot.gap_prev_pair[1];
+    pair_engaged0[index] = slot.pair_engaged[0];
+    pair_engaged1[index] = slot.pair_engaged[1];
+    tensile_streak_pair0[index] = slot.tensile_streak_pair[0];
+    tensile_streak_pair1[index] = slot.tensile_streak_pair[1];
+    gap[index] = slot.gap;
+    gap_prev[index] = slot.gap_prev;
+    slot_state[index] = static_cast<std::uint8_t>(slot.state);
+    mass_at_engagement[index] = slot.mass_at_engagement;
+    vol_at_engagement[index] = slot.vol_at_engagement;
+    devolumized[index] = static_cast<int>(slot.devolumized);
+    lambda_last[index] = slot.lambda_last;
+    impact_heat_total[index] = slot.impact_heat_total;
+    engage_count[index] = slot.engage_count;
+    release_count[index] = slot.release_count;
+    reproject_count[index] = slot.reproject_count;
+    reproject_heat_total[index] = slot.reproject_heat_total;
+    reproject_count_last_logged[index] = slot.reproject_count_last_logged;
+    reproject_heat_last_logged[index] = slot.reproject_heat_last_logged;
+  }
+
+  const std::vector<hsize_t> cell_dims = {static_cast<hsize_t>(n_cells)};
+  const std::vector<hsize_t> contact_gap_dims = {
+      static_cast<hsize_t>(n_cells), 2U};
+  const std::vector<hsize_t> slot_dims = {
+      static_cast<hsize_t>(n_slots_size)};
+  const auto write_u8 = [&](const std::string& name,
+                            const std::vector<std::uint8_t>& values,
+                            const std::string& units) {
+    write_numeric_dataset(file, group_path, name, H5T_NATIVE_UINT8, slot_dims,
+                          values.data(), units, cfg);
+  };
+  const auto write_int = [&](const std::string& name,
+                             const std::vector<int>& values,
+                             const std::string& units) {
+    write_numeric_dataset(file, group_path, name, H5T_NATIVE_INT, slot_dims,
+                          values.data(), units, cfg);
+  };
+  const auto write_double = [&](const std::string& name,
+                                const std::vector<double>& values,
+                                const std::string& units) {
+    write_numeric_dataset(file, group_path, name, H5T_NATIVE_DOUBLE,
+                          slot_dims, values.data(), units, cfg);
+  };
+
+  write_numeric_dataset(file, group_path, "inactive_member_mask",
+                        H5T_NATIVE_UINT8, cell_dims,
+                        evacuated.inactive_member_mask.data(), "flag", cfg);
+  write_numeric_dataset(file, group_path, "closure_lineage",
+                        H5T_NATIVE_UINT8, cell_dims,
+                        evacuated.closure_lineage.data(), "flag", cfg);
+  write_numeric_dataset(file, group_path, "contact_active_mask",
+                        H5T_NATIVE_UINT8, cell_dims,
+                        evacuated.contact_active_mask.data(), "flag", cfg);
+  write_numeric_dataset(file, group_path, "mass_ref", H5T_NATIVE_DOUBLE,
+                        cell_dims, evacuated.mass_ref.data(), "g", cfg);
+  write_numeric_dataset(file, group_path, "vol_ref", H5T_NATIVE_DOUBLE,
+                        cell_dims, evacuated.vol_ref.data(), "cm3", cfg);
+  write_numeric_dataset(file, group_path, "x_r_ref", H5T_NATIVE_DOUBLE,
+                        {static_cast<hsize_t>(evacuated.x_r_ref.size())},
+                        evacuated.x_r_ref.data(), "cm", cfg);
+  write_numeric_dataset(file, group_path, "x_z_ref", H5T_NATIVE_DOUBLE,
+                        {static_cast<hsize_t>(evacuated.x_z_ref.size())},
+                        evacuated.x_z_ref.data(), "cm", cfg);
+  write_numeric_dataset(file, group_path, "controller_previous_volume",
+                        H5T_NATIVE_DOUBLE, cell_dims,
+                        evacuated.controller_previous_volume.data(), "cm3", cfg);
+  write_numeric_dataset(file, group_path, "controller_previous_contact_gap",
+                        H5T_NATIVE_DOUBLE, contact_gap_dims,
+                        controller_previous_contact_gap.data(), "cm", cfg);
+  write_numeric_dataset(file, group_path, "off_streak", H5T_NATIVE_INT,
+                        cell_dims, evacuated.off_streak.data(), "count", cfg);
+  write_numeric_dataset(file, group_path, "controller_dwell_remaining",
+                        H5T_NATIVE_INT, cell_dims,
+                        evacuated.controller_dwell_remaining.data(), "count", cfg);
+  write_numeric_dataset(
+      file, group_path, "controller_evaluations_since_conversion",
+      H5T_NATIVE_INT, cell_dims,
+      evacuated.controller_evaluations_since_conversion.data(), "count", cfg);
+  if (!evacuated.cell_axis_edge_collapsed.empty()) {
+    write_numeric_dataset(file, group_path, "cell_axis_edge_collapsed",
+                          H5T_NATIVE_UINT8, cell_dims,
+                          evacuated.cell_axis_edge_collapsed.data(), "flag",
+                          cfg);
+  }
+  if (!evacuated.node_axis_alias.empty()) {
+    write_numeric_dataset(file, group_path, "node_axis_alias",
+                          H5T_NATIVE_INT,
+                          {static_cast<hsize_t>(state.x_r.size())},
+                          evacuated.node_axis_alias.data(), "index", cfg);
+  }
+  write_numeric_dataset(file, group_path, "conversions_total", H5T_NATIVE_INT,
+                        {}, &evacuated.conversions_total, "count", cfg);
+  write_numeric_dataset(file, group_path, "n_slots", H5T_NATIVE_INT, {},
+                        &n_slots, "count", cfg);
+
+  write_int("cell", cell, "index");
+  write_int("axis", axis, "enum");
+  write_int("node_a0", node_a0, "index");
+  write_int("node_a1", node_a1, "index");
+  write_int("node_b0", node_b0, "index");
+  write_int("node_b1", node_b1, "index");
+  write_double("normal_pair_r0", normal_pair_r0, "dimensionless");
+  write_double("normal_pair_z0", normal_pair_z0, "dimensionless");
+  write_double("normal_pair_r1", normal_pair_r1, "dimensionless");
+  write_double("normal_pair_z1", normal_pair_z1, "dimensionless");
+  write_double("gap_at_engagement_pair0", gap_at_engagement_pair0, "cm");
+  write_double("gap_at_engagement_pair1", gap_at_engagement_pair1, "cm");
+  write_double("h_perp_ref", h_perp_ref, "cm");
+  write_double("g0", g0, "cm");
+  write_double("g_arm", g_arm, "cm");
+  write_double("gap_pair0", gap_pair0, "cm");
+  write_double("gap_pair1", gap_pair1, "cm");
+  write_double("gap_prev_pair0", gap_prev_pair0, "cm");
+  write_double("gap_prev_pair1", gap_prev_pair1, "cm");
+  write_u8("pair_engaged0", pair_engaged0, "flag");
+  write_u8("pair_engaged1", pair_engaged1, "flag");
+  write_int("tensile_streak_pair0", tensile_streak_pair0, "count");
+  write_int("tensile_streak_pair1", tensile_streak_pair1, "count");
+  write_double("gap", gap, "cm");
+  write_double("gap_prev", gap_prev, "cm");
+  write_u8("state", slot_state, "enum");
+  write_double("mass_at_engagement", mass_at_engagement, "g");
+  write_double("vol_at_engagement", vol_at_engagement, "cm3");
+  write_int("devolumized", devolumized, "flag");
+  write_double("lambda_last", lambda_last, "dyn");
+  write_double("impact_heat_total", impact_heat_total, "erg");
+  write_int("engage_count", engage_count, "count");
+  write_int("release_count", release_count, "count");
+  write_int("reproject_count", reproject_count, "count");
+  write_double("reproject_heat_total", reproject_heat_total, "erg");
+  write_int("reproject_count_last_logged", reproject_count_last_logged,
+            "count");
+  write_double("reproject_heat_last_logged", reproject_heat_last_logged,
+               "erg");
+}
+
 void write_hydro_group(const hid_t file,
                        const core::State& state,
                        const core::Config& cfg) {
@@ -2017,6 +2415,29 @@ void write_hydro_group(const hid_t file,
   write_numeric_dataset(file, "hydro", "ei", H5T_NATIVE_DOUBLE, cdim, ei.data(), "erg/g", cfg);
   write_numeric_dataset(file, "hydro", "Pe", H5T_NATIVE_DOUBLE, cdim, Pe.data(), "dyne/cm2", cfg);
   write_numeric_dataset(file, "hydro", "Pi", H5T_NATIVE_DOUBLE, cdim, Pi.data(), "dyne/cm2", cfg);
+  if (cfg.numerics.diagnostics.conduction_energy_rate_export.enabled) {
+    const auto conduction_e_rate =
+        copy_field_to_host(state.conduction_e_rate);
+    write_numeric_dataset(file,
+                          "hydro",
+                          "conduction_e_rate",
+                          H5T_NATIVE_DOUBLE,
+                          cdim,
+                          conduction_e_rate.data(),
+                          "erg/cm3/s",
+                          cfg);
+  }
+  if (cfg.numerics.diagnostics.refinement_estimator.enabled &&
+      state.refine_error.size() == n_cells) {
+    write_numeric_dataset(file,
+                          "hydro",
+                          "refine_error",
+                          H5T_NATIVE_DOUBLE,
+                          cdim,
+                          state.refine_error.data(),
+                          "dimensionless",
+                          cfg);
+  }
   write_numeric_dataset(file,
                         "hydro",
                         "Qvisc",
@@ -3556,6 +3977,8 @@ void write_common_snapshot_content(const hid_t file,
   write_numeric_dataset(file, "time_state", "step", H5T_NATIVE_INT32, {}, &step_i32, "count", cfg);
   write_numeric_dataset(file, "time_state", "t", H5T_NATIVE_DOUBLE, {}, &t, "s", cfg);
   write_numeric_dataset(file, "time_state", "dt", H5T_NATIVE_DOUBLE, {}, &state.dt, "s", cfg);
+  write_numeric_dataset(file, "time_state", "dt_growth_ref", H5T_NATIVE_DOUBLE,
+                        {}, &state.dt_growth_ref, "s", cfg);
   if (cfg.numerics.hydro.adaptive_av.enabled) {
     write_numeric_dataset(file,
                           "time_state",
@@ -3665,6 +4088,8 @@ void write_checkpoint_extras(const hid_t file,
                              const int step,
                              const double t) {
   write_ale_reference_checkpoint_group(file, state, cfg);
+  write_carrier_checkpoint_group(file, state, cfg);
+  write_evacuated_cells_checkpoint_group(file, state, cfg);
 
   std::vector<std::int8_t> hydro_active = state.hydro_active;
   if (!has_button_center(state)) {
@@ -4345,14 +4770,15 @@ void HDF5Writer::write_snapshot(const core::State& state,
 #endif
 }
 
-void HDF5Writer::write_checkpoint(const core::State& state,
-                                  const core::Config& cfg,
-                                  const radiation::PhotonPool& photon_pool,
-                                  const int file_index,
-                                  const int step,
-                                  const double t,
-                                  const std::string& output_dir,
-                                  const std::string& case_name) const {
+std::string HDF5Writer::write_checkpoint(
+    const core::State& state,
+    const core::Config& cfg,
+    const radiation::PhotonPool& photon_pool,
+    const int file_index,
+    const int step,
+    const double t,
+    const std::string& output_dir,
+    const std::string& case_name) const {
 #if TENRYU_ENABLE_HDF5
   std::filesystem::create_directories(output_dir);
   const std::filesystem::path path =
@@ -4380,6 +4806,7 @@ void HDF5Writer::write_checkpoint(const core::State& state,
   TENRYU_ASSERT(!rename_ec,
                 "Failed to atomically publish checkpoint HDF5 file '" + path.string() +
                     "': " + rename_ec.message());
+  return path.string();
 #else
   (void)state;
   (void)cfg;
@@ -4389,6 +4816,7 @@ void HDF5Writer::write_checkpoint(const core::State& state,
   (void)t;
   (void)output_dir;
   (void)case_name;
+  return {};
 #endif
 }
 

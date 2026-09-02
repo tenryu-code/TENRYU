@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstdint>
 #include <vector>
 
@@ -9,7 +11,10 @@
 
 #include "core/error.hpp"
 #include "hydro/boundary_2d.hpp"
+#include "hydro/central_pseudo_core.cuh"
 #include "hydro/corner_jacobian_quality.cuh"
+#include "hydro/pentagon_geometry.cuh"
+#include "hydro/pole_angular_derefine.cuh"
 #include "hydro/rz_corner_mass.cuh"
 #include "mesh/mesh.hpp"
 
@@ -48,6 +53,24 @@ const std::uint8_t* upload_cell_nverts_if_tri(
     const core::State& state,
     const int n_cells) {
   if (!has_tri_cell_nverts(state.mesh.cell_nverts, n_cells)) {
+    return nullptr;
+  }
+  d_cell_nverts.reset(static_cast<std::size_t>(n_cells));
+  d_cell_nverts.copy_from_host(state.mesh.cell_nverts);
+  return d_cell_nverts.data();
+}
+
+const std::uint8_t* upload_cell_nverts_if_nonquad(
+    core::DeviceArray<std::uint8_t>& d_cell_nverts,
+    const core::State& state,
+    const int n_cells) {
+  if (state.mesh.cell_nverts.size() !=
+          static_cast<std::size_t>(n_cells) ||
+      std::none_of(state.mesh.cell_nverts.begin(),
+                   state.mesh.cell_nverts.end(),
+                   [](const std::uint8_t nverts) {
+                     return nverts != 4U;
+                   })) {
     return nullptr;
   }
   d_cell_nverts.reset(static_cast<std::size_t>(n_cells));
@@ -278,6 +301,16 @@ __device__ inline void triangle_corner_volumes(const double* r,
   v_corner[3] = 0.0;
 }
 
+__device__ inline void validate_pentagon_corner_volumes(
+    const double* v_corner) {
+  for (int k = 0; k < 5; ++k) {
+    if (!(v_corner[k] > 0.0) || !isfinite(v_corner[k])) {
+      printf("pentagon subzonal corner volume invalid\n");
+      __trap();
+    }
+  }
+}
+
 __global__ void initialize_subzonal_masses_kernel(
     double* __restrict__ m0,
     double* __restrict__ m1,
@@ -358,6 +391,7 @@ __global__ void initialize_subzonal_masses_multiblock_kernel(
     const int* __restrict__ cell_node_csr_offsets,
     const int* __restrict__ cell_node_csr_indices,
     const std::uint8_t* __restrict__ cell_nverts,
+    const int corner_stride,
     const int n_cells) {
   const int c = blockIdx.x * blockDim.x + threadIdx.x;
   if (c >= n_cells) {
@@ -366,8 +400,8 @@ __global__ void initialize_subzonal_masses_multiblock_kernel(
 
   const int off = cell_node_csr_offsets[c];
   const double m_cell = fmax(mass[c], 0.0);
-  double v_corner[4] = {0.0, 0.0, 0.0, 0.0};
-  double cm[4] = {0.0, 0.0, 0.0, 0.0};
+  double v_corner[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {};
+  double cm[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {};
   const int active_nverts =
       mesh::mesh_topo_cell_active_nverts(cell_nverts, c);
   if (active_nverts == 3) {
@@ -388,7 +422,34 @@ __global__ void initialize_subzonal_masses_multiblock_kernel(
       cm[1] = third;
       cm[2] = third;
     }
+  } else if (active_nverts == 5) {
+    PentagonPoint x[5];
+    for (int k = 0; k < 5; ++k) {
+      const int n = cell_node_csr_indices[off + k];
+      x[k] = {x_r[n], x_z[n]};
+    }
+    pentagon_corner_rz_volumes(x, v_corner);
+    validate_pentagon_corner_volumes(v_corner);
+    double v_sum = 0.0;
+    for (int k = 0; k < 5; ++k) {
+      v_sum += v_corner[k];
+    }
+    for (int k = 0; k < 5; ++k) {
+      cm[k] = m_cell * (v_corner[k] / v_sum);
+    }
+    cm[2] =
+        m_cell - ((cm[0] + cm[1]) + (cm[3] + cm[4]));
   } else {
+    if (active_nverts != 4) {
+#ifdef __CUDA_ARCH__
+      __trap();
+#else
+      ::tenryu::core::tenryu_abort(
+          "active_nverts == 4",
+          "hourglass subzonal mass: general-valence cell reached the quad branch",
+          __FILE__, __LINE__);
+#endif
+    }
     const int n00 = cell_node_csr_indices[off + 0];
     const int n10 = cell_node_csr_indices[off + 1];
     const int n11 = cell_node_csr_indices[off + 2];
@@ -418,17 +479,22 @@ __global__ void initialize_subzonal_masses_multiblock_kernel(
   m1[c] = cm[1];
   m2[c] = cm[2];
   m3[c] = cm[3];
+  const int base = c * corner_stride;
   if (corner_mass != nullptr) {
-    corner_mass[c * 4 + 0] = cm[0];
-    corner_mass[c * 4 + 1] = cm[1];
-    corner_mass[c * 4 + 2] = cm[2];
-    corner_mass[c * 4 + 3] = cm[3];
+    for (int k = 0; k < active_nverts; ++k) {
+      corner_mass[base + k] = cm[k];
+    }
+    for (int k = active_nverts; k < corner_stride; ++k) {
+      corner_mass[base + k] = 0.0;
+    }
   }
   if (corner_volume != nullptr) {
-    corner_volume[c * 4 + 0] = v_corner[0];
-    corner_volume[c * 4 + 1] = v_corner[1];
-    corner_volume[c * 4 + 2] = v_corner[2];
-    corner_volume[c * 4 + 3] = v_corner[3];
+    for (int k = 0; k < active_nverts; ++k) {
+      corner_volume[base + k] = v_corner[k];
+    }
+    for (int k = active_nverts; k < corner_stride; ++k) {
+      corner_volume[base + k] = 0.0;
+    }
   }
 }
 
@@ -439,18 +505,20 @@ __global__ void copy_corner_mass_to_subzonal_kernel(
     double* __restrict__ m3,
     const double* __restrict__ corner_mass,
     const std::uint8_t* __restrict__ cell_nverts,
+    const int corner_stride,
     const int n_cells) {
   const int c = blockIdx.x * blockDim.x + threadIdx.x;
   if (c >= n_cells) {
     return;
   }
-  m0[c] = corner_mass[c * 4 + 0];
-  m1[c] = corner_mass[c * 4 + 1];
-  m2[c] = corner_mass[c * 4 + 2];
+  const int base = c * corner_stride;
+  m0[c] = corner_mass[base + 0];
+  m1[c] = corner_mass[base + 1];
+  m2[c] = corner_mass[base + 2];
   if (mesh::mesh_topo_cell_active_nverts(cell_nverts, c) == 3) {
     m3[c] = 0.0;
   } else {
-    m3[c] = corner_mass[c * 4 + 3];
+    m3[c] = corner_mass[base + 3];
   }
 }
 
@@ -494,13 +562,14 @@ __global__ void update_corner_volumes_multiblock_kernel(
     const int* __restrict__ cell_node_csr_offsets,
     const int* __restrict__ cell_node_csr_indices,
     const std::uint8_t* __restrict__ cell_nverts,
+    const int corner_stride,
     const int n_cells) {
   const int c = blockIdx.x * blockDim.x + threadIdx.x;
   if (c >= n_cells) {
     return;
   }
   const int off = cell_node_csr_offsets[c];
-  double v_corner[4] = {0.0, 0.0, 0.0, 0.0};
+  double v_corner[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {};
   const int active_nverts =
       mesh::mesh_topo_cell_active_nverts(cell_nverts, c);
   if (active_nverts == 3) {
@@ -510,7 +579,25 @@ __global__ void update_corner_volumes_multiblock_kernel(
     const double r[4] = {x_r[n0], x_r[n1], x_r[n2], 0.0};
     const double z[4] = {x_z[n0], x_z[n1], x_z[n2], 0.0};
     triangle_corner_volumes(r, z, v_corner);
+  } else if (active_nverts == 5) {
+    PentagonPoint x[5];
+    for (int k = 0; k < 5; ++k) {
+      const int n = cell_node_csr_indices[off + k];
+      x[k] = {x_r[n], x_z[n]};
+    }
+    pentagon_corner_rz_volumes(x, v_corner);
+    validate_pentagon_corner_volumes(v_corner);
   } else {
+    if (active_nverts != 4) {
+#ifdef __CUDA_ARCH__
+      __trap();
+#else
+      ::tenryu::core::tenryu_abort(
+          "active_nverts == 4",
+          "hourglass corner volume: general-valence cell reached the quad branch",
+          __FILE__, __LINE__);
+#endif
+    }
     const int n00 = cell_node_csr_indices[off + 0];
     const int n10 = cell_node_csr_indices[off + 1];
     const int n11 = cell_node_csr_indices[off + 2];
@@ -525,10 +612,13 @@ __global__ void update_corner_volumes_multiblock_kernel(
                                                      x_z[n01],
                                                      v_corner);
   }
-  corner_volume[c * 4 + 0] = v_corner[0];
-  corner_volume[c * 4 + 1] = v_corner[1];
-  corner_volume[c * 4 + 2] = v_corner[2];
-  corner_volume[c * 4 + 3] = v_corner[3];
+  const int base = c * corner_stride;
+  for (int k = 0; k < active_nverts; ++k) {
+    corner_volume[base + k] = v_corner[k];
+  }
+  for (int k = active_nverts; k < corner_stride; ++k) {
+    corner_volume[base + k] = 0.0;
+  }
 }
 
 void warn_invariant_remap_reinit_once() {
@@ -554,7 +644,7 @@ void update_corner_volumes(core::State& state,
                       expected_corner,
                   "Hydro2D hourglass corner volumes require cell-node CSR indices");
     core::DeviceArray<std::uint8_t> d_cell_nverts;
-    const std::uint8_t* d_cell_nverts_ptr = upload_cell_nverts_if_tri(
+    const std::uint8_t* d_cell_nverts_ptr = upload_cell_nverts_if_nonquad(
         d_cell_nverts, state, static_cast<int>(expected));
     update_corner_volumes_multiblock_kernel<<<blocks, 256>>>(
         state.corner_volume.data(),
@@ -563,6 +653,7 @@ void update_corner_volumes(core::State& state,
         state.mesh.multiblock_cell_node_csr_offsets.data(),
         state.mesh.multiblock_cell_node_csr_indices.data(),
         d_cell_nverts_ptr,
+        state.corner_stride,
         static_cast<int>(expected));
   } else {
     update_corner_volumes_kernel<<<blocks, 256>>>(
@@ -1083,6 +1174,9 @@ __global__ void apply_hourglass_work_kernel(
     const double* __restrict__ mass,
     const double* __restrict__ work_erg,
     const std::int8_t* __restrict__ hydro_active,
+    const std::uint8_t* __restrict__ central_member_mask,
+    const std::uint8_t* __restrict__ central_passive_mask,
+    const std::uint8_t* __restrict__ pole_member_mask,
     const int n_cells,
     const int use_two_temp,
     const int heat_to_electron,
@@ -1090,6 +1184,11 @@ __global__ void apply_hourglass_work_kernel(
     int* __restrict__ clamp_count) {
   const int c = blockIdx.x * blockDim.x + threadIdx.x;
   if (c >= n_cells) {
+    return;
+  }
+  if ((central_member_mask != nullptr && central_member_mask[c] != 0U) ||
+      (central_passive_mask != nullptr && central_passive_mask[c] != 0U) ||
+      (pole_member_mask != nullptr && pole_member_mask[c] != 0U)) {
     return;
   }
   if (hydro_active != nullptr && hydro_active[c] == 0) {
@@ -1386,8 +1485,37 @@ void ensure_hourglass_subzonal_masses_2d(core::State& state,
   if (n_cells <= 0) {
     return;
   }
-  const std::size_t expected = static_cast<std::size_t>(n_cells);
+  static const int diag_cell = [] {
+    const char* s = std::getenv("TENRYU_SUBZ_ENSURE_DIAG");
+    return s != nullptr ? std::atoi(s) : -1;
+  }();
+  static int diag_call_count = 0;
+  ++diag_call_count;
   const bool invariant = corner_mass_lagrangian_invariant_enabled(cfg);
+  auto dump = [&](const char* tag) {
+    if (diag_cell < 0 || diag_cell >= n_cells ||
+        state.corner_mass.size() <
+            static_cast<std::size_t>(diag_cell + 1) * state.corner_stride) {
+      return;
+    }
+    double corner_mass[4];
+    cuda_check(cudaMemcpy(corner_mass,
+                          state.corner_mass.data() +
+                              diag_cell * state.corner_stride,
+                          sizeof(corner_mass), cudaMemcpyDeviceToHost),
+               "Hydro2D subzonal ensure diagnostic copy failed");
+    char line[512];
+    std::snprintf(
+        line, sizeof(line),
+        "[subz_ensure] call=%d tag=%s force=%d invariant=%d initialized=%d "
+        "cm0=%.17e cm1=%.17e cm2=%.17e cm3=%.17e",
+        diag_call_count, tag, force_recompute ? 1 : 0, invariant ? 1 : 0,
+        state.corner_mass_initialized ? 1 : 0, corner_mass[0], corner_mass[1],
+        corner_mass[2], corner_mass[3]);
+    core::log_info(line);
+  };
+  dump("entry");
+  const std::size_t expected = static_cast<std::size_t>(n_cells);
   state.corner_mass_is_lagrangian_invariant = invariant;
   bool recompute = force_recompute;
   auto ensure = [&](core::CellField1D& field) {
@@ -1400,7 +1528,8 @@ void ensure_hourglass_subzonal_masses_2d(core::State& state,
   ensure(state.subzonal_mass_corner1);
   ensure(state.subzonal_mass_corner2);
   ensure(state.subzonal_mass_corner3);
-  const std::size_t expected_corner = expected * 4U;
+  const std::size_t expected_corner =
+      expected * static_cast<std::size_t>(state.corner_stride);
   if (state.corner_mass.size() != expected_corner) {
     state.corner_mass.reset(expected_corner);
     state.corner_mass_initialized = false;
@@ -1416,7 +1545,7 @@ void ensure_hourglass_subzonal_masses_2d(core::State& state,
   }
   core::DeviceArray<std::uint8_t> d_cell_nverts;
   const std::uint8_t* d_cell_nverts_ptr =
-      upload_cell_nverts_if_tri(d_cell_nverts, state, n_cells);
+      upload_cell_nverts_if_nonquad(d_cell_nverts, state, n_cells);
   if (invariant && state.corner_mass_initialized && !force_recompute) {
     const int blocks = (n_cells + 255) / 256;
     copy_corner_mass_to_subzonal_kernel<<<blocks, 256>>>(
@@ -1426,22 +1555,26 @@ void ensure_hourglass_subzonal_masses_2d(core::State& state,
         state.subzonal_mass_corner3.data(),
         state.corner_mass.data(),
         d_cell_nverts_ptr,
+        state.corner_stride,
         n_cells);
     sync_kernel("Hydro2D copy invariant corner masses to subzonal SoA failed");
     if (update_volume) {
       update_corner_volumes(state, blocks, expected, expected_corner);
     }
+    dump("exit");
     return;
   }
   if (invariant && force_recompute && state.corner_mass_initialized) {
     warn_invariant_remap_reinit_once();
   }
   if (!recompute && !update_volume) {
+    dump("exit");
     return;
   }
   const int blocks = (n_cells + 255) / 256;
   if (!recompute) {
     update_corner_volumes(state, blocks, expected, expected_corner);
+    dump("exit");
     return;
   }
   if (state.mesh.topo.multiblock.has_value()) {
@@ -1464,6 +1597,7 @@ void ensure_hourglass_subzonal_masses_2d(core::State& state,
         state.mesh.multiblock_cell_node_csr_offsets.data(),
         state.mesh.multiblock_cell_node_csr_indices.data(),
         d_cell_nverts_ptr,
+        state.corner_stride,
         n_cells);
   } else {
     initialize_subzonal_masses_kernel<<<blocks, 256>>>(
@@ -1481,6 +1615,7 @@ void ensure_hourglass_subzonal_masses_2d(core::State& state,
   }
   sync_kernel("Hydro2D initialize hourglass subzonal masses failed");
   state.corner_mass_initialized = true;
+  dump("exit");
 }
 
 I1BSpuriousSensorSummary compute_hydro_nonaffine_ke_sensor_2d(
@@ -1786,12 +1921,20 @@ void apply_hourglass_work_2d(core::State& state,
                 "apply_hourglass_work_2d work size mismatch");
   const int blocks = (n_cells + 255) / 256;
   const int heat_to_electron = (cfg.numerics.hydro.av_heat_to == "electron") ? 1 : 0;
+  const bool central_overlay_active = central_pseudo_core::active(state);
+  const bool pole_overlay_active = pole_angular_derefine::active(state);
   apply_hourglass_work_kernel<<<blocks, 256>>>(
       state.ee.data(),
       state.ei.data(),
       state.mass.data(),
       compatible_work_erg.data(),
       d_hydro_active,
+      central_overlay_active ? state.central_pseudo_core.d_member_mask.data()
+                             : nullptr,
+      central_overlay_active ? state.central_pseudo_core.d_passive_mask.data()
+                             : nullptr,
+      pole_overlay_active ? state.pole_angular_derefine.d_member_mask.data()
+                          : nullptr,
       n_cells,
       use_two_temp ? 1 : 0,
       heat_to_electron,

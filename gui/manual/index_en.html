@@ -11,7 +11,7 @@
     <header>
       <h1>TENRYU Studio User Manual (1D)</h1>
       <p class="lead">A GUI for safely building input decks for TENRYU 1D radiation-hydrodynamics simulations using forms alone.</p>
-      <p class="meta">Generated: 2026-07-31</p>
+      <p class="meta">Generated: 2026-09-02</p>
       <a class="language-link" href="index_ja.html" lang="ja">日本語版</a>
     </header>
 
@@ -28,6 +28,7 @@
         <li><a href="#drive">Drive</a></li>
         <li><a href="#output">Output</a></li>
         <li><a href="#deck">Reviewing, saving, and running a deck</a></li>
+        <li><a href="#assistant">Assistant (experimental)</a></li>
         <li><a href="#troubleshooting">Troubleshooting</a></li>
       </ol>
     </nav>
@@ -293,8 +294,26 @@
       </aside>
     </section>
 
+    <section id="assistant">
+      <h2>11. Assistant (experimental)</h2>
+      <p>The アシスタント/Assistant view in the left nav provides LLM-driven 1D deck generation and deterministic run diagnostics. LLM features are disabled by default; the environment variable TENRYU_ASSIST_DISABLE=1 is the always-winning kill switch.</p>
+      <h3>Setup</h3>
+      <ul>
+        <li>A local TENRYU checkout (containing tools/assist) is required. Enter its path in Setup and press "Check status" to see the resolved configuration (enabled state, roles, models).</li>
+        <li>To use LLM generation, configure assistant.toml (at the checkout root or under ~/.tenryu/) with enabled = true and a provider for the deck_design role (template: tools/assist/assistant.example.toml). The provider CLI (codex / claude) must be installed and authenticated on the local machine.</li>
+        <li>Deck validation uses the currently selected server profile's binary (via tools/assist/tenryu_remote.sh for ssh profiles). Port, identity file, and host-key policy are forwarded automatically from the profile.</li>
+      </ul>
+      <h3>Deck generation</h3>
+      <p>Write a natural-language specification and press Generate: the loop iterates generation → validate/freeze on the server → lint feedback (1–10 iterations). When the model asks instead of guessing (UNCERTAIN), answer in the reply box and regenerate. Accepted decks can be validated, saved, and run in place; runs enter the normal run history. Every LLM call is journaled in journal.jsonl under the workdir (~/.tenryu/studio-assist/).</p>
+      <h3>Lint and diagnostics</h3>
+      <ul>
+        <li>The validate panel's "Assist lint" runs the solver's validate/freeze plus mesh/zoning lints (node monotonicity, adjacent width ratio, autozone mass ratio, intent-pin checks) against the current form deck.</li>
+        <li>Finished runs in the history view get "Diagnostics (assistant)": digest (history-series reductions and derived metrics), zoning report (mass-form ablation-zoning lint), and zoning promotion suggestions. The server needs python3 (h5py for digest) and a checkout containing tools/assist.</li>
+      </ul>
+    </section>
+
     <section id="troubleshooting">
-      <h2>11. Troubleshooting</h2>
+      <h2>12. Troubleshooting</h2>
       <div class="table-wrap">
         <table>
           <thead>

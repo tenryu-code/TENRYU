@@ -185,7 +185,7 @@ State State::allocate(const Config& cfg) {
 
 State State::allocate(const Config& cfg, const double hydro_t_start_eV) {
   State state;
-  state.corner_stride = corner_stride_for_scheme(cfg.mesh.topology_scheme);
+  state.corner_stride = corner_stride_for_config(cfg);
 
   TENRYU_ASSERT(cfg.mesh.nr > 0, "Mesh.nr must be > 0");
   TENRYU_ASSERT(cfg.main.dim == 1 || cfg.main.dim == 2,
@@ -266,6 +266,10 @@ State State::allocate(const Config& cfg, const double hydro_t_start_eV) {
         compatible_edge_buffer_size(cfg, n_cells, n_nodes);
     state.corner_force_p_r.reset(n_corners);
     state.corner_force_p_z.reset(n_corners);
+    if (cfg.numerics.hydro.aw_compatible_force_work) {
+      state.corner_force_p_rz_r.reset(n_corners);
+      state.corner_force_p_rz_z.reset(n_corners);
+    }
     state.corner_force_sub_r.reset(n_corners);
     state.corner_force_sub_z.reset(n_corners);
     if (cfg.numerics.hydro.time_integration ==
@@ -279,6 +283,14 @@ State State::allocate(const Config& cfg, const double hydro_t_start_eV) {
     state.work_sub_per_cell.reset(n_cells);
     state.work_av_per_cell.reset(n_cells);
   }
+  if (cfg.numerics.hydro.wake_heat_flux_enabled) {
+    state.wake_heat_flux_eta.reset(n_cells);
+    state.wake_heat_flux_eta.fill(0.0);
+    state.wake_heat_flux_zeta.reset(n_cells);
+    state.wake_heat_flux_zeta.fill(0.0);
+  }
+  state.corner_mass_convention =
+      static_cast<int>(cfg.numerics.hydro.corner_mass_convention);
   if (cfg.numerics.hydro.hllc_z_flux_2d_rz) {
     state.hllc_mom_z_cell.reset(n_cells);
     state.hllc_mom_z_cell_initialized = false;
@@ -439,6 +451,7 @@ State State::allocate(const Config& cfg, const double hydro_t_start_eV) {
   state.sn_void_anchor_dE_abs_step = 0.0;
   state.sn_ap_alpha_max = 0.0;
   state.sn_ap_alpha_active_faces = 0.0;
+  state.conduction_e_rate.reset(n_cells);
   state.laser_dep.reset(n_cells);
   state.ray_density.reset(n_cells);
   state.laser_waveforms.resize(cfg.laser.beams.size());
@@ -465,6 +478,7 @@ State State::allocate(const Config& cfg, const double hydro_t_start_eV) {
   state.t = 0.0;
   state.step = 0;
   state.dt = 0.0;
+  state.dt_growth_ref = 0.0;
   state.dt_prev_hydro = -1.0;
   state.trace_mesh_outer_node = -1;
   state.trace_mesh_outer_cell = -1;
@@ -472,6 +486,7 @@ State State::allocate(const Config& cfg, const double hydro_t_start_eV) {
   state.ale_rezone_invocations = 0;
   state.ale_remaps_applied = 0;
   state.ale_last_applied_step = -1;
+  state.reale_rezone_skipped = 0;
   state.ale1d_floor_cooldown_remaining = 0;
   state.diff_ref_diag_baseline_initialized = false;
   state.diff_ref_diag_gas_mesh_volume_initial = 0.0;
@@ -501,7 +516,9 @@ State State::allocate(const Config& cfg, const double hydro_t_start_eV) {
   state.corner_mass_is_lagrangian_invariant = false;
   state.dispatch_counters.reset();
   state.tri_fan_center_perturbation_diag.reset();
+  state.polar_tier_origin_force_diag.reset();
   state.count_edge_compressive_edges_step = 0;
+  state.tensor_pc_degenerate = 0;
   state.max_corner_density_spread_step = 0.0;
   state.max_corner_density_spread_run = 0.0;
   state.max_subzonal_merit_step = 0.0;
@@ -774,6 +791,8 @@ void State::reset() {
   zmom_r4.fill(1.0);
   corner_force_p_r.fill(0.0);
   corner_force_p_z.fill(0.0);
+  corner_force_p_rz_r.fill(0.0);
+  corner_force_p_rz_z.fill(0.0);
   corner_force_sub_r.fill(0.0);
   corner_force_sub_z.fill(0.0);
   corner_force_q_r.fill(0.0);
@@ -783,7 +802,10 @@ void State::reset() {
   work_p_per_cell.fill(0.0);
   work_sub_per_cell.fill(0.0);
   work_av_per_cell.fill(0.0);
+  wake_heat_flux_eta.fill(0.0);
+  wake_heat_flux_zeta.fill(0.0);
   tri_fan_center_perturbation_diag.reset();
+  polar_tier_origin_force_diag.reset();
   pole_angular_derefine = PoleAngularDerefineState{};
   ring7_seam_rezone_requested = false;
   ring7_seam_rezone_request_cell = -1;
@@ -800,6 +822,7 @@ void State::reset() {
   ring7_pole_cap_validation_dt = 0.0;
   ring7_pole_cap_eta_prod_proxy = 0.0;
   count_edge_compressive_edges_step = 0;
+  tensor_pc_degenerate = 0;
   max_corner_density_spread_step = 0.0;
   max_corner_density_spread_run = 0.0;
   max_subzonal_merit_step = 0.0;
@@ -858,6 +881,8 @@ void State::reset() {
   ref_dir0_z.reset(0);
   v_r.fill(0.0);
   v_z.fill(0.0);
+  node_accel_r.fill(0.0);
+  node_accel_z.fill(0.0);
   axis_lagrangian_tangential_engaged_count = 0;
   axis_lagrangian_tangential_ineffective_count = 0;
   axis_lagrangian_tangential_last_sigma = 1.0;
@@ -1057,6 +1082,7 @@ void State::reset() {
   ale_rezone_invocations = 0;
   ale_remaps_applied = 0;
   ale_last_applied_step = -1;
+  reale_rezone_skipped = 0;
   ale1d_floor_cooldown_remaining = 0;
   diff_ref_diag_baseline_initialized = false;
   diff_ref_diag_gas_mesh_volume_initial = 0.0;

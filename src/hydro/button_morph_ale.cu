@@ -4,7 +4,6 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
-#include <numbers>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -17,6 +16,7 @@
 #include "hydro/reference_barrier_ale.hpp"
 #include "mesh/button_align_target.hpp"
 #include "mesh/mesh.hpp"
+#include "mesh/multiblock_theta_ladder.hpp"
 
 namespace tenryu::hydro::button_morph {
 namespace {
@@ -193,7 +193,6 @@ void build_button_morph_targets(const tenryu::core::State& state,
                 "button morph shell first-row spacing must be positive and "
                 "finite");
 
-  constexpr double pi = std::numbers::pi_v<double>;
   for (int layer = 1; layer < idx.n_b; ++layer) {
     for (int k = 0; k <= idx.ntheta; ++k) {
       const int core_id = core_boundary_node_id(idx, k);
@@ -201,8 +200,8 @@ void build_button_morph_targets(const tenryu::core::State& state,
       const double t_core =
           tenryu::mesh::assembly::button_align_perimeter_fraction(
               init_r[core_n], init_z[core_n]);
-      const double theta_seam =
-          pi * static_cast<double>(k) / static_cast<double>(idx.ntheta);
+      const double theta_seam = tenryu::mesh::multiblock_theta_node(
+          k, idx.ntheta, cfg.mesh.multiblock_theta_cap_widen_factor);
       double aligned_r = 0.0;
       double aligned_z = 0.0;
       tenryu::mesh::assembly::button_align_bridge_target(

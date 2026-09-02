@@ -5,6 +5,7 @@ import { useApp } from "../store";
 import { writeScopeHandoff } from "../core/handoff";
 import HistoryChart from "./HistoryChart";
 import ProfilePanel from "./ProfilePanel";
+import { AssistError, KvTable, RawFold } from "./AssistBits";
 import { Badge, Button } from "@tenryu-common/ui/kit";
 
 function stateTone(s: RunUiState): "ok" | "err" | "warn" | "muted" {
@@ -46,6 +47,17 @@ function fmtElapsed(sec: number): string {
   return h > 0 ? `${h}:${mm}:${ss}` : `${mm}:${ss}`;
 }
 
+function withoutTrack(obj: Record<string, unknown>): Record<string, unknown> {
+  const copy = { ...obj };
+  delete copy.track;
+  return copy;
+}
+
+function compactJson(value: unknown): string {
+  const json = JSON.stringify(value) ?? String(value);
+  return json.length > 160 ? `${json.slice(0, 160)}…` : json;
+}
+
 function RunCard({ rec, nowSec }: { rec: RunRecord; nowSec: number }) {
   const m = t();
   const stopRun = useApp((s) => s.stopRun);
@@ -57,6 +69,8 @@ function RunCard({ rec, nowSec }: { rec: RunRecord; nowSec: number }) {
   const rate = useApp((s) => s.runRates[rec.id]);
   const fetchHistory = useApp((s) => s.fetchHistory);
   const hist = useApp((s) => s.histories[rec.id]);
+  const runAssistDiag = useApp((s) => s.runAssistDiag);
+  const diag = useApp((s) => s.assistDiag[rec.id]);
   const [handoffNote, setHandoffNote] = useState<string | null>(null);
 
   const pct =
@@ -136,6 +150,166 @@ function RunCard({ rec, nowSec }: { rec: RunRecord; nowSec: number }) {
                 <ProfilePanel runId={rec.id} runName={rec.name} />
               </>
             ) : null}
+          </div>
+        </details>
+      )}
+      {isTerminal(rec.state) && (
+        <details className="mt-1 text-xs">
+          <summary style={{ color: "var(--fg-secondary)" }}>{m.assist.diagTitle}</summary>
+          <div className="mt-2 flex flex-col gap-3">
+            <div className="flex flex-wrap gap-2">
+              <Button
+                onClick={() => void runAssistDiag(rec.id, "digest")}
+                disabled={diag?.digest?.status === "running"}
+              >
+                {m.assist.diagDigest}
+              </Button>
+              <Button
+                onClick={() => void runAssistDiag(rec.id, "zoning")}
+                disabled={diag?.zoning?.status === "running"}
+              >
+                {m.assist.diagZoning}
+              </Button>
+              <Button
+                onClick={() => void runAssistDiag(rec.id, "promote")}
+                disabled={diag?.promote?.status === "running"}
+              >
+                {m.assist.diagPromote}
+              </Button>
+            </div>
+
+            {diag?.digest?.status === "running" && (
+              <div>
+                <Badge tone="muted">{m.common.loading}</Badge>
+              </div>
+            )}
+            {diag?.digest?.status === "error" && (
+              <AssistError text={diag.digest.error ?? ""} />
+            )}
+            {diag?.digest?.status === "ready" && diag.digest.view && (
+              <div className="flex flex-col gap-2">
+                <h4 className="font-semibold">{m.assist.digestRunTitle}</h4>
+                <KvTable obj={diag.digest.view.run ?? {}} />
+                {diag.digest.view.derived && (
+                  <>
+                    <h4 className="font-semibold">{m.assist.digestDerivedTitle}</h4>
+                    <KvTable obj={diag.digest.view.derived} />
+                  </>
+                )}
+                {diag.digest.view.seriesReductions.length > 0 && (
+                  <div>
+                    <h4 className="mb-1 font-semibold">{m.assist.digestSeriesTitle}</h4>
+                    <table className="w-full text-xs" style={{ fontFamily: "var(--mono)" }}>
+                      <tbody>
+                        {diag.digest.view.seriesReductions.map((entry) => (
+                          <tr key={entry.name} className="align-top">
+                            <td
+                              className="whitespace-nowrap pr-2"
+                              style={{ color: "var(--fg-secondary)" }}
+                            >
+                              {entry.name}
+                            </td>
+                            <td className="break-all">{compactJson(entry.values)}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+                {diag.digest.view.notes.length > 0 && (
+                  <div>
+                    <h4 className="font-semibold">{m.assist.notesTitle}</h4>
+                    <ul>
+                      {diag.digest.view.notes.map((note, index) => (
+                        <li key={index}>{note}</li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+                <RawFold raw={diag.digest.raw} />
+              </div>
+            )}
+
+            {diag?.zoning?.status === "running" && (
+              <div>
+                <Badge tone="muted">{m.common.loading}</Badge>
+              </div>
+            )}
+            {diag?.zoning?.status === "error" && (
+              <AssistError text={diag.zoning.error ?? ""} />
+            )}
+            {diag?.zoning?.status === "ready" && diag.zoning.view && (
+              <div className="flex flex-col gap-2">
+                <div>
+                  <Badge tone={diag.zoning.view.applicable === true ? "ok" : "warn"}>
+                    {diag.zoning.view.applicable === true
+                      ? m.assist.zoningApplicable
+                      : m.assist.zoningNotApplicable}
+                  </Badge>
+                </div>
+                {diag.zoning.view.reason && <div>{diag.zoning.view.reason}</div>}
+                {diag.zoning.view.lintAOk !== null && (
+                  <div>
+                    <div className="mb-1 flex items-center gap-2">
+                      <h4 className="font-semibold">{m.assist.zoningLintA}</h4>
+                      <Badge tone={diag.zoning.view.lintAOk ? "ok" : "err"}>
+                        {diag.zoning.view.lintAOk
+                          ? m.assist.lintPass
+                          : m.assist.lintFail}
+                      </Badge>
+                    </div>
+                    <KvTable obj={diag.zoning.view.lintA ?? {}} />
+                  </div>
+                )}
+                {diag.zoning.view.critical && (
+                  <div>
+                    <h4 className="font-semibold">{m.assist.zoningCritical}</h4>
+                    <KvTable obj={withoutTrack(diag.zoning.view.critical)} />
+                  </div>
+                )}
+                {diag.zoning.view.ablated && (
+                  <div>
+                    <h4 className="font-semibold">{m.assist.zoningAblated}</h4>
+                    <KvTable obj={diag.zoning.view.ablated} />
+                  </div>
+                )}
+                {diag.zoning.view.notes.length > 0 && (
+                  <div>
+                    <h4 className="font-semibold">{m.assist.notesTitle}</h4>
+                    <ul>
+                      {diag.zoning.view.notes.map((note, index) => (
+                        <li key={index}>{note}</li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+                <RawFold raw={diag.zoning.raw} />
+              </div>
+            )}
+
+            {diag?.promote?.status === "running" && (
+              <div>
+                <Badge tone="muted">{m.common.loading}</Badge>
+              </div>
+            )}
+            {diag?.promote?.status === "error" && (
+              <AssistError text={diag.promote.error ?? ""} />
+            )}
+            {diag?.promote?.status === "ready" && diag.promote.view && (
+              <div className="flex flex-col gap-2">
+                <h4 className="font-semibold">{m.assist.promoteBand}</h4>
+                <KvTable obj={diag.promote.view.band ?? {}} />
+                <h4 className="font-semibold">{m.assist.promoteEvidence}</h4>
+                <KvTable obj={diag.promote.view.evidence ?? {}} />
+                {diag.promote.view.conservatismNote && (
+                  <p>{diag.promote.view.conservatismNote}</p>
+                )}
+                {Object.keys(diag.promote.view.extra).length > 0 && (
+                  <KvTable obj={diag.promote.view.extra} />
+                )}
+                <RawFold raw={diag.promote.raw} />
+              </div>
+            )}
           </div>
         </details>
       )}

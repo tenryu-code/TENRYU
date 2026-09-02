@@ -32,6 +32,7 @@
 #include "core/config_validate.hpp"
 #include "core/error.hpp"
 #include "core/radiation_group_structure.hpp"
+#include "hydro/pressure_drive_perturbation.cuh"
 #include "core/zoning_intent.hpp"
 #include "materials/eos_table.hpp"
 #include "materials/ionmix_reader.hpp"
@@ -336,6 +337,127 @@ std::vector<std::string> strict_string_vector(const py::handle value,
   return out;
 }
 
+using PressureDrivePerturbationConfig =
+    Config::NumericsConfig::HydroConfig::PressureDrivePerturbationConfig;
+
+double pressure_drive_amplitude_as_double(const py::handle value,
+                                          std::string_view path) {
+  if (py::isinstance<py::bool_>(value) ||
+      (!py::isinstance<py::float_>(value) &&
+       !py::isinstance<py::int_>(value))) {
+    throw_value_type_error(path, "float", value);
+  }
+  double result;
+  try {
+    result = py::cast<double>(value);
+  } catch (const py::cast_error&) {
+    throw_cast_error(path, "float", value);
+  }
+  if (!std::isfinite(result)) {
+    throw ConfigError(format_range_error(
+        path, "finite float", std::to_string(result)));
+  }
+  return result;
+}
+
+void resolve_random_pressure_drive_modes(
+    PressureDrivePerturbationConfig& config) {
+  config.random_enabled = config.random_rms > 0.0;
+  if (!config.random_enabled) {
+    return;
+  }
+
+  const int random_count = config.random_l_max - config.random_l_min + 1;
+  if (config.mode_l.size() + static_cast<std::size_t>(random_count) >
+      static_cast<std::size_t>(
+          tenryu::hydro::PressureDrivePerturbationParams::kMaxModes)) {
+    throw ConfigError(
+        "Numerics.hydro.pressure_drive_perturbation has more than 24 "
+        "resolved modes");
+  }
+
+  std::vector<double> normal_draws;
+  normal_draws.reserve(static_cast<std::size_t>(random_count));
+  double weighted_square_sum = 0.0;
+  for (int l = config.random_l_min; l <= config.random_l_max; ++l) {
+    std::uint64_t x =
+        static_cast<std::uint64_t>(config.random_seed) ^
+        (0x9E3779B97F4A7C15ULL * static_cast<std::uint64_t>(l + 1));
+    const auto next = [&x]() {
+      x += 0x9E3779B97F4A7C15ULL;
+      std::uint64_t z = x;
+      z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+      z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+      return z ^ (z >> 31);
+    };
+    double u1 = static_cast<double>(next() >> 11) * 0x1.0p-53;
+    const double u2 = static_cast<double>(next() >> 11) * 0x1.0p-53;
+    if (u1 <= 0.0) {
+      u1 = 0x1.0p-53;
+    }
+    const double n_l =
+        std::sqrt(-2.0 * std::log(u1)) * std::cos(2.0 * M_PI * u2);
+    normal_draws.push_back(n_l);
+    weighted_square_sum += n_l * n_l / static_cast<double>(2 * l + 1);
+  }
+  if (weighted_square_sum == 0.0) {
+    throw ConfigError(
+        "Numerics.hydro.pressure_drive_perturbation random spectrum has "
+        "zero normalization");
+  }
+
+  const double scale = config.random_rms / std::sqrt(weighted_square_sum);
+  for (int l = config.random_l_min; l <= config.random_l_max; ++l) {
+    config.mode_l.push_back(l);
+    config.mode_a.push_back(
+        scale * normal_draws[static_cast<std::size_t>(l -
+                                                     config.random_l_min)]);
+  }
+
+  std::ostringstream resolved;
+  resolved << "Numerics.hydro.pressure_drive_perturbation resolved modes:";
+  resolved << std::setprecision(17);
+  for (std::size_t k = 0; k < config.mode_l.size(); ++k) {
+    resolved << " (" << config.mode_l[k] << "," << config.mode_a[k] << ")";
+  }
+  tenryu::core::log_info(resolved.str());
+}
+
+void compute_pressure_drive_perturbation_range(
+    PressureDrivePerturbationConfig& config) {
+  const tenryu::hydro::PressureDrivePerturbationParams params =
+      make_pressure_drive_perturbation_params(config);
+  constexpr int kIntervals = 4096;
+  double g_min = std::numeric_limits<double>::infinity();
+  double g_max = -std::numeric_limits<double>::infinity();
+  double theta_at_min = 0.0;
+  for (int i = 0; i <= kIntervals; ++i) {
+    const double theta =
+        static_cast<double>(i) * M_PI / static_cast<double>(kIntervals);
+    const double g = tenryu::hydro::pressure_drive_perturbation_g(
+        params, std::sin(theta), std::cos(theta));
+    if (g < g_min) {
+      g_min = g;
+      theta_at_min = theta;
+    }
+    g_max = std::max(g_max, g);
+  }
+  if (!(std::isfinite(g_min) && std::isfinite(g_max))) {
+    throw ConfigError(
+        "Numerics.hydro.pressure_drive_perturbation range is not finite");
+  }
+  config.g_min = g_min;
+  config.g_max = g_max;
+  if (g_min <= 0.0) {
+    std::ostringstream message;
+    message << std::setprecision(17)
+            << "Numerics.hydro.pressure_drive_perturbation profile is "
+               "non-positive at theta="
+            << theta_at_min << ": g=" << g_min;
+    throw ConfigError(message.str());
+  }
+}
+
 std::string normalize_repr(std::string repr) {
   static const std::regex kAddressRegex{"0x[0-9a-fA-F]+"};
   return std::regex_replace(std::move(repr), kAddressRegex, "<addr>");
@@ -524,6 +646,1308 @@ void enforce_known_keys(const py::dict& kwargs,
 
 bool has_key(const py::dict& kwargs, const char* key) {
   return kwargs.contains(py::str(key));
+}
+
+void parse_euler_window_dict(
+    const py::dict& euler_window,
+    const std::string& path,
+    Config::NumericsConfig::AleConfig::EulerWindowConfig& config) {
+  enforce_known_keys(
+      euler_window,
+      path,
+      {"enabled", "role", "shape", "r0", "r1", "z0", "z1", "cr", "cz",
+       "rad_in", "rad_out", "transition_width", "t_on_s", "t_off_s",
+       "feather_min_layers", "guard_layers", "axis_core_transaction_mode",
+       "replay_table_path", "replay_tau_lead", "replay_tau_splice",
+       "replay_beta",
+       "axis_core_transition_passage_enabled",
+       "axis_core_ring_release_enabled"});
+  if (has_key(euler_window, "enabled")) {
+    config.enabled =
+        strict_bool(euler_window["enabled"], path + ".enabled");
+  }
+  if (has_key(euler_window, "shape")) {
+    config.shape =
+        strict_string(euler_window["shape"], path + ".shape");
+    if (config.shape != "rectangle" && config.shape != "annulus" &&
+        config.shape != "spherical_disk") {
+      throw ValueError(
+          path + ".shape must be one of {\"rectangle\", \"annulus\", "
+                 "\"spherical_disk\"}");
+    }
+  }
+  if (has_key(euler_window, "role")) {
+    config.role = strict_string(euler_window["role"], path + ".role");
+    if (config.role != "" && config.role != "axis_survival_core") {
+      throw ConfigError(
+          path + ".role must be one of {\"\", \"axis_survival_core\"}");
+    }
+  }
+  if (has_key(euler_window, "r0")) {
+    config.r0 = numeric_as_double(euler_window["r0"], path + ".r0");
+  }
+  if (has_key(euler_window, "r1")) {
+    config.r1 = numeric_as_double(euler_window["r1"], path + ".r1");
+  }
+  if (has_key(euler_window, "z0")) {
+    config.z0 = numeric_as_double(euler_window["z0"], path + ".z0");
+  }
+  if (has_key(euler_window, "z1")) {
+    config.z1 = numeric_as_double(euler_window["z1"], path + ".z1");
+  }
+  if (has_key(euler_window, "cr")) {
+    config.cr = numeric_as_double(euler_window["cr"], path + ".cr");
+  }
+  if (has_key(euler_window, "cz")) {
+    config.cz = numeric_as_double(euler_window["cz"], path + ".cz");
+  }
+  if (has_key(euler_window, "rad_in")) {
+    config.rad_in =
+        numeric_as_double(euler_window["rad_in"], path + ".rad_in");
+  }
+  if (has_key(euler_window, "rad_out")) {
+    config.rad_out =
+        numeric_as_double(euler_window["rad_out"], path + ".rad_out");
+  }
+  if (has_key(euler_window, "transition_width")) {
+    config.transition_width = numeric_as_double(
+        euler_window["transition_width"], path + ".transition_width");
+  }
+  if (has_key(euler_window, "t_on_s")) {
+    config.t_on_s =
+        numeric_as_double(euler_window["t_on_s"], path + ".t_on_s");
+  }
+  if (has_key(euler_window, "t_off_s")) {
+    config.t_off_s =
+        numeric_as_double(euler_window["t_off_s"], path + ".t_off_s");
+  }
+  if (has_key(euler_window, "feather_min_layers")) {
+    config.feather_min_layers = strict_int32(
+        euler_window["feather_min_layers"], path + ".feather_min_layers");
+  }
+  if (has_key(euler_window, "guard_layers")) {
+    config.guard_layers = strict_int32(
+        euler_window["guard_layers"], path + ".guard_layers");
+  }
+  if (has_key(euler_window, "axis_core_transaction_mode")) {
+    config.axis_core_transaction_mode = strict_string(
+        euler_window["axis_core_transaction_mode"],
+        path + ".axis_core_transaction_mode");
+  }
+  if (has_key(euler_window, "replay_table_path")) {
+    config.replay_table_path = strict_string(
+        euler_window["replay_table_path"], path + ".replay_table_path");
+  }
+  if (has_key(euler_window, "replay_tau_lead")) {
+    config.replay_tau_lead = numeric_as_double(
+        euler_window["replay_tau_lead"], path + ".replay_tau_lead");
+  }
+  if (has_key(euler_window, "replay_tau_splice")) {
+    config.replay_tau_splice = numeric_as_double(
+        euler_window["replay_tau_splice"], path + ".replay_tau_splice");
+  }
+  if (has_key(euler_window, "replay_beta")) {
+    config.replay_beta = numeric_as_double(
+        euler_window["replay_beta"], path + ".replay_beta");
+  }
+  if (has_key(euler_window, "axis_core_transition_passage_enabled")) {
+    config.axis_core_transition_passage_enabled = strict_bool(
+        euler_window["axis_core_transition_passage_enabled"],
+        path + ".axis_core_transition_passage_enabled");
+  }
+  if (has_key(euler_window, "axis_core_ring_release_enabled")) {
+    config.axis_core_ring_release_enabled = strict_bool(
+        euler_window["axis_core_ring_release_enabled"],
+        path + ".axis_core_ring_release_enabled");
+  }
+}
+
+void validate_euler_window_config(
+    const Config::NumericsConfig::AleConfig::EulerWindowConfig& config,
+    const std::string& path) {
+  if (config.axis_core_transaction_mode != "static" &&
+      config.axis_core_transaction_mode != "always_moving" &&
+      config.axis_core_transaction_mode != "clearance_replay") {
+    throw ValueError(
+        path + ".axis_core_transaction_mode must be one of "
+               "{\"static\", \"always_moving\", \"clearance_replay\"}");
+  }
+  if (config.axis_core_transaction_mode != "static" &&
+      (!config.enabled || config.role != "axis_survival_core")) {
+    throw ConfigError(
+        path + " axis_core_transaction_mode=\"" +
+        config.axis_core_transaction_mode + "\" requires "
+               "enabled=true and role=\"axis_survival_core\"");
+  }
+  if (!(std::isfinite(config.replay_tau_lead) &&
+        config.replay_tau_lead > 0.0)) {
+    throw ValueError(path + ".replay_tau_lead must be finite and > 0");
+  }
+  if (!(std::isfinite(config.replay_tau_splice) &&
+        config.replay_tau_splice > 0.0)) {
+    throw ValueError(path + ".replay_tau_splice must be finite and > 0");
+  }
+  if (!(std::isfinite(config.replay_beta) && config.replay_beta >= 0.0)) {
+    throw ValueError(path + ".replay_beta must be finite and >= 0");
+  }
+  if (config.axis_core_transition_passage_enabled &&
+      (!config.enabled || config.role != "axis_survival_core")) {
+    throw ConfigError(
+        path + " axis_core_transition_passage_enabled=true requires "
+               "enabled=true and role=\"axis_survival_core\"");
+  }
+  if (config.axis_core_ring_release_enabled &&
+      (!config.enabled || config.role != "axis_survival_core")) {
+    throw ConfigError(
+        path + " axis_core_ring_release_enabled=true requires "
+               "enabled=true and role=\"axis_survival_core\"");
+  }
+  if (config.role != "" && config.role != "axis_survival_core") {
+    throw ConfigError(
+        path + ".role must be one of {\"\", \"axis_survival_core\"}");
+  }
+  if (config.shape != "rectangle" && config.shape != "annulus" &&
+      config.shape != "spherical_disk") {
+    throw ValueError(
+        path + ".shape must be one of {\"rectangle\", \"annulus\", "
+               "\"spherical_disk\"}");
+  }
+  if (config.shape == "spherical_disk" &&
+      config.role != "axis_survival_core") {
+    throw ConfigError(
+        path + " shape=\"spherical_disk\" requires "
+               "role=\"axis_survival_core\"");
+  }
+  if (config.role == "axis_survival_core") {
+    if (config.shape != "spherical_disk") {
+      throw ConfigError(
+          path + " role=\"axis_survival_core\" requires "
+                 "shape=\"spherical_disk\"");
+    }
+    if (config.t_on_s != 0.0) {
+      throw ConfigError(
+          path + " role=\"axis_survival_core\" requires t_on_s == 0.0");
+    }
+    if (config.t_off_s >= 0.0) {
+      throw ConfigError(
+          "the axis-core time-gated release was deleted 2026-08-03; "
+          "t_off_s must be -1 for axis_survival_core");
+    }
+    if (config.rad_in != 0.0) {
+      throw ConfigError(
+          path + " shape=\"spherical_disk\" requires rad_in == 0.0");
+    }
+    if (config.cr != 0.0 || config.cz != 0.0) {
+      throw ConfigError(
+          path + " shape=\"spherical_disk\" requires cr == 0.0 and "
+                 "cz == 0.0");
+    }
+  }
+  if (!config.enabled) {
+    return;
+  }
+  if (!(config.transition_width > 0.0)) {
+    throw ValueError(
+        path + ".transition_width must be > 0 when enabled");
+  }
+  if (config.t_off_s >= 0.0 && !(config.t_off_s > config.t_on_s)) {
+    throw ValueError(path + ".t_off_s must exceed t_on_s");
+  }
+  if (config.shape == "rectangle" &&
+      (!(config.r1 > config.r0) || !(config.z1 > config.z0))) {
+    throw ValueError(
+        path + " rectangle bounds require r1 > r0 and z1 > z0");
+  }
+  if (config.shape == "annulus" &&
+      (!(config.rad_in >= 0.0) || !(config.rad_out > config.rad_in))) {
+    throw ValueError(
+        path + " annulus bounds require rad_out > rad_in >= 0");
+  }
+}
+
+void parse_band_ale_dict(
+    const py::dict& band_ale,
+    const std::string& path,
+    Config::NumericsConfig::AleConfig::BandAleConfig& config) {
+  enforce_known_keys(
+      band_ale,
+      path,
+      {"enabled",
+       "aspect_trigger",
+       "release_hysteresis",
+       "chi",
+       "respace_move_cap_frac",
+       "estimator_band_hold_mach",
+       "bands",
+       "compose_with_rezone",
+       "belt_target",
+       "center_target",
+       "axis_target",
+       "axis_segment_halfwidth",
+       "axis_shell_block_enabled",
+       "sigma_linesearch_enabled",
+       "transaction_energy_closure_enabled",
+       "estimator_band_cut",
+       "estimator_band_shock_hold",
+       "estimator_band_front_hold_margin_rows",
+       "estimator_band_axis",
+       "estimator_band_in_rows",
+       "estimator_band_out_rows",
+       "estimator_band_eta_on",
+       "estimator_band_eta_off",
+       "estimator_band_per_column",
+       "estimator_band_pc_filter_halfwidth",
+       "estimator_band_pc_slope_limit",
+       "estimator_band_pc_slope_reject",
+       "estimator_band_pc_curvature_limit",
+       "estimator_band_pc_chi_max",
+       "estimator_band_pc_chi_step",
+       "estimator_band_pc_sigma_floor",
+       "estimator_band_pc_coverage_full",
+       "estimator_band_pc_coverage_min",
+       "estimator_band_pc_cooldown_events",
+       "estimator_band_pc_phase_b",
+       "estimator_band_pc_tube_dilate_rows",
+       "estimator_band_pc_tube_dilate_cols_extra",
+       "estimator_band_pc_ambiguous_hold_fraction",
+       "closure_catchment_enabled",
+       "closure_catchment_forced_active",
+       "closure_catchment_s_catch_cm",
+       "closure_catchment_s_protect_cm",
+       "closure_catchment_spacing_floor_cm",
+       "closure_catchment_ratio_max",
+       "closure_catchment_nu_max",
+       "closure_catchment_max_bites",
+       "closure_catchment_shock_hold",
+       "closure_catchment_eta_h_arm",
+       "closure_catchment_eta_h_full",
+       "closure_catchment_eta_m_arm",
+       "closure_catchment_eta_m_full",
+       "closure_catchment_reset_eta",
+       "closure_catchment_support_core_rows",
+       "closure_catchment_support_taper_rows",
+       "closure_catchment_accum_frac",
+       "closure_catchment_rearm_drop",
+       "pole_theta_enabled",
+       "pole_theta_routine_enabled",
+       "pole_theta_phys_lp",
+       "pole_theta_phys_lc",
+       "pole_theta_noise_floor",
+       "pole_theta_noise_ceiling",
+       "pole_theta_h_arm",
+       "pole_theta_h_fire",
+       "pole_theta_h_hard",
+       "pole_theta_h_release",
+       "pole_theta_kappa_arm",
+       "pole_theta_kappa_fire",
+       "pole_theta_kappa_hard",
+       "pole_theta_alpha",
+       "pole_theta_alpha_hard",
+       "pole_theta_deadband_frac",
+       "pole_theta_move_limit_frac",
+       "pole_theta_move_limit_hard_frac",
+       "pole_theta_cooldown_s",
+       "pole_theta_cooldown_base_s",
+       "pole_theta_predict_window_s",
+       "pole_theta_predict_horizon_s",
+       "pole_theta_halo_columns",
+       "pole_theta_halo_rows",
+       "pole_theta_post_h_floor",
+       "pole_theta_curve_preserving",
+       "pole_theta_protected_modes",
+       "pole_theta_fit_order",
+       "pole_theta_shock_hold",
+       "shell_window_in_rows",
+       "shell_window_out_rows",
+       "shell_boundary_guard_rows",
+       "shell_min_spacing_frac",
+       "shell_front_metric",
+       "shell_target",
+       "axis_repair_enabled",
+       "axis_repair_eta_on",
+       "axis_repair_eta_off",
+       "axis_repair_cap_rel"});
+  if (has_key(band_ale, "enabled")) {
+    config.enabled = strict_bool(band_ale["enabled"], path + ".enabled");
+  }
+  if (has_key(band_ale, "aspect_trigger")) {
+    config.aspect_trigger =
+        numeric_as_double(band_ale["aspect_trigger"], path + ".aspect_trigger");
+  }
+  if (has_key(band_ale, "release_hysteresis")) {
+    config.release_hysteresis = numeric_as_double(
+        band_ale["release_hysteresis"], path + ".release_hysteresis");
+  }
+  if (has_key(band_ale, "chi")) {
+    config.chi = numeric_as_double(band_ale["chi"], path + ".chi");
+  }
+  if (has_key(band_ale, "respace_move_cap_frac")) {
+    config.respace_move_cap_frac = numeric_as_double(
+        band_ale["respace_move_cap_frac"],
+        path + ".respace_move_cap_frac");
+  }
+  if (has_key(band_ale, "estimator_band_hold_mach")) {
+    config.estimator_band_hold_mach = numeric_as_double(
+        band_ale["estimator_band_hold_mach"],
+        path + ".estimator_band_hold_mach");
+  }
+  if (has_key(band_ale, "bands")) {
+    config.bands = strict_string(band_ale["bands"], path + ".bands");
+  }
+  if (has_key(band_ale, "compose_with_rezone")) {
+    config.compose_with_rezone = strict_bool(
+        band_ale["compose_with_rezone"], path + ".compose_with_rezone");
+  }
+  if (has_key(band_ale, "belt_target")) {
+    config.belt_target =
+        strict_string(band_ale["belt_target"], path + ".belt_target");
+  }
+  if (has_key(band_ale, "center_target")) {
+    config.center_target =
+        strict_string(band_ale["center_target"], path + ".center_target");
+  }
+  if (has_key(band_ale, "axis_target")) {
+    config.axis_target =
+        strict_string(band_ale["axis_target"], path + ".axis_target");
+  }
+  if (has_key(band_ale, "axis_segment_halfwidth")) {
+    config.axis_segment_halfwidth = strict_int32(
+        band_ale["axis_segment_halfwidth"],
+        path + ".axis_segment_halfwidth");
+  }
+  if (has_key(band_ale, "axis_shell_block_enabled")) {
+    config.axis_shell_block_enabled = strict_bool(
+        band_ale["axis_shell_block_enabled"],
+        path + ".axis_shell_block_enabled");
+  }
+  if (has_key(band_ale, "sigma_linesearch_enabled")) {
+    config.sigma_linesearch_enabled = strict_bool(
+        band_ale["sigma_linesearch_enabled"],
+        path + ".sigma_linesearch_enabled");
+  }
+  if (has_key(band_ale, "transaction_energy_closure_enabled")) {
+    config.transaction_energy_closure_enabled = strict_bool(
+        band_ale["transaction_energy_closure_enabled"],
+        path + ".transaction_energy_closure_enabled");
+  }
+  if (has_key(band_ale, "estimator_band_cut")) {
+    config.estimator_band_cut = numeric_as_double(
+        band_ale["estimator_band_cut"], path + ".estimator_band_cut");
+  }
+  if (has_key(band_ale, "estimator_band_shock_hold")) {
+    config.estimator_band_shock_hold = numeric_as_double(
+        band_ale["estimator_band_shock_hold"],
+        path + ".estimator_band_shock_hold");
+  }
+  if (has_key(band_ale, "estimator_band_front_hold_margin_rows")) {
+    config.estimator_band_front_hold_margin_rows = numeric_as_double(
+        band_ale["estimator_band_front_hold_margin_rows"],
+        path + ".estimator_band_front_hold_margin_rows");
+  }
+  if (has_key(band_ale, "estimator_band_axis")) {
+    config.estimator_band_axis = strict_string(
+        band_ale["estimator_band_axis"], path + ".estimator_band_axis");
+  }
+  if (has_key(band_ale, "estimator_band_in_rows")) {
+    config.estimator_band_in_rows = strict_int32(
+        band_ale["estimator_band_in_rows"],
+        path + ".estimator_band_in_rows");
+  }
+  if (has_key(band_ale, "estimator_band_out_rows")) {
+    config.estimator_band_out_rows = strict_int32(
+        band_ale["estimator_band_out_rows"],
+        path + ".estimator_band_out_rows");
+  }
+  if (has_key(band_ale, "estimator_band_eta_on")) {
+    config.estimator_band_eta_on = numeric_as_double(
+        band_ale["estimator_band_eta_on"],
+        path + ".estimator_band_eta_on");
+  }
+  if (has_key(band_ale, "estimator_band_eta_off")) {
+    config.estimator_band_eta_off = numeric_as_double(
+        band_ale["estimator_band_eta_off"],
+        path + ".estimator_band_eta_off");
+  }
+  if (has_key(band_ale, "estimator_band_per_column")) {
+    config.estimator_band_per_column = strict_bool(
+        band_ale["estimator_band_per_column"],
+        path + ".estimator_band_per_column");
+  }
+  if (has_key(band_ale, "estimator_band_pc_filter_halfwidth")) {
+    config.estimator_band_pc_filter_halfwidth = strict_int32(
+        band_ale["estimator_band_pc_filter_halfwidth"],
+        path + ".estimator_band_pc_filter_halfwidth");
+  }
+  if (has_key(band_ale, "estimator_band_pc_slope_limit")) {
+    config.estimator_band_pc_slope_limit = numeric_as_double(
+        band_ale["estimator_band_pc_slope_limit"],
+        path + ".estimator_band_pc_slope_limit");
+  }
+  if (has_key(band_ale, "estimator_band_pc_slope_reject")) {
+    config.estimator_band_pc_slope_reject = numeric_as_double(
+        band_ale["estimator_band_pc_slope_reject"],
+        path + ".estimator_band_pc_slope_reject");
+  }
+  if (has_key(band_ale, "estimator_band_pc_curvature_limit")) {
+    config.estimator_band_pc_curvature_limit = numeric_as_double(
+        band_ale["estimator_band_pc_curvature_limit"],
+        path + ".estimator_band_pc_curvature_limit");
+  }
+  if (has_key(band_ale, "estimator_band_pc_chi_max")) {
+    config.estimator_band_pc_chi_max = numeric_as_double(
+        band_ale["estimator_band_pc_chi_max"],
+        path + ".estimator_band_pc_chi_max");
+  }
+  if (has_key(band_ale, "estimator_band_pc_chi_step")) {
+    config.estimator_band_pc_chi_step = numeric_as_double(
+        band_ale["estimator_band_pc_chi_step"],
+        path + ".estimator_band_pc_chi_step");
+  }
+  if (has_key(band_ale, "estimator_band_pc_sigma_floor")) {
+    config.estimator_band_pc_sigma_floor = numeric_as_double(
+        band_ale["estimator_band_pc_sigma_floor"],
+        path + ".estimator_band_pc_sigma_floor");
+  }
+  if (has_key(band_ale, "estimator_band_pc_coverage_full")) {
+    config.estimator_band_pc_coverage_full = numeric_as_double(
+        band_ale["estimator_band_pc_coverage_full"],
+        path + ".estimator_band_pc_coverage_full");
+  }
+  if (has_key(band_ale, "estimator_band_pc_coverage_min")) {
+    config.estimator_band_pc_coverage_min = numeric_as_double(
+        band_ale["estimator_band_pc_coverage_min"],
+        path + ".estimator_band_pc_coverage_min");
+  }
+  if (has_key(band_ale, "estimator_band_pc_cooldown_events")) {
+    config.estimator_band_pc_cooldown_events = strict_int32(
+        band_ale["estimator_band_pc_cooldown_events"],
+        path + ".estimator_band_pc_cooldown_events");
+  }
+  if (has_key(band_ale, "estimator_band_pc_phase_b")) {
+    config.estimator_band_pc_phase_b = strict_bool(
+        band_ale["estimator_band_pc_phase_b"],
+        path + ".estimator_band_pc_phase_b");
+  }
+  if (has_key(band_ale, "estimator_band_pc_tube_dilate_rows")) {
+    config.estimator_band_pc_tube_dilate_rows = strict_int32(
+        band_ale["estimator_band_pc_tube_dilate_rows"], path + ".estimator_band_pc_tube_dilate_rows");
+  }
+  if (has_key(band_ale, "estimator_band_pc_tube_dilate_cols_extra")) {
+    config.estimator_band_pc_tube_dilate_cols_extra = strict_int32(
+        band_ale["estimator_band_pc_tube_dilate_cols_extra"],
+        path + ".estimator_band_pc_tube_dilate_cols_extra");
+  }
+  if (has_key(band_ale, "estimator_band_pc_ambiguous_hold_fraction")) {
+    config.estimator_band_pc_ambiguous_hold_fraction = numeric_as_double(
+        band_ale["estimator_band_pc_ambiguous_hold_fraction"],
+        path + ".estimator_band_pc_ambiguous_hold_fraction");
+  }
+  if (has_key(band_ale, "closure_catchment_enabled")) {
+    config.closure_catchment_enabled = strict_bool(
+        band_ale["closure_catchment_enabled"],
+        path + ".closure_catchment_enabled");
+  }
+  if (has_key(band_ale, "closure_catchment_forced_active")) {
+    config.closure_catchment_forced_active = strict_bool(
+        band_ale["closure_catchment_forced_active"],
+        path + ".closure_catchment_forced_active");
+  }
+  if (has_key(band_ale, "closure_catchment_s_catch_cm")) {
+    config.closure_catchment_s_catch_cm = numeric_as_double(
+        band_ale["closure_catchment_s_catch_cm"],
+        path + ".closure_catchment_s_catch_cm");
+  }
+  if (has_key(band_ale, "closure_catchment_s_protect_cm")) {
+    config.closure_catchment_s_protect_cm = numeric_as_double(
+        band_ale["closure_catchment_s_protect_cm"],
+        path + ".closure_catchment_s_protect_cm");
+  }
+  if (has_key(band_ale, "closure_catchment_spacing_floor_cm")) {
+    config.closure_catchment_spacing_floor_cm = numeric_as_double(
+        band_ale["closure_catchment_spacing_floor_cm"],
+        path + ".closure_catchment_spacing_floor_cm");
+  }
+  if (has_key(band_ale, "closure_catchment_ratio_max")) {
+    config.closure_catchment_ratio_max = numeric_as_double(
+        band_ale["closure_catchment_ratio_max"],
+        path + ".closure_catchment_ratio_max");
+  }
+  if (has_key(band_ale, "closure_catchment_nu_max")) {
+    config.closure_catchment_nu_max = numeric_as_double(
+        band_ale["closure_catchment_nu_max"],
+        path + ".closure_catchment_nu_max");
+  }
+  if (has_key(band_ale, "closure_catchment_max_bites")) {
+    config.closure_catchment_max_bites = strict_int32(
+        band_ale["closure_catchment_max_bites"],
+        path + ".closure_catchment_max_bites");
+  }
+  if (has_key(band_ale, "closure_catchment_shock_hold")) {
+    config.closure_catchment_shock_hold = numeric_as_double(
+        band_ale["closure_catchment_shock_hold"],
+        path + ".closure_catchment_shock_hold");
+  }
+  if (has_key(band_ale, "closure_catchment_eta_h_arm")) {
+    config.closure_catchment_eta_h_arm = numeric_as_double(
+        band_ale["closure_catchment_eta_h_arm"],
+        path + ".closure_catchment_eta_h_arm");
+  }
+  if (has_key(band_ale, "closure_catchment_eta_h_full")) {
+    config.closure_catchment_eta_h_full = numeric_as_double(
+        band_ale["closure_catchment_eta_h_full"],
+        path + ".closure_catchment_eta_h_full");
+  }
+  if (has_key(band_ale, "closure_catchment_eta_m_arm")) {
+    config.closure_catchment_eta_m_arm = numeric_as_double(
+        band_ale["closure_catchment_eta_m_arm"],
+        path + ".closure_catchment_eta_m_arm");
+  }
+  if (has_key(band_ale, "closure_catchment_eta_m_full")) {
+    config.closure_catchment_eta_m_full = numeric_as_double(
+        band_ale["closure_catchment_eta_m_full"],
+        path + ".closure_catchment_eta_m_full");
+  }
+  if (has_key(band_ale, "closure_catchment_reset_eta")) {
+    config.closure_catchment_reset_eta = numeric_as_double(
+        band_ale["closure_catchment_reset_eta"],
+        path + ".closure_catchment_reset_eta");
+  }
+  if (has_key(band_ale, "closure_catchment_support_core_rows")) {
+    config.closure_catchment_support_core_rows = strict_int32(
+        band_ale["closure_catchment_support_core_rows"],
+        path + ".closure_catchment_support_core_rows");
+  }
+  if (has_key(band_ale, "closure_catchment_support_taper_rows")) {
+    config.closure_catchment_support_taper_rows = strict_int32(
+        band_ale["closure_catchment_support_taper_rows"],
+        path + ".closure_catchment_support_taper_rows");
+  }
+  if (has_key(band_ale, "closure_catchment_accum_frac")) {
+    config.closure_catchment_accum_frac = numeric_as_double(
+        band_ale["closure_catchment_accum_frac"],
+        path + ".closure_catchment_accum_frac");
+  }
+  if (has_key(band_ale, "closure_catchment_rearm_drop")) {
+    config.closure_catchment_rearm_drop = numeric_as_double(
+        band_ale["closure_catchment_rearm_drop"],
+        path + ".closure_catchment_rearm_drop");
+  }
+  if (has_key(band_ale, "pole_theta_enabled")) {
+    config.pole_theta_enabled = strict_bool(
+        band_ale["pole_theta_enabled"], path + ".pole_theta_enabled");
+  }
+  if (has_key(band_ale, "pole_theta_routine_enabled")) {
+    config.pole_theta_routine_enabled = strict_bool(
+        band_ale["pole_theta_routine_enabled"],
+        path + ".pole_theta_routine_enabled");
+  }
+  if (has_key(band_ale, "pole_theta_phys_lp")) {
+    config.pole_theta_phys_lp = strict_int32(
+        band_ale["pole_theta_phys_lp"], path + ".pole_theta_phys_lp");
+  }
+  if (has_key(band_ale, "pole_theta_phys_lc")) {
+    config.pole_theta_phys_lc = strict_int32(
+        band_ale["pole_theta_phys_lc"], path + ".pole_theta_phys_lc");
+  }
+  if (has_key(band_ale, "pole_theta_noise_floor")) {
+    config.pole_theta_noise_floor = numeric_as_double(
+        band_ale["pole_theta_noise_floor"],
+        path + ".pole_theta_noise_floor");
+  }
+  if (has_key(band_ale, "pole_theta_noise_ceiling")) {
+    config.pole_theta_noise_ceiling = numeric_as_double(
+        band_ale["pole_theta_noise_ceiling"],
+        path + ".pole_theta_noise_ceiling");
+  }
+  if (has_key(band_ale, "pole_theta_h_arm")) {
+    config.pole_theta_h_arm = numeric_as_double(
+        band_ale["pole_theta_h_arm"], path + ".pole_theta_h_arm");
+  }
+  if (has_key(band_ale, "pole_theta_h_fire")) {
+    config.pole_theta_h_fire = numeric_as_double(
+        band_ale["pole_theta_h_fire"], path + ".pole_theta_h_fire");
+  }
+  if (has_key(band_ale, "pole_theta_h_hard")) {
+    config.pole_theta_h_hard = numeric_as_double(
+        band_ale["pole_theta_h_hard"], path + ".pole_theta_h_hard");
+  }
+  if (has_key(band_ale, "pole_theta_h_release")) {
+    config.pole_theta_h_release = numeric_as_double(
+        band_ale["pole_theta_h_release"], path + ".pole_theta_h_release");
+  }
+  if (has_key(band_ale, "pole_theta_kappa_arm")) {
+    config.pole_theta_kappa_arm = numeric_as_double(
+        band_ale["pole_theta_kappa_arm"], path + ".pole_theta_kappa_arm");
+  }
+  if (has_key(band_ale, "pole_theta_kappa_fire")) {
+    config.pole_theta_kappa_fire = numeric_as_double(
+        band_ale["pole_theta_kappa_fire"],
+        path + ".pole_theta_kappa_fire");
+  }
+  if (has_key(band_ale, "pole_theta_kappa_hard")) {
+    config.pole_theta_kappa_hard = numeric_as_double(
+        band_ale["pole_theta_kappa_hard"],
+        path + ".pole_theta_kappa_hard");
+  }
+  if (has_key(band_ale, "pole_theta_alpha")) {
+    config.pole_theta_alpha = numeric_as_double(
+        band_ale["pole_theta_alpha"], path + ".pole_theta_alpha");
+  }
+  if (has_key(band_ale, "pole_theta_alpha_hard")) {
+    config.pole_theta_alpha_hard = numeric_as_double(
+        band_ale["pole_theta_alpha_hard"], path + ".pole_theta_alpha_hard");
+  }
+  if (has_key(band_ale, "pole_theta_deadband_frac")) {
+    config.pole_theta_deadband_frac = numeric_as_double(
+        band_ale["pole_theta_deadband_frac"],
+        path + ".pole_theta_deadband_frac");
+  }
+  if (has_key(band_ale, "pole_theta_move_limit_frac")) {
+    config.pole_theta_move_limit_frac = numeric_as_double(
+        band_ale["pole_theta_move_limit_frac"],
+        path + ".pole_theta_move_limit_frac");
+  }
+  if (has_key(band_ale, "pole_theta_move_limit_hard_frac")) {
+    config.pole_theta_move_limit_hard_frac = numeric_as_double(
+        band_ale["pole_theta_move_limit_hard_frac"],
+        path + ".pole_theta_move_limit_hard_frac");
+  }
+  if (has_key(band_ale, "pole_theta_cooldown_s")) {
+    config.pole_theta_cooldown_s = numeric_as_double(
+        band_ale["pole_theta_cooldown_s"], path + ".pole_theta_cooldown_s");
+  }
+  if (has_key(band_ale, "pole_theta_cooldown_base_s")) {
+    config.pole_theta_cooldown_base_s = numeric_as_double(
+        band_ale["pole_theta_cooldown_base_s"],
+        path + ".pole_theta_cooldown_base_s");
+  }
+  if (has_key(band_ale, "pole_theta_predict_window_s")) {
+    config.pole_theta_predict_window_s = numeric_as_double(
+        band_ale["pole_theta_predict_window_s"],
+        path + ".pole_theta_predict_window_s");
+  }
+  if (has_key(band_ale, "pole_theta_predict_horizon_s")) {
+    config.pole_theta_predict_horizon_s = numeric_as_double(
+        band_ale["pole_theta_predict_horizon_s"],
+        path + ".pole_theta_predict_horizon_s");
+  }
+  if (has_key(band_ale, "pole_theta_halo_columns")) {
+    config.pole_theta_halo_columns = strict_int32(
+        band_ale["pole_theta_halo_columns"],
+        path + ".pole_theta_halo_columns");
+  }
+  if (has_key(band_ale, "pole_theta_halo_rows")) {
+    config.pole_theta_halo_rows = strict_int32(
+        band_ale["pole_theta_halo_rows"], path + ".pole_theta_halo_rows");
+  }
+  if (has_key(band_ale, "pole_theta_post_h_floor")) {
+    config.pole_theta_post_h_floor = numeric_as_double(
+        band_ale["pole_theta_post_h_floor"],
+        path + ".pole_theta_post_h_floor");
+  }
+  if (has_key(band_ale, "pole_theta_curve_preserving")) {
+    config.pole_theta_curve_preserving = strict_bool(
+        band_ale["pole_theta_curve_preserving"],
+        path + ".pole_theta_curve_preserving");
+  }
+  if (has_key(band_ale, "pole_theta_protected_modes")) {
+    config.pole_theta_protected_modes = strict_string(
+        band_ale["pole_theta_protected_modes"],
+        path + ".pole_theta_protected_modes");
+  }
+  if (has_key(band_ale, "pole_theta_fit_order")) {
+    config.pole_theta_fit_order = strict_int32(
+        band_ale["pole_theta_fit_order"],
+        path + ".pole_theta_fit_order");
+  }
+  if (has_key(band_ale, "pole_theta_shock_hold")) {
+    config.pole_theta_shock_hold = numeric_as_double(
+        band_ale["pole_theta_shock_hold"],
+        path + ".pole_theta_shock_hold");
+  }
+  if (has_key(band_ale, "shell_window_in_rows")) {
+    config.shell_window_in_rows = strict_int32(
+        band_ale["shell_window_in_rows"],
+        path + ".shell_window_in_rows");
+  }
+  if (has_key(band_ale, "shell_window_out_rows")) {
+    config.shell_window_out_rows = strict_int32(
+        band_ale["shell_window_out_rows"],
+        path + ".shell_window_out_rows");
+  }
+  if (has_key(band_ale, "shell_boundary_guard_rows")) {
+    config.shell_boundary_guard_rows = strict_int32(
+        band_ale["shell_boundary_guard_rows"],
+        path + ".shell_boundary_guard_rows");
+  }
+  if (has_key(band_ale, "shell_min_spacing_frac")) {
+    config.shell_min_spacing_frac = numeric_as_double(
+        band_ale["shell_min_spacing_frac"],
+        path + ".shell_min_spacing_frac");
+  }
+  if (has_key(band_ale, "shell_front_metric")) {
+    config.shell_front_metric = strict_string(
+        band_ale["shell_front_metric"], path + ".shell_front_metric");
+  }
+  if (has_key(band_ale, "shell_target")) {
+    config.shell_target =
+        strict_string(band_ale["shell_target"], path + ".shell_target");
+  }
+  if (has_key(band_ale, "axis_repair_enabled")) {
+    config.axis_repair_enabled = strict_bool(
+        band_ale["axis_repair_enabled"], path + ".axis_repair_enabled");
+  }
+  if (has_key(band_ale, "axis_repair_eta_on")) {
+    config.axis_repair_eta_on = numeric_as_double(
+        band_ale["axis_repair_eta_on"], path + ".axis_repair_eta_on");
+  }
+  if (has_key(band_ale, "axis_repair_eta_off")) {
+    config.axis_repair_eta_off = numeric_as_double(
+        band_ale["axis_repair_eta_off"], path + ".axis_repair_eta_off");
+  }
+  if (has_key(band_ale, "axis_repair_cap_rel")) {
+    config.axis_repair_cap_rel = numeric_as_double(
+        band_ale["axis_repair_cap_rel"], path + ".axis_repair_cap_rel");
+  }
+}
+
+void parse_evacuated_cell_dict(
+    const py::dict& evacuated_cell,
+    const std::string& path,
+    Config::NumericsConfig::AleConfig::EvacuatedCellConfig& config) {
+  enforce_known_keys(
+      evacuated_cell,
+      path,
+      {"enabled",
+       "every_n_steps",
+       "arm_mass_fraction",
+       "off_mass_fraction",
+       "rho_vacuum_policy_g_per_cc",
+       "off_hold_evaluations",
+       "laser_ne_over_ncrit_max",
+       "laser_wavelength_nm",
+       "coupling_fraction_max",
+       "max_cells_per_event",
+       "rematerialize_enabled",
+       "rematerialize_after_evaluations",
+       "rematerialize_volume_fraction",
+       "rematerialize_neighbor_change_max",
+       "rematerialize_dwell_evaluations",
+       "closure_contact"});
+  if (has_key(evacuated_cell, "enabled")) {
+    config.enabled =
+        strict_bool(evacuated_cell["enabled"], path + ".enabled");
+  }
+  if (has_key(evacuated_cell, "every_n_steps")) {
+    config.every_n_steps = strict_int32(
+        evacuated_cell["every_n_steps"], path + ".every_n_steps");
+  }
+  if (has_key(evacuated_cell, "arm_mass_fraction")) {
+    config.arm_mass_fraction = numeric_as_double(
+        evacuated_cell["arm_mass_fraction"], path + ".arm_mass_fraction");
+  }
+  if (has_key(evacuated_cell, "off_mass_fraction")) {
+    config.off_mass_fraction = numeric_as_double(
+        evacuated_cell["off_mass_fraction"], path + ".off_mass_fraction");
+  }
+  if (has_key(evacuated_cell, "rho_vacuum_policy_g_per_cc")) {
+    config.rho_vacuum_policy_g_per_cc = numeric_as_double(
+        evacuated_cell["rho_vacuum_policy_g_per_cc"],
+        path + ".rho_vacuum_policy_g_per_cc");
+  }
+  if (has_key(evacuated_cell, "off_hold_evaluations")) {
+    config.off_hold_evaluations = strict_int32(
+        evacuated_cell["off_hold_evaluations"],
+        path + ".off_hold_evaluations");
+  }
+  if (has_key(evacuated_cell, "laser_ne_over_ncrit_max")) {
+    config.laser_ne_over_ncrit_max = numeric_as_double(
+        evacuated_cell["laser_ne_over_ncrit_max"],
+        path + ".laser_ne_over_ncrit_max");
+  }
+  if (has_key(evacuated_cell, "laser_wavelength_nm")) {
+    config.laser_wavelength_nm = numeric_as_double(
+        evacuated_cell["laser_wavelength_nm"],
+        path + ".laser_wavelength_nm");
+  }
+  if (has_key(evacuated_cell, "coupling_fraction_max")) {
+    config.coupling_fraction_max = numeric_as_double(
+        evacuated_cell["coupling_fraction_max"],
+        path + ".coupling_fraction_max");
+  }
+  if (has_key(evacuated_cell, "max_cells_per_event")) {
+    config.max_cells_per_event = strict_int32(
+        evacuated_cell["max_cells_per_event"],
+        path + ".max_cells_per_event");
+  }
+  if (has_key(evacuated_cell, "rematerialize_enabled")) {
+    config.rematerialize_enabled = strict_bool(
+        evacuated_cell["rematerialize_enabled"],
+        path + ".rematerialize_enabled");
+  }
+  if (has_key(evacuated_cell, "rematerialize_after_evaluations")) {
+    config.rematerialize_after_evaluations = strict_int32(
+        evacuated_cell["rematerialize_after_evaluations"],
+        path + ".rematerialize_after_evaluations");
+  }
+  if (has_key(evacuated_cell, "rematerialize_volume_fraction")) {
+    config.rematerialize_volume_fraction = numeric_as_double(
+        evacuated_cell["rematerialize_volume_fraction"],
+        path + ".rematerialize_volume_fraction");
+  }
+  if (has_key(evacuated_cell, "rematerialize_neighbor_change_max")) {
+    config.rematerialize_neighbor_change_max = numeric_as_double(
+        evacuated_cell["rematerialize_neighbor_change_max"],
+        path + ".rematerialize_neighbor_change_max");
+  }
+  if (has_key(evacuated_cell, "rematerialize_dwell_evaluations")) {
+    config.rematerialize_dwell_evaluations = strict_int32(
+        evacuated_cell["rematerialize_dwell_evaluations"],
+        path + ".rematerialize_dwell_evaluations");
+  }
+  if (has_key(evacuated_cell, "closure_contact")) {
+    const py::handle closure_contact_obj = evacuated_cell["closure_contact"];
+    if (!py::isinstance<py::dict>(closure_contact_obj)) {
+      throw_value_type_error(
+          path + ".closure_contact", "dict", closure_contact_obj);
+    }
+    const py::dict closure_contact =
+        py::reinterpret_borrow<py::dict>(closure_contact_obj);
+    const std::string closure_path = path + ".closure_contact";
+    enforce_known_keys(
+        closure_contact,
+        closure_path,
+        {"enabled",
+         "gap_floor_fraction",
+         "gap_arm_fraction",
+         "live_mass_gate",
+         "live_volume_gate",
+         "refill_min_mass_fraction",
+         "refill_min_density_ratio",
+         "release_force_c",
+         "release_persistence_stages",
+         "reengage_gap_margin",
+         "mortar_position_drift_beta",
+         "surface_engage_enabled",
+         "lcp_apply_enabled",
+         "axis_edge_collapse",
+         "flank_tangential_strip",
+         "seam_interface_owner_enabled"});
+    auto& closure = config.closure_contact;
+    if (has_key(closure_contact, "enabled")) {
+      closure.enabled = strict_bool(
+          closure_contact["enabled"], closure_path + ".enabled");
+    }
+    if (has_key(closure_contact, "gap_floor_fraction")) {
+      closure.gap_floor_fraction = numeric_as_double(
+          closure_contact["gap_floor_fraction"],
+          closure_path + ".gap_floor_fraction");
+    }
+    if (has_key(closure_contact, "gap_arm_fraction")) {
+      closure.gap_arm_fraction = numeric_as_double(
+          closure_contact["gap_arm_fraction"],
+          closure_path + ".gap_arm_fraction");
+    }
+    if (has_key(closure_contact, "live_mass_gate")) {
+      closure.live_mass_gate = numeric_as_double(
+          closure_contact["live_mass_gate"],
+          closure_path + ".live_mass_gate");
+    }
+    if (has_key(closure_contact, "live_volume_gate")) {
+      closure.live_volume_gate = numeric_as_double(
+          closure_contact["live_volume_gate"],
+          closure_path + ".live_volume_gate");
+    }
+    if (has_key(closure_contact, "refill_min_mass_fraction")) {
+      closure.refill_min_mass_fraction = numeric_as_double(
+          closure_contact["refill_min_mass_fraction"],
+          closure_path + ".refill_min_mass_fraction");
+    }
+    if (has_key(closure_contact, "refill_min_density_ratio")) {
+      closure.refill_min_density_ratio = numeric_as_double(
+          closure_contact["refill_min_density_ratio"],
+          closure_path + ".refill_min_density_ratio");
+    }
+    if (has_key(closure_contact, "release_force_c")) {
+      closure.release_force_c = numeric_as_double(
+          closure_contact["release_force_c"],
+          closure_path + ".release_force_c");
+    }
+    if (has_key(closure_contact, "release_persistence_stages")) {
+      closure.release_persistence_stages = strict_int32(
+          closure_contact["release_persistence_stages"],
+          closure_path + ".release_persistence_stages");
+    }
+    if (has_key(closure_contact, "reengage_gap_margin")) {
+      closure.reengage_gap_margin = numeric_as_double(
+          closure_contact["reengage_gap_margin"],
+          closure_path + ".reengage_gap_margin");
+    }
+    if (has_key(closure_contact, "mortar_position_drift_beta")) {
+      closure.mortar_position_drift_beta = numeric_as_double(
+          closure_contact["mortar_position_drift_beta"],
+          closure_path + ".mortar_position_drift_beta");
+    }
+    if (has_key(closure_contact, "surface_engage_enabled")) {
+      closure.surface_engage_enabled = strict_bool(
+          closure_contact["surface_engage_enabled"],
+          closure_path + ".surface_engage_enabled");
+    }
+    if (has_key(closure_contact, "lcp_apply_enabled")) {
+      closure.lcp_apply_enabled = strict_bool(
+          closure_contact["lcp_apply_enabled"],
+          closure_path + ".lcp_apply_enabled");
+    }
+    if (has_key(closure_contact, "axis_edge_collapse")) {
+      const py::handle axis_edge_collapse_obj =
+          closure_contact["axis_edge_collapse"];
+      if (!py::isinstance<py::dict>(axis_edge_collapse_obj)) {
+        throw_value_type_error(closure_path + ".axis_edge_collapse",
+                               "dict",
+                               axis_edge_collapse_obj);
+      }
+      const py::dict axis_edge_collapse =
+          py::reinterpret_borrow<py::dict>(axis_edge_collapse_obj);
+      const std::string collapse_path =
+          closure_path + ".axis_edge_collapse";
+      enforce_known_keys(axis_edge_collapse,
+                         collapse_path,
+                         {"enabled",
+                          "ulp_count",
+                          "h_ref_fraction",
+                          "release_hysteresis",
+                          "persistence_window",
+                          "persistence_min_closing",
+                          "repair_recurrence_steps",
+                          "repair_futility_fraction"});
+      auto& collapse = closure.axis_edge_collapse;
+      if (has_key(axis_edge_collapse, "enabled")) {
+        collapse.enabled = strict_bool(
+            axis_edge_collapse["enabled"], collapse_path + ".enabled");
+      }
+      if (has_key(axis_edge_collapse, "ulp_count")) {
+        collapse.ulp_count = numeric_as_double(
+            axis_edge_collapse["ulp_count"], collapse_path + ".ulp_count");
+      }
+      if (has_key(axis_edge_collapse, "h_ref_fraction")) {
+        collapse.h_ref_fraction = numeric_as_double(
+            axis_edge_collapse["h_ref_fraction"],
+            collapse_path + ".h_ref_fraction");
+      }
+      if (has_key(axis_edge_collapse, "release_hysteresis")) {
+        collapse.release_hysteresis = numeric_as_double(
+            axis_edge_collapse["release_hysteresis"],
+            collapse_path + ".release_hysteresis");
+      }
+      if (has_key(axis_edge_collapse, "persistence_window")) {
+        collapse.persistence_window = strict_int32(
+            axis_edge_collapse["persistence_window"],
+            collapse_path + ".persistence_window");
+      }
+      if (has_key(axis_edge_collapse, "persistence_min_closing")) {
+        collapse.persistence_min_closing = strict_int32(
+            axis_edge_collapse["persistence_min_closing"],
+            collapse_path + ".persistence_min_closing");
+      }
+      if (has_key(axis_edge_collapse, "repair_recurrence_steps")) {
+        collapse.repair_recurrence_steps = strict_int32(
+            axis_edge_collapse["repair_recurrence_steps"],
+            collapse_path + ".repair_recurrence_steps");
+      }
+      if (has_key(axis_edge_collapse, "repair_futility_fraction")) {
+        collapse.repair_futility_fraction = numeric_as_double(
+            axis_edge_collapse["repair_futility_fraction"],
+            collapse_path + ".repair_futility_fraction");
+      }
+    }
+    if (has_key(closure_contact, "flank_tangential_strip")) {
+      const py::handle flank_tangential_strip_obj =
+          closure_contact["flank_tangential_strip"];
+      if (!py::isinstance<py::dict>(flank_tangential_strip_obj)) {
+        throw_value_type_error(closure_path + ".flank_tangential_strip",
+                               "dict",
+                               flank_tangential_strip_obj);
+      }
+      const py::dict flank_tangential_strip =
+          py::reinterpret_borrow<py::dict>(flank_tangential_strip_obj);
+      const std::string strip_path =
+          closure_path + ".flank_tangential_strip";
+      enforce_known_keys(flank_tangential_strip,
+                         strip_path,
+                         {"enabled",
+                          "untangler_enabled",
+                          "band_layers",
+                          "band_halfwidth_j",
+                          "arm_quality_ratio",
+                          "release_quality_ratio",
+                          "min_progress_factor",
+                          "lead_steps",
+                          "release_persistence_steps",
+                          "release_shear_number",
+                          "slip_handoff_ratio",
+                          "slip_patch_enabled"});
+      auto& strip = closure.flank_tangential_strip;
+      if (has_key(flank_tangential_strip, "enabled")) {
+        strip.enabled = strict_bool(
+            flank_tangential_strip["enabled"], strip_path + ".enabled");
+      }
+      if (has_key(flank_tangential_strip, "untangler_enabled")) {
+        strip.untangler_enabled = strict_bool(
+            flank_tangential_strip["untangler_enabled"],
+            strip_path + ".untangler_enabled");
+      }
+      if (has_key(flank_tangential_strip, "band_layers")) {
+        strip.band_layers = strict_int32(
+            flank_tangential_strip["band_layers"],
+            strip_path + ".band_layers");
+      }
+      if (has_key(flank_tangential_strip, "band_halfwidth_j")) {
+        strip.band_halfwidth_j = strict_int32(
+            flank_tangential_strip["band_halfwidth_j"],
+            strip_path + ".band_halfwidth_j");
+      }
+      if (has_key(flank_tangential_strip, "arm_quality_ratio")) {
+        strip.arm_quality_ratio = numeric_as_double(
+            flank_tangential_strip["arm_quality_ratio"],
+            strip_path + ".arm_quality_ratio");
+      }
+      if (has_key(flank_tangential_strip, "release_quality_ratio")) {
+        strip.release_quality_ratio = numeric_as_double(
+            flank_tangential_strip["release_quality_ratio"],
+            strip_path + ".release_quality_ratio");
+      }
+      if (has_key(flank_tangential_strip, "min_progress_factor")) {
+        strip.min_progress_factor = numeric_as_double(
+            flank_tangential_strip["min_progress_factor"],
+            strip_path + ".min_progress_factor");
+      }
+      if (has_key(flank_tangential_strip, "lead_steps")) {
+        strip.lead_steps = strict_int32(
+            flank_tangential_strip["lead_steps"],
+            strip_path + ".lead_steps");
+      }
+      if (has_key(flank_tangential_strip,
+                  "release_persistence_steps")) {
+        strip.release_persistence_steps = strict_int32(
+            flank_tangential_strip["release_persistence_steps"],
+            strip_path + ".release_persistence_steps");
+      }
+      if (has_key(flank_tangential_strip, "release_shear_number")) {
+        strip.release_shear_number = numeric_as_double(
+            flank_tangential_strip["release_shear_number"],
+            strip_path + ".release_shear_number");
+      }
+      if (has_key(flank_tangential_strip, "slip_handoff_ratio")) {
+        strip.slip_handoff_ratio = numeric_as_double(
+            flank_tangential_strip["slip_handoff_ratio"],
+            strip_path + ".slip_handoff_ratio");
+      }
+      if (has_key(flank_tangential_strip, "slip_patch_enabled")) {
+        strip.slip_patch_enabled = strict_bool(
+            flank_tangential_strip["slip_patch_enabled"],
+            strip_path + ".slip_patch_enabled");
+      }
+    }
+    if (has_key(closure_contact, "seam_interface_owner_enabled")) {
+      closure.seam_interface_owner_enabled = strict_bool(
+          closure_contact["seam_interface_owner_enabled"],
+          closure_path + ".seam_interface_owner_enabled");
+    }
+  }
+}
+
+void validate_band_ale_config(
+    const Config::NumericsConfig::AleConfig::BandAleConfig& config,
+    const std::string& path) {
+  if (config.estimator_band_per_column && config.bands != "estimator") {
+    throw ConfigError(
+        path + ".estimator_band_per_column=true requires bands=\"estimator\"");
+  }
+  if (!config.enabled) {
+    return;
+  }
+  if (!(std::isfinite(config.aspect_trigger) &&
+        config.aspect_trigger > 0.0 && config.aspect_trigger <= 1.0)) {
+    throw ValueError(path + ".aspect_trigger must be finite and in (0, 1]");
+  }
+  if (!(std::isfinite(config.release_hysteresis) &&
+        config.release_hysteresis > 1.0)) {
+    throw ValueError(
+        path + ".release_hysteresis must be finite and > 1");
+  }
+  if (!(std::isfinite(config.chi) &&
+        config.chi >= 0.0 && config.chi <= 1.0)) {
+    throw ValueError(path + ".chi must be finite and in [0, 1]");
+  }
+  if (config.bands != "belts" && config.bands != "axis" &&
+      config.bands != "belts_axis" && config.bands != "shell" &&
+      config.bands != "belts_axis_shell" && config.bands != "estimator") {
+    throw ValueError(
+        path + ".bands must be one of {\"belts\", \"axis\", "
+               "\"belts_axis\", \"shell\", \"belts_axis_shell\", "
+               "\"estimator\"}");
+  }
+  if (config.belt_target != "ring_mean" &&
+      config.belt_target != "respace") {
+    throw ValueError(
+        path + ".belt_target must be one of {\"ring_mean\", \"respace\"}");
+  }
+  if (config.center_target != "line" &&
+      config.center_target != "volume_fraction") {
+    throw ValueError(
+        path +
+        ".center_target must be one of {\"line\", \"volume_fraction\"}");
+  }
+  if (config.axis_target != "z_laplacian" &&
+      config.axis_target != "respace") {
+    throw ValueError(
+        path +
+        ".axis_target must be one of {\"z_laplacian\", \"respace\"}");
+  }
+  if (config.axis_segment_halfwidth < 1 ||
+      config.axis_segment_halfwidth > 64) {
+    throw ValueError(
+        path + ".axis_segment_halfwidth must be in [1, 64]");
+  }
+  if (!(std::isfinite(config.estimator_band_cut) &&
+        config.estimator_band_cut > 0.0 &&
+        config.estimator_band_cut < 1.0)) {
+    throw ValueError(
+        path + ".estimator_band_cut must be finite and in (0, 1)");
+  }
+  if (!(std::isfinite(config.estimator_band_shock_hold) &&
+        config.estimator_band_shock_hold > config.estimator_band_cut &&
+        config.estimator_band_shock_hold <= 1.0)) {
+    throw ValueError(
+        path +
+        ".estimator_band_shock_hold must be finite, greater than "
+        "estimator_band_cut, and <= 1.0");
+  }
+  if (!(config.estimator_band_front_hold_margin_rows >= 0.0)) {
+    throw ConfigError(
+        path + ".estimator_band_front_hold_margin_rows must be >= 0.0");
+  }
+  if (config.estimator_band_axis != "auto" &&
+      config.estimator_band_axis != "i" &&
+      config.estimator_band_axis != "j") {
+    throw ConfigError(
+        path + ".estimator_band_axis must be one of {\"auto\", \"i\", \"j\"}");
+  }
+  if (config.estimator_band_in_rows < 1) {
+    throw ValueError(path + ".estimator_band_in_rows must be >= 1");
+  }
+  if (config.estimator_band_out_rows < 1) {
+    throw ValueError(path + ".estimator_band_out_rows must be >= 1");
+  }
+  if (!(std::isfinite(config.estimator_band_eta_on) &&
+        std::isfinite(config.estimator_band_eta_off) &&
+        config.estimator_band_eta_off > 1.0 &&
+        config.estimator_band_eta_off < config.estimator_band_eta_on)) {
+    throw ValueError(
+        path +
+        ".estimator_band_eta_on and estimator_band_eta_off must satisfy "
+        "1 < eta_off < eta_on");
+  }
+  if (config.estimator_band_pc_filter_halfwidth < 1 ||
+      config.estimator_band_pc_filter_halfwidth > 3) {
+    throw ValueError(
+        path + ".estimator_band_pc_filter_halfwidth must be in [1, 3]");
+  }
+  if (!(std::isfinite(config.estimator_band_pc_slope_limit) &&
+        config.estimator_band_pc_slope_limit > 0.0)) {
+    throw ValueError(
+        path + ".estimator_band_pc_slope_limit must be finite and > 0");
+  }
+  if (!(std::isfinite(config.estimator_band_pc_slope_reject) &&
+        config.estimator_band_pc_slope_reject >=
+            config.estimator_band_pc_slope_limit)) {
+    throw ValueError(
+        path + ".estimator_band_pc_slope_reject must be finite and >= "
+        "estimator_band_pc_slope_limit");
+  }
+  if (!(std::isfinite(config.estimator_band_pc_curvature_limit) &&
+        config.estimator_band_pc_curvature_limit > 0.0)) {
+    throw ValueError(
+        path + ".estimator_band_pc_curvature_limit must be finite and > 0");
+  }
+  if (!(std::isfinite(config.estimator_band_pc_chi_max) &&
+        config.estimator_band_pc_chi_max > 0.0 &&
+        config.estimator_band_pc_chi_max <= 1.0)) {
+    throw ValueError(
+        path + ".estimator_band_pc_chi_max must be finite and in (0, 1]");
+  }
+  if (!(std::isfinite(config.estimator_band_pc_chi_step) &&
+        config.estimator_band_pc_chi_step > 0.0)) {
+    throw ValueError(
+        path + ".estimator_band_pc_chi_step must be finite and > 0");
+  }
+  if (!(std::isfinite(config.estimator_band_pc_sigma_floor) &&
+        config.estimator_band_pc_sigma_floor > 0.0 &&
+        config.estimator_band_pc_sigma_floor < 1.0)) {
+    throw ValueError(
+        path + ".estimator_band_pc_sigma_floor must be finite and in (0, 1)");
+  }
+  if (!(std::isfinite(config.estimator_band_pc_coverage_min) &&
+        std::isfinite(config.estimator_band_pc_coverage_full) &&
+        config.estimator_band_pc_coverage_min > 0.0 &&
+        config.estimator_band_pc_coverage_min <=
+            config.estimator_band_pc_coverage_full &&
+        config.estimator_band_pc_coverage_full <= 1.0)) {
+    throw ValueError(
+        path + ".estimator_band_pc_coverage_min and "
+        "estimator_band_pc_coverage_full must satisfy "
+        "0 < coverage_min <= coverage_full <= 1");
+  }
+  if (config.estimator_band_pc_cooldown_events < 1) {
+    throw ValueError(
+        path + ".estimator_band_pc_cooldown_events must be >= 1");
+  }
+  if (config.estimator_band_pc_tube_dilate_rows < 0) {
+    throw ValueError(path + ".estimator_band_pc_tube_dilate_rows must be >= 0");
+  }
+  if (config.estimator_band_pc_tube_dilate_cols_extra < 0) {
+    throw ValueError(path + ".estimator_band_pc_tube_dilate_cols_extra must be >= 0");
+  }
+  if (!(std::isfinite(config.estimator_band_pc_ambiguous_hold_fraction) &&
+        config.estimator_band_pc_ambiguous_hold_fraction >= 0.0 &&
+        config.estimator_band_pc_ambiguous_hold_fraction <= 1.0)) {
+    throw ValueError(
+        path + ".estimator_band_pc_ambiguous_hold_fraction must be finite and in [0, 1]");
+  }
+  if (config.shell_window_in_rows < 0) {
+    throw ValueError(path + ".shell_window_in_rows must be >= 0");
+  }
+  if (config.shell_window_out_rows < 0) {
+    throw ValueError(path + ".shell_window_out_rows must be >= 0");
+  }
+  if (config.shell_boundary_guard_rows < 0) {
+    throw ValueError(path + ".shell_boundary_guard_rows must be >= 0");
+  }
+  if (config.shell_front_metric != "grad_rho" &&
+      config.shell_front_metric != "min_spacing") {
+    throw ValueError(
+        path +
+        ".shell_front_metric must be one of {\"grad_rho\", \"min_spacing\"}");
+  }
+  if (config.shell_target != "respace") {
+    throw ValueError(path + ".shell_target must be \"respace\"");
+  }
+  if (!(std::isfinite(config.axis_repair_eta_on) &&
+        std::isfinite(config.axis_repair_eta_off) &&
+        config.axis_repair_eta_on > 0.0 &&
+        config.axis_repair_eta_on < config.axis_repair_eta_off &&
+        config.axis_repair_eta_off <= 1.0)) {
+    throw ValueError(
+        path +
+        ".axis_repair_eta_on and axis_repair_eta_off must satisfy "
+        "0 < eta_on < eta_off <= 1");
+  }
+  if (!(std::isfinite(config.axis_repair_cap_rel) &&
+        config.axis_repair_cap_rel > 0.0 &&
+        config.axis_repair_cap_rel <= 0.2)) {
+    throw ValueError(
+        path + ".axis_repair_cap_rel must be finite and in (0, 0.2]");
+  }
 }
 
 void warn_ignored_key(std::string_view key_path) {
@@ -727,6 +2151,12 @@ TopologyScheme parse_topology_scheme(const std::string& value,
   if (value == "multiblock_half_butterfly_trifan_cap_5block") {
     return TopologyScheme::MULTIBLOCK_HALF_BUTTERFLY_TRIFAN_CAP_5BLOCK;
   }
+  if (value == "multiblock_polar_tier") {
+    return TopologyScheme::MULTIBLOCK_POLAR_TIER;
+  }
+  if (value == "multiblock_polar_tier_cart_center") {
+    return TopologyScheme::MULTIBLOCK_POLAR_TIER_CART_CENTER;
+  }
   if (value == "cone_shell_spine") {
     return TopologyScheme::CONE_SHELL_SPINE;
   }
@@ -738,6 +2168,8 @@ TopologyScheme parse_topology_scheme(const std::string& value,
       " must be one of {\"single_block\", \"multiblock_cart_core_polar_shell\", "
       "\"multiblock_half_butterfly_5block\", "
       "\"multiblock_half_butterfly_trifan_cap_5block\", "
+      "\"multiblock_polar_tier\", "
+      "\"multiblock_polar_tier_cart_center\", "
       "\"cone_shell_spine\", \"pentagon_belt_shell\"}, got " +
       value);
 }
@@ -994,7 +2426,9 @@ void parse_hydro_z_boundary(HydroBoundary2D::ZFaceConfig& out,
   }
 
   const py::dict dict = py::reinterpret_borrow<py::dict>(obj);
-  enforce_known_keys(dict, path, {"type", "rho_g_per_cc", "u_z_cm_per_s", "T_eV"});
+  enforce_known_keys(dict, path,
+                     {"type", "rho_g_per_cc", "u_z_cm_per_s", "T_eV",
+                      "drive_t_end_s"});
   if (!has_key(dict, "type")) {
     throw ValueError(std::string(path) + ".type is required");
   }
@@ -1025,6 +2459,14 @@ void parse_hydro_z_boundary(HydroBoundary2D::ZFaceConfig& out,
       numeric_as_double(dict["u_z_cm_per_s"], std::string(path) + ".u_z_cm_per_s");
   out.supply_T_eV =
       numeric_as_double(dict["T_eV"], std::string(path) + ".T_eV");
+  if (has_key(dict, "drive_t_end_s")) {
+    out.drive_t_end_s = numeric_as_double(
+        dict["drive_t_end_s"], std::string(path) + ".drive_t_end_s");
+    if (!(std::isfinite(out.drive_t_end_s) && out.drive_t_end_s > 0.0)) {
+      throw ConfigError(std::string(path) +
+                        ".drive_t_end_s must be finite and > 0");
+    }
+  }
   if (!(out.supply_rho_g_per_cc > 0.0)) {
     throw ValueError(format_range_error(std::string(path) + ".rho_g_per_cc",
                                         "> 0",
@@ -1048,6 +2490,146 @@ void ensure_int_ge(std::int64_t value, std::int64_t lower, std::string_view path
   if (value < lower) {
     throw ValueError(format_range_error(path, ">= " + std::to_string(lower),
                                         std::to_string(value)));
+  }
+}
+
+void validate_evacuated_cell_config(
+    const Config::NumericsConfig::AleConfig::EvacuatedCellConfig& config,
+    const std::string& path) {
+  ensure_int_ge(config.every_n_steps, 1, path + ".every_n_steps");
+  if (!(std::isfinite(config.off_mass_fraction) &&
+        std::isfinite(config.arm_mass_fraction) &&
+        config.off_mass_fraction > 0.0 &&
+        config.off_mass_fraction < config.arm_mass_fraction &&
+        config.arm_mass_fraction < 1.0)) {
+    throw ValueError(
+        path + " requires 0 < off_mass_fraction < arm_mass_fraction < 1");
+  }
+  if (!(std::isfinite(config.rho_vacuum_policy_g_per_cc) &&
+        config.rho_vacuum_policy_g_per_cc > 0.0)) {
+    throw ValueError(
+        path + ".rho_vacuum_policy_g_per_cc must be finite and > 0");
+  }
+  ensure_int_ge(
+      config.off_hold_evaluations, 1, path + ".off_hold_evaluations");
+  if (!(std::isfinite(config.laser_ne_over_ncrit_max) &&
+        config.laser_ne_over_ncrit_max > 0.0)) {
+    throw ValueError(
+        path + ".laser_ne_over_ncrit_max must be finite and > 0");
+  }
+  if (!(std::isfinite(config.laser_wavelength_nm) &&
+        config.laser_wavelength_nm > 0.0)) {
+    throw ValueError(path + ".laser_wavelength_nm must be finite and > 0");
+  }
+  if (!(std::isfinite(config.coupling_fraction_max) &&
+        config.coupling_fraction_max > 0.0)) {
+    throw ValueError(path + ".coupling_fraction_max must be finite and > 0");
+  }
+  ensure_int_ge(
+      config.max_cells_per_event, 1, path + ".max_cells_per_event");
+  ensure_int_ge(config.rematerialize_after_evaluations,
+                1,
+                path + ".rematerialize_after_evaluations");
+  if (!(std::isfinite(config.rematerialize_volume_fraction) &&
+        config.rematerialize_volume_fraction > 0.0 &&
+        config.rematerialize_volume_fraction < 1.0)) {
+    throw ValueError(
+        path + ".rematerialize_volume_fraction must be finite and in (0, 1)");
+  }
+  if (!(std::isfinite(config.rematerialize_neighbor_change_max) &&
+        config.rematerialize_neighbor_change_max > 0.0 &&
+        config.rematerialize_neighbor_change_max < 1.0)) {
+    throw ValueError(
+        path +
+        ".rematerialize_neighbor_change_max must be finite and in (0, 1)");
+  }
+  ensure_int_ge(config.rematerialize_dwell_evaluations,
+                1,
+                path + ".rematerialize_dwell_evaluations");
+  const auto& closure = config.closure_contact;
+  const std::string closure_path = path + ".closure_contact";
+  const auto ensure_open_unit_interval = [&](const double value,
+                                             const std::string& field) {
+    if (!(std::isfinite(value) && value > 0.0 && value < 1.0)) {
+      throw ValueError(closure_path + "." + field +
+                       " must be finite and in (0, 1)");
+    }
+  };
+  ensure_open_unit_interval(closure.gap_floor_fraction,
+                            "gap_floor_fraction");
+  ensure_open_unit_interval(closure.gap_arm_fraction, "gap_arm_fraction");
+  ensure_open_unit_interval(closure.live_mass_gate, "live_mass_gate");
+  ensure_open_unit_interval(closure.live_volume_gate, "live_volume_gate");
+  ensure_open_unit_interval(closure.refill_min_mass_fraction,
+                            "refill_min_mass_fraction");
+  ensure_open_unit_interval(closure.refill_min_density_ratio,
+                            "refill_min_density_ratio");
+  ensure_open_unit_interval(closure.reengage_gap_margin,
+                            "reengage_gap_margin");
+  if (!(std::isfinite(closure.mortar_position_drift_beta) &&
+        closure.mortar_position_drift_beta >= 0.0 &&
+        closure.mortar_position_drift_beta <= 0.1)) {
+    throw ValueError(closure_path +
+                     ".mortar_position_drift_beta must be finite and in "
+                     "[0, 0.1]");
+  }
+  if (!(closure.gap_arm_fraction > closure.gap_floor_fraction)) {
+    throw ValueError(closure_path +
+                     ".gap_arm_fraction must be greater than "
+                     "gap_floor_fraction");
+  }
+  if (!(std::isfinite(closure.release_force_c) &&
+        closure.release_force_c > 0.0)) {
+    throw ValueError(closure_path +
+                     ".release_force_c must be finite and > 0");
+  }
+  ensure_int_ge(closure.release_persistence_stages,
+                1,
+                closure_path + ".release_persistence_stages");
+  if (closure.lcp_apply_enabled && !closure.surface_engage_enabled) {
+    throw ConfigError(
+        closure_path + ".lcp_apply_enabled=true requires " +
+        closure_path + ".surface_engage_enabled=true");
+  }
+  const auto& collapse = closure.axis_edge_collapse;
+  const std::string collapse_path = closure_path + ".axis_edge_collapse";
+  if (collapse.persistence_window < 2 ||
+      collapse.persistence_window > 8) {
+    throw ValueError(collapse_path +
+                     ".persistence_window must be in [2, 8]");
+  }
+  if (collapse.persistence_min_closing < 1 ||
+      collapse.persistence_min_closing > collapse.persistence_window) {
+    throw ValueError(
+        collapse_path +
+        ".persistence_min_closing must be in [1, persistence_window]");
+  }
+  const auto& strip = closure.flank_tangential_strip;
+  const std::string strip_path =
+      closure_path + ".flank_tangential_strip";
+  if (strip.band_layers < 1 || strip.band_layers > 3) {
+    throw ValueError(strip_path + ".band_layers must be in [1, 3]");
+  }
+  if (strip.band_halfwidth_j < 1 || strip.band_halfwidth_j > 32) {
+    throw ValueError(
+        strip_path + ".band_halfwidth_j must be in [1, 32]");
+  }
+  if (!(std::isfinite(strip.arm_quality_ratio) &&
+        std::isfinite(strip.release_quality_ratio) &&
+        strip.arm_quality_ratio > 0.0 &&
+        strip.arm_quality_ratio < strip.release_quality_ratio &&
+        strip.release_quality_ratio <= 1.0)) {
+    throw ValueError(
+        strip_path +
+        " quality ratios must satisfy 0 < arm_quality_ratio < "
+        "release_quality_ratio <= 1");
+  }
+  if (!(strip.min_progress_factor > 1.0)) {
+    throw ConfigError(strip_path + ".min_progress_factor must be > 1.0");
+  }
+  if (!(std::isfinite(strip.slip_handoff_ratio) &&
+        strip.slip_handoff_ratio > 0.0)) {
+    throw ConfigError(strip_path + ".slip_handoff_ratio must be > 0.0");
   }
 }
 
@@ -1420,11 +3002,30 @@ void Builder::set_mesh(py::dict kwargs) {
                       "multiblock_cart_core_r_match",
                       "multiblock_cart_core_n_c",
                       "multiblock_cart_core_bridge_layers",
+                      "polar_tier_cart_cut_ring",
+                      "polar_tier_center_kind",
                       "multiblock_cart_core_bridge_grading",
+                      "multiblock_cart_core_bridge_spacing_floor",
+                      "multiblock_cart_core_bridge_ratio_max",
+                      "multiblock_theta_cap_widen_factor",
                       "multiblock_transition_scheme",
                       "multiblock_cap_p",
                       "multiblock_bridge_elliptic_sweeps",
                       "multiblock_bridge_elliptic_omega",
+                      "polar_tier_chi_lo", "polar_tier_chi_hi",
+                      "polar_tier_belt_thickness_frac",
+                      "polar_tier_belt_rows",
+                      "polar_tier_pole_cap_m",
+                      "polar_tier_pole_cap_alpha",
+                      "polar_tier_dendrite_enabled",
+                      "polar_tier_native_pentagon",
+                      "shell_polar_cap_dendrite",
+                      "shell_cap_rows_2x",
+                      "polar_tier_dendrite_s_theta_rows_below",
+                      "polar_tier_fan_sectors",
+                      "polar_tier_min_tier_columns",
+                      "polar_tier_fan_first_ring_radius_cm",
+                      "polar_tier_hydro_enabled",
                       "multiblock_outer_svec_tangent_balance", "floors"});
 
   auto& mesh = config.mesh;
@@ -1450,8 +3051,16 @@ void Builder::set_mesh(py::dict kwargs) {
   mesh.multiblock_cart_core_r_match = std::numeric_limits<double>::quiet_NaN();
   mesh.multiblock_cart_core_n_c = -1;
   mesh.multiblock_cart_core_bridge_layers = -1;
+  mesh.polar_tier_cart_cut_ring = -1;
+  mesh.polar_tier_center_kind = mesh_defaults.polar_tier_center_kind;
   mesh.multiblock_cart_core_bridge_grading =
       mesh_defaults.multiblock_cart_core_bridge_grading;
+  mesh.multiblock_cart_core_bridge_spacing_floor =
+      mesh_defaults.multiblock_cart_core_bridge_spacing_floor;
+  mesh.multiblock_cart_core_bridge_ratio_max =
+      mesh_defaults.multiblock_cart_core_bridge_ratio_max;
+  mesh.multiblock_theta_cap_widen_factor =
+      mesh_defaults.multiblock_theta_cap_widen_factor;
   mesh.multiblock_transition_scheme =
       mesh_defaults.multiblock_transition_scheme;
   mesh.multiblock_cap_p = mesh_defaults.multiblock_cap_p;
@@ -1459,6 +3068,29 @@ void Builder::set_mesh(py::dict kwargs) {
       mesh_defaults.multiblock_bridge_elliptic_sweeps;
   mesh.multiblock_bridge_elliptic_omega =
       mesh_defaults.multiblock_bridge_elliptic_omega;
+  mesh.polar_tier_chi_lo = mesh_defaults.polar_tier_chi_lo;
+  mesh.polar_tier_chi_hi = mesh_defaults.polar_tier_chi_hi;
+  mesh.polar_tier_belt_thickness_frac =
+      mesh_defaults.polar_tier_belt_thickness_frac;
+  mesh.polar_tier_belt_rows = mesh_defaults.polar_tier_belt_rows;
+  mesh.polar_tier_pole_cap_m = mesh_defaults.polar_tier_pole_cap_m;
+  mesh.polar_tier_pole_cap_alpha = mesh_defaults.polar_tier_pole_cap_alpha;
+  mesh.polar_tier_dendrite_enabled =
+      mesh_defaults.polar_tier_dendrite_enabled;
+  mesh.polar_tier_native_pentagon =
+      mesh_defaults.polar_tier_native_pentagon;
+  mesh.shell_polar_cap_dendrite =
+      mesh_defaults.shell_polar_cap_dendrite;
+  mesh.shell_cap_rows_2x = mesh_defaults.shell_cap_rows_2x;
+  mesh.polar_tier_dendrite_s_theta_rows_below =
+      mesh_defaults.polar_tier_dendrite_s_theta_rows_below;
+  mesh.polar_tier_fan_sectors = mesh_defaults.polar_tier_fan_sectors;
+  mesh.polar_tier_min_tier_columns =
+      mesh_defaults.polar_tier_min_tier_columns;
+  mesh.polar_tier_fan_first_ring_radius_cm =
+      mesh_defaults.polar_tier_fan_first_ring_radius_cm;
+  mesh.polar_tier_hydro_enabled =
+      mesh_defaults.polar_tier_hydro_enabled;
   mesh.multiblock_outer_svec_tangent_balance =
       mesh_defaults.multiblock_outer_svec_tangent_balance;
   bool grading_specified = false;
@@ -1948,25 +3580,136 @@ void Builder::set_mesh(py::dict kwargs) {
       has_key(kwargs, "multiblock_cart_core_n_c") ||
       has_key(kwargs, "multiblock_cart_core_bridge_layers") ||
       has_key(kwargs, "multiblock_cart_core_bridge_grading") ||
+      has_key(kwargs, "multiblock_cart_core_bridge_spacing_floor") ||
+      has_key(kwargs, "multiblock_cart_core_bridge_ratio_max") ||
+      has_key(kwargs, "multiblock_transition_scheme") ||
+      has_key(kwargs, "multiblock_cap_p") ||
+      has_key(kwargs, "multiblock_bridge_elliptic_sweeps") ||
+      has_key(kwargs, "multiblock_bridge_elliptic_omega") ||
+      has_key(kwargs, "polar_tier_chi_lo") ||
+      has_key(kwargs, "polar_tier_chi_hi") ||
+      has_key(kwargs, "polar_tier_belt_thickness_frac") ||
+      has_key(kwargs, "polar_tier_belt_rows") ||
+      has_key(kwargs, "polar_tier_pole_cap_m") ||
+      has_key(kwargs, "polar_tier_pole_cap_alpha") ||
+      has_key(kwargs, "polar_tier_dendrite_enabled") ||
+      has_key(kwargs, "polar_tier_native_pentagon") ||
+      has_key(kwargs, "shell_polar_cap_dendrite") ||
+      has_key(kwargs, "shell_cap_rows_2x") ||
+      has_key(kwargs, "polar_tier_dendrite_s_theta_rows_below") ||
+      has_key(kwargs, "polar_tier_fan_sectors") ||
+      has_key(kwargs, "polar_tier_min_tier_columns") ||
+      has_key(kwargs, "polar_tier_fan_first_ring_radius_cm") ||
+      has_key(kwargs, "polar_tier_hydro_enabled") ||
+      has_key(kwargs, "multiblock_outer_svec_tangent_balance");
+  const bool has_polar_tier_key =
+      has_key(kwargs, "polar_tier_chi_lo") ||
+      has_key(kwargs, "polar_tier_chi_hi") ||
+      has_key(kwargs, "polar_tier_belt_thickness_frac") ||
+      has_key(kwargs, "polar_tier_belt_rows") ||
+      has_key(kwargs, "polar_tier_pole_cap_m") ||
+      has_key(kwargs, "polar_tier_pole_cap_alpha") ||
+      has_key(kwargs, "polar_tier_dendrite_enabled") ||
+      has_key(kwargs, "polar_tier_native_pentagon") ||
+      has_key(kwargs, "shell_polar_cap_dendrite") ||
+      has_key(kwargs, "shell_cap_rows_2x") ||
+      has_key(kwargs, "polar_tier_dendrite_s_theta_rows_below") ||
+      has_key(kwargs, "polar_tier_fan_sectors") ||
+      has_key(kwargs, "polar_tier_min_tier_columns") ||
+      has_key(kwargs, "polar_tier_fan_first_ring_radius_cm") ||
+      has_key(kwargs, "polar_tier_hydro_enabled");
+  const bool has_cart_center_key =
+      has_key(kwargs, "multiblock_cart_core_r_c") ||
+      has_key(kwargs, "multiblock_cart_core_n_c") ||
+      has_key(kwargs, "multiblock_cart_core_bridge_layers") ||
+      has_key(kwargs, "multiblock_cart_core_bridge_grading") ||
+      has_key(kwargs, "multiblock_cart_core_bridge_spacing_floor") ||
+      has_key(kwargs, "multiblock_cart_core_bridge_ratio_max") ||
+      has_key(kwargs, "center_button_outer_node_ring") ||
+      has_key(kwargs, "multiblock_theta_cap_widen_factor") ||
       has_key(kwargs, "multiblock_transition_scheme") ||
       has_key(kwargs, "multiblock_cap_p") ||
       has_key(kwargs, "multiblock_bridge_elliptic_sweeps") ||
       has_key(kwargs, "multiblock_bridge_elliptic_omega") ||
       has_key(kwargs, "multiblock_outer_svec_tangent_balance");
+  if (has_polar_tier_key &&
+      mesh.topology_scheme != TopologyScheme::MULTIBLOCK_POLAR_TIER &&
+      mesh.topology_scheme !=
+          TopologyScheme::MULTIBLOCK_POLAR_TIER_CART_CENTER) {
+    throw ConfigError(
+        "Mesh.polar_tier_* keys require "
+        "Mesh.topology_scheme=\"multiblock_polar_tier\" or "
+        "\"multiblock_polar_tier_cart_center\"");
+  }
+  if (mesh.topology_scheme == TopologyScheme::MULTIBLOCK_POLAR_TIER &&
+      has_cart_center_key) {
+    throw ConfigError(
+        "Mesh.topology_scheme=\"multiblock_polar_tier\" rejects "
+        "cart-core/button/tri-fan-specific multiblock keys");
+  }
+  if (has_key(kwargs, "polar_tier_cart_cut_ring")) {
+    mesh.polar_tier_cart_cut_ring =
+        strict_int32(kwargs["polar_tier_cart_cut_ring"],
+                     "Mesh.polar_tier_cart_cut_ring");
+  }
+  if (mesh.polar_tier_cart_cut_ring != -1 &&
+      mesh.topology_scheme !=
+          TopologyScheme::MULTIBLOCK_POLAR_TIER_CART_CENTER) {
+    throw ConfigError(
+        "Mesh.polar_tier_cart_cut_ring requires "
+        "Mesh.topology_scheme=\"multiblock_polar_tier_cart_center\"");
+  }
+  if (has_key(kwargs, "polar_tier_center_kind")) {
+    mesh.polar_tier_center_kind = strict_string(
+        kwargs["polar_tier_center_kind"],
+        "Mesh.polar_tier_center_kind");
+  }
+  if (mesh.polar_tier_center_kind != "cart_box" &&
+      mesh.polar_tier_center_kind != "trifan_cap") {
+    throw ValueError(
+        "Mesh.polar_tier_center_kind must be one of "
+        "{\"cart_box\", \"trifan_cap\"}");
+  }
+  if (mesh.polar_tier_center_kind != "cart_box" &&
+      mesh.topology_scheme !=
+          TopologyScheme::MULTIBLOCK_POLAR_TIER_CART_CENTER) {
+    throw ConfigError(
+        "Mesh.polar_tier_center_kind is only meaningful for "
+        "Mesh.topology_scheme=\"multiblock_polar_tier_cart_center\"");
+  }
   if (has_key(kwargs, "multiblock_cart_core_bridge_grading") &&
       mesh.topology_scheme !=
-          TopologyScheme::MULTIBLOCK_CART_CORE_POLAR_SHELL) {
+          TopologyScheme::MULTIBLOCK_CART_CORE_POLAR_SHELL &&
+      mesh.topology_scheme !=
+          TopologyScheme::MULTIBLOCK_POLAR_TIER_CART_CENTER) {
     throw ConfigError(
         "multiblock_cart_core_bridge_grading requires "
-        "multiblock_cart_core_polar_shell topology");
+        "multiblock_cart_core_polar_shell or "
+        "multiblock_polar_tier_cart_center topology");
+  }
+  if (has_key(kwargs, "multiblock_cart_core_bridge_spacing_floor") &&
+      mesh.topology_scheme !=
+          TopologyScheme::MULTIBLOCK_POLAR_TIER_CART_CENTER) {
+    throw ConfigError(
+        "multiblock_cart_core_bridge_spacing_floor requires "
+        "multiblock_polar_tier_cart_center topology");
+  }
+  if (has_key(kwargs, "multiblock_cart_core_bridge_ratio_max") &&
+      mesh.topology_scheme !=
+          TopologyScheme::MULTIBLOCK_POLAR_TIER_CART_CENTER) {
+    throw ConfigError(
+        "multiblock_cart_core_bridge_ratio_max requires "
+        "multiblock_polar_tier_cart_center topology");
   }
   if (mesh.topology_scheme == TopologyScheme::SINGLE_BLOCK && has_multiblock_key) {
     throw ConfigError(
         "Mesh.multiblock_* requires "
         "Mesh.topology_scheme=\"multiblock_cart_core_polar_shell\" or "
         "\"multiblock_half_butterfly_5block\" or "
-        "\"multiblock_half_butterfly_trifan_cap_5block\" or "
-        "\"pentagon_belt_shell\"");
+        "\"multiblock_half_butterfly_trifan_cap_5block\", "
+        "\"pentagon_belt_shell\" or "
+        "\"multiblock_polar_tier\" or "
+        "\"multiblock_polar_tier_cart_center\"");
   }
   if (has_key(kwargs, "multiblock_cart_core_r_c")) {
     mesh.multiblock_cart_core_r_c =
@@ -1993,11 +3736,68 @@ void Builder::set_mesh(py::dict kwargs) {
         kwargs["multiblock_cart_core_bridge_grading"],
         "Mesh.multiblock_cart_core_bridge_grading");
     if (mesh.multiblock_cart_core_bridge_grading != "uniform" &&
-        mesh.multiblock_cart_core_bridge_grading != "quintic_log") {
+        mesh.multiblock_cart_core_bridge_grading != "quintic_log" &&
+        mesh.multiblock_cart_core_bridge_grading != "log") {
       throw ConfigError(
           "Mesh.multiblock_cart_core_bridge_grading must be one of "
-          "{\"uniform\", \"quintic_log\"}, got " +
+          "{\"uniform\", \"quintic_log\", \"log\"}, got " +
           mesh.multiblock_cart_core_bridge_grading);
+    }
+  }
+  if (has_key(kwargs, "multiblock_cart_core_bridge_spacing_floor")) {
+    mesh.multiblock_cart_core_bridge_spacing_floor = numeric_as_double(
+        kwargs["multiblock_cart_core_bridge_spacing_floor"],
+        "Mesh.multiblock_cart_core_bridge_spacing_floor");
+    if (!(std::isfinite(mesh.multiblock_cart_core_bridge_spacing_floor) &&
+          mesh.multiblock_cart_core_bridge_spacing_floor >= 0.0)) {
+      throw ConfigError(
+          "Mesh.multiblock_cart_core_bridge_spacing_floor must be finite "
+          "and >= 0");
+    }
+    if (mesh.multiblock_cart_core_bridge_spacing_floor > 0.0 &&
+        mesh.multiblock_cart_core_bridge_grading != "log") {
+      throw ConfigError(
+          "Mesh.multiblock_cart_core_bridge_spacing_floor > 0 requires "
+          "Mesh.multiblock_cart_core_bridge_grading=\"log\"");
+    }
+  }
+  if (has_key(kwargs, "multiblock_cart_core_bridge_ratio_max")) {
+    mesh.multiblock_cart_core_bridge_ratio_max = numeric_as_double(
+        kwargs["multiblock_cart_core_bridge_ratio_max"],
+        "Mesh.multiblock_cart_core_bridge_ratio_max");
+    if (!(std::isfinite(mesh.multiblock_cart_core_bridge_ratio_max) &&
+          mesh.multiblock_cart_core_bridge_ratio_max > 1.0)) {
+      throw ConfigError(
+          "Mesh.multiblock_cart_core_bridge_ratio_max must be finite and "
+          "> 1");
+    }
+    if (mesh.multiblock_cart_core_bridge_grading != "log") {
+      throw ConfigError(
+          "Mesh.multiblock_cart_core_bridge_ratio_max requires "
+          "Mesh.multiblock_cart_core_bridge_grading=\"log\"");
+    }
+  }
+  if (has_key(kwargs, "multiblock_theta_cap_widen_factor")) {
+    mesh.multiblock_theta_cap_widen_factor = numeric_as_double(
+        kwargs["multiblock_theta_cap_widen_factor"],
+        "Mesh.multiblock_theta_cap_widen_factor");
+    if (!(std::isfinite(mesh.multiblock_theta_cap_widen_factor) &&
+          mesh.multiblock_theta_cap_widen_factor >= 1.0)) {
+      throw ValueError(
+          "Mesh.multiblock_theta_cap_widen_factor must be finite and >= 1");
+    }
+    if (mesh.multiblock_theta_cap_widen_factor != 1.0 &&
+        mesh.topology_scheme !=
+            TopologyScheme::MULTIBLOCK_CART_CORE_POLAR_SHELL) {
+      throw ConfigError(
+          "multiblock_theta_cap_widen_factor requires "
+          "multiblock_cart_core topology");
+    }
+    if (mesh.multiblock_theta_cap_widen_factor != 1.0 &&
+        mesh.logical_mesh_2d == "polar_in_box") {
+      throw ConfigError(
+          "multiblock_theta_cap_widen_factor is not supported with "
+          "polar_in_box (exterior theta ladder is equiangular)");
     }
   }
   if (has_key(kwargs, "multiblock_transition_scheme")) {
@@ -2034,13 +3834,152 @@ void Builder::set_mesh(py::dict kwargs) {
           "Mesh.multiblock_bridge_elliptic_omega must be finite and in (0, 2)");
     }
   }
+  if (has_key(kwargs, "polar_tier_chi_lo")) {
+    mesh.polar_tier_chi_lo =
+        numeric_as_double(kwargs["polar_tier_chi_lo"],
+                          "Mesh.polar_tier_chi_lo");
+  }
+  if (has_key(kwargs, "polar_tier_chi_hi")) {
+    mesh.polar_tier_chi_hi =
+        numeric_as_double(kwargs["polar_tier_chi_hi"],
+                          "Mesh.polar_tier_chi_hi");
+  }
+  if (!(std::isfinite(mesh.polar_tier_chi_lo) &&
+        std::isfinite(mesh.polar_tier_chi_hi) &&
+        mesh.polar_tier_chi_lo > 0.0 &&
+        mesh.polar_tier_chi_hi > mesh.polar_tier_chi_lo)) {
+    throw ValueError(
+        "Mesh.polar_tier_chi_lo/chi_hi must be finite with "
+        "0 < chi_lo < chi_hi");
+  }
+  if (has_key(kwargs, "polar_tier_belt_thickness_frac")) {
+    mesh.polar_tier_belt_thickness_frac =
+        numeric_as_double(kwargs["polar_tier_belt_thickness_frac"],
+                          "Mesh.polar_tier_belt_thickness_frac");
+  }
+  if (!(std::isfinite(mesh.polar_tier_belt_thickness_frac) &&
+        mesh.polar_tier_belt_thickness_frac >= 0.0 &&
+        mesh.polar_tier_belt_thickness_frac <= 0.9)) {
+    throw ValueError(
+        "Mesh.polar_tier_belt_thickness_frac must be finite and in [0, 0.9]");
+  }
+  if (has_key(kwargs, "polar_tier_belt_rows")) {
+    mesh.polar_tier_belt_rows =
+        strict_int32(kwargs["polar_tier_belt_rows"],
+                     "Mesh.polar_tier_belt_rows");
+  }
+  if (mesh.polar_tier_belt_rows != 1 &&
+      mesh.polar_tier_belt_rows != 2 &&
+      mesh.polar_tier_belt_rows != 3) {
+    throw ValueError(
+        "Mesh.polar_tier_belt_rows must be one of {1, 2, 3}");
+  }
+  if (has_key(kwargs, "polar_tier_pole_cap_m")) {
+    mesh.polar_tier_pole_cap_m =
+        strict_int32(kwargs["polar_tier_pole_cap_m"],
+                     "Mesh.polar_tier_pole_cap_m");
+  }
+  if (mesh.polar_tier_pole_cap_m != 0 &&
+      (mesh.polar_tier_pole_cap_m < 4 ||
+       mesh.polar_tier_pole_cap_m > 48)) {
+    throw ValueError(
+        "Mesh.polar_tier_pole_cap_m must be 0 or in [4, 48]");
+  }
+  if (has_key(kwargs, "polar_tier_pole_cap_alpha")) {
+    mesh.polar_tier_pole_cap_alpha =
+        numeric_as_double(kwargs["polar_tier_pole_cap_alpha"],
+                          "Mesh.polar_tier_pole_cap_alpha");
+  }
+  if (!(std::isfinite(mesh.polar_tier_pole_cap_alpha) &&
+        mesh.polar_tier_pole_cap_alpha >= 0.0 &&
+        mesh.polar_tier_pole_cap_alpha <= 1.0)) {
+    throw ValueError(
+        "Mesh.polar_tier_pole_cap_alpha must be finite and in [0, 1]");
+  }
+  if (has_key(kwargs, "polar_tier_dendrite_enabled")) {
+    mesh.polar_tier_dendrite_enabled =
+        strict_bool(kwargs["polar_tier_dendrite_enabled"],
+                    "Mesh.polar_tier_dendrite_enabled");
+  }
+  if (has_key(kwargs, "polar_tier_native_pentagon")) {
+    mesh.polar_tier_native_pentagon =
+        strict_bool(kwargs["polar_tier_native_pentagon"],
+                    "Mesh.polar_tier_native_pentagon");
+  }
+  if (has_key(kwargs, "shell_polar_cap_dendrite")) {
+    mesh.shell_polar_cap_dendrite =
+        strict_bool(kwargs["shell_polar_cap_dendrite"],
+                    "Mesh.shell_polar_cap_dendrite");
+  }
+  if (has_key(kwargs, "shell_cap_rows_2x")) {
+    mesh.shell_cap_rows_2x =
+        strict_int32(kwargs["shell_cap_rows_2x"],
+                     "Mesh.shell_cap_rows_2x");
+  }
+  if (mesh.shell_cap_rows_2x < 12 || mesh.shell_cap_rows_2x > 288 ||
+      mesh.shell_cap_rows_2x == 287) {
+    throw ValueError(
+        "Mesh.shell_cap_rows_2x must be in [12, 286] or equal 288");
+  }
+  if (has_key(kwargs, "polar_tier_dendrite_s_theta_rows_below")) {
+    mesh.polar_tier_dendrite_s_theta_rows_below = strict_int32(
+        kwargs["polar_tier_dendrite_s_theta_rows_below"],
+        "Mesh.polar_tier_dendrite_s_theta_rows_below");
+  }
+  if (mesh.polar_tier_dendrite_s_theta_rows_below < 1 ||
+      mesh.polar_tier_dendrite_s_theta_rows_below > 40) {
+    throw ValueError(
+        "Mesh.polar_tier_dendrite_s_theta_rows_below must be in [1, 40]");
+  }
+  if (has_key(kwargs, "polar_tier_fan_sectors")) {
+    mesh.polar_tier_fan_sectors =
+        strict_int32(kwargs["polar_tier_fan_sectors"],
+                     "Mesh.polar_tier_fan_sectors");
+  }
+  if (mesh.polar_tier_fan_sectors != 6 &&
+      mesh.polar_tier_fan_sectors != 12) {
+    throw ValueError(
+        "Mesh.polar_tier_fan_sectors must be 6 or 12");
+  }
+  if (has_key(kwargs, "polar_tier_min_tier_columns")) {
+    mesh.polar_tier_min_tier_columns =
+        strict_int32(kwargs["polar_tier_min_tier_columns"],
+                     "Mesh.polar_tier_min_tier_columns");
+    ensure_int_ge(mesh.polar_tier_min_tier_columns, 1,
+                  "Mesh.polar_tier_min_tier_columns");
+  }
+  if (has_key(kwargs, "polar_tier_fan_first_ring_radius_cm")) {
+    mesh.polar_tier_fan_first_ring_radius_cm =
+        numeric_as_double(
+            kwargs["polar_tier_fan_first_ring_radius_cm"],
+            "Mesh.polar_tier_fan_first_ring_radius_cm");
+  }
+  if (!(std::isfinite(mesh.polar_tier_fan_first_ring_radius_cm) &&
+        mesh.polar_tier_fan_first_ring_radius_cm >= 0.0)) {
+    throw ValueError(
+        "Mesh.polar_tier_fan_first_ring_radius_cm must be finite and >= 0");
+  }
+  if (has_key(kwargs, "polar_tier_hydro_enabled")) {
+    mesh.polar_tier_hydro_enabled =
+        strict_bool(kwargs["polar_tier_hydro_enabled"],
+                    "Mesh.polar_tier_hydro_enabled");
+  }
+  validate_polar_tier_dendrite_config(mesh);
   if (has_key(kwargs, "multiblock_outer_svec_tangent_balance")) {
     mesh.multiblock_outer_svec_tangent_balance = strict_bool(
         kwargs["multiblock_outer_svec_tangent_balance"],
         "Mesh.multiblock_outer_svec_tangent_balance");
   }
-  if (mesh.topology_scheme != TopologyScheme::SINGLE_BLOCK &&
-      mesh.topology_scheme != TopologyScheme::PENTAGON_BELT_SHELL) {
+  if (mesh.topology_scheme == TopologyScheme::MULTIBLOCK_POLAR_TIER ||
+      mesh.topology_scheme ==
+          TopologyScheme::MULTIBLOCK_POLAR_TIER_CART_CENTER) {
+    if (std::isnan(mesh.multiblock_cart_core_r_match)) {
+      mesh.multiblock_cart_core_r_match =
+          mesh.spherical_polar_s_max / 6.0;
+    }
+  } else if (mesh.topology_scheme != TopologyScheme::SINGLE_BLOCK &&
+             mesh.topology_scheme !=
+                 TopologyScheme::PENTAGON_BELT_SHELL) {
     if (std::isnan(mesh.multiblock_cart_core_r_c)) {
       mesh.multiblock_cart_core_r_c = mesh.spherical_polar_s_max / 12.0;
     }
@@ -5798,7 +7737,7 @@ void Builder::set_numerics(py::dict kwargs) {
   enforce_known_keys(kwargs, "Numerics",
                      {"splitting_order", "splitting", "T_start_eV", "coulomb_log_floor",
                       "has_physical_rz_axis",
-                      "persistent_loop", "dt", "debug", "hydro", "conduction", "ale",
+                      "persistent_loop", "z_reflection", "dt", "debug", "hydro", "conduction", "ale",
                       "plic", "materials", "ale1d",
                       "floors", "positivity", "safety", "cell_search", "diagnostics",
                       "diagnostics_every", "profile", "cfl",
@@ -5865,6 +7804,20 @@ void Builder::set_numerics(py::dict kwargs) {
           persistent_loop["chunk_steps"], "Numerics.persistent_loop.chunk_steps");
     }
   }
+  if (has_key(kwargs, "z_reflection")) {
+    const py::handle z_reflection_obj = kwargs["z_reflection"];
+    if (!py::isinstance<py::dict>(z_reflection_obj)) {
+      throw_value_type_error(
+          "Numerics.z_reflection", "dict", z_reflection_obj);
+    }
+    const py::dict z_reflection =
+        py::reinterpret_borrow<py::dict>(z_reflection_obj);
+    enforce_known_keys(z_reflection, "Numerics.z_reflection", {"mode"});
+    if (has_key(z_reflection, "mode")) {
+      numerics.z_reflection.mode = strict_string(
+          z_reflection["mode"], "Numerics.z_reflection.mode");
+    }
+  }
   if (has_key(kwargs, "debug")) {
     const py::handle debug_obj = kwargs["debug"];
     if (!py::isinstance<py::dict>(debug_obj)) {
@@ -5919,7 +7872,11 @@ void Builder::set_numerics(py::dict kwargs) {
                         "icf",
                         "hotspot_gas",
                         "conservation",
+                        "refinement_estimator",
+                        "refinement_autopilot",
+                        "evacuated_cell_shadow",
                         "ale_provenance_emission",
+                        "conduction_energy_rate_export",
                         "mesh_quality_min",
                         "shock_approach",
                         "ale_velcoherence",
@@ -6048,6 +8005,347 @@ void Builder::set_numerics(py::dict kwargs) {
                         "Numerics.diagnostics.conservation.enabled");
       }
     }
+    if (has_key(diagnostics, "refinement_estimator")) {
+      const py::handle estimator_obj = diagnostics["refinement_estimator"];
+      if (!py::isinstance<py::dict>(estimator_obj)) {
+        throw_value_type_error("Numerics.diagnostics.refinement_estimator",
+                               "dict",
+                               estimator_obj);
+      }
+      const py::dict estimator =
+          py::reinterpret_borrow<py::dict>(estimator_obj);
+      enforce_known_keys(estimator,
+                         "Numerics.diagnostics.refinement_estimator",
+                         {"enabled", "every", "filter_eps", "detect_cutoff"});
+      auto& cfg_estimator = numerics.diagnostics.refinement_estimator;
+      if (has_key(estimator, "enabled")) {
+        cfg_estimator.enabled = strict_bool(
+            estimator["enabled"],
+            "Numerics.diagnostics.refinement_estimator.enabled");
+      }
+      if (has_key(estimator, "every")) {
+        cfg_estimator.every = strict_int32(
+            estimator["every"],
+            "Numerics.diagnostics.refinement_estimator.every");
+        ensure_int_ge(cfg_estimator.every,
+                      1,
+                      "Numerics.diagnostics.refinement_estimator.every");
+      }
+      if (has_key(estimator, "filter_eps")) {
+        cfg_estimator.filter_eps = numeric_as_double(
+            estimator["filter_eps"],
+            "Numerics.diagnostics.refinement_estimator.filter_eps");
+        if (!(std::isfinite(cfg_estimator.filter_eps) &&
+              cfg_estimator.filter_eps > 0.0)) {
+          throw ValueError(
+              "Numerics.diagnostics.refinement_estimator.filter_eps must be "
+              "finite and > 0");
+        }
+      }
+      if (has_key(estimator, "detect_cutoff")) {
+        cfg_estimator.detect_cutoff = numeric_as_double(
+            estimator["detect_cutoff"],
+            "Numerics.diagnostics.refinement_estimator.detect_cutoff");
+        if (!(std::isfinite(cfg_estimator.detect_cutoff) &&
+              cfg_estimator.detect_cutoff > 0.0 &&
+              cfg_estimator.detect_cutoff < 1.0)) {
+          throw ValueError(
+              "Numerics.diagnostics.refinement_estimator.detect_cutoff must "
+              "be finite and in (0, 1)");
+        }
+      }
+    }
+    if (has_key(diagnostics, "refinement_autopilot")) {
+      const py::handle autopilot_obj = diagnostics["refinement_autopilot"];
+      if (!py::isinstance<py::dict>(autopilot_obj)) {
+        throw_value_type_error("Numerics.diagnostics.refinement_autopilot",
+                               "dict",
+                               autopilot_obj);
+      }
+      const py::dict autopilot =
+          py::reinterpret_borrow<py::dict>(autopilot_obj);
+      enforce_known_keys(autopilot,
+                         "Numerics.diagnostics.refinement_autopilot",
+                         {"enabled",
+                          "mode",
+                          "ckpt_lead_h",
+                          "e_on",
+                          "e_off",
+                          "assoc_cut",
+                          "strong_cut",
+                          "gap_bridge",
+                          "persist",
+                          "n_q_plan",
+                          "chi_design",
+                          "s_rep_cm",
+                          "handoff_cm",
+                          "window_lo_h",
+                          "window_hi_h",
+                          "history",
+                          "cov_min"});
+      auto& cfg_autopilot = numerics.diagnostics.refinement_autopilot;
+      if (has_key(autopilot, "enabled")) {
+        cfg_autopilot.enabled = strict_bool(
+            autopilot["enabled"],
+            "Numerics.diagnostics.refinement_autopilot.enabled");
+      }
+      if (has_key(autopilot, "mode")) {
+        cfg_autopilot.mode = strict_string(
+            autopilot["mode"],
+            "Numerics.diagnostics.refinement_autopilot.mode");
+      }
+      if (has_key(autopilot, "ckpt_lead_h")) {
+        cfg_autopilot.ckpt_lead_h = numeric_as_double(
+            autopilot["ckpt_lead_h"],
+            "Numerics.diagnostics.refinement_autopilot.ckpt_lead_h");
+      }
+      if (has_key(autopilot, "e_on")) {
+        cfg_autopilot.e_on = numeric_as_double(
+            autopilot["e_on"],
+            "Numerics.diagnostics.refinement_autopilot.e_on");
+      }
+      if (has_key(autopilot, "e_off")) {
+        cfg_autopilot.e_off = numeric_as_double(
+            autopilot["e_off"],
+            "Numerics.diagnostics.refinement_autopilot.e_off");
+      }
+      if (has_key(autopilot, "assoc_cut")) {
+        cfg_autopilot.assoc_cut = numeric_as_double(
+            autopilot["assoc_cut"],
+            "Numerics.diagnostics.refinement_autopilot.assoc_cut");
+      }
+      if (has_key(autopilot, "strong_cut")) {
+        cfg_autopilot.strong_cut = numeric_as_double(
+            autopilot["strong_cut"],
+            "Numerics.diagnostics.refinement_autopilot.strong_cut");
+      }
+      if (has_key(autopilot, "gap_bridge")) {
+        cfg_autopilot.gap_bridge = strict_int32(
+            autopilot["gap_bridge"],
+            "Numerics.diagnostics.refinement_autopilot.gap_bridge");
+      }
+      if (has_key(autopilot, "persist")) {
+        cfg_autopilot.persist = strict_int32(
+            autopilot["persist"],
+            "Numerics.diagnostics.refinement_autopilot.persist");
+      }
+      if (has_key(autopilot, "n_q_plan")) {
+        cfg_autopilot.n_q_plan = numeric_as_double(
+            autopilot["n_q_plan"],
+            "Numerics.diagnostics.refinement_autopilot.n_q_plan");
+      }
+      if (has_key(autopilot, "chi_design")) {
+        cfg_autopilot.chi_design = numeric_as_double(
+            autopilot["chi_design"],
+            "Numerics.diagnostics.refinement_autopilot.chi_design");
+      }
+      if (has_key(autopilot, "s_rep_cm")) {
+        cfg_autopilot.s_rep_cm = numeric_as_double(
+            autopilot["s_rep_cm"],
+            "Numerics.diagnostics.refinement_autopilot.s_rep_cm");
+      }
+      if (has_key(autopilot, "handoff_cm")) {
+        cfg_autopilot.handoff_cm = numeric_as_double(
+            autopilot["handoff_cm"],
+            "Numerics.diagnostics.refinement_autopilot.handoff_cm");
+      }
+      if (has_key(autopilot, "window_lo_h")) {
+        cfg_autopilot.window_lo_h = numeric_as_double(
+            autopilot["window_lo_h"],
+            "Numerics.diagnostics.refinement_autopilot.window_lo_h");
+      }
+      if (has_key(autopilot, "window_hi_h")) {
+        cfg_autopilot.window_hi_h = numeric_as_double(
+            autopilot["window_hi_h"],
+            "Numerics.diagnostics.refinement_autopilot.window_hi_h");
+      }
+      if (has_key(autopilot, "history")) {
+        cfg_autopilot.history = strict_int32(
+            autopilot["history"],
+            "Numerics.diagnostics.refinement_autopilot.history");
+      }
+      if (has_key(autopilot, "cov_min")) {
+        cfg_autopilot.cov_min = numeric_as_double(
+            autopilot["cov_min"],
+            "Numerics.diagnostics.refinement_autopilot.cov_min");
+      }
+
+      const auto in_open_unit_interval = [](const double value) {
+        return std::isfinite(value) && value > 0.0 && value < 1.0;
+      };
+      if (cfg_autopilot.mode != "shadow" &&
+          cfg_autopilot.mode != "arm_exit") {
+        throw ValueError(
+            "Numerics.diagnostics.refinement_autopilot.mode must be exactly "
+            "\"shadow\" or \"arm_exit\"");
+      }
+      if (!(std::isfinite(cfg_autopilot.ckpt_lead_h) &&
+            cfg_autopilot.ckpt_lead_h > 0.0)) {
+        throw ValueError(
+            "Numerics.diagnostics.refinement_autopilot.ckpt_lead_h must be "
+            "finite and > 0");
+      }
+      if (!in_open_unit_interval(cfg_autopilot.e_on)) {
+        throw ValueError(
+            "Numerics.diagnostics.refinement_autopilot.e_on must be finite "
+            "and in (0, 1)");
+      }
+      if (!in_open_unit_interval(cfg_autopilot.e_off)) {
+        throw ValueError(
+            "Numerics.diagnostics.refinement_autopilot.e_off must be finite "
+            "and in (0, 1)");
+      }
+      if (!in_open_unit_interval(cfg_autopilot.assoc_cut)) {
+        throw ValueError(
+            "Numerics.diagnostics.refinement_autopilot.assoc_cut must be "
+            "finite and in (0, 1)");
+      }
+      if (!in_open_unit_interval(cfg_autopilot.strong_cut)) {
+        throw ValueError(
+            "Numerics.diagnostics.refinement_autopilot.strong_cut must be "
+            "finite and in (0, 1)");
+      }
+      if (!(cfg_autopilot.e_off < cfg_autopilot.e_on)) {
+        throw ValueError(
+            "Numerics.diagnostics.refinement_autopilot.e_off must be < e_on");
+      }
+      if (!(cfg_autopilot.assoc_cut <= cfg_autopilot.strong_cut)) {
+        throw ValueError(
+            "Numerics.diagnostics.refinement_autopilot.assoc_cut must be <= "
+            "strong_cut");
+      }
+      ensure_non_negative(
+          cfg_autopilot.gap_bridge,
+          "Numerics.diagnostics.refinement_autopilot.gap_bridge");
+      ensure_int_ge(cfg_autopilot.persist,
+                    1,
+                    "Numerics.diagnostics.refinement_autopilot.persist");
+      if (!(std::isfinite(cfg_autopilot.n_q_plan) &&
+            cfg_autopilot.n_q_plan > 0.0)) {
+        throw ValueError(
+            "Numerics.diagnostics.refinement_autopilot.n_q_plan must be "
+            "finite and > 0");
+      }
+      if (!in_open_unit_interval(cfg_autopilot.chi_design)) {
+        throw ValueError(
+            "Numerics.diagnostics.refinement_autopilot.chi_design must be "
+            "finite and in (0, 1)");
+      }
+      if (!(std::isfinite(cfg_autopilot.s_rep_cm) &&
+            std::isfinite(cfg_autopilot.handoff_cm) &&
+            cfg_autopilot.s_rep_cm > cfg_autopilot.handoff_cm &&
+            cfg_autopilot.handoff_cm > 0.0)) {
+        throw ValueError(
+            "Numerics.diagnostics.refinement_autopilot requires s_rep_cm > "
+            "handoff_cm > 0 with finite values");
+      }
+      if (!(std::isfinite(cfg_autopilot.window_lo_h) &&
+            std::isfinite(cfg_autopilot.window_hi_h) &&
+            cfg_autopilot.window_hi_h >= cfg_autopilot.window_lo_h &&
+            cfg_autopilot.window_lo_h > 0.0)) {
+        throw ValueError(
+            "Numerics.diagnostics.refinement_autopilot requires window_hi_h "
+            ">= window_lo_h > 0 with finite values");
+      }
+      ensure_int_ge(cfg_autopilot.history,
+                    3,
+                    "Numerics.diagnostics.refinement_autopilot.history");
+      if (!(std::isfinite(cfg_autopilot.cov_min) &&
+            cfg_autopilot.cov_min > 0.0 && cfg_autopilot.cov_min <= 1.0)) {
+        throw ValueError(
+            "Numerics.diagnostics.refinement_autopilot.cov_min must be finite "
+            "and in (0, 1]");
+      }
+    }
+    if (has_key(diagnostics, "evacuated_cell_shadow")) {
+      const py::handle shadow_obj = diagnostics["evacuated_cell_shadow"];
+      if (!py::isinstance<py::dict>(shadow_obj)) {
+        throw_value_type_error("Numerics.diagnostics.evacuated_cell_shadow",
+                               "dict",
+                               shadow_obj);
+      }
+      const py::dict shadow = py::reinterpret_borrow<py::dict>(shadow_obj);
+      enforce_known_keys(shadow,
+                         "Numerics.diagnostics.evacuated_cell_shadow",
+                         {"enabled",
+                          "every_n_steps",
+                          "arm_mass_fraction",
+                          "off_mass_fraction",
+                          "rho_vacuum_policy_g_per_cc",
+                          "laser_wavelength_nm",
+                          "laser_ne_over_ncrit_max"});
+      auto& cfg_shadow = numerics.diagnostics.evacuated_cell_shadow;
+      if (has_key(shadow, "enabled")) {
+        cfg_shadow.enabled = strict_bool(
+            shadow["enabled"],
+            "Numerics.diagnostics.evacuated_cell_shadow.enabled");
+      }
+      if (has_key(shadow, "every_n_steps")) {
+        cfg_shadow.every_n_steps = strict_int32(
+            shadow["every_n_steps"],
+            "Numerics.diagnostics.evacuated_cell_shadow.every_n_steps");
+      }
+      if (has_key(shadow, "arm_mass_fraction")) {
+        cfg_shadow.arm_mass_fraction = numeric_as_double(
+            shadow["arm_mass_fraction"],
+            "Numerics.diagnostics.evacuated_cell_shadow.arm_mass_fraction");
+      }
+      if (has_key(shadow, "off_mass_fraction")) {
+        cfg_shadow.off_mass_fraction = numeric_as_double(
+            shadow["off_mass_fraction"],
+            "Numerics.diagnostics.evacuated_cell_shadow.off_mass_fraction");
+      }
+      if (has_key(shadow, "rho_vacuum_policy_g_per_cc")) {
+        cfg_shadow.rho_vacuum_policy_g_per_cc = numeric_as_double(
+            shadow["rho_vacuum_policy_g_per_cc"],
+            "Numerics.diagnostics.evacuated_cell_shadow."
+            "rho_vacuum_policy_g_per_cc");
+      }
+      if (has_key(shadow, "laser_wavelength_nm")) {
+        cfg_shadow.laser_wavelength_nm = numeric_as_double(
+            shadow["laser_wavelength_nm"],
+            "Numerics.diagnostics.evacuated_cell_shadow."
+            "laser_wavelength_nm");
+      }
+      if (has_key(shadow, "laser_ne_over_ncrit_max")) {
+        cfg_shadow.laser_ne_over_ncrit_max = numeric_as_double(
+            shadow["laser_ne_over_ncrit_max"],
+            "Numerics.diagnostics.evacuated_cell_shadow."
+            "laser_ne_over_ncrit_max");
+      }
+
+      ensure_int_ge(
+          cfg_shadow.every_n_steps,
+          1,
+          "Numerics.diagnostics.evacuated_cell_shadow.every_n_steps");
+      if (!(std::isfinite(cfg_shadow.off_mass_fraction) &&
+            std::isfinite(cfg_shadow.arm_mass_fraction) &&
+            cfg_shadow.off_mass_fraction > 0.0 &&
+            cfg_shadow.off_mass_fraction < cfg_shadow.arm_mass_fraction &&
+            cfg_shadow.arm_mass_fraction < 1.0)) {
+        throw ValueError(
+            "Numerics.diagnostics.evacuated_cell_shadow requires "
+            "0 < off_mass_fraction < arm_mass_fraction < 1");
+      }
+      if (!(std::isfinite(cfg_shadow.rho_vacuum_policy_g_per_cc) &&
+            cfg_shadow.rho_vacuum_policy_g_per_cc > 0.0)) {
+        throw ValueError(
+            "Numerics.diagnostics.evacuated_cell_shadow."
+            "rho_vacuum_policy_g_per_cc must be finite and > 0");
+      }
+      if (!(std::isfinite(cfg_shadow.laser_wavelength_nm) &&
+            cfg_shadow.laser_wavelength_nm > 0.0)) {
+        throw ValueError(
+            "Numerics.diagnostics.evacuated_cell_shadow."
+            "laser_wavelength_nm must be finite and > 0");
+      }
+      if (!(std::isfinite(cfg_shadow.laser_ne_over_ncrit_max) &&
+            cfg_shadow.laser_ne_over_ncrit_max > 0.0)) {
+        throw ValueError(
+            "Numerics.diagnostics.evacuated_cell_shadow."
+            "laser_ne_over_ncrit_max must be finite and > 0");
+      }
+    }
     if (has_key(diagnostics, "ale_provenance_emission")) {
       const py::handle ale_prov_obj = diagnostics["ale_provenance_emission"];
       if (!py::isinstance<py::dict>(ale_prov_obj)) {
@@ -6064,6 +8362,28 @@ void Builder::set_numerics(py::dict kwargs) {
         numerics.diagnostics.ale_provenance_emission.enabled =
             strict_bool(ale_prov["enabled"],
                         "Numerics.diagnostics.ale_provenance_emission.enabled");
+      }
+    }
+    if (has_key(diagnostics, "conduction_energy_rate_export")) {
+      const py::handle cond_rate_obj =
+          diagnostics["conduction_energy_rate_export"];
+      if (!py::isinstance<py::dict>(cond_rate_obj)) {
+        throw_value_type_error(
+            "Numerics.diagnostics.conduction_energy_rate_export",
+            "dict",
+            cond_rate_obj);
+      }
+      const py::dict cond_rate =
+          py::reinterpret_borrow<py::dict>(cond_rate_obj);
+      enforce_known_keys(
+          cond_rate,
+          "Numerics.diagnostics.conduction_energy_rate_export",
+          {"enabled"});
+      if (has_key(cond_rate, "enabled")) {
+        numerics.diagnostics.conduction_energy_rate_export.enabled =
+            strict_bool(
+                cond_rate["enabled"],
+                "Numerics.diagnostics.conduction_energy_rate_export.enabled");
       }
     }
     if (has_key(diagnostics, "mesh_quality_min")) {
@@ -6095,7 +8415,9 @@ void Builder::set_numerics(py::dict kwargs) {
           py::reinterpret_borrow<py::dict>(shock_approach_obj);
       enforce_known_keys(shock_approach,
                          "Numerics.diagnostics.shock_approach",
-                         {"enabled", "every", "target_radius_cm", "bins", "h_cell_cm"});
+                         {"enabled", "every", "target_radius_cm", "bins", "h_cell_cm",
+                          "sectors", "modal_l_max", "sector_confidence_nu",
+                          "sector_guard_crossings"});
       auto& cfg_shock_approach = numerics.diagnostics.shock_approach;
       if (has_key(shock_approach, "enabled")) {
         cfg_shock_approach.enabled = strict_bool(
@@ -6122,6 +8444,26 @@ void Builder::set_numerics(py::dict kwargs) {
             shock_approach["h_cell_cm"],
             "Numerics.diagnostics.shock_approach.h_cell_cm");
       }
+      if (has_key(shock_approach, "sectors")) {
+        cfg_shock_approach.sectors = strict_int32(
+            shock_approach["sectors"],
+            "Numerics.diagnostics.shock_approach.sectors");
+      }
+      if (has_key(shock_approach, "modal_l_max")) {
+        cfg_shock_approach.modal_l_max = strict_int32(
+            shock_approach["modal_l_max"],
+            "Numerics.diagnostics.shock_approach.modal_l_max");
+      }
+      if (has_key(shock_approach, "sector_confidence_nu")) {
+        cfg_shock_approach.sector_confidence_nu = numeric_as_double(
+            shock_approach["sector_confidence_nu"],
+            "Numerics.diagnostics.shock_approach.sector_confidence_nu");
+      }
+      if (has_key(shock_approach, "sector_guard_crossings")) {
+        cfg_shock_approach.sector_guard_crossings = numeric_as_double(
+            shock_approach["sector_guard_crossings"],
+            "Numerics.diagnostics.shock_approach.sector_guard_crossings");
+      }
       ensure_int_ge(cfg_shock_approach.every,
                     1,
                     "Numerics.diagnostics.shock_approach.every");
@@ -6131,6 +8473,26 @@ void Builder::set_numerics(py::dict kwargs) {
       ensure_non_negative(
           cfg_shock_approach.h_cell_cm,
           "Numerics.diagnostics.shock_approach.h_cell_cm");
+      ensure_int_ge(cfg_shock_approach.sectors,
+                    0,
+                    "Numerics.diagnostics.shock_approach.sectors");
+      if (cfg_shock_approach.sectors > 0 &&
+          (cfg_shock_approach.sectors < 4 ||
+           cfg_shock_approach.sectors % 2 != 0)) {
+        throw ValueError(
+            "Numerics.diagnostics.shock_approach.sectors must be even and >= 4 when > 0");
+      }
+      if (cfg_shock_approach.modal_l_max < 0 ||
+          cfg_shock_approach.modal_l_max > 4) {
+        throw ValueError(
+            "Numerics.diagnostics.shock_approach.modal_l_max must be in [0, 4]");
+      }
+      ensure_positive(
+          cfg_shock_approach.sector_confidence_nu,
+          "Numerics.diagnostics.shock_approach.sector_confidence_nu");
+      ensure_non_negative(
+          cfg_shock_approach.sector_guard_crossings,
+          "Numerics.diagnostics.shock_approach.sector_guard_crossings");
       if (cfg_shock_approach.enabled &&
           !(cfg_shock_approach.target_radius_cm > 0.0)) {
         throw ConfigError(
@@ -6692,8 +9054,11 @@ void Builder::set_numerics(py::dict kwargs) {
     }
     const py::dict dt = py::reinterpret_borrow<py::dict>(dt_obj);
     enforce_known_keys(dt, "Numerics.dt",
-                       {"initial_s", "cfl_hydro", "cfl_cond", "f_min_fleck",
+                       {"initial_s", "cfl_hydro", "cfl_length_2d", "cfl_cond",
+                        "edge_accel_displacement_cfl_enabled",
+                        "f_min_fleck",
                         "growth_factor", "max_s", "min_s",
+                        "min_consecutive_steps",
                         "floor_stall_max_consecutive_steps"});
     if (has_key(dt, "initial_s")) {
       if (dt["initial_s"].is_none()) {
@@ -6705,6 +9070,22 @@ void Builder::set_numerics(py::dict kwargs) {
     }
     if (has_key(dt, "cfl_hydro")) {
       numerics.dt.cfl_hydro = numeric_as_double(dt["cfl_hydro"], "Numerics.dt.cfl_hydro");
+    }
+    if (has_key(dt, "cfl_length_2d")) {
+      numerics.dt.cfl_length_2d =
+          strict_string(dt["cfl_length_2d"], "Numerics.dt.cfl_length_2d");
+      if (numerics.dt.cfl_length_2d != "sqrt_area" &&
+          numerics.dt.cfl_length_2d != "min_altitude") {
+        throw ValueError(
+            "Numerics.dt.cfl_length_2d must be one of "
+            "{\"sqrt_area\", \"min_altitude\"}, got " +
+            numerics.dt.cfl_length_2d);
+      }
+    }
+    if (has_key(dt, "edge_accel_displacement_cfl_enabled")) {
+      numerics.dt.edge_accel_displacement_cfl_enabled = strict_bool(
+          dt["edge_accel_displacement_cfl_enabled"],
+          "Numerics.dt.edge_accel_displacement_cfl_enabled");
     }
     if (has_key(dt, "cfl_cond")) {
       numerics.dt.cfl_cond = numeric_as_double(dt["cfl_cond"], "Numerics.dt.cfl_cond");
@@ -6722,6 +9103,10 @@ void Builder::set_numerics(py::dict kwargs) {
     }
     if (has_key(dt, "min_s")) {
       numerics.dt.min_s = numeric_as_double(dt["min_s"], "Numerics.dt.min_s");
+    }
+    if (has_key(dt, "min_consecutive_steps")) {
+      numerics.dt.min_consecutive_steps = strict_int32(
+          dt["min_consecutive_steps"], "Numerics.dt.min_consecutive_steps");
     }
     if (has_key(dt, "floor_stall_max_consecutive_steps")) {
       numerics.dt.floor_stall_max_consecutive_steps = strict_int32(
@@ -6742,15 +9127,40 @@ void Builder::set_numerics(py::dict kwargs) {
     const py::dict hydro = py::reinterpret_borrow<py::dict>(hydro_obj);
     enforce_known_keys(hydro, "Numerics.hydro",
                        {"enabled", "compatible_energy", "T_start_eV", "boundary", "boundary_1d", "boundary_2d",
-                       "av_type", "av_model", "corner_mass_convention",
+                       "av_type", "av_model", "rz_momentum_scheme", "corner_mass_convention",
                        "time_integration", "total_energy_identity_check",
                        "rz_momentum_scheme",
                        "axis_node_mass_convention",
                        "av_C1", "av_C2", "av_linear", "av_quadratic",
+                       "csw98_degenerate_side_floor_rel",
+                       "csw98_damper_impulse_beta",
+                       "csw98_axisline_av_mode",
+                       "csw98_axisline_d1prime_cfl_enabled",
+                       "csw98_limiter_shock_floor_enabled",
+                       "csw98_axisline_work_planar_enabled",
+                       "tensor_av_C1", "tensor_av_C2",
                        "av_qcap_over_p", "av_qcap_center_band_only",
                        "av_cfl_coefficient",
                        "csw_C1", "csw_C2", "csw_limiter",
                        "csw_limiter_enabled",
+                       "csw_axis_mirror_limiter",
+                       "csw_rz_lift_enabled", "csw_rz_lift_guard_ratio",
+                       "csw_pole_floor_enabled", "csw_pole_floor_sigma0",
+                       "csw_pole_floor_theta0_rad", "csw_pole_floor_thetaf_rad",
+                       "csw_pole_desens_enabled", "csw_pole_desens_alpha",
+                       "csw_pole_desens_theta0_rad", "csw_pole_desens_thetaf_rad",
+                       "csw_polar_slaving_enabled",
+                       "csw_polar_slaving_min_columns",
+                       "csw_polar_slaving_full_columns",
+                       "csw_polar_slaving_outer_columns",
+                       "csw_polar_slaving_chi_on",
+                       "csw_polar_slaving_chi_full",
+                       "csw_polar_slaving_strength",
+                       "csw_polar_slaving_av_stiffness_cfl_enabled",
+                       "csw_polar_slaving_av_stiffness_sigma",
+                       "wake_heat_flux_enabled", "wake_heat_flux_CE",
+                       "wake_heat_flux_theta_a_rad", "wake_heat_flux_theta_b_rad",
+                       "wake_heat_flux_global_theta",
                        "csw_shock_limiter_floor", "csw_zero_uniform_compression",
                        "csw_diagnostics",
                        "av_limiter_J", "av_heat_C", "post_shock_heat",
@@ -6763,7 +9173,10 @@ void Builder::set_numerics(py::dict kwargs) {
                         "subzonal_mass_lagrangian_invariant_enabled",
                         "anti_hourglass_kappa",
                         "subzonal_pressure_enabled",
+                        "pentagon_affine_null_enabled",
+                        "pentagon_affine_null_kappa",
                         "subzonal_dt_limiter_enabled",
+                        "aw_compatible_force_work",
                         "subzonal_pressure_mode",
                         "subzonal_band_mode",
                         "subzonal_band_feather_layers",
@@ -6772,7 +9185,8 @@ void Builder::set_numerics(py::dict kwargs) {
                         "subzonal_alpha2",
                         "subzonal_merit_power",
                         "subzonal_merit_constant",
-                        "hourglass", "adaptive_av", "plasma_viscosity",
+                        "hourglass", "axis_projection", "adaptive_av",
+                        "plasma_viscosity",
                         "av_eos_aware",
                         "av_eos_gamma1_ref", "av_eos_boost_max",
                         "odd_even_damping_C", "ee_odd_even_C",
@@ -6780,7 +9194,7 @@ void Builder::set_numerics(py::dict kwargs) {
                         "hk_velocity_damper_grad_Te_max",
                         "hk_velocity_damper_grad_rho_max",
                         "hk_velocity_damper_guard_cells", "av_heat_to",
-                        "boundary_pressure",
+                        "boundary_pressure", "pressure_drive_perturbation",
                         "rho_e_linear_grid", "eos_writeback", "eos_closure_mode",
                         "qei_evaluate_at_t_n", "qei_multiplier", "exact_override",
                         "total_energy_remap_2d_rz",
@@ -6876,7 +9290,7 @@ void Builder::set_numerics(py::dict kwargs) {
         throw ValueError(
             "Numerics.hydro.av_model must be one of "
             "{\"scalar_vnr_legacy\", \"csw_edge\", \"csw_edge_csw98\", "
-            "\"csw_edge_plus_tensor_limited\"}, got " +
+            "\"csw_edge_plus_tensor_limited\", \"mimetic_tensor_v1\"}, got " +
             av_model);
       }
     }
@@ -7047,10 +9461,32 @@ void Builder::set_numerics(py::dict kwargs) {
           hydro["subzonal_pressure_enabled"],
           "Numerics.hydro.subzonal_pressure_enabled");
     }
+    if (has_key(hydro, "pentagon_affine_null_enabled")) {
+      numerics.hydro.pentagon_affine_null_enabled = strict_bool(
+          hydro["pentagon_affine_null_enabled"],
+          "Numerics.hydro.pentagon_affine_null_enabled");
+    }
+    if (has_key(hydro, "pentagon_affine_null_kappa")) {
+      numerics.hydro.pentagon_affine_null_kappa = numeric_as_double(
+          hydro["pentagon_affine_null_kappa"],
+          "Numerics.hydro.pentagon_affine_null_kappa");
+      if (!(std::isfinite(numerics.hydro.pentagon_affine_null_kappa) &&
+            numerics.hydro.pentagon_affine_null_kappa >= 0.0 &&
+            numerics.hydro.pentagon_affine_null_kappa <= 1.0)) {
+        throw ValueError(
+            "Numerics.hydro.pentagon_affine_null_kappa must be finite and "
+            "in [0, 1]");
+      }
+    }
     if (has_key(hydro, "subzonal_dt_limiter_enabled")) {
       numerics.hydro.subzonal_dt_limiter_enabled = strict_bool(
           hydro["subzonal_dt_limiter_enabled"],
           "Numerics.hydro.subzonal_dt_limiter_enabled");
+    }
+    if (has_key(hydro, "aw_compatible_force_work")) {
+      numerics.hydro.aw_compatible_force_work = strict_bool(
+          hydro["aw_compatible_force_work"],
+          "Numerics.hydro.aw_compatible_force_work");
     }
     if (has_key(hydro, "subzonal_pressure_mode")) {
       numerics.hydro.subzonal_pressure_mode = strict_string(
@@ -7197,6 +9633,71 @@ void Builder::set_numerics(py::dict kwargs) {
         ensure_positive(hg.max_force_per_node_fraction,
                         "Numerics.hydro.hourglass.max_force_per_node_fraction");
       }
+    }
+    if (has_key(hydro, "axis_projection")) {
+      const py::handle axis_projection_obj = hydro["axis_projection"];
+      if (!py::isinstance<py::dict>(axis_projection_obj)) {
+        throw_value_type_error(
+            "Numerics.hydro.axis_projection", "dict", axis_projection_obj);
+      }
+      const py::dict axis_projection =
+          py::reinterpret_borrow<py::dict>(axis_projection_obj);
+      enforce_known_keys(
+          axis_projection,
+          "Numerics.hydro.axis_projection",
+          {"enabled", "shadow_only", "q_on", "q_floor", "patch_halfwidth",
+           "log_every_n_steps"});
+      auto& projection = numerics.hydro.axis_projection;
+      if (has_key(axis_projection, "enabled")) {
+        projection.enabled = strict_bool(
+            axis_projection["enabled"],
+            "Numerics.hydro.axis_projection.enabled");
+      }
+      if (has_key(axis_projection, "shadow_only")) {
+        projection.shadow_only = strict_bool(
+            axis_projection["shadow_only"],
+            "Numerics.hydro.axis_projection.shadow_only");
+      }
+      if (has_key(axis_projection, "q_on")) {
+        projection.q_on = numeric_as_double(
+            axis_projection["q_on"],
+            "Numerics.hydro.axis_projection.q_on");
+      }
+      if (!(std::isfinite(projection.q_on) &&
+            projection.q_on > 0.0 && projection.q_on < 1.0)) {
+        throw ValueError(
+            "Numerics.hydro.axis_projection.q_on must be finite and in (0, 1)");
+      }
+      if (has_key(axis_projection, "q_floor")) {
+        projection.q_floor = numeric_as_double(
+            axis_projection["q_floor"],
+            "Numerics.hydro.axis_projection.q_floor");
+      }
+      if (!(std::isfinite(projection.q_floor) &&
+            projection.q_floor > 0.0 &&
+            projection.q_floor < projection.q_on)) {
+        throw ValueError(
+            "Numerics.hydro.axis_projection.q_floor must be finite and in "
+            "(0, q_on)");
+      }
+      if (has_key(axis_projection, "patch_halfwidth")) {
+        projection.patch_halfwidth = strict_int32(
+            axis_projection["patch_halfwidth"],
+            "Numerics.hydro.axis_projection.patch_halfwidth");
+      }
+      if (projection.patch_halfwidth < 1 ||
+          projection.patch_halfwidth > 8) {
+        throw ValueError(
+            "Numerics.hydro.axis_projection.patch_halfwidth must be in [1, 8]");
+      }
+      if (has_key(axis_projection, "log_every_n_steps")) {
+        projection.log_every_n_steps = strict_int32(
+            axis_projection["log_every_n_steps"],
+            "Numerics.hydro.axis_projection.log_every_n_steps");
+      }
+      ensure_non_negative(
+          projection.log_every_n_steps,
+          "Numerics.hydro.axis_projection.log_every_n_steps");
     }
     if (has_key(hydro, "plasma_viscosity")) {
       const py::handle pv_obj = hydro["plasma_viscosity"];
@@ -7948,6 +10449,49 @@ void Builder::set_numerics(py::dict kwargs) {
       numerics.hydro.av_quadratic =
           numeric_as_double(hydro["av_quadratic"], "Numerics.hydro.av_quadratic");
     }
+    if (has_key(hydro, "csw98_degenerate_side_floor_rel")) {
+      numerics.hydro.csw98_degenerate_side_floor_rel = numeric_as_double(
+          hydro["csw98_degenerate_side_floor_rel"],
+          "Numerics.hydro.csw98_degenerate_side_floor_rel");
+    }
+    if (has_key(hydro, "csw98_damper_impulse_beta")) {
+      numerics.hydro.csw98_damper_impulse_beta = numeric_as_double(
+          hydro["csw98_damper_impulse_beta"],
+          "Numerics.hydro.csw98_damper_impulse_beta");
+    }
+    if (has_key(hydro, "csw98_axisline_av_mode")) {
+      numerics.hydro.csw98_axisline_av_mode = strict_string(
+          hydro["csw98_axisline_av_mode"],
+          "Numerics.hydro.csw98_axisline_av_mode");
+      if (numerics.hydro.csw98_axisline_av_mode != "off" &&
+          numerics.hydro.csw98_axisline_av_mode != "d1prime") {
+        throw ValueError(
+            "Numerics.hydro.csw98_axisline_av_mode must be one of {\"off\", \"d1prime\"}");
+      }
+    }
+    if (has_key(hydro, "csw98_axisline_d1prime_cfl_enabled")) {
+      numerics.hydro.csw98_axisline_d1prime_cfl_enabled = strict_bool(
+          hydro["csw98_axisline_d1prime_cfl_enabled"],
+          "Numerics.hydro.csw98_axisline_d1prime_cfl_enabled");
+    }
+    if (has_key(hydro, "csw98_limiter_shock_floor_enabled")) {
+      numerics.hydro.csw98_limiter_shock_floor_enabled = strict_bool(
+          hydro["csw98_limiter_shock_floor_enabled"],
+          "Numerics.hydro.csw98_limiter_shock_floor_enabled");
+    }
+    if (has_key(hydro, "csw98_axisline_work_planar_enabled")) {
+      numerics.hydro.csw98_axisline_work_planar_enabled = strict_bool(
+          hydro["csw98_axisline_work_planar_enabled"],
+          "Numerics.hydro.csw98_axisline_work_planar_enabled");
+    }
+    if (has_key(hydro, "tensor_av_C1")) {
+      numerics.hydro.tensor_av_C1 = numeric_as_double(
+          hydro["tensor_av_C1"], "Numerics.hydro.tensor_av_C1");
+    }
+    if (has_key(hydro, "tensor_av_C2")) {
+      numerics.hydro.tensor_av_C2 = numeric_as_double(
+          hydro["tensor_av_C2"], "Numerics.hydro.tensor_av_C2");
+    }
     if (numerics.hydro.av_model == AvModel::CswEdge ||
         numerics.hydro.av_model == AvModel::CswEdgeCsw98) {
       if (!av_c1_explicit) {
@@ -8012,6 +10556,130 @@ void Builder::set_numerics(py::dict kwargs) {
       numerics.hydro.csw_limiter_enabled = strict_bool(
           hydro["csw_limiter_enabled"],
           "Numerics.hydro.csw_limiter_enabled");
+    }
+    if (has_key(hydro, "csw_axis_mirror_limiter")) {
+      numerics.hydro.csw_axis_mirror_limiter = strict_bool(
+          hydro["csw_axis_mirror_limiter"],
+          "Numerics.hydro.csw_axis_mirror_limiter");
+    }
+    if (has_key(hydro, "csw_rz_lift_enabled")) {
+      numerics.hydro.csw_rz_lift_enabled = strict_bool(
+          hydro["csw_rz_lift_enabled"],
+          "Numerics.hydro.csw_rz_lift_enabled");
+    }
+    if (has_key(hydro, "csw_rz_lift_guard_ratio")) {
+      numerics.hydro.csw_rz_lift_guard_ratio = numeric_as_double(
+          hydro["csw_rz_lift_guard_ratio"],
+          "Numerics.hydro.csw_rz_lift_guard_ratio");
+    }
+    if (has_key(hydro, "csw_pole_floor_enabled")) {
+      numerics.hydro.csw_pole_floor_enabled = strict_bool(
+          hydro["csw_pole_floor_enabled"],
+          "Numerics.hydro.csw_pole_floor_enabled");
+    }
+    if (has_key(hydro, "csw_pole_floor_sigma0")) {
+      numerics.hydro.csw_pole_floor_sigma0 = numeric_as_double(
+          hydro["csw_pole_floor_sigma0"],
+          "Numerics.hydro.csw_pole_floor_sigma0");
+    }
+    if (has_key(hydro, "csw_pole_floor_theta0_rad")) {
+      numerics.hydro.csw_pole_floor_theta0_rad = numeric_as_double(
+          hydro["csw_pole_floor_theta0_rad"],
+          "Numerics.hydro.csw_pole_floor_theta0_rad");
+    }
+    if (has_key(hydro, "csw_pole_floor_thetaf_rad")) {
+      numerics.hydro.csw_pole_floor_thetaf_rad = numeric_as_double(
+          hydro["csw_pole_floor_thetaf_rad"],
+          "Numerics.hydro.csw_pole_floor_thetaf_rad");
+    }
+    if (has_key(hydro, "csw_pole_desens_enabled")) {
+      numerics.hydro.csw_pole_desens_enabled = strict_bool(
+          hydro["csw_pole_desens_enabled"],
+          "Numerics.hydro.csw_pole_desens_enabled");
+    }
+    if (has_key(hydro, "csw_pole_desens_alpha")) {
+      numerics.hydro.csw_pole_desens_alpha = numeric_as_double(
+          hydro["csw_pole_desens_alpha"],
+          "Numerics.hydro.csw_pole_desens_alpha");
+    }
+    if (has_key(hydro, "csw_pole_desens_theta0_rad")) {
+      numerics.hydro.csw_pole_desens_theta0_rad = numeric_as_double(
+          hydro["csw_pole_desens_theta0_rad"],
+          "Numerics.hydro.csw_pole_desens_theta0_rad");
+    }
+    if (has_key(hydro, "csw_pole_desens_thetaf_rad")) {
+      numerics.hydro.csw_pole_desens_thetaf_rad = numeric_as_double(
+          hydro["csw_pole_desens_thetaf_rad"],
+          "Numerics.hydro.csw_pole_desens_thetaf_rad");
+    }
+    if (has_key(hydro, "csw_polar_slaving_enabled")) {
+      numerics.hydro.csw_polar_slaving_enabled = strict_bool(
+          hydro["csw_polar_slaving_enabled"],
+          "Numerics.hydro.csw_polar_slaving_enabled");
+    }
+    if (has_key(hydro, "csw_polar_slaving_min_columns")) {
+      numerics.hydro.csw_polar_slaving_min_columns = strict_int32(
+          hydro["csw_polar_slaving_min_columns"],
+          "Numerics.hydro.csw_polar_slaving_min_columns");
+    }
+    if (has_key(hydro, "csw_polar_slaving_full_columns")) {
+      numerics.hydro.csw_polar_slaving_full_columns = strict_int32(
+          hydro["csw_polar_slaving_full_columns"],
+          "Numerics.hydro.csw_polar_slaving_full_columns");
+    }
+    if (has_key(hydro, "csw_polar_slaving_outer_columns")) {
+      numerics.hydro.csw_polar_slaving_outer_columns = strict_int32(
+          hydro["csw_polar_slaving_outer_columns"],
+          "Numerics.hydro.csw_polar_slaving_outer_columns");
+    }
+    if (has_key(hydro, "csw_polar_slaving_chi_on")) {
+      numerics.hydro.csw_polar_slaving_chi_on = numeric_as_double(
+          hydro["csw_polar_slaving_chi_on"],
+          "Numerics.hydro.csw_polar_slaving_chi_on");
+    }
+    if (has_key(hydro, "csw_polar_slaving_chi_full")) {
+      numerics.hydro.csw_polar_slaving_chi_full = numeric_as_double(
+          hydro["csw_polar_slaving_chi_full"],
+          "Numerics.hydro.csw_polar_slaving_chi_full");
+    }
+    if (has_key(hydro, "csw_polar_slaving_strength")) {
+      numerics.hydro.csw_polar_slaving_strength = numeric_as_double(
+          hydro["csw_polar_slaving_strength"],
+          "Numerics.hydro.csw_polar_slaving_strength");
+    }
+    if (has_key(hydro, "csw_polar_slaving_av_stiffness_cfl_enabled")) {
+      numerics.hydro.csw_polar_slaving_av_stiffness_cfl_enabled = strict_bool(
+          hydro["csw_polar_slaving_av_stiffness_cfl_enabled"],
+          "Numerics.hydro.csw_polar_slaving_av_stiffness_cfl_enabled");
+    }
+    if (has_key(hydro, "csw_polar_slaving_av_stiffness_sigma")) {
+      numerics.hydro.csw_polar_slaving_av_stiffness_sigma = numeric_as_double(
+          hydro["csw_polar_slaving_av_stiffness_sigma"],
+          "Numerics.hydro.csw_polar_slaving_av_stiffness_sigma");
+    }
+    if (has_key(hydro, "wake_heat_flux_enabled")) {
+      numerics.hydro.wake_heat_flux_enabled = strict_bool(
+          hydro["wake_heat_flux_enabled"],
+          "Numerics.hydro.wake_heat_flux_enabled");
+    }
+    if (has_key(hydro, "wake_heat_flux_CE")) {
+      numerics.hydro.wake_heat_flux_CE = numeric_as_double(
+          hydro["wake_heat_flux_CE"], "Numerics.hydro.wake_heat_flux_CE");
+    }
+    if (has_key(hydro, "wake_heat_flux_theta_a_rad")) {
+      numerics.hydro.wake_heat_flux_theta_a_rad = numeric_as_double(
+          hydro["wake_heat_flux_theta_a_rad"],
+          "Numerics.hydro.wake_heat_flux_theta_a_rad");
+    }
+    if (has_key(hydro, "wake_heat_flux_theta_b_rad")) {
+      numerics.hydro.wake_heat_flux_theta_b_rad = numeric_as_double(
+          hydro["wake_heat_flux_theta_b_rad"],
+          "Numerics.hydro.wake_heat_flux_theta_b_rad");
+    }
+    if (has_key(hydro, "wake_heat_flux_global_theta")) {
+      numerics.hydro.wake_heat_flux_global_theta = strict_bool(
+          hydro["wake_heat_flux_global_theta"],
+          "Numerics.hydro.wake_heat_flux_global_theta");
     }
     if (has_key(hydro, "csw_shock_limiter_floor")) {
       numerics.hydro.csw_shock_limiter_floor = numeric_as_double(
@@ -8243,6 +10911,168 @@ void Builder::set_numerics(py::dict kwargs) {
       numerics.hydro.av_heat_to =
           strict_string(hydro["av_heat_to"], "Numerics.hydro.av_heat_to");
     }
+    if (has_key(hydro, "pressure_drive_perturbation")) {
+      const py::handle perturbation_obj =
+          hydro["pressure_drive_perturbation"];
+      if (!py::isinstance<py::dict>(perturbation_obj)) {
+        throw_value_type_error(
+            "Numerics.hydro.pressure_drive_perturbation",
+            "dict",
+            perturbation_obj);
+      }
+      const py::dict perturbation =
+          py::reinterpret_borrow<py::dict>(perturbation_obj);
+      enforce_known_keys(perturbation,
+                         "Numerics.hydro.pressure_drive_perturbation",
+                         {"enabled",
+                          "legendre_modes",
+                          "ring_spots",
+                          "random_seed",
+                          "random_l_min",
+                          "random_l_max",
+                          "random_rms"});
+      auto& perturbation_config =
+          numerics.hydro.pressure_drive_perturbation;
+      if (has_key(perturbation, "enabled")) {
+        perturbation_config.enabled = strict_bool(
+            perturbation["enabled"],
+            "Numerics.hydro.pressure_drive_perturbation.enabled");
+      }
+      if (has_key(perturbation, "legendre_modes")) {
+        const py::handle modes_obj = perturbation["legendre_modes"];
+        if (!py::isinstance<py::sequence>(modes_obj) ||
+            py::isinstance<py::str>(modes_obj)) {
+          throw ConfigError(
+              "Numerics.hydro.pressure_drive_perturbation.legendre_modes "
+              "must be a list of [l, amplitude] pairs");
+        }
+        const py::sequence modes =
+            py::reinterpret_borrow<py::sequence>(modes_obj);
+        if (modes.size() >
+            tenryu::hydro::PressureDrivePerturbationParams::kMaxModes) {
+          throw ConfigError(
+              "Numerics.hydro.pressure_drive_perturbation has more than 24 "
+              "resolved modes");
+        }
+        for (std::size_t k = 0; k < modes.size(); ++k) {
+          const py::handle mode_obj = modes[k];
+          if (!py::isinstance<py::sequence>(mode_obj) ||
+              py::isinstance<py::str>(mode_obj)) {
+            throw ConfigError(
+                "Numerics.hydro.pressure_drive_perturbation.legendre_modes "
+                "entries must be [l, amplitude] pairs");
+          }
+          const py::sequence mode =
+              py::reinterpret_borrow<py::sequence>(mode_obj);
+          if (mode.size() != 2) {
+            throw ConfigError(
+                "Numerics.hydro.pressure_drive_perturbation.legendre_modes "
+                "entries must contain exactly two values");
+          }
+          const std::string base =
+              "Numerics.hydro.pressure_drive_perturbation.legendre_modes[" +
+              std::to_string(k) + "]";
+          const int l = strict_int32(mode[0], base + "[0]");
+          if (l < 1 || l > 16) {
+            throw ConfigError(base + "[0] must be in [1, 16]");
+          }
+          perturbation_config.mode_l.push_back(l);
+          perturbation_config.mode_a.push_back(
+              pressure_drive_amplitude_as_double(mode[1], base + "[1]"));
+        }
+      }
+      if (has_key(perturbation, "ring_spots")) {
+        const py::handle spots_obj = perturbation["ring_spots"];
+        if (!py::isinstance<py::sequence>(spots_obj) ||
+            py::isinstance<py::str>(spots_obj)) {
+          throw ConfigError(
+              "Numerics.hydro.pressure_drive_perturbation.ring_spots must "
+              "be a list of [theta0, sigma, amplitude] triples");
+        }
+        const py::sequence spots =
+            py::reinterpret_borrow<py::sequence>(spots_obj);
+        if (spots.size() >
+            tenryu::hydro::PressureDrivePerturbationParams::kMaxSpots) {
+          throw ConfigError(
+              "Numerics.hydro.pressure_drive_perturbation has more than 4 "
+              "ring spots");
+        }
+        for (std::size_t m = 0; m < spots.size(); ++m) {
+          const py::handle spot_obj = spots[m];
+          if (!py::isinstance<py::sequence>(spot_obj) ||
+              py::isinstance<py::str>(spot_obj)) {
+            throw ConfigError(
+                "Numerics.hydro.pressure_drive_perturbation.ring_spots "
+                "entries must be [theta0, sigma, amplitude] triples");
+          }
+          const py::sequence spot =
+              py::reinterpret_borrow<py::sequence>(spot_obj);
+          if (spot.size() != 3) {
+            throw ConfigError(
+                "Numerics.hydro.pressure_drive_perturbation.ring_spots "
+                "entries must contain exactly three values");
+          }
+          const std::string base =
+              "Numerics.hydro.pressure_drive_perturbation.ring_spots[" +
+              std::to_string(m) + "]";
+          const double theta0 = numeric_as_double(spot[0], base + "[0]");
+          const double sigma = numeric_as_double(spot[1], base + "[1]");
+          const double amplitude =
+              pressure_drive_amplitude_as_double(spot[2], base + "[2]");
+          if (theta0 < 0.0 || theta0 > M_PI) {
+            throw ConfigError(base + "[0] must be in [0, pi]");
+          }
+          if (!(sigma > 0.0)) {
+            throw ConfigError(base + "[1] must be > 0");
+          }
+          perturbation_config.spot_theta0.push_back(theta0);
+          perturbation_config.spot_sigma.push_back(sigma);
+          perturbation_config.spot_amp.push_back(amplitude);
+        }
+      }
+      if (has_key(perturbation, "random_seed")) {
+        perturbation_config.random_seed = static_cast<long long>(strict_int64(
+            perturbation["random_seed"],
+            "Numerics.hydro.pressure_drive_perturbation.random_seed"));
+      }
+      if (has_key(perturbation, "random_l_min")) {
+        perturbation_config.random_l_min = strict_int32(
+            perturbation["random_l_min"],
+            "Numerics.hydro.pressure_drive_perturbation.random_l_min");
+      }
+      if (has_key(perturbation, "random_l_max")) {
+        perturbation_config.random_l_max = strict_int32(
+            perturbation["random_l_max"],
+            "Numerics.hydro.pressure_drive_perturbation.random_l_max");
+      }
+      if (has_key(perturbation, "random_rms")) {
+        perturbation_config.random_rms = pressure_drive_amplitude_as_double(
+            perturbation["random_rms"],
+            "Numerics.hydro.pressure_drive_perturbation.random_rms");
+      }
+      if (perturbation_config.random_l_min < 1 ||
+          perturbation_config.random_l_min >
+              perturbation_config.random_l_max ||
+          perturbation_config.random_l_max > 16) {
+        throw ConfigError(
+            "Numerics.hydro.pressure_drive_perturbation random l range must "
+            "satisfy 1 <= random_l_min <= random_l_max <= 16");
+      }
+      resolve_random_pressure_drive_modes(perturbation_config);
+      if (perturbation_config.mode_l.size() >
+          static_cast<std::size_t>(
+              tenryu::hydro::PressureDrivePerturbationParams::kMaxModes)) {
+        throw ConfigError(
+            "Numerics.hydro.pressure_drive_perturbation has more than 24 "
+            "resolved modes");
+      }
+      if (perturbation_config.enabled &&
+          perturbation_config.mode_l.empty() &&
+          perturbation_config.spot_theta0.empty()) {
+        throw ConfigError("perturbation enabled but empty");
+      }
+      compute_pressure_drive_perturbation_range(perturbation_config);
+    }
     if (has_key(hydro, "boundary_pressure")) {
       const auto callable = extract_callable_or_throw(hydro["boundary_pressure"],
                                                       "Numerics.hydro.boundary_pressure");
@@ -8392,7 +11222,22 @@ void Builder::set_numerics(py::dict kwargs) {
     }
     const py::dict ale = py::reinterpret_borrow<py::dict>(ale_obj);
     enforce_known_keys(ale, "Numerics.ale",
-                       {"enabled", "ale_identity_mode", "ale_mover_diag",
+                       {"enabled", "mesh_mode", "reale_core",
+                        "rezone_min_dt_s",
+                        "tess_gpu_dual",
+                        "tess_gpu_restrict",
+                        "dvclp_solver_rev",
+                        "reale_lloyd_max",
+                        "reale_short_edge_collapse_rel",
+                        "reale_subdomain_rezone",
+                        "reale_subdomain_frac_max",
+                        "reale_overlay_additivity_tol",
+                        "reale_corner_mass_reset",
+                        "reale_velocity_max_principle",
+                        "reale_dt_trigger_factor",
+                        "reale_dt_trigger_cooldown",
+                        "ale_identity_mode",
+                        "ale_mover_diag",
                         "ale_preserve_lagrangian_velocity_carry",
                         "align_diagnostics",
                         "every_n_steps", "warmup_steps",
@@ -8410,6 +11255,7 @@ void Builder::set_numerics(py::dict kwargs) {
                         "Te_jump_threshold", "preventive_axis_guard_fraction",
                         "axis_z_motion", "winslow_axis_kappa",
                         "button_morph",
+                        "runtime_controller",
                         "reference_barrier_enabled",
                         "reference_target",
                         "reference_blend_default",
@@ -8450,6 +11296,8 @@ void Builder::set_numerics(py::dict kwargs) {
                           "safe_backtrack_enabled",
                           "safe_backtrack_min_exp",
                           "safe_backtrack_binary_iters",
+                          "mesh_epoch_enabled",
+                          "mesh_epoch_max_per_step",
                           "corner_cell_aspect_protection_enabled",
                           "corner_cell_aspect_eta",
                           "rezone_solver",
@@ -8460,6 +11308,9 @@ void Builder::set_numerics(py::dict kwargs) {
                           "m1_min_j_dec_rel",
                           "m1_barrier_beta",
                           "euler_window",
+                          "euler_windows",
+                          "band_ale",
+                          "evacuated_cell",
                           "rezone_local_admissibility_linesearch",
                         "rezone_local_j_floor_rel",
                         "rezone_local_linesearch_max_halves",
@@ -8536,6 +11387,7 @@ void Builder::set_numerics(py::dict kwargs) {
                         "conservative_remap_lagrangian_bulk_center_node_ring_max",
                         "central_pseudo_core_enabled",
                         "central_pseudo_core_s_c",
+                        "central_pseudo_core_activation_time_s",
                         "central_pseudo_core_ring_absorption_enabled",
                         "central_pseudo_core_ring_absorption_tau",
                         "conv_rezone_enabled",
@@ -8553,9 +11405,6 @@ void Builder::set_numerics(py::dict kwargs) {
                         "central_pseudo_core_spherical_absorb_pjump",
                         "central_pseudo_core_mixed_absorb_enabled",
                         "central_pseudo_core_absorb_watch_rows",
-                        "central_pseudo_core_terminal_absorb_enabled",
-                        "central_pseudo_core_terminal_rebound_factor",
-                        "central_pseudo_core_terminal_tail_dt_s",
                         "remap_mass_closure_reject_tol",
                         "rezone_closure_cooldown_steps",
                         "csr_optionb_coherent_enabled",
@@ -8578,6 +11427,95 @@ void Builder::set_numerics(py::dict kwargs) {
     const bool remap_ms_post_check_explicit = has_key(ale, "remap_ms_post_check");
     if (has_key(ale, "enabled")) {
       numerics.ale.enabled = strict_bool(ale["enabled"], "Numerics.ale.enabled");
+    }
+    if (has_key(ale, "mesh_mode")) {
+      numerics.ale.mesh_mode =
+          strict_string(ale["mesh_mode"], "Numerics.ale.mesh_mode");
+    }
+    if (has_key(ale, "reale_core")) {
+      numerics.ale.reale_core =
+          strict_string(ale["reale_core"], "Numerics.ale.reale_core");
+    }
+    if (has_key(ale, "rezone_min_dt_s")) {
+      numerics.ale.rezone_min_dt_s = numeric_as_double(
+          ale["rezone_min_dt_s"], "Numerics.ale.rezone_min_dt_s");
+    }
+    if (has_key(ale, "tess_gpu_dual")) {
+      numerics.ale.tess_gpu_dual =
+          strict_bool(ale["tess_gpu_dual"], "Numerics.ale.tess_gpu_dual");
+    }
+    if (has_key(ale, "tess_gpu_restrict")) {
+      numerics.ale.tess_gpu_restrict = strict_bool(
+          ale["tess_gpu_restrict"], "Numerics.ale.tess_gpu_restrict");
+    }
+    if (has_key(ale, "dvclp_solver_rev")) {
+      numerics.ale.dvclp_solver_rev = strict_int32(
+          ale["dvclp_solver_rev"], "Numerics.ale.dvclp_solver_rev");
+      if (numerics.ale.dvclp_solver_rev < 0 ||
+          numerics.ale.dvclp_solver_rev > 1) {
+        throw ConfigError(
+            "Numerics.ale.dvclp_solver_rev must be 0 or 1");
+      }
+    }
+    if (has_key(ale, "reale_lloyd_max")) {
+      numerics.ale.reale_lloyd_max = strict_int32(
+          ale["reale_lloyd_max"], "Numerics.ale.reale_lloyd_max");
+      if (numerics.ale.reale_lloyd_max < 0 ||
+          numerics.ale.reale_lloyd_max > 64) {
+        throw ConfigError(
+            "Numerics.ale.reale_lloyd_max must be in [0, 64]");
+      }
+    }
+    if (has_key(ale, "reale_short_edge_collapse_rel")) {
+      numerics.ale.reale_short_edge_collapse_rel = numeric_as_double(
+          ale["reale_short_edge_collapse_rel"],
+          "Numerics.ale.reale_short_edge_collapse_rel");
+    }
+    if (has_key(ale, "reale_subdomain_rezone")) {
+      numerics.ale.reale_subdomain_rezone = strict_bool(
+          ale["reale_subdomain_rezone"],
+          "Numerics.ale.reale_subdomain_rezone");
+    }
+    if (has_key(ale, "reale_subdomain_frac_max")) {
+      numerics.ale.reale_subdomain_frac_max = numeric_as_double(
+          ale["reale_subdomain_frac_max"],
+          "Numerics.ale.reale_subdomain_frac_max");
+    }
+    if (has_key(ale, "reale_overlay_additivity_tol")) {
+      numerics.ale.reale_overlay_additivity_tol = numeric_as_double(
+          ale["reale_overlay_additivity_tol"],
+          "Numerics.ale.reale_overlay_additivity_tol");
+    }
+    if (has_key(ale, "reale_corner_mass_reset")) {
+      numerics.ale.reale_corner_mass_reset = strict_bool(
+          ale["reale_corner_mass_reset"],
+          "Numerics.ale.reale_corner_mass_reset");
+    }
+    if (has_key(ale, "reale_velocity_max_principle")) {
+      numerics.ale.reale_velocity_max_principle = strict_bool(
+          ale["reale_velocity_max_principle"],
+          "Numerics.ale.reale_velocity_max_principle");
+    }
+    if (has_key(ale, "reale_dt_trigger_factor")) {
+      numerics.ale.reale_dt_trigger_factor = numeric_as_double(
+          ale["reale_dt_trigger_factor"],
+          "Numerics.ale.reale_dt_trigger_factor");
+      if (!(numerics.ale.reale_dt_trigger_factor > 0.0) ||
+          !(numerics.ale.reale_dt_trigger_factor <= 1.0)) {
+        throw ConfigError(
+            "Numerics.ale.reale_dt_trigger_factor must be in (0, 1]");
+      }
+    }
+    if (has_key(ale, "reale_dt_trigger_cooldown")) {
+      numerics.ale.reale_dt_trigger_cooldown = strict_int32(
+          ale["reale_dt_trigger_cooldown"],
+          "Numerics.ale.reale_dt_trigger_cooldown");
+      if (numerics.ale.reale_dt_trigger_cooldown < 0 ||
+          numerics.ale.reale_dt_trigger_cooldown > 100000) {
+        throw ConfigError(
+            "Numerics.ale.reale_dt_trigger_cooldown must be in "
+            "[0, 100000]");
+      }
     }
     if (has_key(ale, "ale_identity_mode")) {
       numerics.ale.ale_identity_mode = strict_bool(
@@ -8653,6 +11591,11 @@ void Builder::set_numerics(py::dict kwargs) {
       if (!swept_volume_sign_fixed_explicit) {
         numerics.ale.swept_volume_sign_fixed = alias_value;
       }
+    }
+    if (!numerics.ale.swept_volume_sign_fixed) {
+      throw ConfigError(
+          "legacy swept-volume sign convention removed 2026-08-05 (epoch "
+          "2); see NUMERICS");
     }
     if (has_key(ale, "every_n_steps")) {
       numerics.ale.every_n_steps =
@@ -8843,6 +11786,371 @@ void Builder::set_numerics(py::dict kwargs) {
           !(button_morph_cfg.t_end_s > button_morph_cfg.t_start_s)) {
         throw ConfigError(
             "Numerics.ale.button_morph.t_end_s must exceed t_start_s when enabled");
+      }
+    }
+    if (has_key(ale, "runtime_controller")) {
+      const py::handle runtime_controller_obj = ale["runtime_controller"];
+      if (!py::isinstance<py::dict>(runtime_controller_obj)) {
+        throw_value_type_error("Numerics.ale.runtime_controller", "dict",
+                               runtime_controller_obj);
+      }
+      const py::dict runtime_controller =
+          py::reinterpret_borrow<py::dict>(runtime_controller_obj);
+      enforce_known_keys(runtime_controller,
+                         "Numerics.ale.runtime_controller",
+                         {"monitor_enabled", "monitor_every", "shell_rows",
+                          "controller_shell_rows", "cap_columns",
+                          "q_soft", "q_hard", "q_recover", "h_soft",
+                          "h_hard", "h_recover", "soft_persistence",
+                          "recover_checks", "winslow_sweeps",
+                          "winslow_omega", "beta_monitor_soft",
+                          "beta_monitor_hard", "beta_mass", "beta_front",
+                          "beta_theta", "g_max", "front_width_cells",
+                          "cap_fraction", "cap_normal_fraction",
+                          "controller_enabled", "commit_rollback_enabled",
+                          "activation_front_mode",
+                          "activation_front_margin_hs", "activation_time_s",
+                          "cadence_soft",
+                          "cadence_hard", "cadence_recovery",
+                          "pre_step_enabled", "failures_hard_force",
+                          "failures_big_repair", "escalation_max_failures"});
+      auto& runtime_cfg = numerics.ale.runtime_controller;
+      if (has_key(runtime_controller, "monitor_enabled")) {
+        runtime_cfg.monitor_enabled = strict_bool(
+            runtime_controller["monitor_enabled"],
+            "Numerics.ale.runtime_controller.monitor_enabled");
+      }
+      if (has_key(runtime_controller, "monitor_every")) {
+        runtime_cfg.monitor_every = strict_int32(
+            runtime_controller["monitor_every"],
+            "Numerics.ale.runtime_controller.monitor_every");
+      }
+      if (has_key(runtime_controller, "shell_rows")) {
+        runtime_cfg.shell_rows = strict_int32(
+            runtime_controller["shell_rows"],
+            "Numerics.ale.runtime_controller.shell_rows");
+      }
+      if (has_key(runtime_controller, "controller_shell_rows")) {
+        runtime_cfg.controller_shell_rows = strict_int32(
+            runtime_controller["controller_shell_rows"],
+            "Numerics.ale.runtime_controller.controller_shell_rows");
+      }
+      if (has_key(runtime_controller, "cap_columns")) {
+        runtime_cfg.cap_columns = strict_int32(
+            runtime_controller["cap_columns"],
+            "Numerics.ale.runtime_controller.cap_columns");
+      }
+      if (has_key(runtime_controller, "q_soft")) {
+        runtime_cfg.q_soft = numeric_as_double(
+            runtime_controller["q_soft"],
+            "Numerics.ale.runtime_controller.q_soft");
+      }
+      if (has_key(runtime_controller, "q_hard")) {
+        runtime_cfg.q_hard = numeric_as_double(
+            runtime_controller["q_hard"],
+            "Numerics.ale.runtime_controller.q_hard");
+      }
+      if (has_key(runtime_controller, "q_recover")) {
+        runtime_cfg.q_recover = numeric_as_double(
+            runtime_controller["q_recover"],
+            "Numerics.ale.runtime_controller.q_recover");
+      }
+      if (has_key(runtime_controller, "h_soft")) {
+        runtime_cfg.h_soft = numeric_as_double(
+            runtime_controller["h_soft"],
+            "Numerics.ale.runtime_controller.h_soft");
+      }
+      if (has_key(runtime_controller, "h_hard")) {
+        runtime_cfg.h_hard = numeric_as_double(
+            runtime_controller["h_hard"],
+            "Numerics.ale.runtime_controller.h_hard");
+      }
+      if (has_key(runtime_controller, "h_recover")) {
+        runtime_cfg.h_recover = numeric_as_double(
+            runtime_controller["h_recover"],
+            "Numerics.ale.runtime_controller.h_recover");
+      }
+      if (has_key(runtime_controller, "soft_persistence")) {
+        runtime_cfg.soft_persistence = strict_int32(
+            runtime_controller["soft_persistence"],
+            "Numerics.ale.runtime_controller.soft_persistence");
+      }
+      if (has_key(runtime_controller, "recover_checks")) {
+        runtime_cfg.recover_checks = strict_int32(
+            runtime_controller["recover_checks"],
+            "Numerics.ale.runtime_controller.recover_checks");
+      }
+      if (has_key(runtime_controller, "winslow_sweeps")) {
+        runtime_cfg.winslow_sweeps = strict_int32(
+            runtime_controller["winslow_sweeps"],
+            "Numerics.ale.runtime_controller.winslow_sweeps");
+      }
+      if (has_key(runtime_controller, "winslow_omega")) {
+        runtime_cfg.winslow_omega = numeric_as_double(
+            runtime_controller["winslow_omega"],
+            "Numerics.ale.runtime_controller.winslow_omega");
+      }
+      if (has_key(runtime_controller, "beta_monitor_soft")) {
+        runtime_cfg.beta_monitor_soft = numeric_as_double(
+            runtime_controller["beta_monitor_soft"],
+            "Numerics.ale.runtime_controller.beta_monitor_soft");
+      }
+      if (has_key(runtime_controller, "beta_monitor_hard")) {
+        runtime_cfg.beta_monitor_hard = numeric_as_double(
+            runtime_controller["beta_monitor_hard"],
+            "Numerics.ale.runtime_controller.beta_monitor_hard");
+      }
+      if (has_key(runtime_controller, "beta_mass")) {
+        runtime_cfg.beta_mass = numeric_as_double(
+            runtime_controller["beta_mass"],
+            "Numerics.ale.runtime_controller.beta_mass");
+      }
+      if (has_key(runtime_controller, "beta_front")) {
+        runtime_cfg.beta_front = numeric_as_double(
+            runtime_controller["beta_front"],
+            "Numerics.ale.runtime_controller.beta_front");
+      }
+      if (has_key(runtime_controller, "beta_theta")) {
+        runtime_cfg.beta_theta = numeric_as_double(
+            runtime_controller["beta_theta"],
+            "Numerics.ale.runtime_controller.beta_theta");
+      }
+      if (has_key(runtime_controller, "g_max")) {
+        runtime_cfg.g_max = numeric_as_double(
+            runtime_controller["g_max"],
+            "Numerics.ale.runtime_controller.g_max");
+      }
+      if (has_key(runtime_controller, "front_width_cells")) {
+        runtime_cfg.front_width_cells = numeric_as_double(
+            runtime_controller["front_width_cells"],
+            "Numerics.ale.runtime_controller.front_width_cells");
+      }
+      if (has_key(runtime_controller, "cap_fraction")) {
+        runtime_cfg.cap_fraction = numeric_as_double(
+            runtime_controller["cap_fraction"],
+            "Numerics.ale.runtime_controller.cap_fraction");
+      }
+      if (has_key(runtime_controller, "cap_normal_fraction")) {
+        runtime_cfg.cap_normal_fraction = numeric_as_double(
+            runtime_controller["cap_normal_fraction"],
+            "Numerics.ale.runtime_controller.cap_normal_fraction");
+      }
+      if (has_key(runtime_controller, "controller_enabled")) {
+        runtime_cfg.controller_enabled = strict_bool(
+            runtime_controller["controller_enabled"],
+            "Numerics.ale.runtime_controller.controller_enabled");
+      }
+      if (has_key(runtime_controller, "commit_rollback_enabled")) {
+        runtime_cfg.commit_rollback_enabled = strict_bool(
+            runtime_controller["commit_rollback_enabled"],
+            "Numerics.ale.runtime_controller.commit_rollback_enabled");
+      }
+      if (has_key(runtime_controller, "activation_front_mode")) {
+        runtime_cfg.activation_front_mode = strict_string(
+            runtime_controller["activation_front_mode"],
+            "Numerics.ale.runtime_controller.activation_front_mode");
+      }
+      if (has_key(runtime_controller, "activation_front_margin_hs")) {
+        runtime_cfg.activation_front_margin_hs = numeric_as_double(
+            runtime_controller["activation_front_margin_hs"],
+            "Numerics.ale.runtime_controller.activation_front_margin_hs");
+      }
+      if (has_key(runtime_controller, "activation_time_s")) {
+        runtime_cfg.activation_time_s = numeric_as_double(
+            runtime_controller["activation_time_s"],
+            "Numerics.ale.runtime_controller.activation_time_s");
+      }
+      if (has_key(runtime_controller, "cadence_soft")) {
+        runtime_cfg.cadence_soft = strict_int32(
+            runtime_controller["cadence_soft"],
+            "Numerics.ale.runtime_controller.cadence_soft");
+      }
+      if (has_key(runtime_controller, "cadence_hard")) {
+        runtime_cfg.cadence_hard = strict_int32(
+            runtime_controller["cadence_hard"],
+            "Numerics.ale.runtime_controller.cadence_hard");
+      }
+      if (has_key(runtime_controller, "cadence_recovery")) {
+        runtime_cfg.cadence_recovery = strict_int32(
+            runtime_controller["cadence_recovery"],
+            "Numerics.ale.runtime_controller.cadence_recovery");
+      }
+      if (has_key(runtime_controller, "pre_step_enabled")) {
+        runtime_cfg.pre_step_enabled = strict_bool(
+            runtime_controller["pre_step_enabled"],
+            "Numerics.ale.runtime_controller.pre_step_enabled");
+      }
+      if (has_key(runtime_controller, "failures_hard_force")) {
+        runtime_cfg.failures_hard_force = strict_int32(
+            runtime_controller["failures_hard_force"],
+            "Numerics.ale.runtime_controller.failures_hard_force");
+      }
+      if (has_key(runtime_controller, "failures_big_repair")) {
+        runtime_cfg.failures_big_repair = strict_int32(
+            runtime_controller["failures_big_repair"],
+            "Numerics.ale.runtime_controller.failures_big_repair");
+      }
+      if (has_key(runtime_controller, "escalation_max_failures")) {
+        runtime_cfg.escalation_max_failures = strict_int32(
+            runtime_controller["escalation_max_failures"],
+            "Numerics.ale.runtime_controller.escalation_max_failures");
+      }
+
+      ensure_int_ge(runtime_cfg.monitor_every, 1,
+                    "Numerics.ale.runtime_controller.monitor_every");
+      ensure_int_ge(runtime_cfg.shell_rows, 0,
+                    "Numerics.ale.runtime_controller.shell_rows");
+      ensure_int_ge(runtime_cfg.controller_shell_rows, 0,
+                    "Numerics.ale.runtime_controller.controller_shell_rows");
+      ensure_int_ge(runtime_cfg.cap_columns, 0,
+                    "Numerics.ale.runtime_controller.cap_columns");
+      ensure_int_ge(runtime_cfg.soft_persistence, 1,
+                    "Numerics.ale.runtime_controller.soft_persistence");
+      ensure_int_ge(runtime_cfg.recover_checks, 1,
+                    "Numerics.ale.runtime_controller.recover_checks");
+      ensure_int_ge(runtime_cfg.cadence_soft, 1,
+                    "Numerics.ale.runtime_controller.cadence_soft");
+      ensure_int_ge(runtime_cfg.cadence_hard, 1,
+                    "Numerics.ale.runtime_controller.cadence_hard");
+      ensure_int_ge(runtime_cfg.cadence_recovery, 1,
+                    "Numerics.ale.runtime_controller.cadence_recovery");
+      if (runtime_cfg.failures_hard_force < 1 ||
+          runtime_cfg.failures_big_repair < runtime_cfg.failures_hard_force ||
+          runtime_cfg.escalation_max_failures <
+              runtime_cfg.failures_big_repair) {
+        throw ValueError(
+            "Numerics.ale.runtime_controller failure thresholds must satisfy "
+            "1 <= failures_hard_force <= failures_big_repair <= "
+            "escalation_max_failures");
+      }
+      if (runtime_cfg.cadence_hard > runtime_cfg.cadence_soft) {
+        throw ValueError(
+            "Numerics.ale.runtime_controller.cadence_hard must be <= cadence_soft");
+      }
+      if (runtime_cfg.cadence_recovery < runtime_cfg.cadence_soft) {
+        throw ValueError(
+            "Numerics.ale.runtime_controller.cadence_recovery must be >= cadence_soft");
+      }
+      if (runtime_cfg.controller_enabled && !runtime_cfg.monitor_enabled) {
+        throw ValueError(
+            "Numerics.ale.runtime_controller.controller_enabled=true requires monitor_enabled=true");
+      }
+      if (runtime_cfg.activation_front_mode != "min" &&
+          runtime_cfg.activation_front_mode != "mean") {
+        throw ValueError(
+            "Numerics.ale.runtime_controller.activation_front_mode must be one of {\"min\", \"mean\"}");
+      }
+      if (!(std::isfinite(runtime_cfg.activation_front_margin_hs) &&
+            runtime_cfg.activation_front_margin_hs >= 0.0)) {
+        throw ValueError(
+            "Numerics.ale.runtime_controller.activation_front_margin_hs must be finite and >= 0");
+      }
+      if (runtime_cfg.winslow_sweeps < 1 || runtime_cfg.winslow_sweeps > 16) {
+        throw ValueError(
+            "Numerics.ale.runtime_controller.winslow_sweeps must be in [1, 16]");
+      }
+      if (!(std::isfinite(runtime_cfg.q_soft) && runtime_cfg.q_soft > 0.0 &&
+            runtime_cfg.q_soft <= 1.0)) {
+        throw ValueError(
+            "Numerics.ale.runtime_controller.q_soft must be finite and in (0, 1]");
+      }
+      if (!(std::isfinite(runtime_cfg.q_hard) && runtime_cfg.q_hard > 0.0)) {
+        throw ValueError(
+            "Numerics.ale.runtime_controller.q_hard must be finite and > 0");
+      }
+      if (!(std::isfinite(runtime_cfg.q_recover) &&
+            runtime_cfg.q_recover > 0.0 && runtime_cfg.q_recover <= 1.0)) {
+        throw ValueError(
+            "Numerics.ale.runtime_controller.q_recover must be finite and in (0, 1]");
+      }
+      if (!(runtime_cfg.q_hard < runtime_cfg.q_soft)) {
+        throw ValueError(
+            "Numerics.ale.runtime_controller.q_hard must be less than q_soft");
+      }
+      if (!(runtime_cfg.q_soft < runtime_cfg.q_recover)) {
+        throw ValueError(
+            "Numerics.ale.runtime_controller.q_recover must exceed q_soft");
+      }
+      if (!(std::isfinite(runtime_cfg.h_soft) && runtime_cfg.h_soft > 0.0)) {
+        throw ValueError(
+            "Numerics.ale.runtime_controller.h_soft must be finite and > 0");
+      }
+      if (!(std::isfinite(runtime_cfg.h_hard) && runtime_cfg.h_hard > 0.0)) {
+        throw ValueError(
+            "Numerics.ale.runtime_controller.h_hard must be finite and > 0");
+      }
+      if (!(std::isfinite(runtime_cfg.h_recover) &&
+            runtime_cfg.h_recover > 0.0)) {
+        throw ValueError(
+            "Numerics.ale.runtime_controller.h_recover must be finite and > 0");
+      }
+      if (!(runtime_cfg.h_hard < runtime_cfg.h_soft)) {
+        throw ValueError(
+            "Numerics.ale.runtime_controller.h_hard must be less than h_soft");
+      }
+      if (!(runtime_cfg.h_soft < runtime_cfg.h_recover)) {
+        throw ValueError(
+            "Numerics.ale.runtime_controller.h_recover must exceed h_soft");
+      }
+      if (!(std::isfinite(runtime_cfg.winslow_omega) &&
+            runtime_cfg.winslow_omega > 0.0 &&
+            runtime_cfg.winslow_omega <= 1.0)) {
+        throw ValueError(
+            "Numerics.ale.runtime_controller.winslow_omega must be finite and in (0, 1]");
+      }
+      if (!(std::isfinite(runtime_cfg.beta_monitor_soft) &&
+            runtime_cfg.beta_monitor_soft >= 0.0 &&
+            runtime_cfg.beta_monitor_soft < 1.0)) {
+        throw ValueError(
+            "Numerics.ale.runtime_controller.beta_monitor_soft must be finite and in [0, 1)");
+      }
+      if (!(std::isfinite(runtime_cfg.beta_monitor_hard) &&
+            runtime_cfg.beta_monitor_hard >= 0.0 &&
+            runtime_cfg.beta_monitor_hard < 1.0)) {
+        throw ValueError(
+            "Numerics.ale.runtime_controller.beta_monitor_hard must be finite and in [0, 1)");
+      }
+      if (!(std::isfinite(runtime_cfg.beta_mass) &&
+            runtime_cfg.beta_mass >= 0.0 && runtime_cfg.beta_mass <= 0.5)) {
+        throw ValueError(
+            "Numerics.ale.runtime_controller.beta_mass must be finite and in [0, 0.5]");
+      }
+      if (!(std::isfinite(runtime_cfg.beta_front) &&
+            runtime_cfg.beta_front >= 0.0 && runtime_cfg.beta_front <= 0.5)) {
+        throw ValueError(
+            "Numerics.ale.runtime_controller.beta_front must be finite and in [0, 0.5]");
+      }
+      if (runtime_cfg.beta_mass + runtime_cfg.beta_front > 0.9) {
+        throw ValueError(
+            "Numerics.ale.runtime_controller.beta_mass + beta_front must be <= 0.9");
+      }
+      if (!(std::isfinite(runtime_cfg.beta_theta) &&
+            runtime_cfg.beta_theta >= 0.0 && runtime_cfg.beta_theta <= 0.5)) {
+        throw ValueError(
+            "Numerics.ale.runtime_controller.beta_theta must be finite and in [0, 0.5]");
+      }
+      if (!(std::isfinite(runtime_cfg.g_max) && runtime_cfg.g_max > 1.0 &&
+            runtime_cfg.g_max < 1.6)) {
+        throw ValueError(
+            "Numerics.ale.runtime_controller.g_max must be finite and in (1, 1.6)");
+      }
+      if (!(std::isfinite(runtime_cfg.front_width_cells) &&
+            runtime_cfg.front_width_cells >= 1.0 &&
+            runtime_cfg.front_width_cells <= 8.0)) {
+        throw ValueError(
+            "Numerics.ale.runtime_controller.front_width_cells must be finite and in [1, 8]");
+      }
+      if (!(std::isfinite(runtime_cfg.cap_fraction) &&
+            runtime_cfg.cap_fraction > 0.0 &&
+            runtime_cfg.cap_fraction <= 0.2)) {
+        throw ValueError(
+            "Numerics.ale.runtime_controller.cap_fraction must be finite and in (0, 0.2]");
+      }
+      if (!(std::isfinite(runtime_cfg.cap_normal_fraction) &&
+            runtime_cfg.cap_normal_fraction > 0.0 &&
+            runtime_cfg.cap_normal_fraction <= runtime_cfg.cap_fraction)) {
+        throw ValueError(
+            "Numerics.ale.runtime_controller.cap_normal_fraction must be finite and in (0, cap_fraction]");
       }
     }
     if (has_key(ale, "reference_barrier_enabled")) {
@@ -9055,6 +12363,20 @@ void Builder::set_numerics(py::dict kwargs) {
           ale["safe_backtrack_binary_iters"],
           "Numerics.ale.safe_backtrack_binary_iters");
     }
+    if (has_key(ale, "mesh_epoch_enabled")) {
+      numerics.ale.mesh_epoch_enabled = strict_bool(
+          ale["mesh_epoch_enabled"],
+          "Numerics.ale.mesh_epoch_enabled");
+    }
+    if (has_key(ale, "mesh_epoch_max_per_step")) {
+      numerics.ale.mesh_epoch_max_per_step = strict_int32(
+          ale["mesh_epoch_max_per_step"],
+          "Numerics.ale.mesh_epoch_max_per_step");
+      if (numerics.ale.mesh_epoch_max_per_step < 1) {
+        throw ConfigError(
+            "Numerics.ale.mesh_epoch_max_per_step must be >= 1");
+      }
+    }
     if (has_key(ale, "corner_cell_aspect_protection_enabled")) {
       numerics.ale.corner_cell_aspect_protection_enabled = strict_bool(
           ale["corner_cell_aspect_protection_enabled"],
@@ -9108,64 +12430,64 @@ void Builder::set_numerics(py::dict kwargs) {
       }
       const py::dict euler_window =
           py::reinterpret_borrow<py::dict>(euler_window_obj);
-      enforce_known_keys(
+      parse_euler_window_dict(
           euler_window,
           "Numerics.ale.euler_window",
-          {"enabled", "shape", "r0", "r1", "z0", "z1", "cr", "cz",
-           "rad_in", "rad_out", "transition_width"});
-      auto& euler_window_cfg = numerics.ale.euler_window;
-      if (has_key(euler_window, "enabled")) {
-        euler_window_cfg.enabled = strict_bool(
-            euler_window["enabled"],
-            "Numerics.ale.euler_window.enabled");
+          numerics.ale.euler_window);
+      numerics.ale.euler_window.replay_table_path =
+          resolve_namelist_relative_path(
+              config, numerics.ale.euler_window.replay_table_path);
+    }
+    if (has_key(ale, "euler_windows")) {
+      const py::handle euler_windows_obj = ale["euler_windows"];
+      if (!py::isinstance<py::sequence>(euler_windows_obj) ||
+          py::isinstance<py::str>(euler_windows_obj)) {
+        throw_value_type_error(
+            "Numerics.ale.euler_windows", "list[dict]", euler_windows_obj);
       }
-      if (has_key(euler_window, "shape")) {
-        euler_window_cfg.shape = strict_string(
-            euler_window["shape"], "Numerics.ale.euler_window.shape");
-        if (euler_window_cfg.shape != "rectangle" &&
-            euler_window_cfg.shape != "annulus") {
-          throw ValueError(
-              "Numerics.ale.euler_window.shape must be one of "
-              "{\"rectangle\", \"annulus\"}");
+      const py::sequence euler_windows =
+          py::reinterpret_borrow<py::sequence>(euler_windows_obj);
+      numerics.ale.euler_windows.clear();
+      numerics.ale.euler_windows.reserve(euler_windows.size());
+      for (std::size_t i = 0; i < euler_windows.size(); ++i) {
+        const std::string path =
+            "Numerics.ale.euler_windows[" + std::to_string(i) + "]";
+        const py::handle euler_window_obj = euler_windows[i];
+        if (!py::isinstance<py::dict>(euler_window_obj)) {
+          throw_value_type_error(path, "dict", euler_window_obj);
         }
+        const py::dict euler_window =
+            py::reinterpret_borrow<py::dict>(euler_window_obj);
+        Config::NumericsConfig::AleConfig::EulerWindowConfig config;
+        parse_euler_window_dict(euler_window, path, config);
+        config.replay_table_path =
+            resolve_namelist_relative_path(this->config,
+                                           config.replay_table_path);
+        numerics.ale.euler_windows.push_back(std::move(config));
       }
-      if (has_key(euler_window, "r0")) {
-        euler_window_cfg.r0 = numeric_as_double(
-            euler_window["r0"], "Numerics.ale.euler_window.r0");
+    }
+    if (has_key(ale, "band_ale")) {
+      const py::handle band_ale_obj = ale["band_ale"];
+      if (!py::isinstance<py::dict>(band_ale_obj)) {
+        throw_value_type_error(
+            "Numerics.ale.band_ale", "dict", band_ale_obj);
       }
-      if (has_key(euler_window, "r1")) {
-        euler_window_cfg.r1 = numeric_as_double(
-            euler_window["r1"], "Numerics.ale.euler_window.r1");
+      const py::dict band_ale =
+          py::reinterpret_borrow<py::dict>(band_ale_obj);
+      parse_band_ale_dict(
+          band_ale, "Numerics.ale.band_ale", numerics.ale.band_ale);
+    }
+    if (has_key(ale, "evacuated_cell")) {
+      const py::handle evacuated_cell_obj = ale["evacuated_cell"];
+      if (!py::isinstance<py::dict>(evacuated_cell_obj)) {
+        throw_value_type_error(
+            "Numerics.ale.evacuated_cell", "dict", evacuated_cell_obj);
       }
-      if (has_key(euler_window, "z0")) {
-        euler_window_cfg.z0 = numeric_as_double(
-            euler_window["z0"], "Numerics.ale.euler_window.z0");
-      }
-      if (has_key(euler_window, "z1")) {
-        euler_window_cfg.z1 = numeric_as_double(
-            euler_window["z1"], "Numerics.ale.euler_window.z1");
-      }
-      if (has_key(euler_window, "cr")) {
-        euler_window_cfg.cr = numeric_as_double(
-            euler_window["cr"], "Numerics.ale.euler_window.cr");
-      }
-      if (has_key(euler_window, "cz")) {
-        euler_window_cfg.cz = numeric_as_double(
-            euler_window["cz"], "Numerics.ale.euler_window.cz");
-      }
-      if (has_key(euler_window, "rad_in")) {
-        euler_window_cfg.rad_in = numeric_as_double(
-            euler_window["rad_in"], "Numerics.ale.euler_window.rad_in");
-      }
-      if (has_key(euler_window, "rad_out")) {
-        euler_window_cfg.rad_out = numeric_as_double(
-            euler_window["rad_out"], "Numerics.ale.euler_window.rad_out");
-      }
-      if (has_key(euler_window, "transition_width")) {
-        euler_window_cfg.transition_width = numeric_as_double(
-            euler_window["transition_width"],
-            "Numerics.ale.euler_window.transition_width");
-      }
+      const py::dict evacuated_cell =
+          py::reinterpret_borrow<py::dict>(evacuated_cell_obj);
+      parse_evacuated_cell_dict(evacuated_cell,
+                                "Numerics.ale.evacuated_cell",
+                                numerics.ale.evacuated_cell);
     }
     if (has_key(ale, "rezone_local_admissibility_linesearch")) {
       numerics.ale.rezone_local_admissibility_linesearch = strict_bool(
@@ -9594,36 +12916,17 @@ void Builder::set_numerics(py::dict kwargs) {
     if (!(numerics.ale.m1_barrier_beta >= 0.0)) {
       throw ValueError("Numerics.ale.m1_barrier_beta must be >= 0");
     }
-    if (numerics.ale.euler_window.enabled) {
-      if (numerics.ale.euler_window.shape != "rectangle" &&
-          numerics.ale.euler_window.shape != "annulus") {
-        throw ValueError(
-            "Numerics.ale.euler_window.shape must be one of "
-            "{\"rectangle\", \"annulus\"}");
-      }
-      if (!(numerics.ale.euler_window.transition_width > 0.0)) {
-        throw ValueError(
-            "Numerics.ale.euler_window.transition_width must be > 0 when "
-            "enabled");
-      }
-      if (numerics.ale.euler_window.shape == "rectangle" &&
-          (!(numerics.ale.euler_window.r1 >
-             numerics.ale.euler_window.r0) ||
-           !(numerics.ale.euler_window.z1 >
-             numerics.ale.euler_window.z0))) {
-        throw ValueError(
-            "Numerics.ale.euler_window rectangle bounds require "
-            "r1 > r0 and z1 > z0");
-      }
-      if (numerics.ale.euler_window.shape == "annulus" &&
-          (!(numerics.ale.euler_window.rad_in >= 0.0) ||
-           !(numerics.ale.euler_window.rad_out >
-             numerics.ale.euler_window.rad_in))) {
-        throw ValueError(
-            "Numerics.ale.euler_window annulus bounds require "
-            "rad_out > rad_in >= 0");
-      }
+    validate_euler_window_config(
+        numerics.ale.euler_window, "Numerics.ale.euler_window");
+    for (std::size_t i = 0; i < numerics.ale.euler_windows.size(); ++i) {
+      validate_euler_window_config(
+          numerics.ale.euler_windows[i],
+          "Numerics.ale.euler_windows[" + std::to_string(i) + "]");
     }
+    validate_band_ale_config(
+        numerics.ale.band_ale, "Numerics.ale.band_ale");
+    validate_evacuated_cell_config(
+        numerics.ale.evacuated_cell, "Numerics.ale.evacuated_cell");
     if (!(numerics.ale.rezone_local_j_floor_rel >= 0.0)) {
       throw ValueError("Numerics.ale.rezone_local_j_floor_rel must be >= 0");
     }
@@ -9783,6 +13086,18 @@ void Builder::set_numerics(py::dict kwargs) {
           ale["central_pseudo_core_s_c"],
           "Numerics.ale.central_pseudo_core_s_c");
     }
+    if (has_key(ale, "central_pseudo_core_activation_time_s")) {
+      numerics.ale.central_pseudo_core_activation_time_s = numeric_as_double(
+          ale["central_pseudo_core_activation_time_s"],
+          "Numerics.ale.central_pseudo_core_activation_time_s");
+      if (!(std::isfinite(
+                numerics.ale.central_pseudo_core_activation_time_s) &&
+            numerics.ale.central_pseudo_core_activation_time_s >= 0.0)) {
+        throw ConfigError(
+            "Numerics.ale.central_pseudo_core_activation_time_s must be "
+            "finite and >= 0");
+      }
+    }
     if (has_key(ale, "central_pseudo_core_ring_absorption_enabled")) {
       numerics.ale.central_pseudo_core_ring_absorption_enabled = strict_bool(
           ale["central_pseudo_core_ring_absorption_enabled"],
@@ -9925,30 +13240,6 @@ void Builder::set_numerics(py::dict kwargs) {
         throw ConfigError(
             "Numerics.ale.central_pseudo_core_absorb_watch_rows must be in "
             "[1, 8]");
-      }
-    }
-    if (has_key(ale, "central_pseudo_core_terminal_absorb_enabled")) {
-      numerics.ale.central_pseudo_core_terminal_absorb_enabled = strict_bool(
-          ale["central_pseudo_core_terminal_absorb_enabled"],
-          "Numerics.ale.central_pseudo_core_terminal_absorb_enabled");
-    }
-    if (has_key(ale, "central_pseudo_core_terminal_rebound_factor")) {
-      numerics.ale.central_pseudo_core_terminal_rebound_factor =
-          numeric_as_double(
-              ale["central_pseudo_core_terminal_rebound_factor"],
-              "Numerics.ale.central_pseudo_core_terminal_rebound_factor");
-      if (!(numerics.ale.central_pseudo_core_terminal_rebound_factor > 1.0)) {
-        throw ConfigError(
-            "Numerics.ale.central_pseudo_core_terminal_rebound_factor must be > 1");
-      }
-    }
-    if (has_key(ale, "central_pseudo_core_terminal_tail_dt_s")) {
-      numerics.ale.central_pseudo_core_terminal_tail_dt_s = numeric_as_double(
-          ale["central_pseudo_core_terminal_tail_dt_s"],
-          "Numerics.ale.central_pseudo_core_terminal_tail_dt_s");
-      if (!(numerics.ale.central_pseudo_core_terminal_tail_dt_s > 0.0)) {
-        throw ConfigError(
-            "Numerics.ale.central_pseudo_core_terminal_tail_dt_s must be > 0");
       }
     }
     if (has_key(ale, "remap_mass_closure_reject_tol")) {
@@ -11014,9 +14305,9 @@ void Builder::set_output(py::dict kwargs) {
   enforce_known_keys(kwargs, "Output",
                      {"directory", "format", "plot_every", "history_every",
                       "checkpoint_every", "plot_every_s", "history_every_s",
-                      "checkpoint_every_s", "checkpoint_keep_last", "compression",
-                      "compression_level", "save_namelist_copy", "save_frozen_config",
-                      "plot_fields"});
+                      "checkpoint_every_s", "write_final_snapshot",
+                      "checkpoint_keep_last", "compression", "compression_level",
+                      "save_namelist_copy", "save_frozen_config", "plot_fields"});
 
   auto& output = config.output;
   if (has_key(kwargs, "directory")) {
@@ -11042,6 +14333,10 @@ void Builder::set_output(py::dict kwargs) {
   if (has_key(kwargs, "plot_every_s")) {
     output.plot_every_s =
         numeric_as_double(kwargs["plot_every_s"], "Output.plot_every_s");
+  }
+  if (has_key(kwargs, "write_final_snapshot")) {
+    output.write_final_snapshot = strict_bool(
+        kwargs["write_final_snapshot"], "Output.write_final_snapshot");
   }
   if (has_key(kwargs, "history_every_s")) {
     output.history_every_s =
@@ -11638,6 +14933,33 @@ void Builder::validate() {
   }
   if (!is_dimension(main.dimension)) {
     throw ConfigError("Main.dimension must be \"1D_SPH\", \"1D_CYL\", or \"2D_RZ\"");
+  }
+  if (numerics.hydro.pressure_drive_perturbation.enabled &&
+      main.dimension != "2D_RZ") {
+    throw ConfigError(
+        "pressure_drive_perturbation requires a 2D_RZ pressure drive");
+  }
+  if (numerics.hydro.pressure_drive_perturbation.enabled &&
+      numerics.hydro.ring7_quotient_enabled) {
+    throw ConfigError(
+        "pressure_drive_perturbation is not supported with the ring7 seam quotient");
+  }
+  if (mesh.shell_polar_cap_dendrite && laser.enabled) {
+    throw ConfigError(
+        "Laser.enabled=true is not supported with "
+        "Mesh.shell_polar_cap_dendrite=true (laser+shellcap is out of v1 scope)");
+  }
+  if (mesh.shell_polar_cap_dendrite &&
+      numerics.ale.pole_axis_bbsw_enabled) {
+    throw ConfigError(
+        "Numerics.ale.pole_axis_bbsw_enabled=true is not supported with "
+        "Mesh.shell_polar_cap_dendrite=true (pending shell-chain generalization)");
+  }
+  if (mesh.shell_polar_cap_dendrite &&
+      numerics.hydro.ring7_quotient_enabled) {
+    throw ConfigError(
+        "Numerics.hydro.ring7_quotient_enabled=true is not supported with "
+        "Mesh.shell_polar_cap_dendrite=true (pending shell-chain generalization)");
   }
   if (!is_temperature_model(main.temperature_model)) {
     throw ConfigError("Main.temperature_model must be \"1T\", \"2T\", or \"auto\"");
@@ -13182,6 +16504,20 @@ void Builder::validate() {
         "multiblock_transition_scheme=\"hermite_bridge\"");
   }
   tenryu::core::validate_multiblock_topology_config(config);
+  if (numerics.diagnostics.refinement_autopilot.mode == "arm_exit" &&
+      mesh.topology_scheme == TopologyScheme::SINGLE_BLOCK) {
+    throw ConfigError(
+        "Diagnostics.refinement_autopilot.mode=\"arm_exit\" requires a "
+        "multiblock topology (the epoch/swap machinery is multiblock-only; "
+        "use \"shadow\" on single-block meshes)");
+  }
+  if (numerics.conduction.enabled && main.dimension == "2D_RZ" &&
+      mesh.topology_scheme != TopologyScheme::SINGLE_BLOCK) {
+    throw ConfigError(
+        "Numerics.conduction.enabled=True requires the single_block 2D_RZ "
+        "topology (the structured conduction kernels do not address "
+        "multiblock CSR meshes; fail-closed refusal)");
+  }
   if (mesh.topology_scheme != TopologyScheme::SINGLE_BLOCK &&
       mesh.topology_scheme != TopologyScheme::PENTAGON_BELT_SHELL) {
     if (!mesh.grid_segments.empty()) {
@@ -14292,6 +17628,14 @@ void Builder::validate() {
         !numerics.hydro.boundary_2d.z_top_cfg.is_state_supply()) {
       throw ConfigError(
           "Radiation.multigroup_diffusion boundary.z_top='state_supply' requires Numerics.hydro.boundary_2d.z_top.type='state_supply'");
+    }
+    if ((fld_bottom_state_supply &&
+         std::isfinite(
+             numerics.hydro.boundary_2d.z_bottom_cfg.drive_t_end_s)) ||
+        (fld_top_state_supply &&
+         std::isfinite(numerics.hydro.boundary_2d.z_top_cfg.drive_t_end_s))) {
+      throw ConfigError(
+          "state_supply drive window is not supported with an FLD state_supply z-boundary in this version");
     }
   }
   const auto supported_sn_angles = [](const int n) {
@@ -15678,12 +19022,21 @@ void Builder::validate() {
       throw ConfigError(
           "Numerics.ale.central_pseudo_core_enabled=true is supported only in 2D_RZ");
     }
-    if (mesh.topology_scheme != TopologyScheme::MULTIBLOCK_HALF_BUTTERFLY_5BLOCK &&
-        mesh.topology_scheme !=
-            TopologyScheme::MULTIBLOCK_HALF_BUTTERFLY_TRIFAN_CAP_5BLOCK) {
+    const bool five_block =
+        mesh.topology_scheme ==
+            TopologyScheme::MULTIBLOCK_HALF_BUTTERFLY_5BLOCK ||
+        mesh.topology_scheme ==
+            TopologyScheme::MULTIBLOCK_HALF_BUTTERFLY_TRIFAN_CAP_5BLOCK;
+    const bool hybrid_trifan_cap =
+        mesh.topology_scheme ==
+            TopologyScheme::MULTIBLOCK_POLAR_TIER_CART_CENTER &&
+        mesh.polar_tier_center_kind == "trifan_cap";
+    if (!five_block && !hybrid_trifan_cap) {
       throw ConfigError(
           "Numerics.ale.central_pseudo_core_enabled=true requires a 5-block "
-          "multiblock center topology");
+          "multiblock center topology or "
+          "Mesh.topology_scheme=\"multiblock_polar_tier_cart_center\" with "
+          "Mesh.polar_tier_center_kind=\"trifan_cap\"");
     }
     if (numerics.materials.per_material_conservation_enabled) {
       throw ConfigError(
@@ -15864,33 +19217,82 @@ void Builder::validate() {
   if (!(numerics.ale.preventive_axis_guard_fraction >= 0.0)) {
     throw ValueError("Numerics.ale.preventive_axis_guard_fraction must be >= 0");
   }
-  if (numerics.ale.euler_window.enabled) {
-    if (numerics.ale.euler_window.shape != "rectangle" &&
-        numerics.ale.euler_window.shape != "annulus") {
-      throw ValueError(
-          "Numerics.ale.euler_window.shape must be one of "
-          "{\"rectangle\", \"annulus\"}");
+  if (numerics.ale.euler_window.axis_core_transaction_mode ==
+          "clearance_replay" &&
+      numerics.ale.euler_window.replay_table_path.empty()) {
+    throw ConfigError(
+        "Numerics.ale.euler_window "
+        "axis_core_transaction_mode=\"clearance_replay\" requires "
+        "a non-empty replay_table_path");
+  }
+  validate_euler_window_config(
+      numerics.ale.euler_window, "Numerics.ale.euler_window");
+  for (std::size_t i = 0; i < numerics.ale.euler_windows.size(); ++i) {
+    validate_euler_window_config(
+        numerics.ale.euler_windows[i],
+        "Numerics.ale.euler_windows[" + std::to_string(i) + "]");
+  }
+  validate_band_ale_config(
+      numerics.ale.band_ale, "Numerics.ale.band_ale");
+  tenryu::core::validate_band_ale_config(config);
+  tenryu::core::validate_closure_catchment_config(config);
+  tenryu::core::validate_pole_theta_config(config);
+  validate_evacuated_cell_config(
+      numerics.ale.evacuated_cell, "Numerics.ale.evacuated_cell");
+  const bool axis_survival_core_configured =
+      numerics.ale.euler_window.role == "axis_survival_core";
+  const bool axis_survival_core_enabled =
+      numerics.ale.euler_window.enabled && axis_survival_core_configured;
+  if (numerics.ale.euler_window.axis_core_transaction_mode != "static" &&
+      !main.restart_from.empty()) {
+    throw ConfigError(
+        "Numerics.ale.euler_window "
+        "axis_core_transaction_mode=\"" +
+        numerics.ale.euler_window.axis_core_transaction_mode +
+        "\" rejects "
+        "Main.restart_from in v1");
+  }
+  if (axis_survival_core_configured &&
+      !numerics.ale.euler_windows.empty()) {
+    throw ConfigError(
+        "Numerics.ale.euler_window role=\"axis_survival_core\" requires "
+        "Numerics.ale.euler_windows to be empty");
+  }
+  for (std::size_t i = 0; i < numerics.ale.euler_windows.size(); ++i) {
+    if (numerics.ale.euler_windows[i].role == "axis_survival_core") {
+      throw ConfigError(
+          "axis_survival_core must use the single "
+          "Numerics.ale.euler_window entry");
     }
-    if (!(numerics.ale.euler_window.transition_width > 0.0)) {
-      throw ValueError(
-          "Numerics.ale.euler_window.transition_width must be > 0 when "
-          "enabled");
-    }
-    if (numerics.ale.euler_window.shape == "rectangle" &&
-        (!(numerics.ale.euler_window.r1 > numerics.ale.euler_window.r0) ||
-         !(numerics.ale.euler_window.z1 > numerics.ale.euler_window.z0))) {
-      throw ValueError(
-          "Numerics.ale.euler_window rectangle bounds require "
-          "r1 > r0 and z1 > z0");
-    }
-    if (numerics.ale.euler_window.shape == "annulus" &&
-        (!(numerics.ale.euler_window.rad_in >= 0.0) ||
-         !(numerics.ale.euler_window.rad_out >
-           numerics.ale.euler_window.rad_in))) {
-      throw ValueError(
-          "Numerics.ale.euler_window annulus bounds require "
-          "rad_out > rad_in >= 0");
-    }
+  }
+  if (axis_survival_core_configured &&
+      !numerics.ale.conservative_remap_enabled) {
+    throw ConfigError(
+        "Numerics.ale.euler_window role=\"axis_survival_core\" requires "
+        "Numerics.ale.conservative_remap_enabled=true");
+  }
+  if (mesh.polar_tier_dendrite_enabled &&
+      numerics.ale.rezone_solver == "m1_tmop") {
+    throw ConfigError(
+        "Mesh.polar_tier_dendrite_enabled=true is mutually exclusive with "
+        "Numerics.ale.rezone_solver=\"m1_tmop\" in v1: the M1 theta-ring "
+        "machinery is not qualified on nonuniform dendrite ladders "
+        "(tmp/ale_p2_briefs/design_dendrite.md §7)");
+  }
+  if (mesh.polar_tier_dendrite_enabled &&
+      (numerics.ale.euler_window.enabled ||
+       !numerics.ale.euler_windows.empty()) &&
+      !axis_survival_core_enabled) {
+    throw ConfigError(
+        "Mesh.polar_tier_dendrite_enabled=true is mutually exclusive with "
+        "Numerics.ale.euler_window.enabled=true or non-empty "
+        "Numerics.ale.euler_windows unless the single Euler window has "
+        "role=\"axis_survival_core\" in v1: the plain Euler-window machinery is "
+        "not qualified on nonuniform dendrite ladders "
+        "(tmp/ale_p2_briefs/design_dendrite.md §7)");
+  }
+  if (numerics.ale.euler_window.enabled ||
+      !numerics.ale.euler_windows.empty()) {
     if (!numerics.ale.conservative_remap_enabled) {
       throw ConfigError(
           "Numerics.ale.euler_window.enabled=true requires "
@@ -15907,12 +19309,94 @@ void Builder::validate() {
           "Main.dimension=\"2D_RZ\" and multiblock Mesh.topology_scheme");
     }
   }
+  if (numerics.ale.band_ale.enabled) {
+    if (numerics.ale.band_ale.compose_with_rezone &&
+        numerics.ale.band_ale.bands != "estimator") {
+      throw ConfigError(
+          "Numerics.ale.band_ale.compose_with_rezone=true requires "
+          "Numerics.ale.band_ale.bands=\"estimator\"");
+    }
+    if (numerics.ale.band_ale.compose_with_rezone &&
+        config.mesh.topology_scheme != TopologyScheme::SINGLE_BLOCK) {
+      throw ConfigError(
+          "band_ale.compose_with_rezone is single-block only (§20 v1)");
+    }
+    if (numerics.ale.band_ale.bands == "estimator" &&
+        !numerics.diagnostics.refinement_estimator.enabled) {
+      throw ConfigError(
+          "Numerics.ale.band_ale.bands=\"estimator\" requires "
+          "Numerics.diagnostics.refinement_estimator.enabled=true");
+    }
+    if (numerics.ale.band_ale.bands == "estimator" &&
+        !numerics.diagnostics.refinement_autopilot.enabled) {
+      throw ConfigError(
+          "Numerics.ale.band_ale.bands=\"estimator\" requires "
+          "Diagnostics.refinement_autopilot.enabled (the §18.5 front hold "
+          "needs the tracker)");
+    }
+    if (!numerics.ale.conservative_remap_enabled) {
+      throw ConfigError(
+          "Numerics.ale.band_ale.enabled=true requires "
+          "Numerics.ale.conservative_remap_enabled=true");
+    }
+    if (numerics.ale.rezone_solver == "m1_tmop") {
+      throw ConfigError(
+          "Numerics.ale.band_ale.enabled=true is mutually exclusive "
+          "with Numerics.ale.rezone_solver=\"m1_tmop\"");
+    }
+    if ((numerics.ale.euler_window.enabled ||
+         !numerics.ale.euler_windows.empty()) &&
+        !axis_survival_core_enabled) {
+      throw ConfigError(
+          "Numerics.ale.band_ale.enabled=true is mutually exclusive "
+          "with Numerics.ale.euler_window");
+    }
+    const bool band_ale_topology_ok =
+        config.main.dimension == "2D_RZ" &&
+        (config.mesh.topology_scheme != TopologyScheme::SINGLE_BLOCK ||
+         numerics.ale.band_ale.bands == "estimator");
+    if (!band_ale_topology_ok) {
+      throw ConfigError(
+          "Numerics.ale.band_ale.enabled=true requires Main.dimension=\"2D_RZ\" "
+          "and a multiblock Mesh.topology_scheme (bands=\"estimator\" also "
+          "accepts single_block, §18.6)");
+    }
+  }
+  if (numerics.ale.evacuated_cell.enabled) {
+    if (main.dim != 2) {
+      throw ConfigError(
+          "Numerics.ale.evacuated_cell requires Main.dimension=\"2D_RZ\"");
+    }
+    if (mesh.topology_scheme != TopologyScheme::SINGLE_BLOCK) {
+      throw ConfigError(
+          "Numerics.ale.evacuated_cell is single-block only (§21 v2a)");
+    }
+    if (!numerics.ale.enabled) {
+      throw ConfigError(
+          "Numerics.ale.evacuated_cell requires Numerics.ale.enabled=true "
+          "(the policy is for ALE-managed exteriors)");
+    }
+    if (!numerics.diagnostics.conduction_energy_rate_export.enabled) {
+      throw ConfigError(
+          "Numerics.ale.evacuated_cell requires conduction_energy_rate_export "
+          "(the coupling gate consumes it)");
+    }
+    if (numerics.conduction.nonlocal_model == "snb") {
+      throw ConfigError(
+          "evacuated_cell with SNB nonlocal conduction is not supported yet "
+          "(§21 v2a is local-conduction only)");
+    }
+  }
   tenryu::core::validate_ale1d_config(config);
+  tenryu::core::validate_dt_config(config);
+  tenryu::core::validate_reale_v2_config(config);
+  tenryu::core::validate_z_reflection_config(config);
   tenryu::core::validate_ale_identity_diag_config(config);
   tenryu::core::validate_transaction_failure_inject_config(config);
   tenryu::core::validate_m1_tmop_config(config);
   tenryu::core::validate_multiblock_differential_reference_config(config);
   tenryu::core::validate_central_pseudo_core_config(config);
+  tenryu::core::validate_polar_tier_runtime_config(config);
   tenryu::core::validate_icf_standard_ale_profile_config(config);
   tenryu::core::validate_legacy_regression_profile(config);
   validate_production_audit_config(numerics);
@@ -16039,6 +19523,12 @@ void Builder::validate() {
   }
   if (!(numerics.dt.growth_factor >= 1.0)) {
     throw ValueError("Numerics.dt.growth_factor must be >= 1.0");
+  }
+  if (numerics.dt.growth_factor <= 1.0) {
+    tenryu::core::log_warning(
+        "Numerics.dt.growth_factor <= 1.0 makes every transient dt reduction "
+        "permanent (dt can never recover); encode a fixed-dt intent via "
+        "dt.max_s instead");
   }
   if (numerics.dt.floor_stall_max_consecutive_steps < 0) {
     throw ValueError("Numerics.dt.floor_stall_max_consecutive_steps must be >= 0");

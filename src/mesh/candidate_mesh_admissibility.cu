@@ -276,12 +276,13 @@ __host__ __device__ inline void continuous_path_check(
     const double v_old,
     const double volume_floor,
     const CandidateMeshAdmissibilityFloors& floors,
+    const std::uint8_t* reference_flat_corner,
     int& bad_corner,
     MeshGeometryFailureKind& kind) {
   kind = MeshGeometryFailureKind::None;
   bad_corner = -1;
   double j_scale = 0.0;
-  if (nverts > 4) {
+  if (reference_flat_corner == nullptr && nverts > 4) {
     for (int k = 0; k < nverts; ++k) {
       const double scale_j =
           reference_available ? reference_j[k] : old_j[k];
@@ -289,7 +290,11 @@ __host__ __device__ inline void continuous_path_check(
     }
   }
   for (int k = 0; k < nverts; ++k) {
-    if (nverts > 4) {
+    if (reference_flat_corner != nullptr &&
+        reference_flat_corner[k] != 0U) {
+      continue;
+    }
+    if (reference_flat_corner == nullptr && nverts > 4) {
       const double scale_j =
           reference_available ? reference_j[k] : old_j[k];
       if (abs_double(scale_j) <= kFlatCornerRelEps * j_scale) {
@@ -359,7 +364,7 @@ __host__ __device__ inline void continuous_path_check(
   }
 }
 
-__device__ CandidateMeshQuality make_neutral_quality() {
+__host__ __device__ CandidateMeshQuality make_neutral_quality() {
   CandidateMeshQuality q{};
   q.min_rz_volume_rel = kDeviceInf;
   q.min_corner_j_rel = kDeviceInf;
@@ -924,7 +929,8 @@ __global__ void evaluate_candidate_mesh_quality_kernel(
     MeshGeometryFailureKind path_kind = MeshGeometryFailureKind::None;
     continuous_path_check(r_old, z_old, r_new, z_new, nverts, flip, old_j,
                           reference_j, reference_available, v_old,
-                          volume_floor, floors, path_bad_corner, path_kind);
+                          volume_floor, floors, nullptr, path_bad_corner,
+                          path_kind);
     if (path_kind != MeshGeometryFailureKind::None) {
       q.first_bad_cell = c;
       q.first_bad_corner = path_bad_corner;
@@ -935,7 +941,9 @@ __global__ void evaluate_candidate_mesh_quality_kernel(
   out[c] = q;
 }
 
-__global__ void evaluate_candidate_mesh_quality_csr_kernel(
+template <int SlotCap = kMeshTopoCellStorageSlotsMax>
+__host__ __device__ CandidateMeshQuality
+evaluate_candidate_mesh_quality_csr_cell(
     const double* node_r_old,
     const double* node_z_old,
     const double* node_r_reference,
@@ -943,7 +951,7 @@ __global__ void evaluate_candidate_mesh_quality_csr_kernel(
     const double* delta_r,
     const double* delta_z,
     const double sigma,
-    const int n_cells_total,
+    const int c,
     const int topology_stride,
     const int* cell_node_csr_offsets,
     const int* cell_node_csr_indices,
@@ -952,14 +960,9 @@ __global__ void evaluate_candidate_mesh_quality_csr_kernel(
     const CandidateMeshAdmissibilityFloors floors,
     const std::uint8_t* cell_nverts,
     const std::uint8_t* inactive_cell_mask,
-    CandidateMeshQuality* out) {
-  const int c = blockIdx.x * blockDim.x + threadIdx.x;
-  if (c >= n_cells_total) {
-    return;
-  }
+    const std::uint8_t* reference_flat_corner) {
   if (inactive_cell_mask != nullptr && inactive_cell_mask[c] != 0U) {
-    out[c] = make_neutral_quality();
-    return;
+    return make_neutral_quality();
   }
 
   const int stable_cell = cell_id_stable[c];
@@ -975,7 +978,9 @@ __global__ void evaluate_candidate_mesh_quality_csr_kernel(
   if (off < 0 || next < off ||
       slot_width != topology_stride ||
       (slot_width != kMeshTopoCellStorageSlots &&
-       slot_width != kMeshTopoCellStorageSlotsMax) ||
+       slot_width != kMeshTopoCellStorageSlotsMax &&
+       slot_width != kMeshTopoCellStorageSlotsMaxGeneral) ||
+      slot_width > SlotCap ||
       (floors.n_csr_indices >= 0 && next > floors.n_csr_indices)) {
     q.min_rz_volume_rel = -kDeviceInf;
     q.min_corner_j_rel = -kDeviceInf;
@@ -983,18 +988,19 @@ __global__ void evaluate_candidate_mesh_quality_csr_kernel(
     q.first_bad_cell = c;
     q.first_bad_stable_cell = stable_cell;
     q.kind = MeshGeometryFailureKind::TopologyInvariantViolation;
-    out[c] = q;
-    return;
+    return q;
   }
 
-  int nodes[kMeshTopoCellStorageSlotsMax] =
-      {-1, -1, -1, -1, -1, -1, -1, -1};
-  double r_old[kMeshTopoCellStorageSlotsMax] = {0.0};
-  double z_old[kMeshTopoCellStorageSlotsMax] = {0.0};
-  double r_new[kMeshTopoCellStorageSlotsMax] = {0.0};
-  double z_new[kMeshTopoCellStorageSlotsMax] = {0.0};
-  double r_reference[kMeshTopoCellStorageSlotsMax] = {0.0};
-  double z_reference[kMeshTopoCellStorageSlotsMax] = {0.0};
+  int nodes[SlotCap] = {};
+  for (int k = 0; k < SlotCap; ++k) {
+    nodes[k] = -1;
+  }
+  double r_old[SlotCap] = {0.0};
+  double z_old[SlotCap] = {0.0};
+  double r_new[SlotCap] = {0.0};
+  double z_new[SlotCap] = {0.0};
+  double r_reference[SlotCap] = {0.0};
+  double z_reference[SlotCap] = {0.0};
   const bool reference_available =
       (floors.volume_rel > 0.0 || floors.corner_j_rel > 0.0 ||
        floors.gauss_j_rel > 0.0) &&
@@ -1003,7 +1009,7 @@ __global__ void evaluate_candidate_mesh_quality_csr_kernel(
   bool node_ids_ok = true;
   if (cell_nverts != nullptr) {
     nverts = static_cast<int>(cell_nverts[c]);
-    node_ids_ok = nverts >= 3 && nverts <= kMeshTopoCellStorageSlotsMax &&
+    node_ids_ok = nverts >= 3 && nverts <= SlotCap &&
                   nverts <= slot_width;
     for (int k = 0; node_ids_ok && k < nverts; ++k) {
       nodes[k] = cell_node_csr_indices[off + k];
@@ -1024,7 +1030,7 @@ __global__ void evaluate_candidate_mesh_quality_csr_kernel(
         node_ids_ok = false;
       }
     }
-    if (nverts < 3 || nverts > kMeshTopoCellStorageSlotsMax ||
+    if (nverts < 3 || nverts > SlotCap ||
         nverts > slot_width) {
       node_ids_ok = false;
     }
@@ -1036,8 +1042,7 @@ __global__ void evaluate_candidate_mesh_quality_csr_kernel(
     q.first_bad_cell = c;
     q.first_bad_stable_cell = stable_cell;
     q.kind = MeshGeometryFailureKind::TopologyInvariantViolation;
-    out[c] = q;
-    return;
+    return q;
   }
   for (int k = 0; k < nverts; ++k) {
     r_old[k] = node_r_old[nodes[k]];
@@ -1063,8 +1068,7 @@ __global__ void evaluate_candidate_mesh_quality_csr_kernel(
     q.first_bad_cell = c;
     q.first_bad_stable_cell = stable_cell;
     q.kind = MeshGeometryFailureKind::NonFiniteNodeCoordinate;
-    out[c] = q;
-    return;
+    return q;
   }
 
   double v_old = 0.0;
@@ -1114,9 +1118,9 @@ __global__ void evaluate_candidate_mesh_quality_csr_kernel(
   }
   q.min_rz_volume_rel = signed_ratio(v_new, v_old);
 
-  double old_j[kMeshTopoCellStorageSlotsMax]{};
-  double new_j[kMeshTopoCellStorageSlotsMax]{};
-  double reference_j[kMeshTopoCellStorageSlotsMax]{};
+  double old_j[SlotCap]{};
+  double new_j[SlotCap]{};
+  double reference_j[SlotCap]{};
   if (nverts == 3) {
     triangle_corner_jacobians(r_old, z_old, old_j);
     triangle_corner_jacobians(r_new, z_new, new_j);
@@ -1154,7 +1158,7 @@ __global__ void evaluate_candidate_mesh_quality_csr_kernel(
   bool corner_ok = true;
   int bad_corner = -1;
   double j_scale = 0.0;
-  if (nverts > 4) {
+  if (reference_flat_corner == nullptr && nverts > 4) {
     for (int k = 0; k < nverts; ++k) {
       const double scale_j =
           reference_available ? reference_j[k] : old_j[k];
@@ -1162,7 +1166,17 @@ __global__ void evaluate_candidate_mesh_quality_csr_kernel(
     }
   }
   for (int k = 0; k < nverts; ++k) {
-    if (nverts > 4) {
+    if (reference_flat_corner != nullptr &&
+        reference_flat_corner[c * topology_stride + k] != 0U) {
+      if (!finite_double(old_j[k]) || !finite_double(new_j[k])) {
+        corner_ok = false;
+        if (bad_corner < 0) {
+          bad_corner = k;
+        }
+      }
+      continue;
+    }
+    if (reference_flat_corner == nullptr && nverts > 4) {
       const double scale_j =
           reference_available ? reference_j[k] : old_j[k];
       if (abs_double(scale_j) <= kFlatCornerRelEps * j_scale) {
@@ -1233,6 +1247,7 @@ __global__ void evaluate_candidate_mesh_quality_csr_kernel(
                                              reference_available));
 
   if (!finite_double(v_old) || !finite_double(v_new)) {
+    q.failing_value = v_new;
     q.first_bad_cell = c;
     q.first_bad_stable_cell = stable_cell;
     q.kind = MeshGeometryFailureKind::NonFiniteCellVolume;
@@ -1240,15 +1255,18 @@ __global__ void evaluate_candidate_mesh_quality_csr_kernel(
                  ? (!(v_old > 0.0) || !(v_new > volume_floor))
                  : (v_old == 0.0 || !same_orientation(v_old, v_new) ||
                     !(abs_double(v_new) > volume_floor))) {
+    q.failing_value = v_new;
     q.first_bad_cell = c;
     q.first_bad_stable_cell = stable_cell;
     q.kind = MeshGeometryFailureKind::NonPositiveCellVolume;
   } else if (!corner_ok) {
+    q.failing_value = new_j[bad_corner];
     q.first_bad_cell = c;
     q.first_bad_stable_cell = stable_cell;
     q.first_bad_corner = bad_corner;
     q.kind = MeshGeometryFailureKind::NonPositiveCellArea;
   } else if (!finite_double(old_gauss) || !finite_double(new_gauss)) {
+    q.failing_value = new_gauss;
     q.first_bad_cell = c;
     q.first_bad_stable_cell = stable_cell;
     q.kind = MeshGeometryFailureKind::NonFiniteCellArea;
@@ -1257,6 +1275,7 @@ __global__ void evaluate_candidate_mesh_quality_csr_kernel(
                  : (old_gauss == 0.0 ||
                     !same_orientation(old_gauss, new_gauss) ||
                     !(abs_double(new_gauss) > gauss_floor))) {
+    q.failing_value = new_gauss;
     q.first_bad_cell = c;
     q.first_bad_stable_cell = stable_cell;
     q.kind = MeshGeometryFailureKind::NonPositiveCellArea;
@@ -1281,7 +1300,12 @@ __global__ void evaluate_candidate_mesh_quality_csr_kernel(
     MeshGeometryFailureKind path_kind = MeshGeometryFailureKind::None;
     continuous_path_check(r_old, z_old, r_new, z_new, nverts, flip, old_j,
                           reference_j, reference_available, v_old,
-                          volume_floor, floors, path_bad_corner, path_kind);
+                          volume_floor, floors,
+                          reference_flat_corner == nullptr
+                              ? nullptr
+                              : reference_flat_corner +
+                                    c * topology_stride,
+                          path_bad_corner, path_kind);
     if (path_kind != MeshGeometryFailureKind::None) {
       q.first_bad_cell = c;
       q.first_bad_stable_cell = stable_cell;
@@ -1290,7 +1314,38 @@ __global__ void evaluate_candidate_mesh_quality_csr_kernel(
     }
   }
 
-  out[c] = q;
+  return q;
+}
+
+template <int SlotCap = kMeshTopoCellStorageSlotsMax>
+__global__ void evaluate_candidate_mesh_quality_csr_kernel(
+    const double* node_r_old,
+    const double* node_z_old,
+    const double* node_r_reference,
+    const double* node_z_reference,
+    const double* delta_r,
+    const double* delta_z,
+    const double sigma,
+    const int n_cells_total,
+    const int topology_stride,
+    const int* cell_node_csr_offsets,
+    const int* cell_node_csr_indices,
+    const int* cell_id_stable,
+    const int* cell_orientation_sign,
+    const CandidateMeshAdmissibilityFloors floors,
+    const std::uint8_t* cell_nverts,
+    const std::uint8_t* inactive_cell_mask,
+    const std::uint8_t* reference_flat_corner,
+    CandidateMeshQuality* out) {
+  const int c = blockIdx.x * blockDim.x + threadIdx.x;
+  if (c >= n_cells_total) {
+    return;
+  }
+  out[c] = evaluate_candidate_mesh_quality_csr_cell<SlotCap>(
+      node_r_old, node_z_old, node_r_reference, node_z_reference, delta_r,
+      delta_z, sigma, c, topology_stride, cell_node_csr_offsets,
+      cell_node_csr_indices, cell_id_stable, cell_orientation_sign, floors,
+      cell_nverts, inactive_cell_mask, reference_flat_corner);
 }
 
 inline double host_rz_polygon_volume(const std::vector<double>& r,
@@ -1749,13 +1804,14 @@ CandidateMeshQuality evaluate_candidate_mesh_quality_csr(
     const int* d_macro_boundary_nodes,
     const int n_macro_boundary_nodes,
     const double* d_node_r_reference,
-    const double* d_node_z_reference) {
+    const double* d_node_z_reference,
+    const std::uint8_t* d_reference_flat_corner) {
   return evaluate_candidate_mesh_quality_csr(
       d_node_r_old, d_node_z_old, d_delta_r, d_delta_z, sigma, n_cells_total,
       topology_stride, d_cell_node_csr_offsets, d_cell_node_csr_indices,
       d_cell_id_stable, nullptr, floors, d_cell_nverts, d_inactive_cell_mask,
       d_macro_boundary_nodes, n_macro_boundary_nodes, d_node_r_reference,
-      d_node_z_reference);
+      d_node_z_reference, d_reference_flat_corner);
 }
 
 CandidateMeshQuality evaluate_candidate_mesh_quality_csr(
@@ -1776,7 +1832,8 @@ CandidateMeshQuality evaluate_candidate_mesh_quality_csr(
     const int* d_macro_boundary_nodes,
     const int n_macro_boundary_nodes,
     const double* d_node_r_reference,
-    const double* d_node_z_reference) {
+    const double* d_node_z_reference,
+    const std::uint8_t* d_reference_flat_corner) {
   TENRYU_ASSERT(n_cells_total > 0,
                 "CSR candidate mesh quality requires n_cells_total > 0");
   TENRYU_ASSERT(d_cell_node_csr_offsets != nullptr,
@@ -1797,12 +1854,22 @@ CandidateMeshQuality evaluate_candidate_mesh_quality_csr(
 
   constexpr int threads = 128;
   const int blocks = (n_cells_total + threads - 1) / threads;
-  evaluate_candidate_mesh_quality_csr_kernel<<<blocks, threads>>>(
-      d_node_r_old, d_node_z_old, d_node_r_reference, d_node_z_reference,
-      d_delta_r, d_delta_z, sigma, n_cells_total, topology_stride,
-      d_cell_node_csr_offsets, d_cell_node_csr_indices, d_cell_id_stable,
-      d_cell_orientation_sign, floors, d_cell_nverts, d_inactive_cell_mask,
-      d_quality);
+  if (topology_stride <= kMeshTopoCellStorageSlotsMax) {
+    evaluate_candidate_mesh_quality_csr_kernel<<<blocks, threads>>>(
+        d_node_r_old, d_node_z_old, d_node_r_reference, d_node_z_reference,
+        d_delta_r, d_delta_z, sigma, n_cells_total, topology_stride,
+        d_cell_node_csr_offsets, d_cell_node_csr_indices, d_cell_id_stable,
+        d_cell_orientation_sign, floors, d_cell_nverts, d_inactive_cell_mask,
+        d_reference_flat_corner, d_quality);
+  } else {
+    evaluate_candidate_mesh_quality_csr_kernel<
+        kMeshTopoCellStorageSlotsMaxGeneral><<<blocks, threads>>>(
+        d_node_r_old, d_node_z_old, d_node_r_reference, d_node_z_reference,
+        d_delta_r, d_delta_z, sigma, n_cells_total, topology_stride,
+        d_cell_node_csr_offsets, d_cell_node_csr_indices, d_cell_id_stable,
+        d_cell_orientation_sign, floors, d_cell_nverts, d_inactive_cell_mask,
+        d_reference_flat_corner, d_quality);
+  }
   cuda_check(cudaGetLastError(),
              "CSR candidate mesh quality kernel launch failed");
   cuda_check(cudaDeviceSynchronize(),
@@ -1837,6 +1904,7 @@ CandidateMeshQuality evaluate_candidate_mesh_quality_csr(
         q.first_bad_stable_cell < out.first_bad_stable_cell;
     if (replace) {
       out.kind = q.kind;
+      out.failing_value = q.failing_value;
       out.first_bad_cell = q.first_bad_cell;
       out.first_bad_stable_cell = q.first_bad_stable_cell;
       out.first_bad_corner = q.first_bad_corner;
@@ -1859,6 +1927,7 @@ CandidateMeshQuality evaluate_candidate_mesh_quality_csr(
         macro_quality.first_bad_stable_cell < out.first_bad_stable_cell;
     if (replace) {
       out.kind = macro_quality.kind;
+      out.failing_value = macro_quality.failing_value;
       out.first_bad_cell = macro_quality.first_bad_cell;
       out.first_bad_stable_cell = macro_quality.first_bad_stable_cell;
       out.first_bad_corner = macro_quality.first_bad_corner;
@@ -1868,10 +1937,13 @@ CandidateMeshQuality evaluate_candidate_mesh_quality_csr(
   return out;
 }
 
-// Contract note (2026-07-26 kernel review): this is a dyadic halving search — it
-// returns the FIRST accepted sigma among sigma_init / 2^k, which is not the
-// supremum of admissible sigma. If halving drops below sigma_min, the exact
-// sigma_min value is never evaluated and 0.0 is returned.
+// Contract note (k17 AI-review 8.9): the non-CSR searches, and CSR searches
+// with refine_iters == 0, return the FIRST accepted sigma among
+// sigma_init / 2^k, which is not the supremum of admissible sigma. With CSR
+// refinement, the returned sigma is within
+// (hi - lo) = 2^-refine_iters * sigma_lo of the first constraint crossing
+// above sigma_lo. If halving drops below sigma_min, the exact sigma_min value
+// is never evaluated and 0.0 is returned.
 LineSearchResult linesearch_largest_admissible_sigma(
     const double* d_node_r_old,
     const double* d_node_z_old,
@@ -1969,13 +2041,15 @@ LineSearchResult linesearch_largest_admissible_sigma_csr(
     const int* d_macro_boundary_nodes,
     const int n_macro_boundary_nodes,
     const double* d_node_r_reference,
-    const double* d_node_z_reference) {
+    const double* d_node_z_reference,
+    const int refine_iters) {
   return linesearch_largest_admissible_sigma_csr(
       d_node_r_old, d_node_z_old, d_delta_r, d_delta_z, sigma_init, sigma_min,
       max_iters, n_cells_total, topology_stride, d_cell_node_csr_offsets,
       d_cell_node_csr_indices, d_cell_id_stable, nullptr, floors,
       d_cell_nverts, d_inactive_cell_mask, d_macro_boundary_nodes,
-      n_macro_boundary_nodes, d_node_r_reference, d_node_z_reference);
+      n_macro_boundary_nodes, d_node_r_reference, d_node_z_reference,
+      refine_iters);
 }
 
 LineSearchResult linesearch_largest_admissible_sigma_csr(
@@ -1998,7 +2072,8 @@ LineSearchResult linesearch_largest_admissible_sigma_csr(
     const int* d_macro_boundary_nodes,
     const int n_macro_boundary_nodes,
     const double* d_node_r_reference,
-    const double* d_node_z_reference) {
+    const double* d_node_z_reference,
+    const int refine_iters) {
   LineSearchResult result{};
   double sigma = sigma_init;
   const int iter_limit = std::max(0, max_iters);
@@ -2011,6 +2086,33 @@ LineSearchResult linesearch_largest_admissible_sigma_csr(
         d_inactive_cell_mask, d_macro_boundary_nodes, n_macro_boundary_nodes,
         d_node_r_reference, d_node_z_reference);
     if (result.quality.admissible()) {
+      if (iter > 0 && refine_iters > 0) {
+        double lo = sigma;
+        double hi = std::min(2.0 * sigma, sigma_init);
+        CandidateMeshQuality quality_lo = result.quality;
+        for (int i = 0; i < refine_iters && hi > lo; ++i) {
+          const double mid = 0.5 * (lo + hi);
+          const CandidateMeshQuality quality =
+              evaluate_candidate_mesh_quality_csr(
+                  d_node_r_old, d_node_z_old, d_delta_r, d_delta_z, mid,
+                  n_cells_total, topology_stride, d_cell_node_csr_offsets,
+                  d_cell_node_csr_indices, d_cell_id_stable,
+                  d_cell_orientation_sign, floors, d_cell_nverts,
+                  d_inactive_cell_mask, d_macro_boundary_nodes,
+                  n_macro_boundary_nodes, d_node_r_reference,
+                  d_node_z_reference);
+          ++result.refine_iters_used;
+          if (quality.admissible()) {
+            lo = mid;
+            quality_lo = quality;
+          } else {
+            hi = mid;
+          }
+        }
+        result.sigma_accepted = lo;
+        result.quality = quality_lo;
+        return result;
+      }
       result.sigma_accepted = sigma;
       return result;
     }
@@ -2026,6 +2128,52 @@ LineSearchResult linesearch_largest_admissible_sigma_csr(
 
   result.sigma_accepted = 0.0;
   return result;
+}
+
+void host_polygon_corner_jacobians(const double* r,
+                                   const double* z,
+                                   const int nverts,
+                                   double* j) {
+  polygon_corner_jacobians(r, z, nverts, j);
+}
+
+double host_rz_polygon_volume_exact(const double* r,
+                                    const double* z,
+                                    const int nverts) {
+  return rz_polygon_volume_exact(r, z, nverts);
+}
+
+CandidateMeshQuality host_evaluate_candidate_mesh_quality_csr_cell(
+    const double* node_r_old,
+    const double* node_z_old,
+    const double* node_r_reference,
+    const double* node_z_reference,
+    const double* delta_r,
+    const double* delta_z,
+    const double sigma,
+    const int cell,
+    const int topology_stride,
+    const int* cell_node_csr_offsets,
+    const int* cell_node_csr_indices,
+    const int* cell_id_stable,
+    const int* cell_orientation_sign,
+    const CandidateMeshAdmissibilityFloors& floors,
+    const std::uint8_t* cell_nverts,
+    const std::uint8_t* inactive_cell_mask,
+    const std::uint8_t* reference_flat_corner) {
+  if (topology_stride <= kMeshTopoCellStorageSlotsMax) {
+    return evaluate_candidate_mesh_quality_csr_cell(
+        node_r_old, node_z_old, node_r_reference, node_z_reference, delta_r,
+        delta_z, sigma, cell, topology_stride, cell_node_csr_offsets,
+        cell_node_csr_indices, cell_id_stable, cell_orientation_sign, floors,
+        cell_nverts, inactive_cell_mask, reference_flat_corner);
+  }
+  return evaluate_candidate_mesh_quality_csr_cell<
+      kMeshTopoCellStorageSlotsMaxGeneral>(
+      node_r_old, node_z_old, node_r_reference, node_z_reference, delta_r,
+      delta_z, sigma, cell, topology_stride, cell_node_csr_offsets,
+      cell_node_csr_indices, cell_id_stable, cell_orientation_sign, floors,
+      cell_nverts, inactive_cell_mask, reference_flat_corner);
 }
 
 }  // namespace tenryu::mesh

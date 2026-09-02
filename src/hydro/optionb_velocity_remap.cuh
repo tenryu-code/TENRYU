@@ -675,9 +675,13 @@ __host__ __device__ inline void gather_corner_momentum(
   }
 }
 
-// If v_min/v_max are omitted, the current cell's own corner
-// velocity range as a placeholder bound; expanded donor-stencil bounds are
-// expected to replace that at wiring time.
+// v1 contract (ratified 2026-08-17): omitted v_min/v_max selects the
+// cell's own corner velocity range as the Stage-3a bound — the
+// more-limiting, monotone-safe choice (the filter can only redistribute
+// within values the cell already attains), and the live production CSR
+// wiring uses exactly this form. Expanded donor-stencil bounds remain a
+// recorded refinement; they would loosen the clamp and change production
+// trajectories, so they require their own adjudication + re-baselining.
 __host__ __device__ inline AffineHourglassFilterResult
 apply_affine_orthogonal_hourglass_filter(
     const double* r,

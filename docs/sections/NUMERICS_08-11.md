@@ -856,6 +856,77 @@ PR9 の `gxii_1d_regression` はこの runtime 診断とは別に
 `ablation_multishock_metric` と compressed-shell `shell_dep_noise_cv` を verification
 ログへ出力する。これらは production gate の比較指標であり、輸送状態へフィードバックしない。
 
+### 10.5 FLASH4.7 Modified-Lohner refinement estimator (§18 C1)
+
+設計 doc §18 C1 の read-only 検出場は、FLASH4.7
+`gr_markRefineDerefine.F90` の form を 2D に特化し、multiblock は各 structured
+block、single-block は全格子を一つの block view として、方向
+\(p\in\{1\ (\mathrm{rad}/r),2\ (\mathrm{ang}/z)\}\) と変数
+\(u\in\{\rho,P_e+P_i\}\) について full first/second derivative tensor を評価する。
+polar family ではセル重心半径 \(s\) と重心角
+\(\theta=\operatorname{atan2}(r,z)\) から従来どおり物理 metric factor
+\[
+g_1=\frac{1}{|s_{l+1,k}-s_{l-1,k}|},\qquad
+g_2=\frac{1}{s_{l,k}|\theta_{l,k+1}-\theta_{l,k-1}|}
+\]
+を作る。rectangular single-block では代わりに FLASH 自身の geometry 別規約に従い
+\[
+g_1=\frac{1}{|r_{l+1,k}-r_{l-1,k}|},\qquad
+g_2=\frac{1}{|z_{l,k+1}-z_{l,k-1}|}
+\]
+という重心座標差を使う。この絶対値により estimator は block ごとの layer/column indexing orientation
+に不変となる（inner tier blocks は layers inward に index する）。これは block
+coordinates が常に ascending な FLASH では signed form と等価である。一次微分
+\(\delta_pu=(u_{+p}-u_{-p})g_p\) とその大きさスケール
+\(a_p=(|u_{+p}|+|u_{-p}|)g_p\) (`delua`) を先に求める。次に
+\(p,q\in\{1,2\}\) の4項すべてに対して
+\[
+d^{(2)}_{pq}=(\delta_pu_{+q}-\delta_pu_{-q})g_q,\quad
+d^{(3)}_{pq}=(|\delta_pu_{+q}|+|\delta_pu_{-q}|)g_q,\quad
+d^{(4)}_{pq}=(a_{p,+q}+a_{p,-q})g_q
+\]
+を評価し、
+\[
+N=\sum_{p,q}(d^{(2)}_{pq})^2,\qquad
+D=\sum_{p,q}(d^{(3)}_{pq}+\epsilon d^{(4)}_{pq})^2,\qquad
+E_u=\sqrt{N/D},\qquad E_{\mathrm{cell}}=\max(E_\rho,E_{P_e+P_i})
+\]
+とする。filter 項は `delua` 大きさスケールにかける。選択された geometry の metric
+distance（polar family は radial arc factors、rectangular single-block は重心の
+\(r/z\) coordinate differences）が 0、または geometry が non-finite
+な方向の一次微分と大きさスケールは 0 とする。\(D=0\)
+で \(N\ne0\) なら FLASH の HUGE branch を per-cell field で 1 に cap し、
+\(N=D=0\) なら 0 とする。各 block の各 grid edge から 2 cells は
+\(E_{\mathrm{cell}}=0\) に clamp する。FLASH の per-block max に対し、TENRYU は
+§18 autopilot の細かい空間粒度のため per-cell field を保持する。これは検出・snapshot
+出力だけに使い、hydro state へは feedback しない。
+
+`Numerics.diagnostics.conduction_energy_rate_export.enabled=True` では、conduction
+operator 前後の authoritative `ee` 差に operator 後の `rho` を掛けて `dt` で割った
+energy rate per volume を `hydro/conduction_e_rate` [erg/cm3/s] に出力する。この
+operator-level difference は floor/clamp injection を構成上含む。
+
+設計 doc §18.1 items 5--8 の W3a SHADOW autopilot は、structured blocks の
+per-angular-column profile を block radial order と各 block の orientation-normalized
+layer order で topologically stitch し、build 時の centroid-angle alignment check に
+外れた block を警告付きで除外する。各 column では `E >= assoc_cut` の連結成分から
+innermost strong component を association し、その範囲を前後 2 cells 拡張した
+physical pressure ridge `|p[i+1]-p[i-1]| / |s[i+1]-s[i-1]|` で front を localize
+する。実測では max-E cell が pressure ridge の 2--3 cells pre-shock 側に位置する
+stencil-edge bias があるため、E は association、pressure ridge は localization と
+役割を分離する。column front の median と ascending 1% lead quantile を robust
+aggregate とし、dual hysteresis と persistence を持つ SEARCH/TRACKED/ARMED shadow
+state machine、linear+quadratic ensemble fit、および -3 sigma earliest-arrival
+prediction を評価する。`mode="shadow"` は結果をログへ出すだけで state を変更せず
+remesh も起動しない。`mode="arm_exit"` は ARMED 中に
+`d_clear_h <= window_hi_h + ckpt_lead_h` となると checkpoint を要求する。tracker 評価は
+checkpoint emission と同一 step で、その直前に physics を挟まず実行されるため、書かれた
+checkpoint state が commit state となる。WOULD_FIRE と同一 step の checkpoint を確認した
+場合だけ `autopilot_decision.json` を書いて clean stop し、checkpoint が着地しなければ
+fail-closed で hold して走行を継続する。exec-level wrapper は validated swap の
+budget-of-one を強制する。
+estimator の single-block 対応にかかわらず、この tracker は multiblock-only のままである。
+
 ---
 
 ## 11. 数値的"安全策"まとめ（NaN/破綻回避）

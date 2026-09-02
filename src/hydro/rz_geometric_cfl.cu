@@ -71,7 +71,35 @@ __device__ double atomic_min_double(double* address, const double val) {
   return __longlong_as_double(static_cast<long long>(old));
 }
 
-__device__ double rz_volume4(const double2 x[4]) {
+__device__ __forceinline__ void record_rz_geometric_candidate(
+    double* __restrict__ min_dt,
+    int* __restrict__ winner_cell,
+    const double target_dt,
+    const int cell,
+    const double candidate) {
+  atomic_min_double(min_dt, candidate);
+  if (winner_cell != nullptr && candidate == target_dt) {
+    atomicMin(winner_cell, cell);
+  }
+}
+
+// Planar signed area (x2) of the quad, used only for its sign: the revolved
+// volume expression below is shoelace-family and flips sign with the node
+// winding. Spherical-polar meshes are clockwise-wound under the kernel node
+// ordering, so without this the structured branch sees V0 < 0 and drives dt to
+// zero. The button path already applies the equivalent correction via
+// rz::button_orientation_sign().
+__device__ double rz_winding_orientation4(const double2 x[4]) {
+  double a2 = 0.0;
+#pragma unroll
+  for (int k = 0; k < 4; ++k) {
+    const int l = (k + 1) & 3;
+    a2 += x[k].x * x[l].y - x[l].x * x[k].y;
+  }
+  return (a2 >= 0.0) ? 1.0 : -1.0;
+}
+
+__device__ double rz_volume4(const double2 x[4], const double orientation) {
   double s = 0.0;
 #pragma unroll
   for (int k = 0; k < 4; ++k) {
@@ -84,7 +112,7 @@ __device__ double rz_volume4(const double2 x[4]) {
   }
   constexpr double pi_over_three =
       1.0471975511965977461542144610931676280657231331250352736615;
-  return pi_over_three * s;
+  return orientation * (pi_over_three * s);
 }
 
 __device__ double rz_csr_polygon_volume_at_tau(
@@ -171,17 +199,22 @@ __device__ bool rz_geom_ok_with_cumulative(const double2 x0[4],
                                             const double V_initial,
                                             const double etaV,
                                             const double etaV_cum,
-                                            const double r_floor) {
+                                            const double r_floor,
+                                            const double orientation) {
   double2 xp[4];
 #pragma unroll
   for (int k = 0; k < 4; ++k) {
     xp[k].x = x0[k].x + tau * vhalf[k].x;
     xp[k].y = x0[k].y + tau * vhalf[k].y;
-    if (xp[k].x < r_floor) {
+    // Exact-axis nodes (already at r <= r_floor) are pinned on the axis by the
+    // axis slave and cannot cross it; applying the crossing floor to them makes
+    // the predicate false for every tau and bisects dt to zero on any
+    // axis-touching mesh. Only nodes that start off-axis are floor-tested.
+    if (x0[k].x > r_floor && xp[k].x < r_floor) {
       return false;
     }
   }
-  const double Vp = rz_volume4(xp);
+  const double Vp = rz_volume4(xp, orientation);
   const double floor_per_step = etaV * V0;
   const double floor_cumulative = etaV_cum * V_initial;
   const double floor_effective = fmax(floor_per_step, floor_cumulative);
@@ -209,6 +242,8 @@ __device__ bool rz_button_geom_ok_with_cumulative(
 }
 
 __global__ void rz_geometric_cfl_kernel(double* __restrict__ min_dt,
+                                        int* __restrict__ winner_cell,
+                                        const double target_dt,
                                         const double* __restrict__ x_r,
                                         const double* __restrict__ x_z,
                                         const double* __restrict__ v_r,
@@ -243,14 +278,14 @@ __global__ void rz_geometric_cfl_kernel(double* __restrict__ min_dt,
         rz_button_volume_at_tau(x_r, x_z, v_r, v_z, button_outer_node_ring,
                                 nz, 0.0);
     if (!(V0 > 0.0) || !isfinite(V0)) {
-      atomic_min_double(min_dt, 0.0);
+      record_rz_geometric_candidate(min_dt, winner_cell, target_dt, c, 0.0);
       return;
     }
     double V_initial = 0.0;
     if (cumulative_enabled != 0) {
       V_initial = cell_vol_initial[c];
       if (!(V_initial > 0.0) || !isfinite(V_initial)) {
-        atomic_min_double(min_dt, 0.0);
+        record_rz_geometric_candidate(min_dt, winner_cell, target_dt, c, 0.0);
         return;
       }
     }
@@ -273,7 +308,7 @@ __global__ void rz_geometric_cfl_kernel(double* __restrict__ min_dt,
         hi = mid;
       }
     }
-    atomic_min_double(min_dt, lo);
+    record_rz_geometric_candidate(min_dt, winner_cell, target_dt, c, lo);
     return;
   }
 
@@ -289,14 +324,14 @@ __global__ void rz_geometric_cfl_kernel(double* __restrict__ min_dt,
     const double V0 = rz_csr_polygon_volume_at_tau(
         x_r, x_z, v_r, v_z, cell_nodes, active_nverts, orientation_sign, 0.0);
     if (!(V0 > 0.0) || !isfinite(V0)) {
-      atomic_min_double(min_dt, 0.0);
+      record_rz_geometric_candidate(min_dt, winner_cell, target_dt, c, 0.0);
       return;
     }
     double V_initial = 0.0;
     if (cumulative_enabled != 0) {
       V_initial = cell_vol_initial[c];
       if (!(V_initial > 0.0) || !isfinite(V_initial)) {
-        atomic_min_double(min_dt, 0.0);
+        record_rz_geometric_candidate(min_dt, winner_cell, target_dt, c, 0.0);
         return;
       }
     }
@@ -320,7 +355,7 @@ __global__ void rz_geometric_cfl_kernel(double* __restrict__ min_dt,
         hi = mid;
       }
     }
-    atomic_min_double(min_dt, lo);
+    record_rz_geometric_candidate(min_dt, winner_cell, target_dt, c, lo);
     return;
   }
 
@@ -345,21 +380,22 @@ __global__ void rz_geometric_cfl_kernel(double* __restrict__ min_dt,
       make_double2(v_r[n01], v_z[n01]),
   };
 
-  const double V0 = rz_volume4(x0);
+  const double orientation = rz_winding_orientation4(x0);
+  const double V0 = rz_volume4(x0, orientation);
   if (!(V0 > 0.0) || !isfinite(V0)) {
-    atomic_min_double(min_dt, 0.0);
+    record_rz_geometric_candidate(min_dt, winner_cell, target_dt, c, 0.0);
     return;
   }
   double V_initial = 0.0;
   if (cumulative_enabled != 0) {
     V_initial = cell_vol_initial[c];
     if (!(V_initial > 0.0) || !isfinite(V_initial)) {
-      atomic_min_double(min_dt, 0.0);
+      record_rz_geometric_candidate(min_dt, winner_cell, target_dt, c, 0.0);
       return;
     }
   }
   if (rz_geom_ok_with_cumulative(x0, vh, dt_in, V0, V_initial, etaV, etaV_cum,
-                                 r_floor)) {
+                                 r_floor, orientation)) {
     return;
   }
 
@@ -369,13 +405,13 @@ __global__ void rz_geometric_cfl_kernel(double* __restrict__ min_dt,
   for (int it = 0; it < 48; ++it) {
     const double mid = 0.5 * (lo + hi);
     if (rz_geom_ok_with_cumulative(x0, vh, mid, V0, V_initial, etaV, etaV_cum,
-                                   r_floor)) {
+                                   r_floor, orientation)) {
       lo = mid;
     } else {
       hi = mid;
     }
   }
-  atomic_min_double(min_dt, lo);
+  record_rz_geometric_candidate(min_dt, winner_cell, target_dt, c, lo);
 }
 
 }  // namespace
@@ -384,7 +420,11 @@ double compute_rz_geometric_cfl_dt(const core::State& state,
                                    const core::Config& cfg,
                                    const double dt_proposed,
                                    const double* vhalf_r,
-                                   const double* vhalf_z) {
+                                   const double* vhalf_z,
+                                   int* argmin_cell) {
+  if (argmin_cell != nullptr) {
+    *argmin_cell = -1;
+  }
   if (!cfg.numerics.hydro.rz_geometric_cfl_enabled ||
       state.mesh.dim != 2 ||
       !(dt_proposed > 0.0) ||
@@ -480,7 +520,7 @@ double compute_rz_geometric_cfl_dt(const core::State& state,
 
   const int blocks = (n_cells + 255) / 256;
   rz_geometric_cfl_kernel<<<blocks, 256>>>(
-      d_min_dt, state.x_r.data(), state.x_z.data(), vhalf_r,
+      d_min_dt, nullptr, 0.0, state.x_r.data(), state.x_z.data(), vhalf_r,
       vhalf_z, cumulative_enabled ? state.cell_vol_initial.data() : nullptr,
       d_cell_kind,
       is_multiblock ? state.mesh.multiblock_cell_node_csr_offsets.data()
@@ -499,6 +539,40 @@ double compute_rz_geometric_cfl_dt(const core::State& state,
   double min_dt = inf;
   cuda_check(cudaMemcpy(&min_dt, d_min_dt, sizeof(double), cudaMemcpyDeviceToHost),
              "RZ geometric CFL: copy min_dt failed");
+  if (argmin_cell != nullptr && std::isfinite(min_dt) &&
+      min_dt < dt_proposed) {
+    int* d_winner_cell = static_cast<int*>(core::device_scratch_acquire(
+        "rzgcfl:winner_cell", sizeof(int)));
+    cuda_check(cudaMemcpy(d_winner_cell, &n_cells, sizeof(int),
+                          cudaMemcpyHostToDevice),
+               "RZ geometric CFL: init winner cell failed");
+    rz_geometric_cfl_kernel<<<blocks, 256>>>(
+        d_min_dt, d_winner_cell, min_dt, state.x_r.data(), state.x_z.data(),
+        vhalf_r, vhalf_z,
+        cumulative_enabled ? state.cell_vol_initial.data() : nullptr,
+        d_cell_kind,
+        is_multiblock ? state.mesh.multiblock_cell_node_csr_offsets.data()
+                      : nullptr,
+        is_multiblock ? state.mesh.multiblock_cell_node_csr_indices.data()
+                      : nullptr,
+        d_cell_orientation_sign, d_cell_nverts, n_cells, nr, nz,
+        button_outer_node_ring, dt_proposed,
+        cfg.numerics.hydro.rz_geometric_cfl_etaV,
+        cfg.numerics.hydro.rz_geometric_cfl_v_initial_floor,
+        cumulative_enabled ? 1 : 0,
+        cfg.numerics.hydro.rz_geometric_cfl_r_floor);
+    cuda_check(cudaGetLastError(),
+               "RZ geometric CFL winner kernel launch failed");
+    cuda_check(cudaDeviceSynchronize(),
+               "RZ geometric CFL winner kernel execution failed");
+    int winner_cell = n_cells;
+    cuda_check(cudaMemcpy(&winner_cell, d_winner_cell, sizeof(int),
+                          cudaMemcpyDeviceToHost),
+               "RZ geometric CFL: copy winner cell failed");
+    if (winner_cell >= 0 && winner_cell < n_cells) {
+      *argmin_cell = winner_cell;
+    }
+  }
   if (d_cell_kind != nullptr) {
     cuda_check(cudaFree(d_cell_kind),
                "RZ geometric CFL: cudaFree cell_kind failed");
@@ -514,7 +588,7 @@ double compute_rz_geometric_cfl_dt(const core::State& state,
                                    const core::Config& cfg,
                                    const double dt_proposed) {
   return compute_rz_geometric_cfl_dt(
-      state, cfg, dt_proposed, state.v_r.data(), state.v_z.data());
+      state, cfg, dt_proposed, state.v_r.data(), state.v_z.data(), nullptr);
 }
 
 }  // namespace tenryu::hydro

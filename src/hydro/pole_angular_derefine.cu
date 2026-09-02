@@ -1116,11 +1116,14 @@ __global__ void zero_member_compatible_cell_buffers_kernel(
     double* __restrict__ corner_force_p_z,
     double* __restrict__ corner_force_sub_r,
     double* __restrict__ corner_force_sub_z,
+    double* __restrict__ corner_force_q_r,
+    double* __restrict__ corner_force_q_z,
     double* __restrict__ work_p,
     double* __restrict__ work_sub,
     double* __restrict__ work_av,
     const std::uint8_t* __restrict__ member_mask,
-    const int n_cells) {
+    const int n_cells,
+    const int corner_stride) {
   const int c = blockIdx.x * blockDim.x + threadIdx.x;
   if (c >= n_cells || member_mask == nullptr || member_mask[c] == 0U) {
     return;
@@ -1131,6 +1134,13 @@ __global__ void zero_member_compatible_cell_buffers_kernel(
     corner_force_p_z[base + k] = 0.0;
     corner_force_sub_r[base + k] = 0.0;
     corner_force_sub_z[base + k] = 0.0;
+  }
+  if (corner_force_q_r != nullptr) {
+    const int q_base = c * corner_stride;
+    for (int k = 0; k < corner_stride; ++k) {
+      corner_force_q_r[q_base + k] = 0.0;
+      corner_force_q_z[q_base + k] = 0.0;
+    }
   }
   work_p[c] = 0.0;
   work_sub[c] = 0.0;
@@ -1149,6 +1159,22 @@ __global__ void zero_member_work_kernel(double* __restrict__ work_p,
   work_p[c] = 0.0;
   work_sub[c] = 0.0;
   work_av[c] = 0.0;
+}
+
+__global__ void zero_member_aw_pressure_work_force_kernel(
+    double* __restrict__ corner_force_p_rz_r,
+    double* __restrict__ corner_force_p_rz_z,
+    const std::uint8_t* __restrict__ member_mask,
+    const int n_cells) {
+  const int c = blockIdx.x * blockDim.x + threadIdx.x;
+  if (c >= n_cells || member_mask == nullptr || member_mask[c] == 0U) {
+    return;
+  }
+  const int base = 4 * c;
+  for (int k = 0; k < 4; ++k) {
+    corner_force_p_rz_r[base + k] = 0.0;
+    corner_force_p_rz_z[base + k] = 0.0;
+  }
 }
 
 __global__ void zero_internal_member_edge_forces_kernel(
@@ -1278,7 +1304,13 @@ void refresh_geometry_exempt_cells(core::State& state) {
 }
 
 bool configured(const core::Config& cfg) {
-  return is_supported_topology(cfg) && env_flag_enabled(kEnvEnable);
+  const bool enabled = env_flag_enabled(kEnvEnable);
+  if (enabled && cfg.mesh.shell_polar_cap_dendrite) {
+    throw core::namelist::ConfigError(
+        "pole angular derefine is not supported with "
+        "Mesh.shell_polar_cap_dendrite=true (pending shell-chain generalization)");
+  }
+  return is_supported_topology(cfg) && enabled;
 }
 
 bool assertions_enabled() {
@@ -1948,20 +1980,41 @@ void zero_member_compatible_cell_buffers(core::State& state) {
     return;
   }
   const int blocks = (n_cells + 255) / 256;
+  const std::size_t n_corners =
+      static_cast<std::size_t>(n_cells) *
+      static_cast<std::size_t>(state.corner_stride);
+  const bool has_corner_q = state.corner_force_q_r.size() == n_corners &&
+                            state.corner_force_q_z.size() == n_corners;
   zero_member_compatible_cell_buffers_kernel<<<blocks, 256>>>(
       state.corner_force_p_r.data(),
       state.corner_force_p_z.data(),
       state.corner_force_sub_r.data(),
       state.corner_force_sub_z.data(),
+      has_corner_q ? state.corner_force_q_r.data() : nullptr,
+      has_corner_q ? state.corner_force_q_z.data() : nullptr,
       state.work_p_per_cell.data(),
       state.work_sub_per_cell.data(),
       state.work_av_per_cell.data(),
       state.pole_angular_derefine.d_member_mask.data(),
-      n_cells);
+      n_cells,
+      state.corner_stride);
   cuda_check(cudaGetLastError(),
              "polar shell angular de-refine zero compatible buffers launch failed");
   cuda_check(cudaDeviceSynchronize(),
              "polar shell angular de-refine zero compatible buffers failed");
+  if (!state.corner_force_p_rz_r.empty()) {
+    zero_member_aw_pressure_work_force_kernel<<<blocks, 256>>>(
+        state.corner_force_p_rz_r.data(),
+        state.corner_force_p_rz_z.data(),
+        state.pole_angular_derefine.d_member_mask.data(),
+        n_cells);
+    cuda_check(
+        cudaGetLastError(),
+        "polar shell angular de-refine zero member AW pressure work force launch failed");
+    cuda_check(
+        cudaDeviceSynchronize(),
+        "polar shell angular de-refine zero member AW pressure work force failed");
+  }
 }
 
 void zero_member_edge_av_forces(core::State& state) {

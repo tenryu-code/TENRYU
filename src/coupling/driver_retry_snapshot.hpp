@@ -16,6 +16,9 @@ namespace tenryu::coupling {
 // Bit-exact rollback container for tenryu::core::State, scoped to deterministic
 // radiation/conduction modes (FLD / SN / HOLO). This intentionally excludes the
 // IMC particle pool and RNG counters; Commit 2 will reject IMC + retry.
+// Carrier fields are excluded because rezone installation happens after
+// commit, outside the retry envelope, so rollback cannot span a carrier
+// update.
 struct DriverRetrySnapshot {
   ~DriverRetrySnapshot();
 

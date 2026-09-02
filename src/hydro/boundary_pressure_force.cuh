@@ -2,6 +2,8 @@
 
 #include <cuda_runtime.h>
 
+#include "hydro/pressure_drive_perturbation.cuh"
+
 namespace tenryu::hydro::detail {
 
 struct RzBoundaryPressureFaceAreaVector {
@@ -145,7 +147,9 @@ void launch_r_outer_boundary_pressure_forces(double* force_r,
                                              int nz,
                                              double p_ext,
                                              bool rz_exact_endpoint,
-                                             int rz_scheme);
+                                             int rz_scheme,
+                                             const PressureDrivePerturbationParams& drive_pert,
+                                             const bool drive_pert_enabled);
 
 void launch_r_outer_boundary_mirror_forces(double* force_r,
                                            double* force_z,
@@ -166,7 +170,9 @@ void launch_multiblock_polar_shell_pressure_forces(double* force_r,
                                                    int nz_polar,
                                                    double p_ext,
                                                    bool rz_exact_endpoint,
-                                                   const double* node_mass = nullptr,
-                                                   int rz_scheme = 0);
+                                                   const double* node_mass,
+                                                   int rz_scheme,
+                                                   const PressureDrivePerturbationParams& drive_pert,
+                                                   const bool drive_pert_enabled);
 
 }  // namespace tenryu::hydro::detail

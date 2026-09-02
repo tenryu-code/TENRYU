@@ -18,6 +18,7 @@
 #include "hydro/mesh_regime.cuh"
 #include "hydro/pole_angular_derefine.cuh"
 #include "hydro/rz_corner_mass.cuh"
+#include "mesh/reference_flat_path.hpp"
 #include "parallel/reduction.hpp"
 
 namespace tenryu::hydro {
@@ -31,9 +32,12 @@ constexpr int kNoFailingCornerKey = std::numeric_limits<int>::max();
 constexpr int kInHydroGaussSlotOffset = 4;
 constexpr int kInHydroRzSlot = 8;
 constexpr int kInHydroAxisSlot = 9;
-constexpr int kMeshQualityGaussSlotOffset = 4;
-constexpr int kMeshQualityRzSlot = 8;
-constexpr int kMeshQualityAxisSlot = 9;
+constexpr int kMeshQualityGaussSlotOffset = 8;
+constexpr int kMeshQualityRzSlot = 12;
+constexpr int kMeshQualityPlanarAreaSlot = 13;
+constexpr int kMeshQualityAxisVertexSlotOffset = 14;
+constexpr int kMeshQualityAxisSlot = 22;
+constexpr int kMeshQualitySlotCount = 23;
 constexpr int kCompositeDetailSlotBits = 8;
 constexpr unsigned int kCompositeDetailSlotMask = 0xffU;
 constexpr unsigned long long kNoFailingCompositeKey =
@@ -62,6 +66,20 @@ inline double sigma_from_sortable_uint32(const std::uint32_t sigma_bits) {
   float sigma = 0.0F;
   std::memcpy(&sigma, &sigma_bits, sizeof(float));
   return static_cast<double>(sigma);
+}
+
+inline unsigned long long compose_min_key_host(const double sigma_in,
+                                               const int detail_key) {
+  double sigma = sigma_in;
+  if (!std::isfinite(sigma) || sigma < 0.0) {
+    sigma = 0.0;
+  }
+  sigma = std::min(sigma, 1.0);
+  const float sigma_float = static_cast<float>(sigma);
+  std::uint32_t sigma_bits = 0U;
+  std::memcpy(&sigma_bits, &sigma_float, sizeof(sigma_bits));
+  return (static_cast<unsigned long long>(sigma_bits) << 32) |
+         static_cast<unsigned int>(detail_key < 0 ? 0 : detail_key);
 }
 
 __host__ __device__ inline int in_hydro_corner_failure_key(const int cell,
@@ -98,6 +116,17 @@ __host__ __device__ inline int mesh_quality_rz_failure_key(const int cell) {
 
 __host__ __device__ inline int mesh_quality_axis_failure_key(const int cell) {
   return composite_detail_key(cell, kMeshQualityAxisSlot);
+}
+
+__host__ __device__ inline int mesh_quality_axis_vertex_failure_key(
+    const int cell,
+    const int vertex) {
+  return composite_detail_key(cell, kMeshQualityAxisVertexSlotOffset + vertex);
+}
+
+__host__ __device__ inline int mesh_quality_planar_area_failure_key(
+    const int cell) {
+  return composite_detail_key(cell, kMeshQualityPlanarAreaSlot);
 }
 
 inline void cuda_check(const cudaError_t err, const char* message) {
@@ -347,8 +376,8 @@ __device__ __forceinline__ double multiblock_oriented_rz_volume_at_sigma(
     const int nverts,
     const double orientation_sign,
     const double sigma) {
-  double rr[4] = {0.0, 0.0, 0.0, 0.0};
-  double zz[4] = {0.0, 0.0, 0.0, 0.0};
+  double rr[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {0.0};
+  double zz[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {0.0};
   for (int k = 0; k < nverts; ++k) {
     rr[k] = rr0[k] + sigma * (rr1[k] - rr0[k]);
     zz[k] = zz0[k] + sigma * (zz1[k] - zz0[k]);
@@ -462,6 +491,86 @@ first_multiblock_oriented_rz_volume_floor_root(const double* rr0,
   return InHydroCornerJRoot{};
 }
 
+__device__ __forceinline__ double
+multiblock_oriented_rz_volume_min_on_unit_interval(
+    const double* rr0,
+    const double* zz0,
+    const double* rr1,
+    const double* zz1,
+    const int nverts,
+    const double orientation_sign) {
+  double a;
+  double b;
+  double c;
+  double d;
+  multiblock_oriented_rz_volume_cubic_coefficients(
+      rr0, zz0, rr1, zz1, nverts, orientation_sign, a, b, c, d);
+  if (!in_hydro_isfinite(a) || !in_hydro_isfinite(b) ||
+      !in_hydro_isfinite(c) || !in_hydro_isfinite(d)) {
+    return -INFINITY;
+  }
+
+  double min_v = fmin(a, in_hydro_cubic_at_sigma(a, b, c, d, 1.0));
+  const double qa = 3.0 * d;
+  const double qb = 2.0 * c;
+  const double qc = b;
+  const double scale = fmax(fmax(fabs(qa), fabs(qb)),
+                            fmax(fabs(qc), 1.0e-300));
+  if (fabs(qa) <= kInHydroCornerJQuadraticDegeneracyEps * scale) {
+    if (fabs(qb) > kInHydroCornerJQuadraticDegeneracyEps * scale) {
+      const double root = -qc / qb;
+      if (root > 0.0 && root < 1.0) {
+        min_v = fmin(min_v, in_hydro_cubic_at_sigma(a, b, c, d, root));
+      }
+    }
+    return min_v;
+  }
+
+  const double disc = qb * qb - 4.0 * qa * qc;
+  const double disc_scale = fmax(qb * qb, fabs(4.0 * qa * qc));
+  if (disc >= -kInHydroCornerJQuadraticDegeneracyEps * disc_scale) {
+    const double sqrt_disc = sqrt(fmax(0.0, disc));
+    const double root_a = (-qb - sqrt_disc) / (2.0 * qa);
+    const double root_b = (-qb + sqrt_disc) / (2.0 * qa);
+    if (root_a > 0.0 && root_a < 1.0) {
+      min_v = fmin(min_v, in_hydro_cubic_at_sigma(a, b, c, d, root_a));
+    }
+    if (root_b > 0.0 && root_b < 1.0) {
+      min_v = fmin(min_v, in_hydro_cubic_at_sigma(a, b, c, d, root_b));
+    }
+  }
+  return min_v;
+}
+
+__device__ __forceinline__ void oriented_planar_area_coefficients(
+    const double* rr0,
+    const double* zz0,
+    const double* rr1,
+    const double* zz1,
+    const int nverts,
+    const double orientation_sign,
+    double& q0,
+    double& q1,
+    double& q2) {
+  q0 = 0.0;
+  q1 = 0.0;
+  q2 = 0.0;
+  for (int k = 0; k < nverts; ++k) {
+    const int kp = (k + 1 == nverts) ? 0 : k + 1;
+    const double drk = rr1[k] - rr0[k];
+    const double dzk = zz1[k] - zz0[k];
+    const double drp = rr1[kp] - rr0[kp];
+    const double dzp = zz1[kp] - zz0[kp];
+    q0 += corner_jacobian_cross2(rr0[k], zz0[k], rr0[kp], zz0[kp]);
+    q1 += corner_jacobian_cross2(drk, dzk, rr0[kp], zz0[kp]) +
+          corner_jacobian_cross2(rr0[k], zz0[k], drp, dzp);
+    q2 += corner_jacobian_cross2(drk, dzk, drp, dzp);
+  }
+  q0 *= orientation_sign;
+  q1 *= orientation_sign;
+  q2 *= orientation_sign;
+}
+
 template <typename Field>
 std::vector<double> copy_field_to_vector(const Field& field) {
   std::vector<double> host(field.size(), 0.0);
@@ -505,15 +614,95 @@ double corner_limited_tau_host(const double* r,
   return lo;
 }
 
+AxisMarginPredicateResult evaluate_collapsed_axis_margin_predicate_quad_host(
+    const double* r_current,
+    const double* z_current,
+    const double* r_trial,
+    const double* z_trial,
+    const double floor_eps) {
+  AxisMarginPredicateResult result{};
+  result.min_margin = std::numeric_limits<double>::infinity();
+  double rt[4] = {r_trial[0], r_trial[1], r_trial[2], r_trial[3]};
+  rt[0] = 0.0;
+  rt[3] = 0.0;
+
+  const double axis_scale =
+      std::max({std::abs(r_current[0]), std::abs(r_current[3]), 1.0e-30});
+  const double axis_floor = floor_eps * axis_scale;
+  const double axis_margin =
+      axis_floor - std::max(std::abs(r_trial[0]), std::abs(r_trial[3]));
+  result.min_margin = std::min(result.min_margin, axis_margin);
+  if (!(axis_margin >= 0.0) || !std::isfinite(axis_margin)) {
+    result.admissible = false;
+    result.failed_condition = 1;
+    return result;
+  }
+
+  const double r_scale =
+      std::max({std::abs(r_current[1]), std::abs(r_current[2]), 1.0e-30});
+  const double r_floor = floor_eps * r_scale;
+  const double r_margin = std::min(rt[1], rt[2]) - r_floor;
+  result.min_margin = std::min(result.min_margin, r_margin);
+  if (!(rt[1] > r_floor && rt[2] > r_floor) ||
+      !std::isfinite(r_margin)) {
+    result.admissible = false;
+    result.failed_condition = 2;
+    return result;
+  }
+
+  const double area_current =
+      0.5 * rz::rz_polygon_area2_exact(r_current, z_current, 4);
+  const double area_floor =
+      floor_eps * std::max(std::abs(area_current), 1.0e-30);
+  const double area_margin =
+      0.5 * rz::rz_polygon_area2_exact(rt, z_trial, 4) - area_floor;
+  result.min_margin = std::min(result.min_margin, area_margin);
+  if (!(area_margin > 0.0) || !std::isfinite(area_margin)) {
+    result.admissible = false;
+    result.failed_condition = 4;
+    return result;
+  }
+
+  const double volume_current =
+      rz::rz_polygon_volume_exact(r_current, z_current, 4);
+  const double volume_floor =
+      floor_eps * std::max(std::abs(volume_current), 1.0e-30);
+  const double volume_margin =
+      rz::rz_polygon_volume_exact(rt, z_trial, 4) - volume_floor;
+  result.min_margin = std::min(result.min_margin, volume_margin);
+  if (!(volume_margin > 0.0) || !std::isfinite(volume_margin)) {
+    result.admissible = false;
+    result.failed_condition = 5;
+    return result;
+  }
+  return result;
+}
+
+AxisMarginPredicateResult evaluate_axis_margin_for_guard_host(
+    const double* r_current,
+    const double* z_current,
+    const double* r_trial,
+    const double* z_trial,
+    const double floor_eps,
+    const bool axis_edge_collapsed) {
+  return axis_edge_collapsed
+             ? evaluate_collapsed_axis_margin_predicate_quad_host(
+                   r_current, z_current, r_trial, z_trial, floor_eps)
+             : evaluate_axis_margin_predicate_quad(
+                   r_current, z_current, r_trial, z_trial, floor_eps);
+}
+
 double axis_margin_limited_tau_host(const double* r,
                                     const double* z,
                                     const double* vr,
                                     const double* vz,
                                     const double dt,
-                                    const double floor_eps) {
+                                    const double floor_eps,
+                                    const bool axis_edge_collapsed) {
   double rr[4];
   double zz[4];
-  const auto current = evaluate_axis_margin_predicate_quad(r, z, r, z, floor_eps);
+  const auto current = evaluate_axis_margin_for_guard_host(
+      r, z, r, z, floor_eps, axis_edge_collapsed);
   if (!current.admissible) {
     return 0.0;
   }
@@ -525,8 +714,8 @@ double axis_margin_limited_tau_host(const double* r,
       rr[k] = r[k] + mid * vr[k];
       zz[k] = z[k] + mid * vz[k];
     }
-    const auto trial =
-        evaluate_axis_margin_predicate_quad(r, z, rr, zz, floor_eps);
+    const auto trial = evaluate_axis_margin_for_guard_host(
+        r, z, rr, zz, floor_eps, axis_edge_collapsed);
     if (trial.admissible) {
       lo = mid;
     } else {
@@ -694,6 +883,8 @@ __global__ void corner_jacobian_trial_scale_kernel(
     const double* __restrict__ v_r,
     const double* __restrict__ v_z,
     const std::int8_t* __restrict__ hydro_active,
+    const std::uint8_t* __restrict__ axis_edge_collapsed,
+    const std::uint8_t* __restrict__ geometry_policy_exempt,
     const CellRegime* __restrict__ cell_regime,
     const int nr,
     const int nz,
@@ -711,6 +902,12 @@ __global__ void corner_jacobian_trial_scale_kernel(
   if (hydro_active != nullptr && hydro_active[c] == 0) {
     return;
   }
+  const bool collapsed =
+      axis_edge_collapsed != nullptr && axis_edge_collapsed[c] != 0U;
+  if (!collapsed && geometry_policy_exempt != nullptr &&
+      geometry_policy_exempt[c] != 0U) {
+    return;
+  }
 
   const int i = c / nz;
   const int j = c - i * nz;
@@ -726,7 +923,7 @@ __global__ void corner_jacobian_trial_scale_kernel(
           : legacy_trigger_scale;
 
   if (axis_margin_guard_enabled != 0 && has_physical_rz_axis != 0 &&
-      i == 0) {
+      i == 0 && !collapsed) {
     double r_current[4];
     double z_current[4];
     cell_quad_at_tau_device(x_r, x_z, v_r, v_z, nodes, 0.0, r_current,
@@ -746,7 +943,9 @@ __global__ void corner_jacobian_trial_scale_kernel(
     return;
   }
 
-  for (int corner = 0; corner < 4; ++corner) {
+  const int corner_begin = collapsed ? 1 : 0;
+  const int corner_end = collapsed ? 3 : 4;
+  for (int corner = corner_begin; corner < corner_end; ++corner) {
     const double j_current =
         corner_jacobian_at_tau_device(x_r, x_z, v_r, v_z, nodes, corner, 0.0);
     if (!(j_current > 0.0) || !isfinite(j_current)) {
@@ -1020,8 +1219,13 @@ __global__ void in_hydro_candidate_corner_j_guard_kernel(
 __device__ __forceinline__ void mesh_quality_record_failure(
     double* __restrict__ min_sigma,
     unsigned long long* __restrict__ first_failing_composite_key,
+    double* __restrict__ failure_min_values,
+    const int cell,
+    const int slot,
+    const double min_value,
     const double sigma,
     const int detail_key) {
+  failure_min_values[cell * kMeshQualitySlotCount + slot] = min_value;
   record_composite_failure(min_sigma, first_failing_composite_key,
                            sigma, detail_key);
 }
@@ -1029,6 +1233,7 @@ __device__ __forceinline__ void mesh_quality_record_failure(
 __global__ void mesh_quality_dt_limit_kernel(
     double* __restrict__ min_sigma,
     unsigned long long* __restrict__ first_failing_composite_key,
+    double* __restrict__ failure_min_values,
     const double* __restrict__ x_r_start,
     const double* __restrict__ x_z_start,
     const double* __restrict__ v_r_half,
@@ -1040,6 +1245,7 @@ __global__ void mesh_quality_dt_limit_kernel(
     const int corner_j_enabled,
     const int gauss_j_enabled,
     const int rz_volume_enabled,
+    const int planar_area_enabled,
     const int axis_margin_additive,
     const int has_physical_rz_axis,
     const double corner_j_floor_rel,
@@ -1099,12 +1305,16 @@ __global__ void mesh_quality_dt_limit_kernel(
       const int key = mesh_quality_corner_failure_key(c, corner);
 
       if (!isfinite(j0) || !isfinite(j1) || !isfinite(j2)) {
-        mesh_quality_record_failure(min_sigma, first_failing_composite_key, 0.0, key);
+        mesh_quality_record_failure(
+            min_sigma, first_failing_composite_key, failure_min_values, c,
+            corner, -INFINITY, 0.0, key);
         continue;
       }
       const double floor = (j0 > 0.0) ? corner_j_floor_rel * j0 : 0.0;
       if (!(j0 > floor)) {
-        mesh_quality_record_failure(min_sigma, first_failing_composite_key, 0.0, key);
+        mesh_quality_record_failure(
+            min_sigma, first_failing_composite_key, failure_min_values, c,
+            corner, j0, 0.0, key);
         continue;
       }
       const double local_min_j =
@@ -1115,7 +1325,9 @@ __global__ void mesh_quality_dt_limit_kernel(
       const InHydroCornerJRoot root =
           first_in_hydro_corner_j_floor_root(j0, j1, j2, floor);
       const double sigma = root.found ? root.sigma : 0.0;
-      mesh_quality_record_failure(min_sigma, first_failing_composite_key, sigma, key);
+      mesh_quality_record_failure(
+          min_sigma, first_failing_composite_key, failure_min_values, c,
+          corner, local_min_j, sigma, key);
     }
   }
 
@@ -1131,12 +1343,16 @@ __global__ void mesh_quality_dt_limit_kernel(
                                        j0, j1, j2);
       const int key = mesh_quality_gauss_failure_key(c, q);
       if (!isfinite(j0) || !isfinite(j1) || !isfinite(j2)) {
-        mesh_quality_record_failure(min_sigma, first_failing_composite_key, 0.0, key);
+        mesh_quality_record_failure(
+            min_sigma, first_failing_composite_key, failure_min_values, c,
+            kMeshQualityGaussSlotOffset + q, -INFINITY, 0.0, key);
         continue;
       }
       const double floor = (j0 > 0.0) ? gauss_j_floor_rel * j0 : 0.0;
       if (!(j0 > floor)) {
-        mesh_quality_record_failure(min_sigma, first_failing_composite_key, 0.0, key);
+        mesh_quality_record_failure(
+            min_sigma, first_failing_composite_key, failure_min_values, c,
+            kMeshQualityGaussSlotOffset + q, j0, 0.0, key);
         continue;
       }
       const double local_min_j =
@@ -1147,7 +1363,9 @@ __global__ void mesh_quality_dt_limit_kernel(
       const InHydroCornerJRoot root =
           first_in_hydro_corner_j_floor_root(j0, j1, j2, floor);
       const double sigma = root.found ? root.sigma : 0.0;
-      mesh_quality_record_failure(min_sigma, first_failing_composite_key, sigma, key);
+      mesh_quality_record_failure(
+          min_sigma, first_failing_composite_key, failure_min_values, c,
+          kMeshQualityGaussSlotOffset + q, local_min_j, sigma, key);
     }
   }
 
@@ -1156,7 +1374,9 @@ __global__ void mesh_quality_dt_limit_kernel(
     const double floor = (v0 > 0.0) ? rz_volume_floor_rel * v0 : 0.0;
     const int key = mesh_quality_rz_failure_key(c);
     if (!isfinite(v0) || !(v0 > floor)) {
-      mesh_quality_record_failure(min_sigma, first_failing_composite_key, 0.0, key);
+      mesh_quality_record_failure(
+          min_sigma, first_failing_composite_key, failure_min_values, c,
+          kMeshQualityRzSlot, isfinite(v0) ? v0 : -INFINITY, 0.0, key);
     } else {
       const double local_min_v =
           in_hydro_rz_volume_min_on_unit_interval(rr0, zz0, rr1, zz1);
@@ -1164,7 +1384,39 @@ __global__ void mesh_quality_dt_limit_kernel(
         const InHydroCornerJRoot root =
             first_in_hydro_rz_volume_floor_root(rr0, zz0, rr1, zz1, floor);
         const double sigma = root.found ? root.sigma : 0.0;
-        mesh_quality_record_failure(min_sigma, first_failing_composite_key, sigma, key);
+        mesh_quality_record_failure(
+            min_sigma, first_failing_composite_key, failure_min_values, c,
+            kMeshQualityRzSlot, local_min_v, sigma, key);
+      }
+    }
+  }
+
+  if (planar_area_enabled != 0) {
+    double q0;
+    double q1;
+    double q2;
+    oriented_planar_area_coefficients(
+        rr0, zz0, rr1, zz1, 4, 1.0, q0, q1, q2);
+    const int key = mesh_quality_planar_area_failure_key(c);
+    const double floor = (q0 > 0.0) ? gauss_j_floor_rel * q0 : 0.0;
+    if (!isfinite(q0) || !isfinite(q1) || !isfinite(q2)) {
+      mesh_quality_record_failure(
+          min_sigma, first_failing_composite_key, failure_min_values, c,
+          kMeshQualityPlanarAreaSlot, -INFINITY, 0.0, key);
+    } else if (!(q0 > floor)) {
+      mesh_quality_record_failure(
+          min_sigma, first_failing_composite_key, failure_min_values, c,
+          kMeshQualityPlanarAreaSlot, q0, 0.0, key);
+    } else {
+      const double local_min_area =
+          in_hydro_trial_quadratic_min_on_unit_interval(q0, q1, q2);
+      if (!(local_min_area >= floor && isfinite(local_min_area))) {
+        const InHydroCornerJRoot root =
+            first_in_hydro_corner_j_floor_root(q0, q1, q2, floor);
+        const double sigma = root.found ? root.sigma : 0.0;
+        mesh_quality_record_failure(
+            min_sigma, first_failing_composite_key, failure_min_values, c,
+            kMeshQualityPlanarAreaSlot, local_min_area, sigma, key);
       }
     }
   }
@@ -1175,7 +1427,9 @@ __global__ void mesh_quality_dt_limit_kernel(
                                             corner_j_floor_rel);
     const int key = mesh_quality_axis_failure_key(c);
     if (!current.admissible) {
-      mesh_quality_record_failure(min_sigma, first_failing_composite_key, 0.0, key);
+      mesh_quality_record_failure(
+          min_sigma, first_failing_composite_key, failure_min_values, c,
+          kMeshQualityAxisSlot, current.min_margin, 0.0, key);
       return;
     }
     const AxisMarginPredicateResult full =
@@ -1185,7 +1439,9 @@ __global__ void mesh_quality_dt_limit_kernel(
       const double sigma =
           axis_margin_candidate_sigma_device(rr0, zz0, rr1, zz1,
                                              corner_j_floor_rel);
-      mesh_quality_record_failure(min_sigma, first_failing_composite_key, sigma, key);
+      mesh_quality_record_failure(
+          min_sigma, first_failing_composite_key, failure_min_values, c,
+          kMeshQualityAxisSlot, full.min_margin, sigma, key);
     }
   }
 }
@@ -1193,6 +1449,7 @@ __global__ void mesh_quality_dt_limit_kernel(
 __global__ void mesh_quality_dt_limit_multiblock_rz_volume_kernel(
     double* __restrict__ min_sigma,
     unsigned long long* __restrict__ first_failing_composite_key,
+    double* __restrict__ failure_min_values,
     int* __restrict__ debug_printed,
     const double* __restrict__ x_r_start,
     const double* __restrict__ x_z_start,
@@ -1205,8 +1462,17 @@ __global__ void mesh_quality_dt_limit_multiblock_rz_volume_kernel(
     const int* __restrict__ cell_node_csr_indices,
     const int* __restrict__ cell_orientation_sign,
     const std::uint8_t* __restrict__ cell_nverts,
+    const std::uint8_t* __restrict__ reference_flat_corner,
     const int n_cells,
     const double dt,
+    const int corner_j_enabled,
+    const int gauss_j_enabled,
+    const int rz_volume_enabled,
+    const int planar_area_enabled,
+    const int axis_margin_enabled,
+    const int use_path_volume_floor,
+    const double corner_j_floor_rel,
+    const double gauss_j_floor_rel,
     const double rz_volume_floor_rel,
     const int state_step) {
   const int c = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1221,7 +1487,8 @@ __global__ void mesh_quality_dt_limit_multiblock_rz_volume_kernel(
   }
 
   const double state_vol = cell_vol[c];
-  if (!isfinite(state_vol) || !(state_vol > 0.0)) {
+  if (use_path_volume_floor == 0 &&
+      (!isfinite(state_vol) || !(state_vol > 0.0))) {
     return;
   }
 
@@ -1229,65 +1496,228 @@ __global__ void mesh_quality_dt_limit_multiblock_rz_volume_kernel(
   const int nverts = mesh::mesh_topo_cell_active_nverts(cell_nverts, c);
   const double orientation_sign =
       static_cast<double>(cell_orientation_sign[c]);
-  int nodes[4] = {-1, -1, -1, -1};
-  double rr0[4] = {0.0, 0.0, 0.0, 0.0};
-  double zz0[4] = {0.0, 0.0, 0.0, 0.0};
-  double rr1[4] = {0.0, 0.0, 0.0, 0.0};
-  double zz1[4] = {0.0, 0.0, 0.0, 0.0};
+  double rr0[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {0.0};
+  double zz0[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {0.0};
+  double rr1[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {0.0};
+  double zz1[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {0.0};
+  if (nverts < 3 || nverts > mesh::kMeshTopoCellStorageSlotsMax ||
+      !(orientation_sign == 1.0 || orientation_sign == -1.0)) {
+    const int key = mesh_quality_planar_area_failure_key(c);
+    mesh_quality_record_failure(
+        min_sigma, first_failing_composite_key, failure_min_values, c,
+        kMeshQualityPlanarAreaSlot, -INFINITY, 0.0, key);
+    return;
+  }
   for (int k = 0; k < nverts; ++k) {
     const int n = cell_node_csr_indices[off + k];
-    nodes[k] = n;
     rr0[k] = x_r_start[n];
     zz0[k] = x_z_start[n];
     rr1[k] = x_r_start[n] + dt * v_r_half[n];
     zz1[k] = x_z_start[n] + dt * v_z_half[n];
   }
 
-  const double v0 = multiblock_oriented_rz_volume_at_sigma(
-      rr0, zz0, rr1, zz1, nverts, orientation_sign, 0.0);
-  const double floor = rz_volume_floor_rel * state_vol;
-  const int key = mesh_quality_rz_failure_key(c);
-  if (!isfinite(v0) || !(v0 > floor)) {
-    if (state_step == 0 && debug_printed != nullptr &&
-        atomicCAS(debug_printed, 0, 1) == 0) {
-      printf("[mesh-quality-multiblock-rz-volume sigma0 step0] c=%d "
-             "active_nverts=%d orientation_sign=%.0f V0=%.17e "
-             "state_vol=%.17e floor=%.17e "
-             "nodes=(%d,%.17e,%.17e),(%d,%.17e,%.17e),"
-             "(%d,%.17e,%.17e),(%d,%.17e,%.17e)\n",
-             c, nverts, orientation_sign, v0, state_vol, floor,
-             nodes[0], rr0[0], zz0[0],
-             nodes[1], rr0[1], zz0[1],
-             nodes[2], rr0[2], zz0[2],
-             nodes[3], rr0[3], zz0[3]);
+  if (corner_j_enabled != 0) {
+    double j0[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {0.0};
+    double j1[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {0.0};
+    double j2[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {0.0};
+    for (int k = 0; k < nverts; ++k) {
+      const int kp = (k + 1 == nverts) ? 0 : k + 1;
+      const int km = (k == 0) ? nverts - 1 : k - 1;
+      const double a0r = rr0[kp] - rr0[k];
+      const double a0z = zz0[kp] - zz0[k];
+      const double b0r = rr0[km] - rr0[k];
+      const double b0z = zz0[km] - zz0[k];
+      const double dar = (rr1[kp] - rr1[k]) - a0r;
+      const double daz = (zz1[kp] - zz1[k]) - a0z;
+      const double dbr = (rr1[km] - rr1[k]) - b0r;
+      const double dbz = (zz1[km] - zz1[k]) - b0z;
+      j0[k] = orientation_sign *
+              corner_jacobian_cross2(a0r, a0z, b0r, b0z);
+      j1[k] = orientation_sign *
+              (corner_jacobian_cross2(dar, daz, b0r, b0z) +
+               corner_jacobian_cross2(a0r, a0z, dbr, dbz));
+      j2[k] = orientation_sign *
+              corner_jacobian_cross2(dar, daz, dbr, dbz);
     }
-    mesh_quality_record_failure(min_sigma, first_failing_composite_key,
-                                0.0, key);
-    return;
+    for (int k = 0; k < nverts; ++k) {
+      if (reference_flat_corner != nullptr &&
+          reference_flat_corner[
+              c * mesh::kMeshTopoCellStorageSlotsMax + k] != 0U) {
+        continue;
+      }
+      const int key = mesh_quality_corner_failure_key(c, k);
+      if (!isfinite(j0[k]) || !isfinite(j1[k]) || !isfinite(j2[k])) {
+        mesh_quality_record_failure(
+            min_sigma, first_failing_composite_key, failure_min_values, c, k,
+            -INFINITY, 0.0, key);
+        continue;
+      }
+      const double floor = (j0[k] > 0.0) ? corner_j_floor_rel * j0[k] : 0.0;
+      if (!(j0[k] > floor)) {
+        mesh_quality_record_failure(
+            min_sigma, first_failing_composite_key, failure_min_values, c, k,
+            j0[k], 0.0, key);
+        continue;
+      }
+      const double min_j = in_hydro_trial_quadratic_min_on_unit_interval(
+          j0[k], j1[k], j2[k]);
+      if (!(min_j >= floor && isfinite(min_j))) {
+        const InHydroCornerJRoot root =
+            first_in_hydro_corner_j_floor_root(j0[k], j1[k], j2[k], floor);
+        mesh_quality_record_failure(
+            min_sigma, first_failing_composite_key, failure_min_values, c, k,
+            min_j, root.found ? root.sigma : 0.0, key);
+      }
+    }
   }
 
-  const InHydroCornerJRoot root =
-      first_multiblock_oriented_rz_volume_floor_root(
-          rr0, zz0, rr1, zz1, nverts, orientation_sign, floor);
-  const double sigma = root.found ? root.sigma : 0.0;
-  if (!root.found) {
-    return;
+  if (gauss_j_enabled != 0 && nverts == 4) {
+    constexpr double g = 0.57735026918962576450914878050195745565;
+    const double xi[4] = {-g, g, g, -g};
+    const double eta[4] = {-g, -g, g, g};
+    for (int q = 0; q < 4; ++q) {
+      double j0;
+      double j1;
+      double j2;
+      in_hydro_gauss_j_coefficients_at(
+          rr0, zz0, rr1, zz1, xi[q], eta[q], j0, j1, j2);
+      j0 *= orientation_sign;
+      j1 *= orientation_sign;
+      j2 *= orientation_sign;
+      const int key = mesh_quality_gauss_failure_key(c, q);
+      const int slot = kMeshQualityGaussSlotOffset + q;
+      if (!isfinite(j0) || !isfinite(j1) || !isfinite(j2)) {
+        mesh_quality_record_failure(
+            min_sigma, first_failing_composite_key, failure_min_values, c,
+            slot, -INFINITY, 0.0, key);
+        continue;
+      }
+      const double floor = (j0 > 0.0) ? gauss_j_floor_rel * j0 : 0.0;
+      if (!(j0 > floor)) {
+        mesh_quality_record_failure(
+            min_sigma, first_failing_composite_key, failure_min_values, c,
+            slot, j0, 0.0, key);
+        continue;
+      }
+      const double min_j = in_hydro_trial_quadratic_min_on_unit_interval(
+          j0, j1, j2);
+      if (!(min_j >= floor && isfinite(min_j))) {
+        const InHydroCornerJRoot root =
+            first_in_hydro_corner_j_floor_root(j0, j1, j2, floor);
+        mesh_quality_record_failure(
+            min_sigma, first_failing_composite_key, failure_min_values, c,
+            slot, min_j, root.found ? root.sigma : 0.0, key);
+      }
+    }
   }
-  if (state_step == 0 && sigma == 0.0 && debug_printed != nullptr &&
-      atomicCAS(debug_printed, 0, 1) == 0) {
-    printf("[mesh-quality-multiblock-rz-volume sigma0 step0] c=%d "
-           "active_nverts=%d orientation_sign=%.0f V0=%.17e "
-           "state_vol=%.17e floor=%.17e "
-           "nodes=(%d,%.17e,%.17e),(%d,%.17e,%.17e),"
-           "(%d,%.17e,%.17e),(%d,%.17e,%.17e)\n",
-           c, nverts, orientation_sign, v0, state_vol, floor,
-           nodes[0], rr0[0], zz0[0],
-           nodes[1], rr0[1], zz0[1],
-           nodes[2], rr0[2], zz0[2],
-           nodes[3], rr0[3], zz0[3]);
+
+  if (planar_area_enabled != 0) {
+    double q0;
+    double q1;
+    double q2;
+    oriented_planar_area_coefficients(
+        rr0, zz0, rr1, zz1, nverts, orientation_sign, q0, q1, q2);
+    const int key = mesh_quality_planar_area_failure_key(c);
+    const double floor = (q0 > 0.0) ? gauss_j_floor_rel * q0 : 0.0;
+    const double min_area = in_hydro_trial_quadratic_min_on_unit_interval(
+        q0, q1, q2);
+    if (!isfinite(q0) || !isfinite(q1) || !isfinite(q2)) {
+      mesh_quality_record_failure(
+          min_sigma, first_failing_composite_key, failure_min_values, c,
+          kMeshQualityPlanarAreaSlot, -INFINITY, 0.0, key);
+    } else if (!(q0 > floor)) {
+      mesh_quality_record_failure(
+          min_sigma, first_failing_composite_key, failure_min_values, c,
+          kMeshQualityPlanarAreaSlot, q0, 0.0, key);
+    } else if (!(min_area >= floor && isfinite(min_area))) {
+      const InHydroCornerJRoot root =
+          first_in_hydro_corner_j_floor_root(q0, q1, q2, floor);
+      mesh_quality_record_failure(
+          min_sigma, first_failing_composite_key, failure_min_values, c,
+          kMeshQualityPlanarAreaSlot, min_area,
+          root.found ? root.sigma : 0.0, key);
+    }
   }
-  mesh_quality_record_failure(min_sigma, first_failing_composite_key,
-                              sigma, key);
+
+  if (axis_margin_enabled != 0) {
+    for (int k = 0; k < nverts; ++k) {
+      const double r0 = rr0[k];
+      const double r1 = rr1[k];
+      const int slot = kMeshQualityAxisVertexSlotOffset + k;
+      const int key = mesh_quality_axis_vertex_failure_key(c, k);
+      if (!isfinite(r0) || !isfinite(r1)) {
+        mesh_quality_record_failure(
+            min_sigma, first_failing_composite_key, failure_min_values, c,
+            slot, -INFINITY, 0.0, key);
+        continue;
+      }
+      if (r0 < 0.0) {
+        mesh_quality_record_failure(
+            min_sigma, first_failing_composite_key, failure_min_values, c,
+            slot, r0, 0.0, key);
+        continue;
+      }
+      if (r0 == 0.0) {
+        continue;
+      }
+      const double floor = corner_j_floor_rel * r0;
+      if (r1 <= floor) {
+        const double denominator = r0 - r1;
+        const double sigma =
+            denominator > 0.0 ? (r0 - floor) / denominator : 0.0;
+        mesh_quality_record_failure(
+            min_sigma, first_failing_composite_key, failure_min_values, c,
+            slot, fmin(r0, r1) - floor,
+            isfinite(sigma) ? fmin(fmax(sigma, 0.0), 1.0) : 0.0, key);
+      }
+    }
+  }
+
+  if (rz_volume_enabled != 0) {
+    const double v0 = multiblock_oriented_rz_volume_at_sigma(
+        rr0, zz0, rr1, zz1, nverts, orientation_sign, 0.0);
+    const double floor_baseline =
+        use_path_volume_floor != 0 ? v0 : state_vol;
+    const double floor =
+        (floor_baseline > 0.0) ? rz_volume_floor_rel * floor_baseline : 0.0;
+    const int key = mesh_quality_rz_failure_key(c);
+    if (!isfinite(v0) || !isfinite(floor_baseline) || !(v0 > floor)) {
+      if (state_step == 0 && debug_printed != nullptr &&
+          atomicCAS(debug_printed, 0, 1) == 0) {
+        printf("[mesh-quality-multiblock-rz-volume sigma0 step0] c=%d "
+               "active_nverts=%d orientation_sign=%.0f V0=%.17e "
+               "state_vol=%.17e floor=%.17e\n",
+               c, nverts, orientation_sign, v0, state_vol, floor);
+      }
+      mesh_quality_record_failure(
+          min_sigma, first_failing_composite_key, failure_min_values, c,
+          kMeshQualityRzSlot, isfinite(v0) ? v0 : -INFINITY, 0.0, key);
+    } else if (use_path_volume_floor == 0) {
+      const InHydroCornerJRoot root =
+          first_multiblock_oriented_rz_volume_floor_root(
+              rr0, zz0, rr1, zz1, nverts, orientation_sign, floor);
+      if (root.found) {
+        const double min_v =
+            multiblock_oriented_rz_volume_min_on_unit_interval(
+                rr0, zz0, rr1, zz1, nverts, orientation_sign);
+        mesh_quality_record_failure(
+            min_sigma, first_failing_composite_key, failure_min_values, c,
+            kMeshQualityRzSlot, min_v, root.sigma, key);
+      }
+    } else {
+      const double min_v =
+          multiblock_oriented_rz_volume_min_on_unit_interval(
+              rr0, zz0, rr1, zz1, nverts, orientation_sign);
+      if (!(min_v >= floor && isfinite(min_v))) {
+        const InHydroCornerJRoot root =
+            first_multiblock_oriented_rz_volume_floor_root(
+                rr0, zz0, rr1, zz1, nverts, orientation_sign, floor);
+        mesh_quality_record_failure(
+            min_sigma, first_failing_composite_key, failure_min_values, c,
+            kMeshQualityRzSlot, min_v, root.found ? root.sigma : 0.0, key);
+      }
+    }
+  }
 }
 
 __global__ void mesh_quality_rz_volume_cell_margin_kernel(
@@ -1349,10 +1779,10 @@ __global__ void mesh_quality_rz_volume_cell_margin_kernel(
   const int nverts = mesh::mesh_topo_cell_active_nverts(cell_nverts, c);
   const double orientation_sign =
       static_cast<double>(cell_orientation_sign[c]);
-  double rr0[4] = {0.0, 0.0, 0.0, 0.0};
-  double zz0[4] = {0.0, 0.0, 0.0, 0.0};
-  double rr1[4] = {0.0, 0.0, 0.0, 0.0};
-  double zz1[4] = {0.0, 0.0, 0.0, 0.0};
+  double rr0[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {0.0};
+  double zz0[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {0.0};
+  double rr1[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {0.0};
+  double zz1[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {0.0};
   for (int k = 0; k < nverts; ++k) {
     const int n = cell_node_csr_indices[off + k];
     rr0[k] = x_r_start[n];
@@ -1396,10 +1826,19 @@ MeshQualityDtLimit compute_multiblock_mesh_quality_dt_limit(
     const double* d_v_r_half,
     const double* d_v_z_half,
     const double dt,
-    const parallel::Reduction* reduction) {
+    const parallel::Reduction* reduction,
+    const bool force_path_guard) {
   MeshQualityDtLimit result{};
   result.suggested_dt = dt;
-  if (!cfg.numerics.hydro.mesh_quality_dt_rz_volume_enabled) {
+  const bool corner_j_enabled = force_path_guard;
+  const bool gauss_j_enabled = force_path_guard;
+  const bool rz_volume_enabled =
+      force_path_guard || cfg.numerics.hydro.mesh_quality_dt_rz_volume_enabled;
+  const bool planar_area_enabled = force_path_guard;
+  const bool axis_margin_enabled =
+      force_path_guard && cfg.numerics.has_physical_rz_axis;
+  if (!corner_j_enabled && !gauss_j_enabled && !rz_volume_enabled &&
+      !planar_area_enabled && !axis_margin_enabled) {
     return result;
   }
   if (state.mesh.dim != 2) {
@@ -1415,6 +1854,9 @@ MeshQualityDtLimit compute_multiblock_mesh_quality_dt_limit(
                     std::isfinite(
                         cfg.numerics.hydro.mesh_quality_dt_rz_volume_floor_rel),
                 "mesh-quality multiblock RZ-volume floor_rel must be finite > 0");
+  TENRYU_ASSERT(cfg.numerics.hydro.mesh_quality_dt_corner_j_floor_rel > 0.0 &&
+                    cfg.numerics.hydro.mesh_quality_dt_gauss_j_floor_rel > 0.0,
+                "mesh-quality multiblock J floors must be > 0");
   TENRYU_ASSERT(d_x_r_start != nullptr && d_x_z_start != nullptr &&
                     d_v_r_half != nullptr && d_v_z_half != nullptr,
                 "mesh-quality multiblock dt CFL requires non-null coordinate and velocity fields");
@@ -1450,6 +1892,10 @@ MeshQualityDtLimit compute_multiblock_mesh_quality_dt_limit(
   d_min_sigma.reset(1U);
   core::DeviceArray<unsigned long long> d_first_failing_composite_key("corner_j:compute_multiblock_mesh_quality_dt_limit:d_first_failing_composite_key");
   d_first_failing_composite_key.reset(1U);
+  core::DeviceArray<double> d_failure_min_values(
+      "corner_j:compute_multiblock_mesh_quality_dt_limit:d_failure_min_values");
+  d_failure_min_values.reset(
+      static_cast<std::size_t>(n_cells) * kMeshQualitySlotCount);
   core::DeviceArray<int> d_cell_orientation_sign("corner_j:compute_multiblock_mesh_quality_dt_limit:d_cell_orientation_sign");
   d_cell_orientation_sign.reset(
       static_cast<std::size_t>(n_cells));
@@ -1461,6 +1907,66 @@ MeshQualityDtLimit compute_multiblock_mesh_quality_dt_limit(
     d_cell_nverts_owned.reset(static_cast<std::size_t>(n_cells));
     d_cell_nverts_owned.copy_from_host(state.mesh.cell_nverts);
     d_cell_nverts = d_cell_nverts_owned.data();
+  }
+
+  std::vector<double> reference_r;
+  std::vector<double> reference_z;
+  std::vector<std::uint8_t> reference_flat_corner;
+  bool has_reference_flat_corner = false;
+  if (force_path_guard) {
+    TENRYU_ASSERT(
+        state.x_r_initial.size() == static_cast<std::size_t>(n_nodes) &&
+            state.x_z_initial.size() == static_cast<std::size_t>(n_nodes),
+        "typed path guard requires immutable construction coordinates");
+    state.x_r_initial.copy_to_host(reference_r);
+    state.x_z_initial.copy_to_host(reference_z);
+    reference_flat_corner.assign(
+        static_cast<std::size_t>(n_cells) *
+            mesh::kMeshTopoCellStorageSlotsMax,
+        0U);
+    for (int cell = 0; cell < n_cells; ++cell) {
+      const int offset =
+          mb.cell_node_csr_offsets[static_cast<std::size_t>(cell)];
+      const int nverts = mesh::mesh_topo_cell_active_nverts(
+          state.mesh.cell_nverts.empty() ? nullptr
+                                        : state.mesh.cell_nverts.data(),
+          cell);
+      const int orientation_sign =
+          mb.cell_orientation_sign[static_cast<std::size_t>(cell)];
+      for (int corner = 0; corner < nverts; ++corner) {
+        const int previous = (corner + nverts - 1) % nverts;
+        const int next = (corner + 1) % nverts;
+        const int previous_node = mb.cell_node_csr_indices[
+            static_cast<std::size_t>(offset + previous)];
+        const int node = mb.cell_node_csr_indices[
+            static_cast<std::size_t>(offset + corner)];
+        const int next_node = mb.cell_node_csr_indices[
+            static_cast<std::size_t>(offset + next)];
+        if (mesh::classify_reference_corner(
+                reference_r[static_cast<std::size_t>(previous_node)],
+                reference_z[static_cast<std::size_t>(previous_node)],
+                reference_r[static_cast<std::size_t>(node)],
+                reference_z[static_cast<std::size_t>(node)],
+                reference_r[static_cast<std::size_t>(next_node)],
+                reference_z[static_cast<std::size_t>(next_node)],
+                orientation_sign) ==
+            mesh::ReferenceCornerClass::FlatReference) {
+          reference_flat_corner[
+              static_cast<std::size_t>(cell) *
+                  mesh::kMeshTopoCellStorageSlotsMax +
+              static_cast<std::size_t>(corner)] = 1U;
+          has_reference_flat_corner = true;
+        }
+      }
+    }
+  }
+  core::DeviceArray<std::uint8_t> d_reference_flat_corner(
+      "corner_j:compute_multiblock_mesh_quality_dt_limit:d_reference_flat_corner");
+  const std::uint8_t* d_reference_flat_corner_ptr = nullptr;
+  if (has_reference_flat_corner) {
+    d_reference_flat_corner.reset(reference_flat_corner.size());
+    d_reference_flat_corner.copy_from_host(reference_flat_corner);
+    d_reference_flat_corner_ptr = d_reference_flat_corner.data();
   }
 
   core::DeviceArray<std::int8_t> d_active_owned("corner_j:compute_multiblock_mesh_quality_dt_limit:d_active_owned");
@@ -1487,6 +1993,7 @@ MeshQualityDtLimit compute_multiblock_mesh_quality_dt_limit(
   mesh_quality_dt_limit_multiblock_rz_volume_kernel<<<blocks, 256>>>(
       d_min_sigma.data(),
       d_first_failing_composite_key.data(),
+      d_failure_min_values.data(),
       d_debug_printed.data(),
       d_x_r_start,
       d_x_z_start,
@@ -1499,8 +2006,17 @@ MeshQualityDtLimit compute_multiblock_mesh_quality_dt_limit(
       state.mesh.multiblock_cell_node_csr_indices.data(),
       d_cell_orientation_sign.data(),
       d_cell_nverts,
+      d_reference_flat_corner_ptr,
       n_cells,
       dt,
+      corner_j_enabled ? 1 : 0,
+      gauss_j_enabled ? 1 : 0,
+      rz_volume_enabled ? 1 : 0,
+      planar_area_enabled ? 1 : 0,
+      axis_margin_enabled ? 1 : 0,
+      force_path_guard ? 1 : 0,
+      cfg.numerics.hydro.mesh_quality_dt_corner_j_floor_rel,
+      cfg.numerics.hydro.mesh_quality_dt_gauss_j_floor_rel,
       cfg.numerics.hydro.mesh_quality_dt_rz_volume_floor_rel,
       state.step);
   cuda_check(cudaGetLastError(),
@@ -1514,6 +2030,111 @@ MeshQualityDtLimit compute_multiblock_mesh_quality_dt_limit(
                         sizeof(unsigned long long),
                         cudaMemcpyDeviceToHost),
              "mesh-quality multiblock dt CFL: copy first_failing_key failed");
+
+  unsigned long long local_exact_composite_key = no_composite_key;
+  double local_exact_min_value = std::numeric_limits<double>::infinity();
+  if (has_reference_flat_corner) {
+    std::vector<double> start_r(static_cast<std::size_t>(n_nodes), 0.0);
+    std::vector<double> start_z(static_cast<std::size_t>(n_nodes), 0.0);
+    std::vector<double> velocity_r(static_cast<std::size_t>(n_nodes), 0.0);
+    std::vector<double> velocity_z(static_cast<std::size_t>(n_nodes), 0.0);
+    cuda_check(cudaMemcpy(start_r.data(), d_x_r_start,
+                          static_cast<std::size_t>(n_nodes) * sizeof(double),
+                          cudaMemcpyDeviceToHost),
+               "typed path guard: copy start r failed");
+    cuda_check(cudaMemcpy(start_z.data(), d_x_z_start,
+                          static_cast<std::size_t>(n_nodes) * sizeof(double),
+                          cudaMemcpyDeviceToHost),
+               "typed path guard: copy start z failed");
+    cuda_check(cudaMemcpy(velocity_r.data(), d_v_r_half,
+                          static_cast<std::size_t>(n_nodes) * sizeof(double),
+                          cudaMemcpyDeviceToHost),
+               "typed path guard: copy velocity r failed");
+    cuda_check(cudaMemcpy(velocity_z.data(), d_v_z_half,
+                          static_cast<std::size_t>(n_nodes) * sizeof(double),
+                          cudaMemcpyDeviceToHost),
+               "typed path guard: copy velocity z failed");
+    std::vector<double> end_r(static_cast<std::size_t>(n_nodes), 0.0);
+    std::vector<double> end_z(static_cast<std::size_t>(n_nodes), 0.0);
+    for (int node = 0; node < n_nodes; ++node) {
+      const std::size_t index = static_cast<std::size_t>(node);
+      end_r[index] = std::fma(dt, velocity_r[index], start_r[index]);
+      end_z[index] = std::fma(dt, velocity_z[index], start_z[index]);
+    }
+    for (int cell = 0; cell < n_cells; ++cell) {
+      if ((!state.hydro_active.empty() &&
+           state.hydro_active[static_cast<std::size_t>(cell)] == 0) ||
+          (state.central_pseudo_core.inactive_member_mask.size() ==
+               static_cast<std::size_t>(n_cells) &&
+           state.central_pseudo_core
+                   .inactive_member_mask[static_cast<std::size_t>(cell)] !=
+               0U) ||
+          (state.pole_angular_derefine.inactive_member_mask.size() ==
+               static_cast<std::size_t>(n_cells) &&
+           state.pole_angular_derefine
+                   .inactive_member_mask[static_cast<std::size_t>(cell)] !=
+               0U)) {
+        continue;
+      }
+      const std::size_t flat_offset =
+          static_cast<std::size_t>(cell) *
+          mesh::kMeshTopoCellStorageSlotsMax;
+      bool cell_has_flat_corner = false;
+      for (int corner = 0; corner < mesh::kMeshTopoCellStorageSlotsMax;
+           ++corner) {
+        cell_has_flat_corner =
+            cell_has_flat_corner ||
+            reference_flat_corner[flat_offset +
+                                  static_cast<std::size_t>(corner)] != 0U;
+      }
+      if (!cell_has_flat_corner) {
+        continue;
+      }
+      const int offset =
+          mb.cell_node_csr_offsets[static_cast<std::size_t>(cell)];
+      const int nverts = mesh::mesh_topo_cell_active_nverts(
+          state.mesh.cell_nverts.empty() ? nullptr
+                                        : state.mesh.cell_nverts.data(),
+          cell);
+      double cell_reference_r[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {};
+      double cell_reference_z[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {};
+      double cell_start_r[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {};
+      double cell_start_z[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {};
+      double cell_end_r[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {};
+      double cell_end_z[mesh::kMeshTopoCellStorageSlotsMaxGeneral] = {};
+      for (int corner = 0; corner < nverts; ++corner) {
+        const int node = mb.cell_node_csr_indices[
+            static_cast<std::size_t>(offset + corner)];
+        const std::size_t node_index = static_cast<std::size_t>(node);
+        cell_reference_r[corner] = reference_r[node_index];
+        cell_reference_z[corner] = reference_z[node_index];
+        cell_start_r[corner] = start_r[node_index];
+        cell_start_z[corner] = start_z[node_index];
+        cell_end_r[corner] = end_r[node_index];
+        cell_end_z[corner] = end_z[node_index];
+      }
+      const mesh::ReferenceFlatCellPathResult exact =
+          mesh::evaluate_reference_flat_cell_path(
+              cell_reference_r, cell_reference_z, cell_start_r, cell_start_z,
+              cell_end_r, cell_end_z, nverts,
+              mb.cell_orientation_sign[static_cast<std::size_t>(cell)]);
+      if (exact.admissible) {
+        continue;
+      }
+      const int corner = exact.first_flat_corner >= 0
+                             ? exact.first_flat_corner
+                             : 0;
+      const unsigned long long key = compose_min_key_host(
+          exact.first_failure_tau,
+          mesh_quality_corner_failure_key(cell, corner));
+      if (key < local_exact_composite_key) {
+        local_exact_composite_key = key;
+        local_exact_min_value = exact.min_oriented_turn;
+      }
+    }
+    local_composite_key =
+        std::min(local_composite_key, local_exact_composite_key);
+  }
 
   std::uint64_t global_composite_key =
       static_cast<std::uint64_t>(local_composite_key);
@@ -1539,8 +2160,11 @@ MeshQualityDtLimit compute_multiblock_mesh_quality_dt_limit(
   }
 
   result.admissible = false;
+  const double safety_alpha =
+      force_path_guard ? 0.5
+                       : cfg.numerics.hydro.mesh_quality_dt_safety_alpha;
   const double raw_suggested_dt =
-      cfg.numerics.hydro.mesh_quality_dt_safety_alpha * global_sigma * dt;
+      safety_alpha * global_sigma * dt;
   result.suggested_dt =
       (std::isfinite(raw_suggested_dt) && raw_suggested_dt > 0.0)
           ? std::min(raw_suggested_dt, dt)
@@ -1549,9 +2173,46 @@ MeshQualityDtLimit compute_multiblock_mesh_quality_dt_limit(
 
   const auto detail_key =
       static_cast<std::uint32_t>(global_composite_key & 0xffffffffULL);
+  const int first_slot = composite_detail_slot(detail_key);
   result.first_cell = composite_detail_cell(detail_key);
-  result.metric = MeshQualityFailingMetric::RzVolume;
-  result.first_corner_or_gauss = -1;
+  double local_min_value = std::numeric_limits<double>::infinity();
+  if (static_cast<std::uint64_t>(local_composite_key) ==
+      global_composite_key) {
+    if (static_cast<std::uint64_t>(local_exact_composite_key) ==
+        global_composite_key) {
+      local_min_value = local_exact_min_value;
+    } else {
+      const std::size_t value_index =
+          static_cast<std::size_t>(result.first_cell * kMeshQualitySlotCount +
+                                   first_slot);
+      cuda_check(cudaMemcpy(&local_min_value,
+                            d_failure_min_values.data() + value_index,
+                            sizeof(double), cudaMemcpyDeviceToHost),
+                 "mesh-quality multiblock dt CFL: copy failure min failed");
+    }
+  }
+  result.min_value =
+      reduction != nullptr ? reduction->allreduce_min(local_min_value)
+                           : local_min_value;
+  if (first_slot >= 0 && first_slot < kMeshQualityGaussSlotOffset) {
+    result.metric = MeshQualityFailingMetric::CornerJ;
+    result.first_corner_or_gauss = first_slot;
+  } else if (first_slot >= kMeshQualityGaussSlotOffset &&
+             first_slot < kMeshQualityRzSlot) {
+    result.metric = MeshQualityFailingMetric::GaussJ;
+    result.first_corner_or_gauss = first_slot - kMeshQualityGaussSlotOffset;
+  } else if (first_slot == kMeshQualityRzSlot) {
+    result.metric = MeshQualityFailingMetric::RzVolume;
+    result.first_corner_or_gauss = -1;
+  } else if (first_slot == kMeshQualityPlanarAreaSlot) {
+    result.metric = MeshQualityFailingMetric::PlanarArea;
+    result.first_corner_or_gauss = -1;
+  } else if (first_slot >= kMeshQualityAxisVertexSlotOffset &&
+             first_slot < kMeshQualityAxisSlot) {
+    result.metric = MeshQualityFailingMetric::AxisMargin;
+    result.first_corner_or_gauss =
+        first_slot - kMeshQualityAxisVertexSlotOffset;
+  }
   return result;
 }
 
@@ -1738,10 +2399,14 @@ __global__ void corner_balance_kernel(
     const std::int8_t* __restrict__ hydro_active,
     const int nr,
     const int nz,
-    const double balance_threshold) {
+    const double balance_threshold,
+    const std::uint8_t* __restrict__ geometry_policy_exempt) {
   const int c = blockIdx.x * blockDim.x + threadIdx.x;
   const int n_cells = nr * nz;
   if (c >= n_cells) {
+    return;
+  }
+  if (geometry_policy_exempt != nullptr && geometry_policy_exempt[c] != 0) {
     return;
   }
   if (hydro_active != nullptr && hydro_active[c] == 0) {
@@ -1824,10 +2489,39 @@ const char* mesh_quality_metric_string(const MeshQualityFailingMetric metric) {
       return "mesh_quality_rz_volume";
     case MeshQualityFailingMetric::AxisMargin:
       return "mesh_quality_axis_margin";
+    case MeshQualityFailingMetric::PlanarArea:
+      return "mesh_quality_planar_area";
     case MeshQualityFailingMetric::None:
       return "";
   }
   return "";
+}
+
+const char* mesh_quality_predicate_string(
+    const MeshQualityFailingMetric metric) {
+  switch (metric) {
+    case MeshQualityFailingMetric::CornerJ:
+      return "corner_j";
+    case MeshQualityFailingMetric::GaussJ:
+      return "gauss_j";
+    case MeshQualityFailingMetric::RzVolume:
+      return "rz_volume";
+    case MeshQualityFailingMetric::AxisMargin:
+      return "axis_margin";
+    case MeshQualityFailingMetric::PlanarArea:
+      return "planar_area";
+    case MeshQualityFailingMetric::None:
+      return "none";
+  }
+  return "unknown";
+}
+
+bool i1b_path_guard_enabled() {
+  static const bool enabled = [] {
+    const char* const raw = std::getenv("TENRYU_I1B_PATH_GUARD");
+    return raw != nullptr && std::strcmp(raw, "1") == 0;
+  }();
+  return enabled;
 }
 
 MeshQualityDtLimit compute_mesh_quality_dt_limit(
@@ -1838,29 +2532,32 @@ MeshQualityDtLimit compute_mesh_quality_dt_limit(
     const double* d_v_r_half,
     const double* d_v_z_half,
     const double dt,
-    const parallel::Reduction* reduction) {
+    const parallel::Reduction* reduction,
+    const bool force_path_guard) {
   MeshQualityDtLimit result{};
   result.suggested_dt = dt;
-  if (!cfg.numerics.hydro.mesh_quality_dt_cfl_enabled) {
+  if (!cfg.numerics.hydro.mesh_quality_dt_cfl_enabled && !force_path_guard) {
     return result;
   }
   if (state.mesh.topo.multiblock.has_value()) {
     return compute_multiblock_mesh_quality_dt_limit(
         state, cfg, d_x_r_start, d_x_z_start, d_v_r_half, d_v_z_half, dt,
-        reduction);
+        reduction, force_path_guard);
   }
 
   const bool corner_j_enabled =
-      cfg.numerics.hydro.mesh_quality_dt_corner_j_enabled;
+      force_path_guard || cfg.numerics.hydro.mesh_quality_dt_corner_j_enabled;
   const bool gauss_j_enabled =
-      cfg.numerics.hydro.mesh_quality_dt_gauss_j_enabled;
+      force_path_guard || cfg.numerics.hydro.mesh_quality_dt_gauss_j_enabled;
   const bool rz_volume_enabled =
-      cfg.numerics.hydro.mesh_quality_dt_rz_volume_enabled;
+      force_path_guard || cfg.numerics.hydro.mesh_quality_dt_rz_volume_enabled;
+  const bool planar_area_enabled = force_path_guard;
   const bool axis_margin_enabled =
-      cfg.numerics.hydro.mesh_quality_dt_axis_margin_additive &&
+      (force_path_guard ||
+       cfg.numerics.hydro.mesh_quality_dt_axis_margin_additive) &&
       cfg.numerics.has_physical_rz_axis;
   if (!corner_j_enabled && !gauss_j_enabled && !rz_volume_enabled &&
-      !axis_margin_enabled) {
+      !planar_area_enabled && !axis_margin_enabled) {
     return result;
   }
   if (state.mesh.dim != 2) {
@@ -1899,12 +2596,17 @@ MeshQualityDtLimit compute_mesh_quality_dt_limit(
 
   double* d_min_sigma = nullptr;
   unsigned long long* d_first_failing_composite_key = nullptr;
+  double* d_failure_min_values = nullptr;
   d_min_sigma = static_cast<double*>(core::device_scratch_acquire(
       "cjq:mesh_quality_dt_min_sigma", sizeof(double)));
   d_first_failing_composite_key =
       static_cast<unsigned long long*>(core::device_scratch_acquire(
           "cjq:mesh_quality_dt_first_failing_key",
           sizeof(unsigned long long)));
+  d_failure_min_values = static_cast<double*>(core::device_scratch_acquire(
+      "cjq:mesh_quality_dt_failure_min_values",
+      static_cast<std::size_t>(n_cells) * kMeshQualitySlotCount *
+          sizeof(double)));
 
   const double one = 1.0;
   const unsigned long long no_composite_key = kNoFailingCompositeKey;
@@ -1931,6 +2633,7 @@ MeshQualityDtLimit compute_mesh_quality_dt_limit(
   mesh_quality_dt_limit_kernel<<<blocks, 256>>>(
       d_min_sigma,
       d_first_failing_composite_key,
+      d_failure_min_values,
       d_x_r_start,
       d_x_z_start,
       d_v_r_half,
@@ -1942,6 +2645,7 @@ MeshQualityDtLimit compute_mesh_quality_dt_limit(
       corner_j_enabled ? 1 : 0,
       gauss_j_enabled ? 1 : 0,
       rz_volume_enabled ? 1 : 0,
+      planar_area_enabled ? 1 : 0,
       axis_margin_enabled ? 1 : 0,
       cfg.numerics.has_physical_rz_axis ? 1 : 0,
       cfg.numerics.hydro.mesh_quality_dt_corner_j_floor_rel,
@@ -1979,13 +2683,29 @@ MeshQualityDtLimit compute_mesh_quality_dt_limit(
   }
 
   result.admissible = false;
-  result.suggested_dt =
-      cfg.numerics.hydro.mesh_quality_dt_safety_alpha * global_sigma * dt;
+  const double safety_alpha =
+      force_path_guard ? 0.5
+                       : cfg.numerics.hydro.mesh_quality_dt_safety_alpha;
+  result.suggested_dt = safety_alpha * global_sigma * dt;
 
   const auto detail_key =
       static_cast<std::uint32_t>(global_composite_key & 0xffffffffULL);
   const int first_slot = composite_detail_slot(detail_key);
   result.first_cell = composite_detail_cell(detail_key);
+  double local_min_value = std::numeric_limits<double>::infinity();
+  if (static_cast<std::uint64_t>(local_composite_key) ==
+      global_composite_key) {
+    const std::size_t value_index =
+        static_cast<std::size_t>(result.first_cell * kMeshQualitySlotCount +
+                                 first_slot);
+    cuda_check(cudaMemcpy(&local_min_value,
+                          d_failure_min_values + value_index,
+                          sizeof(double), cudaMemcpyDeviceToHost),
+               "mesh-quality dt CFL: copy failure min failed");
+  }
+  result.min_value =
+      reduction != nullptr ? reduction->allreduce_min(local_min_value)
+                           : local_min_value;
   if (first_slot >= 0 && first_slot < kMeshQualityGaussSlotOffset) {
     result.metric = MeshQualityFailingMetric::CornerJ;
     result.first_corner_or_gauss = first_slot;
@@ -1998,6 +2718,9 @@ MeshQualityDtLimit compute_mesh_quality_dt_limit(
     result.first_corner_or_gauss = -1;
   } else if (first_slot == kMeshQualityAxisSlot) {
     result.metric = MeshQualityFailingMetric::AxisMargin;
+    result.first_corner_or_gauss = -1;
+  } else if (first_slot == kMeshQualityPlanarAreaSlot) {
+    result.metric = MeshQualityFailingMetric::PlanarArea;
     result.first_corner_or_gauss = -1;
   }
   return result;
@@ -2015,7 +2738,9 @@ CornerJacobianQualityResult check_trial_lagrangian_corner_jacobian_host(
     const parallel::Reduction* reduction,
     const std::vector<std::int8_t>& hydro_active,
     const bool axis_margin_guard_enabled,
-    const bool has_physical_rz_axis) {
+    const bool has_physical_rz_axis,
+    const std::vector<std::uint8_t>* const axis_edge_collapsed,
+    const std::vector<std::uint8_t>* const geometry_policy_exempt) {
   TENRYU_ASSERT(dt > 0.0, "corner-J trial scale requires dt > 0");
   TENRYU_ASSERT(floor_eps >= 0.0 && floor_eps < 1.0,
                 "corner-J floor_eps must be in [0, 1)");
@@ -2024,6 +2749,13 @@ CornerJacobianQualityResult check_trial_lagrangian_corner_jacobian_host(
   TENRYU_ASSERT(hydro_active.empty() ||
                     static_cast<int>(hydro_active.size()) == n_cells,
                 "corner-J trial check requires hydro_active size == n_cells");
+  TENRYU_ASSERT(axis_edge_collapsed == nullptr ||
+                    static_cast<int>(axis_edge_collapsed->size()) == n_cells,
+                "corner-J trial check requires collapse mask size == n_cells");
+  TENRYU_ASSERT(geometry_policy_exempt == nullptr ||
+                    static_cast<int>(geometry_policy_exempt->size()) == n_cells,
+                "corner-J trial check requires geometry-policy-exempt mask "
+                "size == n_cells");
   TENRYU_ASSERT(static_cast<int>(r_base.size()) == n_nodes &&
                     static_cast<int>(z_base.size()) == n_nodes &&
                     static_cast<int>(v_r.size()) == n_nodes &&
@@ -2042,6 +2774,13 @@ CornerJacobianQualityResult check_trial_lagrangian_corner_jacobian_host(
         hydro_active[static_cast<std::size_t>(c)] == 0) {
       continue;
     }
+    const bool collapsed =
+        axis_edge_collapsed != nullptr &&
+        (*axis_edge_collapsed)[static_cast<std::size_t>(c)] != 0U;
+    if (!collapsed && geometry_policy_exempt != nullptr &&
+        (*geometry_policy_exempt)[static_cast<std::size_t>(c)] != 0U) {
+      continue;
+    }
     double r[4];
     double z[4];
     double vr[4];
@@ -2055,8 +2794,8 @@ CornerJacobianQualityResult check_trial_lagrangian_corner_jacobian_host(
         rr[k] = r[k] + dt * vr[k];
         zz[k] = z[k] + dt * vz[k];
       }
-      const auto trial =
-          evaluate_axis_margin_predicate_quad(r, z, rr, zz, floor_eps);
+      const auto trial = evaluate_axis_margin_for_guard_host(
+          r, z, rr, zz, floor_eps, collapsed);
       local_min_trial = std::min(local_min_trial, trial.min_margin);
       local_min_current = std::min(local_min_current, trial.min_margin);
       local_min_ratio = std::min(local_min_ratio, trial.admissible ? 1.0 : 0.0);
@@ -2068,11 +2807,40 @@ CornerJacobianQualityResult check_trial_lagrangian_corner_jacobian_host(
         result.admissible = false;
         local_suggested_dt = std::min(
             local_suggested_dt,
-            axis_margin_limited_tau_host(r, z, vr, vz, dt, floor_eps));
+            axis_margin_limited_tau_host(
+                r, z, vr, vz, dt, floor_eps, collapsed));
       }
-      continue;
+      if (!collapsed) {
+        continue;
+      }
     }
-    for (int corner = 0; corner < 4; ++corner) {
+    if (collapsed) {
+      double rr[4];
+      double zz[4];
+      for (int k = 0; k < 4; ++k) {
+        rr[k] = r[k] + dt * vr[k];
+        zz[k] = z[k] + dt * vz[k];
+      }
+      const double current_volume = rz::rz_polygon_volume_exact(r, z, 4);
+      const double trial_volume = rz::rz_polygon_volume_exact(rr, zz, 4);
+      if (!(trial_volume > 0.0) || !std::isfinite(trial_volume)) {
+        if (result.first_failing_cell < 0) {
+          result.first_failing_cell = c;
+          result.first_failing_corner = 1;
+          std::ostringstream oss;
+          oss << std::scientific << std::setprecision(17)
+              << "[guard-collapsed-volume] cell=" << c
+              << " current=" << current_volume
+              << " trial=" << trial_volume;
+          core::log_warning(oss.str());
+        }
+        result.admissible = false;
+        local_suggested_dt = 0.0;
+      }
+    }
+    const int corner_begin = collapsed ? 1 : 0;
+    const int corner_end = collapsed ? 3 : 4;
+    for (int corner = corner_begin; corner < corner_end; ++corner) {
       const double j_current = corner_jacobian_from_quad(r, z, corner);
       const double j_trial = corner_jacobian_at_tau_host(r, z, vr, vz, corner, dt);
       local_min_current = std::min(local_min_current, j_current);
@@ -2134,11 +2902,14 @@ CornerJacobianQualityResult check_trial_lagrangian_corner_jacobian_fields(
     const parallel::Reduction* reduction,
     const std::vector<std::int8_t>& hydro_active,
     const bool axis_margin_guard_enabled,
-    const bool has_physical_rz_axis) {
+    const bool has_physical_rz_axis,
+    const std::vector<std::uint8_t>* const axis_edge_collapsed,
+    const std::vector<std::uint8_t>* const geometry_policy_exempt) {
   return check_trial_lagrangian_corner_jacobian_host(
       nr, nz, copy_field_to_vector(r_base), copy_field_to_vector(z_base),
       copy_field_to_vector(v_r), copy_field_to_vector(v_z), dt, floor_eps,
-      reduction, hydro_active, axis_margin_guard_enabled, has_physical_rz_axis);
+      reduction, hydro_active, axis_margin_guard_enabled, has_physical_rz_axis,
+      axis_edge_collapsed, geometry_policy_exempt);
 }
 
 CornerJacobianScaleResult compute_corner_jacobian_trial_scale(
@@ -2150,7 +2921,9 @@ CornerJacobianScaleResult compute_corner_jacobian_trial_scale(
     const bool regime_aware_corner_j_guard_enabled,
     const bool axis_margin_guard_enabled,
     const double legacy_trigger_scale,
-    const bool has_physical_rz_axis) {
+    const bool has_physical_rz_axis,
+    const std::uint8_t* const d_axis_edge_collapsed,
+    const std::uint8_t* const d_geometry_policy_exempt) {
   CornerJacobianScaleResult result{};
   result.trigger_threshold = legacy_trigger_scale;
   if (state.mesh.dim != 2 || !(dt_in > 0.0) || !std::isfinite(dt_in)) {
@@ -2219,8 +2992,8 @@ CornerJacobianScaleResult compute_corner_jacobian_trial_scale(
       d_min_scale, d_first_failing_cell, d_first_failing_corner,
       d_any_trigger, d_first_trigger_key,
       state.x_r.data(), state.x_z.data(), state.v_r.data(), state.v_z.data(),
-      d_active, d_cell_regime, nr, nz, dt_in, floor_eps,
-      regime_aware_corner_j_guard_enabled ? 1 : 0,
+      d_active, d_axis_edge_collapsed, d_geometry_policy_exempt, d_cell_regime,
+      nr, nz, dt_in, floor_eps, regime_aware_corner_j_guard_enabled ? 1 : 0,
       axis_margin_guard_enabled ? 1 : 0,
       has_physical_rz_axis ? 1 : 0,
       legacy_trigger_scale);
@@ -2685,7 +3458,8 @@ tenryu::coupling::HydroStepResult compute_in_hydro_candidate_mesh_guard(
 CornerBalanceResult evaluate_corner_balance(
     const core::State& state,
     const double balance_threshold,
-    const parallel::Reduction* reduction) {
+    const parallel::Reduction* reduction,
+    const std::uint8_t* geometry_policy_exempt) {
   CornerBalanceResult result{};
   if (state.mesh.dim != 2) {
     return result;
@@ -2741,7 +3515,8 @@ CornerBalanceResult evaluate_corner_balance(
   const int blocks = (n_cells + 255) / 256;
   corner_balance_kernel<<<blocks, 256>>>(
       d_min_q_balance, d_first_failing_key, d_any_non_positive, d_any_non_finite,
-      state.x_r.data(), state.x_z.data(), d_active, nr, nz, balance_threshold);
+      state.x_r.data(), state.x_z.data(), d_active, nr, nz, balance_threshold,
+      geometry_policy_exempt);
   cuda_check(cudaGetLastError(), "corner balance kernel launch failed");
   cuda_check(cudaDeviceSynchronize(), "corner balance kernel execution failed");
 

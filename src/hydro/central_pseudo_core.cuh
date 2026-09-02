@@ -7,6 +7,31 @@
 
 namespace tenryu::hydro::central_pseudo_core {
 
+namespace detail {
+
+struct PlanarBoundaryPressureSegmentAreaVector {
+  double r = 0.0;
+  double z = 0.0;
+};
+
+__host__ __device__ inline PlanarBoundaryPressureSegmentAreaVector
+planar_boundary_pressure_segment_area_vector(const double r_a,
+                                             const double z_a,
+                                             const double r_b,
+                                             const double z_b) {
+  PlanarBoundaryPressureSegmentAreaVector area{
+      0.5 * (z_b - z_a), -0.5 * (r_b - r_a)};
+  const double r_mid = 0.5 * (r_a + r_b);
+  const double z_mid = 0.5 * (z_a + z_b);
+  if (area.r * r_mid + area.z * z_mid < 0.0) {
+    area.r = -area.r;
+    area.z = -area.z;
+  }
+  return area;
+}
+
+}  // namespace detail
+
 bool configured(const core::Config& cfg);
 bool active(const core::State& state);
 
@@ -27,23 +52,6 @@ bool request_ring_absorption(core::State& state,
 // request_ring_absorption.
 bool request_macro_boundary_absorption(core::State& state,
                                        const core::Config& cfg);
-// Terminal absorption (I1-B-R, env TENRYU_I1B_TERMINAL_ABSORB):
-// armed by request_ring_absorption when the rebound-phase emergency walk
-// requests the structurally unabsorbable LAST shell row. The driver checks
-// the pending flag at the top of every step attempt, executes the terminal
-// absorption on the restored pre-step state (ALL remaining active cells
-// become stratified 1D shells; the 2D mesh state is frozen), then integrates
-// the core1d-only tail to t_end via run_terminal_core1d_tail.
-bool terminal_absorb_pending(const core::State& state);
-void execute_terminal_absorption(core::State& state, const core::Config& cfg);
-// Integrate the post-terminal core1d rebound to t_end. p_drive evaluates the
-// external drive pressure [dyn/cm^2] at a given time (zero after drive-off).
-// Advances state.t / state.step; returns false only if the sub-model stalls
-// (no substep progress), which the caller must treat as a hard failure.
-bool run_terminal_core1d_tail(core::State& state,
-                              const core::Config& cfg,
-                              double (*p_drive)(const core::State&, double));
-
 // Detect-gated stale-reference repair (env TENRYU_I1B_CORE_REF_REPAIR): if a
 // core-halo cell's exact RZ polygon volume on the persistent reference has
 // flipped sign or vanished vs the current mesh, sync the core-halo reference
@@ -81,11 +89,13 @@ void add_boundary_pressure_force(core::State& state,
                                  const core::CellField1D& cell_pressure,
                                  double* force_r,
                                  double* force_z,
-                                 double impulse_dt);
+                                 double impulse_dt,
+                                 const char* diag_tag = "untagged");
 
 void set_boundary_pressure_work(core::State& state,
                                 const core::Config& cfg,
                                 double dt,
+                                const core::NodeField1D& node_mass,
                                 const double* old_velocity_r,
                                 const double* old_velocity_z,
                                 const double* new_velocity_r,

@@ -12,7 +12,11 @@
 namespace tenryu::hydro {
 
 double compute_corner_j_predict_cfl_dt(const core::State& state,
-                                       const core::Config& cfg) {
+                                       const core::Config& cfg,
+                                       CornerJPredictCflArgmin* argmin) {
+  if (argmin != nullptr) {
+    *argmin = CornerJPredictCflArgmin{};
+  }
   if (cfg.mesh.topology_scheme !=
       core::TopologyScheme::MULTIBLOCK_CART_CORE_POLAR_SHELL) {
     static bool warned_non_button_topology = false;
@@ -88,14 +92,21 @@ double compute_corner_j_predict_cfl_dt(const core::State& state,
       vr[k] = v_r[n];
       vz[k] = v_z[n];
     }
-    dt_max = std::min(
-        dt_max,
-        corner_j_predict_dt_max(
-            xr, xz, vr, vz,
-            cfg.numerics.hydro.corner_j_predict_max_shrink));
+    const double cell_dt = corner_j_predict_dt_max(
+        xr, xz, vr, vz,
+        cfg.numerics.hydro.corner_j_predict_max_shrink);
+    if (cell_dt < dt_max) {
+      dt_max = cell_dt;
+      if (argmin != nullptr) {
+        argmin->cell_id = c;
+      }
+    }
   }
-
-  return cfg.numerics.hydro.corner_j_predict_cfl_safety * dt_max;
+  const double dt = cfg.numerics.hydro.corner_j_predict_cfl_safety * dt_max;
+  if (argmin != nullptr) {
+    argmin->dt = dt;
+  }
+  return dt;
 }
 
 }  // namespace tenryu::hydro

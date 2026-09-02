@@ -1,6 +1,8 @@
 #pragma once
 
 #include <algorithm>
+#include <cfloat>
+#include <climits>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -10,6 +12,7 @@
 #include <cuda_runtime.h>
 
 #include "core/error.hpp"
+#include "hydro/ale_remap_2d_rz.hpp"
 #include "hydro/rz_quad_volume.cuh"
 #include "mesh/mesh.hpp"
 
@@ -216,8 +219,20 @@ __device__ inline double flux_r_face_t(const double* field,
                                        const int i_face,
                                        const int j,
                                        const int nr,
-                                       const int nz) {
+                                       const int nz,
+                                       const RemapDispatchAuditDeviceView audit = {},
+                                       const std::uint8_t* geometry_policy_exempt = nullptr) {
   if (i_face <= 0 || i_face >= nr) {
+    return 0.0;
+  }
+
+  const int i_left = i_face - 1;
+  const int i_right = i_face;
+  const int c_left = cell_index(i_left, j, nz);
+  const int c_right = cell_index(i_right, j, nz);
+  if (geometry_policy_exempt != nullptr &&
+      (geometry_policy_exempt[c_left] != 0 ||
+       geometry_policy_exempt[c_right] != 0)) {
     return 0.0;
   }
 
@@ -229,16 +244,27 @@ __device__ inline double flux_r_face_t(const double* field,
     return 0.0;
   }
 
-  const int i_left = i_face - 1;
-  const int i_right = i_face;
   const int i_donor = (dV_legacy > 0.0) ? i_left : i_right;
+  remap_dispatch_audit_count(
+      audit,
+      RemapDispatchAuditCounter::LegacySweptVolume,
+      cell_index(i_donor, j, nz));
 
   const int i_m = clampi(i_donor - 1, 0, nr - 1);
   const int i_p = clampi(i_donor + 1, 0, nr - 1);
+  const int c_m = cell_index(i_m, j, nz);
+  const int c_d = cell_index(i_donor, j, nz);
+  const int c_p = cell_index(i_p, j, nz);
 
-  const double q_m = field[cell_index(i_m, j, nz)];
-  const double q_d = field[cell_index(i_donor, j, nz)];
-  const double q_p = field[cell_index(i_p, j, nz)];
+  if (geometry_policy_exempt != nullptr &&
+      (geometry_policy_exempt[c_m] != 0 ||
+       geometry_policy_exempt[c_p] != 0)) {
+    return field[c_d] * dV_legacy;
+  }
+
+  const double q_m = field[c_m];
+  const double q_d = field[c_d];
+  const double q_p = field[c_p];
 
   const double den = q_p - q_d;
   double r_ratio = 0.0;
@@ -269,8 +295,20 @@ __device__ inline double flux_z_face_t(const double* field,
                                        const int i,
                                        const int j_face,
                                        const int nr,
-                                       const int nz) {
+                                       const int nz,
+                                       const RemapDispatchAuditDeviceView audit = {},
+                                       const std::uint8_t* geometry_policy_exempt = nullptr) {
   if (j_face <= 0 || j_face >= nz) {
+    return 0.0;
+  }
+
+  const int j_low = j_face - 1;
+  const int j_high = j_face;
+  const int c_low = cell_index(i, j_low, nz);
+  const int c_high = cell_index(i, j_high, nz);
+  if (geometry_policy_exempt != nullptr &&
+      (geometry_policy_exempt[c_low] != 0 ||
+       geometry_policy_exempt[c_high] != 0)) {
     return 0.0;
   }
 
@@ -282,16 +320,27 @@ __device__ inline double flux_z_face_t(const double* field,
     return 0.0;
   }
 
-  const int j_low = j_face - 1;
-  const int j_high = j_face;
   const int j_donor = (dV_legacy > 0.0) ? j_low : j_high;
+  remap_dispatch_audit_count(
+      audit,
+      RemapDispatchAuditCounter::LegacySweptVolume,
+      cell_index(i, j_donor, nz));
 
   const int j_m = clampi(j_donor - 1, 0, nz - 1);
   const int j_p = clampi(j_donor + 1, 0, nz - 1);
+  const int c_m = cell_index(i, j_m, nz);
+  const int c_d = cell_index(i, j_donor, nz);
+  const int c_p = cell_index(i, j_p, nz);
 
-  const double q_m = field[cell_index(i, j_m, nz)];
-  const double q_d = field[cell_index(i, j_donor, nz)];
-  const double q_p = field[cell_index(i, j_p, nz)];
+  if (geometry_policy_exempt != nullptr &&
+      (geometry_policy_exempt[c_m] != 0 ||
+       geometry_policy_exempt[c_p] != 0)) {
+    return field[c_d] * dV_legacy;
+  }
+
+  const double q_m = field[c_m];
+  const double q_d = field[c_d];
+  const double q_p = field[c_p];
 
   const double den = q_p - q_d;
   double r_ratio = 0.0;
@@ -539,10 +588,17 @@ static __global__ __launch_bounds__(256, 4) void conservative_remap_kernel_t(
     const double* __restrict__ x_z_new,
     const int sweep_direction,
     const int nr,
-    const int nz) {
+    const int nz,
+    const std::uint8_t* __restrict__ geometry_policy_exempt,
+    const RemapDispatchAuditDeviceView audit) {
   const int c = blockIdx.x * blockDim.x + threadIdx.x;
   const int n_cells = nr * nz;
   if (c >= n_cells) {
+    return;
+  }
+
+  if (geometry_policy_exempt != nullptr && geometry_policy_exempt[c] != 0) {
+    field_new[c] = field_old[c];
     return;
   }
 
@@ -562,7 +618,9 @@ static __global__ __launch_bounds__(256, 4) void conservative_remap_kernel_t(
                                               i + 1,
                                               j,
                                               nr,
-                                              nz);
+                                              nz,
+                                              audit,
+                                              geometry_policy_exempt);
     F_minus = detail::flux_r_face_t<FixedSign>(field_old,
                                                x_r_old,
                                                x_z_old,
@@ -571,7 +629,9 @@ static __global__ __launch_bounds__(256, 4) void conservative_remap_kernel_t(
                                                i,
                                                j,
                                                nr,
-                                               nz);
+                                               nz,
+                                               audit,
+                                               geometry_policy_exempt);
   } else {
     F_plus = detail::flux_z_face_t<FixedSign>(field_old,
                                               x_r_old,
@@ -581,7 +641,9 @@ static __global__ __launch_bounds__(256, 4) void conservative_remap_kernel_t(
                                               i,
                                               j + 1,
                                               nr,
-                                              nz);
+                                              nz,
+                                              audit,
+                                              geometry_policy_exempt);
     F_minus = detail::flux_z_face_t<FixedSign>(field_old,
                                                x_r_old,
                                                x_z_old,
@@ -590,7 +652,9 @@ static __global__ __launch_bounds__(256, 4) void conservative_remap_kernel_t(
                                                i,
                                                j,
                                                nr,
-                                               nz);
+                                               nz,
+                                               audit,
+                                               geometry_policy_exempt);
   }
 
   const double qbar_new = qbar_old - F_plus + F_minus;
@@ -601,6 +665,8 @@ template <bool FixedSign>
 static __global__ __launch_bounds__(256, 4) void compute_intermediate_volume_kernel_t(
     double* __restrict__ vol_mid,
     int* __restrict__ nonpositive_count,
+    const std::uint8_t* __restrict__ geometry_policy_exempt,
+    int* __restrict__ d_first_nonpositive_cell,
     const double* __restrict__ vol_old,
     const double* __restrict__ x_r_old,
     const double* __restrict__ x_z_old,
@@ -612,6 +678,11 @@ static __global__ __launch_bounds__(256, 4) void compute_intermediate_volume_ker
   const int c = blockIdx.x * blockDim.x + threadIdx.x;
   const int n_cells = nr * nz;
   if (c >= n_cells) {
+    return;
+  }
+
+  if (geometry_policy_exempt != nullptr && geometry_policy_exempt[c] != 0) {
+    vol_mid[c] = vol_old[c];
     return;
   }
 
@@ -640,6 +711,7 @@ static __global__ __launch_bounds__(256, 4) void compute_intermediate_volume_ker
   vol_mid[c] = invalid_vol ? 0.0 : vol;
   if (invalid_vol) {
     atomicAdd(nonpositive_count, 1);
+    atomicMin(d_first_nonpositive_cell, c);
   }
 }
 
@@ -655,7 +727,9 @@ inline void launch_conservative_remap(double* d_field_new,
                                       const int nr,
                                       const int nz,
                                       const bool swept_volume_sign_fixed,
-                                      cudaStream_t stream = nullptr) {
+                                      const RemapDispatchAuditDeviceView audit = {},
+                                      cudaStream_t stream = nullptr,
+                                      const std::uint8_t* d_geometry_policy_exempt = nullptr) {
   const int n_cells = nr * nz;
   const int blocks = (n_cells + 255) / 256;
   if (swept_volume_sign_fixed) {
@@ -669,7 +743,9 @@ inline void launch_conservative_remap(double* d_field_new,
                                                                    d_xz_new,
                                                                    sweep_direction,
                                                                    nr,
-                                                                   nz);
+                                                                   nz,
+                                                                   d_geometry_policy_exempt,
+                                                                   audit);
   } else {
     conservative_remap_kernel_t<false><<<blocks, 256, 0, stream>>>(d_field_new,
                                                                     d_field_old,
@@ -681,7 +757,9 @@ inline void launch_conservative_remap(double* d_field_new,
                                                                     d_xz_new,
                                                                     sweep_direction,
                                                                     nr,
-                                                                    nz);
+                                                                    nz,
+                                                                    d_geometry_policy_exempt,
+                                                                    audit);
   }
 }
 
@@ -698,18 +776,31 @@ inline bool launch_remap_strang(double* d_field_inout,
                                 const int nz,
                                 const int step_number,
                                 const bool swept_volume_sign_fixed,
+                                const std::uint8_t* d_geometry_policy_exempt = nullptr,
+                                const RemapDispatchAuditDeviceView audit = {},
                                 cudaStream_t stream = nullptr) {
   const int first_dir = (step_number % 2 == 0) ? 0 : 1;
   const int second_dir = 1 - first_dir;
   const int n_cells = nr * nz;
   const int blocks = (n_cells + 255) / 256;
   int* d_nonpositive_count = nullptr;
+  int* d_first_nonpositive_cell = nullptr;
   CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_nonpositive_count), sizeof(int)));
+  CUDA_CHECK(
+      cudaMalloc(reinterpret_cast<void**>(&d_first_nonpositive_cell), sizeof(int)));
   CUDA_CHECK(cudaMemsetAsync(d_nonpositive_count, 0, sizeof(int), stream));
+  int first_nonpositive_cell = INT_MAX;
+  CUDA_CHECK(cudaMemcpyAsync(d_first_nonpositive_cell,
+                             &first_nonpositive_cell,
+                             sizeof(int),
+                             cudaMemcpyHostToDevice,
+                             stream));
 
   if (swept_volume_sign_fixed) {
     compute_intermediate_volume_kernel_t<true><<<blocks, 256, 0, stream>>>(d_vol_mid,
                                                                             d_nonpositive_count,
+                                                                            d_geometry_policy_exempt,
+                                                                            d_first_nonpositive_cell,
                                                                             d_vol_old,
                                                                             d_xr_old,
                                                                             d_xz_old,
@@ -721,6 +812,8 @@ inline bool launch_remap_strang(double* d_field_inout,
   } else {
     compute_intermediate_volume_kernel_t<false><<<blocks, 256, 0, stream>>>(d_vol_mid,
                                                                              d_nonpositive_count,
+                                                                             d_geometry_policy_exempt,
+                                                                             d_first_nonpositive_cell,
                                                                              d_vol_old,
                                                                              d_xr_old,
                                                                              d_xz_old,
@@ -746,8 +839,30 @@ inline bool launch_remap_strang(double* d_field_inout,
                                stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
   }
+  if (nonpositive_count > 0) {
+    if (stream == nullptr) {
+      CUDA_CHECK(cudaMemcpy(&first_nonpositive_cell,
+                            d_first_nonpositive_cell,
+                            sizeof(int),
+                            cudaMemcpyDeviceToHost));
+    } else {
+      CUDA_CHECK(cudaMemcpyAsync(&first_nonpositive_cell,
+                                 d_first_nonpositive_cell,
+                                 sizeof(int),
+                                 cudaMemcpyDeviceToHost,
+                                 stream));
+      CUDA_CHECK(cudaStreamSynchronize(stream));
+    }
+  }
+  CUDA_CHECK(cudaFree(d_first_nonpositive_cell));
   CUDA_CHECK(cudaFree(d_nonpositive_count));
   if (nonpositive_count > 0) {
+    core::log_warning(
+        "[ale-remap] transport aborted: non-positive intermediate volume at cell=" +
+        std::to_string(first_nonpositive_cell) +
+        " (i=" + std::to_string(first_nonpositive_cell / nz) +
+        ", j=" + std::to_string(first_nonpositive_cell % nz) +
+        ") count=" + std::to_string(nonpositive_count));
     return false;
   }
 
@@ -763,7 +878,9 @@ inline bool launch_remap_strang(double* d_field_inout,
                             nr,
                             nz,
                             swept_volume_sign_fixed,
-                            stream);
+                            audit,
+                            stream,
+                            d_geometry_policy_exempt);
   CUDA_CHECK(cudaGetLastError());
   if (stream == nullptr) {
     CUDA_CHECK(cudaDeviceSynchronize());
@@ -782,7 +899,9 @@ inline bool launch_remap_strang(double* d_field_inout,
                             nr,
                             nz,
                             swept_volume_sign_fixed,
-                            stream);
+                            audit,
+                            stream,
+                            d_geometry_policy_exempt);
   CUDA_CHECK(cudaGetLastError());
   if (stream == nullptr) {
     CUDA_CHECK(cudaDeviceSynchronize());
@@ -859,22 +978,44 @@ __device__ inline double ms2_van_leer_limiter_factor(const double* field,
                                                      const int i,
                                                      const int j,
                                                      const int nr,
-                                                     const int nz) {
+                                                     const int nz,
+                                                     const std::uint8_t* geometry_policy_exempt) {
   const int c = cell_index(i, j, nz);
   const double q_c = field[c];
   double q_neighbor[4] = {q_c, q_c, q_c, q_c};
+  bool use_neighbor[4] = {true, true, true, true};
 
   if (i > 0) {
-    q_neighbor[0] = field[cell_index(i - 1, j, nz)];
+    const int c_n = cell_index(i - 1, j, nz);
+    if (geometry_policy_exempt != nullptr && geometry_policy_exempt[c_n] != 0) {
+      use_neighbor[0] = false;
+    } else {
+      q_neighbor[0] = field[c_n];
+    }
   }
   if (i + 1 < nr) {
-    q_neighbor[1] = field[cell_index(i + 1, j, nz)];
+    const int c_n = cell_index(i + 1, j, nz);
+    if (geometry_policy_exempt != nullptr && geometry_policy_exempt[c_n] != 0) {
+      use_neighbor[1] = false;
+    } else {
+      q_neighbor[1] = field[c_n];
+    }
   }
   if (j > 0) {
-    q_neighbor[2] = field[cell_index(i, j - 1, nz)];
+    const int c_n = cell_index(i, j - 1, nz);
+    if (geometry_policy_exempt != nullptr && geometry_policy_exempt[c_n] != 0) {
+      use_neighbor[2] = false;
+    } else {
+      q_neighbor[2] = field[c_n];
+    }
   }
   if (j + 1 < nz) {
-    q_neighbor[3] = field[cell_index(i, j + 1, nz)];
+    const int c_n = cell_index(i, j + 1, nz);
+    if (geometry_policy_exempt != nullptr && geometry_policy_exempt[c_n] != 0) {
+      use_neighbor[3] = false;
+    } else {
+      q_neighbor[3] = field[c_n];
+    }
   }
 
   const int n00 = node_index(i, j, nz);
@@ -897,6 +1038,9 @@ __device__ inline double ms2_van_leer_limiter_factor(const double* field,
       0.5 * (x_z[n01] + x_z[n11])};
 
   for (int f = 0; f < 4; ++f) {
+    if (!use_neighbor[f]) {
+      continue;
+    }
     const double q_f = q_c + grad_r * (r_face[f] - r_c) + grad_z * (z_face[f] - z_c);
     psi = fmin(psi, ms2_van_leer_limiter_ratio(q_c, q_neighbor[f], q_f));
   }
@@ -915,31 +1059,44 @@ __device__ inline double ms2_barth_jespersen_limiter_factor(const double* field,
                                                            const int i,
                                                            const int j,
                                                            const int nr,
-                                                           const int nz) {
+                                                           const int nz,
+                                                           const std::uint8_t* geometry_policy_exempt) {
   const int c = cell_index(i, j, nz);
   const double q_c = field[c];
   double q_min = q_c;
   double q_max = q_c;
 
   if (i > 0) {
-    const double q = field[cell_index(i - 1, j, nz)];
-    q_min = fmin(q_min, q);
-    q_max = fmax(q_max, q);
+    const int c_n = cell_index(i - 1, j, nz);
+    if (geometry_policy_exempt == nullptr || geometry_policy_exempt[c_n] == 0) {
+      const double q = field[c_n];
+      q_min = fmin(q_min, q);
+      q_max = fmax(q_max, q);
+    }
   }
   if (i + 1 < nr) {
-    const double q = field[cell_index(i + 1, j, nz)];
-    q_min = fmin(q_min, q);
-    q_max = fmax(q_max, q);
+    const int c_n = cell_index(i + 1, j, nz);
+    if (geometry_policy_exempt == nullptr || geometry_policy_exempt[c_n] == 0) {
+      const double q = field[c_n];
+      q_min = fmin(q_min, q);
+      q_max = fmax(q_max, q);
+    }
   }
   if (j > 0) {
-    const double q = field[cell_index(i, j - 1, nz)];
-    q_min = fmin(q_min, q);
-    q_max = fmax(q_max, q);
+    const int c_n = cell_index(i, j - 1, nz);
+    if (geometry_policy_exempt == nullptr || geometry_policy_exempt[c_n] == 0) {
+      const double q = field[c_n];
+      q_min = fmin(q_min, q);
+      q_max = fmax(q_max, q);
+    }
   }
   if (j + 1 < nz) {
-    const double q = field[cell_index(i, j + 1, nz)];
-    q_min = fmin(q_min, q);
-    q_max = fmax(q_max, q);
+    const int c_n = cell_index(i, j + 1, nz);
+    if (geometry_policy_exempt == nullptr || geometry_policy_exempt[c_n] == 0) {
+      const double q = field[c_n];
+      q_min = fmin(q_min, q);
+      q_max = fmax(q_max, q);
+    }
   }
 
   if (q_max - q_min <= 1.0e-30) {
@@ -1248,6 +1405,10 @@ __host__ __device__ inline double csr_face_swept_volume_outward(
                                    &nb)) {
     return 0.0;
   }
+  if (x_r_old[na] == x_r_new[na] && x_z_old[na] == x_z_new[na] &&
+      x_r_old[nb] == x_r_new[nb] && x_z_old[nb] == x_z_new[nb]) {
+    return 0.0;
+  }
   return csr_cell_orientation_sign(cell, cell_orientation_sign) *
          face_swept_volume_outward(x_r_old[na],
                                    x_z_old[na],
@@ -1272,7 +1433,8 @@ __host__ __device__ inline double csr_face_swept_moments_outward(
     const std::uint8_t* cell_nverts,
     double* rq,
     double* zq,
-    CsrFaceSweptMomentsStatus* status) {
+    CsrFaceSweptMomentsStatus* status,
+    bool* exact_moments = nullptr) {
   if (rq != nullptr) {
     *rq = 0.0;
   }
@@ -1281,6 +1443,9 @@ __host__ __device__ inline double csr_face_swept_moments_outward(
   }
   if (status != nullptr) {
     *status = CsrFaceSweptMomentsStatus::SKIP;
+  }
+  if (exact_moments != nullptr) {
+    *exact_moments = false;
   }
 
   int na = -1;
@@ -1292,6 +1457,10 @@ __host__ __device__ inline double csr_face_swept_moments_outward(
                                    local_face,
                                    &na,
                                    &nb)) {
+    return 0.0;
+  }
+  if (x_r_old[na] == x_r_new[na] && x_z_old[na] == x_z_new[na] &&
+      x_r_old[nb] == x_r_new[nb] && x_z_old[nb] == x_z_new[nb]) {
     return 0.0;
   }
 
@@ -1338,6 +1507,9 @@ __host__ __device__ inline double csr_face_swept_moments_outward(
       }
       if (status != nullptr) {
         *status = CsrFaceSweptMomentsStatus::OK;
+      }
+      if (exact_moments != nullptr) {
+        *exact_moments = true;
       }
       return dV_csr;
     }
@@ -1386,7 +1558,8 @@ __device__ inline double csr_limited_reconstruction(
     const double r_face,
     const double z_face,
     const double floor_value,
-    const std::uint8_t* cell_nverts = nullptr) {
+    const std::uint8_t* cell_nverts = nullptr,
+    const RemapDispatchAuditDeviceView audit = {}) {
   const double q = field[cell];
   const double r_c =
       csr_cell_center_r(
@@ -1397,6 +1570,10 @@ __device__ inline double csr_limited_reconstruction(
   double q_face = q + grad_r[cell] * (r_face - r_c) +
                   grad_z[cell] * (z_face - z_c);
   if (!isfinite(q_face)) {
+    remap_dispatch_audit_count(
+        audit,
+        RemapDispatchAuditCounter::ReconstructionNonfiniteFallback,
+        cell);
     q_face = q;
   }
   if (floor_value >= 0.0) {
@@ -1416,8 +1593,18 @@ __device__ inline double ms2_flux_r_face_t(const double* field,
                                            const int i_face,
                                            const int j,
                                            const int nr,
-                                           const int nz) {
+                                           const int nz,
+                                           const RemapDispatchAuditDeviceView audit = {},
+                                           const std::uint8_t* geometry_policy_exempt = nullptr) {
   if (i_face <= 0 || i_face >= nr) {
+    return 0.0;
+  }
+
+  const int c_left = cell_index(i_face - 1, j, nz);
+  const int c_right = cell_index(i_face, j, nz);
+  if (geometry_policy_exempt != nullptr &&
+      (geometry_policy_exempt[c_left] != 0 ||
+       geometry_policy_exempt[c_right] != 0)) {
     return 0.0;
   }
 
@@ -1429,6 +1616,8 @@ __device__ inline double ms2_flux_r_face_t(const double* field,
 
   const int i_donor = (deltaV > 0.0) ? (i_face - 1) : i_face;
   const int c_d = cell_index(i_donor, j, nz);
+  remap_dispatch_audit_count(
+      audit, RemapDispatchAuditCounter::ExactSweptMoment, c_d);
   const double r_c = cell_center_r(x_r_old, i_donor, j, nz);
   const double z_c = cell_center_z(x_z_old, i_donor, j, nz);
   const double m_r =
@@ -1451,8 +1640,18 @@ __device__ inline double ms2_flux_z_face_t(const double* field,
                                            const int i,
                                            const int j_face,
                                            const int nr,
-                                           const int nz) {
+                                           const int nz,
+                                           const RemapDispatchAuditDeviceView audit = {},
+                                           const std::uint8_t* geometry_policy_exempt = nullptr) {
   if (j_face <= 0 || j_face >= nz) {
+    return 0.0;
+  }
+
+  const int c_low = cell_index(i, j_face - 1, nz);
+  const int c_high = cell_index(i, j_face, nz);
+  if (geometry_policy_exempt != nullptr &&
+      (geometry_policy_exempt[c_low] != 0 ||
+       geometry_policy_exempt[c_high] != 0)) {
     return 0.0;
   }
 
@@ -1464,6 +1663,8 @@ __device__ inline double ms2_flux_z_face_t(const double* field,
 
   const int j_donor = (deltaV > 0.0) ? (j_face - 1) : j_face;
   const int c_d = cell_index(i, j_donor, nz);
+  remap_dispatch_audit_count(
+      audit, RemapDispatchAuditCounter::ExactSweptMoment, c_d);
   const double r_c = cell_center_r(x_r_old, i, j_donor, nz);
   const double z_c = cell_center_z(x_z_old, i, j_donor, nz);
   const double m_r =
@@ -1484,10 +1685,18 @@ static __global__ __launch_bounds__(256, 4) void compute_cell_slopes_lstsq_2d_rz
     const double* __restrict__ x_r,
     const double* __restrict__ x_z,
     const int nr,
-    const int nz) {
+    const int nz,
+    const RemapDispatchAuditDeviceView audit,
+    const std::uint8_t* __restrict__ geometry_policy_exempt = nullptr) {
   const int c = blockIdx.x * blockDim.x + threadIdx.x;
   const int n_cells = nr * nz;
   if (c >= n_cells) {
+    return;
+  }
+
+  if (geometry_policy_exempt != nullptr && geometry_policy_exempt[c] != 0) {
+    grad_r[c] = 0.0;
+    grad_z[c] = 0.0;
     return;
   }
 
@@ -1504,20 +1713,32 @@ static __global__ __launch_bounds__(256, 4) void compute_cell_slopes_lstsq_2d_rz
   double b1 = 0.0;
 
   if (i > 0) {
-    detail::ms2_accumulate_lstsq_neighbor(
-        field, x_r, x_z, a00, a01, a11, b0, b1, q_c, r_c, z_c, i - 1, j, nz);
+    const int c_n = detail::cell_index(i - 1, j, nz);
+    if (geometry_policy_exempt == nullptr || geometry_policy_exempt[c_n] == 0) {
+      detail::ms2_accumulate_lstsq_neighbor(
+          field, x_r, x_z, a00, a01, a11, b0, b1, q_c, r_c, z_c, i - 1, j, nz);
+    }
   }
   if (i + 1 < nr) {
-    detail::ms2_accumulate_lstsq_neighbor(
-        field, x_r, x_z, a00, a01, a11, b0, b1, q_c, r_c, z_c, i + 1, j, nz);
+    const int c_n = detail::cell_index(i + 1, j, nz);
+    if (geometry_policy_exempt == nullptr || geometry_policy_exempt[c_n] == 0) {
+      detail::ms2_accumulate_lstsq_neighbor(
+          field, x_r, x_z, a00, a01, a11, b0, b1, q_c, r_c, z_c, i + 1, j, nz);
+    }
   }
   if (j > 0) {
-    detail::ms2_accumulate_lstsq_neighbor(
-        field, x_r, x_z, a00, a01, a11, b0, b1, q_c, r_c, z_c, i, j - 1, nz);
+    const int c_n = detail::cell_index(i, j - 1, nz);
+    if (geometry_policy_exempt == nullptr || geometry_policy_exempt[c_n] == 0) {
+      detail::ms2_accumulate_lstsq_neighbor(
+          field, x_r, x_z, a00, a01, a11, b0, b1, q_c, r_c, z_c, i, j - 1, nz);
+    }
   }
   if (j + 1 < nz) {
-    detail::ms2_accumulate_lstsq_neighbor(
-        field, x_r, x_z, a00, a01, a11, b0, b1, q_c, r_c, z_c, i, j + 1, nz);
+    const int c_n = detail::cell_index(i, j + 1, nz);
+    if (geometry_policy_exempt == nullptr || geometry_policy_exempt[c_n] == 0) {
+      detail::ms2_accumulate_lstsq_neighbor(
+          field, x_r, x_z, a00, a01, a11, b0, b1, q_c, r_c, z_c, i, j + 1, nz);
+    }
   }
 
   const double det = a00 * a11 - a01 * a01;
@@ -1526,6 +1747,10 @@ static __global__ __launch_bounds__(256, 4) void compute_cell_slopes_lstsq_2d_rz
     grad_r[c] = (a11 * b0 - a01 * b1) / det;
     grad_z[c] = (-a01 * b0 + a00 * b1) / det;
   } else {
+    remap_dispatch_audit_count(
+        audit,
+        RemapDispatchAuditCounter::Ms2DegenerateGradientFallback,
+        c);
     grad_r[c] = (fabs(a00) > 1.0e-300) ? (b0 / a00) : 0.0;
     grad_z[c] = (fabs(a11) > 1.0e-300) ? (b1 / a11) : 0.0;
   }
@@ -1538,17 +1763,38 @@ static __global__ __launch_bounds__(256, 4) void apply_slope_limiter_van_leer_ke
     const double* __restrict__ x_r,
     const double* __restrict__ x_z,
     const int nr,
-    const int nz) {
+    const int nz,
+    const RemapDispatchAuditDeviceView audit,
+    const std::uint8_t* __restrict__ geometry_policy_exempt = nullptr) {
   const int c = blockIdx.x * blockDim.x + threadIdx.x;
   const int n_cells = nr * nz;
   if (c >= n_cells) {
     return;
   }
 
+  if (geometry_policy_exempt != nullptr && geometry_policy_exempt[c] != 0) {
+    grad_r[c] = 0.0;
+    grad_z[c] = 0.0;
+    return;
+  }
+
   const int i = c / nz;
   const int j = c - i * nz;
   const double psi = detail::ms2_van_leer_limiter_factor(
-      field, x_r, x_z, grad_r[c], grad_z[c], i, j, nr, nz);
+      field,
+      x_r,
+      x_z,
+      grad_r[c],
+      grad_z[c],
+      i,
+      j,
+      nr,
+      nz,
+      geometry_policy_exempt);
+  if (psi < 1.0) {
+    remap_dispatch_audit_count(
+        audit, RemapDispatchAuditCounter::LimiterActivation, c);
+  }
   grad_r[c] *= psi;
   grad_z[c] *= psi;
 }
@@ -1560,17 +1806,39 @@ void apply_slope_limiter_barth_jespersen_kernel(double* __restrict__ grad_r,
                                                 const double* __restrict__ x_r,
                                                 const double* __restrict__ x_z,
                                                 const int nr,
-                                                const int nz) {
+                                                const int nz,
+                                                const RemapDispatchAuditDeviceView audit,
+                                                const std::uint8_t* __restrict__
+                                                    geometry_policy_exempt = nullptr) {
   const int c = blockIdx.x * blockDim.x + threadIdx.x;
   const int n_cells = nr * nz;
   if (c >= n_cells) {
     return;
   }
 
+  if (geometry_policy_exempt != nullptr && geometry_policy_exempt[c] != 0) {
+    grad_r[c] = 0.0;
+    grad_z[c] = 0.0;
+    return;
+  }
+
   const int i = c / nz;
   const int j = c - i * nz;
   const double psi = detail::ms2_barth_jespersen_limiter_factor(
-      field, x_r, x_z, grad_r[c], grad_z[c], i, j, nr, nz);
+      field,
+      x_r,
+      x_z,
+      grad_r[c],
+      grad_z[c],
+      i,
+      j,
+      nr,
+      nz,
+      geometry_policy_exempt);
+  if (psi < 1.0) {
+    remap_dispatch_audit_count(
+        audit, RemapDispatchAuditCounter::LimiterActivation, c);
+  }
   grad_r[c] *= psi;
   grad_z[c] *= psi;
 }
@@ -1754,10 +2022,17 @@ static __global__ __launch_bounds__(256, 4) void conservative_remap_ms2_kernel_t
     const double* __restrict__ x_z_new,
     const int sweep_direction,
     const int nr,
-    const int nz) {
+    const int nz,
+    const std::uint8_t* __restrict__ geometry_policy_exempt,
+    const RemapDispatchAuditDeviceView audit) {
   const int c = blockIdx.x * blockDim.x + threadIdx.x;
   const int n_cells = nr * nz;
   if (c >= n_cells) {
+    return;
+  }
+
+  if (geometry_policy_exempt != nullptr && geometry_policy_exempt[c] != 0) {
+    field_new[c] = field_old[c];
     return;
   }
 
@@ -1778,7 +2053,9 @@ static __global__ __launch_bounds__(256, 4) void conservative_remap_ms2_kernel_t
                                                   i + 1,
                                                   j,
                                                   nr,
-                                                  nz);
+                                                  nz,
+                                                  audit,
+                                                  geometry_policy_exempt);
     F_minus = detail::ms2_flux_r_face_t<FixedSign>(field_old,
                                                    grad_r,
                                                    grad_z,
@@ -1789,7 +2066,9 @@ static __global__ __launch_bounds__(256, 4) void conservative_remap_ms2_kernel_t
                                                    i,
                                                    j,
                                                    nr,
-                                                   nz);
+                                                   nz,
+                                                   audit,
+                                                   geometry_policy_exempt);
   } else {
     F_plus = detail::ms2_flux_z_face_t<FixedSign>(field_old,
                                                   grad_r,
@@ -1801,7 +2080,9 @@ static __global__ __launch_bounds__(256, 4) void conservative_remap_ms2_kernel_t
                                                   i,
                                                   j + 1,
                                                   nr,
-                                                  nz);
+                                                  nz,
+                                                  audit,
+                                                  geometry_policy_exempt);
     F_minus = detail::ms2_flux_z_face_t<FixedSign>(field_old,
                                                    grad_r,
                                                    grad_z,
@@ -1812,7 +2093,9 @@ static __global__ __launch_bounds__(256, 4) void conservative_remap_ms2_kernel_t
                                                    i,
                                                    j,
                                                    nr,
-                                                   nz);
+                                                   nz,
+                                                   audit,
+                                                   geometry_policy_exempt);
   }
 
   const double qbar_new = qbar_old - F_plus + F_minus;
@@ -1834,18 +2117,44 @@ inline void launch_conservative_remap_ms2(double* d_field_new,
                                           const int nz,
                                           const RemapMs2Limiter limiter,
                                           const bool swept_volume_sign_fixed = false,
-                                          cudaStream_t stream = nullptr) {
+                                          const RemapDispatchAuditDeviceView audit = {},
+                                          cudaStream_t stream = nullptr,
+                                          const std::uint8_t* d_geometry_policy_exempt = nullptr) {
   const int n_cells = nr * nz;
   const int blocks = (n_cells + 255) / 256;
   compute_cell_slopes_lstsq_2d_rz_kernel<<<blocks, 256, 0, stream>>>(
-      d_grad_r, d_grad_z, d_field_old, d_xr_old, d_xz_old, nr, nz);
+      d_grad_r,
+      d_grad_z,
+      d_field_old,
+      d_xr_old,
+      d_xz_old,
+      nr,
+      nz,
+      audit,
+      d_geometry_policy_exempt);
   CUDA_CHECK(cudaGetLastError());
   if (limiter == RemapMs2Limiter::BarthJespersen) {
     apply_slope_limiter_barth_jespersen_kernel<<<blocks, 256, 0, stream>>>(
-        d_grad_r, d_grad_z, d_field_old, d_xr_old, d_xz_old, nr, nz);
+        d_grad_r,
+        d_grad_z,
+        d_field_old,
+        d_xr_old,
+        d_xz_old,
+        nr,
+        nz,
+        audit,
+        d_geometry_policy_exempt);
   } else {
     apply_slope_limiter_van_leer_kernel<<<blocks, 256, 0, stream>>>(
-        d_grad_r, d_grad_z, d_field_old, d_xr_old, d_xz_old, nr, nz);
+        d_grad_r,
+        d_grad_z,
+        d_field_old,
+        d_xr_old,
+        d_xz_old,
+        nr,
+        nz,
+        audit,
+        d_geometry_policy_exempt);
   }
   CUDA_CHECK(cudaGetLastError());
   if (swept_volume_sign_fixed) {
@@ -1861,7 +2170,9 @@ inline void launch_conservative_remap_ms2(double* d_field_new,
                                                                        d_xz_new,
                                                                        sweep_direction,
                                                                        nr,
-                                                                       nz);
+                                                                       nz,
+                                                                       d_geometry_policy_exempt,
+                                                                       audit);
   } else {
     conservative_remap_ms2_kernel_t<false><<<blocks, 256, 0, stream>>>(d_field_new,
                                                                         d_field_old,
@@ -1875,7 +2186,9 @@ inline void launch_conservative_remap_ms2(double* d_field_new,
                                                                         d_xz_new,
                                                                         sweep_direction,
                                                                         nr,
-                                                                        nz);
+                                                                        nz,
+                                                                        d_geometry_policy_exempt,
+                                                                        audit);
   }
 }
 
@@ -1893,24 +2206,37 @@ inline bool launch_remap_strang_ms2(double* d_field_inout,
                                     const int step_number,
                                     const RemapMs2Limiter limiter,
                                     const bool swept_volume_sign_fixed = false,
+                                    const std::uint8_t* d_geometry_policy_exempt = nullptr,
+                                    const RemapDispatchAuditDeviceView audit = {},
                                     cudaStream_t stream = nullptr) {
   const int first_dir = (step_number % 2 == 0) ? 0 : 1;
   const int second_dir = 1 - first_dir;
   const int n_cells = nr * nz;
   const int blocks = (n_cells + 255) / 256;
   int* d_nonpositive_count = nullptr;
+  int* d_first_nonpositive_cell = nullptr;
   double* d_grad_r = nullptr;
   double* d_grad_z = nullptr;
   CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_nonpositive_count), sizeof(int)));
+  CUDA_CHECK(
+      cudaMalloc(reinterpret_cast<void**>(&d_first_nonpositive_cell), sizeof(int)));
   CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_grad_r),
                         static_cast<std::size_t>(n_cells) * sizeof(double)));
   CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_grad_z),
                         static_cast<std::size_t>(n_cells) * sizeof(double)));
   CUDA_CHECK(cudaMemsetAsync(d_nonpositive_count, 0, sizeof(int), stream));
+  int first_nonpositive_cell = INT_MAX;
+  CUDA_CHECK(cudaMemcpyAsync(d_first_nonpositive_cell,
+                             &first_nonpositive_cell,
+                             sizeof(int),
+                             cudaMemcpyHostToDevice,
+                             stream));
 
   if (swept_volume_sign_fixed) {
     compute_intermediate_volume_kernel_t<true><<<blocks, 256, 0, stream>>>(d_vol_mid,
                                                                             d_nonpositive_count,
+                                                                            d_geometry_policy_exempt,
+                                                                            d_first_nonpositive_cell,
                                                                             d_vol_old,
                                                                             d_xr_old,
                                                                             d_xz_old,
@@ -1922,6 +2248,8 @@ inline bool launch_remap_strang_ms2(double* d_field_inout,
   } else {
     compute_intermediate_volume_kernel_t<false><<<blocks, 256, 0, stream>>>(d_vol_mid,
                                                                              d_nonpositive_count,
+                                                                             d_geometry_policy_exempt,
+                                                                             d_first_nonpositive_cell,
                                                                              d_vol_old,
                                                                              d_xr_old,
                                                                              d_xz_old,
@@ -1947,10 +2275,32 @@ inline bool launch_remap_strang_ms2(double* d_field_inout,
                                stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
   }
+  if (nonpositive_count > 0) {
+    if (stream == nullptr) {
+      CUDA_CHECK(cudaMemcpy(&first_nonpositive_cell,
+                            d_first_nonpositive_cell,
+                            sizeof(int),
+                            cudaMemcpyDeviceToHost));
+    } else {
+      CUDA_CHECK(cudaMemcpyAsync(&first_nonpositive_cell,
+                                 d_first_nonpositive_cell,
+                                 sizeof(int),
+                                 cudaMemcpyDeviceToHost,
+                                 stream));
+      CUDA_CHECK(cudaStreamSynchronize(stream));
+    }
+  }
+  CUDA_CHECK(cudaFree(d_first_nonpositive_cell));
   CUDA_CHECK(cudaFree(d_nonpositive_count));
   if (nonpositive_count > 0) {
     CUDA_CHECK(cudaFree(d_grad_z));
     CUDA_CHECK(cudaFree(d_grad_r));
+    core::log_warning(
+        "[ale-remap] transport aborted: non-positive intermediate volume at cell=" +
+        std::to_string(first_nonpositive_cell) +
+        " (i=" + std::to_string(first_nonpositive_cell / nz) +
+        ", j=" + std::to_string(first_nonpositive_cell % nz) +
+        ") count=" + std::to_string(nonpositive_count));
     return false;
   }
 
@@ -1969,7 +2319,9 @@ inline bool launch_remap_strang_ms2(double* d_field_inout,
                                 nz,
                                 limiter,
                                 swept_volume_sign_fixed,
-                                stream);
+                                audit,
+                                stream,
+                                d_geometry_policy_exempt);
   CUDA_CHECK(cudaGetLastError());
   if (stream == nullptr) {
     CUDA_CHECK(cudaDeviceSynchronize());
@@ -1992,7 +2344,9 @@ inline bool launch_remap_strang_ms2(double* d_field_inout,
                                 nz,
                                 limiter,
                                 swept_volume_sign_fixed,
-                                stream);
+                                audit,
+                                stream,
+                                d_geometry_policy_exempt);
   CUDA_CHECK(cudaGetLastError());
   if (stream == nullptr) {
     CUDA_CHECK(cudaDeviceSynchronize());

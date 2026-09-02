@@ -76,6 +76,38 @@ py::list serialize_double_list_17g(const std::vector<double>& values) {
   return out;
 }
 
+py::float_ serialize_double_17g(const double value) {
+  py::object format_fn = py::module_::import("builtins").attr("format");
+  return py::float_(py::str(format_fn(value, ".17g")));
+}
+
+py::list serialize_pressure_drive_modes(
+    const Config::NumericsConfig::HydroConfig::
+        PressureDrivePerturbationConfig& config) {
+  py::list out;
+  for (std::size_t k = 0; k < config.mode_l.size(); ++k) {
+    py::list mode;
+    mode.append(config.mode_l[k]);
+    mode.append(serialize_double_17g(config.mode_a[k]));
+    out.append(mode);
+  }
+  return out;
+}
+
+py::list serialize_pressure_drive_spots(
+    const Config::NumericsConfig::HydroConfig::
+        PressureDrivePerturbationConfig& config) {
+  py::list out;
+  for (std::size_t m = 0; m < config.spot_theta0.size(); ++m) {
+    py::list spot;
+    spot.append(serialize_double_17g(config.spot_theta0[m]));
+    spot.append(serialize_double_17g(config.spot_sigma[m]));
+    spot.append(serialize_double_17g(config.spot_amp[m]));
+    out.append(spot);
+  }
+  return out;
+}
+
 bool auto_config_has_non_default(const Config::MeshConfig::AutoZoneConfig& cfg) {
   const Config::MeshConfig::AutoZoneConfig def;
   return cfg.mass_ratio_max != def.mass_ratio_max ||
@@ -111,6 +143,10 @@ const char* topology_scheme_to_string(const TopologyScheme topology_scheme) {
       return "multiblock_half_butterfly_5block";
     case TopologyScheme::MULTIBLOCK_HALF_BUTTERFLY_TRIFAN_CAP_5BLOCK:
       return "multiblock_half_butterfly_trifan_cap_5block";
+    case TopologyScheme::MULTIBLOCK_POLAR_TIER:
+      return "multiblock_polar_tier";
+    case TopologyScheme::MULTIBLOCK_POLAR_TIER_CART_CENTER:
+      return "multiblock_polar_tier_cart_center";
     case TopologyScheme::CONE_SHELL_SPINE:
       return "cone_shell_spine";
     case TopologyScheme::PENTAGON_BELT_SHELL:
@@ -295,6 +331,65 @@ py::dict serialize_mesh(const Config::MeshConfig& mesh) {
   } else if (mesh.topology_scheme == TopologyScheme::PENTAGON_BELT_SHELL) {
     out["topology_scheme"] = topology_scheme_to_string(mesh.topology_scheme);
     out["pentagon_belt_layers"] = py::cast(mesh.pentagon_belt_layers);
+  } else if (mesh.topology_scheme == TopologyScheme::MULTIBLOCK_POLAR_TIER ||
+             mesh.topology_scheme ==
+                 TopologyScheme::MULTIBLOCK_POLAR_TIER_CART_CENTER) {
+    out["topology_scheme"] = topology_scheme_to_string(mesh.topology_scheme);
+    out["multiblock_cart_core_r_match"] =
+        mesh.multiblock_cart_core_r_match;
+    if (mesh.topology_scheme ==
+        TopologyScheme::MULTIBLOCK_POLAR_TIER_CART_CENTER) {
+      out["multiblock_cart_core_r_c"] = mesh.multiblock_cart_core_r_c;
+      out["multiblock_cart_core_n_c"] = mesh.multiblock_cart_core_n_c;
+      out["multiblock_cart_core_bridge_layers"] =
+          mesh.multiblock_cart_core_bridge_layers;
+      if (mesh.multiblock_cart_core_bridge_grading !=
+              defaults.multiblock_cart_core_bridge_grading ||
+          mesh.multiblock_cart_core_bridge_spacing_floor !=
+              defaults.multiblock_cart_core_bridge_spacing_floor ||
+          mesh.multiblock_cart_core_bridge_ratio_max !=
+              defaults.multiblock_cart_core_bridge_ratio_max) {
+        out["multiblock_cart_core_bridge_grading"] =
+            mesh.multiblock_cart_core_bridge_grading;
+        out["multiblock_cart_core_bridge_spacing_floor"] =
+            mesh.multiblock_cart_core_bridge_spacing_floor;
+        out["multiblock_cart_core_bridge_ratio_max"] =
+            mesh.multiblock_cart_core_bridge_ratio_max;
+      }
+      out["polar_tier_cart_cut_ring"] = mesh.polar_tier_cart_cut_ring;
+      if (mesh.polar_tier_center_kind !=
+          defaults.polar_tier_center_kind) {
+        out["polar_tier_center_kind"] = mesh.polar_tier_center_kind;
+      }
+    }
+    out["polar_tier_chi_lo"] = mesh.polar_tier_chi_lo;
+    out["polar_tier_chi_hi"] = mesh.polar_tier_chi_hi;
+    out["polar_tier_belt_thickness_frac"] =
+        mesh.polar_tier_belt_thickness_frac;
+    out["polar_tier_belt_rows"] = mesh.polar_tier_belt_rows;
+    out["polar_tier_pole_cap_m"] = mesh.polar_tier_pole_cap_m;
+    out["polar_tier_pole_cap_alpha"] = mesh.polar_tier_pole_cap_alpha;
+    if (mesh.polar_tier_dendrite_enabled) {
+      out["polar_tier_dendrite_enabled"] = true;
+      if (mesh.polar_tier_native_pentagon) {
+        out["polar_tier_native_pentagon"] = true;
+      }
+      out["polar_tier_dendrite_s_theta_rows_below"] =
+          mesh.polar_tier_dendrite_s_theta_rows_below;
+    }
+    if (mesh.shell_polar_cap_dendrite) {
+      out["shell_polar_cap_dendrite"] = true;
+    }
+    if (mesh.shell_cap_rows_2x != defaults.shell_cap_rows_2x) {
+      out["shell_cap_rows_2x"] = mesh.shell_cap_rows_2x;
+    }
+    out["polar_tier_fan_sectors"] = mesh.polar_tier_fan_sectors;
+    out["polar_tier_min_tier_columns"] =
+        mesh.polar_tier_min_tier_columns;
+    out["polar_tier_fan_first_ring_radius_cm"] =
+        mesh.polar_tier_fan_first_ring_radius_cm;
+    out["polar_tier_hydro_enabled"] =
+        mesh.polar_tier_hydro_enabled;
   } else {
     out["topology_scheme"] = topology_scheme_to_string(mesh.topology_scheme);
     out["multiblock_cart_core_r_c"] = mesh.multiblock_cart_core_r_c;
@@ -304,6 +399,16 @@ py::dict serialize_mesh(const Config::MeshConfig& mesh) {
         mesh.multiblock_cart_core_bridge_layers;
     out["multiblock_cart_core_bridge_grading"] =
         mesh.multiblock_cart_core_bridge_grading;
+    if (mesh.multiblock_cart_core_bridge_spacing_floor !=
+        defaults.multiblock_cart_core_bridge_spacing_floor) {
+      out["multiblock_cart_core_bridge_spacing_floor"] =
+          mesh.multiblock_cart_core_bridge_spacing_floor;
+    }
+    if (mesh.multiblock_theta_cap_widen_factor !=
+        defaults.multiblock_theta_cap_widen_factor) {
+      out["multiblock_theta_cap_widen_factor"] =
+          mesh.multiblock_theta_cap_widen_factor;
+    }
     if (mesh.multiblock_transition_scheme !=
         defaults.multiblock_transition_scheme) {
       out["multiblock_transition_scheme"] =
@@ -1098,17 +1203,24 @@ py::dict serialize_numerics(const Config::NumericsConfig& numerics) {
   py::dict dt;
   dt["initial_s"] = numerics.dt.initial_s;
   dt["cfl_hydro"] = numerics.dt.cfl_hydro;
+  dt["cfl_length_2d"] = numerics.dt.cfl_length_2d;
+  dt["edge_accel_displacement_cfl_enabled"] =
+      numerics.dt.edge_accel_displacement_cfl_enabled;
   dt["cfl_cond"] = numerics.dt.cfl_cond;
   dt["f_min_fleck"] = numerics.dt.f_min_fleck;
   dt["growth_factor"] = numerics.dt.growth_factor;
   dt["max_s"] = numerics.dt.max_s;
   dt["min_s"] = numerics.dt.min_s;
+  dt["min_consecutive_steps"] = numerics.dt.min_consecutive_steps;
   dt["floor_stall_max_consecutive_steps"] =
       numerics.dt.floor_stall_max_consecutive_steps;
 
   py::dict persistent_loop;
   persistent_loop["enabled"] = numerics.persistent_loop.enabled;
   persistent_loop["chunk_steps"] = numerics.persistent_loop.chunk_steps;
+
+  py::dict z_reflection;
+  z_reflection["mode"] = numerics.z_reflection.mode;
 
   py::dict hydro_boundary_2d;
   hydro_boundary_2d["r_inner"] = numerics.hydro.boundary_2d.r_inner;
@@ -1127,6 +1239,9 @@ py::dict serialize_numerics(const Config::NumericsConfig& numerics) {
         out["rho_g_per_cc"] = face.supply_rho_g_per_cc;
         out["u_z_cm_per_s"] = face.supply_u_z_cm_per_s;
         out["T_eV"] = face.supply_T_eV;
+        if (std::isfinite(face.drive_t_end_s)) {
+          out["drive_t_end_s"] = face.drive_t_end_s;
+        }
         return py::object(out);
       };
   hydro_boundary_2d["z_bottom"] =
@@ -1174,6 +1289,17 @@ py::dict serialize_numerics(const Config::NumericsConfig& numerics) {
   hourglass["max_force_per_node_fraction"] =
       numerics.hydro.hourglass.max_force_per_node_fraction;
 
+  py::dict axis_projection;
+  axis_projection["enabled"] = numerics.hydro.axis_projection.enabled;
+  axis_projection["shadow_only"] =
+      numerics.hydro.axis_projection.shadow_only;
+  axis_projection["q_on"] = numerics.hydro.axis_projection.q_on;
+  axis_projection["q_floor"] = numerics.hydro.axis_projection.q_floor;
+  axis_projection["patch_halfwidth"] =
+      numerics.hydro.axis_projection.patch_halfwidth;
+  axis_projection["log_every_n_steps"] =
+      numerics.hydro.axis_projection.log_every_n_steps;
+
   py::dict plasma_viscosity;
   plasma_viscosity["enabled"] = numerics.hydro.plasma_viscosity.enabled;
   plasma_viscosity["model"] = numerics.hydro.plasma_viscosity.model;
@@ -1216,8 +1342,18 @@ py::dict serialize_numerics(const Config::NumericsConfig& numerics) {
       numerics.hydro.anti_hourglass_kappa;
   hydro["subzonal_pressure_enabled"] =
       numerics.hydro.subzonal_pressure_enabled;
+  if (!numerics.hydro.pentagon_affine_null_enabled) {
+    hydro["pentagon_affine_null_enabled"] = false;
+  }
+  if (numerics.hydro.pentagon_affine_null_kappa != 0.03) {
+    hydro["pentagon_affine_null_kappa"] =
+        numerics.hydro.pentagon_affine_null_kappa;
+  }
   hydro["subzonal_dt_limiter_enabled"] =
       numerics.hydro.subzonal_dt_limiter_enabled;
+  if (numerics.hydro.aw_compatible_force_work) {
+    hydro["aw_compatible_force_work"] = true;
+  }
   hydro["subzonal_pressure_mode"] =
       numerics.hydro.subzonal_pressure_mode;
   hydro["subzonal_band_mode"] =
@@ -1383,6 +1519,24 @@ py::dict serialize_numerics(const Config::NumericsConfig& numerics) {
   hydro["boundary_2d"] = hydro_boundary_2d;
   hydro["av_linear"] = numerics.hydro.av_linear;
   hydro["av_quadratic"] = numerics.hydro.av_quadratic;
+  hydro["csw98_degenerate_side_floor_rel"] =
+      numerics.hydro.csw98_degenerate_side_floor_rel;
+  hydro["csw98_damper_impulse_beta"] =
+      numerics.hydro.csw98_damper_impulse_beta;
+  hydro["csw98_axisline_av_mode"] =
+      numerics.hydro.csw98_axisline_av_mode;
+  hydro["csw98_axisline_d1prime_cfl_enabled"] =
+      numerics.hydro.csw98_axisline_d1prime_cfl_enabled;
+  hydro["csw98_limiter_shock_floor_enabled"] =
+      numerics.hydro.csw98_limiter_shock_floor_enabled;
+  hydro["csw98_axisline_work_planar_enabled"] =
+      numerics.hydro.csw98_axisline_work_planar_enabled;
+  if (numerics.hydro.tensor_av_C1 != 1.0) {
+    hydro["tensor_av_C1"] = numerics.hydro.tensor_av_C1;
+  }
+  if (numerics.hydro.tensor_av_C2 != 1.0) {
+    hydro["tensor_av_C2"] = numerics.hydro.tensor_av_C2;
+  }
   hydro["av_qcap_over_p"] = numerics.hydro.av_qcap_over_p;
   hydro["av_qcap_center_band_only"] = numerics.hydro.av_qcap_center_band_only;
   hydro["av_cfl_coefficient"] = numerics.hydro.av_cfl_coefficient;
@@ -1390,6 +1544,60 @@ py::dict serialize_numerics(const Config::NumericsConfig& numerics) {
   hydro["csw_C2"] = numerics.hydro.csw_C2;
   hydro["csw_limiter"] = numerics.hydro.csw_limiter;
   hydro["csw_limiter_enabled"] = numerics.hydro.csw_limiter_enabled;
+  if (numerics.hydro.csw_axis_mirror_limiter) {
+    hydro["csw_axis_mirror_limiter"] = true;
+  }
+  if (numerics.hydro.csw_rz_lift_enabled) {
+    hydro["csw_rz_lift_enabled"] = true;
+    hydro["csw_rz_lift_guard_ratio"] =
+        numerics.hydro.csw_rz_lift_guard_ratio;
+  }
+  if (numerics.hydro.csw_pole_floor_enabled) {
+    hydro["csw_pole_floor_enabled"] = true;
+    hydro["csw_pole_floor_sigma0"] = numerics.hydro.csw_pole_floor_sigma0;
+    hydro["csw_pole_floor_theta0_rad"] =
+        numerics.hydro.csw_pole_floor_theta0_rad;
+    hydro["csw_pole_floor_thetaf_rad"] =
+        numerics.hydro.csw_pole_floor_thetaf_rad;
+  }
+  if (numerics.hydro.csw_pole_desens_enabled) {
+    hydro["csw_pole_desens_enabled"] = true;
+    hydro["csw_pole_desens_alpha"] = numerics.hydro.csw_pole_desens_alpha;
+    hydro["csw_pole_desens_theta0_rad"] =
+        numerics.hydro.csw_pole_desens_theta0_rad;
+    hydro["csw_pole_desens_thetaf_rad"] =
+        numerics.hydro.csw_pole_desens_thetaf_rad;
+  }
+  if (numerics.hydro.csw_polar_slaving_enabled) {
+    hydro["csw_polar_slaving_enabled"] = true;
+    hydro["csw_polar_slaving_min_columns"] =
+        numerics.hydro.csw_polar_slaving_min_columns;
+    hydro["csw_polar_slaving_full_columns"] =
+        numerics.hydro.csw_polar_slaving_full_columns;
+    hydro["csw_polar_slaving_outer_columns"] =
+        numerics.hydro.csw_polar_slaving_outer_columns;
+    hydro["csw_polar_slaving_chi_on"] =
+        numerics.hydro.csw_polar_slaving_chi_on;
+    hydro["csw_polar_slaving_chi_full"] =
+        numerics.hydro.csw_polar_slaving_chi_full;
+    hydro["csw_polar_slaving_strength"] =
+        numerics.hydro.csw_polar_slaving_strength;
+  }
+  if (numerics.hydro.csw_polar_slaving_av_stiffness_cfl_enabled) {
+    hydro["csw_polar_slaving_av_stiffness_cfl_enabled"] = true;
+    hydro["csw_polar_slaving_av_stiffness_sigma"] =
+        numerics.hydro.csw_polar_slaving_av_stiffness_sigma;
+  }
+  if (numerics.hydro.wake_heat_flux_enabled) {
+    hydro["wake_heat_flux_enabled"] = true;
+    hydro["wake_heat_flux_CE"] = numerics.hydro.wake_heat_flux_CE;
+    hydro["wake_heat_flux_theta_a_rad"] =
+        numerics.hydro.wake_heat_flux_theta_a_rad;
+    hydro["wake_heat_flux_theta_b_rad"] =
+        numerics.hydro.wake_heat_flux_theta_b_rad;
+    hydro["wake_heat_flux_global_theta"] =
+        numerics.hydro.wake_heat_flux_global_theta;
+  }
   hydro["csw_shock_limiter_floor"] = numerics.hydro.csw_shock_limiter_floor;
   hydro["csw_zero_uniform_compression"] =
       numerics.hydro.csw_zero_uniform_compression;
@@ -1406,6 +1614,7 @@ py::dict serialize_numerics(const Config::NumericsConfig& numerics) {
   hydro["crossing_dt_safety"] = numerics.hydro.crossing_dt_safety;
   hydro["time_integrator"] = numerics.hydro.time_integrator;
   hydro["hourglass"] = hourglass;
+  hydro["axis_projection"] = axis_projection;
   hydro["adaptive_av"] = adaptive_av;
   hydro["plasma_viscosity"] = plasma_viscosity;
   hydro["av_eos_aware"] = numerics.hydro.av_eos_aware;
@@ -1423,6 +1632,24 @@ py::dict serialize_numerics(const Config::NumericsConfig& numerics) {
       numerics.hydro.hk_velocity_damper_guard_cells;
   hydro["av_heat_to"] = numerics.hydro.av_heat_to;
   hydro["boundary_pressure"] = serialize_callable(numerics.hydro.pressure_drive_1d);
+  const auto& pressure_drive_perturbation =
+      numerics.hydro.pressure_drive_perturbation;
+  py::dict pressure_drive_perturbation_dict;
+  pressure_drive_perturbation_dict["enabled"] =
+      pressure_drive_perturbation.enabled;
+  pressure_drive_perturbation_dict["legendre_modes"] =
+      serialize_pressure_drive_modes(pressure_drive_perturbation);
+  pressure_drive_perturbation_dict["ring_spots"] =
+      serialize_pressure_drive_spots(pressure_drive_perturbation);
+  pressure_drive_perturbation_dict["random_seed"] =
+      pressure_drive_perturbation.random_seed;
+  pressure_drive_perturbation_dict["random_l_min"] =
+      pressure_drive_perturbation.random_l_min;
+  pressure_drive_perturbation_dict["random_l_max"] =
+      pressure_drive_perturbation.random_l_max;
+  pressure_drive_perturbation_dict["random_rms"] = 0.0;
+  hydro["pressure_drive_perturbation"] =
+      pressure_drive_perturbation_dict;
 
   py::dict conduction;
   conduction["enabled"] = numerics.conduction.enabled;
@@ -1451,6 +1678,67 @@ py::dict serialize_numerics(const Config::NumericsConfig& numerics) {
   py::dict ale;
   const Config::NumericsConfig::AleConfig ale_defaults;
   ale["enabled"] = numerics.ale.enabled;
+  if (numerics.ale.mesh_mode != ale_defaults.mesh_mode) {
+    ale["mesh_mode"] = numerics.ale.mesh_mode;
+  }
+  if (numerics.ale.reale_core != ale_defaults.reale_core) {
+    ale["reale_core"] = numerics.ale.reale_core;
+  }
+  if (numerics.ale.rezone_min_dt_s != ale_defaults.rezone_min_dt_s) {
+    ale["rezone_min_dt_s"] = numerics.ale.rezone_min_dt_s;
+  }
+  if (numerics.ale.tess_gpu_dual != ale_defaults.tess_gpu_dual) {
+    ale["tess_gpu_dual"] = numerics.ale.tess_gpu_dual;
+  }
+  if (numerics.ale.tess_gpu_restrict != ale_defaults.tess_gpu_restrict) {
+    ale["tess_gpu_restrict"] = numerics.ale.tess_gpu_restrict;
+  }
+  if (numerics.ale.dvclp_solver_rev != ale_defaults.dvclp_solver_rev) {
+    ale["dvclp_solver_rev"] = numerics.ale.dvclp_solver_rev;
+  }
+  if (numerics.ale.reale_lloyd_max != ale_defaults.reale_lloyd_max) {
+    ale["reale_lloyd_max"] = numerics.ale.reale_lloyd_max;
+  }
+  if (numerics.ale.reale_short_edge_collapse_rel !=
+      ale_defaults.reale_short_edge_collapse_rel) {
+    ale["reale_short_edge_collapse_rel"] =
+        numerics.ale.reale_short_edge_collapse_rel;
+  }
+  if (numerics.ale.reale_subdomain_rezone !=
+      ale_defaults.reale_subdomain_rezone) {
+    ale["reale_subdomain_rezone"] =
+        numerics.ale.reale_subdomain_rezone;
+  }
+  if (numerics.ale.reale_subdomain_frac_max !=
+      ale_defaults.reale_subdomain_frac_max) {
+    ale["reale_subdomain_frac_max"] =
+        numerics.ale.reale_subdomain_frac_max;
+  }
+  if (numerics.ale.reale_overlay_additivity_tol !=
+      ale_defaults.reale_overlay_additivity_tol) {
+    ale["reale_overlay_additivity_tol"] =
+        numerics.ale.reale_overlay_additivity_tol;
+  }
+  if (numerics.ale.reale_corner_mass_reset !=
+      ale_defaults.reale_corner_mass_reset) {
+    ale["reale_corner_mass_reset"] =
+        numerics.ale.reale_corner_mass_reset;
+  }
+  if (numerics.ale.reale_velocity_max_principle !=
+      ale_defaults.reale_velocity_max_principle) {
+    ale["reale_velocity_max_principle"] =
+        numerics.ale.reale_velocity_max_principle;
+  }
+  if (numerics.ale.reale_dt_trigger_factor !=
+      ale_defaults.reale_dt_trigger_factor) {
+    ale["reale_dt_trigger_factor"] =
+        numerics.ale.reale_dt_trigger_factor;
+  }
+  if (numerics.ale.reale_dt_trigger_cooldown !=
+      ale_defaults.reale_dt_trigger_cooldown) {
+    ale["reale_dt_trigger_cooldown"] =
+        numerics.ale.reale_dt_trigger_cooldown;
+  }
   ale["every_n_steps"] = numerics.ale.every_n_steps;
   ale["warmup_steps"] = numerics.ale.warmup_steps;
   ale["relaxation"] = numerics.ale.relaxation;
@@ -1488,6 +1776,74 @@ py::dict serialize_numerics(const Config::NumericsConfig& numerics) {
   button_morph["every_n_steps"] =
       numerics.ale.button_morph.every_n_steps;
   ale["button_morph"] = button_morph;
+  py::dict runtime_controller;
+  runtime_controller["monitor_enabled"] =
+      numerics.ale.runtime_controller.monitor_enabled;
+  runtime_controller["monitor_every"] =
+      numerics.ale.runtime_controller.monitor_every;
+  runtime_controller["shell_rows"] =
+      numerics.ale.runtime_controller.shell_rows;
+  runtime_controller["controller_shell_rows"] =
+      numerics.ale.runtime_controller.controller_shell_rows;
+  runtime_controller["cap_columns"] =
+      numerics.ale.runtime_controller.cap_columns;
+  runtime_controller["q_soft"] = numerics.ale.runtime_controller.q_soft;
+  runtime_controller["q_hard"] = numerics.ale.runtime_controller.q_hard;
+  runtime_controller["q_recover"] = numerics.ale.runtime_controller.q_recover;
+  runtime_controller["h_soft"] = numerics.ale.runtime_controller.h_soft;
+  runtime_controller["h_hard"] = numerics.ale.runtime_controller.h_hard;
+  runtime_controller["h_recover"] = numerics.ale.runtime_controller.h_recover;
+  runtime_controller["soft_persistence"] =
+      numerics.ale.runtime_controller.soft_persistence;
+  runtime_controller["recover_checks"] =
+      numerics.ale.runtime_controller.recover_checks;
+  runtime_controller["winslow_sweeps"] =
+      numerics.ale.runtime_controller.winslow_sweeps;
+  runtime_controller["winslow_omega"] =
+      numerics.ale.runtime_controller.winslow_omega;
+  runtime_controller["beta_monitor_soft"] =
+      numerics.ale.runtime_controller.beta_monitor_soft;
+  runtime_controller["beta_monitor_hard"] =
+      numerics.ale.runtime_controller.beta_monitor_hard;
+  runtime_controller["beta_mass"] =
+      numerics.ale.runtime_controller.beta_mass;
+  runtime_controller["beta_front"] =
+      numerics.ale.runtime_controller.beta_front;
+  runtime_controller["beta_theta"] =
+      numerics.ale.runtime_controller.beta_theta;
+  runtime_controller["g_max"] =
+      numerics.ale.runtime_controller.g_max;
+  runtime_controller["front_width_cells"] =
+      numerics.ale.runtime_controller.front_width_cells;
+  runtime_controller["cap_fraction"] =
+      numerics.ale.runtime_controller.cap_fraction;
+  runtime_controller["cap_normal_fraction"] =
+      numerics.ale.runtime_controller.cap_normal_fraction;
+  runtime_controller["controller_enabled"] =
+      numerics.ale.runtime_controller.controller_enabled;
+  runtime_controller["commit_rollback_enabled"] =
+      numerics.ale.runtime_controller.commit_rollback_enabled;
+  runtime_controller["activation_front_mode"] =
+      numerics.ale.runtime_controller.activation_front_mode;
+  runtime_controller["activation_front_margin_hs"] =
+      numerics.ale.runtime_controller.activation_front_margin_hs;
+  runtime_controller["activation_time_s"] =
+      numerics.ale.runtime_controller.activation_time_s;
+  runtime_controller["cadence_soft"] =
+      numerics.ale.runtime_controller.cadence_soft;
+  runtime_controller["cadence_hard"] =
+      numerics.ale.runtime_controller.cadence_hard;
+  runtime_controller["cadence_recovery"] =
+      numerics.ale.runtime_controller.cadence_recovery;
+  runtime_controller["pre_step_enabled"] =
+      numerics.ale.runtime_controller.pre_step_enabled;
+  runtime_controller["failures_hard_force"] =
+      numerics.ale.runtime_controller.failures_hard_force;
+  runtime_controller["failures_big_repair"] =
+      numerics.ale.runtime_controller.failures_big_repair;
+  runtime_controller["escalation_max_failures"] =
+      numerics.ale.runtime_controller.escalation_max_failures;
+  ale["runtime_controller"] = runtime_controller;
   ale["reference_barrier_enabled"] = numerics.ale.reference_barrier_enabled;
   ale["reference_target"] = numerics.ale.reference_target;
   ale["reference_blend_default"] = numerics.ale.reference_blend_default;
@@ -1565,6 +1921,8 @@ py::dict serialize_numerics(const Config::NumericsConfig& numerics) {
       numerics.ale.safe_backtrack_min_exp;
   ale["safe_backtrack_binary_iters"] =
       numerics.ale.safe_backtrack_binary_iters;
+  ale["mesh_epoch_enabled"] = numerics.ale.mesh_epoch_enabled;
+  ale["mesh_epoch_max_per_step"] = numerics.ale.mesh_epoch_max_per_step;
   ale["corner_cell_aspect_protection_enabled"] =
       numerics.ale.corner_cell_aspect_protection_enabled;
   ale["corner_cell_aspect_eta"] =
@@ -1581,6 +1939,9 @@ py::dict serialize_numerics(const Config::NumericsConfig& numerics) {
   if (numerics.ale.euler_window.enabled) {
     py::dict euler_window;
     euler_window["enabled"] = numerics.ale.euler_window.enabled;
+    if (!numerics.ale.euler_window.role.empty()) {
+      euler_window["role"] = numerics.ale.euler_window.role;
+    }
     euler_window["shape"] = numerics.ale.euler_window.shape;
     euler_window["r0"] = numerics.ale.euler_window.r0;
     euler_window["r1"] = numerics.ale.euler_window.r1;
@@ -1592,8 +1953,408 @@ py::dict serialize_numerics(const Config::NumericsConfig& numerics) {
     euler_window["rad_out"] = numerics.ale.euler_window.rad_out;
     euler_window["transition_width"] =
         numerics.ale.euler_window.transition_width;
+    euler_window["t_on_s"] = numerics.ale.euler_window.t_on_s;
+    euler_window["t_off_s"] = numerics.ale.euler_window.t_off_s;
+    if (numerics.ale.euler_window.feather_min_layers != 3) {
+      euler_window["feather_min_layers"] =
+          numerics.ale.euler_window.feather_min_layers;
+    }
+    if (numerics.ale.euler_window.guard_layers != 1) {
+      euler_window["guard_layers"] =
+          numerics.ale.euler_window.guard_layers;
+    }
+    if (numerics.ale.euler_window.axis_core_transaction_mode != "static") {
+      euler_window["axis_core_transaction_mode"] =
+          numerics.ale.euler_window.axis_core_transaction_mode;
+    }
+    if (!numerics.ale.euler_window.replay_table_path.empty()) {
+      euler_window["replay_table_path"] =
+          numerics.ale.euler_window.replay_table_path;
+    }
+    if (numerics.ale.euler_window.replay_tau_lead != 4.5e-12) {
+      euler_window["replay_tau_lead"] =
+          numerics.ale.euler_window.replay_tau_lead;
+    }
+    if (numerics.ale.euler_window.replay_tau_splice != 1.4e-12) {
+      euler_window["replay_tau_splice"] =
+          numerics.ale.euler_window.replay_tau_splice;
+    }
+    if (numerics.ale.euler_window.replay_beta != 1.0) {
+      euler_window["replay_beta"] = numerics.ale.euler_window.replay_beta;
+    }
+    if (numerics.ale.euler_window.axis_core_transition_passage_enabled) {
+      euler_window["axis_core_transition_passage_enabled"] = true;
+    }
+    if (numerics.ale.euler_window.axis_core_ring_release_enabled) {
+      euler_window["axis_core_ring_release_enabled"] = true;
+    }
     ale["euler_window"] = euler_window;
   }
+  if (!numerics.ale.euler_windows.empty()) {
+    py::list euler_windows;
+    for (const auto& config : numerics.ale.euler_windows) {
+      py::dict euler_window;
+      euler_window["enabled"] = config.enabled;
+      if (!config.role.empty()) {
+        euler_window["role"] = config.role;
+      }
+      euler_window["shape"] = config.shape;
+      euler_window["r0"] = config.r0;
+      euler_window["r1"] = config.r1;
+      euler_window["z0"] = config.z0;
+      euler_window["z1"] = config.z1;
+      euler_window["cr"] = config.cr;
+      euler_window["cz"] = config.cz;
+      euler_window["rad_in"] = config.rad_in;
+      euler_window["rad_out"] = config.rad_out;
+      euler_window["transition_width"] = config.transition_width;
+      euler_window["t_on_s"] = config.t_on_s;
+      euler_window["t_off_s"] = config.t_off_s;
+      if (config.feather_min_layers != 3) {
+        euler_window["feather_min_layers"] = config.feather_min_layers;
+      }
+      if (config.guard_layers != 1) {
+        euler_window["guard_layers"] = config.guard_layers;
+      }
+      if (config.axis_core_transaction_mode != "static") {
+        euler_window["axis_core_transaction_mode"] =
+            config.axis_core_transaction_mode;
+      }
+      if (!config.replay_table_path.empty()) {
+        euler_window["replay_table_path"] = config.replay_table_path;
+      }
+      if (config.replay_tau_lead != 4.5e-12) {
+        euler_window["replay_tau_lead"] = config.replay_tau_lead;
+      }
+      if (config.replay_tau_splice != 1.4e-12) {
+        euler_window["replay_tau_splice"] = config.replay_tau_splice;
+      }
+      if (config.replay_beta != 1.0) {
+        euler_window["replay_beta"] = config.replay_beta;
+      }
+      if (config.axis_core_transition_passage_enabled) {
+        euler_window["axis_core_transition_passage_enabled"] = true;
+      }
+      if (config.axis_core_ring_release_enabled) {
+        euler_window["axis_core_ring_release_enabled"] = true;
+      }
+      euler_windows.append(std::move(euler_window));
+    }
+    ale["euler_windows"] = std::move(euler_windows);
+  }
+  if (numerics.ale.band_ale.enabled) {
+    py::dict band_ale;
+    band_ale["enabled"] = numerics.ale.band_ale.enabled;
+    band_ale["aspect_trigger"] = numerics.ale.band_ale.aspect_trigger;
+    band_ale["release_hysteresis"] =
+        numerics.ale.band_ale.release_hysteresis;
+    band_ale["chi"] = numerics.ale.band_ale.chi;
+    band_ale["respace_move_cap_frac"] =
+        numerics.ale.band_ale.respace_move_cap_frac;
+    band_ale["estimator_band_hold_mach"] =
+        numerics.ale.band_ale.estimator_band_hold_mach;
+    band_ale["bands"] = numerics.ale.band_ale.bands;
+    band_ale["compose_with_rezone"] =
+        numerics.ale.band_ale.compose_with_rezone;
+    band_ale["belt_target"] = numerics.ale.band_ale.belt_target;
+    band_ale["center_target"] = numerics.ale.band_ale.center_target;
+    band_ale["axis_target"] = numerics.ale.band_ale.axis_target;
+    band_ale["axis_segment_halfwidth"] =
+        numerics.ale.band_ale.axis_segment_halfwidth;
+    band_ale["axis_shell_block_enabled"] =
+        numerics.ale.band_ale.axis_shell_block_enabled;
+    band_ale["sigma_linesearch_enabled"] =
+        numerics.ale.band_ale.sigma_linesearch_enabled;
+    band_ale["transaction_energy_closure_enabled"] =
+        numerics.ale.band_ale.transaction_energy_closure_enabled;
+    band_ale["estimator_band_cut"] =
+        numerics.ale.band_ale.estimator_band_cut;
+    band_ale["estimator_band_shock_hold"] =
+        numerics.ale.band_ale.estimator_band_shock_hold;
+    band_ale["estimator_band_front_hold_margin_rows"] =
+        numerics.ale.band_ale.estimator_band_front_hold_margin_rows;
+    band_ale["estimator_band_axis"] =
+        numerics.ale.band_ale.estimator_band_axis;
+    band_ale["estimator_band_in_rows"] =
+        numerics.ale.band_ale.estimator_band_in_rows;
+    band_ale["estimator_band_out_rows"] =
+        numerics.ale.band_ale.estimator_band_out_rows;
+    band_ale["estimator_band_eta_on"] =
+        numerics.ale.band_ale.estimator_band_eta_on;
+    band_ale["estimator_band_eta_off"] =
+        numerics.ale.band_ale.estimator_band_eta_off;
+    band_ale["estimator_band_per_column"] =
+        numerics.ale.band_ale.estimator_band_per_column;
+    band_ale["estimator_band_pc_filter_halfwidth"] =
+        numerics.ale.band_ale.estimator_band_pc_filter_halfwidth;
+    band_ale["estimator_band_pc_slope_limit"] =
+        numerics.ale.band_ale.estimator_band_pc_slope_limit;
+    band_ale["estimator_band_pc_slope_reject"] =
+        numerics.ale.band_ale.estimator_band_pc_slope_reject;
+    band_ale["estimator_band_pc_curvature_limit"] =
+        numerics.ale.band_ale.estimator_band_pc_curvature_limit;
+    band_ale["estimator_band_pc_chi_max"] =
+        numerics.ale.band_ale.estimator_band_pc_chi_max;
+    band_ale["estimator_band_pc_chi_step"] =
+        numerics.ale.band_ale.estimator_band_pc_chi_step;
+    band_ale["estimator_band_pc_sigma_floor"] =
+        numerics.ale.band_ale.estimator_band_pc_sigma_floor;
+    band_ale["estimator_band_pc_coverage_full"] =
+        numerics.ale.band_ale.estimator_band_pc_coverage_full;
+    band_ale["estimator_band_pc_coverage_min"] =
+        numerics.ale.band_ale.estimator_band_pc_coverage_min;
+    band_ale["estimator_band_pc_cooldown_events"] =
+        numerics.ale.band_ale.estimator_band_pc_cooldown_events;
+    band_ale["estimator_band_pc_phase_b"] =
+        numerics.ale.band_ale.estimator_band_pc_phase_b;
+    band_ale["estimator_band_pc_tube_dilate_rows"] =
+        numerics.ale.band_ale.estimator_band_pc_tube_dilate_rows;
+    band_ale["estimator_band_pc_tube_dilate_cols_extra"] =
+        numerics.ale.band_ale.estimator_band_pc_tube_dilate_cols_extra;
+    band_ale["estimator_band_pc_ambiguous_hold_fraction"] =
+        numerics.ale.band_ale.estimator_band_pc_ambiguous_hold_fraction;
+    band_ale["closure_catchment_enabled"] =
+        numerics.ale.band_ale.closure_catchment_enabled;
+    band_ale["closure_catchment_forced_active"] =
+        numerics.ale.band_ale.closure_catchment_forced_active;
+    band_ale["closure_catchment_s_catch_cm"] =
+        numerics.ale.band_ale.closure_catchment_s_catch_cm;
+    band_ale["closure_catchment_s_protect_cm"] =
+        numerics.ale.band_ale.closure_catchment_s_protect_cm;
+    band_ale["closure_catchment_spacing_floor_cm"] =
+        numerics.ale.band_ale.closure_catchment_spacing_floor_cm;
+    band_ale["closure_catchment_ratio_max"] =
+        numerics.ale.band_ale.closure_catchment_ratio_max;
+    band_ale["closure_catchment_nu_max"] =
+        numerics.ale.band_ale.closure_catchment_nu_max;
+    band_ale["closure_catchment_max_bites"] =
+        numerics.ale.band_ale.closure_catchment_max_bites;
+    band_ale["closure_catchment_shock_hold"] =
+        numerics.ale.band_ale.closure_catchment_shock_hold;
+    band_ale["closure_catchment_eta_h_arm"] =
+        numerics.ale.band_ale.closure_catchment_eta_h_arm;
+    band_ale["closure_catchment_eta_h_full"] =
+        numerics.ale.band_ale.closure_catchment_eta_h_full;
+    band_ale["closure_catchment_eta_m_arm"] =
+        numerics.ale.band_ale.closure_catchment_eta_m_arm;
+    band_ale["closure_catchment_eta_m_full"] =
+        numerics.ale.band_ale.closure_catchment_eta_m_full;
+    band_ale["closure_catchment_reset_eta"] =
+        numerics.ale.band_ale.closure_catchment_reset_eta;
+    band_ale["closure_catchment_support_core_rows"] =
+        numerics.ale.band_ale.closure_catchment_support_core_rows;
+    band_ale["closure_catchment_support_taper_rows"] =
+        numerics.ale.band_ale.closure_catchment_support_taper_rows;
+    band_ale["closure_catchment_accum_frac"] =
+        numerics.ale.band_ale.closure_catchment_accum_frac;
+    band_ale["closure_catchment_rearm_drop"] =
+        numerics.ale.band_ale.closure_catchment_rearm_drop;
+    band_ale["pole_theta_enabled"] =
+        numerics.ale.band_ale.pole_theta_enabled;
+    band_ale["pole_theta_routine_enabled"] =
+        numerics.ale.band_ale.pole_theta_routine_enabled;
+    band_ale["pole_theta_phys_lp"] =
+        numerics.ale.band_ale.pole_theta_phys_lp;
+    band_ale["pole_theta_phys_lc"] =
+        numerics.ale.band_ale.pole_theta_phys_lc;
+    band_ale["pole_theta_noise_floor"] =
+        numerics.ale.band_ale.pole_theta_noise_floor;
+    band_ale["pole_theta_noise_ceiling"] =
+        numerics.ale.band_ale.pole_theta_noise_ceiling;
+    band_ale["pole_theta_h_arm"] = numerics.ale.band_ale.pole_theta_h_arm;
+    band_ale["pole_theta_h_fire"] = numerics.ale.band_ale.pole_theta_h_fire;
+    band_ale["pole_theta_h_hard"] = numerics.ale.band_ale.pole_theta_h_hard;
+    band_ale["pole_theta_h_release"] =
+        numerics.ale.band_ale.pole_theta_h_release;
+    band_ale["pole_theta_kappa_arm"] =
+        numerics.ale.band_ale.pole_theta_kappa_arm;
+    band_ale["pole_theta_kappa_fire"] =
+        numerics.ale.band_ale.pole_theta_kappa_fire;
+    band_ale["pole_theta_kappa_hard"] =
+        numerics.ale.band_ale.pole_theta_kappa_hard;
+    band_ale["pole_theta_alpha"] = numerics.ale.band_ale.pole_theta_alpha;
+    band_ale["pole_theta_alpha_hard"] =
+        numerics.ale.band_ale.pole_theta_alpha_hard;
+    band_ale["pole_theta_deadband_frac"] =
+        numerics.ale.band_ale.pole_theta_deadband_frac;
+    band_ale["pole_theta_move_limit_frac"] =
+        numerics.ale.band_ale.pole_theta_move_limit_frac;
+    band_ale["pole_theta_move_limit_hard_frac"] =
+        numerics.ale.band_ale.pole_theta_move_limit_hard_frac;
+    band_ale["pole_theta_cooldown_s"] =
+        numerics.ale.band_ale.pole_theta_cooldown_s;
+    band_ale["pole_theta_cooldown_base_s"] =
+        numerics.ale.band_ale.pole_theta_cooldown_base_s;
+    band_ale["pole_theta_predict_window_s"] =
+        numerics.ale.band_ale.pole_theta_predict_window_s;
+    band_ale["pole_theta_predict_horizon_s"] =
+        numerics.ale.band_ale.pole_theta_predict_horizon_s;
+    band_ale["pole_theta_halo_columns"] =
+        numerics.ale.band_ale.pole_theta_halo_columns;
+    band_ale["pole_theta_halo_rows"] =
+        numerics.ale.band_ale.pole_theta_halo_rows;
+    band_ale["pole_theta_post_h_floor"] =
+        numerics.ale.band_ale.pole_theta_post_h_floor;
+    band_ale["pole_theta_curve_preserving"] =
+        numerics.ale.band_ale.pole_theta_curve_preserving;
+    band_ale["pole_theta_protected_modes"] =
+        numerics.ale.band_ale.pole_theta_protected_modes;
+    band_ale["pole_theta_fit_order"] =
+        numerics.ale.band_ale.pole_theta_fit_order;
+    band_ale["pole_theta_shock_hold"] =
+        numerics.ale.band_ale.pole_theta_shock_hold;
+    band_ale["shell_window_in_rows"] =
+        numerics.ale.band_ale.shell_window_in_rows;
+    band_ale["shell_window_out_rows"] =
+        numerics.ale.band_ale.shell_window_out_rows;
+    band_ale["shell_boundary_guard_rows"] =
+        numerics.ale.band_ale.shell_boundary_guard_rows;
+    band_ale["shell_min_spacing_frac"] =
+        numerics.ale.band_ale.shell_min_spacing_frac;
+    band_ale["shell_front_metric"] =
+        numerics.ale.band_ale.shell_front_metric;
+    band_ale["shell_target"] = numerics.ale.band_ale.shell_target;
+    band_ale["axis_repair_enabled"] =
+        numerics.ale.band_ale.axis_repair_enabled;
+    band_ale["axis_repair_eta_on"] =
+        numerics.ale.band_ale.axis_repair_eta_on;
+    band_ale["axis_repair_eta_off"] =
+        numerics.ale.band_ale.axis_repair_eta_off;
+    band_ale["axis_repair_cap_rel"] =
+        numerics.ale.band_ale.axis_repair_cap_rel;
+    ale["band_ale"] = std::move(band_ale);
+  }
+  py::dict evacuated_cell;
+  evacuated_cell["enabled"] = numerics.ale.evacuated_cell.enabled;
+  evacuated_cell["every_n_steps"] =
+      numerics.ale.evacuated_cell.every_n_steps;
+  evacuated_cell["arm_mass_fraction"] =
+      numerics.ale.evacuated_cell.arm_mass_fraction;
+  evacuated_cell["off_mass_fraction"] =
+      numerics.ale.evacuated_cell.off_mass_fraction;
+  evacuated_cell["rho_vacuum_policy_g_per_cc"] =
+      numerics.ale.evacuated_cell.rho_vacuum_policy_g_per_cc;
+  evacuated_cell["off_hold_evaluations"] =
+      numerics.ale.evacuated_cell.off_hold_evaluations;
+  evacuated_cell["laser_ne_over_ncrit_max"] =
+      numerics.ale.evacuated_cell.laser_ne_over_ncrit_max;
+  evacuated_cell["laser_wavelength_nm"] =
+      numerics.ale.evacuated_cell.laser_wavelength_nm;
+  evacuated_cell["coupling_fraction_max"] =
+      numerics.ale.evacuated_cell.coupling_fraction_max;
+  evacuated_cell["max_cells_per_event"] =
+      numerics.ale.evacuated_cell.max_cells_per_event;
+  evacuated_cell["rematerialize_enabled"] =
+      numerics.ale.evacuated_cell.rematerialize_enabled;
+  evacuated_cell["rematerialize_after_evaluations"] =
+      numerics.ale.evacuated_cell.rematerialize_after_evaluations;
+  evacuated_cell["rematerialize_volume_fraction"] =
+      numerics.ale.evacuated_cell.rematerialize_volume_fraction;
+  evacuated_cell["rematerialize_neighbor_change_max"] =
+      numerics.ale.evacuated_cell.rematerialize_neighbor_change_max;
+  evacuated_cell["rematerialize_dwell_evaluations"] =
+      numerics.ale.evacuated_cell.rematerialize_dwell_evaluations;
+  py::dict closure_contact;
+  closure_contact["enabled"] =
+      numerics.ale.evacuated_cell.closure_contact.enabled;
+  closure_contact["gap_floor_fraction"] =
+      numerics.ale.evacuated_cell.closure_contact.gap_floor_fraction;
+  closure_contact["gap_arm_fraction"] =
+      numerics.ale.evacuated_cell.closure_contact.gap_arm_fraction;
+  closure_contact["live_mass_gate"] =
+      numerics.ale.evacuated_cell.closure_contact.live_mass_gate;
+  closure_contact["live_volume_gate"] =
+      numerics.ale.evacuated_cell.closure_contact.live_volume_gate;
+  closure_contact["refill_min_mass_fraction"] =
+      numerics.ale.evacuated_cell.closure_contact.refill_min_mass_fraction;
+  closure_contact["refill_min_density_ratio"] =
+      numerics.ale.evacuated_cell.closure_contact.refill_min_density_ratio;
+  closure_contact["release_force_c"] =
+      numerics.ale.evacuated_cell.closure_contact.release_force_c;
+  closure_contact["release_persistence_stages"] =
+      numerics.ale.evacuated_cell.closure_contact.release_persistence_stages;
+  closure_contact["reengage_gap_margin"] =
+      numerics.ale.evacuated_cell.closure_contact.reengage_gap_margin;
+  closure_contact["mortar_position_drift_beta"] = numerics.ale.evacuated_cell
+                                                       .closure_contact
+                                                       .mortar_position_drift_beta;
+  closure_contact["surface_engage_enabled"] =
+      numerics.ale.evacuated_cell.closure_contact.surface_engage_enabled;
+  closure_contact["lcp_apply_enabled"] =
+      numerics.ale.evacuated_cell.closure_contact.lcp_apply_enabled;
+  py::dict axis_edge_collapse;
+  axis_edge_collapse["enabled"] =
+      numerics.ale.evacuated_cell.closure_contact.axis_edge_collapse.enabled;
+  axis_edge_collapse["ulp_count"] =
+      numerics.ale.evacuated_cell.closure_contact.axis_edge_collapse.ulp_count;
+  axis_edge_collapse["h_ref_fraction"] = numerics.ale.evacuated_cell
+                                               .closure_contact
+                                               .axis_edge_collapse
+                                               .h_ref_fraction;
+  axis_edge_collapse["release_hysteresis"] = numerics.ale.evacuated_cell
+                                                  .closure_contact
+                                                  .axis_edge_collapse
+                                                  .release_hysteresis;
+  axis_edge_collapse["persistence_window"] = numerics.ale.evacuated_cell
+                                                  .closure_contact
+                                                  .axis_edge_collapse
+                                                  .persistence_window;
+  axis_edge_collapse["persistence_min_closing"] =
+      numerics.ale.evacuated_cell.closure_contact.axis_edge_collapse
+          .persistence_min_closing;
+  axis_edge_collapse["repair_recurrence_steps"] =
+      numerics.ale.evacuated_cell.closure_contact.axis_edge_collapse
+          .repair_recurrence_steps;
+  axis_edge_collapse["repair_futility_fraction"] =
+      numerics.ale.evacuated_cell.closure_contact.axis_edge_collapse
+          .repair_futility_fraction;
+  closure_contact["axis_edge_collapse"] = axis_edge_collapse;
+  py::dict flank_tangential_strip;
+  flank_tangential_strip["enabled"] = numerics.ale.evacuated_cell
+                                            .closure_contact
+                                            .flank_tangential_strip
+                                            .enabled;
+  flank_tangential_strip["untangler_enabled"] =
+      numerics.ale.evacuated_cell.closure_contact.flank_tangential_strip
+          .untangler_enabled;
+  flank_tangential_strip["band_layers"] = numerics.ale.evacuated_cell
+                                                .closure_contact
+                                                .flank_tangential_strip
+                                                .band_layers;
+  flank_tangential_strip["band_halfwidth_j"] =
+      numerics.ale.evacuated_cell.closure_contact.flank_tangential_strip
+          .band_halfwidth_j;
+  flank_tangential_strip["arm_quality_ratio"] =
+      numerics.ale.evacuated_cell.closure_contact.flank_tangential_strip
+          .arm_quality_ratio;
+  flank_tangential_strip["release_quality_ratio"] =
+      numerics.ale.evacuated_cell.closure_contact.flank_tangential_strip
+          .release_quality_ratio;
+  flank_tangential_strip["min_progress_factor"] =
+      numerics.ale.evacuated_cell.closure_contact.flank_tangential_strip
+          .min_progress_factor;
+  flank_tangential_strip["lead_steps"] = numerics.ale.evacuated_cell
+                                               .closure_contact
+                                               .flank_tangential_strip
+                                               .lead_steps;
+  flank_tangential_strip["release_persistence_steps"] =
+      numerics.ale.evacuated_cell.closure_contact.flank_tangential_strip
+          .release_persistence_steps;
+  flank_tangential_strip["release_shear_number"] =
+      numerics.ale.evacuated_cell.closure_contact.flank_tangential_strip
+          .release_shear_number;
+  flank_tangential_strip["slip_handoff_ratio"] =
+      numerics.ale.evacuated_cell.closure_contact.flank_tangential_strip
+          .slip_handoff_ratio;
+  flank_tangential_strip["slip_patch_enabled"] =
+      numerics.ale.evacuated_cell.closure_contact.flank_tangential_strip
+          .slip_patch_enabled;
+  closure_contact["flank_tangential_strip"] = flank_tangential_strip;
+  closure_contact["seam_interface_owner_enabled"] =
+      numerics.ale.evacuated_cell.closure_contact
+          .seam_interface_owner_enabled;
+  evacuated_cell["closure_contact"] = std::move(closure_contact);
+  ale["evacuated_cell"] = std::move(evacuated_cell);
   ale["rezone_local_admissibility_linesearch"] =
       numerics.ale.rezone_local_admissibility_linesearch;
   ale["rezone_local_j_floor_rel"] =
@@ -1815,6 +2576,11 @@ py::dict serialize_numerics(const Config::NumericsConfig& numerics) {
     ale["central_pseudo_core_s_c"] =
         numerics.ale.central_pseudo_core_s_c;
   }
+  if (numerics.ale.central_pseudo_core_activation_time_s !=
+      ale_defaults.central_pseudo_core_activation_time_s) {
+    ale["central_pseudo_core_activation_time_s"] =
+        numerics.ale.central_pseudo_core_activation_time_s;
+  }
   if (numerics.ale.central_pseudo_core_ring_absorption_enabled ||
       numerics.ale.central_pseudo_core_ring_absorption_tau !=
           ale_defaults.central_pseudo_core_ring_absorption_tau ||
@@ -1884,11 +2650,6 @@ py::dict serialize_numerics(const Config::NumericsConfig& numerics) {
       numerics.ale.central_pseudo_core_mixed_absorb_enabled ||
       numerics.ale.central_pseudo_core_absorb_watch_rows !=
           ale_defaults.central_pseudo_core_absorb_watch_rows ||
-      numerics.ale.central_pseudo_core_terminal_absorb_enabled ||
-      numerics.ale.central_pseudo_core_terminal_rebound_factor !=
-          ale_defaults.central_pseudo_core_terminal_rebound_factor ||
-      numerics.ale.central_pseudo_core_terminal_tail_dt_s !=
-          ale_defaults.central_pseudo_core_terminal_tail_dt_s ||
       numerics.ale.remap_mass_closure_reject_tol !=
           ale_defaults.remap_mass_closure_reject_tol ||
       numerics.ale.rezone_closure_cooldown_steps !=
@@ -1903,12 +2664,6 @@ py::dict serialize_numerics(const Config::NumericsConfig& numerics) {
         numerics.ale.central_pseudo_core_mixed_absorb_enabled;
     ale["central_pseudo_core_absorb_watch_rows"] =
         numerics.ale.central_pseudo_core_absorb_watch_rows;
-    ale["central_pseudo_core_terminal_absorb_enabled"] =
-        numerics.ale.central_pseudo_core_terminal_absorb_enabled;
-    ale["central_pseudo_core_terminal_rebound_factor"] =
-        numerics.ale.central_pseudo_core_terminal_rebound_factor;
-    ale["central_pseudo_core_terminal_tail_dt_s"] =
-        numerics.ale.central_pseudo_core_terminal_tail_dt_s;
     ale["remap_mass_closure_reject_tol"] =
         numerics.ale.remap_mass_closure_reject_tol;
     ale["rezone_closure_cooldown_steps"] =
@@ -2255,10 +3010,77 @@ py::dict serialize_numerics(const Config::NumericsConfig& numerics) {
   py::dict conservation;
   conservation["enabled"] = numerics.diagnostics.conservation.enabled;
   diagnostics["conservation"] = conservation;
+  py::dict refinement_estimator;
+  refinement_estimator["enabled"] =
+      numerics.diagnostics.refinement_estimator.enabled;
+  refinement_estimator["every"] =
+      numerics.diagnostics.refinement_estimator.every;
+  refinement_estimator["filter_eps"] =
+      numerics.diagnostics.refinement_estimator.filter_eps;
+  refinement_estimator["detect_cutoff"] =
+      numerics.diagnostics.refinement_estimator.detect_cutoff;
+  diagnostics["refinement_estimator"] = refinement_estimator;
+  py::dict refinement_autopilot;
+  refinement_autopilot["enabled"] =
+      numerics.diagnostics.refinement_autopilot.enabled;
+  refinement_autopilot["mode"] =
+      numerics.diagnostics.refinement_autopilot.mode;
+  refinement_autopilot["ckpt_lead_h"] =
+      numerics.diagnostics.refinement_autopilot.ckpt_lead_h;
+  refinement_autopilot["e_on"] =
+      numerics.diagnostics.refinement_autopilot.e_on;
+  refinement_autopilot["e_off"] =
+      numerics.diagnostics.refinement_autopilot.e_off;
+  refinement_autopilot["assoc_cut"] =
+      numerics.diagnostics.refinement_autopilot.assoc_cut;
+  refinement_autopilot["strong_cut"] =
+      numerics.diagnostics.refinement_autopilot.strong_cut;
+  refinement_autopilot["gap_bridge"] =
+      numerics.diagnostics.refinement_autopilot.gap_bridge;
+  refinement_autopilot["persist"] =
+      numerics.diagnostics.refinement_autopilot.persist;
+  refinement_autopilot["n_q_plan"] =
+      numerics.diagnostics.refinement_autopilot.n_q_plan;
+  refinement_autopilot["chi_design"] =
+      numerics.diagnostics.refinement_autopilot.chi_design;
+  refinement_autopilot["s_rep_cm"] =
+      numerics.diagnostics.refinement_autopilot.s_rep_cm;
+  refinement_autopilot["handoff_cm"] =
+      numerics.diagnostics.refinement_autopilot.handoff_cm;
+  refinement_autopilot["window_lo_h"] =
+      numerics.diagnostics.refinement_autopilot.window_lo_h;
+  refinement_autopilot["window_hi_h"] =
+      numerics.diagnostics.refinement_autopilot.window_hi_h;
+  refinement_autopilot["history"] =
+      numerics.diagnostics.refinement_autopilot.history;
+  refinement_autopilot["cov_min"] =
+      numerics.diagnostics.refinement_autopilot.cov_min;
+  diagnostics["refinement_autopilot"] = refinement_autopilot;
+  py::dict evacuated_cell_shadow;
+  evacuated_cell_shadow["enabled"] =
+      numerics.diagnostics.evacuated_cell_shadow.enabled;
+  evacuated_cell_shadow["every_n_steps"] =
+      numerics.diagnostics.evacuated_cell_shadow.every_n_steps;
+  evacuated_cell_shadow["arm_mass_fraction"] =
+      numerics.diagnostics.evacuated_cell_shadow.arm_mass_fraction;
+  evacuated_cell_shadow["off_mass_fraction"] =
+      numerics.diagnostics.evacuated_cell_shadow.off_mass_fraction;
+  evacuated_cell_shadow["rho_vacuum_policy_g_per_cc"] =
+      numerics.diagnostics.evacuated_cell_shadow.rho_vacuum_policy_g_per_cc;
+  evacuated_cell_shadow["laser_wavelength_nm"] =
+      numerics.diagnostics.evacuated_cell_shadow.laser_wavelength_nm;
+  evacuated_cell_shadow["laser_ne_over_ncrit_max"] =
+      numerics.diagnostics.evacuated_cell_shadow.laser_ne_over_ncrit_max;
+  diagnostics["evacuated_cell_shadow"] = evacuated_cell_shadow;
   py::dict ale_provenance_emission;
   ale_provenance_emission["enabled"] =
       numerics.diagnostics.ale_provenance_emission.enabled;
   diagnostics["ale_provenance_emission"] = ale_provenance_emission;
+  py::dict conduction_energy_rate_export;
+  conduction_energy_rate_export["enabled"] =
+      numerics.diagnostics.conduction_energy_rate_export.enabled;
+  diagnostics["conduction_energy_rate_export"] =
+      conduction_energy_rate_export;
   if (numerics.diagnostics.ale_velcoherence.enabled ||
       numerics.diagnostics.ale_velcoherence.every_n_steps != 1) {
     py::dict ale_velcoherence;
@@ -2283,6 +3105,14 @@ py::dict serialize_numerics(const Config::NumericsConfig& numerics) {
       numerics.diagnostics.shock_approach.bins;
   shock_approach["h_cell_cm"] =
       numerics.diagnostics.shock_approach.h_cell_cm;
+  shock_approach["sectors"] =
+      numerics.diagnostics.shock_approach.sectors;
+  shock_approach["modal_l_max"] =
+      numerics.diagnostics.shock_approach.modal_l_max;
+  shock_approach["sector_confidence_nu"] =
+      numerics.diagnostics.shock_approach.sector_confidence_nu;
+  shock_approach["sector_guard_crossings"] =
+      numerics.diagnostics.shock_approach.sector_guard_crossings;
   diagnostics["shock_approach"] = shock_approach;
   py::dict production_audit;
   production_audit["enabled"] =
@@ -2422,6 +3252,7 @@ py::dict serialize_numerics(const Config::NumericsConfig& numerics) {
   out["radiation_thermal_subcycle"] = numerics.radiation_thermal_subcycle;
   out["has_physical_rz_axis"] = numerics.has_physical_rz_axis;
   out["persistent_loop"] = persistent_loop;
+  out["z_reflection"] = z_reflection;
   out["dt"] = dt;
   out["hydro"] = hydro;
   out["conduction"] = conduction;
@@ -2447,6 +3278,7 @@ py::dict serialize_output(const Config::OutputConfig& output) {
   out["history_every"] = output.history_every;
   out["checkpoint_every"] = output.checkpoint_every;
   out["plot_every_s"] = output.plot_every_s;
+  out["write_final_snapshot"] = output.write_final_snapshot;
   out["history_every_s"] = output.history_every_s;
   out["checkpoint_every_s"] = output.checkpoint_every_s;
   out["checkpoint_keep_last"] = output.checkpoint_keep_last;
@@ -2856,10 +3688,49 @@ void apply_legacy_mesh_defaults(py::dict& root) {
                          py::str(multiblock_transition_scheme_to_string(
                              defaults.multiblock_transition_scheme)));
   set_default_if_missing(mesh, "multiblock_cap_p", py::cast(defaults.multiblock_cap_p));
+  set_default_if_missing(mesh, "multiblock_theta_cap_widen_factor",
+                         py::cast(defaults.multiblock_theta_cap_widen_factor));
   set_default_if_missing(mesh, "multiblock_bridge_elliptic_sweeps",
                          py::cast(defaults.multiblock_bridge_elliptic_sweeps));
   set_default_if_missing(mesh, "multiblock_bridge_elliptic_omega",
                          py::cast(defaults.multiblock_bridge_elliptic_omega));
+  set_default_if_missing(mesh, "polar_tier_chi_lo",
+                         py::cast(defaults.polar_tier_chi_lo));
+  set_default_if_missing(mesh, "polar_tier_chi_hi",
+                         py::cast(defaults.polar_tier_chi_hi));
+  set_default_if_missing(
+      mesh, "polar_tier_belt_thickness_frac",
+      py::cast(defaults.polar_tier_belt_thickness_frac));
+  set_default_if_missing(mesh, "polar_tier_belt_rows",
+                         py::cast(defaults.polar_tier_belt_rows));
+  set_default_if_missing(mesh, "polar_tier_pole_cap_m",
+                         py::cast(defaults.polar_tier_pole_cap_m));
+  set_default_if_missing(mesh, "polar_tier_pole_cap_alpha",
+                         py::cast(defaults.polar_tier_pole_cap_alpha));
+  set_default_if_missing(mesh, "polar_tier_dendrite_enabled",
+                         py::cast(defaults.polar_tier_dendrite_enabled));
+  set_default_if_missing(mesh, "polar_tier_native_pentagon",
+                         py::cast(defaults.polar_tier_native_pentagon));
+  set_default_if_missing(mesh, "shell_polar_cap_dendrite",
+                         py::cast(defaults.shell_polar_cap_dendrite));
+  set_default_if_missing(mesh, "shell_cap_rows_2x",
+                         py::cast(defaults.shell_cap_rows_2x));
+  set_default_if_missing(
+      mesh, "polar_tier_dendrite_s_theta_rows_below",
+      py::cast(defaults.polar_tier_dendrite_s_theta_rows_below));
+  set_default_if_missing(mesh, "polar_tier_fan_sectors",
+                         py::cast(defaults.polar_tier_fan_sectors));
+  set_default_if_missing(mesh, "polar_tier_min_tier_columns",
+                         py::cast(defaults.polar_tier_min_tier_columns));
+  set_default_if_missing(
+      mesh, "polar_tier_fan_first_ring_radius_cm",
+      py::cast(defaults.polar_tier_fan_first_ring_radius_cm));
+  set_default_if_missing(mesh, "polar_tier_cart_cut_ring",
+                         py::cast(defaults.polar_tier_cart_cut_ring));
+  set_default_if_missing(mesh, "polar_tier_center_kind",
+                         py::cast(defaults.polar_tier_center_kind));
+  set_default_if_missing(mesh, "polar_tier_hydro_enabled",
+                         py::cast(defaults.polar_tier_hydro_enabled));
   set_default_if_missing(
       mesh, "multiblock_outer_svec_tangent_balance",
       py::cast(defaults.multiblock_outer_svec_tangent_balance));
@@ -2871,10 +3742,18 @@ void normalize_mesh_default_elision(py::dict& root) {
     return;
   }
   const Config::MeshConfig defaults;
+  const bool polar_tier =
+      dict_contains(mesh, "topology_scheme") &&
+      (mesh[py::str("topology_scheme")].cast<std::string>() ==
+           "multiblock_polar_tier" ||
+       mesh[py::str("topology_scheme")].cast<std::string>() ==
+           "multiblock_polar_tier_cart_center");
   pop_if_equal(mesh, "multiblock_transition_scheme",
                py::str(multiblock_transition_scheme_to_string(
                    defaults.multiblock_transition_scheme)));
   pop_if_equal(mesh, "multiblock_cap_p", py::cast(defaults.multiblock_cap_p));
+  pop_if_equal(mesh, "multiblock_theta_cap_widen_factor",
+               py::cast(defaults.multiblock_theta_cap_widen_factor));
   pop_if_equal(mesh, "multiblock_bridge_elliptic_sweeps",
                py::cast(defaults.multiblock_bridge_elliptic_sweeps));
   pop_if_equal(mesh, "multiblock_bridge_elliptic_omega",
@@ -2890,6 +3769,45 @@ void normalize_mesh_default_elision(py::dict& root) {
   }
   pop_if_equal(mesh, "multiblock_outer_svec_tangent_balance",
                py::cast(defaults.multiblock_outer_svec_tangent_balance));
+  pop_if_equal(mesh, "polar_tier_dendrite_enabled",
+               py::cast(defaults.polar_tier_dendrite_enabled));
+  pop_if_equal(mesh, "polar_tier_native_pentagon",
+               py::cast(defaults.polar_tier_native_pentagon));
+  pop_if_equal(mesh, "polar_tier_cart_cut_ring",
+               py::cast(defaults.polar_tier_cart_cut_ring));
+  pop_if_equal(mesh, "polar_tier_center_kind",
+               py::cast(defaults.polar_tier_center_kind));
+  pop_if_equal(mesh, "shell_polar_cap_dendrite",
+               py::cast(defaults.shell_polar_cap_dendrite));
+  pop_if_equal(mesh, "shell_cap_rows_2x",
+               py::cast(defaults.shell_cap_rows_2x));
+  pop_if_equal(
+      mesh, "polar_tier_dendrite_s_theta_rows_below",
+      py::cast(defaults.polar_tier_dendrite_s_theta_rows_below));
+  if (!polar_tier) {
+    pop_if_equal(mesh, "polar_tier_chi_lo",
+                 py::cast(defaults.polar_tier_chi_lo));
+    pop_if_equal(mesh, "polar_tier_chi_hi",
+                 py::cast(defaults.polar_tier_chi_hi));
+    pop_if_equal(
+        mesh, "polar_tier_belt_thickness_frac",
+        py::cast(defaults.polar_tier_belt_thickness_frac));
+    pop_if_equal(mesh, "polar_tier_belt_rows",
+                 py::cast(defaults.polar_tier_belt_rows));
+    pop_if_equal(mesh, "polar_tier_pole_cap_m",
+                 py::cast(defaults.polar_tier_pole_cap_m));
+    pop_if_equal(mesh, "polar_tier_pole_cap_alpha",
+                 py::cast(defaults.polar_tier_pole_cap_alpha));
+    pop_if_equal(mesh, "polar_tier_fan_sectors",
+                 py::cast(defaults.polar_tier_fan_sectors));
+    pop_if_equal(mesh, "polar_tier_min_tier_columns",
+                 py::cast(defaults.polar_tier_min_tier_columns));
+    pop_if_equal(
+        mesh, "polar_tier_fan_first_ring_radius_cm",
+        py::cast(defaults.polar_tier_fan_first_ring_radius_cm));
+    pop_if_equal(mesh, "polar_tier_hydro_enabled",
+                 py::cast(defaults.polar_tier_hydro_enabled));
+  }
 }
 
 void apply_legacy_laser_defaults(py::dict& root) {
@@ -3491,6 +4409,18 @@ void apply_legacy_numerics_defaults(py::dict& root) {
     const Config::NumericsConfig::DtConfig dt_defaults;
     set_default_if_missing(
         dt,
+        "cfl_length_2d",
+        py::str(dt_defaults.cfl_length_2d));
+    set_default_if_missing(
+        dt,
+        "edge_accel_displacement_cfl_enabled",
+        py::cast(dt_defaults.edge_accel_displacement_cfl_enabled));
+    set_default_if_missing(
+        dt,
+        "min_consecutive_steps",
+        py::cast(dt_defaults.min_consecutive_steps));
+    set_default_if_missing(
+        dt,
         "floor_stall_max_consecutive_steps",
         py::cast(dt_defaults.floor_stall_max_consecutive_steps));
   }
@@ -3513,6 +4443,20 @@ void apply_legacy_numerics_defaults(py::dict& root) {
         py::cast(persistent_loop_defaults.chunk_steps));
   }
 
+  py::dict z_reflection;
+  if (!dict_contains(numerics, "z_reflection")) {
+    z_reflection = py::dict();
+    numerics[py::str("z_reflection")] = z_reflection;
+  } else if (try_get_child_dict(numerics, "z_reflection", &z_reflection)) {
+    // Existing dict is updated below.
+  }
+  if (py::isinstance<py::dict>(numerics[py::str("z_reflection")])) {
+    z_reflection = numerics[py::str("z_reflection")].cast<py::dict>();
+    const Config::NumericsConfig::ZReflectionConfig z_reflection_defaults;
+    set_default_if_missing(
+        z_reflection, "mode", py::cast(z_reflection_defaults.mode));
+  }
+
   py::dict ale;
   if (!dict_contains(numerics, "ale")) {
     ale = py::dict();
@@ -3523,6 +4467,360 @@ void apply_legacy_numerics_defaults(py::dict& root) {
   if (py::isinstance<py::dict>(numerics[py::str("ale")])) {
     ale = numerics[py::str("ale")].cast<py::dict>();
     const Config::NumericsConfig::AleConfig ale_defaults;
+    py::dict evacuated_cell;
+    if (!dict_contains(ale, "evacuated_cell")) {
+      evacuated_cell = py::dict();
+      ale[py::str("evacuated_cell")] = evacuated_cell;
+    } else if (try_get_child_dict(ale, "evacuated_cell", &evacuated_cell)) {
+      // Existing dict is updated below.
+    }
+    if (py::isinstance<py::dict>(ale[py::str("evacuated_cell")])) {
+      evacuated_cell = ale[py::str("evacuated_cell")].cast<py::dict>();
+      const auto& defaults = ale_defaults.evacuated_cell;
+      set_default_if_missing(
+          evacuated_cell, "enabled", py::cast(defaults.enabled));
+      set_default_if_missing(evacuated_cell,
+                             "every_n_steps",
+                             py::cast(defaults.every_n_steps));
+      set_default_if_missing(evacuated_cell,
+                             "arm_mass_fraction",
+                             py::cast(defaults.arm_mass_fraction));
+      set_default_if_missing(evacuated_cell,
+                             "off_mass_fraction",
+                             py::cast(defaults.off_mass_fraction));
+      set_default_if_missing(evacuated_cell,
+                             "rho_vacuum_policy_g_per_cc",
+                             py::cast(defaults.rho_vacuum_policy_g_per_cc));
+      set_default_if_missing(evacuated_cell,
+                             "off_hold_evaluations",
+                             py::cast(defaults.off_hold_evaluations));
+      set_default_if_missing(evacuated_cell,
+                             "laser_ne_over_ncrit_max",
+                             py::cast(defaults.laser_ne_over_ncrit_max));
+      set_default_if_missing(evacuated_cell,
+                             "laser_wavelength_nm",
+                             py::cast(defaults.laser_wavelength_nm));
+      set_default_if_missing(evacuated_cell,
+                             "coupling_fraction_max",
+                             py::cast(defaults.coupling_fraction_max));
+      set_default_if_missing(evacuated_cell,
+                             "max_cells_per_event",
+                             py::cast(defaults.max_cells_per_event));
+      set_default_if_missing(evacuated_cell,
+                             "rematerialize_enabled",
+                             py::cast(defaults.rematerialize_enabled));
+      set_default_if_missing(
+          evacuated_cell,
+          "rematerialize_after_evaluations",
+          py::cast(defaults.rematerialize_after_evaluations));
+      set_default_if_missing(
+          evacuated_cell,
+          "rematerialize_volume_fraction",
+          py::cast(defaults.rematerialize_volume_fraction));
+      set_default_if_missing(
+          evacuated_cell,
+          "rematerialize_neighbor_change_max",
+          py::cast(defaults.rematerialize_neighbor_change_max));
+      set_default_if_missing(
+          evacuated_cell,
+          "rematerialize_dwell_evaluations",
+          py::cast(defaults.rematerialize_dwell_evaluations));
+      py::dict closure_contact;
+      if (!dict_contains(evacuated_cell, "closure_contact")) {
+        closure_contact = py::dict();
+        evacuated_cell[py::str("closure_contact")] = closure_contact;
+      } else if (try_get_child_dict(
+                     evacuated_cell, "closure_contact", &closure_contact)) {
+        // Existing dict is updated below.
+      }
+      if (py::isinstance<py::dict>(
+              evacuated_cell[py::str("closure_contact")])) {
+        closure_contact =
+            evacuated_cell[py::str("closure_contact")].cast<py::dict>();
+        const auto& closure_defaults = defaults.closure_contact;
+        set_default_if_missing(closure_contact,
+                               "enabled",
+                               py::cast(closure_defaults.enabled));
+        set_default_if_missing(
+            closure_contact,
+            "gap_floor_fraction",
+            py::cast(closure_defaults.gap_floor_fraction));
+        set_default_if_missing(closure_contact,
+                               "gap_arm_fraction",
+                               py::cast(closure_defaults.gap_arm_fraction));
+        set_default_if_missing(closure_contact,
+                               "live_mass_gate",
+                               py::cast(closure_defaults.live_mass_gate));
+        set_default_if_missing(closure_contact,
+                               "live_volume_gate",
+                               py::cast(closure_defaults.live_volume_gate));
+        set_default_if_missing(
+            closure_contact,
+            "refill_min_mass_fraction",
+            py::cast(closure_defaults.refill_min_mass_fraction));
+        set_default_if_missing(
+            closure_contact,
+            "refill_min_density_ratio",
+            py::cast(closure_defaults.refill_min_density_ratio));
+        set_default_if_missing(closure_contact,
+                               "release_force_c",
+                               py::cast(closure_defaults.release_force_c));
+        set_default_if_missing(
+            closure_contact,
+            "release_persistence_stages",
+            py::cast(closure_defaults.release_persistence_stages));
+        set_default_if_missing(
+            closure_contact,
+            "reengage_gap_margin",
+            py::cast(closure_defaults.reengage_gap_margin));
+        set_default_if_missing(
+            closure_contact,
+            "mortar_position_drift_beta",
+            py::cast(closure_defaults.mortar_position_drift_beta));
+        set_default_if_missing(
+            closure_contact,
+            "surface_engage_enabled",
+            py::cast(closure_defaults.surface_engage_enabled));
+        set_default_if_missing(
+            closure_contact,
+            "lcp_apply_enabled",
+            py::cast(closure_defaults.lcp_apply_enabled));
+      }
+    }
+    set_default_if_missing(
+        ale, "mesh_mode", py::cast(ale_defaults.mesh_mode));
+    set_default_if_missing(
+        ale, "reale_core", py::cast(ale_defaults.reale_core));
+    set_default_if_missing(
+        ale, "rezone_min_dt_s", py::cast(ale_defaults.rezone_min_dt_s));
+    set_default_if_missing(
+        ale, "tess_gpu_dual", py::cast(ale_defaults.tess_gpu_dual));
+    set_default_if_missing(
+        ale, "tess_gpu_restrict", py::cast(ale_defaults.tess_gpu_restrict));
+    set_default_if_missing(
+        ale, "dvclp_solver_rev", py::cast(ale_defaults.dvclp_solver_rev));
+    set_default_if_missing(
+        ale, "reale_lloyd_max", py::cast(ale_defaults.reale_lloyd_max));
+    set_default_if_missing(
+        ale, "reale_short_edge_collapse_rel",
+        py::cast(ale_defaults.reale_short_edge_collapse_rel));
+    set_default_if_missing(
+        ale, "reale_subdomain_rezone",
+        py::cast(ale_defaults.reale_subdomain_rezone));
+    set_default_if_missing(
+        ale, "reale_subdomain_frac_max",
+        py::cast(ale_defaults.reale_subdomain_frac_max));
+    set_default_if_missing(
+        ale, "reale_overlay_additivity_tol",
+        py::cast(ale_defaults.reale_overlay_additivity_tol));
+    set_default_if_missing(
+        ale, "reale_corner_mass_reset",
+        py::cast(ale_defaults.reale_corner_mass_reset));
+    set_default_if_missing(
+        ale, "reale_velocity_max_principle",
+        py::cast(ale_defaults.reale_velocity_max_principle));
+    set_default_if_missing(
+        ale, "reale_dt_trigger_factor",
+        py::cast(ale_defaults.reale_dt_trigger_factor));
+    set_default_if_missing(
+        ale, "reale_dt_trigger_cooldown",
+        py::cast(ale_defaults.reale_dt_trigger_cooldown));
+    py::dict band_ale;
+    if (try_get_child_dict(ale, "band_ale", &band_ale)) {
+      const auto& defaults = ale_defaults.band_ale;
+      set_default_if_missing(
+          band_ale, "respace_move_cap_frac",
+          py::cast(defaults.respace_move_cap_frac));
+      set_default_if_missing(
+          band_ale, "estimator_band_hold_mach",
+          py::cast(defaults.estimator_band_hold_mach));
+      set_default_if_missing(
+          band_ale, "estimator_band_per_column",
+          py::cast(defaults.estimator_band_per_column));
+      set_default_if_missing(
+          band_ale, "estimator_band_pc_filter_halfwidth",
+          py::cast(defaults.estimator_band_pc_filter_halfwidth));
+      set_default_if_missing(
+          band_ale, "estimator_band_pc_slope_limit",
+          py::cast(defaults.estimator_band_pc_slope_limit));
+      set_default_if_missing(
+          band_ale, "estimator_band_pc_slope_reject",
+          py::cast(defaults.estimator_band_pc_slope_reject));
+      set_default_if_missing(
+          band_ale, "estimator_band_pc_curvature_limit",
+          py::cast(defaults.estimator_band_pc_curvature_limit));
+      set_default_if_missing(
+          band_ale, "estimator_band_pc_chi_max",
+          py::cast(defaults.estimator_band_pc_chi_max));
+      set_default_if_missing(
+          band_ale, "estimator_band_pc_chi_step",
+          py::cast(defaults.estimator_band_pc_chi_step));
+      set_default_if_missing(
+          band_ale, "estimator_band_pc_sigma_floor",
+          py::cast(defaults.estimator_band_pc_sigma_floor));
+      set_default_if_missing(
+          band_ale, "estimator_band_pc_coverage_full",
+          py::cast(defaults.estimator_band_pc_coverage_full));
+      set_default_if_missing(
+          band_ale, "estimator_band_pc_coverage_min",
+          py::cast(defaults.estimator_band_pc_coverage_min));
+      set_default_if_missing(
+          band_ale, "estimator_band_pc_cooldown_events",
+          py::cast(defaults.estimator_band_pc_cooldown_events));
+      set_default_if_missing(
+          band_ale, "estimator_band_pc_phase_b",
+          py::cast(defaults.estimator_band_pc_phase_b));
+      set_default_if_missing(
+          band_ale, "estimator_band_pc_tube_dilate_rows",
+          py::cast(defaults.estimator_band_pc_tube_dilate_rows));
+      set_default_if_missing(
+          band_ale, "estimator_band_pc_tube_dilate_cols_extra",
+          py::cast(defaults.estimator_band_pc_tube_dilate_cols_extra));
+      set_default_if_missing(
+          band_ale, "estimator_band_pc_ambiguous_hold_fraction",
+          py::cast(defaults.estimator_band_pc_ambiguous_hold_fraction));
+      set_default_if_missing(
+          band_ale, "closure_catchment_enabled",
+          py::cast(defaults.closure_catchment_enabled));
+      set_default_if_missing(
+          band_ale, "closure_catchment_forced_active",
+          py::cast(defaults.closure_catchment_forced_active));
+      set_default_if_missing(
+          band_ale, "closure_catchment_s_catch_cm",
+          py::cast(defaults.closure_catchment_s_catch_cm));
+      set_default_if_missing(
+          band_ale, "closure_catchment_s_protect_cm",
+          py::cast(defaults.closure_catchment_s_protect_cm));
+      set_default_if_missing(
+          band_ale, "closure_catchment_spacing_floor_cm",
+          py::cast(defaults.closure_catchment_spacing_floor_cm));
+      set_default_if_missing(
+          band_ale, "closure_catchment_ratio_max",
+          py::cast(defaults.closure_catchment_ratio_max));
+      set_default_if_missing(
+          band_ale, "closure_catchment_nu_max",
+          py::cast(defaults.closure_catchment_nu_max));
+      set_default_if_missing(
+          band_ale, "closure_catchment_max_bites",
+          py::cast(defaults.closure_catchment_max_bites));
+      set_default_if_missing(
+          band_ale, "closure_catchment_shock_hold",
+          py::cast(defaults.closure_catchment_shock_hold));
+      set_default_if_missing(
+          band_ale, "closure_catchment_eta_h_arm",
+          py::cast(defaults.closure_catchment_eta_h_arm));
+      set_default_if_missing(
+          band_ale, "closure_catchment_eta_h_full",
+          py::cast(defaults.closure_catchment_eta_h_full));
+      set_default_if_missing(
+          band_ale, "closure_catchment_eta_m_arm",
+          py::cast(defaults.closure_catchment_eta_m_arm));
+      set_default_if_missing(
+          band_ale, "closure_catchment_eta_m_full",
+          py::cast(defaults.closure_catchment_eta_m_full));
+      set_default_if_missing(
+          band_ale, "closure_catchment_reset_eta",
+          py::cast(defaults.closure_catchment_reset_eta));
+      set_default_if_missing(
+          band_ale, "closure_catchment_support_core_rows",
+          py::cast(defaults.closure_catchment_support_core_rows));
+      set_default_if_missing(
+          band_ale, "closure_catchment_support_taper_rows",
+          py::cast(defaults.closure_catchment_support_taper_rows));
+      set_default_if_missing(
+          band_ale, "closure_catchment_accum_frac",
+          py::cast(defaults.closure_catchment_accum_frac));
+      set_default_if_missing(
+          band_ale, "closure_catchment_rearm_drop",
+          py::cast(defaults.closure_catchment_rearm_drop));
+      set_default_if_missing(
+          band_ale, "pole_theta_enabled",
+          py::cast(defaults.pole_theta_enabled));
+      set_default_if_missing(
+          band_ale, "pole_theta_routine_enabled",
+          py::cast(defaults.pole_theta_routine_enabled));
+      set_default_if_missing(
+          band_ale, "pole_theta_phys_lp",
+          py::cast(defaults.pole_theta_phys_lp));
+      set_default_if_missing(
+          band_ale, "pole_theta_phys_lc",
+          py::cast(defaults.pole_theta_phys_lc));
+      set_default_if_missing(
+          band_ale, "pole_theta_noise_floor",
+          py::cast(defaults.pole_theta_noise_floor));
+      set_default_if_missing(
+          band_ale, "pole_theta_noise_ceiling",
+          py::cast(defaults.pole_theta_noise_ceiling));
+      set_default_if_missing(
+          band_ale, "pole_theta_h_arm",
+          py::cast(defaults.pole_theta_h_arm));
+      set_default_if_missing(
+          band_ale, "pole_theta_h_fire",
+          py::cast(defaults.pole_theta_h_fire));
+      set_default_if_missing(
+          band_ale, "pole_theta_h_hard",
+          py::cast(defaults.pole_theta_h_hard));
+      set_default_if_missing(
+          band_ale, "pole_theta_h_release",
+          py::cast(defaults.pole_theta_h_release));
+      set_default_if_missing(
+          band_ale, "pole_theta_kappa_arm",
+          py::cast(defaults.pole_theta_kappa_arm));
+      set_default_if_missing(
+          band_ale, "pole_theta_kappa_fire",
+          py::cast(defaults.pole_theta_kappa_fire));
+      set_default_if_missing(
+          band_ale, "pole_theta_kappa_hard",
+          py::cast(defaults.pole_theta_kappa_hard));
+      set_default_if_missing(
+          band_ale, "pole_theta_alpha",
+          py::cast(defaults.pole_theta_alpha));
+      set_default_if_missing(
+          band_ale, "pole_theta_alpha_hard",
+          py::cast(defaults.pole_theta_alpha_hard));
+      set_default_if_missing(
+          band_ale, "pole_theta_deadband_frac",
+          py::cast(defaults.pole_theta_deadband_frac));
+      set_default_if_missing(
+          band_ale, "pole_theta_move_limit_frac",
+          py::cast(defaults.pole_theta_move_limit_frac));
+      set_default_if_missing(
+          band_ale, "pole_theta_move_limit_hard_frac",
+          py::cast(defaults.pole_theta_move_limit_hard_frac));
+      set_default_if_missing(
+          band_ale, "pole_theta_cooldown_s",
+          py::cast(defaults.pole_theta_cooldown_s));
+      set_default_if_missing(
+          band_ale, "pole_theta_cooldown_base_s",
+          py::cast(defaults.pole_theta_cooldown_base_s));
+      set_default_if_missing(
+          band_ale, "pole_theta_predict_window_s",
+          py::cast(defaults.pole_theta_predict_window_s));
+      set_default_if_missing(
+          band_ale, "pole_theta_predict_horizon_s",
+          py::cast(defaults.pole_theta_predict_horizon_s));
+      set_default_if_missing(
+          band_ale, "pole_theta_halo_columns",
+          py::cast(defaults.pole_theta_halo_columns));
+      set_default_if_missing(
+          band_ale, "pole_theta_halo_rows",
+          py::cast(defaults.pole_theta_halo_rows));
+      set_default_if_missing(
+          band_ale, "pole_theta_post_h_floor",
+          py::cast(defaults.pole_theta_post_h_floor));
+      set_default_if_missing(
+          band_ale, "pole_theta_curve_preserving",
+          py::cast(defaults.pole_theta_curve_preserving));
+      set_default_if_missing(
+          band_ale, "pole_theta_protected_modes",
+          py::cast(defaults.pole_theta_protected_modes));
+      set_default_if_missing(
+          band_ale, "pole_theta_fit_order",
+          py::cast(defaults.pole_theta_fit_order));
+      set_default_if_missing(
+          band_ale, "pole_theta_shock_hold",
+          py::cast(defaults.pole_theta_shock_hold));
+    }
     py::dict align_diagnostics;
     if (!dict_contains(ale, "align_diagnostics")) {
       align_diagnostics = py::dict();
@@ -3547,6 +4845,91 @@ void apply_legacy_numerics_defaults(py::dict& root) {
                              py::cast(defaults.w_p));
       set_default_if_missing(align_diagnostics, "floor_rel",
                              py::cast(defaults.floor_rel));
+    }
+    py::dict runtime_controller;
+    if (!dict_contains(ale, "runtime_controller")) {
+      runtime_controller = py::dict();
+      ale[py::str("runtime_controller")] = runtime_controller;
+    } else if (try_get_child_dict(
+                   ale, "runtime_controller", &runtime_controller)) {
+      // Existing dict is updated below.
+    }
+    if (py::isinstance<py::dict>(ale[py::str("runtime_controller")])) {
+      runtime_controller =
+          ale[py::str("runtime_controller")].cast<py::dict>();
+      const auto& defaults = ale_defaults.runtime_controller;
+      set_default_if_missing(runtime_controller, "monitor_enabled",
+                             py::cast(defaults.monitor_enabled));
+      set_default_if_missing(runtime_controller, "monitor_every",
+                             py::cast(defaults.monitor_every));
+      set_default_if_missing(runtime_controller, "shell_rows",
+                             py::cast(defaults.shell_rows));
+      set_default_if_missing(runtime_controller, "controller_shell_rows",
+                             py::cast(defaults.controller_shell_rows));
+      set_default_if_missing(runtime_controller, "cap_columns",
+                             py::cast(defaults.cap_columns));
+      set_default_if_missing(runtime_controller, "q_soft",
+                             py::cast(defaults.q_soft));
+      set_default_if_missing(runtime_controller, "q_hard",
+                             py::cast(defaults.q_hard));
+      set_default_if_missing(runtime_controller, "q_recover",
+                             py::cast(defaults.q_recover));
+      set_default_if_missing(runtime_controller, "h_soft",
+                             py::cast(defaults.h_soft));
+      set_default_if_missing(runtime_controller, "h_hard",
+                             py::cast(defaults.h_hard));
+      set_default_if_missing(runtime_controller, "h_recover",
+                             py::cast(defaults.h_recover));
+      set_default_if_missing(runtime_controller, "soft_persistence",
+                             py::cast(defaults.soft_persistence));
+      set_default_if_missing(runtime_controller, "recover_checks",
+                             py::cast(defaults.recover_checks));
+      set_default_if_missing(runtime_controller, "winslow_sweeps",
+                             py::cast(defaults.winslow_sweeps));
+      set_default_if_missing(runtime_controller, "winslow_omega",
+                             py::cast(defaults.winslow_omega));
+      set_default_if_missing(runtime_controller, "beta_monitor_soft",
+                             py::cast(defaults.beta_monitor_soft));
+      set_default_if_missing(runtime_controller, "beta_monitor_hard",
+                             py::cast(defaults.beta_monitor_hard));
+      set_default_if_missing(runtime_controller, "beta_mass",
+                             py::cast(defaults.beta_mass));
+      set_default_if_missing(runtime_controller, "beta_front",
+                             py::cast(defaults.beta_front));
+      set_default_if_missing(runtime_controller, "beta_theta",
+                             py::cast(defaults.beta_theta));
+      set_default_if_missing(runtime_controller, "g_max",
+                             py::cast(defaults.g_max));
+      set_default_if_missing(runtime_controller, "front_width_cells",
+                             py::cast(defaults.front_width_cells));
+      set_default_if_missing(runtime_controller, "cap_fraction",
+                             py::cast(defaults.cap_fraction));
+      set_default_if_missing(runtime_controller, "cap_normal_fraction",
+                             py::cast(defaults.cap_normal_fraction));
+      set_default_if_missing(runtime_controller, "controller_enabled",
+                             py::cast(defaults.controller_enabled));
+      set_default_if_missing(runtime_controller, "commit_rollback_enabled",
+                             py::cast(defaults.commit_rollback_enabled));
+      set_default_if_missing(runtime_controller, "activation_front_mode",
+                             py::cast(defaults.activation_front_mode));
+      set_default_if_missing(runtime_controller, "activation_front_margin_hs",
+                             py::cast(defaults.activation_front_margin_hs));
+      set_default_if_missing(runtime_controller, "activation_time_s",
+                             py::cast(defaults.activation_time_s));
+      set_default_if_missing(runtime_controller, "cadence_soft",
+                             py::cast(defaults.cadence_soft));
+      set_default_if_missing(runtime_controller, "cadence_hard",
+                             py::cast(defaults.cadence_hard));
+      set_default_if_missing(runtime_controller, "cadence_recovery",
+                             py::cast(defaults.cadence_recovery));
+      set_default_if_missing(runtime_controller, "pre_step_enabled",
+                             py::cast(defaults.pre_step_enabled));
+      set_default_if_missing(runtime_controller, "failures_hard_force",
+                             py::cast(defaults.failures_hard_force));
+      set_default_if_missing(runtime_controller, "failures_big_repair",
+                             py::cast(defaults.failures_big_repair));
+      set_default_if_missing(runtime_controller, "escalation_max_failures",
+                             py::cast(defaults.escalation_max_failures));
     }
     if (dict_contains(ale, "donor_sign_fixed") &&
         !dict_contains(ale, "swept_volume_sign_fixed")) {
@@ -3713,6 +5096,12 @@ void apply_legacy_numerics_defaults(py::dict& root) {
     set_default_if_missing(ale,
                            "safe_backtrack_binary_iters",
                            py::cast(ale_defaults.safe_backtrack_binary_iters));
+    set_default_if_missing(ale,
+                           "mesh_epoch_enabled",
+                           py::cast(ale_defaults.mesh_epoch_enabled));
+    set_default_if_missing(ale,
+                           "mesh_epoch_max_per_step",
+                           py::cast(ale_defaults.mesh_epoch_max_per_step));
     set_default_if_missing(
         ale,
         "corner_cell_aspect_protection_enabled",
@@ -3743,6 +5132,7 @@ void apply_legacy_numerics_defaults(py::dict& root) {
                            py::cast(ale_defaults.m1_barrier_beta));
     py::dict euler_window_defaults;
     euler_window_defaults["enabled"] = ale_defaults.euler_window.enabled;
+    euler_window_defaults["role"] = ale_defaults.euler_window.role;
     euler_window_defaults["shape"] = ale_defaults.euler_window.shape;
     euler_window_defaults["r0"] = ale_defaults.euler_window.r0;
     euler_window_defaults["r1"] = ale_defaults.euler_window.r1;
@@ -3754,6 +5144,26 @@ void apply_legacy_numerics_defaults(py::dict& root) {
     euler_window_defaults["rad_out"] = ale_defaults.euler_window.rad_out;
     euler_window_defaults["transition_width"] =
         ale_defaults.euler_window.transition_width;
+    euler_window_defaults["t_on_s"] = ale_defaults.euler_window.t_on_s;
+    euler_window_defaults["t_off_s"] = ale_defaults.euler_window.t_off_s;
+    euler_window_defaults["feather_min_layers"] =
+        ale_defaults.euler_window.feather_min_layers;
+    euler_window_defaults["guard_layers"] =
+        ale_defaults.euler_window.guard_layers;
+    euler_window_defaults["axis_core_transaction_mode"] =
+        ale_defaults.euler_window.axis_core_transaction_mode;
+    euler_window_defaults["replay_table_path"] =
+        ale_defaults.euler_window.replay_table_path;
+    euler_window_defaults["replay_tau_lead"] =
+        ale_defaults.euler_window.replay_tau_lead;
+    euler_window_defaults["replay_tau_splice"] =
+        ale_defaults.euler_window.replay_tau_splice;
+    euler_window_defaults["replay_beta"] =
+        ale_defaults.euler_window.replay_beta;
+    euler_window_defaults["axis_core_transition_passage_enabled"] =
+        ale_defaults.euler_window.axis_core_transition_passage_enabled;
+    euler_window_defaults["axis_core_ring_release_enabled"] =
+        ale_defaults.euler_window.axis_core_ring_release_enabled;
     set_default_if_missing(
         ale, "euler_window", euler_window_defaults);
     if (py::isinstance<py::dict>(ale[py::str("euler_window")])) {
@@ -3763,6 +5173,10 @@ void apply_legacy_numerics_defaults(py::dict& root) {
           euler_window,
           "enabled",
           py::cast(ale_defaults.euler_window.enabled));
+      set_default_if_missing(
+          euler_window,
+          "role",
+          py::cast(ale_defaults.euler_window.role));
       set_default_if_missing(
           euler_window,
           "shape",
@@ -3791,6 +5205,48 @@ void apply_legacy_numerics_defaults(py::dict& root) {
           euler_window,
           "transition_width",
           py::cast(ale_defaults.euler_window.transition_width));
+      set_default_if_missing(
+          euler_window, "t_on_s", py::cast(ale_defaults.euler_window.t_on_s));
+      set_default_if_missing(
+          euler_window, "t_off_s", py::cast(ale_defaults.euler_window.t_off_s));
+      set_default_if_missing(
+          euler_window,
+          "feather_min_layers",
+          py::cast(ale_defaults.euler_window.feather_min_layers));
+      set_default_if_missing(
+          euler_window,
+          "guard_layers",
+          py::cast(ale_defaults.euler_window.guard_layers));
+      set_default_if_missing(
+          euler_window,
+          "axis_core_transaction_mode",
+          py::cast(ale_defaults.euler_window.axis_core_transaction_mode));
+      set_default_if_missing(
+          euler_window,
+          "replay_table_path",
+          py::cast(ale_defaults.euler_window.replay_table_path));
+      set_default_if_missing(
+          euler_window,
+          "replay_tau_lead",
+          py::cast(ale_defaults.euler_window.replay_tau_lead));
+      set_default_if_missing(
+          euler_window,
+          "replay_tau_splice",
+          py::cast(ale_defaults.euler_window.replay_tau_splice));
+      set_default_if_missing(
+          euler_window,
+          "replay_beta",
+          py::cast(ale_defaults.euler_window.replay_beta));
+      set_default_if_missing(
+          euler_window,
+          "axis_core_transition_passage_enabled",
+          py::cast(
+              ale_defaults.euler_window.axis_core_transition_passage_enabled));
+      set_default_if_missing(
+          euler_window,
+          "axis_core_ring_release_enabled",
+          py::cast(
+              ale_defaults.euler_window.axis_core_ring_release_enabled));
     }
     set_default_if_missing(
         ale,
@@ -4163,6 +5619,42 @@ void apply_legacy_numerics_defaults(py::dict& root) {
   if (py::isinstance<py::dict>(numerics[py::str("hydro")])) {
     hydro = numerics[py::str("hydro")].cast<py::dict>();
     const Config::NumericsConfig::HydroConfig hydro_defaults;
+    py::dict pressure_drive_perturbation;
+    if (!dict_contains(hydro, "pressure_drive_perturbation")) {
+      pressure_drive_perturbation = py::dict();
+      hydro[py::str("pressure_drive_perturbation")] =
+          pressure_drive_perturbation;
+    } else if (try_get_child_dict(hydro,
+                                  "pressure_drive_perturbation",
+                                  &pressure_drive_perturbation)) {
+      // Existing dict is updated below.
+    }
+    if (py::isinstance<py::dict>(
+            hydro[py::str("pressure_drive_perturbation")])) {
+      pressure_drive_perturbation =
+          hydro[py::str("pressure_drive_perturbation")].cast<py::dict>();
+      const auto& perturbation_defaults =
+          hydro_defaults.pressure_drive_perturbation;
+      set_default_if_missing(pressure_drive_perturbation,
+                             "enabled",
+                             py::cast(perturbation_defaults.enabled));
+      set_default_if_missing(
+          pressure_drive_perturbation, "legendre_modes", py::list());
+      set_default_if_missing(
+          pressure_drive_perturbation, "ring_spots", py::list());
+      set_default_if_missing(pressure_drive_perturbation,
+                             "random_seed",
+                             py::cast(perturbation_defaults.random_seed));
+      set_default_if_missing(pressure_drive_perturbation,
+                             "random_l_min",
+                             py::cast(perturbation_defaults.random_l_min));
+      set_default_if_missing(pressure_drive_perturbation,
+                             "random_l_max",
+                             py::cast(perturbation_defaults.random_l_max));
+      set_default_if_missing(pressure_drive_perturbation,
+                             "random_rms",
+                             py::cast(perturbation_defaults.random_rms));
+    }
     // 2026-07-26 review: legacy frozen-config
     // default completion for the new 1D keys — no schema bump needed.
     set_default_if_missing(hydro, "crossing_dt_safety",
@@ -4214,6 +5706,43 @@ void apply_legacy_numerics_defaults(py::dict& root) {
           hourglass,
           "max_force_per_node_fraction",
           py::cast(hydro_defaults.hourglass.max_force_per_node_fraction));
+    }
+    py::dict axis_projection;
+    if (!dict_contains(hydro, "axis_projection")) {
+      axis_projection = py::dict();
+      hydro[py::str("axis_projection")] = axis_projection;
+    } else if (try_get_child_dict(
+                   hydro, "axis_projection", &axis_projection)) {
+      // Existing dict is updated below.
+    }
+    if (py::isinstance<py::dict>(
+            hydro[py::str("axis_projection")])) {
+      axis_projection =
+          hydro[py::str("axis_projection")].cast<py::dict>();
+      set_default_if_missing(
+          axis_projection,
+          "enabled",
+          py::cast(hydro_defaults.axis_projection.enabled));
+      set_default_if_missing(
+          axis_projection,
+          "shadow_only",
+          py::cast(hydro_defaults.axis_projection.shadow_only));
+      set_default_if_missing(
+          axis_projection,
+          "q_on",
+          py::cast(hydro_defaults.axis_projection.q_on));
+      set_default_if_missing(
+          axis_projection,
+          "q_floor",
+          py::cast(hydro_defaults.axis_projection.q_floor));
+      set_default_if_missing(
+          axis_projection,
+          "patch_halfwidth",
+          py::cast(hydro_defaults.axis_projection.patch_halfwidth));
+      set_default_if_missing(
+          axis_projection,
+          "log_every_n_steps",
+          py::cast(hydro_defaults.axis_projection.log_every_n_steps));
     }
     set_default_if_missing(
         hydro,
@@ -4462,6 +5991,14 @@ void apply_legacy_numerics_defaults(py::dict& root) {
         py::cast(hydro_defaults.av_qcap_over_p));
     set_default_if_missing(
         hydro,
+        "tensor_av_C1",
+        py::cast(hydro_defaults.tensor_av_C1));
+    set_default_if_missing(
+        hydro,
+        "tensor_av_C2",
+        py::cast(hydro_defaults.tensor_av_C2));
+    set_default_if_missing(
+        hydro,
         "av_model",
         py::str(av_model_to_string(hydro_defaults.av_model)));
     // Frozen configs predating this key ran BBSW; they resolve to BBSW
@@ -4499,8 +6036,124 @@ void apply_legacy_numerics_defaults(py::dict& root) {
         py::cast(hydro_defaults.av_cfl_coefficient));
     set_default_if_missing(
         hydro,
+        "csw98_degenerate_side_floor_rel",
+        py::cast(hydro_defaults.csw98_degenerate_side_floor_rel));
+    set_default_if_missing(
+        hydro,
+        "csw98_damper_impulse_beta",
+        py::cast(hydro_defaults.csw98_damper_impulse_beta));
+    set_default_if_missing(
+        hydro,
+        "csw98_axisline_av_mode",
+        py::str(hydro_defaults.csw98_axisline_av_mode));
+    set_default_if_missing(
+        hydro,
+        "csw98_axisline_d1prime_cfl_enabled",
+        py::cast(hydro_defaults.csw98_axisline_d1prime_cfl_enabled));
+    set_default_if_missing(
+        hydro,
         "csw_limiter_enabled",
         py::cast(hydro_defaults.csw_limiter_enabled));
+    set_default_if_missing(
+        hydro,
+        "csw_axis_mirror_limiter",
+        py::cast(hydro_defaults.csw_axis_mirror_limiter));
+    set_default_if_missing(
+        hydro,
+        "csw_rz_lift_enabled",
+        py::cast(hydro_defaults.csw_rz_lift_enabled));
+    set_default_if_missing(
+        hydro,
+        "csw_rz_lift_guard_ratio",
+        py::cast(hydro_defaults.csw_rz_lift_guard_ratio));
+    set_default_if_missing(
+        hydro,
+        "csw_pole_floor_enabled",
+        py::cast(hydro_defaults.csw_pole_floor_enabled));
+    set_default_if_missing(
+        hydro,
+        "csw_pole_floor_sigma0",
+        py::cast(hydro_defaults.csw_pole_floor_sigma0));
+    set_default_if_missing(
+        hydro,
+        "csw_pole_floor_theta0_rad",
+        py::cast(hydro_defaults.csw_pole_floor_theta0_rad));
+    set_default_if_missing(
+        hydro,
+        "csw_pole_floor_thetaf_rad",
+        py::cast(hydro_defaults.csw_pole_floor_thetaf_rad));
+    set_default_if_missing(
+        hydro,
+        "csw_pole_desens_enabled",
+        py::cast(hydro_defaults.csw_pole_desens_enabled));
+    set_default_if_missing(
+        hydro,
+        "csw_pole_desens_alpha",
+        py::cast(hydro_defaults.csw_pole_desens_alpha));
+    set_default_if_missing(
+        hydro,
+        "csw_pole_desens_theta0_rad",
+        py::cast(hydro_defaults.csw_pole_desens_theta0_rad));
+    set_default_if_missing(
+        hydro,
+        "csw_pole_desens_thetaf_rad",
+        py::cast(hydro_defaults.csw_pole_desens_thetaf_rad));
+    set_default_if_missing(
+        hydro,
+        "csw_polar_slaving_enabled",
+        py::cast(hydro_defaults.csw_polar_slaving_enabled));
+    set_default_if_missing(
+        hydro,
+        "csw_polar_slaving_min_columns",
+        py::cast(hydro_defaults.csw_polar_slaving_min_columns));
+    set_default_if_missing(
+        hydro,
+        "csw_polar_slaving_full_columns",
+        py::cast(hydro_defaults.csw_polar_slaving_full_columns));
+    set_default_if_missing(
+        hydro,
+        "csw_polar_slaving_outer_columns",
+        py::cast(hydro_defaults.csw_polar_slaving_outer_columns));
+    set_default_if_missing(
+        hydro,
+        "csw_polar_slaving_chi_on",
+        py::cast(hydro_defaults.csw_polar_slaving_chi_on));
+    set_default_if_missing(
+        hydro,
+        "csw_polar_slaving_chi_full",
+        py::cast(hydro_defaults.csw_polar_slaving_chi_full));
+    set_default_if_missing(
+        hydro,
+        "csw_polar_slaving_strength",
+        py::cast(hydro_defaults.csw_polar_slaving_strength));
+    set_default_if_missing(
+        hydro,
+        "csw_polar_slaving_av_stiffness_cfl_enabled",
+        py::cast(hydro_defaults.csw_polar_slaving_av_stiffness_cfl_enabled));
+    set_default_if_missing(
+        hydro,
+        "csw_polar_slaving_av_stiffness_sigma",
+        py::cast(hydro_defaults.csw_polar_slaving_av_stiffness_sigma));
+    set_default_if_missing(
+        hydro,
+        "wake_heat_flux_enabled",
+        py::cast(hydro_defaults.wake_heat_flux_enabled));
+    set_default_if_missing(
+        hydro,
+        "wake_heat_flux_CE",
+        py::cast(hydro_defaults.wake_heat_flux_CE));
+    set_default_if_missing(
+        hydro,
+        "wake_heat_flux_theta_a_rad",
+        py::cast(hydro_defaults.wake_heat_flux_theta_a_rad));
+    set_default_if_missing(
+        hydro,
+        "wake_heat_flux_theta_b_rad",
+        py::cast(hydro_defaults.wake_heat_flux_theta_b_rad));
+    set_default_if_missing(
+        hydro,
+        "wake_heat_flux_global_theta",
+        py::cast(hydro_defaults.wake_heat_flux_global_theta));
     set_default_if_missing(
         hydro,
         "qei_evaluate_at_t_n",
@@ -4549,6 +6202,14 @@ void apply_legacy_numerics_defaults(py::dict& root) {
         hydro,
         "subzonal_pressure_enabled",
         py::cast(hydro_defaults.subzonal_pressure_enabled));
+    set_default_if_missing(
+        hydro,
+        "pentagon_affine_null_enabled",
+        py::cast(hydro_defaults.pentagon_affine_null_enabled));
+    set_default_if_missing(
+        hydro,
+        "pentagon_affine_null_kappa",
+        py::cast(hydro_defaults.pentagon_affine_null_kappa));
     set_default_if_missing(
         hydro,
         "subzonal_dt_limiter_enabled",
@@ -4701,6 +6362,138 @@ void apply_legacy_numerics_defaults(py::dict& root) {
                              "enabled",
                              py::cast(diagnostics_defaults.conservation.enabled));
     }
+    py::dict refinement_estimator;
+    if (!dict_contains(diagnostics, "refinement_estimator")) {
+      refinement_estimator = py::dict();
+      diagnostics[py::str("refinement_estimator")] = refinement_estimator;
+    } else if (try_get_child_dict(diagnostics,
+                                  "refinement_estimator",
+                                  &refinement_estimator)) {
+      // Existing dict is updated below.
+    }
+    if (py::isinstance<py::dict>(
+            diagnostics[py::str("refinement_estimator")])) {
+      refinement_estimator =
+          diagnostics[py::str("refinement_estimator")].cast<py::dict>();
+      const auto& estimator_defaults =
+          diagnostics_defaults.refinement_estimator;
+      set_default_if_missing(
+          refinement_estimator, "enabled", py::cast(estimator_defaults.enabled));
+      set_default_if_missing(
+          refinement_estimator, "every", py::cast(estimator_defaults.every));
+      set_default_if_missing(refinement_estimator,
+                             "filter_eps",
+                             py::cast(estimator_defaults.filter_eps));
+      set_default_if_missing(refinement_estimator,
+                             "detect_cutoff",
+                             py::cast(estimator_defaults.detect_cutoff));
+    }
+    py::dict refinement_autopilot;
+    if (!dict_contains(diagnostics, "refinement_autopilot")) {
+      refinement_autopilot = py::dict();
+      diagnostics[py::str("refinement_autopilot")] = refinement_autopilot;
+    } else if (try_get_child_dict(diagnostics,
+                                  "refinement_autopilot",
+                                  &refinement_autopilot)) {
+      // Existing dict is updated below.
+    }
+    if (py::isinstance<py::dict>(
+            diagnostics[py::str("refinement_autopilot")])) {
+      refinement_autopilot =
+          diagnostics[py::str("refinement_autopilot")].cast<py::dict>();
+      const auto& autopilot_defaults =
+          diagnostics_defaults.refinement_autopilot;
+      set_default_if_missing(refinement_autopilot,
+                             "enabled",
+                             py::cast(autopilot_defaults.enabled));
+      set_default_if_missing(refinement_autopilot,
+                             "mode",
+                             py::cast(autopilot_defaults.mode));
+      set_default_if_missing(refinement_autopilot,
+                             "ckpt_lead_h",
+                             py::cast(autopilot_defaults.ckpt_lead_h));
+      set_default_if_missing(refinement_autopilot,
+                             "e_on",
+                             py::cast(autopilot_defaults.e_on));
+      set_default_if_missing(refinement_autopilot,
+                             "e_off",
+                             py::cast(autopilot_defaults.e_off));
+      set_default_if_missing(refinement_autopilot,
+                             "assoc_cut",
+                             py::cast(autopilot_defaults.assoc_cut));
+      set_default_if_missing(refinement_autopilot,
+                             "strong_cut",
+                             py::cast(autopilot_defaults.strong_cut));
+      set_default_if_missing(refinement_autopilot,
+                             "gap_bridge",
+                             py::cast(autopilot_defaults.gap_bridge));
+      set_default_if_missing(refinement_autopilot,
+                             "persist",
+                             py::cast(autopilot_defaults.persist));
+      set_default_if_missing(refinement_autopilot,
+                             "n_q_plan",
+                             py::cast(autopilot_defaults.n_q_plan));
+      set_default_if_missing(refinement_autopilot,
+                             "chi_design",
+                             py::cast(autopilot_defaults.chi_design));
+      set_default_if_missing(refinement_autopilot,
+                             "s_rep_cm",
+                             py::cast(autopilot_defaults.s_rep_cm));
+      set_default_if_missing(refinement_autopilot,
+                             "handoff_cm",
+                             py::cast(autopilot_defaults.handoff_cm));
+      set_default_if_missing(refinement_autopilot,
+                             "window_lo_h",
+                             py::cast(autopilot_defaults.window_lo_h));
+      set_default_if_missing(refinement_autopilot,
+                             "window_hi_h",
+                             py::cast(autopilot_defaults.window_hi_h));
+      set_default_if_missing(refinement_autopilot,
+                             "history",
+                             py::cast(autopilot_defaults.history));
+      set_default_if_missing(refinement_autopilot,
+                             "cov_min",
+                             py::cast(autopilot_defaults.cov_min));
+    }
+    py::dict evacuated_cell_shadow;
+    if (!dict_contains(diagnostics, "evacuated_cell_shadow")) {
+      evacuated_cell_shadow = py::dict();
+      diagnostics[py::str("evacuated_cell_shadow")] = evacuated_cell_shadow;
+    } else if (try_get_child_dict(diagnostics,
+                                  "evacuated_cell_shadow",
+                                  &evacuated_cell_shadow)) {
+      // Existing dict is updated below.
+    }
+    if (py::isinstance<py::dict>(
+            diagnostics[py::str("evacuated_cell_shadow")])) {
+      evacuated_cell_shadow =
+          diagnostics[py::str("evacuated_cell_shadow")].cast<py::dict>();
+      const auto& shadow_defaults =
+          diagnostics_defaults.evacuated_cell_shadow;
+      set_default_if_missing(evacuated_cell_shadow,
+                             "enabled",
+                             py::cast(shadow_defaults.enabled));
+      set_default_if_missing(evacuated_cell_shadow,
+                             "every_n_steps",
+                             py::cast(shadow_defaults.every_n_steps));
+      set_default_if_missing(evacuated_cell_shadow,
+                             "arm_mass_fraction",
+                             py::cast(shadow_defaults.arm_mass_fraction));
+      set_default_if_missing(evacuated_cell_shadow,
+                             "off_mass_fraction",
+                             py::cast(shadow_defaults.off_mass_fraction));
+      set_default_if_missing(
+          evacuated_cell_shadow,
+          "rho_vacuum_policy_g_per_cc",
+          py::cast(shadow_defaults.rho_vacuum_policy_g_per_cc));
+      set_default_if_missing(evacuated_cell_shadow,
+                             "laser_wavelength_nm",
+                             py::cast(shadow_defaults.laser_wavelength_nm));
+      set_default_if_missing(
+          evacuated_cell_shadow,
+          "laser_ne_over_ncrit_max",
+          py::cast(shadow_defaults.laser_ne_over_ncrit_max));
+    }
     py::dict ale_provenance_emission;
     if (!dict_contains(diagnostics, "ale_provenance_emission")) {
       ale_provenance_emission = py::dict();
@@ -4719,6 +6512,27 @@ void apply_legacy_numerics_defaults(py::dict& root) {
           ale_provenance_emission,
           "enabled",
           py::cast(diagnostics_defaults.ale_provenance_emission.enabled));
+    }
+    py::dict conduction_energy_rate_export;
+    if (!dict_contains(diagnostics, "conduction_energy_rate_export")) {
+      conduction_energy_rate_export = py::dict();
+      diagnostics[py::str("conduction_energy_rate_export")] =
+          conduction_energy_rate_export;
+    } else if (try_get_child_dict(diagnostics,
+                                  "conduction_energy_rate_export",
+                                  &conduction_energy_rate_export)) {
+      // Existing dict is updated below.
+    }
+    if (py::isinstance<py::dict>(
+            diagnostics[py::str("conduction_energy_rate_export")])) {
+      conduction_energy_rate_export =
+          diagnostics[py::str("conduction_energy_rate_export")]
+              .cast<py::dict>();
+      set_default_if_missing(
+          conduction_energy_rate_export,
+          "enabled",
+          py::cast(
+              diagnostics_defaults.conduction_energy_rate_export.enabled));
     }
     py::dict ale_velcoherence;
     if (!dict_contains(diagnostics, "ale_velcoherence")) {
@@ -4757,6 +6571,33 @@ void apply_legacy_numerics_defaults(py::dict& root) {
           mesh_quality_min,
           "enabled",
           py::cast(diagnostics_defaults.mesh_quality_min.enabled));
+    }
+    py::dict shock_approach;
+    if (!dict_contains(diagnostics, "shock_approach")) {
+      shock_approach = py::dict();
+      diagnostics[py::str("shock_approach")] = shock_approach;
+    } else if (try_get_child_dict(diagnostics,
+                                  "shock_approach",
+                                  &shock_approach)) {
+      // Existing dict is updated below.
+    }
+    if (py::isinstance<py::dict>(
+            diagnostics[py::str("shock_approach")])) {
+      shock_approach =
+          diagnostics[py::str("shock_approach")].cast<py::dict>();
+      const auto& shock_defaults = diagnostics_defaults.shock_approach;
+      set_default_if_missing(
+          shock_approach, "sectors", py::cast(shock_defaults.sectors));
+      set_default_if_missing(shock_approach,
+                             "modal_l_max",
+                             py::cast(shock_defaults.modal_l_max));
+      set_default_if_missing(shock_approach,
+                             "sector_confidence_nu",
+                             py::cast(shock_defaults.sector_confidence_nu));
+      set_default_if_missing(
+          shock_approach,
+          "sector_guard_crossings",
+          py::cast(shock_defaults.sector_guard_crossings));
     }
     py::dict production_audit;
     if (!dict_contains(diagnostics, "production_audit")) {
@@ -5049,6 +6890,23 @@ py::dict parse_checkpoint_json_or_throw(const std::string& json_str) {
   return parsed.cast<py::dict>();
 }
 
+void remove_retired_terminal_takeover_keys(py::dict& root) {
+  py::dict numerics;
+  if (!try_get_child_dict(root, "numerics", &numerics)) {
+    return;
+  }
+  py::dict ale;
+  if (!try_get_child_dict(numerics, "ale", &ale)) {
+    return;
+  }
+  ale.attr("pop")(py::str("central_pseudo_core_terminal_absorb_enabled"),
+                  py::none());
+  ale.attr("pop")(py::str("central_pseudo_core_terminal_rebound_factor"),
+                  py::none());
+  ale.attr("pop")(py::str("central_pseudo_core_terminal_tail_dt_s"),
+                  py::none());
+}
+
 void apply_checkpoint_migrations(py::dict& root) {
   int schema_version = read_schema_version_or_default(root, kCheckpointJsonSchemaV1);
   if (schema_version <= 0) {
@@ -5181,6 +7039,7 @@ void apply_checkpoint_migrations(py::dict& root) {
     schema_version = kCheckpointJsonSchemaV25;
   }
   apply_legacy_numerics_defaults(root);
+  remove_retired_terminal_takeover_keys(root);
   normalize_mesh_default_elision(root);
 }
 
@@ -5210,6 +7069,15 @@ bool Freeze::configs_equivalent(const std::string& json_a, const std::string& js
     py::dict normalized_b = parse_checkpoint_json_or_throw(json_b);
     apply_checkpoint_migrations(normalized_a);
     apply_checkpoint_migrations(normalized_b);
+    // Ignore the operational restart source when comparing frozen configurations.
+    py::dict main_a;
+    if (try_get_child_dict(normalized_a, "main", &main_a)) {
+      main_a.attr("pop")(py::str("restart_from"), py::none());
+    }
+    py::dict main_b;
+    if (try_get_child_dict(normalized_b, "main", &main_b)) {
+      main_b.attr("pop")(py::str("restart_from"), py::none());
+    }
     return py_objects_equal(normalized_a, normalized_b);
   } catch (const py::error_already_set& e) {
     throw ConfigError(std::string("Failed to compare checkpoint frozen_config JSON: ") + e.what());

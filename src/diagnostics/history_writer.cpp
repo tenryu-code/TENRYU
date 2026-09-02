@@ -2130,25 +2130,32 @@ HistoryWriter::compute_corner_bc_audit_values(
     out.r_outer_ghost_u_z = out.interior_u_z;
   }
 
-  out.z_top_ghost_rho = bc.z_top_cfg.supply_rho_g_per_cc;
-  out.z_top_ghost_u_r = 0.0;
-  out.z_top_ghost_u_z = bc.z_top_cfg.supply_u_z_cm_per_s;
+  const bool z_top_supply_active = bc.z_top_cfg.supply_active(record.t_s);
+  out.z_top_ghost_rho = z_top_supply_active
+                            ? bc.z_top_cfg.supply_rho_g_per_cc
+                            : out.interior_rho;
+  out.z_top_ghost_u_r = z_top_supply_active ? 0.0 : out.interior_u_r;
+  out.z_top_ghost_u_z = z_top_supply_active
+                            ? bc.z_top_cfg.supply_u_z_cm_per_s
+                            : -out.interior_u_z;
   const double z_bottom_ghost_u_z = bc.z_bottom_cfg.supply_u_z_cm_per_s;
   out.diagonal_corner_ghost_rho = out.z_top_ghost_rho;
-  out.diagonal_corner_ghost_u_r = 0.0;
+  out.diagonal_corner_ghost_u_r = out.z_top_ghost_u_r;
   out.diagonal_corner_ghost_u_z = out.z_top_ghost_u_z;
   out.dt_at_cell = record.hydro_winner_dt_at_cell;
 
 #ifndef NDEBUG
   if (corner_bc_audit_assert_enabled() && corner_bc_audit_i1_like_case(cfg_)) {
-    if (bc.z_bottom_cfg.is_state_supply()) {
+    if (bc.z_bottom_cfg.supply_active(record.t_s)) {
       TENRYU_ASSERT(z_bottom_ghost_u_z > 0.0,
                     "corner_bc_audit: I1 z_bottom state_supply ghost u_z must be positive");
     }
-    TENRYU_ASSERT(out.z_top_ghost_u_z > 0.0,
-                  "corner_bc_audit: I1 z_top state_supply ghost u_z must be positive");
-    TENRYU_ASSERT(out.diagonal_corner_ghost_u_z > 0.0,
-                  "corner_bc_audit: I1 diagonal corner ghost u_z must be positive");
+    if (z_top_supply_active) {
+      TENRYU_ASSERT(out.z_top_ghost_u_z > 0.0,
+                    "corner_bc_audit: I1 z_top state_supply ghost u_z must be positive");
+      TENRYU_ASSERT(out.diagonal_corner_ghost_u_z > 0.0,
+                    "corner_bc_audit: I1 diagonal corner ghost u_z must be positive");
+    }
     TENRYU_ASSERT(out.r_outer_ghost_u_z == out.interior_u_z,
                   "corner_bc_audit: I1 r_outer reflect ghost must preserve u_z");
   }
@@ -2316,6 +2323,12 @@ HistoryWriter::build_ale_provenance_values(
   out.achieved_min_altitude_rel = obs.achieved_min_altitude_rel;
   out.achieved_max_condition_number = obs.achieved_max_condition_number;
   out.negative_rz_volume_count_total = obs.negative_rz_volume_count_total;
+  out.ale_monitor_observed = obs.ale_monitor_observed;
+  out.ale_monitor_state = obs.ale_monitor_state;
+  out.ale_monitor_q_min = obs.ale_monitor_q_min;
+  out.ale_monitor_h_min = obs.ale_monitor_h_min;
+  out.ale_monitor_q_min_cell = obs.ale_monitor_q_min_cell;
+  out.ale_monitor_h_min_cell = obs.ale_monitor_h_min_cell;
   return out;
 }
 
@@ -2336,6 +2349,7 @@ HistoryWriter::PendingHistoryRecord HistoryWriter::build_pending_record(
   rec.ale_provenance_enabled = ale_provenance_enabled_;
   rec.hotspot_gas_enabled = hotspot_gas_enabled_;
   rec.mesh_quality_min_enabled = mesh_quality_min_enabled_;
+  rec.ale_state_enabled = ale_state_enabled_;
   rec.conservation_enabled = conservation_enabled_;
   rec.dt_breakdown_history_enabled = dt_breakdown_history_enabled_;
   rec.center_perturbation_enabled = center_perturbation_enabled_;
@@ -2821,6 +2835,39 @@ void HistoryWriter::write_mesh_quality_min_history(
                        "dimensionless");
 }
 
+void HistoryWriter::write_ale_state_history(
+    const hid_t file,
+    const AleProvenanceValues& values,
+    const double time,
+    const std::int64_t step) const {
+  if (!values.ale_monitor_observed) {
+    return;
+  }
+  const std::string base = "/diagnostics/ale_state/";
+  append_scalar_i32(file, base + "step", static_cast<std::int32_t>(step), "count");
+  append_scalar_double(file, base + "t_s", time, "s");
+  append_scalar_i32(file,
+                    base + "state",
+                    static_cast<std::int32_t>(values.ale_monitor_state),
+                    "code");
+  append_scalar_double(file,
+                       base + "q_min",
+                       values.ale_monitor_q_min,
+                       "dimensionless");
+  append_scalar_double(file,
+                       base + "h_min",
+                       values.ale_monitor_h_min,
+                       "dimensionless");
+  append_scalar_i32(file,
+                    base + "q_min_cell",
+                    static_cast<std::int32_t>(values.ale_monitor_q_min_cell),
+                    "count");
+  append_scalar_i32(file,
+                    base + "h_min_cell",
+                    static_cast<std::int32_t>(values.ale_monitor_h_min_cell),
+                    "count");
+}
+
 void write_mesh_quality_min_history(
     const hid_t file,
     const tenryu::coupling::ProfileObservability& obs,
@@ -2861,6 +2908,39 @@ void write_mesh_quality_min_history(
                        base + "achieved_max_condition_number",
                        obs.achieved_max_condition_number,
                        "dimensionless");
+}
+
+void write_ale_state_history(
+    const hid_t file,
+    const tenryu::coupling::ProfileObservability& obs,
+    const double time,
+    const int step) {
+  if (!obs.ale_monitor_observed) {
+    return;
+  }
+  const std::string base = "/diagnostics/ale_state/";
+  append_scalar_i32(file, base + "step", static_cast<std::int32_t>(step), "count");
+  append_scalar_double(file, base + "t_s", time, "s");
+  append_scalar_i32(file,
+                    base + "state",
+                    static_cast<std::int32_t>(obs.ale_monitor_state),
+                    "code");
+  append_scalar_double(file,
+                       base + "q_min",
+                       obs.ale_monitor_q_min,
+                       "dimensionless");
+  append_scalar_double(file,
+                       base + "h_min",
+                       obs.ale_monitor_h_min,
+                       "dimensionless");
+  append_scalar_i32(file,
+                    base + "q_min_cell",
+                    static_cast<std::int32_t>(obs.ale_monitor_q_min_cell),
+                    "count");
+  append_scalar_i32(file,
+                    base + "h_min_cell",
+                    static_cast<std::int32_t>(obs.ale_monitor_h_min_cell),
+                    "count");
 }
 
 void write_ale_provenance_history(
@@ -3117,7 +3197,10 @@ void append_ale_provenance_final_to_history_file(
       core::effective_diagnostics_ale_provenance_emission_enabled(cfg);
   const bool mesh_quality_min_enabled =
       cfg.numerics.diagnostics.mesh_quality_min.enabled;
-  if (!ale_provenance_enabled && !mesh_quality_min_enabled) {
+  const bool ale_state_enabled =
+      cfg.numerics.ale.runtime_controller.monitor_enabled;
+  if (!ale_provenance_enabled && !mesh_quality_min_enabled &&
+      !ale_state_enabled) {
     return;
   }
   const bool exists = std::filesystem::exists(history_path);
@@ -3132,6 +3215,9 @@ void append_ale_provenance_final_to_history_file(
   }
   if (mesh_quality_min_enabled) {
     write_mesh_quality_min_history(file, obs, time, step);
+  }
+  if (ale_state_enabled) {
+    write_ale_state_history(file, obs, time, step);
   }
   if (ale_provenance_enabled) {
     const char* plic_gate_status =
@@ -3220,6 +3306,7 @@ void HistoryWriter::init(const core::Config& cfg, const std::string& output_dir)
   ale_provenance_enabled_ =
       core::effective_diagnostics_ale_provenance_emission_enabled(cfg);
   mesh_quality_min_enabled_ = cfg.numerics.diagnostics.mesh_quality_min.enabled;
+  ale_state_enabled_ = cfg.numerics.ale.runtime_controller.monitor_enabled;
   conservation_enabled_ = core::effective_diagnostics_conservation_enabled(cfg);
   dt_breakdown_history_enabled_ =
       cfg.numerics.diagnostics.dt_breakdown_history_enabled;
@@ -3231,6 +3318,7 @@ void HistoryWriter::init(const core::Config& cfg, const std::string& output_dir)
       (cfg.output.history_every > 0) || (cfg.output.history_every_s > 0.0) ||
       dt_breakdown_history_enabled_ ||
       mesh_quality_min_enabled_ ||
+      ale_state_enabled_ ||
       center_perturbation_enabled_ ||
       hotspot_gas_enabled_ ||
       cfg.diagnostics.per_operator_radial_fourier_enabled ||
@@ -3916,6 +4004,12 @@ void HistoryWriter::append_record_to_file(
                                      rec.ale_provenance_values,
                                      rec.t,
                                      rec.step);
+    }
+    if (rec.ale_state_enabled) {
+      write_ale_state_history(file,
+                              rec.ale_provenance_values,
+                              rec.t,
+                              rec.step);
     }
   }
   if (rec.conservation_enabled) {

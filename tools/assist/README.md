@@ -67,6 +67,8 @@ Every LLM invocation is journaled as JSONL with model identity and prompt/respon
 | `TENRYU_REMOTE_BIN` | Remote `tenryu` binary | `$TENRYU_REMOTE_REPO/build/tenryu` |
 | `TENRYU_REMOTE_TMPDIR` | Remote temporary directory | `/tmp` |
 | `TENRYU_REMOTE_SSH` | SSH command | `ssh` |
+| `TENRYU_REMOTE_SSH_OPTS` | Extra options inserted after the ssh command (word-split; no spaces inside values) | empty |
+| `TENRYU_REMOTE_SCP_OPTS` | Extra options inserted after the scp command (word-split; no spaces inside values) | empty |
 | `TENRYU_REMOTE_SCP` | SCP command | `scp` |
 | `TENRYU_REMOTE_RSYNC` | rsync command | `rsync` |
 
@@ -74,7 +76,7 @@ Every LLM invocation is journaled as JSONL with model identity and prompt/respon
 TENRYU_REMOTE_HOST=parma TENRYU_REMOTE_REPO=... tools/assist/assist.py lint-deck deck.py --tenryu tools/assist/tenryu_remote.sh
 ```
 
-Interpolated paths and arguments must contain only letters, digits, `_./+=:@-`; spaces and quotes are not supported.
+Interpolated paths and arguments must contain only letters, digits, `_./+=:@-`; spaces and quotes are not supported. rsync callers can use the standard `RSYNC_RSH` environment variable for equivalent per-connection options.
 
 ## Work-item skills (CC / codex pairs)
 
@@ -94,3 +96,13 @@ for Claude providers instruct "Invoke the <name> skill". Current items:
 
 Planned items follow the same pattern (full-deck generation, zoning repair,
 run forensics, plain-language run reports).
+
+## TENRYU Studio integration
+
+TENRYU Studio (gui/) exposes this harness in its アシスタント view: deterministic
+verbs run on the selected server profile (`python3 tools/assist/assist.py …` inside
+the server-side checkout), while `generate-deck` runs on the local machine with
+`--tenryu tools/assist/tenryu_remote.sh` driving the server binary. Per-profile ssh
+options are forwarded via `TENRYU_REMOTE_SSH_OPTS` / `TENRYU_REMOTE_SCP_OPTS` and
+`RSYNC_RSH`. Studio workdirs live under `~/.tenryu/studio-assist/<stamp>/`. Design:
+docs/design/gui_assistant_integration_20260902.md.
