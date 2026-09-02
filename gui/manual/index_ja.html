@@ -11,7 +11,7 @@
     <header>
       <h1>TENRYU Studio ユーザーマニュアル (1D)</h1>
       <p class="lead">TENRYU 1D 放射流体シミュレーションの入力デッキを、フォーム操作だけで安全に組み立てる GUI。</p>
-      <p class="meta">生成日: 2026-07-31</p>
+      <p class="meta">生成日: 2026-09-02</p>
       <a class="language-link" href="index_en.html" lang="en">English version</a>
     </header>
 
@@ -28,6 +28,7 @@
         <li><a href="#drive">駆動</a></li>
         <li><a href="#output">出力</a></li>
         <li><a href="#deck">デッキの確認・保存・実行</a></li>
+        <li><a href="#assistant">アシスタント (実験的)</a></li>
         <li><a href="#troubleshooting">トラブルシューティング</a></li>
       </ol>
     </nav>
@@ -293,8 +294,26 @@
       </aside>
     </section>
 
+    <section id="assistant">
+      <h2>11. アシスタント (実験的)</h2>
+      <p>左ナビの「アシスタント」ビューは、LLM による 1D デッキ生成と決定論的な実行診断を提供します。既定では LLM 機能は無効で、環境変数 TENRYU_ASSIST_DISABLE=1 が常に優先される kill switch です。</p>
+      <h3>準備</h3>
+      <ul>
+        <li>ローカルに TENRYU チェックアウト (tools/assist を含む) が必要です。「設定」欄にそのパスを入力し「状態確認」を押すと、解決された設定 (有効/無効・ロール・モデル) が表示されます。</li>
+        <li>LLM 生成を使うには、チェックアウト直下または ~/.tenryu/ の assistant.toml で enabled = true と deck_design ロールのプロバイダを設定します (雛形: tools/assist/assistant.example.toml)。プロバイダ CLI (codex / claude) はローカルマシンで認証済みであることが前提です。</li>
+        <li>デッキ検証は現在選択中のサーバープロファイルのバイナリで行われます (ssh プロファイルでは tools/assist/tenryu_remote.sh 経由)。ポート・鍵・ホストキー方針はプロファイル設定から自動で引き継がれます。</li>
+      </ul>
+      <h3>デッキ生成</h3>
+      <p>仕様を自然言語で書いて「生成」を押すと、生成 → サーバーでの validate/freeze → lint フィードバックの反復ループが走ります (最大反復 1–10)。モデルが不明点を推測せず質問してきた場合 (UNCERTAIN)、回答欄で答えて再生成できます。受理されたデッキはその場で検証・保存・実行でき、実行は通常の実行履歴に入ります。全 LLM 呼び出しは作業ディレクトリ (~/.tenryu/studio-assist/) の journal.jsonl に記録されます。</p>
+      <h3>Lint と診断</h3>
+      <ul>
+        <li>検証パネルの「詳細 Lint」は、現在のフォームデッキに対して solver の validate/freeze に加え、メッシュ・ゾーニング系の lint (節点単調性・隣接幅比・autozone 質量比・intent ピン検査) を実行します。</li>
+        <li>実行履歴の終了 run には「診断 (アシスタント)」があり、ダイジェスト (履歴系列の縮約と派生指標)・ゾーニング診断 (アブレート帯の質量形 lint)・ゾーニング昇格案を表示します。サーバー側に python3 (ダイジェストには h5py) と tools/assist を含むチェックアウトが必要です。</li>
+      </ul>
+    </section>
+
     <section id="troubleshooting">
-      <h2>11. トラブルシューティング</h2>
+      <h2>12. トラブルシューティング</h2>
       <div class="table-wrap">
         <table>
           <thead>
