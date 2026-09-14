@@ -1900,6 +1900,13 @@ struct Config {
       //     tabulated EOS whose cold heat capacities lie far below the
       //     ideal-gas values; the analytic metric then overshoots). 1D_SPH only.
       std::string qei_heat_capacity = "ideal_gas";
+      // Tension cutoff of the tabulated total pressure after every 1D EOS
+      // closure: when true, P_e is raised so that P_e + P_i >= 
+      // pressure_tension_cutoff_value (dyn/cm^2, <= 0). A fluid cannot sustain
+      // the cold-curve tension of a table; default false keeps the historic
+      // arithmetic. 1D_SPH only.
+      bool pressure_tension_cutoff = false;
+      double pressure_tension_cutoff_value = 0.0;
     };
 
     struct ConductionConfig {

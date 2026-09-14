@@ -81,6 +81,8 @@ struct PersistentParams {
   int hydro_enabled = 0;
   int compatible_energy = 0;
   int energy_authoritative = 0;
+  int pressure_tension_cutoff = 0;
+  double pressure_tension_cutoff_value = 0.0;
   int two_temperature = 0;
   int q_heat_to_electron = 0;
   int conduction_enabled = 0;
@@ -1029,12 +1031,18 @@ __device__ void refresh_geometry_density_closure(const PersistentParams& p,
           no_mie_gruneisen, false, false, false, false, false, false, false,
           p.energy_authoritative != 0, nullptr, nullptr, kExactOverrideNone,
           b.cv_e, b.cv_i);
+      if (p.pressure_tension_cutoff != 0) {
+        apply_pressure_tension_cutoff_body(c, b.Pe, b.Pi, p.pressure_tension_cutoff_value);
+      }
     }
   } else {
     for (int c = pk_thread_id(p); c < p.n_cells; c += pk_thread_stride(p)) {
       enforce_1t_closure_ideal_kernel_body(
           c, b.ee, b.ei, b.Te, b.Ti, b.Pe, b.Pi, b.rho, b.zbar, b.gamma_eff,
           b.A_eff, p.fallback_z, p.cv_e_override, p.Te_floor, b.cv_e, b.cv_i);
+      if (p.pressure_tension_cutoff != 0) {
+        apply_pressure_tension_cutoff_body(c, b.Pe, b.Pi, p.pressure_tension_cutoff_value);
+      }
     }
   }
   pk_sync(p);
@@ -4152,6 +4160,8 @@ PersistentParams make_params(const core::State& state,
   p.compatible_energy = cfg.numerics.hydro.compatible_energy ? 1 : 0;
   p.energy_authoritative =
       (cfg.numerics.hydro.eos_closure_mode == "energy_authoritative") ? 1 : 0;
+  p.pressure_tension_cutoff = cfg.numerics.hydro.pressure_tension_cutoff ? 1 : 0;
+  p.pressure_tension_cutoff_value = cfg.numerics.hydro.pressure_tension_cutoff_value;
   p.two_temperature = cfg.main.two_temperature ? 1 : 0;
   p.q_heat_to_electron =
       (cfg.numerics.hydro.av_heat_to == "electron") ? 1 : 0;

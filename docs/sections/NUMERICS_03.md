@@ -8437,6 +8437,14 @@ remap 完了後、以下のシーケンスで原始変数を再構築する：
    > \(\partial P_{\rm tot}/\partial\rho|_T\)（密度 ±2 % の中心差分、\(T\) は床以上）を評価し、非正のセル数・
    > \(\rho, T_e\) の範囲・最小値を起動時に WARNING で報告する（状態は変えない）。対処は入力側 — 初期状態を
    > 表の力学的に安定な枝に置くか、凝縮相を正しく表す EOS（SESAME 等）を使う。
+   > **張力カットオフ（`Numerics.hydro.pressure_tension_cutoff`、2026-09-15）**: 表の張力そのものを
+   > 動力学から外す構成則の選択肢。`True` のとき各 EOS 閉包（入口・半段・出口、persistent loop 含む）の直後に
+   > \(P_e := \max(P_e,\;P_{\min}-P_i)\) を適用して全圧を \(P_{\min}\)（既定 0）以上にする（cold curve の張力は電子表に
+   > 載っているため電子圧側で修正）。温度・エネルギーは変えず、力（`build_cell_pq`）・仕事（2T エネルギー更新の
+   > \(-P_e\,dV, -P_i\,dV\) と compatible 分配）・人工粘性の圧力参照はすべて閉包後の `state.Pe/Pi` を読むので
+   > 一貫する。床付き領域では \(\partial P/\partial\rho|_T=0\)（中立）で、上の指数的成長は起きない。流体は張力を
+   > 支えられない（キャビテーション）という物理に基づく構成則であり、状態量の事後補正ではない。既定 `False`
+   > は従来の算術。
 7. 安全策（§11）：温度・密度フロアクランプ（U2）
 
 CSR remap has one additional post-remap closure rule for evacuated cells.  If a
