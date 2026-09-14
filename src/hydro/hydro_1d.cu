@@ -456,7 +456,7 @@ __global__ void compute_density_kernel(double* __restrict__ rho,
 }
 
 __global__ void apply_pressure_tension_cutoff_kernel(double* __restrict__ Pe,
-                                                     const double* __restrict__ Pi,
+                                                     double* __restrict__ Pi,
                                                      const int c_begin,
                                                      const int c_end,
                                                      const double p_min) {

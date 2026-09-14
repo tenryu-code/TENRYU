@@ -638,18 +638,27 @@ __device__ __forceinline__ double total_pressure_device(
 // the tension of a tabulated cold curve (the NIF DS liquid-D2 table gives
 // -7 kbar at the initial state with dP/drho|_T < 0, which drives an
 // exponential interface and round-off instability). Applied after every 1D
-// EOS closure: the electron pressure is raised so that P_e + P_i >= p_min
-// (the cold-curve tension lives in the electron table). Temperatures and
-// energies are not modified; the force, the work terms and the artificial
-// viscosity all read the floored pressures.
+// EOS closure: when P_e + P_i < p_min both species pressures are scaled by
+// the same factor s = p_min / (P_e + P_i) (0 when p_min = 0), so the total
+// reaches p_min with no spurious species work — a cavitated fluid does no
+// pdV work on either species. (The first rule, raising only P_e to
+// p_min - P_i, left P_e = -P_i < 0 in floored cells, so -P_e dV did work on
+// the electrons during compression; withdrawn 2026-09-15. The time-step
+// collapse seen in the same runs came from the IMC-only Fleck-floor dt
+// constraint, NUMERICS §2.2 (c), and occurred with the cutoff off as
+// well.) Temperatures and energies are not modified; the force, the
+// work terms and the artificial viscosity all read the floored pressures.
 __device__ __forceinline__ void apply_pressure_tension_cutoff_body(
     const int i,
     double* __restrict__ Pe,
-    const double* __restrict__ Pi,
+    double* __restrict__ Pi,
     const double p_min) {
   const double p_total = Pe[i] + Pi[i];
   if (p_total < p_min) {
-    Pe[i] = p_min - Pi[i];
+    // p_min <= 0 (validated) and p_total < p_min, so p_total < 0 and 0 <= s < 1.
+    const double s = p_min / p_total;
+    Pe[i] *= s;
+    Pi[i] *= s;
   }
 }
 

@@ -32,6 +32,16 @@ Python 3.9+ is supported through a bundled strict TOML-subset parser. Configurat
 
 ## Verbs
 
+`import-deck` records a Python namelist without a CUDA binary and supports
+Studio form import and numerical equivalence checks. It runs the deck in a
+timed child process in the deck's directory; this executes ordinary local
+Python, including its imports and side effects. No assistant/provider config
+or server profile is needed. Errors include the traceback. A mesh-planner deck
+can use `--repo-root` to locate a checkout or mirror.
+Usage: `tools/assist/assist.py import-deck --deck DECK [--repo-root DIR] [--timeout SECONDS]`
+The alternative `--request FILE` takes the JSON record/verify/compare protocol
+documented in [`docs/gui/DECK_IMPORT.md`](../../docs/gui/DECK_IMPORT.md).
+
 `status` reports the resolved assistant configuration.
 Usage: `tools/assist/assist.py status [--config FILE]`
 

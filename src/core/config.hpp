@@ -1901,8 +1901,9 @@ struct Config {
       //     ideal-gas values; the analytic metric then overshoots). 1D_SPH only.
       std::string qei_heat_capacity = "ideal_gas";
       // Tension cutoff of the tabulated total pressure after every 1D EOS
-      // closure: when true, P_e is raised so that P_e + P_i >= 
-      // pressure_tension_cutoff_value (dyn/cm^2, <= 0). A fluid cannot sustain
+      // closure: when true and P_e + P_i < pressure_tension_cutoff_value
+      // (dyn/cm^2, <= 0), both species pressures are scaled by the same factor
+      // so that the total equals the cutoff value. A fluid cannot sustain
       // the cold-curve tension of a table; default false keeps the historic
       // arithmetic. 1D_SPH only.
       bool pressure_tension_cutoff = false;

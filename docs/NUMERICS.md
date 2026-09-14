@@ -1833,6 +1833,7 @@ f_c = \frac{1}{1 + \alpha\,c\,\beta_c\,\sigma_{P,c}\,\Delta t}
 
 > \(f_{\min}\) が小さいほど制約は緩い。\(f_{\max}\)（SPECIFICATION §6.4.5、Fleck factor上限）とは独立のパラメータ。
 > この下限は IMC 側 Fleck にのみ適用する。FLD 側 Fleck は stiff-cell 極限を保つため下限を使わない。
+> 実装（2026-09-15）: \(\Delta t_{rad}\) を計算する `compute_dt_rad_limit`（`src/radiation/fleck.cu`）は `Radiation.mode = imc_ddmc` のときだけ有限値を返し、`multigroup_diffusion`（FLD）と `sn_transport` では \(+\infty\)（駆動側の \(\Delta t\) 選択に入らない）。persistent loop の複製 `persistent_fld_dt_rad` も同じく \(+\infty\)。それ以前は輻射が有効な全モードで評価されており、表 EOS の電子熱容量が表の床（`EOSTable` の \(10^{-3}\) erg/(g·eV)）にあるセルでは \(\beta_c\) が発散し、冷たく光学的に厚いセルで \(\Delta t_{rad}\sim10^{-21}\) s になって計算が止まっていた（NIF DS 液体 D2 デッキ、SESAME 表、\(T_r=55\) eV：セル 197、\(T_e=25\) meV、\(\rho=0.29\) g/cc、\(\sigma_P=4.8\times10^{10}\) cm\(^{-1}\)、\(\beta=30\)）。既定経路（gxii / cbet 回帰、Marshak 波、灰色 FLD 輻射衝撃波、Hammer–Rosen）では制約が効いていなかったので状態量は bit 一致で、変わるのは履歴の診断列 `diagnostics/dt_breakdown_history/dt_rad`（+∞）だけ。
 
 > **σ_P 陳腐化に関する注意**：\(\sigma_{P,c}\) は Phase 4（Radiation演算子冒頭）で計算される。
 > Phase 5（Hydro 半ステップ後半）で \(T_e\) が変化するため、Phase 6 の \(\Delta t_{rad}\) 計算時には
@@ -10904,8 +10905,11 @@ remap 完了後、以下のシーケンスで原始変数を再構築する：
    > 表の力学的に安定な枝に置くか、凝縮相を正しく表す EOS（SESAME 等）を使う。
    > **張力カットオフ（`Numerics.hydro.pressure_tension_cutoff`、2026-09-15）**: 表の張力そのものを
    > 動力学から外す構成則の選択肢。`True` のとき各 EOS 閉包（入口・半段・出口、persistent loop 含む）の直後に
-   > \(P_e := \max(P_e,\;P_{\min}-P_i)\) を適用して全圧を \(P_{\min}\)（既定 0）以上にする（cold curve の張力は電子表に
-   > 載っているため電子圧側で修正）。温度・エネルギーは変えず、力（`build_cell_pq`）・仕事（2T エネルギー更新の
+   > 全圧 \(P_e+P_i<P_{\min}\)（既定 0）のセルで両種の圧力を同じ比 \(s=P_{\min}/(P_e+P_i)\)（\(P_{\min}=0\) なら 0）で縮め、
+   > 全圧を \(P_{\min}\) にする — キャビテーションした流体はどちらの種にも pdV 仕事をしない（電子圧だけを
+   > \(P_{\min}-P_i\) に引き上げる最初の規則は床付きセルで \(P_e=-P_i<0\) となり、圧縮時に \(-P_e\,dV\) が電子に
+   > 仕事をする（種ごとの見かけの仕事）ため 2026-09-15 に撤回。同じ run で見えた時間刻みの崩壊は §2.2 (c) の IMC 専用の
+   > Fleck 因子下限による \(\Delta t\) 制約が原因で、カットオフ無しでも起きていた）。温度・エネルギーは変えず、力（`build_cell_pq`）・仕事（2T エネルギー更新の
    > \(-P_e\,dV, -P_i\,dV\) と compatible 分配）・人工粘性の圧力参照はすべて閉包後の `state.Pe/Pi` を読むので
    > 一貫する。床付き領域では \(\partial P/\partial\rho|_T=0\)（中立）で、上の指数的成長は起きない。流体は張力を
    > 支えられない（キャビテーション）という物理に基づく構成則であり、状態量の事後補正ではない。既定 `False`

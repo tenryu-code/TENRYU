@@ -12,12 +12,22 @@ export interface ExecOpts {
   timeoutMs?: number;
 }
 
+export interface DeckImportSettings {
+  venue: "local" | "server";
+  workingDirectory: string;
+  environmentText: string;
+  /** Recency survives JSON object-key reordering in settings storage. */
+  lastUsedAt?: number;
+}
+
 export interface AppSettings {
   lastProfileId?: string;
   runs?: RunRecord[];
   lang?: "ja" | "en";
   /** Absolute path of a local TENRYU checkout providing tools/assist (assistant). */
   assistLocalRepo?: string;
+  /** Oldest to newest successful imports, keyed by the opened file path. */
+  deckImportSettings?: Record<string, DeckImportSettings>;
 }
 
 export interface Backend {

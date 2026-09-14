@@ -1,12 +1,13 @@
 import { create } from "zustand";
 import { newId } from "@tenryu-common/core/ids";
 import { getBackend } from "@tenryu-common/backend";
-import type { Backend, ExecResult } from "@tenryu-common/backend/types";
+import type { Backend, ExecResult, DeckImportSettings } from "@tenryu-common/backend/types";
 import RUN_DETACHED_SH from "./core/assets/run_detached.sh?raw";
 import { logLine, logOp } from "@tenryu-common/core/applog";
-import { defaultFormState, migrateFormState, validateFormState, type FormState } from "./core/deck/formState";
-import { generateDeck, generateDeckForSave } from "./core/deck/generate";
+import { defaultFormState, validateFormState, type FormState } from "./core/deck/formState";
 import { extractGuiState } from "./core/deck/roundtrip";
+import { generateDeck, generateDeckForSave } from "./core/deck/generate";
+import { loadDeckText as readDeckText, parseImportEnvironment } from "./core/deck/loadDeck";
 import { parseMeshPreview, type MeshPreviewData } from "./core/meshPreviewParse";
 import { profileBinMissing, type ServerProfile } from "@tenryu-common/core/profiles";
 import { parseLastProgress } from "./core/progressParse";
@@ -295,6 +296,16 @@ export interface AppState {
   saveNamelist(): Promise<void>;
   saveNamelistAs(): Promise<void>;
   loadNamelist(): Promise<void>;
+  loadDeckText(text: string, filename?: string | null, sourceFilename?: string, options?: { autoDetectWorkingDirectory?: boolean }): Promise<string | null>;
+  pendingDeckImport: { text: string; filename: string | null; name: string; error?: string } | null;
+  resolveImportSettings(filename: string | null): AppState["importSettings"];
+  setPendingDeckImport(value: AppState["pendingDeckImport"]): void;
+  importSettings: { venue: "local" | "server"; workingDirectory: string; environmentText: string; venueExplicit?: boolean };
+  deckImportSettings: Record<string, DeckImportSettings>;
+  setImportSettings(value: Partial<AppState["importSettings"]>): void;
+  deckImportBusy: boolean;
+  importReportOpen: boolean;
+  setImportReportOpen(open: boolean): void;
   saveDeckToFile(): Promise<boolean>;
   saveTextAs(suggestedName: string, content: string): Promise<boolean>;
   testConnection(p: ServerProfile): Promise<void>;
@@ -478,6 +489,7 @@ export const useApp = create<AppState>()((set, get) => {
         runs: s.runs.slice(0, MAX_RUN_RECORDS),
         lang: s.lang,
         assistLocalRepo: s.assistLocalRepo || undefined,
+        deckImportSettings: s.deckImportSettings,
       });
     } catch {
       /* non-fatal */
@@ -497,6 +509,26 @@ export const useApp = create<AppState>()((set, get) => {
     formErrors: initialDerived.formErrors,
     deck: initialDerived.deck,
     deckIoStatus: null,
+    pendingDeckImport: null,
+    resolveImportSettings(filename) {
+      // Remembered settings for this file win; otherwise Studio's other server
+      // actions target the selected profile, so the import venue follows it
+      // until the user picks a venue explicitly.
+      const remembered = filename ? get().deckImportSettings[filename] : undefined;
+      const settings = remembered ? {venue:remembered.venue,workingDirectory:remembered.workingDirectory,
+        environmentText:remembered.environmentText,venueExplicit:true} : get().importSettings;
+      const venue = settings.venueExplicit ? settings.venue : (currentProfile(get()) ? "server" : "local");
+      return {...settings, venue};
+    },
+    setPendingDeckImport(pendingDeckImport) {
+      set({pendingDeckImport, importSettings:get().resolveImportSettings(pendingDeckImport?.filename ?? null), ...(pendingDeckImport ? {importReportOpen:false} : {})});
+    },
+    deckImportSettings: {},
+    importSettings: {venue:"local",workingDirectory:"",environmentText:""},
+    setImportSettings(value) { set({importSettings:{...get().importSettings,...value}}); },
+    deckImportBusy: false,
+    importReportOpen: false,
+    setImportReportOpen(open) { set({ importReportOpen: open }); },
     namelistPath: null,
     validating: false,
     validateResult: null,
@@ -559,6 +591,8 @@ export const useApp = create<AppState>()((set, get) => {
           runs: settings.runs ?? [],
           lang,
           assistLocalRepo: settings.assistLocalRepo ?? "",
+          deckImportSettings: Object.fromEntries(Object.entries(settings.deckImportSettings ?? {})
+            .sort(([,a],[,b])=>(a.lastUsedAt ?? 0)-(b.lastUsedAt ?? 0)).slice(-50)),
           ...deriveDeck(form),
         });
       } catch (err) {
@@ -593,6 +627,7 @@ export const useApp = create<AppState>()((set, get) => {
           runs: s.runs.slice(0, MAX_RUN_RECORDS),
           lang,
           assistLocalRepo: s.assistLocalRepo || undefined,
+          deckImportSettings: s.deckImportSettings,
         });
       } catch {
         /* non-fatal */
@@ -719,22 +754,72 @@ export const useApp = create<AppState>()((set, get) => {
       }
     },
 
+    async loadDeckText(text, filename, sourceFilename, options) {
+      if (get().deckImportBusy) return t().deck.importBusy;
+      const before = get().form;
+      set({ deckImportBusy: true });
+      let context = "";
+      try {
+        const embedded = extractGuiState(text);
+        const settings = !embedded.ok && embedded.reason === "no-marker"
+          ? {...get().importSettings} : {venue:"local" as const,workingDirectory:"",environmentText:""};
+        const profile = settings.venue === "server" ? currentProfile(get()) : null;
+        logOp(`deck import ${settings.venue}${profile ? ` profile=${profile.name}` : ""} cwd=${settings.workingDirectory || "(default)"} env=${Object.keys(parseImportEnvironment(settings.environmentText)).join(",") || "(none)"} file=${filename ?? "(paste)"}`);
+        context = t().deck.importContext(
+          settings.venue === "server" ? `${t().deck.importServer}${profile ? `: ${profile.name}` : ""}` : t().deck.importLocal,
+          settings.workingDirectory || t().deck.importDirectoryDefault,
+          Object.keys(parseImportEnvironment(settings.environmentText)).join(", ") || t().deck.importNone,
+        );
+        const repo = settings.venue === "server"
+          ? (profile && /(?:tools\.mesh_planner|TENRYU_REPO)/.test(text) ? await resolveRepoRoot(profile) : null)
+          : get().assistLocalRepo.trim() || get().assistMirror.root;
+        const form = await readDeckText(be(), text, filename, repo, {...settings, sourceFilename, profile,
+          environment:parseImportEnvironment(settings.environmentText),
+          autoDetectWorkingDirectory: options?.autoDetectWorkingDirectory === true});
+        if (get().form !== before) throw new Error(t().deck.importFormChanged);
+        get().loadForm(form);
+        set({ importReportOpen: !!form.deckImport });
+        if (filename && !embedded.ok && embedded.reason === "no-marker") {
+          const {venue,environmentText} = settings;
+          // Remember the directory that actually worked, including an auto-detected one.
+          const workingDirectory = settings.workingDirectory || form.deckImport?.evaluation?.workingDirectory || "";
+          const entries = Object.entries(get().deckImportSettings).filter(([path])=>path !== filename);
+          entries.push([filename,{venue,workingDirectory,environmentText,lastUsedAt:Date.now()}]);
+          set({deckImportSettings:Object.fromEntries(entries.slice(-50))});
+          await persistRuns();
+        }
+        return null;
+      } catch (err) {
+        const detail = context ? `${context}\n${String(err)}` : String(err);
+        logLine("error", `deck import failed: ${detail.split("\n").slice(0, 12).join(" | ")}`);
+        set({ deckIoStatus: { kind: "error", detail } });
+        return detail;
+      } finally {
+        set({ deckImportBusy: false });
+      }
+    },
+
     async loadNamelist() {
+      if (get().deckImportBusy) return;
       try {
         const picked = await be().openLocalTextFile(["py"]);
         if (picked === null) return;
-        const r = extractGuiState(picked.content);
-        if (!r.ok) {
-          const msg = r.reason === "no-marker"
-            ? t().deck.loadErrNoMarker
-            : r.reason === "bad-json"
-              ? t().deck.loadErrBadJson
-              : t().deck.loadErrBadVersion;
-          set({ deckIoStatus: { kind: "error", detail: msg } });
+        const embedded = extractGuiState(picked.content);
+        if (!embedded.ok && embedded.reason === "no-marker") {
+          // Try automatically first; the settings dialog appears only when that fails.
+          set({importSettings:get().resolveImportSettings(picked.path)});
+          const error = await get().loadDeckText(picked.content, picked.path, undefined, {autoDetectWorkingDirectory:true});
+          if (error) {
+            set({deckIoStatus:null});
+            get().setPendingDeckImport({text:picked.content,filename:picked.path,name:picked.name,error});
+            return;
+          }
+          set({ pendingDeckImport:null, namelistPath: picked.path, deckIoStatus: { kind: "loaded", detail: picked.name } });
           return;
         }
-        get().loadForm(migrateFormState(r.state));
-        set({ namelistPath: picked.path, deckIoStatus: { kind: "loaded", detail: picked.name } });
+        const error = await get().loadDeckText(picked.content, picked.path);
+        if (error) return;
+        set({ pendingDeckImport:null, namelistPath: picked.path, deckIoStatus: { kind: "loaded", detail: picked.name } });
       } catch (err) {
         set({ deckIoStatus: { kind: "error", detail: String(err) } });
       }
