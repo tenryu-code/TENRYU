@@ -9304,7 +9304,7 @@ void Builder::set_numerics(py::dict kwargs) {
     }
     const py::dict hydro = py::reinterpret_borrow<py::dict>(hydro_obj);
     enforce_known_keys(hydro, "Numerics.hydro",
-                       {"enabled", "compatible_energy", "T_start_eV", "T_start_inactive_cells", "qei_heat_capacity", "boundary", "boundary_1d", "boundary_2d",
+                       {"enabled", "compatible_energy", "T_start_eV", "T_start_inactive_cells", "qei_heat_capacity", "pressure_tension_cutoff", "pressure_tension_cutoff_value", "boundary", "boundary_1d", "boundary_2d",
                        "av_type", "av_model", "rz_momentum_scheme", "corner_mass_convention",
                        "time_integration", "total_energy_identity_check",
                        "rz_momentum_scheme",
@@ -10465,6 +10465,20 @@ void Builder::set_numerics(py::dict kwargs) {
             "Numerics.hydro.qei_heat_capacity must be one of "
             "{\"ideal_gas\", \"table\"}, got " +
             numerics.hydro.qei_heat_capacity);
+      }
+    }
+    if (has_key(hydro, "pressure_tension_cutoff")) {
+      numerics.hydro.pressure_tension_cutoff = strict_bool(
+          hydro["pressure_tension_cutoff"], "Numerics.hydro.pressure_tension_cutoff");
+    }
+    if (has_key(hydro, "pressure_tension_cutoff_value")) {
+      numerics.hydro.pressure_tension_cutoff_value = numeric_as_double(
+          hydro["pressure_tension_cutoff_value"],
+          "Numerics.hydro.pressure_tension_cutoff_value");
+      if (!(std::isfinite(numerics.hydro.pressure_tension_cutoff_value) &&
+            numerics.hydro.pressure_tension_cutoff_value <= 0.0)) {
+        throw ValueError(
+            "Numerics.hydro.pressure_tension_cutoff_value must be finite and <= 0 (dyn/cm^2)");
       }
     }
     if (has_key(hydro, "boundary")) {

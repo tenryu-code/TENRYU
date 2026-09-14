@@ -634,6 +634,25 @@ __device__ __forceinline__ double total_pressure_device(
   return Pe[i] + Pi[i];
 }
 
+// Numerics.hydro.pressure_tension_cutoff (2026-09-15): a fluid cannot sustain
+// the tension of a tabulated cold curve (the NIF DS liquid-D2 table gives
+// -7 kbar at the initial state with dP/drho|_T < 0, which drives an
+// exponential interface and round-off instability). Applied after every 1D
+// EOS closure: the electron pressure is raised so that P_e + P_i >= p_min
+// (the cold-curve tension lives in the electron table). Temperatures and
+// energies are not modified; the force, the work terms and the artificial
+// viscosity all read the floored pressures.
+__device__ __forceinline__ void apply_pressure_tension_cutoff_body(
+    const int i,
+    double* __restrict__ Pe,
+    const double* __restrict__ Pi,
+    const double p_min) {
+  const double p_total = Pe[i] + Pi[i];
+  if (p_total < p_min) {
+    Pe[i] = p_min - Pi[i];
+  }
+}
+
 __device__ __forceinline__ double interface_developed_shock_weight_1d_device(
     const double* __restrict__ Pe,
     const double* __restrict__ Pi,

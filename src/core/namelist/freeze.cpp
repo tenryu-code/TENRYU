@@ -1360,6 +1360,8 @@ py::dict serialize_numerics(const Config::NumericsConfig& numerics) {
   hydro["compatible_energy"] = numerics.hydro.compatible_energy;
   hydro["T_start_inactive_cells"] = numerics.hydro.T_start_inactive_cells;
   hydro["qei_heat_capacity"] = numerics.hydro.qei_heat_capacity;
+  hydro["pressure_tension_cutoff"] = numerics.hydro.pressure_tension_cutoff;
+  hydro["pressure_tension_cutoff_value"] = numerics.hydro.pressure_tension_cutoff_value;
   hydro["rho_e_linear_grid"] = numerics.hydro.rho_e_linear_grid;
   hydro["eos_writeback"] = numerics.hydro.eos_writeback;
   hydro["eos_closure_mode"] = numerics.hydro.eos_closure_mode;

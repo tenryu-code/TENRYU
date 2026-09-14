@@ -1913,6 +1913,8 @@ Numerics(
   - `conservation_residual_hard_warning_threshold_rel: float`（既定 `1.0e-10`；有効範囲 `>= conservation_residual_warn_threshold_rel`）
 - `hydro: dict`
   - `T_start_eV: float`（既定 `0.0` [eV]；有効範囲：`≥ 0`；Hydro開始温度閾値。セルごとに `T_e >= T_start_eV` を判定し、閾値未満のセルではHydro（メッシュ移動）をスキップする。0.0 = 全セル常時有効。一度活性化したセルは以降判定をスキップ（一方向スイッチ）。リスタート時は `hydro_active` フラグから復元（§7.4参照）。NUMERICS §2.1.1参照）
+  - `pressure_tension_cutoff: bool`（既定 `False`；`True` で 1D の各 EOS 閉包の直後に電子圧を引き上げ、全圧 \(P_e+P_i\) を `pressure_tension_cutoff_value` 以上にする（張力カットオフ）。流体は表 EOS の cold curve の張力を支えられない — PROPACEOS 由来の液体 D2 表は初期状態で −7 kbar かつ \(\partial P/\partial\rho|_T<0\) で、界面と丸め誤差の指数的不安定を駆動する。温度・エネルギーは変えず、力・仕事・人工粘性は同じ床付き圧力を読む。`Main.dimension="1D_SPH"` 専用。NUMERICS §3 参照。2026-09-15）
+  - `pressure_tension_cutoff_value: float`（既定 `0.0` [dyn/cm²]；有効範囲 `<= 0`、有限。`pressure_tension_cutoff=True` のときの全圧の下限）
   - `T_start_inactive_cells: str`（既定 `"passive_fill"`；許可値 `{"passive_fill", "rigid_wall"}`；`T_start_eV > 0` のときの非活性セルの扱い。`"passive_fill"` = 従来（圧力寄与ゼロ、隣接セルのいずれかが活性ならノードが動く、低密度フィル専用）。`"rigid_wall"` = ノードは両側のセルが活性のときだけ動き、非活性セルは剛体壁として体積・エネルギーを保持、電子イオン緩和は非活性セルでもマスクしない（多材料の高密度界面向け、閾値は初期温度のすぐ上に置く）。`"rigid_wall"` は `Main.dimension="1D_SPH"` 専用。NUMERICS §2.1.1参照）
   - `qei_heat_capacity: str`（既定 `"ideal_gas"`；許可値 `{"ideal_gas", "table"}`；1D Lagrangian の 2T エネルギー更新（非 compatible 経路）の電子イオン緩和に使う比熱の計量。`"ideal_gas"` = 従来（理想気体の解析比熱、bit 凍結）。`"table"` = 表閉包の \(c_{v,e}, c_{v,i}\)（compatible 経路と同じ; 表の低温比熱が理想値より桁で小さい材料では解析比熱の緩和が過剰移動して振動するため、表 EOS の冷たいデッキで推奨）。`"table"` は `Main.dimension="1D_SPH"` 専用。NUMERICS [2026-09-14 追補 2] 参照）
   - `axis_motion_floor_fraction: float`（既定 `0.0` [無次元]；有効範囲：`[0, 1]`；2D_RZ 専用の Lagrangian axis-row preflight。`0` で無効。`>0` では Predictor/Corrector の位置 commit 前に \(i=1\) row の radial motion を縮小し、各 axis-row cell の analytic margin が commit 前 margin のこの割合以上に残るようにする。NUMERICS §3.2.12a 参照）
@@ -3605,6 +3607,7 @@ Langdon default-on (2026-08-10): `Laser.ib.langdon_model` gains `"auto"` (new de
 - debug：trace_mesh_motion=False, trace_mesh_node_selector=`"outer_equator"`, trace_mesh_cell=7, trace_max_steps=5
 - hydro T_start_eV=0.0（常時有効；NUMERICS §2.1.1準拠）
 - hydro T_start_inactive_cells="passive_fill"（許可値 `{"passive_fill","rigid_wall"}`；NUMERICS §2.1.1準拠）
+- hydro pressure_tension_cutoff=False, pressure_tension_cutoff_value=0.0（張力カットオフ；NIF DS デッキ `examples/nifds/liquid_d2_1d.py` は True。NUMERICS §3 参照）
 - hydro qei_heat_capacity="ideal_gas"（許可値 `{"ideal_gas","table"}`；NUMERICS [2026-09-14 追補 2] 準拠）
 - hydro corner_mass_convention = "kinematic_basis_rz_v1"
 - hydro time_integration = "midpoint_v1", total_energy_identity_check = False

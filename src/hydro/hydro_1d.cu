@@ -455,6 +455,18 @@ __global__ void compute_density_kernel(double* __restrict__ rho,
       (i >= own_begin && i < own_end) ? rho_clamp_count : nullptr);
 }
 
+__global__ void apply_pressure_tension_cutoff_kernel(double* __restrict__ Pe,
+                                                     const double* __restrict__ Pi,
+                                                     const int c_begin,
+                                                     const int c_end,
+                                                     const double p_min) {
+  const int i = c_begin + blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= c_end) {
+    return;
+  }
+  persistent_1d::apply_pressure_tension_cutoff_body(i, Pe, Pi, p_min);
+}
+
 __global__ void enforce_1t_closure_kernel(double* __restrict__ ee,
                                           double* __restrict__ ei,
                                           double* __restrict__ Te,
@@ -3063,6 +3075,12 @@ void enforce_1t_closure(
       inverse_failure_count,
       exact_override_kind, cv_e_ptr, cv_i_ptr);
   sync_kernel("Hydro1D enforce_1t_closure kernel failed");
+  if (cfg.numerics.hydro.pressure_tension_cutoff) {
+    apply_pressure_tension_cutoff_kernel<<<fw.blocks(), 256>>>(
+        state.Pe.data(), state.Pi.data(), fw.begin, fw.end,
+        cfg.numerics.hydro.pressure_tension_cutoff_value);
+    sync_kernel("Hydro1D pressure tension cutoff (1T) kernel failed");
+  }
   // cv override: replace table cv with exact ideal gas cv after closure
   if (exact_override_kind == kExactOverrideCv && cv_e_ptr != nullptr) {
     const double cv_ig = diagnostic_cv_i_mass(mat.A) + diagnostic_cv_e_mass(mat.A, mat.Z);
@@ -3111,6 +3129,12 @@ void enforce_2t_closure(
       inverse_failure_count,
       exact_override_kind, cv_e_ptr, cv_i_ptr);
   sync_kernel("Hydro1D enforce_2t_closure kernel failed");
+  if (cfg.numerics.hydro.pressure_tension_cutoff) {
+    apply_pressure_tension_cutoff_kernel<<<fw.blocks(), 256>>>(
+        state.Pe.data(), state.Pi.data(), fw.begin, fw.end,
+        cfg.numerics.hydro.pressure_tension_cutoff_value);
+    sync_kernel("Hydro1D pressure tension cutoff (2T) kernel failed");
+  }
   // cv override: replace table cv with exact ideal gas cv after 2T closure
   if (exact_override_kind == kExactOverrideCv) {
     if (cv_e_ptr != nullptr) {
@@ -3567,14 +3591,19 @@ void log_initial_mechanical_stability(const core::State& state, const core::Conf
     const double Ti_c = std::max(Ti.empty() ? Te_c : Ti[c], Ti_floor);
     const double rho_m = rho[c] * 0.98;
     const double rho_p = rho[c] * 1.02;
-    const double P_m = tab->ion.pressure(rho_m, Ti_c) + tab->electron.pressure(rho_m, Te_c);
-    const double P_p = tab->ion.pressure(rho_p, Ti_c) + tab->electron.pressure(rho_p, Te_c);
+    double P_m = tab->ion.pressure(rho_m, Ti_c) + tab->electron.pressure(rho_m, Te_c);
+    double P_p = tab->ion.pressure(rho_p, Ti_c) + tab->electron.pressure(rho_p, Te_c);
+    if (cfg.numerics.hydro.pressure_tension_cutoff) {
+      // The closure floors the total pressure; the floored branch is flat (dP/drho = 0).
+      P_m = std::max(P_m, cfg.numerics.hydro.pressure_tension_cutoff_value);
+      P_p = std::max(P_p, cfg.numerics.hydro.pressure_tension_cutoff_value);
+    }
     if (!std::isfinite(P_m) || !std::isfinite(P_p)) {
       continue;
     }
     ++n_checked;
     const double dpdr = (P_p - P_m) / (rho_p - rho_m);
-    if (dpdr > 0.0) {
+    if (!(dpdr < 0.0)) {
       continue;
     }
     ++n_unstable;
@@ -3588,7 +3617,7 @@ void log_initial_mechanical_stability(const core::State& state, const core::Conf
     return;
   }
   std::ostringstream oss;
-  oss << std::setprecision(4) << "Hydro1D: EOS isothermal compressibility is non-positive (dP/drho|_T <= 0) in "
+  oss << std::setprecision(4) << "Hydro1D: EOS isothermal compressibility is negative (dP/drho|_T < 0) in "
       << n_unstable << " of " << n_checked << " non-void table-EOS cells at the initial state: rho in ["
       << rho_lo << ", " << rho_hi << "] g/cc, Te in [" << T_lo << ", " << T_hi
       << "] eV, min dP/drho|_T = " << dpdr_min * 1.0e-9 << " kbar/(g/cc)"
