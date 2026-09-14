@@ -12,6 +12,7 @@
 - **多材料の 1D 閉包が先頭材料の表に固定されていた。** hydro の EOS 閉包・音速・2T エネルギー更新、輻射の物質更新、Qei、レーザー／燃焼の入射、伝導の再閉包、初期化を各セルの支配材料の表で閉じるようにしました。表の密度下限未満は理想気体へ切り替えず最下行へクランプ。再閉包の表天井キャッシュは Config の表で鍵付け。
 - `Materials.materials[].opacity.tmat_skip_lte_repair` が namelist 検証時の変換にしか効いておらず、実行時の表再読み込み（FLD 1D/2D・S_N 1D/2D・IMC・persistent loop・硬 X 線診断）では常に修復が適用されていました。全読み込み点へ配線。
 - 表 EOS の音速テスト（`test_hydro_table_eos`）の期待値を、2026-07-26 の解析的局所微分（log 双線形補間の微分は格子節点で 1 次誤差）に合わせて更新（節点 5 %、log 中点 1 % の 2 段検査）。実装は不変。
+- **IMC 用の Fleck 因子下限による Δt 制約（`Numerics.dt.f_min_fleck`）が FLD / S_N の run にも掛かっていた。** NUMERICS §2.2 (c) の根拠は Monte Carlo の分散悪化で、FLD 側は f に下限を設けない仕様なのに、駆動側は輻射が有効なら常にこの Δt を評価していました。表 EOS の電子熱容量が表の床にある冷たく光学的に厚いセル（SESAME の液体 D2、25 meV）では β が発散して Δt が 1e-21 s に落ち、計算が進まなくなります（NIF DS デッキ、Tr = 55 eV）。`Radiation.mode = imc_ddmc` 以外では評価しないようにしました（persistent loop の複製も同じ）。1D FLD の既定経路（gxii / cbet の回帰、Marshak 波、灰色 FLD の輻射衝撃波・球面 5 % 摂動、Hammer–Rosen）は状態量が bit 一致で、変わるのは履歴ファイルの診断列 `diagnostics/dt_breakdown_history/dt_rad`（候補値が +∞ になる）だけです。
 - gxii 1D FLD 回帰の golden を、文書化済みの既定変更（Langdon 既定 ON など）の後に再基準化。
 
 ### 機能追加
@@ -20,7 +21,7 @@
 - **`Materials.materials[].opacity.tmat_kirchhoff_pe`（既定 False）。** True で TMAT 読み込み時に全ノード・全群で \(\kappa_{PE}:=\kappa_{PA}\)（Kirchhoff の法則）。PROPACEOS 由来の表は各群の Wien 裾で \(\kappa_{PE}\) が 1e-99 へアンダーフローしたり \(\kappa_{PA}\) の 10³ 倍になったりして Fleck 因子が数 meV で桁跳びし、外側反復が収束しません。LTE 表ではこれを True にします（`is_lte` 属性は変えず値だけ置換）。
 - `Numerics.hydro.qei_heat_capacity`（既定 `"ideal_gas"` = 従来の算術、`"table"` = 表の \(c_{v,e}, c_{v,i}\) で Qei を計量）。表の低温電子比熱が理想値より桁で小さいとき、理想計量の Qei が \(T_e\) を過大に動かして振動する問題への対応。
 - `Numerics.hydro.T_start_inactive_cells="rigid_wall"`（既定 `"passive_fill"` は不変）: セル単位の hydro 開始温度で非活性のセルを剛体壁として扱う変種。非活性セルはプラズマ端と一緒に平行移動しません。
-- **張力カットオフ `Numerics.hydro.pressure_tension_cutoff`（既定 False）。** True で 1D の各 EOS 閉包の直後に電子圧を引き上げ、全圧 \(P_e+P_i\) を `pressure_tension_cutoff_value`（既定 0、\(\le0\) [dyn/cm²]）以上にします。流体は表 EOS の cold curve の張力を支えられません — PROPACEOS 由来の液体 D2 表は初期状態（0.17 g/cc、1 meV）で −7 kbar かつ \(\partial P/\partial\rho|_T<0\) で、D2/CH 界面の膨張と燃料内部の密度波（丸め誤差の指数成長）を駆動していました。温度・エネルギーは変えず、力・仕事・人工粘性は同じ床付き圧力を読みます。NIF DS デッキの 3 ns 検証で界面変位 0.044 µm → 0、燃料内部の密度摂動なし。単体テスト `test_hydro_1d_step`（tension ケース）。
+- **張力カットオフ `Numerics.hydro.pressure_tension_cutoff`（既定 False）。** True で 1D の各 EOS 閉包の直後に、全圧 \(P_e+P_i\) が `pressure_tension_cutoff_value`（既定 0、\(\le0\) [dyn/cm²]）を下回るセルの両種の圧力を同じ比で縮めて全圧をその値にします（値 0 なら両種とも 0 で、床付き相では pdV 仕事をしません）。流体は表 EOS の cold curve の張力を支えられません — PROPACEOS 由来の液体 D2 表は初期状態（0.17 g/cc、1 meV）で −7 kbar かつ \(\partial P/\partial\rho|_T<0\) で、D2/CH 界面の膨張と燃料内部の密度波（丸め誤差の指数成長）を駆動していました。温度・エネルギーは変えず、力・仕事・人工粘性は同じ床付き圧力を読みます。NIF DS デッキの 3 ns 検証で界面変位 0.044 µm → 0、燃料内部の密度摂動なし。単体テスト `test_hydro_1d_step`（tension ケース）。
 - **起動時診断: 初期状態の力学的安定性。** 各セルの支配材料のイオン表+電子表から \(\partial P_{\rm tot}/\partial\rho|_T\) を評価し、非正（スピノーダル、または非物理的な cold curve）のセル数・\(\rho, T_e\) の範囲・最小値を WARNING で報告します（状態は変えません）。床温度に固定されたセルの応答は等温で、そこでは Lagrange 格子が丸め誤差を指数的に増幅します（NUMERICS §3）。
 - 1D FLD: 放射エネルギーの保存的メッシュ移流 `hydro_coupling="conservative_advection"`（opt-in、1D Lagrangian のホスト駆動ループ）。
 - 等質量の自動分割 `Mesh.auto_regions`（等厚の区画を等セル数で分割し、材料境界で質量比を合わせる）。NIF 直接駆動の設計スタディ（`examples/nifds/`）は開発用ワークツリーのパスと未同梱の表に依存するため、このスナップショットには含めません。

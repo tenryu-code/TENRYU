@@ -1835,6 +1835,7 @@ f_c = \frac{1}{1 + \alpha\,c\,\beta_c\,\sigma_{P,c}\,\Delta t}
 
 > \(f_{\min}\) が小さいほど制約は緩い。\(f_{\max}\)（SPECIFICATION §6.4.5、Fleck factor上限）とは独立のパラメータ。
 > この下限は IMC 側 Fleck にのみ適用する。FLD 側 Fleck は stiff-cell 極限を保つため下限を使わない。
+> 実装（2026-09-15）: \(\Delta t_{rad}\) を計算する `compute_dt_rad_limit`（`src/radiation/fleck.cu`）は `Radiation.mode = imc_ddmc` のときだけ有限値を返し、`multigroup_diffusion`（FLD）と `sn_transport` では \(+\infty\)（駆動側の \(\Delta t\) 選択に入らない）。persistent loop の複製 `persistent_fld_dt_rad` も同じく \(+\infty\)。それ以前は輻射が有効な全モードで評価されており、表 EOS の電子熱容量が表の床（`EOSTable` の \(10^{-3}\) erg/(g·eV)）にあるセルでは \(\beta_c\) が発散し、冷たく光学的に厚いセルで \(\Delta t_{rad}\sim10^{-21}\) s になって計算が止まっていた（NIF DS 液体 D2 デッキ、SESAME 表、\(T_r=55\) eV：セル 197、\(T_e=25\) meV、\(\rho=0.29\) g/cc、\(\sigma_P=4.8\times10^{10}\) cm\(^{-1}\)、\(\beta=30\)）。既定経路（gxii / cbet 回帰、Marshak 波、灰色 FLD 輻射衝撃波、Hammer–Rosen）では制約が効いていなかったので状態量は bit 一致で、変わるのは履歴の診断列 `diagnostics/dt_breakdown_history/dt_rad`（+∞）だけ。
 
 > **σ_P 陳腐化に関する注意**：\(\sigma_{P,c}\) は Phase 4（Radiation演算子冒頭）で計算される。
 > Phase 5（Hydro 半ステップ後半）で \(T_e\) が変化するため、Phase 6 の \(\Delta t_{rad}\) 計算時には

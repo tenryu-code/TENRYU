@@ -14,6 +14,7 @@ import {
 } from "./meshAuto";
 import { t } from "../../i18n";
 import { BEAM_PRESETS } from "./beamPresets";
+import { generateImportedDeck } from "./deckImport";
 
 export class GeneratorError extends Error {}
 
@@ -72,6 +73,11 @@ function emitPiecewise(
 }
 
 export function generateDeck(f: FormState): string {
+  if (f.deckImport) {
+    const plain = { ...f };
+    delete plain.deckImport;
+    return generateImportedDeck(f, generateDeck(plain));
+  }
   const errs = validateFormState(f);
   if (errs.length > 0) {
     throw new GeneratorError(t().validation.formHasErrors + "\n- " + errs.join("\n- "));

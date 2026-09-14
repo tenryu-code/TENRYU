@@ -14,6 +14,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     providers.install_cancellation_handlers()
     parser = argparse.ArgumentParser(prog="assist.py")
     subparsers = parser.add_subparsers(dest="subcommand", required=True)
+    import_parser = subparsers.add_parser("import-deck")
+    import_input = import_parser.add_mutually_exclusive_group(required=True)
+    import_input.add_argument("--deck")
+    import_input.add_argument("--request", help="JSON request file (record/verify/compare)")
+    import_parser.add_argument("--repo-root")
+    import_parser.add_argument("--timeout", type=float, default=30)
     status_parser = subparsers.add_parser("status")
     status_parser.add_argument("--config")
     status_parser.add_argument(
@@ -102,6 +108,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     ask_parser.add_argument("--json", action="store_true")
     ask_parser.add_argument("--print-prompt", action="store_true")
     args = parser.parse_args(argv)
+
+    if args.subcommand == "import-deck":
+        from tools.assist.deck_import import main_import_deck
+
+        return main_import_deck(args)
 
     if args.subcommand == "status":
         try:

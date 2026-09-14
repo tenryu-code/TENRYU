@@ -3020,73 +3020,15 @@ __device__ void persistent_conduction_step(const PersistentParams& p,
   pk_sync(p);
 }
 
-__device__ double persistent_fld_dt_rad(const PersistentParams& p,
-                                        const PersistentDeviceBuffers& b,
-                                        double* smem_v,
-                                        int* smem_i) {
-  if (p.radiation_enabled == 0) {
-    return CUDART_INF;
-  }
-  double local_min = CUDART_INF;
-  int local_idx = INT_MAX;
-  for (int c = pk_thread_id(p); c < p.n_cells; c += pk_thread_stride(p)) {
-    if (b.cell_is_void != nullptr && b.cell_is_void[c] != 0U) {
-      continue;
-    }
-    const double rho_raw = b.rho[c];
-    if (!(rho_raw >= p.rho_floor)) {
-      continue;
-    }
-    const double sigma_P =
-        fmax(rho_raw, 0.0) * persistent_constant_opacity_kappa_a(p, b, c);
-    if (!(sigma_P > 0.0)) {
-      continue;
-    }
-    const double Te_c = fmax(b.Te[c], p.Te_floor);
-    const bool has_cv_e_cell =
-        p.fld_has_cv_e != 0 && b.cv_e != nullptr && b.cv_e[c] > 0.0;
-    double Cv_e = -1.0;
-    if (p.cv_e_override > 0.0) {
-      Cv_e = p.cv_e_override;
-    } else if (has_cv_e_cell) {
-      Cv_e = fmax(rho_raw, 0.0) * b.cv_e[c];
-    } else {
-      const double z = fmax(b.zbar[c], 0.0);
-      const double A_c = (b.A_eff != nullptr) ? fmax(b.A_eff[c], 1.0e-12)
-                                              : fmax(p.material_A, 1.0e-12);
-      const double gm1_c =
-          (b.gamma_eff != nullptr)
-              ? fmax(b.gamma_eff[c] - 1.0, 1.0e-12)
-              : fmax(p.material_gm1, 1.0e-12);
-      const double cv_mass_e =
-          z * core::constants::eV_to_erg /
-          (A_c * core::constants::proton_mass * gm1_c);
-      Cv_e = fmax(rho_raw, 0.0) * cv_mass_e;
-    }
-    Cv_e = fmax(Cv_e, 1.0e-30);
-    double beta =
-        4.0 * core::constants::a_eV * Te_c * Te_c * Te_c / Cv_e;
-    if (p.cv_e_override <= 0.0 && !has_cv_e_cell) {
-      beta = fmin(beta, 1.0);
-    }
-    const double denom =
-        p.fld_f_min * p.fld_alpha * core::constants::c_light * beta * sigma_P;
-    if (!(denom > 0.0)) {
-      continue;
-    }
-    const double candidate = (1.0 - p.fld_f_min) / denom;
-    if (candidate < local_min ||
-        (candidate == local_min && c < local_idx)) {
-      local_min = candidate;
-      local_idx = c;
-    }
-  }
-  double min_local = CUDART_INF;
-  int min_idx = INT_MAX;
-  pk_reduce_argmin(p, b, local_min, local_idx, smem_v, smem_i, &min_local,
-                   &min_idx);
-  (void)min_idx;
-  return min_local;
+// Numerics.dt.f_min_fleck is an IMC-only time-step constraint (NUMERICS
+// §2.2 (c)); the persistent FLD loop never applies it, matching
+// compute_dt_rad_limit, which returns +inf unless Radiation.mode = imc_ddmc
+// (2026-09-15). The signature is kept so the dt ladder call site is unchanged.
+__device__ double persistent_fld_dt_rad(const PersistentParams& /*p*/,
+                                        const PersistentDeviceBuffers& /*b*/,
+                                        double* /*smem_v*/,
+                                        int* /*smem_i*/) {
+  return CUDART_INF;
 }
 
 template <int GEOM>

@@ -7,6 +7,8 @@ import { currentProfile, useApp, type SectionKey } from "./store";
 import ChatDock from "./ui/ChatDock";
 import CommandPalette from "./ui/CommandPalette";
 import DeckPreview from "./ui/DeckPreview";
+import DeckLoadDialog from "./ui/DeckLoadDialog";
+import DeckImportReport from "./ui/DeckImportReport";
 import DeckView from "./ui/DeckView";
 import HistoryView from "./ui/HistoryView";
 import AssistantView from "./ui/AssistantView";
@@ -45,6 +47,7 @@ export default function App() {
   const starting = useApp((s) => s.starting);
   const form = useApp((s) => s.form);
   const deckIoStatus = useApp((s) => s.deckIoStatus);
+  const deckImportBusy = useApp((s) => s.deckImportBusy);
   const loadNamelist = useApp((s) => s.loadNamelist);
   const saveNamelist = useApp((s) => s.saveNamelist);
   const saveNamelistAs = useApp((s) => s.saveNamelistAs);
@@ -220,13 +223,22 @@ export default function App() {
         </Button>
       </header>
 
-      {loadError ? (
-        <div className="border-b px-4 py-1 text-xs" style={{ borderColor: "var(--separator)", color: "var(--err)" }}>
-          {m.errors.bridgeDown} ({loadError})
-        </div>
-      ) : (
-        <div />
-      )}
+      <div>
+        {deckImportBusy && <div role="status" className="px-4 py-2 text-xs">{m.deck.importBusy}</div>}
+        {deckIoStatus?.kind === "error" && <details open className="max-h-56 overflow-auto border-b px-4 py-2 text-xs" style={{color:"var(--err)",borderColor:"var(--separator)"}}>
+          <summary>{deckIoStatus.detail.split("\n")[0]}</summary>
+          <pre className="whitespace-pre-wrap break-words">{deckIoStatus.detail}</pre>
+          <Button onClick={()=>useApp.setState({deckIoStatus:null})}>{m.common.close}</Button>
+        </details>}
+
+        {loadError ? (
+          <div className="border-b px-4 py-1 text-xs" style={{ borderColor: "var(--separator)", color: "var(--err)" }}>
+            {m.errors.bridgeDown} ({loadError})
+          </div>
+        ) : (
+          <div />
+        )}
+      </div>
 
       <div
         className="grid min-h-0"
@@ -322,7 +334,7 @@ export default function App() {
         {deckIoStatus !== null && (
           <StatusItem tone={deckIoStatus.kind === "error" ? "err" : "muted"}>
             {deckIoStatus.kind === "saved" ? m.deckIo.saved : deckIoStatus.kind === "loaded" ? m.deckIo.loaded : ""}
-            {deckIoStatus.detail}
+            {deckIoStatus.detail.split("\n")[0]}
           </StatusItem>
         )}
         {namelistPath !== null && (
@@ -360,6 +372,8 @@ export default function App() {
           { id: "load", label: m.deckIo.menuLoad, hint: "⌘O", run: () => void loadNamelist() },
         ]}
       />
+      <DeckImportReport />
+      <DeckLoadDialog />
     </div>
   );
 }

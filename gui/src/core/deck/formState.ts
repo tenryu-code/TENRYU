@@ -4,6 +4,7 @@ import { defaultShape2D, type Shape2D } from "../geometry2d";
 import { t } from "../../i18n";
 import { computeRegionSegments2d, computeShapeRadialRegions } from "./meshAuto";
 import { BEAM_PRESETS, expandedPairCount, PAIR_CAP } from "./beamPresets";
+import type { DeckImportState } from "./deckImport";
 
 // Flux-limiter default per electron-transport model. 0.06 is the tuned local
 // (Spitzer-Harm) limiter. Under SNB the cap is a safety guard only (NUMERICS
@@ -321,6 +322,8 @@ export interface FormState {
     checkpointEveryS: Q | null;
   };
   customPythonBlock: string;
+  /** Optional v1 extension; absent on old GUI decks. */
+  deckImport?: DeckImportState;
 }
 
 /** Ensure a background-gas material named "gas" exists and is assigned as the 2D
@@ -701,6 +704,7 @@ export function migrateFormState(raw: FormState): FormState {
     merged.mesh.zMax = { ...merged.mesh.rMax };
   }
   if (
+    !raw.deckImport &&
     merged.main.dimension === "2D_RZ" &&
     (!Array.isArray(raw.geometry?.shapes2d) || raw.geometry.shapes2d.length === 0) &&
     Array.isArray(raw.geometry?.regions) &&

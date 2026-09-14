@@ -115,16 +115,15 @@ describe("namelist IO", () => {
     expect(useApp.getState().namelistPath).toBeNull();
   });
 
-  it("load reports a non-GUI deck", async () => {
+  it("headerless file open tries an automatic import and falls back to the settings dialog", async () => {
     const before = structuredClone(useApp.getState().form);
     fake.openResult = { name: "x.py", path: "/tmp/x.py", content: "print(1)" };
 
     await useApp.getState().loadNamelist();
 
-    expect(useApp.getState().deckIoStatus).toEqual({
-      kind: "error",
-      detail: t().deck.loadErrNoMarker,
-    });
+    expect(useApp.getState().pendingDeckImport).toMatchObject({text:"print(1)",filename:"/tmp/x.py",name:"x.py"});
+    expect(useApp.getState().pendingDeckImport?.error).toContain("Invalid import temporary directory");
+    expect(useApp.getState().deckIoStatus).toBeNull();
     expect(useApp.getState().form).toEqual(before);
   });
 

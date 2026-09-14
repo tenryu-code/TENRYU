@@ -9,11 +9,13 @@ export default function RemoteFileBrowser({
   initialPath,
   onPick,
   onClose,
+  mode = "file",
 }: {
   title: string;
   initialPath: string;
   onPick: (path: string) => void;
   onClose: () => void;
+  mode?: "file" | "directory";
 }) {
   const m = t();
   const listRemoteDir = useApp((s) => s.listRemoteDir);
@@ -45,16 +47,17 @@ export default function RemoteFileBrowser({
   }, [onClose]);
 
   const entries = (listing?.ok ? listing.entries : []).filter(
-    (entry) => entry.dir || !onlyH5 || entry.name.endsWith(".h5"),
+    (entry) => mode === "directory" || entry.dir || !onlyH5 || entry.name.endsWith(".h5"),
   );
 
   return (
     <div
-      className="fixed inset-0 z-10 flex items-center justify-center"
+      className="fixed inset-0 z-[60] flex items-center justify-center"
       style={{ background: "rgba(0,0,0,0.4)" }}
       onClick={onClose}
     >
       <div
+        role="dialog" aria-modal="true" aria-label={title}
         className="flex max-h-[70vh] min-h-[320px] w-[640px] flex-col gap-2 rounded-lg border p-4"
         style={{ background: "var(--bg-panel)", borderColor: "var(--separator)" }}
         onClick={(e) => e.stopPropagation()}
@@ -65,15 +68,22 @@ export default function RemoteFileBrowser({
           <Button onClick={onClose}>{m.common.cancel}</Button>
         </div>
         <div className="flex items-center gap-2">
+          <Button
+            disabled={busy || path === "/"}
+            title={remoteParentDir(path || pathInput)}
+            onClick={() => void load(remoteParentDir(path || pathInput))}
+          >
+            {m.remoteFs.up}
+          </Button>
           <TextInput
             value={pathInput}
             onChange={(e) => setPathInput(e.target.value)}
             onKeyDown={(e) => {
-              if (e.key === "Enter") void load(pathInput);
+              if (e.key === "Enter" && !busy) void load(pathInput);
             }}
             style={{ fontFamily: "var(--mono)" }}
           />
-          <Button onClick={() => void load(pathInput)}>{m.remoteFs.go}</Button>
+          <Button disabled={busy} onClick={() => void load(pathInput)}>{m.remoteFs.go}</Button>
         </div>
         {listing !== null && !listing.ok && (
           <div className="text-xs" style={{ color: "var(--err)", fontFamily: "var(--mono)" }}>
@@ -88,7 +98,7 @@ export default function RemoteFileBrowser({
           <div
             className={`px-2 py-1 ${path === "/" ? "cursor-default opacity-40" : "cursor-pointer hover:bg-[var(--bg-inset)]"}`}
             onClick={() => {
-              if (path !== "/") void load(remoteParentDir(path));
+              if (!busy && path !== "/") void load(remoteParentDir(path));
             }}
           >
             ..
@@ -96,11 +106,12 @@ export default function RemoteFileBrowser({
           {entries.map((entry) => (
             <div
               key={`${entry.dir ? "d" : "f"}-${entry.name}`}
-              className="cursor-pointer px-2 py-1 hover:bg-[var(--bg-inset)]"
+              className={`px-2 py-1 ${mode === "directory" && !entry.dir ? "opacity-40" : "cursor-pointer hover:bg-[var(--bg-inset)]"}`}
               onClick={() => {
+                if (busy) return;
                 const selected = joinRemoteDir(path, entry.name);
                 if (entry.dir) void load(selected);
-                else onPick(selected);
+                else if (mode === "file") onPick(selected);
               }}
             >
               {entry.name}
@@ -114,20 +125,21 @@ export default function RemoteFileBrowser({
           )}
         </div>
         <div className="flex items-center gap-2">
-          <label className="flex items-center gap-2 text-xs">
+          {mode === "file" && <label className="flex items-center gap-2 text-xs">
             <input
               type="checkbox"
               checked={onlyH5}
               onChange={(e) => setOnlyH5(e.target.checked)}
             />
             {m.remoteFs.onlyH5}
-          </label>
+          </label>}
           <div className="flex-1" />
           {busy && (
             <span className="text-xs" style={{ color: "var(--fg-secondary)" }}>
               {m.server.testing}
             </span>
           )}
+          {mode === "directory" && <Button variant="primary" disabled={busy || !listing?.ok} onClick={()=>onPick(path)}>{m.remoteFs.selectFolder}</Button>}
         </div>
       </div>
     </div>

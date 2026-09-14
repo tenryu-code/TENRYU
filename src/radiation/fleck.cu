@@ -515,6 +515,16 @@ double compute_dt_rad_limit(const core::State& state,
   if (!cfg.radiation.enabled || state.rho.empty()) {
     return std::numeric_limits<double>::infinity();
   }
+  // Numerics.dt.f_min_fleck is an IMC constraint (NUMERICS §2.2 (c)): a small
+  // Fleck factor inflates the effective scattering and the Monte Carlo
+  // variance. The FLD and S_N linearizations keep f unbounded below
+  // (SPECIFICATION §6.4.7), so the constraint does not apply to them. Before
+  // 2026-09-15 it was evaluated for every radiation mode; with a table EOS
+  // whose electron heat capacity sits at the table floor, beta diverges and a
+  // cold opaque cell drove dt to ~1e-21 s (NIF DS liquid-D2 deck, SESAME).
+  if (cfg.radiation.mode != core::RadiationMode::ImcDdmc) {
+    return std::numeric_limits<double>::infinity();
+  }
   if (cfg.materials.materials.empty()) {
     return std::numeric_limits<double>::infinity();
   }
