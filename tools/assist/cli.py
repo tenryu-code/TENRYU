@@ -5,15 +5,26 @@ import json
 import sys
 from typing import List, Optional
 
+from tools.assist import providers
 from tools.assist.config import AssistConfigError, load_config, resolved_summary
 from tools.assist.tomlmini import TomlSubsetError
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    providers.install_cancellation_handlers()
     parser = argparse.ArgumentParser(prog="assist.py")
     subparsers = parser.add_subparsers(dest="subcommand", required=True)
     status_parser = subparsers.add_parser("status")
     status_parser.add_argument("--config")
+    status_parser.add_argument(
+        "--config-or-defaults",
+        dest="config_or_defaults",
+        metavar="PATH",
+        help=(
+            "use PATH when it exists, otherwise the built-in defaults; "
+            "skips the configuration discovery"
+        ),
+    )
     status_parser.add_argument("--json", action="store_true")
 
     digest_parser = subparsers.add_parser("digest")
@@ -51,16 +62,53 @@ def main(argv: Optional[List[str]] = None) -> int:
     generate_parser.add_argument("--max-iters", type=int, default=10)
     generate_parser.add_argument("--workdir")
     generate_parser.add_argument("--config")
+    generate_parser.add_argument(
+        "--config-or-defaults",
+        dest="config_or_defaults",
+        metavar="PATH",
+        help=(
+            "use PATH when it exists, otherwise the built-in defaults; "
+            "skips the configuration discovery"
+        ),
+    )
 
     freeze_parser = subparsers.add_parser("freeze-baseline")
     freeze_parser.add_argument("deck")
     freeze_parser.add_argument("--tenryu")
     freeze_parser.add_argument("-o", "--output")
+
+    docmap_parser = subparsers.add_parser("docmap")
+    docmap_parser.add_argument("--repo-root")
+    docmap_parser.add_argument("-o", "--output")
+    docmap_parser.add_argument("--keys-out")
+
+    ask_parser = subparsers.add_parser("ask")
+    ask_parser.add_argument("question", nargs="?")
+    ask_parser.add_argument("--question-file")
+    ask_parser.add_argument("--config")
+    ask_parser.add_argument(
+        "--config-or-defaults",
+        dest="config_or_defaults",
+        metavar="PATH",
+        help=(
+            "use PATH when it exists, otherwise the built-in defaults; "
+            "skips the configuration discovery"
+        ),
+    )
+    ask_parser.add_argument("--workdir")
+    ask_parser.add_argument("--repo-root")
+    ask_parser.add_argument("--max-history", type=int, default=6)
+    ask_parser.add_argument("--timeout-s", type=int, default=900)
+    ask_parser.add_argument("--json", action="store_true")
+    ask_parser.add_argument("--print-prompt", action="store_true")
     args = parser.parse_args(argv)
 
     if args.subcommand == "status":
         try:
-            config = load_config(cli_path=args.config)
+            config = load_config(
+                cli_path=args.config,
+                optional_cli_path=args.config_or_defaults,
+            )
         except (AssistConfigError, TomlSubsetError) as error:
             print("assist: config error: {0}".format(error), file=sys.stderr)
             return 2
@@ -96,5 +144,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         from tools.assist.deck_lint import main_freeze_baseline
 
         return main_freeze_baseline(args)
+
+    if args.subcommand == "docmap":
+        from tools.assist.docmap import main_docmap
+
+        return main_docmap(args)
+
+    if args.subcommand == "ask":
+        from tools.assist.ask import main_ask
+
+        return main_ask(args)
 
     return 2

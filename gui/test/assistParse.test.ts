@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  parseAskResult,
   parseAssistStatus,
   parseDeckLint,
   parseDigest,
@@ -44,11 +45,27 @@ describe("parseAssistStatus", () => {
       enabled: true,
       disabledBy: null,
       configSource: "/home/user/.tenryu/assistant.toml",
+      providers: [
+        {
+          name: "claude",
+          command: "claude -p {prompt_file}",
+          model: "opus",
+        },
+        {
+          name: "codex",
+          command: "codex exec {prompt_file}",
+          model: "gpt-5.6",
+        },
+      ],
       roles: [
         { role: "deck_design", provider: "codex", model: "gpt-5.6" },
         { role: "explanation", provider: "dry_run", model: null },
         { role: "forensics", provider: "claude", model: "opus" },
       ],
+      budget: {
+        maxInterventionsPerRun: 3,
+        maxTokensPerDecision: 30000,
+      },
       warnings: ["review independence is degraded"],
     });
   });
@@ -67,7 +84,46 @@ describe("parseAssistStatus", () => {
       enabled: false,
       disabledBy: null,
       configSource: null,
+      providers: [],
       roles: [{ role: "deck_design", provider: "dry_run", model: null }],
+      budget: {
+        maxInterventionsPerRun: null,
+        maxTokensPerDecision: null,
+      },
+      warnings: [],
+    });
+  });
+
+  it("maps and sorts provider objects and finite budget values", () => {
+    expect(
+      dataOf(
+        parseAssistStatus(
+          JSON.stringify({
+            providers: {
+              zed: { command_template: "zed", model: "z-model" },
+              ignored: "not an object",
+              alpha: { command_template: 3, model: false },
+            },
+            budget: {
+              max_interventions_per_run: 5,
+              max_tokens_per_decision: 1000,
+            },
+          }),
+        ),
+      ),
+    ).toEqual({
+      enabled: false,
+      disabledBy: null,
+      configSource: null,
+      providers: [
+        { name: "alpha", command: "", model: "" },
+        { name: "zed", command: "zed", model: "z-model" },
+      ],
+      roles: [],
+      budget: {
+        maxInterventionsPerRun: 5,
+        maxTokensPerDecision: 1000,
+      },
       warnings: [],
     });
   });
@@ -97,11 +153,65 @@ describe("parseDeckLint", () => {
       only_in_baseline: [],
       heuristic_note: "leaves equal to the baseline are only PROBABLY defaults",
     };
+    const requirementSummary = {
+      applicable: true,
+      reason: "physics inputs available",
+      ablator: {
+        name: "CD",
+        rho_c_gcc: 0.0123,
+        zbar_source: "material",
+      },
+      wavelength_nm: 351,
+      geometry: "1D_SPH",
+      R0_cm: 0.03,
+      peak_intensity_W_cm2: 1e15,
+      mu_abl_total_g_cm2: 0.004,
+      ablated_mass_fraction: 0.125,
+      t_formation_s: 2.5e-10,
+      ceiling_formation_g_cm2: 0.0004,
+      profile: [
+        { depth_g_cm2: 0.001, ceiling_g_cm2: 0.0003, t_abl_s: 1e-10 },
+      ],
+      shock: {
+        applicable: true,
+        ceiling_g_cm2: 0.0002,
+        event_times_s: [1e-10, 2e-10],
+      },
+      bands_recommended: [
+        {
+          kind: "ablation",
+          depth_lo_g_cm2: 0,
+          depth_hi_g_cm2: 0.004,
+          r_lo_cm: 0.02,
+          r_hi_cm: 0.03,
+          areal_mass_max_g_cm2: 0.0004,
+          mass_frac_lo: 0.875,
+          mass_frac_hi: 1,
+        },
+      ],
+      check: {
+        ok: false,
+        ablation: {
+          n_checked: 8,
+          n_violations: 2,
+          max_ratio: 1.25,
+          worst: { index: 7 },
+        },
+        shock: {
+          n_checked: 2,
+          n_violations: 1,
+          max_ratio: 1.1,
+          worst: { index: 3 },
+        },
+        layers: { ok: true, violations: [] },
+      },
+    };
     const payload = {
       schema: "tenryu.assist.decklint.v0",
       deck: "/tmp/deck.py",
       tenryu: "/srv/TENRYU/build/tenryu",
       validate: { exit_code: 0, ok: true, stderr_tail: "warning tail" },
+      resolution_requirement_summary: requirementSummary,
       mesh_preview: meshPreview,
       lints: [
         { id: "node-monotonic", severity: "hard", ok: true },
@@ -133,6 +243,28 @@ describe("parseDeckLint", () => {
     expect(dataOf(parseDeckLint(JSON.stringify(payload)))).toEqual({
       toolError: null,
       validate: { ok: true, exitCode: 0, stderrTail: "warning tail" },
+      requirement: {
+        applicable: true,
+        reason: "physics inputs available",
+        ablatorName: "CD",
+        rhoCGcc: 0.0123,
+        ablatedMassFraction: 0.125,
+        tFormationS: 2.5e-10,
+        ceilingFormationGCm2: 0.0004,
+        checkOk: false,
+        ablationViolations: 2,
+        ablationMaxRatio: 1.25,
+        shockApplicable: true,
+        shockViolations: 1,
+        bandsRecommended: [
+          {
+            kind: "ablation",
+            rLoCm: 0.02,
+            rHiCm: 0.03,
+            arealMassMaxGCm2: 0.0004,
+          },
+        ],
+      },
       meshPreview,
       lints: [
         {
@@ -178,10 +310,82 @@ describe("parseDeckLint", () => {
     ).toEqual({
       toolError: null,
       validate: { ok: null, exitCode: null, stderrTail: "" },
+      requirement: null,
       meshPreview: null,
       lints: [],
       intentLock: null,
       defaultsDiff: null,
+    });
+  });
+
+  it("maps a null resolution requirement summary to null", () => {
+    const view = dataOf(
+      parseDeckLint(
+        JSON.stringify({
+          schema: "tenryu.assist.decklint.v0",
+          resolution_requirement_summary: null,
+        }),
+      ),
+    );
+
+    expect(view.requirement).toBeNull();
+  });
+
+  it("maps invalid resolution requirement field types tolerantly", () => {
+    const view = dataOf(
+      parseDeckLint(
+        JSON.stringify({
+          schema: "tenryu.assist.decklint.v0",
+          resolution_requirement_summary: {
+            applicable: true,
+            reason: 123,
+            ablator: { name: 456, rho_c_gcc: "0.0123" },
+            ablated_mass_fraction: "0.125",
+            t_formation_s: "2.5e-10",
+            ceiling_formation_g_cm2: "0.0004",
+            shock: { applicable: "true" },
+            bands_recommended: [
+              {
+                kind: "ablation",
+                r_lo_cm: "0.02",
+                r_hi_cm: "0.03",
+                areal_mass_max_g_cm2: "0.0004",
+              },
+            ],
+            check: {
+              ok: "false",
+              ablation: {
+                n_violations: "2",
+                max_ratio: "1.25",
+              },
+              shock: { n_violations: "1" },
+            },
+          },
+        }),
+      ),
+    );
+
+    expect(view.requirement).toEqual({
+      applicable: true,
+      reason: null,
+      ablatorName: null,
+      rhoCGcc: null,
+      ablatedMassFraction: null,
+      tFormationS: null,
+      ceilingFormationGCm2: null,
+      checkOk: null,
+      ablationViolations: null,
+      ablationMaxRatio: null,
+      shockApplicable: null,
+      shockViolations: null,
+      bandsRecommended: [
+        {
+          kind: "ablation",
+          rLoCm: null,
+          rHiCm: null,
+          arealMassMaxGCm2: null,
+        },
+      ],
     });
   });
 
@@ -200,6 +404,7 @@ describe("parseDeckLint", () => {
     ).toEqual({
       toolError: "validate failed to run: timeout",
       validate: { ok: null, exitCode: null, stderrTail: "" },
+      requirement: null,
       meshPreview: null,
       lints: [],
       intentLock: null,
@@ -294,6 +499,122 @@ describe("parseGenerateResult", () => {
     const result = parseGenerateResult("not json");
     expect(result.ok).toBe(false);
     expect(result.raw).toBe("not json");
+  });
+});
+
+describe("parseAskResult", () => {
+  it("maps a full answered result with checks", () => {
+    expect(
+      dataOf(
+        parseAskResult(
+          JSON.stringify({
+            status: "answered",
+            answer: "Use Numerics.dt.initial_s.",
+            turn: 2,
+            workdir: "/tmp/ask",
+            answer_path: "/tmp/ask/answer_2.md",
+            history_path: "/tmp/ask/history.jsonl",
+            docmap_path: "/tmp/ask/docmap.json",
+            keys_path: "/tmp/ask/keys.json",
+            checks: {
+              citations: {
+                verified: ["SPECIFICATION.md:42", 7],
+                unverified: [
+                  { citation: "missing.md:1", reason: "path not found" },
+                  "ignored",
+                ],
+              },
+              keys: {
+                known: ["Numerics.dt.initial_s", null],
+                unknown: ["Numerics.dt.typo"],
+              },
+            },
+          }),
+        ),
+      ),
+    ).toEqual({
+      status: "answered",
+      answer: "Use Numerics.dt.initial_s.",
+      turn: 2,
+      workdir: "/tmp/ask",
+      error: null,
+      checks: {
+        citationsVerified: ["SPECIFICATION.md:42"],
+        citationsUnverified: [
+          { citation: "missing.md:1", reason: "path not found" },
+        ],
+        keysKnown: ["Numerics.dt.initial_s"],
+        keysUnknown: ["Numerics.dt.typo"],
+      },
+    });
+  });
+
+  it("maps an error result", () => {
+    expect(
+      dataOf(
+        parseAskResult(
+          JSON.stringify({
+            status: "error",
+            error: "provider failed",
+            workdir: "/tmp/ask",
+          }),
+        ),
+      ),
+    ).toEqual({
+      status: "error",
+      answer: null,
+      turn: null,
+      workdir: "/tmp/ask",
+      error: "provider failed",
+      checks: null,
+    });
+  });
+
+  it("accepts a JSON object preceded by a preamble line", () => {
+    expect(
+      dataOf(
+        parseAskResult(
+          'provider preamble\n{"status":"answered","answer":"ok","turn":1}',
+        ),
+      ),
+    ).toEqual({
+      status: "answered",
+      answer: "ok",
+      turn: 1,
+      workdir: null,
+      error: null,
+      checks: null,
+    });
+  });
+
+  it("returns an error for malformed text", () => {
+    const result = parseAskResult("not json");
+    expect(result.ok).toBe(false);
+    expect(result.raw).toBe("not json");
+  });
+
+  it("tolerates odd optional shapes with nulls", () => {
+    expect(
+      dataOf(
+        parseAskResult(
+          JSON.stringify({
+            status: "answered",
+            answer: 12,
+            turn: "1",
+            workdir: false,
+            error: [],
+            checks: "not an object",
+          }),
+        ),
+      ),
+    ).toEqual({
+      status: "answered",
+      answer: null,
+      turn: null,
+      workdir: null,
+      error: null,
+      checks: null,
+    });
   });
 });
 

@@ -110,4 +110,12 @@ ZoningResult compute_zoning_intent_nodes(
     const ZoningIntentConfig& cfg,
     const std::function<double(double)>& rho0);
 
+// Cumulative measure fraction F(r) = (integral from r_min to r of a) /
+// (integral from r_min to r_max of a) for the intent's measure and rho0,
+// using the solver's own panel quadrature (same breakpoints/events as
+// compute_zoning_intent_nodes).
+[[nodiscard]] double measure_fraction_at(
+    double r_min, double r_max, const ZoningIntentConfig& cfg,
+    const std::function<double(double)>& rho0, double r);
+
 }  // namespace tenryu::core

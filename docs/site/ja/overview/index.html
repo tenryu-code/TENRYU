@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="ja" data-lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>概要 — TENRYU ドキュメント</title>
+  <link rel="stylesheet" href="../../style.css">
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>概要</h1>
+    <p class="abstract">TENRYU は、エネルギー整合なラグランジュ流体を中核とし、複数の物理演算子をストラング分割で時間発展させる構成である。この節では、コードの対象範囲と設計原則、モジュール構成、全カーネルに共通する数値基盤、そしてすべての変更を判定する検証の哲学を説明する。</p>
+    <h2>概要ガイド</h2>
+    <div class="card-grid">
+      <a class="card" href="architecture.html">
+        <h3>アーキテクチャとモジュール地図</h3>
+        <p>Python namelist から GPU 上の State、物理演算子、HDF5 出力までの流れをたどる。</p>
+      </a>
+      <a class="card" href="numerics-foundations.html">
+        <h3>数値基盤</h3>
+        <p>共通の方程式、変数配置、単位系、演算子順序、時間刻み制御を説明する。</p>
+      </a>
+      <a class="card" href="timestep.html">
+        <h3>時間刻み制御と CFL</h3>
+        <p>大域 Δt の決定則と、カーネル別の CFL・安定条件の式を一覧する。</p>
+      </a>
+      <a class="card" href="verification-philosophy.html">
+        <h3>検証の哲学</h3>
+        <p>解析解による検査、基準解との回帰、再現性の試験、ベンチマークによる証拠の積み上げを示す。</p>
+      </a>
+      <a class="card" href="nomenclature.html">
+        <h3>記号・用語集</h3>
+        <p>バージョン表記、略語、外部コード名、共有定数、記号の対照表。</p>
+      </a>
+    </div>
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["\\[", "\\]"]] } };</script>
+  <script defer src="../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../nav.js" data-page="overview" data-root="../"></script>
+</body>
+</html>

@@ -15,6 +15,28 @@ namespace {
 
 constexpr int kBlockSize = 256;
 
+__global__ void advect_fld_cell_energy_kernel(
+    double* energy, const double* before, const double* after,
+    int begin, int end, int groups, int* invalid) {
+  const int k = blockIdx.x * blockDim.x + threadIdx.x;
+  if (k >= (end - begin) * groups) return;
+  const int cell = begin + k / groups;
+  const int index = cell * groups + k % groups;
+  const double v0 = before[cell], v1 = after[cell], e = energy[index];
+  if (!(v0 > 0.0) || !(v1 > 0.0) || !isfinite(v0) ||
+      !isfinite(v1) || !isfinite(e)) {
+    atomicExch(invalid, 1);
+    return;
+  }
+  if (v0 == v1) return;
+  const double updated = e * (v0 / v1);
+  if (!isfinite(updated)) {
+    atomicExch(invalid, 1);
+    return;
+  }
+  energy[index] = updated;
+}
+
 inline void cuda_check(const cudaError_t err, const char* message) {
   TENRYU_ASSERT(err == cudaSuccess, message);
 }
@@ -231,6 +253,32 @@ double reduce_device_sum_persistent(FldEnergyScratch& scratch,
 }
 
 }  // namespace
+
+void advect_fld_cell_energy(core::State& state, const double* volume_before,
+                           const int cell_begin, const int cell_end,
+                           const int groups) {
+  TENRYU_ASSERT(groups > 0 && cell_begin >= 0 && cell_end >= cell_begin &&
+                    static_cast<std::size_t>(cell_end) <= state.vol.size() &&
+                    state.rad_E.size() == state.vol.size() * groups,
+                "FLD cell advection has inconsistent field sizes/window");
+  if (cell_begin == cell_end) return;
+  TENRYU_ASSERT(volume_before != nullptr, "FLD cell advection needs old volumes");
+  const std::size_t count = static_cast<std::size_t>(cell_end-cell_begin)*groups;
+  TENRYU_ASSERT(state.rad_E.size() <= static_cast<std::size_t>(std::numeric_limits<int>::max()),
+                "FLD cell advection window exceeds kernel index range");
+  auto& scratch = fld_energy_scratch();
+  scratch.ensure_capacity(0, 0);
+  cuda_check(cudaMemset(scratch.d_counts, 0, sizeof(int)),
+             "FLD cell advection flag reset failed");
+  advect_fld_cell_energy_kernel<<<(count+255)/256, 256>>>(
+      state.rad_E.data(), volume_before, state.vol.data(),
+      cell_begin, cell_end, groups, scratch.d_counts);
+  cuda_check(cudaGetLastError(), "FLD cell advection kernel launch failed");
+  int invalid = 0;
+  cuda_check(cudaMemcpy(&invalid, scratch.d_counts, sizeof(int), cudaMemcpyDeviceToHost),
+             "FLD cell advection flag read failed");
+  TENRYU_ASSERT(invalid == 0, "FLD cell advection encountered invalid volume/energy");
+}
 
 double compute_fld_rad_energy_total_device(const core::State& state,
                                            const core::Config& cfg) {

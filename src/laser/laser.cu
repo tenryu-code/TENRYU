@@ -1,4 +1,5 @@
 #include "laser/laser.cuh"
+#include "core/nvtx_range.hpp"
 
 #include <array>
 #include <algorithm>
@@ -1767,6 +1768,7 @@ void laser_step(core::State& state,
                 const bool verbose,
                 const bool collect_density_diag,
                 const std::string& output_dir) {
+  const core::NvtxRange nvtx_range("laser.step");
   const bool phys_ext_active = laser.laser_phys_ext_active();
   TENRYU_ASSERT(!phys_ext_active || state.mesh.dim == 1,
                 "laser ib/ra extensions are 1D_SPH-only in v1");
@@ -2015,7 +2017,12 @@ void laser_step(core::State& state,
   }
   RaytraceSkipCache* skip_cache = nullptr;
   if (!radial_absorption_1d && !hot_e_on) {
-    skip_cache = &global_skip_cache();
+    auto& cache = global_skip_cache();
+    if (state.mesh.dim != 1 || laser.raytrace_skip_config.enabled) {
+      skip_cache = &cache;
+    } else if (cache.valid || cache.consecutive_skip_count != 0) {
+      cache.invalidate();
+    }
   }
   if (beams.items.empty()) {
     if (skip_cache != nullptr) {
@@ -2030,15 +2037,17 @@ void laser_step(core::State& state,
     return;
   }
   std::vector<Vec3> beam_dirs;
-  beam_dirs.reserve(beams.items.size());
   std::vector<Vec3> beam_focuses;
-  beam_focuses.reserve(beams.items.size());
   std::vector<double> beam_defocus;
-  beam_defocus.reserve(beams.items.size());
-  for (const Beam& beam : beams.items) {
-    beam_dirs.push_back(Vec3{beam.dir_x, beam.dir_y, beam.dir_z});
-    beam_focuses.push_back(Vec3{beam.focus_x, beam.focus_y, beam.focus_lab_z});
-    beam_defocus.push_back(beam.defocus_DR);
+  if (state.mesh.dim != 1 || skip_cache != nullptr) {
+    beam_dirs.reserve(beams.items.size());
+    beam_focuses.reserve(beams.items.size());
+    beam_defocus.reserve(beams.items.size());
+    for (const Beam& beam : beams.items) {
+      beam_dirs.push_back(Vec3{beam.dir_x, beam.dir_y, beam.dir_z});
+      beam_focuses.push_back(Vec3{beam.focus_x, beam.focus_y, beam.focus_lab_z});
+      beam_defocus.push_back(beam.defocus_DR);
+    }
   }
 
   const double total_power = beams.total_power(t);
@@ -2529,8 +2538,10 @@ void laser_step(core::State& state,
     for (std::size_t b = 0; b < beams.items.size(); ++b) {
       group_powers[b] = std::max(0.0, beams.items[b].get_power(t));
     }
-    f_hat_groups.assign(group_powers.size(), std::vector<double>(state.laser_dep.size(), 0.0));
-    skip_group_powers = group_powers;
+    if (skip_cache != nullptr) {
+      f_hat_groups.assign(group_powers.size(), std::vector<double>(state.laser_dep.size(), 0.0));
+      skip_group_powers = group_powers;
+    }
   } else {
     beam_groups = group_beams_by_theta(beams.items, laser.cbet.enable);
     group_powers.assign(beam_groups.size(), 0.0);
@@ -3047,8 +3058,10 @@ void laser_step(core::State& state,
         for (std::size_t c = 0; c < fold_dep.size(); ++c) {
           total_dep_1d[c] += fold_dep[c];
         }
-        for (std::size_t c = 0; c < fold_dep.size(); ++c) {
-          f_hat_groups[b][c] = fold_dep[c] / std::max(P_beam, 1.0e-30);
+        if (skip_cache != nullptr) {
+          for (std::size_t c = 0; c < fold_dep.size(); ++c) {
+            f_hat_groups[b][c] = fold_dep[c] / std::max(P_beam, 1.0e-30);
+          }
         }
         ++fold_replays;
         continue;
@@ -3254,6 +3267,7 @@ void laser_step(core::State& state,
       int* h_ray_steps_out = nullptr;
       int max_ray_steps_override = 0;
       if (!use_fast_trace_1d) {
+        const core::NvtxRange nvtx_order_range("laser.ray_ordering");
         auto& previous_steps = lmesh.ray_steps_previous[b];
         auto& ray_order = lmesh.ray_order[b];
         auto& steps_output = lmesh.ray_steps_output[b];
@@ -3581,8 +3595,10 @@ void laser_step(core::State& state,
         for (std::size_t c = 0; c < dep_power_cell.size(); ++c) {
           total_dep_1d[c] += dep_power_cell[c];
         }
-        for (std::size_t c = 0; c < dep_power_cell.size(); ++c) {
-          f_hat_groups[b][c] = dep_power_cell[c] / std::max(P_beam, 1.0e-30);
+        if (skip_cache != nullptr) {
+          for (std::size_t c = 0; c < dep_power_cell.size(); ++c) {
+            f_hat_groups[b][c] = dep_power_cell[c] / std::max(P_beam, 1.0e-30);
+          }
         }
         if (fold_enabled && !fold_armed) {
           fold_dep = dep_power_cell;
@@ -4042,7 +4058,9 @@ void laser_step(core::State& state,
         const double P_beam_b = std::max(0.0, beams.items[b].get_power(t));
         for (std::size_t c = 0; c < dep_power_cell.size(); ++c) {
           total_dep_1d[c] += dep_power_cell[c];
-          f_hat_groups[b][c] = dep_power_cell[c] / std::max(P_beam_b, 1.0e-30);
+          if (skip_cache != nullptr) {
+            f_hat_groups[b][c] = dep_power_cell[c] / std::max(P_beam_b, 1.0e-30);
+          }
         }
       }
       std::ostringstream cbet_oss;

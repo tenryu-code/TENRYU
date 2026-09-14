@@ -31,6 +31,8 @@
 #include "core/cone_shell_ladder.hpp"
 #include "core/config_validate.hpp"
 #include "core/error.hpp"
+#include "core/mesh_requirement.hpp"
+#include "core/namelist/frozen_table.hpp"
 #include "core/radiation_group_structure.hpp"
 #include "hydro/pressure_drive_perturbation.cuh"
 #include "core/zoning_intent.hpp"
@@ -44,6 +46,27 @@ namespace {
 namespace py = pybind11;
 
 thread_local Builder* g_active_builder = nullptr;
+
+static MeshRequirementParams to_mesh_requirement_params(
+    const Config::MeshConfig::ResolutionRequirementNL& config) {
+  MeshRequirementParams params;
+  params.enabled = config.enabled;
+  params.apply = config.apply;
+  params.zones_per_scale_length = config.zones_per_scale_length;
+  params.intensity_exponent = config.intensity_exponent;
+  params.intensity_reference_W_cm2 = config.intensity_reference_W_cm2;
+  params.scale_length_factor = config.scale_length_factor;
+  params.ablation_mass_safety = config.ablation_mass_safety;
+  params.formation_ablated_fraction = config.formation_ablated_fraction;
+  params.absorbed_fraction = config.absorbed_fraction;
+  params.shock_cells_per_separation = config.shock_cells_per_separation;
+  params.shock_event_min_separation_frac =
+      config.shock_event_min_separation_frac;
+  params.min_cells_per_layer = config.min_cells_per_layer;
+  params.zbar_override = config.zbar_override;
+  params.n_bands = config.n_bands;
+  return params;
+}
 
 constexpr std::uint64_t kFnv1aOffsetBasis = 1469598103934665603ull;
 constexpr std::uint64_t kFnv1aPrime = 1099511628211ull;
@@ -2961,7 +2984,7 @@ void Builder::set_mesh(py::dict kwargs) {
   enforce_known_keys(kwargs, "Mesh",
                      {"nr", "nz", "r_min", "r_max", "z_min", "z_max", "grid_type_r",
                       "grid_type_z", "grid_r", "grid_z", "grid_theta", "grid", "auto_regions",
-                      "zoning_intent",
+                      "zoning_intent", "resolution_requirement",
                       "explicit_nodes", "explicit_nodes_z", "explicit_nodes_theta",
                       "auto_regions_axis", "auto_zone",
                       "geometry_1d", "motion",
@@ -3038,6 +3061,8 @@ void Builder::set_mesh(py::dict kwargs) {
   mesh.grid_segments_theta_repr.clear();
   mesh.auto_regions.clear();
   mesh.zoning_intent = Config::MeshConfig::ZoningIntentNL{};
+  mesh.resolution_requirement =
+      Config::MeshConfig::ResolutionRequirementNL{};
   mesh.auto_regions_axis = mesh_defaults.auto_regions_axis;
   mesh.auto_config = Config::MeshConfig::AutoZoneConfig{};
   mesh.grading = Config::MeshConfig::GradingConfig{};
@@ -4334,6 +4359,152 @@ void Builder::set_mesh(py::dict kwargs) {
           "Mesh.zoning_intent.min_cells_per_segment");
     }
   }
+  if (has_key(kwargs, "resolution_requirement")) {
+    const py::handle requirement_obj = kwargs["resolution_requirement"];
+    if (!py::isinstance<py::dict>(requirement_obj)) {
+      throw_value_type_error("Mesh.resolution_requirement", "dict",
+                             requirement_obj);
+    }
+    const py::dict requirement =
+        py::reinterpret_borrow<py::dict>(requirement_obj);
+    enforce_known_keys(
+        requirement, "Mesh.resolution_requirement",
+        {"enabled", "apply", "zones_per_scale_length",
+         "intensity_exponent", "intensity_reference_W_cm2",
+         "scale_length_factor", "ablation_mass_safety",
+         "formation_ablated_fraction", "absorbed_fraction",
+         "shock_cells_per_separation",
+         "shock_event_min_separation_frac", "min_cells_per_layer",
+         "zbar_override", "n_bands"});
+    auto& rr = mesh.resolution_requirement;
+    rr.detected = true;
+    if (has_key(requirement, "enabled")) {
+      rr.enabled = strict_bool(requirement["enabled"],
+                               "Mesh.resolution_requirement.enabled");
+    }
+    if (has_key(requirement, "apply")) {
+      rr.apply = strict_string(requirement["apply"],
+                               "Mesh.resolution_requirement.apply");
+    }
+    if (has_key(requirement, "zones_per_scale_length")) {
+      rr.zones_per_scale_length = strict_int32(
+          requirement["zones_per_scale_length"],
+          "Mesh.resolution_requirement.zones_per_scale_length");
+    }
+    if (has_key(requirement, "intensity_exponent")) {
+      rr.intensity_exponent = numeric_as_double(
+          requirement["intensity_exponent"],
+          "Mesh.resolution_requirement.intensity_exponent");
+    }
+    if (has_key(requirement, "intensity_reference_W_cm2")) {
+      rr.intensity_reference_W_cm2 = numeric_as_double(
+          requirement["intensity_reference_W_cm2"],
+          "Mesh.resolution_requirement.intensity_reference_W_cm2");
+    }
+    if (has_key(requirement, "scale_length_factor")) {
+      rr.scale_length_factor = numeric_as_double(
+          requirement["scale_length_factor"],
+          "Mesh.resolution_requirement.scale_length_factor");
+    }
+    if (has_key(requirement, "ablation_mass_safety")) {
+      rr.ablation_mass_safety = numeric_as_double(
+          requirement["ablation_mass_safety"],
+          "Mesh.resolution_requirement.ablation_mass_safety");
+    }
+    if (has_key(requirement, "formation_ablated_fraction")) {
+      rr.formation_ablated_fraction = numeric_as_double(
+          requirement["formation_ablated_fraction"],
+          "Mesh.resolution_requirement.formation_ablated_fraction");
+    }
+    if (has_key(requirement, "absorbed_fraction")) {
+      rr.absorbed_fraction = numeric_as_double(
+          requirement["absorbed_fraction"],
+          "Mesh.resolution_requirement.absorbed_fraction");
+    }
+    if (has_key(requirement, "shock_cells_per_separation")) {
+      rr.shock_cells_per_separation = strict_int32(
+          requirement["shock_cells_per_separation"],
+          "Mesh.resolution_requirement.shock_cells_per_separation");
+    }
+    if (has_key(requirement, "shock_event_min_separation_frac")) {
+      rr.shock_event_min_separation_frac = numeric_as_double(
+          requirement["shock_event_min_separation_frac"],
+          "Mesh.resolution_requirement.shock_event_min_separation_frac");
+    }
+    if (has_key(requirement, "min_cells_per_layer")) {
+      rr.min_cells_per_layer = strict_int32(
+          requirement["min_cells_per_layer"],
+          "Mesh.resolution_requirement.min_cells_per_layer");
+    }
+    if (has_key(requirement, "zbar_override")) {
+      rr.zbar_override = numeric_as_double(
+          requirement["zbar_override"],
+          "Mesh.resolution_requirement.zbar_override");
+    }
+    if (has_key(requirement, "n_bands")) {
+      rr.n_bands = strict_int32(requirement["n_bands"],
+                                "Mesh.resolution_requirement.n_bands");
+    }
+
+    if (rr.apply != "report" && rr.apply != "enforce") {
+      throw ValueError(
+          "Mesh.resolution_requirement.apply must be one of {\"report\", "
+          "\"enforce\"}, got " +
+          rr.apply);
+    }
+    if (rr.zones_per_scale_length < 1) {
+      throw ConfigError(
+          "Mesh.resolution_requirement.zones_per_scale_length must be >= 1");
+    }
+    if (!(rr.intensity_exponent >= 0.0)) {
+      throw ConfigError(
+          "Mesh.resolution_requirement.intensity_exponent must be >= 0");
+    }
+    if (!(rr.intensity_reference_W_cm2 > 0.0)) {
+      throw ConfigError(
+          "Mesh.resolution_requirement.intensity_reference_W_cm2 must be > 0");
+    }
+    if (!(rr.scale_length_factor > 0.0)) {
+      throw ConfigError(
+          "Mesh.resolution_requirement.scale_length_factor must be > 0");
+    }
+    if (!(rr.ablation_mass_safety > 0.0)) {
+      throw ConfigError(
+          "Mesh.resolution_requirement.ablation_mass_safety must be > 0");
+    }
+    if (!(rr.formation_ablated_fraction > 0.0 &&
+          rr.formation_ablated_fraction < 1.0)) {
+      throw ConfigError(
+          "Mesh.resolution_requirement.formation_ablated_fraction must be in "
+          "(0, 1)");
+    }
+    if (!(rr.absorbed_fraction > 0.0 && rr.absorbed_fraction <= 1.0)) {
+      throw ConfigError(
+          "Mesh.resolution_requirement.absorbed_fraction must be in (0, 1]");
+    }
+    if (rr.shock_cells_per_separation < 1) {
+      throw ConfigError(
+          "Mesh.resolution_requirement.shock_cells_per_separation must be >= 1");
+    }
+    if (!(rr.shock_event_min_separation_frac > 0.0 &&
+          rr.shock_event_min_separation_frac < 1.0)) {
+      throw ConfigError(
+          "Mesh.resolution_requirement.shock_event_min_separation_frac must "
+          "be in (0, 1)");
+    }
+    if (rr.min_cells_per_layer < 1) {
+      throw ConfigError(
+          "Mesh.resolution_requirement.min_cells_per_layer must be >= 1");
+    }
+    if (!(rr.zbar_override >= 0.0)) {
+      throw ConfigError(
+          "Mesh.resolution_requirement.zbar_override must be >= 0");
+    }
+    if (rr.n_bands < 1 || rr.n_bands > 32) {
+      throw ConfigError(
+          "Mesh.resolution_requirement.n_bands must be in [1, 32]");
+    }
+  }
   const auto parse_explicit_nodes = [&](const char* key,
                                         std::vector<double>& dst) {
     if (!has_key(kwargs, key)) {
@@ -4766,7 +4937,7 @@ void Builder::set_materials(py::dict kwargs) {
       }
       const py::dict opacity = py::reinterpret_borrow<py::dict>(opacity_obj);
       enforce_known_keys(opacity, "Materials.materials.opacity",
-                         {"model", "file", "tmat_skip_lte_repair",
+                         {"model", "file", "tmat_skip_lte_repair", "tmat_kirchhoff_pe",
                           "kappa_a", "kappa_planck", "kappa_s", "units",
                           "lambda_method", "lambda_fd_delta_rel",
                           "lambda_fd_abs_min", "f_min", "kappa0_cm2_g",
@@ -4793,6 +4964,12 @@ void Builder::set_materials(py::dict kwargs) {
             opacity["tmat_skip_lte_repair"],
             "Materials.materials[" + std::to_string(i) +
                 "].opacity.tmat_skip_lte_repair");
+      }
+      if (has_key(opacity, "tmat_kirchhoff_pe")) {
+        def.tmat_kirchhoff_pe = strict_bool(
+            opacity["tmat_kirchhoff_pe"],
+            "Materials.materials[" + std::to_string(i) +
+                "].opacity.tmat_kirchhoff_pe");
       }
       if (has_key(opacity, "kappa_a")) {
         kappa_a_explicit = true;
@@ -5832,10 +6009,11 @@ void Builder::set_radiation(py::dict kwargs) {
           strict_string(fld["hydro_coupling"],
                         "Radiation.multigroup_diffusion.hydro_coupling");
       if (fld_cfg.hydro_coupling != "none" &&
+          fld_cfg.hydro_coupling != "conservative_advection" &&
           fld_cfg.hydro_coupling != "gamma_r_43") {
         throw ConfigError(
             "Radiation.multigroup_diffusion.hydro_coupling must be"
-            " \"none\" or \"gamma_r_43\"");
+            " \"none\", \"conservative_advection\", or \"gamma_r_43\"");
       }
     }
     if (has_key(fld, "outer_tol")) {
@@ -9126,7 +9304,7 @@ void Builder::set_numerics(py::dict kwargs) {
     }
     const py::dict hydro = py::reinterpret_borrow<py::dict>(hydro_obj);
     enforce_known_keys(hydro, "Numerics.hydro",
-                       {"enabled", "compatible_energy", "T_start_eV", "boundary", "boundary_1d", "boundary_2d",
+                       {"enabled", "compatible_energy", "T_start_eV", "T_start_inactive_cells", "qei_heat_capacity", "boundary", "boundary_1d", "boundary_2d",
                        "av_type", "av_model", "rz_momentum_scheme", "corner_mass_convention",
                        "time_integration", "total_energy_identity_check",
                        "rz_momentum_scheme",
@@ -10265,6 +10443,28 @@ void Builder::set_numerics(py::dict kwargs) {
       if (has_key(kwargs, "T_start_eV")) {
         tenryu::core::log_warning(
             "Numerics.hydro.T_start_eV overrides deprecated Numerics.T_start_eV");
+      }
+    }
+    if (has_key(hydro, "T_start_inactive_cells")) {
+      numerics.hydro.T_start_inactive_cells = strict_string(
+          hydro["T_start_inactive_cells"], "Numerics.hydro.T_start_inactive_cells");
+      if (numerics.hydro.T_start_inactive_cells != "passive_fill" &&
+          numerics.hydro.T_start_inactive_cells != "rigid_wall") {
+        throw ValueError(
+            "Numerics.hydro.T_start_inactive_cells must be one of "
+            "{\"passive_fill\", \"rigid_wall\"}, got " +
+            numerics.hydro.T_start_inactive_cells);
+      }
+    }
+    if (has_key(hydro, "qei_heat_capacity")) {
+      numerics.hydro.qei_heat_capacity = strict_string(
+          hydro["qei_heat_capacity"], "Numerics.hydro.qei_heat_capacity");
+      if (numerics.hydro.qei_heat_capacity != "ideal_gas" &&
+          numerics.hydro.qei_heat_capacity != "table") {
+        throw ValueError(
+            "Numerics.hydro.qei_heat_capacity must be one of "
+            "{\"ideal_gas\", \"table\"}, got " +
+            numerics.hydro.qei_heat_capacity);
       }
     }
     if (has_key(hydro, "boundary")) {
@@ -14972,6 +15172,17 @@ void Builder::validate() {
   if (!numerics.hydro.av_type_explicit && main.dimension == "1D_SPH") {
     numerics.hydro.av_type = "csw";
   }
+  if (numerics.hydro.T_start_inactive_cells == "rigid_wall" &&
+      main.dimension != "1D_SPH") {
+    throw ConfigError(
+        "Numerics.hydro.T_start_inactive_cells=\"rigid_wall\" requires "
+        "Main.dimension=\"1D_SPH\"");
+  }
+  if (numerics.hydro.qei_heat_capacity == "table" && main.dimension != "1D_SPH") {
+    throw ConfigError(
+        "Numerics.hydro.qei_heat_capacity=\"table\" requires "
+        "Main.dimension=\"1D_SPH\"");
+  }
   if (numerics.conduction.nonlocal_model != "none" &&
       numerics.conduction.nonlocal_model != "snb") {
     throw ConfigError(
@@ -16183,6 +16394,10 @@ void Builder::validate() {
       tenryu::core::log_warning("[mesh-autozone] " + w);
     }
   }
+  if (main.dimension == "2D_RZ" &&
+      mesh.resolution_requirement.detected) {
+    throw ConfigError("Mesh.resolution_requirement is 1D only");
+  }
   if (mesh.zoning_intent.enabled) {
     const auto& zoning = mesh.zoning_intent;
     if (!mesh.auto_regions.empty()) {
@@ -16311,12 +16526,237 @@ void Builder::validate() {
       };
     }
 
+    mesh.resolution_requirement.injected_bands.clear();
+    if (mesh.resolution_requirement.apply == "enforce" &&
+        mesh.resolution_requirement.enabled && config.laser.enabled &&
+        !is_width) {
+      std::vector<tenryu::core::namelist::FrozenTable1D> beam_tables;
+      for (std::size_t i = 0; i < config.laser.beams.size(); ++i) {
+        const std::string path =
+            "Laser.beams[" + std::to_string(i) + "].power";
+        const auto callable = callable_objects.find(path);
+        if (callable == callable_objects.end()) {
+          continue;
+        }
+        auto table = tenryu::core::namelist::create_frozen_table(
+            callable->second, 0.0, config.main.t_end, 10000);
+        table.zero_outside = true;
+        beam_tables.push_back(std::move(table));
+      }
+
+      if (beam_tables.empty()) {
+        tenryu::core::log_warning(
+            "[mesh-requirement] enforce requested but no beam power callable; "
+            "nothing injected");
+      } else {
+        tenryu::core::MeshRequirementInputs inputs;
+        if (mesh.geometry_1d == "cylindrical") {
+          inputs.geometry_code = 1;
+        } else if (mesh.geometry_1d == "planar") {
+          inputs.geometry_code = 2;
+        } else {
+          inputs.geometry_code = 0;
+        }
+        inputs.r_min = mesh.r_min;
+        inputs.r_max = mesh.r_max;
+        inputs.t_end = config.main.t_end;
+        inputs.wavelength_nm = config.laser.wavelength_nm;
+        inputs.laser_enabled = config.laser.enabled;
+        inputs.power_W = beam_tables.front();
+        std::fill(inputs.power_W.y.begin(), inputs.power_W.y.end(), 0.0);
+        inputs.power_W.zero_outside = true;
+        for (const auto& table : beam_tables) {
+          for (std::size_t k = 0; k < inputs.power_W.x.size(); ++k) {
+            inputs.power_W.y[k] += table.eval(inputs.power_W.x[k]);
+          }
+        }
+
+        inputs.materials.reserve(config.materials.materials.size());
+        for (const auto& material : config.materials.materials) {
+          inputs.materials.push_back(
+              {material.name, material.A, material.Z, material.is_void});
+        }
+        inputs.rho0 = rho0;
+
+        std::vector<std::pair<int, py::object>> volfrac_callables;
+        for (std::size_t i = 0; i < config.materials.materials.size(); ++i) {
+          const std::string path = "Geometry.volfrac." +
+                                   config.materials.materials[i].name;
+          const auto callable = callable_objects.find(path);
+          if (callable != callable_objects.end()) {
+            volfrac_callables.emplace_back(static_cast<int>(i),
+                                           callable->second);
+          }
+        }
+        if (volfrac_callables.empty()) {
+          throw ConfigError(
+              "Mesh.resolution_requirement enforce requires at least one "
+              "Geometry.volfrac.<name> callable");
+        }
+        inputs.material_at =
+            [volfrac_callables = std::move(volfrac_callables)](
+                const double r) {
+              int dominant = -1;
+              double maximum = -std::numeric_limits<double>::infinity();
+              for (const auto& [material, callable] : volfrac_callables) {
+                const double fraction = py::cast<double>(callable(r));
+                if (fraction > maximum) {
+                  maximum = fraction;
+                  dominant = material;
+                }
+              }
+              return dominant;
+            };
+        for (const auto& region : zoning.density_regions) {
+          if (region.r_end > mesh.r_min && region.r_end < mesh.r_max) {
+            inputs.breakpoints.push_back(region.r_end);
+          }
+        }
+        inputs.rho_void_cut = mesh.auto_config.rho_void_cut;
+
+        const tenryu::core::MeshRequirementReport report =
+            tenryu::core::build_mesh_requirement(
+                inputs,
+                to_mesh_requirement_params(mesh.resolution_requirement));
+        if (!report.applicable) {
+          tenryu::core::log_info(
+              "[mesh-requirement] enforce: not applicable (" +
+              report.reason + ")");
+        } else {
+          constexpr double kPi =
+              3.141592653589793238462643383279502884;
+          struct DrMinConflict {
+            std::string kind;
+            double areal_mass_max_g_cm2;
+            double cell_measure_max;
+            double width_admissible;
+          };
+          std::vector<DrMinConflict> dr_min_conflicts;
+          std::size_t injected = 0;
+          for (const auto& band : report.bands_recommended) {
+            if (!std::isfinite(band.areal_mass_max_g_cm2) ||
+                !(band.areal_mass_max_g_cm2 > 0.0) ||
+                !(band.r_lo_cm < band.r_hi_cm)) {
+              continue;
+            }
+            const double fraction_begin = std::clamp(
+                tenryu::core::measure_fraction_at(
+                    mesh.r_min, mesh.r_max, zic, rho0, band.r_lo_cm),
+                0.0, 1.0);
+            const double fraction_end = std::clamp(
+                tenryu::core::measure_fraction_at(
+                    mesh.r_min, mesh.r_max, zic, rho0, band.r_hi_cm),
+                0.0, 1.0);
+            if (!(fraction_end > fraction_begin)) {
+              continue;
+            }
+
+            double cell_measure_max = band.areal_mass_max_g_cm2;
+            if (zic.measure ==
+                tenryu::core::ZoningMeasure::kSphericalCellMass) {
+              cell_measure_max =
+                  4.0 * kPi * band.r_lo_cm * band.r_lo_cm *
+                  band.areal_mass_max_g_cm2;
+            } else if (zic.measure ==
+                       tenryu::core::ZoningMeasure::kCylindricalLineMass) {
+              cell_measure_max = 2.0 * kPi * band.r_lo_cm *
+                                 band.areal_mass_max_g_cm2;
+            }
+            if (!(cell_measure_max > 0.0) ||
+                !std::isfinite(cell_measure_max)) {
+              tenryu::core::log_warning(
+                  "[mesh-requirement] skipped band '" + band.kind +
+                  "' (r_lo=" + std::to_string(band.r_lo_cm) +
+                  " cm): its cell-measure bound degenerates to 0 in this "
+                  "measure");
+              continue;
+            }
+            zic.bands.push_back(
+                {fraction_begin, fraction_end, 0.0, cell_measure_max});
+            mesh.resolution_requirement.injected_bands.push_back(
+                {band.kind, fraction_begin, fraction_end, cell_measure_max,
+                 band.areal_mass_max_g_cm2, band.r_lo_cm, band.r_hi_cm});
+            ++injected;
+
+            if (zic.dr_min > 0.0) {
+              double width_admissible =
+                  std::numeric_limits<double>::infinity();
+              for (int j = 0; j <= 64; ++j) {
+                const double r =
+                    band.r_lo_cm + static_cast<double>(j) *
+                                           (band.r_hi_cm - band.r_lo_cm) /
+                                           64.0;
+                const double rho = rho0(r);
+                if (!(rho > 0.0) || !std::isfinite(rho)) {
+                  continue;
+                }
+                double width = band.areal_mass_max_g_cm2 / rho;
+                if (zic.measure ==
+                    tenryu::core::ZoningMeasure::kSphericalCellMass) {
+                  if (r == 0.0) {
+                    continue;
+                  }
+                  width = cell_measure_max /
+                          (4.0 * kPi * r * r * rho);
+                } else if (zic.measure ==
+                           tenryu::core::ZoningMeasure::kCylindricalLineMass) {
+                  if (r == 0.0) {
+                    continue;
+                  }
+                  width = cell_measure_max / (2.0 * kPi * r * rho);
+                }
+                if (std::isfinite(width)) {
+                  width_admissible = std::min(width_admissible, width);
+                }
+              }
+              if (std::isfinite(width_admissible) &&
+                  width_admissible < zic.dr_min) {
+                dr_min_conflicts.push_back(
+                    {band.kind, band.areal_mass_max_g_cm2, cell_measure_max,
+                     width_admissible});
+              }
+            }
+          }
+          if (!dr_min_conflicts.empty()) {
+            const auto conflict = std::min_element(
+                dr_min_conflicts.begin(), dr_min_conflicts.end(),
+                [](const DrMinConflict& lhs, const DrMinConflict& rhs) {
+                  return lhs.width_admissible < rhs.width_admissible;
+                });
+            std::ostringstream message;
+            message << std::scientific << std::setprecision(6)
+                    << "[mesh-requirement] "
+                       "MESH_RESOLUTION_REQUIREMENT_DR_MIN_CONFLICT: "
+                       "Mesh.zoning_intent.dr_min="
+                    << zic.dr_min
+                    << " cm exceeds the cell width admitted by the injected "
+                       "band '"
+                    << conflict->kind << "' (areal-mass ceiling "
+                    << conflict->areal_mass_max_g_cm2
+                    << " g/cm^2 => width <= " << conflict->width_admissible
+                    << " cm under measure " << zoning.measure
+                    << "); lower or omit dr_min (admissible dr_min <= "
+                    << conflict->width_admissible
+                    << " cm); do not weaken the requirement";
+            throw ConfigError(message.str());
+          }
+          tenryu::core::log_info(
+              "[mesh-requirement] enforce injected " +
+              std::to_string(injected) + " bands into zoning_intent");
+        }
+      }
+    }
+
     const tenryu::core::ZoningResult result =
         tenryu::core::compute_zoning_intent_nodes(
             mesh.r_min, mesh.r_max, zic, rho0);
     if (!result.ok) {
-      throw ConfigError("[mesh-zoning-intent] " + result.diag.code + ": " +
-                        result.diag.message);
+      const std::string injected_prefix =
+          mesh.resolution_requirement.injected_bands.empty()
+              ? std::string{}
+              : "[mesh-requirement] injected bands active; ";
+      throw ConfigError(injected_prefix + "[mesh-zoning-intent] " +
+                        result.diag.code + ": " + result.diag.message);
     }
     mesh.explicit_nodes = result.nodes;
     const int n = static_cast<int>(mesh.explicit_nodes.size()) - 1;
@@ -16872,7 +17312,7 @@ void Builder::validate() {
                               "/opacity payload");
           }
           ionmix_opacity = materials::tmat_to_ionmix_opacity(
-              *tmat.opacity, mat.tmat_skip_lte_repair);
+              *tmat.opacity, mat.tmat_skip_lte_repair, mat.tmat_kirchhoff_pe);
         } catch (const std::exception& ex) {
           throw ConfigError("Failed to load TMAT opacity file for "
                             "Materials.materials[\"" +
@@ -17882,6 +18322,13 @@ void Builder::validate() {
     throw ConfigError(
         "Numerics.hydro.plasma_viscosity is not supported with per-material "
         "conservation in 2D (v1)");
+  }
+  if (radiation.multigroup_diffusion.hydro_coupling == "conservative_advection" &&
+      (main.dim != 1 || radiation.mode != RadiationMode::MultigroupDiffusion ||
+       mesh.motion != "lagrangian" || numerics.ale1d.enabled ||
+       numerics.persistent_loop.enabled)) {
+    throw ConfigError(
+        "conservative_advection requires 1D Lagrangian FLD without ALE1D or persistent loop");
   }
   if (radiation.mode == RadiationMode::MultigroupDiffusion) {
     if (radiation.enabled &&

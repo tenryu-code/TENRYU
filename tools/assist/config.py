@@ -1,6 +1,7 @@
 """Configuration model and resolution for the experimental assistant."""
 
 import os
+import sys
 from dataclasses import dataclass, field
 from typing import Dict, List, Mapping, Optional
 
@@ -13,11 +14,13 @@ KNOWN_ROLES = (
     "intervention_proposer",
     "intervention_reviewer",
     "explanation",
+    "question_answering",
 )
 ENV_KILL_SWITCH = "TENRYU_ASSIST_DISABLE"
 ENV_CONFIG_PATH = "TENRYU_ASSIST_CONFIG"
 DEFAULT_CONFIG_BASENAME = "assistant.toml"
 USER_CONFIG_PATH = "~/.tenryu/assistant.toml"
+APP_CONFIG_IDENTIFIER = "jp.osaka-u.ile.tenryu-studio"
 
 
 @dataclass
@@ -48,10 +51,44 @@ class AssistConfigError(ValueError):
     """Raised when assistant configuration is invalid."""
 
 
+def app_config_path(
+    env: Mapping[str, str], platform: Optional[str] = None
+) -> Optional[str]:
+    """Path of the Studio-managed assistant.toml in the app configuration folder."""
+    platform = platform if platform is not None else sys.platform
+    home = env.get("HOME") or os.path.expanduser("~")
+    if platform.startswith("darwin"):
+        return os.path.join(
+            home,
+            "Library",
+            "Application Support",
+            APP_CONFIG_IDENTIFIER,
+            "assistant.toml",
+        )
+    if platform.startswith("win"):
+        appdata = env.get("APPDATA")
+        if not appdata:
+            return None
+        return os.path.join(appdata, APP_CONFIG_IDENTIFIER, "assistant.toml")
+    base = env.get("XDG_CONFIG_HOME") or os.path.join(home, ".config")
+    return os.path.join(base, APP_CONFIG_IDENTIFIER, "assistant.toml")
+
+
 def find_config_path(
-    cli_path: Optional[str], env: Mapping[str, str], cwd: str
+    cli_path: Optional[str],
+    env: Mapping[str, str],
+    cwd: str,
+    platform: Optional[str] = None,
+    optional_cli_path: Optional[str] = None,
 ) -> Optional[str]:
     """Resolve the assistant configuration path in precedence order."""
+    if cli_path is not None and optional_cli_path is not None:
+        raise AssistConfigError(
+            "--config and --config-or-defaults are mutually exclusive"
+        )
+    if optional_cli_path is not None:
+        return optional_cli_path if os.path.exists(optional_cli_path) else None
+
     if cli_path is not None:
         if not os.path.exists(cli_path):
             raise AssistConfigError("config file does not exist: {0}".format(cli_path))
@@ -67,9 +104,14 @@ def find_config_path(
     if os.path.exists(cwd_path):
         return cwd_path
 
-    user_path = os.path.expanduser(USER_CONFIG_PATH)
+    home = env.get("HOME") or os.path.expanduser("~")
+    user_path = os.path.join(home, ".tenryu", "assistant.toml")
     if os.path.exists(user_path):
         return user_path
+
+    app_path = app_config_path(env, platform)
+    if app_path is not None and os.path.exists(app_path):
+        return app_path
     return None
 
 
@@ -179,15 +221,21 @@ def load_config(
     cli_path: Optional[str] = None,
     env: Optional[Mapping[str, str]] = None,
     cwd: Optional[str] = None,
+    optional_cli_path: Optional[str] = None,
 ) -> AssistConfig:
-    """Load and validate assistant configuration."""
+    """Load and validate assistant configuration.
+
+    ``optional_cli_path`` uses that file when present or built-in defaults when absent.
+    """
     if env is None:
         env = os.environ
     if cwd is None:
         cwd = os.getcwd()
 
     disabled = env.get(ENV_KILL_SWITCH, "") in ("1", "true", "TRUE", "yes")
-    path = find_config_path(cli_path, env, cwd)
+    path = find_config_path(
+        cli_path, env, cwd, optional_cli_path=optional_cli_path
+    )
     if path is None:
         config = AssistConfig()
     else:

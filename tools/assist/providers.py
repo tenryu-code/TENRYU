@@ -1,8 +1,12 @@
 """Provider command abstraction for the experimental assistant."""
 
 import os
+import signal
 import shlex
+import shutil
 import subprocess
+import sys
+import tempfile
 import time
 from datetime import datetime, timezone
 from typing import List
@@ -19,10 +23,41 @@ from tools.assist.journal import JournalWriter, sha256_hex
 DRY_RUN_PROVIDER = ProviderSpec(
     name="dry_run", command_template="dry_run", model="none"
 )
+_ACTIVE_CHILDREN: set = set()
+_CANCELLATION_HANDLERS_INSTALLED = False
 
 
 class AssistDisabledError(RuntimeError):
     """Raised when an LLM invocation is attempted while disabled."""
+
+
+def _terminate_group(child, sig=signal.SIGTERM):
+    try:
+        os.killpg(os.getpgid(child.pid), sig)
+    except ProcessLookupError:
+        pass
+    try:
+        child.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(os.getpgid(child.pid), signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+def install_cancellation_handlers():
+    global _CANCELLATION_HANDLERS_INSTALLED
+    if _CANCELLATION_HANDLERS_INSTALLED:
+        return
+
+    def handle_cancellation(_signum, _frame):
+        for child in list(_ACTIVE_CHILDREN):
+            _terminate_group(child)
+        sys.exit(130)
+
+    signal.signal(signal.SIGTERM, handle_cancellation)
+    signal.signal(signal.SIGINT, handle_cancellation)
+    _CANCELLATION_HANDLERS_INSTALLED = True
 
 
 def resolve_role(cfg: AssistConfig, role: str) -> ProviderSpec:
@@ -62,6 +97,7 @@ def invoke(
     workdir: str,
     journal: "JournalWriter",
     timeout_s: int = 600,
+    cwd=None,
 ) -> str:
     """Invoke a configured provider and journal the completed attempt."""
     if not cfg.enabled:
@@ -75,7 +111,10 @@ def invoke(
     response = ""
     exit_status = None
     error = None
+    prompt_file = ""
+    child = None
     prompt_bytes = prompt_text.encode("utf-8")
+    invocation_cwd = cwd if cwd is not None else workdir
 
     try:
         spec = resolve_role(cfg, role)
@@ -85,26 +124,56 @@ def invoke(
         )
         with open(prompt_path, "w", encoding="utf-8") as stream:
             stream.write(prompt_text)
+        prompt_file = prompt_path
+
+        if any(character.isspace() for character in prompt_path):
+            safe_dir = tempfile.mkdtemp(prefix="tenryu-assist-", dir=None)
+            if any(character.isspace() for character in safe_dir):
+                raise AssistConfigError(
+                    "temporary directory path contains whitespace: {0}".format(
+                        safe_dir
+                    )
+                )
+            safe_prompt = os.path.join(safe_dir, os.path.basename(prompt_path))
+            with open(safe_prompt, "w", encoding="utf-8") as stream:
+                stream.write(prompt_text)
+            for filename in ("docmap.md", "namelist_keys.txt"):
+                source = os.path.join(workdir, filename)
+                if os.path.isfile(source):
+                    shutil.copyfile(source, os.path.join(safe_dir, filename))
+            prompt_file = safe_prompt
 
         if spec.name == "dry_run":
             command = ["dry_run"]
             response = "DRY-RUN RESPONSE\n" + sha256_hex(prompt_text)[:16]
             exit_status = 0
         else:
-            command = build_command(spec, prompt_path)
-            completed = subprocess.run(
+            command = build_command(spec, prompt_file)
+            child = subprocess.Popen(
                 command,
-                cwd=workdir,
-                capture_output=True,
+                cwd=invocation_cwd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                timeout=timeout_s,
+                start_new_session=True,
             )
-            response = completed.stdout
-            exit_status = completed.returncode
-            if completed.returncode != 0:
+            _ACTIVE_CHILDREN.add(child)
+            try:
+                try:
+                    stdout, stderr = child.communicate(timeout=timeout_s)
+                except subprocess.TimeoutExpired:
+                    _terminate_group(child)
+                    stdout, stderr = child.communicate()
+                    response = stdout
+                    raise
+            finally:
+                _ACTIVE_CHILDREN.discard(child)
+            response = stdout
+            exit_status = child.returncode
+            if child.returncode != 0:
                 raise RuntimeError(
                     "provider command exited with code {0}: {1}".format(
-                        completed.returncode, completed.stderr[-2000:]
+                        child.returncode, stderr[-2000:]
                     )
                 )
     except Exception as caught:
@@ -117,6 +186,9 @@ def invoke(
         "provider": provider_name,
         "model": model,
         "command": command,
+        "child_pid": child.pid if child is not None else None,
+        "cwd": invocation_cwd,
+        "prompt_file": prompt_file,
         "prompt_sha256": sha256_hex(prompt_bytes),
         "prompt_bytes": len(prompt_bytes),
         "response_sha256": sha256_hex(response),

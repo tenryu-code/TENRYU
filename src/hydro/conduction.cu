@@ -1,4 +1,5 @@
 #include "hydro/conduction.cuh"
+#include "core/nvtx_range.hpp"
 #include "hydro/conduction_snb_2d.cuh"
 
 #include <algorithm>
@@ -96,6 +97,7 @@ double tridiagonal_relative_residual(const std::vector<double>& lower,
                                      const std::vector<double>& upper,
                                      const std::vector<double>& rhs,
                                      const std::vector<double>& x) {
+  const core::NvtxRange nvtx_range("conduction.host_residual");
   const std::size_t n = diag.size();
   if (n == 0 || lower.size() != n || upper.size() != n || rhs.size() != n ||
       x.size() != n) {
@@ -277,6 +279,7 @@ void compute_effective_material_properties(const core::Config& cfg,
                                            const int n_cells,
                                            std::vector<double>& A_eff,
                                            std::vector<double>& gamma_eff) {
+  const core::NvtxRange nvtx_range("conduction.material_properties");
   TENRYU_ASSERT(!cfg.materials.materials.empty(),
                 "Conduction requires at least one material");
   const auto& materials = cfg.materials.materials;
@@ -3640,6 +3643,7 @@ void audit_sts_ladder_stability(const std::vector<double>& tau,
 }
 
 void conduction_sync_eos(core::State& state, const core::Config& cfg) {
+  const core::NvtxRange nvtx_range("conduction.internal_eos");
   const int n_cells = static_cast<int>(state.rho.size());
   if (n_cells <= 0) {
     return;
@@ -3656,32 +3660,39 @@ void conduction_sync_eos(core::State& state, const core::Config& cfg) {
       return;
     }
   }
-  std::vector<double> A_eff;
-  std::vector<double> gamma_eff;
-  compute_effective_material_properties(cfg, state, n_cells, A_eff, gamma_eff);
-  TENRYU_ASSERT(A_eff.size() == static_cast<std::size_t>(n_cells),
-                "Conduction eos_sync A_eff size mismatch");
-  TENRYU_ASSERT(gamma_eff.size() == static_cast<std::size_t>(n_cells),
-                "Conduction eos_sync gamma_eff size mismatch");
+  const double* d_A_eff = nullptr;
+  const double* d_gamma_eff = nullptr;
+  if (state.mesh.dim == 1 &&
+      state.A_eff.size() == static_cast<std::size_t>(n_cells) &&
+      state.gamma_eff.size() == static_cast<std::size_t>(n_cells)) {
+    d_A_eff = state.A_eff.data();
+    d_gamma_eff = state.gamma_eff.data();
+  } else {
+    std::vector<double> A_eff;
+    std::vector<double> gamma_eff;
+    compute_effective_material_properties(cfg, state, n_cells, A_eff, gamma_eff);
+    TENRYU_ASSERT(A_eff.size() == static_cast<std::size_t>(n_cells),
+                  "Conduction eos_sync A_eff size mismatch");
+    TENRYU_ASSERT(gamma_eff.size() == static_cast<std::size_t>(n_cells),
+                  "Conduction eos_sync gamma_eff size mismatch");
 
-  double* d_A_eff = nullptr;
-  double* d_gamma_eff = nullptr;
-  d_A_eff = static_cast<double*>(core::device_scratch_acquire(
-      "conduction:conduction_sync_eos:d_A_eff",
-      static_cast<std::size_t>(n_cells) * sizeof(double)));
-  d_gamma_eff = static_cast<double*>(core::device_scratch_acquire(
-      "conduction:conduction_sync_eos:d_gamma_eff",
-      static_cast<std::size_t>(n_cells) * sizeof(double)));
-  cuda_check(cudaMemcpy(d_A_eff,
-                        A_eff.data(),
-                        static_cast<std::size_t>(n_cells) * sizeof(double),
-                        cudaMemcpyHostToDevice),
-             "Conduction: cudaMemcpy eos d_A_eff failed");
-  cuda_check(cudaMemcpy(d_gamma_eff,
-                        gamma_eff.data(),
-                        static_cast<std::size_t>(n_cells) * sizeof(double),
-                        cudaMemcpyHostToDevice),
-             "Conduction: cudaMemcpy eos d_gamma_eff failed");
+    d_A_eff = static_cast<double*>(core::device_scratch_acquire(
+        "conduction:conduction_sync_eos:d_A_eff",
+        static_cast<std::size_t>(n_cells) * sizeof(double)));
+    d_gamma_eff = static_cast<double*>(core::device_scratch_acquire(
+        "conduction:conduction_sync_eos:d_gamma_eff",
+        static_cast<std::size_t>(n_cells) * sizeof(double)));
+    cuda_check(cudaMemcpy(const_cast<double*>(d_A_eff),
+                          A_eff.data(),
+                          static_cast<std::size_t>(n_cells) * sizeof(double),
+                          cudaMemcpyHostToDevice),
+               "Conduction: cudaMemcpy eos d_A_eff failed");
+    cuda_check(cudaMemcpy(const_cast<double*>(d_gamma_eff),
+                          gamma_eff.data(),
+                          static_cast<std::size_t>(n_cells) * sizeof(double),
+                          cudaMemcpyHostToDevice),
+               "Conduction: cudaMemcpy eos d_gamma_eff failed");
+  }
 
   const core::State::LaunchWindow cw = state.owned_cell_window(n_cells);
   eos_sync_electron_kernel<<<cw.blocks(), kBlockSize>>>(
@@ -3776,6 +3787,7 @@ ConductionResult conduction_step_1d_implicit(core::State& state,
                                              const parallel::PartitionInfo& part,
                                              parallel::CommBuffers* bufs,
                                              cudaStream_t stream) {
+  const core::NvtxRange nvtx_range("conduction.implicit_solve");
   (void)bufs;
   ConductionResult result;
   result.dt_cond = std::numeric_limits<double>::infinity();
@@ -4889,20 +4901,25 @@ ConductionResult conduction_step_1d_sts(core::State& state,
   double* d_A_eff = nullptr;
   double* d_flux_limiter_faces = nullptr;
   if (use_flux_limiter != 0 && n_cells > 1) {
-    std::vector<double> A_eff;
-    std::vector<double> gamma_eff;
-    compute_effective_material_properties(cfg, state, n_cells, A_eff, gamma_eff);
-    (void)gamma_eff;
-    TENRYU_ASSERT(A_eff.size() == static_cast<std::size_t>(n_cells),
-                  "Conduction 1D STS A_eff size mismatch");
-    d_A_eff = static_cast<double*>(core::device_scratch_acquire(
-        "conduction:conduction_step_1d_sts:d_A_eff",
-        static_cast<std::size_t>(n_cells) * sizeof(double)));
-    cuda_check(cudaMemcpy(d_A_eff,
-                          A_eff.data(),
-                          static_cast<std::size_t>(n_cells) * sizeof(double),
-                          cudaMemcpyHostToDevice),
-               "Conduction: cudaMemcpy d_A_eff failed");
+    if (state.A_eff.size() == static_cast<std::size_t>(n_cells) &&
+        state.gamma_eff.size() == static_cast<std::size_t>(n_cells)) {
+      d_A_eff = const_cast<double*>(state.A_eff.data());
+    } else {
+      std::vector<double> A_eff;
+      std::vector<double> gamma_eff;
+      compute_effective_material_properties(cfg, state, n_cells, A_eff, gamma_eff);
+      (void)gamma_eff;
+      TENRYU_ASSERT(A_eff.size() == static_cast<std::size_t>(n_cells),
+                    "Conduction 1D STS A_eff size mismatch");
+      d_A_eff = static_cast<double*>(core::device_scratch_acquire(
+          "conduction:conduction_step_1d_sts:d_A_eff",
+          static_cast<std::size_t>(n_cells) * sizeof(double)));
+      cuda_check(cudaMemcpy(d_A_eff,
+                            A_eff.data(),
+                            static_cast<std::size_t>(n_cells) * sizeof(double),
+                            cudaMemcpyHostToDevice),
+                 "Conduction: cudaMemcpy d_A_eff failed");
+    }
     d_flux_limiter_faces = static_cast<double*>(core::device_scratch_acquire(
         "conduction:conduction_step_1d_sts:d_flux_limiter_faces",
         static_cast<std::size_t>(n_cells) * sizeof(double)));
@@ -5181,6 +5198,11 @@ ConductionResult conduction_step_1d_sts(core::State& state,
                   "SNB nonlocal conduction does not support the "
                   "TENRYU_CONDUCTION_TEST_KAPPA_POWER hook");
     double* d_A_eff_snb = d_A_eff;
+    if (d_A_eff_snb == nullptr &&
+        state.A_eff.size() == static_cast<std::size_t>(n_cells) &&
+        state.gamma_eff.size() == static_cast<std::size_t>(n_cells)) {
+      d_A_eff_snb = const_cast<double*>(state.A_eff.data());
+    }
     if (d_A_eff_snb == nullptr) {
       std::vector<double> A_eff_snb;
       std::vector<double> gamma_eff_snb;

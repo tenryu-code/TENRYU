@@ -5,6 +5,7 @@
 #include <cuda_runtime.h>
 
 #include "core/error.hpp"
+#include "core/kernel_guard.hpp"
 
 namespace tenryu::hydro {
 namespace {
@@ -110,7 +111,7 @@ void apply_boundary_1d(core::State& state, const core::Config& cfg) {
                                       static_cast<int>(state.x_r.size()),
                                       apply_outer, cfg.mesh.r_min, cfg.mesh.r_max);
   cuda_check(cudaGetLastError(), "apply_boundary_1d kernel launch failed");
-  cuda_check(cudaDeviceSynchronize(), "apply_boundary_1d kernel execution failed");
+  cuda_check(core::debug_kernel_sync(), "apply_boundary_1d kernel execution failed");
 }
 
 }  // namespace tenryu::hydro

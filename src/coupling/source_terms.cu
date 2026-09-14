@@ -1,11 +1,14 @@
 #include "coupling/source_terms.hpp"
+#include "core/nvtx_range.hpp"
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <iomanip>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -21,7 +24,9 @@
 #include "hydro/per_material_eos_project.cuh"
 #include "materials/eos_device.cuh"
 #include "materials/eos_device_table.hpp"
+#include "materials/eos_cell_table_selector.cuh"
 #include "materials/eos_table.hpp"
+#include "materials/eos_table_reclose.cuh"
 #include "mesh/cell_geometry_2d.cuh"
 
 namespace tenryu::coupling {
@@ -302,6 +307,411 @@ void compute_effective_A_gamma(const core::Config& cfg,
       (*dominant_material)[static_cast<std::size_t>(c)] = best_mat;
     }
   }
+}
+
+struct LaserInjectionMaterial {
+  double inv_A;
+  double gamma;
+  bool is_void;
+
+  bool operator==(const LaserInjectionMaterial& other) const {
+    return inv_A == other.inv_A && gamma == other.gamma && is_void == other.is_void;
+  }
+};
+
+struct LaserInjectionDeviceCache {
+  core::DeviceBuffer<std::uint8_t> cell_is_void;
+  std::vector<std::uint8_t> cached_cell_is_void;
+  core::DeviceBuffer<LaserInjectionMaterial> materials;
+  std::vector<LaserInjectionMaterial> cached_materials;
+  std::shared_ptr<const materials::EOSTableTriplet> eos_tables;
+};
+
+struct LaserInjectionDeviceParams {
+  SourceEOSTableViews tables;
+  double A0;
+  double gamma0;
+  double te_floor;
+  double ti_floor;
+  double cv_e_override;
+  double T_ref;
+  int n_materials;
+  bool use_two_temp;
+  bool has_table_eos;
+  bool use_first_cv_override;
+  // Per-cell dominant-material table selection (multi-material closure).
+  materials::CellEOSTableSelector cell_tables;
+  // eos_closure_mode == "energy_authoritative": sub-floor energies are kept
+  // (only the temperature is floored) instead of being rewritten (2026-09-14).
+  bool energy_authoritative;
+};
+
+struct LaserInjectionCellLedger {
+  double floor_e;
+  double floor_i;
+  double skipped_energy;
+  int clamp_count;
+  bool skipped;
+};
+
+struct LaserInjectionSummary {
+  double floor_energy = 0.0;
+  double skipped_energy = 0.0;
+  double redirected_void_energy = 0.0;
+  double unrecoverable_void_energy = 0.0;
+  double redirected_fraction = 0.0;
+  double negative_deposit = 0.0;
+  int clamp_count = 0;
+  int redirected_void_cells = 0;
+  int first_negative_cell = -1;
+};
+
+__global__ void prepare_laser_injection_kernel(
+    const double* deposition, const std::uint8_t* cell_is_void,
+    double* redirected, const int n, LaserInjectionSummary* summary) {
+  if (blockIdx.x != 0 || threadIdx.x != 0) return;
+  LaserInjectionSummary result;
+  for (int c = 0; c < n; ++c) {
+    double dep = deposition[c];
+    if (dep < 0.0) {
+      if (result.first_negative_cell < 0) {
+        result.first_negative_cell = c;
+        result.negative_deposit = dep;
+      }
+      dep = 0.0;
+    }
+    redirected[c] = dep;
+  }
+  double carry = 0.0;
+  for (int c = n - 1; c >= 0; --c) {
+    const double dep = redirected[c];
+    if (cell_is_void[c] != 0U) {
+      if (dep > 0.0) {
+        ++result.redirected_void_cells;
+        result.redirected_void_energy += dep;
+      }
+      carry += dep;
+      redirected[c] = 0.0;
+    } else if (carry > 0.0) {
+      redirected[c] += carry;
+      carry = 0.0;
+    }
+  }
+  if (carry > 0.0) {
+    result.unrecoverable_void_energy = carry;
+    result.skipped_energy += carry;
+  }
+  if (result.redirected_void_cells > 0 || result.unrecoverable_void_energy > 0.0) {
+    double total = result.redirected_void_energy;
+    for (int c = 0; c < n; ++c) total += redirected[c];
+    result.redirected_fraction = total > 0.0 ? result.redirected_void_energy / total : 0.0;
+  }
+  *summary = result;
+}
+
+__device__ void laser_injection_material_properties(
+    const int c, const LaserInjectionDeviceParams& params,
+    const double* volfrac, const LaserInjectionMaterial* materials,
+    double& A, double& gamma) {
+  if (params.n_materials <= 1 || volfrac == nullptr) return;
+  double frac_sum = 0.0;
+  double inv_A = 0.0;
+  double gamma_sum = 0.0;
+  for (int m = 0; m < params.n_materials; ++m) {
+    if (materials[m].is_void) continue;
+    const double raw = volfrac[static_cast<std::size_t>(c) * params.n_materials + m];
+    const double frac = (::isfinite(raw) && raw > 0.0) ? raw : 0.0;
+    frac_sum += frac;
+    // Match the host's separately rounded products, without CUDA contraction.
+    inv_A = __dadd_rn(inv_A, __dmul_rn(frac, materials[m].inv_A));
+    gamma_sum = __dadd_rn(gamma_sum, __dmul_rn(frac, materials[m].gamma));
+  }
+  if (frac_sum > 1.0e-30) {
+    inv_A /= frac_sum;
+    gamma_sum /= frac_sum;
+  }
+  if (::isfinite(inv_A) && inv_A > 1.0e-30) {
+    A = materials::reclose_max(1.0 / inv_A, kMinEffectiveA);
+  }
+  if (::isfinite(gamma_sum) && gamma_sum > 0.0) {
+    gamma = materials::reclose_max(gamma_sum, kMinEffectiveGamma);
+  }
+}
+
+__global__ void inject_laser_source_cells_kernel(
+    const LaserInjectionDeviceParams params, const int n,
+    const std::uint8_t* cell_is_void, const LaserInjectionMaterial* material_params,
+    const double* volfrac, const double* rho, const double* vol, const double* zbar,
+    const double* cv_e, const double* laser_dep,
+    double* ee, double* Te, double* Pe, double* ei, double* Ti, double* Pi,
+    LaserInjectionCellLedger* ledger) {
+  const int c = blockIdx.x * blockDim.x + threadIdx.x;
+  if (c >= n) return;
+  ledger[c] = {};
+  int local_clamp_count = 0;
+  const double dep = laser_dep[static_cast<std::size_t>(c)];
+  const std::size_t c_idx = static_cast<std::size_t>(c);
+  if (cell_is_void[c_idx] != 0U) {
+    return;
+  }
+  const double rho_c = rho[c_idx];
+  const double vol_c = vol[c_idx];
+  const double denom = rho_c * vol_c;
+  if (!(denom > 1.0e-30)) {
+    ledger[c].skipped_energy = dep;
+    ledger[c].skipped = true;
+    return;
+  }
+
+  // Per-cell dominant-material tables (multi-material closure, 2026-09-14);
+  // cells whose material has no table keep the first material's table.
+  const materials::DeviceEOSTableView tab_ele =
+      params.cell_tables.electron(c, params.tables.electron);
+  const materials::DeviceEOSTableView tab_ion = params.cell_tables.ion(c, params.tables.ion);
+
+  double A_c = params.A0;
+  double gamma_c = params.gamma0;
+  laser_injection_material_properties(c, params, volfrac, material_params, A_c, gamma_c);
+  const double gm1_c = gamma_c - 1.0;
+  const double cv_mass_i =
+      materials::reclose_max(core::constants::eV_to_erg /
+                   (A_c * core::constants::proton_mass * gm1_c),
+               1.0e-30);
+  if (!params.use_two_temp) {
+    // 1T closure: ee stores total internal energy.
+    ee[c_idx] += ei[c_idx];
+  }
+  ee[c_idx] += dep / denom;
+  const double ee_before_floor = ee[c_idx];
+
+  const double rho_safe = materials::reclose_max(rho_c, 1.0e-30);
+  const bool use_table_eos_closure = params.use_two_temp && params.has_table_eos;
+  double Te_raw = 0.0;
+  double Te_new = params.te_floor;
+  if (use_table_eos_closure) {
+    Te_raw = materials::reclose_temperature_from_energy<true>(tab_ele, rho_safe, ee[c_idx]);
+    if (!::isfinite(Te_raw) || Te_raw < params.te_floor) {
+      Te_new = params.te_floor;
+      if (!params.energy_authoritative || !::isfinite(Te_raw)) {
+        ee[c_idx] = materials::reclose_energy<true>(tab_ele, rho_safe, Te_new);
+      }
+    } else {
+      Te_new = Te_raw;
+    }
+    Pe[c_idx] = materials::reclose_pressure<true>(tab_ele, rho_safe, Te_new);
+  } else if (params.use_first_cv_override && params.T_ref > 0.0) {
+    const double T_ref = params.T_ref;
+    const double T_ref3 = T_ref * T_ref * T_ref;
+    const double alpha0 = params.cv_e_override / (4.0 * T_ref3);
+    const double arg = ee[c_idx] * rho_safe / alpha0;
+    Te_raw = (arg > 0.0) ? ::pow(arg, 0.25) : 0.0;
+    if (!::isfinite(Te_raw)) {
+      Te_raw = 0.0;
+    }
+    Te_new = materials::reclose_max(Te_raw, params.te_floor);
+    const double Te4 = Te_new * Te_new * Te_new * Te_new;
+    ee[c_idx] = alpha0 * Te4 / rho_safe;
+  } else {
+    const double z = materials::reclose_max(zbar[c_idx], 0.0);
+    double cv_mass_e = 0.0;
+    if (params.use_first_cv_override) {
+      cv_mass_e = params.cv_e_override / rho_safe;
+    } else if (cv_e != nullptr && cv_e[c_idx] > 0.0) {
+      cv_mass_e = cv_e[c_idx];
+    } else {
+      cv_mass_e = z * core::constants::eV_to_erg /
+                  (A_c * core::constants::proton_mass * gm1_c);
+    }
+    cv_mass_e = materials::reclose_max(cv_mass_e, 1.0e-30);
+    const double cv_mass_total = params.use_two_temp
+                                     ? cv_mass_e
+                                     : (params.use_first_cv_override
+                                            ? cv_mass_e
+                                            : materials::reclose_max(cv_mass_e + cv_mass_i,
+                                                       1.0e-30));
+    Te_raw = ee[c_idx] / cv_mass_total;
+    if (!::isfinite(Te_raw)) {
+      Te_raw = 0.0;
+    }
+    Te_new = materials::reclose_max(Te_raw, params.te_floor);
+    ee[c_idx] = cv_mass_total * Te_new;
+  }
+
+  if (Te_new > Te_raw) {
+    ++local_clamp_count;
+  }
+  const double de_floor_e = ee[c_idx] - ee_before_floor;
+  if (de_floor_e > 0.0) {
+    ledger[c].floor_e = __dmul_rn(__dmul_rn(rho_c, vol_c), de_floor_e);
+  }
+
+  Te[c_idx] = Te_new;
+  if (!use_table_eos_closure) {
+    Pe[c_idx] = gm1_c * rho_c * ee[c_idx];
+  }
+  if (params.use_two_temp) {
+    if (params.has_table_eos) {
+      const double Ti_raw_table =
+          materials::reclose_temperature_from_energy<true>(tab_ion, rho_safe, ei[c_idx]);
+      const double ei_before_floor = ei[c_idx];
+      if (!::isfinite(Ti_raw_table) || Ti_raw_table < params.ti_floor) {
+        ++local_clamp_count;
+        Ti[c_idx] = params.ti_floor;
+        if (!params.energy_authoritative || !::isfinite(Ti_raw_table)) {
+          ei[c_idx] = materials::reclose_energy<true>(tab_ion, rho_safe, params.ti_floor);
+        }
+      } else {
+        Ti[c_idx] = Ti_raw_table;
+      }
+      Pi[c_idx] = materials::reclose_pressure<true>(tab_ion, rho_safe, Ti[c_idx]);
+      const double de_floor_i = ei[c_idx] - ei_before_floor;
+      if (de_floor_i > 0.0) {
+        ledger[c].floor_i = __dmul_rn(__dmul_rn(rho_c, vol_c), de_floor_i);
+      }
+    } else {
+      const double Ti_prev = ::isfinite(Ti[c_idx]) ? Ti[c_idx] : 0.0;
+      if (Ti_prev < params.ti_floor) {
+        ++local_clamp_count;
+        const double ei_before_floor = ei[c_idx];
+        Ti[c_idx] = params.ti_floor;
+        ei[c_idx] = cv_mass_i * params.ti_floor;
+        Pi[c_idx] = gm1_c * rho_c * ei[c_idx];
+        const double de_floor_i = ei[c_idx] - ei_before_floor;
+        if (de_floor_i > 0.0) {
+          ledger[c].floor_i = __dmul_rn(__dmul_rn(rho_c, vol_c), de_floor_i);
+        }
+      }
+    }
+  } else {
+    // 1T closure convention: ee is total internal energy, ei/Pi are unused.
+    Ti[c_idx] = Te_new;
+    ei[c_idx] = 0.0;
+    Pi[c_idx] = 0.0;
+  }
+  ledger[c].clamp_count = local_clamp_count;
+}
+
+__global__ void fold_laser_injection_ledger_kernel(
+    const LaserInjectionCellLedger* ledger, const int n,
+    LaserInjectionSummary* summary) {
+  if (blockIdx.x != 0 || threadIdx.x != 0) return;
+  // Fixed cell order, electron then ion, exactly as in the host ledger.
+  for (int c = 0; c < n; ++c) {
+    if (ledger[c].floor_e > 0.0) summary->floor_energy += ledger[c].floor_e;
+    if (ledger[c].floor_i > 0.0) summary->floor_energy += ledger[c].floor_i;
+    if (ledger[c].skipped) summary->skipped_energy += ledger[c].skipped_energy;
+    summary->clamp_count += ledger[c].clamp_count;
+  }
+}
+
+double inject_laser_source_terms_device(
+    core::State& state, const core::Config& cfg,
+    const core::Config::MaterialsConfig::MatDef& mat0,
+    const bool has_table_eos, const bool use_first_cv_override,
+    double* E_floor_injected, int* clamp_count,
+    const hydro::HydroEOSContext* eos_ctx) {
+  static LaserInjectionDeviceCache cache;
+  const std::size_t n = state.rho.size();
+  if (cache.cached_cell_is_void != state.cell_is_void) {
+    cache.cell_is_void.reset(n);
+    cache.cell_is_void.copy_from_host(state.cell_is_void);
+    cache.cached_cell_is_void = state.cell_is_void;
+  }
+  std::vector<LaserInjectionMaterial> material_params;
+  material_params.reserve(cfg.materials.materials.size());
+  for (const auto& mat : cfg.materials.materials) {
+    material_params.push_back({1.0 / std::max(mat.A, kMinEffectiveA),
+                              std::max(mat.ideal_gas_gamma, kMinEffectiveGamma),
+                              mat.is_void});
+  }
+  if (cache.cached_materials != material_params) {
+    cache.materials.reset(material_params.size());
+    cache.materials.copy_from_host(material_params);
+    cache.cached_materials = material_params;
+  }
+  const bool valid_volfrac = state.volFrac.size() == n * material_params.size();
+  if (!valid_volfrac && material_params.size() > 1) {
+    static bool warned_volfrac_size_mismatch = false;
+    if (!warned_volfrac_size_mismatch) {
+      core::log_warning("Multi-material mixing: volFrac size mismatch (" +
+                        std::to_string(state.volFrac.size()) + " vs expected " +
+                        std::to_string(n * material_params.size()) +
+                        "); falling back to first non-void material.");
+      warned_volfrac_size_mismatch = true;
+    }
+  }
+  LaserInjectionDeviceParams params{};
+  if (has_table_eos && cfg.main.two_temperature) {
+    params.tables = select_source_eos_table_views(
+        mat0, cfg.materials.first_nonvoid_material_index(), nullptr);
+    // Keep the table cache's identity alive across independent driver runs.
+    cache.eos_tables = mat0.eos_tables;
+  }
+  params.A0 = std::max(mat0.A, kMinEffectiveA);
+  params.gamma0 = std::max(mat0.ideal_gas_gamma, kMinEffectiveGamma);
+  params.te_floor = cfg.numerics.floors.Te;
+  params.ti_floor = cfg.numerics.floors.Ti;
+  params.cv_e_override = mat0.cv_e_override;
+  params.T_ref = mat0.eos_T_ref_eV;
+  params.n_materials = static_cast<int>(material_params.size());
+  params.use_two_temp = cfg.main.two_temperature;
+  params.has_table_eos = has_table_eos;
+  params.use_first_cv_override = use_first_cv_override;
+  state.ensure_cell_material_props(cfg);
+  params.cell_tables = materials::make_cell_eos_table_selector(
+      eos_ctx != nullptr ? eos_ctx->d_ion_views : nullptr,
+      eos_ctx != nullptr ? eos_ctx->d_electron_views : nullptr,
+      eos_ctx != nullptr ? eos_ctx->d_total_views : nullptr,
+      eos_ctx != nullptr ? eos_ctx->n_materials : 0,
+      (n > 0 && state.cell_material_index.size() == n) ? state.cell_material_index.data()
+                                                        : nullptr);
+  params.energy_authoritative =
+      (cfg.numerics.hydro.eos_closure_mode == "energy_authoritative");
+  auto* redirected = static_cast<double*>(core::device_scratch_acquire(
+      "source_terms:laser_redirected", n * sizeof(double)));
+  auto* ledger = static_cast<LaserInjectionCellLedger*>(core::device_scratch_acquire(
+      "source_terms:laser_cell_ledger", n * sizeof(LaserInjectionCellLedger)));
+  auto* summary = static_cast<LaserInjectionSummary*>(core::device_scratch_acquire(
+      "source_terms:laser_summary", sizeof(LaserInjectionSummary)));
+  prepare_laser_injection_kernel<<<1, 1>>>(
+      state.laser_dep.data(), cache.cell_is_void.data(), redirected,
+      static_cast<int>(n), summary);
+  cuda_check(cudaGetLastError(), "prepare_laser_injection_kernel launch failed");
+  cuda_check(core::debug_kernel_sync(), "prepare_laser_injection_kernel failed");
+  constexpr int threads = 128;
+  inject_laser_source_cells_kernel<<<(n + threads - 1) / threads, threads>>>(
+      params, static_cast<int>(n), cache.cell_is_void.data(), cache.materials.data(),
+      valid_volfrac ? state.volFrac.data() : nullptr,
+      state.rho.data(), state.vol.data(), state.zbar.data(),
+      state.cv_e.empty() ? nullptr : state.cv_e.data(), redirected,
+      state.ee.data(), state.Te.data(), state.Pe.data(), state.ei.data(),
+      state.Ti.data(), state.Pi.data(), ledger);
+  cuda_check(cudaGetLastError(), "inject_laser_source_cells_kernel launch failed");
+  cuda_check(core::debug_kernel_sync(), "inject_laser_source_cells_kernel failed");
+  fold_laser_injection_ledger_kernel<<<1, 1>>>(ledger, static_cast<int>(n), summary);
+  cuda_check(cudaGetLastError(), "fold_laser_injection_ledger_kernel launch failed");
+  cuda_check(core::debug_kernel_sync(), "fold_laser_injection_ledger_kernel failed");
+  LaserInjectionSummary result;
+  cuda_check(cudaMemcpy(&result, summary, sizeof(result), cudaMemcpyDeviceToHost),
+             "inject_laser_source_terms_device summary D2H failed");
+  static bool warned_negative_laser_dep = false;
+  if (result.first_negative_cell >= 0 && !warned_negative_laser_dep) {
+    core::log_warning("inject_laser_source_terms: negative laser_dep detected (cell=" +
+                      std::to_string(result.first_negative_cell) + ", value=" +
+                      std::to_string(result.negative_deposit) + "); clamping to 0.");
+    warned_negative_laser_dep = true;
+  }
+  if ((result.redirected_void_cells > 0 || result.unrecoverable_void_energy > 0.0) &&
+      (result.redirected_fraction >= 0.05 || result.unrecoverable_void_energy > 0.0)) {
+    core::log_warning("WARNING: laser energy in void cells redirected from " +
+                      std::to_string(result.redirected_void_cells) + " cells (" +
+                      std::to_string(result.redirected_fraction * 100.0) +
+                      "% of total), unrecoverable=" +
+                      std::to_string(result.unrecoverable_void_energy) + " erg");
+  }
+  accumulate_floor_and_clamp(E_floor_injected, clamp_count,
+                            result.floor_energy, result.clamp_count);
+  return result.skipped_energy;
 }
 
 void compute_raw_net_radiation_source_terms(const std::vector<double>& rad_dep,
@@ -720,11 +1130,13 @@ __global__ void inject_radiation_source_terms_kernel(
     const bool use_first_cv_override,
     const double cv_e_override,
     const double eos_T_ref_eV,
-    const tenryu::materials::DeviceEOSTableView tab_ion,
-    const tenryu::materials::DeviceEOSTableView tab_ele,
+    const tenryu::materials::DeviceEOSTableView tab_ion_first,
+    const tenryu::materials::DeviceEOSTableView tab_ele_first,
+    const tenryu::materials::CellEOSTableSelector cell_tables,
     double* __restrict__ floor_energy,
     double* __restrict__ skipped_energy,
-    int* __restrict__ clamp_count) {
+    int* __restrict__ clamp_count,
+    const int energy_authoritative) {
   const int c = blockIdx.x * blockDim.x + threadIdx.x;
   if (c >= n_cells) {
     return;
@@ -752,6 +1164,12 @@ __global__ void inject_radiation_source_terms_kernel(
     return;
   }
 
+  // Per-cell dominant-material tables (multi-material closure, 2026-09-14);
+  // cells whose material has no table keep the first material's table.
+  const tenryu::materials::DeviceEOSTableView tab_ion = cell_tables.ion(c, tab_ion_first);
+  const tenryu::materials::DeviceEOSTableView tab_ele =
+      cell_tables.electron(c, tab_ele_first);
+
   const double A_c = A_eff[c];
   const double gm1_c = gamma_eff[c] - 1.0;
   const double cv_mass_i =
@@ -775,8 +1193,12 @@ __global__ void inject_radiation_source_terms_kernel(
         tab_ele, rb_e, ee[c]);
     if (!isfinite(Te_raw) || Te_raw < te_floor) {
       Te_new = te_floor;
-      const double logTe = log(fmax(Te_new, 1.0e-300));
-      ee[c] = tenryu::materials::device_eos_energy(tab_ele, rb_e, logTe);
+      // Energy-authoritative: keep the sub-floor energy (only the temperature
+      // is floored); the table value is written only for non-finite input.
+      if (energy_authoritative == 0 || !isfinite(Te_raw)) {
+        const double logTe = log(fmax(Te_new, 1.0e-300));
+        ee[c] = tenryu::materials::device_eos_energy(tab_ele, rb_e, logTe);
+      }
     } else {
       Te_new = Te_raw;
     }
@@ -839,8 +1261,10 @@ __global__ void inject_radiation_source_terms_kernel(
       if (!isfinite(Ti_raw_table) || Ti_raw_table < ti_floor) {
         atomicAdd(clamp_count, 1);
         Ti[c] = ti_floor;
-        const double logTi = log(fmax(ti_floor, 1.0e-300));
-        ei[c] = tenryu::materials::device_eos_energy(tab_ion, rb_i, logTi);
+        if (energy_authoritative == 0 || !isfinite(Ti_raw_table)) {
+          const double logTi = log(fmax(ti_floor, 1.0e-300));
+          ei[c] = tenryu::materials::device_eos_energy(tab_ion, rb_i, logTi);
+        }
       } else {
         Ti[c] = Ti_raw_table;
       }
@@ -895,8 +1319,10 @@ __global__ void qei_coupling_substep_kernel(
     const double cv_e_override,
     const double eos_T_ref_eV,
     const double qei_multiplier,
-    const tenryu::materials::DeviceEOSTableView tab_ion,
-    const tenryu::materials::DeviceEOSTableView tab_ele) {
+    const tenryu::materials::DeviceEOSTableView tab_ion_first,
+    const tenryu::materials::DeviceEOSTableView tab_ele_first,
+    const tenryu::materials::CellEOSTableSelector cell_tables,
+    const int energy_authoritative) {
   const int c = blockIdx.x * blockDim.x + threadIdx.x;
   if (c >= n_cells || !(dt > 0.0)) {
     return;
@@ -907,6 +1333,12 @@ __global__ void qei_coupling_substep_kernel(
   if (hydro_active != nullptr && hydro_active[c] == 0) {
     return;
   }
+
+  // Per-cell dominant-material tables (multi-material closure, 2026-09-14);
+  // cells whose material has no table keep the first material's table.
+  const tenryu::materials::DeviceEOSTableView tab_ion = cell_tables.ion(c, tab_ion_first);
+  const tenryu::materials::DeviceEOSTableView tab_ele =
+      cell_tables.electron(c, tab_ele_first);
 
   const double rho_c = rho[c];
   const double rho_safe = fmax(rho_c, 1.0e-30);
@@ -951,8 +1383,22 @@ __global__ void qei_coupling_substep_kernel(
   // where the frozen-cv transfer overshoots the stored energy). One shared
   // applied transfer keeps ee + ei exactly conserved and both sides
   // nonnegative; cells where the floors never engaged are bit-identical.
-  const double qei_hi = fmax(ee[c], 0.0);   // most the electrons can give
-  const double qei_lo = -fmax(ei[c], 0.0);  // most the ions can give
+  double qei_hi = fmax(ee[c], 0.0);   // most the electrons can give
+  double qei_lo = -fmax(ei[c], 0.0);  // most the ions can give
+  // Energy-authoritative table cells: the admissible domain is
+  // [e(rho, T_floor), inf) and signed (negative cold-curve) table energies are
+  // valid, so bound the transfer by the energy above the floor (2026-09-14).
+  if (energy_authoritative != 0 && has_table_eos && tab_ele.n_rho > 0 &&
+      tab_ion.n_rho > 0 && te_floor > 0.0 && ti_floor > 0.0) {
+    const auto rb_e_floor = tenryu::materials::find_rho_bracket(tab_ele, rho_safe);
+    const auto rb_i_floor = tenryu::materials::find_rho_bracket(tab_ion, rho_safe);
+    const double e_e_floor = tenryu::materials::device_eos_energy(
+        tab_ele, rb_e_floor, log(fmax(te_floor, 1.0e-300)));
+    const double e_i_floor = tenryu::materials::device_eos_energy(
+        tab_ion, rb_i_floor, log(fmax(ti_floor, 1.0e-300)));
+    qei_hi = fmax(ee[c] - e_e_floor, 0.0);
+    qei_lo = fmin(-(ei[c] - e_i_floor), 0.0);
+  }
   const double qei_applied =
       isfinite(qei_term) ? fmin(fmax(qei_term, qei_lo), qei_hi) : 0.0;
   ee[c] -= qei_applied;
@@ -967,8 +1413,12 @@ __global__ void qei_coupling_substep_kernel(
     Te_raw = tenryu::materials::device_eos_T_from_e_monotone(tab_ele, rb_e, ee[c]);
     if (!isfinite(Te_raw) || Te_raw < te_floor) {
       Te_new = te_floor;
-      const double logTe = log(fmax(Te_new, 1.0e-300));
-      ee[c] = tenryu::materials::device_eos_energy(tab_ele, rb_e, logTe);
+      // Energy-authoritative: keep the sub-floor energy (only the temperature
+      // is floored); the table value is written only for non-finite input.
+      if (energy_authoritative == 0 || !isfinite(Te_raw)) {
+        const double logTe = log(fmax(Te_new, 1.0e-300));
+        ee[c] = tenryu::materials::device_eos_energy(tab_ele, rb_e, logTe);
+      }
     } else {
       Te_new = Te_raw;
     }
@@ -1012,8 +1462,10 @@ __global__ void qei_coupling_substep_kernel(
         tenryu::materials::device_eos_T_from_e_monotone(tab_ion, rb_i, ei[c]);
     if (!isfinite(Ti_raw_table) || Ti_raw_table < ti_floor) {
       Ti[c] = ti_floor;
-      const double logTi = log(fmax(ti_floor, 1.0e-300));
-      ei[c] = tenryu::materials::device_eos_energy(tab_ion, rb_i, logTi);
+      if (energy_authoritative == 0 || !isfinite(Ti_raw_table)) {
+        const double logTi = log(fmax(ti_floor, 1.0e-300));
+        ei[c] = tenryu::materials::device_eos_energy(tab_ion, rb_i, logTi);
+      }
     } else {
       Ti[c] = Ti_raw_table;
     }
@@ -1845,6 +2297,16 @@ double inject_radiation_source_terms_impl(core::State& state,
   cuda_check(cudaMemset(d_clamp_count, 0, sizeof(int)),
              "inject_radiation_source_terms zero clamp_count failed");
 
+  state.ensure_cell_material_props(cfg);
+  const materials::CellEOSTableSelector cell_tables =
+      materials::make_cell_eos_table_selector(
+          eos_ctx != nullptr ? eos_ctx->d_ion_views : nullptr,
+          eos_ctx != nullptr ? eos_ctx->d_electron_views : nullptr,
+          eos_ctx != nullptr ? eos_ctx->d_total_views : nullptr,
+          eos_ctx != nullptr ? eos_ctx->n_materials : 0,
+          state.cell_material_index.size() == static_cast<std::size_t>(n_cells)
+              ? state.cell_material_index.data()
+              : nullptr);
   const int threads = 256;
   const int blocks = (n_cells + threads - 1) / threads;
   inject_radiation_source_terms_kernel<<<blocks, threads>>>(
@@ -1855,7 +2317,9 @@ double inject_radiation_source_terms_impl(core::State& state,
       d_gamma_eff, d_cell_is_void, d_diffusion_cell, d_holo_source_cell, n_cells, te_floor,
       ti_floor, use_two_temp, has_table_eos, use_first_cv_override,
       mat0.cv_e_override, mat0.eos_T_ref_eV, table_views.ion,
-      table_views.electron, &d_reduction[0], &d_reduction[1], d_clamp_count);
+      table_views.electron, cell_tables, &d_reduction[0], &d_reduction[1],
+      d_clamp_count,
+      (cfg.numerics.hydro.eos_closure_mode == "energy_authoritative") ? 1 : 0);
   cuda_check(cudaGetLastError(),
              "inject_radiation_source_terms kernel launch failed");
   if (verbose_subphase_timing) {
@@ -1963,7 +2427,9 @@ void apply_qei_coupling_substep(core::State& state,
     cuda_check(cudaMemcpy(d_cell_is_void, state.cell_is_void.data(), void_bytes,
                           cudaMemcpyHostToDevice),
                "per-material Q_ei copy cell_is_void failed");
-    d_hydro_active = const_cast<std::int8_t*>(state.hydro_active_device_ptr());
+    d_hydro_active = (cfg.numerics.hydro.T_start_inactive_cells == "rigid_wall")
+                         ? nullptr
+                         : const_cast<std::int8_t*>(state.hydro_active_device_ptr());
 
     const std::vector<SourceMaterialParams> h_params = make_source_material_params(cfg);
     d_params = static_cast<SourceMaterialParams*>(core::device_scratch_acquire(
@@ -2166,8 +2632,20 @@ void apply_qei_coupling_substep(core::State& state,
                         cudaMemcpyHostToDevice),
              "apply_qei_coupling_substep copy cell_is_void failed");
 
-  d_hydro_active = const_cast<std::int8_t*>(state.hydro_active_device_ptr());
+  d_hydro_active = (cfg.numerics.hydro.T_start_inactive_cells == "rigid_wall")
+                       ? nullptr
+                       : const_cast<std::int8_t*>(state.hydro_active_device_ptr());
 
+  state.ensure_cell_material_props(cfg);
+  const materials::CellEOSTableSelector cell_tables =
+      materials::make_cell_eos_table_selector(
+          eos_ctx != nullptr ? eos_ctx->d_ion_views : nullptr,
+          eos_ctx != nullptr ? eos_ctx->d_electron_views : nullptr,
+          eos_ctx != nullptr ? eos_ctx->d_total_views : nullptr,
+          eos_ctx != nullptr ? eos_ctx->n_materials : 0,
+          state.cell_material_index.size() == static_cast<std::size_t>(n_cells)
+              ? state.cell_material_index.data()
+              : nullptr);
   const int threads = 256;
   const int blocks = (n_cells + threads - 1) / threads;
   qei_coupling_substep_kernel<<<blocks, threads>>>(
@@ -2179,7 +2657,8 @@ void apply_qei_coupling_substep(core::State& state,
       n_cells, dt_sub, cfg.numerics.floors.Te, cfg.numerics.floors.Ti,
       has_table_eos, use_first_cv_override, mat0.cv_e_override,
       mat0.eos_T_ref_eV, cfg.numerics.hydro.qei_multiplier,
-      table_views.ion, table_views.electron);
+      table_views.ion, table_views.electron, cell_tables,
+      (cfg.numerics.hydro.eos_closure_mode == "energy_authoritative") ? 1 : 0);
   cuda_check(cudaGetLastError(),
              "apply_qei_coupling_substep kernel launch failed");
   cuda_check(core::debug_kernel_sync(),
@@ -2191,7 +2670,9 @@ double inject_laser_source_terms(core::State& state,
                                  const core::Config& cfg,
                                  const double dt,
                                  double* E_floor_injected,
-                                 int* clamp_count) {
+                                 int* clamp_count,
+                                 const hydro::HydroEOSContext* eos_ctx) {
+  const core::NvtxRange nvtx_range("source.laser_injection");
   if (state.laser_dep.empty() || state.rho.empty() || dt <= 0.0) {
     return 0.0;
   }
@@ -2219,6 +2700,18 @@ double inject_laser_source_terms(core::State& state,
   const bool use_first_cv_override = any_cv_e_override && mat0.cv_e_override > 0.0;
 
   const int n_cells = static_cast<int>(state.rho.size());
+  const char* host_path = std::getenv("TENRYU_LASER_SOURCE_HOST");
+  // CUDA pow(x, 0.25) does not reproduce the legacy host libm bitwise.
+  // Keep that analytic override on its original path; tabular 2T takes priority.
+  const bool legacy_t4_closure = use_first_cv_override && mat0.eos_T_ref_eV > 0.0 &&
+                                 !(cfg.main.two_temperature && has_table_eos);
+  if (cfg.main.dimension == "1D_SPH" &&
+      !legacy_t4_closure &&
+      !(host_path != nullptr && host_path[0] == '1')) {
+    return inject_laser_source_terms_device(
+        state, cfg, mat0, has_table_eos, use_first_cv_override,
+        E_floor_injected, clamp_count, eos_ctx);
+  }
   std::vector<double> A_eff;
   std::vector<double> gamma_eff;
   compute_effective_A_gamma(cfg, state, n_cells, A_eff, gamma_eff, nullptr);
@@ -2229,6 +2722,8 @@ double inject_laser_source_terms(core::State& state,
 
   const double te_floor = cfg.numerics.floors.Te;
   const double ti_floor = cfg.numerics.floors.Ti;
+  const bool energy_authoritative =
+      (cfg.numerics.hydro.eos_closure_mode == "energy_authoritative");
 
   std::vector<double> rho(state.rho.size(), 0.0);
   std::vector<double> zbar(state.zbar.size(), 0.0);
@@ -2363,6 +2858,33 @@ double inject_laser_source_terms(core::State& state,
     skipped_energy += carry_dep;
   }
 
+  // Per-cell dominant-material tables (multi-material closure, 2026-09-14);
+  // cells whose material has no non-empty table keep the first non-void
+  // material's table (historic behaviour). Mirrors the device kernel.
+  state.ensure_cell_material_props(cfg);
+  std::vector<int> cell_mat_h(static_cast<std::size_t>(n_cells), first_nonvoid);
+  if (state.cell_material_index.size() == static_cast<std::size_t>(n_cells)) {
+    state.cell_material_index.copy_to_host(cell_mat_h);
+  }
+  const auto cell_tables_of = [&](const std::size_t i)
+      -> const materials::EOSTableTriplet* {
+    const int m = cell_mat_h[i];
+    if (m >= 0 && static_cast<std::size_t>(m) < materials.size() &&
+        materials[static_cast<std::size_t>(m)].eos_tables) {
+      return materials[static_cast<std::size_t>(m)].eos_tables.get();
+    }
+    return nullptr;
+  };
+  const auto electron_table_of = [&](const std::size_t i) -> const materials::EOSTable& {
+    const auto* tabs = cell_tables_of(i);
+    return (tabs != nullptr && !tabs->electron.empty()) ? tabs->electron
+                                                        : mat0.eos_tables->electron;
+  };
+  const auto ion_table_of = [&](const std::size_t i) -> const materials::EOSTable& {
+    const auto* tabs = cell_tables_of(i);
+    return (tabs != nullptr && !tabs->ion.empty()) ? tabs->ion : mat0.eos_tables->ion;
+  };
+
   for (int c = 0; c < n_cells; ++c) {
     const double dep = laser_dep[static_cast<std::size_t>(c)];
     const std::size_t c_idx = static_cast<std::size_t>(c);
@@ -2395,14 +2917,16 @@ double inject_laser_source_terms(core::State& state,
     double Te_raw = 0.0;
     double Te_new = te_floor;
     if (use_table_eos_closure) {
-      Te_raw = mat0.eos_tables->electron.temperature_from_energy(rho_safe, ee[c_idx]);
+      Te_raw = electron_table_of(c_idx).temperature_from_energy(rho_safe, ee[c_idx]);
       if (!std::isfinite(Te_raw) || Te_raw < te_floor) {
         Te_new = te_floor;
-        ee[c_idx] = mat0.eos_tables->electron.energy(rho_safe, Te_new);
+        if (!energy_authoritative || !std::isfinite(Te_raw)) {
+          ee[c_idx] = electron_table_of(c_idx).energy(rho_safe, Te_new);
+        }
       } else {
         Te_new = Te_raw;
       }
-      Pe[c_idx] = mat0.eos_tables->electron.pressure(rho_safe, Te_new);
+      Pe[c_idx] = electron_table_of(c_idx).pressure(rho_safe, Te_new);
     } else if (use_first_cv_override && mat0.eos_T_ref_eV > 0.0) {
       const double T_ref = mat0.eos_T_ref_eV;
       const double T_ref3 = T_ref * T_ref * T_ref;
@@ -2456,16 +2980,18 @@ double inject_laser_source_terms(core::State& state,
     if (use_two_temp) {
       if (has_table_eos) {
         const double Ti_raw_table =
-            mat0.eos_tables->ion.temperature_from_energy(rho_safe, ei[c_idx]);
+            ion_table_of(c_idx).temperature_from_energy(rho_safe, ei[c_idx]);
         const double ei_before_floor = ei[c_idx];
         if (!std::isfinite(Ti_raw_table) || Ti_raw_table < ti_floor) {
           ++local_clamp_count;
           Ti[c_idx] = ti_floor;
-          ei[c_idx] = mat0.eos_tables->ion.energy(rho_safe, ti_floor);
+          if (!energy_authoritative || !std::isfinite(Ti_raw_table)) {
+            ei[c_idx] = ion_table_of(c_idx).energy(rho_safe, ti_floor);
+          }
         } else {
           Ti[c_idx] = Ti_raw_table;
         }
-        Pi[c_idx] = mat0.eos_tables->ion.pressure(rho_safe, Ti[c_idx]);
+        Pi[c_idx] = ion_table_of(c_idx).pressure(rho_safe, Ti[c_idx]);
         const double de_floor_i = ei[c_idx] - ei_before_floor;
         if (de_floor_i > 0.0) {
           floor_energy += rho_c * vol_c * de_floor_i;
@@ -2610,6 +3136,35 @@ double inject_burn_source_terms(core::State& state,
   int local_clamp_count = 0;
   double skipped_energy = 0.0;
 
+  // Per-cell dominant-material tables (multi-material closure, 2026-09-14);
+  // cells whose material has no non-empty table keep the first non-void
+  // material's table (historic behaviour). Mirrors the device kernel.
+  state.ensure_cell_material_props(cfg);
+  std::vector<int> cell_mat_h(static_cast<std::size_t>(n_cells), first_nonvoid);
+  if (state.cell_material_index.size() == static_cast<std::size_t>(n_cells)) {
+    state.cell_material_index.copy_to_host(cell_mat_h);
+  }
+  const auto cell_tables_of = [&](const std::size_t i)
+      -> const materials::EOSTableTriplet* {
+    const int m = cell_mat_h[i];
+    if (m >= 0 && static_cast<std::size_t>(m) < materials.size() &&
+        materials[static_cast<std::size_t>(m)].eos_tables) {
+      return materials[static_cast<std::size_t>(m)].eos_tables.get();
+    }
+    return nullptr;
+  };
+  const auto electron_table_of = [&](const std::size_t i) -> const materials::EOSTable& {
+    const auto* tabs = cell_tables_of(i);
+    return (tabs != nullptr && !tabs->electron.empty()) ? tabs->electron
+                                                        : mat0.eos_tables->electron;
+  };
+  const auto ion_table_of = [&](const std::size_t i) -> const materials::EOSTable& {
+    const auto* tabs = cell_tables_of(i);
+    return (tabs != nullptr && !tabs->ion.empty()) ? tabs->ion : mat0.eos_tables->ion;
+  };
+
+  const bool energy_authoritative =
+      (cfg.numerics.hydro.eos_closure_mode == "energy_authoritative");
   for (int c = 0; c < n_cells; ++c) {
     const std::size_t c_idx = static_cast<std::size_t>(c);
     const double rho_c = rho[c_idx];
@@ -2640,14 +3195,16 @@ double inject_burn_source_terms(core::State& state,
     double Te_raw = 0.0;
     double Te_new = te_floor;
     if (use_table_eos_closure) {
-      Te_raw = mat0.eos_tables->electron.temperature_from_energy(rho_safe, ee[c_idx]);
+      Te_raw = electron_table_of(c_idx).temperature_from_energy(rho_safe, ee[c_idx]);
       if (!std::isfinite(Te_raw) || Te_raw < te_floor) {
         Te_new = te_floor;
-        ee[c_idx] = mat0.eos_tables->electron.energy(rho_safe, Te_new);
+        if (!energy_authoritative || !std::isfinite(Te_raw)) {
+          ee[c_idx] = electron_table_of(c_idx).energy(rho_safe, Te_new);
+        }
       } else {
         Te_new = Te_raw;
       }
-      Pe[c_idx] = mat0.eos_tables->electron.pressure(rho_safe, Te_new);
+      Pe[c_idx] = electron_table_of(c_idx).pressure(rho_safe, Te_new);
     } else if (use_first_cv_override && mat0.eos_T_ref_eV > 0.0) {
       const double T_ref = mat0.eos_T_ref_eV;
       const double T_ref3 = T_ref * T_ref * T_ref;
@@ -2702,16 +3259,18 @@ double inject_burn_source_terms(core::State& state,
       ei[c_idx] += dep_i / denom;
       if (has_table_eos) {
         const double Ti_raw_table =
-            mat0.eos_tables->ion.temperature_from_energy(rho_safe, ei[c_idx]);
+            ion_table_of(c_idx).temperature_from_energy(rho_safe, ei[c_idx]);
         const double ei_before_floor = ei[c_idx];
         if (!std::isfinite(Ti_raw_table) || Ti_raw_table < ti_floor) {
           ++local_clamp_count;
           Ti[c_idx] = ti_floor;
-          ei[c_idx] = mat0.eos_tables->ion.energy(rho_safe, ti_floor);
+          if (!energy_authoritative || !std::isfinite(Ti_raw_table)) {
+            ei[c_idx] = ion_table_of(c_idx).energy(rho_safe, ti_floor);
+          }
         } else {
           Ti[c_idx] = Ti_raw_table;
         }
-        Pi[c_idx] = mat0.eos_tables->ion.pressure(rho_safe, Ti[c_idx]);
+        Pi[c_idx] = ion_table_of(c_idx).pressure(rho_safe, Ti[c_idx]);
         const double de_floor_i = ei[c_idx] - ei_before_floor;
         if (de_floor_i > 0.0) {
           floor_energy += rho_c * vol_c * de_floor_i;

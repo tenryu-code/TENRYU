@@ -324,6 +324,34 @@ struct Config {
       int min_cells_per_segment = 1;
     };
     ZoningIntentNL zoning_intent;
+    // Physics-derived 1D initial-mesh resolution requirement (core/mesh_requirement,
+    // NUMERICS §3.1.0c). `detected` = the deck wrote the block (frozen emission gate).
+    struct ResolutionRequirementNL {
+      bool detected = false;
+      bool enabled = true;
+      std::string apply = "report";   // report | enforce
+      int zones_per_scale_length = 9;
+      double intensity_exponent = 0.4;
+      double intensity_reference_W_cm2 = 1.0e14;
+      double scale_length_factor = 0.12;
+      double ablation_mass_safety = 1.5;
+      double formation_ablated_fraction = 0.1;
+      double absorbed_fraction = 1.0;
+      int shock_cells_per_separation = 8;
+      double shock_event_min_separation_frac = 0.05;
+      int min_cells_per_layer = 10;
+      double zbar_override = 0.0;
+      int n_bands = 6;
+      // Bands appended to zoning_intent by apply="enforce" (recorded for the frozen config;
+      // same fields as ZoningIntentBandNL plus the areal-mass ceiling they came from).
+      struct InjectedBand {
+        std::string kind;
+        double measure_frac_begin = 0.0, measure_frac_end = 0.0, cell_measure_max = 0.0;
+        double areal_mass_max_g_cm2 = 0.0, r_lo_cm = 0.0, r_hi_cm = 0.0;
+      };
+      std::vector<InjectedBand> injected_bands;
+    };
+    ResolutionRequirementNL resolution_requirement;
     GradingConfig grading;
     std::vector<double> explicit_nodes;
     std::vector<double> explicit_nodes_z;
@@ -495,6 +523,9 @@ struct Config {
       std::string opacity_model = "constant";
       std::string opacity_file;
       bool tmat_skip_lte_repair = false;
+      // TMAT only: replace kappa_PE by kappa_PA on every table entry at load
+      // (Kirchhoff's law); see tmat_to_ionmix_opacity in tmat_reader.cpp.
+      bool tmat_kirchhoff_pe = false;
       double kappa_a_constant = 0.0;
       double kappa_planck_override = -1.0;  // <0 = unset: Planck constant follows `kappa_a` (frozen behavior)
       double kappa_s_constant = 0.0;
@@ -1855,6 +1886,20 @@ struct Config {
         double g_max = 1.0;
       } pressure_drive_perturbation;
       std::map<std::string, CallableInfo> pressure_drive_2d;
+      // Treatment of hydro-inactive cells (T_start_eV > 0):
+      //   "passive_fill" (default): zero pressure, a node moves when either
+      //     neighbour is active (low-density fill / vacuum stand-in);
+      //   "rigid_wall": a node moves only when both neighbours are active
+      //     (inactive cells are rigid walls, no work is done on them) and the
+      //     electron-ion coupling is not masked. 1D_SPH only.
+      std::string T_start_inactive_cells = "passive_fill";
+      // Heat-capacity metric of the electron-ion coupling in the 1D
+      // Lagrangian 2T energy update (non-compatible path):
+      //   "ideal_gas" (default, bit-frozen): analytic ideal-gas cv_e / cv_i;
+      //   "table": the cv_e / cv_i of the table closure (consistent with
+      //     tabulated EOS whose cold heat capacities lie far below the
+      //     ideal-gas values; the analytic metric then overshoots). 1D_SPH only.
+      std::string qei_heat_capacity = "ideal_gas";
     };
 
     struct ConductionConfig {

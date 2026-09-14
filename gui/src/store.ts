@@ -20,10 +20,12 @@ import { joinRemote, shQuotePath } from "@tenryu-common/core/ssh";
 import { toCanonical } from "./core/units";
 import { parseValidateOutput, type ValidateResult } from "./core/validateParse";
 import {
+  buildAskScript,
   buildCancelScript,
-  buildEchoHomeScript,
   buildGenerateScript,
   buildLatestOutputDirScript,
+  buildMirrorProbeScript,
+  buildMirrorSyncScript,
   buildMkdirScript,
   buildProbeAssistScript,
   buildRemoteAssistScript,
@@ -31,6 +33,7 @@ import {
   buildStatusScript,
 } from "./core/assist/commands";
 import {
+  parseAskResult,
   parseAssistStatus,
   parseDeckLint,
   parseDigest,
@@ -38,25 +41,39 @@ import {
   parseJournalTail,
   parsePromoteZoning,
   parseZoningReport,
+  type AskChecksView,
   type AssistStatusView,
   type DeckLintView,
   type DigestView,
   type PromoteZoningView,
   type ZoningReportView,
 } from "./core/assist/parse";
+import {
+  addPreset,
+  buildAssistantToml,
+  formFromStatus,
+  validateAssistConfigForm,
+  type AssistConfigForm,
+  type PresetKey,
+} from "./core/assist/config";
 import { setLang, t, type Lang } from "./i18n";
 
 let backendOverride: Backend | null = null;
+let assistConfigPathCache: string | null = null;
 /** Test hook: inject a fake backend (call before first store action). */
 export function __setBackendForTest(b: Backend | null): void {
   backendOverride = b;
   homeCache.clear();
   repoRootCache.clear();
-  localHomeCache = null;
+  assistConfigPathCache = null;
   assistProbeCache.clear();
   if (assistJournalTimer !== null) {
     clearInterval(assistJournalTimer);
     assistJournalTimer = null;
+  }
+  if (assistAskJournalTimer !== null) {
+    clearInterval(assistAskJournalTimer);
+    assistAskJournalTimer = null;
   }
 }
 function be(): Backend {
@@ -86,9 +103,9 @@ const MAX_RUN_RECORDS = 50;
 
 const homeCache = new Map<string, string>();
 const repoRootCache = new Map<string, string | null>();
-let localHomeCache: string | null = null;
 const assistProbeCache = new Map<string, boolean>();
 let assistJournalTimer: ReturnType<typeof setInterval> | null = null;
+let assistAskJournalTimer: ReturnType<typeof setInterval> | null = null;
 
 async function resolveHome(profile: ServerProfile): Promise<string> {
   if (profile.transport === "local") return "";
@@ -103,15 +120,15 @@ async function resolveHome(profile: ServerProfile): Promise<string> {
   return home;
 }
 
-async function resolveLocalHome(): Promise<string> {
-  if (localHomeCache !== null) return localHomeCache;
-  const r = await be().execLocal(["bash", "-lc", buildEchoHomeScript()], { timeoutMs: 15000 });
-  const home = r.stdout.trim().split("\n").pop() ?? "";
-  if (r.code !== 0 || !home.startsWith("/")) {
-    throw new Error(`ローカル HOME を解決できません: ${r.stderr.trim() || `exit=${r.code}`}`);
+async function resolveAssistConfigPath(): Promise<string> {
+  if (assistConfigPathCache === null) {
+    assistConfigPathCache = `${await be().appConfigDir()}/assistant.toml`;
   }
-  localHomeCache = home;
-  return home;
+  return assistConfigPathCache;
+}
+
+function repoRootScript(tenryuBin: string): string {
+  return `d=$(dirname ${shQuotePath(tenryuBin)}); for i in 1 2 3 4 5 6 7 8; do if [ -f "$d/tools/mesh_planner.py" ]; then echo "$d"; break; fi; d=$(dirname "$d"); done`;
 }
 
 /** Locate the TENRYU checkout on the server by walking up from tenryuBin (cached). */
@@ -120,7 +137,7 @@ async function resolveRepoRoot(profile: ServerProfile): Promise<string | null> {
   const key = `${profile.id}\0${profile.tenryuBin}`;
   const cached = repoRootCache.get(key);
   if (cached !== undefined) return cached;
-  const script = `d=$(dirname ${shQuotePath(profile.tenryuBin)}); for i in 1 2 3 4 5 6 7 8; do if [ -f "$d/tools/mesh_planner.py" ]; then echo "$d"; break; fi; d=$(dirname "$d"); done`;
+  const script = repoRootScript(profile.tenryuBin);
   let resolved: string | null = null;
   try {
     const r = await be().exec(profile, ["bash", "-lc", script], { timeoutMs: 15000 });
@@ -174,6 +191,7 @@ export interface AppState {
   view: View;
   section: SectionKey;
   lang: Lang;
+  chatOpen: boolean;
   form: FormState;
   formErrors: string[];
   deck: string;
@@ -201,6 +219,21 @@ export interface AppState {
   starting: boolean;
   assistLocalRepo: string;
   assistStatus: { status: "idle" | "loading" | "ready" | "error"; view?: AssistStatusView; raw?: string; error?: string };
+  assistMirror: {
+    status: "idle" | "syncing" | "ready" | "error";
+    root: string | null;
+    profileId: string | null;
+    lastSyncIso: string | null;
+    errorCode: string | null;
+    errorDetail: string | null;
+  };
+  assistConfig: {
+    form: AssistConfigForm | null;
+    path: string | null;
+    status: "idle" | "saving" | "saved" | "error";
+    savedPath: string | null;
+    error: string | null;
+  };
   assistLint: { status: "idle" | "running" | "ready" | "error"; view?: DeckLintView; raw?: string; error?: string; exitOk?: boolean };
   assistSpec: string;
   assistUseTemplate: boolean;
@@ -219,6 +252,23 @@ export interface AppState {
     resultRaw: string | null;
     lint: Record<string, unknown> | null;
   };
+  assistQuestion: string;
+  assistAsk: {
+    phase: "idle" | "running" | "answered" | "error";
+    workdir: string | null;
+    turns: Array<{
+      turn: number;
+      question: string;
+      answer: string;
+      checks: AskChecksView | null;
+    }>;
+    /** The question in flight (or the one the last error belongs to). */
+    pendingQuestion: string | null;
+    lastKind: string | null;
+    errorCode: string | null;
+    errorDetail: string | null;
+    resultRaw: string | null;
+  };
   assistDiag: Record<string, {
     digest?: { status: "running" | "ready" | "error"; view?: DigestView; raw?: string; error?: string };
     zoning?: { status: "running" | "ready" | "error"; view?: ZoningReportView; raw?: string; error?: string };
@@ -229,6 +279,8 @@ export interface AppState {
   loadInitial(): Promise<void>;
   setView(v: View): void;
   setSection(s: SectionKey): void;
+  setChatOpen(open: boolean): void;
+  toggleChat(): void;
   setUiLang(lang: Lang): Promise<void>;
   selectProfile(id: string | null): Promise<void>;
   upsertProfile(p: ServerProfile): Promise<void>;
@@ -257,13 +309,23 @@ export interface AppState {
   fetchProfileList(runId: string): Promise<void>;
   fetchProfileSnap(runId: string, index: number): Promise<void>;
   setAssistLocalRepo(path: string): Promise<void>;
+  syncAssistMirror(): Promise<boolean>;
+  resolveAssistRepo(): Promise<string | null>;
   setAssistSpec(spec: string): void;
   setAssistUseTemplate(v: boolean): void;
   setAssistMaxIters(n: number): void;
   setAssistIntentJson(v: string): void;
   fetchAssistStatus(): Promise<void>;
+  initAssistConfigForm(): void;
+  setAssistConfigForm(form: AssistConfigForm): void;
+  addAssistProviderPreset(key: PresetKey): void;
+  saveAssistConfig(): Promise<void>;
   runAssistLint(): Promise<void>;
   runAssistDiag(runId: string, verb: "digest" | "zoning" | "promote"): Promise<void>;
+  setAssistQuestion(q: string): void;
+  askAssistQuestion(): Promise<void>;
+  cancelAssistQuestion(): Promise<void>;
+  resetAssistConversation(): void;
   generateAssistDeck(): Promise<void>;
   answerAssistClarification(answer: string): Promise<void>;
   cancelAssistGeneration(): Promise<void>;
@@ -295,6 +357,26 @@ const initialAssistGen: AppState["assistGen"] = {
   lint: null,
 };
 
+const initialAssistAsk: AppState["assistAsk"] = {
+  phase: "idle",
+  workdir: null,
+  turns: [],
+  pendingQuestion: null,
+  lastKind: null,
+  errorCode: null,
+  errorDetail: null,
+  resultRaw: null,
+};
+
+const initialAssistMirror: AppState["assistMirror"] = {
+  status: "idle",
+  root: null,
+  profileId: null,
+  lastSyncIso: null,
+  errorCode: null,
+  errorDetail: null,
+};
+
 export const useApp = create<AppState>()((set, get) => {
   function patchRun(runId: string, patch: Partial<RunRecord>): void {
     set({ runs: get().runs.map((r) => (r.id === runId ? { ...r, ...patch } : r)) });
@@ -307,6 +389,13 @@ export const useApp = create<AppState>()((set, get) => {
     }
   }
 
+  function stopAssistAskJournalTimer(): void {
+    if (assistAskJournalTimer !== null) {
+      clearInterval(assistAskJournalTimer);
+      assistAskJournalTimer = null;
+    }
+  }
+
   function failGen(code: string, detail?: string): void {
     set({
       assistGen: {
@@ -316,6 +405,26 @@ export const useApp = create<AppState>()((set, get) => {
         errorDetail: detail ?? null,
       },
     });
+  }
+
+  function failAsk(code: string, detail?: string): void {
+    const cur = get().assistAsk;
+    const draft = get().assistQuestion;
+    const errored: AppState["assistAsk"] = {
+      ...cur,
+      phase: "error",
+      errorCode: code,
+      errorDetail: detail ?? null,
+    };
+    // Give the question back to the input box when a launched ask fails, unless
+    // the user already started typing a replacement. Pre-launch failures
+    // (NO_QUESTION / NO_SOURCE / NO_LOCAL_ASSIST) never reach this branch:
+    // the phase is not yet "running" when they are reported.
+    if (cur.phase === "running" && cur.pendingQuestion !== null && draft.trim() === "") {
+      set({ assistAsk: errored, assistQuestion: cur.pendingQuestion });
+      return;
+    }
+    set({ assistAsk: errored });
   }
 
   function errorWithDetail(code: string, detail: string): string {
@@ -383,6 +492,7 @@ export const useApp = create<AppState>()((set, get) => {
     view: "form",
     section: "basic",
     lang: "ja",
+    chatOpen: false,
     form: initialForm,
     formErrors: initialDerived.formErrors,
     deck: initialDerived.deck,
@@ -410,12 +520,22 @@ export const useApp = create<AppState>()((set, get) => {
     starting: false,
     assistLocalRepo: "",
     assistStatus: { status: "idle" },
+    assistMirror: initialAssistMirror,
+    assistConfig: {
+      form: null,
+      path: null,
+      status: "idle",
+      savedPath: null,
+      error: null,
+    },
     assistLint: { status: "idle" },
     assistSpec: "",
     assistUseTemplate: true,
     assistMaxIters: 10,
     assistIntentJson: "",
     assistGen: initialAssistGen,
+    assistQuestion: "",
+    assistAsk: initialAssistAsk,
     assistDiag: {},
     assistDeckValidate: { status: "idle" },
 
@@ -454,6 +574,14 @@ export const useApp = create<AppState>()((set, get) => {
       set({ section: s, view: "form" });
     },
 
+    setChatOpen(open) {
+      set({ chatOpen: open });
+    },
+
+    toggleChat() {
+      set({ chatOpen: !get().chatOpen });
+    },
+
     async setUiLang(lang) {
       setLang(lang);
       const form = get().form;
@@ -472,7 +600,13 @@ export const useApp = create<AppState>()((set, get) => {
     },
 
     async selectProfile(id) {
-      set({ currentProfileId: id, connResult: null });
+      set({
+        currentProfileId: id,
+        connResult: null,
+        assistMirror: get().currentProfileId === id
+          ? get().assistMirror
+          : initialAssistMirror,
+      });
       await persistRuns();
     },
 
@@ -616,6 +750,298 @@ export const useApp = create<AppState>()((set, get) => {
       await persistRuns();
     },
 
+    async syncAssistMirror() {
+      const profile = currentProfile(get());
+      if (profile === null) {
+        set({
+          assistMirror: {
+            ...get().assistMirror,
+            status: "error",
+            root: null,
+            profileId: null,
+            errorCode: "NO_PROFILE",
+            errorDetail: null,
+          },
+        });
+        return false;
+      }
+      if (profileBinMissing(profile)) {
+        set({
+          assistMirror: {
+            ...get().assistMirror,
+            status: "error",
+            root: null,
+            profileId: profile.id,
+            errorCode: "NO_BIN",
+            errorDetail: null,
+          },
+        });
+        return false;
+      }
+
+      try {
+        if (profile.transport === "local") {
+          const r = await be().execLocal(
+            ["bash", "-lc", repoRootScript(profile.tenryuBin)],
+            { timeoutMs: 15000 },
+          );
+          const root = r.code === 0 ? (r.stdout.trim().split("\n").pop() ?? "") : "";
+          if (!root.startsWith("/")) {
+            set({
+              assistMirror: {
+                ...get().assistMirror,
+                status: "error",
+                root: null,
+                profileId: profile.id,
+                errorCode: "NO_TOOLS",
+                errorDetail: null,
+              },
+            });
+            return false;
+          }
+          set({
+            assistMirror: {
+              status: "ready",
+              root,
+              profileId: profile.id,
+              lastSyncIso: null,
+              errorCode: null,
+              errorDetail: null,
+            },
+          });
+          return true;
+        }
+
+        const serverRoot = await resolveRepoRoot(profile);
+        if (serverRoot === null) {
+          set({
+            assistMirror: {
+              ...get().assistMirror,
+              status: "error",
+              root: null,
+              profileId: profile.id,
+              errorCode: "NO_TOOLS",
+              errorDetail: null,
+            },
+          });
+          return false;
+        }
+        const wrapper = buildRemoteWrapperEnv(
+          profile,
+          serverRoot,
+          await absRemotePath(profile, profile.tenryuBin),
+        );
+        if (wrapper.error !== null) {
+          set({
+            assistMirror: {
+              ...get().assistMirror,
+              status: "error",
+              root: null,
+              profileId: profile.id,
+              errorCode: wrapper.error,
+              errorDetail: null,
+            },
+          });
+          return false;
+        }
+
+        const appConfigDir = await be().appConfigDir();
+        const mirrorRoot = `${appConfigDir}/mirror/${profile.id}`;
+        set({
+          assistMirror: {
+            ...get().assistMirror,
+            status: "syncing",
+            root: null,
+            profileId: profile.id,
+          },
+        });
+        await be().execLocal(["bash", "-lc", buildMkdirScript(`${appConfigDir}/mirror`)]);
+        const r = await be().execLocal(
+          [
+            "bash",
+            "-lc",
+            buildMirrorSyncScript({
+              host: wrapper.env.TENRYU_REMOTE_HOST,
+              sshOpts: wrapper.env.TENRYU_REMOTE_SSH_OPTS,
+              serverRepoRoot: serverRoot,
+              mirrorRoot,
+              harnessDir: await be().assistHarnessDir(),
+            }),
+          ],
+          { timeoutMs: 600000 },
+        );
+        if (r.code === 0 && r.stdout.includes("MIRROR_OK")) {
+          const lastSyncIso = new Date().toISOString();
+          await be().writeLocalText(
+            `${mirrorRoot}/mirror.json`,
+            JSON.stringify(
+              {
+                serverRepoRoot: serverRoot,
+                host: wrapper.env.TENRYU_REMOTE_HOST,
+                lastSyncIso,
+              },
+              null,
+              2,
+            ) + "\n",
+          );
+          set({
+            assistMirror: {
+              status: "ready",
+              root: mirrorRoot,
+              profileId: profile.id,
+              lastSyncIso,
+              errorCode: null,
+              errorDetail: null,
+            },
+          });
+          assistProbeCache.clear();
+          return true;
+        }
+
+        const missingLine = r.stdout.split("\n").find((line) => line.startsWith("MISSING:"))?.trim() ?? "";
+        const errorCode = r.code === 3
+          ? "MIRROR_INCOMPLETE"
+          : r.code === 4
+            ? "MIRROR_HARNESS_MISSING"
+            : "MIRROR_SYNC_FAILED";
+        const fallbackDetail = (r.stderr === "" ? r.stdout : r.stderr).slice(-2000);
+        const errorDetail = r.code === 3
+          ? `${missingLine} (server: ${serverRoot})`
+          : r.code === 4
+            ? missingLine
+            : fallbackDetail === ""
+              ? `exit ${r.code}`
+              : fallbackDetail;
+        set({
+          assistMirror: {
+            ...get().assistMirror,
+            status: "error",
+            root: null,
+            profileId: profile.id,
+            errorCode,
+            errorDetail,
+          },
+        });
+        return false;
+      } catch (err) {
+        set({
+          assistMirror: {
+            ...get().assistMirror,
+            status: "error",
+            root: null,
+            profileId: profile.id,
+            errorCode: "EXEC_FAILED",
+            errorDetail: String(err),
+          },
+        });
+        return false;
+      }
+    },
+
+    async resolveAssistRepo() {
+      const override = get().assistLocalRepo.trim();
+      if (override !== "") return override;
+
+      const profile = currentProfile(get());
+      if (profile === null) {
+        set({
+          assistMirror: {
+            ...get().assistMirror,
+            status: "error",
+            root: null,
+            profileId: null,
+            errorCode: "NO_PROFILE",
+            errorDetail: null,
+          },
+        });
+        return null;
+      }
+
+      try {
+        if (profile.transport === "local") {
+          const r = await be().execLocal(
+            ["bash", "-lc", repoRootScript(profile.tenryuBin)],
+            { timeoutMs: 15000 },
+          );
+          const root = r.code === 0 ? (r.stdout.trim().split("\n").pop() ?? "") : "";
+          if (!root.startsWith("/")) {
+            set({
+              assistMirror: {
+                ...get().assistMirror,
+                status: "error",
+                root: null,
+                profileId: profile.id,
+                errorCode: "NO_TOOLS",
+                errorDetail: null,
+              },
+            });
+            return null;
+          }
+          set({
+            assistMirror: {
+              status: "ready",
+              root,
+              profileId: profile.id,
+              lastSyncIso: null,
+              errorCode: null,
+              errorDetail: null,
+            },
+          });
+          return root;
+        }
+
+        const appConfigDir = await be().appConfigDir();
+        const mirrorRoot = `${appConfigDir}/mirror/${profile.id}`;
+        const probe = await be().execLocal(
+          ["bash", "-lc", buildMirrorProbeScript(mirrorRoot)],
+          { timeoutMs: 15000 },
+        );
+        if (probe.stdout.includes("MIRROR_OK")) {
+          let lastSyncIso: string | null = null;
+          if (get().assistMirror.root !== mirrorRoot) {
+            try {
+              const metadata = JSON.parse(
+                await be().readLocalText(`${mirrorRoot}/mirror.json`),
+              ) as { lastSyncIso?: unknown };
+              lastSyncIso = typeof metadata.lastSyncIso === "string"
+                ? metadata.lastSyncIso
+                : null;
+            } catch {
+              lastSyncIso = null;
+            }
+            set({
+              assistMirror: {
+                status: "ready",
+                root: mirrorRoot,
+                profileId: profile.id,
+                lastSyncIso,
+                errorCode: null,
+                errorDetail: null,
+              },
+            });
+          }
+          return mirrorRoot;
+        }
+
+        if (await get().syncAssistMirror()) {
+          return get().assistMirror.root;
+        }
+        return null;
+      } catch (err) {
+        set({
+          assistMirror: {
+            ...get().assistMirror,
+            status: "error",
+            root: null,
+            profileId: profile.id,
+            errorCode: "EXEC_FAILED",
+            errorDetail: String(err),
+          },
+        });
+        return null;
+      }
+    },
+
     setAssistSpec(spec) {
       set({ assistSpec: spec });
     },
@@ -632,10 +1058,118 @@ export const useApp = create<AppState>()((set, get) => {
       set({ assistIntentJson: v });
     },
 
+    setAssistQuestion(q) {
+      set({ assistQuestion: q });
+    },
+
+    initAssistConfigForm() {
+      const status = get().assistStatus;
+      set({
+        assistConfig: {
+          ...get().assistConfig,
+          form: formFromStatus(
+            status.status === "ready" ? (status.view ?? null) : null,
+          ),
+          status: "idle",
+          error: null,
+        },
+      });
+    },
+
+    setAssistConfigForm(form) {
+      const current = get().assistConfig;
+      set({
+        assistConfig: {
+          ...current,
+          form,
+          status:
+            current.status === "saved" || current.status === "error"
+              ? "idle"
+              : current.status,
+          error:
+            current.status === "saved" || current.status === "error"
+              ? null
+              : current.error,
+        },
+      });
+    },
+
+    addAssistProviderPreset(key) {
+      const current = get().assistConfig;
+      if (current.form === null) return;
+      set({
+        assistConfig: {
+          ...current,
+          form: addPreset(current.form, key),
+        },
+      });
+    },
+
+    async saveAssistConfig() {
+      const initial = get().assistConfig;
+      const form = initial.form;
+      if (form === null) return;
+
+      const errors = validateAssistConfigForm(form);
+      if (errors.length > 0) {
+        set({
+          assistConfig: {
+            ...initial,
+            status: "error",
+            error: errors
+              .map((error) => `${error.code}: ${error.detail}`)
+              .join("; "),
+          },
+        });
+        return;
+      }
+
+      try {
+        const path = await resolveAssistConfigPath();
+        set({
+          assistConfig: {
+            ...initial,
+            status: "saving",
+            path,
+          },
+        });
+        const parentDirectory = path.slice(0, path.lastIndexOf("/"));
+        await be().execLocal([
+          "bash",
+          "-lc",
+          buildMkdirScript(parentDirectory),
+        ]);
+        await be().writeLocalText(path, buildAssistantToml(form));
+        set({
+          assistConfig: {
+            ...initial,
+            status: "saved",
+            savedPath: path,
+            path,
+            error: null,
+          },
+        });
+        const repo = await get().resolveAssistRepo();
+        if (repo === null) {
+          set({ assistStatus: { status: "error", error: "NO_SOURCE" } });
+          return;
+        }
+        await get().fetchAssistStatus();
+      } catch (err) {
+        set({
+          assistConfig: {
+            ...initial,
+            status: "error",
+            error: `CONFIG_WRITE_FAILED: ${String(err)}`,
+          },
+        });
+      }
+    },
+
     async fetchAssistStatus() {
-      const repo = get().assistLocalRepo.trim();
-      if (repo === "") {
-        set({ assistStatus: { status: "error", error: "NO_LOCAL_REPO" } });
+      const repo = await get().resolveAssistRepo();
+      if (repo === null) {
+        set({ assistStatus: { status: "error", error: "NO_SOURCE" } });
         return;
       }
       try {
@@ -648,9 +1182,12 @@ export const useApp = create<AppState>()((set, get) => {
           set({ assistStatus: { status: "error", error: "NO_LOCAL_ASSIST" } });
           return;
         }
-        const r = await be().execLocal(["bash", "-lc", buildStatusScript(repo)], {
-          timeoutMs: 30000,
-        });
+        const configPath = await resolveAssistConfigPath();
+        set({ assistConfig: { ...get().assistConfig, path: configPath } });
+        const r = await be().execLocal(
+          ["bash", "-lc", buildStatusScript(repo, await resolveAssistConfigPath())],
+          { timeoutMs: 30000 },
+        );
         if (r.code !== 0) {
           set({
             assistStatus: {
@@ -857,6 +1394,177 @@ export const useApp = create<AppState>()((set, get) => {
       }
     },
 
+    async askAssistQuestion() {
+      if (get().assistAsk.phase === "running") return;
+      const question = get().assistQuestion.trim();
+      if (!question) {
+        failAsk("NO_QUESTION");
+        return;
+      }
+      const repo = await get().resolveAssistRepo();
+      if (repo === null) {
+        failAsk("NO_SOURCE");
+        return;
+      }
+
+      let workdir = get().assistAsk.workdir;
+      let launched = false;
+      try {
+        const probe = await be().execLocal(
+          ["bash", "-lc", buildProbeAssistScript(repo)],
+          { timeoutMs: 30000 },
+        );
+        if (!probe.stdout.includes("ASSIST_OK")) {
+          failAsk("NO_LOCAL_ASSIST");
+          return;
+        }
+
+        if (!workdir) {
+          workdir = `${await be().appConfigDir()}/ask/${nowStamp()}`;
+          await be().execLocal(["bash", "-lc", buildMkdirScript(workdir)]);
+        }
+        const turnIndex = get().assistAsk.turns.length + 1;
+        const questionPath = `${workdir}/question_${turnIndex}.md`;
+        await be().writeLocalText(questionPath, question + "\n");
+
+        const current = get().assistAsk;
+        set({
+          assistAsk: {
+            ...current,
+            phase: "running",
+            workdir,
+            pendingQuestion: question,
+            lastKind: null,
+            errorCode: null,
+            errorDetail: null,
+            resultRaw: null,
+          },
+          assistQuestion: "",
+        });
+        launched = true;
+
+        stopAssistAskJournalTimer();
+        assistAskJournalTimer = setInterval(() => {
+          void be()
+            .readLocalText(`${workdir}/journal.jsonl`, 262144)
+            .then((text) => {
+              const { entries } = parseJournalTail(text);
+              const cur = get().assistAsk;
+              if (cur.phase === "running" && cur.workdir === workdir) {
+                set({
+                  assistAsk: {
+                    ...cur,
+                    lastKind: entries[entries.length - 1]?.kind ?? null,
+                  },
+                });
+              }
+            })
+            .catch(() => {});
+        }, 2000);
+
+        const r = await be().execLocal(
+          [
+            "bash",
+            "-lc",
+            buildAskScript({
+              localRepo: repo,
+              workdir,
+              questionPath,
+              configPath: await resolveAssistConfigPath(),
+            }),
+          ],
+          { timeoutMs: 1800000 },
+        );
+        stopAssistAskJournalTimer();
+
+        const cur = get().assistAsk;
+        if (cur.workdir !== workdir || cur.phase !== "running") return;
+        const parsed = parseAskResult(r.stdout);
+        if (!parsed.ok) {
+          failAsk(
+            "RESULT_PARSE",
+            `${parsed.error}; stderr: ${r.stderr.slice(-2000)}`,
+          );
+          set({
+            assistAsk: { ...get().assistAsk, resultRaw: r.stdout },
+          });
+          return;
+        }
+
+        if (parsed.data.status === "answered" && parsed.data.answer !== null) {
+          set({
+            assistAsk: {
+              ...cur,
+              phase: "answered",
+              turns: [
+                ...cur.turns,
+                {
+                  turn: parsed.data.turn ?? turnIndex,
+                  question,
+                  answer: parsed.data.answer,
+                  checks: parsed.data.checks,
+                },
+              ],
+              pendingQuestion: null,
+              resultRaw: r.stdout,
+            },
+            assistQuestion: "",
+          });
+        } else {
+          failAsk(
+            "ASK_FAILED",
+            parsed.data.error ??
+              `status ${parsed.data.status}; stderr: ${r.stderr.slice(-2000)}`,
+          );
+          set({
+            assistAsk: { ...get().assistAsk, resultRaw: r.stdout },
+          });
+        }
+      } catch (err) {
+        stopAssistAskJournalTimer();
+        if (!launched) {
+          failAsk("EXEC_FAILED", String(err));
+          return;
+        }
+        const cur = get().assistAsk;
+        if (cur.phase === "running" && cur.workdir === workdir) {
+          failAsk("EXEC_FAILED", String(err));
+        }
+      }
+    },
+
+    async cancelAssistQuestion() {
+      const cur = get().assistAsk;
+      if (cur.phase !== "running" || cur.workdir === null) return;
+      const draft = get().assistQuestion;
+      const cancelled: AppState["assistAsk"] = {
+        ...cur,
+        phase: "error",
+        errorCode: "CANCELLED",
+        errorDetail: null,
+      };
+      // Same draft restore as failAsk: the cancelled question returns to the
+      // input box only when the user has not typed a replacement.
+      if (draft.trim() === "" && cur.pendingQuestion !== null) {
+        set({ assistAsk: cancelled, assistQuestion: cur.pendingQuestion });
+      } else {
+        set({ assistAsk: cancelled });
+      }
+      stopAssistAskJournalTimer();
+      try {
+        await be().execLocal(["bash", "-lc", buildCancelScript(cur.workdir)], {
+          timeoutMs: 15000,
+        });
+      } catch {
+        /* cancellation is best-effort */
+      }
+    },
+
+    resetAssistConversation() {
+      if (get().assistAsk.phase === "running") return;
+      set({ assistAsk: initialAssistAsk });
+    },
+
     async generateAssistDeck() {
       if (get().assistGen.phase === "running") return;
       const spec = get().assistSpec;
@@ -864,9 +1572,9 @@ export const useApp = create<AppState>()((set, get) => {
         failGen("NO_SPEC");
         return;
       }
-      const repo = get().assistLocalRepo.trim();
-      if (repo === "") {
-        failGen("NO_LOCAL_REPO");
+      const repo = await get().resolveAssistRepo();
+      if (repo === null) {
+        failGen("NO_SOURCE");
         return;
       }
 
@@ -923,9 +1631,8 @@ export const useApp = create<AppState>()((set, get) => {
           }
         }
 
-        const home = await resolveLocalHome();
         const stamp = nowStamp();
-        workdir = `${home}/.tenryu/studio-assist/${stamp}`;
+        workdir = `${await be().appConfigDir()}/generate/${stamp}`;
         const specPath = `${workdir}/spec.md`;
         const outDeckPath = `${workdir}/out_deck.py`;
         await be().execLocal(["bash", "-lc", buildMkdirScript(workdir)], {
@@ -1000,6 +1707,7 @@ export const useApp = create<AppState>()((set, get) => {
               intentPath,
               tenryuArg,
               env,
+              configPath: await resolveAssistConfigPath(),
             }),
           ],
           { timeoutMs: 3600000 },

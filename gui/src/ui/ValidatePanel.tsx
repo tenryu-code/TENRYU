@@ -193,6 +193,75 @@ export default function ValidatePanel() {
               </div>
             ))}
           </div>
+          {assistLint.view.requirement !== null && (
+            <div className="flex flex-col gap-1">
+              <div className="flex items-center gap-2">
+                <h3 className="text-xs font-semibold">
+                  {m.assist.requirementTitle}
+                </h3>
+                {!assistLint.view.requirement.applicable ? (
+                  <>
+                    <Badge tone="muted">
+                      {m.assist.requirementNotApplicable}
+                    </Badge>
+                    {assistLint.view.requirement.reason && (
+                      <span className="text-xs" style={{ color: "var(--fg-secondary)" }}>
+                        {assistLint.view.requirement.reason}
+                      </span>
+                    )}
+                  </>
+                ) : assistLint.view.requirement.checkOk === true ? (
+                  <Badge tone="ok">{m.assist.requirementPass}</Badge>
+                ) : assistLint.view.requirement.checkOk === false ? (
+                  <Badge tone="err">{m.assist.requirementFail}</Badge>
+                ) : null}
+              </div>
+              {assistLint.view.requirement.applicable && (
+                <>
+                  <KvTable
+                    obj={{
+                      [m.assist.requirementAblator]:
+                        assistLint.view.requirement.ablatorName,
+                      [m.assist.requirementRhoC]:
+                        assistLint.view.requirement.rhoCGcc?.toPrecision(3) ?? null,
+                      [m.assist.requirementAblatedFraction]:
+                        assistLint.view.requirement.ablatedMassFraction?.toPrecision(3) ?? null,
+                      [m.assist.requirementFormationTime]:
+                        assistLint.view.requirement.tFormationS?.toPrecision(3) ?? null,
+                      [m.assist.requirementFormationCeiling]:
+                        assistLint.view.requirement.ceilingFormationGCm2?.toPrecision(3) ?? null,
+                      [m.assist.requirementAblationViolations]: `${
+                        assistLint.view.requirement.ablationViolations === null
+                          ? "null"
+                          : String(assistLint.view.requirement.ablationViolations)
+                      } / ${
+                        assistLint.view.requirement.ablationMaxRatio?.toPrecision(3) ?? "null"
+                      }`,
+                      [m.assist.requirementShock]: `${String(
+                        assistLint.view.requirement.shockApplicable,
+                      )} / ${
+                        assistLint.view.requirement.shockViolations === null
+                          ? "null"
+                          : String(assistLint.view.requirement.shockViolations)
+                      }`,
+                    }}
+                  />
+                  <div className="text-xs font-semibold" style={{ color: "var(--fg-secondary)" }}>
+                    {m.assist.requirementBands}
+                  </div>
+                  <ul className="flex flex-col gap-1 text-xs" style={{ fontFamily: "var(--mono)" }}>
+                    {assistLint.view.requirement.bandsRecommended.map((band, index) => (
+                      <li key={`${band.kind}-${index}`}>
+                        {band.kind}: {band.rLoCm?.toPrecision(3) ?? "null"}–
+                        {band.rHiCm?.toPrecision(3) ?? "null"} cm, ≤{" "}
+                        {band.arealMassMaxGCm2?.toPrecision(3) ?? "null"} g/cm²
+                      </li>
+                    ))}
+                  </ul>
+                </>
+              )}
+            </div>
+          )}
           {assistLint.view.meshPreview !== null && (
             <div className="flex items-start gap-2 text-xs" style={{ fontFamily: "var(--mono)" }}>
               <span>{m.assist.meshPreviewLine}:</span>

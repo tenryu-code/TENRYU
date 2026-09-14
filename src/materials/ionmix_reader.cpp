@@ -590,6 +590,29 @@ double IonmixOpacityData::sigma_R(const int group,
   return rho * interpolate_kappa(kappa_R, group, ni_cm3, T_eV);
 }
 
+namespace {
+std::atomic<int> zbar_clamp_warn_count{0};
+}
+
+bool zbar_clamp_warning_limit_reached() {
+  return zbar_clamp_warn_count.load(std::memory_order_relaxed) >= 11;
+}
+
+void report_zbar_clamped_input(const double rho, const double T_eV,
+                                const double rho_used, const double T_used) {
+  const int warn_count = zbar_clamp_warn_count.fetch_add(1, std::memory_order_relaxed);
+  if (warn_count < 10) {
+    core::log_warning("IONMIX tabular Zbar interpolate clamped inputs to table bounds: "
+                      "rho_in=" + std::to_string(rho) +
+                      ", T_in=" + std::to_string(T_eV) +
+                      ", rho_used=" + std::to_string(rho_used) +
+                      ", T_used=" + std::to_string(T_used));
+  } else if (warn_count == 10) {
+    core::log_warning("IONMIX tabular Zbar interpolate clamped inputs to table bounds; "
+                      "suppressing further warnings");
+  }
+}
+
 double IonmixZbarTable::interpolate(const double rho, const double T_eV) const {
   TENRYU_ASSERT(!rho_grid.empty() && !T_grid_eV.empty(),
                 "IonmixZbarTable::interpolate requires non-empty grids");
@@ -621,18 +644,7 @@ double IonmixZbarTable::interpolate(const double rho, const double T_eV) const {
   T_safe = std::clamp(T_safe, T_grid_eV.front(), T_grid_eV.back());
 
   if (clamped_to_bounds) {
-    static std::atomic<int> clamp_warn_count{0};
-    const int warn_count = clamp_warn_count.fetch_add(1, std::memory_order_relaxed);
-    if (warn_count < 10) {
-      core::log_warning("IONMIX tabular Zbar interpolate clamped inputs to table bounds: "
-                        "rho_in=" + std::to_string(rho) +
-                        ", T_in=" + std::to_string(T_eV) +
-                        ", rho_used=" + std::to_string(rho_safe) +
-                        ", T_used=" + std::to_string(T_safe));
-    } else if (warn_count == 10) {
-      core::log_warning("IONMIX tabular Zbar interpolate clamped inputs to table bounds; "
-                        "suppressing further warnings");
-    }
+    report_zbar_clamped_input(rho, T_eV, rho_safe, T_safe);
   }
 
   const double x = std::log(rho_safe);

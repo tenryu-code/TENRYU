@@ -38,6 +38,10 @@ struct DeviceEOSInverseRecloseResult {
   int fallback_used;
   int lower_clamp;
   int upper_clamp;
+  // 1 when the raw inverse temperature lies below the runtime floor T_floor
+  // (energy below e(rho, T_floor)); reported separately from lower_clamp,
+  // which refers to the table's first temperature row (2026-09-14).
+  int floor_clamp;
 };
 
 #ifdef __CUDACC__
@@ -447,6 +451,7 @@ __device__ inline DeviceEOSInverseRecloseResult device_inverse_reclose(
   out.fallback_used = 0;
   out.lower_clamp = 0;
   out.upper_clamp = 0;
+  out.floor_clamp = 0;
 
   if (tab.n_rho <= 0 || tab.n_T <= 0 || tab.e_table == nullptr ||
       !isfinite(rho) || !(rho > 0.0) || !isfinite(e_target)) {
@@ -479,7 +484,14 @@ __device__ inline DeviceEOSInverseRecloseResult device_inverse_reclose(
     out.upper_clamp = 1;
   }
 
-  out.T = fmax(device_eos_T_from_e_monotone(tab, rb, e_target), fmax(T_floor, 1.0e-30));
+  const double T_raw = device_eos_T_from_e_monotone(tab, rb, e_target);
+  const double T_floor_eff = fmax(T_floor, 1.0e-30);
+  out.T = fmax(T_raw, T_floor_eff);
+  // Energy below the table energy at the runtime floor: the returned state is
+  // floored (T = T_floor) but the target energy is outside the admissible
+  // domain [e(rho, T_floor), inf). Closures use this to veto the floor
+  // write-back in energy-authoritative mode (2026-09-14).
+  out.floor_clamp = (isfinite(T_raw) && T_raw < T_floor_eff) ? 1 : 0;
   out.logT = log(fmax(out.T, 1.0e-30));
   out.pressure = device_eos_pressure(tab, rb, out.logT);
   out.energy = device_eos_energy(tab, rb, out.logT);
@@ -510,6 +522,7 @@ device_inverse_reclose_with_low_density_extrap(
   out.fallback_used = 0;
   out.lower_clamp = 0;
   out.upper_clamp = 0;
+  out.floor_clamp = 0;
 
   if (!isfinite(rho) || !(rho > 0.0) || !isfinite(e_target)) {
     out.bracket_failure = 1;

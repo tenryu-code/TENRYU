@@ -63,3 +63,13 @@ xattr -cr "TENRYU Studio.app"
 機密情報、認証情報、個人情報を Issue やデッキへ含めないでください。
 
 利用条件については [EULA.md](EULA.md) を参照してください。
+
+## Question answering (experimental)
+
+`python3 tools/assist/assist.py ask "your question"` answers questions about TENRYU from the
+documents and source in this checkout, using your own Claude Code or Codex CLI login (or API
+key). The client needs `python3` (on macOS: Xcode Command Line Tools) and your own Claude Code or Codex CLI; TENRYU Studio detects a missing interpreter as an execution error. Setup: copy `tools/assist/assistant.example.toml` to `~/.tenryu/assistant.toml`, set
+`enabled = true`, and point the `question_answering` role at `claude_readonly` or
+`codex_readonly`. Answers end with `path:line` citations that are checked against this
+checkout; see `tools/assist/README.md`. The same feature is available in the Studio assistant view.
+TENRYU Studio needs no checkout on the client: it mirrors the server checkout over the profile's SSH connection (Documents and source → Sync from server).

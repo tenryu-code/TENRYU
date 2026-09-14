@@ -16,6 +16,10 @@ export default defineConfig({
         "./node_modules/@tauri-apps/api/core",
         import.meta.url,
       ).pathname,
+      "@tauri-apps/api/path": new URL(
+        "./node_modules/@tauri-apps/api/path",
+        import.meta.url,
+      ).pathname,
       "@tauri-apps/plugin-dialog": new URL(
         "./node_modules/@tauri-apps/plugin-dialog",
         import.meta.url,

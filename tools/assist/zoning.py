@@ -103,6 +103,7 @@ def _read_snapshot(path: Path, h5py_module, notes: list) -> Optional[dict]:
                 "path": path,
                 "t": time_value,
                 "geometry": geometry,
+                "nodes": nodes,
                 "rho": rho,
                 "centers": centers,
                 "widths": widths,
@@ -166,6 +167,184 @@ def _interpolate(xs: list, ys: list, value: float) -> float:
         return ys[upper]
     fraction = (value - xs[lower]) / (xs[upper] - xs[lower])
     return ys[lower] + fraction * (ys[upper] - ys[lower])
+
+
+def _finite_float(value) -> Optional[float]:
+    try:
+        result = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return result if math.isfinite(result) else None
+
+
+def _finite_ratio(numerator, denominator) -> Optional[float]:
+    numerator_value = _finite_float(numerator)
+    denominator_value = _finite_float(denominator)
+    if numerator_value is None or denominator_value in (None, 0.0):
+        return None
+    return _finite_float(numerator_value / denominator_value)
+
+
+def _observed_ablated_areal_mass(
+    snapshot: dict, ablated_indices: list, geometry_code, R0_cm
+) -> Optional[float]:
+    nodes = snapshot.get("nodes")
+    densities = snapshot.get("rho")
+    if not isinstance(nodes, list) or not isinstance(densities, list):
+        return None
+    if len(nodes) != len(densities) + 1:
+        return None
+    if geometry_code not in (0, 1, 2):
+        return None
+    R0_value = _finite_float(R0_cm)
+    if geometry_code in (0, 1) and R0_value in (None, 0.0):
+        return None
+
+    total = 0.0
+    for index in ablated_indices:
+        if not isinstance(index, int) or index < 0 or index >= len(densities):
+            return None
+        density = _finite_float(densities[index])
+        r_lo = _finite_float(nodes[index])
+        r_hi = _finite_float(nodes[index + 1])
+        if density is None or r_lo is None or r_hi is None:
+            return None
+        if geometry_code == 0:
+            cell_areal_mass = (
+                density
+                * (r_hi ** 3 - r_lo ** 3)
+                / (3.0 * R0_value ** 2)
+            )
+        elif geometry_code == 1:
+            cell_areal_mass = (
+                density * (r_hi ** 2 - r_lo ** 2) / (2.0 * R0_value)
+            )
+        else:
+            cell_areal_mass = density * (r_hi - r_lo)
+        if not math.isfinite(cell_areal_mass):
+            return None
+        total += cell_areal_mass
+    return _finite_float(total)
+
+
+def _prediction_vs_observation(
+    requirement: dict,
+    report: dict,
+    snapshots: list,
+    ablated_indices: list,
+) -> dict:
+    inputs = requirement.get("inputs")
+    if not isinstance(inputs, dict):
+        inputs = {}
+    ablator = inputs.get("ablator")
+    if not isinstance(ablator, dict):
+        ablator = {}
+    params = requirement.get("params")
+    if not isinstance(params, dict):
+        params = {}
+    ablation = requirement.get("ablation")
+    if not isinstance(ablation, dict):
+        ablation = {}
+
+    predicted_mu = _finite_float(ablation.get("mu_abl_total_g_cm2"))
+    observed_mass = (
+        _observed_ablated_areal_mass(
+            snapshots[0],
+            ablated_indices,
+            inputs.get("geometry"),
+            inputs.get("R0_cm"),
+        )
+        if snapshots
+        else None
+    )
+    ablated_mass_ratio = _finite_ratio(observed_mass, predicted_mu)
+
+    critical = report.get("critical")
+    if not isinstance(critical, dict):
+        critical = {}
+    predicted_rho_c = _finite_float(ablator.get("rho_c_gcc"))
+    observed_rho_c = _finite_float(critical.get("rho_c_gcc"))
+    rho_c_ratio = _finite_ratio(observed_rho_c, predicted_rho_c)
+
+    predicted_track = requirement.get("scale_length_track")
+    if not isinstance(predicted_track, list):
+        predicted_track = []
+    track_points = []
+    for entry in predicted_track:
+        if not isinstance(entry, dict):
+            continue
+        time_value = _finite_float(entry.get("t_s"))
+        scale_length = _finite_float(entry.get("L_c_cm"))
+        if time_value is not None and scale_length is not None:
+            track_points.append((time_value, scale_length))
+    track_points.sort(key=lambda point: point[0])
+    predicted_times = [point[0] for point in track_points]
+    predicted_lengths = [point[1] for point in track_points]
+
+    observed_track = critical.get("track")
+    if not isinstance(observed_track, list):
+        observed_track = []
+    scale_length = []
+    scale_length_ratios = []
+    for entry in observed_track:
+        if not isinstance(entry, dict):
+            continue
+        time_value = _finite_float(entry.get("t_s"))
+        observed_length = _finite_float(entry.get("L_c_cm"))
+        predicted_length = (
+            _interpolate(predicted_times, predicted_lengths, time_value)
+            if predicted_times and time_value is not None
+            else None
+        )
+        ratio = _finite_ratio(observed_length, predicted_length)
+        if ratio is not None:
+            scale_length_ratios.append(ratio)
+        scale_length.append(
+            {
+                "t_s": time_value,
+                "predicted_L_c_cm": predicted_length,
+                "observed_L_c_cm": observed_length,
+                "ratio_obs_over_pred": ratio,
+            }
+        )
+
+    ratio_min = min(scale_length_ratios) if scale_length_ratios else None
+    ratio_median = (
+        statistics.median(scale_length_ratios)
+        if scale_length_ratios
+        else None
+    )
+    ratio_max = max(scale_length_ratios) if scale_length_ratios else None
+    scale_length_factor = _finite_float(params.get("scale_length_factor"))
+    ablation_mass_safety = _finite_float(params.get("ablation_mass_safety"))
+    suggested_scale_length_factor = (
+        _finite_float(scale_length_factor * ratio_median)
+        if scale_length_factor is not None and ratio_median is not None
+        else None
+    )
+    suggested_ablation_mass_safety = (
+        _finite_float(
+            ablation_mass_safety * max(1.0, ablated_mass_ratio)
+        )
+        if ablation_mass_safety is not None and ablated_mass_ratio is not None
+        else None
+    )
+
+    return {
+        "predicted_mu_abl_total_g_cm2": predicted_mu,
+        "observed_ablated_areal_mass_g_cm2": observed_mass,
+        "ablated_mass_ratio_obs_over_pred": ablated_mass_ratio,
+        "predicted_rho_c_gcc": predicted_rho_c,
+        "observed_rho_c_gcc": observed_rho_c,
+        "rho_c_ratio_obs_over_pred": rho_c_ratio,
+        "scale_length": scale_length,
+        "scale_length_ratio_min": ratio_min,
+        "scale_length_ratio_median": ratio_median,
+        "scale_length_ratio_max": ratio_max,
+        "suggested_scale_length_factor": suggested_scale_length_factor,
+        "suggested_ablation_mass_safety": suggested_ablation_mass_safety,
+        "note": "report-only; edit Mesh.resolution_requirement to adopt",
+    }
 
 
 def _scale_length(snapshot: dict, radius: float, notes: list) -> Optional[float]:
@@ -493,6 +672,18 @@ def build_zoning_report(
         "track": pressure_entries,
         "uncalibrated_indicator": True,
     }
+    requirement_path = root / "mesh_requirement.json"
+    if requirement_path.is_file():
+        requirement = _read_json_dict(
+            requirement_path, notes, "mesh_requirement.json"
+        )
+        if (
+            isinstance(requirement, dict)
+            and requirement.get("applicable") is True
+        ):
+            report["prediction_vs_observation"] = _prediction_vs_observation(
+                requirement, report, snapshots, ablated_indices
+            )
     return report
 
 

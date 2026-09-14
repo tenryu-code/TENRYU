@@ -295,6 +295,25 @@ void OutputManager::write_run_info(const tenryu::core::State& state,
   TENRYU_ASSERT(!ofs.fail(), "Failed to close run_info.json");
 }
 
+void OutputManager::write_mesh_requirement(const std::string& json) const {
+  const std::filesystem::path out_path =
+      std::filesystem::path(output_dir) / "mesh_requirement.json";
+  std::ofstream ofs(out_path, std::ios::binary | std::ios::trunc);
+  TENRYU_ASSERT(ofs.good(),
+                "Failed to open mesh_requirement.json for writing");
+
+  ofs << json;
+  if (!json.empty() && json.back() != '\n') {
+    ofs << '\n';
+  }
+  TENRYU_ASSERT(ofs.good(),
+                "Failed while writing mesh_requirement.json");
+  ofs.flush();
+  TENRYU_ASSERT(ofs.good(), "Failed to flush mesh_requirement.json");
+  ofs.close();
+  TENRYU_ASSERT(!ofs.fail(), "Failed to close mesh_requirement.json");
+}
+
 void OutputManager::write_frozen_config(const std::string& case_name,
                                         const std::string& frozen_json) const {
   const std::filesystem::path out_path =

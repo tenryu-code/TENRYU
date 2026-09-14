@@ -86,7 +86,8 @@ EOSTablePair tmat_eos_to_table_pair(const TmatEOSData& eos);
 EOSTableTriplet tmat_eos_to_table_triplet(const TmatEOSData& eos, double A_amu);
 IonmixZbarTable tmat_eos_to_zbar_table(const TmatEOSData& eos, double A_amu);
 IonmixOpacityData tmat_to_ionmix_opacity(const TmatOpacityData& opacity,
-                                         bool skip_lte_repair = false);
+                                         bool skip_lte_repair = false,
+                                         bool kirchhoff_pe = false);
 // Number-fraction weights come from material.number_fraction if present; otherwise
 // they are derived as x_e = (w_e/A_e) / sum(w/A).
 ZeffRatioTable tmat_ionization_to_zeff_ratio(const TmatIonizationData& ion,

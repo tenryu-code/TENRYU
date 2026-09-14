@@ -162,6 +162,212 @@ def width_ratio_lint_entry(geometry: dict, zoning_measure) -> dict:
     return entry
 
 
+def _requirement_profile_indices(length: int) -> List[int]:
+    if length <= 8:
+        return list(range(length))
+    return [int(round(index * float(length - 1) / 7.0)) for index in range(8)]
+
+
+def requirement_summary(preview_dict) -> Optional[dict]:
+    """Build a compact, tolerant summary of a mesh requirement preview."""
+    if not isinstance(preview_dict, dict):
+        return None
+    requirement = preview_dict.get("mesh_requirement")
+    if not isinstance(requirement, dict):
+        return None
+
+    inputs = requirement.get("inputs")
+    if not isinstance(inputs, dict):
+        inputs = {}
+    ablator = inputs.get("ablator")
+    if not isinstance(ablator, dict):
+        ablator = {}
+    ablation = requirement.get("ablation")
+    if not isinstance(ablation, dict):
+        ablation = {}
+    profile_source = ablation.get("profile")
+    if not isinstance(profile_source, list):
+        profile_source = []
+    profile = []
+    for index in _requirement_profile_indices(len(profile_source)):
+        point = profile_source[index]
+        if not isinstance(point, dict):
+            point = {}
+        profile.append(
+            {
+                "depth_g_cm2": point.get("depth_g_cm2"),
+                "ceiling_g_cm2": point.get("ceiling_g_cm2"),
+                "t_abl_s": point.get("t_abl_s"),
+            }
+        )
+
+    shocks = requirement.get("shocks")
+    if not isinstance(shocks, dict):
+        shocks = {}
+    event_source = shocks.get("events")
+    if not isinstance(event_source, list):
+        event_source = []
+    event_times = [
+        event.get("t_s") if isinstance(event, dict) else None
+        for event in event_source
+    ]
+
+    check = requirement.get("requirement_check")
+    if not isinstance(check, dict):
+        check = {}
+    ablation_check = check.get("ablation")
+    if not isinstance(ablation_check, dict):
+        ablation_check = {}
+    shock_check = check.get("shock")
+    if not isinstance(shock_check, dict):
+        shock_check = {}
+    layers_check = check.get("layers")
+    if not isinstance(layers_check, dict):
+        layers_check = {}
+
+    return {
+        "applicable": requirement.get("applicable"),
+        "reason": requirement.get("reason"),
+        "ablator": {
+            "name": ablator.get("name"),
+            "rho_c_gcc": ablator.get("rho_c_gcc"),
+            "zbar_source": ablator.get("zbar_source"),
+        },
+        "wavelength_nm": inputs.get("wavelength_nm"),
+        "geometry": inputs.get("geometry"),
+        "R0_cm": inputs.get("R0_cm"),
+        "peak_intensity_W_cm2": inputs.get("peak_intensity_W_cm2"),
+        "mu_abl_total_g_cm2": ablation.get("mu_abl_total_g_cm2"),
+        "ablated_mass_fraction": ablation.get("ablated_mass_fraction"),
+        "t_formation_s": ablation.get("t_formation_s"),
+        "ceiling_formation_g_cm2": ablation.get(
+            "ceiling_formation_g_cm2"
+        ),
+        "dr_min_admissible_cm": ablation.get("dr_min_admissible_cm"),
+        "profile": profile,
+        "shock": {
+            "applicable": shocks.get("applicable"),
+            "ceiling_g_cm2": shocks.get("ceiling_g_cm2"),
+            "event_times_s": event_times,
+        },
+        "bands_recommended": requirement.get("bands_recommended"),
+        "check": {
+            "ok": check.get("ok"),
+            "ablation": {
+                "n_checked": ablation_check.get("n_checked"),
+                "n_violations": ablation_check.get("n_violations"),
+                "max_ratio": ablation_check.get("max_ratio"),
+                "worst": ablation_check.get("worst"),
+            },
+            "shock": {
+                "n_checked": shock_check.get("n_checked"),
+                "n_violations": shock_check.get("n_violations"),
+                "max_ratio": shock_check.get("max_ratio"),
+                "worst": shock_check.get("worst"),
+            },
+            "layers": {
+                "ok": layers_check.get("ok"),
+                "violations": layers_check.get("violations"),
+            },
+        },
+    }
+
+
+def _requirement_has_violations(rule: dict) -> bool:
+    value = rule.get("n_violations")
+    return isinstance(value, (int, float)) and value > 0
+
+
+def requirement_lint_entries(
+    preview_dict, laser_enabled: Optional[bool]
+) -> List[dict]:
+    """Build tolerant lint entries from a mesh requirement preview."""
+    if not isinstance(preview_dict, dict):
+        return []
+    requirement = preview_dict.get("mesh_requirement")
+    if not isinstance(requirement, dict):
+        return []
+
+    applicable = requirement.get("applicable") is True
+    reason = requirement.get("reason")
+    ablation = requirement.get("ablation")
+    if not isinstance(ablation, dict):
+        ablation = {}
+    shocks = requirement.get("shocks")
+    if not isinstance(shocks, dict):
+        shocks = {}
+    check = requirement.get("requirement_check")
+    if not isinstance(check, dict):
+        check = {}
+    ablation_check = check.get("ablation")
+    if not isinstance(ablation_check, dict):
+        ablation_check = {}
+    shock_check = check.get("shock")
+    if not isinstance(shock_check, dict):
+        shock_check = {}
+    layers_check = check.get("layers")
+    if not isinstance(layers_check, dict):
+        layers_check = {}
+
+    entries = [
+        {
+            "id": "ablation-band-resolution",
+            "severity": "hard",
+            "ok": not (
+                applicable and _requirement_has_violations(ablation_check)
+            ),
+            "detail": {
+                "applicable": applicable,
+                "reason": reason,
+                "n_violations": ablation_check.get("n_violations"),
+                "max_ratio": ablation_check.get("max_ratio"),
+                "worst": ablation_check.get("worst"),
+                "ceiling_formation_g_cm2": ablation.get(
+                    "ceiling_formation_g_cm2"
+                ),
+                "bands_recommended": requirement.get("bands_recommended"),
+            },
+        }
+    ]
+    if reason == "disabled_by_deck":
+        entries.append(
+            {
+                "id": "resolution-requirement-disabled",
+                "severity": "hard",
+                "ok": False,
+                "detail": {"reason": reason},
+            }
+        )
+    if applicable:
+        shock_applicable = shocks.get("applicable") is True
+        entries.append(
+            {
+                "id": "shock-separation-resolution",
+                "severity": "warn",
+                "ok": not (
+                    shock_applicable
+                    and _requirement_has_violations(shock_check)
+                ),
+                "detail": {
+                    "applicable": shock_applicable,
+                    "n_violations": shock_check.get("n_violations"),
+                    "max_ratio": shock_check.get("max_ratio"),
+                    "worst": shock_check.get("worst"),
+                    "ceiling_g_cm2": shocks.get("ceiling_g_cm2"),
+                },
+            }
+        )
+        entries.append(
+            {
+                "id": "layer-min-cells",
+                "severity": "info",
+                "ok": layers_check.get("ok"),
+                "detail": {"violations": layers_check.get("violations")},
+            }
+        )
+    return entries
+
+
 def _resolve_pin_path(values: dict, path: str):
     current = values
     for component in path.split("."):
@@ -426,6 +632,7 @@ def run_deck_lint(deck: str, tenryu: str, pins=None, baseline=None, keep_tmp=Fal
                             "ok": preview["nr"] == len(r_nodes) - 1,
                         }
                     )
+            lints.extend(requirement_lint_entries(preview, None))
 
         if autozone is not None:
             mass_ratio_max = autozone["mass_ratio_max"]
@@ -472,6 +679,12 @@ def run_deck_lint(deck: str, tenryu: str, pins=None, baseline=None, keep_tmp=Fal
                 "stderr_tail": validate.stderr[-2000:],
             },
             "mesh_preview": preview_summary,
+            "resolution_requirement_summary": requirement_summary(preview),
+            "mesh_requirement": (
+                preview.get("mesh_requirement")
+                if isinstance(preview, dict)
+                else None
+            ),
             "lints": lints,
             "intent_lock": intent_lock,
             "defaults_diff": default_changes,

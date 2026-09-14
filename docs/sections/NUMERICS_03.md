@@ -250,6 +250,89 @@ bitwise 一致・幅下限・隣接比（pin 跨ぎは `ratio_jump_allowed` で�
 棄却**され（`MESH_POSTCHECK_*`）、達成統計（比 max/mean・ソフト超過数・
 最小幅・帯別達成値・求積残差）はこの検証格子から報告される。
 
+#### 3.1.0c 物理由来の初期メッシュ分解能要求（`Mesh.resolution_requirement`、1D、Experimental）
+
+`core/mesh_requirement`（`build_mesh_requirement` / `check_mesh_requirement`）は、デッキの
+レーザー波形・波長・材料層（密度・A・Z）・幾何から、初期メッシュが満たすべき分解能要求を
+決定論的に見積もるスケーリング則モデルである（設計記録
+docs/design/mesh_resolution_requirement_20260903.md）。probe run 後の質量形ゾーニング判定
+（`tools/assist zoning-report`）を置き換えるものではなく、最初の probe より前の情報を与え、
+probe との比較で係数を較正するためのものである。
+
+**臨界密度**: 材料 \(m\) について \(n_c = 1.11485\times10^{21}/\lambda_{\mu m}^2\) cm⁻³、
+\(\rho_{c,m} = n_c m_u A_m/\bar Z_m\)。\(\bar Z_m\) は `zbar_override`、それ以外は \(Z\le18\) で
+完全電離（最小の \(\rho_c\) = 最も厳しい天井、保守的）、\(Z>18\) は Thomas–Fermi 近似
+（`materials::compute_zbar_tf`、コロナ温度で 5 回反復）。
+
+**強度・音速・アブレーション率**: 総ビーム出力 \(P(t)\)（run と同じ 10000 点標本）から
+\(I(t) = 10^7 P/A_0\)、\(A_0\) は球 \(4\pi R_0^2\)・円筒 \(2\pi R_0\)・平面 1 cm²
+（\(R_0\) = 最外の非 void セルの外縁）。付与釣合い \(I = 4\rho_c c_T^3\) から
+\(c_T = (f_{abs} I/(4\rho_{c,front}))^{1/3}\)、質量アブレーション率
+\(\dot m = \rho_{c,front}\, c_T\)（\(\propto I^{1/3}\lambda^{-4/3}\)；Regan et al. 2007 の
+CH/351 nm/10¹⁵ W/cm² 実測 1.3–1.6×10⁶ g cm⁻² s⁻¹ に対しモデル 1.25×10⁶）。
+\(\rho_{c,front}\) はその時刻にアブレーション前面にある材料の臨界密度（層構造に追随）。
+
+**アブレート質量と深さ座標**: \(\mu_{abl}(t) = s_{abl}\int_0^t \dot m\,dt'\)
+（`ablation_mass_safety`）。セル \(i\) の参照面密度質量は球で
+\(a_i = \rho_i (r_{i+1}^3 - r_i^3)/(3R_0^2)\)（円筒 \(\rho_i(r_{i+1}^2-r_i^2)/(2R_0)\)、
+平面 \(\rho_i\Delta r_i\)）、深さ \(d_i = \sum_{j\ \mathrm{outside}\ i} a_j\)。
+\(d_i < \mu_{abl}(t_{end})\) のセルがアブレート予定で、その完全アブレート時刻は
+\(t_i = \mu_{abl}^{-1}(d_i + a_i)\)。
+
+**臨界面のスケール長**: \(L_c(t) = \eta \int_0^t c_T\,dt'\)（`scale_length_factor`、既定
+0.12 — Scheiner & Schmitt 2021 Fig. 1(d) の 0.1 / 0.7 ns の実測 4 / 19 μm に較正; 等温希薄波
+\(c_T t\) は伝導構造により 7–10 倍過大）。球幾何では \(L_c \le R_0/2\)。
+
+**形成時間と天井**: 最外皮は \(L_c\to0\) の間にアブレートされ、いかなるメッシュでも分解
+できない。収束を要求する深さは \(d_f = \phi_f\,\mu_{abl}(t_{end})\)
+（`formation_ablated_fraction`）から、\(t_f = \mu_{abl}^{-1}(d_f)\)。アブレート予定セルの
+要求（Scheiner & Schmitt の「臨界面でのスケール長をアブレートされる全ゾーンが分解する」）は
+\[ a_i \le a_{max,i} = \rho_{c,i}\, L_c(\max(t_i, t_f))/N_{res} \]
+（`zones_per_scale_length`、既定 8; Be/351 nm 参照条件で天井 1.5×10⁻⁶ g/cm² —
+実証合格線 1.39×10⁻⁶ と準合格 2.8×10⁻⁶ の間）。\(d_f\) より深いセルほど天井が緩む
+（アブレート時刻が遅く \(L_c\) が大きい）— パルス形状はここで入る。
+
+**較正（2026-09-04、実測キャンペーン）**: `zones_per_scale_length` の既定は 9、天井には
+経験的な強度補正 \(f_I = \min(1, (I_{peak}/10^{14}\ \mathrm{W\ cm^{-2}})^{-0.4})\) を乗じる
+（`intensity_exponent`、`intensity_reference_W_cm2`）。根拠は
+`tools/validation/mesh_convergence_campaign.py` による 29 ケース（波形 8 種 × 波長
+351/527/1053 nm × 初期密度 0.05–2.5 g/cc・層状・球シェル）の格子収束実測
+（`docs/validation/mesh_convergence_reference.md`、設計記録
+`docs/design/mesh_convergence_campaign_20260903.md`）: 一様参照 4.9×10⁻⁷ g/cm² に対する
+収束面密度質量と先験天井の比は幾何平均 1.26（0.39–5.28）で、10¹⁵ W/cm² では天井が緩すぎ
+（0.4）、緩やかな波形・低密度・527 nm では保守的（2–5）だった。補正後は測定した全ケースで
+天井 ≤ 収束値（最小余裕 1.0、最大 9）。1053 nm は 1.2 nm セルでも吸収エネルギー 3 % に
+未収束（表に最終増分を記載）。
+
+**衝撃波分離則**: \(P_a = 40\,\mathrm{Mbar}\,(I_{15}/\lambda_{\mu m})^{2/3}\) の
+時間履歴で、準位 \(P_{max}2^{-k}\)（\(2^{-k}\ge0.01\)）の最初の上向き交差をイベントとし、
+`shock_event_min_separation_frac`·\(t_{end}\) 以内は合流（最早時刻・最大圧力）。連続する
+イベント対について未衝撃ペイロード（\(\rho_{pay}\) = アブレート予定外の非 void 最大密度）
+での強い衝撃波速度 \(u_s = \sqrt{(4/3)P_a/\rho_{pay}}\) と Lagrangian 分離
+\(\Delta\mu = \rho_{pay} u_s \Delta t\) から、天井 \(\min_k \Delta\mu_k/N_{sep}\)
+（`shock_cells_per_separation`）を非アブレート非 void セルの局所面密度質量 \(\rho_i\Delta r_i\)
+に課す。イベントが 2 未満なら非適用。
+
+**層則（情報）**: 同一支配材料の連続セル列は `min_cells_per_layer` 以上。
+
+**推奨帯**: 形成帯 \([0, d_f]\)（天井 \(a_{max}(t_f)\)）、`n_bands` 個のアブレート帯
+（\([d_f, \mu_{abl}(t_{end})]\) を等分、天井は帯の浅い端の値 = 帯内最小、保守的）、
+ペイロード帯（衝撃波天井）。`zoning_intent` に `apply="enforce"` で注入するときの測度換算は
+`areal_mass` → \(a\)、`spherical_cell_mass` → \(4\pi r_{lo}^2 a\)、
+`cylindrical_line_mass` → \(2\pi r_{lo} a\)（帯内の厳密セル別上限を超えない、保守的）。
+各推奨帯には、帯内（非 void セル）の最大初期密度 \(\max\rho_0\) に対する許容セル幅
+`width_max_cm` \(= a_{\max}/\max\rho_0\) を併記し、report 全体では帯にわたる最小値
+`dr_min_admissible_cm` を持つ。これを超える明示的な幅下限（`zoning_intent.dr_min`）は天井と
+両立しないため、`enforce` 時は求解前に `MESH_RESOLUTION_REQUIREMENT_DR_MIN_CONFLICT` で拒否する
+（SPECIFICATION §6.4）。
+
+**運用**: `apply="report"`（既定）はメッシュに影響せず、`validate` / run 開始時に
+`[mesh-requirement]` 行と `mesh_requirement.json`（run 出力）を出す。`apply="enforce"` は
+`zoning_intent` では帯を注入（不能なら証明書付き `MESH_*` で棄却）、他の形式では違反時に
+`MESH_RESOLUTION_REQUIREMENT_VIOLATED` で validate/run を拒否する。係数（\(\eta, N_{res},
+s_{abl}, \phi_f\)、\(P_a\) 係数）は probe 較正までの暫定値であり、`zoning-report` が
+予測/実測比を報告する。放射駆動（Marshak 境界）の前面分解能・2D・時間依存 remesh は対象外。
+
 #### 3.1.1 スタガード格子配置
 
 1D球対称メッシュのスタガード配置（2D RZ §3.2と同じ思想）。
@@ -1728,6 +1811,14 @@ M_j\,\frac{du_j}{dt} = -A_j\,(p_{q,i} - p_{q,i-1}),\qquad A_j = 4\pi r_j^2
 - \(Q_{ghost} = Q_{N-1}\)（人工粘性はゼロ勾配コピー — 外側節点の運動量式と
   compatible work の両方で同じ \(p_q - p_{q,ghost}\) を使うため、境界面の
   \(Q\) は力・仕事の双方から一貫して打ち消える）
+  > **2026-09-14 修正**: 2026-08-04 の境界値デバイス読み出し化（b2ed6651d）で、compatible
+  > energy 更新側に渡す \(p_{q,ghost}^{n+1/2}\) が FREE 境界だけ 0 になっていた（PRESSURE/FIXED/REFLECT
+  > の値は計算していたが、更新カーネルが ghost を差し引くのは FREE の最外セルだけ）。運動量式は
+  > 引き続き \(Q_{ghost}=Q_{N-1}\) を使うため、自由境界で毎ステップ \(Q_{N-1}A_N\bar u_N\Delta t\) の
+  > エネルギーが生成されていた（`test_hydro_1d_step` の VNR compatible energy 試験が 08-04 以降
+  > 残差 \(1.4\times10^7\) erg で失敗、bisect で特定）。`Hydro1D::lagrangian_step` の compatible
+  > 分岐に FREE の \(Q_{N-1}\) 読み出しを戻した。影響するのは `compatible_energy=True` かつ
+  > `boundary_1d="free"` の run（`cbet_gxii_1d_off`, `parallel_gxii_1d` など）。
 
 **節点量のゴースト規約（スカラー量とは別系統；
 2026-07-26 明確化）**：AV の slope 再構成（§3.1.6 の \(\sigma_j\)）が参照する仮想
@@ -8335,6 +8426,17 @@ remap 完了後、以下のシーケンスで原始変数を再構築する：
    table がない成分は従来の
    \(P=(\gamma-1)\rho e\)、\(C_v \propto 1/(A m_p(\gamma-1))\) を用いる（H13）。
 6. 音速：§1.1.6 準拠（H15。理想気体: \(c_s = \sqrt{(\gamma_e P_e + \gamma_i P_i)/\rho}\)、テーブルEOS: 等エントロピー偏微分）
+   > **初期状態の力学的安定性の診断（2026-09-14）**: 床温度に固定されたセルの応答は等温なので、初期の
+   > \((\rho,T)\) が表の \(\partial P/\partial\rho|_T\le0\) の領域（スピノーダル、または非物理的な cold curve）に
+   > あるセルでは Lagrange 格子が丸め誤差を指数的に増幅する。ソルバの断熱音速は床置換された \(c_v\) により
+   > \(T(\partial P/\partial T)^2/(\rho^2c_v)\) の項が大きく正に留まるため指標にならない。NIF DS の液体 D2 デッキ
+   > （PROPACEOS 由来の D2 表）は 1 meV で液相の \(P=0\) が 0.34 g/cc にあり、0.17 g/cc では
+   > \(\partial P/\partial\rho|_T=-55\) kbar/(g/cc)。実測の成長率 \(7\times10^9\) s⁻¹ で、最も細いセル
+   > （r≈25〜30 µm、幅 0.46 µm）に 6 ns から密度の波状構造が現れ、界面では D2/CH の圧力差を種として
+   > 最初から成長する。`Hydro1D::prepare_initial_sound_speed` は各セルの支配材料のイオン表+電子表から
+   > \(\partial P_{\rm tot}/\partial\rho|_T\)（密度 ±2 % の中心差分、\(T\) は床以上）を評価し、非正のセル数・
+   > \(\rho, T_e\) の範囲・最小値を起動時に WARNING で報告する（状態は変えない）。対処は入力側 — 初期状態を
+   > 表の力学的に安定な枝に置くか、凝縮相を正しく表す EOS（SESAME 等）を使う。
 7. 安全策（§11）：温度・密度フロアクランプ（U2）
 
 CSR remap has one additional post-remap closure rule for evacuated cells.  If a

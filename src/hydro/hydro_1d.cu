@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iomanip>
+#include <limits>
 #include <initializer_list>
 #include <sstream>
 #include <string>
@@ -35,6 +36,7 @@
 #include "hydro/shock_tracker.hpp"
 #include "materials/eos_device.cuh"
 #include "materials/eos_device_table.cuh"
+#include "materials/eos_cell_table_selector.cuh"
 #include "materials/eos_rho_e_device.cuh"
 #include "materials/helmholtz_jet_device.cuh"
 #include "materials/helmholtz_spline_device.cuh"
@@ -110,6 +112,10 @@ struct HydroTableViews {
   tenryu::materials::HelmholtzSplineDeviceView spline_total{};
   tenryu::materials::HelmholtzJetDeviceView jet_total{};
   tenryu::materials::MieGruneisenDeviceView mie_gruneisen{};
+  // Per-material view arrays for the per-cell dominant-material table
+  // selection (multi-material closure, 2026-09-14). cell_material_index is
+  // filled per launch by cell_table_selector().
+  tenryu::materials::CellEOSTableSelector cell_tables{};
   std::uint8_t hydro_backend_kind = 0u;
   bool supports_rho_e_reclosure = false;
 };
@@ -145,6 +151,9 @@ inline HydroTableViews select_hydro_table_views(const HydroEOSContext* eos_ctx) 
   views.tab_total_rho_e = eos_ctx->total_rho_e_view(0);
   views.hydro_backend_kind = eos_ctx->material_hydro_backend_kind(0);
   views.supports_rho_e_reclosure = eos_ctx->material_supports_rho_e_reclosure(0);
+  views.cell_tables = tenryu::materials::make_cell_eos_table_selector(
+      eos_ctx->d_ion_views, eos_ctx->d_electron_views, eos_ctx->d_total_views,
+      eos_ctx->n_materials, nullptr);
   if (views.hydro_backend_kind == 1u) {
     views.spline_total = eos_ctx->total_helmholtz_view(0);
   } else if (views.hydro_backend_kind == 2u) {
@@ -153,6 +162,18 @@ inline HydroTableViews select_hydro_table_views(const HydroEOSContext* eos_ctx) 
     views.mie_gruneisen = eos_ctx->mie_gruneisen_view(0);
   }
   return views;
+}
+
+// Per-cell table selector for a launch: the context's per-material view
+// arrays plus the state's dominant-material index (null when not sized).
+inline tenryu::materials::CellEOSTableSelector cell_table_selector(
+    const HydroTableViews& views, const core::State& state) {
+  tenryu::materials::CellEOSTableSelector selector = views.cell_tables;
+  const std::size_t n = state.rho.size();
+  selector.cell_material_index =
+      (n > 0 && state.cell_material_index.size() == n) ? state.cell_material_index.data()
+                                                        : nullptr;
+  return selector;
 }
 
 inline bool hydro_has_table_eos_backend_data(const HydroTableViews& views) {
@@ -452,7 +473,8 @@ __global__ void enforce_1t_closure_kernel(double* __restrict__ ee,
                                           const double fallback_z,
                                           const double cv_e_override,
                                           const double te_floor,
-                                          const tenryu::materials::DeviceEOSTableView tab_total,
+                                          const tenryu::materials::DeviceEOSTableView tab_total_first,
+                                          const tenryu::materials::CellEOSTableSelector cell_tables,
                                           const tenryu::materials::EOSRhoEDeviceView
                                               tab_total_rho_e,
                                           const tenryu::materials::HelmholtzSplineDeviceView
@@ -476,6 +498,8 @@ __global__ void enforce_1t_closure_kernel(double* __restrict__ ee,
     return;
   }
 
+  // Per-cell dominant-material table (multi-material closure, 2026-09-14).
+  const tenryu::materials::DeviceEOSTableView tab_total = cell_tables.total(i, tab_total_first);
   const double rho_i = fmax(rho[i], 1.0e-30);
   // Per-cell effective ideal-gas properties (see State::ensure_cell_material_props).
   const double gamma = fmax(gamma_eff[i], 1.0 + 1.0e-12);
@@ -568,7 +592,12 @@ __global__ void enforce_1t_closure_kernel(double* __restrict__ ee,
                               &ei[i], &Te[i], &Ti[i], &Pe[i], &Pi[i]);
       return;
     }
-    if (tab_total.n_rho > 0 && rho_i >= exp(tab_total.log_rho_min)) {
+    // Below the table's density floor the bracket clamps to the lowest density
+    // row (same convention as the FLD matter update, the source injections and
+    // the temperature re-closure); the former switch to the ideal-gas branch
+    // disagreed with those evaluators and ratcheted the energy of expanding
+    // low-density cells (2026-09-14).
+    if (tab_total.n_rho > 0) {
       const auto rb = tenryu::materials::find_rho_bracket(tab_total, rho_i);
       const double T = fmax(te_floor, 1.0e-30);
       const double logT = log(T);
@@ -590,7 +619,7 @@ __global__ void enforce_1t_closure_kernel(double* __restrict__ ee,
       return;
     }
   }
-  if (tab_total.n_rho > 0 && rho_i >= exp(tab_total.log_rho_min)) {
+  if (tab_total.n_rho > 0) {
     const double e_raw = ee[i];
     const double e = energy_inverse_input(e_raw);
     const bool repair_energy = energy_needs_repair(e_raw);
@@ -605,7 +634,7 @@ __global__ void enforce_1t_closure_kernel(double* __restrict__ ee,
         (i >= own_begin && i < own_end) ? inverse_failure_count : nullptr);
     const bool clamp_veto = energy_authoritative && !repair_energy &&
         inv.bracket_failure == 0 &&
-        (inv.lower_clamp != 0 || inv.upper_clamp != 0);
+        (inv.lower_clamp != 0 || inv.upper_clamp != 0 || inv.floor_clamp != 0);
     if (!clamp_veto &&
         (allow_table_energy_writeback || repair_energy ||
          inv.bracket_failure != 0 || inv.lower_clamp != 0 ||
@@ -679,8 +708,9 @@ __global__ void enforce_2t_closure_kernel(double* __restrict__ ee,
                                           const double cv_e_override,
                                           const double te_floor,
                                           const double ti_floor,
-                                          const tenryu::materials::DeviceEOSTableView tab_ion,
-                                          const tenryu::materials::DeviceEOSTableView tab_ele,
+                                          const tenryu::materials::DeviceEOSTableView tab_ion_first,
+                                          const tenryu::materials::DeviceEOSTableView tab_ele_first,
+                                          const tenryu::materials::CellEOSTableSelector cell_tables,
                                           const tenryu::materials::EOSRhoEDeviceView
                                               tab_total_rho_e,
                                           const tenryu::materials::HelmholtzSplineDeviceView
@@ -707,6 +737,9 @@ __global__ void enforce_2t_closure_kernel(double* __restrict__ ee,
     return;
   }
 
+  // Per-cell dominant-material tables (multi-material closure, 2026-09-14).
+  const tenryu::materials::DeviceEOSTableView tab_ion = cell_tables.ion(i, tab_ion_first);
+  const tenryu::materials::DeviceEOSTableView tab_ele = cell_tables.electron(i, tab_ele_first);
   persistent_1d::enforce_2t_closure_kernel_body(
       i, ee, ei, Te, Ti, Pe, Pi, rho, zbar, n_cells, gamma_eff, A_eff,
       fallback_z, cv_e_override, te_floor, ti_floor, tab_ion, tab_ele,
@@ -724,7 +757,8 @@ __global__ void compute_sound_speed_1t_kernel(double* __restrict__ cs,
                                               const double* __restrict__ rho,
                                               const double* __restrict__ Pe,
                                               const double* __restrict__ Pi,
-                                              const tenryu::materials::DeviceEOSTableView tab_total,
+                                              const tenryu::materials::DeviceEOSTableView tab_total_first,
+                                              const tenryu::materials::CellEOSTableSelector cell_tables,
                                               const tenryu::materials::EOSRhoEDeviceView
                                                   tab_total_rho_e,
                                               const tenryu::materials::HelmholtzSplineDeviceView
@@ -746,6 +780,8 @@ __global__ void compute_sound_speed_1t_kernel(double* __restrict__ cs,
     return;
   }
 
+  // Per-cell dominant-material table (multi-material closure, 2026-09-14).
+  const tenryu::materials::DeviceEOSTableView tab_total = cell_tables.total(i, tab_total_first);
   const double rho_i = fmax(rho[i], 1.0e-30);
   const double gamma = fmax(gamma_eff[i], 1.0 + 1.0e-12);
   if (use_exact_ideal_gas) {
@@ -782,7 +818,7 @@ __global__ void compute_sound_speed_1t_kernel(double* __restrict__ cs,
     cs[i] = apply_exact_sound_speed_override(exact_override_kind, cs[i], rho_i, Pe[i], Pi[i]);
     return;
   }
-  if (tab_total.n_rho > 0 && rho_i >= exp(tab_total.log_rho_min)) {
+  if (tab_total.n_rho > 0) {
     const auto rb = tenryu::materials::find_rho_bracket(tab_total, rho_i);
     const double e = (tab_total.n_rho > 0) ? ee[i] : fmax(ee[i], 0.0);
     const double T =
@@ -810,8 +846,9 @@ __global__ void compute_sound_speed_2t_kernel(double* __restrict__ cs,
                                               const double* __restrict__ Pi,
                                               const double* __restrict__ Te,
                                               const double* __restrict__ Ti,
-                                              const tenryu::materials::DeviceEOSTableView tab_ion,
-                                              const tenryu::materials::DeviceEOSTableView tab_ele,
+                                              const tenryu::materials::DeviceEOSTableView tab_ion_first,
+                                              const tenryu::materials::DeviceEOSTableView tab_ele_first,
+                                              const tenryu::materials::CellEOSTableSelector cell_tables,
                                               const tenryu::materials::EOSRhoEDeviceView
                                                   tab_total_rho_e,
                                               const tenryu::materials::HelmholtzSplineDeviceView
@@ -837,6 +874,9 @@ __global__ void compute_sound_speed_2t_kernel(double* __restrict__ cs,
     return;
   }
 
+  // Per-cell dominant-material tables (multi-material closure, 2026-09-14).
+  const tenryu::materials::DeviceEOSTableView tab_ion = cell_tables.ion(i, tab_ion_first);
+  const tenryu::materials::DeviceEOSTableView tab_ele = cell_tables.electron(i, tab_ele_first);
   persistent_1d::compute_sound_speed_2t_kernel_body(
       i, cs, rho, ee, ei, Pe, Pi, Te, Ti, tab_ion, tab_ele,
       tab_total_rho_e, spline_total, jet_total, mie_gruneisen, cv_i_arr,
@@ -848,14 +888,15 @@ __global__ void compute_node_activity_kernel(std::uint8_t* __restrict__ node_act
                                              const std::int8_t* __restrict__ hydro_active,
                                              const int c_begin,
                                              const int c_end,
-                                             const int n_cells) {
+                                             const int n_cells,
+                                             const int rigid_inactive) {
   const int i = c_begin + blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= c_end) {
     return;
   }
 
   persistent_1d::compute_node_activity_kernel_body(
-      i, node_active, hydro_active, n_cells);
+      i, node_active, hydro_active, n_cells, rigid_inactive);
 }
 
 __global__ void zero_center_node_kernel(std::uint8_t* __restrict__ node_active,
@@ -1429,26 +1470,34 @@ __global__ void energy_update_with_old_volume_2t_kernel(
     const double* __restrict__ A_eff,
     const double fallback_z,
     const double qei_multiplier,
-    const tenryu::materials::DeviceEOSTableView tab_ion,
-    const tenryu::materials::DeviceEOSTableView tab_ele,
+    const tenryu::materials::DeviceEOSTableView tab_ion_first,
+    const tenryu::materials::DeviceEOSTableView tab_ele_first,
+    const tenryu::materials::CellEOSTableSelector cell_tables,
     const double* __restrict__ cv_e_arr,
     const double* __restrict__ cv_i_arr,
     const int q_heat_to_electron,
     const int compatible_energy,
     double* __restrict__ eta_compatible,
     double* __restrict__ E_floor_injected,
-    int* __restrict__ clamp_count) {
+    int* __restrict__ clamp_count,
+    const double te_floor,
+    const double ti_floor,
+    const int energy_authoritative) {
   const int i = c_begin + blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= c_end) {
     return;
   }
 
+  // Per-cell dominant-material tables (multi-material closure, 2026-09-14).
+  const tenryu::materials::DeviceEOSTableView tab_ion = cell_tables.ion(i, tab_ion_first);
+  const tenryu::materials::DeviceEOSTableView tab_ele = cell_tables.electron(i, tab_ele_first);
   persistent_1d::energy_update_with_old_volume_2t_kernel_body<GEOM>(
       i, ee, ei, ee_old, ei_old, rho_half, Te_half, Ti_half, r_new, r_old,
       u_half, vol, vol_old, mass, Pe_half, Pi_half, Q_half, zbar,
       hydro_active, n_cells, dt, gamma_eff, A_eff, fallback_z, tab_ion,
       tab_ele, cv_e_arr, cv_i_arr, q_heat_to_electron, compatible_energy,
-      eta_compatible, E_floor_injected, clamp_count);
+      eta_compatible, E_floor_injected, clamp_count, qei_multiplier, te_floor,
+      ti_floor, energy_authoritative);
 }
 
 template <int GEOM>
@@ -1639,7 +1688,13 @@ __global__ void apply_qei_transfer_2t_kernel(
     const double qei_multiplier,
     double* __restrict__ E_floor_injected,
     int* __restrict__ clamp_count,
-    const double* __restrict__ zmom_r2) {
+    const double* __restrict__ zmom_r2,
+    const tenryu::materials::DeviceEOSTableView tab_ion_first,
+    const tenryu::materials::DeviceEOSTableView tab_ele_first,
+    const tenryu::materials::CellEOSTableSelector cell_tables,
+    const double te_floor,
+    const double ti_floor,
+    const int energy_authoritative) {
   const int i = c_begin + blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= c_end) {
     return;
@@ -1679,8 +1734,25 @@ __global__ void apply_qei_transfer_2t_kernel(
   // conserved with both sides nonnegative, so this kernel no longer injects
   // floor energy at all; a clipped transfer is still counted. Cells where
   // the floors never engaged are bit-identical.
-  const double qei_hi = fmax(ee[i], 0.0);   // most the electrons can give
-  const double qei_lo = -fmax(ei[i], 0.0);  // most the ions can give
+  double qei_hi = fmax(ee[i], 0.0);   // most the electrons can give
+  double qei_lo = -fmax(ei[i], 0.0);  // most the ions can give
+  // Energy-authoritative table cells: bound by the table energy at the runtime
+  // floor instead of zero (signed table energies are valid, 2026-09-14).
+  if (energy_authoritative != 0 && te_floor > 0.0 && ti_floor > 0.0) {
+    const tenryu::materials::DeviceEOSTableView tab_ion = cell_tables.ion(i, tab_ion_first);
+    const tenryu::materials::DeviceEOSTableView tab_ele = cell_tables.electron(i, tab_ele_first);
+    if (tab_ion.n_rho > 0 && tab_ele.n_rho > 0) {
+      const double rho_floor_eval = fmax(rho[i], 1.0e-30);
+      const auto rb_i_floor = tenryu::materials::find_rho_bracket(tab_ion, rho_floor_eval);
+      const auto rb_e_floor = tenryu::materials::find_rho_bracket(tab_ele, rho_floor_eval);
+      const double e_i_floor =
+          tenryu::materials::device_eos_energy(tab_ion, rb_i_floor, log(ti_floor));
+      const double e_e_floor =
+          tenryu::materials::device_eos_energy(tab_ele, rb_e_floor, log(te_floor));
+      qei_hi = fmax(ee[i] - e_e_floor, 0.0);
+      qei_lo = fmin(-(ei[i] - e_i_floor), 0.0);
+    }
+  }
   const double qei_applied =
       isfinite(qei_term) ? fmin(fmax(qei_term, qei_lo), qei_hi) : 0.0;
   ee[i] -= qei_applied;
@@ -2981,7 +3053,8 @@ void enforce_1t_closure(
       fw.begin, fw.end, cw.begin, cw.end, n_cells,
       state.gamma_eff.data(), state.A_eff.data(), mat.Z, mat.cv_e_override,
       cfg.numerics.floors.Te,
-      eos_views.tab_total, eos_views.tab_total_rho_e, eos_views.spline_total,
+      eos_views.tab_total, cell_table_selector(eos_views, state), eos_views.tab_total_rho_e,
+      eos_views.spline_total,
       eos_views.jet_total,
       use_helmholtz_spline_backend(eos_views), use_helmholtz_jet_backend(eos_views),
       use_rho_e_table_backend(eos_views),
@@ -3028,7 +3101,8 @@ void enforce_2t_closure(
       state.gamma_eff.data(), state.A_eff.data(), mat.Z, mat.cv_e_override,
       cfg.numerics.floors.Te,
       cfg.numerics.floors.Ti,
-      eos_views.tab_ion, eos_views.tab_ele, eos_views.tab_total_rho_e, eos_views.spline_total,
+      eos_views.tab_ion, eos_views.tab_ele, cell_table_selector(eos_views, state),
+      eos_views.tab_total_rho_e, eos_views.spline_total,
       eos_views.jet_total, eos_views.mie_gruneisen,
       use_helmholtz_spline_backend(eos_views), use_helmholtz_jet_backend(eos_views),
       use_rho_e_table_backend(eos_views), use_mie_gruneisen_backend(eos_views),
@@ -3126,6 +3200,7 @@ void compute_cell_sound_speed(core::CellField1DView cs,
     compute_sound_speed_2t_kernel<<<cw.blocks(), 256>>>(
         cs.data(), state.rho.data(), state.ee.data(), state.ei.data(), state.Pe.data(),
         state.Pi.data(), state.Te.data(), state.Ti.data(), eos_views.tab_ion, eos_views.tab_ele,
+        cell_table_selector(eos_views, state),
         eos_views.tab_total_rho_e, eos_views.spline_total, eos_views.jet_total,
         eos_views.mie_gruneisen, cv_i_ptr,
         cv_e_ptr, cw.begin, cw.end, n_cells,
@@ -3137,7 +3212,8 @@ void compute_cell_sound_speed(core::CellField1DView cs,
   } else {
     compute_sound_speed_1t_kernel<<<cw.blocks(), 256>>>(
         cs.data(), state.ee.data(), state.Te.data(), state.rho.data(), state.Pe.data(),
-        state.Pi.data(), eos_views.tab_total, eos_views.tab_total_rho_e, eos_views.spline_total,
+        state.Pi.data(), eos_views.tab_total, cell_table_selector(eos_views, state),
+        eos_views.tab_total_rho_e, eos_views.spline_total,
         eos_views.jet_total, cv_e_ptr, cw.begin, cw.end, n_cells,
         use_helmholtz_spline_backend(eos_views), use_helmholtz_jet_backend(eos_views),
         use_rho_e_table_backend(eos_views),
@@ -3424,6 +3500,105 @@ void follow_void_region_nodes_1d(core::State& state, const core::Config& cfg) {
   sync_kernel("Hydro1D: follow_void_nodes kernel failed");
 }
 
+namespace {
+
+// Initial mechanical stability of the EOS (2026-09-14). Cells pinned at the
+// temperature floor respond isothermally, so the relevant stiffness is the
+// table's isothermal derivative dP_tot/drho|_T at the cell's (rho, T): where
+// it is <= 0 (spinodal region or an unphysical cold curve) the Lagrangian
+// scheme amplifies round-off exponentially (NIF DS liquid-D2 deck, PROPACEOS
+// table: 0.17 g/cc at 1 meV has dP/drho|_T = -55 kbar/(g/cc), measured growth
+// rate 7e9 1/s, visible after ~6 ns). The adiabatic sound speed used by the
+// solver stays positive there (the floored heat capacity inflates the
+// T (dP/dT)^2 / (rho^2 cv) term), so it cannot serve as the indicator. The
+// derivative is a central finite difference (2 % in density) of the ion plus
+// electron table pressures of the cell's dominant material; the state is not
+// modified.
+void log_initial_mechanical_stability(const core::State& state, const core::Config& cfg) {
+  const std::size_t n = state.rho.size();
+  if (n == 0) {
+    return;
+  }
+  const auto& mats = cfg.materials.materials;
+  if (mats.empty()) {
+    return;
+  }
+  std::vector<double> rho(n);
+  state.rho.copy_to_host(rho.data());
+  std::vector<double> Te;
+  if (state.Te.size() == n) {
+    Te.resize(n);
+    state.Te.copy_to_host(Te.data());
+  }
+  std::vector<double> Ti;
+  if (state.Ti.size() == n) {
+    Ti.resize(n);
+    state.Ti.copy_to_host(Ti.data());
+  }
+  std::vector<int> cell_mat;
+  if (state.cell_material_index.size() == n) {
+    cell_mat.resize(n);
+    state.cell_material_index.copy_to_host(cell_mat);
+  }
+  const bool has_void = state.cell_is_void.size() == n;
+  const double Te_floor = cfg.numerics.floors.Te;
+  const double Ti_floor = cfg.numerics.floors.Ti;
+  std::size_t n_unstable = 0;
+  std::size_t n_checked = 0;
+  double rho_lo = std::numeric_limits<double>::infinity();
+  double rho_hi = 0.0;
+  double T_lo = std::numeric_limits<double>::infinity();
+  double T_hi = 0.0;
+  double dpdr_min = std::numeric_limits<double>::infinity();
+  for (std::size_t c = 0; c < n; ++c) {
+    if (has_void && state.cell_is_void[c] != 0u) {
+      continue;
+    }
+    if (!(rho[c] > 0.0) || !std::isfinite(rho[c])) {
+      continue;
+    }
+    int m = cell_mat.empty() ? 0 : cell_mat[c];
+    m = std::min(std::max(m, 0), static_cast<int>(mats.size()) - 1);
+    const auto& tab = mats[static_cast<std::size_t>(m)].eos_tables;
+    if (!tab || tab->ion.empty() || tab->electron.empty()) {
+      continue;
+    }
+    const double Te_c = std::max(Te.empty() ? Te_floor : Te[c], Te_floor);
+    const double Ti_c = std::max(Ti.empty() ? Te_c : Ti[c], Ti_floor);
+    const double rho_m = rho[c] * 0.98;
+    const double rho_p = rho[c] * 1.02;
+    const double P_m = tab->ion.pressure(rho_m, Ti_c) + tab->electron.pressure(rho_m, Te_c);
+    const double P_p = tab->ion.pressure(rho_p, Ti_c) + tab->electron.pressure(rho_p, Te_c);
+    if (!std::isfinite(P_m) || !std::isfinite(P_p)) {
+      continue;
+    }
+    ++n_checked;
+    const double dpdr = (P_p - P_m) / (rho_p - rho_m);
+    if (dpdr > 0.0) {
+      continue;
+    }
+    ++n_unstable;
+    rho_lo = std::min(rho_lo, rho[c]);
+    rho_hi = std::max(rho_hi, rho[c]);
+    T_lo = std::min(T_lo, Te_c);
+    T_hi = std::max(T_hi, Te_c);
+    dpdr_min = std::min(dpdr_min, dpdr);
+  }
+  if (n_unstable == 0) {
+    return;
+  }
+  std::ostringstream oss;
+  oss << std::setprecision(4) << "Hydro1D: EOS isothermal compressibility is non-positive (dP/drho|_T <= 0) in "
+      << n_unstable << " of " << n_checked << " non-void table-EOS cells at the initial state: rho in ["
+      << rho_lo << ", " << rho_hi << "] g/cc, Te in [" << T_lo << ", " << T_hi
+      << "] eV, min dP/drho|_T = " << dpdr_min * 1.0e-9 << " kbar/(g/cc)"
+      << " -- cells pinned at the temperature floor respond isothermally there and density "
+      << "perturbations grow exponentially from round-off; check the EOS cold curve and the initial state";
+  core::log_warning(oss.str());
+}
+
+}  // namespace
+
 void Hydro1D::prepare_initial_sound_speed(core::State& state,
                                           const core::Config& cfg,
                                           const HydroEOSContext* eos_ctx) const {
@@ -3434,7 +3609,8 @@ void Hydro1D::prepare_initial_sound_speed(core::State& state,
   const HydroTableViews eos_views = select_hydro_table_views(eos_ctx);
   ensure_table_cv_fields(state, eos_views,
                          cfg.numerics.hydro.compatible_energy ||
-                             !cfg.main.two_temperature);
+                             !cfg.main.two_temperature ||
+                             cfg.numerics.hydro.qei_heat_capacity == "table");
   validate_compatible_energy_eos_support(cfg, eos_views);
 
   const bool use_two_temp = cfg.main.two_temperature;
@@ -3476,6 +3652,7 @@ void Hydro1D::prepare_initial_sound_speed(core::State& state,
   cs_n.reset(state.rho.size());
   compute_cell_sound_speed(cs_n, state, cfg, use_two_temp, eos_views);
   state.cs = std::move(cs_n);
+  log_initial_mechanical_stability(state, cfg);
   log_exact_ideal_gas_step0_diagnostic(state, cfg, eos_views);
 }
 
@@ -3606,7 +3783,8 @@ tenryu::coupling::HydroStepResult Hydro1D::lagrangian_step(
   const HydroTableViews eos_views = select_hydro_table_views(eos_ctx);
   const bool compatible_energy_requested = cfg.numerics.hydro.compatible_energy;
   ensure_table_cv_fields(state, eos_views,
-                         compatible_energy_requested || !cfg.main.two_temperature);
+                         compatible_energy_requested || !cfg.main.two_temperature ||
+                             cfg.numerics.hydro.qei_heat_capacity == "table");
   validate_compatible_energy_eos_support(cfg, eos_views);
   const bool compatible_energy_eos_supported =
       !hydro_has_table_eos_backend_data(eos_views) || eos_views.supports_rho_e_reclosure;
@@ -3651,6 +3829,12 @@ tenryu::coupling::HydroStepResult Hydro1D::lagrangian_step(
 
   std::int8_t* d_hydro_active =
       const_cast<std::int8_t*>(state.hydro_active_device_ptr());
+  // Numerics.hydro.T_start_inactive_cells: rigid inactive cells hold their
+  // nodes and keep the electron-ion coupling (the mask is dropped for Qei).
+  const bool rigid_inactive_cells =
+      (cfg.numerics.hydro.T_start_inactive_cells == "rigid_wall");
+  const std::int8_t* d_hydro_active_qei =
+      rigid_inactive_cells ? nullptr : d_hydro_active;
   std::uint8_t* d_cell_is_void =
       upload_cell_is_void(state.cell_is_void, "cell_is_void_step");
   const auto h1d_dump6 = [&](const char* phase) {
@@ -4022,7 +4206,8 @@ tenryu::coupling::HydroStepResult Hydro1D::lagrangian_step(
   cuda_check(cudaMemset(d_node_active, 0, n_nodes * sizeof(std::uint8_t)),
              "Hydro1D: cudaMemset node_active failed");
   compute_node_activity_kernel<<<cw.blocks(), 256>>>(d_node_active, d_hydro_active,
-                                                      cw.begin, cw.end, n_cells);
+                                                      cw.begin, cw.end, n_cells,
+                                                      rigid_inactive_cells ? 1 : 0);
   zero_center_node_kernel<<<1, 1>>>(d_node_active, n_nodes);
   sync_kernel("Hydro1D: compute_node_activity kernel failed");
 
@@ -4172,9 +4357,12 @@ tenryu::coupling::HydroStepResult Hydro1D::lagrangian_step(
       a_n.data(), d_node_active, nw.begin, nw.end, n_nodes, dt);
   sync_kernel("Hydro1D: predictor_update kernel failed");
 
-  propagate_void_node_displacement_kernel<<<1, 1>>>(
-      state.x_r.data(), state.v_r.data(), r_old.data(), d_node_active, n_nodes);
-  sync_kernel("Hydro1D: propagate_void_node predictor failed");
+  // rigid_wall inactive cells hold their nodes: no displacement propagation.
+  if (!rigid_inactive_cells) {
+    propagate_void_node_displacement_kernel<<<1, 1>>>(
+        state.x_r.data(), state.v_r.data(), r_old.data(), d_node_active, n_nodes);
+    sync_kernel("Hydro1D: propagate_void_node predictor failed");
+  }
 
   apply_boundary_1d(state, cfg);
   follow_void_region_nodes_1d(state, cfg);
@@ -4643,9 +4831,12 @@ tenryu::coupling::HydroStepResult Hydro1D::lagrangian_step(
     sync_kernel("Hydro1D: gamma_r force work kernel failed");
   }
 
-  propagate_void_node_displacement_kernel<<<1, 1>>>(
-      state.x_r.data(), state.v_r.data(), r_old.data(), d_node_active, n_nodes);
-  sync_kernel("Hydro1D: propagate_void_node corrector failed");
+  // rigid_wall inactive cells hold their nodes: no displacement propagation.
+  if (!rigid_inactive_cells) {
+    propagate_void_node_displacement_kernel<<<1, 1>>>(
+        state.x_r.data(), state.v_r.data(), r_old.data(), d_node_active, n_nodes);
+    sync_kernel("Hydro1D: propagate_void_node corrector failed");
+  }
 
   apply_boundary_1d(state, cfg);
   follow_void_region_nodes_1d(state, cfg);
@@ -4773,6 +4964,20 @@ tenryu::coupling::HydroStepResult Hydro1D::lagrangian_step(
                             sizeof(double), cudaMemcpyDeviceToHost),
                  "Hydro1D: copy compatible Qvisc boundary failed");
       ghost_pq_half = pe_last + pi_last + qvisc_last;
+    } else if (bc == HydroBoundaryType::FREE) {
+      // Free boundary: the acceleration kernel adds the boundary cell's Q as
+      // the ghost (zero-gradient Q, no viscous force on the free surface) and
+      // the compatible energy update subtracts the same ghost from the last
+      // cell's outer face (free_outer_boundary). The 2026-08-04 device-read
+      // change (b2ed6651d) left ghost_pq_half = 0 for FREE — the only
+      // boundary type whose ghost the energy update consumes — so the work
+      // Q_last A u dt was created every step at a free outer boundary
+      // (NUMERICS 3, ghost convention; restored 2026-09-14).
+      double qvisc_last = 0.0;
+      cuda_check(cudaMemcpy(&qvisc_last, state.Qvisc.data() + n_cells - 1,
+                            sizeof(double), cudaMemcpyDeviceToHost),
+                 "Hydro1D: copy compatible free-boundary Qvisc failed");
+      ghost_pq_half = qvisc_last;
     }
     cuda_check(cudaMemcpy(state.ee.data(), e_old.data(), n_cells * sizeof(double),
                           cudaMemcpyDeviceToDevice),
@@ -4845,6 +5050,8 @@ tenryu::coupling::HydroStepResult Hydro1D::lagrangian_step(
     }
     if (use_two_temp) {
       const auto& mat = cfg.materials.materials.front();
+      const int energy_authoritative_qei =
+          (cfg.numerics.hydro.eos_closure_mode == "energy_authoritative") ? 1 : 0;
       const bool use_table_cv_qei = hydro_has_table_eos_backend_data(eos_views);
       const double* cv_e_ptr =
           (use_table_cv_qei && !state.cv_e.empty()) ? state.cv_e.data() : nullptr;
@@ -4854,23 +5061,39 @@ tenryu::coupling::HydroStepResult Hydro1D::lagrangian_step(
         apply_qei_transfer_2t_kernel<true><<<cw.blocks(), 256>>>(
             state.ee.data(), state.ei.data(), rho_half.data(), Te_half.data(),
             Ti_half.data(), state.mass.data(), state.zbar.data(), cv_e_ptr, cv_i_ptr,
-            d_hydro_active, cw.begin, cw.end, n_cells, dt,
+            d_hydro_active_qei, cw.begin, cw.end, n_cells, dt,
             state.gamma_eff.data(), state.A_eff.data(), mat.Z,
             cfg.numerics.hydro.qei_multiplier,
-            d_hydro_floor, d_hydro_clamp_count, state.zmom_r2.data());
+            d_hydro_floor, d_hydro_clamp_count, state.zmom_r2.data(),
+            eos_views.tab_ion, eos_views.tab_ele, cell_table_selector(eos_views, state),
+            cfg.numerics.floors.Te, cfg.numerics.floors.Ti, energy_authoritative_qei);
       } else {
         apply_qei_transfer_2t_kernel<false><<<cw.blocks(), 256>>>(
             state.ee.data(), state.ei.data(), rho_half.data(), Te_half.data(),
             Ti_half.data(), state.mass.data(), state.zbar.data(), cv_e_ptr, cv_i_ptr,
-            d_hydro_active, cw.begin, cw.end, n_cells, dt,
+            d_hydro_active_qei, cw.begin, cw.end, n_cells, dt,
             state.gamma_eff.data(), state.A_eff.data(), mat.Z,
             cfg.numerics.hydro.qei_multiplier,
-            d_hydro_floor, d_hydro_clamp_count, nullptr);
+            d_hydro_floor, d_hydro_clamp_count, nullptr,
+            eos_views.tab_ion, eos_views.tab_ele, cell_table_selector(eos_views, state),
+            cfg.numerics.floors.Te, cfg.numerics.floors.Ti, energy_authoritative_qei);
       }
       sync_kernel("Hydro1D: compatible qei transfer kernel failed");
     }
   } else if (use_two_temp) {
     const auto& mat = cfg.materials.materials.front();
+    const int energy_authoritative_update =
+        (cfg.numerics.hydro.eos_closure_mode == "energy_authoritative") ? 1 : 0;
+    // Numerics.hydro.qei_heat_capacity = "table": couple with the table
+    // closure's cv_e / cv_i (as the compatible-energy path does) instead of
+    // the analytic ideal-gas heat capacities (2026-09-14).
+    const bool use_table_cv_qei_update =
+        (cfg.numerics.hydro.qei_heat_capacity == "table") &&
+        hydro_has_table_eos_backend_data(eos_views);
+    const double* cv_e_qei_ptr =
+        (use_table_cv_qei_update && !state.cv_e.empty()) ? state.cv_e.data() : nullptr;
+    const double* cv_i_qei_ptr =
+        (use_table_cv_qei_update && !state.cv_i.empty()) ? state.cv_i.data() : nullptr;
     switch (geom_code) {
       case 1:
         energy_update_with_old_volume_2t_kernel<1><<<cw.blocks(), 256>>>(
@@ -4881,10 +5104,11 @@ tenryu::coupling::HydroStepResult Hydro1D::lagrangian_step(
             cw.begin, cw.end, n_cells, dt,
             state.gamma_eff.data(), state.A_eff.data(), mat.Z,
             cfg.numerics.hydro.qei_multiplier,
-            eos_views.tab_ion, eos_views.tab_ele,
-            nullptr, nullptr, q_heat_to_electron, legacy_volume_compatible_energy,
+            eos_views.tab_ion, eos_views.tab_ele, cell_table_selector(eos_views, state),
+            cv_e_qei_ptr, cv_i_qei_ptr, q_heat_to_electron, legacy_volume_compatible_energy,
             state.eta_compatible.empty() ? nullptr : state.eta_compatible.data(),
-            d_hydro_floor, d_hydro_clamp_count);
+            d_hydro_floor, d_hydro_clamp_count, cfg.numerics.floors.Te,
+            cfg.numerics.floors.Ti, energy_authoritative_update);
         break;
       case 2:
         energy_update_with_old_volume_2t_kernel<2><<<cw.blocks(), 256>>>(
@@ -4895,10 +5119,11 @@ tenryu::coupling::HydroStepResult Hydro1D::lagrangian_step(
             cw.begin, cw.end, n_cells, dt,
             state.gamma_eff.data(), state.A_eff.data(), mat.Z,
             cfg.numerics.hydro.qei_multiplier,
-            eos_views.tab_ion, eos_views.tab_ele,
-            nullptr, nullptr, q_heat_to_electron, legacy_volume_compatible_energy,
+            eos_views.tab_ion, eos_views.tab_ele, cell_table_selector(eos_views, state),
+            cv_e_qei_ptr, cv_i_qei_ptr, q_heat_to_electron, legacy_volume_compatible_energy,
             state.eta_compatible.empty() ? nullptr : state.eta_compatible.data(),
-            d_hydro_floor, d_hydro_clamp_count);
+            d_hydro_floor, d_hydro_clamp_count, cfg.numerics.floors.Te,
+            cfg.numerics.floors.Ti, energy_authoritative_update);
         break;
       default:
         energy_update_with_old_volume_2t_kernel<0><<<cw.blocks(), 256>>>(
@@ -4909,10 +5134,11 @@ tenryu::coupling::HydroStepResult Hydro1D::lagrangian_step(
             cw.begin, cw.end, n_cells, dt,
             state.gamma_eff.data(), state.A_eff.data(), mat.Z,
             cfg.numerics.hydro.qei_multiplier,
-            eos_views.tab_ion, eos_views.tab_ele,
-            nullptr, nullptr, q_heat_to_electron, legacy_volume_compatible_energy,
+            eos_views.tab_ion, eos_views.tab_ele, cell_table_selector(eos_views, state),
+            cv_e_qei_ptr, cv_i_qei_ptr, q_heat_to_electron, legacy_volume_compatible_energy,
             state.eta_compatible.empty() ? nullptr : state.eta_compatible.data(),
-            d_hydro_floor, d_hydro_clamp_count);
+            d_hydro_floor, d_hydro_clamp_count, cfg.numerics.floors.Te,
+            cfg.numerics.floors.Ti, energy_authoritative_update);
         break;
     }
   } else {

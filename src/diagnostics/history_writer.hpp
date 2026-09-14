@@ -140,6 +140,8 @@ std::optional<double> read_icf_initial_radius_from_history_file(
     const std::string& history_path);
 #endif
 
+class HistoryAppendFile;
+
 class HistoryWriter {
  public:
   HistoryWriter() = default;
@@ -372,38 +374,40 @@ class HistoryWriter {
       const core::State& state,
       const DtBreakdownHistoryRecord& record) const;
   [[nodiscard]] PlasmaHistoryDiagnostics compute_plasma_history_diagnostics(
-      const core::State& state) const;
+      const core::State& state, const double* zbar_host = nullptr,
+      const double* mass_host = nullptr) const;
   [[nodiscard]] ImplosionHistoryDiagnostics compute_implosion_history_diagnostics(
-      const core::State& state) const;
+      const core::State& state, const double* rho_host = nullptr,
+      const double* mass_host = nullptr, const double* Te_host = nullptr) const;
   [[nodiscard]] AleProvenanceValues build_ale_provenance_values(
       tenryu::coupling::ProfileObservability& obs,
       std::int64_t step) const;
-  void append_record_to_file(hid_t file, const PendingHistoryRecord& rec) const;
-  void write_per_row_mass_history(hid_t file, const PerRowMassValues& values) const;
-  void write_corner_bc_audit_history(hid_t file, const CornerBcAuditValues& values) const;
-  void write_av_max_history(hid_t file, const AvMaxHistoryValues& values) const;
+  void append_record_to_file(const HistoryAppendFile& file, const PendingHistoryRecord& rec) const;
+  void write_per_row_mass_history(const HistoryAppendFile& file, const PerRowMassValues& values) const;
+  void write_corner_bc_audit_history(const HistoryAppendFile& file, const CornerBcAuditValues& values) const;
+  void write_av_max_history(const HistoryAppendFile& file, const AvMaxHistoryValues& values) const;
   void write_tri_fan_center_perturbation_history(
-      hid_t file,
+      const HistoryAppendFile& file,
       const core::TriFanCenterPerturbationDiag& diag,
       double time,
       std::int64_t step) const;
   void write_ale_provenance_history(
-      hid_t file,
+      const HistoryAppendFile& file,
       const AleProvenanceValues& values,
       double time,
       std::int64_t step) const;
   void write_material_interface_history(
-      hid_t file,
+      const HistoryAppendFile& file,
       const AleProvenanceValues& values,
       double time,
       std::int64_t step) const;
   void write_mesh_quality_min_history(
-      hid_t file,
+      const HistoryAppendFile& file,
       const AleProvenanceValues& values,
       double time,
       std::int64_t step) const;
   void write_ale_state_history(
-      hid_t file,
+      const HistoryAppendFile& file,
       const AleProvenanceValues& values,
       double time,
       std::int64_t step) const;

@@ -328,6 +328,7 @@ int cmd_run(const std::string& namelist_path,
     std::string case_name;
     std::string effective_restart_for_driver;
     std::string frozen_json;
+    std::string mesh_requirement_json;
     std::optional<tenryu::core::namelist::FrozenTable1D> pressure_drive_1d;
     tenryu::io::PerMaterialCheckpointReadStatus per_material_checkpoint_status =
         tenryu::io::PerMaterialCheckpointReadStatus::MissingGroupDisabled;
@@ -384,6 +385,17 @@ int cmd_run(const std::string& namelist_path,
             tenryu::core::namelist::evaluate_geometry(cfg, runtime.builder(), state);
         initial_plic_interface_cells_observed =
             geometry_summary.interface_cells_observed;
+        if (cfg.main.dim == 1) {
+          bool mesh_requirement_violated = false;
+          std::string mesh_requirement_violation;
+          mesh_requirement_json = build_mesh_requirement_json_for_config(
+              cfg, runtime.builder(), &mesh_requirement_violated,
+              &mesh_requirement_violation);
+          if (mesh_requirement_violated) {
+            throw tenryu::core::namelist::ConfigError(
+                mesh_requirement_violation);
+          }
+        }
         initialize_output_timing(state, cfg);
       }
 
@@ -484,6 +496,9 @@ int cmd_run(const std::string& namelist_path,
 
     if (io_rank == 0) {
       out.write_run_info(state, cfg);
+      if (!mesh_requirement_json.empty()) {
+        out.write_mesh_requirement(mesh_requirement_json);
+      }
     }
     tenryu::materials::log_hard_xray_opacity_diagnostic(cfg);
 

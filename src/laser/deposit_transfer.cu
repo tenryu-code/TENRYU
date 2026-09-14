@@ -1,4 +1,5 @@
 #include "laser/deposit_transfer.cuh"
+#include "core/nvtx_range.hpp"
 
 #include "parallel/reduction.hpp"
 
@@ -687,6 +688,7 @@ void apply_deposit_redistribution_1d(
     const int smooth_passes,
     const double smooth_alpha,
     const std::vector<double>* hot_e_extra_power) {
+  const core::NvtxRange nvtx_range("laser.deposit_redistribution");
   TENRYU_ASSERT(state.mesh.dim == 1, "apply_deposit_redistribution_1d expects 1D_SPH state");
   TENRYU_ASSERT(smooth_passes >= 0,
                 "apply_deposit_redistribution_1d smooth_passes must be >= 0");
@@ -979,6 +981,7 @@ void transfer_to_1d(core::State& state,
                     const parallel::PartitionInfo& part,
                     const int smooth_passes,
                     const double smooth_alpha) {
+  const core::NvtxRange nvtx_range("laser.deposit_transfer");
   TENRYU_ASSERT(state.mesh.dim == 1, "transfer_to_1d expects 1D_SPH state");
   TENRYU_ASSERT(node_R.size() == static_cast<std::size_t>(mesh.n_nodes_r),
                 "transfer_to_1d node_R size mismatch");
@@ -1031,6 +1034,7 @@ void transfer_to_1d(core::State& state,
                     const parallel::PartitionInfo& part,
                     const int smooth_passes,
                     const double smooth_alpha) {
+  const core::NvtxRange nvtx_range("laser.deposit_transfer");
   TENRYU_ASSERT(state.mesh.dim == 1, "transfer_to_1d expects 1D_SPH state");
   if (!(dt > 0.0)) {
     mesh.last_ghost_transition_blend = 0.0;

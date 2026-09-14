@@ -599,6 +599,26 @@ P_i = P_{total} - P_e,\quad e_i = e_{total} - e_e
 > **IONMIX v4 ASCII フォーマット**（レガシー）：トークンベースの ASCII リーダーも存在するが、
 > バイナリ .cn4 リーダーを推奨する。ASCII リーダーは将来削除予定。
 
+[2026-09-07] PROPACEOS conversion validates `E_total = E_ion + E_electron`
+against the existing relative tolerance or the sum of half-last-decimal-unit
+rounding bounds from the three original ASCII tokens, whichever is larger,
+plus floating-point addition roundoff. This handles cancellation of negative
+cold electron and positive ion energies without discarding valid printed data.
+Nonfinite values and discrepancies exceeding those bounds remain errors;
+no energy value is rewritten. `tests/tools/test_propaceos_energy_roundoff.py`
+checks accepted cancellation, rejected corruption, and token/block association.
+
+[2026-09-08] The offline wide-D2 regrouping utility
+`examples/nifds/phase2/prepare_table.py` uses piecewise-constant native bins,
+Planck-weighted arithmetic means for absorption/emission opacities and
+`dB/dT`-weighted harmonic means for Rosseland opacity on each target bin.
+EOS arrays are copied unchanged. For the specific 859-to-80-group conversion,
+the last native opacity is continued from 100 to 300 keV to cover CD's tail.
+Native-node grey integrals, constant-opacity invariance, source-labelled EOS
+blocks, and off-grid interpolation differences are audited by `audit_table.py`.
+Node-grey conservation does not imply off-grid or spectrally resolved equivalence.
+
+
 **TMAT-H5（v1.0）**：
 - `/eos/@primary_density_axis` と `/opacity/@primary_density_axis` は `"ni_cm3"` を使用する。
 - 密度グリッドは `/eos/grid/ni_cm3` と `/opacity/grid/ni_cm3` に格納される。
@@ -702,6 +722,16 @@ per-step `dE_total` の総和ではなく端点閉包式 \((E_0+\sum\text{src}-E
 > 配線されており死んでいた。2D_RZ 側の同型経路（`ale_axis_band_controller`）は
 > 未修正（2D 側への relay）。
 
+[2026-09-07] The pressureless all-at-temperature-floor initialization exception
+is restricted to analytic EOS paths (including the explicit exact-ideal-gas
+hydro override). Tabular EOS initial conditions must obtain their nonzero
+cold pressure and internal energy from the existing table lookup, even when
+the requested temperature equals the code floor. Otherwise a subsequent
+energy-authoritative inverse closure sees zero energy instead of the stated
+thermal initial condition. This changes no table values, floor settings, or
+runtime closure; out-of-table cryogenic temperatures still clamp to the table
+endpoint and must not be interpreted as validated liquid states.
+
 [2026-07-20] The 1T branch of the driver EOS initialization computed
 \(e_e\) from the ideal-gas cv even for table-EOS materials (power_law_te /
 TMAT), while the 2T branch consults the table; the conduction-side
@@ -721,6 +751,125 @@ snapped back to the legacy/fleck position (131.50 vs 127.50 cells), all
 certified gates re-passed (GXII golden, Hammer–Rosen, RMtV, freq-dep
 relaxation, fleck_relaxation_0d 36 legs, verify_marshak_feature_1d), and the
 Marshak-feature gate now certifies under the production-default closure.
+
+[2026-09-14] **多材料テーブル EOS の閉包 — セルの支配材料のテーブル選択**: 1D の閉包鎖
+（hydro の EOS 閉包 `enforce_1t_closure_kernel` / `enforce_2t_closure_kernel`、音速
+`compute_sound_speed_1t_kernel` / `compute_sound_speed_2t_kernel`、2T エネルギー更新
+`energy_update_with_old_volume_2t_kernel`、輻射入射の射影 `inject_radiation_source_terms_kernel`、
+Qei 副段 `qei_coupling_substep_kernel`、レーザー／燃焼入射の閉包（device kernel と host ループ）、
+伝導後・輻射半段後の温度→エネルギー再閉包 `sync_ee_from_Te_device` / `sync_ee_from_Te_table`、
+energy-authoritative の伝導増分 `apply_conduction_energy_increment`（device / host）、および 1D FLD の物質エネルギー更新 `update_matter_kernel` / `exp_source_transfer_kernel` / `exp_mg_source_transfer_kernel` / `compute_fleck_for_fld_kernel`）は、
+従来すべてのセルを先頭（最初の非 void）材料のテーブルで評価していた。NIF DS の D2 燃料 + CH 殻
+デッキでは CH セルが「1.05 g/cc の D2」として閉包され、1 meV で 0.6 Mbar の非物理圧力が殻を燃料側へ
+押していた。修正後は各セルの支配材料（`State::cell_material_index`: 体積分率最大の非 void 材料）の
+テーブルを `materials::CellEOSTableSelector`（`HydroEOSContext` の材料別 device view 配列
+`d_ion_views` / `d_electron_views` / `d_total_views` + セル材料添字。FLD は `HydroEOSContext` を持たないので
+`fld_1d_gpu.cu` 内の材料別電子テーブルキャッシュから同じ形の view 配列を作る）で選ぶ。規則: (i) 支配材料が
+要求種別（electron / ion / total）の非空テーブルを持つセルは、そのテーブルとそのテーブルの温度天井
+（高温 tail 拡張の \(T_{\rm top}\)、`DriverRecloseContext` に材料別に一度だけ upload）で評価する。
+(ii) テーブルを持たない材料のセル、および材料添字が未整備のときは従来どおり先頭材料のテーブルへ
+フォールバックする。(iii) テーブル対理想気体・`cv_e_override`・hydro backend 種別などの分岐判定と
+解析分岐の材料定数（\(A, \gamma\) 等）は従来どおり先頭材料の値のまま（テーブル材料と理想気体材料の
+混在構成は未対応で挙動不変）。単一材料では選ばれる view・天井が従来と同一オブジェクト（同じ
+`DeviceEOSTable::view()`、同じ `T_grid_eV.back()`）なので算術は bit 同一。
+`initialize_eos_fields_if_needed` は同日に先行してセル材料別に修正済み。
+`refresh_mie_gruneisen_thermo_from_energy`（Mie–Grüneisen backend 限定）と 1D ALE の post-remap
+再閉包 `ale_1d_driver.cu::eos_reclosure_kernel`（材料 0 のテーブルと \(A,\gamma\) に意図的に限定、Lagrangian
+デッキでは不使用）は対象外のまま。
+
+[2026-09-14 追補] **テーブル密度下限より低密度のセルの 1D hydro 閉包**: 1D の EOS 閉包（1T/2T）と音速は
+従来 \(\rho < \rho_{\min}\)（テーブル密度格子の下限）で理想気体分岐へ切り替えていたが、FLD の物質更新・
+輻射／Qei 注入・温度再閉包は同じセルを最低密度行へクランプしたテーブルで評価する。2 つの e↔T 写像
+（テーブルは電離エネルギーを含む）が交互に閉包すると、テーブルの \(c_v\) が理想値を上回る温度域で
+利得 > 1 の往復となり、膨張して下限を横切った最外セルのエネルギーが幾何級数的に増える（NIF DS 高解像度
+デッキ: CH 表の \(\rho_{\min}=1.08\times10^{-6}\) g/cc を 7.65 ns に横切った直後に \(T_e\) が
+\(1.6\times10^{12}\) eV へ発散し dt 床で停止。旧コードでは CH セルが D2 表（\(\rho_{\min}=3.3\times10^{-7}\)）
+で評価されていたため潜在していた）。修正後は hydro も他の評価器と同じクランプ規約（legacy tabular backend の
+1T/2T 閉包と音速の 5 箇所、`hydro_1d.cu` / `hydro_1d_bodies.cuh`）に従う。下限より低密度のセルの \(P\) は
+最低密度行の値（\(\rho_{\min}/\rho\) 倍の過大評価）で、これは他の評価器と共通の既存の限界。Helmholtz
+spline / jet / rho-e / Mie–Grüneisen backend の密度ゲートと 2D（`hydro_2d.cu`）は据え置き。密度が常に
+下限以上の run は bit 不変（cbet_gxii_1d_off: 最小 \(\rho\) \(3.4\times10^{-7}\) > CD 表の
+\(1.16\times10^{-7}\)、旧新 bit 一致で確認）。
+
+[2026-09-14 追補 2] **符号付き表エネルギーと共通の許容域（1D_SPH）**: PrOpacEOS 由来の TMAT 表は
+電子エネルギーの cold-curve が負（CH 1.05 g/cc では \(e_e<0\) が 0.45 eV 以下、D2 0.17 g/cc では
+0.21 eV 以下）で、イオンエネルギーは 2 meV 以下で平坦である。従来は複数の評価器が負のエネルギーを
+無効値として扱い、無記帳でエネルギーを生成していた: (i) 伝導後の増分 `apply_conduction_energy_increment`
+（device / host）が \(e_e\leftarrow\max(e_e+c_v\Delta T_e,0)\) と 0 に切り上げ、続く逆算で \(T_e\) を
+\(e_e(T)=0\) となる温度へ設定する（履歴の伝導段の増分が \(-E_e^{\rm init}\) にちょうど一致）;
+(ii) hydro 閉包の `energy_needs_repair` が \(e<0\) を repair 扱いし、clamp veto を迂回して床値
+\(e(\rho,T_{\rm floor})\) を書き戻す; (iii) FLD の energy-authoritative 経路（`update_matter_body` /
+`exp_mg_source_transfer_body` の EOS_TAIL 分岐）が入口・出口で \(\max(e_e,0)\); (iv) Qei 副段
+`qei_coupling_substep_kernel` と compatible 経路 `apply_qei_transfer_2t_kernel` の供出上限
+\(\max(e,0)\)（負でも床より上の電子エネルギーは供出できず、正の cold 基準を含むイオンは基準分まで供出
+できる扱い）; (v) 輻射／レーザー／燃焼入射の閉包が \(T_{\rm raw}<T_{\rm floor}\) のセルで
+\(e\leftarrow e(\rho,T_{\rm floor})\) と書き戻す; (vi) 2T エネルギー更新 `energy_update_with_old_volume_2t_kernel`
+の wrapper が `Numerics.hydro.qei_multiplier` を body に渡しておらず（常に 1）、交換に上限が無い。
+NIF DS デッキ（D2 + CH、1 meV 開始）では (i)→(vi)→(ii) の順で毎サイクルイオンだけが加熱され
+（D2 \(T_i\) 0.167 eV、CH 0.40 eV で飽和 — \(e_e\) のゼロ交差温度の近傍）、生じた圧力差が界面を
+2 km/s で押していた。輻射・伝導 OFF でも動くセルで (ii)(v) の埋め戻しが続く。
+修正（energy_authoritative モード）: 種 \(s\)・支配材料のテーブル・密度ごとの許容域を
+\([e_s(\rho,T_{{\rm floor},s}),\infty)\)（\(T_{\rm floor}\) = `Numerics.floors.Te` / `.Ti`）と定義し、
+負の表エネルギーを有効値とする。(a) `energy_needs_repair` は非有限のみ; (b) 逆算
+`device_inverse_reclose` が新フラグ `floor_clamp`（生の逆算温度 \(<T_{\rm floor}\)）を返し、1T/2T
+閉包の clamp veto に含める（表先頭行で判定する `lower_clamp` と実行時床の不一致を閉じる。書き込み
+条件は不変なので legacy は bit 不変）; (c) 伝導増分の 0 切り上げを撤去（保存形 \(e_e\mathrel{+}=c_v\Delta T_e\)
+は維持し、\(e(\rho,T_{\rm new})\) への置換はしない）; (d) FLD tail 経路の \(\max(\cdot,0)\) を撤去;
+(e) Qei（hydro カーネル・compatible 経路・副段）は両方向を床上エネルギーで制限
+\(e_{i,{\rm floor}}-e_i^\ast\le q\le e_e^\ast-e_{e,{\rm floor}}\)（\(q>0\): 電子→イオン。hydro カーネルは
+同ステップの仕事後エネルギーで評価、0 は常に許容、制限が不作動なら算術順序不変）、`qei_multiplier`
+を body へ配線; (f) 輻射／レーザー／燃焼入射の床分岐は温度のみ床にしてエネルギーを保持する（非有限
+入力の repair は従来どおり）。legacy モードは全評価器で従来挙動を bit 保存する。warm な単一材料 run
+（\(e>0\)、\(T(e)\ge T_{\rm floor}\)、Qei が上限に達しない）では全変更が不作動で bit 同一（検証:
+gxii_1d_fld_regression / cbet_gxii_1d_off の dataset 単位 bit 比較 + 単体試験）。対象外（未修正）:
+材料別 Qei カーネル `qei_coupling_substep_kernel_per_material`
+（`Numerics.materials.per_material_conservation_enabled`、既定 OFF）、Mie–Grüneisen 再閉包
+`reclose_thermo_from_energy` の \(\max(e,0)\)、2D 閉包（`hydro_2d.cu` は独自の `energy_needs_repair`）、
+台帳の \(\max(e_e+e_i,0)\)、非有限入力の repair 意味論、Qei の二重配置（hydro 両半段 + 熱副段）と
+解析式／表比熱の不一致、自由境界の人工粘性仕事の不整合、音速で負の部分圧の圧縮率寄与を捨てる処理。
+同日の追加（Qei の比熱計量）: 修正後に 26 meV 開始の同デッキ（輻射・伝導 OFF）で、静止セルのイオン→電子の
+交換が数サイクルで \(T_e\) を 26 meV → 0.16 eV に上げたまま半ステップ周期で振動する現象が残った
+（`qei_multiplier` を実効ゼロにすると消える）。原因は非 compatible 経路の 2T エネルギー更新の Qei が
+解析式（理想気体の \(c_{v,e}, c_{v,i}\)、\(f_{\rm relax}\to1\) で完全緩和）を使う一方、表の低温電子比熱
+（D2 0.17 g/cc, 26 meV で \(\approx1.3\times10^{10}\) erg/g/eV）が理想値（\(3.2\times10^{11}\)）より桁で
+小さいこと: 理想計量で温度差を消す移動量が表計量では \(T_e\) を 20 倍以上動かし、符号を変えて発散し、
+床上限で振幅が止まる。新オプション `Numerics.hydro.qei_heat_capacity`（既定 `"ideal_gas"` = 従来の
+算術・bit 凍結、`"table"` = 表閉包の \(c_{v,e}, c_{v,i}\) を `compute_qei_term_with_cv` に渡す — compatible
+経路・Qei 副段と同じ計量）を追加し、NIF DS デッキ `examples/nifds/liquid_d2_1d.py` は `"table"` を既定にした。
+既定を `"table"` に切り替えるには認証済み表 EOS run の再基準化が必要（未実施）。
+同日の追加（FLD 外側反復の 2 周期振動の根因と修正）: 輻射 ON の同デッキで、平坦な \(c_v\) 域の冷たいセルへ
+最初の吸収が届く区間（1 meV 開始で 6〜50 ps、63 サイクル中 23）の FLD 外側反復（Fleck-Cummings 経路
+`update_matter_body`）が残差 30〜50 の 2 周期振動になり `max_outer_iterations` に達していた（修正前は同区間の
+セルが電子エネルギーの 0 切り上げでゼロ交差温度に固定されていたため見かけ上収束していた）。セル単位の
+トレース（最外 CH セル、反復値 \(T_e=16\) meV、\(f=0.25\)）で、物質更新の放射項が
+\((1-f)c\sigma^{PE}E^n=2.3\times10^{21}\) erg/cm³/s（吸収 \(c\sigma^{PA}E^{n+1}=5.1\times10^{19}\)）となり、
+1 反復で \(1.8\times10^{9}\) erg/g を物質から奪って床温度へ落とし、次の反復で \(f=1\) に戻って 16 meV へ
+上がる往復だった。根因は §6.7 の W-B 適合修正（2026-07-03）が物質側の再放射項に \((1-f)c\sigma^{PE}E^n\) を使って
+いたこと: 放射側の E 方程式は同じ項を \((1-f)c\sigma^{PA}E^n\) で戻すので、\(\sigma^{PE}\ne\sigma^{PA}\) の表では
+\((1-f)c(\sigma^{PE}-\sigma^{PA})E^n\Delta t\) が毎反復消える。CH の TMAT 表は最低 4 群（0.1 eV 側）で
+\(\sigma^{PE}/\sigma^{PA}=140\)〜\(2800\)（それ以上の群では 1）であり、群 0 の \(7\times10^{-4}\) erg/cm³ の
+古い場がこの損失を生んでいた（灰色・定数不透明度では \(\sigma^{PE}=\sigma^{PA}\) で顕在化しない）。修正:
+`update_matter_body`（`fld_1d_gpu.cu`）・`update_matter_body_persistent`（`fld_1d_bodies.cuh`）・2D_RZ
+`update_matter_kernel`（`fld_2d_rz_gpu.cu`）の Newton 残差と `rad_emit` 記帳の再放射項を
+\((1-f)c\sigma^{PA}E^n\) に統一（Planck 項 \(f\,c\sigma^{PE}B\) と Jacobian は不変。2D の `rad_emit` 記帳は
+元から assembly の source と同じ \(\sigma^{PA}\) だった）。単体テスト `test_fld_fleck_beta` の blend ケースが、
+\(\sigma^{PE}=100\sigma^{PA}\) の 1 セル問題で物質更新の根と記帳がこの混合と一致することを検査する。
+混合の統一後も、界面近くの CH セル（1 meV 開始で 63 サイクル中 17）が小振幅の 2 周期（反復値 6.75 ↔ 8.03 meV、
+\(f=0.99\leftrightarrow0.37\)）で収束しなかった。原因は表そのもの: PROPACEOS 由来の TMAT 表（変換時 `kirchhoff_pe=0`、
+`examples/nifds/phase2/prepare_table.py` で Planck 算術平均に再群化）は各群の Wien 裾で \(\kappa^{PE}\) が使えない —
+CH では全 524,880 エントリ中 173,500 が 1e-99 へのアンダーフロー、実行密度で \(\kappa^{PE}/\kappa^{PA}\) が最大 2,900
+（群 0 は \(T=10\)〜13 meV、群 1 は 13〜16 meV … と帯が \(E_g/T\approx6\)〜12 を追って移動）、D2 も同様。
+NLTE 係数カーネルの Fleck 因子は \(\sigma_{p,em}=\sum_g\sigma^{PE}_g b_g\) から作られるため、Planck 重みが異常群に
+掛かる温度で \(\sigma_{p,em}\) が 2〜3 桁跳び（6.65 meV: \(3\times10^{11}\)、9.2 meV: \(4.6\times10^{14}\) cm⁻¹）、
+\(f(T)\) が不連続になって逐次代入の外側反復に不動点が無くなる。対応: 新オプション
+`Materials.materials[].opacity.tmat_kirchhoff_pe`（既定 False = 従来の算術・bit 凍結。True = TMAT 読み込み時に
+`tmat_to_ionmix_opacity` で全ノード・全群 \(\kappa^{PE}:=\kappa^{PA}\)（Kirchhoff の法則。`is_lte` 属性は変えず NLTE 係数
+経路のまま値だけ置換、`lte_repair` は不要になるので省略）。FLD 1D/2D・S_N 1D/2D・IMC・persistent loop・dt 制限・
+硬 X 線診断の全読み込み点に配線）を追加し、NIF DS デッキは True を既定にした（単体テスト `test_tmat_reader` の
+kirchhoff ケース）。表の根本対策（変換時 `kirchhoff_pe=1`、または Wien 裾を扱える再群化）は DS 側の課題。
+修正後の同デッキ: 1 meV 開始 0.05 ns（63 サイクル）で未収束 17→1（残るのは初回サイクルのみ、残差 0.05）・平均外側反復 12.5→4.4、26 meV 開始で未収束 1（初回のみ）・平均 3.9、F1 3 ns（1572 サイクル）で未収束 348→1（初回のみ）・平均反復 13.4→4.8、界面変位 0.044 µm/1 ns は不変、界面 CH セルの \(T_i\)（0.05 ns）3.9→1.6 meV。gxii・cbet は既定値で bit 同一（240/385 データセット）。
+残る既知の問題: 表そのものの資格化（`EOSTable::finalize` の非正 \(c_v\) の床置換と \(e\) 表の不整合、
+1 meV での物性の妥当性、最低群の \(\sigma^{PE}\gg\sigma^{PA}\) の由来）は別課題。
 
 **Hydro-only exact ideal-gas diagnostic backend (`eos.hydro_backend="exact_ideal_gas"`)**:
 - 1D_SPH 限定の診断 backend。raw ion/electron/total table を upload したまま、Hydro kernel 内の EOS closure / sound speed のみを解析 ideal gas に置き換える。
@@ -1482,7 +1631,24 @@ Hydro演算子 \(\mathcal{H}\) の適用をセル単位で制御する。
 - **非活性セルの処理**：`hydro_active_c = false` のセルは圧力・人工粘性による力の寄与をゼロとする。座標・速度は固定。
 - **Δt への影響**：CFL条件（§2.2 (a)）は活性セルのみを対象とする。全セルが非活性の場合は \(\Delta t_{hydro} = \infty\)（Δt制御から除外）。
 - **GPU実装**：フラグ更新は単純なCUDAカーネル（1スレッド/セル）で行い、非活性セルは `if (!hydro_active[c]) { if (Te[c] >= T_start) hydro_active[c] = 1; }` のみ。活性セルはカーネル内で即座に `return` する。
-- **使用制約（重要）**：`hydro_active` は**低密度フィル領域（真空代替）を静的に保持する数値マスク**であり、高密度物質の運動を温度条件で抑制する目的には使用してはならない。非活性セルは力の寄与がゼロであるため、隣接する活性セルのノードが OR 伝播（node_active）で移動する際に、非活性セルは「動かされるが押し返さない」片務的な力学状態になる。これはフィル領域（ρ ≪ ρ_shell）では物理的に許容されるが、高密度物質に適用するとエネルギー・運動量の非物理的な注入/消失を引き起こす。
+- **非活性セルの扱い（`hydro.T_start_inactive_cells`、2026-09-14 追加）**：
+  - `"passive_fill"`（既定、従来の挙動）：非活性セルは圧力・人工粘性の寄与ゼロ、ノードは隣接セルの
+    いずれかが活性なら動く（上記の OR 伝播）。活性ノードに続く非活性ノード列は、その活性ノードの変位で
+    平行移動される（フィル領域がプラズマ端に追従、`propagate_void_node_displacement_kernel`）。活性セルは非活性の隣を真空とみなして押し込み、非活性セルは
+    押し返さずに圧縮される（PdV 仕事は消える）。低密度フィル領域専用（次項の使用制約）。
+  - `"rigid_wall"`：ノードは**両側**のセルが活性のときだけ動く
+    \[
+    \text{node\_active}_j = \bigwedge_{c \in \mathcal{N}(j)} \text{hydro\_active}_c
+    \]
+    （最外ノードは最外セルに従う）。非活性セルは剛体壁として自分のノードを保持し（`passive_fill` が行う
+    非活性ノード列の平行移動 `propagate_void_node_displacement` も行わない）、体積・エネルギーは
+    活性化まで不変（固定ノードに対する PdV 仕事はゼロなので、活性領域のエネルギーは保存される）。
+    活性セルは壁に向かって圧縮され、壁側のセルは輻射・熱伝導・電子イオン緩和で加熱されて
+    \(T_e \ge T_{\text{start}}\) に達した時点で活性化する。このモードでは電子イオン緩和（\(Q_{ei}\)、
+    hydro 内の transfer と source_terms の副段）を `hydro_active` でマスクしない。多材料の高密度界面
+    （初期状態の圧力不整合を、加熱されるまで流体に見せない用途）向け。冷たいセルは加熱による活性化まで
+    衝撃波を通さないため、閾値は初期温度のすぐ上（例: 初期 26 meV に対し 0.05 eV）に置く。1D_SPH 専用。
+- **使用制約（重要、`passive_fill` に適用）**：`hydro_active` は**低密度フィル領域（真空代替）を静的に保持する数値マスク**であり、高密度物質の運動を温度条件で抑制する目的には使用してはならない。非活性セルは力の寄与がゼロであるため、隣接する活性セルのノードが OR 伝播（node_active）で移動する際に、非活性セルは「動かされるが押し返さない」片務的な力学状態になる。これはフィル領域（ρ ≪ ρ_shell）では物理的に許容されるが、高密度物質に適用するとエネルギー・運動量の非物理的な注入/消失を引き起こす。
 - **活性化境界でのエネルギー保存**：非活性→活性の遷移時に、そのセルの座標・体積は隣接活性ノードの移動によって既に変化している可能性がある。活性化直後の最初のステップで PdV 仕事が不連続にならないよう、活性化時に ρ, e を現在の V から再計算する（質量保存からの ρ = ΔM/V による自動更新で対応）。
 
 ### 2.2 Δt制御

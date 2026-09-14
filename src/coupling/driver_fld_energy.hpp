@@ -5,6 +5,13 @@
 
 namespace tenryu::coupling {
 
+// Passive comoving radiation transport, without radiation pressure work:
+// E_g(new) V(new) = E_g(old) V(old), independently in each owned cell/group.
+// Invalid volumes/energies fail; no clipping, projection, or redistribution.
+// An unchanged volume leaves the field bitwise unchanged.
+void advect_fld_cell_energy(core::State& state, const double* volume_before,
+                           int cell_begin, int cell_end, int groups);
+
 double compute_fld_rad_energy_total_device(const core::State& state,
                                            const core::Config& cfg);
 

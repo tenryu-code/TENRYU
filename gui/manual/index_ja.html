@@ -299,12 +299,16 @@
       <p>左ナビの「アシスタント」ビューは、LLM による 1D デッキ生成と決定論的な実行診断を提供します。既定では LLM 機能は無効で、環境変数 TENRYU_ASSIST_DISABLE=1 が常に優先される kill switch です。</p>
       <h3>準備</h3>
       <ul>
-        <li>ローカルに TENRYU チェックアウト (tools/assist を含む) が必要です。「設定」欄にそのパスを入力し「状態確認」を押すと、解決された設定 (有効/無効・ロール・モデル) が表示されます。</li>
-        <li>LLM 生成を使うには、チェックアウト直下または ~/.tenryu/ の assistant.toml で enabled = true と deck_design ロールのプロバイダを設定します (雛形: tools/assist/assistant.example.toml)。プロバイダ CLI (codex / claude) はローカルマシンで認証済みであることが前提です。</li>
+        <li>Mac 側には python3（Xcode コマンドラインツール付属）と、自分でログインした Claude Code か Codex CLI が必要です。</li>
+        <li>Mac に TENRYU を置く必要はありません。「文書とソースの取得元」でサーバープロファイルを選び「サーバーから同期」を押すと、サーバーのチェックアウトから文書・例題・ソースがアプリの設定フォルダに取り寄せられます（未同期なら最初の質問やデッキ生成で自動同期）。アシスタント本体（tools/assist）はアプリに同梱されているので、サーバー側チェックアウトには docs/ と src/ があれば十分です。開発者はローカルのチェックアウトを指定して代わりに使えます。</li>
+        <li>設定欄の「LLM 設定」でプロバイダ（Claude Code / Codex CLI の雛形）とモデル、役割の割当を選び「保存」すると、アプリの設定フォルダ（macOS では ~/Library/Application Support/jp.osaka-u.ile.tenryu-studio/assistant.toml）に書き出され、状態確認が再実行されます。</li>
+        <li>Studio が使う設定はアプリの設定フォルダの assistant.toml だけです（未作成なら LLM 機能は無効の既定のまま）。CLI 版 (tools/assist) は ./assistant.toml や ~/.tenryu/assistant.toml も探します（雛形: tools/assist/assistant.example.toml）。プロバイダ CLI (codex / claude) はローカルマシンで認証済みであることが前提です。</li>
         <li>デッキ検証は現在選択中のサーバープロファイルのバイナリで行われます (ssh プロファイルでは tools/assist/tenryu_remote.sh 経由)。ポート・鍵・ホストキー方針はプロファイル設定から自動で引き継がれます。</li>
       </ul>
+      <h3>質問</h3>
+      <p>「質問」欄に TENRYU についての質問を入力して送信すると、ローカルチェックアウトで <code>tools/assist/assist.py ask</code> が実行され、<code>question_answering</code> 役割に設定したプロバイダ（読み取り専用の CLI）が文書とソースを探索して回答します。回答末尾の根拠（<code>path:line</code>）と namelist キーは自動で実在を検査され、確認できなかった項目が表示されます。同じ会話で続けて質問すると前の往復が引き継がれます。作業ディレクトリはアプリの設定フォルダの <code>ask/&lt;stamp&gt;/</code> です。ヘッダーの「質問チャット」ボタン（⌘J / Ctrl+J）で右側にチャット欄が開き、どの画面からでも質問できる。Enter で送信、Shift+Enter で改行。</p>
       <h3>デッキ生成</h3>
-      <p>仕様を自然言語で書いて「生成」を押すと、生成 → サーバーでの validate/freeze → lint フィードバックの反復ループが走ります (最大反復 1–10)。モデルが不明点を推測せず質問してきた場合 (UNCERTAIN)、回答欄で答えて再生成できます。受理されたデッキはその場で検証・保存・実行でき、実行は通常の実行履歴に入ります。全 LLM 呼び出しは作業ディレクトリ (~/.tenryu/studio-assist/) の journal.jsonl に記録されます。</p>
+      <p>仕様を自然言語で書いて「生成」を押すと、生成 → サーバーでの validate/freeze → lint フィードバックの反復ループが走ります (最大反復 1–10)。モデルが不明点を推測せず質問してきた場合 (UNCERTAIN)、回答欄で答えて再生成できます。受理されたデッキはその場で検証・保存・実行でき、実行は通常の実行履歴に入ります。全 LLM 呼び出しはアプリの設定フォルダの作業ディレクトリ <code>generate/&lt;stamp&gt;/</code> にある journal.jsonl に記録されます。</p>
       <h3>Lint と診断</h3>
       <ul>
         <li>検証パネルの「詳細 Lint」は、現在のフォームデッキに対して solver の validate/freeze に加え、メッシュ・ゾーニング系の lint (節点単調性・隣接幅比・autozone 質量比・intent ピン検査) を実行します。</li>

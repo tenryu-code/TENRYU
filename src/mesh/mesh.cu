@@ -1,5 +1,6 @@
 #include "mesh/mesh.hpp"
 #include "mesh/geometry_1d.cuh"
+#include "mesh/radial_nodes_1d.cuh"
 
 #include <algorithm>
 #include <array>
@@ -10026,6 +10027,37 @@ void assert_trifan_cap_shared_node_maps(const MultiblockIndexing& idx) {
 
 }  // namespace
 
+std::vector<double> build_1d_radial_nodes(const core::Config& cfg,
+                                          const int nr) {
+  if (!cfg.mesh.explicit_nodes.empty()) {
+    std::vector<double> nodes = cfg.mesh.explicit_nodes;
+    for (std::size_t k = 1; k < nodes.size(); ++k) {
+      TENRYU_ASSERT(nodes[k] > nodes[k - 1],
+                    "Mesh.explicit_nodes must be strictly increasing");
+    }
+    return nodes;
+  }
+
+  std::vector<GridSegment> segments = cfg.mesh.grid_segments;
+  GradingConfig grading = cfg.mesh.grading;
+  if (segments.empty()) {
+    GridSegment seg;
+    seg.r_start = cfg.mesh.r_min;
+    seg.r_end = cfg.mesh.r_max;
+    seg.nr = nr;
+    segments.push_back(seg);
+    grading.edge_ratio = std::nextafter(1.0, 0.0);
+  }
+  // exact_measure_v2 is 1D-only (validated at parse time); the measure
+  // dimension follows the same geometry mapping as mesh.geometry_code.
+  const int graded_measure_dim =
+      (cfg.main.dimension == "1D_CYL" ||
+       cfg.mesh.geometry_1d == "cylindrical")
+          ? 2
+          : ((cfg.mesh.geometry_1d == "planar") ? 1 : 3);
+  return build_graded_nodes(segments, grading, false, graded_measure_dim);
+}
+
 void rebuild_multiblock_node_edge_csr(Mesh& mesh) {
   TENRYU_ASSERT(mesh.topo.multiblock.has_value(),
                 "node-edge CSR rebuild requires multiblock topology");
@@ -12107,8 +12139,21 @@ Mesh create_mesh(const tenryu::core::Config& cfg, tenryu::core::State& state) {
   std::vector<double> r_nodes;
   const bool radial_explicit_nodes = !cfg.mesh.explicit_nodes.empty();
   const bool radial_grid_segments = !cfg.mesh.grid_segments.empty();
-  if (radial_explicit_nodes &&
-      mesh.logical != LogicalMesh2D::PolarInBox) {
+  if (mesh.dim == 1) {
+    r_nodes = build_1d_radial_nodes(cfg, mesh.topo.nr);
+    if (radial_explicit_nodes) {
+      TENRYU_ASSERT(static_cast<int>(r_nodes.size()) == mesh.topo.nr + 1,
+                    "Mesh.explicit_nodes count mismatch: got " +
+                        std::to_string(r_nodes.size()) + " nodes, expected " +
+                        std::to_string(mesh.topo.nr + 1));
+    } else {
+      TENRYU_ASSERT(static_cast<int>(r_nodes.size()) == mesh.topo.nr + 1,
+                    "Graded node count mismatch: got " +
+                        std::to_string(r_nodes.size()) + " nodes, expected " +
+                        std::to_string(mesh.topo.nr + 1));
+    }
+  } else if (radial_explicit_nodes &&
+             mesh.logical != LogicalMesh2D::PolarInBox) {
     r_nodes = cfg.mesh.explicit_nodes;
     TENRYU_ASSERT(static_cast<int>(r_nodes.size()) == mesh.topo.nr + 1,
                   "Mesh.explicit_nodes count mismatch: got " +
@@ -12118,7 +12163,7 @@ Mesh create_mesh(const tenryu::core::Config& cfg, tenryu::core::State& state) {
       TENRYU_ASSERT(r_nodes[k] > r_nodes[k - 1],
                     "Mesh.explicit_nodes must be strictly increasing");
     }
-  } else if (mesh.dim == 1 || radial_grid_segments) {
+  } else if (radial_grid_segments) {
     std::vector<GridSegment> segments = cfg.mesh.grid_segments;
     GradingConfig grading = cfg.mesh.grading;
     if (segments.empty()) {

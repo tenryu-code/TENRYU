@@ -36,6 +36,11 @@ struct GeometryCallables {
   std::vector<std::function<double(double, double)>> volfrac;
 };
 
+struct InitialProfileSamples {
+  std::vector<double> rho;
+  std::vector<int> material;  // -1 means no material has a positive fraction.
+};
+
 GeometrySummary evaluate_geometry_from_callables(
     const Config& cfg,
     State& state,
@@ -45,6 +50,9 @@ GeometrySummary evaluate_geometry_from_callables(
 GeometrySummary evaluate_geometry(const Config& cfg,
                                   const Builder& builder,
                                   State& state);
+InitialProfileSamples sample_initial_profile_at_centers(
+    const Config& cfg, const Builder& builder,
+    const std::vector<double>& nodes);
 #endif
 
 void evaluate_geometry(const Config& cfg, State& state);

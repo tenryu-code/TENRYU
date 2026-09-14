@@ -596,7 +596,7 @@ double compute_dt_rad_limit(const core::State& state,
         TENRYU_ASSERT(tmat.opacity.has_value(),
                       "compute_dt_rad_limit tmat opacity requires /opacity payload");
         cached_table = std::make_unique<materials::IonmixOpacityData>(
-            materials::tmat_to_ionmix_opacity(*tmat.opacity, true));
+            materials::tmat_to_ionmix_opacity(*tmat.opacity, true, mat.tmat_kirchhoff_pe));
       } else {
         cached_table = std::make_unique<materials::IonmixOpacityData>(
             materials::load_ionmix_opacity(mat.opacity_file));

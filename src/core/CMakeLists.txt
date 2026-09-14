@@ -9,6 +9,7 @@ add_library(tenryu_core STATIC
   state_per_material_init.cpp
   auto_zone.cpp
   zoning_intent.cpp
+  mesh_requirement.cpp
   ${PROJECT_SOURCE_DIR}/src/materials/ionmix_reader.cpp
   ${PROJECT_SOURCE_DIR}/src/materials/zbar_tf.cpp
   namelist/frozen_table.cpp

@@ -1,4 +1,5 @@
 #include "laser/ray_init.cuh"
+#include "core/nvtx_range.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -283,6 +284,7 @@ RayArray1D initialize_rays_1d(const Beam& beam,
                               const int rays_per_beam,
                               const double beam_power,
                               cudaStream_t stream) {
+  const core::NvtxRange nvtx_range("laser.ray_initialization");
   RayArray1D out;
   if (rays_per_beam <= 0 || !(beam_power > 0.0)) {
     return out;

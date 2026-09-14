@@ -11,7 +11,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "bridge": "node dev-bridge/server.mjs",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "stage-assist": "mkdir -p src-tauri/assist-staging/tools && rsync -a --delete --exclude __pycache__ --exclude '*.pyc' ../tools/assist/ src-tauri/assist-staging/tools/assist/"
   },
   "dependencies": {
     "@radix-ui/react-dialog": "^1.1.2",

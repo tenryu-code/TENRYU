@@ -11,6 +11,34 @@ const SAFE_IDENTITY = /^[A-Za-z0-9_./+=:@~-]+$/; // ssh itself expands ~ in -i v
 const BASE_SSH_OPTS =
   "-o BatchMode=yes -o ConnectTimeout=8 -o ServerAliveInterval=5";
 
+/** Checkout subset copied into the local mirror (paths relative to the server repo root). */
+export const MIRROR_PATHS: readonly string[] = [
+  "docs/site", "docs/SPECIFICATION.md", "docs/TUTORIAL_ja.md", "docs/OUTPUT_SCHEMA.md",
+  "docs/POSTPROCESSING.md", "docs/NUMERICS.md", "docs/ARCHITECTURE.md", "docs/VERIFICATION.md",
+  "docs/sections", "examples", "tools/mesh_planner.py", "src",
+];
+export const MIRROR_EXCLUDES: readonly string[] = ["__pycache__", "*.pdf", "*.h5", "*.prp", "*.cn4", "*.o", "*.a"];
+
+export interface MirrorSyncArgs {
+  host: string;           // ssh destination (user@host or alias), already validated by buildRemoteWrapperEnv
+  sshOpts: string;        // TENRYU_REMOTE_SSH_OPTS from buildRemoteWrapperEnv
+  serverRepoRoot: string; // absolute, validated
+  mirrorRoot: string;     // absolute local directory
+  harnessDir: string;     // absolute local path of the bundled tools/assist
+}
+
+/** Fetch the checkout subset with tar over ssh into a temporary directory, then swap it in. */
+export function buildMirrorSyncScript(a: MirrorSyncArgs): string {
+  const excludes = MIRROR_EXCLUDES.map((e) => `--exclude=${shQuote(e)}`).join(" ");
+  const paths = MIRROR_PATHS.join(" ");
+  const remoteCmd = `cd ${shQuote(a.serverRepoRoot)} && tar -czf - ${excludes} ${paths} 2>/dev/null`;
+  return `tmp=${shQuote(a.mirrorRoot + ".tmp")} && dst=${shQuote(a.mirrorRoot)} && rm -rf "$tmp" && mkdir -p "$tmp" && (ssh ${a.sshOpts} ${a.host} ${shQuote(remoteCmd)} || true) | tar -xzf - -C "$tmp"; rm -rf "$tmp/tools/assist" && mkdir -p "$tmp/tools" && cp -R ${shQuote(a.harnessDir)} "$tmp/tools/assist" && missing=""; for f in docs/SPECIFICATION.md docs/site/ja/index.html src/core/namelist/builder.cpp; do test -f "$tmp/$f" || missing="$missing $f"; done; if [ -n "$missing" ]; then echo "MISSING:$missing"; exit 3; fi; test -f "$tmp/tools/assist/assist.py" || { echo "MISSING: bundled tools/assist/assist.py"; exit 4; }; rm -rf "$dst" && mv "$tmp" "$dst" && echo MIRROR_OK`;
+}
+
+export function buildMirrorProbeScript(mirrorRoot: string): string {
+  return `test -f ${shQuote(mirrorRoot)}/tools/assist/assist.py && echo MIRROR_OK`;
+}
+
 export interface RemoteWrapperEnv {
   env: Record<string, string>;
   /** null when composable; otherwise one of "HOST_UNSUPPORTED",
@@ -86,12 +114,22 @@ export function buildEchoHomeScript(): string {
   return 'echo "$HOME"';
 }
 
+export function buildFileExistsScript(path: string): string {
+  return `test -f ${shQuote(path)} && echo FILE_OK`;
+}
+
 export function buildProbeAssistScript(repo: string): string {
   return `test -f ${shQuote(repo)}/tools/assist/assist.py && echo ASSIST_OK`;
 }
 
-export function buildStatusScript(localRepo: string): string {
-  return `cd ${shQuote(localRepo)} && python3 tools/assist/assist.py status`;
+/** Local status using the Studio config path or built-in defaults when absent. */
+export function buildStatusScript(
+  localRepo: string,
+  configPath: string,
+): string {
+  let script = `cd ${shQuote(localRepo)} && python3 tools/assist/assist.py status`;
+  script += ` --config-or-defaults ${shQuote(configPath)}`;
+  return script;
 }
 
 export interface GenerateScriptArgs {
@@ -105,6 +143,8 @@ export interface GenerateScriptArgs {
   /** "tools/assist/tenryu_remote.sh" (ssh profiles) or an absolute local binary. */
   tenryuArg: string;
   env: Record<string, string>;
+  /** Studio config path; missing files select the built-in defaults. */
+  configPath: string;
 }
 
 export function buildGenerateScript(a: GenerateScriptArgs): string {
@@ -123,6 +163,24 @@ export function buildGenerateScript(a: GenerateScriptArgs): string {
   if (a.intentPath !== null) {
     script += ` --intent ${shQuote(a.intentPath)}`;
   }
+  script += ` --config-or-defaults ${shQuote(a.configPath)}`;
+  return script;
+}
+
+export interface AskScriptArgs {
+  localRepo: string;
+  workdir: string;
+  questionPath: string;
+  /** Studio config path; missing files select the built-in defaults. */
+  configPath: string;
+}
+
+/** Local question answering: `assist.py ask --json` in the local checkout. */
+export function buildAskScript(a: AskScriptArgs): string {
+  let script =
+    `cd ${shQuote(a.localRepo)} && python3 tools/assist/assist.py ask --json` +
+    ` --workdir ${shQuote(a.workdir)} --question-file ${shQuote(a.questionPath)}`;
+  script += ` --config-or-defaults ${shQuote(a.configPath)}`;
   return script;
 }
 
