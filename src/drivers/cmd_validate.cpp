@@ -1,17 +1,24 @@
 #include "drivers/cli.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <iomanip>
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "core/config.hpp"
 #include "core/error.hpp"
 #if TENRYU_ENABLE_PYTHON
 #include <pybind11/pybind11.h>
+#include "core/mesh_requirement.hpp"
+#include "core/namelist/frozen_table.hpp"
+#include "core/namelist/geometry_eval.hpp"
+#include "core/namelist/errors.hpp"
 #include "core/namelist/runtime.hpp"
+#include "mesh/radial_nodes_1d.cuh"
 #endif
 
 namespace tenryu::drivers {
@@ -356,9 +363,95 @@ void validate_callable_sanity(const tenryu::core::Config& cfg,
   }
 }
 
+tenryu::core::MeshRequirementParams mesh_requirement_params(
+    const tenryu::core::Config::MeshConfig::ResolutionRequirementNL& config) {
+  tenryu::core::MeshRequirementParams params;
+  params.enabled = config.enabled;
+  params.apply = config.apply;
+  params.zones_per_scale_length = config.zones_per_scale_length;
+  params.intensity_exponent = config.intensity_exponent;
+  params.intensity_reference_W_cm2 = config.intensity_reference_W_cm2;
+  params.scale_length_factor = config.scale_length_factor;
+  params.ablation_mass_safety = config.ablation_mass_safety;
+  params.formation_ablated_fraction = config.formation_ablated_fraction;
+  params.absorbed_fraction = config.absorbed_fraction;
+  params.shock_cells_per_separation = config.shock_cells_per_separation;
+  params.shock_event_min_separation_frac =
+      config.shock_event_min_separation_frac;
+  params.min_cells_per_layer = config.min_cells_per_layer;
+  params.zbar_override = config.zbar_override;
+  params.n_bands = config.n_bands;
+  return params;
+}
+
+tenryu::core::namelist::FrozenTable1D total_laser_power_table(
+    const tenryu::core::Config& cfg,
+    const tenryu::core::namelist::Builder& builder) {
+  constexpr int kSamples = 10000;
+  std::vector<tenryu::core::namelist::FrozenTable1D> beam_tables;
+  for (std::size_t i = 0; i < cfg.laser.beams.size(); ++i) {
+    const std::string path =
+        "Laser.beams[" + std::to_string(i) + "].power";
+    const auto callable = builder.callable_objects.find(path);
+    if (callable == builder.callable_objects.end()) {
+      continue;
+    }
+    auto table = tenryu::core::namelist::create_frozen_table(
+        callable->second, 0.0, cfg.main.t_end, kSamples);
+    table.zero_outside = true;
+    beam_tables.push_back(std::move(table));
+  }
+
+  if (beam_tables.empty()) {
+    auto table = tenryu::core::namelist::create_frozen_table_from_sampler(
+        [](double) { return 0.0; }, 0.0, cfg.main.t_end, kSamples);
+    table.zero_outside = true;
+    return table;
+  }
+
+  auto total = beam_tables.front();
+  std::fill(total.y.begin(), total.y.end(), 0.0);
+  total.zero_outside = true;
+  for (const auto& table : beam_tables) {
+    for (std::size_t k = 0; k < total.x.size(); ++k) {
+      total.y[k] += table.eval(total.x[k]);
+    }
+  }
+  return total;
+}
+
+int mesh_requirement_geometry_code(const tenryu::core::Config& cfg) {
+  if (cfg.mesh.geometry_1d == "cylindrical") {
+    return 1;
+  }
+  if (cfg.mesh.geometry_1d == "planar") {
+    return 2;
+  }
+  return 0;
+}
+
+std::string mesh_requirement_violation_message(
+    const tenryu::core::MeshRequirementRuleCheck& rule,
+    const std::string& name) {
+  std::ostringstream out;
+  out.setf(std::ios::fmtflags(0), std::ios::floatfield);
+  out << std::setprecision(17)
+      << "[mesh-requirement] MESH_RESOLUTION_REQUIREMENT_VIOLATED: "
+      << name << " worst cell " << rule.worst_cell << " ["
+      << rule.worst_r_lo_cm << "," << rule.worst_r_hi_cm
+      << "] areal mass " << rule.worst_areal_mass_g_cm2
+      << " > ceiling " << rule.worst_ceiling_g_cm2 << " (ratio "
+      << rule.max_ratio << ")";
+  return out.str();
+}
+
 #endif
 
-void emit_mesh_preview_json(const tenryu::core::Config& cfg) {
+#if TENRYU_ENABLE_PYTHON
+void emit_mesh_preview_json(
+    const tenryu::core::Config& cfg,
+    const tenryu::core::namelist::Builder& builder,
+    const std::string& requirement_json) {
   std::ostringstream oss;
   oss.setf(std::ios::fmtflags(0), std::ios::floatfield);
   oss << std::setprecision(17);
@@ -407,7 +500,15 @@ void emit_mesh_preview_json(const tenryu::core::Config& cfg) {
   } else {
     oss << ",\"polar\":null";
   }
-  if (!mesh.explicit_nodes.empty()) {
+  std::vector<double> radial_nodes;
+  tenryu::core::namelist::InitialProfileSamples samples;
+  if (cfg.main.dim == 1) {
+    radial_nodes = tenryu::mesh::build_1d_radial_nodes(cfg, cfg.mesh.nr);
+    samples = tenryu::core::namelist::sample_initial_profile_at_centers(
+        cfg, builder, radial_nodes);
+    oss << ",\"r_nodes\":";
+    emit_nodes(radial_nodes);
+  } else if (!mesh.explicit_nodes.empty()) {
     oss << ",\"r_nodes\":";
     emit_nodes(mesh.explicit_nodes);
   } else {
@@ -440,11 +541,135 @@ void emit_mesh_preview_json(const tenryu::core::Config& cfg) {
   } else {
     oss << ",\"zoning_measure\":null";
   }
+  if (cfg.main.dim == 1) {
+    oss << ",\"rho0_cells\":";
+    emit_nodes(samples.rho);
+    oss << ",\"material_cells\":[";
+    for (std::size_t i = 0; i < samples.material.size(); ++i) {
+      if (i > 0U) {
+        oss << ",";
+      }
+      oss << samples.material[i];
+    }
+    oss << "]";
+    oss << ",\"mesh_requirement\":" << requirement_json;
+  } else {
+    oss << ",\"mesh_requirement\":null";
+  }
   oss << "}";
   std::cout << "TENRYU-MESH-PREVIEW: " << oss.str() << std::endl;
 }
+#endif
 
 }  // namespace
+
+#if TENRYU_ENABLE_PYTHON
+std::string build_mesh_requirement_json_for_config(
+    const tenryu::core::Config& cfg,
+    const tenryu::core::namelist::Builder& builder,
+    bool* violated_out,
+    std::string* violation_message_out) {
+  if (violated_out != nullptr) {
+    *violated_out = false;
+  }
+  if (violation_message_out != nullptr) {
+    violation_message_out->clear();
+  }
+  if (cfg.main.dim != 1) {
+    return "null";
+  }
+
+  const std::vector<double> nodes =
+      tenryu::mesh::build_1d_radial_nodes(cfg, cfg.mesh.nr);
+  const tenryu::core::namelist::InitialProfileSamples samples =
+      tenryu::core::namelist::sample_initial_profile_at_centers(
+          cfg, builder, nodes);
+
+  tenryu::core::MeshRequirementInputs inputs;
+  inputs.geometry_code = mesh_requirement_geometry_code(cfg);
+  inputs.r_min = cfg.mesh.r_min;
+  inputs.r_max = cfg.mesh.r_max;
+  inputs.t_end = cfg.main.t_end;
+  inputs.wavelength_nm = cfg.laser.wavelength_nm;
+  inputs.laser_enabled = cfg.laser.enabled;
+  inputs.power_W = total_laser_power_table(cfg, builder);
+  inputs.materials.reserve(cfg.materials.materials.size());
+  for (const auto& material : cfg.materials.materials) {
+    inputs.materials.push_back(
+        {material.name, material.A, material.Z, material.is_void});
+  }
+  inputs.rho0 = [&nodes, &samples](const double r) {
+    std::size_t cell = static_cast<std::size_t>(
+        std::upper_bound(nodes.begin(), nodes.end(), r) - nodes.begin());
+    cell = cell == 0U ? 0U : cell - 1U;
+    cell = std::min(cell, samples.rho.size() - 1U);
+    return samples.rho[cell];
+  };
+  inputs.material_at = [&nodes, &samples](const double r) {
+    std::size_t cell = static_cast<std::size_t>(
+        std::upper_bound(nodes.begin(), nodes.end(), r) - nodes.begin());
+    cell = cell == 0U ? 0U : cell - 1U;
+    cell = std::min(cell, samples.material.size() - 1U);
+    return samples.material[cell];
+  };
+  if (nodes.size() > 2U) {
+    inputs.breakpoints.assign(nodes.begin() + 1, nodes.end() - 1);
+  }
+  inputs.rho_void_cut = cfg.mesh.auto_config.rho_void_cut;
+
+  const tenryu::core::MeshRequirementReport report =
+      tenryu::core::build_mesh_requirement(
+          inputs, mesh_requirement_params(cfg.mesh.resolution_requirement));
+  const tenryu::core::MeshRequirementCheck check =
+      tenryu::core::check_mesh_requirement(
+          report, inputs, nodes, samples.rho, samples.material);
+
+  const bool ablation_violation = check.ablation.n_violations > 0;
+  const bool shock_violation = check.shock.n_violations > 0;
+  const bool enforce_violation =
+      cfg.mesh.resolution_requirement.apply == "enforce" &&
+      !cfg.mesh.zoning_intent.enabled &&
+      (ablation_violation || shock_violation);
+  std::string violation_message;
+  if (enforce_violation) {
+    if (ablation_violation) {
+      violation_message = mesh_requirement_violation_message(
+          check.ablation, "ablation");
+    } else {
+      violation_message = mesh_requirement_violation_message(
+          check.shock, "shock");
+    }
+    if (violated_out != nullptr) {
+      *violated_out = true;
+    }
+    if (violation_message_out != nullptr) {
+      *violation_message_out = violation_message;
+    }
+  }
+
+  if (!report.applicable) {
+    tenryu::core::log_info(
+        "[mesh-requirement] not applicable (" + report.reason + ")");
+  } else if (!check.ok &&
+             cfg.mesh.resolution_requirement.apply == "report") {
+    if (ablation_violation) {
+      tenryu::core::log_warning(mesh_requirement_violation_message(
+          check.ablation, "ablation"));
+    } else if (shock_violation) {
+      tenryu::core::log_warning(mesh_requirement_violation_message(
+          check.shock, "shock"));
+    } else {
+      tenryu::core::log_warning(
+          "[mesh-requirement] layer resolution violation");
+    }
+  } else if (check.ok) {
+    tenryu::core::log_info(
+        "[mesh-requirement] requirement check passed");
+  }
+
+  return tenryu::core::mesh_requirement_json(report, &check);
+}
+#endif
 
 int cmd_validate(const std::string& namelist_path, const bool mesh_preview) {
 #if TENRYU_ENABLE_PYTHON
@@ -457,8 +682,21 @@ int cmd_validate(const std::string& namelist_path, const bool mesh_preview) {
     validate_callable_sanity(cfg, runtime.builder());
     tenryu::core::log_info("[TENRYU] Configuration validated successfully.");
     log_preflight_summary(cfg);
+
+    bool mesh_requirement_violated = false;
+    std::string mesh_requirement_violation;
+    std::string mesh_requirement_json;
+    if (cfg.main.dim == 1 && (mesh_preview || cfg.laser.enabled)) {
+      mesh_requirement_json = build_mesh_requirement_json_for_config(
+          cfg, runtime.builder(), &mesh_requirement_violated,
+          &mesh_requirement_violation);
+    }
     if (mesh_preview) {
-      emit_mesh_preview_json(cfg);
+      emit_mesh_preview_json(cfg, runtime.builder(), mesh_requirement_json);
+    }
+    if (mesh_requirement_violated) {
+      throw tenryu::core::namelist::ConfigError(
+          mesh_requirement_violation);
     }
     return 0;
   } catch (const std::exception& e) {

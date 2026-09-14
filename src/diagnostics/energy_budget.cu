@@ -843,9 +843,11 @@ EnergyBudget compute_step_energy_budget(const EnergyBudgetStepInput& input) {
   const double E_artificial =
       out.E_floor + E_safety_non_floor + out.E_redistribution_unresolved;
   out.E_denom = std::max({E_total_before, E_source, 1.0e-20});
-  // W-J: subtract the tallied radiation-field mesh-advection term (a known,
-  // physical dE_total contribution outside every operator tally) so the
-  // residual measures genuine bookkeeping error.
+  // Legacy W-J bookkeeping residual, not an unconditional physical-closure
+  // test: in hydro_coupling=none, E_rad_mesh_advection includes energy created
+  // by frozen radiation density on changing volumes. It is not a measured
+  // external boundary flux. Conservative cell advection makes this term zero
+  // up to roundoff. Physical audits must also report the unadjusted balance.
   out.epsilon_budget =
       std::abs((out.dE_total - E_artificial - out.E_rad_mesh_advection) -
                (E_source - E_sink)) / out.E_denom;

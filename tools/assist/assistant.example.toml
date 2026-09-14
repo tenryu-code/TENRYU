@@ -1,18 +1,31 @@
 # TENRYU assistant configuration (EXPERIMENTAL).
 # Copy to ./assistant.toml or ~/.tenryu/assistant.toml and edit.
 # The assistant is OFF unless enabled = true AND TENRYU_ASSIST_DISABLE is unset.
+#
+# Provider command templates: {model} and {prompt_file} are substituted. The prompt is
+# written to a file; feed it to the CLI on stdin with a shell redirect
+# (sh -c '... < {prompt_file}'). If {prompt_file} is absent from the template, the prompt
+# file PATH is appended as the last argument, which is wrong for CLIs that take the prompt
+# text itself (claude -p) — always use the redirect form.
 
 enabled = false
 
 [providers.codex]
-# {model} and {prompt_file} are substituted; if {prompt_file} is absent the
-# prompt file path is appended as the last argument.
-command = "codex exec -m {model} -s workspace-write -"
+command = "sh -c 'codex exec --skip-git-repo-check -m {model} -s workspace-write - < {prompt_file}'"
 model = "gpt-5.6-sol"
 
 [providers.claude]
-command = "claude -p --model {model}"
-model = "opus-5"
+command = "sh -c 'claude -p --model {model} < {prompt_file}'"
+model = "opus"
+
+# Read-only providers for question answering: the CLI may read the checkout, never write.
+[providers.claude_readonly]
+command = "sh -c 'claude -p --model {model} --tools Read,Grep,Glob --no-session-persistence --add-dir \"$(dirname {prompt_file})\" < {prompt_file}'"
+model = "opus"
+
+[providers.codex_readonly]
+command = "sh -c 'codex exec --skip-git-repo-check -m {model} -s read-only - < {prompt_file}'"
+model = "gpt-5.6-sol"
 
 [roles]
 deck_design = "codex"
@@ -20,6 +33,7 @@ forensics = "claude"
 intervention_proposer = "claude"
 intervention_reviewer = "codex"
 explanation = "claude"
+question_answering = "claude_readonly"
 
 [budget]
 max_interventions_per_run = 3

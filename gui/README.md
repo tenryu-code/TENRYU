@@ -10,6 +10,8 @@ Tauri 2 + React/TypeScript の Web コア分離型 (設計は
 - Tauri シェル (`src-tauri/`) のビルドは Mac で行う (Linux dev 環境には
   webkit2gtk が無い)。手順は M5 の Mac ビルド手順書を参照。
 
+`npm run tauri build` はまず `npm run stage-assist` で `tools/assist` を `src-tauri/assist-staging/`（git 管理外）へ `__pycache__` 抜きで複製し、それをアプリの Resources/tools/assist として同梱する。`src-tauri/` で単に `cargo build` を実行する場合は、事前に `npm run stage-assist` を実行する必要がある。
+
 ## 開発 (Linux)
 
 ```bash
@@ -23,12 +25,16 @@ npm run dev            # Vite (http://localhost:5173, /api を bridge へ proxy)
 
 左ナビ「アシスタント」から tools/assist (リポジトリ同梱の LLM ハーネス) を GUI で操作できる。
 
+Mac に TENRYU チェックアウトを置く必要はなく、「文書とソースの取得元」で選択中のサーバープロファイルから文書・例題・ソースをアプリ設定フォルダへ同期する（未同期時は質問・デッキ生成前に自動同期し、開発者はローカルチェックアウトを上書き指定できる）。アシスタント本体はアプリ同梱（Tauri resources: tools/assist）。
+「質問チャット」(⌘J / Ctrl+J) は同じ状態を右側のドックで会話表示する。
+「LLM 設定」フォームは assistant.toml を GUI から生成する（保存先はアプリの設定フォルダ (Tauri appConfigDir; dev bridge は TENRYU_GUI_BRIDGE_DIR)）。
+
 - 決定論 verb (詳細 Lint / ダイジェスト / ゾーニング診断) はサーバープロファイル上で
   `python3 tools/assist/assist.py …` を実行する (サーバー側チェックアウトに tools/assist が必要)。
 - LLM 生成 (generate-deck) はローカルで実行し、デッキ検証だけ
   `tools/assist/tenryu_remote.sh` 経由でサーバーのバイナリに委ねる。プロバイダ CLI と
   その認証はローカル前提。設定は assistant.toml (既定 OFF・TENRYU_ASSIST_DISABLE が
-  kill switch)。作業ディレクトリは `~/.tenryu/studio-assist/<stamp>/`。
+  kill switch)。作業ディレクトリはアプリの設定フォルダの `generate/<stamp>/`。
 - このために Tauri shell 許可に bash が追加されている (ssh/scp と同格のローカル実行
   権限。webview は同梱コードのみを実行する)。
 

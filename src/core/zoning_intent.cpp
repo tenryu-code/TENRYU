@@ -619,6 +619,106 @@ PanelTable build_verification_panel(const PanelTable& source,
 
 }  // namespace
 
+double measure_fraction_at(
+    const double r_min, const double r_max,
+    const ZoningIntentConfig& cfg,
+    const std::function<double(double)>& rho0,
+    const double r) {
+  if (r <= r_min) {
+    return 0.0;
+  }
+  if (r >= r_max) {
+    return 1.0;
+  }
+  if (!std::isfinite(r_min) || !std::isfinite(r_max) || !(r_max > r_min) ||
+      (cfg.measure != ZoningMeasure::kWidth && !rho0)) {
+    return std::numeric_limits<double>::quiet_NaN();
+  }
+
+  const double position_tolerance =
+      kPositionToleranceScale * (r_max - r_min);
+  std::vector<double> segment_edges;
+  segment_edges.reserve(cfg.pins.size() + 2U);
+  segment_edges.push_back(r_min);
+  for (const ZoningIntentPin& pin : cfg.pins) {
+    if (pin.r > r_min && pin.r < r_max) {
+      segment_edges.push_back(pin.r);
+    }
+  }
+  segment_edges.push_back(r_max);
+
+  IntegrandEvaluator evaluator;
+  evaluator.measure = cfg.measure;
+  evaluator.profile = &cfg.profile;
+  evaluator.anchors = &cfg.anchors;
+  evaluator.rho0 = &rho0;
+
+  SegmentData domain;
+  domain.r_begin = r_min;
+  domain.r_end = r_max;
+  for (std::size_t segment_index = 0;
+       segment_index + 1U < segment_edges.size(); ++segment_index) {
+    const double segment_begin = segment_edges[segment_index];
+    const double segment_end = segment_edges[segment_index + 1U];
+    std::vector<double> panel_edges = {segment_begin, segment_end};
+    for (const ZoningProfilePoint& point : cfg.profile) {
+      if (point.r > segment_begin && point.r < segment_end) {
+        panel_edges.push_back(point.r);
+      }
+    }
+    for (const ZoningAnchor& anchor : cfg.anchors) {
+      const double support_begin = anchor.r - anchor.half_width;
+      if (support_begin > segment_begin && support_begin < segment_end) {
+        panel_edges.push_back(support_begin);
+      }
+      if (anchor.r > segment_begin && anchor.r < segment_end) {
+        panel_edges.push_back(anchor.r);
+      }
+      const double support_end = anchor.r + anchor.half_width;
+      if (support_end > segment_begin && support_end < segment_end) {
+        panel_edges.push_back(support_end);
+      }
+    }
+    for (const double event : cfg.extra_events) {
+      if (std::isfinite(event) && event > segment_begin &&
+          event < segment_end) {
+        panel_edges.push_back(event);
+      }
+    }
+    std::sort(panel_edges.begin(), panel_edges.end());
+    std::vector<double> deduplicated_edges;
+    deduplicated_edges.reserve(panel_edges.size());
+    for (const double edge : panel_edges) {
+      if (deduplicated_edges.empty() ||
+          edge - deduplicated_edges.back() > position_tolerance) {
+        deduplicated_edges.push_back(edge);
+      }
+    }
+    if (!bitwise_equal(deduplicated_edges.back(), segment_end)) {
+      deduplicated_edges.back() = segment_end;
+    }
+
+    for (std::size_t i = 0; i + 1U < deduplicated_edges.size(); ++i) {
+      PanelTable panel;
+      if (!build_refined_panel(deduplicated_edges[i],
+                               deduplicated_edges[i + 1U], evaluator,
+                               panel)) {
+        return std::numeric_limits<double>::quiet_NaN();
+      }
+      domain.measure_total += panel.measure.total;
+      domain.panels.push_back(std::move(panel));
+    }
+  }
+  if (!(domain.measure_total > 0.0) ||
+      !std::isfinite(domain.measure_total)) {
+    return std::numeric_limits<double>::quiet_NaN();
+  }
+  return std::clamp(
+      evaluate_cumulative(domain, r, IntegrandKind::kMeasure) /
+          domain.measure_total,
+      0.0, 1.0);
+}
+
 ZoningResult compute_zoning_intent_nodes(
     const double r_min, const double r_max,
     const ZoningIntentConfig& cfg,

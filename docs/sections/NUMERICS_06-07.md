@@ -2238,6 +2238,47 @@ hydro half step ごとに \(E_rV^{4/3}\) を保存する gamma_r=4/3 radiation c
 \(p_r=\sum_g E_g/3\) の force-side coupling を使う。
 Default flipped 2026-07-06, reverted same day (v1 defect), RE-ADOPTED same night after the v3 fix and fresh A/B (R2-1=A). Scope enforcement (2026-07-06): activation additionally requires mode=="multigroup_diffusion" (SnTransport excluded). (History) DEFAULT REVERTED to "none" the same day: the rebaseline combined audit measured cumulative unexplained energy +8.6e9 erg (~10% of absorbed) on the GXII FLD regression with coupling on vs +0.6e9 off — the v1 force-side p_r work and the exact-adiabat V^{4/3} field payment do not cancel at finite amplitude (shocks/AV), a defect class invisible to the smooth-adiabat and linear-ceff gates. Deck opt-outs on compatible_energy decks stay as explicit documentation. Re-adoption path: v2 work-consistent payment (same p_r_half, same swept dV_c on BOTH modes — the design-doc v2 ruling extended to non-compatible mode, whose "v1 stays bit-for-bit" assumption this audit falsified).
 
+
+[2026-09-08: mesh-motion conservation]
+An explicit `hydro_coupling="conservative_advection"` is available for
+1D Lagrangian FLD on the host-driven split loop (no ALE1D or persistent loop).
+It solves the passive comoving transport subproblem
+`D E_g / Dt = -E_g div(u)`, without radiation pressure force/work:
+`U_g = E_g V` is carried across each accepted hydro half-step and
+`E_g,new = E_g,old (V_old / V_new)` is published before the next radiation
+solve. Each cell/group uses its own actual volumes. There is no symmetry
+projection, smoothing, clipping, or redistribution, and unchanged volumes
+leave the field bitwise unchanged. Invalid volumes or nonfinite fields fail.
+Owned cells are updated and the existing 1D Allgatherv restores the replicated
+radiation line; full-step retry snapshots already include `rad_E`.
+The default and the existing `none`/`gamma_r_43` paths remain unchanged.
+
+This option is a reduced passive-field model, not complete moving-medium
+radiation hydrodynamics. With comoving radiation pressure enabled the grey
+energy law instead contains `-P_r:grad(u)`; isotropic pressure gives
+`D E / Dt = -(4/3) E div(u)`, and the gas must receive the equal/opposite
+discrete force work. The existing gamma mode pays the actual nodal work,
+`U_new = U_old - W_r`; its continuum adiabat is not an exact finite-step
+identity. Frequency-shift group coupling and a general lab-frame ALE flux
+are outside the new option.
+
+Historical `none` freezes energy density during mesh motion:
+`Delta U = sum_cg E_cg (V_new - V_old)`. For a closed spherical domain with
+uniform field and linear expansion ratio s this produces `U_new/U_old=s^3`.
+The existing `E_rad_mesh_advection` ledger measures that change, and
+`epsilon_budget` subtracts it; the adjusted epsilon is NOT a physical
+closed-system conservation test. With conservative advection that mesh term
+is zero to roundoff. A physical audit must show the unadjusted balance and
+actual external boundary fluxes separately. A lab-frame moving-control-volume
+formulation would require flux `F_lab - w E_lab` at every face; simply
+freezing a nonuniform cell field is not such a remap.
+
+Tests: `test_radiation_mesh_motion` exercises expanding/contracting planar
+and spherical ideal-gas domains, signed multigroup cell energies, stationary
+cells, owned windows, and active closed-domain diffusion.
+`examples/verification/radiation_mesh_advection.py` provides a standard
+table-free example with reflecting radiation boundaries.
+
 Cut-1a/2 では DSA/TSA 加速は使わない。
 収束判定は
 \(\max_c |\Delta T_{e,c}|/\max(T_{e,c},T_{floor}) <\)

@@ -67,6 +67,11 @@ struct IonmixEOSData {
   }
 };
 
+// Share the existing ordered warning budget with the device field updater.
+bool zbar_clamp_warning_limit_reached();
+void report_zbar_clamped_input(double rho, double T_eV,
+                                double rho_used, double T_used);
+
 struct IonmixZbarTable {
   std::vector<double> rho_grid;      // [g/cm^3]
   std::vector<double> T_grid_eV;     // [eV]

@@ -4135,7 +4135,7 @@ void IMC::transport_step(core::State& state,
         TENRYU_ASSERT(tmat.opacity.has_value(),
                       "IMC::transport_step tmat opacity.model requires /opacity payload");
         nlte_table_ = std::make_unique<materials::IonmixOpacityData>(
-            materials::tmat_to_ionmix_opacity(*tmat.opacity));
+            materials::tmat_to_ionmix_opacity(*tmat.opacity, mat.tmat_skip_lte_repair, mat.tmat_kirchhoff_pe));
       } else {
         nlte_table_ = std::make_unique<materials::IonmixOpacityData>(
             materials::load_ionmix_opacity(mat.opacity_file));

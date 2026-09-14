@@ -1,6 +1,7 @@
 import { open, save } from "@tauri-apps/plugin-dialog";
+import { appConfigDir, join, resourceDir } from "@tauri-apps/api/path";
 import { readFile, readTextFile, writeFile, writeTextFile } from "@tauri-apps/plugin-fs";
-import { Command } from "@tauri-apps/plugin-shell";
+import { Command, type Child } from "@tauri-apps/plugin-shell";
 import { LazyStore } from "@tauri-apps/plugin-store";
 import type { ServerProfile } from "../core/profiles";
 import { planExec, planReadText, planUploadText } from "../core/ssh";
@@ -9,6 +10,42 @@ import type { AppSettings, Backend, ExecOpts, ExecResult } from "./types";
 
 const LOCAL_TRANSPORT_ERROR =
   "ローカル transport は開発用 (dev-bridge) 専用です。ssh プロファイルを使ってください。";
+
+/** Local commands without an explicit timeout are cut off after 10 minutes. */
+const DEFAULT_LOCAL_TIMEOUT_MS = 600000;
+
+function concatUtf8(chunks: Uint8Array[]): string {
+  let total = 0;
+  for (const c of chunks) total += c.length;
+  const buf = new Uint8Array(total);
+  let offset = 0;
+  for (const c of chunks) {
+    buf.set(c, offset);
+    offset += c.length;
+  }
+  return new TextDecoder().decode(buf);
+}
+
+/**
+ * Stop a timed-out local command: SIGTERM to the direct children of the bash -lc wrapper
+ * (the assistant harness forwards it to its provider process group), escalate to SIGKILL
+ * after 2 s, then kill the wrapper itself.
+ */
+async function terminateLocalCommand(child: Child): Promise<void> {
+  try {
+    await Command.create("bash", [
+      "-lc",
+      `pkill -TERM -P ${child.pid}; sleep 2; pkill -KILL -P ${child.pid}; exit 0`,
+    ]).execute();
+  } catch {
+    /* best effort */
+  }
+  try {
+    await child.kill();
+  } catch {
+    /* already exited */
+  }
+}
 
 export class TauriBackend implements Backend {
   readonly kind = "tauri" as const;
@@ -127,12 +164,52 @@ export class TauriBackend implements Backend {
     return await readBinaryViaExec(this.exec.bind(this), profile, remotePath, maxBytes);
   }
 
-  async execLocal(argv: string[], _opts?: ExecOpts): Promise<ExecResult> {
+  async execLocal(argv: string[], opts?: ExecOpts): Promise<ExecResult> {
     // Capability whitelist mirrors src-tauri/capabilities/default.json: local
     // execution is restricted to bash (login shell restores the user PATH).
     if (argv[0] !== "bash") throw new Error(`execLocal: only bash is permitted (got ${argv[0]})`);
-    const out = await Command.create("bash", argv.slice(1)).execute();
-    return { code: out.code, stdout: out.stdout, stderr: out.stderr, timedOut: false };
+    const cmd = Command.create("bash", argv.slice(1), { encoding: "raw" });
+    const out: Uint8Array[] = [];
+    const err: Uint8Array[] = [];
+    cmd.stdout.on("data", (chunk) => {
+      out.push(chunk);
+    });
+    cmd.stderr.on("data", (chunk) => {
+      err.push(chunk);
+    });
+    return await new Promise<ExecResult>((resolve, reject) => {
+      let settled = false;
+      let timedOut = false;
+      let timer: ReturnType<typeof setTimeout> | null = null;
+      const settle = (fn: () => void) => {
+        if (settled) return;
+        settled = true;
+        if (timer !== null) clearTimeout(timer);
+        fn();
+      };
+      cmd.on("error", (e) => settle(() => reject(new Error(String(e)))));
+      cmd.on("close", (p) =>
+        settle(() =>
+          resolve({
+            code: timedOut ? null : p.code,
+            stdout: concatUtf8(out),
+            stderr: concatUtf8(err),
+            timedOut,
+          }),
+        ),
+      );
+      cmd.spawn().then(
+        (child) => {
+          if (settled) return;
+          const limit = Math.max(1000, opts?.timeoutMs ?? DEFAULT_LOCAL_TIMEOUT_MS);
+          timer = setTimeout(() => {
+            timedOut = true;
+            void terminateLocalCommand(child);
+          }, limit);
+        },
+        (e) => settle(() => reject(e instanceof Error ? e : new Error(String(e)))),
+      );
+    });
   }
 
   async readLocalText(path: string, maxBytes = 262144): Promise<string> {
@@ -142,5 +219,13 @@ export class TauriBackend implements Backend {
 
   async writeLocalText(path: string, content: string): Promise<void> {
     await writeTextFile(path, content);
+  }
+
+  async appConfigDir(): Promise<string> {
+    return (await appConfigDir()).replace(/[\\/]+$/, "");
+  }
+
+  async assistHarnessDir(): Promise<string> {
+    return (await join(await resourceDir(), "tools", "assist")).replace(/[\\/]+$/, "");
   }
 }

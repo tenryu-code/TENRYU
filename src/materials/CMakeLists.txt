@@ -20,6 +20,7 @@ add_library(tenryu_materials STATIC
   sesame_reader.cpp
   tmat_reader.cpp
   zmoment_state.cu
+  zbar_device.cu
 )
 
 target_include_directories(tenryu_materials PUBLIC ${PROJECT_SOURCE_DIR}/src)

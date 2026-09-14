@@ -4,9 +4,9 @@
   "version": "0.1.0",
   "identifier": "jp.osaka-u.ile.tenryu-studio",
   "build": {
-    "beforeDevCommand": "npm run dev",
+    "beforeDevCommand": "npm run stage-assist && npm run dev",
     "devUrl": "http://localhost:5173",
-    "beforeBuildCommand": "npm run build",
+    "beforeBuildCommand": "npm run stage-assist && npm run build",
     "frontendDist": "../dist"
   },
   "app": {
@@ -33,9 +33,16 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
+    "resources": {
+      "assist-staging/tools/assist/": "tools/assist/"
+    },
     "macOS": {
       "minimumSystemVersion": "10.15"
     }
   },
-  "plugins": {}
+  "plugins": {
+    "fs": {
+      "requireLiteralLeadingDot": false
+    }
+  }
 }

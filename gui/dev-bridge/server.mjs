@@ -5,11 +5,16 @@ import fs from "node:fs";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 const PORT = Number(process.env.TENRYU_GUI_BRIDGE_PORT || 5175);
 const HOST = "127.0.0.1";
 const CONF_DIR =
   process.env.TENRYU_GUI_BRIDGE_DIR || path.join(os.homedir(), ".config", "tenryu-studio-dev");
+const ASSIST_HARNESS_DIR = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)),
+  "../../tools/assist",
+);
 const MOCK_BIN = process.env.TENRYU_GUI_MOCK_BIN || "";
 const MAX_BODY = 8 * 1024 * 1024;
 const MAX_CAPTURE = 4 * 1024 * 1024;
@@ -134,6 +139,14 @@ const server = http.createServer(async (req, res) => {
     }
     if (route === "GET /api/settings") {
       sendJson(res, 200, readJsonFile(path.join(CONF_DIR, "settings.json"), { settings: {} }));
+      return;
+    }
+    if (route === "GET /api/app-config-dir") {
+      sendJson(res, 200, { dir: CONF_DIR });
+      return;
+    }
+    if (route === "GET /api/assist-harness-dir") {
+      sendJson(res, 200, { dir: ASSIST_HARNESS_DIR });
       return;
     }
     if (route === "PUT /api/settings") {

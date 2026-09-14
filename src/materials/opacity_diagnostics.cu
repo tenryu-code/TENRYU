@@ -38,7 +38,7 @@ namespace {
     const TmatFile tmat = load_tmat(mat.opacity_file);
     TENRYU_ASSERT(tmat.opacity.has_value(),
                   "hard-X-ray opacity diagnostic requires TMAT /opacity payload");
-    return tmat_to_ionmix_opacity(*tmat.opacity);
+    return tmat_to_ionmix_opacity(*tmat.opacity, mat.tmat_skip_lte_repair, mat.tmat_kirchhoff_pe);
   }
   if (mat.opacity_model == "table_nlte" || mat.opacity_model == "ionmix") {
     return load_ionmix_opacity(mat.opacity_file);

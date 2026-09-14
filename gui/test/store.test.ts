@@ -62,6 +62,12 @@ class FakeBackend implements Backend {
   async writeLocalText(path: string, content: string): Promise<void> {
     this.localTextFiles[path] = content;
   }
+  async appConfigDir(): Promise<string> {
+    return "/home/fake/appconfig";
+  }
+  async assistHarnessDir(): Promise<string> {
+    return "/app/resources/tools/assist";
+  }
   async exec(_p: ServerProfile, argv: string[]) {
     this.execs.push(argv);
     return this.execResult;

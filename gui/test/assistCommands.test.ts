@@ -1,16 +1,21 @@
 import { describe, expect, it } from "vitest";
 import type { ServerProfile } from "@tenryu-common/core/profiles";
 import {
+  buildAskScript,
   buildCancelScript,
   buildEchoHomeScript,
   buildEnvPrefix,
+  buildFileExistsScript,
   buildGenerateScript,
   buildLatestOutputDirScript,
+  buildMirrorProbeScript,
+  buildMirrorSyncScript,
   buildMkdirScript,
   buildProbeAssistScript,
   buildRemoteAssistScript,
   buildRemoteWrapperEnv,
   buildStatusScript,
+  MIRROR_PATHS,
 } from "../src/core/assist/commands";
 
 const BASE_OPTS =
@@ -122,6 +127,7 @@ describe("buildGenerateScript", () => {
         intentPath: "/tmp/assist run/intent.json",
         tenryuArg: "tools/assist/tenryu_remote.sh",
         env: { B: "y z", A: "x" },
+        configPath: "/Users/me/Library/Application Support/assistant.toml",
       }),
     ).toBe(
       "cd '/Users/me/TENRYU repo' && env A=x B='y z' " +
@@ -129,7 +135,8 @@ describe("buildGenerateScript", () => {
         "'/tmp/assist run/spec.md' --out-deck '/tmp/assist run/out_deck.py' " +
         "--tenryu tools/assist/tenryu_remote.sh --workdir '/tmp/assist run' " +
         "--max-iters 7 --template '/tmp/assist run/template.py' " +
-        "--intent '/tmp/assist run/intent.json'",
+        "--intent '/tmp/assist run/intent.json' " +
+        "--config-or-defaults '/Users/me/Library/Application Support/assistant.toml'",
     );
   });
 
@@ -145,11 +152,13 @@ describe("buildGenerateScript", () => {
         intentPath: null,
         tenryuArg: "/repo/build/tenryu",
         env: {},
+        configPath: "/c/assistant.toml",
       }),
     ).toBe(
       "cd /repo && python3 tools/assist/assist.py generate-deck /tmp/spec.md " +
         "--out-deck /tmp/out.py --tenryu /repo/build/tenryu " +
-        "--workdir /tmp/work --max-iters 5",
+        "--workdir /tmp/work --max-iters 5 " +
+        "--config-or-defaults /c/assistant.toml",
     );
   });
 
@@ -163,6 +172,7 @@ describe("buildGenerateScript", () => {
       intentPath: null,
       tenryuArg: "/repo/build/tenryu",
       env: {},
+      configPath: "/c/assistant.toml",
     };
 
     expect(buildGenerateScript({ ...base, maxIters: 0 })).toContain(
@@ -174,7 +184,76 @@ describe("buildGenerateScript", () => {
   });
 });
 
+describe("buildAskScript", () => {
+  it("builds the local question-answering command", () => {
+    expect(
+      buildAskScript({
+        localRepo: "/Users/me/TENRYU repo",
+        workdir: "/tmp/ask run",
+        questionPath: "/tmp/ask run/question_1.md",
+        configPath: "/Users/me/Library/Application Support/assistant.toml",
+      }),
+    ).toBe(
+      "cd '/Users/me/TENRYU repo' && python3 tools/assist/assist.py ask --json " +
+        "--workdir '/tmp/ask run' --question-file '/tmp/ask run/question_1.md' " +
+        "--config-or-defaults '/Users/me/Library/Application Support/assistant.toml'",
+    );
+  });
+});
+
 describe("assistant shell-script builders", () => {
+  it("builds the mirror sync and probe scripts", () => {
+    expect(
+      buildMirrorSyncScript({
+        host: "user@parma",
+        sshOpts: `${BASE_OPTS} -p 2222`,
+        serverRepoRoot: "/srv/TENRYU",
+        mirrorRoot: "/home/me/Library/Application Support/x/mirror/p1",
+        harnessDir: "/Applications/TENRYU Studio.app/Contents/Resources/tools/assist",
+      }),
+    ).toBe(
+      "tmp='/home/me/Library/Application Support/x/mirror/p1.tmp' && " +
+        "dst='/home/me/Library/Application Support/x/mirror/p1' && rm -rf \"$tmp\" && " +
+        "mkdir -p \"$tmp\" && (ssh -o BatchMode=yes -o ConnectTimeout=8 " +
+        "-o ServerAliveInterval=5 -p 2222 user@parma " +
+        "'cd /srv/TENRYU && tar -czf - --exclude=__pycache__ " +
+        "--exclude='\\''*.pdf'\\'' --exclude='\\''*.h5'\\'' " +
+        "--exclude='\\''*.prp'\\'' --exclude='\\''*.cn4'\\'' " +
+        "--exclude='\\''*.o'\\'' --exclude='\\''*.a'\\'' docs/site " +
+        "docs/SPECIFICATION.md docs/TUTORIAL_ja.md docs/OUTPUT_SCHEMA.md " +
+        "docs/POSTPROCESSING.md docs/NUMERICS.md docs/ARCHITECTURE.md " +
+        "docs/VERIFICATION.md docs/sections examples tools/mesh_planner.py " +
+        "src 2>/dev/null' || true) | tar -xzf - -C \"$tmp\"; " +
+        "rm -rf \"$tmp/tools/assist\" && mkdir -p \"$tmp/tools\" && " +
+        "cp -R '/Applications/TENRYU Studio.app/Contents/Resources/tools/assist' " +
+        "\"$tmp/tools/assist\" && missing=\"\"; for f in docs/SPECIFICATION.md " +
+        "docs/site/ja/index.html src/core/namelist/builder.cpp; do " +
+        "test -f \"$tmp/$f\" || missing=\"$missing $f\"; done; " +
+        "if [ -n \"$missing\" ]; then echo \"MISSING:$missing\"; exit 3; fi; " +
+        "test -f \"$tmp/tools/assist/assist.py\" || { echo " +
+        "\"MISSING: bundled tools/assist/assist.py\"; exit 4; }; rm -rf \"$dst\" && " +
+        "mv \"$tmp\" \"$dst\" && echo MIRROR_OK",
+    );
+    expect(MIRROR_PATHS).not.toContain("tools/assist");
+    expect(
+      buildMirrorProbeScript("/home/me/Library/Application Support/x/mirror/p1"),
+    ).toBe(
+      "test -f '/home/me/Library/Application Support/x/mirror/p1'/tools/assist/assist.py && echo MIRROR_OK",
+    );
+  });
+
+  it("quotes the repository path inside the ssh remote command", () => {
+    expect(
+      buildMirrorSyncScript({
+        host: "parma",
+        sshOpts: BASE_OPTS,
+        serverRepoRoot: "/srv/TENRYU checkout",
+        mirrorRoot: "/tmp/mirror",
+        harnessDir: "/tmp/harness",
+      }),
+    ).toContain(String.raw`'cd '\''/srv/TENRYU checkout'\'' && tar -czf -`);
+  });
+
   it("builds the cancel script", () => {
     expect(buildCancelScript("/tmp/assist run")).toBe(
       "pkill -f -- '/tmp/assist run' 2>/dev/null || true",
@@ -207,10 +286,12 @@ describe("assistant shell-script builders", () => {
     );
   });
 
-  it("builds the local status command", () => {
-    expect(buildStatusScript("/Users/me/TENRYU repo")).toBe(
-      "cd '/Users/me/TENRYU repo' && python3 tools/assist/assist.py status",
-    );
+  it("always passes --config-or-defaults", () => {
+    expect(
+      buildStatusScript("/r", "/c/assistant.toml").endsWith(
+        " --config-or-defaults /c/assistant.toml",
+      ),
+    ).toBe(true);
   });
 
   it("builds mkdir and HOME lookup scripts", () => {
@@ -218,5 +299,6 @@ describe("assistant shell-script builders", () => {
       "mkdir -p '/tmp/assist run'",
     );
     expect(buildEchoHomeScript()).toBe('echo "$HOME"');
+    expect(buildFileExistsScript("/a b/assistant.toml")).toBe("test -f '/a b/assistant.toml' && echo FILE_OK");
   });
 });

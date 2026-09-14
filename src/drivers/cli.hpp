@@ -6,6 +6,11 @@
 
 namespace tenryu::core {
 struct Config;
+#if TENRYU_ENABLE_PYTHON
+namespace namelist {
+class Builder;
+}
+#endif
 }
 
 namespace tenryu::drivers {
@@ -20,6 +25,14 @@ void configure_logging(const CliOptions& options);
 void setup_file_logging(const std::string& log_dir);
 
 void validate_s2_multiblock_runtime_features(const tenryu::core::Config& cfg);
+
+#if TENRYU_ENABLE_PYTHON
+std::string build_mesh_requirement_json_for_config(
+    const tenryu::core::Config& cfg,
+    const tenryu::core::namelist::Builder& builder,
+    bool* violated_out,
+    std::string* violation_message_out);
+#endif
 
 int cmd_run(const std::string& namelist_path,
             const std::string& restart_prefix = "",

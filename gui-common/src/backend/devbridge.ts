@@ -207,4 +207,14 @@ export class DevBridgeBackend implements Backend {
   async writeLocalText(path: string, content: string): Promise<void> {
     await this.post("/api/write-file", { path, content });
   }
+
+  async appConfigDir(): Promise<string> {
+    const r = await this.get<{ dir: string }>("/api/app-config-dir");
+    return r.dir.replace(/\/+$/, "");
+  }
+
+  async assistHarnessDir(): Promise<string> {
+    const r = await this.get<{ dir: string }>("/api/assist-harness-dir");
+    return r.dir.replace(/\/+$/, "");
+  }
 }

@@ -1,4 +1,6 @@
 #include "radiation/fld_1d_gpu.cuh"
+#include "radiation/fld_anderson.cuh"
+#include "core/nvtx_range.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -25,6 +27,7 @@
 #include "core/error.hpp"
 #include "core/kernel_guard.hpp"
 #include "materials/eos_device_table.hpp"
+#include "materials/eos_cell_table_selector.cuh"
 #include "materials/eos_table.hpp"
 #include "materials/ionmix_reader.cuh"
 #include "materials/ionmix_reader.hpp"
@@ -43,6 +46,47 @@ namespace {
 
 constexpr double kPi = 3.141592653589793238462643383279502884;
 constexpr int kBlock = 256;
+
+struct OuterSnapshotSpan {
+  std::uint8_t* field;
+  std::size_t offset;
+  std::size_t bytes;
+};
+
+struct OuterSnapshotTable {
+  static constexpr int kCapacity = 32;
+  OuterSnapshotSpan spans[kCapacity];
+};
+
+// Pass the small descriptor table as kernel arguments, avoiding a descriptor
+// upload and one CUDA API call for every speculative-state field.
+__global__ void copy_outer_snapshot_kernel(const OuterSnapshotTable table,
+                                           std::uint8_t* arena,
+                                           const bool restore) {
+  const OuterSnapshotSpan span = table.spans[blockIdx.x];
+  if (span.bytes == 0U) {
+    return;
+  }
+  const auto* src = restore ? arena + span.offset : span.field;
+  auto* dst = restore ? span.field : arena + span.offset;
+  const std::size_t first = blockIdx.y * blockDim.x + threadIdx.x;
+  const std::size_t stride = gridDim.y * blockDim.x;
+  const bool aligned = span.bytes % sizeof(unsigned long long) == 0U &&
+      reinterpret_cast<std::uintptr_t>(src) % alignof(unsigned long long) == 0U &&
+      reinterpret_cast<std::uintptr_t>(dst) % alignof(unsigned long long) == 0U;
+  if (aligned) {
+    const auto* words_src = reinterpret_cast<const unsigned long long*>(src);
+    auto* words_dst = reinterpret_cast<unsigned long long*>(dst);
+    for (std::size_t i = first; i < span.bytes / sizeof(unsigned long long);
+         i += stride) {
+      words_dst[i] = words_src[i];
+    }
+  } else {
+    for (std::size_t i = first; i < span.bytes; i += stride) {
+      dst[i] = src[i];
+    }
+  }
+}
 
 inline void cuda_check(const cudaError_t err, const char* message) {
   TENRYU_ASSERT(err == cudaSuccess, message);
@@ -330,6 +374,99 @@ materials::DeviceEOSTableView fld_electron_eos_device_view(
   return fld_electron_eos_table_cache().view_for(*tables);
 }
 
+// Per-material electron EOS device tables for the per-cell dominant-material
+// selection in the matter-update kernels (multi-material closure, 2026-09-14).
+// Every material's electron table is uploaded once (keyed on the Config's
+// triplet pointers) and a device array of views indexed by the Config
+// material slot is kept; materials without a table get an empty view.
+class FldMaterialElectronEOSCache {
+ public:
+  ~FldMaterialElectronEOSCache() {
+    if (d_views_ != nullptr) {
+      static_cast<void>(cudaFree(d_views_));
+    }
+  }
+
+  const materials::DeviceEOSTableView* device_views_for(const core::Config& cfg) {
+    const auto& mats = cfg.materials.materials;
+    std::vector<const materials::EOSTableTriplet*> keys(mats.size(), nullptr);
+    for (std::size_t m = 0; m < mats.size(); ++m) {
+      keys[m] = mats[m].eos_tables.get();
+    }
+    if (keys != keys_ || d_views_ == nullptr) {
+      tables_.clear();
+      tables_.resize(mats.size());
+      std::vector<materials::DeviceEOSTableView> host_views(mats.size());
+      for (std::size_t m = 0; m < mats.size(); ++m) {
+        if (mats[m].eos_tables) {
+          tables_[m].upload(mats[m].eos_tables->electron);
+        }
+        host_views[m] = tables_[m].view();
+      }
+      if (d_views_ != nullptr) {
+        cuda_check(cudaFree(d_views_), "FLD material electron view array free failed");
+        d_views_ = nullptr;
+      }
+      if (!host_views.empty()) {
+        cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_views_),
+                              host_views.size() * sizeof(materials::DeviceEOSTableView)),
+                   "FLD material electron view array alloc failed");
+        cuda_check(cudaMemcpy(d_views_, host_views.data(),
+                              host_views.size() * sizeof(materials::DeviceEOSTableView),
+                              cudaMemcpyHostToDevice),
+                   "FLD material electron view array H2D failed");
+      }
+      keys_ = keys;
+    }
+    return d_views_;
+  }
+
+  [[nodiscard]] int n_materials() const {
+    return static_cast<int>(keys_.size());
+  }
+
+ private:
+  std::vector<const materials::EOSTableTriplet*> keys_;
+  std::vector<materials::DeviceEOSTable> tables_;
+  materials::DeviceEOSTableView* d_views_ = nullptr;
+};
+
+FldMaterialElectronEOSCache& fld_material_electron_eos_cache() {
+  static FldMaterialElectronEOSCache cache;
+  return cache;
+}
+
+// Per-cell electron table selector for the matter-update kernels. Null
+// (selection disabled, kernels keep the first material's view) when the run
+// has at most one non-void material, no material has a table, or the
+// dominant-material index is not sized.
+materials::CellEOSTableSelector fld_cell_electron_table_selector(
+    core::State& state, const core::Config& cfg, const int n_cells) {
+  materials::CellEOSTableSelector selector;
+  int n_nonvoid = 0;
+  bool any_table = false;
+  for (const auto& m : cfg.materials.materials) {
+    if (!m.is_void) {
+      ++n_nonvoid;
+    }
+    if (m.eos_tables) {
+      any_table = true;
+    }
+  }
+  if (n_nonvoid <= 1 || !any_table || n_cells <= 0) {
+    return selector;
+  }
+  state.ensure_cell_material_props(cfg);
+  if (state.cell_material_index.size() != static_cast<std::size_t>(n_cells)) {
+    return selector;
+  }
+  auto& cache = fld_material_electron_eos_cache();
+  selector.electron_views = cache.device_views_for(cfg);
+  selector.n_materials = cache.n_materials();
+  selector.cell_material_index = state.cell_material_index.data();
+  return selector;
+}
+
 __device__ inline bool has_electron_eos_table(
     const materials::DeviceEOSTableView& electron_eos) {
   return electron_eos.n_rho > 0 && electron_eos.n_T > 0 &&
@@ -356,7 +493,7 @@ void ensure_nlte_table_uploaded(const core::Config& cfg,
     TENRYU_ASSERT(tmat.opacity.has_value(),
                   "FLD tmat opacity.model requires /opacity payload");
     cache.host = std::make_unique<materials::IonmixOpacityData>(
-        materials::tmat_to_ionmix_opacity(*tmat.opacity));
+        materials::tmat_to_ionmix_opacity(*tmat.opacity, mat.tmat_skip_lte_repair, mat.tmat_kirchhoff_pe));
   } else {
     cache.host = std::make_unique<materials::IonmixOpacityData>(
         materials::load_ionmix_opacity(mat.opacity_file));
@@ -424,7 +561,7 @@ void ensure_multimat_opacity_uploaded(const core::Config& cfg,
       TENRYU_ASSERT(tmat.opacity.has_value(),
                     "FLD tmat opacity.model requires /opacity payload");
       entry.host = std::make_unique<materials::IonmixOpacityData>(
-          materials::tmat_to_ionmix_opacity(*tmat.opacity));
+          materials::tmat_to_ionmix_opacity(*tmat.opacity, mat.tmat_skip_lte_repair, mat.tmat_kirchhoff_pe));
       if (cfg.radiation.group_repack_hard_xray) {
         std::vector<double> target_bounds = cfg.radiation.group_bounds_eV;
         if (target_bounds.empty()) {
@@ -705,7 +842,8 @@ __global__ void compute_fleck_for_fld_kernel(
     const double cv_e_override,
     const double* __restrict__ gamma_eff,
     const double* __restrict__ A_eff,
-    const materials::DeviceEOSTableView electron_eos,
+    const materials::DeviceEOSTableView electron_eos_first,
+    const materials::CellEOSTableSelector cell_tables,
     const int use_table_cv,
     const double temperature_floor_eV,
     const double* __restrict__ rad_E_old,
@@ -717,6 +855,8 @@ __global__ void compute_fleck_for_fld_kernel(
   if (c >= n_cells) {
     return;
   }
+  // Per-cell dominant-material electron table (multi-material closure, 2026-09-14).
+  const materials::DeviceEOSTableView electron_eos = cell_tables.electron(c, electron_eos_first);
   fld_1d_bodies::compute_fleck_for_fld_kernel_body(c, rho, Te, zbar, cell_is_void, sigma_a,
                                     state_cv_e, f_fleck, n_cells, n_groups, dt,
                                     alpha, cv_e_override, gamma_eff, A_eff,
@@ -1114,6 +1254,11 @@ __device__ inline void update_matter_body(
       // emits f*eta + (1-f)*c*sigma*E_old, so the matter must lose exactly
       // that blend — booking the unblended c*sigma*B here created
       // O((1-f)*c*sigma*dt*|E_old-B|) phantom energy per step.
+      // The re-emission term uses the ABSORPTION opacity sigma_pa, exactly as
+      // assemble_fld_tridiag_kernel_body sources it; sigma_pe (emission
+      // opacity) belongs only to the Planckian part. Booking it with sigma_pe
+      // (2026-07-03 .. 2026-09-14) destroyed (1-f)*c*(sigma_pe-sigma_pa)*E_old*dt
+      // per iteration wherever a TMAT table has sigma_pe != sigma_pa.
       double f = 1.0;
       double E_old_g = 0.0;
       if (fleck != nullptr) {
@@ -1123,7 +1268,7 @@ __device__ inline void update_matter_body(
                       : 0.0;
       }
       const double emit_g = f * core::constants::c_light * sigma_pe_g * B +
-                            (1.0 - f) * core::constants::c_light * sigma_pe_g *
+                            (1.0 - f) * core::constants::c_light * sigma_pa *
                                 E_old_g;
       s_F_g[g] = -(core::constants::c_light * sigma_pa * E - emit_g);
       s_dF_g[g] = f * core::constants::c_light * sigma_pe_g *
@@ -1226,7 +1371,7 @@ __device__ inline void update_matter_body(
         dt * V *
         (f * core::constants::c_light * sigma_pe_g * core::constants::a_eV *
              Tn4 * b +
-         (1.0 - f) * core::constants::c_light * sigma_pe_g * E_old_g);
+         (1.0 - f) * core::constants::c_light * sigma_pa * E_old_g);
   }
 }
 
@@ -1243,7 +1388,8 @@ __global__ void update_matter_kernel(
     const double* __restrict__ fleck,      // nullable [n_cells*n_groups]
     const double* __restrict__ rad_E_old,  // required when fleck != nullptr
     PlanckTableDeviceView planck,
-    materials::DeviceEOSTableView electron_eos,
+    materials::DeviceEOSTableView electron_eos_first,
+    const materials::CellEOSTableSelector cell_tables,
     double* __restrict__ Te,
     double* __restrict__ ee,
     double* __restrict__ Pe,
@@ -1267,6 +1413,8 @@ __global__ void update_matter_kernel(
   }
 
   extern __shared__ double smem[];
+  // Per-cell dominant-material electron table (multi-material closure, 2026-09-14).
+  const materials::DeviceEOSTableView electron_eos = cell_tables.electron(c, electron_eos_first);
   update_matter_body<EOS_TAIL>(
       c, tid, smem, rho, vol, zbar, cv_e, Te_old, sigma_a, sigma_pe, rad_E,
       fleck, rad_E_old, planck, electron_eos, Te, ee, Pe, rad_dep, rad_emit,
@@ -1351,7 +1499,7 @@ __device__ inline void exp_source_transfer_body(
   if (use_table) {
     double e_n;
     if constexpr (EOS_TAIL) {
-      e_n = fmax(finite_or_zero(ee[c]), 0.0);
+      e_n = finite_or_zero(ee[c]);  // signed table energies are valid (2026-09-14)
     } else {
       e_n = materials::device_eos_energy(
           electron_eos, br, eos_log_temperature(T_n, temperature_floor_eV));
@@ -1388,7 +1536,7 @@ __device__ inline void exp_source_transfer_body(
     }
     T_new = T;
     if constexpr (EOS_TAIL) {
-      ee[c] = fmax(e_n + q / rho_c, 0.0);
+      ee[c] = e_n + q / rho_c;
       const auto th = materials::device_eos_eval_with_high_t_tail(
           electron_eos, br, T_new, temperature_floor_eV);
       Pe[c] = th.P;
@@ -1433,12 +1581,15 @@ __global__ void exp_source_transfer_kernel(
     const double cv_e_override,
     const double* __restrict__ gamma_eff,
     const double* __restrict__ A_eff,
-    const materials::DeviceEOSTableView electron_eos,
+    const materials::DeviceEOSTableView electron_eos_first,
+    const materials::CellEOSTableSelector cell_tables,
     const double temperature_floor_eV) {
   const int c = blockIdx.x * blockDim.x + threadIdx.x;
   if (c >= n_cells) {
     return;
   }
+  // Per-cell dominant-material electron table (multi-material closure, 2026-09-14).
+  const materials::DeviceEOSTableView electron_eos = cell_tables.electron(c, electron_eos_first);
   exp_source_transfer_body<EOS_TAIL>(
       c, rho, vol, zbar, state_cv_e, cell_is_void, sigma_a, rad_E, Te, ee, Pe,
       rad_dep, rad_emit, delta_T_rel, n_cells, dt, cv_e_override, gamma_eff,
@@ -1678,7 +1829,7 @@ __device__ inline void exp_mg_source_transfer_body(
       if (use_table) {
         double e_n;
         if constexpr (EOS_TAIL) {
-          e_n = fmax(finite_or_zero(ee[c]), 0.0);
+          e_n = finite_or_zero(ee[c]);  // signed table energies are valid (2026-09-14)
         } else {
           e_n = materials::device_eos_energy(
               electron_eos, br, eos_log_temperature(T_n, temperature_floor_eV));
@@ -1715,7 +1866,7 @@ __device__ inline void exp_mg_source_transfer_body(
         }
         T_new = T;
         if constexpr (EOS_TAIL) {
-          ee[c] = fmax(e_new, 0.0);
+          ee[c] = e_new;
           const auto th = materials::device_eos_eval_with_high_t_tail(
               electron_eos, br, T_new, temperature_floor_eV);
           Pe[c] = th.P;
@@ -1782,7 +1933,8 @@ __global__ void exp_mg_source_transfer_kernel(
     const double cv_e_override,
     const double* __restrict__ gamma_eff,
     const double* __restrict__ A_eff,
-    const materials::DeviceEOSTableView electron_eos,
+    const materials::DeviceEOSTableView electron_eos_first,
+    const materials::CellEOSTableSelector cell_tables,
     const PlanckTableDeviceView planck,
     const double temperature_floor_eV,
     const Phi1PoleSet poles) {
@@ -1790,6 +1942,8 @@ __global__ void exp_mg_source_transfer_kernel(
   if (c >= n_cells) {
     return;
   }
+  // Per-cell dominant-material electron table (multi-material closure, 2026-09-14).
+  const materials::DeviceEOSTableView electron_eos = cell_tables.electron(c, electron_eos_first);
   exp_mg_source_transfer_body<EOS_TAIL>(
       c, rho, vol, zbar, state_cv_e, cell_is_void, sigma_a, rad_E, Te, ee, Pe,
       rad_dep, rad_emit, delta_T_rel, reject_count, reject_info, reject_vals,
@@ -2421,6 +2575,8 @@ void evaluate_fld_opacity_and_emission(
                             cudaMemcpyHostToDevice),
                  "FLD Fleck copy cell_is_void failed");
     }
+    const materials::CellEOSTableSelector cell_tables =
+        fld_cell_electron_table_selector(state, cfg, n_cells);
     const int fleck_grid = (n_cells + kBlock - 1) / kBlock;
     if (fleck_grid > 0) {
       // Diagnostic-only hook (W-I dt-sensitivity isolation): scales the
@@ -2450,6 +2606,7 @@ void evaluate_fld_opacity_and_emission(
           (mat.hydro_eos_backend != "exact_ideal_gas")
               ? fld_electron_eos_device_view(mat.eos_tables.get())
               : materials::DeviceEOSTableView{},
+          cell_tables,
           (fld.fleck_cv_source == "table") ? 1 : 0,
           cfg.numerics.floors.Te,
           state.rad_E.data(),
@@ -2832,6 +2989,7 @@ void advance_radiation_step_fld_1d(
     const PlanckTable& planck,
     const core::Config::MaterialsConfig::MatDef& mat,
     const double dt) {
+  const core::NvtxRange nvtx_range("radiation.fld_1d");
   TENRYU_ASSERT(cfg.radiation.mode == core::RadiationMode::MultigroupDiffusion,
                 "advance_radiation_step_fld_1d requires multigroup_diffusion mode");
   TENRYU_ASSERT(state.mesh.dim == 1 || cfg.main.dimension == "1D_SPH",
@@ -2858,6 +3016,8 @@ void advance_radiation_step_fld_1d(
   // Matter coupling consumes the shared per-cell effective properties (multi-material fix)
   // properties (radiation can run with hydro disabled, so ensure here too).
   state.ensure_cell_material_props(cfg);
+  const materials::CellEOSTableSelector cell_tables =
+      fld_cell_electron_table_selector(state, cfg, static_cast<int>(state.rho.size()));
 
   const int cell_grid = (n_cells + kBlock - 1) / kBlock;
   if (cell_grid > 0) {
@@ -3036,6 +3196,7 @@ void advance_radiation_step_fld_1d(
               (mat.hydro_eos_backend != "exact_ideal_gas")
                   ? fld_electron_eos_device_view(mat.eos_tables.get())
                   : materials::DeviceEOSTableView{},
+              cell_tables,
               cfg.numerics.floors.Te);
         } else {
           exp_source_transfer_kernel<false><<<cell_grid, kBlock>>>(
@@ -3062,6 +3223,7 @@ void advance_radiation_step_fld_1d(
               (mat.hydro_eos_backend != "exact_ideal_gas")
                   ? fld_electron_eos_device_view(mat.eos_tables.get())
                   : materials::DeviceEOSTableView{},
+              cell_tables,
               cfg.numerics.floors.Te);
         }
         cuda_check(cudaGetLastError(), "FLD exp source kernel launch failed");
@@ -3119,6 +3281,7 @@ void advance_radiation_step_fld_1d(
               (mat.hydro_eos_backend != "exact_ideal_gas")
                   ? fld_electron_eos_device_view(mat.eos_tables.get())
                   : materials::DeviceEOSTableView{},
+              cell_tables,
               planck.device_view(),
               cfg.numerics.floors.Te,
               poles);
@@ -3151,6 +3314,7 @@ void advance_radiation_step_fld_1d(
               (mat.hydro_eos_backend != "exact_ideal_gas")
                   ? fld_electron_eos_device_view(mat.eos_tables.get())
                   : materials::DeviceEOSTableView{},
+              cell_tables,
               planck.device_view(),
               cfg.numerics.floors.Te,
               poles);
@@ -3227,8 +3391,33 @@ void advance_radiation_step_fld_1d(
         std::getenv("TENRYU_FLD_OUTER_NO_PIPELINE");
     const bool outer_pipeline_disabled =
         outer_no_pipeline_env != nullptr && std::atoi(outer_no_pipeline_env) != 0;
+    // Anderson acceleration of the outer fixed-point iteration (namelist
+    // outer_accel="anderson"; 1D port of the 2D_RZ scheme, 2026-09-14).
+    // The mixing rewrites Te between outer iterations, which the pipelined
+    // loop (convergence check overlapped with the next iteration) cannot
+    // host, so the plain loop is used whenever the acceleration is on.
+    const bool aa_enabled = fld.outer_accel == "anderson" && n_cells > 0;
+    const int aa_m = std::min(std::max(fld.anderson_m, 1), fld_anderson::kMaxHistory);
+    const double aa_beta = fld.anderson_beta;
+    const std::size_t aa_bytes = sizeof(double) * static_cast<std::size_t>(n_cells);
+    fld_anderson::Ring aa_ring;
+    double* aa_scalar = nullptr;
+    if (aa_enabled) {
+      static const char* const kAaUTags[fld_anderson::kMaxHistory + 1] = {
+          "fld1d:aa_u0", "fld1d:aa_u1", "fld1d:aa_u2", "fld1d:aa_u3", "fld1d:aa_u4"};
+      static const char* const kAaFTags[fld_anderson::kMaxHistory + 1] = {
+          "fld1d:aa_f0", "fld1d:aa_f1", "fld1d:aa_f2", "fld1d:aa_f3", "fld1d:aa_f4"};
+      for (int s = 0; s < aa_m + 1; ++s) {
+        aa_ring.u[s] = static_cast<double*>(core::device_scratch_acquire(kAaUTags[s], aa_bytes));
+        aa_ring.f[s] = static_cast<double*>(core::device_scratch_acquire(kAaFTags[s], aa_bytes));
+      }
+      aa_ring.m = aa_m;
+      aa_ring.count = 0;
+      aa_scalar = static_cast<double*>(
+          core::device_scratch_acquire("fld1d:aa_scalar", sizeof(double)));
+    }
     const bool use_outer_pipeline =
-        pipeline_opacity_model && !outer_pipeline_disabled;
+        pipeline_opacity_model && !outer_pipeline_disabled && !aa_enabled;
     const bool has_nlte_clamp_counts =
         mat.opacity_model == "table_nlte" || mat.opacity_model == "tmat";
 
@@ -3282,6 +3471,7 @@ void advance_radiation_step_fld_1d(
               (mat.hydro_eos_backend != "exact_ideal_gas")
                   ? fld_electron_eos_device_view(mat.eos_tables.get())
                   : materials::DeviceEOSTableView{},
+              cell_tables,
               state.Te.data(),
               state.ee.data(),
               state.Pe.data(),
@@ -3315,6 +3505,7 @@ void advance_radiation_step_fld_1d(
               (mat.hydro_eos_backend != "exact_ideal_gas")
                   ? fld_electron_eos_device_view(mat.eos_tables.get())
                   : materials::DeviceEOSTableView{},
+              cell_tables,
               state.Te.data(),
               state.ee.data(),
               state.Pe.data(),
@@ -3346,6 +3537,12 @@ void advance_radiation_step_fld_1d(
 
     if (!use_outer_pipeline) {
       for (int iter = 0; iter < max_iter; ++iter) {
+        const int aa_slot = aa_enabled ? (iter % (aa_m + 1)) : 0;
+        if (aa_enabled) {
+          cuda_check(cudaMemcpy(aa_ring.u[aa_slot], state.Te.data(), aa_bytes,
+                                cudaMemcpyDeviceToDevice),
+                     "FLD1D AA snapshot u_k failed");
+        }
         launch_outer_iteration(iter, nullptr);
         const FldOuterCheck check =
             reduce_outer_check(state, n_cells, fld.outer_tol);
@@ -3359,6 +3556,13 @@ void advance_radiation_step_fld_1d(
         if (check.converged) {
           state.fld_converged = true;
           break;
+        }
+        if (aa_enabled && iter + 1 < max_iter) {
+          // Not converged and another iteration follows: mix the next
+          // linearization temperature (Te) from the residual history.
+          fld_anderson::record_and_mix(aa_ring, aa_slot, iter, state.Te.data(), n_cells,
+                                       aa_beta, cfg.numerics.floors.Te, aa_scalar);
+          cuda_check(cudaGetLastError(), "FLD1D AA mix launch failed");
         }
       }
     } else {
@@ -3452,34 +3656,31 @@ void advance_radiation_step_fld_1d(
         mutation_spans.push_back({d_nlte_clamp_counts, 3 * sizeof(int)});
       }
 
+      TENRYU_ASSERT(mutation_spans.size() <= OuterSnapshotTable::kCapacity,
+                    "FLD outer snapshot descriptor capacity exceeded");
+      OuterSnapshotTable snapshot_table{};
       std::size_t snapshot_bytes = 0U;
+      int snapshot_entries = 0;
+      constexpr std::size_t kSnapshotAlignment = alignof(unsigned long long);
       for (const MutationSpan& span : mutation_spans) {
+        snapshot_table.spans[snapshot_entries++] = {
+            static_cast<std::uint8_t*>(span.device_ptr), snapshot_bytes, span.bytes};
         snapshot_bytes += span.bytes;
+        snapshot_bytes = (snapshot_bytes + kSnapshotAlignment - 1U) &
+                         ~(kSnapshotAlignment - 1U);
       }
       auto* snapshot_arena = static_cast<std::uint8_t*>(
           core::device_scratch_acquire("fld1d:outer_pipeline_snapshots",
                                        kPipelineSlots * snapshot_bytes));
       const auto copy_snapshot = [&](const int slot,
                                      const bool restore) {
-        std::size_t offset = static_cast<std::size_t>(slot) * snapshot_bytes;
-        for (const MutationSpan& span : mutation_spans) {
-          void* const arena_ptr = snapshot_arena + offset;
-          cuda_check(
-              restore
-                  ? cudaMemcpyAsync(span.device_ptr,
-                                    arena_ptr,
-                                    span.bytes,
-                                    cudaMemcpyDeviceToDevice,
-                                    outer_stream)
-                  : cudaMemcpyAsync(arena_ptr,
-                                    span.device_ptr,
-                                    span.bytes,
-                                    cudaMemcpyDeviceToDevice,
-                                    outer_stream),
-              restore ? "FLD outer pipeline restore failed"
-                      : "FLD outer pipeline snapshot failed");
-          offset += span.bytes;
-        }
+        auto* const arena = snapshot_arena +
+                            static_cast<std::size_t>(slot) * snapshot_bytes;
+        copy_outer_snapshot_kernel<<<dim3(snapshot_entries, 4), kBlock, 0,
+                                     outer_stream>>>(snapshot_table, arena, restore);
+        cuda_check(cudaGetLastError(),
+                   restore ? "FLD outer pipeline restore failed"
+                           : "FLD outer pipeline snapshot failed");
       };
 
       for (int iter = 0; iter < max_iter; ++iter) {

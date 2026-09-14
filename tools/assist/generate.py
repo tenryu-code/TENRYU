@@ -29,6 +29,38 @@ Rules:
 FEEDBACK_HEADER = (
     "ITERATION-FEEDBACK (previous attempt failed validation; fix ONLY what is needed):"
 )
+FEEDBACK_KEY_ORDER = (
+    "validate", "lints", "intent_lock", "defaults_diff", "mesh_preview",
+    "resolution_requirement_summary",
+)
+
+
+def build_feedback_text(payload, limit=6000):
+    """Iteration feedback: priority-ordered lint payload without the full requirement object."""
+    if not isinstance(payload, dict):
+        return json.dumps(payload)[:limit]
+    ordered = {key: payload[key] for key in FEEDBACK_KEY_ORDER if key in payload}
+    for key in sorted(payload):
+        if key not in ordered and key != "mesh_requirement":
+            ordered[key] = payload[key]
+    return json.dumps(ordered)[:limit]
+
+
+REQUIREMENT_HEADER = "RESOLUTION REQUIREMENTS (deterministic; computed by the solver from the laser waveform, wavelength, target layering and geometry)"
+REQUIREMENT_GUIDE = """Interpretation: the numbers below are hard resolution targets for THIS deck's laser and target.
+Express them with the mesh vocabulary, never by hand-placed nodes:
+- use `zoning_intent` with a mass measure (`areal_mass`, or the geometry mass measure) and set
+  `resolution_requirement=dict(apply="enforce")` so the solver injects the recommended bands itself;
+- or, when you must write bands yourself, copy `bands_recommended` (r ranges and areal-mass
+  ceilings) into `zoning_intent.bands` using the measure conversion of the tenryu-mesh-1d skill;
+- give the budget the requirement needs (`n_cells`); if the budget is pinned and the solver
+  reports infeasibility, answer `UNCERTAIN:` instead of weakening a ceiling;
+- if you set `dr_min` (zoning_intent or auto_zone), keep it at or below the summary's
+  `dr_min_admissible_cm` (the ceilings imply thinner cells than a larger floor allows); a
+  larger floor is refused before solving as `MESH_RESOLUTION_REQUIREMENT_DR_MIN_CONFLICT`
+  whose message names the admissible value — lower or omit `dr_min`, never the requirement;
+- never set `resolution_requirement.enabled=False` and never raise `zones_per_scale_length` down or
+  `scale_length_factor` up to pass: the lint `resolution-requirement-disabled` is a hard failure."""
 
 
 def extract_deck(response_text: str):
@@ -79,12 +111,52 @@ def generate_deck(
     feedback = ""
     previous_deck = ""
     last_lint = None
+    requirement_context = None
+
+    if template_text is not None:
+        template_path = os.path.join(workdir, "template_input.py")
+        with open(template_path, "w", encoding="utf-8") as stream:
+            stream.write(template_text)
+        template_payload, _ = lint_fn(template_path)
+        if isinstance(template_payload, dict) and "error" in template_payload:
+            journal.append(
+                "template_lint_error",
+                {"error": template_payload["error"]},
+            )
+        elif isinstance(template_payload, dict):
+            summary = template_payload.get("resolution_requirement_summary")
+            if isinstance(summary, dict) and summary.get("applicable") is True:
+                requirement_context = (summary, "template")
 
     for i in range(max_iters):
+        if i > 0 and isinstance(last_lint, dict):
+            summary = last_lint.get("resolution_requirement_summary")
+            if isinstance(summary, dict) and summary.get("applicable") is True:
+                requirement_context = (summary, "iteration-{0}".format(i - 1))
+
         prompt = PROMPT_HEADER + "\n== SPEC ==\n" + spec_text
-        if template_text and i == 0:
+        if template_text is not None and i == 0:
             prompt += (
                 "\n== STARTING TEMPLATE (modify as needed) ==\n" + template_text
+            )
+        if requirement_context is not None:
+            summary, source = requirement_context
+            summary_text = json.dumps(summary, sort_keys=True)
+            prompt += (
+                "\n== "
+                + REQUIREMENT_HEADER
+                + " ==\n"
+                + REQUIREMENT_GUIDE
+                + "\n"
+                + summary_text
+            )
+            journal.append(
+                "requirement_context",
+                {
+                    "iteration": i,
+                    "source": source,
+                    "sha256": sha256_hex(summary_text),
+                },
             )
         if i > 0:
             prompt += (
@@ -169,7 +241,7 @@ def generate_deck(
                 "lint": payload,
             }
 
-        feedback = json.dumps(payload, sort_keys=True)[:6000]
+        feedback = build_feedback_text(payload)
         previous_deck = deck_text
 
     journal.append("generation_failed", {"iterations": max_iters})
@@ -195,7 +267,10 @@ def _read_text(path, label):
 def main_generate_deck(args, lint_fn=None) -> int:
     """CLI entry point for generate-deck."""
     try:
-        cfg = load_config(cli_path=args.config)
+        cfg = load_config(
+            cli_path=args.config,
+            optional_cli_path=getattr(args, "config_or_defaults", None),
+        )
     except (AssistConfigError, TomlSubsetError) as error:
         print("assist: config error: {0}".format(error), file=sys.stderr)
         return 2

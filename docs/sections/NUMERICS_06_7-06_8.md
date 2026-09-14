@@ -545,7 +545,13 @@ Newton には入れない。
 > \((1-f)c\sigma\Delta t\,|E^n-B|\) の幻エネルギーが毎 step 発生していた
 > （`fld_1d_volume_source_balance` gate が検出、修正で balance 残差
 > 7.9e-6 → 2.1e-10）。修正後の 1D kernel は Newton 残差・Jacobian・
-> `rad_emit` 記帳の全てで \(f\,c\sigma^{PE}B(T)+(1-f)c\sigma^{PE}E^n\) を使う
+> `rad_emit` 記帳の全てで \(f\,c\sigma^{PE}B(T)+(1-f)c\sigma^{PA}E^n\) を使う
+> （**2026-09-14 訂正**: 再放射項 \((1-f)c\sigma E^n\) の \(\sigma\) は E 方程式（上式）と同じ吸収
+> 不透明度 \(\sigma^{PA}\)。2026-07-03 の実装は物質側だけ \(\sigma^{PE}\) を使っており、\(\sigma^{PE}\ne\sigma^{PA}\)
+> の TMAT 表では \((1-f)c(\sigma^{PE}-\sigma^{PA})E^n\Delta t\) が毎反復消える不整合だった — §2 の
+> [2026-09-14 追補 2] 同日追加を参照。`update_matter_body`（`fld_1d_gpu.cu`）・`update_matter_body_persistent`
+> （`fld_1d_bodies.cuh`）・2D_RZ `update_matter_kernel`（`fld_2d_rz_gpu.cu`）の Newton 残差と `rad_emit`
+> 記帳を \(\sigma^{PA}\) に統一した。）
 > （実装は emission の \(B(T)\) を iterate ごとに再評価する — 凍結 \(S^{used}\)
 > と outer 収束点で一致）。付随修正 2 件: (i) assemble の \(f_c\) 参照は
 > `fleck[c]`（セル素 index）だったため \(G>1\) で誤要素を読んでいた —
@@ -556,6 +562,8 @@ Newton には入れない。
 > ため、標準 Fleck-Cummings \(f=1/(1+z)\)（\(zf\to1/\alpha\)）に一本化した。
 > 2D_RZ 側の同型監査（matter 側の \(f\) 整合・`fleck[c]` indexing・blend)は
 > 2D セッションへ引き継ぎ。
+> 2026-09-14: 2D_RZ の物質 Newton も同じ \(\sigma^{PE}\) 混同を持っていたため同時に \(\sigma^{PA}\) へ統一
+> （2D の `rad_emit` 記帳は元から assembly の source と同じ \(\sigma^{PA}\) だった）。
 
 > **W-I AFI モード（2026-07-03）**: `Radiation.multigroup_diffusion.fleck_mode="afi"` は Fleck ブレンドを消費点（assembly の擬似散乱項 + 物質側ブレンド）で無効化し、outer 反復（Picard）が完全陰的 emission \(c\sigma B(T^{n+1})\) を収束させる。Larsen, Kumar & Morel (JCP 238, 2013) により AFI 離散化は任意 \(\Delta t\) で一意解・最大原理・平衡拡散極限を満たす。実測（GXII FLD nr200）: Fleck 既定は生産 \(\Delta t\)（コロナ z≈3）で吸収エネルギーを z→0 極限比 ~35% 抑制し dt 依存が全 metric を汚染、AFI は生産 dt で極限の数%以内（dt×4 でも残差数%）。コロナの Picard 縮小率 ~z/(1+z)≈0.75 のため `max_outer_iterations >= 40` 推奨（未収束は rate-limited warning が出る）。既定は従来 `"fleck_cummings"`（golden 影響なし）。**既定は Fleck を維持（ユーザー決定 2026-07-04）** — AFI は namelist opt-in の検証・測定モードとして存続し、GXII golden の再基準化は行わない。dt 感度の定量（Fleck ~25% vs AFI 4.1%）は VERIFICATION §10.1 に記録済み。
 
@@ -564,10 +572,64 @@ hydro half step ごとに \(E_rV^{4/3}\) を保存する gamma_r=4/3 radiation c
 \(p_r=\sum_g E_g/3\) の force-side coupling を使う。
 Default flipped 2026-07-06, reverted same day (v1 defect), RE-ADOPTED same night after the v3 fix and fresh A/B (R2-1=A). Scope enforcement (2026-07-06): activation additionally requires mode=="multigroup_diffusion" (SnTransport excluded). (History) DEFAULT REVERTED to "none" the same day: the rebaseline combined audit measured cumulative unexplained energy +8.6e9 erg (~10% of absorbed) on the GXII FLD regression with coupling on vs +0.6e9 off — the v1 force-side p_r work and the exact-adiabat V^{4/3} field payment do not cancel at finite amplitude (shocks/AV), a defect class invisible to the smooth-adiabat and linear-ceff gates. Deck opt-outs on compatible_energy decks stay as explicit documentation. Re-adoption path: v2 work-consistent payment (same p_r_half, same swept dV_c on BOTH modes — the design-doc v2 ruling extended to non-compatible mode, whose "v1 stays bit-for-bit" assumption this audit falsified).
 
+
+[2026-09-08: mesh-motion conservation]
+An explicit `hydro_coupling="conservative_advection"` is available for
+1D Lagrangian FLD on the host-driven split loop (no ALE1D or persistent loop).
+It solves the passive comoving transport subproblem
+`D E_g / Dt = -E_g div(u)`, without radiation pressure force/work:
+`U_g = E_g V` is carried across each accepted hydro half-step and
+`E_g,new = E_g,old (V_old / V_new)` is published before the next radiation
+solve. Each cell/group uses its own actual volumes. There is no symmetry
+projection, smoothing, clipping, or redistribution, and unchanged volumes
+leave the field bitwise unchanged. Invalid volumes or nonfinite fields fail.
+Owned cells are updated and the existing 1D Allgatherv restores the replicated
+radiation line; full-step retry snapshots already include `rad_E`.
+The default and the existing `none`/`gamma_r_43` paths remain unchanged.
+
+This option is a reduced passive-field model, not complete moving-medium
+radiation hydrodynamics. With comoving radiation pressure enabled the grey
+energy law instead contains `-P_r:grad(u)`; isotropic pressure gives
+`D E / Dt = -(4/3) E div(u)`, and the gas must receive the equal/opposite
+discrete force work. The existing gamma mode pays the actual nodal work,
+`U_new = U_old - W_r`; its continuum adiabat is not an exact finite-step
+identity. Frequency-shift group coupling and a general lab-frame ALE flux
+are outside the new option.
+
+Historical `none` freezes energy density during mesh motion:
+`Delta U = sum_cg E_cg (V_new - V_old)`. For a closed spherical domain with
+uniform field and linear expansion ratio s this produces `U_new/U_old=s^3`.
+The existing `E_rad_mesh_advection` ledger measures that change, and
+`epsilon_budget` subtracts it; the adjusted epsilon is NOT a physical
+closed-system conservation test. With conservative advection that mesh term
+is zero to roundoff. A physical audit must show the unadjusted balance and
+actual external boundary fluxes separately. A lab-frame moving-control-volume
+formulation would require flux `F_lab - w E_lab` at every face; simply
+freezing a nonuniform cell field is not such a remap.
+
+Tests: `test_radiation_mesh_motion` exercises expanding/contracting planar
+and spherical ideal-gas domains, signed multigroup cell energies, stationary
+cells, owned windows, and active closed-domain diffusion.
+`examples/verification/radiation_mesh_advection.py` provides a standard
+table-free example with reflecting radiation boundaries.
+
 Cut-1a/2 では DSA/TSA 加速は使わない。
 収束判定は
 \(\max_c |\Delta T_{e,c}|/\max(T_{e,c},T_{floor}) <\)
 `Radiation.multigroup_diffusion.outer_tol` である。
+
+Anderson 加速（`outer_accel="anderson"`、`anderson_m`、`anderson_beta`; 2026-09-14 に 1D_SPH へ移植、
+実装は `fld_anderson.cuh`）: 2D_RZ と同じ Walker–Ni 形の混合を 1D の非パイプライン外側ループに適用する。
+各反復の入口で線形化温度 \(u_k=T_e\) を \(m+1\) 段の履歴環に写し、物質更新の出力 \(g_k\) から残差
+\(f_k=g_k-u_k\) を作り、収束せず次の反復へ進むときだけ最近 \(p\le m\) 個の差分 \(\Delta u_j,\Delta f_j\) で
+最小二乗（Tikhonov 正則化 \(10^{-12}\,\mathrm{tr}/p\)、Cholesky）した
+\(u_{k+1}=u_k+\beta f_k-\sum_j\gamma_j(\Delta u_j+\beta\Delta f_j)\) を次の線形化温度にする
+（`floors.Te` で床、非有限は生の Newton 出力、退化した最小二乗は混合なし）。収束判定は生の Newton 出力に
+対する上式のままで、収束時の状態は混合しない。有効時は外側ループのパイプライン化を使わない。動機:
+再放射項の統一と Kirchhoff 強制（§2 [2026-09-14 追補 2]）の後も、Planck 平均不透明度の急な温度依存で
+\(f(T)\) が急変する冷たいセルは逐次代入で 2 周期に落ちうる（NIF DS デッキ 1572 サイクル中 1 サイクル、
+セル 157 が 0.608↔0.641 eV、\(f=0.72\leftrightarrow0.92\)）。単体テスト `test_fld_anderson` は同一係数の
+線形写像（縮小・非縮小）で Anderson(1) が 1 回の混合で不動点に達することを検査する。
 
 2D_RZ FLD の deterministic tallies は
 `rad_dep[c,g]=Delta t V_c c sigma_PA E^{n+1}_{c,g}` と

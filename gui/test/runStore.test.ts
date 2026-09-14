@@ -73,6 +73,12 @@ class FakeRunBackend implements Backend {
   async writeLocalText(path: string, content: string): Promise<void> {
     this.localTextFiles[path] = content;
   }
+  async appConfigDir(): Promise<string> {
+    return "/home/fake/appconfig";
+  }
+  async assistHarnessDir(): Promise<string> {
+    return "/app/resources/tools/assist";
+  }
   async exec(_p: ServerProfile, argv: string[]): Promise<ExecResult> {
     if (argv[0] === "bash" && argv[1] === "-lc" && argv[2].includes("mesh_planner")) return { code: 0, stdout: "", stderr: "", timedOut: false };
     this.execLog.push(argv);

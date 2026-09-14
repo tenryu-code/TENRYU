@@ -543,6 +543,49 @@ py::dict serialize_mesh(const Config::MeshConfig& mesh) {
         serialize_double_list_17g(zoning.extra_events);
     out["zoning_intent"] = intent;
   }
+  if (mesh.resolution_requirement.detected) {
+    const auto& requirement = mesh.resolution_requirement;
+    py::dict rr;
+    rr["enabled"] = requirement.enabled;
+    rr["apply"] = requirement.apply;
+    rr["zones_per_scale_length"] = requirement.zones_per_scale_length;
+    rr["intensity_exponent"] =
+        serialize_double_17g(requirement.intensity_exponent);
+    rr["intensity_reference_W_cm2"] =
+        serialize_double_17g(requirement.intensity_reference_W_cm2);
+    rr["scale_length_factor"] =
+        serialize_double_17g(requirement.scale_length_factor);
+    rr["ablation_mass_safety"] =
+        serialize_double_17g(requirement.ablation_mass_safety);
+    rr["formation_ablated_fraction"] =
+        serialize_double_17g(requirement.formation_ablated_fraction);
+    rr["absorbed_fraction"] =
+        serialize_double_17g(requirement.absorbed_fraction);
+    rr["shock_cells_per_separation"] =
+        requirement.shock_cells_per_separation;
+    rr["shock_event_min_separation_frac"] =
+        serialize_double_17g(requirement.shock_event_min_separation_frac);
+    rr["min_cells_per_layer"] = requirement.min_cells_per_layer;
+    rr["zbar_override"] = serialize_double_17g(requirement.zbar_override);
+    rr["n_bands"] = requirement.n_bands;
+
+    py::list injected_bands;
+    for (const auto& band : requirement.injected_bands) {
+      py::dict b;
+      b["kind"] = band.kind;
+      b["measure_frac_begin"] =
+          serialize_double_17g(band.measure_frac_begin);
+      b["measure_frac_end"] = serialize_double_17g(band.measure_frac_end);
+      b["cell_measure_max"] = serialize_double_17g(band.cell_measure_max);
+      b["areal_mass_max_g_cm2"] =
+          serialize_double_17g(band.areal_mass_max_g_cm2);
+      b["r_lo_cm"] = serialize_double_17g(band.r_lo_cm);
+      b["r_hi_cm"] = serialize_double_17g(band.r_hi_cm);
+      injected_bands.append(std::move(b));
+    }
+    rr["injected_bands"] = std::move(injected_bands);
+    out["resolution_requirement"] = std::move(rr);
+  }
   if (mesh.auto_regions_axis != "r") {
     out["auto_regions_axis"] = mesh.auto_regions_axis;
   }
@@ -1315,6 +1358,8 @@ py::dict serialize_numerics(const Config::NumericsConfig& numerics) {
   py::dict hydro;
   hydro["enabled"] = numerics.hydro.enabled;
   hydro["compatible_energy"] = numerics.hydro.compatible_energy;
+  hydro["T_start_inactive_cells"] = numerics.hydro.T_start_inactive_cells;
+  hydro["qei_heat_capacity"] = numerics.hydro.qei_heat_capacity;
   hydro["rho_e_linear_grid"] = numerics.hydro.rho_e_linear_grid;
   hydro["eos_writeback"] = numerics.hydro.eos_writeback;
   hydro["eos_closure_mode"] = numerics.hydro.eos_closure_mode;

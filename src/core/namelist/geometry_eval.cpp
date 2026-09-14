@@ -7,6 +7,7 @@
 #include <numeric>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "core/error.hpp"
@@ -483,6 +484,51 @@ double eval_scalar_callable(const py::object& callable,
     return py::cast<double>(callable(r));
   }
   return py::cast<double>(callable(r, z));
+}
+
+InitialProfileSamples sample_initial_profile_at_centers(
+    const Config& cfg, const Builder& builder,
+    const std::vector<double>& nodes) {
+  InitialProfileSamples samples;
+  if (nodes.size() < 2U) {
+    return samples;
+  }
+
+  const py::object& rho_obj =
+      require_callable_object(builder, "Geometry.rho");
+  const int rho_nargs = infer_callable_args(rho_obj, false);
+  std::vector<std::pair<py::object, int>> volfrac_callables;
+  volfrac_callables.reserve(cfg.materials.materials.size());
+  for (const auto& material : cfg.materials.materials) {
+    const py::object& callable = require_callable_object(
+        builder, "Geometry.volfrac." + material.name);
+    volfrac_callables.emplace_back(callable,
+                                   infer_callable_args(callable, false));
+  }
+
+  const std::size_t n_cells = nodes.size() - 1U;
+  samples.rho.reserve(n_cells);
+  samples.material.reserve(n_cells);
+  for (std::size_t i = 0; i < n_cells; ++i) {
+    const double center = 0.5 * (nodes[i] + nodes[i + 1U]);
+    samples.rho.push_back(
+        eval_scalar_callable(rho_obj, rho_nargs, center, 0.0));
+
+    int dominant = -1;
+    double maximum = 0.0;
+    for (std::size_t material = 0; material < volfrac_callables.size();
+         ++material) {
+      const auto& [callable, nargs] = volfrac_callables[material];
+      const double fraction =
+          eval_scalar_callable(callable, nargs, center, 0.0);
+      if (fraction > maximum) {
+        maximum = fraction;
+        dominant = static_cast<int>(material);
+      }
+    }
+    samples.material.push_back(dominant);
+  }
+  return samples;
 }
 
 std::array<double, 2> eval_velocity_callable(const py::object& callable,

@@ -1063,7 +1063,7 @@ void ensure_nlte_table_uploaded(const core::Config& cfg,
     TENRYU_ASSERT(tmat.opacity.has_value(),
                   "FLD2D tmat opacity.model requires /opacity payload");
     cache.host = std::make_unique<materials::IonmixOpacityData>(
-        materials::tmat_to_ionmix_opacity(*tmat.opacity));
+        materials::tmat_to_ionmix_opacity(*tmat.opacity, mat.tmat_skip_lte_repair, mat.tmat_kirchhoff_pe));
   } else {
     cache.host = std::make_unique<materials::IonmixOpacityData>(
         materials::load_ionmix_opacity(mat.opacity_file));
@@ -3999,7 +3999,7 @@ __global__ void update_matter_kernel(
       }
       const double emit_g = f * core::constants::c_light * sigma_pe_g * B +
                             (1.0 - f) * core::constants::c_light *
-                                sigma_pe_g * E_old_g;
+                                sigma_pa * E_old_g;
       s_F_g[g] = -(dep_rate - emit_g);
       s_dF_g[g] = f * core::constants::c_light * sigma_pe_g * 4.0 *
                   core::constants::a_eV * T3 * b;
@@ -4079,7 +4079,7 @@ __global__ void update_matter_kernel(
           }
           const double emit_g = f * core::constants::c_light * sigma_pe_g * B +
                                 (1.0 - f) * core::constants::c_light *
-                                    sigma_pe_g * E_old_g;
+                                    sigma_pa * E_old_g;
           F_next += -(dep_rate - emit_g);
           S_residual = fmax(S_residual, fmax(fabs(emit_g), fabs(dep_rate)));
         }

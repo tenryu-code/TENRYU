@@ -1,4 +1,5 @@
 #include "laser/laser_mesh.cuh"
+#include "core/nvtx_range.hpp"
 #include "laser/laser_mesh_bodies.cuh"
 
 #include <algorithm>
@@ -341,6 +342,7 @@ DynamicMeshParams1D compute_dynamic_mesh_params_1d(
     const double r_max_factor,
     const double target_radius,
     const int nr_max) {
+  const core::NvtxRange nvtx_range("laser.dynamic_mesh");
   const int n_cells = static_cast<int>(rho.size());
   TENRYU_ASSERT(static_cast<int>(zbar.size()) == n_cells,
                 "compute_dynamic_mesh_params_1d zbar size mismatch");
@@ -1487,6 +1489,7 @@ LaserMesh create_from_config(const core::Config& cfg) {
 void build_hydro_mirror_1d(const LaserMesh& mesh,
                            const core::State& state,
                            HydroMirror1D& mirror) {
+  const core::NvtxRange nvtx_range("laser.hydro_mirror");
   TENRYU_ASSERT(state.mesh.dim == 1, "build_hydro_mirror_1d expects 1D_SPH state");
 
   mirror.rho.assign(state.rho.size(), 0.0);
@@ -1514,6 +1517,7 @@ void map_from_hydro_1d(LaserMesh& mesh,
                        const core::State& state,
                        const core::Config::LaserConfig& laser_cfg,
                        cudaStream_t stream) {
+  const core::NvtxRange nvtx_range("laser.map_hydro");
   HydroMirror1D hydro;
   build_hydro_mirror_1d(mesh, state, hydro);
   map_from_hydro_1d(mesh, state, laser_cfg, hydro, stream);
@@ -1524,6 +1528,7 @@ void map_from_hydro_1d(LaserMesh& mesh,
                        const core::Config::LaserConfig& laser_cfg,
                        const HydroMirror1D& hydro,
                        cudaStream_t stream) {
+  const core::NvtxRange nvtx_range("laser.map_hydro");
   TENRYU_ASSERT(mesh.is_allocated(), "map_from_hydro_1d requires allocated LaserMesh");
   TENRYU_ASSERT(state.mesh.dim == 1, "map_from_hydro_1d expects 1D_SPH state");
 

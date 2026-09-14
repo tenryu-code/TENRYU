@@ -46,8 +46,10 @@ constexpr int kExactOverridePressureAndCs = 6;
 constexpr int kExactOverridePTCs = 7;  // P+T+cs exact, cv from table
 constexpr int kExactOverrideNoWriteback = 8;  // skip ee writeback
 
+// Signed table energies (negative cold-curve values) are valid closure inputs;
+// only non-finite energies take the repair path (2026-09-14).
 __host__ __device__ inline bool energy_needs_repair(const double e) {
-  return !isfinite(e) || e < 0.0;
+  return !isfinite(e);
 }
 
 __host__ __device__ inline double energy_inverse_input(const double e) {
@@ -364,7 +366,12 @@ __device__ inline void enforce_2t_closure_kernel_body(
     Pe[i] = tenryu::materials::device_mie_gruneisen_pressure(mie_gruneisen, rho_i, e_e, true);
     return;
   }
-  if (tab_ion.n_rho > 0 && rho_i >= exp(tab_ion.log_rho_min)) {
+  // Below the table's density floor the bracket clamps to the lowest density
+  // row (same convention as the FLD matter update, the source injections and
+  // the temperature re-closure); the former switch to the ideal-gas branch
+  // disagreed with those evaluators and ratcheted the energy of expanding
+  // low-density cells (2026-09-14).
+  if (tab_ion.n_rho > 0) {
     const double e_i_raw = ei[i];
     const double e_e_raw = ee[i];
     const bool repair_i = energy_needs_repair(e_i_raw);
@@ -387,10 +394,10 @@ __device__ inline void enforce_2t_closure_kernel_body(
     record_inverse_reclose_status(inv_e, inverse_clamp_count, inverse_failure_count);
     const bool clamp_veto_i = energy_authoritative && !repair_i &&
         inv_i.bracket_failure == 0 &&
-        (inv_i.lower_clamp != 0 || inv_i.upper_clamp != 0);
+        (inv_i.lower_clamp != 0 || inv_i.upper_clamp != 0 || inv_i.floor_clamp != 0);
     const bool clamp_veto_e = energy_authoritative && !repair_e &&
         inv_e.bracket_failure == 0 &&
-        (inv_e.lower_clamp != 0 || inv_e.upper_clamp != 0);
+        (inv_e.lower_clamp != 0 || inv_e.upper_clamp != 0 || inv_e.floor_clamp != 0);
     if (!clamp_veto_i &&
         (allow_table_energy_writeback || repair_i ||
          inv_i.bracket_failure != 0 || inv_i.lower_clamp != 0 ||
@@ -594,7 +601,7 @@ __device__ inline void compute_sound_speed_2t_kernel_body(
     cs[i] = apply_exact_sound_speed_override(exact_override_kind, cs[i], rho_i, Pe[i], Pi[i]);
     return;
   }
-  if (tab_ion.n_rho > 0 && rho_i >= exp(tab_ion.log_rho_min)) {
+  if (tab_ion.n_rho > 0) {
     const auto rb_ion = tenryu::materials::find_rho_bracket(tab_ion, rho_i);
     const auto rb_ele = tenryu::materials::find_rho_bracket(tab_ele, rho_i);
     const double logTi = log(fmax(Ti[i], 1.0e-30));
@@ -962,18 +969,32 @@ __device__ inline void compute_q_1d_kernel_body(
          rho[i] * (c1_eff * dr * cs[i] * chi);
 }
 
+// rigid_inactive == 0 ("passive_fill"): a node is active when either adjacent
+// cell is active. rigid_inactive != 0 ("rigid_wall",
+// Numerics.hydro.T_start_inactive_cells): a node is active only when both
+// adjacent cells are active, so inactive cells hold their nodes and receive
+// no work; the outer boundary node follows the last cell.
 __device__ inline void compute_node_activity_kernel_body(
     const int i,
     std::uint8_t* __restrict__ node_active,
     const std::int8_t* __restrict__ hydro_active,
-    const int /*n_cells*/) {
+    const int n_cells,
+    const int rigid_inactive = 0) {
   const bool active = (hydro_active == nullptr) || (hydro_active[i] != 0);
   if (!active) {
     return;
   }
-
-  node_active[i] = 1u;
-  node_active[i + 1] = 1u;
+  if (rigid_inactive == 0 || hydro_active == nullptr) {
+    node_active[i] = 1u;
+    node_active[i + 1] = 1u;
+    return;
+  }
+  if (i == 0 || hydro_active[i - 1] != 0) {
+    node_active[i] = 1u;
+  }
+  if (i + 1 >= n_cells || hydro_active[i + 1] != 0) {
+    node_active[i + 1] = 1u;
+  }
 }
 
 __device__ inline void zero_center_node_kernel_body(
@@ -1359,7 +1380,11 @@ __device__ inline void energy_update_with_old_volume_2t_kernel_body(
     const int compatible_energy,
     double* __restrict__ eta_compatible,
     double* __restrict__ E_floor_injected,
-    int* __restrict__ clamp_count) {
+    int* __restrict__ clamp_count,
+    const double qei_multiplier = 1.0,
+    const double te_floor = 0.0,
+    const double ti_floor = 0.0,
+    const int energy_authoritative = 0) {
   const bool active = (hydro_active == nullptr) || (hydro_active[i] != 0);
   if (!active) {
     ee[i] = ee_old[i];
@@ -1397,10 +1422,57 @@ __device__ inline void energy_update_with_old_volume_2t_kernel_body(
       cv_e_arr != nullptr && cv_i_arr != nullptr) {
     qei_term = tenryu::materials::compute_qei_term_with_cv(
         rho_qei, fmax(Te_half[i], 0.0), fmax(Ti_half[i], 0.0), z, A,
-        fmax(cv_e_arr[i], 0.0), fmax(cv_i_arr[i], 0.0), dt);
+        fmax(cv_e_arr[i], 0.0), fmax(cv_i_arr[i], 0.0), dt, qei_multiplier);
   } else {
     qei_term = tenryu::materials::compute_qei_term_analytical(
-        rho_qei, fmax(Te_half[i], 0.0), fmax(Ti_half[i], 0.0), z, A, gamma, dt);
+        rho_qei, fmax(Te_half[i], 0.0), fmax(Ti_half[i], 0.0), z, A, gamma, dt,
+        qei_multiplier);
+  }
+
+  // Energy-authoritative bound on the exchange (2026-09-14): the transfer may
+  // not push either species below its table energy at the runtime floor (the
+  // admissible domain is [e(rho, T_floor), inf); signed table energies are
+  // valid). Evaluated on the post-work energies of this update. When the bound
+  // is inactive, qei_term and every expression below are unchanged.
+  if (energy_authoritative != 0 && tab_ion.n_rho > 0 && tab_ele.n_rho > 0 &&
+      te_floor > 0.0 && ti_floor > 0.0 && isfinite(qei_term) && qei_term != 0.0) {
+    double work_i = 0.0;
+    double work_e = 0.0;
+    const double q_work_b = -Q_half[i] * dV / m;
+    if (compatible_energy != 0) {
+      const double p_total_b = Pe_half[i] + Pi_half[i];
+      double electron_frac_b = 0.5;
+      if (fabs(p_total_b) > 0.0) {
+        electron_frac_b = Pe_half[i] / p_total_b;
+      }
+      const double pdv_total_b = -p_total_b * dV / m;
+      work_e += electron_frac_b * pdv_total_b;
+      work_i += (1.0 - electron_frac_b) * pdv_total_b;
+    } else {
+      work_i += -Pi_half[i] * dV / m;
+      work_e += -Pe_half[i] * dV / m;
+    }
+    if (q_heat_to_electron != 0) {
+      work_e += q_work_b;
+    } else {
+      work_i += q_work_b;
+    }
+    const double rho_floor_eval = fmax(rho_qei, 1.0e-30);
+    const auto rb_i_floor = tenryu::materials::find_rho_bracket(tab_ion, rho_floor_eval);
+    const auto rb_e_floor = tenryu::materials::find_rho_bracket(tab_ele, rho_floor_eval);
+    const double e_i_floor =
+        tenryu::materials::device_eos_energy(tab_ion, rb_i_floor, log(ti_floor));
+    const double e_e_floor =
+        tenryu::materials::device_eos_energy(tab_ele, rb_e_floor, log(te_floor));
+    const double qei_hi = fmax((ee_old[i] + work_e) - e_e_floor, 0.0);
+    const double qei_lo = fmin(-((ei_old[i] + work_i) - e_i_floor), 0.0);
+    const double qei_bounded = fmin(fmax(qei_term, qei_lo), qei_hi);
+    if (qei_bounded != qei_term) {
+      qei_term = qei_bounded;
+      if (clamp_count != nullptr) {
+        atomicAdd(clamp_count, 1);
+      }
+    }
   }
 
   // Q_ei applied as conservative transfer: +Q_ei to ions, -Q_ei to electrons

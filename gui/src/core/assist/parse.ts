@@ -47,8 +47,13 @@ export interface AssistStatusView {
   enabled: boolean;
   disabledBy: string | null;
   configSource: string | null;
+  providers: Array<{ name: string; command: string; model: string }>;
   /** roles joined with providers; model null when the provider is unknown/dry_run. */
   roles: Array<{ role: string; provider: string; model: string | null }>;
+  budget: {
+    maxInterventionsPerRun: number | null;
+    maxTokensPerDecision: number | null;
+  };
   warnings: string[];
 }
 
@@ -59,6 +64,22 @@ export function parseAssistStatus(stdout: string): Parsed<AssistStatusView> {
   const providers = isObject(parsed.data.providers)
     ? parsed.data.providers
     : {};
+  const providerViews = Object.entries(providers)
+    .flatMap(([name, value]) =>
+      isObject(value)
+        ? [
+            {
+              name,
+              command:
+                typeof value.command_template === "string"
+                  ? value.command_template
+                  : "",
+              model: typeof value.model === "string" ? value.model : "",
+            },
+          ]
+        : [],
+    )
+    .sort((left, right) => left.name.localeCompare(right.name));
   const roleValues = isObject(parsed.data.roles) ? parsed.data.roles : {};
   const roles = Object.entries(roleValues)
     .filter((entry): entry is [string, string] => typeof entry[1] === "string")
@@ -70,6 +91,7 @@ export function parseAssistStatus(stdout: string): Parsed<AssistStatusView> {
       return { role, provider, model };
     })
     .sort((left, right) => left.role.localeCompare(right.role));
+  const budget = isObject(parsed.data.budget) ? parsed.data.budget : {};
 
   return {
     ok: true,
@@ -77,7 +99,14 @@ export function parseAssistStatus(stdout: string): Parsed<AssistStatusView> {
       enabled: parsed.data.enabled === true,
       disabledBy: stringOrNull(parsed.data.disabled_by),
       configSource: stringOrNull(parsed.data.config_source),
+      providers: providerViews,
       roles,
+      budget: {
+        maxInterventionsPerRun: numberOrNull(
+          budget.max_interventions_per_run,
+        ),
+        maxTokensPerDecision: numberOrNull(budget.max_tokens_per_decision),
+      },
       warnings: stringArray(parsed.data.warnings),
     },
     raw: parsed.raw,
@@ -91,6 +120,26 @@ export interface DeckLintView {
     exitCode: number | null;
     stderrTail: string;
   };
+  requirement: {
+    applicable: boolean;
+    reason: string | null;
+    ablatorName: string | null;
+    rhoCGcc: number | null;
+    ablatedMassFraction: number | null;
+    tFormationS: number | null;
+    ceilingFormationGCm2: number | null;
+    checkOk: boolean | null;
+    ablationViolations: number | null;
+    ablationMaxRatio: number | null;
+    shockApplicable: boolean | null;
+    shockViolations: number | null;
+    bandsRecommended: Array<{
+      kind: string;
+      rLoCm: number | null;
+      rHiCm: number | null;
+      arealMassMaxGCm2: number | null;
+    }>;
+  } | null;
   meshPreview: Record<string, unknown> | null;
   lints: Array<{
     id: string;
@@ -113,6 +162,60 @@ export function parseDeckLint(stdout: string): Parsed<DeckLintView> {
   if (!parsed.ok) return parsed;
 
   const validate = isObject(parsed.data.validate) ? parsed.data.validate : {};
+  const requirementSummary = isObject(
+    parsed.data.resolution_requirement_summary,
+  )
+    ? parsed.data.resolution_requirement_summary
+    : null;
+  let requirement: DeckLintView["requirement"] = null;
+  if (requirementSummary !== null) {
+    const ablator = isObject(requirementSummary.ablator)
+      ? requirementSummary.ablator
+      : {};
+    const check = isObject(requirementSummary.check)
+      ? requirementSummary.check
+      : {};
+    const ablationCheck = isObject(check.ablation) ? check.ablation : {};
+    const shock = isObject(requirementSummary.shock)
+      ? requirementSummary.shock
+      : {};
+    const shockCheck = isObject(check.shock) ? check.shock : {};
+    const bandsRecommended = Array.isArray(
+      requirementSummary.bands_recommended,
+    )
+      ? requirementSummary.bands_recommended.flatMap((value) => {
+          if (!isObject(value) || typeof value.kind !== "string") return [];
+          return [
+            {
+              kind: value.kind,
+              rLoCm: numberOrNull(value.r_lo_cm),
+              rHiCm: numberOrNull(value.r_hi_cm),
+              arealMassMaxGCm2: numberOrNull(value.areal_mass_max_g_cm2),
+            },
+          ];
+        })
+      : [];
+    requirement = {
+      applicable: requirementSummary.applicable === true,
+      reason: stringOrNull(requirementSummary.reason),
+      ablatorName: stringOrNull(ablator.name),
+      rhoCGcc: numberOrNull(ablator.rho_c_gcc),
+      ablatedMassFraction: numberOrNull(
+        requirementSummary.ablated_mass_fraction,
+      ),
+      tFormationS: numberOrNull(requirementSummary.t_formation_s),
+      ceilingFormationGCm2: numberOrNull(
+        requirementSummary.ceiling_formation_g_cm2,
+      ),
+      checkOk: typeof check.ok === "boolean" ? check.ok : null,
+      ablationViolations: numberOrNull(ablationCheck.n_violations),
+      ablationMaxRatio: numberOrNull(ablationCheck.max_ratio),
+      shockApplicable:
+        typeof shock.applicable === "boolean" ? shock.applicable : null,
+      shockViolations: numberOrNull(shockCheck.n_violations),
+      bandsRecommended,
+    };
+  }
   const lints = Array.isArray(parsed.data.lints)
     ? parsed.data.lints.flatMap((value) => {
         if (
@@ -166,6 +269,7 @@ export function parseDeckLint(stdout: string): Parsed<DeckLintView> {
         stderrTail:
           typeof validate.stderr_tail === "string" ? validate.stderr_tail : "",
       },
+      requirement,
       meshPreview: isObject(parsed.data.mesh_preview)
         ? parsed.data.mesh_preview
         : null,
@@ -218,6 +322,66 @@ export function parseGenerateResult(stdout: string): Parsed<GenerateResultView> 
       deckPath: stringOrNull(parsed.data.deck_path),
       error: stringOrNull(parsed.data.error),
       lint: lintValue,
+    },
+    raw: parsed.raw,
+  };
+}
+
+export interface AskChecksView {
+  citationsVerified: string[];
+  citationsUnverified: Array<{ citation: string; reason: string }>;
+  keysKnown: string[];
+  keysUnknown: string[];
+}
+
+export interface AskResultView {
+  status: string;
+  answer: string | null;
+  turn: number | null;
+  workdir: string | null;
+  error: string | null;
+  checks: AskChecksView | null;
+}
+
+export function parseAskResult(stdout: string): Parsed<AskResultView> {
+  const parsed = parseJsonObject(stdout);
+  if (!parsed.ok) return parsed;
+  if (typeof parsed.data.status !== "string") {
+    return { ok: false, error: "missing status", raw: parsed.raw };
+  }
+
+  let checks: AskChecksView | null = null;
+  if (isObject(parsed.data.checks)) {
+    const citations = isObject(parsed.data.checks.citations)
+      ? parsed.data.checks.citations
+      : {};
+    const keys = isObject(parsed.data.checks.keys)
+      ? parsed.data.checks.keys
+      : {};
+    checks = {
+      citationsVerified: stringArray(citations.verified),
+      citationsUnverified: Array.isArray(citations.unverified)
+        ? citations.unverified
+            .filter(isObject)
+            .map((value) => ({
+              citation: String(value.citation ?? ""),
+              reason: String(value.reason ?? ""),
+            }))
+        : [],
+      keysKnown: stringArray(keys.known),
+      keysUnknown: stringArray(keys.unknown),
+    };
+  }
+
+  return {
+    ok: true,
+    data: {
+      status: parsed.data.status,
+      answer: stringOrNull(parsed.data.answer),
+      turn: numberOrNull(parsed.data.turn),
+      workdir: stringOrNull(parsed.data.workdir),
+      error: stringOrNull(parsed.data.error),
+      checks,
     },
     raw: parsed.raw,
   };

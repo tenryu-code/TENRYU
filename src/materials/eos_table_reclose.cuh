@@ -67,20 +67,16 @@ TENRYU_HOST_DEVICE inline double reclose_log_coordinate(
     const int n) {
   const double value_min = ::exp(log_grid[0]);
   const double value_max = ::exp(log_grid[n - 1]);
-  const double value_safe = ::isnan(value) ? value_min : value;
+  const double value_safe = std::isnan(value) ? value_min : value;
   const double value_clamped =
       reclose_clamp(value_safe, value_min, value_max);
   return ::log(value_clamped);
 }
 
-TENRYU_HOST_DEVICE inline double reclose_bilinear_log_interp(
-    const DeviceEOSTableView& table,
-    const double* values,
-    const double rho,
-    const double T_eV) {
-  const double x = reclose_log_coordinate(rho, table.log_rho_grid, table.n_rho);
-  const double y = reclose_log_coordinate(T_eV, table.log_T_grid, table.n_T);
-
+template <bool SeparateProducts = false>
+TENRYU_HOST_DEVICE inline double reclose_bilinear_at_log_coordinates(
+    const DeviceEOSTableView& table, const double* values,
+    const double x, const double y) {
   const RecloseBracket rb =
       reclose_bracket_index(table.log_rho_grid, table.n_rho, x);
   const RecloseBracket tb =
@@ -101,39 +97,61 @@ TENRYU_HOST_DEVICE inline double reclose_bilinear_log_interp(
   const double v01 = values[base1 + rb.lo];
   const double v11 = values[base1 + rb.hi];
 
+#if defined(__CUDA_ARCH__)
+  if constexpr (SeparateProducts) {
+    const double vx0 = __dadd_rn(v00, __dmul_rn(tx, v10 - v00));
+    const double vx1 = __dadd_rn(v01, __dmul_rn(tx, v11 - v01));
+    return __dadd_rn(vx0, __dmul_rn(ty, vx1 - vx0));
+  }
+#endif
   const double vx0 = v00 + tx * (v10 - v00);
   const double vx1 = v01 + tx * (v11 - v01);
   return vx0 + ty * (vx1 - vx0);
 }
 
+template <bool SeparateProducts = false>
+TENRYU_HOST_DEVICE inline double reclose_bilinear_log_interp(
+    const DeviceEOSTableView& table,
+    const double* values,
+    const double rho,
+    const double T_eV) {
+  const double x = reclose_log_coordinate(rho, table.log_rho_grid, table.n_rho);
+  const double y = reclose_log_coordinate(T_eV, table.log_T_grid, table.n_T);
+  return reclose_bilinear_at_log_coordinates<SeparateProducts>(table, values, x, y);
+}
+
+template <bool SeparateProducts = false>
 TENRYU_HOST_DEVICE inline double reclose_pressure(
     const DeviceEOSTableView& table,
     const double rho,
     const double T_eV) {
-  return reclose_bilinear_log_interp(table, table.P_table, rho, T_eV);
+  return reclose_bilinear_log_interp<SeparateProducts>(table, table.P_table, rho, T_eV);
 }
 
+template <bool SeparateProducts = false>
 TENRYU_HOST_DEVICE inline double reclose_energy(
     const DeviceEOSTableView& table,
     const double rho,
     const double T_eV) {
-  return reclose_bilinear_log_interp(table, table.e_table, rho, T_eV);
+  return reclose_bilinear_log_interp<SeparateProducts>(table, table.e_table, rho, T_eV);
 }
 
+template <bool SeparateProducts = false>
 TENRYU_HOST_DEVICE inline double reclose_cv(const DeviceEOSTableView& table,
                                              const double rho,
                                              const double T_eV) {
-  return reclose_bilinear_log_interp(table, table.cv_table, rho, T_eV);
+  return reclose_bilinear_log_interp<SeparateProducts>(table, table.cv_table, rho, T_eV);
 }
 
+template <bool SeparateProducts = false>
 TENRYU_HOST_DEVICE inline double reclose_temperature_from_energy(
     const DeviceEOSTableView& table,
     const double rho,
     const double e) {
   const double T_min = ::exp(table.log_T_grid[0]);
   const double T_max = ::exp(table.log_T_grid[table.n_T - 1]);
-  const double e_min = reclose_energy(table, rho, T_min);
-  const double e_max = reclose_energy(table, rho, T_max);
+  const double e_min = reclose_energy<SeparateProducts>(table, rho, T_min);
+  const double e_max = reclose_energy<SeparateProducts>(table, rho, T_max);
   if (e <= e_min) {
     return T_min;
   }
@@ -150,11 +168,19 @@ TENRYU_HOST_DEVICE inline double reclose_temperature_from_energy(
     return T_min;
   }
   const double alpha = (e - e_min) / de_span;
-  double T = reclose_clamp(T_min + alpha * (T_max - T_min), T_min, T_max);
+  double T;
+#if defined(__CUDA_ARCH__)
+  if constexpr (SeparateProducts) {
+    T = reclose_clamp(__dadd_rn(T_min, __dmul_rn(alpha, T_max - T_min)), T_min, T_max);
+  } else
+#endif
+  {
+    T = reclose_clamp(T_min + alpha * (T_max - T_min), T_min, T_max);
+  }
 
   for (int iter = 0; iter < 24; ++iter) {
-    const double e_curr = reclose_energy(table, rho, T);
-    const double cv_curr = reclose_max(reclose_cv(table, rho, T), kRecloseCvFloor);
+    const double e_curr = reclose_energy<SeparateProducts>(table, rho, T);
+    const double cv_curr = reclose_max(reclose_cv<SeparateProducts>(table, rho, T), kRecloseCvFloor);
     const double f = e_curr - e;
     if (::fabs(f) <= 1.0e-10 * reclose_max(::fabs(e), 1.0)) {
       break;
@@ -191,7 +217,7 @@ TENRYU_HOST_DEVICE inline RecloseThermo reclose_thermo_from_energy(
   const double rho_safe = reclose_max(rho, 1.0e-30);
   const double T_raw =
       reclose_temperature_from_energy(table, rho_safe, reclose_max(energy, 0.0));
-  const double T = (::isfinite(T_raw) && T_raw >= T_floor) ? T_raw : T_floor;
+  const double T = (std::isfinite(T_raw) && T_raw >= T_floor) ? T_raw : T_floor;
   return {T,
           reclose_energy(table, rho_safe, T),
           reclose_pressure(table, rho_safe, T),

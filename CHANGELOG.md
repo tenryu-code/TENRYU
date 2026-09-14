@@ -2,6 +2,52 @@
 
 配布スナップショットの更新記録です。日付はスナップショット作成日。
 
+## 2026-09-15
+
+### 不具合修正
+
+- **FLD の Fleck 線形化（1D_SPH / 2D_RZ）: 物質更新の再放射項が放射側と違う不透明度を使っていた。** 放射の E 方程式は実効散乱を \((1-f)c\sigma^{PA}E^n\)（吸収不透明度）で戻すのに、物質側の Newton 残差と `rad_emit` 記帳は 2026-07-03 以来 \(\sigma^{PE}\)（放射不透明度）を使っていました。\(\sigma^{PE}\ne\sigma^{PA}\) の TMAT 表では毎反復 \((1-f)c(\sigma^{PE}-\sigma^{PA})E^n\Delta t\) のエネルギーが消え、冷たいセルの外側反復が 2 周期で振動していました。1D の物質更新・persistent loop 版・2D_RZ の物質 Newton を \(\sigma^{PA}\) に統一（灰色・定数不透明度では算術不変）。単体テスト（`test_fld_fleck_beta` の blend ケース）を追加（NUMERICS §6.7 の注記を訂正）。
+- **1D hydro の compatible energy 更新で、自由境界の ghost Q が 2026-08-04 以降 0 になっていた。** 運動量式は境界セルの Q をゼロ勾配コピーした ghost を使うのに、エネルギー更新側だけ ghost が 0 になり、自由境界セルに人工粘性があると毎ステップ \(Q_{N-1}A\bar u\Delta t\) のエネルギーが生成されていました。`test_hydro_1d_step` の VNR 試験の失敗を bisect で特定し、FREE 分岐を復元。影響は `compatible_energy=True` かつ `boundary_1d="free"` の run のみ。
+- **符号付き表エネルギーの許容域を 1D の全評価器で統一（energy_authoritative モード）。** cold curve が負の表エネルギー（PROPACEOS 由来表の低温側）を、伝導の増分・閉包の修復・FLD の末尾経路・Qei・注入の床分岐が 0 へ切り上げ／床へ埋め戻していたため、冷たい多材料デッキ（液体 D2 + CH）で静止セルのイオンエネルギーが毎サイクル生成されていました。許容域を \([e(\rho,T_{\rm floor}),\infty)\) に統一し（修復は非有限のみ、`floor_clamp` の拒否、Qei は両方向を床上エネルギーで制限、注入の床分岐は温度のみ）、`qei_multiplier` を hydro カーネルにも配線。legacy モードの算術は不変。
+- **多材料の 1D 閉包が先頭材料の表に固定されていた。** hydro の EOS 閉包・音速・2T エネルギー更新、輻射の物質更新、Qei、レーザー／燃焼の入射、伝導の再閉包、初期化を各セルの支配材料の表で閉じるようにしました。表の密度下限未満は理想気体へ切り替えず最下行へクランプ。再閉包の表天井キャッシュは Config の表で鍵付け。
+- `Materials.materials[].opacity.tmat_skip_lte_repair` が namelist 検証時の変換にしか効いておらず、実行時の表再読み込み（FLD 1D/2D・S_N 1D/2D・IMC・persistent loop・硬 X 線診断）では常に修復が適用されていました。全読み込み点へ配線。
+- 表 EOS の音速テスト（`test_hydro_table_eos`）の期待値を、2026-07-26 の解析的局所微分（log 双線形補間の微分は格子節点で 1 次誤差）に合わせて更新（節点 5 %、log 中点 1 % の 2 段検査）。実装は不変。
+- gxii 1D FLD 回帰の golden を、文書化済みの既定変更（Langdon 既定 ON など）の後に再基準化。
+
+### 機能追加
+
+- **1D FLD 外側反復の Anderson 加速。** `Radiation.multigroup_diffusion.outer_accel="anderson"`（`anderson_m`, `anderson_beta`）を 2D_RZ から 1D_SPH へ移植（`src/radiation/fld_anderson.cuh`、有効時は外側ループのパイプライン化を使わない）。既定 `"none"` は従来どおり。Planck 平均不透明度の温度依存が急な冷たいセルで逐次代入が 2 周期に落ちる場合の対策で、NIF DS デッキ 3 ns（1572 サイクル）の未収束を 0 にしました。単体テスト `test_fld_anderson`。
+- **`Materials.materials[].opacity.tmat_kirchhoff_pe`（既定 False）。** True で TMAT 読み込み時に全ノード・全群で \(\kappa_{PE}:=\kappa_{PA}\)（Kirchhoff の法則）。PROPACEOS 由来の表は各群の Wien 裾で \(\kappa_{PE}\) が 1e-99 へアンダーフローしたり \(\kappa_{PA}\) の 10³ 倍になったりして Fleck 因子が数 meV で桁跳びし、外側反復が収束しません。LTE 表ではこれを True にします（`is_lte` 属性は変えず値だけ置換）。
+- `Numerics.hydro.qei_heat_capacity`（既定 `"ideal_gas"` = 従来の算術、`"table"` = 表の \(c_{v,e}, c_{v,i}\) で Qei を計量）。表の低温電子比熱が理想値より桁で小さいとき、理想計量の Qei が \(T_e\) を過大に動かして振動する問題への対応。
+- `Numerics.hydro.T_start_inactive_cells="rigid_wall"`（既定 `"passive_fill"` は不変）: セル単位の hydro 開始温度で非活性のセルを剛体壁として扱う変種。非活性セルはプラズマ端と一緒に平行移動しません。
+- **起動時診断: 初期状態の力学的安定性。** 各セルの支配材料のイオン表+電子表から \(\partial P_{\rm tot}/\partial\rho|_T\) を評価し、非正（スピノーダル、または非物理的な cold curve）のセル数・\(\rho, T_e\) の範囲・最小値を WARNING で報告します（状態は変えません）。床温度に固定されたセルの応答は等温で、そこでは Lagrange 格子が丸め誤差を指数的に増幅します（NUMERICS §3）。
+- 1D FLD: 放射エネルギーの保存的メッシュ移流 `hydro_coupling="conservative_advection"`（opt-in、1D Lagrangian のホスト駆動ループ）。
+- 等質量の自動分割 `Mesh.auto_regions`（等厚の区画を等セル数で分割し、材料境界で質量比を合わせる）。NIF 直接駆動の設計スタディ（`examples/nifds/`）は開発用ワークツリーのパスと未同梱の表に依存するため、このスナップショットには含めません。
+- Studio: ヘッダ無し手書き Python デッキの取り込み（⌘O、作業ディレクトリ・環境・サーバ側実行の設定を記録、失敗時に設定を表示）、サーバのファイルブラウザに上の階層へ戻るボタン。
+- TMAT: 検証済み wide D2 表のデータ監査（`tools/tmat`; 表本体は同梱しません）。
+
+### 性能
+
+- 1D のデバイス常駐化: ホスト側で評価していた物理（レーザー入射、伝導の再閉包、表電離、放射の投機的スナップショット）をデバイスへ移し、毎ステップの D2H を減らし、history をデータセット単位で一括書き込み。実験デッキで 6.5 ns 実行が −22.6 %、GXII −50 %、Noh −79 %（RTX 4090）。opt-in の NVTX 範囲でステップ内の遅延を帰属できます。
+
+### ドキュメント・検証系
+
+- NUMERICS: 符号付き表エネルギーの許容域（§2 追補）、多材料閉包の支配材料表、Fleck 再放射項の訂正と TMAT 表の \(\kappa_{PE}\) 異常（§6.7 注記）、自由境界 ghost の復元（§3）、初期状態の力学的安定性（§3）、D2 表とメッシュの保存監査。SPECIFICATION §6.4／§9.1 に新キー。
+- テスト: 上記の各修正に単体テストを追加（Fleck blend、Anderson、TMAT kirchhoff、多材料の再閉包、伝導増分の恒等性、sub-floor 閉包の拒否、Qei の上限と multiplier、燃焼ゼロ注入の恒等性、剛体壁の非活性セル）。`test_hydro_1d_step` と `test_hydro_table_eos` は全件合格に復旧。
+- 格子収束キャンペーン（2026-09-03/04）: 参照表の来歴と較正キーを追記し、要求モデルの既定をキャンペーン結果から較正。
+
+## 2026-09-03
+
+### 機能追加
+
+- **物理由来の初期メッシュ分解能要求（1D、実験的）。** `Mesh.resolution_requirement` により、デッキのレーザー波形・波長・材料層・幾何からアブレート帯の面密度質量天井プロファイル・衝撃波分離天井・層あたり最小セル数を決定論的に見積もり、`validate` と run 開始時に判定します（`apply="report"` 既定はメッシュ不変、`apply="enforce"` は `zoning_intent` に推奨帯を注入／他形式は違反時に拒否）。run 出力に `mesh_requirement.json`、`validate --mesh-preview` に全 1D 形式の節点列と要求・判定を追加。アシスタントの `lint-deck` は要求違反を hard lint として反復フィードバックし、`generate-deck` はプロンプトに要求を提示、`zoning-report` は probe 実測との比を報告します（NUMERICS §3.1.0c、設計 docs/design/mesh_resolution_requirement_20260903.md）。
+- **格子収束の実測キャンペーンと較正。** `tools/validation/mesh_convergence_campaign.py`（29 ケース×表面面密度質量の梯子、観測量抽出と収束判定、参照表出力）を追加し、その結果（`docs/validation/mesh_convergence_reference.md`、`tools/assist/data/mesh_convergence_reference.json`）から `Mesh.resolution_requirement` の既定を較正（`zones_per_scale_length` 9、強度補正 `intensity_exponent` 0.4）。
+- **`dr_min` と要求天井の衝突検査。** 要求 JSON に帯ごとの `width_max_cm` と `ablation.dr_min_admissible_cm`（注入天井と両立する最大の `dr_min`）を追加。`apply="enforce"` で `zoning_intent.dr_min` がこれを超える場合は求解前に `MESH_RESOLUTION_REQUIREMENT_DR_MIN_CONFLICT` で拒否します（メッセージに許容値を明記）。アシスタントの要求サマリ・生成ガイド・スキルにも反映。
+- `tools/assist`: new `docmap` verb (deterministic document map + namelist key index from the `enforce_known_keys` lists in `src/core/namelist/builder.cpp`) and `ask` verb (question answering about TENRYU from the checkout's documents and source, with automatic checks that cited paths and namelist keys exist). New role `question_answering`; read-only provider examples in `tools/assist/assistant.example.toml`. Each user runs it with their own CLI login or API key.
+- Skill `tenryu-docs-qa` (`tools/assist/skills/codex/`, `.claude/skills/`) — the retrieval guidance used as the prompt head.
+- Studio: question panel in the assistant view (local `assist.py ask --json`, journal progress, evidence check display).
+- Export now includes `docs/site/`, `docs/OUTPUT_SCHEMA.md`, `docs/POSTPROCESSING.md`, and `.claude/skills/tenryu-docs-qa/`.
+
 ## 2026-09-02
 
 ### 機能追加

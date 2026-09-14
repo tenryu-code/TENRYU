@@ -1,4 +1,5 @@
 #include "coupling/driver.hpp"
+#include "core/nvtx_range.hpp"
 
 #include <algorithm>
 #include <array>
@@ -107,6 +108,7 @@
 #include "materials/ionmix_reader.hpp"
 #include "materials/tmat_reader.hpp"
 #include "materials/zbar_tf.hpp"
+#include "materials/zbar_device.hpp"
 #include "materials/zmoment_state.cuh"
 #include "mesh/mesh.hpp"
 #include "mesh/z_reflection.hpp"
@@ -752,7 +754,7 @@ materials::IonmixOpacityDeviceView persistent_loop_nlte_opacity_view(
     TENRYU_ASSERT(tmat.opacity.has_value(),
                   "persistent_loop tmat opacity.model requires /opacity payload");
     cache.host = std::make_unique<materials::IonmixOpacityData>(
-        materials::tmat_to_ionmix_opacity(*tmat.opacity));
+        materials::tmat_to_ionmix_opacity(*tmat.opacity, mat.tmat_skip_lte_repair, mat.tmat_kirchhoff_pe));
   } else {
     cache.host = std::make_unique<materials::IonmixOpacityData>(
         materials::load_ionmix_opacity(mat.opacity_file));
@@ -961,6 +963,7 @@ bool all_active_cells_collapsed_to_one_temperature(const core::State& state,
 }
 
 void update_zbar_thomas_fermi(core::State& state, const core::Config& cfg) {
+  const core::NvtxRange nvtx_range("material.zbar_tf");
   if (cfg.materials.zbar.model != "thomas_fermi") {
     return;
   }
@@ -1033,6 +1036,7 @@ void update_zbar_thomas_fermi(core::State& state, const core::Config& cfg) {
 }
 
 void update_zbar_tabular(core::State& state, const core::Config& cfg) {
+  const core::NvtxRange nvtx_range("material.zbar_tabular");
   if (cfg.materials.zbar.model != "tabular") {
     return;
   }
@@ -1111,9 +1115,21 @@ void update_zbar_tabular(core::State& state, const core::Config& cfg) {
   state.zbar.copy_from_host(zbar.data());
 }
 
-void update_zbar_for_step(core::State& state, const core::Config& cfg) {
+void update_zbar_for_step(core::State& state, const core::Config& cfg,
+                           materials::ZbarDeviceContext& device_context) {
   if (cfg.materials.zbar.model == "fixed") {
     // fixed Zbar: no per-step update needed, initialized at setup.
+    return;
+  }
+  const char* host_path = std::getenv("TENRYU_ZBAR_HOST");
+  // CUDA transcendental rounding fails the strict non-TMAT TF parity gate.
+  // TMAT paths retain the separately accepted ULP-scale arithmetic contract.
+  const bool legacy_tf = cfg.materials.zbar.model == "thomas_fermi" &&
+      !std::all_of(cfg.materials.materials.begin(), cfg.materials.materials.end(),
+                   [](const auto& mat) { return mat.is_void || mat.eos_model == "tmat"; });
+  if (cfg.main.dimension == "1D_SPH" && !legacy_tf &&
+      !(host_path != nullptr && host_path[0] == '1')) {
+    materials::update_zbar_fields_device(device_context, state, cfg);
     return;
   }
   update_zbar_thomas_fermi(state, cfg);
@@ -2638,9 +2654,32 @@ void initialize_eos_fields_if_needed_impl(core::State& state, core::Config& cfg)
   std::vector<double> gamma_eff_h(n, 0.0);
   state.A_eff.copy_to_host(A_eff_h.data());
   state.gamma_eff.copy_to_host(gamma_eff_h.data());
+  // Per-cell material tables (multi-material fix, 2026-09-14): the tabular
+  // branches below evaluated every cell with the first non-void material's
+  // tables, so e.g. a CH shell around D2 fuel was initialized from the D2
+  // table at 1.05 g/cc (0.6 Mbar instead of ~0). Use the cell's dominant
+  // material; fall back to the first non-void material when unavailable.
+  const std::size_t n_materials_all = cfg.materials.materials.size();
+  std::vector<int> cell_mat_h(n, first_nonvoid);
+  if (state.cell_material_index.size() == n) {
+    state.cell_material_index.copy_to_host(cell_mat_h);
+  }
+  auto material_of_cell = [&](std::size_t i) -> const decltype(mat)& {
+    const int m = cell_mat_h[i];
+    if (m >= 0 && static_cast<std::size_t>(m) < n_materials_all &&
+        !cfg.materials.materials[static_cast<std::size_t>(m)].is_void) {
+      return cfg.materials.materials[static_cast<std::size_t>(m)];
+    }
+    return mat;
+  };
+  bool any_material_tables = false;
+  for (const auto& m : cfg.materials.materials) {
+    if (!m.is_void && m.eos_tables) { any_material_tables = true; break; }
+  }
 
-  // Preserve intentionally pressureless ICs used by verification/unit tests
-  // (e.g. Noh): all thermal fields at floor with zero internal energies.
+  // Preserve intentionally pressureless analytic ICs (e.g. Noh). A tabular
+  // cold state can have nonzero energy/pressure at the temperature floor and
+  // must be initialized from the EOS before any energy-authoritative reclose.
   bool all_at_floor = true;
   const double te_floor = cfg.numerics.floors.Te;
   const double ti_floor = cfg.numerics.floors.Ti;
@@ -2650,7 +2689,7 @@ void initialize_eos_fields_if_needed_impl(core::State& state, core::Config& cfg)
       break;
     }
   }
-  if (all_at_floor) {
+  if (all_at_floor && (!any_material_tables || use_exact_hydro)) {
     return;
   }
 
@@ -2661,14 +2700,16 @@ void initialize_eos_fields_if_needed_impl(core::State& state, core::Config& cfg)
   std::vector<double> Pe(n, 0.0);
   std::vector<double> Pi(n, 0.0);
   for (std::size_t i = 0; i < n; ++i) {
+    const auto& cmat = material_of_cell(i);
+    const bool use_exact_hydro_c = use_exact_ideal_gas_hydro_backend(cmat);
     const double z = std::max(zbar[i], 0.0);
     const double rho_safe = std::max(rho[i], 1.0e-30);
     const double gamma = std::max(gamma_eff_h[i], 1.0 + 1.0e-12);
     const double A = std::max(A_eff_h[i], 1.0e-12);
     const double cv_i = kEvToErg / (A * kProtonMass * (gamma - 1.0));
     double cv_e = 0.0;
-    if (mat.cv_e_override > 0.0) {
-      cv_e = mat.cv_e_override / rho_safe;
+    if (cmat.cv_e_override > 0.0) {
+      cv_e = cmat.cv_e_override / rho_safe;
     } else {
       // Known limitation: cv_e uses Zbar(T,rho) only; the T*dZbar/dT correction
       // from Thomas-Fermi ionization is not yet wired into this closure.
@@ -2681,11 +2722,11 @@ void initialize_eos_fields_if_needed_impl(core::State& state, core::Config& cfg)
 
     if (use_two_temp) {
       Ti[i] = ti;
-      if (mat.eos_tables && !use_exact_hydro) {
-        ee[i] = mat.eos_tables->electron.energy(rho[i], te);
-        ei[i] = mat.eos_tables->ion.energy(rho[i], ti);
-        Pe[i] = mat.eos_tables->electron.pressure(rho[i], te);
-        Pi[i] = mat.eos_tables->ion.pressure(rho[i], ti);
+      if (cmat.eos_tables && !use_exact_hydro_c) {
+        ee[i] = cmat.eos_tables->electron.energy(rho[i], te);
+        ei[i] = cmat.eos_tables->ion.energy(rho[i], ti);
+        Pe[i] = cmat.eos_tables->electron.pressure(rho[i], te);
+        Pi[i] = cmat.eos_tables->ion.pressure(rho[i], ti);
       } else {
         ee[i] = cv_e * te;
         ei[i] = cv_i * ti;
@@ -2695,16 +2736,16 @@ void initialize_eos_fields_if_needed_impl(core::State& state, core::Config& cfg)
     } else {
       Ti[i] = te;
       double e_total = 0.0;
-      if (mat.eos_T_ref_eV > 0.0 && mat.cv_e_override > 0.0) {
-        const double T_ref = mat.eos_T_ref_eV;
+      if (cmat.eos_T_ref_eV > 0.0 && cmat.cv_e_override > 0.0) {
+        const double T_ref = cmat.eos_T_ref_eV;
         const double T_ref3 = T_ref * T_ref * T_ref;
-        const double alpha0 = mat.cv_e_override / (4.0 * T_ref3);
+        const double alpha0 = cmat.cv_e_override / (4.0 * T_ref3);
         const double T4 = te * te * te * te;
         e_total = alpha0 * T4 / rho_safe;
         ee[i] = e_total;
         Pe[i] = (gamma - 1.0) * rho[i] * e_total;
-      } else if (mat.eos_tables && !use_exact_hydro &&
-                 !mat.eos_tables->total.empty()) {
+      } else if (cmat.eos_tables && !use_exact_hydro_c &&
+                 !cmat.eos_tables->total.empty()) {
         // 1T ee-init fix (2026-07-20): the 1T branch initialized ee from the ideal-gas
         // cv even for table-EOS materials (the 2T branch above consults the
         // table). The legacy eos closure silently rewrote ee to the table
@@ -2713,9 +2754,9 @@ void initialize_eos_fields_if_needed_impl(core::State& state, core::Config& cfg)
         // inverse of the ideal ee) — the mechanism behind the registered
         // EA x exp_rosenbrock Marshak-feature front offset. Initialize from
         // the same 1T total table the runtime sync uses.
-        e_total = mat.eos_tables->total.energy(rho[i], te);
+        e_total = cmat.eos_tables->total.energy(rho[i], te);
         ee[i] = e_total;
-        Pe[i] = mat.eos_tables->total.pressure(rho[i], te);
+        Pe[i] = cmat.eos_tables->total.pressure(rho[i], te);
       } else {
         e_total = (cv_i + cv_e) * te;
         ee[i] = e_total;
@@ -2734,7 +2775,38 @@ void initialize_eos_fields_if_needed_impl(core::State& state, core::Config& cfg)
   state.Pi.copy_from_host(Pi.data());
 }
 
-static void sync_ee_from_Te_table(core::State& state, const core::Config& cfg) {
+static bool conduction_eos_device_enabled(const core::Config& cfg) {
+  const char* host_path = std::getenv("TENRYU_CONDUCTION_EOS_HOST");
+  return cfg.main.dimension == "1D_SPH" &&
+         !(host_path != nullptr && host_path[0] == '1');
+}
+
+static bool conduction_energy_increment_needs_old_fields(const core::Config& cfg) {
+  const int first = cfg.materials.first_nonvoid_material_index();
+  if (first < 0) return false;
+  const auto& mat = cfg.materials.materials[static_cast<std::size_t>(first)];
+  if (!mat.eos_tables) return false;
+  const auto& table = cfg.main.two_temperature ? mat.eos_tables->electron
+                                               : mat.eos_tables->total;
+  return !table.empty() && !table.T_grid_eV.empty();
+}
+
+static bool conduction_energy_eos_device_enabled(
+    const core::Config& cfg, const hydro::HydroEOSContext& eos_context) {
+  if (!conduction_eos_device_enabled(cfg) ||
+      !conduction_energy_increment_needs_old_fields(cfg)) return false;
+  const int first = cfg.materials.first_nonvoid_material_index();
+  const auto view = cfg.main.two_temperature ? eos_context.electron_view(first)
+                                             : eos_context.total_view(first);
+  return view.n_rho > 0 && view.n_T > 0;
+}
+
+static void sync_ee_from_Te_table(core::State& state, const core::Config& cfg,
+                                 const hydro::HydroEOSContext& eos_context,
+                                 DriverRecloseContext& reclose_context) {
+  const core::NvtxRange nvtx_range("conduction.eos_from_temperature");
+  if (conduction_eos_device_enabled(cfg) &&
+      sync_ee_from_Te_device(state, cfg, eos_context, reclose_context)) return;
   const int first_nonvoid = cfg.materials.first_nonvoid_material_index();
   if (first_nonvoid < 0) {
     return;
@@ -2746,6 +2818,38 @@ static void sync_ee_from_Te_table(core::State& state, const core::Config& cfg) {
   }
 
   const std::size_t n = state.rho.size();
+  // Per-cell dominant-material tables (multi-material closure, 2026-09-14):
+  // a cell whose material has a non-empty table of the requested kind is
+  // evaluated with it; otherwise the first non-void material's table (the
+  // historic behaviour) is kept. Mirrors the device kernel's selection.
+  state.ensure_cell_material_props(cfg);
+  std::vector<int> cell_mat_h(n, first_nonvoid);
+  if (state.cell_material_index.size() == n) {
+    state.cell_material_index.copy_to_host(cell_mat_h);
+  }
+  const std::size_t n_materials_all = cfg.materials.materials.size();
+  const auto cell_tables_of = [&](const std::size_t i)
+      -> const materials::EOSTableTriplet* {
+    const int m = cell_mat_h[i];
+    if (m >= 0 && static_cast<std::size_t>(m) < n_materials_all &&
+        cfg.materials.materials[static_cast<std::size_t>(m)].eos_tables) {
+      return cfg.materials.materials[static_cast<std::size_t>(m)].eos_tables.get();
+    }
+    return nullptr;
+  };
+  const auto electron_table_of = [&](const std::size_t i) -> const materials::EOSTable& {
+    const auto* tabs = cell_tables_of(i);
+    return (tabs != nullptr && !tabs->electron.empty()) ? tabs->electron
+                                                        : mat.eos_tables->electron;
+  };
+  const auto ion_table_of = [&](const std::size_t i) -> const materials::EOSTable& {
+    const auto* tabs = cell_tables_of(i);
+    return (tabs != nullptr && !tabs->ion.empty()) ? tabs->ion : mat.eos_tables->ion;
+  };
+  const auto total_table_of = [&](const std::size_t i) -> const materials::EOSTable& {
+    const auto* tabs = cell_tables_of(i);
+    return (tabs != nullptr && !tabs->total.empty()) ? tabs->total : mat.eos_tables->total;
+  };
   std::vector<double> rho(n, 0.0);
   std::vector<double> zbar(n, 0.0);
   std::vector<double> Te(n, 0.0);
@@ -2844,7 +2948,7 @@ static void sync_ee_from_Te_table(core::State& state, const core::Config& cfg) {
     }
 
     if (!two_temp && !mat.eos_tables->total.empty()) {
-      const HostTailThermo th = eval_with_tail(mat.eos_tables->total, rho_safe, te);
+      const HostTailThermo th = eval_with_tail(total_table_of(i), rho_safe, te);
       ee[i] = th.e;
       Pe[i] = th.P;
       cv_e[i] = th.cv;
@@ -2853,7 +2957,7 @@ static void sync_ee_from_Te_table(core::State& state, const core::Config& cfg) {
     }
     {
       const HostTailThermo th_e =
-          eval_with_tail(mat.eos_tables->electron, rho_safe, te);
+          eval_with_tail(electron_table_of(i), rho_safe, te);
       ee[i] = th_e.e;
       Pe[i] = th_e.P;
       cv_e[i] = th_e.cv;
@@ -2862,7 +2966,7 @@ static void sync_ee_from_Te_table(core::State& state, const core::Config& cfg) {
     if (two_temp) {
       const double ti = std::max(Ti[i], ti_floor);
       const HostTailThermo th_i =
-          eval_with_tail(mat.eos_tables->ion, rho_safe, ti);
+          eval_with_tail(ion_table_of(i), rho_safe, ti);
       ei[i] = th_i.e;
       Pi[i] = th_i.P;
       cv_i[i] = th_i.cv;
@@ -2890,30 +2994,58 @@ static void apply_conduction_energy_increment(
     core::State& state,
     const core::Config& cfg,
     const std::vector<double>& Te_old,
-    const std::vector<double>& cv_old) {
+    const std::vector<double>& cv_old,
+    const hydro::HydroEOSContext& eos_context,
+    DriverRecloseContext& reclose_context) {
+  const core::NvtxRange nvtx_range("conduction.eos_energy_increment");
+  if (conduction_eos_device_enabled(cfg) &&
+      apply_conduction_energy_increment_device(state, cfg, eos_context, reclose_context)) return;
   const int first_nonvoid = cfg.materials.first_nonvoid_material_index();
   if (first_nonvoid < 0) {
-    sync_ee_from_Te_table(state, cfg);
+    sync_ee_from_Te_table(state, cfg, eos_context, reclose_context);
     return;
   }
   const auto& mat =
       cfg.materials.materials[static_cast<std::size_t>(first_nonvoid)];
   if (!mat.eos_tables) {
-    sync_ee_from_Te_table(state, cfg);
+    sync_ee_from_Te_table(state, cfg, eos_context, reclose_context);
     return;
   }
-  const auto& tab = cfg.main.two_temperature ? mat.eos_tables->electron
-                                             : mat.eos_tables->total;
-  if (tab.empty() || tab.T_grid_eV.empty()) {
-    sync_ee_from_Te_table(state, cfg);
+  const auto& tab_first = cfg.main.two_temperature ? mat.eos_tables->electron
+                                                   : mat.eos_tables->total;
+  if (tab_first.empty() || tab_first.T_grid_eV.empty()) {
+    sync_ee_from_Te_table(state, cfg, eos_context, reclose_context);
     return;
   }
 
   const std::size_t n = state.rho.size();
   if (Te_old.size() != n) {
-    sync_ee_from_Te_table(state, cfg);
+    sync_ee_from_Te_table(state, cfg, eos_context, reclose_context);
     return;
   }
+  // Per-cell dominant-material table (multi-material closure, 2026-09-14);
+  // falls back to the first non-void material's table when the cell's
+  // material has no non-empty table of the requested kind.
+  state.ensure_cell_material_props(cfg);
+  std::vector<int> cell_mat_h(n, first_nonvoid);
+  if (state.cell_material_index.size() == n) {
+    state.cell_material_index.copy_to_host(cell_mat_h);
+  }
+  const std::size_t n_materials_all = cfg.materials.materials.size();
+  const auto table_of_cell = [&](const std::size_t i) -> const materials::EOSTable& {
+    const int m = cell_mat_h[i];
+    if (m >= 0 && static_cast<std::size_t>(m) < n_materials_all) {
+      const auto& cm = cfg.materials.materials[static_cast<std::size_t>(m)];
+      if (cm.eos_tables) {
+        const auto& t = cfg.main.two_temperature ? cm.eos_tables->electron
+                                                 : cm.eos_tables->total;
+        if (!t.empty() && !t.T_grid_eV.empty()) {
+          return t;
+        }
+      }
+    }
+    return tab_first;
+  };
   std::vector<double> rho(n, 0.0);
   std::vector<double> Te(n, 0.0);
   std::vector<double> ee(n, 0.0);
@@ -2931,20 +3063,22 @@ static void apply_conduction_energy_increment(
   }
 
   const double te_floor = cfg.numerics.floors.Te;
-  const double T_top = tab.T_grid_eV.back();
 
   for (std::size_t i = 0; i < n; ++i) {
     if (state.cell_is_void.size() > i && state.cell_is_void[i] != 0U) {
       continue;
     }
+    const materials::EOSTable& tab = table_of_cell(i);
+    const double T_top = tab.T_grid_eV.back();
     const double rho_safe = std::max(rho[i], 1.0e-30);
     const double cv_used = (i < cv_old.size() && cv_old[i] > 0.0)
                                ? cv_old[i]
                                : std::max(tab.cv(rho_safe, std::max(Te_old[i],
                                                                     te_floor)),
                                           0.0);
-    // Exact booking of the solve's energy motion in its own metric.
-    ee[i] = std::max(ee[i] + cv_used * (Te[i] - Te_old[i]), 0.0);
+    // Exact booking of the solve's energy motion in its own metric. Signed
+    // table energies are valid: no zero clamp (2026-09-14).
+    ee[i] = ee[i] + cv_used * (Te[i] - Te_old[i]);
 
     // Tail-aware inversion: T from the updated energy.
     double T_inv = tab.temperature_from_energy(rho_safe, ee[i]);
@@ -3825,6 +3959,7 @@ double compute_boundary_pdv_work_1d(const core::State& state,
 
 diagnostics::EnergyTotals compute_energy_totals_for_state(const core::State& state,
                                                           const core::Config& cfg) {
+  const core::NvtxRange nvtx_range("diagnostics.energy_totals");
   if (cfg.main.dimension == "2D_RZ") {
     return diagnostics::compute_energy_totals_2d(state);
   }
@@ -3839,6 +3974,7 @@ struct ConservationTotals {
 
 ConservationTotals compute_conservation_totals_for_state(const core::State& state,
                                                          const core::Config& cfg) {
+  const core::NvtxRange nvtx_range("diagnostics.conservation_totals");
   ConservationTotals totals{};
   const auto rho = copy_field_to_host(state.rho);
   const auto vol = copy_field_to_host(state.vol);
@@ -5033,6 +5169,7 @@ void execute_split_operators(const SplittingOrder order,
                              const double dt,
                              const double t_n,
                              const SplitOperatorCallbacks& callbacks) {
+  const core::NvtxRange nvtx_range("coupling.split_operators");
   TENRYU_ASSERT(dt > 0.0, "execute_split_operators requires positive dt");
   TENRYU_ASSERT(static_cast<bool>(callbacks.hydro),
                 "execute_split_operators requires hydro callback");
@@ -5681,6 +5818,7 @@ DtLineage compute_dt_lineage(const core::State& state,
                              const hydro::HydroEOSContext* eos_ctx,
                              const bool defer_dt_floor_abort,
                              DtReanchorState* reanchor) {
+  const core::NvtxRange nvtx_range("coupling.dt_lineage");
   DtLineage lineage;
   lineage.cycle = state.step;
   lineage.t_s = state.t;
@@ -6600,6 +6738,9 @@ void Driver::run(core::State& state,
   parallel::CommBuffers comm_buffers;
   comm_buffers.gpu_aware_mpi = parallel::detect_gpu_aware_mpi();
   bool persistent_loop_active = cfg.numerics.persistent_loop.enabled;
+  TENRYU_ASSERT(!persistent_loop_active || !cfg.radiation.enabled ||
+                    cfg.radiation.multigroup_diffusion.hydro_coupling != "conservative_advection",
+                "conservative_advection is not implemented in the persistent loop");
   static const bool persistent_loop_trace = [] {
     const char* v = std::getenv("TENRYU_PK_CHUNK_TRACE");
     return v && std::string(v) == "1";
@@ -6736,6 +6877,7 @@ void Driver::run(core::State& state,
   }
   hydro::HydroEOSContext eos_ctx;
   DriverRecloseContext reclose_ctx;
+  materials::ZbarDeviceContext zbar_device_context;
   eos_ctx.initialize(cfg);
   const std::size_t n = state.rho.size();
   if (eos_ctx.any_table ||
@@ -7103,6 +7245,7 @@ void Driver::run(core::State& state,
   };
 
   const auto emit_due_outputs = [&](auto fill_history_snapshot) {
+    const core::NvtxRange nvtx_range("phase.outputs");
     const bool do_history = out.should_history(state.step, state.t, state, cfg);
     const bool do_dt_diagnostics =
         cfg.numerics.diagnostics.dt_breakdown_history_enabled;
@@ -7277,6 +7420,8 @@ void Driver::run(core::State& state,
   bool fixed_dt_logged = false;
   bool autopilot_fire_stop = false;
   while (state.t < cfg.main.t_end && state.step < cfg.main.max_steps) {
+    const core::NvtxRange nvtx_range("step");
+    core::NvtxRange nvtx_step_phase("step_phase.setup");
     static const std::pair<int, int> forced_ring_release = [] {
       const char* raw = std::getenv("TENRYU_I1B_RING_RELEASE_FORCE");
       if (raw == nullptr) {
@@ -7521,6 +7666,7 @@ void Driver::run(core::State& state,
       }
     }
 
+    nvtx_step_phase.reset("step_phase.dt");
     const auto t_dt_start = verbose_phase_timing ? Clock::now() : Clock::time_point{};
     DtLineage step_dt_lineage = compute_dt_lineage(
         state,
@@ -7984,6 +8130,7 @@ void Driver::run(core::State& state,
       double time = 0.0;
     };
     std::vector<DeferredOpRecord> deferred_op_records;
+    nvtx_step_phase.reset("step_phase.operator_preparation");
     const auto t_energy_before_start =
         verbose_phase_timing ? Clock::now() : Clock::time_point{};
     diagnostics::EnergyTotals energy_before{};
@@ -8016,6 +8163,16 @@ void Driver::run(core::State& state,
         ((cfg.radiation.multigroup_diffusion.hydro_coupling == "gamma_r_43") ||
          rad_gamma::gamma_r_43_enabled_from_env());  // env stays diagnostic override
     const int rad_gamma43_n_groups = std::max(cfg.radiation.groups, 1);
+    const bool rad_cell_advection_on = cfg.radiation.enabled &&
+        cfg.radiation.multigroup_diffusion.hydro_coupling == "conservative_advection";
+    TENRYU_ASSERT(!rad_cell_advection_on ||
+                      (is_1d && cfg.mesh.motion == "lagrangian" &&
+                       !cfg.numerics.ale1d.enabled &&
+                       cfg.radiation.mode == core::RadiationMode::MultigroupDiffusion &&
+                       !rad_gamma::gamma_r_43_enabled_from_env()),
+                  "conservative_advection requires 1D Lagrangian FLD and no gamma override");
+    core::CellField1D rad_advection_vol_before;
+    if (rad_cell_advection_on) rad_advection_vol_before.reset(state.rho.size());
     core::CellField1D rad_gamma43_vol_before;
     core::CellField1D rad_gamma43_p_r;
     core::CellField1D rad_gamma43_W_r;
@@ -9326,6 +9483,7 @@ void Driver::run(core::State& state,
     callbacks.hydro = [&](const double dt_op,
                            const double t_op,
                            const char* hydro_half) -> HydroStepResult {
+      const core::NvtxRange nvtx_range("phase.hydro");
       HydroStepResult res;
       bool axis_band_applied_this_half_step = false;
       if (!cfg.numerics.hydro.enabled) {
@@ -9335,7 +9493,7 @@ void Driver::run(core::State& state,
       const PhaseEnergySnapshot e_before_phase = capture_phase_energy();
       const auto t_phase_start =
           verbose_phase_timing ? Clock::now() : Clock::time_point{};
-      update_zbar_for_step(state, cfg);
+      update_zbar_for_step(state, cfg, zbar_device_context);
       const auto op_energy_before =
           operator_energy_tracker.enabled() ? capture_operator_energy_cap()
                                             : OpEnergyCapture{};
@@ -9369,6 +9527,12 @@ void Driver::run(core::State& state,
           diagnostics::RadialFourierStagePhase::Before,
           t_op);
       if (is_1d) {
+        if (rad_cell_advection_on) {
+          TENRYU_ASSERT(cudaMemcpy(rad_advection_vol_before.data(), state.vol.data(),
+                                  state.vol.size()*sizeof(double), cudaMemcpyDeviceToDevice)
+                            == cudaSuccess,
+                        "FLD cell advection old-volume copy failed");
+        }
         if (rad_gamma43_coupling_on) {
           const cudaError_t wk_copy_err = cudaMemcpy(
               rad_gamma43_vol_before.data(), state.vol.data(),
@@ -9501,6 +9665,12 @@ void Driver::run(core::State& state,
         // 1D solve and the NEXT hydro half's radiation-pressure field both
         // read the full line (root cause of the §16.4 FLD-1D bitwise FAIL —
         // rank!=0 lines missed the hot-region payments; design doc §6h).
+        allgatherv_1d_cell_line(state.rad_E.data(), rad_gamma43_n_groups);
+      }
+      if (rad_cell_advection_on && !res.retry_required) {
+        const auto window = state.owned_cell_window(static_cast<int>(state.rho.size()));
+        advect_fld_cell_energy(state, rad_advection_vol_before.data(),
+                              window.begin, window.end, rad_gamma43_n_groups);
         allgatherv_1d_cell_line(state.rad_E.data(), rad_gamma43_n_groups);
       }
       if (cfg.radiation.enabled && deterministic_radiation_mode) {
@@ -9655,6 +9825,7 @@ void Driver::run(core::State& state,
       return res;
     };
     const auto run_conduction_phase = [&](const double dt_op, const double t_op) {
+      const core::NvtxRange nvtx_range("phase.conduction");
       if (!cfg.numerics.conduction.enabled) {
         return;
       }
@@ -9670,7 +9841,11 @@ void Driver::run(core::State& state,
           (cfg.numerics.hydro.eos_closure_mode == "energy_authoritative");
       std::vector<double> cond_Te_old;
       std::vector<double> cond_cv_old;
-      if (cond_energy_authoritative) {
+      if (cond_energy_authoritative && conduction_energy_eos_device_enabled(cfg, eos_ctx)) {
+        capture_conduction_fields_device(reclose_ctx, state);
+      } else if (cond_energy_authoritative &&
+                 (cfg.main.dimension != "1D_SPH" ||
+                  conduction_energy_increment_needs_old_fields(cfg))) {
         const std::size_t nc = state.Te.size();
         cond_Te_old.resize(nc);
         if (!state.cv_e.empty()) {
@@ -9699,7 +9874,7 @@ void Driver::run(core::State& state,
            cfg.numerics.safety.overshoot_fatal_enabled)
               ? compute_temperature_audit_device(state).max_te
               : 0.0;
-      update_zbar_for_step(state, cfg);
+      update_zbar_for_step(state, cfg, zbar_device_context);
       const auto op_energy_before =
           operator_energy_tracker.enabled() ? capture_operator_energy_cap()
                                             : OpEnergyCapture{};
@@ -9776,9 +9951,9 @@ void Driver::run(core::State& state,
               : 0.0;
       if (cond_energy_authoritative) {
         apply_conduction_energy_increment(state, cfg, cond_Te_old,
-                                          cond_cv_old);
+                                          cond_cv_old, eos_ctx, reclose_ctx);
       } else {
-        sync_ee_from_Te_table(state, cfg);
+        sync_ee_from_Te_table(state, cfg, eos_ctx, reclose_ctx);
       }
       if (cfg.numerics.diagnostics.conduction_energy_rate_export.enabled) {
         const std::vector<double> conduction_ee_after =
@@ -9838,6 +10013,7 @@ void Driver::run(core::State& state,
       run_conduction_phase(dt_op, t_op);
     };
     callbacks.laser = [&](const double dt_op, const double t_op) {
+      const core::NvtxRange nvtx_range("phase.laser");
       if (!cfg.laser.enabled) {
         return;
       }
@@ -9990,7 +10166,7 @@ void Driver::run(core::State& state,
       const PhaseEnergySnapshot e_before_inject = capture_phase_energy();
       const double inject_laser_source_terms_skipped_energy =
           inject_laser_source_terms(
-              state, cfg, dt_op, &source_E_floor, &source_clamp_count);
+              state, cfg, dt_op, &source_E_floor, &source_clamp_count, &eos_ctx);
       record_mesh_attr_zero(
           diagnostics::mesh_attribution::MeshDeformSource::LaserHeating);
       log_phase_energy("laser_inject_only", e_before_inject);
@@ -10035,6 +10211,7 @@ void Driver::run(core::State& state,
       log_phase_energy("laser_callback", e_before_phase);
     };
     callbacks.burn = [&](const double dt_op, const double t_op) {
+      const core::NvtxRange nvtx_range("phase.burn");
       // merge union 2026-07-18: the 1D (v2/v2-E incl. neutron heating + MC)
       // and 2D (local/Corman diffusion) burn stages evolved on separate
       // lineages; dispatch on mesh.dim, bodies kept verbatim per family.
@@ -10084,14 +10261,22 @@ void Driver::run(core::State& state,
       std::vector<double> x_r_h(state.x_r.size(), 0.0);
       std::vector<double> v_r_node_h(state.v_r.size(), 0.0);
       std::vector<double> v_r_h(n_cells, 0.0);
-      state.rho.copy_to_host(rho_h.data());
-      state.vol.copy_to_host(vol_h.data());
-      state.Te.copy_to_host(Te_h.data());
-      state.Ti.copy_to_host(Ti_h.data());
-      state.zbar.copy_to_host(zbar_h.data());
-      state.A_eff.copy_to_host(A_eff_h.data());
-      state.ee.copy_to_host(ee_h.data());
-      state.ei.copy_to_host(ei_h.data());
+      if (n_cells > 0) {
+        const std::size_t n = static_cast<std::size_t>(n_cells);
+        std::vector<double> burn_input_pack(8U * n);
+        const double* sources[8] = {
+            state.rho.data(), state.vol.data(), state.Te.data(), state.Ti.data(),
+            state.zbar.data(), state.A_eff.data(), state.ee.data(), state.ei.data()};
+        double* destinations[8] = {
+            rho_h.data(), vol_h.data(), Te_h.data(), Ti_h.data(),
+            zbar_h.data(), A_eff_h.data(), ee_h.data(), ei_h.data()};
+        core::pack_pull_fields(sources, 8, n_cells, burn_input_pack.data(),
+                               "driver:burn_1d:input_fields");
+        for (std::size_t field = 0; field < 8U; ++field) {
+          std::memcpy(destinations[field], burn_input_pack.data() + field * n,
+                      n * sizeof(double));
+        }
+      }
       state.volFrac.copy_to_host(vf_h.data());
       state.x_r.copy_to_host(x_r_h.data());
       if (!v_r_node_h.empty()) {
@@ -11019,6 +11204,7 @@ void Driver::run(core::State& state,
       }
     };
     callbacks.radiation = [&](const double dt_op, const double t_op) {
+      const core::NvtxRange nvtx_range("phase.radiation");
       if (!cfg.radiation.enabled) {
         return;
       }
@@ -11527,7 +11713,7 @@ void Driver::run(core::State& state,
         }
       };
 
-      update_zbar_for_step(state, cfg);
+      update_zbar_for_step(state, cfg, zbar_device_context);
       mark_rad_subphase(rad_other_ms);
       if (cfg.radiation.imc.two_stage) {
         const double dt_half = 0.5 * dt_op;
@@ -11594,7 +11780,7 @@ void Driver::run(core::State& state,
 
         // Mid-stage EOS re-closure: inject_radiation_source_terms() has already
         // projected ee -> Te/Pe; sync_ee_from_Te_table refreshes ee/Pe/Cv from Te.
-        sync_ee_from_Te_table(state, cfg);
+        sync_ee_from_Te_table(state, cfg, eos_ctx, reclose_ctx);
         refresh_mie_gruneisen_thermo_from_energy(state, cfg, eos_ctx, reclose_ctx);
         if (delta_E_rad_prev_saved.empty()) {
           state.delta_E_rad_prev.reset(0);
@@ -11604,7 +11790,7 @@ void Driver::run(core::State& state,
           }
           state.delta_E_rad_prev.copy_from_host(delta_E_rad_prev_saved.data());
         }
-        update_zbar_for_step(state, cfg);
+        update_zbar_for_step(state, cfg, zbar_device_context);
         mark_rad_subphase(rad_other_ms);
 
         run_radiation_stage(dt_half, t_op + dt_half);
@@ -11737,7 +11923,9 @@ void Driver::run(core::State& state,
       }
       materials::zmoment_fill_fields(state, nullptr);
     }
+    nvtx_step_phase.reset("step_phase.operators");
     execute_split_operators(order_, dt, state.t, callbacks);
+    nvtx_step_phase.reset("step_phase.mesh_and_retry");
 
     // W-C (NUMERICS §6.8): the SN material Newton requests a global timestep
     // rejection when no positivity-preserving root exists above T_floor or
@@ -13811,6 +13999,7 @@ void Driver::run(core::State& state,
       warned_2t_collapse = true;
     }
 
+    nvtx_step_phase.reset("step_phase.energy_and_audit");
     const auto t_energy_after_start =
         verbose_phase_timing ? Clock::now() : Clock::time_point{};
     diagnostics::EnergyTotals energy_after{};
@@ -14703,6 +14892,7 @@ void Driver::run(core::State& state,
     if (is_2d) {
       state.mesh.materialize_host_svec();
     }
+    nvtx_step_phase.reset("step_phase.diagnostics");
     const auto t_diag_start =
         verbose_phase_timing ? Clock::now() : Clock::time_point{};
     diagnostics::log_energy_budget_step(step_budget, cfg, state.step, state.t);

@@ -12,6 +12,7 @@
 #include <cuda_runtime.h>
 
 #include "core/device_scratch.hpp"
+#include "core/kernel_guard.hpp"
 
 namespace tenryu::coupling::rad_gamma {
 
@@ -26,7 +27,7 @@ void rg_cuda_check(cudaError_t err, const char* msg) {
 
 void rg_sync(const char* msg) {
   rg_cuda_check(cudaGetLastError(), msg);
-  rg_cuda_check(cudaDeviceSynchronize(), msg);
+  rg_cuda_check(core::debug_kernel_sync(), msg);
 }
 
 __global__ void gamma_r_43_volume_update_kernel(

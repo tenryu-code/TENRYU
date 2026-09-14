@@ -310,6 +310,42 @@ def _read_numeric_tokens(lines: list[str]) -> list[float]:
     return tokens
 
 
+def _energy_roundoff_allowance(lines: list[str], start: int, count: int) -> np.ndarray:
+    """Sum half-last-decimal-unit bounds for three printed energy blocks."""
+    bounds: list[float] = []
+    position = 0
+    for line in lines:
+        if line.lstrip().startswith("*"):
+            continue
+        for match in FLOAT_TOKEN_RE.finditer(line):
+            if position >= start:
+                token = match.group().lower().replace("d", "e")
+                mantissa, _, exponent = token.partition("e")
+                decimals = len(mantissa.split(".")[1]) if "." in mantissa else 0
+                bounds.append(0.5 * 10.0 ** (int(exponent or "0") - decimals))
+                if len(bounds) == 3 * count:
+                    return np.asarray(bounds).reshape(3, count).sum(axis=0)
+            position += 1
+    raise ValueError("missing printed energy tokens for roundoff audit")
+
+
+def _check_energy_consistency(total: np.ndarray, ion: np.ndarray,
+                              electron: np.ndarray, allowance: np.ndarray) -> float:
+    """Validate stored energies without rewriting any component or total."""
+    for name, values in (("total energy", total), ("ion energy", ion),
+                         ("electron energy", electron)):
+        _check_finite(name, values)
+    residual = np.abs(total - (ion + electron))
+    scale = np.maximum(np.abs(total), 1.0e-30)
+    fp_bound = 64 * np.finfo(float).eps * (np.abs(total) + np.abs(ion) + np.abs(electron))
+    limit = np.maximum(1.0e-6 * scale, allowance + fp_bound)
+    max_rel = float(np.max(residual / scale))
+    if np.any(residual > limit):
+        raise ValueError("Eint != Eion + Eele consistency check failed beyond printed "
+                         f"roundoff bounds (max_rel={max_rel:.3e})")
+    return max_rel
+
+
 def _find_data_start(lines: list[str]) -> int:
     """Return 0-based line index where the numeric data section begins.
 
@@ -419,6 +455,7 @@ def read_propaceos_prp(path: Path) -> PropaceosData:
     zbar_flat = stream.read_array(n2d_eos, "zbar")
     stream.skip(3 * n2d_op, "integrated opacity blocks")
     if write_eos_data == 2:
+        energy_token_start = stream.pos
         e_int = stream.read_array(n2d_eos, "total internal energy")
         e_i = stream.read_array(n2d_eos, "ion energy")
         e_e = stream.read_array(n2d_eos, "electron energy")
@@ -452,10 +489,15 @@ def read_propaceos_prp(path: Path) -> PropaceosData:
     max_rel_err = float(
         np.max(np.abs(e_int_2d - e_sum) / np.maximum(np.abs(e_int_2d), 1.0e-30))
     )
+    allowance = np.zeros_like(e_int_2d)
     if max_rel_err > 1.0e-6:
-        raise ValueError(
-            f"Eint != Eion + Eele consistency check failed (max_rel={max_rel_err:.3e})"
-        )
+        allowance = _energy_roundoff_allowance(
+            lines[data_start:], energy_token_start, n2d_eos).reshape(e_int_2d.shape)
+    _check_energy_consistency(e_int_2d, e_i_2d, e_e_2d, allowance)
+    if max_rel_err > 1.0e-6:
+        print(f"WARNING: energy sum differs by max_rel={max_rel_err:.3e}, "
+              "within source decimal-rounding bounds; stored components preserved",
+              file=sys.stderr)
 
     kappa_r = np.empty((ngroups, ndens_op, ntemp_op), dtype=np.float64)
     kappa_pa = np.empty((ngroups, ndens_op, ntemp_op), dtype=np.float64)

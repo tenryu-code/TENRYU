@@ -581,6 +581,16 @@ Mesh::Search（NUMERICS §9.3–§9.5）を使用。粒子の物理座標は変�
 - `Materials::Tables`：SESAME/IONMIXロード、単位変換、範囲外clamp、診断
 - `Materials::DeviceEOSTable`（`src/materials/eos_device_table.hpp`, `eos_device_table.cuh`, `eos_device_table.cu`）：
   table EOS data/view upload and device-side interpolation/inversion helpers
+- `Materials::ZbarDeviceContext` (`src/materials/zbar_device.hpp`, `zbar_device.cu`,
+  `zbar_math.hpp`): driver-owned cache for immutable per-material ionization tables,
+  material descriptors, and the host-owned void mask. The 1D updater reads resident
+  rho/Te/volFrac and writes resident zbar; tabular interpolation and Thomas–Fermi
+  evaluation preserve ordered material mixing. Tabular clamp warnings share the
+  host reader's ordered warning budget through a bounded device summary. The
+  fixed-ionization path remains a no-op, and `TENRYU_ZBAR_HOST=1` selects the
+  original per-step host update for bisection. Non-TMAT Thomas–Fermi decks retain
+  that host update because their strict bitwise gate rejects CUDA transcendental
+  rounding; the device TF dispatch requires every non-void material to use TMAT.
 - `Materials::EOSRhoETable`（`src/materials/eos_rho_e_table.hpp`, `eos_rho_e_table.cpp`, `eos_rho_e_device.hpp`, `eos_rho_e_device.cuh`, `eos_rho_e_device.cu`）：
   hydro-only total-EOS direct table on either \((\log\rho,\log e)\) or \((\rho,e)\). CPU
   initialization resamples raw `total` `P(\rho,T), e(\rho,T)` into `P(\rho,e), T(\rho,e)` on
@@ -2161,6 +2171,12 @@ void laser_step(
 **責務**：演算子分割、dt制御、ソース項統合
 
 - `Coupling::Driver`
+  - `DriverRecloseContext` (`driver_reclose.hpp/.cu`) also owns device snapshots
+    of conduction-entry Te/cv. Its 1D temperature and energy-increment helpers
+    reuse `HydroEOSContext` raw EOS views and preserve each old helper's field
+    write set and high-temperature tail. Device table availability is checked
+    before selecting snapshots; unavailable tables retain the old host path.
+    `TENRYU_CONDUCTION_EOS_HOST=1` selects the original host EOS handoff.
   - dt = min(hydro, cond, rad, user, output)（NUMERICS §2.2）。成長制限 ≤1.2×dt^n は別途適用。レーザーは独立Δt制約を持たない（hydroサブステップに包含、NUMERICS §2.2(d)）
   - **マルチrank同期**：各rank がローカル dt を計算後、`MPI_Allreduce(MPI_MIN)` でグローバル最小 dt を全rankで共有（NUMERICS §2.2）。成長制限 1.2×dt^n はグローバル dt に対して適用する
   - **Hydro開始温度チェック**（NUMERICS §2.1.1）：
@@ -2280,6 +2296,14 @@ void laser_step(
 - `Diag::MeshDeformAttribution`（`src/diagnostics/mesh_deform_attribution.{hpp,cuh,cu}`）：default-off の 2D_RZ mesh failure root-cause diagnostics。`Hydro2D::lagrangian_step` invocation ごとに opt-in workspace が start node positions と per-source displacement buffers を所有し、failure 時だけ `mesh_failure_attribution.jsonl` に per-source corner-J degradation を書く。HDF5 schema と `dt_lineage.jsonl` format は変更しない。
 - `Diag::MeshDegeneracyForensics`（`src/diagnostics/mesh_degeneracy_forensics.{hpp,cu}`）：default-off の repeated pre-commit `mesh_quality_*` / `in_hydro_*` failure diagnostics。`Hydro2D` は opt-in 時だけ failing cell の4 node position/velocity/acceleration sample を `HydroStepResult` に載せ、`Coupling::Driver` retry path が同一 `(cell, corner, stage)` count と `sigma_safe` threshold を評価して `mesh_degeneracy_forensics.jsonl` へ J(σ), nodal velocity, hourglass amplitude, material/work context を追記する。HDF5 schema と physics state は変更しない。
 - `Diag::IcfShellDiagnostics`, `Diag::HotspotGasDiagnostics`, と `Diag::OperatorEnergyResiduals`（`src/diagnostics/diagnostics.{hpp,cu}`, `operator_energy_residuals.{hpp,cu}`）：default-off の ICF shell IFAR/CR、inert gas-hotspot tracer compression metrics、per-operator energy residual。`Coupling::Driver` が history cadence で初期 shell 半径、hotspot tracer state、operator 境界、明示的 `delta_E_ext` を渡し、`HistoryWriter` が `/diagnostics/icf/v1/`, `/diagnostics/hotspot_gas/v1/`, `/diagnostics/conservation/v1/`, `/diagnostics/ale_provenance/v1/` に path-versioned HDF5 series を追記する。HDF5 root `schema_version` は変更しない。
+- `Diag::HistoryAppendFile` (`src/diagnostics/history_writer.cpp`): transaction-local
+  1D history buffers group already computed rows by dataset and append one
+  hyperslab per dataset within the existing flush/copy/rename transaction.
+  Dataset handles and owned variable-length strings live until flush; pending
+  lengths and last times preserve monotonic rejection and consistency checks.
+  Numeric values, attributes, datatypes, shapes and cadence are unchanged.
+  Public raw-HDF5 writers and 2D retain immediate appends;
+  `TENRYU_HISTORY_BATCH_WRITES=0` selects that path for 1D bisection.
 - `Diag::CornerBCAudit`（`src/diagnostics/history_writer.cpp`）：`dt_breakdown_history_enabled=True` の history writer が、CFL winner が r_outer-reflect ∩ z_top-state_supply corner halo に入った step だけ `/diagnostics/corner_bc_audit/v1/` へ interior/ghost state と local dt/cs/Qvisc を追記する diagnostic-only HDF5 group。physics state と HDF5 root `schema_version` は変更しない。
 - `Diag::EscapeValveHistory` (`src/diagnostics/escape_valve_history.{hpp,cpp}`):
   Fixed-column HDF5 writer for

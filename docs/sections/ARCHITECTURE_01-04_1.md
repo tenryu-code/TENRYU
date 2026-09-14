@@ -165,6 +165,10 @@ tenryu/
   - `auto_zone.hpp`：`AutoZoneRegion`, `AutoZoneConfig`, `AutoZoneDiagnostics` 構造体、`compute_auto_zone_nodes()` API
   - `auto_zone.cpp`：等質量球殻分割、非対称幾何級数ブリッジ、二分法 \(q\) 求解、制約調整、ファイナライゼーション
   - 初期化時に `Namelist::Builder` から呼び出され、生成されたノード配列を `MeshConfig::explicit_nodes` に格納。ランタイムでは使用されない
+- `Core::MeshRequirement`（`src/core/mesh_requirement.{hpp,cpp}`、NUMERICS §3.1.0c）: 1D 初期メッシュの物理由来分解能要求（レーザー波形・波長・材料層・幾何 → アブレート帯の面密度質量天井プロファイル・衝撃波分離天井・層則・推奨帯）。ホスト専用・Python 非依存。
+  - `build_mesh_requirement()`：メッシュ非依存の見積もり（`FrozenTable1D` の出力波形と piecewise 一定の ρ₀(r)/材料(r) を入力）
+  - `check_mesh_requirement()`：ノード列とセル別 ρ₀/材料に対する判定、`mesh_requirement_json()`：決定論 JSON
+  - 呼び出し元: `Namelist::Builder`（`apply="enforce"` の `zoning_intent` 帯注入 — `zoning_intent::measure_fraction_at` で測度分数へ換算）、`drivers/cmd_validate`（`--mesh-preview` の `mesh_requirement` 項と `[mesh-requirement]` 判定）、`drivers/cmd_run`（run 開始時の `mesh_requirement.json`）。ランタイム物理では使用されない。1D ノード列は `mesh::build_1d_radial_nodes()`（`src/mesh/radial_nodes_1d.cuh`、`create_mesh` と同一実装）で得る。
 - `Core::DeviceScratch`（`src/core/device_scratch.{hpp,cu}`、per-call cudaMalloc/cudaFree を scratch pool に置換する host オーバーヘッド削減）：
   プロセス寿命・タグ指名・grow-only のデバイス／ピン止めホスト scratch プール
   （`device_scratch_acquire(tag, bytes)` / `host_pinned_scratch_acquire`、内容はゼロ化されない
@@ -592,6 +596,7 @@ struct Config {
     struct NumericsConfig {
         std::string splitting_order = "strang"; // v1.0固定: Strang splitting（SPECIFICATION §6.4.7, NUMERICS §2.1）
         double T_start_eV = 0.0;        // Hydro開始温度 [eV]（既定 0.0）
+        // hydro.T_start_inactive_cells = "passive_fill" | "rigid_wall"（NumericsConfig::HydroConfig の末尾メンバ、既定 "passive_fill"）
         double coulomb_log_floor = 2.0; // クーロン対数下限（既定 2.0）
         struct DtConfig {
             double initial_s = 1e-15;       // [s] 初期Δt（SPECIFICATION §6.4.7 既定 1e-15）。

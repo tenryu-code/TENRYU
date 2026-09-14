@@ -1616,7 +1616,8 @@ IonmixZbarTable tmat_eos_to_zbar_table(const TmatEOSData& eos, const double A_am
 }
 
 IonmixOpacityData tmat_to_ionmix_opacity(const TmatOpacityData& opacity,
-                                         const bool skip_lte_repair) {
+                                         const bool skip_lte_repair,
+                                         const bool kirchhoff_pe) {
   tmat_require(opacity.ngroups > 0 && opacity.ndens > 0 && opacity.ntemp > 0,
                "TMAT_E006",
                "tmat_to_ionmix_opacity requires ngroups>0, ndens>0, ntemp>0");
@@ -1674,7 +1675,21 @@ IonmixOpacityData tmat_to_ionmix_opacity(const TmatOpacityData& opacity,
   out.is_lte = opacity.is_lte;
   out.numdens_cm3 = opacity.rho_grid;
 
-  if (!out.is_lte && !skip_lte_repair) {
+  if (kirchhoff_pe) {
+    // Materials.materials[].opacity.tmat_kirchhoff_pe (2026-09-14): enforce
+    // Kirchhoff's law at load, kappa_PE := kappa_PA on every node and group.
+    // PROPACEOS-derived TMAT tables converted with kirchhoff_pe=0 carry an
+    // emission opacity that is unusable in the Wien tail of each group
+    // (underflow to 1e-99 and 10^3-fold overshoots over kappa_PA in the band
+    // E_g/T ~ 6-12); with it the Fleck factor jumps by orders of magnitude
+    // across a few meV and the FLD outer iteration cannot converge. The
+    // is_lte flag is kept as read so the coefficient path does not change.
+    out.kappa_PE = out.kappa_PA;
+    core::log_info("[tmat] kirchhoff_pe: emission opacity replaced by the absorption "
+                   "opacity on " + std::to_string(n3d) + " table entries");
+  }
+
+  if (!out.is_lte && !skip_lte_repair && !kirchhoff_pe) {
     constexpr double gamma_floor = 0.9;
     const std::size_t total_nodes = checked_n2d(nD, nT, "lte_repair node count");
     const auto node_index = [nT](const int d, const int t) {

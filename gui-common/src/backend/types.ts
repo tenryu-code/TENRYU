@@ -51,4 +51,8 @@ export interface Backend {
   readLocalText(path: string, maxBytes?: number): Promise<string>;
   /** Write a LOCAL text file at an explicit path (no dialog; parent must exist). */
   writeLocalText(path: string, content: string): Promise<void>;
+  /** Directory where this app keeps its own configuration files (Tauri appConfigDir; the dev bridge conf dir). No trailing slash. */
+  appConfigDir(): Promise<string>;
+  /** Directory of the assistant harness shipped with this app (tools/assist: assist.py, skills, examples). */
+  assistHarnessDir(): Promise<string>;
 }

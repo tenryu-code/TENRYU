@@ -4,6 +4,7 @@ import { profileBinMissing } from "@tenryu-common/core/profiles";
 import { isTerminal } from "@tenryu-common/core/runstate";
 import { t } from "./i18n";
 import { currentProfile, useApp, type SectionKey } from "./store";
+import ChatDock from "./ui/ChatDock";
 import CommandPalette from "./ui/CommandPalette";
 import DeckPreview from "./ui/DeckPreview";
 import DeckView from "./ui/DeckView";
@@ -15,6 +16,17 @@ import { Button, Select } from "@tenryu-common/ui/kit";
 import { SplitPane, StatusBar, StatusItem } from "@tenryu-common/ui/shell";
 
 const NAV_KEYS: SectionKey[] = ["presets", "basic", "materials", "mesh", "physics", "laser", "output"];
+
+/** Current viewport width in CSS px, tracked so the layout can drop panes when space runs out. */
+function useWindowWidth(): number {
+  const [width, setWidth] = useState(typeof window === "undefined" ? 1600 : window.innerWidth);
+  useEffect(() => {
+    const onResize = (): void => setWidth(window.innerWidth);
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+  return width;
+}
 
 export default function App() {
   const m = t();
@@ -42,10 +54,17 @@ export default function App() {
   const profile = useApp((s) => currentProfile(s));
   const lang = useApp((s) => s.lang);
   const setUiLang = useApp((s) => s.setUiLang);
+  const chatOpen = useApp((s) => s.chatOpen);
+  const toggleChat = useApp((s) => s.toggleChat);
   const [historyDeckOpen, setHistoryDeckOpen] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
+  const windowWidth = useWindowWidth();
   const pibBlocked = form.main.dimension === "2D_RZ" && form.mesh.meshMode2d === "polar_in_box";
   const binMissing = profile !== null && profileBinMissing(profile);
+  // The deck aside yields to the chat dock when the window cannot hold both.
+  const asideOpen =
+    (view === "form" || (view === "history" && historyDeckOpen)) &&
+    !(chatOpen && windowWidth < 1500);
 
   useEffect(() => {
     void loadInitial();
@@ -114,6 +133,11 @@ export default function App() {
         setPaletteOpen((v) => !v);
         return;
       }
+      if ((e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey && e.key.toLowerCase() === "j") {
+        e.preventDefault();
+        toggleChat();
+        return;
+      }
       if ((e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey && e.key >= "1" && e.key <= "7") {
         e.preventDefault();
         const idx = Number(e.key) - 1;
@@ -130,7 +154,7 @@ export default function App() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [binMissing, pibBlocked, runValidate, setSection, setView, startRun]);
+  }, [binMissing, pibBlocked, runValidate, setSection, setView, startRun, toggleChat]);
 
   return (
     <div className="grid h-full" style={{ gridTemplateRows: "44px auto minmax(0,1fr) 26px" }}>
@@ -153,6 +177,14 @@ export default function App() {
             {m.run.showDeckPane}
           </Button>
         )}
+        <Button
+          aria-pressed={chatOpen}
+          variant={chatOpen ? "primary" : "secondary"}
+          title="⌘J / Ctrl+J"
+          onClick={() => toggleChat()}
+        >
+          {m.chat.toggle}
+        </Button>
         <div className="flex-1" />
         <Select
           value={lang}
@@ -200,9 +232,7 @@ export default function App() {
         className="grid min-h-0"
         style={{
           gridTemplateColumns:
-            view === "form" || (view === "history" && historyDeckOpen)
-              ? "220px minmax(0,1fr) 440px"
-              : "220px minmax(0,1fr)",
+            "220px minmax(0,1fr)" + (asideOpen ? " 440px" : "") + (chatOpen ? " 400px" : ""),
         }}
       >
         <nav
@@ -258,7 +288,7 @@ export default function App() {
         <main className="min-h-0 min-w-0 overflow-auto p-4">
           {view === "servers" ? <ServersView /> : view === "assist" ? <AssistantView /> : view === "history" ? <HistoryView /> : <DeckView />}
         </main>
-        {(view === "form" || (view === "history" && historyDeckOpen)) && (
+        {asideOpen && (
           <aside
             className="min-h-0 min-w-0 overflow-hidden border-l"
             style={{ borderColor: "var(--separator)", background: "var(--bg-panel)" }}
@@ -286,6 +316,7 @@ export default function App() {
             )}
           </aside>
         )}
+        {chatOpen && <ChatDock />}
       </div>
       <StatusBar>
         {deckIoStatus !== null && (
@@ -322,6 +353,7 @@ export default function App() {
           { id: "history", label: m.nav.history, run: () => setView("history") },
           { id: "servers", label: m.nav.servers, run: () => setView("servers") },
           { id: "assist", label: m.nav.assist, run: () => setView("assist") },
+          { id: "chat", label: m.chat.toggle, run: () => toggleChat() },
           { id: "validate", label: m.validate.run, hint: "⌘⏎", run: () => void runValidate() },
           { id: "run", label: m.run.run, hint: "⇧⌘⏎", run: () => { if (!pibBlocked && !binMissing) void startRun(); } },
           { id: "save", label: m.deckIo.menuSave, hint: "⌘S", run: () => void saveNamelist() },

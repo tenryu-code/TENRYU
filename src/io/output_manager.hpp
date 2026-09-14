@@ -30,6 +30,7 @@ class OutputManager {
 
   void write_run_info(const tenryu::core::State& state,
                       const tenryu::core::Config& cfg) const;
+  void write_mesh_requirement(const std::string& json) const;
   void write_frozen_config(const std::string& case_name,
                            const std::string& frozen_json) const;
   void write_snapshot(const tenryu::core::State& state,

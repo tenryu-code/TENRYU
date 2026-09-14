@@ -1,4 +1,5 @@
 #include "diagnostics/history_writer.hpp"
+#include "core/nvtx_range.hpp"
 
 #include <algorithm>
 #include <array>
@@ -7,6 +8,10 @@
 #include <cstdint>
 #include <cctype>
 #include <cstddef>
+#include <cstring>
+#include <initializer_list>
+#include <map>
+#include <string_view>
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
@@ -16,6 +21,7 @@
 #include <vector>
 
 #include "core/config_validate.hpp"
+#include "core/device_pack.hpp"
 #include "core/error.hpp"
 #include "coupling/profile_observability.hpp"
 
@@ -24,6 +30,45 @@
 #endif
 
 namespace tenryu::diagnostics {
+#if TENRYU_ENABLE_HDF5
+// A transaction-local append target. Implicit conversion from a raw HDF5 file
+// keeps standalone diagnostic writers on their original immediate path.
+class HistoryAppendFile {
+ public:
+  HistoryAppendFile(hid_t file, bool batch = false) : file_(file), batch_(batch) {}
+  HistoryAppendFile(const HistoryAppendFile&) = delete;
+  HistoryAppendFile& operator=(const HistoryAppendFile&) = delete;
+  operator hid_t() const noexcept { return file_; }
+
+  bool append(const std::string& path, hid_t type, const void* values,
+              const char* units, std::initializer_list<hsize_t> shape = {1}) const;
+  std::optional<hsize_t> pending_length(const std::string& path) const;
+  std::optional<double> pending_double(const std::string& path, bool first) const;
+  void flush() const;
+
+ private:
+  struct Series {
+    hid_t dataset = -1;
+    hid_t type = -1;
+    std::vector<hsize_t> shape;
+    hsize_t start = 0;
+    hsize_t rows = 0;
+    bool units_written = false;
+    bool variable_string = false;
+    std::vector<unsigned char> bytes;
+    std::vector<std::string> strings;
+    ~Series();
+  };
+  static std::string_view key(const std::string& path) {
+    const auto first = path.find_first_not_of('/');
+    return first == std::string::npos ? std::string_view(path) : std::string_view(path).substr(first);
+  }
+  hid_t file_;
+  bool batch_;
+  mutable std::map<std::string, Series, std::less<>> series_;
+};
+#endif
+
 namespace {
 
 std::string angle_tag(const double angle_deg) {
@@ -46,7 +91,7 @@ void warn_h5_close_failure(const herr_t status, const char* op, const char* cont
   }
 }
 
-void ensure_parent_groups(const hid_t file, const std::string& dataset_path) {
+void ensure_parent_groups(const HistoryAppendFile& file, const std::string& dataset_path) {
   std::size_t pos = 0;
   while (true) {
     pos = dataset_path.find('/', pos);
@@ -116,7 +161,7 @@ void write_double_vector_attribute_if_missing(const hid_t dataset,
                         "HistoryWriter::write_double_vector_attribute_if_missing");
 }
 
-hid_t open_or_create_group(const hid_t file, const std::string& path) {
+hid_t open_or_create_group(const HistoryAppendFile& file, const std::string& path) {
   ensure_parent_groups(file, path + "/_");
   if (tenryu::io::h5_link_exists(file, path.c_str(), H5P_DEFAULT) > 0) {
     const hid_t gid = H5Gopen2(file, path.c_str(), H5P_DEFAULT);
@@ -231,10 +276,170 @@ std::optional<double> read_double_attribute_if_exists(const hid_t object,
   return value;
 }
 
-void append_scalar_double(const hid_t file,
+}  // namespace
+
+HistoryAppendFile::Series::~Series() {
+  if (dataset >= 0) {
+    warn_h5_close_failure(H5Dclose(dataset), "H5Dclose", "HistoryWriter batch");
+  }
+  if (type >= 0) {
+    warn_h5_close_failure(H5Tclose(type), "H5Tclose", "HistoryWriter batch");
+  }
+}
+
+bool HistoryAppendFile::append(const std::string& path, const hid_t type,
+                               const void* values, const char* units,
+                               std::initializer_list<hsize_t> shape) const {
+  if (!batch_) {
+    return false;
+  }
+  auto it = series_.find(key(path));
+  const bool inserted = it == series_.end();
+  if (inserted) {
+    it = series_.try_emplace(std::string(key(path))).first;
+  }
+  auto& row = it->second;
+  if (inserted) {
+    ensure_parent_groups(file_, path);
+    row.type = H5Tcopy(type);
+    TENRYU_ASSERT(row.type >= 0, "HistoryWriter batch type copy failed");
+    row.shape = shape;
+    row.variable_string = H5Tis_variable_str(type) > 0;
+    const int rank = static_cast<int>(shape.size());
+    if (tenryu::io::h5_link_exists(file_, path.c_str(), H5P_DEFAULT) > 0) {
+      row.dataset = H5Dopen2(file_, path.c_str(), H5P_DEFAULT);
+      TENRYU_ASSERT(row.dataset >= 0, "HistoryWriter batch open failed: " + path);
+      const hid_t space = H5Dget_space(row.dataset);
+      TENRYU_ASSERT(space >= 0, "HistoryWriter batch space query failed");
+      TENRYU_ASSERT(H5Sget_simple_extent_ndims(space) == rank,
+                    "HistoryWriter batch rank mismatch: " + path);
+      std::vector<hsize_t> dims(shape.size());
+      TENRYU_ASSERT(H5Sget_simple_extent_dims(space, dims.data(), nullptr) == rank,
+                    "HistoryWriter batch extent query failed");
+      warn_h5_close_failure(H5Sclose(space), "H5Sclose", "HistoryWriter batch");
+      row.start = dims[0];
+      for (std::size_t i = 1; i < dims.size(); ++i) {
+        TENRYU_ASSERT(dims[i] == row.shape[i], "HistoryWriter batch width mismatch: " + path);
+      }
+    } else {
+      std::vector<hsize_t> dims(shape);
+      auto max_dims = dims;
+      auto chunk = dims;
+      dims[0] = 0;
+      max_dims[0] = H5S_UNLIMITED;
+      chunk[0] = 256;
+      const hid_t space = H5Screate_simple(rank, dims.data(), max_dims.data());
+      TENRYU_ASSERT(space >= 0, "HistoryWriter batch create space failed");
+      const hid_t dcpl = H5Pcreate(H5P_DATASET_CREATE);
+      TENRYU_ASSERT(dcpl >= 0, "HistoryWriter batch create properties failed");
+      TENRYU_ASSERT(H5Pset_chunk(dcpl, rank, chunk.data()) >= 0,
+                    "HistoryWriter batch chunk setup failed");
+      row.dataset = H5Dcreate2(file_, path.c_str(), type, space,
+                              H5P_DEFAULT, dcpl, H5P_DEFAULT);
+      TENRYU_ASSERT(row.dataset >= 0, "HistoryWriter batch create failed: " + path);
+      warn_h5_close_failure(H5Pclose(dcpl), "H5Pclose", "HistoryWriter batch");
+      warn_h5_close_failure(H5Sclose(space), "H5Sclose", "HistoryWriter batch");
+    }
+  }
+  TENRYU_ASSERT(row.shape.size() == shape.size() &&
+                  std::equal(row.shape.begin(), row.shape.end(), shape.begin()) &&
+                  H5Tequal(row.type, type) > 0,
+                "HistoryWriter batch row contract changed: " + path);
+  if (!row.units_written && units != nullptr && units[0] != '\0') {
+    write_units_attribute_if_missing(row.dataset, units);
+    row.units_written = true;
+  }
+  if (row.variable_string) {
+    // Own the strings until H5Dwrite; callers' temporary c_str pointers expire.
+    row.strings.emplace_back(*static_cast<const char* const*>(values));
+  } else {
+    std::size_t count = H5Tget_size(type);
+    for (const auto dim : shape) {
+      count *= static_cast<std::size_t>(dim);
+    }
+    const auto* bytes = static_cast<const unsigned char*>(values);
+    row.bytes.insert(row.bytes.end(), bytes, bytes + count);
+  }
+  ++row.rows;
+  return true;
+}
+
+std::optional<hsize_t> HistoryAppendFile::pending_length(const std::string& path) const {
+  if (!batch_) { return std::nullopt; }
+  const auto it = series_.find(key(path));
+  if (it == series_.end()) {
+    return std::nullopt;
+  }
+  TENRYU_ASSERT(it->second.shape.size() == 1,
+                "HistoryWriter scalar length query requires rank one: " + path);
+  return it->second.start + it->second.rows;
+}
+
+std::optional<double> HistoryAppendFile::pending_double(const std::string& path,
+                                                       const bool first) const {
+  if (!batch_) { return std::nullopt; }
+  const auto it = series_.find(key(path));
+  if (it == series_.end() || it->second.rows == 0 ||
+      (first && it->second.start != 0)) {
+    return std::nullopt;
+  }
+  const auto& row = it->second;
+  TENRYU_ASSERT(row.shape.size() == 1 && H5Tequal(row.type, H5T_NATIVE_DOUBLE) > 0,
+                "HistoryWriter scalar double query type mismatch: " + path);
+  double value;
+  const std::size_t offset = first ? 0 : row.bytes.size() - sizeof(value);
+  std::memcpy(&value, row.bytes.data() + offset, sizeof(value));
+  return value;
+}
+
+void HistoryAppendFile::flush() const {
+  for (auto& [path, row] : series_) {
+    if (row.rows == 0) {
+      continue;
+    }
+    auto dims = row.shape;
+    auto count = row.shape;
+    std::vector<hsize_t> start(row.shape.size(), 0);
+    dims[0] = row.start + row.rows;
+    count[0] = row.rows;
+    start[0] = row.start;
+    TENRYU_ASSERT(H5Dset_extent(row.dataset, dims.data()) >= 0,
+                  "HistoryWriter batch extend failed: " + path);
+    const hid_t space = H5Dget_space(row.dataset);
+    TENRYU_ASSERT(space >= 0, "HistoryWriter batch file space failed");
+    TENRYU_ASSERT(H5Sselect_hyperslab(space, H5S_SELECT_SET, start.data(), nullptr,
+                                     count.data(), nullptr) >= 0,
+                  "HistoryWriter batch hyperslab failed");
+    const hid_t memory = H5Screate_simple(static_cast<int>(count.size()), count.data(), nullptr);
+    TENRYU_ASSERT(memory >= 0, "HistoryWriter batch memory space failed");
+    std::vector<const char*> strings;
+    if (row.variable_string) {
+      strings.reserve(row.strings.size());
+      for (const auto& text : row.strings) {
+        strings.push_back(text.c_str());
+      }
+    }
+    const void* values = row.variable_string ? static_cast<const void*>(strings.data())
+                                              : static_cast<const void*>(row.bytes.data());
+    TENRYU_ASSERT(H5Dwrite(row.dataset, row.type, memory, space, H5P_DEFAULT, values) >= 0,
+                  "HistoryWriter batch write failed: " + path);
+    warn_h5_close_failure(H5Sclose(memory), "H5Sclose", "HistoryWriter batch");
+    warn_h5_close_failure(H5Sclose(space), "H5Sclose", "HistoryWriter batch");
+    row.start += row.rows;
+    row.rows = 0;
+    row.bytes.clear();
+    row.strings.clear();
+  }
+}
+
+namespace {
+
+void append_scalar_double(const HistoryAppendFile& file,
                           const std::string& path,
                           const double value,
                           const char* units) {
+  if (file.append(path, H5T_NATIVE_DOUBLE, &value, units)) { return; }
+
   ensure_parent_groups(file, path);
 
   if (tenryu::io::h5_link_exists(file, path.c_str(), H5P_DEFAULT) > 0) {
@@ -316,10 +521,12 @@ void append_scalar_double(const hid_t file,
                         "HistoryWriter::append_scalar_double(create space)");
 }
 
-void append_scalar_i64(const hid_t file,
+void append_scalar_i64(const HistoryAppendFile& file,
                        const std::string& path,
                        const std::int64_t value,
                        const char* units) {
+  if (file.append(path, H5T_NATIVE_INT64, &value, units)) { return; }
+
   ensure_parent_groups(file, path);
 
   if (tenryu::io::h5_link_exists(file, path.c_str(), H5P_DEFAULT) > 0) {
@@ -402,12 +609,14 @@ void append_scalar_i64(const hid_t file,
 }
 
 template <typename T>
-void append_scalar_native(const hid_t file,
+void append_scalar_native(const HistoryAppendFile& file,
                           const std::string& path,
                           const T value,
                           const hid_t h5_type,
                           const char* units,
                           const char* label) {
+  if (file.append(path, h5_type, &value, units)) { return; }
+
   ensure_parent_groups(file, path);
 
   if (tenryu::io::h5_link_exists(file, path.c_str(), H5P_DEFAULT) > 0) {
@@ -506,39 +715,38 @@ void append_scalar_native(const hid_t file,
                         "HistoryWriter::append_scalar_native(create space)");
 }
 
-void append_scalar_i32(const hid_t file,
+void append_scalar_i32(const HistoryAppendFile& file,
                        const std::string& path,
                        const std::int32_t value,
                        const char* units) {
   append_scalar_native(file, path, value, H5T_NATIVE_INT32, units, "i32");
 }
 
-void append_scalar_u64(const hid_t file,
+void append_scalar_u64(const HistoryAppendFile& file,
                        const std::string& path,
                        const std::uint64_t value,
                        const char* units) {
   append_scalar_native(file, path, value, H5T_NATIVE_UINT64, units, "u64");
 }
 
-void append_scalar_u16(const hid_t file,
+void append_scalar_u16(const HistoryAppendFile& file,
                        const std::string& path,
                        const std::uint16_t value,
                        const char* units) {
   append_scalar_native(file, path, value, H5T_NATIVE_UINT16, units, "u16");
 }
 
-void append_scalar_u8(const hid_t file,
+void append_scalar_u8(const HistoryAppendFile& file,
                       const std::string& path,
                       const std::uint8_t value,
                       const char* units) {
   append_scalar_native(file, path, value, H5T_NATIVE_UINT8, units, "u8");
 }
 
-void append_scalar_fixed_string(const hid_t file,
+void append_scalar_fixed_string(const HistoryAppendFile& file,
                                 const std::string& path,
                                 const std::string& value) {
   constexpr std::size_t kStringBytes = 128;
-  ensure_parent_groups(file, path);
   std::array<char, kStringBytes> buffer{};
   if (value.size() >= kStringBytes) {
     core::log_warning(
@@ -554,6 +762,11 @@ void append_scalar_fixed_string(const hid_t file,
                 "HistoryWriter H5Tset_size(fixed string) failed");
   TENRYU_ASSERT(H5Tset_strpad(type, H5T_STR_NULLTERM) >= 0,
                 "HistoryWriter H5Tset_strpad(fixed string) failed");
+  if (file.append(path, type, buffer.data(), nullptr)) {
+    warn_h5_close_failure(H5Tclose(type), "H5Tclose", "HistoryWriter batch string");
+    return;
+  }
+  ensure_parent_groups(file, path);
 
   if (tenryu::io::h5_link_exists(file, path.c_str(), H5P_DEFAULT) > 0) {
     const hid_t dset = H5Dopen2(file, path.c_str(), H5P_DEFAULT);
@@ -637,15 +850,19 @@ void append_scalar_fixed_string(const hid_t file,
                         "HistoryWriter::append_scalar_fixed_string(create type)");
 }
 
-void append_scalar_vlen_string(const hid_t file,
+void append_scalar_vlen_string(const HistoryAppendFile& file,
                                const std::string& path,
                                const std::string& value) {
-  ensure_parent_groups(file, path);
   const char* raw = value.c_str();
   const hid_t type = H5Tcopy(H5T_C_S1);
   TENRYU_ASSERT(type >= 0, "HistoryWriter H5Tcopy(vlen string) failed");
   TENRYU_ASSERT(H5Tset_size(type, H5T_VARIABLE) >= 0,
                 "HistoryWriter H5Tset_size(vlen string) failed");
+  if (file.append(path, type, &raw, nullptr)) {
+    warn_h5_close_failure(H5Tclose(type), "H5Tclose", "HistoryWriter batch string");
+    return;
+  }
+  ensure_parent_groups(file, path);
 
   if (tenryu::io::h5_link_exists(file, path.c_str(), H5P_DEFAULT) > 0) {
     const hid_t dset = H5Dopen2(file, path.c_str(), H5P_DEFAULT);
@@ -729,17 +946,19 @@ void append_scalar_vlen_string(const hid_t file,
                         "HistoryWriter::append_scalar_vlen_string(create type)");
 }
 
-void append_3x3_i32_matrix(const hid_t file,
+void append_3x3_i32_matrix(const HistoryAppendFile& file,
                            const std::string& path,
                            const int values[3][3],
                            const char* units) {
-  ensure_parent_groups(file, path);
   std::int32_t packed[3][3] = {};
   for (int i = 0; i < 3; ++i) {
     for (int j = 0; j < 3; ++j) {
       packed[i][j] = static_cast<std::int32_t>(values[i][j]);
     }
   }
+
+  if (file.append(path, H5T_NATIVE_INT32, packed, units, {1, 3, 3})) { return; }
+  ensure_parent_groups(file, path);
 
   if (tenryu::io::h5_link_exists(file, path.c_str(), H5P_DEFAULT) > 0) {
     const hid_t dset = H5Dopen2(file, path.c_str(), H5P_DEFAULT);
@@ -840,7 +1059,7 @@ std::uint8_t plic_reconstruction_kind_from_event(
 }
 
 void append_plic_event_row(
-    const hid_t file,
+    const HistoryAppendFile& file,
     const std::string& base,
     const tenryu::coupling::ProfileObservability::PlicDegradationEvent& evt) {
   append_scalar_u8(file, base + "case_id", evt.case_id, "enum");
@@ -873,7 +1092,7 @@ void append_plic_event_row(
   append_scalar_double(file, base + "time", evt.time, "s");
 }
 
-void append_plic_event_summary_row(const hid_t file,
+void append_plic_event_summary_row(const HistoryAppendFile& file,
                                    const std::string& base,
                                    const std::uint8_t case_id,
                                    const std::uint8_t severity,
@@ -888,7 +1107,7 @@ void append_plic_event_summary_row(const hid_t file,
 }
 
 void append_plic_per_cell_state_row(
-    const hid_t file,
+    const HistoryAppendFile& file,
     const std::string& base,
     const tenryu::coupling::ProfileObservability::PlicDegradationEvent& evt) {
   append_scalar_double(file,
@@ -911,15 +1130,16 @@ bool material_interface_per_cell_state_enabled(
          cfg.numerics.plic.material_interface_per_cell_state == "dense_debug";
 }
 
-void append_row_double_matrix(const hid_t file,
+void append_row_double_matrix(const HistoryAppendFile& file,
                               const std::string& path,
                               const std::vector<double>& row_values,
                               const char* units) {
   if (row_values.empty()) {
     return;
   }
-  ensure_parent_groups(file, path);
   const hsize_t n_cols = static_cast<hsize_t>(row_values.size());
+  if (file.append(path, H5T_NATIVE_DOUBLE, row_values.data(), units, {1, n_cols})) { return; }
+  ensure_parent_groups(file, path);
 
   if (tenryu::io::h5_link_exists(file, path.c_str(), H5P_DEFAULT) > 0) {
     const hid_t dset = H5Dopen2(file, path.c_str(), H5P_DEFAULT);
@@ -1002,7 +1222,7 @@ void append_row_double_matrix(const hid_t file,
                         "HistoryWriter::append_row_double_matrix(create space)");
 }
 
-void write_i32_vector_dataset_if_missing(const hid_t file,
+void write_i32_vector_dataset_if_missing(const HistoryAppendFile& file,
                                          const std::string& path,
                                          const std::vector<int>& values) {
   if (values.empty()) {
@@ -1062,7 +1282,7 @@ void write_i32_vector_dataset_if_missing(const hid_t file,
                         "HistoryWriter::write_i32_vector_dataset_if_missing(create space)");
 }
 
-void write_double_vector_dataset_if_missing(const hid_t file,
+void write_double_vector_dataset_if_missing(const HistoryAppendFile& file,
                                             const std::string& path,
                                             const std::vector<double>& values,
                                             const char* units) {
@@ -1115,7 +1335,7 @@ void write_double_vector_dataset_if_missing(const hid_t file,
                         "HistoryWriter::write_double_vector_dataset_if_missing(create space)");
 }
 
-void write_dt_breakdown_history(const hid_t file,
+void write_dt_breakdown_history(const HistoryAppendFile& file,
                                 const DtBreakdownHistoryRecord& record) {
   if (!record.valid) {
     return;
@@ -1191,7 +1411,7 @@ void write_dt_breakdown_history(const hid_t file,
       "dimensionless");
 }
 
-void write_plasma_viscosity_history(const hid_t file,
+void write_plasma_viscosity_history(const HistoryAppendFile& file,
                                     const PlasmaViscosityHistoryRecord& record) {
   if (!record.valid) {
     return;
@@ -1240,7 +1460,7 @@ void write_plasma_viscosity_history(const hid_t file,
 }
 
 void write_radial_fourier_audit_history(
-    const hid_t file,
+    const HistoryAppendFile& file,
     const RadialFourierAuditRecord& record) {
   if (!record.valid) {
     return;
@@ -1275,7 +1495,7 @@ void write_radial_fourier_audit_history(
 }
 
 void write_radial_fourier_complex_audit_history(
-    const hid_t file,
+    const HistoryAppendFile& file,
     const RadialFourierComplexAuditRecord& record) {
 #if !TENRYU_RFA_V2_WRITES_HISTORY
   (void)file;
@@ -1322,7 +1542,7 @@ void write_radial_fourier_complex_audit_history(
 }
 
 void write_fld_substage_audit_history(
-    const hid_t file,
+    const HistoryAppendFile& file,
     const std::vector<FldSubstageAuditRecord>& records) {
   constexpr const char* base = "/diagnostics/fld_substage_audit/v1/";
   for (const auto& record : records) {
@@ -1390,7 +1610,7 @@ void write_fld_substage_audit_history(
   }
 }
 
-void write_cfl_winner_history(const hid_t file,
+void write_cfl_winner_history(const HistoryAppendFile& file,
                               const DtBreakdownHistoryRecord& record) {
   if (!record.valid) {
     return;
@@ -1516,7 +1736,7 @@ bool corner_bc_audit_i1_like_case(const core::Config& cfg) {
 }
 #endif
 
-void append_scalar_double_compat(const hid_t file,
+void append_scalar_double_compat(const HistoryAppendFile& file,
                                  const std::string& preferred_path,
                                  const std::string& legacy_path,
                                  const double value,
@@ -1530,7 +1750,7 @@ void append_scalar_double_compat(const hid_t file,
   append_scalar_double(file, selected, value, units);
 }
 
-void append_scalar_i64_compat(const hid_t file,
+void append_scalar_i64_compat(const HistoryAppendFile& file,
                               const std::string& preferred_path,
                               const std::string& legacy_path,
                               const std::int64_t value,
@@ -1544,7 +1764,10 @@ void append_scalar_i64_compat(const hid_t file,
   append_scalar_i64(file, selected, value, units);
 }
 
-std::optional<hsize_t> dataset_length_if_exists(const hid_t file, const std::string& path) {
+std::optional<hsize_t> dataset_length_if_exists(const HistoryAppendFile& file, const std::string& path) {
+  if (const auto pending = file.pending_length(path); pending.has_value()) {
+    return pending;
+  }
   if (tenryu::io::h5_link_exists(file, path.c_str(), H5P_DEFAULT) <= 0) {
     return std::nullopt;
   }
@@ -1564,8 +1787,11 @@ std::optional<hsize_t> dataset_length_if_exists(const hid_t file, const std::str
   return dims[0];
 }
 
-std::optional<double> last_scalar_double_if_exists(const hid_t file,
+std::optional<double> last_scalar_double_if_exists(const HistoryAppendFile& file,
                                                    const std::string& path) {
+  if (const auto pending = file.pending_double(path, false); pending.has_value()) {
+    return pending;
+  }
   const auto len = dataset_length_if_exists(file, path);
   if (!len.has_value() || *len == 0) {
     return std::nullopt;
@@ -1603,8 +1829,11 @@ std::optional<double> last_scalar_double_if_exists(const hid_t file,
   return value;
 }
 
-std::optional<double> first_scalar_double_if_exists(const hid_t file,
+std::optional<double> first_scalar_double_if_exists(const HistoryAppendFile& file,
                                                     const std::string& path) {
+  if (const auto pending = file.pending_double(path, true); pending.has_value()) {
+    return pending;
+  }
   const auto len = dataset_length_if_exists(file, path);
   if (!len.has_value() || *len == 0) {
     return std::nullopt;
@@ -1655,7 +1884,7 @@ std::string sanitize_operator_name(std::string name) {
   return name;
 }
 
-void write_icf_shell_history(const hid_t file,
+void write_icf_shell_history(const HistoryAppendFile& file,
                              const IcfShellDiagnostics& icf,
                              const double time,
                              const int step) {
@@ -1678,7 +1907,7 @@ void write_icf_shell_history(const hid_t file,
                         "HistoryWriter::write_icf_shell_history(group)");
 }
 
-void write_hotspot_gas_history(const hid_t file,
+void write_hotspot_gas_history(const HistoryAppendFile& file,
                                const HotspotGasDiagnostics& hot,
                                const core::Config& cfg,
                                const double time,
@@ -1836,7 +2065,7 @@ void write_hotspot_gas_history(const hid_t file,
 }
 
 void write_operator_energy_residuals_history(
-    const hid_t file,
+    const HistoryAppendFile& file,
     const std::vector<OperatorResidualEntry>& entries,
     const double time,
     const int step) {
@@ -1861,7 +2090,7 @@ void write_operator_energy_residuals_history(
   }
 }
 
-void assert_history_dataset_lengths_consistent(const hid_t file) {
+void assert_history_dataset_lengths_consistent(const HistoryAppendFile& file) {
   const auto t_len = dataset_length_if_exists(file, "t");
   if (!t_len.has_value()) {
     return;
@@ -2165,19 +2394,24 @@ HistoryWriter::compute_corner_bc_audit_values(
 }
 
 HistoryWriter::PlasmaHistoryDiagnostics
-HistoryWriter::compute_plasma_history_diagnostics(const core::State& state) const {
+HistoryWriter::compute_plasma_history_diagnostics(
+    const core::State& state, const double* zbar_host, const double* mass_host) const {
   PlasmaHistoryDiagnostics out{};
   if (state.zbar.empty()) {
     return out;
   }
-  const auto zbar = copy_field_to_host(state.zbar);
-  const auto mass = copy_field_to_host(state.mass);
-  const bool has_mass = (mass.size() == zbar.size());
+  const auto zbar_copy = zbar_host == nullptr
+      ? copy_field_to_host(state.zbar) : std::vector<double>{};
+  const auto mass_copy = mass_host == nullptr
+      ? copy_field_to_host(state.mass) : std::vector<double>{};
+  const double* zbar = zbar_host != nullptr ? zbar_host : zbar_copy.data();
+  const double* mass = mass_host != nullptr ? mass_host : mass_copy.data();
+  const bool has_mass = (state.mass.size() == state.zbar.size());
 
   long double weighted_sum = 0.0L;
   long double weight_total = 0.0L;
   double zbar_max = 0.0;
-  for (std::size_t c = 0; c < zbar.size(); ++c) {
+  for (std::size_t c = 0; c < state.zbar.size(); ++c) {
     const double z = std::max(zbar[c], 0.0);
     const double w = has_mass ? std::max(mass[c], 0.0) : 1.0;
     weighted_sum += static_cast<long double>(w) * static_cast<long double>(z);
@@ -2194,25 +2428,33 @@ HistoryWriter::compute_plasma_history_diagnostics(const core::State& state) cons
 }
 
 HistoryWriter::ImplosionHistoryDiagnostics
-HistoryWriter::compute_implosion_history_diagnostics(const core::State& state) const {
+HistoryWriter::compute_implosion_history_diagnostics(
+    const core::State& state, const double* rho_host, const double* mass_host,
+    const double* Te_host) const {
   ImplosionHistoryDiagnostics out{};
   if (state.rho.empty()) {
     return out;
   }
 
-  const auto rho = copy_field_to_host(state.rho);
-  const auto mass = copy_field_to_host(state.mass);
-  const auto Te = copy_field_to_host(state.Te);
-  const bool has_mass = (mass.size() == rho.size());
-  const bool has_centroid_r = (state.mesh.cell_centroid_r.size() == rho.size());
-  const bool has_centroid_z = (state.mesh.cell_centroid_z.size() == rho.size());
+  const auto rho_copy = rho_host == nullptr
+      ? copy_field_to_host(state.rho) : std::vector<double>{};
+  const auto mass_copy = mass_host == nullptr
+      ? copy_field_to_host(state.mass) : std::vector<double>{};
+  const auto Te_copy = Te_host == nullptr
+      ? copy_field_to_host(state.Te) : std::vector<double>{};
+  const double* rho = rho_host != nullptr ? rho_host : rho_copy.data();
+  const double* mass = mass_host != nullptr ? mass_host : mass_copy.data();
+  const double* Te = Te_host != nullptr ? Te_host : Te_copy.data();
+  const bool has_mass = (state.mass.size() == state.rho.size());
+  const bool has_centroid_r = (state.mesh.cell_centroid_r.size() == state.rho.size());
+  const bool has_centroid_z = (state.mesh.cell_centroid_z.size() == state.rho.size());
 
-  out.rho_peak = *std::max_element(rho.begin(), rho.end());
+  out.rho_peak = *std::max_element(rho, rho + state.rho.size());
   const double shell_threshold = 0.1 * out.rho_peak;
   double min_radius = std::numeric_limits<double>::infinity();
   long double weighted_radius_sum = 0.0L;
   long double weight_sum = 0.0L;
-  for (std::size_t c = 0; c < rho.size(); ++c) {
+  for (std::size_t c = 0; c < state.rho.size(); ++c) {
     if (rho[c] < shell_threshold) {
       continue;
     }
@@ -2233,10 +2475,10 @@ HistoryWriter::compute_implosion_history_diagnostics(const core::State& state) c
     out.shell_radius_min = out.shell_radius_mean;
   }
 
-  if (Te.size() == rho.size() && has_centroid_r) {
+  if (state.Te.size() == state.rho.size() && has_centroid_r) {
     std::size_t center_cell = 0;
     double min_dist2 = std::numeric_limits<double>::infinity();
-    for (std::size_t c = 0; c < rho.size(); ++c) {
+    for (std::size_t c = 0; c < state.rho.size(); ++c) {
       const double r = state.mesh.cell_centroid_r[c];
       double dist2 = r * r;
       if (state.mesh.dim == 2 && has_centroid_z) {
@@ -2448,14 +2690,29 @@ HistoryWriter::PendingHistoryRecord HistoryWriter::build_pending_record(
       rec.av_max_values = values;
     }
   }
-  rec.plasma_diag = compute_plasma_history_diagnostics(state);
-  rec.implosion_diag = compute_implosion_history_diagnostics(state);
+  const std::size_t n = state.rho.size();
+  if (state.mesh.dim == 1 && n > 0 &&
+      n <= static_cast<std::size_t>(std::numeric_limits<int>::max()) &&
+      state.mass.size() == n && state.Te.size() == n && state.zbar.size() == n) {
+    std::vector<double> fields(4 * n);
+    const double* sources[4] = {state.rho.data(), state.mass.data(),
+                                state.Te.data(), state.zbar.data()};
+    core::pack_pull_fields(sources, 4, static_cast<int>(n), fields.data(),
+                           "history:plasma_implosion:pull");
+    rec.plasma_diag = compute_plasma_history_diagnostics(
+        state, fields.data() + 3 * n, fields.data() + n);
+    rec.implosion_diag = compute_implosion_history_diagnostics(
+        state, fields.data(), fields.data() + n, fields.data() + 2 * n);
+  } else {
+    rec.plasma_diag = compute_plasma_history_diagnostics(state);
+    rec.implosion_diag = compute_implosion_history_diagnostics(state);
+  }
   rec.tri_fan_center_perturbation_diag = state.tri_fan_center_perturbation_diag;
   return rec;
 }
 
 void HistoryWriter::write_per_row_mass_history(
-    const hid_t file,
+    const HistoryAppendFile& file,
     const PerRowMassValues& values) const {
   constexpr const char* base = "/diagnostics/per_row_mass/";
   append_scalar_i64(file, std::string(base) + "cycle", values.step, "count");
@@ -2499,7 +2756,7 @@ void HistoryWriter::write_per_row_mass_history(
 }
 
 void HistoryWriter::write_corner_bc_audit_history(
-    const hid_t file,
+    const HistoryAppendFile& file,
     const CornerBcAuditValues& values) const {
   constexpr const char* base = "/diagnostics/corner_bc_audit/v1/";
   append_scalar_i64(file, std::string(base) + "cycle", values.cycle, "count");
@@ -2560,7 +2817,7 @@ void HistoryWriter::write_corner_bc_audit_history(
 }
 
 void HistoryWriter::write_av_max_history(
-    const hid_t file,
+    const HistoryAppendFile& file,
     const AvMaxHistoryValues& values) const {
   constexpr const char* base = "/diagnostics/av_max/";
   append_scalar_i64(file, std::string(base) + "cycle", values.step, "count");
@@ -2590,7 +2847,7 @@ void HistoryWriter::write_av_max_history(
 }
 
 void HistoryWriter::write_tri_fan_center_perturbation_history(
-    const hid_t file,
+    const HistoryAppendFile& file,
     const core::TriFanCenterPerturbationDiag& diag,
     const double time,
     const std::int64_t step) const {
@@ -2619,7 +2876,7 @@ void HistoryWriter::write_tri_fan_center_perturbation_history(
 }
 
 void HistoryWriter::write_ale_provenance_history(
-    const hid_t file,
+    const HistoryAppendFile& file,
     const AleProvenanceValues& values,
     const double time,
     const std::int64_t step) const {
@@ -2711,7 +2968,7 @@ void HistoryWriter::write_ale_provenance_history(
 }
 
 void HistoryWriter::write_material_interface_history(
-    const hid_t file,
+    const HistoryAppendFile& file,
     const AleProvenanceValues& values,
     const double time,
     const std::int64_t step) const {
@@ -2794,7 +3051,7 @@ void HistoryWriter::write_material_interface_history(
 }
 
 void HistoryWriter::write_mesh_quality_min_history(
-    const hid_t file,
+    const HistoryAppendFile& file,
     const AleProvenanceValues& values,
     const double time,
     const std::int64_t step) const {
@@ -2836,7 +3093,7 @@ void HistoryWriter::write_mesh_quality_min_history(
 }
 
 void HistoryWriter::write_ale_state_history(
-    const hid_t file,
+    const HistoryAppendFile& file,
     const AleProvenanceValues& values,
     const double time,
     const std::int64_t step) const {
@@ -3493,6 +3750,7 @@ void HistoryWriter::append_fld_substage_audit_batch(
 }
 
 void HistoryWriter::append(const core::State& state, const HistorySnapshot& snapshot) {
+  const core::NvtxRange nvtx_range("diagnostics.history_append");
   if (!enabled_) {
     (void)state;
     (void)snapshot;
@@ -3514,6 +3772,7 @@ void HistoryWriter::append(const core::State& state, const HistorySnapshot& snap
 }
 
 void HistoryWriter::flush_pending() {
+  const core::NvtxRange nvtx_range("diagnostics.history_flush");
   last_flush_time_ = std::chrono::steady_clock::now();
   if (pending_.empty() || !enabled_) {
     return;
@@ -3539,8 +3798,15 @@ void HistoryWriter::flush_pending() {
                          H5P_DEFAULT);
   TENRYU_ASSERT(file >= 0, "HistoryWriter failed to open/create history file");
 
-  for (const auto& rec : pending_) {
-    append_record_to_file(file, rec);
+  {
+    const char* batch_env = std::getenv("TENRYU_HISTORY_BATCH_WRITES");
+    const bool batch = cfg_.main.dim == 1 &&
+                       !(batch_env != nullptr && std::string(batch_env) == "0");
+    const HistoryAppendFile target(file, batch);
+    for (const auto& rec : pending_) {
+      append_record_to_file(target, rec);
+    }
+    target.flush();
   }
 
   warn_h5_close_failure(H5Fclose(file), "H5Fclose", "HistoryWriter::append(finalize)");
@@ -3561,7 +3827,7 @@ void HistoryWriter::flush_pending() {
 
 #if TENRYU_ENABLE_HDF5
 void HistoryWriter::append_record_to_file(
-    const hid_t file,
+    const HistoryAppendFile& file,
     const PendingHistoryRecord& rec) const {
   const auto last_t = last_scalar_double_if_exists(file, "t");
   if (last_t.has_value() && !(rec.t > *last_t)) {
