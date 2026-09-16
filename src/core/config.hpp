@@ -19,6 +19,7 @@
 
 namespace tenryu::materials {
 struct EOSTableTriplet;
+struct ColdEquilibriumTable;
 struct IonmixZbarTable;
 }
 
@@ -498,6 +499,20 @@ struct Config {
       std::string eos_model = "ideal_gas";
       std::string eos_file;
       int sesame_material_id = -1;
+      // SESAME T = 0 cold-curve ladder rows (materials/eos_table.hpp);
+      // 0 drops the T <= 0 rows as before 2026-09-15.
+      int sesame_cold_curve_rows = 12;
+      // Cold-equilibrium reference state of the material (used when
+      // Numerics.hydro.T_start_inactive_cells == "cold_equilibrium";
+      // materials/cold_equilibrium.hpp, NUMERICS §1 (b)). cgs + eV.
+      struct ColdReferenceDef {
+        bool enabled = false;
+        double rho0 = 0.0;  // [g/cm^3]
+        double Te0 = 0.0;   // [eV]
+        double Ti0 = 0.0;   // [eV]
+        double P0 = 0.0;    // [dyn/cm^2]
+        double K0 = 0.0;    // bulk modulus [dyn/cm^2]
+      } cold_reference;
       double ideal_gas_gamma = 5.0 / 3.0;
       double cv_e_override = -1.0;  // [erg/(g*eV)] mass-specific electron heat capacity override (per unit mass per eV)
       double eos_T_ref_eV = -1.0;
@@ -515,6 +530,8 @@ struct Config {
       double mg_dT_rel = 0.1;
       // Loaded EOS tables: ion, electron, total (shared_ptr for cheap copy in Config).
       std::shared_ptr<const materials::EOSTableTriplet> eos_tables;
+      // Cold-equilibrium primitive table (built at validation when the mode is on).
+      std::shared_ptr<const materials::ColdEquilibriumTable> cold_table;
       // Restart safety hash for table EOS identity; 0 indicates ideal_gas/non-tabular EOS.
       std::uint64_t eos_signature = 0;
 
@@ -1892,7 +1909,21 @@ struct Config {
       //   "rigid_wall": a node moves only when both neighbours are active
       //     (inactive cells are rigid walls, no work is done on them) and the
       //     electron-ion coupling is not masked. 1D_SPH only.
+      //   "cold_equilibrium": no hydro mask at all; T_start_eV is the end of the
+      //     electron-temperature transition of the cold-equilibrium EOS branch
+      //     (materials/cold_equilibrium.hpp). 1D_SPH, 2T, table EOS only.
       std::string T_start_inactive_cells = "passive_fill";
+      // Numerical parameters of T_start_inactive_cells == "cold_equilibrium"
+      // (NUMERICS §1 (b)): temperature transition begins at
+      // transition_begin_fraction * T_start_eV; the density support of the
+      // correction is |ln(rho/rho0)| <= ln(density_core_ratio) (full) tapering
+      // to zero at ln(density_outer_ratio).
+      struct ColdEquilibriumConfig {
+        double transition_begin_fraction = 0.5;
+        double density_core_ratio = 1.10;
+        double density_outer_ratio = 1.50;
+        int inverse_max_iterations = 80;
+      } cold_equilibrium;
       // Heat-capacity metric of the electron-ion coupling in the 1D
       // Lagrangian 2T energy update (non-compatible path):
       //   "ideal_gas" (default, bit-frozen): analytic ideal-gas cv_e / cv_i;

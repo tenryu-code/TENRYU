@@ -9,6 +9,7 @@
 #include <cuda_runtime.h>
 
 #include "core/error.hpp"
+#include "materials/cold_equilibrium_table.hpp"
 #include "materials/eos_table.hpp"
 
 namespace tenryu::materials {
@@ -80,6 +81,7 @@ DeviceEOSTable& DeviceEOSTable::operator=(DeviceEOSTable&& other) noexcept {
     d_log_rho_inv_ = other.d_log_rho_inv_;
     d_log_T_inv_ = other.d_log_T_inv_;
     supports_rho_e_reclosure_ = other.supports_rho_e_reclosure_;
+    cold_ = std::move(other.cold_);
 
     other.d_log_rho_grid_ = nullptr;
     other.d_log_T_grid_ = nullptr;
@@ -170,6 +172,11 @@ void DeviceEOSTable::upload(const EOSTable& cpu_table) {
   log_rho_max_ = cpu_table.log_rho_grid.back();
   log_T_min_ = cpu_table.log_T_grid.front();
   log_T_max_ = cpu_table.log_T_grid.back();
+  if (cpu_table.cold != nullptr && !cpu_table.cold->empty()) {
+    cold_.upload(*cpu_table.cold);
+  } else {
+    cold_ = DeviceColdEquilibriumTable{};
+  }
   supports_rho_e_reclosure_ = table_supports_rho_e_reclosure(cpu_table) ? 1u : 0u;
 
   if (n_rho_ > 1) {
@@ -221,6 +228,7 @@ DeviceEOSTableView DeviceEOSTable::view() const {
   v.d_log_rho_inv = d_log_rho_inv_;
   v.d_log_T_inv = d_log_T_inv_;
   v.supports_rho_e_reclosure = supports_rho_e_reclosure_;
+  v.cold = cold_.view();
   return v;
 }
 
@@ -256,6 +264,7 @@ void DeviceEOSTable::free_all() {
   d_log_rho_inv_ = 0.0;
   d_log_T_inv_ = 0.0;
   supports_rho_e_reclosure_ = 0u;
+  cold_ = DeviceColdEquilibriumTable{};
 }
 
 }  // namespace tenryu::materials

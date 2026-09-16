@@ -37,6 +37,7 @@
 #include "materials/eos_device.cuh"
 #include "materials/eos_device_table.cuh"
 #include "materials/eos_cell_table_selector.cuh"
+#include "materials/cold_equilibrium.hpp"
 #include "materials/eos_rho_e_device.cuh"
 #include "materials/helmholtz_jet_device.cuh"
 #include "materials/helmholtz_spline_device.cuh"
@@ -743,7 +744,8 @@ __global__ void enforce_2t_closure_kernel(double* __restrict__ ee,
                                           int* __restrict__ inverse_failure_count,
                                           const int exact_override_kind,
                                           double* __restrict__ cv_e_out,
-                                          double* __restrict__ cv_i_out) {
+                                          double* __restrict__ cv_i_out,
+                                          double* __restrict__ e_cold_out) {
   const int i = c_begin + blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= c_end) {
     return;
@@ -761,6 +763,10 @@ __global__ void enforce_2t_closure_kernel(double* __restrict__ ee,
       (i >= own_begin && i < own_end) ? inverse_clamp_count : nullptr,
       (i >= own_begin && i < own_end) ? inverse_failure_count : nullptr,
       exact_override_kind, cv_e_out, cv_i_out);
+  if (e_cold_out != nullptr) {
+    e_cold_out[i] =
+        tenryu::materials::cold_reference(tab_ele.cold, fmax(rho[i], 1.0e-30)).C;
+  }
 }
 
 __global__ void compute_sound_speed_1t_kernel(double* __restrict__ cs,
@@ -3127,7 +3133,8 @@ void enforce_2t_closure(
       use_exact_ideal_gas_backend(eos_views), cfg.numerics.hydro.eos_writeback,
       preserve_table_energy, energy_authoritative, inverse_clamp_count,
       inverse_failure_count,
-      exact_override_kind, cv_e_ptr, cv_i_ptr);
+      exact_override_kind, cv_e_ptr, cv_i_ptr,
+      state.e_cold.empty() ? nullptr : state.e_cold.data());
   sync_kernel("Hydro1D enforce_2t_closure kernel failed");
   if (cfg.numerics.hydro.pressure_tension_cutoff) {
     apply_pressure_tension_cutoff_kernel<<<fw.blocks(), 256>>>(
@@ -3574,6 +3581,11 @@ void log_initial_mechanical_stability(const core::State& state, const core::Conf
   double T_lo = std::numeric_limits<double>::infinity();
   double T_hi = 0.0;
   double dpdr_min = std::numeric_limits<double>::infinity();
+  const std::size_t n_mat = cfg.materials.materials.size();
+  std::vector<double> p_min(n_mat, +std::numeric_limits<double>::infinity());
+  std::vector<double> p_max(n_mat, -std::numeric_limits<double>::infinity());
+  std::vector<double> p_sum(n_mat, 0.0);
+  std::vector<std::size_t> p_count(n_mat, 0);
   for (std::size_t c = 0; c < n; ++c) {
     if (has_void && state.cell_is_void[c] != 0u) {
       continue;
@@ -3593,6 +3605,7 @@ void log_initial_mechanical_stability(const core::State& state, const core::Conf
     const double rho_p = rho[c] * 1.02;
     double P_m = tab->ion.pressure(rho_m, Ti_c) + tab->electron.pressure(rho_m, Te_c);
     double P_p = tab->ion.pressure(rho_p, Ti_c) + tab->electron.pressure(rho_p, Te_c);
+    const double p_center = tab->ion.pressure(rho[c], Ti_c) + tab->electron.pressure(rho[c], Te_c);
     if (cfg.numerics.hydro.pressure_tension_cutoff) {
       // The closure floors the total pressure; the floored branch is flat (dP/drho = 0).
       P_m = std::max(P_m, cfg.numerics.hydro.pressure_tension_cutoff_value);
@@ -3601,6 +3614,10 @@ void log_initial_mechanical_stability(const core::State& state, const core::Conf
     if (!std::isfinite(P_m) || !std::isfinite(P_p)) {
       continue;
     }
+    p_min[static_cast<std::size_t>(m)] = std::min(p_min[static_cast<std::size_t>(m)], p_center);
+    p_max[static_cast<std::size_t>(m)] = std::max(p_max[static_cast<std::size_t>(m)], p_center);
+    p_sum[static_cast<std::size_t>(m)] += p_center;
+    ++p_count[static_cast<std::size_t>(m)];
     ++n_checked;
     const double dpdr = (P_p - P_m) / (rho_p - rho_m);
     if (!(dpdr < 0.0)) {
@@ -3613,17 +3630,45 @@ void log_initial_mechanical_stability(const core::State& state, const core::Conf
     T_hi = std::max(T_hi, Te_c);
     dpdr_min = std::min(dpdr_min, dpdr);
   }
-  if (n_unstable == 0) {
-    return;
+  if (n_unstable != 0) {
+    std::ostringstream oss;
+    oss << std::setprecision(4) << "Hydro1D: EOS isothermal compressibility is negative (dP/drho|_T < 0) in "
+        << n_unstable << " of " << n_checked << " non-void table-EOS cells at the initial state: rho in ["
+        << rho_lo << ", " << rho_hi << "] g/cc, Te in [" << T_lo << ", " << T_hi
+        << "] eV, min dP/drho|_T = " << dpdr_min * 1.0e-9 << " kbar/(g/cc)"
+        << " -- cells pinned at the temperature floor respond isothermally there and density "
+        << "perturbations grow exponentially from round-off; check the EOS cold curve and the initial state";
+    core::log_warning(oss.str());
   }
-  std::ostringstream oss;
-  oss << std::setprecision(4) << "Hydro1D: EOS isothermal compressibility is negative (dP/drho|_T < 0) in "
-      << n_unstable << " of " << n_checked << " non-void table-EOS cells at the initial state: rho in ["
-      << rho_lo << ", " << rho_hi << "] g/cc, Te in [" << T_lo << ", " << T_hi
-      << "] eV, min dP/drho|_T = " << dpdr_min * 1.0e-9 << " kbar/(g/cc)"
-      << " -- cells pinned at the temperature floor respond isothermally there and density "
-      << "perturbations grow exponentially from round-off; check the EOS cold curve and the initial state";
-  core::log_warning(oss.str());
+  // Initial pressure balance across materials (2026-09-16): an undriven
+  // interface moves until the total pressures on both sides agree, so report
+  // the per-material table pressure at t = 0 and the largest difference.
+  double p_lo = std::numeric_limits<double>::infinity();
+  double p_hi = -std::numeric_limits<double>::infinity();
+  std::ostringstream pmsg;
+  pmsg << std::scientific << std::setprecision(4) << "Hydro1D: initial total pressure by material [kbar]:";
+  for (std::size_t m = 0; m < n_mat; ++m) {
+    if (p_count[m] == 0) {
+      continue;
+    }
+    const double mean = p_sum[m] / static_cast<double>(p_count[m]);
+    pmsg << " " << cfg.materials.materials[m].name << " mean " << mean / 1.0e9
+         << " (min " << p_min[m] / 1.0e9 << ", max " << p_max[m] / 1.0e9 << ")";
+    p_lo = std::min(p_lo, mean);
+    p_hi = std::max(p_hi, mean);
+  }
+  if (std::isfinite(p_lo) && std::isfinite(p_hi)) {
+    const double mismatch = p_hi - p_lo;
+    pmsg << "; max mismatch " << mismatch / 1.0e9 << " kbar";
+    if (mismatch > 1.0e8) {
+      core::log_warning(pmsg.str() +
+                        " -- the material interfaces will move until the pressures agree; "
+                        "with Numerics.hydro.T_start_inactive_cells=\"cold_equilibrium\" give every "
+                        "material the same eos.cold_reference.P0");
+    } else {
+      core::log_info(pmsg.str());
+    }
+  }
 }
 
 }  // namespace

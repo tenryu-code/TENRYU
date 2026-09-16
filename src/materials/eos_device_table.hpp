@@ -3,6 +3,7 @@
 #include <cstdint>
 
 #include "materials/eos_device_table.cuh"
+#include "materials/cold_equilibrium_device.hpp"
 
 namespace tenryu::materials {
 
@@ -44,6 +45,7 @@ class DeviceEOSTable {
   double d_log_rho_inv_ = 0.0;
   double d_log_T_inv_ = 0.0;
   std::uint8_t supports_rho_e_reclosure_ = 0u;
+  DeviceColdEquilibriumTable cold_;
 
   void free_all();
 };

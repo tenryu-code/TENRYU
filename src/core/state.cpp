@@ -255,6 +255,9 @@ State State::allocate(const Config& cfg, const double hydro_t_start_eV) {
   state.Pe.reset(n_cells);
   state.Pi.reset(n_cells);
   state.Qvisc.reset(n_cells);
+  if (cfg.numerics.hydro.T_start_inactive_cells == "cold_equilibrium") {
+    state.e_cold.reset(n_cells);
+  }
   state.zmom_r2.reset(n_cells);
   state.zmom_r4.reset(n_cells);
   state.zmom_r2.fill(1.0);
@@ -456,7 +459,12 @@ State State::allocate(const Config& cfg, const double hydro_t_start_eV) {
   state.ray_density.reset(n_cells);
   state.laser_waveforms.resize(cfg.laser.beams.size());
 
-  const std::int8_t hydro_init = (hydro_t_start_eV == 0.0) ? 1 : 0;
+  // cold_equilibrium (NUMERICS §2.1.1): T_start_eV is the electron-temperature
+  // transition of the EOS branch, not a hydro mask, whichever entry point
+  // built the state.
+  const double hydro_t_start_eff =
+      (cfg.numerics.hydro.T_start_inactive_cells == "cold_equilibrium") ? 0.0 : hydro_t_start_eV;
+  const std::int8_t hydro_init = (hydro_t_start_eff == 0.0) ? 1 : 0;
   state.hydro_active.resize(n_cells, hydro_init);
   state.note_hydro_active_host_write();
   state.state_supply_mask.assign(n_cells, static_cast<std::int8_t>(0));
@@ -473,7 +481,7 @@ State State::allocate(const Config& cfg, const double hydro_t_start_eV) {
   state.state_supply_dPz_step = 0.0;
   state.cell_is_void.assign(n_cells, static_cast<std::uint8_t>(0));
   apply_button_dormant_storage_mask(state, cfg, n_cells);
-  state.hydro_t_start_eV = hydro_t_start_eV;
+  state.hydro_t_start_eV = hydro_t_start_eff;
 
   state.t = 0.0;
   state.step = 0;

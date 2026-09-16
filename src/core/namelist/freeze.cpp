@@ -623,6 +623,17 @@ py::dict serialize_materials(const Config::MaterialsConfig& materials) {
     m["eos_model"] = mat.eos_model;
     m["eos_file"] = mat.eos_file;
     m["sesame_material_id"] = mat.sesame_material_id;
+    m["sesame_cold_curve_rows"] = mat.sesame_cold_curve_rows;
+    {
+      py::dict cr;
+      cr["enabled"] = mat.cold_reference.enabled;
+      cr["rho_gcc"] = mat.cold_reference.rho0;
+      cr["Te0_eV"] = mat.cold_reference.Te0;
+      cr["Ti0_eV"] = mat.cold_reference.Ti0;
+      cr["P0_dyn_cm2"] = mat.cold_reference.P0;
+      cr["bulk_modulus_dyn_cm2"] = mat.cold_reference.K0;
+      m["cold_reference"] = cr;
+    }
     m["ideal_gas_gamma"] = mat.ideal_gas_gamma;
     m["cv_e_override"] = mat.cv_e_override;
     m["eos_T_ref_eV"] = mat.eos_T_ref_eV;
@@ -1359,6 +1370,14 @@ py::dict serialize_numerics(const Config::NumericsConfig& numerics) {
   hydro["enabled"] = numerics.hydro.enabled;
   hydro["compatible_energy"] = numerics.hydro.compatible_energy;
   hydro["T_start_inactive_cells"] = numerics.hydro.T_start_inactive_cells;
+  {
+    py::dict ce;
+    ce["transition_begin_fraction"] = numerics.hydro.cold_equilibrium.transition_begin_fraction;
+    ce["density_core_ratio"] = numerics.hydro.cold_equilibrium.density_core_ratio;
+    ce["density_outer_ratio"] = numerics.hydro.cold_equilibrium.density_outer_ratio;
+    ce["inverse_max_iterations"] = numerics.hydro.cold_equilibrium.inverse_max_iterations;
+    hydro["cold_equilibrium"] = ce;
+  }
   hydro["qei_heat_capacity"] = numerics.hydro.qei_heat_capacity;
   hydro["pressure_tension_cutoff"] = numerics.hydro.pressure_tension_cutoff;
   hydro["pressure_tension_cutoff_value"] = numerics.hydro.pressure_tension_cutoff_value;

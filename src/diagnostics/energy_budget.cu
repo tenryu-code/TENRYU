@@ -62,12 +62,17 @@ __device__ inline void compute_energy_contrib_1d_kernel_body(
     double* __restrict__ contrib_kin_nodal,
     const double* __restrict__ rho,
     const double* __restrict__ ee,
+    const double* __restrict__ e_cold,
     const double* __restrict__ ei,
     const double* __restrict__ vol,
     const double* __restrict__ mass,
     const double* __restrict__ v_r,
     const int n_cells) {
-  contrib_int_e[c] = rho[c] * ee[c] * vol[c];
+  // Cold-equilibrium branch: the electron internal energy is q_e + C(v)
+  // (state.ee holds q_e, state.e_cold holds C). Without the array the
+  // historic expression is used unchanged.
+  contrib_int_e[c] = (e_cold != nullptr) ? rho[c] * (ee[c] + e_cold[c]) * vol[c]
+                                         : rho[c] * ee[c] * vol[c];
   contrib_int_i[c] = rho[c] * ei[c] * vol[c];
 
   const double u = 0.5 * (v_r[c] + v_r[c + 1]);
@@ -85,6 +90,7 @@ __global__ void compute_energy_contrib_1d_kernel(
     double* __restrict__ contrib_kin_nodal,
     const double* __restrict__ rho,
     const double* __restrict__ ee,
+    const double* __restrict__ e_cold,
     const double* __restrict__ ei,
     const double* __restrict__ vol,
     const double* __restrict__ mass,
@@ -100,7 +106,7 @@ __global__ void compute_energy_contrib_1d_kernel(
 
   compute_energy_contrib_1d_kernel_body(c, contrib_int_e, contrib_int_i,
                                         contrib_kin, contrib_kin_nodal, rho,
-                                        ee, ei, vol, mass, v_r, n_cells);
+                                        ee, e_cold, ei, vol, mass, v_r, n_cells);
 }
 
 __global__ void compute_energy_contrib_2d_kernel(
@@ -472,6 +478,7 @@ bool compute_energy_totals_1d_contrib(const core::State& state,
       d_kin_nodal,
       state.rho.data(),
       state.ee.data(),
+      state.e_cold.empty() ? nullptr : state.e_cold.data(),
       state.ei.data(),
       state.vol.data(),
       state.mass.data(),

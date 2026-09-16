@@ -8,6 +8,7 @@
 namespace tenryu::materials {
 
 struct IonmixEOSData;
+struct ColdEquilibriumTable;
 
 struct EOSTable {
   std::vector<double> rho_grid;
@@ -18,6 +19,12 @@ struct EOSTable {
 
   std::vector<double> log_rho_grid;
   std::vector<double> log_T_grid;
+
+  // Cold-equilibrium branch attached to an electron table (non-owning; the
+  // owner is Config::MaterialsConfig::MatDef::cold_table). When set, pressure /
+  // energy / cv / temperature_from_energy return the corrected quantities of
+  // materials/cold_equilibrium.hpp; nullptr keeps the historic arithmetic.
+  const ColdEquilibriumTable* cold = nullptr;
 
   [[nodiscard]] std::size_t n_rho() const noexcept {
     return rho_grid.size();
@@ -53,9 +60,16 @@ struct EOSTableTriplet {
   EOSTable total;
 };
 
+// SESAME (rho, T) table from a raw 301/304 payload. A T = 0 row (cold curve)
+// is kept as `cold_curve_rows` synthetic rows T_k = T_1 / 2^k that hold the
+// linear-in-T interpolation between the cold curve and the first positive
+// isotherm; 0 drops the T <= 0 rows (historic behaviour). NUMERICS §1 (b).
+struct SesameEOSTableRaw;
+EOSTable sesame_table_from_raw(const SesameEOSTableRaw& raw, int cold_curve_rows);
 EOSTablePair load_sesame(const std::string& filename,
                          int mat_id,
-                         double zbar_hint = 0.0);
+                         double zbar_hint = 0.0,
+                         int cold_curve_rows = 12);
 // Ion table on the total (301) grid: ion = total - electron with the electron
 // (304) table resampled onto the 301 nodes by the same bilinear-log
 // interpolant used at runtime. 301/304 grids may differ (e.g. Polystyrene
