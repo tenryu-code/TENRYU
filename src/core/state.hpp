@@ -677,6 +677,12 @@ struct State {
   CellField1D cv_e;  // electron heat capacity [erg/(g*eV)], from table EOS or ideal gas
   CellField1D cv_i;  // ion heat capacity [erg/(g*eV)], from table EOS or ideal gas
   CellField1D cs;    // sound speed [cm/s], from table EOS or ideal gas fallback
+  // Cold-equilibrium mechanical energy C(v) per cell [erg/g] (materials/
+  // cold_equilibrium.hpp); sized only when Numerics.hydro.T_start_inactive_cells
+  // == "cold_equilibrium", written by the 1D 2T closure. state.ee then holds
+  // the electron caloric coordinate q_e and the physical electron energy is
+  // ee + e_cold (NUMERICS §1 (b)).
+  CellField1D e_cold;
   int av_max_cell_id = -1;
   int av_max_i = -1;
   int av_max_j = -1;

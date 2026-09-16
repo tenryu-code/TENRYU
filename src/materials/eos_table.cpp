@@ -1,8 +1,10 @@
 #include "materials/eos_table.hpp"
+#include "materials/cold_equilibrium_table.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <fstream>
+#include <iomanip>
 #include <limits>
 #include <sstream>
 #include <stdexcept>
@@ -92,7 +94,7 @@ double bilinear_log_interp(const EOSTable& table,
   return vx0 + ty * (vx1 - vx0);
 }
 
-EOSTable from_sesame_raw(const SesameEOSTableRaw& raw) {
+EOSTable from_sesame_raw(const SesameEOSTableRaw& raw, const int cold_curve_rows) {
   std::size_t rho_skip = 0;
   while (rho_skip < raw.rho_grid.size() && raw.rho_grid[rho_skip] <= 0.0) {
     ++rho_skip;
@@ -101,10 +103,35 @@ EOSTable from_sesame_raw(const SesameEOSTableRaw& raw) {
   while (T_skip < raw.T_grid_eV.size() && raw.T_grid_eV[T_skip] <= 0.0) {
     ++T_skip;
   }
+  // Cold-curve ladder (2026-09-15). SESAME 301/304 tables carry a T = 0
+  // isotherm (the cold curve). The log-bilinear interpolant cannot hold a
+  // T = 0 node, and dropping the row clamped every state below the first
+  // positive isotherm to that isotherm: 5263 deuterium starts at 290 K, so
+  // liquid D2 at 0.17 g/cc and 1 meV was evaluated at 290 K (P = 2.9 kbar)
+  // instead of on the cold curve (P = 0), and the CH/D2 interface of the NIF
+  // DS deck moved under that pressure difference. The last non-positive row is
+  // kept as the T = 0 anchor and represented by `cold_curve_rows` synthetic
+  // rows at T_k = T_1 / 2^k (k = rows..1) holding the linear-in-T
+  // interpolation between the cold curve and the first positive isotherm,
+  //   f(rho, T) = f_c(rho) + (T / T_1) (f_1(rho) - f_c(rho))   (P and e),
+  // which the existing interpolant reproduces to the log-interpolation error
+  // between adjacent ladder rows (< 7 % of the thermal part); below the lowest
+  // ladder row the state clamps to it. cold_curve_rows = 0 restores the
+  // historic behaviour (rows with T <= 0 dropped), bitwise.
+  const bool has_cold_curve =
+      T_skip > 0 && T_skip < raw.T_grid_eV.size() && cold_curve_rows > 0;
+  const std::size_t n_ladder =
+      has_cold_curve ? static_cast<std::size_t>(cold_curve_rows) : 0;
 
   EOSTable table;
   table.rho_grid.assign(raw.rho_grid.begin() + rho_skip, raw.rho_grid.end());
-  table.T_grid_eV.assign(raw.T_grid_eV.begin() + T_skip, raw.T_grid_eV.end());
+  const double T_1 = has_cold_curve ? raw.T_grid_eV[T_skip] : 0.0;
+  table.T_grid_eV.clear();
+  for (std::size_t k = n_ladder; k >= 1; --k) {
+    table.T_grid_eV.push_back(std::ldexp(T_1, -static_cast<int>(k)));
+  }
+  table.T_grid_eV.insert(table.T_grid_eV.end(),
+                         raw.T_grid_eV.begin() + T_skip, raw.T_grid_eV.end());
 
   const std::size_t n_rho_raw = raw.rho_grid.size();
   const std::size_t n_points = table.n_rho() * table.n_T();
@@ -112,11 +139,32 @@ EOSTable from_sesame_raw(const SesameEOSTableRaw& raw) {
   table.e_table.resize(n_points);
   for (std::size_t j = 0; j < table.n_T(); ++j) {
     for (std::size_t i = 0; i < table.n_rho(); ++i) {
-      const std::size_t src = (j + T_skip) * n_rho_raw + (i + rho_skip);
       const std::size_t dst = table.flat_index(i, j);
-      table.P_table[dst] = raw.pressure_dyne_per_cm2[src];
-      table.e_table[dst] = raw.energy_erg_per_g[src];
+      if (j < n_ladder) {
+        const std::size_t src_c = (T_skip - 1) * n_rho_raw + (i + rho_skip);
+        const std::size_t src_1 = T_skip * n_rho_raw + (i + rho_skip);
+        const double w = table.T_grid_eV[j] / T_1;
+        table.P_table[dst] =
+            raw.pressure_dyne_per_cm2[src_c] +
+            w * (raw.pressure_dyne_per_cm2[src_1] - raw.pressure_dyne_per_cm2[src_c]);
+        table.e_table[dst] =
+            raw.energy_erg_per_g[src_c] +
+            w * (raw.energy_erg_per_g[src_1] - raw.energy_erg_per_g[src_c]);
+      } else {
+        const std::size_t src = (j - n_ladder + T_skip) * n_rho_raw + (i + rho_skip);
+        table.P_table[dst] = raw.pressure_dyne_per_cm2[src];
+        table.e_table[dst] = raw.energy_erg_per_g[src];
+      }
     }
+  }
+  if (has_cold_curve) {
+    std::ostringstream msg;
+    msg << std::scientific << std::setprecision(3)
+        << "SESAME EOS table: T = 0 cold curve kept as a " << n_ladder
+        << "-row linear ladder from " << table.T_grid_eV.front() << " eV to "
+        << table.T_grid_eV[n_ladder - 1] << " eV below the first isotherm "
+        << T_1 << " eV (states below it were clamped to that isotherm before 2026-09-15)";
+    core::log_info(msg.str());
   }
   table.finalize();
   return table;
@@ -152,6 +200,10 @@ std::vector<double> make_log_uniform_grid(const std::size_t n,
 }
 
 }  // namespace
+
+EOSTable sesame_table_from_raw(const SesameEOSTableRaw& raw, const int cold_curve_rows) {
+  return from_sesame_raw(raw, cold_curve_rows);
+}
 
 void EOSTable::finalize() {
   assert_monotonic_positive(rho_grid, "EOS rho grid must be strictly increasing");
@@ -199,21 +251,50 @@ void EOSTable::finalize() {
 
 double EOSTable::pressure(const double rho, const double T_eV) const {
   TENRYU_ASSERT(!empty(), "EOSTable::pressure requires non-empty table");
-  return bilinear_log_interp(*this, P_table, rho, T_eV);
+  const double base = bilinear_log_interp(*this, P_table, rho, T_eV);
+  if (cold == nullptr || cold->empty()) {
+    return base;
+  }
+  const ColdEquilibriumView cv_view = cold->view();
+  return base - cold_gate(cv_view, T_eV).w * cold_reference(cv_view, rho).dC;
 }
 
 double EOSTable::energy(const double rho, const double T_eV) const {
   TENRYU_ASSERT(!empty(), "EOSTable::energy requires non-empty table");
-  return bilinear_log_interp(*this, e_table, rho, T_eV);
+  const double base = bilinear_log_interp(*this, e_table, rho, T_eV);
+  if (cold == nullptr || cold->empty()) {
+    return base;
+  }
+  const ColdEquilibriumView cv_view = cold->view();
+  const ColdGate g = cold_gate(cv_view, T_eV);
+  return base + (g.w - T_eV * g.dw - 1.0) * cold_reference(cv_view, rho).C;
 }
 
 double EOSTable::cv(const double rho, const double T_eV) const {
   TENRYU_ASSERT(!empty(), "EOSTable::cv requires non-empty table");
-  return bilinear_log_interp(*this, cv_table, rho, T_eV);
+  const double base = bilinear_log_interp(*this, cv_table, rho, T_eV);
+  if (cold == nullptr || cold->empty()) {
+    return base;
+  }
+  const ColdEquilibriumView cv_view = cold->view();
+  return base - T_eV * cold_gate(cv_view, T_eV).d2w * cold_reference(cv_view, rho).C;
 }
 
 double EOSTable::temperature_from_energy(const double rho, const double e) const {
   TENRYU_ASSERT(!empty(), "EOSTable::temperature_from_energy requires non-empty table");
+
+  if (cold != nullptr && !cold->empty()) {
+    // Cold-equilibrium electron table: invert q_e(v, T) with the shared
+    // safeguarded Newton/bisection (statuses 1/2 clamp to the table bounds,
+    // matching the historic clamping of this function).
+    const ColdEquilibriumView cv_view = cold->view();
+    const ColdInverseResult inv = cold_inverse_Te(
+        cv_view, rho, e, T_grid_eV.front(), T_grid_eV.back(),
+        std::numeric_limits<double>::quiet_NaN(),
+        [&](const double T) { return bilinear_log_interp(*this, e_table, rho, T); },
+        [&](const double T) { return bilinear_log_interp(*this, cv_table, rho, T); });
+    return inv.T;
+  }
 
   const double T_min = T_grid_eV.front();
   const double T_max = T_grid_eV.back();
@@ -222,8 +303,15 @@ double EOSTable::temperature_from_energy(const double rho, const double e) const
   if (e <= e_min) {
     return T_min;
   }
-  if (e >= e_max) {
+  if (e > e_max) {
     return T_max;
+  }
+  // Exact plateau at a temperature node: return the lowest node of the
+  // plateau (same rule as device_eos_T_from_e_monotone, 2026-09-16).
+  for (std::size_t j = 0; j < n_T(); ++j) {
+    if (energy(rho, T_grid_eV[j]) == e) {
+      return T_grid_eV[j];
+    }
   }
 
   double T_lo = T_min;
@@ -411,13 +499,14 @@ EOSTable build_sesame_ion_table(const EOSTable& total, const EOSTable& electron)
 
 EOSTablePair load_sesame(const std::string& filename,
                          const int mat_id,
-                         const double zbar_hint) {
+                         const double zbar_hint,
+                         const int cold_curve_rows) {
   const SesameData sesame = read_xsesame(filename, mat_id);
 
-  EOSTable total = from_sesame_raw(*sesame.table_301_total);
+  EOSTable total = from_sesame_raw(*sesame.table_301_total, cold_curve_rows);
   EOSTable electron;
   if (sesame.table_304_electron.has_value()) {
-    electron = from_sesame_raw(*sesame.table_304_electron);
+    electron = from_sesame_raw(*sesame.table_304_electron, cold_curve_rows);
   } else {
     // Approximation for 304-missing materials: split total EOS into electron/ion
     // pieces with a constant zbar_hint ratio. This is a 1T fallback only.

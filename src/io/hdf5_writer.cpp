@@ -2446,6 +2446,12 @@ void write_hydro_group(const hid_t file,
                         Qvisc.data(),
                         "dyne/cm2",
                         cfg);
+  if (state.e_cold.size() == static_cast<std::size_t>(n_cells)) {
+    // Cold-equilibrium mechanical energy C(v); hydro/ee holds q_e in this mode.
+    const auto e_cold = copy_field_to_host(state.e_cold);
+    write_numeric_dataset(file, "hydro", "e_cold", H5T_NATIVE_DOUBLE, cdim, e_cold.data(),
+                          "erg/g", cfg);
+  }
   if (state.hot_e_Q_host.size() == static_cast<std::size_t>(n_cells)) {
     write_numeric_dataset(file, "hydro", "hot_e_Q", H5T_NATIVE_DOUBLE, cdim,
                           state.hot_e_Q_host.data(), "erg/cm3/s", cfg);

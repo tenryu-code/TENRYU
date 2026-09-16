@@ -3,6 +3,7 @@
 #include <cmath>
 
 #include "core/macros.hpp"
+#include "materials/cold_equilibrium.hpp"
 #include "materials/eos_device_table.cuh"
 
 namespace tenryu::materials {
@@ -121,7 +122,7 @@ TENRYU_HOST_DEVICE inline double reclose_bilinear_log_interp(
 }
 
 template <bool SeparateProducts = false>
-TENRYU_HOST_DEVICE inline double reclose_pressure(
+TENRYU_HOST_DEVICE inline double reclose_pressure_base(
     const DeviceEOSTableView& table,
     const double rho,
     const double T_eV) {
@@ -129,7 +130,7 @@ TENRYU_HOST_DEVICE inline double reclose_pressure(
 }
 
 template <bool SeparateProducts = false>
-TENRYU_HOST_DEVICE inline double reclose_energy(
+TENRYU_HOST_DEVICE inline double reclose_energy_base(
     const DeviceEOSTableView& table,
     const double rho,
     const double T_eV) {
@@ -137,10 +138,44 @@ TENRYU_HOST_DEVICE inline double reclose_energy(
 }
 
 template <bool SeparateProducts = false>
-TENRYU_HOST_DEVICE inline double reclose_cv(const DeviceEOSTableView& table,
-                                             const double rho,
-                                             const double T_eV) {
+TENRYU_HOST_DEVICE inline double reclose_cv_base(const DeviceEOSTableView& table,
+                                                  const double rho,
+                                                  const double T_eV) {
   return reclose_bilinear_log_interp<SeparateProducts>(table, table.cv_table, rho, T_eV);
+}
+
+template <bool SeparateProducts = false>
+TENRYU_HOST_DEVICE inline double reclose_pressure(const DeviceEOSTableView& table,
+                                                  const double rho,
+                                                  const double T_eV) {
+  const double base = reclose_pressure_base<SeparateProducts>(table, rho, T_eV);
+  if (!cold_enabled(table.cold)) {
+    return base;
+  }
+  return base - cold_gate(table.cold, T_eV).w * cold_reference(table.cold, rho).dC;
+}
+
+template <bool SeparateProducts = false>
+TENRYU_HOST_DEVICE inline double reclose_energy(const DeviceEOSTableView& table,
+                                                const double rho,
+                                                const double T_eV) {
+  const double base = reclose_energy_base<SeparateProducts>(table, rho, T_eV);
+  if (!cold_enabled(table.cold)) {
+    return base;
+  }
+  const ColdGate g = cold_gate(table.cold, T_eV);
+  return base + (g.w - T_eV * g.dw - 1.0) * cold_reference(table.cold, rho).C;
+}
+
+template <bool SeparateProducts = false>
+TENRYU_HOST_DEVICE inline double reclose_cv(const DeviceEOSTableView& table,
+                                            const double rho,
+                                            const double T_eV) {
+  const double base = reclose_cv_base<SeparateProducts>(table, rho, T_eV);
+  if (!cold_enabled(table.cold)) {
+    return base;
+  }
+  return base - T_eV * cold_gate(table.cold, T_eV).d2w * cold_reference(table.cold, rho).C;
 }
 
 template <bool SeparateProducts = false>
@@ -150,6 +185,13 @@ TENRYU_HOST_DEVICE inline double reclose_temperature_from_energy(
     const double e) {
   const double T_min = ::exp(table.log_T_grid[0]);
   const double T_max = ::exp(table.log_T_grid[table.n_T - 1]);
+  if (cold_enabled(table.cold)) {
+    const ColdInverseResult inv = cold_inverse_Te(
+        table.cold, rho, e, T_min, T_max, 0.0,
+        [&](const double T) { return reclose_energy_base<SeparateProducts>(table, rho, T); },
+        [&](const double T) { return reclose_cv_base<SeparateProducts>(table, rho, T); });
+    return inv.T;
+  }
   const double e_min = reclose_energy<SeparateProducts>(table, rho, T_min);
   const double e_max = reclose_energy<SeparateProducts>(table, rho, T_max);
   if (e <= e_min) {

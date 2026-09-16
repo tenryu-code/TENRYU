@@ -2,6 +2,16 @@
 
 配布スナップショットの更新記録です。日付はスナップショット作成日。
 
+## 2026-09-16
+
+### 機能追加
+
+- **低温平衡構成則 `Numerics.hydro.T_start_inactive_cells="cold_equilibrium"`（材料キー `eos.cold_reference`、数値パラメータ `Numerics.hydro.cold_equilibrium`）。** 表の極低温側の欠陥（cold curve の平坦化・張力・スピノーダル）に依らず、指定した参照状態を全圧 P0・体積弾性率 K0 の力学平衡に置き、電子温度が `T_start_eV` を超えると厳密に元の表へ戻ります。冷たい領域は剛体ではなく通常どおり圧縮・衝撃波に応答します。1D_SPH・2T・表 EOS 専用で、`Numerics.hydro.qei_heat_capacity="table"` が必須です。電子表に付けた cold branch は hydro 閉包・FLD/S_N・伝導・Qei・注入の全評価器に同じ写像で効きます。`state.ee` は電子熱量座標 q_e、`hydro/e_cold` に力学エネルギー C(v) を出力し、エネルギー台帳は q_e+C を集計します。起動時に材料ごとの初期全圧と最大不整合を報告します。NIF DS デッキの既定はこのモード（液体 D2 K0=1.2e9、ポリスチレン K0=5.8e10 dyn/cm²、遷移 1–2 eV）。既定経路（gxii / cbet の回帰）は bit 一致。
+
+### 不具合修正
+
+- **hydro の開始閾値 `Numerics.T_start_eV` が builder を経由しない状態確保でも同じ意味を持つように統一。** `T_start_inactive_cells="cold_equilibrium"` では、どの経路で状態を確保しても hydro の開始マスクは作られません。
+
 ## 2026-09-15
 
 ### 不具合修正
@@ -13,6 +23,7 @@
 - `Materials.materials[].opacity.tmat_skip_lte_repair` が namelist 検証時の変換にしか効いておらず、実行時の表再読み込み（FLD 1D/2D・S_N 1D/2D・IMC・persistent loop・硬 X 線診断）では常に修復が適用されていました。全読み込み点へ配線。
 - 表 EOS の音速テスト（`test_hydro_table_eos`）の期待値を、2026-07-26 の解析的局所微分（log 双線形補間の微分は格子節点で 1 次誤差）に合わせて更新（節点 5 %、log 中点 1 % の 2 段検査）。実装は不変。
 - **IMC 用の Fleck 因子下限による Δt 制約（`Numerics.dt.f_min_fleck`）が FLD / S_N の run にも掛かっていた。** NUMERICS §2.2 (c) の根拠は Monte Carlo の分散悪化で、FLD 側は f に下限を設けない仕様なのに、駆動側は輻射が有効なら常にこの Δt を評価していました。表 EOS の電子熱容量が表の床にある冷たく光学的に厚いセル（SESAME の液体 D2、25 meV）では β が発散して Δt が 1e-21 s に落ち、計算が進まなくなります（NIF DS デッキ、Tr = 55 eV）。`Radiation.mode = imc_ddmc` 以外では評価しないようにしました（persistent loop の複製も同じ）。1D FLD の既定経路（gxii / cbet の回帰、Marshak 波、灰色 FLD の輻射衝撃波・球面 5 % 摂動、Hammer–Rosen）は状態量が bit 一致で、変わるのは履歴ファイルの診断列 `diagnostics/dt_breakdown_history/dt_rad`（候補値が +∞ になる）だけです。
+- **SESAME 表の T = 0 等温線（cold curve）が捨てられ、低温状態が最初の正の等温線にクランプされていた。** 5263 重水素は 290 K（0.17 g/cc で P = 2.9 kbar）、7592 ポリスチレンの電子表は 2901 K が最低行のため、1 meV で初期化した液体 D2 と CH の界面に 2.9 kbar の圧力差が生じ、0.5〜2 ns で D2 側の密度が 12 % 下がり CH 側が 11 % 上がっていました。cold curve を保持し、最初の等温線との間を T について線形に補間する 12 本の合成行を置きます（`Materials.materials[].eos.sesame_cold_curve_rows`、0 で従来挙動）。
 - gxii 1D FLD 回帰の golden を、文書化済みの既定変更（Langdon 既定 ON など）の後に再基準化。
 
 ### 機能追加

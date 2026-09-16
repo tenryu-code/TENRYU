@@ -36,6 +36,7 @@
 #include "core/radiation_group_structure.hpp"
 #include "hydro/pressure_drive_perturbation.cuh"
 #include "core/zoning_intent.hpp"
+#include "materials/cold_equilibrium_table.hpp"
 #include "materials/eos_table.hpp"
 #include "materials/ionmix_reader.hpp"
 #include "materials/tmat_reader.hpp"
@@ -4777,7 +4778,7 @@ void Builder::set_materials(py::dict kwargs) {
       }
       const py::dict eos = py::reinterpret_borrow<py::dict>(eos_obj);
       enforce_known_keys(eos, "Materials.materials.eos",
-                         {"model", "file", "sesame_material_id", "ideal_gas",
+                         {"model", "file", "sesame_material_id", "sesame_cold_curve_rows", "cold_reference", "ideal_gas",
                           "cv_e_override", "eos_T_ref_eV", "hydro_backend",
                           "mg_T_ref_eV", "mg_dT_rel", "f_erg_g", "beta",
                           "mu_rho", "gamma_p", "step_D_erg_g_eV",
@@ -4803,6 +4804,46 @@ void Builder::set_materials(py::dict kwargs) {
         def.sesame_material_id = strict_int32(
             eos["sesame_material_id"],
             "Materials.materials[" + std::to_string(i) + "].eos.sesame_material_id");
+      }
+      if (has_key(eos, "sesame_cold_curve_rows")) {
+        def.sesame_cold_curve_rows = strict_int32(
+            eos["sesame_cold_curve_rows"],
+            "Materials.materials[" + std::to_string(i) + "].eos.sesame_cold_curve_rows");
+        if (def.sesame_cold_curve_rows < 0 || def.sesame_cold_curve_rows > 60) {
+          throw ValueError(
+              "Materials.materials[" + std::to_string(i) +
+              "].eos.sesame_cold_curve_rows must be in [0, 60], got " +
+              std::to_string(def.sesame_cold_curve_rows));
+        }
+      }
+      if (has_key(eos, "cold_reference")) {
+        const py::object cr_obj = eos["cold_reference"];
+        if (!py::isinstance<py::dict>(cr_obj)) {
+          throw ValueError("Materials.materials[" + std::to_string(i) +
+                           "].eos.cold_reference must be a dict");
+        }
+        const py::dict cr = py::reinterpret_borrow<py::dict>(cr_obj);
+        enforce_known_keys(cr, "Materials.materials.eos.cold_reference",
+                           {"rho_gcc", "Te0_eV", "Ti0_eV", "P0_dyn_cm2", "bulk_modulus_dyn_cm2"});
+        const std::string prefix =
+            "Materials.materials[" + std::to_string(i) + "].eos.cold_reference.";
+        for (const char* key : {"rho_gcc", "Te0_eV", "Ti0_eV", "bulk_modulus_dyn_cm2"}) {
+          if (!has_key(cr, key)) {
+            throw ValueError(prefix + key + " is required");
+          }
+        }
+        auto& cr_def = def.cold_reference;
+        cr_def.enabled = true;
+        cr_def.rho0 = numeric_as_double(cr["rho_gcc"], prefix + "rho_gcc");
+        cr_def.Te0 = numeric_as_double(cr["Te0_eV"], prefix + "Te0_eV");
+        cr_def.Ti0 = numeric_as_double(cr["Ti0_eV"], prefix + "Ti0_eV");
+        cr_def.P0 = has_key(cr, "P0_dyn_cm2") ? numeric_as_double(cr["P0_dyn_cm2"], prefix + "P0_dyn_cm2") : 0.0;
+        cr_def.K0 = numeric_as_double(cr["bulk_modulus_dyn_cm2"], prefix + "bulk_modulus_dyn_cm2");
+        if (!(cr_def.rho0 > 0.0) || !std::isfinite(cr_def.rho0) || !(cr_def.Te0 > 0.0) ||
+            !std::isfinite(cr_def.Te0) || !(cr_def.Ti0 > 0.0) || !std::isfinite(cr_def.Ti0) ||
+            !std::isfinite(cr_def.P0) || !(cr_def.K0 > 0.0) || !std::isfinite(cr_def.K0)) {
+          throw ValueError(prefix + "* requires rho_gcc > 0, Te0_eV > 0, Ti0_eV > 0, finite P0_dyn_cm2 and bulk_modulus_dyn_cm2 > 0");
+        }
       }
       if (has_key(eos, "cv_e_override")) {
         def.cv_e_override = numeric_as_double(
@@ -9304,7 +9345,7 @@ void Builder::set_numerics(py::dict kwargs) {
     }
     const py::dict hydro = py::reinterpret_borrow<py::dict>(hydro_obj);
     enforce_known_keys(hydro, "Numerics.hydro",
-                       {"enabled", "compatible_energy", "T_start_eV", "T_start_inactive_cells", "qei_heat_capacity", "pressure_tension_cutoff", "pressure_tension_cutoff_value", "boundary", "boundary_1d", "boundary_2d",
+                       {"enabled", "compatible_energy", "T_start_eV", "T_start_inactive_cells", "cold_equilibrium", "qei_heat_capacity", "pressure_tension_cutoff", "pressure_tension_cutoff_value", "boundary", "boundary_1d", "boundary_2d",
                        "av_type", "av_model", "rz_momentum_scheme", "corner_mass_convention",
                        "time_integration", "total_energy_identity_check",
                        "rz_momentum_scheme",
@@ -10449,11 +10490,47 @@ void Builder::set_numerics(py::dict kwargs) {
       numerics.hydro.T_start_inactive_cells = strict_string(
           hydro["T_start_inactive_cells"], "Numerics.hydro.T_start_inactive_cells");
       if (numerics.hydro.T_start_inactive_cells != "passive_fill" &&
-          numerics.hydro.T_start_inactive_cells != "rigid_wall") {
+          numerics.hydro.T_start_inactive_cells != "rigid_wall" &&
+          numerics.hydro.T_start_inactive_cells != "cold_equilibrium") {
         throw ValueError(
             "Numerics.hydro.T_start_inactive_cells must be one of "
-            "{\"passive_fill\", \"rigid_wall\"}, got " +
+            "{\"passive_fill\", \"rigid_wall\", \"cold_equilibrium\"}, got " +
             numerics.hydro.T_start_inactive_cells);
+      }
+    }
+    if (has_key(hydro, "cold_equilibrium")) {
+      const py::object ce_obj = hydro["cold_equilibrium"];
+      if (!py::isinstance<py::dict>(ce_obj)) {
+        throw ValueError("Numerics.hydro.cold_equilibrium must be a dict");
+      }
+      const py::dict ce = py::reinterpret_borrow<py::dict>(ce_obj);
+      enforce_known_keys(ce, "Numerics.hydro.cold_equilibrium",
+                         {"transition_begin_fraction", "density_core_ratio",
+                          "density_outer_ratio", "inverse_max_iterations"});
+      auto& cfg_ce = numerics.hydro.cold_equilibrium;
+      if (has_key(ce, "transition_begin_fraction")) {
+        cfg_ce.transition_begin_fraction = numeric_as_double(
+            ce["transition_begin_fraction"], "Numerics.hydro.cold_equilibrium.transition_begin_fraction");
+      }
+      if (has_key(ce, "density_core_ratio")) {
+        cfg_ce.density_core_ratio = numeric_as_double(
+            ce["density_core_ratio"], "Numerics.hydro.cold_equilibrium.density_core_ratio");
+      }
+      if (has_key(ce, "density_outer_ratio")) {
+        cfg_ce.density_outer_ratio = numeric_as_double(
+            ce["density_outer_ratio"], "Numerics.hydro.cold_equilibrium.density_outer_ratio");
+      }
+      if (has_key(ce, "inverse_max_iterations")) {
+        cfg_ce.inverse_max_iterations = strict_int32(
+            ce["inverse_max_iterations"], "Numerics.hydro.cold_equilibrium.inverse_max_iterations");
+      }
+      if (!(cfg_ce.transition_begin_fraction > 0.0 && cfg_ce.transition_begin_fraction < 1.0) ||
+          !(cfg_ce.density_core_ratio > 1.0) ||
+          !(cfg_ce.density_outer_ratio > cfg_ce.density_core_ratio) ||
+          cfg_ce.inverse_max_iterations < 8) {
+        throw ValueError(
+            "Numerics.hydro.cold_equilibrium requires 0 < transition_begin_fraction < 1, "
+            "1 < density_core_ratio < density_outer_ratio and inverse_max_iterations >= 8");
       }
     }
     if (has_key(hydro, "qei_heat_capacity")) {
@@ -15192,6 +15269,43 @@ void Builder::validate() {
         "Numerics.hydro.T_start_inactive_cells=\"rigid_wall\" requires "
         "Main.dimension=\"1D_SPH\"");
   }
+  if (numerics.hydro.T_start_inactive_cells == "cold_equilibrium") {
+    if (main.dimension != "1D_SPH") {
+      throw ConfigError("Numerics.hydro.T_start_inactive_cells=\"cold_equilibrium\" requires Main.dimension=\"1D_SPH\"");
+    }
+    if (!main.two_temperature) {
+      throw ConfigError("Numerics.hydro.T_start_inactive_cells=\"cold_equilibrium\" requires Main.temperature_model=\"2T\"");
+    }
+    if (!(numerics.T_start_eV > 0.0)) {
+      throw ConfigError("Numerics.hydro.T_start_inactive_cells=\"cold_equilibrium\" requires Numerics.hydro.T_start_eV > 0 (end of the electron-temperature transition)");
+    }
+    if (numerics.hydro.pressure_tension_cutoff) {
+      throw ConfigError("Numerics.hydro.T_start_inactive_cells=\"cold_equilibrium\" is incompatible with Numerics.hydro.pressure_tension_cutoff=True");
+    }
+    if (numerics.hydro.compatible_energy) {
+      throw ConfigError("Numerics.hydro.T_start_inactive_cells=\"cold_equilibrium\" is not available with compatible_energy=True (phase 1)");
+    }
+    if (numerics.persistent_loop.enabled) {
+      throw ConfigError("Numerics.hydro.T_start_inactive_cells=\"cold_equilibrium\" is not available with the persistent loop (phase 1)");
+    }
+    if (numerics.hydro.qei_heat_capacity != "table") {
+      throw ConfigError("Numerics.hydro.T_start_inactive_cells=\"cold_equilibrium\" requires Numerics.hydro.qei_heat_capacity=\"table\" (the electron-ion exchange must use the table heat capacities in cold table states; the ideal-gas heat capacity overshoots there)");
+    }
+    for (const auto& mat : materials.materials) {
+      if (mat.is_void) {
+        continue;
+      }
+      if (mat.eos_model != "sesame" && mat.eos_model != "ionmix" && mat.eos_model != "tmat") {
+        throw ConfigError("Numerics.hydro.T_start_inactive_cells=\"cold_equilibrium\" requires a table EOS (sesame/ionmix/tmat) for material '" + mat.name + "'");
+      }
+      if (!mat.cold_reference.enabled) {
+        throw ConfigError("Numerics.hydro.T_start_inactive_cells=\"cold_equilibrium\" requires Materials.materials[].eos.cold_reference for material '" + mat.name + "'");
+      }
+    }
+    // The threshold is the EOS transition, not a hydro mask: every cell keeps
+    // its mechanical response (NUMERICS §2.1.1).
+    hydro_t_start_eV = 0.0;
+  }
   if (numerics.hydro.qei_heat_capacity == "table" && main.dimension != "1D_SPH") {
     throw ConfigError(
         "Numerics.hydro.qei_heat_capacity=\"table\" requires "
@@ -17256,14 +17370,57 @@ void Builder::validate() {
       // ion table resamples 304 onto the 301 grid before differencing
       // (build_sesame_ion_table) — node-wise subtraction across differently
       // shaped arrays would be out-of-bounds.
-      auto [total, electron] = materials::load_sesame(mat.eos_file, mat.sesame_material_id);
+      auto [total, electron] = materials::load_sesame(
+          mat.eos_file, mat.sesame_material_id, 0.0, mat.sesame_cold_curve_rows);
       materials::EOSTable ion = materials::build_sesame_ion_table(total, electron);
       mat.eos_tables = std::make_shared<const materials::EOSTableTriplet>(
           materials::EOSTableTriplet{std::move(ion), std::move(electron), std::move(total)});
       tenryu::core::log_info("SESAME EOS loaded for material '" + mat.name +
                              "', table EOS active.");
     }
+    if (numerics.hydro.T_start_inactive_cells == "cold_equilibrium" && !mat.is_void) {
+      TENRYU_ASSERT(mat.eos_tables != nullptr,
+                    "cold_equilibrium requires the material's EOS tables");
+      materials::ColdEquilibriumParams cp;
+      cp.rho0 = mat.cold_reference.rho0;
+      cp.Te0 = mat.cold_reference.Te0;
+      cp.Ti0 = mat.cold_reference.Ti0;
+      cp.P0 = mat.cold_reference.P0;
+      cp.K0 = mat.cold_reference.K0;
+      cp.T_star = numerics.T_start_eV;
+      cp.T_begin_fraction = numerics.hydro.cold_equilibrium.transition_begin_fraction;
+      cp.density_core_ratio = numerics.hydro.cold_equilibrium.density_core_ratio;
+      cp.density_outer_ratio = numerics.hydro.cold_equilibrium.density_outer_ratio;
+      cp.max_iterations = numerics.hydro.cold_equilibrium.inverse_max_iterations;
+      mat.cold_table = std::make_shared<const materials::ColdEquilibriumTable>(
+          materials::build_cold_equilibrium_table(mat.eos_tables->ion, mat.eos_tables->electron, cp));
+      // Attach the cold branch to the electron table so that every evaluator
+      // (hydro closure, FLD/S_N matter updates, conduction reclosure, Qei,
+      // injections) sees the same cold-aware electron EOS (eos_table.hpp).
+      {
+        materials::EOSTableTriplet with_cold = *mat.eos_tables;
+        with_cold.electron.cold = mat.cold_table.get();
+        mat.eos_tables = std::make_shared<const materials::EOSTableTriplet>(std::move(with_cold));
+      }
+      const double P_table_ref =
+          mat.eos_tables->ion.pressure(cp.rho0, cp.Ti0) + mat.eos_tables->electron.pressure(cp.rho0, cp.Te0);
+      std::ostringstream cmsg;
+      cmsg << std::scientific << std::setprecision(4)
+           << "cold_equilibrium: material '" << mat.name << "' reference (rho0=" << cp.rho0
+           << " g/cc, Te0=" << cp.Te0 << " eV, Ti0=" << cp.Ti0 << " eV): table pressure "
+           << P_table_ref / 1.0e9 << " kbar -> P0 " << cp.P0 / 1.0e9 << " kbar, K0 "
+           << cp.K0 / 1.0e9 << " kbar, transition " << cp.T_begin_fraction * cp.T_star
+           << "-" << cp.T_star << " eV, density support x" << cp.density_core_ratio
+           << " (full) to x" << cp.density_outer_ratio << " (zero)";
+      tenryu::core::log_info(cmsg.str());
+    }
     mat.eos_signature = compute_material_eos_signature(mat);
+    if (mat.cold_table) {
+      fnv1a_mix_value(mat.eos_signature, mat.cold_reference.rho0);
+      fnv1a_mix_value(mat.eos_signature, mat.cold_reference.K0);
+      fnv1a_mix_value(mat.eos_signature, mat.cold_reference.P0);
+      fnv1a_mix_value(mat.eos_signature, numerics.T_start_eV);
+    }
     if (!mat.is_void && materials.zbar.model == "tabular") {
       std::string zbar_source_file;
       if ((mat.eos_model == "ionmix" || mat.eos_model == "tmat") &&

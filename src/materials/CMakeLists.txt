@@ -2,6 +2,7 @@ add_library(tenryu_materials STATIC
   eos.cpp
   eos_rho_e_table.cpp
   eos_table.cpp
+  cold_equilibrium_table.cpp
   helmholtz_jet.cpp
   helmholtz_jet_device.cu
   helmholtz_bspline.cpp
@@ -13,6 +14,7 @@ add_library(tenryu_materials STATIC
   opacity_diagnostics.cu
   eos_rho_e_device.cu
   eos_device_table.cu
+  cold_equilibrium_device.cu
   opacity_table.cpp
   # zbar_tf.cpp is compiled into tenryu_core (materials links it PUBLIC);
   # listing it here too would duplicate its symbols under whole-archive

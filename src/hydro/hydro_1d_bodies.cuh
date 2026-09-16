@@ -616,9 +616,19 @@ __device__ inline void compute_sound_speed_2t_kernel_body(
             : fmax(tenryu::materials::device_eos_cv(tab_ele, rb_ele, logTe), 0.0);
     const double cs_ion =
         tenryu::materials::device_eos_sound_speed(tab_ion, rb_ion, logTi, rho_i, cv_i);
-    const double cs_ele =
-        tenryu::materials::device_eos_sound_speed(tab_ele, rb_ele, logTe, rho_i, cv_e);
-    cs[i] = sqrt(cs_ion * cs_ion + cs_ele * cs_ele);
+    if (!tenryu::materials::cold_enabled(tab_ele.cold)) {
+      // Tables without a cold branch: the historic arithmetic, kept verbatim so
+      // that the default paths stay bitwise identical.
+      const double cs_ele =
+          tenryu::materials::device_eos_sound_speed(tab_ele, rb_ele, logTe, rho_i, cv_e);
+      cs[i] = sqrt(cs_ion * cs_ion + cs_ele * cs_ele);
+    } else {
+      // Cold-equilibrium electron branch: signed electron contribution (may be
+      // negative), see NUMERICS §1 (b).
+      const double cs2_ele =
+          tenryu::materials::device_eos_sound_speed2_signed(tab_ele, rb_ele, logTe, rho_i, cv_e);
+      cs[i] = sqrt(fmax(cs_ion * cs_ion + cs2_ele, 0.0));
+    }
     cs[i] = apply_exact_sound_speed_override(exact_override_kind, cs[i], rho_i, Pe[i], Pi[i]);
     return;
   }
@@ -1444,6 +1454,10 @@ __device__ inline void energy_update_with_old_volume_2t_kernel_body(
     eta_compatible[i] = dV_geom - dV;
   }
   const double rho_qei = fmax(rho_half[i], 0.0);
+  // Cold-equilibrium electron work pressure (P_e^N + (1 - w) D_C; equals
+  // Pe_half when the electron table has no cold branch).
+  const double Pe_work = tenryu::materials::cold_electron_work_pressure(
+      tab_ele.cold, rho_qei, fmax(Te_half[i], 0.0), Pe_half[i], vol_old[i] / m, vol[i] / m);
   const double z = (zbar != nullptr) ? fmax(zbar[i], 0.0) : fallback_z;
   double qei_term = 0.0;
   if (tab_ion.n_rho > 0 && tab_ele.n_rho > 0 &&
@@ -1478,7 +1492,7 @@ __device__ inline void energy_update_with_old_volume_2t_kernel_body(
       work_i += (1.0 - electron_frac_b) * pdv_total_b;
     } else {
       work_i += -Pi_half[i] * dV / m;
-      work_e += -Pe_half[i] * dV / m;
+      work_e += -Pe_work * dV / m;
     }
     if (q_heat_to_electron != 0) {
       work_e += q_work_b;
@@ -1519,7 +1533,7 @@ __device__ inline void energy_update_with_old_volume_2t_kernel_body(
     de_i += (1.0 - electron_frac) * pdv_total;
   } else {
     de_i += -Pi_half[i] * dV / m;
-    de_e += -Pe_half[i] * dV / m;
+    de_e += -Pe_work * dV / m;
   }
   if (q_heat_to_electron != 0) {
     de_e += q_work;
