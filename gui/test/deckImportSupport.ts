@@ -75,6 +75,11 @@ function comparableForm(form: FormState): unknown {
     f.mesh.nz = defaultFormState().mesh.nz;
   }
   if (f.mesh.grid1d === "graded") f.mesh.nr = f.mesh.segments.reduce((n,s)=>n+s.nr,0);
+  // Reference states and cold-equilibrium parameters are written only in that mode.
+  if (f.hydro.inactiveCells !== "cold_equilibrium") {
+    f.hydro.coldEquilibrium = defaultFormState().hydro.coldEquilibrium;
+    f.materials.forEach(material=>{ delete material.coldReference; });
+  }
   // Disabled branches carry no recoverable parameters beyond their enable bit.
   if (!f.laser.enabled) f.laser = defaultFormState().laser;
   if (!f.radiation.enabled) f.radiation = {...defaultFormState().radiation,enabled:false};

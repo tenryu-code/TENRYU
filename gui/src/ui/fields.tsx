@@ -25,7 +25,9 @@ export function QInput({
 }) {
   let cgs = "";
   try {
-    cgs = `= ${String(Number(toCanonical(value, kind).toPrecision(6)))} ${CANONICAL_UNIT[kind]}`;
+    // An empty entry (NaN) shows no conversion instead of "= NaN".
+    const canonical = toCanonical(value, kind);
+    cgs = Number.isFinite(canonical) ? `= ${String(Number(canonical.toPrecision(6)))} ${CANONICAL_UNIT[kind]}` : "";
   } catch {
     cgs = "";
   }

@@ -41,6 +41,7 @@ const cm = (q: Q) => toCanonical(q, "length");
 const sec = (q: Q) => toCanonical(q, "time");
 const eV = (q: Q) => toCanonical(q, "temperature");
 const watt = (q: Q) => toCanonical(q, "power");
+const dynCm2 = (q: Q) => toCanonical(q, "pressure");
 
 /** `<value>,` plus an original-unit comment when the input unit is not canonical. */
 function numC(value: number, orig: Q): string {
@@ -291,7 +292,11 @@ export function generateDeck(f: FormState): string {
     L.push(`            A=${pyNum(m.A)},`);
     L.push(`            Z=${pyNum(m.Z)},`);
     if (m.eosModel === "tmat") {
-      L.push(`            eos=dict(model="tmat", file=${pyStr(m.eosFile.trim())}),`);
+      const ref = f.hydro.inactiveCells === "cold_equilibrium" ? m.coldReference : undefined;
+      const coldRef = ref
+        ? `, cold_reference=dict(rho_gcc=${pyNum(ref.rhoGcc)}, Te0_eV=${pyNum(eV(ref.Te0))}, Ti0_eV=${pyNum(eV(ref.Ti0))}, P0_dyn_cm2=${pyNum(dynCm2(ref.P0))}, bulk_modulus_dyn_cm2=${pyNum(dynCm2(ref.K0))})`
+        : "";
+      L.push(`            eos=dict(model="tmat", file=${pyStr(m.eosFile.trim())}${coldRef}),`);
     } else {
       const cv = m.cvEOverride !== undefined && m.cvEOverride !== null ? `, cv_e_override=${pyNum(m.cvEOverride)}` : "";
       L.push(`            eos=dict(model="ideal_gas", ideal_gas=dict(gamma=${pyNum(m.gamma)})${cv}),`);
@@ -504,6 +509,18 @@ export function generateDeck(f: FormState): string {
   L.push(`        growth_factor=${pyNum(f.numerics.growthFactor)},`);
   L.push("    ),");
   const tStart = `, T_start_eV=${pyNum(f.hydro.tStartEV)}`;
+  // The inactive-cell treatment and the exchange heat capacity are written only
+  // when they differ from the solver defaults, so decks with default settings
+  // are unchanged; the cold-equilibrium parameters are written whenever that
+  // mode is selected. validateFormState restricts all three to 1D_SPH.
+  const hy = f.hydro;
+  const inactive = hy.inactiveCells === "passive_fill" ? "" : `, T_start_inactive_cells=${pyStr(hy.inactiveCells)}`;
+  const ce = hy.coldEquilibrium;
+  const coldEq =
+    hy.inactiveCells === "cold_equilibrium"
+      ? `, cold_equilibrium=dict(transition_begin_fraction=${pyNum(ce.transitionBeginFraction)}, density_core_ratio=${pyNum(ce.densityCoreRatio)}, density_outer_ratio=${pyNum(ce.densityOuterRatio)}, inverse_max_iterations=${pyNum(ce.inverseMaxIterations)})`
+      : "";
+  const qei = hy.qeiHeatCapacity === "table" ? `, qei_heat_capacity="table"` : "";
   const pv = f.hydro.plasmaVisc;
   const pvisc = pv.enabled
     ? `, plasma_viscosity=dict(enabled=True, model=${pyStr(pv.model)}, species=${pyStr(pv.species)}, eta_const=${pyNum(pv.etaConst)}, eta0_scale=${pyNum(pv.eta0Scale)}, mfp_cap_cells=${pyNum(pv.mfpCapCells)}, lnlambda_fixed=${pyNum(pv.lnLambdaFixed)}, dt_safety=${pyNum(pv.dtSafety)})`
@@ -518,7 +535,7 @@ export function generateDeck(f: FormState): string {
     L.push(`    hydro=dict(enabled=${pyBool(f.hydro.enabled)}${tStart}),`);
   } else {
     L.push(
-      `    hydro=dict(enabled=${pyBool(f.hydro.enabled)}, boundary_1d=${pyStr(f.hydro.boundary1d)}${bp}${tStart}${pvisc}, driver_full_step_retry_enabled=True),`,
+      `    hydro=dict(enabled=${pyBool(f.hydro.enabled)}, boundary_1d=${pyStr(f.hydro.boundary1d)}${bp}${tStart}${inactive}${coldEq}${qei}${pvisc}, driver_full_step_retry_enabled=True),`,
     );
   }
   const cn = f.conduction;

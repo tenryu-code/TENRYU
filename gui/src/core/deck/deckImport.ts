@@ -1,4 +1,4 @@
-import { defaultFormState, makeHotEChannel, validateFormState, type FormState } from "./formState";
+import { coldEquilibriumErrors, defaultFormState, emptyColdReference, makeHotEChannel, validateFormState, type FormState } from "./formState";
 import { defaultShape2D } from "../geometry2d";
 import { q, toCanonical, type Q } from "../units";
 import { BEAM_PRESETS, expandedPairCount, PAIR_CAP } from "./beamPresets";
@@ -11,6 +11,10 @@ export interface ImportRule {
   path: DeckPath;
   kind: "mapped" | "approximated" | "passthrough" | "omitted";
   reason: string;
+  /** Passthrough of a key the form did not write (for example a solver default
+   *  written explicitly in the source); an edit of the form field bound to
+   *  exactly this path replaces it instead of conflicting. */
+  sourceOnly?: boolean;
 }
 export interface ImportBinding { formPath: string; deckPath: DeckPath }
 export interface ImportEvaluationSettings {
@@ -115,6 +119,20 @@ export function mapRecordedDeck(record: DeckRecord): { form: FormState; bindings
       put(`${dest}.gamma`, [...src, "eos", "ideal_gas", "gamma"]);
       put(`${dest}.opacityModel`, [...src, "opacity", "model"], choice("constant", "tmat"));
       fields(dest, [...src, "opacity"], { opacityFile: "file", kappaA: "kappa_a", kappaS: "kappa_s" });
+      // Reference state of the cold-equilibrium EOS branch. Editing it, or the
+      // prefill when the mode is switched to cold_equilibrium, activates the
+      // whole source dict.
+      const coldSrc: DeckPath = [...src, "eos", "cold_reference"];
+      const coldRef = getAt(b, coldSrc);
+      if (coldRef && typeof coldRef === "object" && !coldRef._type) {
+        f.materials[i].coldReference = emptyColdReference();
+        put(`${dest}.coldReference.rhoGcc`, [...coldSrc, "rho_gcc"]);
+        put(`${dest}.coldReference.Te0`, [...coldSrc, "Te0_eV"], quantity("eV"));
+        put(`${dest}.coldReference.Ti0`, [...coldSrc, "Ti0_eV"], quantity("eV"));
+        put(`${dest}.coldReference.P0`, [...coldSrc, "P0_dyn_cm2"], quantity("dyn/cm²"));
+        put(`${dest}.coldReference.K0`, [...coldSrc, "bulk_modulus_dyn_cm2"], quantity("dyn/cm²"));
+      }
+      bind(`${dest}.coldReference`, coldSrc);
     });
     bind("materials.length", ["Materials", "materials"]);
   }
@@ -179,6 +197,10 @@ export function mapRecordedDeck(record: DeckRecord): { form: FormState; bindings
   for (const [key, src] of Object.entries({ dtInitial: "initial_s", dtMax: "max_s", dtMin: "min_s" })) put(`numerics.${key}`, ["Numerics", "dt", src], quantity("s"));
   fields("numerics.floors", ["Numerics", "floors"], { rhoFloorGcc: "rho_floor_gcc", TeFloorEV: "Te_floor_eV", TiFloorEV: "Ti_floor_eV" });
   fields("hydro", ["Numerics", "hydro"], { enabled: "enabled", tStartEV: "T_start_eV" });
+  put("hydro.inactiveCells", ["Numerics", "hydro", "T_start_inactive_cells"], choice("passive_fill", "rigid_wall", "cold_equilibrium"));
+  put("hydro.qeiHeatCapacity", ["Numerics", "hydro", "qei_heat_capacity"], choice("ideal_gas", "table"));
+  fields("hydro.coldEquilibrium", ["Numerics", "hydro", "cold_equilibrium"], { transitionBeginFraction: "transition_begin_fraction", densityCoreRatio: "density_core_ratio", densityOuterRatio: "density_outer_ratio", inverseMaxIterations: "inverse_max_iterations" });
+  bind("hydro.inactiveCells", ["Numerics", "hydro", "cold_equilibrium"]);
   put("hydro.boundary1d", ["Numerics", "hydro", "boundary_1d"], choice("free", "reflect", "pressure"));
   const pressure = b.Numerics?.hydro?.boundary_pressure?.curve;
   if (pressure?.kind === "constant") f.hydro.boundaryPressure.value = q(pressure.value*1e-12, "Mbar");
@@ -310,6 +332,11 @@ export function mapRecordedDeck(record: DeckRecord): { form: FormState; bindings
   }
   if (f.burn.enabled && (f.main.dimension!=="1D_SPH" || f.main.geometry1d!=="spherical")) placeholder("burn.enabled",false);
   if (f.laser.cbet.enabled && expandedPairCount(BEAM_PRESETS[f.laser.cbet.portPreset].ports.length,f.laser.cbet.nImpactBins)>PAIR_CAP) placeholder("laser.cbet.nImpactBins",d.laser.cbet.nImpactBins);
+  // Modes the form cannot represent (a non-TMAT EOS or an incomplete reference
+  // state under cold_equilibrium, 1D-only settings in 2D) keep the source value.
+  if (f.hydro.inactiveCells === "rigid_wall" && f.main.dimension !== "1D_SPH") placeholder("hydro.inactiveCells",d.hydro.inactiveCells);
+  if (f.hydro.inactiveCells === "cold_equilibrium" && coldEquilibriumErrors(f).length) placeholder("hydro.inactiveCells",d.hydro.inactiveCells);
+  if (f.hydro.qeiHeatCapacity === "table" && f.main.dimension !== "1D_SPH") placeholder("hydro.qeiHeatCapacity",d.hydro.qeiHeatCapacity);
   if (!(f.numerics.growthFactor>1 && f.numerics.growthFactor<=2)) placeholder("numerics.growthFactor",d.numerics.growthFactor);
   const initial = toCanonical(f.numerics.dtInitial,"time"), max = toCanonical(f.numerics.dtMax,"time");
   if (!(max>=initial)) placeholder("numerics.dtMax",q(initial,"s"));
@@ -333,7 +360,8 @@ export function importActivePaths(f: FormState): DeckPath[] {
 export function generateImportedDeck(f: FormState, plain: string): string {
   const state = f.deckImport!;
   const active = importActivePaths(f);
-  const conflicts = state.rules.filter(rule=>rule.kind==="passthrough" && active.some(p=>p.every((v,i)=>rule.path[i]===v) || rule.path.every((v,i)=>p[i]===v)));
+  const samePath = (a: DeckPath, b: DeckPath) => a.length===b.length && a.every((v,i)=>b[i]===v);
+  const conflicts = state.rules.filter(rule=>rule.kind==="passthrough" && !(rule.sourceOnly && active.some(p=>samePath(p,rule.path))) && active.some(p=>p.every((v,i)=>rule.path[i]===v) || rule.path.every((v,i)=>p[i]===v)));
   if (conflicts.length) throw new Error(t().deck.importConflict+"\n"+conflicts.map(r=>r.path.join(".")).join("\n"));
   const header = `# TENRYU-GUI-STATE: ${JSON.stringify(f)}`;
   if (!state.rules.some(rule=>rule.kind==="passthrough" || rule.kind==="omitted")) {

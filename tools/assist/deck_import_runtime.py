@@ -71,6 +71,9 @@ def _studio_import_prepare(source, filename, rules, active, current_file=None):
     original, _, calls = _studio_capture(source, filename)
     policies = {tuple(rule["path"]): rule["kind"] for rule in rules}
     activated = [tuple(path) for path in active]
+    # Keys only the source wrote (sourceOnly) whose form field was edited: the
+    # edit is bound to exactly that path, so the form value replaces the source.
+    editable = {tuple(rule["path"]) for rule in rules if rule.get("sourceOnly")} & set(activated)
     called = set()
     missing = object()
 
@@ -83,6 +86,8 @@ def _studio_import_prepare(source, filename, rules, active, current_file=None):
     def merge(old, new, path):
         policy = policies.get(path)
         if policy == "passthrough":
+            if path in editable and new is not missing:
+                return new
             return old
         if policy in ("mapped", "approximated"):
             return new

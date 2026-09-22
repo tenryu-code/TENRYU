@@ -146,6 +146,7 @@
         <li><strong>A/Z:</strong> Specify atomic mass A and atomic number Z.</li>
         <li><strong>EOS:</strong> For <code>ideal_gas</code>, specify γ and override cv<sub>e</sub> if needed. For a TMAT table, specify the table file.</li>
         <li><strong>Opacity:</strong> For <code>constant</code>, specify κ<sub>a</sub> and κ<sub>s</sub> [cm²/g]. Tabulated opacity is also available.</li>
+        <li><strong>Reference state:</strong> Appears when the treatment of cells below <code>T_start</code> on the Physics tab is <code>cold_equilibrium</code>. Specify the reference density ρ<sub>0</sub>, electron temperature T<sub>e0</sub>, ion temperature T<sub>i0</sub>, total pressure P<sub>0</sub>, and bulk modulus K<sub>0</sub> (<code>eos.cold_reference</code>). Selecting the mode fills in the density and temperatures of the first region made of the material (P<sub>0</sub> = 0); "Fill from initial state" copies them again. Enter K<sub>0</sub> per material (literature examples: liquid D2 1.2×10<sup>9</sup> dyn/cm², polystyrene 5.8×10<sup>10</sup> dyn/cm²).</li>
       </ul>
 
       <aside class="tip">
@@ -204,7 +205,9 @@
 
       <ul>
         <li><strong>Ion thermal conduction:</strong> Separately enable or disable ion thermal conduction.</li>
-        <li><strong>Hydrodynamics:</strong> Set enabled/disabled, outer boundary (<code>free</code> / <code>pressure</code>), and start time <code>T_start</code>.</li>
+        <li><strong>Hydrodynamics:</strong> Set enabled/disabled, the outer boundary (<code>free</code> / <code>reflect</code> / <code>pressure</code>), and the hydro start temperature <code>T_start</code> [eV] (a cell starts hydrodynamics when its electron temperature reaches this value; 0 = always on).</li>
+        <li><strong>Cells below T_start:</strong> <code>passive_fill</code> (default; no pressure, follows the neighbours), <code>rigid_wall</code> (keeps volume and energy as a rigid wall; 1D only), or <code>cold_equilibrium</code> (1D only). With <code>cold_equilibrium</code> hydrodynamics runs in every cell, and only while the electron temperature is at or below <code>T_start</code> the EOS is corrected so that each material's reference state is in mechanical equilibrium at total pressure P<sub>0</sub> with bulk modulus K<sub>0</sub> (the table is recovered above <code>T_start</code>). It requires a TMAT EOS for every material and 2T; selecting it sets the electron-ion exchange heat capacity to <code>table</code> and shows the reference-state fields on the Materials tab. The transition start, density range, and inversion iteration cap are under "details".</li>
+        <li><strong>Electron-ion exchange heat capacity:</strong> <code>ideal_gas</code> (default) or <code>table</code> (EOS-table heat capacity; 1D only).</li>
         <li><strong>Plasma viscosity:</strong> OFF by default.</li>
       </ul>
     </section>
