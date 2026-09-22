@@ -27,6 +27,22 @@ describe.skipIf(!enabled)("examples corpus (TENRYU_IMPORT_CORPUS=1)",()=>{
         const helpers: Record<string,string> = {
           "examples/verification/compare_ale_identity_diag.py":"SystemExit: 2",
           "examples/verification/i1b_polar_common.py":"No Main block was executed",
+          // NIF DS study: analysis scripts that require command-line arguments,
+          // and the deck, whose TMAT tables live in the study's working
+          // directory on the compute server (import it with the server venue).
+          "examples/nifds/ablation.py":"SystemExit: 2",
+          "examples/nifds/analyze.py":"TypeError: argument should be a str or an os.PathLike object",
+          "examples/nifds/compact_runs.py":"SystemExit: 2",
+          "examples/nifds/liquid_d2_1d.py":"must identify an existing TMAT table",
+          "examples/nifds/phase2/audit_table.py":"SystemExit: 2",
+          "examples/nifds/phase2/prepare_table.py":"SystemExit: 2",
+          "examples/nifds/phase2/run_infra_checks.py":"SystemExit: 2",
+          "examples/nifds/phase2/summarize_mesh_audit.py":"SystemExit: 2",
+          "examples/nifds/phase2/write_table_note.py":"SystemExit: 2",
+          "examples/nifds/run_case.py":"SystemExit: 2",
+          "examples/nifds/summarize.py":"SystemExit: 2",
+          "examples/nifds/table_inventory.py":"SystemExit: 2",
+          "examples/nifds/write_report.py":"SystemExit: 2",
         };
         expect(helpers[name],record.error).toBeTruthy();
         expect(record.error).toContain(helpers[name]);

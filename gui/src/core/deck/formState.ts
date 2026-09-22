@@ -24,6 +24,22 @@ export type RadMode = "multigroup_diffusion" | "sn_transport";
 export type OuterRadBc = "vacuum" | "reflect" | "marshak";
 export type ZRadBc = "vacuum" | "reflect";
 export type HydroBc1d = "free" | "reflect" | "pressure";
+/** Numerics.hydro.T_start_inactive_cells: treatment of cells whose electron
+ *  temperature is below Numerics.hydro.T_start_eV. */
+export type InactiveCellMode = "passive_fill" | "rigid_wall" | "cold_equilibrium";
+/** Numerics.hydro.qei_heat_capacity: heat capacities in the electron-ion exchange. */
+export type QeiHeatCapacity = "ideal_gas" | "table";
+
+/** Reference state of the cold-equilibrium EOS branch
+ *  (Materials.materials[].eos.cold_reference; NUMERICS §1 (b)). A NaN value
+ *  marks an entry that has not been filled in yet. */
+export interface ColdReferenceForm {
+  rhoGcc: number;
+  Te0: Q;
+  Ti0: Q;
+  P0: Q;
+  K0: Q;
+}
 
 export interface MaterialForm {
   name: string;
@@ -37,6 +53,8 @@ export interface MaterialForm {
   kappaA: number;
   kappaS: number;
   opacityFile: string;
+  /** Emitted as eos.cold_reference only when hydro.inactiveCells is "cold_equilibrium". */
+  coldReference?: ColdReferenceForm;
 }
 
 export interface RegionForm {
@@ -276,6 +294,15 @@ export interface FormState {
       points: WaveformPoint[];
     };
     tStartEV: number;
+    inactiveCells: InactiveCellMode;
+    qeiHeatCapacity: QeiHeatCapacity;
+    /** Numerics.hydro.cold_equilibrium (used with inactiveCells = "cold_equilibrium"). */
+    coldEquilibrium: {
+      transitionBeginFraction: number;
+      densityCoreRatio: number;
+      densityOuterRatio: number;
+      inverseMaxIterations: number;
+    };
     plasmaVisc: {
       enabled: boolean;
       model: "braginskii" | "constant";
@@ -345,6 +372,45 @@ export function ensureBackgroundGas(f: FormState): void {
     });
   }
   f.geometry.background2d.materialName = "gas";
+}
+
+/** Reference state with P0 = 0 and every other entry still to be filled in. */
+export function emptyColdReference(): ColdReferenceForm {
+  return {
+    rhoGcc: Number.NaN,
+    Te0: q(Number.NaN, "eV"),
+    Ti0: q(Number.NaN, "eV"),
+    P0: q(0, "GPa"),
+    K0: q(Number.NaN, "GPa"),
+  };
+}
+
+/** Reference state whose density and temperatures are the initial state of the
+ *  first 1D region made of the material (left empty when no region uses it);
+ *  P0 = 0 and the bulk modulus stays to be filled in. */
+export function coldReferenceFromInitialState(f: FormState, materialName: string): ColdReferenceForm {
+  const ref = emptyColdReference();
+  const region = f.geometry.regions.find((r) => r.materialName === materialName);
+  if (region) {
+    ref.rhoGcc = region.rho;
+    ref.Te0 = { ...region.Te };
+    ref.Ti0 = { ...region.Ti };
+  }
+  return ref;
+}
+
+/** Select the treatment of cells below the hydro start temperature (immer-style
+ *  draft). Selecting "cold_equilibrium" also selects the table heat capacities
+ *  for the electron-ion exchange, which the solver requires in that mode, and
+ *  gives every material without a reference state one prefilled from its
+ *  initial state. */
+export function setInactiveCellMode(f: FormState, mode: InactiveCellMode): void {
+  f.hydro.inactiveCells = mode;
+  if (mode !== "cold_equilibrium") return;
+  f.hydro.qeiHeatCapacity = "table";
+  for (const material of f.materials) {
+    if (!material.coldReference) material.coldReference = coldReferenceFromInitialState(f, material.name);
+  }
 }
 
 export function defaultFormState(): FormState {
@@ -528,6 +594,14 @@ export function defaultFormState(): FormState {
         ],
       },
       tStartEV: 0.0,
+      inactiveCells: "passive_fill",
+      qeiHeatCapacity: "ideal_gas",
+      coldEquilibrium: {
+        transitionBeginFraction: 0.5,
+        densityCoreRatio: 1.1,
+        densityOuterRatio: 1.5,
+        inverseMaxIterations: 80,
+      },
       plasmaVisc: {
         enabled: false,
         model: "braginskii",
@@ -592,7 +666,7 @@ export function migrateFormState(raw: FormState): FormState {
     ...raw,
     materials: (raw.materials ?? d.materials).map((mat) => {
       const partial = mat as Partial<MaterialForm> & Pick<MaterialForm, "name" | "A" | "Z" | "gamma">;
-      return {
+      const material = {
         eosModel: "ideal_gas" as const,
         eosFile: "",
         opacityModel: "constant" as const,
@@ -601,6 +675,10 @@ export function migrateFormState(raw: FormState): FormState {
         opacityFile: "",
         ...partial,
       } as MaterialForm;
+      if (partial.coldReference) {
+        material.coldReference = { ...emptyColdReference(), ...partial.coldReference };
+      }
+      return material;
     }),
     main: { ...d.main, ...raw.main },
     mesh: {
@@ -688,6 +766,12 @@ export function migrateFormState(raw: FormState): FormState {
       boundaryPressure: raw.hydro?.boundaryPressure ?? d.hydro.boundaryPressure,
       tStartEV:
         raw.hydro && typeof raw.hydro.tStartEV === "number" ? raw.hydro.tStartEV : d.hydro.tStartEV,
+      inactiveCells:
+        raw.hydro?.inactiveCells === "rigid_wall" || raw.hydro?.inactiveCells === "cold_equilibrium"
+          ? raw.hydro.inactiveCells
+          : d.hydro.inactiveCells,
+      qeiHeatCapacity: raw.hydro?.qeiHeatCapacity === "table" ? "table" : d.hydro.qeiHeatCapacity,
+      coldEquilibrium: { ...d.hydro.coldEquilibrium, ...raw.hydro?.coldEquilibrium },
       plasmaVisc: { ...d.hydro.plasmaVisc, ...raw.hydro?.plasmaVisc },
     },
     burn: {
@@ -777,6 +861,42 @@ export function effectiveLaserRaysPerBeam(f: FormState): number {
 
 const IDENT_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const NAME_RE = /^[A-Za-z0-9_-]+$/;
+
+/** Conditions of Numerics.hydro.T_start_inactive_cells="cold_equilibrium" as the
+ *  solver checks them at validation (src/core/namelist/builder.cpp): 1D_SPH, 2T,
+ *  T_start > 0, table heat capacities in the electron-ion exchange, parameter
+ *  ranges, and a TMAT EOS with a complete eos.cold_reference for every material. */
+export function coldEquilibriumErrors(f: FormState): string[] {
+  const v = t().validation;
+  const errs: string[] = [];
+  const positive = (x: number) => Number.isFinite(x) && x > 0;
+  if (f.main.dimension !== "1D_SPH") errs.push(v.coldEq1dOnly);
+  if (f.main.temperatureModel !== "2T") errs.push(v.coldEqNeeds2T);
+  if (!positive(f.hydro.tStartEV)) errs.push(v.coldEqNeedsTStart);
+  if (f.hydro.qeiHeatCapacity !== "table") errs.push(v.coldEqNeedsQeiTable);
+  const ce = f.hydro.coldEquilibrium;
+  if (!(ce.transitionBeginFraction > 0 && ce.transitionBeginFraction < 1)) errs.push(v.coldEqBeginFractionRange);
+  if (!(ce.densityCoreRatio > 1 && Number.isFinite(ce.densityOuterRatio) && ce.densityOuterRatio > ce.densityCoreRatio)) {
+    errs.push(v.coldEqDensityRatios);
+  }
+  if (!(Number.isInteger(ce.inverseMaxIterations) && ce.inverseMaxIterations >= 8 && ce.inverseMaxIterations <= 2147483647)) {
+    errs.push(v.coldEqMaxIterations);
+  }
+  for (const mat of f.materials) {
+    if (mat.eosModel !== "tmat") errs.push(v.coldEqNeedsTableEos(mat.name));
+    const ref = mat.coldReference;
+    if (!ref) {
+      errs.push(v.coldRefMissing(mat.name));
+      continue;
+    }
+    if (!positive(ref.rhoGcc)) errs.push(v.coldRefRhoPositive(mat.name));
+    if (!positive(toCanonical(ref.Te0, "temperature"))) errs.push(v.coldRefTe0Positive(mat.name));
+    if (!positive(toCanonical(ref.Ti0, "temperature"))) errs.push(v.coldRefTi0Positive(mat.name));
+    if (!Number.isFinite(toCanonical(ref.P0, "pressure"))) errs.push(v.coldRefP0Finite(mat.name));
+    if (!positive(toCanonical(ref.K0, "pressure"))) errs.push(v.coldRefK0Positive(mat.name));
+  }
+  return errs;
+}
 
 /** Form validation in the current UI language. Empty result = generatable. */
 export function validateFormState(f: FormState): string[] {
@@ -1076,6 +1196,13 @@ export function validateFormState(f: FormState): string[] {
   if (!(Number.isFinite(f.hydro.tStartEV) && f.hydro.tStartEV >= 0)) {
     errs.push(t().validation.hydroTStartNonNeg);
   }
+  if (f.hydro.inactiveCells === "rigid_wall" && f.main.dimension !== "1D_SPH") {
+    errs.push(v.hydroRigidWall1dOnly);
+  }
+  if (f.hydro.qeiHeatCapacity === "table" && f.main.dimension !== "1D_SPH") {
+    errs.push(v.qeiTable1dOnly);
+  }
+  if (f.hydro.inactiveCells === "cold_equilibrium") errs.push(...coldEquilibriumErrors(f));
   const pv = f.hydro.plasmaVisc;
   if (pv.enabled) {
     if (f.main.dimension !== "1D_SPH") errs.push(v.pvisc1dOnly);

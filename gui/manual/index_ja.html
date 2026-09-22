@@ -146,6 +146,7 @@
         <li><strong>A/Z:</strong> 原子量 A と原子番号 Z を指定します。</li>
         <li><strong>EOS:</strong> <code>ideal_gas</code> では γ を指定し、必要なら cv<sub>e</sub> を上書きします。TMAT テーブルを使う場合はテーブルファイルを指定します。</li>
         <li><strong>不透明度:</strong> <code>constant</code> では κ<sub>a</sub>、κ<sub>s</sub> [cm²/g] を指定します。テーブル不透明度も選択できます。</li>
+        <li><strong>参照状態:</strong> 物理タブで <code>T_start</code> 未満のセルの扱いを <code>cold_equilibrium</code> にすると現れます。参照密度 ρ<sub>0</sub>、参照電子温度 T<sub>e0</sub>、参照イオン温度 T<sub>i0</sub>、参照全圧 P<sub>0</sub>、体積弾性率 K<sub>0</sub> を指定します (<code>eos.cold_reference</code>)。モードを選んだ時点で、その材料の最初の領域の密度と温度が入り (P<sub>0</sub> = 0)、「初期状態から設定」で入れ直せます。K<sub>0</sub> は材料ごとに入力します (文献値の例: 液体 D2 1.2×10<sup>9</sup> dyn/cm²、ポリスチレン 5.8×10<sup>10</sup> dyn/cm²)。</li>
       </ul>
 
       <aside class="tip">
@@ -204,7 +205,9 @@
 
       <ul>
         <li><strong>イオン熱伝導:</strong> イオンの熱伝導を個別に ON/OFF します。</li>
-        <li><strong>流体:</strong> 有効化、外側境界 (<code>free</code> / <code>pressure</code>)、開始時刻 <code>T_start</code> を設定します。</li>
+        <li><strong>流体:</strong> 有効化、外側境界 (<code>free</code> / <code>reflect</code> / <code>pressure</code>)、流体開始温度 <code>T_start</code> [eV] (セルの電子温度がこの値に達するまで流体計算をしない。0 = 常時有効) を設定します。</li>
+        <li><strong>T_start 未満のセルの扱い:</strong> <code>passive_fill</code> (既定。圧力を持たず隣接セルに追従)、<code>rigid_wall</code> (剛体壁として体積とエネルギーを保持、1D 専用)、<code>cold_equilibrium</code> (1D 専用) から選びます。<code>cold_equilibrium</code> では流体計算を全セルで行い、電子温度が <code>T_start</code> 以下のときだけ EOS を補正して、各材料の参照状態を全圧 P<sub>0</sub>・体積弾性率 K<sub>0</sub> の力学平衡に置きます (<code>T_start</code> を超えると元の表に戻ります)。全材料の TMAT EOS と 2T が必要で、選ぶと電子・イオン交換の比熱が <code>table</code> になり、材料タブに参照状態の欄が現れます。遷移開始比・密度範囲・逆変換の反復上限は「詳細」で変えられます。</li>
+        <li><strong>電子・イオン交換の比熱:</strong> <code>ideal_gas</code> (既定) または <code>table</code> (EOS 表の比熱、1D 専用)。</li>
         <li><strong>プラズマ粘性:</strong> 既定は OFF です。</li>
       </ul>
     </section>

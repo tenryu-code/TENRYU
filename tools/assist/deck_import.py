@@ -462,7 +462,10 @@ def make_rules(original, candidate, context=None):
         if old is missing:
             rules.append({"path": list(path), "kind": "omitted", "reason": "Absent from source; GUI default is not added"})
         elif new is missing:
-            rules.append({"path": list(path), "kind": "passthrough", "reason": "Outside the form's emitted settings"})
+            # The form did not write this key (for example because the GUI
+            # omits solver defaults). sourceOnly lets an edit of the form field
+            # bound to exactly this path replace the retained source value.
+            rules.append({"path": list(path), "kind": "passthrough", "reason": "Outside the form's emitted settings", "sourceOnly": True})
         elif isinstance(old, dict) and isinstance(new, dict):
             if not old and not new:
                 rules.append({"path": list(path), "kind": "mapped", "reason": "Empty block/dictionary"})

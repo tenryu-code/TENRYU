@@ -1,9 +1,22 @@
 import { useState } from "react";
 import { t } from "../../i18n";
 import { currentProfile, useApp } from "../../store";
-import { NumInput, SelectField, TextField } from "../fields";
+import { NumInput, QInput, SelectField, TextField } from "../fields";
 import { Button } from "@tenryu-common/ui/kit";
 import RemoteFileBrowser from "../RemoteFileBrowser";
+import {
+  coldReferenceFromInitialState,
+  emptyColdReference,
+  type ColdReferenceForm,
+  type FormState,
+} from "../../core/deck/formState";
+
+/** The material's reference state in an immer-style draft, created empty on first edit. */
+function coldReferenceDraft(f: FormState, i: number): ColdReferenceForm {
+  const material = f.materials[i];
+  if (!material.coldReference) material.coldReference = emptyColdReference();
+  return material.coldReference;
+}
 
 export default function MaterialsSection() {
   const m = t();
@@ -19,6 +32,7 @@ export default function MaterialsSection() {
     const i = s.lastIndexOf("/");
     return s.startsWith("/") && i > 0 ? s.slice(0, i) : "";
   };
+  const coldEquilibrium = form.hydro.inactiveCells === "cold_equilibrium";
   return (
     <div className="max-w-xl flex flex-col gap-1">
       <h1 className="mb-2 text-base font-semibold">{m.form.materialsTitle}</h1>
@@ -81,6 +95,55 @@ export default function MaterialsSection() {
               </Button>
             </div>
           )}
+          {coldEquilibrium && (() => {
+            const ref = material.coldReference ?? emptyColdReference();
+            return (
+              <div className="my-1 rounded border p-2" style={{ borderColor: "var(--separator)" }}>
+                <div className="mb-1 text-xs font-semibold">{m.form.coldRefTitle}</div>
+                <NumInput
+                  label={m.form.coldRefRho}
+                  value={ref.rhoGcc}
+                  onChange={(n) => update((f) => { coldReferenceDraft(f, i).rhoGcc = n ?? Number.NaN; })}
+                />
+                <QInput
+                  label={m.form.coldRefTe0}
+                  kind="temperature"
+                  value={ref.Te0}
+                  onChange={(v) => update((f) => { coldReferenceDraft(f, i).Te0 = v; })}
+                />
+                <QInput
+                  label={m.form.coldRefTi0}
+                  kind="temperature"
+                  value={ref.Ti0}
+                  onChange={(v) => update((f) => { coldReferenceDraft(f, i).Ti0 = v; })}
+                />
+                <QInput
+                  label={m.form.coldRefP0}
+                  kind="pressure"
+                  value={ref.P0}
+                  onChange={(v) => update((f) => { coldReferenceDraft(f, i).P0 = v; })}
+                />
+                <QInput
+                  label={m.form.coldRefK0}
+                  kind="pressure"
+                  value={ref.K0}
+                  onChange={(v) => update((f) => { coldReferenceDraft(f, i).K0 = v; })}
+                />
+                <Button
+                  onClick={() => update((f) => {
+                    const initial = coldReferenceFromInitialState(f, f.materials[i].name);
+                    const draft = coldReferenceDraft(f, i);
+                    draft.rhoGcc = initial.rhoGcc;
+                    draft.Te0 = initial.Te0;
+                    draft.Ti0 = initial.Ti0;
+                  })}
+                >
+                  {m.form.coldRefFromInitial}
+                </Button>
+                <p className="mt-1 text-xs" style={{ color: "var(--fg-secondary)" }}>{m.form.coldRefHint}</p>
+              </div>
+            );
+          })()}
           <SelectField
             label={m.form.matOpacityModel}
             value={material.opacityModel}

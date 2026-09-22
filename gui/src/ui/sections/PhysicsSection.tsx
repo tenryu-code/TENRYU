@@ -3,7 +3,12 @@ import { currentProfile, useApp } from "../../store";
 import { BoundsInput, MultiCheckField, NumInput, QInput, SelectField, SwitchField } from "../fields";
 import { Button, FieldGroup } from "@tenryu-common/ui/kit";
 import WaveformEditor from "../WaveformEditor";
-import { conductionFLimDefault } from "../../core/deck/formState";
+import {
+  conductionFLimDefault,
+  setInactiveCellMode,
+  type InactiveCellMode,
+  type QeiHeatCapacity,
+} from "../../core/deck/formState";
 
 export default function PhysicsSection() {
   const m = t();
@@ -230,9 +235,62 @@ export default function PhysicsSection() {
       )}
       <NumInput
         label={m.form.hydroTStart}
+        hint={m.form.hydroTStartHint}
         value={form.hydro.tStartEV}
         onChange={(n) => update((f) => { f.hydro.tStartEV = n ?? 0; })}
       />
+      <SelectField
+        label={m.form.hydroInactiveCells}
+        value={form.hydro.inactiveCells}
+        options={[
+          { value: "passive_fill", label: m.form.hydroInactivePassiveFill },
+          { value: "rigid_wall", label: m.form.hydroInactiveRigidWall },
+          { value: "cold_equilibrium", label: m.form.hydroInactiveColdEquilibrium },
+        ]}
+        onChange={(v) => update((f) => { setInactiveCellMode(f, v as InactiveCellMode); })}
+      />
+      <p className="text-xs" style={{ color: "var(--fg-secondary)", maxWidth: "26rem" }}>
+        {form.hydro.inactiveCells === "rigid_wall"
+          ? m.form.hydroInactiveRigidWallHint
+          : form.hydro.inactiveCells === "cold_equilibrium"
+            ? m.form.hydroInactiveColdEquilibriumHint
+            : m.form.hydroInactivePassiveFillHint}
+      </p>
+      <SelectField
+        label={m.form.qeiHeatCapacity}
+        value={form.hydro.qeiHeatCapacity}
+        options={[
+          { value: "ideal_gas", label: m.form.qeiHeatCapacityIdealGas },
+          { value: "table", label: m.form.qeiHeatCapacityTable },
+        ]}
+        onChange={(v) => update((f) => { f.hydro.qeiHeatCapacity = v as QeiHeatCapacity; })}
+      />
+      {form.hydro.inactiveCells === "cold_equilibrium" && (
+        <details>
+          <summary>{m.form.coldEqAdvanced}</summary>
+          <NumInput
+            label={m.form.coldEqBeginFraction}
+            value={form.hydro.coldEquilibrium.transitionBeginFraction}
+            onChange={(n) => update((f) => { f.hydro.coldEquilibrium.transitionBeginFraction = n ?? 0.5; })}
+          />
+          <NumInput
+            label={m.form.coldEqCoreRatio}
+            value={form.hydro.coldEquilibrium.densityCoreRatio}
+            onChange={(n) => update((f) => { f.hydro.coldEquilibrium.densityCoreRatio = n ?? 1.1; })}
+          />
+          <NumInput
+            label={m.form.coldEqOuterRatio}
+            value={form.hydro.coldEquilibrium.densityOuterRatio}
+            onChange={(n) => update((f) => { f.hydro.coldEquilibrium.densityOuterRatio = n ?? 1.5; })}
+          />
+          <NumInput
+            int
+            label={m.form.coldEqMaxIterations}
+            value={form.hydro.coldEquilibrium.inverseMaxIterations}
+            onChange={(n) => update((f) => { f.hydro.coldEquilibrium.inverseMaxIterations = n ?? 80; })}
+          />
+        </details>
+      )}
       </FieldGroup>
       {form.hydro.enabled && form.main.dimension === "1D_SPH" && (
         <FieldGroup title={m.form.pviscTitle}>
