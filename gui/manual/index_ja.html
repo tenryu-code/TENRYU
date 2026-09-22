@@ -45,7 +45,7 @@
       <p>ヘッダーには「読込」「保存」「別名保存」、言語切替、実行サーバー選択、validate 実行、実行▶があります。左ナビには「プリセット」「基本設定」「材料」「ジオメトリー」「物理」「駆動」「出力」「実行履歴」「サーバー」が並び、中央に選択中のフォーム、右側に deck プレビューと検証パネルが表示されます。</p>
 
       <aside class="tip">
-        <strong>ヒント:</strong> デッキ先頭に埋め込まれる <code>TENRYU-GUI-STATE</code> コメントにより、保存したデッキを「読込」するとフォーム状態が完全復元されます。
+        <strong>ヒント:</strong> <code>TENRYU-GUI-STATE</code> コメントがあればフォームを完全復元します。コメントのない deck も、作業場所・環境変数・ローカルまたはサーバーの実行先を指定して Python を評価し、取込レポートを表示します。
       </aside>
 
       <figure>
@@ -146,6 +146,7 @@
         <li><strong>A/Z:</strong> 原子量 A と原子番号 Z を指定します。</li>
         <li><strong>EOS:</strong> <code>ideal_gas</code> では γ を指定し、必要なら cv<sub>e</sub> を上書きします。TMAT テーブルを使う場合はテーブルファイルを指定します。</li>
         <li><strong>不透明度:</strong> <code>constant</code> では κ<sub>a</sub>、κ<sub>s</sub> [cm²/g] を指定します。テーブル不透明度も選択できます。</li>
+        <li><strong>参照状態:</strong> 物理タブで <code>T_start</code> 未満のセルの扱いを <code>cold_equilibrium</code> にすると現れます。参照密度 ρ<sub>0</sub>、参照電子温度 T<sub>e0</sub>、参照イオン温度 T<sub>i0</sub>、参照全圧 P<sub>0</sub>、体積弾性率 K<sub>0</sub> を指定します (<code>eos.cold_reference</code>)。モードを選んだ時点で、その材料の最初の領域の密度と温度が入り (P<sub>0</sub> = 0)、「初期状態から設定」で入れ直せます。K<sub>0</sub> は材料ごとに入力します (文献値の例: 液体 D2 1.2×10<sup>9</sup> dyn/cm²、ポリスチレン 5.8×10<sup>10</sup> dyn/cm²)。</li>
       </ul>
 
       <aside class="tip">
@@ -204,7 +205,9 @@
 
       <ul>
         <li><strong>イオン熱伝導:</strong> イオンの熱伝導を個別に ON/OFF します。</li>
-        <li><strong>流体:</strong> 有効化、外側境界 (<code>free</code> / <code>pressure</code>)、開始時刻 <code>T_start</code> を設定します。</li>
+        <li><strong>流体:</strong> 有効化、外側境界 (<code>free</code> / <code>reflect</code> / <code>pressure</code>)、流体開始温度 <code>T_start</code> [eV] (セルの電子温度がこの値に達するまで流体計算をしない。0 = 常時有効) を設定します。</li>
+        <li><strong>T_start 未満のセルの扱い:</strong> <code>passive_fill</code> (既定。圧力を持たず隣接セルに追従)、<code>rigid_wall</code> (剛体壁として体積とエネルギーを保持、1D 専用)、<code>cold_equilibrium</code> (1D 専用) から選びます。<code>cold_equilibrium</code> では流体計算を全セルで行い、電子温度が <code>T_start</code> 以下のときだけ EOS を補正して、各材料の参照状態を全圧 P<sub>0</sub>・体積弾性率 K<sub>0</sub> の力学平衡に置きます (<code>T_start</code> を超えると元の表に戻ります)。全材料の TMAT EOS と 2T が必要で、選ぶと電子・イオン交換の比熱が <code>table</code> になり、材料タブに参照状態の欄が現れます。遷移開始比・密度範囲・逆変換の反復上限は「詳細」で変えられます。</li>
+        <li><strong>電子・イオン交換の比熱:</strong> <code>ideal_gas</code> (既定) または <code>table</code> (EOS 表の比熱、1D 専用)。</li>
         <li><strong>プラズマ粘性:</strong> 既定は OFF です。</li>
       </ul>
     </section>
@@ -290,7 +293,7 @@
       <pre><code>./build/tenryu run deck.py</code></pre>
 
       <aside class="tip">
-        <strong>ヒント:</strong> デッキはただの Python なので、保存後に手で編集しても構いません。ただし <code>TENRYU-GUI-STATE</code> コメントを消すとフォーム状態を復元できなくなります。
+        <strong>ヒント:</strong> 保存後に手で編集した Python を取り込むには <code>TENRYU-GUI-STATE</code> コメントを削除します。残っている場合はヘッダのフォーム状態を優先します。ファイル読込と貼付けのどちらでも、評価前に作業ディレクトリー、環境変数（1行に <code>KEY=VALUE</code>）、ローカルの <code>python3</code> または選択中のサーバーを指定できます。作業場所には deck を実行するディレクトリーを指定してください。「参照…」でサーバー上を移動し、「このフォルダーを選択」で設定できます。作業ディレクトリーを空のまま読み込むと、Studio はサーバー上の同名 deck を探し、その場所と親フォルダーを順に試して最初に成功した場所を採用します（⌘O では設定画面の前に自動で試し、失敗時は試した場所を表示）。サーバーの既定は一時転送先で、このまま失敗した場合は専用の案内を表示します。deck が読む環境変数名を文字列から検出して表示し、ソース変更時にも不足する NAME= 行を追加します。空値は送信せず、継承した環境変数や deck の既定値を使います。ファイル取込に成功すると、実行先・作業場所・環境変数欄をファイルパス別に直近50件までアプリ設定へ保存し、次回は実行先の既定値より優先して復元します。設定はセッション中にも保持し、取込レポートと保存ヘッダに記録します。環境変数の値はヘッダとアプリ設定に平文で保存されます。ソースと関数を子プロセスで複数回評価します（各45秒でタイムアウト）。サーバーでは同梱ハーネス、要求 JSON、deck をプロファイルの実行ディレクトリー配下の一時ディレクトリーに転送し、終了後に削除します。依存ファイルはそのサーバーに必要です。信頼できるコードを取り込んでください。レポートには対応付けた値、標本点で検証した関数、元の Python で保持する設定、追加しない既定値を表示します。フォームの値は取込時に固定され、元ソースで保持する設定は solver 実行時の作業場所と環境に従います。再実行ヘルパーはこれらを変更せず、取込時の環境変数指定も solver には適用しません。保持対象と衝突するフォーム編集はエラーになります。通常のローカル deck はサーバーやミラー不要ですが、mesh-planner の import にはローカルのミラーやサーバーの checkout が必要になる場合があります。<code>__file__</code> や元ファイル付近のモジュールに依存する場合は、任意の元ファイルパス欄を指定してください。保存後に移動する場合は参照データやモジュールも移してください。
       </aside>
     </section>
 
@@ -299,12 +302,16 @@
       <p>左ナビの「アシスタント」ビューは、LLM による 1D デッキ生成と決定論的な実行診断を提供します。既定では LLM 機能は無効で、環境変数 TENRYU_ASSIST_DISABLE=1 が常に優先される kill switch です。</p>
       <h3>準備</h3>
       <ul>
-        <li>ローカルに TENRYU チェックアウト (tools/assist を含む) が必要です。「設定」欄にそのパスを入力し「状態確認」を押すと、解決された設定 (有効/無効・ロール・モデル) が表示されます。</li>
-        <li>LLM 生成を使うには、チェックアウト直下または ~/.tenryu/ の assistant.toml で enabled = true と deck_design ロールのプロバイダを設定します (雛形: tools/assist/assistant.example.toml)。プロバイダ CLI (codex / claude) はローカルマシンで認証済みであることが前提です。</li>
+        <li>Mac 側には python3（Xcode コマンドラインツール付属）と、自分でログインした Claude Code か Codex CLI が必要です。</li>
+        <li>Mac に TENRYU を置く必要はありません。「文書とソースの取得元」でサーバープロファイルを選び「サーバーから同期」を押すと、サーバーのチェックアウトから文書・例題・ソースがアプリの設定フォルダに取り寄せられます（未同期なら最初の質問やデッキ生成で自動同期）。アシスタント本体（tools/assist）はアプリに同梱されているので、サーバー側チェックアウトには docs/ と src/ があれば十分です。開発者はローカルのチェックアウトを指定して代わりに使えます。</li>
+        <li>設定欄の「LLM 設定」でプロバイダ（Claude Code / Codex CLI の雛形）とモデル、役割の割当を選び「保存」すると、アプリの設定フォルダ（macOS では ~/Library/Application Support/jp.osaka-u.ile.tenryu-studio/assistant.toml）に書き出され、状態確認が再実行されます。</li>
+        <li>Studio が使う設定はアプリの設定フォルダの assistant.toml だけです（未作成なら LLM 機能は無効の既定のまま）。CLI 版 (tools/assist) は ./assistant.toml や ~/.tenryu/assistant.toml も探します（雛形: tools/assist/assistant.example.toml）。プロバイダ CLI (codex / claude) はローカルマシンで認証済みであることが前提です。</li>
         <li>デッキ検証は現在選択中のサーバープロファイルのバイナリで行われます (ssh プロファイルでは tools/assist/tenryu_remote.sh 経由)。ポート・鍵・ホストキー方針はプロファイル設定から自動で引き継がれます。</li>
       </ul>
+      <h3>質問</h3>
+      <p>「質問」欄に TENRYU についての質問を入力して送信すると、ローカルチェックアウトで <code>tools/assist/assist.py ask</code> が実行され、<code>question_answering</code> 役割に設定したプロバイダ（読み取り専用の CLI）が文書とソースを探索して回答します。回答末尾の根拠（<code>path:line</code>）と namelist キーは自動で実在を検査され、確認できなかった項目が表示されます。同じ会話で続けて質問すると前の往復が引き継がれます。作業ディレクトリはアプリの設定フォルダの <code>ask/&lt;stamp&gt;/</code> です。ヘッダーの「質問チャット」ボタン（⌘J / Ctrl+J）で右側にチャット欄が開き、どの画面からでも質問できる。Enter で送信、Shift+Enter で改行。</p>
       <h3>デッキ生成</h3>
-      <p>仕様を自然言語で書いて「生成」を押すと、生成 → サーバーでの validate/freeze → lint フィードバックの反復ループが走ります (最大反復 1–10)。モデルが不明点を推測せず質問してきた場合 (UNCERTAIN)、回答欄で答えて再生成できます。受理されたデッキはその場で検証・保存・実行でき、実行は通常の実行履歴に入ります。全 LLM 呼び出しは作業ディレクトリ (~/.tenryu/studio-assist/) の journal.jsonl に記録されます。</p>
+      <p>仕様を自然言語で書いて「生成」を押すと、生成 → サーバーでの validate/freeze → lint フィードバックの反復ループが走ります (最大反復 1–10)。モデルが不明点を推測せず質問してきた場合 (UNCERTAIN)、回答欄で答えて再生成できます。受理されたデッキはその場で検証・保存・実行でき、実行は通常の実行履歴に入ります。全 LLM 呼び出しはアプリの設定フォルダの作業ディレクトリ <code>generate/&lt;stamp&gt;/</code> にある journal.jsonl に記録されます。</p>
       <h3>Lint と診断</h3>
       <ul>
         <li>検証パネルの「詳細 Lint」は、現在のフォームデッキに対して solver の validate/freeze に加え、メッシュ・ゾーニング系の lint (節点単調性・隣接幅比・autozone 質量比・intent ピン検査) を実行します。</li>

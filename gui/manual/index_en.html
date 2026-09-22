@@ -45,7 +45,7 @@
       <p>The header contains Open, Save, Save As, the language selector, execution-server selector, Validate, and Run ▶. The left navigation contains Presets, Basic, Materials, Geometry, Physics, Drive, Output, Run History, and Servers. The selected form appears in the center, while the deck preview and validation panel appear on the right.</p>
 
       <aside class="tip">
-        <strong>Tip:</strong> A <code>TENRYU-GUI-STATE</code> comment embedded at the beginning of the deck lets Open restore the complete form state from a saved deck.
+        <strong>Tip:</strong> The <code>TENRYU-GUI-STATE</code> comment restores the exact form. Decks without it are also accepted: Studio lets you set the working directory, environment and local or server venue before executing Python, then shows an import report.
       </aside>
 
       <figure>
@@ -146,6 +146,7 @@
         <li><strong>A/Z:</strong> Specify atomic mass A and atomic number Z.</li>
         <li><strong>EOS:</strong> For <code>ideal_gas</code>, specify γ and override cv<sub>e</sub> if needed. For a TMAT table, specify the table file.</li>
         <li><strong>Opacity:</strong> For <code>constant</code>, specify κ<sub>a</sub> and κ<sub>s</sub> [cm²/g]. Tabulated opacity is also available.</li>
+        <li><strong>Reference state:</strong> Appears when the treatment of cells below <code>T_start</code> on the Physics tab is <code>cold_equilibrium</code>. Specify the reference density ρ<sub>0</sub>, electron temperature T<sub>e0</sub>, ion temperature T<sub>i0</sub>, total pressure P<sub>0</sub>, and bulk modulus K<sub>0</sub> (<code>eos.cold_reference</code>). Selecting the mode fills in the density and temperatures of the first region made of the material (P<sub>0</sub> = 0); "Fill from initial state" copies them again. Enter K<sub>0</sub> per material (literature examples: liquid D2 1.2×10<sup>9</sup> dyn/cm², polystyrene 5.8×10<sup>10</sup> dyn/cm²).</li>
       </ul>
 
       <aside class="tip">
@@ -204,7 +205,9 @@
 
       <ul>
         <li><strong>Ion thermal conduction:</strong> Separately enable or disable ion thermal conduction.</li>
-        <li><strong>Hydrodynamics:</strong> Set enabled/disabled, outer boundary (<code>free</code> / <code>pressure</code>), and start time <code>T_start</code>.</li>
+        <li><strong>Hydrodynamics:</strong> Set enabled/disabled, the outer boundary (<code>free</code> / <code>reflect</code> / <code>pressure</code>), and the hydro start temperature <code>T_start</code> [eV] (a cell starts hydrodynamics when its electron temperature reaches this value; 0 = always on).</li>
+        <li><strong>Cells below T_start:</strong> <code>passive_fill</code> (default; no pressure, follows the neighbours), <code>rigid_wall</code> (keeps volume and energy as a rigid wall; 1D only), or <code>cold_equilibrium</code> (1D only). With <code>cold_equilibrium</code> hydrodynamics runs in every cell, and only while the electron temperature is at or below <code>T_start</code> the EOS is corrected so that each material's reference state is in mechanical equilibrium at total pressure P<sub>0</sub> with bulk modulus K<sub>0</sub> (the table is recovered above <code>T_start</code>). It requires a TMAT EOS for every material and 2T; selecting it sets the electron-ion exchange heat capacity to <code>table</code> and shows the reference-state fields on the Materials tab. The transition start, density range, and inversion iteration cap are under "details".</li>
+        <li><strong>Electron-ion exchange heat capacity:</strong> <code>ideal_gas</code> (default) or <code>table</code> (EOS-table heat capacity; 1D only).</li>
         <li><strong>Plasma viscosity:</strong> OFF by default.</li>
       </ul>
     </section>
@@ -290,7 +293,7 @@
       <pre><code>./build/tenryu run deck.py</code></pre>
 
       <aside class="tip">
-        <strong>Tip:</strong> A deck is ordinary Python, so you may edit it by hand after saving. However, deleting the <code>TENRYU-GUI-STATE</code> comment prevents the form state from being restored.
+        <strong>Tip:</strong> Hand-edited Python can be imported by removing <code>TENRYU-GUI-STATE</code>; when the comment remains, its stored form takes precedence. Both Open and paste let you choose the working directory, environment variables (<code>KEY=VALUE</code> per line) and local <code>python3</code> or the selected server before evaluation. Choose the directory from which you run the deck. Browse beside the directory field opens a server directory picker; use Select this folder. With a blank working directory, Studio looks for same-named copies of the deck on the server and tries their directories and ancestors in turn, adopting the first that works (⌘O attempts this before showing the dialog and lists the directories tried on failure). The server default is the temporary upload directory, and a failure with this default includes specific guidance. Studio lists literal environment-variable reads found in the deck and appends missing NAME= lines as the source changes. Empty values are not sent (inherited values and deck defaults still apply). Successful file imports remember venue, directory and environment text by file path in app settings, up to the 50 most recent paths, and restore them ahead of the venue default. Settings also remain available for the session and are recorded in the import report and saved header. Environment values are stored as plain text in the header and app settings. Studio evaluates the source and callables several times in child processes (45-second timeout each). On a server it uploads the bundled harness, request and deck to a temporary directory under the profile's run directory and removes them afterwards; dependencies must exist on that server. Only import trusted code. The report lists mapped values, sampling-verified functions, source-preserved settings and omitted defaults. Mapped form values are fixed at import time; source-preserved settings follow the solver's run-time working directory and environment. Replay changes neither, and import environment overrides are not applied to solver runs. Conflicting form edits are rejected. Plain local decks need no server or mirror; mesh-planner imports may need a local mirror or the server checkout. Set the optional source filename when <code>__file__</code> or source-local imports matter. Move required data and modules along with a saved deck.
       </aside>
     </section>
 
@@ -299,12 +302,16 @@
       <p>The アシスタント/Assistant view in the left nav provides LLM-driven 1D deck generation and deterministic run diagnostics. LLM features are disabled by default; the environment variable TENRYU_ASSIST_DISABLE=1 is the always-winning kill switch.</p>
       <h3>Setup</h3>
       <ul>
-        <li>A local TENRYU checkout (containing tools/assist) is required. Enter its path in Setup and press "Check status" to see the resolved configuration (enabled state, roles, models).</li>
-        <li>To use LLM generation, configure assistant.toml (at the checkout root or under ~/.tenryu/) with enabled = true and a provider for the deck_design role (template: tools/assist/assistant.example.toml). The provider CLI (codex / claude) must be installed and authenticated on the local machine.</li>
+        <li>The Mac needs python3 (from the Xcode Command Line Tools) and your own logged-in Claude Code or Codex CLI.</li>
+        <li>No TENRYU checkout is needed on this machine. Choose a server profile under Documents and source and press Sync from server: documents, examples, and the source are fetched from the server checkout into the app configuration folder (the first question or deck generation syncs automatically when nothing is synced yet). The assistant harness (tools/assist) ships with the app, so the server checkout only needs docs/ and src/. Developers may point to a local checkout instead.</li>
+        <li>In the LLM settings form of the Setup panel, choose providers (Claude Code / Codex CLI templates), models and role assignments and press Save: the file is written to the app configuration folder (macOS: ~/Library/Application Support/jp.osaka-u.ile.tenryu-studio/assistant.toml) and the status check runs again.</li>
+        <li>Studio reads only the assistant.toml in its app configuration folder (LLM features stay at the disabled default until it exists). The CLI (tools/assist) also looks for ./assistant.toml and ~/.tenryu/assistant.toml (template: tools/assist/assistant.example.toml). The provider CLI (codex / claude) must be installed and authenticated on the local machine.</li>
         <li>Deck validation uses the currently selected server profile's binary (via tools/assist/tenryu_remote.sh for ssh profiles). Port, identity file, and host-key policy are forwarded automatically from the profile.</li>
       </ul>
+      <h3>Questions</h3>
+      <p>Type a question about TENRYU in the Question field and send it: Studio runs <code>tools/assist/assist.py ask</code> in the local checkout, and the provider configured for the <code>question_answering</code> role (a read-only CLI) explores the documents and source to answer. The <code>path:line</code> citations and namelist keys at the end of the answer are checked against the checkout automatically; anything that could not be verified is listed. Follow-up questions in the same conversation include the previous turns. The working directory is <code>ask/&lt;stamp&gt;/</code> under the app configuration folder. The Chat button in the header (⌘J / Ctrl+J) opens a chat column on the right that is available from every view; Enter sends, Shift+Enter inserts a newline.</p>
       <h3>Deck generation</h3>
-      <p>Write a natural-language specification and press Generate: the loop iterates generation → validate/freeze on the server → lint feedback (1–10 iterations). When the model asks instead of guessing (UNCERTAIN), answer in the reply box and regenerate. Accepted decks can be validated, saved, and run in place; runs enter the normal run history. Every LLM call is journaled in journal.jsonl under the workdir (~/.tenryu/studio-assist/).</p>
+      <p>Write a natural-language specification and press Generate: the loop iterates generation → validate/freeze on the server → lint feedback (1–10 iterations). When the model asks instead of guessing (UNCERTAIN), answer in the reply box and regenerate. Accepted decks can be validated, saved, and run in place; runs enter the normal run history. Every LLM call is journaled in journal.jsonl under the workdir (<code>generate/&lt;stamp&gt;/</code> under the app configuration folder).</p>
       <h3>Lint and diagnostics</h3>
       <ul>
         <li>The validate panel's "Assist lint" runs the solver's validate/freeze plus mesh/zoning lints (node monotonicity, adjacent width ratio, autozone mass ratio, intent-pin checks) against the current form deck.</li>
