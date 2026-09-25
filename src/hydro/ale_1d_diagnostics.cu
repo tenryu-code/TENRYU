@@ -6,6 +6,7 @@
 
 #include <cub/cub.cuh>
 
+#include "core/device_scratch.hpp"
 #include "core/error.hpp"
 #include "core/fancy_iterators.cuh"
 
@@ -18,45 +19,35 @@ inline void cuda_check(const cudaError_t err, const char* message) {
   TENRYU_ASSERT(err == cudaSuccess, message);
 }
 
+// Work buffer from the persistent device scratch pool: one buffer per tag,
+// kept across ALE attempts instead of a cudaMalloc/cudaFree pair per call
+// (cudaFree synchronizes the device). Contents are not zeroed, as with
+// cudaMalloc; two live buffers never share a tag.
 template <typename T>
 class DeviceBuffer {
  public:
-  explicit DeviceBuffer(const std::size_t count) {
-    reset(count);
+  DeviceBuffer() = default;
+
+  DeviceBuffer(const char* tag, const std::size_t count) {
+    reset(tag, count);
   }
 
-  ~DeviceBuffer() {
-    release();
-  }
-
-  DeviceBuffer(const DeviceBuffer&) = delete;
-  DeviceBuffer& operator=(const DeviceBuffer&) = delete;
-
-  void reset(const std::size_t count) {
-    release();
-    size_ = count;
-    if (size_ == 0) {
-      return;
-    }
-    cuda_check(cudaMalloc(reinterpret_cast<void**>(&ptr_), size_ * sizeof(T)),
-               "ALE1D diagnostics cudaMalloc failed");
+  void reset(const char* tag, const std::size_t count) {
+    ptr_ = (count == 0)
+               ? nullptr
+               : static_cast<T*>(core::device_scratch_acquire(tag, count * sizeof(T)));
   }
 
   T* data() noexcept {
     return ptr_;
   }
 
- private:
-  void release() {
-    if (ptr_ != nullptr) {
-      cuda_check(cudaFree(ptr_), "ALE1D diagnostics cudaFree failed");
-      ptr_ = nullptr;
-    }
-    size_ = 0;
+  const T* data() const noexcept {
+    return ptr_;
   }
 
+ private:
   T* ptr_ = nullptr;
-  std::size_t size_ = 0;
 };
 
 template <typename InputIt>
@@ -67,12 +58,12 @@ double reduce_sum(InputIt input,
   if (n <= 0) {
     return 0.0;
   }
-  DeviceBuffer<double> out(1);
+  DeviceBuffer<double> out("ale1d_diagnostics:reduce_sum:out", 1);
   std::size_t temp_bytes = 0;
   cuda_check(cub::DeviceReduce::Sum(nullptr, temp_bytes, input, out.data(), n,
                                     stream),
              label);
-  DeviceBuffer<unsigned char> temp(temp_bytes);
+  DeviceBuffer<unsigned char> temp("ale1d_diagnostics:reduce_sum:temp", temp_bytes);
   cuda_check(cub::DeviceReduce::Sum(temp.data(), temp_bytes, input, out.data(),
                                     n, stream),
              label);

@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdio>
 
+#include "core/deterministic_sum.hpp"
 #include "core/device_scratch.hpp"
 #include "core/error.hpp"
 #include "laser/ib_absorption.cuh"
@@ -251,13 +252,16 @@ __global__ void fast_trace_1d_kernel(
                           local_ray] += dP * tail_weights[idx];
           }
         }
+        // Per-ray tail slots [k * batch_capacity + ray] (k: redistributed
+        // count, lumped count, redistributed dP, lumped dP), summed in a
+        // fixed order by the launcher (2026-09-24; atomicAdd before).
         if (tail_stats != nullptr) {
           if (redistribute_tail) {
-            atomicAdd(&tail_stats[0], 1.0);
-            atomicAdd(&tail_stats[2], dP);
+            tail_stats[0 * batch_capacity + local_ray] = 1.0;
+            tail_stats[2 * batch_capacity + local_ray] = dP;
           } else {
-            atomicAdd(&tail_stats[1], 1.0);
-            atomicAdd(&tail_stats[3], dP);
+            tail_stats[1 * batch_capacity + local_ray] = 1.0;
+            tail_stats[3 * batch_capacity + local_ray] = dP;
           }
         }
         P = P_tail;
@@ -645,8 +649,9 @@ cudaError_t launch_fast_trace_1d(
                                          : rays.n_rays;
   const std::size_t shell_doubles =
       static_cast<std::size_t>(batch_capacity) * n_shells;
+  // Per-ray scalars: 4 tallies and 4 tail-statistics slots.
   const std::size_t slab_doubles =
-      shell_doubles + 4ULL * static_cast<std::size_t>(batch_capacity);
+      shell_doubles + 8ULL * static_cast<std::size_t>(batch_capacity);
   const std::size_t reduction_doubles =
       static_cast<std::size_t>(n_shells) + kReducedScalarCount;
   const std::size_t scratch_bytes =
@@ -683,8 +688,13 @@ cudaError_t launch_fast_trace_1d(
     double* const per_ray_critical_hits = per_ray_unabsorbed + batch_rays;
     double* const per_ray_invalid = per_ray_critical_hits + batch_rays;
     double* const per_ray_ra = per_ray_invalid + batch_rays;
+    double* const per_ray_tail = slab + shell_doubles +
+                                 4ULL * static_cast<std::size_t>(batch_capacity);
     cudaMemsetAsync(per_ray_unabsorbed, 0,
                     4ULL * static_cast<std::size_t>(batch_rays) * sizeof(double),
+                    stream);
+    cudaMemsetAsync(per_ray_tail, 0,
+                    4ULL * static_cast<std::size_t>(batch_capacity) * sizeof(double),
                     stream);
 
     const int ray_grid = (batch_rays + kBlockSize - 1) / kBlockSize;
@@ -696,7 +706,13 @@ cudaError_t launch_fast_trace_1d(
         laser_cfg.raytrace.eps_crit, laser_cfg.raytrace.test_kappa, lambda_cm,
         phys, phys_ext != nullptr ? 1 : 0, slab,
         per_ray_unabsorbed, per_ray_critical_hits, per_ray_invalid, per_ray_ra,
-        d_tau_shell_out, d_tail_stats);
+        d_tau_shell_out, d_tail_stats != nullptr ? per_ray_tail : nullptr);
+    if (d_tail_stats != nullptr) {
+      for (int k = 0; k < 4; ++k) {
+        core::deterministic_sum(per_ray_tail + static_cast<std::size_t>(k) * batch_capacity,
+                                batch_rays, d_tail_stats + k, true, stream);
+      }
+    }
     if (d_pabs_per_ray_out != nullptr) {
       sum_fast_trace_absorbed_per_ray_kernel<<<ray_grid, kBlockSize, 0, stream>>>(
           slab, per_ray_ra, ray_offset, batch_rays, batch_capacity, n_shells,

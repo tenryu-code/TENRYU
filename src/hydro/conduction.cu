@@ -1,4 +1,5 @@
 #include "hydro/conduction.cuh"
+#include "core/deterministic_sum.hpp"
 #include "core/nvtx_range.hpp"
 #include "hydro/conduction_snb_2d.cuh"
 
@@ -18,6 +19,7 @@
 #include <cuda_runtime.h>
 #include <cusparse.h>
 
+#include "core/device_pack.hpp"
 #include "core/device_scratch.hpp"
 #include "core/error.hpp"
 #include "core/kernel_guard.hpp"
@@ -470,17 +472,10 @@ __host__ __device__ inline double coulomb_log_formula(const double n_e,
   return fmax(2.0, ln_lambda_raw);
 }
 
-__host__ __device__ inline double spitzer_kappa_formula(const double Te_eV,
-                                                        const double Zbar,
-                                                        const double ln_lambda) {
-  constexpr double kappa0 = 3.06e9;  // [erg/(cm*s*eV^{7/2})]
-  const double te = sanitize_te_for_pow(Te_eV);
-  if (!(te > 0.0) || !(Zbar > 0.0) || !(ln_lambda > 0.0)) {
-    return 0.0;
-  }
-  const double kappa = kappa0 * pow(te, 2.5) / (Zbar * ln_lambda);
-  return isfinite(kappa) ? kappa : 0.0;
-}
+// Spitzer conductivity with the Epperlein-Short xi(Z) factor (NUMERICS §4.1:
+// every path, user ruling 2026-07-30); one definition shared with the 1D
+// kernel bodies.
+using conduction_bodies::spitzer_kappa_formula;
 
 __host__ __device__ inline double vth_e_formula(const double Te_eV) {
   const double te = sanitize_te_for_pow(Te_eV);
@@ -1285,13 +1280,10 @@ __global__ void compute_spitzer_deff_2d_kernel(
   const double z = fmax(zbar[c], 0.0);
   const double rho_c = fmax(rho[c], 0.0);
   const double te = (isfinite(Te[c]) && Te[c] > 0.0) ? fmin(Te[c], kMaxTeForPow) : 0.0;
-  const double gamma_c = fmax(gamma_eff[c], kMinEffectiveGamma);
   const double A_c = fmax(A_eff[c], kMinEffectiveA);
-  const double cv_e_ideal = (gamma_c > 1.0 && A_c > 0.0)
-                                ? (z * kEvToErg / (A_c * kProtonMass * (gamma_c - 1.0)))
-                                : 0.0;
-  const double cv_e =
-      (state_cv_e != nullptr && state_cv_e[c] > 0.0) ? state_cv_e[c] : cv_e_ideal;
+  // Shared with the energy booking after the solve (conduction_cv.hpp).
+  const double cv_e = conduction_solve_cv_e(state_cv_e != nullptr ? state_cv_e[c] : 0.0,
+                                            zbar[c], gamma_eff[c], A_eff[c]);
   const double rho_cv = rho_c * cv_e;
 
   if (rho_cv_e != nullptr) {
@@ -1529,8 +1521,8 @@ __global__ void conduction_1d_sts_stage_kernel(
 
   conduction_bodies::conduction_1d_sts_stage_kernel_body<GEOM>(
       i, Te_old, Te_new, kappa_sh, flux_limiter_faces, rho_cv_e, cell_is_void,
-      vol, x_r, n_cells, tau, Te_floor, alpha_cells, clamp_count, E_floor,
-      floor_limiter_mode);
+      vol, x_r, n_cells, tau, Te_floor, alpha_cells, clamp_count, nullptr,
+      floor_limiter_mode, E_floor);
 }
 
 // W-G2 kirchhoff face diagnostics (TENRYU_CONDUCTION_FACE_DIAG, read-only):
@@ -1743,8 +1735,8 @@ __global__ void conduction_1d_sts_stage_kirchhoff_kernel(
 
   conduction_bodies::conduction_1d_sts_stage_kirchhoff_kernel_body<GEOM>(
       i, Te_old, Te_new, kappa_sh, flux_limiter_faces, rho_cv_e, cell_is_void,
-      vol, x_r, n_cells, tau, Te_floor, alpha_cells, clamp_count, E_floor,
-      floor_limiter_mode);
+      vol, x_r, n_cells, tau, Te_floor, alpha_cells, clamp_count, nullptr,
+      floor_limiter_mode, E_floor);
 }
 
 template <int GEOM>
@@ -1780,7 +1772,7 @@ __global__ void conduction_1d_sts_fused_kirchhoff_kernel(
       conduction_bodies::conduction_1d_sts_stage_kirchhoff_kernel_body<GEOM>(
           i, te_curr, te_next, kappa_sh, flux_limiter_faces, rho_cv_e,
           cell_is_void, vol, x_r, n_cells, tau, Te_floor, alpha_cells,
-          clamp_count, E_floor, floor_limiter_mode);
+          clamp_count, nullptr, floor_limiter_mode, E_floor);
     }
     __syncthreads();
 
@@ -2093,7 +2085,7 @@ __global__ void conduction_1d_sts_stage_secant_kernel(
   conduction_bodies::conduction_1d_sts_stage_secant_kernel_body<GEOM>(
       i, Te_old, Te_new, rho_cv_e, cell_is_void, vol, x_r, rho, n_cells, tau,
       Te_floor, kappa0, kappa_power, kappa_rho_power, alpha_cells, clamp_count,
-      E_floor, floor_limiter_mode);
+      nullptr, floor_limiter_mode, E_floor);
 }
 
 template <int GEOM>
@@ -2377,9 +2369,9 @@ __global__ void conduction_1d_sts_stage_kernel_per_material(
   double Te_computed = Te_old_i + tau * net_power / (rho_cv * V);
   if (!isfinite(Te_computed) || Te_computed < Te_floor) {
     if (isfinite(Te_computed) && Te_floor > Te_computed) {
-      atomic_add_double(E_floor, rho_cv * (Te_floor - Te_computed) * V);
+      E_floor[i] += rho_cv * (Te_floor - Te_computed) * V;
     } else if (!isfinite(Te_computed) && Te_floor > 0.0) {
-      atomic_add_double(E_floor, rho_cv * Te_floor * V);
+      E_floor[i] += rho_cv * Te_floor * V;
     }
     Te_new[i] = Te_floor;
     atomicAdd(clamp_count, 1);
@@ -2840,9 +2832,14 @@ __global__ void clamp_1d_conduction_solution_kernel(
     const int n_cells,
     const double Te_floor,
     int* __restrict__ clamp_count,
-    double* __restrict__ E_floor) {
+    double* __restrict__ E_floor,
+    const double* __restrict__ proceed) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n_cells) {
+    return;
+  }
+  // A skipped implicit solve (proceed = 0) clamps nothing.
+  if (proceed != nullptr && !(*proceed > 0.0)) {
     return;
   }
 
@@ -2864,9 +2861,9 @@ __global__ void clamp_1d_conduction_solution_kernel(
   const double rho_cv = rho_cv_e[i];
   if (rho_cv > 0.0) {
     if (isfinite(Te_i) && Te_floor > Te_i) {
-      atomic_add_double(E_floor, rho_cv * (Te_floor - Te_i) * V);
+      E_floor[i] += rho_cv * (Te_floor - Te_i) * V;
     } else if (!isfinite(Te_i) && Te_floor > 0.0) {
-      atomic_add_double(E_floor, rho_cv * Te_floor * V);
+      E_floor[i] += rho_cv * Te_floor * V;
     }
   }
 
@@ -3020,6 +3017,65 @@ void log_plain_1d_dtexp_debug(const core::State& state,
   core::log_info(std::string(line));
 }
 
+// Device copy of State::cell_is_void, uploaded only when the host mask
+// changes (core::device_cell_is_void). No conduction kernel writes the mask.
+const std::uint8_t* conduction_device_cell_is_void(const core::State& state) {
+  return core::device_cell_is_void(state.cell_is_void);
+}
+
+// (min dt ratio, min D_eff, max D_eff) start values of the coefficient
+// kernels' atomic min/max.
+__global__ void init_conduction_diag3_kernel(double* __restrict__ diag3) {
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    const double inf = __longlong_as_double(0x7ff0000000000000LL);
+    diag3[0] = inf;
+    diag3[1] = inf;
+    diag3[2] = 0.0;
+  }
+}
+
+// Implicit 1D solve pack: diag3 as above, the floor-clamp pack (E_floor, clamp
+// count) zeroed, and the proceed flag.
+__global__ void init_implicit_conduction_pack_kernel(double* __restrict__ pack) {
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    const double inf = __longlong_as_double(0x7ff0000000000000LL);
+    pack[0] = inf;
+    pack[1] = inf;
+    pack[2] = 0.0;
+    pack[3] = 0.0;
+    pack[4] = 0.0;
+    pack[5] = 0.0;
+  }
+}
+
+// The implicit solve runs when the explicit limit dt_exp = cfl_cond * min
+// ratio is finite and positive (the host rule of
+// conduction_diagnostics_from_diag3); proceed = 1 or 0.
+__global__ void implicit_conduction_proceed_kernel(const double* __restrict__ diag3,
+                                                   const double cfl_cond,
+                                                   double* __restrict__ proceed) {
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    const double min_ratio = diag3[0];
+    double dt_exp = __longlong_as_double(0x7ff0000000000000LL);
+    if (isfinite(min_ratio) && min_ratio > 0.0) {
+      dt_exp = __dmul_rn(cfl_cond, min_ratio);
+    }
+    *proceed = (isfinite(dt_exp) && dt_exp > 0.0) ? 1.0 : 0.0;
+  }
+}
+
+__global__ void copy_if_proceed_kernel(double* __restrict__ dst,
+                                       const double* __restrict__ src,
+                                       const int n,
+                                       const double* __restrict__ proceed) {
+  if (!(*proceed > 0.0)) {
+    return;
+  }
+  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
+    dst[i] = src[i];
+  }
+}
+
 ConductionDiagnostics compute_per_material_1d_operator(
     const core::State& state,
     const core::Config& cfg,
@@ -3036,15 +3092,7 @@ ConductionDiagnostics compute_per_material_1d_operator(
   ConductionMaterialParams* d_params = nullptr;
   copy_material_params_to_device(cfg, &d_params);
 
-  std::uint8_t* d_cell_is_void = nullptr;
-  d_cell_is_void = static_cast<std::uint8_t*>(core::device_scratch_acquire(
-      "conduction:compute_per_material_1d_operator:d_cell_is_void",
-      static_cast<std::size_t>(n_cells) * sizeof(std::uint8_t)));
-  cuda_check(cudaMemcpy(d_cell_is_void,
-                        state.cell_is_void.data(),
-                        static_cast<std::size_t>(n_cells) * sizeof(std::uint8_t),
-                        cudaMemcpyHostToDevice),
-             "Conduction: cudaMemcpy per-material cell_is_void failed");
+  const std::uint8_t* d_cell_is_void = conduction_device_cell_is_void(state);
 
   double* d_diag3 = static_cast<double*>(core::device_scratch_acquire(
       "conduction:compute_per_material_1d_operator:diag3_pack", 3 * sizeof(double)));
@@ -3206,108 +3254,19 @@ ConductionDiagnostics compute_per_material_2d_operator(
   return diag;
 }
 
-ConductionDiagnostics compute_conduction_diagnostics_impl(const core::State& state,
-                                                          const core::Config& cfg,
-                                                          double* d_diffusion,
-                                                          double* d_rho_cv_e,
-                                                          const HydroEOSContext* eos_ctx) {
-  ConductionDiagnostics diag;
-  diag.dt_exp = std::numeric_limits<double>::infinity();
-  diag.dt_cond = std::numeric_limits<double>::infinity();
-  diag.deff_min = 0.0;
-  diag.deff_max = 0.0;
-
+// Coefficient kernels of the single-closure (not per-material) conduction
+// operator: fills d_diffusion and d_rho_cv_e and the atomic min/max pack
+// d_diag3 = (min dt ratio, min D_eff, max D_eff), which must hold
+// {inf, inf, 0} on entry (init_conduction_diag3_kernel).
+void launch_conduction_coefficients(const core::State& state,
+                                    const core::Config& cfg,
+                                    double* d_diffusion,
+                                    double* d_rho_cv_e,
+                                    double* d_diag3) {
   const int n_cells = static_cast<int>(state.rho.size());
-  if (n_cells <= 0) {
-    return diag;
-  }
-
-  TENRYU_ASSERT(state.Te.size() == state.rho.size(), "Conduction Te/rho size mismatch");
-  TENRYU_ASSERT(state.zbar.size() == state.rho.size(),
-                "Conduction zbar/rho size mismatch");
-  TENRYU_ASSERT(state.vol.size() == state.rho.size(), "Conduction vol/rho size mismatch");
-  TENRYU_ASSERT(state.cell_is_void.size() == state.rho.size(),
-                "Conduction cell_is_void/rho size mismatch");
-  TENRYU_ASSERT(!cfg.materials.materials.empty(),
-                "Conduction requires at least one material");
-
-  if (state.mesh.dim == 1) {
-    TENRYU_ASSERT(state.x_r.size() == state.rho.size() + 1,
-                  "Conduction 1D requires node count = cell count + 1");
-  } else if (state.mesh.dim == 2) {
-    TENRYU_ASSERT(state.mesh.topo.n_cells == n_cells,
-                  "Conduction 2D requires mesh/state cell consistency");
-    TENRYU_ASSERT(state.x_r.size() == state.x_z.size(),
-                  "Conduction 2D requires matching node coordinate arrays");
-    TENRYU_ASSERT(state.x_r.size() == static_cast<std::size_t>(state.mesh.topo.n_nodes),
-                  "Conduction 2D requires mesh/state node consistency");
-  } else {
-    return diag;
-  }
-
-  // dt-lineage argmin callers pass d_rho_cv_e == nullptr, but the Kirchhoff
-  // dt-ratio kernel below dereferences it per cell (null deref caught by
-  // compute-sanitizer under TENRYU_DT_LINEAGE=1). Bind a zeroed scratch that
-  // the per-material/deff kernels then fill; callers passing a real buffer
-  // never enter this branch.
-  if (d_rho_cv_e == nullptr) {
-    d_rho_cv_e = static_cast<double*>(core::device_scratch_acquire(
-        "conduction:compute_conduction_diagnostics_impl:d_rho_cv_e_local",
-        static_cast<std::size_t>(n_cells) * sizeof(double)));
-    cuda_check(cudaMemset(d_rho_cv_e, 0,
-                          static_cast<std::size_t>(n_cells) * sizeof(double)),
-               "Conduction: cudaMemset local rho_cv_e failed");
-  }
-
-  if (per_material_conduction_ready(state, cfg, eos_ctx)) {
-    const int n_mat = static_cast<int>(cfg.materials.materials.size());
-    double* d_rho_cv_local = d_rho_cv_e;
-    if (d_rho_cv_local == nullptr) {
-      d_rho_cv_local = static_cast<double*>(core::device_scratch_acquire(
-          "conduction:compute_conduction_diagnostics_impl:d_rho_cv_local",
-          static_cast<std::size_t>(n_cells) * sizeof(double)));
-    }
-    if (state.mesh.dim == 1) {
-      const int n_faces = std::max(0, n_cells - 1);
-      double* d_kappa_face = nullptr;
-      double* d_kappa_pm = nullptr;
-      d_kappa_face = static_cast<double*>(core::device_scratch_acquire(
-          "conduction:compute_conduction_diagnostics_impl:d_kappa_face",
-          static_cast<std::size_t>(std::max(1, n_faces)) *
-              sizeof(double)));
-      d_kappa_pm = static_cast<double*>(core::device_scratch_acquire(
-          "conduction:compute_conduction_diagnostics_impl:d_kappa_pm_faces",
-          static_cast<std::size_t>(std::max(1, n_faces * n_mat)) *
-              sizeof(double)));
-      diag = compute_per_material_1d_operator(
-          state, cfg, eos_ctx, d_kappa_face, d_kappa_pm, d_rho_cv_local);
-      if (d_diffusion != nullptr) {
-        cuda_check(cudaMemset(d_diffusion,
-                              0,
-                              static_cast<std::size_t>(n_cells) * sizeof(double)),
-                   "Conduction: cudaMemset per-material diagnostics diffusion failed");
-      }
-    } else {
-      double* d_kappa_local = d_diffusion;
-      if (d_kappa_local == nullptr) {
-        d_kappa_local = static_cast<double*>(core::device_scratch_acquire(
-            "conduction:compute_conduction_diagnostics_impl:d_kappa_local",
-            static_cast<std::size_t>(n_cells) * sizeof(double)));
-      }
-      double* d_kappa_pm = nullptr;
-      d_kappa_pm = static_cast<double*>(core::device_scratch_acquire(
-          "conduction:compute_conduction_diagnostics_impl:d_kappa_pm_kappa",
-          static_cast<std::size_t>(n_cells) *
-              static_cast<std::size_t>(n_mat) * sizeof(double)));
-      diag = compute_per_material_2d_operator(
-          state, cfg, eos_ctx, d_kappa_local, d_kappa_pm, d_rho_cv_local);
-    }
-    return diag;
-  }
-
   double* d_A_eff = nullptr;
   double* d_gamma_eff = nullptr;
-  std::uint8_t* d_cell_is_void = nullptr;
+  const std::uint8_t* d_cell_is_void = nullptr;
   if (state.A_eff.size() == static_cast<std::size_t>(n_cells) &&
       state.gamma_eff.size() == static_cast<std::size_t>(n_cells)) {
     d_A_eff = const_cast<double*>(state.A_eff.data());
@@ -3337,26 +3296,11 @@ ConductionDiagnostics compute_conduction_diagnostics_impl(const core::State& sta
                           cudaMemcpyHostToDevice),
                "Conduction: cudaMemcpy d_gamma_eff failed");
   }
-  d_cell_is_void = static_cast<std::uint8_t*>(core::device_scratch_acquire(
-      "conduction:compute_conduction_diagnostics_impl:d_cell_is_void",
-      static_cast<std::size_t>(n_cells) * sizeof(std::uint8_t)));
-  cuda_check(cudaMemcpy(d_cell_is_void,
-                        state.cell_is_void.data(),
-                        static_cast<std::size_t>(n_cells) * sizeof(std::uint8_t),
-                        cudaMemcpyHostToDevice),
-             "Conduction: cudaMemcpy d_cell_is_void failed");
+  d_cell_is_void = conduction_device_cell_is_void(state);
 
-  double* d_diag3 = static_cast<double*>(core::device_scratch_acquire(
-      "conduction:compute_conduction_diagnostics_impl:diag3_pack", 3 * sizeof(double)));
   double* d_min_ratio = d_diag3 + 0;
   double* d_min_deff = d_diag3 + 1;
   double* d_max_deff = d_diag3 + 2;
-
-  const double inf = std::numeric_limits<double>::infinity();
-  const double h_diag3_init[3] = {inf, inf, 0.0};
-  cuda_check(cudaMemcpy(d_diag3, h_diag3_init, sizeof(h_diag3_init),
-                        cudaMemcpyHostToDevice),
-             "Conduction: cudaMemcpy init diagnostics diag3 pack failed");
 
   const core::State::LaunchWindow cw = state.owned_cell_window_ghost(n_cells, 1);  // alpha/deff: ghost-extended (interface faces; min/max atomics idempotent)
   const double* state_cv_e = state.cv_e.empty() ? nullptr : state.cv_e.data();
@@ -3537,13 +3481,20 @@ ConductionDiagnostics compute_conduction_diagnostics_impl(const core::State& sta
     cuda_check(cudaGetLastError(), "Conduction: kirchhoff dt ratio launch failed");
     cuda_check(core::debug_kernel_sync(), "Conduction: kirchhoff dt ratio failed");
   }
+}
 
-  double h_diag3[3] = {0.0, 0.0, 0.0};
-  cuda_check(cudaMemcpy(h_diag3, d_diag3, sizeof(h_diag3), cudaMemcpyDeviceToHost),
-             "Conduction: cudaMemcpy diagnostics diag3 pack failed");
-  double min_ratio = h_diag3[0];
-  double min_deff = h_diag3[1];
-  double max_deff = h_diag3[2];
+// Host rule for the (min dt ratio, min D_eff, max D_eff) pack of
+// launch_conduction_coefficients.
+ConductionDiagnostics conduction_diagnostics_from_diag3(const double* h_diag3,
+                                                       const core::Config& cfg) {
+  ConductionDiagnostics diag;
+  diag.dt_exp = std::numeric_limits<double>::infinity();
+  diag.dt_cond = std::numeric_limits<double>::infinity();
+  diag.deff_min = 0.0;
+  diag.deff_max = 0.0;
+  const double min_ratio = h_diag3[0];
+  const double min_deff = h_diag3[1];
+  const double max_deff = h_diag3[2];
 
   if (std::isfinite(min_deff) && min_deff > 0.0) {
     diag.deff_min = min_deff;
@@ -3557,6 +3508,118 @@ ConductionDiagnostics compute_conduction_diagnostics_impl(const core::State& sta
     diag.dt_cond =
         compute_dt_cond_from_dt_exp(diag.dt_exp, cfg.numerics.conduction.sts_max_stages);
   }
+  return diag;
+}
+
+ConductionDiagnostics compute_conduction_diagnostics_impl(const core::State& state,
+                                                          const core::Config& cfg,
+                                                          double* d_diffusion,
+                                                          double* d_rho_cv_e,
+                                                          const HydroEOSContext* eos_ctx) {
+  ConductionDiagnostics diag;
+  diag.dt_exp = std::numeric_limits<double>::infinity();
+  diag.dt_cond = std::numeric_limits<double>::infinity();
+  diag.deff_min = 0.0;
+  diag.deff_max = 0.0;
+
+  const int n_cells = static_cast<int>(state.rho.size());
+  if (n_cells <= 0) {
+    return diag;
+  }
+
+  TENRYU_ASSERT(state.Te.size() == state.rho.size(), "Conduction Te/rho size mismatch");
+  TENRYU_ASSERT(state.zbar.size() == state.rho.size(),
+                "Conduction zbar/rho size mismatch");
+  TENRYU_ASSERT(state.vol.size() == state.rho.size(), "Conduction vol/rho size mismatch");
+  TENRYU_ASSERT(state.cell_is_void.size() == state.rho.size(),
+                "Conduction cell_is_void/rho size mismatch");
+  TENRYU_ASSERT(!cfg.materials.materials.empty(),
+                "Conduction requires at least one material");
+
+  if (state.mesh.dim == 1) {
+    TENRYU_ASSERT(state.x_r.size() == state.rho.size() + 1,
+                  "Conduction 1D requires node count = cell count + 1");
+  } else if (state.mesh.dim == 2) {
+    TENRYU_ASSERT(state.mesh.topo.n_cells == n_cells,
+                  "Conduction 2D requires mesh/state cell consistency");
+    TENRYU_ASSERT(state.x_r.size() == state.x_z.size(),
+                  "Conduction 2D requires matching node coordinate arrays");
+    TENRYU_ASSERT(state.x_r.size() == static_cast<std::size_t>(state.mesh.topo.n_nodes),
+                  "Conduction 2D requires mesh/state node consistency");
+  } else {
+    return diag;
+  }
+
+  // dt-lineage argmin callers pass d_rho_cv_e == nullptr, but the Kirchhoff
+  // dt-ratio kernel below dereferences it per cell (null deref caught by
+  // compute-sanitizer under TENRYU_DT_LINEAGE=1). Bind a zeroed scratch that
+  // the per-material/deff kernels then fill; callers passing a real buffer
+  // never enter this branch.
+  if (d_rho_cv_e == nullptr) {
+    d_rho_cv_e = static_cast<double*>(core::device_scratch_acquire(
+        "conduction:compute_conduction_diagnostics_impl:d_rho_cv_e_local",
+        static_cast<std::size_t>(n_cells) * sizeof(double)));
+    cuda_check(cudaMemset(d_rho_cv_e, 0,
+                          static_cast<std::size_t>(n_cells) * sizeof(double)),
+               "Conduction: cudaMemset local rho_cv_e failed");
+  }
+
+  if (per_material_conduction_ready(state, cfg, eos_ctx)) {
+    const int n_mat = static_cast<int>(cfg.materials.materials.size());
+    double* d_rho_cv_local = d_rho_cv_e;
+    if (d_rho_cv_local == nullptr) {
+      d_rho_cv_local = static_cast<double*>(core::device_scratch_acquire(
+          "conduction:compute_conduction_diagnostics_impl:d_rho_cv_local",
+          static_cast<std::size_t>(n_cells) * sizeof(double)));
+    }
+    if (state.mesh.dim == 1) {
+      const int n_faces = std::max(0, n_cells - 1);
+      double* d_kappa_face = nullptr;
+      double* d_kappa_pm = nullptr;
+      d_kappa_face = static_cast<double*>(core::device_scratch_acquire(
+          "conduction:compute_conduction_diagnostics_impl:d_kappa_face",
+          static_cast<std::size_t>(std::max(1, n_faces)) *
+              sizeof(double)));
+      d_kappa_pm = static_cast<double*>(core::device_scratch_acquire(
+          "conduction:compute_conduction_diagnostics_impl:d_kappa_pm_faces",
+          static_cast<std::size_t>(std::max(1, n_faces * n_mat)) *
+              sizeof(double)));
+      diag = compute_per_material_1d_operator(
+          state, cfg, eos_ctx, d_kappa_face, d_kappa_pm, d_rho_cv_local);
+      if (d_diffusion != nullptr) {
+        cuda_check(cudaMemset(d_diffusion,
+                              0,
+                              static_cast<std::size_t>(n_cells) * sizeof(double)),
+                   "Conduction: cudaMemset per-material diagnostics diffusion failed");
+      }
+    } else {
+      double* d_kappa_local = d_diffusion;
+      if (d_kappa_local == nullptr) {
+        d_kappa_local = static_cast<double*>(core::device_scratch_acquire(
+            "conduction:compute_conduction_diagnostics_impl:d_kappa_local",
+            static_cast<std::size_t>(n_cells) * sizeof(double)));
+      }
+      double* d_kappa_pm = nullptr;
+      d_kappa_pm = static_cast<double*>(core::device_scratch_acquire(
+          "conduction:compute_conduction_diagnostics_impl:d_kappa_pm_kappa",
+          static_cast<std::size_t>(n_cells) *
+              static_cast<std::size_t>(n_mat) * sizeof(double)));
+      diag = compute_per_material_2d_operator(
+          state, cfg, eos_ctx, d_kappa_local, d_kappa_pm, d_rho_cv_local);
+    }
+    return diag;
+  }
+
+  double* d_diag3 = static_cast<double*>(core::device_scratch_acquire(
+      "conduction:compute_conduction_diagnostics_impl:diag3_pack", 3 * sizeof(double)));
+  init_conduction_diag3_kernel<<<1, 1>>>(d_diag3);
+  cuda_check(cudaGetLastError(), "Conduction: diag3 pack init launch failed");
+  launch_conduction_coefficients(state, cfg, d_diffusion, d_rho_cv_e, d_diag3);
+
+  double h_diag3[3] = {0.0, 0.0, 0.0};
+  cuda_check(cudaMemcpy(h_diag3, d_diag3, sizeof(h_diag3), cudaMemcpyDeviceToHost),
+             "Conduction: cudaMemcpy diagnostics diag3 pack failed");
+  diag = conduction_diagnostics_from_diag3(h_diag3, cfg);
   log_plain_1d_dtexp_debug(state, d_diffusion, d_rho_cv_e, diag.dt_exp);
   return diag;
 }
@@ -3651,12 +3714,13 @@ void conduction_sync_eos(core::State& state, const core::Config& cfg) {
   // In energy-authoritative mode with a table backend the driver's
   // post-conduction sync (single, tail-aware table surface) performs the
   // Te -> ee conversion; the internal linear cv*T projection would fight
-  // it (measured +-16 kJ/subcycle representation swing, net leak).
+  // it (measured +-16 kJ/subcycle representation swing, net leak). The table
+  // backend is the one of the tables' reference material: in 1D any non-void
+  // material with tables (an ideal gas listed first used to leave the linear
+  // projection on for the tabled cells, 2026-09-23).
   if (cfg.numerics.hydro.eos_closure_mode == "energy_authoritative") {
-    const int first_nonvoid = cfg.materials.first_nonvoid_material_index();
-    if (first_nonvoid >= 0 &&
-        cfg.materials.materials[static_cast<std::size_t>(first_nonvoid)]
-            .eos_tables) {
+    const int ref = cfg.materials.eos_table_reference_material_index(cfg.main.dim);
+    if (ref >= 0 && cfg.materials.materials[static_cast<std::size_t>(ref)].eos_tables) {
       return;
     }
   }
@@ -3802,7 +3866,7 @@ ConductionResult conduction_step_1d_implicit(core::State& state,
 
   double* d_kappa_eff = nullptr;
   double* d_rho_cv_e = nullptr;
-  std::uint8_t* d_cell_is_void = nullptr;
+  const std::uint8_t* d_cell_is_void = nullptr;
   double* d_A_eff = nullptr;
   double* d_flux_limiter_faces = nullptr;
   double* d_lower = nullptr;
@@ -3814,7 +3878,16 @@ ConductionResult conduction_step_1d_implicit(core::State& state,
   void* d_cusparse_buffer = nullptr;
   cusparseHandle_t cusparse_handle = nullptr;
 
-  auto cleanup = [&]() {};
+  TENRYU_ASSERT(state.Te.size() == state.rho.size(), "Conduction Te/rho size mismatch");
+  TENRYU_ASSERT(state.zbar.size() == state.rho.size(),
+                "Conduction zbar/rho size mismatch");
+  TENRYU_ASSERT(state.vol.size() == state.rho.size(), "Conduction vol/rho size mismatch");
+  TENRYU_ASSERT(state.cell_is_void.size() == state.rho.size(),
+                "Conduction cell_is_void/rho size mismatch");
+  TENRYU_ASSERT(!cfg.materials.materials.empty(),
+                "Conduction requires at least one material");
+  TENRYU_ASSERT(state.x_r.size() == state.rho.size() + 1,
+                "Conduction 1D requires node count = cell count + 1");
 
   d_kappa_eff = static_cast<double*>(core::device_scratch_acquire(
       "conduction:conduction_step_1d_implicit:d_kappa_eff",
@@ -3823,26 +3896,40 @@ ConductionResult conduction_step_1d_implicit(core::State& state,
       "conduction:conduction_step_1d_implicit:d_rho_cv_e",
       static_cast<std::size_t>(n_cells) * sizeof(double)));
 
-  const auto diag =
-      compute_conduction_diagnostics_impl(state, cfg, d_kappa_eff, d_rho_cv_e, nullptr);
-  result.dt_exp = diag.dt_exp;
-  result.dt_cond = std::numeric_limits<double>::infinity();
-  result.deff_min = diag.deff_min;
-  result.deff_max = diag.deff_max;
+  // One device buffer comes back to the host once, after the solve: the
+  // tridiagonal system and its solution for the residual diagnostics (lower,
+  // diag, upper, rhs, solution; n values each, for n_cells >= 3), then the
+  // pack (min dt ratio, min D_eff, max D_eff, E_floor, clamp count, proceed).
+  // Whether to solve (dt_exp finite and positive, as the host rule of
+  // conduction_diagnostics_from_diag3) is decided on the device, so no
+  // readback precedes the solve; a skipped solve leaves Te untouched.
+  const std::size_t n_stage = static_cast<std::size_t>(n_cells) * 5;
+  double* d_diag_stage = static_cast<double*>(core::device_scratch_acquire(
+      "conduction:conduction_step_1d_implicit:stage_pack",
+      (n_stage + 6) * sizeof(double)));
+  double* d_pack = d_diag_stage + n_stage;
+  double* d_diag3 = d_pack;
+  double* d_clampfloor = d_pack + 3;
+  const double* d_proceed = d_pack + 5;
+  d_e_floor = d_clampfloor + 0;
+  d_clamp_count = reinterpret_cast<int*>(d_clampfloor + 1);
+  // Floor-clamp energy per cell, summed in a fixed order into the pack
+  // before its readback (2026-09-24; atomicAdd before).
+  double* d_e_floor_cells = static_cast<double*>(core::device_scratch_acquire(
+      "conduction:conduction_step_1d_implicit:e_floor_cells",
+      static_cast<std::size_t>(std::max(n_cells, 1)) * sizeof(double)));
+  cuda_check(cudaMemset(d_e_floor_cells, 0,
+                        static_cast<std::size_t>(std::max(n_cells, 1)) * sizeof(double)),
+             "Conduction: implicit floor cells zero failed");
 
-  if (!std::isfinite(diag.dt_exp) || !(diag.dt_exp > 0.0)) {
-    cleanup();
-    return result;
-  }
+  init_implicit_conduction_pack_kernel<<<1, 1>>>(d_pack);
+  cuda_check(cudaGetLastError(), "Conduction: implicit pack init launch failed");
+  launch_conduction_coefficients(state, cfg, d_kappa_eff, d_rho_cv_e, d_diag3);
+  implicit_conduction_proceed_kernel<<<1, 1>>>(d_diag3, cfg.numerics.dt.cfl_cond,
+                                               d_pack + 5);
+  cuda_check(cudaGetLastError(), "Conduction: implicit proceed flag launch failed");
 
-  d_cell_is_void = static_cast<std::uint8_t*>(core::device_scratch_acquire(
-      "conduction:conduction_step_1d_implicit:d_cell_is_void",
-      static_cast<std::size_t>(n_cells) * sizeof(std::uint8_t)));
-  cuda_check(cudaMemcpy(d_cell_is_void,
-                        state.cell_is_void.data(),
-                        static_cast<std::size_t>(n_cells) * sizeof(std::uint8_t),
-                        cudaMemcpyHostToDevice),
-             "Conduction: cudaMemcpy implicit d_cell_is_void failed");
+  d_cell_is_void = conduction_device_cell_is_void(state);
 
   d_lower = static_cast<double*>(core::device_scratch_acquire(
       "conduction:conduction_step_1d_implicit:d_lower",
@@ -3856,14 +3943,6 @@ ConductionResult conduction_step_1d_implicit(core::State& state,
   d_rhs = static_cast<double*>(core::device_scratch_acquire(
       "conduction:conduction_step_1d_implicit:d_rhs",
       static_cast<std::size_t>(n_cells) * sizeof(double)));
-
-  double* d_clampfloor = static_cast<double*>(core::device_scratch_acquire(
-      "conduction:conduction_step_1d_implicit:clampfloor_pack", 2 * sizeof(double)));
-  d_e_floor = d_clampfloor + 0;
-  d_clamp_count = reinterpret_cast<int*>(d_clampfloor + 1);
-
-  cuda_check(cudaMemsetAsync(d_clampfloor, 0, 2 * sizeof(double), stream),
-             "Conduction: init clampfloor pack (implicit) failed");
 
   const int use_flux_limiter = (cfg.numerics.conduction.test_kappa > 0.0) ? 0 : 1;
   if (use_flux_limiter != 0 && n_cells > 1) {
@@ -3921,9 +4000,6 @@ ConductionResult conduction_step_1d_implicit(core::State& state,
                           sizeof(double),
                           cudaMemcpyDeviceToDevice),
                "Conduction: implicit single-cell Te copy failed");
-    result.solver_residual = 0.0;
-    result.solver_iterations = 1;
-    result.solver_cond_number_est = 1.0;
   } else {
     const int blocks = (n_cells + kBlockSize - 1) / kBlockSize;
     // W-G2: test_planar is the historic planar alias (verify-only, spherical
@@ -4004,6 +4080,17 @@ ConductionResult conduction_step_1d_implicit(core::State& state,
     cuda_check(core::debug_kernel_sync(), "Conduction: implicit system assembly failed");
 
     if (n_cells == 2) {
+      double h_pack_pre[6] = {};
+      cuda_check(cudaMemcpy(h_pack_pre, d_pack, sizeof(h_pack_pre), cudaMemcpyDeviceToHost),
+                 "Conduction: implicit 2x2 pack copy failed");
+      if (!(h_pack_pre[5] > 0.0)) {
+        const ConductionDiagnostics diag = conduction_diagnostics_from_diag3(h_pack_pre, cfg);
+        result.dt_exp = diag.dt_exp;
+        result.deff_min = diag.deff_min;
+        result.deff_max = diag.deff_max;
+        log_plain_1d_dtexp_debug(state, d_kappa_eff, d_rho_cv_e, diag.dt_exp);
+        return result;
+      }
       std::array<double, 2> h_lower = {};
       std::array<double, 2> h_diag = {};
       std::array<double, 2> h_upper = {};
@@ -4048,13 +4135,6 @@ ConductionResult conduction_step_1d_implicit(core::State& state,
       cuda_check(cudaMemcpy(d_rhs, h_sol.data(), 2 * sizeof(double), cudaMemcpyHostToDevice),
                  "Conduction: implicit 2x2 solution copy failed");
     } else {
-      std::vector<double> h_lower(static_cast<std::size_t>(n_cells));
-      std::vector<double> h_diag(static_cast<std::size_t>(n_cells));
-      std::vector<double> h_upper(static_cast<std::size_t>(n_cells));
-      std::vector<double> h_rhs(static_cast<std::size_t>(n_cells));
-      double* d_diag_stage = static_cast<double*>(core::device_scratch_acquire(
-          "conduction:conduction_step_1d_implicit:diag_stage",
-          static_cast<std::size_t>(n_cells) * 5 * sizeof(double)));
       const std::size_t nb = static_cast<std::size_t>(n_cells) * sizeof(double);
       cuda_check(cudaMemcpyAsync(d_diag_stage + 0 * n_cells, d_lower, nb,
                                  cudaMemcpyDeviceToDevice, stream),
@@ -4106,21 +4186,6 @@ ConductionResult conduction_step_1d_implicit(core::State& state,
       cuda_check(cudaMemcpyAsync(d_diag_stage + 4 * n_cells, d_rhs, nb,
                                  cudaMemcpyDeviceToDevice, stream),
                  "Conduction: implicit solution stage copy failed");
-      std::vector<double> h_stage(static_cast<std::size_t>(n_cells) * 5);
-      cuda_check(cudaMemcpy(h_stage.data(), d_diag_stage,
-                            static_cast<std::size_t>(n_cells) * 5 * sizeof(double),
-                            cudaMemcpyDeviceToHost),
-                 "Conduction: implicit diagnostic stage copy failed");
-      std::memcpy(h_lower.data(), h_stage.data() + 0 * n_cells, nb);
-      std::memcpy(h_diag.data(),  h_stage.data() + 1 * n_cells, nb);
-      std::memcpy(h_upper.data(), h_stage.data() + 2 * n_cells, nb);
-      std::memcpy(h_rhs.data(),   h_stage.data() + 3 * n_cells, nb);
-      std::vector<double> h_sol(static_cast<std::size_t>(n_cells));
-      std::memcpy(h_sol.data(),   h_stage.data() + 4 * n_cells, nb);
-      result.solver_residual =
-          tridiagonal_relative_residual(h_lower, h_diag, h_upper, h_rhs, h_sol);
-      result.solver_iterations = 1;
-      result.solver_cond_number_est = diagonal_ratio_condition_estimate(h_diag);
     }
   }
 
@@ -4141,7 +4206,8 @@ ConductionResult conduction_step_1d_implicit(core::State& state,
         n_cells,
         cfg.numerics.floors.Te,
         d_clamp_count,
-        d_e_floor);
+        d_e_floor_cells,
+        d_proceed);
   };
   switch (geom_code) {
     case 1:
@@ -4157,20 +4223,49 @@ ConductionResult conduction_step_1d_implicit(core::State& state,
   cuda_check(cudaGetLastError(), "Conduction: implicit floor clamp launch failed");
   cuda_check(core::debug_kernel_sync(), "Conduction: implicit floor clamp failed");
 
-  cuda_check(cudaMemcpy(state.Te.data(),
-                        d_rhs,
-                        static_cast<std::size_t>(n_cells) * sizeof(double),
-                        cudaMemcpyDeviceToDevice),
-             "Conduction: implicit Te copy-back failed");
+  copy_if_proceed_kernel<<<blocks, kBlockSize>>>(state.Te.data(), d_rhs, n_cells, d_proceed);
+  cuda_check(cudaGetLastError(), "Conduction: implicit Te copy-back launch failed");
+  core::deterministic_sum(d_e_floor_cells, n_cells, d_e_floor, false);
+
+  const bool staged = n_cells >= 3;
+  std::vector<double> h_stage((staged ? n_stage : 0) + 6);
+  cuda_check(cudaMemcpy(h_stage.data(), staged ? d_diag_stage : d_pack,
+                        h_stage.size() * sizeof(double), cudaMemcpyDeviceToHost),
+             "Conduction: implicit stage/pack copy failed");
+  const double* h_pack = h_stage.data() + (staged ? n_stage : 0);
+  const ConductionDiagnostics diag = conduction_diagnostics_from_diag3(h_pack, cfg);
+  result.dt_exp = diag.dt_exp;
+  result.deff_min = diag.deff_min;
+  result.deff_max = diag.deff_max;
+  log_plain_1d_dtexp_debug(state, d_kappa_eff, d_rho_cv_e, diag.dt_exp);
+  const bool proceed = h_pack[5] > 0.0;
+  TENRYU_ASSERT(proceed == (std::isfinite(diag.dt_exp) && diag.dt_exp > 0.0),
+                "Conduction: implicit device proceed flag disagrees with the host rule");
+  if (!proceed) {
+    return result;
+  }
+  if (n_cells == 1) {
+    result.solver_residual = 0.0;
+    result.solver_iterations = 1;
+    result.solver_cond_number_est = 1.0;
+  }
+  if (staged) {
+    const auto n = static_cast<std::ptrdiff_t>(n_cells);
+    const std::vector<double> h_lower(h_stage.begin(), h_stage.begin() + n);
+    const std::vector<double> h_diag(h_stage.begin() + n, h_stage.begin() + 2 * n);
+    const std::vector<double> h_upper(h_stage.begin() + 2 * n, h_stage.begin() + 3 * n);
+    const std::vector<double> h_rhs(h_stage.begin() + 3 * n, h_stage.begin() + 4 * n);
+    const std::vector<double> h_sol(h_stage.begin() + 4 * n, h_stage.begin() + 5 * n);
+    result.solver_residual =
+        tridiagonal_relative_residual(h_lower, h_diag, h_upper, h_rhs, h_sol);
+    result.solver_iterations = 1;
+    result.solver_cond_number_est = diagonal_ratio_condition_estimate(h_diag);
+  }
 
   conduction_sync_eos(state, cfg);
 
-  double h_clampfloor[2] = {0.0, 0.0};
-  cuda_check(cudaMemcpy(h_clampfloor, d_clampfloor, sizeof(h_clampfloor),
-                        cudaMemcpyDeviceToHost),
-             "Conduction: copy clampfloor pack (implicit) failed");
-  result.E_floor_injected = h_clampfloor[0];
-  std::memcpy(&result.clamp_count, &h_clampfloor[1], sizeof(int));
+  result.E_floor_injected = h_pack[3];
+  std::memcpy(&result.clamp_count, &h_pack[4], sizeof(int));
   if (part.n_ranks > 1 && part.rank != 0) {
     // Replicated solve: every rank computed the identical full-line tally;
     // only rank 0 reports it (same convention as replicated_tally_share).
@@ -4183,7 +4278,6 @@ ConductionResult conduction_step_1d_implicit(core::State& state,
                       std::to_string(result.clamp_count));
   }
 
-  cleanup();
   return result;
 }
 
@@ -4195,6 +4289,7 @@ ConductionResult conduction_step_1d_sts_per_material(core::State& state,
                                                      parallel::CommBuffers* bufs,
                                                      cudaStream_t stream) {
   ConductionResult result;
+  result.energy_closed_by_solve = true;
   result.dt_cond = std::numeric_limits<double>::infinity();
   result.dt_exp = std::numeric_limits<double>::infinity();
   const int floor_limiter_mode =
@@ -4303,7 +4398,7 @@ ConductionResult conduction_step_1d_sts_per_material(core::State& state,
 
   double* d_te_tmp = nullptr;
   double* d_alpha_cells = nullptr;
-  std::uint8_t* d_cell_is_void = nullptr;
+  const std::uint8_t* d_cell_is_void = nullptr;
   int* d_clamp_count = nullptr;
   double* d_e_floor = nullptr;
   d_te_tmp = static_cast<double*>(core::device_scratch_acquire(
@@ -4312,14 +4407,7 @@ ConductionResult conduction_step_1d_sts_per_material(core::State& state,
   d_alpha_cells = static_cast<double*>(core::device_scratch_acquire(
       "conduction:alpha_pass:1d_sts_per_material",
       static_cast<std::size_t>(n_cells) * sizeof(double)));
-  d_cell_is_void = static_cast<std::uint8_t*>(core::device_scratch_acquire(
-      "conduction:conduction_step_1d_sts_per_material:d_cell_is_void",
-      static_cast<std::size_t>(n_cells) * sizeof(std::uint8_t)));
-  cuda_check(cudaMemcpy(d_cell_is_void,
-                        state.cell_is_void.data(),
-                        static_cast<std::size_t>(n_cells) * sizeof(std::uint8_t),
-                        cudaMemcpyHostToDevice),
-             "Conduction: cudaMemcpy per-material d_cell_is_void failed");
+  d_cell_is_void = conduction_device_cell_is_void(state);
   double* d_clampfloor = static_cast<double*>(core::device_scratch_acquire(
       "conduction:conduction_step_1d_sts_per_material:clampfloor_pack",
       2 * sizeof(double)));
@@ -4330,6 +4418,14 @@ ConductionResult conduction_step_1d_sts_per_material(core::State& state,
   cuda_check(cudaMemcpy(d_clampfloor, h_clampfloor_init, sizeof(h_clampfloor_init),
                         cudaMemcpyHostToDevice),
              "Conduction: init clampfloor pack (per-material) failed");
+  // Floor-clamp energy per cell over all stages, summed in a fixed order
+  // before the readback (2026-09-24).
+  double* d_e_floor_cells = static_cast<double*>(core::device_scratch_acquire(
+      "conduction:conduction_step_1d_sts_per_material:e_floor_cells",
+      static_cast<std::size_t>(std::max(n_cells, 1)) * sizeof(double)));
+  cuda_check(cudaMemset(d_e_floor_cells, 0,
+                        static_cast<std::size_t>(std::max(n_cells, 1)) * sizeof(double)),
+             "Conduction: per-material floor cells zero failed");
 
   const core::State::LaunchWindow cw = state.owned_cell_window(n_cells);
   // Ghost-extended window for alpha/diffusivity passes: interface-face
@@ -4380,7 +4476,7 @@ ConductionResult conduction_step_1d_sts_per_material(core::State& state,
         cfg.numerics.floors.Te,
         d_alpha_cells,
         d_clamp_count,
-        d_e_floor,
+        d_e_floor_cells,
         floor_limiter_mode);
   };
   for (int sub = 0; sub < n_sub; ++sub) {
@@ -4424,6 +4520,7 @@ ConductionResult conduction_step_1d_sts_per_material(core::State& state,
         part, *bufs, te_ptr, 1, state.mesh.topo.n_cells, halo_stream, 4);
   }
 
+  core::deterministic_sum(d_e_floor_cells, n_cells, d_e_floor, false);
   double h_clampfloor[2] = {0.0, 0.0};
   cuda_check(cudaMemcpy(h_clampfloor, d_clampfloor, sizeof(h_clampfloor),
                         cudaMemcpyDeviceToHost),
@@ -4446,6 +4543,7 @@ ConductionResult conduction_step_2d_sts_per_material(core::State& state,
                                                      parallel::CommBuffers* bufs,
                                                      cudaStream_t stream) {
   ConductionResult result;
+  result.energy_closed_by_solve = true;
   result.dt_cond = std::numeric_limits<double>::infinity();
   result.dt_exp = std::numeric_limits<double>::infinity();
   const int floor_limiter_mode =
@@ -4862,15 +4960,7 @@ ConductionResult conduction_step_1d_sts(core::State& state,
   d_alpha_cells = static_cast<double*>(core::device_scratch_acquire(
       "conduction:alpha_pass:1d_sts",
       static_cast<std::size_t>(n_cells) * sizeof(double)));
-  std::uint8_t* d_cell_is_void = nullptr;
-  d_cell_is_void = static_cast<std::uint8_t*>(core::device_scratch_acquire(
-      "conduction:conduction_step_1d_sts:d_cell_is_void",
-      static_cast<std::size_t>(n_cells) * sizeof(std::uint8_t)));
-  cuda_check(cudaMemcpy(d_cell_is_void,
-                        state.cell_is_void.data(),
-                        static_cast<std::size_t>(n_cells) * sizeof(std::uint8_t),
-                        cudaMemcpyHostToDevice),
-             "Conduction: cudaMemcpy d_cell_is_void failed");
+  const std::uint8_t* d_cell_is_void = conduction_device_cell_is_void(state);
 
   int* d_clamp_count = nullptr;
   double* d_e_floor = nullptr;
@@ -4879,10 +4969,17 @@ ConductionResult conduction_step_1d_sts(core::State& state,
   d_e_floor = d_clampfloor + 0;
   d_clamp_count = reinterpret_cast<int*>(d_clampfloor + 1);
 
-  const double h_clampfloor_init[2] = {0.0, 0.0};
-  cuda_check(cudaMemcpy(d_clampfloor, h_clampfloor_init, sizeof(h_clampfloor_init),
-                        cudaMemcpyHostToDevice),
+  cuda_check(cudaMemsetAsync(d_clampfloor, 0, 2 * sizeof(double), stream),
              "Conduction: init clampfloor pack (sts) failed");
+  // Floor-clamp energy per cell over all stages, summed in a fixed order
+  // before the readback (2026-09-24; atomicAdd before).
+  double* d_e_floor_cells = static_cast<double*>(core::device_scratch_acquire(
+      "conduction:conduction_step_1d_sts:e_floor_cells",
+      static_cast<std::size_t>(std::max(n_cells, 1)) * sizeof(double)));
+  cuda_check(cudaMemsetAsync(d_e_floor_cells, 0,
+                             static_cast<std::size_t>(std::max(n_cells, 1)) * sizeof(double),
+                             stream),
+             "Conduction: sts floor cells zero failed");
 
   const core::State::LaunchWindow cw = state.owned_cell_window(n_cells);
   // Ghost-extended window for alpha/diffusivity passes: interface-face
@@ -5080,7 +5177,7 @@ ConductionResult conduction_step_1d_sts(core::State& state,
         Te_floor,
         d_alpha_cells,
         d_clamp_count,
-        d_e_floor,
+        d_e_floor_cells,
         floor_limiter_mode);
   };
   // W-G2 nlheat verify hook (default-inert): under
@@ -5137,7 +5234,7 @@ ConductionResult conduction_step_1d_sts(core::State& state,
         stage_kappa_rho_power,
         d_alpha_cells,
         d_clamp_count,
-        d_e_floor,
+        d_e_floor_cells,
         floor_limiter_mode);
   };
   // W-G2 kirchhoff face_kappa_policy (env bridge; unset = historic harmonic,
@@ -5184,7 +5281,7 @@ ConductionResult conduction_step_1d_sts(core::State& state,
         Te_floor,
         d_alpha_cells,
         d_clamp_count,
-        d_e_floor,
+        d_e_floor_cells,
         floor_limiter_mode);
   };
   const bool snb_on =
@@ -5246,20 +5343,21 @@ ConductionResult conduction_step_1d_sts(core::State& state,
           stages_per_sub,
           Te_floor,
           d_clamp_count,
-          d_e_floor,
+          d_e_floor_cells,
           floor_limiter_mode);
     };
     // Fused ping-pong parity:
     // stages/sub even, any n_sub: te_curr=state.Te, te_next=d_te_tmp
     // stages/sub odd, n_sub even: te_curr=state.Te, te_next=d_te_tmp
     // stages/sub odd, n_sub odd: te_curr=d_te_tmp, te_next=state.Te
+    // Every subcycle uses the same stage ladder.
+    cuda_check(cudaMemcpy(d_stage_tau,
+                          tau.data(),
+                          static_cast<std::size_t>(stages_per_sub) *
+                              sizeof(double),
+                          cudaMemcpyHostToDevice),
+               "Conduction: upload fused STS stage taus failed");
     for (int sub = 0; sub < n_sub; ++sub) {
-      cuda_check(cudaMemcpy(d_stage_tau,
-                            tau.data(),
-                            static_cast<std::size_t>(stages_per_sub) *
-                                sizeof(double),
-                            cudaMemcpyHostToDevice),
-                 "Conduction: upload fused STS stage taus failed");
       switch (geom_code) {
         case 1:
           launch_fused_kirchhoff(std::integral_constant<int, 1>{});
@@ -5343,6 +5441,7 @@ ConductionResult conduction_step_1d_sts(core::State& state,
         part, *bufs, te_ptr, 1, state.mesh.topo.n_cells, halo_stream, 4);
   }
 
+  core::deterministic_sum(d_e_floor_cells, n_cells, d_e_floor, false, stream);
   double h_clampfloor[2] = {0.0, 0.0};
   cuda_check(cudaMemcpy(h_clampfloor, d_clampfloor, sizeof(h_clampfloor),
                         cudaMemcpyDeviceToHost),
@@ -6225,13 +6324,7 @@ SnbFluxProbe snb_probe_fluxes(core::State& state, const core::Config& cfg,
                         static_cast<std::size_t>(n_cells) * sizeof(double),
                         cudaMemcpyHostToDevice),
              "SNB probe: A_eff upload failed");
-  std::uint8_t* d_cell_is_void = static_cast<std::uint8_t*>(core::device_scratch_acquire(
-      "conduction:snb_probe:d_cell_is_void",
-      static_cast<std::size_t>(n_cells) * sizeof(std::uint8_t)));
-  cuda_check(cudaMemcpy(d_cell_is_void, state.cell_is_void.data(),
-                        static_cast<std::size_t>(n_cells) * sizeof(std::uint8_t),
-                        cudaMemcpyHostToDevice),
-             "SNB probe: cell_is_void upload failed");
+  const std::uint8_t* d_cell_is_void = conduction_device_cell_is_void(state);
 
   const int n_groups = cfg.numerics.conduction.snb_n_groups;
   const std::size_t nf = static_cast<std::size_t>(n_cells) + 1;

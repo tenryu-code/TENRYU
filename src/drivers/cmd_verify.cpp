@@ -417,9 +417,8 @@ void maybe_bind_pressure_drive_table(const core::Config& cfg,
   TENRYU_ASSERT(it != builder.callable_objects.end(),
                 "boundary pressure callable metadata found but callable object missing");
 
-  constexpr int kSamples = 10000;
-  state.pressure_drive_1d =
-      core::namelist::create_frozen_table(it->second, 0.0, cfg.main.t_end, kSamples);
+  state.pressure_drive_1d = core::namelist::create_frozen_time_table(
+      it->second, cfg.main.t_end, "Numerics.hydro.boundary_pressure");
   state.pressure_drive_1d->zero_outside = true;
 #else
   (void)cfg;
@@ -442,22 +441,51 @@ void maybe_bind_marshak_table(const core::Config& cfg,
     TENRYU_ASSERT(it != builder.callable_objects.end(),
                   "marshak_Tr callable metadata found but callable object missing");
 
-    constexpr int kSamples = 10000;
-    state.marshak_Tr_1d =
-        core::namelist::create_frozen_table(it->second, 0.0, cfg.main.t_end, kSamples);
+    state.marshak_Tr_1d = core::namelist::create_frozen_time_table(
+        it->second, cfg.main.t_end, "Radiation.boundary.marshak_Tr",
+        /*require_non_negative=*/true);
     state.marshak_Tr_1d->zero_outside = true;
   }
 
-  constexpr int kSamples = 10000;
   for (const auto& [face, _] : cfg.radiation.boundary.marshak_Tr_map) {
     const std::string path = "Radiation.boundary.marshak_Tr_map." + face;
     const auto it = builder.callable_objects.find(path);
     if (it == builder.callable_objects.end()) {
       continue;
     }
-    auto table = core::namelist::create_frozen_table(it->second, 0.0, cfg.main.t_end, kSamples);
+    auto table = core::namelist::create_frozen_time_table(it->second, cfg.main.t_end, path,
+                                                          /*require_non_negative=*/true);
     table.zero_outside = true;
     state.marshak_Tr_face_tables[face] = std::move(table);
+  }
+
+  // Hot-electron eta(t) tables, as `tenryu run` binds them (verify runs used
+  // to clear them and fall back to the constant eta).
+  if (cfg.laser.hot_electron.eta_hot_table.detected) {
+    const auto eta_it = builder.callable_objects.find("Laser.hot_electron.eta_hot_table");
+    if (eta_it != builder.callable_objects.end()) {
+      state.hot_e_eta_1d = core::namelist::create_frozen_time_table(
+          eta_it->second, cfg.main.t_end, "Laser.hot_electron.eta_hot_table");
+      state.hot_e_eta_1d->zero_outside = true;
+    }
+  }
+  if (cfg.laser.hot_electron.sources_specified) {
+    state.hot_e_eta_ch_1d.assign(cfg.laser.hot_electron.sources.size(), std::nullopt);
+    for (std::size_t si = 0; si < cfg.laser.hot_electron.sources.size(); ++si) {
+      if (!cfg.laser.hot_electron.sources[si].eta_table.detected) {
+        continue;
+      }
+      const auto eta_it = builder.callable_objects.find(
+          "Laser.hot_electron.sources[" + std::to_string(si) + "].eta_table");
+      if (eta_it == builder.callable_objects.end()) {
+        continue;
+      }
+      auto table = core::namelist::create_frozen_time_table(
+          eta_it->second, cfg.main.t_end,
+          "Laser.hot_electron.sources[" + std::to_string(si) + "].eta_table");
+      table.zero_outside = true;
+      state.hot_e_eta_ch_1d[si] = std::move(table);
+    }
   }
 #else
   (void)cfg;
@@ -471,7 +499,6 @@ void maybe_bind_laser_tables(const core::Config& cfg,
                              core::State& state) {
 #if TENRYU_ENABLE_PYTHON
   state.laser_waveforms.assign(cfg.laser.beams.size(), core::namelist::FrozenTable1D{});
-  constexpr int kSamples = 10000;
   for (std::size_t i = 0; i < cfg.laser.beams.size(); ++i) {
     const std::string path = "Laser.beams[" + std::to_string(i) + "].power";
     const auto it = builder.callable_objects.find(path);
@@ -486,8 +513,12 @@ void maybe_bind_laser_tables(const core::Config& cfg,
       state.laser_waveforms[i] = std::move(fallback);
       continue;
     }
-    auto table = core::namelist::create_frozen_table(it->second, 0.0, cfg.main.t_end, kSamples);
+    auto table = core::namelist::create_frozen_time_table(it->second, cfg.main.t_end, path,
+                                                          /*require_non_negative=*/true);
     table.zero_outside = true;
+    core::namelist::normalize_beam_power_table(table, cfg.main.t_end,
+                                               cfg.laser.beams[i].energy_J,
+                                               ("Laser.beams[" + std::to_string(i) + "]").c_str());
     state.laser_waveforms[i] = std::move(table);
   }
 #else
@@ -9205,6 +9236,9 @@ core::Config make_sn_verify_config(const int n_cells,
   cfg.radiation.holo.enabled = false;
   cfg.radiation.imc.difference.enabled = false;
   cfg.radiation.sn_transport.n_angles = 8;
+  // The 1D default scheme (the builder's choice for a deck that does not set
+  // it); the gates of the linear-characteristic sweep set it explicitly.
+  cfg.radiation.sn_transport.spatial_scheme = "linear_discontinuous";
   cfg.radiation.sn_transport.max_outer_iterations = 3;
   cfg.radiation.sn_transport.max_inner_iterations = 8;
   cfg.radiation.sn_transport.outer_tol = 1.0e-8;
@@ -9338,11 +9372,16 @@ bool run_sn_1d_marshak_equilibration_impl(const std::string& label,
   // matter baseline and over-applied the exchange per outer (an artificial
   // acceleration toward equilibrium). With the baseline pinned to the step
   // start the honest transient reaches max_rel < 1e-6 at ~5600 steps
-  // (measured); 8000 keeps a comfortable margin. The gate tests the
-  // equilibrium fixed point, not the rate.
+  // (measured); 8000 kept a comfortable margin. The gate tests the
+  // equilibrium fixed point, not the rate. 2026-09-25: 16000 for the
+  // linear-discontinuous scheme, whose transient is slower (planar: max_rel
+  // 1.2e-5 at 8000 steps) and is the converged one — the inner-slab
+  // temperature at 1000..6000 steps matches a 128-cell run to 0.05 %, while
+  // the linear-characteristic 8-cell run leads it (49.65 eV at 3000 steps
+  // against 47.67).
   const int max_steps = (diag_max_steps != nullptr && diag_max_steps[0] != 0)
                             ? std::atoi(diag_max_steps)
-                            : 8000;
+                            : 16000;
   for (; steps < max_steps && max_rel > 1.0e-6; ++steps) {
     radiation::advance_radiation_step_sn_1d(
         state, cfg, planck, cfg.materials.materials.front(), dt);
@@ -9423,6 +9462,11 @@ bool run_sn_1d_planar_slab_attenuation_verify() {
   const double Te0 = 1.0e-4;  // emission ~ (Te0/Tr)^4 = 1.6e-27: negligible
   const double cv_e = 1.0e24;
   core::Config cfg = make_sn_verify_config(n, 1, sigma, cv_e);
+  // The closed form below is the characteristic sweep's exact attenuation;
+  // the linear-discontinuous scheme attenuates a pure absorber to second
+  // order in the cell optical depth (1 / (1 + tau + tau^2 / 2) per cell),
+  // tested in test_sn_1d_ld_step.
+  cfg.radiation.sn_transport.spatial_scheme = "linear_characteristic";
   cfg.mesh.geometry_1d = "planar";
   cfg.radiation.sn_transport.boundary.outer_r = "marshak";
   cfg.radiation.boundary.marshak_Tr_eV = Tr;

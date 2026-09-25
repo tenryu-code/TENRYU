@@ -15,7 +15,10 @@ __device__ inline void gamma_r_43_work_update_kernel_body(
     const double* __restrict__ vol_after,
     const int n_cells,
     const int n_groups,
-    double* __restrict__ floor_sum) {
+    double* __restrict__ floor_sum,
+    double* __restrict__ floor_slot = nullptr) {
+  // floor_slot: this cell's floor-energy slot (summed in a fixed order by the
+  // caller); without it the energy goes to floor_sum by an atomicAdd.
   (void)n_cells;
   const double v0 = vol_before[c];
   const double v1 = vol_after[c];
@@ -36,8 +39,12 @@ __device__ inline void gamma_r_43_work_update_kernel_body(
 
   const double raw_total = (sum_old * v0 - W) / v1;
   const double new_total = fmax(raw_total, 0.0);
-  if (raw_total < 0.0 && floor_sum != nullptr) {
-    atomicAdd(floor_sum, -raw_total * v1);
+  if (raw_total < 0.0) {
+    if (floor_slot != nullptr) {
+      *floor_slot = -raw_total * v1;
+    } else if (floor_sum != nullptr) {
+      atomicAdd(floor_sum, -raw_total * v1);
+    }
   }
 
   if (sum_old > 0.0) {

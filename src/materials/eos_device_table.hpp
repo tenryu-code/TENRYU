@@ -44,6 +44,8 @@ class DeviceEOSTable {
   double log_T_max_ = 0.0;
   double d_log_rho_inv_ = 0.0;
   double d_log_T_inv_ = 0.0;
+  double log_rho_guess_inv_ = 0.0;
+  double log_T_guess_inv_ = 0.0;
   std::uint8_t supports_rho_e_reclosure_ = 0u;
   DeviceColdEquilibriumTable cold_;
 

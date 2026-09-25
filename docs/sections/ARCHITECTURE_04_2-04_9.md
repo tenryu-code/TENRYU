@@ -580,7 +580,17 @@ Mesh::Search（NUMERICS §9.3–§9.5）を使用。粒子の物理座標は変�
 - `Materials::Mixture`：多材料セルの混合則（EOS混合は NUMERICS §1.1.5 (c)、伝導/ソース結合のセル実効量は NUMERICS §1.1.5a、SPECIFICATION §6.4.3）
 - `Materials::Tables`：SESAME/IONMIXロード、単位変換、範囲外clamp、診断
 - `Materials::DeviceEOSTable`（`src/materials/eos_device_table.hpp`, `eos_device_table.cuh`, `eos_device_table.cu`）：
-  table EOS data/view upload and device-side interpolation/inversion helpers
+  table EOS data/view upload and device-side interpolation/inversion helpers.
+  `eos_device_table_warp.cuh` (2026-09-25) holds warp-cooperative forms of the
+  inversion (`device_inverse_reclose_warp`, `..._with_high_t_tail_warp`,
+  `device_eos_T_from_e_monotone_warp`, `cold_inverse_Te_warp`): every lane of a
+  warp calls them with the same arguments, the bisections over table rows and
+  temperature nodes evaluate the next five levels' 31 midpoints in parallel and
+  descend with the sequential loop's decisions, so the decisions are the
+  sequential ones and the values agree to rounding (the compiler may contract a
+  multiply-add differently; `tests/materials/test_eos_inverse_warp.cu`). The 1D 2T
+  closure kernel (`enforce_2t_closure_split_kernel`, hydro_1d.cu) runs the ion and
+  electron inversions of a cell on two such warps
 - `Materials::ZbarDeviceContext` (`src/materials/zbar_device.hpp`, `zbar_device.cu`,
   `zbar_math.hpp`): driver-owned cache for immutable per-material ionization tables,
   material descriptors, and the host-owned void mask. The 1D updater reads resident
@@ -1023,7 +1033,7 @@ Config パース時に文字列→enum変換を行う。
     mirrors and local dispatch counters, and exposes cache invalidation
     helpers for the per-material mutation sites.
 - `Hydro::ALE1D`（`src/hydro/ale_1d_driver.{cuh,cu}`, `ale_1d_types.cuh`, `ale_1d_sensor.{cuh,cu}`, `ale_1d_rezone.{cuh,cu}`, `ale_1d_remap.{cuh,cu}`, `ale_1d_velocity_project.{cuh,cu}`, `ale_1d_diagnostics.{cuh,cu}`）
-  - 1D_SPH solution-adaptive ALE V3 の public API と skip-path diagnostics を保持する。現行版では GPU sensor が `compute_features` で feature list を構築し、`ale_1d_rezone` が monitor、common node mask、CPU equidistribution scratch candidate を構築し、`ale_1d_remap` が volume-coordinate MUSCL/minmod remap（first-order donor fallback と cosine protected-face taper 付き）を caller-owned scratch に書き、`ale_1d_velocity_project` が同じ swept volumes と mass phi を使って cell momentum remap と mass-weighted node projection scratch を構築する。`ale_1d_diagnostics` が scratch diagnostics を評価し、`apply_ale_1d` は hard 許容誤差を満たした場合だけ二相 commit で state を更新する。
+  - 1D_SPH solution-adaptive ALE V3 の public API と skip-path diagnostics を保持する。現行版では GPU sensor が `compute_features` で feature list を構築し、`ale_1d_rezone` が monitor、common node mask、CPU equidistribution scratch candidate を構築し、`ale_1d_remap` が volume-coordinate MUSCL/minmod remap（first-order donor fallback と cosine protected-face taper 付き）を caller-owned scratch に書き、`ale_1d_velocity_project` が mass remap の受理済み面質量流束（`Ale1dRemapScratch::mass_flux`）と mass phi を使い、各セルの両端節点速度の組を比量として移流する half-index-shift 法（Benson 1992 §3.5.5）で節点速度 scratch を構築する（2026-09-23 に cell momentum remap + mass-weighted node projection から置換）。`ale_1d_diagnostics` が scratch diagnostics を評価し、`apply_ale_1d` は hard 許容誤差を満たした場合だけ二相 commit で state を更新する。
   - V3 1D ALE は opt-in / experimental。既定は `numerics.ale1d.enabled=False` で、通常の GXII short-pulse は pure Lagrangian を使う。
   - runtime scope は 1D_SPH + deterministic radiation (FLD/S_N) のみ。IMC/DDMC は config validation で `ConfigError` とし、runtime guard は defensive skip として残す。
 - `Hydro::PLIC` (`src/hydro/plic_geometry.{cuh,cu}`,
@@ -1483,6 +1493,13 @@ struct HypreSolver {
   Persistent state は `rad_E_old`, `fld_sigma_a`, `fld_sigma_pe`,
   `fld_sigma_R`, `fld_eta`, `fld_nlte_f_work`, `fld_nlte_sigma_eff_work`,
   `fld_D_cell`, `fld_lower/diag/upper/rhs`, `fld_Te_old` を使う。
+- 1D の多材料の係数（2026-09-24、FLD と \(S_N\) が共有）：
+  `src/radiation/multimat_opacity_1d.cuh`（材料ごとの不透明度の記述
+  `MatOpacityDesc` と、セルの材料から部分密度で不透明度を混合する
+  `eval_opacity_multimat_kernel`、\(S_N\) の物理散乱 `eval_scattering_multimat_kernel`。
+  無名名前空間なので取り込む翻訳単位ごとに実体を持つ）と
+  `src/radiation/material_electron_eos_1d.hpp`/`.cu`（材料ごとの電子 EOS 表の device
+  配列とセルごとの選択 `cell_electron_table_selector_1d`、物質結合の Newton が使う）。
 - `Rad::FLD2DRZ`（`src/radiation/fld_2d_rz_gpu.cuh`, `fld_2d_rz_gpu.cu`,
   `src/radiation/amgx_solver.hpp`, `amgx_solver.cpp`）：
   `Radiation.mode="multigroup_diffusion"` かつ `Main.dimension="2D_RZ"` の
@@ -1501,8 +1518,18 @@ struct HypreSolver {
   matter update で publish する。
 - `Rad::SNTransport1D`（`src/radiation/sn_transport_1d_gpu.cuh`,
   `sn_transport_1d_gpu.cu`, `sn_dsa_1d_gpu.cu`,
-  `sn_material_newton_gpu.cu`）：
+  `sn_material_newton_gpu.cu`; 線形不連続法 `sn_ld_1d_gpu.{cuh,cu}`,
+  共有部 `sn_transport_1d_internal.hpp`（不透明度評価・角度求積・状態配列）と
+  `sn_electron_eos.cuh`（電子 EOS の尾部・逆算・比熱））：
   `Radiation.mode="sn_transport"` 専用の 1D_SPH pure \(S_N\) production 経路。
+  `spatial_scheme="linear_discontinuous"`（1D の既定、2026-09-25）は
+  `advance_radiation_step_sn_1d` が Marshak 入射・体積源の設定後に
+  `sn_ld::advance_step` へ渡し、節点強度の掃引（群ごとに 1 warp。セル行列の逆行列は
+  Newton 反復ごとに前計算）、整合 P1 系の block Thomas（Newton 反復ごとに 1 回の組み立てと
+  ブロック消去、対角ブロックは部分ピボットの Gauss–Jordan で逆行列にして保持、右辺ごとの代入）、節点温度の Newton と
+  吸収率密度の GMRES、節点物質更新（線形化と物質更新は節点ごとに 1 warp、群の Planck 項を
+  レーンで並列、EOS の逆算は warp 並列の二分法）をすべて GPU 上で行う（host は GMRES の
+  Hessenberg 小行列と収束判定のみ。NUMERICS §6.8.4）。以下は `"linear_characteristic"` の記述。
   IMC/DDMC/HOLO/difference を bypass し、group-parallel/angle-serial
   spherical sweep、group-batched DSA tridiagonal solve、GPU Newton material
   coupling を CUDA 上で実行する。
@@ -2033,15 +2060,13 @@ struct LaserMesh {
     double  n_crit;                 // 臨界密度 [1/cm³]
     double  n_hat_margin;           // [dimensionless] 臨界密度クリップ閾値（既定 1-eps_crit=0.9999）（NUMERICS §5.7.1）
 
-    // --- 1D_SPH map/EMA device buffers ---
-    double* prev_n_hat_device;      // [(nr+1)×(nz+1)] 前ステップの clipped n̂（EMA用）
+    // --- 1D_SPH map device buffers ---
     double* hydro_A_eff_device;     // [hydro_cell_capacity] 1D_SPH map用 A_eff scratch
     uint8_t* hydro_cell_is_void_device; // [hydro_cell_capacity] 1D_SPH map用 void flag scratch
     int     hydro_cell_capacity;    // hydro scratch capacity [cells]
 
-    // --- ホスト側キャッシュ（1D_SPH near-critical EMA 初回seed用）---
-    std::vector<double> prev_n_hat_host; // 旧hostキャッシュ/初回seed（通常更新後はdevice保持）
-    bool    prev_n_hat_valid;       // prev_n_hat_device の有効フラグ（mesh size change/release で無効化）
+    // （1D の写像は step 間平滑化をしないので状態を持たない。2026-09-24 に
+    //   prev_n_hat_device と State::laser_nhat_smoothing_{r,n_hat} を撤去、NUMERICS §5.7.4）
 
     // --- ゴーストコロナ設定（1D_SPH、NUMERICS §5.7.5）---
     bool    ghost_corona_enabled;           // ゴーストコロナ有効フラグ
@@ -2056,11 +2081,12 @@ struct LaserMesh {
 
     // --- ブローオフ遷移モデル（NUMERICS §5.7.5.4）---
     bool    ghost_transition_enabled;       // 遷移モデル有効フラグ
-    double  ghost_transition_resolved_nhat; // resolved-corona 判定閾値 n̂ [dimensionless]（既定 0.9）
-    int     ghost_transition_resolved_cells;// 復帰に必要な亜臨界セル数（既定 3）
+    double  ghost_transition_resolved_nhat; // resolved-corona 判定閾値 n̂ [dimensionless]（既定 0.9。ゴーストの減衰にも使う）
+    int     ghost_transition_resolved_cells;// ゴーストが消え、ハンドオフが復帰する亜臨界セル数（既定 3）
     double  ghost_transition_density_exponent; // 密度バイアス指数 α_ρ（既定 1.0）
     double  last_ghost_transition_blend;    // 直近のブレンド係数 β（診断用、毎ステップ更新）
     int     last_ghost_transition_resolved_cells; // 直近の resolved セル数（診断用、毎ステップ更新）
+    double  last_ghost_width;               // 直近の 1D マッピングのゴースト幅 W [cm]（0＝なし。診断用、NUMERICS §5.7.5.2）
     double  last_trace_unabsorbed_power;    // raytrace/skip 直後の未吸収パワー [erg/s]（診断用）
     double  last_transfer_blocked_power;    // transfer で受け皿がなく捨てたパワー [erg/s]（診断用）
     double  last_unabsorbed_power;          // transfer 後の最終未吸収パワー [erg/s]（診断用）
@@ -2145,10 +2171,18 @@ void laser_step(
   - `network.cuh`：`burn_network_step()` — 凍結温度 RK2 subcycle、決定論 scale-back
     正値性、counts 一次主義の台帳恒等（host/device 共有単一実装）
   - `network_gpu.cu/.cuh`：セル並列 device kernel（host-device identity ctest 済み）
-  - `deposition.cuh`：`alpha_rho_lambda()`（Fraley 3d×δ_log）、種 range スケール、
-    `point_sphere_deposited_fraction(u,τ)` 閉形式
+  - `deposition.cuh`：`alpha_rho_lambda()`（Fraley 3d×δ_log、媒質係数 `FraleyRangeMedium`）、
+    種 range スケール、`point_sphere_deposited_fraction(u,τ)` 閉形式
+  - `field_ions.hpp`：減速の場イオン `FieldIons`（イオンあたりの平均 A・Z・Z²・Z²/A）、
+    燃焼在庫と材料の体積分率からのセル毎の組成 `cell_field_ions()`（host）、
+    局所 range の媒質係数 `fraley_range_medium()`、Corman/MC カーネル用のセル配列 `FieldIonCells`
   - `partition.hpp/.cpp`（host）：LP 減速積分の初期化時タブレーション
-    （64×16 log 格子 × 6 生成物 slot）、Fraley Eq.4 knob
+    （64×16 log 格子 × 6 生成物 slot）、Fraley Eq.4 knob。表の構築は、減速項を
+    エネルギーごとに 1 回評価して各軸で使い回し（電子の減速は Ti に、イオンの速度項は
+    ne によらない）、生成物 slot × Te の作業を優先度の低いスレッド群で並列に計算する。
+    driver は初期化時に `std::shared_future` で背景構築を始め、燃焼の段が最初に表を
+    要するときに待つ（局所沈着は燃料が反応しうるまで段を飛ばす）。1 項ずつの定義と
+    ビット一致を `tests/burn/test_burn_partition_table.cpp` で検査（2026-09-25）
   - `burn_stage.hpp/.cpp`（host）：`compute_burn_step_1d()` — 燃料域/column 幾何、
     ネットワーク呼び出し、per-cell 沈着/分配、台帳（プレーン配列 in/out、単体テスト可能）
 - driver 結線（coupling/ 所有）：`callbacks.burn`（laser 直後・radiation 前）、
@@ -2211,6 +2245,12 @@ void laser_step(
     radiation energy diagnostic used by `Driver::run`: `max(rad_E,0)*vol`
     contributions are formed on the GPU, block-reduced deterministically, and
     accumulated on host from block partials for epsilon-budget inputs.
+  - `src/coupling/thermal_subcycle_scan.{hpp,cu}` provides the two device
+    scans of the thermal subcycle (NUMERICS §2.1): the compressed floor-hit
+    test after each substep and the initial substep-count prediction (minimum
+    Te margin above the floor guard). Each returns one value to the host
+    instead of copying Te and rho. The attempt backups and substep tallies are
+    driver-owned buffers kept across steps.
   - `src/coupling/driver_retry_snapshot.{hpp,cu}` provides the State
     snapshot/restore primitive for driver-level full-step retry on an
     inadmissible hydro corrector.
@@ -2304,6 +2344,16 @@ void laser_step(
   Numeric values, attributes, datatypes, shapes and cadence are unchanged.
   Public raw-HDF5 writers and 2D retain immediate appends;
   `TENRYU_HISTORY_BATCH_WRITES=0` selects that path for 1D bisection.
+  Since 2026-09-25 the batches are written by one worker thread of the
+  writer: the first row of a run is written synchronously (it creates the
+  file), later batches (64 rows or 30 s) are queued to the worker, and
+  `flush_pending()` (outputs, run end, restart) queues the pending rows and
+  waits for the queue to drain; the destructor drains and joins. HDF5 may be
+  built without thread safety, so every HDF5 call of the time loop (history
+  worker and appenders, snapshot and checkpoint writers, checkpoint and TMAT
+  readers, escape-valve and positivity histories) runs under the
+  process-wide `core::hdf5_mutex()` (`src/core/hdf5_mutex.hpp`, a recursive
+  mutex).
 - `Diag::CornerBCAudit`（`src/diagnostics/history_writer.cpp`）：`dt_breakdown_history_enabled=True` の history writer が、CFL winner が r_outer-reflect ∩ z_top-state_supply corner halo に入った step だけ `/diagnostics/corner_bc_audit/v1/` へ interior/ghost state と local dt/cs/Qvisc を追記する diagnostic-only HDF5 group。physics state と HDF5 root `schema_version` は変更しない。
 - `Diag::EscapeValveHistory` (`src/diagnostics/escape_valve_history.{hpp,cpp}`):
   Fixed-column HDF5 writer for
@@ -2391,7 +2441,7 @@ DiagOutput compute_diagnostics(
 ### 4.9 io/
 **責務**：入出力、再始動、メタデータ
 
-- `IO::HDF5Writer`：並列HDF5
+- `IO::HDF5Writer`：並列HDF5。snapshot と checkpoint の deflate 付き dataset のうち 64 KiB 以上は、プロセス共通の圧縮スレッド群（`DeflatePool`。スレッド数は使える CPU 数 − 2、最低 2。使える CPU 数は Linux ではプロセスの affinity と cgroup の CPU 上限で制限する — RunPod の pod はハードウェアスレッド 128・上限 13.6 CPU）が圧縮（zlib `compress2`、HDF5 の deflate フィルタと同じ形式・同じレベル）し、ファイルを閉じる前に `H5Dwrite_chunk` で書く（`DeferredDeflateChunks`、2026-09-25）。512 KiB を超える dataset は第 1 次元に沿って約 256 KiB のチャンクに分けて保存する（端のチャンクは 0 で埋める）。時間ループの snapshot（`OutputManager::write_snapshot`）は `HDF5Writer::write_snapshot_in_background` で書く: ファイルの作成・群・属性・小さい dataset の書き込みと大きい dataset のチャンクの圧縮依頼までを行って返り（データはこの時点で複製済み）、完了（圧縮の待ち・チャンクの書き込み・close・`.tmp` からの rename による公開）は 1 本の完了スレッド（`SnapshotFinisher`）が書いた順に行う（2026-09-25。完了待ちは 2 個まで、超えると書き込み側が待つ。完了スレッドのエラーは次の書き込みか `HDF5Writer::wait_for_snapshot_writes` で再送出され、driver は run の最後の snapshot の後で待つ）。`HDF5Writer::write_snapshot` は同じ書き込みの後、公開まで待ってから返る（戻った時点でファイルがある）。HDF5 の呼び出しはプロセス共通の再帰ロック（`core::hdf5_mutex`）で直列化する（完了スレッドも同じロックの下で書く）。スナップショットの各群は NVTX 区間 `io.snapshot.*`（完了スレッドの close は `io.snapshot.close`）で計測できる
 - `IO::Checkpoint`：State + Mesh + census粒子（容量対策含む）
 - `IO::Restart`
 - `IO::Schema`：互換性ルール（スキーマ破壊禁止）

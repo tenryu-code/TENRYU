@@ -3,6 +3,7 @@
 #include "laser/laser_mesh_bodies.cuh"
 
 #include <algorithm>
+#include <climits>
 #include <cmath>
 #include <cstring>
 #include <iomanip>
@@ -14,6 +15,7 @@
 
 #include "core/constants.hpp"
 #include "core/device_pack.hpp"
+#include "core/device_scratch.hpp"
 #include "core/error.hpp"
 #include "laser/cbet_lm_fields.cuh"
 #include "laser/ib_absorption.cuh"
@@ -382,9 +384,12 @@ DynamicMeshParams1D compute_dynamic_mesh_params_1d(
                      ? r_max_factor * r_edges[static_cast<std::size_t>(outermost_threshold + 1)]
                      : fallback_r_max;
 
+  // Critical radius for the node layout: the same log-interpolated crossing
+  // the n_hat profile and the deposition split use (formerly the face
+  // r_edges[fcrit], a third definition; 2026-09-23).
   const double R_crit_raw =
       (fcrit >= 0 && fcrit < static_cast<int>(r_edges.size()))
-          ? r_edges[static_cast<std::size_t>(fcrit)]
+          ? crit_est.r_interp
           : (0.5 * R_max);
   double min_dr_crit = std::numeric_limits<double>::max();
   double min_dr_global = std::numeric_limits<double>::max();
@@ -427,7 +432,6 @@ using laser_mesh_bodies::compute_gradient_kernel_body;
 using laser_mesh_bodies::compute_radial_gradient_kernel_body;
 using laser_mesh_bodies::compute_smooth_kappa_ext_kernel_body;
 using laser_mesh_bodies::compute_smooth_kappa_kernel_body;
-using laser_mesh_bodies::ema_smooth_n_hat_kernel_body;
 using laser_mesh_bodies::extract_radial_profile_kernel_body;
 using laser_mesh_bodies::extract_radial_te_kernel_body;
 using laser_mesh_bodies::map_hydro_to_laser_1d_kernel_body;
@@ -463,10 +467,7 @@ __global__ void map_hydro_to_laser_1d_kernel(
     const double ghost_Te_min_eV,
     const int critical_clip,
     const double n_hat_margin,
-    const int fcrit_cell,
-    const double r_crit_interp,
-    const double ne_fcrit_center,
-    const double r_fcrit_center) {
+    const int fcrit_cell) {
   const int idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx >= n_nodes_total) {
     return;
@@ -478,19 +479,7 @@ __global__ void map_hydro_to_laser_1d_kernel(
       n_cells, n_crit_safe, use_ghost_corona, outer_surface_cell,
       ghost_ne_inner, ghost_scale_length, ghost_ne_min, r_surface_outer,
       r_ghost_outer, Te_anchor, zbar_anchor, ghost_zbar_min, ghost_zbar_max,
-      ghost_Te_min_eV, critical_clip, n_hat_margin, fcrit_cell,
-      r_crit_interp, ne_fcrit_center, r_fcrit_center);
-}
-
-__global__ void ema_smooth_n_hat_kernel(double* __restrict__ n_hat,
-                                        const double* __restrict__ prev_n_hat,
-                                        const int n_nodes_total) {
-  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx >= n_nodes_total) {
-    return;
-  }
-
-  ema_smooth_n_hat_kernel_body(idx, n_hat, prev_n_hat, n_nodes_total);
+      ghost_Te_min_eV, critical_clip, n_hat_margin, fcrit_cell);
 }
 
 void ensure_hydro_mapping_capacity(LaserMesh& mesh, const int n_cells) {
@@ -568,11 +557,242 @@ __global__ void compute_smooth_kappa_ext_kernel(
     const double eps_n,
     const double coulomb_log_floor,
     const int n_nodes_total,
-    const LaserPhysExtOptions opt) {
+    const LaserPhysExtOptions opt,
+    const int* __restrict__ node_material) {
   const int idx = blockIdx.x * blockDim.x + threadIdx.x;
   compute_smooth_kappa_ext_kernel_body(
       idx, smooth_kappa_factor, n_hat, T_e, Zbar, lambda_cm, eps_n,
-      coulomb_log_floor, n_nodes_total, opt);
+      coulomb_log_floor, n_nodes_total, opt, node_material);
+}
+
+// The profile nodes of laser_mesh_bodies::build_trace_profile_nodes_1d placed
+// by one block in parallel over the hydro cells: the same nodes, bitwise, as
+// the serial pass (which the persistent loop's leader thread runs). The serial
+// pass places each node after the previous one, but where a cell lies inside
+// the profile's outer radius and is at least 16 subdiv minimum gaps wide
+// (relative to its outer face), its nodes do not depend on the nodes before it
+// once the cell before it is such a cell too: that cell's node below the upper
+// face lies above its other nodes and at least 4 minimum gaps below this
+// cell's lower face, so the serial pass places the face as a new node, and
+// every later node of the cell is decided against the cell's own nodes (the
+// merge rule's condition on the node before the last applies only to a node
+// of higher rank than the last, and a face has the highest). The same holds
+// for the first cell that crosses the outer radius: the serial pass drops the
+// nodes beyond the radius without changing its state, so that cell, the cells
+// beyond it (whose nodes are all dropped) and the tail (the hydro end, the
+// graded nodes beyond it, the outer radius) form one last segment placed in
+// order from its first node. The block places the segments -- the profile's
+// start through cell 0 as the serial pass does, every further cell inside the
+// radius, the last segment -- in two passes: it counts each thread's
+// consecutive segments, scans the counts, and writes the segments at their
+// offsets. A profile starting below r = 0, a narrow or non-increasing cell
+// inside the radius, cell 0 crossing the radius, fewer than two cells or a
+// count above capacity take the serial pass in thread 0. Before, one thread
+// placed the nodes: about 0.46 ms per step late in the GXII FLD deck (FP64
+// latency of one dependent chain).
+constexpr int kTraceProfileBlock = 1024;
+
+__device__ inline laser_mesh_bodies::TraceProfileCursor trace_profile_segment_cursor(
+    const int segment,
+    double* out,
+    const int capacity,
+    const bool clip,
+    const double r_outer) {
+  laser_mesh_bodies::TraceProfileCursor cur;
+  cur.out = out;
+  cur.capacity = capacity;
+  cur.clip = clip;
+  cur.r_outer = r_outer;
+  if (segment > 0) {
+    // Placed on its own: the serial pass has placed more than two nodes before
+    // it and places its first node as a new node.
+    cur.rule_count_base = 2;
+    cur.last = -1.0;
+    cur.before_last = -1.0;
+    cur.last_rank = 2;
+  }
+  return cur;
+}
+
+// Segment `segment` of the profile: 0 the profile's start through cell 0; 1 ..
+// c_cross - 1 one cell each; c_cross the cells c_cross .. c_last (the first
+// cell crossing the outer radius and those beyond it; none when every cell is
+// inside) and the tail.
+__device__ inline void trace_profile_place_segment(laser_mesh_bodies::TraceProfileCursor& cur,
+                                                   const int segment,
+                                                   const int c_cross,
+                                                   const int c_last,
+                                                   const double* __restrict__ r_edges,
+                                                   const double* __restrict__ graded_r,
+                                                   const int n_graded,
+                                                   const double* pair_r,
+                                                   const int n_pair,
+                                                   const int parts,
+                                                   const bool planar) {
+  if (segment == 0) {
+    for (int k = 0; !planar && k < n_graded && graded_r[k] < r_edges[0]; ++k) {
+      laser_mesh_bodies::trace_profile_push_ranked(cur, graded_r[k], 0);
+    }
+    laser_mesh_bodies::trace_profile_push_cell(cur, r_edges, 0, pair_r, n_pair, parts);
+  } else if (segment < c_cross) {
+    laser_mesh_bodies::trace_profile_push_cell(cur, r_edges, segment, pair_r, n_pair, parts);
+  } else {
+    for (int c = c_cross; c <= c_last; ++c) {
+      laser_mesh_bodies::trace_profile_push_cell(cur, r_edges, c, pair_r, n_pair, parts);
+    }
+    laser_mesh_bodies::trace_profile_push_tail(cur, r_edges[c_last + 1], graded_r, n_graded);
+  }
+}
+
+__global__ __launch_bounds__(kTraceProfileBlock) void build_trace_profile_nodes_1d_parallel_kernel(
+    const double* __restrict__ r_edges,
+    const std::uint8_t* __restrict__ cell_is_void,
+    const int n_cells,
+    const int outer_surface_cell,
+    const int fcrit_cell,
+    const double* __restrict__ rho,
+    const double* __restrict__ zbar,
+    const double* __restrict__ A_eff_cell,
+    const double n_crit_safe,
+    const int critical_clip,
+    const double n_hat_margin,
+    const double* __restrict__ graded_r,
+    const int n_graded,
+    double* __restrict__ out,
+    const int capacity,
+    int* __restrict__ count_out,
+    const int subdiv,
+    const int planar) {
+  __shared__ double sh_pair[laser_mesh_bodies::kTracePairNodesMax + 1];
+  __shared__ int sh_n_pair;
+  __shared__ int sh_serial;
+  __shared__ int sh_c_cross;
+  __shared__ int sh_scan[kTraceProfileBlock];
+  const int tid = static_cast<int>(threadIdx.x);
+  const int nthreads = static_cast<int>(blockDim.x);
+  const int parts = subdiv > 1 ? subdiv : 1;
+  const bool clip = n_graded > 0;
+  const double r_outer = clip ? graded_r[n_graded - 1] : 0.0;
+  const int c_last =
+      (n_cells > 0) ? laser_mesh_bodies::trace_profile_last_cell_1d(n_cells, outer_surface_cell)
+                    : -1;
+  if (tid == 0) {
+    sh_serial = (c_last < 1) ? 1 : 0;
+    sh_n_pair = 0;
+    sh_c_cross = c_last + 1;
+    if (c_last >= 1) {
+      sh_n_pair = laser_mesh_bodies::trace_profile_pair_nodes_1d(
+          r_edges, cell_is_void, n_cells, c_last, fcrit_cell, rho, zbar, A_eff_cell, n_crit_safe,
+          critical_clip, n_hat_margin, sh_pair);
+      if (!(r_edges[0] >= 0.0)) {
+        sh_serial = 1;
+      }
+    }
+  }
+  __syncthreads();
+  // The first cell whose upper face is not inside the outer radius (a NaN face
+  // counts as not inside).
+  if (clip) {
+    for (int c = tid; c <= c_last; c += nthreads) {
+      if (!(r_edges[c + 1] <= r_outer)) {
+        atomicMin(&sh_c_cross, c);
+      }
+    }
+  }
+  __syncthreads();
+  const int c_cross = sh_c_cross;
+  for (int c = tid; c < c_cross; c += nthreads) {
+    if (!laser_mesh_bodies::trace_profile_cell_independent(r_edges[c], r_edges[c + 1], parts)) {
+      atomicOr(&sh_serial, 1);
+    }
+  }
+  if (tid == 0 && c_cross < 1) {
+    sh_serial = 1;
+  }
+  __syncthreads();
+  if (sh_serial != 0) {
+    if (tid == 0) {
+      *count_out = laser_mesh_bodies::build_trace_profile_nodes_1d(
+          r_edges, cell_is_void, n_cells, outer_surface_cell, fcrit_cell, rho, zbar, A_eff_cell,
+          n_crit_safe, critical_clip, n_hat_margin, graded_r, n_graded, out, capacity, subdiv,
+          planar != 0);
+    }
+    return;
+  }
+  const int n_pair = sh_n_pair;
+  const bool is_planar = planar != 0;
+  // Segments: 0 the profile's start through cell 0, 1 .. c_cross - 1 the cells
+  // inside the outer radius, c_cross the rest.
+  const int n_seg = c_cross + 1;
+  const int chunk = (n_seg + nthreads - 1) / nthreads;
+  const int s_begin = min(n_seg, tid * chunk);
+  const int s_end = min(n_seg, s_begin + chunk);
+  int my_count = 0;
+  for (int seg = s_begin; seg < s_end; ++seg) {
+    laser_mesh_bodies::TraceProfileCursor cur =
+        trace_profile_segment_cursor(seg, nullptr, INT_MAX, clip, r_outer);
+    trace_profile_place_segment(cur, seg, c_cross, c_last, r_edges, graded_r, n_graded, sh_pair,
+                                n_pair, parts, is_planar);
+    my_count += cur.count;
+  }
+  // Inclusive scan of the threads' counts (fixed order).
+  sh_scan[tid] = my_count;
+  __syncthreads();
+  for (int step = 1; step < nthreads; step <<= 1) {
+    const int add = (tid >= step) ? sh_scan[tid - step] : 0;
+    __syncthreads();
+    sh_scan[tid] += add;
+    __syncthreads();
+  }
+  const int total = sh_scan[nthreads - 1];
+  if (total > capacity) {
+    if (tid == 0) {
+      *count_out = laser_mesh_bodies::build_trace_profile_nodes_1d(
+          r_edges, cell_is_void, n_cells, outer_surface_cell, fcrit_cell, rho, zbar, A_eff_cell,
+          n_crit_safe, critical_clip, n_hat_margin, graded_r, n_graded, out, capacity, subdiv,
+          planar != 0);
+    }
+    return;
+  }
+  int offset = sh_scan[tid] - my_count;
+  for (int seg = s_begin; seg < s_end; ++seg) {
+    laser_mesh_bodies::TraceProfileCursor cur =
+        trace_profile_segment_cursor(seg, out + offset, capacity - offset, clip, r_outer);
+    trace_profile_place_segment(cur, seg, c_cross, c_last, r_edges, graded_r, n_graded, sh_pair,
+                                n_pair, parts, is_planar);
+    offset += cur.count;
+  }
+  if (tid == 0) {
+    *count_out = total;
+  }
+}
+
+__global__ void map_node_material_1d_kernel(
+    const double* __restrict__ node_R,
+    const double* __restrict__ node_Z,
+    const double* __restrict__ r_edges,
+    const std::uint8_t* __restrict__ cell_is_void,
+    const int* __restrict__ cell_material_index,
+    const double* __restrict__ node_Zbar,
+    const int n_nodes_total,
+    const int n_nodes_z,
+    const int n_cells,
+    const int use_ghost_corona,
+    const int outer_surface_cell,
+    const double r_surface_outer,
+    const double r_ghost_outer,
+    const LaserZeffMaterial* __restrict__ zeff_materials,
+    const int n_materials,
+    int* __restrict__ node_material_out,
+    double* __restrict__ node_zcoll_out) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= n_nodes_total) {
+    return;
+  }
+  laser_mesh_bodies::map_node_material_1d_kernel_body(
+      idx, node_R, node_Z, r_edges, cell_is_void, cell_material_index, node_Zbar,
+      n_nodes_z, n_cells, use_ghost_corona, outer_surface_cell, r_surface_outer,
+      r_ghost_outer, zeff_materials, n_materials, node_material_out, node_zcoll_out);
 }
 
 __global__ void extract_radial_profile_kernel(
@@ -703,9 +923,15 @@ LaserMesh& LaserMesh::operator=(LaserMesh&& other) noexcept {
   radial_n_hat_raw = other.radial_n_hat_raw;
   radial_smooth_kappa = other.radial_smooth_kappa;
   radial_T_e = other.radial_T_e;
+  radial_Zbar = other.radial_Zbar;
   radial_dn_dr = other.radial_dn_dr;
+  radial_zero = other.radial_zero;
+  radial_n_nodes = other.radial_n_nodes;
+  radial_capacity = other.radial_capacity;
+  trace_profile_1d = other.trace_profile_1d;
+  trace_profile_map = other.trace_profile_map;
+  geometry_code = other.geometry_code;
   deposit = other.deposit;
-  prev_n_hat_device = other.prev_n_hat_device;
   hydro_A_eff_device = other.hydro_A_eff_device;
   hydro_cell_is_void_device = other.hydro_cell_is_void_device;
   hydro_cell_capacity = other.hydro_cell_capacity;
@@ -755,6 +981,7 @@ LaserMesh& LaserMesh::operator=(LaserMesh&& other) noexcept {
   ghost_transition_density_exponent = other.ghost_transition_density_exponent;
   last_ghost_transition_blend = other.last_ghost_transition_blend;
   last_ghost_transition_resolved_cells = other.last_ghost_transition_resolved_cells;
+  last_ghost_width = other.last_ghost_width;
   last_trace_unabsorbed_power = other.last_trace_unabsorbed_power;
   last_transfer_blocked_power = other.last_transfer_blocked_power;
   last_unabsorbed_power = other.last_unabsorbed_power;
@@ -770,8 +997,6 @@ LaserMesh& LaserMesh::operator=(LaserMesh&& other) noexcept {
   last_cbet_overflow_rays = other.last_cbet_overflow_rays;
   last_cbet_iterations = other.last_cbet_iterations;
   last_cbet_converged = other.last_cbet_converged;
-  prev_n_hat_host = std::move(other.prev_n_hat_host);
-  prev_n_hat_valid = other.prev_n_hat_valid;
   ray_steps_previous = std::move(other.ray_steps_previous);
   ray_steps_output = std::move(other.ray_steps_output);
   ray_order = std::move(other.ray_order);
@@ -801,9 +1026,13 @@ LaserMesh& LaserMesh::operator=(LaserMesh&& other) noexcept {
   other.radial_n_hat_raw = nullptr;
   other.radial_smooth_kappa = nullptr;
   other.radial_T_e = nullptr;
+  other.radial_Zbar = nullptr;
   other.radial_dn_dr = nullptr;
+  other.radial_zero = nullptr;
+  other.radial_n_nodes = 0;
+  other.radial_capacity = 0;
+  other.trace_profile_1d = false;
   other.deposit = nullptr;
-  other.prev_n_hat_device = nullptr;
   other.hydro_A_eff_device = nullptr;
   other.hydro_cell_is_void_device = nullptr;
   other.hydro_cell_capacity = 0;
@@ -833,6 +1062,7 @@ LaserMesh& LaserMesh::operator=(LaserMesh&& other) noexcept {
   other.ghost_transition_enabled = false;
   other.last_ghost_transition_blend = 0.0;
   other.last_ghost_transition_resolved_cells = 0;
+  other.last_ghost_width = 0.0;
   other.last_trace_unabsorbed_power = 0.0;
   other.last_transfer_blocked_power = 0.0;
   other.last_unabsorbed_power = 0.0;
@@ -848,8 +1078,6 @@ LaserMesh& LaserMesh::operator=(LaserMesh&& other) noexcept {
   other.last_cbet_overflow_rays = 0;
   other.last_cbet_iterations = 0;
   other.last_cbet_converged = true;
-  other.prev_n_hat_host.clear();
-  other.prev_n_hat_valid = false;
   other.ray_steps_previous.clear();
   other.ray_steps_output.clear();
   other.ray_order.clear();
@@ -920,14 +1148,17 @@ void LaserMesh::release() {
     cuda_check(cudaFree(radial_dn_dr), "LaserMesh::release radial_dn_dr cudaFree failed");
     radial_dn_dr = nullptr;
   }
+  if (radial_Zbar != nullptr) {
+    cuda_check(cudaFree(radial_Zbar), "LaserMesh::release radial_Zbar cudaFree failed");
+    radial_Zbar = nullptr;
+  }
+  if (radial_zero != nullptr) {
+    cuda_check(cudaFree(radial_zero), "LaserMesh::release radial_zero cudaFree failed");
+    radial_zero = nullptr;
+  }
   if (deposit != nullptr) {
     cuda_check(cudaFree(deposit), "LaserMesh::release deposit cudaFree failed");
     deposit = nullptr;
-  }
-  if (prev_n_hat_device != nullptr) {
-    cuda_check(cudaFree(prev_n_hat_device),
-               "LaserMesh::release prev_n_hat_device cudaFree failed");
-    prev_n_hat_device = nullptr;
   }
   if (hydro_A_eff_device != nullptr) {
     cuda_check(cudaFree(hydro_A_eff_device),
@@ -1033,8 +1264,6 @@ void LaserMesh::release() {
   last_cbet_overflow_rays = 0;
   last_cbet_iterations = 0;
   last_cbet_converged = true;
-  prev_n_hat_host.clear();
-  prev_n_hat_valid = false;
   ray_steps_previous.clear();
   ray_steps_output.clear();
   ray_order.clear();
@@ -1047,7 +1276,7 @@ bool LaserMesh::is_allocated() const {
          grad_n_hat_Z != nullptr && radial_node_r != nullptr &&
          radial_n_hat != nullptr && radial_n_hat_raw != nullptr &&
          radial_smooth_kappa != nullptr && radial_T_e != nullptr &&
-         radial_dn_dr != nullptr && deposit != nullptr && prev_n_hat_device != nullptr;
+         radial_dn_dr != nullptr && deposit != nullptr;
 }
 
 int LaserMesh::n_nodes() const {
@@ -1056,15 +1285,11 @@ int LaserMesh::n_nodes() const {
 
 void LaserMesh::allocate(const int nr_cells, const int nz_cells) {
   if (nr_cells <= nr_capacity && nz_cells <= nz_capacity && is_allocated()) {
-    const bool size_changed = (nr != nr_cells) || (nz != nz_cells);
     nr = nr_cells;
     nz = nz_cells;
     n_nodes_r = nr + 1;
     n_nodes_z = nz + 1;
     radial_n_nodes = n_nodes_r;
-    if (size_changed) {
-      prev_n_hat_valid = false;
-    }
     clear_deposit();
     return;
   }
@@ -1114,43 +1339,40 @@ void LaserMesh::allocate(const int nr_cells, const int nz_cells) {
                    "LaserMesh::allocate grad_n_hat_R cudaMalloc failed");
   alloc_or_cleanup(grad_n_hat_Z, n_nodes_capacity_total * sizeof(double),
                    "LaserMesh::allocate grad_n_hat_Z cudaMalloc failed");
-  alloc_or_cleanup(radial_node_r,
-                   static_cast<std::size_t>(n_nodes_r_capacity) * sizeof(double),
+  // Radial profile: at least the axis column (the 2D path and the capacity
+  // before the first 1D map); ensure_radial_capacity grows it.
+  radial_capacity = std::max(radial_capacity, n_nodes_r_capacity);
+  const std::size_t radial_bytes = static_cast<std::size_t>(radial_capacity) * sizeof(double);
+  alloc_or_cleanup(radial_node_r, radial_bytes,
                    "LaserMesh::allocate radial_node_r cudaMalloc failed");
-  alloc_or_cleanup(radial_n_hat,
-                   static_cast<std::size_t>(n_nodes_r_capacity) * sizeof(double),
+  alloc_or_cleanup(radial_n_hat, radial_bytes,
                    "LaserMesh::allocate radial_n_hat cudaMalloc failed");
-  alloc_or_cleanup(radial_n_hat_raw,
-                   static_cast<std::size_t>(n_nodes_r_capacity) * sizeof(double),
+  alloc_or_cleanup(radial_n_hat_raw, radial_bytes,
                    "LaserMesh::allocate radial_n_hat_raw cudaMalloc failed");
-  alloc_or_cleanup(radial_smooth_kappa,
-                   static_cast<std::size_t>(n_nodes_r_capacity) * sizeof(double),
+  alloc_or_cleanup(radial_smooth_kappa, radial_bytes,
                    "LaserMesh::allocate radial_smooth_kappa cudaMalloc failed");
-  alloc_or_cleanup(radial_T_e,
-                   static_cast<std::size_t>(n_nodes_r_capacity) * sizeof(double),
+  alloc_or_cleanup(radial_T_e, radial_bytes,
                    "LaserMesh::allocate radial_T_e cudaMalloc failed");
-  alloc_or_cleanup(radial_dn_dr,
-                   static_cast<std::size_t>(n_nodes_r_capacity) * sizeof(double),
+  alloc_or_cleanup(radial_Zbar, radial_bytes,
+                   "LaserMesh::allocate radial_Zbar cudaMalloc failed");
+  alloc_or_cleanup(radial_dn_dr, radial_bytes,
                    "LaserMesh::allocate radial_dn_dr cudaMalloc failed");
+  alloc_or_cleanup(radial_zero, sizeof(double),
+                   "LaserMesh::allocate radial_zero cudaMalloc failed");
+  cuda_check(cudaMemset(radial_zero, 0, sizeof(double)), "LaserMesh::allocate radial_zero memset failed");
   alloc_or_cleanup(deposit, n_nodes_capacity_total * sizeof(double),
                    "LaserMesh::allocate deposit cudaMalloc failed");
-  alloc_or_cleanup(prev_n_hat_device, n_nodes_capacity_total * sizeof(double),
-                   "LaserMesh::allocate prev_n_hat_device cudaMalloc failed");
 
   clear_deposit();
 }
 
 void LaserMesh::ensure_capacity(const int nr_new, const int nz_new) {
   if (nr_new <= nr_capacity && nz_new <= nz_capacity) {
-    const bool size_changed = (nr != nr_new) || (nz != nz_new);
     nr = nr_new;
     nz = nz_new;
     n_nodes_r = nr + 1;
     n_nodes_z = nz + 1;
     radial_n_nodes = n_nodes_r;
-    if (size_changed) {
-      prev_n_hat_valid = false;
-    }
     ++steps_since_realloc;
     if (nr_new * 2 <= nr_capacity && nz_new * 2 <= nz_capacity) {
       ++underuse_steps;
@@ -1198,6 +1420,25 @@ void LaserMesh::ensure_capacity(const int nr_new, const int nz_new) {
   n_nodes_r = nr + 1;
   n_nodes_z = nz + 1;
   radial_n_nodes = n_nodes_r;
+}
+
+void LaserMesh::ensure_radial_capacity(const int n_nodes) {
+  if (n_nodes <= radial_capacity && radial_node_r != nullptr) {
+    return;
+  }
+  const int new_capacity = std::max(n_nodes, 2 * radial_capacity);
+  double** arrays[] = {&radial_node_r, &radial_n_hat, &radial_n_hat_raw, &radial_smooth_kappa,
+                       &radial_T_e,    &radial_Zbar,  &radial_dn_dr};
+  for (double** a : arrays) {
+    if (*a != nullptr) {
+      cuda_check(cudaFree(*a), "LaserMesh::ensure_radial_capacity cudaFree failed");
+      *a = nullptr;
+    }
+    cuda_check(cudaMalloc(reinterpret_cast<void**>(a),
+                          static_cast<std::size_t>(new_capacity) * sizeof(double)),
+               "LaserMesh::ensure_radial_capacity cudaMalloc failed");
+  }
+  radial_capacity = new_capacity;
 }
 
 void LaserMesh::clear_deposit(cudaStream_t stream) const {
@@ -1413,6 +1654,20 @@ void LaserMesh::clear_step_scratch(cudaStream_t stream) const {
              "LaserMesh::clear_step_scratch memset scratch_error_flags failed");
 }
 
+double laser_turn_on_time_s(const core::State& state) {
+  double t_on = std::numeric_limits<double>::infinity();
+  for (const auto& table : state.laser_waveforms) {
+    const std::size_t n = std::min(table.x.size(), table.y.size());
+    for (std::size_t k = 0; k < n; ++k) {
+      if (table.y[k] > 0.0) {
+        t_on = std::min(t_on, (k == 0) ? table.x[0] : table.x[k - 1]);
+        break;
+      }
+    }
+  }
+  return std::isfinite(t_on) ? t_on : 0.0;
+}
+
 LaserMesh create_from_config(const core::Config& cfg) {
   LaserMesh mesh;
 
@@ -1527,7 +1782,8 @@ void map_from_hydro_1d(LaserMesh& mesh,
                        const core::State& state,
                        const core::Config::LaserConfig& laser_cfg,
                        const HydroMirror1D& hydro,
-                       cudaStream_t stream) {
+                       cudaStream_t stream,
+                       LaserNodeMaterial1D* node_material) {
   const core::NvtxRange nvtx_range("laser.map_hydro");
   TENRYU_ASSERT(mesh.is_allocated(), "map_from_hydro_1d requires allocated LaserMesh");
   TENRYU_ASSERT(state.mesh.dim == 1, "map_from_hydro_1d expects 1D_SPH state");
@@ -1606,18 +1862,7 @@ void map_from_hydro_1d(LaserMesh& mesh,
                          (A_eff * kProtonMass * n_crit_safe);
   }
 
-  const CriticalSurfaceEstimate1D crit_est =
-      estimate_critical_surface_1d(ne_raw_cell, r_edges);
-  const int fcrit = crit_est.fcrit;
-  const double r_crit_interp = crit_est.r_interp;
-  const int fcrit_cell = fcrit;
-  const double ne_fcrit_center =
-      (fcrit_cell >= 0 && fcrit_cell < n_cells) ? ne_raw_cell[static_cast<std::size_t>(fcrit_cell)]
-                                                 : 0.0;
-  const double r_fcrit_center = (fcrit_cell >= 0 && fcrit_cell < n_cells)
-                                    ? 0.5 * (r_edges[static_cast<std::size_t>(fcrit_cell)] +
-                                             r_edges[static_cast<std::size_t>(fcrit_cell + 1)])
-                                    : 0.0;
+  const int fcrit_cell = estimate_critical_surface_1d(ne_raw_cell, r_edges).fcrit;
   int outer_surface_cell = -1;
   for (int c = n_cells - 1; c >= 0; --c) {
     if (cell_is_void[static_cast<std::size_t>(c)] != 0U) {
@@ -1628,14 +1873,43 @@ void map_from_hydro_1d(LaserMesh& mesh,
       break;
     }
   }
-  const bool use_ghost_corona =
+  // Ghost corona (NUMERICS §5.7.5.2): a sub-grid ramp outside an unresolved
+  // surface. It is never denser than the outermost real cell, so a surface
+  // already below ne_min gets none, and it fades with the resolved hydro
+  // corona (the handoff transition's count and thresholds): full width with
+  // no resolved cell, gone once transition_resolved_cells are resolved.
+  // Without the fade and with the inner density raised to ne_min, the
+  // width growing with c_s * t kept a uniform ne_min layer outside a
+  // resolved corona for the whole run (before 2026-09-23).
+  const bool ghost_configured =
       mesh.ghost_corona_enabled && outer_surface_cell >= 0 && mesh.ghost_n_out > 0;
+  const double ghost_ne_min = std::max(mesh.ghost_ne_min_frac, 1.0e-12);
+  const double ghost_ne_max = std::max(mesh.ghost_ne_max_frac, ghost_ne_min * 1.0001);
+  const double outer_n_hat =
+      (outer_surface_cell >= 0) ? ne_raw_cell[static_cast<std::size_t>(outer_surface_cell)] : 0.0;
+  const double ghost_ne_inner =
+      (outer_n_hat < 1.0) ? std::min(outer_n_hat, ghost_ne_max) : ghost_ne_max;
+  double ghost_fade = 0.0;
+  if (ghost_configured) {
+    int resolved_cells = 0;
+    for (int c = outer_surface_cell; c >= 0; --c) {
+      if (cell_is_void[static_cast<std::size_t>(c)] != 0U) {
+        continue;
+      }
+      if (ne_raw_cell[static_cast<std::size_t>(c)] < mesh.ghost_transition_resolved_nhat) {
+        ++resolved_cells;
+      } else {
+        break;
+      }
+    }
+    const double required_cells =
+        static_cast<double>(std::max(mesh.ghost_transition_resolved_cells, 1));
+    ghost_fade = std::clamp(1.0 - static_cast<double>(resolved_cells) / required_cells, 0.0, 1.0);
+  }
+  const bool use_ghost_corona =
+      ghost_configured && ghost_fade > 0.0 && ghost_ne_inner > ghost_ne_min;
   const double r_surface_outer =
       (outer_surface_cell >= 0) ? r_edges[static_cast<std::size_t>(outer_surface_cell + 1)] : 0.0;
-  const double base_ghost_width =
-      use_ghost_corona
-          ? std::max(static_cast<double>(mesh.ghost_n_out) * params.dR_fine, 1.0e-30)
-          : 0.0;
   constexpr int kGhostAnchorSpan = 3;
   double Te_anchor_raw = mesh.ghost_Te_min_eV;
   if (!Te_host.empty()) {
@@ -1680,47 +1954,58 @@ void map_from_hydro_1d(LaserMesh& mesh,
                           mesh.ghost_zbar_min),
                  mesh.ghost_zbar_min,
                  std::max(mesh.ghost_zbar_max, mesh.ghost_zbar_min));
+  // Width: the corona the ghost stands in for expands at the anchor sound
+  // speed, so the width is max(n_out fine cells, c_s * t) (t: simulation
+  // time), times the fade. A fixed n_out * dR_fine (2026-09-23) left a ramp
+  // of about ten nanometres in front of an unresolved surface in GXII: the
+  // absorbed fraction of the first 300 steps fell from 0.104 to 0.054 and
+  // changed by more than 10 % from one step to the next 5 times as often.
   const double A_anchor =
       std::max(average_outer_cells(A_eff_cell, cell_is_void, outer_surface_cell,
                                    kGhostAnchorSpan, mesh.material_A),
                1.0e-30);
   const double ghost_cs = compute_ghost_sound_speed_cm_s(Te_anchor, zbar_anchor, A_anchor);
-  const double transient_ghost_width =
-      std::max(base_ghost_width, ghost_cs * std::max(state.t, 0.0));
-  const double ghost_width = use_ghost_corona ? transient_ghost_width : 0.0;
+  // The corona forms when the laser turns on: c_s times the time since the
+  // first positive power sample, not since t = 0 (a pulse that starts late
+  // otherwise gets a ghost as wide as c_s times the whole delay).
+  if (mesh.laser_turn_on_s < 0.0) {
+    mesh.laser_turn_on_s = laser_turn_on_time_s(state);
+  }
+  const double t_since_turn_on = std::max(state.t - mesh.laser_turn_on_s, 0.0);
+  const double ghost_width =
+      use_ghost_corona
+          ? std::max(ghost_fade * std::max(static_cast<double>(mesh.ghost_n_out) * params.dR_fine,
+                                           ghost_cs * t_since_turn_on),
+                     1.0e-30)
+          : 0.0;
+  mesh.last_ghost_width = ghost_width;
   const double r_ghost_outer = r_surface_outer + ghost_width;
-  const double ghost_ne_min =
-      std::max(mesh.ghost_ne_min_frac, 1.0e-12);
-  const double ghost_ne_max =
-      std::max(mesh.ghost_ne_max_frac, ghost_ne_min * 1.0001);
-  const double ghost_ne_inner =
-      (outer_surface_cell >= 0 &&
-       ne_raw_cell[static_cast<std::size_t>(outer_surface_cell)] < 1.0)
-          ? std::clamp(std::max(ne_raw_cell[static_cast<std::size_t>(outer_surface_cell)],
-                                ghost_ne_min * 1.0001),
-                       ghost_ne_min * 1.0001,
-                       ghost_ne_max)
-          : ghost_ne_max;
+  // TENRYU_LASER_GHOST_DIAG=1: one line per 1D map with the surface and
+  // ghost-corona parameters (read-only diagnostic).
+  static const bool ghost_diag = [] {
+    const char* v = std::getenv("TENRYU_LASER_GHOST_DIAG");
+    return v != nullptr && v[0] == '1';
+  }();
+  if (ghost_diag) {
+    std::ostringstream oss;
+    oss << std::scientific << std::setprecision(6) << "[laser-ghost] t=" << state.t
+        << " step=" << state.step << " outer_cell=" << outer_surface_cell
+        << " fcrit_cell=" << fcrit_cell << " outer_n_hat=" << outer_n_hat
+        << " r_surface=" << r_surface_outer << " configured=" << (ghost_configured ? 1 : 0)
+        << " fade=" << ghost_fade << " use=" << (use_ghost_corona ? 1 : 0)
+        << " ne_inner=" << ghost_ne_inner << " width=" << ghost_width
+        << " Te_anchor=" << Te_anchor << " zbar_anchor=" << zbar_anchor
+        << " cs=" << ghost_cs << " t_on=" << t_since_turn_on
+        << " dR_fine=" << params.dR_fine << " R_crit=" << params.R_crit;
+    if (outer_surface_cell >= 1) {
+      oss << " n_hat[outer-1]=" << ne_raw_cell[static_cast<std::size_t>(outer_surface_cell - 1)];
+    }
+    core::log_info(oss.str());
+  }
   const double ghost_log_span =
-      std::log(std::max(ghost_ne_inner, ghost_ne_min * 1.0001) / ghost_ne_min);
+      use_ghost_corona ? std::log(ghost_ne_inner / ghost_ne_min) : 0.0;
   const double ghost_scale_length =
       (ghost_log_span > 0.0) ? std::max(ghost_width / ghost_log_span, 1.0e-30) : ghost_width;
-
-  if (mesh.prev_n_hat_valid && !mesh.prev_n_hat_host.empty() &&
-      static_cast<int>(mesh.prev_n_hat_host.size()) != n_nodes_total) {
-    mesh.prev_n_hat_valid = false;
-    mesh.prev_n_hat_host.clear();
-  }
-  if (mesh.prev_n_hat_valid && !mesh.prev_n_hat_host.empty()) {
-    cuda_check(cudaMemcpyAsync(mesh.prev_n_hat_device, mesh.prev_n_hat_host.data(),
-                               static_cast<std::size_t>(n_nodes_total) * sizeof(double),
-                               cudaMemcpyHostToDevice, stream),
-               "map_from_hydro_1d memcpyAsync prev_n_hat_host failed");
-    cuda_check(cudaStreamSynchronize(stream),
-               "map_from_hydro_1d prev_n_hat_host stream synchronize failed");
-    mesh.prev_n_hat_host.clear();
-  }
-  const bool apply_ema = mesh.prev_n_hat_valid;
 
   cuda_check(cudaMemcpyAsync(mesh.node_R, node_R.data(), node_R.size() * sizeof(double),
                              cudaMemcpyHostToDevice, stream),
@@ -1749,22 +2034,176 @@ void map_from_hydro_1d(LaserMesh& mesh,
       outer_surface_cell, ghost_ne_inner, ghost_scale_length, ghost_ne_min, r_surface_outer,
       r_ghost_outer, Te_anchor, zbar_anchor, mesh.ghost_zbar_min, mesh.ghost_zbar_max,
       mesh.ghost_Te_min_eV, laser_cfg.lasermesh.critical_clip ? 1 : 0,
-      mesh.n_hat_margin, fcrit_cell, r_crit_interp, ne_fcrit_center, r_fcrit_center);
+      mesh.n_hat_margin, fcrit_cell);
   cuda_check(cudaGetLastError(), "map_from_hydro_1d map kernel launch failed");
-
-  if (apply_ema) {
-    ema_smooth_n_hat_kernel<<<grid, block, 0, stream>>>(
-        mesh.n_e_hat, mesh.prev_n_hat_device, n_nodes_total);
-    cuda_check(cudaGetLastError(), "map_from_hydro_1d EMA kernel launch failed");
+  if (node_material != nullptr && node_material->cell_material_index != nullptr) {
+    if (node_material->node_material.size() < static_cast<std::size_t>(n_nodes_total)) {
+      node_material->node_material.reset(static_cast<std::size_t>(n_nodes_total));
+      node_material->node_zcoll.reset(static_cast<std::size_t>(n_nodes_total));
+    }
+    map_node_material_1d_kernel<<<grid, block, 0, stream>>>(
+        mesh.node_R, mesh.node_Z, state.x_r.data(), mesh.hydro_cell_is_void_device,
+        node_material->cell_material_index, mesh.Zbar, n_nodes_total, mesh.n_nodes_z,
+        n_cells, use_ghost_corona ? 1 : 0, outer_surface_cell, r_surface_outer,
+        r_ghost_outer, node_material->zeff_materials, node_material->n_materials,
+        node_material->node_material.data(), node_material->node_zcoll.data());
+    cuda_check(cudaGetLastError(), "map_from_hydro_1d node material kernel launch failed");
   }
-  cuda_check(cudaMemcpyAsync(mesh.prev_n_hat_device, mesh.n_e_hat,
-                             static_cast<std::size_t>(n_nodes_total) * sizeof(double),
-                             cudaMemcpyDeviceToDevice, stream),
-             "map_from_hydro_1d memcpyAsync prev_n_hat_device failed");
-  mesh.prev_n_hat_valid = true;
 
-  refresh_radial_profile_1d(mesh, false, stream);
+  // Radial profile of the 1D traces on the hydro-anchored nodes
+  // (laser_mesh_bodies::build_trace_profile_nodes_1d; the same map as the 2D
+  // nodes, evaluated at Z = 0). Its IB factor follows in compute_smooth_kappa.
+  mesh.geometry_code = state.mesh.geometry_code;
+  LaserMesh::TraceProfileMap1D& tp = mesh.trace_profile_map;
+  tp.n_cells = n_cells;
+  tp.outer_surface_cell = outer_surface_cell;
+  tp.fcrit_cell = fcrit_cell;
+  tp.use_ghost_corona = use_ghost_corona ? 1 : 0;
+  tp.critical_clip = laser_cfg.lasermesh.critical_clip ? 1 : 0;
+  tp.n_crit_safe = n_crit_safe;
+  tp.ghost_ne_inner = ghost_ne_inner;
+  tp.ghost_scale_length = ghost_scale_length;
+  tp.ghost_ne_min = ghost_ne_min;
+  tp.r_surface_outer = r_surface_outer;
+  tp.r_ghost_outer = r_ghost_outer;
+  tp.Te_anchor = Te_anchor;
+  tp.zbar_anchor = zbar_anchor;
+  map_trace_profile_1d(mesh, state, 1, stream, node_material);
   mesh.dx_min = params.dR_fine;
+}
+
+void place_trace_profile_nodes_1d(const double* r_edges,
+                                  const std::uint8_t* cell_is_void,
+                                  const int n_cells,
+                                  const int outer_surface_cell,
+                                  const int fcrit_cell,
+                                  const double* rho,
+                                  const double* zbar,
+                                  const double* A_eff_cell,
+                                  const double n_crit_safe,
+                                  const int critical_clip,
+                                  const double n_hat_margin,
+                                  const double* graded_r,
+                                  const int n_graded,
+                                  double* out,
+                                  const int capacity,
+                                  int* d_count,
+                                  const int subdiv,
+                                  const bool planar,
+                                  cudaStream_t stream) {
+  build_trace_profile_nodes_1d_parallel_kernel<<<1, kTraceProfileBlock, 0, stream>>>(
+      r_edges, cell_is_void, n_cells, outer_surface_cell, fcrit_cell, rho, zbar, A_eff_cell,
+      n_crit_safe, critical_clip, n_hat_margin, graded_r, n_graded, out, capacity, d_count,
+      subdiv, planar ? 1 : 0);
+  cuda_check(cudaGetLastError(), "place_trace_profile_nodes_1d launch failed");
+}
+
+void map_trace_profile_1d(LaserMesh& mesh,
+                          const core::State& state,
+                          const int subdiv,
+                          cudaStream_t stream,
+                          LaserNodeMaterial1D* node_material) {
+  const LaserMesh::TraceProfileMap1D& tp = mesh.trace_profile_map;
+  const int n_cells = tp.n_cells;
+  TENRYU_ASSERT(n_cells > 0 && mesh.n_nodes_r >= 2,
+                "map_trace_profile_1d requires a mapped 1D laser mesh");
+  const int capacity =
+      laser_mesh_bodies::trace_profile_node_capacity_1d(n_cells, mesh.n_nodes_r, subdiv);
+  mesh.ensure_radial_capacity(capacity);
+  int* d_profile_count = static_cast<int*>(
+      core::device_scratch_acquire("laser_mesh:trace_profile_count", sizeof(int)));
+  place_trace_profile_nodes_1d(state.x_r.data(), mesh.hydro_cell_is_void_device, n_cells,
+                               tp.outer_surface_cell, tp.fcrit_cell, state.rho.data(),
+                               state.zbar.data(), mesh.hydro_A_eff_device, tp.n_crit_safe,
+                               tp.critical_clip, mesh.n_hat_margin, mesh.node_R, mesh.n_nodes_r,
+                               mesh.radial_node_r, capacity, d_profile_count, subdiv,
+                               mesh.geometry_code == 2, stream);
+  int n_profile = 0;
+  cuda_check(cudaMemcpyAsync(&n_profile, d_profile_count, sizeof(int), cudaMemcpyDeviceToHost,
+                             stream),
+             "map_trace_profile_1d count D2H failed");
+  cuda_check(cudaStreamSynchronize(stream), "map_trace_profile_1d count synchronize failed");
+  TENRYU_ASSERT(n_profile >= 2, "map_trace_profile_1d needs at least two nodes");
+  mesh.radial_n_nodes = n_profile;
+  mesh.trace_profile_1d = true;
+  const int block = 256;
+  const int profile_grid = (n_profile + block - 1) / block;
+  map_hydro_to_laser_1d_kernel<<<profile_grid, block, 0, stream>>>(
+      mesh.radial_node_r, mesh.radial_zero, state.rho.data(), state.Te.data(),
+      state.zbar.data(), mesh.hydro_A_eff_device, mesh.hydro_cell_is_void_device,
+      state.x_r.data(), mesh.radial_n_hat, mesh.radial_n_hat_raw, mesh.radial_T_e,
+      mesh.radial_Zbar, n_profile, 1, n_cells, tp.n_crit_safe, tp.use_ghost_corona,
+      tp.outer_surface_cell, tp.ghost_ne_inner, tp.ghost_scale_length, tp.ghost_ne_min,
+      tp.r_surface_outer, tp.r_ghost_outer, tp.Te_anchor, tp.zbar_anchor, mesh.ghost_zbar_min,
+      mesh.ghost_zbar_max, mesh.ghost_Te_min_eV, tp.critical_clip, mesh.n_hat_margin,
+      tp.fcrit_cell);
+  cuda_check(cudaGetLastError(), "map_trace_profile_1d map launch failed");
+  if (node_material != nullptr && node_material->cell_material_index != nullptr) {
+    if (node_material->radial_node_material.size() < static_cast<std::size_t>(n_profile)) {
+      node_material->radial_node_material.reset(static_cast<std::size_t>(capacity));
+      node_material->radial_zcoll.reset(static_cast<std::size_t>(capacity));
+    }
+    map_node_material_1d_kernel<<<profile_grid, block, 0, stream>>>(
+        mesh.radial_node_r, mesh.radial_zero, state.x_r.data(), mesh.hydro_cell_is_void_device,
+        node_material->cell_material_index, mesh.radial_Zbar, n_profile, 1, n_cells,
+        tp.use_ghost_corona, tp.outer_surface_cell, tp.r_surface_outer, tp.r_ghost_outer,
+        node_material->zeff_materials, node_material->n_materials,
+        node_material->radial_node_material.data(), node_material->radial_zcoll.data());
+    cuda_check(cudaGetLastError(), "map_trace_profile_1d material launch failed");
+  }
+  compute_radial_gradient_kernel<<<profile_grid, block, 0, stream>>>(
+      mesh.radial_dn_dr, mesh.radial_node_r, mesh.radial_n_hat, n_profile);
+  cuda_check(cudaGetLastError(), "map_trace_profile_1d gradient launch failed");
+}
+
+void compute_trace_profile_kappa_1d(LaserMesh& mesh,
+                                    const double lambda_cm,
+                                    const double eps_n,
+                                    const double coulomb_log_floor,
+                                    cudaStream_t stream,
+                                    const LaserPhysExtOptions* phys_ext,
+                                    const LaserNodeMaterial1D* node_material) {
+  const int n_profile = mesh.radial_n_nodes;
+  if (n_profile <= 0) {
+    return;
+  }
+  const int profile_blocks = (n_profile + 255) / 256;
+  if (phys_ext != nullptr) {
+    compute_smooth_kappa_ext_kernel<<<profile_blocks, 256, 0, stream>>>(
+        mesh.radial_smooth_kappa, mesh.radial_n_hat, mesh.radial_T_e, mesh.radial_Zbar,
+        lambda_cm, eps_n, coulomb_log_floor, n_profile, *phys_ext,
+        (node_material != nullptr && !node_material->radial_node_material.empty())
+            ? node_material->radial_node_material.data()
+            : nullptr);
+  } else {
+    compute_smooth_kappa_kernel<<<profile_blocks, 256, 0, stream>>>(
+        mesh.radial_smooth_kappa, mesh.radial_n_hat, mesh.radial_T_e, mesh.radial_Zbar,
+        lambda_cm, eps_n, coulomb_log_floor, n_profile);
+  }
+  cuda_check(cudaGetLastError(), "compute_trace_profile_kappa_1d launch failed");
+}
+
+void extract_axis_column_profile_1d(LaserMesh& mesh,
+                                    cudaStream_t stream,
+                                    LaserNodeMaterial1D* node_material) {
+  TENRYU_ASSERT(mesh.n_nodes_r >= 2 && mesh.n_nodes_z >= 1,
+                "extract_axis_column_profile_1d requires a mapped 1D laser mesh");
+  mesh.ensure_radial_capacity(mesh.n_nodes_r);
+  refresh_radial_profile_1d(mesh, true, stream, mesh.radial_T_e);
+  if (node_material != nullptr && node_material->cell_material_index != nullptr &&
+      node_material->node_zcoll.size() >=
+          static_cast<std::size_t>(mesh.n_nodes_r) * static_cast<std::size_t>(mesh.n_nodes_z)) {
+    if (node_material->radial_zcoll.size() < static_cast<std::size_t>(mesh.n_nodes_r)) {
+      node_material->radial_node_material.reset(static_cast<std::size_t>(mesh.n_nodes_r));
+      node_material->radial_zcoll.reset(static_cast<std::size_t>(mesh.n_nodes_r));
+    }
+    const int grid = (mesh.n_nodes_r + 255) / 256;
+    extract_radial_te_kernel<<<grid, 256, 0, stream>>>(node_material->radial_zcoll.data(),
+                                                     node_material->node_zcoll.data(),
+                                                     mesh.n_nodes_z, mesh.n_nodes_z / 2,
+                                                     mesh.n_nodes_r);
+    cuda_check(cudaGetLastError(), "extract_axis_column_profile_1d zcoll launch failed");
+  }
 }
 
 static void map_from_hydro_2d_impl(LaserMesh& mesh,
@@ -2144,22 +2583,32 @@ void compute_smooth_kappa(LaserMesh& mesh,
                           const double eps_n,
                           const double coulomb_log_floor,
                           cudaStream_t stream,
-                          const LaserPhysExtOptions* phys_ext) {
+                          const LaserPhysExtOptions* phys_ext,
+                          const LaserNodeMaterial1D* node_material) {
   TENRYU_ASSERT(mesh.is_allocated(), "compute_smooth_kappa requires allocated LaserMesh");
   const int n_nodes_total = mesh.n_nodes();
   const int blocks = (n_nodes_total + 255) / 256;
   if (phys_ext != nullptr) {
     compute_smooth_kappa_ext_kernel<<<blocks, 256, 0, stream>>>(
         mesh.smooth_kappa_factor, mesh.n_e_hat, mesh.T_e, mesh.Zbar,
-        lambda_cm, eps_n, coulomb_log_floor, n_nodes_total, *phys_ext);
+        lambda_cm, eps_n, coulomb_log_floor, n_nodes_total, *phys_ext,
+        (node_material != nullptr && !node_material->node_material.empty())
+            ? node_material->node_material.data()
+            : nullptr);
   } else {
     compute_smooth_kappa_kernel<<<blocks, 256, 0, stream>>>(
         mesh.smooth_kappa_factor, mesh.n_e_hat, mesh.T_e, mesh.Zbar, lambda_cm, eps_n,
         coulomb_log_floor, n_nodes_total);
   }
   cuda_check(cudaGetLastError(), "compute_smooth_kappa kernel launch failed");
-  refresh_radial_profile_1d(
-      mesh, true, stream, phys_ext != nullptr ? mesh.radial_T_e : nullptr);
+  if (mesh.trace_profile_1d && mesh.radial_n_nodes > 0) {
+    // The 1D traces' IB factor on the profile nodes (map_from_hydro_1d).
+    compute_trace_profile_kappa_1d(mesh, lambda_cm, eps_n, coulomb_log_floor, stream, phys_ext,
+                                   node_material);
+  } else {
+    refresh_radial_profile_1d(
+        mesh, true, stream, phys_ext != nullptr ? mesh.radial_T_e : nullptr);
+  }
 }
 
 void upload_zeff_table(LaserMesh& mesh,

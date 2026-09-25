@@ -238,9 +238,8 @@ double compute_beta_host(const core::Config& cfg,
     const double T = std::max(Te_c, 0.0);
     beta = 4.0 * core::constants::a_eV * T * T * T / Cv_e;
   }
-  if (mat.cv_e_override <= 0.0 && !has_state_cv_e) {
-    beta = std::min(beta, 1.0);
-  }
+  // No beta <= 1 cap on the ideal-gas fallback: the host reference follows
+  // the device NLTE coefficient kernel (NUMERICS §6.7).
   return std::max(beta, 0.0);
 }
 

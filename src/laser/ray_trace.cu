@@ -1,5 +1,6 @@
 #include "laser/ray_trace.cuh"
 #include "laser/ray_trace_bodies.cuh"
+#include "laser/ray_trace_characteristic.cuh"
 
 #include <algorithm>
 #include <cmath>
@@ -31,8 +32,28 @@ constexpr double kCritLayerHandoffBeta = 1.0;
 constexpr double kNearCritMSoftClampStart = 0.80;
 constexpr double kNearCritMSoftClampStop = 0.95;
 constexpr double kTauTailMax = 700.0;
+// __launch_bounds__ of the 1D spherical trace (its register budget).
 constexpr int kRayTrace1DBlockSize = 64;
+// Launch block of the 1D spherical trace and its per-ray reductions: one warp.
+// The rays run sorted by their step count in the previous trace, so the
+// longest rays fill the first warps; one warp per block puts them on
+// different SMs instead of two to an SM sharing its few FP64 units, which
+// set the time of the trace on GPUs with a low FP64 rate. Every ray (and
+// every per-cell sum of the tally reduction) computes the same values.
+constexpr int kRayTrace1DLaunchBlock = 32;
+static_assert(kRayTrace1DLaunchBlock <= kRayTrace1DBlockSize,
+              "the 1D trace launch block must fit its launch bounds");
 constexpr std::size_t kRayTrace1DSharedBytesCap = 96ULL * 1024ULL;
+// Blocks of the 1D characteristic trace: 32 lanes (one warp) per ray, four rays
+// per block; 64, 128 or 256 lanes per ray (several warps), 256 threads per block
+// (the kernel's register use allows at most 8 warps per SM on sm_89 either way).
+constexpr int kRayTrace1DCharacteristicBlock = 128;
+constexpr int kRayTrace1DCharacteristicWideBlock = 256;
+
+template <int kLanes>
+constexpr int characteristic_block_threads() {
+  return (kLanes == 32) ? kRayTrace1DCharacteristicBlock : kRayTrace1DCharacteristicWideBlock;
+}
 
 TENRYU_HOST_DEVICE inline bool outside_mesh(const double R,
                                             const double Z,
@@ -812,97 +833,6 @@ TENRYU_HOST_DEVICE inline double interpolate_radial_field(
   return field[c.i] * (1.0 - c.t) + field[c.i + 1] * c.t;
 }
 
-TENRYU_HOST_DEVICE inline double local_ds_radial(const double* radial_node_r,
-                                                 const RadialInterval& c,
-                                                 const double cfl_ray) {
-  const double dr = radial_node_r[c.i + 1] - radial_node_r[c.i];
-  return cfl_ray * ::fmax(dr, 1.0e-30);
-}
-
-TENRYU_HOST_DEVICE inline double first_exit_fraction_radial(const double old_R,
-                                                            const double old_Z,
-                                                            const double new_R,
-                                                            const double new_Z,
-                                                            const double r_max) {
-  const double dR = new_R - old_R;
-  const double dZ = new_Z - old_Z;
-  const double a = dR * dR + dZ * dZ;
-  if (!(a > 0.0)) {
-    return 1.0;
-  }
-
-  const double b = 2.0 * (old_R * dR + old_Z * dZ);
-  const double c = old_R * old_R + old_Z * old_Z - r_max * r_max;
-  const double disc = b * b - 4.0 * a * c;
-  if (!(disc >= 0.0)) {
-    return 1.0;
-  }
-
-  double t_exit = 1.0;
-  const double sqrt_disc = ::sqrt(disc);
-  const double inv_2a = 0.5 / a;
-  const double roots[2] = {(-b - sqrt_disc) * inv_2a, (-b + sqrt_disc) * inv_2a};
-  for (const double t : roots) {
-    if (t >= 0.0 && t < t_exit) {
-      t_exit = t;
-    }
-  }
-  return clamp_unit_interval(t_exit);
-}
-
-TENRYU_HOST_DEVICE inline bool advance_to_radial_profile_entry(double* R,
-                                                               double* Z,
-                                                               double* vR,
-                                                               const double vZ,
-                                                               const double* radial_node_r,
-                                                               const int n_radial_nodes) {
-  if (!outside_radial_profile(*R, *Z, radial_node_r, n_radial_nodes)) {
-    return true;
-  }
-
-  const double r_max = radial_node_r[n_radial_nodes - 1];
-  const double a = (*vR) * (*vR) + vZ * vZ;
-  if (!(a > 0.0)) {
-    return false;
-  }
-
-  const double b = 2.0 * ((*R) * (*vR) + (*Z) * vZ);
-  const double c = (*R) * (*R) + (*Z) * (*Z) - r_max * r_max;
-  const double disc = b * b - 4.0 * a * c;
-  if (!(disc > 0.0)) {
-    return false;
-  }
-
-  const double sqrt_disc = ::sqrt(disc);
-  const double s_entry = (-b - sqrt_disc) * (0.5 / a);
-  if (!(s_entry > 0.0)) {
-    return false;
-  }
-
-  const double R_entry_unreflected = *R + (*vR) * s_entry;
-  const double Z_entry = *Z + vZ * s_entry;
-  if (!::isfinite(R_entry_unreflected) || !::isfinite(Z_entry)) {
-    return false;
-  }
-
-  *R = R_entry_unreflected;
-  *Z = Z_entry;
-  reflect_axis_if_needed(R, vR);
-
-  if (outside_radial_profile(*R, *Z, radial_node_r, n_radial_nodes)) {
-    const double r_entry = radial_distance(*R, *Z);
-    constexpr double kEntryTolRel = 1.0e-12;
-    if (!::isfinite(r_entry) || !(r_entry > 0.0) || r_entry > r_max * (1.0 + kEntryTolRel)) {
-      return false;
-    }
-    const double scale = r_max / r_entry;
-    *R *= scale;
-    *Z *= scale;
-  }
-
-  return true;
-}
-
 struct DepositCellCacheGuard {
   double* deposit = nullptr;
   int cell = -1;
@@ -1448,7 +1378,9 @@ void ray_trace_1d_sph(double* __restrict__ deposit_1d,
                       const laser::LaserPhysExtOptions phys_opt,
                       const double* __restrict__ radial_T_e,
                       double* __restrict__ ra_per_ray,
-                      double* __restrict__ tau_shell_out
+                      double* __restrict__ tau_shell_out,
+                      const int ray_begin,
+                      const int ray_end
                       ) {
   extern __shared__ double rt_smem[];
   // Stage the per-cell arrays into shared memory (bit-exact copies;
@@ -1512,11 +1444,13 @@ void ray_trace_1d_sph(double* __restrict__ deposit_1d,
         (radial_T_e != nullptr) ? s_radial_T_e : radial_T_e;
   }
 
+  // Rays [ray_begin, ray_end), whose per-ray tally rows start at ray_begin;
+  // the launcher passes a ray order only when one launch traces all rays.
   const int t = blockIdx.x * blockDim.x + threadIdx.x;
-  if (t >= n_rays) {
+  if (t >= ray_end - ray_begin) {
     return;
   }
-  const int ray = (ray_order != nullptr) ? ray_order[t] : t;
+  const int ray = (ray_order != nullptr) ? ray_order[t] : ray_begin + t;
   ray_trace_bodies::ray_trace_1d_sph_body<kCbetRecord, kHotECapture, kPhysExt>(
       ray, deposit_1d, deposit_per_ray, unabsorbed_per_ray, tail_power_per_ray,
       body_radial_node_r, body_radial_n_hat, body_radial_n_hat_raw,
@@ -1531,12 +1465,189 @@ void ray_trace_1d_sph(double* __restrict__ deposit_1d,
       n_output_rays, output_stride, traj_max_steps, step_histogram, step_count,
       ray_steps_out, P_unabsorbed, tail_closure_count, tail_closure_absorbed_power,
       critical_surface_hit_count, error_flags, cbet_args, hot_e_params,
-      hot_e_capture, phys_opt, body_radial_T_e, ra_per_ray, tau_shell_out);
+      hot_e_capture, phys_opt, body_radial_T_e, ra_per_ray, tau_shell_out, ray_begin);
 }
 
 
+// Breakpoints and pieces of the 1D characteristic trace (shared by all rays).
+__global__ void build_characteristic_breakpoints_kernel(const double* __restrict__ node_r,
+                                                        const int n_nodes,
+                                                        const double* __restrict__ edges,
+                                                        const int n_cells,
+                                                        const double split_r,
+                                                        double* __restrict__ out_r,
+                                                        int* __restrict__ out_count) {
+  const int t = blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= n_nodes + n_cells + 2) {
+    return;
+  }
+  ray_trace_bodies::characteristic_breakpoint_body(t, node_r, n_nodes, edges, n_cells, split_r,
+                                                   out_r, out_count);
+}
+
+__global__ void build_characteristic_piece_info_kernel(
+    const double* __restrict__ piece_r,
+    const int* __restrict__ count,
+    const double* __restrict__ node_r,
+    const int n_nodes,
+    const double* __restrict__ edges,
+    const int n_cells,
+    const int allowed_supercritical_cell,
+    const int critical_adjacent_subcritical_cell,
+    const double critical_adjacent_split_r,
+    int* __restrict__ out_interval,
+    int* __restrict__ out_cell,
+    const int capacity) {
+  const int k = blockIdx.x * blockDim.x + threadIdx.x;
+  if (k >= capacity) {
+    return;
+  }
+  ray_trace_bodies::characteristic_piece_info_body(
+      k, piece_r, count, node_r, n_nodes, edges, n_cells, allowed_supercritical_cell,
+      critical_adjacent_subcritical_cell, critical_adjacent_split_r, out_interval, out_cell);
+}
+
+// 1D spherical trace along the characteristics (Laser.raytrace.integrator =
+// "characteristic", NUMERICS 5.3.6): kLanes lanes per ray (32: one warp; 64 ..
+// 256: several warps of the block, the launcher's choice from the ray count and
+// the GPU); the per-cell arrays are staged in shared memory as in
+// ray_trace_1d_sph.
+template <int kLanes, bool kCbetRecord, bool kHotECapture, bool kPhysExt>
+__global__ __launch_bounds__(characteristic_block_threads<kLanes>())
+void ray_trace_1d_characteristic(const ray_trace_bodies::CharacteristicPieces pieces,
+                                 double* __restrict__ deposit_1d,
+                                 double* __restrict__ deposit_per_ray,
+                                 double* __restrict__ unabsorbed_per_ray,
+                                 double* __restrict__ tail_power_per_ray,
+                                 const double* __restrict__ radial_node_r,
+                                 const double* __restrict__ radial_n_hat,
+                                 const double* __restrict__ radial_n_hat_raw,
+                                 const double* __restrict__ radial_smooth_kappa,
+                                 const double* __restrict__ radial_dn_dr,
+                                 const double* __restrict__ hydro_r_edges,
+                                 const int allowed_supercritical_cell,
+                                 const int critical_adjacent_subcritical_cell,
+                                 const double critical_adjacent_split_r,
+                                 const double* __restrict__ ray_R0,
+                                 const double* __restrict__ ray_Z0,
+                                 const double* __restrict__ ray_vR0,
+                                 const double* __restrict__ ray_vZ0,
+                                 const double* __restrict__ ray_power,
+                                 const double* __restrict__ ray_power0,
+                                 const double eps_n,
+                                 const double eps_crit,
+                                 const double lambda_cm,
+                                 const double test_kappa_cm_inv,
+                                 const double intensity_cutoff,
+                                 const int max_ray_steps,
+                                 const int n_radial_nodes,
+                                 const int n_hydro_cells,
+                                 const int n_rays,
+                                 const int ray_begin,
+                                 const int ray_end,
+                                 const int use_shared_staging,
+                                 double* __restrict__ traj_pos_R,
+                                 double* __restrict__ traj_pos_Z,
+                                 double* __restrict__ traj_power,
+                                 int* __restrict__ traj_step_count,
+                                 const int n_output_rays,
+                                 const int output_stride,
+                                 const int traj_max_steps,
+                                 int* __restrict__ step_histogram,
+                                 int* __restrict__ step_count,
+                                 int* __restrict__ ray_steps_out,
+                                 double* __restrict__ P_unabsorbed,
+                                 unsigned long long* __restrict__ tail_closure_count,
+                                 double* __restrict__ tail_closure_absorbed_power,
+                                 unsigned long long* __restrict__ critical_surface_hit_count,
+                                 core::DeviceErrorFlags* __restrict__ error_flags,
+                                 const CbetRecordDeviceArgs cbet_args,
+                                 const HotECaptureParams hot_e_params,
+                                 double* __restrict__ hot_e_capture,
+                                 const laser::LaserPhysExtOptions phys_opt,
+                                 const double* __restrict__ radial_T_e,
+                                 double* __restrict__ ra_per_ray,
+                                 double* __restrict__ tau_shell_out,
+                                 const int reflect_at_critical,
+                                 const int geometry,
+                                 const double* __restrict__ ray_vA0) {
+  extern __shared__ double rt_smem[];
+  const int n_slab =
+      (n_radial_nodes > n_hydro_cells + 1) ? n_radial_nodes : n_hydro_cells + 1;
+  const int n_stage_arrays = (radial_T_e != nullptr) ? 7 : 6;
+  const std::size_t total_stage_doubles =
+      static_cast<std::size_t>(n_stage_arrays) * static_cast<std::size_t>(n_slab);
+  const double* body_radial_node_r = radial_node_r;
+  const double* body_radial_n_hat = radial_n_hat;
+  const double* body_radial_n_hat_raw = radial_n_hat_raw;
+  const double* body_radial_smooth_kappa = radial_smooth_kappa;
+  const double* body_radial_dn_dr = radial_dn_dr;
+  const double* body_hydro_r_edges = hydro_r_edges;
+  const double* body_radial_T_e = radial_T_e;
+  if (use_shared_staging != 0) {
+    const double* stage_srcs[7] = {radial_node_r, radial_n_hat, radial_n_hat_raw,
+                                   radial_smooth_kappa, radial_dn_dr, hydro_r_edges,
+                                   radial_T_e};
+    const int stage_lengths[7] = {n_radial_nodes, n_radial_nodes, n_radial_nodes,
+                                  n_radial_nodes, n_radial_nodes, n_hydro_cells + 1,
+                                  n_radial_nodes};
+    for (std::size_t i = threadIdx.x; i < total_stage_doubles; i += blockDim.x) {
+      const int f = static_cast<int>(i / n_slab);
+      const int c = static_cast<int>(i) - f * n_slab;
+      if (stage_srcs[f] != nullptr && c < stage_lengths[f]) {
+        rt_smem[i] = stage_srcs[f][c];
+      }
+    }
+    __syncthreads();
+    body_radial_node_r = rt_smem + 0 * n_slab;
+    body_radial_n_hat = rt_smem + 1 * n_slab;
+    body_radial_n_hat_raw = rt_smem + 2 * n_slab;
+    body_radial_smooth_kappa = rt_smem + 3 * n_slab;
+    body_radial_dn_dr = rt_smem + 4 * n_slab;
+    body_hydro_r_edges = rt_smem + 5 * n_slab;
+    body_radial_T_e = (radial_T_e != nullptr) ? rt_smem + 6 * n_slab : nullptr;
+  }
+  // kLanes lanes per ray (the ray index is uniform over the lanes); rays
+  // [ray_begin, ray_end), whose per-ray tally rows start at ray_begin.
+  const int ray = ray_begin + static_cast<int>((blockIdx.x * blockDim.x + threadIdx.x) /
+                                               static_cast<unsigned>(kLanes));
+  if (ray >= ray_end) {
+    return;
+  }
+  ray_trace_bodies::ray_trace_1d_characteristic_body<kLanes, kCbetRecord, kHotECapture, kPhysExt>(
+      ray, pieces, deposit_1d, deposit_per_ray, unabsorbed_per_ray, tail_power_per_ray,
+      body_radial_node_r, body_radial_n_hat, body_radial_n_hat_raw, body_radial_smooth_kappa,
+      body_radial_dn_dr, body_hydro_r_edges, allowed_supercritical_cell,
+      critical_adjacent_subcritical_cell, critical_adjacent_split_r, ray_R0, ray_Z0, ray_vR0,
+      ray_vZ0, ray_power, ray_power0, eps_n, eps_crit, lambda_cm, test_kappa_cm_inv,
+      intensity_cutoff, max_ray_steps, n_radial_nodes, n_hydro_cells, n_rays, traj_pos_R,
+      traj_pos_Z, traj_power, traj_step_count, n_output_rays, output_stride, traj_max_steps,
+      step_histogram, step_count, ray_steps_out, P_unabsorbed, tail_closure_count,
+      tail_closure_absorbed_power, critical_surface_hit_count, error_flags, cbet_args,
+      hot_e_params, hot_e_capture, phys_opt, body_radial_T_e, ra_per_ray, tau_shell_out,
+      ray_begin, reflect_at_critical, geometry, ray_vA0);
+}
+
+
+// Normal-incidence absorption along the radius (Laser.mode =
+// "radial_absorption_1d"): the power enters the outermost cell and crosses the
+// cells inward, each attenuating it by its optical depth at the cell midpoint,
+// until the critical density or the intensity cutoff. One block: the cells'
+// inputs (midpoint n_hat, n_hat_raw, the IB kappa and the optical depth) are
+// evaluated in parallel, kRadialAbsorptionChunk cells at a time into shared
+// memory, and thread 0 carries the power across the chunk in cell order with
+// the same arithmetic as the former one-thread loop (bit-identical results).
+constexpr int kRadialAbsorptionBlock = 256;
+constexpr int kRadialAbsorptionChunk = 1024;
+// Per-cell status, in the order the power crosses them.
+constexpr int kRadialCellOk = 0;
+constexpr int kRadialCellBadGeometry = 1;  // non-finite faces or dr <= 0
+constexpr int kRadialCellBadState = 2;     // non-finite n_hat or n_hat_raw
+constexpr int kRadialCellBadKappa = 3;     // non-finite or negative kappa
+constexpr int kRadialCellBadTau = 4;       // non-finite or negative tau
+
 template <bool kHotECapture>
-__global__ __launch_bounds__(1, 1)
+__global__ __launch_bounds__(kRadialAbsorptionBlock, 1)
 void radial_absorption_1d_kernel(double P_total,
                                  const double* __restrict__ hydro_r_edges,
                                  const double* __restrict__ radial_node_r,
@@ -1556,12 +1667,17 @@ void radial_absorption_1d_kernel(double P_total,
                                  const HotECaptureParams hot_e_params,
                                  double* __restrict__ hot_e_capture   // [ch*3 + {0:valid,1:r_s,2:P_before}]
                                  ) {
-  if (blockIdx.x != 0 || threadIdx.x != 0) {
+  if (blockIdx.x != 0) {
     return;
   }
+  __shared__ double s_tau[kRadialAbsorptionChunk];
+  __shared__ double s_nh_raw[kRadialAbsorptionChunk];
+  __shared__ int s_status[kRadialAbsorptionChunk];
+  __shared__ int s_done;
+  const int tid = threadIdx.x;
 
   if (!::isfinite(P_total) || !(P_total > 0.0)) {
-    if (!::isfinite(P_total) && error_flags != nullptr) {
+    if (tid == 0 && !::isfinite(P_total) && error_flags != nullptr) {
       atomicExch(&error_flags->nan_particle, 1);
     }
     return;
@@ -1569,15 +1685,18 @@ void radial_absorption_1d_kernel(double P_total,
   if (hydro_r_edges == nullptr || radial_node_r == nullptr || radial_n_hat == nullptr ||
       radial_n_hat_raw == nullptr || radial_smooth_kappa == nullptr ||
       deposit_power_cell == nullptr || n_hydro_cells <= 0 || n_radial_nodes < 2) {
-    if (error_flags != nullptr) {
-      atomicExch(&error_flags->invalid_cell, 1);
-    }
-    if (P_unabsorbed != nullptr) {
-      atomic_add_double(P_unabsorbed, P_total);
+    if (tid == 0) {
+      if (error_flags != nullptr) {
+        atomicExch(&error_flags->invalid_cell, 1);
+      }
+      if (P_unabsorbed != nullptr) {
+        atomic_add_double(P_unabsorbed, P_total);
+      }
     }
     return;
   }
 
+  // Thread 0's carried state.
   double P = P_total;
   [[maybe_unused]] unsigned hot_e_captured_mask = 0u;
   const double nh_crit = 1.0 - eps_crit;
@@ -1585,114 +1704,126 @@ void radial_absorption_1d_kernel(double P_total,
       (::isfinite(intensity_cutoff) && intensity_cutoff > 0.0)
           ? intensity_cutoff * P_total
           : -1.0;
-
-  for (int c = n_hydro_cells - 1; c >= 0; --c) {
-    if (cutoff_power > 0.0 && P < cutoff_power) {
-      if (P_unabsorbed != nullptr) {
-        atomic_add_double(P_unabsorbed, P);
-      }
-      return;
+  if (tid == 0) {
+    s_done = 0;
+  }
+  const auto book_and_stop = [&]() {
+    if (P_unabsorbed != nullptr) {
+      atomic_add_double(P_unabsorbed, P);
     }
+    s_done = 1;
+  };
 
-    const double r0 = hydro_r_edges[c];
-    const double r1 = hydro_r_edges[c + 1];
-    const double dr = r1 - r0;
-    if (!::isfinite(r0) || !::isfinite(r1) || !(dr > 0.0)) {
-      if (error_flags != nullptr) {
-        atomicExch(&error_flags->invalid_cell, 1);
-      }
-      if (P_unabsorbed != nullptr) {
-        atomic_add_double(P_unabsorbed, P);
-      }
-      return;
-    }
-
-    const double r_mid = 0.5 * (r0 + r1);
-    const RadialInterval radial_cell =
-        locate_radial_interval(radial_node_r, n_radial_nodes, r_mid);
-    const double nh = interpolate_radial_field(radial_n_hat, radial_cell);
-    const double nh_raw = interpolate_radial_field(radial_n_hat_raw, radial_cell);
-    if (!::isfinite(nh) || !::isfinite(nh_raw)) {
-      if (error_flags != nullptr) {
-        atomicExch(&error_flags->invalid_cell, 1);
-      }
-      if (P_unabsorbed != nullptr) {
-        atomic_add_double(P_unabsorbed, P);
-      }
-      return;
-    }
-
-    if constexpr (kHotECapture) {
-      for (int he_ch = 0; he_ch < hot_e_params.n_channels; ++he_ch) {
-        if ((hot_e_captured_mask & (1u << he_ch)) != 0u) {
-          continue;
+  for (int chunk_end = n_hydro_cells; chunk_end > 0; chunk_end -= kRadialAbsorptionChunk) {
+    const int chunk_begin = ::max(chunk_end - kRadialAbsorptionChunk, 0);
+    // The chunk's cells, in parallel.
+    for (int c = chunk_begin + tid; c < chunk_end; c += blockDim.x) {
+      const int s = c - chunk_begin;
+      const double r0 = hydro_r_edges[c];
+      const double r1 = hydro_r_edges[c + 1];
+      const double dr = r1 - r0;
+      int status = kRadialCellOk;
+      double tau = 0.0;
+      double nh_raw = 0.0;
+      if (!::isfinite(r0) || !::isfinite(r1) || !(dr > 0.0)) {
+        status = kRadialCellBadGeometry;
+      } else {
+        const double r_mid = 0.5 * (r0 + r1);
+        const RadialInterval radial_cell =
+            locate_radial_interval(radial_node_r, n_radial_nodes, r_mid);
+        const double nh = interpolate_radial_field(radial_n_hat, radial_cell);
+        nh_raw = interpolate_radial_field(radial_n_hat_raw, radial_cell);
+        if (!::isfinite(nh) || !::isfinite(nh_raw)) {
+          status = kRadialCellBadState;
+        } else {
+          double kappa = 0.0;
+          if (test_kappa_cm_inv > 0.0) {
+            kappa = test_kappa_cm_inv;
+          } else {
+            const double smooth_factor =
+                interpolate_radial_field(radial_smooth_kappa, radial_cell);
+            kappa = compute_kappa_from_smooth(smooth_factor, nh, eps_n);
+          }
+          if (!::isfinite(kappa) || kappa < 0.0) {
+            status = kRadialCellBadKappa;
+          } else {
+            tau = compute_optical_depth(kappa, kappa, dr);
+            if (!::isfinite(tau) || tau < 0.0) {
+              status = kRadialCellBadTau;
+            }
+          }
         }
-        if (!(nh_raw >= hot_e_params.threshold_nhat[he_ch])) {
-          continue;
+      }
+      s_tau[s] = tau;
+      s_nh_raw[s] = nh_raw;
+      s_status[s] = status;
+    }
+    __syncthreads();
+    if (tid == 0 && s_done == 0) {
+      for (int c = chunk_end - 1; c >= chunk_begin; --c) {
+        const int s = c - chunk_begin;
+        if (cutoff_power > 0.0 && P < cutoff_power) {
+          book_and_stop();
+          break;
         }
-        hot_e_captured_mask |= (1u << he_ch);
-        hot_e_capture[he_ch * 3 + 0] = 1.0;
-        hot_e_capture[he_ch * 3 + 1] = r1;  // outer edge of the crossing cell (launch radius)
-        hot_e_capture[he_ch * 3 + 2] = P;   // ray power remaining at the crossing
-        P *= hot_e_params.one_minus_eta[he_ch];
+        const int status = s_status[s];
+        if (status == kRadialCellBadGeometry || status == kRadialCellBadState) {
+          if (error_flags != nullptr) {
+            atomicExch(&error_flags->invalid_cell, 1);
+          }
+          book_and_stop();
+          break;
+        }
+        const double nh_raw = s_nh_raw[s];
+        if constexpr (kHotECapture) {
+          for (int he_ch = 0; he_ch < hot_e_params.n_channels; ++he_ch) {
+            if ((hot_e_captured_mask & (1u << he_ch)) != 0u) {
+              continue;
+            }
+            if (!(nh_raw >= hot_e_params.threshold_nhat[he_ch])) {
+              continue;
+            }
+            hot_e_captured_mask |= (1u << he_ch);
+            hot_e_capture[he_ch * 3 + 0] = 1.0;
+            hot_e_capture[he_ch * 3 + 1] = hydro_r_edges[c + 1];  // outer edge of the crossing cell
+            hot_e_capture[he_ch * 3 + 2] = P;  // power remaining at the crossing
+            P *= hot_e_params.one_minus_eta[he_ch];
+          }
+        }
+        if (nh_raw >= nh_crit) {
+          record_critical_surface_hit(critical_surface_hit_count);
+          book_and_stop();
+          break;
+        }
+        if (status == kRadialCellBadKappa || status == kRadialCellBadTau) {
+          if (error_flags != nullptr) {
+            atomicExch(&error_flags->invalid_cell, 1);
+          }
+          book_and_stop();
+          break;
+        }
+        double P_next = P;
+        const double dP = absorbed_power_expm1(P, s_tau[s], P_next);
+        if (!::isfinite(dP) || !::isfinite(P_next) || dP < 0.0 || P_next < 0.0) {
+          if (error_flags != nullptr) {
+            atomicExch(&error_flags->nan_particle, 1);
+          }
+          book_and_stop();
+          break;
+        }
+        if (dP > 0.0) {
+          deposit_power_cell[c] += dP;
+        }
+        P = P_next;
       }
     }
-
-    if (nh_raw >= nh_crit) {
-      record_critical_surface_hit(critical_surface_hit_count);
-      if (P_unabsorbed != nullptr) {
-        atomic_add_double(P_unabsorbed, P);
-      }
+    __syncthreads();
+    if (s_done != 0) {
       return;
     }
-
-    double kappa = 0.0;
-    if (test_kappa_cm_inv > 0.0) {
-      kappa = test_kappa_cm_inv;
-    } else {
-      const double smooth_factor = interpolate_radial_field(radial_smooth_kappa, radial_cell);
-      kappa = compute_kappa_from_smooth(smooth_factor, nh, eps_n);
-    }
-    if (!::isfinite(kappa) || kappa < 0.0) {
-      if (error_flags != nullptr) {
-        atomicExch(&error_flags->invalid_cell, 1);
-      }
-      if (P_unabsorbed != nullptr) {
-        atomic_add_double(P_unabsorbed, P);
-      }
-      return;
-    }
-
-    const double tau = compute_optical_depth(kappa, kappa, dr);
-    if (!::isfinite(tau) || tau < 0.0) {
-      if (error_flags != nullptr) {
-        atomicExch(&error_flags->invalid_cell, 1);
-      }
-      if (P_unabsorbed != nullptr) {
-        atomic_add_double(P_unabsorbed, P);
-      }
-      return;
-    }
-
-    double P_next = P;
-    const double dP = absorbed_power_expm1(P, tau, P_next);
-    if (!::isfinite(dP) || !::isfinite(P_next) || dP < 0.0 || P_next < 0.0) {
-      if (error_flags != nullptr) {
-        atomicExch(&error_flags->nan_particle, 1);
-      }
-      if (P_unabsorbed != nullptr) {
-        atomic_add_double(P_unabsorbed, P);
-      }
-      return;
-    }
-
-    if (dP > 0.0) {
-      deposit_power_cell[c] += dP;
-    }
-    P = P_next;
   }
 
-  if (P > 0.0 && P_unabsorbed != nullptr) {
+  if (tid == 0 && P > 0.0 && P_unabsorbed != nullptr) {
     atomic_add_double(P_unabsorbed, P);
   }
 }
@@ -1730,7 +1861,8 @@ template __global__ void ray_trace_1d_sph<false, false, false>(
     unsigned long long* __restrict__, double* __restrict__, unsigned long long* __restrict__,
     core::DeviceErrorFlags* __restrict__, const CbetRecordDeviceArgs,
     const HotECaptureParams, double* __restrict__, const laser::LaserPhysExtOptions,
-    const double* __restrict__, double* __restrict__, double* __restrict__);
+    const double* __restrict__, double* __restrict__, double* __restrict__,
+    const int, const int);
 template __global__ void ray_trace_1d_sph<false, true, false>(
     double* __restrict__, double* __restrict__, double* __restrict__, double* __restrict__,
     const double* __restrict__, const double* __restrict__, const double* __restrict__,
@@ -1747,7 +1879,8 @@ template __global__ void ray_trace_1d_sph<false, true, false>(
     unsigned long long* __restrict__, double* __restrict__, unsigned long long* __restrict__,
     core::DeviceErrorFlags* __restrict__, const CbetRecordDeviceArgs,
     const HotECaptureParams, double* __restrict__, const laser::LaserPhysExtOptions,
-    const double* __restrict__, double* __restrict__, double* __restrict__);
+    const double* __restrict__, double* __restrict__, double* __restrict__,
+    const int, const int);
 template __global__ void ray_trace_1d_sph<true, false, false>(
     double* __restrict__, double* __restrict__, double* __restrict__, double* __restrict__,
     const double* __restrict__, const double* __restrict__, const double* __restrict__,
@@ -1764,7 +1897,8 @@ template __global__ void ray_trace_1d_sph<true, false, false>(
     unsigned long long* __restrict__, double* __restrict__, unsigned long long* __restrict__,
     core::DeviceErrorFlags* __restrict__, const CbetRecordDeviceArgs,
     const HotECaptureParams, double* __restrict__, const laser::LaserPhysExtOptions,
-    const double* __restrict__, double* __restrict__, double* __restrict__);
+    const double* __restrict__, double* __restrict__, double* __restrict__,
+    const int, const int);
 template __global__ void ray_trace_1d_sph<true, true, false>(
     double* __restrict__, double* __restrict__, double* __restrict__, double* __restrict__,
     const double* __restrict__, const double* __restrict__, const double* __restrict__,
@@ -1781,7 +1915,8 @@ template __global__ void ray_trace_1d_sph<true, true, false>(
     unsigned long long* __restrict__, double* __restrict__, unsigned long long* __restrict__,
     core::DeviceErrorFlags* __restrict__, const CbetRecordDeviceArgs,
     const HotECaptureParams, double* __restrict__, const laser::LaserPhysExtOptions,
-    const double* __restrict__, double* __restrict__, double* __restrict__);
+    const double* __restrict__, double* __restrict__, double* __restrict__,
+    const int, const int);
 
 template __global__ void ray_trace_1d_sph<false, false, true>(
     double* __restrict__, double* __restrict__, double* __restrict__, double* __restrict__,
@@ -1799,7 +1934,8 @@ template __global__ void ray_trace_1d_sph<false, false, true>(
     unsigned long long* __restrict__, double* __restrict__, unsigned long long* __restrict__,
     core::DeviceErrorFlags* __restrict__, const CbetRecordDeviceArgs,
     const HotECaptureParams, double* __restrict__, const laser::LaserPhysExtOptions,
-    const double* __restrict__, double* __restrict__, double* __restrict__);
+    const double* __restrict__, double* __restrict__, double* __restrict__,
+    const int, const int);
 template __global__ void ray_trace_1d_sph<false, true, true>(
     double* __restrict__, double* __restrict__, double* __restrict__, double* __restrict__,
     const double* __restrict__, const double* __restrict__, const double* __restrict__,
@@ -1816,7 +1952,8 @@ template __global__ void ray_trace_1d_sph<false, true, true>(
     unsigned long long* __restrict__, double* __restrict__, unsigned long long* __restrict__,
     core::DeviceErrorFlags* __restrict__, const CbetRecordDeviceArgs,
     const HotECaptureParams, double* __restrict__, const laser::LaserPhysExtOptions,
-    const double* __restrict__, double* __restrict__, double* __restrict__);
+    const double* __restrict__, double* __restrict__, double* __restrict__,
+    const int, const int);
 template __global__ void ray_trace_1d_sph<true, false, true>(
     double* __restrict__, double* __restrict__, double* __restrict__, double* __restrict__,
     const double* __restrict__, const double* __restrict__, const double* __restrict__,
@@ -1833,7 +1970,8 @@ template __global__ void ray_trace_1d_sph<true, false, true>(
     unsigned long long* __restrict__, double* __restrict__, unsigned long long* __restrict__,
     core::DeviceErrorFlags* __restrict__, const CbetRecordDeviceArgs,
     const HotECaptureParams, double* __restrict__, const laser::LaserPhysExtOptions,
-    const double* __restrict__, double* __restrict__, double* __restrict__);
+    const double* __restrict__, double* __restrict__, double* __restrict__,
+    const int, const int);
 template __global__ void ray_trace_1d_sph<true, true, true>(
     double* __restrict__, double* __restrict__, double* __restrict__, double* __restrict__,
     const double* __restrict__, const double* __restrict__, const double* __restrict__,
@@ -1850,7 +1988,25 @@ template __global__ void ray_trace_1d_sph<true, true, true>(
     unsigned long long* __restrict__, double* __restrict__, unsigned long long* __restrict__,
     core::DeviceErrorFlags* __restrict__, const CbetRecordDeviceArgs,
     const HotECaptureParams, double* __restrict__, const laser::LaserPhysExtOptions,
-    const double* __restrict__, double* __restrict__, double* __restrict__);
+    const double* __restrict__, double* __restrict__, double* __restrict__,
+    const int, const int);
+#define TENRYU_CHARACTERISTIC_INSTANTIATION(LANES, CBET, HOTE, PHYS)                         \
+  template __global__ void ray_trace_1d_characteristic<LANES, CBET, HOTE, PHYS>(const ray_trace_bodies::CharacteristicPieces, double* __restrict__, double* __restrict__, double* __restrict__, double* __restrict__, const double* __restrict__, const double* __restrict__, const double* __restrict__, const double* __restrict__, const double* __restrict__, const double* __restrict__, const int, const int, const double, const double* __restrict__, const double* __restrict__, const double* __restrict__, const double* __restrict__, const double* __restrict__, const double* __restrict__, const double, const double, const double, const double, const double, const int, const int, const int, const int, const int, const int, const int, double* __restrict__, double* __restrict__, double* __restrict__, int* __restrict__, const int, const int, const int, int* __restrict__, int* __restrict__, int* __restrict__, double* __restrict__, unsigned long long* __restrict__, double* __restrict__, unsigned long long* __restrict__, core::DeviceErrorFlags* __restrict__, const CbetRecordDeviceArgs, const HotECaptureParams, double* __restrict__, const laser::LaserPhysExtOptions, const double* __restrict__, double* __restrict__, double* __restrict__, const int, const int, const double* __restrict__);
+#define TENRYU_CHARACTERISTIC_INSTANTIATIONS(LANES)                                          \
+  TENRYU_CHARACTERISTIC_INSTANTIATION(LANES, false, false, false)                            \
+  TENRYU_CHARACTERISTIC_INSTANTIATION(LANES, false, false, true)                             \
+  TENRYU_CHARACTERISTIC_INSTANTIATION(LANES, false, true, false)                             \
+  TENRYU_CHARACTERISTIC_INSTANTIATION(LANES, false, true, true)                              \
+  TENRYU_CHARACTERISTIC_INSTANTIATION(LANES, true, false, false)                             \
+  TENRYU_CHARACTERISTIC_INSTANTIATION(LANES, true, false, true)                              \
+  TENRYU_CHARACTERISTIC_INSTANTIATION(LANES, true, true, false)                              \
+  TENRYU_CHARACTERISTIC_INSTANTIATION(LANES, true, true, true)
+TENRYU_CHARACTERISTIC_INSTANTIATIONS(32)
+TENRYU_CHARACTERISTIC_INSTANTIATIONS(64)
+TENRYU_CHARACTERISTIC_INSTANTIATIONS(128)
+TENRYU_CHARACTERISTIC_INSTANTIATIONS(256)
+#undef TENRYU_CHARACTERISTIC_INSTANTIATIONS
+#undef TENRYU_CHARACTERISTIC_INSTANTIATION
 
 __global__ __launch_bounds__(64)
 void ray_trace_2d(double* __restrict__ deposit,
@@ -3451,6 +3607,74 @@ std::size_t launchable_dynamic_shared_bytes(
   return 0;
 }
 
+// Threads of `kernel` resident on the device at once with blocks of `block`
+// threads and `shared_bytes` of dynamic shared memory: SMs x resident blocks per
+// SM (cudaOccupancyMaxActiveBlocksPerMultiprocessor, cached per kernel and
+// shared size) x block.
+template <typename KernelFunction>
+long long resident_threads(KernelFunction kernel, const int block, const std::size_t shared_bytes) {
+  static std::map<std::pair<const void*, std::size_t>, int> blocks_per_sm_cache;
+  const auto key = std::make_pair(reinterpret_cast<const void*>(kernel), shared_bytes);
+  auto it = blocks_per_sm_cache.find(key);
+  if (it == blocks_per_sm_cache.end()) {
+    int blocks_per_sm = 0;
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm, kernel, block,
+                                                      shared_bytes) != cudaSuccess) {
+      (void)cudaGetLastError();
+      blocks_per_sm = 0;
+    }
+    it = blocks_per_sm_cache.emplace(key, blocks_per_sm).first;
+  }
+  static const int n_sm = [] {
+    int device = 0;
+    int value = 0;
+    if (cudaGetDevice(&device) != cudaSuccess ||
+        cudaDeviceGetAttribute(&value, cudaDevAttrMultiProcessorCount, device) != cudaSuccess) {
+      (void)cudaGetLastError();
+      return 0;
+    }
+    return value;
+  }();
+  return static_cast<long long>(n_sm) * static_cast<long long>(it->second) *
+         static_cast<long long>(block);
+}
+
+// Lanes per ray of the characteristic trace (Laser.raytrace.lanes_per_ray; 0
+// chooses): the widest of 256, 128 and 64 lanes with which every ray of the
+// launch is resident on the GPU at once (rays x lanes at most the resident
+// threads of that width's kernel on this device), else 32 (one warp per ray).
+// Wider tiles take more of a ray's pieces at a time, so a ray passes through
+// fewer sequential chunks; once the rays exceed the resident threads they run
+// in several waves and extra lanes no longer shorten the trace. The choice
+// depends only on the ray count, the device and the kernels' resources, so a
+// run repeats it (and its rounding) step for step.
+template <bool kCbet, bool kHotE, bool kPhys>
+int characteristic_lanes_per_ray(const int requested,
+                                 const int n_rays,
+                                 const std::size_t requested_shared_bytes) {
+  if (requested == 32 || requested == 64 || requested == 128 || requested == 256) {
+    return requested;
+  }
+  const auto fits = [&](auto lanes_tag) {
+    constexpr int kLanes = decltype(lanes_tag)::value;
+    const auto kernel = ray_trace_1d_characteristic<kLanes, kCbet, kHotE, kPhys>;
+    const std::size_t shared = launchable_dynamic_shared_bytes(kernel, requested_shared_bytes);
+    const long long resident =
+        resident_threads(kernel, characteristic_block_threads<kLanes>(), shared);
+    return resident > 0 && static_cast<long long>(n_rays) * kLanes <= resident;
+  };
+  if (fits(std::integral_constant<int, 256>{})) {
+    return 256;
+  }
+  if (fits(std::integral_constant<int, 128>{})) {
+    return 128;
+  }
+  if (fits(std::integral_constant<int, 64>{})) {
+    return 64;
+  }
+  return 32;
+}
+
 }  // namespace
 
 cudaError_t launch_ray_trace_1d_sph(const RayArray1D& rays,
@@ -3509,8 +3733,7 @@ cudaError_t launch_ray_trace_1d_sph(const RayArray1D& rays,
     max_ray_steps = std::min(max_ray_steps, max_ray_steps_override);
   }
   max_ray_steps = std::min(max_ray_steps, kMaxRayStepsGuard);
-  constexpr int block = kRayTrace1DBlockSize;
-  const int grid = (rays.n_rays + block - 1) / block;
+  constexpr int block = kRayTrace1DLaunchBlock;
   const int n_slab =
       std::max(mesh.radial_n_nodes, n_hydro_cells + 1);
   const int n_stage_arrays =
@@ -3523,34 +3746,44 @@ cudaError_t launch_ray_trace_1d_sph(const RayArray1D& rays,
           ? requested_shared_bytes
           : 0;
 
-  // Fixed-order tally-reduction statistical-reproducibility contract: per-ray private tallies +
-  // fixed-order reduction give bitwise-deterministic deposition. Falls back to
-  // the legacy shared-atomic path only if the scratch allocation would be
-  // unreasonably large.
+  // Fixed-order tally reduction: each ray adds to its own rows (deposit per
+  // cell, unabsorbed power, tail-closure power) and the rows are reduced over
+  // the rays in ascending order, which makes the deposition bitwise
+  // deterministic. When the rows of all rays exceed kPerRayBytesCap the rays
+  // are traced in consecutive batches whose rows fit, each batch reduced
+  // before the next (the totals are the batch sums added in batch order).
+  // The CBET record pass adds to the shared arrays with atomics: its
+  // deposition is recomputed from the records afterwards.
   double* d_per_ray_deposit = nullptr;
   double* d_per_ray_unabsorbed = nullptr;
   double* d_per_ray_tail = nullptr;
   double* d_per_ray_hot_e_capture = nullptr;
   double* d_ra_per_ray = nullptr;
-  const std::size_t per_ray_doubles =
-      static_cast<std::size_t>(rays.n_rays) *
-      static_cast<std::size_t>(n_hydro_cells);
-  const std::size_t per_ray_bytes = per_ray_doubles * sizeof(double);
   constexpr std::size_t kPerRayBytesCap = 256ULL * 1024ULL * 1024ULL;
-  if (!cbet_record_mode && per_ray_bytes > 0 && per_ray_bytes <= kPerRayBytesCap) {
+  const std::size_t n_rays_total = static_cast<std::size_t>(rays.n_rays);
+  const std::size_t row_doubles = static_cast<std::size_t>(std::max(n_hydro_cells, 0));
+  const bool per_ray_tallies = !cbet_record_mode && row_doubles > 0;
+  int batch_rays = rays.n_rays;
+  if (per_ray_tallies && n_rays_total * row_doubles * sizeof(double) > kPerRayBytesCap) {
+    batch_rays = static_cast<int>(
+        std::max<std::size_t>(kPerRayBytesCap / (row_doubles * sizeof(double)), 1ULL));
+  }
+  const std::size_t batch_row_doubles = static_cast<std::size_t>(batch_rays) * row_doubles +
+                                        2ULL * static_cast<std::size_t>(batch_rays);
+  if (per_ray_tallies) {
+    // Layout: deposit rows | unabsorbed | tail power (one batch of rays) |
+    // hot-electron capture rows (all rays, indexed by the ray).
+    const std::size_t batch = static_cast<std::size_t>(batch_rays);
     const std::size_t he_channels =
         hot_e_capture_enabled ? static_cast<std::size_t>(hot_e_params.n_channels) : 1ULL;
-    const std::size_t slab_doubles =
-        per_ray_doubles + 2ULL * static_cast<std::size_t>(rays.n_rays) +
-        4ULL * static_cast<std::size_t>(rays.n_rays) * he_channels;
+    const std::size_t slab_doubles = batch_row_doubles + 4ULL * n_rays_total * he_channels;
     double* slab = static_cast<double*>(core::device_scratch_acquire(
         "ray_trace_1d_sph:per_ray_slab", slab_doubles * sizeof(double)));
-    // Pooled scratch asserts on true OOM instead of falling back; accepted for <=cap path (1D scratch is ~1.6 MB).
+    // Pooled scratch asserts on true OOM instead of falling back.
     d_per_ray_deposit = slab;
-    d_per_ray_unabsorbed = slab + per_ray_doubles;
-    d_per_ray_tail = slab + per_ray_doubles + rays.n_rays;
-    d_per_ray_hot_e_capture =
-        slab + per_ray_doubles + 2ULL * static_cast<std::size_t>(rays.n_rays);
+    d_per_ray_unabsorbed = slab + batch * row_doubles;
+    d_per_ray_tail = d_per_ray_unabsorbed + batch;
+    d_per_ray_hot_e_capture = d_per_ray_tail + batch;
     cudaMemsetAsync(slab, 0, slab_doubles * sizeof(double), stream);
   }
   if (phys_ext != nullptr && phys_ext->ra_enable != 0 &&
@@ -3573,7 +3806,9 @@ cudaError_t launch_ray_trace_1d_sph(const RayArray1D& rays,
   int* d_ray_order = static_cast<int*>(core::device_scratch_acquire(
       "ray_trace_1d_sph:ray_order", ray_index_bytes));
   const int* kernel_ray_order = nullptr;
-  if (h_ray_order != nullptr) {
+  // The march's longest-first ray order spans all rays: used only when one
+  // launch traces them all.
+  if (h_ray_order != nullptr && batch_rays == rays.n_rays) {
     const cudaError_t order_status =
         cudaMemcpyAsync(d_ray_order, h_ray_order, ray_index_bytes,
                         cudaMemcpyHostToDevice, stream);
@@ -3583,228 +3818,168 @@ cudaError_t launch_ray_trace_1d_sph(const RayArray1D& rays,
     kernel_ray_order = d_ray_order;
   }
 
-  if (cbet_record_mode && hot_e_capture_enabled) {
-    if (phys_ext != nullptr) {
-      const std::size_t ray_trace_shared_bytes =
-          launchable_dynamic_shared_bytes(ray_trace_1d_sph<true, true, true>,
-                                          requested_ray_trace_shared_bytes);
-      const int use_shared_staging = ray_trace_shared_bytes > 0 ? 1 : 0;
-      ray_trace_1d_sph<true, true, true>
-          <<<grid, block, ray_trace_shared_bytes, stream>>>(
-          d_deposit_1d, d_per_ray_deposit, d_per_ray_unabsorbed, d_per_ray_tail,
-          mesh.radial_node_r, mesh.radial_n_hat, mesh.radial_n_hat_raw,
-          mesh.radial_smooth_kappa, mesh.radial_dn_dr, d_hydro_r_edges,
-          allowed_supercritical_cell, critical_adjacent_subcritical_cell,
-          critical_adjacent_split_r, rays.R0, rays.Z0, rays.vR0, rays.vZ0, rays.power, rays.power0,
-          laser_cfg.raytrace.cfl_ray,
-          laser_cfg.raytrace.ds_adapt_g_target, laser_cfg.raytrace.ds_adapt_tau_target,
-          laser_cfg.raytrace.ds_adapt_theta_target, laser_cfg.raytrace.ds_adapt_max_factor,
-          laser_cfg.absorption.eps_n,
-          laser_cfg.raytrace.eps_crit, lambda_cm, laser_cfg.absorption.coulomb_log_floor,
-          laser_cfg.raytrace.test_kappa, laser_cfg.raytrace.intensity_cutoff, max_ray_steps,
-          mesh.radial_n_nodes, n_hydro_cells, rays.n_rays, use_shared_staging,
-          d_traj_pos1, d_traj_pos2, d_traj_power,
-          d_traj_step_count, n_output_rays, output_stride, traj_max_steps, d_step_histogram,
-          d_step_count, kernel_ray_order, d_ray_steps_out, d_unabsorbed,
-          d_tail_closure_count, d_tail_closure_absorbed_power,
-          d_critical_surface_hit_count, d_error_flags, *cbet_record,
-          hot_e_params, d_per_ray_hot_e_capture, *phys_ext, d_radial_T_e,
-          d_ra_per_ray, d_tau_shell_out);
-    } else {
-      const std::size_t ray_trace_shared_bytes =
-          launchable_dynamic_shared_bytes(ray_trace_1d_sph<true, true, false>,
-                                          requested_ray_trace_shared_bytes);
-      const int use_shared_staging = ray_trace_shared_bytes > 0 ? 1 : 0;
-      ray_trace_1d_sph<true, true, false>
-          <<<grid, block, ray_trace_shared_bytes, stream>>>(
-          d_deposit_1d, d_per_ray_deposit, d_per_ray_unabsorbed, d_per_ray_tail,
-          mesh.radial_node_r, mesh.radial_n_hat, mesh.radial_n_hat_raw,
-          mesh.radial_smooth_kappa, mesh.radial_dn_dr, d_hydro_r_edges,
-          allowed_supercritical_cell, critical_adjacent_subcritical_cell,
-          critical_adjacent_split_r, rays.R0, rays.Z0, rays.vR0, rays.vZ0, rays.power, rays.power0,
-          laser_cfg.raytrace.cfl_ray,
-          laser_cfg.raytrace.ds_adapt_g_target, laser_cfg.raytrace.ds_adapt_tau_target,
-          laser_cfg.raytrace.ds_adapt_theta_target, laser_cfg.raytrace.ds_adapt_max_factor,
-          laser_cfg.absorption.eps_n,
-          laser_cfg.raytrace.eps_crit, lambda_cm, laser_cfg.absorption.coulomb_log_floor,
-          laser_cfg.raytrace.test_kappa, laser_cfg.raytrace.intensity_cutoff, max_ray_steps,
-          mesh.radial_n_nodes, n_hydro_cells, rays.n_rays, use_shared_staging,
-          d_traj_pos1, d_traj_pos2, d_traj_power,
-          d_traj_step_count, n_output_rays, output_stride, traj_max_steps, d_step_histogram,
-          d_step_count, kernel_ray_order, d_ray_steps_out, d_unabsorbed,
-          d_tail_closure_count, d_tail_closure_absorbed_power,
-          d_critical_surface_hit_count, d_error_flags, *cbet_record,
-          hot_e_params, d_per_ray_hot_e_capture, laser::LaserPhysExtOptions{},
-          nullptr, nullptr, d_tau_shell_out);
-    }
-  } else if (cbet_record_mode) {
-    if (phys_ext != nullptr) {
-      const std::size_t ray_trace_shared_bytes =
-          launchable_dynamic_shared_bytes(ray_trace_1d_sph<true, false, true>,
-                                          requested_ray_trace_shared_bytes);
-      const int use_shared_staging = ray_trace_shared_bytes > 0 ? 1 : 0;
-      ray_trace_1d_sph<true, false, true>
-          <<<grid, block, ray_trace_shared_bytes, stream>>>(
-          d_deposit_1d, d_per_ray_deposit, d_per_ray_unabsorbed, d_per_ray_tail,
-          mesh.radial_node_r, mesh.radial_n_hat, mesh.radial_n_hat_raw,
-          mesh.radial_smooth_kappa, mesh.radial_dn_dr, d_hydro_r_edges,
-          allowed_supercritical_cell, critical_adjacent_subcritical_cell,
-          critical_adjacent_split_r, rays.R0, rays.Z0, rays.vR0, rays.vZ0, rays.power, rays.power0,
-          laser_cfg.raytrace.cfl_ray,
-          laser_cfg.raytrace.ds_adapt_g_target, laser_cfg.raytrace.ds_adapt_tau_target,
-          laser_cfg.raytrace.ds_adapt_theta_target, laser_cfg.raytrace.ds_adapt_max_factor,
-          laser_cfg.absorption.eps_n,
-          laser_cfg.raytrace.eps_crit, lambda_cm, laser_cfg.absorption.coulomb_log_floor,
-          laser_cfg.raytrace.test_kappa, laser_cfg.raytrace.intensity_cutoff, max_ray_steps,
-          mesh.radial_n_nodes, n_hydro_cells, rays.n_rays, use_shared_staging,
-          d_traj_pos1, d_traj_pos2, d_traj_power,
-          d_traj_step_count, n_output_rays, output_stride, traj_max_steps, d_step_histogram,
-          d_step_count, kernel_ray_order, d_ray_steps_out, d_unabsorbed,
-          d_tail_closure_count, d_tail_closure_absorbed_power,
-          d_critical_surface_hit_count, d_error_flags, *cbet_record,
-          HotECaptureParams{}, nullptr, *phys_ext, d_radial_T_e,
-          d_ra_per_ray, d_tau_shell_out);
-    } else {
-      const std::size_t ray_trace_shared_bytes =
-          launchable_dynamic_shared_bytes(ray_trace_1d_sph<true, false, false>,
-                                          requested_ray_trace_shared_bytes);
-      const int use_shared_staging = ray_trace_shared_bytes > 0 ? 1 : 0;
-      ray_trace_1d_sph<true, false, false>
-          <<<grid, block, ray_trace_shared_bytes, stream>>>(
-          d_deposit_1d, d_per_ray_deposit, d_per_ray_unabsorbed, d_per_ray_tail,
-          mesh.radial_node_r, mesh.radial_n_hat, mesh.radial_n_hat_raw,
-          mesh.radial_smooth_kappa, mesh.radial_dn_dr, d_hydro_r_edges,
-          allowed_supercritical_cell, critical_adjacent_subcritical_cell,
-          critical_adjacent_split_r, rays.R0, rays.Z0, rays.vR0, rays.vZ0, rays.power, rays.power0,
-          laser_cfg.raytrace.cfl_ray,
-          laser_cfg.raytrace.ds_adapt_g_target, laser_cfg.raytrace.ds_adapt_tau_target,
-          laser_cfg.raytrace.ds_adapt_theta_target, laser_cfg.raytrace.ds_adapt_max_factor,
-          laser_cfg.absorption.eps_n,
-          laser_cfg.raytrace.eps_crit, lambda_cm, laser_cfg.absorption.coulomb_log_floor,
-          laser_cfg.raytrace.test_kappa, laser_cfg.raytrace.intensity_cutoff, max_ray_steps,
-          mesh.radial_n_nodes, n_hydro_cells, rays.n_rays, use_shared_staging,
-          d_traj_pos1, d_traj_pos2, d_traj_power,
-          d_traj_step_count, n_output_rays, output_stride, traj_max_steps, d_step_histogram,
-          d_step_count, kernel_ray_order, d_ray_steps_out, d_unabsorbed,
-          d_tail_closure_count, d_tail_closure_absorbed_power,
-          d_critical_surface_hit_count, d_error_flags, *cbet_record,
-          HotECaptureParams{}, nullptr, laser::LaserPhysExtOptions{}, nullptr,
-          nullptr, d_tau_shell_out);
-    }
-  } else if (hot_e_capture_enabled) {
-    if (phys_ext != nullptr) {
-      const std::size_t ray_trace_shared_bytes =
-          launchable_dynamic_shared_bytes(ray_trace_1d_sph<false, true, true>,
-                                          requested_ray_trace_shared_bytes);
-      const int use_shared_staging = ray_trace_shared_bytes > 0 ? 1 : 0;
-      ray_trace_1d_sph<false, true, true>
-          <<<grid, block, ray_trace_shared_bytes, stream>>>(
-          d_deposit_1d, d_per_ray_deposit, d_per_ray_unabsorbed, d_per_ray_tail,
-          mesh.radial_node_r, mesh.radial_n_hat, mesh.radial_n_hat_raw,
-          mesh.radial_smooth_kappa, mesh.radial_dn_dr, d_hydro_r_edges,
-          allowed_supercritical_cell, critical_adjacent_subcritical_cell,
-          critical_adjacent_split_r, rays.R0, rays.Z0, rays.vR0, rays.vZ0, rays.power, rays.power0,
-          laser_cfg.raytrace.cfl_ray,
-          laser_cfg.raytrace.ds_adapt_g_target, laser_cfg.raytrace.ds_adapt_tau_target,
-          laser_cfg.raytrace.ds_adapt_theta_target, laser_cfg.raytrace.ds_adapt_max_factor,
-          laser_cfg.absorption.eps_n,
-          laser_cfg.raytrace.eps_crit, lambda_cm, laser_cfg.absorption.coulomb_log_floor,
-          laser_cfg.raytrace.test_kappa, laser_cfg.raytrace.intensity_cutoff, max_ray_steps,
-          mesh.radial_n_nodes, n_hydro_cells, rays.n_rays, use_shared_staging,
-          d_traj_pos1, d_traj_pos2, d_traj_power,
-          d_traj_step_count, n_output_rays, output_stride, traj_max_steps, d_step_histogram,
-          d_step_count, kernel_ray_order, d_ray_steps_out, d_unabsorbed,
-          d_tail_closure_count, d_tail_closure_absorbed_power,
-          d_critical_surface_hit_count, d_error_flags, CbetRecordDeviceArgs{},
-          hot_e_params, d_per_ray_hot_e_capture, *phys_ext, d_radial_T_e,
-          d_ra_per_ray, d_tau_shell_out);
-    } else {
-      const std::size_t ray_trace_shared_bytes =
-          launchable_dynamic_shared_bytes(ray_trace_1d_sph<false, true, false>,
-                                          requested_ray_trace_shared_bytes);
-      const int use_shared_staging = ray_trace_shared_bytes > 0 ? 1 : 0;
-      ray_trace_1d_sph<false, true, false>
-          <<<grid, block, ray_trace_shared_bytes, stream>>>(
-          d_deposit_1d, d_per_ray_deposit, d_per_ray_unabsorbed, d_per_ray_tail,
-          mesh.radial_node_r, mesh.radial_n_hat, mesh.radial_n_hat_raw,
-          mesh.radial_smooth_kappa, mesh.radial_dn_dr, d_hydro_r_edges,
-          allowed_supercritical_cell, critical_adjacent_subcritical_cell,
-          critical_adjacent_split_r, rays.R0, rays.Z0, rays.vR0, rays.vZ0, rays.power, rays.power0,
-          laser_cfg.raytrace.cfl_ray,
-          laser_cfg.raytrace.ds_adapt_g_target, laser_cfg.raytrace.ds_adapt_tau_target,
-          laser_cfg.raytrace.ds_adapt_theta_target, laser_cfg.raytrace.ds_adapt_max_factor,
-          laser_cfg.absorption.eps_n,
-          laser_cfg.raytrace.eps_crit, lambda_cm, laser_cfg.absorption.coulomb_log_floor,
-          laser_cfg.raytrace.test_kappa, laser_cfg.raytrace.intensity_cutoff, max_ray_steps,
-          mesh.radial_n_nodes, n_hydro_cells, rays.n_rays, use_shared_staging,
-          d_traj_pos1, d_traj_pos2, d_traj_power,
-          d_traj_step_count, n_output_rays, output_stride, traj_max_steps, d_step_histogram,
-          d_step_count, kernel_ray_order, d_ray_steps_out, d_unabsorbed,
-          d_tail_closure_count, d_tail_closure_absorbed_power,
-          d_critical_surface_hit_count, d_error_flags, CbetRecordDeviceArgs{},
-          hot_e_params, d_per_ray_hot_e_capture, laser::LaserPhysExtOptions{},
-          nullptr, nullptr, d_tau_shell_out);
-    }
-  } else {
-    if (phys_ext != nullptr) {
-      const std::size_t ray_trace_shared_bytes =
-          launchable_dynamic_shared_bytes(ray_trace_1d_sph<false, false, true>,
-                                          requested_ray_trace_shared_bytes);
-      const int use_shared_staging = ray_trace_shared_bytes > 0 ? 1 : 0;
-      ray_trace_1d_sph<false, false, true>
-          <<<grid, block, ray_trace_shared_bytes, stream>>>(
-          d_deposit_1d, d_per_ray_deposit, d_per_ray_unabsorbed, d_per_ray_tail,
-          mesh.radial_node_r, mesh.radial_n_hat, mesh.radial_n_hat_raw,
-          mesh.radial_smooth_kappa, mesh.radial_dn_dr, d_hydro_r_edges,
-          allowed_supercritical_cell, critical_adjacent_subcritical_cell,
-          critical_adjacent_split_r, rays.R0, rays.Z0, rays.vR0, rays.vZ0, rays.power, rays.power0,
-          laser_cfg.raytrace.cfl_ray,
-          laser_cfg.raytrace.ds_adapt_g_target, laser_cfg.raytrace.ds_adapt_tau_target,
-          laser_cfg.raytrace.ds_adapt_theta_target, laser_cfg.raytrace.ds_adapt_max_factor,
-          laser_cfg.absorption.eps_n,
-          laser_cfg.raytrace.eps_crit, lambda_cm, laser_cfg.absorption.coulomb_log_floor,
-          laser_cfg.raytrace.test_kappa, laser_cfg.raytrace.intensity_cutoff, max_ray_steps,
-          mesh.radial_n_nodes, n_hydro_cells, rays.n_rays, use_shared_staging,
-          d_traj_pos1, d_traj_pos2, d_traj_power,
-          d_traj_step_count, n_output_rays, output_stride, traj_max_steps, d_step_histogram,
-          d_step_count, kernel_ray_order, d_ray_steps_out, d_unabsorbed,
-          d_tail_closure_count, d_tail_closure_absorbed_power,
-          d_critical_surface_hit_count, d_error_flags, CbetRecordDeviceArgs{},
-          HotECaptureParams{}, nullptr, *phys_ext, d_radial_T_e,
-          d_ra_per_ray, d_tau_shell_out);
-    } else {
-      const std::size_t ray_trace_shared_bytes =
-          launchable_dynamic_shared_bytes(ray_trace_1d_sph<false, false, false>,
-                                          requested_ray_trace_shared_bytes);
-      const int use_shared_staging = ray_trace_shared_bytes > 0 ? 1 : 0;
-      ray_trace_1d_sph<false, false, false>
-          <<<grid, block, ray_trace_shared_bytes, stream>>>(
-          d_deposit_1d, d_per_ray_deposit, d_per_ray_unabsorbed, d_per_ray_tail,
-          mesh.radial_node_r, mesh.radial_n_hat, mesh.radial_n_hat_raw,
-          mesh.radial_smooth_kappa, mesh.radial_dn_dr, d_hydro_r_edges,
-          allowed_supercritical_cell, critical_adjacent_subcritical_cell,
-          critical_adjacent_split_r, rays.R0, rays.Z0, rays.vR0, rays.vZ0, rays.power, rays.power0,
-          laser_cfg.raytrace.cfl_ray,
-          laser_cfg.raytrace.ds_adapt_g_target, laser_cfg.raytrace.ds_adapt_tau_target,
-          laser_cfg.raytrace.ds_adapt_theta_target, laser_cfg.raytrace.ds_adapt_max_factor,
-          laser_cfg.absorption.eps_n,
-          laser_cfg.raytrace.eps_crit, lambda_cm, laser_cfg.absorption.coulomb_log_floor,
-          laser_cfg.raytrace.test_kappa, laser_cfg.raytrace.intensity_cutoff, max_ray_steps,
-          mesh.radial_n_nodes, n_hydro_cells, rays.n_rays, use_shared_staging,
-          d_traj_pos1, d_traj_pos2, d_traj_power,
-          d_traj_step_count, n_output_rays, output_stride, traj_max_steps, d_step_histogram,
-          d_step_count, kernel_ray_order, d_ray_steps_out, d_unabsorbed,
-          d_tail_closure_count, d_tail_closure_absorbed_power,
-          d_critical_surface_hit_count, d_error_flags, CbetRecordDeviceArgs{},
-          HotECaptureParams{}, nullptr, laser::LaserPhysExtOptions{}, nullptr,
-          nullptr, d_tau_shell_out);
-    }
+  // One kernel per (CBET records, hot-electron capture, extended physics):
+  // Laser.raytrace.integrator="characteristic" integrates the rays along their
+  // characteristics (one warp per ray over a piece table shared by the rays),
+  // "leapfrog" marches them.
+  const bool characteristic = laser_cfg.raytrace.integrator == "characteristic" ||
+                              laser_cfg.raytrace.integrator == "auto";
+  ray_trace_bodies::CharacteristicPieces pieces{};
+  if (characteristic) {
+    const int capacity =
+        ray_trace_bodies::characteristic_piece_capacity(mesh.radial_n_nodes, n_hydro_cells);
+    double* d_piece_r = static_cast<double*>(core::device_scratch_acquire(
+        "ray_trace_1d_characteristic:piece_r",
+        static_cast<std::size_t>(capacity + 1) * sizeof(double)));
+    int* d_piece_ints = static_cast<int*>(core::device_scratch_acquire(
+        "ray_trace_1d_characteristic:piece_ints",
+        static_cast<std::size_t>(2 * capacity + 1) * sizeof(int)));
+    int* d_piece_interval = d_piece_ints;
+    int* d_piece_cell = d_piece_ints + capacity;
+    int* d_piece_count = d_piece_ints + 2 * capacity;
+    const int n_items = mesh.radial_n_nodes + n_hydro_cells + 2;
+    constexpr int kBuildBlock = 256;
+    build_characteristic_breakpoints_kernel<<<(n_items + kBuildBlock - 1) / kBuildBlock,
+                                              kBuildBlock, 0, stream>>>(
+        mesh.radial_node_r, mesh.radial_n_nodes, d_hydro_r_edges, n_hydro_cells,
+        critical_adjacent_split_r, d_piece_r, d_piece_count);
+    build_characteristic_piece_info_kernel<<<(capacity + kBuildBlock - 1) / kBuildBlock,
+                                             kBuildBlock, 0, stream>>>(
+        d_piece_r, d_piece_count, mesh.radial_node_r, mesh.radial_n_nodes, d_hydro_r_edges,
+        n_hydro_cells, allowed_supercritical_cell, critical_adjacent_subcritical_cell,
+        critical_adjacent_split_r, d_piece_interval, d_piece_cell, capacity);
+    pieces = ray_trace_bodies::CharacteristicPieces{d_piece_r, d_piece_interval, d_piece_cell,
+                                                    d_piece_count};
   }
+  int batch_begin = 0;
+  int batch_end = rays.n_rays;
+  const auto launch_variant = [&](auto cbet_tag, auto hot_e_tag, auto phys_tag) {
+    constexpr bool kCbet = decltype(cbet_tag)::value;
+    constexpr bool kHotE = decltype(hot_e_tag)::value;
+    constexpr bool kPhys = decltype(phys_tag)::value;
+    const CbetRecordDeviceArgs cbet_args = kCbet ? *cbet_record : CbetRecordDeviceArgs{};
+    const HotECaptureParams he_params = kHotE ? hot_e_params : HotECaptureParams{};
+    double* const he_capture = kHotE ? d_per_ray_hot_e_capture : nullptr;
+    const laser::LaserPhysExtOptions px = kPhys ? *phys_ext : laser::LaserPhysExtOptions{};
+    const double* const radial_T_e = kPhys ? d_radial_T_e : nullptr;
+    double* const ra_per_ray = kPhys ? d_ra_per_ray : nullptr;
+    if (characteristic) {
+      const int batch_count = batch_end - batch_begin;
+      const auto launch_lanes = [&](auto lanes_tag) {
+        constexpr int kLanes = decltype(lanes_tag)::value;
+        const auto kernel = ray_trace_1d_characteristic<kLanes, kCbet, kHotE, kPhys>;
+        const std::size_t shared_bytes =
+            launchable_dynamic_shared_bytes(kernel, requested_ray_trace_shared_bytes);
+        constexpr int kBlock = characteristic_block_threads<kLanes>();
+        const long long threads = static_cast<long long>(batch_count) * kLanes;
+        const int char_grid = static_cast<int>((threads + kBlock - 1) / kBlock);
+        kernel<<<char_grid, kBlock, shared_bytes, stream>>>(
+            pieces, d_deposit_1d, d_per_ray_deposit, d_per_ray_unabsorbed, d_per_ray_tail,
+            mesh.radial_node_r, mesh.radial_n_hat, mesh.radial_n_hat_raw,
+            mesh.radial_smooth_kappa, mesh.radial_dn_dr, d_hydro_r_edges,
+            allowed_supercritical_cell, critical_adjacent_subcritical_cell,
+            critical_adjacent_split_r, rays.R0, rays.Z0, rays.vR0, rays.vZ0, rays.power,
+            rays.power0, laser_cfg.absorption.eps_n, laser_cfg.raytrace.eps_crit, lambda_cm,
+            laser_cfg.raytrace.test_kappa, laser_cfg.raytrace.intensity_cutoff, max_ray_steps,
+            mesh.radial_n_nodes, n_hydro_cells, rays.n_rays, batch_begin, batch_end,
+            shared_bytes > 0 ? 1 : 0, d_traj_pos1, d_traj_pos2, d_traj_power, d_traj_step_count,
+            n_output_rays,
+            output_stride, traj_max_steps, d_step_histogram, d_step_count, d_ray_steps_out,
+            d_unabsorbed, d_tail_closure_count, d_tail_closure_absorbed_power,
+            d_critical_surface_hit_count, d_error_flags, cbet_args, he_params, he_capture, px,
+            radial_T_e, ra_per_ray, d_tau_shell_out,
+            laser_cfg.absorption.terminate ? 0 : 1, mesh.geometry_code, rays.vA0);
+      };
+      switch (characteristic_lanes_per_ray<kCbet, kHotE, kPhys>(
+          laser_cfg.raytrace.lanes_per_ray, batch_count, requested_ray_trace_shared_bytes)) {
+        case 256:
+          launch_lanes(std::integral_constant<int, 256>{});
+          break;
+        case 128:
+          launch_lanes(std::integral_constant<int, 128>{});
+          break;
+        case 64:
+          launch_lanes(std::integral_constant<int, 64>{});
+          break;
+        default:
+          launch_lanes(std::integral_constant<int, 32>{});
+          break;
+      }
+      return;
+    }
+    // The march traces the sphere only (the builder requires the
+    // characteristic integrator for the other 1D geometries).
+    TENRYU_ASSERT(mesh.geometry_code == 0,
+                  "the 1D leapfrog ray trace supports Mesh.geometry_1d=\"spherical\" only");
+    const auto kernel = ray_trace_1d_sph<kCbet, kHotE, kPhys>;
+    const std::size_t ray_trace_shared_bytes =
+        launchable_dynamic_shared_bytes(kernel, requested_ray_trace_shared_bytes);
+    const int use_shared_staging = ray_trace_shared_bytes > 0 ? 1 : 0;
+    const int march_grid = (batch_end - batch_begin + block - 1) / block;
+    kernel<<<march_grid, block, ray_trace_shared_bytes, stream>>>(
+        d_deposit_1d, d_per_ray_deposit, d_per_ray_unabsorbed, d_per_ray_tail,
+        mesh.radial_node_r, mesh.radial_n_hat, mesh.radial_n_hat_raw,
+        mesh.radial_smooth_kappa, mesh.radial_dn_dr, d_hydro_r_edges,
+        allowed_supercritical_cell, critical_adjacent_subcritical_cell,
+        critical_adjacent_split_r, rays.R0, rays.Z0, rays.vR0, rays.vZ0, rays.power, rays.power0,
+        laser_cfg.raytrace.cfl_ray,
+        laser_cfg.raytrace.ds_adapt_g_target, laser_cfg.raytrace.ds_adapt_tau_target,
+        laser_cfg.raytrace.ds_adapt_theta_target, laser_cfg.raytrace.ds_adapt_max_factor,
+        laser_cfg.absorption.eps_n,
+        laser_cfg.raytrace.eps_crit, lambda_cm, laser_cfg.absorption.coulomb_log_floor,
+        laser_cfg.raytrace.test_kappa, laser_cfg.raytrace.intensity_cutoff, max_ray_steps,
+        mesh.radial_n_nodes, n_hydro_cells, rays.n_rays, use_shared_staging,
+        d_traj_pos1, d_traj_pos2, d_traj_power,
+        d_traj_step_count, n_output_rays, output_stride, traj_max_steps, d_step_histogram,
+        d_step_count, kernel_ray_order, d_ray_steps_out, d_unabsorbed,
+        d_tail_closure_count, d_tail_closure_absorbed_power,
+        d_critical_surface_hit_count, d_error_flags, cbet_args, he_params, he_capture, px,
+        radial_T_e, ra_per_ray, d_tau_shell_out, batch_begin, batch_end);
+  };
+  const auto launch_phys = [&](auto cbet_tag, auto hot_e_tag) {
+    if (phys_ext != nullptr) {
+      launch_variant(cbet_tag, hot_e_tag, std::true_type{});
+    } else {
+      launch_variant(cbet_tag, hot_e_tag, std::false_type{});
+    }
+  };
+  const auto launch_hot_e = [&](auto cbet_tag) {
+    if (hot_e_capture_enabled) {
+      launch_phys(cbet_tag, std::true_type{});
+    } else {
+      launch_phys(cbet_tag, std::false_type{});
+    }
+  };
   if (d_pabs_per_ray_out != nullptr) {
     TENRYU_ASSERT(d_per_ray_deposit != nullptr,
                   "ray_trace_1d_sph pabs diagnostic requires per-ray tallies");
-    sum_absorbed_power_per_ray_1d_kernel<<<grid, block, 0, stream>>>(
-        d_per_ray_deposit, rays.n_rays, n_hydro_cells, d_pabs_per_ray_out);
+  }
+  for (batch_begin = 0; batch_begin < rays.n_rays; batch_begin = batch_end) {
+    batch_end = std::min(rays.n_rays, batch_begin + batch_rays);
+    const int batch_count = batch_end - batch_begin;
+    if (batch_begin > 0) {
+      // The rows of the previous batch have been reduced (stream order).
+      cudaMemsetAsync(d_per_ray_deposit, 0, batch_row_doubles * sizeof(double), stream);
+    }
+    if (cbet_record_mode) {
+      launch_hot_e(std::true_type{});
+    } else {
+      launch_hot_e(std::false_type{});
+    }
+    const int batch_grid = (batch_count + block - 1) / block;
+    if (d_pabs_per_ray_out != nullptr) {
+      sum_absorbed_power_per_ray_1d_kernel<<<batch_grid, block, 0, stream>>>(
+          d_per_ray_deposit, batch_count, n_hydro_cells, d_pabs_per_ray_out + batch_begin);
+    }
+    if (d_per_ray_deposit != nullptr) {
+      const int red_total = n_hydro_cells + 3;
+      const int red_grid = (red_total + block - 1) / block;
+      reduce_per_ray_tallies_1d_kernel<<<red_grid, block, 0, stream>>>(
+          d_per_ray_deposit, d_per_ray_unabsorbed, d_per_ray_tail, d_deposit_1d,
+          d_unabsorbed, d_tail_closure_absorbed_power, batch_count,
+          n_hydro_cells, d_ra_per_ray != nullptr ? d_ra_per_ray + batch_begin : nullptr,
+          d_ra_per_ray != nullptr ? d_ra_power_total : nullptr);
+    }
   }
   if (h_ray_steps_out != nullptr) {
     const cudaError_t steps_status =
@@ -3813,15 +3988,6 @@ cudaError_t launch_ray_trace_1d_sph(const RayArray1D& rays,
     if (steps_status != cudaSuccess) {
       return steps_status;
     }
-  }
-  if (d_per_ray_deposit != nullptr) {
-    const int red_total = n_hydro_cells + 3;
-    const int red_grid = (red_total + block - 1) / block;
-    reduce_per_ray_tallies_1d_kernel<<<red_grid, block, 0, stream>>>(
-        d_per_ray_deposit, d_per_ray_unabsorbed, d_per_ray_tail, d_deposit_1d,
-        d_unabsorbed, d_tail_closure_absorbed_power, rays.n_rays,
-        n_hydro_cells, d_ra_per_ray,
-        d_ra_per_ray != nullptr ? d_ra_power_total : nullptr);
   }
   return cudaGetLastError();
 }
@@ -3861,7 +4027,7 @@ cudaError_t launch_radial_absorption_1d(double P_total,
   }
 
   if (hot_e_capture_enabled) {
-    radial_absorption_1d_kernel<true><<<1, 1, 0, stream>>>(
+    radial_absorption_1d_kernel<true><<<1, kRadialAbsorptionBlock, 0, stream>>>(
         P_total, d_hydro_r_edges, mesh.radial_node_r, mesh.radial_n_hat,
         mesh.radial_n_hat_raw, mesh.radial_smooth_kappa, laser_cfg.absorption.eps_n,
         laser_cfg.raytrace.eps_crit, laser_cfg.raytrace.test_kappa,
@@ -3869,7 +4035,7 @@ cudaError_t launch_radial_absorption_1d(double P_total,
         d_unabsorbed, d_critical_surface_hit_count, d_error_flags,
         hot_e_params, d_hot_e_capture);
   } else {
-    radial_absorption_1d_kernel<false><<<1, 1, 0, stream>>>(
+    radial_absorption_1d_kernel<false><<<1, kRadialAbsorptionBlock, 0, stream>>>(
         P_total, d_hydro_r_edges, mesh.radial_node_r, mesh.radial_n_hat,
         mesh.radial_n_hat_raw, mesh.radial_smooth_kappa, laser_cfg.absorption.eps_n,
         laser_cfg.raytrace.eps_crit, laser_cfg.raytrace.test_kappa,

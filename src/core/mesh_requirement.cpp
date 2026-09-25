@@ -11,6 +11,7 @@
 #include <utility>
 #include <vector>
 
+#include "core/constants.hpp"
 #include "core/error.hpp"
 #include "materials/zbar_tf.hpp"
 
@@ -18,9 +19,12 @@ namespace tenryu::core {
 namespace {
 
 constexpr double kCriticalDensityCoefficient = 1.11485e21;
-constexpr double kAtomicMassG = 1.66053907e-24;
+// Ion mass A * m_p and eV -> erg as in the solver (the laser map computes
+// n_e / n_c with A_eff * proton_mass), so the requirement's critical density
+// is the one the run sees.
+constexpr double kIonMassUnitG = constants::proton_mass;
 constexpr double kWattToErgPerSecond = 1.0e7;
-constexpr double kEvToErg = 1.602176634e-12;
+constexpr double kEvToErg = constants::eV_to_erg;
 constexpr double kDynPerMbar = 1.0e12;
 constexpr int kSubintervalsPerPanel = 64;
 
@@ -568,12 +572,12 @@ MeshRequirementReport build_mesh_requirement(const MeshRequirementInputs& in,
         info.zbar = material.Z / 2.0;
         for (int iteration = 0; iteration < 5; ++iteration) {
           info.zbar = std::min(std::max(info.zbar, 1.0e-3), material.Z);
-          const double rho_c = critical_number_density * kAtomicMassG *
+          const double rho_c = critical_number_density * kIonMassUnitG *
                                material.A / info.zbar;
           const double c_T = std::cbrt(params.absorbed_fraction *
                                        peak_intensity_erg / (4.0 * rho_c));
           const double temperature_eV =
-              material.A * kAtomicMassG * c_T * c_T /
+              material.A * kIonMassUnitG * c_T * c_T /
               ((info.zbar + 1.0) * kEvToErg);
           info.zbar = tenryu::materials::compute_zbar_tf(
               rho_c, temperature_eV, material.Z, material.A);
@@ -581,7 +585,7 @@ MeshRequirementReport build_mesh_requirement(const MeshRequirementInputs& in,
         info.zbar_source = "thomas_fermi";
       }
       info.zbar = std::min(std::max(info.zbar, 1.0e-3), material.Z);
-      info.rho_c_gcc = critical_number_density * kAtomicMassG * material.A /
+      info.rho_c_gcc = critical_number_density * kIonMassUnitG * material.A /
                        info.zbar;
     }
     report.materials.push_back(std::move(info));

@@ -366,6 +366,42 @@ __device__ __forceinline__ double csw_node_slope_1d_device(
   return csw_node_slope_van_leer_device(d_minus, d_plus);
 }
 
+// Velocity gradient of cell k divided by grad_i (the compressing cell's own gradient, < 0).
+// A cell outside the mesh takes the ratio 1 (linear continuation; the mirror image at a
+// reflecting centre); a degenerate cell (non-positive width, non-finite ratio) takes 0.
+__device__ __forceinline__ double csw_gradient_ratio_1d_device(
+    const double* __restrict__ node_r,
+    const double* __restrict__ node_u,
+    const int k,
+    const int n_cells,
+    const double grad_i) {
+  if (k < 0 || k >= n_cells) {
+    return 1.0;
+  }
+  const double dr = node_r[k + 1] - node_r[k];
+  if (!(dr > 0.0)) {
+    return 0.0;
+  }
+  const double ratio = ((node_u[k + 1] - node_u[k]) / dr) / grad_i;
+  return isfinite(ratio) ? ratio : 0.0;
+}
+
+// Christensen's limiter as written by Caramana, Shashkov and Whalen (1998, eq. 12):
+// psi = max(0, min((r_l + r_r)/2, 2 r_l, 2 r_r, 1)), with r_l and r_r the velocity gradients of
+// the neighbour cells over the cell's own. psi = 1 when the velocity is linear across the three
+// cells and falls continuously to 0 when a neighbour does not compress. grad_i must be < 0.
+__device__ __forceinline__ double csw_christensen_psi_1d_device(
+    const double* __restrict__ node_r,
+    const double* __restrict__ node_u,
+    const int i,
+    const int n_cells,
+    const double grad_i) {
+  const double r_l = csw_gradient_ratio_1d_device(node_r, node_u, i - 1, n_cells, grad_i);
+  const double r_r = csw_gradient_ratio_1d_device(node_r, node_u, i + 1, n_cells, grad_i);
+  const double psi = fmin(fmin(0.5 * (r_l + r_r), 2.0 * r_l), fmin(2.0 * r_r, 1.0));
+  return fmax(0.0, psi);
+}
+
 __device__ __forceinline__ double riemann_cell_center_r_1d_device(
     const double* __restrict__ node_r,
     const int i) {
@@ -1061,8 +1097,14 @@ __global__ void compute_q_csw_1d_kernel(
     const double u_right_star = node_u[i + 1] - 0.5 * dr * s_right;
     const double chi_reconstructed = fmax(0.0, -(u_right_star - u_left_star) / dr);
     chi_lim = fmin(chi_raw, chi_reconstructed);
-    if (chi_reconstructed > 0.0 && shock_limiter_floor > 0.0) {
-      chi_lim = fmin(chi_raw, fmax(chi_lim, shock_limiter_floor * chi_raw));
+    if (shock_limiter_floor > 0.0) {
+      // The floor holds f chi_raw where a neighbour does not share the compression (a shock's
+      // foot or tail) and is weighted by 1 - psi, so it vanishes continuously as the velocity
+      // field becomes linear: the viscous pressure stays a continuous function of the velocities.
+      const double psi =
+          csw_christensen_psi_1d_device(node_r, node_u, i, n_cells, raw_grad);
+      chi_lim = fmin(chi_raw,
+                     fmax(chi_lim, shock_limiter_floor * (1.0 - psi) * chi_raw));
     }
   }
 

@@ -296,6 +296,7 @@ Output(
     directory="outputs/lp1d_ex08_d2_shell_implosion",
     format="hdf5",
     plot_every_s=2.0e-11,
+    history_every=1,
     history_every_s=1.0e-9,
     checkpoint_every=5000,
     checkpoint_keep_last=2,

@@ -494,19 +494,9 @@ bool all_active_cells_collapsed_device(const core::State& state,
   if (n_cells == 0) {
     return false;
   }
-  const std::int8_t* d_active = nullptr;
-  if (!state.hydro_active.empty()) {
-    auto* buf = static_cast<std::int8_t*>(core::device_scratch_acquire(
-        "safety_audit:collapse2t:active",
-        static_cast<std::size_t>(n_cells) * sizeof(std::int8_t)));
-    cuda_check(cudaMemcpy(buf,
-                          state.hydro_active.data(),
-                          static_cast<std::size_t>(n_cells) *
-                              sizeof(std::int8_t),
-                          cudaMemcpyHostToDevice),
-               "2T collapse mask upload failed");
-    d_active = buf;
-  }
+  // The State's device mirror of hydro_active (uploaded when the host mask
+  // changes), as the hydro kernels read it.
+  const std::int8_t* d_active = state.hydro_active_device_ptr();
   auto* d_counts = static_cast<int*>(core::device_scratch_acquire(
       "safety_audit:collapse2t:counts", 2 * sizeof(int)));
   cuda_check(cudaMemset(d_counts, 0, 2 * sizeof(int)),

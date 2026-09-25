@@ -15,6 +15,7 @@
 
 #include "core/constants.hpp"
 #include "core/error.hpp"
+#include "core/hdf5_mutex.hpp"
 
 #if TENRYU_ENABLE_HDF5
 #include "io/hdf5_utils.hpp"
@@ -1286,6 +1287,7 @@ std::vector<double> transpose_dt_to_td(const std::vector<double>& src,
 
 TmatFile load_tmat(const std::string& filepath, const TmatLoadMode mode) {
 #if TENRYU_ENABLE_HDF5
+  const std::lock_guard<std::recursive_mutex> hdf5_lock(::tenryu::core::hdf5_mutex());
   tmat_require(!filepath.empty(),
                "TMAT_E001",
                "TMAT file path must not be empty");

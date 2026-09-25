@@ -52,6 +52,9 @@ class HDF5Writer {
  public:
   HDF5Writer() = default;
 
+  // Writes the snapshot and returns once it is published (the file renamed
+  // from .tmp; any snapshot still pending from write_snapshot_in_background is
+  // published first).
   void write_snapshot(const tenryu::core::State& state,
                       const tenryu::core::Config& cfg,
                       int file_index,
@@ -60,6 +63,21 @@ class HDF5Writer {
                       const std::string& output_dir,
                       const std::string& case_name,
                       int rank = 0) const;
+
+  // The same snapshot, finished by a worker thread: the call creates the file,
+  // writes the groups, attributes and small datasets and queues the large
+  // datasets' compression (the data is copied before it returns); the worker
+  // waits for the compression, writes the chunks, closes the file and
+  // publishes it, in the order of the calls, at most two pending. The time
+  // loop's snapshots (OutputManager::write_snapshot) take this path.
+  void write_snapshot_in_background(const tenryu::core::State& state,
+                                    const tenryu::core::Config& cfg,
+                                    int file_index,
+                                    int step,
+                                    double t,
+                                    const std::string& output_dir,
+                                    const std::string& case_name,
+                                    int rank = 0) const;
 
   std::string write_checkpoint(
       const tenryu::core::State& state,
@@ -70,6 +88,9 @@ class HDF5Writer {
       double t,
       const std::string& output_dir,
       const std::string& case_name) const;
+  // Waits until every snapshot of write_snapshot_in_background so far is
+  // published and rethrows the first error of the worker.
+  static void wait_for_snapshot_writes();
 };
 
 }  // namespace tenryu::io

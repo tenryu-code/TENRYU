@@ -265,7 +265,7 @@ struct FrozenTable1D {
 ```
 
 **サンプリングパラメータ**：
-- laser波形：`n_samples` = 10000（`t ∈ [0, Main.t_end]` を等間隔分割）
+- laser波形：時刻 \(k \cdot 2^{-40}\) s（\(k = 0..\lceil t_{end}/2^{-40}\rceil\)）に局所細分（弦と中点の差 > 局所値の 1e-6、最小 \(2^{-47}\) s）を加えた標本（`core/namelist/frozen_table.cpp` `create_frozen_time_table`）
 - 境界温度：同上。検証用途のため精度よりもシンプルさを優先
 - geometry関数：メッシュ座標数 = セル数（or ノード数）の一括評価。テーブル化不要
 
@@ -525,7 +525,7 @@ struct Config {
             std::string top_z = "vacuum";      // 2D RZ only: Z上面
             int marshak_particles = 1000;      // Marshak BC 粒子数/step（全面合算、面面積比で配分。NUMERICS §8.2）
             // Marshak 放射温度 T_r(t) [eV]：1D_SPH は単一 FrozenTable1D、2D_RZ は面別 map
-            // 1D_SPH: marshak_Tr = FrozenTable1D（callable → 10000点凍結、SPECIFICATION §6.4.5）
+            // 1D_SPH: marshak_Tr = FrozenTable1D（callable → 時刻表に凍結、SPECIFICATION §6.4.5）
             // 2D_RZ:  marshak_Tr_map["r_outer"] / ["z_bottom"] / ["z_top"] = FrozenTable1D（SPECIFICATION §6.4.5）
             FrozenTable1D marshak_Tr;                          // 1D_SPH 用（2D_RZ では未使用）
             std::map<std::string, FrozenTable1D> marshak_Tr_map; // 2D_RZ 用（面名 → 温度テーブル）
@@ -648,7 +648,7 @@ struct Config {
                 std::string state_supply_donor_mode = "interior_per_i"; // "interior_per_i" | "interior_radial_average"
                 hydro::BC2DRZConfig bc_config;       // explicit normal/tangential material/mesh semantics
                 FrozenTable1D pressure_drive;       // [dyne/cm²] 時間依存駆動圧力 P_drive(t)（"pressure" type 時に使用。NUMERICS §8.1、SPECIFICATION §6.4.7）
-                // namelist の boundary_pressure callable から初期化時に FrozenTable1D 化（10000点線形補間）
+                // namelist の boundary_pressure callable から初期化時に FrozenTable1D 化（時刻表、線形補間）
             } boundary_2d;
             std::string av_type = "vnr";    // "vnr" | "riemann"（"riemann" は 1D_SPH 限定。SPECIFICATION §6.4.7）
             // namelist名: av_C1, av_C2, av_limiter_J, av_heat_C（SPECIFICATION §6.4.7）

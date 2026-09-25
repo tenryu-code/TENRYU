@@ -6,6 +6,7 @@
 #include <string>
 
 #include "core/error.hpp"
+#include "core/hdf5_mutex.hpp"
 
 #if TENRYU_ENABLE_HDF5
 #include <hdf5.h>
@@ -217,6 +218,7 @@ void write_positivity_history_file(
   }
 
 #if TENRYU_ENABLE_HDF5
+  const std::lock_guard<std::recursive_mutex> hdf5_lock(::tenryu::core::hdf5_mutex());
   const std::filesystem::path path(history_path);
   if (path.has_parent_path()) {
     std::filesystem::create_directories(path.parent_path());

@@ -578,16 +578,26 @@ def common_metrics(
     rad1 = compute_E_rad_total(final["rad_E"], final_mesh)
     u0 = matter_energy(first, first_mesh)
     u1 = matter_energy(final, final_mesh)
-    escaped_series = read_history_scalar(Path(final["path"]).parent, Path(final["path"]).stem.rsplit("_", 1)[0], "energy/radiation_escaped")
-    escaped_from_history = float(sum(max(x, 0.0) for x in escaped_series)) if escaped_series else None
+    run_id = Path(final["path"]).stem.rsplit("_", 1)[0]
+    # Run-cumulative history series (energy/radiation_escaped since 2026-08-30,
+    # energy/marshak_in since 2026-09-23; both then have a *_step sibling) give
+    # the run total as their last value; older per-step series are summed.
+    def history_total(name: str) -> float | None:
+        series = read_history_scalar(Path(final["path"]).parent, run_id, name)
+        if not series:
+            return None
+        if read_history_scalar(Path(final["path"]).parent, run_id, name + "_step"):
+            return float(series[-1])
+        return float(sum(max(x, 0.0) for x in series))
+
+    escaped_from_history = history_total("energy/radiation_escaped")
     escaped_from_state = final.get("E_rad_escaped_state")
     escaped = escaped_from_state if escaped_from_state is not None else escaped_from_history
     escaped_source = "time_state/E_rad_escaped" if escaped_from_state is not None else "history/sum(energy/radiation_escaped)"
     if escaped is None:
         escaped = estimate_terminal_vacuum_boundary_energy(final["rad_E"], final_mesh)
         escaped_source = "terminal_outer_rad_E_shell"
-    marshak_series = read_history_scalar(Path(final["path"]).parent, Path(final["path"]).stem.rsplit("_", 1)[0], "energy/marshak_in")
-    marshak_from_history = float(sum(max(x, 0.0) for x in marshak_series)) if marshak_series else None
+    marshak_from_history = history_total("energy/marshak_in")
     marshak_from_state = final.get("E_Marshak_in_state")
     marshak_in = float(marshak_from_state if marshak_from_state is not None else (marshak_from_history or 0.0))
 

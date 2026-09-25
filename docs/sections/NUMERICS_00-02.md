@@ -370,38 +370,38 @@ n_i = \frac{\rho}{A\,m_p} \quad [\text{cm}^{-3}]
 
 **平均電離度 \(\bar{Z}\)**：v1.0では3モデルを提供する。
 1. **fixed**（既定）：\(\bar{Z} = Z\)（ユーザ指定の原子番号 or 有効電荷。完全電離を仮定）
-2. **thomas\_fermi**：More et al. (1988) のフィッティング公式
+2. **thomas\_fermi**：More (1985) Table IV の Thomas–Fermi 電離度フィット
 3. **tabular**：IONMIXテーブルから \(\bar{Z}(\rho, T_e)\) を補間取得
 
-**Thomas–Fermiモデル**（More, Warren, Young & Zimmerman, Phys. Fluids 31, 3059, 1988）：
+**Thomas–Fermiモデル**（R. M. More, Adv. At. Mol. Phys. **21**, 305 (1985), Table IV —
+TF 電離状態への近似フィット。QEOS（More, Warren, Young & Zimmerman, Phys. Fluids **31**, 3059 (1988)）
+の TF 相似則 式 (83a,b) と同じ変数）：
 
-水素等価変数による無次元化：
+TF 相似変数：
 \[
-\rho^H = \rho/A,\quad T_e^H = T_e/Z^{4/3}
+R = \frac{\rho\,[\mathrm{g/cm^3}]}{Z A},\quad T_0 = \frac{T_e\,[\mathrm{eV}]}{Z^{4/3}},\quad
+T_F = \frac{T_0}{1+T_0}
 \]
-圧力電離（冷）：
+フィット：
 \[
-\bar{Z}_0^H = \frac{\eta}{1+\eta},\quad \eta = \left(\frac{\rho^H}{0.148\;\text{g/cm}^3}\right)^{1/2}
+\begin{aligned}
+&A = a_1 T_0^{a_2} + a_3 T_0^{a_4},\qquad B = -\exp\!\left(b_0 + b_1 T_F + b_2 T_F^7\right),\qquad
+C = c_1 T_F + c_2,\\
+&Q_1 = A R^{B},\qquad Q = \left(R^{C} + Q_1^{C}\right)^{1/C},\qquad x = \alpha Q^{\beta},\qquad
+\bar{Z} = \frac{Z\,x}{1 + x + \sqrt{1+2x}}
+\end{aligned}
 \]
-熱電離：
-\[
-\bar{Z}_{th}^H = (1-\bar{Z}_0^H)\,Y,\quad
-Y = \left[1 + \left(\frac{T_0^H}{T_e^H}\right)^{1/2}\right]^{-1}
-\]
-\[
-T_0^H = 0.0327\,\exp\!\bigl(6.98\,(\rho^H)^{0.075}\bigr) \quad [\text{eV}]
-\]
-合計：
-\[
-\bar{Z} = Z\,\bigl(\bar{Z}_0^H + \bar{Z}_{th}^H\bigr)
-\]
+係数：\(\alpha=14.3139\)、\(\beta=0.6624\)、\(a_1=0.003323\)、\(a_2=0.9718\)、
+\(a_3=9.26148\times10^{-5}\)、\(a_4=3.10165\)、\(b_0=-1.7630\)、\(b_1=1.43175\)、\(b_2=0.31546\)、
+\(c_1=-0.366667\)、\(c_2=0.983333\)。\(T\to0\) で \(Q\to R\)（圧力電離のみ、例: 液体 D₂ 0.17 g/cc で
+\(\bar Z=0.439\)）、高温・低密度で \(\bar Z\to Z\)（D₂ 0.17 g/cc: 100 eV で 0.968、1 keV で 0.997）。
+原典の例（Ar、1 keV、30 g/cc で \(n_e\approx7\times10^{24}\,\mathrm{cm^{-3}}\)）を再現する（単体試験）。
 
-> **適用範囲**：More et al. (1988) フィッティングの妥当性は
-> \(\rho \in [10^{-3},\, 10^{4}]\) g/cm\(^3\)、\(T_e \in [0.01,\, 10^4]\) eV の範囲で確認されている。
-> 範囲外では \(\bar{Z}\) をクランプする：\(\rho < 10^{-3}\) では \(\rho^H = 10^{-3}/A\)、
-> \(\rho > 10^4\) では \(\rho^H = 10^4/A\)、\(T_e\) も同様に \([0.01, 10^4]\) eV でクランプ。
-> \(Z\) はユーザ指定の **単一種の原子番号** である（混合材料セルではEOS混合則 §1.1.5(c) を適用）。
-> 精度は～10%。生産計算ではIONMIXテーブルの \(\bar{Z}\) を推奨する。
+> **2026-09-23 修正**: 従来の式は密度を \(\rho/A\)（\(Z\) で割らない）で規格化し、熱電離を
+> \(Y=[1+(T_0^H/T_e^H)^{1/2}]^{-1}\) で与えていた。TF 相似則と合わず \(Z>1\) の冷たい物質を過大電離
+> （CH 1.05 g/cc 0.1 eV: 1.85、本式 1.30）し、高温で完全電離への近づきが遅かった（D₂ 1 keV: 0.946）。
+> 入力の保護は \(\rho>0\)、\(T\ge0\) のみで、密度・温度のクランプは行わない。
+> \(Z\)、\(A\) は材料の平均核電荷・質量数（混合材料セルではEOS混合則 §1.1.5(c) を適用）。
 
 **電子数密度**：
 \[
@@ -485,7 +485,7 @@ P_N(v)=P_i^N(v,T_{i0})+P_e^N(v,T_{e0}),
 \[
 \tilde P_e=P_e^N-wC',\qquad \tilde e_e=e_e^N+(w-T_ew')C,\qquad \tilde c_{v,e}=c_{v,e}^N-T_ew''C,
 \]
-イオン側は不変。保存変数は電子熱量座標 \(q_e=\tilde e_e-C(v)\)（`state.ee` に格納。\(T_e\le T_*/2\) で \(q_e=e_e^N\)）で、物質エネルギーは \(e_i+q_e+C(v)\)（\(C\) は `state.e_cold`、HDF5 の `hydro/e_cold`。エネルギー台帳の電子内部エネルギーは \(q_e+C\) を集計する）。\(P_N\) は実行時と同じ log 双線形補間（密度節点間で \(\ln\rho\) に線形）で評価し、\(C_0\) は節点ごとに閉形式で積分する（`materials/cold_equilibrium.hpp`、`build_cold_equilibrium_table`）。逆変換 \(q_e\to T_e\) は安全化 Newton–二分法（収束判定は温度括弧の相対幅 \(4\times10^{-15}\)。表全体のエネルギー幅に対する許容は使わない — 極低温で電子エネルギーがほぼ平坦な表では、根から遠い温度を受け入れてしまう）、平坦なエネルギー列は下端の温度を返す（CPU/GPU 共通）。音速の密度微分に使う \(C''\) は基底表と同じ密度区間で評価する（参照密度が表の節点と一致する場合の整合）。電子表に cold branch を付けると（`EOSTable::cold`、`DeviceEOSTable::upload` が同梱）、hydro 閉包・FLD/S\(_N\) の物質更新・伝導の再閉包・Qei・注入の全評価器が同じ写像を使う。hydro の電子側 pdV 仕事は \(-[\bar P_e^N+(1-\bar w)D_C],\Delta v\)（\(D_C=[C(v^{n+1})-C(v^n)]/[v^{n+1}-v^n]\)、力は \(\tilde P_e\) を使う。予測子・修正子はそのままで、全エネルギーの不一致は \(O(\Delta t^3)\)）。音速の電子部は \((\tilde P_e)_\rho+T_e(\tilde P_e)_{T_e}^2/(\rho^2\tilde c_{v,e})\)。hydro のマスクは行わず全セルが力学的に応答する（衝撃波は透過する）。参照物性の出典: 液体 D2 19 K の \(K_T=1.20\times10^9\) dyn/cm²（Richardson, Leachman, Lemmon 2014, J. Phys. Chem. Ref. Data 43, 013103, Table 7 から \(K_S=\rho c_S^2\)、\(K_T=K_S c_v/c_p\)）、ポリスチレン極低温の \(K_S=5.8\times10^{10}\) dyn/cm²（Topp & Cahill 1996, Z. Phys. B 101, 235、\(K_S=\rho(c_L^2-\tfrac43c_T^2)\)）。適用条件: 1D_SPH・2T・表 EOS、`pressure_tension_cutoff=False`、`compatible_energy=False`、persistent loop 不可、`qei_heat_capacity="table"` 必須（電子・イオン交換に表の比熱を使う。理想気体の比熱は極低温の表状態で桁違いに大きく、交換が振動する）。起動時に材料ごとの初期全圧と最大不整合を報告する（0.1 kbar 超で WARNING）。
+イオン側は不変。保存変数は電子熱量座標 \(q_e=\tilde e_e-C(v)\)（`state.ee` に格納。\(T_e\le T_*/2\) で \(q_e=e_e^N\)）で、物質エネルギーは \(e_i+q_e+C(v)\)（\(C\) は `state.e_cold`、HDF5 の `hydro/e_cold`。エネルギー台帳の電子内部エネルギーは \(q_e+C\) を集計する）。\(P_N\) は実行時と同じ log 双線形補間（密度節点間で \(\ln\rho\) に線形）で評価し、\(C_0\) は節点ごとに閉形式で積分する（`materials/cold_equilibrium.hpp`、`build_cold_equilibrium_table`）。逆変換 \(q_e\to T_e\) は表の温度節点の上で解く（2026-09-25）：根を含む節点区間を符号の二分探索で特定し（\(F\ge0\) を上側とする）、区間内では基底表のエネルギーが \(\ln T\) に線形なので、ゲートが一定の区間（\(T\le T_a\) または \(T\ge T_*\)）では \(F\) の根を直接求め、遷移区間では区間内の括弧付き Newton（\(u=\ln T\)、厳密な導関数 \(dF/du=s-T^2w''C\)、\(s\) は区間のエネルギー勾配）で解く（収束判定は温度括弧の相対幅または Newton 刻みが \(4\times10^{-15}\)）。表全体のエネルギー幅に対する許容は使わない — 極低温で電子エネルギーがほぼ平坦な表では、根から遠い温度を受け入れてしまう。平坦なエネルギー列は下端の温度を返す（CPU/GPU 共通）。節点を渡さない呼び出しは従来の安全化 Newton–二分法で、表の比熱で Newton 刻みを取るため補間の勾配と一致せず、1 回の逆変換に約 50 回の評価を要した（節点上の方式は NIF DS で平均 6.4 回）。音速の密度微分に使う \(C''\) は基底表と同じ密度区間で評価する（参照密度が表の節点と一致する場合の整合）。電子表に cold branch を付けると（`EOSTable::cold`、`DeviceEOSTable::upload` が同梱）、hydro 閉包・FLD/S\(_N\) の物質更新・伝導の再閉包・Qei・注入の全評価器が同じ写像を使う。hydro の電子側 pdV 仕事は \(-[\bar P_e^N+(1-\bar w)D_C],\Delta v\)（\(D_C=[C(v^{n+1})-C(v^n)]/[v^{n+1}-v^n]\)、力は \(\tilde P_e\) を使う。予測子・修正子はそのままで、全エネルギーの不一致は \(O(\Delta t^3)\)）。音速の電子部は \((\tilde P_e)_\rho+T_e(\tilde P_e)_{T_e}^2/(\rho^2\tilde c_{v,e})\)。hydro のマスクは行わず全セルが力学的に応答する（衝撃波は透過する）。参照物性の出典: 液体 D2 19 K の \(K_T=1.20\times10^9\) dyn/cm²（Richardson, Leachman, Lemmon 2014, J. Phys. Chem. Ref. Data 43, 013103, Table 7 から \(K_S=\rho c_S^2\)、\(K_T=K_S c_v/c_p\)）、ポリスチレン極低温の \(K_S=5.8\times10^{10}\) dyn/cm²（Topp & Cahill 1996, Z. Phys. B 101, 235、\(K_S=\rho(c_L^2-\tfrac43c_T^2)\)）。適用条件: 1D_SPH・2T・表 EOS、`pressure_tension_cutoff=False`、`compatible_energy=False`、persistent loop 不可、`qei_heat_capacity="table"` 必須（電子・イオン交換に表の比熱を使う。理想気体の比熱は極低温の表状態で桁違いに大きく、交換が振動する）。起動時に材料ごとの初期全圧と最大不整合を報告する（0.1 kbar 超で WARNING）。
 
 
 2T 分離：テーブル 301 と 304 は**グリッドサイズが異なる**場合がある（例：Polystyrene 301=73×41, 304=63×33）。
@@ -725,6 +725,26 @@ dt 推定暴走のため射影形を維持（+17.5 J/2.5 ns の文書化残差�
 per-step `dE_total` の総和ではなく端点閉包式 \((E_0+\sum\text{src}-E_{\rm end})-\sum\text{esc}\)
 で評価する（per-step 系列の cumsum は縫い目二重計上で 5–10× 過大）。2D_RZ の閉包は
 別構造のため本ノブの対象外（EOS 閉包修正文書の relay 節参照）。
+追補（2026-09-23）: thermal subcycle の Qei 副段（`qei_coupling_substep_kernel`）の電子・
+イオン閉包にも同じ tail を適用した（\(e>e(\rho,T_{\rm top})\) で
+\(T=T_{\rm top}+(e-e_{\rm top})/c_{v,\rm top}\)、\(P=P_{\rm top}T/T_{\rm top}\)、
+\(c_v=c_{v,\rm top}\)）。従来は \(T\) を \(T_{\rm max}\) で頭打ちにして \(P,c_v\) も天井値を
+書いていたため、直後の伝導が天井で平らにされた \(T_e\) で熱流束を作り、天井を超える
+コロナの熱輸送を毎副段過小に評価していた（エネルギー自体は保存）。legacy モードは不変。
+追補（2026-09-23）: 1D の音速（`compute_cell_sound_speed` の 2T/1T 表分岐と 1D ALE 後の
+音速）も `energy_authoritative` では tail に合わせる。天井を超えるセルでは
+\(c_s(T)=c_s(T_{\rm top})\sqrt{T/T_{\rm top}}\)（`device_eos_sound_speed_with_high_t_tail`）
+とし、1T は温度を tail の逆算 \(T=T_{\rm top}+(e-e_{\rm top})/c_{v,\rm top}\) で得る。
+追補（2026-09-23）: レーザー沈着（`inject_laser_source_cells_kernel`）と燃焼沈着
+（`inject_burn_source_cells_kernel`、§14.5）の表 EOS 閉包も、`energy_authoritative` では
+天井を超える電子・イオンのエネルギーを同じ tail で閉じる（\(T\)・\(P\) を tail 値に。
+\(c_v\) はこれらの沈着閉包では従来どおり書かない）。従来はホスト移植の逆変換が
+\(T_{\rm max}\) で頭打ちにしていた。legacy モードは不変。
+tail は \(P\propto T\)・\(c_v\) 一定の理想気体延長なので、断熱指数を天井の行の値に保つ
+この形は理想気体で厳密で、天井で連続である。従来は表を天井で評価していたため、閉包の
+圧力が \(P_{\rm top}T/T_{\rm top}\) なのに音速は \(\sqrt{T_{\rm top}/T}\) 倍小さく、
+CFL の時間刻みと人工粘性の一次項に入っていた。tail の anchor が無効な表（天井の
+\(c_v\le0\) など）では閉包と同じく天井のまま。legacy モードと天井以下は bit 不変。2D_RZ は対象外。
 
 > **追補（2026-07-26）**: 1D ALE の post-remap EOS reclosure
 > （`ale_1d_driver.cu::eos_reclosure_kernel`）は上記ファミリ閉鎖から漏れており、
@@ -782,15 +802,70 @@ energy-authoritative の伝導増分 `apply_conduction_energy_increment`（devic
 `fld_1d_gpu.cu` 内の材料別電子テーブルキャッシュから同じ形の view 配列を作る）で選ぶ。規則: (i) 支配材料が
 要求種別（electron / ion / total）の非空テーブルを持つセルは、そのテーブルとそのテーブルの温度天井
 （高温 tail 拡張の \(T_{\rm top}\)、`DriverRecloseContext` に材料別に一度だけ upload）で評価する。
-(ii) テーブルを持たない材料のセル、および材料添字が未整備のときは従来どおり先頭材料のテーブルへ
-フォールバックする。(iii) テーブル対理想気体・`cv_e_override`・hydro backend 種別などの分岐判定と
-解析分岐の材料定数（\(A, \gamma\) 等）は従来どおり先頭材料の値のまま（テーブル材料と理想気体材料の
-混在構成は未対応で挙動不変）。単一材料では選ばれる view・天井が従来と同一オブジェクト（同じ
+(ii) テーブルを持たない材料のセル（2T ではイオンと電子の両テーブルが揃わない材料のセル）は空の view を
+受け取り、各評価器はそのセルをその材料の理想気体（セルの実効 \(A,\gamma\) と \(\bar Z\)。伝導後の再閉包は
+1D hydro 閉包の理想気体分岐と同じ式 `hydro::ideal_gas_cell_cv` を使う）で閉じる（2026-09-23。以前は
+先頭材料のテーブルへフォールバックしており、その「先頭材料」も評価器ごとに異なった — hydro は材料
+スロット 0、ほかは最初の非 void 材料。材料順が「テーブル材料, 理想気体材料」のデッキでは理想気体の
+セルがテーブル材料の EOS で閉じていた）。材料添字が未整備のときは従来どおり先頭材料のテーブル。
+2D も通る経路（燃焼入射・Qei 副段・輻射入射の device kernel、レーザー入射と伝導再閉包の host ループ）は、
+2D の hydro 閉包が全セルを材料 0 のテーブルで評価しているので、2D に限り従来どおり先頭材料のテーブルを
+貸す（device は `CellEOSTableSelector::lend_fallback_to_tableless`、host は `mesh.dim == 1` で分岐）。
+(iii) テーブル対理想気体の分岐はセルのテーブル有無で判定する（2T の閉包・音速・エネルギー更新・
+レーザー／燃焼入射・伝導後の再閉包はイオンと電子の両テーブルが揃うこと）。実行全体でテーブル経路を
+使うかどうかの判定（入射の `has_table_eos`、伝導後の再閉包の起動と伝導ソルバー内の線形射影
+\(e_e=c_{v}T_e\) の省略、1D hydro の `hydro_has_table_eos_backend_data`: compatible 再閉包・Qei の表比熱）
+は、1D ではいずれかの非 void 材料が表を持てば表の経路をとり、フォールバック view はその最初の材料の表
+（`MaterialsConfig::eos_table_reference_material_index`、2026-09-23）。以前は先頭の非 void 材料
+（hydro は材料スロット 0）で決めていたため、理想気体（または void）を先に並べたデッキでは表のセルまで
+理想気体の扱いになり、伝導ソルバーの線形射影が CD のセルのエネルギーを \(c_vT\) に書き換えていた
+（10 eV の CD が 2 step で 17.3 eV、エネルギー誤差 0.1–0.27）。エネルギー更新のゼロ下限もセルごと
+（§3.1.5）。2D の判定は先頭の非 void 材料のまま。`cv_e_override` と hydro backend 種別（helmholtz 系・
+rho_e 表・Mie–Grüneisen は材料 0 の view を全セルに使う）は従来どおり先頭材料の値のまま。（2026-09-24 に解消 — 下段）単一材料では選ばれる view・天井が従来と同一オブジェクト（同じ
 `DeviceEOSTable::view()`、同じ `T_grid_eV.back()`）なので算術は bit 同一。
 `initialize_eos_fields_if_needed` は同日に先行してセル材料別に修正済み。
 `refresh_mie_gruneisen_thermo_from_energy`（Mie–Grüneisen backend 限定）と 1D ALE の post-remap
 再閉包 `ale_1d_driver.cu::eos_reclosure_kernel`（材料 0 のテーブルと \(A,\gamma\) に意図的に限定、Lagrangian
 デッキでは不使用）は対象外のまま。
+
+[2026-09-24] **材料ごとの閉包パラメータ — hydro backend 種別・`cv_e_override`・`eos_T_ref_eV` をセルの材料から**:
+上段の「`cv_e_override` と hydro backend 種別は先頭材料の値のまま」を解消した。1D で非 void 材料どうしが
+hydro backend 種別（`eos.hydro_backend`）、`cv_e_override`、`eos_T_ref_eV` のいずれかで異なるデッキでは、
+各セルがその支配材料の値で閉じる。材料別の値は `materials::MaterialClosureParams`（種別・\(A\)・\(Z\)・
+\(\gamma\)・`cv_e_override`・`eos_T_ref_eV`）の device 配列にまとめ（`materials/material_closure.cu`、
+値が材料間で異なるときだけ `CellEOSTableSelector::closure_params` に載る。単一材料と一様なデッキでは
+null で、各評価器は従来のスカラー引数と算術のまま）、次の評価器がセルごとに読む:
+(i) 1D hydro の閉包・音速（`enforce_1t/2t_closure_kernel`、`compute_sound_speed_1t/2t_kernel`）は
+セルごとの種別・代理表（helmholtz spline / jet・rho-e 表・Mie–Grüneisen の view を材料別の device 配列
+`HydroEOSContext::d_*_views` から。非 void 材料が 2 つ以上あり代理表を使う材料があるときに upload）・
+`cv_e_override` で評価する。そのとき各カーネルは別のテンプレート実体（`kPerCell=true`）で起動し、
+一様なデッキの実体の算術は変えない。厳密上書き（`exact_override`）は厳密理想気体と Mie–Grüneisen の
+セルには掛けない（実行全体では、それ以外の材料があるときだけ有効）。`exact_override="cv"` の比熱はセルの
+材料の \(A,Z\) から（`fill_exact_override_cv_kernel`、材料の \(A,Z\) が異なるときも）。エネルギー更新の
+ゼロ下限は helmholtz 系の材料のセルだけ符号付き。compatible energy の rho-e 逆閉包の対応は全非 void 材料で判定。
+(ii) 伝導後の温度→エネルギー再閉包（`sync_ee_from_Te_device` / host）は、厳密理想気体の材料のセルは
+その材料の \(A,\gamma\)・`cv_e_override`・`eos_T_ref_eV` の厳密式、それ以外の表を持たないセルは
+その材料の `cv_e_override` の理想気体で閉じる（先頭材料が厳密理想気体のとき、表を持つ他材料のセルも
+表で閉じる）。energy-authoritative の伝導増分（device / host）は厳密理想気体のセルのエネルギーを、
+伝導ソルバーが使った比熱（hydro の厳密閉包の一定比熱）で温度へ戻す（以前はその材料が保持している表で
+逆変換していた）。
+(iii) レーザー・燃焼・輻射の入射と Qei 副段の理想気体分岐は、セルの材料の `cv_e_override` と
+\(T^3\) 比熱（`eos_T_ref_eV`）で閉じる。いずれかの材料が \(T^3\) 比熱を使うときの 1D レーザー入射は
+従来どおり host 経路（`pow` の bit 再現のため）。
+(iv) 1D FLD の物質更新・Fleck・灰色加速のカーネルは `cv_e_override` をセルの材料から。
+(v) Mie–Grüneisen の温度更新（`refresh_mie_gruneisen_thermo_from_energy`）は Mie–Grüneisen の材料が
+一つでもあれば動き、各セルはその材料の表で、材料別パラメータがあるときは Mie–Grüneisen のセルだけを更新する
+（以前は先頭材料が Mie–Grüneisen のときだけ、全非 void セルを先頭材料の表で書き換えていた）。
+(vi) 厳密理想気体の材料は、表を保持していても閉包では表を持たない材料として扱う: 材料別の view 配列
+（`HydroEOSContext::d_*_views`、FLD の材料別電子表キャッシュ）の項を空にし、表の参照材料
+（`eos_table_reference_material_index`）から外し、初期化の表の有無の判定からも外す。その結果、一様な厳密
+理想気体デッキでは 2T の冷エネルギー出力 `e_cold` が 0、エネルギー更新のゼロ下限が有効、伝導増分と FLD の
+物質更新が表ではなく理想気体の式になる（いずれも hydro の厳密閉包との食い違いの解消）。
+変わらないもの: 単一材料・材料間で上記の値が同じデッキの算術（`closure_params` が null）。
+常駐ループは従来どおりこれらのデッキを受け付けない（理想気体 legacy・同一 `cv_e_override` に限定）。
+2D は対象外（`material_closure_params_vary` は 1D でだけ真）。ctest `test_per_cell_closure_params`
+（厳密理想気体の材料と `cv_e_override` を持つ材料の 2 材料デッキで、1T / 2T の閉包・音速と伝導後の再閉包が
+各セルの材料の式に一致すること）。
 
 [2026-09-14 追補] **テーブル密度下限より低密度のセルの 1D hydro 閉包**: 1D の EOS 閉包（1T/2T）と音速は
 従来 \(\rho < \rho_{\min}\)（テーブル密度格子の下限）で理想気体分岐へ切り替えていたが、FLD の物質更新・
@@ -840,8 +915,8 @@ gxii_1d_fld_regression / cbet_gxii_1d_off の dataset 単位 bit 比較 + 単体
 材料別 Qei カーネル `qei_coupling_substep_kernel_per_material`
 （`Numerics.materials.per_material_conservation_enabled`、既定 OFF）、Mie–Grüneisen 再閉包
 `reclose_thermo_from_energy` の \(\max(e,0)\)、2D 閉包（`hydro_2d.cu` は独自の `energy_needs_repair`）、
-台帳の \(\max(e_e+e_i,0)\)、非有限入力の repair 意味論、Qei の二重配置（hydro 両半段 + 熱副段）と
-解析式／表比熱の不一致、自由境界の人工粘性仕事の不整合、音速で負の部分圧の圧縮率寄与を捨てる処理。
+台帳の \(\max(e_e+e_i,0)\)、非有限入力の repair 意味論、Qei の
+解析式／表比熱の不一致（Qei の二重配置は 2026-09-23 に修正 — 下記 Radiation thermal microcycling の段落）、自由境界の人工粘性仕事の不整合、音速で負の部分圧の圧縮率寄与を捨てる処理。
 同日の追加（Qei の比熱計量）: 修正後に 26 meV 開始の同デッキ（輻射・伝導 OFF）で、静止セルのイオン→電子の
 交換が数サイクルで \(T_e\) を 26 meV → 0.16 eV に上げたまま半ステップ周期で振動する現象が残った
 （`qei_multiplier` を実効ゼロにすると消える）。原因は非 compatible 経路の 2T エネルギー更新の Qei が
@@ -1169,6 +1244,12 @@ Void 材料の体積分率は `cell_is_void` マスクの導出にのみ使用�
 > Rosseland平均はフラックス（拡散）支配の輸送であり、光学的に厚い領域での
 > 調和平均が物理的に正しい（光子は最も透過しやすい成分を選好する）。
 > v1.0では上記2種を固定する（SPECIFICATION §6.4.3: Planck平均 = `"linear_mass"`、Rosseland平均 = `"harmonic_mass_R"`）。
+> 実装（2026-09-24、1D）: `opacity_mix_rule` の 3 値を実装した — `"linear_mass"`（既定）は Planck・Rosseland とも
+> 線形、`"harmonic_mass_R"` は Planck 線形・Rosseland 調和（上式、各成分を \(10^{-20}\) cm²/g で下限）、`"max"` は
+> 両方とも存在する材料の最大値。テーブル不透明度の混合セル（`eval_opacity_multimat_kernel`、規則ごとのテンプレート
+> 実体）と定数不透明度の per-cell 混合（`State::ensure_cell_material_props`、質量分率・無ければ体積分率）の両方。
+> 純セルはどの規則でもその材料の値。2D は線形のみで、他の値は ConfigError。2026-09-23 から 09-24 までは
+> `"linear_mass"` だけを受理し、それ以前は受理して無視していた（下の doc-truth 注記は 2026-08-29 時点）。
 
 > **実装状態（doc-truth 注記 2026-08-29）**: 上式は設計目標であり、現行ランタイムの
 > 実装とは異なる。実装（`State::ensure_cell_material_props`）は、定数不透明度材料の
@@ -1185,7 +1266,7 @@ Void 材料の体積分率は `cell_is_void` マスクの導出にのみ使用�
 > 使用可能になった — 各非 void 材料は constant または LTE tmat（`--kirchhoff-pe` 変換、
 > `/opacity` の `is_lte=1` をランタイムで検証）を持て、セルの支配材料 index
 > （`State::cell_material_index`、体積分率 argmax）でテーブルを選択し
-> (ρ, T_e) 補間で per-cell per-group σ_a/σ_pe/σ_R を評価する。**第 2 段 (同日)**: NLTE tmat も多材料対応 — NLTE 係数カーネルにセル材料フィルタを追加し材料ごとに起動（材料定数はその材料の A/cv/γ/λ 引数、σ_pe≠σ_pa と η・Fleck をカーネルが自セル分のみ充填; 共有 η/Fleck 段は skip マスクで NLTE セルを保護）。table_nlte (IONMIX 直読) は未対応のまま。**第 3 段 (2026-08-31) — 混合セルの厳密混合**: 混合セルは寄与材料すべてを \(\sigma_{mix} = \rho \sum_m w_m\,\kappa_m(\rho_m, T_e)\) で厳密合成する — 重み \(w_m\) は質量分率（per-material 質量が未追跡なら体積分率で代替）、各材料のテーブルはその**部分密度** \(\rho_m = \rho\,w_m/f_m\)（\(= m_m/(V f_m)\)、\(f_m\) 縮退時はセル密度に fallback）で評価する。体積分割セルの厳密式（\(f_m \sigma_m(\rho_m) = \rho\,w_m \kappa_m(\rho_m)\)）。純セルは従来の支配材料経路に bit 一致で還元（H5 データセット単位 A/B で実証）。NLTE **支配**セルのみ NLTE 起動が支配材料近似で充填し、混合セル内の非支配 NLTE 材料はテーブル κ_PA/PE/R で寄与する。恒久 ctest `test_fld_multimat_opacity`（κ 入替 A/B・平坦テーブル vs 定数経路整合・混合セル部分密度厳密値）。なお定数材料同士の従来混合則（上記の線形体積分率加重）はテーブル無しデッキで不変に保たれる。
+> (ρ, T_e) 補間で per-cell per-group σ_a/σ_pe/σ_R を評価する。**第 2 段 (同日)**: NLTE tmat も多材料対応 — NLTE 係数カーネルにセル材料フィルタを追加し材料ごとに起動（材料定数はその材料の A/cv/γ/λ 引数、σ_pe≠σ_pa と η・Fleck をカーネルが自セル分のみ充填; 共有 η/Fleck 段は skip マスクで NLTE セルを保護）。table_nlte (IONMIX 直読) は未対応のまま。**第 3 段 (2026-08-31) — 混合セルの厳密混合**: 混合セルは寄与材料すべてを \(\sigma_{mix} = \rho \sum_m w_m\,\kappa_m(\rho_m, T_e)\) で厳密合成する — 重み \(w_m\) は質量分率（per-material 質量が未追跡なら体積分率で代替）、各材料のテーブルはその**部分密度** \(\rho_m = \rho\,w_m/f_m\)（\(= m_m/(V f_m)\)、\(f_m\) 縮退時はセル密度に fallback）で評価する。体積分割セルの厳密式（\(f_m \sigma_m(\rho_m) = \rho\,w_m \kappa_m(\rho_m)\)）。純セルは従来の支配材料経路に bit 一致で還元（H5 データセット単位 A/B で実証）。NLTE **支配**セルのみ NLTE 起動が支配材料近似で充填し、混合セル内の非支配 NLTE 材料はテーブル κ_PA/PE/R で寄与する。恒久 ctest `test_fld_multimat_opacity`（κ 入替 A/B・平坦テーブル vs 定数経路整合・混合セル部分密度厳密値）。なお定数材料同士の従来混合則（上記の線形体積分率加重）はテーブル無しデッキで不変に保たれる。**第 4 段 (2026-09-23) — 放出不透明度の一致**: 物質側は放出 \(f\,c\,\sigma^{PE} B\) を失うので、放射側の \(\eta\) も同じ混合 \(\sigma^{PE}\) から作る（従来は \(\sigma^{PA}\) から作っており、LTE 指定でも \(\kappa^{PE}\ne\kappa^{PA}\) の表（`tmat_kirchhoff_pe=False`）では \(c(\sigma^{PE}-\sigma^{PA})B\,\Delta t\,V\) が毎ステップ生成・消滅した）。定数材料と `tmat_kirchhoff_pe=True` の表では \(\sigma^{PE}=\sigma^{PA}\) なので不変。NLTE の係数計算の有無（警告集計と、外側反復の先回り計算を取り消すときに戻す配列の範囲）は先頭の非 void 材料ではなく全材料で判定する（先頭が定数材料で他に表がある 1D デッキでは \(\sigma^{PA}\)・\(\sigma^R\)・NLTE 作業配列が戻されていなかった）。ctest `test_fld_multimat_opacity` の収支ケース（\(\kappa^{PE}=3\kappa^{PA}\) の表で 1 ステップの物質＋放射の変化 = −流出を、欠陥の大きさの \(10^{-7}\) で検査。修正前は欠陥そのもの 4.3e6 erg の不一致）。 **第 5 段 (2026-09-24) — すべての不透明度モデルを材料ごとに**: 多材料の 1D FLD は、材料のどれかが表・べき乗則・周波数依存 Marshak 不透明度なら全セルを `eval_opacity_multimat_kernel` で評価する（定数だけのデッキは従来どおり `State::ensure_cell_material_props` の per-cell 定数）。材料の種類ごとに: べき乗則 \(\kappa=\kappa_0 (T/T_{ref})^{-\alpha_T}(\rho_m/\rho_{ref})^{\lambda_\rho}\)（部分密度 \(\rho_m\) で、灰色）、周波数依存 Marshak は群平均の吸収係数 \(\sigma_{P,g},\sigma_{R,g}\)（密度に依らない [1/cm]、単一材料と同じ Simpson 128 区間 `materials::freq_dep_marshak_group_sigmas`）を \(\rho_m\) で割った \(\kappa\) — 線形混合で \(\sigma=\sum_m f_m\sigma_m\)（体積分率加重）になる、`table_nlte`（IONMIX 表）は表から読んで LTE の表（放出＝吸収）は混合カーネル、非 LTE の表は `tmat` の非 LTE 表と同じく材料ごとの NLTE 係数起動が支配セルを埋める。材料が複数あるとき Fleck 線形化の有無は、どれかの材料が使えば実行全体で有効（`use_fld_fleck(cfg, mat)`；周波数依存 Marshak のセルも共有カーネルの Fleck 因子を使う。単一材料では従来どおり先頭材料の模型で決まる）。`opacity.model="ionmix"` は LTE の IONMIX 表として `table_nlte` の経路で評価する（builder が変換し、非 LTE の表は ConfigError）。ctest `test_fld_multimat_opacity` に混合則のケース。
 
 **質量分率 \(f_{m,\alpha}\) の時間発展**：ラグランジュステップでは各セルの \(f_{m,\alpha}\) は不変（セル境界を越える物質移動なし）。ALE remap（§3.3.4）により体積分率 \(f_\alpha V\) がセル間で輸送され、remap 後に \(f_\alpha = (f_\alpha V)' / V'\) として正規化し、\(f_{m,\alpha} = f_\alpha\,\rho_\alpha / \sum_\beta f_\beta\,\rho_\beta\) として質量分率を再計算する（ARCHITECTURE §4.4 remap リスト参照）。v1.0 では材料界面追跡を行わず、remap が唯一の \(f_{m,\alpha}\) 更新機構である。
 
@@ -1234,6 +1315,15 @@ c_{v,i} = \frac{k_B}{A_{eff}\,m_p\,(\gamma_{eff}-1)}
 - `inject_radiation_source_terms` / `inject_laser_source_terms` はセルごとの
   \(A_{eff}, \gamma_{eff}\) を用いて \(e_e \leftrightarrow T_e\) クロージャを行う
 - Te \(\leftrightarrow\) ee の変換は上式の \(c_{v,e}(A_{eff},\gamma_{eff})\) を用いる
+- 1T（2026-09-23）: 入射（レーザー・燃焼・輻射）の閉包は、全表（`total`）を持つセルでは全エネルギーを
+  その表で逆算して \(T\)・\(P\) を表から取る（2T の電子表の閉包と同じ手順、表の無いセルは理想気体）。
+  理想気体の分岐では、状態の \(c_v\) を全熱容量としてそのまま使う（1T の hydro 閉包がそこに
+  \((1+\bar Z)e/(A m_p(\gamma-1))\) を入れている）。以前は 1T で表を使わず全セルを理想気体の分岐で閉じ
+  （表のセルに \((\gamma-1)\rho e\) の圧力）、状態の全熱容量にイオンの分をもう一度足していた
+  （\(T\) を \((1+\bar Z)/(2+\bar Z)\) 倍に過小評価）。\(T\)・\(P\) は次の閉包（hydro の入口の閉包）で
+  書き直されるが、その間の演算子（Strang 順でレーザーの次の燃焼段など）はこの値を読み、全エネルギーが
+  \(c_v T_{\rm floor}\) を下回る表のセル（負の冷たい曲線のエネルギーなど）では理想気体の分岐がエネルギー
+  自体を床へ引き上げていた（床の注入として記帳）。
 
 **単一材料フォールバック**：
 \[
@@ -1489,7 +1579,16 @@ smoothing 前に 0 とし、face smoothing の barrier としても扱う。
 compressed cell floor hit を検出して同じ Radiation 演算子を細分化して再試行する。
 Hydro / Laser / IMC transport kernel の離散化は変更しない。Conduction は同じ
 `conduction_step` を使うが、standalone Strang 位置では呼ばず、thermal substep 内で
-`Radiation -> Qei -> Conduction` として評価する。
+`Radiation -> Qei -> Conduction` として評価する。Qei も同じ扱いで、thermal subcycle が
+走る step（`core::thermal_subcycle_active(cfg)` = `radiation_thermal_subcycle` かつ
+Radiation 有効かつ `imc.two_stage=False`）では、Hydro の 2T エネルギー更新
+（非 compatible の `energy_update_with_old_volume_2t_kernel`、compatible 経路の
+`apply_qei_transfer_2t_kernel`）は電子・イオン交換を行わず pdV・Q 仕事だけを与える。
+交換は thermal substep 内の `apply_qei_coupling_substep` による 1 回（合計 \(\Delta t\)）
+だけになる。thermal subcycle が走らない step では従来どおり Hydro の 2 回の半ステップ
+（合計 \(\Delta t\)）が交換を担う（2026-09-23 修正: 従来は thermal subcycle 有効時にも
+Hydro 両半段が交換を行い、1 step あたり \(2\Delta t\) 分の緩和を与えていた —
+\(\Delta t\lesssim\tau_{\rm eff}\) の領域で Te–Ti 緩和率が 2 倍）。
 
 Retry 判定は各 radiation substep の `source_injection` 完了後に行う。
 セル \(c\) が
@@ -1503,7 +1602,8 @@ T_{e,c} \le T_{e,floor} + 0.5\ {\rm eV}
 
 Algorithm:
 1. Radiation 演算子開始時に `ee`, `ei`, `Te`, `Ti`, `Pe`, `Pi` に加え、放射
-   prognostic state `rad_E`, `rad_E_old`, `sn_psi_prev`（mode 依存で空の場合は
+   prognostic state `rad_E`, `rad_E_old`, `sn_psi_prev`（線形不連続法 §6.8.4 では
+   `sn_psi_sd_prev`, `sn_ee_node_offset` も。mode 依存で空の場合は
    no-op）を GPU 上の backup field へ device-to-device copy し、step energy
    ledger accumulator（escaped / marshak_in / volume_source_in /
    numerical_loss / HOLO LO 4 量）の現在値を host snapshot する
@@ -1533,8 +1633,21 @@ Algorithm:
 4. 任意の substep 後に compressed floor hit が見つかり、かつ \(n_{sub}<16\) なら、
    pre-radiation の熱力学+放射状態を backup から復元し、ledger accumulator を
    snapshot 値へ巻き戻して、\(n_{sub}\leftarrow 2n_{sub}\)
-   として再試行する。
+   として再試行する。復元する状態は \(e_e,e_i,T_e,T_i,P_e,P_i\)、`rad_E`、
+   `rad_E_old`、`sn_psi_prev`（と `sn_psi_sd_prev`、`sn_ee_node_offset`）、閉包の比熱 \(c_{v,e},c_{v,i}\)、\(\bar Z\)（伝導の段が
+   更新する）、step の床注入・クランプ数、伝導と \(S_N\) 物質 Newton の全 step 再試行要求、
+   境界・体積源の step ledger（\(c_v\)・\(\bar Z\)・床注入・クランプ数・再試行要求は
+   2026-09-23 に追加。それまでは失敗した試行の値を再試行へ持ち越していた）。
 5. \(n_{sub}=16\) でも floor hit が残る場合は、それ以上の retry は行わず結果を受理する。
+6. 放射解は各回、自分が進めた区間の交換エネルギーで `rad_dep`・`rad_emit`（HOLO 有効時は
+   `holo_rad_dep`・`holo_rad_emit`）を上書きする。step の出力はこれらを step 全体の交換として
+   読む（checkpoint の `rad_dep`・`rad_emit`、`deposited_power` \(=\texttt{rad\_dep}/(V\Delta t)\)、
+   HOLO の源不一致診断）ため、\(n_{sub}>1\) では採用した試行の全 substep の値をデバイス上で
+   合計し、ループの後で書き戻す（two-stage 経路と同じ扱い）。\(n_{sub}=1\) では解が書いた値を
+   そのまま使う。履歴の `radiation/fld_outer_iterations`・`fld_outer_residual`・
+   `fld_outer_converged` も step の全 FLD 解について集約する（反復数は合計、残差は最大、収束は
+   全解が収束したときだけ 1）。巻き戻した試行の値は含めない（2026-09-23 修正: 従来はどれも
+   最後の substep の値で、`deposited_power` は \(1/n_{sub}\) 倍になっていた）。
 
 Prototype limitation（IMC 系。deterministic FLD/\(S_N\) は 2026-07-26 の
 transactional 化で解消）: IMC photon pool / census state は復元しない。
@@ -1620,6 +1733,10 @@ face flux は反対称なので
 現在の \((\rho, T_e)\) から \(\bar{Z}\) を再評価する。
 これにより、1回目の \(\mathcal{H}(\Delta t/2)\) による圧縮/加熱後の電離度が伝導係数へ反映され、
 \(\mathcal{C}(\Delta t)\) 後の \(T_e\) 変化が NLTE/Fleck closure に反映される。
+実装上は各 \(\mathcal{H}(\Delta t/2)\) の冒頭でも再評価する。1D では加えて Laser
+演算子 \(\mathcal{L}\) の冒頭でも再評価する（2026-09-23: 従来 \(\mathcal{L}\) は前ステップの
+2 回目の \(\mathcal{H}(\Delta t/2)\) 冒頭の \(\bar Z\) を読み、電子密度・臨界半径・IB 吸収係数・
+ゴーストコロナの基準値が半ステップ分古い電離度で決まっていた）。
 
 #### 2.1.1 Hydro開始温度条件（セル単位）
 
@@ -1656,8 +1773,10 @@ Hydro演算子 \(\mathcal{H}\) の適用をセル単位で制御する。
     \text{node\_active}_j = \bigwedge_{c \in \mathcal{N}(j)} \text{hydro\_active}_c
     \]
     （最外ノードは最外セルに従う）。非活性セルは剛体壁として自分のノードを保持し（`passive_fill` が行う
-    非活性ノード列の平行移動 `propagate_void_node_displacement` も行わない）、体積・エネルギーは
-    活性化まで不変（固定ノードに対する PdV 仕事はゼロなので、活性領域のエネルギーは保存される）。
+    非活性ノード列の平行移動 `propagate_void_node_displacement` も行わない）、体積は活性化まで不変、
+    エネルギーは流体の仕事に対して不変（固定ノードに対する PdV 仕事はゼロなので、活性領域のエネルギーは
+    保存される）。電子イオン緩和はマスクせず、2T のエネルギー更新は非活性セルでも \(Q_{ei}\) を適用する
+    （仕事の項は \(dV=0\) で消える。2026-09-23 是正 — 非 compatible の 2T 更新では Qei もマスクされていた）。
     活性セルは壁に向かって圧縮され、壁側のセルは輻射・熱伝導・電子イオン緩和で加熱されて
     \(T_e \ge T_{\text{start}}\) に達した時点で活性化する。このモードでは電子イオン緩和（\(Q_{ei}\)、
     hydro 内の transfer と source_terms の副段）を `hydro_active` でマスクしない。多材料の高密度界面
@@ -1884,8 +2003,15 @@ baseline の bit-exact 挙動を保つ。
 
 **Δt成長制限**：急激なΔt増大を防止するため、前ステップ比で制限する：
 \[
-\Delta t^{n+1} \le \min\!\bigl(\Delta t_{all},\; g_{dt}\,\Delta t^n\bigr),\quad g_{dt} = \text{growth\_factor}\;(\text{既定 }1.2,\;\text{SPECIFICATION §6.4.7})
+\Delta t^{n+1} \le \min\!\bigl(\Delta t_{all},\; g_{dt}\,\Delta t^n_{ref}\bigr),\quad g_{dt} = \text{growth\_factor}\;(\text{既定 }1.2,\;\text{SPECIFICATION §6.4.7})
 \]
+\(\Delta t^n_{ref}\)（`state.dt_growth_ref`）は前ステップの Δt から 2D の接触 cap を除いた値で、
+1D ではさらに出力時刻と \(t_{end}\) への切り詰め（(f)）も含めない（2026-09-23 是正 — 旧実装は
+切り詰めた Δt を基準にしたため、出力のたびに Δt が \(g_{dt}\) 倍ずつしか回復せず、余分な
+ステップを要した。切り詰めはステップの終わりを出力時刻に合わせるためのもので安定条件ではない）。
+2D は従来どおり切り詰め後の値を基準にする。
+driver full-step retry が Δt を縮めたステップでは、縮めた Δt を基準にする。永続カーネル
+（`dt_ladder_eval` の `dt_growth_basis`）も同じ基準を用いる。
 
 **(f) 出力時刻整合**（SPECIFICATION §6.4.8 `X_every_s` パラメータ）：
 

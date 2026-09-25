@@ -299,6 +299,12 @@ def read_history_energy(run_dir: Path, t_snapshot_s: np.ndarray, face_area_cm2: 
         )
         marshak = np.asarray(handle[marshak_name], dtype=float)
         escaped = np.asarray(handle[escaped_name], dtype=float)
+        # History semantics by writer date: energy/marshak_in is run-cumulative
+        # when energy/marshak_in_step exists (2026-09-23), and
+        # energy/radiation_escaped when energy/radiation_escaped_step exists
+        # (2026-08-30); older series are per-step.
+        marshak_cumulative = "energy/marshak_in_step" in handle
+        escaped_cumulative = "energy/radiation_escaped_step" in handle
     if not (t_hist.size == marshak.size == escaped.size):
         stop(f"{path}: t, {marshak_name}, and {escaped_name} lengths differ")
     if t_hist.size == 0:
@@ -306,7 +312,9 @@ def read_history_energy(run_dir: Path, t_snapshot_s: np.ndarray, face_area_cm2: 
     if t_hist.size > 1 and np.any(np.diff(t_hist) < 0.0):
         stop(f"{path}: history t is not monotone")
 
-    net_cumulative_erg = np.cumsum(marshak - escaped)
+    marshak_total = marshak if marshak_cumulative else np.cumsum(marshak)
+    escaped_total = escaped if escaped_cumulative else np.cumsum(escaped)
+    net_cumulative_erg = marshak_total - escaped_total
     if t_hist[0] > 0.0:
         t_hist = np.concatenate(([0.0], t_hist))
         net_cumulative_erg = np.concatenate(([0.0], net_cumulative_erg))

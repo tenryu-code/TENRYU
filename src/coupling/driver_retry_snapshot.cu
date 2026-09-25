@@ -84,6 +84,10 @@ __global__ void snapshot_table_copy_kernel(
 
 constexpr std::size_t kArenaAlignment = alignof(unsigned long long);
 constexpr int kSnapshotCopyBlockSize = 256;
+// Entries are copied in chunks of this size, one block per chunk (a block
+// per entry left a multi-MB FLD work array to a single SM). Multiple of the
+// word size, so a chunk of an aligned entry stays aligned.
+constexpr std::size_t kSnapshotChunkBytes = 64U * 1024U;
 
 std::size_t align_arena_offset(const std::size_t offset) {
   return (offset + kArenaAlignment - 1U) &
@@ -146,6 +150,9 @@ void enumerate_snapshot_fields(
   TENRYU_SNAPSHOT_FIELD(gas_tracer_Y);
   TENRYU_SNAPSHOT_FIELD(cv_e);
   TENRYU_SNAPSHOT_FIELD(cv_i);
+  // Cold-equilibrium reference energy C (the budget's internal energy is
+  // rho (ee + e_cold) V): rolled back with ee (2026-09-23).
+  TENRYU_SNAPSHOT_FIELD(e_cold);
   TENRYU_SNAPSHOT_FIELD(cs);
   TENRYU_SNAPSHOT_FIELD(mass_per_material);
   TENRYU_SNAPSHOT_FIELD(Ee_per_material);
@@ -312,11 +319,28 @@ void upload_snapshot_table(DriverRetrySnapshot& snap) {
   std::vector<SnapshotCopyDesc> copy_table;
   copy_table.reserve(snap.entries.size());
   for (const auto& entry : snap.entries) {
-    copy_table.push_back(
-        {static_cast<const char*>(entry.field_ptr),
-         static_cast<unsigned long long>(entry.offset),
-         static_cast<unsigned long long>(entry.bytes)});
+    for (std::size_t start = 0; start < entry.bytes; start += kSnapshotChunkBytes) {
+      const std::size_t bytes =
+          (entry.bytes - start < kSnapshotChunkBytes) ? (entry.bytes - start)
+                                                      : kSnapshotChunkBytes;
+      copy_table.push_back(
+          {static_cast<const char*>(entry.field_ptr) + start,
+           static_cast<unsigned long long>(entry.offset + start),
+           static_cast<unsigned long long>(bytes)});
+    }
   }
+  if (copy_table.size() > snap.table_capacity) {
+    if (snap.d_table != nullptr) {
+      cuda_check(cudaFree(snap.d_table),
+                 "driver retry snapshot table cudaFree failed");
+    }
+    cuda_check(cudaMalloc(&snap.d_table, copy_table.size() * sizeof(SnapshotCopyDesc)),
+               "driver retry snapshot table cudaMalloc failed");
+    snap.table_capacity = copy_table.size();
+  }
+  TENRYU_ASSERT(copy_table.size() <= static_cast<std::size_t>(std::numeric_limits<int>::max()),
+                "driver retry snapshot copy table exceeds the kernel grid limit");
+  snap.copy_blocks = copy_table.size();
   if (!copy_table.empty()) {
     cuda_check(cudaMemcpy(snap.d_table,
                           copy_table.data(),
@@ -341,6 +365,15 @@ DriverRetrySnapshot::~DriverRetrySnapshot() {
   }
   if (d_arena != nullptr) {
     static_cast<void>(cudaFree(d_arena));
+  }
+  if (d_sn_psi_prev != nullptr) {
+    static_cast<void>(cudaFree(d_sn_psi_prev));
+  }
+  if (d_sn_psi_sd_prev != nullptr) {
+    static_cast<void>(cudaFree(d_sn_psi_sd_prev));
+  }
+  if (d_sn_ee_node_offset != nullptr) {
+    static_cast<void>(cudaFree(d_sn_ee_node_offset));
   }
 }
 
@@ -436,6 +469,44 @@ void capture_driver_retry_snapshot(DriverRetrySnapshot& snap,
   snap.N_burn_neutrons_dd = state.N_burn_neutrons_dd;
   snap.burn_mc_live = state.burn_mc_live;
   snap.hot_e_eps_cum_host = state.hot_e_eps_cum_host;
+  snap.sn_psi_prev_count = state.sn_psi_prev.size();
+  if (snap.sn_psi_prev_count > snap.sn_psi_prev_capacity) {
+    if (snap.d_sn_psi_prev != nullptr) {
+      cuda_check(cudaFree(snap.d_sn_psi_prev),
+                 "driver retry snapshot sn_psi_prev cudaFree failed");
+      snap.d_sn_psi_prev = nullptr;
+    }
+    cuda_check(cudaMalloc(&snap.d_sn_psi_prev, snap.sn_psi_prev_count * sizeof(double)),
+               "driver retry snapshot sn_psi_prev cudaMalloc failed");
+    snap.sn_psi_prev_capacity = snap.sn_psi_prev_count;
+  }
+  if (snap.sn_psi_prev_count > 0) {
+    cuda_check(cudaMemcpy(snap.d_sn_psi_prev, state.sn_psi_prev.data(),
+                          snap.sn_psi_prev_count * sizeof(double), cudaMemcpyDeviceToDevice),
+               "driver retry snapshot sn_psi_prev capture failed");
+  }
+  const auto capture_sized = [](void*& d, std::size_t& count, std::size_t& capacity,
+                                  const double* src, const std::size_t n, const char* what) {
+    count = n;
+    if (count > capacity) {
+      if (d != nullptr) {
+        cuda_check(cudaFree(d), what);
+        d = nullptr;
+      }
+      cuda_check(cudaMalloc(&d, count * sizeof(double)), what);
+      capacity = count;
+    }
+    if (count > 0) {
+      cuda_check(cudaMemcpy(d, src, count * sizeof(double), cudaMemcpyDeviceToDevice), what);
+    }
+  };
+  capture_sized(snap.d_sn_psi_sd_prev, snap.sn_psi_sd_prev_count, snap.sn_psi_sd_prev_capacity,
+                state.sn_psi_sd_prev.data(), state.sn_psi_sd_prev.size(),
+                "driver retry snapshot sn_psi_sd_prev capture failed");
+  capture_sized(snap.d_sn_ee_node_offset, snap.sn_ee_node_offset_count,
+                snap.sn_ee_node_offset_capacity, state.sn_ee_node_offset.data(),
+                state.sn_ee_node_offset.size(),
+                "driver retry snapshot sn_ee_node_offset capture failed");
   snap.E_hot_e_deposited = state.E_hot_e_deposited;
   snap.E_hot_e_escaped = state.E_hot_e_escaped;
   snap.hot_e_enabled_any = state.hot_e_enabled_any;
@@ -455,32 +526,15 @@ void capture_driver_retry_snapshot(DriverRetrySnapshot& snap,
     snap.arena_bytes = required_arena_bytes;
   }
 
-  if (snap.entries.size() > snap.table_capacity) {
-    if (snap.d_table != nullptr) {
-      cuda_check(cudaFree(snap.d_table),
-                 "driver retry snapshot table cudaFree failed");
-    }
-    cuda_check(cudaMalloc(
-                   &snap.d_table,
-                   snap.entries.size() * sizeof(SnapshotCopyDesc)),
-               "driver retry snapshot table cudaMalloc failed");
-    snap.table_capacity = snap.entries.size();
-    snap.table_dirty = true;
-  }
-
   upload_snapshot_table(snap);
 
-  TENRYU_ASSERT(
-      snap.entries.size() <=
-          static_cast<std::size_t>(std::numeric_limits<int>::max()),
-      "driver retry snapshot entry count exceeds kernel limit");
-  if (!snap.entries.empty()) {
-    snapshot_table_copy_kernel<<<static_cast<int>(snap.entries.size()),
+  if (snap.copy_blocks > 0) {
+    snapshot_table_copy_kernel<<<static_cast<int>(snap.copy_blocks),
                                  kSnapshotCopyBlockSize,
                                  0,
                                  stream>>>(
         static_cast<const SnapshotCopyDesc*>(snap.d_table),
-        static_cast<int>(snap.entries.size()),
+        static_cast<int>(snap.copy_blocks),
         true,
         static_cast<char*>(snap.d_arena));
     cuda_check(cudaGetLastError(),
@@ -520,6 +574,7 @@ void capture_driver_retry_snapshot(DriverRetrySnapshot& snap,
   snap.E_floor_injected = state.E_floor_injected;
   snap.E_pdV_bdry = state.E_pdV_bdry;
   snap.E_Marshak_in = state.E_Marshak_in;
+  snap.E_volume_in = state.E_volume_in;
   snap.E_solver = state.E_solver;
   snap.state_supply_dM_cumulative = state.state_supply_dM_cumulative;
   snap.state_supply_dE_cumulative = state.state_supply_dE_cumulative;
@@ -683,13 +738,13 @@ void restore_driver_retry_snapshot(tenryu::core::State& state,
   }
   upload_snapshot_table(snap);
 
-  if (!snap.entries.empty()) {
-    snapshot_table_copy_kernel<<<static_cast<int>(snap.entries.size()),
+  if (snap.copy_blocks > 0) {
+    snapshot_table_copy_kernel<<<static_cast<int>(snap.copy_blocks),
                                  kSnapshotCopyBlockSize,
                                  0,
                                  stream>>>(
         static_cast<const SnapshotCopyDesc*>(snap.d_table),
-        static_cast<int>(snap.entries.size()),
+        static_cast<int>(snap.copy_blocks),
         false,
         static_cast<char*>(snap.d_arena));
     cuda_check(cudaGetLastError(),
@@ -713,6 +768,30 @@ void restore_driver_retry_snapshot(tenryu::core::State& state,
   state.N_burn_neutrons_dd = snap.N_burn_neutrons_dd;
   state.burn_mc_live = snap.burn_mc_live;
   state.hot_e_eps_cum_host = snap.hot_e_eps_cum_host;
+  if (state.sn_psi_prev.size() != snap.sn_psi_prev_count) {
+    state.sn_psi_prev.reset(snap.sn_psi_prev_count);
+  }
+  if (snap.sn_psi_prev_count > 0) {
+    cuda_check(cudaMemcpy(state.sn_psi_prev.data(), snap.d_sn_psi_prev,
+                          snap.sn_psi_prev_count * sizeof(double), cudaMemcpyDeviceToDevice),
+               "driver retry snapshot sn_psi_prev restore failed");
+  }
+  if (state.sn_psi_sd_prev.size() != snap.sn_psi_sd_prev_count) {
+    state.sn_psi_sd_prev.reset(snap.sn_psi_sd_prev_count);
+  }
+  if (snap.sn_psi_sd_prev_count > 0) {
+    cuda_check(cudaMemcpy(state.sn_psi_sd_prev.data(), snap.d_sn_psi_sd_prev,
+                          snap.sn_psi_sd_prev_count * sizeof(double), cudaMemcpyDeviceToDevice),
+               "driver retry snapshot sn_psi_sd_prev restore failed");
+  }
+  if (state.sn_ee_node_offset.size() != snap.sn_ee_node_offset_count) {
+    state.sn_ee_node_offset.reset(snap.sn_ee_node_offset_count);
+  }
+  if (snap.sn_ee_node_offset_count > 0) {
+    cuda_check(cudaMemcpy(state.sn_ee_node_offset.data(), snap.d_sn_ee_node_offset,
+                          snap.sn_ee_node_offset_count * sizeof(double), cudaMemcpyDeviceToDevice),
+               "driver retry snapshot sn_ee_node_offset restore failed");
+  }
   state.E_hot_e_deposited = snap.E_hot_e_deposited;
   state.E_hot_e_escaped = snap.E_hot_e_escaped;
   state.hot_e_enabled_any = snap.hot_e_enabled_any;
@@ -762,6 +841,7 @@ void restore_driver_retry_snapshot(tenryu::core::State& state,
   state.E_floor_injected = snap.E_floor_injected;
   state.E_pdV_bdry = snap.E_pdV_bdry;
   state.E_Marshak_in = snap.E_Marshak_in;
+  state.E_volume_in = snap.E_volume_in;
   state.E_solver = snap.E_solver;
   state.state_supply_dM_cumulative = snap.state_supply_dM_cumulative;
   state.state_supply_dE_cumulative = snap.state_supply_dE_cumulative;

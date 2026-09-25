@@ -9,6 +9,7 @@ add_library(tenryu_radiation STATIC
   sn_transport_1d_gpu.cu
   sn_transport_2d_gpu.cu
   sn_dsa_1d_gpu.cu
+  sn_ld_1d_gpu.cu
   sn_material_newton_gpu.cu
   holo_lo_state.cu
   mode_selector.cpp
@@ -26,6 +27,7 @@ add_library(tenryu_radiation STATIC
   ddmc_transport_2d_gpu.cu
   rw_transport_gpu.cu
   fld_1d_gpu.cu
+  material_electron_eos_1d.cu
   fld_2d_rz_gpu.cu
   fld_substage_audit_drain.cpp
   amgx_solver.cpp

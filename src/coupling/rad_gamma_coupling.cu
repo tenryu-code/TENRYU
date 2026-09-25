@@ -9,8 +9,10 @@
 #include <stdexcept>
 #include <string>
 
+#include <cub/device/device_reduce.cuh>
 #include <cuda_runtime.h>
 
+#include "core/deterministic_sum.hpp"
 #include "core/device_scratch.hpp"
 #include "core/kernel_guard.hpp"
 
@@ -64,7 +66,7 @@ __global__ void gamma_r_43_work_update_kernel(
     const int c_begin,
     const int c_end,
     const int n_groups,
-    double* __restrict__ floor_sum) {
+    double* __restrict__ floor_cells) {
   const int c = c_begin + blockIdx.x * blockDim.x + threadIdx.x;
   if (c >= c_end) {
     return;
@@ -72,7 +74,8 @@ __global__ void gamma_r_43_work_update_kernel(
 
   // The body does not use n_cells; c_end bounds this launch window.
   gamma_r_43_work_update_kernel_body(c, rad_E, W_r, vol_before, vol_after,
-                                     c_end, n_groups, floor_sum);
+                                     c_end, n_groups, nullptr,
+                                     floor_cells + (c - c_begin));
 }
 
 __global__ void radiation_pressure_field_kernel(
@@ -127,12 +130,18 @@ double apply_gamma_r_43_work_update(double* rad_E,
   d_floor_sum = static_cast<double*>(core::device_scratch_acquire(
       "rad_gamma_coupling:apply_gamma_r_43_work_update:d_floor_sum",
       sizeof(double)));
-  rg_cuda_check(cudaMemset(d_floor_sum, 0, sizeof(double)),
+  // Per-cell floor slots summed in a fixed order: the ledger is bitwise from
+  // run to run (2026-09-24; an atomicAdd accumulation before).
+  double* d_floor_cells = static_cast<double*>(core::device_scratch_acquire(
+      "rad_gamma_coupling:apply_gamma_r_43_work_update:d_floor_cells",
+      static_cast<std::size_t>(n_window) * sizeof(double)));
+  rg_cuda_check(cudaMemset(d_floor_cells, 0, static_cast<std::size_t>(n_window) * sizeof(double)),
                 "rad_gamma: work update floor cudaMemset failed");
   const int blocks = (n_window + 255) / 256;
   gamma_r_43_work_update_kernel<<<blocks, 256>>>(
       rad_E, W_r, vol_before, vol_after, c_begin, c_end, n_groups,
-      d_floor_sum);
+      d_floor_cells);
+  core::deterministic_sum(d_floor_cells, n_window, d_floor_sum, false);
   rg_sync("rad_gamma: work update kernel failed");
 
   double floor_sum = 0.0;
@@ -140,6 +149,29 @@ double apply_gamma_r_43_work_update(double* rad_E,
                            cudaMemcpyDeviceToHost),
                 "rad_gamma: work update floor copy failed");
   return floor_sum;
+}
+
+double sum_gamma_r_43_work(const double* W_r, const int c_begin,
+                          const int c_end) {
+  const int n_window = c_end - c_begin;
+  if (W_r == nullptr || n_window <= 0) {
+    return 0.0;
+  }
+  double* d_sum = static_cast<double*>(core::device_scratch_acquire(
+      "rad_gamma_coupling:sum_gamma_r_43_work:d_sum", sizeof(double)));
+  std::size_t temp_bytes = 0U;
+  rg_cuda_check(cub::DeviceReduce::Sum(nullptr, temp_bytes, W_r + c_begin,
+                                       d_sum, n_window),
+                "rad_gamma: work sum size query failed");
+  void* d_temp = core::device_scratch_acquire(
+      "rad_gamma_coupling:sum_gamma_r_43_work:d_temp", temp_bytes);
+  rg_cuda_check(cub::DeviceReduce::Sum(d_temp, temp_bytes, W_r + c_begin,
+                                       d_sum, n_window),
+                "rad_gamma: work sum failed");
+  double sum = 0.0;
+  rg_cuda_check(cudaMemcpy(&sum, d_sum, sizeof(double), cudaMemcpyDeviceToHost),
+                "rad_gamma: work sum copy failed");
+  return sum;
 }
 
 void compute_radiation_pressure_field(double* p_r,

@@ -31,7 +31,8 @@ __device__ inline DeviceColdInverseResult device_cold_inverse_reclose(
   const auto ee_base = [&](const double T) { return device_eos_energy_base(tab, rb, log(T)); };
   const auto cv_base = [&](const double T) { return device_eos_cv_base(tab, rb, log(T)); };
   const ColdInverseResult inv =
-      cold_inverse_Te(cold, rho, qe_target, T_lo, T_hi, 0.0, ee_base, cv_base);
+      cold_inverse_Te(cold, rho, qe_target, T_lo, T_hi, 0.0, ee_base, cv_base, tab.log_T_grid,
+                      tab.n_T);
   const double T = inv.T;
   const double logT = log(fmax(T, 1.0e-30));
   const ColdElectronState s = cold_electron_forward(

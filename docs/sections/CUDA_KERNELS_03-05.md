@@ -374,19 +374,13 @@ __global__ void map_hydro_to_laser_1d_kernel(
     int n_nodes_total, int n_nodes_z, int n_cells,
     /* n_crit, ghost corona, critical reconstruction, clip scalars */
 );
-
-__global__ void ema_smooth_n_hat_kernel(
-    double* __restrict__ n_hat,              // [N_LM] in/out clipped n_e/n_crit
-    const double* __restrict__ prev_n_hat,   // [N_LM] previous clipped n_e/n_crit
-    int n_nodes_total
-);
 ```
 
 - **block**: 256, **grid**: `(N_LM_nodes+255)/256`
 - **処理**: 各LaserMeshノードの(R,Z)座標に対応するHydroMeshセルを特定し、双線形補間（NUMERICS §5.2）
-  - 1D_SPH: `idx = blockIdx.x * blockDim.x + threadIdx.x`、`i = idx / n_nodes_z`、`j = idx % n_nodes_z`。`r = sqrt(R² + Z²)` で1D球メッシュの対応セルを device-side 二分探索し、密度正規化、edge-anchored log reconstruction、ghost corona、critical clip を各ノードで評価する。出力は LaserMesh device arrays に直接書き込む（host側の節点フィールド生成とH2D転送は行わない）
+  - 1D_SPH: `idx = blockIdx.x * blockDim.x + threadIdx.x`、`i = idx / n_nodes_z`、`j = idx % n_nodes_z`。`r = sqrt(R² + Z²)` で1D球メッシュの対応セルを device-side 二分探索し、密度正規化、臨界隣接セル対の対数線形プロファイル（NUMERICS §5.7.3(a)）、ghost corona、critical clip を各ノードで評価する。出力は LaserMesh device arrays に直接書き込む（host側の節点フィールド生成とH2D転送は行わない）
   - 2D_RZ: LaserMeshとHydroMeshが同じRZ座標系 → 直接的な双線形補間
-- **EMA**: 1D_SPH near-critical smoothing は `ema_smooth_n_hat_kernel` で実行する。条件は `cur > 0.3 && prev > 0.3 && |cur-prev| < 0.01`、係数は `α=0.05`。`prev_n_hat` は LaserMesh device buffer に保持し、mesh size change/release で無効化する
+- **step 間平滑化なし**: 1D_SPH の clipped \(\hat n\) は写像した値そのもの（`ema_smooth_n_hat_radial_kernel` は 2026-09-24 に撤去、NUMERICS §5.7.4）
 - **レジスタ**: ~15（補間重み4、HydroMeshセルインデックス、一時変数）
 - **メモリ**: HydroMesh フィールドへの読み込みは scattered（各 LaserMesh ノードが異なる HydroMesh セルを参照）。`__ldg()` で L2 キャッシュ活用
 
@@ -547,6 +541,7 @@ void ray_trace_2d(
 ```
 
 - **block**: 64, **grid**: `(n_rays+63)/64`
+  - 1D_SPH の `ray_trace_1d_sph` は `__launch_bounds__(64)` のまま 32 スレッド（1 warp）/block で起動する（2026-09-24）。レイは前回のトレースの step 数の降順に並ぶので長いレイが先頭の warp に集まり、1 warp/block にするとそれらが別々の SM に載って、FP64 演算器の少ない GPU で同じ SM の演算器を奪い合わない（GXII 300 step の kernel 時間 36.2 → 34.8 ms/step、RTX 4090）。レイ別集約も同じ block で起動する。
 - **n_rays の決定**（NUMERICS §5.6.3、SPECIFICATION §6.4.6 `rays_per_beam` 参照）：
   - **1D_SPH**（L3 `ray_trace_2d`）：`n_rays = Σ_beams rays_per_beam`。各ビームの `rays_per_beam` 本のレイを R 方向に等間隔配置（NUMERICS §5.6.3(a)）
   - **2D_RZ**（L4 `ray_trace_3d`）：`n_rays = Σ_beams N_eff(beam)`。各ビームの `rays_per_beam = N` は断面2D格子の1辺あたりの本数。円形アパーチャにより実効本数 `N_eff ≈ π/4 × N²`（NUMERICS §5.6.3(b)）

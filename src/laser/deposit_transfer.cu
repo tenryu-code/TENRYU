@@ -393,17 +393,35 @@ AllowedSupercriticalCell1D find_allowed_supercritical_cell_1d_impl(
 
   std::vector<double> n_hat_cell(n_cells, 0.0);
   int outermost_real = -1;
-  bool any_subcritical_real = false;
+  int outermost_supercritical_real = -1;
   for (std::size_t c = 0; c < n_cells; ++c) {
     if (!cell_is_void.empty() && cell_is_void[c] != 0U) {
       continue;
     }
     outermost_real = static_cast<int>(c);
     n_hat_cell[c] = compute_cell_n_hat_approx(rho[c], zbar[c], A_eff[c], n_crit);
-    any_subcritical_real = any_subcritical_real || (n_hat_cell[c] < 1.0);
+    if (n_hat_cell[c] >= 1.0) {
+      outermost_supercritical_real = static_cast<int>(c);
+    }
   }
   if (outermost_real < 0) {
     return {};
+  }
+  // The laser enters from outside and turns at the outermost critical layer,
+  // so only real cells outside the outermost supercritical cell can receive
+  // its power. Subcritical cells it shields (the gas inside a shell) do not
+  // count: with them counted, a gas-filled shell with an outer void had no
+  // receiver, its ghost-corona power was searched inward past the shell into
+  // the gas, and its surface deposit escaped.
+  bool any_subcritical_real = false;
+  for (int c = outermost_supercritical_real + 1; c <= outermost_real; ++c) {
+    if (!cell_is_void.empty() && cell_is_void[static_cast<std::size_t>(c)] != 0U) {
+      continue;
+    }
+    if (n_hat_cell[static_cast<std::size_t>(c)] < 1.0) {
+      any_subcritical_real = true;
+      break;
+    }
   }
 
   const CriticalSurfaceEstimate1D crit_est = estimate_critical_surface_1d(n_hat_cell, r_edges);

@@ -7,20 +7,35 @@
 
 namespace tenryu::burn {
 
+// Stopping medium of the range fit relative to equimolar DT (NUMERICS
+// §14.3): fe scales the electron term (electrons per unit mass), fi the ion
+// term (sum of Z^2/A per unit mass). Equimolar DT is fe = fi = 1.
+struct FraleyRangeMedium {
+  double fe = 1.0;
+  double fi = 1.0;
+};
+
 // rho*lambda for the 3.540 MeV DT alpha [g/cm^2]; Te in keV, rho in g/cm^3.
 // Fraley 1974 fit 3d (+-2% vs the integrated stopping, 1-100 keV, at solid
 // DT rho0=0.213) times the electron-term Coulomb-log density scaling from
 // Fraley 3b; reproduces Fraley's stated range enhancement delta(rho)=1->3
 // for solid->1e4 g/cm^3 above 10 keV (2.92 at 10 keV, 1e4 g/cm^3).
-TENRYU_HOST_DEVICE inline double alpha_rho_lambda(double Te_keV,
-                                                   double rho_gcc) {
+// The fit is 1/(rho lambda) = S_e + S_i with S_e = 1/(1.5e-2 T^{5/4})
+// (electrons) and S_i = 8.2e-3/1.5e-2 (ions); another medium scales them
+// to fe S_e + fi S_i, and its electron density enters the Coulomb-log
+// density scaling as the DT-equivalent density fe rho.
+TENRYU_HOST_DEVICE inline double alpha_rho_lambda(
+    double Te_keV, double rho_gcc,
+    const FraleyRangeMedium medium = FraleyRangeMedium{}) {
   const double kRho0 = 0.213;
   double Te = (Te_keV > 0.1) ? Te_keV : 0.1;
   const double Te54 = pow(Te, 1.25);
-  const double base = 1.5e-2 * Te54 / (1.0 + 8.2e-3 * Te54);
+  const double base =
+      1.5e-2 * Te54 / (medium.fe + (medium.fi * 8.2e-3) * Te54);
   const double rho = (rho_gcc > 1.0e-12) ? rho_gcc : 1.0e-12;
+  const double rho_e = medium.fe * rho;
   double num = 1.0 + 0.17 * log(Te);
-  double den = 1.0 + 0.17 * log(Te * sqrt(kRho0 / rho));
+  double den = 1.0 + 0.17 * log(Te * sqrt(kRho0 / rho_e));
   num = (num > 0.15) ? num : 0.15;
   den = (den > 0.15) ? den : 0.15;
   return base * (num / den);

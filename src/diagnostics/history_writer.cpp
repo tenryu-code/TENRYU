@@ -1,4 +1,5 @@
 #include "diagnostics/history_writer.hpp"
+#include "core/hdf5_mutex.hpp"
 #include "core/nvtx_range.hpp"
 
 #include <algorithm>
@@ -89,6 +90,51 @@ void warn_h5_close_failure(const herr_t status, const char* op, const char* cont
   if (status < 0) {
     core::log_warning(std::string("[WARN] ") + op + " failed in " + context);
   }
+}
+
+// Opens the history file in place for one append batch, creating it on first
+// use; the batch closes it again, so between batches the file on disk is
+// complete and other processes can read it. Nothing copies the file: the
+// former copy-then-rename per batch cost O(file size) each time, quadratic in
+// the run length (2026-09-23). HDF5 file locking is off for this handle so a
+// reader holding the file open neither blocks nor aborts the run (it can see
+// a batch half written and must reopen). A process killed during a batch's
+// write can leave the file unreadable, which the copy used to prevent: such a
+// file is moved aside (<name>.unreadable-<n>) and a new history file starts.
+hid_t open_history_for_append(const std::string& path, const char* context) {
+  const hid_t fapl = H5Pcreate(H5P_FILE_ACCESS);
+  TENRYU_ASSERT(fapl >= 0, "HistoryWriter H5Pcreate(file access) failed");
+#if H5_VERSION_GE(1, 12, 1) || \
+    (H5_VERS_MAJOR == 1 && H5_VERS_MINOR == 10 && H5_VERS_RELEASE >= 7)
+  warn_h5_close_failure(H5Pset_file_locking(fapl, false, true), "H5Pset_file_locking",
+                        "HistoryWriter::open_history_for_append");
+#endif
+  hid_t file = -1;
+  if (std::filesystem::exists(path)) {
+    file = H5Fopen(path.c_str(), H5F_ACC_RDWR, fapl);
+    if (file < 0) {
+      std::string aside;
+      for (int n = 0;; ++n) {
+        aside = path + ".unreadable-" + std::to_string(n);
+        if (!std::filesystem::exists(aside)) {
+          break;
+        }
+      }
+      std::error_code ec;
+      std::filesystem::rename(path, aside, ec);
+      core::log_error("HistoryWriter: history file '" + path + "' could not be opened for " +
+                      context + "; moved to '" + aside + "'" +
+                      (ec ? " (move failed: " + ec.message() + ")" : std::string()) +
+                      " and a new history file is started");
+    }
+  }
+  if (file < 0) {
+    file = H5Fcreate(path.c_str(), H5F_ACC_TRUNC, H5P_DEFAULT, fapl);
+  }
+  warn_h5_close_failure(H5Pclose(fapl), "H5Pclose", "HistoryWriter::open_history_for_append");
+  TENRYU_ASSERT(file >= 0, std::string("HistoryWriter failed to open/create history file for ") +
+                               context + ": " + path);
+  return file;
 }
 
 void ensure_parent_groups(const HistoryAppendFile& file, const std::string& dataset_path) {
@@ -2597,7 +2643,6 @@ HistoryWriter::PendingHistoryRecord HistoryWriter::build_pending_record(
   rec.center_perturbation_enabled = center_perturbation_enabled_;
   rec.E_laser_deposited = state.E_laser_deposited;
   rec.E_laser_escaped = state.E_laser_escaped;
-  rec.E_rad_escaped = state.E_rad_escaped;
   rec.E_laser_incident = state.E_laser_incident;
   rec.E_ra_deposited = state.E_ra_deposited;
   rec.E_cbet_iaw_step = state.E_cbet_iaw_step;
@@ -2667,29 +2712,24 @@ HistoryWriter::PendingHistoryRecord HistoryWriter::build_pending_record(
   rec.ale_rezone_invocations = state.ale_rezone_invocations;
   rec.snapshot = snapshot;
   rec.snapshot.ale_provenance = nullptr;
+  if (!rec.snapshot.energy_cumulative.valid) {
+    auto& cum = rec.snapshot.energy_cumulative;
+    cum.valid = true;
+    cum.marshak_in = state.E_Marshak_in;
+    cum.volume_in = state.E_volume_in;
+    cum.radiation_escaped = state.E_rad_escaped;
+    cum.numerical_loss = state.E_numerical_loss;
+    cum.pdv_boundary = state.E_pdV_bdry;
+    cum.floor_injected = state.E_floor_injected;
+    cum.safety_injected = state.E_safety;
+    cum.solver_residual = state.E_solver;
+  }
   if (snapshot.ale_provenance != nullptr) {
     rec.has_ale_provenance = true;
     rec.ale_provenance_values =
         build_ale_provenance_values(*snapshot.ale_provenance, rec.step);
   }
-  if (rec.dt_breakdown_history_enabled) {
-    rec.per_row_mass_values = compute_per_row_mass_values(state);
-    rec.corner_bc_audit_values =
-        compute_corner_bc_audit_values(state, snapshot.dt_breakdown);
-    if (state.mesh.dim == 2) {
-      AvMaxHistoryValues values{};
-      values.step = state.step;
-      values.t = state.t;
-      values.cell_id = state.av_max_cell_id;
-      values.i = state.av_max_i;
-      values.j = state.av_max_j;
-      values.q_visc_max = state.av_q_visc_max;
-      values.rho_at_max = state.av_rho_at_max;
-      values.cs_at_max = state.av_cs_at_max;
-      values.delta_u_at_max = state.av_delta_u_at_max;
-      rec.av_max_values = values;
-    }
-  }
+  fill_dt_breakdown_group_values(state, rec);
   const std::size_t n = state.rho.size();
   if (state.mesh.dim == 1 && n > 0 &&
       n <= static_cast<std::size_t>(std::numeric_limits<int>::max()) &&
@@ -2709,6 +2749,59 @@ HistoryWriter::PendingHistoryRecord HistoryWriter::build_pending_record(
   }
   rec.tri_fan_center_perturbation_diag = state.tri_fan_center_perturbation_diag;
   return rec;
+}
+
+void HistoryWriter::fill_dt_breakdown_group_values(const core::State& state,
+                                                   PendingHistoryRecord& rec) const {
+  if (!rec.dt_breakdown_history_enabled) {
+    return;
+  }
+  rec.per_row_mass_values = compute_per_row_mass_values(state);
+  rec.corner_bc_audit_values =
+      compute_corner_bc_audit_values(state, rec.snapshot.dt_breakdown);
+  if (state.mesh.dim == 2) {
+    AvMaxHistoryValues values{};
+    values.step = state.step;
+    values.t = state.t;
+    values.cell_id = state.av_max_cell_id;
+    values.i = state.av_max_i;
+    values.j = state.av_max_j;
+    values.q_visc_max = state.av_q_visc_max;
+    values.rho_at_max = state.av_rho_at_max;
+    values.cs_at_max = state.av_cs_at_max;
+    values.delta_u_at_max = state.av_delta_u_at_max;
+    rec.av_max_values = values;
+  }
+}
+
+void HistoryWriter::write_dt_breakdown_groups(const HistoryAppendFile& file,
+                                              const PendingHistoryRecord& rec) const {
+  if (!rec.dt_breakdown_history_enabled) {
+    return;
+  }
+  const auto& dt = rec.snapshot.dt_breakdown;
+  // In 1D the dt-breakdown groups also hold the steps between full rows, so
+  // the full row's check on the top-level t does not cover them: a restart
+  // re-emits steps already on file, and a row that is not after the group's
+  // last t_s is skipped here.
+  if (cfg_.main.dim == 1 && dt.valid) {
+    const auto last_t =
+        last_scalar_double_if_exists(file, "/diagnostics/dt_breakdown_history/t_s");
+    if (last_t.has_value() && !(dt.t_s > *last_t)) {
+      return;
+    }
+  }
+  write_dt_breakdown_history(file, dt);
+  write_cfl_winner_history(file, dt);
+  if (rec.corner_bc_audit_values.has_value()) {
+    write_corner_bc_audit_history(file, *rec.corner_bc_audit_values);
+  }
+  if (rec.per_row_mass_values.has_value()) {
+    write_per_row_mass_history(file, *rec.per_row_mass_values);
+  }
+  if (rec.av_max_values.has_value()) {
+    write_av_max_history(file, *rec.av_max_values);
+  }
 }
 
 void HistoryWriter::write_per_row_mass_history(
@@ -3460,12 +3553,7 @@ void append_ale_provenance_final_to_history_file(
       !ale_state_enabled) {
     return;
   }
-  const bool exists = std::filesystem::exists(history_path);
-  const hid_t file =
-      exists ? H5Fopen(history_path.c_str(), H5F_ACC_RDWR, H5P_DEFAULT)
-             : H5Fcreate(history_path.c_str(), H5F_ACC_TRUNC, H5P_DEFAULT, H5P_DEFAULT);
-  TENRYU_ASSERT(file >= 0,
-                "HistoryWriter failed to open history file for final ALE provenance");
+  const hid_t file = open_history_for_append(history_path, "the final ALE provenance");
   if (ale_provenance_enabled) {
     write_ale_provenance_history(file, obs, time, step);
     write_material_interface_history(file, obs, cfg, time, step);
@@ -3540,9 +3628,22 @@ HistoryWriter::~HistoryWriter() noexcept {
   } catch (...) {
     core::log_warning("HistoryWriter: suppressed exception during destructor flush");
   }
+#if TENRYU_ENABLE_HDF5
+  if (batch_worker_.joinable()) {
+    {
+      const std::lock_guard<std::mutex> lock(batch_mutex_);
+      batch_stop_ = true;
+    }
+    batch_cv_.notify_all();
+    batch_worker_.join();
+  }
+#endif
 }
 
 void HistoryWriter::init(const core::Config& cfg, const std::string& output_dir) {
+#if TENRYU_ENABLE_HDF5
+  wait_for_batches();
+#endif
   cfg_ = cfg;
   append_flush_every_ = 64;
   if (const char* value = std::getenv("TENRYU_HISTORY_APPEND_EVERY");
@@ -3608,39 +3709,10 @@ void HistoryWriter::append_radial_fourier_audit(
   flush_pending();
 
 #if TENRYU_ENABLE_HDF5
-  const std::filesystem::path history_path(path_);
-  const std::filesystem::path temp_path = history_path.string() + ".tmp";
-  const bool exists = std::filesystem::exists(history_path);
-  std::error_code remove_tmp_ec;
-  std::filesystem::remove(temp_path, remove_tmp_ec);
-  if (exists) {
-    TENRYU_ASSERT(std::filesystem::copy_file(history_path,
-                                             temp_path,
-                                             std::filesystem::copy_options::overwrite_existing),
-                  "HistoryWriter failed to stage history file copy for radial Fourier append");
-  }
-  const hid_t file =
-      exists ? H5Fopen(temp_path.string().c_str(), H5F_ACC_RDWR, H5P_DEFAULT)
-             : H5Fcreate(temp_path.string().c_str(),
-                         H5F_ACC_TRUNC,
-                         H5P_DEFAULT,
-                         H5P_DEFAULT);
-  TENRYU_ASSERT(file >= 0,
-                "HistoryWriter failed to open/create history file for radial Fourier audit");
-
+  const hid_t file = open_history_for_append(path_, "the radial Fourier audit");
   write_radial_fourier_audit_history(file, record);
-
   warn_h5_close_failure(H5Fclose(file), "H5Fclose",
                         "HistoryWriter::append_radial_fourier_audit(finalize)");
-  try {
-    std::filesystem::rename(temp_path, history_path);
-  } catch (const std::filesystem::filesystem_error& e) {
-    core::log_error("HistoryWriter: transactional rename failed from '" +
-                    temp_path.string() + "' to '" + history_path.string() +
-                    "': " + e.what());
-    std::error_code cleanup_ec;
-    std::filesystem::remove(temp_path, cleanup_ec);
-  }
 #endif
 }
 
@@ -3656,43 +3728,12 @@ void HistoryWriter::append_radial_fourier_complex_audit(
   flush_pending();
 
 #if TENRYU_ENABLE_HDF5
-  const std::filesystem::path history_path(path_);
-  const std::filesystem::path temp_path = history_path.string() + ".tmp";
-  const bool exists = std::filesystem::exists(history_path);
-  std::error_code remove_tmp_ec;
-  std::filesystem::remove(temp_path, remove_tmp_ec);
-  if (exists) {
-    TENRYU_ASSERT(
-        std::filesystem::copy_file(
-            history_path,
-            temp_path,
-            std::filesystem::copy_options::overwrite_existing),
-        "HistoryWriter failed to stage history file copy for radial Fourier v2 append");
-  }
-  const hid_t file =
-      exists ? H5Fopen(temp_path.string().c_str(), H5F_ACC_RDWR, H5P_DEFAULT)
-             : H5Fcreate(temp_path.string().c_str(),
-                         H5F_ACC_TRUNC,
-                         H5P_DEFAULT,
-                         H5P_DEFAULT);
-  TENRYU_ASSERT(file >= 0,
-                "HistoryWriter failed to open/create history file for radial Fourier v2 audit");
-
+  const hid_t file = open_history_for_append(path_, "the radial Fourier v2 audit");
   write_radial_fourier_complex_audit_history(file, record);
-
   warn_h5_close_failure(
       H5Fclose(file),
       "H5Fclose",
       "HistoryWriter::append_radial_fourier_complex_audit(finalize)");
-  try {
-    std::filesystem::rename(temp_path, history_path);
-  } catch (const std::filesystem::filesystem_error& e) {
-    core::log_error("HistoryWriter: transactional rename failed from '" +
-                    temp_path.string() + "' to '" + history_path.string() +
-                    "': " + e.what());
-    std::error_code cleanup_ec;
-    std::filesystem::remove(temp_path, cleanup_ec);
-  }
 #endif
 #endif
 }
@@ -3709,43 +3750,12 @@ void HistoryWriter::append_fld_substage_audit_batch(
   flush_pending();
 
 #if TENRYU_ENABLE_HDF5
-  const std::filesystem::path history_path(path_);
-  const std::filesystem::path temp_path = history_path.string() + ".tmp";
-  const bool exists = std::filesystem::exists(history_path);
-  std::error_code remove_tmp_ec;
-  std::filesystem::remove(temp_path, remove_tmp_ec);
-  if (exists) {
-    TENRYU_ASSERT(
-        std::filesystem::copy_file(
-            history_path,
-            temp_path,
-            std::filesystem::copy_options::overwrite_existing),
-        "HistoryWriter failed to stage history file copy for FLD substage audit append");
-  }
-  const hid_t file =
-      exists ? H5Fopen(temp_path.string().c_str(), H5F_ACC_RDWR, H5P_DEFAULT)
-             : H5Fcreate(temp_path.string().c_str(),
-                         H5F_ACC_TRUNC,
-                         H5P_DEFAULT,
-                         H5P_DEFAULT);
-  TENRYU_ASSERT(file >= 0,
-                "HistoryWriter failed to open/create history file for FLD substage audit");
-
+  const hid_t file = open_history_for_append(path_, "the FLD substage audit");
   write_fld_substage_audit_history(file, records);
-
   warn_h5_close_failure(
       H5Fclose(file),
       "H5Fclose",
       "HistoryWriter::append_fld_substage_audit_batch(finalize)");
-  try {
-    std::filesystem::rename(temp_path, history_path);
-  } catch (const std::filesystem::filesystem_error& e) {
-    core::log_error("HistoryWriter: transactional rename failed from '" +
-                    temp_path.string() + "' to '" + history_path.string() +
-                    "': " + e.what());
-    std::error_code cleanup_ec;
-    std::filesystem::remove(temp_path, cleanup_ec);
-  }
 #endif
 }
 
@@ -3758,68 +3768,142 @@ void HistoryWriter::append(const core::State& state, const HistorySnapshot& snap
   }
 
 #if TENRYU_ENABLE_HDF5
-  pending_.push_back(build_pending_record(state, snapshot));
-  const auto now = std::chrono::steady_clock::now();
-  if (!history_bootstrapped_ ||
-      static_cast<int>(pending_.size()) >= append_flush_every_ ||
-      now - last_flush_time_ >= std::chrono::seconds(30)) {
-    flush_pending();
-  }
+  queue_record(build_pending_record(state, snapshot));
 #else
   (void)state;
   (void)snapshot;
 #endif
 }
 
-void HistoryWriter::flush_pending() {
-  const core::NvtxRange nvtx_range("diagnostics.history_flush");
-  last_flush_time_ = std::chrono::steady_clock::now();
-  if (pending_.empty() || !enabled_) {
+void HistoryWriter::append_dt_breakdown(const core::State& state,
+                                        const DtBreakdownHistoryRecord& record) {
+  const core::NvtxRange nvtx_range("diagnostics.history_append_dt_breakdown");
+  if (!enabled_ || !dt_breakdown_history_enabled_ || !record.valid) {
+    (void)state;
+    (void)record;
     return;
   }
 
 #if TENRYU_ENABLE_HDF5
-  const std::filesystem::path history_path(path_);
-  const std::filesystem::path temp_path = history_path.string() + ".tmp";
-  const bool exists = std::filesystem::exists(history_path);
-  std::error_code remove_tmp_ec;
-  std::filesystem::remove(temp_path, remove_tmp_ec);
-  if (exists) {
-    TENRYU_ASSERT(std::filesystem::copy_file(history_path,
-                                             temp_path,
-                                             std::filesystem::copy_options::overwrite_existing),
-                  "HistoryWriter failed to stage history file copy for transactional append");
-  }
-  const hid_t file =
-      exists ? H5Fopen(temp_path.string().c_str(), H5F_ACC_RDWR, H5P_DEFAULT)
-             : H5Fcreate(temp_path.string().c_str(),
-                         H5F_ACC_TRUNC,
-                         H5P_DEFAULT,
-                         H5P_DEFAULT);
-  TENRYU_ASSERT(file >= 0, "HistoryWriter failed to open/create history file");
+  PendingHistoryRecord rec{};
+  rec.t = state.t;
+  rec.dt = state.dt;
+  rec.step = state.step;
+  rec.dt_only = true;
+  rec.dt_breakdown_history_enabled = true;
+  rec.snapshot.dt_breakdown = record;
+  fill_dt_breakdown_group_values(state, rec);
+  queue_record(std::move(rec));
+#endif
+}
 
+#if TENRYU_ENABLE_HDF5
+void HistoryWriter::queue_record(PendingHistoryRecord&& rec) {
+  pending_.push_back(std::move(rec));
+  if (!history_bootstrapped_) {
+    // The first row is written before the step returns, so that the file
+    // exists from the first step on.
+    flush_pending();
+    return;
+  }
+  const auto now = std::chrono::steady_clock::now();
+  if (static_cast<int>(pending_.size()) >= append_flush_every_ ||
+      now - last_flush_time_ >= std::chrono::seconds(30)) {
+    last_flush_time_ = now;
+    enqueue_pending_batch();
+  }
+}
+
+void HistoryWriter::write_batch(const std::vector<PendingHistoryRecord>& batch) const {
+  const core::NvtxRange nvtx_range("diagnostics.history_batch_write");
+  const std::lock_guard<std::recursive_mutex> hdf5_lock(core::hdf5_mutex());
+  const hid_t file = open_history_for_append(path_, "the history rows");
   {
     const char* batch_env = std::getenv("TENRYU_HISTORY_BATCH_WRITES");
-    const bool batch = cfg_.main.dim == 1 &&
-                       !(batch_env != nullptr && std::string(batch_env) == "0");
-    const HistoryAppendFile target(file, batch);
-    for (const auto& rec : pending_) {
+    const bool batched = cfg_.main.dim == 1 &&
+                         !(batch_env != nullptr && std::string(batch_env) == "0");
+    const HistoryAppendFile target(file, batched);
+    for (const auto& rec : batch) {
       append_record_to_file(target, rec);
     }
     target.flush();
   }
-
   warn_h5_close_failure(H5Fclose(file), "H5Fclose", "HistoryWriter::append(finalize)");
-  try {
-    std::filesystem::rename(temp_path, history_path);
-    history_bootstrapped_ = true;
-  } catch (const std::filesystem::filesystem_error& e) {
-    core::log_error("HistoryWriter: transactional rename failed from '" + temp_path.string() +
-                    "' to '" + history_path.string() + "': " + e.what());
-    std::error_code cleanup_ec;
-    std::filesystem::remove(temp_path, cleanup_ec);
+}
+
+void HistoryWriter::batch_worker_loop() {
+  for (;;) {
+    std::vector<PendingHistoryRecord> batch;
+    {
+      std::unique_lock<std::mutex> lock(batch_mutex_);
+      batch_cv_.wait(lock, [this] { return batch_stop_ || !batch_queue_.empty(); });
+      if (batch_queue_.empty()) {
+        return;  // stop requested and nothing left
+      }
+      batch = std::move(batch_queue_.front());
+      batch_queue_.pop_front();
+      batch_busy_ = true;
+    }
+    std::exception_ptr error;
+    try {
+      write_batch(batch);
+    } catch (...) {
+      error = std::current_exception();
+    }
+    {
+      const std::lock_guard<std::mutex> lock(batch_mutex_);
+      batch_busy_ = false;
+      if (error && !batch_error_) {
+        batch_error_ = error;
+      }
+    }
+    batch_cv_.notify_all();
+  }
+}
+
+void HistoryWriter::enqueue_pending_batch() {
+  if (pending_.empty()) {
+    return;
+  }
+  {
+    const std::lock_guard<std::mutex> lock(batch_mutex_);
+    if (batch_error_) {
+      std::rethrow_exception(batch_error_);
+    }
+    batch_queue_.push_back(std::move(pending_));
   }
   pending_.clear();
+  if (!batch_worker_.joinable()) {
+    batch_worker_ = std::thread([this] { batch_worker_loop(); });
+  }
+  batch_cv_.notify_all();
+}
+
+void HistoryWriter::wait_for_batches() {
+  std::unique_lock<std::mutex> lock(batch_mutex_);
+  batch_cv_.wait(lock, [this] { return batch_queue_.empty() && !batch_busy_; });
+  if (batch_error_) {
+    const std::exception_ptr error = batch_error_;
+    batch_error_ = nullptr;
+    std::rethrow_exception(error);
+  }
+}
+#endif
+
+void HistoryWriter::flush_pending() {
+  const core::NvtxRange nvtx_range("diagnostics.history_flush");
+  last_flush_time_ = std::chrono::steady_clock::now();
+  if (!enabled_) {
+    return;
+  }
+
+#if TENRYU_ENABLE_HDF5
+  const bool wrote_rows = !pending_.empty();
+  enqueue_pending_batch();
+  wait_for_batches();
+  if (wrote_rows) {
+    history_bootstrapped_ = true;
+  }
 #else
   pending_.clear();
 #endif
@@ -3829,6 +3913,10 @@ void HistoryWriter::flush_pending() {
 void HistoryWriter::append_record_to_file(
     const HistoryAppendFile& file,
     const PendingHistoryRecord& rec) const {
+  if (rec.dt_only) {
+    write_dt_breakdown_groups(file, rec);
+    return;
+  }
   const auto last_t = last_scalar_double_if_exists(file, "t");
   if (last_t.has_value() && !(rec.t > *last_t)) {
     core::log_warning("HistoryWriter: skipped non-monotonic append at t=" +
@@ -3839,19 +3927,7 @@ void HistoryWriter::append_record_to_file(
   append_scalar_double(file, "t", rec.t, "s");
   append_scalar_i64(file, "cycle", static_cast<std::int64_t>(rec.step), "count");
   append_scalar_double(file, "dt", rec.dt, "s");
-  if (rec.dt_breakdown_history_enabled) {
-    write_dt_breakdown_history(file, rec.snapshot.dt_breakdown);
-    write_cfl_winner_history(file, rec.snapshot.dt_breakdown);
-    if (rec.corner_bc_audit_values.has_value()) {
-      write_corner_bc_audit_history(file, *rec.corner_bc_audit_values);
-    }
-    if (rec.per_row_mass_values.has_value()) {
-      write_per_row_mass_history(file, *rec.per_row_mass_values);
-    }
-    if (rec.av_max_values.has_value()) {
-      write_av_max_history(file, *rec.av_max_values);
-    }
-  }
+  write_dt_breakdown_groups(file, rec);
   write_plasma_viscosity_history(file, rec.snapshot.plasma_viscosity);
   if (rec.center_perturbation_enabled) {
     write_tri_fan_center_perturbation_history(
@@ -3864,7 +3940,10 @@ void HistoryWriter::append_record_to_file(
   //   marshak_in, laser_deposited, laser_escaped, radiation_escaped, numerical_loss,
   //   pdv_boundary, floor_injected, safety_injected, redistribution_unresolved,
   //   solver_residual, conservation_error}
-  //   laser_incident, laser_deposited, and laser_escaped are cumulative counters.
+  //   laser_incident, laser_deposited, laser_escaped, radiation_escaped,
+  //   marshak_in, E_volume_in, numerical_loss, pdv_boundary, floor_injected,
+  //   safety_injected and solver_residual are run-cumulative; the step values
+  //   of the last eight are in the matching *_step datasets.
   // - plasma/{Zbar_mean, Zbar_max}
   // - implosion/{rho_peak, rho_R, shell_radius_mean, shell_radius_min, center_temperature}
   // - modes/{P_ell, ell_values}
@@ -3904,9 +3983,15 @@ void HistoryWriter::append_record_to_file(
       file, "energy/radiation_field", "energy/E_rad", rec.snapshot.energy.E_rad, "erg");
   append_scalar_double_compat(
       file, "energy/laser_incident", "energy/E_laser_in", rec.E_laser_incident, "erg");
+  // 2026-09-23 semantic fix: the SPEC names below are run-cumulative (they
+  // held the step values, while laser_* and radiation_escaped were already
+  // cumulative); the step values moved to the *_step datasets.
+  const auto& cum = rec.snapshot.energy_cumulative;
   append_scalar_double_compat(
-      file, "energy/marshak_in", "energy/E_Marshak_in", rec.snapshot.energy.E_Marshak_in, "erg");
-  append_scalar_double(file, "energy/E_volume_in", rec.snapshot.energy.E_volume_in, "erg");
+      file, "energy/marshak_in", "energy/E_Marshak_in", cum.marshak_in, "erg");
+  append_scalar_double(file, "energy/marshak_in_step", rec.snapshot.energy.E_Marshak_in, "erg");
+  append_scalar_double(file, "energy/E_volume_in", cum.volume_in, "erg");
+  append_scalar_double(file, "energy/E_volume_in_step", rec.snapshot.energy.E_volume_in, "erg");
   append_scalar_double(file, "energy/laser_deposited", rec.E_laser_deposited, "erg");
   append_scalar_double(file, "energy/E_cbet_iaw_step", rec.E_cbet_iaw_step, "erg");
   append_scalar_double(file, "energy/E_cbet_iaw", rec.E_cbet_iaw, "erg");
@@ -3917,7 +4002,7 @@ void HistoryWriter::append_record_to_file(
   append_scalar_double_compat(file,
                               "energy/radiation_escaped",
                               "energy/E_rad_esc",
-                              rec.E_rad_escaped,
+                              cum.radiation_escaped,
                               "erg");
   append_scalar_double(file,
                        "energy/radiation_escaped_step",
@@ -3926,21 +4011,29 @@ void HistoryWriter::append_record_to_file(
   append_scalar_double_compat(file,
                               "energy/numerical_loss",
                               "energy/E_numerical_loss",
-                              rec.snapshot.energy.E_numerical_loss,
+                              cum.numerical_loss,
                               "erg");
+  append_scalar_double(file,
+                       "energy/numerical_loss_step",
+                       rec.snapshot.energy.E_numerical_loss,
+                       "erg");
   append_scalar_double_compat(
-      file, "energy/pdv_boundary", "energy/E_pdV_bdry", rec.snapshot.energy.E_pdV_bdry, "erg");
+      file, "energy/pdv_boundary", "energy/E_pdV_bdry", cum.pdv_boundary, "erg");
+  append_scalar_double(file, "energy/pdv_boundary_step", rec.snapshot.energy.E_pdV_bdry, "erg");
   append_scalar_double_compat(
-      file, "energy/floor_injected", "energy/E_floor", rec.snapshot.energy.E_floor, "erg");
+      file, "energy/floor_injected", "energy/E_floor", cum.floor_injected, "erg");
+  append_scalar_double(file, "energy/floor_injected_step", rec.snapshot.energy.E_floor, "erg");
   append_scalar_double_compat(
-      file, "energy/safety_injected", "energy/E_safety", rec.snapshot.energy.E_safety, "erg");
+      file, "energy/safety_injected", "energy/E_safety", cum.safety_injected, "erg");
+  append_scalar_double(file, "energy/safety_injected_step", rec.snapshot.energy.E_safety, "erg");
   append_scalar_double_compat(file,
                               "energy/redistribution_unresolved",
                               "energy/E_redistribution_unresolved",
                               rec.snapshot.energy.E_redistribution_unresolved,
                               "erg");
   append_scalar_double_compat(
-      file, "energy/solver_residual", "energy/E_solver", rec.snapshot.energy.E_solver, "erg");
+      file, "energy/solver_residual", "energy/E_solver", cum.solver_residual, "erg");
+  append_scalar_double(file, "energy/solver_residual_step", rec.snapshot.energy.E_solver, "erg");
   append_scalar_double(file, "energy/E_total", rec.snapshot.energy.E_total, "erg");
   append_scalar_double(file, "energy/dE_total", rec.snapshot.energy.dE_total, "erg");
   append_scalar_double_compat(file,
@@ -4457,6 +4550,10 @@ void HistoryWriter::append_record_to_file(
                     "laser/corona_transition_resolved_cells",
                     rec.snapshot.laser_pattern.corona_transition_resolved_cells,
                     "cells");
+  append_scalar_double(file,
+                       "laser/ghost_corona_width",
+                       rec.snapshot.laser_pattern.ghost_corona_width,
+                       "cm");
   for (std::size_t b = 0; b < rec.snapshot.laser_pattern.absorbed_fraction_per_beam.size();
        ++b) {
     append_scalar_double(file,
@@ -4477,6 +4574,24 @@ void HistoryWriter::append_record_to_file(
                     "radiation/fld_outer_converged",
                     static_cast<std::int64_t>(rec.snapshot.fld_solver.outer_converged),
                     "flag");
+  if (rec.snapshot.sn_solver.active) {
+    append_scalar_i64(file,
+                      "radiation/sn_outer_iterations",
+                      rec.snapshot.sn_solver.outer_iterations,
+                      "count");
+    append_scalar_i64(file,
+                      "radiation/sn_inner_iterations",
+                      rec.snapshot.sn_solver.inner_iterations,
+                      "count");
+    append_scalar_double(file,
+                         "radiation/sn_outer_residual",
+                         rec.snapshot.sn_solver.outer_residual,
+                         "dimensionless");
+    append_scalar_i64(file,
+                      "radiation/sn_converged",
+                      static_cast<std::int64_t>(rec.snapshot.sn_solver.converged),
+                      "flag");
+  }
 
   // Legacy runs can have mode counts stored in mc/n_imc and mc/n_ddmc.
   const bool imc_mode_uses_legacy_path =

@@ -14,6 +14,7 @@ add_library(tenryu_coupling STATIC
   reale_mode.cpp
   staged_dt_gate.cpp
   source_terms.cu
+  thermal_subcycle_scan.cu
 )
 
 target_include_directories(tenryu_coupling PUBLIC ${PROJECT_SOURCE_DIR}/src)

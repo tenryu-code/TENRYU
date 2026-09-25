@@ -3,6 +3,7 @@ add_library(tenryu_core STATIC
   config.cpp
   device_scratch.cu
   device_pack.cu
+  deterministic_sum.cu
   mesh_transaction.cu
   error.cpp
   state.cpp
@@ -13,6 +14,7 @@ add_library(tenryu_core STATIC
   ${PROJECT_SOURCE_DIR}/src/materials/ionmix_reader.cpp
   ${PROJECT_SOURCE_DIR}/src/materials/zbar_tf.cpp
   namelist/frozen_table.cpp
+  namelist/laser_zeff_resolution.cpp
   namelist/geometry_eval.cpp
   namelist/geometry_eval_volume_cut.cpp
 )
@@ -32,7 +34,14 @@ endif()
 target_include_directories(tenryu_core PUBLIC ${PROJECT_SOURCE_DIR}/src)
 
 target_link_libraries(tenryu_core PUBLIC spdlog::spdlog)
-target_link_libraries(tenryu_core PRIVATE CUDA::cudart)
+# PUBLIC: the core headers include the CUDA runtime and Thrust, so every target
+# that includes them (plain C++ translation units too) needs the toolkit's
+# include directories. With PRIVATE the host compiler found them only where the
+# toolkit sits on its default search path (a standard /usr/local/cuda install
+# does not: src/mesh/z_reflection.cpp failed with thrust/device_vector.h not
+# found). A static library's private link dependencies already reach the final
+# link, so the linked libraries are unchanged.
+target_link_libraries(tenryu_core PUBLIC CUDA::cudart)
 
 if(TENRYU_ENABLE_PYTHON)
   target_link_libraries(tenryu_core PRIVATE

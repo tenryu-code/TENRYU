@@ -709,6 +709,25 @@ __device__ __forceinline__ double cfl_1d_face_area(const int geom_code,
   return tenryu::mesh::geometry_1d_face_area(geom_code, r);
 }
 
+// A 1D cell compresses when its nodes approach (u_{i+1} < u_i, the CSW
+// viscosity's test) or its volume shrinks (A_{i+1} u_{i+1} < A_i u_i, the
+// VNR viscosity's test). Neither viscosity acts outside compressing cells, so
+// the linear viscosity term C_1 c_s enters the CFL denominator only there
+// (NUMERICS §3.1.9).
+__device__ __forceinline__ bool cfl_1d_cell_compresses(const double* __restrict__ x_r,
+                                                       const double* __restrict__ v_r,
+                                                       const int i,
+                                                       const int geom_code) {
+  const double u0 = v_r[i];
+  const double u1 = v_r[i + 1];
+  if (u1 < u0) {
+    return true;
+  }
+  return cfl_1d_face_area(geom_code, x_r[i + 1]) * u1 -
+             cfl_1d_face_area(geom_code, x_r[i]) * u0 <
+         0.0;
+}
+
 __device__ inline void cfl_1d_kernel_body(
     const int i,
     const int /*tid*/,
@@ -785,10 +804,12 @@ __device__ inline void cfl_1d_kernel_body(
     denom += fmax(0.0, v_r[i] - v_r[i + 1]);
   } else {
     // Lagrangian CFL: mesh moves with fluid, only acoustic speed matters.
-    // Add AV linear/quadratic corrections for shock-capture stability.
+    // Add AV linear/quadratic corrections for shock-capture stability; the
+    // linear term only where the viscosity can act (compressing cells).
     chi = compute_chi_1d(x_r, v_r, i, n_cells, J);
     const double compression_speed = dr * chi;
-    denom += c1 * cs + c2 * compression_speed;
+    const double c1_cs = cfl_1d_cell_compresses(x_r, v_r, i, geom_code) ? c1 * cs : 0.0;
+    denom += c1_cs + c2 * compression_speed;
   }
   if (denom > 0.0) {
     atomic_min_double(min_dt, dr / denom);
@@ -955,6 +976,7 @@ __global__ void cfl_1d_lineage_argmin_kernel(
     const int c_begin,
     const int c_end,
     const int n_cells,
+    const int geom_code,
     const double gamma,
     const double c1,
     const double c2,
@@ -989,7 +1011,9 @@ __global__ void cfl_1d_lineage_argmin_kernel(
     } else {
       const double chi = compute_chi_1d(x_r, v_r, i, n_cells, J);
       const double compression_speed = dr * chi;
-      denom += c1 * cs + c2 * compression_speed;
+      const double c1_cs =
+          cfl_1d_cell_compresses(x_r, v_r, i, geom_code) ? c1 * cs : 0.0;
+      denom += c1_cs + c2 * compression_speed;
     }
     if (denom > 0.0) {
       candidate = dr / denom;
@@ -2978,6 +3002,24 @@ VolumeRateDtArgmin compute_dt_hydro_volume_rate_argmin(
   return result;
 }
 
+namespace {
+
+// Start values of the CFL reduce pack: min dt, min post-shock dt, min
+// node-crossing dt, min artificial-heat dt (atomic minima) and the
+// have-active flag.
+__global__ void init_cfl_reduce_pack_kernel(double* __restrict__ pack) {
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    const double inf = __longlong_as_double(0x7ff0000000000000LL);
+    pack[0] = inf;
+    pack[1] = inf;
+    pack[2] = inf;
+    pack[3] = inf;
+    pack[4] = 0.0;
+  }
+}
+
+}  // namespace
+
 HydroDtDiagnostics compute_dt_hydro_diagnostics(
     const core::State& state,
     const core::Config& cfg,
@@ -3051,10 +3093,8 @@ HydroDtDiagnostics compute_dt_hydro_diagnostics(
   double* d_min_dt_art_heat = d_pack + 3;
   int* d_have_active = reinterpret_cast<int*>(d_pack + 4);
 
-  const double inf = std::numeric_limits<double>::infinity();
-  const double h_init[5] = {inf, inf, inf, inf, 0.0};
-  cuda_check(cudaMemcpy(d_pack, h_init, sizeof(h_init), cudaMemcpyHostToDevice),
-             "CFL: memcpy init reduce pack failed");
+  init_cfl_reduce_pack_kernel<<<1, 1>>>(d_pack);
+  cuda_check(cudaGetLastError(), "CFL: init reduce pack launch failed");
 
   const std::vector<std::int8_t> effective_active =
       make_cfl_central_macro_effective_active(state, cfg);
@@ -3815,7 +3855,7 @@ HydroDtDiagnostics compute_dt_hydro_diagnostics(
           d_winner_cell,
           static_cast<int>(result.min_contributor.term_class), target_dt,
           state.x_r.data(), state.v_r.data(), state.ee.data(), ei, cs, d_active,
-          cw.begin, cw.end, n_cells, gamma, av_c1, av_c2,
+          cw.begin, cw.end, n_cells, state.mesh.geometry_code, gamma, av_c1, av_c2,
           av_du_mode == 1 ? 1 : 0, cfg.numerics.hydro.crossing_dt_safety,
           av_limiter_J);
       cuda_check(cudaGetLastError(),

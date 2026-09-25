@@ -518,6 +518,7 @@ State State::allocate(const Config& cfg, const double hydro_t_start_eV) {
   state.E_floor_injected = 0.0;
   state.E_pdV_bdry = 0.0;
   state.E_Marshak_in = 0.0;
+  state.E_volume_in = 0.0;
   state.E_solver = 0.0;
   state.radiation_device_flags = DeviceErrorFlags{};
   state.corner_mass_initialized = false;
@@ -681,18 +682,35 @@ void State::ensure_cell_material_props(const Config& cfg) {
     }
   }
 
+  // Constant opacities per cell, mixed over the non-void materials. A void
+  // material is vacuum: it neither absorbs nor emits, and a cell without
+  // non-void material has kappa = 0. (Such cells used to take the first
+  // material's kappa: the floor-density void outside a target absorbed and
+  // re-emitted the corona's radiation, reaching ~100 eV within a radiation
+  // solve, and kept the FLD outer iteration from converging, 2026-09-24.)
   const double kappa0 = mat0.kappa_a_constant;
   std::vector<double> host_kappa_planck(n_cells, kappa0);
   std::vector<double> host_kappa_rosseland(n_cells, kappa0);
-  // Diagnostic-only harmonic opacity mixing override, spec §5b A1.
+  // Materials.opacity_mix_rule (NUMERICS §1.1.5): "linear_mass" mixes the
+  // Planck and Rosseland opacities linearly, "harmonic_mass_R" the Planck
+  // opacity linearly and the Rosseland opacity harmonically, "max" takes the
+  // largest material opacity for both (2026-09-24; only "linear_mass" was
+  // implemented before). The environment override
+  // TENRYU_MM_OPACITY_MIX=harmonic (a diagnostic, not a namelist option)
+  // mixes both harmonically.
   static const bool use_harmonic_opacity_mix = [] {
     const char* mix = std::getenv("TENRYU_MM_OPACITY_MIX");
     return mix != nullptr && std::strcmp(mix, "harmonic") == 0;
   }();
+  const std::string& mix_rule = cfg.materials.opacity_mix_rule;
+  const bool planck_harmonic = use_harmonic_opacity_mix;
+  const bool rosseland_harmonic =
+      use_harmonic_opacity_mix || mix_rule == "harmonic_mass_R";
+  const bool mix_max = !use_harmonic_opacity_mix && mix_rule == "max";
   constexpr double kMinOpacityDenom = 1.0e-300;
   std::vector<double> kappa_m(n_mat, kappa0);
   for (std::size_t m = 0; m < n_mat; ++m) {
-    kappa_m[m] = materials[m].kappa_a_constant;
+    kappa_m[m] = materials[m].is_void ? 0.0 : materials[m].kappa_a_constant;
   }
   if (mass_per_material.size() == expected) {
     std::vector<double> host_mass(expected, 0.0);
@@ -704,22 +722,36 @@ void State::ensure_cell_material_props(const Config& cfg) {
         mass_sum += host_mass[base + m];
       }
       const double mass_denom = std::max(mass_sum, kMinOpacityDenom);
-      double kappa_c = 0.0;
-      double inv_kappa_c = 0.0;
+      // Per unit cell mass: the absorbing (non-void) mass times its mixed kappa.
+      double kappa_lin = 0.0;
+      double inv_kappa = 0.0;
+      double kappa_top = 0.0;
+      double nonvoid_mass = 0.0;
       for (std::size_t m = 0; m < n_mat; ++m) {
-        const double w = host_mass[base + m] / mass_denom;
-        if (use_harmonic_opacity_mix) {
-          inv_kappa_c += w / std::max(kappa_m[m], kMinOpacityDenom);
-        } else {
-          kappa_c += w * kappa_m[m];
+        if (materials[m].is_void) {
+          continue;
+        }
+        nonvoid_mass += host_mass[base + m];
+      }
+      const double nonvoid_denom = std::max(nonvoid_mass, kMinOpacityDenom);
+      for (std::size_t m = 0; m < n_mat; ++m) {
+        if (materials[m].is_void) {
+          continue;
+        }
+        kappa_lin += (host_mass[base + m] / mass_denom) * kappa_m[m];
+        inv_kappa += (host_mass[base + m] / nonvoid_denom) /
+                     std::max(kappa_m[m], kMinOpacityDenom);
+        if (host_mass[base + m] > 0.0) {
+          kappa_top = std::max(kappa_top, kappa_m[m]);
         }
       }
-      if (use_harmonic_opacity_mix) {
-        kappa_c =
-            (std::isfinite(inv_kappa_c) && inv_kappa_c > 0.0) ? 1.0 / inv_kappa_c : 0.0;
-      }
-      host_kappa_planck[c] = kappa_c;
-      host_kappa_rosseland[c] = kappa_c;
+      const double kappa_harm = (std::isfinite(inv_kappa) && inv_kappa > 0.0)
+                                    ? (nonvoid_mass / mass_denom) / inv_kappa
+                                    : 0.0;
+      const double kappa_mx = (nonvoid_mass / mass_denom) * kappa_top;
+      host_kappa_planck[c] = mix_max ? kappa_mx : (planck_harmonic ? kappa_harm : kappa_lin);
+      host_kappa_rosseland[c] =
+          mix_max ? kappa_mx : (rosseland_harmonic ? kappa_harm : kappa_lin);
     }
   } else if (n_mat > 1U && volFrac.size() == expected) {
     std::vector<double> host_volfrac(expected, 0.0);
@@ -727,8 +759,9 @@ void State::ensure_cell_material_props(const Config& cfg) {
     for (std::size_t c = 0; c < n_cells; ++c) {
       const std::size_t base = c * n_mat;
       double frac_sum = 0.0;
-      double kappa_c = 0.0;
-      double inv_kappa_c = 0.0;
+      double kappa_lin = 0.0;
+      double inv_kappa = 0.0;
+      double kappa_top = 0.0;
       for (std::size_t m = 0; m < n_mat; ++m) {
         if (materials[m].is_void) {
           continue;
@@ -737,23 +770,24 @@ void State::ensure_cell_material_props(const Config& cfg) {
         const double frac =
             (std::isfinite(frac_raw) && frac_raw > 0.0) ? frac_raw : 0.0;
         frac_sum += frac;
-        if (use_harmonic_opacity_mix) {
-          inv_kappa_c += frac / std::max(kappa_m[m], kMinOpacityDenom);
-        } else {
-          kappa_c += frac * kappa_m[m];
+        kappa_lin += frac * kappa_m[m];
+        inv_kappa += frac / std::max(kappa_m[m], kMinOpacityDenom);
+        if (frac > 0.0) {
+          kappa_top = std::max(kappa_top, kappa_m[m]);
         }
       }
       if (frac_sum > 1.0e-30) {
-        if (use_harmonic_opacity_mix) {
-          inv_kappa_c /= frac_sum;
-          kappa_c = (std::isfinite(inv_kappa_c) && inv_kappa_c > 0.0)
-                        ? 1.0 / inv_kappa_c
-                        : 0.0;
-        } else {
-          kappa_c /= frac_sum;
-        }
-        host_kappa_planck[c] = kappa_c;
-        host_kappa_rosseland[c] = kappa_c;
+        const double inv_mean = inv_kappa / frac_sum;
+        const double kappa_harm =
+            (std::isfinite(inv_mean) && inv_mean > 0.0) ? 1.0 / inv_mean : 0.0;
+        const double kappa_mean = kappa_lin / frac_sum;
+        host_kappa_planck[c] =
+            mix_max ? kappa_top : (planck_harmonic ? kappa_harm : kappa_mean);
+        host_kappa_rosseland[c] =
+            mix_max ? kappa_top : (rosseland_harmonic ? kappa_harm : kappa_mean);
+      } else {
+        host_kappa_planck[c] = 0.0;
+        host_kappa_rosseland[c] = 0.0;
       }
     }
   }
@@ -1138,6 +1172,7 @@ void State::reset() {
   E_floor_injected = 0.0;
   E_pdV_bdry = 0.0;
   E_Marshak_in = 0.0;
+  E_volume_in = 0.0;
   E_solver = 0.0;
   radiation_device_flags = DeviceErrorFlags{};
   dispatch_counters.reset();

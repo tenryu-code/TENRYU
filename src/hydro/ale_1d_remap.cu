@@ -12,6 +12,7 @@
 
 #include <cub/cub.cuh>
 
+#include "core/device_scratch.hpp"
 #include "core/fancy_iterators.cuh"
 #include "mesh/geometry_1d.cuh"
 
@@ -47,30 +48,23 @@ int effective_cell_count(const core::State& state, const core::Config& cfg) {
   return cfg.mesh.nr;
 }
 
+// Work buffer from the persistent device scratch pool: one buffer per tag,
+// kept across ALE attempts instead of a cudaMalloc/cudaFree pair per call
+// (cudaFree synchronizes the device). Contents are not zeroed, as with
+// cudaMalloc; two live buffers never share a tag.
 template <typename T>
 class DeviceBuffer {
  public:
   DeviceBuffer() = default;
 
-  explicit DeviceBuffer(const std::size_t count) {
-    reset(count);
+  DeviceBuffer(const char* tag, const std::size_t count) {
+    reset(tag, count);
   }
 
-  ~DeviceBuffer() {
-    release();
-  }
-
-  DeviceBuffer(const DeviceBuffer&) = delete;
-  DeviceBuffer& operator=(const DeviceBuffer&) = delete;
-
-  void reset(const std::size_t count) {
-    release();
-    size_ = count;
-    if (size_ == 0) {
-      return;
-    }
-    cuda_check(cudaMalloc(reinterpret_cast<void**>(&ptr_), size_ * sizeof(T)),
-               "ALE1D remap cudaMalloc failed");
+  void reset(const char* tag, const std::size_t count) {
+    ptr_ = (count == 0)
+               ? nullptr
+               : static_cast<T*>(core::device_scratch_acquire(tag, count * sizeof(T)));
   }
 
   T* data() noexcept {
@@ -82,16 +76,7 @@ class DeviceBuffer {
   }
 
  private:
-  void release() {
-    if (ptr_ != nullptr) {
-      cuda_check(cudaFree(ptr_), "ALE1D remap cudaFree failed");
-      ptr_ = nullptr;
-    }
-    size_ = 0;
-  }
-
   T* ptr_ = nullptr;
-  std::size_t size_ = 0;
 };
 
 __host__ __device__ double volume_coordinate(const double r, const int geom) {
@@ -725,6 +710,22 @@ __device__ double radiation_flux(const int face,
   return delta_y[face] * rad_e[d * n_groups + group];
 }
 
+// Face mass fluxes of the first-order donor mass remap (the fluxes
+// remap_mass_energy_kernel applies), for the velocity projection.
+__global__ void first_order_mass_flux_kernel(const double* __restrict__ r_old,
+                                             const double* __restrict__ mass,
+                                             const double* __restrict__ delta_y,
+                                             const int* __restrict__ donor,
+                                             double* __restrict__ face_mass_flux,
+                                             const int n,
+                                             const int geom) {
+  const int j = blockIdx.x * blockDim.x + threadIdx.x;
+  if (j > n) {
+    return;
+  }
+  face_mass_flux[j] = mass_flux(j, delta_y, donor, mass, r_old, geom);
+}
+
 __global__ void remap_mass_energy_kernel(
     const double* __restrict__ r_old,
     const double* __restrict__ mass,
@@ -854,12 +855,12 @@ double reduce_sum(InputIt input,
   if (n <= 0) {
     return 0.0;
   }
-  DeviceBuffer<double> out(1);
+  DeviceBuffer<double> out("ale1d_remap:reduce_sum:out", 1);
   std::size_t temp_bytes = 0;
   cuda_check(cub::DeviceReduce::Sum(nullptr, temp_bytes, input, out.data(), n,
                                     stream),
              label);
-  DeviceBuffer<unsigned char> temp(temp_bytes);
+  DeviceBuffer<unsigned char> temp("ale1d_remap:reduce_sum:temp", temp_bytes);
   cuda_check(cub::DeviceReduce::Sum(temp.data(), temp_bytes, input, out.data(),
                                     n, stream),
              label);
@@ -1061,8 +1062,8 @@ int validate_extensive_field(const double* q_old,
                              const int fallback_bit,
                              const bool record_fallback,
                              cudaStream_t stream) {
-  DeviceBuffer<double> d_first_fail_data(6);
-  DeviceBuffer<int> d_first_fail_cell(1);
+  DeviceBuffer<double> d_first_fail_data("ale1d_remap:validate_extensive_field:d_first_fail_data", 6);
+  DeviceBuffer<int> d_first_fail_cell("ale1d_remap:validate_extensive_field:d_first_fail_cell", 1);
   cuda_check(cudaMemsetAsync(fail_count.data(), 0, sizeof(int), stream),
              "ALE1D remap bounds count memset failed");
   cuda_check(cudaMemsetAsync(d_first_fail_cell.data(),
@@ -1138,8 +1139,8 @@ int validate_specific_field(const double* q_old,
                             const int fallback_bit,
                             const bool record_fallback,
                             cudaStream_t stream) {
-  DeviceBuffer<double> d_first_fail_data(6);
-  DeviceBuffer<int> d_first_fail_cell(1);
+  DeviceBuffer<double> d_first_fail_data("ale1d_remap:validate_specific_field:d_first_fail_data", 6);
+  DeviceBuffer<int> d_first_fail_cell("ale1d_remap:validate_specific_field:d_first_fail_cell", 1);
   cuda_check(cudaMemsetAsync(fail_count.data(), 0, sizeof(int), stream),
              "ALE1D remap bounds count memset failed");
   cuda_check(cudaMemsetAsync(d_first_fail_cell.data(),
@@ -1497,6 +1498,7 @@ void Ale1dRemapScratch::resize(const int n_cells,
   phi_face.resize(n + 1U);
   donor.resize(n + 1U);
   fallback_flags.resize(n);
+  mass_flux.resize(n + 1U);
 }
 
 bool Ale1dRemapScratch::size_matches(const int n_cells,
@@ -1513,7 +1515,7 @@ bool Ale1dRemapScratch::size_matches(const int n_cells,
          volFrac_new.size() == n * static_cast<std::size_t>(n_materials) &&
          vol_new.size() == n && delta_Y.size() == n + 1U &&
          phi_face.size() == n + 1U && donor.size() == n + 1U &&
-         fallback_flags.size() == n;
+         fallback_flags.size() == n && mass_flux.size() == n + 1U;
 }
 
 Ale1dRemapResult remap_v3(const core::State& state,
@@ -1578,7 +1580,7 @@ Ale1dRemapResult remap_v3(const core::State& state,
                 "ALE1D remap scratch size mismatch");
 
   cudaStream_t stream = nullptr;
-  DeviceBuffer<double> d_r_candidate(static_cast<std::size_t>(n + 1));
+  DeviceBuffer<double> d_r_candidate("ale1d_remap:remap_v3:d_r_candidate", static_cast<std::size_t>(n + 1));
   cuda_check(cudaMemcpyAsync(d_r_candidate.data(),
                              r_candidate.data(),
                              static_cast<std::size_t>(n + 1) * sizeof(double),
@@ -1601,14 +1603,14 @@ Ale1dRemapResult remap_v3(const core::State& state,
     protected_face[static_cast<std::size_t>(face)] = 1U;
   }
 
-  DeviceBuffer<std::uint8_t> d_pinned(static_cast<std::size_t>(n + 1));
+  DeviceBuffer<std::uint8_t> d_pinned("ale1d_remap:remap_v3:d_pinned", static_cast<std::size_t>(n + 1));
   cuda_check(cudaMemcpyAsync(d_pinned.data(),
                              pinned.data(),
                              pinned.size() * sizeof(std::uint8_t),
                              cudaMemcpyHostToDevice,
                              stream),
              "ALE1D remap node mask upload failed");
-  DeviceBuffer<std::uint8_t> d_protected_face(static_cast<std::size_t>(n + 1));
+  DeviceBuffer<std::uint8_t> d_protected_face("ale1d_remap:remap_v3:d_protected_face", static_cast<std::size_t>(n + 1));
   cuda_check(cudaMemcpyAsync(d_protected_face.data(),
                              protected_face.data(),
                              protected_face.size() * sizeof(std::uint8_t),
@@ -1616,7 +1618,7 @@ Ale1dRemapResult remap_v3(const core::State& state,
                              stream),
              "ALE1D remap protected-face upload failed");
 
-  DeviceBuffer<int> d_invalid_count(1);
+  DeviceBuffer<int> d_invalid_count("ale1d_remap:remap_v3:d_invalid_count", 1);
   cuda_check(cudaMemsetAsync(d_invalid_count.data(), 0, sizeof(int), stream),
              "ALE1D remap invalid-count memset failed");
 
@@ -1653,13 +1655,13 @@ Ale1dRemapResult remap_v3(const core::State& state,
              "ALE1D remap fallback memset failed");
 
   const bool high_order = cfg.numerics.ale1d.remap.high_order_enabled;
-  DeviceBuffer<double> d_zero_phi(static_cast<std::size_t>(n + 1));
+  DeviceBuffer<double> d_zero_phi("ale1d_remap:remap_v3:d_zero_phi", static_cast<std::size_t>(n + 1));
   cuda_check(cudaMemsetAsync(d_zero_phi.data(),
                              0,
                              static_cast<std::size_t>(n + 1) * sizeof(double),
                              stream),
              "ALE1D remap zero-phi memset failed");
-  DeviceBuffer<double> d_radiation_phi(static_cast<std::size_t>(n + 1));
+  DeviceBuffer<double> d_radiation_phi("ale1d_remap:remap_v3:d_radiation_phi", static_cast<std::size_t>(n + 1));
   if (high_order) {
     build_phi_kernel<<<blocks_for(n + 1), kBlockSize, 0, stream>>>(
         d_protected_face.data(),
@@ -1689,10 +1691,9 @@ Ale1dRemapResult remap_v3(const core::State& state,
                "ALE1D remap zero radiation phi copy failed");
   }
 
-  DeviceBuffer<double> d_q(static_cast<std::size_t>(n));
-  DeviceBuffer<double> d_slope(static_cast<std::size_t>(n));
-  DeviceBuffer<double> d_mass_flux(static_cast<std::size_t>(n + 1));
-  DeviceBuffer<int> d_fail_count(1);
+  DeviceBuffer<double> d_q("ale1d_remap:remap_v3:d_q", static_cast<std::size_t>(n));
+  DeviceBuffer<double> d_slope("ale1d_remap:remap_v3:d_slope", static_cast<std::size_t>(n));
+  DeviceBuffer<int> d_fail_count("ale1d_remap:remap_v3:d_fail_count", 1);
   const double theta = cfg.numerics.ale1d.remap.limiter_theta;
   const bool fallback_enabled =
       cfg.numerics.ale1d.remap.fallback_to_first_order_on_bounds_fail;
@@ -1739,7 +1740,7 @@ Ale1dRemapResult remap_v3(const core::State& state,
                                                  accepted_phi,
                                                  d_q.data(),
                                                  d_slope.data(),
-                                                 d_mass_flux.data(),
+                                                 scratch.mass_flux.data(),
                                                  n,
                                                  geom);
     cuda_check(cudaGetLastError(),
@@ -1761,7 +1762,7 @@ Ale1dRemapResult remap_v3(const core::State& state,
                                stream),
                "ALE1D remap new mass consistency download failed");
     cuda_check(cudaMemcpyAsync(mass_flux_host.data(),
-                               d_mass_flux.data(),
+                               scratch.mass_flux.data(),
                                static_cast<std::size_t>(n + 1) * sizeof(double),
                                cudaMemcpyDeviceToHost,
                                stream),
@@ -1825,7 +1826,8 @@ Ale1dRemapResult remap_v3(const core::State& state,
       compute_specific_energy_offset(state.ei.data(), n, stream);
   DeviceBuffer<double> d_shifted_energy;
   if (ee_offset > 0.0 || ei_offset > 0.0) {
-    d_shifted_energy.reset(static_cast<std::size_t>(n));
+    d_shifted_energy.reset("ale1d_remap:remap_v3:d_shifted_energy",
+                           static_cast<std::size_t>(n));
   }
   const auto remap_specific_energies = [&]() {
     const double* ee_specific = state.ee.data();
@@ -1854,7 +1856,7 @@ Ale1dRemapResult remap_v3(const core::State& state,
                                                    d_q.data(),
                                                    ee_specific,
                                                    state.mass.data(),
-                                                   d_mass_flux.data(),
+                                                   scratch.mass_flux.data(),
                                                    scratch.mass_new.data(),
                                                    scratch.ee_new.data(),
                                                    d_slope.data(),
@@ -1898,7 +1900,7 @@ Ale1dRemapResult remap_v3(const core::State& state,
                                                    d_q.data(),
                                                    ei_specific,
                                                    state.mass.data(),
-                                                   d_mass_flux.data(),
+                                                   scratch.mass_flux.data(),
                                                    scratch.mass_new.data(),
                                                    scratch.ei_new.data(),
                                                    d_slope.data(),
@@ -1949,7 +1951,7 @@ Ale1dRemapResult remap_v3(const core::State& state,
   }
 
   if (n_mat > 0) {
-    DeviceBuffer<double> d_material_ext(static_cast<std::size_t>(n));
+    DeviceBuffer<double> d_material_ext("ale1d_remap:remap_v3:d_material_ext", static_cast<std::size_t>(n));
     for (int m = 0; m < n_mat; ++m) {
       fill_material_mass_density_kernel<<<blocks_for(n), kBlockSize, 0, stream>>>(
           state.x_r.data(),
@@ -2002,7 +2004,7 @@ Ale1dRemapResult remap_v3(const core::State& state,
   }
 
   if (n_groups > 0) {
-    DeviceBuffer<double> d_rad_new(static_cast<std::size_t>(n));
+    DeviceBuffer<double> d_rad_new("ale1d_remap:remap_v3:d_rad_new", static_cast<std::size_t>(n));
     for (int g = 0; g < n_groups; ++g) {
       fill_radiation_density_kernel<<<blocks_for(n), kBlockSize, 0, stream>>>(
           state.rad_E.data(), d_q.data(), n, n_groups, g);
@@ -2153,7 +2155,7 @@ Ale1dRemapResult remap_first_order(const core::State& state,
                 "ALE1D remap scratch size mismatch");
 
   cudaStream_t stream = nullptr;
-  DeviceBuffer<double> d_r_candidate(static_cast<std::size_t>(n + 1));
+  DeviceBuffer<double> d_r_candidate("ale1d_remap:remap_first_order:d_r_candidate", static_cast<std::size_t>(n + 1));
   cuda_check(cudaMemcpyAsync(d_r_candidate.data(),
                              r_candidate.data(),
                              static_cast<std::size_t>(n + 1) * sizeof(double),
@@ -2165,7 +2167,7 @@ Ale1dRemapResult remap_first_order(const core::State& state,
   for (std::size_t j = 0; j < pinned.size(); ++j) {
     pinned[j] = node_mask.pinned[j] ? 1U : 0U;
   }
-  DeviceBuffer<std::uint8_t> d_pinned(static_cast<std::size_t>(n + 1));
+  DeviceBuffer<std::uint8_t> d_pinned("ale1d_remap:remap_first_order:d_pinned", static_cast<std::size_t>(n + 1));
   cuda_check(cudaMemcpyAsync(d_pinned.data(),
                              pinned.data(),
                              pinned.size() * sizeof(std::uint8_t),
@@ -2173,7 +2175,7 @@ Ale1dRemapResult remap_first_order(const core::State& state,
                              stream),
              "ALE1D remap node mask upload failed");
 
-  DeviceBuffer<int> d_invalid_count(1);
+  DeviceBuffer<int> d_invalid_count("ale1d_remap:remap_first_order:d_invalid_count", 1);
   cuda_check(cudaMemsetAsync(d_invalid_count.data(), 0, sizeof(int), stream),
              "ALE1D remap invalid-count memset failed");
 
@@ -2234,6 +2236,16 @@ Ale1dRemapResult remap_first_order(const core::State& state,
       n,
       geom);
   cuda_check(cudaGetLastError(), "ALE1D remap mass/energy kernel launch failed");
+  first_order_mass_flux_kernel<<<blocks_for(n + 1), kBlockSize, 0, stream>>>(
+      state.x_r.data(),
+      state.mass.data(),
+      scratch.delta_Y.data(),
+      scratch.donor.data(),
+      scratch.mass_flux.data(),
+      n,
+      geom);
+  cuda_check(cudaGetLastError(),
+             "ALE1D remap first-order mass flux kernel launch failed");
 
   if (n_mat > 0) {
     remap_material_mass_kernel<<<blocks_for(n * n_mat), kBlockSize, 0, stream>>>(
@@ -2270,9 +2282,9 @@ Ale1dRemapResult remap_first_order(const core::State& state,
   }
 
   if (cfg.numerics.ale1d.ke_conservation_closure) {
-    DeviceBuffer<double> d_q(static_cast<std::size_t>(n));
-    DeviceBuffer<double> d_slope(static_cast<std::size_t>(n));
-    DeviceBuffer<int> d_fail_count(1);
+    DeviceBuffer<double> d_q("ale1d_remap:remap_first_order:d_q", static_cast<std::size_t>(n));
+    DeviceBuffer<double> d_slope("ale1d_remap:remap_first_order:d_slope", static_cast<std::size_t>(n));
+    DeviceBuffer<int> d_fail_count("ale1d_remap:remap_first_order:d_fail_count", 1);
     fill_kinetic_density_kernel<<<blocks_for(n), kBlockSize, 0, stream>>>(
         state.mass.data(), state.v_r.data(), state.x_r.data(), d_q.data(), n, geom);
     cuda_check(cudaGetLastError(),

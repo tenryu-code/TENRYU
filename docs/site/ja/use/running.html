@@ -131,7 +131,7 @@ Diagnostics(enabled=True, every=1)</code></pre>
 
     <section aria-labelledby="restart">
       <h2 id="restart">チェックポイントと再開</h2>
-      <p>再開するデッキでは、<code>Main.restart_from</code> にチェックポイントの接頭辞を指定する。たとえば <code>Main(..., restart_from="outputs/minimal_1d/checkpoints/minimal_1d_ckpt_0100")</code> のように、ランクの接尾辞や <code>.h5</code> を除いた接頭辞を渡す。再開は、チェックポイントに保存された状態、時刻、時間刻みを引き継ぎ、元の出力の配置をそのまま続ける。指定した接頭辞に一致するチェックポイントがない場合や、凍結後の設定と整合しない場合（次元・メッシュ・材料・群・seed の不一致）は、開始する前に失敗する。</p>
+      <p>再開するデッキでは、<code>Main.restart_from</code> にチェックポイントの接頭辞を指定する。たとえば <code>Main(..., restart_from="outputs/minimal_1d/checkpoints/minimal_1d_ckpt_0100")</code> のように、ランクの接尾辞や <code>.h5</code> を除いた接頭辞を渡す。再開は、チェックポイントに保存された状態、時刻、時間刻みを引き継ぎ、元の出力の配置をそのまま続ける。指定した接頭辞に一致するチェックポイントがない場合や、凍結後の設定と整合しない場合（次元・メッシュ・材料・群・seed の不一致）は、開始する前に失敗する。1D の run は、途中のチェックポイントから再開しても元の run とビット一致で続く（2026-09-26 以降のチェックポイント。GXII の FLD・S<sub>N</sub> デッキと燃焼のあるデッキで、履歴の全列の一致を確かめている。光線追跡の再利用 <code>Laser.raytrace_skip_config.enabled=True</code> の run は再開直後に全光線を追跡し直すので一致しない）。2026-09-25 より前の 1D の S<sub>N</sub> の run を再開するときは、<code>Radiation.sn_transport.spatial_scheme="linear_characteristic"</code> を明示すると従来の空間離散化で続く。</p>
     </section>
 
     <section aria-labelledby="troubleshooting">

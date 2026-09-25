@@ -651,6 +651,9 @@ py::dict serialize_materials(const Config::MaterialsConfig& materials) {
     m["mg_dT_rel"] = mat.mg_dT_rel;
     m["opacity_model"] = mat.opacity_model;
     m["opacity_file"] = mat.opacity_file;
+    if (mat.opacity_lte_required) {
+      m["opacity_lte_required"] = true;
+    }
     m["kappa_a_constant"] = mat.kappa_a_constant;
     if (mat.kappa_planck_override >= 0.0) {
       m["kappa_planck_override"] = mat.kappa_planck_override;
@@ -854,6 +857,8 @@ py::dict serialize_radiation(const Config::RadiationConfig& radiation) {
       radiation.multigroup_diffusion.cg_tol_norm;
   multigroup_diffusion["outer_accel"] =
       radiation.multigroup_diffusion.outer_accel;
+  multigroup_diffusion["limiter_evaluation"] =
+      radiation.multigroup_diffusion.limiter_evaluation;
   multigroup_diffusion["anderson_m"] =
       radiation.multigroup_diffusion.anderson_m;
   multigroup_diffusion["anderson_beta"] =
@@ -907,8 +912,11 @@ py::dict serialize_radiation(const Config::RadiationConfig& radiation) {
   sn_transport["outer_tol_hydro_error_scale"] =
       radiation.sn_transport.outer_tol_hydro_error_scale;
   sn_transport["inner_tol"] = radiation.sn_transport.inner_tol;
+  sn_transport["grey_preconditioner"] = radiation.sn_transport.grey_preconditioner;
   sn_transport["inner_graph_unroll"] = radiation.sn_transport.inner_graph_unroll;
   sn_transport["dsa_enabled"] = radiation.sn_transport.dsa_enabled;
+  sn_transport["inner_acceleration"] = radiation.sn_transport.inner_acceleration;
+  sn_transport["anderson_depth"] = radiation.sn_transport.anderson_depth;
   sn_transport["z_boundary"] = radiation.sn_transport.z_boundary;
   sn_transport["diffusion_fallback_mode"] =
       radiation.sn_transport.diffusion_fallback_mode;
@@ -1026,6 +1034,9 @@ py::dict serialize_laser(const Config::LaserConfig& laser) {
       b["profile_I_rel"] = beam.profile_I;
     }
     b["power"] = serialize_callable(beam.power);
+    if (beam.energy_J > 0.0) {
+      b["energy_J"] = beam.energy_J;
+    }
     beams.append(std::move(b));
   }
 
@@ -1055,6 +1066,12 @@ py::dict serialize_laser(const Config::LaserConfig& laser) {
   absorption["eps_n"] = laser.absorption.eps_n;
   absorption["coulomb_log_floor"] = laser.absorption.coulomb_log_floor;
   absorption["debug_dump_lasermesh"] = laser.absorption.debug_dump_lasermesh;
+  // Behavior at the critical radius (terminate = False reflects the rays in
+  // the characteristic trace, 2026-09-24; neither value was recorded before).
+  py::dict critical_handling;
+  critical_handling["terminate"] = laser.absorption.terminate;
+  critical_handling["terminate_mode"] = laser.absorption.terminate_mode;
+  absorption["critical_handling"] = critical_handling;
   out["absorption"] = absorption;
   py::dict lasermesh;
   lasermesh["nr"] = laser.lasermesh.nr;
@@ -1101,6 +1118,16 @@ py::dict serialize_laser(const Config::LaserConfig& laser) {
   ib["langdon_model"] = laser.ib.langdon_model;
   ib["langdon_te_min_eV"] = laser.ib.langdon_te_min_eV;
   ib["zeff_table_loaded"] = laser.ib.zeff_table.ndens > 0;
+  if (!laser.ib.material_zeff.empty()) {
+    py::list per_material;
+    for (const auto& mz : laser.ib.material_zeff) {
+      py::dict entry;
+      entry["model"] = mz.model;
+      entry["langdon_zcoll"] = mz.langdon_zcoll;
+      per_material.append(std::move(entry));
+    }
+    ib["material_zeff"] = per_material;
+  }
   out["ib"] = ib;
   py::dict ra;
   ra["enable"] = laser.ra.enable;
@@ -1113,9 +1140,12 @@ py::dict serialize_laser(const Config::LaserConfig& laser) {
   raytrace["eps_crit"] = laser.raytrace.eps_crit;
   raytrace["max_steps"] = laser.raytrace.max_steps;
   raytrace["integrator"] = laser.raytrace.integrator;
+  raytrace["azimuthal_rays"] = laser.raytrace.azimuthal_rays;
+  raytrace["lanes_per_ray"] = laser.raytrace.lanes_per_ray;
   raytrace["test_kappa"] = laser.raytrace.test_kappa;
   raytrace["ds_adapt_g_target"] = laser.raytrace.ds_adapt_g_target;
   raytrace["ds_adapt_tau_target"] = laser.raytrace.ds_adapt_tau_target;
+  raytrace["ds_adapt_theta_target"] = laser.raytrace.ds_adapt_theta_target;
   raytrace["ds_adapt_max_factor"] = laser.raytrace.ds_adapt_max_factor;
   raytrace["debug_one_ray"] = laser.raytrace.debug_one_ray;
   out["raytrace"] = raytrace;
@@ -2850,6 +2880,7 @@ py::dict serialize_numerics(const Config::NumericsConfig& numerics) {
   ale1d["candidate_dt_penalty_max"] =
       numerics.ale1d.candidate_dt_penalty_max;
   ale1d["emergency_enabled"] = numerics.ale1d.emergency_enabled;
+  ale1d["emergency_max_dr_ratio"] = numerics.ale1d.emergency_max_dr_ratio;
   ale1d["min_cells"] = numerics.ale1d.min_cells;
   ale1d["protected_fraction_max"] = numerics.ale1d.protected_fraction_max;
   ale1d["min_movable_segment_warn"] =
@@ -3916,6 +3947,33 @@ void apply_legacy_laser_defaults(py::dict& root) {
   }
 }
 
+// Keys introduced after the checkpoint schema's last version bump, filled with
+// their defaults so that a restart from a checkpoint written before the key
+// existed, with a deck that leaves the key unset, passes the frozen
+// configuration comparison. (Those runs traced 32 lanes per ray and always
+// applied the S_N grey preconditioner; the restarted run follows the new
+// defaults, which change the results at the rounding level.)
+void apply_current_defaults(py::dict& root) {
+  py::dict laser;
+  if (try_get_child_dict(root, "laser", &laser)) {
+    py::dict raytrace;
+    if (try_get_child_dict(laser, "raytrace", &raytrace)) {
+      const Config::LaserConfig::RaytraceConfig raytrace_defaults;
+      set_default_if_missing(raytrace, "lanes_per_ray",
+                             py::cast(raytrace_defaults.lanes_per_ray));
+    }
+  }
+  py::dict radiation;
+  if (try_get_child_dict(root, "radiation", &radiation)) {
+    py::dict sn_transport;
+    if (try_get_child_dict(radiation, "sn_transport", &sn_transport)) {
+      const Config::RadiationConfig::SnTransportConfig sn_defaults;
+      set_default_if_missing(sn_transport, "grey_preconditioner",
+                             py::cast(sn_defaults.grey_preconditioner));
+    }
+  }
+}
+
 void apply_legacy_radiation_defaults(py::dict& root) {
   py::dict radiation;
   if (!try_get_child_dict(root, "radiation", &radiation)) {
@@ -4273,6 +4331,12 @@ void apply_legacy_radiation_defaults(py::dict& root) {
                            "dsa_enabled",
                            py::cast(sn_defaults.dsa_enabled));
     set_default_if_missing(sn_transport,
+                           "inner_acceleration",
+                           py::cast(sn_defaults.inner_acceleration));
+    set_default_if_missing(sn_transport,
+                           "anderson_depth",
+                           py::cast(sn_defaults.anderson_depth));
+    set_default_if_missing(sn_transport,
                            "z_boundary",
                            py::cast(sn_defaults.z_boundary));
     set_default_if_missing(sn_transport,
@@ -4507,6 +4571,34 @@ void apply_legacy_numerics_defaults(py::dict& root) {
         persistent_loop,
         "chunk_steps",
         py::cast(persistent_loop_defaults.chunk_steps));
+  }
+
+  // Numerics.ale1d keys added after the V3 introduction: a legacy frozen
+  // config takes the struct defaults (min_width_floor 2026-08-07 and its
+  // retrigger_cooldown_steps 2026-08-10, emergency_max_dr_ratio 2026-09-23),
+  // so a restart from an older checkpoint compares equal.
+  py::dict ale1d;
+  if (try_get_child_dict(numerics, "ale1d", &ale1d)) {
+    const Config::NumericsConfig::Ale1dConfig ale1d_defaults;
+    set_default_if_missing(ale1d, "emergency_max_dr_ratio",
+                           py::cast(ale1d_defaults.emergency_max_dr_ratio));
+    if (!dict_contains(ale1d, "min_width_floor")) {
+      ale1d[py::str("min_width_floor")] = py::dict();
+    }
+    py::dict min_width_floor;
+    if (try_get_child_dict(ale1d, "min_width_floor", &min_width_floor)) {
+      const auto& floor_defaults = ale1d_defaults.min_width_floor;
+      set_default_if_missing(min_width_floor, "enabled", py::cast(floor_defaults.enabled));
+      set_default_if_missing(min_width_floor, "floor_cm", py::cast(floor_defaults.floor_cm));
+      set_default_if_missing(min_width_floor, "target_factor",
+                             py::cast(floor_defaults.target_factor));
+      set_default_if_missing(min_width_floor, "relief_halfwidth_cells",
+                             py::cast(floor_defaults.relief_halfwidth_cells));
+      set_default_if_missing(min_width_floor, "max_growth_factor",
+                             py::cast(floor_defaults.max_growth_factor));
+      set_default_if_missing(min_width_floor, "retrigger_cooldown_steps",
+                             py::cast(floor_defaults.retrigger_cooldown_steps));
+    }
   }
 
   py::dict z_reflection;
@@ -7105,6 +7197,7 @@ void apply_checkpoint_migrations(py::dict& root) {
     schema_version = kCheckpointJsonSchemaV25;
   }
   apply_legacy_numerics_defaults(root);
+  apply_current_defaults(root);
   remove_retired_terminal_takeover_keys(root);
   normalize_mesh_default_elision(root);
 }

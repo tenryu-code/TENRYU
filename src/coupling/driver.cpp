@@ -13,6 +13,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <future>
 #include <iomanip>
 #include <limits>
 #include <memory>
@@ -29,6 +30,7 @@
 #include "core/device_pack.hpp"
 #include "core/device_scratch.hpp"
 #include "core/error.hpp"
+#include "core/thermal_subcycle.hpp"
 #include "core/mesh_transaction.hpp"
 #include "core/namelist/errors.hpp"
 #include "core/state_per_material_init.hpp"
@@ -41,6 +43,7 @@
 #include "coupling/persistent_loop.hpp"
 #include "coupling/reale_mode.hpp"
 #include "coupling/source_terms.hpp"
+#include "coupling/thermal_subcycle_scan.hpp"
 #include "diagnostics/diagnostics.hpp"
 #include "diagnostics/energy_budget.hpp"
 #include "diagnostics/escape_valve_history.hpp"
@@ -71,6 +74,7 @@
 #include "hydro/cavity_boundary_graph.hpp"
 #include "hydro/cap_energy_audit.hpp"
 #include "hydro/conduction.cuh"
+#include "hydro/conduction_cv.hpp"
 #include "hydro/braginskii_viscosity.cuh"
 #include "coupling/rad_gamma_coupling.cuh"
 #include "hydro/compatible_av_csw.cuh"
@@ -106,10 +110,12 @@
 #include "laser/laser.cuh"
 #include "materials/eos_table.hpp"
 #include "materials/ionmix_reader.hpp"
+#include "materials/material_closure.hpp"
 #include "materials/tmat_reader.hpp"
 #include "materials/zbar_tf.hpp"
 #include "materials/zbar_device.hpp"
 #include "materials/zmoment_state.cuh"
+#include "mesh/geometry_1d.cuh"
 #include "mesh/mesh.hpp"
 #include "mesh/z_reflection.hpp"
 #include "parallel/partition.hpp"
@@ -132,6 +138,7 @@
 #include "burn/neutron_moments.hpp"
 #include "burn/burn_stage_2d.hpp"
 #include "burn/corman_diffusion_2d.cuh"
+#include "burn/field_ions.hpp"
 #include "burn/partition.hpp"
 #include "burn/screening.hpp"
 
@@ -191,6 +198,38 @@ bool any_nonzero_span(const std::vector<double>& values,
 
 double charged_species_Z(const int species) {
   return (species == burn::kHe3 || species == burn::kHe4) ? 2.0 : 1.0;
+}
+
+// Field ions of each cell (NUMERICS §14.3, §14.7): the burn inventory
+// species and the cell's non-fuel, non-void materials by volume fraction;
+// cells with neither take the configured fuel mixture Burn.x_D/x_T/x_He3.
+void burn_cell_field_ions(const core::Config& cfg,
+                          const std::vector<int>& fuel_mats,
+                          const std::vector<double>& burn_Y,
+                          const std::vector<double>& volFrac,
+                          const int n_cells,
+                          std::vector<burn::FieldIons>& out) {
+  const int n_mat = static_cast<int>(cfg.materials.materials.size());
+  std::vector<burn::FieldIonMaterial> materials(
+      static_cast<std::size_t>(n_mat));
+  for (int m = 0; m < n_mat; ++m) {
+    const auto& def = cfg.materials.materials[static_cast<std::size_t>(m)];
+    burn::FieldIonMaterial& mat = materials[static_cast<std::size_t>(m)];
+    mat.A = def.A;
+    mat.Z = def.Z;
+    mat.field = !def.is_void &&
+                std::find(fuel_mats.begin(), fuel_mats.end(), m) ==
+                    fuel_mats.end();
+  }
+  const bool have_volfrac =
+      n_cells > 0 && volFrac.size() >= static_cast<std::size_t>(n_cells) *
+                                           static_cast<std::size_t>(n_mat);
+  burn::cell_field_ions(
+      burn_Y, have_volfrac ? volFrac.data() : nullptr, n_mat, materials,
+      n_cells,
+      burn::field_ions_from_fractions(cfg.burn.x_D, cfg.burn.x_T,
+                                      cfg.burn.x_He3),
+      out);
 }
 
 std::size_t burn_mc_pool_capacity_size(const int n_cells,
@@ -2628,8 +2667,6 @@ void initialize_eos_fields_if_needed_impl(core::State& state, core::Config& cfg)
     return;
   }
 
-  const bool use_exact_hydro = use_exact_ideal_gas_hydro_backend(mat);
-
   const std::size_t n = state.rho.size();
   TENRYU_ASSERT(state.zbar.size() == n, "initialize_eos_fields_if_needed zbar/rho size mismatch");
   TENRYU_ASSERT(state.Te.size() == n, "initialize_eos_fields_if_needed Te/rho size mismatch");
@@ -2672,9 +2709,15 @@ void initialize_eos_fields_if_needed_impl(core::State& state, core::Config& cfg)
     }
     return mat;
   };
+  // Some non-void material closes with its tables (an exact ideal-gas
+  // material does not; each cell below takes its own material's closure,
+  // so the first material's backend no longer decides for all, 2026-09-24).
   bool any_material_tables = false;
   for (const auto& m : cfg.materials.materials) {
-    if (!m.is_void && m.eos_tables) { any_material_tables = true; break; }
+    if (!m.is_void && m.eos_tables && !use_exact_ideal_gas_hydro_backend(m)) {
+      any_material_tables = true;
+      break;
+    }
   }
 
   // Preserve intentionally pressureless analytic ICs (e.g. Noh). A tabular
@@ -2689,7 +2732,7 @@ void initialize_eos_fields_if_needed_impl(core::State& state, core::Config& cfg)
       break;
     }
   }
-  if (all_at_floor && (!any_material_tables || use_exact_hydro)) {
+  if (all_at_floor && !any_material_tables) {
     return;
   }
 
@@ -2781,10 +2824,14 @@ static bool conduction_eos_device_enabled(const core::Config& cfg) {
          !(host_path != nullptr && host_path[0] == '1');
 }
 
+// The table re-closure after the conduction solve follows the tables'
+// reference material (Config eos_table_reference_material_index): in 1D the
+// first non-void material with tables, so an ideal gas listed first does not
+// switch it off for the tabled cells (2026-09-23).
 static bool conduction_energy_increment_needs_old_fields(const core::Config& cfg) {
-  const int first = cfg.materials.first_nonvoid_material_index();
-  if (first < 0) return false;
-  const auto& mat = cfg.materials.materials[static_cast<std::size_t>(first)];
+  const int ref = cfg.materials.eos_table_reference_material_index(cfg.main.dim);
+  if (ref < 0) return false;
+  const auto& mat = cfg.materials.materials[static_cast<std::size_t>(ref)];
   if (!mat.eos_tables) return false;
   const auto& table = cfg.main.two_temperature ? mat.eos_tables->electron
                                                : mat.eos_tables->total;
@@ -2795,9 +2842,9 @@ static bool conduction_energy_eos_device_enabled(
     const core::Config& cfg, const hydro::HydroEOSContext& eos_context) {
   if (!conduction_eos_device_enabled(cfg) ||
       !conduction_energy_increment_needs_old_fields(cfg)) return false;
-  const int first = cfg.materials.first_nonvoid_material_index();
-  const auto view = cfg.main.two_temperature ? eos_context.electron_view(first)
-                                             : eos_context.total_view(first);
+  const int ref = cfg.materials.eos_table_reference_material_index(cfg.main.dim);
+  const auto view = cfg.main.two_temperature ? eos_context.electron_view(ref)
+                                             : eos_context.total_view(ref);
   return view.n_rho > 0 && view.n_T > 0;
 }
 
@@ -2813,15 +2860,36 @@ static void sync_ee_from_Te_table(core::State& state, const core::Config& cfg,
   }
   const auto& mat = cfg.materials.materials[static_cast<std::size_t>(first_nonvoid)];
   const bool use_exact_hydro = use_exact_ideal_gas_hydro_backend(mat);
-  if (!mat.eos_tables && !use_exact_hydro) {
+  // Per-cell closure parameters (a 1D run whose materials differ in their
+  // backend, cv_e_override or eos_T_ref_eV; the device kernel's rule).
+  const bool per_cell_params = materials::material_closure_params_vary(cfg);
+  const std::vector<materials::MaterialClosureParams> closure_params =
+      materials::material_closure_params(cfg);
+  bool any_exact = use_exact_hydro;
+  if (per_cell_params) {
+    for (const auto& p : closure_params) {
+      any_exact = any_exact || (p.is_void == 0u &&
+                                p.hydro_backend_kind == materials::kHydroBackendExactIdealGas);
+    }
+  }
+  // The tables' reference material (fallback view, 1T table kind): in 1D the
+  // first non-void material with tables (2026-09-23).
+  const int ref = cfg.materials.eos_table_reference_material_index(cfg.main.dim);
+  const materials::EOSTableTriplet* ref_tables =
+      (ref >= 0) ? cfg.materials.materials[static_cast<std::size_t>(ref)].eos_tables.get()
+                 : nullptr;
+  if (ref_tables == nullptr && !any_exact) {
     return;
   }
 
   const std::size_t n = state.rho.size();
   // Per-cell dominant-material tables (multi-material closure, 2026-09-14):
   // a cell whose material has a non-empty table of the requested kind is
-  // evaluated with it; otherwise the first non-void material's table (the
-  // historic behaviour) is kept. Mirrors the device kernel's selection.
+  // evaluated with it. In 1D a cell whose material has no such table (in 2T:
+  // not both the electron and the ion table) closes with the ideal gas of its
+  // material, as the 1D hydro closure and the device kernel do (2026-09-23).
+  // The 2D closures still evaluate every cell with one material's tables, so
+  // in 2D such a cell keeps the first non-void material's table.
   state.ensure_cell_material_props(cfg);
   std::vector<int> cell_mat_h(n, first_nonvoid);
   if (state.cell_material_index.size() == n) {
@@ -2840,16 +2908,47 @@ static void sync_ee_from_Te_table(core::State& state, const core::Config& cfg,
   const auto electron_table_of = [&](const std::size_t i) -> const materials::EOSTable& {
     const auto* tabs = cell_tables_of(i);
     return (tabs != nullptr && !tabs->electron.empty()) ? tabs->electron
-                                                        : mat.eos_tables->electron;
+                                                        : ref_tables->electron;
   };
   const auto ion_table_of = [&](const std::size_t i) -> const materials::EOSTable& {
     const auto* tabs = cell_tables_of(i);
-    return (tabs != nullptr && !tabs->ion.empty()) ? tabs->ion : mat.eos_tables->ion;
+    return (tabs != nullptr && !tabs->ion.empty()) ? tabs->ion : ref_tables->ion;
   };
   const auto total_table_of = [&](const std::size_t i) -> const materials::EOSTable& {
     const auto* tabs = cell_tables_of(i);
-    return (tabs != nullptr && !tabs->total.empty()) ? tabs->total : mat.eos_tables->total;
+    return (tabs != nullptr && !tabs->total.empty()) ? tabs->total : ref_tables->total;
   };
+  const bool evaluate_total = !cfg.main.two_temperature && ref_tables != nullptr &&
+                              (!use_exact_hydro || per_cell_params) &&
+                              !ref_tables->total.empty();
+  const bool tableless_cells_ideal = (state.mesh.dim == 1);
+  const auto cell_is_tableless = [&](const std::size_t i) {
+    if (ref_tables == nullptr) {
+      return true;
+    }
+    const int m = cell_mat_h[i];
+    if (!tableless_cells_ideal || m < 0 || static_cast<std::size_t>(m) >= n_materials_all) {
+      return false;
+    }
+    const auto* tabs = cell_tables_of(i);
+    if (tabs == nullptr) {
+      return true;
+    }
+    if (evaluate_total) {
+      return tabs->total.empty();
+    }
+    return tabs->electron.empty() || (cfg.main.two_temperature && tabs->ion.empty());
+  };
+  std::vector<double> gamma_eff_h;
+  std::vector<double> A_eff_h;
+  if (tableless_cells_ideal && (!use_exact_hydro || per_cell_params)) {
+    TENRYU_ASSERT(state.gamma_eff.size() == n && state.A_eff.size() == n,
+                  "conduction EOS sync needs gamma_eff/A_eff per cell");
+    gamma_eff_h.resize(n);
+    A_eff_h.resize(n);
+    state.gamma_eff.copy_to_host(gamma_eff_h.data());
+    state.A_eff.copy_to_host(A_eff_h.data());
+  }
   std::vector<double> rho(n, 0.0);
   std::vector<double> zbar(n, 0.0);
   std::vector<double> Te(n, 0.0);
@@ -2900,27 +2999,38 @@ static void sync_ee_from_Te_table(core::State& state, const core::Config& cfg,
     out.cv = std::max(tab.cv(rho_s, T_eV), 0.0);
     return out;
   };
-  const double gamma = mat.ideal_gas_gamma;
-  const double A = mat.A;
-  const double cv_i_mass = kEvToErg / (A * kProtonMass * (gamma - 1.0));
-
   for (std::size_t i = 0; i < n; ++i) {
     if (state.cell_is_void.size() > i && state.cell_is_void[i] != 0U) {
       continue;
     }
+    // The cell's material's closure parameters when they differ between the
+    // materials (1D), else the first non-void material's (2026-09-24).
+    const int cm = cell_mat_h[i];
+    const materials::MaterialClosureParams* cp =
+        (per_cell_params && cm >= 0 && static_cast<std::size_t>(cm) < closure_params.size())
+            ? &closure_params[static_cast<std::size_t>(cm)]
+            : nullptr;
+    const bool exact_c =
+        (cp != nullptr) ? (cp->hydro_backend_kind == materials::kHydroBackendExactIdealGas)
+                        : use_exact_hydro;
+    const double gamma = (cp != nullptr) ? cp->gamma : mat.ideal_gas_gamma;
+    const double A = (cp != nullptr) ? cp->A : mat.A;
+    const double cv_override_c = (cp != nullptr) ? cp->cv_e_override : mat.cv_e_override;
+    const double T_ref_c = (cp != nullptr) ? cp->eos_T_ref_eV : mat.eos_T_ref_eV;
+    const double cv_i_mass = kEvToErg / (A * kProtonMass * (gamma - 1.0));
     const double rho_safe = std::max(rho[i], 1.0e-30);
     const double te = std::max(Te[i], te_floor);
     const double z = std::max(zbar[i], 0.0);
     const double cv_e_mass =
-        (mat.cv_e_override > 0.0)
-            ? (mat.cv_e_override / rho_safe)
+        (cv_override_c > 0.0)
+            ? (cv_override_c / rho_safe)
             : (z * kEvToErg / (A * kProtonMass * (gamma - 1.0)));
     const double cv_e_cell = std::max(cv_e_mass, 0.0);
     const double cv_i_cell = std::max(cv_i_mass, 0.0);
     cv_e[i] = two_temp ? cv_e_cell : (cv_e_cell + cv_i_cell);
     cv_i[i] = two_temp ? cv_i_cell : 0.0;
 
-    if (use_exact_hydro) {
+    if (exact_c) {
       if (two_temp) {
         const double ti = std::max(Ti[i], ti_floor);
         ee[i] = cv_e[i] * te;
@@ -2930,10 +3040,10 @@ static void sync_ee_from_Te_table(core::State& state, const core::Config& cfg,
       } else {
         const double cv_total = cv_e[i] + cv_i[i];
         double e_total = 0.0;
-        if (mat.eos_T_ref_eV > 0.0 && mat.cv_e_override > 0.0) {
-          const double T_ref = mat.eos_T_ref_eV;
+        if (T_ref_c > 0.0 && cv_override_c > 0.0) {
+          const double T_ref = T_ref_c;
           const double T_ref3 = T_ref * T_ref * T_ref;
-          const double alpha0 = mat.cv_e_override / (4.0 * T_ref3);
+          const double alpha0 = cv_override_c / (4.0 * T_ref3);
           const double T4 = te * te * te * te;
           e_total = alpha0 * T4 / rho_safe;
         } else {
@@ -2947,7 +3057,22 @@ static void sync_ee_from_Te_table(core::State& state, const core::Config& cfg,
       continue;
     }
 
-    if (!two_temp && !mat.eos_tables->total.empty()) {
+    if (cell_is_tableless(i)) {
+      const hydro::IdealGasCellCv ideal = hydro::ideal_gas_cell_cv(
+          two_temp, gamma_eff_h[i], A_eff_h[i], zbar[i], cv_override_c, rho_safe);
+      cv_e[i] = ideal.cv_e;
+      cv_i[i] = ideal.cv_i;
+      ee[i] = ideal.cv_e * te;
+      Pe[i] = ideal.gm1 * rho[i] * ee[i];
+      if (two_temp) {
+        const double ti = std::max(Ti[i], ti_floor);
+        ei[i] = ideal.cv_i * ti;
+        Pi[i] = ideal.gm1 * rho[i] * ei[i];
+      }
+      continue;
+    }
+
+    if (evaluate_total) {
       const HostTailThermo th = eval_with_tail(total_table_of(i), rho_safe, te);
       ee[i] = th.e;
       Pe[i] = th.P;
@@ -3001,18 +3126,22 @@ static void apply_conduction_energy_increment(
   if (conduction_eos_device_enabled(cfg) &&
       apply_conduction_energy_increment_device(state, cfg, eos_context, reclose_context)) return;
   const int first_nonvoid = cfg.materials.first_nonvoid_material_index();
-  if (first_nonvoid < 0) {
+  // The tables' reference material (fallback view): in 1D the first non-void
+  // material with tables (2026-09-23).
+  const int ref = cfg.materials.eos_table_reference_material_index(cfg.main.dim);
+  if (first_nonvoid < 0 || ref < 0) {
     sync_ee_from_Te_table(state, cfg, eos_context, reclose_context);
     return;
   }
   const auto& mat =
       cfg.materials.materials[static_cast<std::size_t>(first_nonvoid)];
-  if (!mat.eos_tables) {
+  const auto& ref_mat = cfg.materials.materials[static_cast<std::size_t>(ref)];
+  if (!ref_mat.eos_tables) {
     sync_ee_from_Te_table(state, cfg, eos_context, reclose_context);
     return;
   }
-  const auto& tab_first = cfg.main.two_temperature ? mat.eos_tables->electron
-                                                   : mat.eos_tables->total;
+  const auto& tab_first = cfg.main.two_temperature ? ref_mat.eos_tables->electron
+                                                   : ref_mat.eos_tables->total;
   if (tab_first.empty() || tab_first.T_grid_eV.empty()) {
     sync_ee_from_Te_table(state, cfg, eos_context, reclose_context);
     return;
@@ -3023,9 +3152,13 @@ static void apply_conduction_energy_increment(
     sync_ee_from_Te_table(state, cfg, eos_context, reclose_context);
     return;
   }
-  // Per-cell dominant-material table (multi-material closure, 2026-09-14);
-  // falls back to the first non-void material's table when the cell's
-  // material has no non-empty table of the requested kind.
+  // Per-cell dominant-material table (multi-material closure, 2026-09-14).
+  // In 1D a cell whose material has no non-empty table of the requested kind
+  // (in 2T: not both the electron and the ion table) closes with the ideal
+  // gas of its material, as the 1D hydro closure and the device kernel do
+  // (2026-09-23). The 2D closures still evaluate every cell with one
+  // material's tables, so in 2D such a cell falls back to the first non-void
+  // material's table.
   state.ensure_cell_material_props(cfg);
   std::vector<int> cell_mat_h(n, first_nonvoid);
   if (state.cell_material_index.size() == n) {
@@ -3046,23 +3179,54 @@ static void apply_conduction_energy_increment(
     }
     return tab_first;
   };
+  const bool tableless_cells_ideal = (state.mesh.dim == 1);
+  const auto cell_is_tableless = [&](const std::size_t i) {
+    if (!tableless_cells_ideal) {
+      return false;
+    }
+    const int m = cell_mat_h[i];
+    if (m < 0 || static_cast<std::size_t>(m) >= n_materials_all) {
+      return false;
+    }
+    const auto& cm = cfg.materials.materials[static_cast<std::size_t>(m)];
+    if (!cm.eos_tables) {
+      return true;
+    }
+    const auto& t = cfg.main.two_temperature ? cm.eos_tables->electron : cm.eos_tables->total;
+    return t.empty() || t.T_grid_eV.empty() ||
+           (cfg.main.two_temperature && cm.eos_tables->ion.empty());
+  };
   std::vector<double> rho(n, 0.0);
   std::vector<double> Te(n, 0.0);
   std::vector<double> ee(n, 0.0);
   std::vector<double> Pe(n, 0.0);
   std::vector<double> cv_e(n, 0.0);
+  std::vector<double> zbar(n, 0.0);
+  std::vector<double> gamma_eff(n, 0.0);
+  std::vector<double> A_eff(n, 0.0);
+  TENRYU_ASSERT(state.zbar.size() == n && state.gamma_eff.size() == n && state.A_eff.size() == n,
+                "conduction increment needs zbar/gamma_eff/A_eff per cell");
   {
-    std::vector<double> cond_pack(3 * n);
-    const double* srcs[3] = {state.rho.data(), state.Te.data(),
-                             state.ee.data()};
-    core::pack_pull_fields(srcs, 3, static_cast<int>(n), cond_pack.data(),
+    std::vector<double> cond_pack(6 * n);
+    const double* srcs[6] = {state.rho.data(), state.Te.data(), state.ee.data(),
+                             state.zbar.data(), state.gamma_eff.data(), state.A_eff.data()};
+    core::pack_pull_fields(srcs, 6, static_cast<int>(n), cond_pack.data(),
                            "driver:apply_cond_incr:pull");
     std::memcpy(rho.data(), cond_pack.data(), n * sizeof(double));
     std::memcpy(Te.data(), cond_pack.data() + n, n * sizeof(double));
     std::memcpy(ee.data(), cond_pack.data() + 2 * n, n * sizeof(double));
+    std::memcpy(zbar.data(), cond_pack.data() + 3 * n, n * sizeof(double));
+    std::memcpy(gamma_eff.data(), cond_pack.data() + 4 * n, n * sizeof(double));
+    std::memcpy(A_eff.data(), cond_pack.data() + 5 * n, n * sizeof(double));
   }
 
   const double te_floor = cfg.numerics.floors.Te;
+  // Per-cell closure parameters (1D runs whose materials differ in them; the
+  // device kernel's rule, 2026-09-24).
+  const bool per_cell_params = materials::material_closure_params_vary(cfg);
+  const std::vector<materials::MaterialClosureParams> closure_params =
+      materials::material_closure_params(cfg);
+  const bool first_exact = use_exact_ideal_gas_hydro_backend(mat);
 
   for (std::size_t i = 0; i < n; ++i) {
     if (state.cell_is_void.size() > i && state.cell_is_void[i] != 0U) {
@@ -3071,14 +3235,49 @@ static void apply_conduction_energy_increment(
     const materials::EOSTable& tab = table_of_cell(i);
     const double T_top = tab.T_grid_eV.back();
     const double rho_safe = std::max(rho[i], 1.0e-30);
-    const double cv_used = (i < cv_old.size() && cv_old[i] > 0.0)
-                               ? cv_old[i]
-                               : std::max(tab.cv(rho_safe, std::max(Te_old[i],
-                                                                    te_floor)),
-                                          0.0);
+    // The heat capacity the conduction solve used in this cell
+    // (conduction_cv.hpp): the captured EOS value when positive, otherwise the
+    // ideal-gas value; the former max(table cv, 0) booked zero there
+    // (2026-09-23).
+    const double cv_used = hydro::conduction_solve_cv_e(
+        i < cv_old.size() ? cv_old[i] : 0.0, zbar[i], gamma_eff[i], A_eff[i]);
     // Exact booking of the solve's energy motion in its own metric. Signed
     // table energies are valid: no zero clamp (2026-09-14).
     ee[i] = ee[i] + cv_used * (Te[i] - Te_old[i]);
+
+    const int cm = cell_mat_h[i];
+    const materials::MaterialClosureParams* cp =
+        (per_cell_params && cm >= 0 && static_cast<std::size_t>(cm) < closure_params.size())
+            ? &closure_params[static_cast<std::size_t>(cm)]
+            : nullptr;
+    const bool exact_c =
+        (cp != nullptr) ? (cp->hydro_backend_kind == materials::kHydroBackendExactIdealGas)
+                        : first_exact;
+    if (tableless_cells_ideal && exact_c) {
+      // Exact ideal-gas cell: invert with the heat capacity the solve used
+      // (the hydro closure's constant one), as the device kernel does.
+      double T_exact = (cv_used > 0.0) ? ee[i] / cv_used : te_floor;
+      if (!std::isfinite(T_exact) || T_exact < te_floor) {
+        T_exact = te_floor;
+      }
+      Te[i] = T_exact;
+      Pe[i] = (std::max(gamma_eff[i], 1.0 + 1.0e-12) - 1.0) * rho[i] * std::max(ee[i], 0.0);
+      cv_e[i] = cv_used;
+      continue;
+    }
+    if (cell_is_tableless(i)) {
+      const hydro::IdealGasCellCv ideal = hydro::ideal_gas_cell_cv(
+          cfg.main.two_temperature, gamma_eff[i], A_eff[i], zbar[i],
+          (cp != nullptr) ? cp->cv_e_override : mat.cv_e_override, rho_safe);
+      double T_ideal = (ideal.cv_e > 0.0) ? ee[i] / ideal.cv_e : te_floor;
+      if (!std::isfinite(T_ideal) || T_ideal < te_floor) {
+        T_ideal = te_floor;
+      }
+      Te[i] = T_ideal;
+      Pe[i] = ideal.gm1 * rho[i] * std::max(ee[i], 0.0);
+      cv_e[i] = ideal.cv_e;
+      continue;
+    }
 
     // Tail-aware inversion: T from the updated energy.
     double T_inv = tab.temperature_from_energy(rho_safe, ee[i]);
@@ -3124,20 +3323,44 @@ static void refresh_mie_gruneisen_thermo_from_energy(core::State& state,
                                                      const core::Config& cfg,
                                                      const hydro::HydroEOSContext& eos_ctx,
                                                      DriverRecloseContext& reclose_ctx) {
-  const int first_nonvoid = cfg.materials.first_nonvoid_material_index();
-  if (first_nonvoid < 0) {
+  // The Mie-Gruneisen materials' cells take their temperatures from their
+  // own tables. With several non-void materials each cell uses its own
+  // material's tables, and with per-material closure parameters only the
+  // Mie-Gruneisen cells are re-closed (2026-09-24; every non-void cell used
+  // to be re-closed with the first material's tables whenever that material
+  // was Mie-Gruneisen).
+  int mg_material = -1;
+  int n_nonvoid = 0;
+  for (std::size_t m = 0; m < cfg.materials.materials.size(); ++m) {
+    const auto& cm = cfg.materials.materials[m];
+    if (cm.is_void) {
+      continue;
+    }
+    ++n_nonvoid;
+    if (mg_material < 0 && cm.eos_tables && use_mie_gruneisen_hydro_backend(cm)) {
+      mg_material = static_cast<int>(m);
+    }
+  }
+  if (mg_material < 0 || !cfg.main.two_temperature) {
     return;
   }
-  const auto& mat = cfg.materials.materials[static_cast<std::size_t>(first_nonvoid)];
-  if (!mat.eos_tables || !use_mie_gruneisen_hydro_backend(mat) || !cfg.main.two_temperature) {
-    return;
-  }
+  const auto& mat = cfg.materials.materials[static_cast<std::size_t>(mg_material)];
 
   if (state.mesh.dim == 1) {
     const materials::DeviceEOSTableView electron_view =
-        eos_ctx.electron_view(first_nonvoid);
+        eos_ctx.electron_view(mg_material);
     const materials::DeviceEOSTableView ion_view =
-        eos_ctx.ion_view(first_nonvoid);
+        eos_ctx.ion_view(mg_material);
+    materials::CellEOSTableSelector cell_tables{};
+    if (n_nonvoid > 1) {
+      state.ensure_cell_material_props(cfg);
+      if (state.cell_material_index.size() == state.rho.size()) {
+        cell_tables = materials::make_cell_eos_table_selector(
+            eos_ctx.d_ion_views, eos_ctx.d_electron_views, eos_ctx.d_total_views,
+            eos_ctx.n_materials, state.cell_material_index.data());
+        cell_tables.closure_params = eos_ctx.d_closure_params;
+      }
+    }
     if (electron_view.n_rho > 0 && ion_view.n_rho > 0) {
       launch_tabular_eos_reclose(
           reclose_ctx,
@@ -3155,7 +3378,8 @@ static void refresh_mie_gruneisen_thermo_from_energy(core::State& state,
           state.cv_e.empty() ? nullptr : state.cv_e.data(),
           state.cv_i.empty() ? nullptr : state.cv_i.data(),
           cfg.numerics.floors.Te,
-          cfg.numerics.floors.Ti);
+          cfg.numerics.floors.Ti,
+          cell_tables);
       return;
     }
   }
@@ -3572,6 +3796,31 @@ double compute_holo_E_LO_total(const core::State& state, const core::Config& cfg
   return static_cast<double>(total);
 }
 
+// Run-cumulative energy ledger for the history (SPEC §7.3). Marshak,
+// volume-source, radiation-escape, numerical-loss, boundary-pdV and floor
+// counters accumulate each rank's share, so they are summed over ranks like
+// the step budget's rank-local terms; E_safety and E_solver accumulate the
+// already-reduced step budget values and are taken as they are.
+diagnostics::EnergyLedgerCumulative cumulative_energy_ledger(
+    const core::State& state,
+    const parallel::Reduction& reducer) {
+  std::array<double, 6> local = {state.E_Marshak_in,     state.E_volume_in,
+                                 state.E_rad_escaped,    state.E_numerical_loss,
+                                 state.E_pdV_bdry,       state.E_floor_injected};
+  reducer.allreduce_sum(local.data(), static_cast<int>(local.size()));
+  diagnostics::EnergyLedgerCumulative out{};
+  out.valid = true;
+  out.marshak_in = local[0];
+  out.volume_in = local[1];
+  out.radiation_escaped = local[2];
+  out.numerical_loss = local[3];
+  out.pdv_boundary = local[4];
+  out.floor_injected = local[5];
+  out.safety_injected = state.E_safety;
+  out.solver_residual = state.E_solver;
+  return out;
+}
+
 double compute_holo_particle_net_source_core(const core::State& state,
                                              const core::Config& cfg) {
   const std::size_t n_cells = state.rho.size();
@@ -3929,6 +4178,12 @@ double compute_boundary_pdv_work_1d(const core::State& state,
   if (n_nodes == 0 || state.v_r.size() != n_nodes) {
     return 0.0;
   }
+  // Only a pressure boundary does work on the outer node; the other
+  // boundaries need no readback of the outer node.
+  const hydro::HydroBoundaryType bc_type = hydro::parse_boundary_type_1d(cfg);
+  if (bc_type != hydro::HydroBoundaryType::PRESSURE) {
+    return 0.0;
+  }
 
   double outer_node_r = 0.0;
   double outer_node_v = 0.0;
@@ -3940,19 +4195,14 @@ double compute_boundary_pdv_work_1d(const core::State& state,
   outer_node_r = out2[0];
   outer_node_v = out2[1];
 
-  const hydro::HydroBoundaryType bc_type = hydro::parse_boundary_type_1d(cfg);
-  double p_outer = 0.0;
-  if (bc_type == hydro::HydroBoundaryType::PRESSURE) {
-    p_outer = boundary_pressure_drive(state, t_op + 0.5 * dt_op);
-  }
+  const double p_outer = boundary_pressure_drive(state, t_op + 0.5 * dt_op);
 
   const double r_outer = std::max(outer_node_r, 0.0);
-  const bool cylindrical_1d =
-      state.mesh.geometry_code == 1 ||
-      core::geometry_1d_from_dimension(cfg.main.dimension) ==
-          core::Geometry1D::Cylindrical;
+  // The hydro's own face area (4 pi r^2, 2 pi r per unit length, 1 per unit
+  // area); Main.dimension="1D_CYL" also sets geometry_code 1. Planar used to
+  // take 4 pi r^2 here while the hydro works with area 1.
   const double area_outer =
-      cylindrical_1d ? 2.0 * kPi * r_outer : 4.0 * kPi * r_outer * r_outer;
+      mesh::geometry_1d_face_area(state.mesh.geometry_code, r_outer);
   const double v_outer = outer_node_v;
   return p_outer * area_outer * v_outer * dt_op;
 }
@@ -4950,8 +5200,7 @@ std::string describe_split_sequence(const SplittingOrder order,
     }
   };
   const bool embed_conduction_in_thermal_subcycle =
-      cfg.numerics.radiation_thermal_subcycle && cfg.radiation.enabled &&
-      !cfg.radiation.imc.two_stage;
+      core::thermal_subcycle_active(cfg);
   const bool standalone_conduction =
       cfg.numerics.conduction.enabled && !embed_conduction_in_thermal_subcycle;
 
@@ -5998,6 +6247,13 @@ DtLineage compute_dt_lineage(const core::State& state,
 
   dt_new = std::min(dt_new, cfg.numerics.dt.max_s);
   dt_uncapped = std::min(dt_uncapped, cfg.numerics.dt.max_s);
+  // In 1D the next step grows from dt before the truncations to output times
+  // and t_end below: they place the end of this step, they are not a
+  // stability bound, and growing from a truncated step would hold the
+  // following steps to growth_factor^k times the truncated value
+  // (NUMERICS §2.2). 2D keeps growing from the truncated dt.
+  const bool growth_basis_before_truncation = state.mesh.dim == 1;
+  double dt_growth_basis = dt_uncapped;
 
   double dt_output = std::numeric_limits<double>::infinity();
   auto output_gap = [&](const double t_next, const double every_s) {
@@ -6030,17 +6286,22 @@ DtLineage compute_dt_lineage(const core::State& state,
 
   dt_new = std::min(dt_new, t_end - state.t);
   dt_uncapped = std::min(dt_uncapped, t_end - state.t);
+  if (!growth_basis_before_truncation) {
+    dt_growth_basis = dt_uncapped;
+  }
   const bool retry_dt_forced =
       !g_dt_lineage_context.retry_phase.empty() &&
       g_dt_lineage_context.retry_dt_after > 0.0;
   if (retry_dt_forced) {
     dt_new = g_dt_lineage_context.retry_dt_after;
     dt_uncapped = dt_new;
+    dt_growth_basis = dt_new;
   }
   const double fixed_dt = i1b_fixed_dt();
   if (fixed_dt > 0.0) {
     dt_new = std::min(fixed_dt, t_end - state.t);
     dt_uncapped = dt_new;
+    dt_growth_basis = dt_new;
   }
   static std::uint64_t dt_forensic_calls_since_log = 100;
   if (dt_forensic_calls_since_log < 100) {
@@ -6065,6 +6326,7 @@ DtLineage compute_dt_lineage(const core::State& state,
     dt_forensic_calls_since_log = 0;
   }
   lineage.dt_uncapped_by_contact = dt_uncapped;
+  lineage.dt_growth_basis = dt_growth_basis;
   double dt_chosen = dt_new;
   lineage.dt_chosen = dt_chosen;
   lineage.dt_hydro = dt_hydro;
@@ -6117,7 +6379,7 @@ DtLineage compute_dt_lineage(const core::State& state,
     in.dt_cond = dt_cond;
     in.dt_visc = lineage.dt_visc;
     in.dt_rad = dt_rad_val;
-    in.dt_prev = state.dt;
+    in.dt_prev = (state.dt_growth_ref > 0.0) ? state.dt_growth_ref : state.dt;
     in.growth_factor = cfg.numerics.dt.growth_factor;
     in.dt_max = cfg.numerics.dt.max_s;
     in.dt_output = dt_output;
@@ -6430,6 +6692,7 @@ DtLineage compute_dt_lineage(const core::State& state,
         lineage.dt_chosen = candidate;
         lineage.dt_uncapped_by_contact =
             std::max(lineage.dt_uncapped_by_contact, candidate);
+        lineage.dt_growth_basis = std::max(lineage.dt_growth_basis, candidate);
         lineage.limiter = "rezone_reanchor";
       }
     }
@@ -6583,7 +6846,21 @@ void Driver::run(core::State& state,
     laser_mesh = laser::create_from_config(cfg);
   }
   std::vector<int> burn_fuel_mats;
-  burn::PartitionTable burn_partition_table;
+  // The LP partition table is built on worker threads from the start of the
+  // run and waited for where a burn stage first needs it (a local-scheme
+  // stage runs only once a fuel cell can react).
+  std::shared_future<burn::PartitionTable> burn_partition_future;
+  const auto burn_partition_table = [&]() -> const burn::PartitionTable& {
+    return burn_partition_future.get();
+  };
+  const auto start_burn_partition_table = [&]() {
+    burn_partition_future =
+        std::async(std::launch::async,
+                   [x_D = cfg.burn.x_D, x_T = cfg.burn.x_T, x_He3 = cfg.burn.x_He3] {
+                     return burn::build_partition_table(x_D, x_T, x_He3);
+                   })
+            .share();
+  };
   core::DeviceBuffer<double> burn_r_node_dev;
   core::DeviceBuffer<double> burn_vol_dev;
   core::DeviceBuffer<double> burn_rho_dev;
@@ -6591,6 +6868,7 @@ void Driver::run(core::State& state,
   core::DeviceBuffer<double> burn_Ti_dev;
   core::DeviceBuffer<double> burn_ne_dev;
   core::DeviceBuffer<double> burn_S_birth_dev;
+  core::DeviceBuffer<double> burn_field_ions_dev;
   // --- Nuclear burn init: fuel material indices, species inventories,
   //     LP partition table (init-time; no runtime Python) ---
   if (cfg.burn.scheme != "diffusion") {
@@ -6615,8 +6893,7 @@ void Driver::run(core::State& state,
       TENRYU_ASSERT(found >= 0, "Burn fuel material validation failed");
       burn_fuel_mats.push_back(found);
     }
-    burn_partition_table = burn::build_partition_table(
-        cfg.burn.x_D, cfg.burn.x_T, cfg.burn.x_He3);
+    start_burn_partition_table();
     const int n_cells = static_cast<int>(state.rho.size());
     const std::size_t burn_inventory_size =
         static_cast<std::size_t>(n_cells) * burn::kNumSpecies;
@@ -6935,8 +7212,7 @@ void Driver::run(core::State& state,
       TENRYU_ASSERT(found >= 0, "Burn fuel material validation failed");
       burn_fuel_mats.push_back(found);
     }
-    burn_partition_table = burn::build_partition_table(
-        cfg.burn.x_D, cfg.burn.x_T, cfg.burn.x_He3);
+    start_burn_partition_table();
     const int n_cells = static_cast<int>(state.rho.size());
     const std::size_t burn_inventory_size =
         static_cast<std::size_t>(n_cells) * burn::kNumSpecies;
@@ -7105,13 +7381,17 @@ void Driver::run(core::State& state,
                   "the r-slab halo strips assume the structured "
                   "single-block index space (deferral list; equal-split "
                   "node-mass modes included)");
-    TENRYU_ASSERT(cfg.numerics.hydro.time_integration !=
-                      core::HydroTimeIntegration::MidpointV1,
+    // Numerics.hydro.time_integration selects the 2D RZ integrator only (the
+    // 1D Lagrangian step has one integrator); its default midpoint_v1 made
+    // every 1D multi-rank run fail this guard from 2026-07-29 to 2026-09-26.
+    TENRYU_ASSERT(cfg.main.dim != 2 ||
+                      cfg.numerics.hydro.time_integration !=
+                          core::HydroTimeIntegration::MidpointV1,
                   "midpoint_v1 time integration is not supported under MPI "
                   "in v1 (merge seam: midpoint internals are not "
                   "rank-decomposed)");
   }
-  bool warned_2t_collapse = false;
+  bool seen_2t_separation = false;
   bool warned_clamp_threshold = false;
   parallel::EmigrantBuffer emigrants;
   parallel::EmigrantBuffer immigrants;
@@ -7244,17 +7524,29 @@ void Driver::run(core::State& state,
     return t_next_output;
   };
 
-  const auto emit_due_outputs = [&](auto fill_history_snapshot) {
+  const auto emit_due_outputs = [&](auto fill_history_snapshot,
+                                    auto make_dt_breakdown_record) {
     const core::NvtxRange nvtx_range("phase.outputs");
     const bool do_history = out.should_history(state.step, state.t, state, cfg);
     const bool do_dt_diagnostics =
         cfg.numerics.diagnostics.dt_breakdown_history_enabled;
-    if ((do_history || do_dt_diagnostics) && history_writer.enabled()) {
+    // The dt-breakdown groups are written every step and the full row at the
+    // history_every / history_every_s cadence (SPEC §6.4, §7.3). In 2D the
+    // dt-breakdown diagnostic still writes the full row every step.
+    const bool full_row =
+        do_history || (do_dt_diagnostics && state.mesh.dim != 1);
+    if (full_row && history_writer.enabled()) {
       diagnostics::HistorySnapshot snapshot{};
-      fill_history_snapshot(snapshot);
+      {
+        const core::NvtxRange nvtx_fill("outputs.history_snapshot");
+        fill_history_snapshot(snapshot);
+      }
       if (part_info.rank == 0) {
         history_writer.append(state, snapshot);
       }
+    } else if (do_dt_diagnostics && history_writer.enabled() &&
+               part_info.rank == 0) {
+      history_writer.append_dt_breakdown(state, make_dt_breakdown_record());
     }
     if (do_history) {
       maybe_report_f09_fallback();
@@ -7264,6 +7556,7 @@ void Driver::run(core::State& state,
 
     if (out.should_plot(state.step, state.t, state, cfg)) {
       if (part_info.rank == 0) {
+        const core::NvtxRange nvtx_snapshot("outputs.write_snapshot");
         out.write_snapshot(state, cfg, state.step, state.t, case_name, part_info.rank);
         last_plot_step = state.step;
         out.write_run_info(state, cfg);
@@ -7285,6 +7578,7 @@ void Driver::run(core::State& state,
                               cfg.output.checkpoint_every_s,
                               state.t);
       if (part_info.rank == 0) {
+        const core::NvtxRange nvtx_checkpoint("outputs.write_checkpoint");
         out.write_checkpoint(state,
                              cfg,
                              imc.photon_pool(),
@@ -7317,13 +7611,26 @@ void Driver::run(core::State& state,
       state.dt = cfg.numerics.dt.initial_s / cfg.numerics.dt.growth_factor;
       state.dt_growth_ref = state.dt;
     }
+    // History rows carry the budget and clamp count of the step before them,
+    // as in the multi-kernel loop (the persistent path wrote the totals only,
+    // so its conservation error was always 0; 2026-09-23).
+    std::optional<PersistentStepSummary> persistent_last_step;
+    const auto fill_persistent_history = [&](diagnostics::HistorySnapshot& snapshot) {
+      if (persistent_last_step) {
+        snapshot.energy = persistent_last_step->budget;
+        snapshot.clamp_count = persistent_last_step->clamp_count;
+      } else {
+        snapshot.energy = diagnostics::compute_energy_budget_1d(state);
+      }
+    };
     while ((cfg.main.t_end - state.t) >
                1.0e-14 * std::max(std::abs(state.t),
                                    std::abs(cfg.main.t_end)) &&
            state.step < cfg.main.max_steps) {
-      emit_due_outputs([&](diagnostics::HistorySnapshot& snapshot) {
-        snapshot.energy = diagnostics::compute_energy_budget_1d(state);
-      });
+      // The persistent loop does not run with the dt-breakdown history
+      // (persistent_loop.cu rejects it), so there is no per-step dt record.
+      emit_due_outputs(fill_persistent_history,
+                       [] { return diagnostics::DtBreakdownHistoryRecord{}; });
       update_next_output_time(state.t_next_plot, cfg.output.plot_every_s, state.t);
       update_next_output_time(state.t_next_history, cfg.output.history_every_s,
                               state.t);
@@ -7345,6 +7652,59 @@ void Driver::run(core::State& state,
                                               t_next_output,
                                               remaining_steps);
       TENRYU_ASSERT(chunk.error_code == 0, "persistent_loop: device error");
+      // The multi-kernel per-step checks on the chunk's steps.
+      for (const PersistentStepSummary& step_summary : chunk.steps) {
+        const diagnostics::EnergyBudget& step_budget = step_summary.budget;
+        if (cfg.numerics.safety.energy_fatal &&
+            step_budget.epsilon_budget > cfg.numerics.safety.energy_budget_tol) {
+          std::ostringstream oss;
+          oss << std::scientific << std::setprecision(6);
+          oss << "Energy budget violation: epsilon_budget=" << step_budget.epsilon_budget
+              << " exceeds safety.energy_budget_tol=" << cfg.numerics.safety.energy_budget_tol
+              << " at step=" << step_summary.step
+              << ", t=" << step_summary.t_after
+              << ", dt=" << step_summary.dt;
+          TENRYU_ASSERT(false, oss.str());
+        }
+        const int step_clamp_count = step_summary.clamp_count;
+        if (!warned_clamp_threshold &&
+            step_clamp_count > cfg.numerics.safety.clamp_warn_threshold) {
+          std::ostringstream oss;
+          oss << "[SAFETY] step=" << step_summary.step
+              << " t=" << step_summary.t_after
+              << " dt=" << step_summary.dt
+              << ": Floor clamp count exceeded safety.clamp_warn_threshold: clamp_count="
+              << step_clamp_count
+              << ", threshold=" << cfg.numerics.safety.clamp_warn_threshold;
+          core::log_warning(oss.str());
+          warned_clamp_threshold = true;
+        }
+        if (step_clamp_count > cfg.numerics.safety.clamp_fatal_threshold) {
+          std::ostringstream oss;
+          oss << "[SAFETY] step=" << step_summary.step
+              << " t=" << step_summary.t_after
+              << " dt=" << step_summary.dt
+              << ": Floor clamp count exceeded safety.clamp_fatal_threshold: clamp_count="
+              << step_clamp_count
+              << ", threshold=" << cfg.numerics.safety.clamp_fatal_threshold;
+          TENRYU_ASSERT(false, oss.str());
+        }
+        if (step_clamp_count > 100) {
+          static int persistent_high_clamp_warn_count = 0;
+          ++persistent_high_clamp_warn_count;
+          if (persistent_high_clamp_warn_count == 1 ||
+              persistent_high_clamp_warn_count % 100 == 0) {
+            core::log_warning("High clamp count: " + std::to_string(step_clamp_count) +
+                              " clamps this step (warning #" +
+                              std::to_string(persistent_high_clamp_warn_count) + ")");
+          }
+        }
+        diagnostics::log_energy_budget_step(step_budget, cfg, step_summary.step,
+                                            step_summary.t_after);
+      }
+      if (!chunk.steps.empty()) {
+        persistent_last_step = chunk.steps.back();
+      }
       log_progress_if_needed(state, cfg, reducer);
       TENRYU_ASSERT(chunk.steps_advanced > 0 || chunk.exit_reason != 0,
                     "persistent_loop: empty chunk without exit");
@@ -7355,9 +7715,31 @@ void Driver::run(core::State& state,
                      " t_next_history=" +
                          std::to_string(state.t_next_history));
     }
-    emit_due_outputs([&](diagnostics::HistorySnapshot& snapshot) {
-      snapshot.energy = diagnostics::compute_energy_budget_1d(state);
-    });
+    emit_due_outputs(fill_persistent_history,
+                     [] { return diagnostics::DtBreakdownHistoryRecord{}; });
+    // End of run as in the multi-kernel loop: the final snapshot and the
+    // termination reason (the persistent path returned without them,
+    // 2026-09-23).
+    if (cfg.output.write_final_snapshot && part_info.rank == 0 &&
+        last_plot_step != state.step) {
+      out.write_snapshot(state, cfg, state.step, state.t, case_name,
+                         part_info.rank);
+      out.write_run_info(state, cfg);
+      core::log_info("[output] wrote final snapshot (step=" +
+                     std::to_string(state.step) +
+                     ", t=" + format_sci(state.t) + ")");
+    }
+    if ((cfg.main.t_end - state.t) <=
+        1.0e-14 * std::max(std::abs(state.t), std::abs(cfg.main.t_end))) {
+      out.set_termination_reason("t_end_reached");
+    } else if (state.step >= cfg.main.max_steps) {
+      out.set_termination_reason("max_steps_reached");
+    } else {
+      out.set_termination_reason("loop_exit_condition");
+    }
+    if (part_info.rank == 0) {
+      out.write_run_info(state, cfg);
+    }
     return;
   }
 
@@ -7419,6 +7801,14 @@ void Driver::run(core::State& state,
   h1d_dump7("d1");
   bool fixed_dt_logged = false;
   bool autopilot_fire_stop = false;
+  // Thermal-subcycle attempt backups and substep tallies, kept across steps
+  // so the device buffers are allocated once (copying into a field of the
+  // same size does not reallocate), not cudaMalloc'd and freed every step.
+  struct ThermalSubcycleScratch {
+    core::CellField1D ee, ei, Te, Ti, Pe, Pi, cv_e, cv_i, zbar, sn_ee_node_offset;
+    core::GroupField1D rad_E, rad_E_old, sn_psi_prev, sn_psi_sd_prev;
+    core::GroupField1D rad_dep_total, rad_emit_total, holo_rad_dep_total, holo_rad_emit_total;
+  } thermal_subcycle_scratch;
   while (state.t < cfg.main.t_end && state.step < cfg.main.max_steps) {
     const core::NvtxRange nvtx_range("step");
     core::NvtxRange nvtx_step_phase("step_phase.setup");
@@ -7700,6 +8090,8 @@ void Driver::run(core::State& state,
         step_dt_lineage.dt_uncapped_by_contact =
             std::max(step_dt_lineage.dt_uncapped_by_contact,
                      cfg.numerics.dt.min_s);
+        step_dt_lineage.dt_growth_basis =
+            std::max(step_dt_lineage.dt_growth_basis, cfg.numerics.dt.min_s);
         step_dt_lineage.dt_floor_abort_pending = false;
       } else if (state.central_pseudo_core.built &&
                  state.central_pseudo_core.min_member_ring_count >
@@ -7726,6 +8118,8 @@ void Driver::run(core::State& state,
         step_dt_lineage.dt_uncapped_by_contact =
             std::max(step_dt_lineage.dt_uncapped_by_contact,
                      cfg.numerics.dt.min_s);
+        step_dt_lineage.dt_growth_basis =
+            std::max(step_dt_lineage.dt_growth_basis, cfg.numerics.dt.min_s);
         step_dt_lineage.dt_floor_abort_pending = false;
       } else if (step_dt_lineage.limiter == "growth" &&
                  step_dt_lineage.dt_hydro >= cfg.numerics.dt.min_s) {
@@ -7737,6 +8131,8 @@ void Driver::run(core::State& state,
         step_dt_lineage.dt_uncapped_by_contact =
             std::max(step_dt_lineage.dt_uncapped_by_contact,
                      cfg.numerics.dt.min_s);
+        step_dt_lineage.dt_growth_basis =
+            std::max(step_dt_lineage.dt_growth_basis, cfg.numerics.dt.min_s);
         step_dt_lineage.dt_floor_abort_pending = false;
       } else {
         if (dt_floor_consecutive >=
@@ -7759,7 +8155,7 @@ void Driver::run(core::State& state,
     }
     double dt = reducer.allreduce_min(step_dt_lineage.dt_chosen);
     double dt_ref =
-        reducer.allreduce_min(step_dt_lineage.dt_uncapped_by_contact);
+        reducer.allreduce_min(step_dt_lineage.dt_growth_basis);
     if (verbose_phase_timing) {
       step_dt_ms += ms(t_dt_start, Clock::now());
     }
@@ -8404,6 +8800,7 @@ void Driver::run(core::State& state,
     double step_E_laser_in = 0.0;
     double step_E_burn_in = 0.0;
     double step_E_laser_esc = 0.0;
+    double step_E_laser_dropped = 0.0;
     double step_E_ra_dep = 0.0;
     double step_E_cbet_iaw = 0.0;
     double step_E_rad_esc = 0.0;
@@ -8425,6 +8822,19 @@ void Driver::run(core::State& state,
     double step_holo_boundary_out = 0.0;
     double step_holo_matter_delta = 0.0;
     double step_holo_source_balance_error = 0.0;
+    // FLD outer-iteration history over every FLD solve of the step (a
+    // thermal-subcycled step solves once per substep): iterations summed,
+    // the largest exit residual, converged only if every solve converged.
+    int step_fld_solves = 0;
+    std::int64_t step_fld_outer_iterations = 0;
+    double step_fld_outer_residual = 0.0;
+    bool step_fld_converged = true;
+    // The same over the step's S_N solves (outer and inner iterations).
+    int step_sn_solves = 0;
+    std::int64_t step_sn_outer_iterations = 0;
+    std::int64_t step_sn_inner_iterations = 0;
+    double step_sn_outer_residual = 0.0;
+    bool step_sn_converged = true;
     const double prev_E_solver = state.E_solver;
     int step_clamp_count = 0;
     std::vector<laser::RayOutputData> step_ray_output;
@@ -9030,7 +9440,7 @@ void Driver::run(core::State& state,
                                &eos_ctx);
         dt = reducer.allreduce_min(step_dt_lineage.dt_chosen);
         dt_ref =
-            reducer.allreduce_min(step_dt_lineage.dt_uncapped_by_contact);
+            reducer.allreduce_min(step_dt_lineage.dt_growth_basis);
         if (verbose_phase_timing) {
           step_dt_ms += ms(t_dt_retry_start, Clock::now());
         }
@@ -9058,8 +9468,7 @@ void Driver::run(core::State& state,
         out.should_plot(state.step + 1, state.t + dt, state, cfg);
     clear_laser_ray_output(state);
     const bool embed_conduction_in_thermal_subcycle =
-        cfg.numerics.radiation_thermal_subcycle && cfg.radiation.enabled &&
-        !cfg.radiation.imc.two_stage;
+        core::thermal_subcycle_active(cfg);
     const bool phase_energy_trace_enabled = (cfg.main.verbosity == "verbose");
     // W-J (VERIFICATION 10.1 drive-phase eps audit): per-operator energy
     // ledger closure, read-only and default-inert. Enable with
@@ -9637,9 +10046,21 @@ void Driver::run(core::State& state,
       const std::string hydro_operator_name =
           hydro_half != nullptr ? std::string("hydro_") + hydro_half
                                 : std::string("hydro");
+      // The radiation pressure force's work W_r is kinetic energy the matter
+      // gains in the step; the field pays it back after this audit.
+      double hydro_radiation_pressure_work = 0.0;
+      if (operator_energy_tracker.enabled() && is_1d && rad_gamma43_coupling_on &&
+          !res.retry_required) {
+        const auto gr_cw =
+            state.owned_cell_window(static_cast<int>(state.rho.size()));
+        hydro_radiation_pressure_work =
+            reducer.allreduce_sum(rad_gamma::sum_gamma_r_43_work(
+                rad_gamma43_W_r.data(), gr_cw.begin, gr_cw.end));
+      }
       record_operator_energy(hydro_operator_name,
                              op_energy_before,
-                             std::max(hydro_E_floor, 0.0) - hydro_pdv_work);
+                             std::max(hydro_E_floor, 0.0) - hydro_pdv_work +
+                                 hydro_radiation_pressure_work);
       wj_audit_log(hydro_operator_name.c_str(), wj_b_hydro);
       if (rad_gamma43_coupling_on && !res.retry_required) {
         // gamma_r=4/3 field update BEFORE the Delta(E_r V) tally below, so
@@ -9949,7 +10370,10 @@ void Driver::run(core::State& state,
           cond_ebal_enabled
               ? diagnostics::compute_energy_budget_1d(state).E_total
               : 0.0;
-      if (cond_energy_authoritative) {
+      if (conduction_result.energy_closed_by_solve) {
+        // Per-material conduction booked the energy in the material
+        // energies and derived ee, Te and Pe from them.
+      } else if (cond_energy_authoritative) {
         apply_conduction_energy_increment(state, cfg, cond_Te_old,
                                           cond_cv_old, eos_ctx, reclose_ctx);
       } else {
@@ -10084,7 +10508,14 @@ void Driver::run(core::State& state,
         allgatherv_2d_node_field(state.x_r.data());
         allgatherv_2d_node_field(state.x_z.data());
       }
-      // Laser reads Zbar internally from state.zbar while building its hydro mirror.
+      // Laser reads Zbar internally from state.zbar while building its hydro
+      // mirror. In 1D the last Zbar refresh ran at the start of the previous
+      // step's second hydro half, so refresh it from the current rho/Te here
+      // (n_e, the critical radius, IB kappa and the ghost-corona anchor all
+      // derive from it; 2026-09-23).
+      if (is_1d) {
+        update_zbar_for_step(state, cfg, zbar_device_context);
+      }
       laser::laser_step(state,
                         laser_mesh,
                         cfg.laser,
@@ -10150,13 +10581,25 @@ void Driver::run(core::State& state,
           std::fclose(fp);
         }
       }
+      // The laser step's ledger: commanded = deposited + unabsorbed (rays)
+      // + hot-electron escape + power the deposit transfer could not place
+      // (no receiver cell) + CBET ion-acoustic sink. The dropped power is a
+      // loss of the laser operator; it is a global value, booked once (rank 0)
+      // with the rank-local numerical losses.
       const double commanded = std::max(laser_mesh.last_commanded_energy, 0.0);
       const double escaped = std::max(laser_mesh.last_unabsorbed_power, 0.0) * dt_op;
+      const double hot_e_escaped = std::max(state.hot_e_escaped_step, 0.0);
+      const double transfer_dropped =
+          std::max(laser_mesh.last_transfer_blocked_power, 0.0) * dt_op;
       const double ra_dep = std::max(laser_mesh.last_ra_power, 0.0) * dt_op;
       step_E_laser_in += commanded;
       step_E_laser_esc += escaped;
       step_E_ra_dep += ra_dep;
-      step_E_laser_esc += std::max(state.hot_e_escaped_step, 0.0);
+      step_E_laser_esc += hot_e_escaped;
+      step_E_laser_dropped += transfer_dropped;
+      if (part_info.rank == 0) {
+        step_E_numerical_loss += transfer_dropped;
+      }
       step_E_cbet_iaw += state.E_cbet_iaw_step;
       const double sum_laser_dep_after_transfer =
           sum_field_for_phase_trace(state.laser_dep);
@@ -10175,7 +10618,9 @@ void Driver::run(core::State& state,
       step_clamp_count += std::max(source_clamp_count, 0);
       refresh_mie_gruneisen_thermo_from_energy(state, cfg, eos_ctx, reclose_ctx);
       const double laser_delta_E_ext =
-          std::max(commanded - escaped - state.E_cbet_iaw_step, 0.0) -
+          std::max(commanded - escaped - hot_e_escaped - transfer_dropped -
+                       state.E_cbet_iaw_step,
+                   0.0) -
           std::max(inject_laser_source_terms_skipped_energy, 0.0) +
           std::max(source_E_floor, 0.0);
       record_operator_energy("laser", op_energy_before, laser_delta_E_ext);
@@ -10246,9 +10691,62 @@ void Driver::run(core::State& state,
                                             : OpEnergyCapture{};
       const WjOpAuditSnapshot wj_b_burn =
           wj_op_audit_active ? wj_audit_capture() : WjOpAuditSnapshot{};
+      if (part_info.n_ranks > 1) {
+        // Full-line burn inputs (1D replication, spec
+        // mpi_m18d_laser_burn_spec.md §2 d2): the host stage loops the
+        // whole line on every rank; gather owner-true matter (and volFrac
+        // before the material-prop rebuild below) so the replicated stage
+        // — and its host inventories — stay rank-identical by induction.
+        allgatherv_1d_cell_line(state.rho.data(), 1);
+        allgatherv_1d_cell_line(state.vol.data(), 1);
+        allgatherv_1d_cell_line(state.Te.data(), 1);
+        allgatherv_1d_cell_line(state.Ti.data(), 1);
+        allgatherv_1d_cell_line(state.zbar.data(), 1);
+        allgatherv_1d_cell_line(state.ee.data(), 1);
+        allgatherv_1d_cell_line(state.ei.data(), 1);
+        if (!state.volFrac.empty() && state.mesh.topo.n_cells > 0 &&
+            state.volFrac.size() %
+                    static_cast<std::size_t>(state.mesh.topo.n_cells) ==
+                0) {
+          allgatherv_1d_cell_line(
+              state.volFrac.data(),
+              static_cast<int>(
+                  state.volFrac.size() /
+                  static_cast<std::size_t>(state.mesh.topo.n_cells)));
+          state.invalidate_cell_material_props();
+        }
+      }
+      // Every rank runs the replicated stage and counts every burn tally:
+      // the step ledger takes them once (rank 0). The operator energy audit
+      // compares rank-reduced energies with the full external energy, and
+      // the dt limit is min-reduced, so neither is shared.
+      const double burn_tally_share =
+          (part_info.n_ranks > 1 && part_info.rank != 0) ? 0.0 : 1.0;
       state.ensure_cell_material_props(cfg);
       const int n_cells = static_cast<int>(state.rho.size());
       const int n_mat = static_cast<int>(cfg.materials.materials.size());
+      // Local scheme with no reacting cell (every region cell has rho <= 0 or
+      // Ti below T_floor): the stage would deposit nothing and leave the
+      // inventories as they are, and the injection leaves cells without a
+      // deposit untouched, so the step reduces to its zero diagnostics.
+      // Skipping it avoids the host copies and the stage launches; the
+      // outcome is bit-identical. The diffusion and MC schemes keep their
+      // in-flight populations and always run.
+      if (cfg.burn.scheme != "diffusion" && cfg.burn.scheme != "mc" &&
+          !burn::burn_1d_region_may_react(
+              state.rho.data(), state.Ti.data(), state.volFrac.data(), n_cells,
+              n_mat, burn_fuel_mats, cfg.burn.vf_threshold, cfg.burn.T_floor_keV)) {
+        const std::size_t n = static_cast<std::size_t>(n_cells);
+        state.burn_rate_host.assign(n, 0.0);
+        state.burn_Q_e_host.assign(n, 0.0);
+        state.burn_Q_i_host.assign(n, 0.0);
+        refresh_mie_gruneisen_thermo_from_energy(state, cfg, eos_ctx, reclose_ctx);
+        state.burn_enabled_any = true;
+        record_operator_energy("burn", op_energy_before, 0.0);
+        wj_audit_log("burn", wj_b_burn);
+        log_phase_energy("burn_callback", e_before_phase);
+        return;
+      }
       std::vector<double> rho_h(n_cells, 0.0);
       std::vector<double> vol_h(n_cells, 0.0);
       std::vector<double> Te_h(n_cells, 0.0);
@@ -10305,6 +10803,32 @@ void Driver::run(core::State& state,
       bin.volFrac = vf_h.data();
       bin.fuel_mat = burn_fuel_mats.data();
       bin.n_fuel_mat = static_cast<int>(burn_fuel_mats.size());
+      // Field ions at the start of the step: the local range of in-place
+      // deposition (NUMERICS §14.3) and the slowing-down of transported
+      // products (§14.7).
+      std::vector<burn::FieldIons> burn_field_ions;
+      burn_cell_field_ions(cfg, burn_fuel_mats, state.burn_n_host, vf_h,
+                           n_cells, burn_field_ions);
+      std::vector<double> burn_range_fe(burn_field_ions.size(), 1.0);
+      std::vector<double> burn_range_fi(burn_field_ions.size(), 1.0);
+      for (std::size_t c = 0; c < burn_field_ions.size(); ++c) {
+        const burn::FraleyRangeMedium medium =
+            burn::fraley_range_medium(burn_field_ions[c]);
+        burn_range_fe[c] = medium.fe;
+        burn_range_fi[c] = medium.fi;
+      }
+      bin.range_fe = burn_range_fe.data();
+      bin.range_fi = burn_range_fi.data();
+      const burn::FieldIons burn_field_uniform = burn::field_ions_from_fractions(
+          cfg.burn.x_D, cfg.burn.x_T, cfg.burn.x_He3);
+      const auto upload_burn_field_ions = [&](const char* label) {
+        std::vector<double> packed;
+        burn::pack_field_ion_cells(burn_field_ions, packed);
+        copy_host_to_device_prefix(burn_field_ions_dev, packed, label);
+        burn::FieldIonCells cells;
+        cells.values = burn_field_ions_dev.data();
+        return cells;
+      };
       const auto contains_fuel = [&](const char* fuel) {
         return std::find(cfg.burn.fuels.begin(),
                          cfg.burn.fuels.end(),
@@ -10361,7 +10885,7 @@ void Driver::run(core::State& state,
         const burn::BurnStageResult r =
             burn::compute_burn_step_1d(bin,
                                        bp,
-                                       burn_partition_table,
+                                       burn_partition_table(),
                                        state.burn_n_host,
                                        dE_e,
                                        dE_i,
@@ -10383,6 +10907,8 @@ void Driver::run(core::State& state,
         cp.E_max_keV = 15500.0;
         cp.lnL_e = 0.0;
         cp.lnL_I = 0.0;
+        cp.field = burn_field_uniform;
+        cp.field_cells = upload_burn_field_ions("burn diffusion field ions");
 
         const std::size_t n_cells_sz = static_cast<std::size_t>(n_cells);
         const std::size_t n_groups_sz =
@@ -10543,32 +11069,35 @@ void Driver::run(core::State& state,
         double burn_E_floor = 0.0;
         int burn_clamps = 0;
         const double skipped = inject_burn_source_terms(
-            state, cfg, dE_e, dE_i, &burn_E_floor, &burn_clamps);
+            state, cfg, dE_e, dE_i, &burn_E_floor, &burn_clamps, &eos_ctx);
         refresh_mie_gruneisen_thermo_from_energy(state, cfg, eos_ctx, reclose_ctx);
         state.burn_enabled_any = true;
         state.burn_diffusion_any = true;
-        state.burn_released_step = r.released_charged + r.released_neutron;
-        state.burn_dep_e_step = dep_e_total;
-        state.burn_dep_i_step = dep_i_total;
-        state.burn_esc_charged_step = escaped_total;
-        state.burn_esc_neutron_step = r.esc_neutron;
-        state.burn_nh_dep_e_step = r.nh_dep_e;
-        state.burn_nh_dep_i_step = r.nh_dep_i;
-        state.burn_nh_degraded_step = r.nh_degraded;
-        state.burn_nh_escaped_step = r.nh_escaped;
-        state.burn_dt_limit_s = dt_limit;
+        state.burn_released_step =
+            burn_tally_share * (r.released_charged + r.released_neutron);
+        state.burn_dep_e_step = burn_tally_share * dep_e_total;
+        state.burn_dep_i_step = burn_tally_share * dep_i_total;
+        state.burn_esc_charged_step = burn_tally_share * escaped_total;
+        state.burn_esc_neutron_step = burn_tally_share * r.esc_neutron;
+        state.burn_nh_dep_e_step = burn_tally_share * r.nh_dep_e;
+        state.burn_nh_dep_i_step = burn_tally_share * r.nh_dep_i;
+        state.burn_nh_degraded_step = burn_tally_share * r.nh_degraded;
+        state.burn_nh_escaped_step = burn_tally_share * r.nh_escaped;
+        // The reaction stage's own limit (fuel depletion beyond subcycle_max
+        // substeps, neutron-heating deposition) applies here too.
+        state.burn_dt_limit_s = std::min(dt_limit, r.dt_limit_s);
         state.E_burn_released += state.burn_released_step;
-        state.E_burn_dep_e += dep_e_total;
-        state.E_burn_dep_i += dep_i_total;
-        state.E_burn_esc_charged += escaped_total;
-        state.E_burn_esc_neutron += r.esc_neutron;
-        state.E_burn_inflight = inflight_total;
-        state.N_burn_neutrons_dt += r.n_neutrons_dt;
-        state.N_burn_neutrons_dd += r.n_neutrons_dd;
-        step_E_numerical_loss += skipped;
-        step_E_floor += std::max(burn_E_floor, 0.0);
+        state.E_burn_dep_e += burn_tally_share * dep_e_total;
+        state.E_burn_dep_i += burn_tally_share * dep_i_total;
+        state.E_burn_esc_charged += burn_tally_share * escaped_total;
+        state.E_burn_esc_neutron += burn_tally_share * r.esc_neutron;
+        state.E_burn_inflight = burn_tally_share * inflight_total;
+        state.N_burn_neutrons_dt += burn_tally_share * r.n_neutrons_dt;
+        state.N_burn_neutrons_dd += burn_tally_share * r.n_neutrons_dd;
+        step_E_numerical_loss += burn_tally_share * skipped;
+        step_E_floor += burn_tally_share * std::max(burn_E_floor, 0.0);
         step_clamp_count += std::max(burn_clamps, 0);
-        step_E_burn_in += dep_e_total + dep_i_total;
+        step_E_burn_in += burn_tally_share * (dep_e_total + dep_i_total);
         const double burn_delta_E_ext =
             std::max(dep_e_total + dep_i_total - skipped, 0.0) +
             std::max(burn_E_floor, 0.0);
@@ -10579,7 +11108,7 @@ void Driver::run(core::State& state,
         const burn::BurnStageResult r =
             burn::compute_burn_step_1d(bin,
                                        bp,
-                                       burn_partition_table,
+                                       burn_partition_table(),
                                        state.burn_n_host,
                                        dE_e,
                                        dE_i,
@@ -10657,6 +11186,8 @@ void Driver::run(core::State& state,
         mp.E_min_keV = cfg.burn.diffusion_E_min_keV;
         mp.particles_per_cell = cfg.burn.mc_particles_per_cell;
         mp.seed = static_cast<unsigned long long>(cfg.main.seed);
+        mp.field = burn_field_uniform;
+        mp.field_cells = upload_burn_field_ions("burn MC field ions");
         const burn::McStepResult mr = burn::mc_transport_step(
             mp,
             n_cells,
@@ -10728,32 +11259,35 @@ void Driver::run(core::State& state,
         double burn_E_floor = 0.0;
         int burn_clamps = 0;
         const double skipped = inject_burn_source_terms(
-            state, cfg, dE_e, dE_i, &burn_E_floor, &burn_clamps);
+            state, cfg, dE_e, dE_i, &burn_E_floor, &burn_clamps, &eos_ctx);
         refresh_mie_gruneisen_thermo_from_energy(state, cfg, eos_ctx, reclose_ctx);
         state.burn_enabled_any = true;
         state.burn_mc_any = true;
-        state.burn_released_step = r.released_charged + r.released_neutron;
-        state.burn_dep_e_step = dep_e_total;
-        state.burn_dep_i_step = dep_i_total;
-        state.burn_esc_charged_step = mr.escaped_erg;
-        state.burn_esc_neutron_step = r.esc_neutron;
-        state.burn_nh_dep_e_step = r.nh_dep_e;
-        state.burn_nh_dep_i_step = r.nh_dep_i;
-        state.burn_nh_degraded_step = r.nh_degraded;
-        state.burn_nh_escaped_step = r.nh_escaped;
-        state.burn_dt_limit_s = dt_limit;
+        state.burn_released_step =
+            burn_tally_share * (r.released_charged + r.released_neutron);
+        state.burn_dep_e_step = burn_tally_share * dep_e_total;
+        state.burn_dep_i_step = burn_tally_share * dep_i_total;
+        state.burn_esc_charged_step = burn_tally_share * mr.escaped_erg;
+        state.burn_esc_neutron_step = burn_tally_share * r.esc_neutron;
+        state.burn_nh_dep_e_step = burn_tally_share * r.nh_dep_e;
+        state.burn_nh_dep_i_step = burn_tally_share * r.nh_dep_i;
+        state.burn_nh_degraded_step = burn_tally_share * r.nh_degraded;
+        state.burn_nh_escaped_step = burn_tally_share * r.nh_escaped;
+        // The reaction stage's own limit (fuel depletion beyond subcycle_max
+        // substeps, neutron-heating deposition) applies here too.
+        state.burn_dt_limit_s = std::min(dt_limit, r.dt_limit_s);
         state.E_burn_released += state.burn_released_step;
-        state.E_burn_dep_e += dep_e_total;
-        state.E_burn_dep_i += dep_i_total;
-        state.E_burn_esc_charged += mr.escaped_erg;
-        state.E_burn_esc_neutron += r.esc_neutron;
-        state.E_burn_inflight = mr.inflight_erg;
-        state.N_burn_neutrons_dt += r.n_neutrons_dt;
-        state.N_burn_neutrons_dd += r.n_neutrons_dd;
-        step_E_numerical_loss += skipped;
-        step_E_floor += std::max(burn_E_floor, 0.0);
+        state.E_burn_dep_e += burn_tally_share * dep_e_total;
+        state.E_burn_dep_i += burn_tally_share * dep_i_total;
+        state.E_burn_esc_charged += burn_tally_share * mr.escaped_erg;
+        state.E_burn_esc_neutron += burn_tally_share * r.esc_neutron;
+        state.E_burn_inflight = burn_tally_share * mr.inflight_erg;
+        state.N_burn_neutrons_dt += burn_tally_share * r.n_neutrons_dt;
+        state.N_burn_neutrons_dd += burn_tally_share * r.n_neutrons_dd;
+        step_E_numerical_loss += burn_tally_share * skipped;
+        step_E_floor += burn_tally_share * std::max(burn_E_floor, 0.0);
         step_clamp_count += std::max(burn_clamps, 0);
-        step_E_burn_in += dep_e_total + dep_i_total;
+        step_E_burn_in += burn_tally_share * (dep_e_total + dep_i_total);
         const double burn_delta_E_ext =
             std::max(dep_e_total + dep_i_total - skipped, 0.0) +
             std::max(burn_E_floor, 0.0);
@@ -10762,7 +11296,7 @@ void Driver::run(core::State& state,
         const burn::BurnStageResult r =
             burn::compute_burn_step_1d(bin,
                                        bp,
-                                       burn_partition_table,
+                                       burn_partition_table(),
                                        state.burn_n_host,
                                        dE_e,
                                        dE_i,
@@ -10779,30 +11313,31 @@ void Driver::run(core::State& state,
         double burn_E_floor = 0.0;
         int burn_clamps = 0;
         const double skipped = inject_burn_source_terms(
-            state, cfg, dE_e, dE_i, &burn_E_floor, &burn_clamps);
+            state, cfg, dE_e, dE_i, &burn_E_floor, &burn_clamps, &eos_ctx);
         refresh_mie_gruneisen_thermo_from_energy(state, cfg, eos_ctx, reclose_ctx);
         state.burn_enabled_any = true;
-        state.burn_released_step = r.released_charged + r.released_neutron;
-        state.burn_dep_e_step = r.dep_e;
-        state.burn_dep_i_step = r.dep_i;
-        state.burn_esc_charged_step = r.esc_charged;
-        state.burn_esc_neutron_step = r.esc_neutron;
-        state.burn_nh_dep_e_step = r.nh_dep_e;
-        state.burn_nh_dep_i_step = r.nh_dep_i;
-        state.burn_nh_degraded_step = r.nh_degraded;
-        state.burn_nh_escaped_step = r.nh_escaped;
+        state.burn_released_step =
+            burn_tally_share * (r.released_charged + r.released_neutron);
+        state.burn_dep_e_step = burn_tally_share * r.dep_e;
+        state.burn_dep_i_step = burn_tally_share * r.dep_i;
+        state.burn_esc_charged_step = burn_tally_share * r.esc_charged;
+        state.burn_esc_neutron_step = burn_tally_share * r.esc_neutron;
+        state.burn_nh_dep_e_step = burn_tally_share * r.nh_dep_e;
+        state.burn_nh_dep_i_step = burn_tally_share * r.nh_dep_i;
+        state.burn_nh_degraded_step = burn_tally_share * r.nh_degraded;
+        state.burn_nh_escaped_step = burn_tally_share * r.nh_escaped;
         state.burn_dt_limit_s = r.dt_limit_s;
         state.E_burn_released += state.burn_released_step;
-        state.E_burn_dep_e += r.dep_e;
-        state.E_burn_dep_i += r.dep_i;
-        state.E_burn_esc_charged += r.esc_charged;
-        state.E_burn_esc_neutron += r.esc_neutron;
-        state.N_burn_neutrons_dt += r.n_neutrons_dt;
-        state.N_burn_neutrons_dd += r.n_neutrons_dd;
-        step_E_numerical_loss += skipped;
-        step_E_floor += std::max(burn_E_floor, 0.0);
+        state.E_burn_dep_e += burn_tally_share * r.dep_e;
+        state.E_burn_dep_i += burn_tally_share * r.dep_i;
+        state.E_burn_esc_charged += burn_tally_share * r.esc_charged;
+        state.E_burn_esc_neutron += burn_tally_share * r.esc_neutron;
+        state.N_burn_neutrons_dt += burn_tally_share * r.n_neutrons_dt;
+        state.N_burn_neutrons_dd += burn_tally_share * r.n_neutrons_dd;
+        step_E_numerical_loss += burn_tally_share * skipped;
+        step_E_floor += burn_tally_share * std::max(burn_E_floor, 0.0);
         step_clamp_count += std::max(burn_clamps, 0);
-        step_E_burn_in += r.dep_e + r.dep_i;
+        step_E_burn_in += burn_tally_share * (r.dep_e + r.dep_i);
         const double burn_delta_E_ext =
             std::max(r.dep_e + r.dep_i - skipped, 0.0) +
             std::max(burn_E_floor, 0.0);
@@ -10827,39 +11362,9 @@ void Driver::run(core::State& state,
                                             : OpEnergyCapture{};
       const WjOpAuditSnapshot wj_b_burn =
           wj_op_audit_active ? wj_audit_capture() : WjOpAuditSnapshot{};
-      if (part_info.n_ranks > 1 && is_1d) {
-        // Full-line burn inputs (Option C 1D replication, spec
-        // mpi_m18d_laser_burn_spec.md §2 d2): the host stage loops the
-        // whole line on every rank; gather owner-true matter (and
-        // volFrac before the material-prop rebuild below) so the
-        // replicated stage — and its host inventories — stay
-        // rank-identical by induction.
-        allgatherv_1d_cell_line(state.rho.data(), 1);
-        allgatherv_1d_cell_line(state.vol.data(), 1);
-        allgatherv_1d_cell_line(state.Te.data(), 1);
-        allgatherv_1d_cell_line(state.Ti.data(), 1);
-        allgatherv_1d_cell_line(state.zbar.data(), 1);
-        allgatherv_1d_cell_line(state.ee.data(), 1);
-        allgatherv_1d_cell_line(state.ei.data(), 1);
-        if (!state.volFrac.empty() && state.mesh.topo.n_cells > 0 &&
-            state.volFrac.size() %
-                    static_cast<std::size_t>(state.mesh.topo.n_cells) ==
-                0) {
-          allgatherv_1d_cell_line(
-              state.volFrac.data(),
-              static_cast<int>(
-                  state.volFrac.size() /
-                  static_cast<std::size_t>(state.mesh.topo.n_cells)));
-          state.invalidate_cell_material_props();
-        }
-      }
-      // 1D replication counts every burn tally on every rank — the step
-      // ledger must take them ONCE (rank 0); 2D owned-window stages
-      // produce disjoint partials (share 1) completed by the budget
-      // Allreduce.
-      const double burn_tally_share =
-          (part_info.n_ranks > 1 && is_1d && part_info.rank != 0) ? 0.0
-                                                                  : 1.0;
+      // 2D owned-window stages produce disjoint partials that the budget
+      // Allreduce completes: every rank counts its own tallies.
+      constexpr double burn_tally_share = 1.0;
       state.ensure_cell_material_props(cfg);
       const int n_cells = static_cast<int>(state.rho.size());
       const int n_mat = static_cast<int>(cfg.materials.materials.size());
@@ -10896,6 +11401,10 @@ void Driver::run(core::State& state,
       bin.volFrac = vf_h.data();
       bin.fuel_mat = burn_fuel_mats.data();
       bin.n_fuel_mat = static_cast<int>(burn_fuel_mats.size());
+      // Field ions at the start of the step (NUMERICS §14.7).
+      std::vector<burn::FieldIons> burn_field_ions;
+      burn_cell_field_ions(cfg, burn_fuel_mats, state.burn_n_host, vf_h,
+                           n_cells, burn_field_ions);
       if (part_info.n_ranks > 1 && is_2d) {
         // Owned-window 2D stage (Option C): tallies become disjoint
         // partials completed by the budget Allreduce; 1D keeps the full
@@ -10936,7 +11445,7 @@ void Driver::run(core::State& state,
         const burn::BurnStage2DResult r =
             burn::compute_burn_step_2d(bin,
                                        bp,
-                                       burn_partition_table,
+                                       burn_partition_table(),
                                        state.burn_n_host,
                                        dE_e,
                                        dE_i,
@@ -10951,6 +11460,22 @@ void Driver::run(core::State& state,
         cp.E_max_keV = 15500.0;
         cp.lnL_e = 0.0;
         cp.lnL_I = 0.0;
+        cp.field = burn::field_ions_from_fractions(cfg.burn.x_D, cfg.burn.x_T,
+                                                   cfg.burn.x_He3);
+        {
+          std::vector<double> packed;
+          burn::pack_field_ion_cells(burn_field_ions, packed);
+          copy_host_to_device_prefix(burn_field_ions_dev, packed,
+                                     "burn 2D diffusion field ions");
+          if (is_2d && part_info.n_ranks > 1) {
+            // The owned window's inventory is current only on its owner:
+            // ghost cells take the owner's field ions.
+            parallel::exchange_cell_strips_scaled(
+                part_info, comm_buffers, burn_field_ions_dev.data(),
+                burn::kFieldIonCellValues, 23);
+          }
+          cp.field_cells.values = burn_field_ions_dev.data();
+        }
 
         const std::size_t n_cells_sz = static_cast<std::size_t>(n_cells);
         const std::size_t n_groups_sz =
@@ -11126,7 +11651,7 @@ void Driver::run(core::State& state,
         double burn_E_floor = 0.0;
         int burn_clamps = 0;
         const double skipped = inject_burn_source_terms(
-            state, cfg, dE_e, dE_i, &burn_E_floor, &burn_clamps);
+            state, cfg, dE_e, dE_i, &burn_E_floor, &burn_clamps, &eos_ctx);
         refresh_mie_gruneisen_thermo_from_energy(state, cfg, eos_ctx, reclose_ctx);
         state.burn_enabled_any = true;
         state.burn_diffusion_any = true;
@@ -11136,7 +11661,9 @@ void Driver::run(core::State& state,
         state.burn_dep_i_step = burn_tally_share * dep_i_total;
         state.burn_esc_charged_step = burn_tally_share * escaped_total;
         state.burn_esc_neutron_step = burn_tally_share * r.esc_neutron;
-        state.burn_dt_limit_s = dt_limit;
+        // The reaction stage's own limit (fuel depletion beyond subcycle_max
+        // substeps, neutron-heating deposition) applies here too.
+        state.burn_dt_limit_s = std::min(dt_limit, r.dt_limit_s);
         state.E_burn_released += state.burn_released_step;
         state.E_burn_dep_e += burn_tally_share * dep_e_total;
         state.E_burn_dep_i += burn_tally_share * dep_i_total;
@@ -11157,7 +11684,7 @@ void Driver::run(core::State& state,
         const burn::BurnStage2DResult r =
             burn::compute_burn_step_2d(bin,
                                        bp,
-                                       burn_partition_table,
+                                       burn_partition_table(),
                                        state.burn_n_host,
                                        dE_e,
                                        dE_i,
@@ -11173,7 +11700,7 @@ void Driver::run(core::State& state,
         double burn_E_floor = 0.0;
         int burn_clamps = 0;
         const double skipped = inject_burn_source_terms(
-            state, cfg, dE_e, dE_i, &burn_E_floor, &burn_clamps);
+            state, cfg, dE_e, dE_i, &burn_E_floor, &burn_clamps, &eos_ctx);
         refresh_mie_gruneisen_thermo_from_energy(state, cfg, eos_ctx, reclose_ctx);
         state.burn_enabled_any = true;
         state.burn_released_step =
@@ -11404,8 +11931,12 @@ void Driver::run(core::State& state,
           parallel::merge_immigrants(imc.photon_pool(), immigrants, false, mig_stream);
         }
       };
+      // drive_time_s: evaluation time of the 1D FLD / S_N boundary drive
+      // (Marshak T_r(t), pulsed flux) = midpoint of the interval this stage
+      // advances; NaN keeps the solver's historic state.t.
       const auto run_radiation_stage = [&](const double dt_stage,
-                                           const double t_stage) {
+                                           const double t_stage,
+                                           const double drive_time_s) {
         const bool deterministic_stage =
             cfg.radiation.mode == core::RadiationMode::MultigroupDiffusion ||
             cfg.radiation.mode == core::RadiationMode::SnTransport;
@@ -11421,7 +11952,32 @@ void Driver::run(core::State& state,
             diagnostics::RadialFourierStageId::FldSolve,
             diagnostics::RadialFourierStagePhase::Before,
             t_stage);
-        imc.transport_step(state, cfg, dt_stage, part_info, &comm_buffers);
+        imc.transport_step(state, cfg, dt_stage, part_info, &comm_buffers,
+                           drive_time_s);
+        if (cfg.radiation.mode == core::RadiationMode::MultigroupDiffusion) {
+          ++step_fld_solves;
+          step_fld_outer_iterations +=
+              static_cast<std::int64_t>(state.fld_outer_iterations);
+          // A NaN exit residual stays visible in the history.
+          const double solve_residual = state.fld_outer_residual;
+          if (!std::isnan(step_fld_outer_residual) &&
+              (std::isnan(solve_residual) ||
+               solve_residual > step_fld_outer_residual)) {
+            step_fld_outer_residual = solve_residual;
+          }
+          step_fld_converged = step_fld_converged && state.fld_converged;
+        }
+        if (cfg.radiation.mode == core::RadiationMode::SnTransport) {
+          ++step_sn_solves;
+          step_sn_outer_iterations += static_cast<std::int64_t>(state.sn_outer_iterations);
+          step_sn_inner_iterations += static_cast<std::int64_t>(state.sn_inner_iterations);
+          const double solve_residual = state.sn_outer_residual;
+          if (!std::isnan(step_sn_outer_residual) &&
+              (std::isnan(solve_residual) || solve_residual > step_sn_outer_residual)) {
+            step_sn_outer_residual = solve_residual;
+          }
+          step_sn_converged = step_sn_converged && state.sn_converged;
+        }
         emit_radial_fourier_audit(
             diagnostics::RadialFourierStageId::FldSolve,
             diagnostics::RadialFourierStagePhase::After,
@@ -11530,15 +12086,10 @@ void Driver::run(core::State& state,
       const auto has_compressed_floor_hit = [&]() {
         TENRYU_ASSERT(state.Te.size() == state.rho.size(),
                       "thermal subcycle floor check requires Te/rho size match");
-        const auto host_Te = copy_field_to_host(state.Te);
-        const auto host_rho = copy_field_to_host(state.rho);
         const double te_floor_threshold = cfg.numerics.floors.Te + 0.5;
-        for (std::size_t i = 0; i < host_Te.size(); ++i) {
-          if (host_rho[i] > 5.0 && host_Te[i] <= te_floor_threshold) {
-            return true;
-          }
-        }
-        return false;
+        return thermal_subcycle_floor_hit(state.Te.data(), state.rho.data(),
+                                          static_cast<int>(state.Te.size()),
+                                          5.0, te_floor_threshold);
       };
       const auto predict_initial_thermal_substeps = [&]() {
         const std::size_t n_cells = state.rho.size();
@@ -11548,13 +12099,7 @@ void Driver::run(core::State& state,
         }
         TENRYU_ASSERT(state.ee.size() == n_cells && state.Te.size() == n_cells,
                       "thermal subcycle prediction requires ee/Te/rho size match");
-        const auto host_ee = copy_field_to_host(state.ee);
-        const auto host_Te = copy_field_to_host(state.Te);
-        const auto host_rho = copy_field_to_host(state.rho);
-        TENRYU_ASSERT(host_ee.size() == n_cells,
-                      "thermal subcycle prediction ee host size mismatch");
 
-        double min_ratio = 1.0e30;
         const double te_floor = cfg.numerics.floors.Te;
         constexpr double dT_guard = 1.0;
         // Option C (§6o.4k): scan OWNED cells only — the full-range loop
@@ -11570,16 +12115,11 @@ void Driver::run(core::State& state,
           scan_begin = static_cast<std::size_t>(cw.begin);
           scan_end = static_cast<std::size_t>(cw.end);
         }
-        for (std::size_t i = scan_begin; i < scan_end; ++i) {
-          if (host_rho[i] < 5.0) {
-            continue;
-          }
-          const double Te_margin = host_Te[i] - (te_floor + dT_guard);
-          if (Te_margin < 5.0 && host_Te[i] > te_floor + dT_guard) {
-            const double ratio = Te_margin / std::max(host_Te[i], 1.0);
-            min_ratio = std::min(min_ratio, ratio);
-          }
-        }
+        // Cells with rho >= 5 whose Te lies within 5 eV above the floor
+        // guard: min of (Te - guard) / max(Te, 1), 1e30 when none.
+        double min_ratio = thermal_subcycle_min_margin_ratio(
+            state.Te.data(), state.rho.data(), static_cast<int>(scan_begin),
+            static_cast<int>(scan_end), 5.0, te_floor + dT_guard, 5.0);
         if (part_info.n_ranks > 1) {
           min_ratio = reducer.allreduce_min(min_ratio);
         }
@@ -11597,12 +12137,12 @@ void Driver::run(core::State& state,
         return n_sub;
       };
       const auto run_single_stage_with_thermal_subcycling = [&]() {
-        core::CellField1D backup_ee;
-        core::CellField1D backup_ei;
-        core::CellField1D backup_Te;
-        core::CellField1D backup_Ti;
-        core::CellField1D backup_Pe;
-        core::CellField1D backup_Pi;
+        auto& backup_ee = thermal_subcycle_scratch.ee;
+        auto& backup_ei = thermal_subcycle_scratch.ei;
+        auto& backup_Te = thermal_subcycle_scratch.Te;
+        auto& backup_Ti = thermal_subcycle_scratch.Ti;
+        auto& backup_Pe = thermal_subcycle_scratch.Pe;
+        auto& backup_Pi = thermal_subcycle_scratch.Pi;
         copy_device_field(backup_ee, state.ee, "thermal-subcycle backup ee");
         copy_device_field(backup_ei, state.ei, "thermal-subcycle backup ei");
         copy_device_field(backup_Te, state.Te, "thermal-subcycle backup Te");
@@ -11620,15 +12160,42 @@ void Driver::run(core::State& state,
         // radiation field and double-counted every failed attempt's
         // boundary flows in the step budget. Empty fields (mode-dependent)
         // copy as no-ops. Bit-identical whenever no retry fires.
-        core::GroupField1D backup_rad_E;
-        core::GroupField1D backup_rad_E_old;
-        core::GroupField1D backup_sn_psi_prev;
+        auto& backup_rad_E = thermal_subcycle_scratch.rad_E;
+        auto& backup_rad_E_old = thermal_subcycle_scratch.rad_E_old;
+        auto& backup_sn_psi_prev = thermal_subcycle_scratch.sn_psi_prev;
+        // The linear-discontinuous S_N's starting-direction history and
+        // in-cell electron energy offset advance with the attempt as well.
+        auto& backup_sn_psi_sd_prev = thermal_subcycle_scratch.sn_psi_sd_prev;
+        auto& backup_sn_ee_node_offset = thermal_subcycle_scratch.sn_ee_node_offset;
+        // The attempt also rewrites the closure heat capacities (FLD matter
+        // update, Qei substep, conduction reclosure) and Zbar (the conduction
+        // phase refreshes it), adds to the step floor/clamp ledgers and may
+        // raise the conduction full-step retry request; a floor-hit retry
+        // restores all of them (2026-09-23; they used to carry the failed
+        // attempt's values into the retried one).
+        auto& backup_cv_e = thermal_subcycle_scratch.cv_e;
+        auto& backup_cv_i = thermal_subcycle_scratch.cv_i;
+        auto& backup_zbar = thermal_subcycle_scratch.zbar;
+        copy_device_field(backup_cv_e, state.cv_e, "thermal-subcycle backup cv_e");
+        copy_device_field(backup_cv_i, state.cv_i, "thermal-subcycle backup cv_i");
+        copy_device_field(backup_zbar, state.zbar, "thermal-subcycle backup zbar");
+        const double saved_step_E_floor = step_E_floor;
+        const int saved_step_clamp_count = step_clamp_count;
+        const bool saved_conduction_retry_requested = conduction_retry_requested;
+        const hydro::ConductionResult saved_conduction_retry_result = conduction_retry_result;
+        // The S_N material Newton ORs its full-step rejection request into
+        // this flag; a discarded attempt's request must not reject the step.
+        const int saved_sn_material_retry_flag = state.sn_material_retry_flag;
         copy_device_field(backup_rad_E, state.rad_E,
                           "thermal-subcycle backup rad_E");
         copy_device_field(backup_rad_E_old, state.rad_E_old,
                           "thermal-subcycle backup rad_E_old");
         copy_device_field(backup_sn_psi_prev, state.sn_psi_prev,
                           "thermal-subcycle backup sn_psi_prev");
+        copy_device_field(backup_sn_psi_sd_prev, state.sn_psi_sd_prev,
+                          "thermal-subcycle backup sn_psi_sd_prev");
+        copy_device_field(backup_sn_ee_node_offset, state.sn_ee_node_offset,
+                          "thermal-subcycle backup sn_ee_node_offset");
         const double saved_step_E_rad_esc = step_E_rad_esc;
         const double saved_step_E_marshak_in = step_E_marshak_in;
         const double saved_step_E_volume_in = step_E_volume_in;
@@ -11638,6 +12205,16 @@ void Driver::run(core::State& state,
         const double saved_step_holo_matter_delta = step_holo_matter_delta;
         const double saved_step_holo_source_balance_error =
             step_holo_source_balance_error;
+        const int saved_step_fld_solves = step_fld_solves;
+        const std::int64_t saved_step_fld_outer_iterations =
+            step_fld_outer_iterations;
+        const double saved_step_fld_outer_residual = step_fld_outer_residual;
+        const bool saved_step_fld_converged = step_fld_converged;
+        const int saved_step_sn_solves = step_sn_solves;
+        const std::int64_t saved_step_sn_outer_iterations = step_sn_outer_iterations;
+        const std::int64_t saved_step_sn_inner_iterations = step_sn_inner_iterations;
+        const double saved_step_sn_outer_residual = step_sn_outer_residual;
+        const bool saved_step_sn_converged = step_sn_converged;
         const auto restore_pre_radiation_state = [&]() {
           copy_device_field(state.ee, backup_ee, "thermal-subcycle restore ee");
           copy_device_field(state.ei, backup_ei, "thermal-subcycle restore ei");
@@ -11651,6 +12228,18 @@ void Driver::run(core::State& state,
                             "thermal-subcycle restore rad_E_old");
           copy_device_field(state.sn_psi_prev, backup_sn_psi_prev,
                             "thermal-subcycle restore sn_psi_prev");
+          copy_device_field(state.sn_psi_sd_prev, backup_sn_psi_sd_prev,
+                            "thermal-subcycle restore sn_psi_sd_prev");
+          copy_device_field(state.sn_ee_node_offset, backup_sn_ee_node_offset,
+                            "thermal-subcycle restore sn_ee_node_offset");
+          copy_device_field(state.cv_e, backup_cv_e, "thermal-subcycle restore cv_e");
+          copy_device_field(state.cv_i, backup_cv_i, "thermal-subcycle restore cv_i");
+          copy_device_field(state.zbar, backup_zbar, "thermal-subcycle restore zbar");
+          step_E_floor = saved_step_E_floor;
+          step_clamp_count = saved_step_clamp_count;
+          conduction_retry_requested = saved_conduction_retry_requested;
+          conduction_retry_result = saved_conduction_retry_result;
+          state.sn_material_retry_flag = saved_sn_material_retry_flag;
           step_E_rad_esc = saved_step_E_rad_esc;
           step_E_marshak_in = saved_step_E_marshak_in;
           step_E_volume_in = saved_step_E_volume_in;
@@ -11660,6 +12249,61 @@ void Driver::run(core::State& state,
           step_holo_matter_delta = saved_step_holo_matter_delta;
           step_holo_source_balance_error =
               saved_step_holo_source_balance_error;
+          step_fld_solves = saved_step_fld_solves;
+          step_fld_outer_iterations = saved_step_fld_outer_iterations;
+          step_fld_outer_residual = saved_step_fld_outer_residual;
+          step_fld_converged = saved_step_fld_converged;
+          step_sn_solves = saved_step_sn_solves;
+          step_sn_outer_iterations = saved_step_sn_outer_iterations;
+          step_sn_inner_iterations = saved_step_sn_inner_iterations;
+          step_sn_outer_residual = saved_step_sn_outer_residual;
+          step_sn_converged = saved_step_sn_converged;
+        };
+
+        // Each radiation solve rewrites rad_dep/rad_emit (and the HOLO LO
+        // tallies) with the energy of the interval it advances, but the
+        // step output reads them as the whole step's exchange (checkpoint
+        // rad_dep/rad_emit, deposited_power = rad_dep / (V dt), the HOLO
+        // source-mismatch diagnostic). With n_sub > 1 the accepted
+        // attempt's substeps are summed on the device and written back after
+        // the loop, as the two-stage path does; n_sub = 1 leaves them as the
+        // single solve wrote them.
+        auto& substep_rad_dep_total = thermal_subcycle_scratch.rad_dep_total;
+        auto& substep_rad_emit_total = thermal_subcycle_scratch.rad_emit_total;
+        auto& substep_holo_rad_dep_total = thermal_subcycle_scratch.holo_rad_dep_total;
+        auto& substep_holo_rad_emit_total = thermal_subcycle_scratch.holo_rad_emit_total;
+        const auto sum_substep_field = [&](core::GroupField1D& total,
+                                           const core::GroupField1D& field,
+                                           const bool first_substep) {
+          if (first_substep) {
+            copy_device_field(total, field, "thermal-subcycle tally total");
+            return;
+          }
+          TENRYU_ASSERT(total.size() == field.size(),
+                        "thermal-subcycle tally size changed between substeps");
+          core::add_device_array(total.data(), field.data(), field.size());
+        };
+        const auto sum_substep_tallies = [&](const bool first_substep) {
+          sum_substep_field(substep_rad_dep_total, state.rad_dep, first_substep);
+          sum_substep_field(substep_rad_emit_total, state.rad_emit, first_substep);
+          if (cfg.radiation.holo.enabled) {
+            sum_substep_field(substep_holo_rad_dep_total, state.holo_rad_dep,
+                              first_substep);
+            sum_substep_field(substep_holo_rad_emit_total, state.holo_rad_emit,
+                              first_substep);
+          }
+        };
+        const auto publish_substep_tallies = [&]() {
+          copy_device_field(state.rad_dep, substep_rad_dep_total,
+                            "thermal-subcycle rad_dep total");
+          copy_device_field(state.rad_emit, substep_rad_emit_total,
+                            "thermal-subcycle rad_emit total");
+          if (cfg.radiation.holo.enabled) {
+            copy_device_field(state.holo_rad_dep, substep_holo_rad_dep_total,
+                              "thermal-subcycle holo_rad_dep total");
+            copy_device_field(state.holo_rad_emit, substep_holo_rad_emit_total,
+                              "thermal-subcycle holo_rad_emit total");
+          }
         };
 
         int n_sub = predict_initial_thermal_substeps();
@@ -11684,8 +12328,15 @@ void Driver::run(core::State& state,
           retry = false;
           const double dt_sub = dt_op / static_cast<double>(n_sub);
           for (int m = 0; m < n_sub; ++m) {
-            const double t_sub = t_op + static_cast<double>(m) * dt_sub;
-            run_radiation_stage(dt_sub, t_sub);
+            // The radiation operator advances [t_n, t_n + dt] (state.t = t_n
+            // until the step ends); substep m covers
+            // [t_n + m dt_sub, t_n + (m + 1) dt_sub]. The former t_op-based
+            // start (t_op = t_mid under Strang) shifted every substep by dt/2.
+            const double t_sub = state.t + static_cast<double>(m) * dt_sub;
+            run_radiation_stage(dt_sub, t_sub, t_sub + 0.5 * dt_sub);
+            if (n_sub > 1) {
+              sum_substep_tallies(m == 0);
+            }
             const PhaseEnergySnapshot e_before_qei = capture_phase_energy();
             emit_radial_fourier_audit(
                 diagnostics::RadialFourierStageId::NewtonSource,
@@ -11710,6 +12361,10 @@ void Driver::run(core::State& state,
               break;
             }
           }
+        }
+        // retry is false here, so n_sub is the accepted attempt's count.
+        if (n_sub > 1) {
+          publish_substep_tallies();
         }
       };
 
@@ -11774,7 +12429,8 @@ void Driver::run(core::State& state,
           }
         };
 
-        run_radiation_stage(dt_half, t_op);
+        run_radiation_stage(dt_half, t_op,
+                            std::numeric_limits<double>::quiet_NaN());
         accumulate_stage_tallies();
         mark_rad_subphase(rad_other_ms);
 
@@ -11793,7 +12449,8 @@ void Driver::run(core::State& state,
         update_zbar_for_step(state, cfg, zbar_device_context);
         mark_rad_subphase(rad_other_ms);
 
-        run_radiation_stage(dt_half, t_op + dt_half);
+        run_radiation_stage(dt_half, t_op + dt_half,
+                            std::numeric_limits<double>::quiet_NaN());
         accumulate_stage_tallies();
         mark_rad_subphase(rad_other_ms);
 
@@ -11825,7 +12482,7 @@ void Driver::run(core::State& state,
           // the same photon state instead of only restoring thermodynamics.
           run_single_stage_with_thermal_subcycling();
         } else {
-          run_radiation_stage(dt_op, t_op);
+          run_radiation_stage(dt_op, t_op, state.t + 0.5 * dt_op);
         }
       }
       refresh_mie_gruneisen_thermo_from_energy(state, cfg, eos_ctx, reclose_ctx);
@@ -11850,15 +12507,16 @@ void Driver::run(core::State& state,
             static_cast<int>(state.Te.size()),
             d_overshoot_before,
             d_overshoot_before_flags,
-            marshak_boundary_temperature(state, cfg, t_op + dt_op),
+            marshak_boundary_temperature(state, cfg, state.t + dt_op),
             wj_arena.d_flags + static_cast<std::size_t>(
                 StepViolationFlag::RadiationOvershootCount),
             wj_arena.d_scalars + static_cast<std::size_t>(
                 StepScalarSlot::RadiationOvershootMaxRatio));
         deferred_radiation_overshoot = true;
       } else {
+        // The radiation operator ends at t_n + dt (state.t = t_n here).
         const OvershootMetrics overshoot =
-            compute_overshoot_metrics(state, cfg, te_max_before, t_op + dt_op);
+            compute_overshoot_metrics(state, cfg, te_max_before, state.t + dt_op);
         imc.set_last_overshoot_metrics(overshoot.count, overshoot.max_ratio);
       }
       mark_rad_subphase(rad_overshoot_ms);
@@ -11867,7 +12525,7 @@ void Driver::run(core::State& state,
                           "radiation",
                           te_max_before,
                           state.step + 1,
-                          t_op + dt_op,
+                          state.t + dt_op,
                           dt_op);
       mark_rad_subphase(rad_safety_ms);
       if (verbose_phase_timing) {
@@ -13567,6 +14225,7 @@ void Driver::run(core::State& state,
                 << ") NOT applied: reason="
                 << hydro::ale1d::to_string(ale1d_out.skip_reason)
                 << " remap_rejected=" << (ale1d_out.remap_rejected ? 1 : 0)
+                << " candidate_dt_gain=" << ale1d_out.candidate_dt_gain
                 << " mass_err=" << ale1d_out.mass_conservation_rel_err
                 << " energy_err=" << ale1d_out.energy_conservation_rel_err
                 << " radiation_conservation_rel_err="
@@ -13991,12 +14650,13 @@ void Driver::run(core::State& state,
       state.mesh.materialize_host_svec();
     }
 
-    if (cfg.main.two_temperature && !warned_2t_collapse &&
-        all_active_cells_collapsed_to_one_temperature(state, cfg)) {
-      core::log_warning("2T model collapse detected: all cells have Te ≈ Ti at step " +
-                        std::to_string(state.step + 1) +
-                        ". Check EOS or initial conditions.");
-      warned_2t_collapse = true;
+    // A 2T run that starts at Te = Ti (a cold target in equilibrium) keeps them equal until
+    // energy reaches the electrons or the ions separately. The check records whether they
+    // ever separate (it is not evaluated again once they have: it reads back from the GPU),
+    // and the end of the run reports a run in which they never did.
+    if (cfg.main.two_temperature && !seen_2t_separation &&
+        !all_active_cells_collapsed_to_one_temperature(state, cfg)) {
+      seen_2t_separation = true;
     }
 
     nvtx_step_phase.reset("step_phase.energy_and_audit");
@@ -14500,7 +15160,7 @@ void Driver::run(core::State& state,
       const double dE_rad = E_rad_after - E_rad_before;
       const double dE_total = dE_matter + dE_rad;
       const double expected_inflow =
-          step_E_laser_in + step_E_burn_in - step_E_laser_esc -
+          step_E_laser_in + step_E_burn_in - step_E_laser_esc - step_E_laser_dropped -
           step_E_cbet_iaw - step_E_rad_esc + step_E_marshak_in;
       const double gap = expected_inflow - dE_total;
       std::ostringstream oss;
@@ -14828,8 +15488,8 @@ void Driver::run(core::State& state,
     // because budget_input.E_safety reuses step_E_floor above.
     state.E_safety += std::max(step_budget.E_safety, 0.0);
     state.E_numerical_loss += std::max(step_E_numerical_loss, 0.0);
-    state.E_laser_deposited +=
-        std::max(step_E_laser_in - step_E_laser_esc - step_E_cbet_iaw, 0.0);
+    state.E_laser_deposited += std::max(
+        step_E_laser_in - step_E_laser_esc - step_E_cbet_iaw - step_E_laser_dropped, 0.0);
     state.E_laser_escaped += std::max(step_E_laser_esc, 0.0);
     state.E_laser_incident += std::max(step_E_laser_in, 0.0);
     state.E_ra_deposited += std::max(step_E_ra_dep, 0.0);
@@ -14840,6 +15500,7 @@ void Driver::run(core::State& state,
     state.E_floor_injected += std::max(step_E_floor, 0.0);
     state.E_pdV_bdry += step_E_pdV_bdry;
     state.E_Marshak_in += std::max(step_E_marshak_in, 0.0);
+    state.E_volume_in += std::max(step_E_volume_in, 0.0);
     state.E_solver += step_budget.E_solver;
 
     if (energy_audit_enabled) {
@@ -14851,7 +15512,9 @@ void Driver::run(core::State& state,
                                        E_rad_before,
                                        E_rad_after,
                                        step_E_laser_in,
-                                       step_E_laser_esc,
+                                       // the laser's sinks outside the matter:
+                                       // escape and the transfer's dropped power
+                                       step_E_laser_esc + step_E_laser_dropped,
                                        step_E_cbet_iaw,
                                        step_E_rad_esc,
                                        step_E_marshak_in,
@@ -14904,6 +15567,17 @@ void Driver::run(core::State& state,
       tenryu::hydro::evacuated_cell_shadow_step(state, cfg);
     }
 
+    // The ICF shell diagnostics take the shell radius of the first step with a
+    // valid shell as their initial radius. In 1D such a step need not write a
+    // full history row (only the dt-breakdown rows), so the radius is taken
+    // here rather than when the row is filled.
+    if (icf_history_enabled && state.mesh.dim == 1 &&
+        !(profile_observability_.shell_initial_radius_cm() > 0.0)) {
+      const auto shell = diagnostics::compute_icf_shell_diagnostics(state, cfg, 0.0);
+      if (shell.valid) {
+        profile_observability_.set_shell_initial_radius_cm(shell.R_initial_cm);
+      }
+    }
     emit_due_outputs([&](diagnostics::HistorySnapshot& snapshot) {
       if (cfg.numerics.diagnostics.dt_breakdown_history_enabled) {
         snapshot.dt_breakdown =
@@ -14932,6 +15606,7 @@ void Driver::run(core::State& state,
         }
       }
       snapshot.energy = step_budget;
+      snapshot.energy_cumulative = cumulative_energy_ledger(state, reducer);
       snapshot.conservation_residuals = conservation_residuals;
       snapshot.clamp_count = step_clamp_count;
       snapshot.phase_energy = phase_energy;
@@ -15011,15 +15686,23 @@ void Driver::run(core::State& state,
           cfg.diagnostics.sphericity.enabled) {
         diagnostics::ArealDensityDiagnostics areal_device{};
         diagnostics::SphericityDiagnostics sphericity_device{};
+        // 2D: device kernels; 1D: one readback for both diagnostics.
         const bool shape_device_ok =
             part_info.n_ranks == 1 &&
-            diagnostics::compute_shape_history_device(
-                state,
-                cfg,
-                cfg.diagnostics.areal_density.enabled ? &areal_device
-                                                      : nullptr,
-                cfg.diagnostics.sphericity.enabled ? &sphericity_device
-                                                   : nullptr);
+            (diagnostics::compute_shape_history_device(
+                 state,
+                 cfg,
+                 cfg.diagnostics.areal_density.enabled ? &areal_device
+                                                       : nullptr,
+                 cfg.diagnostics.sphericity.enabled ? &sphericity_device
+                                                    : nullptr) ||
+             diagnostics::compute_shape_history_1d(
+                 state,
+                 cfg,
+                 cfg.diagnostics.areal_density.enabled ? &areal_device
+                                                       : nullptr,
+                 cfg.diagnostics.sphericity.enabled ? &sphericity_device
+                                                    : nullptr));
         if (cfg.diagnostics.areal_density.enabled) {
           snapshot.areal_density =
               shape_device_ok ? areal_device
@@ -15036,10 +15719,22 @@ void Driver::run(core::State& state,
         snapshot.laser_pattern =
             diagnostics::compute_laser_pattern(state, cfg, mesh_ptr);
       }
-      snapshot.fld_solver.outer_iterations =
-          static_cast<std::int64_t>(state.fld_outer_iterations);
-      snapshot.fld_solver.outer_residual = state.fld_outer_residual;
-      snapshot.fld_solver.outer_converged = state.fld_converged ? 1 : 0;
+      if (step_fld_solves > 0) {
+        snapshot.fld_solver.outer_iterations = step_fld_outer_iterations;
+        snapshot.fld_solver.outer_residual = step_fld_outer_residual;
+        snapshot.fld_solver.outer_converged = step_fld_converged ? 1 : 0;
+      } else {
+        snapshot.fld_solver.outer_iterations =
+            static_cast<std::int64_t>(state.fld_outer_iterations);
+        snapshot.fld_solver.outer_residual = state.fld_outer_residual;
+        snapshot.fld_solver.outer_converged = state.fld_converged ? 1 : 0;
+      }
+      snapshot.sn_solver.active = cfg.radiation.enabled &&
+                                  cfg.radiation.mode == core::RadiationMode::SnTransport;
+      snapshot.sn_solver.outer_iterations = step_sn_outer_iterations;
+      snapshot.sn_solver.inner_iterations = step_sn_inner_iterations;
+      snapshot.sn_solver.outer_residual = step_sn_outer_residual;
+      snapshot.sn_solver.converged = (step_sn_solves > 0 && step_sn_converged) ? 1 : 0;
       if (icf_history_enabled) {
         snapshot.icf_shell = diagnostics::compute_icf_shell_diagnostics(
             state, cfg, profile_observability_.shell_initial_radius_cm());
@@ -15060,7 +15755,7 @@ void Driver::run(core::State& state,
       if (conservation_history_enabled) {
         snapshot.operator_residuals = operator_energy_tracker.entries();
       }
-    });
+    }, [&] { return make_dt_breakdown_history_record(state, step_dt_lineage); });
     state.checkpoint_request = false;
     if (cfg.main.dim == 2 &&
         cfg.numerics.diagnostics.refinement_autopilot.mode == "arm_exit") {
@@ -15196,6 +15891,9 @@ void Driver::run(core::State& state,
                    std::to_string(state.step) +
                    ", t=" + format_sci(state.t) + ")");
   }
+  // Snapshots are published by a worker thread (io::HDF5Writer): the run ends
+  // with every snapshot on disk.
+  out.wait_for_snapshots();
 
   if (autopilot_fire_stop) {
     out.set_termination_reason("autopilot_fire");
@@ -15243,6 +15941,11 @@ void Driver::run(core::State& state,
       core::log_warning(
           f09_fallback_line("[f09-fallback] run total:", recorder));
     }
+  }
+  if (cfg.main.two_temperature && !seen_2t_separation && state.step > 0) {
+    core::log_warning("2T model collapse: Te ≈ Ti in all active cells at every step of the run "
+                      "(to step " + std::to_string(state.step) +
+                      "). Check EOS or initial conditions.");
   }
   hydro::corner_collapse_ledger_flush();
   hydro::ale::remap_dispatch_audit_flush();

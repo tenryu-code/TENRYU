@@ -108,6 +108,8 @@ struct PackedLayout {
   std::size_t ee = 0U;
   std::size_t ei = 0U;
   std::size_t v_r = 0U;
+  std::size_t range_fe = 0U;
+  std::size_t range_fi = 0U;
   std::size_t mu = 0U;
   std::size_t mu_weight = 0U;
   std::size_t S_out = 0U;
@@ -128,7 +130,7 @@ struct PackedLayout {
 
   PackedLayout(const std::size_t n, const bool have_birth,
                const bool have_neutron, const bool have_velocity,
-               const std::size_t n_mu) {
+               const bool have_range_medium, const std::size_t n_mu) {
     burn_y = take<double>(n * static_cast<std::size_t>(kNumSpecies));
     dE_e = take<double>(n);
     dE_i = take<double>(n);
@@ -156,6 +158,10 @@ struct PackedLayout {
     ei = take<double>(n);
     if (have_velocity) {
       v_r = take<double>(n);
+    }
+    if (have_range_medium) {
+      range_fe = take<double>(n);
+      range_fi = take<double>(n);
     }
     if (have_neutron) {
       mu = take<double>(n_mu);
@@ -293,7 +299,8 @@ __global__ void burn_stage_main_1d_kernel(
     const double* __restrict__ zbar, const double* __restrict__ A_eff,
     const double* __restrict__ vol, const double* __restrict__ r_node,
     const double* __restrict__ ee, const double* __restrict__ ei,
-    const double* __restrict__ v_r, const double* __restrict__ S_out,
+    const double* __restrict__ v_r, const double* __restrict__ range_fe,
+    const double* __restrict__ range_fi, const double* __restrict__ S_out,
     double* __restrict__ burn_y, double* __restrict__ dE_e,
     double* __restrict__ dE_i, double* __restrict__ rate_diag,
     double* __restrict__ Qe_diag, double* __restrict__ Qi_diag,
@@ -384,7 +391,13 @@ __global__ void burn_stage_main_1d_kernel(
       (span > 1.0e-9 * R_b) ? (S_out[c] / span) : rho[c];
   const double Te_keV_c = Te_eV[c] * 1.0e-3;
   const double Ti_keV_c = ((Ti_eV[c] > 0.0) ? Ti_eV[c] : 0.0) * 1.0e-3;
-  const double rho_lam_alpha = alpha_rho_lambda(Te_keV_c, rho[c]);
+  FraleyRangeMedium range_medium;
+  if (range_fe != nullptr) {
+    range_medium.fe = range_fe[c];
+    range_medium.fi = range_fi[c];
+  }
+  const double rho_lam_alpha =
+      alpha_rho_lambda(Te_keV_c, rho[c], range_medium);
 
   for (int k = 0; k < kNumReactions; ++k) {
     if (!(counts[k] > 0.0)) {
@@ -847,8 +860,10 @@ BurnStageResult compute_burn_step_1d_device_stage(
       (have_neutron && neutron_mu_valid)
           ? static_cast<std::size_t>(p.neutron_heating_n_mu)
           : 0U;
+  const bool have_range_medium =
+      p.scheme == 0 && in.range_fe != nullptr && in.range_fi != nullptr;
   const PackedLayout layout(n, have_birth, have_neutron, in.v_r != nullptr,
-                            packed_n_mu);
+                            have_range_medium, packed_n_mu);
   std::vector<unsigned char> host_pack(layout.bytes, 0U);
   unsigned char* const host_base = host_pack.data();
   pack_doubles(host_base, layout.burn_y, burn_y.data(),
@@ -864,6 +879,10 @@ BurnStageResult compute_burn_step_1d_device_stage(
   pack_doubles(host_base, layout.ei, in.ei, n);
   if (in.v_r != nullptr) {
     pack_doubles(host_base, layout.v_r, in.v_r, n);
+  }
+  if (have_range_medium) {
+    pack_doubles(host_base, layout.range_fe, in.range_fe, n);
+    pack_doubles(host_base, layout.range_fi, in.range_fi, n);
   }
   if (have_neutron && neutron_mu_valid) {
     pack_doubles(host_base, layout.mu, neutron_mu.data(), packed_n_mu);
@@ -908,6 +927,12 @@ BurnStageResult compute_burn_step_1d_device_stage(
   const double* const d_v_r =
       (in.v_r != nullptr) ? packed_ptr<double>(device_base, layout.v_r)
                           : nullptr;
+  const double* const d_range_fe =
+      have_range_medium ? packed_ptr<double>(device_base, layout.range_fe)
+                        : nullptr;
+  const double* const d_range_fi =
+      have_range_medium ? packed_ptr<double>(device_base, layout.range_fi)
+                        : nullptr;
   const double* const d_mu =
       (have_neutron && neutron_mu_valid)
           ? packed_ptr<double>(device_base, layout.mu)
@@ -950,8 +975,9 @@ BurnStageResult compute_burn_step_1d_device_stage(
   const int active_grid = (active_cells + kBlock - 1) / kBlock;
   burn_stage_main_1d_kernel<<<active_grid, kBlock>>>(
       n_cells, first, last, p, partition_table, d_rho, d_Ti_eV, d_Te_eV,
-      d_zbar, d_A_eff, d_vol, d_r_node, d_ee, d_ei, d_v_r, d_S_out,
-      d_burn_y, d_dE_e, d_dE_i, d_rate_diag, d_Qe_diag, d_Qi_diag,
+      d_zbar, d_A_eff, d_vol, d_r_node, d_ee, d_ei, d_v_r, d_range_fe,
+      d_range_fi, d_S_out, d_burn_y, d_dE_e, d_dE_i, d_rate_diag, d_Qe_diag,
+      d_Qi_diag,
       d_S_birth, d_nh_emit, d_cell_tallies);
   CUDA_CHECK(cudaGetLastError());
   if (have_neutron && neutron_mu_valid) {
@@ -1033,6 +1059,98 @@ BurnStageResult compute_burn_step_1d_device_stage(
   dt_limit_subcycle = packet.dt_limit_subcycle;
   screening_warning_flags = packet.screening_warning_flags;
   return result;
+}
+
+namespace {
+
+constexpr int kMaxRegionFuelMaterials = 16;
+
+struct RegionFuelMaterials {
+  int m[kMaxRegionFuelMaterials];
+  int n;
+};
+
+__global__ void burn_region_bounds_kernel(const double* __restrict__ volfrac,
+                                          const int n_cells,
+                                          const int n_mat,
+                                          const RegionFuelMaterials fuel,
+                                          const double vf_threshold,
+                                          int* __restrict__ bounds) {
+  const int c = blockIdx.x * blockDim.x + threadIdx.x;
+  if (c >= n_cells) {
+    return;
+  }
+  // Same summation order as the stage's host loop.
+  double fuel_frac = 0.0;
+  for (int i = 0; i < fuel.n; ++i) {
+    fuel_frac += volfrac[static_cast<std::size_t>(c) * n_mat + fuel.m[i]];
+  }
+  if (fuel_frac > vf_threshold) {
+    atomicMin(&bounds[0], c);
+    atomicMax(&bounds[1], c);
+  }
+}
+
+// bounds = (first fuel cell, last fuel cell, reacting flag) start values.
+__global__ void init_burn_region_bounds_kernel(int* __restrict__ bounds, const int n_cells) {
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    bounds[0] = n_cells;
+    bounds[1] = -1;
+    bounds[2] = 0;
+  }
+}
+
+__global__ void burn_region_reacting_kernel(const double* __restrict__ rho,
+                                            const double* __restrict__ Ti_eV,
+                                            const double T_floor_keV,
+                                            int* __restrict__ bounds) {
+  const int first = bounds[0];
+  const int last = bounds[1];
+  for (int c = first + blockIdx.x * blockDim.x + threadIdx.x; c <= last;
+       c += gridDim.x * blockDim.x) {
+    if (!(rho[c] <= 0.0) && !(Ti_eV[c] * 1.0e-3 < T_floor_keV)) {
+      bounds[2] = 1;
+      return;
+    }
+  }
+}
+
+}  // namespace
+
+bool burn_1d_region_may_react(const double* d_rho,
+                              const double* d_Ti_eV,
+                              const double* d_volfrac,
+                              const int n_cells,
+                              const int n_mat,
+                              const std::vector<int>& fuel_mats,
+                              const double vf_threshold,
+                              const double T_floor_keV) {
+  if (n_cells <= 0 || fuel_mats.empty()) {
+    return false;
+  }
+  if (static_cast<int>(fuel_mats.size()) > kMaxRegionFuelMaterials ||
+      d_volfrac == nullptr || d_rho == nullptr || d_Ti_eV == nullptr) {
+    return true;  // cannot decide here: run the stage
+  }
+  RegionFuelMaterials fuel{};
+  fuel.n = static_cast<int>(fuel_mats.size());
+  for (int i = 0; i < fuel.n; ++i) {
+    fuel.m[i] = fuel_mats[static_cast<std::size_t>(i)];
+  }
+  auto* d_bounds = static_cast<int*>(
+      core::device_scratch_acquire("burn:region_may_react", 3 * sizeof(int)));
+  init_burn_region_bounds_kernel<<<1, 1>>>(d_bounds, n_cells);
+  CUDA_CHECK(cudaGetLastError());
+  constexpr int kBlock = 128;
+  const int grid = (n_cells + kBlock - 1) / kBlock;
+  burn_region_bounds_kernel<<<grid, kBlock>>>(d_volfrac, n_cells, n_mat, fuel,
+                                              vf_threshold, d_bounds);
+  CUDA_CHECK(cudaGetLastError());
+  burn_region_reacting_kernel<<<grid, kBlock>>>(d_rho, d_Ti_eV, T_floor_keV, d_bounds);
+  CUDA_CHECK(cudaGetLastError());
+  int result[3] = {0, 0, 0};
+  CUDA_CHECK(cudaMemcpy(result, d_bounds, sizeof(result), cudaMemcpyDeviceToHost));
+  return result[2] != 0;
 }
 
 }  // namespace tenryu::burn

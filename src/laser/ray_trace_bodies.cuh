@@ -968,9 +968,14 @@ TENRYU_HOST_DEVICE inline bool advance_to_radial_profile_entry(double* R,
     return false;
   }
 
-  const double sqrt_disc = ::sqrt(disc);
-  const double s_entry = (-b - sqrt_disc) * (0.5 / a);
-  if (!(s_entry > 0.0)) {
+  // The ray enters only when moving inward (b < 0), at the smaller root, taken
+  // in the form without cancellation; c <= 0 is a start on the sphere up to
+  // rounding (entry at the start point).
+  if (!(b < 0.0)) {
+    return false;
+  }
+  const double s_entry = (c > 0.0) ? (2.0 * c) / (::sqrt(disc) - b) : 0.0;
+  if (!(s_entry >= 0.0)) {
     return false;
   }
 
@@ -985,17 +990,30 @@ TENRYU_HOST_DEVICE inline bool advance_to_radial_profile_entry(double* R,
   reflect_axis_if_needed(R, vR);
 
   if (outside_radial_profile(*R, *Z, radial_node_r, n_radial_nodes)) {
+    // The rounded entry point lies just outside r_max: back onto the profile,
+    // shrinking by ulps until the outside test agrees (the rescaled point can
+    // itself round outside; such a ray used to be booked as missing the
+    // target).
     const double r_entry = radial_distance(*R, *Z);
     constexpr double kEntryTolRel = 1.0e-12;
     if (!::isfinite(r_entry) || !(r_entry > 0.0) || r_entry > r_max * (1.0 + kEntryTolRel)) {
       return false;
     }
-    const double scale = r_max / r_entry;
-    *R *= scale;
-    *Z *= scale;
+    const double R_on = *R;
+    const double Z_on = *Z;
+    double scale = r_max / r_entry;
+    for (int k = 0; k < 16 &&
+                    outside_radial_profile(R_on * scale, Z_on * scale, radial_node_r,
+                                           n_radial_nodes);
+         ++k) {
+      scale = ::nextafter(scale, 0.0);
+    }
+    *R = R_on * scale;
+    *Z = Z_on * scale;
   }
 
-  return true;
+  // The returned point is inside the profile by the callers' test.
+  return !outside_radial_profile(*R, *Z, radial_node_r, n_radial_nodes);
 }
 
 struct DepositCellCacheGuard {
@@ -1400,12 +1418,16 @@ __device__ inline void ray_trace_1d_sph_body(const int ray,
                       const laser::LaserPhysExtOptions phys_opt,
                       const double* __restrict__ radial_T_e,
                       double* __restrict__ ra_per_ray,
-                      double* __restrict__ tau_shell_out
+                      double* __restrict__ tau_shell_out,
+                      const int per_ray_row_base = 0
                       ) {
   (void)lambda_cm;
   (void)coulomb_log_floor;
 
   const int tid = ray;
+  // Row of this ray in the per-ray tallies (deposit, unabsorbed, tail power):
+  // the launcher traces the rays in batches when all rows do not fit.
+  const int row = ray - per_ray_row_base;
   const int output_idx = (output_stride > 0) ? (tid / output_stride) : -1;
   const bool traj_on = (traj_pos_R != nullptr) && (output_stride > 0) &&
                        (tid % output_stride == 0) && (output_idx < n_output_rays);
@@ -1419,13 +1441,13 @@ __device__ inline void ray_trace_1d_sph_body(const int ray,
   // deterministic. Null buffers fall back to the legacy shared-atomic tally.
   double* deposit_target =
       (deposit_per_ray != nullptr)
-          ? deposit_per_ray + static_cast<std::size_t>(tid) *
+          ? deposit_per_ray + static_cast<std::size_t>(row) *
                                   static_cast<std::size_t>(n_hydro_cells)
           : deposit_1d;
   DepositCellCacheGuard deposit_cache(deposit_target);
   int hydro_hint = n_hydro_cells / 2;
   double* tail_slot =
-      (tail_power_per_ray != nullptr) ? &tail_power_per_ray[tid] : nullptr;
+      (tail_power_per_ray != nullptr) ? &tail_power_per_ray[row] : nullptr;
 
   double R = ray_R0[tid];
   double Z = ray_Z0[tid];
@@ -1462,7 +1484,7 @@ __device__ inline void ray_trace_1d_sph_body(const int ray,
     }
     if (::isfinite(I) && I > 0.0) {
       if (unabsorbed_per_ray != nullptr) {
-        unabsorbed_per_ray[tid] += I;
+        unabsorbed_per_ray[row] += I;
       } else {
         atomic_add_double(P_unabsorbed, I);
       }
@@ -1492,10 +1514,9 @@ __device__ inline void ray_trace_1d_sph_body(const int ray,
     ++traj_stored;
   }
   if (outside_radial_profile(R, Z, radial_node_r, n_radial_nodes)) {
-    if (!advance_to_radial_profile_entry(&R, &Z, &vR, vZ, radial_node_r, n_radial_nodes) ||
-        outside_radial_profile(R, Z, radial_node_r, n_radial_nodes)) {
+    if (!advance_to_radial_profile_entry(&R, &Z, &vR, vZ, radial_node_r, n_radial_nodes)) {
       if (unabsorbed_per_ray != nullptr) {
-        unabsorbed_per_ray[tid] += I;
+        unabsorbed_per_ray[row] += I;
       } else {
         atomic_add_double(P_unabsorbed, I);
       }
@@ -1531,7 +1552,7 @@ __device__ inline void ray_trace_1d_sph_body(const int ray,
         atomicExch(&error_flags->invalid_cell, 1);
       }
       if (unabsorbed_per_ray != nullptr) {
-        unabsorbed_per_ray[tid] += I;
+        unabsorbed_per_ray[row] += I;
       } else {
         atomic_add_double(P_unabsorbed, I);
       }
@@ -1557,7 +1578,7 @@ __device__ inline void ray_trace_1d_sph_body(const int ray,
         }
       }
       if (unabsorbed_per_ray != nullptr) {
-        unabsorbed_per_ray[tid] += I;
+        unabsorbed_per_ray[row] += I;
       } else {
         atomic_add_double(P_unabsorbed, I);
       }
@@ -1580,8 +1601,14 @@ __device__ inline void ray_trace_1d_sph_body(const int ray,
           const double I_vac = vacuum_map_intensity(
               phys_opt.langdon_I0_wcm2, phys_opt.langdon_w_cm, R,
               phys_opt.langdon_profile_kind, phys_opt.langdon_sg_two_m);
+          // Multi-material decks: the collision charge of the radial
+          // profile (the node's material, 2026-09-24).
+          const double zcoll0 =
+              (phys_opt.langdon_zcoll_radial != nullptr)
+                  ? interpolate_radial_field(phys_opt.langdon_zcoll_radial, carried_c)
+                  : phys_opt.langdon_zcoll;
           kappa0 *= compute_langdon_factor(phys_opt.langdon_model,
-                                           phys_opt.langdon_zcoll, I_vac,
+                                           zcoll0, I_vac,
                                            lambda_cm, Te0,
                                            phys_opt.langdon_te_min_eV);
         }
@@ -1597,7 +1624,7 @@ __device__ inline void ray_trace_1d_sph_body(const int ray,
         atomicExch(&error_flags->invalid_cell, 1);
       }
       if (unabsorbed_per_ray != nullptr) {
-        unabsorbed_per_ray[tid] += I;
+        unabsorbed_per_ray[row] += I;
       } else {
         atomic_add_double(P_unabsorbed, I);
       }
@@ -1625,7 +1652,7 @@ __device__ inline void ray_trace_1d_sph_body(const int ray,
         atomicExch(&error_flags->nan_particle, 1);
       }
       if (unabsorbed_per_ray != nullptr) {
-        unabsorbed_per_ray[tid] += I;
+        unabsorbed_per_ray[row] += I;
       } else {
         atomic_add_double(P_unabsorbed, I);
       }
@@ -1693,7 +1720,7 @@ __device__ inline void ray_trace_1d_sph_body(const int ray,
         atomicExch(&error_flags->invalid_cell, 1);
       }
       if (unabsorbed_per_ray != nullptr) {
-        unabsorbed_per_ray[tid] += I;
+        unabsorbed_per_ray[row] += I;
       } else {
         atomic_add_double(P_unabsorbed, I);
       }
@@ -1719,7 +1746,7 @@ __device__ inline void ray_trace_1d_sph_body(const int ray,
         }
       }
       if (unabsorbed_per_ray != nullptr) {
-        unabsorbed_per_ray[tid] += I;
+        unabsorbed_per_ray[row] += I;
       } else {
         atomic_add_double(P_unabsorbed, I);
       }
@@ -1761,7 +1788,7 @@ __device__ inline void ray_trace_1d_sph_body(const int ray,
       }
       if (tail_status == TailClosureStatus::kInvalid) {
         if (unabsorbed_per_ray != nullptr) {
-          unabsorbed_per_ray[tid] += I;
+          unabsorbed_per_ray[row] += I;
         } else {
           atomic_add_double(P_unabsorbed, I);
         }
@@ -1798,7 +1825,7 @@ __device__ inline void ray_trace_1d_sph_body(const int ray,
           }
         }
         if (unabsorbed_per_ray != nullptr) {
-          unabsorbed_per_ray[tid] += I;
+          unabsorbed_per_ray[row] += I;
         } else {
           atomic_add_double(P_unabsorbed, I);
         }
@@ -1836,6 +1863,7 @@ __device__ inline void ray_trace_1d_sph_body(const int ray,
     R += ds_cur * vR;
     Z += ds_cur * vZ;
     const double R_unreflected = R;
+    const double vR_unreflected = vR;
     reflect_axis_if_needed(&R, &vR);
 
     if (!::isfinite(R) || !::isfinite(Z) || !::isfinite(vR) || !::isfinite(vZ)) {
@@ -1843,7 +1871,7 @@ __device__ inline void ray_trace_1d_sph_body(const int ray,
         atomicExch(&error_flags->nan_particle, 1);
       }
       if (unabsorbed_per_ray != nullptr) {
-        unabsorbed_per_ray[tid] += I;
+        unabsorbed_per_ray[row] += I;
       } else {
         atomic_add_double(P_unabsorbed, I);
       }
@@ -1861,7 +1889,7 @@ __device__ inline void ray_trace_1d_sph_body(const int ray,
                                           radial_node_r[n_radial_nodes - 1]);
       if (!(t_mesh > 0.0)) {
         if (unabsorbed_per_ray != nullptr) {
-          unabsorbed_per_ray[tid] += I;
+          unabsorbed_per_ray[row] += I;
         } else {
           atomic_add_double(P_unabsorbed, I);
         }
@@ -1882,7 +1910,7 @@ __device__ inline void ray_trace_1d_sph_body(const int ray,
         atomicExch(&error_flags->invalid_cell, 1);
       }
       if (unabsorbed_per_ray != nullptr) {
-        unabsorbed_per_ray[tid] += I;
+        unabsorbed_per_ray[row] += I;
       } else {
         atomic_add_double(P_unabsorbed, I);
       }
@@ -1908,7 +1936,7 @@ __device__ inline void ray_trace_1d_sph_body(const int ray,
         }
       }
       if (unabsorbed_per_ray != nullptr) {
-        unabsorbed_per_ray[tid] += I;
+        unabsorbed_per_ray[row] += I;
       } else {
         atomic_add_double(P_unabsorbed, I);
       }
@@ -1950,7 +1978,7 @@ __device__ inline void ray_trace_1d_sph_body(const int ray,
       }
       if (tail_status == TailClosureStatus::kInvalid) {
         if (unabsorbed_per_ray != nullptr) {
-          unabsorbed_per_ray[tid] += I;
+          unabsorbed_per_ray[row] += I;
         } else {
           atomic_add_double(P_unabsorbed, I);
         }
@@ -1987,7 +2015,7 @@ __device__ inline void ray_trace_1d_sph_body(const int ray,
           }
         }
         if (unabsorbed_per_ray != nullptr) {
-          unabsorbed_per_ray[tid] += I;
+          unabsorbed_per_ray[row] += I;
         } else {
           atomic_add_double(P_unabsorbed, I);
         }
@@ -2050,7 +2078,7 @@ __device__ inline void ray_trace_1d_sph_body(const int ray,
         atomicExch(&error_flags->invalid_cell, 1);
       }
       if (unabsorbed_per_ray != nullptr) {
-        unabsorbed_per_ray[tid] += I;
+        unabsorbed_per_ray[row] += I;
       } else {
         atomic_add_double(P_unabsorbed, I);
       }
@@ -2121,7 +2149,7 @@ __device__ inline void ray_trace_1d_sph_body(const int ray,
         }
       }
       if (unabsorbed_per_ray != nullptr) {
-        unabsorbed_per_ray[tid] += I;
+        unabsorbed_per_ray[row] += I;
       } else {
         atomic_add_double(P_unabsorbed, I);
       }
@@ -2205,7 +2233,7 @@ __device__ inline void ray_trace_1d_sph_body(const int ray,
           }
         }
         if (unabsorbed_per_ray != nullptr) {
-          unabsorbed_per_ray[tid] += I;
+          unabsorbed_per_ray[row] += I;
         } else {
           atomic_add_double(P_unabsorbed, I);
         }
@@ -2241,7 +2269,7 @@ __device__ inline void ray_trace_1d_sph_body(const int ray,
           }
         }
         if (unabsorbed_per_ray != nullptr) {
-          unabsorbed_per_ray[tid] += I;
+          unabsorbed_per_ray[row] += I;
         } else {
           atomic_add_double(P_unabsorbed, I);
         }
@@ -2262,7 +2290,7 @@ __device__ inline void ray_trace_1d_sph_body(const int ray,
           atomicExch(&error_flags->invalid_cell, 1);
         }
         if (unabsorbed_per_ray != nullptr) {
-          unabsorbed_per_ray[tid] += I;
+          unabsorbed_per_ray[row] += I;
         } else {
           atomic_add_double(P_unabsorbed, I);
         }
@@ -2286,8 +2314,12 @@ __device__ inline void ray_trace_1d_sph_body(const int ray,
           const double I_vac = vacuum_map_intensity(
               phys_opt.langdon_I0_wcm2, phys_opt.langdon_w_cm, R,
               phys_opt.langdon_profile_kind, phys_opt.langdon_sg_two_m);
+          const double zcoll_stop =
+              (phys_opt.langdon_zcoll_radial != nullptr)
+                  ? interpolate_radial_field(phys_opt.langdon_zcoll_radial, c_stop)
+                  : phys_opt.langdon_zcoll;
           kappa_stop *= compute_langdon_factor(phys_opt.langdon_model,
-                                               phys_opt.langdon_zcoll, I_vac,
+                                               zcoll_stop, I_vac,
                                                lambda_cm, Te0,
                                                phys_opt.langdon_te_min_eV);
         }
@@ -2298,7 +2330,7 @@ __device__ inline void ray_trace_1d_sph_body(const int ray,
         atomicExch(&error_flags->invalid_cell, 1);
       }
       if (unabsorbed_per_ray != nullptr) {
-        unabsorbed_per_ray[tid] += I;
+        unabsorbed_per_ray[row] += I;
       } else {
         atomic_add_double(P_unabsorbed, I);
       }
@@ -2321,7 +2353,7 @@ __device__ inline void ray_trace_1d_sph_body(const int ray,
         atomicExch(&error_flags->invalid_cell, 1);
       }
       if (unabsorbed_per_ray != nullptr) {
-        unabsorbed_per_ray[tid] += I;
+        unabsorbed_per_ray[row] += I;
       } else {
         atomic_add_double(P_unabsorbed, I);
       }
@@ -2408,7 +2440,7 @@ __device__ inline void ray_trace_1d_sph_body(const int ray,
             atomicExch(&error_flags->nan_particle, 1);
           }
           if (unabsorbed_per_ray != nullptr) {
-            unabsorbed_per_ray[tid] += I;
+            unabsorbed_per_ray[row] += I;
           } else {
             atomic_add_double(P_unabsorbed, I);
           }
@@ -2426,7 +2458,7 @@ __device__ inline void ray_trace_1d_sph_body(const int ray,
           atomicExch(&error_flags->nan_particle, 1);
         }
         if (unabsorbed_per_ray != nullptr) {
-          unabsorbed_per_ray[tid] += I;
+          unabsorbed_per_ray[row] += I;
         } else {
           atomic_add_double(P_unabsorbed, I);
         }
@@ -2468,6 +2500,20 @@ __device__ inline void ray_trace_1d_sph_body(const int ray,
     }
 
     I = I_next;
+    if (entry_handoff_interval >= 0) {
+      // Vacuum-to-matter entry: the step was cut at the surface node and the
+      // carried interval, n_hat and kappa are those of the surface, so the ray
+      // continues from the entry point. The vacuum path is straight (g = 0),
+      // so the velocity is the pre-reflection one, reflected only if the axis
+      // crossing lies before the entry point (the reflect_axis_if_needed
+      // rule). The ray formerly continued from the uncut end point, skipping
+      // the material between the surface and that point (2026-09-23).
+      const bool stop_reflected =
+          R_stop_path < 0.0 || (R_stop_path == 0.0 && vR_unreflected < 0.0);
+      R = R_stop;
+      Z = Z_stop;
+      vR = stop_reflected ? -vR_unreflected : vR_unreflected;
+    }
     if (traj_on && traj_stored < traj_max_steps) {
       const int idx = output_idx * traj_max_steps + traj_stored;
       traj_pos_R[idx] = R;
@@ -2478,7 +2524,14 @@ __device__ inline void ray_trace_1d_sph_body(const int ray,
       }
       ++traj_stored;
     }
-    ds_prev = ds_cur * t_stop;
+    // The step's second half-kick is completed at the start of the next step
+    // with the carried interval's gradient. After a vacuum entry the carried
+    // interval is the material one, but the step itself lay in vacuum, whose
+    // one-sided force at the surface is 0: no completion kick (ds_prev = 0).
+    // Completing it with the material gradient gave a kick of
+    // 0.25 * ds_vacuum * |dn/dr|, which reverses a ray entering a steep
+    // surface layer after a long vacuum stride (2026-09-23).
+    ds_prev = (entry_handoff_interval >= 0) ? 0.0 : ds_cur * t_stop;
     carried_c = c_stop;
     carried_nh = nh_stop;
     carried_nh_raw = nh_stop_raw;
@@ -2504,7 +2557,7 @@ __device__ inline void ray_trace_1d_sph_body(const int ray,
         }
       }
       if (unabsorbed_per_ray != nullptr) {
-        unabsorbed_per_ray[tid] += I;
+        unabsorbed_per_ray[row] += I;
       } else {
         atomic_add_double(P_unabsorbed, I);
       }
@@ -2519,7 +2572,7 @@ __device__ inline void ray_trace_1d_sph_body(const int ray,
         cbet_cursor.flush();
       }
       if (unabsorbed_per_ray != nullptr) {
-        unabsorbed_per_ray[tid] += I;
+        unabsorbed_per_ray[row] += I;
       } else {
         atomic_add_double(P_unabsorbed, I);
       }
@@ -2534,7 +2587,7 @@ __device__ inline void ray_trace_1d_sph_body(const int ray,
     cbet_cursor.flush();
   }
   if (unabsorbed_per_ray != nullptr) {
-    unabsorbed_per_ray[tid] += I;
+    unabsorbed_per_ray[row] += I;
   } else {
     atomic_add_double(P_unabsorbed, I);
   }
@@ -2564,11 +2617,33 @@ __device__ inline void reduce_per_ray_tallies_1d_body(
   // owns exactly one output slot, so the trailing atomic adds have a single
   // writer per launch and beam launches accumulate in stream order.
   if (c < n_cells) {
+    // Eight rows' loads issued together, then added in ray order (the same
+    // sum as the one-row loop; 2026-09-25: the loop was latency-bound).
     double acc = 0.0;
-    for (int r = 0; r < n_rays; ++r) {
-      acc += deposit_per_ray[static_cast<std::size_t>(r) *
-                                 static_cast<std::size_t>(n_cells) +
-                             static_cast<std::size_t>(c)];
+    const std::size_t stride = static_cast<std::size_t>(n_cells);
+    const double* __restrict__ column = deposit_per_ray + static_cast<std::size_t>(c);
+    int r = 0;
+    for (; r + 8 <= n_rays; r += 8) {
+      const std::size_t o = static_cast<std::size_t>(r) * stride;
+      const double v0 = column[o];
+      const double v1 = column[o + stride];
+      const double v2 = column[o + 2 * stride];
+      const double v3 = column[o + 3 * stride];
+      const double v4 = column[o + 4 * stride];
+      const double v5 = column[o + 5 * stride];
+      const double v6 = column[o + 6 * stride];
+      const double v7 = column[o + 7 * stride];
+      acc += v0;
+      acc += v1;
+      acc += v2;
+      acc += v3;
+      acc += v4;
+      acc += v5;
+      acc += v6;
+      acc += v7;
+    }
+    for (; r < n_rays; ++r) {
+      acc += column[static_cast<std::size_t>(r) * stride];
     }
     if (acc != 0.0) {
       atomic_add_double(&deposit_1d[c], acc);

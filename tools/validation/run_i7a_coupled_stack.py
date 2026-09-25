@@ -171,11 +171,21 @@ def floor_injection_metrics(outdir: Path) -> dict[str, Any]:
     with h5py.File(candidates[0], "r") as handle:
         if "energy/floor_injected" not in handle or "energy/laser_incident" not in handle:
             return {"floor_metrics_available": False}
-        floor = np.asarray(handle["energy/floor_injected"][()], dtype=float)
+        # energy/laser_incident is run-cumulative, and so is
+        # energy/floor_injected when energy/floor_injected_step exists
+        # (2026-09-23); older floor series are per-step. Step maxima use the
+        # per-step values at the history rows.
         laser = np.asarray(handle["energy/laser_incident"][()], dtype=float)
+        floor_series = np.asarray(handle["energy/floor_injected"][()], dtype=float)
+        if "energy/floor_injected_step" in handle:
+            floor = np.asarray(handle["energy/floor_injected_step"][()], dtype=float)
+            floor_total = float(floor_series[-1]) if floor_series.size else 0.0
+        else:
+            floor = floor_series
+            floor_total = float(np.sum(floor))
 
-    floor_total = float(np.sum(floor))
-    laser_total = float(np.sum(laser))
+    laser_total = float(laser[-1]) if laser.size else 0.0
+    laser_steps = np.diff(laser, prepend=0.0) if laser.size else laser
     if laser_total > 0.0:
         ratio = floor_total / laser_total
     else:
@@ -185,8 +195,8 @@ def floor_injection_metrics(outdir: Path) -> dict[str, Any]:
         "floor_injected_total_erg": floor_total,
         "laser_incident_total_erg": laser_total,
         "floor_to_laser_total_ratio": ratio,
-        "floor_step_max_erg": float(np.max(floor)),
-        "laser_step_max_erg": float(np.max(laser)),
+        "floor_step_max_erg": float(np.max(floor)) if floor.size else 0.0,
+        "laser_step_max_erg": float(np.max(laser_steps)) if laser_steps.size else 0.0,
         "floor_runaway": bool(ratio > FLOOR_RUNAWAY_RATIO),
         "floor_polluted": bool(ratio > FLOOR_POLLUTED_RATIO),
     }

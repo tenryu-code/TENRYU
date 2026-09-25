@@ -247,7 +247,7 @@ Numerics(
 Output(
     directory="./build/output_verify_gxii_1d_regression",
     plot_every=0,
-    history_every=0,
+    history_every=1,
     checkpoint_every=0,
     plot_every_s=-1.0,
     history_every_s=-1.0,

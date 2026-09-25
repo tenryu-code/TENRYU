@@ -53,6 +53,26 @@ std::string format_range(const std::vector<double>& range) {
   return "[" + std::to_string(range[0]) + ", " + std::to_string(range[1]) + "]";
 }
 
+// x f(x) for the normalized Planck density in x = E/T,
+// f(x) = (15/pi^4) x^3/(e^x - 1) (same branches as Groups' Planck kernel):
+// d/d ln T of the fraction above x is x f(x).
+double planck_x_density(const double x) {
+  constexpr double kPi = 3.141592653589793238462643383279502884;
+  constexpr double kNorm = 15.0 / (kPi * kPi * kPi * kPi);
+  if (!(x > 0.0) || !std::isfinite(x)) {
+    return 0.0;
+  }
+  double kernel = 0.0;
+  if (x < 1.0e-3) {
+    kernel = x * x - 0.5 * x * x * x;
+  } else if (x > 500.0) {
+    kernel = x * x * x * std::exp(-x);
+  } else {
+    kernel = (x * x * x) / std::expm1(x);
+  }
+  return kNorm * x * kernel;
+}
+
 }  // namespace
 
 PlanckTable::~PlanckTable() {
@@ -69,23 +89,50 @@ PlanckTable& PlanckTable::operator=(PlanckTable&& other) noexcept {
 
     n_T_ = other.n_T_;
     n_groups_ = other.n_groups_;
+    constant_in_T_ = other.constant_in_T_;
     T_grid_host_ = std::move(other.T_grid_host_);
     b_g_host_ = std::move(other.b_g_host_);
     cdf_g_host_ = std::move(other.cdf_g_host_);
+    tail_g_host_ = std::move(other.tail_g_host_);
+    ln_cdf_g_host_ = std::move(other.ln_cdf_g_host_);
+    ln_tail_g_host_ = std::move(other.ln_tail_g_host_);
+    dln_cdf_g_host_ = std::move(other.dln_cdf_g_host_);
+    dln_tail_g_host_ = std::move(other.dln_tail_g_host_);
+    ln_T_grid_host_ = std::move(other.ln_T_grid_host_);
     d_T_grid_ = other.d_T_grid_;
     d_b_g_ = other.d_b_g_;
     d_cdf_g_ = other.d_cdf_g_;
+    d_tail_g_ = other.d_tail_g_;
+    d_ln_cdf_g_ = other.d_ln_cdf_g_;
+    d_ln_tail_g_ = other.d_ln_tail_g_;
+    d_dln_cdf_g_ = other.d_dln_cdf_g_;
+    d_dln_tail_g_ = other.d_dln_tail_g_;
+    d_ln_T_grid_ = other.d_ln_T_grid_;
 
     other.n_T_ = 0;
     other.n_groups_ = 1;
+    other.constant_in_T_ = false;
     other.d_T_grid_ = nullptr;
     other.d_b_g_ = nullptr;
     other.d_cdf_g_ = nullptr;
+    other.d_tail_g_ = nullptr;
+    other.d_ln_cdf_g_ = nullptr;
+    other.d_ln_tail_g_ = nullptr;
+    other.d_dln_cdf_g_ = nullptr;
+    other.d_dln_tail_g_ = nullptr;
+    other.d_ln_T_grid_ = nullptr;
   }
   return *this;
 }
 
 void PlanckTable::release() {
+  for (double** p : {&d_tail_g_, &d_ln_cdf_g_, &d_ln_tail_g_, &d_dln_cdf_g_, &d_dln_tail_g_,
+                     &d_ln_T_grid_}) {
+    if (*p != nullptr) {
+      cuda_check(cudaFree(*p), "PlanckTable cudaFree interpolation table failed");
+      *p = nullptr;
+    }
+  }
   if (d_cdf_g_ != nullptr) {
     cuda_check(cudaFree(d_cdf_g_), "PlanckTable cudaFree cdf failed");
     d_cdf_g_ = nullptr;
@@ -117,6 +164,9 @@ void PlanckTable::build(const Groups& groups,
   T_grid_host_.assign(static_cast<std::size_t>(n_T_), 0.0);
   b_g_host_.assign(static_cast<std::size_t>(n_T_ * n_groups_), 0.0);
   cdf_g_host_.assign(static_cast<std::size_t>(n_T_ * n_groups_), 0.0);
+  dln_cdf_g_host_.assign(static_cast<std::size_t>(n_T_ * n_groups_), 0.0);
+  dln_tail_g_host_.assign(static_cast<std::size_t>(n_T_ * n_groups_), 0.0);
+  std::vector<double> xf_bound(static_cast<std::size_t>(n_groups_ + 1), 0.0);
 
   const double log_min = std::log(T_min_eV);
   const double log_max = std::log(T_max_eV);
@@ -193,6 +243,33 @@ void PlanckTable::build(const Groups& groups,
       cdf_g_host_[static_cast<std::size_t>(k * n_groups_ + g)] = cdf;
     }
     cdf_g_host_[static_cast<std::size_t>(k * n_groups_ + (n_groups_ - 1))] = 1.0;
+
+    // Node slopes for the Hermite interpolation in ln T: with raw
+    // cumulative RC_g, raw tail RD_g and raw sum S (so C = RC/S, D = RD/S),
+    // d RC_g/du = xf(x_0) - xf(x_{g+1}), d RD_g/du = xf(x_{g+1}) - xf(x_G),
+    // d S/du = xf(x_0) - xf(x_G), xf(x) = x f(x), x_k = E_k/T.
+    if (sum > 0.0) {
+      for (int kb = 0; kb <= n_groups_; ++kb) {
+        const double E = (kb < n_groups_) ? groups.energy_lo(kb) : groups.energy_hi(n_groups_ - 1);
+        xf_bound[static_cast<std::size_t>(kb)] = planck_x_density(E / T);
+      }
+      const double dS = xf_bound.front() - xf_bound.back();
+      constexpr double kSlopeFloor = 1.0e-300;
+      double rc = 0.0;
+      for (int g = 0; g < n_groups_; ++g) {
+        rc += raw_b[static_cast<std::size_t>(g)];
+        const double drc = xf_bound.front() - xf_bound[static_cast<std::size_t>(g + 1)];
+        dln_cdf_g_host_[static_cast<std::size_t>(k * n_groups_ + g)] =
+            (rc > kSlopeFloor) ? (drc / rc - dS / sum) : 0.0;
+      }
+      double rd = 0.0;
+      for (int g = n_groups_ - 1; g >= 0; --g) {
+        const double drd = xf_bound[static_cast<std::size_t>(g + 1)] - xf_bound.back();
+        dln_tail_g_host_[static_cast<std::size_t>(k * n_groups_ + g)] =
+            (rd > kSlopeFloor) ? (drd / rd - dS / sum) : 0.0;
+        rd += raw_b[static_cast<std::size_t>(g)];
+      }
+    }
   }
 
   if (n_groups_ > 1) {
@@ -217,31 +294,62 @@ void PlanckTable::build(const Groups& groups,
     }
   }
 
-  cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_T_grid_),
-                        sizeof(double) * static_cast<std::size_t>(n_T_)),
-             "PlanckTable::build cudaMalloc T_grid failed");
-  cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_b_g_),
-                        sizeof(double) * static_cast<std::size_t>(n_T_ * n_groups_)),
-             "PlanckTable::build cudaMalloc b_g failed");
-  cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_cdf_g_),
-                        sizeof(double) * static_cast<std::size_t>(n_T_ * n_groups_)),
-             "PlanckTable::build cudaMalloc cdf failed");
+  finalize_and_upload("PlanckTable::build");
+}
 
-  cuda_check(cudaMemcpy(d_T_grid_,
-                        T_grid_host_.data(),
-                        sizeof(double) * static_cast<std::size_t>(n_T_),
-                        cudaMemcpyHostToDevice),
-             "PlanckTable::build copy T_grid failed");
-  cuda_check(cudaMemcpy(d_b_g_,
-                        b_g_host_.data(),
-                        sizeof(double) * static_cast<std::size_t>(n_T_ * n_groups_),
-                        cudaMemcpyHostToDevice),
-             "PlanckTable::build copy b_g failed");
-  cuda_check(cudaMemcpy(d_cdf_g_,
-                        cdf_g_host_.data(),
-                        sizeof(double) * static_cast<std::size_t>(n_T_ * n_groups_),
-                        cudaMemcpyHostToDevice),
-             "PlanckTable::build copy cdf failed");
+void PlanckTable::finalize_and_upload(const char* who) {
+  const std::size_t n_T = static_cast<std::size_t>(n_T_);
+  const std::size_t n_g = static_cast<std::size_t>(n_groups_);
+  TENRYU_ASSERT(T_grid_host_.size() == n_T && b_g_host_.size() == n_T * n_g &&
+                    cdf_g_host_.size() == n_T * n_g && dln_cdf_g_host_.size() == n_T * n_g &&
+                    dln_tail_g_host_.size() == n_T * n_g,
+                "PlanckTable::finalize_and_upload size mismatch");
+  // Tails as suffix sums of b_g (not 1 - C_g, which cancels for the small
+  // Wien tails), and the logs the interpolation mixes geometrically.
+  constexpr double kLnFloor = 1.0e-300;
+  constant_in_T_ = true;
+  for (std::size_t k = 1; k < n_T && constant_in_T_; ++k) {
+    for (std::size_t g = 0; g < n_g; ++g) {
+      if (b_g_host_[k * n_g + g] != b_g_host_[g]) {
+        constant_in_T_ = false;
+        break;
+      }
+    }
+  }
+  tail_g_host_.assign(n_T * n_g, 0.0);
+  ln_cdf_g_host_.assign(n_T * n_g, 0.0);
+  ln_tail_g_host_.assign(n_T * n_g, 0.0);
+  ln_T_grid_host_.assign(n_T, 0.0);
+  for (std::size_t k = 0; k < n_T; ++k) {
+    ln_T_grid_host_[k] = std::log(T_grid_host_[k]);
+    double tail = 0.0;
+    for (std::size_t g = n_g; g-- > 0;) {
+      tail_g_host_[k * n_g + g] = tail;
+      tail += b_g_host_[k * n_g + g];
+    }
+    for (std::size_t g = 0; g < n_g; ++g) {
+      ln_cdf_g_host_[k * n_g + g] = std::log(std::max(cdf_g_host_[k * n_g + g], kLnFloor));
+      ln_tail_g_host_[k * n_g + g] = std::log(std::max(tail_g_host_[k * n_g + g], kLnFloor));
+    }
+  }
+
+  const auto upload = [&](double** dst, const std::vector<double>& src, const char* what) {
+    const std::string msg_alloc = std::string(who) + " cudaMalloc " + what + " failed";
+    const std::string msg_copy = std::string(who) + " copy " + what + " failed";
+    cuda_check(cudaMalloc(reinterpret_cast<void**>(dst), sizeof(double) * src.size()),
+               msg_alloc.c_str());
+    cuda_check(cudaMemcpy(*dst, src.data(), sizeof(double) * src.size(), cudaMemcpyHostToDevice),
+               msg_copy.c_str());
+  };
+  upload(&d_T_grid_, T_grid_host_, "T_grid");
+  upload(&d_b_g_, b_g_host_, "b_g");
+  upload(&d_cdf_g_, cdf_g_host_, "cdf");
+  upload(&d_tail_g_, tail_g_host_, "tail");
+  upload(&d_ln_cdf_g_, ln_cdf_g_host_, "ln_cdf");
+  upload(&d_ln_tail_g_, ln_tail_g_host_, "ln_tail");
+  upload(&d_dln_cdf_g_, dln_cdf_g_host_, "dln_cdf");
+  upload(&d_dln_tail_g_, dln_tail_g_host_, "dln_tail");
+  upload(&d_ln_T_grid_, ln_T_grid_host_, "ln_T_grid");
 }
 
 void PlanckTable::build_constant_fractions(const Groups& groups,
@@ -274,6 +382,8 @@ void PlanckTable::build_constant_fractions(const Groups& groups,
   T_grid_host_ = {T_min_eV, T_max_eV};
   b_g_host_.assign(static_cast<std::size_t>(2 * n_groups_), 0.0);
   cdf_g_host_.assign(static_cast<std::size_t>(2 * n_groups_), 0.0);
+  dln_cdf_g_host_.assign(static_cast<std::size_t>(2 * n_groups_), 0.0);
+  dln_tail_g_host_.assign(static_cast<std::size_t>(2 * n_groups_), 0.0);
   for (int k = 0; k < 2; ++k) {
     double cdf = 0.0;
     for (int g = 0; g < n_groups_; ++g) {
@@ -285,30 +395,7 @@ void PlanckTable::build_constant_fractions(const Groups& groups,
     cdf_g_host_[static_cast<std::size_t>(k * n_groups_ + (n_groups_ - 1))] = 1.0;
   }
 
-  cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_T_grid_),
-                        sizeof(double) * static_cast<std::size_t>(n_T_)),
-             "PlanckTable::build_constant_fractions cudaMalloc T_grid failed");
-  cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_b_g_),
-                        sizeof(double) * static_cast<std::size_t>(n_T_ * n_groups_)),
-             "PlanckTable::build_constant_fractions cudaMalloc b_g failed");
-  cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_cdf_g_),
-                        sizeof(double) * static_cast<std::size_t>(n_T_ * n_groups_)),
-             "PlanckTable::build_constant_fractions cudaMalloc cdf failed");
-  cuda_check(cudaMemcpy(d_T_grid_,
-                        T_grid_host_.data(),
-                        sizeof(double) * static_cast<std::size_t>(n_T_),
-                        cudaMemcpyHostToDevice),
-             "PlanckTable::build_constant_fractions copy T_grid failed");
-  cuda_check(cudaMemcpy(d_b_g_,
-                        b_g_host_.data(),
-                        sizeof(double) * static_cast<std::size_t>(n_T_ * n_groups_),
-                        cudaMemcpyHostToDevice),
-             "PlanckTable::build_constant_fractions copy b_g failed");
-  cuda_check(cudaMemcpy(d_cdf_g_,
-                        cdf_g_host_.data(),
-                        sizeof(double) * static_cast<std::size_t>(n_T_ * n_groups_),
-                        cudaMemcpyHostToDevice),
-             "PlanckTable::build_constant_fractions copy cdf failed");
+  finalize_and_upload("PlanckTable::build_constant_fractions");
 }
 
 std::vector<double> resolve_compute_T_range_eV(const core::Config& cfg,

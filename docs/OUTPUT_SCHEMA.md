@@ -14,7 +14,7 @@
 ## 2. Snapshot (`<case>_NNNNNN.h5`)
 
 主な構成:
-- `/` attrs: `t`, `cycle`, `geometry`, `n_cells`, `n_nodes`, `n_groups`, `n_materials`, `schema_version`
+- `/` attrs: `t`, `cycle`, `geometry`, `n_cells`, `n_nodes`, `n_groups`, `n_materials`, `schema_version`; 1D files also carry `geometry_1d` (`"spherical"` | `"cylindrical"` | `"planar"`, 2026-09-24): `geometry` is `Main.dimension`, which reads `1D_SPH` for every `Mesh.geometry_1d`. Readers that do not know the attribute are unaffected (additive, no `schema_version` change).
 - `/metadata`: `namelist_source`, `frozen_config`, `group_bounds_eV`
 - `/mesh`: `x_r`, `x_z(2Dのみ)`, `v_r`, `v_z(2Dのみ)`, `cell_material_id`; multiblock files additionally use `/mesh/topology/v2` for the 3-block scheme or `/mesh/topology/v3` for the half-butterfly 5-block scheme
 - `/hydro`: `rho`, `Te`, `Ti`, `ee`, `ei`, `Pe`, `Pi`, `Qvisc`, `mass`, `vol`, `zbar`, `volFrac`
@@ -64,6 +64,10 @@ snapshot内容に加えて以下を保存:
 - `/rng/*` (`rng_counter`, `global_id`)
 - `/time_state/*` (`t`, `step`, `dt`, 累積エネルギー項, `user_seed`)
 - `/output_state/*` (`t_next_plot`, `t_next_history`, `t_next_checkpoint`)
+- 1D: `/hydro/cv_e`, `/hydro/cv_i`, `/hydro/cs` (閉包の比熱と音速。あれば再開時に閉包をかけ直さない), `/hydro_flags/cell_is_void`
+- `/conduction_state/*` (熱伝導ソルバーの run 累積統計)
+- 1D S_N: `/radiation_sn/psi_prev`, `/radiation_sn/psi_sd_prev`, `/radiation_sn/ee_node_offset`
+- 燃焼: `/burn_state/specific_inventory` (比インベントリ Y_s [1/g]、cell-major [n_cells×5]、D・T・He3・He4・p。再開はこれを `/hydro/burn_n_*` から作る Y_s より優先する)
 
 ## 5. frozen_config.json 形式
 

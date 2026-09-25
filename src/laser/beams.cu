@@ -31,6 +31,11 @@ double Beam::get_power(const double t) const {
   return waveform_power_at_time(power_table, t) * W_to_erg_per_s;
 }
 
+double Beam::get_average_power(const double t0, const double t1) const {
+  constexpr double W_to_erg_per_s = 1.0e7;
+  return waveform_average_power(power_table, t0, t1) * W_to_erg_per_s;
+}
+
 double Beam::profile(const double R_cm) const {
   const double w0 = std::max(profile_w0_cm, 1.0e-30);
   const double x = R_cm / w0;
@@ -61,7 +66,7 @@ double Beam::profile(const double R_cm) const {
     const double a = (span > 0.0) ? (R_cm - profile_r_cm[lo]) / span : 0.0;
     return profile_I[lo] + a * (profile_I[hi] - profile_I[lo]);
   }
-  // gaussian + custom fallback
+  // gaussian
   return std::exp(-2.0 * x * x);
 }
 
@@ -69,6 +74,14 @@ double Beams::total_power(const double t) const {
   double sum = 0.0;
   for (const Beam& beam : items) {
     sum += std::max(0.0, beam.get_power(t));
+  }
+  return sum;
+}
+
+double Beams::total_average_power(const double t0, const double t1) const {
+  double sum = 0.0;
+  for (const Beam& beam : items) {
+    sum += std::max(0.0, beam.get_average_power(t0, t1));
   }
   return sum;
 }
@@ -131,11 +144,11 @@ Beams create_from_config(const core::Config::LaserConfig& laser,
                         "; using zero-power fallback");
     }
 
-    if (out.profile_model == "custom") {
-      core::log_warning("Laser profile_model='custom' is not implemented in M12; falling back "
-                        "to gaussian");
-      out.profile_model = "gaussian";
-    }
+    // The namelist freezes profile=dict(model="custom", func=..., r_max_um=...)
+    // into a "table" profile; "custom" here means a Config built without it.
+    TENRYU_ASSERT(out.profile_model != "custom",
+                  "Laser profile_model='custom' reached the beams without its frozen "
+                  "table (the namelist samples func into profile_r_cm / profile_I)");
 
     if (out.profile_model != "gaussian" && out.profile_model != "super_gaussian" &&
         out.profile_model != "flat_top" && out.profile_model != "table") {

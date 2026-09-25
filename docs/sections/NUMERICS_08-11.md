@@ -589,7 +589,7 @@ E_{pdV}^{boundary} = \sum_{f \in \partial\Omega} P_f \,(A_f\, v_{n,f})\,\Delta t
 E_{artificial}=E_{floor}+\max(E_{safety}-E_{floor},0)+E_{redistribution\_unresolved}.
 \]
 \(E_{numerical\_loss}\) は粒子移送失敗等のアルゴリズム限界による数値的喪失エネルギー（§12.3.1参照）。物理的境界流出 \(E_{rad,esc}\) とは明確に区別する。
-分母のフロア：\(E_{denom} = \max(E_{total}^n,\, E_{source},\, 10^{-20}\;\text{erg})\)。コールドスタート（全エネルギー≈0）での0除算と偽 FATAL を防止する。
+分母：\(E_{denom} = \max(|E_{int,e}^n|+|E_{int,i}^n|+|E_{kin}^n|+|E_{rad}^n|,\, E_{source},\, 10^{-20}\;\text{erg})\)。第 1 項はエネルギーの和を作る各項の大きさで、\(\Delta E_{total}\) の丸め誤差はこれに比例する。表 EOS の冷たい曲線では内部エネルギーが負になり、\(E_{total}^n\) がこれらの項に比べて小さく（負にも）なるため、2026-09-25 までの \(\max(E_{total}^n,\dots)\) では冷たい標的から始まる run の最初の数 step で入力エネルギー（\(10^{-18}\) erg 程度）が分母になり、丸め誤差だけで \(\varepsilon_{budget}\sim1\) と床・安全補正の比の警告が出ていた。全項が非負なら従来の \(E_{total}^n\) と同じ値である。\(10^{-20}\) erg はコールドスタート（全エネルギー≈0）での0除算を防ぐ。
 
 > **注意**：\(\varepsilon_{budget}\) の分子は **物理的保存誤差**であり、\(E_{floor}\)、\(E_{safety}\)、\(E_{redistribution\_unresolved}\) は人工補正として取り除く。\(E_{solver}\) は符号に応じて \(E_{source}\) または \(E_{sink}\) に入れる。
 > これらは総収支式に陽に入るため、正しく計上すれば恒等式を満たす。

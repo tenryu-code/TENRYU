@@ -15,6 +15,10 @@ struct DeviceErrorFlags {
   int32_t infinite_loop = 0;
   int32_t ddmc_sigma_tot_zero = 0;
   int32_t roulette_kill = 0;
+  // 1D characteristic ray trace: pieces whose quadrature was accepted at the
+  // panel depth or count cap (error estimate above the tolerance); a count,
+  // not an error.
+  int32_t unresolved_quadrature = 0;
 };
 
 }  // namespace tenryu::core

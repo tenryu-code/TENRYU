@@ -24,6 +24,10 @@ struct DeviceEOSTableView {
   std::uint8_t supports_rho_e_reclosure;  // table energy is monotone enough for T(rho,e)
   // Cold-equilibrium branch of an electron table (n_knots == 0 = none).
   ColdEquilibriumView cold;
+  // Non-uniform grids: (n - 1) / (x_max - x_min). The bracket search starts
+  // at the index this gives and steps to the bracket (0 = binary search).
+  double log_rho_guess_inv;
+  double log_T_guess_inv;
 };
 
 struct RhoBracket {
@@ -110,7 +114,8 @@ __device__ inline RhoBracket find_bracket_from_log(const double* grid,
                                                    const double x_raw,
                                                    const double x_min,
                                                    const double x_max,
-                                                   double dlog_inv) {
+                                                   double dlog_inv,
+                                                   const double guess_inv = 0.0) {
   if (n <= 0) {
     return RhoBracket{0, 0, 0.0};
   }
@@ -149,12 +154,27 @@ __device__ inline RhoBracket find_bracket_from_log(const double* grid,
 
   int lo = 0;
   int hi = n - 1;
-  while (hi - lo > 1) {
-    const int mid = lo + ((hi - lo) >> 1);
-    if (grid[mid] <= x) {
-      lo = mid;
-    } else {
-      hi = mid;
+  if (guess_inv > 0.0 && isfinite(guess_inv)) {
+    // Here grid[0] < x < grid[n - 1]: the bracket of the binary search below
+    // is the largest lo with grid[lo] <= x (then x < grid[lo + 1]). Start at
+    // the index of a uniform grid with the mean step and step to it; on a
+    // nearly uniform grid that is the start or a neighbour.
+    lo = clamp_int(static_cast<int>((x - grid[0]) * guess_inv), 0, n - 2);
+    while (lo > 0 && grid[lo] > x) {
+      --lo;
+    }
+    while (lo < n - 2 && grid[lo + 1] <= x) {
+      ++lo;
+    }
+    hi = lo + 1;
+  } else {
+    while (hi - lo > 1) {
+      const int mid = lo + ((hi - lo) >> 1);
+      if (grid[mid] <= x) {
+        lo = mid;
+      } else {
+        hi = mid;
+      }
     }
   }
 
@@ -171,7 +191,8 @@ __device__ inline RhoBracket find_T_bracket_from_log(const DeviceEOSTableView& t
                                logT,
                                tab.log_T_min,
                                tab.log_T_max,
-                               tab.d_log_T_inv);
+                               tab.d_log_T_inv,
+                               tab.log_T_guess_inv);
 }
 
 __device__ inline RhoBracket find_rho_bracket(const DeviceEOSTableView& tab,
@@ -188,7 +209,8 @@ __device__ inline RhoBracket find_rho_bracket(const DeviceEOSTableView& tab,
                                log_rho,
                                tab.log_rho_min,
                                tab.log_rho_max,
-                               tab.d_log_rho_inv);
+                               tab.d_log_rho_inv,
+                               tab.log_rho_guess_inv);
 }
 
 __device__ inline RhoBracket find_T_bracket(const DeviceEOSTableView& tab,
@@ -205,7 +227,8 @@ __device__ inline RhoBracket find_T_bracket(const DeviceEOSTableView& tab,
                                log_T,
                                tab.log_T_min,
                                tab.log_T_max,
-                               tab.d_log_T_inv);
+                               tab.d_log_T_inv,
+                               tab.log_T_guess_inv);
 }
 
 // Density represented by a rho bracket (log-linear position between the two
@@ -218,10 +241,31 @@ __device__ inline double device_rho_from_bracket(const DeviceEOSTableView& tab,
   return exp(l0 + clamp01(rb.w) * (l1 - l0));
 }
 
-__device__ inline double interp_at(const DeviceEOSTableView& tab,
-                                   const double* field,
-                                   const RhoBracket& rb,
-                                   const double logT) {
+// Temperature bracket of interp_at (rows j0 < j1 and weight, clamped).
+__device__ inline RhoBracket interp_T_bracket(const DeviceEOSTableView& tab,
+                                              const double logT) {
+  const RhoBracket tb = find_T_bracket_from_log(tab, logT);
+  int j0 = 0;
+  int j1 = 0;
+  double wt = 0.0;
+  if (tab.n_T == 1) {
+    j0 = 0;
+    j1 = 0;
+    wt = 0.0;
+  } else {
+    j0 = clamp_int(tb.i0, 0, tab.n_T - 2);
+    j1 = clamp_int(tb.i1, j0 + 1, tab.n_T - 1);
+    wt = clamp01(tb.w);
+  }
+  return RhoBracket{j0, j1, wt};
+}
+
+// interp_at with its temperature bracket (interp_T_bracket) given, so that
+// several fields at one temperature share it.
+__device__ inline double interp_at_bracket(const DeviceEOSTableView& tab,
+                                           const double* field,
+                                           const RhoBracket& rb,
+                                           const RhoBracket& tb) {
   if (tab.n_rho <= 0 || tab.n_T <= 0 || field == nullptr) {
     return 0.0;
   }
@@ -239,19 +283,9 @@ __device__ inline double interp_at(const DeviceEOSTableView& tab,
     wr = clamp01(rb.w);
   }
 
-  const RhoBracket tb = find_T_bracket_from_log(tab, logT);
-  int j0 = 0;
-  int j1 = 0;
-  double wt = 0.0;
-  if (tab.n_T == 1) {
-    j0 = 0;
-    j1 = 0;
-    wt = 0.0;
-  } else {
-    j0 = clamp_int(tb.i0, 0, tab.n_T - 2);
-    j1 = clamp_int(tb.i1, j0 + 1, tab.n_T - 1);
-    wt = clamp01(tb.w);
-  }
+  const int j0 = tb.i0;
+  const int j1 = tb.i1;
+  const double wt = tb.w;
 
   const int base0 = j0 * tab.n_rho;
   const int base1 = j1 * tab.n_rho;
@@ -263,6 +297,16 @@ __device__ inline double interp_at(const DeviceEOSTableView& tab,
   const double vx0 = v00 + wr * (v10 - v00);
   const double vx1 = v01 + wr * (v11 - v01);
   return vx0 + wt * (vx1 - vx0);
+}
+
+__device__ inline double interp_at(const DeviceEOSTableView& tab,
+                                   const double* field,
+                                   const RhoBracket& rb,
+                                   const double logT) {
+  if (tab.n_rho <= 0 || tab.n_T <= 0 || field == nullptr) {
+    return 0.0;
+  }
+  return interp_at_bracket(tab, field, rb, interp_T_bracket(tab, logT));
 }
 
 struct AnalyticIdealEos {
@@ -328,6 +372,58 @@ __device__ inline double device_eos_cv_base(const DeviceEOSTableView& tab,
                                             const RhoBracket& rb,
                                             const double logT) {
   return interp_at(tab, tab.cv_table, rb, logT);
+}
+
+// The cold-equilibrium reference C(v) at the density of a table bracket,
+// which the cold-aware evaluators below compute at every call.
+__device__ inline ColdReference device_cold_reference_at(const DeviceEOSTableView& tab,
+                                                         const RhoBracket& rb) {
+  return cold_reference(tab.cold, device_rho_from_bracket(tab, rb));
+}
+
+// device_eos_energy with the cold reference of the bracket given.
+__device__ inline double device_eos_energy_with(const DeviceEOSTableView& tab,
+                                                const RhoBracket& rb,
+                                                const double logT,
+                                                const ColdReference& cref) {
+  const double base = device_eos_energy_base(tab, rb, logT);
+  if (!cold_enabled(tab.cold)) {
+    return base;
+  }
+  const double T = exp(logT);
+  const ColdGate g = cold_gate(tab.cold, T);
+  return base + (g.w - T * g.dw - 1.0) * cref.C;
+}
+
+struct DeviceEOSThermo {
+  double pressure;
+  double energy;
+  double cv;
+};
+
+// device_eos_pressure, device_eos_energy and device_eos_cv at one
+// temperature, with one temperature bracket and the cold reference of the
+// density bracket given (unused without a cold branch).
+__device__ inline DeviceEOSThermo device_eos_thermo_with(const DeviceEOSTableView& tab,
+                                                         const RhoBracket& rb,
+                                                         const double logT,
+                                                         const ColdReference& cref) {
+  DeviceEOSThermo out{};
+  if (tab.n_rho <= 0 || tab.n_T <= 0) {
+    return out;
+  }
+  const RhoBracket tb = interp_T_bracket(tab, logT);
+  out.pressure = interp_at_bracket(tab, tab.P_table, rb, tb);
+  out.energy = interp_at_bracket(tab, tab.e_table, rb, tb);
+  out.cv = interp_at_bracket(tab, tab.cv_table, rb, tb);
+  if (cold_enabled(tab.cold)) {
+    const double T = exp(logT);
+    const ColdGate g = cold_gate(tab.cold, T);
+    out.pressure = out.pressure - g.w * cref.dC;
+    out.energy = out.energy + (g.w - T * g.dw - 1.0) * cref.C;
+    out.cv = out.cv - T * g.d2w * cref.C;
+  }
+  return out;
 }
 
 // Cold-aware evaluators (cold_equilibrium.hpp): tables without a cold branch
@@ -414,9 +510,12 @@ __device__ inline double device_eos_cv_extrap(
   return device_eos_cv(tab, rb, logT);
 }
 
+// cref: the cold reference of the bracket (device_cold_reference_at), or null
+// to compute it.
 __device__ inline double device_eos_T_from_e_monotone(const DeviceEOSTableView& tab,
                                                        const RhoBracket& rb,
-                                                       const double e_target) {
+                                                       const double e_target,
+                                                       const ColdReference* cref = nullptr) {
   if (tab.n_rho <= 0 || tab.n_T <= 0 || tab.e_table == nullptr) {
     return 0.0;
   }
@@ -429,7 +528,8 @@ __device__ inline double device_eos_T_from_e_monotone(const DeviceEOSTableView& 
     const ColdInverseResult inv = cold_inverse_Te(
         tab.cold, rho, e_target, T_min, T_max, 0.0,
         [&](const double T) { return device_eos_energy_base(tab, rb, log(T)); },
-        [&](const double T) { return device_eos_cv_base(tab, rb, log(T)); });
+        [&](const double T) { return device_eos_cv_base(tab, rb, log(T)); },
+        tab.log_T_grid, tab.n_T, (cref != nullptr) ? &cref->C : nullptr);
     return inv.T;
   }
 
@@ -554,12 +654,13 @@ __device__ inline DeviceEOSInverseRecloseResult device_inverse_reclose(
   }
 
   // Cold-aware admissible energy range: q_e at the table temperature bounds.
-  const double e_min = cold_enabled(tab.cold)
-                           ? device_eos_energy(tab, rb, tab.log_T_min)
-                           : mixed_e_row(tab, i0, i1, wr, 0);
-  const double e_max = cold_enabled(tab.cold)
-                           ? device_eos_energy(tab, rb, tab.log_T_max)
-                           : mixed_e_row(tab, i0, i1, wr, tab.n_T - 1);
+  // The cold reference depends on the density bracket only: computed once.
+  const bool cold = cold_enabled(tab.cold);
+  const ColdReference cref = cold ? device_cold_reference_at(tab, rb) : ColdReference{};
+  const double e_min = cold ? device_eos_energy_with(tab, rb, tab.log_T_min, cref)
+                            : mixed_e_row(tab, i0, i1, wr, 0);
+  const double e_max = cold ? device_eos_energy_with(tab, rb, tab.log_T_max, cref)
+                            : mixed_e_row(tab, i0, i1, wr, tab.n_T - 1);
   const bool bad_bracket = !isfinite(e_min) || !isfinite(e_max) || !(e_max > e_min);
   if (bad_bracket) {
     out.bracket_failure = 1;
@@ -569,7 +670,7 @@ __device__ inline DeviceEOSInverseRecloseResult device_inverse_reclose(
     out.upper_clamp = 1;
   }
 
-  const double T_raw = device_eos_T_from_e_monotone(tab, rb, e_target);
+  const double T_raw = device_eos_T_from_e_monotone(tab, rb, e_target, cold ? &cref : nullptr);
   const double T_floor_eff = fmax(T_floor, 1.0e-30);
   out.T = fmax(T_raw, T_floor_eff);
   // Energy below the table energy at the runtime floor: the returned state is
@@ -578,9 +679,10 @@ __device__ inline DeviceEOSInverseRecloseResult device_inverse_reclose(
   // write-back in energy-authoritative mode (2026-09-14).
   out.floor_clamp = (isfinite(T_raw) && T_raw < T_floor_eff) ? 1 : 0;
   out.logT = log(fmax(out.T, 1.0e-30));
-  out.pressure = device_eos_pressure(tab, rb, out.logT);
-  out.energy = device_eos_energy(tab, rb, out.logT);
-  out.cv = fmax(device_eos_cv(tab, rb, out.logT), 0.0);
+  const DeviceEOSThermo thermo = device_eos_thermo_with(tab, rb, out.logT, cref);
+  out.pressure = thermo.pressure;
+  out.energy = thermo.energy;
+  out.cv = fmax(thermo.cv, 0.0);
   return out;
 }
 
@@ -648,23 +750,35 @@ struct DeviceEOSHighTTailAnchor {
   int valid = 0;
 };
 
-__device__ inline DeviceEOSHighTTailAnchor device_eos_high_t_tail_anchor(
+// The anchor depends on the density bracket only; cref is its cold reference
+// (device_cold_reference_at).
+__device__ inline DeviceEOSHighTTailAnchor device_eos_high_t_tail_anchor_with(
     const DeviceEOSTableView& tab,
-    const RhoBracket& rb) {
+    const RhoBracket& rb,
+    const ColdReference& cref) {
   DeviceEOSHighTTailAnchor a{};
   if (tab.n_rho <= 0 || tab.n_T <= 0 || tab.e_table == nullptr) {
     return a;
   }
   const double logT_top = tab.log_T_max;
   a.T_top = exp(logT_top);
-  a.e_top = device_eos_energy(tab, rb, logT_top);
-  a.P_top = device_eos_pressure(tab, rb, logT_top);
-  a.cv_top = device_eos_cv(tab, rb, logT_top);
+  const DeviceEOSThermo top = device_eos_thermo_with(tab, rb, logT_top, cref);
+  a.e_top = top.energy;
+  a.P_top = top.pressure;
+  a.cv_top = top.cv;
   a.valid = (isfinite(a.T_top) && a.T_top > 0.0 && isfinite(a.e_top) &&
              isfinite(a.P_top) && isfinite(a.cv_top) && a.cv_top > 0.0)
                 ? 1
                 : 0;
   return a;
+}
+
+__device__ inline DeviceEOSHighTTailAnchor device_eos_high_t_tail_anchor(
+    const DeviceEOSTableView& tab,
+    const RhoBracket& rb) {
+  const ColdReference cref =
+      cold_enabled(tab.cold) ? device_cold_reference_at(tab, rb) : ColdReference{};
+  return device_eos_high_t_tail_anchor_with(tab, rb, cref);
 }
 
 // Forward evaluation with the tail: below/at the ceiling this is exactly
@@ -676,14 +790,17 @@ struct DeviceEOSTailThermo {
   int in_tail = 0;
 };
 
-__device__ inline DeviceEOSTailThermo device_eos_eval_with_high_t_tail(
+// With the bracket's anchor and cold reference given (evaluations at one
+// density: compute them once).
+__device__ inline DeviceEOSTailThermo device_eos_eval_with_high_t_tail_with(
     const DeviceEOSTableView& tab,
     const RhoBracket& rb,
     const double T,
-    const double T_floor) {
+    const double T_floor,
+    const DeviceEOSHighTTailAnchor& a,
+    const ColdReference& cref) {
   DeviceEOSTailThermo out{};
   const double T_eff = fmax(T, fmax(T_floor, 1.0e-30));
-  const DeviceEOSHighTTailAnchor a = device_eos_high_t_tail_anchor(tab, rb);
   if (a.valid != 0 && T_eff > a.T_top) {
     out.e = a.e_top + a.cv_top * (T_eff - a.T_top);
     out.P = a.P_top * (T_eff / a.T_top);
@@ -692,11 +809,23 @@ __device__ inline DeviceEOSTailThermo device_eos_eval_with_high_t_tail(
     return out;
   }
   const double logT = log(T_eff);
-  out.e = device_eos_energy(tab, rb, logT);
-  out.P = device_eos_pressure(tab, rb, logT);
-  out.cv = fmax(device_eos_cv(tab, rb, logT), 0.0);
+  const DeviceEOSThermo th = device_eos_thermo_with(tab, rb, logT, cref);
+  out.e = th.energy;
+  out.P = th.pressure;
+  out.cv = fmax(th.cv, 0.0);
   out.in_tail = 0;
   return out;
+}
+
+__device__ inline DeviceEOSTailThermo device_eos_eval_with_high_t_tail(
+    const DeviceEOSTableView& tab,
+    const RhoBracket& rb,
+    const double T,
+    const double T_floor) {
+  const ColdReference cref =
+      cold_enabled(tab.cold) ? device_cold_reference_at(tab, rb) : ColdReference{};
+  return device_eos_eval_with_high_t_tail_with(
+      tab, rb, T, T_floor, device_eos_high_t_tail_anchor_with(tab, rb, cref), cref);
 }
 
 // Inverse reclosure with the tail: identical to device_inverse_reclose
@@ -851,6 +980,30 @@ __device__ inline double device_eos_sound_speed(const DeviceEOSTableView& tab,
   return (cs2_fallback > 0.0) ? sqrt(cs2_fallback) : 0.0;
 }
 
+// Sound speed on the high-temperature tail (energy-authoritative closure,
+// device_eos_eval_with_high_t_tail): above the table ceiling P = P_top T/T_top
+// and e is linear in T with cv_top, an ideal gas with the top row's adiabatic
+// index, so cs = cs(T_top) sqrt(T/T_top). It is continuous at the ceiling and
+// equals device_eos_sound_speed below it. Evaluating the table at the clamped
+// ceiling instead (the plain function) under-states cs by sqrt(T_top/T) in the
+// tail, which enters the CFL step and the linear artificial-viscosity term
+// (2026-09-23).
+__device__ inline double device_eos_sound_speed_with_high_t_tail(
+    const DeviceEOSTableView& tab,
+    const RhoBracket& rb,
+    const double logT,
+    const double rho,
+    const double cv) {
+  // Same validity condition as the closure's tail anchor: without a valid
+  // anchor the closure keeps the ceiling and so does the sound speed.
+  if (tab.n_T > 1 && isfinite(logT) && logT > tab.log_T_max &&
+      device_eos_high_t_tail_anchor(tab, rb).valid != 0) {
+    const double cs_top = device_eos_sound_speed(tab, rb, tab.log_T_max, rho, cv);
+    return cs_top * exp(0.5 * (logT - tab.log_T_max));
+  }
+  return device_eos_sound_speed(tab, rb, logT, rho, cv);
+}
+
 // Signed squared electron sound speed of a cold-equilibrium electron table
 // (materials/cold_equilibrium.hpp): (P~_e)_rho + T (P~_e)_T^2 / (rho^2 cv~),
 // which may be negative because the branch replaces the table's cold-curve
@@ -925,6 +1078,23 @@ __device__ inline double device_eos_sound_speed2_signed(const DeviceEOSTableView
     cs2_c += T * dPdT_c * dPdT_c / (rho * rho * cv_c);
   }
   return isfinite(cs2_c) ? cs2_c : 0.0;
+}
+
+// Signed squared sound speed with the high-temperature tail: above the
+// ceiling the value at the ceiling scaled by T/T_top (see
+// device_eos_sound_speed_with_high_t_tail).
+__device__ inline double device_eos_sound_speed2_signed_with_high_t_tail(
+    const DeviceEOSTableView& tab,
+    const RhoBracket& rb,
+    const double logT,
+    const double rho,
+    const double cv) {
+  if (tab.n_T > 1 && isfinite(logT) && logT > tab.log_T_max &&
+      device_eos_high_t_tail_anchor(tab, rb).valid != 0) {
+    return device_eos_sound_speed2_signed(tab, rb, tab.log_T_max, rho, cv) *
+           exp(logT - tab.log_T_max);
+  }
+  return device_eos_sound_speed2_signed(tab, rb, logT, rho, cv);
 }
 #endif  // __CUDACC__
 

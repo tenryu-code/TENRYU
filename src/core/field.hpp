@@ -394,6 +394,19 @@ class ScratchField1D {
     size_ = n;
   }
 
+  // reset() without the zero fill, for a field whose every element the caller
+  // writes before any is read (the pool buffer keeps its previous contents
+  // until then).
+  void reset_for_overwrite(const char* tag, const std::size_t n) {
+    if (n == 0) {
+      data_ = nullptr;
+      size_ = 0;
+      return;
+    }
+    data_ = static_cast<double*>(device_scratch_acquire(tag, n * sizeof(double)));
+    size_ = n;
+  }
+
   void copy_from_host(const std::vector<double>& src) {
     TENRYU_ASSERT(src.size() == size_,
                   "ScratchField1D::copy_from_host vector size mismatch");

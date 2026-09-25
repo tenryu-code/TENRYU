@@ -368,38 +368,38 @@ n_i = \frac{\rho}{A\,m_p} \quad [\text{cm}^{-3}]
 
 **平均電離度 \(\bar{Z}\)**：v1.0では3モデルを提供する。
 1. **fixed**（既定）：\(\bar{Z} = Z\)（ユーザ指定の原子番号 or 有効電荷。完全電離を仮定）
-2. **thomas\_fermi**：More et al. (1988) のフィッティング公式
+2. **thomas\_fermi**：More (1985) Table IV の Thomas–Fermi 電離度フィット
 3. **tabular**：IONMIXテーブルから \(\bar{Z}(\rho, T_e)\) を補間取得
 
-**Thomas–Fermiモデル**（More, Warren, Young & Zimmerman, Phys. Fluids 31, 3059, 1988）：
+**Thomas–Fermiモデル**（R. M. More, Adv. At. Mol. Phys. **21**, 305 (1985), Table IV —
+TF 電離状態への近似フィット。QEOS（More, Warren, Young & Zimmerman, Phys. Fluids **31**, 3059 (1988)）
+の TF 相似則 式 (83a,b) と同じ変数）：
 
-水素等価変数による無次元化：
+TF 相似変数：
 \[
-\rho^H = \rho/A,\quad T_e^H = T_e/Z^{4/3}
+R = \frac{\rho\,[\mathrm{g/cm^3}]}{Z A},\quad T_0 = \frac{T_e\,[\mathrm{eV}]}{Z^{4/3}},\quad
+T_F = \frac{T_0}{1+T_0}
 \]
-圧力電離（冷）：
+フィット：
 \[
-\bar{Z}_0^H = \frac{\eta}{1+\eta},\quad \eta = \left(\frac{\rho^H}{0.148\;\text{g/cm}^3}\right)^{1/2}
+\begin{aligned}
+&A = a_1 T_0^{a_2} + a_3 T_0^{a_4},\qquad B = -\exp\!\left(b_0 + b_1 T_F + b_2 T_F^7\right),\qquad
+C = c_1 T_F + c_2,\\
+&Q_1 = A R^{B},\qquad Q = \left(R^{C} + Q_1^{C}\right)^{1/C},\qquad x = \alpha Q^{\beta},\qquad
+\bar{Z} = \frac{Z\,x}{1 + x + \sqrt{1+2x}}
+\end{aligned}
 \]
-熱電離：
-\[
-\bar{Z}_{th}^H = (1-\bar{Z}_0^H)\,Y,\quad
-Y = \left[1 + \left(\frac{T_0^H}{T_e^H}\right)^{1/2}\right]^{-1}
-\]
-\[
-T_0^H = 0.0327\,\exp\!\bigl(6.98\,(\rho^H)^{0.075}\bigr) \quad [\text{eV}]
-\]
-合計：
-\[
-\bar{Z} = Z\,\bigl(\bar{Z}_0^H + \bar{Z}_{th}^H\bigr)
-\]
+係数：\(\alpha=14.3139\)、\(\beta=0.6624\)、\(a_1=0.003323\)、\(a_2=0.9718\)、
+\(a_3=9.26148\times10^{-5}\)、\(a_4=3.10165\)、\(b_0=-1.7630\)、\(b_1=1.43175\)、\(b_2=0.31546\)、
+\(c_1=-0.366667\)、\(c_2=0.983333\)。\(T\to0\) で \(Q\to R\)（圧力電離のみ、例: 液体 D₂ 0.17 g/cc で
+\(\bar Z=0.439\)）、高温・低密度で \(\bar Z\to Z\)（D₂ 0.17 g/cc: 100 eV で 0.968、1 keV で 0.997）。
+原典の例（Ar、1 keV、30 g/cc で \(n_e\approx7\times10^{24}\,\mathrm{cm^{-3}}\)）を再現する（単体試験）。
 
-> **適用範囲**：More et al. (1988) フィッティングの妥当性は
-> \(\rho \in [10^{-3},\, 10^{4}]\) g/cm\(^3\)、\(T_e \in [0.01,\, 10^4]\) eV の範囲で確認されている。
-> 範囲外では \(\bar{Z}\) をクランプする：\(\rho < 10^{-3}\) では \(\rho^H = 10^{-3}/A\)、
-> \(\rho > 10^4\) では \(\rho^H = 10^4/A\)、\(T_e\) も同様に \([0.01, 10^4]\) eV でクランプ。
-> \(Z\) はユーザ指定の **単一種の原子番号** である（混合材料セルではEOS混合則 §1.1.5(c) を適用）。
-> 精度は～10%。生産計算ではIONMIXテーブルの \(\bar{Z}\) を推奨する。
+> **2026-09-23 修正**: 従来の式は密度を \(\rho/A\)（\(Z\) で割らない）で規格化し、熱電離を
+> \(Y=[1+(T_0^H/T_e^H)^{1/2}]^{-1}\) で与えていた。TF 相似則と合わず \(Z>1\) の冷たい物質を過大電離
+> （CH 1.05 g/cc 0.1 eV: 1.85、本式 1.30）し、高温で完全電離への近づきが遅かった（D₂ 1 keV: 0.946）。
+> 入力の保護は \(\rho>0\)、\(T\ge0\) のみで、密度・温度のクランプは行わない。
+> \(Z\)、\(A\) は材料の平均核電荷・質量数（混合材料セルではEOS混合則 §1.1.5(c) を適用）。
 
 **電子数密度**：
 \[
@@ -483,7 +483,7 @@ P_N(v)=P_i^N(v,T_{i0})+P_e^N(v,T_{e0}),
 \[
 \tilde P_e=P_e^N-wC',\qquad \tilde e_e=e_e^N+(w-T_ew')C,\qquad \tilde c_{v,e}=c_{v,e}^N-T_ew''C,
 \]
-イオン側は不変。保存変数は電子熱量座標 \(q_e=\tilde e_e-C(v)\)（`state.ee` に格納。\(T_e\le T_*/2\) で \(q_e=e_e^N\)）で、物質エネルギーは \(e_i+q_e+C(v)\)（\(C\) は `state.e_cold`、HDF5 の `hydro/e_cold`。エネルギー台帳の電子内部エネルギーは \(q_e+C\) を集計する）。\(P_N\) は実行時と同じ log 双線形補間（密度節点間で \(\ln\rho\) に線形）で評価し、\(C_0\) は節点ごとに閉形式で積分する（`materials/cold_equilibrium.hpp`、`build_cold_equilibrium_table`）。逆変換 \(q_e\to T_e\) は安全化 Newton–二分法（収束判定は温度括弧の相対幅 \(4\times10^{-15}\)。表全体のエネルギー幅に対する許容は使わない — 極低温で電子エネルギーがほぼ平坦な表では、根から遠い温度を受け入れてしまう）、平坦なエネルギー列は下端の温度を返す（CPU/GPU 共通）。音速の密度微分に使う \(C''\) は基底表と同じ密度区間で評価する（参照密度が表の節点と一致する場合の整合）。電子表に cold branch を付けると（`EOSTable::cold`、`DeviceEOSTable::upload` が同梱）、hydro 閉包・FLD/S\(_N\) の物質更新・伝導の再閉包・Qei・注入の全評価器が同じ写像を使う。hydro の電子側 pdV 仕事は \(-[\bar P_e^N+(1-\bar w)D_C],\Delta v\)（\(D_C=[C(v^{n+1})-C(v^n)]/[v^{n+1}-v^n]\)、力は \(\tilde P_e\) を使う。予測子・修正子はそのままで、全エネルギーの不一致は \(O(\Delta t^3)\)）。音速の電子部は \((\tilde P_e)_\rho+T_e(\tilde P_e)_{T_e}^2/(\rho^2\tilde c_{v,e})\)。hydro のマスクは行わず全セルが力学的に応答する（衝撃波は透過する）。参照物性の出典: 液体 D2 19 K の \(K_T=1.20\times10^9\) dyn/cm²（Richardson, Leachman, Lemmon 2014, J. Phys. Chem. Ref. Data 43, 013103, Table 7 から \(K_S=\rho c_S^2\)、\(K_T=K_S c_v/c_p\)）、ポリスチレン極低温の \(K_S=5.8\times10^{10}\) dyn/cm²（Topp & Cahill 1996, Z. Phys. B 101, 235、\(K_S=\rho(c_L^2-\tfrac43c_T^2)\)）。適用条件: 1D_SPH・2T・表 EOS、`pressure_tension_cutoff=False`、`compatible_energy=False`、persistent loop 不可、`qei_heat_capacity="table"` 必須（電子・イオン交換に表の比熱を使う。理想気体の比熱は極低温の表状態で桁違いに大きく、交換が振動する）。起動時に材料ごとの初期全圧と最大不整合を報告する（0.1 kbar 超で WARNING）。
+イオン側は不変。保存変数は電子熱量座標 \(q_e=\tilde e_e-C(v)\)（`state.ee` に格納。\(T_e\le T_*/2\) で \(q_e=e_e^N\)）で、物質エネルギーは \(e_i+q_e+C(v)\)（\(C\) は `state.e_cold`、HDF5 の `hydro/e_cold`。エネルギー台帳の電子内部エネルギーは \(q_e+C\) を集計する）。\(P_N\) は実行時と同じ log 双線形補間（密度節点間で \(\ln\rho\) に線形）で評価し、\(C_0\) は節点ごとに閉形式で積分する（`materials/cold_equilibrium.hpp`、`build_cold_equilibrium_table`）。逆変換 \(q_e\to T_e\) は表の温度節点の上で解く（2026-09-25）：根を含む節点区間を符号の二分探索で特定し（\(F\ge0\) を上側とする）、区間内では基底表のエネルギーが \(\ln T\) に線形なので、ゲートが一定の区間（\(T\le T_a\) または \(T\ge T_*\)）では \(F\) の根を直接求め、遷移区間では区間内の括弧付き Newton（\(u=\ln T\)、厳密な導関数 \(dF/du=s-T^2w''C\)、\(s\) は区間のエネルギー勾配）で解く（収束判定は温度括弧の相対幅または Newton 刻みが \(4\times10^{-15}\)）。表全体のエネルギー幅に対する許容は使わない — 極低温で電子エネルギーがほぼ平坦な表では、根から遠い温度を受け入れてしまう。平坦なエネルギー列は下端の温度を返す（CPU/GPU 共通）。節点を渡さない呼び出しは従来の安全化 Newton–二分法で、表の比熱で Newton 刻みを取るため補間の勾配と一致せず、1 回の逆変換に約 50 回の評価を要した（節点上の方式は NIF DS で平均 6.4 回）。音速の密度微分に使う \(C''\) は基底表と同じ密度区間で評価する（参照密度が表の節点と一致する場合の整合）。電子表に cold branch を付けると（`EOSTable::cold`、`DeviceEOSTable::upload` が同梱）、hydro 閉包・FLD/S\(_N\) の物質更新・伝導の再閉包・Qei・注入の全評価器が同じ写像を使う。hydro の電子側 pdV 仕事は \(-[\bar P_e^N+(1-\bar w)D_C],\Delta v\)（\(D_C=[C(v^{n+1})-C(v^n)]/[v^{n+1}-v^n]\)、力は \(\tilde P_e\) を使う。予測子・修正子はそのままで、全エネルギーの不一致は \(O(\Delta t^3)\)）。音速の電子部は \((\tilde P_e)_\rho+T_e(\tilde P_e)_{T_e}^2/(\rho^2\tilde c_{v,e})\)。hydro のマスクは行わず全セルが力学的に応答する（衝撃波は透過する）。参照物性の出典: 液体 D2 19 K の \(K_T=1.20\times10^9\) dyn/cm²（Richardson, Leachman, Lemmon 2014, J. Phys. Chem. Ref. Data 43, 013103, Table 7 から \(K_S=\rho c_S^2\)、\(K_T=K_S c_v/c_p\)）、ポリスチレン極低温の \(K_S=5.8\times10^{10}\) dyn/cm²（Topp & Cahill 1996, Z. Phys. B 101, 235、\(K_S=\rho(c_L^2-\tfrac43c_T^2)\)）。適用条件: 1D_SPH・2T・表 EOS、`pressure_tension_cutoff=False`、`compatible_energy=False`、persistent loop 不可、`qei_heat_capacity="table"` 必須（電子・イオン交換に表の比熱を使う。理想気体の比熱は極低温の表状態で桁違いに大きく、交換が振動する）。起動時に材料ごとの初期全圧と最大不整合を報告する（0.1 kbar 超で WARNING）。
 
 
 2T 分離：テーブル 301 と 304 は**グリッドサイズが異なる**場合がある（例：Polystyrene 301=73×41, 304=63×33）。
@@ -723,6 +723,26 @@ dt 推定暴走のため射影形を維持（+17.5 J/2.5 ns の文書化残差�
 per-step `dE_total` の総和ではなく端点閉包式 \((E_0+\sum\text{src}-E_{\rm end})-\sum\text{esc}\)
 で評価する（per-step 系列の cumsum は縫い目二重計上で 5–10× 過大）。2D_RZ の閉包は
 別構造のため本ノブの対象外（EOS 閉包修正文書の relay 節参照）。
+追補（2026-09-23）: thermal subcycle の Qei 副段（`qei_coupling_substep_kernel`）の電子・
+イオン閉包にも同じ tail を適用した（\(e>e(\rho,T_{\rm top})\) で
+\(T=T_{\rm top}+(e-e_{\rm top})/c_{v,\rm top}\)、\(P=P_{\rm top}T/T_{\rm top}\)、
+\(c_v=c_{v,\rm top}\)）。従来は \(T\) を \(T_{\rm max}\) で頭打ちにして \(P,c_v\) も天井値を
+書いていたため、直後の伝導が天井で平らにされた \(T_e\) で熱流束を作り、天井を超える
+コロナの熱輸送を毎副段過小に評価していた（エネルギー自体は保存）。legacy モードは不変。
+追補（2026-09-23）: 1D の音速（`compute_cell_sound_speed` の 2T/1T 表分岐と 1D ALE 後の
+音速）も `energy_authoritative` では tail に合わせる。天井を超えるセルでは
+\(c_s(T)=c_s(T_{\rm top})\sqrt{T/T_{\rm top}}\)（`device_eos_sound_speed_with_high_t_tail`）
+とし、1T は温度を tail の逆算 \(T=T_{\rm top}+(e-e_{\rm top})/c_{v,\rm top}\) で得る。
+追補（2026-09-23）: レーザー沈着（`inject_laser_source_cells_kernel`）と燃焼沈着
+（`inject_burn_source_cells_kernel`、§14.5）の表 EOS 閉包も、`energy_authoritative` では
+天井を超える電子・イオンのエネルギーを同じ tail で閉じる（\(T\)・\(P\) を tail 値に。
+\(c_v\) はこれらの沈着閉包では従来どおり書かない）。従来はホスト移植の逆変換が
+\(T_{\rm max}\) で頭打ちにしていた。legacy モードは不変。
+tail は \(P\propto T\)・\(c_v\) 一定の理想気体延長なので、断熱指数を天井の行の値に保つ
+この形は理想気体で厳密で、天井で連続である。従来は表を天井で評価していたため、閉包の
+圧力が \(P_{\rm top}T/T_{\rm top}\) なのに音速は \(\sqrt{T_{\rm top}/T}\) 倍小さく、
+CFL の時間刻みと人工粘性の一次項に入っていた。tail の anchor が無効な表（天井の
+\(c_v\le0\) など）では閉包と同じく天井のまま。legacy モードと天井以下は bit 不変。2D_RZ は対象外。
 
 > **追補（2026-07-26）**: 1D ALE の post-remap EOS reclosure
 > （`ale_1d_driver.cu::eos_reclosure_kernel`）は上記ファミリ閉鎖から漏れており、
@@ -780,15 +800,70 @@ energy-authoritative の伝導増分 `apply_conduction_energy_increment`（devic
 `fld_1d_gpu.cu` 内の材料別電子テーブルキャッシュから同じ形の view 配列を作る）で選ぶ。規則: (i) 支配材料が
 要求種別（electron / ion / total）の非空テーブルを持つセルは、そのテーブルとそのテーブルの温度天井
 （高温 tail 拡張の \(T_{\rm top}\)、`DriverRecloseContext` に材料別に一度だけ upload）で評価する。
-(ii) テーブルを持たない材料のセル、および材料添字が未整備のときは従来どおり先頭材料のテーブルへ
-フォールバックする。(iii) テーブル対理想気体・`cv_e_override`・hydro backend 種別などの分岐判定と
-解析分岐の材料定数（\(A, \gamma\) 等）は従来どおり先頭材料の値のまま（テーブル材料と理想気体材料の
-混在構成は未対応で挙動不変）。単一材料では選ばれる view・天井が従来と同一オブジェクト（同じ
+(ii) テーブルを持たない材料のセル（2T ではイオンと電子の両テーブルが揃わない材料のセル）は空の view を
+受け取り、各評価器はそのセルをその材料の理想気体（セルの実効 \(A,\gamma\) と \(\bar Z\)。伝導後の再閉包は
+1D hydro 閉包の理想気体分岐と同じ式 `hydro::ideal_gas_cell_cv` を使う）で閉じる（2026-09-23。以前は
+先頭材料のテーブルへフォールバックしており、その「先頭材料」も評価器ごとに異なった — hydro は材料
+スロット 0、ほかは最初の非 void 材料。材料順が「テーブル材料, 理想気体材料」のデッキでは理想気体の
+セルがテーブル材料の EOS で閉じていた）。材料添字が未整備のときは従来どおり先頭材料のテーブル。
+2D も通る経路（燃焼入射・Qei 副段・輻射入射の device kernel、レーザー入射と伝導再閉包の host ループ）は、
+2D の hydro 閉包が全セルを材料 0 のテーブルで評価しているので、2D に限り従来どおり先頭材料のテーブルを
+貸す（device は `CellEOSTableSelector::lend_fallback_to_tableless`、host は `mesh.dim == 1` で分岐）。
+(iii) テーブル対理想気体の分岐はセルのテーブル有無で判定する（2T の閉包・音速・エネルギー更新・
+レーザー／燃焼入射・伝導後の再閉包はイオンと電子の両テーブルが揃うこと）。実行全体でテーブル経路を
+使うかどうかの判定（入射の `has_table_eos`、伝導後の再閉包の起動と伝導ソルバー内の線形射影
+\(e_e=c_{v}T_e\) の省略、1D hydro の `hydro_has_table_eos_backend_data`: compatible 再閉包・Qei の表比熱）
+は、1D ではいずれかの非 void 材料が表を持てば表の経路をとり、フォールバック view はその最初の材料の表
+（`MaterialsConfig::eos_table_reference_material_index`、2026-09-23）。以前は先頭の非 void 材料
+（hydro は材料スロット 0）で決めていたため、理想気体（または void）を先に並べたデッキでは表のセルまで
+理想気体の扱いになり、伝導ソルバーの線形射影が CD のセルのエネルギーを \(c_vT\) に書き換えていた
+（10 eV の CD が 2 step で 17.3 eV、エネルギー誤差 0.1–0.27）。エネルギー更新のゼロ下限もセルごと
+（§3.1.5）。2D の判定は先頭の非 void 材料のまま。`cv_e_override` と hydro backend 種別（helmholtz 系・
+rho_e 表・Mie–Grüneisen は材料 0 の view を全セルに使う）は従来どおり先頭材料の値のまま。（2026-09-24 に解消 — 下段）単一材料では選ばれる view・天井が従来と同一オブジェクト（同じ
 `DeviceEOSTable::view()`、同じ `T_grid_eV.back()`）なので算術は bit 同一。
 `initialize_eos_fields_if_needed` は同日に先行してセル材料別に修正済み。
 `refresh_mie_gruneisen_thermo_from_energy`（Mie–Grüneisen backend 限定）と 1D ALE の post-remap
 再閉包 `ale_1d_driver.cu::eos_reclosure_kernel`（材料 0 のテーブルと \(A,\gamma\) に意図的に限定、Lagrangian
 デッキでは不使用）は対象外のまま。
+
+[2026-09-24] **材料ごとの閉包パラメータ — hydro backend 種別・`cv_e_override`・`eos_T_ref_eV` をセルの材料から**:
+上段の「`cv_e_override` と hydro backend 種別は先頭材料の値のまま」を解消した。1D で非 void 材料どうしが
+hydro backend 種別（`eos.hydro_backend`）、`cv_e_override`、`eos_T_ref_eV` のいずれかで異なるデッキでは、
+各セルがその支配材料の値で閉じる。材料別の値は `materials::MaterialClosureParams`（種別・\(A\)・\(Z\)・
+\(\gamma\)・`cv_e_override`・`eos_T_ref_eV`）の device 配列にまとめ（`materials/material_closure.cu`、
+値が材料間で異なるときだけ `CellEOSTableSelector::closure_params` に載る。単一材料と一様なデッキでは
+null で、各評価器は従来のスカラー引数と算術のまま）、次の評価器がセルごとに読む:
+(i) 1D hydro の閉包・音速（`enforce_1t/2t_closure_kernel`、`compute_sound_speed_1t/2t_kernel`）は
+セルごとの種別・代理表（helmholtz spline / jet・rho-e 表・Mie–Grüneisen の view を材料別の device 配列
+`HydroEOSContext::d_*_views` から。非 void 材料が 2 つ以上あり代理表を使う材料があるときに upload）・
+`cv_e_override` で評価する。そのとき各カーネルは別のテンプレート実体（`kPerCell=true`）で起動し、
+一様なデッキの実体の算術は変えない。厳密上書き（`exact_override`）は厳密理想気体と Mie–Grüneisen の
+セルには掛けない（実行全体では、それ以外の材料があるときだけ有効）。`exact_override="cv"` の比熱はセルの
+材料の \(A,Z\) から（`fill_exact_override_cv_kernel`、材料の \(A,Z\) が異なるときも）。エネルギー更新の
+ゼロ下限は helmholtz 系の材料のセルだけ符号付き。compatible energy の rho-e 逆閉包の対応は全非 void 材料で判定。
+(ii) 伝導後の温度→エネルギー再閉包（`sync_ee_from_Te_device` / host）は、厳密理想気体の材料のセルは
+その材料の \(A,\gamma\)・`cv_e_override`・`eos_T_ref_eV` の厳密式、それ以外の表を持たないセルは
+その材料の `cv_e_override` の理想気体で閉じる（先頭材料が厳密理想気体のとき、表を持つ他材料のセルも
+表で閉じる）。energy-authoritative の伝導増分（device / host）は厳密理想気体のセルのエネルギーを、
+伝導ソルバーが使った比熱（hydro の厳密閉包の一定比熱）で温度へ戻す（以前はその材料が保持している表で
+逆変換していた）。
+(iii) レーザー・燃焼・輻射の入射と Qei 副段の理想気体分岐は、セルの材料の `cv_e_override` と
+\(T^3\) 比熱（`eos_T_ref_eV`）で閉じる。いずれかの材料が \(T^3\) 比熱を使うときの 1D レーザー入射は
+従来どおり host 経路（`pow` の bit 再現のため）。
+(iv) 1D FLD の物質更新・Fleck・灰色加速のカーネルは `cv_e_override` をセルの材料から。
+(v) Mie–Grüneisen の温度更新（`refresh_mie_gruneisen_thermo_from_energy`）は Mie–Grüneisen の材料が
+一つでもあれば動き、各セルはその材料の表で、材料別パラメータがあるときは Mie–Grüneisen のセルだけを更新する
+（以前は先頭材料が Mie–Grüneisen のときだけ、全非 void セルを先頭材料の表で書き換えていた）。
+(vi) 厳密理想気体の材料は、表を保持していても閉包では表を持たない材料として扱う: 材料別の view 配列
+（`HydroEOSContext::d_*_views`、FLD の材料別電子表キャッシュ）の項を空にし、表の参照材料
+（`eos_table_reference_material_index`）から外し、初期化の表の有無の判定からも外す。その結果、一様な厳密
+理想気体デッキでは 2T の冷エネルギー出力 `e_cold` が 0、エネルギー更新のゼロ下限が有効、伝導増分と FLD の
+物質更新が表ではなく理想気体の式になる（いずれも hydro の厳密閉包との食い違いの解消）。
+変わらないもの: 単一材料・材料間で上記の値が同じデッキの算術（`closure_params` が null）。
+常駐ループは従来どおりこれらのデッキを受け付けない（理想気体 legacy・同一 `cv_e_override` に限定）。
+2D は対象外（`material_closure_params_vary` は 1D でだけ真）。ctest `test_per_cell_closure_params`
+（厳密理想気体の材料と `cv_e_override` を持つ材料の 2 材料デッキで、1T / 2T の閉包・音速と伝導後の再閉包が
+各セルの材料の式に一致すること）。
 
 [2026-09-14 追補] **テーブル密度下限より低密度のセルの 1D hydro 閉包**: 1D の EOS 閉包（1T/2T）と音速は
 従来 \(\rho < \rho_{\min}\)（テーブル密度格子の下限）で理想気体分岐へ切り替えていたが、FLD の物質更新・
@@ -838,8 +913,8 @@ gxii_1d_fld_regression / cbet_gxii_1d_off の dataset 単位 bit 比較 + 単体
 材料別 Qei カーネル `qei_coupling_substep_kernel_per_material`
 （`Numerics.materials.per_material_conservation_enabled`、既定 OFF）、Mie–Grüneisen 再閉包
 `reclose_thermo_from_energy` の \(\max(e,0)\)、2D 閉包（`hydro_2d.cu` は独自の `energy_needs_repair`）、
-台帳の \(\max(e_e+e_i,0)\)、非有限入力の repair 意味論、Qei の二重配置（hydro 両半段 + 熱副段）と
-解析式／表比熱の不一致、自由境界の人工粘性仕事の不整合、音速で負の部分圧の圧縮率寄与を捨てる処理。
+台帳の \(\max(e_e+e_i,0)\)、非有限入力の repair 意味論、Qei の
+解析式／表比熱の不一致（Qei の二重配置は 2026-09-23 に修正 — 下記 Radiation thermal microcycling の段落）、自由境界の人工粘性仕事の不整合、音速で負の部分圧の圧縮率寄与を捨てる処理。
 同日の追加（Qei の比熱計量）: 修正後に 26 meV 開始の同デッキ（輻射・伝導 OFF）で、静止セルのイオン→電子の
 交換が数サイクルで \(T_e\) を 26 meV → 0.16 eV に上げたまま半ステップ周期で振動する現象が残った
 （`qei_multiplier` を実効ゼロにすると消える）。原因は非 compatible 経路の 2T エネルギー更新の Qei が
@@ -1167,6 +1242,12 @@ Void 材料の体積分率は `cell_is_void` マスクの導出にのみ使用�
 > Rosseland平均はフラックス（拡散）支配の輸送であり、光学的に厚い領域での
 > 調和平均が物理的に正しい（光子は最も透過しやすい成分を選好する）。
 > v1.0では上記2種を固定する（SPECIFICATION §6.4.3: Planck平均 = `"linear_mass"`、Rosseland平均 = `"harmonic_mass_R"`）。
+> 実装（2026-09-24、1D）: `opacity_mix_rule` の 3 値を実装した — `"linear_mass"`（既定）は Planck・Rosseland とも
+> 線形、`"harmonic_mass_R"` は Planck 線形・Rosseland 調和（上式、各成分を \(10^{-20}\) cm²/g で下限）、`"max"` は
+> 両方とも存在する材料の最大値。テーブル不透明度の混合セル（`eval_opacity_multimat_kernel`、規則ごとのテンプレート
+> 実体）と定数不透明度の per-cell 混合（`State::ensure_cell_material_props`、質量分率・無ければ体積分率）の両方。
+> 純セルはどの規則でもその材料の値。2D は線形のみで、他の値は ConfigError。2026-09-23 から 09-24 までは
+> `"linear_mass"` だけを受理し、それ以前は受理して無視していた（下の doc-truth 注記は 2026-08-29 時点）。
 
 > **実装状態（doc-truth 注記 2026-08-29）**: 上式は設計目標であり、現行ランタイムの
 > 実装とは異なる。実装（`State::ensure_cell_material_props`）は、定数不透明度材料の
@@ -1183,7 +1264,7 @@ Void 材料の体積分率は `cell_is_void` マスクの導出にのみ使用�
 > 使用可能になった — 各非 void 材料は constant または LTE tmat（`--kirchhoff-pe` 変換、
 > `/opacity` の `is_lte=1` をランタイムで検証）を持て、セルの支配材料 index
 > （`State::cell_material_index`、体積分率 argmax）でテーブルを選択し
-> (ρ, T_e) 補間で per-cell per-group σ_a/σ_pe/σ_R を評価する。**第 2 段 (同日)**: NLTE tmat も多材料対応 — NLTE 係数カーネルにセル材料フィルタを追加し材料ごとに起動（材料定数はその材料の A/cv/γ/λ 引数、σ_pe≠σ_pa と η・Fleck をカーネルが自セル分のみ充填; 共有 η/Fleck 段は skip マスクで NLTE セルを保護）。table_nlte (IONMIX 直読) は未対応のまま。**第 3 段 (2026-08-31) — 混合セルの厳密混合**: 混合セルは寄与材料すべてを \(\sigma_{mix} = \rho \sum_m w_m\,\kappa_m(\rho_m, T_e)\) で厳密合成する — 重み \(w_m\) は質量分率（per-material 質量が未追跡なら体積分率で代替）、各材料のテーブルはその**部分密度** \(\rho_m = \rho\,w_m/f_m\)（\(= m_m/(V f_m)\)、\(f_m\) 縮退時はセル密度に fallback）で評価する。体積分割セルの厳密式（\(f_m \sigma_m(\rho_m) = \rho\,w_m \kappa_m(\rho_m)\)）。純セルは従来の支配材料経路に bit 一致で還元（H5 データセット単位 A/B で実証）。NLTE **支配**セルのみ NLTE 起動が支配材料近似で充填し、混合セル内の非支配 NLTE 材料はテーブル κ_PA/PE/R で寄与する。恒久 ctest `test_fld_multimat_opacity`（κ 入替 A/B・平坦テーブル vs 定数経路整合・混合セル部分密度厳密値）。なお定数材料同士の従来混合則（上記の線形体積分率加重）はテーブル無しデッキで不変に保たれる。
+> (ρ, T_e) 補間で per-cell per-group σ_a/σ_pe/σ_R を評価する。**第 2 段 (同日)**: NLTE tmat も多材料対応 — NLTE 係数カーネルにセル材料フィルタを追加し材料ごとに起動（材料定数はその材料の A/cv/γ/λ 引数、σ_pe≠σ_pa と η・Fleck をカーネルが自セル分のみ充填; 共有 η/Fleck 段は skip マスクで NLTE セルを保護）。table_nlte (IONMIX 直読) は未対応のまま。**第 3 段 (2026-08-31) — 混合セルの厳密混合**: 混合セルは寄与材料すべてを \(\sigma_{mix} = \rho \sum_m w_m\,\kappa_m(\rho_m, T_e)\) で厳密合成する — 重み \(w_m\) は質量分率（per-material 質量が未追跡なら体積分率で代替）、各材料のテーブルはその**部分密度** \(\rho_m = \rho\,w_m/f_m\)（\(= m_m/(V f_m)\)、\(f_m\) 縮退時はセル密度に fallback）で評価する。体積分割セルの厳密式（\(f_m \sigma_m(\rho_m) = \rho\,w_m \kappa_m(\rho_m)\)）。純セルは従来の支配材料経路に bit 一致で還元（H5 データセット単位 A/B で実証）。NLTE **支配**セルのみ NLTE 起動が支配材料近似で充填し、混合セル内の非支配 NLTE 材料はテーブル κ_PA/PE/R で寄与する。恒久 ctest `test_fld_multimat_opacity`（κ 入替 A/B・平坦テーブル vs 定数経路整合・混合セル部分密度厳密値）。なお定数材料同士の従来混合則（上記の線形体積分率加重）はテーブル無しデッキで不変に保たれる。**第 4 段 (2026-09-23) — 放出不透明度の一致**: 物質側は放出 \(f\,c\,\sigma^{PE} B\) を失うので、放射側の \(\eta\) も同じ混合 \(\sigma^{PE}\) から作る（従来は \(\sigma^{PA}\) から作っており、LTE 指定でも \(\kappa^{PE}\ne\kappa^{PA}\) の表（`tmat_kirchhoff_pe=False`）では \(c(\sigma^{PE}-\sigma^{PA})B\,\Delta t\,V\) が毎ステップ生成・消滅した）。定数材料と `tmat_kirchhoff_pe=True` の表では \(\sigma^{PE}=\sigma^{PA}\) なので不変。NLTE の係数計算の有無（警告集計と、外側反復の先回り計算を取り消すときに戻す配列の範囲）は先頭の非 void 材料ではなく全材料で判定する（先頭が定数材料で他に表がある 1D デッキでは \(\sigma^{PA}\)・\(\sigma^R\)・NLTE 作業配列が戻されていなかった）。ctest `test_fld_multimat_opacity` の収支ケース（\(\kappa^{PE}=3\kappa^{PA}\) の表で 1 ステップの物質＋放射の変化 = −流出を、欠陥の大きさの \(10^{-7}\) で検査。修正前は欠陥そのもの 4.3e6 erg の不一致）。 **第 5 段 (2026-09-24) — すべての不透明度モデルを材料ごとに**: 多材料の 1D FLD は、材料のどれかが表・べき乗則・周波数依存 Marshak 不透明度なら全セルを `eval_opacity_multimat_kernel` で評価する（定数だけのデッキは従来どおり `State::ensure_cell_material_props` の per-cell 定数）。材料の種類ごとに: べき乗則 \(\kappa=\kappa_0 (T/T_{ref})^{-\alpha_T}(\rho_m/\rho_{ref})^{\lambda_\rho}\)（部分密度 \(\rho_m\) で、灰色）、周波数依存 Marshak は群平均の吸収係数 \(\sigma_{P,g},\sigma_{R,g}\)（密度に依らない [1/cm]、単一材料と同じ Simpson 128 区間 `materials::freq_dep_marshak_group_sigmas`）を \(\rho_m\) で割った \(\kappa\) — 線形混合で \(\sigma=\sum_m f_m\sigma_m\)（体積分率加重）になる、`table_nlte`（IONMIX 表）は表から読んで LTE の表（放出＝吸収）は混合カーネル、非 LTE の表は `tmat` の非 LTE 表と同じく材料ごとの NLTE 係数起動が支配セルを埋める。材料が複数あるとき Fleck 線形化の有無は、どれかの材料が使えば実行全体で有効（`use_fld_fleck(cfg, mat)`；周波数依存 Marshak のセルも共有カーネルの Fleck 因子を使う。単一材料では従来どおり先頭材料の模型で決まる）。`opacity.model="ionmix"` は LTE の IONMIX 表として `table_nlte` の経路で評価する（builder が変換し、非 LTE の表は ConfigError）。ctest `test_fld_multimat_opacity` に混合則のケース。
 
 **質量分率 \(f_{m,\alpha}\) の時間発展**：ラグランジュステップでは各セルの \(f_{m,\alpha}\) は不変（セル境界を越える物質移動なし）。ALE remap（§3.3.4）により体積分率 \(f_\alpha V\) がセル間で輸送され、remap 後に \(f_\alpha = (f_\alpha V)' / V'\) として正規化し、\(f_{m,\alpha} = f_\alpha\,\rho_\alpha / \sum_\beta f_\beta\,\rho_\beta\) として質量分率を再計算する（ARCHITECTURE §4.4 remap リスト参照）。v1.0 では材料界面追跡を行わず、remap が唯一の \(f_{m,\alpha}\) 更新機構である。
 
@@ -1232,6 +1313,15 @@ c_{v,i} = \frac{k_B}{A_{eff}\,m_p\,(\gamma_{eff}-1)}
 - `inject_radiation_source_terms` / `inject_laser_source_terms` はセルごとの
   \(A_{eff}, \gamma_{eff}\) を用いて \(e_e \leftrightarrow T_e\) クロージャを行う
 - Te \(\leftrightarrow\) ee の変換は上式の \(c_{v,e}(A_{eff},\gamma_{eff})\) を用いる
+- 1T（2026-09-23）: 入射（レーザー・燃焼・輻射）の閉包は、全表（`total`）を持つセルでは全エネルギーを
+  その表で逆算して \(T\)・\(P\) を表から取る（2T の電子表の閉包と同じ手順、表の無いセルは理想気体）。
+  理想気体の分岐では、状態の \(c_v\) を全熱容量としてそのまま使う（1T の hydro 閉包がそこに
+  \((1+\bar Z)e/(A m_p(\gamma-1))\) を入れている）。以前は 1T で表を使わず全セルを理想気体の分岐で閉じ
+  （表のセルに \((\gamma-1)\rho e\) の圧力）、状態の全熱容量にイオンの分をもう一度足していた
+  （\(T\) を \((1+\bar Z)/(2+\bar Z)\) 倍に過小評価）。\(T\)・\(P\) は次の閉包（hydro の入口の閉包）で
+  書き直されるが、その間の演算子（Strang 順でレーザーの次の燃焼段など）はこの値を読み、全エネルギーが
+  \(c_v T_{\rm floor}\) を下回る表のセル（負の冷たい曲線のエネルギーなど）では理想気体の分岐がエネルギー
+  自体を床へ引き上げていた（床の注入として記帳）。
 
 **単一材料フォールバック**：
 \[
@@ -1487,7 +1577,16 @@ smoothing 前に 0 とし、face smoothing の barrier としても扱う。
 compressed cell floor hit を検出して同じ Radiation 演算子を細分化して再試行する。
 Hydro / Laser / IMC transport kernel の離散化は変更しない。Conduction は同じ
 `conduction_step` を使うが、standalone Strang 位置では呼ばず、thermal substep 内で
-`Radiation -> Qei -> Conduction` として評価する。
+`Radiation -> Qei -> Conduction` として評価する。Qei も同じ扱いで、thermal subcycle が
+走る step（`core::thermal_subcycle_active(cfg)` = `radiation_thermal_subcycle` かつ
+Radiation 有効かつ `imc.two_stage=False`）では、Hydro の 2T エネルギー更新
+（非 compatible の `energy_update_with_old_volume_2t_kernel`、compatible 経路の
+`apply_qei_transfer_2t_kernel`）は電子・イオン交換を行わず pdV・Q 仕事だけを与える。
+交換は thermal substep 内の `apply_qei_coupling_substep` による 1 回（合計 \(\Delta t\)）
+だけになる。thermal subcycle が走らない step では従来どおり Hydro の 2 回の半ステップ
+（合計 \(\Delta t\)）が交換を担う（2026-09-23 修正: 従来は thermal subcycle 有効時にも
+Hydro 両半段が交換を行い、1 step あたり \(2\Delta t\) 分の緩和を与えていた —
+\(\Delta t\lesssim\tau_{\rm eff}\) の領域で Te–Ti 緩和率が 2 倍）。
 
 Retry 判定は各 radiation substep の `source_injection` 完了後に行う。
 セル \(c\) が
@@ -1501,7 +1600,8 @@ T_{e,c} \le T_{e,floor} + 0.5\ {\rm eV}
 
 Algorithm:
 1. Radiation 演算子開始時に `ee`, `ei`, `Te`, `Ti`, `Pe`, `Pi` に加え、放射
-   prognostic state `rad_E`, `rad_E_old`, `sn_psi_prev`（mode 依存で空の場合は
+   prognostic state `rad_E`, `rad_E_old`, `sn_psi_prev`（線形不連続法 §6.8.4 では
+   `sn_psi_sd_prev`, `sn_ee_node_offset` も。mode 依存で空の場合は
    no-op）を GPU 上の backup field へ device-to-device copy し、step energy
    ledger accumulator（escaped / marshak_in / volume_source_in /
    numerical_loss / HOLO LO 4 量）の現在値を host snapshot する
@@ -1531,8 +1631,21 @@ Algorithm:
 4. 任意の substep 後に compressed floor hit が見つかり、かつ \(n_{sub}<16\) なら、
    pre-radiation の熱力学+放射状態を backup から復元し、ledger accumulator を
    snapshot 値へ巻き戻して、\(n_{sub}\leftarrow 2n_{sub}\)
-   として再試行する。
+   として再試行する。復元する状態は \(e_e,e_i,T_e,T_i,P_e,P_i\)、`rad_E`、
+   `rad_E_old`、`sn_psi_prev`（と `sn_psi_sd_prev`、`sn_ee_node_offset`）、閉包の比熱 \(c_{v,e},c_{v,i}\)、\(\bar Z\)（伝導の段が
+   更新する）、step の床注入・クランプ数、伝導と \(S_N\) 物質 Newton の全 step 再試行要求、
+   境界・体積源の step ledger（\(c_v\)・\(\bar Z\)・床注入・クランプ数・再試行要求は
+   2026-09-23 に追加。それまでは失敗した試行の値を再試行へ持ち越していた）。
 5. \(n_{sub}=16\) でも floor hit が残る場合は、それ以上の retry は行わず結果を受理する。
+6. 放射解は各回、自分が進めた区間の交換エネルギーで `rad_dep`・`rad_emit`（HOLO 有効時は
+   `holo_rad_dep`・`holo_rad_emit`）を上書きする。step の出力はこれらを step 全体の交換として
+   読む（checkpoint の `rad_dep`・`rad_emit`、`deposited_power` \(=\texttt{rad\_dep}/(V\Delta t)\)、
+   HOLO の源不一致診断）ため、\(n_{sub}>1\) では採用した試行の全 substep の値をデバイス上で
+   合計し、ループの後で書き戻す（two-stage 経路と同じ扱い）。\(n_{sub}=1\) では解が書いた値を
+   そのまま使う。履歴の `radiation/fld_outer_iterations`・`fld_outer_residual`・
+   `fld_outer_converged` も step の全 FLD 解について集約する（反復数は合計、残差は最大、収束は
+   全解が収束したときだけ 1）。巻き戻した試行の値は含めない（2026-09-23 修正: 従来はどれも
+   最後の substep の値で、`deposited_power` は \(1/n_{sub}\) 倍になっていた）。
 
 Prototype limitation（IMC 系。deterministic FLD/\(S_N\) は 2026-07-26 の
 transactional 化で解消）: IMC photon pool / census state は復元しない。
@@ -1618,6 +1731,10 @@ face flux は反対称なので
 現在の \((\rho, T_e)\) から \(\bar{Z}\) を再評価する。
 これにより、1回目の \(\mathcal{H}(\Delta t/2)\) による圧縮/加熱後の電離度が伝導係数へ反映され、
 \(\mathcal{C}(\Delta t)\) 後の \(T_e\) 変化が NLTE/Fleck closure に反映される。
+実装上は各 \(\mathcal{H}(\Delta t/2)\) の冒頭でも再評価する。1D では加えて Laser
+演算子 \(\mathcal{L}\) の冒頭でも再評価する（2026-09-23: 従来 \(\mathcal{L}\) は前ステップの
+2 回目の \(\mathcal{H}(\Delta t/2)\) 冒頭の \(\bar Z\) を読み、電子密度・臨界半径・IB 吸収係数・
+ゴーストコロナの基準値が半ステップ分古い電離度で決まっていた）。
 
 #### 2.1.1 Hydro開始温度条件（セル単位）
 
@@ -1654,8 +1771,10 @@ Hydro演算子 \(\mathcal{H}\) の適用をセル単位で制御する。
     \text{node\_active}_j = \bigwedge_{c \in \mathcal{N}(j)} \text{hydro\_active}_c
     \]
     （最外ノードは最外セルに従う）。非活性セルは剛体壁として自分のノードを保持し（`passive_fill` が行う
-    非活性ノード列の平行移動 `propagate_void_node_displacement` も行わない）、体積・エネルギーは
-    活性化まで不変（固定ノードに対する PdV 仕事はゼロなので、活性領域のエネルギーは保存される）。
+    非活性ノード列の平行移動 `propagate_void_node_displacement` も行わない）、体積は活性化まで不変、
+    エネルギーは流体の仕事に対して不変（固定ノードに対する PdV 仕事はゼロなので、活性領域のエネルギーは
+    保存される）。電子イオン緩和はマスクせず、2T のエネルギー更新は非活性セルでも \(Q_{ei}\) を適用する
+    （仕事の項は \(dV=0\) で消える。2026-09-23 是正 — 非 compatible の 2T 更新では Qei もマスクされていた）。
     活性セルは壁に向かって圧縮され、壁側のセルは輻射・熱伝導・電子イオン緩和で加熱されて
     \(T_e \ge T_{\text{start}}\) に達した時点で活性化する。このモードでは電子イオン緩和（\(Q_{ei}\)、
     hydro 内の transfer と source_terms の副段）を `hydro_active` でマスクしない。多材料の高密度界面
@@ -1882,8 +2001,15 @@ baseline の bit-exact 挙動を保つ。
 
 **Δt成長制限**：急激なΔt増大を防止するため、前ステップ比で制限する：
 \[
-\Delta t^{n+1} \le \min\!\bigl(\Delta t_{all},\; g_{dt}\,\Delta t^n\bigr),\quad g_{dt} = \text{growth\_factor}\;(\text{既定 }1.2,\;\text{SPECIFICATION §6.4.7})
+\Delta t^{n+1} \le \min\!\bigl(\Delta t_{all},\; g_{dt}\,\Delta t^n_{ref}\bigr),\quad g_{dt} = \text{growth\_factor}\;(\text{既定 }1.2,\;\text{SPECIFICATION §6.4.7})
 \]
+\(\Delta t^n_{ref}\)（`state.dt_growth_ref`）は前ステップの Δt から 2D の接触 cap を除いた値で、
+1D ではさらに出力時刻と \(t_{end}\) への切り詰め（(f)）も含めない（2026-09-23 是正 — 旧実装は
+切り詰めた Δt を基準にしたため、出力のたびに Δt が \(g_{dt}\) 倍ずつしか回復せず、余分な
+ステップを要した。切り詰めはステップの終わりを出力時刻に合わせるためのもので安定条件ではない）。
+2D は従来どおり切り詰め後の値を基準にする。
+driver full-step retry が Δt を縮めたステップでは、縮めた Δt を基準にする。永続カーネル
+（`dt_ladder_eval` の `dt_growth_basis`）も同じ基準を用いる。
 
 **(f) 出力時刻整合**（SPECIFICATION §6.4.8 `X_every_s` パラメータ）：
 
@@ -2186,11 +2312,11 @@ docs/design/mesh_resolution_requirement_20260903.md）。probe run 後の質量�
 probe との比較で係数を較正するためのものである。
 
 **臨界密度**: 材料 \(m\) について \(n_c = 1.11485\times10^{21}/\lambda_{\mu m}^2\) cm⁻³、
-\(\rho_{c,m} = n_c m_u A_m/\bar Z_m\)。\(\bar Z_m\) は `zbar_override`、それ以外は \(Z\le18\) で
+\(\rho_{c,m} = n_c m_p A_m/\bar Z_m\)（イオン質量はソルバーと同じ \(A m_p\)。レーザー写像の \(n_e/n_c\) と同じ臨界密度になる。2026-09-24 に原子質量単位 \(m_u\) から変更、\(\rho_c\) は +0.73 %）。\(\bar Z_m\) は `zbar_override`、それ以外は \(Z\le18\) で
 完全電離（最小の \(\rho_c\) = 最も厳しい天井、保守的）、\(Z>18\) は Thomas–Fermi 近似
 （`materials::compute_zbar_tf`、コロナ温度で 5 回反復）。
 
-**強度・音速・アブレーション率**: 総ビーム出力 \(P(t)\)（run と同じ 10000 点標本）から
+**強度・音速・アブレーション率**: 総ビーム出力 \(P(t)\)（run と同じ時刻標本: \(2^{-40}\) s 格子と局所細分。複数ビームは全ビームの標本時刻の和集合で合計）から
 \(I(t) = 10^7 P/A_0\)、\(A_0\) は球 \(4\pi R_0^2\)・円筒 \(2\pi R_0\)・平面 1 cm²
 （\(R_0\) = 最外の非 void セルの外縁）。付与釣合い \(I = 4\rho_c c_T^3\) から
 \(c_T = (f_{abs} I/(4\rho_{c,front}))^{1/3}\)、質量アブレーション率
@@ -2313,9 +2439,13 @@ and the two-face area average used by 1D node/cell diagnostics is
 \(0.5\,2\pi(r_a+r_b)\).  Implementation is by compile-time `Geometry1D`
 template forks of the 1D kernels; spherical branches keep the historical
 arithmetic verbatim (bitwise regime), with 1D_SPH bit-neutrality anchored by
-`tests/hydro/test_1d_sph_bitwise_golden.cu`.  The initial scope is the pure hydro
-core: radiation, laser, conduction, and ale1d are rejected at validation.  The
-boundary-PdV energy-audit diagnostic is geometry-aware.  The Sedov gate is
+`tests/hydro/test_1d_sph_bitwise_golden.cu`.  Since 2026-09-24 the builder maps
+`"1D_CYL"` to `"1D_SPH"` with `Mesh.geometry_1d="cylindrical"` (the same
+`geometry_code`), so the physics of the cylindrical 1D geometry (FLD/S_N
+radiation, conduction, the radial laser absorption, ALE) is available; the
+initial scope was the pure hydro core, with radiation, laser, conduction, and
+ale1d rejected at validation.  The boundary-PdV energy-audit diagnostic is
+geometry-aware.  The Sedov gate is
 H3-RADIAL-CYL multi-grid exponent \(1/2\).
 
 #### 3.1.3 ノード質量
@@ -2634,6 +2764,9 @@ guard で無効化された pair 数を表す。
   \tilde f_{iQ}=\frac{\max(P_{i,i}^{n+1/2}+Q_i^{n+1/2},0)}
   {\max(|p_{q,i}^{n+1/2}|,\epsilon)}
   \]
+  （`av_heat_to="electron"` では \(Q_i^{n+1/2}\) を電子側に置き
+  \(\tilde f_e=\max(P_e+Q,0)/\ldots\)、\(\tilde f_{iQ}=\max(P_i,0)/\ldots\) — 2026-09-23 是正:
+  旧実装は `av_heat_to` によらず AV 仕事をイオンへ入れていた）
   から、**明示的な後段正規化**
   \[
   f_e = \frac{\tilde f_e}{\tilde f_e + \tilde f_{iQ}},\qquad
@@ -2658,6 +2791,14 @@ guard で無効化された pair 数を表す。
   と monotone bracketed inverse で求め、\(P_e,P_i,c_v\) を table から再評価する。
   compatible path では table inverse が範囲内にある限り `ee/ei` は writeback せず、
   NaN/Inf/負 energy または table floor/ceiling clamp 時だけ table boundary energy へ repair する。
+  compatible work の加算そのもの（`compatible_energy_update_1d_kernel`）は、表 EOS
+  （2T はイオンと電子の表、1T は全表）または Helmholtz spline/jet の閉包をもつセルでは符号付きのまま
+  \(e\leftarrow e+\Delta e\) とし、0 への切り上げは理想気体のセルに限る（非 compatible の 2T 更新・
+  人工加熱・衝撃波後加熱・midpoint_v2 の stage と同じ規則。2026-09-23）。この判定はセルごと
+  （`signed_energy_cells_kernel`）で、以前は 2T で材料 0 のイオン表の有無が全セルを決め（理想気体を
+  先に並べたデッキでは表のセルの負エネルギーも切り上げた）、1T では全セルを切り上げていた。
+  それ以前は表の cold curve の負エネルギーも 0 へ切り上げて床注入として計上し、
+  energy-authoritative 閉包がその 0 を保持するため、負エネルギー域のセルが加熱されていた。
   compatible TMAT reclosure の floor/ceiling clamp と bracket failure は device counter で集計し、
   非ゼロなら hydro warning として出力する。
 - `eta_compatible` 診断量
@@ -2672,7 +2813,9 @@ guard で無効化された pair 数を表す。
   EOS 再閉包前にイオン比内部エネルギー \(e_i\) へ保存形で加える。
   この項は compatible force-work 分解には含めない
 - `post_shock_heat=True` のときは、別経路の局所熱流束 \(\mathbf{H}^{ps}\) を
-  全比内部エネルギー \(e_{tot}=e_e+e_i\) に対して保存形で加える。
+  全比内部エネルギー \(e_{tot}=e_e+e_i\) に対して保存形で加える。面の熱流は更新前のエネルギーから
+  面ごとに一度だけ求め、両隣のセルが同じ値を使う（2026-09-23 是正 — 旧実装は同じカーネルで隣のセルの
+  エネルギーを読みながら自セルを更新しており、結果が読み書きの順序に依存し、面の熱流が両隣で食い違いえた）。
   2T ではセルの net \(\Delta e_{tot}^{ps}\) を
   \(P_e^{n+1/2}/(P_e^{n+1/2}+P_i^{n+1/2})\) と
   \(P_i^{n+1/2}/(P_e^{n+1/2}+P_i^{n+1/2})\) の比で電子・イオンへ分配する。
@@ -2848,6 +2991,22 @@ T_{k,i}^{new} = T_{k,i}^{old} + \frac{\Delta e_{k,i}}{c_{v,k,i}} \quad (k=e,i)
 6. **フロアクランプ**：最終的な \(T^{final}\) は \(T_{floor}\)（§1.1.7）以上にクランプする。
 
 理想気体EOS（\(c_v = \text{const}\)）では反復なしで 1 回目で厳密に収束する。
+
+**1T の全エネルギー再規格化（legacy PdV path）**：1T・`compatible_energy=False`・駆動圧境界なしの
+ステップでは、Corrector の後に活性セルの \(e\) を一律に拡大縮小し（残差は最初の活性セルへ）、
+\(E=\sum_i \Delta M_i e_i + K\) を \(E^{target}=E^{n}+W_r+E_{floor}\) に合わせる。\(W_r\) は
+輻射圧（`hydro_coupling="gamma_r_43"`）の力の仕事の総和（ドライバが輻射場から同量を差し引く）、
+\(E_{floor}\) はステップ内の床注入（安全台帳へ計上）。\(K\) は節点形 \(\sum_j \tfrac12 m_j u_j^2\)
+（\(m_j\) は隣接セル質量の半分ずつ、運動量更新が運ぶ運動エネルギー。\(W_r\) も節点の運動エネルギー
+\(\Delta K_j=F_j\bar u_j\Delta t\) として定義される）で測る。2026-09-24 是正 — それまでは輻射圧が働く
+ステップ以外はセル平均形 \(\tfrac12 m_i\bigl((u_i+u_{i+1})/2\bigr)^2\)（1 セルあたり
+\(\tfrac18 m_i(u_{i+1}-u_i)^2\) だけ小さい）で測っており、セル内で速度が変わる所で両者の差を内部エネルギーへ
+移していた。エネルギー予算（履歴 `energy/kinetic` と保存誤差）も同日から 1D では節点形で測る
+（セル平均形は膨張するアブレーション域で運動エネルギーを沈着量の 1 割程度過小に測り、見かけのエネルギー損失を
+示していた）。2026-09-23 是正 — 旧実装は
+\(E^{target}=E^n\)（\(K\) は常にセル平均形）で、床注入をステップ内で \(e\) から差し引き直し、
+輻射圧の力による運動エネルギーの変化もセル平均形で測った分だけ \(e\) から差し引いていた
+（輻射場は節点形の \(W_r\) を払うので、両者の差だけ系全体のエネルギーが合わなかった）。
 
 #### 3.1.6 人工粘性（1D球対称）
 
@@ -3137,12 +3296,30 @@ u_{R,i}^* = u_{i+1}-\frac{1}{2}\Delta r_i s_{i+1}
 \qquad
 \chi_i^{lim}=\min(\chi_i^{raw},\chi_i^{rec})
 \]
-を作る。`csw_shock_limiter_floor=f` は \(\chi_i^{rec}>0\) のときだけ
+を作る。`csw_shock_limiter_floor=f` は、Caramana-Shashkov-Whalen (1998) 式 (12) の
+Christensen limiter
+\[
+\psi_i=\max\left(0,\;\min\left(\tfrac{1}{2}(r_{l,i}+r_{r,i}),\;2r_{l,i},\;2r_{r,i},\;1\right)\right),
+\qquad
+r_{l,i}=\frac{g_{i-1}}{g_i},\quad r_{r,i}=\frac{g_{i+1}}{g_i},\quad
+g_k=\frac{u_{k+1}-u_k}{\Delta r_k}
+\]
+で重み付けした下限
 \[
 \chi_i^{lim}\leftarrow
-\min\left(\chi_i^{raw},\;\max(\chi_i^{lim},\;f\chi_i^{raw})\right)
+\min\left(\chi_i^{raw},\;\max\left(\chi_i^{lim},\;f\,(1-\psi_i)\,\chi_i^{raw}\right)\right)
 \]
-を適用し、滑らかな一様圧縮（\(\chi_i^{rec}=0\)）では \(Q_i=0\) を保つ。
+として働く（\(g_i<0\)）。メッシュ外の隣接セルは \(r=1\)（線形延長。反射中心では鏡像と一致）、
+幅が正でない、または比が有限でない隣接セルは \(r=0\) とする。3 セルにわたって速度が線形なら
+\(\psi_i=1\) で下限は消え、一様圧縮で \(Q_i=0\) を保つ。隣接セルが圧縮していない衝撃波の
+足元・後端では \(\psi_i=0\) で \(f\chi_i^{raw}\) が残る。勾配がセルあたり相対 \(\delta\) で
+変わる滑らかな圧縮では \(\chi_i^{lim}/\chi_i^{raw}=O(\delta^2)\) である。\(\psi_i\) は速度の
+連続関数なので、\(Q_i\) も速度の連続関数になる（CSW98 は、衝撃波後方の偽の振動を避けるため
+limiter が引数に対してできるだけ滑らかであることを求めている）。
+2026-09-25 までの実装は下限を \(\chi_i^{rec}>0\) の符号だけで入り切りしていた。滑らかな圧縮では
+\(\chi_i^{rec}\) が \(O(\delta^2)\) の微小量で、その符号は曲率や丸め誤差で変わるため、粘性がセル
+ごとに 0 と \(f\chi_i^{raw}\) の間を不連続に跳んでいた（勾配が線形に変わる圧縮では全セルに
+\(f\chi_i^{raw}\)、不等間隔格子上の厳密な一様圧縮でも丸め誤差で一部のセルに入る）。
 `csw_zero_uniform_compression=False` では reconstruction limiting を丸ごと
 バイパスし \(\chi_i^{lim} = \chi_i^{raw}\) とする（jump gate なしの生 VNR 相当
 — 診断・比較用。2026-07-26 明文化: 旧正典は False 分岐の
@@ -3572,11 +3749,17 @@ M_j\,\frac{du_j}{dt} = -A_j\,(p_{q,i} - p_{q,i-1}),\qquad A_j = 4\pi r_j^2
 
 \[
 \Delta t_{acoustic+AV} = C_{CFL}\cdot\min_{i \in \mathcal{A}}\!\left(
-\frac{\Delta r_i}{c_{s,i} + C_1\,c_{s,i} + C_2\,\Delta r_i\,\chi_i}
+\frac{\Delta r_i}{c_{s,i} + g_i\,C_1\,c_{s,i} + C_2\,\Delta r_i\,\chi_i}
 \right)
 \]
 - \(\mathcal{A} = \{i \mid \text{hydro\_active}_i = \text{true}\}\)：活性セル集合（§2.1.1）。\(\mathcal{A} = \emptyset\) のとき \(\Delta t_{hydro} = \infty\)。
 - \(C_1,\; C_2\)：人工粘性係数（§3.1.6）
+- \(g_i\)：セル \(i\) が圧縮しているとき 1、それ以外は 0。圧縮とは節点が近づく
+  （\(u_{i+1} < u_i\)、CSW の作用条件）か体積が縮む
+  （\(A_{i+1}u_{i+1} < A_i u_i\)、VNR の作用条件）ことを指す。どちらの人工粘性も非圧縮セルでは
+  \(Q = 0\) なので、一次項 \(C_1 c_{s,i}\) は作用しうるセルにだけ加える（2026-09-23 是正 —
+  旧式は非圧縮セルにも常に加え、非圧縮セルが律速するとき \(\Delta t\) を \(1/(1+C_1)\) 倍に
+  縮めていた）。永続カーネルの CFL（`persistent_1d::cfl_1d_candidate_body`）も同じ式。
 - \(\chi_i\) [1/s] は §3.1.6 の Christensen速度リミタで定義した圧縮率をそのまま用いる。
   CFL分母では圧縮速度 \(\Delta r_i\chi_i\) [cm/s] を人工粘性の補正項として加える。
 - `av_type="riemann"` では VNR 係数を CFL に使用せず、§3.1.6 の Riemann face
@@ -3704,7 +3887,9 @@ M_j\,\frac{du_j}{dt} = -A_j\,(p_{q,i} - p_{q,i-1}),\qquad A_j = 4\pi r_j^2
    \]
    （\(\Delta V^{n\to n+1/2} = V^{n+1/2} - V^n\) は predictor の幾何半更新の
    体積差、\(Q^n\) work は `av_heat_to` の宛先へ、1T は総和形。\(Q_{ei}\)
-   等の source は stage には含めない — Strang 分割の別演算子）。
+   等の source は stage には含めない — Strang 分割の別演算子）。stage のゼロ下限は理想気体の
+   エネルギーにだけ適用し、符号付きの表エネルギー（負の冷たい曲線）はそのまま使う（2026-09-23 是正 —
+   旧実装は stage を常に 0 で切り、表 EOS の中間圧力を誤らせていた）。
 2. EOS closure は \(P^{n+1/2} = P(\rho^{n+1/2}, e^{\star})\) を返す
    （真の時間中心圧力）。AV も同状態で再評価。
 3. Corrector のエネルギー更新は \(P_{half} = P^{n+1/2}\)、
@@ -3752,6 +3937,10 @@ M_j\,\frac{du_j}{dt} = -A_j\,(p_{q,i} - p_{q,i-1}),\qquad A_j = 4\pi r_j^2
   > 残差 \(1.4\times10^7\) erg で失敗、bisect で特定）。`Hydro1D::lagrangian_step` の compatible
   > 分岐に FREE の \(Q_{N-1}\) 読み出しを戻した。影響するのは `compatible_energy=True` かつ
   > `boundary_1d="free"` の run（`cbet_gxii_1d_off`, `parallel_gxii_1d` など）。
+  > **2026-09-23 修正**: 駆動圧境界（`boundary_1d="pressure"`）も運動量式の ghost は
+  > \(P_{drive}+Q_{N-1}\) なのに、compatible energy 更新は最外セルの外側面の \(Q\) 仕事を引いて
+  > いなかった（ghost の差し引きが FREE 限定）。外側面の仕事から \(Q_{N-1}\) を除き、
+  > \(P_{drive}\) の仕事は従来どおり境界の外部仕事として台帳へ入る。
 
 **節点量のゴースト規約（スカラー量とは別系統；
 2026-07-26 明確化）**：AV の slope 再構成（§3.1.6 の \(\sigma_j\)）が参照する仮想
@@ -6506,10 +6695,13 @@ unconditionally in dt.
 
 With `Numerics.hydro.csw98_limiter_shock_floor_enabled` (default false), the
 structured limiter's force attenuation is floored at
-`csw_shock_limiter_floor` on compressive sides, matching the 1D csw kernel's
-shock floor: at a strong front the edge viscosity retains at least
-floor x its unlimited value instead of being extinguished by the
-smooth-ramp classification.
+`csw_shock_limiter_floor` on compressive sides: at a strong front the edge
+viscosity retains at least floor x its unlimited value instead of being
+extinguished by the smooth-ramp classification. The floor is not weighted:
+every compressive edge keeps it, in a smooth compression as well. (It was
+introduced to match the 1D csw kernel's shock floor; since 2026-09-25 the
+1D kernel weights its floor by 1 - psi, section 3.1.6, so the two differ
+where the velocity varies linearly.)
 
 With `Numerics.hydro.csw98_axisline_work_planar_enabled` (default false),
 axis-line edges book the AV pair power in the planar metric (weights 1
@@ -15195,6 +15387,12 @@ V3 solution-adaptive ALE は `numerics.ale1d.enabled` でのみ制御する。�
 
 > **運用注意**：`Ale1dConfig::enabled=false` / `numerics.ale1d.enabled=False` が既定であり、1D ALE V3 は実験的な opt-in 機能として、long-pulse ablation front penetration や multi-shock systems など localized moving feature がある場合に限って検討する。
 
+**発火条件と候補の判定（2026-09-23）**：試行は cadence（`every_n_steps` の倍数の step）、品質（`emergency_enabled` かつ隣接セル幅比の最大 \(\max_i\max(\Delta r_i/\Delta r_{i+1},\Delta r_{i+1}/\Delta r_i)\) が `emergency_max_dr_ratio` を超える）、min-width floor（下記）のいずれかで発火し、前回の適用から `min_steps_between_ale` step 未満なら skip する（`TooSoon`）。候補メッシュは remap の前に音響 dt 上限
+\[
+\Delta t_{ac}=\min_i\frac{r_{i+1}-r_i}{c_{s,i}}\qquad(c_{s,i}>0\ \text{のセル})
+\]
+で判定する。現メッシュは現在の \(c_s\) を使い、候補セルは重なる現メッシュのセルの \(c_s\) の最大値を使う（remap が候補セルをそれらから埋めるので保守的な見積り）。\(\Delta t_{ac}^{cur}/\Delta t_{ac}^{cand}\) が `candidate_dt_penalty_max` を超える候補は棄却する（`DtPenaltyTooLarge`）。cadence だけで発火した試行は、`enable_benefit_gate=True` のとき \(\Delta t_{ac}^{cand}/\Delta t_{ac}^{cur}\ge\) `benefit_min_dt_gain` を要求し、未満は棄却する（`BenefitTooSmall`）。品質と min-width floor のトリガはメッシュの欠陥への対処なので効果判定の対象外で、dt ペナルティだけを受ける。それまで品質トリガは `candidate_dt_penalty_max` を隣接セル幅比の閾値に流用し、効果判定と dt ペナルティのパラメータは読み込むだけで評価しておらず、`min_steps_between_ale` による skip を `BenefitTooSmall` と表示していた。
+
 **min-width floor モード（2026-08-07、experimental-incomplete）**：
 `numerics.ale1d.min_width_floor`（既定 `enabled=False`）は、最小セル幅が
 `floor_cm` を下回ったステップで sensor/monitor 経路を経ずに直接候補を構築する
@@ -15213,7 +15411,7 @@ remap_v3・速度射影・保存則ゲート・commit）は monitor 経路と共
 
 **再トリガ cooldown（2026-08-10）**：`retrigger_cooldown_steps`（int、
 既定 0、`>=0`）は、floor トリガ由来の rezone 試行が理由を問わず適用されなかった
-（no_relief・候補棄却・保存則棄却・benefit gate 棄却等）直後から、以後 N step の
+（no_relief・候補棄却・dt ペナルティ棄却・保存則棄却等。floor トリガの試行は効果判定の対象外）直後から、以後 N step の
 あいだ floor トリガの評価自体（node 座標の host 転送と最小幅スキャンを含む）を
 スキップする。cadence/quality トリガは影響を受けず、いずれかの経路で rezone が
 適用されたら cooldown は 0 にリセットされる。カウンタは in-memory の driver 状態
@@ -15422,21 +15620,37 @@ For \(N_{\rm ramp}=2\), \(\phi(0)=0\), \(\phi(1)=0.5\), and \(\phi(d\ge2)=1\). R
 
 After the high-order attempt, each field is checked for positivity and local boundedness. Mass, material component mass, and radiation are checked as densities; electron/ion energies are checked as recovered specific energies after the conservative energy and mass remaps. If a field fails and `fallback_to_first_order_on_bounds_fail=True`, that field is recomputed with \(\phi=0\). For electron/ion energy fallback, the recovered specific energy uses a mass denominator from the same first-order donor remap; if the high-order mass candidate had passed its own bounds, mass is recomputed with \(\phi=0\) before the specific-energy fallback is accepted. If the fallback still fails, remap returns `ConservationRejected`. Scratch diagnostics record the cells/fields that required fallback. `high_order_enabled=False` directly selects the Week 4 first-order donor path.
 
-The remapped conserved quantities are mass \(m_i\), material masses \(m_if_{i,m}\), electron and ion material energies \(m_ie_{e,i}\), \(m_ie_{i,i}\), and radiation group energies \(V_iE_{g,i}\). Scratch outputs store \(m_i^n\), \(V_i^n\), normalized \(f_{i,m}^n\), specific \(e_{e,i}^n,e_{i,i}^n\), and radiation energy densities \(E_{g,i}^n\). This function is a two-phase operation: it reads `State` and `r_candidate`, writes only `Ale1dRemapScratch`, and does not mutate mesh or physics state. The driver then projects velocity into `Ale1dVelocityProjectScratch`, computes hard diagnostics, and only on acceptance commits `x_r`, mass, energies, radiation energy density, volume fractions, and nodal velocity, followed by boundary application, geometry/rho refresh, EOS reclosure, and transient source/viscosity invalidation.
+The remapped conserved quantities are mass \(m_i\), material masses \(m_if_{i,m}\), electron and ion material energies \(m_ie_{e,i}\), \(m_ie_{i,i}\), and radiation group energies \(V_iE_{g,i}\). Scratch outputs store \(m_i^n\), \(V_i^n\), normalized \(f_{i,m}^n\), specific \(e_{e,i}^n,e_{i,i}^n\), and radiation energy densities \(E_{g,i}^n\). This function is a two-phase operation: it reads `State` and `r_candidate`, writes only `Ale1dRemapScratch`, and does not mutate mesh or physics state. The driver then projects velocity into `Ale1dVelocityProjectScratch`, computes hard diagnostics, and only on acceptance commits `x_r`, mass, energies, radiation energy density, volume fractions, and nodal velocity, followed by boundary application, geometry/rho refresh, EOS reclosure, and transient source/viscosity invalidation. The EOS reclosure and the cell sound speed are the hydro's closure of the committed fields (`Hydro1D::close_eos_and_sound_speed`: the 1T or 2T closure of §3.1 with every EOS backend and the per-cell material properties rebuilt after the volume-fraction remap), i.e. the state the next Lagrangian step's entry closure produces. 2026-09-23: the ALE had its own per-species reclosure, which closed 1T runs with the 2T formulas (\(T_i\) at the floor with \(c_{v,i}T_{floor}\) put into \(e_i\) and booked as a floor injection, \(T_e=e/c_{v,e}\), \(c_{v,e}\) without the ion part) and raised table energies below the temperature floor to \(e(T_{floor})\) where the hydro's energy-authoritative closure keeps them.
 
-Velocity projection is also two-phase. From old nodal velocities and old cell masses,
+Velocity projection is also two-phase and uses the half-index-shift method (Benson 1992, §3.5.5). Each cell carries the velocities of its two nodes,
 \[
-u_i^o=\frac{1}{2}(v_i^o+v_{i+1}^o),\qquad p_i^o=m_i^o u_i^o.
+\psi^L_i=v_i^o,\qquad \psi^R_i=v_{i+1}^o,
 \]
-The already remapped mass \(m_i^n\) is reused. Cell momentum \(p_i^o\) is remapped with the same swept volumes, donors, and mass \(\phi_j\), then
+as specific quantities advected with the accepted face mass fluxes \(F_j\) of the mass remap (\(m_i^n=m_i^o+F_{i+1}-F_i\); `Ale1dRemapScratch::mass_flux`, zero at pinned faces and the domain ends). For each field the donor cell carries a limited linear reconstruction in the mass coordinate,
 \[
-u_i^n=p_i^n/m_i^n.
+s_i=\operatorname{minmod}\left(
+\theta\frac{\psi_i-\psi_{i-1}}{\tfrac12(m_{i-1}+m_i)},
+\frac{\psi_{i+1}-\psi_{i-1}}{\tfrac12m_{i-1}+m_i+\tfrac12m_{i+1}},
+\theta\frac{\psi_{i+1}-\psi_i}{\tfrac12(m_i+m_{i+1})}
+\right),
 \]
-Interior node velocities are mass-weighted,
+scaled so that the values at the cell's two faces stay inside the neighbours' range (\(\theta=\) `limiter_theta`; boundary cells and cells next to a face with \(\phi=0\) use \(s_i=0\)). The value on the mass swept through face \(j\) is the donor's reconstruction at the centroid of that mass,
 \[
-v_j^n=\frac{m_{j-1}^n u_{j-1}^n+m_j^n u_j^n}{m_{j-1}^n+m_j^n},\qquad 1\le j<N,
+\psi_j^{\rm sw}=\psi_d+\phi_js_d\delta_j,\qquad
+\delta_j=\begin{cases}
+\tfrac12(F_j-m_d^o), & F_j>0,\ d=j,\\
+\tfrac12(m_d^o+F_j), & F_j<0,\ d=j-1,
+\end{cases}
 \]
-with \(v_0^n=0\) at the spherical center and \(v_N^n=u_{N-1}^n\) before the boundary kernel is applied. The diagnostic kinetic energy drift uses
+and the conservative update \(m_i^n\psi_i^n=m_i^o\psi_i^o+F_{i+1}\psi_{i+1}^{\rm sw}-F_i\psi_i^{\rm sw}\) is evaluated as
+\[
+\psi_i^n=\psi_i^o+\frac{F_{i+1}(\psi_{i+1}^{\rm sw}-\psi_i^o)-F_i(\psi_i^{\rm sw}-\psi_i^o)}{m_i^n},
+\]
+which keeps a uniform field exactly uniform. The new node velocities are the mass-weighted means of the two adjacent cells' values,
+\[
+v_j^n=\frac{m_j^n\psi^{L,n}_j+m_{j-1}^n\psi^{R,n}_{j-1}}{m_j^n+m_{j-1}^n},\qquad 1\le j<N,
+\]
+with \(v_0^n=0\) at the spherical center and \(v_N^n=\psi^{R,n}_{N-1}\) before the boundary kernel is applied. Without transport the projection returns the old velocities exactly, a uniform velocity over any density stays uniform (DeBar's consistency condition), and the nodal momentum \(\sum_jM_jv_j=\tfrac12\sum_im_i(\psi^L_i+\psi^R_i)\), \(M_j=\tfrac12(m_{j-1}+m_j)\), is conserved (the center node is set to rest). 2026-09-23: this replaces a cell-momentum projection (\(p_i=m_i(v_i+v_{i+1})/2\) remapped with its own momentum-density reconstruction, \(v_j^n=(p_{j-1}^n+p_j^n)/(m_{j-1}^n+m_j^n)\)), which averaged node \(\to\) cell \(\to\) node and so smoothed any non-uniform velocity and removed kinetic energy even when no face moved (the inversion error of Benson 1992, §3.5.3). The diagnostic kinetic energy drift uses
 \[
 K=\sum_j\frac{1}{2}m_j^{node}v_j^2,\qquad
 m_j^{node}\approx\frac{1}{2}(m_{j-1}+m_j),
@@ -15457,7 +15671,9 @@ omitting missing neighbor masses at the domain ends, and reports \(|K^n-K^o|/K^o
 \(\xi\) は Braginskii の \(\gamma_0(Z)\)（3.16, 4.9, 6.1, 6.9, …, 12.5）の
 Epperlein–Short 型補間で、全次元・全経路（1D/2D・per-material・SNB 基底流束・
 persistent loop）に常時適用される（user 裁定 2026-07-30 — 固定係数経路は削除、
-namelist `spitzer_z_correction` は deprecated no-op、"off" はエラー）。
+namelist `spitzer_z_correction` は deprecated no-op、"off" はエラー）。2026-09-23 是正: 2D の
+Kershaw 係数・材料別経路（§4.1.1）・材料別の Dirichlet 境界・公開 API `conduction::spitzer_conductivity`
+は \(\xi\) の無い別定義の式を使っていた。現在は全経路が同じ式（`conduction_bodies.cuh`）を使う。
 charge-moment 表（§1.1.3a）併用時は衝突電荷 \(\bar Z r_2\) に対して評価する。
 ここで \(\bar{Z}\) は平均電離度（§1.1.4）。
 固定モデルでは \(\bar{Z} = Z\)（原子番号）。Thomas-Fermi/テーブルモデルでは §1.1.4 の \(\bar{Z}\) を使用する。
@@ -15682,6 +15898,10 @@ ctest `C1 Zel'dovich-Raizer thermal-wave gate is production-level` は
 `numerics.materials.per_material_conservation_enabled=true` かつ hydro EOS context が利用可能な場合、
 電子熱伝導は材料ごとの電子エネルギー \(E_{e,c,m}\) を直接更新する。従来の単一材料/disabled 経路は
 従来 kernel を使い、bit-exact disabled invariant の対象として残す。
+材料別保存は 2D_RZ 専用である（1D_SPH では ConfigError。1D の流体・レーザー・輻射・燃焼は材料別
+エネルギーを更新しないため — 2026-09-23）。解の後は材料別エネルギーの和から \(e_e\) を、材料別 EOS から
+\(T_e\)・\(P_e\) を導出し、ドライバは伝導の増分を \(e_e\) に再計上しない（2026-09-23 是正 — 旧実装は
+エネルギー主体の表 EOS でドライバが \(c_{v,old}\Delta T_e\) を重ねて加え、伝導エネルギーを二重に計上していた）。
 
 1D face \(f=(L,R)\) では、材料 \(m\) の面体積率を
 \[
@@ -15696,9 +15916,10 @@ n_{e,f,m}=\rho_{f,m}\bar Z_m/(A_m m_p),\qquad
 \]
 を評価し、
 \[
-\kappa_{SH,f,m}=\kappa_0\,T_{e,f,m}^{5/2}/(\bar Z_m\ln\Lambda_{f,m})
+\kappa_{SH,f,m}=\kappa_0\,\xi(\bar Z_m)\,T_{e,f,m}^{5/2}/(\bar Z_m\ln\Lambda_{f,m})
 \]
-を得る。Flux limiter は集約後ではなく材料ごとに適用する：
+を得る（\(\xi\) は §4.1）。\(\bar Z_m\) は材料ごとの一定値（固定 zbar モデルならその値、それ以外は材料の Z）で、
+材料別の EOS・人工粘性と同じ約束である（表形式・TF の電離度は材料別には評価しない）。Flux limiter は集約後ではなく材料ごとに適用する：
 \[
 q_{SH,f,m}=-\kappa_{SH,f,m}\nabla T_{e,f,m},\qquad
 q_{\max,f,m}=f_{lim}n_{e,f,m}k_BT_{e,f,m}v_{th,e}(T_{e,f,m}),
@@ -16185,6 +16406,21 @@ w_{i+1/2} = A_{i+1/2}\,\kappa_{i+1/2}\,\phi_{i+1/2}/\Delta r_{i+1/2}
 GPU 上では cuSPARSE の cyclic-reduction ベース直接解法 `cusparseDgtsv2`
 でこの系を解く。
 
+**セル比熱と伝導後の記帳（2026-09-23）**：\(c_{v,e,i}\) は EOS 閉包が保持する
+`state.cv_e` が正ならその値、非正なら理想気体の値
+\(\bar Z_i e/(A_i m_p(\gamma_i-1))\)（\(A_i,\gamma_i\) はセルの実効質量数と比熱比）
+とする（`conduction_solve_cv_e`。STS の有効拡散係数経路と 2D_RZ の同経路、理想気体
+EOS 同期も同じ関数を使う）。表の比熱が非正になるのは、低温平衡の比熱
+\(c_{v,\rm base}-T\,w''\,C\) が遷移域で負になり閉包がそれを 0 に切り上げたセルなどである。
+energy-authoritative の伝導後の記帳 `apply_conduction_energy_increment`（device / host）は
+同じ関数・同じ入力（捕捉した `state.cv_e`、\(\bar Z\)、\(\gamma_{\rm eff}\)、
+\(A_{\rm eff}\)）で
+\(e_{e,i}\leftarrow e_{e,i}+c_{v,e,i}(T_{e,i}^{n+1}-T_{e,i}^{n})\) とし、解法が動かした
+エネルギーをそのまま記帳する。2026-09-23 までは記帳側が非正のセルで
+\(\max(c_v^{\rm table}(T^n),0)\)（多くは 0）を掛けていたため、解法がそのセルへ運んだ熱が
+台帳に載らなかった。材料別保存の経路（§4.1.1）は非正のセルを熱容量 0 として扱い
+温度を動かさないので、記帳の比熱によらず増分は 0 になる。
+
 **2D_RZ（`conduction.solver="hypre"`）**：
 
 **陰的定式化（backward Euler）**：
@@ -16545,6 +16781,20 @@ n_{crit} = \frac{m_e \omega_L^2}{4\pi e^2} \quad [\text{cm}^{-3}]
 
 > 将来拡張：ターンニングポイントでの鏡面反射など（v1.0ではしない）。
 
+**反射モード（`critical_handling.terminate=False`、2026-09-24、特性曲線積分 §5.3.6 のみ — その既定）**:
+レイは臨界半径（\(\hat n_{raw}=1-\varepsilon_{crit}\)）で終了せず、そこで反射して（転回点と同じ扱い、
+RA は \(b=B\) で 1 回）同じ区間を外向きにたどる。臨界層の解析的尾部閉包（§5.4.4）は使わず、
+臨界半径までの吸収は特性曲線の求積で計算する（\(\hat n_{raw}\in[1-\varepsilon_{crit},1]\) の薄層の
+光学厚、層全体の \(O(\sqrt{\varepsilon_{crit}})\) は含まない）。`terminate_mode="deposit"` とは併用不可
+（ConfigError）、行進（`integrator="leapfrog"`）では ConfigError。既定の `terminate=True` では、
+閉包は入口から臨界密度までの片道の光学厚だけを吸収し、残りは外向きの経路を通らずに未吸収となる
+（臨界層の手前で転回するレイは往復とも追跡される）。そのため吸収が衝突径数と閉包の入口区間で
+不連続に変わり、GXII（`gxii_1d_fld_regression`）では最初の 50 ps で 1 step ごとに吸収効率が
+0.06 と 0.98 の間を往復した（時間刻みの上限を 1/40 にしても残る）。反射モードでは同じ区間の往復が 0.002 以下になり、全吸収は
+0.924 → 0.937、保存誤差の最大は 7.0e-3 → 1.6e-3。残る段差（0.1〜0.17、2 ns で数回）は臨界半径の
+移動に伴うレーザー格子の作り直し（`LaserMesh1D` の節点の変更）と一致する。`terminate=False` は
+2026-09-24 までは受理されて無視されていた。
+
 #### 5.2.1 v1.0 で扱わない物理（Non-goals）
 以下はv1.0のスコープ外であり、実装しない。将来バージョンでの拡張候補として記録する：
 - **共鳴吸収**（resonance absorption）：臨界面での電場共鳴による吸収。v1.0はIBのみ
@@ -16771,12 +17021,38 @@ Z^0 \leftarrow Z^0 + v_Z s_{entry}
 \(r^0 \le r_{max}\) を再確認できない場合、または上記条件を満たす root が存在しない場合は、
 そのレイは profile に入らないものとして未吸収終了する。
 
+**1D_SPH の行進中 vacuum→物質 entry hand-off（2026-07-31）**：
+mesh 内部にも真空区間（\(\kappa=0,\ \hat\nabla\hat n=0,\ \hat n_{raw}=0\)）が
+ありうる。純真空セグメントはどのステップメトリクスにも拘束されず（全メトリクス
+のスケール量が 0）、粗い真空ノード由来の長大ストライドが物質面を盲目的に
+跨ぎうる（実測: 0.01 cm シェルに対し 0.35 cm ストライド — セグメント定数
+（始点区間の \(\kappa, g\)）が真空値のままシェル内 \(\hat n\ 0\to0.037\) を
+無キック・無吸収で通過し、角運動量保存の下で転回が \(\hat n\) 換算 0.027
+浅くなる）。純真空セグメントは厳密に直線なので、最外物質ノード半径
+\(r_{surf}\)（\(\hat n_{raw}>0\) の最外ノードの外側隣接ノード）との弦-球面
+交差を上記と同形の 2 次方程式で厳密に解き、\(t_{stop}\) をそこで打ち切る。
+着地点はノード上で locate が曖昧になるため、位置ナッジではなく**次セグメント
+の carried 区間を物質側区間に明示的に固定**する（\(t=1\) の区間上端 =
+表面ノード。補間される停止点物理量は不変で、次セグメントの
+\(\Delta s_{base},\ \hat\nabla\hat n,\ \kappa\) が物質側になる）。真空側は
+\(g=0\) のため Verlet の打ち切りキック過剰も生じない。この打ち切り
+（\(t_{stop}<1\)）は終端イベントではなく行進を継続し、次のステップは交点
+（打ち切った停止点）から始める。直線の真空区間なので速度は位置更新前の値のまま
+とし、全ステップの軸反射が交点より後で起きていれば反射を戻す。真空の打ち切り
+ステップの後半キックは真空側の片側の力（0）で完了し、次ステップ冒頭の完了キック
+は行わない（`ds_prev = 0`。carried 区間を物質側に固定した後に物質側の勾配で
+完了すると \(0.25\,\Delta s_{vac}\,|d\hat n/dr|\) の非物理的なキックになり、長い
+真空ストライドの後に急な表面層へ入るレイを反転させていた）
+（2026-09-23。それまでは区間・停止点物理量だけを表面へ固定し、レイの位置は
+打ち切り前の終点のままだったため、表面からその終点までの物質（最大で真空
+ストライド 1 回分）を無吸収で飛び越えていた）。
+
 > **注意**：`ds_adapt_max_factor = 1.0` に設定すると適応は無効化され、
 > 全ステップで \(\Delta s_{cur} = \Delta s_{base}\) となる。
 > 既存の検証テスト（Beer-Lambert、屈折等）はこの設定で参照解と比較する。
 
 **RK2（Velocity-Verlet、将来拡張）**：
-`raytrace.integrator="rk2"` は将来版予約。**v1.0では未対応** であり、指定時は ConfigError とする。
+`raytrace.integrator="rk2"` は未実装であり、指定時は ConfigError とする（受け付ける値は `"auto"`・`"leapfrog"`・`"characteristic"`、§5.3.6）。
 \[
 \hat{\mathbf{r}}^{n+1} = \hat{\mathbf{r}}^n + C_{ray}\,\hat{\mathbf{v}}^n - \frac{C_{ray}^2}{4}\hat\nabla\hat n(\hat{\mathbf{r}}^n)
 \]
@@ -16786,7 +17062,7 @@ Z^0 \leftarrow Z^0 + v_Z s_{entry}
 精度2次、Leapfrogのシンプレクティック性を持たないが、半ステップ速度が不要。
 
 **RK4（古典4段、将来拡張）**：
-`raytrace.integrator="rk4"` は将来版予約。**v1.0では未対応** であり、指定時は ConfigError とする。
+`raytrace.integrator="rk4"` は未実装であり、指定時は ConfigError とする。
 状態ベクトル \(\mathbf{y}=(\hat{\mathbf{r}}, \hat{\mathbf{v}})\) に対し：
 \[
 \mathbf{k}_1 = h\,\mathbf{f}(\mathbf{y}^n),\quad
@@ -16987,6 +17263,163 @@ block の**固定形状 tree reduction**（atomics 不使用・run 反復 bit �
 bit 同一（5 case / 133 assertions PASS 2026-08-04）+ 3step フル A/B
 （march 比の吸収・バング・ρ_peak 一致 — 実測値はコミット時点の
 VERIFICATION 記録を正とする）。
+
+#### 5.3.6 1D_SPH の特性曲線積分（`raytrace.integrator="characteristic"`、2026-09-24）
+
+1D_SPH の `mode="raytrace_2d"` で `Laser.raytrace.integrator="characteristic"`
+（既定の `"auto"` はここで `"characteristic"` になる。§5.3.2 の行進は
+`"leapfrog"` で選ぶ）のとき、§5.3.2 の行進（`ray_trace_1d_sph_body`）に代えて、各レイを特性曲線に
+沿って区間ごとに積分する（`ray_trace_1d_characteristic_body`、
+`src/laser/ray_trace_characteristic.cuh`）。媒質（`radial_n_hat`・
+`radial_n_hat_raw`・`radial_smooth_kappa`・`radial_T_e` は §5.7.4 の断面節点間で
+\(r\) に線形）、発射・事象の規約、出力（セル沈着・unabsorbed・尾部閉包・
+臨界到達・CBET 記録・hot-electron 捕獲行・RA・軌跡・\(\tau\) 診断）は行進と同じである。
+
+**(a) 保存量と求積式**：§5.3.2 の \(d\hat{\mathbf r}/d\xi=\hat{\mathbf v},\;
+d\hat{\mathbf v}/d\xi=-\hat\nabla\hat n/2\)（\(|\hat{\mathbf v}|^2+\hat n=1\)）は
+球対称場で角運動量 \(B=|\mathbf r\times\mathbf v|\) を保存する。
+\(\varepsilon=1-\hat n\)、\(Q(r)=r^2\varepsilon(r)-B^2\)（経路上 \(Q\ge0\)）として
+\[
+\frac{ds}{|dr|}=\frac{\sqrt{\varepsilon}\,r}{\sqrt{Q}},\qquad
+\frac{d\phi}{|dr|}=\frac{B}{r\sqrt{Q}},\qquad
+d\tau=\kappa_{IB}\,ds
+\]
+（\(\phi\) は子午面の極角。\(d\phi/d\xi=-L/r^2\)、\(L=R v_Z-Z v_R\)）。
+\(B\) は入射点で速度を \(|\hat{\mathbf v}|=\sqrt{1-\hat n}\) に合わせた後の
+\(|R v_Z - Z v_R|\)（真空入射では衝突径数）。
+
+**(b) 区間分割と事象**：経路は次の点で区切る — レーザー半径節点、hydro セル面、
+critical-adjacent 分割半径、事象半径。各区間は 1 つの hydro セルに収まるので、
+沈着はそのセルへ直接入る（行進の中点帰属 — 面をまたぐステップの全吸収を
+中点のセルへ置く — は生じない）。内向き leg の事象は区間ごとに:
+転回点（区間で 3 次式となる \(Q\) の最大根。\(r>0\) で \(Q'=0\) は
+\(r^*=2(1-n_0)/(3n_1)\) のみなので括弧内の根は一意。二分法＋安全化 Newton）、
+臨界（\(\hat n_{raw}=1-\varepsilon_{crit}\) の線形交点）、中心（\(B=0\)。
+\(\phi\leftarrow\phi+\pi\) で反対側へ抜ける）。入射時・区間入口で
+\(Q\le0\)（接線入射）なら、その点で転回する。外向き leg は同じ区間を
+プロファイル端まで戻る。
+
+**(c) 求積**：区間 \([a,b]\) の \(\Delta s,\Delta\phi,\tau\) を適応
+Gauss–Kronrod (3, 7) で求める。転回点を含む区間は
+\(u=\sqrt{r-r_t}\)（\(r_t\) = 転回点）、転回点に近い内向き区間は
+\(Q\) の Newton 外挿根 \(r_0=a-Q(a)/Q'(a)\)（\(a-r_0<b-a\) のとき）を使った
+\(u=\sqrt{r-r_0}\) を変数とし（\(1/\sqrt Q\) の特異性が正則な被積分関数になる）、
+外向き leg の区間は \(r_t\) と区間自身の \(r_0\) のうち区間の入口 \(a\) に近い方を
+中心にする（2026-09-25。転回点を傾きの小さい区間で過ぎたレイでは、次の区間の入口で
+\(Q\) がまだ 0 に近く、そこから \(Q\) が急に増えるので、遠い \(r_t\) を中心にすると
+\(1/\sqrt Q\) がほぼ特異のまま残る — GXII の臨界層で \(r_t\) が \(a\) の
+\(6\times10^{-6}\) cm 下、\(r_0\) が \(1.6\times10^{-10}\) cm 下の区間がパネルの上限に達し、
+300 ステップで 63 区間が上限で受け入れられていた。修正後は 0 区間、GXII のエネルギー量の
+変化は相対 \(2\times10^{-7}\) 程度）。それ以外は \(r\) を変数とする。パネルは \(|K_7-G_3|\) が 3 量それぞれで
+（区間全体の \(K_7\) の \(10^{-7}\) 倍、\(\phi\) と \(\tau\) は絶対値
+\(10^{-12}\) を下限とする）許容誤差のパネル幅比例分以下になるまで二分する
+（深さ 20・64 パネルが上限。上限で受け入れた区間は数えて警告する：
+`DeviceErrorFlags::unresolved_quadrature`）。\(|K_7-G_3|\) は \(G_3\) の誤差の目安で、
+受け入れた \(K_7\) 自体の誤差はずっと小さい。\(\kappa_{IB}\) は §5.4 の
+`compute_kappa_from_smooth`（`test_kappa` 指定時は定数）。Langdon 因子
+（§5.4.5、`langdon_model`）は通過する区間ごとに、その区間で吸収が起こる位置
+— 求積変数（\(u\) または \(r\)）の光学的厚さ重み付き平均 \(\bar x\) —
+の半径と、そこでの極角（区間入口の \(\phi\) から \(\Delta\phi\) を求積変数で
+線形に配分した値）での \(R_{cyl}=r|\sin\phi|\) の真空写像強度と \(T_e\)（線形）で
+評価し、その区間の \(\tau\) に掛ける（転回点を含む区間では吸収が転回点側に
+偏るので、中点での評価より正確）。
+区間ごとに \(\Delta P=-I\,\mathrm{expm1}(-\tau)\)、\(I\leftarrow I-\Delta P\)。
+
+**(c') 並列化**：区切り点（半径節点・\((0,r_{max})\) 内の hydro セル面・分割半径）は
+全レイで共通なので、トレースごとに GPU 上で 1 回だけ昇順の区間表
+（`CharacteristicPieces`: 区切り点、区間ごとの半径区間とセル）を作る
+（各点の順位を二分探索で求めて書き込む。等しい値は節点・面・分割半径の順で、
+その間は長さ 0 の区間になる）。1 レイを \(L\) レーン（\(L\in\{32,64,128,256\}\)。
+\(L>32\) では同じブロックの \(L/32\) 個の warp が組になる）で追跡し、経路に沿った
+\(L\) 区間ずつ処理する。各レーンが 1 区間を担当し、出力に依らない
+量（入口検査・尾部閉包の判定・内向き事象・求積・Langdon 因子・吸収率）を
+並列に求める。続いて組の中の走査で、各区間入口の極角（前置和）と出力
+（透過率の前置積）を求め、最初の事象でその塊を打ち切り、沈着・
+\(\tau\) 診断・CBET 記録を同じセルの連続区間ごとの区分和で 1 レーンが書く。
+走査は warp 内のシャッフル走査で、\(L>32\) では warp ごとの結果を共有メモリに置いて
+warp の順に結合する（組ごとの名前付きバリア `bar.sync` で同期し、区分和は塊の
+先頭の warp から後ろへ繰り越す）。
+leg を終える事象（転回・中心・臨界・尾部閉包・下限出力・上限回数）は全レーンが
+同じ値で処理し、レーン 0 が書く。
+
+\(L\) は `Laser.raytrace.lanes_per_ray` で与え、既定の 0 では起動側がレイ数と GPU から
+決める（2026-09-25）: 各 \(L\) の核関数の実体について、GPU が同時に常駐させられる
+スレッド数 \(N_{res}(L)\)（占有率 API の SM あたり常駐ブロック数 × SM 数 × ブロックの
+スレッド数）を求め、そのバッチのレイ数 \(N_{ray}\) が \(N_{ray}L\le N_{res}(L)\) を満たす
+最大の \(L\in\{256,128,64\}\)、どれも満たさなければ 32 とする。レイが全部同時に常駐する
+範囲で、1 レイが順に通る塊の数を減らす（レイが常駐数を超えると数回に分けて走るので、
+レーンを増やしても速くならない）。RTX 4090 の GXII FLD 後半（1.85 ns から 100 ステップ）では
+250 本で \(L=128\) が選ばれトレースは 1.48 → 0.84 ms/step（32 → 自動）、1000 本では
+\(L=32\) のまま（64 は同等、128・256 は遅い）。和と積の結合順が \(L\) で変わるので、
+結果の丸めは \(L\) による。同じレイ数・同じ GPU なら選択は毎ステップ同じで、run の反復は
+bit で一致する。別の種類の GPU や別のレイ数では \(L\) が変わりうるので、別の GPU と bit で
+比べるときは `lanes_per_ray` を固定する。常駐ループは 32 レーン形で追跡するので、
+多カーネル経路と和と積の結合順が同じになるのは \(L=32\) のとき（1 レーン形は同じ算法の逐次形で、
+和と積の丸め順だけが異なる）。
+
+**(d) 行進との対応（互換規約）**：
+- 臨界層の解析的尾部閉包（§5.2、`try_tail_closure_1d`）は行進と同じ判定と入力
+  （\(\hat n_{raw}\ge0.5\)・方向・到達ギャップ・帯域 \(1-\hat n_{raw}<A/g\)）を
+  各区間の入口で評価する（行進は各ステップの入口）。臨界を横切る区間では、
+  行進と同じく staged hot-electron 捕獲を区間入口の出力で適用してから
+  判定なしの閉包を試み、閉包しなければ臨界半径まで吸収して終了する
+  （`record_critical_surface_hit`）。線形層・垂直入射では閉包は解析積分と一致する
+  ので、全吸収は 16/15 則（\(\tau=(16/15)A/|d\hat n/dr|\)）に一致する。
+  `critical_handling.terminate=False`（§5.2 の反射モード）では閉包を評価せず、臨界を横切る
+  区間は臨界半径まで吸収してそこで反射し、外向きの最初の区間は始点（臨界半径上）の
+  臨界判定を省く。
+- hot-electron 捕獲は閾値の上向き交点（線形 \(\hat n_{raw}\) の厳密な交点半径）で、
+  交点までの吸収後の出力を記録する。径方向の方向余弦は
+  \(\mu=\pm\sqrt{Q}/(r\sqrt\varepsilon)\)。
+- RA（§5.4.5 (d)、`compute_ra_event_fraction`）は転回点で \(b=B\) として 1 回
+  （行進は最初の外向きステップで \(b_{eff}=\sqrt{1-\hat n}\,r\approx B\)）。
+- 作業量（`n_steps`、ステップ統計と `max_steps` の上限）は区間数＋追加パネル数。
+  転回点への接近で増えないため、ホスト側のレイ並べ替えと動的上限
+  （行進専用）は使わない。
+- 決定論: \(L\) を決めれば各レイの計算順は固定で、行進と同じレイ別集計と固定順縮約を使う
+  （run 反復で bit 同一。\(L\) の選び方は (c')）。常駐ループ（persistent loop）でも同じ本体
+  （32 レーン形）を使う。
+
+**(e) 検証**（`tests/laser/test_ray_trace_characteristic.cu`）: 一様媒質の弦
+（\(\tau=2\kappa\sqrt{r_{max}^2-b^2}\) と出口点）、折れ線プロファイルの放射状
+レイ（区間ごとの解析積分）、転回するレイの \(\tau\)・出口点・セル別沈着を
+独立な参照解（\(\xi\) 形式のレイ方程式をホストで Dormand–Prince 5(4)、
+全区切り点に着地）と比較、細かい行進への収束、16/15 則、hot-electron 捕獲行、
+run 反復 bit 同一、CBET 記録（\(\sum ds\)・\(\sum S\)・セル訪問順）、接線入射、
+反射モードの往復吸収（臨界半径より外側の区間ごとの解析積分の 2 倍、入射側から出る）。
+hot-electron 捕獲・CBET 記録・run 反復の各試験は \(L=32,64,128,256\) のすべてで行い、
+1 レーン形（同じ算法の逐次形）と起動側の選んだ \(L\) のトレースが丸め誤差の範囲で一致する
+ことも確かめる（`lanes_per_ray` 0・32・64・128・256）。
+
+**(g) 1D の円柱・平板（`Mesh.geometry_1d="cylindrical"`・`"planar"`、2026-09-24）**：
+円柱（軸は lab z）では断面内の位置 \((R,Z)\)、\(r=\sqrt{R^2+Z^2}\) を追跡し、断面内の角運動量
+\(B=|Rv_Z-Zv_R|\) と軸方向速度 \(V\)（`RayArray1D::vA0`）が保存される：
+\(Q(r)=r^2(\varepsilon-V^2)-B^2\)、\(ds/|dr|=\sqrt\varepsilon\,r/\sqrt Q\)、
+\(d\phi/|dr|=B/(r\sqrt Q)\)。平板（法線は lab z、高さ \(x\)、内側の壁 \(x_{min}\)）では横方向
+速度 \(V\)（面内の \(v_R\) と面外の \(v_A\) の合成）が保存され、\(Q(x)=\varepsilon-V^2\)
+（区間で 1 次）、\(ds/|dx|=\sqrt\varepsilon/\sqrt Q\)、極角の代わりに横ずれ
+\(dy/|dx|=V/\sqrt Q\) を積分する。球はこれらの \(V=0\) の場合で、式も丸めも従来と同じ。
+転回点: 円柱は \(e_0=1-V^2-n_0\) とした 3 次式（\(r^*=2e_0/(3n_1)\)）、平板は 1 次式の根。
+事象: 円柱は球と同じ（\(B=0\) なら中心を抜ける）、平板は内側の壁（流体の固定壁 = 鏡面）で反射
+（\(Q>0\) なので正則化根なし、横ずれはそのまま続く）。区間表の区切り点は \((x_{min},r_{max})\) 内の
+hydro 面。RA（§5.4.5）の \(b\)（\(b/r_{crit}\) が臨界での真空入射角の正弦）は円柱
+\(b=\sqrt{B^2+V^2 r_{crit}^2}\)、平板 \(b=V r_{crit}\)。hot-electron 捕獲の方向余弦は
+\(\mu=\pm\sqrt Q/(g\sqrt\varepsilon)\)（\(g=r\)、平板は 1）。軌跡出力は円柱が断面の
+\((|r\sin\phi|, r\cos\phi)\)、平板が（横ずれ, 高さ）。Langdon 因子（§5.4.5）の真空写像は
+球面上の円形ビームの強度なので球でのみ使い、他の幾何では builder が `langdon_model` を無効にする
+（`auto` は off、明示指定は ConfigError）。行進（`integrator="leapfrog"`）は球のみで、円柱・平板は
+特性曲線積分を要求する（`auto` は特性曲線積分、`leapfrog` は ConfigError）。常駐ループは球のみ。
+沈着はセルごとのパワーで、流体の体積（円柱は単位長さ、平板は単位面積あたり）と同じ単位になる
+（ビームの `power` は円柱で単位長さ、平板で単位面積あたり: `radial_absorption_1d` と同じ解釈）。
+検証（`tests/laser/test_ray_trace_characteristic.cu` の `[geometry_1d]`）: 軸方向速度 0 の円柱の
+追跡が球と bit 一致、一様媒質の円柱で軸方向速度をもつ直線路（\(\tau=2\kappa\sqrt{1-b^2}/\cos\chi\)）、
+一様な平板の壁での反射（\(\tau=2\kappa/\cos\theta\)、面外速度成分を含む）、平板の線形層の斜入射で
+32/15 \(\cos^5\theta\) 則（往復 \(\tau=2(A/n_c)(16/15)\cos^5\theta\)）。
+
+線形場（区間ごとの \(\hat n\)、\(\hat n_{raw}\)、IB 係数、\(T_e\)）は区間の始点基準
+\(f(r)=v_0+s(r-x_0)\) で評価する（2026-09-24）。切片形 \(f_0+f_1 r\) は \(|f_1 r|\) 倍の
+丸め誤差を失い、\(r=0.01\) cm の幅 \(2\times10^{-17}\) cm の断面区間で \(\hat n\) に
+\(10^{-3}\) の誤差を生じて転回点・臨界の判定と求積を壊していた（GXII の S_N デッキ）。
 
 ### 5.4 逆制動輻射吸収（IB）
 
@@ -17193,8 +17626,8 @@ supercritical node への leak を防ぐため、2D_RZ では §5.5 と同様に
 
 #### 5.4a Radial absorption 1D integral (`radial_absorption_1d` mode)
 
-`Laser.mode="radial_absorption_1d"` は 1D_SPH 専用の球対称 1D 積分である。
-球殻面に垂直な inward radial flux を仮定し、z軸平行光でも現行 R-Z 2D レイトレーシングでもない。
+`Laser.mode="radial_absorption_1d"` は 1D_SPH（`Mesh.geometry_1d` の球・円柱・平板）の 1D 積分である。
+殻面（円柱面・平板面）に垂直な inward radial flux を仮定し、z軸平行光でもレイトレーシングでもない。
 
 各ビームの時刻 \(t\) のパワーを
 \[
@@ -17204,7 +17637,10 @@ P_{\mathrm{total}}(t) = \sum_b P_b(t) \quad [\mathrm{erg/s}]
 `direction`, `f_number`, `focus`, `defocus`, `profile`, `rays_per_beam` は
 このモードの吸収分布に影響しない（入力互換とパワー波形のために保持される）。
 
-離散化は Hydro 1Dセルの外側 \(r_{\max}\) から内側 \(r=0\) へ単一スレッドで逐次積分する。
+離散化は Hydro 1Dセルの外側 \(r_{\max}\) から内側 \(r=0\) へ逐次積分する（2026-09-24 から、各セルの
+中点の \(\hat n\)・\(\hat n_{raw}\)・IB 係数・\(\tau_c\) を 1 ブロックで 1024 セルずつ並列に
+共有メモリへ求め、パワーの受け渡しだけをスレッド 0 がセル順に行う — 従来の 1 スレッドの逐次計算と
+同じ演算で bit 一致。常駐ループも同じ分け方）。
 セル \(c\) の幅を \(dr_c = r_{c+1/2}-r_{c-1/2}\) とし、radial lookup で得た
 \(\kappa_{\mathrm{smooth},c}\) [cm\(^{-1}\)] を用いる：
 \[
@@ -17263,6 +17699,29 @@ Z_{\rm eff}=\frac{\sum_s n_s Z_s^2}{\sum_s n_s Z_s}
   \(Z_{\rm eff}/\bar Z\) 表（(nᵢ, T) 格子、[1,10] クランプ）を
   デバイス常駐させ、ノードごとに log-log 双線形（端クランプ）で評価。
   nᵢ = n̂·n_crit/\(\bar Z\)。表提供材料が 1 つのときのみ有効。
+- `"auto"`（既定、構築時解決、2026-09-23 改訂）: 電離段分率表があれば `"table"`、
+  `ib.species` の指定があれば `"sequential_strip"`、全ての非 void 材料が同じ多種組成
+  （TMAT `/material` の Z と数割合）を持てばその組成を `ib.species` として
+  `"sequential_strip"`、それ以外は `"off"`（混合物を含むなら WARNING）。従来は表が
+  無ければ常に `"off"` で、組成の分かる CD（GXII デッキ）でも完全電離コロナの
+  κ_IB が \(\bar Z/Z_{\rm eff}=0.66\) 倍に過小だった。単一元素は `"off"` のまま
+  （\(Z_{\rm eff}=\bar Z\) で算術も従来と同一）。`ib.species` と共通組成による解決は
+  IB 拡張のある球の 1D_SPH だけで行い、円筒・平板の 1D（1D_CYL を含む、2026-09-24）と
+  2D_RZ では表が無ければ従来どおり `"off"`（警告なし; 非球の 1D は光線追跡を使わず、
+  レーザー演算子は 1D 以外で IB 拡張を拒否する）。
+- **材料ごとの衝突電荷（2026-09-24、1D の多材料デッキ）**: 非 void 材料が 2 つ以上の 1D_SPH デッキでは、
+  各材料のモデルを材料ごとに決める（`Config::LaserConfig::IBExt::material_zeff`）: `"auto"` は
+  その材料が `/ionization` を持てば `"table"`（その材料の表）、`ib.species` の指定があれば全材料に
+  その組成で `"sequential_strip"`、無ければその材料の TMAT 組成が 2〜4 種なら `"sequential_strip"`、
+  それ以外は `"off"`。明示の `"table"` / `"sequential_strip"` は可能な材料にだけ適用し、他は `"off"`。
+  レーザー格子の各節点は、その節点が値を取る流体セル（`map_hydro_to_laser_1d_kernel_body` と同じ
+  セル探索）の材料、ghost corona の節点は外表面セルの材料を持ち（`map_node_material_1d_kernel`）、
+  \(\kappa\) の前置因子はその材料のモデルで評価する。Langdon の \(Z_{\rm coll}\) は材料の組成の完全電離値
+  \(\sum x z^2/\sum x z\)（組成が無い材料では節点の \(\bar Z\)）を動径節点ごとに持ち、光線追跡（行進法・
+  特性曲線法とも）は区間内で線形補間する（単一材料のデッキは従来どおり 1 つのスカラー）。以前は材料間で
+  組成が違うと `"off"`（平均 \(\bar Z\)）で、`/ionization` を持つ材料が複数あるか材料が 2 つ以上あると
+  ConfigError だった。流体の電離モーメント比 \(r_2, r_4\)（Qei・伝導・粘性）も同様に各セルの材料の表から
+  （`zmoment_fill_by_material_kernel`、表の無い材料のセルは 1）。
 
 **(b) レーザー周波数クーロン対数**（`ib.coulomb_log_model =
 "laser_frequency"`）。§5.4.3 の既定 lnΛ は \(b_{max}\sim v_T/\omega_p\)
@@ -17432,6 +17891,15 @@ w_k^{norm} = \frac{\text{profile}(R_k)\cdot 2\pi R_k\Delta R_k}{\sum_j \text{pro
 ここで \(\text{profile}(R)\) はビーム強度プロファイル（下記参照）、
 \(2\pi R_k\Delta R_k\) はレイ \(k\) が代表する環状面積（RZ軸対称）。
 
+**ステップ内のビームパワー（1D、2026-09-23）**: レーザー演算子は区間
+\([t_n,t_n+\Delta t]\) の沈着を与えるので、1D ではビーム \(b\) のパワーとして
+凍結波形（区分線形テーブル）の厳密な区間平均
+\(\bar P_b=\Delta t^{-1}\int_{t_n}^{t_n+\Delta t}P_b(t)\,dt\) を用いる（レイの出力、
+Langdon の強度、指令エネルギー台帳 \(\bar P\Delta t\)、再トレース省略の正規化の全て）。
+ステップのエネルギーの和は任意の刻み方でパルスの積分に一致し、急峻な立ち上がりを
+またぐステップも自分の分を受け取る（従来の \(P_b(t_n)\) は \(\Delta t/2\) の遅れと、
+立ち上がりをまたぐステップの沈着ゼロを生んでいた）。2D は \(P_b(t_n)\) のまま。
+
 最内リング \(k=0\) の代表半径は \(\Delta R/2\)（面ベース化により
 厳密な軸上 \(R=0\) レイは存在しない）。
 
@@ -17450,6 +17918,24 @@ w_k^{norm} = \frac{\text{profile}(R_k)\cdot 2\pi R_k\Delta R_k}{\sum_j \text{pro
 >
 > **ビーム半径 \(R_{beam}\) との関係**：\(R_{beam}\) はF値から決まるビーム外径（§5.6.1）であり、
 > \(R > R_{beam}\) のレイは生成しない。profile(R) は \(R_{beam}\) 内での相対強度分布を定義する。
+>
+> **基準面（1D、2026-09-23）**：profile は標的中心を通る面（lab \(z=0\)、Langdon の vacuum map
+> が表す面と同じ）で定義し、焦点を通る直線レイに沿って打ち出し面へ写す：
+> 打ち出し半径 \(R_k\) のレイの重みは \(\text{profile}(R_k\,|z_f|/|Z_{init}-z_f|)\)。
+> \(R_k/R_{beam}\) はリングごとに一定なので、重みはレーザーメッシュ外半径 \(Z_{init}\) に依存
+> しない（従来は固定の \(w_0\) を動く打ち出し面で評価しており、コロナが広がるほど外側のレイの
+> 重みが落ちて衝突径数の分布が狭まっていた — GXII で \(Z_{init}\) 0.1→1 mm のとき外縁レイの重み
+> 1→0.135）。焦点が標的中心（\(z_f=0\)）なら全リングが \(R=0\) に写り、f 値の円錐内で一様。
+>
+> **ビーム軸と焦点（1D、2026-09-23）**：1D の標的は球対称なので、ビームは向きによらず打ち出し面
+> \(Z_{init}\)（レーザーメッシュ上端）から −Z 方向へ進むものとして追跡する。焦点位置は lab 座標の
+> 焦点 \(\mathbf{f}\) をビーム軸へ射影した \(z_f=-\mathbf{f}\cdot\hat{\mathbf{d}}\)（標的中心基準、
+> 光源側が正。方向 (0,0,−1) では焦点の lab z）。レイは焦点を通る直線上を −Z へ進む：
+> \(z_f<Z_{init}\) なら焦点へ収束、\(z_f>Z_{init}\)（ビームが打ち出し面より手前で焦点を通過済み）なら
+> 焦点から発散。以前は焦点の lab z をそのまま使っており、\(z_f>Z_{init}\) ではレイを +Z（標的から
+> 離れる向き）へ打ち出し、−Z 以外の方向のビームは鏡像の位置の焦点で追跡していた。同じレイになる
+> ビームを 1 回の追跡にまとめる判定（`FoldKey`、永続カーネルのビーム一致判定も同じ）も、焦点の
+> lab z ではなく \(z_f\) で比べる。
 
 **1D_SPH レイ配列の構築**：
 
@@ -17465,6 +17951,24 @@ R_k = \left(k+\tfrac12\right)\Delta R,\qquad
 旧仕様の node-based 配置 \(R_k=k\Delta R\) は最外半リング
 \([R_{beam}-\Delta R/2,\,R_{beam}]\) を欠き、profile モーメントを内向きに
 \(O(1/N_R)\) 偏らせていた（2026-07-26 カーネルレビュー指摘）。
+
+**(a') 1D の円柱・平板：輪 × 方位角（2026-09-24）**
+
+`Mesh.geometry_1d="cylindrical"`（軸は lab z）・`"planar"`（法線は lab z、真空側が +z）では、
+ビームの lab の向き \(\hat{\mathbf p}\) が入射を決める（平板では \(p_z>0\) の向きは真空側から来るよう
+反転する）。球と同じ輪（\(R_k\)、重み、\(Z_{init}\)、焦点 \(z_f\)）を、ビーム軸まわりの方位角
+\(\psi_m=2\pi(m+1/2)/M\)（`Laser.raytrace.azimuthal_rays` \(=M\)、既定 16）に広げ、各レイを
+3 次元の直線（打ち出し面の点 \(-Z_{init}\hat{\mathbf p}+R_k(\cos\psi\,\hat{\mathbf e}_1+
+\sin\psi\,\hat{\mathbf e}_2)\) と焦点 \(-z_f\hat{\mathbf p}\) を結ぶ、球と同じ収束・発散の向き）として
+作り、その直線上を断面の外側（円柱は半径 \(R_{max}\)、平板は高さ \(R_{max}\)）まで戻した点から、
+追跡の平面（円柱は断面、Z がビームの断面内の来た向き; 平板は（横, 高さ））の位置・速度と面外速度
+\(v_A\) に写す。パワーは輪の重み \(/M\)。平板の垂直入射では全方位角が同じレイになるので
+\(M=1\)。レイは GPU 上で作る（輪の重みはホストの従来の計算）。builder は、円柱の軸に沿う
+ビーム（断面成分 \(<10^{-3}\)）と平板に平行なビーム（法線成分 \(<10^{-3}\)）を ConfigError にする。
+検証（`tests/laser/test_ray_init.cu` の `[geometry_1d]`）: 平板の垂直入射で輪ごとに 1 本・
+\(\sin\theta_k=R_k/\sqrt{R_k^2+(Z_{init}-z_f)^2}\)・総パワー、斜入射で方位角ごとの広がり
+（入射角が軸の角度をまたぐ）・単位速度・総パワー、円柱の横入射で全レイが断面の外から内向き・
+軸方向運動量の和が 0・総パワー。
 
 **(b) 2D_RZ：2D断面配列（ビーム軸直交平面）**
 
@@ -17696,7 +18200,9 @@ piecewise-geometricメッシュを毎ステップ再生成する。
    \hat n_c \ge 1,\ \hat n_{c+1}<1
    \]
    を満たす最外側faceとして求める（なければ未定義）
-3. \(R_{crit}\) は \(r_{edge}[f_{crit}]\)（未定義時は \(0.5R_{max}\)）
+3. \(R_{crit}\) は §5.7.4 のセル中心間対数補間で \(\hat n = 1\) となる位置
+   （外側に亜臨界実セルがない場合は \(r_{edge}[f_{crit}]\)、未定義時は \(0.5R_{max}\)）。
+   2026-09-23 まではここだけ \(r_{edge}[f_{crit}]\) を使っていた
 4. 局所最小セル幅 \(min\_dr_{crit}\) は以下の和集合領域で評価する：
    - \(|c-f_{crit}| \le 10\) の近傍セル
    - \(|r_c-R_{crit}| \le 0.05R_{crit}\) の半径窓
@@ -17738,6 +18244,37 @@ Q(R_i, Z_j) = Q\!\left(\sqrt{R_i^2 + Z_j^2}\right)
 \]
 ここで座標原点はターゲット中心（ビーム方向ベクトルと `focus` から決定）。
 
+**節点密度の評価（2026-07-31 線形補間化）**：\(\hat n\) の元となる電子密度
+\(n_e = \rho\bar Z/(A_{\rm eff}m_p)\) は、節点半径 \(r\) を挟む**同種物質の
+隣接 hydro セル中心間の \(r\) 線形補間**で評価する（境界・void 隣接・表面外
+セルは従来どおり所属セル値へフォールバック）。旧仕様の区分一定サンプリング
+（所属セル値をそのまま使用）は、節点 \(\hat n\) に \(|\partial_r\hat n|\,
+\Delta r_{cell}/2\) の階段誤差（解析ゲートで実測 \(2.44\times10^{-4}\) =
+予測値）を与え、レーザーノードが hydro セルより細かい臨界近傍では区間勾配
+`radial_dn_dr` が 0/2 倍の櫛状ノイズ（実測 27.5%）となってレイ転回点を
+散乱させていた。線形補間により線形プロファイルは任意のノード配置で厳密に
+再現される（場誤差 \(4.4\times10^{-16}\)）。\(T_e,\bar Z\) の節点値は
+従来どおり所属セル値（補間しない）。
+
+**臨界隣接セル対の対数線形プロファイル（2026-09-23）**：最後の超臨界実セル
+\(c_{\mathrm{hi}}\) とその外側の亜臨界実セル \(c_{\mathrm{lo}}\)
+（\(\hat n_{c_{\mathrm{hi}}} \ge 1 > \hat n_{c_{\mathrm{lo}}} > 0\)、両方とも非 void）の
+中心間 \([r_{c_{\mathrm{hi}}}, r_{c_{\mathrm{lo}}}]\) だけは、線形補間の代わりに
+両中心値を結ぶ対数線形プロファイルを用いる：
+\[
+\hat n_{raw}(r) = \hat n_{c_{\mathrm{hi}}}
+\left(\frac{\hat n_{c_{\mathrm{lo}}}}{\hat n_{c_{\mathrm{hi}}}}\right)^{s},
+\qquad
+s = \frac{r - r_{c_{\mathrm{hi}}}}{r_{c_{\mathrm{lo}}} - r_{c_{\mathrm{hi}}}}
+\]
+これは両中心で隣接区間の線形補間と連続・単調で、§5.7.4 の \(R_{\mathrm{crit}}\)
+でちょうど \(\hat n_{raw} = 1\) を横切る（同じ直線）。旧仕様は \(c_{\mathrm{lo}}\)
+側の半セルで線形補間値が 1 未満の点だけを \(R_{\mathrm{crit}}\) を起点とする
+対数値に置き換えていたため、対数の交点と線形の交点の間が
+\(\hat n = 1\) に張り付き、線形の交点で不連続に落ちていた
+（隣接 \(\hat n = 10 \,|\, 0.5\) で \(1 \to 0.586\)）。転回点付近の
+吸収経路の長さがこの段差に左右されていた。
+
 **(b) 2D_RZ：軸対称場の直接マッピング**
 
 2D_RZ流体メッシュの物理量 \(Q(R,Z)\) をLaserMesh節点 \((R_i, Z_j)\) にマッピングする。
@@ -17757,21 +18294,83 @@ LaserMesh上の物理量（\(\hat n, T_e, \bar Z\)）は **各レーザー演算
 HydroMeshから再マッピングする（Strang splitting中に1回）。
 1D_SPHでは同タイミングで格子点配置（`node_R`, `node_Z`）も再生成する。
 2D_RZでは格子点配置は初期化時固定のまま再利用する。
-1D_SPH ではさらに、`node_Z=0` 列から
-`radial_node_r`, `radial_n_hat`, `radial_n_hat_raw`, `radial_smooth_kappa`,
-`radial_dn_dr` を抽出し、ray trace の 1D lookup に使う。
+1D_SPH ではさらに、ray trace が参照する 1D 断面（`radial_node_r`, `radial_n_hat`,
+`radial_n_hat_raw`, `radial_T_e`, `radial_Zbar`, `radial_smooth_kappa`, `radial_dn_dr`）を
+流体セルに固定した節点の上で作る（`laser_mesh_bodies::build_trace_profile_nodes_1d`、
+2026-09-24。多カーネル経路では 1 ブロックがセルごとに並列に置き（2026-09-25、下の並列配置）、
+persistent loop は同じ関数を 1 スレッドで順に実行する。両者の節点は bit で同じ）。
+節点は、最外実セルまでの各実セルについて内側 face・セル中心・外側 face の直下
+（face から \(\max(10^{-6}\Delta r_{cell},\,4\times10^{-9} r)\) 内側）、§5.7.3(a) の
+臨界隣接セル対の区間の節点、最外実セルの外側 face、その外側の LaserMesh 半径節点
+（ゴーストコロナ域）で、LaserMesh の外端（レイの入射半径）で打ち切る。球では中心 \(r=0\)
+から始まり（最内 face より内側の LaserMesh 節点を先に置く）、平板（`geometry_1d="planar"`）
+では最内 face（壁）から始まる。臨界隣接セル対の \(\hat n_{raw}=\hat n_{hi}
+e^{-\lambda(r-r_{hi})}\)（\(\lambda=\ln(\hat n_{hi}/\hat n_{lo})/(r_{lo}-r_{hi})\)）では、
+clip 値（`critical_clip` なら `n_hat_margin`、他は 1）に達する折れ点を節点とし、亜臨界側に
+折れ点からの距離 \(x\) で間隔 \(\Delta x=\min(0.06/\lambda,\max(10^{-4}/\lambda,
+\sqrt{0.016\,x/\lambda}))\) の節点を最大 160 点置く（線形補間による IB 係数の誤差を
+\(10^{-3}\) 程度に抑える: 折れ点近くでは \(\delta n/(2\epsilon)\) が支配し \(\epsilon\approx\lambda x\)、
+遠方では \((\lambda\Delta x)^2/4\)）。超臨界側は \(\hat n\) が clip 値で一定なので節点を置かない。
+相対 \(10^{-9} r\) 未満に近い 2 節点は、face・セル中心・流体の外端、折れ点、その他の順に
+残す（数 ulp の区間では線形場が意味を失う）。各節点の \(\hat n, \hat n_{raw}, T_e,
+\bar Z\) は §5.7.3(a) の写像を \(Z=0\) で評価し、IB 係数 `radial_smooth_kappa` は同じ式で
+節点ごとに求め、`radial_dn_dr` は節点間の差分とする。この節点の上では、セル中心で折れる
+\(n_e\) の区分線形と face で段差をもつ \(T_e, \bar Z\)（セル値）が節点間の線形補間で
+表され、節点配置は流体の格子だけで決まる。
 
-1D_SPH の `map_from_hydro_1d` では、レイトレースに使う clipped nodal density
-\(\hat n\) に対して step 間 EMA を適用する。前回値が有効で節点数が不変、かつ
-current/previous の両方が \(\hat n > 0.3\) を満たし、
-\[
-|\hat n_{cur} - \hat n_{prev}| < 0.01
-\]
-のときに限り、
-\[
-\hat n \leftarrow \alpha \hat n_{cur} + (1-\alpha)\hat n_{prev},\qquad \alpha = 0.05
-\]
-で更新する。`n_hat_raw` は平滑化せず、節点数が変化した場合は EMA 状態を破棄する。
+**並列配置（2026-09-25、`place_trace_profile_nodes_1d`）**：順の配置は各節点を直前の節点に対して
+決める（近すぎる 2 節点の統合）。しかし、断面の外端より内側にあり、幅 \(w=r_{i+1/2}-r_{i-1/2}\) が
+外側 face の \(16\,p\times10^{-9}\) 倍以上（\(p\) は半セルあたりの分割数、\(10^{-9}\) は統合の
+相対間隔）のセルは、直前のセルも同じ条件を満たすなら、節点が前のセルの節点に依らない：前のセルの
+外側 face 直下の節点（face から \(\max(10^{-6}w,\,4\times10^{-9}r)<w/4\) 内側）はそのセルの他の節点より
+上にあり、次のセルの内側 face から統合間隔の 4 倍以上離れているので、順の配置でも内側 face は必ず
+新しい節点になり、以後の節点はセル自身の節点だけで決まる。外端をまたぐ最初のセルからは、外端より
+先の節点を捨てるだけで状態を変えないので、そのセル・その外側のセル・尾部（流体の外端、その外側の
+LaserMesh 節点、外端）を 1 つの区分として順に置く。1 ブロック（1024 スレッド）が、断面の始点から
+セル 0 まで・内側の各セル・最後の区分をスレッドに割り当て、各スレッドの節点数の前置和で書き込み位置を
+決めて書く。中心より内側から始まる断面、条件を満たさないセル（狭い、または面が増加しない）、
+セル 0 が外端をまたぐ、セルが 2 未満、容量超過のときは、1 スレッドの順の配置に戻る
+（`tests/laser/test_trace_profile_nodes.cu` がこれらの場合を含む乱数格子で順の配置と bit で比べる）。
+RTX 4090 の GXII FLD 後半（1.85 ns から 300 ステップ）で、1 スレッドの配置の 0.46 ms/step（FP64 の
+依存連鎖の待ち）が 0.12 ms/step になった（最初の 300 ステップでは 0.33 → 0.13 ms/step）。
+
+2026-09-24 までは LaserMesh の `node_Z=0` 列（§5.7.4 の \(R_{\mathrm{crit}}\) に細帯を置いた
+等比格子）を抽出していた。この節点は流体セルに対して位置が決まらず、線形補間が \(n_e\) の
+折れ点と \(T_e, \bar Z\) の段差を切っていた。同じ凍結状態での比較（`TENRYU_LASER_TRACE_COMPARE_EVERY`
+の `axis_column` と、流体セル基準の断面を半セルあたり 8・64 分割した `profile_refined`）で、GXII の
+立ち上がり（step 30〜110）の 1 ビームの吸収パワーは、旧来の列が細分割した断面から最大 47% 離れ、
+流体セル基準の断面は 0.1% 以内（折れ点節点と適応節点の導入前は最大 6%）。GXII 全長では吸収率
+0.937 → 0.933、吸収効率の step 間の符号交互の振れ（幅 0.02 超）2 → 2 回（折れ点節点の導入前の
+流体セル基準の断面では 11 回）。
+
+読み取りだけの診断（run の堆積・台帳は変えない）: `TENRYU_LASER_TRACE_COMPARE_EVERY=N` は N step ごとに
+同じ凍結状態で積分法と断面を取り替えた追跡を行い、変種ごとに 1 行（吸収・非吸収パワー、特性曲線法との
+吸収パワー比、堆積分布の L1 距離、刻み上限で止まった光線、節点数、カーネル時間）を出す。
+`TENRYU_LASER_TRACE_COMPARE_PARTS=k`（既定 8）は `profile_refined` の半セルあたりの分割数。
+`TENRYU_LASER_GHOST_DIAG=1` は 1D の写像ごとに表面とゴーストコロナのパラメータ（表面セル、臨界セル、
+表面の \(\hat n\)、表面半径、減衰係数、\(n_e\) の内端値、幅、アンカーの \(T_e, \bar Z\)、音速、
+レーザー点灯からの時間）を 1 行出す。
+
+1D_SPH の `map_from_hydro_1d` は、レイトレースに使う clipped nodal density を
+その時点の流体状態だけから作る：\(\hat n = \min(1, \max(0, \hat n_{raw}))\)
+（`critical_clip` ではさらに `n_hat_margin` で上から抑える）。step 間の平滑化はしない。
+
+**step 間平滑化の撤去（2026-09-24）**：2026-03-23 から 2026-09-24 まで、clipped \(\hat n\)
+だけに step 間 EMA（\(\alpha = 0.05\)、current/previous がともに \(\hat n > 0.3\) かつ
+\(|\hat n_{cur} - \hat n_{prev}| < 0.01\) の節点で
+\(\hat n \leftarrow \alpha \hat n_{cur} + (1-\alpha)\hat n_{prev}\)）を掛け、`n_hat_raw` は
+平滑化していなかった。当初は節点番号で前回値と対応させていたが、写像のたびに節点配置を
+作り直す（細帯が臨界半径に追従する）ため別の半径の値と混ぜており、2026-09-23 に同じ半径で
+混ぜる形にして retry・checkpoint に状態を持たせた。その形で GXII（1500 step、§5.7.5.2 の
+ゴースト幅）を平滑化の有無で比べると、吸収率の step 間変化は減らず（相対変化の中央値
+0.0029 対 0.0013、10 % を超える変化 20 回対 21 回）、動く臨界面の近くで平滑化値が
+流体の密度から最大約 0.0095 遅れた（例：\(\hat n = 0.999\) 対 \(\hat n_{raw} = 0.992\)）。
+レイはその分だけ遅く進み大きい \(\kappa\) を見て、レイトレースの kernel 時間は約 3.2 倍
+（212 s 対 66 s）、半数の step で一部のレイが `max_steps` に達して残りの出力を未吸収に
+計上した。ray trace の臨界終了・tail closure・ステップ制御は \(\hat n = \mathrm{clip}(\hat n_{raw})\)
+を前提に \(\hat n_{raw}\) で判定しており、平滑化はこの前提も崩していた。このため平滑化を
+撤去し、retry・checkpoint の状態も持たない（途中版の checkpoint にある
+`laser_smoothing/{r,n_hat}` は読まない）。
 
 1D_SPH の動的 LaserMesh 再生成で用いる臨界半径 \(R_{\mathrm{crit}}\) は、
 最後の超臨界実セル \(c_{\mathrm{hi}}\) とその外側の亜臨界実セル \(c_{\mathrm{lo}}\)
@@ -17786,9 +18385,12 @@ r_{c_{\mathrm{hi}}} + \text{clamp}(\theta, 0, 1)\,
 \left(r_{c_{\mathrm{lo}}} - r_{c_{\mathrm{hi}}}\right)
 \]
 ここで \(r_c\) はセル中心半径。外側に亜臨界実セルがまだ存在しない場合は、
-従来どおり最後の超臨界セル外側 face を用いる。`map_from_hydro_1d` の
-critical-adjacent subcritical cell の log 再構成も同じ \(R_{\mathrm{crit}}\) を
-アンカーに使う。
+従来どおり最後の超臨界セル外側 face を用いる。§5.7.3(a) の臨界隣接セル対の
+対数線形プロファイルはこの \(R_{\mathrm{crit}}\) でちょうど 1 となる。
+節点配置（`compute_dynamic_mesh_params_1d` と persistent loop の同等処理）と
+1D 付与の臨界セル分配（`find_allowed_supercritical_cell_1d`）も同じ
+\(R_{\mathrm{crit}}\) を使う（2026-09-23 まで節点配置だけは最後の超臨界セル
+外側 face を使っており、臨界半径の定義が 3 通りあった）。
 
 > **将来拡張**：Lagrangian流体メッシュの大変形に追従するLaserMeshの動的再生成。
 
@@ -17822,9 +18424,55 @@ LaserMesh 再マッピング時（§5.7.4）に、最外 3 非 void セルから
 - 電子温度下限：\(T_{e,\text{ghost}} \ge \texttt{Te\_min\_eV}\)（既定 50 eV）
 - 電荷数範囲：\(\bar{Z} \in [\texttt{zbar\_min}, \texttt{zbar\_max}]\)（既定 \([1.0, 4.0]\)）
 
-プロファイル幅は \(\max(w_{\text{base}},\; c_s \times t)\) で時間発展する
-（\(c_s\) はアンカー値から推定した音速、\(t\) はシミュレーション時刻）。
-最外実セルが既に亜臨界の場合、ゴースト内側密度は実セル密度に追随する。
+**内側密度・減衰・幅（2026-09-23、幅は 2026-09-24 改訂）**：ゴーストは解像されていない
+表面の外に置く格子以下の補助プロファイルであり、実在しない物質を足さないよう次の 3 条件で作る。
+
+1. 内側密度は最外実セル \(c_{\text{out}}\) を超えない：
+   \(\hat n_{\text{inner}} = \min(\hat n_{c_{\text{out}}},\, \texttt{ne\_max\_frac})\)
+   （\(\hat n_{c_{\text{out}}} \ge 1\) の超臨界表面では \(\texttt{ne\_max\_frac}\)）。
+   \(\hat n_{\text{inner}} \le \texttt{ne\_min\_frac}\) ならゴーストは作らない。
+2. 流体側のコロナが解像されるにつれて縮めて消す。最外実セルから内向きに連続して
+   \(\hat n_c < \texttt{transition\_resolved\_nhat}\) を満たすセル数
+   \(N_{\text{resolved}}\)（§5.7.5.4 と同じ数え方・同じパラメータ。
+   `transition_enabled` によらず使う）から
+   \[
+   f = \text{clamp}\!\left(1 - \frac{N_{\text{resolved}}}{N_{\text{required}}},\; 0,\; 1\right),
+   \qquad N_{\text{required}} = \texttt{transition\_resolved\_cells}
+   \]
+   とし、\(f = 0\) でゴーストなし。
+3. 幅は、ゴーストが代わりを務めるコロナがアンカー値の音速で広がるとして
+   \[
+   W = f \cdot \max\!\left(\texttt{n\_out} \cdot dR_{\text{fine}},\ c_s\,(t - t_{\text{on}})\right),
+   \qquad c_s = \sqrt{\frac{\bar Z_{\text{anchor}}\, T_{e,\text{anchor}}}{A_{\text{anchor}}\, m_p}}
+   \]
+   とする（\(dR_{\text{fine}}\) は §5.7.2 の細帯幅、\(t\) はシミュレーション時刻、
+   \(t_{\text{on}}\) はレーザーの立ち上がり時刻 = 各ビームの凍結パワー表で最初に正になる
+   標本の直前の横軸（最初の標本が正ならその横軸）の全ビームでの最小値。
+   \(t < t_{\text{on}}\) では \(c_s\,(t - t_{\text{on}})\) を 0 とする）。
+   減衰 \(f\) があるので、コロナが解像されれば幅に関係なくゴーストは消える。
+
+プロファイルは表面半径 \(r_{\text{surf}}\)（最外実セルの外側 face）から
+\[
+\hat n(r) = \text{clamp}\!\left(\hat n_{\text{inner}}\,
+e^{-(r - r_{\text{surf}})/L},\ \texttt{ne\_min\_frac},\ \hat n_{\text{inner}}\right),
+\quad L = \frac{W}{\ln(\hat n_{\text{inner}}/\texttt{ne\_min\_frac})},
+\quad r_{\text{surf}} \le r \le r_{\text{surf}} + W
+\]
+で、その外側は \(\hat n = 0\)。
+
+旧仕様（2026-09-23 まで）は幅を \(\max(w_{\text{base}}, c_s t)\)（\(c_s\) はアンカー値の
+音速、\(t\) はシミュレーション時刻）で伸ばし、内側密度を
+\([\texttt{ne\_min\_frac}, \texttt{ne\_max\_frac}]\) にクランプしていた。このため
+コロナが解像された後も、外縁の実セルが \(\texttt{ne\_min\_frac}\) を下回った後も、
+流体外縁の外に \(\hat n \approx \texttt{ne\_min\_frac}\) のほぼ一様な層が
+\(c_s t\)（2.5 ns・keV で数百 µm）にわたって残り、その吸収（片道の光学的厚さは
+keV で \(10^{-2}\) 程度、低温ほど増える）が最外セルへ渡されていた。
+2026-09-23〜24 は幅を \(f \cdot \texttt{n\_out} \cdot dR_{\text{fine}}\) に固定していたが、
+GXII では未解像の表面の前に約 10 nm の傾斜しか残らず、最初の 300 step の吸収率が
+0.104 から 0.054 に下がり、吸収率が step 間で 10 % を超えて変わる回数が約 5 倍に
+なったため、\(c_s t\) の成長を戻した。2026-09-24 までは \(t\) の原点がシミュレーション開始
+（\(t = 0\)）で、パルスの立ち上がりが遅いデッキでは幅を遅れの分だけ大きく見積もっていたため、
+原点をレーザーの立ち上がり \(t_{\text{on}}\) に変えた（立ち上がりが \(t = 0\) のデッキは不変）。
 
 ##### 5.7.5.3 ハンドオフステンシル（void 側吸収パワーの再分配）
 
@@ -17839,8 +18487,8 @@ w_k^{\text{base}} = \exp\!\left(-\frac{k}{d_{\text{handoff}}}\right), \quad k = 
 \]
 
 ここで \(k\) はアンカーセルからの内向きオフセット、
-\(N_{\text{handoff}} = \texttt{handoff\_cells}\)（既定 6）、
-\(d_{\text{handoff}} = \texttt{handoff\_decay}\)（既定 2.0）。
+\(N_{\text{handoff}} = \texttt{handoff\_cells}\)（既定 4）、
+\(d_{\text{handoff}} = \texttt{handoff\_decay}\)（既定 1.5）。
 void セルはスキップされる。
 
 正規化による分配：
@@ -17865,7 +18513,12 @@ supercritical 実セルへ一旦落ちたパワーは最も近い **外側の亜
 critical-adjacent な亜臨界セルへ落ちた沈着も同じ inward stencil で近臨界帯へ再分配する。
 この再分配にはベースライン重み \(w_k^{\text{base}}\) を用い、
 密度バイアスは適用しない。
-亜臨界の実セルが 1 つも存在しない初期段階では、この例外受け皿は最外の実セルに一致する。
+最外の超臨界実セルより外側に亜臨界の実セルが 1 つも存在しない段階（固体表面の初期、
+内部をガスで満たしたシェルの初期）では、この例外受け皿は最外の実セルに一致する。
+亜臨界セルの有無はレーザー側（最外の超臨界実セルより外側）だけで判定し、シェルに遮られた
+内部の亜臨界ガスは数えない（2026-09-23。以前は内部ガスも数えたため、外側が void の
+ガス充填シェルでは受け皿が無くなり、ゴーストコロナのパワーが内向き探索でシェルを越えて
+ガスへ渡され、シェル表面の沈着は未吸収に回っていた）。
 それでも受け皿が存在しない場合、そのパワーは `laser_dep` に入れず
 未吸収パワーとして収支へ戻す（§5.8.2）。
 
@@ -17924,6 +18577,7 @@ critical-adjacent な実表面セルからの再配分は、外向きアブレ�
 |---|---|---|---|
 | `laser/corona_transition_blend` | double | 無次元 | ブレンド係数 \(\beta\)（0＝安定、1＝遷移活発） |
 | `laser/corona_transition_resolved_cells` | int64 | cells | 外側から連続して亜臨界な実セルの数 \(N_{\text{resolved}}\) |
+| `laser/ghost_corona_width` | double | cm | 直近の 1D マッピングで使ったゴースト幅 \(W\)（0＝ゴーストなし。persistent loop では更新しない） |
 
 ### 5.8 座標変換と沈着の転写
 
@@ -17955,7 +18609,8 @@ resolved-corona が不足している間は、critical-adjacent な亜臨界セ�
 同じ inward stencil で近臨界帯へ広げる。
 このときの重みはベース指数重み \(w_k^{\text{base}}\) を使い、
 void 側ハンドオフ用の密度バイアスは適用しない。
-亜臨界の実セルが存在しない場合、この例外受け皿は最外の実セルになる。
+最外の超臨界実セルより外側に亜臨界の実セルが存在しない場合（シェル内部のガスは数えない）、
+この例外受け皿は最外の実セルになる。
 それでも受け皿が存在しない分は `laser_dep` に加えず、未吸収として扱う。
 
 診断目的で、`Laser.deposit.deposit_smooth_passes > 0` かつ
@@ -18057,8 +18712,27 @@ D_{i,j}^{(m)}
 > **ゼロ吸収ガード**：\(\sum_{i,j}\text{deposit}_{i,j}^{total} \le \varepsilon_{abs}\)（\(\varepsilon_{abs} = 10^{-20}\) erg/s）の場合は、保存検証をスキップする（吸収なし → 保存が自明に成立）。
 （全ビーム合算後に評価。deposit は [erg/s]、laser\_dep/Δt は [erg/s]。）
 ここで \(P_{\mathrm{blocked}}\) [erg/s] は、転写先が void または超臨界であるため
-HydroMesh へ結合しなかったパワーであり、ステップ収支では
-`laser_unabsorbed` に加算する。
+HydroMesh へ結合しなかったパワーであり、ステップ収支ではレーザー演算子の損失
+（履歴 `laser/transfer_blocked_power_total`、エネルギー予算では数値損失
+`energy/E_numerical_loss` に rank 0 で 1 回計上し、`energy/laser_deposited` からは除く）として扱う。
+`laser_unabsorbed` には加算しない（2026-09-24 変更。以前は差分
+\(P_{in} - \sum_c \text{laser\_dep}[c]/\Delta t\) を未吸収とみなしており、転写の損失と
+高速電子の逃げ分が未吸収に紛れ、driver の逃げエネルギーで高速電子の逃げ分を二重に数えていた）。
+
+**1D のレーザーパワー台帳（2026-09-24）**：各ステップで
+\[
+P_{in} = \frac{\sum_c \text{laser\_dep}[c]}{\Delta t} + P_{\mathrm{unabs}} + P_{\mathrm{hot,esc}}
+       + P_{\mathrm{blocked}} + P_{\mathrm{IAW}}
+\]
+を検査する。\(\text{laser\_dep}\) は高速電子の沈着を含む。\(P_{\mathrm{unabs}}\) は光線の
+明示的な集計（プロファイル外へ出た光線、強度カットオフ・ステップ上限・不正状態で止めた光線の
+残存パワー、光線を持たないビーム、ビーム畳み込みの再生分）だけで、差分による推定はしない。
+\(P_{\mathrm{hot,esc}}\) は高速電子の逃げ、\(P_{\mathrm{IAW}}\) は port section CBET のイオン音波への損失。
+残差が `Laser.deposit.conservation_tol`（下限 \(10^{-10}\)）×\(P_{in}\) を超えたら警告する。
+2D は従来どおり差分 \(P_{in} - \sum_c\text{laser\_dep}/\Delta t - P_{\mathrm{IAW}} - P_{\mathrm{hot,esc}}
+- P_{\mathrm{blocked}}\) を光線集計の下限として使う。driver は逃げエネルギーを
+\((P_{\mathrm{unabs}} + P_{\mathrm{hot,esc}})\Delta t\)、レーザーの沈着を
+\((P_{in} - P_{\mathrm{unabs}} - P_{\mathrm{hot,esc}} - P_{\mathrm{blocked}} - P_{\mathrm{IAW}})\Delta t\) とする。
 
 ### 5.9 レイトレース Skip 最適化
 
@@ -18110,6 +18784,13 @@ ICFシミュレーションでは、プラズマ条件（ρ, T_e, Z̄）は流�
 ビーム毎にパラメータグループが異なる場合はグループ毎にキャッシュし、各グループ内のビームパワー合計でスケーリングする。
 
 **次元検証**：[無次元] × [erg/s] × [s] = [erg] ✓（`rad_dep` と同一規約）
+
+**1D の再配分（2026-09-23）**：1D のキャッシュの \(\hat f\) はビーム別のレイの付着（受け皿への
+付け替え・ゴーストコロナの受け渡し・平滑化の前）なので、スケーリングした付着に現在の流体状態で
+トレース時と同じ再配分（`apply_deposit_redistribution_1d`）を適用してから `laser_dep` とする。
+この再配分は付着について線形なので、トレースしたステップと同じ流体状態なら結果は一致する。
+以前はスケーリングした値をそのまま書いており、void・超臨界セルに付着が残った（ゴーストコロナの
+ある 1D デッキでは、省略したステップの付着のほぼ全量が void セルに入っていた）。
 
 物理的妥当性：
 - レイ軌道は ∇n̂ に依存し、δ < threshold で変化が保証される
@@ -19001,6 +19682,23 @@ C_{v,e} = \rho\,c_{v,e}^{state}
 
 > **\(b_g(T)\) の定義**（§0.3 参照）：\(b_g(T) = \int_{\nu_g}^{\nu_{g+1}} B(\nu,T)\,d\nu \Big/ \int_0^\infty B(\nu,T)\,d\nu\)
 > （群 \(g\) の Planck 分率）。v1.0 では PlanckTable（ARCHITECTURE §4.3）から温度補間で取得する。
+> **表の温度間の補間（2026-09-23）**: 表の温度 \(T_k\)（対数等間隔）の間では、累積分率
+> \(C_g=\sum_{g'\le g}b_{g'}\)（低エネルギー側）と裾の和 \(D_g=1-C_g=\sum_{g'>g}b_{g'}\)
+> （高エネルギー側）の対数を \(u=\ln T\) の 3 次 Hermite 多項式で補間する。節点の傾きは
+> 群境界 \(x_k=E_k/T\) での Planck 密度 \(f(x)=(15/\pi^4)x^3/(e^x-1)\) から解析的に
+> \(d\,\mathrm{RC}_g/du=x_0f(x_0)-x_{g+1}f(x_{g+1})\)、
+> \(d\,\mathrm{RD}_g/du=x_{g+1}f(x_{g+1})-x_Gf(x_G)\)、
+> \(dS/du=x_0f(x_0)-x_Gf(x_G)\)（RC・RD・\(S\) は正規化前の累積・裾・和、
+> \(d\ln C_g/du=\mathrm{RC}_g'/\mathrm{RC}_g-S'/S\) など）で求めて表に持つ。
+> 両端の温度で \(C_g<1/2\) の群までは \(C\)、それより上の群は \(D\) を使い、
+> \(b_g\) は隣り合う値の差（\(b_g=\hat C_g-\hat C_{g-1}\)、\(\hat D_{g-1}-\hat D_g\)、
+> 切り替えの群では \((1-\hat D_g)-\hat C_{g-1}\)）とするので、和は構成上ちょうど 1。
+> 誤差は \(O(\Delta u^4)\) で、補間誤差より小さい負の差が出た場合だけ 0 に切り上げる。
+> 従来は \(b_g\) を \(T\) について線形補間しており、凸な Wien 側の群を区間中央で約
+> \((\Delta T/T)^2(x^2-2x)/8\)（\(x=h\nu/T\)）過大にしていた（既定 200 点・8 桁で
+> \(x=10\) なら約 9%）。累積・裾を \(\ln T\) で幾何補間（1 次）する案も試したが、Wien 側は
+> 改善する一方でピーク付近の群の絶対誤差が線形補間より大きく、不採用とした。
+> 全行が同じ表（picket-fence 用の定数分率）は格納値をそのまま返す。
 
 \[
 \beta = \frac{4 a_{eV} T_e^3}{C_{v,e}} \quad [\text{無次元}]
@@ -20667,6 +21365,21 @@ cap 非経由のため挙動不変）。放射エネルギー式に
 > Fleck blend とも σ 配列値のみが異なる）。冪乗 EOS `power_law_te` は初期化時 tabulation で
 > table-EOS 経路に乗る（新規離散化なし）。
 >
+> **表不透明度のセル（2026-09-23）**: tmat/table_nlte 不透明度のセルでは Fleck 因子を NLTE
+> 係数カーネル（上記の cell 単一 \(f_c\)）が作る。1D FLD ではこのカーネルにも `"table"` の比熱
+> 規則（電子 EOS テーブルがあれば現在 \(T_e\) の `device_eos_cv`、セルの支配材料のテーブルを
+> 優先、無ければ legacy チェーン）を適用する。2026-09-23 まで NLTE カーネルは指定によらず
+> legacy チェーン（cv_e_override → state cv_e → ideal gas）を使っており、tmat 不透明度の
+> デッキでは既定の `"table"` が効いていなかった（state cv_e は流体の閉包時点の表の cv で、
+> 外側反復中の \(T_e\) には追従しない）。2D_RZ の FLD と S_N の呼び出しは従来どおり legacy
+> チェーン。下記の secant/guard の β と `exp_phi1` の形は NLTE カーネルにも実装した（2026-09-24。
+> 予測子の正味加熱は \(c(\sigma_{P,{\rm abs}}E-\sigma_{P,{\rm em}}aT^4)\)、\(U_e\) は熱容量を取るセルの電子表、
+> 表が無いか step 開始の輻射が無いときは tangent。既定 tangent・be の実体は従来どおり — テンプレート
+> 実体を分けている。2026-09-23〜24 は namelist で拒否、それ以前は黙って無視されていた）。
+> 多材料デッキで LTE の表と周波数依存 Marshak 不透明度が支配するセルは、共有の Fleck カーネルで
+> Planck 平均の吸収係数による群共通の \(f\) を使う（単一材料の表が NLTE カーネルから得る灰色の \(f\) と同じ形。
+> 群ごとの \(f_g\) を使うと、同じ材料でも他の材料の有無で Fleck 因子が変わっていた）。
+>
 > **fleck_beta（2026-07-14 導入；外部裁定 2026-07-15、docs/design/fleck_beta_secant_20260714.md §7-8）**:
 > β の線形化点は `Radiation.multigroup_diffusion.fleck_beta` で選ぶ。`"tangent"`（**既定**、bit 凍結）
 > = 上式の接線 β。`"secant"`（opt-in、table-EOS セル・1D FLD のみ — 2D fleck kernel は独立実装で
@@ -20875,8 +21588,14 @@ drive temperature accepts a deck time callable
 `Radiation.boundary.marshak_Tr` (frozen to a table at initialization — no
 runtime Python) in addition to the constant `marshak_Tr_eV`. Precedence and
 evaluation follow the IMC emitter convention: a positive constant wins;
-otherwise the frozen table is evaluated once per radiation call at the
-solve-entry time `state.t`. The per-group incident flux
+otherwise the frozen table is evaluated once per radiation call. 1D FLD / SN
+(2026-09-23): the evaluation time is the midpoint of the interval the call
+advances — the driver passes \(t_n+\Delta t/2\) for the single-stage
+Radiation operator and \(t_n+(m+\tfrac12)\Delta t_{\rm sub}\) for thermal substep
+\(m\) (the operator advances \([t_n,t_n+\Delta t]\) in both Strang and sequential
+order); the historic solve-entry `state.t` \(=t_n\) lagged the drive by
+\(\Delta t/2\) and held every substep at \(T_r(t_n)\). Callers that pass no drive
+time (verification drivers) keep `state.t`; 2D keeps `state.t`. The per-group incident flux
 F_inc,g = (c/4) a T_r^4(t) b_g(T_r(t)) and the `marshak_in` ledger use the
 resolved temperature, so a staircase drive T_r: 100→200 eV produces exactly
 a 16× per-step `marshak_in` jump (validated). The same wiring applies to the
@@ -20904,8 +21623,15 @@ S_{\Delta t})/(1+\lambda_{pa})\)）が入り、Newton の全系エネルギー�
 していた（outer=8 で源点 +25%）。固定後は追加反復が同一の保存的不動点へ
 収束する（無源 1 step で outer=8 が outer=1 と bit 一致、線源つき outer=8
 が参照帯に着地）ため、outer 数の制限は不要。検証 = 独立 S₈ 離散化
-（`tools/su_olson_sn_reference.py`）と ξ=0.01/1.0/3.16 で 0.2%/5.3%/13.9%
-一致（恒久 ctest `test_sn_1d_su_olson` volume-source ケース）。
+（`tools/su_olson_sn_reference.py`）と ξ=0.01/1.0/3.16 で 0.15%/4.8%/2.3%
+一致（2026-09-23 に Newton の上側ブラケットへ \(S_{\Delta t}\) を入れた後の値。以前の
+0.2%/5.3%/13.9% には、源が支配的な初期ステップで失われた注入エネルギーの分が含まれていた）（恒久 ctest `test_sn_1d_su_olson` volume-source ケース）。注入エネルギー
+\(\sum_{r_c\le x_{max}}\Delta t\,V_c\,\dot S\) は `sn_volume_source_in_step`
+として step energy budget（`volume_in`）に計上する（2026-09-23。従来は常に 0
+で、線源つき run の保存監査に注入分が現れなかった）。Newton の上側ブラケットは
+\(S_{\Delta t}\) を含む（下記 §6.8 の閉包 8 項）。同じ ctest の台帳ケースが、各
+solve の注入量と、物質＋放射エネルギーの変化 = 注入 − 流出（注入量の相対
+\(10^{-10}\)）と、`rad_dep` が書き戻し後の \(E^{n+1}\) を使うことを検査する。
 
 **1D_SPH \(S_N\) 外側 Marshak 境界（W-B2, 2026-07-03）** —
 `Radiation.sn_transport.boundary.outer_r="marshak"`（1D_SPH、
@@ -21015,10 +21741,17 @@ D_{c,g}=\frac{c\,\lambda(R_{c,g})}{\sigma_{R,c,g}}
 ~\(10^{-4}\) 相対と \(R=50\) での +2% 不連続を持った — 1D 2 コピー修正済み、
 2D コピーは別途対応）。面係数の構成は次元で異なる（2026-07-26 doc 真実復元）:
 **1D_SPH は face-centered 評価**（1D face 中心評価化後の現行実装）—
-\(\sigma_{R,f}=\tfrac12(\sigma_{R,L}+\sigma_{R,R})\)、
+\(\sigma_{R,f}=(\sigma_{R,L}\Delta_L+\sigma_{R,R}\Delta_R)/(\Delta_L+\Delta_R)\)
+（\(\Delta_{L,R}\) は両セルの幅。両セル中心間の光学的厚さ
+\(\sigma_{R,L}\Delta_L/2+\sigma_{R,R}\Delta_R/2\) を中心間距離 \(d_f\) で割ったもので、
+拡散極限の直列抵抗として厳密。実装は算術平均に幅差の項を足す形
+\(\tfrac12(\sigma_L+\sigma_R)+\tfrac12(\sigma_L-\sigma_R)(\Delta_L-\Delta_R)/(\Delta_L+\Delta_R)\)
+で、等幅なら従来の \(\tfrac12(\sigma_{R,L}+\sigma_{R,R})\) と bit 一致。2026-09-23 まで
+幅の重みなしの算術平均で、幅比 \(w\) の界面では拡散極限の
+面の伝導度が最大 \((w+1)/2\) 倍ずれた）、
 \(E_f=\max(\tfrac12(E_L+E_R),10^{-300})\)、
 \(R_f=|E_R-E_L|/(d_f\,\sigma_{R,f}\,E_f)\)、
-\(D_f=c\,\lambda(R_f)/\sigma_{R,f}\)。拡散極限（両側 \(\lambda=1/3\)）では旧
+\(D_f=c\,\lambda(R_f)/\sigma_{R,f}\)。等幅の拡散極限（両側 \(\lambda=1/3\)）では旧
 harmonic 形 \(\mathrm{harm}(c/3\sigma_L,\,c/3\sigma_R)=c/(3\cdot\tfrac12(\sigma_L+\sigma_R))\)
 と厳密一致する。**2D_RZ は現行 cell-centered** \(D_c\)（cell 勾配で \(R_c\)）を
 隣接 harmonic mean して \(D_f\) を作る — 1D の修正前と同型の front-stall 機構が
@@ -21058,6 +21791,41 @@ requested/resolved を run_info + HDF5 metadata に記録、**AmgX 未 link buil
 debug fallback CG の別名。validate() を経ない手組み config（unit test 経路）が
 "auto" のまま solver へ到達した場合は WARNING 付き Jacobi fallback の防御分岐が拾う。
 Convergence criterion: ||r_k|| <= cg_inner_tol · D where D = ||r_0|| (cg_tol_norm="r0", historic default) or max(||b||, tiny) (cg_tol_norm="rhs"). The rhs normalization decouples the stopping test from warm-start quality; with the previous-solution warm start the r0-relative form over-solves by construction.
+
+**1D 外側反復の灰色加速・流束制限子の評価・void セル（2026-09-24）**
+
+- **灰色加速**（`outer_accel="grey"`、既定 `"auto"` は 1D でこれ、2D_RZ では `"none"`）:
+  外側反復 \(k\) は \(T_k\) で Fleck 係数 \(f_g\) と不透明度を評価して各群を解き、\(f_g\) を固定して物質温度
+  \(T^{k+1/2}\) を解く。固定点は \(f_g(T^*)\) を持つ。\(T_k\) で線形化し（不透明度固定、
+  \(f=1/(1+z)\)、\(z\propto T^3\) より \(f'_g=-3f_g(1-f_g)/T\)）、
+  \(S'_g=f_g c\sigma^{pe}_g B'_g + f'_g(c\sigma^{pe}_g B_g - c\sigma^{a}_g E^n_g)\)、
+  \(D=\rho c_v/\Delta t+\sum_g S'_g\)、\(w_g=S'_g/D\)、\(P=\sum_g f'_g(c\sigma^{pe}_g B_g-c\sigma^a_g E^n_g)\)、
+  \(\Delta T_k=T^{k+1/2}-T_k\) とすると、固定点への補正は
+  \(A_g e_g-\Delta t V w_g\sum_h c\sigma^a_h e_h=\Delta t V w_g (D-P)\Delta T_k\)、
+  \(T^*-T^{k+1/2}=(\sum_h c\sigma^a_h e_h-P\Delta T_k)/D\)（\(A_g\) は反復 \(k\) の群の三重対角行列）。
+  \(e_g=\xi_g\varepsilon\)、\(\xi_g\propto w_g/(1+\Delta t c\sigma^a_g)\)（無限媒質の最遅モード、
+  \(\sum_g c\sigma^a_g\xi_g=1\) に規格化）として群について足すと \(\varepsilon\) の三重対角方程式 1 本になり
+  （Morel, Larsen & Matzen, JQSRT 34 (1985) 243 の多群-灰色合成加速）、次の反復は
+  \(T^{k+1/2}+(\varepsilon-P\Delta T_k)/D\)（\([-T/2,+T]\) に制限、電子エネルギー・圧力は物質更新と同じ閉包）から始める。
+  1 群では線形化した補正そのもの（Newton 段）。補正は \(\Delta T_k\) とともに消えるので、収束解は加速なしの
+  反復と同じ。スペクトルと灰色行列は反復 \(k\) の組み立て直後（群の解法が行列を上書きしうるので解く前）に作り、
+  右辺と補正は反復 \(k+1\) の最初に適用する（収束して抜ける反復の状態は加速前の生の出力のまま）。
+  通常ループと常駐ループで同じ device 関数（`fld_1d_grey_accel.cuh`）を使う。灰色の三重対角方程式は
+  並列循環縮約（PCR、`core::pcr_solve_strided`）で解く（2026-09-25。通常ループは 1 ブロック、行を共有メモリ
+  に置けないときは大域メモリの作業領域、常駐ループはグリッド全体。各行の演算は同じで、両ループの解は丸め誤差の
+  範囲で一致する — 積和の融合のされ方がカーネルごとに変わりうる）。以前の 1 スレッドの Thomas 法は FP64 の割り算の依存連鎖で、RTX 4090 の GXII FLD で
+  0.27 ms/step（最初の 300 ステップ）・0.55 ms/step（1.85 ns から）かかっていた（PCR で 0.036・0.069 ms/step）。
+  解の丸めは変わる（方程式は同じ）。
+- **流束制限子の評価**（`limiter_evaluation`、既定 `"predictor"`）: 流束制限子の \(R\) を、最初の外側反復の
+  放射場（step 開始時の場で制限子を評価し、step 開始時の温度の放射で各群を解いた結果）から評価して step 内は
+  固定する。`"iterate"`（従来）は毎反復その時点の放射場から評価し直すが、この遅れた固定点反復は光学的に薄く
+  流れが支配的な領域で停滞・振動し、GXII 回帰デッキの初期（〜0.2 ns）で 20 回の上限に達していた（残差最大 9e-3）。
+  予測子方式と灰色加速の組み合わせで、同デッキの全 step が 2 次収束する（平均 2.6 回）。
+- **void セル**: void セルは真空として吸収・放射をしない（\(\sigma^a=\sigma^{pe}=\eta=0\)、物質温度は交換で
+  変わらない）。拡散係数の正則化のための Rosseland 不透明度の下限はそのまま。以前は不透明度の下限
+  （\(\rho\kappa_{floor}\)）と定数不透明度の混合（非 void 材料を含まないセルが先頭材料の \(\kappa\) を取っていた）
+  により、ターゲット外の下限密度セルがコロナの放射を吸って 1 回の放射計算の中で 100 eV 程度まで加熱され、
+  外側反復の収束を妨げていた（GXII: 未収束 238 step、平均 13.6 回 → 修正後 85 step、4.0 回）。
 
 Opt-in Anderson(m) acceleration (`outer_accel="anderson"`) mixes the next emission-linearization temperature from the last m outer residuals (Walker-Ni form, damping beta, Tikhonov-regularized normal equations, per-step history). Mixing is applied only when continuing to another outer iteration; a converged exit always returns the raw Newton output, so the accepted fixed point satisfies the same outer_tol contract as plain iteration. Degenerate least-squares rounds fall back to plain iteration; mixed temperatures are floored at floors.Te and non-finite mixes fall back to the raw Newton value per cell.
 
@@ -22696,6 +23464,40 @@ This is the documented production behavior. Any use of Fleck-derived
 SN emission coefficient when \(\sigma^{PE}\) is available, is an implementation
 defect rather than an alternate model.
 
+#### 1D_SPH multi-material decks (2026-09-24)
+
+A 1D_SPH deck with more than one non-void material evaluates every cell's
+coefficients from its own materials (`radiation/multimat_opacity_1d.cuh`,
+shared with the 1D FLD solver; the opacity models are those of the FLD
+multi-material path: `constant`, `none`, `tmat`, `table_nlte`, `power_law`,
+`freq_dep_marshak`):
+
+- absorption and emission: \(\sigma^{PA}_g=\rho\sum_m w_m\kappa^{PA}_{m,g}(\rho_m,T_e)\)
+  and the same for \(\sigma^{PE}_g\), with the mass fractions \(w_m\) (volume
+  fractions without per-material masses) and the partial densities
+  \(\rho_m=\rho w_m/f_m\) for the density-dependent models; for a constant
+  material \(\kappa^{PA}=\kappa^{PE}=\) `kappa_a` (the single-material S_N
+  reading). `Materials.opacity_mix_rule="max"` takes the largest material
+  value; `"harmonic_mass_R"` changes only the Rosseland mean, which S_N does
+  not use, so its absorption is the linear mix;
+- physical scattering: \(\sigma_{s,g}=\rho\sum_m w_m\kappa_{s,m}\) with
+  \(\kappa_{s,m}=\) `kappa_s` for the constant, power-law and
+  frequency-dependent Marshak materials and 0 for the tables (as in the
+  single-material paths), bounded by \(\rho\,[\)`opacity_floor`,
+  `opacity_cap`\(]\) (no floor in a cell whose dominant material is a
+  table);
+- emission \(\eta_g=c\,\sigma^{PE}_g a_{eV}T_e^4 b_g(T_e)\);
+- a cell whose dominant material (largest volume fraction) is a non-LTE
+  table takes that material's NLTE coefficients at the cell density (the
+  single-material NLTE launch restricted to those cells, the dominant-material
+  approximation of the FLD solver); its scattering stays the mix above;
+- the material Newton closes every cell with its dominant material's electron
+  table (none for an exact ideal-gas material) and `cv_e_override`
+  (`radiation::cell_electron_table_selector_1d`, shared with FLD).
+
+A deck of two identical materials in pure cells repeats the single-material
+step bitwise (`test_sn_1d_multimat`).
+
 1D_SPH and 2D_RZ GPU \(S_N\) production use the cell-local conservative
 active-set closure. The namelist no longer exposes closure selectors; the
 implementation is hardwired to conservative active set, signed face-flux
@@ -22751,8 +23553,16 @@ material residual rather than silently injected by a pre-source floor.
 local conservation identity is broken.
 8. The upper energy bracket is
 \[
-U_{hi}=U_e(T_e^n)+\sum_g\max(E^*_g,0).
+U_{hi}=U_e(T_e^n)+\sum_g\max(E^*_g,0)+S_{\Delta t},
 \]
+with \(S_{\Delta t}=\Delta t\,\dot S\) the 1D external volume-source energy
+(zero without a source), since \(U_e+\sum_gE^+_g=U_e^n+\sum_gE^*_g+S_{\Delta t}\)
+and \(E^+_g\ge0\). Before 2026-09-23 the bracket omitted \(S_{\Delta t}\): a
+source-dominated cell (\(E^*\approx0\) on its first step) had its root above
+the bracket, the twenty doublings of the expansion (starting from
+\(\sum_g\max(E^*_g,0)\), or \(10^{-12}\max(|U_e^n|,1)\) when that is zero)
+did not reach it, and the clamp to the bracket lost the source energy (23% of
+the injection in the `test_sn_1d_su_olson` ledger case).
 If the upper-bracket sign check fails because of roundoff or table behavior,
 the bracket is expanded adaptively; expansion failure is also a global
 timestep-rejection condition.
@@ -22932,10 +23742,16 @@ F^{diff}_{f,g}=-D_{f,g}\frac{E^n_{R,g}-E^n_{L,g}}
 \]
 The AP path reuses `state.sn_sigma_s` as its "\(\sigma^R\)". **Fill truth
 (2026-07-26 doc restoration)**: `sn_sigma_s` holds the
-PHYSICAL scattering opacity — constant/power-law materials fill it with
-\(\rho\kappa_s\) (`kappa_s`), and the NLTE pure-SN path fills it with the
+PHYSICAL scattering opacity — constant, power-law and `freq_dep_marshak`
+materials fill it with \(\rho\kappa_s\) (`kappa_s`, bounded by the S_N
+opacity floor/cap like the constant evaluator), and the NLTE pure-SN path
+fills it with the
 Fleck-bypassed effective scattering \((1-f)\sigma^{PA}=0\) (f=1). It is NOT
-the Rosseland mean. Consequently, in every production deck with
+the Rosseland mean. (Until 2026-09-23 the 1D power-law and
+`freq_dep_marshak` paths stored the evaluator's second output there — the
+power-law absorption itself and the Rosseland group mean — so those
+materials scattered as much as, or more than, they absorbed; the 2D stage
+still zeroes `sn_sigma_s` for the analytic models.) Consequently, in every production deck with
 \(\kappa_s=0\) the \(\tau\) gate below evaluates \(\tau\approx0\) and the
 blend weight is exactly \(\alpha=0\) on every face — the AP blend is inert
 and the \(S_N\) answer is native transport (the sweep itself is unaffected:
@@ -22975,47 +23791,50 @@ same statistic on the geometric interior as a fallback and records the mask
 source.
 
 The face-flux path applies a conservative donor-cell limiter before
-Phase B, in two passes [two-pass inflow-credit correction, 2026-07-14]. For each cell and group, with
-raw inflow/outflow loads
+Phase B, evaluated in the order of the flow (2026-09-25). For each cell and
+group, with the inflow/outflow loads
 \[
 I_{c,g}=\Delta t\,
-\frac{A_{c-1/2}\max(F_{c-1/2,g},0)
-      +A_{c+1/2}\max(-F_{c+1/2,g},0)}{V_c},
+\frac{A_{c-1/2}\,\theta_{c-1,g}\max(F_{c-1/2,g},0)
+      +A_{c+1/2}\,\theta_{c+1,g}\max(-F_{c+1/2,g},0)}{V_c},
 \qquad
 O_{c,g}=\Delta t\,
 \frac{A_{c+1/2}\max(F_{c+1/2,g},0)
       +A_{c-1/2}\max(-F_{c-1/2,g},0)}{V_c},
 \]
-pass 1 caps each cell's outflow by its stored energy alone,
+(domain-boundary inflow has no donor and enters with \(\theta=1\))
 \[
-\theta^{(1)}_{c,g}=
-\begin{cases}
-\min(1,E^n_{c,g}/O_{c,g}), & O_{c,g}>0,\\
-1, & O_{c,g}=0 ,
-\end{cases}
-\]
-and pass 2 credits the inflow as limited by the upwind donors' pass-1
-factors (domain-boundary inflow has no donor and is credited in full):
-\[
-\widehat I_{c,g}=\Delta t\,
-\frac{A_{c-1/2}\,\theta^{(1)}_{c-1,g}\max(F_{c-1/2,g},0)
-      +A_{c+1/2}\,\theta^{(1)}_{c+1,g}\max(-F_{c+1/2,g},0)}{V_c},
-\qquad
 \theta_{c,g}=
 \begin{cases}
-\min(1,(E^n_{c,g}+\widehat I_{c,g})/O_{c,g}), & O_{c,g}>0,\\
+\min(1,(E^n_{c,g}+I_{c,g})/O_{c,g}), & O_{c,g}>0,\\
 1, & O_{c,g}=0 .
 \end{cases}
 \]
-Crediting the pass-1-limited inflow — never the raw \(I_{c,g}\) — keeps
-positivity exact (every credited erg is deliverable within the step by
-construction) while restoring free-streaming pass-through: the pre-fix
-single-pass donor-only cap \(\theta=\min(1,E^n_{c,g}/O_{c,g})\) throttled a
-conduit cell by its stored energy even though the same-step inflow
-replenishes it, blocking fronts and freezing transient accumulations at
-\(c\Delta t>\Delta x\) (measured 248 eV against a 200 eV drive; the
-raw-credit form \((E^n+I)/O\) previously documented here was never the 1D
-implementation).
+The inflow is credited with the upstream donors' final \(\theta\). Every face
+flux has one direction, so the inflow of a cell comes only from cells
+upstream of it and no cell is upstream of itself: one pass from left to right
+sets every cell whose left face does not carry flux out of it to the left
+(its inflow comes from the left or it has none; a sink has no outflow), and a
+pass from right to left sets the cells whose outflow goes left and whose
+inflow comes from the right (`compute_streaming_theta_ordered_kernel`, one
+thread per group). Then \(E^n_c V_c+\Delta t\,(\widehat{\text{in}}-\widehat{\text{out}})\ge0\)
+in every cell, and a cell that passes on what it receives is not limited.
+The former two-pass credit (2026-07-14) weighted the inflow with the donors'
+first-pass factors \(\min(1,E^n/O)\) instead: when \(c\Delta t\gg\Delta x\) every
+first-pass factor is small, so a chain of conduit cells stayed limited to
+about twice its stored energy per step and fronts stalled. Measured on the
+planar Marshak slab of `sn_1d_planar_marshak_equilibration` (0.4 cm,
+\(\sigma=50\,\mathrm{cm^{-1}}\), 50 eV drive, \(\Delta t=10^{-10}\) s, \(c\Delta t=3\) cm), inner-cell
+temperature after 2000 steps: on 32 cells it stayed near its 1 eV start
+before (8 cells heated through) and reaches 39.66 eV now, 36.23 eV on 128
+cells, against 35.94 eV of the linear-discontinuous scheme on
+32 and 128 cells (§6.8.4); after 3000 steps 48.57 / 47.73 against 47.65
+(`test_sn_streaming_limiter`). On the GXII S_N deck (300 cells, 0.15 ns) the
+peak density went from 3.80 to 3.40 g/cm³ (linear-discontinuous 3.37) and
+the radiation field energy at the deck's time step from 14 894 to 11 560 erg
+(at \(\Delta t=5\times10^{-15}\) s: 11 253 erg; the former limiter still gave a peak
+density of 3.81 there, \(c\Delta t=1.5\,\mu\mathrm{m}\) being wider than the shell's
+cells).
 Each face flux is then scaled once by its upwind donor:
 \[
 \widehat F_{f,g}=\theta_{d(f,g),g}F_{f,g},
@@ -23030,9 +23849,10 @@ limited face flux is still single-valued and enters adjacent cells with opposite
 signs.
 
 In 2D_RZ the limiter remains single-pass with the raw inflow credit,
-\(\theta=\min(1,(E^n_{c,g}+I_{c,g})/O_{c,g})\); the two-pass positivity-exact
-credit above is 1D-only as of the two-pass inflow-credit revision, and the port is on the 2D-side
-ledger together with the angular-state persistence itself. The outgoing-energy
+\(\theta=\min(1,(E^n_{c,g}+I_{c,g})/O_{c,g})\) with the raw inflow; the flow-ordered
+credit above is 1D-only (in 2D the flux directions can form cycles, and the
+two-pass form below limits conduit cells like the former 1D form — not
+measured in 2D, 2026-09-25). The outgoing-energy
 sum includes all non-axis R/Z faces with the cylindrical face areas above. The donor is the upwind cell in the global face
 orientation: lower \(i\) or lower \(j\) for positive R/Z flux, higher \(i\) or
 higher \(j\) for negative R/Z flux. Incoming face power contributes to
@@ -23149,6 +23969,15 @@ measured) while absorbing benchmarks (su_olson) were untouched — the
 coverage hole that hid the defect. Regression gate:
 `verify sn_1d_planar_transparent_gap`. The scalar flux is
 \(\phi_g=\sum_n w_n\psi_{g,n}\) and \(E_g=\phi_g/c\).
+[2026-09-23] Every solve starts by copying `rad_E` into `rad_E_old` (the FLD
+rule); the copy used to happen only at step 0 and at the end of each solve,
+so after a checkpoint restart `rad_E_old` was 0 and the first step solved
+\(E^*=0-\Delta t\,\nabla\cdot F\), losing the radiation field. `sn_psi_prev`
+is part of the full-step retry snapshot (restored with its size, so an
+attempt that allocated it reseeds as the failed one did) and of checkpoints
+(`radiation_sn/psi_prev`); a restart keeps it when its size matches
+\(n_{cells}\,n_{groups}\,n_{angles}\) and reseeds isotropically otherwise
+(older checkpoints), with a logged warning.
 
 1D_SPH uses even-order Gauss-Legendre \(S_N\) sets. The default production
 choice is \(S_{16}\) (`Radiation.sn_transport.n_angles=16`). \(S_8\) is allowed
@@ -23495,48 +24324,77 @@ with \(A^R_\pm=2\pi r_\pm\Delta z\) and
 
 Source iteration is accelerated by per-group DSA when
 `Radiation.sn_transport.dsa_enabled=True`; when it is `False`, the sweep
-iteration skips the DSA correction branch and no DSA kernels are launched. In
-the notation of Larsen
-(1982), Eq. 4.12, the isotropic-scattering error equation places the lagged
-scattering error on the right-hand side. For backward Euler TENRYU stores the
-scalar flux \(\phi=cE\), multiplies the correction equation by \(c\Delta t\),
-and assembles the 1D_SPH row in volume-integrated form:
+iteration skips the DSA correction branch and no DSA kernels are launched.
+**The 1D correction is consistent with the sweep's discretization**
+(2026-09-24). The correction \(f\) of the angular flux satisfies the swept
+(backward-Euler, conservative-streaming) equations with the lagged
+scattering residual \(\sigma_s(\phi^{l+1/2}-\phi^l)\) as source (Larsen 1982,
+Eq. 4.12). With the P1 ansatz \(\psi_m=a\Phi+b\mu_mJ\) at the cell faces
+(\(a=1/\sum w\), \(b=1/\sum w\mu^2\), so \(\sum w\psi=\Phi\), \(\sum
+w\mu\psi=J\)), the zeroth and first angular moments of the discrete balance
+of cell \(c\) are
 \[
 \begin{aligned}
-&\left(V_c+c\Delta t\,\sigma_{a,c,g}V_c+\sum_f K_f+B_c\right)
-\delta\phi_{c,g}
--\sum_{f\in\mathrm{interior}} K_f\delta\phi_{nb(f),g} \\
-&\qquad =
-c\Delta t\,\sigma_{s,c,g}V_c
-\left(\phi^{sweep}_{c,g}-\phi^{old}_{c,g}\right),
+&A_oJ_o-A_iJ_i+\left(\sigma_a+\tfrac{1}{c\Delta t}\right)V\Phi_c
+ =\sigma_sV\left(\phi^{l+1/2}_c-\phi^l_c\right),\\
+&k\,(A_o\Phi_o-A_i\Phi_i)-k\,(A_o-A_i)\,\Phi_c
+ +\left(\sigma_t+\tfrac{1}{c\Delta t}\right)VJ_c=0,
 \end{aligned}
 \]
-with
-\[
-D_{c,g}=\frac{1}{3\sigma_{t,c,g}},\qquad
-K_f=c\Delta t\,A_fD_f/\Delta r_f.
-\]
-There is no factor \(1/2\) on the RHS: the angular source is
-\(\sigma_s\phi/2\), but the scalar moment integrates over the discrete angular
-weights whose sum is 2, leaving \(\sigma_s\phi\). The \(c\Delta t\sigma_s V\)
-factor is therefore cell/group local and is required for DSA to correct the
-source-iteration residual at the same scale as the backward-Euler transport
-operator.
+with \(k=a\sum w\mu^2\) (\(1/3\)) and \(A_f\), \(V\) the face areas and
+volume of the mesh geometry. The first moment of the angular redistribution
+is \(-k(A_o-A_i)\Phi_c/V\) for any quadrature, by the discrete cancellation of
+the isotropic flux that the conservative streaming form guarantees; its
+\(J\) part vanishes for the symmetric quadratures (Gauss–Legendre: exactly 0
+to rounding). The cell moments \(\Phi_c=\sum w\psi_m\), \(J_c=\sum
+w\mu\psi_m\) come from the sweep's own spatial closure
+\(\psi_m=\theta\psi_{dn}+(1-\theta)\psi_{up}\) (\(\theta\) per cell, group and
+angle: `precompute_lc_weights_kernel` for the linear-characteristic sweeps,
+\(1/2\) for the serial diamond sweeps), which makes them linear in the four
+face moments of the cell. Boundaries: \(J=0\) at the reflecting inner face
+(centre, axis, symmetry plane); no incoming correction through the outer face,
+\(a\Phi S_1=bJS_2\) with \(S_1=\sum_{\mu<0}w|\mu|\), \(S_2=\sum_{\mu<0}w\mu^2\)
+(the Marshak incoming intensity is data, so the vacuum condition holds for the
+correction). Ordered \((\Phi_0,J_0,\dots,\Phi_N,J_N)\) the rows (inner
+condition, then per cell balance and first moment, then outer condition) form
+a pentadiagonal system per group, solved for all groups at once by cuSPARSE
+`cusparseDgpsvInterleavedBatch` (QR, no pivoting failure on the zero diagonal
+of the inner row); the cell correction is \(\Phi_c\), added to the swept flux
+with the non-negativity floor (`sn_dsa_1d_gpu.cu`).
 
-At \(r=0\), 1D_SPH scalar parity gives a no-flux DSA boundary, so no additional
-row contribution is assembled. At the outer vacuum boundary the 1D_SPH DSA
-operator applies the same Marshak-like leakage convention used by
-`escaped_energy_kernel` in `src/radiation/sn_transport_1d_gpu.cu`:
-\[
-F_{out}=\beta_{vac}cE=\beta_{vac}\phi,\qquad \beta_{vac}=0.5.
-\]
-The corresponding volume-integrated diagonal term is
-\[
-B_c=c\Delta t\,\beta_{vac}A_{out}
-\]
-on the last cell only; it is not divided by \(V_c\). The resulting tridiagonal
-systems are solved by cuSPARSE `cusparseDgtsv2StridedBatch` with batch count
-\(G\), system size \(N_{cell}\), and stride \(N_{cell}\). In 2D_RZ the DSA
+**Why (measured 2026-09-24).** The former operator was a cell-centred
+diffusion equation (\(D=1/(3(\sigma_t+1/(c\Delta t)))\), harmonic face values,
+a \(\tfrac12cE\) outer leakage) that is not derived from the swept closure. A
+line-by-line Python replica of `sn_sweep_spherical_lc_kernel` and of that
+operator gave the spectral radius of the accelerated iteration 3.5 at
+\(\sigma_t\Delta r=10.5\) (S8 and S16), 5.5 at 104 and 6.1 at 500 (divergent;
+the GPU test at \(\sigma_s\Delta r=10.4\) stopped at 400 iterations with
+residual \(\infty\)), 0.75 at 2.9, 0.15 at 0.3; with the consistent operator
+0.21, 0.21, 0.22, 0.18 and 0.18, and at most 0.29 on geometric and random
+meshes, material jumps (thick core / thin shell and the reverse, cell by cell
+1000 / 1), near-void cells, steady state (\(\Delta t\to\infty\)), tiny cells at
+the centre and S32. `test_sn_1d_scattering_slab_dsa` checks the GPU rows
+against a host dense solve of the same system (three geometries, a varying
+\(\theta\)), the convergence on cells of optical thickness 10 in the three
+geometries (at most 30 iterations to \(10^{-8}\), against the unaccelerated
+reference), and the Anderson comparison below.
+
+**Anderson acceleration** (`Radiation.sn_transport.inner_acceleration=
+"anderson"`, 1D_SPH, 2026-09-24): the DSA-corrected source iteration
+\(\phi^{l+1}=G(\phi^l)\) (sweep, DSA correction, both with the
+non-negativity of the sweep) is mixed with the last `anderson_depth`
+\(m\le4\) residuals \(f_j=G(\phi^j)-\phi^j\) in the Walker–Ni form of the FLD
+outer iteration (`fld_anderson.cuh`, \(\beta=1\), Tikhonov-regularised normal
+equations, floor 0): \(\phi^{l+1}=\phi^l+f_l-\sum_j\gamma_j(\Delta\phi_j+\Delta
+f_j)\). The history restarts with every outer iteration, the unrolled graph
+path is not used, and the converged iterate is \(G(\phi)\) (no mix after the
+last iteration). Anderson mixing needs only evaluations of \(G\), so it keeps
+working with the sweep's non-negativity fix-ups, which make \(G\) nonlinear
+and rule out a Krylov solver on the sweep operator. `test_sn_1d_scattering_slab_dsa`
+compares the iteration counts and the converged fields of optically thick
+scattering spheres.
+The pentadiagonal systems have \(2(N_{cell}+1)\) rows per group, interleaved
+by group; the cuSPARSE work buffer is sized before capture. In 2D_RZ the DSA
 correction uses the corresponding R/Z 5-point diffusion stencil and a Jacobi
 iteration on the GPU; this is functional but not yet optimized for GXII-scale
 2D production.
@@ -23551,11 +24409,25 @@ every \(K\) inner iterations. The graph key includes cell/group/angle counts,
 \(K\), DSA mode,
 \(\Delta t\), spherical-sweep dynamic shared-memory size, quadrature-device
 pointers, mesh/radiation buffer pointers, the streaming-limiter mode flag, and
-the DSA cuSPARSE work buffer pointer. It is recaptured when those keys change,
+the DSA cuSPARSE work buffer and pentadiagonal scratch pointers. It is recaptured when those keys change,
 which covers mesh reallocations, angle-count changes, namelist mode changes,
-and timestep changes that alter kernel parameters. The DSA cuSPARSE buffer is
+and timestep changes that alter kernel parameters. When only \(\Delta t\) changed
+(buffers and sizes unchanged), the recaptured bodies update the instantiated
+graph in place (`cudaGraphExecUpdate`, same topology) instead of a new
+instantiation; any other key change, or a failed update, instantiates a new
+graph (2026-09-24). The DSA cuSPARSE buffer is
 allocated before capture; if graph capture or instantiation is unavailable, the
 solver falls back to the same streamed kernel sequence.
+
+Without scattering (every \(\sigma_s\) entry of the outer iteration exactly
+zero) the sweep source does not depend on the previous iterate, so one body
+(sweep, DSA step, state copy) is the transport solution for the outer
+iteration's emission. The solver then runs exactly one and records one inner
+iteration with residual 0, where the source iteration repeated the same sweep
+\(K\) times and then reported the residual 0 (2026-09-24; the run log states it
+once). The fixup tallies (radial and angular fixup counts and artificial
+absorption), which accumulate over the sweeps of a step, then count each outer
+iteration's sweep once.
 
 After each outer Picard sweep, a GPU Newton kernel solves the implicit electron
 balance cell-locally:
@@ -23593,9 +24465,13 @@ with defaults \(10^{-4}\) and \(10^{-5}\), respectively. Picard exits when
 because further Picard work is below the hydro time-integration error scale in
 the targeted GXII regime. Inner source iteration uses `inner_tol`. The
 deterministic tallies are
-`rad_dep[c,g]=c sigma_PA E_g V_c Delta t` and
+`rad_dep[c,g]=c sigma_PA E^{n+1}_g V_c Delta t` and
 `rad_emit[c,g]=eta_g V_c Delta t`, with
-\(\eta_g=c\sigma^{PE}_g a_{eV}T^4b_g\).
+\(\eta_g=c\sigma^{PE}_g a_{eV}T^4b_g\) at the final \(T\) and
+\(E^{n+1}_g\) the radiation energy the matter Newton writes back (the
+Newton kernel reads the written-back array explicitly; its input and output
+radiation arrays are the same array and are not `__restrict__`-qualified,
+2026-09-23).
 
 In 2D_RZ production SN, when the outer material Picard residual satisfies
 `outer_residual <= outer_tol` but the inner source iteration has not satisfied
@@ -23675,10 +24551,11 @@ clone with the per-level reflection index. `precompute_lc_weights_kernel`, the
 K2 moment/face reductions, the E*/donor-\(\theta\)/AP closures, escaped-energy
 and marshak boundary bookkeeping are reused unchanged (flat ordinate sums +
 runtime `geom`); the marshak ledger's discrete \(S^-=\sum_{\mu<0}w|\mu|\) is
-taken from the product set. **DSA is force-disabled for cylindrical** (the
-tridiagonal operator hardcodes \(4\pi r^2\) faces — spherical-only;
-acceleration-only, converged answer unchanged, one-time warning; pure-absorber
-gates unaffected). `TENRYU_DEBUG_LANE_PARALLEL` builds reject cylindrical.
+taken from the product set. **DSA runs for cylindrical** with the
+\(2\pi r\) faces and the product set's \(\mu\), \(w\) and \(\theta\) in the
+consistent face-moment rows (2026-09-24; the cell-centred operator ran from
+2026-09-23; it was force-disabled while the tridiagonal operator hard-coded
+\(4\pi r^2\) faces; acceleration only, the converged answer is unchanged). `TENRYU_DEBUG_LANE_PARALLEL` builds reject cylindrical.
 
 **Gates/tests**: `sn_1d_cylindrical_marshak_equilibration` (phase A uniform
 blackbody fixed point on the FULL cylinder r0=0 including the axis cell —
@@ -23687,9 +24564,38 @@ plateau, outer_rel 1.6e-7 / max_rel 9.6e-7 at 1800 steps, tolerances 1e-5 as
 spherical/planar), ctest `test_sn_cyl_quadrature` (CPU invariants) and
 `test_sn_1d_cylindrical_fixed_point` (LC+diamond × S8+S32, drift ≤ 1e-12,
 \(\chi=1/3\)). Residuals: no analytic cylindrical transport benchmark in the
-library yet (Lewis & Miller / PARTISN manuals in manual_queue); DSA
-cylindrical faces; multigroup cylindrical marshak (G=1 parity with the other
-geometries).
+library yet (Lewis & Miller / PARTISN manuals in manual_queue); multigroup
+cylindrical marshak (G=1 parity with the other geometries).
+
+#### 6.8.4 1D linear-discontinuous scheme (`spatial_scheme="linear_discontinuous"`, the 1D default, 2026-09-25)
+
+**Why.** With an emission or scattering source that is constant in each cell, a 1D spatial closure puts the wrong current into an optically thick, graded medium once \(\sigma\Delta r\gtrsim1\): for an emission \(\propto1+4r^2\) in a sphere (\(\sigma=40\), S8) the linear-characteristic scheme's current at \(r=0.5\) is 3.2× the diffusion current at \(\sigma\Delta r=4\) (1.24× at 1), and in a thick scattering sphere (\(\sigma_t=10\), \(c=1-10^{-4}\), \(\sigma\Delta r=10\)) its centre value is 81 % low (measured on replicas of the sweeps, 2026-09-25). Linear in-cell emission, scattering source and electron temperature, the temperature profile carried from step to step, restore the diffusion limit; rebuilding the in-cell profile from cell means at every step instead is several times less accurate. A Marshak wave (100 eV drive, \(\sigma=40\,\mathrm{cm^{-1}}\), \(C_v=5a T_b^3\), 200 steps of \(\Delta t=0.1/c\)) on 10 cells (\(\sigma\Delta r=4\)) against 160: max \(|T-T_{fine}|/T_b\) = 0.101 (sphere) / 0.068 (slab) with this scheme, 0.695 / 0.595 with the linear-characteristic scheme (`test_sn_1d_ld_step`); an independent Python implementation of the same discretization gives 0.101394 for the sphere, the GPU result to six digits. The linear-characteristic scheme's energy update (\(E^*=E^n-\Delta t\,\nabla\cdot F\) with the face fluxes limited so that no cell ends the step with negative radiation energy) throttled the transport through cells narrower than \(c\Delta t\) until its limiter credited the inflow in the order of the flow (2026-09-25, §6.8.2): a Marshak slab (0.4 cm, \(\sigma=50\,\mathrm{cm^{-1}}\), 50 eV drive, \(\Delta t=10^{-10}\) s) heated through on 8 cells but stayed cold inside on 32 and 128 cells; now its inner-cell temperature after 2000 steps converges with refinement to this scheme's (39.66 eV on 32 cells, 36.23 on 128, against 35.94 on 32 and 128 cells here; 49.52 on 8 cells).
+
+**Discretization.** Per cell the basis \(b_L=(r_R-r)/h\), \(b_R=(r-r_L)/h\), lumped masses \(M_j=\int b_jA\,dr\), \(N_j=\int b_jA'\,dr\) (two-point Gauss, exact) with the face area \(A=4\pi r^2\), \(2\pi r\) (per unit length) or 1 (per unit area). For ordinate \(m\) of an angular chain (§6.8.1; §6.8.3 for the cylinder's levels; the whole Gauss–Legendre set for the sphere and the slab):
+\[
+\begin{aligned}
+&\tfrac{\mu}{h}(M_L\psi_L+M_R\psi_R)-\mu A_L\hat\psi_L+\tfrac{N_L}{w_m}\big(\alpha_{m+\frac12}\psi_{m+\frac12,L}-\alpha_{m-\frac12}\psi_{m-\frac12,L}\big)+\big(\sigma_t+\tfrac1{c\Delta t}\big)M_L\psi_L=M_L\big(q_L+\tfrac{\psi^n_L}{c\Delta t}\big),\\
+&-\tfrac{\mu}{h}(M_L\psi_L+M_R\psi_R)+\mu A_R\hat\psi_R+\tfrac{N_R}{w_m}\big(\alpha_{m+\frac12}\psi_{m+\frac12,R}-\alpha_{m-\frac12}\psi_{m-\frac12,R}\big)+\big(\sigma_t+\tfrac1{c\Delta t}\big)M_R\psi_R=M_R\big(q_R+\tfrac{\psi^n_R}{c\Delta t}\big),
+\end{aligned}
+\]
+with the upwind face traces \(\hat\psi\) (the neighbour's node on the inflow side, the cell's own on the outflow side), the weighted diamond \(\psi_m=\tau_m\psi_{m+1/2}+(1-\tau_m)\psi_{m-1/2}\) at each node and the Carlson coefficients \(\alpha\) (zero at both ends of every chain; no angular term in the slab). Since \(N_L+N_R=A_R-A_L\) and the angular terms telescope, the weighted sum over nodes and ordinates is the exact cell balance; a uniform isotropic field satisfies every row exactly (\(V/h-A_L-N_L=0\)). Each chain starts from its starting direction, \(-s\,\partial_r\psi+(\sigma_t+1/c\Delta t)\psi=q+\psi^n_{sd}/c\Delta t\) along the diameter (\(s=1\) sphere, \(\sin\theta_\ell\) cylinder level), solved as a planar linear-discontinuous transport from the outer inflow with its own history. At the centre, the axis and the inner face of the slab the outward ordinate enters with its reflection partner's outflow. Outer face: vacuum or the Marshak inflow of §6.8 — a blackbody drive enters as \(\psi_{in}=cB_g/2\), a flux drive (`marshak.flux_erg_per_cm2_s`) as \(\psi_{in}=F_{inc}/\sum_{\mu<0}w|\mu|\) so that the discrete incoming current is the specified flux (the linear-characteristic scheme keeps \(2F_{inc}\)). The GPU sweep runs one warp per group, a chain's half-set of ordinates as a diagonal wavefront over the cells. A pure absorber is attenuated by \(1/(1+\tau+\tau^2/2)\) per cell of optical depth \(\tau\) along the ordinate (the linear-characteristic sweep: \(e^{-\tau}\)): slab, optical depth 20, S8, cells with \(\sigma\Delta x=2.5\) … 0.04 (8 … 256 cells), max relative error of the cell radiation energy where it exceeds \(10^{-3}\) of the drive 1.53, 0.81, 0.25, 0.076, 0.022, 0.0073; problems dominated by the uncollided attenuation of a beam through cells of optical depth \(\gtrsim1\) are more accurate with `"linear_characteristic"`.
+
+**Matter.** Every cell carries two electron specific energies, \(e_L=\bar e-(M_R/V)\delta\), \(e_R=\bar e+(M_L/V)\delta\) (\(V=M_L+M_R\)): `ee` \(=\bar e\) is their lumped-mass mean and the offset \(\delta=e_R-e_L\) is carried from step to step (`State::sn_ee_node_offset`, checkpoint `radiation_sn/ee_node_offset` [erg/g]; zero at the first step, after an ALE remap and after a size change; reduced where a node would fall below the energy of the temperature floor). \(T=T(e)\) from the cell material's electron EOS (the table closures of the cell-average Newton, with its tail convention; the ideal-gas closure \(e=e_{ref}+c_v(T-T_{ref})\) about the step-start `ee`, `Te`). The nodal matter equation is lumped like the transport:
+\[
+\rho\,(e_j-e^n_j)=\Delta t\Big(A_j-\sum_g\varepsilon_{g,j}\Big),\qquad A_j=\sum_g\sigma_{a,g}\phi_{g,j},\qquad\varepsilon_{g,j}=c\,\sigma_{pe,g}B_g(T_j).
+\]
+
+**Iteration.** Newton on the nodal temperatures: the cell opacities are evaluated at \(T(\bar e_k)\), and about \(T_k\)
+\[
+\varepsilon_g=\underbrace{c\sigma_{pe,g}B_g(T_k)-\chi_g\,\frac{\Delta t\sum_hc\sigma_{pe,h}B_h(T_k)+\rho(e_k-e^n)}{D}}_{\text{fixed}_g}+\underbrace{\chi_g\frac{\Delta t}{D}}_{\kappa_g}A,\qquad\chi_g=c\sigma_{pe,g}B'_g(T_k),\quad D=\rho c_v(T_k)+\Delta t\sum_h\chi_h,
+\]
+\(B'_g=a\,(4T^3b_g+T^4\,db_g/dT)\) with \(db_g/dT\) the derivative of the Planck table's own interpolation (\(4b_g+T\,db_g/dT=\int_{group}xf\,e^x/(e^x-1)\,dx>0\) for the Planck density \(f\); a negative interpolated value is set to 0). The per-angle source is \((\text{fixed}_g+\kappa_gA+\sigma_{s,g}\phi_g+S\delta_{g0})/2\). The coupling \((I-K)A=b\) — \(K\) the transport of every group's \(\kappa_gA\) — is solved by GMRES (restart 30, classical Gram–Schmidt with one reorthogonalization — both passes on the device, one copy of the coefficients to the host per Krylov step — deterministic reductions; each node's residual scaled by \(s_j=\sum_g\sigma_{a,g}(|\phi_{ref}|+cB_g)\); converged when the residual has dropped by `inner_tol` from the Newton iteration's first one, at most `max_inner_iterations` Krylov steps), right-preconditioned by the grey low-order correction: spectral shape \(\xi_g\propto\kappa_g/(\sigma_{a,g}+1/c\Delta t)\), \(\sum\xi_g=1\); the consistent P1 system of the sweep (the P1 ansatz \(\psi=a\Phi+b\mu J\) at both nodes inserted in every ordinate's equations, zeroth and first angular moments per node: four unknowns per cell, block tridiagonal, block Thomas) with the transport cross section \(1/\sum_g\xi_g/(\sigma_{t,g}+1/c\Delta t)\), the removal \((1-\sum_g\kappa_g)\sum_g\xi_g\sigma_{a,g}+1/c\Delta t\) and the source \(\sum_g\kappa_g\,r\); the correction of \(A\) is \(\sum_g\xi_g\sigma_{a,g}\Phi\). The preconditioner is applied in a Newton iteration only where it pays for itself (`Radiation.sn_transport.grey_preconditioner`, default `"auto"`, 2026-09-25): with the local gain \(\gamma_j=\bar\kappa_j\bar\sigma_{a,j}/\mathrm{rem}_j\) of the correction at node \(j\) (\(\bar\kappa=\sum_g\kappa_g\), \(\bar\sigma_a=\sum_g\xi_g\sigma_{a,g}\), \(\mathrm{rem}\) the removal above) — in an infinite medium the correction maps a smooth absorption-rate error \(v\) to \((1+\gamma)v\), and the unpreconditioned coupling contracts it by \(\gamma/(1+\gamma)\) per Krylov step — `"auto"` applies it when \(\max_j\gamma_j>0.1\) (a contraction above 0.091 per step) and otherwise runs GMRES unpreconditioned, skipping the P1 assembly, factorization and solves; `"on"` always applies it, `"off"` never. The converged solution and the tolerances are the same; the Krylov iterates differ, so does the rounding of the solution. In the GXII S_N deck \(\max_j\gamma_j\) stays below 0.065 (below 0.005 over the first 2000 steps); the correction saved 0.3 Krylov steps per Newton iteration late in the run (restarted from step 12000, 300 steps) and none early, and skipping it shortens the step by 3.8 ms late (8.14 to 7.01 s) and by 2.3 ms over the first 2000 steps (25.8 to 21.2 s, RTX 4090); the histories of the 300 late steps agree to \(10^{-10}\) relative. `TENRYU_SN_LD_PRECOND_AUDIT=1` logs, per Newton iteration, the largest gain, whether the preconditioner ran, the Krylov steps and the first residual ratios (read-only). Physical scattering is converged inside every transport solve by source iteration with the same P1 system per group, to 0.1 `inner_tol` (\(c=1-10^{-4}\), \(\sigma\Delta r=0.3/3/30\): 16/13/6 iterations in the sphere and the cylinder, 15/10/6 in the slab, to \(10^{-11}\)). The next linearization point of each node is its own balance temperature with the transport's absorption held (\(\rho(e(T)-e^n)+\Delta t\sum_gc\sigma_{pe,g}B_g(T)=\Delta t\max(A,0)\), safeguarded Newton), moved by at most a factor 4 per iteration (a tangent taken far below the solution overshoots by orders of magnitude when the emission dominates the heat capacity: a 5 eV → 100 eV step, measured), and by a fraction \(\omega\) of the step that halves (down to 1/16) when a step reverses the previous one without shrinking below half of it (the cell opacities are held at the point; a table-opacity corona cell at 643 eV alternated by ±20 eV and did not converge in 20 iterations without it). The iteration stops when the nodal temperatures change by at most `outer_tol` (the effective value of §6.8) and GMRES has converged. On the GPU the linearization and the nodal matter update (with its balance temperature) run one warp per node, the groups' Planck terms in parallel over the lanes and the sums over the groups in the group order; the electron EOS inversions (a bisection in \(\ln T\)) run on a warp that evaluates the next five bisection levels' 31 midpoints in parallel and descends the tree with the sequential loop's decisions (the same result); the P1 systems (the preconditioner's, and with physical scattering one per group) are assembled and eliminated once per Newton iteration, each diagonal block (with the lower neighbour eliminated) inverted by Gauss–Jordan with partial pivoting and stored as its inverse, and applied to every right-hand side by forward and backward substitution with matrix-vector products; the sweep's cell matrices of every group, ordinate and starting direction are inverted once per Newton iteration (they depend on the cross sections and the mesh only), so a cell's solve in the sweep is its right-hand side (source, inflow trace, angular edge) times the inverse, and each lane loads its next cell's operands one diagonal ahead (2026-09-25; the inverses change the rounding: the GXII S_N deck's integrated quantities differ from the Cramer's-rule and LU-substitution forms by at most \(2\times10^{-5}\) relative over 1593 steps, the iteration counts are the same).
+
+**Accepted state.** Each iteration's nodal energies follow from the transport's own absorption and the emission that entered its final sweep, \(e_j=e^n_j+\Delta t(A_j-\sum_g(\text{fixed}_g+\kappa_gA^*_j))/\rho\): radiation and matter exchange the same energy, so the step conserves energy for any iterate (to the scattering tolerance; measured step imbalance ≤ \(3\times10^{-15}\) relative). `ee` is the lumped-mass mean, `Te` \(=T(\)`ee`\()\), `Pe` from the EOS; `rad_E` \(=\sum_jM_j\phi_j/(cV)\) (`sn_phi_old` the same mean of \(\phi\)); `rad_dep`/`rad_emit` the absorbed/emitted energy of the step; the face flux is the transport's own current (no blending with a diffusion flux, no limiter, no void-cell energy anchor); the escape is booked gross as in §6.8. A step that did not converge, or that raised a node to the floor energy, requests the driver's retry through `sn_material_retry_flag` (4 Newton, 8 GMRES, 16 scattering, 1 floor). Void cells have no absorption, emission or scattering and keep their matter energy. \(\psi^n\) (every ordinate and node, `radiation_sn/psi_prev`) and the starting-direction histories (`radiation_sn/psi_sd_prev`) are rescaled at the step start per (cell, group) so that \(\sum_jM_j\phi^n_j=cE^nV\) with \(E^n\) the radiation energy the other operators left (compression, remap, a restart), or seeded isotropic and flat in the cell (first step, a size change, a remap, no usable history).
+
+**Namelist.** A 1D deck that does not set `spatial_scheme` runs this scheme; `inner_acceleration="anderson"` is refused with it, and `dsa_enabled`, `inner_graph_unroll`, `outer_tol_stagnation_factor`, `diffusion_fallback_mode`, `tau_diffusion_on/off` apply to the linear-characteristic scheme only.
+
+**Tests.** ctest `test_sn_1d_ld` (the GPU sweep and moments against a host implementation of the same equations in the three geometries; the P1-accelerated source iteration of thick scattering against a dense direct solution: error ≤ \(2.5\times10^{-12}\)) and `test_sn_1d_ld_step` (the Planck fraction derivative against central differences, worst relative difference \(2.2\times10^{-8}\); the equilibrium fixed point in every geometry, one and three groups, with scattering: change ≤ \(3\times10^{-15}\); the step energy balance with vacuum and Marshak boundaries, scattering, void cells and a flux drive; the Marshak waves above; the slab attenuation study above; six groups with the frequency-dependent opacity (\(\sigma\) from \(10^{8}\) to 26 cm⁻¹, 5 eV matter under a 150 eV drive): every step converged, at most 139 GMRES iterations in a step, run-to-run bitwise identical). Verification: `sn_1d_analytic_marshak`, `sn_1d_su_olson`, `sn_1d_marshak_equilibration` (sphere, slab, cylinder), `sn_1d_planar_transparent_gap`, `sn_1d_origin_symmetry` and `sn_1d_e_old_transient` run this scheme; `sn_1d_planar_slab_attenuation` (the exact attenuation) and `sn_1d_spherical_lathrop_two_region` set `"linear_characteristic"`. The slab equilibration's inner-slab temperature on 8 cells matches a 128-cell run to 0.05 % from 1000 steps on (the linear-characteristic 8-cell run leads it: 49.65 eV at 3000 steps against 47.67), so its step cap is 16000 (it reaches the plateau more slowly than the linear-characteristic run it was set for).
 
 ---
 
@@ -26313,7 +27219,7 @@ E_{pdV}^{boundary} = \sum_{f \in \partial\Omega} P_f \,(A_f\, v_{n,f})\,\Delta t
 E_{artificial}=E_{floor}+\max(E_{safety}-E_{floor},0)+E_{redistribution\_unresolved}.
 \]
 \(E_{numerical\_loss}\) は粒子移送失敗等のアルゴリズム限界による数値的喪失エネルギー（§12.3.1参照）。物理的境界流出 \(E_{rad,esc}\) とは明確に区別する。
-分母のフロア：\(E_{denom} = \max(E_{total}^n,\, E_{source},\, 10^{-20}\;\text{erg})\)。コールドスタート（全エネルギー≈0）での0除算と偽 FATAL を防止する。
+分母：\(E_{denom} = \max(|E_{int,e}^n|+|E_{int,i}^n|+|E_{kin}^n|+|E_{rad}^n|,\, E_{source},\, 10^{-20}\;\text{erg})\)。第 1 項はエネルギーの和を作る各項の大きさで、\(\Delta E_{total}\) の丸め誤差はこれに比例する。表 EOS の冷たい曲線では内部エネルギーが負になり、\(E_{total}^n\) がこれらの項に比べて小さく（負にも）なるため、2026-09-25 までの \(\max(E_{total}^n,\dots)\) では冷たい標的から始まる run の最初の数 step で入力エネルギー（\(10^{-18}\) erg 程度）が分母になり、丸め誤差だけで \(\varepsilon_{budget}\sim1\) と床・安全補正の比の警告が出ていた。全項が非負なら従来の \(E_{total}^n\) と同じ値である。\(10^{-20}\) erg はコールドスタート（全エネルギー≈0）での0除算を防ぐ。
 
 > **注意**：\(\varepsilon_{budget}\) の分子は **物理的保存誤差**であり、\(E_{floor}\)、\(E_{safety}\)、\(E_{redistribution\_unresolved}\) は人工補正として取り除く。\(E_{solver}\) は符号に応じて \(E_{source}\) または \(E_{sink}\) に入れる。
 > これらは総収支式に陽に入るため、正しく計上すれば恒等式を満たす。
@@ -27733,7 +28639,7 @@ ALE remap（§3.3.4）は rezone後に1回のcellフィールド交換で対応�
   - \(E_{census}^{total}\)：census粒子エネルギー合計
   - \(N_{particles}^{total}\)：全粒子数
   - \(N_{mode\_switch}^{total}\)：モード変換回数
-- 収支チェック：§10.2 の \(\varepsilon_{budget}\) 定義に従い、分母に \(E_{denom} = \max(E_{total}^n, E_{source}, 10^{-20})\) を使用する（§11.1参照）
+- 収支チェック：§10.2 の \(\varepsilon_{budget}\) 定義に従い、分母に \(E_{denom} = \max(|E_{int,e}^n|+|E_{int,i}^n|+|E_{kin}^n|+|E_{rad}^n|, E_{source}, 10^{-20})\) を使用する（§11.1参照）
 
 **エネルギー収支 MPI_Allreduce のタイミング**：
 
@@ -28314,6 +29220,16 @@ transaction 拡張が必要で escalate 済み（同 dt 内の当該ステップ
 （T_e keV、g/cm²。δ(ρ)=1→3 for solid→**絶対密度** 10⁴ g/cm³ を再現、G-K0）。
 非 α 種は電子 drag 域スケーリング \(\lambda_s=\lambda_\alpha\sqrt{m_sE_s/m_\alpha E_\alpha}(Z_\alpha/Z_s)^2\)。
 
+**媒質の組成**（2026-09-23 是正 — 旧実装は組成によらず等モル DT の飛程を使っていた）:
+fit 3d は等モル DT の値なので、\(1/(\rho\lambda)=S_e+S_i\)（電子項
+\(S_e=1/(1.5\times10^{-2}T_e^{5/4})\)、イオン項 \(S_i=8.2\times10^{-3}/1.5\times10^{-2}\)）に分け、
+単位質量あたりの電子数と \(\sum_j Z_j^2/A_j\) の等モル DT 比
+\(f_e=(\bar Z/\bar A)/(\bar Z/\bar A)_{DT}\)、\(f_i=(\overline{Z^2/A}/\bar A)/(\overline{Z^2/A}/\bar A)_{DT}\)
+（上線はイオンあたりの平均）で \(f_eS_e+f_iS_i\) とする。Coulomb-log 密度補正の ρ は DT 換算の
+電子密度に当たる \(f_e\rho\) で置く。組成はステップ開始時のセルの場イオン（§14.7 と同じ定義）。
+等モル DT では \(f_e=f_i=1\) が厳密に成り立ち旧式とビット同一、灰（⁴He・p）が溜まると 1 からずれる。
+純 D は \(f_e=1.249\)・\(f_i=1.497\)（10 keV・固体密度で飛程 0.79 倍）。
+
 幾何は**点源球核**（一様媒質・直線飛行・v 線形電子 drag の前荷重減速
 \(E(s)=E_0(1-s/\lambda)^2\)）：出生半径比 u=r/R_b、τ=R_b ρ̄/ρλ に対する閉形式
 （asinh 1 個の初等関数、G-K1 で凍結求積参照 39 点 abs ≤ 1e-11）。体積平均は古典二分枝
@@ -28350,7 +29266,13 @@ T_i=T_e 対角で評価）±3 点＋Python prototype ±1 点の転写忠実帯�
 H/2-C-R-H/2、burn は全 dt 陽的源で分割しない）。ステージは host 実行（in-flight mirror
 方式は inject_laser_source_terms 前例踏襲；perf 最適化は将来の別 PR）。沈着は
 \(e_e{+}\!=dE_e/(\rho V)\), \(e_i{+}\!=dE_i/(\rho V)\) 後に Te/Ti/Pe/Pi を再閉包
-（table EOS / cv_override / ideal の全分岐、1T は合算を e_e へ）。核融合エネルギーは
+（table EOS / cv_override / ideal の全分岐、1T は合算を e_e へ）。沈着と閉包はデバイス上で
+レーザー沈着と同じ閉包を使い、energy_authoritative の表 EOS では表の温度上限を超えた
+エネルギーを高温側の延長（\(T=T_{top}+(e-e_{top})/c_{v,top}\)、\(P=P_{top}T/T_{top}\)、§1）で
+閉じる。沈着の無いセル（\(dE_e=dE_i=0\)）は触らない（2026-09-23 修正: 従来はホストで全セルを
+再閉包しており、反応の無いセルの Te を逆変換の許容誤差だけ動かし、表の上限を超えたセルでは
+Te を \(T_{max}\) に止めていた）。void・質量ゼロのセルへの沈着は skipped として台帳に計上し、
+床注入・クランプ数はセル順の固定順で畳み込む。local スキームで燃焼域（燃料体積分率が vf_threshold を超える最初から最後のセル）に反応しうるセル（\(\rho>0\) かつ \(T_i\ge T_{floor}\)）が無い step は、ステージと沈着を実行せず診断量をゼロにする（沈着ゼロのセルは触らないので結果は実行した場合とbit 同一。2026-09-23、ホスト転送と起動の省略）。核融合エネルギーは
 静止質量起源の**外部源**として budget の source 側 `E_burn_in` に登録（逃逸荷電/中性子は
 流体に入らないので sink ではない）。W5 実測：burn 活性 6 run すべてで
 epsilon_budget ≤ 6e-16。dt 制限は hot-electron 意味論
@@ -28386,9 +29308,24 @@ D_g は flux-limited（加算型 limiter + Post-Wilson \(|\bar\mu|^{-1}=1+3e^{-(
 明示 NRL 型 Coulomb log で毎セル毎ステップ評価（論文 intro の絶対値 anchor は未印字
 log 処方を含むため転写対象から棄却 — log-free 恒等式 e/i∝E^{3/2}・λ∝E² と 0-D 解析
 減速極限 \(E(t)=[(E_0^{3/2}+\gamma t_E)e^{-3t/2t_E}-\gamma t_E]^{2/3}\) が gate）。
+t_E は電子とのエネルギー緩和時間 \(\dot E = -E/t_E\) で、Corman (1975) p. 380 の
+\(t_E = 3m\theta_e^{3/2}/(8\sqrt{2\pi m_e}\,n_e Z^2 e^4\ln\Lambda_e)\)
+（Spitzer の運動量減速時間の半分。2026-09-23 是正 — 旧実装は分母の 8 を 4 としており
+t_E が 2 倍、電子加熱率が半分だった。`Burn.scheme="diffusion"`（1D・2D）と `"mc"` が共有する）。
 **イオン Coulomb log と γ は (群, セル) 毎**に群中心エネルギーで評価する
 （2026-07-26 修正 — 旧実装は出生エネルギーで 1 回評価し
 全群へ流用しており、最接近距離の E 依存が終端域で欠落していた）。
+**場イオン**（2026-09-23 是正 — 旧実装は全セルで等モル DT に固定し、イオン Coulomb log の
+場イオン密度と質量だけ A=2.5、γ・λ は 2.51505 を使っていた）: γ・λ・イオン Coulomb log の場イオンは
+セル毎の組成から作る。燃焼在庫の D/T/³He/⁴He/p（比在庫 \(Y_s\)、重み \(Y_s m_p\)）と、
+セルの非燃料・非 void 材料（重み \(vf_m/A_m\) — 在庫の初期化と同じく材料の質量分率を体積分率で置く、
+電荷は材料の Z、化合物は平均の Z で代表）を完全電離のイオンとして平均し、\(\bar A\)・\(\overline{Z^2}\)・\(\overline{Z^2/A}\) を得る:
+\(n_i=\rho/(\bar A m_p)\)、γ の \(\sum_j n_jZ_j^2/m_j=n_i\overline{Z^2/A}/m_p\)、λ の
+\(\sum_j n_jZ_j^2=n_i\overline{Z^2}\)、イオン Coulomb log の Debye 項 \(n_i\overline{Z^2}/kT_i\) と換算質量の
+場イオン質量 \(\bar A m_p\)。面の λ は両セルの \(\sum_j n_jZ_j^2\) の平均で評価する。在庫も場の材料も無い
+セル（void）は設定の燃料組成 Burn.x_D/x_T/x_He3 を使う。組成はステップ開始時の在庫で評価し、2D の
+複数ランクでは所有者の値を ghost セルへ交換する。電子項 t_E は従来どおりセルの
+\(n_e=\bar Z\rho/(A_{eff}m_p)\)。
 t_E 非正/非有限のセルは γ が有限なら純イオン drag で減速を継続
 （\(\tau=(2/3)(E_{g+1}^{3/2}-E_g^{3/2})/\gamma\)、分配は全イオン — §6.5 修正;
 旧実装は sink ごと消していた）。
@@ -28418,7 +29355,9 @@ Brysk 1973 の二 Maxwell 平均モーメント。燃焼重み付き ⟨T_i⟩_b
 \tfrac{m_n}{m_D+m_T}\tfrac{3}{2}\theta + \tfrac{m_\alpha}{m_n+m_\alpha}\langle K\rangle\)
 （⟨K⟩ = 3T_reac−(3/2)θ、T_reac は Brysk Table 1 転写（Reac 列 = ⟨E⟩/3 と解読、
 両公表 anchor 35 keV/336 keV·33/157 keV を実装前検算で再現）、log-T 補間・[1,100] keV clamp）、
-熱幅 σ² = 2m_nθ⟨E_n⟩/(m_n+m_partner)、全幅は 4π 平均の流体広がり
+熱幅 σ² = 2m_nθ⟨E_n⟩/(m_n+m_partner)（ガウス分布の標準偏差。Brysk の 336/157 keV は
+1/e 半値半幅 \(\sqrt2\sigma\)。実装は 2026-09-23 まで係数 1/2 を掛け、σ を半分に報告していた）、
+全幅は 4π 平均の流体広がり
 σ_fluid² = 2m_nE_{n0}⟨v_r²⟩/3 を加算（球対称 1D の合成検出器は方向平均 —
 一次モーメントは対称消失、視線スペクトルは v3/Crilly-Munro scope として設計 doc 記録）。
 history `burn/neutron_{Ti_burn,mean_shift,sigma_thermal,sigma_total}_{dt,dd}`
@@ -28427,7 +29366,7 @@ history `burn/neutron_{Ti_burn,mean_shift,sigma_thermal,sigma_total}_{dt,dd}`
 ### 14.9 MC α 輸送（v2、`Burn.scheme="mc"`、統計モード）
 
 Yuan-Moses-McKenty 2005 型の直線 CSDA Monte Carlo（1D 球面特化、角散乱なし —
-偏向 λ は拡散 scheme のみ）。**停止能係数は §14.7 と同一**（corman_tE/γ 共有 —
+偏向 λ は拡散 scheme のみ）。**停止能係数は §14.7 と同一**（場イオンを含む。corman_tE/γ 共有 —
 scheme 間一致 gate が模型恒等性の検証になる）。イオン Coulomb log は
 **粒子の現在エネルギー**で毎セグメント評価（2026-07-26 修正 —
 旧実装は出生エネルギーで凍結、Bragg-peak 近傍の γ を誤っていた。RNG 消費は不変）。粒子 (r, μ, E, w, slot) は
@@ -28435,13 +29374,19 @@ scheme 間一致 gate が模型恒等性の検証になる）。イオン Coulom
 **RNG は Philox / curand_init(seed^global_id, subsequence=step, offset) —
 NUMERICS §12.7.1 凍結契約**（global_id = (cell·6+slot)·N_mc+sample）。
 CSDA 沈着は局所瞬時レート比で e/i 分割、熱化 E≤E_min → イオン、逃逸 → 台帳。
-tally は atomicAdd（統計モード — bitwise 非適用、§0.3 MC 条項が適用）。
+新しい粒子は pool の既存粒子の後ろに (cell, slot, sample) の順で並ぶ（(cell, slot) ごとの粒子数の排他的走査で
+位置を決める）。セルへの沈着は 128 ビットの固定小数点の整数（64 ビット 2 語、下位語の桁上がりを上位語へ）に
+原子的に足す: そのステップの粒子の総エネルギー E_tot = f·2^e（0.5 ≤ f < 1）に対し 1 単位 = 2^(e−100) で、
+1 回の沈着の丸めは 2^(−100)·E_tot 以下。整数の和は順序に依らず、発生・逃逸・飛行中の集計も
+(cell, slot) または粒子ごとの値の固定順序の和なので、同じ seed の再実行はビット一致する（2026-09-24。
+それまでは浮動小数点の atomicAdd で、pool の並びもスレッドの実行順だった）。負または非有限の沈着が
+あったセルは沈着を NaN で返す。
 per-particle 簿記により台帳恒等 released = dep+esc+ΔE_inflight は RNG に
 依らず厳密（実測 8.5e-15、ε_budget 5.6e-16）。
 **三 scheme 整合（3 keV/ρ10/ρR0.2 実測）**: deposited fraction
 fraley 0.968 / mc 0.928 / diffusion 0.722 — mc（参照級）に対し fraley は
 その解析近似（+4%）、diffusion は Milne 逃逸+スペクトル拡散で低め、と
-物理的序列どおり。CV gate: 同 seed 5 run CV ≤ 1e-3（atomic 順序帯、§0.3 文言）
+物理的序列どおり。CV gate: 同 seed 5 run CV ≤ 1e-3（§0.3 文言。2026-09-24 以降はビット一致）
 + 異 seed 5 run CV ≤ 5%（統計収束、1/√N 傾向は PERFORMANCE 記帳）。
 
 ### 14.10 2D_RZ port（scheme="local"|"diffusion"、2026-07-11）

@@ -79,6 +79,7 @@ Output(
     plot_every=0,
     checkpoint_every=0,
     plot_every_s=-1.0,
+    history_every=1,
     history_every_s=1.0e-11,
     checkpoint_every_s=-1.0,
 )

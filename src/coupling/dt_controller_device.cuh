@@ -103,6 +103,9 @@ struct DtLadderIn {
 struct DtLadderOut {
   double dt_chosen;
   int limiter;
+  // dt before the truncation to the output time and t_end: the next step's
+  // growth reference (dt_prev), NUMERICS §2.2.
+  double dt_growth_basis;
 };
 
 __host__ __device__ inline DtLadderOut dt_ladder_eval(
@@ -115,6 +118,7 @@ __host__ __device__ inline DtLadderOut dt_ladder_eval(
   const double dt_growth = in.growth_factor * in.dt_prev;
   dt_new = (dt_growth < dt_new) ? dt_growth : dt_new;
   dt_new = (in.dt_max < dt_new) ? in.dt_max : dt_new;
+  const double dt_growth_basis = dt_new;
   dt_new = (in.dt_output < dt_new) ? in.dt_output : dt_new;
   dt_new = (in.dt_remaining < dt_new) ? in.dt_remaining : dt_new;
 
@@ -136,7 +140,7 @@ __host__ __device__ inline DtLadderOut dt_ladder_eval(
   } else if (dt_new == in.dt_max) {
     limiter = kDtLimiterMax;
   }
-  return {dt_new, limiter};
+  return {dt_new, limiter, dt_growth_basis};
 }
 
 void run_dt_controller_check(const DtLadderIn& in, double out[2]);

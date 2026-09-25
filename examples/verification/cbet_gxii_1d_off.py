@@ -160,6 +160,7 @@ Output(
     directory="outputs/cbet_gxii_1d_off",
     format="hdf5",
     plot_every_s=1.0e-9,
+    history_every=1,
     history_every_s=50.0e-12,
     checkpoint_every=0,
     save_namelist_copy=False,

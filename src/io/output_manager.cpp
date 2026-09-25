@@ -253,6 +253,20 @@ void OutputManager::init(const tenryu::core::Config& cfg, const int rank) {
   checkpoint_count_ = max_checkpoint_index + 1;
 }
 
+OutputManager::~OutputManager() {
+  try {
+    HDF5Writer::wait_for_snapshot_writes();
+  } catch (const std::exception& e) {
+    core::log_warning(std::string("OutputManager: snapshot publication failed: ") + e.what());
+  } catch (...) {
+    core::log_warning("OutputManager: snapshot publication failed");
+  }
+}
+
+void OutputManager::wait_for_snapshots() const {
+  HDF5Writer::wait_for_snapshot_writes();
+}
+
 void OutputManager::set_termination_reason(std::string reason) {
   termination_reason_ = std::move(reason);
 }
@@ -343,7 +357,10 @@ void OutputManager::write_snapshot(const tenryu::core::State& state,
   }
   const int file_index = snapshot_count_++;
   HDF5Writer writer;
-  writer.write_snapshot(state, cfg, file_index, step, t, results_dir, case_name, rank);
+  // Published by the writer's worker thread; the driver waits for it at the
+  // end of the run (wait_for_snapshots).
+  writer.write_snapshot_in_background(state, cfg, file_index, step, t, results_dir, case_name,
+                                      rank);
 }
 
 void OutputManager::write_checkpoint(

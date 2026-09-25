@@ -17,6 +17,13 @@ struct IonmixOpacityDeviceView {
     const double* kappa_PA = nullptr;      ///< [ngroups * ndens * ntemp] Planck absorption [cm^2/g]
     const double* kappa_PE = nullptr;      ///< [ngroups * ndens * ntemp] Planck emission  [cm^2/g]
     const double* kappa_R  = nullptr;      ///< [ngroups * ndens * ntemp] Rosseland        [cm^2/g]
+    /// Optional log(max(kappa, kKappaFloor)) of the three tables (same
+    /// layout), filled with the device log so interpolate() gives identical
+    /// results with or without them; null means interpolate() takes the four
+    /// corner logs itself (2026-09-23).
+    const double* log_kappa_PA = nullptr;
+    const double* log_kappa_PE = nullptr;
+    const double* log_kappa_R  = nullptr;
     int ntemp   = 0;
     int ndens   = 0;
     int ngroups = 0;
@@ -26,6 +33,14 @@ struct IonmixOpacityDeviceView {
     double log_ni_max = 0.0;   ///< log(numdens_cm3.back())
     double T_min = 0.0;        ///< temps_eV.front()  (linear, for FD boundary)
     double T_max = 0.0;        ///< temps_eV.back()   (linear, for FD boundary)
+
+    /// Precomputed log table of kappa_table (one of the three), or null.
+    __device__ __forceinline__ const double* log_table_for(const double* kappa_table) const {
+        if (kappa_table == kappa_PA) return log_kappa_PA;
+        if (kappa_table == kappa_PE) return log_kappa_PE;
+        if (kappa_table == kappa_R) return log_kappa_R;
+        return nullptr;
+    }
 
     /// Flat index into kappa tables: layout [group][dens][temp], T-fastest.
     __device__ __forceinline__ int flat_index(int g, int d, int t) const {
@@ -123,10 +138,15 @@ struct IonmixOpacityDeviceView {
         }
 
         // Log-space interpolation (floor at 1e-100 to avoid log(0))
-        const double lk00 = log(fmax(k00, kKappaFloor));
-        const double lk10 = log(fmax(k10, kKappaFloor));
-        const double lk01 = log(fmax(k01, kKappaFloor));
-        const double lk11 = log(fmax(k11, kKappaFloor));
+        const double* log_table = log_table_for(kappa_table);
+        const double lk00 = log_table != nullptr ? log_table[flat_index(g, d0, t0)]
+                                                 : log(fmax(k00, kKappaFloor));
+        const double lk10 = log_table != nullptr ? log_table[flat_index(g, d1, t0)]
+                                                 : log(fmax(k10, kKappaFloor));
+        const double lk01 = log_table != nullptr ? log_table[flat_index(g, d0, t1)]
+                                                 : log(fmax(k01, kKappaFloor));
+        const double lk11 = log_table != nullptr ? log_table[flat_index(g, d1, t1)]
+                                                 : log(fmax(k11, kKappaFloor));
 
         // Bilinear lerp in log-kappa space
         const double lkx0 = lk00 + tx * (lk10 - lk00);

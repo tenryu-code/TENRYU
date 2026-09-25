@@ -74,10 +74,15 @@ BryskMoments brysk_moments(const int channel, const double Ti_burn_keV,
       (A_partner / (kNeutronA + A_partner)) * K_mean;
   const double E_n_keV = E_n0_keV + moments.mean_shift_keV;
 
-  // Convert Brysk's full 1/e width convention to Gaussian sigma.
+  // Gaussian sigma of the thermal (CM-velocity) broadening: the CM velocity
+  // component along the neutron direction has variance theta/(m_n + m_X), so
+  // E_n - <E_n> = m_n u_n V_par has sigma^2 = 2 m_n theta E_n / (m_n + m_X).
+  // Brysk's 336 keV (DT) and 157 keV (DD) at 10 keV are 1/e HALF widths,
+  // sqrt(2) sigma (FWHM = 2.355 sigma, the familiar 177 sqrt(T) keV for DT).
+  // The former factor 0.5 read them as full widths and halved sigma
+  // (2026-09-23).
   moments.sigma_thermal_keV =
-      0.5 * std::sqrt(2.0 * kNeutronA * theta * E_n_keV /
-                      (kNeutronA + A_partner));
+      std::sqrt(2.0 * kNeutronA * theta * E_n_keV / (kNeutronA + A_partner));
 
   double sigma_fluid_keV = 0.0;
   if (vr2_burn_cm2s2 > 0.0) {

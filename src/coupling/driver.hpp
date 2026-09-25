@@ -89,6 +89,9 @@ struct DtLineage {
   double t_s = 0.0;
   double dt_chosen = 0.0;
   double dt_uncapped_by_contact = 0.0;
+  // dt_uncapped_by_contact before the truncation to output times and t_end:
+  // the growth reference of the next step (NUMERICS §2.2).
+  double dt_growth_basis = 0.0;
   // Set instead of asserting when dt collapses below Numerics.dt.min_s and
   // the caller passed defer_dt_floor_abort: the caller must either rescue
   // (e.g. central pseudo-core ring absorption) or re-raise the abort.

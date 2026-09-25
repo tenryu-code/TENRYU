@@ -23,6 +23,10 @@ if(TENRYU_ENABLE_HDF5)
   if(HDF5_IS_PARALLEL)
     target_link_libraries(tenryu_io PUBLIC MPI::MPI_CXX)
   endif()
+  # zlib compresses the large deflate datasets of snapshots and checkpoints in
+  # parallel (hdf5_writer.cpp, the deflate filter's own compress2 call).
+  find_package(ZLIB REQUIRED)
+  target_link_libraries(tenryu_io PRIVATE ZLIB::ZLIB)
 endif()
 
 set_target_properties(tenryu_io PROPERTIES

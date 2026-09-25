@@ -254,10 +254,13 @@ struct ColdInverseResult {
   int iterations;
 };
 
-// Safeguarded Newton/bisection for F(T) = ee_base(T) + (w - T w' - 1) C - qe_target
-// on [T_lo, T_hi]. `ee_base(T)` and `cv_base(T)` are callables evaluating the
-// base electron table at the fixed density (host: EOSTable::energy/cv, device:
-// device_eos_energy/device_eos_cv with a fixed rho bracket).
+// Root of F(T) = ee_base(T) + (w - T w' - 1) C - qe_target on [T_lo, T_hi].
+// `ee_base(T)` and `cv_base(T)` are callables evaluating the base electron
+// table at the fixed density (host: EOSTable::energy/cv, device:
+// device_eos_energy/device_eos_cv with a fixed rho bracket), bilinear in
+// (ln rho, ln T). With the table's log-temperature nodes (log_T_nodes,
+// n_nodes) the root is found on them (below); without them, by the
+// safeguarded Newton/bisection iteration.
 template <class EBase, class CvBase>
 TENRYU_HOST_DEVICE inline ColdInverseResult cold_inverse_Te(const ColdEquilibriumView& view,
                                                             const double rho,
@@ -266,12 +269,20 @@ TENRYU_HOST_DEVICE inline ColdInverseResult cold_inverse_Te(const ColdEquilibriu
                                                             const double T_hi,
                                                             const double T_hint,
                                                             EBase&& ee_base,
-                                                            CvBase&& cv_base) {
+                                                            CvBase&& cv_base,
+                                                            const double* log_T_nodes = nullptr,
+                                                            const int n_nodes = 0,
+                                                            const double* C_given = nullptr) {
   ColdInverseResult out{T_lo, 4, 0};
   if (!(T_hi > T_lo) || !(T_lo > 0.0) || !(qe_target == qe_target) || !(rho > 0.0)) {
     return out;
   }
-  const double C = cold_reference(view, rho).C;
+  // C_given: cold_reference(view, rho).C computed by the caller.
+  const double C = (C_given != nullptr) ? *C_given : cold_reference(view, rho).C;
+  const auto G = [&](const double T) {
+    const ColdGate g = cold_gate(view, T);
+    return (g.w - T * g.dw - 1.0) * C;
+  };
   auto F = [&](const double T) {
     const ColdGate g = cold_gate(view, T);
     return ee_base(T) + (g.w - T * g.dw - 1.0) * C - qe_target;
@@ -298,6 +309,125 @@ TENRYU_HOST_DEVICE inline ColdInverseResult cold_inverse_Te(const ColdEquilibriu
     out.status = 2;
     return out;
   }
+  const int max_it = (view.max_iterations > 0) ? view.max_iterations : 80;
+  if (log_T_nodes != nullptr && n_nodes >= 2) {
+    // Between two neighbouring nodes ee_base is linear in u = ln T, so F is
+    // too wherever the gate is constant (T <= T_a or T >= T_star). The node
+    // interval of the root is found by bisection over the nodes inside
+    // (T_lo, T_hi) (F < 0 below, F >= 0 above: f == 0 counts as the upper
+    // side, as in the iteration below); in it the root of the linear F is
+    // solved directly, and in the gate's transition by Newton in u with the
+    // exact derivative dF/du = s - T^2 w'' C (s the energy slope of the
+    // interval), bracketed. (The iteration without nodes steps with the
+    // table heat capacity, which is not the interpolant's slope, and needed
+    // about 50 evaluations per inversion.)
+    const double u_lo = log(T_lo);
+    const double u_hi = log(T_hi);
+    int k0 = 0;  // first node with u > u_lo
+    {
+      int lo = -1;
+      int hi = n_nodes;
+      while (hi - lo > 1) {
+        const int mid = lo + ((hi - lo) >> 1);
+        if (log_T_nodes[mid] > u_lo) {
+          hi = mid;
+        } else {
+          lo = mid;
+        }
+      }
+      k0 = hi;
+    }
+    int k1 = n_nodes - 1;  // last node with u < u_hi
+    {
+      int lo = -1;
+      int hi = n_nodes;
+      while (hi - lo > 1) {
+        const int mid = lo + ((hi - lo) >> 1);
+        if (log_T_nodes[mid] < u_hi) {
+          lo = mid;
+        } else {
+          hi = mid;
+        }
+      }
+      k1 = lo;
+    }
+    double TL = T_lo;
+    double FL = F_lo;
+    double TR = T_hi;
+    double FR = F_hi;
+    int a = k0 - 1;
+    int b = k1 + 1;
+    int evaluations = 0;
+    while (b - a > 1) {
+      const int m = a + ((b - a) >> 1);
+      const double Tm = exp(log_T_nodes[m]);
+      const double fm = F(Tm);
+      ++evaluations;
+      if (fm < 0.0) {
+        a = m;
+        TL = Tm;
+        FL = fm;
+      } else {
+        b = m;
+        TR = Tm;
+        FR = fm;
+      }
+    }
+    out.iterations = evaluations;
+    out.status = 0;
+    if (FR == 0.0) {
+      out.T = TR;
+      return out;
+    }
+    double uL = log(TL);
+    double uR = log(TR);
+    const bool gate_constant =
+        !(view.T_star > view.T_a) || TR <= view.T_a || TL >= view.T_star;
+    if (gate_constant) {
+      const double u = uL + (-FL) * (uR - uL) / (FR - FL);
+      out.T = fmin(fmax(exp(u), TL), TR);
+      return out;
+    }
+    const double s = ((FR - G(TR)) - (FL - G(TL))) / (uR - uL);
+    double u = uL + (-FL) * (uR - uL) / (FR - FL);
+    for (int it = 0; it < max_it; ++it) {
+      const double T = exp(u);
+      const double f = F(T);
+      ++out.iterations;
+      if (f == 0.0) {
+        out.T = T;
+        return out;
+      }
+      if (f < 0.0) {
+        uL = u;
+        TL = T;
+      } else {
+        uR = u;
+        TR = T;
+      }
+      if ((TR - TL) <= 4.0e-15 * TR) {
+        out.T = TR;
+        return out;
+      }
+      const ColdGate g = cold_gate(view, T);
+      const double D = s - T * T * g.d2w * C;
+      double u_new = 0.5 * (uL + uR);
+      if (D > 0.0) {
+        const double u_newton = u - f / D;
+        if (u_newton > uL && u_newton < uR) {
+          u_new = u_newton;
+        }
+      }
+      if (fabs(u_new - u) <= 4.0e-15) {
+        out.T = exp(u_new);
+        return out;
+      }
+      u = u_new;
+    }
+    out.T = TR;
+    out.status = 3;
+    return out;
+  }
   // Bracketing iteration in T with Newton acceleration. Convergence is judged
   // on the temperature bracket (relative width 4e-15) or on a Newton step of
   // that size, never on an energy tolerance: a table whose electron energy is
@@ -306,7 +436,6 @@ TENRYU_HOST_DEVICE inline ColdInverseResult cold_inverse_Te(const ColdEquilibriu
   // so that an exactly flat stretch of q_e(T) converges to its lowest
   // temperature, the convention of the base table inverse. Two consecutive
   // Newton steps that do not cross the root force a bisection step.
-  const int max_it = (view.max_iterations > 0) ? view.max_iterations : 80;
   double L = T_lo;
   double R = T_hi;
   double T = (T_hint == T_hint && T_hint > L && T_hint < R) ? T_hint : sqrt(L * R);

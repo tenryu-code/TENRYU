@@ -10,25 +10,34 @@
 #include <cstdlib>
 #include <limits>
 #include <memory>
+#include <sstream>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #include <cuda_runtime.h>
 
+#include "core/deterministic_sum.hpp"
 #include "core/constants.hpp"
+#include "core/device_scratch.hpp"
 #include "core/error.hpp"
 #include "materials/ionmix_reader.cuh"
 #include "materials/ionmix_reader.hpp"
 #include "materials/opacity.cuh"
+#include "materials/opacity_eval.cuh"
 #include "materials/tmat_reader.hpp"
 #include "mesh/geometry_1d.cuh"
 #include "radiation/group_structure.hpp"
+#include "radiation/fld_anderson.cuh"
 #include "radiation/groups.cuh"
 #include "radiation/lc_weights.cuh"
+#include "radiation/material_electron_eos_1d.hpp"
+#include "radiation/multimat_opacity_1d.cuh"
 #include "radiation/nlte_coeffs.cuh"
 #include "radiation/planck_table.cuh"
 #include "radiation/sn_cyl_quadrature_1d.hpp"
 #include "radiation/sn_dsa_1d_gpu.cuh"
+#include "radiation/sn_transport_1d_internal.hpp"
 #include "radiation/sn_material_newton_gpu.cuh"
 
 namespace tenryu::radiation {
@@ -565,6 +574,26 @@ __global__ void fill_kernel(double* __restrict__ values,
   if (i < n_values) {
     values[i] = value;
   }
+}
+
+// Physical scattering sigma_s = rho kappa_s with the bounds of the constant
+// opacity evaluator (eval_opacity_constant_kernel_body).
+__global__ void fill_constant_scattering_kernel(const double* __restrict__ rho,
+                                                const double kappa_s,
+                                                const double kappa_floor,
+                                                const double kappa_cap,
+                                                double* __restrict__ sigma_s,
+                                                const int n_cells,
+                                                const int n_groups) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= n_cells * n_groups) {
+    return;
+  }
+  const double rho_c = rho[idx / n_groups];
+  const double rho_safe = (rho_c >= 0.0) ? rho_c : 0.0;
+  sigma_s[idx] = materials::apply_sigma_bounds(rho_safe * kappa_s,
+                                               rho_safe * fmax(kappa_floor, 0.0),
+                                               rho_safe * fmax(kappa_cap, 0.0));
 }
 
 __global__ void zero_sn_step_setup_kernel(
@@ -2045,9 +2074,11 @@ __global__ void anchor_void_rad_E_to_moments_kernel(
   if (anchor_dE_tally != nullptr && vol != nullptr) {
     const double V = fmax(finite_or_zero(vol[idx / n_groups]), 0.0);
     const double dE_erg = V * (E_after - E_before);
+    // Per-(cell, group) slots [idx] and [n_total + idx], summed in a fixed
+    // order by the step (2026-09-24; atomicAdd before).
     if (dE_erg != 0.0) {
-      atomicAdd(&anchor_dE_tally[0], dE_erg);
-      atomicAdd(&anchor_dE_tally[1], fabs(dE_erg));
+      anchor_dE_tally[idx] += dE_erg;
+      anchor_dE_tally[n_total + idx] += fabs(dE_erg);
     }
   }
 }
@@ -2147,6 +2178,16 @@ __global__ void sn_metric_identity_check_kernel(
 }
 #endif
 
+// Counts the entries of sigma_s that are not exactly zero (a NaN counts).
+__global__ void count_nonzero_scattering_kernel(const double* __restrict__ sigma_s,
+                                                const int total,
+                                                int* __restrict__ count) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < total && !(sigma_s[i] == 0.0)) {
+    atomicAdd(count, 1);
+  }
+}
+
 __global__ void max_relative_delta_kernel(const double* __restrict__ next,
                                           const double* __restrict__ prev,
                                           double* __restrict__ out,
@@ -2171,6 +2212,9 @@ __global__ void max_relative_delta_kernel(const double* __restrict__ next,
   }
 }
 
+// One thread sums the groups in index order, so the escape ledger is the
+// same from run to run (an atomicAdd per group added them in arrival order,
+// which moved the last bit between identical runs).
 __global__ void escaped_energy_kernel(const double* __restrict__ x_r,
                                       const double* __restrict__ face_flux,
                                       double* __restrict__ out,
@@ -2178,16 +2222,18 @@ __global__ void escaped_energy_kernel(const double* __restrict__ x_r,
                                       int n_groups,
                                       double dt,
                                       const int geom) {
-  const int g = blockIdx.x * blockDim.x + threadIdx.x;
-  if (g >= n_groups || n_cells <= 0) {
+  if (blockIdx.x != 0 || threadIdx.x != 0 || n_cells <= 0) {
     return;
   }
   const double r = x_r[n_cells];
   const double area = face_area(r, geom);
   const std::size_t outer =
-      static_cast<std::size_t>(n_cells) * static_cast<std::size_t>(n_groups) +
-      static_cast<std::size_t>(g);
-  atomicAdd(out, dt * area * finite_or_zero(face_flux[outer]));
+      static_cast<std::size_t>(n_cells) * static_cast<std::size_t>(n_groups);
+  double sum = 0.0;
+  for (int g = 0; g < n_groups; ++g) {
+    sum += dt * area * finite_or_zero(face_flux[outer + static_cast<std::size_t>(g)]);
+  }
+  *out += sum;
 }
 
 __global__ void apply_face_flux_boundary_kernel(
@@ -2394,7 +2440,20 @@ __global__ void compute_ap_blended_face_flux_kernel(
   alpha_face[idx] = alpha;
 }
 
-__global__ void compute_streaming_theta_kernel(
+// Streaming limiter of the face-flux update (NUMERICS 6.8.2), per group in
+// the order of the flow: every face flux has one direction, so the inflow of
+// a cell comes only from cells upstream of it (a rightward face from the
+// left neighbour, a leftward face from the right one) and no cell is
+// upstream of itself. theta_c = min(1, (E_c V_c + limited inflow) /
+// outflow), with the limited inflow the upstream donors' final theta times
+// their face flux (domain-boundary inflow in full): the cell's energy after
+// the update, E_c V_c + dt (inflow - outflow), is non-negative, and a cell
+// that passes on what it receives is not limited. Two passes: left to right
+// every cell whose left face does not carry flux leftward out of it (its
+// inflow is from the left or none; a sink has no outflow), then right to
+// left the cells whose outflow goes left and whose inflow comes from the
+// right. One thread per group.
+__global__ void compute_streaming_theta_ordered_kernel(
     const double* __restrict__ rad_E_old,
     const double* __restrict__ node_r,
     const double* __restrict__ vol,
@@ -2404,88 +2463,94 @@ __global__ void compute_streaming_theta_kernel(
     int n_groups,
     double dt,
     const int geom) {
-  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  const int total = n_cells * n_groups;
-  if (idx >= total) {
+  const int g = blockIdx.x * blockDim.x + threadIdx.x;
+  if (g >= n_groups) {
     return;
   }
-  const int c = idx / n_groups;
-  const int g = idx - c * n_groups;
-  const double V = fmax(nonnegative_finite(vol[c]), kEnergyFloor);
-  const double A_in = face_area(node_r[c], geom);
-  const double A_out = face_area(node_r[c + 1], geom);
-  const double F_in =
-      finite_or_zero(face_flux[static_cast<std::size_t>(c) *
-                                   static_cast<std::size_t>(n_groups) +
-                               static_cast<std::size_t>(g)]);
-  const double F_out =
-      finite_or_zero(face_flux[static_cast<std::size_t>(c + 1) *
-                                   static_cast<std::size_t>(n_groups) +
-                               static_cast<std::size_t>(g)]);
-  const double out =
-      fmax(dt, 0.0) * (fmax(F_out, 0.0) * A_out + fmax(-F_in, 0.0) * A_in) / V;
-  const double E_old = nonnegative_finite(rad_E_old[idx]);
-  theta[idx] = (out > kEnergyFloor) ? fmin(1.0, E_old / out) : 1.0;
-}
-
-// Pass-2 inflow credit. The donor-only cap (pass 1) makes
-// free-streaming pass-through impossible (a conduit cell is throttled by its
-// stored E even though the inflow replenishes it within the same step) and
-// freezes transient accumulation at a neutral equilibrium. Crediting the
-// PASS-1-LIMITED inflow keeps positivity exact (E_new = E_old +
-// dt (theta_up in - theta' out)/V >= 0 by construction) while a uniformly
-// throttled stream (theta >= 1/2) relaxes to full pass-through.
-__global__ void compute_streaming_theta_credit_kernel(
-    const double* __restrict__ rad_E_old,
-    const double* __restrict__ node_r,
-    const double* __restrict__ vol,
-    const double* __restrict__ face_flux,
-    const double* __restrict__ theta_donor,
-    double* __restrict__ theta_out,
-    int n_cells,
-    int n_groups,
-    double dt,
-    const int geom) {
-  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  const int total = n_cells * n_groups;
-  if (idx >= total) {
-    return;
+  const double dtp = fmax(dt, 0.0);
+  const auto flux = [&](const int f) {
+    return finite_or_zero(face_flux[static_cast<std::size_t>(f) *
+                                        static_cast<std::size_t>(n_groups) +
+                                    static_cast<std::size_t>(g)]);
+  };
+  const auto theta_at = [&](const int c) -> double& {
+    return theta[static_cast<std::size_t>(c) * static_cast<std::size_t>(n_groups) +
+                 static_cast<std::size_t>(g)];
+  };
+  // The operands of cell c that do not depend on theta, loaded one cell
+  // ahead of the recursion (the loads then overlap the previous cell's
+  // arithmetic).
+  struct CellOperands {
+    double V;
+    double A_in;
+    double A_out;
+    double E_old;
+    double F_in;
+    double F_out;
+  };
+  const auto load = [&](const int c) {
+    CellOperands o;
+    o.V = fmax(nonnegative_finite(vol[c]), kEnergyFloor);
+    o.A_in = face_area(node_r[c], geom);
+    o.A_out = face_area(node_r[c + 1], geom);
+    o.E_old = nonnegative_finite(
+        rad_E_old[static_cast<std::size_t>(c) * static_cast<std::size_t>(n_groups) +
+                  static_cast<std::size_t>(g)]);
+    o.F_in = flux(c);
+    o.F_out = flux(c + 1);
+    return o;
+  };
+  // theta of a cell for its face fluxes and the final theta of its left and
+  // right donors (used only where that face brings inflow).
+  const auto limit = [&](const CellOperands& o, const double th_l, const double th_r) {
+    const double out =
+        dtp * (fmax(o.F_out, 0.0) * o.A_out + fmax(-o.F_in, 0.0) * o.A_in) / o.V;
+    if (!(out > kEnergyFloor)) {
+      return 1.0;
+    }
+    const double in_limited =
+        dtp * (fmax(o.F_in, 0.0) * th_l * o.A_in + fmax(-o.F_out, 0.0) * th_r * o.A_out) / o.V;
+    return fmin(1.0, (o.E_old + in_limited) / out);
+  };
+  // Left to right: every cell except those whose outflow goes left and
+  // whose inflow comes from the right (F_in <= 0, F_out < 0). A cell here
+  // with inflow from the left (F_in > 0) has its donor c - 1 set just
+  // before in this pass; inflow from the right occurs here only in a sink,
+  // which has no outflow.
+  double th_prev = 1.0;
+  CellOperands next = load(0);
+  for (int c = 0; c < n_cells; ++c) {
+    const CellOperands cur = next;
+    if (c + 1 < n_cells) {
+      next = load(c + 1);
+    }
+    if (!(cur.F_in <= 0.0 && cur.F_out < 0.0)) {
+      const double th_l = (cur.F_in > 0.0 && c > 0) ? th_prev : 1.0;
+      th_prev = limit(cur, th_l, 1.0);
+      theta_at(c) = th_prev;
+    }
   }
-  const int c = idx / n_groups;
-  const int g = idx - c * n_groups;
-  const double V = fmax(nonnegative_finite(vol[c]), kEnergyFloor);
-  const double A_in = face_area(node_r[c], geom);
-  const double A_out = face_area(node_r[c + 1], geom);
-  const double F_in =
-      finite_or_zero(face_flux[static_cast<std::size_t>(c) *
-                                   static_cast<std::size_t>(n_groups) +
-                               static_cast<std::size_t>(g)]);
-  const double F_out =
-      finite_or_zero(face_flux[static_cast<std::size_t>(c + 1) *
-                                   static_cast<std::size_t>(n_groups) +
-                               static_cast<std::size_t>(g)]);
-  const double out =
-      fmax(dt, 0.0) * (fmax(F_out, 0.0) * A_out + fmax(-F_in, 0.0) * A_in) / V;
-  // Pass-1-limited inflow credit: face c inflow (F_in > 0) is throttled by
-  // the LEFT donor cell's theta; face c+1 inflow (F_out < 0) by the RIGHT
-  // donor cell's. Domain-boundary inflow has no donor => theta = 1.
-  const double th_l =
-      (c > 0) ? finite_or_zero(theta_donor[static_cast<std::size_t>(c - 1) *
-                                               static_cast<std::size_t>(n_groups) +
-                                           static_cast<std::size_t>(g)])
-              : 1.0;
-  const double th_r =
-      (c + 1 < n_cells)
-          ? finite_or_zero(theta_donor[static_cast<std::size_t>(c + 1) *
-                                           static_cast<std::size_t>(n_groups) +
-                                       static_cast<std::size_t>(g)])
-          : 1.0;
-  const double in_credit =
-      fmax(dt, 0.0) *
-      (fmax(F_in, 0.0) * th_l * A_in + fmax(-F_out, 0.0) * th_r * A_out) / V;
-  const double E_old = nonnegative_finite(rad_E_old[idx]);
-  theta_out[idx] =
-      (out > kEnergyFloor) ? fmin(1.0, (E_old + in_credit) / out) : 1.0;
+  // Right to left: the cells left out above; the donor c + 1 is one of them
+  // set just before, or a cell of the first pass (a source), or the outer
+  // boundary.
+  double th_next = 1.0;
+  bool next_set_here = false;
+  next = load(n_cells - 1);
+  for (int c = n_cells - 1; c >= 0; --c) {
+    const CellOperands cur = next;
+    if (c > 0) {
+      next = load(c - 1);
+    }
+    if (cur.F_in <= 0.0 && cur.F_out < 0.0) {
+      const double th_r =
+          (c + 1 >= n_cells) ? 1.0 : (next_set_here ? th_next : theta_at(c + 1));
+      th_next = limit(cur, 1.0, th_r);
+      theta_at(c) = th_next;
+      next_set_here = true;
+    } else {
+      next_set_here = false;
+    }
+  }
 }
 
 __global__ void apply_donor_theta_face_flux_kernel(
@@ -2529,6 +2594,257 @@ std::vector<double> radiation_group_bounds(const core::Config& cfg,
   return Groups::make_log_uniform_bounds(n_groups, Tmin, Tmax);
 }
 
+// Multi-material S_N opacities (more than one non-void material, 2026-09-24):
+// every material's description (radiation/multimat_opacity_1d.cuh) with the
+// S_N reading of the constant-opacity inputs, which the single-material path
+// uses: kappa_a is the absorption and emission opacity, kappa_s the physical
+// scattering (also for the power law and the frequency-dependent Marshak
+// opacity); the tables have no scattering.
+struct SnMultiMatOpacityEntry {
+  std::unique_ptr<materials::IonmixOpacityData> host;
+  DeviceOpacityTable device;
+  int groups = 0;
+  bool is_lte = false;
+};
+
+struct SnMultiMatOpacityCache {
+  std::vector<SnMultiMatOpacityEntry> entries;
+  core::DeviceArray<MatOpacityDesc> device_descs;
+  // Group bounds [eV] for the frequency-dependent Marshak materials.
+  core::DeviceArray<double> group_bounds;
+  std::string signature;
+};
+
+SnMultiMatOpacityCache& sn_multimat_opacity_cache() {
+  static SnMultiMatOpacityCache cache;
+  return cache;
+}
+
+bool sn_is_table_opacity(const std::string& model) {
+  return model == "tmat" || model == "table_nlte";
+}
+
+int sn_nonvoid_material_count(const core::Config& cfg) {
+  int n = 0;
+  for (const auto& material : cfg.materials.materials) {
+    if (!material.is_void) {
+      ++n;
+    }
+  }
+  return n;
+}
+
+void ensure_sn_multimat_opacity_uploaded(const core::Config& cfg, const int n_groups) {
+  std::ostringstream sig;
+  sig.precision(17);
+  bool any_freq_dep = false;
+  for (const auto& mat : cfg.materials.materials) {
+    sig << mat.is_void << ":" << mat.opacity_model << ":" << mat.opacity_file << ":" << mat.A
+        << ":" << mat.kappa_a_constant << ":" << mat.kappa_s_constant << ":"
+        << mat.opacity_power_law_kappa0_cm2_g << "," << mat.opacity_power_law_alpha_T << ","
+        << mat.opacity_power_law_lambda_rho << "," << mat.opacity_power_law_T_ref_eV << ","
+        << mat.opacity_power_law_rho_ref_g_cc << ":" << mat.tmat_skip_lte_repair << ":"
+        << mat.tmat_kirchhoff_pe << ";";
+    any_freq_dep = any_freq_dep || (!mat.is_void && mat.opacity_model == "freq_dep_marshak");
+  }
+  sig << "groups:" << n_groups << ";repack:" << cfg.radiation.group_repack_hard_xray << ";";
+  std::vector<double> bounds;
+  if (any_freq_dep) {
+    bounds = radiation_group_bounds(cfg, n_groups);
+    sig << "bounds:";
+    for (const double b : bounds) {
+      sig << b << ",";
+    }
+  }
+  const std::string signature = sig.str();
+  auto& cache = sn_multimat_opacity_cache();
+  if (cache.signature == signature &&
+      cache.entries.size() == cfg.materials.materials.size()) {
+    return;
+  }
+
+  cache.entries = std::vector<SnMultiMatOpacityEntry>(cfg.materials.materials.size());
+  std::vector<MatOpacityDesc> descs(cfg.materials.materials.size());
+  for (std::size_t m = 0; m < cfg.materials.materials.size(); ++m) {
+    const auto& mat = cfg.materials.materials[m];
+    auto& entry = cache.entries[m];
+    auto& desc = descs[m];
+    desc.inv_A_mp = 1.0 / (std::max(mat.A, 1.0e-12) * core::constants::proton_mass);
+    if (mat.is_void) {
+      desc.kind = 0;
+      desc.is_void = 1;
+      continue;
+    }
+    if (sn_is_table_opacity(mat.opacity_model)) {
+      bool is_lte = false;
+      if (mat.opacity_model == "tmat") {
+        const materials::TmatFile tmat = materials::load_tmat(mat.opacity_file);
+        TENRYU_ASSERT(tmat.opacity.has_value(),
+                      "SN tmat opacity.model requires /opacity payload");
+        entry.host = std::make_unique<materials::IonmixOpacityData>(
+            materials::tmat_to_ionmix_opacity(*tmat.opacity, mat.tmat_skip_lte_repair,
+                                              mat.tmat_kirchhoff_pe));
+        is_lte = tmat.opacity->is_lte;
+      } else {
+        entry.host = std::make_unique<materials::IonmixOpacityData>(
+            materials::load_ionmix_opacity(mat.opacity_file));
+        is_lte = entry.host->is_lte;
+      }
+      if (cfg.radiation.group_repack_hard_xray) {
+        std::vector<double> target_bounds = cfg.radiation.group_bounds_eV;
+        if (target_bounds.empty()) {
+          const std::vector<double> range = resolve_compute_T_range_eV(cfg, false);
+          target_bounds = repack_group_bounds_for_hard_xray(n_groups, range);
+        }
+        *entry.host = resample_opacity_groups_to_bounds(*entry.host, target_bounds);
+      }
+      TENRYU_ASSERT(entry.host->ngroups == n_groups,
+                    "SN multi-material opacity table group count must match Radiation.groups");
+      entry.device.upload(*entry.host);
+      entry.groups = n_groups;
+      entry.is_lte = is_lte;
+      desc.kind = is_lte ? 1 : 2;
+      desc.view = entry.device.view();
+      desc.kappa_scatter = 0.0;
+      continue;
+    }
+    desc.kappa_scatter = std::max(0.0, mat.kappa_s_constant);
+    if (mat.opacity_model == "power_law") {
+      desc.kind = 3;
+      desc.pl_kappa0 = mat.opacity_power_law_kappa0_cm2_g;
+      desc.pl_alpha_T = mat.opacity_power_law_alpha_T;
+      desc.pl_lambda_rho = mat.opacity_power_law_lambda_rho;
+      desc.pl_T_ref = mat.opacity_power_law_T_ref_eV;
+      desc.pl_rho_ref = mat.opacity_power_law_rho_ref_g_cc;
+      continue;
+    }
+    if (mat.opacity_model == "freq_dep_marshak") {
+      desc.kind = 4;
+      continue;
+    }
+    // "constant" (and "none", whose constants are zero).
+    desc.kind = 0;
+    desc.kappa_planck = std::max(0.0, mat.kappa_a_constant);
+    desc.kappa_rosseland = std::max(0.0, mat.kappa_a_constant);
+  }
+  cache.device_descs.reset(descs.size());
+  cache.device_descs.copy_from_host(descs);
+  cache.group_bounds.reset(bounds.size());
+  if (!bounds.empty()) {
+    cache.group_bounds.copy_from_host(bounds);
+  }
+  cache.signature = signature;
+}
+
+// Outputs of the multi-material S_N opacity evaluation. sigma_s and eta may
+// be null (the opacity-lag diagnostic needs only the absorption and emission
+// opacities); the work arrays are [n_cells * n_groups].
+struct SnMultiMatOpacityOutputs {
+  double* sigma_a = nullptr;
+  double* sigma_pe = nullptr;
+  double* sigma_s = nullptr;
+  double* eta = nullptr;
+  double* sigma_R_work = nullptr;
+  double* f_work = nullptr;
+  double* sigma_a_eff_work = nullptr;
+  double* sigma_s_eff_work = nullptr;
+  double* eta_cdf_work = nullptr;
+  double* eta_work = nullptr;
+  double* lambda_work = nullptr;
+};
+
+// Every cell's opacities from its materials (eval_opacity_multimat_kernel,
+// Materials.opacity_mix_rule for the absorption; the emission opacity mixes
+// like the absorption) and its physical scattering
+// (eval_scattering_multimat_kernel); emission eta = c sigma_pe B(T). Cells
+// whose dominant material is an NLTE table take that material's NLTE
+// coefficients at the cell density (the per-material launch of the
+// single-material table path restricted to those cells: the dominant-material
+// approximation of the FLD solver); the tables have no scattering, so such a
+// cell keeps the scattering of its other materials.
+NlteCoeffsDeviceResult evaluate_multimat_opacity_sn(core::State& state,
+                                                    const core::Config& cfg,
+                                                    const PlanckTable& planck,
+                                                    const int n_cells,
+                                                    const int n_groups,
+                                                    const double dt,
+                                                    const SnMultiMatOpacityOutputs& out) {
+  const auto& sn = cfg.radiation.sn_transport;
+  const auto& mats = cfg.materials.materials;
+  const int n_materials = static_cast<int>(mats.size());
+  TENRYU_ASSERT(n_materials <= 16, "SN multi-material opacity supports at most 16 materials");
+  ensure_sn_multimat_opacity_uploaded(cfg, n_groups);
+  state.ensure_cell_material_props(cfg);
+  TENRYU_ASSERT(state.cell_material_index.size() == static_cast<std::size_t>(n_cells),
+                "SN multi-material opacity requires the per-cell material index");
+  auto& cache = sn_multimat_opacity_cache();
+  const std::size_t n_cell_mat = static_cast<std::size_t>(n_cells) * mats.size();
+  const double* mass_per_material =
+      (state.mass_per_material.size() == n_cell_mat) ? state.mass_per_material.data() : nullptr;
+  const double* vol_frac = (state.volFrac.size() == n_cell_mat) ? state.volFrac.data() : nullptr;
+  const int cell_grid = (n_cells + kBlock - 1) / kBlock;
+  if (cell_grid > 0) {
+    const auto launch = [&](auto rule) {
+      eval_opacity_multimat_kernel<decltype(rule)::value><<<cell_grid, kBlock>>>(
+          state.rho.data(), state.Te.data(), state.cell_material_index.data(),
+          mass_per_material, vol_frac, cache.device_descs.data(), n_materials,
+          sn.opacity_floor, sn.opacity_cap, cfg.numerics.floors.Te, out.sigma_a,
+          out.sigma_pe, out.sigma_R_work, n_cells, n_groups,
+          cache.group_bounds.empty() ? nullptr : cache.group_bounds.data());
+    };
+    const std::string& mix_rule = cfg.materials.opacity_mix_rule;
+    if (mix_rule == "harmonic_mass_R") {
+      launch(std::integral_constant<int, 1>{});
+    } else if (mix_rule == "max") {
+      launch(std::integral_constant<int, 2>{});
+    } else {
+      launch(std::integral_constant<int, 0>{});
+    }
+    cuda_check(cudaGetLastError(), "SN multi-material opacity launch failed");
+    if (out.sigma_s != nullptr) {
+      eval_scattering_multimat_kernel<<<cell_grid, kBlock>>>(
+          state.rho.data(), state.cell_material_index.data(), mass_per_material, vol_frac,
+          cache.device_descs.data(), n_materials, sn.opacity_floor, sn.opacity_cap,
+          out.sigma_s, n_cells, n_groups);
+      cuda_check(cudaGetLastError(), "SN multi-material scattering launch failed");
+    }
+  }
+  const int total = n_cells * n_groups;
+  const int total_grid = (total + kBlock - 1) / kBlock;
+  if (out.eta != nullptr && total_grid > 0) {
+    build_eta_from_planck_kernel<<<total_grid, kBlock>>>(
+        state.Te.data(), out.sigma_pe, planck.device_view(), out.eta, n_cells, n_groups,
+        cfg.numerics.floors.Te);
+    cuda_check(cudaGetLastError(), "SN multi-material eta launch failed");
+  }
+  NlteCoeffsDeviceResult result{};
+  const double* cv_e_ptr =
+      (state.cv_e.size() == static_cast<std::size_t>(n_cells)) ? state.cv_e.data() : nullptr;
+  for (int m = 0; m < n_materials; ++m) {
+    const auto& material = mats[static_cast<std::size_t>(m)];
+    if (material.is_void || !sn_is_table_opacity(material.opacity_model) ||
+        cache.entries[static_cast<std::size_t>(m)].is_lte) {
+      continue;
+    }
+    const auto material_result = compute_nlte_coefficients_cuda_pure_sn(
+        state.rho.data(), state.Te.data(), state.zbar.data(), cv_e_ptr,
+        state.cell_is_void.data(), state.cell_is_void.size(),
+        cache.entries[static_cast<std::size_t>(m)].device.view(), planck.device_view(),
+        n_cells, n_groups, dt, std::max(material.A, 1.0e-12), 1.0, 0.0, 1.0,
+        material.lambda_fd_delta_rel, material.lambda_fd_abs_min, sn.opacity_cap,
+        material.cv_e_override, cfg.numerics.floors.Te,
+        std::max(material.ideal_gas_gamma - 1.0, 1.0e-12), false, false, false, out.f_work,
+        out.sigma_a, out.sigma_pe, out.sigma_R_work, out.sigma_a_eff_work,
+        out.sigma_s_eff_work, out.eta_cdf_work,
+        (out.eta != nullptr) ? out.eta : out.eta_work, out.lambda_work, 0,
+        cfg.materials.low_density_extrapolation, state.cell_material_index.data(), m);
+    result.negative_alpha_clamp_count += material_result.negative_alpha_clamp_count;
+    result.negative_eta_clamp_count += material_result.negative_eta_clamp_count;
+    result.nan_inf_count += material_result.nan_inf_count;
+  }
+  return result;
+}
+
 void ensure_state_buffers(core::State& state,
                           const int n_cells,
                           const int n_groups,
@@ -2564,7 +2880,6 @@ void ensure_state_buffers(core::State& state,
   state.sn_face_flux_limited.reset(n_faces);
   state.sn_face_alpha.reset(n_faces);
   state.sn_stream_theta.reset(n_total);
-  state.sn_stream_theta_donor.reset(n_total);
   state.sn_E_star_flux.reset(n_total);
   state.sn_diag_E_star_flux.reset(n_total);
   state.sn_psi_scratch.reset(n_psi);
@@ -2589,24 +2904,6 @@ void ensure_state_buffers(core::State& state,
   state.sn_reduction_work.reset(1);
 }
 
-void initialize_rad_E_old_if_needed(core::State& state,
-                                    const int n_cells,
-                                    const int n_groups) {
-  const std::size_t bytes =
-      static_cast<std::size_t>(n_cells) * static_cast<std::size_t>(n_groups) *
-      sizeof(double);
-  if (bytes == 0U) {
-    return;
-  }
-  if (state.step == 0 || state.holo_ale_invalidated) {
-    cuda_check(cudaMemcpy(state.rad_E_old.data(),
-                          state.rad_E.data(),
-                          bytes,
-                          cudaMemcpyDeviceToDevice),
-               "SN initialize rad_E_old failed");
-  }
-}
-
 void evaluate_opacity_and_emission(core::State& state,
                                    const core::Config& cfg,
                                    const PlanckTable& planck,
@@ -2616,6 +2913,33 @@ void evaluate_opacity_and_emission(core::State& state,
                                    const double dt) {
   const auto& sn = cfg.radiation.sn_transport;
   const int total = n_cells * n_groups;
+  if (sn_nonvoid_material_count(cfg) > 1) {
+    const std::size_t scratch_size = static_cast<std::size_t>(total);
+    state.sn_nlte_f_work.reset(scratch_size);
+    state.sn_nlte_sigma_eff_work.reset(scratch_size);
+    state.sn_nlte_sigma_s_eff_work.reset(scratch_size);
+    state.sn_nlte_eta_cdf_work.reset(scratch_size);
+    state.sn_nlte_lambda_work.reset(scratch_size);
+    SnMultiMatOpacityOutputs out;
+    out.sigma_a = state.sn_sigma_a.data();
+    out.sigma_pe = state.sn_sigma_pe.data();
+    out.sigma_s = state.sn_sigma_s.data();
+    out.eta = state.sn_eta.data();
+    out.sigma_R_work = state.sn_dsa_rhs.data();
+    out.f_work = state.sn_nlte_f_work.data();
+    out.sigma_a_eff_work = state.sn_nlte_sigma_eff_work.data();
+    out.sigma_s_eff_work = state.sn_nlte_sigma_s_eff_work.data();
+    out.eta_cdf_work = state.sn_nlte_eta_cdf_work.data();
+    out.lambda_work = state.sn_nlte_lambda_work.data();
+    const auto result = evaluate_multimat_opacity_sn(state, cfg, planck, n_cells, n_groups, dt, out);
+    if (result.nan_inf_count != 0 || result.negative_eta_clamp_count != 0) {
+      core::log_warning("SN NLTE coefficient clamp counts: nan_inf=" +
+                        std::to_string(result.nan_inf_count) +
+                        ", eta=" +
+                        std::to_string(result.negative_eta_clamp_count));
+    }
+    return;
+  }
   const bool use_nlte =
       mat.opacity_model == "table_nlte" || mat.opacity_model == "tmat";
   if (use_nlte) {
@@ -2679,7 +3003,6 @@ void evaluate_opacity_and_emission(core::State& state,
   opacity_view.rho = state.rho.data();
   opacity_view.Te = state.Te.data();
   opacity_view.sigma_a = state.sn_sigma_a.data();
-  opacity_view.sigma_R = state.sn_sigma_s.data();
   opacity_view.n_cells = n_cells;
   opacity_view.n_groups = n_groups;
   opacity_view.opacity_model =
@@ -2688,6 +3011,16 @@ void evaluate_opacity_and_emission(core::State& state,
           : ((mat.opacity_model == "power_law")
                  ? materials::kOpacityModelPowerLaw
                  : materials::kOpacityModelConstant);
+  // sn_sigma_s is the physical scattering rho kappa_s (NUMERICS §6.8). The
+  // constant evaluator writes it as its second output (kappa_rosseland_const
+  // = kappa_s); the power-law and frequency-dependent evaluators write an
+  // absorption mean there (the power law repeats its absorption, the Marshak
+  // model its Rosseland mean), so their second output goes to scratch and
+  // the scattering is filled after the evaluation.
+  const bool scattering_from_evaluator =
+      opacity_view.opacity_model == materials::kOpacityModelConstant;
+  opacity_view.sigma_R = scattering_from_evaluator ? state.sn_sigma_s.data()
+                                                   : state.sn_dsa_rhs.data();
   opacity_view.kappa_planck_const = std::max(0.0, mat.kappa_a_constant);
   opacity_view.kappa_rosseland_const = std::max(0.0, mat.kappa_s_constant);
   opacity_view.kappa_floor = sn.opacity_floor;
@@ -2711,6 +3044,13 @@ void evaluate_opacity_and_emission(core::State& state,
   materials::evaluate_opacity_cuda(opacity_view, nullptr);
   const int grid = (total + kBlock - 1) / kBlock;
   if (grid > 0) {
+    if (!scattering_from_evaluator) {
+      fill_constant_scattering_kernel<<<grid, kBlock>>>(
+          state.rho.data(), opacity_view.kappa_rosseland_const,
+          opacity_view.kappa_floor, opacity_view.kappa_cap,
+          state.sn_sigma_s.data(), n_cells, n_groups);
+      cuda_check(cudaGetLastError(), "SN scattering fill launch failed");
+    }
     cuda_check(cudaMemcpy(state.sn_sigma_pe.data(),
                           state.sn_sigma_a.data(),
                           sizeof(double) * static_cast<std::size_t>(total),
@@ -2833,10 +3173,9 @@ double compute_escaped_energy(core::State& state,
                               const int n_groups,
                               const double dt) {
   zero_reduction(state);
-  const int grid = (n_groups + kBlock - 1) / kBlock;
-  if (grid > 0) {
+  if (n_groups > 0) {
     // The E*-flux path consumes sn_face_flux_limited, so escape booking now matches the array that actually updates E in absorbing regimes; in streaming tests theta == 1 and blend alpha == 0 make limited == raw, bit-unchanged there.
-    escaped_energy_kernel<<<grid, kBlock>>>(
+    escaped_energy_kernel<<<1, 1>>>(
         state.x_r.data(),
         state.sn_face_flux_limited.data(),
         state.sn_reduction_work.data(),
@@ -2875,19 +3214,57 @@ void compute_opacity_lag_diagnostic(core::State& state,
   }
   const int total_grid = (total + kBlock - 1) / kBlock;
   const auto& sn = cfg.radiation.sn_transport;
-  core::GroupField1D sigma_pa_new(static_cast<std::size_t>(total));
-  core::GroupField1D sigma_pe_new(static_cast<std::size_t>(total));
+  // Work arrays from the scratch pool (zeroed like a fresh allocation): this
+  // runs at the end of every S_N solve, where ten cudaMalloc/cudaFree pairs
+  // and a device synchronization cost more than the evaluation itself.
+  core::GroupField1D sigma_pa_new("sn:opacity_lag:sigma_pa_new");
+  sigma_pa_new.reset(static_cast<std::size_t>(total));
+  core::GroupField1D sigma_pe_new("sn:opacity_lag:sigma_pe_new");
+  sigma_pe_new.reset(static_cast<std::size_t>(total));
   const bool use_nlte =
       mat.opacity_model == "table_nlte" || mat.opacity_model == "tmat";
-  if (use_nlte) {
+  if (sn_nonvoid_material_count(cfg) > 1) {
+    core::GroupField1D f_work("sn:opacity_lag:f_work");
+    f_work.reset(static_cast<std::size_t>(total));
+    core::GroupField1D sigma_R_work("sn:opacity_lag:sigma_R_work");
+    sigma_R_work.reset(static_cast<std::size_t>(total));
+    core::GroupField1D sigma_a_eff_work("sn:opacity_lag:sigma_a_eff_work");
+    sigma_a_eff_work.reset(static_cast<std::size_t>(total));
+    core::GroupField1D sigma_s_eff_work("sn:opacity_lag:sigma_s_eff_work");
+    sigma_s_eff_work.reset(static_cast<std::size_t>(total));
+    core::GroupField1D eta_cdf_work("sn:opacity_lag:eta_cdf_work");
+    eta_cdf_work.reset(static_cast<std::size_t>(total));
+    core::GroupField1D eta_work("sn:opacity_lag:eta_work");
+    eta_work.reset(static_cast<std::size_t>(total));
+    core::GroupField1D lambda_work("sn:opacity_lag:lambda_work");
+    lambda_work.reset(static_cast<std::size_t>(total));
+    SnMultiMatOpacityOutputs out;
+    out.sigma_a = sigma_pa_new.data();
+    out.sigma_pe = sigma_pe_new.data();
+    out.sigma_R_work = sigma_R_work.data();
+    out.f_work = f_work.data();
+    out.sigma_a_eff_work = sigma_a_eff_work.data();
+    out.sigma_s_eff_work = sigma_s_eff_work.data();
+    out.eta_cdf_work = eta_cdf_work.data();
+    out.eta_work = eta_work.data();
+    out.lambda_work = lambda_work.data();
+    static_cast<void>(evaluate_multimat_opacity_sn(state, cfg, planck, n_cells, n_groups, dt, out));
+  } else if (use_nlte) {
     ensure_nlte_table_uploaded(cfg, mat, n_groups);
-    core::GroupField1D f_work(static_cast<std::size_t>(total));
-    core::GroupField1D sigma_R_work(static_cast<std::size_t>(total));
-    core::GroupField1D sigma_a_eff_work(static_cast<std::size_t>(total));
-    core::GroupField1D sigma_s_eff_work(static_cast<std::size_t>(total));
-    core::GroupField1D eta_cdf_work(static_cast<std::size_t>(total));
-    core::GroupField1D eta_work(static_cast<std::size_t>(total));
-    core::GroupField1D lambda_work(static_cast<std::size_t>(total));
+    core::GroupField1D f_work("sn:opacity_lag:f_work");
+    f_work.reset(static_cast<std::size_t>(total));
+    core::GroupField1D sigma_R_work("sn:opacity_lag:sigma_R_work");
+    sigma_R_work.reset(static_cast<std::size_t>(total));
+    core::GroupField1D sigma_a_eff_work("sn:opacity_lag:sigma_a_eff_work");
+    sigma_a_eff_work.reset(static_cast<std::size_t>(total));
+    core::GroupField1D sigma_s_eff_work("sn:opacity_lag:sigma_s_eff_work");
+    sigma_s_eff_work.reset(static_cast<std::size_t>(total));
+    core::GroupField1D eta_cdf_work("sn:opacity_lag:eta_cdf_work");
+    eta_cdf_work.reset(static_cast<std::size_t>(total));
+    core::GroupField1D eta_work("sn:opacity_lag:eta_work");
+    eta_work.reset(static_cast<std::size_t>(total));
+    core::GroupField1D lambda_work("sn:opacity_lag:lambda_work");
+    lambda_work.reset(static_cast<std::size_t>(total));
     auto& cache = nlte_cache();
     const double* cv_e_ptr =
         (state.cv_e.size() == static_cast<std::size_t>(n_cells)) ? state.cv_e.data()
@@ -2929,7 +3306,8 @@ void compute_opacity_lag_diagnostic(core::State& state,
         0,
         cfg.materials.low_density_extrapolation));
   } else {
-    core::GroupField1D sigma_R_new(static_cast<std::size_t>(total));
+    core::GroupField1D sigma_R_new("sn:opacity_lag:sigma_R_new");
+    sigma_R_new.reset(static_cast<std::size_t>(total));
     materials::OpacityEvalView opacity_view{};
     opacity_view.rho = state.rho.data();
     opacity_view.Te = state.Te.data();
@@ -2974,7 +3352,6 @@ void compute_opacity_lag_diagnostic(core::State& state,
       state.sn_diag_chi_opacity.data(),
       total);
   cuda_check(cudaGetLastError(), "SN diagnostic opacity chi launch failed");
-  cuda_check(cudaDeviceSynchronize(), "SN diagnostic opacity chi sync failed");
 }
 
 struct SnQuadratureDeviceCache {
@@ -3100,6 +3477,7 @@ struct SnInnerGraphKey {
   const void* dsa_diag = nullptr;
   const void* dsa_upper = nullptr;
   const void* dsa_buffer = nullptr;
+  const void* dsa_scratch = nullptr;
 };
 
 bool operator==(const SnInnerGraphKey& a, const SnInnerGraphKey& b) {
@@ -3133,7 +3511,8 @@ bool operator==(const SnInnerGraphKey& a, const SnInnerGraphKey& b) {
          a.Prr == b.Prr && a.face_flux_raw == b.face_flux_raw &&
          a.reduction == b.reduction &&
          a.dsa_lower == b.dsa_lower && a.dsa_diag == b.dsa_diag &&
-         a.dsa_upper == b.dsa_upper && a.dsa_buffer == b.dsa_buffer;
+         a.dsa_upper == b.dsa_upper && a.dsa_buffer == b.dsa_buffer &&
+         a.dsa_scratch == b.dsa_scratch;
 }
 
 struct SnInnerGraphCache {
@@ -3245,6 +3624,7 @@ SnInnerGraphKey make_inner_graph_key(const core::State& state,
   key.dsa_diag = state.sn_dsa_diag.data();
   key.dsa_upper = state.sn_dsa_upper.data();
   key.dsa_buffer = state.sn_dsa_cusparse_buffer.data();
+  key.dsa_scratch = dsa_enabled ? sn_dsa_1d_gpu_scratch(n_cells, n_groups) : nullptr;
   return key;
 }
 
@@ -3503,7 +3883,12 @@ void launch_inner_iteration_body(core::State& state,
   }
 #endif
   if (dsa_enabled) {
-    apply_sn_dsa_1d_gpu(state, n_cells, n_groups, dt, stream);
+    // The linear-characteristic sweeps close each cell with the per-angle
+    // theta of precompute_lc_weights_kernel; the serial sweeps use diamond
+    // differencing (theta = 1/2).
+    apply_sn_dsa_1d_gpu(state, n_cells, n_groups, dt, geom, stream, quad.mu.data(),
+                        quad.weight.data(), n_angles,
+                        linear_characteristic ? state.sn_lc_A_scratch.data() : nullptr);
   }
   if (reduce_residual) {
     cuda_check(cudaMemsetAsync(state.sn_reduction_work.data(), 0, sizeof(double), stream),
@@ -3589,6 +3974,27 @@ double copy_reduction_scalar_from_stream(core::State& state, cudaStream_t stream
   return value;
 }
 
+// True when every sigma_s entry is exactly zero. The sweep source then does
+// not depend on the previous iterate (its scattering part sigma_s * phi is
+// zero), so one sweep is the transport solution for the outer iteration's
+// emission, and every further sweep reproduces it with a residual of exactly
+// zero.
+bool scattering_is_zero(const core::State& state, const int total) {
+  if (total <= 0) {
+    return true;
+  }
+  int* d_count = static_cast<int*>(
+      core::device_scratch_acquire("sn:nonzero_scattering_count", sizeof(int)));
+  cuda_check(cudaMemset(d_count, 0, sizeof(int)), "SN scattering count reset failed");
+  count_nonzero_scattering_kernel<<<(total + kBlock - 1) / kBlock, kBlock>>>(
+      state.sn_sigma_s.data(), total, d_count);
+  cuda_check(cudaGetLastError(), "SN scattering count launch failed");
+  int count = 0;
+  cuda_check(cudaMemcpy(&count, d_count, sizeof(int), cudaMemcpyDeviceToHost),
+             "SN scattering count readback failed");
+  return count == 0;
+}
+
 bool ensure_inner_graph(SnInnerGraphCache& cache,
                         core::State& state,
                         const SnQuadratureDeviceCache& quad,
@@ -3634,9 +4040,19 @@ bool ensure_inner_graph(SnInnerGraphCache& cache,
   if (cache.exec != nullptr && cache.has_key && cache.key == key_with_bc) {
     return true;
   }
-  cache.release_graph();
+  // dt, a kernel argument, changes every step while the buffers and sizes
+  // stay: the iterations are captured again and the instantiated graph is
+  // updated in place (same topology), instead of a new instantiation.
+  SnInnerGraphKey key_new_dt = cache.key;
+  key_new_dt.dt = key_with_bc.dt;
+  const bool dt_only_change =
+      cache.exec != nullptr && cache.has_key && key_new_dt == key_with_bc;
+  if (!dt_only_change) {
+    cache.release_graph();
+  }
   cudaError_t err = cudaStreamBeginCapture(cache.stream, cudaStreamCaptureModeGlobal);
   if (err != cudaSuccess) {
+    cache.release_graph();
     cache.capture_disabled = true;
     warn_inner_graph_disabled(cudaGetErrorString(err));
     return false;
@@ -3662,13 +4078,26 @@ bool ensure_inner_graph(SnInnerGraphCache& cache,
                                 geom,
                                 source_ext);
   }
-  err = cudaStreamEndCapture(cache.stream, &cache.graph);
+  cudaGraph_t captured = nullptr;
+  err = cudaStreamEndCapture(cache.stream, &captured);
   if (err != cudaSuccess) {
-    cache.graph = nullptr;
+    cache.release_graph();
     cache.capture_disabled = true;
     warn_inner_graph_disabled(cudaGetErrorString(err));
     return false;
   }
+  if (dt_only_change) {
+    cudaGraphExecUpdateResultInfo update_info{};
+    if (cudaGraphExecUpdate(cache.exec, captured, &update_info) == cudaSuccess) {
+      static_cast<void>(cudaGraphDestroy(cache.graph));
+      cache.graph = captured;
+      cache.key = key_with_bc;
+      return true;
+    }
+    static_cast<void>(cudaGetLastError());
+    cache.release_graph();
+  }
+  cache.graph = captured;
   cudaGraphNode_t error_node = nullptr;
   char log_buffer[1024] = {};
   err = cudaGraphInstantiate(
@@ -3734,7 +4163,6 @@ void compute_sn_donor_theta_limited_face_flux_1d_gpu(
     const double* const node_r,
     const double* const vol,
     const double* const face_flux_raw,
-    double* const stream_theta_donor,
     double* const stream_theta,
     double* const face_flux_limited,
     const int n_cells,
@@ -3747,8 +4175,6 @@ void compute_sn_donor_theta_limited_face_flux_1d_gpu(
   TENRYU_ASSERT(vol != nullptr, "SN streaming limiter requires vol");
   TENRYU_ASSERT(face_flux_raw != nullptr,
                 "SN streaming limiter requires raw face flux");
-  TENRYU_ASSERT(stream_theta_donor != nullptr,
-                "SN streaming limiter requires donor theta output");
   TENRYU_ASSERT(stream_theta != nullptr,
                 "SN streaming limiter requires theta output");
   TENRYU_ASSERT(face_flux_limited != nullptr,
@@ -3761,30 +4187,18 @@ void compute_sn_donor_theta_limited_face_flux_1d_gpu(
   if (total == 0) {
     return;
   }
-  const int cell_grid = (total + kBlock - 1) / kBlock;
-  compute_streaming_theta_kernel<<<cell_grid, kBlock, 0, stream>>>(
+  const int group_grid = (n_groups + kBlock - 1) / kBlock;
+  compute_streaming_theta_ordered_kernel<<<group_grid, kBlock, 0, stream>>>(
       rad_E_old,
       node_r,
       vol,
       face_flux_raw,
-      stream_theta_donor,
-      n_cells,
-      n_groups,
-      dt,
-      geom);
-  cuda_check(cudaGetLastError(), "SN streaming theta pass-1 launch failed");
-  compute_streaming_theta_credit_kernel<<<cell_grid, kBlock, 0, stream>>>(
-      rad_E_old,
-      node_r,
-      vol,
-      face_flux_raw,
-      stream_theta_donor,
       stream_theta,
       n_cells,
       n_groups,
       dt,
       geom);
-  cuda_check(cudaGetLastError(), "SN streaming theta pass-2 launch failed");
+  cuda_check(cudaGetLastError(), "SN streaming theta launch failed");
   const int face_total = (n_cells + 1) * n_groups;
   const int face_grid = (face_total + kBlock - 1) / kBlock;
   apply_donor_theta_face_flux_kernel<<<face_grid, kBlock, 0, stream>>>(
@@ -3892,7 +4306,8 @@ void advance_radiation_step_sn_1d(
     const core::Config& cfg,
     const PlanckTable& planck,
     const core::Config::MaterialsConfig::MatDef& mat,
-    const double dt) {
+    const double dt,
+    const double drive_time_s) {
   TENRYU_ASSERT(cfg.radiation.mode == core::RadiationMode::SnTransport,
                 "advance_radiation_step_sn_1d requires sn_transport mode");
   TENRYU_ASSERT(state.mesh.dim == 1 || cfg.main.dimension == "1D_SPH",
@@ -3926,25 +4341,25 @@ void advance_radiation_step_sn_1d(
                   "cylindrical S_N polar level count exceeds the sweep warp "
                   "width (n_angles too large)");
   }
-  const bool dsa_effective = sn.dsa_enabled && (geom != 1);
-  if (sn.dsa_enabled && !dsa_effective) {
-    static bool warned_cyl_dsa = false;
-    if (!warned_cyl_dsa) {
-      core::log_warning(
-          "SN DSA acceleration is spherical-only and is disabled for "
-          "cylindrical geometry (plain source iteration; the converged "
-          "answer is unchanged)");
-      warned_cyl_dsa = true;
-    }
-  }
+  // The DSA diffusion operator takes the face areas of every geometry
+  // (it used to hard-code 4 pi r^2, which disabled it for cylindrical and
+  // mis-scaled it for planar geometry).
+  const bool dsa_effective = sn.dsa_enabled;
+  const bool linear_discontinuous = sn.spatial_scheme == "linear_discontinuous";
 
   const int total = n_cells * n_groups;
   core::DeviceArray<double> source_ext_device;
   const double* source_ext = nullptr;
+  // Energy the external volume source injects over this solve (the ledger
+  // counterpart of fld_volume_source_in_step): the Newton residual and the
+  // sweep add S dt per unit volume to every source cell.
+  state.sn_volume_source_in_step = 0.0;
   if (cfg.radiation.volume_source_rate > 0.0 &&
       cfg.radiation.volume_source_x_max > 0.0) {
     std::vector<double> h_x_r;
     state.x_r.copy_to_host(h_x_r);
+    std::vector<double> h_vol;
+    state.vol.copy_to_host(h_vol);
     std::vector<double> h_source_ext(static_cast<std::size_t>(n_cells), 0.0);
     for (int c = 0; c < n_cells; ++c) {
       const double x_center =
@@ -3953,6 +4368,10 @@ void advance_radiation_step_sn_1d(
       if (x_center <= cfg.radiation.volume_source_x_max) {
         h_source_ext[static_cast<std::size_t>(c)] =
             cfg.radiation.volume_source_rate;
+        const double V = h_vol[static_cast<std::size_t>(c)];
+        state.sn_volume_source_in_step +=
+            dt * (std::isfinite(V) ? std::max(V, 0.0) : 0.0) *
+            cfg.radiation.volume_source_rate;
       }
     }
     source_ext_device.reset(static_cast<std::size_t>(n_cells));
@@ -3960,37 +4379,20 @@ void advance_radiation_step_sn_1d(
     static bool warned_volsrc = false;
     if (!warned_volsrc) {
       warned_volsrc = true;
-      core::log_warning("SN 1D external volume source: validated against an independent S_8 discretization (tools/su_olson_sn_reference.py; probe agreement 0.2%/5.3%/13.9% at xi=0.01/1.0/3.16 with dt=3.33e-13 s); multi-outer operation converges to the same conservative fixed point since the Newton matter baseline is pinned to the step start");
+      core::log_warning("SN 1D external volume source: validated against an independent S_8 discretization (tools/su_olson_sn_reference.py; probe agreement 0.15%/4.8%/2.3% at xi=0.01/1.0/3.16 with dt=3.33e-13 s); multi-outer operation converges to the same conservative fixed point since the Newton matter baseline is pinned to the step start");
     }
     source_ext = source_ext_device.data();
   }
   const std::size_t n_psi =
       static_cast<std::size_t>(total) * static_cast<std::size_t>(n_angles);
   ensure_state_buffers(state, n_cells, n_groups, n_angles);
-  initialize_rad_E_old_if_needed(state, n_cells, n_groups);
-
-  // Persistent-angular-intensity fix: (re)seed when its size does not
-  // match (first step, mesh change, restart) — isotropic from rad_E_old.
-  if (state.sn_psi_prev.size() != n_psi) {
-    state.sn_psi_prev.reset(n_psi);
-    const int seed_grid =
-        static_cast<int>((n_psi + kBlock - 1) / static_cast<std::size_t>(kBlock));
-    seed_psi_prev_from_rad_E_kernel<<<seed_grid, kBlock>>>(
-        state.sn_psi_prev.data(), state.rad_E_old.data(), total, n_angles);
-    // 2026-07-26 review: sn_psi_prev is not checkpointed, so a
-    // restart (or mesh change) silently replaces the converged angular
-    // distribution with an isotropic seed — a one-step artificial-scattering
-    // transient. Surface every reseed after step 0 so restarted S_N runs
-    // carry the provenance in their log (checkpointing psi_prev is an HDF5
-    // schema decision, escalated separately).
-    if (state.step > 0) {
-      core::log_warning(
-          "SN psi_prev reseeded ISOTROPICALLY at step " +
-          std::to_string(state.step) +
-          " (mesh change or restart): the angular distribution restarts from "
-          "phi/2 — expect a one-step isotropization transient");
-    }
-  }
+  // Start-of-solve snapshot of the radiation field (the FLD rule): E* and the
+  // time source start from the current rad_E. The former copy only at step 0
+  // (and after an ALE invalidation) left rad_E_old = 0 after a restart, so
+  // the first S_N step solved E* = 0 - dt div F and lost the radiation field,
+  // and it went stale whenever an operator changed rad_E between solves
+  // (2026-09-23). The end-of-solve copy below is kept (same value here).
+  copy_rad_E_to_old(state, n_cells, n_groups);
 
   // W-B2 (NUMERICS §6.8 1D BC): outer Marshak boundary. Fill the persistent
   // per-group incoming intensity psi_in = 2*F_inc (equilibrium-exact for the
@@ -4000,14 +4402,16 @@ void advance_radiation_step_sn_1d(
   double S_neg_marshak = 0.0;
   state.sn_marshak_in_step = 0.0;
   if (sn.boundary.outer_r == "marshak") {
-    // Same marshak_Tr_eV/table precedence as the FLD 1D Marshak site.
+    // Same marshak_Tr_eV/table precedence and drive time as the FLD 1D
+    // Marshak site (midpoint of the advanced interval; state.t when unset).
+    const double t_drive = std::isfinite(drive_time_s) ? drive_time_s : state.t;
     double T_r_eV = cfg.radiation.boundary.marshak_Tr_eV;
     if (!(T_r_eV > 0.0) && state.marshak_Tr_1d.has_value()) {
-      T_r_eV = state.marshak_Tr_1d->eval(state.t);
+      T_r_eV = state.marshak_Tr_1d->eval(t_drive);
     }
     double const_flux = sn.marshak.flux_erg_per_cm2_s;
     if (sn.marshak.flux_pulse_duration_s >= 0.0 &&
-        state.t >= sn.marshak.flux_pulse_duration_s) {
+        t_drive >= sn.marshak.flux_pulse_duration_s) {
       const_flux = 0.0;  // pulsed grey drive expired
     }
     std::vector<double> h_mu;
@@ -4042,7 +4446,14 @@ void advance_radiation_step_sn_1d(
       } else if (g == 0) {
         F_inc = std::max(const_flux, 0.0);
       }
-      psi_in[static_cast<std::size_t>(g)] = 2.0 * F_inc;
+      // The blackbody drive enters as the Planck intensity 2 F_inc = c B / 2
+      // (equilibrium-exact). The linear-discontinuous scheme takes a
+      // flux drive as the isotropic intensity whose discrete half-range
+      // current is the specified flux, F_inc / sum_{mu<0} w |mu|; the older
+      // schemes keep 2 F_inc there too.
+      const bool flux_drive = !(T_r_eV > 0.0);
+      psi_in[static_cast<std::size_t>(g)] =
+          (linear_discontinuous && flux_drive && S_neg > 0.0) ? F_inc / S_neg : 2.0 * F_inc;
       F_discrete_total += S_neg * psi_in[static_cast<std::size_t>(g)];
     }
     cuda_check(cudaMemcpy(state.sn_outer_marshak_psi_in.data(),
@@ -4060,6 +4471,36 @@ void advance_radiation_step_sn_1d(
     state.sn_marshak_in_step =
         dt * tenryu::mesh::geometry_1d_face_area(geom, r_outer) *
         F_discrete_total;
+  }
+
+  // Radiation.sn_transport.spatial_scheme = "linear_discontinuous"
+  // (NUMERICS 6.8): its own step with the boundary inflow and the external
+  // source set up above; the histories have its own layout.
+  if (linear_discontinuous) {
+    sn_ld::advance_step(state, cfg, planck, mat, dt, outer_psi_in, source_ext);
+    return;
+  }
+
+  // Persistent-angular-intensity fix: (re)seed when its size does not
+  // match (first step, mesh change, restart) — isotropic from rad_E_old.
+  if (state.sn_psi_prev.size() != n_psi) {
+    state.sn_psi_prev.reset(n_psi);
+    const int seed_grid =
+        static_cast<int>((n_psi + kBlock - 1) / static_cast<std::size_t>(kBlock));
+    seed_psi_prev_from_rad_E_kernel<<<seed_grid, kBlock>>>(
+        state.sn_psi_prev.data(), state.rad_E_old.data(), total, n_angles);
+    // A restart restores psi_prev from the checkpoint (radiation_sn/psi_prev,
+    // 2026-09-23) and a step retry from the retry snapshot, so a reseed after
+    // step 0 means a mesh or angle-set change, or a checkpoint written before
+    // psi_prev was saved: the angular distribution restarts isotropic — a
+    // one-step artificial-scattering transient. Surface it in the log.
+    if (state.step > 0) {
+      core::log_warning(
+          "SN psi_prev reseeded ISOTROPICALLY at step " +
+          std::to_string(state.step) +
+          " (mesh change or restart): the angular distribution restarts from "
+          "phi/2 — expect a one-step isotropization transient");
+    }
   }
 
   const int cell_grid = (n_cells + kBlock - 1) / kBlock;
@@ -4103,6 +4544,14 @@ void advance_radiation_step_sn_1d(
   state.sn_void_anchor_dE_abs_step = 0.0;
   cuda_check(cudaMemset(sn_anchor_tally_device(), 0, 2U * sizeof(double)),
              "SN anchor tally reset failed");
+  // Anchor energy slots per (cell, group): [0, total) signed, [total, 2 total)
+  // magnitude (anchor_void_rad_E_to_moments_kernel).
+  const std::size_t anchor_slots_n =
+      2U * static_cast<std::size_t>(std::max(n_cells * n_groups, 1));
+  double* d_anchor_slots = static_cast<double*>(core::device_scratch_acquire(
+      "sn_transport_1d:anchor_slots", anchor_slots_n * sizeof(double)));
+  cuda_check(cudaMemset(d_anchor_slots, 0, anchor_slots_n * sizeof(double)),
+             "SN anchor slots reset failed");
 
   const int max_outer = std::max(sn.max_outer_iterations, 1);
   const int max_inner = std::max(sn.max_inner_iterations, 1);
@@ -4142,7 +4591,35 @@ void advance_radiation_step_sn_1d(
   std::vector<double> outer_residual_history;
   outer_residual_history.reserve(static_cast<std::size_t>(max_outer));
 
+  // Radiation.sn_transport.inner_acceleration = "anderson" (2026-09-24):
+  // Anderson mixing (fld_anderson, the FLD outer iteration's) of the
+  // DSA-corrected source iteration, u_k = phi before the sweep and
+  // G(u_k) = phi after the sweep and the DSA correction; the next phi mixes
+  // the last anderson_depth residuals, floored at 0. The history restarts
+  // with every outer iteration (new opacities and emission), and the graph
+  // path (unrolled iterations) is not used.
+  const bool sn_aa_enabled = sn.inner_acceleration == "anderson" && total > 0;
+  fld_anderson::Ring sn_aa_ring;
+  double* sn_aa_work = nullptr;
+  const int sn_aa_m = std::min(std::max(sn.anderson_depth, 1), fld_anderson::kMaxHistory);
+  if (sn_aa_enabled) {
+    static const char* const kSnAaUTags[fld_anderson::kMaxHistory + 1] = {
+        "sn1d:aa_u0", "sn1d:aa_u1", "sn1d:aa_u2", "sn1d:aa_u3", "sn1d:aa_u4"};
+    static const char* const kSnAaFTags[fld_anderson::kMaxHistory + 1] = {
+        "sn1d:aa_f0", "sn1d:aa_f1", "sn1d:aa_f2", "sn1d:aa_f3", "sn1d:aa_f4"};
+    for (int s_idx = 0; s_idx < sn_aa_m + 1; ++s_idx) {
+      sn_aa_ring.u[s_idx] =
+          static_cast<double*>(core::device_scratch_acquire(kSnAaUTags[s_idx], total_bytes));
+      sn_aa_ring.f[s_idx] =
+          static_cast<double*>(core::device_scratch_acquire(kSnAaFTags[s_idx], total_bytes));
+    }
+    sn_aa_ring.m = sn_aa_m;
+    sn_aa_work = static_cast<double*>(core::device_scratch_acquire(
+        "sn1d:aa_work", sizeof(double) * fld_anderson::kWorkDoubles));
+  }
+
   for (int outer = 0; outer < max_outer; ++outer) {
+    sn_aa_ring.count = 0;
     {
       SnTimingScope timing_scope(timing, SnTimingBlock::OpacityEmission);
       evaluate_opacity_and_emission(state, cfg, planck, mat, n_cells, n_groups, dt);
@@ -4176,9 +4653,48 @@ void advance_radiation_step_sn_1d(
                                   source_ext);
     }
     int inner = 0;
-    while (inner < max_inner) {
+    if (scattering_is_zero(state, total)) {
+      // No scattering: one sweep (and the DSA step, a no-op here) is the
+      // solution; the source iteration would repeat it graph_unroll times
+      // and then report a residual of exactly 0 (2026-09-24).
+      {
+        SnTimingScope timing_scope(timing, SnTimingBlock::Sweep, inner_stream);
+        launch_inner_iteration_body(state,
+                                    quad,
+                                    n_cells,
+                                    n_groups,
+                                    n_angles,
+                                    total,
+                                    total_grid,
+                                    sweep_grid,
+                                    sweep_shared_bytes,
+                                    total_bytes,
+                                    dt,
+                                    dsa_effective,
+                                    linear_characteristic,
+                                    false,
+                                    inner_stream,
+                                    true,
+                                    outer_psi_in,
+                                    geom,
+                                    source_ext);
+      }
+      cuda_check(cudaStreamSynchronize(inner_stream),
+                 "SN single-sweep stream sync failed");
+      static bool logged_single_sweep = false;
+      if (!logged_single_sweep) {
+        core::log_info("SN: sigma_s is zero, one sweep per outer iteration "
+                       "(no source iteration)");
+        logged_single_sweep = true;
+      }
+      inner = 1;
+      state.sn_inner_iterations = inner;
+      state.sn_inner_residual = 0.0;
+      inner_converged = true;
+    }
+    while (!inner_converged && inner < max_inner) {
       const int remaining = max_inner - inner;
-      if (remaining >= graph_unroll &&
+      if (!sn_aa_enabled && remaining >= graph_unroll &&
           ensure_inner_graph(graph_cache,
                              state,
                              quad,
@@ -4212,6 +4728,12 @@ void advance_radiation_step_sn_1d(
         }
         continue;
       }
+      const int aa_slot = sn_aa_enabled ? (inner % (sn_aa_m + 1)) : 0;
+      if (sn_aa_enabled) {
+        cuda_check(cudaMemcpyAsync(sn_aa_ring.u[aa_slot], state.sn_phi_old.data(), total_bytes,
+                                   cudaMemcpyDeviceToDevice, inner_stream),
+                   "SN Anderson snapshot of the iterate failed");
+      }
       {
         SnTimingScope timing_scope(timing, SnTimingBlock::Sweep, inner_stream);
         launch_inner_iteration_body(state,
@@ -4244,6 +4766,12 @@ void advance_radiation_step_sn_1d(
       if (state.sn_inner_residual <= sn.inner_tol) {
         inner_converged = true;
         break;
+      }
+      if (sn_aa_enabled && inner < max_inner) {
+        // phi_old holds G(u) of this iteration: mix the next iterate into it.
+        fld_anderson::record_and_mix(sn_aa_ring, aa_slot, inner - 1, state.sn_phi_old.data(),
+                                     total, 1.0, 0.0, sn_aa_work, inner_stream);
+        cuda_check(cudaGetLastError(), "SN Anderson mix launch failed");
       }
     }
     step_max_inner_iterations =
@@ -4310,7 +4838,6 @@ void advance_radiation_step_sn_1d(
           state.x_r.data(),
           state.vol.data(),
           state.sn_face_flux_blended.data(),
-          state.sn_stream_theta_donor.data(),
           state.sn_stream_theta.data(),
           state.sn_face_flux_limited.data(),
           n_cells,
@@ -4361,6 +4888,9 @@ void advance_radiation_step_sn_1d(
     // Shared per-cell effective properties (multi-material fix; radiation can run
     // with hydro disabled, so ensure here).
     state.ensure_cell_material_props(cfg);
+    // Multi-material runs: every cell's own material's electron table and
+    // cv_e_override (2026-09-24; null selector for single-material runs).
+    newton.cell_electron_eos = cell_electron_table_selector_1d(state, cfg, n_cells);
     newton.n_cells = n_cells;
     newton.n_groups = n_groups;
     newton.dt = dt;
@@ -4392,7 +4922,7 @@ void advance_radiation_step_sn_1d(
       anchor_void_rad_E_to_moments_kernel<<<total_grid, kBlock>>>(
           state.rad_E.data(), state.sn_phi_old.data(),
           state.sn_sigma_a.data(), state.sn_sigma_s.data(), state.vol.data(),
-          sn_anchor_tally_device(), total, n_groups, dt);
+          d_anchor_slots, total, n_groups, dt);
       cuda_check(cudaGetLastError(), "SN void rad_E anchor launch failed");
     }
 
@@ -4442,6 +4972,10 @@ void advance_radiation_step_sn_1d(
   }
 
   {
+    const int anchor_total = n_cells * n_groups;
+    core::deterministic_sum(d_anchor_slots, anchor_total, sn_anchor_tally_device() + 0, false);
+    core::deterministic_sum(d_anchor_slots + anchor_total, anchor_total,
+                            sn_anchor_tally_device() + 1, false);
     double h_anchor_tally[2] = {0.0, 0.0};
     cuda_check(cudaMemcpy(h_anchor_tally, sn_anchor_tally_device(),
                           sizeof(h_anchor_tally), cudaMemcpyDeviceToHost),
@@ -4508,5 +5042,42 @@ void advance_radiation_step_sn_1d(
   }
   state.holo_ale_invalidated = false;
 }
+
+
+namespace sn1d_internal {
+
+void evaluate_opacity(core::State& state, const core::Config& cfg, const PlanckTable& planck,
+                      const core::Config::MaterialsConfig::MatDef& mat, const int n_cells,
+                      const int n_groups, const double dt) {
+  evaluate_opacity_and_emission(state, cfg, planck, mat, n_cells, n_groups, dt);
+}
+
+sn_ld::QuadratureView quadrature(const int n_angles, const int geom) {
+  auto& quad = sn_quadrature_cache();
+  quad.ensure(n_angles, geom == 1);
+  sn_ld::QuadratureView view;
+  view.mu = quad.mu.data();
+  view.weight = quad.weight.data();
+  view.alpha = quad.alpha.data();
+  view.tau = quad.tau.data();
+  view.n_angles = n_angles;
+  if (geom == 1) {
+    view.sd_mu = quad.sd_mu.data();
+    view.chain_len = quad.n_azim;
+    view.n_chains = (quad.n_azim > 0) ? n_angles / quad.n_azim : 0;
+  } else {
+    view.sd_mu = nullptr;
+    view.chain_len = n_angles;
+    view.n_chains = 1;
+  }
+  return view;
+}
+
+void ensure_buffers(core::State& state, const int n_cells, const int n_groups,
+                    const int n_angles) {
+  ensure_state_buffers(state, n_cells, n_groups, n_angles);
+}
+
+}  // namespace sn1d_internal
 
 }  // namespace tenryu::radiation

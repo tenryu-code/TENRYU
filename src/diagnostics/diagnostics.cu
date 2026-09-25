@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <iomanip>
 #include <limits>
 #include <numeric>
@@ -11,6 +12,8 @@
 
 #include <cuda_runtime.h>
 
+#include "core/device_pack.hpp"
+#include "core/device_scratch.hpp"
 #include "core/error.hpp"
 #include "laser/laser_mesh.cuh"
 
@@ -316,6 +319,30 @@ double sample_rho_2d(const std::vector<double>& node_r,
   return rho[idx];
 }
 
+// Host arrays of n cells: node_lo[c] = x_r[c], node_hi[c] = x_r[c + 1].
+double integrate_rhoR_1d_host(const double* rho,
+                              const double* node_lo,
+                              const double* node_hi,
+                              const std::size_t n,
+                              const bool shell_only,
+                              const double shell_threshold,
+                              const double* rho_weight) {
+  double integral = 0.0;
+  for (std::size_t c = 0; c < n; ++c) {
+    const double dr = std::max(node_hi[c] - node_lo[c], 0.0);
+    if (dr <= 0.0) {
+      continue;
+    }
+    const double weight =
+        (rho_weight != nullptr) ? clamp01_host(rho_weight[c]) : 1.0;
+    const double rho_masked = rho[c] * weight;
+    const double rho_c =
+        shell_only && rho[c] < shell_threshold ? 0.0 : rho_masked;
+    integral += rho_c * dr;
+  }
+  return integral;
+}
+
 double integrate_rhoR_1d(const core::State& state,
                          const bool shell_only,
                          const double shell_threshold,
@@ -332,21 +359,9 @@ double integrate_rhoR_1d(const core::State& state,
   if (nodes.size() != rho.size() + 1) {
     return 0.0;
   }
-
-  double integral = 0.0;
-  for (std::size_t c = 0; c < rho.size(); ++c) {
-    const double dr = std::max(nodes[c + 1] - nodes[c], 0.0);
-    if (dr <= 0.0) {
-      continue;
-    }
-    const double weight =
-        (rho_weight != nullptr) ? clamp01_host((*rho_weight)[c]) : 1.0;
-    const double rho_masked = rho[c] * weight;
-    const double rho_c =
-        shell_only && rho[c] < shell_threshold ? 0.0 : rho_masked;
-    integral += rho_c * dr;
-  }
-  return integral;
+  return integrate_rhoR_1d_host(rho.data(), nodes.data(), nodes.data() + 1, rho.size(),
+                                shell_only, shell_threshold,
+                                rho_weight != nullptr ? rho_weight->data() : nullptr);
 }
 
 double ray_s_max(const std::vector<double>& node_r,
@@ -429,6 +444,19 @@ double integrate_rhoR_ray_2d(const std::vector<double>& node_r,
   return sum;
 }
 
+double find_shell_radius_1d_host(const double* rho,
+                                 const double* node_hi,
+                                 const std::size_t n,
+                                 const double rho_threshold) {
+  double radius = 0.0;
+  for (std::size_t c = 0; c < n; ++c) {
+    if (rho[c] >= rho_threshold) {
+      radius = std::max(radius, node_hi[c]);
+    }
+  }
+  return radius;
+}
+
 double find_shell_radius_1d(const core::State& state,
                             const double rho_threshold) {
   if (state.mesh.dim != 1 || state.rho.empty()) {
@@ -440,14 +468,7 @@ double find_shell_radius_1d(const core::State& state,
   if (nodes.size() != rho.size() + 1) {
     return 0.0;
   }
-
-  double radius = 0.0;
-  for (std::size_t c = 0; c < rho.size(); ++c) {
-    if (rho[c] >= rho_threshold) {
-      radius = std::max(radius, nodes[c + 1]);
-    }
-  }
-  return radius;
+  return find_shell_radius_1d_host(rho.data(), nodes.data() + 1, rho.size(), rho_threshold);
 }
 
 double find_isodensity_radius_2d(const std::vector<double>& node_r,
@@ -603,60 +624,92 @@ double sum_laser_dep(const core::State& state) {
   return static_cast<double>(sum);
 }
 
-double compute_density_proxy_radius(const laser::LaserMesh* laser_mesh,
-                                    const double* field,
-                                    const double threshold_n_hat) {
+// Largest node_R[i] over the laser mesh nodes (i, j) with field >= threshold,
+// for two thresholds in one pass (2026-09-25; the field used to be copied to
+// the host for each threshold, 3 MB twice per diagnostics step on GXII).
+// For non-negative doubles the ordering of the values is the ordering of
+// their bit patterns, so the integer maximum of the bits is exact and
+// order-independent; the running maximum starts at the integer -1, below the
+// bits of every non-negative double.
+__global__ void density_proxy_radius_kernel(const double* __restrict__ node_R,
+                                            const double* __restrict__ field,
+                                            const int n_nodes,
+                                            const int n_nodes_z,
+                                            const int n_nodes_r,
+                                            const double threshold_a,
+                                            const double threshold_b,
+                                            unsigned long long* __restrict__ out_bits) {
+  long long best_a = -1;
+  long long best_b = -1;
+  for (int n = blockIdx.x * blockDim.x + threadIdx.x; n < n_nodes;
+       n += gridDim.x * blockDim.x) {
+    const double v = field[n];
+    const bool in_a = v >= threshold_a;
+    const bool in_b = v >= threshold_b;
+    if (!in_a && !in_b) {
+      continue;
+    }
+    const int i = n / n_nodes_z;
+    if (i < 0 || i >= n_nodes_r) {
+      continue;
+    }
+    const double r = node_R[i];
+    if (!(r >= 0.0)) {
+      continue;
+    }
+    const long long bits = __double_as_longlong(r);
+    if (in_a && bits > best_a) {
+      best_a = bits;
+    }
+    if (in_b && bits > best_b) {
+      best_b = bits;
+    }
+  }
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    best_a = max(best_a, __shfl_down_sync(0xffffffffu, best_a, offset));
+    best_b = max(best_b, __shfl_down_sync(0xffffffffu, best_b, offset));
+  }
+  if ((threadIdx.x & 31) == 0) {
+    if (best_a >= 0) {
+      atomicMax(&out_bits[0], static_cast<unsigned long long>(best_a));
+    }
+    if (best_b >= 0) {
+      atomicMax(&out_bits[1], static_cast<unsigned long long>(best_b));
+    }
+  }
+}
+
+// The two radii of compute_laser_pattern: [0] critical (n_hat_raw >= 1),
+// [1] near-critical (n_hat_raw >= 0.9); 0 when no node qualifies.
+std::pair<double, double> compute_density_proxy_radii(const laser::LaserMesh* laser_mesh) {
+  constexpr double kNearCriticalNhat = 0.9;
   if (laser_mesh == nullptr || !laser_mesh->is_allocated() ||
       laser_mesh->n_nodes_r <= 0 || laser_mesh->n_nodes_z <= 0 ||
-      field == nullptr || laser_mesh->node_R == nullptr) {
-    return 0.0;
+      laser_mesh->n_e_hat_raw == nullptr || laser_mesh->node_R == nullptr) {
+    return {0.0, 0.0};
   }
-
-  std::vector<double> node_r(static_cast<std::size_t>(laser_mesh->n_nodes_r), 0.0);
-  std::vector<double> n_hat(static_cast<std::size_t>(laser_mesh->n_nodes()), 0.0);
-  cuda_check(cudaMemcpy(node_r.data(),
-                        laser_mesh->node_R,
-                        node_r.size() * sizeof(double),
-                        cudaMemcpyDeviceToHost),
-             "compute_laser_pattern copy node_R failed");
-  cuda_check(cudaMemcpy(n_hat.data(),
-                        field,
-                        n_hat.size() * sizeof(double),
-                        cudaMemcpyDeviceToHost),
-             "compute_laser_pattern copy n_e_hat failed");
-
-  double radius = -1.0;
-  for (std::size_t n = 0; n < n_hat.size(); ++n) {
-    if (n_hat[n] < threshold_n_hat) {
-      continue;
-    }
-    const int i = static_cast<int>(n) / laser_mesh->n_nodes_z;
-    if (i < 0 || i >= laser_mesh->n_nodes_r) {
-      continue;
-    }
-    const double r = node_r[static_cast<std::size_t>(i)];
-    if (r >= 0.0) {
-      radius = std::max(radius, r);
-    }
-  }
-
-  if (!(radius >= 0.0) || !std::isfinite(radius)) {
-    return 0.0;
-  }
-  return radius;
-}
-
-double compute_critical_surface_r(const laser::LaserMesh* laser_mesh) {
-  return compute_density_proxy_radius(laser_mesh, laser_mesh != nullptr ? laser_mesh->n_e_hat_raw
-                                                                        : nullptr,
-                                      1.0);
-}
-
-double compute_near_critical_r(const laser::LaserMesh* laser_mesh) {
-  constexpr double kNearCriticalNhat = 0.9;
-  return compute_density_proxy_radius(laser_mesh, laser_mesh != nullptr ? laser_mesh->n_e_hat_raw
-                                                                        : nullptr,
-                                      kNearCriticalNhat);
+  auto* d_bits = static_cast<unsigned long long*>(core::device_scratch_acquire(
+      "diagnostics:density_proxy_radius_bits", 2 * sizeof(unsigned long long)));
+  cuda_check(cudaMemset(d_bits, 0, 2 * sizeof(unsigned long long)),
+             "compute_laser_pattern radius reset failed");
+  const int n_nodes = laser_mesh->n_nodes();
+  constexpr int kBlock = 256;
+  const int grid = std::max(1, std::min((n_nodes + kBlock - 1) / kBlock, 1024));
+  density_proxy_radius_kernel<<<grid, kBlock>>>(laser_mesh->node_R, laser_mesh->n_e_hat_raw,
+                                                n_nodes, laser_mesh->n_nodes_z,
+                                                laser_mesh->n_nodes_r, 1.0, kNearCriticalNhat,
+                                                d_bits);
+  cuda_check(cudaGetLastError(), "compute_laser_pattern radius launch failed");
+  unsigned long long h_bits[2] = {0ULL, 0ULL};
+  cuda_check(cudaMemcpy(h_bits, d_bits, sizeof(h_bits), cudaMemcpyDeviceToHost),
+             "compute_laser_pattern radius copy failed");
+  const auto radius_of = [](const unsigned long long bits) {
+    // 0 bits: no qualifying node (a qualifying r = +0.0 also reads 0).
+    double r = 0.0;
+    std::memcpy(&r, &bits, sizeof(r));
+    return (r >= 0.0 && std::isfinite(r)) ? r : 0.0;
+  };
+  return {radius_of(h_bits[0]), radius_of(h_bits[1])};
 }
 
 double compute_absorption_weighted_r_1d(const core::State& state) {
@@ -925,6 +978,75 @@ SphericityDiagnostics compute_sphericity(const core::State& state,
   return out;
 }
 
+bool compute_shape_history_1d(const core::State& state,
+                              const core::Config& cfg,
+                              ArealDensityDiagnostics* areal,
+                              SphericityDiagnostics* sphericity) {
+  if (state.mesh.dim != 1 || state.rho.empty()) {
+    return false;
+  }
+  const std::size_t n = state.rho.size();
+  if (state.x_r.size() != n + 1 ||
+      n > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+    return false;
+  }
+  const bool has_hotspot_tracer =
+      areal != nullptr && state.gas_tracer_initialized && state.gas_tracer_Y.size() == n;
+  // One readback: rho, the lower and upper node radius of every cell (x_r
+  // shifted by one node) and the gas tracer.
+  const double* srcs[4] = {state.rho.data(), state.x_r.data(), state.x_r.data() + 1,
+                           has_hotspot_tracer ? state.gas_tracer_Y.data() : nullptr};
+  const int k = has_hotspot_tracer ? 4 : 3;
+  std::vector<double> pack(static_cast<std::size_t>(k) * n);
+  core::pack_pull_fields(srcs, k, static_cast<int>(n), pack.data(),
+                         "diagnostics:shape_history_1d:pull");
+  const double* rho = pack.data();
+  const double* node_lo = rho + n;
+  const double* node_hi = node_lo + n;
+  const double* gas_tracer_Y = has_hotspot_tracer ? node_hi + n : nullptr;
+  const double rho_max = *std::max_element(rho, rho + n);
+
+  if (areal != nullptr) {
+    ArealDensityDiagnostics out{};
+    out.angles_deg = cfg.diagnostics.areal_density.angles_deg;
+    if (out.angles_deg.empty()) {
+      out.angles_deg = {0.0};
+    }
+    out.rhoR.assign(out.angles_deg.size(), 0.0);
+    if (has_hotspot_tracer) {
+      out.rhoR_hotspot_tracer.assign(out.angles_deg.size(), 0.0);
+    }
+    const bool shell_only = (cfg.diagnostics.areal_density.r_range == "shell");
+    const double shell_threshold = 0.1 * rho_max;
+    const double rhoR = integrate_rhoR_1d_host(rho, node_lo, node_hi, n, shell_only,
+                                               shell_threshold, nullptr);
+    std::fill(out.rhoR.begin(), out.rhoR.end(), rhoR);
+    if (has_hotspot_tracer) {
+      const double rhoR_hotspot = integrate_rhoR_1d_host(
+          rho, node_lo, node_hi, n, false, shell_threshold, gas_tracer_Y);
+      std::fill(out.rhoR_hotspot_tracer.begin(), out.rhoR_hotspot_tracer.end(),
+                rhoR_hotspot);
+    }
+    *areal = std::move(out);
+  }
+  if (sphericity != nullptr) {
+    SphericityDiagnostics out{};
+    out.modes = cfg.diagnostics.sphericity.modes;
+    if (out.modes.empty()) {
+      out.modes = {0, 2, 4};
+    }
+    out.coefficients.assign(out.modes.size(), 0.0);
+    const double rho_threshold =
+        std::max(cfg.diagnostics.sphericity.rho_threshold, 0.1 * rho_max);
+    const double radius = find_shell_radius_1d_host(rho, node_hi, n, rho_threshold);
+    for (std::size_t m = 0; m < out.modes.size(); ++m) {
+      out.coefficients[m] = (out.modes[m] == 0) ? radius : 0.0;
+    }
+    *sphericity = std::move(out);
+  }
+  return true;
+}
+
 LaserPatternDiagnostics compute_laser_pattern(const core::State& state,
                                               const core::Config& cfg,
                                               const laser::LaserMesh* laser_mesh) {
@@ -941,8 +1063,11 @@ LaserPatternDiagnostics compute_laser_pattern(const core::State& state,
   if (state.dt > 0.0) {
     out.absorbed_power_total = out.absorbed_total / state.dt;
   }
-  out.critical_surface_r = compute_critical_surface_r(laser_mesh);
-  out.near_critical_r = compute_near_critical_r(laser_mesh);
+  {
+    const auto radii = compute_density_proxy_radii(laser_mesh);
+    out.critical_surface_r = radii.first;
+    out.near_critical_r = radii.second;
+  }
   out.absorption_weighted_r = compute_absorption_weighted_r(state);
   if (laser_mesh != nullptr) {
     if (state.dt > 0.0) {
@@ -972,6 +1097,7 @@ LaserPatternDiagnostics compute_laser_pattern(const core::State& state,
     out.corona_transition_blend = laser_mesh->last_ghost_transition_blend;
     out.corona_transition_resolved_cells =
         static_cast<std::int64_t>(laser_mesh->last_ghost_transition_resolved_cells);
+    out.ghost_corona_width = laser_mesh->last_ghost_width;
   }
 
   if (!cfg.diagnostics.laser_pattern.per_beam) {

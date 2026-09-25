@@ -387,7 +387,6 @@ tenryu::core::MeshRequirementParams mesh_requirement_params(
 tenryu::core::namelist::FrozenTable1D total_laser_power_table(
     const tenryu::core::Config& cfg,
     const tenryu::core::namelist::Builder& builder) {
-  constexpr int kSamples = 10000;
   std::vector<tenryu::core::namelist::FrozenTable1D> beam_tables;
   for (std::size_t i = 0; i < cfg.laser.beams.size(); ++i) {
     const std::string path =
@@ -396,28 +395,23 @@ tenryu::core::namelist::FrozenTable1D total_laser_power_table(
     if (callable == builder.callable_objects.end()) {
       continue;
     }
-    auto table = tenryu::core::namelist::create_frozen_table(
-        callable->second, 0.0, cfg.main.t_end, kSamples);
+    auto table = tenryu::core::namelist::create_frozen_time_table(
+        callable->second, cfg.main.t_end, path, /*require_non_negative=*/true);
     table.zero_outside = true;
+    tenryu::core::namelist::normalize_beam_power_table(
+        table, cfg.main.t_end, cfg.laser.beams[i].energy_J,
+        ("Laser.beams[" + std::to_string(i) + "]").c_str());
     beam_tables.push_back(std::move(table));
   }
 
   if (beam_tables.empty()) {
-    auto table = tenryu::core::namelist::create_frozen_table_from_sampler(
-        [](double) { return 0.0; }, 0.0, cfg.main.t_end, kSamples);
+    auto table = tenryu::core::namelist::create_frozen_time_table_from_sampler(
+        [](double) { return 0.0; }, cfg.main.t_end);
     table.zero_outside = true;
     return table;
   }
 
-  auto total = beam_tables.front();
-  std::fill(total.y.begin(), total.y.end(), 0.0);
-  total.zero_outside = true;
-  for (const auto& table : beam_tables) {
-    for (std::size_t k = 0; k < total.x.size(); ++k) {
-      total.y[k] += table.eval(total.x[k]);
-    }
-  }
-  return total;
+  return tenryu::core::namelist::sum_frozen_tables(beam_tables);
 }
 
 int mesh_requirement_geometry_code(const tenryu::core::Config& cfg) {

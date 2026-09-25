@@ -2,11 +2,16 @@
 
 #include <array>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
+#include <exception>
+#include <mutex>
 #include <optional>
 #include <limits>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "core/config.hpp"
@@ -82,14 +87,34 @@ struct PlasmaViscosityHistoryRecord {
   double heat_rate_e_tot = 0.0;
 };
 
+// Run-cumulative energy ledger terms for the history (SPEC §7.3
+// energy/{marshak_in, E_volume_in, radiation_escaped, numerical_loss,
+// pdv_boundary, floor_injected, safety_injected, solver_residual}); the step
+// values stay in HistorySnapshot::energy and go to the *_step datasets. The
+// driver sums the rank-local State counters over ranks; when `valid` is false
+// the writer takes the local State counters.
+struct EnergyLedgerCumulative {
+  bool valid = false;
+  double marshak_in = 0.0;
+  double volume_in = 0.0;
+  double radiation_escaped = 0.0;
+  double numerical_loss = 0.0;
+  double pdv_boundary = 0.0;
+  double floor_injected = 0.0;
+  double safety_injected = 0.0;
+  double solver_residual = 0.0;
+};
+
 struct HistorySnapshot {
   EnergyBudget energy{};
+  EnergyLedgerCumulative energy_cumulative{};
   ConservationResiduals conservation_residuals{};
   int clamp_count = 0;
   ArealDensityDiagnostics areal_density{};
   SphericityDiagnostics sphericity{};
   LaserPatternDiagnostics laser_pattern{};
   FldSolverDiagnostics fld_solver;
+  SnSolverDiagnostics sn_solver;
   PhaseResolvedEnergyDiagnostics phase_energy{};
   AleClosureAuditDiagnostics ale_closure_audit{};
   IcfShellDiagnostics icf_shell{};
@@ -149,11 +174,18 @@ class HistoryWriter {
 
   void init(const core::Config& cfg, const std::string& output_dir);
   void append(const core::State& state, const HistorySnapshot& snapshot);
+  // Appends only the dt-breakdown groups (/diagnostics/dt_breakdown_history,
+  // cfl_winner and, in 2D, per_row_mass, corner_bc_audit and av_max), which
+  // carry their own cycle/t axes, for a step without a full history row.
+  void append_dt_breakdown(const core::State& state,
+                           const DtBreakdownHistoryRecord& record);
   void append_radial_fourier_audit(const RadialFourierAuditRecord& record);
   void append_radial_fourier_complex_audit(
       const RadialFourierComplexAuditRecord& record);
   void append_fld_substage_audit_batch(
       const std::vector<FldSubstageAuditRecord>& records);
+  // Writes every queued row: hands the pending rows to the batch worker and
+  // waits until all batches are in the file.
   void flush_pending();
 
   [[nodiscard]] bool enabled() const noexcept { return enabled_; }
@@ -269,6 +301,8 @@ class HistoryWriter {
     double t = 0.0;
     double dt = 0.0;
     std::int64_t step = 0;
+    // Only the dt-breakdown groups (append_dt_breakdown); no t/cycle/dt row.
+    bool dt_only = false;
     bool mc_group_enabled = true;
     bool mc_particle_counts_enabled = true;
     bool mc_weight_stats_enabled = true;
@@ -285,7 +319,6 @@ class HistoryWriter {
     bool center_perturbation_enabled = false;
     double E_laser_deposited = 0.0;
     double E_laser_escaped = 0.0;
-    double E_rad_escaped = 0.0;
     double E_laser_incident = 0.0;
     double E_ra_deposited = 0.0;
     double E_cbet_iaw_step = 0.0;
@@ -368,6 +401,11 @@ class HistoryWriter {
   [[nodiscard]] PendingHistoryRecord build_pending_record(
       const core::State& state,
       const HistorySnapshot& snapshot);
+  void fill_dt_breakdown_group_values(const core::State& state,
+                                      PendingHistoryRecord& rec) const;
+  void queue_record(PendingHistoryRecord&& rec);
+  void write_dt_breakdown_groups(const HistoryAppendFile& file,
+                                 const PendingHistoryRecord& rec) const;
   [[nodiscard]] std::optional<PerRowMassValues> compute_per_row_mass_values(
       const core::State& state) const;
   [[nodiscard]] std::optional<CornerBcAuditValues> compute_corner_bc_audit_values(
@@ -383,6 +421,14 @@ class HistoryWriter {
       tenryu::coupling::ProfileObservability& obs,
       std::int64_t step) const;
   void append_record_to_file(const HistoryAppendFile& file, const PendingHistoryRecord& rec) const;
+  // Row batches are written by a worker thread so that the time loop does not
+  // wait for HDF5 (a 64-row batch of a 1D production deck took 25-35 ms);
+  // the batches are written in the order they were queued, each with the
+  // file opened and closed as before.
+  void write_batch(const std::vector<PendingHistoryRecord>& batch) const;
+  void enqueue_pending_batch();
+  void wait_for_batches();
+  void batch_worker_loop();
   void write_per_row_mass_history(const HistoryAppendFile& file, const PerRowMassValues& values) const;
   void write_corner_bc_audit_history(const HistoryAppendFile& file, const CornerBcAuditValues& values) const;
   void write_av_max_history(const HistoryAppendFile& file, const AvMaxHistoryValues& values) const;
@@ -434,6 +480,15 @@ class HistoryWriter {
   bool history_bootstrapped_ = false;
   core::Config cfg_{};
   std::string path_;
+#if TENRYU_ENABLE_HDF5
+  std::thread batch_worker_;
+  std::mutex batch_mutex_;
+  std::condition_variable batch_cv_;
+  std::deque<std::vector<PendingHistoryRecord>> batch_queue_;
+  bool batch_busy_ = false;
+  bool batch_stop_ = false;
+  std::exception_ptr batch_error_;
+#endif
 };
 
 }  // namespace tenryu::diagnostics

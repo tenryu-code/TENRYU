@@ -19,7 +19,7 @@
       <ul>
         <li>規格化したプランク群重み \(b_g(T_e)\) と Fleck 係数 \(f\) により、群ごとの放出と物質エネルギーの更新を同じ線形化で閉じる。</li>
         <li>既定の Levermore–Pomraning 制限関数は、拡散係数 \(D_g=c\lambda_g/\sigma_{R,g}\) を局所の輻射勾配に応じて抑える。</li>
-        <li>1D は群を一括処理する三重対角解法、2D RZ はセルごとの保存型有限体積 5 点 CSR 行列と共役勾配法系のソルバを用いる。</li>
+        <li>1D は群を一括処理する三重対角解法、2D RZ はセルごとの保存型有限体積 5 点 CSR 行列と共役勾配法系のソルバを用いる。1D の外側反復は既定で多群-灰色の合成加速を使い、流束制限子を最初の反復の放射場で評価してステップ内で固定する。</li>
         <li>Marshak の入射、真空境界からの漏れ出し、物質への沈着を同じ面と源の項から集計し、閉じた収支では群の総和が機械精度で打ち消し合う。</li>
       </ul>
     </aside>
@@ -65,7 +65,7 @@
         <li>\(f_{c,g}\) は Fleck の陰性度である。\((1-f_{c,g})c\sigma^{PA}_{c,g}E^n_{c,g}\) は、刻み内の吸収を新しい熱源としてではなく、散乱に似た実効的な再放出として戻す。</li>
         <li>\(\sigma^{PA}_{c,g}\) は除去と沈着に使うプランク吸収係数、\(\sigma^{PE}_{c,g}\) は \(\eta_{c,g}\) を通じて放射率を決める係数である。LTE の経路では一致するが、NLTE の表では異なり得る。</li>
         <li>\(\sigma_{R,c,g}\) は群内ロスランド平均の長さ不透明度 [1/cm] である。拡散係数と制限子の引数の分母に使い、平均の取り方が吸収の \(\sigma^{PA}\) と異なる。</li>
-        <li>\(D_{f,g}\) は面 \(f\) 上の拡散係数である。1D では面上に置いた \(E\) と \(\sigma_R\) から評価し、2D RZ では隣り合うセル中心の \(D\) の調和平均を取る。共有する面では両側のセルが同じ係数を使う。流束項の \(A_f\) は面の面積、\(d_f\) は面を挟む 2 つのセル中心間の距離、\(n(f)\) は面 \(f\) の向こう側の隣接セルである。</li>
+        <li>\(D_{f,g}\) は面 \(f\) 上の拡散係数である。1D では面上に置いた \(E\) と、2 つのセル中心間の光学的厚さをその距離で割った面の \(\sigma_R\)（2 つの半セルの直列抵抗）から評価し、2D RZ では隣り合うセル中心の \(D\) の調和平均を取る。共有する面では両側のセルが同じ係数を使う。流束項の \(A_f\) は面の面積、\(d_f\) は面を挟む 2 つのセル中心間の距離、\(n(f)\) は面 \(f\) の向こう側の隣接セルである。</li>
         <li>\(R=|\nabla E_g|/(\sigma_{R,g}E_g)\) は、光子平均自由行程と輻射エネルギーの勾配長の比である。\(R\ll1\) は拡散的な領域、\(R\gg1\) は制限関数が効く自由流の極限を表す。</li>
       </ul>
 
@@ -119,9 +119,10 @@
           $$
           <p>左辺はステップ全体での（\(T_e^n\) に係留した）セルの電子エネルギー変化、右辺は吸収した群エネルギーから実際に適用した放出 — 凍結した \(S^{\rm used}\) そのもの — を引いた量である。</p>
         </li>
-        <li><p><strong>外側の不動点を判定する。</strong> この反復が自己無撞着にする量 — そして収束判定の対象 — は電子温度 \(T_e\)、いいかえれば \(T_e\) から評価する係数一式である。循環の構造は、群の連立系が \(T_e\) における \(b_g\)・不透明度・\(f\)（およびリミッタの拡散係数は現在の \(E_g\) 反復値）を必要とする一方、その \(T_e\) 自身は解いた \(E_g\) を受け取る物質側の閉包から得られる、という点にある。各反復は緩和なしの純粋なピカール代入で、凍結した段入口状態から後退オイラーの 1 ステップ全体を解き直す — 右辺は常に \(E^n_g\) に、物質収支は \(T_e^n\) に係留されるため、反復は前の結果へ積み増すのではなく<em>置き換え</em>る。新しい \(T_e\) から \(b_g\)、不透明度、\(f\)、\(D_g\) を更新して群の求解を繰り返し、連続する反復間の変化が \(\max_c|T^{k+1}_{e,c}-T^{k}_{e,c}|/\max(T^{k+1}_{e,c},T_{\rm floor})&lt;\texttt{outer_tol}\)（\(T_{\rm floor}\) は設定した温度下限 <code>Te_floor_eV</code>）を満たしたら停止する。実運用の既定値は <code>outer_tol=1e-5</code>、<code>max_outer_iterations=20</code> である。許容値に達しないまま上限に到達した場合は最終反復の結果を採用し、頻度を制限した実行ログの警告に未収束の残差を記録する。</p></li>
+        <li><p><strong>外側の不動点を判定する。</strong> この反復が自己無撞着にする量 — そして収束判定の対象 — は電子温度 \(T_e\)、いいかえれば \(T_e\) から評価する係数一式である。循環の構造は、群の連立系が \(T_e\) における \(b_g\)・不透明度・\(f\)（およびリミッタの拡散係数は現在の \(E_g\) 反復値）を必要とする一方、その \(T_e\) 自身は解いた \(E_g\) を受け取る物質側の閉包から得られる、という点にある。各反復は緩和なしの純粋なピカール代入で、凍結した段入口状態から後退オイラーの 1 ステップ全体を解き直す — 右辺は常に \(E^n_g\) に、物質収支は \(T_e^n\) に係留されるため、反復は前の結果へ積み増すのではなく<em>置き換え</em>る。新しい \(T_e\) から \(b_g\)、不透明度、\(f\)、\(D_g\) を更新して群の求解を繰り返し、連続する反復間の変化が \(\max_c|T^{k+1}_{e,c}-T^{k}_{e,c}|/\max(T^{k+1}_{e,c},T_{\rm floor})&lt;\texttt{outer_tol}\)（\(T_{\rm floor}\) は設定した温度下限 <code>Te_floor_eV</code>）を満たしたら停止する。実運用の既定値は <code>outer_tol=1e-5</code>、<code>max_outer_iterations=20</code> である。許容値に達しないまま上限に到達した場合は最終反復の結果を採用し、頻度を制限した実行ログの警告に未収束の残差を記録する。</p>
+          <p>1D では既定（<code>outer_accel="auto"</code>）で灰色加速を使う。各反復の後、次の反復の温度を、群の誤差を無限媒質の最も遅いモードのスペクトルで表して群について足した灰色の三重対角方程式 1 本（Morel–Larsen–Matzen の多群-灰色合成加速）の解で補正する。補正は反復間の変化とともに消えるので、収束した解は加速なしの反復と同じである。流束制限子は既定（<code>limiter_evaluation="predictor"</code>）で最初の反復の放射場から評価してステップ内で固定する（<code>"iterate"</code> は毎反復評価し直す従来の方式で、この遅れた固定点反復は光学的に薄く流れが支配的な領域で停滞しやすい）。GXII の回帰デッキでは全ステップが 2 次収束する（平均 2.6 回）。2D RZ の既定は加速なしで、任意選択の Anderson 混合（<code>outer_accel="anderson"</code>、1D でも可）もある。</p></li>
         <li><p><strong>境界と台帳を閉じる。</strong> 上の離散項から <code>rad_dep</code> \(=\Delta t\,V_c\,c\sigma^{PA}E^{n+1}\) と <code>rad_emit</code> \(=S^{\rm used}\) を作り、同じ境界の行から <code>marshak_in</code> と <code>escaped</code> を作る。共有する面はひとつの \(A_fD_{f,g}/d_f\) を使うので、2 つのセルからの寄与が相殺し、群について総和した輻射と物質の変化は、浮動小数点の和の範囲で境界の台帳へ集約される。</p></li>
-        <li><p><strong>ボイドの契約を守る。</strong> 明示的なボイドのマスクをもつ表・NLTE の経路では \(f=1\)、\(\sigma^{PA}=\sigma^{PE}=\sigma_R=\eta=0\) とし、物質との交換と温度の更新を行わない。不透明度の下限は、拡散係数を有限に保つためだけに使う。これは数値的に安定なボイドの扱いであって、角度に依存する自由流のモデルではない。</p></li>
+        <li><p><strong>ボイドの契約を守る。</strong> ボイドのセル（<code>is_void</code> の材料のセル）は、1D ではすべての不透明度モデルで、2D RZ では明示的なボイドのマスクをもつ表・NLTE の経路で、\(f=1\)、\(\sigma^{PA}=\sigma^{PE}=\sigma_R=\eta=0\) とし、物質との交換と温度の更新を行わない。不透明度の下限は、拡散係数を有限に保つためだけに使う。これは数値的に安定なボイドの扱いであって、角度に依存する自由流のモデルではない。</p></li>
       </ol>
     </section>
 
@@ -160,6 +161,8 @@
           <tr><th><code>Radiation.multigroup_diffusion.flux_limiter</code></th><td><code>"levermore_pomraning"</code></td><td>FLD の流束制限関数。LP 形が既定である。</td></tr>
           <tr><th><code>Radiation.multigroup_diffusion.max_outer_iterations</code></th><td><code>20</code></td><td>係数と物質の連成に対する外側反復の上限。</td></tr>
           <tr><th><code>Radiation.multigroup_diffusion.outer_tol</code></th><td><code>1e-5</code></td><td>電子温度の相対収束の許容値。</td></tr>
+          <tr><th><code>Radiation.multigroup_diffusion.outer_accel</code></th><td><code>"auto"</code></td><td>外側反復の加速。<code>"auto"</code> は 1D で灰色加速（<code>"grey"</code>）、2D RZ で加速なし（<code>"none"</code>）。<code>"anderson"</code> も選べる。</td></tr>
+          <tr><th><code>Radiation.multigroup_diffusion.limiter_evaluation</code></th><td><code>"predictor"</code></td><td>1D の流束制限子を評価する放射場。<code>"predictor"</code> は最初の反復で固定、<code>"iterate"</code> は毎反復。</td></tr>
           <tr><th><code>Radiation.multigroup_diffusion.boundary.inner_r / outer_r</code></th><td><code>"reflect" / "vacuum"</code></td><td>FLD の半径方向の面種別。外面は <code>marshak</code> も選べる。</td></tr>
           <tr><th><code>Radiation.boundary.marshak_Tr_eV / marshak_Tr</code></th><td>一定値 / 関数</td><td>Marshak の \(T_r\)。関数は初期化時に表へ変換され、実行時に Python は動かない。</td></tr>
         </tbody>
@@ -171,7 +174,7 @@
       <ul>
         <li>解析解による多群 Marshak スペクトルの検査 <code>fld_1d_mg_planar_marshak_spectrum</code> と <code>fld_1d_mg_planar_freqdep_relaxation</code> は、独立に計算したプランク分率に対する \(G=8\) のプラトーと、同じ振動数依存の不透明度に対する閉じた形の群別緩和解を確認する。</li>
         <li>線形化した連成を対で確かめる試験は、0 次元の Fleck 常微分方程式の閉じた形の解、群別の NLTE スペクトルと Fleck 係数の検査、Su–Olson のピケットフェンス問題 [6] — 2 本の不透明度バンドをもつ半解析的なモデルで、バンドの割り当てを入れ替えても解が変わらない重ね合わせ対称性をゲートが利用する — を組み合わせて、線形化された物質結合を固定する。<code>fld_1d_volume_source_balance</code> の修正により、収支の残差は \(7.9\times10^{-6}\) から \(2.1\times10^{-10}\) へ低下した。</li>
-        <li><code>verify_gxii_1d_fld_regression</code> は <a href="../../verification/index.html#gxii">GXII</a> の 1D 基準回帰試験として、吸収した輻射エネルギー、最大圧縮時刻、シェル半径、ピーク密度、面密度、中心温度といった輻射爆縮の指標を判定する。</li>
+        <li><code>verify_gxii_1d_fld_regression</code> は <a href="../../verification/index.html#gxii">GXII</a> の 1D 基準回帰試験として、吸収した輻射エネルギー、最大圧縮時刻、シェル半径、ピーク密度、面密度、中心温度といった輻射爆縮の指標を判定する。既定の外側反復で全ステップが収束する（平均 2.6 回）。</li>
         <li>エネルギー保存の試験は、共有面での相殺、<code>marshak_in</code> と <code>escaped</code>、物質側の放出と沈着を、ひとつの台帳に閉じる。流体を凍結した 2D の多群・グレイ一致検査は \(\varepsilon_{L2}\le10^{-8}\) と \(\varepsilon_{L\infty}\le10^{-6}\) — 場全体の相対 RMS 差と相対最大差 — および台帳のずれの差 \(\le10^{-10}\) を要求し、閉じた箱での実測のずれは \(\le5.1\times10^{-16}\) である。</li>
         <li>2D RZ の層状スラブ Marshak 試験群は、境界の立ち上がり、波面の位置、分布、物質界面での流束、各ステップの台帳残差を、独立な陰的ニュートン有限体積の参照解と比較する。短い時間窓での台帳の判定基準は \(\le10^{-10}\)、認証時の判定基準は \(\varepsilon_{L2}(E)\le0.02\)、界面流束の不連続 \(\le10^{-3}\) である。</li>
       </ul>

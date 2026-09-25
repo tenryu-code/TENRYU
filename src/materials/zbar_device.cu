@@ -8,6 +8,7 @@
 #include "core/config.hpp"
 #include "core/error.hpp"
 #include "core/kernel_guard.hpp"
+#include "core/launch_shape.hpp"
 #include "core/nvtx_range.hpp"
 #include "core/state.hpp"
 #include "materials/ionmix_reader.hpp"
@@ -151,6 +152,38 @@ struct ZbarDeviceContext::Impl {
   core::DeviceBuffer<std::uint8_t> cell_is_void;
   core::DeviceBuffer<std::uint8_t> clamped_inputs;
   core::DeviceBuffer<ZbarClampSummary> clamp_summary;
+  // Clamp-warning summaries come back asynchronously (pinned buffer and an
+  // event) and are reported at a later call, so collecting them costs no
+  // host synchronization (2026-09-23; the synchronous read ran on every call
+  // for as long as fewer than the capped number of warnings had been
+  // printed, i.e. for the whole run when nothing clamped).
+  ZbarClampSummary* pinned_summary = nullptr;
+  cudaEvent_t summary_ready = nullptr;
+  bool summary_pending = false;
+
+  void report_pending(const bool wait) {
+    if (!summary_pending) return;
+    if (wait) {
+      if (cudaEventSynchronize(summary_ready) != cudaSuccess) return;
+    } else if (cudaEventQuery(summary_ready) != cudaSuccess) {
+      return;  // still in flight (or failed; the next call's check reports it)
+    }
+    summary_pending = false;
+    for (int i = 0; i < pinned_summary->count && i < kZbarWarningRecords; ++i) {
+      const auto& warning = pinned_summary->records[i];
+      report_zbar_clamped_input(warning.rho_input, warning.T_input,
+                                warning.rho_used, warning.T_used);
+    }
+  }
+
+  ~Impl() {
+    try {
+      report_pending(true);
+    } catch (...) {
+    }
+    if (summary_ready != nullptr) static_cast<void>(cudaEventDestroy(summary_ready));
+    if (pinned_summary != nullptr) static_cast<void>(cudaFreeHost(pinned_summary));
+  }
 };
 
 ZbarDeviceContext::ZbarDeviceContext() = default;
@@ -197,15 +230,27 @@ void update_zbar_fields_device(ZbarDeviceContext& context,
     cache.materials.copy_from_host(material_params);
     cache.cached_materials = material_params;
   }
-  const bool collect_warnings = tabular && !zbar_clamp_warning_limit_reached();
+  cache.report_pending(false);
+  // One summary in flight at a time: while the previous one is still being
+  // copied back, this call collects none.
+  const bool collect_warnings =
+      tabular && !cache.summary_pending && !zbar_clamp_warning_limit_reached();
   if (collect_warnings) {
     cache.clamped_inputs.reset(n * n_mat);
     cache.clamp_summary.reset(1);
+    if (cache.pinned_summary == nullptr) {
+      void* pinned = nullptr;
+      cuda_check(cudaHostAlloc(&pinned, sizeof(ZbarClampSummary), cudaHostAllocDefault),
+                 "Device Zbar pinned warning summary allocation failed");
+      cache.pinned_summary = static_cast<ZbarClampSummary*>(pinned);
+      cuda_check(cudaEventCreateWithFlags(&cache.summary_ready, cudaEventDisableTiming),
+                 "Device Zbar warning event creation failed");
+    }
   }
   const int cells = static_cast<int>(n);
   const int materials_count = static_cast<int>(n_mat);
-  constexpr int threads = 128;
-  const int blocks = (cells + threads - 1) / threads;
+  const int threads = core::serial_cell_block_size(cells);
+  const int blocks = core::serial_cell_blocks(cells);
   if (tabular) {
     update_zbar_fields_kernel<true><<<blocks, threads>>>(
         state.rho.data(), state.Te.data(), state.volFrac.data(), cache.cell_is_void.data(),
@@ -223,14 +268,12 @@ void update_zbar_fields_device(ZbarDeviceContext& context,
         state.rho.data(), state.Te.data(), cache.clamped_inputs.data(),
         cache.materials.data(), cells, materials_count, cache.clamp_summary.data());
     cuda_check(cudaGetLastError(), "collect_zbar_clamp_warnings_kernel launch failed");
-    ZbarClampSummary summary;
-    cuda_check(cudaMemcpy(&summary, cache.clamp_summary.data(), sizeof(summary), cudaMemcpyDeviceToHost),
+    cuda_check(cudaMemcpyAsync(cache.pinned_summary, cache.clamp_summary.data(),
+                               sizeof(ZbarClampSummary), cudaMemcpyDeviceToHost, nullptr),
                "Device Zbar warning summary D2H failed");
-    for (int i = 0; i < summary.count; ++i) {
-      const auto& warning = summary.records[i];
-      report_zbar_clamped_input(warning.rho_input, warning.T_input,
-                                warning.rho_used, warning.T_used);
-    }
+    cuda_check(cudaEventRecord(cache.summary_ready, nullptr),
+               "Device Zbar warning event record failed");
+    cache.summary_pending = true;
   }
 }
 

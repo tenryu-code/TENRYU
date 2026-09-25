@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <string>
 #include <vector>
@@ -68,11 +69,14 @@ class IMC {
   IMC(IMC&&) noexcept = default;
   IMC& operator=(IMC&&) noexcept = default;
 
+  // drive_time_s: evaluation time of time-dependent boundary drives in the 1D
+  // FLD / S_N solves (midpoint of the advanced interval); NaN = state.t.
   void transport_step(core::State& state,
                       const core::Config& cfg,
                       double dt,
                       const parallel::PartitionInfo& part = parallel::PartitionInfo{},
-                      parallel::CommBuffers* bufs = nullptr);
+                      parallel::CommBuffers* bufs = nullptr,
+                      double drive_time_s = std::numeric_limits<double>::quiet_NaN());
   void invalidate_difference_reference();
 
   [[nodiscard]] static double compute_dt_rad(const core::State& state,

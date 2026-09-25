@@ -9,6 +9,25 @@ namespace tenryu::laser {
 
 constexpr int kIBExtMaxSpecies = 4;
 
+// Collision-charge model of one material slot (1D multi-material decks,
+// Config::LaserConfig::IBExt::material_zeff; 2026-09-24). Device POD.
+struct LaserZeffMaterial {
+  int model = 0;  // 0 = off (Zbar), 1 = sequential_strip, 2 = table
+  int n_species = 0;
+  double z_nuc[kIBExtMaxSpecies] = {0.0, 0.0, 0.0, 0.0};
+  double x_frac[kIBExtMaxSpecies] = {0.0, 0.0, 0.0, 0.0};
+  const double* zeff_table = nullptr;  // device [nD*nT], d*nT+t
+  int zt_nd = 0;
+  int zt_nt = 0;
+  double zt_l10d0 = 0.0;
+  double zt_dl10d = 1.0;
+  double zt_l10t0 = 0.0;
+  double zt_dl10t = 1.0;
+  // Representative collision charge of the Langdon factor; <= 0: the
+  // node's Zbar.
+  double langdon_zcoll = 0.0;
+};
+
 struct LaserPhysExtOptions {
   // master switch mirrors are handled by callers; the POD carries sub-flags
   int zeff_model = 0;          // 0=off, 1=sequential_strip, 2=table
@@ -41,7 +60,44 @@ struct LaserPhysExtOptions {
   double ra_r_crit_cm = -1.0;  // outermost critical radius; <0 disables RA this step
   double ra_ln_cm = -1.0;      // density scale length |dlnne/dr|^-1 at r_crit; <=0 disables
   double k0_cm_inv = 0.0;      // laser vacuum wavenumber 2*pi/lambda
+  // Multi-material decks (2026-09-24): the collision-charge model of every
+  // material slot (device, null otherwise; each laser-mesh node takes its
+  // material's) and the Langdon collision charge per radial node of the 1D
+  // trace (device, null: langdon_zcoll above for every node).
+  const LaserZeffMaterial* zeff_materials = nullptr;
+  int n_zeff_materials = 0;
+  const double* langdon_zcoll_radial = nullptr;
 };
+
+// The options with the collision-charge model of material slot m (a node
+// without material, m < 0, takes Zbar: model off).
+TENRYU_HOST_DEVICE inline LaserPhysExtOptions with_material_zeff(
+    const LaserPhysExtOptions& opt, const int m) {
+  LaserPhysExtOptions out = opt;
+  if (opt.zeff_materials == nullptr) {
+    return out;
+  }
+  if (m < 0 || m >= opt.n_zeff_materials) {
+    out.zeff_model = 0;
+    out.n_species = 0;
+    return out;
+  }
+  const LaserZeffMaterial& mz = opt.zeff_materials[m];
+  out.zeff_model = mz.model;
+  out.n_species = mz.n_species;
+  for (int s = 0; s < kIBExtMaxSpecies; ++s) {
+    out.z_nuc[s] = mz.z_nuc[s];
+    out.x_frac[s] = mz.x_frac[s];
+  }
+  out.zeff_table = mz.zeff_table;
+  out.zt_nd = mz.zt_nd;
+  out.zt_nt = mz.zt_nt;
+  out.zt_l10d0 = mz.zt_l10d0;
+  out.zt_dl10d = mz.zt_dl10d;
+  out.zt_l10t0 = mz.zt_l10t0;
+  out.zt_dl10t = mz.zt_dl10t;
+  return out;
+}
 
 // Bilinear in (log10 ni, log10 Te), clamped to the table edges.
 TENRYU_HOST_DEVICE inline double zeff_ratio_from_table(

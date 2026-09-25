@@ -13,7 +13,9 @@
 \(\xi\) は Braginskii の \(\gamma_0(Z)\)（3.16, 4.9, 6.1, 6.9, …, 12.5）の
 Epperlein–Short 型補間で、全次元・全経路（1D/2D・per-material・SNB 基底流束・
 persistent loop）に常時適用される（user 裁定 2026-07-30 — 固定係数経路は削除、
-namelist `spitzer_z_correction` は deprecated no-op、"off" はエラー）。
+namelist `spitzer_z_correction` は deprecated no-op、"off" はエラー）。2026-09-23 是正: 2D の
+Kershaw 係数・材料別経路（§4.1.1）・材料別の Dirichlet 境界・公開 API `conduction::spitzer_conductivity`
+は \(\xi\) の無い別定義の式を使っていた。現在は全経路が同じ式（`conduction_bodies.cuh`）を使う。
 charge-moment 表（§1.1.3a）併用時は衝突電荷 \(\bar Z r_2\) に対して評価する。
 ここで \(\bar{Z}\) は平均電離度（§1.1.4）。
 固定モデルでは \(\bar{Z} = Z\)（原子番号）。Thomas-Fermi/テーブルモデルでは §1.1.4 の \(\bar{Z}\) を使用する。
@@ -238,6 +240,10 @@ ctest `C1 Zel'dovich-Raizer thermal-wave gate is production-level` は
 `numerics.materials.per_material_conservation_enabled=true` かつ hydro EOS context が利用可能な場合、
 電子熱伝導は材料ごとの電子エネルギー \(E_{e,c,m}\) を直接更新する。従来の単一材料/disabled 経路は
 従来 kernel を使い、bit-exact disabled invariant の対象として残す。
+材料別保存は 2D_RZ 専用である（1D_SPH では ConfigError。1D の流体・レーザー・輻射・燃焼は材料別
+エネルギーを更新しないため — 2026-09-23）。解の後は材料別エネルギーの和から \(e_e\) を、材料別 EOS から
+\(T_e\)・\(P_e\) を導出し、ドライバは伝導の増分を \(e_e\) に再計上しない（2026-09-23 是正 — 旧実装は
+エネルギー主体の表 EOS でドライバが \(c_{v,old}\Delta T_e\) を重ねて加え、伝導エネルギーを二重に計上していた）。
 
 1D face \(f=(L,R)\) では、材料 \(m\) の面体積率を
 \[
@@ -252,9 +258,10 @@ n_{e,f,m}=\rho_{f,m}\bar Z_m/(A_m m_p),\qquad
 \]
 を評価し、
 \[
-\kappa_{SH,f,m}=\kappa_0\,T_{e,f,m}^{5/2}/(\bar Z_m\ln\Lambda_{f,m})
+\kappa_{SH,f,m}=\kappa_0\,\xi(\bar Z_m)\,T_{e,f,m}^{5/2}/(\bar Z_m\ln\Lambda_{f,m})
 \]
-を得る。Flux limiter は集約後ではなく材料ごとに適用する：
+を得る（\(\xi\) は §4.1）。\(\bar Z_m\) は材料ごとの一定値（固定 zbar モデルならその値、それ以外は材料の Z）で、
+材料別の EOS・人工粘性と同じ約束である（表形式・TF の電離度は材料別には評価しない）。Flux limiter は集約後ではなく材料ごとに適用する：
 \[
 q_{SH,f,m}=-\kappa_{SH,f,m}\nabla T_{e,f,m},\qquad
 q_{\max,f,m}=f_{lim}n_{e,f,m}k_BT_{e,f,m}v_{th,e}(T_{e,f,m}),
@@ -741,6 +748,21 @@ w_{i+1/2} = A_{i+1/2}\,\kappa_{i+1/2}\,\phi_{i+1/2}/\Delta r_{i+1/2}
 GPU 上では cuSPARSE の cyclic-reduction ベース直接解法 `cusparseDgtsv2`
 でこの系を解く。
 
+**セル比熱と伝導後の記帳（2026-09-23）**：\(c_{v,e,i}\) は EOS 閉包が保持する
+`state.cv_e` が正ならその値、非正なら理想気体の値
+\(\bar Z_i e/(A_i m_p(\gamma_i-1))\)（\(A_i,\gamma_i\) はセルの実効質量数と比熱比）
+とする（`conduction_solve_cv_e`。STS の有効拡散係数経路と 2D_RZ の同経路、理想気体
+EOS 同期も同じ関数を使う）。表の比熱が非正になるのは、低温平衡の比熱
+\(c_{v,\rm base}-T\,w''\,C\) が遷移域で負になり閉包がそれを 0 に切り上げたセルなどである。
+energy-authoritative の伝導後の記帳 `apply_conduction_energy_increment`（device / host）は
+同じ関数・同じ入力（捕捉した `state.cv_e`、\(\bar Z\)、\(\gamma_{\rm eff}\)、
+\(A_{\rm eff}\)）で
+\(e_{e,i}\leftarrow e_{e,i}+c_{v,e,i}(T_{e,i}^{n+1}-T_{e,i}^{n})\) とし、解法が動かした
+エネルギーをそのまま記帳する。2026-09-23 までは記帳側が非正のセルで
+\(\max(c_v^{\rm table}(T^n),0)\)（多くは 0）を掛けていたため、解法がそのセルへ運んだ熱が
+台帳に載らなかった。材料別保存の経路（§4.1.1）は非正のセルを熱容量 0 として扱い
+温度を動かさないので、記帳の比熱によらず増分は 0 になる。
+
 **2D_RZ（`conduction.solver="hypre"`）**：
 
 **陰的定式化（backward Euler）**：
@@ -1101,6 +1123,20 @@ n_{crit} = \frac{m_e \omega_L^2}{4\pi e^2} \quad [\text{cm}^{-3}]
 
 > 将来拡張：ターンニングポイントでの鏡面反射など（v1.0ではしない）。
 
+**反射モード（`critical_handling.terminate=False`、2026-09-24、特性曲線積分 §5.3.6 のみ — その既定）**:
+レイは臨界半径（\(\hat n_{raw}=1-\varepsilon_{crit}\)）で終了せず、そこで反射して（転回点と同じ扱い、
+RA は \(b=B\) で 1 回）同じ区間を外向きにたどる。臨界層の解析的尾部閉包（§5.4.4）は使わず、
+臨界半径までの吸収は特性曲線の求積で計算する（\(\hat n_{raw}\in[1-\varepsilon_{crit},1]\) の薄層の
+光学厚、層全体の \(O(\sqrt{\varepsilon_{crit}})\) は含まない）。`terminate_mode="deposit"` とは併用不可
+（ConfigError）、行進（`integrator="leapfrog"`）では ConfigError。既定の `terminate=True` では、
+閉包は入口から臨界密度までの片道の光学厚だけを吸収し、残りは外向きの経路を通らずに未吸収となる
+（臨界層の手前で転回するレイは往復とも追跡される）。そのため吸収が衝突径数と閉包の入口区間で
+不連続に変わり、GXII（`gxii_1d_fld_regression`）では最初の 50 ps で 1 step ごとに吸収効率が
+0.06 と 0.98 の間を往復した（時間刻みの上限を 1/40 にしても残る）。反射モードでは同じ区間の往復が 0.002 以下になり、全吸収は
+0.924 → 0.937、保存誤差の最大は 7.0e-3 → 1.6e-3。残る段差（0.1〜0.17、2 ns で数回）は臨界半径の
+移動に伴うレーザー格子の作り直し（`LaserMesh1D` の節点の変更）と一致する。`terminate=False` は
+2026-09-24 までは受理されて無視されていた。
+
 #### 5.2.1 v1.0 で扱わない物理（Non-goals）
 以下はv1.0のスコープ外であり、実装しない。将来バージョンでの拡張候補として記録する：
 - **共鳴吸収**（resonance absorption）：臨界面での電場共鳴による吸収。v1.0はIBのみ
@@ -1372,14 +1408,23 @@ mesh 内部にも真空区間（\(\kappa=0,\ \hat\nabla\hat n=0,\ \hat n_{raw}=0
 表面ノード。補間される停止点物理量は不変で、次セグメントの
 \(\Delta s_{base},\ \hat\nabla\hat n,\ \kappa\) が物質側になる）。真空側は
 \(g=0\) のため Verlet の打ち切りキック過剰も生じない。この打ち切り
-（\(t_{stop}<1\)）は終端イベントではなく行進を継続する。
+（\(t_{stop}<1\)）は終端イベントではなく行進を継続し、次のステップは交点
+（打ち切った停止点）から始める。直線の真空区間なので速度は位置更新前の値のまま
+とし、全ステップの軸反射が交点より後で起きていれば反射を戻す。真空の打ち切り
+ステップの後半キックは真空側の片側の力（0）で完了し、次ステップ冒頭の完了キック
+は行わない（`ds_prev = 0`。carried 区間を物質側に固定した後に物質側の勾配で
+完了すると \(0.25\,\Delta s_{vac}\,|d\hat n/dr|\) の非物理的なキックになり、長い
+真空ストライドの後に急な表面層へ入るレイを反転させていた）
+（2026-09-23。それまでは区間・停止点物理量だけを表面へ固定し、レイの位置は
+打ち切り前の終点のままだったため、表面からその終点までの物質（最大で真空
+ストライド 1 回分）を無吸収で飛び越えていた）。
 
 > **注意**：`ds_adapt_max_factor = 1.0` に設定すると適応は無効化され、
 > 全ステップで \(\Delta s_{cur} = \Delta s_{base}\) となる。
 > 既存の検証テスト（Beer-Lambert、屈折等）はこの設定で参照解と比較する。
 
 **RK2（Velocity-Verlet、将来拡張）**：
-`raytrace.integrator="rk2"` は将来版予約。**v1.0では未対応** であり、指定時は ConfigError とする。
+`raytrace.integrator="rk2"` は未実装であり、指定時は ConfigError とする（受け付ける値は `"auto"`・`"leapfrog"`・`"characteristic"`、§5.3.6）。
 \[
 \hat{\mathbf{r}}^{n+1} = \hat{\mathbf{r}}^n + C_{ray}\,\hat{\mathbf{v}}^n - \frac{C_{ray}^2}{4}\hat\nabla\hat n(\hat{\mathbf{r}}^n)
 \]
@@ -1389,7 +1434,7 @@ mesh 内部にも真空区間（\(\kappa=0,\ \hat\nabla\hat n=0,\ \hat n_{raw}=0
 精度2次、Leapfrogのシンプレクティック性を持たないが、半ステップ速度が不要。
 
 **RK4（古典4段、将来拡張）**：
-`raytrace.integrator="rk4"` は将来版予約。**v1.0では未対応** であり、指定時は ConfigError とする。
+`raytrace.integrator="rk4"` は未実装であり、指定時は ConfigError とする。
 状態ベクトル \(\mathbf{y}=(\hat{\mathbf{r}}, \hat{\mathbf{v}})\) に対し：
 \[
 \mathbf{k}_1 = h\,\mathbf{f}(\mathbf{y}^n),\quad
@@ -1590,6 +1635,163 @@ block の**固定形状 tree reduction**（atomics 不使用・run 反復 bit �
 bit 同一（5 case / 133 assertions PASS 2026-08-04）+ 3step フル A/B
 （march 比の吸収・バング・ρ_peak 一致 — 実測値はコミット時点の
 VERIFICATION 記録を正とする）。
+
+#### 5.3.6 1D_SPH の特性曲線積分（`raytrace.integrator="characteristic"`、2026-09-24）
+
+1D_SPH の `mode="raytrace_2d"` で `Laser.raytrace.integrator="characteristic"`
+（既定の `"auto"` はここで `"characteristic"` になる。§5.3.2 の行進は
+`"leapfrog"` で選ぶ）のとき、§5.3.2 の行進（`ray_trace_1d_sph_body`）に代えて、各レイを特性曲線に
+沿って区間ごとに積分する（`ray_trace_1d_characteristic_body`、
+`src/laser/ray_trace_characteristic.cuh`）。媒質（`radial_n_hat`・
+`radial_n_hat_raw`・`radial_smooth_kappa`・`radial_T_e` は §5.7.4 の断面節点間で
+\(r\) に線形）、発射・事象の規約、出力（セル沈着・unabsorbed・尾部閉包・
+臨界到達・CBET 記録・hot-electron 捕獲行・RA・軌跡・\(\tau\) 診断）は行進と同じである。
+
+**(a) 保存量と求積式**：§5.3.2 の \(d\hat{\mathbf r}/d\xi=\hat{\mathbf v},\;
+d\hat{\mathbf v}/d\xi=-\hat\nabla\hat n/2\)（\(|\hat{\mathbf v}|^2+\hat n=1\)）は
+球対称場で角運動量 \(B=|\mathbf r\times\mathbf v|\) を保存する。
+\(\varepsilon=1-\hat n\)、\(Q(r)=r^2\varepsilon(r)-B^2\)（経路上 \(Q\ge0\)）として
+\[
+\frac{ds}{|dr|}=\frac{\sqrt{\varepsilon}\,r}{\sqrt{Q}},\qquad
+\frac{d\phi}{|dr|}=\frac{B}{r\sqrt{Q}},\qquad
+d\tau=\kappa_{IB}\,ds
+\]
+（\(\phi\) は子午面の極角。\(d\phi/d\xi=-L/r^2\)、\(L=R v_Z-Z v_R\)）。
+\(B\) は入射点で速度を \(|\hat{\mathbf v}|=\sqrt{1-\hat n}\) に合わせた後の
+\(|R v_Z - Z v_R|\)（真空入射では衝突径数）。
+
+**(b) 区間分割と事象**：経路は次の点で区切る — レーザー半径節点、hydro セル面、
+critical-adjacent 分割半径、事象半径。各区間は 1 つの hydro セルに収まるので、
+沈着はそのセルへ直接入る（行進の中点帰属 — 面をまたぐステップの全吸収を
+中点のセルへ置く — は生じない）。内向き leg の事象は区間ごとに:
+転回点（区間で 3 次式となる \(Q\) の最大根。\(r>0\) で \(Q'=0\) は
+\(r^*=2(1-n_0)/(3n_1)\) のみなので括弧内の根は一意。二分法＋安全化 Newton）、
+臨界（\(\hat n_{raw}=1-\varepsilon_{crit}\) の線形交点）、中心（\(B=0\)。
+\(\phi\leftarrow\phi+\pi\) で反対側へ抜ける）。入射時・区間入口で
+\(Q\le0\)（接線入射）なら、その点で転回する。外向き leg は同じ区間を
+プロファイル端まで戻る。
+
+**(c) 求積**：区間 \([a,b]\) の \(\Delta s,\Delta\phi,\tau\) を適応
+Gauss–Kronrod (3, 7) で求める。転回点を含む区間は
+\(u=\sqrt{r-r_t}\)（\(r_t\) = 転回点）、転回点に近い内向き区間は
+\(Q\) の Newton 外挿根 \(r_0=a-Q(a)/Q'(a)\)（\(a-r_0<b-a\) のとき）を使った
+\(u=\sqrt{r-r_0}\) を変数とし（\(1/\sqrt Q\) の特異性が正則な被積分関数になる）、
+外向き leg の区間は \(r_t\) と区間自身の \(r_0\) のうち区間の入口 \(a\) に近い方を
+中心にする（2026-09-25。転回点を傾きの小さい区間で過ぎたレイでは、次の区間の入口で
+\(Q\) がまだ 0 に近く、そこから \(Q\) が急に増えるので、遠い \(r_t\) を中心にすると
+\(1/\sqrt Q\) がほぼ特異のまま残る — GXII の臨界層で \(r_t\) が \(a\) の
+\(6\times10^{-6}\) cm 下、\(r_0\) が \(1.6\times10^{-10}\) cm 下の区間がパネルの上限に達し、
+300 ステップで 63 区間が上限で受け入れられていた。修正後は 0 区間、GXII のエネルギー量の
+変化は相対 \(2\times10^{-7}\) 程度）。それ以外は \(r\) を変数とする。パネルは \(|K_7-G_3|\) が 3 量それぞれで
+（区間全体の \(K_7\) の \(10^{-7}\) 倍、\(\phi\) と \(\tau\) は絶対値
+\(10^{-12}\) を下限とする）許容誤差のパネル幅比例分以下になるまで二分する
+（深さ 20・64 パネルが上限。上限で受け入れた区間は数えて警告する：
+`DeviceErrorFlags::unresolved_quadrature`）。\(|K_7-G_3|\) は \(G_3\) の誤差の目安で、
+受け入れた \(K_7\) 自体の誤差はずっと小さい。\(\kappa_{IB}\) は §5.4 の
+`compute_kappa_from_smooth`（`test_kappa` 指定時は定数）。Langdon 因子
+（§5.4.5、`langdon_model`）は通過する区間ごとに、その区間で吸収が起こる位置
+— 求積変数（\(u\) または \(r\)）の光学的厚さ重み付き平均 \(\bar x\) —
+の半径と、そこでの極角（区間入口の \(\phi\) から \(\Delta\phi\) を求積変数で
+線形に配分した値）での \(R_{cyl}=r|\sin\phi|\) の真空写像強度と \(T_e\)（線形）で
+評価し、その区間の \(\tau\) に掛ける（転回点を含む区間では吸収が転回点側に
+偏るので、中点での評価より正確）。
+区間ごとに \(\Delta P=-I\,\mathrm{expm1}(-\tau)\)、\(I\leftarrow I-\Delta P\)。
+
+**(c') 並列化**：区切り点（半径節点・\((0,r_{max})\) 内の hydro セル面・分割半径）は
+全レイで共通なので、トレースごとに GPU 上で 1 回だけ昇順の区間表
+（`CharacteristicPieces`: 区切り点、区間ごとの半径区間とセル）を作る
+（各点の順位を二分探索で求めて書き込む。等しい値は節点・面・分割半径の順で、
+その間は長さ 0 の区間になる）。1 レイを \(L\) レーン（\(L\in\{32,64,128,256\}\)。
+\(L>32\) では同じブロックの \(L/32\) 個の warp が組になる）で追跡し、経路に沿った
+\(L\) 区間ずつ処理する。各レーンが 1 区間を担当し、出力に依らない
+量（入口検査・尾部閉包の判定・内向き事象・求積・Langdon 因子・吸収率）を
+並列に求める。続いて組の中の走査で、各区間入口の極角（前置和）と出力
+（透過率の前置積）を求め、最初の事象でその塊を打ち切り、沈着・
+\(\tau\) 診断・CBET 記録を同じセルの連続区間ごとの区分和で 1 レーンが書く。
+走査は warp 内のシャッフル走査で、\(L>32\) では warp ごとの結果を共有メモリに置いて
+warp の順に結合する（組ごとの名前付きバリア `bar.sync` で同期し、区分和は塊の
+先頭の warp から後ろへ繰り越す）。
+leg を終える事象（転回・中心・臨界・尾部閉包・下限出力・上限回数）は全レーンが
+同じ値で処理し、レーン 0 が書く。
+
+\(L\) は `Laser.raytrace.lanes_per_ray` で与え、既定の 0 では起動側がレイ数と GPU から
+決める（2026-09-25）: 各 \(L\) の核関数の実体について、GPU が同時に常駐させられる
+スレッド数 \(N_{res}(L)\)（占有率 API の SM あたり常駐ブロック数 × SM 数 × ブロックの
+スレッド数）を求め、そのバッチのレイ数 \(N_{ray}\) が \(N_{ray}L\le N_{res}(L)\) を満たす
+最大の \(L\in\{256,128,64\}\)、どれも満たさなければ 32 とする。レイが全部同時に常駐する
+範囲で、1 レイが順に通る塊の数を減らす（レイが常駐数を超えると数回に分けて走るので、
+レーンを増やしても速くならない）。RTX 4090 の GXII FLD 後半（1.85 ns から 100 ステップ）では
+250 本で \(L=128\) が選ばれトレースは 1.48 → 0.84 ms/step（32 → 自動）、1000 本では
+\(L=32\) のまま（64 は同等、128・256 は遅い）。和と積の結合順が \(L\) で変わるので、
+結果の丸めは \(L\) による。同じレイ数・同じ GPU なら選択は毎ステップ同じで、run の反復は
+bit で一致する。別の種類の GPU や別のレイ数では \(L\) が変わりうるので、別の GPU と bit で
+比べるときは `lanes_per_ray` を固定する。常駐ループは 32 レーン形で追跡するので、
+多カーネル経路と和と積の結合順が同じになるのは \(L=32\) のとき（1 レーン形は同じ算法の逐次形で、
+和と積の丸め順だけが異なる）。
+
+**(d) 行進との対応（互換規約）**：
+- 臨界層の解析的尾部閉包（§5.2、`try_tail_closure_1d`）は行進と同じ判定と入力
+  （\(\hat n_{raw}\ge0.5\)・方向・到達ギャップ・帯域 \(1-\hat n_{raw}<A/g\)）を
+  各区間の入口で評価する（行進は各ステップの入口）。臨界を横切る区間では、
+  行進と同じく staged hot-electron 捕獲を区間入口の出力で適用してから
+  判定なしの閉包を試み、閉包しなければ臨界半径まで吸収して終了する
+  （`record_critical_surface_hit`）。線形層・垂直入射では閉包は解析積分と一致する
+  ので、全吸収は 16/15 則（\(\tau=(16/15)A/|d\hat n/dr|\)）に一致する。
+  `critical_handling.terminate=False`（§5.2 の反射モード）では閉包を評価せず、臨界を横切る
+  区間は臨界半径まで吸収してそこで反射し、外向きの最初の区間は始点（臨界半径上）の
+  臨界判定を省く。
+- hot-electron 捕獲は閾値の上向き交点（線形 \(\hat n_{raw}\) の厳密な交点半径）で、
+  交点までの吸収後の出力を記録する。径方向の方向余弦は
+  \(\mu=\pm\sqrt{Q}/(r\sqrt\varepsilon)\)。
+- RA（§5.4.5 (d)、`compute_ra_event_fraction`）は転回点で \(b=B\) として 1 回
+  （行進は最初の外向きステップで \(b_{eff}=\sqrt{1-\hat n}\,r\approx B\)）。
+- 作業量（`n_steps`、ステップ統計と `max_steps` の上限）は区間数＋追加パネル数。
+  転回点への接近で増えないため、ホスト側のレイ並べ替えと動的上限
+  （行進専用）は使わない。
+- 決定論: \(L\) を決めれば各レイの計算順は固定で、行進と同じレイ別集計と固定順縮約を使う
+  （run 反復で bit 同一。\(L\) の選び方は (c')）。常駐ループ（persistent loop）でも同じ本体
+  （32 レーン形）を使う。
+
+**(e) 検証**（`tests/laser/test_ray_trace_characteristic.cu`）: 一様媒質の弦
+（\(\tau=2\kappa\sqrt{r_{max}^2-b^2}\) と出口点）、折れ線プロファイルの放射状
+レイ（区間ごとの解析積分）、転回するレイの \(\tau\)・出口点・セル別沈着を
+独立な参照解（\(\xi\) 形式のレイ方程式をホストで Dormand–Prince 5(4)、
+全区切り点に着地）と比較、細かい行進への収束、16/15 則、hot-electron 捕獲行、
+run 反復 bit 同一、CBET 記録（\(\sum ds\)・\(\sum S\)・セル訪問順）、接線入射、
+反射モードの往復吸収（臨界半径より外側の区間ごとの解析積分の 2 倍、入射側から出る）。
+hot-electron 捕獲・CBET 記録・run 反復の各試験は \(L=32,64,128,256\) のすべてで行い、
+1 レーン形（同じ算法の逐次形）と起動側の選んだ \(L\) のトレースが丸め誤差の範囲で一致する
+ことも確かめる（`lanes_per_ray` 0・32・64・128・256）。
+
+**(g) 1D の円柱・平板（`Mesh.geometry_1d="cylindrical"`・`"planar"`、2026-09-24）**：
+円柱（軸は lab z）では断面内の位置 \((R,Z)\)、\(r=\sqrt{R^2+Z^2}\) を追跡し、断面内の角運動量
+\(B=|Rv_Z-Zv_R|\) と軸方向速度 \(V\)（`RayArray1D::vA0`）が保存される：
+\(Q(r)=r^2(\varepsilon-V^2)-B^2\)、\(ds/|dr|=\sqrt\varepsilon\,r/\sqrt Q\)、
+\(d\phi/|dr|=B/(r\sqrt Q)\)。平板（法線は lab z、高さ \(x\)、内側の壁 \(x_{min}\)）では横方向
+速度 \(V\)（面内の \(v_R\) と面外の \(v_A\) の合成）が保存され、\(Q(x)=\varepsilon-V^2\)
+（区間で 1 次）、\(ds/|dx|=\sqrt\varepsilon/\sqrt Q\)、極角の代わりに横ずれ
+\(dy/|dx|=V/\sqrt Q\) を積分する。球はこれらの \(V=0\) の場合で、式も丸めも従来と同じ。
+転回点: 円柱は \(e_0=1-V^2-n_0\) とした 3 次式（\(r^*=2e_0/(3n_1)\)）、平板は 1 次式の根。
+事象: 円柱は球と同じ（\(B=0\) なら中心を抜ける）、平板は内側の壁（流体の固定壁 = 鏡面）で反射
+（\(Q>0\) なので正則化根なし、横ずれはそのまま続く）。区間表の区切り点は \((x_{min},r_{max})\) 内の
+hydro 面。RA（§5.4.5）の \(b\)（\(b/r_{crit}\) が臨界での真空入射角の正弦）は円柱
+\(b=\sqrt{B^2+V^2 r_{crit}^2}\)、平板 \(b=V r_{crit}\)。hot-electron 捕獲の方向余弦は
+\(\mu=\pm\sqrt Q/(g\sqrt\varepsilon)\)（\(g=r\)、平板は 1）。軌跡出力は円柱が断面の
+\((|r\sin\phi|, r\cos\phi)\)、平板が（横ずれ, 高さ）。Langdon 因子（§5.4.5）の真空写像は
+球面上の円形ビームの強度なので球でのみ使い、他の幾何では builder が `langdon_model` を無効にする
+（`auto` は off、明示指定は ConfigError）。行進（`integrator="leapfrog"`）は球のみで、円柱・平板は
+特性曲線積分を要求する（`auto` は特性曲線積分、`leapfrog` は ConfigError）。常駐ループは球のみ。
+沈着はセルごとのパワーで、流体の体積（円柱は単位長さ、平板は単位面積あたり）と同じ単位になる
+（ビームの `power` は円柱で単位長さ、平板で単位面積あたり: `radial_absorption_1d` と同じ解釈）。
+検証（`tests/laser/test_ray_trace_characteristic.cu` の `[geometry_1d]`）: 軸方向速度 0 の円柱の
+追跡が球と bit 一致、一様媒質の円柱で軸方向速度をもつ直線路（\(\tau=2\kappa\sqrt{1-b^2}/\cos\chi\)）、
+一様な平板の壁での反射（\(\tau=2\kappa/\cos\theta\)、面外速度成分を含む）、平板の線形層の斜入射で
+32/15 \(\cos^5\theta\) 則（往復 \(\tau=2(A/n_c)(16/15)\cos^5\theta\)）。
+
+線形場（区間ごとの \(\hat n\)、\(\hat n_{raw}\)、IB 係数、\(T_e\)）は区間の始点基準
+\(f(r)=v_0+s(r-x_0)\) で評価する（2026-09-24）。切片形 \(f_0+f_1 r\) は \(|f_1 r|\) 倍の
+丸め誤差を失い、\(r=0.01\) cm の幅 \(2\times10^{-17}\) cm の断面区間で \(\hat n\) に
+\(10^{-3}\) の誤差を生じて転回点・臨界の判定と求積を壊していた（GXII の S_N デッキ）。
 
 ### 5.4 逆制動輻射吸収（IB）
 
@@ -1796,8 +1998,8 @@ supercritical node への leak を防ぐため、2D_RZ では §5.5 と同様に
 
 #### 5.4a Radial absorption 1D integral (`radial_absorption_1d` mode)
 
-`Laser.mode="radial_absorption_1d"` は 1D_SPH 専用の球対称 1D 積分である。
-球殻面に垂直な inward radial flux を仮定し、z軸平行光でも現行 R-Z 2D レイトレーシングでもない。
+`Laser.mode="radial_absorption_1d"` は 1D_SPH（`Mesh.geometry_1d` の球・円柱・平板）の 1D 積分である。
+殻面（円柱面・平板面）に垂直な inward radial flux を仮定し、z軸平行光でもレイトレーシングでもない。
 
 各ビームの時刻 \(t\) のパワーを
 \[
@@ -1807,7 +2009,10 @@ P_{\mathrm{total}}(t) = \sum_b P_b(t) \quad [\mathrm{erg/s}]
 `direction`, `f_number`, `focus`, `defocus`, `profile`, `rays_per_beam` は
 このモードの吸収分布に影響しない（入力互換とパワー波形のために保持される）。
 
-離散化は Hydro 1Dセルの外側 \(r_{\max}\) から内側 \(r=0\) へ単一スレッドで逐次積分する。
+離散化は Hydro 1Dセルの外側 \(r_{\max}\) から内側 \(r=0\) へ逐次積分する（2026-09-24 から、各セルの
+中点の \(\hat n\)・\(\hat n_{raw}\)・IB 係数・\(\tau_c\) を 1 ブロックで 1024 セルずつ並列に
+共有メモリへ求め、パワーの受け渡しだけをスレッド 0 がセル順に行う — 従来の 1 スレッドの逐次計算と
+同じ演算で bit 一致。常駐ループも同じ分け方）。
 セル \(c\) の幅を \(dr_c = r_{c+1/2}-r_{c-1/2}\) とし、radial lookup で得た
 \(\kappa_{\mathrm{smooth},c}\) [cm\(^{-1}\)] を用いる：
 \[
@@ -1866,6 +2071,29 @@ Z_{\rm eff}=\frac{\sum_s n_s Z_s^2}{\sum_s n_s Z_s}
   \(Z_{\rm eff}/\bar Z\) 表（(nᵢ, T) 格子、[1,10] クランプ）を
   デバイス常駐させ、ノードごとに log-log 双線形（端クランプ）で評価。
   nᵢ = n̂·n_crit/\(\bar Z\)。表提供材料が 1 つのときのみ有効。
+- `"auto"`（既定、構築時解決、2026-09-23 改訂）: 電離段分率表があれば `"table"`、
+  `ib.species` の指定があれば `"sequential_strip"`、全ての非 void 材料が同じ多種組成
+  （TMAT `/material` の Z と数割合）を持てばその組成を `ib.species` として
+  `"sequential_strip"`、それ以外は `"off"`（混合物を含むなら WARNING）。従来は表が
+  無ければ常に `"off"` で、組成の分かる CD（GXII デッキ）でも完全電離コロナの
+  κ_IB が \(\bar Z/Z_{\rm eff}=0.66\) 倍に過小だった。単一元素は `"off"` のまま
+  （\(Z_{\rm eff}=\bar Z\) で算術も従来と同一）。`ib.species` と共通組成による解決は
+  IB 拡張のある球の 1D_SPH だけで行い、円筒・平板の 1D（1D_CYL を含む、2026-09-24）と
+  2D_RZ では表が無ければ従来どおり `"off"`（警告なし; 非球の 1D は光線追跡を使わず、
+  レーザー演算子は 1D 以外で IB 拡張を拒否する）。
+- **材料ごとの衝突電荷（2026-09-24、1D の多材料デッキ）**: 非 void 材料が 2 つ以上の 1D_SPH デッキでは、
+  各材料のモデルを材料ごとに決める（`Config::LaserConfig::IBExt::material_zeff`）: `"auto"` は
+  その材料が `/ionization` を持てば `"table"`（その材料の表）、`ib.species` の指定があれば全材料に
+  その組成で `"sequential_strip"`、無ければその材料の TMAT 組成が 2〜4 種なら `"sequential_strip"`、
+  それ以外は `"off"`。明示の `"table"` / `"sequential_strip"` は可能な材料にだけ適用し、他は `"off"`。
+  レーザー格子の各節点は、その節点が値を取る流体セル（`map_hydro_to_laser_1d_kernel_body` と同じ
+  セル探索）の材料、ghost corona の節点は外表面セルの材料を持ち（`map_node_material_1d_kernel`）、
+  \(\kappa\) の前置因子はその材料のモデルで評価する。Langdon の \(Z_{\rm coll}\) は材料の組成の完全電離値
+  \(\sum x z^2/\sum x z\)（組成が無い材料では節点の \(\bar Z\)）を動径節点ごとに持ち、光線追跡（行進法・
+  特性曲線法とも）は区間内で線形補間する（単一材料のデッキは従来どおり 1 つのスカラー）。以前は材料間で
+  組成が違うと `"off"`（平均 \(\bar Z\)）で、`/ionization` を持つ材料が複数あるか材料が 2 つ以上あると
+  ConfigError だった。流体の電離モーメント比 \(r_2, r_4\)（Qei・伝導・粘性）も同様に各セルの材料の表から
+  （`zmoment_fill_by_material_kernel`、表の無い材料のセルは 1）。
 
 **(b) レーザー周波数クーロン対数**（`ib.coulomb_log_model =
 "laser_frequency"`）。§5.4.3 の既定 lnΛ は \(b_{max}\sim v_T/\omega_p\)
@@ -2035,6 +2263,15 @@ w_k^{norm} = \frac{\text{profile}(R_k)\cdot 2\pi R_k\Delta R_k}{\sum_j \text{pro
 ここで \(\text{profile}(R)\) はビーム強度プロファイル（下記参照）、
 \(2\pi R_k\Delta R_k\) はレイ \(k\) が代表する環状面積（RZ軸対称）。
 
+**ステップ内のビームパワー（1D、2026-09-23）**: レーザー演算子は区間
+\([t_n,t_n+\Delta t]\) の沈着を与えるので、1D ではビーム \(b\) のパワーとして
+凍結波形（区分線形テーブル）の厳密な区間平均
+\(\bar P_b=\Delta t^{-1}\int_{t_n}^{t_n+\Delta t}P_b(t)\,dt\) を用いる（レイの出力、
+Langdon の強度、指令エネルギー台帳 \(\bar P\Delta t\)、再トレース省略の正規化の全て）。
+ステップのエネルギーの和は任意の刻み方でパルスの積分に一致し、急峻な立ち上がりを
+またぐステップも自分の分を受け取る（従来の \(P_b(t_n)\) は \(\Delta t/2\) の遅れと、
+立ち上がりをまたぐステップの沈着ゼロを生んでいた）。2D は \(P_b(t_n)\) のまま。
+
 最内リング \(k=0\) の代表半径は \(\Delta R/2\)（面ベース化により
 厳密な軸上 \(R=0\) レイは存在しない）。
 
@@ -2053,6 +2290,24 @@ w_k^{norm} = \frac{\text{profile}(R_k)\cdot 2\pi R_k\Delta R_k}{\sum_j \text{pro
 >
 > **ビーム半径 \(R_{beam}\) との関係**：\(R_{beam}\) はF値から決まるビーム外径（§5.6.1）であり、
 > \(R > R_{beam}\) のレイは生成しない。profile(R) は \(R_{beam}\) 内での相対強度分布を定義する。
+>
+> **基準面（1D、2026-09-23）**：profile は標的中心を通る面（lab \(z=0\)、Langdon の vacuum map
+> が表す面と同じ）で定義し、焦点を通る直線レイに沿って打ち出し面へ写す：
+> 打ち出し半径 \(R_k\) のレイの重みは \(\text{profile}(R_k\,|z_f|/|Z_{init}-z_f|)\)。
+> \(R_k/R_{beam}\) はリングごとに一定なので、重みはレーザーメッシュ外半径 \(Z_{init}\) に依存
+> しない（従来は固定の \(w_0\) を動く打ち出し面で評価しており、コロナが広がるほど外側のレイの
+> 重みが落ちて衝突径数の分布が狭まっていた — GXII で \(Z_{init}\) 0.1→1 mm のとき外縁レイの重み
+> 1→0.135）。焦点が標的中心（\(z_f=0\)）なら全リングが \(R=0\) に写り、f 値の円錐内で一様。
+>
+> **ビーム軸と焦点（1D、2026-09-23）**：1D の標的は球対称なので、ビームは向きによらず打ち出し面
+> \(Z_{init}\)（レーザーメッシュ上端）から −Z 方向へ進むものとして追跡する。焦点位置は lab 座標の
+> 焦点 \(\mathbf{f}\) をビーム軸へ射影した \(z_f=-\mathbf{f}\cdot\hat{\mathbf{d}}\)（標的中心基準、
+> 光源側が正。方向 (0,0,−1) では焦点の lab z）。レイは焦点を通る直線上を −Z へ進む：
+> \(z_f<Z_{init}\) なら焦点へ収束、\(z_f>Z_{init}\)（ビームが打ち出し面より手前で焦点を通過済み）なら
+> 焦点から発散。以前は焦点の lab z をそのまま使っており、\(z_f>Z_{init}\) ではレイを +Z（標的から
+> 離れる向き）へ打ち出し、−Z 以外の方向のビームは鏡像の位置の焦点で追跡していた。同じレイになる
+> ビームを 1 回の追跡にまとめる判定（`FoldKey`、永続カーネルのビーム一致判定も同じ）も、焦点の
+> lab z ではなく \(z_f\) で比べる。
 
 **1D_SPH レイ配列の構築**：
 
@@ -2068,6 +2323,24 @@ R_k = \left(k+\tfrac12\right)\Delta R,\qquad
 旧仕様の node-based 配置 \(R_k=k\Delta R\) は最外半リング
 \([R_{beam}-\Delta R/2,\,R_{beam}]\) を欠き、profile モーメントを内向きに
 \(O(1/N_R)\) 偏らせていた（2026-07-26 カーネルレビュー指摘）。
+
+**(a') 1D の円柱・平板：輪 × 方位角（2026-09-24）**
+
+`Mesh.geometry_1d="cylindrical"`（軸は lab z）・`"planar"`（法線は lab z、真空側が +z）では、
+ビームの lab の向き \(\hat{\mathbf p}\) が入射を決める（平板では \(p_z>0\) の向きは真空側から来るよう
+反転する）。球と同じ輪（\(R_k\)、重み、\(Z_{init}\)、焦点 \(z_f\)）を、ビーム軸まわりの方位角
+\(\psi_m=2\pi(m+1/2)/M\)（`Laser.raytrace.azimuthal_rays` \(=M\)、既定 16）に広げ、各レイを
+3 次元の直線（打ち出し面の点 \(-Z_{init}\hat{\mathbf p}+R_k(\cos\psi\,\hat{\mathbf e}_1+
+\sin\psi\,\hat{\mathbf e}_2)\) と焦点 \(-z_f\hat{\mathbf p}\) を結ぶ、球と同じ収束・発散の向き）として
+作り、その直線上を断面の外側（円柱は半径 \(R_{max}\)、平板は高さ \(R_{max}\)）まで戻した点から、
+追跡の平面（円柱は断面、Z がビームの断面内の来た向き; 平板は（横, 高さ））の位置・速度と面外速度
+\(v_A\) に写す。パワーは輪の重み \(/M\)。平板の垂直入射では全方位角が同じレイになるので
+\(M=1\)。レイは GPU 上で作る（輪の重みはホストの従来の計算）。builder は、円柱の軸に沿う
+ビーム（断面成分 \(<10^{-3}\)）と平板に平行なビーム（法線成分 \(<10^{-3}\)）を ConfigError にする。
+検証（`tests/laser/test_ray_init.cu` の `[geometry_1d]`）: 平板の垂直入射で輪ごとに 1 本・
+\(\sin\theta_k=R_k/\sqrt{R_k^2+(Z_{init}-z_f)^2}\)・総パワー、斜入射で方位角ごとの広がり
+（入射角が軸の角度をまたぐ）・単位速度・総パワー、円柱の横入射で全レイが断面の外から内向き・
+軸方向運動量の和が 0・総パワー。
 
 **(b) 2D_RZ：2D断面配列（ビーム軸直交平面）**
 
@@ -2299,7 +2572,9 @@ piecewise-geometricメッシュを毎ステップ再生成する。
    \hat n_c \ge 1,\ \hat n_{c+1}<1
    \]
    を満たす最外側faceとして求める（なければ未定義）
-3. \(R_{crit}\) は \(r_{edge}[f_{crit}]\)（未定義時は \(0.5R_{max}\)）
+3. \(R_{crit}\) は §5.7.4 のセル中心間対数補間で \(\hat n = 1\) となる位置
+   （外側に亜臨界実セルがない場合は \(r_{edge}[f_{crit}]\)、未定義時は \(0.5R_{max}\)）。
+   2026-09-23 まではここだけ \(r_{edge}[f_{crit}]\) を使っていた
 4. 局所最小セル幅 \(min\_dr_{crit}\) は以下の和集合領域で評価する：
    - \(|c-f_{crit}| \le 10\) の近傍セル
    - \(|r_c-R_{crit}| \le 0.05R_{crit}\) の半径窓
@@ -2351,8 +2626,26 @@ Q(R_i, Z_j) = Q\!\left(\sqrt{R_i^2 + Z_j^2}\right)
 `radial_dn_dr` が 0/2 倍の櫛状ノイズ（実測 27.5%）となってレイ転回点を
 散乱させていた。線形補間により線形プロファイルは任意のノード配置で厳密に
 再現される（場誤差 \(4.4\times10^{-16}\)）。\(T_e,\bar Z\) の節点値は
-従来どおり所属セル値（補間しない）。fcrit セルの臨界クリップ対数補間分岐は
-補間後の \(\hat n_{raw}\) に対して従来どおり適用される。
+従来どおり所属セル値（補間しない）。
+
+**臨界隣接セル対の対数線形プロファイル（2026-09-23）**：最後の超臨界実セル
+\(c_{\mathrm{hi}}\) とその外側の亜臨界実セル \(c_{\mathrm{lo}}\)
+（\(\hat n_{c_{\mathrm{hi}}} \ge 1 > \hat n_{c_{\mathrm{lo}}} > 0\)、両方とも非 void）の
+中心間 \([r_{c_{\mathrm{hi}}}, r_{c_{\mathrm{lo}}}]\) だけは、線形補間の代わりに
+両中心値を結ぶ対数線形プロファイルを用いる：
+\[
+\hat n_{raw}(r) = \hat n_{c_{\mathrm{hi}}}
+\left(\frac{\hat n_{c_{\mathrm{lo}}}}{\hat n_{c_{\mathrm{hi}}}}\right)^{s},
+\qquad
+s = \frac{r - r_{c_{\mathrm{hi}}}}{r_{c_{\mathrm{lo}}} - r_{c_{\mathrm{hi}}}}
+\]
+これは両中心で隣接区間の線形補間と連続・単調で、§5.7.4 の \(R_{\mathrm{crit}}\)
+でちょうど \(\hat n_{raw} = 1\) を横切る（同じ直線）。旧仕様は \(c_{\mathrm{lo}}\)
+側の半セルで線形補間値が 1 未満の点だけを \(R_{\mathrm{crit}}\) を起点とする
+対数値に置き換えていたため、対数の交点と線形の交点の間が
+\(\hat n = 1\) に張り付き、線形の交点で不連続に落ちていた
+（隣接 \(\hat n = 10 \,|\, 0.5\) で \(1 \to 0.586\)）。転回点付近の
+吸収経路の長さがこの段差に左右されていた。
 
 **(b) 2D_RZ：軸対称場の直接マッピング**
 
@@ -2373,21 +2666,83 @@ LaserMesh上の物理量（\(\hat n, T_e, \bar Z\)）は **各レーザー演算
 HydroMeshから再マッピングする（Strang splitting中に1回）。
 1D_SPHでは同タイミングで格子点配置（`node_R`, `node_Z`）も再生成する。
 2D_RZでは格子点配置は初期化時固定のまま再利用する。
-1D_SPH ではさらに、`node_Z=0` 列から
-`radial_node_r`, `radial_n_hat`, `radial_n_hat_raw`, `radial_smooth_kappa`,
-`radial_dn_dr` を抽出し、ray trace の 1D lookup に使う。
+1D_SPH ではさらに、ray trace が参照する 1D 断面（`radial_node_r`, `radial_n_hat`,
+`radial_n_hat_raw`, `radial_T_e`, `radial_Zbar`, `radial_smooth_kappa`, `radial_dn_dr`）を
+流体セルに固定した節点の上で作る（`laser_mesh_bodies::build_trace_profile_nodes_1d`、
+2026-09-24。多カーネル経路では 1 ブロックがセルごとに並列に置き（2026-09-25、下の並列配置）、
+persistent loop は同じ関数を 1 スレッドで順に実行する。両者の節点は bit で同じ）。
+節点は、最外実セルまでの各実セルについて内側 face・セル中心・外側 face の直下
+（face から \(\max(10^{-6}\Delta r_{cell},\,4\times10^{-9} r)\) 内側）、§5.7.3(a) の
+臨界隣接セル対の区間の節点、最外実セルの外側 face、その外側の LaserMesh 半径節点
+（ゴーストコロナ域）で、LaserMesh の外端（レイの入射半径）で打ち切る。球では中心 \(r=0\)
+から始まり（最内 face より内側の LaserMesh 節点を先に置く）、平板（`geometry_1d="planar"`）
+では最内 face（壁）から始まる。臨界隣接セル対の \(\hat n_{raw}=\hat n_{hi}
+e^{-\lambda(r-r_{hi})}\)（\(\lambda=\ln(\hat n_{hi}/\hat n_{lo})/(r_{lo}-r_{hi})\)）では、
+clip 値（`critical_clip` なら `n_hat_margin`、他は 1）に達する折れ点を節点とし、亜臨界側に
+折れ点からの距離 \(x\) で間隔 \(\Delta x=\min(0.06/\lambda,\max(10^{-4}/\lambda,
+\sqrt{0.016\,x/\lambda}))\) の節点を最大 160 点置く（線形補間による IB 係数の誤差を
+\(10^{-3}\) 程度に抑える: 折れ点近くでは \(\delta n/(2\epsilon)\) が支配し \(\epsilon\approx\lambda x\)、
+遠方では \((\lambda\Delta x)^2/4\)）。超臨界側は \(\hat n\) が clip 値で一定なので節点を置かない。
+相対 \(10^{-9} r\) 未満に近い 2 節点は、face・セル中心・流体の外端、折れ点、その他の順に
+残す（数 ulp の区間では線形場が意味を失う）。各節点の \(\hat n, \hat n_{raw}, T_e,
+\bar Z\) は §5.7.3(a) の写像を \(Z=0\) で評価し、IB 係数 `radial_smooth_kappa` は同じ式で
+節点ごとに求め、`radial_dn_dr` は節点間の差分とする。この節点の上では、セル中心で折れる
+\(n_e\) の区分線形と face で段差をもつ \(T_e, \bar Z\)（セル値）が節点間の線形補間で
+表され、節点配置は流体の格子だけで決まる。
 
-1D_SPH の `map_from_hydro_1d` では、レイトレースに使う clipped nodal density
-\(\hat n\) に対して step 間 EMA を適用する。前回値が有効で節点数が不変、かつ
-current/previous の両方が \(\hat n > 0.3\) を満たし、
-\[
-|\hat n_{cur} - \hat n_{prev}| < 0.01
-\]
-のときに限り、
-\[
-\hat n \leftarrow \alpha \hat n_{cur} + (1-\alpha)\hat n_{prev},\qquad \alpha = 0.05
-\]
-で更新する。`n_hat_raw` は平滑化せず、節点数が変化した場合は EMA 状態を破棄する。
+**並列配置（2026-09-25、`place_trace_profile_nodes_1d`）**：順の配置は各節点を直前の節点に対して
+決める（近すぎる 2 節点の統合）。しかし、断面の外端より内側にあり、幅 \(w=r_{i+1/2}-r_{i-1/2}\) が
+外側 face の \(16\,p\times10^{-9}\) 倍以上（\(p\) は半セルあたりの分割数、\(10^{-9}\) は統合の
+相対間隔）のセルは、直前のセルも同じ条件を満たすなら、節点が前のセルの節点に依らない：前のセルの
+外側 face 直下の節点（face から \(\max(10^{-6}w,\,4\times10^{-9}r)<w/4\) 内側）はそのセルの他の節点より
+上にあり、次のセルの内側 face から統合間隔の 4 倍以上離れているので、順の配置でも内側 face は必ず
+新しい節点になり、以後の節点はセル自身の節点だけで決まる。外端をまたぐ最初のセルからは、外端より
+先の節点を捨てるだけで状態を変えないので、そのセル・その外側のセル・尾部（流体の外端、その外側の
+LaserMesh 節点、外端）を 1 つの区分として順に置く。1 ブロック（1024 スレッド）が、断面の始点から
+セル 0 まで・内側の各セル・最後の区分をスレッドに割り当て、各スレッドの節点数の前置和で書き込み位置を
+決めて書く。中心より内側から始まる断面、条件を満たさないセル（狭い、または面が増加しない）、
+セル 0 が外端をまたぐ、セルが 2 未満、容量超過のときは、1 スレッドの順の配置に戻る
+（`tests/laser/test_trace_profile_nodes.cu` がこれらの場合を含む乱数格子で順の配置と bit で比べる）。
+RTX 4090 の GXII FLD 後半（1.85 ns から 300 ステップ）で、1 スレッドの配置の 0.46 ms/step（FP64 の
+依存連鎖の待ち）が 0.12 ms/step になった（最初の 300 ステップでは 0.33 → 0.13 ms/step）。
+
+2026-09-24 までは LaserMesh の `node_Z=0` 列（§5.7.4 の \(R_{\mathrm{crit}}\) に細帯を置いた
+等比格子）を抽出していた。この節点は流体セルに対して位置が決まらず、線形補間が \(n_e\) の
+折れ点と \(T_e, \bar Z\) の段差を切っていた。同じ凍結状態での比較（`TENRYU_LASER_TRACE_COMPARE_EVERY`
+の `axis_column` と、流体セル基準の断面を半セルあたり 8・64 分割した `profile_refined`）で、GXII の
+立ち上がり（step 30〜110）の 1 ビームの吸収パワーは、旧来の列が細分割した断面から最大 47% 離れ、
+流体セル基準の断面は 0.1% 以内（折れ点節点と適応節点の導入前は最大 6%）。GXII 全長では吸収率
+0.937 → 0.933、吸収効率の step 間の符号交互の振れ（幅 0.02 超）2 → 2 回（折れ点節点の導入前の
+流体セル基準の断面では 11 回）。
+
+読み取りだけの診断（run の堆積・台帳は変えない）: `TENRYU_LASER_TRACE_COMPARE_EVERY=N` は N step ごとに
+同じ凍結状態で積分法と断面を取り替えた追跡を行い、変種ごとに 1 行（吸収・非吸収パワー、特性曲線法との
+吸収パワー比、堆積分布の L1 距離、刻み上限で止まった光線、節点数、カーネル時間）を出す。
+`TENRYU_LASER_TRACE_COMPARE_PARTS=k`（既定 8）は `profile_refined` の半セルあたりの分割数。
+`TENRYU_LASER_GHOST_DIAG=1` は 1D の写像ごとに表面とゴーストコロナのパラメータ（表面セル、臨界セル、
+表面の \(\hat n\)、表面半径、減衰係数、\(n_e\) の内端値、幅、アンカーの \(T_e, \bar Z\)、音速、
+レーザー点灯からの時間）を 1 行出す。
+
+1D_SPH の `map_from_hydro_1d` は、レイトレースに使う clipped nodal density を
+その時点の流体状態だけから作る：\(\hat n = \min(1, \max(0, \hat n_{raw}))\)
+（`critical_clip` ではさらに `n_hat_margin` で上から抑える）。step 間の平滑化はしない。
+
+**step 間平滑化の撤去（2026-09-24）**：2026-03-23 から 2026-09-24 まで、clipped \(\hat n\)
+だけに step 間 EMA（\(\alpha = 0.05\)、current/previous がともに \(\hat n > 0.3\) かつ
+\(|\hat n_{cur} - \hat n_{prev}| < 0.01\) の節点で
+\(\hat n \leftarrow \alpha \hat n_{cur} + (1-\alpha)\hat n_{prev}\)）を掛け、`n_hat_raw` は
+平滑化していなかった。当初は節点番号で前回値と対応させていたが、写像のたびに節点配置を
+作り直す（細帯が臨界半径に追従する）ため別の半径の値と混ぜており、2026-09-23 に同じ半径で
+混ぜる形にして retry・checkpoint に状態を持たせた。その形で GXII（1500 step、§5.7.5.2 の
+ゴースト幅）を平滑化の有無で比べると、吸収率の step 間変化は減らず（相対変化の中央値
+0.0029 対 0.0013、10 % を超える変化 20 回対 21 回）、動く臨界面の近くで平滑化値が
+流体の密度から最大約 0.0095 遅れた（例：\(\hat n = 0.999\) 対 \(\hat n_{raw} = 0.992\)）。
+レイはその分だけ遅く進み大きい \(\kappa\) を見て、レイトレースの kernel 時間は約 3.2 倍
+（212 s 対 66 s）、半数の step で一部のレイが `max_steps` に達して残りの出力を未吸収に
+計上した。ray trace の臨界終了・tail closure・ステップ制御は \(\hat n = \mathrm{clip}(\hat n_{raw})\)
+を前提に \(\hat n_{raw}\) で判定しており、平滑化はこの前提も崩していた。このため平滑化を
+撤去し、retry・checkpoint の状態も持たない（途中版の checkpoint にある
+`laser_smoothing/{r,n_hat}` は読まない）。
 
 1D_SPH の動的 LaserMesh 再生成で用いる臨界半径 \(R_{\mathrm{crit}}\) は、
 最後の超臨界実セル \(c_{\mathrm{hi}}\) とその外側の亜臨界実セル \(c_{\mathrm{lo}}\)
@@ -2402,9 +2757,12 @@ r_{c_{\mathrm{hi}}} + \text{clamp}(\theta, 0, 1)\,
 \left(r_{c_{\mathrm{lo}}} - r_{c_{\mathrm{hi}}}\right)
 \]
 ここで \(r_c\) はセル中心半径。外側に亜臨界実セルがまだ存在しない場合は、
-従来どおり最後の超臨界セル外側 face を用いる。`map_from_hydro_1d` の
-critical-adjacent subcritical cell の log 再構成も同じ \(R_{\mathrm{crit}}\) を
-アンカーに使う。
+従来どおり最後の超臨界セル外側 face を用いる。§5.7.3(a) の臨界隣接セル対の
+対数線形プロファイルはこの \(R_{\mathrm{crit}}\) でちょうど 1 となる。
+節点配置（`compute_dynamic_mesh_params_1d` と persistent loop の同等処理）と
+1D 付与の臨界セル分配（`find_allowed_supercritical_cell_1d`）も同じ
+\(R_{\mathrm{crit}}\) を使う（2026-09-23 まで節点配置だけは最後の超臨界セル
+外側 face を使っており、臨界半径の定義が 3 通りあった）。
 
 > **将来拡張**：Lagrangian流体メッシュの大変形に追従するLaserMeshの動的再生成。
 
@@ -2438,9 +2796,55 @@ LaserMesh 再マッピング時（§5.7.4）に、最外 3 非 void セルから
 - 電子温度下限：\(T_{e,\text{ghost}} \ge \texttt{Te\_min\_eV}\)（既定 50 eV）
 - 電荷数範囲：\(\bar{Z} \in [\texttt{zbar\_min}, \texttt{zbar\_max}]\)（既定 \([1.0, 4.0]\)）
 
-プロファイル幅は \(\max(w_{\text{base}},\; c_s \times t)\) で時間発展する
-（\(c_s\) はアンカー値から推定した音速、\(t\) はシミュレーション時刻）。
-最外実セルが既に亜臨界の場合、ゴースト内側密度は実セル密度に追随する。
+**内側密度・減衰・幅（2026-09-23、幅は 2026-09-24 改訂）**：ゴーストは解像されていない
+表面の外に置く格子以下の補助プロファイルであり、実在しない物質を足さないよう次の 3 条件で作る。
+
+1. 内側密度は最外実セル \(c_{\text{out}}\) を超えない：
+   \(\hat n_{\text{inner}} = \min(\hat n_{c_{\text{out}}},\, \texttt{ne\_max\_frac})\)
+   （\(\hat n_{c_{\text{out}}} \ge 1\) の超臨界表面では \(\texttt{ne\_max\_frac}\)）。
+   \(\hat n_{\text{inner}} \le \texttt{ne\_min\_frac}\) ならゴーストは作らない。
+2. 流体側のコロナが解像されるにつれて縮めて消す。最外実セルから内向きに連続して
+   \(\hat n_c < \texttt{transition\_resolved\_nhat}\) を満たすセル数
+   \(N_{\text{resolved}}\)（§5.7.5.4 と同じ数え方・同じパラメータ。
+   `transition_enabled` によらず使う）から
+   \[
+   f = \text{clamp}\!\left(1 - \frac{N_{\text{resolved}}}{N_{\text{required}}},\; 0,\; 1\right),
+   \qquad N_{\text{required}} = \texttt{transition\_resolved\_cells}
+   \]
+   とし、\(f = 0\) でゴーストなし。
+3. 幅は、ゴーストが代わりを務めるコロナがアンカー値の音速で広がるとして
+   \[
+   W = f \cdot \max\!\left(\texttt{n\_out} \cdot dR_{\text{fine}},\ c_s\,(t - t_{\text{on}})\right),
+   \qquad c_s = \sqrt{\frac{\bar Z_{\text{anchor}}\, T_{e,\text{anchor}}}{A_{\text{anchor}}\, m_p}}
+   \]
+   とする（\(dR_{\text{fine}}\) は §5.7.2 の細帯幅、\(t\) はシミュレーション時刻、
+   \(t_{\text{on}}\) はレーザーの立ち上がり時刻 = 各ビームの凍結パワー表で最初に正になる
+   標本の直前の横軸（最初の標本が正ならその横軸）の全ビームでの最小値。
+   \(t < t_{\text{on}}\) では \(c_s\,(t - t_{\text{on}})\) を 0 とする）。
+   減衰 \(f\) があるので、コロナが解像されれば幅に関係なくゴーストは消える。
+
+プロファイルは表面半径 \(r_{\text{surf}}\)（最外実セルの外側 face）から
+\[
+\hat n(r) = \text{clamp}\!\left(\hat n_{\text{inner}}\,
+e^{-(r - r_{\text{surf}})/L},\ \texttt{ne\_min\_frac},\ \hat n_{\text{inner}}\right),
+\quad L = \frac{W}{\ln(\hat n_{\text{inner}}/\texttt{ne\_min\_frac})},
+\quad r_{\text{surf}} \le r \le r_{\text{surf}} + W
+\]
+で、その外側は \(\hat n = 0\)。
+
+旧仕様（2026-09-23 まで）は幅を \(\max(w_{\text{base}}, c_s t)\)（\(c_s\) はアンカー値の
+音速、\(t\) はシミュレーション時刻）で伸ばし、内側密度を
+\([\texttt{ne\_min\_frac}, \texttt{ne\_max\_frac}]\) にクランプしていた。このため
+コロナが解像された後も、外縁の実セルが \(\texttt{ne\_min\_frac}\) を下回った後も、
+流体外縁の外に \(\hat n \approx \texttt{ne\_min\_frac}\) のほぼ一様な層が
+\(c_s t\)（2.5 ns・keV で数百 µm）にわたって残り、その吸収（片道の光学的厚さは
+keV で \(10^{-2}\) 程度、低温ほど増える）が最外セルへ渡されていた。
+2026-09-23〜24 は幅を \(f \cdot \texttt{n\_out} \cdot dR_{\text{fine}}\) に固定していたが、
+GXII では未解像の表面の前に約 10 nm の傾斜しか残らず、最初の 300 step の吸収率が
+0.104 から 0.054 に下がり、吸収率が step 間で 10 % を超えて変わる回数が約 5 倍に
+なったため、\(c_s t\) の成長を戻した。2026-09-24 までは \(t\) の原点がシミュレーション開始
+（\(t = 0\)）で、パルスの立ち上がりが遅いデッキでは幅を遅れの分だけ大きく見積もっていたため、
+原点をレーザーの立ち上がり \(t_{\text{on}}\) に変えた（立ち上がりが \(t = 0\) のデッキは不変）。
 
 ##### 5.7.5.3 ハンドオフステンシル（void 側吸収パワーの再分配）
 
@@ -2455,8 +2859,8 @@ w_k^{\text{base}} = \exp\!\left(-\frac{k}{d_{\text{handoff}}}\right), \quad k = 
 \]
 
 ここで \(k\) はアンカーセルからの内向きオフセット、
-\(N_{\text{handoff}} = \texttt{handoff\_cells}\)（既定 6）、
-\(d_{\text{handoff}} = \texttt{handoff\_decay}\)（既定 2.0）。
+\(N_{\text{handoff}} = \texttt{handoff\_cells}\)（既定 4）、
+\(d_{\text{handoff}} = \texttt{handoff\_decay}\)（既定 1.5）。
 void セルはスキップされる。
 
 正規化による分配：
@@ -2481,7 +2885,12 @@ supercritical 実セルへ一旦落ちたパワーは最も近い **外側の亜
 critical-adjacent な亜臨界セルへ落ちた沈着も同じ inward stencil で近臨界帯へ再分配する。
 この再分配にはベースライン重み \(w_k^{\text{base}}\) を用い、
 密度バイアスは適用しない。
-亜臨界の実セルが 1 つも存在しない初期段階では、この例外受け皿は最外の実セルに一致する。
+最外の超臨界実セルより外側に亜臨界の実セルが 1 つも存在しない段階（固体表面の初期、
+内部をガスで満たしたシェルの初期）では、この例外受け皿は最外の実セルに一致する。
+亜臨界セルの有無はレーザー側（最外の超臨界実セルより外側）だけで判定し、シェルに遮られた
+内部の亜臨界ガスは数えない（2026-09-23。以前は内部ガスも数えたため、外側が void の
+ガス充填シェルでは受け皿が無くなり、ゴーストコロナのパワーが内向き探索でシェルを越えて
+ガスへ渡され、シェル表面の沈着は未吸収に回っていた）。
 それでも受け皿が存在しない場合、そのパワーは `laser_dep` に入れず
 未吸収パワーとして収支へ戻す（§5.8.2）。
 
@@ -2540,6 +2949,7 @@ critical-adjacent な実表面セルからの再配分は、外向きアブレ�
 |---|---|---|---|
 | `laser/corona_transition_blend` | double | 無次元 | ブレンド係数 \(\beta\)（0＝安定、1＝遷移活発） |
 | `laser/corona_transition_resolved_cells` | int64 | cells | 外側から連続して亜臨界な実セルの数 \(N_{\text{resolved}}\) |
+| `laser/ghost_corona_width` | double | cm | 直近の 1D マッピングで使ったゴースト幅 \(W\)（0＝ゴーストなし。persistent loop では更新しない） |
 
 ### 5.8 座標変換と沈着の転写
 
@@ -2571,7 +2981,8 @@ resolved-corona が不足している間は、critical-adjacent な亜臨界セ�
 同じ inward stencil で近臨界帯へ広げる。
 このときの重みはベース指数重み \(w_k^{\text{base}}\) を使い、
 void 側ハンドオフ用の密度バイアスは適用しない。
-亜臨界の実セルが存在しない場合、この例外受け皿は最外の実セルになる。
+最外の超臨界実セルより外側に亜臨界の実セルが存在しない場合（シェル内部のガスは数えない）、
+この例外受け皿は最外の実セルになる。
 それでも受け皿が存在しない分は `laser_dep` に加えず、未吸収として扱う。
 
 診断目的で、`Laser.deposit.deposit_smooth_passes > 0` かつ
@@ -2673,8 +3084,27 @@ D_{i,j}^{(m)}
 > **ゼロ吸収ガード**：\(\sum_{i,j}\text{deposit}_{i,j}^{total} \le \varepsilon_{abs}\)（\(\varepsilon_{abs} = 10^{-20}\) erg/s）の場合は、保存検証をスキップする（吸収なし → 保存が自明に成立）。
 （全ビーム合算後に評価。deposit は [erg/s]、laser\_dep/Δt は [erg/s]。）
 ここで \(P_{\mathrm{blocked}}\) [erg/s] は、転写先が void または超臨界であるため
-HydroMesh へ結合しなかったパワーであり、ステップ収支では
-`laser_unabsorbed` に加算する。
+HydroMesh へ結合しなかったパワーであり、ステップ収支ではレーザー演算子の損失
+（履歴 `laser/transfer_blocked_power_total`、エネルギー予算では数値損失
+`energy/E_numerical_loss` に rank 0 で 1 回計上し、`energy/laser_deposited` からは除く）として扱う。
+`laser_unabsorbed` には加算しない（2026-09-24 変更。以前は差分
+\(P_{in} - \sum_c \text{laser\_dep}[c]/\Delta t\) を未吸収とみなしており、転写の損失と
+高速電子の逃げ分が未吸収に紛れ、driver の逃げエネルギーで高速電子の逃げ分を二重に数えていた）。
+
+**1D のレーザーパワー台帳（2026-09-24）**：各ステップで
+\[
+P_{in} = \frac{\sum_c \text{laser\_dep}[c]}{\Delta t} + P_{\mathrm{unabs}} + P_{\mathrm{hot,esc}}
+       + P_{\mathrm{blocked}} + P_{\mathrm{IAW}}
+\]
+を検査する。\(\text{laser\_dep}\) は高速電子の沈着を含む。\(P_{\mathrm{unabs}}\) は光線の
+明示的な集計（プロファイル外へ出た光線、強度カットオフ・ステップ上限・不正状態で止めた光線の
+残存パワー、光線を持たないビーム、ビーム畳み込みの再生分）だけで、差分による推定はしない。
+\(P_{\mathrm{hot,esc}}\) は高速電子の逃げ、\(P_{\mathrm{IAW}}\) は port section CBET のイオン音波への損失。
+残差が `Laser.deposit.conservation_tol`（下限 \(10^{-10}\)）×\(P_{in}\) を超えたら警告する。
+2D は従来どおり差分 \(P_{in} - \sum_c\text{laser\_dep}/\Delta t - P_{\mathrm{IAW}} - P_{\mathrm{hot,esc}}
+- P_{\mathrm{blocked}}\) を光線集計の下限として使う。driver は逃げエネルギーを
+\((P_{\mathrm{unabs}} + P_{\mathrm{hot,esc}})\Delta t\)、レーザーの沈着を
+\((P_{in} - P_{\mathrm{unabs}} - P_{\mathrm{hot,esc}} - P_{\mathrm{blocked}} - P_{\mathrm{IAW}})\Delta t\) とする。
 
 ### 5.9 レイトレース Skip 最適化
 
@@ -2726,6 +3156,13 @@ ICFシミュレーションでは、プラズマ条件（ρ, T_e, Z̄）は流�
 ビーム毎にパラメータグループが異なる場合はグループ毎にキャッシュし、各グループ内のビームパワー合計でスケーリングする。
 
 **次元検証**：[無次元] × [erg/s] × [s] = [erg] ✓（`rad_dep` と同一規約）
+
+**1D の再配分（2026-09-23）**：1D のキャッシュの \(\hat f\) はビーム別のレイの付着（受け皿への
+付け替え・ゴーストコロナの受け渡し・平滑化の前）なので、スケーリングした付着に現在の流体状態で
+トレース時と同じ再配分（`apply_deposit_redistribution_1d`）を適用してから `laser_dep` とする。
+この再配分は付着について線形なので、トレースしたステップと同じ流体状態なら結果は一致する。
+以前はスケーリングした値をそのまま書いており、void・超臨界セルに付着が残った（ゴーストコロナの
+ある 1D デッキでは、省略したステップの付着のほぼ全量が void セルに入っていた）。
 
 物理的妥当性：
 - レイ軌道は ∇n̂ に依存し、δ < threshold で変化が保証される

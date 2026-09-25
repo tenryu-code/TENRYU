@@ -186,6 +186,16 @@ transaction 拡張が必要で escalate 済み（同 dt 内の当該ステップ
 （T_e keV、g/cm²。δ(ρ)=1→3 for solid→**絶対密度** 10⁴ g/cm³ を再現、G-K0）。
 非 α 種は電子 drag 域スケーリング \(\lambda_s=\lambda_\alpha\sqrt{m_sE_s/m_\alpha E_\alpha}(Z_\alpha/Z_s)^2\)。
 
+**媒質の組成**（2026-09-23 是正 — 旧実装は組成によらず等モル DT の飛程を使っていた）:
+fit 3d は等モル DT の値なので、\(1/(\rho\lambda)=S_e+S_i\)（電子項
+\(S_e=1/(1.5\times10^{-2}T_e^{5/4})\)、イオン項 \(S_i=8.2\times10^{-3}/1.5\times10^{-2}\)）に分け、
+単位質量あたりの電子数と \(\sum_j Z_j^2/A_j\) の等モル DT 比
+\(f_e=(\bar Z/\bar A)/(\bar Z/\bar A)_{DT}\)、\(f_i=(\overline{Z^2/A}/\bar A)/(\overline{Z^2/A}/\bar A)_{DT}\)
+（上線はイオンあたりの平均）で \(f_eS_e+f_iS_i\) とする。Coulomb-log 密度補正の ρ は DT 換算の
+電子密度に当たる \(f_e\rho\) で置く。組成はステップ開始時のセルの場イオン（§14.7 と同じ定義）。
+等モル DT では \(f_e=f_i=1\) が厳密に成り立ち旧式とビット同一、灰（⁴He・p）が溜まると 1 からずれる。
+純 D は \(f_e=1.249\)・\(f_i=1.497\)（10 keV・固体密度で飛程 0.79 倍）。
+
 幾何は**点源球核**（一様媒質・直線飛行・v 線形電子 drag の前荷重減速
 \(E(s)=E_0(1-s/\lambda)^2\)）：出生半径比 u=r/R_b、τ=R_b ρ̄/ρλ に対する閉形式
 （asinh 1 個の初等関数、G-K1 で凍結求積参照 39 点 abs ≤ 1e-11）。体積平均は古典二分枝
@@ -222,7 +232,13 @@ T_i=T_e 対角で評価）±3 点＋Python prototype ±1 点の転写忠実帯�
 H/2-C-R-H/2、burn は全 dt 陽的源で分割しない）。ステージは host 実行（in-flight mirror
 方式は inject_laser_source_terms 前例踏襲；perf 最適化は将来の別 PR）。沈着は
 \(e_e{+}\!=dE_e/(\rho V)\), \(e_i{+}\!=dE_i/(\rho V)\) 後に Te/Ti/Pe/Pi を再閉包
-（table EOS / cv_override / ideal の全分岐、1T は合算を e_e へ）。核融合エネルギーは
+（table EOS / cv_override / ideal の全分岐、1T は合算を e_e へ）。沈着と閉包はデバイス上で
+レーザー沈着と同じ閉包を使い、energy_authoritative の表 EOS では表の温度上限を超えた
+エネルギーを高温側の延長（\(T=T_{top}+(e-e_{top})/c_{v,top}\)、\(P=P_{top}T/T_{top}\)、§1）で
+閉じる。沈着の無いセル（\(dE_e=dE_i=0\)）は触らない（2026-09-23 修正: 従来はホストで全セルを
+再閉包しており、反応の無いセルの Te を逆変換の許容誤差だけ動かし、表の上限を超えたセルでは
+Te を \(T_{max}\) に止めていた）。void・質量ゼロのセルへの沈着は skipped として台帳に計上し、
+床注入・クランプ数はセル順の固定順で畳み込む。local スキームで燃焼域（燃料体積分率が vf_threshold を超える最初から最後のセル）に反応しうるセル（\(\rho>0\) かつ \(T_i\ge T_{floor}\)）が無い step は、ステージと沈着を実行せず診断量をゼロにする（沈着ゼロのセルは触らないので結果は実行した場合とbit 同一。2026-09-23、ホスト転送と起動の省略）。核融合エネルギーは
 静止質量起源の**外部源**として budget の source 側 `E_burn_in` に登録（逃逸荷電/中性子は
 流体に入らないので sink ではない）。W5 実測：burn 活性 6 run すべてで
 epsilon_budget ≤ 6e-16。dt 制限は hot-electron 意味論
@@ -258,9 +274,24 @@ D_g は flux-limited（加算型 limiter + Post-Wilson \(|\bar\mu|^{-1}=1+3e^{-(
 明示 NRL 型 Coulomb log で毎セル毎ステップ評価（論文 intro の絶対値 anchor は未印字
 log 処方を含むため転写対象から棄却 — log-free 恒等式 e/i∝E^{3/2}・λ∝E² と 0-D 解析
 減速極限 \(E(t)=[(E_0^{3/2}+\gamma t_E)e^{-3t/2t_E}-\gamma t_E]^{2/3}\) が gate）。
+t_E は電子とのエネルギー緩和時間 \(\dot E = -E/t_E\) で、Corman (1975) p. 380 の
+\(t_E = 3m\theta_e^{3/2}/(8\sqrt{2\pi m_e}\,n_e Z^2 e^4\ln\Lambda_e)\)
+（Spitzer の運動量減速時間の半分。2026-09-23 是正 — 旧実装は分母の 8 を 4 としており
+t_E が 2 倍、電子加熱率が半分だった。`Burn.scheme="diffusion"`（1D・2D）と `"mc"` が共有する）。
 **イオン Coulomb log と γ は (群, セル) 毎**に群中心エネルギーで評価する
 （2026-07-26 修正 — 旧実装は出生エネルギーで 1 回評価し
 全群へ流用しており、最接近距離の E 依存が終端域で欠落していた）。
+**場イオン**（2026-09-23 是正 — 旧実装は全セルで等モル DT に固定し、イオン Coulomb log の
+場イオン密度と質量だけ A=2.5、γ・λ は 2.51505 を使っていた）: γ・λ・イオン Coulomb log の場イオンは
+セル毎の組成から作る。燃焼在庫の D/T/³He/⁴He/p（比在庫 \(Y_s\)、重み \(Y_s m_p\)）と、
+セルの非燃料・非 void 材料（重み \(vf_m/A_m\) — 在庫の初期化と同じく材料の質量分率を体積分率で置く、
+電荷は材料の Z、化合物は平均の Z で代表）を完全電離のイオンとして平均し、\(\bar A\)・\(\overline{Z^2}\)・\(\overline{Z^2/A}\) を得る:
+\(n_i=\rho/(\bar A m_p)\)、γ の \(\sum_j n_jZ_j^2/m_j=n_i\overline{Z^2/A}/m_p\)、λ の
+\(\sum_j n_jZ_j^2=n_i\overline{Z^2}\)、イオン Coulomb log の Debye 項 \(n_i\overline{Z^2}/kT_i\) と換算質量の
+場イオン質量 \(\bar A m_p\)。面の λ は両セルの \(\sum_j n_jZ_j^2\) の平均で評価する。在庫も場の材料も無い
+セル（void）は設定の燃料組成 Burn.x_D/x_T/x_He3 を使う。組成はステップ開始時の在庫で評価し、2D の
+複数ランクでは所有者の値を ghost セルへ交換する。電子項 t_E は従来どおりセルの
+\(n_e=\bar Z\rho/(A_{eff}m_p)\)。
 t_E 非正/非有限のセルは γ が有限なら純イオン drag で減速を継続
 （\(\tau=(2/3)(E_{g+1}^{3/2}-E_g^{3/2})/\gamma\)、分配は全イオン — §6.5 修正;
 旧実装は sink ごと消していた）。
@@ -290,7 +321,9 @@ Brysk 1973 の二 Maxwell 平均モーメント。燃焼重み付き ⟨T_i⟩_b
 \tfrac{m_n}{m_D+m_T}\tfrac{3}{2}\theta + \tfrac{m_\alpha}{m_n+m_\alpha}\langle K\rangle\)
 （⟨K⟩ = 3T_reac−(3/2)θ、T_reac は Brysk Table 1 転写（Reac 列 = ⟨E⟩/3 と解読、
 両公表 anchor 35 keV/336 keV·33/157 keV を実装前検算で再現）、log-T 補間・[1,100] keV clamp）、
-熱幅 σ² = 2m_nθ⟨E_n⟩/(m_n+m_partner)、全幅は 4π 平均の流体広がり
+熱幅 σ² = 2m_nθ⟨E_n⟩/(m_n+m_partner)（ガウス分布の標準偏差。Brysk の 336/157 keV は
+1/e 半値半幅 \(\sqrt2\sigma\)。実装は 2026-09-23 まで係数 1/2 を掛け、σ を半分に報告していた）、
+全幅は 4π 平均の流体広がり
 σ_fluid² = 2m_nE_{n0}⟨v_r²⟩/3 を加算（球対称 1D の合成検出器は方向平均 —
 一次モーメントは対称消失、視線スペクトルは v3/Crilly-Munro scope として設計 doc 記録）。
 history `burn/neutron_{Ti_burn,mean_shift,sigma_thermal,sigma_total}_{dt,dd}`
@@ -299,7 +332,7 @@ history `burn/neutron_{Ti_burn,mean_shift,sigma_thermal,sigma_total}_{dt,dd}`
 ### 14.9 MC α 輸送（v2、`Burn.scheme="mc"`、統計モード）
 
 Yuan-Moses-McKenty 2005 型の直線 CSDA Monte Carlo（1D 球面特化、角散乱なし —
-偏向 λ は拡散 scheme のみ）。**停止能係数は §14.7 と同一**（corman_tE/γ 共有 —
+偏向 λ は拡散 scheme のみ）。**停止能係数は §14.7 と同一**（場イオンを含む。corman_tE/γ 共有 —
 scheme 間一致 gate が模型恒等性の検証になる）。イオン Coulomb log は
 **粒子の現在エネルギー**で毎セグメント評価（2026-07-26 修正 —
 旧実装は出生エネルギーで凍結、Bragg-peak 近傍の γ を誤っていた。RNG 消費は不変）。粒子 (r, μ, E, w, slot) は
@@ -307,13 +340,19 @@ scheme 間一致 gate が模型恒等性の検証になる）。イオン Coulom
 **RNG は Philox / curand_init(seed^global_id, subsequence=step, offset) —
 NUMERICS §12.7.1 凍結契約**（global_id = (cell·6+slot)·N_mc+sample）。
 CSDA 沈着は局所瞬時レート比で e/i 分割、熱化 E≤E_min → イオン、逃逸 → 台帳。
-tally は atomicAdd（統計モード — bitwise 非適用、§0.3 MC 条項が適用）。
+新しい粒子は pool の既存粒子の後ろに (cell, slot, sample) の順で並ぶ（(cell, slot) ごとの粒子数の排他的走査で
+位置を決める）。セルへの沈着は 128 ビットの固定小数点の整数（64 ビット 2 語、下位語の桁上がりを上位語へ）に
+原子的に足す: そのステップの粒子の総エネルギー E_tot = f·2^e（0.5 ≤ f < 1）に対し 1 単位 = 2^(e−100) で、
+1 回の沈着の丸めは 2^(−100)·E_tot 以下。整数の和は順序に依らず、発生・逃逸・飛行中の集計も
+(cell, slot) または粒子ごとの値の固定順序の和なので、同じ seed の再実行はビット一致する（2026-09-24。
+それまでは浮動小数点の atomicAdd で、pool の並びもスレッドの実行順だった）。負または非有限の沈着が
+あったセルは沈着を NaN で返す。
 per-particle 簿記により台帳恒等 released = dep+esc+ΔE_inflight は RNG に
 依らず厳密（実測 8.5e-15、ε_budget 5.6e-16）。
 **三 scheme 整合（3 keV/ρ10/ρR0.2 実測）**: deposited fraction
 fraley 0.968 / mc 0.928 / diffusion 0.722 — mc（参照級）に対し fraley は
 その解析近似（+4%）、diffusion は Milne 逃逸+スペクトル拡散で低め、と
-物理的序列どおり。CV gate: 同 seed 5 run CV ≤ 1e-3（atomic 順序帯、§0.3 文言）
+物理的序列どおり。CV gate: 同 seed 5 run CV ≤ 1e-3（§0.3 文言。2026-09-24 以降はビット一致）
 + 異 seed 5 run CV ≤ 5%（統計収束、1/√N 傾向は PERFORMANCE 記帳）。
 
 ### 14.10 2D_RZ port（scheme="local"|"diffusion"、2026-07-11）

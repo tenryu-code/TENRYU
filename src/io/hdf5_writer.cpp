@@ -3,21 +3,31 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
+#include <exception>
 #include <filesystem>
 #include <fstream>
+#include <functional>
+#include <future>
 #include <iomanip>
 #include <limits>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include <cuda_runtime.h>
 
 #include "core/error.hpp"
+#include "core/hdf5_mutex.hpp"
+#include "core/nvtx_range.hpp"
 #include "diagnostics/diagnostics.hpp"
 #include "hydro/euler_window_blend.hpp"
 #include "hydro/oriented_swept_volume.cuh"
@@ -25,6 +35,12 @@
 #include "mesh/mesh.hpp"
 
 #if TENRYU_ENABLE_HDF5
+#include <zlib.h>
+
+#if defined(__linux__)
+#include <sched.h>
+#endif
+
 #include "io/hdf5_utils.hpp"
 #endif
 
@@ -1043,37 +1059,460 @@ void write_units_attribute(const hid_t dset, const std::string& units) {
   write_string_attribute(dset, "units", units);
 }
 
+bool skip_filters_for_empty_dataset(const core::Config& cfg,
+                                    const std::vector<hsize_t>& dims) {
+  return (cfg.mesh.topology_scheme ==
+              core::TopologyScheme::PENTAGON_BELT_SHELL ||
+          cfg.numerics.ale.mesh_mode == "reale_v2") &&
+         std::any_of(dims.begin(), dims.end(),
+                     [](const hsize_t dim) { return dim == 0; });
+}
+
+int deflate_level(const core::Config& cfg) {
+  return std::clamp(cfg.output.compression_level, 0, 9);
+}
+
+// Whether make_dcpl puts the deflate filter on a dataset of these dims.
+bool dcpl_uses_deflate(const core::Config& cfg,
+                       const int rank,
+                       const std::vector<hsize_t>& dims) {
+  return cfg.output.compression == "gzip" && cfg.output.compression_level > 0 &&
+         rank > 0 && !skip_filters_for_empty_dataset(cfg, dims);
+}
+
+// A deflate dataset larger than kSplitChunkBytes is stored in chunks of about
+// kTargetChunkBytes along its first dimension, so that its chunks can be
+// compressed in parallel; every other dataset is one chunk of its own dims.
+constexpr std::size_t kSplitChunkBytes = 512 * 1024;
+constexpr std::size_t kTargetChunkBytes = 256 * 1024;
+
+std::vector<hsize_t> chunk_dims_for(const core::Config& cfg,
+                                    const int rank,
+                                    const std::vector<hsize_t>& dims,
+                                    const std::size_t type_size) {
+  std::vector<hsize_t> chunk(static_cast<std::size_t>(rank), 1);
+  for (int i = 0; i < rank; ++i) {
+    chunk[static_cast<std::size_t>(i)] = std::max<hsize_t>(1, dims[static_cast<std::size_t>(i)]);
+  }
+  if (rank > 0 && dcpl_uses_deflate(cfg, rank, dims)) {
+    std::size_t row_bytes = type_size;
+    for (int i = 1; i < rank; ++i) {
+      row_bytes *= static_cast<std::size_t>(chunk[static_cast<std::size_t>(i)]);
+    }
+    if (row_bytes > 0 && row_bytes * static_cast<std::size_t>(chunk[0]) > kSplitChunkBytes) {
+      chunk[0] = std::min<hsize_t>(
+          chunk[0], std::max<hsize_t>(1, static_cast<hsize_t>(kTargetChunkBytes / row_bytes)));
+    }
+  }
+  return chunk;
+}
+
 hid_t make_dcpl(const core::Config& cfg,
                 const int rank,
-                const std::vector<hsize_t>& dims) {
+                const std::vector<hsize_t>& dims,
+                const std::size_t type_size) {
   const hid_t dcpl = H5Pcreate(H5P_DATASET_CREATE);
   TENRYU_ASSERT(dcpl >= 0, "HDF5 H5Pcreate dataset create failed");
 
-  const bool skip_filters_for_empty_dataset =
-      (cfg.mesh.topology_scheme ==
-           core::TopologyScheme::PENTAGON_BELT_SHELL ||
-       cfg.numerics.ale.mesh_mode == "reale_v2") &&
-      std::any_of(dims.begin(), dims.end(),
-                  [](const hsize_t dim) { return dim == 0; });
-  if (rank > 0 && !skip_filters_for_empty_dataset) {
-    std::vector<hsize_t> chunk(static_cast<std::size_t>(rank), 1);
-    for (int i = 0; i < rank; ++i) {
-      chunk[static_cast<std::size_t>(i)] = std::max<hsize_t>(1, dims[static_cast<std::size_t>(i)]);
-    }
+  if (rank > 0 && !skip_filters_for_empty_dataset(cfg, dims)) {
+    const std::vector<hsize_t> chunk = chunk_dims_for(cfg, rank, dims, type_size);
     TENRYU_ASSERT(H5Pset_chunk(dcpl, rank, chunk.data()) >= 0,
                   "HDF5 H5Pset_chunk failed");
   }
 
-  if (cfg.output.compression == "gzip" &&
-      cfg.output.compression_level > 0 && rank > 0 &&
-      !skip_filters_for_empty_dataset) {
-    const int level = std::clamp(cfg.output.compression_level, 0, 9);
-    TENRYU_ASSERT(H5Pset_deflate(dcpl, static_cast<unsigned int>(level)) >= 0,
+  if (dcpl_uses_deflate(cfg, rank, dims)) {
+    TENRYU_ASSERT(H5Pset_deflate(dcpl, static_cast<unsigned int>(deflate_level(cfg))) >= 0,
                   "HDF5 H5Pset_deflate failed");
   }
 
   return dcpl;
 }
+
+// Large deflate datasets of one snapshot or checkpoint, compressed in
+// parallel. Every chunk (chunk_dims_for) is compressed on a worker thread by
+// zlib compress2 at the configured level with a compressBound output buffer,
+// the call the deflate filter makes, over the full chunk (an edge chunk's
+// rows beyond the dataset are zero, never read back), and the chunks are
+// written with H5Dwrite_chunk once the file's content is complete, in the
+// order the datasets were created. The values read back are those of
+// H5Dwrite with the filter; only the file offsets of the chunks differ.
+// Serial deflate took most of a GXII snapshot (15.6 MB of laser-mesh,
+// ray-trajectory and group fields, about 0.5 s).
+#if H5_VERSION_GE(1, 10, 3)
+constexpr bool kDeferredDeflateAvailable = true;
+#else
+constexpr bool kDeferredDeflateAvailable = false;
+#endif
+constexpr std::size_t kDeferredDeflateMinBytes = 64 * 1024;
+
+// CPUs this process may use: the hardware threads, limited on Linux by the
+// affinity mask and by a cgroup CPU quota (a container's share of a larger
+// host: a RunPod pod reports 128 hardware threads with a quota of 13.6 CPUs).
+unsigned available_cpus() {
+  unsigned n = std::thread::hardware_concurrency();
+#if defined(__linux__)
+  cpu_set_t mask;
+  CPU_ZERO(&mask);
+  if (sched_getaffinity(0, sizeof(mask), &mask) == 0) {
+    const int in_mask = CPU_COUNT(&mask);
+    if (in_mask > 0 && (n == 0 || static_cast<unsigned>(in_mask) < n)) {
+      n = static_cast<unsigned>(in_mask);
+    }
+  }
+  double quota = -1.0;
+  double period = -1.0;
+  {
+    std::ifstream v2("/sys/fs/cgroup/cpu.max");  // cgroup v2: "<quota|max> <period>"
+    std::string q;
+    if (v2 >> q >> period && q != "max") {
+      try {
+        quota = std::stod(q);
+      } catch (...) {
+        quota = -1.0;
+      }
+    }
+  }
+  if (!(quota > 0.0)) {
+    std::ifstream q1("/sys/fs/cgroup/cpu/cpu.cfs_quota_us");  // cgroup v1, -1 = none
+    std::ifstream p1("/sys/fs/cgroup/cpu/cpu.cfs_period_us");
+    if (!(q1 >> quota) || !(p1 >> period)) {
+      quota = -1.0;
+    }
+  }
+  if (quota > 0.0 && period > 0.0) {
+    const unsigned limit = std::max(1U, static_cast<unsigned>(quota / period));
+    if (n == 0 || limit < n) {
+      n = limit;
+    }
+  }
+#endif
+  return n;
+}
+
+// The compression workers of the deferred deflate, shared by every snapshot
+// and checkpoint of the process: a fixed pool (the available CPUs less two,
+// at least two) instead of a thread per chunk, so a writer queues all its
+// chunks at once and returns (the output of a GXII snapshot is about 80
+// chunks). The two left over are the simulation's thread and the snapshot
+// finisher.
+class DeflatePool {
+ public:
+  static DeflatePool& instance() {
+    static DeflatePool pool;
+    return pool;
+  }
+
+  std::future<std::vector<unsigned char>> submit(
+      std::function<std::vector<unsigned char>()> task) {
+    auto job = std::make_shared<std::packaged_task<std::vector<unsigned char>()>>(std::move(task));
+    std::future<std::vector<unsigned char>> result = job->get_future();
+    {
+      const std::lock_guard<std::mutex> lock(mutex_);
+      queue_.push_back([job] { (*job)(); });
+    }
+    cv_.notify_one();
+    return result;
+  }
+
+ private:
+  DeflatePool() {
+    const unsigned cpus = available_cpus();
+    const unsigned n = (cpus > 4U) ? cpus - 2U : 2U;
+    for (unsigned i = 0; i < n; ++i) {
+      workers_.emplace_back([this] { run(); });
+    }
+  }
+  ~DeflatePool() {
+    {
+      const std::lock_guard<std::mutex> lock(mutex_);
+      stop_ = true;
+    }
+    cv_.notify_all();
+    for (std::thread& worker : workers_) {
+      if (worker.joinable()) {
+        worker.join();
+      }
+    }
+  }
+  void run() {
+    for (;;) {
+      std::function<void()> job;
+      {
+        std::unique_lock<std::mutex> lock(mutex_);
+        cv_.wait(lock, [this] { return stop_ || !queue_.empty(); });
+        if (queue_.empty()) {
+          return;
+        }
+        job = std::move(queue_.front());
+        queue_.pop_front();
+      }
+      job();
+    }
+  }
+
+  std::mutex mutex_;
+  std::condition_variable cv_;
+  std::deque<std::function<void()>> queue_;
+  std::vector<std::thread> workers_;
+  bool stop_ = false;
+};
+
+class DeferredDeflateChunks {
+ public:
+  explicit DeferredDeflateChunks(const int level) : level_(level) {}
+  DeferredDeflateChunks(const DeferredDeflateChunks&) = delete;
+  DeferredDeflateChunks& operator=(const DeferredDeflateChunks&) = delete;
+  // A writer that did not reach finish() (an error on the way) closes the
+  // datasets without their data; the unpublished temporary file is dropped.
+  ~DeferredDeflateChunks() {
+    for (auto& job : jobs_) {
+      if (job.packed.valid()) {
+        job.packed.wait();
+      }
+      if (job.last_of_dataset) {
+        H5Dclose(job.dset);
+      }
+    }
+  }
+
+  int level() const { return level_; }
+
+  // Takes the open dataset (closed by finish), its dims and chunk dims
+  // (chunk_dims_for) and its bytes in the file datatype's layout.
+  void submit(const hid_t dset, const std::vector<hsize_t>& dims,
+              const std::vector<hsize_t>& chunk, const std::size_t type_size,
+              const unsigned char* data) {
+    const std::size_t rank = dims.size();
+    std::size_t row_bytes = type_size;
+    for (std::size_t i = 1; i < rank; ++i) {
+      row_bytes *= static_cast<std::size_t>(dims[i]);
+    }
+    const std::size_t rows = static_cast<std::size_t>(dims[0]);
+    const std::size_t chunk_rows = static_cast<std::size_t>(chunk[0]);
+    for (std::size_t r0 = 0; r0 < rows; r0 += chunk_rows) {
+      const std::size_t n_rows = std::min(chunk_rows, rows - r0);
+      std::vector<unsigned char> raw(chunk_rows * row_bytes, 0U);
+      std::copy(data + r0 * row_bytes, data + (r0 + n_rows) * row_bytes, raw.begin());
+      auto bytes = std::make_shared<const std::vector<unsigned char>>(std::move(raw));
+      const int level = level_;
+      std::vector<hsize_t> offset(rank, 0);
+      offset[0] = static_cast<hsize_t>(r0);
+      jobs_.push_back(Job{dset, std::move(offset), r0 + chunk_rows >= rows,
+                          DeflatePool::instance().submit([bytes, level] {
+                            return deflate_bytes(*bytes, level);
+                          })});
+    }
+  }
+
+  // Waits until every chunk is compressed (no HDF5 call).
+  void wait_all() const {
+    for (const Job& job : jobs_) {
+      if (job.packed.valid()) {
+        job.packed.wait();
+      }
+    }
+  }
+
+  void finish() {
+#if H5_VERSION_GE(1, 10, 3)
+    const core::NvtxRange nvtx_range("io.deflate_chunk_writes");
+    std::vector<Job> jobs = std::move(jobs_);
+    jobs_.clear();
+    for (std::size_t k = 0; k < jobs.size(); ++k) {
+      Job& job = jobs[k];
+      const std::vector<unsigned char> packed = job.packed.get();
+      const herr_t status = H5Dwrite_chunk(job.dset, H5P_DEFAULT, 0U, job.offset.data(),
+                                           packed.size(), packed.data());
+      if (job.last_of_dataset) {
+        warn_h5_close_failure(H5Dclose(job.dset), "H5Dclose",
+                              "HDF5Writer deferred deflate chunk");
+      }
+      if (status < 0) {
+        // The chunks of a dataset are consecutive jobs: the later jobs close
+        // every dataset still open, this one's included.
+        for (std::size_t r = k + 1; r < jobs.size(); ++r) {
+          jobs[r].packed.wait();
+          if (jobs[r].last_of_dataset) {
+            H5Dclose(jobs[r].dset);
+          }
+        }
+        TENRYU_ASSERT(false, "HDF5 H5Dwrite_chunk failed");
+      }
+    }
+#endif
+  }
+
+ private:
+  struct Job {
+    hid_t dset;
+    std::vector<hsize_t> offset;
+    bool last_of_dataset;
+    std::future<std::vector<unsigned char>> packed;
+  };
+
+  static std::vector<unsigned char> deflate_bytes(const std::vector<unsigned char>& raw,
+                                                  const int level) {
+    uLongf packed_bytes = compressBound(static_cast<uLong>(raw.size()));
+    std::vector<unsigned char> packed(static_cast<std::size_t>(packed_bytes));
+    const int status = compress2(packed.data(), &packed_bytes, raw.data(),
+                                 static_cast<uLong>(raw.size()), level);
+    TENRYU_ASSERT(status == Z_OK, "zlib compress2 failed for a deferred deflate chunk");
+    packed.resize(static_cast<std::size_t>(packed_bytes));
+    return packed;
+  }
+
+  int level_;
+  std::vector<Job> jobs_;
+};
+
+// Snapshots are finished on a worker thread: the writer (holding the HDF5
+// mutex) creates the file, writes every group, attribute and small dataset and
+// queues the large datasets' chunks for compression, then hands the open file
+// here and returns. The worker waits for the chunks' compression, writes them
+// and closes the file under the HDF5 mutex, and publishes it (the rename from
+// .tmp), in the order the snapshots were written. At most kMaxPendingSnapshots
+// wait here (the writer blocks beyond that, bounding the memory of the queued
+// chunks). An error of the worker is rethrown by the next write or by
+// HDF5Writer::wait_for_snapshot_writes, which the driver calls at the end of
+// a run.
+struct PendingSnapshot {
+  hid_t file = -1;
+  std::unique_ptr<DeferredDeflateChunks> chunks;
+  std::filesystem::path tmp_path;
+  std::filesystem::path path;
+};
+
+class SnapshotFinisher {
+ public:
+  static SnapshotFinisher& instance() {
+    static SnapshotFinisher finisher;
+    return finisher;
+  }
+
+  void enqueue(PendingSnapshot&& snapshot) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    rethrow_error_locked();
+    cv_.wait(lock, [this] { return queue_.size() < kMaxPendingSnapshots; });
+    queue_.push_back(std::move(snapshot));
+    if (!worker_.joinable()) {
+      worker_ = std::thread([this] { run(); });
+    }
+    cv_.notify_all();
+  }
+
+  void wait_idle() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    cv_.wait(lock, [this] { return queue_.empty() && !busy_; });
+    rethrow_error_locked();
+  }
+
+ private:
+  static constexpr std::size_t kMaxPendingSnapshots = 2;
+
+  SnapshotFinisher() = default;
+  ~SnapshotFinisher() {
+    {
+      std::unique_lock<std::mutex> lock(mutex_);
+      cv_.wait(lock, [this] { return queue_.empty() && !busy_; });
+      stop_ = true;
+    }
+    cv_.notify_all();
+    if (worker_.joinable()) {
+      worker_.join();
+    }
+  }
+
+  void rethrow_error_locked() {
+    if (error_) {
+      const std::exception_ptr error = error_;
+      error_ = nullptr;
+      std::rethrow_exception(error);
+    }
+  }
+
+  static void finish(PendingSnapshot& snapshot) {
+    snapshot.chunks->wait_all();
+    {
+      const std::lock_guard<std::recursive_mutex> hdf5_lock(core::hdf5_mutex());
+      snapshot.chunks->finish();
+      snapshot.chunks.reset();
+      const core::NvtxRange nvtx_close_range("io.snapshot.close");
+      if (H5Fclose(snapshot.file) < 0) {
+        core::log_warning("[WARN] H5Fclose failed in HDF5Writer::write_snapshot(" +
+                          snapshot.tmp_path.string() +
+                          "); continuing publish because data may already be durable.");
+      }
+      snapshot.file = -1;
+    }
+    std::error_code rename_ec;
+    std::filesystem::rename(snapshot.tmp_path, snapshot.path, rename_ec);
+    TENRYU_ASSERT(!rename_ec, "Failed to atomically publish snapshot HDF5 file '" +
+                                  snapshot.path.string() + "': " + rename_ec.message());
+  }
+
+  void run() {
+    for (;;) {
+      PendingSnapshot snapshot;
+      {
+        std::unique_lock<std::mutex> lock(mutex_);
+        cv_.wait(lock, [this] { return stop_ || !queue_.empty(); });
+        if (queue_.empty()) {
+          return;
+        }
+        snapshot = std::move(queue_.front());
+        queue_.pop_front();
+        busy_ = true;
+      }
+      cv_.notify_all();
+      std::exception_ptr error;
+      try {
+        finish(snapshot);
+      } catch (...) {
+        error = std::current_exception();
+      }
+      if (snapshot.file >= 0) {
+        // An error before the close: the chunks' destructor has closed the
+        // datasets; close the file (unpublished).
+        const std::lock_guard<std::recursive_mutex> hdf5_lock(core::hdf5_mutex());
+        snapshot.chunks.reset();
+        H5Fclose(snapshot.file);
+      }
+      {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        busy_ = false;
+        if (error && !error_) {
+          error_ = error;
+        }
+      }
+      cv_.notify_all();
+    }
+  }
+
+  std::mutex mutex_;
+  std::condition_variable cv_;
+  std::deque<PendingSnapshot> queue_;
+  std::thread worker_;
+  bool busy_ = false;
+  bool stop_ = false;
+  std::exception_ptr error_;
+};
+
+// The writer of the file being written on this thread (null: serial deflate).
+thread_local DeferredDeflateChunks* t_deferred_deflate = nullptr;
+
+class DeferredDeflateScope {
+ public:
+  explicit DeferredDeflateScope(DeferredDeflateChunks* chunks)
+      : previous_(t_deferred_deflate) {
+    t_deferred_deflate = kDeferredDeflateAvailable ? chunks : nullptr;
+  }
+  ~DeferredDeflateScope() { t_deferred_deflate = previous_; }
+  DeferredDeflateScope(const DeferredDeflateScope&) = delete;
+  DeferredDeflateScope& operator=(const DeferredDeflateScope&) = delete;
+
+ private:
+  DeferredDeflateChunks* previous_;
+};
 
 template <typename T>
 void write_numeric_dataset(const hid_t file,
@@ -1093,21 +1532,37 @@ void write_numeric_dataset(const hid_t file,
                           : H5Screate_simple(rank, dims.data(), nullptr);
   TENRYU_ASSERT(space >= 0, "HDF5 failed to create dataspace for " + group_path + "/" + name);
 
-  const hid_t dcpl = make_dcpl(cfg, rank, dims);
+  const std::size_t type_size = H5Tget_size(h5_type);
+  const hid_t dcpl = make_dcpl(cfg, rank, dims, type_size);
   const hid_t dset =
       H5Dcreate2(group, name.c_str(), h5_type, space, H5P_DEFAULT, dcpl, H5P_DEFAULT);
   TENRYU_ASSERT(dset >= 0, "HDF5 failed to create dataset: " + group_path + "/" + name);
 
-  TENRYU_ASSERT(H5Dwrite(dset, h5_type, H5S_ALL, H5S_ALL, H5P_DEFAULT, data) >= 0,
-                "HDF5 failed to write dataset: " + group_path + "/" + name);
+  std::size_t n_bytes = type_size;
+  for (const hsize_t dim : dims) {
+    n_bytes *= static_cast<std::size_t>(dim);
+  }
+  DeferredDeflateChunks* const deferred = t_deferred_deflate;
+  const bool defer = deferred != nullptr && deferred->level() == deflate_level(cfg) &&
+                     dcpl_uses_deflate(cfg, rank, dims) &&
+                     n_bytes >= kDeferredDeflateMinBytes;
+  if (!defer) {
+    TENRYU_ASSERT(H5Dwrite(dset, h5_type, H5S_ALL, H5S_ALL, H5P_DEFAULT, data) >= 0,
+                  "HDF5 failed to write dataset: " + group_path + "/" + name);
+  }
   write_units_attribute(dset, units);
   if (should_mark_derived_projection_when_wave_f_enabled(group_path, name, cfg)) {
     write_scalar_attribute_u8(
         dset, "derived_projection_when_per_material_enabled", static_cast<std::uint8_t>(1));
   }
 
-  warn_h5_close_failure(H5Dclose(dset), "H5Dclose",
-                        "HDF5Writer::write_numeric_dataset(dataset)");
+  if (defer) {
+    deferred->submit(dset, dims, chunk_dims_for(cfg, rank, dims, type_size), type_size,
+                     reinterpret_cast<const unsigned char*>(data));
+  } else {
+    warn_h5_close_failure(H5Dclose(dset), "H5Dclose",
+                          "HDF5Writer::write_numeric_dataset(dataset)");
+  }
   warn_h5_close_failure(H5Pclose(dcpl), "H5Pclose",
                         "HDF5Writer::write_numeric_dataset(dcpl)");
   warn_h5_close_failure(H5Sclose(space), "H5Sclose",
@@ -1161,6 +1616,15 @@ void write_root_attributes(const hid_t file,
   write_scalar_attribute_i64(file, "cycle", static_cast<std::int64_t>(step));
   write_scalar_attribute_i64(file, "step", static_cast<std::int64_t>(step));
   write_string_attribute(file, "geometry", cfg.main.dimension);
+  if (cfg.main.dim == 1) {
+    // The 1D coordinate geometry ("spherical" | "cylindrical" | "planar"):
+    // "geometry" holds Main.dimension, which is "1D_SPH" for all three
+    // Mesh.geometry_1d choices. Main.dimension="1D_CYL" is cylindrical.
+    const std::string geometry_1d =
+        (cfg.main.dimension == "1D_CYL") ? std::string("cylindrical")
+                                         : cfg.mesh.geometry_1d;
+    write_string_attribute(file, "geometry_1d", geometry_1d);
+  }
   write_scalar_attribute_i64(file, "nr", nr_attr);
   write_scalar_attribute_i64(file, "nz", nz_attr);
   write_scalar_attribute_i64(file, "n_cells", static_cast<std::int64_t>(state.rho.size()));
@@ -3965,19 +4429,37 @@ void write_common_snapshot_content(const hid_t file,
                                    const double t,
                                    const std::string& output_dir,
                                    const std::string& case_name) {
-  write_root_attributes(file, state, cfg, step, t, state.dt);
-  write_metadata_group(file, state, cfg, output_dir, case_name);
-  write_mesh_group(file, state, cfg);
-  write_hydro_group(file, state, cfg);
-  write_button_hydro_flags_group(file, state, cfg);
-  write_per_material_conservation_diagnostics_group(file, state, cfg);
-  write_per_material_event_counters_group(file, state, cfg);
-  write_dispatch_counters_group(file, state, cfg);
-  write_ale_lambda_sweep_diagnostics_group(file, state, cfg);
-  write_areal_density_diagnostics_group(file, state, cfg);
-  write_hotspot_gas_diagnostics_group(file, state, cfg);
-  write_radiation_group(file, state, cfg);
-  write_laser_group(file, state, cfg);
+  {
+    const core::NvtxRange nvtx_range("io.snapshot.metadata");
+    write_root_attributes(file, state, cfg, step, t, state.dt);
+    write_metadata_group(file, state, cfg, output_dir, case_name);
+  }
+  {
+    const core::NvtxRange nvtx_range("io.snapshot.mesh");
+    write_mesh_group(file, state, cfg);
+  }
+  {
+    const core::NvtxRange nvtx_range("io.snapshot.hydro");
+    write_hydro_group(file, state, cfg);
+    write_button_hydro_flags_group(file, state, cfg);
+  }
+  {
+    const core::NvtxRange nvtx_range("io.snapshot.diagnostics");
+    write_per_material_conservation_diagnostics_group(file, state, cfg);
+    write_per_material_event_counters_group(file, state, cfg);
+    write_dispatch_counters_group(file, state, cfg);
+    write_ale_lambda_sweep_diagnostics_group(file, state, cfg);
+    write_areal_density_diagnostics_group(file, state, cfg);
+    write_hotspot_gas_diagnostics_group(file, state, cfg);
+  }
+  {
+    const core::NvtxRange nvtx_range("io.snapshot.radiation");
+    write_radiation_group(file, state, cfg);
+  }
+  {
+    const core::NvtxRange nvtx_range("io.snapshot.laser");
+    write_laser_group(file, state, cfg);
+  }
   // time_state group (step, t, dt) for post-processing convenience
   const std::int32_t step_i32 = static_cast<std::int32_t>(step);
   write_numeric_dataset(file, "time_state", "step", H5T_NATIVE_INT32, {}, &step_i32, "count", cfg);
@@ -4097,6 +4579,97 @@ void write_checkpoint_extras(const hid_t file,
   write_carrier_checkpoint_group(file, state, cfg);
   write_evacuated_cells_checkpoint_group(file, state, cfg);
 
+  // Burn inventories as the state holds them: the specific inventories Y_s
+  // [1/g], cell-major [n_cells * 5] (D, T, He3, He4, p). The hydro group's
+  // burn_n_* are the number densities Y_s * rho; a restart that rebuilt Y_s as
+  // n_s / rho differed from the run's Y_s in the last bit, and the burn tallies
+  // of the restarted run with it (2026-09-26).
+  if (state.burn_enabled_any && !state.burn_n_host.empty() &&
+      state.burn_n_host.size() == state.rho.size() * 5U) {
+    write_numeric_dataset(file, "burn_state", "specific_inventory", H5T_NATIVE_DOUBLE,
+                          {static_cast<hsize_t>(state.burn_n_host.size())},
+                          state.burn_n_host.data(), "1/g", cfg);
+  }
+
+  // 1D S_N angular intensity memory (the per-angle time source): a restart
+  // then continues the converged angular distribution instead of reseeding
+  // it isotropically (NUMERICS §6.8).
+  if (state.sn_psi_prev.size() > 0) {
+    std::vector<double> psi_prev(state.sn_psi_prev.size(), 0.0);
+    state.sn_psi_prev.copy_to_host(psi_prev.data());
+    write_numeric_dataset(file, "radiation_sn", "psi_prev", H5T_NATIVE_DOUBLE,
+                          {static_cast<hsize_t>(psi_prev.size())}, psi_prev.data(),
+                          "erg/cm3", cfg);
+  }
+  if (state.sn_psi_sd_prev.size() > 0) {
+    std::vector<double> sd_prev(state.sn_psi_sd_prev.size(), 0.0);
+    state.sn_psi_sd_prev.copy_to_host(sd_prev.data());
+    write_numeric_dataset(file, "radiation_sn", "psi_sd_prev", H5T_NATIVE_DOUBLE,
+                          {static_cast<hsize_t>(sd_prev.size())}, sd_prev.data(),
+                          "erg/cm2/s", cfg);
+  }
+  if (state.sn_ee_node_offset.size() > 0) {
+    std::vector<double> offset(state.sn_ee_node_offset.size(), 0.0);
+    state.sn_ee_node_offset.copy_to_host(offset.data());
+    write_numeric_dataset(file, "radiation_sn", "ee_node_offset", H5T_NATIVE_DOUBLE,
+                          {static_cast<hsize_t>(offset.size())}, offset.data(), "erg/g", cfg);
+  }
+
+  // The closure outputs the first steps of a restart read before the state is closed again
+  // (heat capacities, sound speed): a 1D restart then continues from the in-memory state of
+  // the run instead of closing the restored state a second time. The per-material schema
+  // writes them with the snapshot fields.
+  if (cfg.main.dim == 1 && !cfg.numerics.materials.per_material_conservation_enabled) {
+    const std::size_t n_cells = state.rho.size();
+    const std::vector<hsize_t> cdim = {static_cast<hsize_t>(n_cells)};
+    if (state.cv_e.size() == n_cells) {
+      const auto cv_e = copy_field_to_host(state.cv_e);
+      write_numeric_dataset(file, "hydro", "cv_e", H5T_NATIVE_DOUBLE, cdim, cv_e.data(),
+                            "erg/(g*eV)", cfg);
+    }
+    if (state.cv_i.size() == n_cells) {
+      const auto cv_i = copy_field_to_host(state.cv_i);
+      write_numeric_dataset(file, "hydro", "cv_i", H5T_NATIVE_DOUBLE, cdim, cv_i.data(),
+                            "erg/(g*eV)", cfg);
+    }
+    if (state.cs.size() == n_cells) {
+      const auto cs = copy_field_to_host(state.cs);
+      write_numeric_dataset(file, "hydro", "cs", H5T_NATIVE_DOUBLE, cdim, cs.data(), "cm/s",
+                            cfg);
+    }
+  }
+
+  // Run-cumulative conduction solver statistics (the history's *_max, *_run and *_total
+  // columns): a restart continues them instead of counting from zero.
+  {
+    const std::int64_t steps_total = static_cast<std::int64_t>(state.c1_solver_steps_total);
+    write_numeric_dataset(file, "conduction_state", "solver_steps_total", H5T_NATIVE_INT64, {},
+                          &steps_total, "count", cfg);
+    write_numeric_dataset(file, "conduction_state", "solver_residual_max", H5T_NATIVE_DOUBLE, {},
+                          &state.c1_solver_residual_max, "1", cfg);
+    const std::int32_t iter_max = static_cast<std::int32_t>(state.c1_solver_iter_max);
+    write_numeric_dataset(file, "conduction_state", "solver_iter_max", H5T_NATIVE_INT32, {},
+                          &iter_max, "count", cfg);
+    write_numeric_dataset(file, "conduction_state", "solver_cond_number_max", H5T_NATIVE_DOUBLE,
+                          {}, &state.c1_solver_cond_number_max, "1", cfg);
+    write_numeric_dataset(file, "conduction_state", "bc_heat_flux_integrated", H5T_NATIVE_DOUBLE,
+                          {static_cast<hsize_t>(state.c1_bc_heat_flux_integrated.size())},
+                          state.c1_bc_heat_flux_integrated.data(), "erg", cfg);
+    const std::int64_t snb_steps_total = static_cast<std::int64_t>(state.snb_steps_total);
+    write_numeric_dataset(file, "conduction_state", "snb_steps_total", H5T_NATIVE_INT64, {},
+                          &snb_steps_total, "count", cfg);
+    const std::int32_t snb_iters_max = static_cast<std::int32_t>(state.snb_picard_iters_max);
+    write_numeric_dataset(file, "conduction_state", "snb_picard_iters_max", H5T_NATIVE_INT32, {},
+                          &snb_iters_max, "count", cfg);
+    const std::int32_t snb_nonconverged = static_cast<std::int32_t>(state.snb_nonconverged_steps);
+    write_numeric_dataset(file, "conduction_state", "snb_nonconverged_steps", H5T_NATIVE_INT32, {},
+                          &snb_nonconverged, "count", cfg);
+    write_numeric_dataset(file, "conduction_state", "snb_cap_theta_min_run", H5T_NATIVE_DOUBLE, {},
+                          &state.snb_cap_theta_min_run, "1", cfg);
+    write_numeric_dataset(file, "conduction_state", "snb_dq_over_qsh_max_run", H5T_NATIVE_DOUBLE,
+                          {}, &state.snb_dq_over_qsh_max_run, "1", cfg);
+  }
+
   std::vector<std::int8_t> hydro_active = state.hydro_active;
   if (!has_button_center(state)) {
     if (hydro_active.size() != state.rho.size()) {
@@ -4110,6 +4683,22 @@ void write_checkpoint_extras(const hid_t file,
                           hydro_active.data(),
                           "flag",
                           cfg);
+    // The void-cell mask, which the initialization sets from the materials and a restart
+    // does not rebuild (a button-center mesh writes it with its hydro flags).
+    if (cfg.main.dim == 1) {
+      std::vector<std::uint8_t> cell_is_void = state.cell_is_void;
+      if (cell_is_void.size() != state.rho.size()) {
+        cell_is_void.assign(state.rho.size(), static_cast<std::uint8_t>(0));
+      }
+      write_numeric_dataset(file,
+                            "hydro_flags",
+                            "cell_is_void",
+                            H5T_NATIVE_UINT8,
+                            {static_cast<hsize_t>(cell_is_void.size())},
+                            cell_is_void.data(),
+                            "flag",
+                            cfg);
+    }
   }
 
   const std::size_t n_p = static_cast<std::size_t>(std::max(pool.n_alive, 0));
@@ -4513,6 +5102,14 @@ void write_checkpoint_extras(const hid_t file,
                         cfg);
   write_numeric_dataset(file,
                         "time_state",
+                        "E_volume_in",
+                        H5T_NATIVE_DOUBLE,
+                        {},
+                        &state.E_volume_in,
+                        "erg",
+                        cfg);
+  write_numeric_dataset(file,
+                        "time_state",
                         "E_solver",
                         H5T_NATIVE_DOUBLE,
                         {},
@@ -4735,6 +5332,18 @@ void HDF5Writer::write_snapshot(const core::State& state,
                                 const std::string& output_dir,
                                 const std::string& case_name,
                                 const int rank) const {
+  write_snapshot_in_background(state, cfg, file_index, step, t, output_dir, case_name, rank);
+  wait_for_snapshot_writes();
+}
+
+void HDF5Writer::write_snapshot_in_background(const core::State& state,
+                                              const core::Config& cfg,
+                                              const int file_index,
+                                              const int step,
+                                              const double t,
+                                              const std::string& output_dir,
+                                              const std::string& case_name,
+                                              const int rank) const {
 #if TENRYU_ENABLE_HDF5
   if (rank != 0) {
     return;
@@ -4746,24 +5355,25 @@ void HDF5Writer::write_snapshot(const core::State& state,
       (safe_case_name(case_name) + "_" + format_step(file_index) + ".h5");
   const std::filesystem::path tmp_path = path.string() + ".tmp";
 
-  const hid_t file =
-      H5Fcreate(tmp_path.string().c_str(), H5F_ACC_TRUNC, H5P_DEFAULT, H5P_DEFAULT);
-  TENRYU_ASSERT(file >= 0, "Failed to create snapshot HDF5 file: " + tmp_path.string());
-
-  write_common_snapshot_content(file, state, cfg, step, t, output_dir, case_name);
-  const std::string snapshot_close_context =
-      "HDF5Writer::write_snapshot(" + tmp_path.string() + ")";
-  const herr_t snapshot_close_status = H5Fclose(file);
-  if (snapshot_close_status < 0) {
-    core::log_warning("[WARN] H5Fclose failed in " + snapshot_close_context +
-                      "; continuing publish because data may already be durable.");
+  PendingSnapshot pending;
+  {
+    const std::lock_guard<std::recursive_mutex> hdf5_lock(core::hdf5_mutex());
+    const hid_t file =
+        H5Fcreate(tmp_path.string().c_str(), H5F_ACC_TRUNC, H5P_DEFAULT, H5P_DEFAULT);
+    TENRYU_ASSERT(file >= 0, "Failed to create snapshot HDF5 file: " + tmp_path.string());
+    auto chunks = std::make_unique<DeferredDeflateChunks>(deflate_level(cfg));
+    {
+      const DeferredDeflateScope deferred_scope(chunks.get());
+      write_common_snapshot_content(file, state, cfg, step, t, output_dir, case_name);
+    }
+    pending.file = file;
+    pending.chunks = std::move(chunks);
+    pending.tmp_path = tmp_path;
+    pending.path = path;
   }
-
-  std::error_code rename_ec;
-  std::filesystem::rename(tmp_path, path, rename_ec);
-  TENRYU_ASSERT(!rename_ec,
-                "Failed to atomically publish snapshot HDF5 file '" + path.string() +
-                    "': " + rename_ec.message());
+  // The compression of the large datasets, their chunk writes, the close and
+  // the publication continue on the finisher's thread.
+  SnapshotFinisher::instance().enqueue(std::move(pending));
 #else
   (void)state;
   (void)cfg;
@@ -4792,12 +5402,18 @@ std::string HDF5Writer::write_checkpoint(
       (safe_case_name(case_name) + "_ckpt_" + format_step(file_index) + ".h5");
   const std::filesystem::path tmp_path = path.string() + ".tmp";
 
+  const std::lock_guard<std::recursive_mutex> hdf5_lock(core::hdf5_mutex());
   const hid_t file =
       H5Fcreate(tmp_path.string().c_str(), H5F_ACC_TRUNC, H5P_DEFAULT, H5P_DEFAULT);
   TENRYU_ASSERT(file >= 0, "Failed to create checkpoint HDF5 file: " + tmp_path.string());
 
-  write_common_snapshot_content(file, state, cfg, step, t, output_dir, case_name);
-  write_checkpoint_extras(file, state, cfg, photon_pool, step, t);
+  {
+    DeferredDeflateChunks deferred(deflate_level(cfg));
+    const DeferredDeflateScope deferred_scope(&deferred);
+    write_common_snapshot_content(file, state, cfg, step, t, output_dir, case_name);
+    write_checkpoint_extras(file, state, cfg, photon_pool, step, t);
+    deferred.finish();
+  }
 
   const std::string checkpoint_close_context =
       "HDF5Writer::write_checkpoint(" + tmp_path.string() + ")";
@@ -4823,6 +5439,12 @@ std::string HDF5Writer::write_checkpoint(
   (void)output_dir;
   (void)case_name;
   return {};
+#endif
+}
+
+void HDF5Writer::wait_for_snapshot_writes() {
+#if TENRYU_ENABLE_HDF5
+  SnapshotFinisher::instance().wait_idle();
 #endif
 }
 

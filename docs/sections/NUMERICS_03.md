@@ -260,11 +260,11 @@ docs/design/mesh_resolution_requirement_20260903.md）。probe run 後の質量�
 probe との比較で係数を較正するためのものである。
 
 **臨界密度**: 材料 \(m\) について \(n_c = 1.11485\times10^{21}/\lambda_{\mu m}^2\) cm⁻³、
-\(\rho_{c,m} = n_c m_u A_m/\bar Z_m\)。\(\bar Z_m\) は `zbar_override`、それ以外は \(Z\le18\) で
+\(\rho_{c,m} = n_c m_p A_m/\bar Z_m\)（イオン質量はソルバーと同じ \(A m_p\)。レーザー写像の \(n_e/n_c\) と同じ臨界密度になる。2026-09-24 に原子質量単位 \(m_u\) から変更、\(\rho_c\) は +0.73 %）。\(\bar Z_m\) は `zbar_override`、それ以外は \(Z\le18\) で
 完全電離（最小の \(\rho_c\) = 最も厳しい天井、保守的）、\(Z>18\) は Thomas–Fermi 近似
 （`materials::compute_zbar_tf`、コロナ温度で 5 回反復）。
 
-**強度・音速・アブレーション率**: 総ビーム出力 \(P(t)\)（run と同じ 10000 点標本）から
+**強度・音速・アブレーション率**: 総ビーム出力 \(P(t)\)（run と同じ時刻標本: \(2^{-40}\) s 格子と局所細分。複数ビームは全ビームの標本時刻の和集合で合計）から
 \(I(t) = 10^7 P/A_0\)、\(A_0\) は球 \(4\pi R_0^2\)・円筒 \(2\pi R_0\)・平面 1 cm²
 （\(R_0\) = 最外の非 void セルの外縁）。付与釣合い \(I = 4\rho_c c_T^3\) から
 \(c_T = (f_{abs} I/(4\rho_{c,front}))^{1/3}\)、質量アブレーション率
@@ -387,9 +387,13 @@ and the two-face area average used by 1D node/cell diagnostics is
 \(0.5\,2\pi(r_a+r_b)\).  Implementation is by compile-time `Geometry1D`
 template forks of the 1D kernels; spherical branches keep the historical
 arithmetic verbatim (bitwise regime), with 1D_SPH bit-neutrality anchored by
-`tests/hydro/test_1d_sph_bitwise_golden.cu`.  The initial scope is the pure hydro
-core: radiation, laser, conduction, and ale1d are rejected at validation.  The
-boundary-PdV energy-audit diagnostic is geometry-aware.  The Sedov gate is
+`tests/hydro/test_1d_sph_bitwise_golden.cu`.  Since 2026-09-24 the builder maps
+`"1D_CYL"` to `"1D_SPH"` with `Mesh.geometry_1d="cylindrical"` (the same
+`geometry_code`), so the physics of the cylindrical 1D geometry (FLD/S_N
+radiation, conduction, the radial laser absorption, ALE) is available; the
+initial scope was the pure hydro core, with radiation, laser, conduction, and
+ale1d rejected at validation.  The boundary-PdV energy-audit diagnostic is
+geometry-aware.  The Sedov gate is
 H3-RADIAL-CYL multi-grid exponent \(1/2\).
 
 #### 3.1.3 ノード質量
@@ -708,6 +712,9 @@ guard で無効化された pair 数を表す。
   \tilde f_{iQ}=\frac{\max(P_{i,i}^{n+1/2}+Q_i^{n+1/2},0)}
   {\max(|p_{q,i}^{n+1/2}|,\epsilon)}
   \]
+  （`av_heat_to="electron"` では \(Q_i^{n+1/2}\) を電子側に置き
+  \(\tilde f_e=\max(P_e+Q,0)/\ldots\)、\(\tilde f_{iQ}=\max(P_i,0)/\ldots\) — 2026-09-23 是正:
+  旧実装は `av_heat_to` によらず AV 仕事をイオンへ入れていた）
   から、**明示的な後段正規化**
   \[
   f_e = \frac{\tilde f_e}{\tilde f_e + \tilde f_{iQ}},\qquad
@@ -732,6 +739,14 @@ guard で無効化された pair 数を表す。
   と monotone bracketed inverse で求め、\(P_e,P_i,c_v\) を table から再評価する。
   compatible path では table inverse が範囲内にある限り `ee/ei` は writeback せず、
   NaN/Inf/負 energy または table floor/ceiling clamp 時だけ table boundary energy へ repair する。
+  compatible work の加算そのもの（`compatible_energy_update_1d_kernel`）は、表 EOS
+  （2T はイオンと電子の表、1T は全表）または Helmholtz spline/jet の閉包をもつセルでは符号付きのまま
+  \(e\leftarrow e+\Delta e\) とし、0 への切り上げは理想気体のセルに限る（非 compatible の 2T 更新・
+  人工加熱・衝撃波後加熱・midpoint_v2 の stage と同じ規則。2026-09-23）。この判定はセルごと
+  （`signed_energy_cells_kernel`）で、以前は 2T で材料 0 のイオン表の有無が全セルを決め（理想気体を
+  先に並べたデッキでは表のセルの負エネルギーも切り上げた）、1T では全セルを切り上げていた。
+  それ以前は表の cold curve の負エネルギーも 0 へ切り上げて床注入として計上し、
+  energy-authoritative 閉包がその 0 を保持するため、負エネルギー域のセルが加熱されていた。
   compatible TMAT reclosure の floor/ceiling clamp と bracket failure は device counter で集計し、
   非ゼロなら hydro warning として出力する。
 - `eta_compatible` 診断量
@@ -746,7 +761,9 @@ guard で無効化された pair 数を表す。
   EOS 再閉包前にイオン比内部エネルギー \(e_i\) へ保存形で加える。
   この項は compatible force-work 分解には含めない
 - `post_shock_heat=True` のときは、別経路の局所熱流束 \(\mathbf{H}^{ps}\) を
-  全比内部エネルギー \(e_{tot}=e_e+e_i\) に対して保存形で加える。
+  全比内部エネルギー \(e_{tot}=e_e+e_i\) に対して保存形で加える。面の熱流は更新前のエネルギーから
+  面ごとに一度だけ求め、両隣のセルが同じ値を使う（2026-09-23 是正 — 旧実装は同じカーネルで隣のセルの
+  エネルギーを読みながら自セルを更新しており、結果が読み書きの順序に依存し、面の熱流が両隣で食い違いえた）。
   2T ではセルの net \(\Delta e_{tot}^{ps}\) を
   \(P_e^{n+1/2}/(P_e^{n+1/2}+P_i^{n+1/2})\) と
   \(P_i^{n+1/2}/(P_e^{n+1/2}+P_i^{n+1/2})\) の比で電子・イオンへ分配する。
@@ -922,6 +939,22 @@ T_{k,i}^{new} = T_{k,i}^{old} + \frac{\Delta e_{k,i}}{c_{v,k,i}} \quad (k=e,i)
 6. **フロアクランプ**：最終的な \(T^{final}\) は \(T_{floor}\)（§1.1.7）以上にクランプする。
 
 理想気体EOS（\(c_v = \text{const}\)）では反復なしで 1 回目で厳密に収束する。
+
+**1T の全エネルギー再規格化（legacy PdV path）**：1T・`compatible_energy=False`・駆動圧境界なしの
+ステップでは、Corrector の後に活性セルの \(e\) を一律に拡大縮小し（残差は最初の活性セルへ）、
+\(E=\sum_i \Delta M_i e_i + K\) を \(E^{target}=E^{n}+W_r+E_{floor}\) に合わせる。\(W_r\) は
+輻射圧（`hydro_coupling="gamma_r_43"`）の力の仕事の総和（ドライバが輻射場から同量を差し引く）、
+\(E_{floor}\) はステップ内の床注入（安全台帳へ計上）。\(K\) は節点形 \(\sum_j \tfrac12 m_j u_j^2\)
+（\(m_j\) は隣接セル質量の半分ずつ、運動量更新が運ぶ運動エネルギー。\(W_r\) も節点の運動エネルギー
+\(\Delta K_j=F_j\bar u_j\Delta t\) として定義される）で測る。2026-09-24 是正 — それまでは輻射圧が働く
+ステップ以外はセル平均形 \(\tfrac12 m_i\bigl((u_i+u_{i+1})/2\bigr)^2\)（1 セルあたり
+\(\tfrac18 m_i(u_{i+1}-u_i)^2\) だけ小さい）で測っており、セル内で速度が変わる所で両者の差を内部エネルギーへ
+移していた。エネルギー予算（履歴 `energy/kinetic` と保存誤差）も同日から 1D では節点形で測る
+（セル平均形は膨張するアブレーション域で運動エネルギーを沈着量の 1 割程度過小に測り、見かけのエネルギー損失を
+示していた）。2026-09-23 是正 — 旧実装は
+\(E^{target}=E^n\)（\(K\) は常にセル平均形）で、床注入をステップ内で \(e\) から差し引き直し、
+輻射圧の力による運動エネルギーの変化もセル平均形で測った分だけ \(e\) から差し引いていた
+（輻射場は節点形の \(W_r\) を払うので、両者の差だけ系全体のエネルギーが合わなかった）。
 
 #### 3.1.6 人工粘性（1D球対称）
 
@@ -1211,12 +1244,30 @@ u_{R,i}^* = u_{i+1}-\frac{1}{2}\Delta r_i s_{i+1}
 \qquad
 \chi_i^{lim}=\min(\chi_i^{raw},\chi_i^{rec})
 \]
-を作る。`csw_shock_limiter_floor=f` は \(\chi_i^{rec}>0\) のときだけ
+を作る。`csw_shock_limiter_floor=f` は、Caramana-Shashkov-Whalen (1998) 式 (12) の
+Christensen limiter
+\[
+\psi_i=\max\left(0,\;\min\left(\tfrac{1}{2}(r_{l,i}+r_{r,i}),\;2r_{l,i},\;2r_{r,i},\;1\right)\right),
+\qquad
+r_{l,i}=\frac{g_{i-1}}{g_i},\quad r_{r,i}=\frac{g_{i+1}}{g_i},\quad
+g_k=\frac{u_{k+1}-u_k}{\Delta r_k}
+\]
+で重み付けした下限
 \[
 \chi_i^{lim}\leftarrow
-\min\left(\chi_i^{raw},\;\max(\chi_i^{lim},\;f\chi_i^{raw})\right)
+\min\left(\chi_i^{raw},\;\max\left(\chi_i^{lim},\;f\,(1-\psi_i)\,\chi_i^{raw}\right)\right)
 \]
-を適用し、滑らかな一様圧縮（\(\chi_i^{rec}=0\)）では \(Q_i=0\) を保つ。
+として働く（\(g_i<0\)）。メッシュ外の隣接セルは \(r=1\)（線形延長。反射中心では鏡像と一致）、
+幅が正でない、または比が有限でない隣接セルは \(r=0\) とする。3 セルにわたって速度が線形なら
+\(\psi_i=1\) で下限は消え、一様圧縮で \(Q_i=0\) を保つ。隣接セルが圧縮していない衝撃波の
+足元・後端では \(\psi_i=0\) で \(f\chi_i^{raw}\) が残る。勾配がセルあたり相対 \(\delta\) で
+変わる滑らかな圧縮では \(\chi_i^{lim}/\chi_i^{raw}=O(\delta^2)\) である。\(\psi_i\) は速度の
+連続関数なので、\(Q_i\) も速度の連続関数になる（CSW98 は、衝撃波後方の偽の振動を避けるため
+limiter が引数に対してできるだけ滑らかであることを求めている）。
+2026-09-25 までの実装は下限を \(\chi_i^{rec}>0\) の符号だけで入り切りしていた。滑らかな圧縮では
+\(\chi_i^{rec}\) が \(O(\delta^2)\) の微小量で、その符号は曲率や丸め誤差で変わるため、粘性がセル
+ごとに 0 と \(f\chi_i^{raw}\) の間を不連続に跳んでいた（勾配が線形に変わる圧縮では全セルに
+\(f\chi_i^{raw}\)、不等間隔格子上の厳密な一様圧縮でも丸め誤差で一部のセルに入る）。
 最終的な粘性圧は
 \[
 Q_i=\rho_i\left(C_2^2\Delta r_i^2(\chi_i^{lim})^2+
@@ -1639,11 +1690,17 @@ M_j\,\frac{du_j}{dt} = -A_j\,(p_{q,i} - p_{q,i-1}),\qquad A_j = 4\pi r_j^2
 
 \[
 \Delta t_{acoustic+AV} = C_{CFL}\cdot\min_{i \in \mathcal{A}}\!\left(
-\frac{\Delta r_i}{c_{s,i} + C_1\,c_{s,i} + C_2\,\Delta r_i\,\chi_i}
+\frac{\Delta r_i}{c_{s,i} + g_i\,C_1\,c_{s,i} + C_2\,\Delta r_i\,\chi_i}
 \right)
 \]
 - \(\mathcal{A} = \{i \mid \text{hydro\_active}_i = \text{true}\}\)：活性セル集合（§2.1.1）。\(\mathcal{A} = \emptyset\) のとき \(\Delta t_{hydro} = \infty\)。
 - \(C_1,\; C_2\)：人工粘性係数（§3.1.6）
+- \(g_i\)：セル \(i\) が圧縮しているとき 1、それ以外は 0。圧縮とは節点が近づく
+  （\(u_{i+1} < u_i\)、CSW の作用条件）か体積が縮む
+  （\(A_{i+1}u_{i+1} < A_i u_i\)、VNR の作用条件）ことを指す。どちらの人工粘性も非圧縮セルでは
+  \(Q = 0\) なので、一次項 \(C_1 c_{s,i}\) は作用しうるセルにだけ加える（2026-09-23 是正 —
+  旧式は非圧縮セルにも常に加え、非圧縮セルが律速するとき \(\Delta t\) を \(1/(1+C_1)\) 倍に
+  縮めていた）。永続カーネルの CFL（`persistent_1d::cfl_1d_candidate_body`）も同じ式。
 - \(\chi_i\) [1/s] は §3.1.6 の Christensen速度リミタで定義した圧縮率をそのまま用いる。
   CFL分母では圧縮速度 \(\Delta r_i\chi_i\) [cm/s] を人工粘性の補正項として加える。
 - `av_type="riemann"` では VNR 係数を CFL に使用せず、§3.1.6 の Riemann face
@@ -1771,7 +1828,9 @@ M_j\,\frac{du_j}{dt} = -A_j\,(p_{q,i} - p_{q,i-1}),\qquad A_j = 4\pi r_j^2
    \]
    （\(\Delta V^{n\to n+1/2} = V^{n+1/2} - V^n\) は predictor の幾何半更新の
    体積差、\(Q^n\) work は `av_heat_to` の宛先へ、1T は総和形。\(Q_{ei}\)
-   等の source は stage には含めない — Strang 分割の別演算子）。
+   等の source は stage には含めない — Strang 分割の別演算子）。stage のゼロ下限は理想気体の
+   エネルギーにだけ適用し、符号付きの表エネルギー（負の冷たい曲線）はそのまま使う（2026-09-23 是正 —
+   旧実装は stage を常に 0 で切り、表 EOS の中間圧力を誤らせていた）。
 2. EOS closure は \(P^{n+1/2} = P(\rho^{n+1/2}, e^{\star})\) を返す
    （真の時間中心圧力）。AV も同状態で再評価。
 3. Corrector のエネルギー更新は \(P_{half} = P^{n+1/2}\)、
@@ -1819,6 +1878,10 @@ M_j\,\frac{du_j}{dt} = -A_j\,(p_{q,i} - p_{q,i-1}),\qquad A_j = 4\pi r_j^2
   > 残差 \(1.4\times10^7\) erg で失敗、bisect で特定）。`Hydro1D::lagrangian_step` の compatible
   > 分岐に FREE の \(Q_{N-1}\) 読み出しを戻した。影響するのは `compatible_energy=True` かつ
   > `boundary_1d="free"` の run（`cbet_gxii_1d_off`, `parallel_gxii_1d` など）。
+  > **2026-09-23 修正**: 駆動圧境界（`boundary_1d="pressure"`）も運動量式の ghost は
+  > \(P_{drive}+Q_{N-1}\) なのに、compatible energy 更新は最外セルの外側面の \(Q\) 仕事を引いて
+  > いなかった（ghost の差し引きが FREE 限定）。外側面の仕事から \(Q_{N-1}\) を除き、
+  > \(P_{drive}\) の仕事は従来どおり境界の外部仕事として台帳へ入る。
 
 **節点量のゴースト規約（スカラー量とは別系統；
 2026-07-26 明確化）**：AV の slope 再構成（§3.1.6 の \(\sigma_j\)）が参照する仮想
@@ -4435,10 +4498,13 @@ unconditionally in dt.
 
 With `Numerics.hydro.csw98_limiter_shock_floor_enabled` (default false), the
 structured limiter's force attenuation is floored at
-`csw_shock_limiter_floor` on compressive sides, matching the 1D csw kernel's
-shock floor: at a strong front the edge viscosity retains at least
-floor x its unlimited value instead of being extinguished by the
-smooth-ramp classification.
+`csw_shock_limiter_floor` on compressive sides: at a strong front the edge
+viscosity retains at least floor x its unlimited value instead of being
+extinguished by the smooth-ramp classification. The floor is not weighted:
+every compressive edge keeps it, in a smooth compression as well. (It was
+introduced to match the 1D csw kernel's shock floor; since 2026-09-25 the
+1D kernel weights its floor by 1 - psi, section 3.1.6, so the two differ
+where the velocity varies linearly.)
 
 With `Numerics.hydro.csw98_axisline_work_planar_enabled` (default false),
 axis-line edges book the AV pair power in the planar metric (weights 1
@@ -12407,6 +12473,12 @@ V3 solution-adaptive ALE は `numerics.ale1d.enabled` でのみ制御する。�
 
 > **運用注意**：`Ale1dConfig::enabled=false` / `numerics.ale1d.enabled=False` が既定であり、1D ALE V3 は実験的な opt-in 機能として、long-pulse ablation front penetration や multi-shock systems など localized moving feature がある場合に限って検討する。
 
+**発火条件と候補の判定（2026-09-23）**：試行は cadence（`every_n_steps` の倍数の step）、品質（`emergency_enabled` かつ隣接セル幅比の最大 \(\max_i\max(\Delta r_i/\Delta r_{i+1},\Delta r_{i+1}/\Delta r_i)\) が `emergency_max_dr_ratio` を超える）、min-width floor（下記）のいずれかで発火し、前回の適用から `min_steps_between_ale` step 未満なら skip する（`TooSoon`）。候補メッシュは remap の前に音響 dt 上限
+\[
+\Delta t_{ac}=\min_i\frac{r_{i+1}-r_i}{c_{s,i}}\qquad(c_{s,i}>0\ \text{のセル})
+\]
+で判定する。現メッシュは現在の \(c_s\) を使い、候補セルは重なる現メッシュのセルの \(c_s\) の最大値を使う（remap が候補セルをそれらから埋めるので保守的な見積り）。\(\Delta t_{ac}^{cur}/\Delta t_{ac}^{cand}\) が `candidate_dt_penalty_max` を超える候補は棄却する（`DtPenaltyTooLarge`）。cadence だけで発火した試行は、`enable_benefit_gate=True` のとき \(\Delta t_{ac}^{cand}/\Delta t_{ac}^{cur}\ge\) `benefit_min_dt_gain` を要求し、未満は棄却する（`BenefitTooSmall`）。品質と min-width floor のトリガはメッシュの欠陥への対処なので効果判定の対象外で、dt ペナルティだけを受ける。それまで品質トリガは `candidate_dt_penalty_max` を隣接セル幅比の閾値に流用し、効果判定と dt ペナルティのパラメータは読み込むだけで評価しておらず、`min_steps_between_ale` による skip を `BenefitTooSmall` と表示していた。
+
 **min-width floor モード（2026-08-07、experimental-incomplete）**：
 `numerics.ale1d.min_width_floor`（既定 `enabled=False`）は、最小セル幅が
 `floor_cm` を下回ったステップで sensor/monitor 経路を経ずに直接候補を構築する
@@ -12425,7 +12497,7 @@ remap_v3・速度射影・保存則ゲート・commit）は monitor 経路と共
 
 **再トリガ cooldown（2026-08-10）**：`retrigger_cooldown_steps`（int、
 既定 0、`>=0`）は、floor トリガ由来の rezone 試行が理由を問わず適用されなかった
-（no_relief・候補棄却・保存則棄却・benefit gate 棄却等）直後から、以後 N step の
+（no_relief・候補棄却・dt ペナルティ棄却・保存則棄却等。floor トリガの試行は効果判定の対象外）直後から、以後 N step の
 あいだ floor トリガの評価自体（node 座標の host 転送と最小幅スキャンを含む）を
 スキップする。cadence/quality トリガは影響を受けず、いずれかの経路で rezone が
 適用されたら cooldown は 0 にリセットされる。カウンタは in-memory の driver 状態
@@ -12634,21 +12706,37 @@ For \(N_{\rm ramp}=2\), \(\phi(0)=0\), \(\phi(1)=0.5\), and \(\phi(d\ge2)=1\). R
 
 After the high-order attempt, each field is checked for positivity and local boundedness. Mass, material component mass, and radiation are checked as densities; electron/ion energies are checked as recovered specific energies after the conservative energy and mass remaps. If a field fails and `fallback_to_first_order_on_bounds_fail=True`, that field is recomputed with \(\phi=0\). For electron/ion energy fallback, the recovered specific energy uses a mass denominator from the same first-order donor remap; if the high-order mass candidate had passed its own bounds, mass is recomputed with \(\phi=0\) before the specific-energy fallback is accepted. If the fallback still fails, remap returns `ConservationRejected`. Scratch diagnostics record the cells/fields that required fallback. `high_order_enabled=False` directly selects the Week 4 first-order donor path.
 
-The remapped conserved quantities are mass \(m_i\), material masses \(m_if_{i,m}\), electron and ion material energies \(m_ie_{e,i}\), \(m_ie_{i,i}\), and radiation group energies \(V_iE_{g,i}\). Scratch outputs store \(m_i^n\), \(V_i^n\), normalized \(f_{i,m}^n\), specific \(e_{e,i}^n,e_{i,i}^n\), and radiation energy densities \(E_{g,i}^n\). This function is a two-phase operation: it reads `State` and `r_candidate`, writes only `Ale1dRemapScratch`, and does not mutate mesh or physics state. The driver then projects velocity into `Ale1dVelocityProjectScratch`, computes hard diagnostics, and only on acceptance commits `x_r`, mass, energies, radiation energy density, volume fractions, and nodal velocity, followed by boundary application, geometry/rho refresh, EOS reclosure, and transient source/viscosity invalidation.
+The remapped conserved quantities are mass \(m_i\), material masses \(m_if_{i,m}\), electron and ion material energies \(m_ie_{e,i}\), \(m_ie_{i,i}\), and radiation group energies \(V_iE_{g,i}\). Scratch outputs store \(m_i^n\), \(V_i^n\), normalized \(f_{i,m}^n\), specific \(e_{e,i}^n,e_{i,i}^n\), and radiation energy densities \(E_{g,i}^n\). This function is a two-phase operation: it reads `State` and `r_candidate`, writes only `Ale1dRemapScratch`, and does not mutate mesh or physics state. The driver then projects velocity into `Ale1dVelocityProjectScratch`, computes hard diagnostics, and only on acceptance commits `x_r`, mass, energies, radiation energy density, volume fractions, and nodal velocity, followed by boundary application, geometry/rho refresh, EOS reclosure, and transient source/viscosity invalidation. The EOS reclosure and the cell sound speed are the hydro's closure of the committed fields (`Hydro1D::close_eos_and_sound_speed`: the 1T or 2T closure of §3.1 with every EOS backend and the per-cell material properties rebuilt after the volume-fraction remap), i.e. the state the next Lagrangian step's entry closure produces. 2026-09-23: the ALE had its own per-species reclosure, which closed 1T runs with the 2T formulas (\(T_i\) at the floor with \(c_{v,i}T_{floor}\) put into \(e_i\) and booked as a floor injection, \(T_e=e/c_{v,e}\), \(c_{v,e}\) without the ion part) and raised table energies below the temperature floor to \(e(T_{floor})\) where the hydro's energy-authoritative closure keeps them.
 
-Velocity projection is also two-phase. From old nodal velocities and old cell masses,
+Velocity projection is also two-phase and uses the half-index-shift method (Benson 1992, §3.5.5). Each cell carries the velocities of its two nodes,
 \[
-u_i^o=\frac{1}{2}(v_i^o+v_{i+1}^o),\qquad p_i^o=m_i^o u_i^o.
+\psi^L_i=v_i^o,\qquad \psi^R_i=v_{i+1}^o,
 \]
-The already remapped mass \(m_i^n\) is reused. Cell momentum \(p_i^o\) is remapped with the same swept volumes, donors, and mass \(\phi_j\), then
+as specific quantities advected with the accepted face mass fluxes \(F_j\) of the mass remap (\(m_i^n=m_i^o+F_{i+1}-F_i\); `Ale1dRemapScratch::mass_flux`, zero at pinned faces and the domain ends). For each field the donor cell carries a limited linear reconstruction in the mass coordinate,
 \[
-u_i^n=p_i^n/m_i^n.
+s_i=\operatorname{minmod}\left(
+\theta\frac{\psi_i-\psi_{i-1}}{\tfrac12(m_{i-1}+m_i)},
+\frac{\psi_{i+1}-\psi_{i-1}}{\tfrac12m_{i-1}+m_i+\tfrac12m_{i+1}},
+\theta\frac{\psi_{i+1}-\psi_i}{\tfrac12(m_i+m_{i+1})}
+\right),
 \]
-Interior node velocities are mass-weighted,
+scaled so that the values at the cell's two faces stay inside the neighbours' range (\(\theta=\) `limiter_theta`; boundary cells and cells next to a face with \(\phi=0\) use \(s_i=0\)). The value on the mass swept through face \(j\) is the donor's reconstruction at the centroid of that mass,
 \[
-v_j^n=\frac{m_{j-1}^n u_{j-1}^n+m_j^n u_j^n}{m_{j-1}^n+m_j^n},\qquad 1\le j<N,
+\psi_j^{\rm sw}=\psi_d+\phi_js_d\delta_j,\qquad
+\delta_j=\begin{cases}
+\tfrac12(F_j-m_d^o), & F_j>0,\ d=j,\\
+\tfrac12(m_d^o+F_j), & F_j<0,\ d=j-1,
+\end{cases}
 \]
-with \(v_0^n=0\) at the spherical center and \(v_N^n=u_{N-1}^n\) before the boundary kernel is applied. The diagnostic kinetic energy drift uses
+and the conservative update \(m_i^n\psi_i^n=m_i^o\psi_i^o+F_{i+1}\psi_{i+1}^{\rm sw}-F_i\psi_i^{\rm sw}\) is evaluated as
+\[
+\psi_i^n=\psi_i^o+\frac{F_{i+1}(\psi_{i+1}^{\rm sw}-\psi_i^o)-F_i(\psi_i^{\rm sw}-\psi_i^o)}{m_i^n},
+\]
+which keeps a uniform field exactly uniform. The new node velocities are the mass-weighted means of the two adjacent cells' values,
+\[
+v_j^n=\frac{m_j^n\psi^{L,n}_j+m_{j-1}^n\psi^{R,n}_{j-1}}{m_j^n+m_{j-1}^n},\qquad 1\le j<N,
+\]
+with \(v_0^n=0\) at the spherical center and \(v_N^n=\psi^{R,n}_{N-1}\) before the boundary kernel is applied. Without transport the projection returns the old velocities exactly, a uniform velocity over any density stays uniform (DeBar's consistency condition), and the nodal momentum \(\sum_jM_jv_j=\tfrac12\sum_im_i(\psi^L_i+\psi^R_i)\), \(M_j=\tfrac12(m_{j-1}+m_j)\), is conserved (the center node is set to rest). 2026-09-23: this replaces a cell-momentum projection (\(p_i=m_i(v_i+v_{i+1})/2\) remapped with its own momentum-density reconstruction, \(v_j^n=(p_{j-1}^n+p_j^n)/(m_{j-1}^n+m_j^n)\)), which averaged node \(\to\) cell \(\to\) node and so smoothed any non-uniform velocity and removed kinetic energy even when no face moved (the inversion error of Benson 1992, §3.5.3). The diagnostic kinetic energy drift uses
 \[
 K=\sum_j\frac{1}{2}m_j^{node}v_j^2,\qquad
 m_j^{node}\approx\frac{1}{2}(m_{j-1}+m_j),

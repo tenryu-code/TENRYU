@@ -10,6 +10,7 @@
 #include <thrust/scan.h>
 #include <thrust/system/cuda/execution_policy.h>
 
+#include "core/device_scratch.hpp"
 #include "core/error.hpp"
 #include "core/fancy_iterators.cuh"
 
@@ -27,48 +28,23 @@ inline void cuda_check(const cudaError_t err, const char* message) {
   TENRYU_ASSERT(err == cudaSuccess, message);
 }
 
+// Work buffer from the persistent device scratch pool: one buffer per tag,
+// kept across ALE attempts instead of a cudaMalloc/cudaFree pair per call
+// (cudaFree synchronizes the device). Contents are not zeroed, as with
+// cudaMalloc; two live buffers never share a tag.
 template <typename T>
 class DeviceBuffer {
  public:
   DeviceBuffer() = default;
 
-  explicit DeviceBuffer(const std::size_t count) {
-    reset(count);
+  DeviceBuffer(const char* tag, const std::size_t count) {
+    reset(tag, count);
   }
 
-  ~DeviceBuffer() {
-    release();
-  }
-
-  DeviceBuffer(const DeviceBuffer&) = delete;
-  DeviceBuffer& operator=(const DeviceBuffer&) = delete;
-
-  DeviceBuffer(DeviceBuffer&& other) noexcept {
-    ptr_ = other.ptr_;
-    count_ = other.count_;
-    other.ptr_ = nullptr;
-    other.count_ = 0;
-  }
-
-  DeviceBuffer& operator=(DeviceBuffer&& other) noexcept {
-    if (this != &other) {
-      release();
-      ptr_ = other.ptr_;
-      count_ = other.count_;
-      other.ptr_ = nullptr;
-      other.count_ = 0;
-    }
-    return *this;
-  }
-
-  void reset(const std::size_t count) {
-    release();
-    count_ = count;
-    if (count_ == 0) {
-      return;
-    }
-    cuda_check(cudaMalloc(reinterpret_cast<void**>(&ptr_), count_ * sizeof(T)),
-               "ALE1D sensor cudaMalloc failed");
+  void reset(const char* tag, const std::size_t count) {
+    ptr_ = (count == 0)
+               ? nullptr
+               : static_cast<T*>(core::device_scratch_acquire(tag, count * sizeof(T)));
   }
 
   T* data() noexcept {
@@ -80,16 +56,7 @@ class DeviceBuffer {
   }
 
  private:
-  void release() {
-    if (ptr_ != nullptr) {
-      cuda_check(cudaFree(ptr_), "ALE1D sensor cudaFree failed");
-      ptr_ = nullptr;
-    }
-    count_ = 0;
-  }
-
   T* ptr_ = nullptr;
-  std::size_t count_ = 0;
 };
 
 struct ComponentStats {
@@ -414,11 +381,11 @@ double reduce_sum(InputIt input,
   if (n <= 0) {
     return 0.0;
   }
-  DeviceBuffer<double> out(1);
+  DeviceBuffer<double> out("ale1d_sensor:reduce_sum:out", 1);
   std::size_t temp_bytes = 0;
   cuda_check(cub::DeviceReduce::Sum(nullptr, temp_bytes, input, out.data(), n, stream),
              label);
-  DeviceBuffer<unsigned char> temp(temp_bytes);
+  DeviceBuffer<unsigned char> temp("ale1d_sensor:reduce_sum:temp", temp_bytes);
   cuda_check(cub::DeviceReduce::Sum(temp.data(), temp_bytes, input, out.data(), n, stream),
              label);
   double host = 0.0;
@@ -437,11 +404,11 @@ double reduce_max(InputIt input,
   if (n <= 0) {
     return 0.0;
   }
-  DeviceBuffer<double> out(1);
+  DeviceBuffer<double> out("ale1d_sensor:reduce_max:out", 1);
   std::size_t temp_bytes = 0;
   cuda_check(cub::DeviceReduce::Max(nullptr, temp_bytes, input, out.data(), n, stream),
              label);
-  DeviceBuffer<unsigned char> temp(temp_bytes);
+  DeviceBuffer<unsigned char> temp("ale1d_sensor:reduce_max:temp", temp_bytes);
   cuda_check(cub::DeviceReduce::Max(temp.data(), temp_bytes, input, out.data(), n, stream),
              label);
   double host = 0.0;
@@ -460,11 +427,11 @@ cub::KeyValuePair<int, double> reduce_argmax(const double* values,
   if (n <= 0) {
     return host;
   }
-  DeviceBuffer<cub::KeyValuePair<int, double>> out(1);
+  DeviceBuffer<cub::KeyValuePair<int, double>> out("ale1d_sensor:reduce_argmax:out", 1);
   std::size_t temp_bytes = 0;
   cuda_check(cub::DeviceReduce::ArgMax(nullptr, temp_bytes, values, out.data(), n, stream),
              label);
-  DeviceBuffer<unsigned char> temp(temp_bytes);
+  DeviceBuffer<unsigned char> temp("ale1d_sensor:reduce_argmax:temp", temp_bytes);
   cuda_check(cub::DeviceReduce::ArgMax(temp.data(), temp_bytes, values, out.data(), n, stream),
              label);
   cuda_check(cudaMemcpyAsync(&host, out.data(), sizeof(host),
@@ -521,7 +488,7 @@ bool append_cell_feature(std::vector<Ale1dFeature>& features,
     return false;
   }
 
-  DeviceBuffer<int> bounds(2);
+  DeviceBuffer<int> bounds("ale1d_sensor:append_cell_feature:bounds", 2);
   const int init_bounds[2] = {-1, n};
   cuda_check(cudaMemcpyAsync(bounds.data(), init_bounds, sizeof(init_bounds),
                              cudaMemcpyHostToDevice, stream),
@@ -542,7 +509,7 @@ bool append_cell_feature(std::vector<Ale1dFeature>& features,
     return false;
   }
 
-  DeviceBuffer<double> stats_stage(static_cast<std::size_t>(n) * 5U);
+  DeviceBuffer<double> stats_stage("ale1d_sensor:append_cell_feature:stats_stage", static_cast<std::size_t>(n) * 5U);
   double* w_stage = stats_stage.data();
   double* wr_stage = w_stage + n;
   double* wr2_stage = wr_stage + n;
@@ -636,9 +603,9 @@ void append_interface_features(std::vector<Ale1dFeature>& features,
     return;
   }
 
-  DeviceBuffer<double> face_signal(static_cast<std::size_t>(n + 1));
-  DeviceBuffer<double> score(static_cast<std::size_t>(n + 1));
-  DeviceBuffer<int> selected(static_cast<std::size_t>(max_features));
+  DeviceBuffer<double> face_signal("ale1d_sensor:append_interface_features:face_signal", static_cast<std::size_t>(n + 1));
+  DeviceBuffer<double> score("ale1d_sensor:append_interface_features:score", static_cast<std::size_t>(n + 1));
+  DeviceBuffer<int> selected("ale1d_sensor:append_interface_features:selected", static_cast<std::size_t>(max_features));
   interface_signal_kernel<<<blocks_for(n + 1), kBlockSize, 0, stream>>>(
       state.volFrac.data(), face_signal.data(), n, n_mat);
   cuda_check(cudaGetLastError(), "ALE1D interface signal kernel launch failed");
@@ -773,11 +740,14 @@ std::vector<Ale1dFeature> compute_features(const core::State& state,
   TENRYU_ASSERT(state.vol.size() >= static_cast<std::size_t>(n),
                 "ALE1D sensors require cell volumes");
 
-  core::CellField1D mass_prefix;
+  // Pooled, zeroed work fields (ScratchCellField1D; they were CellField1D
+  // allocations per call).
+  core::ScratchCellField1D mass_prefix;
   double total_mass = 0.0;
   const double* mass_prefix_ptr = nullptr;
   if (state.mass.size() >= static_cast<std::size_t>(n)) {
-    mass_prefix.reset(static_cast<std::size_t>(n));
+    mass_prefix.reset("ale1d_sensor:compute_features:mass_prefix",
+                      static_cast<std::size_t>(n));
     thrust::exclusive_scan(thrust::cuda::par.on(stream),
                            state.mass.data(), state.mass.data() + n,
                            mass_prefix.data());
@@ -787,12 +757,12 @@ std::vector<Ale1dFeature> compute_features(const core::State& state,
     mass_prefix_ptr = mass_prefix.data();
   }
 
-  core::CellField1D signal;
-  core::CellField1D aux1;
-  core::CellField1D aux2;
-  signal.reset(static_cast<std::size_t>(n));
-  aux1.reset(static_cast<std::size_t>(n));
-  aux2.reset(static_cast<std::size_t>(n));
+  core::ScratchCellField1D signal;
+  core::ScratchCellField1D aux1;
+  core::ScratchCellField1D aux2;
+  signal.reset("ale1d_sensor:compute_features:signal", static_cast<std::size_t>(n));
+  aux1.reset("ale1d_sensor:compute_features:aux1", static_cast<std::size_t>(n));
+  aux2.reset("ale1d_sensor:compute_features:aux2", static_cast<std::size_t>(n));
 
   const int blocks = blocks_for(n);
   const auto& ale = cfg.numerics.ale1d;

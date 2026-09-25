@@ -49,6 +49,10 @@ struct ConductionResult {
   long long retry_total_stages = 0;
   int retry_n_sub = 0;
   double retry_dt_exp = 0.0;
+  // Per-material conduction (per_material_conservation) updates the material
+  // energies and derives ee, Te and Pe itself: the caller must not book the
+  // energy increment again or re-derive ee from Te.
+  bool energy_closed_by_solve = false;
 };
 
 struct ConductionDiagnostics {
