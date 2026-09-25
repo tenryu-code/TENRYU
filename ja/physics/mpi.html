@@ -116,7 +116,7 @@
       <ul>
         <li>ランク数の比較では P=1 を参照とし、デッキごとに T-bit、T-sum、T-noise のいずれかを割り当てる。T-bit はビット単位、T-sum は <code>Allreduce(SUM)</code> に由来する差を原則として場の最大値で規格化した \(10^{-8}\) で、T-noise は 2D のコーナー力の <code>atomicAdd</code> について自己較正した帯で判定する。</li>
         <li><code>parallel_halo_exchange_np2</code> と <code>parallel_halo_exchange_np4</code> は、セルと節点における所有側での上書きと、コーナーのゴーストを検査し、解析値および共有節点との機械精度での厳密な一致を要求する。</li>
-        <li><code>ctest --test-dir build -L mpi_gate --output-on-failure</code> は、1D の FLD/S<sub>N</sub>、<a href="../verification/index.html#gxii">GXII</a>、1D/2D の燃焼、2D の S<sub>N</sub>/FLD、LaserMesh を含む、現在 10 ケースの MPI 試験群を実行する。各ケースは、ビット単位・帯・包絡（envelope：文書化された非決定性をもつ指標に使う、参照実行アンサンブルから較正したデッキごとの最悪値の帯 — 検証ページの再現性凡例参照）のいずれか指定された段階で、P&gt;1 での所有領域の出力を P=1 と比較する。</li>
+        <li><code>ctest --test-dir build -L mpi_gate --output-on-failure</code> は、1D の FLD/S<sub>N</sub>、<a href="../verification/index.html#gxii">GXII</a>、1D/2D の燃焼、1D の電子（陰解法と STS）とイオンの熱伝導、2D の S<sub>N</sub>/FLD、LaserMesh を含む、現在 12 ケースの MPI 試験群を実行する。各ケースは、ビット単位・帯・包絡（envelope：文書化された非決定性をもつ指標に使う、参照実行アンサンブルから較正したデッキごとの最悪値の帯 — 検証ページの再現性凡例参照）のいずれか指定された段階で、P&gt;1 での所有領域の出力を P=1 と比較する。</li>
       </ul>
     </section>
     <div id="page-footer"></div>

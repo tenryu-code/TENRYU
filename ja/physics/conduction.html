@@ -75,7 +75,7 @@
       <p>面の κ は左右セルの状態から合成する必要があり、その合成規則を「閉包」と呼ぶ。実運用の既定は <code>kirchhoff_same_material</code> である。同一材料の滑らかな Spitzer 面に限って、\(T^{5/2}\) に強く非線形な κ(T) を両側の温度区間で厳密に積分した割線値（Kirchhoff 変換に基づく面平均）を使う。単純な両端評価では急峻な熱波面の前面で面 κ が過小になり、波面が格子に固着しがちだが、割線値はこの傾向を弱める。物質界面、ボイド、セルの伝導率から抽出した Spitzer 前置因子（\(\kappa_c/T_c^{5/2}\)）がテーブル由来で大きく跳ぶ箇所では調和平均の閉包へ戻す。従来の <code>harmonic</code> 閉包も引き続き選択でき、物質界面や伝導率の大きな跳びを保守的に扱う — 調和平均なので、片側の κ が 0 なら面の流束も 0 である。流束制限に使う SH の推定値と実際の流束は、必ず同じ面閉包を使う。</p>
       <p>1D の平面・円筒・球の演算子は保存型の有限体積で、幾何の違いは面積 \(A_f\) とセル体積 \(V_i\) にしか現れない。材料別モードでは、材料 \(m\) ごとに面の体積率 α<sub>f,m</sub>、温度、密度、\(\bar Z\)、lnΛ から制限済みの κ<sub>eff,f,m</sub> を作る。面で計算した熱流は、片側のセルに +、反対側のセルに − として同じ大きさで与えるため、セル・材料にわたる総和 Σ<sub>c,m</sub>E<sub>e,c,m</sub> は（温度下限による頭打ちが介入しないかぎり）厳密に保存される。STS の段数を決めるときは材料合成値 Σ<sub>m</sub>α<sub>f,m</sub>κ<sub>eff,f,m</sub> を使うが、更新自体は材料別のままである。</p>
       <p><code>cell_is_void</code> のセルでは κ<sub>eff</sub>=0 を強制する。これによりボイドの境界は熱を通さない断熱面になる。このマスクは性能の面でも必要である。下限密度しかもたないボイドのセルを通常の物質として評価すると、拡散率 κ/(ρc<sub>v</sub>) の分母が極端に小さいために巨大な拡散係数が生じ、それが安定限界 Δt<sub>exp</sub> を潰して STS を実質的に止めてしまうからである。SNB でも同じ扱いを徹底する。ボイドのセルは H<sub>g</sub>=0 の恒等行とし、隣接面の群拡散係数を 0 にして、群拡散がボイドを飛び越えて予熱を運ぶ経路を残さない。</p>
-      <p><code>ion_conduction=True</code> は、イオン熱伝導率 κ<sub>i</sub> を用いて同じ保存型拡散の機構をもう一度適用する。2D RZ では電子と同じ Kershaw の 9 点演算子を使う。典型的な ICF プラズマでは κ<sub>i</sub>≪κ<sub>e</sub> なので既定では無効だが、高密度の燃料コアでは明示的に有効化できる。</p>
+      <p><code>ion_conduction=True</code>（1D・2 温度のみ）は、電子の熱伝導の後に、Braginskii のイオン熱伝導率 κ<sub>i</sub>=3.906 n<sub>i</sub>T<sub>i</sub>τ<sub>i</sub>/m<sub>i</sub> でイオン温度を後退 Euler の三重対角系として 1 回解く。面の閉包は電子と同じ <code>face_kappa_policy</code>、面の流束はイオンの自由流束 n<sub>i</sub>T<sub>i</sub>(T<sub>i</sub>/m<sub>i</sub>)<sup>1/2</sup> の <code>ion_f_lim</code> 倍（既定 1）で制限する。動いた熱はイオンの内部エネルギーに記帳し、流体と同じ状態方程式の閉包で T<sub>i</sub> を閉じ直すので、エネルギーは丸め誤差まで保存される。Z=1 では κ<sub>i</sub> は κ<sub>e</sub> のおよそ 1/(25√A) と小さく既定では無効だが、衝撃波の収束直後の中心のように T<sub>i</sub>≫T<sub>e</sub> となる領域ではイオンが熱を運ぶ主体になる。2D ではまだ使えない（設定エラーになる）。</p>
     </section>
 
     <section aria-labelledby="sts">
@@ -182,7 +182,8 @@
         <tbody>
           <tr><th><code>conduction.enabled</code></th><td><code>True</code></td><td>電子熱伝導の演算子全体を有効化。</td></tr>
           <tr><th><code>f_lim</code></th><td>SH: <code>0.06</code><br>SNB: <code>0.5</code></td><td>外側で共通に掛ける調和型の流束上限。SNB での値は物理モデルではなく安全弁である。</td></tr>
-          <tr><th><code>ion_conduction</code></th><td><code>False</code></td><td>独立したイオン熱伝導の処理を追加。</td></tr>
+          <tr><th><code>ion_conduction</code></th><td><code>False</code></td><td>Braginskii のイオン熱伝導（1D・2 温度）を電子の後に解く。</td></tr>
+          <tr><th><code>ion_f_lim</code></th><td><code>1.0</code></td><td>イオン熱流束の上限（イオンの自由流束の倍数）。</td></tr>
           <tr><th><code>solver</code></th><td><code>"sts"</code></td><td>許容値は <code>"sts"</code>（既定の陽的チェビシェフ・スーパータイムステッピング）、<code>"implicit"</code>、<code>"hypre"</code> — 最後のものは hypre ライブラリの BoomerAMG 前処理 [6,7] を使い、任意の Hypre ビルド依存を要する。SNB は <code>"sts"</code> を要求する。</td></tr>
           <tr><th><code>face_kappa_policy</code></th><td><code>"kirchhoff_same_material"</code></td><td>実運用の既定である、同一材料での Kirchhoff 割線による面 κ。従来の <code>"harmonic"</code> 閉包も選べる。</td></tr>
           <tr><th><code>nonlocal_model</code></th><td><code>"none"</code></td><td><code>"none"</code> または 1D の <code>"snb"</code>。</td></tr>
