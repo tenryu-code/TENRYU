@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cfloat>
 #include <cmath>
 
 #include "core/macros.hpp"
@@ -28,6 +29,25 @@ TENRYU_HOST_DEVICE inline double conduction_solve_cv_e(const double state_cv_e,
   const double gamma = fmax(gamma_eff, kMinEffectiveGamma);
   const double A = fmax(A_eff, kMinEffectiveA);
   return (gamma > 1.0 && A > 0.0) ? (z * kEvToErg / (A * kProtonMass * (gamma - 1.0))) : 0.0;
+}
+
+// Ion heat capacity per unit mass [erg/(g eV)] of the ion conduction solve
+// (NUMERICS §4.6), by the rule of conduction_solve_cv_e: the EOS value when it
+// is finite and positive, otherwise the ideal-gas value e / (A m_p (gamma - 1)).
+// The energy booked after the solve uses this same value.
+TENRYU_HOST_DEVICE inline double conduction_solve_cv_i(const double state_cv_i,
+                                                       const double gamma_eff,
+                                                       const double A_eff) {
+  if (state_cv_i > 0.0 && state_cv_i <= DBL_MAX) {  // finite and positive
+    return state_cv_i;
+  }
+  constexpr double kEvToErg = 1.6022e-12;
+  constexpr double kProtonMass = 1.6726219e-24;
+  constexpr double kMinEffectiveA = 1.0e-12;
+  constexpr double kMinEffectiveGamma = 1.0 + 1.0e-12;
+  const double gamma = fmax(gamma_eff, kMinEffectiveGamma);
+  const double A = fmax(A_eff, kMinEffectiveA);
+  return (gamma > 1.0 && A > 0.0) ? (kEvToErg / (A * kProtonMass * (gamma - 1.0))) : 0.0;
 }
 
 // Ideal-gas closure of a 1D cell whose material has no EOS table, in the form

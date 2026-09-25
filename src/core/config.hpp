@@ -2049,7 +2049,12 @@ struct Config {
       // "donor": alpha from the outflow sum, each pair scaled by its donor's alpha —
       // guarantees Te_trial >= floor (Te-floor guarantee fix, docs/design/bug18_...20260712.md).
       std::string sts_floor_limiter = "net";
+      // Braginskii ion heat conduction (1D, 2T): an implicit solve of the ion
+      // temperature after the electron conduction, flux-limited to ion_f_lim
+      // times the ion free-streaming flux n_i T_i sqrt(T_i / m_i)
+      // (NUMERICS §4.6).
       bool ion_conduction = false;
+      double ion_f_lim = 1.0;
       double f_lim = 0.06;
       double mfp_limiter_C = 0.0;
       double sts_damping = 0.01;

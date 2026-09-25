@@ -1298,6 +1298,9 @@ struct State {
   std::vector<double> burn_Q_e_host;      // erg/cm^3/s
   std::vector<double> burn_Q_i_host;      // erg/cm^3/s
   std::vector<double> burn_eps_cum_host;  // erg/g cumulative specific burn heating
+  // Cumulative neutrons born in each cell (DD and DT neutron branches,
+  // absolute number; 1D burn stage only, empty otherwise).
+  std::vector<double> burn_neutron_cum_host;
   DeviceBuffer<double> burn_Ng;           // [6*G*n_cells] specific diffusion in-flight spectra Y_g [1/g]
   DeviceBuffer<double> burn_Ng_work;      // [6*G*n_cells] diffusion density view scratch [1/cm3]
   DeviceBuffer<double> burn_dep_e_dev;    // [n_cells] diffusion deposition scratch

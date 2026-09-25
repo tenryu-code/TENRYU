@@ -13,6 +13,21 @@
 #                            the 1D mc dispatch)
 #   TENRYU_PBURN1D_MAXSTEPS  max_steps (default 25)
 #   TENRYU_PBURN1D_OUTDIR    output directory
+#   TENRYU_PBURN1D_CONDUCTION  "off" (default), "implicit" or "sts": electron
+#                            conduction with that solver plus Braginskii ion
+#                            conduction (NUMERICS 4.6), on an electron
+#                            temperature that falls linearly from 5 keV at
+#                            r_min to 1 keV at r_max and an ion temperature of
+#                            half of it, so every face, the rank boundaries
+#                            included, carries a heat flux and the
+#                            electron-ion exchange runs. The implicit electron
+#                            solve and the ion solve gather the line from the
+#                            owners and run it on every rank, so the gate
+#                            stays bitwise: "implicit" checks the electron
+#                            solve's gather and whole-line coefficients,
+#                            "sts" the ion solve's own gather (with Te = Ti
+#                            the ion gather could be removed without the
+#                            gate noticing).
 
 import os
 
@@ -23,6 +38,9 @@ _MAX_STEPS = int(os.environ.get("TENRYU_PBURN1D_MAXSTEPS", "25"))
 _OUTDIR = os.environ.get(
     "TENRYU_PBURN1D_OUTDIR", "./output_parallel_burn_1d"
 )
+_CONDUCTION = os.environ.get("TENRYU_PBURN1D_CONDUCTION", "off")
+if _CONDUCTION not in ("off", "implicit", "sts"):
+    raise ValueError("TENRYU_PBURN1D_CONDUCTION must be 'off', 'implicit' or 'sts'")
 
 Main(
     name="parallel_burn_1d",
@@ -63,20 +81,32 @@ _R_HOT = 100.1
 
 
 def _te_init(r_cm):
+    if _CONDUCTION != "off":
+        return _T_HOT_EV + (_T_COLD_EV - _T_HOT_EV) * (r_cm - 100.0) / 0.6
     return _T_HOT_EV if r_cm < _R_HOT else _T_COLD_EV
+
+
+def _ti_init(r_cm):
+    if _CONDUCTION != "off":
+        return 0.5 * _te_init(r_cm)
+    return _te_init(r_cm)
 
 
 Geometry(
     volfrac=dict(DT=lambda r: 1.0),
     rho=lambda r: 1.0,
     Te=_te_init,
-    Ti=_te_init,
+    Ti=_ti_init,
     velocity=lambda r: 0.0,
     radiation_field="zero",
 )
 
 Numerics(
-    conduction=dict(enabled=False),
+    conduction=(
+        dict(enabled=True, solver=_CONDUCTION, ion_conduction=True)
+        if _CONDUCTION != "off"
+        else dict(enabled=False)
+    ),
     dt=dict(
         initial_s=2.0e-13,
         max_s=2.0e-13,

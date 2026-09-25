@@ -1261,7 +1261,11 @@ Config パース時に文字列→enum変換を行う。
 - `Hydro::Conduction`（`src/hydro/conduction.cuh`, `conduction.cu`,
   `conduction_snb_2d.cuh`, `conduction_snb_2d.cu`）
   - 電子熱伝導：Spitzer-Härm + flux limiter（NUMERICS §4）
-  - イオン伝導（オプション、既定OFF）
+  - イオン伝導（オプション、既定OFF、1D・2T、2026-09-26）：`ion_conduction_step_1d`
+    （`conduction.cu`）が電子の伝導と記帳の後に Braginskii の \(\kappa_i\) で後退 Euler の
+    三重対角系（電子の陰解法の組み立てカーネルを共用し、1 ブロックの並列巡回縮約で）を解き、
+    \(e_i\) に記帳してから `Hydro1D::close_eos` で閉じ直す（NUMERICS §4.6）。呼び出しは
+    Driver の伝導段（`run_conduction_phase`）の末尾
   - 1D_SPH：3点トリダイアゴナル離散化（NUMERICS §3.1.7）
   - 2D_RZ：Kershaw 9点ステンシル（NUMERICS Appendix A、§4.3）
   - SNB 非局所電子熱輸送（`nonlocal_model="snb"`、既定OFF）：2D_RZ port は
@@ -1362,6 +1366,14 @@ void conduction_step(
     cudaStream_t stream,
     HypreSolver* hypre = nullptr   // solver="hypre" 時のみ非null。Hypre未ビルド時は常にnullptr
 );
+
+// イオン熱伝導（1D・2T、ion_conduction=True のとき）— NUMERICS §4.6。電子の伝導と
+// その記帳の後に Driver が呼ぶ。e_i を記帳し、Hydro1D::close_eos で T_i, P_i を閉じ直す
+// ところまでを自身で行う（下の契約は電子側のみ）。
+IonConductionResult ion_conduction_step_1d(
+    State& state, double dt, const Config& cfg,
+    const PartitionInfo& part, cudaStream_t stream,
+    const HydroEOSContext* eos_ctx);
 ```
 
 **Post-conduction EOS sync 契約**：

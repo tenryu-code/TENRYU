@@ -204,7 +204,7 @@
       <p>SNB の既定値は、エネルギー群数 24、E<sub>max</sub>/(k<sub>B</sub>T<sub>e</sub>)=20、群 mfp 変種 <code>geometric_r2</code> (Sherlock 2017)、電場補正「なし」、Picard 反復上限 8、<code>rtol</code>=0.01 です。r=2 の較正には電場補正が織り込み済みなので、<code>local</code> と併用すると二重計上になります。</p>
 
       <ul>
-        <li><strong>イオン熱伝導:</strong> イオンの熱伝導を個別に ON/OFF します。</li>
+        <li><strong>イオン熱伝導:</strong> Braginskii のイオン熱伝導を電子の熱伝導の後に解きます（1D・2T のみ。2D や 1T ではフォームのエラー）。有効にすると、イオン熱流束の制限係数 <code>ion_f_lim</code>（既定 1 = イオンの自由流束）を設定できます。</li>
         <li><strong>流体:</strong> 有効化、外側境界 (<code>free</code> / <code>reflect</code> / <code>pressure</code>)、流体開始温度 <code>T_start</code> [eV] (セルの電子温度がこの値に達するまで流体計算をしない。0 = 常時有効) を設定します。</li>
         <li><strong>T_start 未満のセルの扱い:</strong> <code>passive_fill</code> (既定。圧力を持たず隣接セルに追従)、<code>rigid_wall</code> (剛体壁として体積とエネルギーを保持、1D 専用)、<code>cold_equilibrium</code> (1D 専用) から選びます。<code>cold_equilibrium</code> では流体計算を全セルで行い、電子温度が <code>T_start</code> 以下のときだけ EOS を補正して、各材料の参照状態を全圧 P<sub>0</sub>・体積弾性率 K<sub>0</sub> の力学平衡に置きます (<code>T_start</code> を超えると元の表に戻ります)。全材料の TMAT EOS と 2T が必要で、選ぶと電子・イオン交換の比熱が <code>table</code> になり、材料タブに参照状態の欄が現れます。遷移開始比・密度範囲・逆変換の反復上限は「詳細」で変えられます。</li>
         <li><strong>電子・イオン交換の比熱:</strong> <code>ideal_gas</code> (既定) または <code>table</code> (EOS 表の比熱、1D 専用)。</li>

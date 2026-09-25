@@ -58,6 +58,7 @@ void HydroEOSContext::initialize(const core::Config& cfg) {
   mie_gruneisen.resize(static_cast<std::size_t>(n_materials));
   hydro_backend_kind.assign(static_cast<std::size_t>(n_materials), 0u);
   rho_e_reclosure_supported.assign(static_cast<std::size_t>(n_materials), 0u);
+  rho_e_reclosure_backend.assign(static_cast<std::size_t>(n_materials), 0u);
 
   any_table = false;
   any_helmholtz_spline = false;
@@ -72,8 +73,10 @@ void HydroEOSContext::initialize(const core::Config& cfg) {
     }
     if (mat.eos_model == "ideal_gas") {
       rho_e_reclosure_supported[static_cast<std::size_t>(m)] = 1u;
+      rho_e_reclosure_backend[static_cast<std::size_t>(m)] = 1u;
     } else if (mat.eos_model == "tmat" && mat.hydro_eos_backend == "legacy" &&
                mat.eos_tables) {
+      rho_e_reclosure_backend[static_cast<std::size_t>(m)] = 1u;
       const bool supports =
           cfg.main.two_temperature
               ? (ion[static_cast<std::size_t>(m)].supports_rho_e_reclosure() &&
@@ -145,6 +148,7 @@ void HydroEOSContext::initialize(const core::Config& cfg) {
   {
     int n_nonvoid = 0;
     bool all_support = true;
+    bool all_backend = true;
     bool any_surrogate = false;
     any_nonvoid_overridable = false;
     for (int m = 0; m < n_materials; ++m) {
@@ -153,6 +157,7 @@ void HydroEOSContext::initialize(const core::Config& cfg) {
       }
       ++n_nonvoid;
       all_support = all_support && rho_e_reclosure_supported[static_cast<std::size_t>(m)] != 0u;
+      all_backend = all_backend && rho_e_reclosure_backend[static_cast<std::size_t>(m)] != 0u;
       const std::uint8_t kind = hydro_backend_kind[static_cast<std::size_t>(m)];
       any_surrogate = any_surrogate || kind == materials::kHydroBackendHelmholtzSpline ||
                       kind == materials::kHydroBackendHelmholtzJet ||
@@ -163,6 +168,7 @@ void HydroEOSContext::initialize(const core::Config& cfg) {
                                  kind != materials::kHydroBackendMieGruneisen);
     }
     all_nonvoid_support_rho_e_reclosure = n_nonvoid > 0 && all_support;
+    all_nonvoid_rho_e_reclosure_backend = n_nonvoid > 0 && all_backend;
     surrogates_per_material = cfg.main.dim == 1 && n_nonvoid > 1 && any_surrogate;
   }
   if (surrogates_per_material) {
@@ -232,6 +238,7 @@ void HydroEOSContext::destroy() {
   surrogates_per_material = false;
   any_nonvoid_overridable = false;
   all_nonvoid_support_rho_e_reclosure = false;
+  all_nonvoid_rho_e_reclosure_backend = false;
   if (d_total_views) {
     cudaFree(d_total_views);
     d_total_views = nullptr;
@@ -255,6 +262,7 @@ void HydroEOSContext::destroy() {
   mie_gruneisen.clear();
   hydro_backend_kind.clear();
   rho_e_reclosure_supported.clear();
+  rho_e_reclosure_backend.clear();
   n_materials = 0;
   any_table = false;
   any_helmholtz_spline = false;
@@ -277,6 +285,7 @@ HydroEOSContext::HydroEOSContext(HydroEOSContext&& o) noexcept
       mie_gruneisen(std::move(o.mie_gruneisen)),
       hydro_backend_kind(std::move(o.hydro_backend_kind)),
       rho_e_reclosure_supported(std::move(o.rho_e_reclosure_supported)),
+      rho_e_reclosure_backend(std::move(o.rho_e_reclosure_backend)),
       d_ion_views(o.d_ion_views),
       d_electron_views(o.d_electron_views),
       d_total_views(o.d_total_views),
@@ -289,6 +298,7 @@ HydroEOSContext::HydroEOSContext(HydroEOSContext&& o) noexcept
       surrogates_per_material(o.surrogates_per_material),
       any_nonvoid_overridable(o.any_nonvoid_overridable),
       all_nonvoid_support_rho_e_reclosure(o.all_nonvoid_support_rho_e_reclosure),
+      all_nonvoid_rho_e_reclosure_backend(o.all_nonvoid_rho_e_reclosure_backend),
       n_materials(o.n_materials),
       any_table(o.any_table),
       any_helmholtz_spline(o.any_helmholtz_spline),
@@ -305,6 +315,7 @@ HydroEOSContext::HydroEOSContext(HydroEOSContext&& o) noexcept
   o.surrogates_per_material = false;
   o.any_nonvoid_overridable = false;
   o.all_nonvoid_support_rho_e_reclosure = false;
+  o.all_nonvoid_rho_e_reclosure_backend = false;
   o.n_materials = 0;
   o.any_table = false;
   o.any_helmholtz_spline = false;
@@ -325,6 +336,7 @@ HydroEOSContext& HydroEOSContext::operator=(HydroEOSContext&& o) noexcept {
     mie_gruneisen = std::move(o.mie_gruneisen);
     hydro_backend_kind = std::move(o.hydro_backend_kind);
     rho_e_reclosure_supported = std::move(o.rho_e_reclosure_supported);
+    rho_e_reclosure_backend = std::move(o.rho_e_reclosure_backend);
     d_ion_views = o.d_ion_views;
     d_electron_views = o.d_electron_views;
     d_total_views = o.d_total_views;
@@ -337,6 +349,7 @@ HydroEOSContext& HydroEOSContext::operator=(HydroEOSContext&& o) noexcept {
     surrogates_per_material = o.surrogates_per_material;
     any_nonvoid_overridable = o.any_nonvoid_overridable;
     all_nonvoid_support_rho_e_reclosure = o.all_nonvoid_support_rho_e_reclosure;
+    all_nonvoid_rho_e_reclosure_backend = o.all_nonvoid_rho_e_reclosure_backend;
     n_materials = o.n_materials;
     any_table = o.any_table;
     any_helmholtz_spline = o.any_helmholtz_spline;
@@ -353,6 +366,7 @@ HydroEOSContext& HydroEOSContext::operator=(HydroEOSContext&& o) noexcept {
     o.surrogates_per_material = false;
     o.any_nonvoid_overridable = false;
     o.all_nonvoid_support_rho_e_reclosure = false;
+    o.all_nonvoid_rho_e_reclosure_backend = false;
     o.n_materials = 0;
     o.any_table = false;
     o.any_helmholtz_spline = false;

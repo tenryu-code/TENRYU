@@ -220,6 +220,9 @@ struct HydroTableViews {
   tenryu::materials::CellEOSTableSelector cell_tables{};
   std::uint8_t hydro_backend_kind = 0u;
   bool supports_rho_e_reclosure = false;
+  // Every non-void material's backend closes T from (rho, e) (ideal gas or a
+  // legacy TMAT table), non-decreasing table energies or not.
+  bool rho_e_reclosure_backend = false;
   // Per-material hydro surrogate views (HydroEOSContext::
   // surrogates_per_material; null otherwise).
   CellHydroSurrogates surrogates{};
@@ -287,6 +290,7 @@ inline HydroTableViews select_hydro_table_views(const HydroEOSContext* eos_ctx) 
   // Compatible energy needs the rho-e inverse re-closure in every non-void
   // material (it used to check the first material alone).
   views.supports_rho_e_reclosure = eos_ctx->all_nonvoid_support_rho_e_reclosure;
+  views.rho_e_reclosure_backend = eos_ctx->all_nonvoid_rho_e_reclosure_backend;
   if (views.hydro_backend_kind == 1u) {
     views.spline_total = eos_ctx->total_helmholtz_view(0);
   } else if (views.hydro_backend_kind == 2u) {
@@ -334,6 +338,24 @@ void ensure_table_cv_fields(core::State& state,
   }
 }
 
+// The compatible energy update keeps its energies through the closure that
+// follows it: every non-void material must close T from (rho, e). With the
+// legacy closure, which writes the table energy of the closed temperature
+// back, the table energies must also be non-decreasing in T in every density
+// row (the written energy is then the one the update produced). The
+// energy-authoritative closure never writes the energy back, so a row that
+// decreases somewhere (the ion tables of the NIF DS materials between 2 and
+// 20 K near solid density) leaves the conserved energies as they are and only
+// has the closure choose among its temperatures, as the non-compatible update
+// does with the same tables.
+bool compatible_energy_eos_supported(const core::Config& cfg, const HydroTableViews& views) {
+  if (!hydro_has_table_eos_backend_data(views) || views.supports_rho_e_reclosure) {
+    return true;
+  }
+  return cfg.numerics.hydro.eos_closure_mode == "energy_authoritative" &&
+         views.rho_e_reclosure_backend;
+}
+
 void validate_compatible_energy_eos_support(const core::Config& cfg,
                                             const HydroTableViews& views) {
   if (!cfg.numerics.hydro.compatible_energy) {
@@ -353,12 +375,12 @@ void validate_compatible_energy_eos_support(const core::Config& cfg,
         "Numerics.hydro.compatible_energy=True with TMAT legacy EOS requires an "
         "initialized HydroEOSContext with uploaded TMAT tables");
   }
-  const bool eos_supported =
-      !hydro_has_table_eos_backend_data(views) || views.supports_rho_e_reclosure;
-  if (!eos_supported) {
+  if (!compatible_energy_eos_supported(cfg, views)) {
     throw core::namelist::ConfigError(
         "Numerics.hydro.compatible_energy=True requires an EOS backend with "
-        "rho-e inverse reclosure support (ideal_gas or TMAT legacy table)");
+        "rho-e inverse reclosure support (ideal_gas or TMAT legacy table; with "
+        "Numerics.hydro.eos_closure_mode=\"legacy\" the table energies must also be "
+        "non-decreasing in temperature in every density row)");
   }
 }
 
@@ -2215,7 +2237,7 @@ __global__ void energy_update_with_old_volume_2t_kernel(
       ti_floor, energy_authoritative, apply_exchange, E_floor_injected);
 }
 
-template <int GEOM>
+template <int GEOM, bool kColdEquilibrium>
 __global__ void compatible_energy_update_1d_kernel(
     double* __restrict__ ee,
     double* __restrict__ ei,
@@ -2241,7 +2263,12 @@ __global__ void compatible_energy_update_1d_kernel(
     double* __restrict__ E_floor_injected,
     int* __restrict__ clamp_count,
     double* __restrict__ residual_sums,
-    const std::uint8_t* __restrict__ signed_energy_cell) {
+    const std::uint8_t* __restrict__ signed_energy_cell,
+    const double* __restrict__ rho_new,
+    const double* __restrict__ vol_old,
+    const double rho_floor,
+    const tenryu::materials::DeviceEOSTableView tab_ele_first,
+    const tenryu::materials::CellEOSTableSelector cell_tables) {
   const int c = c_begin + blockIdx.x * blockDim.x + threadIdx.x;
   if (c >= c_end) {
     return;
@@ -2291,7 +2318,48 @@ __global__ void compatible_energy_update_1d_kernel(
   const double dE = dE_pq + dE_oe;
 
   const double m = mass[c];
-  if (m > 0.0) {
+  // Cold-equilibrium cells (NUMERICS §1 (b)): the electron force pressure is
+  // P~_e = P_e^N - w C'(v), and the stored electron variable is the heat
+  // coordinate q_e = e~_e - C(v). The electron pressure does the work
+  // -P~_e dV_c on the cell (dV_c the volume change of the face velocities),
+  // the rest of the pressure work goes to the species that takes it, and q_e
+  // gives back the cold energy change C(v^{n+1}) - C(v^n) the density change
+  // put into e~_e: total energy (kinetic + e_i + q_e + C) is conserved to
+  // rounding. The shares are signed (P~_e < 0 in tension); cells without a cold
+  // branch keep the fraction split below.
+  // Instantiated with kColdEquilibrium only for cold-equilibrium runs, so the
+  // other runs keep this kernel's code as it was.
+  bool cold_updated = false;
+  if constexpr (kColdEquilibrium) {
+    const tenryu::materials::DeviceEOSTableView tab_e_cold =
+        (use_two_temp != 0) ? cell_tables.electron(c, tab_ele_first)
+                            : tenryu::materials::DeviceEOSTableView{};
+    if (m > 0.0 && use_two_temp != 0 && tenryu::materials::cold_enabled(tab_e_cold.cold)) {
+      const double dV_c = dt * (A_R * ubar_R - A_L * ubar_L);
+      double de_e = 0.0;
+      double de_i = 0.0;
+      if (q_heat_to_electron != 0) {
+        de_i = -Pi_half[c] * dV_c / m;
+        de_e = dE_pq / m - de_i;
+        de_e += dE_oe / m;
+      } else {
+        de_e = -Pe_half[c] * dV_c / m;
+        de_i = dE_pq / m - de_e;
+        de_i += dE_oe / m;
+      }
+      // The densities of the closures that produced e_cold at the start and at
+      // the end of the step (compute_density_kernel_body, then fmax(rho, 1e-30)).
+      const double floor_rho = fmax(rho_floor, 0.0);
+      const double rho_old =
+          fmax((vol_old[c] > 0.0) ? (m / vol_old[c]) : 0.0, floor_rho);
+      const double C_old = tenryu::materials::cold_reference(tab_e_cold.cold, fmax(rho_old, 1.0e-30)).C;
+      const double C_new = tenryu::materials::cold_reference(tab_e_cold.cold, fmax(rho_new[c], 1.0e-30)).C;
+      ee[c] = ee[c] + (de_e - (C_new - C_old));
+      ei[c] = ei[c] + de_i;
+      cold_updated = true;
+    }
+  }
+  if (!cold_updated && m > 0.0) {
     if (use_two_temp != 0) {
       const double p_raw = fmax(fabs(p), 1.0e-30);
       // The AV share Q goes to the species Numerics.hydro.av_heat_to names.
@@ -4253,7 +4321,9 @@ void run_compatible_energy_update_1d(
     const int subtract_outer_ghost,
     double* E_floor_injected,
     int* clamp_count,
-    const std::uint8_t* signed_energy_cell) {
+    const std::uint8_t* signed_energy_cell,
+    const double* vol_old,
+    const HydroTableViews& eos_views) {
   if (n_cells <= 0) {
     return;
   }
@@ -4282,33 +4352,39 @@ void run_compatible_energy_update_1d(
   const int q_heat_to_electron =
       (cfg.numerics.hydro.av_heat_to == "electron") ? 1 : 0;
   const int geom_code = state.mesh.geometry_code;
+  // Cold-equilibrium runs take the kernel instance with the cold branch
+  // (NUMERICS §1 (b)); every other run keeps the instance without it.
+  const bool cold_equilibrium =
+      cfg.numerics.hydro.T_start_inactive_cells == "cold_equilibrium";
+  const tenryu::materials::CellEOSTableSelector cell_tables = cell_table_selector(eos_views, state);
+  const auto launch = [&](auto geom, auto cold) {
+    constexpr int kGeom = decltype(geom)::value;
+    constexpr bool kCold = decltype(cold)::value;
+    compatible_energy_update_1d_kernel<kGeom, kCold><<<cw.blocks(), 256>>>(
+        state.ee.data(), state.ei.data(), v_old, v_new, pq_half, Pe_half, Pi_half,
+        Q_half, node_r_half, odd_even_pair_force_half, p_extra_half, state.mass.data(),
+        d_cell_is_void, cw.begin, cw.end, n_cells, dt,
+        cfg.main.two_temperature ? 1 : 0, q_heat_to_electron,
+        ghost_pq_half, subtract_outer_ghost,
+        E_floor_injected, clamp_count, d_residual_cells, signed_energy_cell,
+        state.rho.data(), vol_old, cfg.numerics.floors.rho, eos_views.tab_ele, cell_tables);
+  };
+  const auto launch_geom = [&](auto geom) {
+    if (cold_equilibrium) {
+      launch(geom, std::true_type{});
+    } else {
+      launch(geom, std::false_type{});
+    }
+  };
   switch (geom_code) {
     case 1:
-      compatible_energy_update_1d_kernel<1><<<cw.blocks(), 256>>>(
-          state.ee.data(), state.ei.data(), v_old, v_new, pq_half, Pe_half, Pi_half,
-          Q_half, node_r_half, odd_even_pair_force_half, p_extra_half, state.mass.data(),
-          d_cell_is_void, cw.begin, cw.end, n_cells, dt,
-          cfg.main.two_temperature ? 1 : 0, q_heat_to_electron,
-          ghost_pq_half, subtract_outer_ghost,
-          E_floor_injected, clamp_count, d_residual_cells, signed_energy_cell);
+      launch_geom(std::integral_constant<int, 1>{});
       break;
     case 2:
-      compatible_energy_update_1d_kernel<2><<<cw.blocks(), 256>>>(
-          state.ee.data(), state.ei.data(), v_old, v_new, pq_half, Pe_half, Pi_half,
-          Q_half, node_r_half, odd_even_pair_force_half, p_extra_half, state.mass.data(),
-          d_cell_is_void, cw.begin, cw.end, n_cells, dt,
-          cfg.main.two_temperature ? 1 : 0, q_heat_to_electron,
-          ghost_pq_half, subtract_outer_ghost,
-          E_floor_injected, clamp_count, d_residual_cells, signed_energy_cell);
+      launch_geom(std::integral_constant<int, 2>{});
       break;
     default:
-      compatible_energy_update_1d_kernel<0><<<cw.blocks(), 256>>>(
-          state.ee.data(), state.ei.data(), v_old, v_new, pq_half, Pe_half, Pi_half,
-          Q_half, node_r_half, odd_even_pair_force_half, p_extra_half, state.mass.data(),
-          d_cell_is_void, cw.begin, cw.end, n_cells, dt,
-          cfg.main.two_temperature ? 1 : 0, q_heat_to_electron,
-          ghost_pq_half, subtract_outer_ghost,
-          E_floor_injected, clamp_count, d_residual_cells, signed_energy_cell);
+      launch_geom(std::integral_constant<int, 0>{});
       break;
   }
   sync_kernel("Hydro1D: compatible energy update kernel failed");
@@ -4680,6 +4756,20 @@ void Hydro1D::close_eos_and_sound_speed(core::State& state,
   state.cs = std::move(cs_n);
 }
 
+void Hydro1D::close_eos(core::State& state,
+                        const core::Config& cfg,
+                        const HydroEOSContext* eos_ctx) const {
+  if (state.rho.empty()) {
+    return;
+  }
+  const HydroTableViews eos_views = select_hydro_table_views(eos_ctx);
+  ensure_table_cv_fields(state, eos_views,
+                         cfg.numerics.hydro.compatible_energy ||
+                             !cfg.main.two_temperature ||
+                             cfg.numerics.hydro.qei_heat_capacity == "table");
+  enforce_eos_closure(state, cfg, cfg.main.two_temperature, eos_views);
+}
+
 tenryu::coupling::HydroStepResult Hydro1D::lagrangian_step(
     core::State& state,
     const double dt,
@@ -4810,13 +4900,12 @@ tenryu::coupling::HydroStepResult Hydro1D::lagrangian_step(
                          compatible_energy_requested || !cfg.main.two_temperature ||
                              cfg.numerics.hydro.qei_heat_capacity == "table");
   validate_compatible_energy_eos_support(cfg, eos_views);
-  const bool compatible_energy_eos_supported =
-      !hydro_has_table_eos_backend_data(eos_views) || eos_views.supports_rho_e_reclosure;
+  const bool compatible_energy_eos_ok = compatible_energy_eos_supported(cfg, eos_views);
   const bool has_incompatible_velocity_damping_forces =
       cfg.numerics.hydro.post_shock_velocity_damping_C > 0.0 ||
       adaptive_av_has_cpsv;
   const bool run_compatible_energy =
-      compatible_energy_requested && compatible_energy_eos_supported &&
+      compatible_energy_requested && compatible_energy_eos_ok &&
       !has_incompatible_velocity_damping_forces;
   const int legacy_volume_compatible_energy = 0;
   if (compatible_energy_requested && state.step == 0) {
@@ -6074,7 +6163,7 @@ tenryu::coupling::HydroStepResult Hydro1D::lagrangian_step(
         pq_extra_ptr,
         n_cells, ghost_pq_half,
         (bc == HydroBoundaryType::FREE || bc == HydroBoundaryType::PRESSURE) ? 1 : 0,
-        d_floor_cells, d_hydro_clamp_count, d_signed_energy_cell);
+        d_floor_cells, d_hydro_clamp_count, d_signed_energy_cell, V_old.data(), eos_views);
     if (const char* h1dbgw = std::getenv("TENRYU_H1D_DEBUG")) {
       // Diagnostic-only (§6o.4l audit lane): ee right after the compatible
       // energy update, sequence-numbered like the rest of the H1D dumps.

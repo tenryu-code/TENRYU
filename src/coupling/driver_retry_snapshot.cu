@@ -459,6 +459,7 @@ void capture_driver_retry_snapshot(DriverRetrySnapshot& snap,
   snap.burn_Q_e_host = state.burn_Q_e_host;
   snap.burn_Q_i_host = state.burn_Q_i_host;
   snap.burn_eps_cum_host = state.burn_eps_cum_host;
+  snap.burn_neutron_cum_host = state.burn_neutron_cum_host;
   snap.E_burn_released = state.E_burn_released;
   snap.E_burn_dep_e = state.E_burn_dep_e;
   snap.E_burn_dep_i = state.E_burn_dep_i;
@@ -758,6 +759,7 @@ void restore_driver_retry_snapshot(tenryu::core::State& state,
   state.burn_Q_e_host = snap.burn_Q_e_host;
   state.burn_Q_i_host = snap.burn_Q_i_host;
   state.burn_eps_cum_host = snap.burn_eps_cum_host;
+  state.burn_neutron_cum_host = snap.burn_neutron_cum_host;
   state.E_burn_released = snap.E_burn_released;
   state.E_burn_dep_e = snap.E_burn_dep_e;
   state.E_burn_dep_i = snap.E_burn_dep_i;

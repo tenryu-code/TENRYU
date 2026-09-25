@@ -11485,7 +11485,8 @@ void Builder::set_numerics(py::dict kwargs) {
     const py::dict conduction = py::reinterpret_borrow<py::dict>(conduction_obj);
     enforce_known_keys(conduction, "Numerics.conduction",
                        {"enabled", "allow_single_material_approximation",
-                        "solver", "sts_floor_limiter", "ion_conduction", "f_lim",
+                        "solver", "sts_floor_limiter", "ion_conduction",
+                        "ion_f_lim", "f_lim",
                         "mfp_limiter_C", "spitzer_z_correction", "sts_damping",
                         "sts_max_stages", "sts_subcycle_eta",
                         "sts_total_stages_max", "halo_strategy", "hypre_rtol",
@@ -11511,6 +11512,10 @@ void Builder::set_numerics(py::dict kwargs) {
     if (has_key(conduction, "ion_conduction")) {
       numerics.conduction.ion_conduction =
           strict_bool(conduction["ion_conduction"], "Numerics.conduction.ion_conduction");
+    }
+    if (has_key(conduction, "ion_f_lim")) {
+      numerics.conduction.ion_f_lim =
+          numeric_as_double(conduction["ion_f_lim"], "Numerics.conduction.ion_f_lim");
     }
     if (has_key(conduction, "f_lim")) {
       numerics.conduction.f_lim =
@@ -15406,9 +15411,6 @@ void Builder::validate() {
     if (numerics.hydro.pressure_tension_cutoff) {
       throw ConfigError("Numerics.hydro.T_start_inactive_cells=\"cold_equilibrium\" is incompatible with Numerics.hydro.pressure_tension_cutoff=True");
     }
-    if (numerics.hydro.compatible_energy) {
-      throw ConfigError("Numerics.hydro.T_start_inactive_cells=\"cold_equilibrium\" is not available with compatible_energy=True (phase 1)");
-    }
     if (numerics.persistent_loop.enabled) {
       throw ConfigError("Numerics.hydro.T_start_inactive_cells=\"cold_equilibrium\" is not available with the persistent loop (phase 1)");
     }
@@ -15490,6 +15492,41 @@ void Builder::validate() {
     }
     if (!(numerics.conduction.snb_picard_rtol > 0.0)) {
       throw ConfigError("Numerics.conduction.snb_picard_rtol must be > 0");
+    }
+  }
+  if (!(std::isfinite(numerics.conduction.ion_f_lim) &&
+        numerics.conduction.ion_f_lim > 0.0)) {
+    throw ConfigError("Numerics.conduction.ion_f_lim must be finite and > 0");
+  }
+  if (numerics.conduction.ion_conduction && numerics.conduction.enabled) {
+    // The ion solve runs on the 1D line after the electron conduction and
+    // books the ion energy; its temperature is closed by the 1D hydro
+    // closure (NUMERICS §4.6).
+    if (!is_dimension_1d(main.dimension)) {
+      throw ConfigError(
+          "Numerics.conduction.ion_conduction=True is implemented for 1D only"
+          " (Main.dimension=\"1D_SPH\"; planar/cylindrical/spherical via"
+          " Mesh.geometry_1d)");
+    }
+    if (!main.two_temperature) {
+      throw ConfigError(
+          "Numerics.conduction.ion_conduction=True requires"
+          " Main.temperature_model=\"2T\"");
+    }
+    if (numerics.materials.per_material_conservation_enabled) {
+      throw ConfigError(
+          "Numerics.conduction.ion_conduction=True does not support"
+          " Numerics.materials.per_material_conservation_enabled=True (the ion"
+          " solve books the cell ion energy, not the material energies)");
+    }
+    for (const auto& mat : materials.materials) {
+      if (!mat.is_void && mat.hydro_eos_backend == "mie_gruneisen") {
+        throw ConfigError(
+            "Numerics.conduction.ion_conduction=True does not support"
+            " eos.hydro_backend=\"mie_gruneisen\" (material '" + mat.name +
+            "': that closure does not define the ion temperature from the ion"
+            " energy)");
+      }
     }
   }
   if ((is_dimension_1d(main.dimension) || main.dimension == "2D_RZ") &&

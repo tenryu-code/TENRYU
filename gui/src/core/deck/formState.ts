@@ -277,6 +277,8 @@ export interface FormState {
     enabled: boolean;
     fLim: number;
     ionConduction: boolean;
+    /** Numerics.conduction.ion_f_lim (emitted only with ion conduction on). */
+    ionFLim: number;
     nonlocalModel: "none" | "snb";
     snbNGroups: number;
     snbEMaxOverTe: number;
@@ -574,6 +576,7 @@ export function defaultFormState(): FormState {
       enabled: true,
       fLim: 0.06,
       ionConduction: false,
+      ionFLim: 1.0,
       nonlocalModel: "none",
       snbNGroups: 24,
       snbEMaxOverTe: 20.0,
@@ -1313,6 +1316,13 @@ export function validateFormState(f: FormState): string[] {
       errs.push(v.snbPicardItersInt);
     }
     if (!(cn.snbPicardRtol > 0)) errs.push(v.snbPicardRtolPositive);
+  }
+  // Mirrors the solver's validation (SPECIFICATION 6.4.7): the ion solve is
+  // 1D and two-temperature only; it runs only with conduction enabled.
+  if (cn.enabled && cn.ionConduction) {
+    if (f.main.dimension !== "1D_SPH") errs.push(v.ionCond1dOnly);
+    if (f.main.temperatureModel !== "2T") errs.push(v.ionCondNeeds2T);
+    if (!(Number.isFinite(cn.ionFLim) && cn.ionFLim > 0)) errs.push(v.ionFLimPositive);
   }
   if (
     f.laser.rayOutputTrajectory &&

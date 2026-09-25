@@ -19,13 +19,17 @@
 #include <cuda_runtime.h>
 #include <cusparse.h>
 
+#include "core/device_block_primitives.cuh"
 #include "core/device_pack.hpp"
 #include "core/device_scratch.hpp"
 #include "core/error.hpp"
+#include "core/launch_shape.hpp"
 #include "core/kernel_guard.hpp"
+#include "hydro/braginskii_viscosity_device.cuh"
 #include "hydro/conduction_bodies.cuh"
 #include "hydro/conduction_snb_1d.cuh"
 #include "hydro/eos_context.hpp"
+#include "hydro/hydro_1d.hpp"
 #include "hydro/evacuated_cell_shadow.hpp"
 #include "hydro/kershaw_boundary.cuh"
 #include "hydro/kershaw_geometry.cuh"
@@ -272,6 +276,49 @@ void conduction_replicate_void_host(std::vector<std::uint8_t>& host_field,
   (void)n_cells;
   (void)part;
 #endif
+}
+
+// Every rank runs the 1D implicit solves (electron and ion) on the whole line,
+// like the 1D radiation solves: the matter lines are re-globalized from their
+// owners first, so the solve does not depend on the rank count. The radiation
+// stage's gather leaves them owner-true when it has just run; without it (a run
+// without radiation) the other ranks' cells would be stale copies. The same
+// fields as the radiation stage's gather; the per-cell void flags are set at
+// initialization for the whole line and do not change.
+void conduction_replicate_1d_matter_lines(core::State& state, const core::Config& cfg,
+                                          const parallel::PartitionInfo& part) {
+  const int n_cells = static_cast<int>(state.rho.size());
+  if (part.n_ranks <= 1 || n_cells <= 0) {
+    return;
+  }
+  const std::size_t n = static_cast<std::size_t>(n_cells);
+  parallel::Reduction red(part.n_ranks);
+  const auto cell_line = [&](core::CellField1D& field) {
+    if (field.size() == n) {
+      conduction_replicate_line(field.data(), n_cells, 1, false, part, red);
+    }
+  };
+  cell_line(state.rho);
+  cell_line(state.Te);
+  cell_line(state.Ti);
+  cell_line(state.vol);
+  cell_line(state.mass);
+  cell_line(state.ee);
+  cell_line(state.ei);
+  cell_line(state.zbar);
+  cell_line(state.cv_e);
+  cell_line(state.cv_i);
+  if (state.x_r.size() == n + 1) {
+    conduction_replicate_line(state.x_r.data(), n_cells, 1, true, part, red);
+  }
+  if (!state.volFrac.empty()) {
+    TENRYU_ASSERT(state.volFrac.size() % n == 0,
+                  "Conduction volFrac gather: size not a multiple of n_cells");
+    conduction_replicate_line(state.volFrac.data(), n_cells,
+                              static_cast<int>(state.volFrac.size() / n), false, part, red);
+    state.invalidate_cell_material_props();
+    state.ensure_cell_material_props(cfg);
+  }
 }
 
 }  // namespace
@@ -3257,12 +3304,16 @@ ConductionDiagnostics compute_per_material_2d_operator(
 // Coefficient kernels of the single-closure (not per-material) conduction
 // operator: fills d_diffusion and d_rho_cv_e and the atomic min/max pack
 // d_diag3 = (min dt ratio, min D_eff, max D_eff), which must hold
-// {inf, inf, 0} on entry (init_conduction_diag3_kernel).
+// {inf, inf, 0} on entry (init_conduction_diag3_kernel). By default only the
+// owned cells and one ghost cell on each interior side are filled (the STS
+// stencil); full_line fills every cell of the 1D line, for the implicit solve
+// that every rank runs on the whole line (the same window as the serial run).
 void launch_conduction_coefficients(const core::State& state,
                                     const core::Config& cfg,
                                     double* d_diffusion,
                                     double* d_rho_cv_e,
-                                    double* d_diag3) {
+                                    double* d_diag3,
+                                    const bool full_line = false) {
   const int n_cells = static_cast<int>(state.rho.size());
   double* d_A_eff = nullptr;
   double* d_gamma_eff = nullptr;
@@ -3302,7 +3353,14 @@ void launch_conduction_coefficients(const core::State& state,
   double* d_min_deff = d_diag3 + 1;
   double* d_max_deff = d_diag3 + 2;
 
-  const core::State::LaunchWindow cw = state.owned_cell_window_ghost(n_cells, 1);  // alpha/deff: ghost-extended (interface faces; min/max atomics idempotent)
+  const core::State::LaunchWindow cw =
+      full_line ? core::State::LaunchWindow{0, n_cells}
+                : state.owned_cell_window_ghost(n_cells, 1);  // alpha/deff: ghost-extended (interface faces; min/max atomics idempotent)
+  // One warp per block for the per-cell FP64 work (Coulomb logarithm, T^{5/2},
+  // Kirchhoff secants) on the few hundred cells of a 1D line
+  // (core::serial_cell_block_size); each thread computes the same values
+  // whatever the block size, and the min/max atomics are exact.
+  const int serial_block = core::serial_cell_block_size(cw.count());
   const double* state_cv_e = state.cv_e.empty() ? nullptr : state.cv_e.data();
   const std::uint8_t* evacuated_cell_mask =
       state.evacuated_cells.d_inactive_member_mask.size() ==
@@ -3347,7 +3405,7 @@ void launch_conduction_coefficients(const core::State& state,
     const double* zmom_r2 =
         state.zmom_active ? state.zmom_r2.data() : nullptr;
     if (zmom_r2 != nullptr) {
-      compute_spitzer_deff_1d_kernel<true><<<cw.blocks(), kBlockSize>>>(
+      compute_spitzer_deff_1d_kernel<true><<<cw.blocks(serial_block), serial_block>>>(
           d_diffusion,
           d_rho_cv_e,
           d_min_ratio,
@@ -3370,7 +3428,7 @@ void launch_conduction_coefficients(const core::State& state,
           state_cv_e,
           zmom_r2);
     } else {
-      compute_spitzer_deff_1d_kernel<false><<<cw.blocks(), kBlockSize>>>(
+      compute_spitzer_deff_1d_kernel<false><<<cw.blocks(serial_block), serial_block>>>(
           d_diffusion,
           d_rho_cv_e,
           d_min_ratio,
@@ -3455,7 +3513,7 @@ void launch_conduction_coefficients(const core::State& state,
                                      : state.mesh.geometry_code;
     auto launch_dt_ratio = [&](auto geom_tag) {
       constexpr int GEOM = decltype(geom_tag)::value;
-      kirchhoff_dt_ratio_1d_kernel<GEOM><<<cw.blocks(), kBlockSize>>>(
+      kirchhoff_dt_ratio_1d_kernel<GEOM><<<cw.blocks(serial_block), serial_block>>>(
           d_min_ratio,
           d_diffusion,
           d_rho_cv_e,
@@ -3863,6 +3921,11 @@ ConductionResult conduction_step_1d_implicit(core::State& state,
   }
   TENRYU_ASSERT(conduction_1d_implicit_supported(state, &part),
                 "Conduction implicit 1D solver requires serial 1D_SPH execution");
+  conduction_replicate_1d_matter_lines(state, cfg, part);
+  // One warp per block for the per-cell and per-face FP64 work of the solve
+  // (Kirchhoff secants, limiter factors) on a 1D line
+  // (core::serial_cell_block_size); the values do not depend on it.
+  const int serial_block = core::serial_cell_block_size(n_cells);
 
   double* d_kappa_eff = nullptr;
   double* d_rho_cv_e = nullptr;
@@ -3924,7 +3987,8 @@ ConductionResult conduction_step_1d_implicit(core::State& state,
 
   init_implicit_conduction_pack_kernel<<<1, 1>>>(d_pack);
   cuda_check(cudaGetLastError(), "Conduction: implicit pack init launch failed");
-  launch_conduction_coefficients(state, cfg, d_kappa_eff, d_rho_cv_e, d_diag3);
+  launch_conduction_coefficients(state, cfg, d_kappa_eff, d_rho_cv_e, d_diag3,
+                                 /*full_line=*/true);
   implicit_conduction_proceed_kernel<<<1, 1>>>(d_diag3, cfg.numerics.dt.cfl_cond,
                                                d_pack + 5);
   cuda_check(cudaGetLastError(), "Conduction: implicit proceed flag launch failed");
@@ -3978,8 +4042,8 @@ ConductionResult conduction_step_1d_implicit(core::State& state,
     const bool limiter_face_kirchhoff =
         (limiter_policy == "kirchhoff_same_material" &&
          cfg.numerics.conduction.test_kappa <= 0.0);
-    const int face_blocks = (n_cells - 1 + kBlockSize - 1) / kBlockSize;
-    compute_1d_flux_limiter_faces_kernel<<<face_blocks, kBlockSize>>>(
+    const int face_blocks = (n_cells - 1 + serial_block - 1) / serial_block;
+    compute_1d_flux_limiter_faces_kernel<<<face_blocks, serial_block>>>(
         d_flux_limiter_faces,
         state.Te.data(),
         d_kappa_eff,
@@ -4001,7 +4065,7 @@ ConductionResult conduction_step_1d_implicit(core::State& state,
                           cudaMemcpyDeviceToDevice),
                "Conduction: implicit single-cell Te copy failed");
   } else {
-    const int blocks = (n_cells + kBlockSize - 1) / kBlockSize;
+    const int blocks = (n_cells + serial_block - 1) / serial_block;
     // W-G2: test_planar is the historic planar alias (verify-only, spherical
     // meshes); otherwise Mesh.geometry_1d drives via geometry_code.
     const int geom_code = cfg.numerics.conduction.test_planar
@@ -4019,7 +4083,7 @@ ConductionResult conduction_step_1d_implicit(core::State& state,
          cfg.numerics.conduction.test_kappa <= 0.0);
     auto launch_build = [&](auto geom_tag) {
       constexpr int GEOM = decltype(geom_tag)::value;
-      build_1d_implicit_system_kernel<GEOM><<<blocks, kBlockSize>>>(
+      build_1d_implicit_system_kernel<GEOM><<<blocks, serial_block>>>(
           d_lower,
           d_diag,
           d_upper,
@@ -4036,7 +4100,7 @@ ConductionResult conduction_step_1d_implicit(core::State& state,
     };
     auto launch_build_kirchhoff = [&](auto geom_tag) {
       constexpr int GEOM = decltype(geom_tag)::value;
-      build_1d_implicit_system_kirchhoff_kernel<GEOM><<<blocks, kBlockSize>>>(
+      build_1d_implicit_system_kirchhoff_kernel<GEOM><<<blocks, serial_block>>>(
           d_lower,
           d_diag,
           d_upper,
@@ -4189,7 +4253,7 @@ ConductionResult conduction_step_1d_implicit(core::State& state,
     }
   }
 
-  const int blocks = (n_cells + kBlockSize - 1) / kBlockSize;
+  const int blocks = (n_cells + serial_block - 1) / serial_block;
   // W-G2: test_planar is the historic planar alias (verify-only, spherical
   // meshes); otherwise Mesh.geometry_1d drives via geometry_code.
   const int geom_code = cfg.numerics.conduction.test_planar
@@ -4197,7 +4261,7 @@ ConductionResult conduction_step_1d_implicit(core::State& state,
                             : state.mesh.geometry_code;
   auto launch_clamp = [&](auto geom_tag) {
     constexpr int GEOM = decltype(geom_tag)::value;
-    clamp_1d_conduction_solution_kernel<GEOM><<<blocks, kBlockSize>>>(
+    clamp_1d_conduction_solution_kernel<GEOM><<<blocks, serial_block>>>(
         d_rhs,
         d_rho_cv_e,
         d_cell_is_void,
@@ -4223,7 +4287,7 @@ ConductionResult conduction_step_1d_implicit(core::State& state,
   cuda_check(cudaGetLastError(), "Conduction: implicit floor clamp launch failed");
   cuda_check(core::debug_kernel_sync(), "Conduction: implicit floor clamp failed");
 
-  copy_if_proceed_kernel<<<blocks, kBlockSize>>>(state.Te.data(), d_rhs, n_cells, d_proceed);
+  copy_if_proceed_kernel<<<blocks, serial_block>>>(state.Te.data(), d_rhs, n_cells, d_proceed);
   cuda_check(cudaGetLastError(), "Conduction: implicit Te copy-back launch failed");
   core::deterministic_sum(d_e_floor_cells, n_cells, d_e_floor, false);
 
@@ -5919,6 +5983,231 @@ double compute_dt_cond_from_dt_exp(const double dt_exp, const int sts_max_stages
   return factor * dt_exp;
 }
 
+// ---- Braginskii ion heat conduction (1D; NUMERICS §4.6) --------------------
+
+// Unmagnetized Braginskii ion heat conductivity kappa_i = 3.906 n_i T_i tau_i
+// / m_i (temperatures in erg), written per eV of temperature gradient
+// [erg/(s cm eV)] like the electron Spitzer conductivity. The collision time
+// and the Coulomb logarithm are those of the ion viscosity
+// (braginskii_viscosity_device.cuh braginskii_eta_poise, no mean-free-path
+// cap: the face flux limiter plays that role here): A and Z floored at 1,
+//   tau_i = kTauI0 sqrt(A) T^{3/2} / (n_i Z^4 lnLambda_ii),
+//   lnLambda_ii = max(2, 23 - ln(Z^3 sqrt(2 n_i) / T^{3/2})).
+constexpr double kBraginskiiIonKappaCoeff = 3.906;
+
+__device__ inline double braginskii_ion_kappa(const double rho,
+                                              const double Ti_eV,
+                                              const double A_eff,
+                                              const double zbar) {
+  const double T = sanitize_te_for_pow(Ti_eV);
+  const double A = fmax(A_eff, 1.0);
+  const double Z = fmax(zbar, 1.0);
+  const double n_i = fmax(rho, 0.0) / (A * kProtonMass);
+  if (!(T > 0.0) || !(n_i > 0.0) || !isfinite(n_i)) {
+    return 0.0;
+  }
+  const double t32 = T * sqrt(T);
+  const double ln_lambda =
+      fmax(2.0, 23.0 - log(Z * Z * Z * sqrt(2.0 * n_i) / t32));
+  const double z4 = (Z * Z) * (Z * Z);
+  const double tau_i = braginskii::kTauI0 * sqrt(A) * t32 / (n_i * z4 * ln_lambda);
+  const double kappa = kBraginskiiIonKappaCoeff * n_i * (kEvToErg * T) * tau_i /
+                       (A * kProtonMass) * kEvToErg;
+  return isfinite(kappa) ? kappa : 0.0;
+}
+
+// Ion free-streaming heat flux n_i T_i v_i with v_i = sqrt(T_i / m_i), the
+// form of the electron q_max_formula with the ion mass [erg/(cm^2 s)].
+__device__ inline double ion_free_streaming_flux(const double n_i,
+                                                 const double Ti_eV,
+                                                 const double A) {
+  const double T = sanitize_te_for_pow(Ti_eV);
+  if (!(n_i > 0.0) || !(T > 0.0) || !(A > 0.0)) {
+    return 0.0;
+  }
+  const double q = n_i * kEvToErg * T * sqrt(kEvToErg * T / (A * kProtonMass));
+  return isfinite(q) ? q : 0.0;
+}
+
+// Cell coefficients of the ion solve: the conductivity (zero in void cells)
+// and rho * cv with the heat capacity per unit mass of conduction_solve_cv_i.
+__global__ void ion_conduction_coefficients_kernel(
+    double* __restrict__ kappa_i,
+    double* __restrict__ rho_cv_i,
+    const double* __restrict__ rho,
+    const double* __restrict__ Ti,
+    const double* __restrict__ zbar,
+    const double* __restrict__ A_eff,
+    const double* __restrict__ gamma_eff,
+    const double* __restrict__ state_cv_i,
+    const std::uint8_t* __restrict__ cell_is_void,
+    const int n_cells) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n_cells) {
+    return;
+  }
+  rho_cv_i[i] = fmax(rho[i], 0.0) *
+                conduction_solve_cv_i(state_cv_i != nullptr ? state_cv_i[i] : 0.0,
+                                      gamma_eff[i], A_eff[i]);
+  if (cell_is_void != nullptr && cell_is_void[i] != static_cast<std::uint8_t>(0)) {
+    kappa_i[i] = 0.0;
+    return;
+  }
+  kappa_i[i] = braginskii_ion_kappa(rho[i], Ti[i], A_eff[i], zbar[i]);
+}
+
+// Face flux-limiter factors 1 / (1 + |q_SH| / q_max) of the ion solve, the
+// form of the electron limiter (compute_1d_flux_limiter_faces_kernel_body):
+// q_SH from the face conductivity of the consuming assembly kernel,
+// q_max = f_lim times the ion free-streaming flux of the face means (arithmetic
+// rho and T, harmonic A).
+__global__ void ion_conduction_limiter_faces_kernel(
+    double* __restrict__ limiter_faces,
+    const double* __restrict__ Ti,
+    const double* __restrict__ kappa_i,
+    const double* __restrict__ rho,
+    const double* __restrict__ A_eff,
+    const double* __restrict__ x_r,
+    const int n_cells,
+    const double f_lim,
+    const bool kirchhoff_face) {
+  const int face = blockIdx.x * blockDim.x + threadIdx.x;
+  if (face + 1 >= n_cells) {
+    return;
+  }
+  const int iL = face;
+  const int iR = face + 1;
+  const double k_face =
+      kirchhoff_face
+          ? kirchhoff_face_kappa_spitzer(kappa_i[iL], kappa_i[iR], Ti[iL], Ti[iR])
+          : harmonic_mean(kappa_i[iL], kappa_i[iR]);
+  const double dr = cell_center_radius(x_r, iR) - cell_center_radius(x_r, iL);
+  double q_sh = 0.0;
+  if (k_face > 0.0 && dr > 0.0) {
+    q_sh = k_face * (Ti[iR] - Ti[iL]) / dr;
+  }
+  double limiter = 1.0;
+  if (k_face > 0.0) {
+    const double t_face =
+        0.5 * (sanitize_te_for_pow(Ti[iL]) + sanitize_te_for_pow(Ti[iR]));
+    const double rho_face = 0.5 * (fmax(rho[iL], 0.0) + fmax(rho[iR], 0.0));
+    const double A_L = fmax(A_eff[iL], 1.0);
+    const double A_R = fmax(A_eff[iR], 1.0);
+    const double A_face = (A_L == A_R) ? A_L : harmonic_mean(A_L, A_R);
+    const double n_i_face = rho_face / (A_face * kProtonMass);
+    const double q_max = f_lim * ion_free_streaming_flux(n_i_face, t_face, A_face);
+    limiter = (q_max > 0.0) ? 1.0 / (1.0 + fabs(q_sh) / q_max) : 0.0;
+  }
+  if (!isfinite(limiter)) {
+    limiter = 0.0;
+  }
+  limiter_faces[face] = fmin(1.0, fmax(limiter, 0.0));
+}
+
+// Books the heat the ion solve moved in flux form: each face carries
+// G_{f} = w_f (T_{f+1} - T_f) of the solved temperatures, with w_f = -upper[f]
+// of the assembled system, and cell i gains dt (G_{i+1/2} - G_{i-1/2}) in
+// e_i (per unit mass rho_i V_i, the volume of the assembly). Each face flux is
+// defined once, so the booked energies sum to zero up to rounding whatever
+// the residual of the tridiagonal solve (a stiff system solves to a relative
+// residual ~1e-9 in energy; the temperature-difference booking
+// cv (T_new - T_old) carried it). T_i is set to the solution until the EOS
+// closure that follows derives it from the booked energy. audit_cells[0, n)
+// holds the energy gained by each cell [erg], audit_cells[n, 2n) its absolute
+// value.
+template <int GEOM>
+__global__ void ion_conduction_book_energy_kernel(
+    double* __restrict__ ei,
+    double* __restrict__ Ti,
+    double* __restrict__ audit_cells,
+    const double* __restrict__ Ti_new,
+    const double* __restrict__ face_upper,
+    const double* __restrict__ rho,
+    const std::uint8_t* __restrict__ cell_is_void,
+    const double* __restrict__ vol,
+    const double* __restrict__ x_r,
+    const int n_cells,
+    const double dt) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n_cells) {
+    return;
+  }
+  audit_cells[i] = 0.0;
+  audit_cells[n_cells + i] = 0.0;
+  if (cell_is_void != nullptr && cell_is_void[i] != static_cast<std::uint8_t>(0)) {
+    return;
+  }
+  const double T_i = Ti_new[i];
+  double G_right = 0.0;
+  if (i + 1 < n_cells) {
+    G_right = -face_upper[i] * (Ti_new[i + 1] - T_i);
+  }
+  double G_left = 0.0;
+  if (i > 0) {
+    G_left = -face_upper[i - 1] * (T_i - Ti_new[i - 1]);
+  }
+  const double dE = dt * (G_right - G_left);
+  double V;
+  if constexpr (GEOM == 2) {
+    V = fmax(x_r[i + 1] - x_r[i], 1.0e-30);
+  } else {
+    V = fmax(vol[i], 1.0e-30);
+  }
+  const double m = fmax(rho[i], 0.0) * V;
+  if (!(m > 0.0) || !isfinite(dE) || !isfinite(T_i)) {
+    return;
+  }
+  ei[i] += dE / m;
+  Ti[i] = T_i;
+  audit_cells[i] = dE;
+  audit_cells[n_cells + i] = fabs(dE);
+}
+
+// The ion system (one tridiagonal system over the cells) by parallel cyclic
+// reduction in one block (core::pcr_solve_strided), with the round buffers in
+// the global slab work (4 n doubles): every coupled row has M/dt > 0 on its
+// diagonal besides the off-diagonal weights (identity rows elsewhere), so the
+// matrix is strictly diagonally dominant and the reduction needs no pivoting.
+// The coefficient arrays serve as round buffers; the solution overwrites rhs.
+__global__ void ion_conduction_pcr_solve_kernel(double* __restrict__ lower,
+                                                double* __restrict__ diag,
+                                                double* __restrict__ upper,
+                                                double* __restrict__ rhs,
+                                                double* __restrict__ work,
+                                                const int n) {
+  core::pcr_solve_strided<false>(lower, diag, upper, rhs, work, work + n, work + 2 * n,
+                                 work + 3 * n, n, n, 1, static_cast<int>(threadIdx.x),
+                                 static_cast<int>(blockDim.x));
+}
+
+// Threads of ion_conduction_pcr_solve_kernel: one per row in whole warps, at
+// most 1024 and at most the kernel's own limit (larger systems take several
+// rows per thread; the rows' arithmetic does not depend on the thread).
+int ion_conduction_pcr_threads(const int n) {
+  static const int max_threads = [] {
+    cudaFuncAttributes attributes{};
+    if (cudaFuncGetAttributes(&attributes, ion_conduction_pcr_solve_kernel) != cudaSuccess) {
+      (void)cudaGetLastError();
+      return 256;
+    }
+    return std::max(32, (attributes.maxThreadsPerBlock / 32) * 32);
+  }();
+  const int rows = std::max(n, 1);
+  return std::min(std::min(1024, max_threads), ((rows + 31) / 32) * 32);
+}
+
+// Per-call conservation audit of the ion solve (the booked energies summed on
+// the device and read back, a warning when the net exceeds 1e-10 of the moved
+// energy): TENRYU_ION_CONDUCTION_AUDIT=1. The flux-form booking conserves by
+// construction, so production runs skip the sums and the read-back.
+bool ion_conduction_audit_enabled() {
+  static const bool enabled = [] {
+    const char* raw = std::getenv("TENRYU_ION_CONDUCTION_AUDIT");
+    return raw != nullptr && raw[0] == '1';
+  }();
+  return enabled;
+}
+
 }  // namespace
 
 namespace conduction {
@@ -6291,6 +6580,151 @@ ConductionResult conduction_step(core::State& state,
     return conduction_step_2d_sts(state, dt, cfg, part, bufs, stream, eos_ctx);
   }
 
+  return result;
+}
+
+IonConductionResult ion_conduction_step_1d(core::State& state,
+                                           const double dt,
+                                           const core::Config& cfg,
+                                           const parallel::PartitionInfo& part,
+                                           cudaStream_t stream,
+                                           const HydroEOSContext* eos_ctx) {
+  IonConductionResult result;
+  if (!cfg.numerics.conduction.enabled || !cfg.numerics.conduction.ion_conduction ||
+      !(dt > 0.0)) {
+    return result;
+  }
+  const core::NvtxRange nvtx_range("conduction.ion_solve");
+  TENRYU_ASSERT(state.mesh.dim == 1, "Ion conduction is implemented for 1D meshes");
+  TENRYU_ASSERT(cfg.main.two_temperature,
+                "Ion conduction requires the two-temperature model");
+  const int n_cells = static_cast<int>(state.rho.size());
+  if (n_cells < 2) {
+    return result;
+  }
+  const std::size_t n = static_cast<std::size_t>(n_cells);
+  TENRYU_ASSERT(state.Ti.size() == n && state.ei.size() == n && state.zbar.size() == n &&
+                    state.vol.size() == n && state.cell_is_void.size() == n,
+                "Ion conduction: cell field sizes differ from the cell count");
+  TENRYU_ASSERT(state.x_r.size() == n + 1,
+                "Ion conduction: node count must be cell count + 1");
+  TENRYU_ASSERT(state.cv_i.empty() || state.cv_i.size() == n,
+                "Ion conduction: cv_i size differs from the cell count");
+
+  // Every rank solves the whole line from the owners' values.
+  conduction_replicate_1d_matter_lines(state, cfg, part);
+  state.ensure_cell_material_props(cfg);
+  TENRYU_ASSERT(state.A_eff.size() == n && state.gamma_eff.size() == n,
+                "Ion conduction needs the per-cell A_eff and gamma_eff");
+
+  const std::uint8_t* d_cell_is_void = conduction_device_cell_is_void(state);
+  const auto acquire = [](const char* tag, const std::size_t count) {
+    return static_cast<double*>(core::device_scratch_acquire(tag, count * sizeof(double)));
+  };
+  double* d_kappa = acquire("conduction:ion_conduction_1d:kappa", n);
+  double* d_rho_cv = acquire("conduction:ion_conduction_1d:rho_cv", n);
+  double* d_limiter = acquire("conduction:ion_conduction_1d:limiter_faces", n);
+  double* d_lower = acquire("conduction:ion_conduction_1d:lower", n);
+  double* d_diag = acquire("conduction:ion_conduction_1d:diag", n);
+  double* d_upper = acquire("conduction:ion_conduction_1d:upper", n);
+  double* d_face_upper = acquire("conduction:ion_conduction_1d:face_upper", n);
+  double* d_rhs = acquire("conduction:ion_conduction_1d:rhs", n);
+  double* d_audit_cells = acquire("conduction:ion_conduction_1d:audit_cells", 2 * n);
+  double* d_audit = acquire("conduction:ion_conduction_1d:audit", 2);
+
+  // One warp per block for the per-cell FP64 work (core::serial_cell_block_size).
+  const int serial_block = core::serial_cell_block_size(n_cells);
+  const int blocks = (n_cells + serial_block - 1) / serial_block;
+  ion_conduction_coefficients_kernel<<<blocks, serial_block>>>(
+      d_kappa, d_rho_cv, state.rho.data(), state.Ti.data(), state.zbar.data(),
+      state.A_eff.data(), state.gamma_eff.data(),
+      state.cv_i.empty() ? nullptr : state.cv_i.data(), d_cell_is_void, n_cells);
+  cuda_check(cudaGetLastError(), "Ion conduction: coefficient launch failed");
+
+  // The face conductivity closure of the electron solve (the environment
+  // bridge first, then Numerics.conduction.face_kappa_policy): the Kirchhoff
+  // secant of the T^{5/2} law applies to kappa_i as well.
+  const char* face_policy_env = std::getenv("TENRYU_CONDUCTION_FACE_KAPPA_POLICY");
+  const std::string face_policy = (face_policy_env != nullptr)
+                                      ? std::string(face_policy_env)
+                                      : cfg.numerics.conduction.face_kappa_policy;
+  const bool kirchhoff_face = (face_policy == "kirchhoff_same_material");
+  const int face_blocks = (n_cells - 1 + serial_block - 1) / serial_block;
+  ion_conduction_limiter_faces_kernel<<<face_blocks, serial_block>>>(
+      d_limiter, state.Ti.data(), d_kappa, state.rho.data(), state.A_eff.data(),
+      state.x_r.data(), n_cells, cfg.numerics.conduction.ion_f_lim, kirchhoff_face);
+  cuda_check(cudaGetLastError(), "Ion conduction: limiter launch failed");
+
+  const int geom_code =
+      cfg.numerics.conduction.test_planar ? 2 : state.mesh.geometry_code;
+  const auto dispatch_geom = [&](auto&& launch) {
+    switch (geom_code) {
+      case 1:
+        launch(std::integral_constant<int, 1>{});
+        break;
+      case 2:
+        launch(std::integral_constant<int, 2>{});
+        break;
+      default:
+        launch(std::integral_constant<int, 0>{});
+        break;
+    }
+  };
+  dispatch_geom([&](auto geom_tag) {
+    constexpr int GEOM = decltype(geom_tag)::value;
+    if (kirchhoff_face) {
+      build_1d_implicit_system_kirchhoff_kernel<GEOM><<<blocks, serial_block>>>(
+          d_lower, d_diag, d_upper, d_rhs, state.Ti.data(), d_kappa, d_limiter, d_rho_cv,
+          d_cell_is_void, state.vol.data(), state.x_r.data(), n_cells, dt);
+    } else {
+      build_1d_implicit_system_kernel<GEOM><<<blocks, serial_block>>>(
+          d_lower, d_diag, d_upper, d_rhs, state.Ti.data(), d_kappa, d_limiter, d_rho_cv,
+          d_cell_is_void, state.vol.data(), state.x_r.data(), n_cells, dt);
+    }
+  });
+  cuda_check(cudaGetLastError(), "Ion conduction: assembly launch failed");
+  // The face weights of the assembly (w = -upper) for the flux-form booking,
+  // kept apart from the solver's arrays.
+  cuda_check(cudaMemcpyAsync(d_face_upper, d_upper, n * sizeof(double),
+                             cudaMemcpyDeviceToDevice, stream),
+             "Ion conduction: face weight copy failed");
+  cuda_check(core::debug_kernel_sync(), "Ion conduction: assembly failed");
+
+  double* d_pcr_work = acquire("conduction:ion_conduction_1d:pcr_work", 4 * n);
+  ion_conduction_pcr_solve_kernel<<<1, ion_conduction_pcr_threads(n_cells)>>>(
+      d_lower, d_diag, d_upper, d_rhs, d_pcr_work, n_cells);
+  cuda_check(cudaGetLastError(), "Ion conduction: tridiagonal solve launch failed");
+
+  dispatch_geom([&](auto geom_tag) {
+    constexpr int GEOM = decltype(geom_tag)::value;
+    ion_conduction_book_energy_kernel<GEOM><<<blocks, serial_block>>>(
+        state.ei.data(), state.Ti.data(), d_audit_cells, d_rhs, d_face_upper,
+        state.rho.data(), d_cell_is_void, state.vol.data(), state.x_r.data(), n_cells,
+        dt);
+  });
+  cuda_check(cudaGetLastError(), "Ion conduction: energy booking launch failed");
+  if (ion_conduction_audit_enabled()) {
+    core::deterministic_sum(d_audit_cells, n_cells, d_audit + 0, false);
+    core::deterministic_sum(d_audit_cells + n, n_cells, d_audit + 1, false);
+    double h_audit[2] = {0.0, 0.0};
+    cuda_check(cudaMemcpy(h_audit, d_audit, sizeof(h_audit), cudaMemcpyDeviceToHost),
+               "Ion conduction: audit readback failed");
+    result.audited = true;
+    result.energy_moved_net = h_audit[0];
+    result.energy_moved_abs = h_audit[1];
+    if (std::fabs(h_audit[0]) > 1.0e-10 * h_audit[1]) {
+      core::log_warning("Ion conduction: the solve moved a net energy of " +
+                        std::to_string(h_audit[0]) + " erg against " +
+                        std::to_string(h_audit[1]) + " erg in absolute value");
+    }
+  }
+
+  // Temperatures and pressures from the booked energies, by the closure the
+  // Lagrangian step runs at its entry, so that the operators before the next
+  // hydro step (burn, the electron-ion exchange of the next thermal substep,
+  // output) see a state on the EOS surface.
+  Hydro1D{}.close_eos(state, cfg, eos_ctx);
+  result.applied = true;
   return result;
 }
 

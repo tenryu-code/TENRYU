@@ -6939,6 +6939,9 @@ void Driver::run(core::State& state,
     if (state.burn_eps_cum_host.empty()) {
       state.burn_eps_cum_host.assign(n_cells, 0.0);
     }
+    if (state.mesh.dim == 1 && state.burn_neutron_cum_host.empty()) {
+      state.burn_neutron_cum_host.assign(n_cells, 0.0);
+    }
   }
   // v1 MPI decomposition is r-slab only (docs/design/mpi_m18_20_20260717.md
   // §3): the flat cell index is r-major, so r-slab ownership is a contiguous
@@ -7257,6 +7260,9 @@ void Driver::run(core::State& state,
     }
     if (state.burn_eps_cum_host.empty()) {
       state.burn_eps_cum_host.assign(n_cells, 0.0);
+    }
+    if (state.mesh.dim == 1 && state.burn_neutron_cum_host.empty()) {
+      state.burn_neutron_cum_host.assign(n_cells, 0.0);
     }
     if (cfg.burn.scheme == "diffusion" && !state.burn_Ng.empty()) {
       const std::size_t expected_burn_Ng_size =
@@ -8567,8 +8573,15 @@ void Driver::run(core::State& state,
                        cfg.radiation.mode == core::RadiationMode::MultigroupDiffusion &&
                        !rad_gamma::gamma_r_43_enabled_from_env()),
                   "conservative_advection requires 1D Lagrangian FLD and no gamma override");
-    core::CellField1D rad_advection_vol_before;
-    if (rad_cell_advection_on) rad_advection_vol_before.reset(state.rho.size());
+    // The old cell volumes of the FLD cell advection, copied in full from
+    // state.vol before every use: a pooled buffer, so the step does not
+    // allocate and free device memory (a CellField1D declared here did both
+    // every step, and the free synchronized the device).
+    core::ScratchCellField1D rad_advection_vol_before;
+    if (rad_cell_advection_on) {
+      rad_advection_vol_before.reset_for_overwrite(
+          "driver:rad_advection_vol_before", state.rho.size());
+    }
     core::CellField1D rad_gamma43_vol_before;
     core::CellField1D rad_gamma43_p_r;
     core::CellField1D rad_gamma43_W_r;
@@ -10403,6 +10416,23 @@ void Driver::run(core::State& state,
                 << " sync_dU=" << (cond_ebal_U2 - cond_ebal_U1);
         core::log_info(cond_os.str());
       }
+      if (is_1d && cfg.numerics.conduction.ion_conduction) {
+        // Braginskii ion heat conduction after the electron conduction and
+        // its energy booking (NUMERICS §4.6): the ion energy is booked and the
+        // EOS closure re-derives T_i and P_i; the phase's energy record below
+        // covers both species.
+        const hydro::IonConductionResult ion_conduction_result =
+            hydro::ion_conduction_step_1d(state, dt_op, cfg, part_info,
+                                          cond_stream, &eos_ctx);
+        if (ion_conduction_result.audited) {
+          std::ostringstream ion_os;
+          ion_os << std::scientific << std::setprecision(6)
+                 << "[ion_conduction] t=" << t_op << " dt=" << dt_op
+                 << " moved_abs=" << ion_conduction_result.energy_moved_abs
+                 << " moved_net=" << ion_conduction_result.energy_moved_net;
+          core::log_debug(ion_os.str());
+        }
+      }
       if (cfg.numerics.hydro.enabled && is_2d &&
           cfg.numerics.hydro.boundary_2d.has_any_state_supply()) {
         emit_radial_fourier_audit(
@@ -10854,6 +10884,19 @@ void Driver::run(core::State& state,
       bp.neutron_heating_n_mu = cfg.burn.neutron_heating_n_mu;
       std::vector<double> dE_e;
       std::vector<double> dE_i;
+      // Neutrons born in each cell this step, added to the cumulative
+      // per-cell count (the birth distribution of the neutron yield; the
+      // specific heating burn_eps_cum follows where the charged products
+      // deposit instead).
+      std::vector<double> neutron_births;
+      const auto accumulate_burn_neutron_births = [&]() {
+        if (state.burn_neutron_cum_host.size() != neutron_births.size()) {
+          return;
+        }
+        for (std::size_t c = 0; c < neutron_births.size(); ++c) {
+          state.burn_neutron_cum_host[c] += neutron_births[c];
+        }
+      };
       const auto store_burn_neutron_diagnostics =
           [&](const burn::BurnStageResult& r) {
             if (r.w_dt > 0.0) {
@@ -10892,8 +10935,10 @@ void Driver::run(core::State& state,
                                        state.burn_rate_host,
                                        state.burn_Q_e_host,
                                        state.burn_Q_i_host,
-                                       &S_birth);
+                                       &S_birth,
+                                       &neutron_births);
         store_burn_neutron_diagnostics(r);
+        accumulate_burn_neutron_births();
         std::vector<double> nh_dE_e;
         std::vector<double> nh_dE_i;
         if (cfg.burn.neutron_heating) {
@@ -11115,8 +11160,10 @@ void Driver::run(core::State& state,
                                        state.burn_rate_host,
                                        state.burn_Q_e_host,
                                        state.burn_Q_i_host,
-                                       &S_birth);
+                                       &S_birth,
+                                       &neutron_births);
         store_burn_neutron_diagnostics(r);
+        accumulate_burn_neutron_births();
         std::vector<double> nh_dE_e;
         std::vector<double> nh_dE_i;
         if (cfg.burn.neutron_heating) {
@@ -11302,8 +11349,11 @@ void Driver::run(core::State& state,
                                        dE_i,
                                        state.burn_rate_host,
                                        state.burn_Q_e_host,
-                                       state.burn_Q_i_host);
+                                       state.burn_Q_i_host,
+                                       nullptr,
+                                       &neutron_births);
         store_burn_neutron_diagnostics(r);
+        accumulate_burn_neutron_births();
         for (int c = 0; c < n_cells; ++c) {
           const double denom = rho_h[c] * vol_h[c];
           if (denom > 1.0e-30) {

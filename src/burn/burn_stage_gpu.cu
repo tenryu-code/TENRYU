@@ -97,6 +97,7 @@ struct PackedLayout {
   std::size_t Qi_diag = 0U;
   std::size_t S_birth = 0U;
   std::size_t nh_emit = 0U;
+  std::size_t neutron_births = 0U;
   std::size_t result = 0U;
   std::size_t rho = 0U;
   std::size_t Ti_eV = 0U;
@@ -130,7 +131,8 @@ struct PackedLayout {
 
   PackedLayout(const std::size_t n, const bool have_birth,
                const bool have_neutron, const bool have_velocity,
-               const bool have_range_medium, const std::size_t n_mu) {
+               const bool have_range_medium, const std::size_t n_mu,
+               const bool have_neutron_births) {
     burn_y = take<double>(n * static_cast<std::size_t>(kNumSpecies));
     dE_e = take<double>(n);
     dE_i = take<double>(n);
@@ -143,6 +145,9 @@ struct PackedLayout {
     if (have_neutron) {
       nh_emit = take<double>(
           n * static_cast<std::size_t>(kNumNeutronLines));
+    }
+    if (have_neutron_births) {
+      neutron_births = take<double>(n);
     }
     result = take<ResultPacket>(1U);
     output_bytes = bytes;
@@ -305,7 +310,8 @@ __global__ void burn_stage_main_1d_kernel(
     double* __restrict__ dE_i, double* __restrict__ rate_diag,
     double* __restrict__ Qe_diag, double* __restrict__ Qi_diag,
     double* __restrict__ S_birth, double* __restrict__ nh_emit,
-    CellTallies* __restrict__ cell_tallies) {
+    CellTallies* __restrict__ cell_tallies,
+    double* __restrict__ neutron_births) {
   const int c = first + blockIdx.x * blockDim.x + threadIdx.x;
   if (c > last || c >= n_cells) {
     return;
@@ -412,6 +418,9 @@ __global__ void burn_stage_main_1d_kernel(
       tallies.n_neutrons_dt += n_reactions;
     } else if (k == kDDn) {
       tallies.n_neutrons_dd += n_reactions;
+    }
+    if (neutron_births != nullptr && (k == kDT || k == kDDn)) {
+      neutron_births[c] += n_reactions;
     }
     if (p.neutron_heating && E_rel_neutron > 0.0) {
       const int line = (k == kDT) ? 0 : 1;
@@ -783,9 +792,14 @@ BurnStageResult compute_burn_step_1d_device_stage(
     std::vector<double>& dE_i, std::vector<double>& rate_diag,
     std::vector<double>& Qe_diag, std::vector<double>& Qi_diag,
     std::vector<double>* S_birth, std::vector<double>& nh_emit,
-    double& dt_limit_subcycle, unsigned int& screening_warning_flags) {
+    double& dt_limit_subcycle, unsigned int& screening_warning_flags,
+    std::vector<double>* neutron_births) {
   const int n_cells = in.n_cells;
   const std::size_t n = static_cast<std::size_t>(n_cells);
+  const bool have_neutron_births = neutron_births != nullptr;
+  if (have_neutron_births) {
+    neutron_births->assign(n, 0.0);
+  }
   dE_e.assign(n, 0.0);
   dE_i.assign(n, 0.0);
   rate_diag.assign(n, 0.0);
@@ -863,7 +877,7 @@ BurnStageResult compute_burn_step_1d_device_stage(
   const bool have_range_medium =
       p.scheme == 0 && in.range_fe != nullptr && in.range_fi != nullptr;
   const PackedLayout layout(n, have_birth, have_neutron, in.v_r != nullptr,
-                            have_range_medium, packed_n_mu);
+                            have_range_medium, packed_n_mu, have_neutron_births);
   std::vector<unsigned char> host_pack(layout.bytes, 0U);
   unsigned char* const host_base = host_pack.data();
   pack_doubles(host_base, layout.burn_y, burn_y.data(),
@@ -914,6 +928,9 @@ BurnStageResult compute_burn_step_1d_device_stage(
       have_birth ? packed_ptr<double>(device_base, layout.S_birth) : nullptr;
   double* const d_nh_emit =
       have_neutron ? packed_ptr<double>(device_base, layout.nh_emit) : nullptr;
+  double* const d_neutron_births =
+      have_neutron_births ? packed_ptr<double>(device_base, layout.neutron_births)
+                          : nullptr;
   const double* const d_rho = packed_ptr<double>(device_base, layout.rho);
   const double* const d_Ti_eV = packed_ptr<double>(device_base, layout.Ti_eV);
   const double* const d_Te_eV = packed_ptr<double>(device_base, layout.Te_eV);
@@ -978,7 +995,7 @@ BurnStageResult compute_burn_step_1d_device_stage(
       d_zbar, d_A_eff, d_vol, d_r_node, d_ee, d_ei, d_v_r, d_range_fe,
       d_range_fi, d_S_out, d_burn_y, d_dE_e, d_dE_i, d_rate_diag, d_Qe_diag,
       d_Qi_diag,
-      d_S_birth, d_nh_emit, d_cell_tallies);
+      d_S_birth, d_nh_emit, d_cell_tallies, d_neutron_births);
   CUDA_CHECK(cudaGetLastError());
   if (have_neutron && neutron_mu_valid) {
     const int cell_grid = (n_cells + kBlock - 1) / kBlock;
@@ -1022,6 +1039,10 @@ BurnStageResult compute_burn_step_1d_device_stage(
     std::memcpy(nh_emit.data(), host_base + layout.nh_emit,
                 n * static_cast<std::size_t>(kNumNeutronLines) *
                     sizeof(double));
+  }
+  if (have_neutron_births) {
+    std::memcpy(neutron_births->data(), host_base + layout.neutron_births,
+                n * sizeof(double));
   }
 
   ResultPacket packet;

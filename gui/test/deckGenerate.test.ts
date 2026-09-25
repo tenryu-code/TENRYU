@@ -354,7 +354,7 @@ describe("generateDeck", () => {
     const f = defaultFormState();
     f.conduction.ionConduction = true;
     const deck = generateDeck(f);
-    expect(deck).toContain("ion_conduction=True");
+    expect(deck).toContain("ion_conduction=True, ion_f_lim=1)");
     expect(generateDeck(defaultFormState())).not.toContain("ion_conduction");
   });
 
