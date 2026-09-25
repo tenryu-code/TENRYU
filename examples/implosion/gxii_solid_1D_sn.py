@@ -120,7 +120,9 @@ Laser(
     enabled=True,
     wavelength_nm=527.0,
     mode="raytrace_2d",
-    rays_per_beam=8000,
+    # The characteristic ray integrator: 1000 rays give the 16000-ray result
+    # (absorbed fraction to 2e-5, peak density within 7e-4; PERFORMANCE 19.3).
+    rays_per_beam=1000,
     ray_output_count=200,
     ray_output_trajectory=True,
     lasermesh=dict(
@@ -176,6 +178,7 @@ Output(
     directory="outputs/gxii_solid_1D_sn",
     format="hdf5",
     plot_every_s=25.0e-12,
+    history_every=1,
     history_every_s=1.0e-9,
     checkpoint_every=2000,
     checkpoint_keep_last=2,

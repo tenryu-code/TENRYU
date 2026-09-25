@@ -39,6 +39,9 @@ struct RayArray1D {
   double* Z0 = nullptr;
   double* vR0 = nullptr;
   double* vZ0 = nullptr;
+  // Velocity component out of the trace's plane: along the axis of a 1D
+  // cylinder, the second lateral direction of a 1D slab; 0 on a sphere.
+  double* vA0 = nullptr;
   double* power = nullptr;
   double* power0 = nullptr;
   int n_rays = 0;
@@ -59,11 +62,23 @@ struct RayArray1D {
   void copy_from_host(const std::vector<Ray2D>& rays, cudaStream_t stream = nullptr);
 };
 
+// 1D rays of one beam: rays_per_beam rings of the beam's cross-section
+// (NUMERICS 5.4). On a sphere each ring is one ray in the plane through the
+// beam axis. On a 1D cylinder (Mesh.geometry_1d="cylindrical", axis along lab
+// z) and a 1D slab (geometry_1d="planar", normal along lab z) each ring takes
+// azimuthal_rays rays around the beam axis (one when every azimuth gives the
+// same ray, a slab at normal incidence), each reduced to the trace's plane
+// and its out-of-plane velocity (RayArray1D::vA0); the rays are computed on
+// the device.
 RayArray1D initialize_rays_1d(const Beam& beam,
                               const LaserMesh& lmesh,
                               int rays_per_beam,
                               double beam_power,
-                              cudaStream_t stream = nullptr);
+                              cudaStream_t stream = nullptr,
+                              int azimuthal_rays = 1);
+
+// Most rays initialize_rays_1d returns per beam for the mesh's geometry.
+int max_rays_1d_per_beam(const LaserMesh& lmesh, int rays_per_beam, int azimuthal_rays);
 
 struct RayArray2D {
   double* x0 = nullptr;

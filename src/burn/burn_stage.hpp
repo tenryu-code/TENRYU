@@ -40,6 +40,10 @@ struct BurnStageInputs {           // all size n_cells unless noted; host
   const double* volFrac = nullptr; // [n_cells*n_mat], cell-major
   const int* fuel_mat = nullptr;   // n_fuel_mat material indices
   int n_fuel_mat = 0;
+  // Local range fit factors of the cell's field ions (NUMERICS §14.3,
+  // fraley_range_medium); nullptr -> equimolar DT (1, 1).
+  const double* range_fe = nullptr;
+  const double* range_fi = nullptr;
 };
 
 struct BurnStageResult {           // scalars in erg (already x vol, x dt)
@@ -85,5 +89,20 @@ BurnStageResult compute_burn_step_1d(const BurnStageInputs& in,
                                      std::vector<double>& Qe_diag,
                                      std::vector<double>& Qi_diag,
                                      std::vector<double>* S_birth = nullptr);
+
+// True when some cell of the 1D burn region can react this step: the region
+// is the first to last cell whose summed fuel volume fraction exceeds
+// vf_threshold (as compute_burn_step_1d forms it) and a cell reacts unless
+// rho <= 0 or Ti * 1e-3 < T_floor_keV (the stage kernel's early returns, same
+// comparisons). When false the stage deposits nothing and leaves the
+// inventories unchanged. Device inputs; one small copy to the host.
+bool burn_1d_region_may_react(const double* d_rho,
+                              const double* d_Ti_eV,
+                              const double* d_volfrac,
+                              int n_cells,
+                              int n_mat,
+                              const std::vector<int>& fuel_mats,
+                              double vf_threshold,
+                              double T_floor_keV);
 
 }  // namespace tenryu::burn

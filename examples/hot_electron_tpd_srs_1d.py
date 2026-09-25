@@ -203,6 +203,7 @@ Output(
     directory="./build/hot_electron_tpd_srs_1d/",
     format="hdf5",
     plot_every_s=5.0e-11,
+    history_every=1,
     history_every_s=1.0e-9,
     checkpoint_every=2000,
     checkpoint_keep_last=2,

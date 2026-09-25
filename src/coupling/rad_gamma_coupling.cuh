@@ -45,6 +45,11 @@ double apply_gamma_r_43_work_update(double* rad_E,
                                     int c_end,
                                     int n_groups);
 
+// Sum of W_r over cells [c_begin, c_end) (device array; fixed-order
+// reduction, one readback): the kinetic energy the radiation pressure force
+// gave the matter in the hydro step [erg].
+double sum_gamma_r_43_work(const double* W_r, int c_begin, int c_end);
+
 // p_r[c] = (1/3) * Sum_g max(rad_E[c*n_groups+g], 0). Device pointers.
 void compute_radiation_pressure_field(double* p_r,
                                       const double* rad_E,

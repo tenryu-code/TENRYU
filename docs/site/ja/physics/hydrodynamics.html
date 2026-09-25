@@ -118,7 +118,7 @@
       \qquad \Delta l_c=\sqrt{A_c}.
       $$
       <p>ここで \(c_{s,c}\) はセルの音速、\(\nabla\!\cdot\mathbf u_c\) はセル平均の速度発散、\(C_1\)・\(C_2\) は直後に既定値を示す線形・2 次の係数である。</p>
-      <p>一般的な既定値は <code>av_C1=0.1</code>、<code>av_C2=1.5</code> である。1D では <code>av_type</code> が <code>vnr</code>、任意選択のリーマン形式、1D の CSW 形式を切り替える。2D ではこれとは別の <code>av_model</code> が、従来の <code>scalar_vnr_legacy</code> か、エネルギー整合な辺力モデルかを選ぶ。</p>
+      <p>一般的な既定値は <code>av_C1=0.1</code>、<code>av_C2=1.5</code> である。1D では <code>av_type</code> が <code>vnr</code>、任意選択のリーマン形式、1D の CSW 形式を切り替え、1D 球のデッキで指定しないときは CSW 形式になる（構造体の既定は <code>vnr</code>）。1D の CSW 形式は、節点の傾きを制限して再構成したセル端の速度から圧縮率を作るので、速度が線形な圧縮では粘性が 0 になる。圧縮しているセルでは、この圧縮率に \(f\,(1-\psi)\) 倍の生の圧縮率の下限を課す（\(f\) は <code>csw_shock_limiter_floor</code>、既定 0.65。\(\psi\) は CSW98 の式 12 の Christensen の制限関数で、隣のセルが圧縮していない衝撃波の足元・後端で 0、3 セルにわたって速度が線形な圧縮で 1）。\(\psi\) は速度の連続関数なので、粘性も速度の連続関数になる。2D ではこれとは別の <code>av_model</code> が、従来の <code>scalar_vnr_legacy</code> か、エネルギー整合な辺力モデルかを選ぶ。</p>
       <p><code>csw_edge_csw98</code> は、旧実装 <code>csw_edge</code> の欠陥 — 面積ベクトルの取り方が原典の median-mesh 構成と異なり、格子に整列した圧縮では力が構造的にゼロになる — を正した、実運用向けの 2D エネルギー整合オプションである。コーナーで対称化した中央メッシュ上の CSW-1998 テンソル族の構成に、厳密な圧縮側スイッチ、Kuropatenko の波速、符号付きのエネルギー整合な仕事を組み合わせる。連続辺の制限関数は同一の論理線上で速度勾配を比較し、自己相似圧縮・剛体回転・線形な格子ずりでは制限比が 1 となって人工散逸を抑える。2D の CSW モデルを選んで係数を省略した場合は、原論文の既定値 \(C_1=C_2=1\) を使う。旧来の <code>csw_edge</code> は、認証の連続性のためビット単位で同一のまま保持している。名前だけ用意されている namelist 値 <code>csw_edge_plus_tensor_limited</code> は未実装で、入力検証が拒否する。</p>
     </section>
 
@@ -142,7 +142,9 @@
           <tr><th>キー</th><th>既定値</th><th>用途</th></tr>
         </thead>
         <tbody>
-          <tr><th><code>av_type</code></th><td><code>"vnr"</code></td><td>1D の衝撃波捕捉方式の選択：<code>vnr</code>、<code>riemann</code>、<code>csw</code>。</td></tr>
+          <tr><th><code>av_type</code></th><td><code>"vnr"</code>（1D 球で未指定なら <code>"csw"</code>）</td><td>1D の衝撃波捕捉方式の選択：<code>vnr</code>、<code>riemann</code>、<code>csw</code>。</td></tr>
+          <tr><th><code>csw_C1</code> / <code>csw_C2</code></th><td><code>0.5</code> / <code>2.0</code></td><td>1D の CSW 形式の線形・2 次の係数（<code>av_C1</code>・<code>av_C2</code> とは別）。</td></tr>
+          <tr><th><code>csw_shock_limiter_floor</code></th><td><code>0.65</code></td><td>1D の CSW 形式の衝撃波での下限 \(f\)。下限は \(f(1-\psi)\) 倍の生の圧縮率。</td></tr>
           <tr><th><code>av_model</code></th><td><code>"scalar_vnr_legacy"</code></td><td>2D RZ での選択。<code>csw_edge_csw98</code> は上記の欠陥を修正したエネルギー整合な CSW98 辺人工粘性である。</td></tr>
           <tr><th><code>av_C1</code></th><td><code>0.1</code></td><td>線形人工粘性の係数。2D の CSW モードで省略した場合は 1.0。</td></tr>
           <tr><th><code>av_C2</code></th><td><code>1.5</code></td><td>2 次人工粘性の係数。スカラー vNR では \(C_2^2\) として入り、2D の CSW モードで省略した場合は 1.0。</td></tr>

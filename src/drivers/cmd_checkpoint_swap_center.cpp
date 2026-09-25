@@ -552,6 +552,7 @@ void copy_restart_ledgers(const core::State& parent,
   target.E_floor_injected = parent.E_floor_injected;
   target.E_pdV_bdry = parent.E_pdV_bdry;
   target.E_Marshak_in = parent.E_Marshak_in;
+  target.E_volume_in = parent.E_volume_in;
   target.E_solver = parent.E_solver;
 
   // The swap begins a new mesh epoch. Empty budget vectors are the reader/

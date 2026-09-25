@@ -12,6 +12,7 @@
 #include "materials/helmholtz_jet_device.hpp"
 #include "materials/helmholtz_spline_device.cuh"
 #include "materials/helmholtz_spline_device.hpp"
+#include "materials/material_closure.hpp"
 #include "materials/mie_gruneisen_device.cuh"
 #include "materials/mie_gruneisen_device.hpp"
 
@@ -37,10 +38,38 @@ struct HydroEOSContext {
   std::vector<std::uint8_t> hydro_backend_kind;
   std::vector<std::uint8_t> rho_e_reclosure_supported;
 
-  /// Device arrays of DeviceEOSTableView, one per material.
+  /// Device arrays of DeviceEOSTableView, one per material: the tables the
+  /// per-cell closures use. An exact ideal-gas material gets an empty view
+  /// (its cells close with the ideal gas; its tables stay uploaded for the
+  /// callers of ion_view() / electron_view() / total_view()).
   materials::DeviceEOSTableView* d_ion_views = nullptr;
   materials::DeviceEOSTableView* d_electron_views = nullptr;
   materials::DeviceEOSTableView* d_total_views = nullptr;
+
+  /// Device arrays of the hydro surrogate views, one per material (see
+  /// surrogates_per_material; the 1D hydro closure then selects the backend
+  /// and the surrogate per cell).
+  materials::EOSRhoEDeviceView* d_rho_e_views = nullptr;
+  materials::HelmholtzSplineDeviceView* d_spline_views = nullptr;
+  materials::HelmholtzJetDeviceView* d_jet_views = nullptr;
+  materials::MieGruneisenDeviceView* d_mie_gruneisen_views = nullptr;
+
+  /// Per-material closure parameters for the per-cell selectors
+  /// (materials::selector_closure_params: null unless the non-void materials
+  /// differ in them). Not owned.
+  const materials::MaterialClosureParams* d_closure_params = nullptr;
+  /// The non-void materials differ in their hydro backend kind (1D).
+  bool backend_kinds_vary = false;
+  /// d_rho_e_views ... d_mie_gruneisen_views are uploaded: a 1D run with more
+  /// than one non-void material, one of which uses a table surrogate (spline,
+  /// jet, rho-e table or Mie-Gruneisen); each cell then takes its own
+  /// material's surrogate.
+  bool surrogates_per_material = false;
+  /// Some non-void material takes the exact override diagnostics (its backend
+  /// is neither the exact ideal gas nor Mie-Gruneisen).
+  bool any_nonvoid_overridable = false;
+  /// Every non-void material supports the rho-e inverse reclosure.
+  bool all_nonvoid_support_rho_e_reclosure = false;
 
   /// Number of materials.
   int n_materials = 0;

@@ -230,12 +230,14 @@ __global__ void compute_coefficients_kernel(
   }
   const double lnLe = (p.lnL_e > 0.0) ? p.lnL_e
                                       : corman_electron_log(Te_eV[c], ne[c]);
+  const FieldIons field = field_ions_at(p.field_cells, p.field, c);
   const double lnLI = (p.lnL_I > 0.0)
                           ? p.lnL_I
                           : corman_ion_log(species_A, species_Z, E_birth_keV,
-                                           rho[c], Te_eV[c], Ti_eV[c], ne[c]);
+                                           rho[c], Te_eV[c], Ti_eV[c], ne[c],
+                                           field);
   tE[c] = corman_tE(species_A, species_Z, Te_eV[c], ne[c], lnLe);
-  gamma[c] = corman_gamma(species_A, species_Z, rho[c], lnLI);
+  gamma[c] = corman_gamma(species_A, species_Z, rho[c], lnLI, field);
   lnL_I[c] = lnLI;
 }
 
@@ -253,10 +255,17 @@ __device__ inline double corman2d_face_D(
   const double Nl = N_old[g * n_cells + cL];
   const double Nr = boundary ? Nl : N_old[g * n_cells + cR];
   const double N_f = boundary ? Nl : 0.5 * (Nl + Nr);
-  const double rho_f = boundary ? rho[cL] : 0.5 * (rho[cL] + rho[cR]);
+  const double nz2_L =
+      corman_field_nz2(rho[cL], field_ions_at(p.field_cells, p.field, cL));
+  const double nz2_f =
+      boundary ? nz2_L
+               : 0.5 * (nz2_L + corman_field_nz2(
+                                    rho[cR], field_ions_at(p.field_cells,
+                                                           p.field, cR)));
   const double lnL_f = boundary ? lnL_I[cL] : 0.5 * (lnL_I[cL] + lnL_I[cR]);
   const double E = center_keV(p, g);
-  const double lambda = corman_lambda(species_A, species_Z, E, rho_f, lnL_f);
+  const double lambda =
+      corman_lambda_nz2(species_A, species_Z, E, nz2_f, lnL_f);
   const double m_s = species_A * corman_detail::kProtonMassG;
   const double v = sqrt(2.0 * E * corman_detail::kKeVToErg / m_s);
   if (!(lambda > 0.0) || !isfinite(lambda)) {
@@ -311,7 +320,8 @@ __device__ inline double boundary_sink(
     const BurnCellGeometryRZ& geom) {
   const int c = cell_index(i, j, nz);
   const double lambda = corman_lambda(species_A, species_Z, center_keV(p, g),
-                                      rho[c], lnL_I[c]);
+                                      rho[c], lnL_I[c],
+                                      field_ions_at(p.field_cells, p.field, c));
   if (!(lambda > 0.0) || !isfinite(lambda)) {
     return 0.0;
   }

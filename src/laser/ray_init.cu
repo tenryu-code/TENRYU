@@ -150,6 +150,7 @@ RayArray1D& RayArray1D::operator=(RayArray1D&& other) noexcept {
   Z0 = other.Z0;
   vR0 = other.vR0;
   vZ0 = other.vZ0;
+  vA0 = other.vA0;
   power = other.power;
   power0 = other.power0;
   n_rays = other.n_rays;
@@ -160,6 +161,7 @@ RayArray1D& RayArray1D::operator=(RayArray1D&& other) noexcept {
   other.Z0 = nullptr;
   other.vR0 = nullptr;
   other.vZ0 = nullptr;
+  other.vA0 = nullptr;
   other.power = nullptr;
   other.power0 = nullptr;
   other.n_rays = 0;
@@ -170,7 +172,7 @@ RayArray1D& RayArray1D::operator=(RayArray1D&& other) noexcept {
 
 void RayArray1D::release() {
   if (pooled) {
-    R0 = Z0 = vR0 = vZ0 = power = power0 = nullptr;
+    R0 = Z0 = vR0 = vZ0 = vA0 = power = power0 = nullptr;
     n_rays = 0;
     n_rays_capacity = 0;
     pooled = false;
@@ -191,6 +193,10 @@ void RayArray1D::release() {
   if (vZ0 != nullptr) {
     cuda_check(cudaFree(vZ0), "RayArray1D::release cudaFree vZ0 failed");
     vZ0 = nullptr;
+  }
+  if (vA0 != nullptr) {
+    cuda_check(cudaFree(vA0), "RayArray1D::release cudaFree vA0 failed");
+    vA0 = nullptr;
   }
   if (power != nullptr) {
     cuda_check(cudaFree(power), "RayArray1D::release cudaFree power failed");
@@ -232,6 +238,7 @@ void RayArray1D::allocate(const int n) {
   alloc_or_cleanup(Z0, "RayArray1D::allocate cudaMalloc Z0 failed");
   alloc_or_cleanup(vR0, "RayArray1D::allocate cudaMalloc vR0 failed");
   alloc_or_cleanup(vZ0, "RayArray1D::allocate cudaMalloc vZ0 failed");
+  alloc_or_cleanup(vA0, "RayArray1D::allocate cudaMalloc vA0 failed");
   alloc_or_cleanup(power, "RayArray1D::allocate cudaMalloc power failed");
   alloc_or_cleanup(power0, "RayArray1D::allocate cudaMalloc power0 failed");
   n_rays_capacity = n;
@@ -246,13 +253,14 @@ void RayArray1D::allocate_pooled(const int n) {
   pooled = true;
   const std::size_t n_sz = static_cast<std::size_t>(n);
   double* slab = static_cast<double*>(core::device_scratch_acquire(
-      "ray_init:ray_array_1d_slab", 6ULL * n_sz * sizeof(double)));
+      "ray_init:ray_array_1d_slab", 7ULL * n_sz * sizeof(double)));
   R0 = slab + 0 * n_sz;
   Z0 = slab + 1 * n_sz;
   vR0 = slab + 2 * n_sz;
   vZ0 = slab + 3 * n_sz;
   power = slab + 4 * n_sz;
   power0 = slab + 5 * n_sz;
+  vA0 = slab + 6 * n_sz;
 }
 
 void RayArray1D::copy_from_host(const std::vector<Ray2D>& rays, cudaStream_t stream) {
@@ -262,7 +270,7 @@ void RayArray1D::copy_from_host(const std::vector<Ray2D>& rays, cudaStream_t str
   }
 
   const std::size_t n = rays.size();
-  std::vector<double> h_slab(6 * n, 0.0);
+  std::vector<double> h_slab(7 * n, 0.0);  // vA0 (slot 6) is 0: rays in the trace's plane
 
   for (std::size_t i = 0; i < n; ++i) {
     h_slab[0 * n + i] = rays[i].R;
@@ -274,26 +282,34 @@ void RayArray1D::copy_from_host(const std::vector<Ray2D>& rays, cudaStream_t str
   }
 
   // Pageable-source async copy is synchronous with respect to h_slab lifetime per CUDA.
-  cuda_check(cudaMemcpyAsync(R0, h_slab.data(), 6 * n * sizeof(double),
+  cuda_check(cudaMemcpyAsync(R0, h_slab.data(), 7 * n * sizeof(double),
                              cudaMemcpyHostToDevice, stream),
              "RayArray1D::copy_from_host memcpyAsync slab failed");
 }
 
-RayArray1D initialize_rays_1d(const Beam& beam,
-                              const LaserMesh& lmesh,
-                              const int rays_per_beam,
-                              const double beam_power,
-                              cudaStream_t stream) {
-  const core::NvtxRange nvtx_range("laser.ray_initialization");
-  RayArray1D out;
-  if (rays_per_beam <= 0 || !(beam_power > 0.0)) {
-    return out;
-  }
+namespace {
 
-  const double Z_init = lmesh.Z_max;
+// Ring layout and weights of a 1D beam (face-based annular quadrature):
+// ring k at R_k = (k + 1/2) dR of the launch plane Z_init = lmesh.Z_max, dR =
+// R_beam / rays_per_beam, R_beam = |Z_init - z_focus| / (2 f_number); weight
+// profile(R_k R_ref / R_beam-scaled) times the annulus area.
+struct RingLayout1D {
+  double Z_init = 0.0;
+  double z_focus = 0.0;
+  double dR = 0.0;
+  std::vector<double> weights;
+  double sum_w = 0.0;
+};
+
+RingLayout1D ring_layout_1d(const Beam& beam, const LaserMesh& lmesh, const int rays_per_beam) {
+  RingLayout1D out;
+  out.Z_init = lmesh.Z_max;
+  // The beam propagates toward -Z from the launch plane Z_init, whatever its
+  // lab direction (spherical symmetry); z_focus is the focus on that axis.
+  out.z_focus = beam.axial_focus_1d();
   const double R_beam =
-      std::abs(Z_init - beam.focus_lab_z) / (2.0 * std::max(beam.f_number, 1.0e-12));
-  const double dR = (rays_per_beam > 0) ? (R_beam / static_cast<double>(rays_per_beam)) : 0.0;
+      std::abs(out.Z_init - out.z_focus) / (2.0 * std::max(beam.f_number, 1.0e-12));
+  out.dR = (rays_per_beam > 0) ? (R_beam / static_cast<double>(rays_per_beam)) : 0.0;
 
   // Face-based annular quadrature (2026-07-26 review): ring faces at k*dR,
   // representative radii at the ring centers (k+1/2)*dR, exact annulus areas
@@ -301,36 +317,245 @@ RayArray1D initialize_rays_1d(const Beam& beam,
   // with a half-cell disk at k=0) left the outermost half ring
   // [R_beam - dR/2, R_beam] uncovered, biasing the sampled profile moments
   // inward by O(1/N).
-  const auto ring_center = [&](const int k) {
-    return dR * (static_cast<double>(k) + 0.5);
-  };
-  std::vector<double> weights(static_cast<std::size_t>(rays_per_beam), 0.0);
-  double sum_w = 0.0;
+  // The intensity profile is defined on the plane through the target centre
+  // (lab z = 0) — the plane whose spot the Langdon vacuum map also describes —
+  // and carried to the launch plane along the straight rays through the focus:
+  // R_ref = R_k |z_f| / |Z_init - z_f|. R_k / R_beam is fixed per ring, so the
+  // weights no longer depend on where the laser mesh currently ends (the former
+  // evaluation at the moving launch plane with a fixed w0 narrowed the beam as
+  // the corona expanded; 2026-09-23). A focus at the target centre maps every
+  // ring to R_ref = 0: uniform intensity over the f-cone.
+  const double launch_to_focus = std::abs(out.Z_init - out.z_focus);
+  const double reference_scale =
+      (launch_to_focus > 0.0) ? std::abs(out.z_focus) / launch_to_focus : 1.0;
+  out.weights.assign(static_cast<std::size_t>(rays_per_beam), 0.0);
   for (int k = 0; k < rays_per_beam; ++k) {
-    const double Rk = ring_center(k);
-    const double area = kPi * (2.0 * static_cast<double>(k) + 1.0) * dR * dR;
-    const double wk = beam.profile(Rk) * std::max(area, 0.0);
-    weights[static_cast<std::size_t>(k)] = wk;
-    sum_w += wk;
+    const double Rk = out.dR * (static_cast<double>(k) + 0.5);
+    const double area = kPi * (2.0 * static_cast<double>(k) + 1.0) * out.dR * out.dR;
+    const double wk = beam.profile(Rk * reference_scale) * std::max(area, 0.0);
+    out.weights[static_cast<std::size_t>(k)] = wk;
+    out.sum_w += wk;
   }
-  if (!(sum_w > 0.0)) {
-    std::fill(weights.begin(), weights.end(), 1.0);
-    sum_w = static_cast<double>(rays_per_beam);
+  if (!(out.sum_w > 0.0)) {
+    std::fill(out.weights.begin(), out.weights.end(), 1.0);
+    out.sum_w = static_cast<double>(rays_per_beam);
+  }
+  return out;
+}
+
+struct Vec3d {
+  double x = 0.0;
+  double y = 0.0;
+  double z = 0.0;
+};
+
+__host__ __device__ inline Vec3d v3(const double x, const double y, const double z) {
+  Vec3d v;
+  v.x = x;
+  v.y = y;
+  v.z = z;
+  return v;
+}
+__host__ __device__ inline Vec3d v3_add(const Vec3d a, const Vec3d b) {
+  return v3(a.x + b.x, a.y + b.y, a.z + b.z);
+}
+__host__ __device__ inline Vec3d v3_scale(const Vec3d a, const double s) {
+  return v3(a.x * s, a.y * s, a.z * s);
+}
+__host__ __device__ inline double v3_dot(const Vec3d a, const Vec3d b) {
+  return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+__host__ __device__ inline Vec3d v3_cross(const Vec3d a, const Vec3d b) {
+  return v3(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x);
+}
+__host__ __device__ inline Vec3d v3_unit(const Vec3d a) {
+  const double n = sqrt(v3_dot(a, a));
+  return (n > 0.0) ? v3_scale(a, 1.0 / n) : a;
+}
+
+// Beam frame of a non-spherical 1D geometry: propagation p (unit), ring
+// frame e1, e2 (unit, perpendicular to p), the trace's plane axes (unit
+// r_axis, z_axis; a_axis out of the plane), the focus point F = -z_focus p
+// (z_focus positive toward the source) and the launch-plane distance.
+struct BeamFrame1D {
+  Vec3d p;
+  Vec3d e1;
+  Vec3d e2;
+  Vec3d r_axis;
+  Vec3d z_axis;
+  Vec3d a_axis;
+  Vec3d focus;
+  double Z_init = 0.0;
+  double dz = 0.0;  // Z_init - z_focus
+  double profile_end = 0.0;
+  int planar = 0;
+};
+
+// Ray (ring k, azimuth m) of a non-spherical 1D geometry: the 3D ray through
+// the focus from the ring point of the launch plane, moved along its line to
+// the outside of the profile (the cylinder r = profile_end, the slab height
+// profile_end), and expressed in the trace's plane.
+__global__ void initialize_rays_1d_geometry_kernel(const BeamFrame1D frame,
+                                                   const double* __restrict__ ring_power,
+                                                   const int n_rings,
+                                                   const int n_azimuth,
+                                                   const double dR,
+                                                   double* __restrict__ R0,
+                                                   double* __restrict__ Z0,
+                                                   double* __restrict__ vR0,
+                                                   double* __restrict__ vZ0,
+                                                   double* __restrict__ vA0,
+                                                   double* __restrict__ power,
+                                                   double* __restrict__ power0) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= n_rings * n_azimuth) {
+    return;
+  }
+  const int k = idx / n_azimuth;
+  const int m = idx - k * n_azimuth;
+  const double Rk = dR * (static_cast<double>(k) + 0.5);
+  const double psi = 2.0 * kPi * (static_cast<double>(m) + 0.5) / static_cast<double>(n_azimuth);
+  const Vec3d offset =
+      v3_add(v3_scale(frame.e1, Rk * cos(psi)), v3_scale(frame.e2, Rk * sin(psi)));
+  const Vec3d P = v3_add(v3_scale(frame.p, -frame.Z_init), offset);
+  // Converging on a focus beyond the launch plane, diverging from one the beam
+  // has already passed (the sphere's rule).
+  const Vec3d to_focus = v3_add(frame.focus, v3_scale(P, -1.0));
+  Vec3d d = v3_unit((frame.dz >= 0.0) ? to_focus : v3_scale(to_focus, -1.0));
+  if (!(v3_dot(d, d) > 0.0)) {
+    d = frame.p;
+  }
+  // Start on the ray's line outside the profile (vacuum lies between).
+  double t = 0.0;
+  if (frame.planar != 0) {
+    const double h = v3_dot(P, frame.z_axis);
+    const double dh = v3_dot(d, frame.z_axis);
+    if (h < frame.profile_end && dh < 0.0) {
+      t = (frame.profile_end - h) / dh;  // < 0: back along the line
+    }
+  } else {
+    const double px = v3_dot(P, frame.r_axis);
+    const double pz = v3_dot(P, frame.z_axis);
+    const double dx = v3_dot(d, frame.r_axis);
+    const double dzt = v3_dot(d, frame.z_axis);
+    const double a = dx * dx + dzt * dzt;
+    const double c = px * px + pz * pz - frame.profile_end * frame.profile_end;
+    if (c < 0.0 && a > 0.0) {
+      // |P_perp + t d_perp| = profile_end, the root with t < 0.
+      const double b = px * dx + pz * dzt;
+      const double disc = b * b - a * c;
+      t = (-b - sqrt(fmax(disc, 0.0))) / a;
+    }
+  }
+  const Vec3d S = v3_add(P, v3_scale(d, t));
+  R0[idx] = v3_dot(S, frame.r_axis);
+  Z0[idx] = v3_dot(S, frame.z_axis);
+  vR0[idx] = v3_dot(d, frame.r_axis);
+  vZ0[idx] = v3_dot(d, frame.z_axis);
+  vA0[idx] = v3_dot(d, frame.a_axis);
+  const double w = ring_power[k] / static_cast<double>(n_azimuth);
+  power[idx] = w;
+  power0[idx] = w;
+}
+
+}  // namespace
+
+int max_rays_1d_per_beam(const LaserMesh& lmesh, const int rays_per_beam,
+                         const int azimuthal_rays) {
+  return (lmesh.geometry_code == 0) ? rays_per_beam
+                                    : rays_per_beam * std::max(azimuthal_rays, 1);
+}
+
+RayArray1D initialize_rays_1d(const Beam& beam,
+                              const LaserMesh& lmesh,
+                              const int rays_per_beam,
+                              const double beam_power,
+                              cudaStream_t stream,
+                              const int azimuthal_rays) {
+  const core::NvtxRange nvtx_range("laser.ray_initialization");
+  RayArray1D out;
+  if (rays_per_beam <= 0 || !(beam_power > 0.0)) {
+    return out;
+  }
+  const RingLayout1D layout = ring_layout_1d(beam, lmesh, rays_per_beam);
+  const double Z_init = layout.Z_init;
+  const double z_focus = layout.z_focus;
+  const double dR = layout.dR;
+  const std::vector<double>& weights = layout.weights;
+  const double sum_w = layout.sum_w;
+
+  if (lmesh.geometry_code != 0) {
+    // Cylinder (axis g = lab z) or slab (normal g = lab z, the vacuum side
+    // at +g): the beam's lab direction sets the incidence.
+    const Vec3d g = v3(0.0, 0.0, 1.0);
+    Vec3d p = v3_unit(v3(beam.dir_x, beam.dir_y, beam.dir_z));
+    BeamFrame1D frame;
+    frame.planar = (lmesh.geometry_code == 2) ? 1 : 0;
+    if (frame.planar != 0 && p.z > 0.0) {
+      p.z = -p.z;  // the beam comes from the vacuum side
+    }
+    frame.p = p;
+    const Vec3d gxp = v3_cross(g, p);
+    const bool along_g = v3_dot(gxp, gxp) < 1.0e-24;
+    frame.e1 = along_g ? v3(1.0, 0.0, 0.0) : v3_unit(gxp);
+    frame.e2 = v3_cross(p, frame.e1);
+    frame.Z_init = Z_init;
+    frame.dz = Z_init - z_focus;
+    frame.focus = v3_scale(p, -z_focus);
+    frame.profile_end = lmesh.R_max;  // the profile ends at the laser mesh radius
+    if (frame.planar != 0) {
+      // Plane (lateral, height): lateral along the beam's tilt.
+      frame.z_axis = g;
+      const Vec3d tilt = v3_add(p, v3_scale(g, -v3_dot(p, g)));
+      frame.r_axis = (v3_dot(tilt, tilt) > 1.0e-24) ? v3_unit(tilt) : v3(1.0, 0.0, 0.0);
+      frame.a_axis = v3_cross(g, frame.r_axis);
+    } else {
+      // Cross-section plane: Z back toward the source (the rays travel toward
+      // -Z, as on a sphere), A along the cylinder axis.
+      const Vec3d p_perp = v3(p.x, p.y, 0.0);
+      frame.z_axis = v3_unit(v3_scale(p_perp, -1.0));
+      frame.r_axis = v3_cross(g, frame.z_axis);
+      frame.a_axis = g;
+    }
+    // A slab at normal incidence: every azimuth gives the same ray.
+    const int n_azimuth = (frame.planar != 0 && along_g) ? 1 : std::max(azimuthal_rays, 1);
+    std::vector<double> ring_power(static_cast<std::size_t>(rays_per_beam), 0.0);
+    for (int k = 0; k < rays_per_beam; ++k) {
+      ring_power[static_cast<std::size_t>(k)] =
+          beam_power * (weights[static_cast<std::size_t>(k)] / sum_w);
+    }
+    double* d_ring_power = static_cast<double*>(core::device_scratch_acquire(
+        "ray_init:ring_power", static_cast<std::size_t>(rays_per_beam) * sizeof(double)));
+    cuda_check(cudaMemcpyAsync(d_ring_power, ring_power.data(),
+                               static_cast<std::size_t>(rays_per_beam) * sizeof(double),
+                               cudaMemcpyHostToDevice, stream),
+               "initialize_rays_1d ring power H2D failed");
+    const int n_rays = rays_per_beam * n_azimuth;
+    out.allocate_pooled(n_rays);
+    const int block = 128;
+    initialize_rays_1d_geometry_kernel<<<(n_rays + block - 1) / block, block, 0, stream>>>(
+        frame, d_ring_power, rays_per_beam, n_azimuth, dR, out.R0, out.Z0, out.vR0, out.vZ0,
+        out.vA0, out.power, out.power0);
+    cuda_check(cudaGetLastError(), "initialize_rays_1d geometry kernel launch failed");
+    return out;
   }
 
   std::vector<Ray2D> rays(static_cast<std::size_t>(rays_per_beam));
   for (int k = 0; k < rays_per_beam; ++k) {
-    const double Rk = ring_center(k);
-    const double dz = Z_init - beam.focus_lab_z;
+    const double Rk = dR * (static_cast<double>(k) + 0.5);
+    const double dz = Z_init - z_focus;
     const double L = std::sqrt(Rk * Rk + dz * dz);
 
     Ray2D ray;
     ray.R = Rk;
     ray.Z = Z_init;
-    ray.vR = (L > 0.0) ? (-Rk / L) : 0.0;
-    const double sgn = (dz >= 0.0) ? -1.0 : 1.0;
+    // Along the line through the focus, toward -Z: converging on a focus
+    // below the launch plane, diverging from one the beam has already passed
+    // above it. (The rays used to be launched toward +Z, away from the target,
+    // in the second case.)
+    ray.vR = (L > 0.0) ? ((dz >= 0.0) ? (-Rk / L) : (Rk / L)) : 0.0;
     const double vR2 = ray.vR * ray.vR;
-    ray.vZ = sgn * std::sqrt(std::max(0.0, 1.0 - vR2));
+    ray.vZ = -std::sqrt(std::max(0.0, 1.0 - vR2));
 
     const double w_norm = weights[static_cast<std::size_t>(k)] / sum_w;
     ray.I = beam_power * w_norm;

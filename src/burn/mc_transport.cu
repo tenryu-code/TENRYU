@@ -6,10 +6,13 @@
 #include <limits>
 #include <vector>
 
+#include <cub/device/device_scan.cuh>
 #include <curand_kernel.h>
 
 #include "burn/burn_constants.hpp"
 #include "burn/corman_diffusion.cuh"
+#include "core/deterministic_sum.hpp"
+#include "core/device_scratch.hpp"
 #include "core/error.hpp"
 
 namespace tenryu::burn {
@@ -125,15 +128,61 @@ __device__ Chord next_chord(const double r, const double mu,
   return c;
 }
 
+// Birth weight of the particles of one (cell, slot); every sample of the
+// pair has the same weight, so a pair spawns all its particles or none.
+__device__ inline double spawn_weight(const McParams& p, const int n_cells,
+                                      const double* __restrict__ S_birth,
+                                      const double* __restrict__ vol,
+                                      const double dt_s, const int cell,
+                                      const int slot) {
+  const double source = S_birth[slot * n_cells + cell];
+  if (!(source > 0.0)) {
+    return 0.0;
+  }
+  const double weight =
+      source * vol[cell] * dt_s / static_cast<double>(p.particles_per_cell);
+  return (weight > 0.0) ? weight : 0.0;
+}
+
+// Particle count and sourced energy of each (cell, slot) pair. An exclusive
+// scan of the counts gives each pair its first pool slot, so the pool is laid
+// out in (cell, slot, sample) order and the transport and its tallies repeat
+// bitwise from run to run (2026-09-24; the slots used to come from an
+// atomicAdd counter in thread-schedule order). counts[n_pairs] is written as
+// 0 so that the scan's last entry is the number of new particles.
+__global__ void spawn_count_kernel(McParams p, int n_cells,
+                                   const double* __restrict__ S_birth,
+                                   const double* __restrict__ vol, double dt_s,
+                                   int* __restrict__ counts,
+                                   double* __restrict__ sourced_pairs) {
+  const int n_pairs = n_cells * kSlots;
+  const int cs = blockIdx.x * blockDim.x + threadIdx.x;
+  if (cs > n_pairs) {
+    return;
+  }
+  if (cs == n_pairs) {
+    counts[cs] = 0;
+    return;
+  }
+  const int slot = cs % kSlots;
+  const int cell = cs / kSlots;
+  const double weight = spawn_weight(p, n_cells, S_birth, vol, dt_s, cell, slot);
+  const bool spawn = weight > 0.0;
+  counts[cs] = spawn ? p.particles_per_cell : 0;
+  sourced_pairs[cs] =
+      spawn ? static_cast<double>(p.particles_per_cell) *
+                  (weight * (slot_birth_MeV(slot) * kMeVToErg))
+            : 0.0;
+}
+
 __global__ void spawn_kernel(
     McParams p, int n_cells, unsigned long long step_index,
     const double* __restrict__ r_node, const double* __restrict__ S_birth,
     const double* __restrict__ vol, double dt_s, double* __restrict__ r_p,
     double* __restrict__ mu_p, double* __restrict__ E_p,
     double* __restrict__ w_p, int* __restrict__ slot_p,
-    unsigned char* __restrict__ alive_p, int capacity,
-    int* __restrict__ live_count, int* __restrict__ overflow,
-    double* __restrict__ totals) {
+    unsigned char* __restrict__ alive_p, const int first_slot,
+    const int* __restrict__ pair_offsets) {
   const std::size_t idx =
       static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   const std::size_t total =
@@ -148,21 +197,11 @@ __global__ void spawn_kernel(
       idx / static_cast<std::size_t>(p.particles_per_cell);
   const int slot = static_cast<int>(cell_slot % kSlots);
   const int cell = static_cast<int>(cell_slot / kSlots);
-  const double source = S_birth[slot * n_cells + cell];
-  if (!(source > 0.0)) {
-    return;
-  }
-  const double weight =
-      source * vol[cell] * dt_s / static_cast<double>(p.particles_per_cell);
+  const double weight = spawn_weight(p, n_cells, S_birth, vol, dt_s, cell, slot);
   if (!(weight > 0.0)) {
     return;
   }
-
-  const int out = atomicAdd(live_count, 1);
-  if (out >= capacity) {
-    atomicExch(overflow, 1);
-    return;
-  }
+  const int out = first_slot + pair_offsets[cell_slot] + sample;
 
   const unsigned long long gid =
       mc_transport_global_id(cell, slot, sample, p.particles_per_cell);
@@ -182,7 +221,84 @@ __global__ void spawn_kernel(
   w_p[out] = weight;
   slot_p[out] = slot;
   alive_p[out] = 1U;
-  atomicAdd(&totals[kTotalSourced], weight * E);
+}
+
+// Energy w E of each live particle; their sum bounds the step's deposits.
+__global__ void particle_energy_kernel(int live_count, const double* __restrict__ E_p,
+                                       const double* __restrict__ w_p,
+                                       const unsigned char* __restrict__ alive_p,
+                                       double* __restrict__ out) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= live_count) {
+    return;
+  }
+  out[i] = (alive_p[i] != 0U) ? w_p[i] * E_p[i] : 0.0;
+}
+
+// Fixed-point deposits. A deposit v is added as the integer rint(v 2^shift)
+// to a 128-bit accumulator held in two 64-bit words (low word first; the
+// carry of the low word goes to the high word), so the sum does not depend
+// on the order of the deposits. shift = 100 - e for the step's total particle
+// energy E_tot = f 2^e (0.5 <= f < 1): every deposit is at most E_tot, so each
+// integer is below 2^100 and the rounding of one deposit is at most
+// 2^-100 E_tot. A negative or non-finite deposit sets bit 63 of the high word,
+// and the cell's deposits are then returned as NaN (the double atomics this
+// replaces carried the NaN into the cell as well).
+constexpr int kFixedPointBits = 100;
+constexpr unsigned long long kFixedPointInvalid = 1ULL << 63;
+
+__device__ inline int fixed_point_shift(const double energy_total) {
+  if (!(energy_total > 0.0) || !isfinite(energy_total)) {
+    return 0;
+  }
+  int e = 0;
+  frexp(energy_total, &e);
+  return kFixedPointBits - e;
+}
+
+__device__ inline void deposit_fixed_point(unsigned long long* __restrict__ word,
+                                           const double v, const int shift) {
+  if (v == 0.0) {
+    return;
+  }
+  const double x = rint(ldexp(v, shift));
+  if (!(x >= 0.0) || !(x < 0x1p120)) {
+    atomicOr(&word[1], kFixedPointInvalid);
+    return;
+  }
+  const double hi_d = floor(x * 0x1p-64);
+  const unsigned long long hi = static_cast<unsigned long long>(hi_d);
+  // x - hi 2^64 is x mod 2^64: exact, and below 2^64.
+  const unsigned long long lo = static_cast<unsigned long long>(x - hi_d * 0x1p64);
+  const unsigned long long old = atomicAdd(&word[0], lo);
+  const unsigned long long carry = (old + lo < old) ? 1ULL : 0ULL;
+  if (hi + carry != 0ULL) {
+    atomicAdd(&word[1], hi + carry);
+  }
+}
+
+__device__ inline double fixed_point_value(const unsigned long long* __restrict__ word,
+                                           const int shift) {
+  if ((word[1] & kFixedPointInvalid) != 0ULL) {
+    return NAN;
+  }
+  return ldexp(static_cast<double>(word[1]) * 0x1p64 + static_cast<double>(word[0]),
+               -shift);
+}
+
+// acc holds the electron words of the cells, then the ion words.
+__global__ void fixed_point_to_deposit_kernel(int n_cells,
+                                              const unsigned long long* __restrict__ acc,
+                                              const double* __restrict__ energy_total,
+                                              double* __restrict__ dep_e,
+                                              double* __restrict__ dep_i) {
+  const int j = blockIdx.x * blockDim.x + threadIdx.x;
+  if (j >= n_cells) {
+    return;
+  }
+  const int shift = fixed_point_shift(*energy_total);
+  dep_e[j] += fixed_point_value(acc + 2 * j, shift);
+  dep_i[j] += fixed_point_value(acc + 2 * (n_cells + j), shift);
 }
 
 __global__ void transport_kernel(
@@ -192,12 +308,21 @@ __global__ void transport_kernel(
     const double* __restrict__ ne, double dt_s, double* __restrict__ r_p,
     double* __restrict__ mu_p, double* __restrict__ E_p,
     const double* __restrict__ w_p, const int* __restrict__ slot_p,
-    unsigned char* __restrict__ alive_p, double* __restrict__ dep_e,
-    double* __restrict__ dep_i, double* __restrict__ totals) {
+    unsigned char* __restrict__ alive_p, const double* __restrict__ energy_total,
+    unsigned long long* __restrict__ acc, double* __restrict__ escaped_p,
+    double* __restrict__ inflight_p) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= live_count || alive_p[i] == 0U) {
+  if (i >= live_count) {
     return;
   }
+  escaped_p[i] = 0.0;
+  inflight_p[i] = 0.0;
+  if (alive_p[i] == 0U) {
+    return;
+  }
+  const int shift = fixed_point_shift(*energy_total);
+  unsigned long long* __restrict__ dep_e = acc;
+  unsigned long long* __restrict__ dep_i = acc + 2 * n_cells;
 
   double r = r_p[i];
   double mu = clamp_unit(mu_p[i]);
@@ -216,7 +341,7 @@ __global__ void transport_kernel(
 
   while (live && dt_rem > 0.0 && E > 0.0) {
     if (E <= E_min) {
-      atomicAdd(&dep_i[j], weight * E);
+      deposit_fixed_point(dep_i + 2 * j, weight * E, shift);
       E = 0.0;
       live = false;
       break;
@@ -224,10 +349,11 @@ __global__ void transport_kernel(
 
     const double lnLe = corman_electron_log(Te_eV[j], ne[j]);
     const double E_keV = E / corman_detail::kKeVToErg;
-    const double lnLI =
-        corman_ion_log(A, Z, E_keV, rho[j], Te_eV[j], Ti_eV[j], ne[j]);
+    const FieldIons field = field_ions_at(p.field_cells, p.field, j);
+    const double lnLI = corman_ion_log(A, Z, E_keV, rho[j], Te_eV[j],
+                                       Ti_eV[j], ne[j], field);
     const double tE = corman_tE(A, Z, Te_eV[j], ne[j], lnLe);
-    const double gamma = corman_gamma(A, Z, rho[j], lnLI);
+    const double gamma = corman_gamma(A, Z, rho[j], lnLI, field);
     const double sqrtE = sqrt(E);
     const double electron =
         (tE > 0.0 && isfinite(tE)) ? (E / tE) : 0.0;
@@ -261,10 +387,10 @@ __global__ void transport_kernel(
     const double e_i = e_loss * fi;
     const double e_e = e_loss - e_i;
     if (e_e != 0.0) {
-      atomicAdd(&dep_e[j], e_e);
+      deposit_fixed_point(dep_e + 2 * j, e_e, shift);
     }
     if (e_i != 0.0) {
-      atomicAdd(&dep_i[j], e_i);
+      deposit_fixed_point(dep_i + 2 * j, e_i, shift);
     }
 
     const double r2_new = fmax(0.0, r * r + s * s + 2.0 * r * s * mu);
@@ -281,12 +407,12 @@ __global__ void transport_kernel(
     }
 
     if (crossed && chord.face > 0 && j + 1 >= n_cells) {
-      atomicAdd(&totals[kTotalEscaped], weight * E);
+      escaped_p[i] = weight * E;
       live = false;
       break;
     }
     if (E <= E_min) {
-      atomicAdd(&dep_i[j], weight * E);
+      deposit_fixed_point(dep_i + 2 * j, weight * E, shift);
       E = 0.0;
       live = false;
       break;
@@ -305,7 +431,7 @@ __global__ void transport_kernel(
     mu_p[i] = mu;
     E_p[i] = E;
     alive_p[i] = 1U;
-    atomicAdd(&totals[kTotalInflight], weight * E);
+    inflight_p[i] = weight * E;
   } else {
     alive_p[i] = 0U;
   }
@@ -454,20 +580,10 @@ McStepResult mc_transport_step(
                     dep_i_dev != nullptr,
                 "MC transport received a null pointer");
 
-  DeviceTemp<int> d_live_count(1U, "MC transport allocate live count failed");
-  DeviceTemp<int> d_overflow(1U, "MC transport allocate overflow flag failed");
-  DeviceTemp<double> d_totals(static_cast<std::size_t>(kTotals),
-                              "MC transport allocate totals failed");
+  double* d_totals = static_cast<double*>(core::device_scratch_acquire(
+      "burn_mc:totals", (static_cast<std::size_t>(kTotals) + 1U) * sizeof(double)));
+  double* d_energy_total = d_totals + kTotals;
   const int initial_count = *live_count_inout;
-  const int zero_i = 0;
-  cuda_check(cudaMemcpyAsync(d_live_count.ptr, &initial_count, sizeof(int),
-                             cudaMemcpyHostToDevice, stream),
-             "MC transport upload live count failed");
-  cuda_check(cudaMemcpyAsync(d_overflow.ptr, &zero_i, sizeof(int),
-                             cudaMemcpyHostToDevice, stream),
-             "MC transport upload overflow flag failed");
-  cuda_check(cudaMemsetAsync(d_totals.ptr, 0, kTotals * sizeof(double), stream),
-             "MC transport zero totals failed");
 
   const std::size_t birth_threads =
       static_cast<std::size_t>(n_cells) * static_cast<std::size_t>(kSlots) *
@@ -475,47 +591,98 @@ McStepResult mc_transport_step(
   TENRYU_ASSERT(birth_threads <=
                     static_cast<std::size_t>(std::numeric_limits<int>::max()),
                 "MC transport birth launch exceeds supported grid size");
-  if (birth_threads > 0U) {
+  const int n_pairs = n_cells * kSlots;
+
+  // Pool slots of the new particles: exclusive scan of the (cell, slot)
+  // counts; the last entry is the number of new particles.
+  int* d_pair_counts = static_cast<int*>(core::device_scratch_acquire(
+      "burn_mc:pair_counts", (static_cast<std::size_t>(n_pairs) + 1U) * sizeof(int)));
+  int* d_pair_offsets = static_cast<int*>(core::device_scratch_acquire(
+      "burn_mc:pair_offsets", (static_cast<std::size_t>(n_pairs) + 1U) * sizeof(int)));
+  double* d_sourced_pairs = static_cast<double*>(core::device_scratch_acquire(
+      "burn_mc:sourced_pairs", static_cast<std::size_t>(n_pairs) * sizeof(double)));
+  {
+    const int grid = (n_pairs + 1 + kBlock - 1) / kBlock;
+    spawn_count_kernel<<<grid, kBlock, 0, stream>>>(p, n_cells, S_birth_dev, vol_dev,
+                                                    dt_s, d_pair_counts, d_sourced_pairs);
+    cuda_check(cudaGetLastError(), "MC transport spawn count kernel launch failed");
+    std::size_t scan_bytes = 0;
+    cuda_check(cub::DeviceScan::ExclusiveSum(nullptr, scan_bytes, d_pair_counts,
+                                             d_pair_offsets, n_pairs + 1, stream),
+               "MC transport spawn scan size query failed");
+    void* d_scan_temp = core::device_scratch_acquire("burn_mc:scan_temp",
+                                                     std::max<std::size_t>(scan_bytes, 1U));
+    cuda_check(cub::DeviceScan::ExclusiveSum(d_scan_temp, scan_bytes, d_pair_counts,
+                                             d_pair_offsets, n_pairs + 1, stream),
+               "MC transport spawn scan failed");
+    core::deterministic_sum(d_sourced_pairs, n_pairs, d_totals + kTotalSourced, false,
+                            stream);
+  }
+  int new_count = 0;
+  cuda_check(cudaMemcpyAsync(&new_count, d_pair_offsets + n_pairs, sizeof(int),
+                             cudaMemcpyDeviceToHost, stream),
+             "MC transport copy spawned count failed");
+  cuda_check(cudaStreamSynchronize(stream),
+             "MC transport spawn count synchronize failed");
+  result.overflow = new_count > capacity - initial_count;
+  TENRYU_ASSERT(!result.overflow,
+                "MC transport particle pool capacity overflow");
+  const int post_spawn_count = initial_count + new_count;
+
+  if (new_count > 0) {
     const int grid =
         static_cast<int>((birth_threads + kBlock - 1U) / kBlock);
     spawn_kernel<<<grid, kBlock, 0, stream>>>(
         p, n_cells, static_cast<unsigned long long>(step_index), r_node_dev,
         S_birth_dev, vol_dev, dt_s, r_p, mu_p, E_p, w_p, slot_p, alive_p,
-        capacity, d_live_count.ptr, d_overflow.ptr, d_totals.ptr);
+        initial_count, d_pair_offsets);
     cuda_check(cudaGetLastError(), "MC transport spawn kernel launch failed");
   }
 
-  int post_spawn_count = 0;
-  int overflow = 0;
-  cuda_check(cudaMemcpyAsync(&post_spawn_count, d_live_count.ptr, sizeof(int),
-                             cudaMemcpyDeviceToHost, stream),
-             "MC transport copy spawned live count failed");
-  cuda_check(cudaMemcpyAsync(&overflow, d_overflow.ptr, sizeof(int),
-                             cudaMemcpyDeviceToHost, stream),
-             "MC transport copy overflow flag failed");
-  cuda_check(cudaStreamSynchronize(stream),
-             "MC transport spawn synchronize failed");
-  result.overflow = (overflow != 0);
-  TENRYU_ASSERT(!result.overflow,
-                "MC transport particle pool capacity overflow");
-  TENRYU_ASSERT(post_spawn_count <= capacity,
-                "MC transport spawned live count exceeds capacity");
-
   if (post_spawn_count > 0) {
+    const std::size_t n_particles = static_cast<std::size_t>(post_spawn_count);
+    double* d_particle_energy = static_cast<double*>(core::device_scratch_acquire(
+        "burn_mc:particle_energy", n_particles * sizeof(double)));
+    double* d_escaped = static_cast<double*>(core::device_scratch_acquire(
+        "burn_mc:escaped", n_particles * sizeof(double)));
+    double* d_inflight = static_cast<double*>(core::device_scratch_acquire(
+        "burn_mc:inflight", n_particles * sizeof(double)));
+    const std::size_t acc_bytes =
+        4U * static_cast<std::size_t>(n_cells) * sizeof(unsigned long long);
+    auto* d_acc = static_cast<unsigned long long*>(
+        core::device_scratch_acquire("burn_mc:deposit_words", acc_bytes));
+    cuda_check(cudaMemsetAsync(d_acc, 0, acc_bytes, stream),
+               "MC transport zero deposit words failed");
     const int grid = (post_spawn_count + kBlock - 1) / kBlock;
+    particle_energy_kernel<<<grid, kBlock, 0, stream>>>(post_spawn_count, E_p, w_p,
+                                                        alive_p, d_particle_energy);
+    cuda_check(cudaGetLastError(), "MC transport particle energy kernel launch failed");
+    core::deterministic_sum(d_particle_energy, post_spawn_count, d_energy_total, false,
+                            stream);
     transport_kernel<<<grid, kBlock, 0, stream>>>(
         p, n_cells, post_spawn_count, r_node_dev, rho_dev, Te_eV_dev,
         Ti_eV_dev, ne_dev, dt_s, r_p, mu_p, E_p, w_p, slot_p, alive_p,
-        dep_e_dev, dep_i_dev, d_totals.ptr);
+        d_energy_total, d_acc, d_escaped, d_inflight);
     cuda_check(cudaGetLastError(),
                "MC transport transport kernel launch failed");
+    core::deterministic_sum(d_escaped, post_spawn_count, d_totals + kTotalEscaped, false,
+                            stream);
+    core::deterministic_sum(d_inflight, post_spawn_count, d_totals + kTotalInflight,
+                            false, stream);
+    const int cell_grid = (n_cells + kBlock - 1) / kBlock;
+    fixed_point_to_deposit_kernel<<<cell_grid, kBlock, 0, stream>>>(
+        n_cells, d_acc, d_energy_total, dep_e_dev, dep_i_dev);
+    cuda_check(cudaGetLastError(), "MC transport deposit conversion kernel launch failed");
+  } else {
+    cuda_check(cudaMemsetAsync(d_totals + kTotalEscaped, 0, 2U * sizeof(double), stream),
+               "MC transport zero totals failed");
   }
 
   compact_particles(post_spawn_count, live_count_inout, r_p, mu_p, E_p, w_p,
                     slot_p, alive_p, stream);
 
   double totals[kTotals] = {0.0, 0.0, 0.0};
-  cuda_check(cudaMemcpyAsync(totals, d_totals.ptr, sizeof(totals),
+  cuda_check(cudaMemcpyAsync(totals, d_totals, sizeof(totals),
                              cudaMemcpyDeviceToHost, stream),
              "MC transport copy totals failed");
   cuda_check(cudaStreamSynchronize(stream),

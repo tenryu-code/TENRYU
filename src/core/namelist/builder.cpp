@@ -1,4 +1,5 @@
 #include "core/namelist/builder.hpp"
+#include "core/namelist/laser_zeff_resolution.hpp"
 
 #if TENRYU_ENABLE_PYTHON
 
@@ -2893,6 +2894,131 @@ int cone_shell_tip_fill_layer_count(
       std::clamp(std::ceil(depth / (2.0 * h_lt)), 6.0, 48.0));
 }
 
+
+// Laser.profile / LaserBeam.profile dict. "table" and the frozen "custom"
+// fill r_cm / I; "custom" samples func(r_transverse_cm) on [0, r_max_um] at
+// initialization and becomes a "table" profile (SPECIFICATION Laser.profile).
+// flat_top takes its radius as radius_um (w0_um is accepted as the same
+// radius, the historic spelling).
+void parse_laser_profile_dict(const py::dict& profile, const std::string& path,
+                              std::string& model, double& w0_um, int& m,
+                              std::vector<double>& r_cm, std::vector<double>& I) {
+  enforce_known_keys(profile, path,
+                     {"model", "w0_um", "m", "r_um", "I_rel", "radius_um", "func",
+                      "r_max_um"});
+  if (has_key(profile, "model")) {
+    model = strict_string(profile["model"], path + ".model");
+  }
+  if (has_key(profile, "w0_um")) {
+    w0_um = numeric_as_double(profile["w0_um"], path + ".w0_um");
+  }
+  if (has_key(profile, "m")) {
+    m = strict_int32(profile["m"], path + ".m");
+  }
+  if (has_key(profile, "radius_um")) {
+    if (model != "flat_top") {
+      throw ConfigError(path + ".radius_um applies to model=\"flat_top\" only");
+    }
+    if (has_key(profile, "w0_um")) {
+      throw ConfigError(path +
+                        ": give the flat_top radius as radius_um or w0_um, not both");
+    }
+    const double radius_um = numeric_as_double(profile["radius_um"], path + ".radius_um");
+    if (!(std::isfinite(radius_um) && radius_um > 0.0)) {
+      throw ConfigError(path + ".radius_um must be > 0");
+    }
+    w0_um = radius_um;
+  }
+  const bool is_table = model == "table";
+  if (is_table) {
+    if (!has_key(profile, "r_um") || !has_key(profile, "I_rel")) {
+      throw ConfigError("Laser profile model=\"table\" requires r_um and I_rel");
+    }
+    if (has_key(profile, "w0_um") || has_key(profile, "m")) {
+      throw ConfigError("Laser profile model=\"table\" does not take w0_um/m");
+    }
+    const std::vector<double> r_um_v = strict_double_vector(profile["r_um"], path + ".r_um");
+    const std::vector<double> I_v = strict_double_vector(profile["I_rel"], path + ".I_rel");
+    if (r_um_v.size() < 2 || r_um_v.size() != I_v.size()) {
+      throw ConfigError(
+          "Laser profile table needs >= 2 points with equal-length r_um and I_rel");
+    }
+    double prev = -1.0;
+    double imax = 0.0;
+    for (std::size_t k = 0; k < r_um_v.size(); ++k) {
+      if (!(r_um_v[k] >= 0.0) || !(r_um_v[k] > prev)) {
+        throw ConfigError("Laser profile table r_um must be >= 0 and strictly ascending");
+      }
+      prev = r_um_v[k];
+      if (!(I_v[k] >= 0.0)) {
+        throw ConfigError("Laser profile table I_rel must be >= 0");
+      }
+      imax = std::max(imax, I_v[k]);
+    }
+    if (!(imax > 0.0)) {
+      throw ConfigError("Laser profile table I_rel must not be all zero");
+    }
+    r_cm.clear();
+    for (const double r : r_um_v) r_cm.push_back(r * 1.0e-4);
+    I = I_v;
+  } else if (has_key(profile, "r_um") || has_key(profile, "I_rel")) {
+    throw ConfigError("Laser profile r_um/I_rel require model=\"table\"");
+  }
+  if (model == "custom") {
+    if (!has_key(profile, "func") || !py_callable(profile["func"])) {
+      throw ConfigError(path +
+                        ": model=\"custom\" requires func, a callable "
+                        "I(r_transverse_cm) -> relative intensity");
+    }
+    if (!has_key(profile, "r_max_um")) {
+      throw ConfigError(path +
+                        ": model=\"custom\" requires r_max_um, the transverse radius "
+                        "up to which func is tabulated (0 beyond it)");
+    }
+    if (has_key(profile, "w0_um") || has_key(profile, "m")) {
+      throw ConfigError("Laser profile model=\"custom\" does not take w0_um/m");
+    }
+    const double r_max_um = numeric_as_double(profile["r_max_um"], path + ".r_max_um");
+    if (!(std::isfinite(r_max_um) && r_max_um > 0.0)) {
+      throw ConfigError(path + ".r_max_um must be > 0");
+    }
+    constexpr int kCustomProfileSamples = 2001;
+    const double r_max_cm = r_max_um * 1.0e-4;
+    const py::handle func = profile["func"];
+    std::vector<double> r_samples(static_cast<std::size_t>(kCustomProfileSamples));
+    std::vector<double> I_samples(static_cast<std::size_t>(kCustomProfileSamples));
+    double imax = 0.0;
+    for (int k = 0; k < kCustomProfileSamples; ++k) {
+      const double r =
+          r_max_cm * static_cast<double>(k) / static_cast<double>(kCustomProfileSamples - 1);
+      double value = 0.0;
+      try {
+        value = py::cast<double>(func(r));
+      } catch (const py::error_already_set& e) {
+        throw ConfigError(path + ".func(" + std::to_string(r) + " cm) failed: " + e.what());
+      } catch (const py::cast_error&) {
+        throw ConfigError(path + ".func must return a float (r = " + std::to_string(r) +
+                          " cm)");
+      }
+      if (!(std::isfinite(value) && value >= 0.0)) {
+        throw ConfigError(path + ".func must return finite values >= 0 (r = " +
+                          std::to_string(r) + " cm gave " + std::to_string(value) + ")");
+      }
+      r_samples[static_cast<std::size_t>(k)] = r;
+      I_samples[static_cast<std::size_t>(k)] = value;
+      imax = std::max(imax, value);
+    }
+    if (!(imax > 0.0)) {
+      throw ConfigError(path + ".func is zero on [0, r_max_um]");
+    }
+    r_cm = std::move(r_samples);
+    I = std::move(I_samples);
+    model = "table";
+  } else if (has_key(profile, "func") || has_key(profile, "r_max_um")) {
+    throw ConfigError(path + ": func/r_max_um require model=\"custom\"");
+  }
+}
+
 }  // namespace
 
 void Builder::mark_block_called(const Block block) {
@@ -4645,9 +4771,25 @@ void Builder::set_materials(py::dict kwargs) {
                       "void_config"});
 
   auto& materials = config.materials;
+  // Mixing of the opacities of a cell's materials (NUMERICS §1.1.5): tables by
+  // mass fraction at the partial densities, constant opacities by mass
+  // fraction (volume fraction when the material masses are not tracked).
+  // "linear_mass": Planck and Rosseland linear; "harmonic_mass_R": Planck
+  // linear, Rosseland harmonic; "max": the largest material opacity. The
+  // non-linear rules are implemented for 1D (2026-09-24; checked after
+  // Main in validate()).
+  const auto set_opacity_mix_rule = [&materials](const std::string& value,
+                                                 const std::string& path) {
+    if (value != "linear_mass" && value != "harmonic_mass_R" && value != "max") {
+      throw ConfigError(path + " must be one of \"linear_mass\", \"harmonic_mass_R\", "
+                        "\"max\", got \"" + value + "\"");
+    }
+    materials.opacity_mix_rule = value;
+  };
   if (has_key(kwargs, "opacity_mix_rule")) {
-    materials.opacity_mix_rule = strict_string(kwargs["opacity_mix_rule"],
-                                               "Materials.opacity_mix_rule");
+    set_opacity_mix_rule(strict_string(kwargs["opacity_mix_rule"],
+                                       "Materials.opacity_mix_rule"),
+                         "Materials.opacity_mix_rule");
   }
   if (has_key(kwargs, "low_density_extrapolation")) {
     materials.low_density_extrapolation = strict_bool(
@@ -4664,8 +4806,9 @@ void Builder::set_materials(py::dict kwargs) {
     enforce_known_keys(mixture, "Materials.mixture",
                        {"fractions", "eos_mix_rule", "opacity_mix_rule"});
     if (has_key(mixture, "opacity_mix_rule")) {
-      materials.opacity_mix_rule = strict_string(
-          mixture["opacity_mix_rule"], "Materials.mixture.opacity_mix_rule");
+      set_opacity_mix_rule(strict_string(mixture["opacity_mix_rule"],
+                                         "Materials.mixture.opacity_mix_rule"),
+                           "Materials.mixture.opacity_mix_rule");
     }
     if (has_key(mixture, "fractions")) {
       warn_ignored_key("Materials.mixture.fractions");
@@ -4999,6 +5142,18 @@ void Builder::set_materials(py::dict kwargs) {
         const std::string raw_opacity_file = strict_string(
             opacity["file"], "Materials.materials[" + std::to_string(i) + "].opacity.file");
         def.opacity_file = resolve_namelist_relative_path(config, raw_opacity_file);
+      }
+      // opacity.model="ionmix": the multigroup LTE opacities of an IONMIX table
+      // (SPECIFICATION §6.4.3). It runs on the tabular path of "table_nlte"
+      // with the file's emission opacity required to equal its absorption
+      // opacity; opacity.file defaults to eos.file for eos.model="ionmix"
+      // (2026-09-24; it used to be refused at run time).
+      if (def.opacity_model == "ionmix") {
+        if (def.opacity_file.empty() && def.eos_model == "ionmix") {
+          def.opacity_file = def.eos_file;
+        }
+        def.opacity_model = "table_nlte";
+        def.opacity_lte_required = true;
       }
       if (has_key(opacity, "tmat_skip_lte_repair")) {
         def.tmat_skip_lte_repair = strict_bool(
@@ -5966,6 +6121,7 @@ void Builder::set_radiation(py::dict kwargs) {
                         "cg_inner_tol",
                         "cg_tol_norm",
                         "outer_accel",
+                        "limiter_evaluation",
                         "anderson_m",
                         "anderson_beta",
                         "cg_max_iter",
@@ -6082,6 +6238,10 @@ void Builder::set_radiation(py::dict kwargs) {
     if (has_key(fld, "outer_accel")) {
       fld_cfg.outer_accel = strict_string(
           fld["outer_accel"], "Radiation.multigroup_diffusion.outer_accel");
+    }
+    if (has_key(fld, "limiter_evaluation")) {
+      fld_cfg.limiter_evaluation = strict_string(
+          fld["limiter_evaluation"], "Radiation.multigroup_diffusion.limiter_evaluation");
     }
     if (has_key(fld, "anderson_m")) {
       fld_cfg.anderson_m = strict_int32(
@@ -6256,8 +6416,11 @@ void Builder::set_radiation(py::dict kwargs) {
                         "outer_tol_stagnation_factor",
                         "outer_tol_hydro_error_scale",
                         "inner_tol",
+                        "grey_preconditioner",
                         "inner_graph_unroll",
                         "dsa_enabled",
+                        "inner_acceleration",
+                        "anderson_depth",
                         "z_boundary",
                         "diffusion_fallback_mode",
                         "tau_diffusion_on",
@@ -6295,6 +6458,11 @@ void Builder::set_radiation(py::dict kwargs) {
     if (has_key(sn, "spatial_scheme")) {
       sn_cfg.spatial_scheme = strict_string(
           sn["spatial_scheme"], "Radiation.sn_transport.spatial_scheme");
+      sn_cfg.spatial_scheme_explicit = true;
+    }
+    if (has_key(sn, "grey_preconditioner")) {
+      sn_cfg.grey_preconditioner = strict_string(
+          sn["grey_preconditioner"], "Radiation.sn_transport.grey_preconditioner");
     }
     if (has_key(sn, "max_outer_iterations")) {
       sn_cfg.max_outer_iterations = strict_int32(
@@ -6332,6 +6500,14 @@ void Builder::set_radiation(py::dict kwargs) {
     if (has_key(sn, "dsa_enabled")) {
       sn_cfg.dsa_enabled =
           strict_bool(sn["dsa_enabled"], "Radiation.sn_transport.dsa_enabled");
+    }
+    if (has_key(sn, "inner_acceleration")) {
+      sn_cfg.inner_acceleration = strict_string(sn["inner_acceleration"],
+                                                "Radiation.sn_transport.inner_acceleration");
+    }
+    if (has_key(sn, "anderson_depth")) {
+      sn_cfg.anderson_depth =
+          strict_int32(sn["anderson_depth"], "Radiation.sn_transport.anderson_depth");
     }
     if (has_key(sn, "z_boundary")) {
       sn_cfg.z_boundary =
@@ -6761,6 +6937,7 @@ void Builder::set_laser(py::dict kwargs) {
     if (has_key(absorption, "terminate")) {
       laser.absorption.terminate =
           strict_bool(absorption["terminate"], "Laser.absorption.terminate");
+      laser.absorption.terminate_explicit = true;
     }
     if (has_key(absorption, "coulomb_log_floor")) {
       laser.absorption.coulomb_log_floor = numeric_as_double(
@@ -6789,6 +6966,7 @@ void Builder::set_laser(py::dict kwargs) {
       if (has_key(critical, "terminate")) {
         laser.absorption.terminate = strict_bool(
             critical["terminate"], "Laser.absorption.critical_handling.terminate");
+        laser.absorption.terminate_explicit = true;
       }
       if (has_key(critical, "terminate_mode")) {
         laser.absorption.terminate_mode = strict_string(
@@ -7067,8 +7245,9 @@ void Builder::set_laser(py::dict kwargs) {
     const py::dict raytrace = py::reinterpret_borrow<py::dict>(trace_obj);
     enforce_known_keys(raytrace, "Laser.raytrace",
                        {"cfl_ray", "intensity_cutoff", "eps_crit", "max_steps", "integrator",
-                        "test_kappa", "ds_adapt_g_target", "ds_adapt_tau_target",
-                        "ds_adapt_theta_target", "ds_adapt_max_factor", "debug_one_ray"});
+                        "azimuthal_rays", "lanes_per_ray", "test_kappa", "ds_adapt_g_target",
+                        "ds_adapt_tau_target", "ds_adapt_theta_target", "ds_adapt_max_factor",
+                        "debug_one_ray"});
     if (has_key(raytrace, "cfl_ray")) {
       laser.raytrace.cfl_ray =
           numeric_as_double(raytrace["cfl_ray"], "Laser.raytrace.cfl_ray");
@@ -7088,6 +7267,14 @@ void Builder::set_laser(py::dict kwargs) {
     if (has_key(raytrace, "integrator")) {
       laser.raytrace.integrator =
           strict_string(raytrace["integrator"], "Laser.raytrace.integrator");
+    }
+    if (has_key(raytrace, "azimuthal_rays")) {
+      laser.raytrace.azimuthal_rays =
+          strict_int32(raytrace["azimuthal_rays"], "Laser.raytrace.azimuthal_rays");
+    }
+    if (has_key(raytrace, "lanes_per_ray")) {
+      laser.raytrace.lanes_per_ray =
+          strict_int32(raytrace["lanes_per_ray"], "Laser.raytrace.lanes_per_ray");
     }
     if (has_key(raytrace, "test_kappa")) {
       laser.raytrace.test_kappa =
@@ -7728,53 +7915,9 @@ void Builder::set_laser(py::dict kwargs) {
       throw_value_type_error("Laser.profile", "dict", profile_obj);
     }
     const py::dict profile = py::reinterpret_borrow<py::dict>(profile_obj);
-    enforce_known_keys(profile, "Laser.profile", {"model", "w0_um", "m", "r_um", "I_rel"});
-    if (has_key(profile, "model")) {
-      laser.profile_model = strict_string(profile["model"], "Laser.profile.model");
-    }
-    if (has_key(profile, "w0_um")) {
-      laser.profile_w0_um = numeric_as_double(profile["w0_um"], "Laser.profile.w0_um");
-    }
-    if (has_key(profile, "m")) {
-      laser.profile_m = strict_int32(profile["m"], "Laser.profile.m");
-    }
-    const bool is_table = laser.profile_model == "table";
-    if (is_table) {
-      if (!has_key(profile, "r_um") || !has_key(profile, "I_rel")) {
-        throw ConfigError("Laser profile model=\"table\" requires r_um and I_rel");
-      }
-      if (has_key(profile, "w0_um") || has_key(profile, "m")) {
-        throw ConfigError("Laser profile model=\"table\" does not take w0_um/m");
-      }
-      const std::vector<double> r_um_v =
-          strict_double_vector(profile["r_um"], "Laser.profile.r_um");
-      const std::vector<double> I_v =
-          strict_double_vector(profile["I_rel"], "Laser.profile.I_rel");
-      if (r_um_v.size() < 2 || r_um_v.size() != I_v.size()) {
-        throw ConfigError(
-            "Laser profile table needs >= 2 points with equal-length r_um and I_rel");
-      }
-      double prev = -1.0;
-      double imax = 0.0;
-      for (std::size_t k = 0; k < r_um_v.size(); ++k) {
-        if (!(r_um_v[k] >= 0.0) || !(r_um_v[k] > prev)) {
-          throw ConfigError("Laser profile table r_um must be >= 0 and strictly ascending");
-        }
-        prev = r_um_v[k];
-        if (!(I_v[k] >= 0.0)) {
-          throw ConfigError("Laser profile table I_rel must be >= 0");
-        }
-        imax = std::max(imax, I_v[k]);
-      }
-      if (!(imax > 0.0)) {
-        throw ConfigError("Laser profile table I_rel must not be all zero");
-      }
-      laser.profile_r_cm.clear();
-      for (const double r : r_um_v) laser.profile_r_cm.push_back(r * 1.0e-4);
-      laser.profile_I = I_v;
-    } else if (has_key(profile, "r_um") || has_key(profile, "I_rel")) {
-      throw ConfigError("Laser profile r_um/I_rel require model=\"table\"");
-    }
+    parse_laser_profile_dict(profile, "Laser.profile", laser.profile_model,
+                             laser.profile_w0_um, laser.profile_m, laser.profile_r_cm,
+                             laser.profile_I);
   }
 
   if (!has_key(kwargs, "beams")) {
@@ -7797,7 +7940,7 @@ void Builder::set_laser(py::dict kwargs) {
     enforce_known_keys(beam, "Laser.beams",
                        {"name", "direction", "theta", "phi", "f_number", "focus",
                         "defocus_DR", "delta_lambda_nm", "power", "profile", "profile_model",
-                        "profile_w0_um", "profile_m", "spot"});
+                        "profile_w0_um", "profile_m", "spot", "energy_J"});
 
     if (has_key(beam, "spot")) {
       if (has_key(beam, "profile")) {
@@ -7868,6 +8011,13 @@ void Builder::set_laser(py::dict kwargs) {
       out.delta_lambda_nm = numeric_as_double(
           beam["delta_lambda_nm"], "Laser.beams[" + std::to_string(i) + "].delta_lambda_nm");
     }
+    if (has_key(beam, "energy_J") && !beam["energy_J"].is_none()) {
+      out.energy_J = numeric_as_double(
+          beam["energy_J"], "Laser.beams[" + std::to_string(i) + "].energy_J");
+      if (!(std::isfinite(out.energy_J) && out.energy_J > 0.0)) {
+        throw ConfigError("Laser.beams[" + std::to_string(i) + "].energy_J must be > 0");
+      }
+    }
 
     if (has_key(beam, "profile")) {
       const py::handle profile_obj = beam["profile"];
@@ -7875,55 +8025,9 @@ void Builder::set_laser(py::dict kwargs) {
         throw_value_type_error("Laser.beams.profile", "dict", profile_obj);
       }
       const py::dict profile = py::reinterpret_borrow<py::dict>(profile_obj);
-      enforce_known_keys(profile, "Laser.beams.profile",
-                         {"model", "w0_um", "m", "r_um", "I_rel"});
-      if (has_key(profile, "model")) {
-        out.profile_model = strict_string(profile["model"], "Laser.beams.profile.model");
-      }
-      if (has_key(profile, "w0_um")) {
-        out.profile_w0_um =
-            numeric_as_double(profile["w0_um"], "Laser.beams.profile.w0_um");
-      }
-      if (has_key(profile, "m")) {
-        out.profile_m = strict_int32(profile["m"], "Laser.beams.profile.m");
-      }
-      const bool is_table = out.profile_model == "table";
-      if (is_table) {
-        if (!has_key(profile, "r_um") || !has_key(profile, "I_rel")) {
-          throw ConfigError("Laser profile model=\"table\" requires r_um and I_rel");
-        }
-        if (has_key(profile, "w0_um") || has_key(profile, "m")) {
-          throw ConfigError("Laser profile model=\"table\" does not take w0_um/m");
-        }
-        const std::vector<double> r_um_v =
-            strict_double_vector(profile["r_um"], "Laser.beams.profile.r_um");
-        const std::vector<double> I_v =
-            strict_double_vector(profile["I_rel"], "Laser.beams.profile.I_rel");
-        if (r_um_v.size() < 2 || r_um_v.size() != I_v.size()) {
-          throw ConfigError(
-              "Laser profile table needs >= 2 points with equal-length r_um and I_rel");
-        }
-        double prev = -1.0;
-        double imax = 0.0;
-        for (std::size_t k = 0; k < r_um_v.size(); ++k) {
-          if (!(r_um_v[k] >= 0.0) || !(r_um_v[k] > prev)) {
-            throw ConfigError("Laser profile table r_um must be >= 0 and strictly ascending");
-          }
-          prev = r_um_v[k];
-          if (!(I_v[k] >= 0.0)) {
-            throw ConfigError("Laser profile table I_rel must be >= 0");
-          }
-          imax = std::max(imax, I_v[k]);
-        }
-        if (!(imax > 0.0)) {
-          throw ConfigError("Laser profile table I_rel must not be all zero");
-        }
-        out.profile_r_cm.clear();
-        for (const double r : r_um_v) out.profile_r_cm.push_back(r * 1.0e-4);
-        out.profile_I = I_v;
-      } else if (has_key(profile, "r_um") || has_key(profile, "I_rel")) {
-        throw ConfigError("Laser profile r_um/I_rel require model=\"table\"");
-      }
+      parse_laser_profile_dict(profile, "Laser.beams.profile", out.profile_model,
+                               out.profile_w0_um, out.profile_m, out.profile_r_cm,
+                               out.profile_I);
     }
     if (has_key(beam, "profile_model")) {
       out.profile_model =
@@ -13961,6 +14065,7 @@ void Builder::set_numerics(py::dict kwargs) {
                        {"enabled", "every_n_steps", "min_steps_between_ale",
                         "enable_benefit_gate", "benefit_min_dt_gain",
                         "candidate_dt_penalty_max", "emergency_enabled",
+                        "emergency_max_dr_ratio",
                         "min_cells", "protected_fraction_max",
                         "min_movable_segment_warn", "min_movable_segment_hard",
                         "max_node_displacement_fraction_mu",
@@ -14223,6 +14328,10 @@ void Builder::set_numerics(py::dict kwargs) {
     if (has_key(ale1d, "emergency_enabled")) {
       ale1d_cfg.emergency_enabled = strict_bool(
           ale1d["emergency_enabled"], "Numerics.ale1d.emergency_enabled");
+    }
+    if (has_key(ale1d, "emergency_max_dr_ratio")) {
+      ale1d_cfg.emergency_max_dr_ratio = numeric_as_double(
+          ale1d["emergency_max_dr_ratio"], "Numerics.ale1d.emergency_max_dr_ratio");
     }
     if (has_key(ale1d, "min_cells")) {
       ale1d_cfg.min_cells =
@@ -15225,6 +15334,21 @@ void Builder::validate() {
   if (!is_dimension(main.dimension)) {
     throw ConfigError("Main.dimension must be \"1D_SPH\", \"1D_CYL\", or \"2D_RZ\"");
   }
+  // Main.dimension="1D_CYL" is Main.dimension="1D_SPH" with
+  // Mesh.geometry_1d="cylindrical" (2026-09-24): every 1D physics that
+  // supports the cylindrical geometry (radiation, conduction, the radial
+  // laser absorption, ALE) is available with it. Until 2026-09-23 1D_CYL
+  // allowed the hydro core only and rejected the rest, although the same
+  // physics ran with geometry_1d="cylindrical".
+  if (main.dimension == "1D_CYL") {
+    if (mesh.geometry_1d == "planar") {
+      throw ConfigError(
+          "Main.dimension=\"1D_CYL\" is the cylindrical 1D geometry; it cannot be"
+          " combined with Mesh.geometry_1d=\"planar\"");
+    }
+    main.dimension = "1D_SPH";
+    mesh.geometry_1d = "cylindrical";
+  }
   if (numerics.hydro.pressure_drive_perturbation.enabled &&
       main.dimension != "2D_RZ") {
     throw ConfigError(
@@ -15472,13 +15596,16 @@ void Builder::validate() {
     }
   }
   if (laser.enabled && laser.cbet.enable) {
-    const bool cbet_ok_1d = (main.dimension == "1D_SPH" && laser.mode == "raytrace_2d");
+    // The 1D CBET rides on the spherical ray trace (Main.dimension="1D_CYL"
+    // is the cylindrical 1D_SPH geometry since 2026-09-24).
+    const bool cbet_ok_1d = (main.dimension == "1D_SPH" && mesh.geometry_1d == "spherical" &&
+                             laser.mode == "raytrace_2d");
     const bool cbet_ok_2d = (main.dimension == "2D_RZ" && laser.mode == "raytrace_3d");
     if (!cbet_ok_1d && !cbet_ok_2d) {
       throw ConfigError(
-          "Laser.cbet.enable=True requires Main.dimension=\"1D_SPH\" with "
-          "Laser.mode=\"raytrace_2d\", or Main.dimension=\"2D_RZ\" with "
-          "Laser.mode=\"raytrace_3d\"");
+          "Laser.cbet.enable=True requires Main.dimension=\"1D_SPH\" (spherical"
+          " Mesh.geometry_1d) with Laser.mode=\"raytrace_2d\", or"
+          " Main.dimension=\"2D_RZ\" with Laser.mode=\"raytrace_3d\"");
     }
   }
   if (burn.enabled) {
@@ -16666,9 +16793,12 @@ void Builder::validate() {
         if (callable == callable_objects.end()) {
           continue;
         }
-        auto table = tenryu::core::namelist::create_frozen_table(
-            callable->second, 0.0, config.main.t_end, 10000);
+        auto table = tenryu::core::namelist::create_frozen_time_table(
+            callable->second, config.main.t_end, path, /*require_non_negative=*/true);
         table.zero_outside = true;
+        tenryu::core::namelist::normalize_beam_power_table(
+            table, config.main.t_end, config.laser.beams[i].energy_J,
+            ("Laser.beams[" + std::to_string(i) + "]").c_str());
         beam_tables.push_back(std::move(table));
       }
 
@@ -16690,14 +16820,7 @@ void Builder::validate() {
         inputs.t_end = config.main.t_end;
         inputs.wavelength_nm = config.laser.wavelength_nm;
         inputs.laser_enabled = config.laser.enabled;
-        inputs.power_W = beam_tables.front();
-        std::fill(inputs.power_W.y.begin(), inputs.power_W.y.end(), 0.0);
-        inputs.power_W.zero_outside = true;
-        for (const auto& table : beam_tables) {
-          for (std::size_t k = 0; k < inputs.power_W.x.size(); ++k) {
-            inputs.power_W.y[k] += table.eval(inputs.power_W.x[k]);
-          }
-        }
+        inputs.power_W = tenryu::core::namelist::sum_frozen_tables(beam_tables);
 
         inputs.materials.reserve(config.materials.materials.size());
         for (const auto& material : config.materials.materials) {
@@ -17189,10 +17312,18 @@ void Builder::validate() {
   if (materials.first_nonvoid_material_index() < 0) {
     throw ConfigError("Materials must include at least one non-void material");
   }
+  if (materials.opacity_mix_rule != "linear_mass" && main.dim != 1) {
+    throw ConfigError("Materials.opacity_mix_rule=\"" + materials.opacity_mix_rule +
+                      "\" is implemented for 1D only; 2D mixes linearly (\"linear_mass\")");
+  }
   std::string first_nlte_file;    // tracks first NLTE tabular opacity file for group derivation
   std::string first_nlte_source;  // "IONMIX" or "TMAT"
   std::vector<double> first_nlte_original_bounds;
   int tmat_ionization_count = 0;
+  // Species composition (nuclear charge ascending, number fraction) of each
+  // TMAT material, from its /material block; empty when not a TMAT material.
+  // Feeds the Laser.ib.zeff_model="auto" resolution below.
+  std::vector<SpeciesComposition> tmat_compositions(materials.materials.size());
   std::set<std::string> names;
   for (std::size_t material_index = 0;
        material_index < materials.materials.size();
@@ -17307,15 +17438,67 @@ void Builder::validate() {
         throw ConfigError("TMAT file \"" + mat.eos_file +
                           "\" has eos.model='tmat' but does not contain /eos payload");
       }
+      {
+        // Number fractions from /material/number_fraction when present,
+        // otherwise x_e = (w_e/A_e) / sum(w/A) (the convention of
+        // tmat_ionization_to_zeff_ratio); equal charges are merged.
+        const auto& info = tmat.material;
+        SpeciesComposition composition;
+        const bool have_nf = info.number_fraction.size() == info.Z.size();
+        double norm = 0.0;
+        for (std::size_t e = 0; e < info.Z.size(); ++e) {
+          const double x =
+              have_nf ? info.number_fraction[e]
+                      : ((e < info.mass_fraction.size() && e < info.A_amu.size() &&
+                          info.A_amu[e] > 0.0)
+                             ? info.mass_fraction[e] / info.A_amu[e]
+                             : 0.0);
+          if (x > 0.0) {
+            composition.emplace_back(static_cast<double>(info.Z[e]), x);
+            norm += x;
+          }
+        }
+        std::sort(composition.begin(), composition.end());
+        SpeciesComposition merged;
+        for (const auto& entry : composition) {
+          if (!merged.empty() && merged.back().first == entry.first) {
+            merged.back().second += entry.second;
+          } else {
+            merged.push_back(entry);
+          }
+        }
+        if (norm > 0.0) {
+          for (auto& entry : merged) {
+            entry.second /= norm;
+          }
+          tmat_compositions[material_index] = std::move(merged);
+        }
+      }
       if (tmat.ionization.has_value()) {
         ++tmat_ionization_count;
+        const materials::ZeffRatioTable zeff_table =
+            materials::resample_zeff_ratio_log_uniform(
+                materials::tmat_ionization_to_zeff_ratio(
+                    *tmat.ionization, tmat.material),
+                256,
+                128);
+        // Every material's tables (multi-material decks take each cell's
+        // material's moments and collision charge, 2026-09-24).
+        if (materials.zmoments_by_material.size() != materials.materials.size()) {
+          materials.zmoments_by_material.assign(
+              materials.materials.size(), std::decay_t<decltype(materials.zmoments)>{});
+        }
+        {
+          auto& own = materials.zmoments_by_material[material_index];
+          own.ndens = zeff_table.ndens;
+          own.ntemp = zeff_table.ntemp;
+          own.ni_grid = zeff_table.ni_grid;
+          own.T_grid_eV = zeff_table.T_grid_eV;
+          own.r2 = zeff_table.ratio;
+          own.r4 = zeff_table.ratio4;
+          own.provider_material = static_cast<int>(material_index);
+        }
         if (tmat_ionization_count == 1) {
-          const materials::ZeffRatioTable zeff_table =
-              materials::resample_zeff_ratio_log_uniform(
-                  materials::tmat_ionization_to_zeff_ratio(
-                      *tmat.ionization, tmat.material),
-                  256,
-                  128);
           materials.zmoments.ndens = zeff_table.ndens;
           materials.zmoments.ntemp = zeff_table.ntemp;
           materials.zmoments.ni_grid = zeff_table.ni_grid;
@@ -17474,6 +17657,13 @@ void Builder::validate() {
                             mat.name + "\"].opacity.file=\"" + mat.opacity_file +
                             "\": " + ex.what());
         }
+        if (mat.opacity_lte_required && !ionmix_opacity.is_lte) {
+          throw ConfigError("Materials.materials[\"" + mat.name +
+                            "\"].opacity.model=\"ionmix\" requires an LTE table, but \"" +
+                            mat.opacity_file +
+                            "\" has an emission opacity that differs from its absorption "
+                            "opacity; use opacity.model=\"table_nlte\" for non-LTE tables");
+        }
       } else {
         try {
           const materials::TmatFile tmat = materials::load_tmat(mat.opacity_file);
@@ -17556,18 +17746,12 @@ void Builder::validate() {
       }
     }
     if (!is_runtime_supported_opacity_model(mat.opacity_model)) {
-      tenryu::core::log_warning(
-          "Materials.materials[\"" + mat.name + "\"].opacity.model=\"" +
-          mat.opacity_model +
-          "\" requests tabular opacity, but IONMIX/SESAME tabular opacity "
-          "interpolation is not implemented yet; current runtime path would fall "
-          "back to constant opacity.");
       throw ConfigError(
           "Materials.materials[\"" + mat.name + "\"].opacity.model=\"" +
           mat.opacity_model +
-          "\" is not supported in this build. Use opacity.model=\"constant\" or "
-          "\"freq_dep_marshak\" or \"table_nlte\" or \"tmat\" or "
-          "\"power_law\" explicitly.");
+          "\" is not supported in this build (SESAME opacity tables are not "
+          "implemented). Use opacity.model=\"constant\", \"ionmix\", "
+          "\"freq_dep_marshak\", \"table_nlte\", \"tmat\" or \"power_law\".");
     }
   }
 
@@ -18039,11 +18223,29 @@ void Builder::validate() {
         "Radiation.multigroup_diffusion.cg_tol_norm must be one of "
         "{\"r0\", \"rhs\"}");
   }
-  if (radiation.multigroup_diffusion.outer_accel != "none" &&
-      radiation.multigroup_diffusion.outer_accel != "anderson") {
+  if (radiation.multigroup_diffusion.outer_accel != "auto" &&
+      radiation.multigroup_diffusion.outer_accel != "none" &&
+      radiation.multigroup_diffusion.outer_accel != "anderson" &&
+      radiation.multigroup_diffusion.outer_accel != "grey") {
     throw ConfigError(
         "Radiation.multigroup_diffusion.outer_accel must be one of "
-        "{\"none\", \"anderson\"}");
+        "{\"auto\", \"none\", \"anderson\", \"grey\"}");
+  }
+  // "grey" (the multifrequency-grey correction of the outer iteration) is the
+  // 1D FLD scheme; "auto" selects it in 1D and no acceleration in 2D_RZ.
+  if (radiation.multigroup_diffusion.outer_accel == "auto") {
+    radiation.multigroup_diffusion.outer_accel = (main.dimension == "2D_RZ") ? "none" : "grey";
+  } else if (radiation.multigroup_diffusion.outer_accel == "grey" &&
+             main.dimension == "2D_RZ") {
+    throw ConfigError(
+        "Radiation.multigroup_diffusion.outer_accel=\"grey\" is implemented for the 1D FLD "
+        "only");
+  }
+  if (radiation.multigroup_diffusion.limiter_evaluation != "predictor" &&
+      radiation.multigroup_diffusion.limiter_evaluation != "iterate") {
+    throw ConfigError(
+        "Radiation.multigroup_diffusion.limiter_evaluation must be one of "
+        "{\"predictor\", \"iterate\"}");
   }
   if (radiation.multigroup_diffusion.anderson_m < 1 ||
       radiation.multigroup_diffusion.anderson_m > 4) {
@@ -18315,11 +18517,30 @@ void Builder::validate() {
         "{\"level_symmetric_8\", \"level_symmetric_16\", \"level_symmetric_32\", "
         "\"product\"}");
   }
+  // 1D default (2026-09-25): the linear-discontinuous scheme (NUMERICS
+  // 6.8.4) — the in-cell emission and electron temperature it carries give
+  // the diffusion-limit current in optically thick cells, which the
+  // linear-characteristic scheme's cell-constant emission does not
+  // (Marshak wave at sigma dr = 4 against a 16x finer mesh: max temperature
+  // error 0.10 / 0.07 of the drive temperature in the sphere / slab, against
+  // 0.70 / 0.60).
+  if (!radiation.sn_transport.spatial_scheme_explicit && main.dimension == "1D_SPH") {
+    radiation.sn_transport.spatial_scheme = "linear_discontinuous";
+  }
   if (radiation.sn_transport.spatial_scheme != "diamond_difference" &&
-      radiation.sn_transport.spatial_scheme != "linear_characteristic") {
+      radiation.sn_transport.spatial_scheme != "linear_characteristic" &&
+      radiation.sn_transport.spatial_scheme != "linear_discontinuous") {
     throw ConfigError(
-        "Radiation.sn_transport.spatial_scheme must be \"diamond_difference\" "
-        "or \"linear_characteristic\"");
+        "Radiation.sn_transport.spatial_scheme must be \"diamond_difference\", "
+        "\"linear_characteristic\" or \"linear_discontinuous\"");
+  }
+  if (radiation.sn_transport.spatial_scheme == "linear_discontinuous" &&
+      main.dimension != "1D_SPH") {
+    // radiation/sn_ld_1d_gpu: the 1D sweep (spherical, cylindrical and
+    // planar geometry).
+    throw ConfigError(
+        "Radiation.sn_transport.spatial_scheme=\"linear_discontinuous\" is "
+        "implemented for 1D (Main.dimension=\"1D_SPH\" or \"1D_CYL\") only");
   }
   if (radiation.sn_transport.max_outer_iterations < 1) {
     throw ValueError(
@@ -18343,8 +18564,47 @@ void Builder::validate() {
   if (!(radiation.sn_transport.inner_tol > 0.0)) {
     throw ValueError("Radiation.sn_transport.inner_tol must be > 0");
   }
+  if (radiation.sn_transport.grey_preconditioner != "auto" &&
+      radiation.sn_transport.grey_preconditioner != "on" &&
+      radiation.sn_transport.grey_preconditioner != "off") {
+    throw ConfigError(
+        "Radiation.sn_transport.grey_preconditioner must be \"auto\", \"on\" or \"off\"");
+  }
+  if (radiation.sn_transport.grey_preconditioner != "auto" &&
+      radiation.sn_transport.spatial_scheme != "linear_discontinuous") {
+    // The grey low-order preconditioner belongs to the linear-discontinuous
+    // scheme's emission GMRES (radiation/sn_ld_1d_gpu).
+    throw ConfigError(
+        "Radiation.sn_transport.grey_preconditioner applies to spatial_scheme="
+        "\"linear_discontinuous\" only; leave it unset for \"" +
+        radiation.sn_transport.spatial_scheme + "\"");
+  }
   if (radiation.sn_transport.inner_graph_unroll < 1) {
     throw ValueError("Radiation.sn_transport.inner_graph_unroll must be >= 1");
+  }
+  if (radiation.sn_transport.inner_acceleration != "none" &&
+      radiation.sn_transport.inner_acceleration != "anderson") {
+    throw ConfigError(
+        "Radiation.sn_transport.inner_acceleration must be \"none\" or \"anderson\"");
+  }
+  if (radiation.sn_transport.anderson_depth < 1 || radiation.sn_transport.anderson_depth > 4) {
+    throw ValueError("Radiation.sn_transport.anderson_depth must be in [1, 4]");
+  }
+  if (radiation.mode == RadiationMode::SnTransport &&
+      radiation.sn_transport.inner_acceleration == "anderson" &&
+      radiation.sn_transport.spatial_scheme == "linear_discontinuous") {
+    // radiation/sn_ld_1d_gpu converges the emission coupling by GMRES and the
+    // scattering with its consistent P1 correction; the Anderson mixing
+    // belongs to the linear-characteristic source iteration.
+    throw ConfigError(
+        "Radiation.sn_transport.inner_acceleration=\"anderson\" applies to "
+        "spatial_scheme=\"linear_characteristic\"; the linear-discontinuous "
+        "scheme has its own iteration (leave inner_acceleration=\"none\")");
+  }
+  if (radiation.mode == RadiationMode::SnTransport &&
+      radiation.sn_transport.inner_acceleration == "anderson" && main.dimension != "1D_SPH") {
+    throw ConfigError(
+        "Radiation.sn_transport.inner_acceleration=\"anderson\" is implemented for 1D_SPH");
   }
   if (radiation.mode == RadiationMode::SnTransport &&
       radiation.sn_transport.n_angles == 8) {
@@ -18462,17 +18722,21 @@ void Builder::validate() {
           " Radiation.boundary.marshak_Tr or marshak_Tr_eV");
     }
   }
+  if (numerics.materials.per_material_conservation_enabled &&
+      main.dimension != "2D_RZ") {
+    throw ConfigError(
+        "Numerics.materials.per_material_conservation_enabled=True is"
+        " supported in 2D_RZ only. 1D keeps one electron and one ion"
+        " temperature per cell and closes a cell holding several materials"
+        " as a mixture; the per-material thermodynamics would take each"
+        " material's ionization as its nuclear charge (or Materials.zbar"
+        " fixed_value) instead of the ionization model, and the 1D hydro,"
+        " laser, radiation and burn operators update the cell energies only");
+  }
   if (radiation.enabled) {
     const auto nonvoid_material_count = std::count_if(
         materials.materials.begin(), materials.materials.end(),
         [](const auto& mat) { return !mat.is_void; });
-    if (nonvoid_material_count > 1 &&
-        numerics.materials.per_material_conservation_enabled) {
-      if (main.dimension != "2D_RZ") {
-        throw ConfigError(
-            "multi-material radiation is wired for 2D_RZ only (I4 G-1); 1D is not yet supported");
-      }
-    }
     if (nonvoid_material_count > 1 && main.dimension == "2D_RZ") {
       for (const auto& mat : materials.materials) {
         if (mat.is_void) {
@@ -18709,8 +18973,71 @@ void Builder::validate() {
   if (laser.raytrace.max_steps > 100000) {
     throw ValueError("Laser.raytrace.max_steps must be <= 100000");
   }
-  if (laser.raytrace.integrator != "leapfrog") {
-    throw ConfigError("Laser.raytrace.integrator must be \"leapfrog\" in v1.0");
+  if (laser.raytrace.integrator != "auto" && laser.raytrace.integrator != "leapfrog" &&
+      laser.raytrace.integrator != "characteristic") {
+    throw ConfigError(
+        "Laser.raytrace.integrator must be \"auto\", \"leapfrog\" or \"characteristic\"");
+  }
+  if (laser.raytrace.azimuthal_rays < 1 || laser.raytrace.azimuthal_rays > 4096) {
+    throw ValueError("Laser.raytrace.azimuthal_rays must be in [1, 4096]");
+  }
+  if (laser.raytrace.lanes_per_ray != 0 && laser.raytrace.lanes_per_ray != 32 &&
+      laser.raytrace.lanes_per_ray != 64 && laser.raytrace.lanes_per_ray != 128 &&
+      laser.raytrace.lanes_per_ray != 256) {
+    throw ValueError("Laser.raytrace.lanes_per_ray must be 0 (chosen by the launcher), 32, 64, "
+                     "128 or 256");
+  }
+  {
+    // "characteristic" integrates the 1D rays along their characteristics
+    // (NUMERICS 5.3.6); "auto" selects it there and the leapfrog march
+    // elsewhere. The march traces spheres only: a 1D cylinder or slab
+    // (Mesh.geometry_1d, NUMERICS 5.3.6 (g)) requires the characteristic
+    // integrator.
+    const bool trace_1d = main.dimension == "1D_SPH" && laser.mode == "raytrace_2d";
+    if (laser.raytrace.integrator == "auto") {
+      laser.raytrace.integrator = trace_1d ? "characteristic" : "leapfrog";
+    } else if (laser.raytrace.integrator == "characteristic" && laser.enabled && !trace_1d) {
+      throw ConfigError(
+          "Laser.raytrace.integrator=\"characteristic\" requires Main.dimension=\"1D_SPH\""
+          " with Laser.mode=\"raytrace_2d\"");
+    }
+    if (laser.raytrace.lanes_per_ray != 0 && laser.raytrace.integrator != "characteristic") {
+      throw ConfigError(
+          "Laser.raytrace.lanes_per_ray applies to the characteristic integrator only (the 1D "
+          "raytrace_2d trace); leave it unset for Laser.raytrace.integrator=\"" +
+          laser.raytrace.integrator + "\"");
+    }
+    if (laser.enabled && trace_1d && mesh.geometry_1d != "spherical" &&
+        laser.raytrace.integrator != "characteristic") {
+      throw ConfigError(
+          "Laser.raytrace.integrator=\"leapfrog\" traces spheres only; Mesh.geometry_1d=\"" +
+          mesh.geometry_1d + "\" requires the characteristic integrator (\"auto\")");
+    }
+    // critical_handling.terminate = False: rays that reach the critical
+    // radius reflect there and are traced outward (no analytic critical-layer
+    // tail closure); implemented by the characteristic integrator only
+    // (2026-09-24; the value used to be accepted and ignored). It is the
+    // default of the characteristic integrator: the analytic closure absorbs
+    // only the one-way depth to the critical density and the ray then
+    // escapes without its outward path (NUMERICS 5.2).
+    if (!laser.absorption.terminate_explicit && laser.raytrace.integrator == "characteristic" &&
+        laser.absorption.terminate_mode != "deposit") {
+      laser.absorption.terminate = false;
+    }
+    if (!laser.absorption.terminate && laser.enabled) {
+      if (laser.raytrace.integrator != "characteristic") {
+        throw ConfigError(
+            "Laser.absorption.critical_handling.terminate=False (reflection at the critical"
+            " radius) requires Laser.raytrace.integrator=\"characteristic\" (1D_SPH,"
+            " Laser.mode=\"raytrace_2d\")");
+      }
+      if (laser.absorption.terminate_mode == "deposit") {
+        throw ConfigError(
+            "Laser.absorption.critical_handling.terminate_mode=\"deposit\" deposits the"
+            " power of the rays that terminate at the critical radius; with terminate=False"
+            " they reflect instead");
+      }
+    }
   }
   if (!std::isfinite(laser.raytrace.test_kappa)) {
     throw ValueError("Laser.raytrace.test_kappa must be finite");
@@ -18752,14 +19079,98 @@ void Builder::validate() {
         laser.deposit.deposit_smooth_alpha <= 0.5)) {
     throw ValueError("Laser.deposit.deposit_smooth_alpha must be in [0, 0.5]");
   }
+  // Per-material collision charge (NUMERICS §5.4.5(a), 2026-09-24): a 1D
+  // deck with more than one non-void material resolves the model of every
+  // material from its own TMAT ionization table and composition; the laser
+  // takes each laser-mesh node's material.
+  const std::string zeff_model_requested = laser.ib.zeff_model;
+  const bool zeff_species_given = !laser.ib.species_z.empty();
+  // The IB extensions act in the spherical 1D ray trace (the cylindrical and
+  // planar 1D geometries use the radial absorption, 1D_CYL included).
+  const bool ib_ext_geometry = main.dimension == "1D_SPH" && mesh.geometry_1d == "spherical";
+  const bool zeff_per_material =
+      ib_ext_geometry && laser.enabled &&
+      std::count_if(materials.materials.begin(), materials.materials.end(),
+                    [](const auto& mat) { return !mat.is_void; }) > 1;
+  if (laser.ib.zeff_model == "auto" && zeff_per_material) {
+    laser.ib.zeff_model = "off";
+  }
   if (laser.ib.zeff_model == "auto") {
-    if (laser.ib.zeff_table.ndens > 0) {
-      laser.ib.zeff_model = "table";
-      tenryu::core::log_info(
-          "Laser.ib.zeff_model=auto -> table (TMAT ionization fractions detected)");
-    } else {
-      laser.ib.zeff_model = "off";
+    // Mixed-ion collision charge for inverse bremsstrahlung (NUMERICS §5.4.5(a));
+    // a mixture resolved to "off" is reported instead of silently using the
+    // mean Zbar (2026-09-23).
+    const LaserZeffResolution zeff = resolve_laser_zeff_auto(
+        laser.ib.zeff_table.ndens > 0, laser.ib.species_z, materials.materials,
+        tmat_compositions, laser.enabled, ib_ext_geometry);
+    laser.ib.zeff_model = zeff.model;
+    if (!zeff.species_z.empty()) {
+      laser.ib.species_z = zeff.species_z;
+      laser.ib.species_x = zeff.species_x;
     }
+    if (!zeff.info.empty()) {
+      tenryu::core::log_info(zeff.info);
+    }
+    if (!zeff.warning.empty()) {
+      tenryu::core::log_warning(zeff.warning);
+    }
+  }
+  if (zeff_per_material) {
+    laser.ib.material_zeff.assign(materials.materials.size(), {});
+    std::ostringstream summary;
+    summary << "Laser.ib.zeff_model=" << zeff_model_requested << " per material:";
+    for (std::size_t m = 0; m < materials.materials.size(); ++m) {
+      const auto& mat = materials.materials[m];
+      auto& mz = laser.ib.material_zeff[m];
+      if (mat.is_void) {
+        continue;
+      }
+      const bool has_table = m < materials.zmoments_by_material.size() &&
+                             materials.zmoments_by_material[m].ndens > 0;
+      std::vector<double> z_list;
+      std::vector<double> x_list;
+      if (zeff_species_given) {
+        z_list = laser.ib.species_z;
+        x_list = laser.ib.species_x;
+      } else if (m < tmat_compositions.size()) {
+        for (const auto& entry : tmat_compositions[m]) {
+          z_list.push_back(entry.first);
+          x_list.push_back(entry.second);
+        }
+      }
+      const bool strip_possible = z_list.size() > 1 && z_list.size() <= 4;
+      if (zeff_model_requested == "table" ||
+          (zeff_model_requested == "auto" && has_table)) {
+        mz.model = has_table ? "table" : "off";
+      } else if (zeff_model_requested == "sequential_strip" ||
+                 zeff_model_requested == "auto") {
+        mz.model = strip_possible ? "sequential_strip" : "off";
+      } else {
+        mz.model = "off";
+      }
+      if (mz.model == "sequential_strip") {
+        mz.species_z = z_list;
+        mz.species_x = x_list;
+      }
+      if (mz.model == "table") {
+        const auto& zt = materials.zmoments_by_material[m];
+        mz.zeff_table.ndens = zt.ndens;
+        mz.zeff_table.ntemp = zt.ntemp;
+        mz.zeff_table.ni_grid = zt.ni_grid;
+        mz.zeff_table.T_grid_eV = zt.T_grid_eV;
+        mz.zeff_table.ratio = zt.r2;
+      }
+      // Langdon: the fully ionized collision charge of the composition
+      // (corona-valid), else the local Zbar.
+      double num = 0.0;
+      double den = 0.0;
+      for (std::size_t e = 0; e < z_list.size() && e < x_list.size(); ++e) {
+        num += x_list[e] * z_list[e] * z_list[e];
+        den += x_list[e] * z_list[e];
+      }
+      mz.langdon_zcoll = (den > 0.0) ? num / den : 0.0;
+      summary << " " << mat.name << "=" << mz.model;
+    }
+    tenryu::core::log_info(summary.str());
   }
   if (laser.ib.langdon_model == "auto") {
     std::string off_reason;
@@ -18769,6 +19180,9 @@ void Builder::validate() {
       off_reason = "not 1D_SPH";
     } else if (laser.mode == "radial_absorption_1d") {
       off_reason = "radial_absorption_1d path (Langdon not applied there)";
+    } else if (mesh.geometry_1d != "spherical") {
+      off_reason = "Mesh.geometry_1d=\"" + mesh.geometry_1d +
+                   "\" (the vacuum map is the round beam's on a sphere)";
     } else {
       const std::string profile_error =
           langdon_profile_compatibility_error(laser);
@@ -18801,6 +19215,11 @@ void Builder::validate() {
           "Laser.ib.langdon_model=legacy_vacuum_map is not supported for "
           "radial_absorption_1d");
     }
+    if (laser.enabled && mesh.geometry_1d != "spherical") {
+      throw ConfigError(
+          "Laser.ib.langdon_model=legacy_vacuum_map requires Mesh.geometry_1d="
+          "\"spherical\" (the vacuum map is the round beam's intensity on a sphere)");
+    }
     const std::string profile_error =
         langdon_profile_compatibility_error(laser);
     if (!profile_error.empty()) {
@@ -18809,29 +19228,27 @@ void Builder::validate() {
           "vacuum-map compatible (" + profile_error + ")");
     }
   }
-  if (laser.ib.zeff_model == "table") {
+  if (laser.ib.zeff_model == "table" ||
+      (zeff_per_material && zeff_model_requested == "table")) {
     if (laser.ib.zeff_table.ndens <= 0) {
       throw ConfigError(
           "Laser.ib.zeff_model=table requires a tmat material with an "
           "/ionization block");
     }
-    if (tmat_ionization_count != 1) {
+    if (tmat_ionization_count != 1 && !zeff_per_material) {
       throw ConfigError(
           "Laser.ib.zeff_model=table requires exactly one tmat material with "
           "an /ionization block");
     }
   }
   if (materials.zmoments.ndens > 0) {
-    if (tmat_ionization_count != 1 ||
-        materials.zmoments.provider_material < 0) {
+    if (tmat_ionization_count < 1 || materials.zmoments.provider_material < 0) {
       throw ConfigError(
-          "TMAT ionization moments require exactly one tmat material with "
-          "an /ionization block");
+          "TMAT ionization moments require a tmat material with an /ionization block");
     }
-    if (materials.materials.size() != 1U) {
-      throw ConfigError(
-          "TMAT ionization moments currently require a single-material problem");
-    }
+    // Several materials: each cell takes its material's tables
+    // (zmoments_by_material; cells of a material without them take ratios
+    // of 1), 2026-09-24.
     if (main.dim != 1) {
       throw ConfigError("TMAT ionization moments are 1D_SPH-only in v1");
     }
@@ -18856,6 +19273,9 @@ void Builder::validate() {
           laser.lasermesh.ghost_corona.ne_min_frac)) {
       throw ValueError("Laser.lasermesh.ghost_corona.ne_max_frac must be > ne_min_frac");
     }
+    if (!(laser.lasermesh.ghost_corona.ne_max_frac < 1.0)) {
+      throw ValueError("Laser.lasermesh.ghost_corona.ne_max_frac must be < 1");
+    }
     if (!(laser.lasermesh.ghost_corona.Te_min_eV > 0.0)) {
       throw ValueError("Laser.lasermesh.ghost_corona.Te_min_eV must be > 0");
     }
@@ -18872,15 +19292,18 @@ void Builder::validate() {
     if (!(laser.lasermesh.ghost_corona.handoff_decay > 0.0)) {
       throw ValueError("Laser.lasermesh.ghost_corona.handoff_decay must be > 0");
     }
+    // The resolved-corona count also fades the ghost profile itself
+    // (NUMERICS §5.7.5.2), so both thresholds are checked whenever the ghost
+    // corona is enabled, not only with the handoff transition model.
+    if (!(laser.lasermesh.ghost_corona.transition_resolved_nhat > 0.0)) {
+      throw ValueError(
+          "Laser.lasermesh.ghost_corona.transition_resolved_nhat must be > 0");
+    }
+    if (laser.lasermesh.ghost_corona.transition_resolved_cells < 1) {
+      throw ValueError(
+          "Laser.lasermesh.ghost_corona.transition_resolved_cells must be >= 1");
+    }
     if (laser.lasermesh.ghost_corona.transition_enabled) {
-      if (!(laser.lasermesh.ghost_corona.transition_resolved_nhat > 0.0)) {
-        throw ValueError(
-            "Laser.lasermesh.ghost_corona.transition_resolved_nhat must be > 0");
-      }
-      if (laser.lasermesh.ghost_corona.transition_resolved_cells < 1) {
-        throw ValueError(
-            "Laser.lasermesh.ghost_corona.transition_resolved_cells must be >= 1");
-      }
       if (!(laser.lasermesh.ghost_corona.transition_density_exponent >= 0.0)) {
         throw ValueError(
             "Laser.lasermesh.ghost_corona.transition_density_exponent must be >= 0");
@@ -18986,11 +19409,32 @@ void Builder::validate() {
             "(8, 18, 32, 50, 72, ...); got " + std::to_string(n));
       }
     }
-    if (laser.enabled && laser.mode != "radial_absorption_1d") {
-      throw ConfigError(
-          "Mesh.geometry_1d != \"spherical\" requires"
-          " Laser.mode=\"radial_absorption_1d\" (raytrace_2d's beam-local"
-          " mesh is spherical-only)");
+    if (laser.enabled && laser.mode == "raytrace_2d") {
+      // The beams' lab directions set the incidence (NUMERICS 5.4): the
+      // cylinder's axis and the slab's normal are the lab z axis. A beam
+      // along the axis never reaches a cylinder; one parallel to a slab never
+      // reaches it.
+      for (std::size_t b = 0; b < laser.beams.size(); ++b) {
+        const auto& d = laser.beams[b].direction;
+        if (d.size() != 3) {
+          continue;
+        }
+        const double n = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+        const double along = (n > 0.0) ? std::abs(d[2]) / n : 1.0;
+        const double across = std::sqrt(std::max(0.0, 1.0 - along * along));
+        if (config.mesh.geometry_1d == "cylindrical" && !(across >= 1.0e-3)) {
+          throw ConfigError("Laser.beams[" + std::to_string(b) +
+                            "].direction is along the cylinder axis (lab z) for"
+                            " Mesh.geometry_1d=\"cylindrical\": the beam never reaches the"
+                            " target");
+        }
+        if (config.mesh.geometry_1d == "planar" && !(along >= 1.0e-3)) {
+          throw ConfigError("Laser.beams[" + std::to_string(b) +
+                            "].direction is parallel to the slab (perpendicular to lab z)"
+                            " for Mesh.geometry_1d=\"planar\": the beam never reaches the"
+                            " target");
+        }
+      }
     }
     if (numerics.conduction.test_planar) {
       throw ConfigError(
@@ -19010,10 +19454,12 @@ void Builder::validate() {
           " \"marshak\" for Main.dimension=\"1D_SPH\"");
     }
     if (snb.outer_r == "marshak") {
-      if (radiation.sn_transport.spatial_scheme != "linear_characteristic") {
+      if (radiation.sn_transport.spatial_scheme != "linear_characteristic" &&
+          radiation.sn_transport.spatial_scheme != "linear_discontinuous") {
         throw ConfigError(
             "1D_SPH SN marshak outer boundary requires"
-            " sn_transport.spatial_scheme=\"linear_characteristic\"");
+            " sn_transport.spatial_scheme=\"linear_characteristic\" or"
+            " \"linear_discontinuous\"");
       }
       const bool has_tr = radiation.boundary.marshak_Tr_eV > 0.0 ||
                           radiation.boundary.marshak_Tr.detected;
@@ -19035,36 +19481,43 @@ void Builder::validate() {
     }
   }
 
+  // Table opacities: the NLTE coefficient kernel implements
+  // Radiation.multigroup_diffusion.fleck_beta (tangent / secant / guard) and
+  // fleck_form (backward Euler / exp_phi1) as the constant-opacity Fleck
+  // kernel does (2026-09-24; both were refused for table opacities before).
+
   if (main.dimension == "1D_SPH" && radiation.enabled) {
     const auto n_nonvoid_materials = std::count_if(
         materials.materials.begin(), materials.materials.end(),
         [](const auto& mat) { return !mat.is_void; });
-    if (n_nonvoid_materials > 1) {
-      if (radiation.mode == RadiationMode::SnTransport) {
-        throw ConfigError(
-            "Radiation.mode=\"sn_transport\" does not support multiple "
-            "non-void materials in 1D_SPH (per-cell scattering-opacity "
-            "mixing is not implemented); use a single non-void material");
-      }
-      if (radiation.mode == RadiationMode::MultigroupDiffusion) {
-        for (std::size_t material_index = 0;
-             material_index < materials.materials.size();
-             ++material_index) {
-          const auto& mat = materials.materials[material_index];
-          if (mat.is_void) {
-            continue;
-          }
-          if (mat.opacity_model != "constant" && mat.opacity_model != "none" &&
-              mat.opacity_model != "tmat") {
-            throw ConfigError(
-                "Materials.materials[" + std::to_string(material_index) +
-                "].opacity.model=\"" + mat.opacity_model +
-                "\": 1D_SPH multi-material decks with "
-                "Radiation.mode=\"multigroup_diffusion\" support "
-                "per-material constant opacities and tmat tables; use "
-                "opacity model \"constant\", \"none\", or \"tmat\", "
-                "or reduce to a single non-void material");
-          }
+    if (n_nonvoid_materials > 1 &&
+        (radiation.mode == RadiationMode::MultigroupDiffusion ||
+         radiation.mode == RadiationMode::SnTransport)) {
+      // Every opacity model is evaluated per material (constant, tmat and
+      // table_nlte tables, power law, frequency-dependent Marshak; FLD
+      // 2026-09-24 for the last three; S_N 2026-09-24, with each material's
+      // physical scattering kappa_s).
+      const std::string mode_name =
+          (radiation.mode == RadiationMode::SnTransport) ? "sn_transport"
+                                                         : "multigroup_diffusion";
+      for (std::size_t material_index = 0;
+           material_index < materials.materials.size();
+           ++material_index) {
+        const auto& mat = materials.materials[material_index];
+        if (mat.is_void) {
+          continue;
+        }
+        if (mat.opacity_model != "constant" && mat.opacity_model != "none" &&
+            mat.opacity_model != "tmat" && mat.opacity_model != "table_nlte" &&
+            mat.opacity_model != "power_law" &&
+            mat.opacity_model != "freq_dep_marshak") {
+          throw ConfigError(
+              "Materials.materials[" + std::to_string(material_index) +
+              "].opacity.model=\"" + mat.opacity_model +
+              "\": 1D_SPH multi-material decks with "
+              "Radiation.mode=\"" + mode_name + "\" support the opacity "
+              "models \"constant\", \"none\", \"tmat\", \"table_nlte\", "
+              "\"power_law\" and \"freq_dep_marshak\"");
         }
       }
     }
@@ -19094,30 +19547,6 @@ void Builder::validate() {
   tenryu::core::validate_hydro_av_config(config);
   tenryu::core::validate_tri_fan_stage2_config(config);
   tenryu::core::validate_button_stage1_config(config);
-  if (main.dimension == "1D_CYL") {
-    // 1D_CYL v1 scope: pure hydro core only
-    // (docs/design/b1_1d_cyl_mode_spec.md section 3).
-    if (radiation.enabled) {
-      throw ConfigError(
-          "Radiation.enabled=True is not supported for "
-          "Main.dimension=\"1D_CYL\" (1D_CYL v1: pure hydro core only)");
-    }
-    if (laser.enabled) {
-      throw ConfigError(
-          "Laser.enabled=True is not supported for "
-          "Main.dimension=\"1D_CYL\" (1D_CYL v1: pure hydro core only)");
-    }
-    if (numerics.conduction.enabled) {
-      throw ConfigError(
-          "Numerics.conduction.enabled=True is not supported for "
-          "Main.dimension=\"1D_CYL\" (1D_CYL v1: pure hydro core only)");
-    }
-    if (numerics.ale1d.enabled) {
-      throw ConfigError(
-          "Numerics.ale1d.enabled=True is not supported for "
-          "Main.dimension=\"1D_CYL\" (1D_CYL v1: pure hydro core only)");
-    }
-  }
   if (numerics.hydro.compatible_energy && main.dimension != "1D_SPH") {
     throw ConfigError(
         "Numerics.hydro.compatible_energy=True is supported only in 1D_SPH");
@@ -20214,8 +20643,11 @@ void Builder::validate() {
       const std::string profile_model =
           beam.profile_model.empty() ? laser.profile_model : beam.profile_model;
       if (profile_model == "custom") {
+        // A profile dict with model="custom" is frozen into "table" at parse
+        // time; this is the flat profile_model key without a func.
         throw ConfigError("Laser.beams[" + std::to_string(i) +
-                          "] profile.model=\"custom\" is not implemented in M12");
+                          "] profile.model=\"custom\" needs profile=dict(model=\"custom\", "
+                          "func=..., r_max_um=...)");
       }
       if (profile_model != "gaussian" && profile_model != "super_gaussian" &&
           profile_model != "flat_top" && profile_model != "table") {
@@ -20233,6 +20665,25 @@ void Builder::validate() {
       if (!beam.focus.empty() && beam.focus.size() != 3) {
         throw ConfigError("Laser.beams[" + std::to_string(i) +
                           "].focus must contain exactly 3 values");
+      }
+      // The 1D ray rings weigh the profile on the plane through the target
+      // centre (NUMERICS 5.5); a focus at the centre maps every ring there.
+      if (main.dimension == "1D_SPH" && laser.mode == "raytrace_2d") {
+        const bool focus_at_centre =
+            (beam.focus.empty() && beam.defocus_DR == 0.0) ||
+            (beam.focus.size() == 3 && beam.focus[0] == 0.0 && beam.focus[1] == 0.0 &&
+             beam.focus[2] == 0.0);
+        const bool profile_given = profile_model != "gaussian" ||
+                                   beam.profile_w0_um > 0.0 || laser.profile_w0_um > 0.0;
+        if (focus_at_centre && profile_given) {
+          tenryu::core::log_warning(
+              "Laser.beams[" + std::to_string(i) +
+              "]: the focus is at the target centre, the plane on which the intensity "
+              "profile is defined, so every ray ring gets the profile's centre value and "
+              "the profile (" + profile_model +
+              ") does not shape the deposition; place the focal spot with focus=(...) or "
+              "defocus_DR to use it");
+        }
       }
       if (!beam.power.detected) {
         throw ConfigError("Laser.beams[" + std::to_string(i) +

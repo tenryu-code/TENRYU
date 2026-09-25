@@ -1,4 +1,5 @@
 #include "radiation/fld_1d_gpu.cuh"
+#include "radiation/fld_1d_grey_accel.cuh"
 #include "radiation/fld_anderson.cuh"
 #include "core/nvtx_range.hpp"
 
@@ -23,11 +24,14 @@
 #include <cusparse.h>
 
 #include "core/constants.hpp"
+#include "core/device_block_primitives.cuh"
 #include "core/device_scratch.hpp"
 #include "core/error.hpp"
 #include "core/kernel_guard.hpp"
 #include "materials/eos_device_table.hpp"
 #include "materials/eos_cell_table_selector.cuh"
+#include "materials/material_closure.hpp"
+#include "materials/opacity_eval.cuh"
 #include "materials/eos_table.hpp"
 #include "materials/ionmix_reader.cuh"
 #include "materials/ionmix_reader.hpp"
@@ -35,8 +39,10 @@
 #include "materials/tmat_reader.hpp"
 #include "radiation/fleck.cuh"
 #include "radiation/fld_1d_bodies.cuh"
+#include "radiation/multimat_opacity_1d.cuh"
 #include "radiation/group_structure.hpp"
 #include "radiation/groups.cuh"
+#include "radiation/material_electron_eos_1d.hpp"
 #include "radiation/nlte_coeffs.cuh"
 #include "radiation/phi1_poles.hpp"
 #include "radiation/planck_table.cuh"
@@ -184,6 +190,17 @@ int limiter_id(const std::string& limiter) {
   return 0;
 }
 
+// log(max(kappa, kKappaFloor)) for IonmixOpacityDeviceView::interpolate:
+// the same device log the interpolation would otherwise take per corner.
+__global__ void fill_log_kappa_kernel(const double* __restrict__ kappa,
+                                      double* __restrict__ log_kappa,
+                                      const std::size_t n) {
+  const std::size_t i = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i < n) {
+    log_kappa[i] = log(fmax(kappa[i], materials::IonmixOpacityDeviceView::kKappaFloor));
+  }
+}
+
 struct DeviceOpacityTable {
   double* d_log_temps = nullptr;
   double* d_log_numdens = nullptr;
@@ -199,6 +216,11 @@ struct DeviceOpacityTable {
   double log_ni_max = 0.0;
   double T_min = 0.0;
   double T_max = 0.0;
+  // log(max(kappa, kKappaFloor)) of the three tables for the view's
+  // interpolation (filled on the device at upload, 2026-09-23).
+  double* d_log_kappa_PA = nullptr;
+  double* d_log_kappa_PE = nullptr;
+  double* d_log_kappa_R = nullptr;
 
   DeviceOpacityTable() = default;
   DeviceOpacityTable(const DeviceOpacityTable&) = delete;
@@ -238,6 +260,15 @@ struct DeviceOpacityTable {
     upload_vec(&d_kappa_PA, host.kappa_PA, "FLD upload kappa_PA failed");
     upload_vec(&d_kappa_PE, host.kappa_PE, "FLD upload kappa_PE failed");
     upload_vec(&d_kappa_R, host.kappa_R, "FLD upload kappa_R failed");
+    const auto fill_log = [n_table](double** dst, const double* src, const char* label) {
+      cuda_check(cudaMalloc(reinterpret_cast<void**>(dst), sizeof(double) * n_table), label);
+      const int grid = static_cast<int>((n_table + 255) / 256);
+      fill_log_kappa_kernel<<<grid, 256>>>(src, *dst, n_table);
+      cuda_check(cudaGetLastError(), label);
+    };
+    fill_log(&d_log_kappa_PA, d_kappa_PA, "FLD log kappa_PA failed");
+    fill_log(&d_log_kappa_PE, d_kappa_PE, "FLD log kappa_PE failed");
+    fill_log(&d_log_kappa_R, d_kappa_R, "FLD log kappa_R failed");
     ntemp = host.ntemp;
     ndens = host.ndens;
     ngroups = host.ngroups;
@@ -250,6 +281,12 @@ struct DeviceOpacityTable {
   }
 
   void release() {
+    for (double** p : {&d_log_kappa_PA, &d_log_kappa_PE, &d_log_kappa_R}) {
+      if (*p != nullptr) {
+        cuda_check(cudaFree(*p), "FLD free log kappa failed");
+        *p = nullptr;
+      }
+    }
     if (d_kappa_R != nullptr) {
       cuda_check(cudaFree(d_kappa_R), "FLD free kappa_R failed");
       d_kappa_R = nullptr;
@@ -282,6 +319,9 @@ struct DeviceOpacityTable {
     out.kappa_PA = d_kappa_PA;
     out.kappa_PE = d_kappa_PE;
     out.kappa_R = d_kappa_R;
+    out.log_kappa_PA = d_log_kappa_PA;
+    out.log_kappa_PE = d_log_kappa_PE;
+    out.log_kappa_R = d_log_kappa_R;
     out.ntemp = ntemp;
     out.ndens = ndens;
     out.ngroups = ngroups;
@@ -315,19 +355,11 @@ struct MultiMatOpacityEntry {
   bool is_lte = false;
 };
 
-struct MatOpacityDesc {
-  // kind: 0 = constant/void, 1 = LTE table, 2 = NLTE table.
-  int kind = 0;
-  int is_void = 0;
-  double kappa_planck = 0.0;
-  double kappa_rosseland = 0.0;
-  double inv_A_mp = 0.0;
-  materials::IonmixOpacityDeviceView view;
-};
-
 struct MultiMatOpacityCache {
   std::vector<MultiMatOpacityEntry> entries;
   core::DeviceArray<MatOpacityDesc> device_descs;
+  // Group bounds [eV] for the frequency-dependent Marshak materials.
+  core::DeviceArray<double> group_bounds;
   std::string signature;
 };
 
@@ -374,97 +406,11 @@ materials::DeviceEOSTableView fld_electron_eos_device_view(
   return fld_electron_eos_table_cache().view_for(*tables);
 }
 
-// Per-material electron EOS device tables for the per-cell dominant-material
-// selection in the matter-update kernels (multi-material closure, 2026-09-14).
-// Every material's electron table is uploaded once (keyed on the Config's
-// triplet pointers) and a device array of views indexed by the Config
-// material slot is kept; materials without a table get an empty view.
-class FldMaterialElectronEOSCache {
- public:
-  ~FldMaterialElectronEOSCache() {
-    if (d_views_ != nullptr) {
-      static_cast<void>(cudaFree(d_views_));
-    }
-  }
-
-  const materials::DeviceEOSTableView* device_views_for(const core::Config& cfg) {
-    const auto& mats = cfg.materials.materials;
-    std::vector<const materials::EOSTableTriplet*> keys(mats.size(), nullptr);
-    for (std::size_t m = 0; m < mats.size(); ++m) {
-      keys[m] = mats[m].eos_tables.get();
-    }
-    if (keys != keys_ || d_views_ == nullptr) {
-      tables_.clear();
-      tables_.resize(mats.size());
-      std::vector<materials::DeviceEOSTableView> host_views(mats.size());
-      for (std::size_t m = 0; m < mats.size(); ++m) {
-        if (mats[m].eos_tables) {
-          tables_[m].upload(mats[m].eos_tables->electron);
-        }
-        host_views[m] = tables_[m].view();
-      }
-      if (d_views_ != nullptr) {
-        cuda_check(cudaFree(d_views_), "FLD material electron view array free failed");
-        d_views_ = nullptr;
-      }
-      if (!host_views.empty()) {
-        cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_views_),
-                              host_views.size() * sizeof(materials::DeviceEOSTableView)),
-                   "FLD material electron view array alloc failed");
-        cuda_check(cudaMemcpy(d_views_, host_views.data(),
-                              host_views.size() * sizeof(materials::DeviceEOSTableView),
-                              cudaMemcpyHostToDevice),
-                   "FLD material electron view array H2D failed");
-      }
-      keys_ = keys;
-    }
-    return d_views_;
-  }
-
-  [[nodiscard]] int n_materials() const {
-    return static_cast<int>(keys_.size());
-  }
-
- private:
-  std::vector<const materials::EOSTableTriplet*> keys_;
-  std::vector<materials::DeviceEOSTable> tables_;
-  materials::DeviceEOSTableView* d_views_ = nullptr;
-};
-
-FldMaterialElectronEOSCache& fld_material_electron_eos_cache() {
-  static FldMaterialElectronEOSCache cache;
-  return cache;
-}
-
-// Per-cell electron table selector for the matter-update kernels. Null
-// (selection disabled, kernels keep the first material's view) when the run
-// has at most one non-void material, no material has a table, or the
-// dominant-material index is not sized.
+// Per-cell electron table selector for the matter-update kernels
+// (radiation/material_electron_eos_1d.hpp, shared with S_N since 2026-09-24).
 materials::CellEOSTableSelector fld_cell_electron_table_selector(
     core::State& state, const core::Config& cfg, const int n_cells) {
-  materials::CellEOSTableSelector selector;
-  int n_nonvoid = 0;
-  bool any_table = false;
-  for (const auto& m : cfg.materials.materials) {
-    if (!m.is_void) {
-      ++n_nonvoid;
-    }
-    if (m.eos_tables) {
-      any_table = true;
-    }
-  }
-  if (n_nonvoid <= 1 || !any_table || n_cells <= 0) {
-    return selector;
-  }
-  state.ensure_cell_material_props(cfg);
-  if (state.cell_material_index.size() != static_cast<std::size_t>(n_cells)) {
-    return selector;
-  }
-  auto& cache = fld_material_electron_eos_cache();
-  selector.electron_views = cache.device_views_for(cfg);
-  selector.n_materials = cache.n_materials();
-  selector.cell_material_index = state.cell_material_index.data();
-  return selector;
+  return cell_electron_table_selector_1d(state, cfg, n_cells);
 }
 
 __device__ inline bool has_electron_eos_table(
@@ -514,11 +460,33 @@ void ensure_nlte_table_uploaded(const core::Config& cfg,
   cache.groups = n_groups;
 }
 
+std::vector<double> radiation_group_bounds(const core::Config& cfg, int n_groups);
+
 void ensure_multimat_opacity_uploaded(const core::Config& cfg,
                                       const int n_groups) {
   std::string signature;
+  bool any_freq_dep = false;
   for (const auto& mat : cfg.materials.materials) {
     signature += mat.opacity_model + ":" + mat.opacity_file + ";";
+    if (mat.opacity_model == "power_law") {
+      std::ostringstream pl;
+      pl.precision(17);
+      pl << mat.opacity_power_law_kappa0_cm2_g << "," << mat.opacity_power_law_alpha_T << ","
+         << mat.opacity_power_law_lambda_rho << "," << mat.opacity_power_law_T_ref_eV << ","
+         << mat.opacity_power_law_rho_ref_g_cc << ";";
+      signature += pl.str();
+    }
+    any_freq_dep = any_freq_dep || (!mat.is_void && mat.opacity_model == "freq_dep_marshak");
+  }
+  std::vector<double> bounds;
+  if (any_freq_dep) {
+    bounds = radiation_group_bounds(cfg, n_groups);
+    std::ostringstream gb;
+    gb.precision(17);
+    for (const double b : bounds) {
+      gb << b << ",";
+    }
+    signature += "bounds:" + gb.str();
   }
 
   auto& cache = multimat_opacity_cache();
@@ -527,7 +495,8 @@ void ensure_multimat_opacity_uploaded(const core::Config& cfg,
   if (reusable) {
     for (std::size_t m = 0; m < cfg.materials.materials.size(); ++m) {
       if (!cfg.materials.materials[m].is_void &&
-          cfg.materials.materials[m].opacity_model == "tmat" &&
+          (cfg.materials.materials[m].opacity_model == "tmat" ||
+           cfg.materials.materials[m].opacity_model == "table_nlte") &&
           cache.entries[m].groups != n_groups) {
         reusable = false;
         break;
@@ -556,12 +525,23 @@ void ensure_multimat_opacity_uploaded(const core::Config& cfg,
       desc.kappa_rosseland = 0.0;
       continue;
     }
-    if (mat.opacity_model == "tmat") {
-      const materials::TmatFile tmat = materials::load_tmat(mat.opacity_file);
-      TENRYU_ASSERT(tmat.opacity.has_value(),
-                    "FLD tmat opacity.model requires /opacity payload");
-      entry.host = std::make_unique<materials::IonmixOpacityData>(
-          materials::tmat_to_ionmix_opacity(*tmat.opacity, mat.tmat_skip_lte_repair, mat.tmat_kirchhoff_pe));
+    if (mat.opacity_model == "tmat" || mat.opacity_model == "table_nlte") {
+      bool is_lte = false;
+      if (mat.opacity_model == "tmat") {
+        const materials::TmatFile tmat = materials::load_tmat(mat.opacity_file);
+        TENRYU_ASSERT(tmat.opacity.has_value(),
+                      "FLD tmat opacity.model requires /opacity payload");
+        entry.host = std::make_unique<materials::IonmixOpacityData>(
+            materials::tmat_to_ionmix_opacity(*tmat.opacity, mat.tmat_skip_lte_repair,
+                                              mat.tmat_kirchhoff_pe));
+        is_lte = tmat.opacity->is_lte;
+      } else {
+        // IONMIX table (the single-material path's ensure_nlte_table_uploaded);
+        // the reader flags an LTE table (emission = absorption opacity).
+        entry.host = std::make_unique<materials::IonmixOpacityData>(
+            materials::load_ionmix_opacity(mat.opacity_file));
+        is_lte = entry.host->is_lte;
+      }
       if (cfg.radiation.group_repack_hard_xray) {
         std::vector<double> target_bounds = cfg.radiation.group_bounds_eV;
         if (target_bounds.empty()) {
@@ -576,9 +556,22 @@ void ensure_multimat_opacity_uploaded(const core::Config& cfg,
           "FLD multi-material opacity table group count must match Radiation.groups");
       entry.device.upload(*entry.host);
       entry.groups = n_groups;
-      entry.is_lte = tmat.opacity->is_lte;
+      entry.is_lte = is_lte;
       desc.kind = entry.is_lte ? 1 : 2;
       desc.view = entry.device.view();
+      continue;
+    }
+    if (mat.opacity_model == "power_law") {
+      desc.kind = 3;
+      desc.pl_kappa0 = mat.opacity_power_law_kappa0_cm2_g;
+      desc.pl_alpha_T = mat.opacity_power_law_alpha_T;
+      desc.pl_lambda_rho = mat.opacity_power_law_lambda_rho;
+      desc.pl_T_ref = mat.opacity_power_law_T_ref_eV;
+      desc.pl_rho_ref = mat.opacity_power_law_rho_ref_g_cc;
+      continue;
+    }
+    if (mat.opacity_model == "freq_dep_marshak") {
+      desc.kind = 4;
       continue;
     }
 
@@ -591,140 +584,25 @@ void ensure_multimat_opacity_uploaded(const core::Config& cfg,
 
   cache.device_descs.reset(descs.size());
   cache.device_descs.copy_from_host(descs);
+  cache.group_bounds.reset(bounds.size());
+  if (!bounds.empty()) {
+    cache.group_bounds.copy_from_host(bounds);
+  }
   cache.signature = std::move(signature);
 }
 
-// Exact volume-partition mixing: sigma = rho * sum_m w_m * kappa_m, evaluated
-// at each material's partial density rho_m = rho*w_m/f_m. Mass fractions are
-// preferred, with volume fractions as fallback. NLTE-dominant cells are filled
-// by the NLTE launch using the dominant-material approximation.
-__global__ void eval_opacity_multimat_kernel(
-    const double* __restrict__ rho,
-    const double* __restrict__ Te,
+// Cells whose dominant material is an LTE table or the frequency-dependent
+// Marshak opacity: one grey Fleck factor (compute_fleck_for_fld_kernel_body).
+__global__ void build_grey_fleck_cell_mask_kernel(
     const int* __restrict__ cell_material_index,
-    const double* __restrict__ mass_per_material,  // [n_cells*n_materials] or nullptr
-    const double* __restrict__ vol_frac,           // [n_cells*n_materials] or nullptr
     const MatOpacityDesc* __restrict__ descs,
     int n_materials,
-    double kappa_floor,
-    double kappa_cap,
-    double temperature_floor_eV,
-    double* __restrict__ sigma_a,
-    double* __restrict__ sigma_pe,
-    double* __restrict__ sigma_R,
-    int n_cells,
-    int n_groups) {
+    std::uint8_t* __restrict__ mask,
+    int n_cells) {
   const int c = blockIdx.x * blockDim.x + threadIdx.x;
-  if (c >= n_cells) {
-    return;
-  }
-
-  const int m_dom = min(max(cell_material_index[c], 0), n_materials - 1);
-  const MatOpacityDesc desc = descs[m_dom];
-  if (desc.kind == 2) {
-    return;  // NLTE material: the per-material NLTE launch fills this cell
-  }
-  const double rho_c = rho[c];
-  const double rho_safe = (rho_c >= 0.0) ? rho_c : 0.0;
-  const double sigma_min = rho_safe * fmax(kappa_floor, 0.0);
-  const double sigma_max = rho_safe * fmax(kappa_cap, 0.0);
-  const int base = c * n_groups;
-
-  constexpr int kMaxMats = 16;
-  // Raw weights: mass fractions when tracked, volume fractions otherwise,
-  // dominant-only as the last resort. Void never participates.
-  double raw[kMaxMats];
-  double wsum = 0.0;
-  for (int m = 0; m < n_materials; ++m) {
-    double r = 0.0;
-    if (!descs[m].is_void) {
-      if (mass_per_material != nullptr) {
-        r = fmax(mass_per_material[c * n_materials + m], 0.0);
-      } else if (vol_frac != nullptr) {
-        r = fmax(vol_frac[c * n_materials + m], 0.0);
-      } else {
-        r = (m == m_dom) ? 1.0 : 0.0;
-      }
-    }
-    raw[m] = r;
-    wsum += r;
-  }
-
-  if (!(wsum > 0.0)) {
-    if (desc.kind == 0) {
-      const double sigma_a_c = fmin(
-          fmax(fmax(rho_safe * desc.kappa_planck, 0.0), sigma_min), sigma_max);
-      const double sigma_R_c = fmin(
-          fmax(fmax(rho_safe * desc.kappa_rosseland, 0.0), sigma_min), sigma_max);
-      for (int g = 0; g < n_groups; ++g) {
-        sigma_a[base + g] = sigma_a_c;
-        sigma_pe[base + g] = sigma_a_c;
-        sigma_R[base + g] = sigma_R_c;
-      }
-      return;
-    }
-
-    const double log_ni = log(fmax(rho_safe * desc.inv_A_mp, 1.0e-300));
-    const double log_T = log(fmax(Te[c], temperature_floor_eV));
-    for (int g = 0; g < n_groups; ++g) {
-      const double kappa_pa =
-          desc.view.interpolate(desc.view.kappa_PA, g, log_ni, log_T);
-      const double kappa_pe =
-          desc.view.interpolate(desc.view.kappa_PE, g, log_ni, log_T);
-      const double kappa_r =
-          desc.view.interpolate(desc.view.kappa_R, g, log_ni, log_T);
-      sigma_a[base + g] = fmin(
-          fmax(fmax(rho_safe * kappa_pa, 0.0), sigma_min), sigma_max);
-      sigma_pe[base + g] = fmin(
-          fmax(fmax(rho_safe * kappa_pe, 0.0), sigma_min), sigma_max);
-      sigma_R[base + g] = fmin(
-          fmax(fmax(rho_safe * kappa_r, 0.0), sigma_min), sigma_max);
-    }
-    return;
-  }
-
-  double w[kMaxMats];
-  double log_ni_m[kMaxMats];
-  for (int m = 0; m < n_materials; ++m) {
-    w[m] = raw[m] / wsum;
-    if (w[m] > 0.0 && descs[m].kind != 0) {
-      double rho_m = rho_safe;
-      if (vol_frac != nullptr) {
-        const double f = fmax(vol_frac[c * n_materials + m], 0.0);
-        if (f > 1.0e-12) {
-          rho_m = rho_safe * w[m] / f;
-        }
-      }
-      log_ni_m[m] = log(fmax(rho_m * descs[m].inv_A_mp, 1.0e-300));
-    } else {
-      log_ni_m[m] = 0.0;
-    }
-  }
-  const double log_T = log(fmax(Te[c], temperature_floor_eV));
-  for (int g = 0; g < n_groups; ++g) {
-    double kappa_pa = 0.0;
-    double kappa_pe = 0.0;
-    double kappa_r = 0.0;
-    for (int m = 0; m < n_materials; ++m) {
-      if (!(w[m] > 0.0)) continue;
-      const MatOpacityDesc& d = descs[m];
-      if (d.kind == 0) {
-        kappa_pa += w[m] * d.kappa_planck;
-        kappa_pe += w[m] * d.kappa_planck;
-        kappa_r += w[m] * d.kappa_rosseland;
-      } else {
-        kappa_pa += w[m] * d.view.interpolate(d.view.kappa_PA, g, log_ni_m[m], log_T);
-        kappa_pe += w[m] * d.view.interpolate(d.view.kappa_PE, g, log_ni_m[m], log_T);
-        kappa_r += w[m] * d.view.interpolate(d.view.kappa_R, g, log_ni_m[m], log_T);
-      }
-    }
-    sigma_a[base + g] = fmin(
-        fmax(fmax(rho_safe * kappa_pa, 0.0), sigma_min), sigma_max);
-    sigma_pe[base + g] = fmin(
-        fmax(fmax(rho_safe * kappa_pe, 0.0), sigma_min), sigma_max);
-    sigma_R[base + g] = fmin(
-        fmax(fmax(rho_safe * kappa_r, 0.0), sigma_min), sigma_max);
-  }
+  if (c >= n_cells) return;
+  const int m = min(max(cell_material_index[c], 0), n_materials - 1);
+  mask[c] = (descs[m].kind == 1 || descs[m].kind == 4) ? 1U : 0U;
 }
 
 __global__ void build_nlte_cell_mask_kernel(
@@ -780,6 +658,230 @@ __global__ void build_eta_from_planck_kernel(
                                     cell_eval_skip);
 }
 
+// Grey acceleration of the outer iteration (fld_1d_grey_accel.cuh).
+template <bool EOS_TAIL>
+__global__ void fld_grey_spectrum_kernel(const double* __restrict__ rho,
+                                         const double* __restrict__ zbar,
+                                         const double* __restrict__ cv_e,
+                                         const int has_cv_e,
+                                         const double cv_e_override,
+                                         const double* __restrict__ A_eff,
+                                         const double* __restrict__ gamma_eff,
+                                         const materials::DeviceEOSTableView electron_eos_first,
+                                         const materials::CellEOSTableSelector cell_tables,
+                                         const double temperature_floor_eV,
+                                         const std::uint8_t* __restrict__ cell_is_void,
+                                         const double* __restrict__ Te,
+                                         const double* __restrict__ sigma_a,
+                                         const double* __restrict__ sigma_pe,
+                                         const double* __restrict__ fleck,
+                                         const double* __restrict__ rad_E_old,
+                                         const PlanckTableDeviceView planck,
+                                         const int n_cells,
+                                         const int n_groups,
+                                         const double dt,
+                                         double* __restrict__ xi,
+                                         double* __restrict__ D,
+                                         double* __restrict__ sum_w,
+                                         double* __restrict__ P) {
+  // One warp per cell (block of 32 threads), 5 * n_groups doubles of shared
+  // memory (spectrum_body_warp).
+  const int c = blockIdx.x;
+  if (c >= n_cells) {
+    return;
+  }
+  extern __shared__ double grey_shared[];
+  const materials::DeviceEOSTableView electron_eos = cell_tables.electron(c, electron_eos_first);
+  fld_1d_grey_accel::spectrum_body_warp<EOS_TAIL>(
+      c, static_cast<int>(threadIdx.x), grey_shared, rho, zbar, cv_e, has_cv_e,
+      cell_tables.cv_e_override(c, cv_e_override), A_eff, gamma_eff, electron_eos,
+      temperature_floor_eV, cell_is_void, Te, sigma_a, sigma_pe, fleck, rad_E_old, planck,
+      n_groups, dt, xi, D, sum_w, P);
+}
+
+__global__ void fld_grey_matrix_kernel(const double* __restrict__ lower,
+                                       const double* __restrict__ diag,
+                                       const double* __restrict__ upper,
+                                       const double* __restrict__ xi,
+                                       const double* __restrict__ D,
+                                       const double* __restrict__ sum_w,
+                                       const double* __restrict__ vol,
+                                       const int n_cells,
+                                       const int n_groups,
+                                       const double dt,
+                                       double* __restrict__ grey_lower,
+                                       double* __restrict__ grey_diag,
+                                       double* __restrict__ grey_upper) {
+  const int c = blockIdx.x * blockDim.x + threadIdx.x;
+  if (c >= n_cells) {
+    return;
+  }
+  fld_1d_grey_accel::matrix_body(c, lower, diag, upper, xi, D, sum_w, vol, n_cells, n_groups,
+                                 dt, grey_lower, grey_diag, grey_upper);
+}
+
+__global__ void fld_grey_rhs_kernel(const double* __restrict__ D,
+                                    const double* __restrict__ sum_w,
+                                    const double* __restrict__ P,
+                                    const double* __restrict__ T_lin,
+                                    const double* __restrict__ Te,
+                                    const double* __restrict__ vol,
+                                    const int n_cells,
+                                    const double dt,
+                                    double* __restrict__ grey_rhs) {
+  const int c = blockIdx.x * blockDim.x + threadIdx.x;
+  if (c >= n_cells) {
+    return;
+  }
+  fld_1d_grey_accel::rhs_body(c, D, sum_w, P, T_lin, Te, vol, dt, grey_rhs);
+}
+
+// The grey system (one tridiagonal system over the cells) by parallel cyclic
+// reduction in one block (core::pcr_solve_strided: ceil(log2 n_cells) rounds,
+// every row updated in parallel in each). The coefficients and the right-hand
+// side are copied into the block's shared memory with their round buffers (8
+// n_cells doubles) or, when they do not fit, into the global slab global_work
+// (the same layout), since the reduction overwrites its inputs; the solution
+// goes to grey_rhs. Each row's arithmetic does not depend on the thread that
+// computes it, so the block size does not change the result. The serial
+// Thomas solve it replaces was a chain of dependent FP64 divisions (about
+// 0.2 ms per solve for 300 cells on an RTX 4090); the reduction changes the
+// rounding of the solution, not the system.
+__global__ void fld_grey_solve_pcr_kernel(const double* __restrict__ grey_lower,
+                                          const double* __restrict__ grey_diag,
+                                          const double* __restrict__ grey_upper,
+                                          double* __restrict__ grey_rhs,
+                                          double* __restrict__ global_work,
+                                          const int n_cells) {
+  extern __shared__ double grey_pcr_shared[];
+  double* const base = (global_work != nullptr) ? global_work : grey_pcr_shared;
+  double* const dl = base;
+  double* const d = base + n_cells;
+  double* const du = base + 2 * n_cells;
+  double* const r = base + 3 * n_cells;
+  double* const dl_work = base + 4 * n_cells;
+  double* const d_work = base + 5 * n_cells;
+  double* const du_work = base + 6 * n_cells;
+  double* const r_work = base + 7 * n_cells;
+  const int tid = static_cast<int>(threadIdx.x);
+  const int nthreads = static_cast<int>(blockDim.x);
+  for (int i = tid; i < n_cells; i += nthreads) {
+    dl[i] = grey_lower[i];
+    d[i] = grey_diag[i];
+    du[i] = grey_upper[i];
+    r[i] = grey_rhs[i];
+  }
+  __syncthreads();
+  core::pcr_solve_strided<false>(dl, d, du, r, dl_work, d_work, du_work, r_work, n_cells,
+                                 n_cells, 1, tid, nthreads);
+  for (int i = tid; i < n_cells; i += nthreads) {
+    grey_rhs[i] = r[i];
+  }
+}
+
+// Threads of fld_grey_solve_pcr_kernel: one per row, in whole warps, at most
+// 1024 and at most the kernel's own limit (its register use; larger systems
+// take several rows per thread).
+int fld_grey_pcr_threads(const int n_cells) {
+  static const int max_threads = [] {
+    cudaFuncAttributes attributes{};
+    if (cudaFuncGetAttributes(&attributes, fld_grey_solve_pcr_kernel) != cudaSuccess) {
+      (void)cudaGetLastError();
+      return 256;
+    }
+    return std::max(32, (attributes.maxThreadsPerBlock / 32) * 32);
+  }();
+  const int rows = std::max(n_cells, 1);
+  return std::min(std::min(1024, max_threads), ((rows + 31) / 32) * 32);
+}
+
+// Dynamic shared memory of fld_grey_solve_pcr_kernel for n_cells, or 0 when
+// the system does not fit in one block's shared memory (the solve then works
+// in a global slab). Raises the kernel's shared-memory limit above the 48 KiB
+// default once when needed.
+std::size_t fld_grey_pcr_shared_bytes(const int n_cells) {
+  const std::size_t bytes = 8U * sizeof(double) * static_cast<std::size_t>(n_cells);
+  static const int max_optin = [] {
+    int device = 0;
+    int value = 0;
+    if (cudaGetDevice(&device) != cudaSuccess ||
+        cudaDeviceGetAttribute(&value, cudaDevAttrMaxSharedMemoryPerBlockOptin, device) !=
+            cudaSuccess) {
+      return 48 * 1024;
+    }
+    return value;
+  }();
+  if (n_cells <= 0 || bytes > static_cast<std::size_t>(max_optin)) {
+    return 0U;
+  }
+  static std::size_t raised_to = 48U * 1024U;
+  if (bytes > raised_to) {
+    if (cudaFuncSetAttribute(fld_grey_solve_pcr_kernel,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             static_cast<int>(bytes)) != cudaSuccess) {
+      return 0U;
+    }
+    raised_to = bytes;
+  }
+  return bytes;
+}
+
+template <bool EOS_TAIL>
+__global__ void fld_grey_apply_kernel(const double* __restrict__ D,
+                                      const double* __restrict__ P,
+                                      const double* __restrict__ T_lin,
+                                      const double* __restrict__ eps,
+                                      const double* __restrict__ rho,
+                                      const double* __restrict__ zbar,
+                                      const double* __restrict__ cv_e,
+                                      const int has_cv_e,
+                                      const double cv_e_override,
+                                      const double* __restrict__ A_eff,
+                                      const double* __restrict__ gamma_eff,
+                                      const materials::DeviceEOSTableView electron_eos_first,
+                                      const materials::CellEOSTableSelector cell_tables,
+                                      const double temperature_floor_eV,
+                                      const int n_cells,
+                                      double* __restrict__ Te,
+                                      double* __restrict__ ee,
+                                      double* __restrict__ Pe) {
+  const int c = blockIdx.x * blockDim.x + threadIdx.x;
+  if (c >= n_cells) {
+    return;
+  }
+  const materials::DeviceEOSTableView electron_eos = cell_tables.electron(c, electron_eos_first);
+  fld_1d_grey_accel::apply_body<EOS_TAIL>(c, D, P, T_lin, eps, rho, zbar, cv_e, has_cv_e,
+                                          cell_tables.cv_e_override(c, cv_e_override), A_eff, gamma_eff, electron_eos,
+                                          temperature_floor_eV, Te, ee, Pe);
+}
+
+// A void cell is vacuum: no absorption or emission, so the radiation streams
+// through it and its matter state is not updated by the exchange. The
+// opacity floors (rho * kappa_floor) and the constant-opacity mix left a small
+// sigma there, and with the void's tiny heat capacity the floor-density cells
+// outside a target reached ~100 eV within one radiation solve and kept the
+// outer iteration from converging (2026-09-24). The Rosseland opacity (the
+// diffusion coefficient's regularisation) is left as is.
+__global__ void zero_void_radiation_exchange_kernel(const std::uint8_t* __restrict__ cell_is_void,
+                                                    double* __restrict__ sigma_a,
+                                                    double* __restrict__ sigma_pe,
+                                                    double* __restrict__ eta,
+                                                    const int n_cells,
+                                                    const int n_groups) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= n_cells * n_groups) {
+    return;
+  }
+  if (cell_is_void[idx / n_groups] == 0U) {
+    return;
+  }
+  sigma_a[idx] = 0.0;
+  if (sigma_pe != nullptr) {
+    sigma_pe[idx] = 0.0;
+  }
+  eta[idx] = 0.0;
+}
+
 __device__ double harmonic_positive(const double a, const double b) {
   if (!(a > 0.0) || !(b > 0.0)) {
     return 0.0;
@@ -815,7 +917,18 @@ __device__ double fld_face_diffusion_coeff(const double* __restrict__ x_r,
   const double dist = fmax(xr - xl, 1.0e-300);
   const double sl = fmax(finite_or_zero(sigma_R[lcg]), sigma_floor);
   const double sr = fmax(finite_or_zero(sigma_R[rcg]), sigma_floor);
-  const double sigma_face = 0.5 * (sl + sr);
+  // Face opacity from the optical depth between the two centres in series,
+  // sigma_face = (sl wl + sr wr) / (wl + wr) with the cell widths wl, wr
+  // (NUMERICS §6.7): the exact face resistance in the diffusion limit.
+  // Written as the arithmetic mean plus a width-difference term, so equal
+  // widths reproduce 0.5 (sl + sr) bit for bit. The unweighted mean erred up
+  // to (w+1)/2 in the face conductivity for a width ratio w (2026-09-23).
+  const double wl = x_r[f] - x_r[f - 1];
+  const double wr = x_r[f + 1] - x_r[f];
+  const double w_sum = wl + wr;
+  const double sigma_face =
+      (w_sum > 0.0) ? 0.5 * (sl + sr) + 0.5 * (sl - sr) * ((wl - wr) / w_sum)
+                    : 0.5 * (sl + sr);
   const double E_face = fmax(0.5 * (El + Er), 1.0e-300);
   const double R = fabs(Er - El) / (dist * sigma_face * E_face);
   const double lambda = flux_limiter_lambda(R, limiter);
@@ -827,6 +940,26 @@ bool use_fld_fleck(const core::Config::MaterialsConfig::MatDef& mat) {
          mat.opacity_model == "constant" || mat.opacity_model == "power_law";
 }
 
+// The Fleck linearization of a run: the first material's model decides in a
+// single-material deck; with several non-void materials any material that
+// uses it switches it on for the run, and the cells of a
+// frequency-dependent Marshak material then take the Fleck factor of the
+// shared kernel (2026-09-24).
+bool use_fld_fleck(const core::Config& cfg,
+                   const core::Config::MaterialsConfig::MatDef& mat) {
+  int n_nonvoid = 0;
+  bool any = false;
+  for (const auto& m : cfg.materials.materials) {
+    if (m.is_void) {
+      continue;
+    }
+    ++n_nonvoid;
+    any = any || use_fld_fleck(m);
+  }
+  return (n_nonvoid > 1) ? any : use_fld_fleck(mat);
+}
+
+template <bool kGreyCells>
 __global__ void compute_fleck_for_fld_kernel(
     const double* __restrict__ rho,
     const double* __restrict__ Te,
@@ -850,20 +983,22 @@ __global__ void compute_fleck_for_fld_kernel(
     const PlanckTableDeviceView planck,
     const int fleck_beta_secant,
     const int fleck_form_exp,
-    const std::uint8_t* __restrict__ cell_eval_skip) {
+    const std::uint8_t* __restrict__ cell_eval_skip,
+    const std::uint8_t* __restrict__ grey_cell) {
   const int c = blockIdx.x * blockDim.x + threadIdx.x;
   if (c >= n_cells) {
     return;
   }
   // Per-cell dominant-material electron table (multi-material closure, 2026-09-14).
   const materials::DeviceEOSTableView electron_eos = cell_tables.electron(c, electron_eos_first);
-  fld_1d_bodies::compute_fleck_for_fld_kernel_body(c, rho, Te, zbar, cell_is_void, sigma_a,
-                                    state_cv_e, f_fleck, n_cells, n_groups, dt,
-                                    alpha, cv_e_override, gamma_eff, A_eff,
-                                    electron_eos, use_table_cv,
-                                    temperature_floor_eV, rad_E_old, planck,
-                                    fleck_beta_secant, fleck_form_exp,
-                                    cell_eval_skip);
+  fld_1d_bodies::compute_fleck_for_fld_kernel_body<kGreyCells>(
+      c, rho, Te, zbar, cell_is_void, sigma_a,
+      state_cv_e, f_fleck, n_cells, n_groups, dt,
+      alpha, cell_tables.cv_e_override(c, cv_e_override), gamma_eff, A_eff,
+      electron_eos, use_table_cv,
+      temperature_floor_eV, rad_E_old, planck,
+      fleck_beta_secant, fleck_form_exp,
+      cell_eval_skip, grey_cell);
 }
 
 // 1D FLD outer-boundary kinds, parsed from
@@ -1187,6 +1322,10 @@ __device__ inline void update_matter_body(
   __shared__ int s_break;
   __shared__ int s_use_table_eos;
   __shared__ materials::RhoBracket s_eos_rho_bracket;
+  // The table evaluations of this cell (thread 0) share its density bracket:
+  // its cold reference and high-temperature anchor are computed once.
+  materials::ColdReference cold_ref{};
+  materials::DeviceEOSHighTTailAnchor tail_anchor{};
 
   if (tid == 0) {
     const double rho_c = positive_or_floor(rho[c], 1.0e-300);
@@ -1214,16 +1353,21 @@ __device__ inline void update_matter_body(
     s_use_table_eos = has_electron_eos_table(electron_eos) ? 1 : 0;
     if (s_use_table_eos != 0) {
       s_eos_rho_bracket = materials::find_rho_bracket(electron_eos, rho_c);
+      cold_ref = materials::cold_enabled(electron_eos.cold)
+                     ? materials::device_cold_reference_at(electron_eos, s_eos_rho_bracket)
+                     : materials::ColdReference{};
       if constexpr (EOS_TAIL) {
-        s_e_e_ref = materials::device_eos_eval_with_high_t_tail(
+        tail_anchor = materials::device_eos_high_t_tail_anchor_with(
+            electron_eos, s_eos_rho_bracket, cold_ref);
+        s_e_e_ref = materials::device_eos_eval_with_high_t_tail_with(
                         electron_eos, s_eos_rho_bracket, s_step_T_ref,
-                        temperature_floor_eV)
+                        temperature_floor_eV, tail_anchor, cold_ref)
                         .e;
       } else {
-        s_e_e_ref = materials::device_eos_energy(
+        s_e_e_ref = materials::device_eos_energy_with(
             electron_eos,
             s_eos_rho_bracket,
-            eos_log_temperature(s_step_T_ref, temperature_floor_eV));
+            eos_log_temperature(s_step_T_ref, temperature_floor_eV), cold_ref);
       }
     } else {
       s_e_e_ref = 0.0;
@@ -1241,6 +1385,7 @@ __device__ inline void update_matter_body(
     const double T = s_T;
     const double T4 = safe_pow4(T);
     const double T3 = (T > 0.0) ? (T4 / T) : 0.0;
+    const PlanckTableDeviceView::Location T_loc = planck.locate_b(T);
 
     for (int g = tid; g < n_groups; g += blockDim.x) {
       const int idx = c * n_groups + g;
@@ -1248,7 +1393,7 @@ __device__ inline void update_matter_body(
       const double sigma_pe_g =
           (sigma_pe != nullptr) ? nonnegative_finite(sigma_pe[idx]) : sigma_pa;
       const double E = nonnegative_finite(rad_E[idx]);
-      const double b = fmax(planck.interpolate_b(g, T), 0.0);
+      const double b = fmax(planck.interpolate_b(g, T_loc), 0.0);
       const double B = core::constants::a_eV * T4 * b;
       // Fleck-consistent exchange (W-B conservation fix): the E-equation
       // emits f*eta + (1-f)*c*sigma*E_old, so the matter must lose exactly
@@ -1283,18 +1428,17 @@ __device__ inline void update_matter_body(
         double e_e_T;
         double cv_e_T;
         if constexpr (EOS_TAIL) {
-          const auto th = materials::device_eos_eval_with_high_t_tail(
-              electron_eos, s_eos_rho_bracket, T, temperature_floor_eV);
+          const auto th = materials::device_eos_eval_with_high_t_tail_with(
+              electron_eos, s_eos_rho_bracket, T, temperature_floor_eV, tail_anchor,
+              cold_ref);
           e_e_T = th.e;
           cv_e_T = fmax(nonnegative_finite(th.cv), 1.0e-300);
         } else {
           const double logT = eos_log_temperature(T, temperature_floor_eV);
-          e_e_T =
-              materials::device_eos_energy(electron_eos, s_eos_rho_bracket, logT);
-          cv_e_T = fmax(
-              nonnegative_finite(
-                  materials::device_eos_cv(electron_eos, s_eos_rho_bracket, logT)),
-              1.0e-300);
+          const auto th =
+              materials::device_eos_thermo_with(electron_eos, s_eos_rho_bracket, logT, cold_ref);
+          e_e_T = th.energy;
+          cv_e_T = fmax(nonnegative_finite(th.cv), 1.0e-300);
         }
         F = s_rho_c * (e_e_T - s_e_e_ref) / s_dt_safe;
         dF = s_rho_c * cv_e_T / s_dt_safe;
@@ -1328,16 +1472,17 @@ __device__ inline void update_matter_body(
     Te[c] = T;
     if (s_use_table_eos != 0) {
       if constexpr (EOS_TAIL) {
-        const auto th = materials::device_eos_eval_with_high_t_tail(
-            electron_eos, s_eos_rho_bracket, T, temperature_floor_eV);
+        const auto th = materials::device_eos_eval_with_high_t_tail_with(
+            electron_eos, s_eos_rho_bracket, T, temperature_floor_eV, tail_anchor,
+            cold_ref);
         ee[c] = th.e;
         Pe[c] = th.P;
       } else {
         const double logT = eos_log_temperature(T, temperature_floor_eV);
-        ee[c] =
-            materials::device_eos_energy(electron_eos, s_eos_rho_bracket, logT);
-        Pe[c] =
-            materials::device_eos_pressure(electron_eos, s_eos_rho_bracket, logT);
+        const auto th =
+            materials::device_eos_thermo_with(electron_eos, s_eos_rho_bracket, logT, cold_ref);
+        ee[c] = th.energy;
+        Pe[c] = th.pressure;
       }
     } else {
       ee[c] = finite_or_zero(ee[c]) + s_cv_mass * (T - s_iter_T_prev);
@@ -1351,13 +1496,14 @@ __device__ inline void update_matter_body(
   const double T_final = s_T;
   const double Tn4 = safe_pow4(T_final);
   const double V = fmax(finite_or_zero(vol[c]), 0.0);
+  const PlanckTableDeviceView::Location T_final_loc = planck.locate_b(T_final);
   for (int g = tid; g < n_groups; g += blockDim.x) {
     const int idx = c * n_groups + g;
     const double sigma_pa = nonnegative_finite(sigma_a[idx]);
     const double sigma_pe_g =
         (sigma_pe != nullptr) ? nonnegative_finite(sigma_pe[idx]) : sigma_pa;
     const double E = nonnegative_finite(rad_E[idx]);
-    const double b = fmax(planck.interpolate_b(g, T_final), 0.0);
+    const double b = fmax(planck.interpolate_b(g, T_final_loc), 0.0);
     double f = 1.0;
     double E_old_g = 0.0;
     if (fleck != nullptr) {
@@ -1418,7 +1564,7 @@ __global__ void update_matter_kernel(
   update_matter_body<EOS_TAIL>(
       c, tid, smem, rho, vol, zbar, cv_e, Te_old, sigma_a, sigma_pe, rad_E,
       fleck, rad_E_old, planck, electron_eos, Te, ee, Pe, rad_dep, rad_emit,
-      delta_T_rel, n_cells, n_groups, dt, A_eff, gamma_eff, cv_e_override,
+      delta_T_rel, n_cells, n_groups, dt, A_eff, gamma_eff, cell_tables.cv_e_override(c, cv_e_override),
       temperature_floor_eV, has_cv_e, max_newton_iterations,
       newton_tolerance);
 }
@@ -1592,7 +1738,7 @@ __global__ void exp_source_transfer_kernel(
   const materials::DeviceEOSTableView electron_eos = cell_tables.electron(c, electron_eos_first);
   exp_source_transfer_body<EOS_TAIL>(
       c, rho, vol, zbar, state_cv_e, cell_is_void, sigma_a, rad_E, Te, ee, Pe,
-      rad_dep, rad_emit, delta_T_rel, n_cells, dt, cv_e_override, gamma_eff,
+      rad_dep, rad_emit, delta_T_rel, n_cells, dt, cell_tables.cv_e_override(c, cv_e_override), gamma_eff,
       A_eff, electron_eos, temperature_floor_eV);
 }
 
@@ -1716,12 +1862,15 @@ __device__ inline void exp_mg_source_transfer_body(
   double rej_E = 0.0;
   double rej_dE = 0.0;
   double E_sum = 0.0;
+  const PlanckTableDeviceView::Location T_n_loc = planck.locate_b(T_n);
+  const PlanckTableDeviceView::Location T_hi_loc = planck.locate_b(T_hi);
+  const PlanckTableDeviceView::Location T_lo_loc = planck.locate_b(T_lo);
   for (int g = 0; g < n_groups; ++g) {
     const double sg = nonnegative_finite(sigma_a[base + g]);
     xi[g] = core::constants::c_light * sg * fmax(dt, 0.0);
-    const double b_g = fmax(planck.interpolate_b(g, T_n), 0.0);
-    const double b_hi = fmax(planck.interpolate_b(g, T_hi), 0.0);
-    const double b_lo = fmax(planck.interpolate_b(g, T_lo), 0.0);
+    const double b_g = fmax(planck.interpolate_b(g, T_n_loc), 0.0);
+    const double b_hi = fmax(planck.interpolate_b(g, T_hi_loc), 0.0);
+    const double b_lo = fmax(planck.interpolate_b(g, T_lo_loc), 0.0);
     const double db_dT = (b_hi - b_lo) / fmax(T_hi - T_lo, 1.0e-300);
     gam[g] = (b_g * fourAT3 + B_n * db_dT) / Cv;
     if (!isfinite(gam[g])) {
@@ -1947,7 +2096,7 @@ __global__ void exp_mg_source_transfer_kernel(
   exp_mg_source_transfer_body<EOS_TAIL>(
       c, rho, vol, zbar, state_cv_e, cell_is_void, sigma_a, rad_E, Te, ee, Pe,
       rad_dep, rad_emit, delta_T_rel, reject_count, reject_info, reject_vals,
-      n_cells, n_groups, dt, cv_e_override, gamma_eff, A_eff, electron_eos,
+      n_cells, n_groups, dt, cell_tables.cv_e_override(c, cv_e_override), gamma_eff, A_eff, electron_eos,
       planck, temperature_floor_eV, poles);
 }
 
@@ -2093,14 +2242,16 @@ __global__ void volume_source_energy_kernel(const double* __restrict__ x_r,
                                             double dt,
                                             double rate,
                                             double r_max) {
+  // One block: each thread sums its cells in index order, then a fixed
+  // tree, so the ledger is bitwise run to run (the per-block atomicAdd of
+  // several blocks followed the block schedule, 2026-09-24).
   __shared__ double shared[kBlock];
   const int tid = threadIdx.x;
-  const int c = blockIdx.x * blockDim.x + tid;
   double local = 0.0;
-  if (c < n_cells) {
+  for (int c = tid; c < n_cells; c += blockDim.x) {
     const double r_c = 0.5 * (x_r[c] + x_r[c + 1]);
     if (r_c <= r_max) {
-      local = dt * fmax(finite_or_zero(vol[c]), 0.0) * rate;
+      local += dt * fmax(finite_or_zero(vol[c]), 0.0) * rate;
     }
   }
   shared[tid] = local;
@@ -2272,47 +2423,127 @@ void evaluate_fld_opacity_and_emission(
   const auto n_nonvoid_materials = std::count_if(
       cfg.materials.materials.begin(), cfg.materials.materials.end(),
       [](const auto& material) { return !material.is_void; });
+  // A multi-material deck with a material whose opacity is not a constant
+  // (tables, power law, frequency-dependent Marshak opacity) evaluates every
+  // cell with its own materials (eval_opacity_multimat_kernel); only
+  // constant opacities mix through State::ensure_cell_material_props.
   const bool any_table = std::any_of(
       cfg.materials.materials.begin(), cfg.materials.materials.end(),
       [](const auto& material) {
         return !material.is_void &&
                (material.opacity_model == "tmat" ||
-                material.opacity_model == "table_nlte");
+                material.opacity_model == "table_nlte" ||
+                material.opacity_model == "power_law" ||
+                material.opacity_model == "freq_dep_marshak");
       });
+  const auto is_table_opacity = [](const std::string& model) {
+    return model == "tmat" || model == "table_nlte";
+  };
   bool multimat_sigma_done = false;
+  // fleck_cv_source="table" in the NLTE coefficient kernel (table opacities):
+  // the Fleck heat capacity is the electron table's cv at the cell
+  // temperature, as in the constant-opacity Fleck kernel below. It used to
+  // take the chain cv_e_override -> state cv_e -> ideal gas whatever the
+  // knob said (2026-09-23).
+  const bool fleck_table_cv = fld.fleck_cv_source == "table";
+  const materials::DeviceEOSTableView fleck_cv_electron_eos =
+      (fleck_table_cv && mat.hydro_eos_backend != "exact_ideal_gas")
+          ? fld_electron_eos_device_view(mat.eos_tables.get())
+          : materials::DeviceEOSTableView{};
+  const materials::CellEOSTableSelector fleck_cv_cell_tables =
+      fleck_table_cv ? fld_cell_electron_table_selector(state, cfg, n_cells)
+                     : materials::CellEOSTableSelector{};
+  const materials::DeviceEOSTableView* const nlte_table_cv_eos =
+      fleck_table_cv ? &fleck_cv_electron_eos : nullptr;
+  const materials::CellEOSTableSelector* const nlte_table_cv_cells =
+      fleck_table_cv ? &fleck_cv_cell_tables : nullptr;
+  // fleck_beta / fleck_form for the table opacities' Fleck factor (the NLTE
+  // coefficient kernel), as for constant opacities (2026-09-24).
+  const int nlte_fleck_beta_mode = (fld.fleck_beta == "secant") ? 1
+                                   : (fld.fleck_beta == "guard") ? 2
+                                                                 : 0;
+  const int nlte_fleck_form_exp = (fld.fleck_form == "exp_phi1") ? 1 : 0;
+  // Every material (void included) an NLTE table: every cell's dominant
+  // material is NLTE, so the mixed-opacity kernel, the NLTE cell mask and the
+  // masked eta and Fleck kernels below would all return without writing;
+  // they are skipped (bit-identical, 2026-09-23).
+  bool multimat_all_nlte = false;
   std::uint8_t* d_nlte_mask = nullptr;
+  // Cells of LTE-table and frequency-dependent materials in a multi-material
+  // deck: one grey Fleck factor (null otherwise).
+  std::uint8_t* d_grey_fleck_mask = nullptr;
   if (n_nonvoid_materials > 1 && any_table) {
     ensure_multimat_opacity_uploaded(cfg, n_groups);
     state.ensure_cell_material_props(cfg);
     auto& cache = multimat_opacity_cache();
+    multimat_all_nlte = true;
+    for (std::size_t m = 0; m < cfg.materials.materials.size(); ++m) {
+      const auto& material = cfg.materials.materials[m];
+      if (material.is_void || !is_table_opacity(material.opacity_model) ||
+          cache.entries[m].is_lte) {
+        multimat_all_nlte = false;
+      }
+    }
     const int opacity_grid = (n_cells + kBlock - 1) / kBlock;
-    if (opacity_grid > 0) {
+    if (opacity_grid > 0 && !multimat_all_nlte) {
       TENRYU_ASSERT(cfg.materials.materials.size() <= 16U,
                     "FLD multi-material opacity supports at most 16 materials");
-      eval_opacity_multimat_kernel<<<opacity_grid, kBlock>>>(
-          state.rho.data(),
-          state.Te.data(),
-          state.cell_material_index.data(),
-          (state.mass_per_material.size() ==
-           static_cast<std::size_t>(n_cells) * cfg.materials.materials.size())
-              ? state.mass_per_material.data()
-              : nullptr,
-          (state.volFrac.size() ==
-           static_cast<std::size_t>(n_cells) * cfg.materials.materials.size())
-              ? state.volFrac.data()
-              : nullptr,
-          cache.device_descs.data(),
-          static_cast<int>(cfg.materials.materials.size()),
-          fld.opacity_floor,
-          fld.opacity_cap,
-          cfg.numerics.floors.Te,
-          state.fld_sigma_a.data(),
-          state.fld_sigma_pe.data(),
-          state.fld_sigma_R.data(),
-          n_cells,
-          n_groups);
+      const auto launch_multimat = [&](auto rule) {
+        eval_opacity_multimat_kernel<decltype(rule)::value><<<opacity_grid, kBlock>>>(
+            state.rho.data(),
+            state.Te.data(),
+            state.cell_material_index.data(),
+            (state.mass_per_material.size() ==
+             static_cast<std::size_t>(n_cells) * cfg.materials.materials.size())
+                ? state.mass_per_material.data()
+                : nullptr,
+            (state.volFrac.size() ==
+             static_cast<std::size_t>(n_cells) * cfg.materials.materials.size())
+                ? state.volFrac.data()
+                : nullptr,
+            cache.device_descs.data(),
+            static_cast<int>(cfg.materials.materials.size()),
+            fld.opacity_floor,
+            fld.opacity_cap,
+            cfg.numerics.floors.Te,
+            state.fld_sigma_a.data(),
+            state.fld_sigma_pe.data(),
+            state.fld_sigma_R.data(),
+            n_cells,
+            n_groups,
+            cache.group_bounds.empty() ? nullptr : cache.group_bounds.data());
+      };
+      // Materials.opacity_mix_rule (NUMERICS §1.1.5).
+      const std::string& mix_rule = cfg.materials.opacity_mix_rule;
+      if (mix_rule == "harmonic_mass_R") {
+        launch_multimat(std::integral_constant<int, 1>{});
+      } else if (mix_rule == "max") {
+        launch_multimat(std::integral_constant<int, 2>{});
+      } else {
+        launch_multimat(std::integral_constant<int, 0>{});
+      }
       cuda_check(cudaGetLastError(),
                  "FLD multi-material opacity kernel launch failed");
+    }
+    const bool any_grey_fleck = std::any_of(
+        cfg.materials.materials.begin(), cfg.materials.materials.end(),
+        [&](const auto& material) {
+          const std::size_t m = static_cast<std::size_t>(&material - cfg.materials.materials.data());
+          return !material.is_void &&
+                 ((is_table_opacity(material.opacity_model) && cache.entries[m].is_lte) ||
+                  material.opacity_model == "freq_dep_marshak");
+        });
+    if (any_grey_fleck && opacity_grid > 0) {
+      d_grey_fleck_mask = static_cast<std::uint8_t*>(core::device_scratch_acquire(
+          "fld1d:multimat_grey_fleck_mask", static_cast<std::size_t>(n_cells)));
+      build_grey_fleck_cell_mask_kernel<<<opacity_grid, kBlock>>>(
+          state.cell_material_index.data(),
+          cache.device_descs.data(),
+          static_cast<int>(cfg.materials.materials.size()),
+          d_grey_fleck_mask,
+          n_cells);
+      cuda_check(cudaGetLastError(),
+                 "FLD multi-material grey Fleck mask kernel launch failed");
     }
     const bool any_nlte = std::any_of(
         cache.entries.begin(), cache.entries.end(),
@@ -2320,13 +2551,13 @@ void evaluate_fld_opacity_and_emission(
           const std::size_t m = static_cast<std::size_t>(
               &entry - cache.entries.data());
           const auto& material = cfg.materials.materials[m];
-          return !material.is_void && material.opacity_model == "tmat" &&
+          return !material.is_void && is_table_opacity(material.opacity_model) &&
                  !entry.is_lte;
         });
     if (any_nlte) {
       d_nlte_mask = static_cast<std::uint8_t*>(core::device_scratch_acquire(
           "fld1d:multimat_nlte_mask", static_cast<std::size_t>(n_cells)));
-      if (opacity_grid > 0) {
+      if (opacity_grid > 0 && !multimat_all_nlte) {
         build_nlte_cell_mask_kernel<<<opacity_grid, kBlock>>>(
             state.cell_material_index.data(),
             cache.device_descs.data(),
@@ -2356,9 +2587,10 @@ void evaluate_fld_opacity_and_emission(
         }
       }
       NlteCoeffsDeviceResult result{};
+      bool void_mask_uploaded = false;
       for (std::size_t m = 0; m < cache.entries.size(); ++m) {
         if (cache.entries[m].is_lte || cfg.materials.materials[m].is_void ||
-            cfg.materials.materials[m].opacity_model != "tmat") {
+            !is_table_opacity(cfg.materials.materials[m].opacity_model)) {
           continue;
         }
         const auto& material = cfg.materials.materials[m];
@@ -2399,9 +2631,19 @@ void evaluate_fld_opacity_and_emission(
             0,
             false,
             pinned_counts,
-            defer_clamp_warning && !first_outer_iter,
+            // One upload per solve: the first NLTE material of the first
+            // outer iteration (all launches share the device mask).
+            (defer_clamp_warning && !first_outer_iter) || void_mask_uploaded,
             state.cell_material_index.data(),
-            static_cast<int>(m));
+            static_cast<int>(m),
+            nlte_table_cv_eos,
+            nlte_table_cv_cells,
+            // Deferred counts: every material's launch copies the running
+            // total, so the pinned slot ends with all materials' counts.
+            /*accumulate_clamp_counts=*/pinned_counts != nullptr &&
+                void_mask_uploaded,
+            state.rad_E.data(), nlte_fleck_beta_mode, nlte_fleck_form_exp);
+        void_mask_uploaded = true;
         result.negative_alpha_clamp_count +=
             material_result.negative_alpha_clamp_count;
         result.negative_eta_clamp_count +=
@@ -2478,7 +2720,15 @@ void evaluate_fld_opacity_and_emission(
         0,
         false,
         pinned_counts,
-        defer_clamp_warning && !first_outer_iter);
+        defer_clamp_warning && !first_outer_iter,
+        nullptr,
+        -1,
+        nlte_table_cv_eos,
+        nlte_table_cv_cells,
+        false,
+        state.rad_E.data(),
+        nlte_fleck_beta_mode,
+        nlte_fleck_form_exp);
     if (!defer_clamp_warning &&
         (result.nan_inf_count != 0 || result.negative_eta_clamp_count != 0)) {
       core::log_warning("FLD NLTE coefficient clamp counts: nan_inf=" +
@@ -2540,19 +2790,27 @@ void evaluate_fld_opacity_and_emission(
     materials::evaluate_opacity_cuda(opacity_view, nullptr);
   }
   const int grid = (total + kBlock - 1) / kBlock;
-  if (grid > 0) {
-    build_eta_from_planck_kernel<<<grid, kBlock>>>(state.Te.data(),
-                                                   state.fld_sigma_a.data(),
-                                                   planck.device_view(),
-                                                   state.fld_eta.data(),
-                                                   n_cells,
-                                                   n_groups,
-                                                   cfg.numerics.floors.Te,
-                                                   d_nlte_mask);
+  if (grid > 0 && !multimat_all_nlte) {
+    // The emission opacity: the matter update loses f*c*sigma_pe*B, so the
+    // radiation must gain eta from the same sigma_pe. The mixed-opacity
+    // kernel fills sigma_pe with kappa_PE for table cells (it can differ from
+    // kappa_PA in an LTE-flagged table; building eta from sigma_a created or
+    // destroyed c*(sigma_pa - sigma_pe)*B*dt per cell and step, 2026-09-23);
+    // the single-material path copies sigma_a into sigma_pe below.
+    build_eta_from_planck_kernel<<<grid, kBlock>>>(
+        state.Te.data(),
+        multimat_sigma_done ? state.fld_sigma_pe.data() : state.fld_sigma_a.data(),
+        planck.device_view(),
+        state.fld_eta.data(),
+        n_cells,
+        n_groups,
+        cfg.numerics.floors.Te,
+        d_nlte_mask);
     cuda_check(cudaGetLastError(), "FLD eta kernel launch failed");
   }
-  if (multimat_sigma_done || mat.opacity_model == "constant" ||
-      mat.opacity_model == "power_law") {
+  if (!multimat_all_nlte &&
+      (multimat_sigma_done || mat.opacity_model == "constant" ||
+       mat.opacity_model == "power_law")) {
     const std::size_t scratch_size = static_cast<std::size_t>(total);
     state.fld_nlte_f_work.reset(scratch_size);
     if (!multimat_sigma_done) {
@@ -2569,11 +2827,15 @@ void evaluate_fld_opacity_and_emission(
       d_cell_is_void = static_cast<std::uint8_t*>(core::device_scratch_acquire(
           "fld_1d_gpu:evaluate_fld_opacity_and_emission:d_cell_is_void",
           void_bytes));
-      cuda_check(cudaMemcpy(d_cell_is_void,
-                            state.cell_is_void.data(),
-                            void_bytes,
-                            cudaMemcpyHostToDevice),
-                 "FLD Fleck copy cell_is_void failed");
+      // The mask does not change within a solve: upload it on the first
+      // outer iteration only.
+      if (first_outer_iter) {
+        cuda_check(cudaMemcpy(d_cell_is_void,
+                              state.cell_is_void.data(),
+                              void_bytes,
+                              cudaMemcpyHostToDevice),
+                   "FLD Fleck copy cell_is_void failed");
+      }
     }
     const materials::CellEOSTableSelector cell_tables =
         fld_cell_electron_table_selector(state, cfg, n_cells);
@@ -2587,7 +2849,8 @@ void evaluate_fld_opacity_and_emission(
           (fleck_alpha_env != nullptr && fleck_alpha_env[0] != 0)
               ? std::atof(fleck_alpha_env)
               : 1.0;
-      compute_fleck_for_fld_kernel<<<fleck_grid, kBlock>>>(
+      const auto launch_fleck = [&](auto grey_cells) {
+      compute_fleck_for_fld_kernel<decltype(grey_cells)::value><<<fleck_grid, kBlock>>>(
           state.rho.data(),
           state.Te.data(),
           state.zbar.data(),
@@ -2615,13 +2878,41 @@ void evaluate_fld_opacity_and_emission(
           : (fld.fleck_beta == "guard") ? 2
                                         : 0,
           (fld.fleck_form == "exp_phi1") ? 1 : 0,
-          d_nlte_mask);
+          d_nlte_mask,
+          d_grey_fleck_mask);
+      };
+      if (d_grey_fleck_mask != nullptr) {
+        launch_fleck(std::true_type{});
+      } else {
+        launch_fleck(std::false_type{});
+      }
       cuda_check(cudaGetLastError(), "FLD Fleck kernel launch failed");
       cuda_check(core::debug_kernel_sync(), "FLD Fleck kernel sync failed");
     }
   }
+  if (state.cell_is_void.size() == static_cast<std::size_t>(n_cells) && total > 0 &&
+      std::any_of(state.cell_is_void.begin(), state.cell_is_void.end(),
+                  [](const std::uint8_t v) { return v != 0U; })) {
+    auto* d_void = static_cast<std::uint8_t*>(core::device_scratch_acquire(
+        "fld_1d_gpu:zero_void_radiation_exchange:cell_is_void",
+        sizeof(std::uint8_t) * static_cast<std::size_t>(n_cells)));
+    if (first_outer_iter) {
+      cuda_check(cudaMemcpy(d_void, state.cell_is_void.data(),
+                            sizeof(std::uint8_t) * static_cast<std::size_t>(n_cells),
+                            cudaMemcpyHostToDevice),
+                 "FLD void mask upload failed");
+    }
+    zero_void_radiation_exchange_kernel<<<(total + kBlock - 1) / kBlock, kBlock>>>(
+        d_void, state.fld_sigma_a.data(),
+        (state.fld_sigma_pe.size() == static_cast<std::size_t>(total)) ? state.fld_sigma_pe.data()
+                                                                       : nullptr,
+        state.fld_eta.data(), n_cells, n_groups);
+    cuda_check(cudaGetLastError(), "FLD void exchange kernel launch failed");
+  }
 }
 
+// rad_E_limiter: the radiation field the flux limiter is evaluated from
+// (nullptr: the current field state.rad_E).
 void assemble_tridiag(core::State& state,
                       const int n_cells,
                       const int n_groups,
@@ -2633,7 +2924,8 @@ void assemble_tridiag(core::State& state,
                       const double volume_source_r_max,
                       const double sigma_floor,
                       const int limiter,
-                      const int exchange_off = 0) {
+                      const int exchange_off = 0,
+                      const double* rad_E_limiter = nullptr) {
   const int total = n_cells * n_groups;
   const int grid = (total + kBlock - 1) / kBlock;
   const int geom_code = state.mesh.geometry_code;
@@ -2648,7 +2940,7 @@ void assemble_tridiag(core::State& state,
         use_fleck ? state.fld_nlte_f_work.data() : nullptr,
         state.fld_eta.data(),
         state.rad_E_old.data(),
-        state.rad_E.data(),
+        (rad_E_limiter != nullptr) ? rad_E_limiter : state.rad_E.data(),
         state.fld_sigma_R.data(),
         state.fld_lower.data(),
         state.fld_diag.data(),
@@ -2956,8 +3248,7 @@ double compute_volume_source_energy(core::State& state,
     return 0.0;
   }
   zero_reduction_scalar(state);
-  const int grid = (n_cells + kBlock - 1) / kBlock;
-  volume_source_energy_kernel<<<grid, kBlock>>>(state.x_r.data(),
+  volume_source_energy_kernel<<<1, kBlock>>>(state.x_r.data(),
                                                 state.vol.data(),
                                                 state.fld_reduction_work.data(),
                                                 n_cells,
@@ -2988,7 +3279,8 @@ void advance_radiation_step_fld_1d(
     const core::Config& cfg,
     const PlanckTable& planck,
     const core::Config::MaterialsConfig::MatDef& mat,
-    const double dt) {
+    const double dt,
+    const double drive_time_s) {
   const core::NvtxRange nvtx_range("radiation.fld_1d");
   TENRYU_ASSERT(cfg.radiation.mode == core::RadiationMode::MultigroupDiffusion,
                 "advance_radiation_step_fld_1d requires multigroup_diffusion mode");
@@ -3045,7 +3337,7 @@ void advance_radiation_step_fld_1d(
       max_iter = v;
     }
   }
-  const bool use_nlte = use_fld_fleck(mat);
+  const bool use_nlte = use_fld_fleck(cfg, mat);
   // W-I AFI mode: the Fleck f-blend is dropped at its two CONSUMPTION
   // points (assembly pseudo-scattering and the matter-side blend) so the
   // outer iteration converges the fully implicit emission (Larsen, Kumar
@@ -3057,31 +3349,37 @@ void advance_radiation_step_fld_1d(
   // 1D boundary handling (NUMERICS §6.7 1D BC): inner r=0 is always
   // reflecting; the outer face honors multigroup_diffusion.boundary.outer_r.
   const int outer_bc = parse_fld_1d_outer_bc(fld.boundary.outer_r);
-  core::DeviceArray<double> marshak_finc;
+  // Pooled (no per-solve cudaMalloc/cudaFree); null without a Marshak face.
+  double* marshak_finc = nullptr;
   double marshak_in_flux_total = 0.0;  // sum_g F_inc,g [erg/cm^2/s]
   if (outer_bc == kFld1dOuterMarshak) {
     // Indirect-drive hohlraum-style boundary: constant marshak_Tr_eV wins when
     // set; otherwise the deck callable frozen at init (state.marshak_Tr_1d,
-    // no runtime Python) is evaluated at solve entry (state.t) — same
-    // precedence/convention as the IMC emitter (source.cu emit_marshak).
+    // no runtime Python) is evaluated at the midpoint of the interval this
+    // solve advances (drive_time_s from the driver's radiation stage /
+    // thermal substep; state.t for callers that pass none). The historic
+    // state.t evaluation lagged the drive by dt/2 (Strang stage) and held every
+    // thermal substep at T_r(t_n) (2026-09-23).
+    const double t_drive = std::isfinite(drive_time_s) ? drive_time_s : state.t;
     double T_r_eV = cfg.radiation.boundary.marshak_Tr_eV;
     if (!(T_r_eV > 0.0) && state.marshak_Tr_1d.has_value()) {
-      T_r_eV = state.marshak_Tr_1d->eval(state.t);
+      T_r_eV = state.marshak_Tr_1d->eval(t_drive);
     }
     double const_flux = fld.marshak.flux_erg_per_cm2_s;
     if (fld.marshak.flux_pulse_duration_s >= 0.0 &&
-        state.t >= fld.marshak.flux_pulse_duration_s) {
+        t_drive >= fld.marshak.flux_pulse_duration_s) {
       const_flux = 0.0;  // pulsed grey drive expired (same rule as 2D_RZ)
     }
     // Namelist validation guarantees exactly one of {marshak_Tr_eV > 0,
     // flux_erg_per_cm2_s > 0}; const_flux may legitimately be 0 here after a
     // pulsed grey drive expires.
-    marshak_finc = core::DeviceArray<double>(static_cast<std::size_t>(n_groups));
+    marshak_finc = static_cast<double*>(core::device_scratch_acquire(
+        "fld1d:marshak_finc", sizeof(double) * static_cast<std::size_t>(n_groups)));
     const int finc_grid = (n_groups + kBlock - 1) / kBlock;
     compute_marshak_finc_kernel<<<finc_grid, kBlock>>>(planck.device_view(),
                                                        T_r_eV,
                                                        const_flux,
-                                                       marshak_finc.data(),
+                                                       marshak_finc,
                                                        n_groups);
     cuda_check(cudaGetLastError(), "FLD marshak finc launch failed");
     if (T_r_eV > 0.0) {
@@ -3358,7 +3656,7 @@ void advance_radiation_step_fld_1d(
     rad_ebal_Ur1 = rad_ebal_field();
     assemble_tridiag(state, n_cells, n_groups, dt, /*use_fleck=*/false,
                      outer_bc,
-                     marshak_finc.empty() ? nullptr : marshak_finc.data(),
+                     marshak_finc,
                      cfg.radiation.volume_source_rate,
                      cfg.radiation.volume_source_x_max,
                      cfg.radiation.multigroup_diffusion.opacity_floor,
@@ -3401,7 +3699,7 @@ void advance_radiation_step_fld_1d(
     const double aa_beta = fld.anderson_beta;
     const std::size_t aa_bytes = sizeof(double) * static_cast<std::size_t>(n_cells);
     fld_anderson::Ring aa_ring;
-    double* aa_scalar = nullptr;
+    double* aa_work = nullptr;
     if (aa_enabled) {
       static const char* const kAaUTags[fld_anderson::kMaxHistory + 1] = {
           "fld1d:aa_u0", "fld1d:aa_u1", "fld1d:aa_u2", "fld1d:aa_u3", "fld1d:aa_u4"};
@@ -3413,16 +3711,105 @@ void advance_radiation_step_fld_1d(
       }
       aa_ring.m = aa_m;
       aa_ring.count = 0;
-      aa_scalar = static_cast<double*>(
-          core::device_scratch_acquire("fld1d:aa_scalar", sizeof(double)));
+      aa_work = static_cast<double*>(core::device_scratch_acquire(
+          "fld1d:aa_work", sizeof(double) * fld_anderson::kWorkDoubles));
     }
     const bool use_outer_pipeline =
         pipeline_opacity_model && !outer_pipeline_disabled && !aa_enabled;
-    const bool has_nlte_clamp_counts =
-        mat.opacity_model == "table_nlte" || mat.opacity_model == "tmat";
+    // Any table material, not only the first non-void one: a multi-material
+    // deck whose first material is constant still runs the NLTE launches.
+    const bool has_nlte_clamp_counts = std::any_of(
+        cfg.materials.materials.begin(), cfg.materials.materials.end(),
+        [](const auto& material) {
+          return !material.is_void && (material.opacity_model == "table_nlte" ||
+                                       material.opacity_model == "tmat");
+        });
+
+    // Grey acceleration of the outer iteration (outer_accel "grey", the 1D
+    // resolution of "auto"): the correction computed from iteration k is
+    // applied at the start of iteration k+1 (fld_1d_grey_accel.cuh).
+    const bool grey_accel =
+        (fld.outer_accel == "grey" || fld.outer_accel == "auto") && !aa_enabled && n_cells > 0;
+    const bool grey_eos_tail = cfg.numerics.hydro.eos_closure_mode == "energy_authoritative";
+    const materials::DeviceEOSTableView grey_electron_eos =
+        (mat.hydro_eos_backend != "exact_ideal_gas")
+            ? fld_electron_eos_device_view(mat.eos_tables.get())
+            : materials::DeviceEOSTableView{};
+    const int grey_has_cv_e = (state.cv_e.size() == static_cast<std::size_t>(n_cells)) ? 1 : 0;
+    double* grey_xi = nullptr;
+    double* grey_cells = nullptr;
+    if (grey_accel) {
+      grey_xi = static_cast<double*>(core::device_scratch_acquire(
+          "fld1d:grey_accel_xi",
+          sizeof(double) * static_cast<std::size_t>(n_cells) * static_cast<std::size_t>(n_groups)));
+      grey_cells = static_cast<double*>(core::device_scratch_acquire(
+          "fld1d:grey_accel_cells", sizeof(double) * 9U * static_cast<std::size_t>(n_cells)));
+    }
+    double* const grey_D = grey_cells;
+    double* const grey_sum_w = grey_accel ? grey_cells + 1 * n_cells : nullptr;
+    double* const grey_lower = grey_accel ? grey_cells + 2 * n_cells : nullptr;
+    double* const grey_diag = grey_accel ? grey_cells + 3 * n_cells : nullptr;
+    double* const grey_upper = grey_accel ? grey_cells + 4 * n_cells : nullptr;
+    double* const grey_rhs = grey_accel ? grey_cells + 5 * n_cells : nullptr;
+    // grey_cells + 6 * n_cells: unused (the Thomas solve's work row before the reduction).
+    const std::size_t grey_shared_bytes = grey_accel ? fld_grey_pcr_shared_bytes(n_cells) : 0U;
+    const int grey_threads = fld_grey_pcr_threads(n_cells);
+    double* const grey_pcr_work =
+        (grey_accel && grey_shared_bytes == 0U)
+            ? static_cast<double*>(core::device_scratch_acquire(
+                  "fld1d:grey_pcr_work", sizeof(double) * 8U * static_cast<std::size_t>(n_cells)))
+            : nullptr;
+    double* const grey_T_lin = grey_accel ? grey_cells + 7 * n_cells : nullptr;
+    double* const grey_P = grey_accel ? grey_cells + 8 * n_cells : nullptr;
+    // The flux limiter from the first outer iterate, held fixed afterwards
+    // (limiter_evaluation "predictor"); iteration 0 evaluates it from the
+    // step-start field.
+    const bool limiter_predictor = fld.limiter_evaluation != "iterate";
+    double* const limiter_E =
+        limiter_predictor
+            ? static_cast<double*>(core::device_scratch_acquire(
+                  "fld1d:limiter_predictor_E",
+                  sizeof(double) * static_cast<std::size_t>(n_cells) *
+                      static_cast<std::size_t>(n_groups)))
+            : nullptr;
 
     const auto launch_outer_iteration = [&](const int iter,
                                             int* const deferred_clamp_counts) {
+      if (grey_accel) {
+        if (iter > 0) {
+          fld_grey_rhs_kernel<<<cell_grid, kBlock>>>(grey_D, grey_sum_w, grey_P, grey_T_lin,
+                                                     state.Te.data(), state.vol.data(), n_cells,
+                                                     dt, grey_rhs);
+          fld_grey_solve_pcr_kernel<<<1, grey_threads, grey_shared_bytes>>>(
+              grey_lower, grey_diag, grey_upper, grey_rhs, grey_pcr_work, n_cells);
+          const auto apply = [&](auto tail_tag) {
+            constexpr bool kTail = decltype(tail_tag)::value;
+            fld_grey_apply_kernel<kTail><<<cell_grid, kBlock>>>(
+                grey_D, grey_P, grey_T_lin, grey_rhs, state.rho.data(), state.zbar.data(),
+                grey_has_cv_e != 0 ? state.cv_e.data() : nullptr, grey_has_cv_e,
+                mat.cv_e_override, state.A_eff.data(), state.gamma_eff.data(), grey_electron_eos,
+                cell_tables, cfg.numerics.floors.Te, n_cells, state.Te.data(), state.ee.data(),
+                state.Pe.data());
+          };
+          if (grey_eos_tail) {
+            apply(std::true_type{});
+          } else {
+            apply(std::false_type{});
+          }
+          cuda_check(cudaGetLastError(), "FLD grey acceleration correction launch failed");
+        }
+        cuda_check(cudaMemcpyAsync(grey_T_lin, state.Te.data(),
+                                   sizeof(double) * static_cast<std::size_t>(n_cells),
+                                   cudaMemcpyDeviceToDevice),
+                   "FLD grey acceleration linearization copy failed");
+      }
+      if (limiter_predictor && iter == 1) {
+        cuda_check(cudaMemcpyAsync(limiter_E, state.rad_E.data(),
+                                   sizeof(double) * static_cast<std::size_t>(n_cells) *
+                                       static_cast<std::size_t>(n_groups),
+                                   cudaMemcpyDeviceToDevice),
+                   "FLD limiter predictor copy failed");
+      }
       evaluate_fld_opacity_and_emission(state, cfg, planck, mat, n_cells,
                                         n_groups, dt,
                                         sigma_iteration_invariant,
@@ -3430,11 +3817,41 @@ void advance_radiation_step_fld_1d(
                                         /*defer_clamp_warning=*/true,
                                         deferred_clamp_counts);
       assemble_tridiag(state, n_cells, n_groups, dt, use_fleck_blend, outer_bc,
-                       marshak_finc.empty() ? nullptr : marshak_finc.data(),
+                       marshak_finc,
                        cfg.radiation.volume_source_rate,
                        cfg.radiation.volume_source_x_max,
                        cfg.radiation.multigroup_diffusion.opacity_floor,
-                       limiter_id(cfg.radiation.multigroup_diffusion.flux_limiter));
+                       limiter_id(cfg.radiation.multigroup_diffusion.flux_limiter),
+                       /*exchange_off=*/0,
+                       (limiter_predictor && iter >= 1) ? limiter_E : nullptr);
+      if (grey_accel) {
+        // Iteration k's spectrum and grey matrix, before the group solve.
+        const auto spectrum = [&](auto tail_tag) {
+          constexpr bool kTail = decltype(tail_tag)::value;
+          fld_grey_spectrum_kernel<kTail><<<n_cells, 32,
+                                            5 * static_cast<std::size_t>(n_groups) *
+                                                sizeof(double)>>>(
+              state.rho.data(), state.zbar.data(),
+              grey_has_cv_e != 0 ? state.cv_e.data() : nullptr, grey_has_cv_e,
+              mat.cv_e_override, state.A_eff.data(), state.gamma_eff.data(), grey_electron_eos,
+              cell_tables, cfg.numerics.floors.Te, nullptr, state.Te.data(),
+              state.fld_sigma_a.data(),
+              use_nlte ? state.fld_sigma_pe.data() : nullptr,
+              use_fleck_blend ? state.fld_nlte_f_work.data() : nullptr,
+              state.rad_E_old.data(), planck.device_view(), n_cells, n_groups, dt, grey_xi,
+              grey_D, grey_sum_w, grey_P);
+        };
+        if (grey_eos_tail) {
+          spectrum(std::true_type{});
+        } else {
+          spectrum(std::false_type{});
+        }
+        fld_grey_matrix_kernel<<<cell_grid, kBlock>>>(
+            state.fld_lower.data(), state.fld_diag.data(), state.fld_upper.data(), grey_xi,
+            grey_D, grey_sum_w, state.vol.data(), n_cells, n_groups, dt, grey_lower, grey_diag,
+            grey_upper);
+        cuda_check(cudaGetLastError(), "FLD grey acceleration matrix launch failed");
+      }
       solve_tridiag(state, n_cells, n_groups);
       const int total = n_cells * n_groups;
       const int total_grid = (total + kBlock - 1) / kBlock;
@@ -3561,7 +3978,7 @@ void advance_radiation_step_fld_1d(
           // Not converged and another iteration follows: mix the next
           // linearization temperature (Te) from the residual history.
           fld_anderson::record_and_mix(aa_ring, aa_slot, iter, state.Te.data(), n_cells,
-                                       aa_beta, cfg.numerics.floors.Te, aa_scalar);
+                                       aa_beta, cfg.numerics.floors.Te, aa_work);
           cuda_check(cudaGetLastError(), "FLD1D AA mix launch failed");
         }
       }
@@ -3660,6 +4077,7 @@ void advance_radiation_step_fld_1d(
                     "FLD outer snapshot descriptor capacity exceeded");
       OuterSnapshotTable snapshot_table{};
       std::size_t snapshot_bytes = 0U;
+      std::size_t snapshot_span_max = 0U;
       int snapshot_entries = 0;
       constexpr std::size_t kSnapshotAlignment = alignof(unsigned long long);
       for (const MutationSpan& span : mutation_spans) {
@@ -3668,7 +4086,13 @@ void advance_radiation_step_fld_1d(
         snapshot_bytes += span.bytes;
         snapshot_bytes = (snapshot_bytes + kSnapshotAlignment - 1U) &
                          ~(kSnapshotAlignment - 1U);
+        snapshot_span_max = std::max(snapshot_span_max, span.bytes);
       }
+      // Blocks per span: about four 8-byte words per thread on the largest span
+      // (the multigroup fields are n_cells * n_groups doubles).
+      const unsigned snapshot_blocks_per_span = static_cast<unsigned>(std::clamp<std::size_t>(
+          (snapshot_span_max / sizeof(unsigned long long) + 4U * kBlock - 1U) / (4U * kBlock),
+          4U, 256U));
       auto* snapshot_arena = static_cast<std::uint8_t*>(
           core::device_scratch_acquire("fld1d:outer_pipeline_snapshots",
                                        kPipelineSlots * snapshot_bytes));
@@ -3676,8 +4100,8 @@ void advance_radiation_step_fld_1d(
                                      const bool restore) {
         auto* const arena = snapshot_arena +
                             static_cast<std::size_t>(slot) * snapshot_bytes;
-        copy_outer_snapshot_kernel<<<dim3(snapshot_entries, 4), kBlock, 0,
-                                     outer_stream>>>(snapshot_table, arena, restore);
+        copy_outer_snapshot_kernel<<<dim3(snapshot_entries, snapshot_blocks_per_span), kBlock,
+                                     0, outer_stream>>>(snapshot_table, arena, restore);
         cuda_check(cudaGetLastError(),
                    restore ? "FLD outer pipeline restore failed"
                            : "FLD outer pipeline snapshot failed");
@@ -3837,7 +4261,7 @@ double fld_compute_fv_uniform_residual_1d(
   // irrelevant here (finc=nullptr) but the boundary diagonal must match the
   // production operator, so the parsed outer BC is passed through.
   assemble_tridiag(state, n_cells, n_groups, dt,
-                   use_fld_fleck(mat) &&
+                   use_fld_fleck(cfg, mat) &&
                        cfg.radiation.multigroup_diffusion.fleck_mode != "afi",
                    parse_fld_1d_outer_bc(
                        cfg.radiation.multigroup_diffusion.boundary.outer_r),

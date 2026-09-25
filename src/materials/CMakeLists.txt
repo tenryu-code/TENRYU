@@ -14,6 +14,7 @@ add_library(tenryu_materials STATIC
   opacity_diagnostics.cu
   eos_rho_e_device.cu
   eos_device_table.cu
+  material_closure.cu
   cold_equilibrium_device.cu
   opacity_table.cpp
   # zbar_tf.cpp is compiled into tenryu_core (materials links it PUBLIC);

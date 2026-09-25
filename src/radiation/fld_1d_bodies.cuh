@@ -442,7 +442,18 @@ __device__ inline double fld_face_diffusion_coeff(
   const double dist = fmax(xr - xl, 1.0e-300);
   const double sl = fmax(finite_or_zero(sigma_R[lcg]), sigma_floor);
   const double sr = fmax(finite_or_zero(sigma_R[rcg]), sigma_floor);
-  const double sigma_face = 0.5 * (sl + sr);
+  // Face opacity from the optical depth between the two centres in series,
+  // sigma_face = (sl wl + sr wr) / (wl + wr) with the cell widths wl, wr
+  // (NUMERICS §6.7): the exact face resistance in the diffusion limit.
+  // Written as the arithmetic mean plus a width-difference term, so equal
+  // widths reproduce 0.5 (sl + sr) bit for bit. The unweighted mean erred up
+  // to (w+1)/2 in the face conductivity for a width ratio w (2026-09-23).
+  const double wl = x_r[f] - x_r[f - 1];
+  const double wr = x_r[f + 1] - x_r[f];
+  const double w_sum = wl + wr;
+  const double sigma_face =
+      (w_sum > 0.0) ? 0.5 * (sl + sr) + 0.5 * (sl - sr) * ((wl - wr) / w_sum)
+                    : 0.5 * (sl + sr);
   const double E_face = fmax(0.5 * (El + Er), 1.0e-300);
   const double R = fabs(Er - El) / (dist * sigma_face * E_face);
   const double lambda = flux_limiter_lambda(R, limiter);
@@ -462,6 +473,11 @@ __device__ inline double fleck_form_phi1(const double z) {
   return (1.0 - exp(-z)) / z;
 }
 
+// kGreyCells: cells flagged in grey_cell take one Fleck factor for all groups
+// from the Planck-mean absorption, as the NLTE coefficient kernel gives a
+// single-material table (multi-material decks with table or
+// frequency-dependent opacities, 2026-09-24).
+template <bool kGreyCells = false>
 __device__ inline void compute_fleck_for_fld_kernel_body(
     const int c,
     const double* __restrict__ rho,
@@ -485,7 +501,8 @@ __device__ inline void compute_fleck_for_fld_kernel_body(
     const PlanckTableDeviceView planck,
     const int fleck_beta_secant,
     const int fleck_form_exp,
-    const std::uint8_t* __restrict__ cell_eval_skip) {
+    const std::uint8_t* __restrict__ cell_eval_skip,
+    const std::uint8_t* __restrict__ grey_cell = nullptr) {
   if (cell_eval_skip != nullptr && cell_eval_skip[c] != 0U) {
     return;
   }
@@ -539,9 +556,10 @@ __device__ inline void compute_fleck_for_fld_kernel_body(
     double E_grey = 0.0;
     double sp_num = 0.0;
     double sp_den = 0.0;
+    const PlanckTableDeviceView::Location Te_loc = planck.locate_b(Te_c);
     for (int g = 0; g < n_groups; ++g) {
       E_grey += fmax(rad_E_old[base + g], 0.0);
-      const double b_g = fmax(planck.interpolate_b(g, Te_c), 0.0);
+      const double b_g = fmax(planck.interpolate_b(g, Te_loc), 0.0);
       sp_num += fmax(sigma_a[base + g], 0.0) * b_g;
       sp_den += b_g;
     }
@@ -577,6 +595,31 @@ __device__ inline void compute_fleck_for_fld_kernel_body(
           beta = (fleck_beta_secant == 2) ? fmax(beta, beta_sec) : beta_sec;
         }
       }
+    }
+  }
+  if constexpr (kGreyCells) {
+    if (grey_cell != nullptr && grey_cell[c] != 0U) {
+      double sp_num = 0.0;
+      double sp_den = 0.0;
+      const PlanckTableDeviceView::Location Te_loc = planck.locate_b(Te_c);
+      for (int g = 0; g < n_groups; ++g) {
+        const double b_g = fmax(planck.interpolate_b(g, Te_loc), 0.0);
+        sp_num += fmax(sigma_a[base + g], 0.0) * b_g;
+        sp_den += b_g;
+      }
+      const double sigma_P = (sp_den > 0.0) ? (sp_num / sp_den) : 0.0;
+      const double z = alpha_safe * beta * core::constants::c_light * sigma_P * dt;
+      double f = (fleck_form_exp != 0) ? fleck_form_phi1(z) : 1.0 / (1.0 + z);
+      if (!isfinite(f) || f < 0.0) {
+        f = 0.0;
+      }
+      if (f > 1.0) {
+        f = 1.0;
+      }
+      for (int g = 0; g < n_groups; ++g) {
+        f_fleck[base + g] = f;
+      }
+      return;
     }
   }
   for (int g = 0; g < n_groups; ++g) {
@@ -827,6 +870,7 @@ __device__ inline void update_matter_body_persistent(
     }
     const double T4 = safe_pow4(T);
     const double T3 = (T > 0.0) ? (T4 / T) : 0.0;
+    const PlanckTableDeviceView::Location T_loc = planck.locate_b(T);
 
     for (int g = tid; g < n_groups; g += kUpdateMatterWarpSize) {
       const int idx = c * n_groups + g;
@@ -834,7 +878,7 @@ __device__ inline void update_matter_body_persistent(
       const double sigma_pe_g =
           (sigma_pe != nullptr) ? nonnegative_finite(sigma_pe[idx]) : sigma_pa;
       const double E = nonnegative_finite(rad_E[idx]);
-      const double b = fmax(planck.interpolate_b(g, T), 0.0);
+      const double b = fmax(planck.interpolate_b(g, T_loc), 0.0);
       const double B = core::constants::a_eV * T4 * b;
       double f = 1.0;
       double E_old_g = 0.0;
@@ -912,13 +956,14 @@ __device__ inline void update_matter_body_persistent(
 
   const double Tn4 = safe_pow4(T_final);
   const double V = fmax(finite_or_zero(vol[c]), 0.0);
+  const PlanckTableDeviceView::Location T_final_loc = planck.locate_b(T_final);
   for (int g = tid; g < n_groups; g += kUpdateMatterWarpSize) {
     const int idx = c * n_groups + g;
     const double sigma_pa = nonnegative_finite(sigma_a[idx]);
     const double sigma_pe_g =
         (sigma_pe != nullptr) ? nonnegative_finite(sigma_pe[idx]) : sigma_pa;
     const double E = nonnegative_finite(rad_E[idx]);
-    const double b = fmax(planck.interpolate_b(g, T_final), 0.0);
+    const double b = fmax(planck.interpolate_b(g, T_final_loc), 0.0);
     double f = 1.0;
     double E_old_g = 0.0;
     if (fleck != nullptr) {

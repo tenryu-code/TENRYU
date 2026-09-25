@@ -371,7 +371,10 @@ __device__ inline void enforce_2t_closure_kernel_body(
   // the temperature re-closure); the former switch to the ideal-gas branch
   // disagreed with those evaluators and ratcheted the energy of expanding
   // low-density cells (2026-09-14).
-  if (tab_ion.n_rho > 0) {
+  // Both tables of the cell's material (a material without one closes with
+  // the ideal gas; the per-cell selector no longer lends another material's
+  // table).
+  if (tab_ion.n_rho > 0 && tab_ele.n_rho > 0) {
     const double e_i_raw = ei[i];
     const double e_e_raw = ee[i];
     const bool repair_i = energy_needs_repair(e_i_raw);
@@ -556,7 +559,8 @@ __device__ inline void compute_sound_speed_2t_kernel_body(
     const bool use_mie_gruneisen,
     const bool use_exact_ideal_gas,
     const int exact_override_kind,
-    const double* __restrict__ gamma_eff) {
+    const double* __restrict__ gamma_eff,
+    const bool high_t_tail) {
   const double rho_i = fmax(rho[i], 1.0e-30);
   const double gamma = fmax(gamma_eff[i], 1.0 + 1.0e-12);
   if (use_exact_ideal_gas) {
@@ -601,7 +605,7 @@ __device__ inline void compute_sound_speed_2t_kernel_body(
     cs[i] = apply_exact_sound_speed_override(exact_override_kind, cs[i], rho_i, Pe[i], Pi[i]);
     return;
   }
-  if (tab_ion.n_rho > 0) {
+  if (tab_ion.n_rho > 0 && tab_ele.n_rho > 0) {
     const auto rb_ion = tenryu::materials::find_rho_bracket(tab_ion, rho_i);
     const auto rb_ele = tenryu::materials::find_rho_bracket(tab_ele, rho_i);
     const double logTi = log(fmax(Ti[i], 1.0e-30));
@@ -614,19 +618,32 @@ __device__ inline void compute_sound_speed_2t_kernel_body(
         (cv_e_arr != nullptr)
             ? fmax(cv_e_arr[i], 0.0)
             : fmax(tenryu::materials::device_eos_cv(tab_ele, rb_ele, logTe), 0.0);
+    // high_t_tail (energy-authoritative closure): above a table's ceiling the
+    // closure extends P = P_top T/T_top, and so does the sound speed
+    // (cs(T_top) sqrt(T/T_top)); below the ceiling both forms are identical.
     const double cs_ion =
-        tenryu::materials::device_eos_sound_speed(tab_ion, rb_ion, logTi, rho_i, cv_i);
+        high_t_tail
+            ? tenryu::materials::device_eos_sound_speed_with_high_t_tail(tab_ion, rb_ion, logTi,
+                                                                        rho_i, cv_i)
+            : tenryu::materials::device_eos_sound_speed(tab_ion, rb_ion, logTi, rho_i, cv_i);
     if (!tenryu::materials::cold_enabled(tab_ele.cold)) {
       // Tables without a cold branch: the historic arithmetic, kept verbatim so
       // that the default paths stay bitwise identical.
       const double cs_ele =
-          tenryu::materials::device_eos_sound_speed(tab_ele, rb_ele, logTe, rho_i, cv_e);
+          high_t_tail
+              ? tenryu::materials::device_eos_sound_speed_with_high_t_tail(tab_ele, rb_ele, logTe,
+                                                                          rho_i, cv_e)
+              : tenryu::materials::device_eos_sound_speed(tab_ele, rb_ele, logTe, rho_i, cv_e);
       cs[i] = sqrt(cs_ion * cs_ion + cs_ele * cs_ele);
     } else {
       // Cold-equilibrium electron branch: signed electron contribution (may be
       // negative), see NUMERICS §1 (b).
       const double cs2_ele =
-          tenryu::materials::device_eos_sound_speed2_signed(tab_ele, rb_ele, logTe, rho_i, cv_e);
+          high_t_tail
+              ? tenryu::materials::device_eos_sound_speed2_signed_with_high_t_tail(
+                    tab_ele, rb_ele, logTe, rho_i, cv_e)
+              : tenryu::materials::device_eos_sound_speed2_signed(tab_ele, rb_ele, logTe, rho_i,
+                                                                  cv_e);
       cs[i] = sqrt(fmax(cs_ion * cs_ion + cs2_ele, 0.0));
     }
     cs[i] = apply_exact_sound_speed_override(exact_override_kind, cs[i], rho_i, Pe[i], Pi[i]);
@@ -1344,7 +1361,8 @@ __device__ inline void energy_update_with_old_volume_kernel_body(
     const int compatible_energy,
     double* __restrict__ eta_compatible,
     double* __restrict__ E_floor_injected,
-    int* __restrict__ clamp_count) {
+    int* __restrict__ clamp_count,
+    double* __restrict__ E_floor_cell = nullptr) {
   const bool active = (hydro_active == nullptr) || (hydro_active[i] != 0);
   if (!active) {
     ee[i] = e_old[i];
@@ -1375,7 +1393,9 @@ __device__ inline void energy_update_with_old_volume_kernel_body(
   const double e_new = fmax(e_raw, 0.0);
   ee[i] = e_new;
   if (e_raw < 0.0) {
-    if (E_floor_injected != nullptr) {
+    if (E_floor_cell != nullptr) {
+      E_floor_cell[i] += m * (e_new - e_raw);
+    } else if (E_floor_injected != nullptr) {
       atomic_add_double(E_floor_injected, m * (e_new - e_raw));
     }
     if (clamp_count != nullptr) {
@@ -1422,7 +1442,11 @@ __device__ inline void energy_update_with_old_volume_2t_kernel_body(
     const double qei_multiplier = 1.0,
     const double te_floor = 0.0,
     const double ti_floor = 0.0,
-    const int energy_authoritative = 0) {
+    const int energy_authoritative = 0,
+    // 0 when the radiation thermal subcycle owns the electron-ion exchange
+    // (core::thermal_subcycle_active): the update then applies pdV/Q work only.
+    const int apply_exchange = 1,
+    double* __restrict__ E_floor_cell = nullptr) {
   const bool active = (hydro_active == nullptr) || (hydro_active[i] != 0);
   if (!active) {
     ee[i] = ee_old[i];
@@ -1460,8 +1484,10 @@ __device__ inline void energy_update_with_old_volume_2t_kernel_body(
       tab_ele.cold, rho_qei, fmax(Te_half[i], 0.0), Pe_half[i], vol_old[i] / m, vol[i] / m);
   const double z = (zbar != nullptr) ? fmax(zbar[i], 0.0) : fallback_z;
   double qei_term = 0.0;
-  if (tab_ion.n_rho > 0 && tab_ele.n_rho > 0 &&
-      cv_e_arr != nullptr && cv_i_arr != nullptr) {
+  if (apply_exchange == 0) {
+    qei_term = 0.0;
+  } else if (tab_ion.n_rho > 0 && tab_ele.n_rho > 0 &&
+             cv_e_arr != nullptr && cv_i_arr != nullptr) {
     qei_term = tenryu::materials::compute_qei_term_with_cv(
         rho_qei, fmax(Te_half[i], 0.0), fmax(Ti_half[i], 0.0), z, A,
         fmax(cv_e_arr[i], 0.0), fmax(cv_i_arr[i], 0.0), dt, qei_multiplier);
@@ -1543,14 +1569,16 @@ __device__ inline void energy_update_with_old_volume_2t_kernel_body(
 
   const double ei_raw = ei_old[i] + de_i;
   const double ee_raw = ee_old[i] + de_e;
-  const bool use_table = (tab_ion.n_rho > 0);
+  const bool use_table = (tab_ion.n_rho > 0 && tab_ele.n_rho > 0);
   const double ei_new = use_table ? ei_raw : fmax(ei_raw, 0.0);
   const double ee_new = use_table ? ee_raw : fmax(ee_raw, 0.0);
   ei[i] = ei_new;
   ee[i] = ee_new;
 
   if (!use_table && ei_raw < 0.0) {
-    if (E_floor_injected != nullptr) {
+    if (E_floor_cell != nullptr) {
+      E_floor_cell[i] += m * (ei_new - ei_raw);
+    } else if (E_floor_injected != nullptr) {
       atomic_add_double(E_floor_injected, m * (ei_new - ei_raw));
     }
     if (clamp_count != nullptr) {
@@ -1558,7 +1586,9 @@ __device__ inline void energy_update_with_old_volume_2t_kernel_body(
     }
   }
   if (!use_table && ee_raw < 0.0) {
-    if (E_floor_injected != nullptr) {
+    if (E_floor_cell != nullptr) {
+      E_floor_cell[i] += m * (ee_new - ee_raw);
+    } else if (E_floor_injected != nullptr) {
       atomic_add_double(E_floor_injected, m * (ee_new - ee_raw));
     }
     if (clamp_count != nullptr) {
@@ -1666,6 +1696,7 @@ __device__ inline double cfl_1d_candidate_body(
     const double* __restrict__ shock_time,
     const std::int8_t* __restrict__ hydro_active,
     const int n_cells,
+    const int geom_code,
     const double t_current,
     const double gamma,
     const double c1,
@@ -1699,7 +1730,15 @@ __device__ inline double cfl_1d_candidate_body(
   } else {
     const double chi = cfl_compute_chi_1d(x_r, v_r, i, n_cells, J);
     const double compression_speed = dr * chi;
-    denom += c1 * cs + c2 * compression_speed;
+    // Linear viscosity term only in compressing cells (nodes approaching or
+    // volume shrinking), as the main CFL kernel (NUMERICS §3.1.9).
+    const bool compresses =
+        v_r[i + 1] < v_r[i] ||
+        geometry_1d_face_area(geom_code, x_r[i + 1]) * v_r[i + 1] -
+                geometry_1d_face_area(geom_code, x_r[i]) * v_r[i] <
+            0.0;
+    const double c1_cs = compresses ? c1 * cs : 0.0;
+    denom += c1_cs + c2 * compression_speed;
   }
   if (denom <= 0.0) {
     return CUDART_INF;

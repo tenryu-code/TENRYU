@@ -40,7 +40,27 @@ struct DriverRetrySnapshot {
   std::vector<Entry> entries;
   void* d_table = nullptr;
   std::size_t table_capacity = 0;
+  // Copy blocks in the device table: each entry is split into chunks of at
+  // most kSnapshotChunkBytes, one block per chunk.
+  std::size_t copy_blocks = 0;
   bool table_dirty = true;
+
+  // 1D S_N angular intensity memory (State::sn_psi_prev). It is allocated
+  // lazily by the first S_N solve, so its size may change inside the retried
+  // region: kept outside the fixed-size arena and restored with its size
+  // (size 0 = the retried attempt reseeds it like the failed one did).
+  void* d_sn_psi_prev = nullptr;
+  std::size_t sn_psi_prev_count = 0;
+  std::size_t sn_psi_prev_capacity = 0;
+  // The linear-discontinuous S_N's starting-direction history
+  // (State::sn_psi_sd_prev) and in-cell electron energy offset
+  // (State::sn_ee_node_offset), lazily sized like sn_psi_prev.
+  void* d_sn_psi_sd_prev = nullptr;
+  std::size_t sn_psi_sd_prev_count = 0;
+  std::size_t sn_psi_sd_prev_capacity = 0;
+  void* d_sn_ee_node_offset = nullptr;
+  std::size_t sn_ee_node_offset_count = 0;
+  std::size_t sn_ee_node_offset_capacity = 0;
 
   // Burn host-primary state (mutated by callbacks.burn before the hydro
   // halves under STRANG; must roll back with the step).
@@ -85,7 +105,7 @@ struct DriverRetrySnapshot {
   double E_ra_deposited = 0.0;
   double E_cbet_iaw_step = 0.0, E_cbet_iaw = 0.0;
   double E_rad_escaped = 0.0, E_floor_injected = 0.0;
-  double E_pdV_bdry = 0.0, E_Marshak_in = 0.0, E_solver = 0.0;
+  double E_pdV_bdry = 0.0, E_Marshak_in = 0.0, E_volume_in = 0.0, E_solver = 0.0;
   double state_supply_dM_cumulative = 0.0, state_supply_dE_cumulative = 0.0;
   double state_supply_dPz_cumulative = 0.0;
   double state_supply_dM_step = 0.0, state_supply_dE_step = 0.0;

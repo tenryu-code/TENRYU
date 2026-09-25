@@ -115,10 +115,15 @@ bool cast_numeric(const py::handle value, double* out) {
   return true;
 }
 
+// The declared pulse energy in J (the waveform is power in W, so its
+// integral is in J): total_energy_erg is converted, total_energy is taken
+// as J. The erg attribute used to be compared with the integral in J.
 std::optional<double> extract_declared_total_energy(const py::object& callable_obj,
                                                     const std::string& callable_path) {
   constexpr std::array<const char*, 2> kEnergyAttrs = {"total_energy_erg", "total_energy"};
-  for (const char* attr : kEnergyAttrs) {
+  constexpr std::array<double, 2> kEnergyAttrToJoule = {1.0e-7, 1.0};
+  for (std::size_t a = 0; a < kEnergyAttrs.size(); ++a) {
+    const char* attr = kEnergyAttrs[a];
     if (!py::hasattr(callable_obj, attr)) {
       continue;
     }
@@ -130,7 +135,7 @@ std::optional<double> extract_declared_total_energy(const py::object& callable_o
                                 "' is not a finite positive number; skipping energy consistency check");
       return std::nullopt;
     }
-    return energy;
+    return energy * kEnergyAttrToJoule[a];
   }
   return std::nullopt;
 }
@@ -154,7 +159,8 @@ void validate_laser_waveform_integral(const std::string& callable_path,
       tenryu::core::log_warning("[TENRYU][laser] callable '" + callable_path +
                                 "' waveform integral mismatch: integral=" +
                                 std::to_string(integral) +
-                                ", declared_total_energy=" + std::to_string(declared) +
+                                " J, declared_total_energy=" + std::to_string(declared) +
+                                " J" +
                                 ", rel_err=" + std::to_string(rel_err) +
                                 " (> 0.10)");
     }
@@ -172,15 +178,15 @@ std::optional<tenryu::core::namelist::FrozenTable1D> maybe_make_time_table(
     const tenryu::core::namelist::Builder& builder,
     const std::string& callable_path,
     const double t_end,
-    const bool zero_outside) {
+    const bool zero_outside,
+    const bool require_non_negative = false) {
   const auto it = builder.callable_objects.find(callable_path);
   if (it == builder.callable_objects.end()) {
     return std::nullopt;
   }
 
-  constexpr int kSamples = 10000;
-  auto table = tenryu::core::namelist::create_frozen_table(
-      it->second, 0.0, t_end, kSamples);
+  auto table = tenryu::core::namelist::create_frozen_time_table(
+      it->second, t_end, callable_path, require_non_negative);
   table.zero_outside = zero_outside;
   return table;
 }
@@ -191,8 +197,12 @@ TableMap build_frozen_tables(const tenryu::core::Config& cfg,
 
   for (std::size_t i = 0; i < cfg.laser.beams.size(); ++i) {
     const std::string path = "Laser.beams[" + std::to_string(i) + "].power";
-    const auto table = maybe_make_time_table(builder, path, cfg.main.t_end, true);
+    auto table = maybe_make_time_table(builder, path, cfg.main.t_end, true,
+                                       /*require_non_negative=*/true);
     if (table.has_value()) {
+      tenryu::core::namelist::normalize_beam_power_table(
+          *table, cfg.main.t_end, cfg.laser.beams[i].energy_J,
+          ("Laser.beams[" + std::to_string(i) + "]").c_str());
       std::optional<double> declared_total_energy;
       const auto callable_it = builder.callable_objects.find(path);
       if (callable_it != builder.callable_objects.end()) {
@@ -207,7 +217,8 @@ TableMap build_frozen_tables(const tenryu::core::Config& cfg,
 
   if (cfg.radiation.boundary.marshak_Tr.detected) {
     const auto table = maybe_make_time_table(
-        builder, "Radiation.boundary.marshak_Tr", cfg.main.t_end, true);
+        builder, "Radiation.boundary.marshak_Tr", cfg.main.t_end, true,
+        /*require_non_negative=*/true);
     if (table.has_value()) {
       tables.emplace("radiation.marshak_Tr", *table);
     }
@@ -237,31 +248,10 @@ TableMap build_frozen_tables(const tenryu::core::Config& cfg,
 
   for (const auto& [face, _] : cfg.radiation.boundary.marshak_Tr_map) {
     const std::string path = "Radiation.boundary.marshak_Tr_map." + face;
-    const auto table = maybe_make_time_table(builder, path, cfg.main.t_end, true);
+    const auto table = maybe_make_time_table(builder, path, cfg.main.t_end, true,
+                                             /*require_non_negative=*/true);
     if (table.has_value()) {
       tables.emplace("radiation.marshak_Tr_map." + face, *table);
-    }
-  }
-
-  if (cfg.laser.hot_electron.eta_hot_table.detected) {
-    const auto table = maybe_make_time_table(
-        builder, "Laser.hot_electron.eta_hot_table", cfg.main.t_end, true);
-    if (table.has_value()) {
-      tables.emplace("laser.hot_e_eta", *table);
-    }
-  }
-  if (cfg.laser.hot_electron.sources_specified) {
-    for (std::size_t si = 0; si < cfg.laser.hot_electron.sources.size(); ++si) {
-      if (!cfg.laser.hot_electron.sources[si].eta_table.detected) {
-        continue;
-      }
-      const auto channel_table = maybe_make_time_table(
-          builder,
-          "Laser.hot_electron.sources[" + std::to_string(si) + "].eta_table",
-          cfg.main.t_end, true);
-      if (channel_table.has_value()) {
-        tables.emplace("laser.hot_e_eta_ch" + std::to_string(si), *channel_table);
-      }
     }
   }
 

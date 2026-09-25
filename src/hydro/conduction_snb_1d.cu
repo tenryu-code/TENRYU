@@ -10,6 +10,7 @@
 
 #include <cusparse.h>
 
+#include "core/deterministic_sum.hpp"
 #include "core/device_scratch.hpp"
 #include "core/error.hpp"
 #include "core/macros.hpp"
@@ -583,10 +584,10 @@ __global__ void snb_stage_kernel(const double* __restrict__ Te_old,
     if (rho_cv > 0.0) {
       if (isfinite(Te_computed) && Te_floor > Te_computed) {
         const double de = rho_cv * (Te_floor - Te_computed) * V;
-        conduction_bodies::atomic_add_double(E_floor, de);
+        E_floor[i] += de;
       } else if (!isfinite(Te_computed) && Te_floor > 0.0) {
         const double de = rho_cv * Te_floor * V;
-        conduction_bodies::atomic_add_double(E_floor, de);
+        E_floor[i] += de;
       }
     }
     Te_new[i] = Te_floor;
@@ -601,7 +602,7 @@ __global__ void snb_stage_kernel(const double* __restrict__ Te_old,
   if (te_ceiling > 0.0 && Te_computed > te_ceiling) {
     if (rho_cv > 0.0) {
       const double de = rho_cv * (Te_computed - te_ceiling) * V;
-      conduction_bodies::atomic_add_double(E_ceiling, de);
+      E_ceiling[i] += de;
     }
     Te_new[i] = te_ceiling;
     atomicAdd(ceiling_count, 1);
@@ -810,6 +811,13 @@ void conduction_step_1d_sts_snb(core::State& state,
       acquire("conduction:snb:ceiling_count", sizeof(int)));
   double* d_e_ceiling = static_cast<double*>(
       acquire("conduction:snb:e_ceiling", sizeof(double)));
+  // Floor and ceiling energies per cell of the accepted iterate, summed in a
+  // fixed order into d_e_floor / d_e_ceiling after the iteration
+  // (2026-09-24; atomicAdd before).
+  double* d_floor_cells = static_cast<double*>(acquire(
+      "conduction:snb:floor_cells", static_cast<std::size_t>(std::max(n_cells, 1)) * sizeof(double)));
+  double* d_ceiling_cells = static_cast<double*>(acquire(
+      "conduction:snb:ceiling_cells", static_cast<std::size_t>(std::max(n_cells, 1)) * sizeof(double)));
 
   // Frozen group reference temperature from Te^n (design §3.2).
   cuda_check(cudaMemset(work.scalars, 0, 8 * sizeof(double)), "SNB: scalars init failed");
@@ -895,6 +903,12 @@ void conduction_step_1d_sts_snb(core::State& state,
                "SNB: ceiling count reset failed");
     cuda_check(cudaMemset(d_e_ceiling, 0, sizeof(double)),
                "SNB: ceiling energy reset failed");
+    cuda_check(cudaMemset(d_floor_cells, 0,
+                          static_cast<std::size_t>(std::max(n_cells, 1)) * sizeof(double)),
+               "SNB: floor cells reset failed");
+    cuda_check(cudaMemset(d_ceiling_cells, 0,
+                          static_cast<std::size_t>(std::max(n_cells, 1)) * sizeof(double)),
+               "SNB: ceiling cells reset failed");
 
     double* te_curr = state.Te.data();
     double* te_next = d_te_tmp;
@@ -905,16 +919,16 @@ void conduction_step_1d_sts_snb(core::State& state,
           snb_stage_kernel<GEOM, true><<<cell_blocks, kBlockSize>>>(
               te_curr, te_next, d_kappa_eff, work.theta_face, work.dq_face,
               d_rho_cv_e, d_cell_is_void, state.vol.data(), state.x_r.data(),
-              n_cells, tau_stage, te_floor, d_clamp_count, d_e_floor,
+              n_cells, tau_stage, te_floor, d_clamp_count, d_floor_cells,
               te_ceiling_eff,
-              d_ceiling_count, d_e_ceiling);
+              d_ceiling_count, d_ceiling_cells);
         } else {
           snb_stage_kernel<GEOM, false><<<cell_blocks, kBlockSize>>>(
               te_curr, te_next, d_kappa_eff, work.theta_face, work.dq_face,
               d_rho_cv_e, d_cell_is_void, state.vol.data(), state.x_r.data(),
-              n_cells, tau_stage, te_floor, d_clamp_count, d_e_floor,
+              n_cells, tau_stage, te_floor, d_clamp_count, d_floor_cells,
               te_ceiling_eff,
-              d_ceiling_count, d_e_ceiling);
+              d_ceiling_count, d_ceiling_cells);
         }
       };
       switch (geom_code) {
@@ -966,6 +980,8 @@ void conduction_step_1d_sts_snb(core::State& state,
     }
   }
 
+  core::deterministic_sum(d_floor_cells, n_cells, d_e_floor, false);
+  core::deterministic_sum(d_ceiling_cells, n_cells, d_e_ceiling, false);
   int host_counters[3] = {0, 0, 0};
   cuda_check(cudaMemcpy(host_counters, work.counters, sizeof(host_counters),
                         cudaMemcpyDeviceToHost),

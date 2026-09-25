@@ -5,23 +5,18 @@
 #include <cstddef>
 #include <cstdlib>
 #include <iomanip>
-#include <limits>
 #include <numeric>
-#include <optional>
 #include <sstream>
 #include <vector>
 
 #include <cub/cub.cuh>
 
 #include "core/error.hpp"
-#include "mesh/geometry_1d.cuh"
 
 namespace tenryu::hydro::ale1d {
 namespace {
 
 constexpr int kBlockSize = 256;
-constexpr double kFourPiOverThree =
-    4.188790204786390984616857844372670512262892532500141094646;
 constexpr double kTiny = 1.0e-300;
 
 inline void cuda_check(const cudaError_t err, const char* message) {
@@ -40,71 +35,7 @@ bool closure_dump_enabled() {
   return enabled;
 }
 
-template <typename T>
-class DeviceBuffer {
- public:
-  explicit DeviceBuffer(const std::size_t count) {
-    reset(count);
-  }
-
-  ~DeviceBuffer() {
-    release();
-  }
-
-  DeviceBuffer(const DeviceBuffer&) = delete;
-  DeviceBuffer& operator=(const DeviceBuffer&) = delete;
-
-  void reset(const std::size_t count) {
-    release();
-    size_ = count;
-    if (size_ == 0) {
-      return;
-    }
-    cuda_check(cudaMalloc(reinterpret_cast<void**>(&ptr_), size_ * sizeof(T)),
-               "ALE1D velocity projection cudaMalloc failed");
-  }
-
-  T* data() noexcept {
-    return ptr_;
-  }
-
-  const T* data() const noexcept {
-    return ptr_;
-  }
-
- private:
-  void release() {
-    if (ptr_ != nullptr) {
-      cuda_check(cudaFree(ptr_), "ALE1D velocity projection cudaFree failed");
-      ptr_ = nullptr;
-    }
-    size_ = 0;
-  }
-
-  T* ptr_ = nullptr;
-  std::size_t size_ = 0;
-};
-
-__host__ __device__ double volume_coordinate(const double r, const int geom) {
-  return (geom == 0) ? (kFourPiOverThree * r * r * r)
-                     : tenryu::mesh::geometry_1d_shell_volume_cubes(geom, 0.0, r);
-}
-
-__host__ __device__ double cell_volume_from_nodes(
-    const double* __restrict__ r,
-    const int i,
-    const int geom) {
-  return volume_coordinate(r[i + 1], geom) - volume_coordinate(r[i], geom);
-}
-
-__device__ double cell_center_y(const double* __restrict__ r,
-                                const int i,
-                                const int geom) {
-  return 0.5 * (volume_coordinate(r[i], geom) +
-                volume_coordinate(r[i + 1], geom));
-}
-
-__device__ double minmod3(const double a, const double b, const double c) {
+__host__ __device__ double minmod3(const double a, const double b, const double c) {
   if (a > 0.0 && b > 0.0 && c > 0.0) {
     return fmin(a, fmin(b, c));
   }
@@ -114,10 +45,10 @@ __device__ double minmod3(const double a, const double b, const double c) {
   return 0.0;
 }
 
-__device__ double slope_scale_for_face_value(const double q_face,
-                                             const double q_cell,
-                                             const double q_min,
-                                             const double q_max) {
+__host__ __device__ double slope_scale_for_face_value(const double q_face,
+                                                      const double q_cell,
+                                                      const double q_min,
+                                                      const double q_max) {
   if (q_face > q_max) {
     const double denom = q_face - q_cell;
     return denom > kTiny ? fmax(0.0, fmin(1.0, (q_max - q_cell) / denom))
@@ -131,143 +62,178 @@ __device__ double slope_scale_for_face_value(const double q_face,
   return 1.0;
 }
 
-__global__ void build_old_momentum_kernel(const double* __restrict__ r_old,
-                                          const double* __restrict__ mass_old,
-                                          const double* __restrict__ v_old,
-                                          double* __restrict__ p_old,
-                                          double* __restrict__ q_p,
-                                          const int n,
-                                          const int geom) {
-  const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= n) {
-    return;
-  }
-  const double u = 0.5 * (v_old[i] + v_old[i + 1]);
-  const double p = mass_old[i] * u;
-  p_old[i] = p;
-  q_p[i] = p / fmax(cell_volume_from_nodes(r_old, i, geom), kTiny);
-}
-
-__global__ void compute_limited_slopes_kernel(
-    const double* __restrict__ q,
-    const double* __restrict__ r_old,
-    const double* __restrict__ phi_face,
-    double* __restrict__ slope,
-    const int n,
-    const double theta,
-    const int geom) {
-  const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= n) {
-    return;
-  }
-
-  slope[i] = 0.0;
-  if (i <= 0 || i >= n - 1 || phi_face[i] == 0.0 ||
-      phi_face[i + 1] == 0.0) {
-    return;
-  }
-
-  const double qm = q[i - 1];
-  const double qi = q[i];
-  const double qp = q[i + 1];
-  if (!isfinite(qm) || !isfinite(qi) || !isfinite(qp)) {
-    return;
-  }
-
-  const double ycm = cell_center_y(r_old, i - 1, geom);
-  const double yc = cell_center_y(r_old, i, geom);
-  const double ycp = cell_center_y(r_old, i + 1, geom);
-  if (!(yc > ycm) || !(ycp > yc)) {
-    return;
-  }
-
-  double s = minmod3(theta * (qi - qm) / (yc - ycm),
-                     (qp - qm) / (ycp - ycm),
-                     theta * (qp - qi) / (ycp - yc));
-  if (s == 0.0 || !isfinite(s)) {
-    return;
-  }
-
-  const double y_l = volume_coordinate(r_old[i], geom);
-  const double y_r = volume_coordinate(r_old[i + 1], geom);
-  const double q_l = qi + s * (y_l - yc);
-  const double q_r = qi + s * (y_r - yc);
-  const double q_min = fmin(qm, fmin(qi, qp));
-  const double q_max = fmax(qm, fmax(qi, qp));
-  const double alpha =
-      fmin(slope_scale_for_face_value(q_l, qi, q_min, q_max),
-           slope_scale_for_face_value(q_r, qi, q_min, q_max));
-  slope[i] = alpha * s;
-}
-
-__device__ double limited_face_flux(const int face,
-                                    const double* __restrict__ r_old,
-                                    const double* __restrict__ delta_y,
-                                    const int* __restrict__ donor,
-                                    const double* __restrict__ phi_face,
-                                    const double* __restrict__ q,
-                                    const double* __restrict__ slope,
-                                    const int geom) {
-  const int d = donor[face];
-  if (d < 0) {
+// Limited slope in the mass coordinate of a cell value q_i with neighbours
+// q_{i-1}, q_{i+1} (cell centres (m_{i-1} + m_i)/2 and (m_i + m_{i+1})/2
+// apart): generalized minmod with theta, scaled so that the values at the
+// cell's two faces stay within the neighbours' range.
+__device__ double mass_coordinate_slope(const double qm,
+                                        const double qi,
+                                        const double qp,
+                                        const double mm,
+                                        const double mi,
+                                        const double mp,
+                                        const double theta) {
+  if (!isfinite(qm) || !isfinite(qi) || !isfinite(qp) || !(mm > 0.0) ||
+      !(mi > 0.0) || !(mp > 0.0)) {
     return 0.0;
   }
-  const double dy = delta_y[face];
-  const double f1 = dy * q[d];
-  const double y_bar = volume_coordinate(r_old[face], geom) + 0.5 * dy;
-  const double q_bar = q[d] + slope[d] * (y_bar - cell_center_y(r_old, d, geom));
-  const double f2 = dy * q_bar;
-  return f1 + phi_face[face] * (f2 - f1);
+  const double d_minus = 0.5 * (mm + mi);
+  const double d_plus = 0.5 * (mi + mp);
+  const double s = minmod3(theta * (qi - qm) / d_minus,
+                           (qp - qm) / (d_minus + d_plus),
+                           theta * (qp - qi) / d_plus);
+  if (s == 0.0 || !isfinite(s)) {
+    return 0.0;
+  }
+  const double q_l = qi - 0.5 * s * mi;
+  const double q_r = qi + 0.5 * s * mi;
+  const double q_min = fmin(qm, fmin(qi, qp));
+  const double q_max = fmax(qm, fmax(qi, qp));
+  const double alpha = fmin(slope_scale_for_face_value(q_l, qi, q_min, q_max),
+                            slope_scale_for_face_value(q_r, qi, q_min, q_max));
+  return alpha * s;
 }
 
-__global__ void remap_momentum_kernel(const double* __restrict__ r_old,
-                                      const double* __restrict__ q_p,
-                                      const double* __restrict__ delta_y,
-                                      const int* __restrict__ donor,
-                                      const double* __restrict__ phi_face,
-                                      const double* __restrict__ slope,
-                                      double* __restrict__ p_new,
-                                      const int n,
-                                      const int geom) {
+// Slopes of the two node velocities each cell carries: psi^L_i = v_i and
+// psi^R_i = v_{i+1}. Boundary cells and cells next to a face with phi = 0
+// (pinned/protected, or a first-order mass basis) stay first order, as in
+// the remap of the conserved fields.
+__global__ void half_index_shift_slopes_kernel(const double* __restrict__ v_old,
+                                               const double* __restrict__ mass_old,
+                                               const double* __restrict__ phi_face,
+                                               double* __restrict__ slope_left,
+                                               double* __restrict__ slope_right,
+                                               const int n,
+                                               const double theta) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n) {
     return;
   }
-  const double p_old = q_p[i] * cell_volume_from_nodes(r_old, i, geom);
-  const double fp =
-      limited_face_flux(i + 1, r_old, delta_y, donor, phi_face, q_p, slope,
-                        geom);
-  const double fm =
-      limited_face_flux(i, r_old, delta_y, donor, phi_face, q_p, slope, geom);
-  p_new[i] = p_old + fp - fm;
-}
-
-__global__ void project_node_velocity_kernel(
-    const double* __restrict__ mass_new,
-    const double* __restrict__ p_new,
-    double* __restrict__ u_new,
-    double* __restrict__ v_new,
-    const int n) {
-  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx < n) {
-    u_new[idx] = (mass_new[idx] > kTiny) ? p_new[idx] / mass_new[idx] : 0.0;
-  }
-  __syncthreads();
-
-  if (idx > n) {
+  slope_left[i] = 0.0;
+  slope_right[i] = 0.0;
+  if (i <= 0 || i >= n - 1 || phi_face[i] == 0.0 || phi_face[i + 1] == 0.0) {
     return;
   }
-  if (idx == 0) {
+  const double mm = mass_old[i - 1];
+  const double mi = mass_old[i];
+  const double mp = mass_old[i + 1];
+  slope_left[i] =
+      mass_coordinate_slope(v_old[i - 1], v_old[i], v_old[i + 1], mm, mi, mp, theta);
+  slope_right[i] =
+      mass_coordinate_slope(v_old[i], v_old[i + 1], v_old[i + 2], mm, mi, mp, theta);
+}
+
+// Flux of a cell quantity through face j: the face mass flux F_j times the
+// donor's linear reconstruction at the swept mass's centroid (F > 0 takes
+// the leftmost F of cell j, F < 0 the rightmost |F| of cell j-1), blended
+// with the donor value by phi_j. Returns false (no flux) for F = 0 or a face
+// without a donor cell.
+__device__ bool swept_value(const int j,
+                            const int field,
+                            const double* __restrict__ v_old,
+                            const double* __restrict__ mass_old,
+                            const double* __restrict__ mass_flux,
+                            const double* __restrict__ phi_face,
+                            const double* __restrict__ slope_left,
+                            const double* __restrict__ slope_right,
+                            const int n,
+                            double* value) {
+  const double F = mass_flux[j];
+  int d = -1;
+  if (F > 0.0) {
+    d = j;
+  } else if (F < 0.0) {
+    d = j - 1;
+  }
+  if (d < 0 || d >= n) {
+    return false;
+  }
+  const double offset = (F > 0.0) ? 0.5 * (F - mass_old[d]) : 0.5 * (mass_old[d] + F);
+  const double q = (field == 0) ? v_old[d] : v_old[d + 1];
+  const double s = (field == 0) ? slope_left[d] : slope_right[d];
+  *value = q + phi_face[j] * s * offset;
+  return true;
+}
+
+// psi^n_i = psi^o_i + [F_{i+1} (psi_{i+1/2} - psi^o_i) - F_i (psi_{i-1/2} -
+// psi^o_i)] / m^n_i: the conservative update m^n psi^n = m^o psi^o +
+// F_{i+1} psi_{i+1/2} - F_i psi_{i-1/2} written with m^o = m^n - F_{i+1} + F_i,
+// so that a uniform psi stays exactly uniform.
+__global__ void half_index_shift_remap_kernel(const double* __restrict__ v_old,
+                                              const double* __restrict__ mass_old,
+                                              const double* __restrict__ mass_new,
+                                              const double* __restrict__ mass_flux,
+                                              const double* __restrict__ phi_face,
+                                              const double* __restrict__ slope_left,
+                                              const double* __restrict__ slope_right,
+                                              double* __restrict__ psi_left,
+                                              double* __restrict__ psi_right,
+                                              double* __restrict__ p_old,
+                                              double* __restrict__ p_new,
+                                              double* __restrict__ u_new,
+                                              const int n) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) {
+    return;
+  }
+  const double m_new = mass_new[i];
+  const double f_plus = mass_flux[i + 1];
+  const double f_minus = mass_flux[i];
+  double psi[2];
+  for (int field = 0; field < 2; ++field) {
+    const double psi_old = (field == 0) ? v_old[i] : v_old[i + 1];
+    double value = psi_old;
+    if (m_new > kTiny) {
+      double q_plus = 0.0;
+      double q_minus = 0.0;
+      const double dq_plus =
+          swept_value(i + 1, field, v_old, mass_old, mass_flux, phi_face, slope_left,
+                      slope_right, n, &q_plus)
+              ? f_plus * (q_plus - psi_old)
+              : 0.0;
+      const double dq_minus =
+          swept_value(i, field, v_old, mass_old, mass_flux, phi_face, slope_left,
+                      slope_right, n, &q_minus)
+              ? f_minus * (q_minus - psi_old)
+              : 0.0;
+      value = psi_old + (dq_plus - dq_minus) / m_new;
+    }
+    psi[field] = value;
+  }
+  psi_left[i] = psi[0];
+  psi_right[i] = psi[1];
+  p_old[i] = mass_old[i] * (0.5 * (v_old[i] + v_old[i + 1]));
+  const double p = 0.5 * m_new * (psi[0] + psi[1]);
+  p_new[i] = p;
+  u_new[i] = (m_new > kTiny) ? p / m_new : 0.0;
+}
+
+// v_j = (m_j psi^L_j + m_{j-1} psi^R_{j-1}) / (m_j + m_{j-1}), evaluated as
+// psi^R_{j-1} + m_j (psi^L_j - psi^R_{j-1}) / (m_j + m_{j-1}) so that equal
+// values return exactly; the centre node is at rest and the outer node takes
+// the last cell's right value.
+__global__ void half_index_shift_node_kernel(const double* __restrict__ mass_new,
+                                             const double* __restrict__ psi_left,
+                                             const double* __restrict__ psi_right,
+                                             double* __restrict__ v_new,
+                                             const int n) {
+  const int j = blockIdx.x * blockDim.x + threadIdx.x;
+  if (j > n) {
+    return;
+  }
+  if (j == 0) {
     v_new[0] = 0.0;
     return;
   }
-  if (idx == n) {
-    v_new[n] = (mass_new[n - 1] > kTiny) ? p_new[n - 1] / mass_new[n - 1]
-                                         : 0.0;
+  if (j == n) {
+    v_new[n] = psi_right[n - 1];
     return;
   }
-  const double denom = mass_new[idx - 1] + mass_new[idx];
-  v_new[idx] = (denom > kTiny) ? (p_new[idx - 1] + p_new[idx]) / denom : 0.0;
+  const double m_right = fmax(mass_new[j], 0.0);
+  const double m_left = fmax(mass_new[j - 1], 0.0);
+  const double denom = m_right + m_left;
+  const double weight_right = (denom > kTiny) ? m_right / denom : 0.5;
+  v_new[j] = psi_right[j - 1] + weight_right * (psi_left[j] - psi_right[j - 1]);
 }
 
 __global__ void kinetic_energy_kernel(const double* __restrict__ mass,
@@ -476,22 +442,24 @@ __global__ void apply_kinetic_closure_redistribution_kernel(
 
 double reduce_sum(const double* input,
                   const int n,
+                  Ale1dVelocityProjectScratch& scratch,
                   cudaStream_t stream,
                   const char* label) {
   if (n <= 0) {
     return 0.0;
   }
-  DeviceBuffer<double> out(1);
   std::size_t temp_bytes = 0;
-  cuda_check(cub::DeviceReduce::Sum(nullptr, temp_bytes, input, out.data(), n,
-                                    stream),
+  cuda_check(cub::DeviceReduce::Sum(nullptr, temp_bytes, input,
+                                    scratch.reduce_out.data(), n, stream),
              label);
-  DeviceBuffer<unsigned char> temp(temp_bytes);
-  cuda_check(cub::DeviceReduce::Sum(temp.data(), temp_bytes, input, out.data(),
-                                    n, stream),
+  if (scratch.reduce_temp.size() < temp_bytes) {
+    scratch.reduce_temp.resize(temp_bytes);
+  }
+  cuda_check(cub::DeviceReduce::Sum(scratch.reduce_temp.data(), temp_bytes, input,
+                                    scratch.reduce_out.data(), n, stream),
              label);
   double host = 0.0;
-  cuda_check(cudaMemcpyAsync(&host, out.data(), sizeof(double),
+  cuda_check(cudaMemcpyAsync(&host, scratch.reduce_out.data(), sizeof(double),
                              cudaMemcpyDeviceToHost, stream),
              label);
   cuda_check(cudaStreamSynchronize(stream), label);
@@ -508,6 +476,16 @@ void Ale1dVelocityProjectScratch::resize(const int n_cells) {
   p_new_cell.resize(n);
   u_new_cell.resize(n);
   v_new_node.resize(n + 1U);
+  psi_left.resize(n);
+  psi_right.resize(n);
+  slope_left.resize(n);
+  slope_right.resize(n);
+  ke_node_old.resize(n + 1U);
+  ke_node_new.resize(n + 1U);
+  deficit.resize(n);
+  capacity.resize(n);
+  deposited.resize(n);
+  reduce_out.resize(1U);
 }
 
 bool Ale1dVelocityProjectScratch::size_matches(const int n_cells) const {
@@ -516,15 +494,19 @@ bool Ale1dVelocityProjectScratch::size_matches(const int n_cells) const {
   }
   const auto n = static_cast<std::size_t>(n_cells);
   return p_old_cell.size() == n && p_new_cell.size() == n &&
-         u_new_cell.size() == n && v_new_node.size() == n + 1U;
+         u_new_cell.size() == n && v_new_node.size() == n + 1U &&
+         psi_left.size() == n && psi_right.size() == n && slope_left.size() == n &&
+         slope_right.size() == n && ke_node_old.size() == n + 1U &&
+         ke_node_new.size() == n + 1U && deficit.size() == n && capacity.size() == n &&
+         deposited.size() == n && reduce_out.size() == 1U;
 }
 
 Ale1dVelocityProjectResult project_velocity(
     const core::State& state,
-    const std::vector<double>& mass_new,
-    const std::vector<double>& delta_Y,
-    const std::vector<int>& donor,
-    const std::vector<double>& phi_face,
+    const double* mass_new,
+    const double* mass_flux,
+    const double* phi_face,
+    const double limiter_theta,
     const bool ke_conservation_closure,
     const bool two_temperature,
     const double* ke_remap,
@@ -532,21 +514,18 @@ Ale1dVelocityProjectResult project_velocity(
     double* ei_new,
     Ale1dVelocityProjectScratch& scratch) {
   Ale1dVelocityProjectResult result;
-  const int n = static_cast<int>(mass_new.size());
-  if (n <= 0 || delta_Y.size() != static_cast<std::size_t>(n + 1) ||
-      donor.size() != static_cast<std::size_t>(n + 1) ||
-      phi_face.size() != static_cast<std::size_t>(n + 1)) {
+  const int n = static_cast<int>(scratch.p_old_cell.size());
+  if (n <= 0 || mass_new == nullptr || mass_flux == nullptr || phi_face == nullptr) {
     return result;
   }
-  const int geom = state.mesh.geometry_code;
+  TENRYU_ASSERT(scratch.size_matches(n),
+                "ALE1D velocity projection scratch size mismatch");
   TENRYU_ASSERT(state.x_r.size() >= static_cast<std::size_t>(n + 1),
                 "ALE1D velocity projection requires n_cells+1 old nodes");
   TENRYU_ASSERT(state.v_r.size() >= static_cast<std::size_t>(n + 1),
                 "ALE1D velocity projection requires n_cells+1 velocities");
   TENRYU_ASSERT(state.mass.size() >= static_cast<std::size_t>(n),
                 "ALE1D velocity projection requires old mass");
-  TENRYU_ASSERT(scratch.size_matches(n),
-                "ALE1D velocity projection scratch size mismatch");
   if (ke_conservation_closure) {
     TENRYU_ASSERT(ke_remap != nullptr,
                   "ALE1D velocity projection requires remapped kinetic energy");
@@ -555,96 +534,37 @@ Ale1dVelocityProjectResult project_velocity(
   }
 
   cudaStream_t stream = nullptr;
-  DeviceBuffer<double> d_mass_new(static_cast<std::size_t>(n));
-  DeviceBuffer<double> d_delta_y(static_cast<std::size_t>(n + 1));
-  DeviceBuffer<int> d_donor(static_cast<std::size_t>(n + 1));
-  DeviceBuffer<double> d_phi(static_cast<std::size_t>(n + 1));
-  DeviceBuffer<double> d_q_p(static_cast<std::size_t>(n));
-  DeviceBuffer<double> d_slope(static_cast<std::size_t>(n));
-  DeviceBuffer<double> d_ke_old(static_cast<std::size_t>(n + 1));
-  DeviceBuffer<double> d_ke_new(static_cast<std::size_t>(n + 1));
-
-  cuda_check(cudaMemcpyAsync(d_mass_new.data(),
-                             mass_new.data(),
-                             static_cast<std::size_t>(n) * sizeof(double),
-                             cudaMemcpyHostToDevice,
-                             stream),
-             "ALE1D velocity projection mass upload failed");
-  cuda_check(cudaMemcpyAsync(d_delta_y.data(),
-                             delta_Y.data(),
-                             static_cast<std::size_t>(n + 1) * sizeof(double),
-                             cudaMemcpyHostToDevice,
-                             stream),
-             "ALE1D velocity projection delta upload failed");
-  cuda_check(cudaMemcpyAsync(d_donor.data(),
-                             donor.data(),
-                             static_cast<std::size_t>(n + 1) * sizeof(int),
-                             cudaMemcpyHostToDevice,
-                             stream),
-             "ALE1D velocity projection donor upload failed");
-  cuda_check(cudaMemcpyAsync(d_phi.data(),
-                             phi_face.data(),
-                             static_cast<std::size_t>(n + 1) * sizeof(double),
-                             cudaMemcpyHostToDevice,
-                             stream),
-             "ALE1D velocity projection phi upload failed");
-
-  build_old_momentum_kernel<<<blocks_for(n), kBlockSize, 0, stream>>>(
-      state.x_r.data(),
-      state.mass.data(),
-      state.v_r.data(),
-      scratch.p_old_cell.data(),
-      d_q_p.data(),
-      n,
-      geom);
-  cuda_check(cudaGetLastError(),
-             "ALE1D velocity projection old momentum launch failed");
-
-  compute_limited_slopes_kernel<<<blocks_for(n), kBlockSize, 0, stream>>>(
-      d_q_p.data(), state.x_r.data(), d_phi.data(), d_slope.data(), n, 1.5,
-      geom);
+  half_index_shift_slopes_kernel<<<blocks_for(n), kBlockSize, 0, stream>>>(
+      state.v_r.data(), state.mass.data(), phi_face, scratch.slope_left.data(),
+      scratch.slope_right.data(), n, limiter_theta);
   cuda_check(cudaGetLastError(),
              "ALE1D velocity projection slope launch failed");
-
-  remap_momentum_kernel<<<blocks_for(n), kBlockSize, 0, stream>>>(
-      state.x_r.data(),
-      d_q_p.data(),
-      d_delta_y.data(),
-      d_donor.data(),
-      d_phi.data(),
-      d_slope.data(),
-      scratch.p_new_cell.data(),
-      n,
-      geom);
+  half_index_shift_remap_kernel<<<blocks_for(n), kBlockSize, 0, stream>>>(
+      state.v_r.data(), state.mass.data(), mass_new, mass_flux, phi_face,
+      scratch.slope_left.data(), scratch.slope_right.data(), scratch.psi_left.data(),
+      scratch.psi_right.data(), scratch.p_old_cell.data(), scratch.p_new_cell.data(),
+      scratch.u_new_cell.data(), n);
   cuda_check(cudaGetLastError(),
              "ALE1D velocity projection remap launch failed");
-
-  project_node_velocity_kernel<<<blocks_for(n + 1), kBlockSize, 0, stream>>>(
-      d_mass_new.data(),
-      scratch.p_new_cell.data(),
-      scratch.u_new_cell.data(),
-      scratch.v_new_node.data(),
-      n);
+  half_index_shift_node_kernel<<<blocks_for(n + 1), kBlockSize, 0, stream>>>(
+      mass_new, scratch.psi_left.data(), scratch.psi_right.data(),
+      scratch.v_new_node.data(), n);
   cuda_check(cudaGetLastError(),
              "ALE1D velocity projection node launch failed");
 
-  std::optional<DeviceBuffer<double>> d_deposited;
   if (ke_conservation_closure) {
-    d_deposited.emplace(static_cast<std::size_t>(n));
-    DeviceBuffer<double> d_deficit(static_cast<std::size_t>(n));
-    DeviceBuffer<double> d_capacity(static_cast<std::size_t>(n));
     // Deposit into the remapped-but-uncommitted candidate. This moves the KE
     // discrepancy into internal energy before diagnostics, so
     // global_total_energy_rel_err retains its KE + internal + radiation meaning.
     constexpr double kClosureSpecificEnergyFloor = 0.0;
     compute_kinetic_closure_deficit_capacity_kernel
         <<<blocks_for(n), kBlockSize, 0, stream>>>(
-            d_deficit.data(),
-            d_capacity.data(),
+            scratch.deficit.data(),
+            scratch.capacity.data(),
             ee_new,
             ei_new,
             ke_remap,
-            d_mass_new.data(),
+            mass_new,
             scratch.v_new_node.data(),
             kClosureSpecificEnergyFloor,
             n,
@@ -653,10 +573,10 @@ Ale1dVelocityProjectResult project_velocity(
                "ALE1D velocity projection KE closure deficit/capacity launch "
                "failed");
     const double global_deficit = reduce_sum(
-        d_deficit.data(), n, stream,
+        scratch.deficit.data(), n, scratch, stream,
         "ALE1D velocity projection KE closure deficit reduction failed");
     const double global_capacity = reduce_sum(
-        d_capacity.data(), n, stream,
+        scratch.capacity.data(), n, scratch, stream,
         "ALE1D velocity projection KE closure capacity reduction failed");
 
     double absorption_factor = 0.0;
@@ -668,9 +588,9 @@ Ale1dVelocityProjectResult project_velocity(
         <<<blocks_for(n), kBlockSize, 0, stream>>>(
             ee_new,
             ei_new,
-            d_deposited->data(),
+            scratch.deposited.data(),
             ke_remap,
-            d_mass_new.data(),
+            mass_new,
             scratch.v_new_node.data(),
             kClosureSpecificEnergyFloor,
             absorption_factor,
@@ -679,24 +599,24 @@ Ale1dVelocityProjectResult project_velocity(
     cuda_check(cudaGetLastError(),
                "ALE1D velocity projection KE closure launch failed");
     result.ke_closure_deposited = reduce_sum(
-        d_deposited->data(), n, stream,
+        scratch.deposited.data(), n, scratch, stream,
         "ALE1D velocity projection KE closure reduction failed");
   }
 
   kinetic_energy_kernel<<<blocks_for(n + 1), kBlockSize, 0, stream>>>(
-      state.mass.data(), state.v_r.data(), d_ke_old.data(), n);
+      state.mass.data(), state.v_r.data(), scratch.ke_node_old.data(), n);
   cuda_check(cudaGetLastError(),
              "ALE1D velocity projection old KE launch failed");
   kinetic_energy_kernel<<<blocks_for(n + 1), kBlockSize, 0, stream>>>(
-      d_mass_new.data(), scratch.v_new_node.data(), d_ke_new.data(), n);
+      mass_new, scratch.v_new_node.data(), scratch.ke_node_new.data(), n);
   cuda_check(cudaGetLastError(),
              "ALE1D velocity projection new KE launch failed");
 
   result.kinetic_energy_old = reduce_sum(
-      d_ke_old.data(), n + 1, stream,
+      scratch.ke_node_old.data(), n + 1, scratch, stream,
       "ALE1D velocity projection old KE reduction failed");
   result.kinetic_energy_new = reduce_sum(
-      d_ke_new.data(), n + 1, stream,
+      scratch.ke_node_new.data(), n + 1, scratch, stream,
       "ALE1D velocity projection new KE reduction failed");
   if (ke_conservation_closure) {
     static int closure_dump_count = 0;
@@ -715,7 +635,7 @@ Ale1dVelocityProjectResult project_velocity(
                                  stream),
                  "ALE1D closure dump ke_remap download failed");
       cuda_check(cudaMemcpyAsync(deposited_host.data(),
-                                 d_deposited->data(),
+                                 scratch.deposited.data(),
                                  static_cast<std::size_t>(n) * sizeof(double),
                                  cudaMemcpyDeviceToHost,
                                  stream),
@@ -733,7 +653,7 @@ Ale1dVelocityProjectResult project_velocity(
                                  stream),
                  "ALE1D closure dump ei_new download failed");
       cuda_check(cudaMemcpyAsync(mass_new_host.data(),
-                                 d_mass_new.data(),
+                                 mass_new,
                                  static_cast<std::size_t>(n) * sizeof(double),
                                  cudaMemcpyDeviceToHost,
                                  stream),

@@ -2,6 +2,8 @@
 
 #include <cuda_runtime.h>
 
+#include <limits>
+
 #include "core/config.hpp"
 #include "core/state.hpp"
 #include "radiation/planck_table.cuh"
@@ -17,12 +19,15 @@ struct Sn1DDiagnostics {
   double escaped_energy = 0.0;
 };
 
+// drive_time_s: evaluation time of the Marshak T_r(t) / pulsed-flux drive
+// (midpoint of the advanced interval); NaN keeps the historic state.t.
 void advance_radiation_step_sn_1d(
     core::State& state,
     const core::Config& cfg,
     const PlanckTable& planck,
     const core::Config::MaterialsConfig::MatDef& mat,
-    double dt);
+    double dt,
+    double drive_time_s = std::numeric_limits<double>::quiet_NaN());
 
 void compute_sn_E_star_flux_1d_gpu(
     const double* rad_E_old,
@@ -42,7 +47,6 @@ void compute_sn_donor_theta_limited_face_flux_1d_gpu(
     const double* node_r,
     const double* vol,
     const double* face_flux_raw,
-    double* const stream_theta_donor,
     double* stream_theta,
     double* face_flux_limited,
     int n_cells,

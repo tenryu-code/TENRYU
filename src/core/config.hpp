@@ -560,6 +560,10 @@ struct Config {
       double lambda_fd_delta_rel = 1.0e-4;
       double lambda_fd_abs_min = 1.0e-6;
       double nlte_f_min = 1.0e-4;
+      // opacity.model="ionmix" (an LTE IONMIX table): the builder runs it as
+      // "table_nlte" and requires the file's emission opacity to equal its
+      // absorption opacity (2026-09-24).
+      bool opacity_lte_required = false;
     };
 
     struct ZbarConfig {
@@ -577,6 +581,11 @@ struct Config {
       std::vector<double> r4;   // <Z^4>/zbar^4
       int provider_material = -1;
     } zmoments;
+    // Ionization moment tables of every material slot (ndens = 0: the
+    // material has none, its cells take the ratios 1). Filled for
+    // multi-material decks (2026-09-24); `zmoments` keeps the single
+    // material's tables.
+    std::vector<ZMomentTables> zmoments_by_material;
 
     struct VoidConfig {
       double rho = 1e-10;
@@ -594,6 +603,26 @@ struct Config {
     int first_nonvoid_material_index() const {
       for (int i = 0; i < static_cast<int>(materials.size()); ++i) {
         if (!materials[i].is_void) {
+          return i;
+        }
+      }
+      return -1;
+    }
+
+    // Material whose tables decide whether a run takes the table closures at
+    // all and serve as their fallback view: in 1D (dim == 1), where every cell
+    // closes with its own material, the first non-void material that closes
+    // with EOS tables, so a deck may list an ideal gas first (a material on
+    // the exact ideal-gas hydro backend closes with the ideal gas although it
+    // keeps its tables, 2026-09-24); in 2D the first non-void material, as the
+    // 2D hydro closure evaluates one material's tables. -1 when there is none.
+    int eos_table_reference_material_index(const int dim) const {
+      if (dim != 1) {
+        return first_nonvoid_material_index();
+      }
+      for (int i = 0; i < static_cast<int>(materials.size()); ++i) {
+        if (!materials[i].is_void && materials[i].eos_tables &&
+            materials[i].hydro_eos_backend != "exact_ideal_gas") {
           return i;
         }
       }
@@ -829,14 +858,26 @@ struct Config {
       //   fixed relative to the problem scale, independent of warm-start
       //   quality. Opt-in; "r0" path is bit-identical to historic behavior.
       std::string cg_tol_norm = "r0";
-      // Opt-in Anderson acceleration of the FLD outer (emission linearization)
-      // fixed-point iteration Te_{k+1} = G(Te_k). "none" (default) is
-      // bit-identical historic plain iteration. "anderson" mixes the next
+      // Acceleration of the FLD outer (emission linearization) fixed-point
+      // iteration Te_{k+1} = G(Te_k). "anderson" (opt-in) mixes the next
       // linearization temperature from the last anderson_m residuals
       // (Walker-Ni form, damping anderson_beta); the converged exit state is
       // always the raw Newton output, so the accepted fixed point obeys the
       // same outer_tol contract.
-      std::string outer_accel = "none";
+      // "grey" (default in 1D through "auto"): after each outer iteration a
+      // grey diffusion equation for the linearized correction gives the next
+      // linearization temperature (multifrequency-grey scheme); the
+      // converged solution is the plain iteration's. "none" is the historic
+      // plain iteration; "auto" resolves to "grey" in 1D and "none" in 2D_RZ.
+      std::string outer_accel = "auto";
+      // Radiation field the 1D flux limiter is evaluated from within a step:
+      // "predictor" (default): the first outer iterate (the groups solved
+      // with the limiter of the step-start field and the emission at the
+      // step-start temperature), then held fixed, so the outer iteration
+      // converges the matter-radiation coupling alone; "iterate": re-evaluated
+      // from every outer iterate (historic; its lagged fixed-point iteration
+      // stalls in optically thin, streaming regions).
+      std::string limiter_evaluation = "predictor";
       int anderson_m = 2;
       double anderson_beta = 1.0;
       int cg_max_iter = 500;
@@ -878,15 +919,29 @@ struct Config {
 
       int n_angles = 16;
       std::string angular_quadrature = "level_symmetric_16";
+      // 2D_RZ default; a 1D deck that does not set it runs
+      // "linear_discontinuous" (the builder sets it; spatial_scheme_explicit
+      // records whether the namelist gave the key).
       std::string spatial_scheme = "linear_characteristic";
+      bool spatial_scheme_explicit = false;
       int max_outer_iterations = 20;
       int max_inner_iterations = 100;
       double outer_tol = 1.0e-4;
       double outer_tol_stagnation_factor = 0.5;
       double outer_tol_hydro_error_scale = 1.0e-5;
       double inner_tol = 1.0e-6;
+      // Grey low-order preconditioner of the linear-discontinuous scheme's
+      // emission GMRES: "auto" applies it in a Newton iteration only when the
+      // largest local gain of the grey correction over the nodes exceeds 0.1
+      // (NUMERICS 6.8.4), "on" always, "off" never.
+      std::string grey_preconditioner = "auto";
       int inner_graph_unroll = 5;
       bool dsa_enabled = true;
+      // Acceleration of the (DSA-corrected) source iteration: "none" or
+      // "anderson" (Anderson mixing of the last anderson_depth iterates,
+      // 1D_SPH, 2026-09-24).
+      std::string inner_acceleration = "none";
+      int anderson_depth = 3;
       std::string diffusion_fallback_mode = "none";
       double tau_diffusion_on = 10.0;
       double tau_diffusion_off = 5.0;
@@ -977,7 +1032,13 @@ struct Config {
     struct AbsorptionConfig {
       std::string model = "inverse_bremsstrahlung";
       double eps_n = 1.0e-4;
+      // True: rays that reach the critical layer terminate (terminate_mode
+      // books their remaining power); False: they reflect at the critical
+      // radius (characteristic integrator only). The builder sets False for
+      // the characteristic integrator unless the namelist gives the value
+      // (terminate_explicit), 2026-09-24.
       bool terminate = true;
+      bool terminate_explicit = false;
       std::string terminate_mode = "escape";  // escape | deposit
       double coulomb_log_floor = 2.0;
       bool debug_dump_lasermesh = false;
@@ -986,9 +1047,9 @@ struct Config {
     struct LaserMeshConfig {
       struct GhostCoronaConfig {
         bool enabled = false;
-        int n_out = 8;
+        int n_out = 12;
         double ne_min_frac = 0.03;
-        double ne_max_frac = 1.05;
+        double ne_max_frac = 0.99;
         double Te_min_eV = 50.0;
         double zbar_min = 1.0;
         double zbar_max = 4.0;
@@ -1019,7 +1080,21 @@ struct Config {
       double intensity_cutoff = 1.0e-6;
       double eps_crit = 1.0e-4;
       int max_steps = 100000;
-      std::string integrator = "leapfrog";
+      // "auto": "characteristic" for the 1D spherical trace (NUMERICS 5.3.6),
+      // "leapfrog" elsewhere (the builder resolves it; unresolved "auto" in a
+      // 1D spherical trace means "characteristic").
+      std::string integrator = "auto";
+      // 1D cylinder / slab (Mesh.geometry_1d != "spherical"): rays per ring
+      // of a beam's cross-section, spread in azimuth around the beam axis
+      // (one when every azimuth gives the same ray: a slab at normal
+      // incidence). A sphere traces one ray per ring.
+      int azimuthal_rays = 16;
+      // Lanes per ray of the characteristic trace: 0 lets the launcher choose
+      // the widest of 256, 128, 64 lanes with which every ray is resident on
+      // the GPU at once (else 32, one warp); 32, 64, 128 or 256 fixes it. The
+      // width sets the rounding order of the trace's lane sums (NUMERICS
+      // 5.3.6 (c')).
+      int lanes_per_ray = 0;
       double test_kappa = -1.0;
       double ds_adapt_g_target = 0.05;
       double ds_adapt_tau_target = 0.05;
@@ -1059,6 +1134,19 @@ struct Config {
       std::string zeff_model = "auto";            // auto | off | sequential_strip | table
       std::vector<double> species_z = {};         // nuclear charges (ascending)
       std::vector<double> species_x = {};         // number fractions (sum ~ 1)
+      // Collision charge of each material slot in a 1D multi-material deck
+      // (resolved by the builder, 2026-09-24; empty otherwise): model
+      // "off" (Zbar), "sequential_strip" (species below) or "table"
+      // (zeff_table below); langdon_zcoll the representative collision
+      // charge of the Langdon factor (<= 0: the local Zbar).
+      struct MaterialZeff {
+        std::string model = "off";
+        std::vector<double> species_z;
+        std::vector<double> species_x;
+        ZeffTableConfig zeff_table;
+        double langdon_zcoll = 0.0;
+      };
+      std::vector<MaterialZeff> material_zeff;
       std::string coulomb_log_model = "debye";    // debye | laser_frequency
       std::string langdon_model = "auto";         // auto | off | legacy_vacuum_map
       double langdon_te_min_eV = 100.0;
@@ -1198,6 +1286,9 @@ struct Config {
       std::vector<double> profile_I;     // "table" model: relative intensity >= 0
       int profile_m = -1;
       CallableInfo power;
+      // > 0: the frozen power table is rescaled so that its integral over
+      // [0, Main.t_end] equals this pulse energy [J] (shape from `power`).
+      double energy_J = -1.0;
     };
 
     // SPEC default is true; implementation keeps false as a safer default.
@@ -1234,8 +1325,18 @@ struct Config {
     HotElectronConfig hot_electron;
     std::vector<BeamDef> beams;
 
+    // Some material of a multi-material deck resolved a collision-charge model.
+    [[nodiscard]] bool material_zeff_active() const {
+      for (const auto& mz : ib.material_zeff) {
+        if (mz.model != "off") {
+          return true;
+        }
+      }
+      return false;
+    }
+
     [[nodiscard]] bool laser_phys_ext_active() const {
-      return (ib.zeff_model != "off" && ib.zeff_model != "auto") ||
+      return (ib.zeff_model != "off" && ib.zeff_model != "auto") || material_zeff_active() ||
              ib.coulomb_log_model != "debye" ||
              (ib.langdon_model != "off" && ib.langdon_model != "auto") || ra.enable ||
              absorption.terminate_mode == "deposit";
@@ -2735,10 +2836,18 @@ struct Config {
       // Trigger
       int every_n_steps = 100;
       int min_steps_between_ale = 50;
+      // Candidate gates on the acoustic time-step bound min_i dr_i / c_s,i
+      // (NUMERICS §3.4.1): an attempt triggered by the cadence alone must
+      // raise it by benefit_min_dt_gain when enable_benefit_gate, and no
+      // candidate may lower it by more than candidate_dt_penalty_max.
       bool enable_benefit_gate = true;
       double benefit_min_dt_gain = 1.5;
       double candidate_dt_penalty_max = 1.25;
+      // Mesh-quality trigger: the largest adjacent cell-width ratio above
+      // emergency_max_dr_ratio (2026-09-23; this used
+      // candidate_dt_penalty_max as the threshold).
       bool emergency_enabled = true;
+      double emergency_max_dr_ratio = 1.25;
 
       // Eligibility guards
       int min_cells = 256;

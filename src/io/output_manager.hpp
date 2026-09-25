@@ -23,7 +23,20 @@ class OutputManager {
   // (every writer entry is already rank-0-gated); rank > 0 sets the base
   // path strings without touching the filesystem — this removes the
   // per-rank directory-index race (run_p2 vs run_p2_001).
+  OutputManager() = default;
+  OutputManager(const OutputManager&) = default;
+  OutputManager& operator=(const OutputManager&) = default;
+  OutputManager(OutputManager&&) = default;
+  OutputManager& operator=(OutputManager&&) = default;
+  // Waits for the snapshots still being published (a safety net; the driver
+  // waits at the end of a run).
+  ~OutputManager();
+
   void init(const tenryu::core::Config& cfg, int rank = 0);
+  // write_snapshot publishes the snapshot on the HDF5 writer's worker thread
+  // (HDF5Writer::write_snapshot_in_background): waits until every snapshot
+  // written so far is on disk, rethrowing a publication error.
+  void wait_for_snapshots() const;
   void set_termination_reason(std::string reason);
   int last_checkpoint_step() const;
   const std::string& last_checkpoint_path() const;

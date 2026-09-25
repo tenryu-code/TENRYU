@@ -9,8 +9,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <sstream>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <cuda_runtime.h>
@@ -39,6 +41,8 @@
 #include "laser/laser_mesh_bodies.cuh"
 #include "laser/laser_phys_ext.cuh"
 #include "laser/ray_trace_bodies.cuh"
+#include "laser/ray_trace_characteristic.cuh"
+#include "radiation/fld_1d_grey_accel.cuh"
 #include "laser/refraction.cuh"
 #include "radiation/fld_1d_bodies.cuh"
 #include "radiation/planck_table.cuh"
@@ -101,6 +105,8 @@ struct PersistentParams {
   int fld_fleck_form_exp = 0;
   int fld_has_cv_e = 0;
   int fld_max_outer_iterations = 0;
+  int fld_grey_accel = 0;  // outer_accel "grey" (the 1D resolution of "auto")
+  int fld_limiter_predictor = 0;  // limiter_evaluation "predictor"
   int laser_enabled = 0;
   int laser_n_folded = 0;
   int laser_mode_raytrace_1d = 0;
@@ -116,8 +122,14 @@ struct PersistentParams {
   int laser_lmesh_critical_clip = 0;
   int laser_lmesh_ghost_corona_enabled = 0;
   int laser_lmesh_ghost_n_out = 0;
+  double laser_turn_on_s = 0.0;  // laser::laser_turn_on_time_s: ghost width grows from it
   int laser_lmesh_ghost_handoff_cells = 4;
+  int laser_lmesh_ghost_transition_resolved_cells = 3;
   int laser_raytrace_max_steps = laser::ray_trace_bodies::kMaxRayStepsGuard;
+  int laser_raytrace_characteristic = 0;  // Laser.raytrace.integrator="characteristic"
+  // Laser.absorption.critical_handling.terminate = False: the characteristic
+  // trace reflects at the critical radius (the multi-kernel launch's flag).
+  int laser_reflect_at_critical = 0;
   radiation::PlanckTableDeviceView planck{};
   materials::IonmixOpacityDeviceView nlte_opacity{};
   core::namelist::FrozenTable1DDeviceView laser_power_table{};
@@ -169,13 +181,14 @@ struct PersistentParams {
   double laser_lmesh_target_radius = 0.0;
   double laser_lmesh_n_hat_margin = 0.9999;
   double laser_lmesh_ghost_ne_min_frac = 0.03;
-  double laser_lmesh_ghost_ne_max_frac = 1.05;
+  double laser_lmesh_ghost_ne_max_frac = 0.99;
   double laser_lmesh_ghost_Te_min_eV = 50.0;
   double laser_lmesh_ghost_zbar_min = 1.0;
   double laser_lmesh_ghost_zbar_max = 4.0;
   double laser_lmesh_ghost_handoff_decay = 1.5;
+  double laser_lmesh_ghost_transition_resolved_nhat = 0.9;
   double laser_beam_f_number = 8.0;
-  double laser_beam_focus_lab_z = 0.0;
+  double laser_beam_focus_lab_z = 0.0;  // Beam::axial_focus_1d() of the beam
   double laser_beam_profile_w0_cm = 0.0;
   double fld_alpha = 1.0;
   double fld_f_min = 0.01;
@@ -186,6 +199,10 @@ struct PersistentParams {
   double t_end = 0.0;
   double t_next_output = 0.0;
   double void_rho = 0.0;
+  // Numerics.hydro.crossing_dt_safety (node-crossing bound of the hydro dt)
+  // and Numerics.safety.nan_fatal (per-step non-finite state check).
+  double crossing_dt_safety = 0.5;
+  int nan_fatal = 1;
 };
 
 struct PersistentMaterialParams {
@@ -279,6 +296,13 @@ struct PersistentDeviceBuffers {
   double* fld_Te_old = nullptr;
   double* fld_delta_T = nullptr;
   double* fld_cp_work = nullptr;
+  // Grey acceleration: spectrum [n_cells x n_groups]; per cell D, sum_w,
+  // grey lower/diag/upper/rhs, (unused), linearization temperature, P and the
+  // four work slabs of the grey system's parallel cyclic reduction.
+  double* fld_grey_xi = nullptr;
+  double* fld_grey_cells = nullptr;
+  // The flux limiter's radiation field under limiter_evaluation "predictor".
+  double* fld_limiter_E = nullptr;
   double* fld_pcr_dl_work = nullptr;
   double* fld_pcr_d_work = nullptr;
   double* fld_pcr_du_work = nullptr;
@@ -304,6 +328,15 @@ struct PersistentDeviceBuffers {
   double* laser_radial_n_hat_raw = nullptr;
   double* laser_radial_smooth_kappa = nullptr;
   double* laser_radial_dn_dr = nullptr;
+  double* laser_radial_T_e = nullptr;
+  double* laser_radial_Zbar = nullptr;
+  double* laser_radial_zero = nullptr;
+  int laser_radial_capacity = 0;
+  // Laser.mode="radial_absorption_1d": each cell's optical depth, n_hat_raw
+  // and status, evaluated in parallel before the leader carries the power.
+  double* laser_radial_cell_tau = nullptr;
+  double* laser_radial_cell_nh_raw = nullptr;
+  int* laser_radial_cell_status = nullptr;
   void* laser_step_tally_slab = nullptr;
   double* laser_unabsorbed = nullptr;
   unsigned long long* laser_tail_closure_count = nullptr;
@@ -320,16 +353,24 @@ struct PersistentDeviceBuffers {
   double* laser_per_ray_deposit = nullptr;
   double* laser_per_ray_unabsorbed = nullptr;
   double* laser_per_ray_tail_power = nullptr;
+  // Piece table of the characteristic trace: breakpoints, then per piece its
+  // radial interval, its deposit cell, and the piece count.
+  double* laser_piece_r = nullptr;
+  int* laser_piece_ints = nullptr;
+  int laser_piece_capacity = 0;
   double* laser_cell_n_hat = nullptr;
   double* laser_widths = nullptr;
-  double* laser_ema_state = nullptr;
-  int* laser_ema_valid = nullptr;
   std::uint8_t* laser_cell_is_void = nullptr;
 
   double* grid_reduce_partials = nullptr;
   int* grid_reduce_indices = nullptr;
   double* grid_reduce_scalar = nullptr;
   int* grid_reduce_index_scalar = nullptr;
+  // pk_reduce_sum_multi scratch: kPkReduceMultiMax rows of
+  // grid_reduce_multi_stride partials and one scalar per value.
+  double* grid_reduce_multi_partials = nullptr;
+  double* grid_reduce_multi_scalars = nullptr;
+  int grid_reduce_multi_stride = 0;
   double* grid_broadcast_doubles = nullptr;
   int* grid_broadcast_ints = nullptr;
   int* grid_error = nullptr;
@@ -351,20 +392,43 @@ struct PersistentDiagRecord {
   double laser_escaped = 0.0;
   double laser_floor = 0.0;
   double laser_skipped = 0.0;
+  // Floor injections of the hydro and conduction steps [erg] (booked into
+  // E_floor_injected / E_safety like the multi-kernel path, 2026-09-23).
+  double hydro_floor = 0.0;
+  double conduction_floor = 0.0;
+  // Radiation energy change across the hydro half-steps (mesh motion and the
+  // radiation-pressure work update), the multi-kernel budget's
+  // E_rad_mesh_advection [erg].
+  double rad_mesh_advection = 0.0;
+  // Energy totals at the start and at the end of the step [erg], as the
+  // multi-kernel step budget measures them (compute_energy_totals_1d and
+  // compute_fld_rad_energy_total_device): sum rho e_e V, sum rho e_i V, the
+  // nodal kinetic energy sum 1/4 m (u_j^2 + u_j+1^2) and sum_g E_g V.
+  double E_int_e_before = 0.0;
+  double E_int_i_before = 0.0;
+  double E_kin_before = 0.0;
+  double E_rad_before = 0.0;
+  double E_int_e_after = 0.0;
+  double E_int_i_after = 0.0;
+  double E_kin_after = 0.0;
+  double E_rad_after = 0.0;
   int step = 0;
   int limiter = 0;
   int fld_outer_iterations = 0;
   int use_cooperative = 0;
   int cooperative_grid_blocks = 1;
-  int pad = 0;
+  // Floor clamps of the step (laser closure, hydro energy and density,
+  // conduction), the multi-kernel step_clamp_count.
+  int clamp_count = 0;
 };
 
-static constexpr int kPersistentDiagRecordVersion = 5;
+static constexpr int kPersistentDiagRecordVersion = 7;
 
 // PersistentChunkResult::error_code packs:
 // low 8 bits reason enum:
 // 1=laser mesh prep failed, 2=laser ray error flags,
-// 3=hydro non-positive volume, 4=FLD divergence, 5=conduction.
+// 3=hydro non-positive volume, 4=FLD divergence, 5=conduction,
+// 6=non-finite state field (Numerics.safety.nan_fatal).
 // For reason 2, bits 8..15 hold laser flag bits:
 // nan_particle/invalid_cell/invalid_boundary/pool_overflow/
 // opacity_out_of_range/infinite_loop/ddmc_sigma_tot_zero/roulette_kill.
@@ -377,6 +441,7 @@ enum PkErrorReason {
   kPkErrorHydroNonPositiveVolume = 3,
   kPkErrorFldDivergence = 4,
   kPkErrorConduction = 5,
+  kPkErrorNonFiniteState = 6,
 };
 
 enum PkLaserErrorFlagBits {
@@ -539,6 +604,62 @@ __device__ inline double pk_reduce_sum(const PersistentParams& p,
   return core::block_reduce_sum_fixed_order<kBlockSize>(v, smem);
 }
 
+constexpr int kPkReduceMultiMax = 6;
+
+// Sums of kN values in one pass: for each value the same fixed-order block
+// and grid trees as pk_reduce_sum (bit-identical results), with two grid
+// syncs in total instead of two per value.
+template <int kN>
+__device__ inline void pk_reduce_sum_multi(const PersistentParams& p,
+                                           const PersistentDeviceBuffers& b,
+                                           const double (&v)[kN],
+                                           double* smem,
+                                           double (&out)[kN]) {
+  static_assert(kN >= 1 && kN <= kPkReduceMultiMax,
+                "pk_reduce_sum_multi: value count out of range");
+  if (p.use_cooperative == 0) {
+    for (int k = 0; k < kN; ++k) {
+      out[k] = core::block_reduce_sum_fixed_order<kBlockSize>(v[k], smem);
+      __syncthreads();
+    }
+    return;
+  }
+  const int stride = b.grid_reduce_multi_stride;
+  for (int k = 0; k < kN; ++k) {
+    const double block_value =
+        core::block_reduce_sum_fixed_order<kBlockSize>(v[k], smem);
+    if (threadIdx.x == 0) {
+      b.grid_reduce_multi_partials[k * stride + blockIdx.x] = block_value;
+    }
+    __syncthreads();
+  }
+  cooperative_groups::this_grid().sync();
+  if (blockIdx.x == 0) {
+    const int grid_count = p.cooperative_grid_blocks;
+    const int n = core::detail::padded_power_of_two(grid_count);
+    for (int k = 0; k < kN; ++k) {
+      double* partials = b.grid_reduce_multi_partials + k * stride;
+      for (int i = grid_count + threadIdx.x; i < n; i += blockDim.x) {
+        partials[i] = 0.0;
+      }
+      __syncthreads();
+      for (int s = n / 2; s > 0; s >>= 1) {
+        for (int i = threadIdx.x; i < s; i += blockDim.x) {
+          partials[i] += partials[i + s];
+        }
+        __syncthreads();
+      }
+      if (threadIdx.x == 0) {
+        b.grid_reduce_multi_scalars[k] = partials[0];
+      }
+    }
+  }
+  cooperative_groups::this_grid().sync();
+  for (int k = 0; k < kN; ++k) {
+    out[k] = *(volatile const double*)&b.grid_reduce_multi_scalars[k];
+  }
+}
+
 __device__ inline double pk_reduce_max(const PersistentParams& p,
                                        const PersistentDeviceBuffers& b,
                                        double v,
@@ -586,6 +707,8 @@ const char* pk_error_reason_name(const int reason) {
       return "FLD divergence";
     case kPkErrorConduction:
       return "conduction";
+    case kPkErrorNonFiniteState:
+      return "non-finite state field (nan_fatal)";
     default:
       return "unknown";
   }
@@ -994,9 +1117,13 @@ __device__ void persistent_eval_constant_opacity_cell(
   const double sigma_max = rho_safe * fmax(p.fld_opacity_cap, 0.0);
   const double sigma =
       materials::apply_sigma_bounds(rho_safe * kappa, sigma_min, sigma_max);
+  // A void cell does not absorb or emit (the multi-kernel FLD's
+  // zero_void_radiation_exchange_kernel); its Rosseland opacity keeps the
+  // floor that regularises the diffusion coefficient.
+  const bool is_void = b.cell_is_void != nullptr && b.cell_is_void[c] != 0U;
   const int base = c * p.n_groups;
   for (int g = 0; g < p.n_groups; ++g) {
-    b.fld_sigma_a[base + g] = sigma;
+    b.fld_sigma_a[base + g] = is_void ? 0.0 : sigma;
     b.fld_sigma_R[base + g] = sigma;
   }
 }
@@ -1063,7 +1190,7 @@ __device__ void compute_sound_speed_into(const PersistentParams& p,
           c, out_cs, b.rho, b.ee, b.ei, b.Pe, b.Pi, b.Te, b.Ti, no_table,
           no_table, no_rho_e_table, no_spline, no_jet, no_mie_gruneisen,
           b.cv_i, b.cv_e, p.n_cells, false, false, false, false, false,
-          kExactOverrideNone, b.gamma_eff);
+          kExactOverrideNone, b.gamma_eff, p.energy_authoritative != 0);
     }
   } else {
     for (int c = pk_thread_id(p); c < p.n_cells; c += pk_thread_stride(p)) {
@@ -1121,14 +1248,63 @@ __device__ double ghost_pq_device(const PersistentParams& p,
   return b.Pe[last] + b.Pi[last] + b.Qvisc[last];
 }
 
+// I + K of the 1T renormalization (Hydro1D::lagrangian_step), K on the
+// nodes: sum 1/4 m (u_j^2 + u_j+1^2), the staggered scheme's kinetic energy.
 __device__ double block_total_energy_1d(const PersistentParams& p,
                                         const PersistentDeviceBuffers& b,
                                         double* smem) {
   double local = 0.0;
   for (int c = pk_thread_id(p); c < p.n_cells; c += pk_thread_stride(p)) {
-    const double u = 0.5 * (b.v_r[c] + b.v_r[c + 1]);
     local += b.rho[c] * (b.ee[c] + b.ei[c]) * b.vol[c] +
-             0.5 * b.mass[c] * u * u;
+             0.25 * b.mass[c] * (b.v_r[c] * b.v_r[c] + b.v_r[c + 1] * b.v_r[c + 1]);
+  }
+  return pk_reduce_sum(p, b, local, smem);
+}
+
+// Radiation energy of cell c, sum_g E_g V, as the audit
+// compute_fld_rad_energy_total_device counts it (an entry with a non-finite
+// E_g or V, or V <= 0, contributes zero).
+__device__ inline double pk_rad_energy_cell(const PersistentParams& p,
+                                            const PersistentDeviceBuffers& b,
+                                            const int c) {
+  if (p.radiation_enabled == 0 || b.rad_E == nullptr) {
+    return 0.0;
+  }
+  const double V = b.vol[c];
+  double sum = 0.0;
+  for (int g = 0; g < p.n_groups; ++g) {
+    const double E = b.rad_E[c * p.n_groups + g];
+    if (isfinite(V) && V > 0.0 && isfinite(E)) {
+      sum += E * V;
+    }
+  }
+  return sum;
+}
+
+// This thread's part of the step-budget energy totals, as
+// compute_energy_totals_1d (sum rho e_e V, sum rho e_i V, the nodal kinetic
+// energy) and the radiation energy audit (pk_rad_energy_cell).
+__device__ inline void pk_energy_totals_local(const PersistentParams& p,
+                                              const PersistentDeviceBuffers& b,
+                                              double (&local)[4]) {
+  local[0] = 0.0;
+  local[1] = 0.0;
+  local[2] = 0.0;
+  local[3] = 0.0;
+  for (int c = pk_thread_id(p); c < p.n_cells; c += pk_thread_stride(p)) {
+    local[0] += b.rho[c] * b.ee[c] * b.vol[c];
+    local[1] += b.rho[c] * b.ei[c] * b.vol[c];
+    local[2] += 0.25 * b.mass[c] * (b.v_r[c] * b.v_r[c] + b.v_r[c + 1] * b.v_r[c + 1]);
+    local[3] += pk_rad_energy_cell(p, b, c);
+  }
+}
+
+__device__ double pk_rad_energy_total(const PersistentParams& p,
+                                      const PersistentDeviceBuffers& b,
+                                      double* smem) {
+  double local = 0.0;
+  for (int c = pk_thread_id(p); c < p.n_cells; c += pk_thread_stride(p)) {
+    local += pk_rad_energy_cell(p, b, c);
   }
   return pk_reduce_sum(p, b, local, smem);
 }
@@ -1204,6 +1380,66 @@ __device__ double persistent_laser_cell_nhat_raw(
          (A * core::constants::proton_mass * p.laser_n_crit);
 }
 
+// Status of a cell for the radial absorption, in the order the power crosses
+// them (the checks of the former one-thread loop).
+constexpr int kPkRadialCellOk = 0;
+constexpr int kPkRadialCellBadGeometry = 1;  // non-finite faces or dr <= 0
+constexpr int kPkRadialCellBadState = 2;     // non-finite n_hat
+constexpr int kPkRadialCellBadKappa = 3;     // non-finite or negative kappa
+constexpr int kPkRadialCellBadTau = 4;       // non-finite or negative tau
+
+// Every thread: the cells' optical depth, n_hat_raw and status (the per-cell
+// part of the radial absorption, the same arithmetic as the leader used to
+// do in its loop).
+__device__ void persistent_laser_radial_absorption_cells(const PersistentParams& p,
+                                                         const PersistentDeviceBuffers& b) {
+  for (int c = pk_thread_id(p); c < p.n_cells; c += pk_thread_stride(p)) {
+    const double r0 = b.x_r[c];
+    const double r1 = b.x_r[c + 1];
+    const double dr = r1 - r0;
+    int status = kPkRadialCellOk;
+    double tau = 0.0;
+    double nh_raw = 0.0;
+    if (!isfinite(r0) || !isfinite(r1) || !(dr > 0.0)) {
+      status = kPkRadialCellBadGeometry;
+    } else {
+      nh_raw = persistent_laser_cell_nhat_raw(p, b, c);
+      const double nh = fmin(1.0, fmax(0.0, nh_raw));
+      if (!isfinite(nh) || !isfinite(nh_raw)) {
+        status = kPkRadialCellBadState;
+      } else {
+        double kappa = 0.0;
+        if (p.laser_test_kappa > 0.0) {
+          kappa = p.laser_test_kappa;
+        } else {
+          const double Te = (b.Te != nullptr) ? b.Te[c] : p.Te_floor;
+          const double z = (b.zbar != nullptr) ? fmax(b.zbar[c], 0.0)
+                                               : fmax(p.fallback_z, 0.0);
+          const double smooth_factor = laser::compute_kappa_smooth_factor(
+              nh, Te, z, p.laser_lambda_cm, p.laser_eps_n,
+              p.laser_coulomb_log_floor);
+          kappa = laser::compute_kappa_from_smooth(smooth_factor, nh,
+                                                   p.laser_eps_n);
+        }
+        if (!isfinite(kappa) || kappa < 0.0) {
+          status = kPkRadialCellBadKappa;
+        } else {
+          tau = laser::compute_optical_depth(kappa, kappa, dr);
+          if (!isfinite(tau) || tau < 0.0) {
+            status = kPkRadialCellBadTau;
+          }
+        }
+      }
+    }
+    b.laser_radial_cell_tau[c] = tau;
+    b.laser_radial_cell_nh_raw[c] = nh_raw;
+    b.laser_radial_cell_status[c] = status;
+  }
+}
+
+// The leader carries the beam's power inward across the cells prepared by
+// persistent_laser_radial_absorption_cells (called by every thread, then a
+// grid sync, before this).
 __device__ void persistent_laser_radial_absorption_single_trace(
     const PersistentParams& p,
     const PersistentDeviceBuffers& b,
@@ -1243,54 +1479,23 @@ __device__ void persistent_laser_radial_absorption_single_trace(
       *single_unabsorbed += P;
       return;
     }
-
-    const double r0 = b.x_r[c];
-    const double r1 = b.x_r[c + 1];
-    const double dr = r1 - r0;
-    if (!isfinite(r0) || !isfinite(r1) || !(dr > 0.0)) {
+    const int status = b.laser_radial_cell_status[c];
+    if (status == kPkRadialCellBadGeometry || status == kPkRadialCellBadState) {
       *single_unabsorbed += P;
       return;
     }
-
-    const double nh_raw = persistent_laser_cell_nhat_raw(p, b, c);
-    const double nh = fmin(1.0, fmax(0.0, nh_raw));
-    if (!isfinite(nh) || !isfinite(nh_raw)) {
-      *single_unabsorbed += P;
-      return;
-    }
-
-    if (nh_raw >= nh_crit) {
+    if (b.laser_radial_cell_nh_raw[c] >= nh_crit) {
       ++(*critical_hits);
       *single_unabsorbed += P;
       return;
     }
-
-    double kappa = 0.0;
-    if (p.laser_test_kappa > 0.0) {
-      kappa = p.laser_test_kappa;
-    } else {
-      const double Te = (b.Te != nullptr) ? b.Te[c] : p.Te_floor;
-      const double z = (b.zbar != nullptr) ? fmax(b.zbar[c], 0.0)
-                                           : fmax(p.fallback_z, 0.0);
-      const double smooth_factor = laser::compute_kappa_smooth_factor(
-          nh, Te, z, p.laser_lambda_cm, p.laser_eps_n,
-          p.laser_coulomb_log_floor);
-      kappa = laser::compute_kappa_from_smooth(smooth_factor, nh,
-                                               p.laser_eps_n);
-    }
-    if (!isfinite(kappa) || kappa < 0.0) {
-      *single_unabsorbed += P;
-      return;
-    }
-
-    const double tau = laser::compute_optical_depth(kappa, kappa, dr);
-    if (!isfinite(tau) || tau < 0.0) {
+    if (status != kPkRadialCellOk) {
       *single_unabsorbed += P;
       return;
     }
 
     double P_next = P;
-    const double dP = laser::absorbed_power_expm1(P, tau, P_next);
+    const double dP = laser::absorbed_power_expm1(P, b.laser_radial_cell_tau[c], P_next);
     if (!isfinite(dP) || !isfinite(P_next) || dP < 0.0 || P_next < 0.0) {
       *single_unabsorbed += P;
       pk_raise_error(
@@ -1415,13 +1620,18 @@ __device__ void persistent_laser_initialize_rays_1d(
         fabs(Z_init - p.laser_beam_focus_lab_z) /
         (2.0 * fmax(p.laser_beam_f_number, 1.0e-12));
     const double dR = R_beam / static_cast<double>(n_rays);
+    // As initialize_rays_1d (2026-09-23; this was an older layout): rays at
+    // the ring centres (k + 1/2) dR with the exact annulus areas, and the
+    // profile evaluated on the plane through the target centre,
+    // R_ref = R_k |z_f| / |Z_init - z_f|.
+    const double launch_to_focus = fabs(Z_init - p.laser_beam_focus_lab_z);
+    const double reference_scale =
+        (launch_to_focus > 0.0) ? fabs(p.laser_beam_focus_lab_z) / launch_to_focus : 1.0;
     for (int k = pk_thread_id(p); k < n_rays; k += pk_thread_stride(p)) {
-      const double Rk = dR * static_cast<double>(k);
-      const double dRk = (k == 0) ? (0.5 * dR) : dR;
-      const double area =
-          (k == 0) ? (kPi * 0.25 * dR * dR) : (2.0 * kPi * Rk * dRk);
+      const double Rk = dR * (static_cast<double>(k) + 0.5);
+      const double area = kPi * (2.0 * static_cast<double>(k) + 1.0) * dR * dR;
       b.laser_ray_weights[k] =
-          persistent_laser_profile_value(p, Rk) * fmax(area, 0.0);
+          persistent_laser_profile_value(p, Rk * reference_scale) * fmax(area, 0.0);
     }
   }
   __threadfence();
@@ -1466,11 +1676,12 @@ __device__ void persistent_laser_initialize_rays_1d(
       (2.0 * fmax(p.laser_beam_f_number, 1.0e-12));
   const double dR = R_beam / static_cast<double>(n_rays);
   for (int k = pk_thread_id(p); k < n_rays; k += pk_thread_stride(p)) {
-    const double Rk = dR * static_cast<double>(k);
+    const double Rk = dR * (static_cast<double>(k) + 0.5);
     const double dz = Z_init - p.laser_beam_focus_lab_z;
     const double L = sqrt(Rk * Rk + dz * dz);
-    const double vR = (L > 0.0) ? (-Rk / L) : 0.0;
-    const double sgn = (dz >= 0.0) ? -1.0 : 1.0;
+    // Toward -Z along the line through the focus (initialize_rays_1d).
+    const double vR = (L > 0.0) ? ((dz >= 0.0) ? (-Rk / L) : (Rk / L)) : 0.0;
+    const double sgn = -1.0;
     const double vR2 = vR * vR;
     const double I = beam_power * (b.laser_ray_weights[k] / sum_w);
     b.laser_ray_R0[k] = Rk;
@@ -1728,9 +1939,6 @@ __device__ bool persistent_laser_prepare_mesh_1d(
     int* fcrit_cell_out,
     int* outer_surface_cell_out,
     int* use_ghost_corona_out,
-    double* r_crit_interp_out,
-    double* ne_fcrit_center_out,
-    double* r_fcrit_center_out,
     double* r_surface_outer_out,
     double* ghost_ne_inner_out,
     double* ghost_scale_length_out,
@@ -1782,8 +1990,10 @@ __device__ bool persistent_laser_prepare_mesh_1d(
   double R_max = (outermost_threshold >= 0)
                      ? p.laser_lmesh_r_max_factor * b.x_r[outermost_threshold + 1]
                      : fallback_r_max;
+  // Same log-interpolated crossing as the host layout
+  // (compute_dynamic_mesh_params_1d, 2026-09-23).
   const double R_crit_raw =
-      (fcrit >= 0 && fcrit <= p.n_cells) ? b.x_r[fcrit] : (0.5 * R_max);
+      (fcrit >= 0 && fcrit <= p.n_cells) ? crit_est.r_interp : (0.5 * R_max);
   double min_dr_crit = CUDART_INF;
   double min_dr_global = CUDART_INF;
   const double r_window = 0.05 * fmax(R_crit_raw, 1.0e-12);
@@ -1824,11 +2034,41 @@ __device__ bool persistent_laser_prepare_mesh_1d(
     return false;
   }
   constexpr int kGhostAnchorSpan = 3;
+  // Ghost corona: same rules as map_from_hydro_1d (NUMERICS §5.7.5.2) —
+  // never denser than the outermost real cell, fades with the resolved
+  // corona, width max(n_out fine cells, c_s * t) times the fade.
+  const bool ghost_configured =
+      p.laser_lmesh_ghost_corona_enabled != 0 && outer_surface_cell >= 0 &&
+      p.laser_lmesh_ghost_n_out > 0;
+  const double ghost_ne_min = fmax(p.laser_lmesh_ghost_ne_min_frac, 1.0e-12);
+  const double ghost_ne_max =
+      fmax(p.laser_lmesh_ghost_ne_max_frac, ghost_ne_min * 1.0001);
+  const double outer_n_hat =
+      (outer_surface_cell >= 0) ? b.laser_cell_n_hat[outer_surface_cell] : 0.0;
+  const double ghost_ne_inner =
+      (outer_n_hat < 1.0) ? fmin(outer_n_hat, ghost_ne_max) : ghost_ne_max;
+  double ghost_fade = 0.0;
+  if (ghost_configured) {
+    int resolved_cells = 0;
+    for (int c = outer_surface_cell; c >= 0; --c) {
+      if (b.laser_cell_is_void != nullptr && b.laser_cell_is_void[c] != 0U) {
+        continue;
+      }
+      if (b.laser_cell_n_hat[c] < p.laser_lmesh_ghost_transition_resolved_nhat) {
+        ++resolved_cells;
+      } else {
+        break;
+      }
+    }
+    const double required_cells = static_cast<double>(
+        p.laser_lmesh_ghost_transition_resolved_cells > 1
+            ? p.laser_lmesh_ghost_transition_resolved_cells
+            : 1);
+    ghost_fade = fmin(
+        1.0, fmax(0.0, 1.0 - static_cast<double>(resolved_cells) / required_cells));
+  }
   const int use_ghost_corona =
-      (p.laser_lmesh_ghost_corona_enabled != 0 && outer_surface_cell >= 0 &&
-       p.laser_lmesh_ghost_n_out > 0)
-          ? 1
-          : 0;
+      (ghost_configured && ghost_fade > 0.0 && ghost_ne_inner > ghost_ne_min) ? 1 : 0;
   const double r_surface_outer =
       (outer_surface_cell >= 0) ? b.x_r[outer_surface_cell + 1] : 0.0;
   const double Te_anchor_raw =
@@ -1852,31 +2092,18 @@ __device__ bool persistent_laser_prepare_mesh_1d(
                b.A_eff, b.laser_cell_is_void, outer_surface_cell,
                kGhostAnchorSpan, p.n_cells, p.material_A),
            1.0e-30);
-  const double base_ghost_width =
-      (use_ghost_corona != 0)
-          ? fmax(static_cast<double>(p.laser_lmesh_ghost_n_out) * dR_fine,
-                 1.0e-30)
-          : 0.0;
   const double ghost_cs =
       persistent_laser_ghost_sound_speed_cm_s(Te_anchor, zbar_anchor, A_anchor);
   const double ghost_width =
       (use_ghost_corona != 0)
-          ? fmax(base_ghost_width, ghost_cs * fmax(t_op, 0.0))
+          ? fmax(ghost_fade *
+                     fmax(static_cast<double>(p.laser_lmesh_ghost_n_out) * dR_fine,
+                          ghost_cs * fmax(t_op - p.laser_turn_on_s, 0.0)),
+                 1.0e-30)
           : 0.0;
   const double r_ghost_outer = r_surface_outer + ghost_width;
-  const double ghost_ne_min = fmax(p.laser_lmesh_ghost_ne_min_frac, 1.0e-12);
-  const double ghost_ne_max =
-      fmax(p.laser_lmesh_ghost_ne_max_frac, ghost_ne_min * 1.0001);
-  const double outer_n_hat =
-      (outer_surface_cell >= 0) ? b.laser_cell_n_hat[outer_surface_cell] : 0.0;
-  const double ghost_ne_inner =
-      (outer_surface_cell >= 0 && outer_n_hat < 1.0)
-          ? fmin(ghost_ne_max,
-                 fmax(fmax(outer_n_hat, ghost_ne_min * 1.0001),
-                      ghost_ne_min * 1.0001))
-          : ghost_ne_max;
   const double ghost_log_span =
-      log(fmax(ghost_ne_inner, ghost_ne_min * 1.0001) / ghost_ne_min);
+      (use_ghost_corona != 0) ? log(ghost_ne_inner / ghost_ne_min) : 0.0;
   const double ghost_scale_length =
       (ghost_log_span > 0.0) ? fmax(ghost_width / ghost_log_span, 1.0e-30)
                              : ghost_width;
@@ -1887,13 +2114,6 @@ __device__ bool persistent_laser_prepare_mesh_1d(
   *fcrit_cell_out = fcrit;
   *outer_surface_cell_out = outer_surface_cell;
   *use_ghost_corona_out = use_ghost_corona;
-  *r_crit_interp_out = crit_est.r_interp;
-  *ne_fcrit_center_out =
-      (fcrit >= 0 && fcrit < p.n_cells) ? b.laser_cell_n_hat[fcrit] : 0.0;
-  *r_fcrit_center_out =
-      (fcrit >= 0 && fcrit < p.n_cells)
-          ? 0.5 * (b.x_r[fcrit] + b.x_r[fcrit + 1])
-          : 0.0;
   *r_surface_outer_out = r_surface_outer;
   *ghost_ne_inner_out = ghost_ne_inner;
   *ghost_scale_length_out = ghost_scale_length;
@@ -2183,14 +2403,12 @@ __device__ void persistent_laser_raytrace_1d_folded(
     double* out_escaped) {
   __shared__ int sh_nr;
   __shared__ int sh_n_nodes_r;
+  __shared__ int sh_n_profile;
   __shared__ int sh_n_nodes_z;
   __shared__ int sh_n_nodes_total;
   __shared__ int sh_fcrit_cell;
   __shared__ int sh_outer_surface_cell;
   __shared__ int sh_use_ghost_corona;
-  __shared__ double sh_r_crit_interp;
-  __shared__ double sh_ne_fcrit_center;
-  __shared__ double sh_r_fcrit_center;
   __shared__ double sh_r_surface_outer;
   __shared__ double sh_ghost_ne_inner;
   __shared__ double sh_ghost_scale_length;
@@ -2216,6 +2434,7 @@ __device__ void persistent_laser_raytrace_1d_folded(
       b.laser_error_flags->infinite_loop = 0;
       b.laser_error_flags->ddmc_sigma_tot_zero = 0;
       b.laser_error_flags->roulette_kill = 0;
+      b.laser_error_flags->unresolved_quadrature = 0;
     }
     if (b.laser_unabsorbed != nullptr) {
       *b.laser_unabsorbed = 0.0;
@@ -2260,8 +2479,7 @@ __device__ void persistent_laser_raytrace_1d_folded(
         p, b, b.grid_broadcast_ints + 0, b.grid_broadcast_ints + 1,
         b.grid_broadcast_ints + 2, b.grid_broadcast_ints + 3,
         b.grid_broadcast_ints + 4, b.grid_broadcast_ints + 6,
-        b.grid_broadcast_ints + 7, b.grid_broadcast_doubles + 0,
-        b.grid_broadcast_doubles + 1, b.grid_broadcast_doubles + 2,
+        b.grid_broadcast_ints + 7,
         b.grid_broadcast_doubles + 3, b.grid_broadcast_doubles + 4,
         b.grid_broadcast_doubles + 5, b.grid_broadcast_doubles + 6,
         b.grid_broadcast_doubles + 7, b.grid_broadcast_doubles + 8,
@@ -2278,12 +2496,6 @@ __device__ void persistent_laser_raytrace_1d_folded(
     sh_fcrit_cell = *(volatile const int*)(b.grid_broadcast_ints + 4);
     sh_outer_surface_cell = *(volatile const int*)(b.grid_broadcast_ints + 6);
     sh_use_ghost_corona = *(volatile const int*)(b.grid_broadcast_ints + 7);
-    sh_r_crit_interp =
-        *(volatile const double*)(b.grid_broadcast_doubles + 0);
-    sh_ne_fcrit_center =
-        *(volatile const double*)(b.grid_broadcast_doubles + 1);
-    sh_r_fcrit_center =
-        *(volatile const double*)(b.grid_broadcast_doubles + 2);
     sh_r_surface_outer =
         *(volatile const double*)(b.grid_broadcast_doubles + 3);
     sh_ghost_ne_inner =
@@ -2321,45 +2533,52 @@ __device__ void persistent_laser_raytrace_1d_folded(
         sh_zbar_anchor, p.laser_lmesh_ghost_zbar_min,
         p.laser_lmesh_ghost_zbar_max,
         p.laser_lmesh_ghost_Te_min_eV, p.laser_lmesh_critical_clip,
-        p.laser_lmesh_n_hat_margin, sh_fcrit_cell, sh_r_crit_interp,
-        sh_ne_fcrit_center, sh_r_fcrit_center);
+        p.laser_lmesh_n_hat_margin, sh_fcrit_cell);
   }
   pk_sync(p);
   persistent_laser_trace_substage(p, local_step, beam_power, "prep_map");
 
-  if (b.laser_ema_valid != nullptr && b.laser_ema_state != nullptr) {
-    if (*(volatile const int*)b.laser_ema_valid == sh_n_nodes_total) {
-      for (int idx = pk_thread_id(p); idx < sh_n_nodes_total; idx += pk_thread_stride(p)) {
-        laser::laser_mesh_bodies::ema_smooth_n_hat_kernel_body(
-            idx, b.laser_n_e_hat, b.laser_ema_state, sh_n_nodes_total);
-      }
-      pk_sync(p);
-    }
-    for (int idx = pk_thread_id(p); idx < sh_n_nodes_total; idx += pk_thread_stride(p)) {
-      b.laser_ema_state[idx] = b.laser_n_e_hat[idx];
-    }
-    pk_sync(p);
-    if (pk_global_leader(p)) {
-      *b.laser_ema_valid = sh_n_nodes_total;
-    }
-    __threadfence();
-    pk_sync(p);
+  // Radial profile of the trace on the hydro-anchored nodes, as the
+  // multi-kernel map_from_hydro_1d (laser_mesh_bodies::
+  // build_trace_profile_nodes_1d, 2026-09-24; the axis column of the 2D
+  // laser mesh before).
+  if (pk_global_leader(p)) {
+    b.grid_broadcast_ints[8] = laser::laser_mesh_bodies::build_trace_profile_nodes_1d(
+        b.x_r, b.laser_cell_is_void, p.n_cells, sh_outer_surface_cell, sh_fcrit_cell, b.rho,
+        b.zbar, b.A_eff, fmax(p.laser_n_crit, 1.0e-30), p.laser_lmesh_critical_clip,
+        p.laser_lmesh_n_hat_margin, b.laser_node_R, sh_n_nodes_r, b.laser_radial_node_r,
+        b.laser_radial_capacity);
   }
-  persistent_laser_trace_substage(p, local_step, beam_power, "prep_ema");
-
-  const int j_center = sh_n_nodes_z / 2;
-  for (int i = pk_thread_id(p); i < sh_n_nodes_r; i += pk_thread_stride(p)) {
-    laser::laser_mesh_bodies::extract_radial_profile_kernel_body(
-        i, b.laser_radial_node_r, b.laser_radial_n_hat,
-        b.laser_radial_n_hat_raw, b.laser_radial_smooth_kappa,
-        b.laser_node_R, b.laser_n_e_hat, b.laser_n_e_hat_raw, nullptr,
-        sh_n_nodes_r, sh_n_nodes_z, j_center, 0);
+  __threadfence();
+  pk_sync(p);
+  if (threadIdx.x == 0) {
+    sh_n_profile = *(volatile const int*)(b.grid_broadcast_ints + 8);
+    if (sh_n_profile < 2) {
+      pk_raise_error(error_flag, pk_encode_error_code(kPkErrorLaserMeshPrep));
+    }
   }
   pk_sync(p);
-  for (int i = pk_thread_id(p); i < sh_n_nodes_r; i += pk_thread_stride(p)) {
+  if (*(volatile const int*)error_flag != 0) {
+    return;
+  }
+  for (int idx = pk_thread_id(p); idx < sh_n_profile; idx += pk_thread_stride(p)) {
+    laser::laser_mesh_bodies::map_hydro_to_laser_1d_kernel_body(
+        idx, b.laser_radial_node_r, b.laser_radial_zero, b.rho, b.Te, b.zbar, b.A_eff,
+        b.laser_cell_is_void, b.x_r, b.laser_radial_n_hat, b.laser_radial_n_hat_raw,
+        b.laser_radial_T_e, b.laser_radial_Zbar, sh_n_profile, 1, p.n_cells,
+        fmax(p.laser_n_crit, 1.0e-30), sh_use_ghost_corona,
+        sh_outer_surface_cell, sh_ghost_ne_inner, sh_ghost_scale_length,
+        sh_ghost_ne_min, sh_r_surface_outer, sh_r_ghost_outer, sh_Te_anchor,
+        sh_zbar_anchor, p.laser_lmesh_ghost_zbar_min,
+        p.laser_lmesh_ghost_zbar_max,
+        p.laser_lmesh_ghost_Te_min_eV, p.laser_lmesh_critical_clip,
+        p.laser_lmesh_n_hat_margin, sh_fcrit_cell);
+  }
+  pk_sync(p);
+  for (int i = pk_thread_id(p); i < sh_n_profile; i += pk_thread_stride(p)) {
     laser::laser_mesh_bodies::compute_radial_gradient_kernel_body(
         i, b.laser_radial_dn_dr, b.laser_radial_node_r,
-        b.laser_radial_n_hat, sh_n_nodes_r);
+        b.laser_radial_n_hat, sh_n_profile);
   }
   for (int idx = pk_thread_id(p); idx < sh_n_nodes_total; idx += pk_thread_stride(p)) {
     laser::laser_mesh_bodies::compute_gradient_kernel_body(
@@ -2373,23 +2592,15 @@ __device__ void persistent_laser_raytrace_1d_folded(
         b.laser_Zbar, p.laser_lambda_cm, p.laser_eps_n,
         p.laser_coulomb_log_floor, sh_n_nodes_total);
   }
+  for (int i = pk_thread_id(p); i < sh_n_profile; i += pk_thread_stride(p)) {
+    laser::laser_mesh_bodies::compute_smooth_kappa_kernel_body(
+        i, b.laser_radial_smooth_kappa, b.laser_radial_n_hat, b.laser_radial_T_e,
+        b.laser_radial_Zbar, p.laser_lambda_cm, p.laser_eps_n,
+        p.laser_coulomb_log_floor, sh_n_profile);
+  }
   pk_sync(p);
   persistent_laser_trace_substage(p, local_step, beam_power, "prep_kappa");
-  for (int i = pk_thread_id(p); i < sh_n_nodes_r; i += pk_thread_stride(p)) {
-    laser::laser_mesh_bodies::extract_radial_profile_kernel_body(
-        i, b.laser_radial_node_r, b.laser_radial_n_hat,
-        b.laser_radial_n_hat_raw, b.laser_radial_smooth_kappa,
-        b.laser_node_R, b.laser_n_e_hat, b.laser_n_e_hat_raw,
-        b.laser_smooth_kappa_factor, sh_n_nodes_r, sh_n_nodes_z, j_center, 1);
-  }
-  pk_sync(p);
   persistent_laser_trace_substage(p, local_step, beam_power, "prep_profile");
-  for (int i = pk_thread_id(p); i < sh_n_nodes_r; i += pk_thread_stride(p)) {
-    laser::laser_mesh_bodies::compute_radial_gradient_kernel_body(
-        i, b.laser_radial_dn_dr, b.laser_radial_node_r,
-        b.laser_radial_n_hat, sh_n_nodes_r);
-  }
-  pk_sync(p);
   persistent_laser_trace_substage(p, local_step, beam_power, "prep_gradients");
 
   const PersistentAllowedSupercriticalCell1D allowed =
@@ -2403,7 +2614,58 @@ __device__ void persistent_laser_raytrace_1d_folded(
 
   pk_phase_prof_mark(p, kPkWatchPhaseLaserTraceMarch, phase_prof_last_phase,
                      phase_prof_last_clock);
-  for (int ray = pk_thread_id(p); ray < n_rays; ray += pk_thread_stride(p)) {
+  laser::ray_trace_bodies::CharacteristicPieces pieces{};
+  if (p.laser_raytrace_characteristic != 0) {
+    // Piece table of this trace (breakpoints, then interval and cell).
+    int* piece_interval = b.laser_piece_ints;
+    int* piece_cell = b.laser_piece_ints + b.laser_piece_capacity;
+    int* piece_count = b.laser_piece_ints + 2 * b.laser_piece_capacity;
+    const int n_items = sh_n_profile + p.n_cells + 2;
+    for (int t = pk_thread_id(p); t < n_items; t += pk_thread_stride(p)) {
+      laser::ray_trace_bodies::characteristic_breakpoint_body(
+          t, b.laser_radial_node_r, sh_n_profile, b.x_r, p.n_cells, allowed.r_crit,
+          b.laser_piece_r, piece_count);
+    }
+    pk_sync(p);
+    const int capacity =
+        laser::ray_trace_bodies::characteristic_piece_capacity(sh_n_profile, p.n_cells);
+    for (int k = pk_thread_id(p); k < capacity; k += pk_thread_stride(p)) {
+      laser::ray_trace_bodies::characteristic_piece_info_body(
+          k, b.laser_piece_r, piece_count, b.laser_radial_node_r, sh_n_profile, b.x_r,
+          p.n_cells, allowed.allowed_cell, allowed.critical_adjacent_subcritical_cell,
+          allowed.r_crit, piece_interval, piece_cell);
+    }
+    pk_sync(p);
+    pieces = laser::ray_trace_bodies::CharacteristicPieces{b.laser_piece_r, piece_interval,
+                                                           piece_cell, piece_count};
+  }
+  if (p.laser_raytrace_characteristic != 0) {
+    // One warp per ray, as in the multi-kernel trace (the same arithmetic in
+    // the same order: bit-identical results).
+    const int n_warps = pk_thread_stride(p) / 32;
+    for (int ray = pk_thread_id(p) / 32; ray < n_rays; ray += n_warps) {
+      laser::ray_trace_bodies::ray_trace_1d_characteristic_body<32, false, false, false>(
+          ray, pieces, b.laser_dep, b.laser_per_ray_deposit,
+          b.laser_per_ray_unabsorbed, b.laser_per_ray_tail_power,
+          b.laser_radial_node_r, b.laser_radial_n_hat,
+          b.laser_radial_n_hat_raw, b.laser_radial_smooth_kappa,
+          b.laser_radial_dn_dr, b.x_r, allowed.allowed_cell,
+          allowed.critical_adjacent_subcritical_cell, allowed.r_crit,
+          b.laser_ray_R0, b.laser_ray_Z0, b.laser_ray_vR0, b.laser_ray_vZ0,
+          b.laser_ray_power, b.laser_ray_power0, p.laser_eps_n,
+          p.laser_eps_crit, p.laser_lambda_cm, p.laser_test_kappa,
+          p.laser_intensity_cutoff, p.laser_raytrace_max_steps, sh_n_profile,
+          p.n_cells, n_rays, nullptr, nullptr, nullptr, nullptr, 0, 1, 0,
+          nullptr, nullptr, nullptr, b.laser_unabsorbed,
+          b.laser_tail_closure_count, b.laser_tail_closure_absorbed_power,
+          b.laser_critical_surface_hit_count, b.laser_error_flags,
+          laser::CbetRecordDeviceArgs{}, laser::HotECaptureParams{}, nullptr,
+          laser::LaserPhysExtOptions{}, nullptr, nullptr, nullptr, 0,
+          p.laser_reflect_at_critical);
+    }
+  }
+  for (int ray = pk_thread_id(p);
+       p.laser_raytrace_characteristic == 0 && ray < n_rays; ray += pk_thread_stride(p)) {
     laser::ray_trace_bodies::ray_trace_1d_sph_body<false, false, false>(
         ray, b.laser_dep, b.laser_per_ray_deposit,
         b.laser_per_ray_unabsorbed, b.laser_per_ray_tail_power,
@@ -2419,7 +2681,7 @@ __device__ void persistent_laser_raytrace_1d_folded(
         p.laser_raytrace_ds_adapt_max_factor, p.laser_eps_n,
         p.laser_eps_crit, p.laser_lambda_cm, p.laser_coulomb_log_floor,
         p.laser_test_kappa, p.laser_intensity_cutoff,
-        p.laser_raytrace_max_steps, sh_n_nodes_r, p.n_cells, n_rays, nullptr,
+        p.laser_raytrace_max_steps, sh_n_profile, p.n_cells, n_rays, nullptr,
         nullptr, nullptr, nullptr, 0, 1, 0, nullptr, nullptr, nullptr,
         b.laser_unabsorbed, b.laser_tail_closure_count,
         b.laser_tail_closure_absorbed_power,
@@ -2549,10 +2811,15 @@ __device__ double persistent_laser_close_electron(
     const double z = (b.zbar != nullptr) ? fmax(b.zbar[c], 0.0)
                                          : fmax(p.fallback_z, 0.0);
     double cv_mass_e = 0.0;
+    bool cv_mass_e_is_total = false;
     if (p.cv_e_override > 0.0) {
       cv_mass_e = p.cv_e_override / rho_safe;
     } else if (b.cv_e != nullptr && b.cv_e[c] > 0.0) {
       cv_mass_e = b.cv_e[c];
+      // In 1T the closure stores the total heat capacity there; the ion part
+      // used to be added a second time (as in the multi-kernel injection,
+      // 2026-09-23).
+      cv_mass_e_is_total = (p.two_temperature == 0);
     } else {
       cv_mass_e = z * core::constants::eV_to_erg /
                   (A_c * core::constants::proton_mass * gm1_c);
@@ -2561,7 +2828,7 @@ __device__ double persistent_laser_close_electron(
     const double cv_mass_total =
         (p.two_temperature != 0)
             ? cv_mass_e
-            : ((p.cv_e_override > 0.0)
+            : ((p.cv_e_override > 0.0 || cv_mass_e_is_total)
                    ? cv_mass_e
                    : fmax(cv_mass_e + cv_mass_i, 1.0e-30));
     Te_raw = b.ee[c] / cv_mass_total;
@@ -2721,6 +2988,9 @@ __device__ void persistent_laser_step(const PersistentParams& p,
         out_escaped);
     pk_sync(p);
   } else {
+    persistent_laser_radial_absorption_cells(p, b);
+    __threadfence();
+    pk_sync(p);
     persistent_laser_radial_absorption_single_trace(
         p, b, sh_beam_power, &sh_single_unabsorbed, &sh_critical_hits,
         error_flag);
@@ -3034,7 +3304,8 @@ __device__ double persistent_fld_dt_rad(const PersistentParams& /*p*/,
 template <int GEOM>
 __device__ void persistent_fld_assemble_geom(const PersistentParams& p,
                                              const PersistentDeviceBuffers& b,
-                                             const double dt) {
+                                             const double dt,
+                                             const double* rad_E_limiter) {
   using namespace tenryu::radiation::fld_1d_bodies;
   const int total = p.n_cells * p.n_groups;
   for (int idx = pk_thread_id(p); idx < total; idx += pk_thread_stride(p)) {
@@ -3042,7 +3313,7 @@ __device__ void persistent_fld_assemble_geom(const PersistentParams& p,
         idx, b.x_r, b.vol, b.fld_sigma_a,
         (p.fld_use_fleck_blend != 0) ? b.fld_sigma_a : nullptr,
         (p.fld_use_fleck_blend != 0) ? b.fld_fleck : nullptr, b.fld_eta,
-        b.rad_E_old, b.rad_E, b.fld_sigma_R, b.fld_lower, b.fld_diag,
+        b.rad_E_old, rad_E_limiter, b.fld_sigma_R, b.fld_lower, b.fld_diag,
         b.fld_upper, b.fld_rhs, p.n_cells, p.n_groups, dt, p.fld_outer_bc,
         b.fld_marshak_finc, p.fld_volume_source_rate,
         p.fld_volume_source_r_max, p.fld_opacity_floor, p.fld_flux_limiter);
@@ -3050,18 +3321,21 @@ __device__ void persistent_fld_assemble_geom(const PersistentParams& p,
   pk_sync(p);
 }
 
+// rad_E_limiter: the field the flux limiter is evaluated from (the current
+// field, or the first outer iterate under limiter_evaluation "predictor").
 __device__ void persistent_fld_assemble(const PersistentParams& p,
                                         const PersistentDeviceBuffers& b,
-                                        const double dt) {
+                                        const double dt,
+                                        const double* rad_E_limiter) {
   switch (p.geom_code) {
     case 1:
-      persistent_fld_assemble_geom<1>(p, b, dt);
+      persistent_fld_assemble_geom<1>(p, b, dt, rad_E_limiter);
       break;
     case 2:
-      persistent_fld_assemble_geom<2>(p, b, dt);
+      persistent_fld_assemble_geom<2>(p, b, dt, rad_E_limiter);
       break;
     default:
-      persistent_fld_assemble_geom<0>(p, b, dt);
+      persistent_fld_assemble_geom<0>(p, b, dt, rad_E_limiter);
       break;
   }
 }
@@ -3144,9 +3418,59 @@ __device__ void persistent_fld_step(const PersistentParams& p,
 
   const int max_iter =
       (p.fld_max_outer_iterations > 1) ? p.fld_max_outer_iterations : 1;
+  // Grey acceleration (fld_1d_grey_accel.cuh), as in the multi-kernel loop:
+  // the correction from iteration k at the start of iteration k+1, the
+  // spectrum and grey matrix after each assembly.
+  double* const grey_D = b.fld_grey_cells;
+  double* const grey_sum_w = b.fld_grey_cells + 1 * p.n_cells;
+  double* const grey_lower = b.fld_grey_cells + 2 * p.n_cells;
+  double* const grey_diag = b.fld_grey_cells + 3 * p.n_cells;
+  double* const grey_upper = b.fld_grey_cells + 4 * p.n_cells;
+  double* const grey_rhs = b.fld_grey_cells + 5 * p.n_cells;
+  double* const grey_T_lin = b.fld_grey_cells + 7 * p.n_cells;
+  double* const grey_P = b.fld_grey_cells + 8 * p.n_cells;
+  double* const grey_pcr_dl = b.fld_grey_cells + 9 * p.n_cells;
+  double* const grey_pcr_d = b.fld_grey_cells + 10 * p.n_cells;
+  double* const grey_pcr_du = b.fld_grey_cells + 11 * p.n_cells;
+  double* const grey_pcr_rhs = b.fld_grey_cells + 12 * p.n_cells;
+  const double* const grey_sigma_pe = (p.fld_use_fleck != 0) ? b.fld_sigma_pe : nullptr;
+  const double* const grey_fleck = (p.fld_use_fleck_blend != 0) ? b.fld_fleck : nullptr;
   for (int iter = 0; iter < max_iter; ++iter) {
     if (sh_converged != 0) {
       break;
+    }
+    if (p.fld_grey_accel != 0) {
+      if (iter > 0) {
+        for (int c = pk_thread_id(p); c < p.n_cells; c += pk_thread_stride(p)) {
+          radiation::fld_1d_grey_accel::rhs_body(c, grey_D, grey_sum_w, grey_P, grey_T_lin, b.Te,
+                                                 b.vol, dt, grey_rhs);
+        }
+        __threadfence();
+        pk_sync(p);
+        // The multi-kernel loop's reduction (fld_grey_solve_pcr_kernel): the
+        // same operations per row, so the two loops agree to rounding (the
+        // compiler may contract a multiply-add differently in the two
+        // kernels). The grey matrix is rebuilt after the next assembly, so it
+        // serves as the reduction's round buffer here.
+        core::pcr_solve_strided<kGrid>(grey_lower, grey_diag, grey_upper, grey_rhs, grey_pcr_dl,
+                                       grey_pcr_d, grey_pcr_du, grey_pcr_rhs, p.n_cells,
+                                       p.n_cells, 1, pk_thread_id(p), pk_thread_stride(p));
+        __threadfence();
+        pk_sync(p);
+        for (int c = pk_thread_id(p); c < p.n_cells; c += pk_thread_stride(p)) {
+          radiation::fld_1d_grey_accel::apply_body<false>(
+              c, grey_D, grey_P, grey_T_lin, grey_rhs, b.rho, b.zbar, (p.fld_has_cv_e != 0) ? b.cv_e : nullptr,
+              p.fld_has_cv_e, p.cv_e_override, b.A_eff, b.gamma_eff,
+              materials::DeviceEOSTableView{}, p.Te_floor, b.Te, b.ee, b.Pe);
+        }
+        __threadfence();
+        pk_sync(p);
+      }
+      for (int c = pk_thread_id(p); c < p.n_cells; c += pk_thread_stride(p)) {
+        grey_T_lin[c] = b.Te[c];
+      }
+      __threadfence();
+      pk_sync(p);
     }
     pk_phase_prof_mark(p, kPkWatchPhaseFldOpacity, phase_prof_last_phase,
                        phase_prof_last_clock);
@@ -3220,7 +3544,35 @@ __device__ void persistent_fld_step(const PersistentParams& p,
     if (p.phase_trace && pk_global_leader(p)) {
       printf("pk_phase step=%d fld_iter %d assemble\n", local_step, iter);
     }
-    persistent_fld_assemble(p, b, dt);
+    if (p.fld_limiter_predictor != 0 && iter == 1) {
+      for (int idx = pk_thread_id(p); idx < total; idx += pk_thread_stride(p)) {
+        b.fld_limiter_E[idx] = b.rad_E[idx];
+      }
+      __threadfence();
+      pk_sync(p);
+    }
+    persistent_fld_assemble(p, b, dt,
+                            (p.fld_limiter_predictor != 0 && iter >= 1) ? b.fld_limiter_E
+                                                                        : b.rad_E);
+    if (p.fld_grey_accel != 0) {
+      for (int c = pk_thread_id(p); c < p.n_cells; c += pk_thread_stride(p)) {
+        radiation::fld_1d_grey_accel::spectrum_body<false>(
+            c, b.rho, b.zbar, (p.fld_has_cv_e != 0) ? b.cv_e : nullptr, p.fld_has_cv_e,
+            p.cv_e_override, b.A_eff, b.gamma_eff, materials::DeviceEOSTableView{}, p.Te_floor,
+            nullptr, b.Te, b.fld_sigma_a, grey_sigma_pe, grey_fleck, b.rad_E_old, p.planck,
+            p.n_groups, dt, b.fld_grey_xi, grey_D, grey_sum_w, grey_P);
+      }
+      __threadfence();
+      pk_sync(p);
+      for (int c = pk_thread_id(p); c < p.n_cells; c += pk_thread_stride(p)) {
+        radiation::fld_1d_grey_accel::matrix_body(c, b.fld_lower, b.fld_diag, b.fld_upper,
+                                                  b.fld_grey_xi, grey_D, grey_sum_w, b.vol,
+                                                  p.n_cells, p.n_groups, dt, grey_lower,
+                                                  grey_diag, grey_upper);
+      }
+      __threadfence();
+      pk_sync(p);
+    }
 
     pk_phase_prof_mark(p, kPkWatchPhaseFldThomas, phase_prof_last_phase,
                        phase_prof_last_clock);
@@ -3404,10 +3756,10 @@ __device__ void persistent_hydro_half_step(const PersistentParams& p,
   pk_sync(p);
 
   refresh_geometry_density_closure(p, b);
+  // The 1T renormalization measures K on the nodes (Hydro1D, NUMERICS §3.1.5).
   const double E_before =
-      (p.renorm_active != 0 && p.two_temperature == 0)
-          ? block_total_energy_1d(p, b, smem)
-          : 0.0;
+      (p.renorm_active != 0 && p.two_temperature == 0) ? block_total_energy_1d(p, b, smem)
+                                                        : 0.0;
 
   compute_sound_speed_into(p, b, b.cs);
   compute_q_vnr_into(p, b, b.cs, b.Qvisc);
@@ -3669,12 +4021,27 @@ __device__ void persistent_hydro_half_step(const PersistentParams& p,
     const double E_after = block_total_energy_1d(p, b, smem);
     const double active_mass = block_active_mass_1d(p, b, smem);
     const double active_internal = block_active_internal_1d(p, b, smem);
+    // Target E^n + W_r + E_floor as in Hydro1D::lagrangian_step (NUMERICS
+    // §3.1.5): the radiation pressure force's work (the field pays it after
+    // the step) and the floor injection of the step (booked by the safety
+    // ledger) are exchanges, not errors of the step. This path rescaled to
+    // E^n and took both back out of e (2026-09-23).
+    double local_work = 0.0;
+    if (p.rad_gamma43_enabled != 0) {
+      for (int c = pk_thread_id(p); c < p.n_cells; c += pk_thread_stride(p)) {
+        local_work += b.rad_gamma_W_r[c];
+      }
+    }
+    const double work_sum =
+        (p.rad_gamma43_enabled != 0) ? pk_reduce_sum(p, b, local_work, smem) : 0.0;
+    const double floor_sum = *(volatile const double*)b.E_floor;
+    const double E_target = E_before + work_sum + fmax(floor_sum, 0.0);
     __shared__ int renorm_mode;
     __shared__ double renorm_value;
     if (threadIdx.x == 0) {
       renorm_mode = 0;
       renorm_value = 0.0;
-      const double delta_E = E_before - E_after;
+      const double delta_E = E_target - E_after;
       if (fabs(delta_E) > 0.0) {
         if (active_internal > 0.0) {
           renorm_mode = 1;
@@ -3695,9 +4062,10 @@ __device__ void persistent_hydro_half_step(const PersistentParams& p,
     }
     pk_sync(p);
 
-    const double E_corrected = block_total_energy_1d(p, b, smem);
+    const double E_corrected =
+        block_total_energy_1d(p, b, smem);
     if (pk_global_leader(p)) {
-      const double residual = E_before - E_corrected;
+      const double residual = E_target - E_corrected;
       if (fabs(residual) > 0.0) {
         add_first_active_residual_kernel_body(b.ee, b.mass, 0, residual);
       }
@@ -3745,6 +4113,7 @@ persistent_chunk_kernel(PersistentParams p,
   __shared__ int smem_i[kBlockSize];
   __shared__ double sh_t;
   __shared__ double sh_dt;
+  __shared__ double sh_dt_growth_basis;
   __shared__ double sh_cand_hydro;
   __shared__ double sh_cand_cond;
   __shared__ double sh_cand_rad;
@@ -3767,6 +4136,7 @@ persistent_chunk_kernel(PersistentParams p,
   if (threadIdx.x == 0) {
     sh_t = d_t_dt[0];
     sh_dt = d_t_dt[1];
+    sh_dt_growth_basis = d_t_dt[2];
     sh_cand_hydro = CUDART_INF;
     sh_cand_cond = CUDART_INF;
     sh_cand_rad = CUDART_INF;
@@ -3789,6 +4159,16 @@ persistent_chunk_kernel(PersistentParams p,
   __threadfence();
   pk_sync(p);
   int* const error_flag = kGrid ? b.grid_error : &sh_error;
+
+  // Energy totals of the step budget at the start of the chunk; each step's
+  // end totals are the next step's start totals (every thread holds the
+  // reduced sums).
+  double E_step_start[4];
+  {
+    double local_totals[4];
+    pk_energy_totals_local(p, b, local_totals);
+    pk_reduce_sum_multi<4>(p, b, local_totals, smem, E_step_start);
+  }
 
   for (int local_step = 0; local_step < p.chunk_steps; ++local_step) {
     if (threadIdx.x == 0) {
@@ -3815,6 +4195,11 @@ persistent_chunk_kernel(PersistentParams p,
     double local_min = CUDART_INF;
     int local_idx = INT_MAX;
     int local_have = 0;
+    // Node-crossing bound of the hydro dt, as in the multi-kernel CFL
+    // (cfl_1d_kernel_body): a closing face may sweep at most
+    // crossing_dt_safety of its cell per step; the bound enters unscaled
+    // (2026-09-23; the persistent loop had no such guard).
+    double local_crossing = CUDART_INF;
     if (p.hydro_enabled != 0) {
       for (int c = pk_thread_id(p); c < p.n_cells; c += pk_thread_stride(p)) {
         double post_dt = CUDART_INF;
@@ -3822,7 +4207,7 @@ persistent_chunk_kernel(PersistentParams p,
         const double candidate =
             tenryu::hydro::persistent_1d::cfl_1d_candidate_body(
                 c, b.x_r, b.v_r, b.ee, b.ei, b.cs, nullptr, b.hydro_active,
-                p.n_cells, sh_t, p.gamma, p.av_linear, p.av_quadratic, 0, 0,
+                p.n_cells, p.geom_code, sh_t, p.gamma, p.av_linear, p.av_quadratic, 0, 0,
                 0.0, 0.0, p.av_limiter_J, &post_dt, &have);
         if (candidate < local_min ||
             (candidate == local_min && c < local_idx)) {
@@ -3831,12 +4216,19 @@ persistent_chunk_kernel(PersistentParams p,
         }
         (void)post_dt;
         local_have |= have;
+        const bool cell_active = (b.hydro_active == nullptr) || (b.hydro_active[c] != 0);
+        const double dr = b.x_r[c + 1] - b.x_r[c];
+        const double closing = b.v_r[c] - b.v_r[c + 1];
+        if (cell_active && p.crossing_dt_safety > 0.0 && dr > 0.0 && closing > 0.0) {
+          local_crossing = fmin(local_crossing, p.crossing_dt_safety * dr / closing);
+        }
       }
     }
     double min_local = CUDART_INF;
     int min_idx = INT_MAX;
     pk_reduce_argmin(p, b, local_min, local_idx, smem_arg, smem_i, &min_local,
                      &min_idx);
+    const double min_crossing = -pk_reduce_max(p, b, -local_crossing, smem);
     const double have_sum =
         pk_reduce_sum(p, b, static_cast<double>(local_have), smem);
     (void)min_idx;
@@ -3847,8 +4239,9 @@ persistent_chunk_kernel(PersistentParams p,
     if (threadIdx.x == 0) {
       const double dt_hydro =
           (p.hydro_enabled != 0)
-              ? dt_hydro_post_1d(min_local, CUDART_INF, p.cfl_hydro,
-                                 have_sum > 0.0 ? 1 : 0)
+              ? fmin(dt_hydro_post_1d(min_local, CUDART_INF, p.cfl_hydro,
+                                      have_sum > 0.0 ? 1 : 0),
+                     min_crossing)
               : CUDART_INF;
       const double cond_min_ratio =
           (p.conduction_enabled != 0 && b.cond_diag3 != nullptr)
@@ -3865,7 +4258,7 @@ persistent_chunk_kernel(PersistentParams p,
                        : CUDART_INF;
       in.dt_visc = CUDART_INF;
       in.dt_rad = dt_rad;
-      in.dt_prev = sh_dt;
+      in.dt_prev = sh_dt_growth_basis;
       in.growth_factor = p.growth_factor;
       in.dt_max = p.dt_max;
       in.dt_output = remaining_out;
@@ -3875,6 +4268,7 @@ persistent_chunk_kernel(PersistentParams p,
       sh_cand_rad = in.dt_rad;
       const DtLadderOut out = dt_ladder_eval(in);
       sh_dt = out.dt_chosen;
+      sh_dt_growth_basis = out.dt_growth_basis;
       sh_limiter = out.limiter;
     }
     pk_sync(p);
@@ -3882,19 +4276,59 @@ persistent_chunk_kernel(PersistentParams p,
       break;
     }
 
+    // Per-step floor injections and clamp counts, the multi-kernel step's
+    // step_E_floor and step_clamp_count. The ring writer (the global leader)
+    // reads the operators' device counters after each operator: every
+    // operator ends with a grid sync after its last update of them, and the
+    // next one resets them through this same thread.
+    const bool ring_writer = pk_global_leader(p);
+    double step_hydro_floor = 0.0;
+    double step_cond_floor = 0.0;
+    int step_clamps = 0;
+    const auto read_clamps = [&]() -> int {
+      return (b.clamp_count != nullptr) ? *(volatile const int*)b.clamp_count : 0;
+    };
+    const int clamps_before_laser = ring_writer ? read_clamps() : 0;
     PK_PHASE_TRACE(kPkWatchPhaseLaser, "laser");
     persistent_laser_step(p, b, sh_dt, sh_t, local_step,
                           &phase_prof_last_phase, &phase_prof_last_clock,
                           error_flag, smem, &sh_laser_input,
                           &sh_laser_escaped, &sh_laser_floor,
                           &sh_laser_skipped);
+    if (ring_writer) {
+      step_clamps += read_clamps() - clamps_before_laser;
+    }
+    // Radiation energy change across each hydro half-step (mesh motion and
+    // the radiation-pressure work update), the multi-kernel budget's
+    // E_rad_mesh_advection: half 1 from the step-start total, half 2 up to
+    // the step-end total of the ring reduction.
+    const bool rad_mesh_budget = (p.hydro_enabled != 0 && p.radiation_enabled != 0);
+    double E_rad_half1_after = 0.0;
+    double E_rad_half2_before = 0.0;
+    const auto hydro_half = [&](const double t_half) {
+      persistent_gamma_r_pre_hydro(p, b);
+      persistent_hydro_half_step(p, b, 0.5 * sh_dt, t_half, error_flag, smem);
+      if (ring_writer) {
+        step_hydro_floor += *(volatile const double*)b.E_floor;
+        step_clamps += read_clamps();
+        if (b.rho_clamp_count != nullptr) {
+          step_clamps += *(volatile const int*)b.rho_clamp_count;
+        }
+      }
+    };
     if (p.hydro_enabled != 0) {
       PK_PHASE_TRACE(kPkWatchPhaseHydro1, "hydro_half_1");
-      persistent_gamma_r_pre_hydro(p, b);
-      persistent_hydro_half_step(p, b, 0.5 * sh_dt, sh_t, error_flag, smem);
+      hydro_half(sh_t);
+      if (rad_mesh_budget) {
+        E_rad_half1_after = pk_rad_energy_total(p, b, smem);
+      }
     }
     PK_PHASE_TRACE(kPkWatchPhaseConduction, "conduction");
     persistent_conduction_step(p, b, sh_dt, error_flag);
+    if (ring_writer && p.conduction_enabled != 0 && sh_dt > 0.0) {
+      step_cond_floor += *(volatile const double*)b.E_floor;
+      step_clamps += read_clamps();
+    }
     PK_PHASE_TRACE(kPkWatchPhaseFldPre, "fld_pre");
     persistent_fld_step<kGrid>(
         p, b, sh_dt, sh_t + 0.5 * sh_dt, local_step,
@@ -3908,47 +4342,93 @@ persistent_chunk_kernel(PersistentParams p,
     }
     PK_PHASE_TRACE(kPkWatchPhaseFldPost, "fld_post");
     if (p.hydro_enabled != 0) {
+      if (rad_mesh_budget) {
+        E_rad_half2_before = pk_rad_energy_total(p, b, smem);
+      }
       PK_PHASE_TRACE(kPkWatchPhaseHydro2, "hydro_half_2");
-      persistent_gamma_r_pre_hydro(p, b);
-      persistent_hydro_half_step(p, b, 0.5 * sh_dt, sh_t + 0.5 * sh_dt,
-                                 error_flag, smem);
+      hydro_half(sh_t + 0.5 * sh_dt);
+    }
+
+    // Non-finite state check of Numerics.safety.nan_fatal (the multi-kernel
+    // path audits Te, Ti, rho, ee and ei after each phase; the persistent
+    // loop had no such check, 2026-09-23).
+    if (p.nan_fatal != 0) {
+      int local_non_finite = 0;
+      for (int c = pk_thread_id(p); c < p.n_cells; c += pk_thread_stride(p)) {
+        if (!isfinite(b.Te[c]) || !isfinite(b.Ti[c]) || !isfinite(b.rho[c]) ||
+            !isfinite(b.ee[c]) || !isfinite(b.ei[c])) {
+          local_non_finite = 1;
+        }
+      }
+      if (local_non_finite != 0) {
+        pk_raise_error(error_flag, pk_encode_error_code(kPkErrorNonFiniteState));
+      }
+      __threadfence();
+      pk_sync(p);
     }
 
     PK_PHASE_TRACE(kPkWatchPhaseRing, "ring");
-    double local_checksum_u = 0.0;
+    // Ring checksums and the step-end energy totals in one reduction.
+    double ring_local[6];
+    ring_local[0] = 0.0;
     for (int j = pk_thread_id(p); j < p.n_nodes; j += pk_thread_stride(p)) {
-      local_checksum_u += b.v_r[j];
+      ring_local[0] += b.v_r[j];
     }
-    const double checksum_u = pk_reduce_sum(p, b, local_checksum_u, smem);
-    double local_checksum_e = 0.0;
+    ring_local[1] = 0.0;
     for (int c = pk_thread_id(p); c < p.n_cells; c += pk_thread_stride(p)) {
-      local_checksum_e += b.ee[c];
+      ring_local[1] += b.ee[c];
     }
-    const double checksum_e = pk_reduce_sum(p, b, local_checksum_e, smem);
+    {
+      double local_totals[4];
+      pk_energy_totals_local(p, b, local_totals);
+      ring_local[2] = local_totals[0];
+      ring_local[3] = local_totals[1];
+      ring_local[4] = local_totals[2];
+      ring_local[5] = local_totals[3];
+    }
+    double ring_sums[6];
+    pk_reduce_sum_multi<6>(p, b, ring_local, smem, ring_sums);
+    const double rad_mesh_advection =
+        rad_mesh_budget ? (E_rad_half1_after - E_step_start[3]) +
+                              (ring_sums[5] - E_rad_half2_before)
+                        : 0.0;
 
     if (threadIdx.x == 0) {
       if (pk_global_leader(p)) {
-        ring[local_step] = PersistentDiagRecord{sh_t,
-                                                sh_dt,
-                                                sh_cand_hydro,
-                                                sh_cand_cond,
-                                                sh_cand_rad,
-                                                checksum_u,
-                                                checksum_e,
-                                                sh_fld_residual,
-                                                sh_fld_escaped,
-                                                sh_fld_marshak_in,
-                                                sh_fld_volume_source,
-                                                sh_laser_input,
-                                                sh_laser_escaped,
-                                                sh_laser_floor,
-                                                sh_laser_skipped,
-                                                steps_done,
-                                                sh_limiter,
-                                                sh_fld_iterations,
-                                                p.use_cooperative,
-                                                p.cooperative_grid_blocks,
-                                                0};
+        PersistentDiagRecord rec{};
+        rec.t = sh_t;
+        rec.dt = sh_dt;
+        rec.cand_hydro = sh_cand_hydro;
+        rec.cand_cond = sh_cand_cond;
+        rec.cand_rad = sh_cand_rad;
+        rec.checksum_u = ring_sums[0];
+        rec.checksum_e = ring_sums[1];
+        rec.fld_outer_residual = sh_fld_residual;
+        rec.fld_escaped = sh_fld_escaped;
+        rec.fld_marshak_in = sh_fld_marshak_in;
+        rec.fld_volume_source = sh_fld_volume_source;
+        rec.laser_input = sh_laser_input;
+        rec.laser_escaped = sh_laser_escaped;
+        rec.laser_floor = sh_laser_floor;
+        rec.laser_skipped = sh_laser_skipped;
+        rec.hydro_floor = step_hydro_floor;
+        rec.conduction_floor = step_cond_floor;
+        rec.rad_mesh_advection = rad_mesh_advection;
+        rec.E_int_e_before = E_step_start[0];
+        rec.E_int_i_before = E_step_start[1];
+        rec.E_kin_before = E_step_start[2];
+        rec.E_rad_before = E_step_start[3];
+        rec.E_int_e_after = ring_sums[2];
+        rec.E_int_i_after = ring_sums[3];
+        rec.E_kin_after = ring_sums[4];
+        rec.E_rad_after = ring_sums[5];
+        rec.step = steps_done;
+        rec.limiter = sh_limiter;
+        rec.fld_outer_iterations = sh_fld_iterations;
+        rec.use_cooperative = p.use_cooperative;
+        rec.cooperative_grid_blocks = p.cooperative_grid_blocks;
+        rec.clamp_count = step_clamps;
+        ring[local_step] = rec;
       }
       sh_t += sh_dt;
       ++steps_done;
@@ -3961,6 +4441,10 @@ persistent_chunk_kernel(PersistentParams p,
       }
     }
     pk_sync(p);
+    E_step_start[0] = ring_sums[2];
+    E_step_start[1] = ring_sums[3];
+    E_step_start[2] = ring_sums[4];
+    E_step_start[3] = ring_sums[5];
     if (sh_exit == kExitRetryOrError) {
       break;
     }
@@ -3972,6 +4456,7 @@ persistent_chunk_kernel(PersistentParams p,
     pk_watch_mark(p, kPkWatchPhaseExit, steps_done, -1, 0);
     d_t_dt[0] = sh_t;
     d_t_dt[1] = sh_dt;
+    d_t_dt[2] = sh_dt_growth_basis;
     d_exit[0] = sh_exit;
     d_exit[1] = steps_done;
     d_exit[2] = *(volatile const int*)error_flag;
@@ -4162,6 +4647,12 @@ PersistentParams make_params(const core::State& state,
       (state.cv_e.size() == state.rho.size()) ? 1 : 0;
   p.fld_max_outer_iterations =
       std::max(cfg.radiation.multigroup_diffusion.max_outer_iterations, 1);
+  p.fld_grey_accel = (cfg.radiation.multigroup_diffusion.outer_accel == "grey" ||
+                      cfg.radiation.multigroup_diffusion.outer_accel == "auto")
+                         ? 1
+                         : 0;
+  p.fld_limiter_predictor =
+      (cfg.radiation.multigroup_diffusion.limiter_evaluation != "iterate") ? 1 : 0;
   p.laser_enabled = cfg.laser.enabled ? 1 : 0;
   p.laser_n_folded =
       cfg.laser.enabled ? static_cast<int>(cfg.laser.beams.size()) : 0;
@@ -4183,10 +4674,17 @@ PersistentParams make_params(const core::State& state,
   p.laser_lmesh_ghost_corona_enabled =
       laser_mesh.ghost_corona_enabled ? 1 : 0;
   p.laser_lmesh_ghost_n_out = laser_mesh.ghost_n_out;
+  p.laser_turn_on_s = laser::laser_turn_on_time_s(state);
   p.laser_lmesh_ghost_handoff_cells = laser_mesh.ghost_handoff_cells;
   p.laser_raytrace_max_steps =
       std::min(std::max(cfg.laser.raytrace.max_steps, 1),
                laser::ray_trace_bodies::kMaxRayStepsGuard);
+  p.laser_raytrace_characteristic =
+      (cfg.laser.raytrace.integrator == "characteristic" ||
+       cfg.laser.raytrace.integrator == "auto")
+          ? 1
+          : 0;
+  p.laser_reflect_at_critical = cfg.laser.absorption.terminate ? 0 : 1;
   if (p.laser_mode_raytrace_1d != 0) {
     const double z_center = 0.5 * (laser_mesh.Z_min + laser_mesh.Z_max);
     const laser::Beams beams =
@@ -4195,7 +4693,7 @@ PersistentParams make_params(const core::State& state,
     if (!beams.items.empty()) {
       const laser::Beam& beam = beams.items.front();
       p.laser_beam_f_number = beam.f_number;
-      p.laser_beam_focus_lab_z = beam.focus_lab_z;
+      p.laser_beam_focus_lab_z = beam.axial_focus_1d();
       p.laser_beam_profile_w0_cm = beam.profile_w0_cm;
       p.laser_profile_m = beam.profile_m;
       if (beam.profile_model == "super_gaussian") {
@@ -4224,6 +4722,8 @@ PersistentParams make_params(const core::State& state,
   p.av_quadratic = cfg.numerics.hydro.av_quadratic;
   p.av_limiter_J = cfg.numerics.hydro.av_limiter_J;
   p.cfl_hydro = cfg.numerics.dt.cfl_hydro;
+  p.crossing_dt_safety = cfg.numerics.hydro.crossing_dt_safety;
+  p.nan_fatal = cfg.numerics.safety.nan_fatal ? 1 : 0;
   p.cfl_cond = cfg.numerics.dt.cfl_cond;
   p.conduction_f_lim = cfg.numerics.conduction.f_lim;
   p.conduction_mfp_limiter_C = cfg.numerics.conduction.mfp_limiter_C;
@@ -4269,6 +4769,10 @@ PersistentParams make_params(const core::State& state,
   p.laser_lmesh_ghost_zbar_min = laser_mesh.ghost_zbar_min;
   p.laser_lmesh_ghost_zbar_max = laser_mesh.ghost_zbar_max;
   p.laser_lmesh_ghost_handoff_decay = laser_mesh.ghost_handoff_decay;
+  p.laser_lmesh_ghost_transition_resolved_nhat =
+      laser_mesh.ghost_transition_resolved_nhat;
+  p.laser_lmesh_ghost_transition_resolved_cells =
+      laser_mesh.ghost_transition_resolved_cells;
   p.fld_alpha = cfg.radiation.imc.alpha;
   p.fld_f_min = cfg.numerics.dt.f_min_fleck;
   p.growth_factor = cfg.numerics.dt.growth_factor;
@@ -4317,12 +4821,19 @@ PersistentDeviceBuffers make_buffers(core::State& state,
       "persistent_loop:grid_reduce_indices", reduce_count);
   b.grid_reduce_scalar = acquire_device_buffer<double>(
       "persistent_loop:grid_reduce_scalar", 1);
+  b.grid_reduce_multi_stride = static_cast<int>(reduce_count);
+  b.grid_reduce_multi_partials = acquire_device_buffer<double>(
+      "persistent_loop:grid_reduce_multi_partials",
+      reduce_count * static_cast<std::size_t>(kPkReduceMultiMax));
+  b.grid_reduce_multi_scalars = acquire_device_buffer<double>(
+      "persistent_loop:grid_reduce_multi_scalars",
+      static_cast<std::size_t>(kPkReduceMultiMax));
   b.grid_reduce_index_scalar = acquire_device_buffer<int>(
       "persistent_loop:grid_reduce_index_scalar", 1);
   b.grid_broadcast_doubles = acquire_device_buffer<double>(
       "persistent_loop:grid_broadcast_doubles", 12);
   b.grid_broadcast_ints = acquire_device_buffer<int>(
-      "persistent_loop:grid_broadcast_ints", 8);
+      "persistent_loop:grid_broadcast_ints", 9);
   b.grid_error = acquire_device_buffer<int>("persistent_loop:grid_error", 1);
   if (state.cell_is_void.size() == n_cells) {
     if (trace) {
@@ -4496,6 +5007,10 @@ PersistentDeviceBuffers make_buffers(core::State& state,
     b.fld_Te_old = state.fld_Te_old.data();
     b.fld_delta_T = state.fld_delta_T.data();
     b.fld_cp_work = state.fld_cusparse_buffer.data();
+    b.fld_grey_xi = acquire_device_buffer<double>("persistent_loop:fld_grey_xi", n_total);
+    b.fld_limiter_E = acquire_device_buffer<double>("persistent_loop:fld_limiter_E", n_total);
+    b.fld_grey_cells = acquire_device_buffer<double>(
+        "persistent_loop:fld_grey_cells", 13U * static_cast<std::size_t>(state.rho.size()));
     if (allocate_fld_pcr_work) {
       b.fld_pcr_dl_work =
           acquire_device_buffer<double>("persistent_loop:fld_pcr_dl_work",
@@ -4521,6 +5036,14 @@ PersistentDeviceBuffers make_buffers(core::State& state,
   }
   if (cfg.laser.enabled) {
     b.laser_dep = state.laser_dep.empty() ? nullptr : state.laser_dep.data();
+    if (cfg.laser.mode == "radial_absorption_1d") {
+      double* cells = acquire_device_buffer<double>(
+          "persistent_laser:radial_cells", 2ULL * std::max<std::size_t>(n_cells, 1));
+      b.laser_radial_cell_tau = cells;
+      b.laser_radial_cell_nh_raw = cells + std::max<std::size_t>(n_cells, 1);
+      b.laser_radial_cell_status = acquire_device_buffer<int>(
+          "persistent_laser:radial_cell_status", std::max<std::size_t>(n_cells, 1));
+    }
     if (cfg.laser.mode == "raytrace_2d" && state.mesh.dim == 1) {
       const std::size_t n_rays =
           static_cast<std::size_t>(std::max(cfg.laser.rays_per_beam, 1));
@@ -4534,11 +5057,19 @@ PersistentDeviceBuffers make_buffers(core::State& state,
       b.laser_smooth_kappa_factor = laser_mesh.smooth_kappa_factor;
       b.laser_grad_n_hat_R = laser_mesh.grad_n_hat_R;
       b.laser_grad_n_hat_Z = laser_mesh.grad_n_hat_Z;
+      // The trace profile (laser_mesh_bodies::build_trace_profile_nodes_1d)
+      // holds at most this many nodes for any graded mesh the capacity allows.
+      laser_mesh.ensure_radial_capacity(laser::laser_mesh_bodies::trace_profile_node_capacity_1d(
+          static_cast<int>(n_cells), laser_mesh.n_nodes_r_capacity));
+      b.laser_radial_capacity = laser_mesh.radial_capacity;
       b.laser_radial_node_r = laser_mesh.radial_node_r;
       b.laser_radial_n_hat = laser_mesh.radial_n_hat;
       b.laser_radial_n_hat_raw = laser_mesh.radial_n_hat_raw;
       b.laser_radial_smooth_kappa = laser_mesh.radial_smooth_kappa;
       b.laser_radial_dn_dr = laser_mesh.radial_dn_dr;
+      b.laser_radial_T_e = laser_mesh.radial_T_e;
+      b.laser_radial_Zbar = laser_mesh.radial_Zbar;
+      b.laser_radial_zero = laser_mesh.radial_zero;
       b.laser_step_tally_slab = laser_mesh.scratch_step_tally_slab;
       b.laser_unabsorbed = laser_mesh.scratch_unabsorbed;
       b.laser_tail_closure_count = laser_mesh.scratch_tail_closure_count;
@@ -4567,20 +5098,20 @@ PersistentDeviceBuffers make_buffers(core::State& state,
       b.laser_per_ray_deposit = per_ray_slab;
       b.laser_per_ray_unabsorbed = per_ray_slab + per_ray_deposit;
       b.laser_per_ray_tail_power = b.laser_per_ray_unabsorbed + n_rays;
+      b.laser_piece_capacity = laser::ray_trace_bodies::characteristic_piece_capacity(
+          std::max(b.laser_radial_capacity, 2), static_cast<int>(n_cells));
+      b.laser_piece_r = acquire_device_buffer<double>(
+          "persistent_laser:piece_r",
+          static_cast<std::size_t>(b.laser_piece_capacity) + 1U);
+      b.laser_piece_ints = acquire_device_buffer<int>(
+          "persistent_laser:piece_ints",
+          2U * static_cast<std::size_t>(b.laser_piece_capacity) + 1U);
       b.laser_cell_n_hat = acquire_device_buffer<double>(
           "persistent_laser:cell_n_hat", n_cells);
       b.laser_widths = acquire_device_buffer<double>(
           "persistent_laser:graded_widths",
           static_cast<std::size_t>(std::max(cfg.laser.lasermesh.nr_max, 4)) +
               1U);
-      b.laser_ema_state = acquire_device_buffer<double>(
-          "persistent_laser:ema_state",
-          static_cast<std::size_t>(
-              std::max(laser_mesh.n_nodes_r_capacity *
-                           laser_mesh.n_nodes_z_capacity,
-                       1)));
-      b.laser_ema_valid =
-          acquire_device_buffer<int>("persistent_laser:ema_valid", 1);
       b.laser_cell_is_void = acquire_device_buffer<std::uint8_t>(
           "persistent_laser:cell_is_void", n_cells);
       std::vector<std::uint8_t> cell_is_void_host(n_cells, 0U);
@@ -4736,10 +5267,6 @@ void prepare_persistent_laser_entry(core::State& state,
     laser::map_from_hydro_1d(laser_mesh, state, cfg.laser, hydro, nullptr);
   }
   laser_mesh.ensure_step_scratch();
-  int* ema_valid =
-      acquire_device_buffer<int>("persistent_laser:ema_valid", 1);
-  cuda_check(cudaMemset(ema_valid, 0, sizeof(int)),
-             "persistent_loop: persistent_laser ema_valid memset failed");
 }
 
 bool persistent_loop_supported_c1(const core::State& state,
@@ -4782,6 +5309,13 @@ bool persistent_loop_supported_c1(const core::State& state,
     return warn_unsupported_once("laser beams configured while laser disabled");
   }
   if (laser_enabled) {
+    // The persistent ray trace runs plain IB absorption (a default
+    // LaserPhysExtOptions); the extensions are refused (2026-09-23).
+    if (cfg.laser.laser_phys_ext_active()) {
+      return warn_unsupported_once(
+          "laser IB/RA extensions (Langdon, effective charge, Coulomb log, resonance "
+          "absorption, deposit at the critical surface)");
+    }
     if (!hydro_enabled) {
       return warn_unsupported_once("laser without hydro");
     }
@@ -4809,6 +5343,12 @@ bool persistent_loop_supported_c1(const core::State& state,
       return warn_unsupported_once("laser ray output configured");
     }
     if (laser_raytrace_1d) {
+      if (cfg.mesh.geometry_1d != "spherical") {
+        // The folded trace launches the sphere's rays (one per ring); a 1D
+        // cylinder or slab traces rings times azimuths with an out-of-plane
+        // velocity (initialize_rays_1d, 2026-09-24).
+        return warn_unsupported_once("laser raytrace on a non-spherical 1D geometry");
+      }
       if (laser_mesh == nullptr || !laser_mesh->is_allocated()) {
         return warn_unsupported_once("laser mesh unavailable for raytrace");
       }
@@ -4836,10 +5376,13 @@ bool persistent_loop_supported_c1(const core::State& state,
         return warn_unsupported_once("laser enabled without beams");
       }
       const laser::Beam& first = beams.items.front();
+      if (first.profile_model == "table") {
+        return warn_unsupported_once("laser table beam profile");
+      }
       for (std::size_t i = 1; i < beams.items.size(); ++i) {
         const laser::Beam& beam = beams.items[i];
         if (beam.f_number != first.f_number ||
-            beam.focus_lab_z != first.focus_lab_z ||
+            beam.axial_focus_1d() != first.axial_focus_1d() ||
             beam.delta_lambda_nm != first.delta_lambda_nm ||
             beam.profile_m != first.profile_m ||
             beam.profile_w0_cm != first.profile_w0_cm ||
@@ -4899,6 +5442,35 @@ bool persistent_loop_supported_c1(const core::State& state,
   }
   if (cfg.laser.enabled && cfg.laser.hot_electron.enable) {
     return warn_unsupported_once("hot_electron");
+  }
+  // Settings the persistent loop does not implement: it would run them as a
+  // different calculation, so they are refused (2026-09-23).
+  if (cfg.materials.zbar.model != "fixed") {
+    return warn_unsupported_once("zbar model other than fixed (never updated here)");
+  }
+  if (cfg.numerics.hydro.qei_multiplier != 1.0) {
+    return warn_unsupported_once("qei_multiplier != 1");
+  }
+  if (cfg.numerics.hydro.time_integrator != "legacy_pc") {
+    return warn_unsupported_once("hydro time_integrator other than legacy_pc");
+  }
+  if (cfg.numerics.conduction.enabled && cfg.numerics.conduction.nonlocal_model != "none") {
+    return warn_unsupported_once("nonlocal (SNB) conduction");
+  }
+  if (cfg.numerics.safety.overshoot_fatal_enabled) {
+    return warn_unsupported_once(
+        "temperature overshoot check (Numerics.safety.overshoot_fatal_enabled)");
+  }
+  for (const auto& mat : cfg.materials.materials) {
+    if (mat.is_void) {
+      continue;
+    }
+    if (!cfg.main.two_temperature && mat.cv_e_override > 0.0) {
+      return warn_unsupported_once("1T cv_e_override (the 1T closure here adds the ion part)");
+    }
+    if (radiation_enabled && mat.kappa_planck_override >= 0.0) {
+      return warn_unsupported_once("kappa_planck override");
+    }
   }
   if (cfg.burn.enabled) {
     return warn_unsupported_once("burn");
@@ -4976,6 +5548,9 @@ bool persistent_loop_supported_c1(const core::State& state,
     if (cfg.radiation.multigroup_diffusion.linear_solver_1d !=
         "cusparse_tridiag") {
       return warn_unsupported_once("non-tridiag 1D FLD solver");
+    }
+    if (cfg.radiation.multigroup_diffusion.outer_accel == "anderson") {
+      return warn_unsupported_once("Anderson-accelerated FLD outer iteration");
     }
     if (cfg.radiation.boundary.marshak_Tr.detected ||
         !cfg.radiation.boundary.marshak_Tr_map.empty()) {
@@ -5228,12 +5803,14 @@ PersistentChunkResult run_persistent_chunk(core::State& state,
   auto* ring = acquire_device_buffer<PersistentDiagRecord>(
       "persistent_loop:diag_ring", static_cast<std::size_t>(chunk_steps));
   int* d_exit = acquire_device_buffer<int>("persistent_loop:exit", 3);
-  double* d_t_dt = acquire_device_buffer<double>("persistent_loop:t_dt", 2);
+  double* d_t_dt = acquire_device_buffer<double>("persistent_loop:t_dt", 3);
   if (trace) {
     core::log_info("pk_host: setup pool acquires block end");
   }
 
-  const double h_t_dt[2] = {state.t, state.dt};
+  // t, dt and the growth reference of the next step (NUMERICS §2.2).
+  const double h_t_dt[3] = {
+      state.t, state.dt, (state.dt_growth_ref > 0.0) ? state.dt_growth_ref : state.dt};
   cuda_check(cudaMemcpy(d_t_dt, h_t_dt, sizeof(h_t_dt), cudaMemcpyHostToDevice),
              "persistent_loop: copy t/dt H2D failed");
   cuda_check(cudaMemset(d_exit, 0, 3 * sizeof(int)),
@@ -5325,7 +5902,7 @@ PersistentChunkResult run_persistent_chunk(core::State& state,
     pk_phase_prof_log(h_phase_prof);
   }
 
-  double h_after[2] = {0.0, 0.0};
+  double h_after[3] = {0.0, 0.0, 0.0};
   int h_exit[3] = {0, 0, 0};
   cuda_check(cudaMemcpy(h_after, d_t_dt, sizeof(h_after), cudaMemcpyDeviceToHost),
              "persistent_loop: copy t/dt D2H failed");
@@ -5342,7 +5919,11 @@ PersistentChunkResult run_persistent_chunk(core::State& state,
 
   state.t = h_after[0];
   state.dt = h_after[1];
+  state.dt_growth_ref = h_after[2];
+  const int step_before_chunk = state.step;
   state.step += h_exit[1];
+  std::vector<PersistentStepSummary> step_summaries;
+  step_summaries.reserve(static_cast<std::size_t>(std::max(h_exit[1], 0)));
   for (int i = 0; i < h_exit[1] && i < chunk_steps; ++i) {
     const PersistentDiagRecord& rec =
         ring_host[static_cast<std::size_t>(i)];
@@ -5351,8 +5932,46 @@ PersistentChunkResult run_persistent_chunk(core::State& state,
     state.E_laser_escaped += std::max(rec.laser_escaped, 0.0);
     state.E_laser_incident += std::max(rec.laser_input, 0.0);
     state.E_numerical_loss += std::max(rec.laser_skipped, 0.0);
-    state.E_floor_injected += std::max(rec.laser_floor, 0.0);
-    state.E_safety += std::max(rec.laser_floor, 0.0);
+    // The radiation boundary and volume-source ledgers and the hydro and
+    // conduction floor injections, booked like the multi-kernel step (they
+    // were recorded here but never booked, 2026-09-23).
+    const double floor_step = std::max(rec.laser_floor, 0.0) +
+                              std::max(rec.hydro_floor, 0.0) +
+                              std::max(rec.conduction_floor, 0.0);
+    state.E_floor_injected += floor_step;
+    state.E_safety += floor_step;
+    state.E_rad_escaped += std::max(rec.fld_escaped, 0.0);
+    state.E_Marshak_in += std::max(rec.fld_marshak_in, 0.0);
+    state.E_volume_in += std::max(rec.fld_volume_source, 0.0);
+
+    // The step budget from the same terms (burn, CBET, boundary PdV work,
+    // unresolved laser redistribution and the solver term are refused or
+    // absent in the persistent loop; one rank, no reduction).
+    diagnostics::EnergyBudgetStepInput budget_input{};
+    budget_input.before.E_int_e = rec.E_int_e_before;
+    budget_input.before.E_int_i = rec.E_int_i_before;
+    budget_input.before.E_kin = rec.E_kin_before;
+    budget_input.after.E_int_e = rec.E_int_e_after;
+    budget_input.after.E_int_i = rec.E_int_i_after;
+    budget_input.after.E_kin = rec.E_kin_after;
+    budget_input.E_rad_before = rec.E_rad_before;
+    budget_input.E_rad_after = rec.E_rad_after;
+    budget_input.E_rad_mesh_advection = rec.rad_mesh_advection;
+    budget_input.E_laser_in = std::max(rec.laser_input, 0.0);
+    budget_input.E_laser_esc = std::max(rec.laser_escaped, 0.0);
+    budget_input.E_Marshak_in = std::max(rec.fld_marshak_in, 0.0);
+    budget_input.E_volume_in = std::max(rec.fld_volume_source, 0.0);
+    budget_input.E_rad_esc = std::max(rec.fld_escaped, 0.0);
+    budget_input.E_numerical_loss = std::max(rec.laser_skipped, 0.0);
+    budget_input.E_floor = floor_step;
+    budget_input.E_safety = floor_step;
+    PersistentStepSummary summary{};
+    summary.step = step_before_chunk + i + 1;
+    summary.t_after = rec.t + rec.dt;
+    summary.dt = rec.dt;
+    summary.clamp_count = rec.clamp_count;
+    summary.budget = diagnostics::compute_step_energy_budget(budget_input);
+    step_summaries.push_back(summary);
   }
   state.mesh.recompute_geometry_device_only(state.vol.data());
   cuda_check(cudaDeviceSynchronize(),
@@ -5365,8 +5984,19 @@ PersistentChunkResult run_persistent_chunk(core::State& state,
   result.dt_after = state.dt;
   result.exit_reason = h_exit[0];
   result.error_code = h_exit[2];
+  result.steps = std::move(step_summaries);
   if (result.error_code != 0) {
     result.exit_reason = kExitRetryOrError;
+  }
+  if (result.error_code != 0 &&
+      (result.error_code & kPkErrorReasonMask) == kPkErrorNonFiniteState) {
+    // As the multi-kernel phase audit: fatal, no retry.
+    std::ostringstream oss;
+    oss << "[SAFETY] step=" << state.step << " t=" << state.t
+        << ": Non-finite state field (Te, Ti, rho, ee or ei) detected after a "
+           "persistent-loop step (nan_fatal=true)";
+    core::log_fatal(oss.str());
+    TENRYU_ASSERT(false, oss.str());
   }
   if (result.exit_reason == kExitRetryOrError) {
     const std::string error_detail = pk_error_description(result.error_code);

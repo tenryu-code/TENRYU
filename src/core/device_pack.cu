@@ -5,6 +5,7 @@
 #include <cuda_runtime.h>
 
 #include "core/device_scratch.hpp"
+#include "core/field.hpp"
 #include "core/error.hpp"
 
 namespace tenryu::core {
@@ -117,6 +118,33 @@ __global__ void gather_two_scalars_kernel(const double* a,
   }
 }
 
+// The arrays of copy_device_arrays: blockIdx.y selects the array.
+struct DeviceArrayCopies {
+  double* dst[8];
+  const double* src[8];
+  int count[8];
+};
+
+__global__ void copy_arrays_kernel(const DeviceArrayCopies copies) {
+  const int a = static_cast<int>(blockIdx.y);
+  const int n = copies.count[a];
+  double* const dst = copies.dst[a];
+  const double* const src = copies.src[a];
+  const int stride = static_cast<int>(gridDim.x * blockDim.x);
+  for (int j = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x); j < n; j += stride) {
+    dst[j] = src[j];
+  }
+}
+
+__global__ void add_array_kernel(double* dst, const double* src, const std::size_t n) {
+  const std::size_t stride =
+      static_cast<std::size_t>(gridDim.x) * static_cast<std::size_t>(blockDim.x);
+  for (std::size_t i = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       i < n; i += stride) {
+    dst[i] += src[i];
+  }
+}
+
 }  // namespace
 
 void pack_pull_fields(const double* const* d_srcs,
@@ -184,6 +212,55 @@ void pull_two_scalars(const double* d_a,
                         2 * sizeof(double),
                         cudaMemcpyDeviceToHost),
              "pull_two_scalars readback failed");
+}
+
+void add_device_array(double* d_dst, const double* d_src, const std::size_t n) {
+  if (n == 0) {
+    return;
+  }
+  TENRYU_ASSERT(d_dst != nullptr && d_src != nullptr,
+                "add_device_array requires device pointers");
+  constexpr std::size_t kMaxGrid = 1024;
+  const std::size_t blocks = (n + kBlockSize - 1) / kBlockSize;
+  const int grid = static_cast<int>(blocks < kMaxGrid ? blocks : kMaxGrid);
+  add_array_kernel<<<grid, kBlockSize>>>(d_dst, d_src, n);
+  cuda_check(cudaGetLastError(), "add_device_array launch failed");
+}
+
+void copy_device_arrays(double* const* d_dsts, const double* const* d_srcs, const int* counts,
+                        const int k) {
+  TENRYU_ASSERT(k >= 0 && k <= 8, "copy_device_arrays requires 0 <= k <= 8");
+  DeviceArrayCopies copies{};
+  int longest = 0;
+  for (int a = 0; a < k; ++a) {
+    TENRYU_ASSERT(counts[a] >= 0, "copy_device_arrays requires non-negative counts");
+    TENRYU_ASSERT(counts[a] == 0 || (d_dsts[a] != nullptr && d_srcs[a] != nullptr),
+                  "copy_device_arrays requires device pointers");
+    copies.dst[a] = d_dsts[a];
+    copies.src[a] = d_srcs[a];
+    copies.count[a] = counts[a];
+    longest = (counts[a] > longest) ? counts[a] : longest;
+  }
+  if (longest == 0) {
+    return;
+  }
+  constexpr int kMaxGridX = 1024;
+  const int blocks = (longest + kBlockSize - 1) / kBlockSize;
+  const dim3 grid(static_cast<unsigned>(blocks < kMaxGridX ? blocks : kMaxGridX),
+                  static_cast<unsigned>(k));
+  copy_arrays_kernel<<<grid, kBlockSize>>>(copies);
+  cuda_check(cudaGetLastError(), "copy_device_arrays launch failed");
+}
+
+const std::uint8_t* device_cell_is_void(const std::vector<std::uint8_t>& host_mask) {
+  static DeviceArray<std::uint8_t> device_mask;
+  static std::vector<std::uint8_t> uploaded;
+  if (device_mask.size() != host_mask.size() || uploaded != host_mask) {
+    device_mask.reset(host_mask.size());
+    device_mask.copy_from_host(host_mask);
+    uploaded = host_mask;
+  }
+  return device_mask.data();
 }
 
 }  // namespace tenryu::core

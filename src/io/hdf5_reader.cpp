@@ -19,6 +19,7 @@
 
 #include "core/config_validate.hpp"
 #include "core/error.hpp"
+#include "core/hdf5_mutex.hpp"
 #include "core/namelist/errors.hpp"
 #include "core/namelist/freeze.hpp"
 #include "hydro/axis_edge_collapse.hpp"
@@ -1796,7 +1797,13 @@ int validate_schema_and_frozen_config(const hid_t file,
 
   const auto geometry = read_root_attr_string(file, "geometry");
   if (geometry.has_value()) {
-    TENRYU_ASSERT(*geometry == cfg.main.dimension,
+    // Checkpoints of Main.dimension="1D_CYL" runs before 2026-09-24 record
+    // "1D_CYL"; the builder now maps 1D_CYL to 1D_SPH with
+    // Mesh.geometry_1d="cylindrical".
+    const bool legacy_cylindrical =
+        *geometry == "1D_CYL" && cfg.main.dimension == "1D_SPH" &&
+        cfg.mesh.geometry_1d == "cylindrical";
+    TENRYU_ASSERT(*geometry == cfg.main.dimension || legacy_cylindrical,
                   "ConfigError: checkpoint geometry mismatch (checkpoint=" + *geometry +
                       ", namelist=" + cfg.main.dimension + ")");
   }
@@ -2475,6 +2482,7 @@ PerMaterialCheckpointReadStatus read_per_material_checkpoint_status(
     const std::string& h5_file_path,
     const bool per_material_enabled) {
 #if TENRYU_ENABLE_HDF5
+  const std::lock_guard<std::recursive_mutex> hdf5_lock(core::hdf5_mutex());
   const hid_t file = H5Fopen(h5_file_path.c_str(), H5F_ACC_RDONLY, H5P_DEFAULT);
   if (file < 0) {
     return per_material_enabled ? PerMaterialCheckpointReadStatus::MissingGroupEnabled
@@ -2508,6 +2516,7 @@ CheckpointData HDF5Reader::read_checkpoint(const core::Config& cfg,
   CheckpointData out{};
 
 #if TENRYU_ENABLE_HDF5
+  const std::lock_guard<std::recursive_mutex> hdf5_lock(core::hdf5_mutex());
   const std::filesystem::path checkpoint_path = resolve_checkpoint_path(checkpoint_prefix, rank);
 
   const hid_t file = H5Fopen(checkpoint_path.string().c_str(), H5F_ACC_RDONLY, H5P_DEFAULT);
@@ -2679,6 +2688,13 @@ CheckpointData HDF5Reader::read_checkpoint(const core::Config& cfg,
                          out.state.Qvisc,
                          "hydro/Qvisc");
   }
+  // Cold-equilibrium reference energy (NUMERICS §1 (b)): the budget's internal
+  // energy is rho (ee + e_cold) V, so it is restored with ee (2026-09-23).
+  if (link_exists(file, "hydro/e_cold") && out.state.e_cold.size() == out.state.rho.size()) {
+    copy_vector_to_field(read_vector_dataset<double>(file, "hydro/e_cold", H5T_NATIVE_DOUBLE),
+                         out.state.e_cold,
+                         "hydro/e_cold");
+  }
   if (link_exists(file, "hydro/hot_e_eps_cum")) {
     out.state.hot_e_eps_cum_host = read_vector_dataset_checked<double>(
         file, "hydro/hot_e_eps_cum", H5T_NATIVE_DOUBLE, out.state.rho.size());
@@ -2721,6 +2737,13 @@ CheckpointData HDF5Reader::read_checkpoint(const core::Config& cfg,
         out.state.burn_n_host[c * kBurnSpeciesCount + s] =
             burn_species[s][c] / rho_safe;
       }
+    }
+    // The specific inventories as the run held them (checkpoints from
+    // 2026-09-26): n_s / rho above differs from them in the last bit.
+    if (link_exists(file, "burn_state/specific_inventory")) {
+      out.state.burn_n_host = read_vector_dataset_checked<double>(
+          file, "burn_state/specific_inventory", H5T_NATIVE_DOUBLE,
+          out.state.rho.size() * kBurnSpeciesCount);
     }
   }
   // hydro/burn_Ng_slot* stores persistent specific spectra Y_g [1/g].
@@ -2826,6 +2849,8 @@ CheckpointData HDF5Reader::read_checkpoint(const core::Config& cfg,
     copy_vector_to_field(read_vector_dataset<double>(file, "hydro/cs", H5T_NATIVE_DOUBLE),
                          out.state.cs,
                          "hydro/cs");
+    // A checkpoint writes cs with the heat capacities the run keeps (hdf5_writer.cpp).
+    out.state.closure_fields_restored = true;
   }
   if (link_exists(file, "hydro/eta_compatible")) {
     copy_vector_to_field(
@@ -3060,6 +3085,45 @@ CheckpointData HDF5Reader::read_checkpoint(const core::Config& cfg,
         read_vector_dataset<std::int8_t>(file, "hydro_flags/hydro_active", H5T_NATIVE_INT8);
     out.state.note_hydro_active_host_write();
   }
+  // The 1D void-cell mask (cells of is_void materials): the initialization that sets it does
+  // not run on a restart, which otherwise continued with no void cell (the laser then took the
+  // outermost void cell for the target surface and dropped the ghost corona). Absent before
+  // 2026-09-25.
+  if (cfg.main.dim == 1 && link_exists(file, "hydro_flags/cell_is_void")) {
+    std::vector<std::uint8_t> cell_is_void =
+        read_vector_dataset<std::uint8_t>(file, "hydro_flags/cell_is_void", H5T_NATIVE_UINT8);
+    TENRYU_ASSERT(cell_is_void.size() == out.state.rho.size(),
+                  "Restart checkpoint hydro_flags/cell_is_void size does not match the cells");
+    out.state.cell_is_void = std::move(cell_is_void);
+  }
+  // 1D S_N angular intensity memory. The solver keeps it when its size
+  // matches the run's n_cells x n_groups x n_angles and reseeds otherwise.
+  if (link_exists(file, "radiation_sn/psi_prev")) {
+    const std::vector<double> psi_prev =
+        read_vector_dataset<double>(file, "radiation_sn/psi_prev", H5T_NATIVE_DOUBLE);
+    out.state.sn_psi_prev.reset(psi_prev.size());
+    if (!psi_prev.empty()) {
+      out.state.sn_psi_prev.copy_from_host(psi_prev.data());
+    }
+  }
+  // Linear-discontinuous S_N histories (absent in older checkpoints: the
+  // solver seeds them, isotropic and with a zero in-cell energy offset).
+  if (link_exists(file, "radiation_sn/psi_sd_prev")) {
+    const std::vector<double> sd_prev =
+        read_vector_dataset<double>(file, "radiation_sn/psi_sd_prev", H5T_NATIVE_DOUBLE);
+    out.state.sn_psi_sd_prev.reset(sd_prev.size());
+    if (!sd_prev.empty()) {
+      out.state.sn_psi_sd_prev.copy_from_host(sd_prev.data());
+    }
+  }
+  if (link_exists(file, "radiation_sn/ee_node_offset")) {
+    const std::vector<double> offset =
+        read_vector_dataset<double>(file, "radiation_sn/ee_node_offset", H5T_NATIVE_DOUBLE);
+    out.state.sn_ee_node_offset.reset(offset.size());
+    if (!offset.empty()) {
+      out.state.sn_ee_node_offset.copy_from_host(offset.data());
+    }
+  }
   if (link_exists(file, "metadata/merge_tombstone")) {
     out.state.merge_tombstone = read_vector_dataset_checked<std::uint8_t>(
         file, "metadata/merge_tombstone", H5T_NATIVE_UINT8, n_cells);
@@ -3167,8 +3231,39 @@ CheckpointData HDF5Reader::read_checkpoint(const core::Config& cfg,
       read_scalar_dataset<double>(file, "time_state/E_pdV_bdry", H5T_NATIVE_DOUBLE, 0.0);
   out.state.E_Marshak_in =
       read_scalar_dataset<double>(file, "time_state/E_Marshak_in", H5T_NATIVE_DOUBLE, 0.0);
+  // Absent before 2026-09-23: the cumulative volume-source input then counts
+  // from the restart.
+  out.state.E_volume_in =
+      read_scalar_dataset<double>(file, "time_state/E_volume_in", H5T_NATIVE_DOUBLE, 0.0);
   out.state.E_solver =
       read_scalar_dataset<double>(file, "time_state/E_solver", H5T_NATIVE_DOUBLE, 0.0);
+  // Run-cumulative conduction solver statistics; absent before 2026-09-25 (they then count
+  // from the restart).
+  out.state.c1_solver_steps_total = static_cast<std::uint64_t>(read_scalar_dataset<std::int64_t>(
+      file, "conduction_state/solver_steps_total", H5T_NATIVE_INT64, 0));
+  out.state.c1_solver_residual_max = read_scalar_dataset<double>(
+      file, "conduction_state/solver_residual_max", H5T_NATIVE_DOUBLE, 0.0);
+  out.state.c1_solver_iter_max = read_scalar_dataset<std::int32_t>(
+      file, "conduction_state/solver_iter_max", H5T_NATIVE_INT32, 0);
+  out.state.c1_solver_cond_number_max = read_scalar_dataset<double>(
+      file, "conduction_state/solver_cond_number_max", H5T_NATIVE_DOUBLE, 0.0);
+  if (link_exists(file, "conduction_state/bc_heat_flux_integrated")) {
+    const std::vector<double> flux = read_vector_dataset<double>(
+        file, "conduction_state/bc_heat_flux_integrated", H5T_NATIVE_DOUBLE);
+    TENRYU_ASSERT(flux.size() == out.state.c1_bc_heat_flux_integrated.size(),
+                  "Restart checkpoint conduction_state/bc_heat_flux_integrated size mismatch");
+    std::copy(flux.begin(), flux.end(), out.state.c1_bc_heat_flux_integrated.begin());
+  }
+  out.state.snb_steps_total = static_cast<std::uint64_t>(read_scalar_dataset<std::int64_t>(
+      file, "conduction_state/snb_steps_total", H5T_NATIVE_INT64, 0));
+  out.state.snb_picard_iters_max = read_scalar_dataset<std::int32_t>(
+      file, "conduction_state/snb_picard_iters_max", H5T_NATIVE_INT32, 0);
+  out.state.snb_nonconverged_steps = read_scalar_dataset<std::int32_t>(
+      file, "conduction_state/snb_nonconverged_steps", H5T_NATIVE_INT32, 0);
+  out.state.snb_cap_theta_min_run = read_scalar_dataset<double>(
+      file, "conduction_state/snb_cap_theta_min_run", H5T_NATIVE_DOUBLE, 1.0);
+  out.state.snb_dq_over_qsh_max_run = read_scalar_dataset<double>(
+      file, "conduction_state/snb_dq_over_qsh_max_run", H5T_NATIVE_DOUBLE, 0.0);
 
   initialize_output_timing(out.state, cfg);
   out.state.t_next_plot = read_scalar_dataset<double>(

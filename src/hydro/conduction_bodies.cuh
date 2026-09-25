@@ -5,6 +5,7 @@
 
 #include <cuda_runtime.h>
 
+#include "hydro/conduction_cv.hpp"
 #include "mesh/geometry_1d.cuh"
 
 namespace tenryu::hydro::conduction_bodies {
@@ -279,13 +280,10 @@ __device__ inline void compute_spitzer_deff_1d_kernel_body(
   const double z = fmax(zbar[i], 0.0);
   const double rho_i = fmax(rho[i], 0.0);
   const double te = sanitize_te_for_pow(Te[i]);
-  const double gamma_i = fmax(gamma_eff[i], kMinEffectiveGamma);
   const double A_i = fmax(A_eff[i], kMinEffectiveA);
-  const double cv_e_ideal = (gamma_i > 1.0 && A_i > 0.0)
-                                ? (z * kEvToErg / (A_i * kProtonMass * (gamma_i - 1.0)))
-                                : 0.0;
-  const double cv_e =
-      (state_cv_e != nullptr && state_cv_e[i] > 0.0) ? state_cv_e[i] : cv_e_ideal;
+  // Shared with the energy booking after the solve (conduction_cv.hpp).
+  const double cv_e = conduction_solve_cv_e(state_cv_e != nullptr ? state_cv_e[i] : 0.0,
+                                            zbar[i], gamma_eff[i], A_eff[i]);
   const double rho_cv = rho_i * cv_e;
 
   if (rho_cv_e != nullptr) {
@@ -443,16 +441,11 @@ __device__ inline void compute_powerlaw_test_kappa_deff_1d_kernel_body(
     const double kappa_power,
     const double kappa_rho_power,
     const double* __restrict__ state_cv_e) {
-  const double z = fmax(zbar[i], 0.0);
   const double rho_i = fmax(rho[i], 0.0);
   const double te = sanitize_te_for_pow(Te[i]);
-  const double gamma_i = fmax(gamma_eff[i], kMinEffectiveGamma);
-  const double A_i = fmax(A_eff[i], kMinEffectiveA);
-  const double cv_e_ideal = (gamma_i > 1.0 && A_i > 0.0)
-                                ? (z * kEvToErg / (A_i * kProtonMass * (gamma_i - 1.0)))
-                                : 0.0;
-  const double cv_e =
-      (state_cv_e != nullptr && state_cv_e[i] > 0.0) ? state_cv_e[i] : cv_e_ideal;
+  // Shared with the energy booking after the solve (conduction_cv.hpp).
+  const double cv_e = conduction_solve_cv_e(state_cv_e != nullptr ? state_cv_e[i] : 0.0,
+                                            zbar[i], gamma_eff[i], A_eff[i]);
   const double rho_cv = rho_i * cv_e;
 
   if (rho_cv_e != nullptr) {
@@ -569,7 +562,8 @@ __device__ inline void conduction_1d_sts_stage_kernel_body(
     const double* __restrict__ alpha_cells,
     int* __restrict__ clamp_count,
     double* __restrict__ E_floor,
-    const int floor_limiter_mode) {
+    const int floor_limiter_mode,
+    double* __restrict__ E_floor_cell = nullptr) {
   if (cell_is_void != nullptr && cell_is_void[i] != static_cast<std::uint8_t>(0)) {
     Te_new[i] = Te_old[i];
     return;
@@ -649,10 +643,18 @@ __device__ inline void conduction_1d_sts_stage_kernel_body(
     if (rho_cv > 0.0) {
       if (isfinite(Te_computed) && Te_floor > Te_computed) {
         const double de = rho_cv * (Te_floor - Te_computed) * V;
-        atomic_add_double(E_floor, de);
+        if (E_floor_cell != nullptr) {
+          E_floor_cell[i] += de;
+        } else {
+          atomic_add_double(E_floor, de);
+        }
       } else if (!isfinite(Te_computed) && Te_floor > 0.0) {
         const double de = rho_cv * Te_floor * V;
-        atomic_add_double(E_floor, de);
+        if (E_floor_cell != nullptr) {
+          E_floor_cell[i] += de;
+        } else {
+          atomic_add_double(E_floor, de);
+        }
       }
     }
     Te_new[i] = Te_floor;
@@ -680,7 +682,8 @@ __device__ inline void conduction_1d_sts_stage_kirchhoff_kernel_body(
     const double* __restrict__ alpha_cells,
     int* __restrict__ clamp_count,
     double* __restrict__ E_floor,
-    const int floor_limiter_mode) {
+    const int floor_limiter_mode,
+    double* __restrict__ E_floor_cell = nullptr) {
   if (cell_is_void != nullptr && cell_is_void[i] != static_cast<std::uint8_t>(0)) {
     Te_new[i] = Te_old[i];
     return;
@@ -762,10 +765,18 @@ __device__ inline void conduction_1d_sts_stage_kirchhoff_kernel_body(
     if (rho_cv > 0.0) {
       if (isfinite(Te_computed) && Te_floor > Te_computed) {
         const double de = rho_cv * (Te_floor - Te_computed) * V;
-        atomic_add_double(E_floor, de);
+        if (E_floor_cell != nullptr) {
+          E_floor_cell[i] += de;
+        } else {
+          atomic_add_double(E_floor, de);
+        }
       } else if (!isfinite(Te_computed) && Te_floor > 0.0) {
         const double de = rho_cv * Te_floor * V;
-        atomic_add_double(E_floor, de);
+        if (E_floor_cell != nullptr) {
+          E_floor_cell[i] += de;
+        } else {
+          atomic_add_double(E_floor, de);
+        }
       }
     }
     Te_new[i] = Te_floor;
@@ -795,7 +806,8 @@ __device__ inline void conduction_1d_sts_stage_secant_kernel_body(
     const double* __restrict__ alpha_cells,
     int* __restrict__ clamp_count,
     double* __restrict__ E_floor,
-    const int floor_limiter_mode) {
+    const int floor_limiter_mode,
+    double* __restrict__ E_floor_cell = nullptr) {
   if (cell_is_void != nullptr && cell_is_void[i] != static_cast<std::uint8_t>(0)) {
     Te_new[i] = Te_old[i];
     return;
@@ -894,10 +906,18 @@ __device__ inline void conduction_1d_sts_stage_secant_kernel_body(
     if (rho_cv > 0.0) {
       if (isfinite(Te_computed) && Te_floor > Te_computed) {
         const double de = rho_cv * (Te_floor - Te_computed) * V;
-        atomic_add_double(E_floor, de);
+        if (E_floor_cell != nullptr) {
+          E_floor_cell[i] += de;
+        } else {
+          atomic_add_double(E_floor, de);
+        }
       } else if (!isfinite(Te_computed) && Te_floor > 0.0) {
         const double de = rho_cv * Te_floor * V;
-        atomic_add_double(E_floor, de);
+        if (E_floor_cell != nullptr) {
+          E_floor_cell[i] += de;
+        } else {
+          atomic_add_double(E_floor, de);
+        }
       }
     }
     Te_new[i] = Te_floor;
@@ -1001,7 +1021,8 @@ __device__ inline void conduction_1d_sts_stage_legacy_inline_alpha_kernel_body(
     const double tau,
     const double Te_floor,
     int* __restrict__ clamp_count,
-    double* __restrict__ E_floor) {
+    double* __restrict__ E_floor,
+    double* __restrict__ E_floor_cell = nullptr) {
   if (cell_is_void != nullptr && cell_is_void[i] != static_cast<std::uint8_t>(0)) {
     Te_new[i] = Te_old[i];
     return;
@@ -1075,10 +1096,18 @@ __device__ inline void conduction_1d_sts_stage_legacy_inline_alpha_kernel_body(
     if (rho_cv > 0.0) {
       if (isfinite(Te_computed) && Te_floor > Te_computed) {
         const double de = rho_cv * (Te_floor - Te_computed) * V;
-        atomic_add_double(E_floor, de);
+        if (E_floor_cell != nullptr) {
+          E_floor_cell[i] += de;
+        } else {
+          atomic_add_double(E_floor, de);
+        }
       } else if (!isfinite(Te_computed) && Te_floor > 0.0) {
         const double de = rho_cv * Te_floor * V;
-        atomic_add_double(E_floor, de);
+        if (E_floor_cell != nullptr) {
+          E_floor_cell[i] += de;
+        } else {
+          atomic_add_double(E_floor, de);
+        }
       }
     }
     Te_new[i] = Te_floor;
@@ -1104,7 +1133,8 @@ __device__ inline void conduction_1d_sts_stage_kirchhoff_legacy_inline_alpha_ker
     const double tau,
     const double Te_floor,
     int* __restrict__ clamp_count,
-    double* __restrict__ E_floor) {
+    double* __restrict__ E_floor,
+    double* __restrict__ E_floor_cell = nullptr) {
   if (cell_is_void != nullptr && cell_is_void[i] != static_cast<std::uint8_t>(0)) {
     Te_new[i] = Te_old[i];
     return;
@@ -1180,10 +1210,18 @@ __device__ inline void conduction_1d_sts_stage_kirchhoff_legacy_inline_alpha_ker
     if (rho_cv > 0.0) {
       if (isfinite(Te_computed) && Te_floor > Te_computed) {
         const double de = rho_cv * (Te_floor - Te_computed) * V;
-        atomic_add_double(E_floor, de);
+        if (E_floor_cell != nullptr) {
+          E_floor_cell[i] += de;
+        } else {
+          atomic_add_double(E_floor, de);
+        }
       } else if (!isfinite(Te_computed) && Te_floor > 0.0) {
         const double de = rho_cv * Te_floor * V;
-        atomic_add_double(E_floor, de);
+        if (E_floor_cell != nullptr) {
+          E_floor_cell[i] += de;
+        } else {
+          atomic_add_double(E_floor, de);
+        }
       }
     }
     Te_new[i] = Te_floor;
@@ -1211,7 +1249,8 @@ __device__ inline void conduction_1d_sts_stage_secant_legacy_inline_alpha_kernel
     const double kappa_power,
     const double kappa_rho_power,
     int* __restrict__ clamp_count,
-    double* __restrict__ E_floor) {
+    double* __restrict__ E_floor,
+    double* __restrict__ E_floor_cell = nullptr) {
   if (cell_is_void != nullptr && cell_is_void[i] != static_cast<std::uint8_t>(0)) {
     Te_new[i] = Te_old[i];
     return;
@@ -1304,10 +1343,18 @@ __device__ inline void conduction_1d_sts_stage_secant_legacy_inline_alpha_kernel
     if (rho_cv > 0.0) {
       if (isfinite(Te_computed) && Te_floor > Te_computed) {
         const double de = rho_cv * (Te_floor - Te_computed) * V;
-        atomic_add_double(E_floor, de);
+        if (E_floor_cell != nullptr) {
+          E_floor_cell[i] += de;
+        } else {
+          atomic_add_double(E_floor, de);
+        }
       } else if (!isfinite(Te_computed) && Te_floor > 0.0) {
         const double de = rho_cv * Te_floor * V;
-        atomic_add_double(E_floor, de);
+        if (E_floor_cell != nullptr) {
+          E_floor_cell[i] += de;
+        } else {
+          atomic_add_double(E_floor, de);
+        }
       }
     }
     Te_new[i] = Te_floor;
@@ -1333,14 +1380,9 @@ __device__ inline void eos_sync_electron_kernel_body(
     const double* __restrict__ state_cv_e) {
   (void)n_cells;
   const double te = fmax(Te[i], Te_floor);
-  const double z = fmax(zbar[i], 0.0);
   const double gamma = fmax(gamma_eff[i], kMinEffectiveGamma);
-  const double A = fmax(A_eff[i], kMinEffectiveA);
-  const double cv_e_ideal = (gamma > 1.0 && A > 0.0)
-                                ? (z * kEvToErg / (A * kProtonMass * (gamma - 1.0)))
-                                : 0.0;
-  const double cv_e =
-      (state_cv_e != nullptr && state_cv_e[i] > 0.0) ? state_cv_e[i] : cv_e_ideal;
+  const double cv_e = conduction_solve_cv_e(state_cv_e != nullptr ? state_cv_e[i] : 0.0,
+                                            zbar[i], gamma_eff[i], A_eff[i]);
   const double e_e = cv_e * te;
   Te[i] = te;
   ee[i] = fmax(e_e, 0.0);

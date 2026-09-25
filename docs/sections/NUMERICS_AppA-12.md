@@ -927,7 +927,7 @@ ALE remap（§3.3.4）は rezone後に1回のcellフィールド交換で対応�
   - \(E_{census}^{total}\)：census粒子エネルギー合計
   - \(N_{particles}^{total}\)：全粒子数
   - \(N_{mode\_switch}^{total}\)：モード変換回数
-- 収支チェック：§10.2 の \(\varepsilon_{budget}\) 定義に従い、分母に \(E_{denom} = \max(E_{total}^n, E_{source}, 10^{-20})\) を使用する（§11.1参照）
+- 収支チェック：§10.2 の \(\varepsilon_{budget}\) 定義に従い、分母に \(E_{denom} = \max(|E_{int,e}^n|+|E_{int,i}^n|+|E_{kin}^n|+|E_{rad}^n|, E_{source}, 10^{-20})\) を使用する（§11.1参照）
 
 **エネルギー収支 MPI_Allreduce のタイミング**：
 

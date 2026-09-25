@@ -28,6 +28,15 @@ class Hydro1D {
                                    const core::Config& cfg,
                                    const HydroEOSContext* eos_ctx = nullptr) const;
 
+  // The EOS closure (1T or 2T, every EOS backend) and the cell sound speed
+  // of the current conserved fields, as at the entry of the Lagrangian
+  // step. For operators that replace the conserved fields between hydro
+  // steps (the 1D ALE commit), so that the state they leave is the one the
+  // hydro would close.
+  void close_eos_and_sound_speed(core::State& state,
+                                 const core::Config& cfg,
+                                 const HydroEOSContext* eos_ctx = nullptr) const;
+
   tenryu::coupling::HydroStepResult lagrangian_step(
       core::State& state,
       double dt,

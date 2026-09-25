@@ -19,6 +19,26 @@ namespace {
 inline void cuda_check(const cudaError_t err, const char* msg) {
   TENRYU_ASSERT(err == cudaSuccess, msg);
 }
+
+template <typename View>
+View* upload_view_array(const std::vector<View>& host_views, const char* what) {
+  if (host_views.empty()) {
+    return nullptr;
+  }
+  View* d_views = nullptr;
+  const std::size_t bytes = sizeof(View) * host_views.size();
+  cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_views), bytes), what);
+  cuda_check(cudaMemcpy(d_views, host_views.data(), bytes, cudaMemcpyHostToDevice), what);
+  return d_views;
+}
+
+template <typename View>
+void free_view_array(View*& d_views) {
+  if (d_views != nullptr) {
+    cudaFree(d_views);
+    d_views = nullptr;
+  }
+}
 }  // namespace
 
 void HydroEOSContext::initialize(const core::Config& cfg) {
@@ -114,6 +134,56 @@ void HydroEOSContext::initialize(const core::Config& cfg) {
       any_helmholtz_jet = true;
     }
     // else: DeviceEOSTable default-constructed -> empty -> n_rho==0 -> ideal gas fallback
+    TENRYU_ASSERT(hydro_backend_kind[static_cast<std::size_t>(m)] ==
+                      materials::hydro_backend_kind_of(cfg, m),
+                  "HydroEOSContext backend kind disagrees with materials::hydro_backend_kind_of");
+  }
+
+  // Run-level facts of the per-cell closures (1D; 2026-09-24).
+  backend_kinds_vary = materials::hydro_backend_kinds_vary(cfg);
+  d_closure_params = materials::selector_closure_params(cfg);
+  {
+    int n_nonvoid = 0;
+    bool all_support = true;
+    bool any_surrogate = false;
+    any_nonvoid_overridable = false;
+    for (int m = 0; m < n_materials; ++m) {
+      if (mats[static_cast<std::size_t>(m)].is_void) {
+        continue;
+      }
+      ++n_nonvoid;
+      all_support = all_support && rho_e_reclosure_supported[static_cast<std::size_t>(m)] != 0u;
+      const std::uint8_t kind = hydro_backend_kind[static_cast<std::size_t>(m)];
+      any_surrogate = any_surrogate || kind == materials::kHydroBackendHelmholtzSpline ||
+                      kind == materials::kHydroBackendHelmholtzJet ||
+                      kind == materials::kHydroBackendRhoETable ||
+                      kind == materials::kHydroBackendMieGruneisen;
+      any_nonvoid_overridable = any_nonvoid_overridable ||
+                                (kind != materials::kHydroBackendExactIdealGas &&
+                                 kind != materials::kHydroBackendMieGruneisen);
+    }
+    all_nonvoid_support_rho_e_reclosure = n_nonvoid > 0 && all_support;
+    surrogates_per_material = cfg.main.dim == 1 && n_nonvoid > 1 && any_surrogate;
+  }
+  if (surrogates_per_material) {
+    std::vector<materials::EOSRhoEDeviceView> h_rho_e(static_cast<std::size_t>(n_materials));
+    std::vector<materials::HelmholtzSplineDeviceView> h_spline(
+        static_cast<std::size_t>(n_materials));
+    std::vector<materials::HelmholtzJetDeviceView> h_jet(static_cast<std::size_t>(n_materials));
+    std::vector<materials::MieGruneisenDeviceView> h_mg(static_cast<std::size_t>(n_materials));
+    for (int m = 0; m < n_materials; ++m) {
+      const std::size_t mi = static_cast<std::size_t>(m);
+      h_rho_e[mi] = total_rho_e[mi].view();
+      h_spline[mi] = total_helmholtz[mi].view();
+      h_jet[mi] = total_helmholtz_jet[mi].view();
+      h_mg[mi] = mie_gruneisen[mi].view();
+    }
+    d_rho_e_views = upload_view_array(h_rho_e, "HydroEOSContext::initialize rho-e view array");
+    d_spline_views =
+        upload_view_array(h_spline, "HydroEOSContext::initialize spline view array");
+    d_jet_views = upload_view_array(h_jet, "HydroEOSContext::initialize jet view array");
+    d_mie_gruneisen_views =
+        upload_view_array(h_mg, "HydroEOSContext::initialize Mie-Gruneisen view array");
   }
 
   if (!any_table) return;
@@ -133,6 +203,13 @@ void HydroEOSContext::initialize(const core::Config& cfg) {
   std::vector<materials::DeviceEOSTableView> h_total_views(
       static_cast<std::size_t>(n_materials));
   for (int m = 0; m < n_materials; ++m) {
+    // An exact ideal-gas material closes with the ideal gas in every per-cell
+    // closure: its entries stay empty (2026-09-24; they used to hold its
+    // tables, so the per-cell table closures of the sources, the conduction
+    // re-closure and the signed-energy mask treated its cells as tabled).
+    if (hydro_backend_kind[static_cast<std::size_t>(m)] == materials::kHydroBackendExactIdealGas) {
+      continue;
+    }
     h_ion_views[static_cast<std::size_t>(m)] = ion[static_cast<std::size_t>(m)].view();
     h_ele_views[static_cast<std::size_t>(m)] = electron[static_cast<std::size_t>(m)].view();
     h_total_views[static_cast<std::size_t>(m)] = total[static_cast<std::size_t>(m)].view();
@@ -146,6 +223,15 @@ void HydroEOSContext::initialize(const core::Config& cfg) {
 }
 
 void HydroEOSContext::destroy() {
+  free_view_array(d_rho_e_views);
+  free_view_array(d_spline_views);
+  free_view_array(d_jet_views);
+  free_view_array(d_mie_gruneisen_views);
+  d_closure_params = nullptr;
+  backend_kinds_vary = false;
+  surrogates_per_material = false;
+  any_nonvoid_overridable = false;
+  all_nonvoid_support_rho_e_reclosure = false;
   if (d_total_views) {
     cudaFree(d_total_views);
     d_total_views = nullptr;
@@ -194,6 +280,15 @@ HydroEOSContext::HydroEOSContext(HydroEOSContext&& o) noexcept
       d_ion_views(o.d_ion_views),
       d_electron_views(o.d_electron_views),
       d_total_views(o.d_total_views),
+      d_rho_e_views(o.d_rho_e_views),
+      d_spline_views(o.d_spline_views),
+      d_jet_views(o.d_jet_views),
+      d_mie_gruneisen_views(o.d_mie_gruneisen_views),
+      d_closure_params(o.d_closure_params),
+      backend_kinds_vary(o.backend_kinds_vary),
+      surrogates_per_material(o.surrogates_per_material),
+      any_nonvoid_overridable(o.any_nonvoid_overridable),
+      all_nonvoid_support_rho_e_reclosure(o.all_nonvoid_support_rho_e_reclosure),
       n_materials(o.n_materials),
       any_table(o.any_table),
       any_helmholtz_spline(o.any_helmholtz_spline),
@@ -201,6 +296,15 @@ HydroEOSContext::HydroEOSContext(HydroEOSContext&& o) noexcept
   o.d_ion_views = nullptr;
   o.d_electron_views = nullptr;
   o.d_total_views = nullptr;
+  o.d_rho_e_views = nullptr;
+  o.d_spline_views = nullptr;
+  o.d_jet_views = nullptr;
+  o.d_mie_gruneisen_views = nullptr;
+  o.d_closure_params = nullptr;
+  o.backend_kinds_vary = false;
+  o.surrogates_per_material = false;
+  o.any_nonvoid_overridable = false;
+  o.all_nonvoid_support_rho_e_reclosure = false;
   o.n_materials = 0;
   o.any_table = false;
   o.any_helmholtz_spline = false;
@@ -224,6 +328,15 @@ HydroEOSContext& HydroEOSContext::operator=(HydroEOSContext&& o) noexcept {
     d_ion_views = o.d_ion_views;
     d_electron_views = o.d_electron_views;
     d_total_views = o.d_total_views;
+    d_rho_e_views = o.d_rho_e_views;
+    d_spline_views = o.d_spline_views;
+    d_jet_views = o.d_jet_views;
+    d_mie_gruneisen_views = o.d_mie_gruneisen_views;
+    d_closure_params = o.d_closure_params;
+    backend_kinds_vary = o.backend_kinds_vary;
+    surrogates_per_material = o.surrogates_per_material;
+    any_nonvoid_overridable = o.any_nonvoid_overridable;
+    all_nonvoid_support_rho_e_reclosure = o.all_nonvoid_support_rho_e_reclosure;
     n_materials = o.n_materials;
     any_table = o.any_table;
     any_helmholtz_spline = o.any_helmholtz_spline;
@@ -231,6 +344,15 @@ HydroEOSContext& HydroEOSContext::operator=(HydroEOSContext&& o) noexcept {
     o.d_ion_views = nullptr;
     o.d_electron_views = nullptr;
     o.d_total_views = nullptr;
+    o.d_rho_e_views = nullptr;
+    o.d_spline_views = nullptr;
+    o.d_jet_views = nullptr;
+    o.d_mie_gruneisen_views = nullptr;
+    o.d_closure_params = nullptr;
+    o.backend_kinds_vary = false;
+    o.surrogates_per_material = false;
+    o.any_nonvoid_overridable = false;
+    o.all_nonvoid_support_rho_e_reclosure = false;
     o.n_materials = 0;
     o.any_table = false;
     o.any_helmholtz_spline = false;

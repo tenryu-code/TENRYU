@@ -247,6 +247,7 @@ Output(
     directory="outputs/lp1d_ex02_two_pulse_timing",
     format="hdf5",
     plot_every_s=1.0e-11,
+    history_every=1,
     history_every_s=1.0e-9,
     checkpoint_every=5000,
     checkpoint_keep_last=2,

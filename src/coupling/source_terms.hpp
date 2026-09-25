@@ -33,13 +33,16 @@ double inject_laser_source_terms(core::State& state,
                                  int* clamp_count = nullptr,
                                  const hydro::HydroEOSContext* eos_ctx = nullptr);
 
-// Deposit burn dE_e/dE_i [erg/cell] with laser host-mirror closure; returns skipped energy.
+// Deposits the burn energies dE_e/dE_i [erg per cell] and closes the deposit
+// cells on the device (NUMERICS §14.5); cells without a deposit are left as
+// they are. Returns the deposit that fell on void or massless cells.
 double inject_burn_source_terms(core::State& state,
                                 const core::Config& cfg,
                                 const std::vector<double>& dE_e,
                                 const std::vector<double>& dE_i,
                                 double* E_floor_injected,
-                                int* clamp_count);
+                                int* clamp_count,
+                                const hydro::HydroEOSContext* eos_ctx = nullptr);
 
 void apply_qei_coupling_substep(core::State& state,
                                 const core::Config& cfg,

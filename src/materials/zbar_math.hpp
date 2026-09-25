@@ -19,23 +19,47 @@ TENRYU_HOST_DEVICE inline double zbar_separate_add_product(
 #endif
 }
 
+// Thomas-Fermi mean ionization, R. M. More, Adv. At. Mol. Phys. 21, 305
+// (1985), Table IV ("an approximate fit to" the TF ionization state), with the
+// TF scaling variables R = rho/(Z A) [g/cm^3] and T0 = T/Z^{4/3} [eV]:
+//   T_F = T0/(1+T0),  A = a1 T0^a2 + a3 T0^a4,  B = -exp(b0 + b1 T_F + b2 T_F^7),
+//   C = c1 T_F + c2,  Q1 = A R^B,  Q = (R^C + Q1^C)^{1/C},  x = alpha Q^beta,
+//   Z* = Z x / (1 + x + sqrt(1 + 2 x)).
+// (2026-09-23: replaces a formula that scaled density by rho/A and approached
+// full ionization as 1 - sqrt(T0/T) — D at 0.17 g/cc gave 0.86 at 100 eV and
+// 0.946 at 1 keV instead of 0.968 / 0.997.) Z and A are the material's mean
+// nuclear charge and mass; rho > 0 and T >= 0 are the only guards.
 TENRYU_HOST_DEVICE inline double zbar_tf_value(
     const double rho, const double Te_eV, const double Z_nuc, const double A_amu) {
   const double Z = reclose_max(Z_nuc, 0.0);
   const double A = reclose_max(A_amu, 1.0e-30);
-  if (Z <= 0.0) return 0.0;
-  const double rho_c = reclose_clamp(rho, 1.0e-3, 1.0e4);
-  const double Te_c = reclose_clamp(Te_eV, 1.0e-2, 1.0e4);
-  const double rho_H = rho_c / A;
-  const double Te_H = Te_c / ::pow(Z, 4.0 / 3.0);
-  const double eta = ::sqrt(reclose_max(rho_H / 0.148, 0.0));
-  const double z0_H = eta / (1.0 + eta);
-  double T0_exp_arg = 6.98 * ::pow(reclose_max(rho_H, 0.0), 0.075);
-  if (!std::isfinite(T0_exp_arg)) T0_exp_arg = 700.0;
-  T0_exp_arg = reclose_min(T0_exp_arg, 700.0);
-  const double T0_H = 0.0327 * ::exp(T0_exp_arg);
-  const double Y = 1.0 / (1.0 + ::sqrt(reclose_max(T0_H / reclose_max(Te_H, 1.0e-30), 0.0)));
-  const double zbar = Z * zbar_separate_add_product(z0_H, 1.0 - z0_H, Y);
+  if (!(Z > 0.0)) return 0.0;
+  constexpr double kAlpha = 14.3139;
+  constexpr double kBeta = 0.6624;
+  constexpr double kA1 = 0.003323;
+  constexpr double kA2 = 0.9718;
+  constexpr double kA3 = 9.26148e-5;
+  constexpr double kA4 = 3.10165;
+  constexpr double kB0 = -1.7630;
+  constexpr double kB1 = 1.43175;
+  constexpr double kB2 = 0.31546;
+  constexpr double kC1 = -0.366667;
+  constexpr double kC2 = 0.983333;
+  const double rho_c = (rho > 0.0 && rho < 1.0e300) ? rho : 1.0e-30;
+  const double T_c = (Te_eV > 0.0 && Te_eV < 1.0e300) ? Te_eV : 0.0;
+  const double R = reclose_max(rho_c / (Z * A), 1.0e-300);
+  const double T0 = T_c / ::pow(Z, 4.0 / 3.0);
+  const double TF = T0 / (1.0 + T0);
+  const double TF2 = TF * TF;
+  const double TF7 = TF2 * TF2 * TF2 * TF;
+  const double A_fit = kA1 * ::pow(T0, kA2) + kA3 * ::pow(T0, kA4);
+  const double B_fit = -::exp(kB0 + kB1 * TF + kB2 * TF7);
+  const double C_fit = kC1 * TF + kC2;
+  const double Q1 = A_fit * ::pow(R, B_fit);
+  const double Q = ::pow(::pow(R, C_fit) + ::pow(Q1, C_fit), 1.0 / C_fit);
+  const double x = kAlpha * ::pow(Q, kBeta);
+  if (!(x < 1.0e300)) return Z;
+  const double zbar = Z * x / (1.0 + x + ::sqrt(1.0 + 2.0 * x));
   return reclose_clamp(zbar, 0.0, Z);
 }
 

@@ -42,8 +42,9 @@ __device__ inline void pcr_sync() {
 
 // Fixed-order block sum reduction. smem must point to kBlockSize doubles.
 // Callers with fewer live items than kBlockSize pass the identity, 0.0, for
-// inactive lanes. The final barrier makes the returned smem[0] value valid for
-// every thread in the block.
+// inactive lanes. Every thread reads the result from smem[0] before the final
+// barrier, so a following reduction on the same smem cannot overwrite smem[0]
+// while another thread still reads it.
 template <int kBlockSize>
 __device__ double block_reduce_sum_fixed_order(double v, double* smem) {
   static_assert(detail::BlockSizeIsValid<kBlockSize>::value,
@@ -60,15 +61,17 @@ __device__ double block_reduce_sum_fixed_order(double v, double* smem) {
     __syncthreads();
   }
 
+  const double total = smem[0];
   __syncthreads();
-  return smem[0];
+  return total;
 }
 
 // Fixed-order block max reduction. smem must point to kBlockSize doubles.
 // Callers with fewer live items than kBlockSize pass the identity, -infinity,
 // for inactive lanes. CUDA fmax returns the non-NaN operand when exactly one
-// operand is NaN; this primitive performs no additional NaN handling. The final
-// barrier makes the returned smem[0] value valid for every thread in the block.
+// operand is NaN; this primitive performs no additional NaN handling. Every
+// thread reads the result from smem[0] before the final barrier (see
+// block_reduce_sum_fixed_order).
 template <int kBlockSize>
 __device__ double block_reduce_max_fixed_order(double v, double* smem) {
   static_assert(detail::BlockSizeIsValid<kBlockSize>::value,
@@ -85,8 +88,9 @@ __device__ double block_reduce_max_fixed_order(double v, double* smem) {
     __syncthreads();
   }
 
+  const double result = smem[0];
   __syncthreads();
-  return smem[0];
+  return result;
 }
 
 // Fixed-order block argmin reduction. smem_v and smem_i must point to

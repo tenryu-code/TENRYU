@@ -3811,7 +3811,8 @@ void IMC::transport_step(core::State& state,
                          const core::Config& cfg,
                          const double dt,
                          const parallel::PartitionInfo& part,
-                         parallel::CommBuffers* bufs) {
+                         parallel::CommBuffers* bufs,
+                         const double drive_time_s) {
   using Clock = std::chrono::steady_clock;
   const bool verbose_imc_timing = cfg.main.verbosity == "verbose";
   const auto elapsed_ms = [](const Clock::time_point& a, const Clock::time_point& b) {
@@ -3959,12 +3960,13 @@ void IMC::transport_step(core::State& state,
   const auto nonvoid_count = std::count_if(
       cfg.materials.materials.begin(), cfg.materials.materials.end(),
       [](const auto& m) { return !m.is_void; });
-  // P2a (2026-08-30): multi-material multigroup-diffusion decks reach here only
-  // with constant/none/LTE-tmat materials (namelist guard); their per-material
-  // tables are evaluated inside evaluate_fld_opacity_and_emission, so the
-  // single-table NLTE routing and its Phase-1 assert do not apply.
+  // P2a (2026-08-30): multi-material multigroup-diffusion decks evaluate their
+  // per-material tables inside evaluate_fld_opacity_and_emission, and
+  // multi-material S_N decks (2026-09-24) inside the S_N opacity evaluation,
+  // so the single-table NLTE routing and its Phase-1 assert do not apply.
   const bool multimat_fld_tables =
-      cfg.radiation.mode == core::RadiationMode::MultigroupDiffusion &&
+      (cfg.radiation.mode == core::RadiationMode::MultigroupDiffusion ||
+       cfg.radiation.mode == core::RadiationMode::SnTransport) &&
       nonvoid_count > 1;
   const bool use_nlte_table =
       !multimat_fld_tables &&
@@ -4052,7 +4054,7 @@ void IMC::transport_step(core::State& state,
 
   if (cfg.radiation.mode == core::RadiationMode::MultigroupDiffusion) {
     if (state.mesh.dim == 1) {
-      advance_radiation_step_fld_1d(state, cfg, planck, mat, dt);
+      advance_radiation_step_fld_1d(state, cfg, planck, mat, dt, drive_time_s);
       return;
     }
     advance_radiation_step_fld_2d_rz(state, cfg, planck, mat, dt, part, bufs);
@@ -4060,7 +4062,7 @@ void IMC::transport_step(core::State& state,
   }
   if (cfg.radiation.mode == core::RadiationMode::SnTransport) {
     if (state.mesh.dim == 1) {
-      advance_radiation_step_sn_1d(state, cfg, planck, mat, dt);
+      advance_radiation_step_sn_1d(state, cfg, planck, mat, dt, drive_time_s);
       return;
     }
     advance_radiation_step_sn_2d_rz(state, cfg, planck, mat, dt, part,

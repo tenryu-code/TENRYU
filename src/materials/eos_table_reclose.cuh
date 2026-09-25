@@ -189,7 +189,8 @@ TENRYU_HOST_DEVICE inline double reclose_temperature_from_energy(
     const ColdInverseResult inv = cold_inverse_Te(
         table.cold, rho, e, T_min, T_max, 0.0,
         [&](const double T) { return reclose_energy_base<SeparateProducts>(table, rho, T); },
-        [&](const double T) { return reclose_cv_base<SeparateProducts>(table, rho, T); });
+        [&](const double T) { return reclose_cv_base<SeparateProducts>(table, rho, T); },
+        table.log_T_grid, table.n_T);
     return inv.T;
   }
   const double e_min = reclose_energy<SeparateProducts>(table, rho, T_min);

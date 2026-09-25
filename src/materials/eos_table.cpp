@@ -292,7 +292,8 @@ double EOSTable::temperature_from_energy(const double rho, const double e) const
         cv_view, rho, e, T_grid_eV.front(), T_grid_eV.back(),
         std::numeric_limits<double>::quiet_NaN(),
         [&](const double T) { return bilinear_log_interp(*this, e_table, rho, T); },
-        [&](const double T) { return bilinear_log_interp(*this, cv_table, rho, T); });
+        [&](const double T) { return bilinear_log_interp(*this, cv_table, rho, T); },
+        log_T_grid.data(), static_cast<int>(log_T_grid.size()));
     return inv.T;
   }
 

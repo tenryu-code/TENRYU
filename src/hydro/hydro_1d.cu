@@ -1,6 +1,7 @@
 #include "hydro/hydro_1d.hpp"
 #include "hydro/braginskii_viscosity.cuh"
 #include "hydro/hydro_1d_bodies.cuh"
+#include "core/thermal_subcycle.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -13,6 +14,7 @@
 #include <initializer_list>
 #include <sstream>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <atomic>
 #include <vector>
@@ -23,12 +25,16 @@
 #include <cuda_runtime.h>
 
 #include "core/constants.hpp"
+#include "core/device_pack.hpp"
 #include "core/device_scratch.hpp"
+#include "core/deterministic_sum.hpp"
 #include "core/error.hpp"
 #include "core/fancy_iterators.cuh"
 #include "core/kernel_guard.hpp"
+#include "core/launch_shape.hpp"
 #include "core/namelist/errors.hpp"
 #include "diagnostics/diagnostics.hpp"
+#include "diagnostics/energy_budget.hpp"
 #include "hydro/adaptive_av_gate.hpp"
 #include "hydro/artificial_viscosity.hpp"
 #include "hydro/boundary.hpp"
@@ -36,11 +42,13 @@
 #include "hydro/shock_tracker.hpp"
 #include "materials/eos_device.cuh"
 #include "materials/eos_device_table.cuh"
+#include "materials/eos_device_table_warp.cuh"
 #include "materials/eos_cell_table_selector.cuh"
 #include "materials/cold_equilibrium.hpp"
 #include "materials/eos_rho_e_device.cuh"
 #include "materials/helmholtz_jet_device.cuh"
 #include "materials/helmholtz_spline_device.cuh"
+#include "materials/material_closure.hpp"
 #include "materials/mie_gruneisen_device.cuh"
 #include "parallel/comm_buffers.hpp"
 #include "parallel/halo_exchange.hpp"
@@ -101,8 +109,101 @@ inline void sync_kernel(const char* message) {
   }
 }
 
+// A step scratch field of n elements that the next kernel writes over the
+// launch window w: without the zero fill when w covers the whole field (every
+// element is then written before it is read; one cudaMemset less), else with
+// it, so that the elements outside the window keep reading 0.
+template <typename Tag>
+void reset_step_scratch(core::ScratchField1D<Tag>& field,
+                        const char* tag,
+                        const int n,
+                        const core::State::LaunchWindow& w) {
+  if (w.begin <= 0 && w.end >= n) {
+    field.reset_for_overwrite(tag, static_cast<std::size_t>(n));
+  } else {
+    field.reset(tag, static_cast<std::size_t>(n));
+  }
+}
+
+// TENRYU_HYDRO1D_SEQUENTIAL_CLOSURE=1 (read at every call): the one-thread-
+// per-cell 2T closure and sound-speed kernels, the reference of the two-warp
+// kernels (enforce_2t_closure_split_kernel, compute_sound_speed_2t_split_kernel),
+// which take the same decisions and agree with them to rounding.
+bool sequential_closure_kernels() {
+  const char* v = std::getenv("TENRYU_HYDRO1D_SEQUENTIAL_CLOSURE");
+  return v != nullptr && v[0] != '\0' && v[0] != '0';
+}
+
 inline double checkerboard_filter_beta_from_odd_even_c(const double C_oe) {
   return kCheckerboardFilterBeta * std::min(std::max(C_oe, 0.0), 1.0);
+}
+
+// Per-material hydro surrogate views (HydroEOSContext d_rho_e_views ...
+// d_mie_gruneisen_views, indexed by the material slot), for the per-cell
+// backend selection of the 1D closure and sound-speed kernels.
+struct CellHydroSurrogates {
+  const tenryu::materials::EOSRhoEDeviceView* rho_e = nullptr;
+  const tenryu::materials::HelmholtzSplineDeviceView* spline = nullptr;
+  const tenryu::materials::HelmholtzJetDeviceView* jet = nullptr;
+  const tenryu::materials::MieGruneisenDeviceView* mie_gruneisen = nullptr;
+};
+
+// Hydro backend of one cell in the per-cell closure: the kind of the cell's
+// material (the run-level choice when the parameters are uniform), its
+// surrogate views and cv_e_override.
+struct CellHydroBackend {
+  tenryu::materials::EOSRhoEDeviceView rho_e;
+  tenryu::materials::HelmholtzSplineDeviceView spline;
+  tenryu::materials::HelmholtzJetDeviceView jet;
+  tenryu::materials::MieGruneisenDeviceView mie_gruneisen;
+  double cv_e_override;
+  int exact_override_kind;
+  bool use_helmholtz;
+  bool use_helmholtz_jet;
+  bool use_rho_e_table;
+  bool use_mie_gruneisen;
+  bool use_exact_ideal_gas;
+};
+
+__device__ inline CellHydroBackend resolve_cell_hydro_backend(
+    const int i,
+    const tenryu::materials::CellEOSTableSelector& cell_tables,
+    const CellHydroSurrogates& surrogates,
+    const tenryu::materials::EOSRhoEDeviceView& rho_e,
+    const tenryu::materials::HelmholtzSplineDeviceView& spline,
+    const tenryu::materials::HelmholtzJetDeviceView& jet,
+    const tenryu::materials::MieGruneisenDeviceView& mie_gruneisen,
+    const double cv_e_override,
+    const int exact_override_kind,
+    const bool use_helmholtz,
+    const bool use_helmholtz_jet,
+    const bool use_rho_e_table,
+    const bool use_mie_gruneisen,
+    const bool use_exact_ideal_gas) {
+  CellHydroBackend b{rho_e, spline, jet, mie_gruneisen, cv_e_override, exact_override_kind,
+                     use_helmholtz, use_helmholtz_jet, use_rho_e_table, use_mie_gruneisen,
+                     use_exact_ideal_gas};
+  const int m = cell_tables.material_of(i);
+  if (m >= 0 && surrogates.spline != nullptr) {
+    b.rho_e = surrogates.rho_e[m];
+    b.spline = surrogates.spline[m];
+    b.jet = surrogates.jet[m];
+    b.mie_gruneisen = surrogates.mie_gruneisen[m];
+  }
+  const tenryu::materials::MaterialClosureParams* p = cell_tables.closure_of(i);
+  if (p != nullptr) {
+    const std::uint8_t kind = p->hydro_backend_kind;
+    b.cv_e_override = p->cv_e_override;
+    b.use_helmholtz = kind == tenryu::materials::kHydroBackendHelmholtzSpline;
+    b.use_helmholtz_jet = kind == tenryu::materials::kHydroBackendHelmholtzJet;
+    b.use_exact_ideal_gas = kind == tenryu::materials::kHydroBackendExactIdealGas;
+    b.use_rho_e_table = kind == tenryu::materials::kHydroBackendRhoETable;
+    b.use_mie_gruneisen = kind == tenryu::materials::kHydroBackendMieGruneisen;
+    if (b.use_exact_ideal_gas || b.use_mie_gruneisen) {
+      b.exact_override_kind = kExactOverrideNone;
+    }
+  }
+  return b;
 }
 
 struct HydroTableViews {
@@ -119,6 +220,24 @@ struct HydroTableViews {
   tenryu::materials::CellEOSTableSelector cell_tables{};
   std::uint8_t hydro_backend_kind = 0u;
   bool supports_rho_e_reclosure = false;
+  // Per-material hydro surrogate views (HydroEOSContext::
+  // surrogates_per_material; null otherwise).
+  CellHydroSurrogates surrogates{};
+  // The closure and sound-speed kernels resolve the backend kind, the
+  // surrogate views and cv_e_override per cell (their per-cell
+  // instantiation): some material's closure parameters differ from the
+  // others' (cell_tables.closure_params) or the materials carry their own
+  // surrogates. Uniform decks keep the run-level arguments (2026-09-24).
+  bool per_cell_closure = false;
+  // Some non-void material takes the exact override diagnostics (per-cell
+  // runs; HydroEOSContext::any_nonvoid_overridable).
+  bool any_nonvoid_overridable = false;
+  // Some material has EOS tables (HydroEOSContext::any_table). Every cell
+  // closes with its own material's tables, so the run-level table decisions
+  // (hydro_has_table_eos_backend_data) take any material, not material 0
+  // alone (2026-09-23; a deck listing an ideal gas or a void first ran its
+  // tabled cells as an ideal-gas run).
+  bool any_material_table = false;
 };
 
 inline bool use_helmholtz_spline_backend(const HydroTableViews& views) {
@@ -151,10 +270,23 @@ inline HydroTableViews select_hydro_table_views(const HydroEOSContext* eos_ctx) 
   views.tab_total = eos_ctx->total_view(0);
   views.tab_total_rho_e = eos_ctx->total_rho_e_view(0);
   views.hydro_backend_kind = eos_ctx->material_hydro_backend_kind(0);
-  views.supports_rho_e_reclosure = eos_ctx->material_supports_rho_e_reclosure(0);
+  views.any_material_table = eos_ctx->any_table;
   views.cell_tables = tenryu::materials::make_cell_eos_table_selector(
       eos_ctx->d_ion_views, eos_ctx->d_electron_views, eos_ctx->d_total_views,
       eos_ctx->n_materials, nullptr);
+  views.cell_tables.closure_params = eos_ctx->d_closure_params;
+  if (eos_ctx->surrogates_per_material) {
+    views.surrogates.rho_e = eos_ctx->d_rho_e_views;
+    views.surrogates.spline = eos_ctx->d_spline_views;
+    views.surrogates.jet = eos_ctx->d_jet_views;
+    views.surrogates.mie_gruneisen = eos_ctx->d_mie_gruneisen_views;
+  }
+  views.per_cell_closure =
+      eos_ctx->d_closure_params != nullptr || eos_ctx->surrogates_per_material;
+  views.any_nonvoid_overridable = eos_ctx->any_nonvoid_overridable;
+  // Compatible energy needs the rho-e inverse re-closure in every non-void
+  // material (it used to check the first material alone).
+  views.supports_rho_e_reclosure = eos_ctx->all_nonvoid_support_rho_e_reclosure;
   if (views.hydro_backend_kind == 1u) {
     views.spline_total = eos_ctx->total_helmholtz_view(0);
   } else if (views.hydro_backend_kind == 2u) {
@@ -178,7 +310,8 @@ inline tenryu::materials::CellEOSTableSelector cell_table_selector(
 }
 
 inline bool hydro_has_table_eos_backend_data(const HydroTableViews& views) {
-  return views.tab_total.n_rho > 0 || views.tab_ion.n_rho > 0 || views.tab_ele.n_rho > 0 ||
+  return views.any_material_table || views.tab_total.n_rho > 0 || views.tab_ion.n_rho > 0 ||
+         views.tab_ele.n_rho > 0 ||
          views.tab_total_rho_e.n_rho > 0 || views.spline_total.n_rho > 0 ||
          views.jet_total.n_rho > 0 || views.mie_gruneisen.n_rho > 0;
 }
@@ -208,9 +341,13 @@ void validate_compatible_energy_eos_support(const core::Config& cfg,
   }
   TENRYU_ASSERT(!cfg.materials.materials.empty(),
                 "Hydro1D requires at least one material");
-  const auto& hydro_mat = cfg.materials.materials.front();
-  const bool requires_uploaded_table =
-      hydro_mat.eos_model == "tmat" && hydro_mat.hydro_eos_backend == "legacy";
+  bool requires_uploaded_table = false;
+  for (const auto& hydro_mat : cfg.materials.materials) {
+    requires_uploaded_table =
+        requires_uploaded_table ||
+        (!hydro_mat.is_void && hydro_mat.eos_model == "tmat" &&
+         hydro_mat.hydro_eos_backend == "legacy");
+  }
   if (requires_uploaded_table && !hydro_has_table_eos_backend_data(views)) {
     throw core::namelist::ConfigError(
         "Numerics.hydro.compatible_energy=True with TMAT legacy EOS requires an "
@@ -226,8 +363,14 @@ void validate_compatible_energy_eos_support(const core::Config& cfg,
 }
 
 inline int select_exact_override_kind(const core::Config& cfg, const HydroTableViews& views) {
-  if (use_exact_ideal_gas_backend(views) || use_mie_gruneisen_backend(views) ||
-      !hydro_has_table_eos_backend_data(views)) {
+  // Per-cell closures: the exact/Mie-Gruneisen cells drop the override in the
+  // kernels (resolve_cell_hydro_backend); the run takes it when some
+  // material can.
+  const bool no_overridable_material =
+      views.per_cell_closure
+          ? !views.any_nonvoid_overridable
+          : (use_exact_ideal_gas_backend(views) || use_mie_gruneisen_backend(views));
+  if (no_overridable_material || !hydro_has_table_eos_backend_data(views)) {
     return kExactOverrideNone;
   }
   const std::string& exact_override = cfg.numerics.hydro.exact_override;
@@ -468,6 +611,7 @@ __global__ void apply_pressure_tension_cutoff_kernel(double* __restrict__ Pe,
   persistent_1d::apply_pressure_tension_cutoff_body(i, Pe, Pi, p_min);
 }
 
+template <bool kPerCell>
 __global__ void enforce_1t_closure_kernel(double* __restrict__ ee,
                                           double* __restrict__ ei,
                                           double* __restrict__ Te,
@@ -484,32 +628,59 @@ __global__ void enforce_1t_closure_kernel(double* __restrict__ ee,
                                           const double* __restrict__ gamma_eff,
                                           const double* __restrict__ A_eff,
                                           const double fallback_z,
-                                          const double cv_e_override,
+                                          const double cv_e_override_run,
                                           const double te_floor,
                                           const tenryu::materials::DeviceEOSTableView tab_total_first,
                                           const tenryu::materials::CellEOSTableSelector cell_tables,
+                                          const CellHydroSurrogates surrogates,
                                           const tenryu::materials::EOSRhoEDeviceView
-                                              tab_total_rho_e,
+                                              tab_total_rho_e_run,
                                           const tenryu::materials::HelmholtzSplineDeviceView
-                                              spline_total,
+                                              spline_total_run,
                                           const tenryu::materials::HelmholtzJetDeviceView
-                                              jet_total,
-                                          const bool use_helmholtz,
-                                          const bool use_helmholtz_jet,
-                                          const bool use_rho_e_table,
-                                          const bool use_exact_ideal_gas,
+                                              jet_total_run,
+                                          const bool use_helmholtz_run,
+                                          const bool use_helmholtz_jet_run,
+                                          const bool use_rho_e_table_run,
+                                          const bool use_exact_ideal_gas_run,
                                           const bool eos_writeback,
                                           const bool preserve_table_energy,
                                           const bool energy_authoritative,
                                           int* __restrict__ inverse_clamp_count,
                                           int* __restrict__ inverse_failure_count,
-                                          const int exact_override_kind,
+                                          const int exact_override_kind_run,
                                           double* __restrict__ cv_e_out,
                                           double* __restrict__ cv_i_out) {
   const int i = c_begin + blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= c_end) {
     return;
   }
+
+  // Backend of this cell: the run-level choice, or in the per-cell
+  // instantiation the cell's material's kind, surrogates and cv_e_override
+  // (resolve_cell_hydro_backend, 2026-09-24).
+  CellHydroBackend be;
+  if constexpr (kPerCell) {
+    be = resolve_cell_hydro_backend(
+        i, cell_tables, surrogates, tab_total_rho_e_run, spline_total_run, jet_total_run,
+        tenryu::materials::MieGruneisenDeviceView{}, cv_e_override_run,
+        exact_override_kind_run, use_helmholtz_run, use_helmholtz_jet_run,
+        use_rho_e_table_run, false, use_exact_ideal_gas_run);
+  } else {
+    be = CellHydroBackend{tab_total_rho_e_run, spline_total_run, jet_total_run,
+                          tenryu::materials::MieGruneisenDeviceView{}, cv_e_override_run,
+                          exact_override_kind_run, use_helmholtz_run, use_helmholtz_jet_run,
+                          use_rho_e_table_run, false, use_exact_ideal_gas_run};
+  }
+  const tenryu::materials::EOSRhoEDeviceView& tab_total_rho_e = be.rho_e;
+  const tenryu::materials::HelmholtzSplineDeviceView& spline_total = be.spline;
+  const tenryu::materials::HelmholtzJetDeviceView& jet_total = be.jet;
+  const bool use_helmholtz = be.use_helmholtz;
+  const bool use_helmholtz_jet = be.use_helmholtz_jet;
+  const bool use_rho_e_table = be.use_rho_e_table;
+  const bool use_exact_ideal_gas = be.use_exact_ideal_gas;
+  const int exact_override_kind = be.exact_override_kind;
+  const double cv_e_override = be.cv_e_override;
 
   // Per-cell dominant-material table (multi-material closure, 2026-09-14).
   const tenryu::materials::DeviceEOSTableView tab_total = cell_tables.total(i, tab_total_first);
@@ -702,6 +873,7 @@ __global__ void enforce_1t_closure_kernel(double* __restrict__ ee,
                           &Te[i], &Ti[i], &Pe[i], &Pi[i]);
 }
 
+template <bool kPerCell>
 __global__ void enforce_2t_closure_kernel(double* __restrict__ ee,
                                           double* __restrict__ ei,
                                           double* __restrict__ Te,
@@ -718,31 +890,32 @@ __global__ void enforce_2t_closure_kernel(double* __restrict__ ee,
                                           const double* __restrict__ gamma_eff,
                                           const double* __restrict__ A_eff,
                                           const double fallback_z,
-                                          const double cv_e_override,
+                                          const double cv_e_override_run,
                                           const double te_floor,
                                           const double ti_floor,
                                           const tenryu::materials::DeviceEOSTableView tab_ion_first,
                                           const tenryu::materials::DeviceEOSTableView tab_ele_first,
                                           const tenryu::materials::CellEOSTableSelector cell_tables,
+                                          const CellHydroSurrogates surrogates,
                                           const tenryu::materials::EOSRhoEDeviceView
-                                              tab_total_rho_e,
+                                              tab_total_rho_e_run,
                                           const tenryu::materials::HelmholtzSplineDeviceView
-                                              spline_total,
+                                              spline_total_run,
                                           const tenryu::materials::HelmholtzJetDeviceView
-                                              jet_total,
+                                              jet_total_run,
                                           const tenryu::materials::MieGruneisenDeviceView
-                                              mie_gruneisen,
-                                          const bool use_helmholtz,
-                                          const bool use_helmholtz_jet,
-                                          const bool use_rho_e_table,
-                                          const bool use_mie_gruneisen,
-                                          const bool use_exact_ideal_gas,
+                                              mie_gruneisen_run,
+                                          const bool use_helmholtz_run,
+                                          const bool use_helmholtz_jet_run,
+                                          const bool use_rho_e_table_run,
+                                          const bool use_mie_gruneisen_run,
+                                          const bool use_exact_ideal_gas_run,
                                           const bool eos_writeback,
                                           const bool preserve_table_energy,
                                           const bool energy_authoritative,
                                           int* __restrict__ inverse_clamp_count,
                                           int* __restrict__ inverse_failure_count,
-                                          const int exact_override_kind,
+                                          const int exact_override_kind_run,
                                           double* __restrict__ cv_e_out,
                                           double* __restrict__ cv_i_out,
                                           double* __restrict__ e_cold_out) {
@@ -751,24 +924,42 @@ __global__ void enforce_2t_closure_kernel(double* __restrict__ ee,
     return;
   }
 
+  // Backend of this cell: the run-level choice, or in the per-cell
+  // instantiation the cell's material's kind, surrogates and cv_e_override
+  // (resolve_cell_hydro_backend, 2026-09-24).
+  CellHydroBackend be;
+  if constexpr (kPerCell) {
+    be = resolve_cell_hydro_backend(
+        i, cell_tables, surrogates, tab_total_rho_e_run, spline_total_run, jet_total_run,
+        mie_gruneisen_run, cv_e_override_run, exact_override_kind_run, use_helmholtz_run,
+        use_helmholtz_jet_run, use_rho_e_table_run, use_mie_gruneisen_run,
+        use_exact_ideal_gas_run);
+  } else {
+    be = CellHydroBackend{tab_total_rho_e_run, spline_total_run, jet_total_run,
+                          mie_gruneisen_run, cv_e_override_run, exact_override_kind_run,
+                          use_helmholtz_run, use_helmholtz_jet_run, use_rho_e_table_run,
+                          use_mie_gruneisen_run, use_exact_ideal_gas_run};
+  }
+
   // Per-cell dominant-material tables (multi-material closure, 2026-09-14).
   const tenryu::materials::DeviceEOSTableView tab_ion = cell_tables.ion(i, tab_ion_first);
   const tenryu::materials::DeviceEOSTableView tab_ele = cell_tables.electron(i, tab_ele_first);
   persistent_1d::enforce_2t_closure_kernel_body(
       i, ee, ei, Te, Ti, Pe, Pi, rho, zbar, n_cells, gamma_eff, A_eff,
-      fallback_z, cv_e_override, te_floor, ti_floor, tab_ion, tab_ele,
-      tab_total_rho_e, spline_total, jet_total, mie_gruneisen, use_helmholtz,
-      use_helmholtz_jet, use_rho_e_table, use_mie_gruneisen, use_exact_ideal_gas,
+      fallback_z, be.cv_e_override, te_floor, ti_floor, tab_ion, tab_ele,
+      be.rho_e, be.spline, be.jet, be.mie_gruneisen, be.use_helmholtz,
+      be.use_helmholtz_jet, be.use_rho_e_table, be.use_mie_gruneisen, be.use_exact_ideal_gas,
       eos_writeback, preserve_table_energy, energy_authoritative,
       (i >= own_begin && i < own_end) ? inverse_clamp_count : nullptr,
       (i >= own_begin && i < own_end) ? inverse_failure_count : nullptr,
-      exact_override_kind, cv_e_out, cv_i_out);
+      be.exact_override_kind, cv_e_out, cv_i_out);
   if (e_cold_out != nullptr) {
     e_cold_out[i] =
         tenryu::materials::cold_reference(tab_ele.cold, fmax(rho[i], 1.0e-30)).C;
   }
 }
 
+template <bool kPerCell>
 __global__ void compute_sound_speed_1t_kernel(double* __restrict__ cs,
                                               const double* __restrict__ ee,
                                               const double* __restrict__ Te,
@@ -777,26 +968,51 @@ __global__ void compute_sound_speed_1t_kernel(double* __restrict__ cs,
                                               const double* __restrict__ Pi,
                                               const tenryu::materials::DeviceEOSTableView tab_total_first,
                                               const tenryu::materials::CellEOSTableSelector cell_tables,
+                                              const CellHydroSurrogates surrogates,
                                               const tenryu::materials::EOSRhoEDeviceView
-                                                  tab_total_rho_e,
+                                                  tab_total_rho_e_run,
                                               const tenryu::materials::HelmholtzSplineDeviceView
-                                                  spline_total,
+                                                  spline_total_run,
                                               const tenryu::materials::HelmholtzJetDeviceView
-                                                  jet_total,
+                                                  jet_total_run,
                                               const double* __restrict__ cv_arr,
                                               const int c_begin,
                                               const int c_end,
                                               const int n_cells,
-                                              const bool use_helmholtz,
-                                              const bool use_helmholtz_jet,
-                                              const bool use_rho_e_table,
-                                              const bool use_exact_ideal_gas,
-                                              const int exact_override_kind,
-                                              const double* __restrict__ gamma_eff) {
+                                              const bool use_helmholtz_run,
+                                              const bool use_helmholtz_jet_run,
+                                              const bool use_rho_e_table_run,
+                                              const bool use_exact_ideal_gas_run,
+                                              const int exact_override_kind_run,
+                                              const double* __restrict__ gamma_eff,
+                                              const bool high_t_tail) {
   const int i = c_begin + blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= c_end) {
     return;
   }
+
+  // Backend of this cell (resolve_cell_hydro_backend; per-cell instantiation).
+  CellHydroBackend be;
+  if constexpr (kPerCell) {
+    be = resolve_cell_hydro_backend(
+        i, cell_tables, surrogates, tab_total_rho_e_run, spline_total_run, jet_total_run,
+        tenryu::materials::MieGruneisenDeviceView{}, 0.0, exact_override_kind_run,
+        use_helmholtz_run, use_helmholtz_jet_run, use_rho_e_table_run, false,
+        use_exact_ideal_gas_run);
+  } else {
+    be = CellHydroBackend{tab_total_rho_e_run, spline_total_run, jet_total_run,
+                          tenryu::materials::MieGruneisenDeviceView{}, 0.0,
+                          exact_override_kind_run, use_helmholtz_run, use_helmholtz_jet_run,
+                          use_rho_e_table_run, false, use_exact_ideal_gas_run};
+  }
+  const tenryu::materials::EOSRhoEDeviceView& tab_total_rho_e = be.rho_e;
+  const tenryu::materials::HelmholtzSplineDeviceView& spline_total = be.spline;
+  const tenryu::materials::HelmholtzJetDeviceView& jet_total = be.jet;
+  const bool use_helmholtz = be.use_helmholtz;
+  const bool use_helmholtz_jet = be.use_helmholtz_jet;
+  const bool use_rho_e_table = be.use_rho_e_table;
+  const bool use_exact_ideal_gas = be.use_exact_ideal_gas;
+  const int exact_override_kind = be.exact_override_kind;
 
   // Per-cell dominant-material table (multi-material closure, 2026-09-14).
   const tenryu::materials::DeviceEOSTableView tab_total = cell_tables.total(i, tab_total_first);
@@ -839,14 +1055,26 @@ __global__ void compute_sound_speed_1t_kernel(double* __restrict__ cs,
   if (tab_total.n_rho > 0) {
     const auto rb = tenryu::materials::find_rho_bracket(tab_total, rho_i);
     const double e = (tab_total.n_rho > 0) ? ee[i] : fmax(ee[i], 0.0);
-    const double T =
+    double T =
         fmax(tenryu::materials::device_eos_T_from_e_monotone(tab_total, rb, e), 1.0e-30);
+    if (high_t_tail && log(T) >= tab_total.log_T_max - 1.0e-12) {
+      // Energy-authoritative closure: an energy above the ceiling energy sits
+      // on the tail, T = T_top + (e - e_top)/cv_top (the table inverse stops
+      // at T_top).
+      const auto anchor = tenryu::materials::device_eos_high_t_tail_anchor(tab_total, rb);
+      if (anchor.valid != 0 && e > anchor.e_top) {
+        T = anchor.T_top + (e - anchor.e_top) / anchor.cv_top;
+      }
+    }
     const double logT = log(T);
     const double cv =
         (cv_arr != nullptr)
             ? fmax(cv_arr[i], 0.0)
             : fmax(tenryu::materials::device_eos_cv(tab_total, rb, logT), 0.0);
-    cs[i] = tenryu::materials::device_eos_sound_speed(tab_total, rb, logT, rho_i, cv);
+    cs[i] = high_t_tail
+                ? tenryu::materials::device_eos_sound_speed_with_high_t_tail(tab_total, rb, logT,
+                                                                            rho_i, cv)
+                : tenryu::materials::device_eos_sound_speed(tab_total, rb, logT, rho_i, cv);
     cs[i] = apply_exact_sound_speed_override(exact_override_kind, cs[i], rho_i, Pe[i], Pi[i]);
     return;
   }
@@ -856,6 +1084,7 @@ __global__ void compute_sound_speed_1t_kernel(double* __restrict__ cs,
   cs[i] = apply_exact_sound_speed_override(exact_override_kind, cs[i], rho_i, Pe[i], Pi[i]);
 }
 
+template <bool kPerCell>
 __global__ void compute_sound_speed_2t_kernel(double* __restrict__ cs,
                                               const double* __restrict__ rho,
                                               const double* __restrict__ ee,
@@ -867,29 +1096,46 @@ __global__ void compute_sound_speed_2t_kernel(double* __restrict__ cs,
                                               const tenryu::materials::DeviceEOSTableView tab_ion_first,
                                               const tenryu::materials::DeviceEOSTableView tab_ele_first,
                                               const tenryu::materials::CellEOSTableSelector cell_tables,
+                                              const CellHydroSurrogates surrogates,
                                               const tenryu::materials::EOSRhoEDeviceView
-                                                  tab_total_rho_e,
+                                                  tab_total_rho_e_run,
                                               const tenryu::materials::HelmholtzSplineDeviceView
-                                                  spline_total,
+                                                  spline_total_run,
                                               const tenryu::materials::HelmholtzJetDeviceView
-                                                  jet_total,
+                                                  jet_total_run,
                                               const tenryu::materials::MieGruneisenDeviceView
-                                                  mie_gruneisen,
+                                                  mie_gruneisen_run,
                                               const double* __restrict__ cv_i_arr,
                                               const double* __restrict__ cv_e_arr,
                                               const int c_begin,
                                               const int c_end,
                                               const int n_cells,
-                                              const bool use_helmholtz,
-                                              const bool use_helmholtz_jet,
-                                              const bool use_rho_e_table,
-                                              const bool use_mie_gruneisen,
-                                              const bool use_exact_ideal_gas,
-                                              const int exact_override_kind,
-                                              const double* __restrict__ gamma_eff) {
+                                              const bool use_helmholtz_run,
+                                              const bool use_helmholtz_jet_run,
+                                              const bool use_rho_e_table_run,
+                                              const bool use_mie_gruneisen_run,
+                                              const bool use_exact_ideal_gas_run,
+                                              const int exact_override_kind_run,
+                                              const double* __restrict__ gamma_eff,
+                                              const bool high_t_tail) {
   const int i = c_begin + blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= c_end) {
     return;
+  }
+
+  // Backend of this cell (resolve_cell_hydro_backend; per-cell instantiation).
+  CellHydroBackend be;
+  if constexpr (kPerCell) {
+    be = resolve_cell_hydro_backend(
+        i, cell_tables, surrogates, tab_total_rho_e_run, spline_total_run, jet_total_run,
+        mie_gruneisen_run, 0.0, exact_override_kind_run, use_helmholtz_run,
+        use_helmholtz_jet_run, use_rho_e_table_run, use_mie_gruneisen_run,
+        use_exact_ideal_gas_run);
+  } else {
+    be = CellHydroBackend{tab_total_rho_e_run, spline_total_run, jet_total_run,
+                          mie_gruneisen_run, 0.0, exact_override_kind_run, use_helmholtz_run,
+                          use_helmholtz_jet_run, use_rho_e_table_run, use_mie_gruneisen_run,
+                          use_exact_ideal_gas_run};
   }
 
   // Per-cell dominant-material tables (multi-material closure, 2026-09-14).
@@ -897,34 +1143,424 @@ __global__ void compute_sound_speed_2t_kernel(double* __restrict__ cs,
   const tenryu::materials::DeviceEOSTableView tab_ele = cell_tables.electron(i, tab_ele_first);
   persistent_1d::compute_sound_speed_2t_kernel_body(
       i, cs, rho, ee, ei, Pe, Pi, Te, Ti, tab_ion, tab_ele,
-      tab_total_rho_e, spline_total, jet_total, mie_gruneisen, cv_i_arr,
-      cv_e_arr, n_cells, use_helmholtz, use_helmholtz_jet, use_rho_e_table,
-      use_mie_gruneisen, use_exact_ideal_gas, exact_override_kind, gamma_eff);
+      be.rho_e, be.spline, be.jet, be.mie_gruneisen, cv_i_arr,
+      cv_e_arr, n_cells, be.use_helmholtz, be.use_helmholtz_jet, be.use_rho_e_table,
+      be.use_mie_gruneisen, be.use_exact_ideal_gas, be.exact_override_kind, gamma_eff,
+      high_t_tail);
 }
 
-__global__ void compute_node_activity_kernel(std::uint8_t* __restrict__ node_active,
-                                             const std::int8_t* __restrict__ hydro_active,
-                                             const int c_begin,
-                                             const int c_end,
-                                             const int n_cells,
-                                             const int rigid_inactive) {
-  const int i = c_begin + blockIdx.x * blockDim.x + threadIdx.x;
+// The table branch of persistent_1d::enforce_2t_closure_kernel_body after its
+// two inversions, which the caller gives (inv_i, inv_e): the same statements
+// in the same order, for enforce_2t_closure_split_kernel.
+__device__ inline void enforce_2t_closure_table_finish(
+    const int i,
+    double* __restrict__ ee,
+    double* __restrict__ ei,
+    double* __restrict__ Te,
+    double* __restrict__ Ti,
+    double* __restrict__ Pe,
+    double* __restrict__ Pi,
+    const double* __restrict__ rho,
+    const double rho_i,
+    const double A,
+    const double fallback_z,
+    const double te_floor,
+    const double ti_floor,
+    const tenryu::materials::EOSRhoEDeviceView tab_total_rho_e,
+    const tenryu::materials::HelmholtzSplineDeviceView spline_total,
+    const tenryu::materials::HelmholtzJetDeviceView jet_total,
+    const bool use_helmholtz,
+    const bool use_helmholtz_jet,
+    const bool use_rho_e_table,
+    const bool energy_authoritative,
+    const bool allow_table_energy_writeback,
+    const bool repair_i,
+    const bool repair_e,
+    const tenryu::materials::DeviceEOSInverseRecloseResult& inv_i,
+    const tenryu::materials::DeviceEOSInverseRecloseResult& inv_e,
+    int* __restrict__ inverse_clamp_count,
+    int* __restrict__ inverse_failure_count,
+    const int exact_override_kind,
+    double* __restrict__ cv_e_out,
+    double* __restrict__ cv_i_out) {
+  using persistent_1d::apply_exact_override_2t;
+  using persistent_1d::record_inverse_reclose_status;
+  record_inverse_reclose_status(inv_i, inverse_clamp_count, inverse_failure_count);
+  record_inverse_reclose_status(inv_e, inverse_clamp_count, inverse_failure_count);
+  const bool clamp_veto_i = energy_authoritative && !repair_i &&
+      inv_i.bracket_failure == 0 &&
+      (inv_i.lower_clamp != 0 || inv_i.upper_clamp != 0 || inv_i.floor_clamp != 0);
+  const bool clamp_veto_e = energy_authoritative && !repair_e &&
+      inv_e.bracket_failure == 0 &&
+      (inv_e.lower_clamp != 0 || inv_e.upper_clamp != 0 || inv_e.floor_clamp != 0);
+  if (!clamp_veto_i &&
+      (allow_table_energy_writeback || repair_i ||
+       inv_i.bracket_failure != 0 || inv_i.lower_clamp != 0 ||
+       inv_i.upper_clamp != 0)) {
+    ei[i] = inv_i.energy;
+  }
+  if (!clamp_veto_e &&
+      (allow_table_energy_writeback || repair_e ||
+       inv_e.bracket_failure != 0 || inv_e.lower_clamp != 0 ||
+       inv_e.upper_clamp != 0)) {
+    ee[i] = inv_e.energy;
+  }
+  Ti[i] = inv_i.T;
+  Te[i] = inv_e.T;
+  const double pi_legacy = inv_i.pressure;
+  const double pe_legacy = inv_e.pressure;
+  if (use_helmholtz && spline_total.n_rho > 0 &&
+      rho_i >= exp(spline_total.log_rho_min)) {
+    const double e_total = ei[i] + ee[i];
+    const double T_total =
+        fmax(tenryu::materials::device_helmholtz_T_from_e(spline_total, rho_i, e_total),
+             fmax(te_floor, ti_floor));
+    const double p_total =
+        tenryu::materials::device_helmholtz_eval_thermo(spline_total,
+                                                        rho_i,
+                                                        log(fmax(T_total, 1.0e-30)))
+            .pressure;
+    const double p_legacy = pi_legacy + pe_legacy;
+    if (fabs(p_legacy) > 1.0e-30 && isfinite(p_legacy)) {
+      const double scale = p_total / p_legacy;
+      Pi[i] = scale * pi_legacy;
+      Pe[i] = scale * pe_legacy;
+    } else {
+      Pi[i] = 0.0;
+      Pe[i] = p_total;
+    }
+  } else if (use_helmholtz_jet && jet_total.n_rho > 0 &&
+             rho_i >= exp(jet_total.log_rho_min)) {
+    const double e_total = ei[i] + ee[i];
+    const double T_total =
+        fmax(tenryu::materials::device_helmholtz_jet_T_from_e(jet_total, rho_i, e_total),
+             fmax(te_floor, ti_floor));
+    const double p_total =
+        tenryu::materials::device_helmholtz_jet_eval_thermo(
+            jet_total, rho_i, log(fmax(T_total, 1.0e-30)))
+            .pressure;
+    const double p_legacy = pi_legacy + pe_legacy;
+    if (fabs(p_legacy) > 1.0e-30 && isfinite(p_legacy)) {
+      const double scale = p_total / p_legacy;
+      Pi[i] = scale * pi_legacy;
+      Pe[i] = scale * pe_legacy;
+    } else {
+      Pi[i] = 0.0;
+      Pe[i] = p_total;
+    }
+  } else if (use_rho_e_table && tab_total_rho_e.n_rho > 0 &&
+             rho_i >= tenryu::materials::eos_rho_e_rho_min(tab_total_rho_e)) {
+    const double e_total = ei[i] + ee[i];
+    const double p_total =
+        tenryu::materials::device_eos_rho_e_eval(tab_total_rho_e, rho_i, e_total).P;
+    const double p_legacy = pi_legacy + pe_legacy;
+    if (isfinite(p_total) && fabs(p_legacy) > 1.0e-30 && isfinite(p_legacy)) {
+      const double scale = p_total / p_legacy;
+      Pi[i] = scale * pi_legacy;
+      Pe[i] = scale * pe_legacy;
+    } else if (isfinite(p_total)) {
+      Pi[i] = 0.0;
+      Pe[i] = p_total;
+    } else {
+      Pi[i] = pi_legacy;
+      Pe[i] = pe_legacy;
+    }
+  } else {
+    Pi[i] = pi_legacy;
+    Pe[i] = pe_legacy;
+  }
+  if (cv_i_out != nullptr) {
+    cv_i_out[i] = inv_i.cv;
+  }
+  if (cv_e_out != nullptr) {
+    cv_e_out[i] = inv_e.cv;
+  }
+  apply_exact_override_2t(exact_override_kind, rho[i], A, fallback_z, te_floor, ti_floor,
+                          ee[i], ei[i], &Te[i], &Ti[i], &Pe[i], &Pi[i]);
+}
+
+// enforce_2t_closure_kernel with each cell on one block of two warps: when the
+// cell closes on its ion and electron tables, warp 0 inverts the ion table and
+// warp 1 the electron table at the same time (device_inverse_reclose_warp:
+// the bisections on the warp), and thread 0 finishes the cell with the
+// sequential statements
+// (enforce_2t_closure_table_finish). Other cells (ideal gas, Mie-Gruneisen, no
+// table) run the sequential body on thread 0. The same operations as
+// enforce_2t_closure_kernel: the same decisions, results equal to rounding
+// (the compiler contracts some multiply-adds differently in the two kernels:
+// the corrected electron pressure of cold cells within 1.2e-14 relative;
+// tests/hydro/test_hydro_1d_step.cu, "[closure]"). One thread per cell spent
+// the kernel's time in the two table inversions one after the other (NIF DS,
+// 360 cells: about 100k of the 111k cycles per thread).
+constexpr int kClosureSplitThreads = 64;
+
+template <bool kPerCell>
+__global__ __launch_bounds__(kClosureSplitThreads) void enforce_2t_closure_split_kernel(
+    double* __restrict__ ee,
+    double* __restrict__ ei,
+    double* __restrict__ Te,
+    double* __restrict__ Ti,
+    double* __restrict__ Pe,
+    double* __restrict__ Pi,
+    const double* __restrict__ rho,
+    const double* __restrict__ zbar,
+    const int c_begin,
+    const int c_end,
+    const int own_begin,
+    const int own_end,
+    const int n_cells,
+    const double* __restrict__ gamma_eff,
+    const double* __restrict__ A_eff,
+    const double fallback_z,
+    const double cv_e_override_run,
+    const double te_floor,
+    const double ti_floor,
+    const tenryu::materials::DeviceEOSTableView tab_ion_first,
+    const tenryu::materials::DeviceEOSTableView tab_ele_first,
+    const tenryu::materials::CellEOSTableSelector cell_tables,
+    const CellHydroSurrogates surrogates,
+    const tenryu::materials::EOSRhoEDeviceView tab_total_rho_e_run,
+    const tenryu::materials::HelmholtzSplineDeviceView spline_total_run,
+    const tenryu::materials::HelmholtzJetDeviceView jet_total_run,
+    const tenryu::materials::MieGruneisenDeviceView mie_gruneisen_run,
+    const bool use_helmholtz_run,
+    const bool use_helmholtz_jet_run,
+    const bool use_rho_e_table_run,
+    const bool use_mie_gruneisen_run,
+    const bool use_exact_ideal_gas_run,
+    const bool eos_writeback,
+    const bool preserve_table_energy,
+    const bool energy_authoritative,
+    int* __restrict__ inverse_clamp_count,
+    int* __restrict__ inverse_failure_count,
+    const int exact_override_kind_run,
+    double* __restrict__ cv_e_out,
+    double* __restrict__ cv_i_out,
+    double* __restrict__ e_cold_out) {
+  const int i = c_begin + static_cast<int>(blockIdx.x);
   if (i >= c_end) {
     return;
   }
+  const int warp = static_cast<int>(threadIdx.x) >> 5;
+  const int lane = static_cast<int>(threadIdx.x) & 31;
+  __shared__ tenryu::materials::DeviceEOSInverseRecloseResult sh_inv_e;
 
-  persistent_1d::compute_node_activity_kernel_body(
-      i, node_active, hydro_active, n_cells, rigid_inactive);
-}
-
-__global__ void zero_center_node_kernel(std::uint8_t* __restrict__ node_active,
-                                        const int n_nodes) {
-  const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i != 0 || n_nodes <= 0) {
+  CellHydroBackend be;
+  if constexpr (kPerCell) {
+    be = resolve_cell_hydro_backend(
+        i, cell_tables, surrogates, tab_total_rho_e_run, spline_total_run, jet_total_run,
+        mie_gruneisen_run, cv_e_override_run, exact_override_kind_run, use_helmholtz_run,
+        use_helmholtz_jet_run, use_rho_e_table_run, use_mie_gruneisen_run,
+        use_exact_ideal_gas_run);
+  } else {
+    be = CellHydroBackend{tab_total_rho_e_run, spline_total_run, jet_total_run,
+                          mie_gruneisen_run, cv_e_override_run, exact_override_kind_run,
+                          use_helmholtz_run, use_helmholtz_jet_run, use_rho_e_table_run,
+                          use_mie_gruneisen_run, use_exact_ideal_gas_run};
+  }
+  const tenryu::materials::DeviceEOSTableView tab_ion = cell_tables.ion(i, tab_ion_first);
+  const tenryu::materials::DeviceEOSTableView tab_ele = cell_tables.electron(i, tab_ele_first);
+  int* const clamp_count = (i >= own_begin && i < own_end) ? inverse_clamp_count : nullptr;
+  int* const failure_count = (i >= own_begin && i < own_end) ? inverse_failure_count : nullptr;
+  // The branch order of enforce_2t_closure_kernel_body: exact ideal gas, then
+  // Mie-Gruneisen, then the two tables.
+  const bool table_branch = !be.use_exact_ideal_gas &&
+                            !(be.use_mie_gruneisen && be.mie_gruneisen.n_rho > 0) &&
+                            tab_ion.n_rho > 0 && tab_ele.n_rho > 0;
+  if (!table_branch) {
+    if (threadIdx.x == 0) {
+      persistent_1d::enforce_2t_closure_kernel_body(
+          i, ee, ei, Te, Ti, Pe, Pi, rho, zbar, n_cells, gamma_eff, A_eff, fallback_z,
+          be.cv_e_override, te_floor, ti_floor, tab_ion, tab_ele, be.rho_e, be.spline, be.jet,
+          be.mie_gruneisen, be.use_helmholtz, be.use_helmholtz_jet, be.use_rho_e_table,
+          be.use_mie_gruneisen, be.use_exact_ideal_gas, eos_writeback, preserve_table_energy,
+          energy_authoritative, clamp_count, failure_count, be.exact_override_kind, cv_e_out,
+          cv_i_out);
+      if (e_cold_out != nullptr) {
+        e_cold_out[i] =
+            tenryu::materials::cold_reference(tab_ele.cold, fmax(rho[i], 1.0e-30)).C;
+      }
+    }
     return;
   }
 
-  persistent_1d::zero_center_node_kernel_body(i, node_active, n_nodes);
+  const double rho_i = fmax(rho[i], 1.0e-30);
+  const double e_i_raw = ei[i];
+  const double e_e_raw = ee[i];
+  tenryu::materials::DeviceEOSInverseRecloseResult inv_i{};
+  if (warp == 0) {
+    const double e_i = persistent_1d::energy_inverse_input(e_i_raw);
+    inv_i = energy_authoritative
+                ? tenryu::materials::device_inverse_reclose_with_high_t_tail_warp(
+                      tab_ion, rho_i, e_i, ti_floor, lane)
+                : tenryu::materials::device_inverse_reclose_warp(tab_ion, rho_i, e_i, ti_floor,
+                                                                 lane);
+    // The cold reference depends on the density only: computed while warp 1
+    // still inverts the electron table (the ion inversion is the shorter one).
+    if (lane == 0 && e_cold_out != nullptr) {
+      e_cold_out[i] = tenryu::materials::cold_reference(tab_ele.cold, rho_i).C;
+    }
+  } else {
+    const double e_e = persistent_1d::energy_inverse_input(e_e_raw);
+    const tenryu::materials::DeviceEOSInverseRecloseResult inv_e =
+        energy_authoritative
+            ? tenryu::materials::device_inverse_reclose_with_high_t_tail_warp(
+                  tab_ele, rho_i, e_e, te_floor, lane)
+            : tenryu::materials::device_inverse_reclose_warp(tab_ele, rho_i, e_e, te_floor,
+                                                             lane);
+    if (lane == 0) {
+      sh_inv_e = inv_e;
+    }
+  }
+  __syncthreads();
+  if (threadIdx.x != 0) {
+    return;
+  }
+  const double A = fmax(A_eff[i], 1.0e-12);
+  const bool allow_table_energy_writeback =
+      !preserve_table_energy &&
+      persistent_1d::enable_table_eos_writeback(eos_writeback, be.exact_override_kind);
+  enforce_2t_closure_table_finish(
+      i, ee, ei, Te, Ti, Pe, Pi, rho, rho_i, A, fallback_z, te_floor, ti_floor, be.rho_e,
+      be.spline, be.jet, be.use_helmholtz, be.use_helmholtz_jet, be.use_rho_e_table,
+      energy_authoritative, allow_table_energy_writeback,
+      persistent_1d::energy_needs_repair(e_i_raw), persistent_1d::energy_needs_repair(e_e_raw),
+      inv_i, sh_inv_e, clamp_count, failure_count, be.exact_override_kind, cv_e_out, cv_i_out);
+}
+
+// compute_sound_speed_2t_kernel with the ion and electron parts of the table
+// sound speed on two warps: a block of 64 threads takes 32 cells, warp 0
+// computes each cell's ion part and warp 1 its electron part at the same time
+// (the sequential expressions), and warp 0 combines them. Cells on another
+// backend run the sequential body on warp 0. The results agree with
+// compute_sound_speed_2t_kernel to rounding (one ulp where the compiler
+// contracts a multiply-add differently; tests/hydro/test_hydro_1d_step.cu,
+// "[closure]").
+template <bool kPerCell>
+__global__ __launch_bounds__(64) void compute_sound_speed_2t_split_kernel(
+    double* __restrict__ cs,
+    const double* __restrict__ rho,
+    const double* __restrict__ ee,
+    const double* __restrict__ ei,
+    const double* __restrict__ Pe,
+    const double* __restrict__ Pi,
+    const double* __restrict__ Te,
+    const double* __restrict__ Ti,
+    const tenryu::materials::DeviceEOSTableView tab_ion_first,
+    const tenryu::materials::DeviceEOSTableView tab_ele_first,
+    const tenryu::materials::CellEOSTableSelector cell_tables,
+    const CellHydroSurrogates surrogates,
+    const tenryu::materials::EOSRhoEDeviceView tab_total_rho_e_run,
+    const tenryu::materials::HelmholtzSplineDeviceView spline_total_run,
+    const tenryu::materials::HelmholtzJetDeviceView jet_total_run,
+    const tenryu::materials::MieGruneisenDeviceView mie_gruneisen_run,
+    const double* __restrict__ cv_i_arr,
+    const double* __restrict__ cv_e_arr,
+    const int c_begin,
+    const int c_end,
+    const int n_cells,
+    const bool use_helmholtz_run,
+    const bool use_helmholtz_jet_run,
+    const bool use_rho_e_table_run,
+    const bool use_mie_gruneisen_run,
+    const bool use_exact_ideal_gas_run,
+    const int exact_override_kind_run,
+    const double* __restrict__ gamma_eff,
+    const bool high_t_tail) {
+  const int lane = static_cast<int>(threadIdx.x) & 31;
+  const int species = static_cast<int>(threadIdx.x) >> 5;  // 0 ion, 1 electron
+  const int i = c_begin + static_cast<int>(blockIdx.x) * 32 + lane;
+  __shared__ double sh_electron[32];
+  const bool in_range = i < c_end;
+  bool table_branch = false;
+  CellHydroBackend be{};
+  tenryu::materials::DeviceEOSTableView tab_ion{};
+  tenryu::materials::DeviceEOSTableView tab_ele{};
+  double rho_i = 0.0;
+  double cs_ion = 0.0;
+  if (in_range) {
+    if constexpr (kPerCell) {
+      be = resolve_cell_hydro_backend(
+          i, cell_tables, surrogates, tab_total_rho_e_run, spline_total_run, jet_total_run,
+          mie_gruneisen_run, 0.0, exact_override_kind_run, use_helmholtz_run,
+          use_helmholtz_jet_run, use_rho_e_table_run, use_mie_gruneisen_run,
+          use_exact_ideal_gas_run);
+    } else {
+      be = CellHydroBackend{tab_total_rho_e_run, spline_total_run, jet_total_run,
+                            mie_gruneisen_run, 0.0, exact_override_kind_run, use_helmholtz_run,
+                            use_helmholtz_jet_run, use_rho_e_table_run, use_mie_gruneisen_run,
+                            use_exact_ideal_gas_run};
+    }
+    tab_ion = cell_tables.ion(i, tab_ion_first);
+    tab_ele = cell_tables.electron(i, tab_ele_first);
+    rho_i = fmax(rho[i], 1.0e-30);
+    // The branch order of compute_sound_speed_2t_kernel_body: exact ideal gas,
+    // Mie-Gruneisen, the Helmholtz spline and jet, the rho-e table, then the
+    // two tables.
+    table_branch =
+        !be.use_exact_ideal_gas && !(be.use_mie_gruneisen && be.mie_gruneisen.n_rho > 0) &&
+        !(be.use_helmholtz && be.spline.n_rho > 0 && rho_i >= exp(be.spline.log_rho_min)) &&
+        !(be.use_helmholtz_jet && be.jet.n_rho > 0 && rho_i >= exp(be.jet.log_rho_min)) &&
+        !(be.use_rho_e_table && be.rho_e.n_rho > 0 &&
+          rho_i >= tenryu::materials::eos_rho_e_rho_min(be.rho_e)) &&
+        tab_ion.n_rho > 0 && tab_ele.n_rho > 0;
+    if (table_branch) {
+      if (species == 0) {
+        const auto rb_ion = tenryu::materials::find_rho_bracket(tab_ion, rho_i);
+        const double logTi = log(fmax(Ti[i], 1.0e-30));
+        const double cv_i =
+            (cv_i_arr != nullptr)
+                ? fmax(cv_i_arr[i], 0.0)
+                : fmax(tenryu::materials::device_eos_cv(tab_ion, rb_ion, logTi), 0.0);
+        cs_ion = high_t_tail
+                     ? tenryu::materials::device_eos_sound_speed_with_high_t_tail(
+                           tab_ion, rb_ion, logTi, rho_i, cv_i)
+                     : tenryu::materials::device_eos_sound_speed(tab_ion, rb_ion, logTi, rho_i,
+                                                                 cv_i);
+      } else {
+        const auto rb_ele = tenryu::materials::find_rho_bracket(tab_ele, rho_i);
+        const double logTe = log(fmax(Te[i], 1.0e-30));
+        const double cv_e =
+            (cv_e_arr != nullptr)
+                ? fmax(cv_e_arr[i], 0.0)
+                : fmax(tenryu::materials::device_eos_cv(tab_ele, rb_ele, logTe), 0.0);
+        if (!tenryu::materials::cold_enabled(tab_ele.cold)) {
+          sh_electron[lane] =
+              high_t_tail ? tenryu::materials::device_eos_sound_speed_with_high_t_tail(
+                                tab_ele, rb_ele, logTe, rho_i, cv_e)
+                          : tenryu::materials::device_eos_sound_speed(tab_ele, rb_ele, logTe,
+                                                                      rho_i, cv_e);
+        } else {
+          sh_electron[lane] =
+              high_t_tail ? tenryu::materials::device_eos_sound_speed2_signed_with_high_t_tail(
+                                tab_ele, rb_ele, logTe, rho_i, cv_e)
+                          : tenryu::materials::device_eos_sound_speed2_signed(tab_ele, rb_ele,
+                                                                              logTe, rho_i, cv_e);
+        }
+      }
+    }
+  }
+  __syncthreads();
+  if (species != 0 || !in_range) {
+    return;
+  }
+  if (!table_branch) {
+    persistent_1d::compute_sound_speed_2t_kernel_body(
+        i, cs, rho, ee, ei, Pe, Pi, Te, Ti, tab_ion, tab_ele, be.rho_e, be.spline, be.jet,
+        be.mie_gruneisen, cv_i_arr, cv_e_arr, n_cells, be.use_helmholtz, be.use_helmholtz_jet,
+        be.use_rho_e_table, be.use_mie_gruneisen, be.use_exact_ideal_gas, be.exact_override_kind,
+        gamma_eff, high_t_tail);
+    return;
+  }
+  if (!tenryu::materials::cold_enabled(tab_ele.cold)) {
+    const double cs_ele = sh_electron[lane];
+    cs[i] = sqrt(cs_ion * cs_ion + cs_ele * cs_ele);
+  } else {
+    const double cs2_ele = sh_electron[lane];
+    cs[i] = sqrt(fmax(cs_ion * cs_ion + cs2_ele, 0.0));
+  }
+  cs[i] = persistent_1d::apply_exact_sound_speed_override(be.exact_override_kind, cs[i], rho_i,
+                                                          Pe[i], Pi[i]);
 }
 
 template <bool kHasExtra>
@@ -1283,6 +1919,57 @@ __global__ void predictor_update_kernel(double* __restrict__ v_r,
       j, v_r, x_r, u_half, u_old, r_old, accel, node_active, n_nodes, dt);
 }
 
+// Zero floor of the energy updates (NUMERICS §3.1.5): an ideal-gas cell
+// clamps a negative specific energy at zero; a cell whose closure keeps
+// signed energies (a table or a Helmholtz closure) does not. signed_energy_cell
+// (signed_energy_cells_kernel) holds the per-cell decision; null clamps.
+__device__ __forceinline__ bool clamp_energy_at_zero(
+    const std::uint8_t* __restrict__ signed_energy_cell, const int i) {
+  return signed_energy_cell == nullptr || signed_energy_cell[i] == 0u;
+}
+
+// Cells whose closure keeps signed energies: every cell under a Helmholtz
+// backend, otherwise a cell whose material has the tables of its closure
+// (2T: ion and electron, 1T: total). Per cell since 2026-09-23: the decision
+// followed material 0's ion table in 2T (so a deck listing an ideal gas first
+// clamped the negative cold-curve energies of its tabled cells) and clamped
+// every cell in 1T.
+__global__ void signed_energy_cells_kernel(
+    std::uint8_t* __restrict__ signed_energy_cell,
+    const tenryu::materials::CellEOSTableSelector cell_tables,
+    const tenryu::materials::DeviceEOSTableView tab_ion_first,
+    const tenryu::materials::DeviceEOSTableView tab_ele_first,
+    const tenryu::materials::DeviceEOSTableView tab_total_first,
+    const int two_temperature,
+    const int all_signed,
+    const int n_cells) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n_cells) {
+    return;
+  }
+  if (all_signed != 0) {
+    signed_energy_cell[i] = 1u;
+    return;
+  }
+  // Per-cell closure: a cell whose material uses a Helmholtz surrogate keeps
+  // signed energies, as all cells of a run on that backend do.
+  const std::uint8_t kind =
+      cell_tables.hydro_backend(i, tenryu::materials::kHydroBackendLegacy);
+  if (kind == tenryu::materials::kHydroBackendHelmholtzSpline ||
+      kind == tenryu::materials::kHydroBackendHelmholtzJet) {
+    signed_energy_cell[i] = 1u;
+    return;
+  }
+  if (two_temperature != 0) {
+    signed_energy_cell[i] = (cell_tables.ion(i, tab_ion_first).n_rho > 0 &&
+                             cell_tables.electron(i, tab_ele_first).n_rho > 0)
+                                ? 1u
+                                : 0u;
+  } else {
+    signed_energy_cell[i] = (cell_tables.total(i, tab_total_first).n_rho > 0) ? 1u : 0u;
+  }
+}
+
 // 2026-07-26 review (time_integrator="midpoint_v2"): advance the
 // internal energies to the half step with the t^n pressure/AV over the
 // predictor's geometric half-step volume change, so the mid-step EOS closure
@@ -1304,7 +1991,8 @@ __global__ void predictor_energy_half_step_kernel(
     const std::uint8_t* __restrict__ cell_is_void,
     const int n_cells,
     const int use_two_temp,
-    const int q_heat_to_electron) {
+    const int q_heat_to_electron,
+    const std::uint8_t* __restrict__ signed_energy_cell) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n_cells) {
     return;
@@ -1319,6 +2007,9 @@ __global__ void predictor_energy_half_step_kernel(
   if (!(m > 0.0)) {
     return;
   }
+  // The zero floor applies to ideal-gas energies only (the rule of the
+  // corrector updates); signed table energies stay signed.
+  const int clamp_to_zero = clamp_energy_at_zero(signed_energy_cell, i) ? 1 : 0;
   const double dV = vol_half[i] - vol_old[i];
   if (use_two_temp != 0) {
     double de_e = -Pe_old[i] * dV / m;
@@ -1329,11 +2020,14 @@ __global__ void predictor_energy_half_step_kernel(
     } else {
       de_i += q_work;
     }
-    ee[i] = fmax(ee[i] + de_e, 0.0);
-    ei[i] = fmax(ei[i] + de_i, 0.0);
+    const double ee_raw = ee[i] + de_e;
+    const double ei_raw = ei[i] + de_i;
+    ee[i] = (clamp_to_zero != 0) ? fmax(ee_raw, 0.0) : ee_raw;
+    ei[i] = (clamp_to_zero != 0) ? fmax(ei_raw, 0.0) : ei_raw;
   } else {
     const double de = -(Pe_old[i] + Pi_old[i] + Q_old[i]) * dV / m;
-    ee[i] = fmax(ee[i] + de, 0.0);
+    const double ee_raw = ee[i] + de;
+    ee[i] = (clamp_to_zero != 0) ? fmax(ee_raw, 0.0) : ee_raw;
   }
 }
 
@@ -1357,19 +2051,31 @@ __global__ void corrector_update_kernel(double* __restrict__ v_r,
       j, v_r, x_r, u_old, r_old, u_half, a_half, node_active, n_nodes, dt);
 }
 
-__global__ void propagate_void_node_displacement_kernel(
+// The serial body's result node by node: an inactive node takes the
+// displacement and velocity of the nearest active node below it (the node
+// before its void run); a run with no active node below it is left alone. A
+// run's nodes read only that active node, which no thread writes, with the
+// body's expressions.
+__global__ void propagate_void_node_displacement_parallel_kernel(
     double* __restrict__ x_r,
     double* __restrict__ v_r,
     const double* __restrict__ r_old,
     const std::uint8_t* __restrict__ node_active,
     const int n_nodes) {
-  const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i != 0) {
+  const int k = blockIdx.x * blockDim.x + threadIdx.x;
+  if (k < 1 || k >= n_nodes || node_active[k] != 0u) {
     return;
   }
-
-  persistent_1d::propagate_void_node_displacement_kernel_body(
-      i, x_r, v_r, r_old, node_active, n_nodes);
+  int a = k - 1;
+  while (a >= 0 && node_active[a] == 0u) {
+    --a;
+  }
+  if (a < 0) {
+    return;
+  }
+  const double delta_x = x_r[a] - r_old[a];
+  x_r[k] = r_old[k] + delta_x;
+  v_r[k] = v_r[a];
 }
 
 __global__ void copy_array_kernel(double* __restrict__ dst,
@@ -1390,18 +2096,6 @@ __global__ void add_arrays_inplace_kernel(double* __restrict__ dst,
     return;
   }
   dst[i] += src[i];
-}
-
-__global__ void average_arrays_kernel(double* __restrict__ out,
-                                      const double* __restrict__ a,
-                                      const double* __restrict__ b,
-                                      const int n) {
-  const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= n) {
-    return;
-  }
-
-  persistent_1d::average_arrays_kernel_body(i, out, a, b, n);
 }
 
 template <int GEOM>
@@ -1454,10 +2148,12 @@ __global__ void energy_update_with_old_volume_kernel(
     return;
   }
 
+  // E_floor_injected: per-cell ledger slots (summed in a fixed order by the
+  // step, core::deterministic_sum).
   persistent_1d::energy_update_with_old_volume_kernel_body<GEOM>(
       i, ee, e_old, r_new, r_old, u_half, vol, vol_old, mass, P_half,
       Q_half, hydro_active, n_cells, dt, compatible_energy, eta_compatible,
-      E_floor_injected, clamp_count);
+      nullptr, clamp_count, E_floor_injected);
 }
 
 template <int GEOM>
@@ -1500,7 +2196,8 @@ __global__ void energy_update_with_old_volume_2t_kernel(
     int* __restrict__ clamp_count,
     const double te_floor,
     const double ti_floor,
-    const int energy_authoritative) {
+    const int energy_authoritative,
+    const int apply_exchange) {
   const int i = c_begin + blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= c_end) {
     return;
@@ -1514,8 +2211,8 @@ __global__ void energy_update_with_old_volume_2t_kernel(
       u_half, vol, vol_old, mass, Pe_half, Pi_half, Q_half, zbar,
       hydro_active, n_cells, dt, gamma_eff, A_eff, fallback_z, tab_ion,
       tab_ele, cv_e_arr, cv_i_arr, q_heat_to_electron, compatible_energy,
-      eta_compatible, E_floor_injected, clamp_count, qei_multiplier, te_floor,
-      ti_floor, energy_authoritative);
+      eta_compatible, nullptr, clamp_count, qei_multiplier, te_floor,
+      ti_floor, energy_authoritative, apply_exchange, E_floor_injected);
 }
 
 template <int GEOM>
@@ -1540,10 +2237,11 @@ __global__ void compatible_energy_update_1d_kernel(
     const int use_two_temp,
     const int q_heat_to_electron,
     const double ghost_pq_half,
-    const int free_outer_boundary,
+    const int subtract_outer_ghost,
     double* __restrict__ E_floor_injected,
     int* __restrict__ clamp_count,
-    double* __restrict__ residual_sums) {
+    double* __restrict__ residual_sums,
+    const std::uint8_t* __restrict__ signed_energy_cell) {
   const int c = c_begin + blockIdx.x * blockDim.x + threadIdx.x;
   if (c >= c_end) {
     return;
@@ -1551,6 +2249,7 @@ __global__ void compatible_energy_update_1d_kernel(
   if (cell_is_void != nullptr && cell_is_void[c] != 0u) {
     return;
   }
+  const int clamp_to_zero = clamp_energy_at_zero(signed_energy_cell, c) ? 1 : 0;
 
   const int jL = c;
   const int jR = c + 1;
@@ -1572,8 +2271,10 @@ __global__ void compatible_energy_update_1d_kernel(
   // field (paid by the driver's work update), not to matter internal energy.
   const double p = (p_extra_half != nullptr) ? (pq_half[c] - p_extra_half[c])
                                              : pq_half[c];
+  // FREE and PRESSURE outer boundaries: the acceleration's ghost carries the
+  // last cell's Q, so the outer face does no Q work (ghost_pq_half = Q_last).
   double p_R = p;
-  if (free_outer_boundary != 0 && c == n_cells - 1) {
+  if (subtract_outer_ghost != 0 && c == n_cells - 1) {
     p_R -= ghost_pq_half;
   }
   const double ubar_L = 0.5 * (v_old[jL] + v_new[jL]);
@@ -1593,8 +2294,13 @@ __global__ void compatible_energy_update_1d_kernel(
   if (m > 0.0) {
     if (use_two_temp != 0) {
       const double p_raw = fmax(fabs(p), 1.0e-30);
-      double f_e = fmax(Pe_half[c], 0.0) / p_raw;
-      double f_iQ = fmax(Pi_half[c] + Q_half[c], 0.0) / p_raw;
+      // The AV share Q goes to the species Numerics.hydro.av_heat_to names.
+      const double pe_share =
+          (q_heat_to_electron != 0) ? Pe_half[c] + Q_half[c] : Pe_half[c];
+      const double pi_share =
+          (q_heat_to_electron != 0) ? Pi_half[c] : Pi_half[c] + Q_half[c];
+      double f_e = fmax(pe_share, 0.0) / p_raw;
+      double f_iQ = fmax(pi_share, 0.0) / p_raw;
       const double f_sum = f_e + f_iQ;
       if (f_sum > 0.0 && isfinite(f_sum)) {
         f_e /= f_sum;
@@ -1612,21 +2318,25 @@ __global__ void compatible_energy_update_1d_kernel(
       }
       const double ee_raw = ee[c] + de_e;
       const double ei_raw = ei[c] + de_i;
-      const double ee_new = fmax(ee_raw, 0.0);
-      const double ei_new = fmax(ei_raw, 0.0);
+      // Signed table energies (negative cold curve) are valid and stay
+      // unclamped, as in the non-compatible update; the zero floor applies
+      // only to ideal-gas energies (clamp_to_zero, same rule as the heating
+      // kernels; 2026-09-23).
+      const double ee_new = (clamp_to_zero != 0) ? fmax(ee_raw, 0.0) : ee_raw;
+      const double ei_new = (clamp_to_zero != 0) ? fmax(ei_raw, 0.0) : ei_raw;
       ee[c] = ee_new;
       ei[c] = ei_new;
-      if (ee_raw < 0.0) {
+      if (clamp_to_zero != 0 && ee_raw < 0.0) {
         if (E_floor_injected != nullptr) {
-          atomic_add_double(E_floor_injected, m * (ee_new - ee_raw));
+          E_floor_injected[c] += m * (ee_new - ee_raw);
         }
         if (clamp_count != nullptr) {
           atomicAdd(clamp_count, 1);
         }
       }
-      if (ei_raw < 0.0) {
+      if (clamp_to_zero != 0 && ei_raw < 0.0) {
         if (E_floor_injected != nullptr) {
-          atomic_add_double(E_floor_injected, m * (ei_new - ei_raw));
+          E_floor_injected[c] += m * (ei_new - ei_raw);
         }
         if (clamp_count != nullptr) {
           atomicAdd(clamp_count, 1);
@@ -1634,11 +2344,11 @@ __global__ void compatible_energy_update_1d_kernel(
       }
     } else {
       const double ee_raw = ee[c] + dE / m;
-      const double ee_new = fmax(ee_raw, 0.0);
+      const double ee_new = (clamp_to_zero != 0) ? fmax(ee_raw, 0.0) : ee_raw;
       ee[c] = ee_new;
-      if (ee_raw < 0.0) {
+      if (clamp_to_zero != 0 && ee_raw < 0.0) {
         if (E_floor_injected != nullptr) {
-          atomic_add_double(E_floor_injected, m * (ee_new - ee_raw));
+          E_floor_injected[c] += m * (ee_new - ee_raw);
         }
         if (clamp_count != nullptr) {
           atomicAdd(clamp_count, 1);
@@ -1648,7 +2358,7 @@ __global__ void compatible_energy_update_1d_kernel(
   }
 
   if (residual_sums != nullptr) {
-    atomic_add_double(&residual_sums[0], dE);
+    residual_sums[c] += dE;
   }
 }
 
@@ -1680,7 +2390,7 @@ __global__ void compatible_energy_kinetic_residual_1d_kernel(
   const double dK =
       0.5 * node_mass * (v_new[j] * v_new[j] - v_old[j] * v_old[j]);
   if (residual_sums != nullptr) {
-    atomic_add_double(&residual_sums[1], dK);
+    residual_sums[j] += dK;
   }
 }
 
@@ -1791,7 +2501,7 @@ __global__ void apply_artificial_heat_kernel(
     const int c_end,
     const int n_cells,
     const double dt,
-    const int clamp_to_zero,
+    const std::uint8_t* __restrict__ signed_energy_cell,
     double* __restrict__ E_floor_injected,
     int* __restrict__ clamp_count) {
   const int i = c_begin + blockIdx.x * blockDim.x + threadIdx.x;
@@ -1810,7 +2520,7 @@ __global__ void apply_artificial_heat_kernel(
   }
 
   const double e_raw = e[i] + dt * heat_rate[i] / m;
-  if (clamp_to_zero == 0) {
+  if (!clamp_energy_at_zero(signed_energy_cell, i)) {
     e[i] = e_raw;
     return;
   }
@@ -1819,7 +2529,7 @@ __global__ void apply_artificial_heat_kernel(
   e[i] = e_new;
   if (e_raw < 0.0) {
     if (E_floor_injected != nullptr) {
-      atomic_add_double(E_floor_injected, m * (e_new - e_raw));
+      E_floor_injected[i] += m * (e_new - e_raw);
     }
     if (clamp_count != nullptr) {
       atomicAdd(clamp_count, 1);
@@ -2422,7 +3132,7 @@ __global__ void apply_hk_velocity_damper_impulse_1d_kernel(
     atomicAdd(active_pairs, 1);
   }
   if (KE_removed != nullptr) {
-    atomic_add_double(KE_removed, E_loss);
+    KE_removed[i] += E_loss;
   }
 }
 
@@ -2573,27 +3283,51 @@ __device__ __forceinline__ double compute_post_shock_face_power_1d(
   return area_face * flux;
 }
 
+// Face powers of the post-shock heat flux from the pre-update energies, one
+// per interior face f = 1..n_cells-1 (between cells f-1 and f); the update
+// kernel below reads them, so no thread reads a neighbour's energy while
+// another thread writes it.
 template <int GEOM>
+__global__ void post_shock_heat_face_power_kernel(
+    double* __restrict__ face_power,
+    const double* __restrict__ rho,
+    const double* __restrict__ ee,
+    const double* __restrict__ ei,
+    const double* __restrict__ cs,
+    const double* __restrict__ shock_time,
+    const double* __restrict__ node_r,
+    const std::int8_t* __restrict__ hydro_active,
+    const int f_begin,
+    const int f_end,
+    const int n_cells,
+    const double t_current,
+    const double heat_c,
+    const double decay_cells) {
+  const int f = f_begin + blockIdx.x * blockDim.x + threadIdx.x;
+  if (f >= f_end) {
+    return;
+  }
+  face_power[f] =
+      (f > 0 && f < n_cells)
+          ? compute_post_shock_face_power_1d<GEOM>(
+                rho, ee, ei, cs, shock_time, node_r, hydro_active, f - 1, f,
+                t_current, heat_c, decay_cells)
+          : 0.0;
+}
+
 __global__ void apply_post_shock_heat_kernel(
     double* __restrict__ ee,
     double* __restrict__ ei,
-    const double* __restrict__ rho,
-    const double* __restrict__ cs,
-    const double* __restrict__ node_r,
+    const double* __restrict__ face_power,
     const double* __restrict__ mass,
     const double* __restrict__ Pe_split,
     const double* __restrict__ Pi_split,
-    const double* __restrict__ shock_time,
     const std::int8_t* __restrict__ hydro_active,
     const int c_begin,
     const int c_end,
-    const int n_cells,
     const double dt,
-    const double t_current,
-    const double heat_c,
-    const double decay_cells,
     const int two_temperature,
-    const int clamp_to_zero,
+    const std::uint8_t* __restrict__ signed_energy_cell,
     double* __restrict__ E_floor_injected,
     int* __restrict__ clamp_count) {
   const int i = c_begin + blockIdx.x * blockDim.x + threadIdx.x;
@@ -2603,24 +3337,15 @@ __global__ void apply_post_shock_heat_kernel(
   if (!hydro_cell_active_1d(hydro_active, i)) {
     return;
   }
+  const int clamp_to_zero = clamp_energy_at_zero(signed_energy_cell, i) ? 1 : 0;
 
   const double m = mass[i];
   if (!(m > 0.0)) {
     return;
   }
 
-  const double left_power =
-      (i > 0)
-          ? compute_post_shock_face_power_1d<GEOM>(
-                rho, ee, ei, cs, shock_time, node_r, hydro_active, i - 1, i,
-                t_current, heat_c, decay_cells)
-          : 0.0;
-  const double right_power =
-      (i + 1 < n_cells)
-          ? compute_post_shock_face_power_1d<GEOM>(
-                rho, ee, ei, cs, shock_time, node_r, hydro_active, i, i + 1,
-                t_current, heat_c, decay_cells)
-          : 0.0;
+  const double left_power = face_power[i];
+  const double right_power = face_power[i + 1];
   const double de_total = dt * (left_power - right_power) / m;
   if (de_total == 0.0) {
     return;
@@ -2636,7 +3361,7 @@ __global__ void apply_post_shock_heat_kernel(
     ee[i] = ee_new;
     if (ee_raw < 0.0) {
       if (E_floor_injected != nullptr) {
-        atomic_add_double(E_floor_injected, m * (ee_new - ee_raw));
+        E_floor_injected[i] += m * (ee_new - ee_raw);
       }
       if (clamp_count != nullptr) {
         atomicAdd(clamp_count, 1);
@@ -2665,7 +3390,7 @@ __global__ void apply_post_shock_heat_kernel(
   ei[i] = ei_new;
   if (ee_raw < 0.0) {
     if (E_floor_injected != nullptr) {
-      atomic_add_double(E_floor_injected, m * (ee_new - ee_raw));
+      E_floor_injected[i] += m * (ee_new - ee_raw);
     }
     if (clamp_count != nullptr) {
       atomicAdd(clamp_count, 1);
@@ -2673,7 +3398,7 @@ __global__ void apply_post_shock_heat_kernel(
   }
   if (ei_raw < 0.0) {
     if (E_floor_injected != nullptr) {
-      atomic_add_double(E_floor_injected, m * (ei_new - ei_raw));
+      E_floor_injected[i] += m * (ei_new - ei_raw);
     }
     if (clamp_count != nullptr) {
       atomicAdd(clamp_count, 1);
@@ -2873,11 +3598,6 @@ std::uint8_t* upload_uint8_array(const std::vector<std::uint8_t>& values,
   return d_values;
 }
 
-std::uint8_t* upload_cell_is_void(const std::vector<std::uint8_t>& cell_is_void,
-                                  const char* name) {
-  return upload_uint8_array(cell_is_void, name);
-}
-
 int* upload_int_array(const std::vector<int>& values, const char* name) {
   if (values.empty()) {
     return nullptr;
@@ -3000,6 +3720,85 @@ std::vector<std::uint8_t> compute_hk_velocity_near_front_mask_1d(
   return near_front;
 }
 
+// Per-step pack of the Lagrangian step, read back once at the end:
+// [0] E_floor (double), [1] hydro clamp count and rho clamp count (two ints),
+// [2] first non-positive-volume cell (int, n_cells when none).
+__global__ void init_lagrangian_step_pack_kernel(double* __restrict__ pack,
+                                                 double* __restrict__ floor_cells,
+                                                 const int n_floor_cells,
+                                                 const int n_cells) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i == 0) {
+    pack[0] = 0.0;
+    pack[1] = 0.0;
+    pack[2] = 0.0;
+    *reinterpret_cast<int*>(pack + 2) = n_cells;
+  }
+  if (i < n_floor_cells) {
+    floor_cells[i] = 0.0;
+  }
+}
+
+// out_k = (a_k + b_k) / 2 for the three pairs of the step's time-centred
+// P_half, Pi_half and Q_half (average_arrays_kernel_body, one launch).
+__global__ void average_three_arrays_kernel(double* __restrict__ out0,
+                                            const double* __restrict__ a0,
+                                            const double* __restrict__ b0,
+                                            double* __restrict__ out1,
+                                            const double* __restrict__ a1,
+                                            const double* __restrict__ b1,
+                                            double* __restrict__ out2,
+                                            const double* __restrict__ a2,
+                                            const double* __restrict__ b2,
+                                            const int n) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) {
+    return;
+  }
+  persistent_1d::average_arrays_kernel_body(i, out0, a0, b0, n);
+  persistent_1d::average_arrays_kernel_body(i, out1, a1, b1, n);
+  persistent_1d::average_arrays_kernel_body(i, out2, a2, b2, n);
+}
+
+// The node mask that a zero fill, compute_node_activity_kernel_body over the
+// cells [c_begin, c_end) and zero_center_node_kernel_body give (the persistent
+// loop's pattern), in one pass over every node: node j is set by its lower
+// cell j - 1 (as that cell's upper node) and by its upper cell j (as that
+// cell's lower node) under the rules of compute_node_activity_kernel_body, and
+// the centre node is 0.
+__global__ void node_activity_1d_kernel(std::uint8_t* __restrict__ node_active,
+                                        const std::int8_t* __restrict__ hydro_active,
+                                        const int c_begin,
+                                        const int c_end,
+                                        const int n_cells,
+                                        const int n_nodes,
+                                        const int rigid_inactive) {
+  const int j = blockIdx.x * blockDim.x + threadIdx.x;
+  if (j >= n_nodes) {
+    return;
+  }
+  if (j == 0) {
+    node_active[0] = 0u;
+    return;
+  }
+  const bool plain = (rigid_inactive == 0 || hydro_active == nullptr);
+  const auto cell_active = [&](const int c) {
+    return (hydro_active == nullptr) || (hydro_active[c] != 0);
+  };
+  bool on = false;
+  const int lower = j - 1;
+  if (lower >= c_begin && lower < c_end && lower < n_cells && cell_active(lower) &&
+      (plain || lower + 1 >= n_cells || hydro_active[lower + 1] != 0)) {
+    on = true;
+  }
+  const int upper = j;
+  if (upper >= c_begin && upper < c_end && upper < n_cells && cell_active(upper) &&
+      (plain || hydro_active[upper - 1] != 0)) {
+    on = true;
+  }
+  node_active[j] = on ? 1u : 0u;
+}
+
 __global__ void find_nonpositive_volume_1d_kernel(
     const double* __restrict__ vol,
     int* __restrict__ first_failing_cell,
@@ -3044,6 +3843,65 @@ void refresh_geometry_and_density(core::State& state,
   }
 }
 
+// Numerics.hydro.exact_override = "cv": the diagnostic exact ideal-gas heat
+// capacities from each cell's material A and Z (the first material's were
+// used for every cell before 2026-09-24). Exact ideal-gas and Mie-Gruneisen
+// cells keep their closure's values (the override does not apply to them).
+__global__ void fill_exact_override_cv_kernel(
+    double* __restrict__ cv_e,
+    double* __restrict__ cv_i,
+    const int* __restrict__ cell_material_index,
+    const tenryu::materials::MaterialClosureParams* __restrict__ params,
+    const int n_materials,
+    const int n_cells,
+    const int two_temperature) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n_cells) {
+    return;
+  }
+  const int m_raw = cell_material_index[i];
+  const int m = (m_raw < 0) ? 0 : ((m_raw >= n_materials) ? (n_materials - 1) : m_raw);
+  const tenryu::materials::MaterialClosureParams p = params[m];
+  if (p.hydro_backend_kind == tenryu::materials::kHydroBackendExactIdealGas ||
+      p.hydro_backend_kind == tenryu::materials::kHydroBackendMieGruneisen) {
+    return;
+  }
+  const double cv_i_ig = diagnostic_cv_i_mass(p.A);
+  if (cv_e != nullptr) {
+    cv_e[i] = (two_temperature != 0) ? diagnostic_cv_e_mass(p.A, p.Z)
+                                     : cv_i_ig + diagnostic_cv_e_mass(p.A, p.Z);
+  }
+  if (cv_i != nullptr) {
+    cv_i[i] = cv_i_ig;
+  }
+}
+
+// Per-cell exact override heat capacities when the cells' materials differ
+// (per-cell closure, or A or Z differing between the non-void materials).
+// Returns false when the run-level fill applies.
+bool fill_exact_override_cv_per_cell(core::State& state,
+                                     const core::Config& cfg,
+                                     const HydroTableViews& eos_views,
+                                     const bool two_temperature,
+                                     double* cv_e_ptr,
+                                     double* cv_i_ptr) {
+  const int n_cells = static_cast<int>(state.rho.size());
+  if (n_cells <= 0 || state.cell_material_index.size() != static_cast<std::size_t>(n_cells) ||
+      !(eos_views.per_cell_closure || tenryu::materials::material_A_or_Z_vary(cfg))) {
+    return false;
+  }
+  const tenryu::materials::MaterialClosureParams* d_params =
+      tenryu::materials::material_closure_params_device(cfg);
+  if (d_params == nullptr) {
+    return false;
+  }
+  fill_exact_override_cv_kernel<<<(n_cells + 255) / 256, 256>>>(
+      cv_e_ptr, cv_i_ptr, state.cell_material_index.data(), d_params,
+      static_cast<int>(cfg.materials.materials.size()), n_cells, two_temperature ? 1 : 0);
+  sync_kernel("Hydro1D per-cell exact override cv kernel failed");
+  return true;
+}
+
 void enforce_1t_closure(
     core::State& state,
     const core::Config& cfg,
@@ -3065,21 +3923,31 @@ void enforce_1t_closure(
   const int exact_override_kind = select_exact_override_kind(cfg, eos_views);
   double* cv_e_ptr = state.cv_e.empty() ? nullptr : state.cv_e.data();
   double* cv_i_ptr = state.cv_i.empty() ? nullptr : state.cv_i.data();
-  enforce_1t_closure_kernel<<<fw.blocks(), 256>>>(
-      state.ee.data(), state.ei.data(), state.Te.data(), state.Ti.data(),
-      state.Pe.data(), state.Pi.data(), state.rho.data(), state.zbar.data(),
-      fw.begin, fw.end, cw.begin, cw.end, n_cells,
-      state.gamma_eff.data(), state.A_eff.data(), mat.Z, mat.cv_e_override,
-      cfg.numerics.floors.Te,
-      eos_views.tab_total, cell_table_selector(eos_views, state), eos_views.tab_total_rho_e,
-      eos_views.spline_total,
-      eos_views.jet_total,
-      use_helmholtz_spline_backend(eos_views), use_helmholtz_jet_backend(eos_views),
-      use_rho_e_table_backend(eos_views),
-      use_exact_ideal_gas_backend(eos_views), cfg.numerics.hydro.eos_writeback,
-      preserve_table_energy, energy_authoritative, inverse_clamp_count,
-      inverse_failure_count,
-      exact_override_kind, cv_e_ptr, cv_i_ptr);
+  const int closure_block = core::serial_cell_block_size(fw.count());
+  const auto launch_closure = [&](auto per_cell) {
+    enforce_1t_closure_kernel<decltype(per_cell)::value>
+        <<<fw.blocks(closure_block), closure_block>>>(
+            state.ee.data(), state.ei.data(), state.Te.data(), state.Ti.data(),
+            state.Pe.data(), state.Pi.data(), state.rho.data(), state.zbar.data(),
+            fw.begin, fw.end, cw.begin, cw.end, n_cells,
+            state.gamma_eff.data(), state.A_eff.data(), mat.Z, mat.cv_e_override,
+            cfg.numerics.floors.Te,
+            eos_views.tab_total, cell_table_selector(eos_views, state),
+            eos_views.surrogates, eos_views.tab_total_rho_e,
+            eos_views.spline_total,
+            eos_views.jet_total,
+            use_helmholtz_spline_backend(eos_views), use_helmholtz_jet_backend(eos_views),
+            use_rho_e_table_backend(eos_views),
+            use_exact_ideal_gas_backend(eos_views), cfg.numerics.hydro.eos_writeback,
+            preserve_table_energy, energy_authoritative, inverse_clamp_count,
+            inverse_failure_count,
+            exact_override_kind, cv_e_ptr, cv_i_ptr);
+  };
+  if (eos_views.per_cell_closure) {
+    launch_closure(std::true_type{});
+  } else {
+    launch_closure(std::false_type{});
+  }
   sync_kernel("Hydro1D enforce_1t_closure kernel failed");
   if (cfg.numerics.hydro.pressure_tension_cutoff) {
     apply_pressure_tension_cutoff_kernel<<<fw.blocks(), 256>>>(
@@ -3089,6 +3957,9 @@ void enforce_1t_closure(
   }
   // cv override: replace table cv with exact ideal gas cv after closure
   if (exact_override_kind == kExactOverrideCv && cv_e_ptr != nullptr) {
+    if (fill_exact_override_cv_per_cell(state, cfg, eos_views, false, cv_e_ptr, cv_i_ptr)) {
+      return;
+    }
     const double cv_ig = diagnostic_cv_i_mass(mat.A) + diagnostic_cv_e_mass(mat.A, mat.Z);
     thrust::fill(thrust::device, cv_e_ptr, cv_e_ptr + n_cells, cv_ig);
     if (cv_i_ptr != nullptr) {
@@ -3118,23 +3989,40 @@ void enforce_2t_closure(
   const int exact_override_kind = select_exact_override_kind(cfg, eos_views);
   double* cv_e_ptr = state.cv_e.empty() ? nullptr : state.cv_e.data();
   double* cv_i_ptr = state.cv_i.empty() ? nullptr : state.cv_i.data();
-  enforce_2t_closure_kernel<<<fw.blocks(), 256>>>(
-      state.ee.data(), state.ei.data(), state.Te.data(), state.Ti.data(),
-      state.Pe.data(), state.Pi.data(), state.rho.data(), state.zbar.data(),
-      fw.begin, fw.end, cw.begin, cw.end, n_cells,
-      state.gamma_eff.data(), state.A_eff.data(), mat.Z, mat.cv_e_override,
-      cfg.numerics.floors.Te,
-      cfg.numerics.floors.Ti,
-      eos_views.tab_ion, eos_views.tab_ele, cell_table_selector(eos_views, state),
-      eos_views.tab_total_rho_e, eos_views.spline_total,
-      eos_views.jet_total, eos_views.mie_gruneisen,
-      use_helmholtz_spline_backend(eos_views), use_helmholtz_jet_backend(eos_views),
-      use_rho_e_table_backend(eos_views), use_mie_gruneisen_backend(eos_views),
-      use_exact_ideal_gas_backend(eos_views), cfg.numerics.hydro.eos_writeback,
-      preserve_table_energy, energy_authoritative, inverse_clamp_count,
-      inverse_failure_count,
-      exact_override_kind, cv_e_ptr, cv_i_ptr,
-      state.e_cold.empty() ? nullptr : state.e_cold.data());
+  const int closure_block = core::serial_cell_block_size(fw.count());
+  // One block of two warps per cell (enforce_2t_closure_split_kernel), or with
+  // TENRYU_HYDRO1D_SEQUENTIAL_CLOSURE the one-thread-per-cell reference.
+  const bool sequential = sequential_closure_kernels();
+  const auto launch_closure = [&](auto per_cell) {
+    constexpr bool kPerCell = decltype(per_cell)::value;
+    const auto kernel = sequential ? enforce_2t_closure_kernel<kPerCell>
+                                   : enforce_2t_closure_split_kernel<kPerCell>;
+    const int blocks = sequential ? fw.blocks(closure_block) : fw.count();
+    const int threads = sequential ? closure_block : kClosureSplitThreads;
+    kernel<<<blocks, threads>>>(
+            state.ee.data(), state.ei.data(), state.Te.data(), state.Ti.data(),
+            state.Pe.data(), state.Pi.data(), state.rho.data(), state.zbar.data(),
+            fw.begin, fw.end, cw.begin, cw.end, n_cells,
+            state.gamma_eff.data(), state.A_eff.data(), mat.Z, mat.cv_e_override,
+            cfg.numerics.floors.Te,
+            cfg.numerics.floors.Ti,
+            eos_views.tab_ion, eos_views.tab_ele, cell_table_selector(eos_views, state),
+            eos_views.surrogates,
+            eos_views.tab_total_rho_e, eos_views.spline_total,
+            eos_views.jet_total, eos_views.mie_gruneisen,
+            use_helmholtz_spline_backend(eos_views), use_helmholtz_jet_backend(eos_views),
+            use_rho_e_table_backend(eos_views), use_mie_gruneisen_backend(eos_views),
+            use_exact_ideal_gas_backend(eos_views), cfg.numerics.hydro.eos_writeback,
+            preserve_table_energy, energy_authoritative, inverse_clamp_count,
+            inverse_failure_count,
+            exact_override_kind, cv_e_ptr, cv_i_ptr,
+            state.e_cold.empty() ? nullptr : state.e_cold.data());
+  };
+  if (eos_views.per_cell_closure) {
+    launch_closure(std::true_type{});
+  } else {
+    launch_closure(std::false_type{});
+  }
   sync_kernel("Hydro1D enforce_2t_closure kernel failed");
   if (cfg.numerics.hydro.pressure_tension_cutoff) {
     apply_pressure_tension_cutoff_kernel<<<fw.blocks(), 256>>>(
@@ -3143,7 +4031,8 @@ void enforce_2t_closure(
     sync_kernel("Hydro1D pressure tension cutoff (2T) kernel failed");
   }
   // cv override: replace table cv with exact ideal gas cv after 2T closure
-  if (exact_override_kind == kExactOverrideCv) {
+  if (exact_override_kind == kExactOverrideCv &&
+      !fill_exact_override_cv_per_cell(state, cfg, eos_views, true, cv_e_ptr, cv_i_ptr)) {
     if (cv_e_ptr != nullptr) {
       const double cv_e_ig = diagnostic_cv_e_mass(mat.A, mat.Z);
       thrust::fill(thrust::device, cv_e_ptr, cv_e_ptr + n_cells, cv_e_ig);
@@ -3227,29 +4116,47 @@ void compute_cell_sound_speed(core::CellField1DView cs,
   const int exact_override_kind = select_exact_override_kind(cfg, eos_views);
   const double* cv_e_ptr = state.cv_e.empty() ? nullptr : state.cv_e.data();
   const double* cv_i_ptr = state.cv_i.empty() ? nullptr : state.cv_i.data();
-  if (use_two_temp) {
-    compute_sound_speed_2t_kernel<<<cw.blocks(), 256>>>(
-        cs.data(), state.rho.data(), state.ee.data(), state.ei.data(), state.Pe.data(),
-        state.Pi.data(), state.Te.data(), state.Ti.data(), eos_views.tab_ion, eos_views.tab_ele,
-        cell_table_selector(eos_views, state),
-        eos_views.tab_total_rho_e, eos_views.spline_total, eos_views.jet_total,
-        eos_views.mie_gruneisen, cv_i_ptr,
-        cv_e_ptr, cw.begin, cw.end, n_cells,
-        use_helmholtz_spline_backend(eos_views),
-        use_helmholtz_jet_backend(eos_views), use_rho_e_table_backend(eos_views),
-        use_mie_gruneisen_backend(eos_views),
-        use_exact_ideal_gas_backend(eos_views), exact_override_kind,
-        state.gamma_eff.data());
+  const bool high_t_tail = (cfg.numerics.hydro.eos_closure_mode == "energy_authoritative");
+  const int cs_block = core::serial_cell_block_size(cw.count());
+  // Two-temperature: the ion and electron parts on two warps
+  // (compute_sound_speed_2t_split_kernel, 32 cells per block of 64 threads),
+  // or with TENRYU_HYDRO1D_SEQUENTIAL_CLOSURE the one-thread-per-cell reference.
+  const bool sequential = sequential_closure_kernels();
+  const auto launch_sound_speed = [&](auto per_cell) {
+    constexpr bool kPerCell = decltype(per_cell)::value;
+    if (use_two_temp) {
+      const auto kernel = sequential ? compute_sound_speed_2t_kernel<kPerCell>
+                                     : compute_sound_speed_2t_split_kernel<kPerCell>;
+      const int blocks = sequential ? cw.blocks(cs_block) : (cw.count() + 31) / 32;
+      const int threads = sequential ? cs_block : 64;
+      kernel<<<blocks, threads>>>(
+          cs.data(), state.rho.data(), state.ee.data(), state.ei.data(), state.Pe.data(),
+          state.Pi.data(), state.Te.data(), state.Ti.data(), eos_views.tab_ion,
+          eos_views.tab_ele, cell_table_selector(eos_views, state), eos_views.surrogates,
+          eos_views.tab_total_rho_e, eos_views.spline_total, eos_views.jet_total,
+          eos_views.mie_gruneisen, cv_i_ptr,
+          cv_e_ptr, cw.begin, cw.end, n_cells,
+          use_helmholtz_spline_backend(eos_views),
+          use_helmholtz_jet_backend(eos_views), use_rho_e_table_backend(eos_views),
+          use_mie_gruneisen_backend(eos_views),
+          use_exact_ideal_gas_backend(eos_views), exact_override_kind,
+          state.gamma_eff.data(), high_t_tail);
+    } else {
+      compute_sound_speed_1t_kernel<kPerCell><<<cw.blocks(cs_block), cs_block>>>(
+          cs.data(), state.ee.data(), state.Te.data(), state.rho.data(), state.Pe.data(),
+          state.Pi.data(), eos_views.tab_total, cell_table_selector(eos_views, state),
+          eos_views.surrogates, eos_views.tab_total_rho_e, eos_views.spline_total,
+          eos_views.jet_total, cv_e_ptr, cw.begin, cw.end, n_cells,
+          use_helmholtz_spline_backend(eos_views), use_helmholtz_jet_backend(eos_views),
+          use_rho_e_table_backend(eos_views),
+          use_exact_ideal_gas_backend(eos_views), exact_override_kind,
+          state.gamma_eff.data(), high_t_tail);
+    }
+  };
+  if (eos_views.per_cell_closure) {
+    launch_sound_speed(std::true_type{});
   } else {
-    compute_sound_speed_1t_kernel<<<cw.blocks(), 256>>>(
-        cs.data(), state.ee.data(), state.Te.data(), state.rho.data(), state.Pe.data(),
-        state.Pi.data(), eos_views.tab_total, cell_table_selector(eos_views, state),
-        eos_views.tab_total_rho_e, eos_views.spline_total,
-        eos_views.jet_total, cv_e_ptr, cw.begin, cw.end, n_cells,
-        use_helmholtz_spline_backend(eos_views), use_helmholtz_jet_backend(eos_views),
-        use_rho_e_table_backend(eos_views),
-        use_exact_ideal_gas_backend(eos_views), exact_override_kind,
-        state.gamma_eff.data());
+    launch_sound_speed(std::false_type{});
   }
   sync_kernel("Hydro1D compute_sound_speed kernel failed");
 }
@@ -3343,23 +4250,33 @@ void run_compatible_energy_update_1d(
     const double* p_extra_half,
     const int n_cells,
     const double ghost_pq_half,
-    const int free_outer_boundary,
+    const int subtract_outer_ghost,
     double* E_floor_injected,
-    int* clamp_count) {
+    int* clamp_count,
+    const std::uint8_t* signed_energy_cell) {
   if (n_cells <= 0) {
     return;
   }
 
-  std::uint8_t* d_cell_is_void =
-      upload_cell_is_void(state.cell_is_void, "cell_is_void_compat");
-  double* d_residual_sums = nullptr;
-  d_residual_sums = static_cast<double*>(core::device_scratch_acquire(
+  const std::uint8_t* d_cell_is_void = core::device_cell_is_void(state.cell_is_void);
+  const int n_nodes = n_cells + 1;
+  // Residual ledger: [0] = sum of the cells' internal-energy changes, [1] =
+  // sum of the nodes' kinetic-energy changes, each summed in a fixed order
+  // from per-cell / per-node slots (core::deterministic_sum, 2026-09-24).
+  double* d_residual_sums = static_cast<double*>(core::device_scratch_acquire(
       "hydro_1d:run_compatible_energy_update_1d:d_residual_sums",
       2 * sizeof(double)));
-  cuda_check(cudaMemset(d_residual_sums, 0, 2 * sizeof(double)),
-             "Hydro1D: cudaMemset compatible residual failed");
+  double* d_residual_cells = static_cast<double*>(core::device_scratch_acquire(
+      "hydro_1d:run_compatible_energy_update_1d:d_residual_cells",
+      static_cast<std::size_t>(n_cells) * sizeof(double)));
+  double* d_residual_nodes = static_cast<double*>(core::device_scratch_acquire(
+      "hydro_1d:run_compatible_energy_update_1d:d_residual_nodes",
+      static_cast<std::size_t>(n_nodes) * sizeof(double)));
+  cuda_check(cudaMemset(d_residual_cells, 0, static_cast<std::size_t>(n_cells) * sizeof(double)),
+             "Hydro1D: cudaMemset compatible residual cells failed");
+  cuda_check(cudaMemset(d_residual_nodes, 0, static_cast<std::size_t>(n_nodes) * sizeof(double)),
+             "Hydro1D: cudaMemset compatible residual nodes failed");
 
-  const int n_nodes = n_cells + 1;
   const core::State::LaunchWindow cw = state.owned_cell_window(n_cells);
   const core::State::LaunchWindow nw = state.owned_node_window(n_nodes);
   const int q_heat_to_electron =
@@ -3372,8 +4289,8 @@ void run_compatible_energy_update_1d(
           Q_half, node_r_half, odd_even_pair_force_half, p_extra_half, state.mass.data(),
           d_cell_is_void, cw.begin, cw.end, n_cells, dt,
           cfg.main.two_temperature ? 1 : 0, q_heat_to_electron,
-          ghost_pq_half, free_outer_boundary,
-          E_floor_injected, clamp_count, d_residual_sums);
+          ghost_pq_half, subtract_outer_ghost,
+          E_floor_injected, clamp_count, d_residual_cells, signed_energy_cell);
       break;
     case 2:
       compatible_energy_update_1d_kernel<2><<<cw.blocks(), 256>>>(
@@ -3381,8 +4298,8 @@ void run_compatible_energy_update_1d(
           Q_half, node_r_half, odd_even_pair_force_half, p_extra_half, state.mass.data(),
           d_cell_is_void, cw.begin, cw.end, n_cells, dt,
           cfg.main.two_temperature ? 1 : 0, q_heat_to_electron,
-          ghost_pq_half, free_outer_boundary,
-          E_floor_injected, clamp_count, d_residual_sums);
+          ghost_pq_half, subtract_outer_ghost,
+          E_floor_injected, clamp_count, d_residual_cells, signed_energy_cell);
       break;
     default:
       compatible_energy_update_1d_kernel<0><<<cw.blocks(), 256>>>(
@@ -3390,16 +4307,18 @@ void run_compatible_energy_update_1d(
           Q_half, node_r_half, odd_even_pair_force_half, p_extra_half, state.mass.data(),
           d_cell_is_void, cw.begin, cw.end, n_cells, dt,
           cfg.main.two_temperature ? 1 : 0, q_heat_to_electron,
-          ghost_pq_half, free_outer_boundary,
-          E_floor_injected, clamp_count, d_residual_sums);
+          ghost_pq_half, subtract_outer_ghost,
+          E_floor_injected, clamp_count, d_residual_cells, signed_energy_cell);
       break;
   }
   sync_kernel("Hydro1D: compatible energy update kernel failed");
 
   compatible_energy_kinetic_residual_1d_kernel<<<nw.blocks(), 256>>>(
       state.mass.data(), v_old, v_new, nullptr, nw.begin, nw.end, n_cells,
-      d_residual_sums);
+      d_residual_nodes);
   sync_kernel("Hydro1D: compatible energy kinetic residual kernel failed");
+  core::deterministic_sum(d_residual_cells, n_cells, d_residual_sums + 0, false);
+  core::deterministic_sum(d_residual_nodes, n_nodes, d_residual_sums + 1, false);
 
   double residual_sums[2] = {0.0, 0.0};
   cuda_check(cudaMemcpy(residual_sums, d_residual_sums, 2 * sizeof(double),
@@ -3548,6 +4467,12 @@ namespace {
 void log_initial_mechanical_stability(const core::State& state, const core::Config& cfg) {
   const std::size_t n = state.rho.size();
   if (n == 0) {
+    return;
+  }
+  // A report on the initial state: a restart (step > 0) resumes a state in
+  // motion, where the materials' pressures legitimately differ and the
+  // advice for the deck's reference states does not apply.
+  if (state.step > 0) {
     return;
   }
   const auto& mats = cfg.materials.materials;
@@ -3719,15 +4644,40 @@ void Hydro1D::prepare_initial_sound_speed(core::State& state,
     dump_one("rho", state.rho.data());
   };
   h1d_dump5("i0");
-  enforce_eos_closure(state, cfg, use_two_temp, eos_views);
+  if (state.closure_fields_restored && state.cs.size() == state.rho.size()) {
+    // A restart from a checkpoint that holds the closure outputs: the state is the closed
+    // state of the run that wrote it. Closing it again would move ee, Te and Pe by rounding
+    // (the closure is not bitwise idempotent) and the restart would not continue that run.
+    state.ensure_cell_material_props(cfg);
+  } else {
+    enforce_eos_closure(state, cfg, use_two_temp, eos_views);
+    core::CellField1D cs_n;
+    cs_n.reset(state.rho.size());
+    compute_cell_sound_speed(cs_n, state, cfg, use_two_temp, eos_views);
+    state.cs = std::move(cs_n);
+  }
   h1d_dump5("i1");
+  log_initial_mechanical_stability(state, cfg);
+  log_exact_ideal_gas_step0_diagnostic(state, cfg, eos_views);
+}
 
+void Hydro1D::close_eos_and_sound_speed(core::State& state,
+                                        const core::Config& cfg,
+                                        const HydroEOSContext* eos_ctx) const {
+  if (state.rho.empty()) {
+    return;
+  }
+  const HydroTableViews eos_views = select_hydro_table_views(eos_ctx);
+  ensure_table_cv_fields(state, eos_views,
+                         cfg.numerics.hydro.compatible_energy ||
+                             !cfg.main.two_temperature ||
+                             cfg.numerics.hydro.qei_heat_capacity == "table");
+  const bool use_two_temp = cfg.main.two_temperature;
+  enforce_eos_closure(state, cfg, use_two_temp, eos_views);
   core::CellField1D cs_n;
   cs_n.reset(state.rho.size());
   compute_cell_sound_speed(cs_n, state, cfg, use_two_temp, eos_views);
   state.cs = std::move(cs_n);
-  log_initial_mechanical_stability(state, cfg);
-  log_exact_ideal_gas_step0_diagnostic(state, cfg, eos_views);
 }
 
 tenryu::coupling::HydroStepResult Hydro1D::lagrangian_step(
@@ -3909,8 +4859,7 @@ tenryu::coupling::HydroStepResult Hydro1D::lagrangian_step(
       (cfg.numerics.hydro.T_start_inactive_cells == "rigid_wall");
   const std::int8_t* d_hydro_active_qei =
       rigid_inactive_cells ? nullptr : d_hydro_active;
-  std::uint8_t* d_cell_is_void =
-      upload_cell_is_void(state.cell_is_void, "cell_is_void_step");
+  const std::uint8_t* d_cell_is_void = core::device_cell_is_void(state.cell_is_void);
   const auto h1d_dump6 = [&](const char* phase) {
     const char* dbg = std::getenv("TENRYU_H1D_DEBUG");
     if (dbg == nullptr) {
@@ -4045,17 +4994,40 @@ tenryu::coupling::HydroStepResult Hydro1D::lagrangian_step(
     return max_value;
   };
   double* d_floors_pack = static_cast<double*>(core::device_scratch_acquire(
-      "hydro_1d:lagrangian_step:floors_pack", 2 * sizeof(double)));
+      "hydro_1d:lagrangian_step:step_pack", 3 * sizeof(double)));
   double* d_hydro_floor = d_floors_pack + 0;
   int* d_hydro_clamp_count =
       reinterpret_cast<int*>(reinterpret_cast<unsigned char*>(d_floors_pack) + 8);
   int* d_rho_clamp_count =
       reinterpret_cast<int*>(reinterpret_cast<unsigned char*>(d_floors_pack) + 12);
-  {
-    const double h_floors_init[2] = {0.0, 0.0};
-    cuda_check(cudaMemcpy(d_floors_pack, h_floors_init, sizeof(h_floors_init),
-                          cudaMemcpyHostToDevice),
-               "Hydro1D: init floors pack failed");
+  int* d_failing_cell =
+      reinterpret_cast<int*>(reinterpret_cast<unsigned char*>(d_floors_pack) + 16);
+  // Floor-injection ledger: every kernel adds its contribution to the cell's
+  // slot and the step sums the slots in a fixed order into d_hydro_floor
+  // (bitwise run to run; the atomicAdd accumulation followed the thread
+  // schedule, 2026-09-24). Zeroed with the step pack in one launch.
+  const int n_floor_cells = std::max(n_cells, 1);
+  double* d_floor_cells = static_cast<double*>(core::device_scratch_acquire(
+      "hydro_1d:lagrangian_step:floor_cells",
+      static_cast<std::size_t>(n_floor_cells) * sizeof(double)));
+  init_lagrangian_step_pack_kernel<<<(n_floor_cells + 255) / 256, 256>>>(
+      d_floors_pack, d_floor_cells, n_floor_cells, n_cells);
+  cuda_check(cudaGetLastError(), "Hydro1D: init step pack launch failed");
+  // Per-cell zero floor of the energy updates (signed_energy_cells_kernel).
+  auto* d_signed_energy_cell = static_cast<std::uint8_t*>(core::device_scratch_acquire(
+      "hydro_1d:lagrangian_step:signed_energy_cell",
+      static_cast<std::size_t>(std::max(n_cells, 1)) * sizeof(std::uint8_t)));
+  if (n_cells > 0) {
+    signed_energy_cells_kernel<<<(n_cells + 255) / 256, 256>>>(
+        d_signed_energy_cell, cell_table_selector(eos_views, state), eos_views.tab_ion,
+        eos_views.tab_ele, eos_views.tab_total, use_two_temp ? 1 : 0,
+        // With per-material closure parameters the kernel decides per cell.
+        (eos_views.cell_tables.closure_params == nullptr &&
+         (use_helmholtz_spline_backend(eos_views) || use_helmholtz_jet_backend(eos_views)))
+            ? 1
+            : 0,
+        n_cells);
+    cuda_check(cudaGetLastError(), "Hydro1D: signed energy cell mask launch failed");
   }
 
   const long long probe_step = static_cast<long long>(state.step) + 1;
@@ -4120,16 +5092,23 @@ tenryu::coupling::HydroStepResult Hydro1D::lagrangian_step(
     core::log_info(ebal_os.str());
   }
   h1d_dump4("e1");
-  const double E_before = apply_1t_energy_renorm
-                              ? allreduce_sum_scalar(
-                                    diagnostics::compute_energy_budget_1d(state).E_total)
-                              : 0.0;
+  // The 1T renormalization measures the kinetic energy on the nodes, the
+  // kinetic energy of the staggered momentum update (and of the radiation
+  // pressure work W_r, dK = F ubar dt per node, paid by the field in the
+  // driver). It used the cell-averaged form except under radiation pressure,
+  // which moved the difference of the two forms into the internal energy
+  // wherever the velocity varies across the cells (2026-09-24).
+  const auto renorm_energy_total = [&]() {
+    const diagnostics::EnergyTotals totals = diagnostics::compute_energy_totals_1d(state);
+    return allreduce_sum_scalar((totals.E_int_e + totals.E_int_i) + totals.E_kin_nodal);
+  };
+  const double E_before = apply_1t_energy_renorm ? renorm_energy_total() : 0.0;
 
   const bool av_eos_aware_active =
       use_vnr_av && cfg.numerics.hydro.av_eos_aware &&
-      (eos_views.tab_total.n_rho > 0 || eos_views.tab_ion.n_rho > 0 ||
-       eos_views.tab_ele.n_rho > 0 || eos_views.spline_total.n_rho > 0 ||
-       eos_views.jet_total.n_rho > 0);
+      (eos_views.any_material_table || eos_views.tab_total.n_rho > 0 ||
+       eos_views.tab_ion.n_rho > 0 || eos_views.tab_ele.n_rho > 0 ||
+       eos_views.spline_total.n_rho > 0 || eos_views.jet_total.n_rho > 0);
   const double av_c1_scalar =
       adaptive_av_enabled ? adaptive_av_cfg.base.c1
                           : (use_csw_av ? cfg.numerics.hydro.csw_C1
@@ -4160,9 +5139,12 @@ tenryu::coupling::HydroStepResult Hydro1D::lagrangian_step(
                          cfg.numerics.hydro.csw_zero_uniform_compression,
                          cfg.numerics.hydro.csw_diagnostics);
   // reset() zero-fills; keep that contract without the per-step realloc (perf lane B).
+  // compute_cell_sound_speed writes the ghost window pw: when it covers every
+  // cell the zero fill is overwritten and skipped.
+  const bool pw_covers_cells = pw.begin <= 0 && pw.end >= n_cells;
   if (cs_pingpong_.size() != n_cells) {
     cs_pingpong_.reset(n_cells);
-  } else {
+  } else if (!pw_covers_cells) {
     cuda_check(cudaMemset(cs_pingpong_.data(), 0,
                           static_cast<std::size_t>(n_cells) * sizeof(double)),
                "Hydro1D: cs_pingpong_ zero reset failed");
@@ -4235,58 +5217,44 @@ tenryu::coupling::HydroStepResult Hydro1D::lagrangian_step(
   core::ScratchCellField1D Pe_old;
   core::ScratchCellField1D Pi_old;
   core::ScratchCellField1D Q_old;
-  r_old.reset("hydro1d_r_old", state.x_r.size());
-  u_old.reset("hydro1d_u_old", state.v_r.size());
-  V_old.reset("hydro1d_V_old", state.vol.size());
-  e_old.reset("hydro1d_e_old", state.ee.size());
-  Pe_old.reset("hydro1d_Pe_old", n_cells);
-  Pi_old.reset("hydro1d_Pi_old", n_cells);
-  Q_old.reset("hydro1d_Q_old", n_cells);
+  // The step-start state, copied whole (no zero fill: every element is
+  // overwritten) by one kernel in place of a cudaMemcpy per field.
+  TENRYU_ASSERT(state.v_r.size() == static_cast<std::size_t>(n_nodes) &&
+                    state.vol.size() == static_cast<std::size_t>(n_cells) &&
+                    state.ee.size() == static_cast<std::size_t>(n_cells) &&
+                    (!use_two_temp || state.ei.size() == static_cast<std::size_t>(n_cells)),
+                "Hydro1D: step-start fields must match the mesh");
+  r_old.reset_for_overwrite("hydro1d_r_old", state.x_r.size());
+  u_old.reset_for_overwrite("hydro1d_u_old", state.v_r.size());
+  V_old.reset_for_overwrite("hydro1d_V_old", state.vol.size());
+  e_old.reset_for_overwrite("hydro1d_e_old", state.ee.size());
+  Pe_old.reset_for_overwrite("hydro1d_Pe_old", n_cells);
+  Pi_old.reset_for_overwrite("hydro1d_Pi_old", n_cells);
+  Q_old.reset_for_overwrite("hydro1d_Q_old", n_cells);
   if (use_two_temp) {
-    ei_old.reset("hydro1d_ei_old", state.ei.size());
+    ei_old.reset_for_overwrite("hydro1d_ei_old", state.ei.size());
   }
-
-  cuda_check(cudaMemcpy(r_old.data(), state.x_r.data(), n_nodes * sizeof(double),
-                        cudaMemcpyDeviceToDevice),
-             "Hydro1D: copy r_old failed");
-  cuda_check(cudaMemcpy(u_old.data(), state.v_r.data(), n_nodes * sizeof(double),
-                        cudaMemcpyDeviceToDevice),
-             "Hydro1D: copy u_old failed");
-  cuda_check(cudaMemcpy(V_old.data(), state.vol.data(), n_cells * sizeof(double),
-                        cudaMemcpyDeviceToDevice),
-             "Hydro1D: copy V_old failed");
-  cuda_check(cudaMemcpy(e_old.data(), state.ee.data(), n_cells * sizeof(double),
-                        cudaMemcpyDeviceToDevice),
-             "Hydro1D: copy e_old failed");
-  cuda_check(cudaMemcpy(Pe_old.data(), state.Pe.data(), n_cells * sizeof(double),
-                        cudaMemcpyDeviceToDevice),
-             "Hydro1D: copy Pe_old failed");
-  cuda_check(cudaMemcpy(Pi_old.data(), state.Pi.data(), n_cells * sizeof(double),
-                        cudaMemcpyDeviceToDevice),
-             "Hydro1D: copy Pi_old failed");
-  cuda_check(cudaMemcpy(Q_old.data(), state.Qvisc.data(), n_cells * sizeof(double),
-                        cudaMemcpyDeviceToDevice),
-             "Hydro1D: copy Q_old failed");
-  if (use_two_temp) {
-    cuda_check(cudaMemcpy(ei_old.data(), state.ei.data(), n_cells * sizeof(double),
-                          cudaMemcpyDeviceToDevice),
-               "Hydro1D: copy ei_old failed");
+  {
+    double* dsts[8] = {r_old.data(), u_old.data(), V_old.data(), e_old.data(),
+                       Pe_old.data(), Pi_old.data(), Q_old.data(), ei_old.data()};
+    const double* srcs[8] = {state.x_r.data(), state.v_r.data(), state.vol.data(),
+                             state.ee.data(), state.Pe.data(), state.Pi.data(),
+                             state.Qvisc.data(), state.ei.data()};
+    const int counts[8] = {n_nodes, n_nodes, n_cells, n_cells, n_cells, n_cells, n_cells, n_cells};
+    core::copy_device_arrays(dsts, srcs, counts, use_two_temp ? 8 : 7);
   }
 
   std::uint8_t* d_node_active = nullptr;
   d_node_active = static_cast<std::uint8_t*>(core::device_scratch_acquire(
       "hydro_1d:lagrangian_step:d_node_active",
       n_nodes * sizeof(std::uint8_t)));
-  cuda_check(cudaMemset(d_node_active, 0, n_nodes * sizeof(std::uint8_t)),
-             "Hydro1D: cudaMemset node_active failed");
-  compute_node_activity_kernel<<<cw.blocks(), 256>>>(d_node_active, d_hydro_active,
-                                                      cw.begin, cw.end, n_cells,
-                                                      rigid_inactive_cells ? 1 : 0);
-  zero_center_node_kernel<<<1, 1>>>(d_node_active, n_nodes);
-  sync_kernel("Hydro1D: compute_node_activity kernel failed");
+  node_activity_1d_kernel<<<(n_nodes + 255) / 256, 256>>>(
+      d_node_active, d_hydro_active, cw.begin, cw.end, n_cells, n_nodes,
+      rigid_inactive_cells ? 1 : 0);
+  sync_kernel("Hydro1D: node_activity kernel failed");
 
   core::ScratchCellField1D pq_n;
-  pq_n.reset("hydro1d_pq_n", n_cells);
+  reset_step_scratch(pq_n, "hydro1d_pq_n", n_cells, pw);
   if (pq_extra_ptr != nullptr) {
     build_cell_pq_kernel<true><<<pw.blocks(), 256>>>(
         pq_n.data(), state.Pe.data(), state.Pi.data(), state.Qvisc.data(),
@@ -4316,7 +5284,7 @@ tenryu::coupling::HydroStepResult Hydro1D::lagrangian_step(
   }
 
   core::ScratchNodeField1D a_n;
-  a_n.reset("hydro1d_a_n", n_nodes);
+  reset_step_scratch(a_n, "hydro1d_a_n", n_nodes, nw);
   const auto bc = parse_boundary_type_1d(cfg);
   const double boundary_pressure_n = pressure_ghost_1d(state, cfg, bc, t_op);
   switch (geom_code) {
@@ -4425,7 +5393,7 @@ tenryu::coupling::HydroStepResult Hydro1D::lagrangian_step(
   }
 
   core::ScratchNodeField1D u_half;
-  u_half.reset("hydro1d_u_half", n_nodes);
+  reset_step_scratch(u_half, "hydro1d_u_half", n_nodes, nw);
   predictor_update_kernel<<<nw.blocks(), 256>>>(
       state.v_r.data(), state.x_r.data(), u_half.data(), u_old.data(), r_old.data(),
       a_n.data(), d_node_active, nw.begin, nw.end, n_nodes, dt);
@@ -4433,7 +5401,7 @@ tenryu::coupling::HydroStepResult Hydro1D::lagrangian_step(
 
   // rigid_wall inactive cells hold their nodes: no displacement propagation.
   if (!rigid_inactive_cells) {
-    propagate_void_node_displacement_kernel<<<1, 1>>>(
+    propagate_void_node_displacement_parallel_kernel<<<(n_nodes + 255) / 256, 256>>>(
         state.x_r.data(), state.v_r.data(), r_old.data(), d_node_active, n_nodes);
     sync_kernel("Hydro1D: propagate_void_node predictor failed");
   }
@@ -4494,7 +5462,7 @@ tenryu::coupling::HydroStepResult Hydro1D::lagrangian_step(
         state.ee.data(), state.ei.data(), state.vol.data(), V_old.data(),
         state.mass.data(), Pe_old.data(), Pi_old.data(), Q_old.data(),
         d_hydro_active, d_cell_is_void, n_cells, use_two_temp ? 1 : 0,
-        q_heat_to_electron);
+        q_heat_to_electron, d_signed_energy_cell);
     sync_kernel("Hydro1D: predictor_energy_half_step kernel failed");
   }
   enforce_eos_closure(state, cfg, use_two_temp, eos_views);
@@ -4539,7 +5507,7 @@ tenryu::coupling::HydroStepResult Hydro1D::lagrangian_step(
   core::ScratchCellField1D q2_half;
   core::ScratchCellField1D div_u_half;
   core::ScratchCellField1D cs_half;
-  cs_half.reset("hydro1d_cs_half", n_cells);
+  reset_step_scratch(cs_half, "hydro1d_cs_half", n_cells, pw);
   compute_cell_sound_speed(cs_half, state, cfg, use_two_temp, eos_views);
   exchange_cell_ghosts({state.rho.data(), state.vol.data(), state.Te.data(),
                         state.Ti.data(), state.Pe.data(), state.Pi.data(),
@@ -4590,24 +5558,26 @@ tenryu::coupling::HydroStepResult Hydro1D::lagrangian_step(
   core::ScratchCellField1D rho_half;
   core::ScratchCellField1D Te_half;
   core::ScratchCellField1D Ti_half;
-  P_half.reset("hydro1d_P_half", n_cells);
-  Pi_half.reset("hydro1d_Pi_half", n_cells);
-  Q_half.reset("hydro1d_Q_half", n_cells);
+  // midpoint_v2 copies every cell below; the average writes the ghost window pw.
+  const core::State::LaunchWindow half_window =
+      midpoint_v2 ? core::State::LaunchWindow{0, n_cells} : pw;
+  reset_step_scratch(P_half, "hydro1d_P_half", n_cells, half_window);
+  reset_step_scratch(Pi_half, "hydro1d_Pi_half", n_cells, half_window);
+  reset_step_scratch(Q_half, "hydro1d_Q_half", n_cells, half_window);
   if (use_two_temp) {
-    rho_half.reset("hydro1d_rho_half", n_cells);
-    Te_half.reset("hydro1d_Te_half", n_cells);
-    Ti_half.reset("hydro1d_Ti_half", n_cells);
+    // Copied whole from the mid-step closure below (no zero fill).
+    rho_half.reset_for_overwrite("hydro1d_rho_half", n_cells);
+    Te_half.reset_for_overwrite("hydro1d_Te_half", n_cells);
+    Ti_half.reset_for_overwrite("hydro1d_Ti_half", n_cells);
   }
   if (midpoint_v2) {
     // midpoint_v2: the stage closure already sits at t^{n+1/2}; averaging it
     // with t^n values would re-introduce the legacy quarter-step bias
     // (2026-07-26 review), so the corrector energy uses the stage values directly.
-    copy_array_kernel<<<blocks_cells, 256>>>(P_half.data(), state.Pe.data(),
-                                             n_cells);
-    copy_array_kernel<<<blocks_cells, 256>>>(Pi_half.data(), state.Pi.data(),
-                                             n_cells);
-    copy_array_kernel<<<blocks_cells, 256>>>(Q_half.data(), state.Qvisc.data(),
-                                             n_cells);
+    double* dsts[3] = {P_half.data(), Pi_half.data(), Q_half.data()};
+    const double* srcs[3] = {state.Pe.data(), state.Pi.data(), state.Qvisc.data()};
+    const int counts[3] = {n_cells, n_cells, n_cells};
+    core::copy_device_arrays(dsts, srcs, counts, 3);
   } else {
     // Ghost-inclusive (§6o.4l -> real defect): the odd-even pair-force
     // stencil inside the compatible energy update reads _half values at
@@ -4615,15 +5585,11 @@ tenryu::coupling::HydroStepResult Hydro1D::lagrangian_step(
     // ghost P_half/Q_half (2-ulp ee flips from step 1's second half-step).
     // Inputs (Pe_old snapshot, closure outputs) are ghost-fresh, so the
     // ghost averages equal the owner's bitwise. Serial: pw == [0, n).
-    average_arrays_kernel<<<pw.blocks(), 256>>>(
-        P_half.data() + pw.begin, Pe_old.data() + pw.begin,
-        state.Pe.data() + pw.begin, pw.count());
-    average_arrays_kernel<<<pw.blocks(), 256>>>(
-        Pi_half.data() + pw.begin, Pi_old.data() + pw.begin,
-        state.Pi.data() + pw.begin, pw.count());
-    average_arrays_kernel<<<pw.blocks(), 256>>>(
-        Q_half.data() + pw.begin, Q_old.data() + pw.begin,
-        state.Qvisc.data() + pw.begin, pw.count());
+    average_three_arrays_kernel<<<pw.blocks(), 256>>>(
+        P_half.data() + pw.begin, Pe_old.data() + pw.begin, state.Pe.data() + pw.begin,
+        Pi_half.data() + pw.begin, Pi_old.data() + pw.begin, state.Pi.data() + pw.begin,
+        Q_half.data() + pw.begin, Q_old.data() + pw.begin, state.Qvisc.data() + pw.begin,
+        pw.count());
   }
   sync_kernel("Hydro1D: build P_half/Pi_half/Q_half kernels failed");
   if (probe_on) {
@@ -4676,19 +5642,14 @@ tenryu::coupling::HydroStepResult Hydro1D::lagrangian_step(
     sync_kernel("Hydro1D: ion_artificial_heat kernel failed");
   }
   if (use_two_temp) {
-    cuda_check(cudaMemcpy(rho_half.data(), state.rho.data(), n_cells * sizeof(double),
-                          cudaMemcpyDeviceToDevice),
-               "Hydro1D: copy rho_half failed");
-    cuda_check(cudaMemcpy(Te_half.data(), state.Te.data(), n_cells * sizeof(double),
-                          cudaMemcpyDeviceToDevice),
-               "Hydro1D: copy Te_half failed");
-    cuda_check(cudaMemcpy(Ti_half.data(), state.Ti.data(), n_cells * sizeof(double),
-                          cudaMemcpyDeviceToDevice),
-               "Hydro1D: copy Ti_half failed");
+    double* dsts[3] = {rho_half.data(), Te_half.data(), Ti_half.data()};
+    const double* srcs[3] = {state.rho.data(), state.Te.data(), state.Ti.data()};
+    const int counts[3] = {n_cells, n_cells, n_cells};
+    core::copy_device_arrays(dsts, srcs, counts, 3);
   }
 
   core::ScratchCellField1D pq_half;
-  pq_half.reset("hydro1d_pq_half", n_cells);
+  reset_step_scratch(pq_half, "hydro1d_pq_half", n_cells, pw);
   if (pq_extra_ptr != nullptr) {
     build_cell_pq_kernel<true><<<pw.blocks(), 256>>>(
         pq_half.data(), state.Pe.data(), state.Pi.data(), state.Qvisc.data(),
@@ -4712,7 +5673,7 @@ tenryu::coupling::HydroStepResult Hydro1D::lagrangian_step(
   }
 
   core::ScratchNodeField1D a_half;
-  a_half.reset("hydro1d_a_half", n_nodes);
+  reset_step_scratch(a_half, "hydro1d_a_half", n_nodes, nw);
   const double boundary_pressure_half =
       pressure_ghost_1d(state, cfg, bc, t_op + 0.5 * dt);
   switch (geom_code) {
@@ -4907,7 +5868,7 @@ tenryu::coupling::HydroStepResult Hydro1D::lagrangian_step(
 
   // rigid_wall inactive cells hold their nodes: no displacement propagation.
   if (!rigid_inactive_cells) {
-    propagate_void_node_displacement_kernel<<<1, 1>>>(
+    propagate_void_node_displacement_parallel_kernel<<<(n_nodes + 255) / 256, 256>>>(
         state.x_r.data(), state.v_r.data(), r_old.data(), d_node_active, n_nodes);
     sync_kernel("Hydro1D: propagate_void_node corrector failed");
   }
@@ -4947,6 +5908,13 @@ tenryu::coupling::HydroStepResult Hydro1D::lagrangian_step(
     d_hk_tau_blocked = reinterpret_cast<int*>(d_hk_pack + 3);
     cuda_check(cudaMemset(d_hk_pack, 0, 4 * sizeof(double)),
                "Hydro1D: cudaMemset hk pack failed");
+    // Removed kinetic energy per cell, summed in a fixed order below.
+    double* d_hk_ke_cells = static_cast<double*>(core::device_scratch_acquire(
+        "hydro_1d:lagrangian_step:hk_ke_cells",
+        static_cast<std::size_t>(std::max(n_cells, 1)) * sizeof(double)));
+    cuda_check(cudaMemset(d_hk_ke_cells, 0,
+                          static_cast<std::size_t>(std::max(n_cells, 1)) * sizeof(double)),
+               "Hydro1D: cudaMemset hk ke cells failed");
 
     core::ScratchNodeField1D hk_velocity_dv;
     hk_velocity_dv.reset("hydro1d_hk_velocity_dv", n_nodes);
@@ -4974,9 +5942,10 @@ tenryu::coupling::HydroStepResult Hydro1D::lagrangian_step(
           cfg.numerics.hydro.hk_velocity_damper_grad_Te_max,
           cfg.numerics.hydro.hk_velocity_damper_grad_rho_max,
           d_hk_active_pairs, d_hk_front_blocked, d_hk_tau_blocked,
-          d_hk_ke_removed);
+          d_hk_ke_cells);
       sync_kernel("Hydro1D: high-k velocity damper impulse kernel failed");
     }
+    core::deterministic_sum(d_hk_ke_cells, n_cells, d_hk_ke_removed, false);
 
     int hk_active_pairs = 0;
     int hk_front_blocked = 0;
@@ -5017,12 +5986,15 @@ tenryu::coupling::HydroStepResult Hydro1D::lagrangian_step(
     if (bc == HydroBoundaryType::PRESSURE) {
       TENRYU_ASSERT(state.pressure_drive_1d.has_value(),
                     "pressure boundary requires initialized pressure_drive_1d table");
+      // The acceleration's ghost is P_bc + Q_last: the boundary node feels no
+      // viscous force, so the last cell's outer face does no Q work either
+      // (subtracted below as for FREE); P_bc's work is the external boundary
+      // work the driver books.
       double qvisc_last = 0.0;
       cuda_check(cudaMemcpy(&qvisc_last, state.Qvisc.data() + n_cells - 1,
                             sizeof(double), cudaMemcpyDeviceToHost),
                  "Hydro1D: copy compatible Qvisc boundary failed");
-      ghost_pq_half =
-          state.pressure_drive_1d->eval(t_op + 0.5 * dt) + qvisc_last;
+      ghost_pq_half = qvisc_last;
     } else if (bc == HydroBoundaryType::FIXED ||
                bc == HydroBoundaryType::REFLECT) {
       double pe_last = 0.0;
@@ -5042,7 +6014,7 @@ tenryu::coupling::HydroStepResult Hydro1D::lagrangian_step(
       // Free boundary: the acceleration kernel adds the boundary cell's Q as
       // the ghost (zero-gradient Q, no viscous force on the free surface) and
       // the compatible energy update subtracts the same ghost from the last
-      // cell's outer face (free_outer_boundary). The 2026-08-04 device-read
+      // cell's outer face (subtract_outer_ghost). The 2026-08-04 device-read
       // change (b2ed6651d) left ghost_pq_half = 0 for FREE — the only
       // boundary type whose ghost the energy update consumes — so the work
       // Q_last A u dt was created every step at a free outer boundary
@@ -5100,8 +6072,9 @@ tenryu::coupling::HydroStepResult Hydro1D::lagrangian_step(
         P_half.data(), Pi_half.data(), Q_half.data(), r_half_compat.data(),
         odd_even_pair_force_half.empty() ? nullptr : odd_even_pair_force_half.data(),
         pq_extra_ptr,
-        n_cells, ghost_pq_half, bc == HydroBoundaryType::FREE ? 1 : 0,
-        d_hydro_floor, d_hydro_clamp_count);
+        n_cells, ghost_pq_half,
+        (bc == HydroBoundaryType::FREE || bc == HydroBoundaryType::PRESSURE) ? 1 : 0,
+        d_floor_cells, d_hydro_clamp_count, d_signed_energy_cell);
     if (const char* h1dbgw = std::getenv("TENRYU_H1D_DEBUG")) {
       // Diagnostic-only (§6o.4l audit lane): ee right after the compatible
       // energy update, sequence-numbered like the rest of the H1D dumps.
@@ -5122,7 +6095,9 @@ tenryu::coupling::HydroStepResult Hydro1D::lagrangian_step(
         std::fclose(fp);
       }
     }
-    if (use_two_temp) {
+    // The electron-ion exchange is applied once per step: by the radiation
+    // thermal subcycle when it runs, otherwise here (compatible energy path).
+    if (use_two_temp && !core::thermal_subcycle_active(cfg)) {
       const auto& mat = cfg.materials.materials.front();
       const int energy_authoritative_qei =
           (cfg.numerics.hydro.eos_closure_mode == "energy_authoritative") ? 1 : 0;
@@ -5138,7 +6113,7 @@ tenryu::coupling::HydroStepResult Hydro1D::lagrangian_step(
             d_hydro_active_qei, cw.begin, cw.end, n_cells, dt,
             state.gamma_eff.data(), state.A_eff.data(), mat.Z,
             cfg.numerics.hydro.qei_multiplier,
-            d_hydro_floor, d_hydro_clamp_count, state.zmom_r2.data(),
+            d_floor_cells, d_hydro_clamp_count, state.zmom_r2.data(),
             eos_views.tab_ion, eos_views.tab_ele, cell_table_selector(eos_views, state),
             cfg.numerics.floors.Te, cfg.numerics.floors.Ti, energy_authoritative_qei);
       } else {
@@ -5148,7 +6123,7 @@ tenryu::coupling::HydroStepResult Hydro1D::lagrangian_step(
             d_hydro_active_qei, cw.begin, cw.end, n_cells, dt,
             state.gamma_eff.data(), state.A_eff.data(), mat.Z,
             cfg.numerics.hydro.qei_multiplier,
-            d_hydro_floor, d_hydro_clamp_count, nullptr,
+            d_floor_cells, d_hydro_clamp_count, nullptr,
             eos_views.tab_ion, eos_views.tab_ele, cell_table_selector(eos_views, state),
             cfg.numerics.floors.Te, cfg.numerics.floors.Ti, energy_authoritative_qei);
       }
@@ -5158,6 +6133,12 @@ tenryu::coupling::HydroStepResult Hydro1D::lagrangian_step(
     const auto& mat = cfg.materials.materials.front();
     const int energy_authoritative_update =
         (cfg.numerics.hydro.eos_closure_mode == "energy_authoritative") ? 1 : 0;
+    // The electron-ion exchange is applied once per step: by the radiation
+    // thermal subcycle when it runs, otherwise by the two hydro halves.
+    // rigid_wall inactive cells take the full update with the Qei mask: their
+    // nodes are held, so the work terms vanish (dV = 0) and only the
+    // exchange acts (SPECIFICATION §6.4 T_start_inactive_cells).
+    const int hydro_applies_exchange = core::thermal_subcycle_active(cfg) ? 0 : 1;
     // Numerics.hydro.qei_heat_capacity = "table": couple with the table
     // closure's cv_e / cv_i (as the compatible-energy path does) instead of
     // the analytic ideal-gas heat capacities (2026-09-14).
@@ -5174,45 +6155,48 @@ tenryu::coupling::HydroStepResult Hydro1D::lagrangian_step(
             state.ee.data(), state.ei.data(), e_old.data(), ei_old.data(), rho_half.data(),
             Te_half.data(), Ti_half.data(), state.x_r.data(), r_old.data(), u_half.data(),
             state.vol.data(), V_old.data(), state.mass.data(), P_half.data(), Pi_half.data(),
-            Q_half.data(), state.zbar.data(), d_hydro_active,
+            Q_half.data(), state.zbar.data(), d_hydro_active_qei,
             cw.begin, cw.end, n_cells, dt,
             state.gamma_eff.data(), state.A_eff.data(), mat.Z,
             cfg.numerics.hydro.qei_multiplier,
             eos_views.tab_ion, eos_views.tab_ele, cell_table_selector(eos_views, state),
             cv_e_qei_ptr, cv_i_qei_ptr, q_heat_to_electron, legacy_volume_compatible_energy,
             state.eta_compatible.empty() ? nullptr : state.eta_compatible.data(),
-            d_hydro_floor, d_hydro_clamp_count, cfg.numerics.floors.Te,
-            cfg.numerics.floors.Ti, energy_authoritative_update);
+            d_floor_cells, d_hydro_clamp_count, cfg.numerics.floors.Te,
+            cfg.numerics.floors.Ti, energy_authoritative_update,
+            hydro_applies_exchange);
         break;
       case 2:
         energy_update_with_old_volume_2t_kernel<2><<<cw.blocks(), 256>>>(
             state.ee.data(), state.ei.data(), e_old.data(), ei_old.data(), rho_half.data(),
             Te_half.data(), Ti_half.data(), state.x_r.data(), r_old.data(), u_half.data(),
             state.vol.data(), V_old.data(), state.mass.data(), P_half.data(), Pi_half.data(),
-            Q_half.data(), state.zbar.data(), d_hydro_active,
+            Q_half.data(), state.zbar.data(), d_hydro_active_qei,
             cw.begin, cw.end, n_cells, dt,
             state.gamma_eff.data(), state.A_eff.data(), mat.Z,
             cfg.numerics.hydro.qei_multiplier,
             eos_views.tab_ion, eos_views.tab_ele, cell_table_selector(eos_views, state),
             cv_e_qei_ptr, cv_i_qei_ptr, q_heat_to_electron, legacy_volume_compatible_energy,
             state.eta_compatible.empty() ? nullptr : state.eta_compatible.data(),
-            d_hydro_floor, d_hydro_clamp_count, cfg.numerics.floors.Te,
-            cfg.numerics.floors.Ti, energy_authoritative_update);
+            d_floor_cells, d_hydro_clamp_count, cfg.numerics.floors.Te,
+            cfg.numerics.floors.Ti, energy_authoritative_update,
+            hydro_applies_exchange);
         break;
       default:
         energy_update_with_old_volume_2t_kernel<0><<<cw.blocks(), 256>>>(
             state.ee.data(), state.ei.data(), e_old.data(), ei_old.data(), rho_half.data(),
             Te_half.data(), Ti_half.data(), state.x_r.data(), r_old.data(), u_half.data(),
             state.vol.data(), V_old.data(), state.mass.data(), P_half.data(), Pi_half.data(),
-            Q_half.data(), state.zbar.data(), d_hydro_active,
+            Q_half.data(), state.zbar.data(), d_hydro_active_qei,
             cw.begin, cw.end, n_cells, dt,
             state.gamma_eff.data(), state.A_eff.data(), mat.Z,
             cfg.numerics.hydro.qei_multiplier,
             eos_views.tab_ion, eos_views.tab_ele, cell_table_selector(eos_views, state),
             cv_e_qei_ptr, cv_i_qei_ptr, q_heat_to_electron, legacy_volume_compatible_energy,
             state.eta_compatible.empty() ? nullptr : state.eta_compatible.data(),
-            d_hydro_floor, d_hydro_clamp_count, cfg.numerics.floors.Te,
-            cfg.numerics.floors.Ti, energy_authoritative_update);
+            d_floor_cells, d_hydro_clamp_count, cfg.numerics.floors.Te,
+            cfg.numerics.floors.Ti, energy_authoritative_update,
+            hydro_applies_exchange);
         break;
     }
   } else {
@@ -5224,7 +6208,7 @@ tenryu::coupling::HydroStepResult Hydro1D::lagrangian_step(
             d_hydro_active, cw.begin, cw.end, n_cells, dt,
             legacy_volume_compatible_energy,
             state.eta_compatible.empty() ? nullptr : state.eta_compatible.data(),
-            d_hydro_floor, d_hydro_clamp_count);
+            d_floor_cells, d_hydro_clamp_count);
         break;
       case 2:
         energy_update_with_old_volume_kernel<2><<<cw.blocks(), 256>>>(
@@ -5233,7 +6217,7 @@ tenryu::coupling::HydroStepResult Hydro1D::lagrangian_step(
             d_hydro_active, cw.begin, cw.end, n_cells, dt,
             legacy_volume_compatible_energy,
             state.eta_compatible.empty() ? nullptr : state.eta_compatible.data(),
-            d_hydro_floor, d_hydro_clamp_count);
+            d_floor_cells, d_hydro_clamp_count);
         break;
       default:
         energy_update_with_old_volume_kernel<0><<<cw.blocks(), 256>>>(
@@ -5242,7 +6226,7 @@ tenryu::coupling::HydroStepResult Hydro1D::lagrangian_step(
             d_hydro_active, cw.begin, cw.end, n_cells, dt,
             legacy_volume_compatible_energy,
             state.eta_compatible.empty() ? nullptr : state.eta_compatible.data(),
-            d_hydro_floor, d_hydro_clamp_count);
+            d_floor_cells, d_hydro_clamp_count);
         break;
     }
   }
@@ -5256,100 +6240,70 @@ tenryu::coupling::HydroStepResult Hydro1D::lagrangian_step(
   }
   if (h_half_valid) {
     double* const heat_target = use_two_temp ? state.ei.data() : state.ee.data();
-    const int clamp_to_zero =
-        use_two_temp
-            ? (((use_helmholtz_spline_backend(eos_views) || use_helmholtz_jet_backend(eos_views)) ||
-                eos_views.tab_ion.n_rho > 0)
-                   ? 0
-                   : 1)
-            : 1;
     apply_artificial_heat_kernel<<<cw.blocks(), 256>>>(
         heat_target, h_half_pingpong_.data(), state.mass.data(), d_hydro_active,
-        cw.begin, cw.end, n_cells, dt, clamp_to_zero,
-        d_hydro_floor, d_hydro_clamp_count);
+        cw.begin, cw.end, n_cells, dt, d_signed_energy_cell,
+        d_floor_cells, d_hydro_clamp_count);
     sync_kernel("Hydro1D: artificial_heat kernel failed");
   }
   if (!H_ion_art_half.empty()) {
-    const int clamp_to_zero =
-        (((use_helmholtz_spline_backend(eos_views) || use_helmholtz_jet_backend(eos_views)) ||
-          eos_views.tab_ion.n_rho > 0)
-             ? 0
-             : 1);
     apply_artificial_heat_kernel<<<cw.blocks(), 256>>>(
         state.ei.data(), H_ion_art_half.data(), state.mass.data(), d_hydro_active,
-        cw.begin, cw.end, n_cells, dt, clamp_to_zero,
-        d_hydro_floor, d_hydro_clamp_count);
+        cw.begin, cw.end, n_cells, dt, d_signed_energy_cell,
+        d_floor_cells, d_hydro_clamp_count);
     sync_kernel("Hydro1D: ion_artificial_heat apply kernel failed");
   }
   if (!H_brag_half.empty()) {
     double* const heat_target =
         use_two_temp ? state.ei.data() : state.ee.data();
-    const int clamp_to_zero =
-        use_two_temp
-            ? (((use_helmholtz_spline_backend(eos_views) || use_helmholtz_jet_backend(eos_views)) ||
-                eos_views.tab_ion.n_rho > 0)
-                   ? 0
-                   : 1)
-            : 1;
     apply_artificial_heat_kernel<<<cw.blocks(), 256>>>(
         heat_target, H_brag_half.data(), state.mass.data(), d_hydro_active,
-        cw.begin, cw.end, n_cells, dt, clamp_to_zero,
-        d_hydro_floor, d_hydro_clamp_count);
+        cw.begin, cw.end, n_cells, dt, d_signed_energy_cell,
+        d_floor_cells, d_hydro_clamp_count);
     sync_kernel("Hydro1D: braginskii_heat apply kernel failed");
   }
   if (!H_brag_e_half.empty()) {
     // Electron-viscous heating goes to the electron energy in 2T and to the
     // single (total) energy in 1T — state.ee in both cases.
-    const int clamp_to_zero =
-        use_two_temp
-            ? (((use_helmholtz_spline_backend(eos_views) || use_helmholtz_jet_backend(eos_views)) ||
-                eos_views.tab_ion.n_rho > 0)
-                   ? 0
-                   : 1)
-            : 1;
     apply_artificial_heat_kernel<<<cw.blocks(), 256>>>(
         state.ee.data(), H_brag_e_half.data(), state.mass.data(),
-        d_hydro_active, cw.begin, cw.end, n_cells, dt, clamp_to_zero,
-        d_hydro_floor, d_hydro_clamp_count);
+        d_hydro_active, cw.begin, cw.end, n_cells, dt, d_signed_energy_cell,
+        d_floor_cells, d_hydro_clamp_count);
     sync_kernel("Hydro1D: braginskii_electron_heat apply kernel failed");
   }
   if (post_shock_heat_enabled && !state.shock_time.empty()) {
-    const int clamp_to_zero =
-        use_two_temp
-            ? (((use_helmholtz_spline_backend(eos_views) || use_helmholtz_jet_backend(eos_views)) ||
-                eos_views.tab_ion.n_rho > 0)
-                   ? 0
-                   : 1)
-            : 1;
+    core::ScratchNodeField1D post_shock_face_power;
+    post_shock_face_power.reset("hydro1d_post_shock_face_power", n_nodes);
+    // Faces of the owned cells: cw.begin .. cw.end (inclusive).
+    const int f_begin = cw.begin;
+    const int f_end = cw.end + 1;
+    const int face_blocks = (f_end - f_begin + 255) / 256;
+    double* ei_split = use_two_temp ? state.ei.data() : nullptr;
     switch (geom_code) {
       case 1:
-        apply_post_shock_heat_kernel<1><<<cw.blocks(), 256>>>(
-            state.ee.data(), use_two_temp ? state.ei.data() : nullptr, state.rho.data(),
-            cs_half.data(), state.x_r.data(), state.mass.data(), P_half.data(),
-            Pi_half.data(), state.shock_time.data(), d_hydro_active,
-            cw.begin, cw.end, n_cells, dt, t_half,
-            post_shock_heat_c, post_shock_heat_decay, use_two_temp ? 1 : 0,
-            clamp_to_zero, d_hydro_floor, d_hydro_clamp_count);
+        post_shock_heat_face_power_kernel<1><<<face_blocks, 256>>>(
+            post_shock_face_power.data(), state.rho.data(), state.ee.data(), ei_split,
+            cs_half.data(), state.shock_time.data(), state.x_r.data(), d_hydro_active,
+            f_begin, f_end, n_cells, t_half, post_shock_heat_c, post_shock_heat_decay);
         break;
       case 2:
-        apply_post_shock_heat_kernel<2><<<cw.blocks(), 256>>>(
-            state.ee.data(), use_two_temp ? state.ei.data() : nullptr, state.rho.data(),
-            cs_half.data(), state.x_r.data(), state.mass.data(), P_half.data(),
-            Pi_half.data(), state.shock_time.data(), d_hydro_active,
-            cw.begin, cw.end, n_cells, dt, t_half,
-            post_shock_heat_c, post_shock_heat_decay, use_two_temp ? 1 : 0,
-            clamp_to_zero, d_hydro_floor, d_hydro_clamp_count);
+        post_shock_heat_face_power_kernel<2><<<face_blocks, 256>>>(
+            post_shock_face_power.data(), state.rho.data(), state.ee.data(), ei_split,
+            cs_half.data(), state.shock_time.data(), state.x_r.data(), d_hydro_active,
+            f_begin, f_end, n_cells, t_half, post_shock_heat_c, post_shock_heat_decay);
         break;
       default:
-        apply_post_shock_heat_kernel<0><<<cw.blocks(), 256>>>(
-            state.ee.data(), use_two_temp ? state.ei.data() : nullptr, state.rho.data(),
-            cs_half.data(), state.x_r.data(), state.mass.data(), P_half.data(),
-            Pi_half.data(), state.shock_time.data(), d_hydro_active,
-            cw.begin, cw.end, n_cells, dt, t_half,
-            post_shock_heat_c, post_shock_heat_decay, use_two_temp ? 1 : 0,
-            clamp_to_zero, d_hydro_floor, d_hydro_clamp_count);
+        post_shock_heat_face_power_kernel<0><<<face_blocks, 256>>>(
+            post_shock_face_power.data(), state.rho.data(), state.ee.data(), ei_split,
+            cs_half.data(), state.shock_time.data(), state.x_r.data(), d_hydro_active,
+            f_begin, f_end, n_cells, t_half, post_shock_heat_c, post_shock_heat_decay);
         break;
     }
+    sync_kernel("Hydro1D: post_shock_heat face power kernel failed");
+    apply_post_shock_heat_kernel<<<cw.blocks(), 256>>>(
+        state.ee.data(), ei_split, post_shock_face_power.data(), state.mass.data(),
+        P_half.data(), Pi_half.data(), d_hydro_active, cw.begin, cw.end, dt,
+        use_two_temp ? 1 : 0, d_signed_energy_cell, d_floor_cells, d_hydro_clamp_count);
     sync_kernel("Hydro1D: post_shock_heat kernel failed");
   }
   if (electron_odd_even_enabled) {
@@ -5366,25 +6320,50 @@ tenryu::coupling::HydroStepResult Hydro1D::lagrangian_step(
     sync_kernel("Hydro1D: electron_odd_even_apply kernel failed");
   }
 
-  {
-    double h_floors[2] = {0.0, 0.0};
-    cuda_check(cudaMemcpy(h_floors, d_floors_pack, sizeof(h_floors),
-                          cudaMemcpyDeviceToHost),
-               "Hydro1D: copy floors pack failed");
-    local_E_floor = h_floors[0];
-    const auto* floors_bytes = reinterpret_cast<const unsigned char*>(h_floors);
-    std::memcpy(&local_clamp_count, floors_bytes + 8, sizeof(int));
-    std::memcpy(&local_rho_clamp_count, floors_bytes + 12, sizeof(int));
-  }
-
   if (probe_on) {
     hydro_step_probe(probe_step, "P9_preren",
                      {{"ee", {state.ee.data(), state.ee.size()}}});
   }
   if (apply_1t_energy_renorm) {
-    const double E_after =
-        allreduce_sum_scalar(diagnostics::compute_energy_budget_1d(state).E_total);
-    const double delta_E = E_before - E_after;
+    const double E_after = renorm_energy_total();
+    // Energy the step exchanges with the rest of the system is not an error
+    // of the step and stays: the kinetic energy the radiation pressure force
+    // gives the matter (its work W_r, which the driver then takes from the
+    // radiation field) and the floor injection (booked by the safety
+    // ledger; every floor write of the step comes after E_before). The
+    // rescaling corrects only the remainder.
+    double* d_exchange = static_cast<double*>(core::device_scratch_acquire(
+        "hydro_1d:lagrangian_step:renorm_exchange", 2 * sizeof(double)));
+    const bool have_rad_work = pq_extra_ptr != nullptr && p_extra_work != nullptr &&
+                               !p_extra_work->empty() && cw.count() > 0;
+    if (have_rad_work) {
+      std::size_t work_temp_bytes = 0U;
+      cuda_check(cub::DeviceReduce::Sum(nullptr, work_temp_bytes,
+                                        p_extra_work->data() + cw.begin,
+                                        d_exchange, cw.count()),
+                 "Hydro1D: radiation work reduce size query failed");
+      void* d_work_temp = core::device_scratch_acquire(
+          "hydro_1d:lagrangian_step:renorm_exchange_temp", work_temp_bytes);
+      cuda_check(cub::DeviceReduce::Sum(d_work_temp, work_temp_bytes,
+                                        p_extra_work->data() + cw.begin,
+                                        d_exchange, cw.count()),
+                 "Hydro1D: radiation work reduce failed");
+    } else {
+      cuda_check(cudaMemsetAsync(d_exchange, 0, sizeof(double)),
+                 "Hydro1D: radiation work zero failed");
+    }
+    core::deterministic_sum(d_floor_cells, n_cells, d_hydro_floor, false);
+    cuda_check(cudaMemcpyAsync(d_exchange + 1, d_hydro_floor, sizeof(double),
+                               cudaMemcpyDeviceToDevice),
+               "Hydro1D: floor energy copy failed");
+    double h_exchange[2] = {0.0, 0.0};
+    cuda_check(cudaMemcpy(h_exchange, d_exchange, sizeof(h_exchange),
+                          cudaMemcpyDeviceToHost),
+               "Hydro1D: exchange energy readback failed");
+    const double E_exchange =
+        allreduce_sum_scalar(h_exchange[0] + std::max(h_exchange[1], 0.0));
+    const double E_target = E_before + E_exchange;
+    const double delta_E = E_target - E_after;
     if (std::abs(E_before) > 0.0) {
       const double rel_corr = std::abs(delta_E) / std::abs(E_before);
       if (rel_corr > 1.0e-12) {
@@ -5469,9 +6448,8 @@ tenryu::coupling::HydroStepResult Hydro1D::lagrangian_step(
       }
 
       if (first_active >= 0) {
-        const double E_corrected =
-            allreduce_sum_scalar(diagnostics::compute_energy_budget_1d(state).E_total);
-        const double residual = E_before - E_corrected;
+        const double E_corrected = renorm_energy_total();
+        const double residual = E_target - E_corrected;
         // The residual patch targets one global cell; only its owner holds
         // valid ee/mass and applies the kernel (all ranks agree on the
         // residual value via the global sums above).
@@ -5518,7 +6496,7 @@ tenryu::coupling::HydroStepResult Hydro1D::lagrangian_step(
                       compatible_table_reclosure, compatible_table_reclosure);
   if (cs_pingpong_.size() != n_cells) {
     cs_pingpong_.reset(n_cells);
-  } else {
+  } else if (!pw_covers_cells) {
     cuda_check(cudaMemset(cs_pingpong_.data(), 0,
                           static_cast<std::size_t>(n_cells) * sizeof(double)),
                "Hydro1D: cs_pingpong_ zero reset failed");
@@ -5581,6 +6559,30 @@ tenryu::coupling::HydroStepResult Hydro1D::lagrangian_step(
       dump_z("cve", state.cv_e.data());
     }
   }
+  // W-B robustness: detect compression-driven node crossing (non-positive
+  // cell volume) at the end of the Lagrangian sub-step. With the driver
+  // full-step retry enabled this becomes a soft failure (restore + dt/2 via
+  // the standard snapshot machinery); otherwise fail hard here, earlier and
+  // with better context than the downstream laser/diagnostics geometry
+  // recompute that used to trip on it. The floor tallies (complete: no
+  // kernel after the energy updates touches them) come back in the same
+  // readback.
+  find_nonpositive_volume_1d_kernel<<<cw.blocks(), 256>>>(
+      state.vol.data(), d_failing_cell, cw.begin, cw.end, n_cells);
+  sync_kernel("Hydro1D find_nonpositive_volume kernel failed");
+  int failing_cell = n_cells;
+  core::deterministic_sum(d_floor_cells, n_cells, d_hydro_floor, false);
+  {
+    double h_pack[3] = {0.0, 0.0, 0.0};
+    cuda_check(cudaMemcpy(h_pack, d_floors_pack, sizeof(h_pack),
+                          cudaMemcpyDeviceToHost),
+               "Hydro1D: copy step pack failed");
+    local_E_floor = h_pack[0];
+    const auto* pack_bytes = reinterpret_cast<const unsigned char*>(h_pack);
+    std::memcpy(&local_clamp_count, pack_bytes + 8, sizeof(int));
+    std::memcpy(&local_rho_clamp_count, pack_bytes + 12, sizeof(int));
+    std::memcpy(&failing_cell, pack_bytes + 16, sizeof(int));
+  }
   if (E_floor_injected != nullptr) {
     *E_floor_injected += std::max(local_E_floor, 0.0);
   }
@@ -5590,28 +6592,7 @@ tenryu::coupling::HydroStepResult Hydro1D::lagrangian_step(
   if (rho_clamp_count != nullptr) {
     *rho_clamp_count += std::max(local_rho_clamp_count, 0);
   }
-
-  // W-B robustness: detect compression-driven node crossing (non-positive
-  // cell volume) at the end of the Lagrangian sub-step. With the driver
-  // full-step retry enabled this becomes a soft failure (restore + dt/2 via
-  // the standard snapshot machinery); otherwise fail hard here, earlier and
-  // with better context than the downstream laser/diagnostics geometry
-  // recompute that used to trip on it.
   {
-    int* d_failing_cell = nullptr;
-    d_failing_cell = static_cast<int*>(core::device_scratch_acquire(
-        "hydro_1d:lagrangian_step:d_failing_cell", sizeof(int)));
-    const int init_sentinel = n_cells;
-    cuda_check(cudaMemcpy(d_failing_cell, &init_sentinel, sizeof(int),
-                          cudaMemcpyHostToDevice),
-               "Hydro1D: init failing_cell failed");
-    find_nonpositive_volume_1d_kernel<<<cw.blocks(), 256>>>(
-        state.vol.data(), d_failing_cell, cw.begin, cw.end, n_cells);
-    sync_kernel("Hydro1D find_nonpositive_volume kernel failed");
-    int failing_cell = n_cells;
-    cuda_check(cudaMemcpy(&failing_cell, d_failing_cell, sizeof(int),
-                          cudaMemcpyDeviceToHost),
-               "Hydro1D: read failing_cell failed");
     if (failing_cell < n_cells) {
       double failing_vol = 0.0;
       cuda_check(cudaMemcpy(&failing_vol,

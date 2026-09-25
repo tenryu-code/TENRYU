@@ -134,6 +134,11 @@ struct Ale1dRemapScratch {
   DeviceArray<double> phi_face;
   DeviceArray<int> donor;
   DeviceArray<int> fallback_flags;
+  // Face mass fluxes of the accepted mass remap (n+1 faces):
+  // m_i^n = m_i^o + F_{i+1} - F_i, F > 0 moving mass from cell j into cell
+  // j-1; zero at pinned faces and at the domain ends. The velocity
+  // projection advects its nodal-velocity pair with these fluxes.
+  DeviceArray<double> mass_flux;
 
   void resize(int n_cells,
               int n_groups,

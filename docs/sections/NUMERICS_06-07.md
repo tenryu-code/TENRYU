@@ -120,6 +120,23 @@ C_{v,e} = \rho\,c_{v,e}^{state}
 
 > **\(b_g(T)\) の定義**（§0.3 参照）：\(b_g(T) = \int_{\nu_g}^{\nu_{g+1}} B(\nu,T)\,d\nu \Big/ \int_0^\infty B(\nu,T)\,d\nu\)
 > （群 \(g\) の Planck 分率）。v1.0 では PlanckTable（ARCHITECTURE §4.3）から温度補間で取得する。
+> **表の温度間の補間（2026-09-23）**: 表の温度 \(T_k\)（対数等間隔）の間では、累積分率
+> \(C_g=\sum_{g'\le g}b_{g'}\)（低エネルギー側）と裾の和 \(D_g=1-C_g=\sum_{g'>g}b_{g'}\)
+> （高エネルギー側）の対数を \(u=\ln T\) の 3 次 Hermite 多項式で補間する。節点の傾きは
+> 群境界 \(x_k=E_k/T\) での Planck 密度 \(f(x)=(15/\pi^4)x^3/(e^x-1)\) から解析的に
+> \(d\,\mathrm{RC}_g/du=x_0f(x_0)-x_{g+1}f(x_{g+1})\)、
+> \(d\,\mathrm{RD}_g/du=x_{g+1}f(x_{g+1})-x_Gf(x_G)\)、
+> \(dS/du=x_0f(x_0)-x_Gf(x_G)\)（RC・RD・\(S\) は正規化前の累積・裾・和、
+> \(d\ln C_g/du=\mathrm{RC}_g'/\mathrm{RC}_g-S'/S\) など）で求めて表に持つ。
+> 両端の温度で \(C_g<1/2\) の群までは \(C\)、それより上の群は \(D\) を使い、
+> \(b_g\) は隣り合う値の差（\(b_g=\hat C_g-\hat C_{g-1}\)、\(\hat D_{g-1}-\hat D_g\)、
+> 切り替えの群では \((1-\hat D_g)-\hat C_{g-1}\)）とするので、和は構成上ちょうど 1。
+> 誤差は \(O(\Delta u^4)\) で、補間誤差より小さい負の差が出た場合だけ 0 に切り上げる。
+> 従来は \(b_g\) を \(T\) について線形補間しており、凸な Wien 側の群を区間中央で約
+> \((\Delta T/T)^2(x^2-2x)/8\)（\(x=h\nu/T\)）過大にしていた（既定 200 点・8 桁で
+> \(x=10\) なら約 9%）。累積・裾を \(\ln T\) で幾何補間（1 次）する案も試したが、Wien 側は
+> 改善する一方でピーク付近の群の絶対誤差が線形補間より大きく、不採用とした。
+> 全行が同じ表（picket-fence 用の定数分率）は格納値をそのまま返す。
 
 \[
 \beta = \frac{4 a_{eV} T_e^3}{C_{v,e}} \quad [\text{無次元}]
@@ -1743,12 +1760,25 @@ emission/effective-scattering split に入れる。すなわち局所・無拡�
 \(f_c\sigma^{PA}\) は NLTE coefficient path で生成されるが、この FLD assembly の
 total-removal diagonal には使わない。Grey constant-opacity FLD では
 \(\sigma^{PE}=\sigma^{PA}=\sigma_a\) とし、専用の `compute_fleck_for_fld`
-kernel で §6.1 の LTE Fleck factor
-\(f_c=1/(1+\alpha\beta c\Delta t\sigma_{a,P})\) と
-McClarren-Urbatsch の smooth blend を table_nlte/tmat と同じ
-RHS emission/effective-scattering split に適用する。この kernel は FLD の
+kernel で §6.1 系の LTE Fleck factor を**群別**に
+\(f_{c,g}=1/(1+\alpha\beta_c c\Delta t\sigma_{a,g})\) として
+table_nlte/tmat と同じ RHS emission/effective-scattering split に適用する
+（\(\beta_c\) は cell 量、\(\sigma_{a,g}\) は群値。constant/power_law opacity
+は周波数非依存で全群同値のため cell 単一 \(f_c\) と一致し、群依存 σ の
+`freq_dep_marshak` 検証 opacity でのみ群別値が現れる。旧記述の
+「\(\sigma_{a,P}\) 単一 \(f_c\) + McClarren-Urbatsch smooth blend」は実装と
+乖離していた — blend は stiff 極限 \(zf\to0\) の交換凍結のため 1D では退役済み、
+時間形状は既定 `"be"` \(f=1/(1+z)\)（下記 fleck_form 参照）。2026-07-26
+doc 真実復元）。この kernel は FLD の
 stiff-cell 要件のため IMC 共有の `compute_fleck_kernel` と分離し、IMC safety の
-\(\beta\le1\) cap と `f_min_fleck` 下限を適用しない。放射エネルギー式に
+\(\beta\le1\) cap と `f_min_fleck` 下限を適用しない。table_nlte/tmat の NLTE
+係数経路（`eval_nlte_opacity_emission` — cell 単一 \(f_c\) を emission-mean
+\(\sigma_{P,\rm em}=\sum_g\eta_g/(a_{eV}cT_e^4)\) から作る）も同様に
+\(\beta\le1\) cap を適用しない（2026-07-26： ideal-gas
+fallback 分岐に残存していた IMC 系譜 cap を除去。cap は「\(f>1\) 防止」に
+不要 — \(z\ge0\) で常に \(0<f\le1\) — であり、高温・低 \(C_v\) セルで f を
+過大化し Fleck 線形化保護を弱めるだけだった。table cv / state cv 経路は
+cap 非経由のため挙動不変）。放射エネルギー式に
 \(\rho c_v\) 型の項は入れない。
 
 > **fleck_cv_source（2026-07-10 導入；既定フリップ 2026-07-11）**: 本カーネルの \(\beta=4a_{\rm eV}T_e^3/(\rho c_{v,e})\)
@@ -1772,6 +1802,21 @@ stiff-cell 要件のため IMC 共有の `compute_fleck_kernel` と分離し、I
 > 冪乗 opacity `power_law`（SPEC §6.4.3）はこの constant 経路と同格に扱われる（eta 構築・
 > Fleck blend とも σ 配列値のみが異なる）。冪乗 EOS `power_law_te` は初期化時 tabulation で
 > table-EOS 経路に乗る（新規離散化なし）。
+>
+> **表不透明度のセル（2026-09-23）**: tmat/table_nlte 不透明度のセルでは Fleck 因子を NLTE
+> 係数カーネル（上記の cell 単一 \(f_c\)）が作る。1D FLD ではこのカーネルにも `"table"` の比熱
+> 規則（電子 EOS テーブルがあれば現在 \(T_e\) の `device_eos_cv`、セルの支配材料のテーブルを
+> 優先、無ければ legacy チェーン）を適用する。2026-09-23 まで NLTE カーネルは指定によらず
+> legacy チェーン（cv_e_override → state cv_e → ideal gas）を使っており、tmat 不透明度の
+> デッキでは既定の `"table"` が効いていなかった（state cv_e は流体の閉包時点の表の cv で、
+> 外側反復中の \(T_e\) には追従しない）。2D_RZ の FLD と S_N の呼び出しは従来どおり legacy
+> チェーン。下記の secant/guard の β と `exp_phi1` の形は NLTE カーネルにも実装した（2026-09-24。
+> 予測子の正味加熱は \(c(\sigma_{P,{\rm abs}}E-\sigma_{P,{\rm em}}aT^4)\)、\(U_e\) は熱容量を取るセルの電子表、
+> 表が無いか step 開始の輻射が無いときは tangent。既定 tangent・be の実体は従来どおり — テンプレート
+> 実体を分けている。2026-09-23〜24 は namelist で拒否、それ以前は黙って無視されていた）。
+> 多材料デッキで LTE の表と周波数依存 Marshak 不透明度が支配するセルは、共有の Fleck カーネルで
+> Planck 平均の吸収係数による群共通の \(f\) を使う（単一材料の表が NLTE カーネルから得る灰色の \(f\) と同じ形。
+> 群ごとの \(f_g\) を使うと、同じ材料でも他の材料の有無で Fleck 因子が変わっていた）。
 >
 > **fleck_beta（2026-07-14 導入；外部裁定 2026-07-15、docs/design/fleck_beta_secant_20260714.md §7-8）**:
 > β の線形化点は `Radiation.multigroup_diffusion.fleck_beta` で選ぶ。`"tangent"`（**既定**、bit 凍結）
@@ -1981,8 +2026,14 @@ drive temperature accepts a deck time callable
 `Radiation.boundary.marshak_Tr` (frozen to a table at initialization — no
 runtime Python) in addition to the constant `marshak_Tr_eV`. Precedence and
 evaluation follow the IMC emitter convention: a positive constant wins;
-otherwise the frozen table is evaluated once per radiation call at the
-solve-entry time `state.t`. The per-group incident flux
+otherwise the frozen table is evaluated once per radiation call. 1D FLD / SN
+(2026-09-23): the evaluation time is the midpoint of the interval the call
+advances — the driver passes \(t_n+\Delta t/2\) for the single-stage
+Radiation operator and \(t_n+(m+\tfrac12)\Delta t_{\rm sub}\) for thermal substep
+\(m\) (the operator advances \([t_n,t_n+\Delta t]\) in both Strang and sequential
+order); the historic solve-entry `state.t` \(=t_n\) lagged the drive by
+\(\Delta t/2\) and held every substep at \(T_r(t_n)\). Callers that pass no drive
+time (verification drivers) keep `state.t`; 2D keeps `state.t`. The per-group incident flux
 F_inc,g = (c/4) a T_r^4(t) b_g(T_r(t)) and the `marshak_in` ledger use the
 resolved temperature, so a staircase drive T_r: 100→200 eV produces exactly
 a 16× per-step `marshak_in` jump (validated). The same wiring applies to the
@@ -2010,8 +2061,15 @@ S_{\Delta t})/(1+\lambda_{pa})\)）が入り、Newton の全系エネルギー�
 していた（outer=8 で源点 +25%）。固定後は追加反復が同一の保存的不動点へ
 収束する（無源 1 step で outer=8 が outer=1 と bit 一致、線源つき outer=8
 が参照帯に着地）ため、outer 数の制限は不要。検証 = 独立 S₈ 離散化
-（`tools/su_olson_sn_reference.py`）と ξ=0.01/1.0/3.16 で 0.2%/5.3%/13.9%
-一致（恒久 ctest `test_sn_1d_su_olson` volume-source ケース）。
+（`tools/su_olson_sn_reference.py`）と ξ=0.01/1.0/3.16 で 0.15%/4.8%/2.3%
+一致（2026-09-23 に Newton の上側ブラケットへ \(S_{\Delta t}\) を入れた後の値。以前の
+0.2%/5.3%/13.9% には、源が支配的な初期ステップで失われた注入エネルギーの分が含まれていた）（恒久 ctest `test_sn_1d_su_olson` volume-source ケース）。注入エネルギー
+\(\sum_{r_c\le x_{max}}\Delta t\,V_c\,\dot S\) は `sn_volume_source_in_step`
+として step energy budget（`volume_in`）に計上する（2026-09-23。従来は常に 0
+で、線源つき run の保存監査に注入分が現れなかった）。Newton の上側ブラケットは
+\(S_{\Delta t}\) を含む（下記 §6.8 の閉包 8 項）。同じ ctest の台帳ケースが、各
+solve の注入量と、物質＋放射エネルギーの変化 = 注入 − 流出（注入量の相対
+\(10^{-10}\)）と、`rad_dep` が書き戻し後の \(E^{n+1}\) を使うことを検査する。
 
 **1D_SPH \(S_N\) 外側 Marshak 境界（W-B2, 2026-07-03）** —
 `Radiation.sn_transport.boundary.outer_r="marshak"`（1D_SPH、
@@ -2113,8 +2171,42 @@ D_{c,g}=\frac{c\,\lambda(R_{c,g})}{\sigma_{R,c,g}}
 \]
 で作る。既定の Levermore-Pomraning limiter は
 \(\lambda=(\coth R-1/R)/R\) で、`"larsen"` は
-\(\lambda=(9+R^2)^{-1/2}\)、`"none"` は \(\lambda=1/3\) を使う。面係数 \(D_f\) は
-隣接 cell 値の harmonic mean である。
+\(\lambda=(9+R^2)^{-1/2}\)、`"none"` は \(\lambda=1/3\) を使う。LP の数値評価は
+\(R<10^{-3}\) で級数 \(1/3-R^2/45+2R^4/945\)（打ち切り誤差 \(O(R^6/4725)\)）、
+\(R>50\) で \((1-1/R)/R\)（\(\coth\) の指数補正 \(<4\times10^{-44}\)）、
+中間域のみ raw 形とする（2026-07-26： 旧分岐
+\(R<10^{-6}\to1/3\) / \(R>50\to1/R\) は \(R\sim10^{-6}\) 近傍の桁落ち
+~\(10^{-4}\) 相対と \(R=50\) での +2% 不連続を持った — 1D 2 コピー修正済み、
+2D コピーは別途対応）。面係数の構成は次元で異なる（2026-07-26 doc 真実復元）:
+**1D_SPH は face-centered 評価**（1D face 中心評価化後の現行実装）—
+\(\sigma_{R,f}=(\sigma_{R,L}\Delta_L+\sigma_{R,R}\Delta_R)/(\Delta_L+\Delta_R)\)
+（\(\Delta_{L,R}\) は両セルの幅。両セル中心間の光学的厚さ
+\(\sigma_{R,L}\Delta_L/2+\sigma_{R,R}\Delta_R/2\) を中心間距離 \(d_f\) で割ったもので、
+拡散極限の直列抵抗として厳密。実装は算術平均に幅差の項を足す形
+\(\tfrac12(\sigma_L+\sigma_R)+\tfrac12(\sigma_L-\sigma_R)(\Delta_L-\Delta_R)/(\Delta_L+\Delta_R)\)
+で、等幅なら従来の \(\tfrac12(\sigma_{R,L}+\sigma_{R,R})\) と bit 一致。2026-09-23 まで
+幅の重みなしの算術平均で、幅比 \(w\) の界面では拡散極限の
+面の伝導度が最大 \((w+1)/2\) 倍ずれた）、
+\(E_f=\max(\tfrac12(E_L+E_R),10^{-300})\)、
+\(R_f=|E_R-E_L|/(d_f\,\sigma_{R,f}\,E_f)\)、
+\(D_f=c\,\lambda(R_f)/\sigma_{R,f}\)。等幅の拡散極限（両側 \(\lambda=1/3\)）では旧
+harmonic 形 \(\mathrm{harm}(c/3\sigma_L,\,c/3\sigma_R)=c/(3\cdot\tfrac12(\sigma_L+\sigma_R))\)
+と厳密一致する。**2D_RZ は現行 cell-centered** \(D_c\)（cell 勾配で \(R_c\)）を
+隣接 harmonic mean して \(D_f\) を作る — 1D の修正前と同型の front-stall 機構が
+残存する既知課題（2026-07-26 カーネルレビュー指摘、face-centered 化は 2D 側の対応範囲）。
+
+> **真空縮退の正則化（2026-08-28）**: \(\sigma_R\) は評価・組み立ての両方で
+> `radiation.multigroup_diffusion.opacity_floor`（既定 **\(10^{-6}\) cm\(^{-1}\)** = mfp 10 km）
+> で floor する。void セル（\(\sigma\to 0\)）かつ一様 \(E\)（\(\nabla E=0\)）の縮退方向では
+> \(R=0\to\lambda=1/3\) となり limiter が \(D=c/(3\sigma)\) の発散を止められない。旧既定
+> \(10^{-100}\) では tmat opacity が void 密度で underflow すると三重対角係数が
+> \(\sim 10^{98}\) に達し、非 pivoting CR（`gtsv2StridedBatch`）も QR pivoting
+> （`gtsv2`）も消去中の桁落ち増幅で NaN を生成した（550 セル zoning デッキの
+> 決定論的セル反転クラッシュの真因; NaN 解は下流の floor クランプ
+> \(\mathrm{fmax}(\mathrm{NaN},E_{floor})=E_{floor}\) で暗黙に床値化され step 800 まで潜伏）。
+> 勾配領域では \(\lambda\sim 1/R\) により \(D_f=c\,d_f E_f/|\Delta E|\) と \(\sigma\) が
+> 相殺されるため、床は縮退方向にのみ作用し、光学的厚い検証系（Su-Olson・Marshak、
+> \(\sigma\ge 1\)）は bit 不変。
 
 1D_SPH の群ごとの線形系は tridiagonal で、CUDA の cuSPARSE
 `cusparseDgtsv2StridedBatch` を使う。batch 数は \(G\)、各 system size は
@@ -2137,6 +2229,41 @@ requested/resolved を run_info + HDF5 metadata に記録、**AmgX 未 link buil
 debug fallback CG の別名。validate() を経ない手組み config（unit test 経路）が
 "auto" のまま solver へ到達した場合は WARNING 付き Jacobi fallback の防御分岐が拾う。
 Convergence criterion: ||r_k|| <= cg_inner_tol · D where D = ||r_0|| (cg_tol_norm="r0", historic default) or max(||b||, tiny) (cg_tol_norm="rhs"). The rhs normalization decouples the stopping test from warm-start quality; with the previous-solution warm start the r0-relative form over-solves by construction.
+
+**1D 外側反復の灰色加速・流束制限子の評価・void セル（2026-09-24）**
+
+- **灰色加速**（`outer_accel="grey"`、既定 `"auto"` は 1D でこれ、2D_RZ では `"none"`）:
+  外側反復 \(k\) は \(T_k\) で Fleck 係数 \(f_g\) と不透明度を評価して各群を解き、\(f_g\) を固定して物質温度
+  \(T^{k+1/2}\) を解く。固定点は \(f_g(T^*)\) を持つ。\(T_k\) で線形化し（不透明度固定、
+  \(f=1/(1+z)\)、\(z\propto T^3\) より \(f'_g=-3f_g(1-f_g)/T\)）、
+  \(S'_g=f_g c\sigma^{pe}_g B'_g + f'_g(c\sigma^{pe}_g B_g - c\sigma^{a}_g E^n_g)\)、
+  \(D=\rho c_v/\Delta t+\sum_g S'_g\)、\(w_g=S'_g/D\)、\(P=\sum_g f'_g(c\sigma^{pe}_g B_g-c\sigma^a_g E^n_g)\)、
+  \(\Delta T_k=T^{k+1/2}-T_k\) とすると、固定点への補正は
+  \(A_g e_g-\Delta t V w_g\sum_h c\sigma^a_h e_h=\Delta t V w_g (D-P)\Delta T_k\)、
+  \(T^*-T^{k+1/2}=(\sum_h c\sigma^a_h e_h-P\Delta T_k)/D\)（\(A_g\) は反復 \(k\) の群の三重対角行列）。
+  \(e_g=\xi_g\varepsilon\)、\(\xi_g\propto w_g/(1+\Delta t c\sigma^a_g)\)（無限媒質の最遅モード、
+  \(\sum_g c\sigma^a_g\xi_g=1\) に規格化）として群について足すと \(\varepsilon\) の三重対角方程式 1 本になり
+  （Morel, Larsen & Matzen, JQSRT 34 (1985) 243 の多群-灰色合成加速）、次の反復は
+  \(T^{k+1/2}+(\varepsilon-P\Delta T_k)/D\)（\([-T/2,+T]\) に制限、電子エネルギー・圧力は物質更新と同じ閉包）から始める。
+  1 群では線形化した補正そのもの（Newton 段）。補正は \(\Delta T_k\) とともに消えるので、収束解は加速なしの
+  反復と同じ。スペクトルと灰色行列は反復 \(k\) の組み立て直後（群の解法が行列を上書きしうるので解く前）に作り、
+  右辺と補正は反復 \(k+1\) の最初に適用する（収束して抜ける反復の状態は加速前の生の出力のまま）。
+  通常ループと常駐ループで同じ device 関数（`fld_1d_grey_accel.cuh`）を使う。灰色の三重対角方程式は
+  並列循環縮約（PCR、`core::pcr_solve_strided`）で解く（2026-09-25。通常ループは 1 ブロック、行を共有メモリ
+  に置けないときは大域メモリの作業領域、常駐ループはグリッド全体。各行の演算は同じで、両ループの解は丸め誤差の
+  範囲で一致する — 積和の融合のされ方がカーネルごとに変わりうる）。以前の 1 スレッドの Thomas 法は FP64 の割り算の依存連鎖で、RTX 4090 の GXII FLD で
+  0.27 ms/step（最初の 300 ステップ）・0.55 ms/step（1.85 ns から）かかっていた（PCR で 0.036・0.069 ms/step）。
+  解の丸めは変わる（方程式は同じ）。
+- **流束制限子の評価**（`limiter_evaluation`、既定 `"predictor"`）: 流束制限子の \(R\) を、最初の外側反復の
+  放射場（step 開始時の場で制限子を評価し、step 開始時の温度の放射で各群を解いた結果）から評価して step 内は
+  固定する。`"iterate"`（従来）は毎反復その時点の放射場から評価し直すが、この遅れた固定点反復は光学的に薄く
+  流れが支配的な領域で停滞・振動し、GXII 回帰デッキの初期（〜0.2 ns）で 20 回の上限に達していた（残差最大 9e-3）。
+  予測子方式と灰色加速の組み合わせで、同デッキの全 step が 2 次収束する（平均 2.6 回）。
+- **void セル**: void セルは真空として吸収・放射をしない（\(\sigma^a=\sigma^{pe}=\eta=0\)、物質温度は交換で
+  変わらない）。拡散係数の正則化のための Rosseland 不透明度の下限はそのまま。以前は不透明度の下限
+  （\(\rho\kappa_{floor}\)）と定数不透明度の混合（非 void 材料を含まないセルが先頭材料の \(\kappa\) を取っていた）
+  により、ターゲット外の下限密度セルがコロナの放射を吸って 1 回の放射計算の中で 100 eV 程度まで加熱され、
+  外側反復の収束を妨げていた（GXII: 未収束 238 step、平均 13.6 回 → 修正後 85 step、4.0 回）。
 
 Opt-in Anderson(m) acceleration (`outer_accel="anderson"`) mixes the next emission-linearization temperature from the last m outer residuals (Walker-Ni form, damping beta, Tikhonov-regularized normal equations, per-step history). Mixing is applied only when continuing to another outer iteration; a converged exit always returns the raw Newton output, so the accepted fixed point satisfies the same outer_tol contract as plain iteration. Degenerate least-squares rounds fall back to plain iteration; mixed temperatures are floored at floors.Te and non-finite mixes fall back to the raw Newton value per cell.
 
@@ -2219,7 +2346,13 @@ Newton には入れない。
 > \((1-f)c\sigma\Delta t\,|E^n-B|\) の幻エネルギーが毎 step 発生していた
 > （`fld_1d_volume_source_balance` gate が検出、修正で balance 残差
 > 7.9e-6 → 2.1e-10）。修正後の 1D kernel は Newton 残差・Jacobian・
-> `rad_emit` 記帳の全てで \(f\,c\sigma^{PE}B(T)+(1-f)c\sigma^{PE}E^n\) を使う
+> `rad_emit` 記帳の全てで \(f\,c\sigma^{PE}B(T)+(1-f)c\sigma^{PA}E^n\) を使う
+> （**2026-09-14 訂正**: 再放射項 \((1-f)c\sigma E^n\) の \(\sigma\) は E 方程式（上式）と同じ吸収
+> 不透明度 \(\sigma^{PA}\)。2026-07-03 の実装は物質側だけ \(\sigma^{PE}\) を使っており、\(\sigma^{PE}\ne\sigma^{PA}\)
+> の TMAT 表では \((1-f)c(\sigma^{PE}-\sigma^{PA})E^n\Delta t\) が毎反復消える不整合だった — §2 の
+> [2026-09-14 追補 2] 同日追加を参照。`update_matter_body`（`fld_1d_gpu.cu`）・`update_matter_body_persistent`
+> （`fld_1d_bodies.cuh`）・2D_RZ `update_matter_kernel`（`fld_2d_rz_gpu.cu`）の Newton 残差と `rad_emit`
+> 記帳を \(\sigma^{PA}\) に統一した。）
 > （実装は emission の \(B(T)\) を iterate ごとに再評価する — 凍結 \(S^{used}\)
 > と outer 収束点で一致）。付随修正 2 件: (i) assemble の \(f_c\) 参照は
 > `fleck[c]`（セル素 index）だったため \(G>1\) で誤要素を読んでいた —
@@ -2230,6 +2363,8 @@ Newton には入れない。
 > ため、標準 Fleck-Cummings \(f=1/(1+z)\)（\(zf\to1/\alpha\)）に一本化した。
 > 2D_RZ 側の同型監査（matter 側の \(f\) 整合・`fleck[c]` indexing・blend)は
 > 2D セッションへ引き継ぎ。
+> 2026-09-14: 2D_RZ の物質 Newton も同じ \(\sigma^{PE}\) 混同を持っていたため同時に \(\sigma^{PA}\) へ統一
+> （2D の `rad_emit` 記帳は元から assembly の source と同じ \(\sigma^{PA}\) だった）。
 
 > **W-I AFI モード（2026-07-03）**: `Radiation.multigroup_diffusion.fleck_mode="afi"` は Fleck ブレンドを消費点（assembly の擬似散乱項 + 物質側ブレンド）で無効化し、outer 反復（Picard）が完全陰的 emission \(c\sigma B(T^{n+1})\) を収束させる。Larsen, Kumar & Morel (JCP 238, 2013) により AFI 離散化は任意 \(\Delta t\) で一意解・最大原理・平衡拡散極限を満たす。実測（GXII FLD nr200）: Fleck 既定は生産 \(\Delta t\)（コロナ z≈3）で吸収エネルギーを z→0 極限比 ~35% 抑制し dt 依存が全 metric を汚染、AFI は生産 dt で極限の数%以内（dt×4 でも残差数%）。コロナの Picard 縮小率 ~z/(1+z)≈0.75 のため `max_outer_iterations >= 40` 推奨（未収束は rate-limited warning が出る）。既定は従来 `"fleck_cummings"`（golden 影響なし）。**既定は Fleck を維持（ユーザー決定 2026-07-04）** — AFI は namelist opt-in の検証・測定モードとして存続し、GXII golden の再基準化は行わない。dt 感度の定量（Fleck ~25% vs AFI 4.1%）は VERIFICATION §10.1 に記録済み。
 
@@ -2283,6 +2418,19 @@ Cut-1a/2 では DSA/TSA 加速は使わない。
 収束判定は
 \(\max_c |\Delta T_{e,c}|/\max(T_{e,c},T_{floor}) <\)
 `Radiation.multigroup_diffusion.outer_tol` である。
+
+Anderson 加速（`outer_accel="anderson"`、`anderson_m`、`anderson_beta`; 2026-09-14 に 1D_SPH へ移植、
+実装は `fld_anderson.cuh`）: 2D_RZ と同じ Walker–Ni 形の混合を 1D の非パイプライン外側ループに適用する。
+各反復の入口で線形化温度 \(u_k=T_e\) を \(m+1\) 段の履歴環に写し、物質更新の出力 \(g_k\) から残差
+\(f_k=g_k-u_k\) を作り、収束せず次の反復へ進むときだけ最近 \(p\le m\) 個の差分 \(\Delta u_j,\Delta f_j\) で
+最小二乗（Tikhonov 正則化 \(10^{-12}\,\mathrm{tr}/p\)、Cholesky）した
+\(u_{k+1}=u_k+\beta f_k-\sum_j\gamma_j(\Delta u_j+\beta\Delta f_j)\) を次の線形化温度にする
+（`floors.Te` で床、非有限は生の Newton 出力、退化した最小二乗は混合なし）。収束判定は生の Newton 出力に
+対する上式のままで、収束時の状態は混合しない。有効時は外側ループのパイプライン化を使わない。動機:
+再放射項の統一と Kirchhoff 強制（§2 [2026-09-14 追補 2]）の後も、Planck 平均不透明度の急な温度依存で
+\(f(T)\) が急変する冷たいセルは逐次代入で 2 周期に落ちうる（NIF DS デッキ 1572 サイクル中 1 サイクル、
+セル 157 が 0.608↔0.641 eV、\(f=0.72\leftrightarrow0.92\)）。単体テスト `test_fld_anderson` は同一係数の
+線形写像（縮小・非縮小）で Anderson(1) が 1 回の混合で不動点に達することを検査する。
 
 2D_RZ FLD の deterministic tallies は
 `rad_dep[c,g]=Delta t V_c c sigma_PA E^{n+1}_{c,g}` と
@@ -3723,12 +3871,23 @@ F(T_e)=
 -\sum_g c\,\sigma^{PA}_g E_g
 +\sum_g c\,\sigma^{PE}_g a_{eV}T_e^4 b_g(T_e),
 \]
-with derivative contribution
+with derivative contribution (implemented form — 2026-07-26 doc truth
+restoration: the old text omitted the \(1/(1+\lambda^{PA})\)
+reduction and the active-set mask that the production active-set Newton has
+always applied; see the Phase B closure below):
 \[
-\frac{\partial F}{\partial T_e}
-=\rho c_{v,e}(\rho,T_e)/\Delta t
-+\sum_g c\,\sigma^{PE}_g\,4a_{eV}T_e^3 b_g(T_e).
+\frac{\partial R}{\partial T_e}
+=\rho c_{v,e}(\rho,T_e)
++\sum_{g:\,E^{+}_g>0}
+\frac{\lambda^{PE}_g}{1+\lambda^{PA}_g}\,4a_{eV}T_e^3 b_g(T_e),
+\qquad
+\lambda^{PA/PE}_g=c\,\sigma^{PA/PE}_g\,\Delta t,
 \]
+for the active-set residual \(R(T)=U_e(T)-U_e(T^n)+\sum_g[E^+_g(T)-E^*_g]\):
+only inactive groups (\(E^+_g>0\)) contribute, each reduced by
+\(1/(1+\lambda^{PA}_g)\). \(db_g/dT\) is not included (inexact Newton — the
+residual itself evaluates \(b_g(T)\) at the trial temperature, so the fixed
+point is exact and the bracketed/adaptive Newton safeguards convergence).
 Here \(e_e(\rho,T)\), \(c_{v,e}(\rho,T)\), and final \(P_e(\rho,T)\)
 come from the TMAT electron EOS table when that table is available. Analytic
 ideal-gas/test builds with no device EOS table keep the legacy constant-\(c_v\)
@@ -3742,6 +3901,40 @@ This is the documented production behavior. Any use of Fleck-derived
 \((1-f)\sigma^{PA}\) scattering in pure SN, or use of \(\sigma^{PA}\) for the
 SN emission coefficient when \(\sigma^{PE}\) is available, is an implementation
 defect rather than an alternate model.
+
+#### 1D_SPH multi-material decks (2026-09-24)
+
+A 1D_SPH deck with more than one non-void material evaluates every cell's
+coefficients from its own materials (`radiation/multimat_opacity_1d.cuh`,
+shared with the 1D FLD solver; the opacity models are those of the FLD
+multi-material path: `constant`, `none`, `tmat`, `table_nlte`, `power_law`,
+`freq_dep_marshak`):
+
+- absorption and emission: \(\sigma^{PA}_g=\rho\sum_m w_m\kappa^{PA}_{m,g}(\rho_m,T_e)\)
+  and the same for \(\sigma^{PE}_g\), with the mass fractions \(w_m\) (volume
+  fractions without per-material masses) and the partial densities
+  \(\rho_m=\rho w_m/f_m\) for the density-dependent models; for a constant
+  material \(\kappa^{PA}=\kappa^{PE}=\) `kappa_a` (the single-material S_N
+  reading). `Materials.opacity_mix_rule="max"` takes the largest material
+  value; `"harmonic_mass_R"` changes only the Rosseland mean, which S_N does
+  not use, so its absorption is the linear mix;
+- physical scattering: \(\sigma_{s,g}=\rho\sum_m w_m\kappa_{s,m}\) with
+  \(\kappa_{s,m}=\) `kappa_s` for the constant, power-law and
+  frequency-dependent Marshak materials and 0 for the tables (as in the
+  single-material paths), bounded by \(\rho\,[\)`opacity_floor`,
+  `opacity_cap`\(]\) (no floor in a cell whose dominant material is a
+  table);
+- emission \(\eta_g=c\,\sigma^{PE}_g a_{eV}T_e^4 b_g(T_e)\);
+- a cell whose dominant material (largest volume fraction) is a non-LTE
+  table takes that material's NLTE coefficients at the cell density (the
+  single-material NLTE launch restricted to those cells, the dominant-material
+  approximation of the FLD solver); its scattering stays the mix above;
+- the material Newton closes every cell with its dominant material's electron
+  table (none for an exact ideal-gas material) and `cv_e_override`
+  (`radiation::cell_electron_table_selector_1d`, shared with FLD).
+
+A deck of two identical materials in pure cells repeats the single-material
+step bitwise (`test_sn_1d_multimat`).
 
 1D_SPH and 2D_RZ GPU \(S_N\) production use the cell-local conservative
 active-set closure. The namelist no longer exposes closure selectors; the
@@ -3798,8 +3991,16 @@ material residual rather than silently injected by a pre-source floor.
 local conservation identity is broken.
 8. The upper energy bracket is
 \[
-U_{hi}=U_e(T_e^n)+\sum_g\max(E^*_g,0).
+U_{hi}=U_e(T_e^n)+\sum_g\max(E^*_g,0)+S_{\Delta t},
 \]
+with \(S_{\Delta t}=\Delta t\,\dot S\) the 1D external volume-source energy
+(zero without a source), since \(U_e+\sum_gE^+_g=U_e^n+\sum_gE^*_g+S_{\Delta t}\)
+and \(E^+_g\ge0\). Before 2026-09-23 the bracket omitted \(S_{\Delta t}\): a
+source-dominated cell (\(E^*\approx0\) on its first step) had its root above
+the bracket, the twenty doublings of the expansion (starting from
+\(\sum_g\max(E^*_g,0)\), or \(10^{-12}\max(|U_e^n|,1)\) when that is zero)
+did not reach it, and the clamp to the bracket lost the source energy (23% of
+the injection in the `test_sn_1d_su_olson` ledger case).
 If the upper-bracket sign check fails because of roundoff or table behavior,
 the bracket is expanded adaptively; expansion failure is also a global
 timestep-rejection condition.
@@ -3865,6 +4066,16 @@ there. The regimes sit 4+ orders apart in \(\lambda^{ext}\) (su_olson
 the anchor never activates in absorbing benchmarks. Gates:
 `verify sn_1d_planar_transparent_gap` (contract C3) and the void-contract
 case in `test_sn_streaming_limiter`.
+Since 2026-07-26, every 1D anchor application is ledgered:
+`state.sn_void_anchor_dE_step` / `sn_void_anchor_dE_abs_step` accumulate the
+signed and absolute \(V\,\Delta E\) over the step (ledger-class scalars,
+atomicAdd order within the documented host-ledger replica band; the anchored
+field itself is bit-unchanged). A validation run that claims independent
+\(S_N\)-reference status can require the abs sum to be exactly 0; a nonzero
+sum is reported to the log (rate-limited). The 1D stagnation exit now also
+sets the pre-existing `state.sn_outer_stagnated` flag (2D already did) and
+logs the acceptance (the 2026-07-26 kernel review left the acceptance policy
+unchanged; changing it is a user decision).
 
 [2026-07-19] The 1D outer-boundary face-flux export and escape ledger
 are now discretely consistent with the sweep in every regime. (i) The vacuum
@@ -3967,8 +4178,27 @@ D_{f,g}=\frac{2D_{L,g}D_{R,g}}{D_{L,g}+D_{R,g}},
 F^{diff}_{f,g}=-D_{f,g}\frac{E^n_{R,g}-E^n_{L,g}}
  {0.5(r_{f+1}-r_{f-1})}.
 \]
-The AP path reuses `state.sn_sigma_s` as \(\sigma^R\); this is the accepted
-dual use for AP blending. Boundary faces are not blended:
+The AP path reuses `state.sn_sigma_s` as its "\(\sigma^R\)". **Fill truth
+(2026-07-26 doc restoration)**: `sn_sigma_s` holds the
+PHYSICAL scattering opacity — constant, power-law and `freq_dep_marshak`
+materials fill it with \(\rho\kappa_s\) (`kappa_s`, bounded by the S_N
+opacity floor/cap like the constant evaluator), and the NLTE pure-SN path
+fills it with the
+Fleck-bypassed effective scattering \((1-f)\sigma^{PA}=0\) (f=1). It is NOT
+the Rosseland mean. (Until 2026-09-23 the 1D power-law and
+`freq_dep_marshak` paths stored the evaluator's second output there — the
+power-law absorption itself and the Rosseland group mean — so those
+materials scattered as much as, or more than, they absorbed; the 2D stage
+still zeroes `sn_sigma_s` for the analytic models.) Consequently, in every production deck with
+\(\kappa_s=0\) the \(\tau\) gate below evaluates \(\tau\approx0\) and the
+blend weight is exactly \(\alpha=0\) on every face — the AP blend is inert
+and the \(S_N\) answer is native transport (the sweep itself is unaffected:
+its \(\sigma_s\) is the correct physical scattering). This matters for the
+open \(S_N\)-vs-MGD bulk-compression comparison: those \(S_N\) results are
+NOT FLD-contaminated through the blend. The blend machinery remains
+unit-gated (`test_sn_ap_face_blend`) with synthetic opacities; wiring a true
+Rosseland array into the AP gauge would ACTIVATE the blend in production and
+is a user decision (escalated). Boundary faces are not blended:
 \(F^{blend}_{1/2,g}=F^{SN}_{1/2,g}=0\) and the outer vacuum face remains the
 SN-enforced \(F^{SN}_{N+1/2,g}=cE^{sweep}_{N-1,g}/2\).
 For 2D_RZ the same harmonic diffusion formula is applied on every internal R
@@ -3999,47 +4229,50 @@ same statistic on the geometric interior as a fallback and records the mask
 source.
 
 The face-flux path applies a conservative donor-cell limiter before
-Phase B, in two passes [two-pass inflow-credit correction, 2026-07-14]. For each cell and group, with
-raw inflow/outflow loads
+Phase B, evaluated in the order of the flow (2026-09-25). For each cell and
+group, with the inflow/outflow loads
 \[
 I_{c,g}=\Delta t\,
-\frac{A_{c-1/2}\max(F_{c-1/2,g},0)
-      +A_{c+1/2}\max(-F_{c+1/2,g},0)}{V_c},
+\frac{A_{c-1/2}\,\theta_{c-1,g}\max(F_{c-1/2,g},0)
+      +A_{c+1/2}\,\theta_{c+1,g}\max(-F_{c+1/2,g},0)}{V_c},
 \qquad
 O_{c,g}=\Delta t\,
 \frac{A_{c+1/2}\max(F_{c+1/2,g},0)
       +A_{c-1/2}\max(-F_{c-1/2,g},0)}{V_c},
 \]
-pass 1 caps each cell's outflow by its stored energy alone,
+(domain-boundary inflow has no donor and enters with \(\theta=1\))
 \[
-\theta^{(1)}_{c,g}=
-\begin{cases}
-\min(1,E^n_{c,g}/O_{c,g}), & O_{c,g}>0,\\
-1, & O_{c,g}=0 ,
-\end{cases}
-\]
-and pass 2 credits the inflow as limited by the upwind donors' pass-1
-factors (domain-boundary inflow has no donor and is credited in full):
-\[
-\widehat I_{c,g}=\Delta t\,
-\frac{A_{c-1/2}\,\theta^{(1)}_{c-1,g}\max(F_{c-1/2,g},0)
-      +A_{c+1/2}\,\theta^{(1)}_{c+1,g}\max(-F_{c+1/2,g},0)}{V_c},
-\qquad
 \theta_{c,g}=
 \begin{cases}
-\min(1,(E^n_{c,g}+\widehat I_{c,g})/O_{c,g}), & O_{c,g}>0,\\
+\min(1,(E^n_{c,g}+I_{c,g})/O_{c,g}), & O_{c,g}>0,\\
 1, & O_{c,g}=0 .
 \end{cases}
 \]
-Crediting the pass-1-limited inflow — never the raw \(I_{c,g}\) — keeps
-positivity exact (every credited erg is deliverable within the step by
-construction) while restoring free-streaming pass-through: the pre-fix
-single-pass donor-only cap \(\theta=\min(1,E^n_{c,g}/O_{c,g})\) throttled a
-conduit cell by its stored energy even though the same-step inflow
-replenishes it, blocking fronts and freezing transient accumulations at
-\(c\Delta t>\Delta x\) (measured 248 eV against a 200 eV drive; the
-raw-credit form \((E^n+I)/O\) previously documented here was never the 1D
-implementation).
+The inflow is credited with the upstream donors' final \(\theta\). Every face
+flux has one direction, so the inflow of a cell comes only from cells
+upstream of it and no cell is upstream of itself: one pass from left to right
+sets every cell whose left face does not carry flux out of it to the left
+(its inflow comes from the left or it has none; a sink has no outflow), and a
+pass from right to left sets the cells whose outflow goes left and whose
+inflow comes from the right (`compute_streaming_theta_ordered_kernel`, one
+thread per group). Then \(E^n_c V_c+\Delta t\,(\widehat{\text{in}}-\widehat{\text{out}})\ge0\)
+in every cell, and a cell that passes on what it receives is not limited.
+The former two-pass credit (2026-07-14) weighted the inflow with the donors'
+first-pass factors \(\min(1,E^n/O)\) instead: when \(c\Delta t\gg\Delta x\) every
+first-pass factor is small, so a chain of conduit cells stayed limited to
+about twice its stored energy per step and fronts stalled. Measured on the
+planar Marshak slab of `sn_1d_planar_marshak_equilibration` (0.4 cm,
+\(\sigma=50\,\mathrm{cm^{-1}}\), 50 eV drive, \(\Delta t=10^{-10}\) s, \(c\Delta t=3\) cm), inner-cell
+temperature after 2000 steps: on 32 cells it stayed near its 1 eV start
+before (8 cells heated through) and reaches 39.66 eV now, 36.23 eV on 128
+cells, against 35.94 eV of the linear-discontinuous scheme on
+32 and 128 cells (§6.8.4); after 3000 steps 48.57 / 47.73 against 47.65
+(`test_sn_streaming_limiter`). On the GXII S_N deck (300 cells, 0.15 ns) the
+peak density went from 3.80 to 3.40 g/cm³ (linear-discontinuous 3.37) and
+the radiation field energy at the deck's time step from 14 894 to 11 560 erg
+(at \(\Delta t=5\times10^{-15}\) s: 11 253 erg; the former limiter still gave a peak
+density of 3.81 there, \(c\Delta t=1.5\,\mu\mathrm{m}\) being wider than the shell's
+cells).
 Each face flux is then scaled once by its upwind donor:
 \[
 \widehat F_{f,g}=\theta_{d(f,g),g}F_{f,g},
@@ -4054,9 +4287,10 @@ limited face flux is still single-valued and enters adjacent cells with opposite
 signs.
 
 In 2D_RZ the limiter remains single-pass with the raw inflow credit,
-\(\theta=\min(1,(E^n_{c,g}+I_{c,g})/O_{c,g})\); the two-pass positivity-exact
-credit above is 1D-only as of the two-pass inflow-credit revision, and the port is on the 2D-side
-ledger together with the angular-state persistence itself. The outgoing-energy
+\(\theta=\min(1,(E^n_{c,g}+I_{c,g})/O_{c,g})\) with the raw inflow; the flow-ordered
+credit above is 1D-only (in 2D the flux directions can form cycles, and the
+two-pass form below limits conduit cells like the former 1D form — not
+measured in 2D, 2026-09-25). The outgoing-energy
 sum includes all non-axis R/Z faces with the cylindrical face areas above. The donor is the upwind cell in the global face
 orientation: lower \(i\) or lower \(j\) for positive R/Z flux, higher \(i\) or
 higher \(j\) for negative R/Z flux. Incoming face power contributes to
@@ -4173,6 +4407,15 @@ measured) while absorbing benchmarks (su_olson) were untouched — the
 coverage hole that hid the defect. Regression gate:
 `verify sn_1d_planar_transparent_gap`. The scalar flux is
 \(\phi_g=\sum_n w_n\psi_{g,n}\) and \(E_g=\phi_g/c\).
+[2026-09-23] Every solve starts by copying `rad_E` into `rad_E_old` (the FLD
+rule); the copy used to happen only at step 0 and at the end of each solve,
+so after a checkpoint restart `rad_E_old` was 0 and the first step solved
+\(E^*=0-\Delta t\,\nabla\cdot F\), losing the radiation field. `sn_psi_prev`
+is part of the full-step retry snapshot (restored with its size, so an
+attempt that allocated it reseeds as the failed one did) and of checkpoints
+(`radiation_sn/psi_prev`); a restart keeps it when its size matches
+\(n_{cells}\,n_{groups}\,n_{angles}\) and reseeds isotropically otherwise
+(older checkpoints), with a logged warning.
 
 1D_SPH uses even-order Gauss-Legendre \(S_N\) sets. The default production
 choice is \(S_{16}\) (`Radiation.sn_transport.n_angles=16`). \(S_8\) is allowed
@@ -4519,48 +4762,77 @@ with \(A^R_\pm=2\pi r_\pm\Delta z\) and
 
 Source iteration is accelerated by per-group DSA when
 `Radiation.sn_transport.dsa_enabled=True`; when it is `False`, the sweep
-iteration skips the DSA correction branch and no DSA kernels are launched. In
-the notation of Larsen
-(1982), Eq. 4.12, the isotropic-scattering error equation places the lagged
-scattering error on the right-hand side. For backward Euler TENRYU stores the
-scalar flux \(\phi=cE\), multiplies the correction equation by \(c\Delta t\),
-and assembles the 1D_SPH row in volume-integrated form:
+iteration skips the DSA correction branch and no DSA kernels are launched.
+**The 1D correction is consistent with the sweep's discretization**
+(2026-09-24). The correction \(f\) of the angular flux satisfies the swept
+(backward-Euler, conservative-streaming) equations with the lagged
+scattering residual \(\sigma_s(\phi^{l+1/2}-\phi^l)\) as source (Larsen 1982,
+Eq. 4.12). With the P1 ansatz \(\psi_m=a\Phi+b\mu_mJ\) at the cell faces
+(\(a=1/\sum w\), \(b=1/\sum w\mu^2\), so \(\sum w\psi=\Phi\), \(\sum
+w\mu\psi=J\)), the zeroth and first angular moments of the discrete balance
+of cell \(c\) are
 \[
 \begin{aligned}
-&\left(V_c+c\Delta t\,\sigma_{a,c,g}V_c+\sum_f K_f+B_c\right)
-\delta\phi_{c,g}
--\sum_{f\in\mathrm{interior}} K_f\delta\phi_{nb(f),g} \\
-&\qquad =
-c\Delta t\,\sigma_{s,c,g}V_c
-\left(\phi^{sweep}_{c,g}-\phi^{old}_{c,g}\right),
+&A_oJ_o-A_iJ_i+\left(\sigma_a+\tfrac{1}{c\Delta t}\right)V\Phi_c
+ =\sigma_sV\left(\phi^{l+1/2}_c-\phi^l_c\right),\\
+&k\,(A_o\Phi_o-A_i\Phi_i)-k\,(A_o-A_i)\,\Phi_c
+ +\left(\sigma_t+\tfrac{1}{c\Delta t}\right)VJ_c=0,
 \end{aligned}
 \]
-with
-\[
-D_{c,g}=\frac{1}{3\sigma_{t,c,g}},\qquad
-K_f=c\Delta t\,A_fD_f/\Delta r_f.
-\]
-There is no factor \(1/2\) on the RHS: the angular source is
-\(\sigma_s\phi/2\), but the scalar moment integrates over the discrete angular
-weights whose sum is 2, leaving \(\sigma_s\phi\). The \(c\Delta t\sigma_s V\)
-factor is therefore cell/group local and is required for DSA to correct the
-source-iteration residual at the same scale as the backward-Euler transport
-operator.
+with \(k=a\sum w\mu^2\) (\(1/3\)) and \(A_f\), \(V\) the face areas and
+volume of the mesh geometry. The first moment of the angular redistribution
+is \(-k(A_o-A_i)\Phi_c/V\) for any quadrature, by the discrete cancellation of
+the isotropic flux that the conservative streaming form guarantees; its
+\(J\) part vanishes for the symmetric quadratures (Gauss–Legendre: exactly 0
+to rounding). The cell moments \(\Phi_c=\sum w\psi_m\), \(J_c=\sum
+w\mu\psi_m\) come from the sweep's own spatial closure
+\(\psi_m=\theta\psi_{dn}+(1-\theta)\psi_{up}\) (\(\theta\) per cell, group and
+angle: `precompute_lc_weights_kernel` for the linear-characteristic sweeps,
+\(1/2\) for the serial diamond sweeps), which makes them linear in the four
+face moments of the cell. Boundaries: \(J=0\) at the reflecting inner face
+(centre, axis, symmetry plane); no incoming correction through the outer face,
+\(a\Phi S_1=bJS_2\) with \(S_1=\sum_{\mu<0}w|\mu|\), \(S_2=\sum_{\mu<0}w\mu^2\)
+(the Marshak incoming intensity is data, so the vacuum condition holds for the
+correction). Ordered \((\Phi_0,J_0,\dots,\Phi_N,J_N)\) the rows (inner
+condition, then per cell balance and first moment, then outer condition) form
+a pentadiagonal system per group, solved for all groups at once by cuSPARSE
+`cusparseDgpsvInterleavedBatch` (QR, no pivoting failure on the zero diagonal
+of the inner row); the cell correction is \(\Phi_c\), added to the swept flux
+with the non-negativity floor (`sn_dsa_1d_gpu.cu`).
 
-At \(r=0\), 1D_SPH scalar parity gives a no-flux DSA boundary, so no additional
-row contribution is assembled. At the outer vacuum boundary the 1D_SPH DSA
-operator applies the same Marshak-like leakage convention used by
-`escaped_energy_kernel` in `src/radiation/sn_transport_1d_gpu.cu`:
-\[
-F_{out}=\beta_{vac}cE=\beta_{vac}\phi,\qquad \beta_{vac}=0.5.
-\]
-The corresponding volume-integrated diagonal term is
-\[
-B_c=c\Delta t\,\beta_{vac}A_{out}
-\]
-on the last cell only; it is not divided by \(V_c\). The resulting tridiagonal
-systems are solved by cuSPARSE `cusparseDgtsv2StridedBatch` with batch count
-\(G\), system size \(N_{cell}\), and stride \(N_{cell}\). In 2D_RZ the DSA
+**Why (measured 2026-09-24).** The former operator was a cell-centred
+diffusion equation (\(D=1/(3(\sigma_t+1/(c\Delta t)))\), harmonic face values,
+a \(\tfrac12cE\) outer leakage) that is not derived from the swept closure. A
+line-by-line Python replica of `sn_sweep_spherical_lc_kernel` and of that
+operator gave the spectral radius of the accelerated iteration 3.5 at
+\(\sigma_t\Delta r=10.5\) (S8 and S16), 5.5 at 104 and 6.1 at 500 (divergent;
+the GPU test at \(\sigma_s\Delta r=10.4\) stopped at 400 iterations with
+residual \(\infty\)), 0.75 at 2.9, 0.15 at 0.3; with the consistent operator
+0.21, 0.21, 0.22, 0.18 and 0.18, and at most 0.29 on geometric and random
+meshes, material jumps (thick core / thin shell and the reverse, cell by cell
+1000 / 1), near-void cells, steady state (\(\Delta t\to\infty\)), tiny cells at
+the centre and S32. `test_sn_1d_scattering_slab_dsa` checks the GPU rows
+against a host dense solve of the same system (three geometries, a varying
+\(\theta\)), the convergence on cells of optical thickness 10 in the three
+geometries (at most 30 iterations to \(10^{-8}\), against the unaccelerated
+reference), and the Anderson comparison below.
+
+**Anderson acceleration** (`Radiation.sn_transport.inner_acceleration=
+"anderson"`, 1D_SPH, 2026-09-24): the DSA-corrected source iteration
+\(\phi^{l+1}=G(\phi^l)\) (sweep, DSA correction, both with the
+non-negativity of the sweep) is mixed with the last `anderson_depth`
+\(m\le4\) residuals \(f_j=G(\phi^j)-\phi^j\) in the Walker–Ni form of the FLD
+outer iteration (`fld_anderson.cuh`, \(\beta=1\), Tikhonov-regularised normal
+equations, floor 0): \(\phi^{l+1}=\phi^l+f_l-\sum_j\gamma_j(\Delta\phi_j+\Delta
+f_j)\). The history restarts with every outer iteration, the unrolled graph
+path is not used, and the converged iterate is \(G(\phi)\) (no mix after the
+last iteration). Anderson mixing needs only evaluations of \(G\), so it keeps
+working with the sweep's non-negativity fix-ups, which make \(G\) nonlinear
+and rule out a Krylov solver on the sweep operator. `test_sn_1d_scattering_slab_dsa`
+compares the iteration counts and the converged fields of optically thick
+scattering spheres.
+The pentadiagonal systems have \(2(N_{cell}+1)\) rows per group, interleaved
+by group; the cuSPARSE work buffer is sized before capture. In 2D_RZ the DSA
 correction uses the corresponding R/Z 5-point diffusion stencil and a Jacobi
 iteration on the GPU; this is functional but not yet optimized for GXII-scale
 2D production.
@@ -4575,11 +4847,25 @@ every \(K\) inner iterations. The graph key includes cell/group/angle counts,
 \(K\), DSA mode,
 \(\Delta t\), spherical-sweep dynamic shared-memory size, quadrature-device
 pointers, mesh/radiation buffer pointers, the streaming-limiter mode flag, and
-the DSA cuSPARSE work buffer pointer. It is recaptured when those keys change,
+the DSA cuSPARSE work buffer and pentadiagonal scratch pointers. It is recaptured when those keys change,
 which covers mesh reallocations, angle-count changes, namelist mode changes,
-and timestep changes that alter kernel parameters. The DSA cuSPARSE buffer is
+and timestep changes that alter kernel parameters. When only \(\Delta t\) changed
+(buffers and sizes unchanged), the recaptured bodies update the instantiated
+graph in place (`cudaGraphExecUpdate`, same topology) instead of a new
+instantiation; any other key change, or a failed update, instantiates a new
+graph (2026-09-24). The DSA cuSPARSE buffer is
 allocated before capture; if graph capture or instantiation is unavailable, the
 solver falls back to the same streamed kernel sequence.
+
+Without scattering (every \(\sigma_s\) entry of the outer iteration exactly
+zero) the sweep source does not depend on the previous iterate, so one body
+(sweep, DSA step, state copy) is the transport solution for the outer
+iteration's emission. The solver then runs exactly one and records one inner
+iteration with residual 0, where the source iteration repeated the same sweep
+\(K\) times and then reported the residual 0 (2026-09-24; the run log states it
+once). The fixup tallies (radial and angular fixup counts and artificial
+absorption), which accumulate over the sweeps of a step, then count each outer
+iteration's sweep once.
 
 After each outer Picard sweep, a GPU Newton kernel solves the implicit electron
 balance cell-locally:
@@ -4592,8 +4878,11 @@ For TMAT/table EOS, the material Jacobian is
 \(\rho c_{v,e}(\rho,T)/\Delta t\), and the converged `ee` and `Pe` are written
 from the same electron table at \((\rho,T)\). If no electron EOS device view is
 provided, the kernel falls back to the legacy constant-\(c_v\) residual and
-ideal-gas pressure write. The radiation Jacobian uses the PE-side analytic
-\(\sum_g c\sigma^{PE}_g4a_{eV}T^3b_g\) term; \(db_g/dT\) is not included. The
+ideal-gas pressure write. The radiation Jacobian uses the PE-side analytic per-group term
+\(\sum_{g:\,E^+_g>0}[\lambda^{PE}_g/(1+\lambda^{PA}_g)]\,4a_{eV}T^3b_g\)
+— the active-set mask and the \(1/(1+\lambda^{PA})\) reduction included
+(2026-07-26 doc truth restoration); \(db_g/dT\) is not
+included. The
 Picard residual is
 \[
 r_k=\max_c\frac{|T^{k+1}_{e,c}-T^{k}_{e,c}|}
@@ -4614,9 +4903,13 @@ with defaults \(10^{-4}\) and \(10^{-5}\), respectively. Picard exits when
 because further Picard work is below the hydro time-integration error scale in
 the targeted GXII regime. Inner source iteration uses `inner_tol`. The
 deterministic tallies are
-`rad_dep[c,g]=c sigma_PA E_g V_c Delta t` and
+`rad_dep[c,g]=c sigma_PA E^{n+1}_g V_c Delta t` and
 `rad_emit[c,g]=eta_g V_c Delta t`, with
-\(\eta_g=c\sigma^{PE}_g a_{eV}T^4b_g\).
+\(\eta_g=c\sigma^{PE}_g a_{eV}T^4b_g\) at the final \(T\) and
+\(E^{n+1}_g\) the radiation energy the matter Newton writes back (the
+Newton kernel reads the written-back array explicitly; its input and output
+radiation arrays are the same array and are not `__restrict__`-qualified,
+2026-09-23).
 
 In 2D_RZ production SN, when the outer material Picard residual satisfies
 `outer_residual <= outer_tol` but the inner source iteration has not satisfied
@@ -4696,10 +4989,11 @@ clone with the per-level reflection index. `precompute_lc_weights_kernel`, the
 K2 moment/face reductions, the E*/donor-\(\theta\)/AP closures, escaped-energy
 and marshak boundary bookkeeping are reused unchanged (flat ordinate sums +
 runtime `geom`); the marshak ledger's discrete \(S^-=\sum_{\mu<0}w|\mu|\) is
-taken from the product set. **DSA is force-disabled for cylindrical** (the
-tridiagonal operator hardcodes \(4\pi r^2\) faces — spherical-only;
-acceleration-only, converged answer unchanged, one-time warning; pure-absorber
-gates unaffected). `TENRYU_DEBUG_LANE_PARALLEL` builds reject cylindrical.
+taken from the product set. **DSA runs for cylindrical** with the
+\(2\pi r\) faces and the product set's \(\mu\), \(w\) and \(\theta\) in the
+consistent face-moment rows (2026-09-24; the cell-centred operator ran from
+2026-09-23; it was force-disabled while the tridiagonal operator hard-coded
+\(4\pi r^2\) faces; acceleration only, the converged answer is unchanged). `TENRYU_DEBUG_LANE_PARALLEL` builds reject cylindrical.
 
 **Gates/tests**: `sn_1d_cylindrical_marshak_equilibration` (phase A uniform
 blackbody fixed point on the FULL cylinder r0=0 including the axis cell —
@@ -4708,12 +5002,40 @@ plateau, outer_rel 1.6e-7 / max_rel 9.6e-7 at 1800 steps, tolerances 1e-5 as
 spherical/planar), ctest `test_sn_cyl_quadrature` (CPU invariants) and
 `test_sn_1d_cylindrical_fixed_point` (LC+diamond × S8+S32, drift ≤ 1e-12,
 \(\chi=1/3\)). Residuals: no analytic cylindrical transport benchmark in the
-library yet (Lewis & Miller / PARTISN manuals in manual_queue); DSA
-cylindrical faces; multigroup cylindrical marshak (G=1 parity with the other
-geometries).
+library yet (Lewis & Miller / PARTISN manuals in manual_queue); multigroup
+cylindrical marshak (G=1 parity with the other geometries).
+
+#### 6.8.4 1D linear-discontinuous scheme (`spatial_scheme="linear_discontinuous"`, the 1D default, 2026-09-25)
+
+**Why.** With an emission or scattering source that is constant in each cell, a 1D spatial closure puts the wrong current into an optically thick, graded medium once \(\sigma\Delta r\gtrsim1\): for an emission \(\propto1+4r^2\) in a sphere (\(\sigma=40\), S8) the linear-characteristic scheme's current at \(r=0.5\) is 3.2× the diffusion current at \(\sigma\Delta r=4\) (1.24× at 1), and in a thick scattering sphere (\(\sigma_t=10\), \(c=1-10^{-4}\), \(\sigma\Delta r=10\)) its centre value is 81 % low (measured on replicas of the sweeps, 2026-09-25). Linear in-cell emission, scattering source and electron temperature, the temperature profile carried from step to step, restore the diffusion limit; rebuilding the in-cell profile from cell means at every step instead is several times less accurate. A Marshak wave (100 eV drive, \(\sigma=40\,\mathrm{cm^{-1}}\), \(C_v=5a T_b^3\), 200 steps of \(\Delta t=0.1/c\)) on 10 cells (\(\sigma\Delta r=4\)) against 160: max \(|T-T_{fine}|/T_b\) = 0.101 (sphere) / 0.068 (slab) with this scheme, 0.695 / 0.595 with the linear-characteristic scheme (`test_sn_1d_ld_step`); an independent Python implementation of the same discretization gives 0.101394 for the sphere, the GPU result to six digits. The linear-characteristic scheme's energy update (\(E^*=E^n-\Delta t\,\nabla\cdot F\) with the face fluxes limited so that no cell ends the step with negative radiation energy) throttled the transport through cells narrower than \(c\Delta t\) until its limiter credited the inflow in the order of the flow (2026-09-25, §6.8.2): a Marshak slab (0.4 cm, \(\sigma=50\,\mathrm{cm^{-1}}\), 50 eV drive, \(\Delta t=10^{-10}\) s) heated through on 8 cells but stayed cold inside on 32 and 128 cells; now its inner-cell temperature after 2000 steps converges with refinement to this scheme's (39.66 eV on 32 cells, 36.23 on 128, against 35.94 on 32 and 128 cells here; 49.52 on 8 cells).
+
+**Discretization.** Per cell the basis \(b_L=(r_R-r)/h\), \(b_R=(r-r_L)/h\), lumped masses \(M_j=\int b_jA\,dr\), \(N_j=\int b_jA'\,dr\) (two-point Gauss, exact) with the face area \(A=4\pi r^2\), \(2\pi r\) (per unit length) or 1 (per unit area). For ordinate \(m\) of an angular chain (§6.8.1; §6.8.3 for the cylinder's levels; the whole Gauss–Legendre set for the sphere and the slab):
+\[
+\begin{aligned}
+&\tfrac{\mu}{h}(M_L\psi_L+M_R\psi_R)-\mu A_L\hat\psi_L+\tfrac{N_L}{w_m}\big(\alpha_{m+\frac12}\psi_{m+\frac12,L}-\alpha_{m-\frac12}\psi_{m-\frac12,L}\big)+\big(\sigma_t+\tfrac1{c\Delta t}\big)M_L\psi_L=M_L\big(q_L+\tfrac{\psi^n_L}{c\Delta t}\big),\\
+&-\tfrac{\mu}{h}(M_L\psi_L+M_R\psi_R)+\mu A_R\hat\psi_R+\tfrac{N_R}{w_m}\big(\alpha_{m+\frac12}\psi_{m+\frac12,R}-\alpha_{m-\frac12}\psi_{m-\frac12,R}\big)+\big(\sigma_t+\tfrac1{c\Delta t}\big)M_R\psi_R=M_R\big(q_R+\tfrac{\psi^n_R}{c\Delta t}\big),
+\end{aligned}
+\]
+with the upwind face traces \(\hat\psi\) (the neighbour's node on the inflow side, the cell's own on the outflow side), the weighted diamond \(\psi_m=\tau_m\psi_{m+1/2}+(1-\tau_m)\psi_{m-1/2}\) at each node and the Carlson coefficients \(\alpha\) (zero at both ends of every chain; no angular term in the slab). Since \(N_L+N_R=A_R-A_L\) and the angular terms telescope, the weighted sum over nodes and ordinates is the exact cell balance; a uniform isotropic field satisfies every row exactly (\(V/h-A_L-N_L=0\)). Each chain starts from its starting direction, \(-s\,\partial_r\psi+(\sigma_t+1/c\Delta t)\psi=q+\psi^n_{sd}/c\Delta t\) along the diameter (\(s=1\) sphere, \(\sin\theta_\ell\) cylinder level), solved as a planar linear-discontinuous transport from the outer inflow with its own history. At the centre, the axis and the inner face of the slab the outward ordinate enters with its reflection partner's outflow. Outer face: vacuum or the Marshak inflow of §6.8 — a blackbody drive enters as \(\psi_{in}=cB_g/2\), a flux drive (`marshak.flux_erg_per_cm2_s`) as \(\psi_{in}=F_{inc}/\sum_{\mu<0}w|\mu|\) so that the discrete incoming current is the specified flux (the linear-characteristic scheme keeps \(2F_{inc}\)). The GPU sweep runs one warp per group, a chain's half-set of ordinates as a diagonal wavefront over the cells. A pure absorber is attenuated by \(1/(1+\tau+\tau^2/2)\) per cell of optical depth \(\tau\) along the ordinate (the linear-characteristic sweep: \(e^{-\tau}\)): slab, optical depth 20, S8, cells with \(\sigma\Delta x=2.5\) … 0.04 (8 … 256 cells), max relative error of the cell radiation energy where it exceeds \(10^{-3}\) of the drive 1.53, 0.81, 0.25, 0.076, 0.022, 0.0073; problems dominated by the uncollided attenuation of a beam through cells of optical depth \(\gtrsim1\) are more accurate with `"linear_characteristic"`.
+
+**Matter.** Every cell carries two electron specific energies, \(e_L=\bar e-(M_R/V)\delta\), \(e_R=\bar e+(M_L/V)\delta\) (\(V=M_L+M_R\)): `ee` \(=\bar e\) is their lumped-mass mean and the offset \(\delta=e_R-e_L\) is carried from step to step (`State::sn_ee_node_offset`, checkpoint `radiation_sn/ee_node_offset` [erg/g]; zero at the first step, after an ALE remap and after a size change; reduced where a node would fall below the energy of the temperature floor). \(T=T(e)\) from the cell material's electron EOS (the table closures of the cell-average Newton, with its tail convention; the ideal-gas closure \(e=e_{ref}+c_v(T-T_{ref})\) about the step-start `ee`, `Te`). The nodal matter equation is lumped like the transport:
+\[
+\rho\,(e_j-e^n_j)=\Delta t\Big(A_j-\sum_g\varepsilon_{g,j}\Big),\qquad A_j=\sum_g\sigma_{a,g}\phi_{g,j},\qquad\varepsilon_{g,j}=c\,\sigma_{pe,g}B_g(T_j).
+\]
+
+**Iteration.** Newton on the nodal temperatures: the cell opacities are evaluated at \(T(\bar e_k)\), and about \(T_k\)
+\[
+\varepsilon_g=\underbrace{c\sigma_{pe,g}B_g(T_k)-\chi_g\,\frac{\Delta t\sum_hc\sigma_{pe,h}B_h(T_k)+\rho(e_k-e^n)}{D}}_{\text{fixed}_g}+\underbrace{\chi_g\frac{\Delta t}{D}}_{\kappa_g}A,\qquad\chi_g=c\sigma_{pe,g}B'_g(T_k),\quad D=\rho c_v(T_k)+\Delta t\sum_h\chi_h,
+\]
+\(B'_g=a\,(4T^3b_g+T^4\,db_g/dT)\) with \(db_g/dT\) the derivative of the Planck table's own interpolation (\(4b_g+T\,db_g/dT=\int_{group}xf\,e^x/(e^x-1)\,dx>0\) for the Planck density \(f\); a negative interpolated value is set to 0). The per-angle source is \((\text{fixed}_g+\kappa_gA+\sigma_{s,g}\phi_g+S\delta_{g0})/2\). The coupling \((I-K)A=b\) — \(K\) the transport of every group's \(\kappa_gA\) — is solved by GMRES (restart 30, classical Gram–Schmidt with one reorthogonalization — both passes on the device, one copy of the coefficients to the host per Krylov step — deterministic reductions; each node's residual scaled by \(s_j=\sum_g\sigma_{a,g}(|\phi_{ref}|+cB_g)\); converged when the residual has dropped by `inner_tol` from the Newton iteration's first one, at most `max_inner_iterations` Krylov steps), right-preconditioned by the grey low-order correction: spectral shape \(\xi_g\propto\kappa_g/(\sigma_{a,g}+1/c\Delta t)\), \(\sum\xi_g=1\); the consistent P1 system of the sweep (the P1 ansatz \(\psi=a\Phi+b\mu J\) at both nodes inserted in every ordinate's equations, zeroth and first angular moments per node: four unknowns per cell, block tridiagonal, block Thomas) with the transport cross section \(1/\sum_g\xi_g/(\sigma_{t,g}+1/c\Delta t)\), the removal \((1-\sum_g\kappa_g)\sum_g\xi_g\sigma_{a,g}+1/c\Delta t\) and the source \(\sum_g\kappa_g\,r\); the correction of \(A\) is \(\sum_g\xi_g\sigma_{a,g}\Phi\). The preconditioner is applied in a Newton iteration only where it pays for itself (`Radiation.sn_transport.grey_preconditioner`, default `"auto"`, 2026-09-25): with the local gain \(\gamma_j=\bar\kappa_j\bar\sigma_{a,j}/\mathrm{rem}_j\) of the correction at node \(j\) (\(\bar\kappa=\sum_g\kappa_g\), \(\bar\sigma_a=\sum_g\xi_g\sigma_{a,g}\), \(\mathrm{rem}\) the removal above) — in an infinite medium the correction maps a smooth absorption-rate error \(v\) to \((1+\gamma)v\), and the unpreconditioned coupling contracts it by \(\gamma/(1+\gamma)\) per Krylov step — `"auto"` applies it when \(\max_j\gamma_j>0.1\) (a contraction above 0.091 per step) and otherwise runs GMRES unpreconditioned, skipping the P1 assembly, factorization and solves; `"on"` always applies it, `"off"` never. The converged solution and the tolerances are the same; the Krylov iterates differ, so does the rounding of the solution. In the GXII S_N deck \(\max_j\gamma_j\) stays below 0.065 (below 0.005 over the first 2000 steps); the correction saved 0.3 Krylov steps per Newton iteration late in the run (restarted from step 12000, 300 steps) and none early, and skipping it shortens the step by 3.8 ms late (8.14 to 7.01 s) and by 2.3 ms over the first 2000 steps (25.8 to 21.2 s, RTX 4090); the histories of the 300 late steps agree to \(10^{-10}\) relative. `TENRYU_SN_LD_PRECOND_AUDIT=1` logs, per Newton iteration, the largest gain, whether the preconditioner ran, the Krylov steps and the first residual ratios (read-only). Physical scattering is converged inside every transport solve by source iteration with the same P1 system per group, to 0.1 `inner_tol` (\(c=1-10^{-4}\), \(\sigma\Delta r=0.3/3/30\): 16/13/6 iterations in the sphere and the cylinder, 15/10/6 in the slab, to \(10^{-11}\)). The next linearization point of each node is its own balance temperature with the transport's absorption held (\(\rho(e(T)-e^n)+\Delta t\sum_gc\sigma_{pe,g}B_g(T)=\Delta t\max(A,0)\), safeguarded Newton), moved by at most a factor 4 per iteration (a tangent taken far below the solution overshoots by orders of magnitude when the emission dominates the heat capacity: a 5 eV → 100 eV step, measured), and by a fraction \(\omega\) of the step that halves (down to 1/16) when a step reverses the previous one without shrinking below half of it (the cell opacities are held at the point; a table-opacity corona cell at 643 eV alternated by ±20 eV and did not converge in 20 iterations without it). The iteration stops when the nodal temperatures change by at most `outer_tol` (the effective value of §6.8) and GMRES has converged. On the GPU the linearization and the nodal matter update (with its balance temperature) run one warp per node, the groups' Planck terms in parallel over the lanes and the sums over the groups in the group order; the electron EOS inversions (a bisection in \(\ln T\)) run on a warp that evaluates the next five bisection levels' 31 midpoints in parallel and descends the tree with the sequential loop's decisions (the same result); the P1 systems (the preconditioner's, and with physical scattering one per group) are assembled and eliminated once per Newton iteration, each diagonal block (with the lower neighbour eliminated) inverted by Gauss–Jordan with partial pivoting and stored as its inverse, and applied to every right-hand side by forward and backward substitution with matrix-vector products; the sweep's cell matrices of every group, ordinate and starting direction are inverted once per Newton iteration (they depend on the cross sections and the mesh only), so a cell's solve in the sweep is its right-hand side (source, inflow trace, angular edge) times the inverse, and each lane loads its next cell's operands one diagonal ahead (2026-09-25; the inverses change the rounding: the GXII S_N deck's integrated quantities differ from the Cramer's-rule and LU-substitution forms by at most \(2\times10^{-5}\) relative over 1593 steps, the iteration counts are the same).
+
+**Accepted state.** Each iteration's nodal energies follow from the transport's own absorption and the emission that entered its final sweep, \(e_j=e^n_j+\Delta t(A_j-\sum_g(\text{fixed}_g+\kappa_gA^*_j))/\rho\): radiation and matter exchange the same energy, so the step conserves energy for any iterate (to the scattering tolerance; measured step imbalance ≤ \(3\times10^{-15}\) relative). `ee` is the lumped-mass mean, `Te` \(=T(\)`ee`\()\), `Pe` from the EOS; `rad_E` \(=\sum_jM_j\phi_j/(cV)\) (`sn_phi_old` the same mean of \(\phi\)); `rad_dep`/`rad_emit` the absorbed/emitted energy of the step; the face flux is the transport's own current (no blending with a diffusion flux, no limiter, no void-cell energy anchor); the escape is booked gross as in §6.8. A step that did not converge, or that raised a node to the floor energy, requests the driver's retry through `sn_material_retry_flag` (4 Newton, 8 GMRES, 16 scattering, 1 floor). Void cells have no absorption, emission or scattering and keep their matter energy. \(\psi^n\) (every ordinate and node, `radiation_sn/psi_prev`) and the starting-direction histories (`radiation_sn/psi_sd_prev`) are rescaled at the step start per (cell, group) so that \(\sum_jM_j\phi^n_j=cE^nV\) with \(E^n\) the radiation energy the other operators left (compression, remap, a restart), or seeded isotropic and flat in the cell (first step, a size change, a remap, no usable history).
+
+**Namelist.** A 1D deck that does not set `spatial_scheme` runs this scheme; `inner_acceleration="anderson"` is refused with it, and `dsa_enabled`, `inner_graph_unroll`, `outer_tol_stagnation_factor`, `diffusion_fallback_mode`, `tau_diffusion_on/off` apply to the linear-characteristic scheme only.
+
+**Tests.** ctest `test_sn_1d_ld` (the GPU sweep and moments against a host implementation of the same equations in the three geometries; the P1-accelerated source iteration of thick scattering against a dense direct solution: error ≤ \(2.5\times10^{-12}\)) and `test_sn_1d_ld_step` (the Planck fraction derivative against central differences, worst relative difference \(2.2\times10^{-8}\); the equilibrium fixed point in every geometry, one and three groups, with scattering: change ≤ \(3\times10^{-15}\); the step energy balance with vacuum and Marshak boundaries, scattering, void cells and a flux drive; the Marshak waves above; the slab attenuation study above; six groups with the frequency-dependent opacity (\(\sigma\) from \(10^{8}\) to 26 cm⁻¹, 5 eV matter under a 150 eV drive): every step converged, at most 139 GMRES iterations in a step, run-to-run bitwise identical). Verification: `sn_1d_analytic_marshak`, `sn_1d_su_olson`, `sn_1d_marshak_equilibration` (sphere, slab, cylinder), `sn_1d_planar_transparent_gap`, `sn_1d_origin_symmetry` and `sn_1d_e_old_transient` run this scheme; `sn_1d_planar_slab_attenuation` (the exact attenuation) and `sn_1d_spherical_lathrop_two_region` set `"linear_characteristic"`. The slab equilibration's inner-slab temperature on 8 cells matches a 128-cell run to 0.05 % from 1000 steps on (the linear-characteristic 8-cell run leads it: 49.65 eV at 3000 steps against 47.67), so its step cap is 16000 (it reaches the plateau more slowly than the linear-characteristic run it was set for).
 
 ---
-
 
 ## 7. DDMC（Discrete Diffusion Monte Carlo） [RETIRED — legacy; 現行輻射は §6.7 FLD / §6.8 \(S_N\)]
 

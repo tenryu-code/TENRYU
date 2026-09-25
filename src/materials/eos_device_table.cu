@@ -80,6 +80,8 @@ DeviceEOSTable& DeviceEOSTable::operator=(DeviceEOSTable&& other) noexcept {
     log_T_max_ = other.log_T_max_;
     d_log_rho_inv_ = other.d_log_rho_inv_;
     d_log_T_inv_ = other.d_log_T_inv_;
+    log_rho_guess_inv_ = other.log_rho_guess_inv_;
+    log_T_guess_inv_ = other.log_T_guess_inv_;
     supports_rho_e_reclosure_ = other.supports_rho_e_reclosure_;
     cold_ = std::move(other.cold_);
 
@@ -96,6 +98,8 @@ DeviceEOSTable& DeviceEOSTable::operator=(DeviceEOSTable&& other) noexcept {
     other.log_T_max_ = 0.0;
     other.d_log_rho_inv_ = 0.0;
     other.d_log_T_inv_ = 0.0;
+    other.log_rho_guess_inv_ = 0.0;
+    other.log_T_guess_inv_ = 0.0;
     other.supports_rho_e_reclosure_ = 0u;
   }
   return *this;
@@ -191,8 +195,12 @@ void DeviceEOSTable::upload(const EOSTable& cpu_table) {
       }
     }
     d_log_rho_inv_ = uniform ? 1.0 / d : 0.0;
+    log_rho_guess_inv_ = (!uniform && log_rho_max_ > log_rho_min_)
+                             ? static_cast<double>(n_rho_ - 1) / (log_rho_max_ - log_rho_min_)
+                             : 0.0;
   } else {
     d_log_rho_inv_ = 0.0;
+    log_rho_guess_inv_ = 0.0;
   }
 
   if (n_T_ > 1) {
@@ -207,8 +215,12 @@ void DeviceEOSTable::upload(const EOSTable& cpu_table) {
       }
     }
     d_log_T_inv_ = uniform ? 1.0 / d : 0.0;
+    log_T_guess_inv_ = (!uniform && log_T_max_ > log_T_min_)
+                           ? static_cast<double>(n_T_ - 1) / (log_T_max_ - log_T_min_)
+                           : 0.0;
   } else {
     d_log_T_inv_ = 0.0;
+    log_T_guess_inv_ = 0.0;
   }
 }
 
@@ -229,6 +241,8 @@ DeviceEOSTableView DeviceEOSTable::view() const {
   v.d_log_T_inv = d_log_T_inv_;
   v.supports_rho_e_reclosure = supports_rho_e_reclosure_;
   v.cold = cold_.view();
+  v.log_rho_guess_inv = log_rho_guess_inv_;
+  v.log_T_guess_inv = log_T_guess_inv_;
   return v;
 }
 
@@ -263,6 +277,8 @@ void DeviceEOSTable::free_all() {
   log_T_max_ = 0.0;
   d_log_rho_inv_ = 0.0;
   d_log_T_inv_ = 0.0;
+  log_rho_guess_inv_ = 0.0;
+  log_T_guess_inv_ = 0.0;
   supports_rho_e_reclosure_ = 0u;
   cold_ = DeviceColdEquilibriumTable{};
 }

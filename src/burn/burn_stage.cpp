@@ -187,7 +187,13 @@ BurnStageResult compute_burn_step_1d_host(const BurnStageInputs& in,
     const double Te_keV_c = in.Te_eV[c] * 1.0e-3;
     const double Ti_keV_c =
         ((in.Ti_eV[c] > 0.0) ? in.Ti_eV[c] : 0.0) * 1.0e-3;
-    const double rho_lam_alpha = alpha_rho_lambda(Te_keV_c, in.rho[c]);
+    FraleyRangeMedium range_medium;
+    if (in.range_fe != nullptr && in.range_fi != nullptr) {
+      range_medium.fe = in.range_fe[c];
+      range_medium.fi = in.range_fi[c];
+    }
+    const double rho_lam_alpha =
+        alpha_rho_lambda(Te_keV_c, in.rho[c], range_medium);
 
     for (int k = 0; k < kNumReactions; ++k) {
       if (!(counts[k] > 0.0)) {

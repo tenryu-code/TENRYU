@@ -204,13 +204,19 @@ __host__ __device__ inline double face_diffusion(
   if (jl == jr) {
     N_face = N_old[g * n_cells + jl];
   }
-  const double rho_face = (jl == jr) ? rho[jl] : 0.5 * (rho[jl] + rho[jr]);
+  const double nz2_l =
+      corman_field_nz2(rho[jl], field_ions_at(p.field_cells, p.field, jl));
+  const double nz2_face =
+      (jl == jr) ? nz2_l
+                 : 0.5 * (nz2_l + corman_field_nz2(
+                                      rho[jr], field_ions_at(p.field_cells,
+                                                             p.field, jr)));
   const double lnL_face =
       (jl == jr) ? lnL_I[g * n_cells + jl]
                  : 0.5 * (lnL_I[g * n_cells + jl] +
                           lnL_I[g * n_cells + jr]);
   const double lambda =
-      corman_lambda(species_A, species_Z, E, rho_face, lnL_face);
+      corman_lambda_nz2(species_A, species_Z, E, nz2_face, lnL_face);
   const double m_s = species_A * corman_detail::kProtonMassG;
   const double v = sqrt(2.0 * E * corman_detail::kKeVToErg / m_s);
   if (!(lambda > 0.0) || !isfinite(lambda)) {
@@ -244,7 +250,8 @@ __host__ __device__ inline double outer_sink_coeff(
   const double D = face_diffusion(p, g, n_cells, species_A, species_Z, r_node,
                                   rho, N_old, lnL_I, n_cells);
   const double lambda = corman_lambda(species_A, species_Z, center_keV(p, g),
-                                      rho[j], lnL_I[g * n_cells + j]);
+                                      rho[j], lnL_I[g * n_cells + j],
+                                      field_ions_at(p.field_cells, p.field, j));
   if (!(D > 0.0) || !(lambda > 0.0) || !isfinite(lambda)) {
     return 0.0;
   }
@@ -321,14 +328,15 @@ __global__ void compute_coefficients_kernel(
   const double lnLe = (p.lnL_e > 0.0) ? p.lnL_e
                                       : corman_electron_log(Te_eV[j], ne[j]);
   tE[j] = corman_tE(species_A, species_Z, Te_eV[j], ne[j], lnLe);
+  const FieldIons field = field_ions_at(p.field_cells, p.field, j);
   for (int g = 0; g < p.n_groups; ++g) {
     const double lnLI =
         (p.lnL_I > 0.0)
             ? p.lnL_I
             : corman_ion_log(species_A, species_Z, center_keV(p, g),
-                             rho[j], Te_eV[j], Ti_eV[j], ne[j]);
+                             rho[j], Te_eV[j], Ti_eV[j], ne[j], field);
     gamma[g * n_cells + j] =
-        corman_gamma(species_A, species_Z, rho[j], lnLI);
+        corman_gamma(species_A, species_Z, rho[j], lnLI, field);
     lnL_I[g * n_cells + j] = lnLI;
   }
 }

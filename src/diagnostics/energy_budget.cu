@@ -75,12 +75,15 @@ __device__ inline void compute_energy_contrib_1d_kernel_body(
                                          : rho[c] * ee[c] * vol[c];
   contrib_int_i[c] = rho[c] * ei[c] * vol[c];
 
-  const double u = 0.5 * (v_r[c] + v_r[c + 1]);
-  contrib_kin[c] = 0.5 * mass[c] * u * u;
-  // W-J-2: nodal-form kinetic (half cell mass to each node). The averaged
-  // form above under-measures kinetic energy where v varies across the cell.
-  contrib_kin_nodal[c] =
-      0.25 * mass[c] * (v_r[c] * v_r[c] + v_r[c + 1] * v_r[c + 1]);
+  // Kinetic energy in the nodal form of the staggered 1D scheme (half of each
+  // cell's mass on each of its nodes): sum_j 1/2 m_j u_j^2 is the kinetic
+  // energy the momentum update carries. The cell-averaged form
+  // 1/2 m ((u_c + u_c+1)/2)^2 falls short by 1/8 m (u_c+1 - u_c)^2 per cell;
+  // in an ablating corona it under-measured the kinetic energy by ~10 % of
+  // the deposited energy and showed a spurious energy loss (2026-09-24).
+  const double kin = 0.25 * mass[c] * (v_r[c] * v_r[c] + v_r[c + 1] * v_r[c + 1]);
+  contrib_kin[c] = kin;
+  contrib_kin_nodal[c] = kin;
 }
 
 __global__ void compute_energy_contrib_1d_kernel(
@@ -305,6 +308,23 @@ __global__ void reduce_sum_block_kernel(const double* __restrict__ in,
   reduce_sum_block_kernel_body(block_idx, tid, s, in, block_sums, n);
 }
 
+constexpr int kBatchedSumMaxArrays = 8;
+
+struct BatchedSumSources {
+  const double* in[kBatchedSumMaxArrays];
+};
+
+// k arrays in one launch: block (x, q) reduces exactly what block x of
+// reduce_sum_block_kernel reduces for array q, into row q of block_sums.
+__global__ void reduce_sum_block_batched_kernel(const BatchedSumSources sources,
+                                                double* __restrict__ block_sums,
+                                                const int n) {
+  __shared__ double s[kBlockSize];
+  const int q = static_cast<int>(blockIdx.y);
+  reduce_sum_block_kernel_body(static_cast<int>(blockIdx.x), threadIdx.x, s, sources.in[q],
+                               block_sums + static_cast<std::size_t>(q) * gridDim.x, n);
+}
+
 double reduce_device_sum(const double* d_contrib,
                          const int n,
                          const char* malloc_msg,
@@ -362,11 +382,14 @@ void reduce_device_sums_batched(const double* const* d_contribs,
       "energy_budget:reduce_block_sums_batched",
       static_cast<std::size_t>(k) * static_cast<std::size_t>(blocks) * sizeof(double)));
 
+  TENRYU_ASSERT(k <= kBatchedSumMaxArrays, "reduce_device_sums_batched takes at most 8 arrays");
+  BatchedSumSources sources{};
   for (int q = 0; q < k; ++q) {
-    reduce_sum_block_kernel<<<blocks, kBlockSize>>>(
-        d_contribs[q], d_block_sums + static_cast<std::size_t>(q) * blocks, n);
-    cuda_check(cudaGetLastError(), launch_msg);
+    sources.in[q] = d_contribs[q];
   }
+  reduce_sum_block_batched_kernel<<<dim3(static_cast<unsigned>(blocks), static_cast<unsigned>(k)),
+                                    kBlockSize>>>(sources, d_block_sums, n);
+  cuda_check(cudaGetLastError(), launch_msg);
   cuda_check(core::debug_kernel_sync(), exec_msg);
 
   double* h_block_sums = static_cast<double*>(core::host_pinned_scratch_acquire(
@@ -692,11 +715,14 @@ void reduce_device_sums_to_slot(const double* const* d_contribs,
   if (blocks <= 0 || k <= 0) {
     return;
   }
+  TENRYU_ASSERT(k <= kBatchedSumMaxArrays, "reduce_device_sums_to_slot takes at most 8 arrays");
+  BatchedSumSources sources{};
   for (int q = 0; q < k; ++q) {
-    reduce_sum_block_kernel<<<blocks, kBlockSize>>>(
-        d_contribs[q], d_slot + static_cast<std::size_t>(q) * blocks, n);
-    cuda_check(cudaGetLastError(), "energy totals slot reduce launch failed");
+    sources.in[q] = d_contribs[q];
   }
+  reduce_sum_block_batched_kernel<<<dim3(static_cast<unsigned>(blocks), static_cast<unsigned>(k)),
+                                    kBlockSize>>>(sources, d_slot, n);
+  cuda_check(cudaGetLastError(), "energy totals slot reduce launch failed");
   cuda_check(core::debug_kernel_sync(),
              "energy totals slot reduce execution failed");
 }
@@ -849,7 +875,13 @@ EnergyBudget compute_step_energy_budget(const EnergyBudgetStepInput& input) {
   const double E_safety_non_floor = std::max(out.E_safety - out.E_floor, 0.0);
   const double E_artificial =
       out.E_floor + E_safety_non_floor + out.E_redistribution_unresolved;
-  out.E_denom = std::max({E_total_before, E_source, 1.0e-20});
+  // The scale of the energy sums: with table EOS cold curves the internal energies can be
+  // negative, and E_total can be small against the terms it is summed from (whose
+  // rounding sets the error floor of dE_total). Equals E_total_before when every term is
+  // non-negative.
+  const double E_scale_before = std::abs(before_E_int_e) + std::abs(before_E_int_i) +
+                                std::abs(before_E_kin) + std::abs(before_E_rad);
+  out.E_denom = std::max({E_scale_before, E_source, 1.0e-20});
   // Legacy W-J bookkeeping residual, not an unconditional physical-closure
   // test: in hydro_coupling=none, E_rad_mesh_advection includes energy created
   // by frozen radiation density on changing volumes. It is not a measured

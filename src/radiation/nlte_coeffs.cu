@@ -5,9 +5,11 @@
 #include <cmath>
 #include <cuda_runtime.h>
 #include <string>
+#include <type_traits>
 
 #include "core/device_scratch.hpp"
 #include "core/error.hpp"
+#include "materials/eos_cell_table_selector.cuh"
 #include "materials/ionmix_reader.cuh"
 #include "radiation/planck_table.cuh"
 
@@ -96,10 +98,23 @@ __device__ inline double edge_log_slope_density_lower_device(
          (log_ni_hi - log_ni_lo);
 }
 
-__device__ inline double interpolate_kappa_with_smooth_edges_device(
+// Evaluation point of interpolate_kappa_with_smooth_edges: everything that
+// depends on (ni, T) but not on the table or group, so the three opacity
+// tables of one thread share one set of logs (2026-09-23; each evaluation
+// used to recompute them). Values and order of operations are unchanged.
+struct KappaEvalPoint {
+  double log_ni_eval;
+  double log_T_eval;
+  double log_ni_edge;
+  double log_T_edge;
+  double log_kappa_min;
+  double log_kappa_max;
+  bool rarefied_extrapolation;
+  bool hot_extrapolation;
+};
+
+__device__ inline KappaEvalPoint make_kappa_eval_point(
     const materials::IonmixOpacityDeviceView& table,
-    const double* kappa_table,
-    int group,
     double ni_cm3,
     double temperature_eV) {
   const double ni_min = exp(table.log_ni_min);
@@ -111,33 +126,47 @@ __device__ inline double interpolate_kappa_with_smooth_edges_device(
   if (!isfinite(T_eval) || !(T_eval > 0.0)) {
     T_eval = table.T_min;
   }
+  KappaEvalPoint pt;
+  pt.log_ni_eval = log(ni_eval);
+  pt.log_T_eval = log(T_eval);
+  pt.rarefied_extrapolation = ni_eval < ni_min;
+  pt.hot_extrapolation = T_eval > table.T_max;
+  pt.log_ni_edge = fmin(fmax(pt.log_ni_eval, table.log_ni_min), table.log_ni_max);
+  pt.log_T_edge = fmin(fmax(pt.log_T_eval, table.log_T_min), table.log_T_max);
+  pt.log_kappa_min = log(kKappaFloor);
+  pt.log_kappa_max = log(DBL_MAX);
+  return pt;
+}
 
-  const double log_ni_eval = log(ni_eval);
-  const double log_T_eval = log(T_eval);
-  const bool rarefied_extrapolation = ni_eval < ni_min;
-  const bool hot_extrapolation = T_eval > table.T_max;
-  const double log_ni_edge =
-      fmin(fmax(log_ni_eval, table.log_ni_min), table.log_ni_max);
-  const double log_T_edge =
-      fmin(fmax(log_T_eval, table.log_T_min), table.log_T_max);
-
-  double log_kappa =
-      safe_log_kappa_device(table.interpolate(kappa_table, group, log_ni_edge, log_T_edge));
-  if (rarefied_extrapolation) {
+__device__ inline double interpolate_kappa_at_point_device(
+    const materials::IonmixOpacityDeviceView& table,
+    const double* kappa_table,
+    int group,
+    const KappaEvalPoint& pt) {
+  double log_kappa = safe_log_kappa_device(
+      table.interpolate(kappa_table, group, pt.log_ni_edge, pt.log_T_edge));
+  if (pt.rarefied_extrapolation) {
     const double slope_ni =
-        edge_log_slope_density_lower_device(table, kappa_table, group, log_T_edge);
-    log_kappa += slope_ni * (log_ni_eval - table.log_ni_min);
+        edge_log_slope_density_lower_device(table, kappa_table, group, pt.log_T_edge);
+    log_kappa += slope_ni * (pt.log_ni_eval - table.log_ni_min);
   }
-  if (hot_extrapolation) {
+  if (pt.hot_extrapolation) {
     const double slope_T =
-        edge_log_slope_temperature_upper_device(table, kappa_table, group, log_ni_edge);
-    log_kappa += slope_T * (log_T_eval - table.log_T_max);
+        edge_log_slope_temperature_upper_device(table, kappa_table, group, pt.log_ni_edge);
+    log_kappa += slope_T * (pt.log_T_eval - table.log_T_max);
   }
-
-  const double log_kappa_min = log(kKappaFloor);
-  const double log_kappa_max = log(DBL_MAX);
-  log_kappa = fmin(fmax(log_kappa, log_kappa_min), log_kappa_max);
+  log_kappa = fmin(fmax(log_kappa, pt.log_kappa_min), pt.log_kappa_max);
   return exp(log_kappa);
+}
+
+__device__ inline double interpolate_kappa_with_smooth_edges_device(
+    const materials::IonmixOpacityDeviceView& table,
+    const double* kappa_table,
+    int group,
+    double ni_cm3,
+    double temperature_eV) {
+  return interpolate_kappa_at_point_device(
+      table, kappa_table, group, make_kappa_eval_point(table, ni_cm3, temperature_eV));
 }
 
 __device__ inline double warp_reduce_sum_device(double value) {
@@ -165,7 +194,11 @@ __device__ inline double block_reduce_sum_device(double value, double* shared) {
     shared[0] = value;
   }
   __syncthreads();
-  return shared[0];
+  // Read before the barrier: the next reduction's warp-0 partial goes to
+  // shared[0] (compute-sanitizer racecheck, 2026-09-24).
+  const double total = shared[0];
+  __syncthreads();
+  return total;
 }
 
 __device__ inline double block_inclusive_scan_device(double value, double* shared) {
@@ -183,6 +216,21 @@ __device__ inline double block_inclusive_scan_device(double value, double* share
   return shared[tid];
 }
 
+// Exponential-Rosenbrock form of the Fleck factor, f = (1 - exp(-z))/z
+// (fld_1d_bodies.cuh fleck_form_phi1).
+__device__ inline double nlte_fleck_form_phi1(const double z) {
+  if (z < 1.0e-6) {
+    return 1.0 - 0.5 * z + z * z / 6.0;
+  }
+  return (1.0 - exp(-z)) / z;
+}
+
+// kBetaMode: 0 tangent beta = 4 a T^3 / Cv_e, 1 secant beta over a local 0-D
+// predictor, 2 guard (the larger of the two); kFormExp: 0 f = 1/(1+z), 1 the
+// exponential form. Radiation.multigroup_diffusion.fleck_beta / fleck_form for
+// table opacities (2026-09-24; the tangent 1/(1+z) instantiation is the
+// historic kernel).
+template <int kBetaMode, int kFormExp>
 __global__ void compute_nlte_coefficients_kernel(
     const double* __restrict__ rho,
     const double* __restrict__ Te,
@@ -222,7 +270,11 @@ __global__ void compute_nlte_coefficients_kernel(
     int* __restrict__ d_negative_eta_count,
     int* __restrict__ d_nan_inf_count,
     const int* __restrict__ cell_material_index,
-    int material_filter) {
+    int material_filter,
+    const materials::DeviceEOSTableView cv_electron_eos,
+    const materials::CellEOSTableSelector cv_cell_tables,
+    const int use_table_cv,
+    const double* __restrict__ rad_E_old) {
   const int c = blockIdx.x;
   if (c >= n_cells) {
     return;
@@ -331,12 +383,10 @@ __global__ void compute_nlte_coefficients_kernel(
     double sigma_pe_raw = 0.0;
     double sigma_R_raw = 0.0;
     if (rho_c > 0.0) {
-      sigma_pa_raw = rho_c * interpolate_kappa_with_smooth_edges_device(
-                                 table, table.kappa_PA, g, ni_c, T_eval);
-      sigma_pe_raw = rho_c * interpolate_kappa_with_smooth_edges_device(
-                                 table, table.kappa_PE, g, ni_c, T_eval);
-      sigma_R_raw = rho_c * interpolate_kappa_with_smooth_edges_device(
-                                table, table.kappa_R, g, ni_c, T_eval);
+      const KappaEvalPoint pt = make_kappa_eval_point(table, ni_c, T_eval);
+      sigma_pa_raw = rho_c * interpolate_kappa_at_point_device(table, table.kappa_PA, g, pt);
+      sigma_pe_raw = rho_c * interpolate_kappa_at_point_device(table, table.kappa_PE, g, pt);
+      sigma_R_raw = rho_c * interpolate_kappa_at_point_device(table, table.kappa_R, g, pt);
     }
 
     if (!isfinite(sigma_pa_raw) || sigma_pa_raw < 0.0) {
@@ -403,13 +453,32 @@ __global__ void compute_nlte_coefficients_kernel(
 
   if (threadIdx.x == 0) {
     double Cv_e = 0.0;
-    if (cv_e_override > 0.0) {
-      Cv_e = cv_e_override;
-    } else if (cv_e_table != nullptr && cv_e_table[c] > 0.0) {
-      Cv_e = fmax(rho_c, 0.0) * cv_e_table[c];
-    } else {
-      Cv_e = rho_c * fmax(zbar[c], 0.0) * kEvToErg /
-             (fmax(A, 1.0e-12) * kProtonMass * fmax(gamma_m1, 1.0e-12));
+    // fleck_cv_source="table" (NUMERICS §6.7): the electron table's cv at the
+    // linearization temperature, i.e. dU_e/dT_e of the energy function the
+    // matter update advances; the same rule and priority as the constant-
+    // opacity Fleck kernel (compute_fleck_for_fld_kernel_body).
+    if (use_table_cv != 0) {
+      const materials::DeviceEOSTableView eos =
+          cv_cell_tables.electron(c, cv_electron_eos);
+      if (eos.n_rho > 0 && eos.n_T > 0 && eos.P_table != nullptr &&
+          eos.e_table != nullptr && eos.cv_table != nullptr) {
+        const materials::RhoBracket br = materials::find_rho_bracket(eos, rho_c);
+        const double cv_mass = materials::device_eos_cv(
+            eos, br, log(fmax(T_eval, fmax(temperature_floor_eV, 1.0e-30))));
+        if (isfinite(cv_mass) && cv_mass > 0.0) {
+          Cv_e = fmax(rho_c, 0.0) * cv_mass;
+        }
+      }
+    }
+    if (!(Cv_e > 0.0)) {
+      if (cv_e_override > 0.0) {
+        Cv_e = cv_e_override;
+      } else if (cv_e_table != nullptr && cv_e_table[c] > 0.0) {
+        Cv_e = fmax(rho_c, 0.0) * cv_e_table[c];
+      } else {
+        Cv_e = rho_c * fmax(zbar[c], 0.0) * kEvToErg /
+               (fmax(A, 1.0e-12) * kProtonMass * fmax(gamma_m1, 1.0e-12));
+      }
     }
     Cv_e = fmax(Cv_e, 1.0e-30);
 
@@ -419,9 +488,10 @@ __global__ void compute_nlte_coefficients_kernel(
     } else {
       beta = 4.0 * kAeV * T_eval * T_eval * T_eval / Cv_e;
     }
-    if (cv_e_override <= 0.0 && !(cv_e_table != nullptr && cv_e_table[c] > 0.0)) {
-      beta = fmin(beta, 1.0);
-    }
+    // No beta <= 1 cap on the ideal-gas fallback (NUMERICS §6.7, 2026-07-26):
+    // f = 1/(1+z) stays in (0, 1] for any z >= 0, and the cap only raised f
+    // for hot low-Cv cells, weakening the Fleck linearization (2026-09-23:
+    // the cap had survived in this kernel).
     if (!isfinite(beta) || beta < 0.0) {
       beta = 0.0;
     }
@@ -440,7 +510,64 @@ __global__ void compute_nlte_coefficients_kernel(
     double f = 1.0;
     if (!bypass_fleck && sigma_p_em > 0.0) {
       const double alpha_safe = (alpha > 0.0) ? alpha : 1.0;
-      f = 1.0 / (1.0 + alpha_safe * beta * kCLight * fmax(dt, 0.0) * sigma_p_em);
+      if constexpr (kBetaMode == 0 && kFormExp == 0) {
+        f = 1.0 / (1.0 + alpha_safe * beta * kCLight * fmax(dt, 0.0) * sigma_p_em);
+      } else {
+        if constexpr (kBetaMode != 0) {
+          // Secant beta = [B(T_pred) - B(T^n)] / [U_e(T_pred) - U_e(T^n)] with
+          // a local 0-D predictor for T_pred and U_e from the electron table
+          // the heat capacity comes from; any failing guard keeps the tangent
+          // beta (the constant-opacity kernel's rule, fld_1d_bodies.cuh
+          // compute_fleck_for_fld_kernel_body). Net heating of the predictor:
+          // c (sigma_P,abs E - sigma_P,em a T^4).
+          const materials::DeviceEOSTableView eos =
+              (use_table_cv != 0) ? cv_cell_tables.electron(c, cv_electron_eos)
+                                  : materials::DeviceEOSTableView{};
+          if (rad_E_old != nullptr && eos.n_rho > 0 && eos.n_T > 0 &&
+              eos.e_table != nullptr) {
+            double E_grey = 0.0;
+            for (int gg = 0; gg < n_groups; ++gg) {
+              E_grey += fmax(rad_E_old[base + gg], 0.0);
+            }
+            const double T_n = fmax(T_eval, 1.0e-12);
+            const double T2n = T_n * T_n;
+            const double B_n = kAeV * T2n * T2n;
+            const double z_tan = alpha_safe * beta * kCLight * fmax(dt, 0.0) * sigma_p_em;
+            const double f_tan = 1.0 / (1.0 + fmax(z_tan, 0.0));
+            double dT_est = f_tan * kCLight * (sigma_p_abs * E_grey - sigma_p_em * B_n) *
+                            fmax(dt, 0.0) / Cv_e;
+            const double dT_cap = 0.5 * T_n;
+            dT_est = fmin(fmax(dT_est, -dT_cap), dT_cap);
+            constexpr double kSecantMinDT = 1.0e-6;
+            if (isfinite(dT_est) && fabs(dT_est) > kSecantMinDT * T_n) {
+              const double T_floor = fmax(temperature_floor_eV, 1.0e-12);
+              const double T_pred = fmax(T_n + dT_est, T_floor);
+              if (T_pred != T_n) {
+                const materials::RhoBracket br = materials::find_rho_bracket(eos, rho_c);
+                const double e_n =
+                    materials::device_eos_energy(eos, br, log(fmax(T_n, T_floor)));
+                const double e_p =
+                    materials::device_eos_energy(eos, br, log(fmax(T_pred, T_floor)));
+                const double dU = fmax(rho_c, 0.0) * (e_p - e_n);
+                const double Tp2 = T_pred * T_pred;
+                const double dB = kAeV * (Tp2 * Tp2 - T2n * T2n);
+                const double beta_sec = dB / dU;
+                if (isfinite(beta_sec) && beta_sec > 0.0) {
+                  beta = (kBetaMode == 2) ? fmax(beta, beta_sec) : beta_sec;
+                }
+              }
+            }
+          }
+        }
+        const double z = alpha_safe * beta * kCLight * fmax(dt, 0.0) * sigma_p_em;
+        f = (kFormExp != 0) ? nlte_fleck_form_phi1(z) : 1.0 / (1.0 + z);
+        if (!isfinite(f) || f < 0.0) {
+          f = 0.0;
+        }
+        if (f > 1.0) {
+          f = 1.0;
+        }
+      }
     }
 
     s_sigma_p_abs = sigma_p_abs;
@@ -618,7 +745,13 @@ NlteCoeffsDeviceResult compute_nlte_coefficients_cuda_impl(
     int* pinned_clamp_counts = nullptr,
     bool reuse_device_void_mask = false,
     const int* cell_material_index = nullptr,
-    int material_filter = -1) {
+    int material_filter = -1,
+    const materials::DeviceEOSTableView* table_cv_electron_eos = nullptr,
+    const materials::CellEOSTableSelector* table_cv_cell_tables = nullptr,
+    bool accumulate_clamp_counts = false,
+    const double* d_rad_E_old = nullptr,
+    int fleck_beta_mode = 0,
+    int fleck_form_exp = 0) {
   (void)f_min;
   (void)f_max;
   (void)fd_delta_rel;
@@ -660,13 +793,17 @@ NlteCoeffsDeviceResult compute_nlte_coefficients_cuda_impl(
   int* const d_negative_alpha = &d_clamp_counts[0];
   int* const d_negative_eta = &d_clamp_counts[1];
   int* const d_nan_inf = &d_clamp_counts[2];
-  nlte_cuda_check(cudaMemsetAsync(d_clamp_counts, 0, 3 * sizeof(int), stream),
-                  "memset clamp_counts");
+  if (!accumulate_clamp_counts) {
+    nlte_cuda_check(cudaMemsetAsync(d_clamp_counts, 0, 3 * sizeof(int), stream),
+                    "memset clamp_counts");
+  }
 
   const int groups_for_block = std::min(n_groups, kMaxGroupsPerBlock);
   const int groups_per_block =
       ((groups_for_block + kWarpSize - 1) / kWarpSize) * kWarpSize;
-  compute_nlte_coefficients_kernel<<<n_cells, groups_per_block, 0, stream>>>(
+  const auto launch = [&](auto beta_mode, auto form_exp) {
+  compute_nlte_coefficients_kernel<decltype(beta_mode)::value, decltype(form_exp)::value>
+      <<<n_cells, groups_per_block, 0, stream>>>(
       d_rho,
       d_Te,
       d_zbar,
@@ -705,7 +842,25 @@ NlteCoeffsDeviceResult compute_nlte_coefficients_cuda_impl(
       d_negative_eta,
       d_nan_inf,
       cell_material_index,
-      material_filter);
+      material_filter,
+      (table_cv_electron_eos != nullptr) ? *table_cv_electron_eos
+                                         : materials::DeviceEOSTableView{},
+      (table_cv_cell_tables != nullptr) ? *table_cv_cell_tables
+                                        : materials::CellEOSTableSelector{},
+      (table_cv_electron_eos != nullptr) ? 1 : 0,
+      d_rad_E_old);
+  };
+  using I0 = std::integral_constant<int, 0>;
+  using I1 = std::integral_constant<int, 1>;
+  using I2 = std::integral_constant<int, 2>;
+  const int beta_mode = (d_rad_E_old != nullptr) ? fleck_beta_mode : 0;
+  if (beta_mode == 1) {
+    fleck_form_exp != 0 ? launch(I1{}, I1{}) : launch(I1{}, I0{});
+  } else if (beta_mode == 2) {
+    fleck_form_exp != 0 ? launch(I2{}, I1{}) : launch(I2{}, I0{});
+  } else {
+    fleck_form_exp != 0 ? launch(I0{}, I1{}) : launch(I0{}, I0{});
+  }
   nlte_cuda_check(cudaGetLastError(), "kernel launch");
 
   if (pinned_clamp_counts != nullptr) {
@@ -861,7 +1016,13 @@ NlteCoeffsDeviceResult compute_nlte_coefficients_cuda_with_pe(
     int* pinned_clamp_counts,
     bool reuse_device_void_mask,
     const int* cell_material_index,
-    int material_filter) {
+    int material_filter,
+    const materials::DeviceEOSTableView* table_cv_electron_eos,
+    const materials::CellEOSTableSelector* table_cv_cell_tables,
+    bool accumulate_clamp_counts,
+    const double* d_rad_E_old,
+    int fleck_beta_mode,
+    int fleck_form_exp) {
   return compute_nlte_coefficients_cuda_impl(
       d_rho,
       d_Te,
@@ -902,7 +1063,13 @@ NlteCoeffsDeviceResult compute_nlte_coefficients_cuda_with_pe(
       pinned_clamp_counts,
       reuse_device_void_mask,
       cell_material_index,
-      material_filter);
+      material_filter,
+      table_cv_electron_eos,
+      table_cv_cell_tables,
+      accumulate_clamp_counts,
+      d_rad_E_old,
+      fleck_beta_mode,
+      fleck_form_exp);
 }
 
 NlteCoeffsDeviceResult compute_nlte_coefficients_cuda_pure_sn(
@@ -940,7 +1107,9 @@ NlteCoeffsDeviceResult compute_nlte_coefficients_cuda_pure_sn(
     double* d_eta,
     double* d_sigma_p_em,
     cudaStream_t stream,
-    bool low_density_extrap) {
+    bool low_density_extrap,
+    const int* cell_material_index,
+    int material_filter) {
   TENRYU_ASSERT(d_sigma_pe != nullptr,
                 "compute_nlte_coefficients_cuda_pure_sn: sigma_pe output null");
   return compute_nlte_coefficients_cuda_impl(
@@ -979,7 +1148,11 @@ NlteCoeffsDeviceResult compute_nlte_coefficients_cuda_pure_sn(
       d_sigma_p_em,
       true,
       stream,
-      low_density_extrap);
+      low_density_extrap,
+      nullptr,
+      false,
+      cell_material_index,
+      material_filter);
 }
 
 }  // namespace tenryu::radiation

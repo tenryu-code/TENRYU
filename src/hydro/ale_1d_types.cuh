@@ -33,7 +33,10 @@ enum class Ale1dSkipReason {
   BenefitTooSmall,
   CandidateInvalid,
   ConservationRejected,
-  DtPenaltyTooLarge
+  DtPenaltyTooLarge,
+  // Within min_steps_between_ale of the last applied rezone (this was
+  // reported as BenefitTooSmall).
+  TooSoon
 };
 
 const char* to_string(Ale1dSkipReason r);
@@ -47,6 +50,9 @@ struct Ale1dStepResult {
   bool remap_rejected = false;
   Ale1dSkipReason skip_reason = Ale1dSkipReason::None;
   double max_dr_ratio = 1.0;
+  // Acoustic time-step bound of the candidate over that of the current mesh
+  // (0 when no candidate was evaluated, 1 when neither has a bound).
+  double candidate_dt_gain = 0.0;
   double mass_conservation_rel_err = 0.0;
   double energy_conservation_rel_err = 0.0;
   double radiation_conservation_rel_err = 0.0;

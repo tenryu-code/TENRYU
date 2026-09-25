@@ -1,5 +1,6 @@
 #pragma once
 
+#include "materials/eos_cell_table_selector.cuh"
 #include "materials/eos_device_table.cuh"
 #include "radiation/planck_table.cuh"
 #include "radiation/sn_transport_gpu.cuh"
@@ -36,6 +37,9 @@ struct SnMaterialNewton1DInputs {
   double* delta_T_rel = nullptr;    // [n_cells]
   PlanckTableDeviceView planck{};
   materials::DeviceEOSTableView electron_eos{}; // optional TMAT electron EOS
+  // Per-cell electron table and heat capacity of multi-material 1D runs
+  // (radiation::cell_electron_table_selector_1d; default: disabled).
+  materials::CellEOSTableSelector cell_electron_eos{};
   int n_cells = 0;
   int n_groups = 0;
   double dt = 0.0;

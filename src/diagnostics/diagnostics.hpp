@@ -112,12 +112,25 @@ struct LaserPatternDiagnostics {
   std::int64_t critical_surface_hit_count = 0;
   double corona_transition_blend = 0.0;
   std::int64_t corona_transition_resolved_cells = 0;
+  double ghost_corona_width = 0.0;
 };
 
 struct FldSolverDiagnostics {
   std::int64_t outer_iterations = 0;
   double outer_residual = 0.0;
   std::uint8_t outer_converged = 0;
+};
+
+// S_N solves of a step (1D and 2D_RZ): outer (the linear-discontinuous
+// scheme's Newton, the older schemes' Picard) and inner (Krylov / source)
+// iterations summed over the step's solves, the largest outer residual, and
+// whether every solve converged. active = the run uses mode "sn_transport".
+struct SnSolverDiagnostics {
+  bool active = false;
+  std::int64_t outer_iterations = 0;
+  std::int64_t inner_iterations = 0;
+  double outer_residual = 0.0;
+  std::uint8_t converged = 0;
 };
 
 struct PhaseResolvedEnergyDiagnostics {
@@ -266,6 +279,15 @@ ArealDensityDiagnostics compute_areal_density(const core::State& state,
 
 SphericityDiagnostics compute_sphericity(const core::State& state,
                                          const core::Config& cfg);
+
+// 1D areal density and sphericity (the compute_areal_density and
+// compute_sphericity 1D results, same arithmetic) from one readback of rho,
+// x_r and the gas tracer; either output may be null. Returns false (outputs
+// untouched) when the state is not a 1D mesh with node count = cells + 1.
+bool compute_shape_history_1d(const core::State& state,
+                              const core::Config& cfg,
+                              ArealDensityDiagnostics* areal,
+                              SphericityDiagnostics* sphericity);
 
 LaserPatternDiagnostics compute_laser_pattern(const core::State& state,
                                               const core::Config& cfg,

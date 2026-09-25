@@ -2,6 +2,8 @@
 
 #include <cuda_runtime.h>
 
+#include "burn/field_ions.hpp"
+
 namespace tenryu::burn {
 
 struct McParams {
@@ -9,6 +11,10 @@ struct McParams {
   int particles_per_cell = 16;  // per slot per step
   unsigned long long seed = 12345ULL;
   double dE_frac = 0.1;         // max relative CSDA energy change per substep
+  // Field ions (NUMERICS §14.7): per cell when `field_cells` is set (device
+  // array), else `field` everywhere.
+  FieldIons field;
+  FieldIonCells field_cells;
 };
 
 struct McStepResult {

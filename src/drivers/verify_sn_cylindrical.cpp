@@ -76,6 +76,9 @@ core::Config make_cyl_sn_gate_config(const int n_cells,
   cfg.radiation.holo.enabled = false;
   cfg.radiation.imc.difference.enabled = false;
   cfg.radiation.sn_transport.n_angles = 8;
+  // The 1D default scheme (the builder's choice for a deck that does not set
+  // it); TENRYU_SN_MARSHAK_DIAG_SCHEME selects another.
+  cfg.radiation.sn_transport.spatial_scheme = "linear_discontinuous";
   cfg.radiation.sn_transport.max_outer_iterations = 8;
   cfg.radiation.sn_transport.max_inner_iterations = 40;
   cfg.radiation.sn_transport.outer_tol = 1.0e-8;

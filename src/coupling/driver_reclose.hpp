@@ -68,6 +68,9 @@ void launch_tabular_eos_reclose(
     double* cv_e,
     double* cv_i,
     double te_floor,
-    double ti_floor);
+    double ti_floor,
+    // Per-cell tables (null index: the views above for every cell). With
+    // closure_params set, only the Mie-Gruneisen cells are re-closed.
+    const materials::CellEOSTableSelector& cell_tables = materials::CellEOSTableSelector{});
 
 }  // namespace tenryu::coupling

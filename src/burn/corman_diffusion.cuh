@@ -6,6 +6,7 @@
 #include <cuda_runtime.h>
 
 #include "burn/burn_constants.hpp"
+#include "burn/field_ions.hpp"
 
 namespace tenryu::burn {
 
@@ -15,6 +16,10 @@ struct CormanParams {
   double E_max_keV = 15500.0;
   double lnL_e = 0.0;
   double lnL_I = 0.0;
+  // Field ions (NUMERICS §14.7): per cell when `field_cells` is set (device
+  // arrays), else `field` everywhere.
+  FieldIons field;
+  FieldIonCells field_cells;
 };
 
 struct CormanStepResult {
@@ -31,6 +36,7 @@ inline constexpr double kElectronMassG = 9.1093837015e-28;
 inline constexpr double kProtonMassG = 1.6726219e-24;
 inline constexpr double kEVToErg = 1.602176634e-12;
 inline constexpr double kKeVToErg = kMeVToErg / 1000.0;
+// Mean mass number of equimolar DT (the default field ions).
 inline constexpr double kFieldA = 2.51505;
 
 __host__ __device__ inline double corman_finite_or_zero(const double x) {
@@ -58,7 +64,8 @@ __host__ __device__ inline double corman_electron_log(double Te_eV,
 
 __host__ __device__ inline double corman_ion_log(
     double species_A, double species_Z, double E_birth_keV, double rho_gcc,
-    double Te_eV, double Ti_eV, double ne_cm3) {
+    double Te_eV, double Ti_eV, double ne_cm3,
+    const FieldIons& field = FieldIons{}) {
   if (!(species_A > 0.0) || !(species_Z > 0.0) || !(E_birth_keV > 0.0) ||
       !(rho_gcc > 0.0) || !(Te_eV > 0.0) || !(Ti_eV > 0.0) ||
       !(ne_cm3 > 0.0)) {
@@ -68,15 +75,15 @@ __host__ __device__ inline double corman_ion_log(
                     corman_detail::kElectronChargeEsu;
   const double kTe = Te_eV * corman_detail::kEVToErg;
   const double kTi = Ti_eV * corman_detail::kEVToErg;
-  const double n_i = rho_gcc / (2.5 * corman_detail::kProtonMassG);
+  const double n_i = rho_gcc / (field.A_bar * corman_detail::kProtonMassG);
   const double inv_lambda2 =
-      4.0 * corman_detail::kPi * e2 * (n_i / kTi + ne_cm3 / kTe);
+      4.0 * corman_detail::kPi * e2 * (n_i * field.z2_bar / kTi + ne_cm3 / kTe);
   if (!(inv_lambda2 > 0.0)) {
     return 2.0;
   }
   const double lambda_D = 1.0 / sqrt(inv_lambda2);
   const double m_s = species_A * corman_detail::kProtonMassG;
-  const double m_field = 2.5 * corman_detail::kProtonMassG;
+  const double m_field = field.A_bar * corman_detail::kProtonMassG;
   const double mu_rel = m_s * m_field / (m_s + m_field);
   const double E_birth_erg = E_birth_keV * corman_detail::kKeVToErg;
   const double u2 = 2.0 * E_birth_erg / m_s;
@@ -97,6 +104,9 @@ __host__ __device__ inline double corman_tE(double species_A,
       !(ne_cm3 > 0.0) || !(lnL_e > 0.0)) {
     return INFINITY;
   }
+  // Energy relaxation time on electrons, dE/dt = -E/t_E (Corman et al.
+  // 1975, p. 380): t_E = 3 m theta_e^{3/2} / (8 sqrt(2 pi m_e) n_e Z^2 e^4
+  // lnLambda_e), half of Spitzer's momentum slowing-down time.
   const double m_s = species_A * corman_detail::kProtonMassG;
   const double kTe = Te_eV * corman_detail::kEVToErg;
   const double e2 = corman_detail::kElectronChargeEsu *
@@ -104,7 +114,7 @@ __host__ __device__ inline double corman_tE(double species_A,
   const double e4 = e2 * e2;
   const double numerator = 3.0 * m_s * kTe * sqrt(kTe);
   const double denominator =
-      4.0 * sqrt(2.0 * corman_detail::kPi * corman_detail::kElectronMassG) *
+      8.0 * sqrt(2.0 * corman_detail::kPi * corman_detail::kElectronMassG) *
       ne_cm3 * species_Z * species_Z * e4 * lnL_e;
   return numerator / denominator;
 }
@@ -112,17 +122,16 @@ __host__ __device__ inline double corman_tE(double species_A,
 __host__ __device__ inline double corman_gamma(double species_A,
                                                double species_Z,
                                                double rho_gcc,
-                                               double lnL_I) {
+                                               double lnL_I,
+                                               const FieldIons& field = FieldIons{}) {
   if (!(species_A > 0.0) || !(species_Z > 0.0) || !(rho_gcc > 0.0) ||
       !(lnL_I > 0.0)) {
     return 0.0;
   }
   const double m_s = species_A * corman_detail::kProtonMassG;
-  const double m_D = 2.0141 * corman_detail::kProtonMassG;
-  const double m_T = 3.0160 * corman_detail::kProtonMassG;
-  const double n_i = rho_gcc /
-                     (corman_detail::kFieldA * corman_detail::kProtonMassG);
-  const double sum_nz2_over_m = 0.5 * n_i * (1.0 / m_D + 1.0 / m_T);
+  const double n_i = rho_gcc / (field.A_bar * corman_detail::kProtonMassG);
+  const double sum_nz2_over_m =
+      n_i * field.z2_over_A_bar / corman_detail::kProtonMassG;
   const double e2 = corman_detail::kElectronChargeEsu *
                     corman_detail::kElectronChargeEsu;
   const double e4 = e2 * e2;
@@ -130,21 +139,26 @@ __host__ __device__ inline double corman_gamma(double species_A,
          sum_nz2_over_m * sqrt(0.5 * m_s);
 }
 
-__host__ __device__ inline double corman_lambda(double species_A,
-                                                double species_Z,
-                                                double E_keV,
-                                                double rho_gcc,
-                                                double lnL_I) {
+// sum_j n_j Z_j^2 of the field ions [1/cm^3] at density rho.
+__host__ __device__ inline double corman_field_nz2(const double rho_gcc,
+                                                   const FieldIons& field) {
+  return rho_gcc / (field.A_bar * corman_detail::kProtonMassG) *
+         field.z2_bar;
+}
+
+// Pitch-angle scattering length for sum_j n_j Z_j^2 = sum_nz2 [1/cm^3].
+__host__ __device__ inline double corman_lambda_nz2(double species_A,
+                                                    double species_Z,
+                                                    double E_keV,
+                                                    double sum_nz2,
+                                                    double lnL_I) {
   if (!(species_A > 0.0) || !(species_Z > 0.0) || !(E_keV > 0.0) ||
-      !(rho_gcc > 0.0) || !(lnL_I > 0.0)) {
+      !(sum_nz2 > 0.0) || !(lnL_I > 0.0)) {
     return INFINITY;
   }
   const double m_s = species_A * corman_detail::kProtonMassG;
   const double E_erg = E_keV * corman_detail::kKeVToErg;
   const double v = sqrt(2.0 * E_erg / m_s);
-  const double n_i = rho_gcc /
-                     (corman_detail::kFieldA * corman_detail::kProtonMassG);
-  const double sum_nz2 = n_i;
   const double e2 = corman_detail::kElectronChargeEsu *
                     corman_detail::kElectronChargeEsu;
   const double e4 = e2 * e2;
@@ -155,6 +169,19 @@ __host__ __device__ inline double corman_lambda(double species_A,
     return INFINITY;
   }
   return 2.0 * v / nu_D;
+}
+
+__host__ __device__ inline double corman_lambda(double species_A,
+                                                double species_Z,
+                                                double E_keV,
+                                                double rho_gcc,
+                                                double lnL_I,
+                                                const FieldIons& field = FieldIons{}) {
+  if (!(rho_gcc > 0.0)) {
+    return INFINITY;
+  }
+  return corman_lambda_nz2(species_A, species_Z, E_keV,
+                           corman_field_nz2(rho_gcc, field), lnL_I);
 }
 
 CormanStepResult corman_diffusion_step(

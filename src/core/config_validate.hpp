@@ -1240,6 +1240,15 @@ inline void validate_ale1d_config(const Config& config) {
                                   " must be positive with min <= max");
     }
   };
+  if (!(ale.emergency_max_dr_ratio >= 1.0)) {
+    throw namelist::ConfigError("Numerics.ale1d.emergency_max_dr_ratio must be >= 1");
+  }
+  if (!(ale.candidate_dt_penalty_max >= 1.0)) {
+    throw namelist::ConfigError("Numerics.ale1d.candidate_dt_penalty_max must be >= 1");
+  }
+  if (!(ale.benefit_min_dt_gain >= 1.0)) {
+    throw namelist::ConfigError("Numerics.ale1d.benefit_min_dt_gain must be >= 1");
+  }
   validate_tol(ale.total_mass_tol, "Numerics.ale1d.total_mass_tol");
   validate_tol(ale.material_mass_tol, "Numerics.ale1d.material_mass_tol");
   validate_tol(ale.radiation_group_energy_tol,

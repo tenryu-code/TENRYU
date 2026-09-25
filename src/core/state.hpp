@@ -614,6 +614,10 @@ struct State {
   bool zmom_active = false;
   DeviceBuffer<double> zmom_r2_table_storage;
   DeviceBuffer<double> zmom_r4_table_storage;
+  // Multi-material decks: the tables of every material slot (null pointers
+  // for a material without them), pointing into the storage above; each
+  // cell takes its material's (2026-09-24). Empty for one material.
+  DeviceBuffer<materials::ZMomentDeviceTables> zmom_tables_by_material;
   CellField1D gamma_eff;
   // Per-cell effective constant opacities, filled and invalidated with
   // ensure_cell_material_props() on the same lifecycle as A_eff/gamma_eff.
@@ -677,6 +681,11 @@ struct State {
   CellField1D cv_e;  // electron heat capacity [erg/(g*eV)], from table EOS or ideal gas
   CellField1D cv_i;  // ion heat capacity [erg/(g*eV)], from table EOS or ideal gas
   CellField1D cs;    // sound speed [cm/s], from table EOS or ideal gas fallback
+  // Set by the checkpoint reader when the checkpoint held the closure outputs cv_e, cv_i
+  // and cs next to ee, ei, Te, Ti, Pe and Pi: the restored state is the closed state of
+  // the run that wrote it, and the start of a 1D run does not close it again (a second
+  // closure is not bitwise idempotent).
+  bool closure_fields_restored = false;
   // Cold-equilibrium mechanical energy C(v) per cell [erg/g] (materials/
   // cold_equilibrium.hpp); sized only when Numerics.hydro.T_start_inactive_cells
   // == "cold_equilibrium", written by the 1D 2T closure. state.ee then holds
@@ -870,9 +879,6 @@ struct State {
   GroupField1D sn_face_flux_limited;  // 1D: [(n_cells+1) * G]; 2D: [(n_R_faces+n_Z_faces) * G], [erg/cm^2/s]
   GroupField1D sn_face_alpha;         // 1D: [(n_cells+1) * G]; 2D: [(n_R_faces+n_Z_faces) * G], dimensionless
   GroupField1D sn_stream_theta;      // [n_cells * G], donor streaming limiter theta [dimensionless]
-  // Pass-1 donor-only theta (inflow-credit pass 2 writes the final
-  // theta into sn_stream_theta).
-  GroupField1D sn_stream_theta_donor;
   GroupField1D sn_E_star_flux;       // [n_cells * G], face-flux E* [erg/cm^3]
   GroupField1D sn_diag_E_star_flux;  // [n_cells * G], always-written face-flux E* diagnostic
   GroupField1D sn_psi_scratch;
@@ -882,8 +888,17 @@ struct State {
   // per-angle (inv_cdt * psi_prev) instead of the isotropized
   // 0.5*inv_cdt*c*rad_E_old (which made transparent-medium fronts diffusive).
   // Reseeded isotropically (0.5*c*rad_E) whenever its size does not match
-  // (first step, mesh change, restart).
+  // (first step, mesh change, restart). With
+  // Radiation.sn_transport.spatial_scheme = "linear_discontinuous" the two
+  // nodal values of every cell: [(g * n_angles + m) * 2 n_cells + 2 c + j].
   GroupField1D sn_psi_prev;
+  // "linear_discontinuous" only: the starting-direction angular history of
+  // every angular chain, [(g * n_chains + k) * 2 n_cells + 2 c + j], and the
+  // electron specific energy difference between a cell's right and left
+  // nodes, e_R - e_L [erg/g] (the in-cell temperature profile the radiation
+  // carries across steps; the cell's ee is the lumped-mass average).
+  GroupField1D sn_psi_sd_prev;
+  CellField1D sn_ee_node_offset;
   GroupField1D sn_lc_E_scratch;
   GroupField1D sn_lc_A_scratch;
   GroupField1D sn_origin_boundary;
@@ -1029,8 +1044,8 @@ struct State {
   double sn_void_anchor_dE_abs_step = 0.0;
   double sn_ap_alpha_max = 0.0;
   double sn_ap_alpha_active_faces = 0.0;
-  // W-B: SN counterpart of fld_volume_source_in_step (unwired until the SN
-  // 1D volume source lands; stays 0 so the ledger reads it unconditionally).
+  // SN counterpart of fld_volume_source_in_step: energy the 1D external
+  // volume source injected over the last SN solve (0 without a source).
   double sn_volume_source_in_step = 0.0;
   // W-C: SN material Newton global-timestep-rejection request (bit 1 =
   // floor-root, bit 2 = bracket-expansion failure; NUMERICS §6.8). Set by the
@@ -1299,6 +1314,8 @@ struct State {
   double E_floor_injected = 0.0;
   double E_pdV_bdry = 0.0;
   double E_Marshak_in = 0.0;
+  // Run-cumulative external radiation volume-source energy [erg].
+  double E_volume_in = 0.0;
   double E_solver = 0.0;
   DeviceErrorFlags radiation_device_flags{};
   mutable DispatchCounters dispatch_counters;

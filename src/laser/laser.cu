@@ -46,6 +46,7 @@
 #include "laser/raytrace_skip.cuh"
 #include "laser/sector_adapter.hpp"
 #include "laser/sector_phase_space.hpp"
+#include "mesh/geometry_1d.cuh"
 
 namespace tenryu::laser {
 namespace {
@@ -92,6 +93,83 @@ double apply_incident_attenuation(const double power_in,
 
 inline void cuda_check(const cudaError_t err, const char* message) {
   TENRYU_ASSERT(err == cudaSuccess, message);
+}
+
+// Per-material collision charge of a 1D multi-material deck (Config
+// material_zeff, 2026-09-24): device descriptors and tables, uploaded once,
+// and the per-node arrays of the laser mesh, sized for its node count.
+struct LaserMaterialZeffState {
+  std::vector<std::string> signature;
+  core::DeviceArray<LaserZeffMaterial> descriptors;
+  std::vector<core::DeviceArray<double>> tables;
+  LaserNodeMaterial1D nodes;
+};
+
+LaserMaterialZeffState& laser_material_zeff_state() {
+  static LaserMaterialZeffState state;
+  return state;
+}
+
+// Uploads the descriptors when the materials' models change; returns false
+// when the deck has none (single material or 2D).
+bool prepare_material_zeff(const core::Config::LaserConfig& laser) {
+  auto& st = laser_material_zeff_state();
+  if (laser.ib.material_zeff.empty()) {
+    return false;
+  }
+  std::vector<std::string> signature;
+  for (const auto& mz : laser.ib.material_zeff) {
+    std::ostringstream key;
+    key.precision(17);
+    key << mz.model << ";" << mz.langdon_zcoll << ";" << mz.species_z.size() << ";"
+        << mz.zeff_table.ndens << "x" << mz.zeff_table.ntemp;
+    for (std::size_t e = 0; e < mz.species_z.size(); ++e) {
+      key << ";" << mz.species_z[e] << ":" << mz.species_x[e];
+    }
+    signature.push_back(key.str());
+  }
+  if (signature == st.signature && st.descriptors.size() == laser.ib.material_zeff.size()) {
+    return true;
+  }
+  const std::size_t n_mat = laser.ib.material_zeff.size();
+  std::vector<LaserZeffMaterial> host(n_mat);
+  st.tables.clear();
+  st.tables.resize(n_mat);
+  for (std::size_t m = 0; m < n_mat; ++m) {
+    const auto& mz = laser.ib.material_zeff[m];
+    LaserZeffMaterial& d = host[m];
+    d.langdon_zcoll = mz.langdon_zcoll;
+    if (mz.model == "sequential_strip") {
+      d.model = 1;
+      d.n_species = static_cast<int>(std::min<std::size_t>(
+          std::min(mz.species_z.size(), mz.species_x.size()),
+          static_cast<std::size_t>(kIBExtMaxSpecies)));
+      for (int e = 0; e < d.n_species; ++e) {
+        d.z_nuc[e] = mz.species_z[static_cast<std::size_t>(e)];
+        d.x_frac[e] = mz.species_x[static_cast<std::size_t>(e)];
+      }
+    } else if (mz.model == "table" && mz.zeff_table.ndens > 0 && mz.zeff_table.ntemp > 0) {
+      const auto& zt = mz.zeff_table;
+      d.model = 2;
+      st.tables[m].reset(zt.ratio.size());
+      st.tables[m].copy_from_host(zt.ratio);
+      d.zeff_table = st.tables[m].data();
+      d.zt_nd = zt.ndens;
+      d.zt_nt = zt.ntemp;
+      d.zt_l10d0 = std::log10(zt.ni_grid.front());
+      if (zt.ni_grid.size() >= 2U) {
+        d.zt_dl10d = std::log10(zt.ni_grid[1]) - d.zt_l10d0;
+      }
+      d.zt_l10t0 = std::log10(zt.T_grid_eV.front());
+      if (zt.T_grid_eV.size() >= 2U) {
+        d.zt_dl10t = std::log10(zt.T_grid_eV[1]) - d.zt_l10t0;
+      }
+    }
+  }
+  st.descriptors.reset(n_mat);
+  st.descriptors.copy_from_host(host);
+  st.signature = signature;
+  return true;
 }
 
 LaserPhysExtOptions build_phys_ext_options(
@@ -352,6 +430,73 @@ void write_profile_diag_dump(
                 "TENRYU_TRACE_TAU_DIAG failed to write profile text header");
 }
 
+// Appends the recorded trajectories of the output rays of one beam (ray i: step_counts[i]
+// points at the start of its device row of traj_max_steps) to the state's flattened trajectory
+// arrays. The rows are read into compact host rows of the largest point count: the trace writes
+// a row only up to the ray's stored point count, and a row's remainder (uninitialised device
+// memory; compute-sanitizer initcheck, 2026-09-24) is copied but never read. The last point's
+// power of each ray goes to its output record when one is given. Nothing is appended when no
+// ray recorded a point.
+static cudaError_t append_trajectory_rows_1d(core::State& state,
+                                             const std::vector<int>& step_counts,
+                                             const int traj_max_steps,
+                                             const double* d_pos1,
+                                             const double* d_pos2,
+                                             const double* d_power,
+                                             const int beam_id,
+                                             RayOutputData* record) {
+  const int n_rays = static_cast<int>(step_counts.size());
+  int points = 0;
+  std::size_t total = 0;
+  for (const int count : step_counts) {
+    const int stored = std::clamp(count, 0, traj_max_steps);
+    points = std::max(points, stored);
+    total += static_cast<std::size_t>(stored);
+  }
+  if (total == 0) {
+    return cudaSuccess;
+  }
+  const std::size_t row = static_cast<std::size_t>(points);
+  std::vector<double> h_pos1(static_cast<std::size_t>(n_rays) * row);
+  std::vector<double> h_pos2(h_pos1.size());
+  std::vector<double> h_power(h_pos1.size());
+  const std::size_t device_pitch = static_cast<std::size_t>(traj_max_steps) * sizeof(double);
+  const std::size_t host_pitch = row * sizeof(double);
+  const double* sources[3] = {d_pos1, d_pos2, d_power};
+  double* targets[3] = {h_pos1.data(), h_pos2.data(), h_power.data()};
+  for (int k = 0; k < 3; ++k) {
+    const cudaError_t err =
+        cudaMemcpy2D(targets[k], host_pitch, sources[k], device_pitch, host_pitch,
+                     static_cast<std::size_t>(n_rays), cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) {
+      return err;
+    }
+  }
+  if (state.ray_traj_offsets.empty()) {
+    state.ray_traj_offsets.push_back(0);
+  }
+  for (int i = 0; i < n_rays; ++i) {
+    const int stored = std::clamp(step_counts[static_cast<std::size_t>(i)], 0, traj_max_steps);
+    const std::size_t base = static_cast<std::size_t>(i) * row;
+    const auto first = static_cast<std::ptrdiff_t>(base);
+    const auto last = static_cast<std::ptrdiff_t>(base + static_cast<std::size_t>(stored));
+    if (record != nullptr && stored > 0) {
+      record->rays_2d[static_cast<std::size_t>(i)].power =
+          h_power[base + static_cast<std::size_t>(stored - 1)];
+    }
+    state.ray_traj_pos1.insert(state.ray_traj_pos1.end(), h_pos1.begin() + first,
+                               h_pos1.begin() + last);
+    state.ray_traj_pos2.insert(state.ray_traj_pos2.end(), h_pos2.begin() + first,
+                               h_pos2.begin() + last);
+    state.ray_traj_power.insert(state.ray_traj_power.end(), h_power.begin() + first,
+                                h_power.begin() + last);
+    state.ray_traj_step_counts.push_back(static_cast<std::int32_t>(stored));
+    state.ray_traj_beam_ids.push_back(static_cast<std::int32_t>(beam_id));
+    state.ray_traj_offsets.push_back(static_cast<std::int64_t>(state.ray_traj_pos1.size()));
+  }
+  return cudaSuccess;
+}
+
 static void write_ray0_diag_dump(const std::string& output_dir,
                                  const char* trace_kind,
                                  const int step,
@@ -395,26 +540,41 @@ static void write_ray0_diag_dump(const std::string& output_dir,
                 "TENRYU_TRACE_TAU_DIAG failed to write ray0 text header");
 }
 
+// 1D beams with equal keys trace the same rays (initialize_rays_1d), so one
+// trace serves them all. The rays depend on the focus through its position on
+// the beam axis (Beam::axial_focus_1d), not the lab z alone.
 struct FoldKey {
   double p_beam = 0.0;
   double f_number = 0.0;
-  double focus_lab_z = 0.0;
+  double axial_focus = 0.0;
   double delta_lambda_nm = 0.0;
   int profile_m = 0;
   double profile_w0_cm = 0.0;
   std::string profile_model;
+  // "table" profiles: the ring weights come from these samples, so two table
+  // beams fold only when their tables are equal.
+  std::vector<double> profile_r_cm;
+  std::vector<double> profile_I;
 };
 
 FoldKey make_fold_key(const Beam& beam, const double p_beam) {
-  return FoldKey{p_beam, beam.f_number, beam.focus_lab_z, beam.delta_lambda_nm,
-                 beam.profile_m, beam.profile_w0_cm, beam.profile_model};
+  return FoldKey{p_beam,
+                 beam.f_number,
+                 beam.axial_focus_1d(),
+                 beam.delta_lambda_nm,
+                 beam.profile_m,
+                 beam.profile_w0_cm,
+                 beam.profile_model,
+                 beam.profile_r_cm,
+                 beam.profile_I};
 }
 
 bool fold_keys_equal(const FoldKey& lhs, const FoldKey& rhs) {
   return lhs.p_beam == rhs.p_beam && lhs.f_number == rhs.f_number &&
-         lhs.focus_lab_z == rhs.focus_lab_z &&
+         lhs.axial_focus == rhs.axial_focus &&
          lhs.delta_lambda_nm == rhs.delta_lambda_nm && lhs.profile_m == rhs.profile_m &&
-         lhs.profile_w0_cm == rhs.profile_w0_cm && lhs.profile_model == rhs.profile_model;
+         lhs.profile_w0_cm == rhs.profile_w0_cm && lhs.profile_model == rhs.profile_model &&
+         lhs.profile_r_cm == rhs.profile_r_cm && lhs.profile_I == rhs.profile_I;
 }
 
 __global__ void per_warp_step_reduce_kernel(const int* d_step_count,
@@ -1257,6 +1417,28 @@ struct HydroCellLocator2D {
   }
 };
 
+// Rays i * stride (i < n_valid) of the five launch arrays, packed as five
+// consecutive runs of n_valid values.
+__global__ void gather_ray_output_1d_kernel(const double* __restrict__ R0,
+                                            const double* __restrict__ Z0,
+                                            const double* __restrict__ vR0,
+                                            const double* __restrict__ vZ0,
+                                            const double* __restrict__ power0,
+                                            const int n_valid,
+                                            const int stride,
+                                            double* __restrict__ out) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n_valid) {
+    return;
+  }
+  const std::size_t src = static_cast<std::size_t>(i) * static_cast<std::size_t>(stride);
+  out[0 * n_valid + i] = R0[src];
+  out[1 * n_valid + i] = Z0[src];
+  out[2 * n_valid + i] = vR0[src];
+  out[3 * n_valid + i] = vZ0[src];
+  out[4 * n_valid + i] = power0[src];
+}
+
 void capture_ray_output_1d(const RayArray1D& rays,
                            const int n_copy,
                            const int stride,
@@ -1270,34 +1452,31 @@ void capture_ray_output_1d(const RayArray1D& rays,
   data.beam_id = beam_id;
   data.rays_2d.resize(static_cast<std::size_t>(n_copy));
   const int n_total = rays.n_rays;
-  std::vector<double> R0(static_cast<std::size_t>(n_total), 0.0);
-  std::vector<double> Z0(static_cast<std::size_t>(n_total), 0.0);
-  std::vector<double> vR0(static_cast<std::size_t>(n_total), 0.0);
-  std::vector<double> vZ0(static_cast<std::size_t>(n_total), 0.0);
-  std::vector<double> power0(static_cast<std::size_t>(n_total), 0.0);
-  const std::size_t bytes = static_cast<std::size_t>(n_total) * sizeof(double);
-  cuda_check(cudaMemcpyAsync(R0.data(), rays.R0, bytes, cudaMemcpyDeviceToHost, stream),
-             "laser_step memcpyAsync ray R0 D2H failed");
-  cuda_check(cudaMemcpyAsync(Z0.data(), rays.Z0, bytes, cudaMemcpyDeviceToHost, stream),
-             "laser_step memcpyAsync ray Z0 D2H failed");
-  cuda_check(cudaMemcpyAsync(vR0.data(), rays.vR0, bytes, cudaMemcpyDeviceToHost, stream),
-             "laser_step memcpyAsync ray vR0 D2H failed");
-  cuda_check(cudaMemcpyAsync(vZ0.data(), rays.vZ0, bytes, cudaMemcpyDeviceToHost, stream),
-             "laser_step memcpyAsync ray vZ0 D2H failed");
-  cuda_check(cudaMemcpyAsync(power0.data(), rays.power0, bytes, cudaMemcpyDeviceToHost, stream),
-             "laser_step memcpyAsync ray power0 D2H failed");
-  cuda_check(cudaStreamSynchronize(stream), "laser_step stream synchronize failed");
-  for (int i = 0; i < n_copy; ++i) {
-    const int src = i * stride;
-    if (src >= n_total) {
-      break;
+  // Only the recorded rays come back (i * stride < n_total), gathered on the
+  // device into one buffer and read with one copy.
+  const long long n_reachable =
+      (static_cast<long long>(n_total) + stride - 1) / static_cast<long long>(stride);
+  const int n_valid = static_cast<int>(std::min<long long>(n_copy, n_reachable));
+  if (n_valid > 0) {
+    auto* d_out = static_cast<double*>(core::device_scratch_acquire(
+        "laser:capture_ray_output_1d", 5 * static_cast<std::size_t>(n_valid) * sizeof(double)));
+    gather_ray_output_1d_kernel<<<(n_valid + 127) / 128, 128, 0, stream>>>(
+        rays.R0, rays.Z0, rays.vR0, rays.vZ0, rays.power0, n_valid, stride, d_out);
+    cuda_check(cudaGetLastError(), "laser_step ray output gather launch failed");
+    std::vector<double> h_out(5 * static_cast<std::size_t>(n_valid), 0.0);
+    cuda_check(cudaMemcpyAsync(h_out.data(), d_out, h_out.size() * sizeof(double),
+                               cudaMemcpyDeviceToHost, stream),
+               "laser_step memcpyAsync ray output D2H failed");
+    cuda_check(cudaStreamSynchronize(stream), "laser_step stream synchronize failed");
+    const std::size_t n = static_cast<std::size_t>(n_valid);
+    for (std::size_t i = 0; i < n; ++i) {
+      auto& rec = data.rays_2d[i];
+      rec.R0 = h_out[0 * n + i];
+      rec.Z0 = h_out[1 * n + i];
+      rec.vR0 = h_out[2 * n + i];
+      rec.vZ0 = h_out[3 * n + i];
+      rec.power0 = h_out[4 * n + i];
     }
-    auto& rec = data.rays_2d[static_cast<std::size_t>(i)];
-    rec.R0 = R0[static_cast<std::size_t>(src)];
-    rec.Z0 = Z0[static_cast<std::size_t>(src)];
-    rec.vR0 = vR0[static_cast<std::size_t>(src)];
-    rec.vZ0 = vZ0[static_cast<std::size_t>(src)];
-    rec.power0 = power0[static_cast<std::size_t>(src)];
   }
   ray_output->push_back(std::move(data));
 }
@@ -1435,6 +1614,15 @@ double sum_field_energy(const core::CellField1D& field) {
 void log_laser_flags(const core::DeviceErrorFlags& flags) {
   if (flags.infinite_loop != 0) {
     core::log_warning("Laser ray trace hit MAX_RAY_STEPS guard");
+  }
+  if (flags.unresolved_quadrature != 0) {
+    static long long unresolved_warnings = 0;
+    if (++unresolved_warnings <= 10 || unresolved_warnings % 1000 == 0) {
+      core::log_warning("Laser ray trace (characteristic): " +
+                        std::to_string(flags.unresolved_quadrature) +
+                        " pieces accepted at the quadrature panel cap (error estimate above the "
+                        "tolerance), warning #" + std::to_string(unresolved_warnings));
+    }
   }
   if (flags.nan_particle != 0) {
     core::log_warning("Laser ray trace encountered non-finite ray state");
@@ -1602,7 +1790,7 @@ void build_port_section_diagnostics(
 
   std::vector<double> impact_parameter(static_cast<std::size_t>(n_rays));
   const double R_beam =
-      std::abs(lmesh.Z_max - beam.focus_lab_z) /
+      std::abs(lmesh.Z_max - beam.axial_focus_1d()) /
       (2.0 * std::max(beam.f_number, 1.0e-12));
   const double dR = R_beam / static_cast<double>(n_rays);
   for (int ray = 0; ray < n_rays; ++ray) {
@@ -1725,6 +1913,237 @@ void build_port_section_diagnostics(
         << " pairs=" << port_state->ports.pairs.size();
     core::log_info(oss.str());
   }
+}
+
+int laser_trace_compare_every() {
+  static const int every = [] {
+    const char* v = std::getenv("TENRYU_LASER_TRACE_COMPARE_EVERY");
+    if (v == nullptr || v[0] == '\0') {
+      return 0;
+    }
+    char* end = nullptr;
+    const long parsed = std::strtol(v, &end, 10);
+    if (end == v || *end != '\0' || parsed <= 0 ||
+        parsed > std::numeric_limits<int>::max()) {
+      return 0;
+    }
+    return static_cast<int>(parsed);
+  }();
+  return every;
+}
+
+// Measure-only comparison of the 1D spherical integrators on one beam's
+// frozen laser state (TENRYU_LASER_TRACE_COMPARE_EVERY=N: every N-th step,
+// traces without CBET records or hot-electron capture). The beam's rays are
+// traced again into scratch buffers with the configured settings, with the
+// characteristic integrator and with the leapfrog march at 4 and 16 times
+// finer steps (cfl_ray and the ds_adapt targets divided, ds_adapt_max_factor
+// 1; these and characteristic_closure trace with the analytic critical-layer
+// closure, the march having no reflection at the critical radius), and with
+// the characteristic integrator on two other radial profiles of the same
+// state: the hydro-anchored profile with every half cell split into
+// TENRYU_LASER_TRACE_COMPARE_PARTS parts (default 8; profile_refined) and the
+// Z = 0 column of the 2D laser mesh, the profile before 2026-09-24
+// (axis_column); the hydro-anchored profile is rebuilt afterwards. One log line per variant: absorbed and unabsorbed power, the
+// absorbed power relative to the characteristic trace, the L1 distance of the
+// deposit profile from the characteristic trace relative to its absorbed
+// power, the rays stopped by the step cap, the profile's node count and the
+// kernel time. The run's deposit, ledgers and error flags are not touched;
+// *phys_ext's radial collision-charge pointer is refreshed (the rebuilt arrays
+// may move).
+void compare_1d_trace_integrators(const RayArray1D& rays,
+                                  LaserMesh& lmesh,
+                                  const core::State& state,
+                                  const core::Config::LaserConfig& laser,
+                                  const double lambda_cm,
+                                  const double* d_hydro_r_edges,
+                                  const int n_cells,
+                                  const AllowedSupercriticalCell1D& allowed,
+                                  LaserPhysExtOptions* phys_ext,
+                                  LaserNodeMaterial1D* node_material,
+                                  const int step,
+                                  const std::size_t beam,
+                                  cudaStream_t stream) {
+  if (rays.n_rays <= 0 || n_cells <= 0) {
+    return;
+  }
+  enum ProfileKind : int { kProfileRun = 0, kProfileRefined = 1, kProfileAxisColumn = 2 };
+  struct Variant {
+    const char* name;
+    const char* integrator;
+    double refine;
+    int profile;
+  };
+  // The march has no reflection at the critical radius: its variants and
+  // characteristic_closure trace with critical_handling.terminate = True
+  // (the analytic critical-layer closure).
+  const Variant variants[] = {{"configured", nullptr, 1.0, kProfileRun},
+                              {"characteristic", "characteristic", 1.0, kProfileRun},
+                              {"characteristic_closure", "characteristic", 1.0, kProfileRun},
+                              {"leapfrog_x4", "leapfrog", 4.0, kProfileRun},
+                              {"leapfrog_x16", "leapfrog", 16.0, kProfileRun},
+                              {"profile_refined", "characteristic", 1.0, kProfileRefined},
+                              {"axis_column", "characteristic", 1.0, kProfileAxisColumn}};
+  constexpr int kVariants = 7;
+  constexpr int kReference = 1;  // characteristic
+  // Parts per half cell of the refined profile (TENRYU_LASER_TRACE_COMPARE_PARTS,
+  // default 8).
+  static const int kRefinedParts = [] {
+    const char* v = std::getenv("TENRYU_LASER_TRACE_COMPARE_PARTS");
+    const long parsed = (v != nullptr) ? std::strtol(v, nullptr, 10) : 0;
+    return (parsed >= 2 && parsed <= 256) ? static_cast<int>(parsed) : 8;
+  }();
+  const bool zcoll_radial_on =
+      phys_ext != nullptr && phys_ext->langdon_zcoll_radial != nullptr && node_material != nullptr;
+  const auto refresh_zcoll = [&]() {
+    if (zcoll_radial_on) {
+      phys_ext->langdon_zcoll_radial = node_material->radial_zcoll.data();
+    }
+  };
+  std::array<int, kVariants> profile_nodes{};
+  double* d_dep = nullptr;
+  double* d_scalars = nullptr;  // unabsorbed, tail power, RA power
+  unsigned long long* d_counts = nullptr;  // tail closures, critical hits
+  core::DeviceErrorFlags* d_flags = nullptr;
+  const auto check = [](const cudaError_t err, const char* what) {
+    TENRYU_ASSERT(err == cudaSuccess, what);
+  };
+  check(cudaMalloc(reinterpret_cast<void**>(&d_dep),
+                   static_cast<std::size_t>(n_cells) * sizeof(double)),
+        "laser trace compare: deposit allocation failed");
+  check(cudaMalloc(reinterpret_cast<void**>(&d_scalars), 3 * sizeof(double)),
+        "laser trace compare: scalar allocation failed");
+  check(cudaMalloc(reinterpret_cast<void**>(&d_counts), 2 * sizeof(unsigned long long)),
+        "laser trace compare: counter allocation failed");
+  check(cudaMalloc(reinterpret_cast<void**>(&d_flags), sizeof(core::DeviceErrorFlags)),
+        "laser trace compare: flag allocation failed");
+  cudaEvent_t ev0 = nullptr;
+  cudaEvent_t ev1 = nullptr;
+  check(cudaEventCreate(&ev0), "laser trace compare: event creation failed");
+  check(cudaEventCreate(&ev1), "laser trace compare: event creation failed");
+  std::array<std::vector<double>, kVariants> deposits;
+  std::array<std::array<double, 3>, kVariants> scalars{};
+  std::array<std::array<unsigned long long, 2>, kVariants> counts{};
+  std::array<core::DeviceErrorFlags, kVariants> flags{};
+  std::array<float, kVariants> kernel_ms{};
+  const bool ra_on = phys_ext != nullptr && phys_ext->ra_enable != 0;
+  int built_profile = kProfileRun;
+  for (int v = 0; v < kVariants; ++v) {
+    if (variants[v].profile != built_profile) {
+      if (variants[v].profile == kProfileRefined) {
+        map_trace_profile_1d(lmesh, state, kRefinedParts, stream, node_material);
+        compute_trace_profile_kappa_1d(lmesh, lambda_cm, laser.absorption.eps_n,
+                                       laser.absorption.coulomb_log_floor, stream, phys_ext,
+                                       node_material);
+      } else if (variants[v].profile == kProfileAxisColumn) {
+        extract_axis_column_profile_1d(lmesh, stream, node_material);
+      }
+      refresh_zcoll();
+      built_profile = variants[v].profile;
+    }
+    profile_nodes[static_cast<std::size_t>(v)] = lmesh.radial_n_nodes;
+    const double* d_radial_T_e = (phys_ext != nullptr) ? lmesh.radial_T_e : nullptr;
+    core::Config::LaserConfig cfg = laser;
+    if (variants[v].integrator != nullptr) {
+      cfg.raytrace.integrator = variants[v].integrator;
+    }
+    if (std::string(variants[v].name) == "characteristic_closure" ||
+        std::string(variants[v].integrator != nullptr ? variants[v].integrator : "") ==
+            "leapfrog") {
+      cfg.absorption.terminate = true;
+    }
+    const double refine = variants[v].refine;
+    if (refine > 1.0) {
+      cfg.raytrace.cfl_ray /= refine;
+      cfg.raytrace.ds_adapt_g_target /= refine;
+      cfg.raytrace.ds_adapt_tau_target /= refine;
+      if (cfg.raytrace.ds_adapt_theta_target > 0.0) {
+        cfg.raytrace.ds_adapt_theta_target /= refine;
+      }
+      cfg.raytrace.ds_adapt_max_factor = 1.0;
+      cfg.raytrace.max_steps = 100000;
+    }
+    check(cudaMemsetAsync(d_dep, 0, static_cast<std::size_t>(n_cells) * sizeof(double), stream),
+          "laser trace compare: memset failed");
+    check(cudaMemsetAsync(d_scalars, 0, 3 * sizeof(double), stream),
+          "laser trace compare: memset failed");
+    check(cudaMemsetAsync(d_counts, 0, 2 * sizeof(unsigned long long), stream),
+          "laser trace compare: memset failed");
+    check(cudaMemsetAsync(d_flags, 0, sizeof(core::DeviceErrorFlags), stream),
+          "laser trace compare: memset failed");
+    check(cudaEventRecord(ev0, stream), "laser trace compare: event record failed");
+    check(launch_ray_trace_1d_sph(
+              rays, lmesh, cfg, lambda_cm, d_hydro_r_edges, n_cells, allowed.allowed_cell,
+              allowed.critical_adjacent_subcritical_cell, allowed.r_crit, d_dep, nullptr,
+              nullptr, nullptr, nullptr, nullptr, 0, 0, 0, d_scalars, d_flags, d_counts,
+              d_scalars + 1, d_counts + 1, stream, nullptr, nullptr, nullptr,
+              HotECaptureParams{}, nullptr, phys_ext, d_radial_T_e,
+              ra_on ? d_scalars + 2 : nullptr),
+          "laser trace compare: trace launch failed");
+    check(cudaEventRecord(ev1, stream), "laser trace compare: event record failed");
+    deposits[static_cast<std::size_t>(v)].assign(static_cast<std::size_t>(n_cells), 0.0);
+    check(cudaMemcpyAsync(deposits[static_cast<std::size_t>(v)].data(), d_dep,
+                          static_cast<std::size_t>(n_cells) * sizeof(double),
+                          cudaMemcpyDeviceToHost, stream),
+          "laser trace compare: deposit copy failed");
+    check(cudaMemcpyAsync(scalars[static_cast<std::size_t>(v)].data(), d_scalars,
+                          3 * sizeof(double), cudaMemcpyDeviceToHost, stream),
+          "laser trace compare: scalar copy failed");
+    check(cudaMemcpyAsync(counts[static_cast<std::size_t>(v)].data(), d_counts,
+                          2 * sizeof(unsigned long long), cudaMemcpyDeviceToHost, stream),
+          "laser trace compare: counter copy failed");
+    check(cudaMemcpyAsync(&flags[static_cast<std::size_t>(v)], d_flags,
+                          sizeof(core::DeviceErrorFlags), cudaMemcpyDeviceToHost, stream),
+          "laser trace compare: flag copy failed");
+    check(cudaStreamSynchronize(stream), "laser trace compare: synchronize failed");
+    check(cudaEventElapsedTime(&kernel_ms[static_cast<std::size_t>(v)], ev0, ev1),
+          "laser trace compare: event timing failed");
+  }
+  if (built_profile != kProfileRun) {
+    map_trace_profile_1d(lmesh, state, 1, stream, node_material);
+    compute_trace_profile_kappa_1d(lmesh, lambda_cm, laser.absorption.eps_n,
+                                   laser.absorption.coulomb_log_floor, stream, phys_ext,
+                                   node_material);
+    refresh_zcoll();
+  }
+  const auto& ref = deposits[kReference];
+  double ref_absorbed = 0.0;
+  for (const double x : ref) {
+    ref_absorbed += x;
+  }
+  for (int v = 0; v < kVariants; ++v) {
+    const auto& dep = deposits[static_cast<std::size_t>(v)];
+    double absorbed = 0.0;
+    double l1 = 0.0;
+    for (std::size_t c = 0; c < dep.size(); ++c) {
+      absorbed += dep[c];
+      l1 += std::abs(dep[c] - ref[c]);
+    }
+    const auto& f = flags[static_cast<std::size_t>(v)];
+    std::ostringstream oss;
+    oss << std::setprecision(10) << "[laser_trace_compare] step=" << step << " beam=" << beam
+        << " variant=" << variants[v].name << " absorbed=" << absorbed
+        << " unabsorbed=" << scalars[static_cast<std::size_t>(v)][0]
+        << " tail_power=" << scalars[static_cast<std::size_t>(v)][1]
+        << " ra_power=" << scalars[static_cast<std::size_t>(v)][2]
+        << " tail_closures=" << counts[static_cast<std::size_t>(v)][0]
+        << " critical_hits=" << counts[static_cast<std::size_t>(v)][1]
+        << " absorbed_rel_characteristic="
+        << ((ref_absorbed > 0.0) ? absorbed / ref_absorbed - 1.0 : 0.0)
+        << " deposit_l1_rel_characteristic=" << ((ref_absorbed > 0.0) ? l1 / ref_absorbed : 0.0)
+        << " step_capped_rays=" << f.infinite_loop
+        << " unresolved_pieces=" << f.unresolved_quadrature << " nan=" << f.nan_particle
+        << " invalid=" << f.invalid_cell
+        << " profile_nodes=" << profile_nodes[static_cast<std::size_t>(v)]
+        << " kernel_ms=" << kernel_ms[static_cast<std::size_t>(v)];
+    core::log_info(oss.str());
+  }
+  cudaEventDestroy(ev0);
+  cudaEventDestroy(ev1);
+  cudaFree(d_flags);
+  cudaFree(d_counts);
+  cudaFree(d_scalars);
+  cudaFree(d_dep);
 }
 
 RaytraceSkipCache& global_skip_cache() {
@@ -2050,7 +2469,13 @@ void laser_step(core::State& state,
     }
   }
 
-  const double total_power = beams.total_power(t);
+  // 1D: the laser operator deposits over [t, t + dt], so the commanded power is
+  // the waveform's exact average over the step (step energies then sum to the
+  // pulse integral; a step straddling a sharp turn-on receives its share).
+  // 2D keeps the historic value at the step start.
+  const double total_power = (state.mesh.dim == 1)
+                                 ? beams.total_average_power(t, t + dt)
+                                 : beams.total_power(t);
   if (phys_ext_options.langdon_model != 0) {
     constexpr double kPiLangdon = 3.14159265358979323846;
     const Beam& common_profile = beams.items.front();
@@ -2325,7 +2750,11 @@ void laser_step(core::State& state,
         const double rbar = state.hot_e_eta_prev_rbar[s];
         if (state.hot_e_eta_prev_valid[s] != 0U &&
             P > 0.0 && rbar > 0.0) {
-          I14 = P / (4.0 * M_PI * rbar * rbar * f_illum) /
+          // Intensity through the capture shell: 4 pi rbar^2 (sphere),
+          // 2 pi rbar per unit length (cylinder), 1 per unit area (planar).
+          I14 = P /
+                (mesh::geometry_1d_face_area(state.mesh.geometry_code, rbar) *
+                 f_illum) /
                 1.0e7 / 1.0e14;
         } else {
           valid = false;
@@ -2517,6 +2946,10 @@ void laser_step(core::State& state,
       hot_e_captures_by_channel(static_cast<std::size_t>(hot_e_n_config_channels));
   std::vector<double> hot_e_capture_stage;
   int hot_e_capture_beams = 0;
+  // 1D beam folding: beams that replay the anchor's trace also replay its
+  // hot-electron capture rows (identical keys give identical rays and captures).
+  std::size_t fold_anchor_beam = 0;
+  std::vector<std::size_t> fold_replayed_beams;
   std::vector<std::vector<tenryu::laser::hot_electron::RayCapture2D>>
       hot_e_captures_by_channel_2d(static_cast<std::size_t>(hot_e_n_config_channels));
   std::vector<double> hot_e_model_sum_P;
@@ -2536,7 +2969,7 @@ void laser_step(core::State& state,
   if (state.mesh.dim == 1) {
     group_powers.assign(beams.items.size(), 0.0);
     for (std::size_t b = 0; b < beams.items.size(); ++b) {
-      group_powers[b] = std::max(0.0, beams.items[b].get_power(t));
+      group_powers[b] = std::max(0.0, beams.items[b].get_average_power(t, t + dt));
     }
     if (skip_cache != nullptr) {
       f_hat_groups.assign(group_powers.size(), std::vector<double>(state.laser_dep.size(), 0.0));
@@ -2616,6 +3049,23 @@ void laser_step(core::State& state,
       *used_skip = true;
     }
     skip_cache->scale_deposit(state, skip_group_powers, dt, stream);
+    if (state.mesh.dim == 1) {
+      // The 1D cache holds the per-beam ray deposition before the
+      // redistribution (blocked receivers, ghost-corona handoff, smoothing),
+      // so the scaled deposit goes through the same redistribution with the
+      // current hydro state as a traced step (it used to be written to
+      // laser_dep as it was, void and supercritical cells included).
+      build_hydro_mirror_1d(lmesh, state, hydro_mirror);
+      std::vector<double> skip_power_cell =
+          copy_cell_deposit_to_host(state.laser_dep, stream);
+      for (double& power : skip_power_cell) {
+        power /= dt;
+      }
+      apply_deposit_redistribution_1d(state, lmesh, hydro_mirror, skip_power_cell, dt,
+                                      laser.deposit.conservation_tol, part,
+                                      laser.deposit.deposit_smooth_passes,
+                                      laser.deposit.deposit_smooth_alpha);
+    }
     if (part.n_ranks > 1) {
       // Keep skip-path deposition ownership consistent with transfer_to_1d/transfer_to_2d.
       mask_non_owned_skip_deposit(state, part);
@@ -2646,10 +3096,25 @@ void laser_step(core::State& state,
 
   const double lambda_cm = laser.wavelength_nm * 1.0e-7;
   CbetLmFields cbet_lm;
+  // Multi-material 1D decks: each laser-mesh node's material's collision
+  // charge, and the Langdon charge per radial node (2026-09-24).
+  LaserNodeMaterial1D* node_material_args = nullptr;
+  const bool material_zeff_on =
+      state.mesh.dim == 1 && phys_ext_active && prepare_material_zeff(laser) &&
+      state.cell_material_index.size() == state.rho.size();
+  if (material_zeff_on) {
+    auto& st = laser_material_zeff_state();
+    st.nodes.cell_material_index = state.cell_material_index.data();
+    st.nodes.zeff_materials = st.descriptors.data();
+    st.nodes.n_materials = static_cast<int>(st.descriptors.size());
+    node_material_args = &st.nodes;
+    phys_ext_options.zeff_materials = st.descriptors.data();
+    phys_ext_options.n_zeff_materials = static_cast<int>(st.descriptors.size());
+  }
   if (state.mesh.dim == 1) {
     build_hydro_mirror_1d(lmesh, state, hydro_mirror);
     if (phys_ext_options.langdon_model != 0 &&
-        phys_ext_options.n_species == 0) {
+        phys_ext_options.n_species == 0 && !material_zeff_on) {
       const std::vector<std::uint8_t>& cell_is_void =
           hydro_mirror.cell_is_void.empty() ? state.cell_is_void
                                             : hydro_mirror.cell_is_void;
@@ -2670,7 +3135,10 @@ void laser_step(core::State& state,
         logged_langdon_zcoll_fallback = true;
       }
     }
-    map_from_hydro_1d(lmesh, state, laser, hydro_mirror, stream);
+    map_from_hydro_1d(lmesh, state, laser, hydro_mirror, stream, node_material_args);
+    if (node_material_args != nullptr && phys_ext_options.langdon_model != 0) {
+      phys_ext_options.langdon_zcoll_radial = node_material_args->radial_zcoll.data();
+    }
   } else {
     cbet_on_2d ? map_from_hydro_2d_cbet(lmesh, state, laser, cbet_lm, stream)
                : map_from_hydro_2d(lmesh, state, laser, stream, &part,
@@ -2688,7 +3156,11 @@ void laser_step(core::State& state,
   compute_gradients(lmesh, stream);
   compute_smooth_kappa(lmesh, lambda_cm, laser.absorption.eps_n,
                        laser.absorption.coulomb_log_floor, stream,
-                       phys_ext_active ? &phys_ext_options : nullptr);
+                       phys_ext_active ? &phys_ext_options : nullptr, node_material_args);
+  // Rays per 1D beam: rings, times azimuths on a cylinder or slab
+  // (initialize_rays_1d).
+  const int rays_1d_per_beam =
+      max_rays_1d_per_beam(lmesh, laser.rays_per_beam, laser.raytrace.azimuthal_rays);
   static bool debug_dump_lasermesh_emitted = false;
   if (state.mesh.dim == 2 && laser.absorption.debug_dump_lasermesh &&
       !debug_dump_lasermesh_emitted) {
@@ -2751,7 +3223,13 @@ void laser_step(core::State& state,
       lmesh.scratch_critical_surface_hit_count;
   core::DeviceErrorFlags* d_error_flags = lmesh.scratch_error_flags;
   auto check_or_fail = [&](const cudaError_t err, const char* message) {
-    TENRYU_ASSERT(err == cudaSuccess, message);
+    if (err != cudaSuccess) {
+      // Name the error: a failed launch or copy looks the same otherwise,
+      // whether the device ran out of a resource or a kernel faulted.
+      const std::string detail = std::string(message) + ": " + cudaGetErrorName(err) + " (" +
+                                 cudaGetErrorString(err) + ")";
+      ::tenryu::core::tenryu_abort("err == cudaSuccess", detail, __FILE__, __LINE__);
+    }
   };
 
   static const bool laser_pack_disabled = [] {
@@ -2773,7 +3251,7 @@ void laser_step(core::State& state,
     const std::size_t trace_slot_count = group_powers.size();
     const std::size_t max_trace_rays =
         (state.mesh.dim == 1)
-            ? static_cast<std::size_t>(std::max(laser.rays_per_beam, 1))
+            ? static_cast<std::size_t>(std::max(rays_1d_per_beam, 1))
             : static_cast<std::size_t>(std::max(laser.rays_per_beam, 2)) *
                   static_cast<std::size_t>(std::max(laser.rays_per_beam, 2));
     const std::size_t max_trace_warps = (max_trace_rays + 31U) / 32U;
@@ -3001,7 +3479,7 @@ void laser_step(core::State& state,
       lmesh.ray_steps_output.resize(beams.items.size());
       lmesh.ray_order.resize(beams.items.size());
       hot_e_capture_stage.assign(static_cast<std::size_t>(beams.items.size()) *
-                                     static_cast<std::size_t>(laser.rays_per_beam) * 4 *
+                                     static_cast<std::size_t>(rays_1d_per_beam) * 4 *
                                      static_cast<std::size_t>(hot_e_params.n_channels),
                                  0.0);
       double* d_traj_pos1 = nullptr;
@@ -3064,11 +3542,13 @@ void laser_step(core::State& state,
           }
         }
         ++fold_replays;
+        fold_replayed_beams.push_back(b);
         continue;
       }
       lmesh.clear_deposit(stream);
       const auto t_init_start = verbose ? Clock::now() : Clock::time_point{};
-      RayArray1D rays = initialize_rays_1d(beam, lmesh, laser.rays_per_beam, P_beam, stream);
+      RayArray1D rays = initialize_rays_1d(beam, lmesh, laser.rays_per_beam, P_beam, stream,
+                                           laser.raytrace.azimuthal_rays);
       if (verbose) {
         init_ms += ms(t_init_start, Clock::now());
       }
@@ -3247,8 +3727,9 @@ void laser_step(core::State& state,
       }();
       const bool use_fast_trace_1d =
           fast_trace_enabled && state.mesh.dim == 1 && laser.mode == "raytrace_2d" &&
-          !laser.cbet.enable && beam.profile_model == "flat_top" &&
-          !hot_e_capture_on && !collect_trajectory && !collect_ray_output;
+          state.mesh.geometry_code == 0 && !laser.cbet.enable &&
+          beam.profile_model == "flat_top" && !hot_e_capture_on && !collect_trajectory &&
+          !collect_ray_output && laser.absorption.terminate;
       static const bool logged_fast_gate = [&] {
         core::log_info(std::string("[fast_trace_gate] use=") +
             (use_fast_trace_1d ? "1" : "0") +
@@ -3263,10 +3744,15 @@ void laser_step(core::State& state,
         return true;
       }();
       (void)logged_fast_gate;
+      // The characteristic integrator's cost per ray is bounded by its pieces
+      // (radial nodes, faces, events): no previous-step ordering or step cap.
+      const bool characteristic_trace_1d =
+          !use_fast_trace_1d && (laser.raytrace.integrator == "characteristic" ||
+                                 laser.raytrace.integrator == "auto");
       const int* h_ray_order = nullptr;
       int* h_ray_steps_out = nullptr;
       int max_ray_steps_override = 0;
-      if (!use_fast_trace_1d) {
+      if (!use_fast_trace_1d && !characteristic_trace_1d) {
         const core::NvtxRange nvtx_order_range("laser.ray_ordering");
         auto& previous_steps = lmesh.ray_steps_previous[b];
         auto& ray_order = lmesh.ray_order[b];
@@ -3342,6 +3828,14 @@ void laser_step(core::State& state,
               d_tau_shell_out, d_pabs_per_ray_out);
       check_traj_or_cleanup(trace_status,
                             "laser_step 1D spherical trace launch failed");
+      if (laser_trace_compare_every() > 0 && !use_fast_trace_1d && !cbet_on &&
+          !hot_e_capture_on && state.step % laser_trace_compare_every() == 0) {
+        compare_1d_trace_integrators(
+            rays, lmesh, state, laser, lambda_cm, state.x_r.data(),
+            static_cast<int>(state.laser_dep.size()), allowed_supercritical,
+            phys_ext_active ? &phys_ext_options : nullptr, node_material_args, state.step, b,
+            stream);
+      }
       if (d_tau_shell_out != nullptr) {
         std::vector<double> tau_shell(tau_diag_doubles, 0.0);
         check_traj_or_cleanup(
@@ -3443,16 +3937,18 @@ void laser_step(core::State& state,
             cudaStreamSynchronize(stream),
             "laser_step ray0 diagnostic synchronize failed");
         write_ray0_diag_dump(output_dir,
-                             use_fast_trace_1d ? "fast" : "march",
+                             use_fast_trace_1d
+                                 ? "fast"
+                                 : (characteristic_trace_1d ? "characteristic" : "march"),
                              state.step, rays.n_rays,
                              ray_R0, ray_Z0, ray_vR0, ray_vZ0);
       }
-      if (!use_fast_trace_1d) {
+      if (!use_fast_trace_1d && !characteristic_trace_1d) {
         ray_steps_pending[b] = 1U;
       }
       if (hot_e_capture_on && d_hot_e_capture_rays != nullptr) {
         const std::size_t stage_row_doubles =
-            static_cast<std::size_t>(laser.rays_per_beam) * 4 *
+            static_cast<std::size_t>(rays_1d_per_beam) * 4 *
             static_cast<std::size_t>(hot_e_params.n_channels);
         const std::size_t copy_doubles =
             static_cast<std::size_t>(rays.n_rays) * 4 *
@@ -3539,50 +4035,12 @@ void laser_step(core::State& state,
                                          static_cast<std::size_t>(n_output_rays_traj) * sizeof(int),
                                          cudaMemcpyDeviceToHost),
                               "laser_step memcpy traj_step_count D2H failed");
-
-        std::int64_t beam_total = 0;
-        for (int i = 0; i < n_output_rays_traj; ++i) {
-          beam_total += static_cast<std::int64_t>(h_step_counts[static_cast<std::size_t>(i)]);
-        }
-
-        if (beam_total > 0) {
-          const std::size_t traj_buf_size =
-              static_cast<std::size_t>(n_output_rays_traj) * static_cast<std::size_t>(traj_max_steps);
-          std::vector<double> h_pos1(traj_buf_size);
-          std::vector<double> h_pos2(traj_buf_size);
-          std::vector<double> h_power(traj_buf_size);
-          check_traj_or_cleanup(cudaMemcpy(h_pos1.data(), d_traj_pos1,
-                                           traj_buf_size * sizeof(double), cudaMemcpyDeviceToHost),
-                                "laser_step memcpy traj_pos1 D2H failed");
-          check_traj_or_cleanup(cudaMemcpy(h_pos2.data(), d_traj_pos2,
-                                           traj_buf_size * sizeof(double), cudaMemcpyDeviceToHost),
-                                "laser_step memcpy traj_pos2 D2H failed");
-          check_traj_or_cleanup(cudaMemcpy(h_power.data(), d_traj_power,
-                                           traj_buf_size * sizeof(double), cudaMemcpyDeviceToHost),
-                                "laser_step memcpy traj_power D2H failed");
-
-          const bool first_beam = state.ray_traj_offsets.empty();
-          if (first_beam) {
-            state.ray_traj_offsets.push_back(0);
-          }
-          for (int i = 0; i < n_output_rays_traj; ++i) {
-            const int sc = h_step_counts[static_cast<std::size_t>(i)];
-            const std::size_t base = static_cast<std::size_t>(i) * static_cast<std::size_t>(traj_max_steps);
-            if (collect_ray_output && ray_output != nullptr && sc > 0) {
-              ray_output->back().rays_2d[static_cast<std::size_t>(i)].power =
-                  h_power[base + static_cast<std::size_t>(sc - 1)];
-            }
-            for (int s = 0; s < sc; ++s) {
-              state.ray_traj_pos1.push_back(h_pos1[base + static_cast<std::size_t>(s)]);
-              state.ray_traj_pos2.push_back(h_pos2[base + static_cast<std::size_t>(s)]);
-              state.ray_traj_power.push_back(h_power[base + static_cast<std::size_t>(s)]);
-            }
-            state.ray_traj_step_counts.push_back(static_cast<std::int32_t>(sc));
-            state.ray_traj_beam_ids.push_back(static_cast<std::int32_t>(beam.wave_id));
-            state.ray_traj_offsets.push_back(
-                static_cast<std::int64_t>(state.ray_traj_pos1.size()));
-          }
-        }
+        check_traj_or_cleanup(
+            append_trajectory_rows_1d(
+                state, h_step_counts, traj_max_steps, d_traj_pos1, d_traj_pos2, d_traj_power,
+                beam.wave_id,
+                (collect_ray_output && ray_output != nullptr) ? &ray_output->back() : nullptr),
+            "laser_step trajectory rows D2H failed");
       }
       if (!port_section) {
         release_traj_buffers();
@@ -3630,6 +4088,7 @@ void laser_step(core::State& state,
                         sizeof(double));
           }
           fold_key = make_fold_key(beam, P_beam);
+          fold_anchor_beam = b;
           fold_armed = true;
         }
       } else if (verbose) {
@@ -3842,67 +4301,13 @@ void laser_step(core::State& state,
                              sizeof(int),
                          cudaMemcpyDeviceToHost),
               "laser_step memcpy traj_step_count D2H failed");
-
-          std::int64_t beam_total = 0;
-          for (int i = 0; i < n_output_rays_traj; ++i) {
-            beam_total += static_cast<std::int64_t>(
-                h_step_counts[static_cast<std::size_t>(i)]);
-          }
-
-          if (beam_total > 0) {
-            const std::size_t traj_buf_size =
-                static_cast<std::size_t>(n_output_rays_traj) *
-                static_cast<std::size_t>(traj_max_steps);
-            std::vector<double> h_pos1(traj_buf_size);
-            std::vector<double> h_pos2(traj_buf_size);
-            std::vector<double> h_power(traj_buf_size);
-            check_traj_or_cleanup(
-                cudaMemcpy(h_pos1.data(), d_traj_pos1,
-                           traj_buf_size * sizeof(double),
-                           cudaMemcpyDeviceToHost),
-                "laser_step memcpy traj_pos1 D2H failed");
-            check_traj_or_cleanup(
-                cudaMemcpy(h_pos2.data(), d_traj_pos2,
-                           traj_buf_size * sizeof(double),
-                           cudaMemcpyDeviceToHost),
-                "laser_step memcpy traj_pos2 D2H failed");
-            check_traj_or_cleanup(
-                cudaMemcpy(h_power.data(), d_traj_power,
-                           traj_buf_size * sizeof(double),
-                           cudaMemcpyDeviceToHost),
-                "laser_step memcpy traj_power D2H failed");
-
-            const bool first_beam = state.ray_traj_offsets.empty();
-            if (first_beam) {
-              state.ray_traj_offsets.push_back(0);
-            }
-            for (int i = 0; i < n_output_rays_traj; ++i) {
-              const int sc =
-                  h_step_counts[static_cast<std::size_t>(i)];
-              const std::size_t base =
-                  static_cast<std::size_t>(i) *
-                  static_cast<std::size_t>(traj_max_steps);
-              if (collect_ray_output && ray_output != nullptr && sc > 0) {
-                ray_output->back().rays_2d[static_cast<std::size_t>(i)].power =
-                    h_power[base + static_cast<std::size_t>(sc - 1)];
-              }
-              for (int s = 0; s < sc; ++s) {
-                state.ray_traj_pos1.push_back(
-                    h_pos1[base + static_cast<std::size_t>(s)]);
-                state.ray_traj_pos2.push_back(
-                    h_pos2[base + static_cast<std::size_t>(s)]);
-                state.ray_traj_power.push_back(
-                    h_power[base + static_cast<std::size_t>(s)]);
-              }
-              state.ray_traj_step_counts.push_back(
-                  static_cast<std::int32_t>(sc));
-              state.ray_traj_beam_ids.push_back(
-                  static_cast<std::int32_t>(traj_beam_id));
-              state.ray_traj_offsets.push_back(
-                  static_cast<std::int64_t>(
-                      state.ray_traj_pos1.size()));
-            }
-          }
+          check_traj_or_cleanup(
+              append_trajectory_rows_1d(
+                  state, h_step_counts, traj_max_steps, d_traj_pos1, d_traj_pos2,
+                  d_traj_power, traj_beam_id,
+                  (collect_ray_output && ray_output != nullptr) ? &ray_output->back()
+                                                                : nullptr),
+              "laser_step trajectory rows D2H failed");
         }
         release_traj_buffers();
         if (verbose) {
@@ -4055,7 +4460,8 @@ void laser_step(core::State& state,
                 static_cast<int>(state.laser_dep.size()), stream),
             "laser_step cbet per-beam reduce failed");
         const auto dep_power_cell = copy_cell_deposit_to_host(state.laser_dep, stream);
-        const double P_beam_b = std::max(0.0, beams.items[b].get_power(t));
+        // Same step-averaged power the 1D rays were launched with.
+        const double P_beam_b = std::max(0.0, beams.items[b].get_average_power(t, t + dt));
         for (std::size_t c = 0; c < dep_power_cell.size(); ++c) {
           total_dep_1d[c] += dep_power_cell[c];
           if (skip_cache != nullptr) {
@@ -4070,6 +4476,7 @@ void laser_step(core::State& state,
                << " exchanged=" << cbet_res.exchanged_power
                << " ledger_rel=" << cbet_res.ledger_residual_rel
                << " clamps=" << cbet_res.clamp_count
+               << " clamped=" << cbet_res.clamped_power
                << " capped_pairs=" << cbet_res.capped_pairs;
       core::log_debug(cbet_oss.str());
     }
@@ -4157,12 +4564,20 @@ void laser_step(core::State& state,
       check_or_fail(cudaStreamSynchronize(stream),
                     "laser_step hot_e capture stage sync failed");
       const std::size_t row_doubles =
-          static_cast<std::size_t>(laser.rays_per_beam) * 4 *
+          static_cast<std::size_t>(rays_1d_per_beam) * 4 *
           static_cast<std::size_t>(hot_e_params.n_channels);
+      // A folded beam replays the anchor's deposit without tracing; its
+      // captures are the anchor's (they used to be left empty, losing those
+      // beams' hot-electron source).
+      for (const std::size_t replayed : fold_replayed_beams) {
+        std::copy_n(hot_e_capture_stage.data() + fold_anchor_beam * row_doubles,
+                    row_doubles,
+                    hot_e_capture_stage.data() + replayed * row_doubles);
+      }
       for (int b = 0; b < static_cast<int>(beams.items.size()); ++b) {
         const double* base = hot_e_capture_stage.data() +
                              static_cast<std::size_t>(b) * row_doubles;
-        for (int rr = 0; rr < laser.rays_per_beam; ++rr) {
+        for (int rr = 0; rr < rays_1d_per_beam; ++rr) {
           for (int k = 0; k < hot_e_params.n_channels; ++k) {
             const double* cap = base +
                 (static_cast<std::size_t>(rr) * hot_e_params.n_channels +
@@ -5120,17 +5535,50 @@ void laser_step(core::State& state,
       (reduction != nullptr && part.n_ranks > 1)
           ? reduction->allreduce_sum(dep_power_local)
           : dep_power_local;
+  // Laser power ledger: input = deposited (incl. the hot-electron deposit) +
+  // unabsorbed (rays leaving the profile, or stopped by the intensity cutoff,
+  // the step guard or an invalid state; skipped and folded beams) +
+  // hot-electron escape + power the transfer could not place (no receiver
+  // cell) + CBET ion-acoustic sink. In 1D every path books its unabsorbed
+  // power explicitly, and the remainder of the ledger is checked, not
+  // classified as unabsorbed (that hid leaks, and counted the hot-electron
+  // escape twice in the driver's escaped energy). In 2D the difference still
+  // bounds the trace tally from below.
+  const double hot_e_escaped_power =
+      (dt > 0.0) ? std::max(state.hot_e_escaped_step, 0.0) / dt : 0.0;
+  const double cbet_iaw_sink = port_section ? cbet_iaw_power : 0.0;
   if (radial_absorption_1d) {
     lmesh.last_transfer_blocked_power = 0.0;
     lmesh.last_unabsorbed_power = P_unabsorbed_trace;
-  } else if (ps_hot_e_capture_on) {
+  } else if (ps_hot_e_capture_on || state.mesh.dim == 1) {
     lmesh.last_unabsorbed_power = P_unabsorbed_trace;
   } else {
-    const double cbet_iaw_sink = port_section ? cbet_iaw_power : 0.0;
-    const double P_unabsorbed =
-        std::max(P_unabsorbed_trace,
-                 std::max(0.0, total_power - dep_power - cbet_iaw_sink));
+    const double P_unabsorbed = std::max(
+        P_unabsorbed_trace,
+        std::max(0.0, total_power - dep_power - cbet_iaw_sink - hot_e_escaped_power -
+                          std::max(lmesh.last_transfer_blocked_power, 0.0)));
     lmesh.last_unabsorbed_power = P_unabsorbed;
+  }
+  if (state.mesh.dim == 1 && !radial_absorption_1d && !ps_hot_e_capture_on) {
+    const double residual = total_power - dep_power - P_unabsorbed_trace -
+                            hot_e_escaped_power -
+                            std::max(lmesh.last_transfer_blocked_power, 0.0) - cbet_iaw_sink;
+    const double tol = std::max(laser.deposit.conservation_tol, 1.0e-10);
+    static long long ledger_warnings = 0;
+    if (total_power > 0.0 && std::abs(residual) > tol * total_power &&
+        (++ledger_warnings <= 10 || ledger_warnings % 1000 == 0)) {
+      std::ostringstream ledger_oss;
+      ledger_oss.setf(std::ios::scientific);
+      ledger_oss << std::setprecision(6)
+                 << "Laser power ledger does not close: input=" << total_power
+                 << " deposited=" << dep_power << " unabsorbed=" << P_unabsorbed_trace
+                 << " hot_e_escaped=" << hot_e_escaped_power
+                 << " transfer_blocked=" << lmesh.last_transfer_blocked_power
+                 << " cbet_iaw=" << cbet_iaw_sink << " residual=" << residual << " ("
+                 << residual / total_power << " of the input, warning #" << ledger_warnings
+                 << ")";
+      core::log_warning(ledger_oss.str());
+    }
   }
   if (ps_hot_e_capture_on) {
     const double hot_e_deposited_power =

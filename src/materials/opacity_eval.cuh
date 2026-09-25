@@ -133,6 +133,52 @@ __global__ inline void eval_opacity_constant_kernel(
                                     error_flags);
 }
 
+// Group-mean Planck and Rosseland absorption coefficients [1/cm] of the
+// frequency-dependent Marshak opacity sigma(nu, T) over [lo, hi] eV:
+// Simpson's rule on 128 log-spaced intervals.
+__device__ inline void freq_dep_marshak_group_sigmas(const double T_c,
+                                                     const double lo,
+                                                     const double hi,
+                                                     double* sigmaP_out,
+                                                     double* sigmaR_out) {
+  constexpr int n_simpson = 128;
+  const double lo_pos = fmax(lo, 1.0e-300);
+  const double log_lo = log(lo_pos);
+  const double log_hi = log(hi);
+  const double h_log = (log_hi - log_lo) / static_cast<double>(n_simpson);
+
+  double sum_wp = 0.0;
+  double sum_sigma_wp = 0.0;
+  double sum_wr = 0.0;
+  double sum_inv_sigma_wr = 0.0;
+
+  for (int i = 0; i <= n_simpson; ++i) {
+    const double z = log_lo + h_log * static_cast<double>(i);
+    const double E = exp(z);
+    const double w = (i == 0 || i == n_simpson) ? 1.0 : ((i & 1) ? 4.0 : 2.0);
+    const double jac = E;
+
+    const double sigma = sigma_nu_marshak(E, T_c);
+    const double wp = planck_weight(E, T_c) * jac;
+    const double wr = rosseland_weight(E, T_c) * jac;
+
+    sum_wp += w * wp;
+    sum_sigma_wp += w * sigma * wp;
+    sum_wr += w * wr;
+    if (sigma > 0.0) {
+      sum_inv_sigma_wr += w * wr / sigma;
+    }
+  }
+
+  sum_wp *= h_log / 3.0;
+  sum_sigma_wp *= h_log / 3.0;
+  sum_wr *= h_log / 3.0;
+  sum_inv_sigma_wr *= h_log / 3.0;
+
+  *sigmaP_out = (sum_wp > 0.0) ? (sum_sigma_wp / sum_wp) : 0.0;
+  *sigmaR_out = (sum_inv_sigma_wr > 0.0) ? (sum_wr / sum_inv_sigma_wr) : 0.0;
+}
+
 __global__ inline void eval_opacity_freq_dep_marshak_kernel(
     const double* __restrict__ rho,
     const double* __restrict__ Te,
@@ -166,7 +212,6 @@ __global__ inline void eval_opacity_freq_dep_marshak_kernel(
   const double sigma_min = rho_c * fmax(kappa_floor, 0.0);
   const double sigma_max = rho_c * fmax(kappa_cap, 0.0);
   const int base = c * n_groups;
-  constexpr int n_simpson = 128;
 
   for (int g = 0; g < n_groups; ++g) {
     const double lo = group_bounds_eV[g];
@@ -180,42 +225,9 @@ __global__ inline void eval_opacity_freq_dep_marshak_kernel(
       continue;
     }
 
-    const double lo_pos = fmax(lo, 1.0e-300);
-    const double log_lo = log(lo_pos);
-    const double log_hi = log(hi);
-    const double h_log = (log_hi - log_lo) / static_cast<double>(n_simpson);
-
-    double sum_wp = 0.0;
-    double sum_sigma_wp = 0.0;
-    double sum_wr = 0.0;
-    double sum_inv_sigma_wr = 0.0;
-
-    for (int i = 0; i <= n_simpson; ++i) {
-      const double z = log_lo + h_log * static_cast<double>(i);
-      const double E = exp(z);
-      const double w = (i == 0 || i == n_simpson) ? 1.0 : ((i & 1) ? 4.0 : 2.0);
-      const double jac = E;
-
-      const double sigma = sigma_nu_marshak(E, T_c);
-      const double wp = planck_weight(E, T_c) * jac;
-      const double wr = rosseland_weight(E, T_c) * jac;
-
-      sum_wp += w * wp;
-      sum_sigma_wp += w * sigma * wp;
-      sum_wr += w * wr;
-      if (sigma > 0.0) {
-        sum_inv_sigma_wr += w * wr / sigma;
-      }
-    }
-
-    sum_wp *= h_log / 3.0;
-    sum_sigma_wp *= h_log / 3.0;
-    sum_wr *= h_log / 3.0;
-    sum_inv_sigma_wr *= h_log / 3.0;
-
-    const double sigmaP = (sum_wp > 0.0) ? (sum_sigma_wp / sum_wp) : 0.0;
-    const double sigmaR =
-        (sum_inv_sigma_wr > 0.0) ? (sum_wr / sum_inv_sigma_wr) : 0.0;
+    double sigmaP = 0.0;
+    double sigmaR = 0.0;
+    freq_dep_marshak_group_sigmas(T_c, lo, hi, &sigmaP, &sigmaR);
 
     sigma_a[base + g] = apply_sigma_bounds(sigmaP, sigma_min, sigma_max);
     sigma_R[base + g] = apply_sigma_bounds(sigmaR, sigma_min, sigma_max);

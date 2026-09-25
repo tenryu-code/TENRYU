@@ -10,6 +10,7 @@
 #include "core/error.hpp"
 #include "materials/eos_device_table.hpp"
 #include "materials/eos_table.hpp"
+#include "radiation/sn_electron_eos.cuh"
 
 namespace tenryu::radiation {
 namespace {
@@ -82,127 +83,13 @@ SnElectronEOSTableCache& sn_electron_eos_table_cache() {
   return cache;
 }
 
-__device__ inline bool has_electron_eos_table(
-    const materials::DeviceEOSTableView& electron_eos) {
-  return electron_eos.n_rho > 0 && electron_eos.n_T > 0 &&
-         electron_eos.P_table != nullptr &&
-         electron_eos.e_table != nullptr &&
-         electron_eos.cv_table != nullptr;
-}
-
-__device__ inline double eos_log_temperature(const double T,
-                                             const double temperature_floor_eV) {
-  return log(fmax(finite_or_zero(T), fmax(temperature_floor_eV, 1.0e-30)));
-}
-
-__device__ inline double sn_tail_T_top(
-    const materials::DeviceEOSTableView& tab) {
-  return exp(tab.log_T_max);
-}
-
-// e/cv/P with a linear-cv ideal tail above the table temperature ceiling;
-// below/at the ceiling these are exactly the existing extrap evaluations.
-__device__ inline double sn_eval_e_tail(
-    const materials::DeviceEOSTableView& tab,
-    const materials::RhoBracket& rb,
-    const double rho_c, const double T, const double Zbar, const double A_c,
-    const bool low_density_extrap) {
-  const double T_top = sn_tail_T_top(tab);
-  if (isfinite(T_top) && T_top > 0.0 && T > T_top) {
-    const double e_top = materials::device_eos_energy_extrap(
-        tab, rb, rho_c, T_top, Zbar, A_c, low_density_extrap);
-    const double cv_top = fmax(
-        materials::device_eos_cv_extrap(tab, rb, rho_c, T_top, Zbar, A_c,
-                                        low_density_extrap),
-        0.0);
-    if (isfinite(e_top) && cv_top > 0.0) {
-      return e_top + cv_top * (T - T_top);
-    }
-  }
-  return materials::device_eos_energy_extrap(tab, rb, rho_c, T, Zbar, A_c,
-                                             low_density_extrap);
-}
-
-__device__ inline double sn_eval_cv_tail(
-    const materials::DeviceEOSTableView& tab,
-    const materials::RhoBracket& rb,
-    const double rho_c, const double T, const double Zbar, const double A_c,
-    const bool low_density_extrap) {
-  const double T_top = sn_tail_T_top(tab);
-  if (isfinite(T_top) && T_top > 0.0 && T > T_top) {
-    const double cv_top = fmax(
-        materials::device_eos_cv_extrap(tab, rb, rho_c, T_top, Zbar, A_c,
-                                        low_density_extrap),
-        0.0);
-    if (cv_top > 0.0) {
-      return cv_top;
-    }
-  }
-  return materials::device_eos_cv_extrap(tab, rb, rho_c, T, Zbar, A_c,
-                                         low_density_extrap);
-}
-
-__device__ inline double sn_eval_P_tail(
-    const materials::DeviceEOSTableView& tab,
-    const materials::RhoBracket& rb,
-    const double rho_c, const double T, const double Zbar, const double A_c,
-    const bool low_density_extrap) {
-  const double T_top = sn_tail_T_top(tab);
-  if (isfinite(T_top) && T_top > 0.0 && T > T_top) {
-    const double P_top = materials::device_eos_pressure_extrap(
-        tab, rb, rho_c, T_top, Zbar, A_c, low_density_extrap);
-    if (isfinite(P_top)) {
-      return P_top * (T / T_top);
-    }
-  }
-  return materials::device_eos_pressure_extrap(tab, rb, rho_c, T, Zbar, A_c,
-                                               low_density_extrap);
-}
-
-template <bool EOS_TAIL>
-__device__ inline double invert_e_e_via_bisection(
-    const materials::DeviceEOSTableView& electron_eos,
-    const materials::RhoBracket& eos_rho_bracket,
-    double e_target,
-    double T_floor,
-    const double rho_c,
-    const double Zbar,
-    const double A_amu,
-    const bool low_density_extrap) {
-  if constexpr (EOS_TAIL) {
-    const double T_top = sn_tail_T_top(electron_eos);
-    const double e_top = materials::device_eos_energy_extrap(
-        electron_eos, eos_rho_bracket, rho_c, T_top, Zbar, A_amu,
-        low_density_extrap);
-    const double cv_top = fmax(materials::device_eos_cv_extrap(
-        electron_eos, eos_rho_bracket, rho_c, T_top, Zbar, A_amu,
-        low_density_extrap), 0.0);
-    if (isfinite(e_top) && cv_top > 0.0 && e_target > e_top) {
-      return T_top + (e_target - e_top) / cv_top;
-    }
-  }
-  // Bisect on log-T to find T such that device_eos_energy(rho, T) ≈ e_target.
-  // Bracket: [log(T_floor), log(T_max)] where log(T_max) = electron_eos.log_T_max.
-  // Iterate up to 60 times until xhi - xlo < 1e-14.
-  double xlo = log(fmax(T_floor, 1.0e-30));
-  double xhi = fmax(electron_eos.log_T_max, log(fmax(T_floor * 10.0, 1.0e-30)));
-  for (int k = 0; k < 60; ++k) {
-    const double xm = 0.5 * (xlo + xhi);
-    if constexpr (EOS_TAIL) {
-      const double e_m = sn_eval_e_tail(
-          electron_eos, eos_rho_bracket, rho_c, exp(xm), Zbar, A_amu,
-          low_density_extrap);
-      if (e_m < e_target) xlo = xm;
-      else                xhi = xm;
-    } else {
-      const double e_m = materials::device_eos_energy(electron_eos, eos_rho_bracket, xm);
-      if (e_m < e_target) xlo = xm;
-      else                xhi = xm;
-    }
-    if (xhi - xlo < 1.0e-14) break;
-  }
-  return exp(0.5 * (xlo + xhi));
-}
+using sn_electron_eos::eos_log_temperature;
+using sn_electron_eos::has_electron_eos_table;
+using sn_electron_eos::invert_e_e_via_bisection;
+using sn_electron_eos::sn_eval_cv_tail;
+using sn_electron_eos::sn_eval_e_tail;
+using sn_electron_eos::sn_eval_P_tail;
+using sn_electron_eos::sn_tail_T_top;
 
 struct ResidualEval {
   double R;       // residual, [erg/cm^3]
@@ -328,6 +215,8 @@ __device__ inline ResidualEval compute_residual_R_production(
   }
   out.R = 0.0;
   double A_eff = 0.0, P_eff = 0.0, dPdT = 0.0;
+  const PlanckTableDeviceView::Location T_prev_loc = planck.locate_b(T_prev_eV);
+  const PlanckTableDeviceView::Location T_loc = planck.locate_b(T);
   for (int g = 0; g < n_groups; ++g) {
     const int idx = c * n_groups + g;
     const double sigma_pa = nonnegative_finite(sigma_a[idx]);
@@ -335,10 +224,11 @@ __device__ inline ResidualEval compute_residual_R_production(
     const double lambda_pa = dt_safe * core::constants::c_light * sigma_pa;
     const double lambda_pe = dt_safe * core::constants::c_light * sigma_pe_g;
     const double T_prev4 = safe_pow4(T_prev_eV);
-    const double b_prev = (n_groups == 1) ? 1.0 : fmax(planck.interpolate_b(g, T_prev_eV), 0.0);
+    const double b_prev =
+        (n_groups == 1) ? 1.0 : fmax(planck.interpolate_b(g, T_prev_loc), 0.0);
     const double B_prev = core::constants::a_eV * T_prev4 * b_prev;
     const double E_post = nonnegative_finite(rad_E[idx]);
-    const double b = (n_groups == 1) ? 1.0 : fmax(planck.interpolate_b(g, T), 0.0);
+    const double b = (n_groups == 1) ? 1.0 : fmax(planck.interpolate_b(g, T_loc), 0.0);
     const double B = core::constants::a_eV * T4 * b;
     const double denom = 1.0 + lambda_pa;
     const double r_g = lambda_pe / denom;
@@ -354,7 +244,7 @@ __device__ inline ResidualEval compute_residual_R_production(
         use_E_star_override
             ? sn_conservative_E_plus_from_star(E_star, lambda_pa, lambda_pe, B, S_dt)
             : sn_conservative_E_plus(E_post, r_g, B, B_prev);
-    A_eff += fmax(E_star, 0.0);
+    A_eff += fmax(E_star, 0.0) + S_dt;
     P_eff += E_plus;
     if (E_plus > 0.0) {
       dPdT += r_g * 4.0 * core::constants::a_eV * T3 * b;
@@ -368,39 +258,20 @@ __device__ inline ResidualEval compute_residual_R_production(
   return out;
 }
 
-__device__ double mass_heat_capacity(const double rho,
-                                     const double zbar,
-                                     const double cv_e_value,
-                                     const double cv_e_const,
-                                     const double Cv_e_const,
-                                     const double A,
-                                     const double gamma) {
-  if (isfinite(cv_e_value) && cv_e_value > 0.0) {
-    return cv_e_value;
-  }
-  const double rho_c = fmax(nonnegative_finite(rho), kTiny);
-  if (isfinite(Cv_e_const) && Cv_e_const > 0.0) {
-    return Cv_e_const / rho_c;
-  }
-  if (isfinite(cv_e_const) && cv_e_const > 0.0) {
-    return cv_e_const;
-  }
-  const double gm1 = fmax(finite_or_zero(gamma) - 1.0, 1.0e-12);
-  const double z = fmax(finite_or_zero(zbar), 0.0);
-  return fmax(z * core::constants::eV_to_erg /
-                  (fmax(finite_or_zero(A), 1.0e-12) *
-                   core::constants::proton_mass * gm1),
-              kTiny);
-}
+using sn_electron_eos::mass_heat_capacity;
 
 template <bool EOS_TAIL>
 __global__ void sn_material_newton_kernel(
     const double* __restrict__ sigma_a,
     const double* __restrict__ sigma_pe,
-    const double* __restrict__ rad_E,
+    // rad_E and rad_E_out are the same array in the SN stages (the Newton
+    // writes E+ in place), so neither is restrict-qualified: the writeback
+    // and the deposition tally below must see each other's accesses in
+    // program order.
+    const double* rad_E,
     const double* __restrict__ E_star_override,
     const double* __restrict__ source_ext,
-    double* __restrict__ rad_E_out,
+    double* rad_E_out,
     int legacy_2d_closure,
     int eos_low_density_extrap,
     const double* __restrict__ rho,
@@ -419,20 +290,25 @@ __global__ void sn_material_newton_kernel(
     double* __restrict__ diag_clip_full_deficit,
     double* __restrict__ delta_T_rel,
     PlanckTableDeviceView planck,
-    materials::DeviceEOSTableView electron_eos,
+    materials::DeviceEOSTableView electron_eos_run,
     int n_cells,
     int n_groups,
     double dt,
     double cv_e_const,
-    double Cv_e_const,
+    double Cv_e_const_run,
     const double* __restrict__ A_eff,
     const double* __restrict__ gamma_eff,
     double temperature_floor_eV,
     int max_iterations,
     double tolerance,
     int* __restrict__ retry_flag,
-    int c_begin) {
+    int c_begin,
+    materials::CellEOSTableSelector cell_tables) {
   const int c = c_begin + blockIdx.x;
+  // The cell's own material's electron table and volumetric heat capacity
+  // in multi-material runs (null selector: the run-level values).
+  const materials::DeviceEOSTableView electron_eos = cell_tables.electron(c, electron_eos_run);
+  const double Cv_e_const = cell_tables.cv_e_override(c, Cv_e_const_run);
   (void)n_cells;
   (void)max_iterations;
   (void)tolerance;
@@ -574,7 +450,7 @@ __global__ void sn_material_newton_kernel(
                   ? sn_conservative_E_plus_from_star(E_star, lambda_pa, lambda_pe, B,
                                                      S_dt)
                   : sn_conservative_E_plus(E_post, r_g, B, B_prev);
-          Ag = fmax(E_star, 0.0);
+          Ag = fmax(E_star, 0.0) + S_dt;
           Pg = E_plus;
           if (E_plus > 0.0) {
             Rprimeg = r_g * 4.0 * core::constants::a_eV * T3 * b;
@@ -635,7 +511,11 @@ __global__ void sn_material_newton_kernel(
   }
 
   // Energy-conservation upper bracket. For conservative_active_set, A_total
-  // is sum_g max(E_star_g, 0), the tight local-conservation bound.
+  // is sum_g max(E_star_g, 0) plus the external volume-source energy S dt,
+  // the tight local-conservation bound: U(T) + sum_g E+_g = U_n + sum_g E*_g
+  // + S dt with E+ >= 0. Without S dt a source-dominated cell (E* ~ 0 on the
+  // first step) had its root above the bracket; the twenty doublings of the
+  // expansion could not reach it and the clamp lost the source energy.
   auto temperature_for_energy = [&](double U_target) {
     if (use_table_eos) {
       return invert_e_e_via_bisection<EOS_TAIL>(
@@ -895,12 +775,17 @@ __global__ void sn_material_newton_kernel(
 
   const double V = nonnegative_finite(vol[c]);
   const double T4 = safe_pow4(T_final);
+  // The deposition tally uses the end-of-solve radiation energy E^{n+1}: the
+  // written-back E+ of the production closure (rad_E_out) or, for the 2D
+  // legacy closure that writes nothing back, rad_E.
+  const double* const E_end =
+      (!use_2d_legacy_closure && rad_E_out != nullptr) ? rad_E_out : rad_E;
   for (int g = threadIdx.x; g < n_groups; g += blockDim.x) {
     const int idx = c * n_groups + g;
     const double sigma_pa = nonnegative_finite(sigma_a[idx]);
     const double sigma_pe_g =
         (sigma_pe != nullptr) ? nonnegative_finite(sigma_pe[idx]) : sigma_pa;
-    const double E = nonnegative_finite(rad_E[idx]);
+    const double E = nonnegative_finite(E_end[idx]);
     const double b =
         (n_groups == 1) ? 1.0 : fmax(planck.interpolate_b(g, T_final), 0.0);
     const double eta =
@@ -1001,7 +886,8 @@ int solve_sn_material_temperature_newton_gpu(
         in.max_iterations,
         in.tolerance,
         d_retry_flag,
-        win_begin);
+        win_begin,
+        in.cell_electron_eos);
   } else {
     sn_material_newton_kernel<false><<<blocks, kNewtonThreads>>>(
         in.sigma_a,
@@ -1040,7 +926,8 @@ int solve_sn_material_temperature_newton_gpu(
         in.max_iterations,
         in.tolerance,
         d_retry_flag,
-        win_begin);
+        win_begin,
+        in.cell_electron_eos);
   }
   cuda_check(cudaGetLastError(), "SN Newton launch failed");
   int retry_flag = 0;
@@ -1118,7 +1005,8 @@ void solve_sn_material_temperature_newton_2d_legacy_gpu(
         in.max_iterations,
         in.tolerance,
         nullptr,
-        win_begin);
+        win_begin,
+        in.cell_electron_eos);
   } else {
     sn_material_newton_kernel<false><<<blocks, kNewtonThreads>>>(
         in.sigma_a,
@@ -1157,7 +1045,8 @@ void solve_sn_material_temperature_newton_2d_legacy_gpu(
         in.max_iterations,
         in.tolerance,
         nullptr,
-        win_begin);
+        win_begin,
+        in.cell_electron_eos);
   }
   cuda_check(cudaGetLastError(), "SN Newton 2D legacy launch failed");
 }
