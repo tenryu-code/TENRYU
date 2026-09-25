@@ -41,7 +41,7 @@
       $$
       <p>それぞれの意味は次のとおりである。</p>
       <ul>
-        <li><strong>成長率制限 \(g_{dt}\)：</strong>前ステップからの急拡大を抑える（<code>Numerics.dt.growth_factor</code>、既定 1.2）。物理側の上限が緩んでも \(\Delta t\) は 1 ステップに 2 割ずつしか伸びない。輻射の項で述べる「係数の 1 ステップ遅れ」を実用上吸収するのもこの制限である。</li>
+        <li><strong>成長率制限 \(g_{dt}\)：</strong>前ステップからの急拡大を抑える（<code>Numerics.dt.growth_factor</code>、既定 1.2）。物理側の上限が緩んでも \(\Delta t\) は 1 ステップに 2 割ずつしか伸びない。1D では、出力時刻や \(t_{end}\) に合わせて切り詰める前の前ステップの値を基準にするので、出力に合わせた後のステップが伸び遅れない。輻射の項で述べる「係数の 1 ステップ遅れ」を実用上吸収するのもこの制限である。</li>
         <li><strong>上限・下限：</strong><code>dt.max_s</code> は利用者が課す上限。\(\Delta t\) が下限 <code>dt.min_s</code>（既定 \(10^{-20}\) s）を下回った場合は、停滞（ストーリング）防止のため FATAL 停止する。</li>
         <li><strong>初期値：</strong><code>dt.initial_s</code> は step 0 だけで使われる（前ステップが存在せず成長率制限を適用できないため）。step 1 以降は無視され、リスタート時はチェックポイントに保存された \(\Delta t\) を初期値として引き継ぐ。</li>
         <li><strong>出力への着地と終端：</strong>時間間隔ベースの出力が有効なら、次の出力時刻を飛び越えないよう \(\Delta t_{output}\) を候補に含める（<a href="#output-landing">後述</a>）。残り時間 \(t_{end}-t\) も同様である。</li>
@@ -80,7 +80,7 @@
       \Delta t_{hydro}=C_{CFL}\cdot\min_c\!\left(\frac{\Delta l_c}{|\mathbf u_c|+c_{s,c}}\right),
       \qquad C_{CFL}=0.3\;(\text{既定})
       $$
-      <p>\(\Delta l_c\) はセル代表長で、1D ではセル幅 \(\Delta r_i\)、2D では子午面セル面積の平方根 \(\sqrt{A_c}\) である。min は <a href="numerics-foundations.html#hydro-active">hydro が活性なセル</a>だけを対象とし、\(c_s=0\) のセル（未加熱のフィル領域など）は \(\Delta t_{hydro}\to\infty\) 相当として他セルに律速を委ねる。全セルが非活性なら流体は制約から外れる。</p>
+      <p>\(\Delta l_c\) はセル代表長で、1D ではセル幅 \(\Delta r_i\)、2D では子午面セル面積の平方根 \(\sqrt{A_c}\) である。min は <a href="numerics-foundations.html#hydro-active">hydro が活性なセル</a>だけを対象とし、\(c_s=0\) のセル（未加熱のフィル領域など）は \(\Delta t_{hydro}\to\infty\) 相当として他セルに律速を委ねる。全セルが非活性なら流体は制約から外れる。1D では分母に人工粘性の項も加わり、一次の項 \(C_1c_s\) は人工粘性が働く圧縮中のセルにだけ加える。</p>
       <p>この基本形に、構成に応じて次の保護が加わる。いずれも \(\Delta t\) を縮める方向（またはリゾーンの強制）にのみ働く。</p>
       <ul>
         <li><strong>post-shock heat（1D、opt-in）：</strong><code>post_shock_heat=True</code> のとき、衝撃波後面の熱流束に対する明示的な制約 \(\Delta t_{ps}\) を評価し、\(\Delta t_{hydro}=\min(\Delta t_{acoustic+AV},\Delta t_{ps})\) とする。</li>
@@ -152,7 +152,7 @@
       <ul>
         <li><strong>履歴の <code>/dt</code>：</strong>採用された \(\Delta t\) の時系列は常に <code>&lt;case&gt;_history.h5</code> に記録される（<a href="../use/outputs.html">出力と解析</a>）。</li>
         <li><strong>ログの limiter 名：</strong>実行ログに、そのステップの \(\Delta t\) と勝った制約の名前が出る。まずここを見る。</li>
-        <li><strong>dt 内訳診断（opt-in）：</strong><code>Numerics.diagnostics.dt_breakdown_history_enabled=True</code> で、履歴に <code>diagnostics/dt_breakdown_history/</code> が毎ステップ作られ、<code>dt_chosen</code>・<code>dt_hydro</code>・<code>dt_rad</code>・<code>dt_cond</code>・<code>dt_post_shock</code>・<code>dt_growth</code>・<code>dt_max</code>・<code>dt_output</code>・<code>dt_remaining</code> と、hydro 内訳（acoustic・axis_margin・volume_rate）、勝者名 <code>dt_winner</code> を記録する。あわせて <code>diagnostics/cfl_winner/</code> が音響 CFL の勝者セル（位置・\(\Delta l\)・\(c_s\)・\(\rho\)）を残す。</li>
+        <li><strong>dt 内訳診断（既定で有効）：</strong><code>Numerics.diagnostics.dt_breakdown_history_enabled</code>（既定 True）で、履歴に <code>diagnostics/dt_breakdown_history/</code> が毎ステップ書かれ（1D で毎ステップ書くのはこの群だけで、他の系列の行は <code>Output.history_every</code> に従う）、<code>dt_chosen</code>・<code>dt_hydro</code>・<code>dt_rad</code>・<code>dt_cond</code>・<code>dt_post_shock</code>・<code>dt_growth</code>・<code>dt_max</code>・<code>dt_output</code>・<code>dt_remaining</code> と、hydro 内訳（acoustic・axis_margin・volume_rate）、勝者名 <code>dt_winner</code> を記録する。あわせて <code>diagnostics/cfl_winner/</code> が音響 CFL の勝者セル（位置・\(\Delta l\)・\(c_s\)・\(\rho\)）を残す。</li>
       </ul>
       <p>典型的な読み方：律速が <code>hydro</code> で <code>cfl_winner</code> が特定セルに張り付くなら、そのセルの格子（つぶれ・微小セル）か音速（過熱・床）を疑う。<code>conduction</code> ならコロナの \(D_{eff}\) 急増（<a href="../physics/conduction.html">伝導ページ</a>の κ∝\(T^{5/2}\)）、<code>radiation</code> なら高 β の硬い結合セル、<code>growth</code> が続くだけなら単に立ち上がり中である。</p>
     </section>
