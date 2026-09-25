@@ -37,6 +37,11 @@ struct HydroEOSContext {
   std::vector<materials::DeviceMieGruneisen> mie_gruneisen;
   std::vector<std::uint8_t> hydro_backend_kind;
   std::vector<std::uint8_t> rho_e_reclosure_supported;
+  /// The material's backend closes T from (rho, e) (ideal gas, or a TMAT
+  /// table on the legacy backend), whether or not its table energies are
+  /// non-decreasing in T in every density row (rho_e_reclosure_supported
+  /// requires that too).
+  std::vector<std::uint8_t> rho_e_reclosure_backend;
 
   /// Device arrays of DeviceEOSTableView, one per material: the tables the
   /// per-cell closures use. An exact ideal-gas material gets an empty view
@@ -70,6 +75,9 @@ struct HydroEOSContext {
   bool any_nonvoid_overridable = false;
   /// Every non-void material supports the rho-e inverse reclosure.
   bool all_nonvoid_support_rho_e_reclosure = false;
+  /// Every non-void material's backend closes T from (rho, e)
+  /// (rho_e_reclosure_backend).
+  bool all_nonvoid_rho_e_reclosure_backend = false;
 
   /// Number of materials.
   int n_materials = 0;

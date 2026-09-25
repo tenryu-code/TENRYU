@@ -116,7 +116,7 @@
       <ul>
         <li>Rank comparisons use P=1 as reference and assign each deck a T-bit, T-sum, or T-noise tier. T-bit is bitwise; T-sum normally gates normalized Allreduce-order differences at \(10^{-8}\); T-noise uses a self-calibrated 2D <code>atomicAdd</code> band.</li>
         <li><code>parallel_halo_exchange_np2</code> and <code>parallel_halo_exchange_np4</code> check cell/node owner-overwrite and corner ghosts, requiring machine-exact agreement with the analytic values and at shared nodes.</li>
-        <li><code>ctest --test-dir build -L mpi_gate --output-on-failure</code> runs the current ten-case MPI battery, covering 1D FLD/S<sub>N</sub>, <a href="../verification/index.html#gxii">GXII</a>, 1D/2D burn, 2D S<sub>N</sub>/FLD, and LaserMesh. Each case compares P&gt;1 owned dumps with P=1 under its configured bit, band, or envelope tier (envelope: a wider per-deck worst-case bound calibrated from reference-run ensembles — see the Verification page's reproducibility legend).</li>
+        <li><code>ctest --test-dir build -L mpi_gate --output-on-failure</code> runs the current twelve-case MPI battery, covering 1D FLD/S<sub>N</sub>, <a href="../verification/index.html#gxii">GXII</a>, 1D/2D burn, 1D electron (implicit and STS) and ion conduction, 2D S<sub>N</sub>/FLD, and LaserMesh. Each case compares P&gt;1 owned dumps with P=1 under its configured bit, band, or envelope tier (envelope: a wider per-deck worst-case bound calibrated from reference-run ensembles — see the Verification page's reproducibility legend).</li>
       </ul>
     </section>
     <div id="page-footer"></div>

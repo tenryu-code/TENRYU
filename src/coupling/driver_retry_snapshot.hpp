@@ -66,6 +66,7 @@ struct DriverRetrySnapshot {
   // halves under STRANG; must roll back with the step).
   std::vector<double> burn_n_host, burn_rate_host, burn_Q_e_host;
   std::vector<double> burn_Q_i_host, burn_eps_cum_host;
+  std::vector<double> burn_neutron_cum_host;
   double E_burn_released = 0.0;
   double E_burn_dep_e = 0.0;
   double E_burn_dep_i = 0.0;

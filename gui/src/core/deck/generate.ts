@@ -539,7 +539,7 @@ export function generateDeck(f: FormState): string {
     );
   }
   const cn = f.conduction;
-  const ionCond = cn.ionConduction ? ", ion_conduction=True" : "";
+  const ionCond = cn.ionConduction ? `, ion_conduction=True, ion_f_lim=${pyNum(cn.ionFLim)}` : "";
   const snb =
     cn.nonlocalModel === "snb"
       ? `, nonlocal_model="snb", snb_n_groups=${pyNum(cn.snbNGroups)}, snb_E_max_over_Te=${pyNum(cn.snbEMaxOverTe)}, snb_mfp=${pyStr(cn.snbMfp)}, snb_efield=${pyStr(cn.snbEfield)}, snb_picard_max_iters=${pyNum(cn.snbPicardMaxIters)}, snb_picard_rtol=${pyNum(cn.snbPicardRtol)}`

@@ -79,6 +79,9 @@ struct BurnStageResult {           // scalars in erg (already x vol, x dt)
 // dE_e/dE_i: [n_cells] OUTPUT, erg added to electrons/ions per cell.
 // rate_diag: [n_cells] OUTPUT, total reactions/cm^3/s this step.
 // Qe_diag/Qi_diag: [n_cells] OUTPUT, erg/cm^3/s.
+// neutron_births: optional [n_cells] OUTPUT, neutrons born in the cell this
+// step (DD and DT neutron branches, absolute number): the per-cell terms of
+// BurnStageResult::n_neutrons_dd + n_neutrons_dt.
 BurnStageResult compute_burn_step_1d(const BurnStageInputs& in,
                                      const BurnStageParams& p,
                                      const PartitionTable& table,
@@ -88,7 +91,8 @@ BurnStageResult compute_burn_step_1d(const BurnStageInputs& in,
                                      std::vector<double>& rate_diag,
                                      std::vector<double>& Qe_diag,
                                      std::vector<double>& Qi_diag,
-                                     std::vector<double>* S_birth = nullptr);
+                                     std::vector<double>* S_birth = nullptr,
+                                     std::vector<double>* neutron_births = nullptr);
 
 // True when some cell of the 1D burn region can react this step: the region
 // is the first to last cell whose summed fuel volume fraction exceeds

@@ -32,6 +32,15 @@ describe("headerless GUI decks: binary-free equivalence", () => {
     expect(r.mesh.pibTailRings).toBe(3);
     expect(r.deckImport!.rules.filter(x=>x.kind==="passthrough")).toEqual([]);
   },120000);
+  it("ion heat conduction and its flux limiter",()=>{
+    const f = defaultFormState();
+    f.conduction.ionConduction = true;
+    f.conduction.ionFLim = 0.3;
+    const r = checkForm("ion_conduction",f);
+    expect(r.conduction.ionConduction).toBe(true);
+    expect(r.conduction.ionFLim).toBe(0.3);
+    expect(r.deckImport!.rules.filter(x=>x.kind==="passthrough")).toEqual([]);
+  },120000);
   for (const gaussianSpec of ["peak","energy"] as const) it(`Gaussian ${gaussianSpec} and pressure table`,()=>{
     const f = defaultFormState();
     f.laser.enabled = true;

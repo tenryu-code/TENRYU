@@ -483,7 +483,7 @@ P_N(v)=P_i^N(v,T_{i0})+P_e^N(v,T_{e0}),
 \[
 \tilde P_e=P_e^N-wC',\qquad \tilde e_e=e_e^N+(w-T_ew')C,\qquad \tilde c_{v,e}=c_{v,e}^N-T_ew''C,
 \]
-イオン側は不変。保存変数は電子熱量座標 \(q_e=\tilde e_e-C(v)\)（`state.ee` に格納。\(T_e\le T_*/2\) で \(q_e=e_e^N\)）で、物質エネルギーは \(e_i+q_e+C(v)\)（\(C\) は `state.e_cold`、HDF5 の `hydro/e_cold`。エネルギー台帳の電子内部エネルギーは \(q_e+C\) を集計する）。\(P_N\) は実行時と同じ log 双線形補間（密度節点間で \(\ln\rho\) に線形）で評価し、\(C_0\) は節点ごとに閉形式で積分する（`materials/cold_equilibrium.hpp`、`build_cold_equilibrium_table`）。逆変換 \(q_e\to T_e\) は表の温度節点の上で解く（2026-09-25）：根を含む節点区間を符号の二分探索で特定し（\(F\ge0\) を上側とする）、区間内では基底表のエネルギーが \(\ln T\) に線形なので、ゲートが一定の区間（\(T\le T_a\) または \(T\ge T_*\)）では \(F\) の根を直接求め、遷移区間では区間内の括弧付き Newton（\(u=\ln T\)、厳密な導関数 \(dF/du=s-T^2w''C\)、\(s\) は区間のエネルギー勾配）で解く（収束判定は温度括弧の相対幅または Newton 刻みが \(4\times10^{-15}\)）。表全体のエネルギー幅に対する許容は使わない — 極低温で電子エネルギーがほぼ平坦な表では、根から遠い温度を受け入れてしまう。平坦なエネルギー列は下端の温度を返す（CPU/GPU 共通）。節点を渡さない呼び出しは従来の安全化 Newton–二分法で、表の比熱で Newton 刻みを取るため補間の勾配と一致せず、1 回の逆変換に約 50 回の評価を要した（節点上の方式は NIF DS で平均 6.4 回）。音速の密度微分に使う \(C''\) は基底表と同じ密度区間で評価する（参照密度が表の節点と一致する場合の整合）。電子表に cold branch を付けると（`EOSTable::cold`、`DeviceEOSTable::upload` が同梱）、hydro 閉包・FLD/S\(_N\) の物質更新・伝導の再閉包・Qei・注入の全評価器が同じ写像を使う。hydro の電子側 pdV 仕事は \(-[\bar P_e^N+(1-\bar w)D_C],\Delta v\)（\(D_C=[C(v^{n+1})-C(v^n)]/[v^{n+1}-v^n]\)、力は \(\tilde P_e\) を使う。予測子・修正子はそのままで、全エネルギーの不一致は \(O(\Delta t^3)\)）。音速の電子部は \((\tilde P_e)_\rho+T_e(\tilde P_e)_{T_e}^2/(\rho^2\tilde c_{v,e})\)。hydro のマスクは行わず全セルが力学的に応答する（衝撃波は透過する）。参照物性の出典: 液体 D2 19 K の \(K_T=1.20\times10^9\) dyn/cm²（Richardson, Leachman, Lemmon 2014, J. Phys. Chem. Ref. Data 43, 013103, Table 7 から \(K_S=\rho c_S^2\)、\(K_T=K_S c_v/c_p\)）、ポリスチレン極低温の \(K_S=5.8\times10^{10}\) dyn/cm²（Topp & Cahill 1996, Z. Phys. B 101, 235、\(K_S=\rho(c_L^2-\tfrac43c_T^2)\)）。適用条件: 1D_SPH・2T・表 EOS、`pressure_tension_cutoff=False`、`compatible_energy=False`、persistent loop 不可、`qei_heat_capacity="table"` 必須（電子・イオン交換に表の比熱を使う。理想気体の比熱は極低温の表状態で桁違いに大きく、交換が振動する）。起動時に材料ごとの初期全圧と最大不整合を報告する（0.1 kbar 超で WARNING）。
+イオン側は不変。保存変数は電子熱量座標 \(q_e=\tilde e_e-C(v)\)（`state.ee` に格納。\(T_e\le T_*/2\) で \(q_e=e_e^N\)）で、物質エネルギーは \(e_i+q_e+C(v)\)（\(C\) は `state.e_cold`、HDF5 の `hydro/e_cold`。エネルギー台帳の電子内部エネルギーは \(q_e+C\) を集計する）。\(P_N\) は実行時と同じ log 双線形補間（密度節点間で \(\ln\rho\) に線形）で評価し、\(C_0\) は節点ごとに閉形式で積分する（`materials/cold_equilibrium.hpp`、`build_cold_equilibrium_table`）。逆変換 \(q_e\to T_e\) は表の温度節点の上で解く（2026-09-25）：根を含む節点区間を符号の二分探索で特定し（\(F\ge0\) を上側とする）、区間内では基底表のエネルギーが \(\ln T\) に線形なので、ゲートが一定の区間（\(T\le T_a\) または \(T\ge T_*\)）では \(F\) の根を直接求め、遷移区間では区間内の括弧付き Newton（\(u=\ln T\)、厳密な導関数 \(dF/du=s-T^2w''C\)、\(s\) は区間のエネルギー勾配）で解く（収束判定は温度括弧の相対幅または Newton 刻みが \(4\times10^{-15}\)）。表全体のエネルギー幅に対する許容は使わない — 極低温で電子エネルギーがほぼ平坦な表では、根から遠い温度を受け入れてしまう。平坦なエネルギー列は下端の温度を返す（CPU/GPU 共通）。節点を渡さない呼び出しは従来の安全化 Newton–二分法で、表の比熱で Newton 刻みを取るため補間の勾配と一致せず、1 回の逆変換に約 50 回の評価を要した（節点上の方式は NIF DS で平均 6.4 回）。音速の密度微分に使う \(C''\) は基底表と同じ密度区間で評価する（参照密度が表の節点と一致する場合の整合）。電子表に cold branch を付けると（`EOSTable::cold`、`DeviceEOSTable::upload` が同梱）、hydro 閉包・FLD/S\(_N\) の物質更新・伝導の再閉包・Qei・注入の全評価器が同じ写像を使う。hydro の電子側 pdV 仕事は \(-[\bar P_e^N+(1-\bar w)D_C],\Delta v\)（\(D_C=[C(v^{n+1})-C(v^n)]/[v^{n+1}-v^n]\)、力は \(\tilde P_e\) を使う。予測子・修正子はそのままで、全エネルギーの不一致は \(O(\Delta t^3)\)）。音速の電子部は \((\tilde P_e)_\rho+T_e(\tilde P_e)_{T_e}^2/(\rho^2\tilde c_{v,e})\)。hydro のマスクは行わず全セルが力学的に応答する（衝撃波は透過する）。参照物性の出典: 液体 D2 19 K の \(K_T=1.20\times10^9\) dyn/cm²（Richardson, Leachman, Lemmon 2014, J. Phys. Chem. Ref. Data 43, 013103, Table 7 から \(K_S=\rho c_S^2\)、\(K_T=K_S c_v/c_p\)）、ポリスチレン極低温の \(K_S=5.8\times10^{10}\) dyn/cm²（Topp & Cahill 1996, Z. Phys. B 101, 235、\(K_S=\rho(c_L^2-\tfrac43c_T^2)\)）。互換エネルギー更新（`compatible_energy=True`、2026-09-26 から併用可）では、面の速度が与えるセルの体積変化 \(\Delta V_c=\Delta t\,(A_R\bar u_R-A_L\bar u_L)\) に対し、電子の力の圧力が \(-\tilde P_e\Delta V_c\) の仕事をし（電子側の自由エネルギーの弾性の力を含む）、圧力の仕事の残りはそれを受ける種へ行き、熱量座標は密度変化が \(\tilde e_e\) に入れた cold エネルギーを返す：\(q_e\leftarrow q_e-\tilde P_e\Delta V_c/m-[C(\rho^{n+1})-C(\rho^n)]\)（\(\rho=\max(m/V,\rho_{floor})\) は step の始めと終わりの閉包が `e_cold` を作った密度）。運動エネルギーと \(e_i+q_e+C\) の和はステップごとに丸め誤差まで保存する（取り分は符号付き — 張力では \(\tilde P_e<0\)。cold branch の無いセルは従来の圧力比の配分）。閉じた球の試験（`test_hydro_1d_step` の `[compatible]`、50 step）で全エネルギーの変化は 3.3e10 erg に対し 7.6e-6 erg、同じ場で cold エネルギーは 2.1e8 erg 動き、互換でない更新は 9.3e3 erg ずれる。この分岐は低温平衡の run だけが使う核関数の実体にあり（`compatible_energy_update_1d_kernel<GEOM, true>`）、他の run の互換更新は従来どおり。適用条件: 1D_SPH・2T・表 EOS、`pressure_tension_cutoff=False`、persistent loop 不可、`qei_heat_capacity="table"` 必須（電子・イオン交換に表の比熱を使う。理想気体の比熱は極低温の表状態で桁違いに大きく、交換が振動する）。起動時に材料ごとの初期全圧と最大不整合を報告する（0.1 kbar 超で WARNING）。
 
 
 2T 分離：テーブル 301 と 304 は**グリッドサイズが異なる**場合がある（例：Polystyrene 301=73×41, 304=63×33）。
@@ -16737,6 +16737,80 @@ Picard 毎 step 2 反復収束）、歪み mesh（ノード 15% sin 変位）は
 **no-added-leak 判定**（SNB 2.16e-5 ≤ 2×OFF 対照 2.56e-5 — OFF Kershaw 2D
 自体の歪み mesh での dt 比例エネルギー漏れは pre-existing found-issue、
 port 設計 doc Addendum 1.3.1 に記録）。
+
+### 4.6 イオン熱伝導（1D、opt-in、2026-09-26）
+
+`Numerics.conduction.ion_conduction=True`（既定 False、`enabled=True` のときだけ有効）で、
+電子の熱伝導とその記帳の後に、イオン温度の熱伝導を 1 回の陰的な解法で解く。
+1D（`Mesh.geometry_1d` の平面・円柱・球）かつ 2T に限る。2D、1T、
+`per_material_conservation_enabled=True`、`eos.hydro_backend="mie_gruneisen"`
+（その閉包はイオンエネルギーからイオン温度を定めない）は `ConfigError`。
+電子側の `solver`（STS／陰解法）によらず、イオン側は常に下の三重対角系で解く。
+
+**伝導率**：非磁化プラズマの Braginskii のイオン熱伝導率
+\[
+\kappa_i = 3.906\,\frac{n_i T_i \tau_i}{m_i},\qquad
+\tau_i = 2.0852\times10^{7}\,\frac{\sqrt{A}\,T_i^{3/2}}{n_i Z^4 \ln\Lambda_{ii}}\ \mathrm{s},\qquad
+\ln\Lambda_{ii} = \max\!\left(2,\ 23-\ln\frac{Z^3\sqrt{2n_i}}{T_i^{3/2}}\right)
+\]
+（\(T_i\) は eV、\(n_i=\rho/(A m_p)\)、\(A,Z\) はセルの実効質量数と \(\bar Z\) を 1 で下から切ったもの。
+衝突時間と Coulomb 対数は §3.1.13 の Braginskii イオン粘性と同じ NRL の式）を、
+温度勾配 1 eV あたりの erg/(s cm eV) で用いる（電子の Spitzer 伝導率と同じ単位）。
+数値的には \(\kappa_i\approx1.25\times10^{8}\,T_i^{5/2}/(\sqrt A\,Z^4\ln\Lambda_{ii})\) で、
+\(Z=1\) では電子の伝導率のおよそ \(1/(25\sqrt A)\) である。
+衝撃波の収束直後の中心のように \(T_i\gg T_e\) となる領域では、イオンが熱を運ぶ主体になる。
+
+**流束制限**：電子と同じ調和型
+\[
+\phi_{i+1/2} = \frac{1}{1+|q_{SH,i+1/2}|/q_{\max,i+1/2}},\qquad
+q_{\max} = f_i\, n_i T_i \sqrt{T_i/m_i}
+\]
+を面ごとに \(T_i^n\) で 1 回評価する（\(q_{SH}\) は下の面伝導率と勾配、\(q_{\max}\) は面の
+\(\rho,T_i\) の算術平均と \(A\) の調和平均から）。\(f_i\) は `Numerics.conduction.ion_f_lim`
+（既定 1.0 = 上限をイオンの自由流束そのものにする。Hoffman et al., Phys. Plasmas 22, 052707 (2015)
+の標準の計算も同じ形の上限を係数 \(f_{iflxm}=1\) で使うが、制限は
+\(\min(\kappa_i\nabla T_i,\ q_{stream}/f_{iflxm})\) の形で、ここでの調和型は上限付近
+（\(|q_{SH}|=q_{\max}\)）で流束を最大半分まで小さくする）。
+
+**離散化**：§4.2.3 と同じ後退 Euler の有限体積式
+\[
+-w_{i-1/2} T_{i,i-1}^{n+1}
++ \left(\frac{\rho_i c_{v,i,i} V_i}{\Delta t} + w_{i-1/2} + w_{i+1/2}\right) T_{i,i}^{n+1}
+- w_{i+1/2} T_{i,i+1}^{n+1}
+= \frac{\rho_i c_{v,i,i} V_i}{\Delta t} T_{i,i}^{n},\qquad
+w_{i+1/2} = A_{i+1/2}\,\kappa_{i,i+1/2}\,\phi_{i+1/2}/\Delta r_{i+1/2}
+\]
+（添字の最初の \(i\) はイオン）。面の伝導率は `face_kappa_policy` に従う（既定
+`"kirchhoff_same_material"` の \(T^{5/2}\) 割線。\(\kappa_i\) も \(T^{5/2}\) 則なので電子と同じ閉包が使える）。
+両端は零流束、`cell_is_void` のセルは恒等行。1 ブロックの並列巡回縮約（`core::pcr_solve_strided`、FLD の灰色系と同じ）で解く: 結合した行は対角に \(M/\Delta t>0\) を持つ狭義の優対角行列なので、ピボット選択は要らない（2 セル以下も同じ GPU の経路）。
+陰解法なので伝導による時間刻みの制約は加えない。係数行列は M 行列なので解は
+\(\min T_i^n \le T_i^{n+1}\le \max T_i^n\) を満たす。
+
+**比熱と記帳**：係数行列の \(c_{v,i}\) は EOS 閉包が保持する `state.cv_i` が有限かつ正ならその値、
+それ以外は理想気体の \(e/(A m_p(\gamma-1))\)（`conduction_solve_cv_i`、電子の
+`conduction_solve_cv_e` と同じ規則）。解の後、解いた温度から面の熱流
+\(G_{i+1/2}=w_{i+1/2}\,(T_{i,i+1}^{n+1}-T_{i,i}^{n+1})\) を求め、
+\(e_{i}\leftarrow e_{i}+\Delta t\,(G_{i+1/2}-G_{i-1/2})/(\rho_i V_i)\) と記帳する（流束形）。
+各面の熱流は 1 回だけ定義して両隣へ逆符号で入るので、記帳したエネルギーの総和は三重対角解法の
+残差によらず丸め誤差まで 0 になる（硬い系では解法の残差がエネルギーで相対 \(10^{-9}\) 程度あり、
+\(c_{v,i}(T_i^{n+1}-T_i^{n})\) で記帳するとそれが残った。2 セルの直接解法も同様）。
+この和と絶対値の和を求めて相対 \(10^{-10}\) を超えたら警告する監査は、環境変数 `TENRYU_ION_CONDUCTION_AUDIT=1` のときだけ行う（読み戻しの同期を本番の run に入れない）。
+記帳の後、1D 流体の EOS 閉包（`Hydro1D::close_eos`、Lagrange ステップの入口と同じ閉包）で
+\(T_i, P_i\) を記帳したエネルギーから閉じ直し、次の流体ステップまでの演算子（燃焼、次の
+熱サブステップの電子イオン緩和、出力）が EOS 面上の状態を見るようにする。
+energy-authoritative の閉包はエネルギーを書き戻さないので、保存は閉包の後も保たれる。
+
+**MPI 1D**：放射・電子の解法と同じく、全ランクが全線を解く。解く前に \(\rho, V, T_i, e_i,
+\bar Z, c_{v,i}\)、節点座標、体積分率を所有ランクの値で集め直す。
+
+**検証（tests/hydro/test_conduction_ion_1d.cu）**：平面の離散固有モード
+\(\cos(\pi(i+1/2)/N)\) の 1 ステップの減衰（\(\Delta t\,D\lambda_1=1\)、\(D=\kappa_i/(\rho c_{v,i})\) を
+テスト内で上式から計算）で振幅比 \(0.5\pm10^{-5}\)（伝導率が 1 % ずれると 0.25 % 動く）、
+電子の場はビット一致で不変；球の高温点を陽解法の限界の約 \(10^4\) 倍の時間刻みで 4 ステップ進めて
+エネルギーの相対誤差 \(10^{-12}\) 以下と最大値原理；温度の段差の面で低温側が 1 ステップに得るエネルギーが
+\(q_{\max}\Delta t\) 以下かつ \(0.8\,q_{\max}\Delta t\) 以上（制限なしでは 10 倍超）；void セルを挟むと
+低温側の得るエネルギーは丸め誤差（相対 \(10^{-13}\)）以下、挟まなければ \(10^{-3}\) 以上；2 セルの長い
+ステップで質量平均温度へ平衡。
 
 ## 5. レーザーレイトレース（内部、2D RZ方式）
 

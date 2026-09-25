@@ -207,7 +207,7 @@ export function mapRecordedDeck(record: DeckRecord): { form: FormState; bindings
   table(["Numerics", "hydro", "boundary_pressure"], "hydro.boundaryPressure.mode", "hydro.boundaryPressure.points", 1e-12);
   bind("hydro.boundaryPressure", ["Numerics", "hydro", "boundary_pressure"]);
   fields("hydro.plasmaVisc", ["Numerics", "hydro", "plasma_viscosity"], { enabled: "enabled", model: "model", species: "species", etaConst: "eta_const", eta0Scale: "eta0_scale", mfpCapCells: "mfp_cap_cells", lnLambdaFixed: "lnlambda_fixed", dtSafety: "dt_safety" });
-  fields("conduction", ["Numerics", "conduction"], { enabled: "enabled", fLim: "f_lim", ionConduction: "ion_conduction", nonlocalModel: "nonlocal_model", snbNGroups: "snb_n_groups", snbEMaxOverTe: "snb_E_max_over_Te", snbMfp: "snb_mfp", snbEfield: "snb_efield", snbPicardMaxIters: "snb_picard_max_iters", snbPicardRtol: "snb_picard_rtol" });
+  fields("conduction", ["Numerics", "conduction"], { enabled: "enabled", fLim: "f_lim", ionConduction: "ion_conduction", ionFLim: "ion_f_lim", nonlocalModel: "nonlocal_model", snbNGroups: "snb_n_groups", snbEMaxOverTe: "snb_E_max_over_Te", snbMfp: "snb_mfp", snbEfield: "snb_efield", snbPicardMaxIters: "snb_picard_max_iters", snbPicardRtol: "snb_picard_rtol" });
   fields("laser", ["Laser"], { enabled: "enabled", wavelengthNm: "wavelength_nm", raysPerBeam: "rays_per_beam", rayOutputTrajectory: "ray_output_trajectory", rayOutputCount: "ray_output_count" });
   put("laser.mode", ["Laser", "mode"], choice("radial_absorption_1d", "raytrace_2d"));
   const beams = b.Laser?.beams;

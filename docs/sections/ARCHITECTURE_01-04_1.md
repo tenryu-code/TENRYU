@@ -671,7 +671,8 @@ struct Config {
             bool enabled = true;             // 電子熱伝導の有効/無効
             enum class Solver : uint8_t { STS = 0, IMPLICIT = 1, HYPRE = 2 };
             Solver solver = Solver::STS;     // "sts"（既定）| "implicit"（1D三重対角陰解法）| "hypre"（NUMERICS §4.2.1/§4.2.3）
-            bool ion_conduction = false;     // イオン熱伝導（SPECIFICATION §6.4.7 既定 False）
+            bool ion_conduction = false;     // Braginskii イオン熱伝導、1D・2T（SPECIFICATION §6.4.7 既定 False、NUMERICS §4.6）
+            double ion_f_lim = 1.0;          // [dimensionless] イオン熱流束の制限係数（イオン自由流束の倍数、NUMERICS §4.6）
             double f_lim = 0.06;             // [dimensionless] flux limiter（NUMERICS §4.1）
             double mfp_limiter_C = 0.0;      // [dimensionless] mean-free-path limiter係数（NUMERICS §4.1）
             // STS パラメータ（solver=STS 時のみ使用）

@@ -40,9 +40,13 @@ BurnStageResult compute_burn_step_1d_host(const BurnStageInputs& in,
                                           std::vector<double>& rate_diag,
                                           std::vector<double>& Qe_diag,
                                           std::vector<double>& Qi_diag,
-                                          std::vector<double>* S_birth) {
+                                          std::vector<double>* S_birth,
+                                          std::vector<double>* neutron_births) {
   const int n_cells = in.n_cells;
   const std::size_t n = static_cast<std::size_t>(n_cells);
+  if (neutron_births != nullptr) {
+    neutron_births->assign(n, 0.0);
+  }
   dE_e.assign(n, 0.0);
   dE_i.assign(n, 0.0);
   rate_diag.assign(n, 0.0);
@@ -209,6 +213,9 @@ BurnStageResult compute_burn_step_1d_host(const BurnStageInputs& in,
       } else if (k == kDDn) {
         result.n_neutrons_dd += n_reactions;
       }
+      if (neutron_births != nullptr && (k == kDT || k == kDDn)) {
+        (*neutron_births)[static_cast<std::size_t>(c)] += n_reactions;
+      }
       if (p.neutron_heating && E_rel_neutron > 0.0) {
         const int line = (k == kDT) ? 0 : 1;
         nh_emit[static_cast<std::size_t>(c) *
@@ -350,13 +357,15 @@ BurnStageResult compute_burn_step_1d(const BurnStageInputs& in,
                                      std::vector<double>& rate_diag,
                                      std::vector<double>& Qe_diag,
                                      std::vector<double>& Qi_diag,
-                                     std::vector<double>* S_birth) {
+                                     std::vector<double>* S_birth,
+                                     std::vector<double>* neutron_births) {
   const char* const host_stage_env = std::getenv("TENRYU_BURN_HOST_STAGE");
   const bool force_host =
       host_stage_env != nullptr && std::strcmp(host_stage_env, "1") == 0;
   if (force_host || in.n_cells <= 0) {
     return compute_burn_step_1d_host(in, p, table, burn_y, dE_e, dE_i,
-                                     rate_diag, Qe_diag, Qi_diag, S_birth);
+                                     rate_diag, Qe_diag, Qi_diag, S_birth,
+                                     neutron_births);
   }
 
   std::vector<double> nh_emit;
@@ -364,7 +373,8 @@ BurnStageResult compute_burn_step_1d(const BurnStageInputs& in,
   unsigned int screening_warning_flags = 0U;
   BurnStageResult result = compute_burn_step_1d_device_stage(
       in, p, table, burn_y, dE_e, dE_i, rate_diag, Qe_diag, Qi_diag,
-      S_birth, nh_emit, dt_limit_subcycle, screening_warning_flags);
+      S_birth, nh_emit, dt_limit_subcycle, screening_warning_flags,
+      neutron_births);
   burn_screening_emit_warnings(screening_warning_flags);
 
   if (result.subcycle_saturated_cells > 0) {

@@ -1752,6 +1752,7 @@ py::dict serialize_numerics(const Config::NumericsConfig& numerics) {
   conduction["solver"] = numerics.conduction.solver;
   conduction["sts_floor_limiter"] = numerics.conduction.sts_floor_limiter;
   conduction["ion_conduction"] = numerics.conduction.ion_conduction;
+  conduction["ion_f_lim"] = numerics.conduction.ion_f_lim;
   conduction["f_lim"] = numerics.conduction.f_lim;
   conduction["mfp_limiter_C"] = numerics.conduction.mfp_limiter_C;
   conduction["sts_damping"] = numerics.conduction.sts_damping;

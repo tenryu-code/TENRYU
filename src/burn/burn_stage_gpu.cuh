@@ -13,6 +13,7 @@ BurnStageResult compute_burn_step_1d_device_stage(
     std::vector<double>& dE_i, std::vector<double>& rate_diag,
     std::vector<double>& Qe_diag, std::vector<double>& Qi_diag,
     std::vector<double>* S_birth, std::vector<double>& nh_emit,
-    double& dt_limit_subcycle, unsigned int& screening_warning_flags);
+    double& dt_limit_subcycle, unsigned int& screening_warning_flags,
+    std::vector<double>* neutron_births = nullptr);
 
 }  // namespace tenryu::burn

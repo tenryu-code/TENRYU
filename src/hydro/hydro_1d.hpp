@@ -37,6 +37,15 @@ class Hydro1D {
                                  const core::Config& cfg,
                                  const HydroEOSContext* eos_ctx = nullptr) const;
 
+  // The EOS closure alone (the sound speed is left as it is: the Lagrangian
+  // step recomputes it at its entry). For operators that change the conserved
+  // energies between hydro steps and must leave temperatures and pressures
+  // on the EOS surface for the operators that follow before the next step
+  // (the ion heat conduction, NUMERICS §4.6).
+  void close_eos(core::State& state,
+                 const core::Config& cfg,
+                 const HydroEOSContext* eos_ctx = nullptr) const;
+
   tenryu::coupling::HydroStepResult lagrangian_step(
       core::State& state,
       double dt,

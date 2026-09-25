@@ -166,6 +166,13 @@ export default function PhysicsSection() {
             checked={form.conduction.ionConduction}
             onChange={(b) => update((f) => { f.conduction.ionConduction = b; })}
           />
+          {form.conduction.ionConduction && (
+            <NumInput
+              label={m.form.condIonFlim}
+              value={form.conduction.ionFLim}
+              onChange={(n) => update((f) => { f.conduction.ionFLim = n ?? 1.0; })}
+            />
+          )}
           {form.main.dimension === "1D_SPH" && form.main.temperatureModel === "2T" &&
             form.conduction.nonlocalModel === "snb" && (
                 <details>

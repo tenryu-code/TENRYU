@@ -80,6 +80,32 @@ ConductionResult conduction_step(
     parallel::CommBuffers* bufs = nullptr, cudaStream_t stream = nullptr,
     const HydroEOSContext* eos_ctx = nullptr);
 
+// Braginskii ion heat conduction of a 1D two-temperature run (NUMERICS §4.6):
+// one implicit (backward Euler) solve of the ion temperature on the whole
+// line, the face fluxes limited to Numerics.conduction.ion_f_lim times the ion
+// free-streaming flux; the face heat fluxes of the solved temperatures are
+// booked in e_i (flux form) and the 1D EOS closure then derives T_i and P_i
+// from the energies (Hydro1D::close_eos). A no-op unless
+// Numerics.conduction.enabled and .ion_conduction are set. Runs after the
+// electron conduction and its energy booking; MPI 1D solves the gathered line
+// on every rank.
+struct IonConductionResult {
+  bool applied = false;
+  // The per-call audit below ran (TENRYU_ION_CONDUCTION_AUDIT=1; production
+  // runs skip its device sums and read-back).
+  bool audited = false;
+  // [erg] sum over cells of the booked energy: zero up to rounding (each face
+  // flux enters its two cells with opposite signs; insulated ends).
+  double energy_moved_net = 0.0;
+  // [erg] sum of the absolute booked energies: twice the energy carried.
+  double energy_moved_abs = 0.0;
+};
+
+IonConductionResult ion_conduction_step_1d(
+    core::State& state, double dt, const core::Config& cfg,
+    const parallel::PartitionInfo& part = parallel::PartitionInfo{},
+    cudaStream_t stream = nullptr, const HydroEOSContext* eos_ctx = nullptr);
+
 // STS conduction stability limit used by global dt control.
 double compute_dt_conduction(const core::State& state,
                              const core::Config& cfg,

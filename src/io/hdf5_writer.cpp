@@ -3016,6 +3016,11 @@ void write_hydro_group(const hid_t file,
     write_numeric_dataset(file, "hydro", "burn_eps_cum", H5T_NATIVE_DOUBLE, cdim,
                           state.burn_eps_cum_host.data(), "erg/g", cfg);
   }
+  if (state.burn_enabled_any &&
+      state.burn_neutron_cum_host.size() == static_cast<std::size_t>(n_cells)) {
+    write_numeric_dataset(file, "hydro", "burn_neutron_cum", H5T_NATIVE_DOUBLE, cdim,
+                          state.burn_neutron_cum_host.data(), "1", cfg);
+  }
   constexpr std::size_t kBurnSpeciesCount = 5;
   if (state.burn_enabled_any &&
       state.burn_n_host.size() == static_cast<std::size_t>(n_cells) * kBurnSpeciesCount) {

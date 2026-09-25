@@ -2715,6 +2715,10 @@ CheckpointData HDF5Reader::read_checkpoint(const core::Config& cfg,
     out.state.burn_eps_cum_host = read_vector_dataset_checked<double>(
         file, "hydro/burn_eps_cum", H5T_NATIVE_DOUBLE, out.state.rho.size());
   }
+  if (link_exists(file, "hydro/burn_neutron_cum")) {
+    out.state.burn_neutron_cum_host = read_vector_dataset_checked<double>(
+        file, "hydro/burn_neutron_cum", H5T_NATIVE_DOUBLE, out.state.rho.size());
+  }
   if (link_exists(file, "hydro/burn_n_D")) {
     constexpr std::size_t kBurnSpeciesCount = 5;
     const char* burn_species_paths[kBurnSpeciesCount] = {
