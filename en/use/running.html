@@ -131,7 +131,7 @@ Diagnostics(enabled=True, every=1)</code></pre>
 
     <section aria-labelledby="restart">
       <h2 id="restart">Checkpoints and restart</h2>
-      <p>A restarting deck sets <code>Main.restart_from</code> to a checkpoint prefix — e.g. <code>Main(..., restart_from="outputs/minimal_1d/checkpoints/minimal_1d_ckpt_0100")</code>, i.e. the prefix without any rank suffix or <code>.h5</code>. The restart inherits the stored state, time, and time step, and continues the original output layout. If no checkpoint matches the prefix, or the frozen configuration disagrees (dimension, mesh, materials, groups, seed), the run fails before starting.</p>
+      <p>A restarting deck sets <code>Main.restart_from</code> to a checkpoint prefix — e.g. <code>Main(..., restart_from="outputs/minimal_1d/checkpoints/minimal_1d_ckpt_0100")</code>, i.e. the prefix without any rank suffix or <code>.h5</code>. The restart inherits the stored state, time, and time step, and continues the original output layout. If no checkpoint matches the prefix, or the frozen configuration disagrees (dimension, mesh, materials, groups, seed), the run fails before starting. A 1D run restarted from an intermediate checkpoint continues bitwise identical to the original run (checkpoints from 2026-09-26 on; every history column checked with the GXII FLD and S<sub>N</sub> decks and a deck with burn; runs that reuse ray traces, <code>Laser.raytrace_skip_config.enabled=True</code>, retrace every ray right after the restart and do not match). To restart a 1D S<sub>N</sub> run from before 2026-09-25, set <code>Radiation.sn_transport.spatial_scheme="linear_characteristic"</code> to continue with the former spatial scheme.</p>
     </section>
 
     <section aria-labelledby="troubleshooting">

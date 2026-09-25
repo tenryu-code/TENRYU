@@ -150,6 +150,7 @@
           <tr><th><code>floor_injected</code> / <code>safety_injected</code> / <code>redistribution_unresolved</code> / <code>solver_residual</code></th><td>Floor, safety, ALE-redistribution, and solver-residual injections [erg] (diagnostic-only; excluded from the conservation-error numerator).</td></tr>
           <tr><th><code>conservation_error</code></th><td>Relative conservation error ε_budget (per the NUMERICS §10.2 identity).</td></tr>
           <tr><th><code>E_volume_in</code> / <code>E_total</code> / <code>dE_total</code> / <code>E_denom</code></th><td>Internal diagnostics (boundary volume work, total energy, its increment, the conservation denominator).</td></tr>
+          <tr><th><code>*_step</code></th><td>The step values [erg] of <code>marshak_in</code>, <code>pdv_boundary</code>, <code>numerical_loss</code>, <code>floor_injected</code>, <code>safety_injected</code>, <code>solver_residual</code> and <code>E_volume_in</code>; the series of the plain names hold run-cumulative values (since 2026-09-24; older files store the step values under the plain names — tell them apart by the presence of <code>energy/marshak_in_step</code>).</td></tr>
           <tr><th><code>phase_diagnostic/</code></th><td>optional (<code>Numerics.diagnostics.phase_resolved_energy=True</code>): matter energies before/after hydro and after ALE, with per-phase internal/kinetic increments.</td></tr>
           <tr><th><code>ale_closure_audit/</code></th><td>optional (<code>Numerics.ale.ke_conservation_closure_audit=True</code>): the ALE kinetic-energy closure audit (K/I decompositions, residuals, floor counters).</td></tr>
         </tbody>
@@ -179,7 +180,8 @@
           <tr><th><code>commanded_power_total</code> / <code>unabsorbed_power_total</code> / <code>trace_unabsorbed_power_total</code></th><td>Incident and unabsorbed power (final / right after the trace) [erg/s].</td></tr>
           <tr><th><code>absorption_efficiency_total</code> / <code>trace_absorption_efficiency_total</code></th><td>Total absorption efficiency (final / right after the trace).</td></tr>
           <tr><th><code>transfer_blocked_power_total</code></th><td>Power dropped for lack of a receiver [erg/s].</td></tr>
-          <tr><th><code>tail_closure_count</code> / <code>tail_closure_absorbed_power_total</code> / <code>critical_surface_hit_count</code></th><td>Rays ended by the near-critical tail closure (which deposits the remaining power analytically and terminates the ray — see <a href="../physics/laser.html">Laser</a>) and their absorbed power; rays terminated at the critical surface.</td></tr>
+          <tr><th><code>tail_closure_count</code> / <code>tail_closure_absorbed_power_total</code> / <code>critical_surface_hit_count</code></th><td>Rays ended by the near-critical tail closure (which deposits the remaining power analytically and terminates the ray — see <a href="../physics/laser.html">Laser</a>) and their absorbed power; rays terminated at the critical surface. The 1D default characteristic integrator reflects rays at the critical radius and does not use the tail closure.</td></tr>
+          <tr><th><code>ghost_corona_width</code></th><td>Width of the 1D ghost corona [cm] (0 when inactive).</td></tr>
           <tr><th><code>cbet_exchanged_power_total</code> / <code>cbet_ledger_residual_rel</code> / <code>cbet_iterations</code> / <code>cbet_clamp_count</code></th><td>CBET exchanged power, ledger residual, iteration count, clamp count. Written as zeros even with CBET disabled.</td></tr>
           <tr><th><code>absorbed_fraction_beam_&lt;i&gt;</code></th><td>Per-beam absorption weights (always 1 for a single beam).</td></tr>
         </tbody>
@@ -190,6 +192,7 @@
         <thead><tr><th>Group</th><th>Trigger and content</th></tr></thead>
         <tbody>
           <tr><th><code>radiation/fld_outer_*</code></th><td>Always (zero when FLD is off): outer Picard iteration count, exit residual, convergence flag.</td></tr>
+          <tr><th><code>radiation/sn_*</code></th><td>Only in <code>mode="sn_transport"</code> runs: the step totals of the outer iterations (Newton on the nodal temperatures in the 1D linear-discontinuous scheme, matter Picard otherwise) and the inner iterations (GMRES Krylov steps in the linear-discontinuous scheme, source iterations otherwise), the outer exit residual and the convergence flag (<code>sn_outer_iterations</code>, <code>sn_inner_iterations</code>, <code>sn_outer_residual</code>, <code>sn_converged</code>).</td></tr>
           <tr><th><code>diagnostics/icf/v1/</code></th><td><code>Numerics.diagnostics.icf.enabled</code>: shell radius, thickness, IFAR, convergence ratio CR.</td></tr>
           <tr><th><code>diagnostics/hotspot_gas/v1/</code></th><td><code>Numerics.diagnostics.hotspot_gas.enabled</code>: tracer-gas mass, radius family (R50…R99 and CR variants), density/pressure/adiabat summaries, Te/Ti statistics, energies, and work proxies.</td></tr>
           <tr><th><code>diagnostics/ale_provenance/v1/</code></th><td>ALE provenance (violation/escape-valve/geometry-failure counters, escape-valve event table, final claim attributes).</td></tr>
@@ -222,6 +225,11 @@
           <tr><th><code>rng/</code></th><td>RNG state (<code>rng_counter</code>, <code>global_id</code>).</td></tr>
           <tr><th><code>time_state/</code></th><td><code>t</code>, <code>step</code>, <code>dt</code>, cumulative energy terms, <code>user_seed</code>. The restart Δt comes from here.</td></tr>
           <tr><th><code>output_state/</code></th><td>Next scheduled output times (<code>t_next_plot</code>, <code>t_next_history</code>, <code>t_next_checkpoint</code>).</td></tr>
+          <tr><th><code>hydro/cv_e</code>, <code>cv_i</code>, <code>cs</code> (1D)</th><td>Heat capacities and sound speed from the equation-of-state closure. A 1D restart from a checkpoint that has them does not close the state again, and the restarted run continues bitwise identical to the original run (except runs that reuse ray traces, <code>Laser.raytrace_skip_config.enabled=True</code>).</td></tr>
+          <tr><th><code>hydro_flags/cell_is_void</code> (1D)</th><td>Marks of the void cells (cells of an <code>is_void</code> material).</td></tr>
+          <tr><th><code>conduction_state/</code></th><td>Run-cumulative statistics of the conduction solver (iteration, residual and condition-number maxima, and so on).</td></tr>
+          <tr><th><code>burn_state/specific_inventory</code></th><td>Burn specific inventories \(Y_s\) [1/g] (per cell D, T, He3, He4, p). A restart uses these rather than the snapshot number densities <code>hydro/burn_n_*</code> divided by the density (since 2026-09-26).</td></tr>
+          <tr><th><code>radiation_sn/</code> (1D S<sub>N</sub>)</th><td>Angular distributions of the linear-discontinuous scheme (<code>psi_prev</code>, <code>psi_sd_prev</code>) and the in-cell electron-energy offset (<code>ee_node_offset</code>); without them a run starts isotropic and flat in the cell.</td></tr>
           <tr><th><code>particles/</code></th><td>Particle pool of the retired Monte Carlo paths (not applicable to production FLD/S<sub>N</sub>).</td></tr>
         </tbody>
       </table>
