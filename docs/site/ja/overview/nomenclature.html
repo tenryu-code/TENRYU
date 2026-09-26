@@ -16,16 +16,14 @@
 
     <section aria-labelledby="versions">
       <h2 id="versions">バージョン表記</h2>
-      <p>本ドキュメントが記述するのは <strong>TENRYU v1</strong>（v1.0 とも表記）— 現行のプロダクション世代である。小文字の「v」はコード全体のリリースではなく、モデル・機能の<em>世代</em>を表す。</p>
+      <p>本ドキュメントが記述するのは TENRYU v1（v1.0 とも表記）— 現行のプロダクション世代である。小文字の「v」はコード全体のリリースではなく、モデル・機能の<em>世代</em>を表す。</p>
       <table class="quick-facts">
         <thead><tr><th>表記</th><th>意味</th></tr></thead>
         <tbody>
           <tr><th>v1 / v1.0</th><td>本サイトが記述する TENRYU のプロダクション世代。「v1 は輻射圧を省く」等の記述はこの世代へのスコープ宣言。</td></tr>
-          <tr><th>burn v2 /「Version 2」</th><td>核燃焼カーネルの第 2 世代モデル（遮蔽・多群荷電粒子拡散・モンテカルロ α 輸送）。</td></tr>
-          <tr><th>burn v2-E</th><td>burn v2 の中性子加熱拡張（2 ライン初回衝突モデル）。</td></tr>
-          <tr><th>MPI v1</th><td>第 1 世代 MPI 移植（監査済み機能スコープと deferral ガードは MPI ページ参照）。</td></tr>
+          <tr><th>v2-E</th><td>2 本の線スペクトルによる初回衝突の中性子加熱モデル（<code>Burn.neutron_heating</code>）を、2D RZ で拒否するエラーメッセージが使う呼び名。</td></tr>
+          <tr><th>MPI v1</th><td>第 1 世代 MPI 移植（監査済みの機能範囲と先送りの保護は MPI ページ参照）。</td></tr>
           <tr><th>M1 v1</th><td>ALE ページの M1/TMOP リゾーンソルバの第 1 世代。</td></tr>
-          <tr><th>V3（hydro）</th><td>流体ページに現れる実験的な 1D 解適応 ALE 経路の内部機能名。検証デッキ名 <code>2d_rz_v3_smooth_temporal</code>（<code>midpoint_v1</code> の収束次数を測る）とは無関係。</td></tr>
           <tr><th><code>pc_v0</code>, <code>midpoint_v1</code>, <code>bbsw_radial_v0</code> …</th><td>接尾辞がそのアルゴリズムの世代を記録する namelist 値。旧世代は凍結構成の互換のため保持される。</td></tr>
         </tbody>
       </table>
@@ -56,12 +54,12 @@
           <tr><th>FV</th><td>有限体積。</td></tr>
           <tr><th>GMG</th><td>幾何マルチグリッド前処理（2D FLD）。</td></tr>
           <tr><th>HED</th><td>High energy density（高エネルギー密度）。</td></tr>
-          <tr><th>HLLC</th><td>Harten–Lax–van Leer-contact 近似リーマン解法（hydro の任意サブモード）。</td></tr>
+          <tr><th>HLLC</th><td>Harten–Lax–van Leer-contact 近似リーマン解法（流体の任意のサブモード）。</td></tr>
           <tr><th>IAW</th><td>イオン音波。</td></tr>
-          <tr><th>IB</th><td>逆制動放射（衝突性レーザー吸収）。</td></tr>
+          <tr><th>IB</th><td>逆制動輻射（衝突性レーザー吸収）。</td></tr>
           <tr><th>ICF</th><td>慣性閉じ込め核融合。</td></tr>
           <tr><th>iSNB</th><td>Implicit SNB：Cao 2015 の Picard 結合による SNB 補正の時間結合。</td></tr>
-          <tr><th>LC</th><td>Linear characteristic：\(S_N\) の本番空間スキーム（<code>linear_characteristic</code>）。</td></tr>
+          <tr><th>LC</th><td>Linear characteristic（線形特性法）：2D RZ の既定の \(S_N\) 空間スキーム（<code>linear_characteristic</code>）。1D の既定は線形不連続法（<code>linear_discontinuous</code>）。</td></tr>
           <tr><th>LP</th><td>Levermore–Pomraning（FLD 既定リミッタ）。</td></tr>
           <tr><th>LPI</th><td>Laser–plasma instability（ホット電子を駆動するパラメトリック不安定性）。</td></tr>
           <tr><th>LTE / NLTE</th><td>局所熱力学平衡 / 非 LTE。</td></tr>
@@ -113,8 +111,8 @@
       <p>単位系は凍結：長さ cm、時間 s、質量 g、エネルギー erg、密度 g/cm³、温度・光子群境界は eV。全物理ページに共通する規約は次の 3 つである。</p>
       <ul>
         <li><strong>\(k_B\) は <code>eV_to_erg</code> \(=1.6022\times10^{-12}\) erg/eV を意味する。</strong>温度が eV で保持されるため、本ドキュメントの \(k_BT\) はすべて eV→erg 変換であり、ケルビン系のボルツマン定数は現れない。</li>
-        <li><strong>\(a_{\rm eV}=1.3720\times10^{2}\) erg cm⁻³ eV⁻⁴</strong> は eV 単位系で表した輻射定数。平衡輻射エネルギー密度は \(T\) を eV として \(a_{\rm eV}T^4\)。</li>
-        <li><strong>\(m_p=1.6726\times10^{-24}\) g</strong> は陽子質量。数密度は \(A\) を amu として \(n_i=\rho/(A\,m_p)\) — TENRYU は原子質量単位を意図的に \(m_p\) と同一視する。真の amu との約 0.8% の差は、材料の実効 \(A\) に吸収される固定の文書化済み規約。</li>
+        <li><strong>\(a_{\rm eV}=1.3720\times10^{2}\) erg cm⁻³ eV⁻⁴ は eV 単位系で表した輻射定数。</strong>平衡輻射エネルギー密度は \(T\) を eV として \(a_{\rm eV}T^4\)。</li>
+        <li><strong>\(m_p=1.6726\times10^{-24}\) g は陽子質量。</strong>数密度は \(A\) を amu として \(n_i=\rho/(A\,m_p)\) — TENRYU は原子質量単位を意図的に \(m_p\) と同一視する。真の amu との約 0.7% の差は、材料の実効 \(A\) に吸収される固定の文書化済み規約。</li>
       </ul>
     </section>
 
@@ -124,14 +122,14 @@
       <table class="quick-facts">
         <thead><tr><th>記号</th><th>文脈ごとの意味</th></tr></thead>
         <tbody>
-          <tr><th>\(\alpha\)</th><td>Fleck 陰性度パラメータ（既定 1.0、FLD）／曲率フープ項の幾何係数（粘性：円筒 1・球 2）／Winslow 計量係数（ALE）／\(\alpha_{iaw}\) は CBET のイオン音波減衰率。</td></tr>
+          <tr><th>\(\alpha\)</th><td>Fleck の陰的パラメータ（既定 1.0、FLD）／曲率フープ項の幾何係数（粘性：円筒 1・球 2）／Winslow 計量係数（ALE）／\(\alpha_{iaw}\) は CBET のイオン音波減衰率。</td></tr>
           <tr><th>\(\beta\)</th><td>輻射–物質剛性比 \(4a_{\rm eV}T_e^3/C_{v,e}\)（FLD）／SNB の規格化電子エネルギー \(E/(k_BT_e)\)（\(\hat\beta\) は大域 max \(T_e\) で規格化した群境界値）／Winslow 計量係数・M1 バリア重み（ALE）。</td></tr>
           <tr><th>\(\lambda\)</th><td>FLD リミッタ関数 \(\lambda(R)\)／SNB 群停止長 \(\lambda_g\)（abs/tr 変種）／ALE ラインサーチのブレンド係数／\(\lambda_0\) はレーザー真空波長。</td></tr>
           <tr><th>\(\theta\)</th><td>伝導の調和フラックス制限係数／CBET の <code>theta_cap</code>／\(S_N\) の donor-\(\theta\) リミッタ／極角。</td></tr>
-          <tr><th>\(\kappa\)</th><td>質量不透明度 [cm²/g]（輻射・EOS/不透明度）。伝導の文脈では電子熱伝導率（\(\kappa\propto T_e^{5/2}\)）。\(\kappa_{\rm IB}\) は逆制動放射の吸収係数（レーザー）。</td></tr>
+          <tr><th>\(\kappa\)</th><td>質量不透明度 [cm²/g]（輻射・EOS/不透明度）。伝導の文脈では電子熱伝導率（\(\kappa\propto T_e^{5/2}\)）。\(\kappa_{\rm IB}\) は逆制動輻射の吸収係数（レーザー）。</td></tr>
           <tr><th>\(g\)</th><td>光子・電子エネルギー群添字（輻射・SNB・ホット電子・燃焼）／CBET では利得曲線 \(P(g)\) の規格化離調 — CBET ページの集計「群」添字は第 3 の無関係な整理番号。</td></tr>
           <tr><th>\(f\)</th><td>Fleck 因子 \(f_{c,g}\)／伝導の自由流フラックス割合 <code>f_lim</code>／陽的ソース時間刻み割合 \(f_E\)（<code>explicit_source_limit</code>）／CBET 較正係数 <code>f_cbet</code>／ホット電子捕獲密度割合 \(f_s\)（<code>source_nc_fraction</code>）／燃焼のイオン加熱割合 \(f_i\)／CBET のドナーキャップ係数 \(f_g\)。</td></tr>
-          <tr><th>\(R\)</th><td>FLD リミッタ引数 \(|\nabla E_g|/(\sigma_{R,g}E_g)\)／\((R,Z)\) の径座標／SNB G2 ゲートのフラックス応答比／粘性のチャネル比 \(\eta_e/\eta_i\)。</td></tr>
+          <tr><th>\(R\)</th><td>FLD リミッタ引数 \(|\nabla E_g|/(\sigma_{R,g}E_g)\)／\((R,Z)\) の径座標／SNB の局所極限の試験（G2）のフラックス応答比／粘性のチャネル比 \(\eta_e/\eta_i\)。</td></tr>
           <tr><th>\(E\)</th><td>群輻射エネルギー密度 \(E_{c,g}\)／粒子運動エネルギー（ホット電子・燃焼の群格子）／2D 伝導更新の保存的セル熱エネルギー \(E_c\)／筆記体 \(\mathcal E\) は SNB 電場オプションの静電場。</td></tr>
           <tr><th>\(e\)</th><td>比内部エネルギー \(e_i,e_e\) [erg/g]（添字はイオン種・電子）／臨界密度 \(m_e\omega_0^2/(4\pi e^2)\) や衝突率の式では素電荷／\(e^{-2}\) スポット半径などでは指数の底。</td></tr>
           <tr><th>\(u\)</th><td>流体速度 \(\mathbf u\)／ホット電子スペクトル式では規格化エネルギー \(u=E/T_h\)（\(u_{g\pm1/2}\) は群端、\(u_{min},u_{max}\) は窓端）。</td></tr>
@@ -142,7 +140,7 @@
           <tr><th>\(\Delta l_c\)</th><td>dt 制限が使うセル代表長：1D はセル幅、2D は \(\sqrt{A_c}\)（\(A_c\) は子午面セル面積）。</td></tr>
           <tr><th>\(T_h\)（= \(T_{hot}\)）</th><td>ホット電子指数スペクトル温度（<code>T_hot_eV</code>、内部で erg に変換）。</td></tr>
           <tr><th>\(n_c\), \(n_{\rm crit}\)</th><td>同一量 — レーザー臨界密度 \(m_e\omega_0^2/(4\pi e^2)\)。ホット電子ページは \(n_c\)、レーザーページは \(n_{\rm crit}\) と表記。</td></tr>
-          <tr><th>\(Z_{\rm eff}\), \(\bar Z_{\rm eff}\)</th><td>\(Z_{\rm eff}=\bar Z r_2\) は電荷状態モーメントによる衝突実効電荷（\(r_2=\langle Z^2\rangle/\bar Z^2\)）；\(\bar Z_{\rm eff}\)（と \(A_{\rm eff}\)）は混合セルの組成平均。検証タグ R2 は \(r_2\) と無関係。</td></tr>
+          <tr><th>\(Z_{\rm eff}\), \(\bar Z_{\rm eff}\)</th><td>\(Z_{\rm eff}=\bar Z r_2\) は電荷状態モーメントによる衝突実効電荷（\(r_2=\langle Z^2\rangle/\bar Z^2\)）；\(\bar Z_{\rm eff}\)（と \(A_{\rm eff}\)）は混合セルの組成平均。検証タグ R2（S<sub>N</sub> の求積と Marshak 分布の試験群）は \(r_2\) と無関係。</td></tr>
           <tr><th>L1 / L2</th><td>レーザー検証ゲート階層（<a href="../verification/index.html#tag-legend">ゲートタグ凡例</a>）；\(L_2\)/\(L_\infty\)（\(\varepsilon_{L2}\), \(\varepsilon_{L\infty}\)）は相対誤差ノルム（場全体の RMS / 最大値）。</td></tr>
           <tr><th>\(w_m\), \(w_k\), \(w_0\)</th><td>\(w_m\)：\(S_N\) 求積重み（1D Gauss–Legendre 集合は \(\int_{-1}^1d\mu=2\) に規格化、方位角は \(\psi\) に畳み込み；よって \(\sum_{\mu_m>0}w_m\mu_m=1/2\)）；\(w_k\)：レーザー環状レイ重み（プロファイル×厳密面積、総和 1）；\(w_0\)：ビームの \(e^{-2}\) スポット半径。</td></tr>
         </tbody>
@@ -151,7 +149,7 @@
 
     <section aria-labelledby="tags">
       <h2 id="tags">検証タグ</h2>
-      <p>検証の語彙 — 再現性ティア（T-bit / T-sum / T-noise / OFF-bit / envelope）と各カーネルのゲートタグ族（L1/L2、G1–G4、G-R/K/P/L、B/N/W、H1/H2、I1/I2/I3/I6、R2、LR07/LE08/FLD-CED）— は<a href="../verification/index.html#reproducibility">検証とベンチマーク</a>ページの再現性凡例と<a href="../verification/index.html#tag-legend">ゲートタグ凡例</a>で一元的に定義されている。</p>
+      <p>検証の語彙 — 再現性の契約（ビット単位、縮約順序の帯、雑音帯、機能オフの一致、envelope）と、試験名と各カーネルページに現れるゲートタグ族（L1/L2、G1–G5、G-R/K/P、H1/H2、I1/I2/I3/I6、R2、LR07/LE08/FLD-CED）— は<a href="../verification/index.html#reproducibility">検証とベンチマーク</a>ページの再現性凡例と<a href="../verification/index.html#tag-legend">ゲートタグ凡例</a>で一元的に定義されている。</p>
     </section>
 
     <div id="page-footer"></div>

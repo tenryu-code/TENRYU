@@ -12,13 +12,13 @@
   <main>
     <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
     <h1>シミュレーションの実行 <span class="badge">reference</span></h1>
-    <p class="abstract">このページは、ビルド済みの <code>build/tenryu</code> を前提に、「最初の 1 本を完走させる → 自分のデッキを書く → つまずいたら直す」までを通しで説明する。TENRYU の入力は 1 個の Python ファイル（namelist デッキ）である。Python の関数は初期化時に評価して表へ凍結されるため、時間ループの最中に Python が呼ばれることはない。</p>
+    <p class="abstract">このページは、ビルド済みの <code>build/tenryu</code> を前提に、「最初の 1 本を完走させる → 自分のデッキを書く → つまずいたら直す」までを通しで説明する。TENRYU の入力は 1 個の Python ファイル（namelist デッキ）である。Python の関数は初期化時に評価され、表へ凍結されるため、時間ループの最中に Python が呼ばれることはない。</p>
 
     <aside class="planned" aria-labelledby="at-a-glance">
       <h3 id="at-a-glance">要点</h3>
       <ul>
-        <li>CLI は 4 つ: <code>run</code>（実行）・<code>validate</code>（実行せず検査）・<code>verify</code>（登録済み検証ケース）・<code>freeze</code>（凍結 JSON の出力）。<strong>run の前に必ず validate</strong> — 設定ミスは実行前にほぼ全部見つかる。</li>
-        <li>最初の 1 本は <code>examples/templates/</code> のテンプレートをそのまま実行すればよい。写経なしで完走する。</li>
+        <li>通常使う CLI サブコマンドは 4 つ: <code>run</code>（実行）・<code>validate</code>（実行せず検査）・<code>verify</code>（登録済み検証ケース）・<code>freeze</code>（凍結 JSON の出力）。run の前には必ず validate を実行する。設定ミスは実行前にほぼ全部見つかる。</li>
+        <li>最初の 1 本は <code>examples/templates/</code> のテンプレートをそのまま実行すればよい。編集せずに完走する。</li>
         <li><code>tenryu</code> とは常にビルドされた実行ファイル <code>build/tenryu</code> のことである — インストール手順はない。リポジトリのルートからパス指定で起動するか、<code>build/</code> を <code>PATH</code> に加える。</li>
         <li>スキーマは厳格である。未知のキー・型違い・不正な組合せは警告ではなくエラーで止まり、打ち間違いには <code>did you mean 'kappa_a'?</code> のような修正候補が出る。</li>
         <li>同じ出力先へ再実行すると上書きせず <code>_001</code> の連番ディレクトリへ書かれる。「結果が変わらない」と思ったらまず出力先を確認する。</li>
@@ -35,8 +35,8 @@
       <table class="quick-facts">
         <thead><tr><th>コマンド</th><th>入力</th><th>用途</th></tr></thead>
         <tbody>
-          <tr><th><code>tenryu validate &lt;deck.py&gt;</code></th><td>任意のデッキ</td><td>実行せずに検査する（数秒）。スキーマ・組合せの検査に加え、次元・格子・材料・物理モジュールの ON/OFF・出力先をまとめた実行前サマリを表示する。<strong>要約を目で確認してから run</strong> — これが最も安上がりなデバッグである。</td></tr>
-          <tr><th><code>tenryu run &lt;deck.py&gt;</code></th><td>任意のデッキ</td><td>本実行。デッキを読み、検証・凍結し、メッシュ・材料表・初期条件を作ってから時間ループに入る。<code>--output-dir &lt;dir&gt;</code> でデッキを編集せずに出力先を上書きできる（新規 run 専用。restart との併用は <code>ConfigError</code>）。</td></tr>
+          <tr><th><code>tenryu validate &lt;deck.py&gt;</code></th><td>任意のデッキ</td><td>実行せずに検査する（数秒）。スキーマ・組合せの検査に加え、次元・格子・材料・物理モジュールの ON/OFF・出力先をまとめた実行前の要約を表示する。run の前にこの要約を目で確認することが、最も安上がりなデバッグである。</td></tr>
+          <tr><th><code>tenryu run &lt;deck.py&gt;</code></th><td>任意のデッキ</td><td>本実行。デッキを読み、検証・凍結し、メッシュ・材料表・初期条件を作ってから時間ループに入る。<code>--output-dir &lt;dir&gt;</code> でデッキを編集せずに出力先を上書きできる（新規 run 専用。再開との併用は <code>ConfigError</code>）。</td></tr>
           <tr><th><code>tenryu verify &lt;name&gt;</code></th><td>登録済みケース名</td><td>解析解・基準解・統合検査の再実行（例: <code>sedov</code>、<code>noh</code>、<code>gxii_1d_fld_regression</code>）。<a href="../verification/index.html">検証とベンチマーク</a>参照。</td></tr>
           <tr><th><code>tenryu freeze &lt;deck.py&gt;</code></th><td>任意のデッキ</td><td>凍結後の設定 JSON を書き出す。実行せずに「実効値」を確認・差分比較したいときに使う。</td></tr>
         </tbody>
@@ -60,12 +60,12 @@ python3 -m tools.tenryu_plot history outputs/template_1d_slab_radiation   # 時�
       <table class="quick-facts">
         <thead><tr><th>テンプレート</th><th>内容</th><th>学べること</th></tr></thead>
         <tbody>
-          <tr><th><code>template_1d_slab_radiation.py</code></th><td>平面 1D・灰色 FLD・Marshak 境界駆動・流体 OFF</td><td>放射伝播の最小構成。validate → run → 可視化の流れ。</td></tr>
+          <tr><th><code>template_1d_slab_radiation.py</code></th><td>平面 1D・グレイ FLD・Marshak 境界駆動・流体 OFF</td><td>輻射伝播の最小構成。validate → run → 可視化の流れ。</td></tr>
           <tr><th><code>template_1d_laser_sphere.py</code></th><td>球 1D・レーザー直接照射・2 温度・伝導 ON</td><td>レーザー波形の書き方、複合物理。</td></tr>
-          <tr><th><code>template_1d_indirect_tr.py</code></th><td>球 1D・Tr(t) 間接照射駆動</td><td>時間依存 callable → 凍結テーブルの流儀。</td></tr>
+          <tr><th><code>template_1d_indirect_tr.py</code></th><td>球 1D・Tr(t) 間接照射駆動</td><td>時間依存 callable → 凍結された表の流儀。</td></tr>
         </tbody>
       </table>
-      <p>改造の定番は、駆動温度・レーザーパワー（callable の返り値）を変える、<code>nr</code> を倍にして収束を見る、<code>Radiation(mode="sn_transport")</code> にして FLD と比べる、の 3 つである。テンプレートは<strong>コピーして名前を変えてから</strong>改造する。物理指標まで確認済みの Studio プリセット 3 種は<a href="examples.html">例題とプリセット</a>にある。</p>
+      <p>改造の定番は、駆動温度・レーザーパワー（callable の返り値）を変える、<code>nr</code> を倍にして収束を見る、<code>Radiation(mode="sn_transport")</code> にして FLD と比べる、の 3 つである。テンプレートはコピーして名前を変えてから改造する。物理指標まで確認済みの Studio プリセット 3 種は<a href="examples.html">例題とプリセット</a>にある。</p>
     </section>
 
     <section aria-labelledby="deck-anatomy">
@@ -120,18 +120,18 @@ Diagnostics(enabled=True, every=1)</code></pre>
 
     <section aria-labelledby="during-run">
       <h2 id="during-run">実行中に見えるもの</h2>
-      <p><code>run</code> は最初にデッキを検証・凍結し（validate と同じ検査）、メッシュと初期状態を構築してから時間ループへ入る。以後はステップの進行がログに流れ、スナップショット・チェックポイントを書くたびに <code>[output] wrote snapshot (step=…, …)</code> の行が出る。ログはコンソールと <code>outputs/&lt;name&gt;/log/</code> の双方に残る。</p>
+      <p><code>run</code> は最初にデッキを検証・凍結し（validate と同じ検査）、メッシュと初期状態を構築してから時間ループへ入る。以後はステップの進行がログに流れ、スナップショットを書くたびに <code>[output] wrote snapshot (step=…, …)</code>、チェックポイントを書くたびに <code>[output] wrote checkpoint (step=…, …)</code> の行が出る。ログはコンソールと <code>outputs/&lt;name&gt;/log/</code> の双方に残る。</p>
       <p>「\(\Delta t\) がどんどん小さくなって進まない」ときは、ログの limiter 名（<code>hydro</code>・<code>conduction</code>・<code>braginskii</code> など）で律速カーネルを特定し、該当物理の設定（床値・格子）を見直す。決定則と全カーネルの式は<a href="../overview/timestep.html">時間刻み制御と CFL</a> にまとめてある。</p>
     </section>
 
     <section aria-labelledby="outputs">
       <h2 id="outputs">出力先</h2>
-      <p>実行時の描画、履歴、チェックポイントは <code>Output.directory</code> に書き出される。ケース名に合わせた <code>outputs/&lt;name&gt;</code> が標準的な整理の仕方である。ディレクトリの内訳（<code>results/</code>・<code>config/</code>・<code>checkpoints/</code>・<code>log/</code>・<code>run_info.json</code>）、ファイルの命名、全データセットの一覧は<a href="outputs.html">出力と解析</a>にまとめた。<code>plot_every</code>・<code>history_every</code>・<code>checkpoint_every</code> はステップ数で指定する間隔（0 で無効）、<code>_s</code> 付き（<code>plot_every_s</code> 等）は秒で指定する間隔で、両方が有効なら OR で発火する。<strong>時間で指定したいときは必ず <code>_s</code> 付きを使う</strong> — 単位事故の定番ポイントである。</p>
+      <p>スナップショット、履歴、チェックポイントは <code>Output.directory</code> に書き出される。ケース名に合わせた <code>outputs/&lt;name&gt;</code> が標準的な整理の仕方である。ディレクトリの内訳（<code>results/</code>・<code>config/</code>・<code>checkpoints/</code>・<code>log/</code>・<code>run_info.json</code>）、ファイルの命名、データセットの一覧は<a href="outputs.html">出力と解析</a>にまとめた。<code>plot_every</code>・<code>history_every</code>・<code>checkpoint_every</code> はステップ数で指定する間隔（0 で無効）、<code>_s</code> 付き（<code>plot_every_s</code> 等）は秒で指定する間隔で、両方が有効なら OR で発火する。時間で指定したいときは必ず <code>_s</code> 付きのキーを使う。ステップ数と秒を取り違える単位の誤りは起きやすい。</p>
     </section>
 
     <section aria-labelledby="restart">
       <h2 id="restart">チェックポイントと再開</h2>
-      <p>再開するデッキでは、<code>Main.restart_from</code> にチェックポイントの接頭辞を指定する。たとえば <code>Main(..., restart_from="outputs/minimal_1d/checkpoints/minimal_1d_ckpt_0100")</code> のように、ランクの接尾辞や <code>.h5</code> を除いた接頭辞を渡す。再開は、チェックポイントに保存された状態、時刻、時間刻みを引き継ぎ、元の出力の配置をそのまま続ける。指定した接頭辞に一致するチェックポイントがない場合や、凍結後の設定と整合しない場合（次元・メッシュ・材料・群・seed の不一致）は、開始する前に失敗する。1D の run は、途中のチェックポイントから再開しても元の run とビット一致で続く（2026-09-26 以降のチェックポイント。GXII の FLD・S<sub>N</sub> デッキと燃焼のあるデッキで、履歴の全列の一致を確かめている。光線追跡の再利用 <code>Laser.raytrace_skip_config.enabled=True</code> の run は再開直後に全光線を追跡し直すので一致しない）。2026-09-25 より前の 1D の S<sub>N</sub> の run を再開するときは、<code>Radiation.sn_transport.spatial_scheme="linear_characteristic"</code> を明示すると従来の空間離散化で続く。</p>
+      <p>再開するデッキでは、<code>Main.restart_from</code> にチェックポイントの接頭辞を指定する。たとえば <code>Main(..., restart_from="outputs/minimal_1d/checkpoints/minimal_1d_ckpt_0000")</code> のように、ランクの接尾辞や <code>.h5</code> を除いた接頭辞を渡す。再開は、チェックポイントに保存された状態、時刻、時間刻みを引き継ぎ、元の出力の配置をそのまま続ける。指定した接頭辞に一致するチェックポイントがない場合や、凍結後の設定と整合しない場合（次元・メッシュ・材料・群・seed の不一致）は、開始する前に失敗する。1D の run は、2026-09-26 以降に書いた途中のチェックポイントから再開すると、元の run とビット一致で続く。GXII の FLD・S<sub>N</sub> デッキと燃焼のあるデッキで、履歴の全列が一致することを確かめている。ただし、光線追跡を再利用する run（<code>Laser.raytrace_skip_config.enabled=True</code>）は、再開直後に全光線を追跡し直すので一致しない。2026-09-25 より前の 1D の S<sub>N</sub> の run を再開するときは、<code>Radiation.sn_transport.spatial_scheme="linear_characteristic"</code> を明示すると従来の空間離散化で続く。</p>
     </section>
 
     <section aria-labelledby="troubleshooting">
@@ -144,11 +144,11 @@ Diagnostics(enabled=True, every=1)</code></pre>
           <tr><th><code>Radiation.mode="imc_ddmc"</code> でエラー</th><td>旧 Monte Carlo 輸送は退役済み。書かない（= FLD 既定）か <code>sn_transport</code> にする。<code>imc=dict(...)</code>/<code>ddmc=dict(...)</code> も同様に退役経路専用の互換キーである。</td></tr>
           <tr><th>実行したのに結果が古いまま</th><td>出力先の衝突で <code>_001</code> の連番ディレクトリへ書かれている。出力先を確認する。</td></tr>
           <tr><th>温度が上がらない / 波が進まない</th><td>まず validate の要約で有効な物理モジュールを確認し、次に <code>config/*_frozen.json</code> で境界・不透明度の実効値を確認する。</td></tr>
-          <tr><th>\(\Delta t\) が縮み続けて進まない</th><td>ログの limiter 名で律速カーネルを特定する（<a href="../overview/timestep.html">時間刻み制御</a>）。床（<code>dt.min_s</code>）を割ると FATAL 停止する。</td></tr>
+          <tr><th>\(\Delta t\) が縮み続けて進まない</th><td>履歴の <code>dt_winner</code>、またはログの limiter 名（<code>Main.verbosity="verbose"</code> のとき出る）で律速カーネルを特定する（<a href="../overview/timestep.html">時間刻み制御</a>）。床（<code>dt.min_s</code>）を割ると FATAL 停止する。</td></tr>
           <tr><th>CMake・ビルド段階の失敗</th><td><a href="building.html">ビルド</a>と<a href="requirements.html">動作環境</a>のページを参照。</td></tr>
         </tbody>
       </table>
-      <p>調べる順番は ① validate の要約 → ② <code>config/*_frozen.json</code>（実効値）→ ③ <code>log/</code> の warning、が早い。</p>
+      <p>① validate の要約 → ② <code>config/*_frozen.json</code>（実効値）→ ③ <code>log/</code> の warning の順に調べると早い。</p>
     </section>
 
     <div id="page-footer"></div>

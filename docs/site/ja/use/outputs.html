@@ -12,7 +12,7 @@
   <main>
     <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
     <h1>出力と解析 <span class="badge">reference</span></h1>
-    <p class="abstract">TENRYU の 1 回の実行は、スナップショット（空間場）・履歴（スカラー時系列）・チェックポイント（再開用）の 3 種の HDF5 と、来歴ファイル（凍結設定・実行情報・ログ）を生成する。このページは<strong>何が出力されるかの全列挙</strong>である — ファイルの種類と命名、スナップショットの全グループとデータセット、履歴の全チャネル、チェックポイントの追加内容、そして読み方。データ型・配列形状まで含む正典はリポジトリの <code>docs/SPECIFICATION.md</code> §7（要約は <code>docs/OUTPUT_SCHEMA.md</code>）である。</p>
+    <p class="abstract">TENRYU の 1 回の実行は、スナップショット（空間場）・履歴（スカラー時系列）・チェックポイント（再開用）の 3 種の HDF5 と、来歴ファイル（凍結設定・実行情報・ログ）を生成する。このページは何が出力されるかを一覧にする — ファイルの種類と命名、スナップショットのグループと主なデータセット、履歴の主なチャネル、チェックポイントの追加内容、そして読み方。データ型・配列形状まで含む正典はリポジトリの <code>docs/SPECIFICATION.md</code> §7（要約は <code>docs/OUTPUT_SCHEMA.md</code>）である。</p>
 
     <aside class="planned" aria-labelledby="at-a-glance">
       <h3 id="at-a-glance">要点</h3>
@@ -29,12 +29,12 @@
       <table class="quick-facts">
         <thead><tr><th>ファイル</th><th>命名</th><th>出力頻度</th><th>用途</th></tr></thead>
         <tbody>
-          <tr><th>スナップショット</th><td><code>&lt;case&gt;_NNNN.h5</code>（4 桁ゼロ詰めサイクル番号）</td><td><code>plot_every</code> ステップごと <em>または</em> <code>plot_every_s</code> 秒ごと（OR 論理）</td><td>場の可視化・後処理。物理時刻はルート属性 <code>t</code>。</td></tr>
-          <tr><th>履歴</th><td><code>&lt;case&gt;_history.h5</code></td><td><code>history_every</code> / <code>history_every_s</code>（OR、追記）</td><td>スカラー診断量の時系列。extensible dataset に毎回追記する。</td></tr>
-          <tr><th>チェックポイント</th><td><code>&lt;case&gt;_ckpt_NNNN.h5</code>（ランク別ファイルでは <code>_rNNNN</code> が付く）</td><td><code>checkpoint_every</code> / <code>checkpoint_every_s</code>（OR）</td><td>リスタート。<code>checkpoint_keep_last</code> 個だけ保持し古いものは自動削除。</td></tr>
+          <tr><th>スナップショット</th><td><code>&lt;name&gt;_NNNN.h5</code>（4 桁ゼロ詰めの通し番号）</td><td><code>plot_every</code> ステップごと <em>または</em> <code>plot_every_s</code> 秒ごと（OR 論理）</td><td>場の可視化・後処理。物理時刻はルート属性 <code>t</code>、サイクル番号は <code>cycle</code>。</td></tr>
+          <tr><th>履歴</th><td><code>&lt;name&gt;_history.h5</code></td><td><code>history_every</code> / <code>history_every_s</code>（OR、追記）</td><td>スカラー診断量の時系列。extensible dataset に毎回追記する。</td></tr>
+          <tr><th>チェックポイント</th><td><code>&lt;name&gt;_ckpt_NNNN.h5</code>（4 桁ゼロ詰めの通し番号）</td><td><code>checkpoint_every</code> / <code>checkpoint_every_s</code>（OR）</td><td>リスタート。<code>checkpoint_keep_last</code> 個だけ保持し古いものは自動削除。</td></tr>
         </tbody>
       </table>
-      <p><code>&lt;case&gt;</code> は <code>Main.name</code>、未指定なら namelist ファイル名（拡張子なし）である。並列 IO は役割別で、スナップショットは並列 HDF5（MPI-IO、collective write）で単一ファイル、履歴は rank 0 のみが書き、チェックポイントはランク別ファイルになる。ディレクトリ全体の配置は次のとおりである。</p>
+      <p><code>&lt;name&gt;</code> は <code>Main.name</code>、未指定なら namelist ファイル名（拡張子なし）である。MPI 並列の run でも、スナップショット・履歴・チェックポイントはすべて rank 0 が書き、ランク別のファイルは作らない。ディレクトリ全体の配置は次のとおりである。</p>
       <pre><code>outputs/&lt;name&gt;/
 ├── results/                  ← スナップショットと履歴
 │   ├── &lt;name&gt;_0000.h5
@@ -47,12 +47,12 @@
 │   └── &lt;name&gt;_ckpt_0100.h5
 ├── log/                      ← 実行ログ
 └── run_info.json             ← 実行の要約（終了状態など）</code></pre>
-      <p>出力先が既に存在して衝突する場合は、上書きせず <code>outputs/&lt;name&gt;_001/</code> のような 3 桁連番の別ディレクトリへ書く。deck を編集せずに出力先を変えたいときは <code>tenryu run &lt;deck&gt; --output-dir &lt;dir&gt;</code> で実行時に上書きできる（新規 run 専用。restart との併用は <code>ConfigError</code>）。</p>
+      <p>出力先が既に存在して衝突する場合は、上書きせず <code>outputs/&lt;name&gt;_001/</code> のような 3 桁連番の別ディレクトリへ書く。デッキを編集せずに出力先を変えたいときは <code>tenryu run &lt;deck&gt; --output-dir &lt;dir&gt;</code> で実行時に上書きできる（新規 run 専用。再開との併用は <code>ConfigError</code>）。</p>
     </section>
 
     <section aria-labelledby="snapshots">
-      <h2 id="snapshots">スナップショットの全データセット</h2>
-      <p>ルート属性は <code>t</code>（時刻 [s]）、<code>cycle</code>、<code>geometry</code>（<code>"1D_SPH"</code>|<code>"2D_RZ"</code>）、<code>n_cells</code>、<code>n_nodes</code>、<code>n_groups</code>、<code>n_materials</code>、<code>schema_version</code> である。1D では配列は 1 次元フラット、<code>mesh/x_z</code>・<code>v_z</code> は省略される。以下、グループごとに列挙する（「optional」は生成条件付き）。</p>
+      <h2 id="snapshots">スナップショットのデータセット</h2>
+      <p>ルート属性は <code>t</code>（時刻 [s]）、<code>cycle</code>、<code>geometry</code>（<code>"1D_SPH"</code>|<code>"2D_RZ"</code>）、<code>n_cells</code>、<code>n_nodes</code>、<code>n_groups</code>、<code>n_materials</code>、<code>schema_version</code> である。<code>geometry</code> は 1D では平面・円筒でも <code>"1D_SPH"</code> なので、1D のファイルは座標系を表す <code>geometry_1d</code>（<code>"spherical"</code>|<code>"cylindrical"</code>|<code>"planar"</code>）も持つ。1D では配列は 1 次元フラット、<code>mesh/x_z</code>・<code>v_z</code> は省略される。以下、グループごとに列挙する（「optional」は生成条件付き）。</p>
 
       <h3>metadata/ — 来歴</h3>
       <table class="quick-facts">
@@ -71,7 +71,7 @@
           <tr><th><code>x_r</code>, <code>x_z</code></th><td>節点座標 [cm]。<code>x_z</code> は 2D のみ。</td></tr>
           <tr><th><code>v_r</code>, <code>v_z</code></th><td>節点速度 [cm/s]。<code>v_z</code> は 2D のみ。</td></tr>
           <tr><th><code>cell_material_id</code></th><td>セルの代表材料インデックス（多材料セルは体積分率最大、同率なら小さい方）。</td></tr>
-          <tr><th><code>topology/v2/</code>・<code>v3/</code>・<code>v4/</code></th><td>optional。マルチブロックメッシュの接続（v2: 3 ブロック、v3: half-butterfly 5 ブロック — block/seam 表と CSR 接続、v4: 五角形帯の <code>cell_nverts</code> と <code>corner_stride</code> 属性）。単一ブロックでは省略。構成の詳細は <a href="../physics/mesh/2d.html">2D メッシュ</a>参照。</td></tr>
+          <tr><th><code>topology/v2/</code>・<code>v3/</code>・<code>v4/</code></th><td>optional。マルチブロックメッシュの接続（v2: 3 ブロック、v3: half-butterfly 5 ブロック — block/seam 表と CSR（圧縮行格納）形式の接続、v4: 五角形帯の <code>cell_nverts</code> と <code>corner_stride</code> 属性）。単一ブロックでは省略。構成の詳細は <a href="../physics/mesh/2d.html">2D メッシュ</a>参照。</td></tr>
         </tbody>
       </table>
 
@@ -85,11 +85,12 @@
           <tr><th><code>mass</code>, <code>vol</code></th><td>セル質量 [g]・体積 [cm³]。</td></tr>
           <tr><th><code>zbar</code></th><td>平均電離度。</td></tr>
           <tr><th><code>volFrac</code></th><td>材料体積分率 [N_cell, N_mat]（多材料時）。</td></tr>
+          <tr><th><code>burn_rate</code>, <code>burn_Q_e</code>, <code>burn_Q_i</code>, <code>burn_eps_cum</code>, <code>burn_n_*</code></th><td>optional（<code>Burn.enabled=True</code> 時）。反応率密度 [1/cm³/s]、燃焼生成物による電子・イオンの加熱率 [erg/cm³/s]、累積の比沈着エネルギー [erg/g]、D・T・He3・He4・p の数密度 [1/cm³]。1D では、セルで生まれた中性子の累積数 <code>burn_neutron_cum</code> も書く。</td></tr>
           <tr><th><code>shock_time</code></th><td>optional。最後に衝撃波を検知した時刻 [s]（post-shock 系機能の有効時）。</td></tr>
-          <tr><th><code>adaptive_av_gate</code>, <code>adaptive_av_mode_cell</code></th><td>optional。適応 AV のゲート履歴と可視化マスク（<code>adaptive_av.enabled=True</code> 時）。</td></tr>
+          <tr><th><code>adaptive_av_gate</code>, <code>adaptive_av_mode_cell</code></th><td>optional。適応人工粘性（AV）のゲート履歴と可視化マスク（<code>adaptive_av.enabled=True</code> 時）。</td></tr>
           <tr><th><code>corner_mass</code></th><td>optional。2D のサブゾーンコーナー質量 [g]（ラグランジュ不変量）。</td></tr>
           <tr><th><code>eta_compatible</code></th><td>optional。旧 compatible 診断の体積差不整合 [cm³]。</td></tr>
-          <tr><th><code>per_material/v1/</code></th><td>optional。材料別保存の schema skeleton（<code>Numerics.materials.per_material_conservation_enabled=True</code> 時）。</td></tr>
+          <tr><th><code>per_material/v1/</code></th><td>optional。材料別の質量 <code>mass</code> [g] と電子・イオンの内部エネルギー <code>Ee</code>・<code>Ei</code> [erg]（セルと材料の組ごと。<code>Numerics.materials.per_material_conservation_enabled=True</code> 時）。</td></tr>
         </tbody>
       </table>
 
@@ -109,11 +110,9 @@
           <tr><th><code>energy_density</code></th><td>群別輻射エネルギー密度 E_g [erg/cm³]（[N_cell, G]）。</td></tr>
           <tr><th><code>rad_dep</code>, <code>rad_emit</code></th><td>当該ステップ累積の吸収・放出 [erg]（群別）。</td></tr>
           <tr><th><code>deposited_power</code></th><td>吸収パワー密度 [erg/cm³/s]（= rad_dep/(VΔt)、可視化用）。</td></tr>
-          <tr><th><code>boundary_flux</code></th><td>群別境界流出 [erg/s]。</td></tr>
-          <tr><th><code>momentum_dep</code></th><td>運動量沈着（診断のみ、流体非結合）。</td></tr>
           <tr><th><code>fleck_factor</code></th><td>2D FLD のみ。セルの Fleck 因子（診断はグレイ G=1 で有効）。</td></tr>
-          <tr><th><code>sn_tau_R</code>, <code>sn_reduced_flux</code>, <code>sn_ap_alpha</code></th><td>2D S<sub>N</sub> のみ。AP face_blend 診断（光学的厚さ・換算流束・面重みの各プロキシ）。</td></tr>
-          <tr><th><code>diag_rad_*</code>（10 種）</th><td>1D S<sub>N</sub> の出力専用診断: <code>E_pre</code>/<code>E_post</code>/<code>emission_at_Tn</code>/<code>emission_at_Tnp1</code>/<code>absorption</code>/<code>clip_energy</code>/<code>clip_full_deficit</code>/<code>chi_opacity</code>/<code>F_first_moment</code>/<code>E_star_flux</code>、および <code>diag_stream_theta</code>・<code>diag_ap_alpha_face</code>。リスタートの状態復元には使われない。</td></tr>
+          <tr><th><code>sn_tau_R</code>, <code>sn_reduced_flux</code>, <code>sn_ap_alpha</code></th><td>2D S<sub>N</sub> のみ。面の流束を S<sub>N</sub> と拡散で混ぜる漸近保存（AP）処理の診断（光学的厚さ・換算流束・混合の重みの各プロキシ）。</td></tr>
+          <tr><th><code>diag_*</code>（12 種）</th><td>1D S<sub>N</sub> の出力専用診断: <code>diag_rad_</code> に続く <code>E_pre</code>/<code>E_post</code>/<code>emission_at_Tn</code>/<code>emission_at_Tnp1</code>/<code>absorption</code> と、<code>diag_</code> に続く <code>clip_energy</code>/<code>clip_full_deficit</code>/<code>chi_opacity</code>/<code>F_first_moment</code>/<code>E_star_flux</code>/<code>stream_theta</code>/<code>ap_alpha_face</code>。リスタートの状態復元には使われない。</td></tr>
           <tr><th><code>ddmc_flag</code></th><td>退役 <code>imc_ddmc</code> 経路のみ有意。現行 FLD/S<sub>N</sub> では意味を持たない。</td></tr>
         </tbody>
       </table>
@@ -124,35 +123,35 @@
         <tbody>
           <tr><th><code>deposited_power</code></th><td>レーザー沈着パワー密度 [erg/cm³/s]。</td></tr>
           <tr><th><code>absorption_fraction</code></th><td>全体吸収率（absorbed/incident）。</td></tr>
-          <tr><th><code>ray_density</code></th><td>レイ初期配置密度 [1/cm³]。</td></tr>
+          <tr><th><code>ray_density</code></th><td>光線の初期配置密度 [1/cm³]。</td></tr>
           <tr><th><code>A_Q_r_shells</code>, <code>A_Q_z_shells</code></th><td>2D のみ。シェル（r 添字固定の z 方向セル列/z 添字固定の r 方向セル列）ごとの沈着非対称度 \((q_{max}-q_{min})/(q_{max}+q_{min})\)。q は各セルにそのステップで沈着したレーザーエネルギー [erg]。</td></tr>
-          <tr><th><code>mesh/</code></th><td><code>ray_output_trajectory=True</code> の非 skip ステップ（= レイトレースを実行したステップ。<code>Laser.raytrace_skip</code> の間引き再利用ステップでは出力されない）のみ。レーザー専用の独立格子 LaserMesh（流体メッシュとは別の 2D RZ 構造格子 — <a href="../physics/laser.html">レーザー</a>参照）の節点座標・\(\hat n_e\)（電子密度の対臨界密度比）・T_e・Z̄・密度勾配・<code>n_crit</code>。</td></tr>
-          <tr><th><code>rays/</code></th><td><code>ray_output_count&gt;0</code> の非 skip ステップのみ。レイの初期位置・方向・パワー（1D: R0/Z0/vR0/vZ0、2D: x0/y0/z0/vx0/vy0/vz0）とビーム ID。</td></tr>
-          <tr><th><code>rays/trajectory/</code></th><td><code>ray_output_trajectory=True</code> 時。CSR 形式の軌跡（offsets・step_count・位置列・残存パワー列）。可視化のレイ重ね描きの元データ。</td></tr>
+          <tr><th><code>mesh/</code></th><td><code>ray_output_trajectory=True</code> の非 skip ステップ（= 光線追跡を実行したステップ。<code>Laser.raytrace_skip</code> の間引き再利用ステップでは出力されない）のみ。レーザー専用の独立格子 LaserMesh（流体メッシュとは別の 2D RZ 構造格子 — <a href="../physics/laser.html">レーザー</a>参照）の節点座標・\(\hat n_e\)（電子密度の対臨界密度比）・T_e・Z̄・密度勾配・<code>n_crit</code>。</td></tr>
+          <tr><th><code>rays/</code></th><td><code>ray_output_count&gt;0</code> の非 skip ステップのみ。光線の初期位置・方向・パワー（1D: R0/Z0/vR0/vZ0、2D: x0/y0/z0/vx0/vy0/vz0）とビーム ID。</td></tr>
+          <tr><th><code>rays/trajectory/</code></th><td><code>ray_output_trajectory=True</code> 時。CSR 形式の軌跡（offsets・step_count・位置列・残存パワー列）。可視化で光線を重ねて描くときの元データ。</td></tr>
         </tbody>
       </table>
-      <p><code>mode="radial_absorption_1d"</code> では物理的なレイ軌跡がないため、<code>deposited_power</code> と <code>absorption_fraction</code> は通常どおり出力されるが <code>rays/</code> 系は空または未作成となる。なお <code>holo/</code> と <code>difference/</code> のグループは退役 <code>imc_ddmc</code> 系経路の専用出力であり、現行の FLD/S<sub>N</sub> 実行では対象外である。</p>
+      <p><code>mode="radial_absorption_1d"</code> では物理的な光線の軌跡がないため、<code>deposited_power</code> と <code>absorption_fraction</code> は通常どおり出力されるが <code>rays/</code> 系は空または未作成となる。なお <code>holo/</code> と <code>difference/</code> のグループは退役 <code>imc_ddmc</code> 系経路の専用出力であり、現行の FLD/S<sub>N</sub> 実行では対象外である。</p>
     </section>
 
     <section aria-labelledby="history">
-      <h2 id="history">履歴の全チャネル</h2>
-      <p><code>results/&lt;name&gt;_history.h5</code> は追記型の時系列である。ルートには <code>t</code>・<code>cycle</code>・<code>dt</code> の 3 本と、完了時に停止理由を記す属性 <code>termination_reason</code>（<code>"t_end"</code>|<code>"max_steps"</code>）が入る。</p>
+      <h2 id="history">履歴のチャネル</h2>
+      <p><code>results/&lt;name&gt;_history.h5</code> は追記型の時系列である。ルートには <code>t</code>・<code>cycle</code>・<code>dt</code> の 3 本が入る。停止理由は <code>run_info.json</code> の <code>termination_reason</code>（<code>"t_end_reached"</code>・<code>"max_steps_reached"</code> など）に記録される。</p>
 
       <h3>energy/ — エネルギー台帳（常時）</h3>
       <table class="quick-facts">
         <thead><tr><th>チャネル</th><th>内容</th></tr></thead>
         <tbody>
-          <tr><th><code>laser_incident</code> / <code>laser_deposited</code> / <code>laser_escaped</code></th><td>レーザーの入射・吸収・未吸収の累積 [erg]。入射と吸収の比が吸収率になる。</td></tr>
+          <tr><th><code>laser_incident</code> / <code>laser_deposited</code> / <code>laser_escaped</code></th><td>レーザーの入射・吸収・未吸収の累積 [erg]。吸収を入射で割った値が吸収率になる。</td></tr>
           <tr><th><code>marshak_in</code> / <code>radiation_escaped</code></th><td>Marshak 境界からの入射累積と、輻射の境界流出累積 [erg]（全群合算）。</td></tr>
           <tr><th><code>pdv_boundary</code></th><td>境界 PdV 仕事の累積 [erg]。</td></tr>
           <tr><th><code>kinetic</code> / <code>internal_electron</code> / <code>internal_ion</code> / <code>radiation_field</code></th><td>運動・電子内部・イオン内部・輻射場の各エネルギー合計 [erg]。</td></tr>
           <tr><th><code>numerical_loss</code></th><td>数値的喪失の累積 [erg]。</td></tr>
           <tr><th><code>floor_injected</code> / <code>safety_injected</code> / <code>redistribution_unresolved</code> / <code>solver_residual</code></th><td>床補正・安全補正・ALE 再分配未解決分・ソルバ残差の各注入量 [erg]（診断専用、保存誤差の分子には含めない）。</td></tr>
-          <tr><th><code>conservation_error</code></th><td>相対保存誤差 ε_budget（NUMERICS §10.2 の恒等式に基づく）。</td></tr>
-          <tr><th><code>E_volume_in</code> / <code>E_total</code> / <code>dE_total</code> / <code>E_denom</code></th><td>内部診断（境界体積仕事・全エネルギー・その差分・保存誤差分母）。</td></tr>
+          <tr><th><code>conservation_error</code></th><td>相対保存誤差 ε_budget（<code>docs/NUMERICS.md</code> §10.2 の恒等式に基づく）。</td></tr>
+          <tr><th><code>E_volume_in</code> / <code>E_total</code> / <code>dE_total</code> / <code>E_denom</code></th><td>内部診断（外部輻射体積源 <code>Radiation.volume_source_rate</code> の入力累積・全エネルギー・その差分・保存誤差分母）。</td></tr>
           <tr><th><code>*_step</code></th><td><code>marshak_in</code>・<code>pdv_boundary</code>・<code>numerical_loss</code>・<code>floor_injected</code>・<code>safety_injected</code>・<code>solver_residual</code>・<code>E_volume_in</code> の、そのステップの値 [erg]。元の名前の系列は run 全体の累積値である（2026-09-24 から。それ以前のファイルはステップの値を元の名前で持つので、<code>energy/marshak_in_step</code> の有無で見分ける）。</td></tr>
           <tr><th><code>phase_diagnostic/</code></th><td>optional（<code>Numerics.diagnostics.phase_resolved_energy=True</code>）。hydro 前後・ALE 後の物質エネルギーと、相ごとの内部/運動エネルギー差分。</td></tr>
-          <tr><th><code>ale_closure_audit/</code></th><td>optional（<code>Numerics.ale.ke_conservation_closure_audit=True</code>）。ALE の運動エネルギークロージャ監査（K/I の分解と残差、床カウンタ）。</td></tr>
+          <tr><th><code>ale_closure_audit/</code></th><td>optional（<code>Numerics.ale.ke_conservation_closure_audit=True</code>）。ALE の運動エネルギー閉包の監査（運動エネルギー K と内部エネルギー I への分解と残差、床補正のカウンタ）。</td></tr>
         </tbody>
       </table>
 
@@ -164,7 +163,7 @@
           <tr><th><code>plasma/Zbar_mean</code>, <code>Zbar_max</code></th><td>質量重み平均と最大の電離度。</td></tr>
           <tr><th><code>implosion/rho_peak</code></th><td>ピーク密度 [g/cm³]。最大圧縮の値と時刻はここから読む。</td></tr>
           <tr><th><code>implosion/rho_R</code>（+ optional <code>rho_R_hotspot_tracer</code>）</th><td>角度別の面密度 [g/cm²]（属性 <code>angles_deg</code>）。後方互換の角度別スカラー <code>rhoR_deg_&lt;角度&gt;</code> も併記される。</td></tr>
-          <tr><th><code>implosion/shell_radius_mean</code>, <code>shell_radius_min</code></th><td>シェルの平均・最小半径 [cm]（ρ &gt; 0.1×ρ_max のセルから算出）。</td></tr>
+          <tr><th><code>implosion/shell_radius_mean</code>, <code>shell_radius_min</code></th><td>シェルの平均・最小半径 [cm]（ρ &gt; 0.1×ρ_max のセルから算出）。1D では <code>shell_radius_min</code> も <code>shell_radius_mean</code> と同じ値である。</td></tr>
           <tr><th><code>implosion/center_temperature</code></th><td>中心電子温度 [eV]。</td></tr>
           <tr><th><code>modes/P_ell</code>, <code>ell_values</code></th><td>2D のみ。Legendre モード振幅と次数（後方互換の <code>a&lt;ℓ&gt;</code> スカラーも併記）。</td></tr>
           <tr><th><code>safety/clamp_count</code></th><td>温度・エネルギークランプの発生回数。</td></tr>
@@ -180,8 +179,8 @@
           <tr><th><code>commanded_power_total</code> / <code>unabsorbed_power_total</code> / <code>trace_unabsorbed_power_total</code></th><td>入射・未吸収（最終／トレース直後）の各パワー [erg/s]。</td></tr>
           <tr><th><code>absorption_efficiency_total</code> / <code>trace_absorption_efficiency_total</code></th><td>総吸収効率（最終／トレース直後）。</td></tr>
           <tr><th><code>transfer_blocked_power_total</code></th><td>受け皿がなく捨てられたパワー [erg/s]。</td></tr>
-          <tr><th><code>tail_closure_count</code> / <code>tail_closure_absorbed_power_total</code> / <code>critical_surface_hit_count</code></th><td>臨界面近傍の裾閉包（残存パワーを解析的に沈着させて光線を終端する処理 — <a href="../physics/laser.html">レーザー</a>参照）で終端したレイ数とその吸収パワー、臨界面で打ち切られたレイ数。1D の既定の特性曲線積分は臨界半径で光線を反射させるので、裾閉包は使わない。</td></tr>
-          <tr><th><code>ghost_corona_width</code></th><td>1D のゴーストコロナの幅 [cm]（無効なら 0）。</td></tr>
+          <tr><th><code>tail_closure_count</code> / <code>tail_closure_absorbed_power_total</code> / <code>critical_surface_hit_count</code></th><td>臨界面近傍の裾閉包（残存パワーを解析的に沈着させて光線を終端する処理 — <a href="../physics/laser.html">レーザー</a>参照）で終端した光線の数とその吸収パワー、臨界面で打ち切られた光線の数。1D の既定の特性曲線積分は臨界半径で光線を反射させるので、裾閉包は使わない。</td></tr>
+          <tr><th><code>ghost_corona_width</code></th><td>1D のゴーストコロナの幅 [cm]（無効なら 0）。ゴーストコロナ（<code>Laser.lasermesh.ghost_corona</code>）は、最外の物質セルの外側に光線追跡のためだけにレーザー格子上へ置く仮想の低密度コロナで、流体の状態は変えない。</td></tr>
           <tr><th><code>cbet_exchanged_power_total</code> / <code>cbet_ledger_residual_rel</code> / <code>cbet_iterations</code> / <code>cbet_clamp_count</code></th><td>CBET の交換パワー・台帳残差・反復数・クランプ数。CBET 無効でも 0 値で常に出力される。</td></tr>
           <tr><th><code>absorbed_fraction_beam_&lt;i&gt;</code></th><td>ビーム別の吸収配分重み（単一ビームでは常に 1）。</td></tr>
         </tbody>
@@ -195,16 +194,16 @@
           <tr><th><code>radiation/sn_*</code></th><td><code>mode="sn_transport"</code> の run だけ。外側反復（1D の線形不連続法は節点温度のニュートン、ほかは物質のピカール）と内側反復（線形不連続法は GMRES の Krylov 反復、ほかは源反復）のステップ内の合計、外側反復の終了残差、収束フラグ（<code>sn_outer_iterations</code>・<code>sn_inner_iterations</code>・<code>sn_outer_residual</code>・<code>sn_converged</code>）。</td></tr>
           <tr><th><code>diagnostics/icf/v1/</code></th><td><code>Numerics.diagnostics.icf.enabled</code>。シェル半径・厚さ・IFAR・収束比 CR。</td></tr>
           <tr><th><code>diagnostics/hotspot_gas/v1/</code></th><td><code>Numerics.diagnostics.hotspot_gas.enabled</code>。トレーサガスの質量・半径群（R50…R99、CR 系）・密度/圧力/断熱度・Te/Ti 統計・エネルギーと仕事プロキシ。</td></tr>
-          <tr><th><code>diagnostics/ale_provenance/v1/</code></th><td>ALE 来歴（違反・退避弁・幾何失敗のカウンタ、退避弁イベント表、最終 claim 属性）。</td></tr>
-          <tr><th><code>diagnostics/mesh_quality_min/v1/</code></th><td><code>Numerics.diagnostics.mesh_quality_min.enabled</code>。受理メッシュの最小コーナー/ガウス J・最小体積・最小辺長/高さ（初期比）と最大条件数。</td></tr>
-          <tr><th><code>diagnostics/ale_lambda_sweep/v1/</code></th><td>ALE 後退探索の λ 掃引診断（Gauss/corner J・体積の許容性プロファイル）。</td></tr>
-          <tr><th><code>diagnostics/radial_fourier_audit/v1/</code>・<code>_v2/v1/</code></th><td>演算子段ごとの動径フーリエ監査（v1: 最大振幅、v2: 固定 (m,j) の複素係数）。</td></tr>
-          <tr><th><code>diagnostics/dt_breakdown_history/</code></th><td><code>Numerics.diagnostics.dt_breakdown_history_enabled</code>。毎ステップの Δt 内訳と勝者（<a href="../overview/timestep.html">時間刻み制御</a>参照）。</td></tr>
+          <tr><th><code>diagnostics/ale_provenance/v1/</code></th><td>ALE 来歴。禁止された設定の違反、メッシュの救済処理（セルの緊急無効化や境界の局所修復など。発動回数は <code>escape_valve_activations</code>）、幾何の失敗の各カウンタと、救済処理のイベント表、run 終了時の状態を記す属性（<code>final_claim_level</code>・<code>reached_t_end</code> など）。</td></tr>
+          <tr><th><code>diagnostics/mesh_quality_min/v1/</code></th><td><code>Numerics.diagnostics.mesh_quality_min.enabled</code>。受理メッシュのコーナー/ガウス点のヤコビアン J の最小・最小体積・最小辺長/高さ（初期比）と最大条件数。</td></tr>
+          <tr><th><code>diagnostics/ale_lambda_sweep/v1/</code></th><td>ALE の後退探索で、リゾーンの移動量に掛ける割合 λ を掃引する診断（ガウス点/コーナーの J と体積の許容性プロファイル）。</td></tr>
+          <tr><th><code>diagnostics/radial_fourier_audit/v1/</code>・<code>_v2/v1/</code></th><td>演算子段ごとの動径フーリエ監査（v1: 最大振幅、v2: 固定した動径モード m と z 方向の行 j の複素係数）。</td></tr>
+          <tr><th><code>diagnostics/dt_breakdown_history/</code></th><td><code>Numerics.diagnostics.dt_breakdown_history_enabled</code>（既定で有効）。毎ステップの Δt 内訳と勝者（<a href="../overview/timestep.html">時間刻み制御</a>参照）。</td></tr>
           <tr><th><code>diagnostics/cfl_winner/</code>・<code>corner_bc_audit/v1/</code></th><td>音響 CFL 勝者セルの記録と、その勝者が特定コーナーハローに入った場合の境界値監査。</td></tr>
           <tr><th><code>diagnostics/fld_substage_audit/v1/</code></th><td>FLD サブステージの動径フーリエ監査（<code>Radiation.multigroup_diffusion.diagnostic_radial_fourier_substage_enabled</code>）。</td></tr>
           <tr><th><code>diagnostics/per_row_mass/</code>・<code>av_max/</code></th><td>dt 内訳診断の有効時。z 行ごとの質量・密度サマリと、最大人工粘性セルの記録。</td></tr>
           <tr><th><code>diagnostics/conservation/v1/</code></th><td><code>Numerics.diagnostics.conservation.enabled</code>。演算子別の保存残差 ε_E と前後エネルギー。</td></tr>
-          <tr><th><code>diagnostics/material_interface/v1/</code></th><td>PLIC 材料界面診断（属性・per-sample 統計・イベント表。V21 additive スキーマ）。</td></tr>
+          <tr><th><code>diagnostics/material_interface/v1/</code></th><td>PLIC（区分線形の界面再構成）による材料界面の診断（属性・サンプルごとの統計・イベント表。<code>schema_version</code> を変えずに追加したグループ）。</td></tr>
           <tr><th><code>mc/</code>・<code>difference/</code>・<code>holo/</code></th><td>退役 <code>imc_ddmc</code> 系の互換診断群。現行 FLD/S<sub>N</sub> の実行では意味を持たない。</td></tr>
         </tbody>
       </table>
@@ -225,9 +224,9 @@
           <tr><th><code>rng/</code></th><td>乱数状態（<code>rng_counter</code>・<code>global_id</code>）。</td></tr>
           <tr><th><code>time_state/</code></th><td><code>t</code>・<code>step</code>・<code>dt</code>・累積エネルギー項・<code>user_seed</code>。再開時の Δt はここから引き継がれる。</td></tr>
           <tr><th><code>output_state/</code></th><td>次回出力予定時刻（<code>t_next_plot</code>・<code>t_next_history</code>・<code>t_next_checkpoint</code>）。</td></tr>
-          <tr><th><code>hydro/cv_e</code>・<code>cv_i</code>・<code>cs</code>（1D）</th><td>状態方程式の閉包が作る比熱と音速。これがあるチェックポイントからの 1D の再開は閉包をかけ直さず、途中から再開した run が元の run とビット一致で続く（光線追跡の再利用 <code>Laser.raytrace_skip_config.enabled=True</code> の run を除く）。</td></tr>
+          <tr><th><code>hydro/cv_e</code>・<code>cv_i</code>・<code>cs</code>（1D）</th><td>状態方程式の閉包が作る比熱と音速。これらがあるチェックポイントからの 1D の再開は閉包をかけ直さず、途中から再開した run が元の run とビット一致で続く（光線追跡の再利用 <code>Laser.raytrace_skip_config.enabled=True</code> の run を除く）。</td></tr>
           <tr><th><code>hydro_flags/cell_is_void</code>（1D）</th><td>空セル（<code>is_void</code> の材料のセル）の印。</td></tr>
-          <tr><th><code>conduction_state/</code></th><td>熱伝導ソルバーの run 全体の累積統計（反復数・残差・条件数の最大など）。</td></tr>
+          <tr><th><code>conduction_state/</code></th><td>熱伝導ソルバの run 全体の累積統計（反復数・残差・条件数の最大など）。</td></tr>
           <tr><th><code>burn_state/specific_inventory</code></th><td>燃焼の比インベントリ \(Y_s\) [1/g]（セルごとに D・T・He3・He4・p の順）。再開は、スナップショットの数密度 <code>hydro/burn_n_*</code> を密度で割った値ではなくこれを使う（2026-09-26 から）。</td></tr>
           <tr><th><code>radiation_sn/</code>（1D S<sub>N</sub>）</th><td>線形不連続法の角度分布（<code>psi_prev</code>・<code>psi_sd_prev</code>）とセル内の電子エネルギーの差（<code>ee_node_offset</code>）。無いチェックポイントからは等方・一様で始める。</td></tr>
           <tr><th><code>particles/</code></th><td>退役 Monte Carlo 経路の粒子プール（現行 FLD/S<sub>N</sub> では対象外）。</td></tr>
@@ -238,7 +237,7 @@
 
     <section aria-labelledby="provenance">
       <h2 id="provenance">来歴: frozen JSON・run_info・ログ</h2>
-      <p><code>config/&lt;name&gt;_frozen.json</code> は、既定値を解決した設定の全体、初期化時に表へ変換した関数の情報、その元データのハッシュの記録である。「入力したつもりの値」ではなく実行が実際に受け取った構成を監査する一次資料であり、再現・比較の際は deck とともに保管する。<code>run_info.json</code> は実行の要約、<code>log/</code> には実行ログが残る。「設定が効いたか怪しい」ときは frozen JSON → log の warning の順に見るのが早い。</p>
+      <p><code>config/&lt;name&gt;_frozen.json</code> は、既定値を解決した設定の全体と、初期化時に表へ変換した関数の要約（関数名、ソースコードのハッシュ、表の範囲・点数・最大値・積分値）の記録である。「入力したつもりの値」ではなく実行が実際に受け取った構成を監査する一次資料であり、再現・比較の際はデッキとともに保管する。<code>run_info.json</code> は実行の要約、<code>log/</code> には実行ログが残る。「設定が効いたか怪しい」ときは frozen JSON → log の warning の順に見るのが早い。</p>
     </section>
 
     <section aria-labelledby="analysis-tools">
@@ -246,7 +245,7 @@
       <p>構造の確認は HDF5 標準ツールで足りる。</p>
       <pre><code>h5ls  outputs/&lt;name&gt;/results/&lt;name&gt;_0010.h5          # グループ一覧
 h5dump -H outputs/&lt;name&gt;/results/&lt;name&gt;_history.h5  # ヘッダ構造</code></pre>
-      <p>最短の可視化は付属の <strong>tenryu_plot</strong>（<code>tools/</code>）である。サブコマンドに <code>profile</code>（空間プロファイル）・<code>history</code>（時系列）・<code>spacetime</code>・<code>summary</code>・<code>compare</code>・<code>spectrum</code> などがある。</p>
+      <p>最短の可視化は付属の <code>tenryu_plot</code>（<code>tools/</code>）である。サブコマンドに <code>profile</code>（空間プロファイル）・<code>history</code>（時系列）・<code>spacetime</code>・<code>summary</code>・<code>compare</code>・<code>spectrum</code> などがある。</p>
       <pre><code>python3 -m tools.tenryu_plot --help                  # 一覧
 python3 -m tools.tenryu_plot profile outputs/&lt;name&gt;  # 空間プロファイル
 python3 -m tools.tenryu_plot history outputs/&lt;name&gt;  # 時系列</code></pre>
