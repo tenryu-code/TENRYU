@@ -90,8 +90,8 @@ b_g(T)=\frac{15}{\pi^4}\int_{x_{g-1}}^{x_g}\frac{x^3}{\exp(x)-1}dx,\quad x=E/T
 **計算方法（v1.0既定）**
 - namelistで `planck_fraction.method="compute"` のとき：
   - 初期化時に温度グリッド \(\{T_k\}\) を自動生成し、各Tで数値積分して \(b_g(T_k)\) をテーブル化
-  - 実行中は \(b_g(T)\) を線形補間（TはeV）
-- `method="tabulate"` のときはユーザテーブルを読む（検証用途）
+  - 実行中は表の温度の間を §6.1 の方法で補間する（累積分率 \(C_g\) または裾の和 \(D_g=1-C_g\) の対数を \(\ln T\) の 3 次 Hermite 多項式で補間し、\(b_g\) を隣り合う値の差とする。T は eV。2026-09-23 まで \(b_g(T)\) を線形補間していた）
+- `method="tabulate"`（ユーザテーブルを読む設計、検証用途）は未実装で、WARNING を出して `"compute"` と同じ計算表を使う
 
 **数値積分の安定評価規約**（被積分関数 \(f(x) = x^3/(\exp(x)-1)\), \(x = E/T\)）：
 - \(x > 500\)：\(f(x) \approx x^3 \exp(-x)\) を使用（`exp(x)` は `x > 709` で double overflow）
@@ -345,9 +345,10 @@ false テンプレート実体はテキスト同一で bit 不変）。消費先
 (iii) SNB の Z 補間因子: 同上、(iv) §3.1.13 Braginskii イオン粘性:
 \(Z^4\to\bar Z^4 r_4\)。クーロン対数は全消費先で legacy 単一種形を保持
 （対数的に弱い）。レーザー IB は §5.4.5(a) の `zeff_model`
-（既定 "auto" = 表があれば table、なければ off）。制約 (v1): 1D_SPH 限定・
-単一材料構成必須（volFrac 混合セルに per-material 帰属が無いため）・
-提供材料はちょうど 1 つ（すべて config 構築時に検証、表が無い run は無検証）。
+（既定 "auto"。構築時の解決規則は §5.4.5(a)）。制約: 1D 限定（config 構築時に検証、表が無い run は無検証）。
+材料が複数あるデッキでは各セルがその材料の表を使い、表を持たない材料のセルは \(r_2=r_4=1\)
+（`zmoment_fill_by_material_kernel`、2026-09-24。それまでは単一材料構成と、表を持つ材料が
+ちょうど 1 つであることを要求していた）。
 CBET の IAW 減衰は多イオン種の行列問題でモーメント置換の対象外（将来課題）、
 hot-e 停止能は \(n_e\) 支配で対象外、輻射不透明度はテーブル由来で構成的に正しい。
 
@@ -1760,7 +1761,7 @@ Hydro演算子 \(\mathcal{H}\) の適用をセル単位で制御する。
   \text{node\_active}_j = \bigvee_{c \in \mathcal{N}(j)} \text{hydro\_active}_c
   \]
   ここで \(\mathcal{N}(j)\) はノード \(j\) に隣接するセル集合。
-- **非活性セルの処理**：`hydro_active_c = false` のセルは圧力・人工粘性による力の寄与をゼロとする。座標・速度は固定。
+- **非活性セルの処理**：`hydro_active_c = false` のセルは圧力・人工粘性による力の寄与をゼロとする。ノードが動くかどうかは下記の `hydro.T_start_inactive_cells` で決まる（既定の `"passive_fill"` では、活性セルに隣接するノードは動き、その先の非活性ノード列も平行移動する）。
 - **Δt への影響**：CFL条件（§2.2 (a)）は活性セルのみを対象とする。全セルが非活性の場合は \(\Delta t_{hydro} = \infty\)（Δt制御から除外）。
 - **GPU実装**：フラグ更新は単純なCUDAカーネル（1スレッド/セル）で行い、非活性セルは `if (!hydro_active[c]) { if (Te[c] >= T_start) hydro_active[c] = 1; }` のみ。活性セルはカーネル内で即座に `return` する。
 - **非活性セルの扱い（`hydro.T_start_inactive_cells`、2026-09-14 追加）**：

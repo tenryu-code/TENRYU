@@ -4,14 +4,14 @@
 **authoritative source は `docs/SPECIFICATION.md` §7.2 / §7.3 / §7.4** であり、ここは要約と確認手順を提供します。
 
 ## 1. 出力ファイル
-- snapshot: `<case>_NNNNNN.h5`
-- history: `<case>_history.h5`
-- checkpoint: `<case>_ckpt_NNNNNN_rNNNN.h5`
+- snapshot: `results/<case>_NNNN.h5`
+- history: `results/<case>_history.h5`
+- checkpoint: `checkpoints/<case>_ckpt_NNNN.h5`（MPI 実行でも rank 0 が 1 つのファイルに書く。旧形式のランク別ファイル `<case>_ckpt_NNNNNN_rNNNN.h5` もリスタートで読み込める）
 - run 開始時の付帯ファイル: `run_info.json`、`config/<case>_frozen.json`、`mesh_requirement.json`（1D かつ Laser 有効のとき。物理由来の初期メッシュ分解能要求の見積もりと判定 — NUMERICS §3.1.0c、schema `tenryu.mesh_requirement.v1`: `applicable`/`reason`、`params`、`inputs`（波長・幾何・R0・面積・尖頭強度・fluence・アブレータの ρ_c）、`ablation`（アブレート面密度質量・質量割合・形成時刻・天井プロファイル）、`scale_length_track`、`shocks`、`layers`、`bands_recommended`、`requirement_check`（則ごとの違反数・最悪セル））
 
-`NNNNNN` は cycle 番号（6桁ゼロ埋め）です。
+パスは `Output.directory` からの相対です（`run_info.json` と `mesh_requirement.json` は `Output.directory` 直下、`<case>_frozen.json` は `config/`）。`NNNN` はスナップショットとチェックポイントそれぞれの 4 桁ゼロ埋めの通し番号で（0 から数え、出力先に既存のファイルがあれば、再開かどうかによらずその最大番号の次から続ける）、cycle 番号ではありません。cycle 番号はルート属性 `cycle` にあります。停止理由は `run_info.json` の `termination_reason` に記録されます。
 
-## 2. Snapshot (`<case>_NNNNNN.h5`)
+## 2. Snapshot (`<case>_NNNN.h5`)
 
 主な構成:
 - `/` attrs: `t`, `cycle`, `geometry`, `n_cells`, `n_nodes`, `n_groups`, `n_materials`, `schema_version`; 1D files also carry `geometry_1d` (`"spherical"` | `"cylindrical"` | `"planar"`, 2026-09-24): `geometry` is `Main.dimension`, which reads `1D_SPH` for every `Mesh.geometry_1d`. Readers that do not know the attribute are unaffected (additive, no `schema_version` change).
@@ -20,7 +20,7 @@
 - `/hydro`: `rho`, `Te`, `Ti`, `ee`, `ei`, `Pe`, `Pi`, `Qvisc`, `mass`, `vol`, `zbar`, `volFrac`; burn-enabled runs add `burn_rate`, `burn_Q_e`, `burn_Q_i`, `burn_eps_cum`, `burn_n_{D,T,He3,He4,p}` and, in 1D, `burn_neutron_cum` (cumulative number of neutrons born in the cell, DD and DT neutron branches, 2026-09-26 additive; the birth distribution of the yield, while `burn_eps_cum` follows where the charged products deposit)
 - `/diagnostics/areal_density/v1` (areal density有効時): `angles_deg`, `rhoR`, optional `rhoR_hotspot_tracer`, reserved optional `rhoR_fuel_tracer`
 - `/diagnostics/hotspot_gas/v1` (hotspot gas有効時): `hotspot_Te_*`, `hotspot_Ti_valid`, 2T-only `hotspot_Ti_*`, `hotspot_energy_*`, `hotspot_work_proxy_*`, `hotspot_work_definition`
-- `/radiation`: `energy_density`, `rad_dep`, `rad_emit`, `deposited_power`, `diag_rad_E_pre`, `diag_rad_E_post`, `diag_rad_emission_at_Tn`, `diag_rad_emission_at_Tnp1`, `diag_rad_absorption`, `diag_clip_energy`, `diag_clip_full_deficit`, `diag_chi_opacity`, `diag_F_first_moment`, `diag_E_star_flux`, `diag_stream_theta`, `diag_ap_alpha_face`, `ddmc_flag`（退役 imc_ddmc 経路のみ有意）, `boundary_flux`, `momentum_dep`
+- `/radiation`: `energy_density`, `rad_dep`, `rad_emit`, `deposited_power`, `diag_rad_E_pre`, `diag_rad_E_post`, `diag_rad_emission_at_Tn`, `diag_rad_emission_at_Tnp1`, `diag_rad_absorption`, `diag_clip_energy`, `diag_clip_full_deficit`, `diag_chi_opacity`, `diag_F_first_moment`, `diag_E_star_flux`, `diag_stream_theta`, `diag_ap_alpha_face`, `ddmc_flag`（退役 imc_ddmc 経路のみ有意）
 - `/holo` (HOLO selector有効時 — 退役 imc_ddmc 系経路): `E_LO`, `consistency_source`, `rad_dep_LO`, `rad_emit_LO`, `Prr_HO`, `chi`, `Prr_coverage`, `core_mask`, `prev_core_mask`, `hold_count`, `dwell_count`, `tau_R`, `reduced_flux`, `mass_q`
 - `/difference` (difference有効時 — 退役 imc_ddmc 系経路): `W`, `E_ref`, `residual_energy_density`
 - `/laser` (laser有効時):
@@ -49,14 +49,14 @@
 - `/implosion/*` (`rho_R`, optional `rho_R_hotspot_tracer`, per-angle scalar aliases)
 - `/diagnostics/hotspot_gas/v1/*` (hotspot gas有効時; same stagnation Te/Ti and work-proxy fields as snapshot, plus existing hotspot compression summaries)
 - `/modes/*` (2D)
-- `/mc/*`
-- `/holo/*` (HOLO diagnostics: `n_core_cells`, `E_LO_total`, LO boundary/source balance terms, `particle_net_source_core`, `lo_particle_source_mismatch`, `Prr_coverage`, `chi_min`, `chi_mean`, `chi_max`)
+- `/mc/*`（退役した imc_ddmc 経路の列。列の有無を固定するため常に書き、現行の FLD・S_N 経路では 0）
+- `/holo/*` (退役した imc_ddmc 系経路の HOLO diagnostics。常に書き、現行の経路では 0: `n_core_cells`, `E_LO_total`, LO boundary/source balance terms, `particle_net_source_core`, `lo_particle_source_mismatch`, `Prr_coverage`, `chi_min`, `chi_mean`, `chi_max`)
 - `/laser/cbet_*`（CBET v1 診断スカラー、2026-07-07 追加 — additive・後方互換）:
   `cbet_exchanged_power_total` [erg/s]、`cbet_ledger_residual_rel` [-]、
   `cbet_iterations` [count]、`cbet_clamp_count` [count]。`Laser.cbet.enable=false`
   （既定）でも 0 値で出力される（列の有無は設定に依存しない）。
 
-## 4. Checkpoint (`<case>_ckpt_NNNNNN_rNNNN.h5`)
+## 4. Checkpoint (`<case>_ckpt_NNNN.h5`)
 
 snapshot内容に加えて以下を保存:
 - `/hydro_flags/hydro_active`
@@ -73,11 +73,11 @@ snapshot内容に加えて以下を保存:
 
 `frozen_config` は namelist 凍結JSON（`tenryu freeze` と同系）です。  
 `metadata/frozen_config` には補助attrsを持ちます:
-- `git_hash`
+- `git_hash`（現在は常に `"unknown"`）
 - `build_type`
-- `cuda_arch`
+- `cuda_arch`（現在は常に `"unknown"`）
 - `gpu_name`
-- `n_ranks`
+- `n_ranks`（現在は常に 1）
 - `rng_seed`
 
 ## 6. CLI確認例
@@ -94,7 +94,7 @@ h5ls <file>.h5
 
 チェックポイントの粒子配列確認:
 ```bash
-h5ls <case>_ckpt_000100_r0000.h5/particles
+h5ls checkpoints/<case>_ckpt_0001.h5/particles
 ```
 
 ## 7. リスタート時の互換規約
@@ -111,24 +111,24 @@ h5ls <case>_ckpt_000100_r0000.h5/particles
 
 凍結項目（dimension/mesh/materials/groups/seed/group_bounds）が不一致なら再開不可です。
 
-## 8. V21 schema (Stage 30 additive)
+## 8. Material-interface diagnostics group (additive)
 
-Stage 30 adds a path-versioned material-interface diagnostics group without
-bumping root `kSchemaVersion`; it remains `schema_version = 1`.
+The history file carries a path-versioned material-interface diagnostics group
+added without bumping root `kSchemaVersion`; files keep `schema_version = 1`.
 
-New history group:
+History group:
 - `/diagnostics/material_interface/v1/`
-- Wave A attributes: `plic_reconstruction_engine_version`,
+- Attributes: `plic_reconstruction_engine_version`,
   `plic_normal_estimator`, `t0_volume_cut_method`, `plic_enabled`,
   `plic_schema_version`, `plic_reconstruction_method`
-- Wave D per-sample datasets: `time_s`, `step`,
+- Per-sample datasets: `time_s`, `step`,
   `interface_cells_observed`, `interface_reconstruction_attempt_count`,
   `interface_reconstruction_success_count`, `plic_max_eta_E_observed`,
   `plic_max_volume_fraction_residual_observed`, and
   `plic_min_grad_F_observed`.
-- Wave D matrix dataset: `class_d_runtime_fires_matrix` with shape
+- Matrix dataset: `class_d_runtime_fires_matrix` with shape
   `[N,3,3]`, indexed by `[sample, case_id-1, severity]`.
-- Wave D event datasets under `/diagnostics/material_interface/v1/plic_events/`:
+- Event datasets under `/diagnostics/material_interface/v1/plic_events/`:
   `case_id`, `severity`, `cell_idx`, `i`, `j`, `eta_E`,
   `grad_F_magnitude`, `severity_metric_kind`, `severity_metric_value`,
   `fallback_used`, `prev_normal_invalidated`, `step`, and `time`.
@@ -136,15 +136,15 @@ New history group:
   rows are replaced for that call by aggregate rows under
   `/diagnostics/material_interface/v1/plic_events_summary/` with `case_id`,
   `severity`, `count`, `step`, and `time`.
-- Wave D final attributes: `final_class_d_aggregate` and
+- Final attributes: `final_class_d_aggregate` and
   `plic_remap_fallback_engaged`.
 - Optional `/per_cell_state/` is written when
   `material_interface_per_cell_state` requests it.
 
 Migration rules:
-- V20 reader handles V21 file: ignore `/diagnostics/material_interface/v1/`.
-- V21 reader handles V20 file: missing group means PLIC disabled.
-- V21 reader handles V21 file with PLIC disabled: group is omitted and treated
-  the same as a V20 file.
-- V21 reader handles a `production_comparable` final claim with missing
-  material-interface group as inconsistent.
+- A reader that predates the group ignores `/diagnostics/material_interface/v1/`.
+- A reader that knows the group treats a missing group as PLIC disabled.
+- With PLIC disabled the group is omitted, so the file reads like one written
+  before the group existed.
+- A reader that knows the group treats a `production_comparable` final claim
+  without the material-interface group as inconsistent.

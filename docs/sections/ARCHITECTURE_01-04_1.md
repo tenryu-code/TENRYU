@@ -37,7 +37,7 @@
 | CUDA Toolkit | **12.0+** | `atomicAdd(double*)` は compute capability 6.0+ で必須。12.0以降の CUDA driver API を想定 |
 | C++ compiler | **C++20対応**（GCC 12+, Clang 15+, NVCC host compiler） | concepts, `<format>` は使用しない（fmt代替） |
 | MPI | **MPI-3.1+** | `MPI_Iallreduce`, `MPI_Neighbor_alltoallv` を使用。GPU-aware MPI 推奨 |
-| HDF5 | **1.12+** | 並列HDF5（`--enable-parallel`）推奨。collective I/O に対応 |
+| HDF5 | **1.12+** | 逐次版・並列版のどちらでもよい（出力は rank 0 だけが書き、MPI-IO・collective I/O は使わない。並列版を検出すると MPI をリンクする） |
 | Python3 + 開発ヘッダ | **3.10+** | namelist埋め込み用 |
 | **pybind11** | **≥ 2.11** | Python namelist → C++ Config 変換。ヘッダオンリー |
 | fmt | 9.0+ | ログフォーマット |
@@ -305,7 +305,7 @@ struct Config {
         // 注: SPECIFICATION §9.1 の次元依存既定: 1D_SPH="lagrangian", 2D_RZ="ale"
         // init時に Config::apply_dimension_defaults(dim) で上書きされる
         struct RezoningConfig {
-            bool enabled = true;             // 2D_RZ ALE rezoning有効化（motion="ale"時のみ使用）
+            bool enabled = false;            // 2D_RZ ALE rezoning有効化（motion="ale"時のみ使用。既定は無効）
             int every_n_steps = 5;           // rezoning頻度 [cycles]（SPECIFICATION §6.4.2 既定 5）
             int warmup_steps = 0;            // reserved guard [cycles]（SPECIFICATION §6.4.2 既定 0）
             double relaxation = 0.2;         // reserved relaxation factor
@@ -573,7 +573,7 @@ struct Config {
         } raytrace;
         // --- raytrace_skip ---（SPECIFICATION §6.4.6 raytrace_skip dict）
         struct RaytraceSkipConfig {
-            bool   enabled = true;
+            bool   enabled = false;        // 2026-08-07 に既定を無効化（NUMERICS §5.9.5）
             double threshold = 0.01;       // [無次元] 最大相対変化量閾値（NUMERICS §5.9）
             int    max_consecutive = 10;   // 最大連続スキップ数
             std::string norm = "max_relative"; // "max_relative" | "l2_relative"

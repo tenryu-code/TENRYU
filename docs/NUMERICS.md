@@ -88,8 +88,8 @@ b_g(T)=\frac{15}{\pi^4}\int_{x_{g-1}}^{x_g}\frac{x^3}{\exp(x)-1}dx,\quad x=E/T
 **計算方法（v1.0既定）**
 - namelistで `planck_fraction.method="compute"` のとき：
   - 初期化時に温度グリッド \(\{T_k\}\) を自動生成し、各Tで数値積分して \(b_g(T_k)\) をテーブル化
-  - 実行中は \(b_g(T)\) を線形補間（TはeV）
-- `method="tabulate"` のときはユーザテーブルを読む（検証用途）
+  - 実行中は表の温度の間を §6.1 の方法で補間する（累積分率 \(C_g\) または裾の和 \(D_g=1-C_g\) の対数を \(\ln T\) の 3 次 Hermite 多項式で補間し、\(b_g\) を隣り合う値の差とする。T は eV。2026-09-23 まで \(b_g(T)\) を線形補間していた）
+- `method="tabulate"`（ユーザテーブルを読む設計、検証用途）は未実装で、WARNING を出して `"compute"` と同じ計算表を使う
 
 **数値積分の安定評価規約**（被積分関数 \(f(x) = x^3/(\exp(x)-1)\), \(x = E/T\)）：
 - \(x > 500\)：\(f(x) \approx x^3 \exp(-x)\) を使用（`exp(x)` は `x > 709` で double overflow）
@@ -343,9 +343,10 @@ false テンプレート実体はテキスト同一で bit 不変）。消費先
 (iii) SNB の Z 補間因子: 同上、(iv) §3.1.13 Braginskii イオン粘性:
 \(Z^4\to\bar Z^4 r_4\)。クーロン対数は全消費先で legacy 単一種形を保持
 （対数的に弱い）。レーザー IB は §5.4.5(a) の `zeff_model`
-（既定 "auto" = 表があれば table、なければ off）。制約 (v1): 1D_SPH 限定・
-単一材料構成必須（volFrac 混合セルに per-material 帰属が無いため）・
-提供材料はちょうど 1 つ（すべて config 構築時に検証、表が無い run は無検証）。
+（既定 "auto"。構築時の解決規則は §5.4.5(a)）。制約: 1D 限定（config 構築時に検証、表が無い run は無検証）。
+材料が複数あるデッキでは各セルがその材料の表を使い、表を持たない材料のセルは \(r_2=r_4=1\)
+（`zmoment_fill_by_material_kernel`、2026-09-24。それまでは単一材料構成と、表を持つ材料が
+ちょうど 1 つであることを要求していた）。
 CBET の IAW 減衰は多イオン種の行列問題でモーメント置換の対象外（将来課題）、
 hot-e 停止能は \(n_e\) 支配で対象外、輻射不透明度はテーブル由来で構成的に正しい。
 
@@ -1758,7 +1759,7 @@ Hydro演算子 \(\mathcal{H}\) の適用をセル単位で制御する。
   \text{node\_active}_j = \bigvee_{c \in \mathcal{N}(j)} \text{hydro\_active}_c
   \]
   ここで \(\mathcal{N}(j)\) はノード \(j\) に隣接するセル集合。
-- **非活性セルの処理**：`hydro_active_c = false` のセルは圧力・人工粘性による力の寄与をゼロとする。座標・速度は固定。
+- **非活性セルの処理**：`hydro_active_c = false` のセルは圧力・人工粘性による力の寄与をゼロとする。ノードが動くかどうかは下記の `hydro.T_start_inactive_cells` で決まる（既定の `"passive_fill"` では、活性セルに隣接するノードは動き、その先の非活性ノード列も平行移動する）。
 - **Δt への影響**：CFL条件（§2.2 (a)）は活性セルのみを対象とする。全セルが非活性の場合は \(\Delta t_{hydro} = \infty\)（Δt制御から除外）。
 - **GPU実装**：フラグ更新は単純なCUDAカーネル（1スレッド/セル）で行い、非活性セルは `if (!hydro_active[c]) { if (Te[c] >= T_start) hydro_active[c] = 1; }` のみ。活性セルはカーネル内で即座に `return` する。
 - **非活性セルの扱い（`hydro.T_start_inactive_cells`、2026-09-14 追加）**：
@@ -15903,6 +15904,16 @@ ctest `C1 Zel'dovich-Raizer thermal-wave gate is production-level` は
 \(T_e\)・\(P_e\) を導出し、ドライバは伝導の増分を \(e_e\) に再計上しない（2026-09-23 是正 — 旧実装は
 エネルギー主体の表 EOS でドライバが \(c_{v,old}\Delta T_e\) を重ねて加え、伝導エネルギーを二重に計上していた）。
 
+実行される 2D RZ の経路では、材料 \(m\) の係数をセルごとに
+\[
+\kappa_{c,m}=\alpha_{c,m}\,\kappa_{eff}\!\left(\rho_{c,m},T_{e,c,m},\bar Z_m\right)
+\]
+として求め（\(\kappa_{eff}\) は下の 1D と同じ flux limiter 付きの形。limiter の \(|\nabla T_e|\) はセル平均の \(T_e\) からセルの 4 頂点で求めた勾配の大きさの平均、平均自由行程による制限の長さはセル面積の平方根）、
+材料ごとの Kershaw 9 点ステンシル（§4.3）の対称な面の対の電力を材料ごとに \(E_{e,c,m}\) へ加える。
+STS の安定性評価には \(\sum_m\kappa_{c,m}\) を使う。以下、「Dirichlet/source conduction boundary」の段落の前までの式は
+1D の材料別カーネル（`compute_spitzer_deff_1d_kernel_per_material`・`conduction_1d_sts_stage_kernel_per_material`）
+のもので、1D は上記のとおり ConfigError のため現在は実行されない。
+
 1D face \(f=(L,R)\) では、材料 \(m\) の面体積率を
 \[
 \alpha_{f,m}=\frac{1}{2}\left(\alpha_{L,m}+\alpha_{R,m}\right)
@@ -16190,8 +16201,9 @@ s = \max\!\left(1,\;\left\lceil \sqrt{2\,\frac{\Delta t}{\Delta t_{exp}}} \right
 > 素朴法の \(N_{sub} = 340\) に対し、STS は \(s = 27\) ステージで済む（約13倍の高速化）。
 
 **ステージ数上限**：\(s_{max} = 40\)（既定、SPECIFICATION §6.4.7）。
-\(s > s_{max}\) の場合は \(s = s_{max}\) にクランプし、警告を出力する。
-§2.2 の \(\Delta t_{cond,sts}\) が正しく設定されていれば通常は発生しない。
+\(\Delta t\) が \(\Delta t_{sts,max}=\eta\,s_{max}(s_{max}+1)/2\cdot\Delta t_{exp}\)（\(\eta\) = `sts_subcycle_eta`、既定 0.9）を超える場合は、
+\(\Delta t\) を \(n_{sub}=\lceil\Delta t/\Delta t_{sts,max}\rceil\) 個の等幅のサブステップに分け、各サブステップを \(s_{max}\) 以下の
+ステージで進める（下の擬似コード）。§2.2 の \(\Delta t_{cond,sts}\) が正しく設定されていれば通常は \(n_{sub}=1\) である。
 
 **STSサブステップ幅**（Chebyshev根分布）：
 \[
@@ -17740,8 +17752,10 @@ v1.0 では臨界反射、ポンデロモーティブ力、非線形吸収を扱
 
 HELIOS ベンチマーク吸収率監査（2026-07-29/30、
 `benchmarks/helios/comparison_LTE/ANALYSIS_laser_algorithm_comparison.md`
-追補 2/3）を受けて導入した 4 つの拡張。(a)〜(b) および (d) は
+追補 2/3）を受けて導入した 4 つの拡張。(b) と (d) は
 namelist opt-in（`Laser.ib` / `Laser.ra`、SPECIFICATION §6.4）で既定 OFF。
+(a) は `ib.zeff_model="auto"` が既定で、構築時に下記 (a) の規則で解決する（電離段分率の表も
+多種の組成も無い材料では OFF と同じ）。
 (c) Langdon は `ib.langdon_model="auto"` が既定で、`laser.enabled=True`、
 `Main.dimension="1D_SPH"`、`laser.mode!="radial_absorption_1d"`、ビーム
 リストが非空、かつ全ビームの有効な (profile model, w0, m) が共通で
@@ -17772,7 +17786,7 @@ Z_{\rm eff}=\frac{\sum_s n_s Z_s^2}{\sum_s n_s Z_s}
 - `"table"`: TMAT 材料の `/ionization` 電離段分率（下記）から縮約した
   \(Z_{\rm eff}/\bar Z\) 表（(nᵢ, T) 格子、[1,10] クランプ）を
   デバイス常駐させ、ノードごとに log-log 双線形（端クランプ）で評価。
-  nᵢ = n̂·n_crit/\(\bar Z\)。表提供材料が 1 つのときのみ有効。
+  nᵢ = n̂·n_crit/\(\bar Z\)。材料ごとの解決（下記）を使わないデッキでは、表を持つ材料がちょうど 1 つのときだけ有効（それ以外は ConfigError）。
 - `"auto"`（既定、構築時解決、2026-09-23 改訂）: 電離段分率表があれば `"table"`、
   `ib.species` の指定があれば `"sequential_strip"`、全ての非 void 材料が同じ多種組成
   （TMAT `/material` の Z と数割合）を持てばその組成を `ib.species` として
@@ -18818,6 +18832,7 @@ ICFシミュレーションでは、プラズマ条件（ρ, T_e, Z̄）は流�
 
 `radial_absorption_1d` は raytrace skip の対象外であり、毎回 §5.4a の 1D serial 積分を実行する。
 このモードに入ると既存の raytrace skip cache は無効化され、正規化吸収分率の再構成は使わない。
+熱い電子モデル（`Laser.hot_electron.enable=True`）が有効なときと、2D の CBET 有効時（`laser.mode="raytrace_3d"`）も Skip しない。
 
 #### 5.9.2 変化メトリクス
 レーザーオペレータが呼ばれるたびに、キャッシュ時の状態との変化量 δ を計算する。
@@ -18831,7 +18846,7 @@ ICFシミュレーションでは、プラズマ条件（ρ, T_e, Z̄）は流�
 \right\}
 \]
 ここで分母のフロアは物理フロア値を使用する：
-\(\rho_{floor}\)（Numerics.density\_floor）、\(T_{e,floor}\)（Numerics.temperature\_floor）、
+\(\rho_{floor}\)（`Mesh.floors.rho_floor_gcc`）、\(T_{e,floor}\)（`Mesh.floors.Te_floor_eV`）、
 \(\bar{Z}_{floor} = 10^{-2}\)（完全中性の近傍で 0 割りを回避）。
 これにより低密度・低温・低電離領域で分母がゼロ近傍になる場合の数値不安定性を防止する。
 
@@ -18904,7 +18919,7 @@ CBET（§5.10）有効時は追加の無効化条件がある：いずれかの�
 | `threshold` | double | 0.01 | 最大相対変化量（1%） |
 | `max_consecutive` | int | 10 | 強制再計算までの最大連続スキップ数 |
 | `norm` | string | "max_relative" | "max_relative" または "l2_relative" |
-| `crit_guard` | double | 0.01 | 臨界近傍ガード：n̂ > n̂\_margin − crit\_guard で再計算 |
+| `crit_guard` | double | 0.01 | 臨界帯の幅：キャッシュ時と現在の n̂ が n̂\_margin − crit\_guard を横断したら（両向き）再計算（§5.9.4） |
 
 #### 5.9.6 エネルギー保存への影響
 パワースケーリングは入射パワーと吸収パワーの比例関係（\(\hat{f}\) の定義）を保存する。
@@ -27252,7 +27267,7 @@ DDMCの運動量沈着（§7.8.2）と合算して出力する。
 \Delta E_{total} = \Delta E_{int,e} + \Delta E_{int,i} + \Delta E_{kin} + \Delta E_{rad}
 \]
 \[
-= E_{laser,in} - E_{laser,esc} + E_{Marshak,in} - E_{rad,esc} - E_{pdV}^{boundary} - E_{numerical\_loss} + E_{floor} + E_{safety} + E_{redistribution\_unresolved} + E_{solver}
+= E_{laser,in} - E_{laser,esc} - E_{CBET,IAW} + E_{Marshak,in} + E_{volume,in} + E_{burn,in} - E_{rad,esc} - E_{pdV}^{boundary} - E_{numerical\_loss} + E_{floor} + E_{safety} + E_{redistribution\_unresolved} + E_{solver} + E_{rad,mesh\_adv}
 \]
 
 各項の定義（全項 [erg] 単位）：
@@ -27262,11 +27277,15 @@ DDMCの運動量沈着（§7.8.2）と合算して出力する。
 | \(\Delta E_{int,e}\) | 電子内部エネルギー変化 | \(\sum_i \rho_i\,\Delta e_{e,i}\,V_i\) |
 | \(\Delta E_{int,i}\) | イオン内部エネルギー変化 | \(\sum_i \rho_i\,\Delta e_{i,i}\,V_i\)（人工粘性散逸を含む） |
 | \(\Delta E_{kin}\) | 運動エネルギー変化 | 1D は \(\sum_i \frac{1}{2}m_i u_i^2\)（\(u_i=\frac{1}{2}(v_i+v_{i+1})\)）の差分。2D RZ は §3.3 Phase 12 と同じ corner-mass nodal kinetic energy \(\sum_c K_c^{diag}\) の差分 |
-| \(\Delta E_{rad}\) | 放射場エネルギー変化 | \(E_{census}^{n+1} - E_{census}^n\)（通常は census粒子エネルギーの差分、\(E_{census}=\sum_p E_p\)。difference path では \(E_{census}=\sum_{i,g}U^{ref}_{i,g}+\sum_p s_pE_p\)） |
+| \(\Delta E_{rad}\) | 放射場エネルギー変化 | FLD・S_N では放射エネルギー密度の体積積分 \(\sum_{i,g}E_{g,i}V_i\) の差分。退役した imc_ddmc 経路では \(E_{census}^{n+1} - E_{census}^n\)（census粒子エネルギーの差分、\(E_{census}=\sum_p E_p\)。difference path では \(E_{census}=\sum_{i,g}U^{ref}_{i,g}+\sum_p s_pE_p\)） |
 | \(E_{laser,in}\) | レーザー入射エネルギー | \(\sum_b P_b(t)\,\Delta t\) |
 | \(E_{laser,esc}\) | レーザー未吸収流出 | 臨界終了 + LaserMesh外終了のレイエネルギー合計 |
+| \(E_{CBET,IAW}\) | CBET でイオン音波へ渡るエネルギー | CBET の交換でレーザーから除かれ、イオン音波に渡る分（`E_cbet_iaw`。CBET 有効時のみ非ゼロ） |
 | \(E_{Marshak,in}\) | Marshak境界入射エネルギー | \(\sum_f \frac{a_{eV}\,c}{4}\,T_{r,f}^4\,A_f\,\Delta t\)（§8.2 per-face合計） |
-| \(E_{rad,esc}\) | 放射境界流出 | vacuum/Marshak境界で脱出した粒子のエネルギー合計（`E_escape[g]` の全群合算）|
+| \(E_{volume,in}\) | 放射の体積源エネルギー | FLD・S_N の体積源で入った放射エネルギー（`E_volume_in`） |
+| \(E_{burn,in}\) | 核融合の沈着エネルギー | 燃焼で生じた荷電粒子が電子・イオンへ沈着したエネルギー（`E_burn_in`） |
+| \(E_{rad,esc}\) | 放射境界流出 | 境界から出た放射エネルギー（退役した imc_ddmc 経路では脱出粒子のエネルギー `E_escape[g]` の全群合算）|
+| \(E_{rad,mesh\_adv}\) | 格子の動きによる放射エネルギー変化 | 流体の半ステップの前後での \(\sum_{i,g}E_{g,i}V_i\) の変化（`E_rad_mesh_advection`）。保存的なセル移流では丸め誤差まで 0。`Radiation.multigroup_diffusion.hydro_coupling="none"` では凍結した放射エネルギー密度が体積変化で生む分を含み、物理的な境界流束ではない（§6.7） |
 | \(E_{pdV}^{boundary}\) | 境界PdV仕事 | 外側境界面での \(P\,dV\) |
 | \(E_{floor}\) | フロア補正注入（実装名: `E_floor_injected`） | \(\sum_c \Delta E_{floor,c}\)（§1.1.7 温度・密度フロア + §11.7 安全検査で注入） |
 | \(E_{safety}\) | 伝導安全補正 | §4.2.2 の負温度clampで注入されたエネルギー |
@@ -27285,10 +27304,10 @@ E_{pdV}^{boundary} = \sum_{f \in \partial\Omega} P_f \,(A_f\, v_{n,f})\,\Delta t
 
 **エネルギー保存誤差の定義**：
 \[
-\varepsilon_{budget} = \frac{|(E_{total}^{n+1} - E_{total}^n - E_{artificial}) - (E_{source} - E_{sink})|}
+\varepsilon_{budget} = \frac{|(E_{total}^{n+1} - E_{total}^n - E_{artificial} - E_{rad,mesh\_adv}) - (E_{source} - E_{sink})|}
                           {E_{denom}}
 \]
-ここで \(E_{source} = E_{laser,in} + E_{Marshak,in} + E_{volume,in} + \max(E_{solver},0)\)、\(E_{sink} = E_{laser,esc} + E_{rad,esc} + E_{numerical\_loss} + E_{pdV}^{boundary} + \max(-E_{solver},0)\)。
+ここで \(E_{source} = E_{laser,in} + E_{Marshak,in} + E_{volume,in} + E_{burn,in} + \max(E_{solver},0)\)、\(E_{sink} = E_{laser,esc} + E_{CBET,IAW} + E_{rad,esc} + E_{numerical\_loss} + E_{pdV}^{boundary} + \max(-E_{solver},0)\)。
 \[
 E_{artificial}=E_{floor}+\max(E_{safety}-E_{floor},0)+E_{redistribution\_unresolved}.
 \]
@@ -29516,8 +29535,15 @@ Design canon: `docs/design/amm_reale_plan_20260806.md` (program),
 `docs/design/tessellator_core_contract_20260808.md` (exact core),
 `docs/design/boundary_carrier_c1_20260810.md` (carrier; consult-29 adoption A229).
 Ledger of record: `tmp/ale_p2_briefs/killer_p2b_verdict.md` (A199-A270).
-No tunable parameters anywhere in this section's machinery (user ruling A185):
-every threshold is a machine-epsilon-derived bound or an absolute predicate.
+Design rule (a user ruling): thresholds are machine-epsilon-derived bounds or
+absolute predicates, not tunables. The current code does not meet the rule
+everywhere: it reads the namelist tolerances
+`Numerics.ale.reale_short_edge_collapse_rel` (default 3.0e-2),
+`reale_overlay_additivity_tol` (1.0e-4), and `reale_subdomain_frac_max` (0.6,
+with `reale_subdomain_rezone=True`), the environment ceiling
+`TENRYU_REALE_REZONE_INTERVAL` (§15.4d), and fixed resource caps (§15.4a: 256
+Newton degrees of freedom, 256 Dykstra sweeps, 64 quotient sweeps; §15.4d: 4
+Lloyd iterations).
 
 ### 15.1 Exact restricted Voronoi core (`src/mesh/tessellation/`)
 
@@ -29725,7 +29751,7 @@ deterministic ladder:
    `||(tau_k - tau_l) + d0_e|| <= b_e`, solved by the same mass-metric
    Dykstra pair projection on cluster masses in stable cut-edge order. A cluster
    containing an axis node has its radial translation frozen. The quotient has
-   the same 256-sweep resource cap; success uses the same unit-collapse
+   its own 64-sweep resource cap (`kDvclpQuotientSweepCap`); success uses the same unit-collapse
    epilogue and post-collapse all-edge re-scan.
 4. **Homothety fallback.** If the quotient exhausts its cap or the
    post-collapse scan finds a residual violation, the pre-D1 component snapshot

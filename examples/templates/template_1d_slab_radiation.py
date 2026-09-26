@@ -31,7 +31,7 @@ Mesh(
 
 # Materials ブロック
 # 何を設定するか: 材質の原子量・電離度と物性モデル。
-# 単位: A/Z は無次元、kappa_a/kappa_s は cm2/g、cv_e_override は erg/(g*eV)。
+# 単位: A/Z は無次元、kappa_a/kappa_s は cm2/g、cv_e_override は体積あたりの erg/(cm3*eV)。
 # 初学者が変えて良い knob と典型値域: A=6.5/Z=3.5 は CH プラスチック相当の代表値、kappa_a=10 から 1000 cm2/g。
 # 触らないほうがよい物: eos と opacity の model は外部テーブル不要の入門例にするため変更しない。
 Materials(

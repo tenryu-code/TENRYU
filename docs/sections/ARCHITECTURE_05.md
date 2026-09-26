@@ -17,7 +17,7 @@ GPUデバイスメモリ上のフィールドデータを管理する薄いRAII�
 // 1Dフィールド（1D_SPH: セルまたはノード単位）
 // メモリ確保：cudaMalloc でGPUデバイスメモリに配置。ホストミラーは持たない。
 // I/O（HDF5出力）時は copy_to_host() でピン留めホストバッファへ転送し、
-// HDF5 collective write 後にホストバッファを解放する。
+// HDF5 への書き込み後にホストバッファを解放する。
 template<typename Tag>
 struct Field1D {
     double* data;     // [n] deviceメモリ（cudaMalloc で確保）
@@ -273,7 +273,8 @@ struct State {
     CellFieldG difference_residual_E; // optional signed residual density diagnostic [erg/cm³]
     double* rad_mom_dep;    // 運動量沈着（診断、NUMERICS §7.8）[dyne·s/cm³]
                             // 2D_RZ: [N_cell × 2]（R,Z成分）、1D_SPH: [N_cell × 1]（径方向のみ）
-                            // SPECIFICATION §7.2: radiation/momentum_dep float64[N_cell, 2]
+                            // 現行コードにこの配列は無く、スナップショットにも出力しない
+                            // （退役した imc_ddmc 経路の値は history の mc/rad_momentum_deposition だけに残る）
     int8_t* bc_type_rad;    // OWNED [4] deviceメモリ。輻射BC種別（面順: R_low,R_high,Z_low,Z_high）
                             // 0=vacuum, 1=reflect, 2=marshak。BoundaryConfig 文字列から init() で変換（CUDA_KERNELS §6.0a R3 参照）
     int8_t* ddmc_candidate; // OWNED [(n_cells+n_ghost) × G] deviceメモリ。DDMC候補フラグ（R2出力、§5.2規約準拠）

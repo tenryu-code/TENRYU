@@ -514,7 +514,7 @@ struct Config {
         double K0 = 0.0;    // bulk modulus [dyn/cm^2]
       } cold_reference;
       double ideal_gas_gamma = 5.0 / 3.0;
-      double cv_e_override = -1.0;  // [erg/(g*eV)] mass-specific electron heat capacity override (per unit mass per eV)
+      double cv_e_override = -1.0;  // [erg/(cm^3*eV)] electron heat capacity per unit volume per eV (the closures divide by rho)
       double eos_T_ref_eV = -1.0;
       double eos_power_law_f_erg_g = 0.0;
       double eos_power_law_beta = 0.0;
