@@ -38,7 +38,7 @@
     <section aria-labelledby="documentation">
       <h2 id="documentation">Change documentation with implementation</h2>
       <p>The engineering contracts named on this page — <code>docs/NUMERICS.md</code>, <code>docs/ARCHITECTURE.md</code>, and <code>docs/SPECIFICATION.md</code> — are documents that live in the TENRYU repository beside the code, publicly readable with the source. Any change to an equation, physical coefficient, time integration, spatial discretization, boundary condition, or unit convention must update <code>docs/NUMERICS.md</code> in the same contribution. <code>NUMERICS.md</code> is the authoritative contract for equations and discretization, not commentary reconstructed later from code. Update <code>docs/ARCHITECTURE.md</code> as well when module ownership or data flow changes.</p>
-      <p>A new namelist key must update both the applicable schema in <code>docs/SPECIFICATION.md</code> §6.4 and the authoritative default list in §9.1. Update user pages and examples when behavior exposed there changes. Code, defaults, frozen representation, validation, and documentation must land together; omitting one leaves the public input contract unreproducible.</p>
+      <p>Adding a namelist key requires updating, in the same pull request, both the applicable schema in <code>docs/SPECIFICATION.md</code> §6.4 and the authoritative default list in §9.1. Update user pages and examples when behavior exposed there changes. Code, defaults, frozen representation, validation, and documentation must land together; omitting one leaves the public input contract unreproducible.</p>
     </section>
 
     <section aria-labelledby="verification">
@@ -55,7 +55,7 @@
 
     <section aria-labelledby="python-runtime">
       <h2 id="python-runtime">Freeze Python inputs at initialization</h2>
-      <p>Python namelist callables are an input convenience for describing initial conditions and time waveforms. Evaluate them over their mesh or time domain during initialization, tabulate them, and transfer the result into the frozen configuration and C++/CUDA-owned data. Do not add Python calls to the time loop or GPU execution path. This boundary excludes runtime dependencies, the GIL, mutable external state, and rank-dependent evaluation from the simulation. A new callable input must define its evaluation domain, table resolution, hash, and frozen representation.</p>
+      <p>Python namelist callables are an input convenience for describing initial conditions and time waveforms. Evaluate them over their mesh or time domain during initialization, tabulate them, and transfer the result into the frozen configuration and C++/CUDA-owned data. Do not add Python calls to the time loop or GPU execution path. This boundary excludes runtime dependencies, the GIL (Python's global interpreter lock), mutable external state, and rank-dependent evaluation from the simulation. A new callable input must define its evaluation domain, table resolution, hash, and frozen representation.</p>
     </section>
 
     <section aria-labelledby="pull-requests">

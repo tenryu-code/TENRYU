@@ -52,7 +52,7 @@
       \rho(r)=\rho_0\exp[-(r-R)/L],\qquad R&lt;r\le R_{\rm corona}.
       $$
       <p>Here \(\rho_0\) is the ramp's base density at the target surface \(R\), \(L\) is its exponential scale length, and \(R_{\rm corona}\) is its outer end.</p>
-      <p>The <a href="../../verification/index.html#gxii">GXII</a> regression uses \(L=2\,\mu\mathrm m\), a \(10\,\mu\mathrm m\) extent, \(\rho_0=0.05\,\mathrm{g\,cm^{-3}}\), and a \(3\times10^{-4}\,\mathrm{g\,cm^{-3}}\) tail guard. This places the 351 nm CH critical density, \(0.028\,\mathrm{g\,cm^{-3}}\) assuming fully ionized CH (\(\bar Z=3.5\), \(\bar A=6.5\)), inside a resolved profile. The ramp must stay strictly monotone to VOID, with no uniform floor plateau. A historical three-cell uniform low-density plateau acted as a resonant cavity in which trace inverse-bremsstrahlung deposition seeded the exponential growth of a checkerboard mode of adjacent node pairs moving in antiphase (the antisymmetric node pairs); this numerical instability is stable with the laser off.</p>
+      <p>The <a href="../../verification/index.html#gxii">GXII</a> regression uses \(L=2\,\mu\mathrm m\), a \(10\,\mu\mathrm m\) extent, \(\rho_0=0.05\,\mathrm{g\,cm^{-3}}\), and a \(3\times10^{-4}\,\mathrm{g\,cm^{-3}}\) tail guard. These parameters place the 351 nm CH critical density, \(0.028\,\mathrm{g\,cm^{-3}}\) assuming fully ionized CH (\(\bar Z=3.5\), \(\bar A=6.5\)), inside a resolved profile. The ramp must stay strictly monotone to VOID, with no uniform floor plateau. A historical three-cell uniform low-density plateau acted as a resonant cavity in which trace inverse-bremsstrahlung deposition seeded the exponential growth of a checkerboard mode of adjacent node pairs moving in antiphase (the antisymmetric node pairs); this numerical instability does not grow with the laser off.</p>
 
       <figure>
         <img src="../../../assets/mesh-1d-regions-corona.png" width="900" height="390" style="max-width:100%;height:auto" alt="One-dimensional region painting and logarithmic density profile for a gas core, shell, exponential corona ramp, and VOID">
@@ -74,7 +74,7 @@
     </section>
 
     <section aria-labelledby="controls">
-      <h2 id="controls">Selected keys</h2>
+      <h2 id="controls">Namelist controls</h2>
       <p>These are the principal mesh and deck-side geometry entry points. See the <a href="../../use/namelist.html">namelist reference</a> for complete validation rules and staged scopes.</p>
       <table class="quick-facts">
         <thead>
@@ -85,7 +85,7 @@
           <tr><th><code>Mesh.geometry_1d</code></th><td>1D</td><td><code>"spherical"</code> (default), <code>"cylindrical"</code>, or <code>"planar"</code> coordinate measure.</td></tr>
           <tr><th><code>Material.is_void</code>, <code>Materials.void_config</code></th><td>deck</td><td>Identify exterior material as a VOID mask and provide a finite floor state.</td></tr>
           <tr><th><code>vacuumOutside1d</code></th><td>Studio-generated</td><td>Generate the <code>VOID</code> material and volume fraction outside the last 1D region.</td></tr>
-          <tr><th><code>coronaRamp1d.{scaleUm, extentUm, rho0, rhoMin}</code></th><td>Studio-generated</td><td>Set the scale, extent, base density, and tail guard of the exponential pre-plasma ramp inside VOID.</td></tr>
+          <tr><th><code>coronaRamp1d.{scaleUm, extentUm, rho0, rhoMin}</code></th><td>Studio-generated</td><td>Set the scale, extent, base density, and tail guard of the exponential pre-plasma ramp inward of the VOID band.</td></tr>
           <tr><th><code>Mesh.grid.grading.{edge_ratio, sg_sigma, sg_order, mapping}</code></th><td>1D graded</td><td>Super-Gaussian edge floor \(\epsilon_{\rm edge}\), breadth \(\sigma_{\rm sg}\), exponent \(m_{\rm sg}\), and the optional <code>"exact_measure_v2"</code> mass-weight mapping.</td></tr>
         </tbody>
       </table>
@@ -94,7 +94,7 @@
     <section aria-labelledby="verification">
       <h2 id="verification">Verification</h2>
       <ul>
-        <li>Builder gates in <code>test_mesh_create</code> cover default and segment-honoring graded zoning, and the <code>exact_measure_v2</code> contracts: constant-density per-cell mass ratios matching the target super-Gaussian weight ratios to rounding level (holding exactly even on a segment containing the origin \(r=0\)), and equal weights producing equal-mass (rather than equal-width) zoning.</li>
+        <li>Builder gates in <code>test_mesh_create</code> cover default and segment-honoring graded zoning, and the <code>exact_measure_v2</code> contracts: constant-density per-cell mass ratios matching the target super-Gaussian weight ratios to rounding level (also on a segment containing the origin \(r=0\)), and equal weights producing equal-mass (rather than equal-width) zoning.</li>
         <li>Generation itself fails loudly on non-finite or non-positive widths, non-monotone node sequences, or a wrong outer endpoint, so an invalid grading never reaches the physics.</li>
         <li>The corona-ramp contract — strictly monotone decrease to VOID with a resolved critical surface — is exercised end-to-end by the <a href="../../verification/index.html#gxii">GXII golden regression</a>, whose deck encodes the ramp parameters quoted above.</li>
       </ul>

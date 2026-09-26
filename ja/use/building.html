@@ -12,12 +12,12 @@
   <main>
     <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
     <h1>ビルド <span class="badge">reference</span></h1>
-    <p class="abstract">TENRYU は C++20 / CUDA C++ のコードを CMake と Ninja で構成し、CUDA 12.x のツールキットと NVIDIA GPU(既定 fatbin は sm_70/80/89/90、継続検証している実機は sm_80 以降)を対象にビルドする。このページでは、リリースビルドの作成、全体・対象限定・名前指定の 3 段階のテスト、MPI の有効化、そして ccache を使った反復ビルドまでを扱う。</p>
+    <p class="abstract">TENRYU は C++20 / CUDA C++ のコードを CMake と Ninja で構成し、CUDA 12.x のツールキットと NVIDIA GPU(既定の対象世代は構成時に検出したローカル GPU、継続検証している実機は sm_80 以降)を対象にビルドする。このページでは、リリースビルドの作成、全体・対象限定・名前指定の 3 段階のテスト、MPI の有効化、そして ccache を使った反復ビルドまでを扱う。</p>
 
     <aside class="planned" aria-labelledby="at-a-glance">
       <h3 id="at-a-glance">要点</h3>
       <ul>
-        <li>必要なものは、CUDA 12.x のツールキット、CMake 3.25 以上、Ninja、そして NVIDIA GPU(検証済み実機は sm_80 以降)である。</li>
+        <li>必要なものは、CUDA 12.x のツールキット、CMake 3.27 以上、Ninja、そして NVIDIA GPU(検証済み実機は sm_80 以降)である。</li>
         <li>標準の手順は、<code>cmake</code> で <code>build/</code> を構成し、<code>ninja -C build</code> でコンパイルする 2 段階である。</li>
         <li>確認は、CTest の全実行、<code>-R</code> による対象限定の CTest、<code>tenryu verify</code> による名前指定の検証を、目的に応じて使い分ける。</li>
         <li>MPI は既定でオフである。複数ランク用のバイナリを作るには、構成時に <code>-DTENRYU_ENABLE_MPI=ON</code> を指定する。</li>
@@ -26,16 +26,16 @@
 
     <section aria-labelledby="prerequisites">
       <h2 id="prerequisites">前提条件</h2>
-      <p>ビルドは NVIDIA CUDA の環境上で行う。CUDA のコンパイラとドライバが見えていることに加え、CMake が CUDA のツールチェーンと依存ライブラリを検出できる必要がある。HDF5 と Python への対応は最上位の CMake で既定オン、MPI は既定オフである。追加機能の有無を変える場合も、まずは同じ「構成 → ビルド」の流れを保つこと。要求の全体像（対応 GPU 世代・コンパイラ・全ライブラリの最低バージョン・CMake オプション一覧・事前チェックのコマンド）は<a href="requirements.html">動作環境と要求スペック</a>にまとめてある。以下は要点の再掲である。</p>
-      <p><strong>ネットワークについて。</strong>テスト・ログ・CLI 系の小依存（Catch2・spdlog・CLI11・pybind11）は、システムに見つからない場合 CMake の FetchContent が構成時に自動取得する。オフライン環境では事前導入するか、ネットワークのある場所で初回の構成を済ませること。CUDA・HDF5・Python・MPI・Hypre は自動取得の対象外である。</p>
+      <p>ビルドは NVIDIA CUDA の環境上で行う。CUDA のコンパイラとドライバが見えていることに加え、CMake が CUDA のツールチェーンと依存ライブラリを検出できる必要がある。HDF5 と Python への対応は最上位の CMake で既定オン、MPI は既定オフである。追加機能を使うには、その開発パッケージも構成時に見えている必要がある。追加機能の有無を変えたときは、構成からやり直してビルドする。要求の全体像（対応 GPU 世代・コンパイラ・全ライブラリの最低バージョン・CMake オプション一覧・事前チェックのコマンド）は<a href="requirements.html">動作環境と要求スペック</a>にまとめてある。以下は要点の再掲である。</p>
+      <p><strong>ネットワークについて。</strong>テスト・ログ・CLI・Python バインディングの小依存（Catch2・spdlog・CLI11・pybind11）は、システムに見つからない場合 CMake の FetchContent が構成時に自動取得する。オフライン環境では事前導入するか、ネットワークのある場所で初回の構成を済ませること。CUDA・HDF5・Python・MPI・Hypre は自動取得の対象外である。</p>
       <table class="quick-facts">
         <thead><tr><th>項目</th><th>要件</th><th>役割</th></tr></thead>
         <tbody>
-          <tr><th>GPU</th><td>NVIDIA 製。既定 fatbin は sm_70;80;89;90、検証済み実機は sm_80 以降。</td><td>CUDA カーネルと検証の実行先である。</td></tr>
+          <tr><th>GPU</th><td>NVIDIA 製。既定の対象は構成時に検出したローカル GPU の世代（GPU が見えなければ sm_70;80;89;90 の fatbin）、検証済み実機は sm_80 以降。</td><td>CUDA カーネルと検証の実行先である。</td></tr>
           <tr><th>CUDA ツールキット</th><td>12.x (12.0 以上)</td><td><code>nvcc</code>、CUDA のヘッダ、実行時ライブラリを提供する。</td></tr>
-          <tr><th>CMake</th><td>3.25 以上</td><td>C++20 / CUDA のターゲット、依存関係、CTest を構成する。</td></tr>
+          <tr><th>CMake</th><td>3.27 以上</td><td>C++20 / CUDA のターゲット、依存関係、CTest を構成する。</td></tr>
           <tr><th>Ninja</th><td>利用できること</td><td>生成されたビルドの依存グラフを並列に実行する。</td></tr>
-          <tr><th>HDF5</th><td>1.12 以上 (既定でオン)</td><td>スナップショット・履歴・チェックポイントの入出力を担う。MPI の集団出力には並列 HDF5 を使う。</td></tr>
+          <tr><th>HDF5</th><td>1.12 以上 (既定でオン)</td><td>スナップショット・履歴・チェックポイントの入出力を担う。ファイルはすべてランク 0 が書くので、逐次版の HDF5 で足りる（並列版の HDF5 も使えるが、そのときはリンクに MPI が要る）。</td></tr>
           <tr><th>Python + pybind11</th><td>Python 3.10 以上、pybind11 2.11 以上 (既定でオン)</td><td>初期化時にだけ namelist を読む組み込みインタープリタである。</td></tr>
           <tr><th>任意の機能</th><td>MPI 3.1 以上 (<code>-DTENRYU_ENABLE_MPI=ON</code>)、Hypre — LLNL の線形ソルバライブラリで、その BoomerAMG 前処理が熱伝導の任意の <code>solver="hypre"</code> 経路を支える</td><td>有効にした CMake のオプションに対応する開発用パッケージが必要である。</td></tr>
         </tbody>
@@ -92,7 +92,7 @@ ninja -C build</code></pre>
       <p>ヘッダを含む再コンパイルを繰り返す環境では、<code>ccache</code> をコンパイラのラッパとして使うと、既にコンパイル済みのオブジェクトを再利用できる。<code>ccache</code> が <code>PATH</code> にある状態で、構成のコマンドに次の 2 つを追加する。</p>
       <pre><code>-DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
 -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache</code></pre>
-      <p>C++ と CUDA の両方を指定することが重要である。ccache はコンパイルの時間を短くするが、構成、リンク、テストを省く仕組みではない。ツールチェーン、コンパイルオプション、ヘッダが変わればキャッシュのキーも変わり、必要なコンパイルは通常どおり実行される。</p>
+      <p>C++ と CUDA のコンパイルがどちらもキャッシュを使えるよう、両方を指定する。ccache はコンパイルの時間を短くするが、構成、リンク、テストを省く仕組みではない。ツールチェーン、コンパイルオプション、ヘッダが変わればキャッシュのキーも変わり、必要なコンパイルは通常どおり実行される。</p>
     </section>
 
     <div id="page-footer"></div>

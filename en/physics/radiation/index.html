@@ -20,8 +20,8 @@
 
     <section aria-labelledby="models">
       <h2 id="models">The two models</h2>
-      <p><strong>Multigroup FLD.</strong> Multigroup flux-limited diffusion partitions photon energy into groups and couples the "stiff" emission and absorption — whose timescales are far shorter than the time step — implicitly to electron matter through Fleck linearization. It forms conservative finite-volume systems: a 1D batched tridiagonal system or a 2D RZ five-point CSR system with CG-family solvers. It recovers diffusion in optically thick regions while the Levermore–Pomraning flux limiter bounds transport in thin regions.</p>
-      <p><strong>\(S_N\) transport.</strong> Discrete-ordinates transport follows finite directions in every photon-energy group and forms cell energies and face fluxes from directional intensities. Wavefront sweeps use source iteration and Picard matter coupling. The angular representation retains free streaming, shadows, and anisotropy that a diffusion closure cannot represent.</p>
+      <p><strong>Multigroup FLD.</strong> Multigroup flux-limited diffusion partitions photon energy into groups and couples the "stiff" emission and absorption — whose timescales are far shorter than the time step — implicitly to electron matter through Fleck linearization. It forms conservative finite-volume systems: a 1D batched tridiagonal system or a 2D RZ five-point CSR (compressed sparse row) system with solvers of the conjugate-gradient (CG) family. It recovers diffusion in optically thick regions while the Levermore–Pomraning flux limiter bounds transport in thin regions.</p>
+      <p><strong>\(S_N\) transport.</strong> Discrete-ordinates transport follows a finite set of directions in every photon-energy group and forms cell energies and face fluxes from directional intensities. It combines wavefront sweeps with source iteration; the matter coupling uses Picard iteration in 2D RZ and with the 1D linear-characteristic scheme, and a Newton iteration on the nodal electron temperatures with the 1D default <a href="sn.html#ld-1d">linear-discontinuous scheme</a>. Because the method retains angular information, it captures free streaming, shadows, and anisotropy that a diffusion closure cannot represent.</p>
     </section>
 
     <section aria-labelledby="comparison">
@@ -33,7 +33,7 @@
         <tbody>
           <tr><th>Angular treatment</th><td>Scalar energy + limited diffusive flux; angle closed by the flux limiter.</td><td>Discrete ordinates \(\{\boldsymbol\mu_m,w_m\}\); Gauss–Legendre in 1D (\(S_{16}\) production default), product level-symmetric in 2D RZ.</td></tr>
           <tr><th>Valid regime</th><td>Optically thick, nearly isotropic radiation fields.</td><td>Adds optically thin streaming, directional illumination, shadows, and ray effects.</td></tr>
-          <tr><th>Matter coupling</th><td>Fleck linearization + outer iteration with cell-local Newton matter update.</td><td>No Fleck effective scattering (\(f=1\), raw Planck-mean absorption/emission opacities \(\sigma^{PA}\)/\(\sigma^{PE}\)); source iteration + Picard outer with active-set Newton closure.</td></tr>
+          <tr><th>Matter coupling</th><td>Fleck linearization + outer iteration with cell-local Newton matter update.</td><td>No Fleck effective scattering (\(f=1\), raw Planck-mean absorption/emission opacities \(\sigma^{PA}\)/\(\sigma^{PE}\)); source iteration + Picard outer with active-set Newton closure in 2D RZ and the 1D linear-characteristic scheme; Newton on nodal electron temperatures in the 1D linear-discontinuous default.</td></tr>
           <tr><th>Cost and solvers</th><td>One diffusion solve per group: 1D batched tridiagonal, 2D RZ five-point CSR with Jacobi-PCG/GMG (geometric multigrid).</td><td>Work ≈ cells × groups × ordinates × iterations; angular and face workspaces.</td></tr>
           <tr><th>Geometry</th><td>1D (spherical, cylindrical, planar) and 2D RZ.</td><td>1D (spherical/planar Gauss–Legendre; cylindrical uses a product quadrature with \(n=2L^2\) ordinates) and 2D RZ.</td></tr>
           <tr><th>When in doubt</th><td>The production default for radiative implosions (the <a href="../../verification/index.html#gxii">GXII</a> golden regression).</td><td>Check quantities of interest on an S<sub>8</sub>/S<sub>16</sub>/S<sub>32</sub> ladder.</td></tr>
@@ -47,8 +47,8 @@
       <ul>
         <li>Shared photon-energy group bounds, Planck fractions \(b_g(T)\), and electron-EOS primitives.</li>
         <li>The same boundary-condition family (reflecting, vacuum, Marshak), with face types nested under each mode's own block.</li>
-        <li>The void-cell contract excludes <code>VOID</code> cells from matter exchange.</li>
-        <li>Boundary/matter energy ledgers that close to machine precision.</li>
+        <li>The void-cell contract, which excludes <code>VOID</code> cells from matter exchange.</li>
+        <li>Boundary and matter energy ledgers that close to machine precision.</li>
         <li>Internal units cgs + eV.</li>
       </ul>
     </section>
@@ -62,7 +62,7 @@
         </thead>
         <tbody>
           <tr><th><code>Radiation.enabled</code></th><td><code>True</code></td><td>Enable the radiation operator.</td></tr>
-          <tr><th><code>Radiation.mode</code></th><td><code>"multigroup_diffusion"</code></td><td>Select <a href="fld.html">multigroup FLD</a> or <code>"sn_transport"</code> → <a href="sn.html">\(S_N\)</a>.</td></tr>
+          <tr><th><code>Radiation.mode</code></th><td><code>"multigroup_diffusion"</code></td><td>Select <a href="fld.html">multigroup FLD</a>, or <a href="sn.html">\(S_N\)</a> with <code>"sn_transport"</code>.</td></tr>
           <tr><th><code>Radiation.groups</code></th><td><code>1</code></td><td>Number \(G\) of photon-energy groups, shared by both solvers.</td></tr>
           <tr><th><code>Radiation.group_bounds_eV</code></th><td><code>[]</code> or <code>"log_uniform"</code></td><td>\(G+1\) group boundaries in eV or logarithmic generator.</td></tr>
           <tr><th><code>Radiation.compute_T_range_eV</code></th><td><code>[]</code></td><td>Temperature range used to generate <code>"log_uniform"</code> groups.</td></tr>
