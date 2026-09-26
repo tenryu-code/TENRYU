@@ -190,7 +190,7 @@ export default function MaterialsSection() {
             disabled={form.materials.length === 1}
             onClick={() => update((f) => { f.materials.splice(i, 1); })}
           >
-            削除
+            {m.common.remove}
           </Button>
         </div>
       ))}
