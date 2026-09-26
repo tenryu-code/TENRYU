@@ -455,7 +455,8 @@ namespace {
 // arrays and returns them via d_contribs_out. Returns false (without
 // touching d_contribs_out) for an empty state.
 bool compute_energy_totals_1d_contrib(const core::State& state,
-                                      double* d_contribs_out[4]) {
+                                      double* d_contribs_out[4],
+                                      const bool whole_line = false) {
   TENRYU_ASSERT(state.mesh.dim == 1, "1D energy totals requires 1D mesh");
   TENRYU_ASSERT(state.mass.size() == state.rho.size(),
                 "Energy totals requires mass/rho size match");
@@ -473,7 +474,8 @@ bool compute_energy_totals_1d_contrib(const core::State& state,
   }
 
   const int n_cells = static_cast<int>(state.rho.size());
-  const core::State::LaunchWindow cw = state.owned_cell_window(n_cells);
+  const core::State::LaunchWindow cw =
+      whole_line ? core::State::LaunchWindow{0, n_cells} : state.owned_cell_window(n_cells);
   const int blocks = cw.blocks(kBlockSize);
 
   double* d_int_e = nullptr;
@@ -521,16 +523,18 @@ bool compute_energy_totals_1d_contrib(const core::State& state,
 }
 }  // namespace
 
-EnergyTotals compute_energy_totals_1d(const core::State& state) {
+EnergyTotals compute_energy_totals_1d(const core::State& state, const bool whole_line) {
   EnergyTotals totals{};
   double* d_contribs[4];
-  if (!compute_energy_totals_1d_contrib(state, d_contribs)) {
+  if (!compute_energy_totals_1d_contrib(state, d_contribs, whole_line)) {
     return totals;
   }
   const int n_cells = static_cast<int>(state.rho.size());
-  const core::State::LaunchWindow cw = state.owned_cell_window(n_cells);
-  // Owned-window sums: reduce only the [cw.begin, cw.end) slice of each
-  // contrib array (non-owned entries are never written under n_ranks > 1).
+  const core::State::LaunchWindow cw =
+      whole_line ? core::State::LaunchWindow{0, n_cells} : state.owned_cell_window(n_cells);
+  // Window sums: reduce only the [cw.begin, cw.end) slice of each contrib
+  // array (the owned window by default: non-owned entries are never written
+  // under n_ranks > 1; whole_line: every cell).
   const double* d_owned_contribs[4] = {
       d_contribs[0] + cw.begin, d_contribs[1] + cw.begin,
       d_contribs[2] + cw.begin, d_contribs[3] + cw.begin};

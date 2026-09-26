@@ -1315,6 +1315,10 @@ __device__ inline void enforce_2t_closure_table_finish(
 // the kernel's time in the two table inversions one after the other (NIF DS,
 // 360 cells: about 100k of the 111k cycles per thread).
 constexpr int kClosureSplitThreads = 64;
+// Longest 1D line closed by enforce_2t_closure_split_kernel; longer lines use
+// the one-thread-per-cell kernel (measured crossover about 530 cells on an
+// RTX 4090).
+constexpr int kClosureSplitMaxCells = 512;
 
 template <bool kPerCell>
 __global__ __launch_bounds__(kClosureSplitThreads) void enforce_2t_closure_split_kernel(
@@ -4058,9 +4062,16 @@ void enforce_2t_closure(
   double* cv_e_ptr = state.cv_e.empty() ? nullptr : state.cv_e.data();
   double* cv_i_ptr = state.cv_i.empty() ? nullptr : state.cv_i.data();
   const int closure_block = core::serial_cell_block_size(fw.count());
-  // One block of two warps per cell (enforce_2t_closure_split_kernel), or with
-  // TENRYU_HYDRO1D_SEQUENTIAL_CLOSURE the one-thread-per-cell reference.
-  const bool sequential = sequential_closure_kernels();
+  // One block of two warps per cell (enforce_2t_closure_split_kernel) on short
+  // lines, where it hides the inversions' latency; from
+  // kClosureSplitMaxCells cells the one-thread-per-cell kernel is faster (its
+  // time barely grows with the cell count, the split kernel's in proportion:
+  // NIF DS on an RTX 4090, 7 calls per step, 263 against 402 us at 360 cells,
+  // 551 against 390 at 720, 1619 against 397 at 2880). The choice follows the
+  // whole line's cell count (the same on every MPI rank); the two agree to
+  // rounding. TENRYU_HYDRO1D_SEQUENTIAL_CLOSURE=1 takes the one-thread kernel
+  // at every size.
+  const bool sequential = sequential_closure_kernels() || n_cells >= kClosureSplitMaxCells;
   const auto launch_closure = [&](auto per_cell) {
     constexpr bool kPerCell = decltype(per_cell)::value;
     const auto kernel = sequential ? enforce_2t_closure_kernel<kPerCell>
@@ -4389,8 +4400,13 @@ void run_compatible_energy_update_1d(
   }
   sync_kernel("Hydro1D: compatible energy update kernel failed");
 
-  compatible_energy_kinetic_residual_1d_kernel<<<nw.blocks(), 256>>>(
-      state.mass.data(), v_old, v_new, nullptr, nw.begin, nw.end, n_cells,
+  // The owned node window includes the node shared with the next rank (both
+  // ranks update it); the residual counts it once, on the rank that owns the
+  // cells above it (disjoint node tiles, the last rank taking the outer node).
+  const core::State::LaunchWindow residual_nw{
+      nw.begin, cw.end < n_cells ? std::min(nw.end, cw.end) : nw.end};
+  compatible_energy_kinetic_residual_1d_kernel<<<residual_nw.blocks(), 256>>>(
+      state.mass.data(), v_old, v_new, nullptr, residual_nw.begin, residual_nw.end, n_cells,
       d_residual_nodes);
   sync_kernel("Hydro1D: compatible energy kinetic residual kernel failed");
   core::deterministic_sum(d_residual_cells, n_cells, d_residual_sums + 0, false);

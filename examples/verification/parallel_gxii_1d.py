@@ -5,9 +5,10 @@
 # laser+SN+hydro 1D replication bitwise at P>1.
 #
 # Knobs:
-#   TENRYU_PGXII_MAXSTEPS  max_steps (default 2 — proven-bitwise horizon;
-#                          interface v_r LSB appears from ~5 steps, audit
-#                          lane §6o.3)
+#   TENRYU_PGXII_MAXSTEPS  max_steps (default 50; bitwise at P=2 checked to
+#                          200 steps on 2026-09-26 — the interface v_r LSB
+#                          once seen from ~5 steps, audit lane §6o.3, no
+#                          longer appears; the default was 2 before)
 #   TENRYU_PGXII_OUTDIR    output directory
 #
 # TMAT path resolves relative to this file's repo checkout so the gate can
@@ -15,7 +16,7 @@
 
 import os
 
-_PGXII_MAXSTEPS = int(os.environ.get("TENRYU_PGXII_MAXSTEPS", "2"))
+_PGXII_MAXSTEPS = int(os.environ.get("TENRYU_PGXII_MAXSTEPS", "50"))
 _PGXII_OUTDIR = os.environ.get(
     "TENRYU_PGXII_OUTDIR", "./output_parallel_gxii_1d"
 )

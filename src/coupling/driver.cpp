@@ -6058,6 +6058,91 @@ diagnostics::DtBreakdownHistoryRecord make_dt_breakdown_history_record(
   return record;
 }
 
+// MPI: the history's dt breakdown from the global view (collective; every
+// rank calls it). Each rank's lineage holds its local candidates and the step
+// dt is their minimum over the ranks; the record takes every candidate's
+// minimum over the ranks, and the limiter and the hydro argmin cell from the
+// lowest rank whose local value is that minimum (the single-rank record).
+DtLineage global_dt_record_lineage(const DtLineage& local,
+                                   const parallel::Reduction& reducer,
+                                   const int rank,
+                                   const int n_ranks) {
+  DtLineage g = local;
+  if (n_ranks <= 1) {
+    return g;
+  }
+  double v[14] = {local.dt_chosen,
+                  local.dt_hydro,
+                  local.dt_rad,
+                  local.dt_cond,
+                  local.dt_hydro_post_shock,
+                  local.dt_growth,
+                  local.dt_output,
+                  local.dt_remaining,
+                  local.dt_max_namelist,
+                  local.dt_hydro_acoustic,
+                  local.dt_hydro_axis_margin,
+                  local.dt_hydro_volume_rate,
+                  local.dt_hydro_tri_fan_center,
+                  local.dt_hydro_corner_j_predict};
+  reducer.allreduce_min(v, 14);
+  g.dt_chosen = v[0];
+  g.dt_hydro = v[1];
+  g.dt_rad = v[2];
+  g.dt_cond = v[3];
+  g.dt_hydro_post_shock = v[4];
+  g.dt_growth = v[5];
+  g.dt_output = v[6];
+  g.dt_remaining = v[7];
+  g.dt_max_namelist = v[8];
+  g.dt_hydro_acoustic = v[9];
+  g.dt_hydro_axis_margin = v[10];
+  g.dt_hydro_volume_rate = v[11];
+  g.dt_hydro_tri_fan_center = v[12];
+  g.dt_hydro_corner_j_predict = v[13];
+  constexpr double kNone = 1.0e18;
+  double owners[2] = {local.dt_chosen == g.dt_chosen ? static_cast<double>(rank) : kNone,
+                      local.dt_hydro == g.dt_hydro ? static_cast<double>(rank) : kNone};
+  reducer.allreduce_min(owners, 2);
+  static const char* const kLimiters[] = {
+      "braginskii", "burn",   "conduction", "driver_retry",    "growth",
+      "hot_electron", "hydro", "init",     "max",             "output",
+      "radiation",  "rezone_reanchor", "t_end", "unknown"};
+  constexpr int kLimiterCount = static_cast<int>(sizeof(kLimiters) / sizeof(kLimiters[0]));
+  if (owners[0] < kNone) {
+    double code = -1.0;
+    for (int i = 0; i < kLimiterCount; ++i) {
+      if (local.limiter == kLimiters[i]) {
+        code = static_cast<double>(i);
+      }
+    }
+    reducer.broadcast(&code, 1, static_cast<int>(owners[0]));
+    if (code >= 0.0) {
+      g.limiter = kLimiters[static_cast<int>(code)];
+    }
+  }
+  if (owners[1] < kNone) {
+    double pack[8] = {static_cast<double>(local.hydro_argmin_cell),
+                      static_cast<double>(local.hydro_argmin_i),
+                      static_cast<double>(local.hydro_argmin_j),
+                      local.hydro_argmin_dt_at_cell,
+                      local.hydro_argmin_sqrt_area,
+                      local.hydro_argmin_cs,
+                      local.hydro_argmin_rho,
+                      local.hydro_argmin_u_z};
+    reducer.broadcast(pack, 8, static_cast<int>(owners[1]));
+    g.hydro_argmin_cell = static_cast<int>(pack[0]);
+    g.hydro_argmin_i = static_cast<int>(pack[1]);
+    g.hydro_argmin_j = static_cast<int>(pack[2]);
+    g.hydro_argmin_dt_at_cell = pack[3];
+    g.hydro_argmin_sqrt_area = pack[4];
+    g.hydro_argmin_cs = pack[5];
+    g.hydro_argmin_rho = pack[6];
+    g.hydro_argmin_u_z = pack[7];
+  }
+  return g;
+}
+
 }  // namespace
 
 DtLineage compute_dt_lineage(const core::State& state,
@@ -7508,6 +7593,138 @@ void Driver::run(core::State& state,
 
   int last_plot_step = -1;
 
+  // 1D MPI (Option C; design doc mpi_m18_20 §4.7): every rank holds the whole
+  // line but updates only its owned cells and nodes (the replicated radiation,
+  // conduction and burn stages gather their own inputs). Rank 0 writes the
+  // snapshots, checkpoints and history from its whole-line arrays, and the 1D
+  // radiation-energy ledger and the implosion diagnostics scan the whole line,
+  // so the lines are re-globalized from their owners before the step-0
+  // outputs and at the end of every step, before the step's energy totals.
+  // The fields are the ones the owned-window kernels write (hydro, closure,
+  // the radiation energy moved with the cells, the laser deposition); the
+  // replicated stages' outputs are the same on every rank already.
+  const auto consolidate_1d_owned_lines = [&]() {
+    if (!is_1d || part_info.n_ranks <= 1) {
+      return;
+    }
+    const core::NvtxRange nvtx_range("mpi.consolidate_1d_lines");
+    const int n_cells_1d = static_cast<int>(state.rho.size());
+    const int n_ranks = part_info.n_ranks;
+    std::vector<int> cell_counts(static_cast<std::size_t>(n_ranks));
+    std::vector<int> cell_displs(static_cast<std::size_t>(n_ranks));
+    const int base = n_cells_1d / n_ranks;
+    const int rem = n_cells_1d % n_ranks;
+    for (int p = 0; p < n_ranks; ++p) {
+      cell_counts[static_cast<std::size_t>(p)] = base + (p < rem ? 1 : 0);
+      cell_displs[static_cast<std::size_t>(p)] = p * base + std::min(p, rem);
+    }
+    std::vector<double> line;
+    std::vector<int> counts(static_cast<std::size_t>(n_ranks));
+    std::vector<int> displs(static_cast<std::size_t>(n_ranks));
+    // Whole-line gather of a field with per_cell entries per cell, cell-major;
+    // a node line has one more entry, owned by the last rank.
+    const auto gather = [&](double* d_field, const std::size_t size,
+                            const int per_cell, const bool node_line) {
+      const std::size_t expected =
+          static_cast<std::size_t>(n_cells_1d + (node_line ? 1 : 0)) *
+          static_cast<std::size_t>(per_cell);
+      if (d_field == nullptr || per_cell <= 0 || size == 0 || size != expected) {
+        return;
+      }
+      for (int p = 0; p < n_ranks; ++p) {
+        const std::size_t ps = static_cast<std::size_t>(p);
+        counts[ps] = (cell_counts[ps] + (node_line && p == n_ranks - 1 ? 1 : 0)) * per_cell;
+        displs[ps] = cell_displs[ps] * per_cell;
+      }
+      line.resize(size);
+      const cudaError_t d2h_err = cudaMemcpy(line.data(), d_field, size * sizeof(double),
+                                             cudaMemcpyDeviceToHost);
+      TENRYU_ASSERT(d2h_err == cudaSuccess, "1D line consolidation D2H failed");
+      const std::size_t me = static_cast<std::size_t>(part_info.rank);
+      std::vector<double> send(line.begin() + displs[me],
+                               line.begin() + displs[me] + counts[me]);
+      reducer.allgatherv(send.data(), counts[me], line.data(), counts.data(),
+                         displs.data());
+      const cudaError_t h2d_err = cudaMemcpy(d_field, line.data(), size * sizeof(double),
+                                             cudaMemcpyHostToDevice);
+      TENRYU_ASSERT(h2d_err == cudaSuccess, "1D line consolidation H2D failed");
+    };
+    const auto cell_field = [&](auto& field, const int per_cell) {
+      gather(field.data(), field.size(), per_cell, false);
+    };
+    cell_field(state.rho, 1);
+    cell_field(state.mass, 1);
+    cell_field(state.vol, 1);
+    cell_field(state.zbar, 1);
+    cell_field(state.Te, 1);
+    cell_field(state.Ti, 1);
+    cell_field(state.ee, 1);
+    cell_field(state.ei, 1);
+    cell_field(state.Pe, 1);
+    cell_field(state.Pi, 1);
+    cell_field(state.Qvisc, 1);
+    cell_field(state.cs, 1);
+    cell_field(state.cv_e, 1);
+    cell_field(state.cv_i, 1);
+    cell_field(state.e_cold, 1);
+    cell_field(state.eta_compatible, 1);
+    cell_field(state.shock_time, 1);
+    cell_field(state.adaptive_av_gate, 1);
+    // The 1D laser stage writes its deposition to the owned cells only.
+    cell_field(state.laser_dep, 1);
+    cell_field(state.ray_density, 1);
+    const int groups = std::max(cfg.radiation.groups, 1);
+    cell_field(state.rad_E, groups);
+    cell_field(state.rad_E_old, groups);
+    cell_field(state.rad_dep, groups);
+    cell_field(state.rad_emit, groups);
+    if (!state.volFrac.empty() && n_cells_1d > 0 &&
+        state.volFrac.size() % static_cast<std::size_t>(n_cells_1d) == 0) {
+      cell_field(state.volFrac,
+                 static_cast<int>(state.volFrac.size() / static_cast<std::size_t>(n_cells_1d)));
+      state.invalidate_cell_material_props();
+      state.ensure_cell_material_props(cfg);
+    }
+    gather(state.x_r.data(), state.x_r.size(), 1, true);
+    // The host cell centres (history diagnostics) from the gathered nodes, the
+    // expression of the 1D geometry kernel.
+    if (state.x_r.size() == static_cast<std::size_t>(n_cells_1d) + 1 &&
+        line.size() == state.x_r.size() &&
+        state.mesh.cell_centroid_r.size() == static_cast<std::size_t>(n_cells_1d)) {
+      for (int c = 0; c < n_cells_1d; ++c) {
+        const std::size_t cs = static_cast<std::size_t>(c);
+        state.mesh.cell_centroid_r[cs] = 0.5 * (line[cs] + line[cs + 1]);
+      }
+      if (state.mesh.cell_centroid_r_device.size() == state.mesh.cell_centroid_r.size()) {
+        state.mesh.cell_centroid_r_device.copy_from_host(state.mesh.cell_centroid_r);
+      }
+    }
+    gather(state.v_r.data(), state.v_r.size(), 1, true);
+    // The hydro activation flags (host) follow the owners' temperatures.
+    if (state.hydro_active.size() == static_cast<std::size_t>(n_cells_1d)) {
+      std::vector<double> flags(state.hydro_active.begin(), state.hydro_active.end());
+      for (int p = 0; p < n_ranks; ++p) {
+        counts[static_cast<std::size_t>(p)] = cell_counts[static_cast<std::size_t>(p)];
+        displs[static_cast<std::size_t>(p)] = cell_displs[static_cast<std::size_t>(p)];
+      }
+      const std::size_t me = static_cast<std::size_t>(part_info.rank);
+      std::vector<double> send(flags.begin() + displs[me],
+                               flags.begin() + displs[me] + counts[me]);
+      reducer.allgatherv(send.data(), counts[me], flags.data(), counts.data(),
+                         displs.data());
+      bool changed = false;
+      for (std::size_t c = 0; c < flags.size(); ++c) {
+        const auto v = static_cast<std::int8_t>(flags[c]);
+        changed = changed || (state.hydro_active[c] != v);
+        state.hydro_active[c] = v;
+      }
+      if (changed) {
+        state.note_hydro_active_host_write();
+      }
+    }
+  };
+
+  consolidate_1d_owned_lines();
   // Write initial snapshot (t=0) before main loop
   if (state.step == 0 && part_info.rank == 0) {
     out.write_snapshot(state, cfg, state.step, state.t, case_name, part_info.rank);
@@ -10108,6 +10325,10 @@ void Driver::run(core::State& state,
         allgatherv_1d_cell_line(state.rad_E.data(), rad_gamma43_n_groups);
       }
       if (cfg.radiation.enabled && deterministic_radiation_mode) {
+        // The radiation energy sums rad_E x vol over the whole line (1D is
+        // replicated): the other ranks' cell volumes from their owners after
+        // this hydro half (1D MPI; no-op otherwise).
+        allgatherv_1d_cell_line(state.vol.data(), 1);
         const long after_off = rad_mesh_E_before_half_off >= 0
                                    ? wj_defer_rad_capture()
                                    : -1;
@@ -14699,6 +14920,9 @@ void Driver::run(core::State& state,
     if (is_2d) {
       state.mesh.materialize_host_svec();
     }
+    // 1D MPI: the owners' lines on every rank before the step's energy totals,
+    // history, snapshot and checkpoint.
+    consolidate_1d_owned_lines();
 
     // A 2T run that starts at Te = Ti (a cold target in equilibrium) keeps them equal until
     // energy reaches the electrons or the ions separately. The check records whether they
@@ -15628,10 +15852,17 @@ void Driver::run(core::State& state,
         profile_observability_.set_shell_initial_radius_cm(shell.R_initial_cm);
       }
     }
+    // MPI: the dt breakdown record from the global view (every rank, every step
+    // it is recorded; the record itself is written by rank 0).
+    const DtLineage dt_record_lineage =
+        (part_info.n_ranks > 1 && cfg.numerics.diagnostics.dt_breakdown_history_enabled)
+            ? global_dt_record_lineage(step_dt_lineage, reducer, part_info.rank,
+                                       part_info.n_ranks)
+            : step_dt_lineage;
     emit_due_outputs([&](diagnostics::HistorySnapshot& snapshot) {
       if (cfg.numerics.diagnostics.dt_breakdown_history_enabled) {
         snapshot.dt_breakdown =
-            make_dt_breakdown_history_record(state, step_dt_lineage);
+            make_dt_breakdown_history_record(state, dt_record_lineage);
       }
       if (hydro::braginskii::params_from_config(cfg).enabled) {
         const auto brag_diag =
@@ -15805,7 +16036,7 @@ void Driver::run(core::State& state,
       if (conservation_history_enabled) {
         snapshot.operator_residuals = operator_energy_tracker.entries();
       }
-    }, [&] { return make_dt_breakdown_history_record(state, step_dt_lineage); });
+    }, [&] { return make_dt_breakdown_history_record(state, dt_record_lineage); });
     state.checkpoint_request = false;
     if (cfg.main.dim == 2 &&
         cfg.numerics.diagnostics.refinement_autopilot.mode == "arm_exit") {

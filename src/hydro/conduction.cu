@@ -6180,6 +6180,10 @@ __global__ void ion_conduction_pcr_solve_kernel(double* __restrict__ lower,
                                  static_cast<int>(blockDim.x));
 }
 
+// Longest line solved by ion_conduction_pcr_solve_kernel; longer lines use
+// cuSPARSE gtsv2 (measured crossover about 700 cells on an RTX 4090).
+constexpr int kIonConductionPcrMaxCells = 640;
+
 // Threads of ion_conduction_pcr_solve_kernel: one per row in whole warps, at
 // most 1024 and at most the kernel's own limit (larger systems take several
 // rows per thread; the rows' arithmetic does not depend on the thread).
@@ -6690,10 +6694,39 @@ IonConductionResult ion_conduction_step_1d(core::State& state,
              "Ion conduction: face weight copy failed");
   cuda_check(core::debug_kernel_sync(), "Ion conduction: assembly failed");
 
-  double* d_pcr_work = acquire("conduction:ion_conduction_1d:pcr_work", 4 * n);
-  ion_conduction_pcr_solve_kernel<<<1, ion_conduction_pcr_threads(n_cells)>>>(
-      d_lower, d_diag, d_upper, d_rhs, d_pcr_work, n_cells);
-  cuda_check(cudaGetLastError(), "Ion conduction: tridiagonal solve launch failed");
+  // The system is strictly diagonally dominant. One block's parallel cyclic
+  // reduction needs no library call and suits the few hundred cells of most 1D
+  // lines, but its FP64 work runs on one SM; for longer lines cuSPARSE's gtsv2
+  // (the electron solver, several blocks) is faster. RTX 4090, per solve: 24.7
+  // against 34.8 us at 360 cells, 51.2 against 50.5 at 720, 220.9 against 59.5
+  // at 2880. The choice follows the whole line's cell count (the same on every
+  // MPI rank).
+  if (n_cells <= kIonConductionPcrMaxCells) {
+    double* d_pcr_work = acquire("conduction:ion_conduction_1d:pcr_work", 4 * n);
+    ion_conduction_pcr_solve_kernel<<<1, ion_conduction_pcr_threads(n_cells)>>>(
+        d_lower, d_diag, d_upper, d_rhs, d_pcr_work, n_cells);
+    cuda_check(cudaGetLastError(), "Ion conduction: tridiagonal solve launch failed");
+  } else {
+    auto& cus_cache = cond_cusparse_cache();
+    if (cus_cache.handle == nullptr) {
+      cusparse_check(cusparseCreate(&cus_cache.handle),
+                     "Ion conduction: cusparseCreate failed");
+    }
+    cusparse_check(cusparseSetStream(cus_cache.handle, stream),
+                   "Ion conduction: cusparseSetStream failed");
+    std::size_t buffer_size = 0;
+    cusparse_check(cusparseDgtsv2_bufferSizeExt(cus_cache.handle, n_cells, 1, d_lower,
+                                                d_diag, d_upper, d_rhs, n_cells,
+                                                &buffer_size),
+                   "Ion conduction: cusparseDgtsv2_bufferSizeExt failed");
+    void* d_gtsv2_buffer = core::device_scratch_acquire(
+        "conduction:ion_conduction_1d:gtsv2_buffer", std::max<std::size_t>(buffer_size, 1));
+    // Full tridiagonal storage with lower[0] = 0 and upper[n-1] = 0 (the
+    // assembly kernels write them so).
+    cusparse_check(cusparseDgtsv2(cus_cache.handle, n_cells, 1, d_lower, d_diag, d_upper,
+                                  d_rhs, n_cells, d_gtsv2_buffer),
+                   "Ion conduction: cusparseDgtsv2 failed");
+  }
 
   dispatch_geom([&](auto geom_tag) {
     constexpr int GEOM = decltype(geom_tag)::value;

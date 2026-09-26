@@ -55,6 +55,7 @@ local 配列・local↔global 写像の記述は M18 前の設計案（写像は
 縮約 = `parallel::Reduction`（`allreduce_sum` / `allgatherv`）、
 rank→GPU binding = local rank による `cudaSetDevice`。ghost_layers = 2
 （NUMERICS §12.2.1）。粒子移送モジュールは LEGACY-inactive（IMC 退役）。
+1D の出力の集約（2026-09-26）：1D はスナップショット・チェックポイント・履歴をランク 0 が全長の配列から書くので、step 0 の出力の前と各ステップの終わり（エネルギーの集計の前）に、所有窓で更新される場（流体・閉包・セルとともに動く放射エネルギー・節点・流体の開始のフラグ）を全ランクで持ち主の値に集める（driver の `consolidate_1d_owned_lines`）。1D の熱伝導の陰解法とイオン熱伝導は、全ランクで全線を解く前に物質の線を集める（`conduction_replicate_1d_matter_lines`、係数は全線で計算）。
 
 ### 7.1 並列モジュール（`src/parallel/`）
 

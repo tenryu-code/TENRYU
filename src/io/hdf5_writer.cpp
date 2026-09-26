@@ -4546,8 +4546,11 @@ void write_common_snapshot_content(const hid_t file,
                           "1",
                           cfg);
   }
-  auto energy_budget = (state.mesh.dim == 2) ? diagnostics::compute_energy_budget_2d(state)
-                                             : diagnostics::compute_energy_budget_1d(state);
+  // 1D: the whole line (rank 0 writes; under MPI its whole-line arrays hold
+  // the owners' values, consolidated by the driver before every output).
+  auto energy_budget = (state.mesh.dim == 2)
+                           ? diagnostics::compute_energy_budget_2d(state)
+                           : diagnostics::compute_energy_budget_1d(state, /*whole_line=*/true);
   write_numeric_dataset(file,
                         "time_state",
                         "E_total",
