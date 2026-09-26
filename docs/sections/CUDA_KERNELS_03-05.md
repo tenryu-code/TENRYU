@@ -439,35 +439,36 @@ __global__ void deposit_lm_to_hydro(
 ### 5.1d L6: ray_skip_check
 
 ```cpp
-__global__ void ray_skip_check(
-    double* __restrict__ delta_max_cell,    // [n_LM_cells] out: LMセル最大相対変化量
-    const double* __restrict__ rho,         // [n_cells] in: 現ステップ ρ（HydroMesh 全体）
-    const double* __restrict__ Te,          // [n_cells] in: 現ステップ Te（HydroMesh 全体）
-    const double* __restrict__ Zbar,        // [n_cells] in: 現ステップ Z̄（HydroMesh 全体）
-    const double* __restrict__ rho_cached,  // [n_LM_cells] in: 前回レイトレース時 ρ（LM対応セルのみ）
-    const double* __restrict__ Te_cached,   // [n_LM_cells] in: 前回レイトレース時 Te（LM対応セルのみ）
-    const double* __restrict__ Zbar_cached, // [n_LM_cells] in: 前回レイトレース時 Z̄（LM対応セルのみ）
-    const int32_t* __restrict__ lm_to_hydro,// [n_LM_cells] in: LMセル→HydroMeshセルのマッピング
-    double rho_floor, double Te_floor, double Zbar_floor,  // フロア値（分母保護用）
-    double n_crit,                          // 臨界密度 n_crit(λ) [1/cm³]（crit_guard判定用）
-    double crit_guard,                      // 臨界面近傍再計算ガード（既定 0.01）
-    const double* __restrict__ A_eff,       // [n_cells] in: 有効原子量（多材料: §1.1.6 調和平均、H15出力と同一。n_e = ρ × Z̄ × N_A / A_eff[hydro_c]）
-    int n_LM_cells
-);
-// **重要: L6 は HydroMesh 上の ρ, Te, Z̄ を読み取る（LaserMesh ではない）**。
-// 理由: §9 Phase 3 の実行順序で L6 は L1（laser_mesh_map）の前に起動されるため、
-// LaserMesh の値は前ステップのもの（stale）。HydroMesh は Phase 1/2 で最新に更新済み。
-// L6 は n_LM_cells 個のセルのみ処理する。lm_to_hydro[lm_c] で HydroMesh セル index を取得し、
-// rho[hydro_c] vs rho_cached[lm_c] を比較する。キャッシュ配列は n_LM_cells サイズ。
-// δ_ρ = |ρ[hydro_c] - ρ_cached[lm_c]| / max(ρ_cached[lm_c], rho_floor)（+ Te, Z̄ 同様）
-// crit_guard 判定: n_e = ρ × Z̄ × N_A / A_eff[hydro_c] を局所計算し、n_e/n_crit > 1 - crit_guard なら強制再計算
-// 注: 分母は **cached** 値を使用する（current ではない）。NUMERICS §5.9.2 準拠
-// 出力: δ_max = max(δ_ρ, δ_Te, δ_Z̄) per cell → CUB Max → host check < raytrace_skip → skip
+__global__ void ray_skip_check_kernel(      // src/laser/raytrace_skip.cu
+    double* __restrict__ delta_max_cell,    // [n_cells] out: セルごとの変化量（max_relative は 3 指標の最大、l2_relative は 3 指標の二乗和）
+    int* __restrict__ crit_hit,             // [1] out: 臨界帯を横断したセルがあれば 1
+    const double* __restrict__ rho,         // [n_cells] in: 現ステップ ρ（HydroMesh）
+    const double* __restrict__ Te,          // [n_cells] in: 現ステップ Te（HydroMesh）
+    const double* __restrict__ Zbar,        // [n_cells] in: 現ステップ Z̄（HydroMesh）
+    const double* __restrict__ volFrac,     // [n_cells × n_mat] in: 体積分率（多材料の A_eff 用）
+    const double* __restrict__ A_mat,       // [n_mat] in: 材料の原子量
+    const int n_mat,
+    const double* __restrict__ rho_cached,  // [n_cells] in: 前回レイトレース時 ρ
+    const double* __restrict__ Te_cached,   // [n_cells] in: 前回レイトレース時 Te
+    const double* __restrict__ Zbar_cached, // [n_cells] in: 前回レイトレース時 Z̄
+    const double rho_floor, const double Te_floor, const double Zbar_floor,  // 分母のフロア（Zbar_floor = 1e-2）
+    const double n_crit,                    // 臨界密度 n_crit(λ) [1/cm³]
+    const double n_hat_margin,              // Laser.lasermesh.critical_margin
+    const double crit_guard,                // 臨界帯の幅（既定 0.01）
+    const double A_eff_uniform,             // A_mat が無いときの原子量
+    const int use_l2_relative,              // 1 = l2_relative、0 = max_relative
+    const int n_cells);
+// HydroMesh の全セルを処理する（キャッシュ配列も HydroMesh のセル数）。
+// max_relative: δ = max(|Δρ|/max(ρ_cached, ρ_floor), |ΔTe|/max(Te_cached, Te_floor), |ΔZ̄|/max(Z̄_cached, Z̄_floor))
+// l2_relative:  分母は現在値 max(|x|, x_floor) で、3 指標の二乗和を書く
+// 臨界帯: A_eff は単一材料なら A_mat[0]、多材料は体積分率で重み付けした 1/A の和の逆数。
+//   n_e = ρ Z̄ / (A_eff m_p) を現在値とキャッシュ値の両方で求め、n_e/n_crit が帯域 n_hat_margin − crit_guard を
+//   横断した（一方だけが帯域を超える）セルがあれば crit_hit = 1（NUMERICS §5.9.4）
 ```
 
-- **block**: 256, **grid**: `(n_LM_cells+255)/256`
-- **処理**: 各LaserMesh対応HydroMeshセルの3指標 δ_ρ, δ_Te, δ_Z̄ を計算（NUMERICS §5.9.2）。lm_to_hydro マッピングで HydroMesh 値を間接参照。分母は max(x_cached, x_floor) でフロア保護。さらに n_e/n_crit > 1 - crit_guard のセルがあれば強制再計算（§5.9.4、n_e = ρ × Z̄ × N_A / A_eff で局所計算）
-- **後段**: CUB `DeviceReduce::Max` → `δ_max` をホストに転送。`δ_max < raytrace_skip` (default 0.01) ならレイトレースを省略
+- **block**: 256, **grid**: `(n_cells+255)/256`
+- **処理**: HydroMesh の各セルで 3 指標 δ_ρ, δ_Te, δ_Z̄（NUMERICS §5.9.2）と臨界帯の横断（§5.9.4）を 1 回の起動で求める
+- **後段**: `crit_hit` が 1 なら再計算する。そうでなければ δ をホストへ転送し、ホストで max_relative は最大値、l2_relative は \(\sqrt{\sum/(3N)}\) を求め、`Laser.raytrace_skip.threshold`（既定 0.01）未満ならレイトレースを省略する
 - **レジスタ**: ~8
 
 ### 5.1e helper: laser_cache_update

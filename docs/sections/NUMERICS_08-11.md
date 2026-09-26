@@ -548,7 +548,7 @@ DDMCの運動量沈着（§7.8.2）と合算して出力する。
 \Delta E_{total} = \Delta E_{int,e} + \Delta E_{int,i} + \Delta E_{kin} + \Delta E_{rad}
 \]
 \[
-= E_{laser,in} - E_{laser,esc} + E_{Marshak,in} - E_{rad,esc} - E_{pdV}^{boundary} - E_{numerical\_loss} + E_{floor} + E_{safety} + E_{redistribution\_unresolved} + E_{solver}
+= E_{laser,in} - E_{laser,esc} - E_{CBET,IAW} + E_{Marshak,in} + E_{volume,in} + E_{burn,in} - E_{rad,esc} - E_{pdV}^{boundary} - E_{numerical\_loss} + E_{floor} + E_{safety} + E_{redistribution\_unresolved} + E_{solver} + E_{rad,mesh\_adv}
 \]
 
 各項の定義（全項 [erg] 単位）：
@@ -558,11 +558,15 @@ DDMCの運動量沈着（§7.8.2）と合算して出力する。
 | \(\Delta E_{int,e}\) | 電子内部エネルギー変化 | \(\sum_i \rho_i\,\Delta e_{e,i}\,V_i\) |
 | \(\Delta E_{int,i}\) | イオン内部エネルギー変化 | \(\sum_i \rho_i\,\Delta e_{i,i}\,V_i\)（人工粘性散逸を含む） |
 | \(\Delta E_{kin}\) | 運動エネルギー変化 | 1D は \(\sum_i \frac{1}{2}m_i u_i^2\)（\(u_i=\frac{1}{2}(v_i+v_{i+1})\)）の差分。2D RZ は §3.3 Phase 12 と同じ corner-mass nodal kinetic energy \(\sum_c K_c^{diag}\) の差分 |
-| \(\Delta E_{rad}\) | 放射場エネルギー変化 | \(E_{census}^{n+1} - E_{census}^n\)（通常は census粒子エネルギーの差分、\(E_{census}=\sum_p E_p\)。difference path では \(E_{census}=\sum_{i,g}U^{ref}_{i,g}+\sum_p s_pE_p\)） |
+| \(\Delta E_{rad}\) | 放射場エネルギー変化 | FLD・S_N では放射エネルギー密度の体積積分 \(\sum_{i,g}E_{g,i}V_i\) の差分。退役した imc_ddmc 経路では \(E_{census}^{n+1} - E_{census}^n\)（census粒子エネルギーの差分、\(E_{census}=\sum_p E_p\)。difference path では \(E_{census}=\sum_{i,g}U^{ref}_{i,g}+\sum_p s_pE_p\)） |
 | \(E_{laser,in}\) | レーザー入射エネルギー | \(\sum_b P_b(t)\,\Delta t\) |
 | \(E_{laser,esc}\) | レーザー未吸収流出 | 臨界終了 + LaserMesh外終了のレイエネルギー合計 |
+| \(E_{CBET,IAW}\) | CBET でイオン音波へ渡るエネルギー | CBET の交換でレーザーから除かれ、イオン音波に渡る分（`E_cbet_iaw`。CBET 有効時のみ非ゼロ） |
 | \(E_{Marshak,in}\) | Marshak境界入射エネルギー | \(\sum_f \frac{a_{eV}\,c}{4}\,T_{r,f}^4\,A_f\,\Delta t\)（§8.2 per-face合計） |
-| \(E_{rad,esc}\) | 放射境界流出 | vacuum/Marshak境界で脱出した粒子のエネルギー合計（`E_escape[g]` の全群合算）|
+| \(E_{volume,in}\) | 放射の体積源エネルギー | FLD・S_N の体積源で入った放射エネルギー（`E_volume_in`） |
+| \(E_{burn,in}\) | 核融合の沈着エネルギー | 燃焼で生じた荷電粒子が電子・イオンへ沈着したエネルギー（`E_burn_in`） |
+| \(E_{rad,esc}\) | 放射境界流出 | 境界から出た放射エネルギー（退役した imc_ddmc 経路では脱出粒子のエネルギー `E_escape[g]` の全群合算）|
+| \(E_{rad,mesh\_adv}\) | 格子の動きによる放射エネルギー変化 | 流体の半ステップの前後での \(\sum_{i,g}E_{g,i}V_i\) の変化（`E_rad_mesh_advection`）。保存的なセル移流では丸め誤差まで 0。`Radiation.multigroup_diffusion.hydro_coupling="none"` では凍結した放射エネルギー密度が体積変化で生む分を含み、物理的な境界流束ではない（§6.7） |
 | \(E_{pdV}^{boundary}\) | 境界PdV仕事 | 外側境界面での \(P\,dV\) |
 | \(E_{floor}\) | フロア補正注入（実装名: `E_floor_injected`） | \(\sum_c \Delta E_{floor,c}\)（§1.1.7 温度・密度フロア + §11.7 安全検査で注入） |
 | \(E_{safety}\) | 伝導安全補正 | §4.2.2 の負温度clampで注入されたエネルギー |
@@ -581,10 +585,10 @@ E_{pdV}^{boundary} = \sum_{f \in \partial\Omega} P_f \,(A_f\, v_{n,f})\,\Delta t
 
 **エネルギー保存誤差の定義**：
 \[
-\varepsilon_{budget} = \frac{|(E_{total}^{n+1} - E_{total}^n - E_{artificial}) - (E_{source} - E_{sink})|}
+\varepsilon_{budget} = \frac{|(E_{total}^{n+1} - E_{total}^n - E_{artificial} - E_{rad,mesh\_adv}) - (E_{source} - E_{sink})|}
                           {E_{denom}}
 \]
-ここで \(E_{source} = E_{laser,in} + E_{Marshak,in} + E_{volume,in} + \max(E_{solver},0)\)、\(E_{sink} = E_{laser,esc} + E_{rad,esc} + E_{numerical\_loss} + E_{pdV}^{boundary} + \max(-E_{solver},0)\)。
+ここで \(E_{source} = E_{laser,in} + E_{Marshak,in} + E_{volume,in} + E_{burn,in} + \max(E_{solver},0)\)、\(E_{sink} = E_{laser,esc} + E_{CBET,IAW} + E_{rad,esc} + E_{numerical\_loss} + E_{pdV}^{boundary} + \max(-E_{solver},0)\)。
 \[
 E_{artificial}=E_{floor}+\max(E_{safety}-E_{floor},0)+E_{redistribution\_unresolved}.
 \]

@@ -376,7 +376,7 @@ MPI実装依存であり最下位ビットの変動があり得るが、モン�
 - `parallel` は `core` と `mesh` に依存（分割にメッシュ情報が必要）
 - `hydro`, `radiation`, `laser` は `parallel` に依存（ハロー交換・粒子移動を呼ぶ）
 - `coupling` は `parallel` に依存（Strang splitting内の交換タイミング制御）
-- `io` は `parallel` に依存（並列HDF5出力のrank情報）
+- `io` は `parallel` に依存（出力を書く rank 0 の判定に rank 情報を使う）
 - `drivers` は `parallel` に依存（MPI初期化/終了）
 
 > 注：`parallel` を含む最新の依存グラフ全体は §6 を参照。

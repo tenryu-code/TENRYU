@@ -2453,16 +2453,16 @@ DiagOutput compute_diagnostics(
 ### 4.9 io/
 **責務**：入出力、再始動、メタデータ
 
-- `IO::HDF5Writer`：並列HDF5。snapshot と checkpoint の deflate 付き dataset のうち 64 KiB 以上は、プロセス共通の圧縮スレッド群（`DeflatePool`。スレッド数は使える CPU 数 − 2、最低 2。使える CPU 数は Linux ではプロセスの affinity と cgroup の CPU 上限で制限する — RunPod の pod はハードウェアスレッド 128・上限 13.6 CPU）が圧縮（zlib `compress2`、HDF5 の deflate フィルタと同じ形式・同じレベル）し、ファイルを閉じる前に `H5Dwrite_chunk` で書く（`DeferredDeflateChunks`、2026-09-25）。512 KiB を超える dataset は第 1 次元に沿って約 256 KiB のチャンクに分けて保存する（端のチャンクは 0 で埋める）。時間ループの snapshot（`OutputManager::write_snapshot`）は `HDF5Writer::write_snapshot_in_background` で書く: ファイルの作成・群・属性・小さい dataset の書き込みと大きい dataset のチャンクの圧縮依頼までを行って返り（データはこの時点で複製済み）、完了（圧縮の待ち・チャンクの書き込み・close・`.tmp` からの rename による公開）は 1 本の完了スレッド（`SnapshotFinisher`）が書いた順に行う（2026-09-25。完了待ちは 2 個まで、超えると書き込み側が待つ。完了スレッドのエラーは次の書き込みか `HDF5Writer::wait_for_snapshot_writes` で再送出され、driver は run の最後の snapshot の後で待つ）。`HDF5Writer::write_snapshot` は同じ書き込みの後、公開まで待ってから返る（戻った時点でファイルがある）。HDF5 の呼び出しはプロセス共通の再帰ロック（`core::hdf5_mutex`）で直列化する（完了スレッドも同じロックの下で書く）。スナップショットの各群は NVTX 区間 `io.snapshot.*`（完了スレッドの close は `io.snapshot.close`）で計測できる
+- `IO::HDF5Writer`：HDF5 出力（rank 0 だけが書き、MPI-IO は使わない）。snapshot と checkpoint の deflate 付き dataset のうち 64 KiB 以上は、プロセス共通の圧縮スレッド群（`DeflatePool`。スレッド数は使える CPU 数 − 2、最低 2。使える CPU 数は Linux ではプロセスの affinity と cgroup の CPU 上限で制限する — RunPod の pod はハードウェアスレッド 128・上限 13.6 CPU）が圧縮（zlib `compress2`、HDF5 の deflate フィルタと同じ形式・同じレベル）し、ファイルを閉じる前に `H5Dwrite_chunk` で書く（`DeferredDeflateChunks`、2026-09-25）。512 KiB を超える dataset は第 1 次元に沿って約 256 KiB のチャンクに分けて保存する（端のチャンクは 0 で埋める）。時間ループの snapshot（`OutputManager::write_snapshot`）は `HDF5Writer::write_snapshot_in_background` で書く: ファイルの作成・群・属性・小さい dataset の書き込みと大きい dataset のチャンクの圧縮依頼までを行って返り（データはこの時点で複製済み）、完了（圧縮の待ち・チャンクの書き込み・close・`.tmp` からの rename による公開）は 1 本の完了スレッド（`SnapshotFinisher`）が書いた順に行う（2026-09-25。完了待ちは 2 個まで、超えると書き込み側が待つ。完了スレッドのエラーは次の書き込みか `HDF5Writer::wait_for_snapshot_writes` で再送出され、driver は run の最後の snapshot の後で待つ）。`HDF5Writer::write_snapshot` は同じ書き込みの後、公開まで待ってから返る（戻った時点でファイルがある）。HDF5 の呼び出しはプロセス共通の再帰ロック（`core::hdf5_mutex`）で直列化する（完了スレッドも同じロックの下で書く）。スナップショットの各群は NVTX 区間 `io.snapshot.*`（完了スレッドの close は `io.snapshot.close`）で計測できる
 - `IO::Checkpoint`：State + Mesh + census粒子（容量対策含む）
 - `IO::Restart`
 - `IO::Schema`：互換性ルール（スキーマ破壊禁止）
 
 **IO方式**：
-- `write_snapshot`：並列HDF5（MPI-IO）、全ランク単一ファイル
-- `write_checkpoint`：ランク別ファイル
-- `read_checkpoint`：rank 0 が全データ読込 → 新パーティションで再分配
-  - **ランク数変更可**：rank 0 が読み込んだ後、新 `PartitionInfo` に基づきセル/粒子を再配布（SPECIFICATION §7.4 準拠）
+- `write_snapshot`：rank 0 だけが 1 つのファイルに書く（MPI-IO は使わない。1D の MPI 実行では書く前に各 rank の担当区間を rank 0 に集める）
+- `write_checkpoint`：rank 0 だけが 1 つのファイル `checkpoints/<case>_ckpt_NNNN.h5` に書く（旧形式のランク別ファイル `_rNNNN.h5` は読み込める）
+- `read_checkpoint`：各 rank が同じチェックポイントファイルを全体読み込む
+  - **ランク数変更可**：各 rank がファイル全体を読むので、保存時と rank 数が違ってもよい（SPECIFICATION §7.4）
   - 粒子の再配布：`cell_id` から新パーティションの所属 rank を判定し MPI 送信
   - `config_hash` 不一致時：WARNING 出力（凍結パラメータ変更は `ConfigError`、SPECIFICATION §7.4 参照）
   - RNG復元：`curand_init(global_id ^ user_seed, step_number, rng_counter)` で O(1) 復元（rank非依存、NUMERICS §12.7.1 準拠）
@@ -2567,8 +2567,6 @@ namespace IO {
     //     : double[n_cells x G] — 1D S_N plateau investigation diagnostics (output-only)
     // /radiation/diag_ap_alpha_face : double[n_faces x G] — AP face_blend weight (output-only)
     // /radiation/ddmc_flag         : int8[n_cells x G]（0=IMC, 1=DDMC, 2=RW。2はlegacy enum値）
-    // /radiation/boundary_flux      : double[G] — [erg/s] 群別境界流出（SPECIFICATION §7.2）
-    // /radiation/momentum_dep      : double[n_cells x D_mom] — [dyne·s/cm³] (診断のみ; D_mom=2D_RZ:2, 1D_SPH:1)
     // /holo/E_LO                  : double[n_cells x G] — HOLO low-order E [erg/cm³]（optional）
     // /holo/consistency_source    : double[n_cells x G] — same-step HOLO RHS source [erg/s]（optional）
     // /holo/rad_dep_LO            : double[n_cells x G] — LO gross absorption diagnostic [erg]（optional）
@@ -2615,9 +2613,8 @@ namespace IO {
                           const Config& cfg, int step, double time);
     State load_checkpoint(const std::string& path, const Config& cfg,
                           const PartitionInfo& part);
-    // Parallel HDF5: H5FD_MPIO + collective write
-    // チャンクサイズ: [n_cells_per_rank, ...]
-    // ファイルシステム固有ヒントは ROMIO_HINTS 環境変数で設定
+    // 出力は rank 0 だけが書く（MPI-IO・collective write は使わない）
+    // 大きい dataset のチャンク分割と圧縮は上の IO::HDF5Writer の説明を参照
 }
 ```
 
