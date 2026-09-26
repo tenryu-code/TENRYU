@@ -20,13 +20,13 @@
         <li>The three presets were checked beyond schema validation: each completed on an RTX 4090 and produced an interpretable result.</li>
         <li>The slab demonstrates heat-front propagation, the laser capsule a direct-drive implosion, and the indirect case stagnation and rebound under Tr(t).</li>
         <li>Use per-step history metrics for sharp implosion peaks that sparse snapshots can miss.</li>
-        <li>The canonical regression reference is <code>examples/verification/gxii_1d_fld_regression.py</code> — the <a href="../verification/index.html#gxii">GXII benchmark deck</a> (GXII: the GEKKO XII laser at ILE, The University of Osaka).</li>
+        <li>The canonical regression reference is <code>examples/verification/gxii_1d_fld_regression.py</code> — the <a href="../verification/index.html#gxii">GXII benchmark deck</a> (GXII: the twelve-beam GEKKO XII laser at the Institute of Laser Engineering, The University of Osaka).</li>
       </ul>
     </aside>
 
     <section aria-labelledby="templates">
       <h2 id="templates">Runnable templates (<code>examples/templates/</code>)</h2>
-      <p>For a first run, the fastest start is a runnable skeleton with comments on every block; they complete unmodified. Copy and rename before editing. The step-by-step procedure is on <a href="running.html#first-run">Running simulations</a>.</p>
+      <p>For a first run, the fastest start is a runnable skeleton with comments on every block; each template completes unmodified. Copy and rename before editing. The step-by-step procedure is on <a href="running.html#first-run">Running simulations</a>.</p>
       <table class="quick-facts">
         <thead><tr><th>Template</th><th>Content</th><th>What it teaches</th></tr></thead>
         <tbody>
@@ -42,7 +42,7 @@
       <p>This suite collects commissioned one-dimensional decks modeling typical laser-plasma experiments.</p>
       <ul>
         <li>Its ten decks cover foil shock breakout, two-pulse shock timing, impedance matching, an exploding foil, a radiative shock in Kr, a cylindrical liner, solid-sphere convergence (with a 600/900/1350-cell study), a D2-filled shell implosion, a CBET + hot-electron corona setup, and Marshak-driven DT burn.</li>
-        <li>The suite README records measured commissioning metrics and caveats for every deck.</li>
+        <li>The suite README records each deck's status, measured commissioning metrics, and caveats.</li>
         <li>The solid materials use <code>tmat</code> EOS tables that are not distributed because they derive from licensed PrOpacEOS data. Users must generate them with <code>tools/tmat/propaceos_to_tmat.py</code> from their own PrOpacEOS/SESAME workflow; one deck additionally requires a SESAME ASCII library.</li>
       </ul>
     </section>
@@ -84,17 +84,17 @@
         <h3 id="absorption-numbers">Three absorption figures, three different conditions</h3>
         <p>This documentation quotes three laser-absorption numbers that are <em>not</em> comparable with one another, because they belong to different irradiation geometries and opacity models:</p>
         <ul>
-          <li><strong>≈83–84%</strong> — the <a href="../verification/index.html#gxii">GXII golden-regression deck</a>: twelve f/3 beams with broad 200 µm super-Gaussian spots overfilling the 250 µm-radius target, constant-opacity ideal-gas benchmark physics.</li>
-          <li><strong>≈86%</strong> — the Studio <code>laser_capsule</code> preset: the same GXII-class 10 TW × 1 ns drive on a preset target whose layer thicknesses, corona ramp, and mesh differ from the regression deck.</li>
-          <li><strong>≈45%</strong> — the HELIOS matched-irradiation LTE campaign: a deliberately narrower ≈113 µm Gaussian spot from a nearly collimated f/191 beam, with LTE table opacities (see <a href="../verification/index.html">Verification &amp; benchmarks</a>).</li>
+          <li><strong>≈93%</strong> — the <a href="../verification/index.html#gxii">GXII golden-regression deck</a> (golden of 2026-09-25): twelve f/3 beams with broad 200 µm super-Gaussian spots overfilling the target of radius 250 µm, with constant-opacity ideal-gas benchmark physics.</li>
+          <li><strong>≈86%</strong> — the Studio <code>laser_capsule</code> preset (measured on 2026-07-31, before the laser changes of August and September 2026): the same GXII-class 10 TW × 1 ns drive on a preset target whose layer thicknesses, corona ramp, and mesh differ from those of the regression deck.</li>
+          <li><strong>≈45%</strong> — the cross-code benchmark against HELIOS (LTE, matched irradiation; measured in July 2026): a deliberately narrow ≈113 µm Gaussian spot from a nearly collimated f/191 beam, with LTE table opacities (see <a href="../verification/index.html">Verification &amp; benchmarks</a>).</li>
         </ul>
-        <p>Absorbed fraction depends strongly on spot size, beam aperture, and the opacity model, so agreement between these numbers is neither expected nor meaningful.</p>
+        <p>Absorbed fraction depends strongly on spot size, beam aperture, and the opacity model, so these numbers are not expected to agree, and their disagreement carries no significance.</p>
       </aside>
     </section>
 
     <section aria-labelledby="verification-library">
       <h2 id="verification-library">Verification deck library</h2>
-      <p><code>examples/verification/</code> is the deck library for reproducing analytic, conservation, single-operator, and integrated regression gates; this page does not enumerate every case. The canonical practical 1D reference spanning direct laser drive, two-temperature matter, hydrodynamics, conduction, and multigroup FLD is <code>gxii_1d_fld_regression.py</code>. In addition to defining the golden-regression input, its comments preserve the corona-ramp lesson. When developing a laser deck, consult those comments together with the pulse, material interfaces, and output history rather than copying key names alone.</p>
+      <p><code>examples/verification/</code> is the deck library for reproducing analytic, conservation, single-operator, and integrated regression gates; this page does not enumerate every case. The canonical practical 1D reference spanning direct laser drive, two-temperature matter, hydrodynamics, conduction, and multigroup FLD is <code>gxii_1d_fld_regression.py</code>. The deck defines the golden-regression input, and its comments record why the initial corona ramp is needed. When developing a laser deck, consult those comments together with the pulse, material interfaces, and output history rather than copying key names alone.</p>
       <p>Presets primarily teach and seed new configurations; verification decks reproduce contracts and detect changes. A plausible preset metric and a passing gate are complementary evidence, and neither substitutes for the other.</p>
     </section>
     <div id="page-footer"></div>

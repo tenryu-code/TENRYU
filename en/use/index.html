@@ -12,7 +12,7 @@
   <main>
     <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
     <h1>Using TENRYU</h1>
-    <p class="abstract">This section covers the whole practical workflow: checking the system requirements, building, completing a first run, writing Python namelist decks (or generating them with TENRYU Studio), and reading the HDF5 outputs. Following the quick start and the path below, this section alone takes you to a completed first run.</p>
+    <p class="abstract">This section covers the whole practical workflow: checking the system requirements, building, completing a first run, writing Python namelist decks (or generating them with TENRYU Studio), and reading the HDF5 outputs. If you follow the quick start and the path below, this section alone takes you to a completed first run.</p>
 
     <section aria-labelledby="quickstart">
       <h2 id="quickstart">Quick start (copy and run)</h2>
@@ -46,7 +46,7 @@ python3 -m tools.tenryu_plot profile outputs/template_1d_slab_radiation</code></
       <a class="card" href="namelist.html"><h3>Namelist reference</h3><p>Navigate top-level blocks, representative keys, units, and authoritative defaults.</p></a>
       <a class="card" href="gui.html"><h3>TENRYU Studio (GUI)</h3><p>Create, validate, save, and run decks from the form-based desktop application.</p></a>
       <a class="card" href="examples.html"><h3>Examples &amp; presets</h3><p>Runnable templates, verified Studio presets, and the verification deck library.</p></a>
-      <a class="card" href="outputs.html"><h3>Outputs &amp; analysis</h3><p>A complete enumeration of the three HDF5 kinds and provenance files, and how to read them.</p></a>
+      <a class="card" href="outputs.html"><h3>Outputs &amp; analysis</h3><p>The three HDF5 file kinds, their groups and main datasets, the provenance files, and how to read them.</p></a>
     </div>
 
     <aside class="planned" aria-labelledby="first-run">
@@ -58,7 +58,7 @@ python3 -m tools.tenryu_plot profile outputs/template_1d_slab_radiation</code></
         <li><a href="examples.html">Examples &amp; presets</a> — run a verified preset, starting with <code>laser_capsule</code>, exactly as distributed.</li>
         <li><a href="outputs.html">Outputs &amp; analysis</a> — read the result: absorption from the energy ledgers (incident versus deposited) and the implosion peak from the per-step history <code>implosion/rho_peak</code>.</li>
       </ol>
-      <p>When you need the physics behind a result, go to the matching <a href="../physics/index.html">physics kernel</a> page; each page's mechanism section explains the background before the equations. How the time step is chosen is collected on <a href="../overview/timestep.html">Time-step control &amp; CFL</a>.</p>
+      <p>When you need the physics behind a result, go to the matching <a href="../physics/index.html">physics kernel</a> page; each page's mechanism section explains the background before the equations. <a href="../overview/timestep.html">Time-step control &amp; CFL</a> explains how the time step is chosen.</p>
     </aside>
 
     <div id="page-footer"></div>

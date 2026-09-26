@@ -26,8 +26,8 @@
 
     <section aria-labelledby="principles-build">
       <h2 id="principles-build">Design principles and build boundary</h2>
-      <p>The first principle is GPU-first execution. Hydrodynamics, FLD and S<sub>N</sub> radiation, and laser ray tracing perform their principal work on NVIDIA GPUs; non-CUDA backends are unsupported. Locality reduces global MPI communication, and fixed dependency directions separate Hydro, Radiation, Laser, Materials, Mesh, Coupling, Diagnostics, I/O, and Driver. Same-GPU, same-configuration reproducibility is an architectural contract.</p>
-      <p>The core uses C++20 and CUDA C++ with CMake (3.25 or newer) and Ninja. Dependencies include CUDA Toolkit 12.x (12.0 or newer), MPI 3.1+, HDF5 1.12+, Python 3.10+, and pybind11 2.11+ — the same requirement set the <a href="../use/building.html">Building</a> page tabulates. Embedded Python reads the single namelist and is released after configuration. MPI and parallel HDF5 provide distributed execution and collective I/O.</p>
+      <p>The first principle is GPU-first execution. Hydrodynamics, FLD and S<sub>N</sub> radiation, and laser ray tracing perform their principal work on NVIDIA GPUs; non-CUDA backends are unsupported. Three properties are architectural contracts on a par with performance: locality that limits global MPI communication; fixed dependency directions among Hydro, Radiation, Laser, Materials, Mesh, Coupling, Diagnostics, I/O, and Driver; and same-GPU, same-configuration reproducibility. Future 3D and additional physics must also fit without breaking the existing boundaries.</p>
+      <p>The core uses C++20 and CUDA C++ with CMake (3.27 or newer) and Ninja. Dependencies include CUDA Toolkit 12.x (12.0 or newer), MPI 3.1+, HDF5 1.12+, Python 3.10+, and pybind11 2.11+ — the same requirement set the <a href="../use/building.html">Building</a> page tabulates. Embedded Python reads the single namelist and is released after configuration. MPI provides distributed execution, and rank 0 writes the HDF5 outputs. Physics modules interact only through shared contracts and never depend on each other's internal representations.</p>
 
       <figure>
         <img src="../../assets/overview-architecture-flow.png" width="980" height="430" style="max-width:100%;height:auto" alt="Block diagram from a Python deck through namelist freezing, Config and State, the coupling driver loop, HDF5 outputs, Studio, and Scope">
@@ -52,7 +52,7 @@
           <tr><th><code>burn/</code></th><td>Advances Bosch–Hale reaction rates, per-cell species networks, product-energy deposition, and species ledgers.</td></tr>
           <tr><th><code>coupling/</code></th><td>Owns operator splitting, dt selection, source injection, EOS reclosure (re-evaluating the EOS whenever an operator changes temperatures or energies, to bring the thermodynamic quantities back into consistency — see <a href="numerics-foundations.html">Numerical foundations</a>), and acceptance of full-step retries.</td></tr>
           <tr><th><code>diagnostics/</code></th><td>Builds ICF observables and audits such as energy budgets, areal density, sphericity, and shell tracking.</td></tr>
-          <tr><th><code>drivers/</code></th><td>Implements the <code>run</code>/<code>verify</code> entry points that assemble Config, mesh, State, callbacks, and the run lifecycle.</td></tr>
+          <tr><th><code>drivers/</code></th><td>Implements the <code>run</code>/<code>verify</code> entry points that assemble Config, mesh, State, and callbacks, then start the run lifecycle.</td></tr>
         </tbody>
       </table>
     </section>
@@ -61,12 +61,12 @@
       <h2 id="config-state-driver">Config, State, and the coupling driver</h2>
       <p>A <code>.py</code> namelist reaches the Builder through CPython and pybind11. The Builder checks types, units, ranges, and cross-field invariants before applying defaults. Geometry callables are evaluated into State arrays; waveforms and time-dependent boundaries become <code>FrozenTable1D</code>. The source and frozen JSON can be stored in HDF5.</p>
       <p><code>Config</code> is passed by const reference to module initialization, with only required fields copied to the GPU. <code>State</code> owns evolving mesh coordinates, density, velocity, 2T energies, pressures, radiation fields, deposition, and ledgers.</p>
-      <p>The coupling driver is the owner of time evolution, not another physics kernel. It chooses dt from the Hydro CFL, conduction and radiation limits, user and output caps, then applies the growth limit relative to the previous accepted step. It calls laser full, hydro half, conduction full, radiation full, and hydro half, inserting required EOS synchronization and halo exchange between operators. When full-step retry is enabled, the driver snapshots State at step entry. An inadmissible Hydro corrector causes a restore, dt halving, and repetition of the entire split sequence. History, snapshots, checkpoints, and cumulative energy accounting sit below the acceptance boundary, so rejected attempts do not become official output.</p>
+      <p>The coupling driver is the owner of time evolution, not another physics kernel. It takes dt as the minimum of the Hydro CFL limit, the conduction and radiation limits, and the user and output caps, then applies the growth limit relative to the previous accepted step. It calls laser full, hydro half, conduction full, radiation full, and hydro half, inserting required EOS synchronization and halo exchange between operators. When full-step retry is enabled, the driver snapshots State at step entry. An inadmissible Hydro corrector causes a restore, dt halving, and repetition of the entire split sequence. History, snapshots, checkpoints, and cumulative energy accounting sit below the acceptance boundary, so rejected attempts do not become official output.</p>
     </section>
 
     <section aria-labelledby="device-memory">
       <h2 id="device-memory">Device-memory idioms</h2>
-      <p>Typed <code>DeviceArray&lt;T&gt;</code> and dimension-specific Field wrappers make ownership, moves, and reset explicit. Temporary workspaces use process-lifetime, named, grow-only scratch pools with unique tags for simultaneous buffers. Acquisition has <code>cudaMalloc</code>'s uninitialized-content contract, so required zeroing is explicit. Pooled wrappers do not free individually; shutdown releases the pools together. This removes repeated time-loop allocation while preventing aliasing and dependence on old contents.</p>
+      <p>Typed <code>DeviceArray&lt;T&gt;</code> and dimension-specific Field wrappers make ownership, moves, and reset explicit. Temporary workspaces use process-lifetime, named, grow-only scratch pools with unique tags for simultaneous buffers. Acquisition has <code>cudaMalloc</code>'s uninitialized-content contract, so required zeroing is explicit. Pooled wrappers do not free individually; shutdown releases the pools together. This convention removes repeated time-loop allocation while preventing aliasing and dependence on old contents.</p>
     </section>
 
     <section aria-labelledby="desktop-apps">
@@ -74,7 +74,7 @@
       <h3>TENRYU Studio — build and run</h3>
       <p>TENRYU Studio is a Tauri 2 and React/TypeScript form-based deck application. It configures the run and generates a Python deck with embedded state for round-trip editing. It validates decks and uses system <code>ssh</code>/<code>scp</code> for configured servers. Its final artifact is the same single-namelist contract accepted by the CLI.</p>
       <h3>TENRYU Scope — inspect and compare</h3>
-      <p>TENRYU Scope specializes in HDF5 snapshots and history. It opens local or remote runs, then renders 1D profiles, histories, and 2D tensor or CSR (compressed-sparse-row connectivity) multiblock fields. It provides colormaps, linear/log ranges, zoom/pan, time animation, lineouts, laser-ray overlays, and PNG, CSV, or video export, separating result exploration from deck authoring.</p>
+      <p>TENRYU Scope specializes in HDF5 snapshots and history. It opens local or remote runs, then renders 1D profiles, histories, and 2D tensor or CSR (compressed-sparse-row connectivity) multiblock fields. It provides colormaps, linear/log ranges, zoom/pan, time animation, lineouts, laser-ray overlays, and PNG, CSV, or video export. Scope does not replace the lightweight result check in Studio; it takes on large-field exploration and run-to-run comparison.</p>
     </section>
 
     <div id="page-footer"></div>
