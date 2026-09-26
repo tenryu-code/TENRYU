@@ -29,7 +29,7 @@ export function presetBlank(): FormState {
 }
 
 /** 平面 1D 放射スラブ: 灰色 FLD + Marshak 120 eV、流体 OFF。
- *  κ=2000 cm²/g・cv=3e11 で 1 ns に壁 ~104 eV・前線 ~35 µm・前方冷域が立つ実証済み構成。 */
+ *  κ=2000 cm²/g・cv_e_override=3e11 erg/(cm³·eV)（体積あたり）で 1 ns に壁 ~104 eV・前線 ~35 µm・前方冷域が立つ実証済み構成。 */
 export function presetSlabRadiation(): FormState {
   const f = defaultFormState();
   f.main.name = "slab_radiation";
