@@ -864,6 +864,7 @@ export const en: Messages = {
     close: "Close",
     copy: "Copy",
     loading: "Loading…",
+    remove: "Remove",
   },
   validation: {
     caseName: "Case name must contain only alphanumerics, _, or - (not empty)",

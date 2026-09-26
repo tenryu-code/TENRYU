@@ -172,7 +172,7 @@ export default function MeshSection() {
                     value={seg.nr}
                     onChange={(n) => update((f) => { f.mesh.segments[i].nr = n ?? 0; })}
                   />
-                  <Button onClick={() => update((f) => { f.mesh.segments.splice(i, 1); })}>削除</Button>
+                  <Button onClick={() => update((f) => { f.mesh.segments.splice(i, 1); })}>{m.common.remove}</Button>
                 </div>
               ))}
               <Button
@@ -282,7 +282,7 @@ export default function MeshSection() {
                 disabled={form.geometry.regions.length === 1}
                 onClick={() => update((f) => { f.geometry.regions.splice(i, 1); })}
               >
-                削除
+                {m.common.remove}
               </Button>
             </div>
           ))}
@@ -392,7 +392,7 @@ export default function MeshSection() {
                   variant="danger"
                   onClick={() => update((f) => { f.geometry.shapes2d.splice(i, 1); })}
                 >
-                  削除
+                  {m.common.remove}
                 </Button>
               </div>
               <TextField
@@ -537,7 +537,7 @@ export default function MeshSection() {
                           f.geometry.shapes2d[i].vertices.splice(vertexIndex, 1);
                         })}
                       >
-                        削除
+                        {m.common.remove}
                       </Button>
                     </div>
                   ))}

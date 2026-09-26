@@ -311,7 +311,7 @@ export default function LaserSection() {
                       disabled={form.laser.beams.length === 1}
                       onClick={() => update((f) => { f.laser.beams.splice(i, 1); })}
                     >
-                      削除
+                      {m.common.remove}
                     </Button>
                   )}
                 </div>

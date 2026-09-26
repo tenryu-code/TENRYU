@@ -863,6 +863,7 @@ export const ja = {
     close: "閉じる",
     copy: "コピー",
     loading: "読み込み中…",
+    remove: "削除",
   },
   validation: {
     caseName: "ケース名は英数字・_・- のみ (空不可)",
