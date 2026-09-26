@@ -30,7 +30,7 @@
       <table class="quick-facts">
         <thead><tr><th>テンプレート</th><th>内容</th><th>学べること</th></tr></thead>
         <tbody>
-          <tr><th><code>template_1d_slab_radiation.py</code></th><td>平面 1D・灰色 FLD・Marshak 境界駆動・流体 OFF</td><td>放射伝播の最小構成。validate → run → 可視化の流れ。</td></tr>
+          <tr><th><code>template_1d_slab_radiation.py</code></th><td>平面 1D・グレイ FLD・Marshak 境界駆動・流体 OFF</td><td>放射伝播の最小構成。validate → run → 可視化の流れ。</td></tr>
           <tr><th><code>template_1d_laser_sphere.py</code></th><td>球 1D・レーザー直接照射・2 温度・伝導 ON</td><td>レーザー波形の書き方、複合物理。</td></tr>
           <tr><th><code>template_1d_indirect_tr.py</code></th><td>球 1D・Tr(t) 間接照射駆動</td><td>時間依存 callable → 凍結テーブルの流儀。</td></tr>
         </tbody>
@@ -41,8 +41,8 @@
       <h2 id="laser-plasma-1d">1 次元レーザープラズマ例題集（<code>examples/laser_plasma_1d/</code>）</h2>
       <p>典型的なレーザープラズマ実験をモデル化した、コミッショニング済みの 1 次元デッキをまとめている。</p>
       <ul>
-        <li>収録する 10 本は、箔の衝撃波ブレークアウト、2 パルス衝撃波タイミング、インピーダンス整合、爆発箔、Kr 中の輻射衝撃波、円筒ライナー、固体球収束（600/900/1350 セルの調査）、D2 充填シェル爆縮、CBET と高温電子を含むコロナ、Marshak 駆動の DT 燃焼を扱う。</li>
-        <li>各デッキで測定したコミッショニング指標と注意点は、例題集の README に記録している。</li>
+        <li>収録する 10 本は、箔の衝撃波ブレークアウト、2 パルス衝撃波タイミング、インピーダンス整合、爆発箔、Kr 中の輻射衝撃波、円筒ライナー、固体球収束（600/900/1350 セルの調査）、D2 充填シェル爆縮、CBET とホット電子を含むコロナ、Marshak 駆動の DT 燃焼を扱う。</li>
+        <li>各デッキの状態、測定したコミッショニング指標、注意点は、例題集の README に記録している。</li>
         <li>固体材料が用いる <code>tmat</code> EOS 表は、ライセンスされた PrOpacEOS 由来のため配布しない。利用者は自身の PrOpacEOS/SESAME ワークフローから <code>tools/tmat/propaceos_to_tmat.py</code> で生成する必要があり、うち 1 本のデッキには SESAME ASCII ライブラリも必要である。</li>
       </ul>
     </section>
@@ -69,7 +69,7 @@
           <tr>
             <th><code>indirect_tr</code><br>間接照射 Tr(t)</th>
             <td>外側の Marshak 境界を 120 eV のフットで 0.5 ns 保ち、1 ns までに 200 eV へ立ち上げる。5 ns まで計算し、アブレータは κ=2000 cm²/g。</td>
-            <td>最大圧縮は約 4.2〜4.5 ns、最小半径は約 10 µm、圧縮比は CR≈30。停滞を越えて反跳へ移る軌道まで捉えている。</td>
+            <td>最大圧縮は約 4.2–4.5 ns、最小半径は約 10 µm、収束比は CR≈30。停滞を越えて反跳へ移る軌道まで捉えている。</td>
           </tr>
         </tbody>
       </table>
@@ -84,9 +84,9 @@
         <h3 id="absorption-numbers">3 つの吸収率と、その異なる条件</h3>
         <p>本ドキュメントには 3 つのレーザー吸収率が登場するが、照射幾何と不透明度モデルが異なるため、<em>互いに比較できない</em>。</p>
         <ul>
-          <li><strong>約 83–84%</strong> — <a href="../verification/index.html#gxii">GXII 基準回帰デッキ</a>：f/3 の 12 ビームが 200 µm の super-Gaussian スポットで半径 250 µm のターゲットを覆う広い照射。固定不透明度・理想気体のベンチマーク物理。</li>
-          <li><strong>約 86%</strong> — Studio の <code>laser_capsule</code> プリセット：同じ GXII 級 10 TW × 1 ns 駆動だが、層の厚み・コロナランプ・格子が回帰デッキとは異なるプリセットターゲット。</li>
-          <li><strong>約 45%</strong> — HELIOS との照射整合 LTE キャンペーン：意図的に狭い約 113 µm のガウススポットをほぼ平行ビーム（f/191）で与え、LTE テーブル不透明度を使用（<a href="../verification/index.html">検証とベンチマーク</a>参照）。</li>
+          <li><strong>約 93%</strong> — <a href="../verification/index.html#gxii">GXII 基準回帰デッキ</a>（2026-09-25 の基準解）：f/3 の 12 ビームが 200 µm の super-Gaussian スポットで半径 250 µm のターゲットを覆う広い照射。固定不透明度・理想気体のベンチマーク物理。</li>
+          <li><strong>約 86%</strong> — Studio の <code>laser_capsule</code> プリセット（2026-07-31 の測定。2026 年 8〜9 月のレーザーの変更より前）：同じ GXII 級 10 TW × 1 ns 駆動だが、層の厚み・コロナ層・格子が回帰デッキとは異なるプリセットターゲット。</li>
+          <li><strong>約 45%</strong> — HELIOS とのコード間ベンチマーク（照射条件をそろえた LTE 比較。2026 年 7 月の測定）：意図的に狭い約 113 µm のガウススポットをほぼ平行ビーム（f/191）で与え、LTE テーブル不透明度を使用（<a href="../verification/index.html">検証とベンチマーク</a>参照）。</li>
         </ul>
         <p>吸収率はスポット径、ビーム開口、不透明度モデルに強く依存するため、これらの数字が一致することは期待されず、一致しないことに意味もない。</p>
       </aside>

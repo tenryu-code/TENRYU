@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="960" height="470" viewBox="0 0 960 470" role="img" aria-labelledby="title desc">
-  <title id="title">Option C の MPI 所有ウィンドウと ghost 交換</title>
+  <title id="title">MPI の所有ウィンドウと ghost 交換</title>
   <desc id="desc">3つの rank が同じ12 cell の global index 空間を保持する。各 rank の所有 cell は青、2層 ghost は黄、far 領域は灰色で、rank 間の矢印が owner-overwrite を示す。</desc>
   <defs>
     <pattern id="far" width="8" height="8" patternUnits="userSpaceOnUse">
@@ -12,7 +12,7 @@
   </defs>
 
   <rect width="960" height="470" rx="14" fill="#f8fafc"/>
-  <text x="480" y="36" text-anchor="middle" fill="#0f172a" font-family="sans-serif" font-size="21" font-weight="700">Option C: 全 rank が同じ global index 空間を保持</text>
+  <text x="480" y="36" text-anchor="middle" fill="#0f172a" font-family="sans-serif" font-size="21" font-weight="700">全 rank が同じ global index 空間を保持</text>
   <text x="195" y="76" fill="#475569" font-family="sans-serif" font-size="14">global cell index c →</text>
 
   <g font-family="sans-serif" font-size="13" text-anchor="middle" fill="#475569">

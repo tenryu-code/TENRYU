@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="640" height="460" viewBox="0 0 640 460" role="img" aria-labelledby="title desc">
   <title id="title">Spherical chord ray tracing in the radius and impact-parameter plane</title>
-  <desc id="desc">Several rays enter a spherical underdense corona with different impact parameters. Refraction bends two rays toward Bouguer turning points, inverse-bremsstrahlung deposition occurs along both legs, and a central ray terminates at the critical surface.</desc>
+  <desc id="desc">Several rays enter a spherical underdense corona with different impact parameters. Refraction bends two rays toward Bouguer turning points, inverse-bremsstrahlung deposition occurs along both legs, and a central ray reaches the critical surface, where the default characteristic integration reflects it and the leapfrog march terminates it.</desc>
   <defs>
     <radialGradient id="corona" cx="50%" cy="50%" r="50%">
       <stop offset="0" stop-color="#fecaca" stop-opacity="0.86"/>
@@ -70,7 +70,7 @@
   <line x1="281" y1="216" x2="281" y2="244" stroke="#dc2626" stroke-width="2.3"/>
   <line x1="274" y1="220" x2="288" y2="240" stroke="#dc2626" stroke-width="2.3"/>
   <line x1="288" y1="220" x2="274" y2="240" stroke="#dc2626" stroke-width="2.3"/>
-  <text x="230" y="257" fill="#b91c1c" font-family="sans-serif" font-size="12" font-weight="700">critical termination</text>
+  <text x="230" y="257" fill="#b91c1c" font-family="sans-serif" font-size="12" font-weight="700">reflect or terminate</text>
 
   <g transform="translate(36 375)" font-family="sans-serif" font-size="12">
     <rect x="0" y="0" width="568" height="56" rx="9" fill="#ffffff" stroke="#cbd5e1"/>
