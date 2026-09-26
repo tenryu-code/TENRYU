@@ -264,7 +264,7 @@ struct HotspotGasDiagnostics {
 void initialize_hotspot_gas_tracer(core::State& state,
                                    const core::Config& cfg);
 
-EnergyBudget compute_energy_budget_1d(const core::State& state);
+EnergyBudget compute_energy_budget_1d(const core::State& state, bool whole_line = false);
 EnergyBudget compute_energy_budget_2d(const core::State& state);
 
 double relative_total_energy_error(const EnergyBudget& reference,

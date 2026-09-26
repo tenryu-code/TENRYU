@@ -1263,7 +1263,7 @@ Config パース時に文字列→enum変換を行う。
   - 電子熱伝導：Spitzer-Härm + flux limiter（NUMERICS §4）
   - イオン伝導（オプション、既定OFF、1D・2T、2026-09-26）：`ion_conduction_step_1d`
     （`conduction.cu`）が電子の伝導と記帳の後に Braginskii の \(\kappa_i\) で後退 Euler の
-    三重対角系（電子の陰解法の組み立てカーネルを共用し、1 ブロックの並列巡回縮約で）を解き、
+    三重対角系（電子の陰解法の組み立てカーネルを共用し、640 セル以下は 1 ブロックの並列巡回縮約、それより長い線は cuSPARSE の gtsv2 で）を解き、
     \(e_i\) に記帳してから `Hydro1D::close_eos` で閉じ直す（NUMERICS §4.6）。呼び出しは
     Driver の伝導段（`run_conduction_phase`）の末尾
   - 1D_SPH：3点トリダイアゴナル離散化（NUMERICS §3.1.7）

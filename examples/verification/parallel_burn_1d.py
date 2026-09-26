@@ -119,6 +119,8 @@ Numerics(
 Output(
     directory=_OUTDIR,
     plot_every=1000000,
+    # The conduction variants also write the final snapshot (snapshot gate).
+    write_final_snapshot=(_CONDUCTION != "off"),
 )
 
 Radiation(enabled=False)

@@ -77,7 +77,10 @@ struct EnergyBudgetStepInput {
   const parallel::Reduction* reduction = nullptr;
 };
 
-EnergyTotals compute_energy_totals_1d(const core::State& state);
+// whole_line: sum every cell of the line instead of the owned window (1D MPI:
+// rank 0's whole-line arrays hold the owners' values after the driver's
+// consolidation; the same window as the serial run).
+EnergyTotals compute_energy_totals_1d(const core::State& state, bool whole_line = false);
 EnergyTotals compute_energy_totals_2d(const core::State& state);
 
 // --- W-R1 slot (read-deferred) audit reductions --------------------------

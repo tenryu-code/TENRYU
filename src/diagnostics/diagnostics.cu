@@ -796,8 +796,8 @@ double compute_absorption_weighted_r(const core::State& state) {
 
 }  // namespace
 
-EnergyBudget compute_energy_budget_1d(const core::State& state) {
-  const EnergyTotals totals = compute_energy_totals_1d(state);
+EnergyBudget compute_energy_budget_1d(const core::State& state, const bool whole_line) {
+  const EnergyTotals totals = compute_energy_totals_1d(state, whole_line);
   EnergyBudget budget{};
   budget.E_int_e = totals.E_int_e;
   budget.E_int_i = totals.E_int_i;
