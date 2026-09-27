@@ -5,6 +5,13 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>TENRYU Studio ユーザーマニュアル (1D)</title>
   <link rel="stylesheet" href="manual.css">
+  <script>
+    /* The color scheme chosen on the documentation site (docs/site/theme.js), if any. */
+    try {
+      var tenryuTheme = window.localStorage.getItem("tenryu-docs-theme");
+      if (tenryuTheme === "light" || tenryuTheme === "dark") document.documentElement.setAttribute("data-theme", tenryuTheme);
+    } catch (err) { /* storage unavailable: follow the system setting */ }
+  </script>
 </head>
 <body>
   <main>
