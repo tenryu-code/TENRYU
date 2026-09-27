@@ -1,11 +1,93 @@
+/* Colors are tokens: the light values below and the dark values in the
+   two screen-only blocks that follow (the operating-system setting through
+   prefers-color-scheme unless the reader chose "light" on the
+   documentation site, and the reader's explicit "dark" choice there, which
+   the inline script of each manual page applies as data-theme on <html>).
+   Printing keeps the light colors. */
 :root {
   color-scheme: light;
+  --page-bg: #fafafa;
+  --text: #1f2937;
+  --text-strong: #111827;
+  --text-lead: #374151;
+  --text-muted: #6b7280;
+  --accent: #2563eb;
+  --link: #1d4ed8;
+  --link-hover: #1e40af;
+  --surface: #fff;
+  --border: #e5e7eb;
+  --figure-border: #ddd;
+  --figure-shadow: rgb(0 0 0 / 8%);
+  --code-bg: #f0f0f0;
+  --pre-border: #ddd;
+  --cell-border: #d9dde3;
+  --table-head-bg: #f3f4f6;
+  --tip-border: #3b82f6;
+  --tip-bg: #eaf3ff;
+  --warn-border: #d97706;
+  --warn-bg: #fff4d8;
+  --footer-border: #d1d5db;
+
   font-family:
     -apple-system, BlinkMacSystemFont, "Segoe UI", "Hiragino Kaku Gothic ProN",
     "Hiragino Sans", "Yu Gothic", Meiryo, Arial, sans-serif;
-  color: #1f2937;
-  background: #fafafa;
+  color: var(--text);
+  background: var(--page-bg);
   line-height: 1.7;
+}
+
+@media screen and (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --page-bg: #111827;
+    --text: #e5e7eb;
+    --text-strong: #f9fafb;
+    --text-lead: #d1d5db;
+    --text-muted: #9ca3af;
+    --accent: #3b82f6;
+    --link: #93c5fd;
+    --link-hover: #bfdbfe;
+    --surface: #1f2937;
+    --border: #374151;
+    --figure-border: #374151;
+    --figure-shadow: rgb(0 0 0 / 40%);
+    --code-bg: #1f2937;
+    --pre-border: #374151;
+    --cell-border: #374151;
+    --table-head-bg: #273449;
+    --tip-border: #3b82f6;
+    --tip-bg: #172554;
+    --warn-border: #d97706;
+    --warn-bg: #3b2a07;
+    --footer-border: #374151;
+  }
+}
+
+@media screen {
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --page-bg: #111827;
+    --text: #e5e7eb;
+    --text-strong: #f9fafb;
+    --text-lead: #d1d5db;
+    --text-muted: #9ca3af;
+    --accent: #3b82f6;
+    --link: #93c5fd;
+    --link-hover: #bfdbfe;
+    --surface: #1f2937;
+    --border: #374151;
+    --figure-border: #374151;
+    --figure-shadow: rgb(0 0 0 / 40%);
+    --code-bg: #1f2937;
+    --pre-border: #374151;
+    --cell-border: #374151;
+    --table-head-bg: #273449;
+    --tip-border: #3b82f6;
+    --tip-bg: #172554;
+    --warn-border: #d97706;
+    --warn-bg: #3b2a07;
+    --footer-border: #374151;
+  }
 }
 
 * {
@@ -18,7 +100,7 @@ html {
 
 body {
   margin: 0;
-  background: #fafafa;
+  background: var(--page-bg);
 }
 
 main {
@@ -34,8 +116,8 @@ header {
 h1,
 h2 {
   padding-left: 14px;
-  border-left: 4px solid #2563eb;
-  color: #111827;
+  border-left: 4px solid var(--accent);
+  color: var(--text-strong);
   line-height: 1.35;
 }
 
@@ -51,7 +133,7 @@ h2 {
 
 h3 {
   margin: 28px 0 10px;
-  color: #1f2937;
+  color: var(--text);
   font-size: 1.15rem;
 }
 
@@ -60,23 +142,23 @@ p {
 }
 
 a {
-  color: #1d4ed8;
+  color: var(--link);
   text-decoration-thickness: 1px;
   text-underline-offset: 2px;
 }
 
 a:hover {
-  color: #1e40af;
+  color: var(--link-hover);
 }
 
 .lead {
   margin-bottom: 8px;
-  color: #374151;
+  color: var(--text-lead);
   font-size: 1.08rem;
 }
 
 .meta {
-  color: #6b7280;
+  color: var(--text-muted);
   font-size: 0.92rem;
 }
 
@@ -88,9 +170,9 @@ a:hover {
 .toc {
   margin: 28px 0 36px;
   padding: 20px 24px;
-  border: 1px solid #e5e7eb;
+  border: 1px solid var(--border);
   border-radius: 6px;
-  background: #fff;
+  background: var(--surface);
 }
 
 .toc h2 {
@@ -128,10 +210,10 @@ li + li {
 figure {
   margin: 22px 0 28px;
   overflow: hidden;
-  border: 1px solid #ddd;
+  border: 1px solid var(--figure-border);
   border-radius: 6px;
-  background: #fff;
-  box-shadow: 0 2px 8px rgb(0 0 0 / 8%);
+  background: var(--surface);
+  box-shadow: 0 2px 8px var(--figure-shadow);
 }
 
 figure img {
@@ -142,8 +224,8 @@ figure img {
 
 figcaption {
   padding: 9px 12px;
-  border-top: 1px solid #e5e7eb;
-  color: #6b7280;
+  border-top: 1px solid var(--border);
+  color: var(--text-muted);
   font-size: 0.9em;
 }
 
@@ -151,7 +233,7 @@ code,
 pre {
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
     "Liberation Mono", "Courier New", monospace;
-  background: #f0f0f0;
+  background: var(--code-bg);
 }
 
 code {
@@ -164,7 +246,7 @@ pre {
   overflow-x: auto;
   margin: 14px 0;
   padding: 14px 16px;
-  border: 1px solid #ddd;
+  border: 1px solid var(--pre-border);
   border-radius: 5px;
   line-height: 1.5;
 }
@@ -178,21 +260,21 @@ table {
   width: 100%;
   margin: 18px 0 26px;
   border-collapse: collapse;
-  background: #fff;
+  background: var(--surface);
   font-size: 0.95rem;
 }
 
 th,
 td {
   padding: 10px 12px;
-  border: 1px solid #d9dde3;
+  border: 1px solid var(--cell-border);
   text-align: left;
   vertical-align: top;
 }
 
 th {
-  background: #f3f4f6;
-  color: #111827;
+  background: var(--table-head-bg);
+  color: var(--text-strong);
 }
 
 .table-wrap {
@@ -208,25 +290,25 @@ th {
 }
 
 .tip {
-  border-left-color: #3b82f6;
-  background: #eaf3ff;
+  border-left-color: var(--tip-border);
+  background: var(--tip-bg);
 }
 
 .warn {
-  border-left-color: #d97706;
-  background: #fff4d8;
+  border-left-color: var(--warn-border);
+  background: var(--warn-bg);
 }
 
 .tip strong,
 .warn strong {
-  color: #111827;
+  color: var(--text-strong);
 }
 
 footer {
   margin-top: 56px;
   padding-top: 20px;
-  border-top: 1px solid #d1d5db;
-  color: #6b7280;
+  border-top: 1px solid var(--footer-border);
+  color: var(--text-muted);
   text-align: center;
   font-size: 0.9rem;
 }

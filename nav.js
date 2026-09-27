@@ -210,8 +210,11 @@
           <span class="language-switcher" aria-label="${text.language}">
             ${languageLink("en", "English")}<span aria-hidden="true">|</span>${languageLink("ja", "日本語")}
           </span>
+          <span class="theme-toggle-slot"></span>
         </nav>
       </header>`;
+    const themeSlot = target.querySelector(".theme-toggle-slot");
+    if (themeSlot && window.TenryuTheme) window.TenryuTheme.mountToggle(themeSlot, lang);
   }
 
   function renderSidebar() {
