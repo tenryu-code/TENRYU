@@ -8,6 +8,14 @@
 :root {
   --topbar-height: 64px;
   --sidebar-width: 280px;
+  /* On wide screens the sidebar and the text column form one block centered
+     in the window: --layout-offset is the equal margin on either side of
+     that block (0 until the window is wider than the block). It holds a
+     percentage, which each use resolves against its own containing block
+     (the viewport for the fixed top bar and sidebar, the body for main),
+     so a classic scrollbar does not push the page into horizontal scroll. */
+  --content-max: 960px;
+  --layout-offset: max(0px, calc((100% - var(--sidebar-width) - var(--content-max)) / 2));
   --slate-900: #1e293b;
   --slate-700: #334155;
   --slate-600: #475569;
@@ -194,7 +202,7 @@ a:hover {
   align-items: center;
   justify-content: space-between;
   height: var(--topbar-height);
-  padding: 0 1.5rem;
+  padding: 0 calc(1.5rem + var(--layout-offset));
   color: var(--topbar-text);
   background: var(--topbar-bg);
   box-shadow: var(--topbar-shadow);
@@ -286,7 +294,8 @@ a:hover {
   top: var(--topbar-height);
   bottom: 0;
   left: 0;
-  width: var(--sidebar-width);
+  width: calc(var(--sidebar-width) + var(--layout-offset));
+  padding-left: var(--layout-offset);
   overflow-y: auto;
   border-right: 1px solid var(--border);
   background: var(--sidebar-bg);
@@ -366,10 +375,10 @@ a:hover {
 
 main {
   width: calc(100% - var(--sidebar-width));
-  max-width: 900px;
+  max-width: var(--content-max);
   min-height: calc(100vh - var(--topbar-height));
   margin-top: var(--topbar-height);
-  margin-left: var(--sidebar-width);
+  margin-left: calc(var(--sidebar-width) + var(--layout-offset));
   padding: 2.5rem;
   background: var(--page-bg);
 }
@@ -440,7 +449,6 @@ h3 {
 }
 
 .abstract {
-  max-width: 78ch;
   color: var(--text-soft);
   font-size: 1.03rem;
 }
@@ -479,6 +487,15 @@ pre {
   overflow-x: auto;
   padding: 1rem;
   border-radius: 0.4rem;
+}
+
+/* nav.js marks a display equation wider than the text column with .is-wide;
+   it then scrolls inside the column instead of widening the page. The 1px of
+   padding keeps glyph edges that touch the box from being clipped. */
+mjx-container[display="true"].is-wide {
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 1px 0;
 }
 
 figure img,
@@ -556,6 +573,25 @@ main img {
   width: 8.5rem;
   color: var(--text-soft);
   background: var(--table-head-bg);
+}
+
+/* nav.js wraps every table in .table-scroll: a table wider than the text
+   column scrolls inside the column instead of widening the page. The
+   wrapper takes over the table's top margin so the spacing is unchanged. */
+.table-scroll {
+  margin-top: 1rem;
+  overflow-x: auto;
+}
+
+.table-scroll > table {
+  margin-top: 0;
+}
+
+@media print {
+  .table-scroll,
+  mjx-container[display="true"].is-wide {
+    overflow: visible;
+  }
 }
 
 .button-row {
@@ -678,6 +714,7 @@ main.language-chooser {
 @media (max-width: 780px) {
   :root {
     --topbar-height: 76px;
+    --layout-offset: 0px;
   }
 
   .topbar {

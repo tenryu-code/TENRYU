@@ -45,7 +45,7 @@
           <tr><th><a href="hot-electrons.html">Hot electrons</a></th><td>Yes (the cylindrical measure rejects <code>"cone"</code>)</td><td>Yes (requires <code>raytrace_3d</code> and <code>"cone"</code>)</td><td>Opt-in via <code>Laser.hot_electron.enable=True</code>.</td></tr>
           <tr><th><a href="eos-opacity.html">EOS, opacity, and ionization</a></th><td>All measures</td><td>Yes</td><td>Always on (material closure).</td></tr>
           <tr><th><a href="burn.html">Nuclear burn</a></th><td>Spherical (<code>fraley</code>, <code>diffusion</code>, <code>mc</code>)</td><td><code>local</code> and <code>diffusion</code> only</td><td>Opt-in via <code>Burn.enabled=True</code>.</td></tr>
-          <tr><th><a href="viscosity.html">Plasma viscosity</a></th><td>Spherical, cylindrical, planar</td><td>Yes</td><td>Opt-in via <code>Numerics.hydro.plasma_viscosity.enabled=True</code>.</td></tr>
+          <tr><th><a href="viscosity.html">Plasma viscosity</a></th><td>Spherical, cylindrical, planar</td><td>Yes</td><td>Opt-in via <code>Numerics.hydro.<wbr>plasma_viscosity.<wbr>enabled=True</code>.</td></tr>
           <tr><th><a href="mpi.html">MPI decomposition</a></th><td>Radial slabs</td><td>Radial slabs (multi-rank requires <code>time_integration="pc_v0"</code>)</td><td>Configured via the <code>Parallel</code> block.</td></tr>
         </tbody>
       </table>

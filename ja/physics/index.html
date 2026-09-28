@@ -45,7 +45,7 @@
           <tr><th><a href="hot-electrons.html">ホット電子</a></th><td>対応（円筒測度では <code>"cone"</code> 不可）</td><td>対応（<code>raytrace_3d</code>+<code>"cone"</code> が前提）</td><td><code>Laser.hot_electron.enable=True</code> の明示指定。</td></tr>
           <tr><th><a href="eos-opacity.html">EOS・不透明度・電離</a></th><td>全測度</td><td>対応</td><td>常時有効（材料クロージャ）。</td></tr>
           <tr><th><a href="burn.html">核燃焼</a></th><td>球対称（<code>fraley</code>・<code>diffusion</code>・<code>mc</code>）</td><td><code>local</code>・<code>diffusion</code> のみ</td><td><code>Burn.enabled=True</code> の明示指定。</td></tr>
-          <tr><th><a href="viscosity.html">プラズマ粘性</a></th><td>球・円筒・平面</td><td>対応</td><td><code>Numerics.hydro.plasma_viscosity.enabled=True</code> の明示指定。</td></tr>
+          <tr><th><a href="viscosity.html">プラズマ粘性</a></th><td>球・円筒・平面</td><td>対応</td><td><code>Numerics.hydro.<wbr>plasma_viscosity.<wbr>enabled=True</code> の明示指定。</td></tr>
           <tr><th><a href="mpi.html">MPI 分割</a></th><td>r スラブ</td><td>r スラブ（複数ランクは <code>time_integration="pc_v0"</code> 必須）</td><td><code>Parallel</code> ブロックで構成。</td></tr>
         </tbody>
       </table>
