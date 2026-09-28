@@ -308,9 +308,59 @@
       <div>${text.footer}</div>`;
   }
 
+  // A table wider than the text column scrolls inside a wrapper
+  // (.table-scroll in style.css) instead of widening the page.
+  function wrapTables() {
+    document.querySelectorAll("main table").forEach((table) => {
+      if (table.parentElement.classList.contains("table-scroll")) return;
+      const wrapper = document.createElement("div");
+      wrapper.className = "table-scroll";
+      table.parentNode.insertBefore(wrapper, table);
+      wrapper.appendChild(table);
+    });
+  }
+
+  // A display equation wider than the text column scrolls inside the column
+  // (.is-wide in style.css). Only such equations get the class, after MathJax
+  // has typeset the page and again when the window is resized, so every
+  // equation that fits keeps overflow visible and none of its ink is clipped.
+  function markWideEquations() {
+    document.querySelectorAll('main mjx-container[display="true"]').forEach((container) => {
+      const math = container.querySelector("mjx-math");
+      const wide = !!math && math.getBoundingClientRect().width > container.clientWidth + 0.5;
+      container.classList.toggle("is-wide", wide);
+    });
+  }
+
+  function watchEquationWidths() {
+    let pending = false;
+    window.addEventListener("resize", () => {
+      if (pending) return;
+      pending = true;
+      window.requestAnimationFrame(() => {
+        pending = false;
+        markWideEquations();
+      });
+    });
+    const afterTypesetting = () => {
+      const mathJax = window.MathJax;
+      if (mathJax && mathJax.startup && mathJax.startup.promise) {
+        // MathJax reports its own startup failure; nothing to mark then.
+        mathJax.startup.promise.then(markWideEquations, () => {});
+      }
+    };
+    if (document.readyState === "loading") {
+      document.addEventListener("DOMContentLoaded", afterTypesetting);
+    } else {
+      afterTypesetting();
+    }
+  }
+
   renderTopbar();
   renderSidebar();
   persistSidebarScroll();
   renderBreadcrumb();
   renderFooter();
+  wrapTables();
+  watchEquationWidths();
 })();

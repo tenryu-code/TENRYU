@@ -136,7 +136,7 @@
           <tr><th><code>Radiation.sn_transport.grey_preconditioner</code></th><td><code>"auto"</code></td><td>1D の線形不連続法のグレイ前処理。<code>"auto"</code> は補正の局所利得の最大が 0.1 を超えるニュートン反復でだけ使う。<code>"on"</code>（常に使う）と <code>"off"</code>（使わない）も選べる。</td></tr>
           <tr><th><code>Radiation.sn_transport.max_outer_iterations</code></th><td><code>20</code></td><td>物質・不透明度の外側反復（1D の線形不連続法ではニュートン反復）の上限回数。</td></tr>
           <tr><th><code>Radiation.sn_transport.outer_tol</code></th><td><code>1e-4</code></td><td>電子温度に対する外側反復（ピカール反復、1D の線形不連続法ではニュートン反復）の残差の基本許容値。</td></tr>
-          <tr><th><code>Radiation.sn_transport.outer_tol_hydro_error_scale</code></th><td><code>1e-5</code></td><td>外側反復の許容値の床を与える流体時間誤差スケール。</td></tr>
+          <tr><th><code>Radiation.sn_transport.<wbr>outer_tol_hydro_error_scale</code></th><td><code>1e-5</code></td><td>外側反復の許容値の床を与える流体時間誤差スケール。</td></tr>
           <tr><th><code>Radiation.sn_transport.inner_tol</code></th><td><code>1e-6</code></td><td>スカラー束の源反復に対する許容値。1D の線形不連続法では GMRES の残差の縮小率。</td></tr>
           <tr><th><code>Radiation.sn_transport.boundary.inner_r / outer_r</code></th><td><code>"reflect_parity" / "vacuum"</code></td><td>軸のパリティと、外側 R 面の種別。</td></tr>
           <tr><th><code>Radiation.sn_transport.boundary.z / z_bottom / z_top</code></th><td><code>"vacuum"</code></td><td>2D RZ における Z 境界（共通指定または面別指定）。<code>reflect</code>、<code>marshak</code> も選べる。</td></tr>
