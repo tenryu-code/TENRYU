@@ -45,7 +45,7 @@
       <p>Protective paths can bypass cadence. The preventive axis guard forces rezoning when the axis margin falls below a configured fraction of its initial value. The axis margin is the geometric headroom against inversion of the axis-touching cell row under node motion, evaluated in closed form from the node coordinates of the axis row and the row outside it (units cm²). The default-off pre-hydro corner-J trigger finds where a signed corner Jacobian reaches its floor along the predicted trajectory and invokes ALE before operator splitting when the admissible fraction of the predicted one-step node displacement — how far it can proceed before a corner Jacobian reaches its floor, minimized over all corners — falls below the threshold. Reference-barrier ALE has additional near-axis margin, corner-J ratio, and diagonal-corner length-ratio triggers.</p>
 
       <figure>
-        <img src="../../../assets/ale-remap-cycle.png" width="1080" height="360" style="max-width:100%;height:auto" alt="ALE cycle from a Lagrangian step through trigger evaluation, rezoning, admissibility gates, conservative remap, and corner-mass rebuilding">
+        <img src="../../../assets/ale-remap-cycle.png" width="1080" height="380" style="max-width:100%;height:auto" alt="ALE cycle: trigger check, rezone of the target mesh, admissibility gates with backtracking, conservative remap and corner-mass rebuild; an untriggered step or a rejected target stays Lagrangian">
         <figcaption>Figure A. Rezoning proposes node coordinates only. State transfer and corner-mass rebuilding commit only when the target and remap pass every gate.</figcaption>
       </figure>
     </section>
@@ -113,7 +113,7 @@
       </ul>
 
       <figure>
-        <img src="../../../assets/ale-remap-swept-region.png" width="760" height="570" style="max-width:100%;height:auto" alt="Swept region between an old and a new face, with a conservative flux between adjacent cells">
+        <img src="../../../assets/ale-remap-swept-region.png" width="820" height="440" style="max-width:100%;height:auto" alt="One-dimensional strip before and after rezoning: the face between cells i and i+1 moves towards cell i+1, so the swept region leaves cell i+1, the donor, and joins cell i, which gains exactly what cell i+1 loses">
         <figcaption>Figure B. A one-dimensional strip view of swept-region remap. The 2D RZ implementation uses the exact axisymmetric volume and first moment of the shaded polygon.</figcaption>
       </figure>
     </section>
