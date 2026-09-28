@@ -40,8 +40,8 @@
       <p>2D RZ では、軸対称なゾーンを \((R,Z)\) 子午面上の四辺形として表す。セル中心の \((\rho,e,P,T)\) を、節点の位置・速度ベクトルと結び付ける。正典となるコーナーベクトルは、回転体としてのセル体積の厳密な勾配 \(\mathbf S_{c,k}=\partial V_c/\partial\mathbf x_{c,k}\) である。これを、力の組み立てと、連鎖律による体積変化率 \(\dot V_c=\sum_k\mathbf u_{n_k}\cdot\mathbf S_{c,k}\) の双方に用いる。</p>
 
       <figure>
-        <img src="../../assets/hydro-staggered-rz.png" width="600" height="450" style="max-width:100%;height:auto" alt="セル中心の熱力学量、節点速度、コーナー質量、コーナー力をもつ RZ 四辺形">
-        <figcaption>図A. 2D RZ 四辺形のスタッガード配置と、4 つのコーナー小セル。図は模式的で、実際の幾何には厳密な RZ 体積勾配を用いる。</figcaption>
+        <img src="../../assets/hydro-staggered-rz.png" width="720" height="480" style="max-width:100%;height:auto" alt="セル中心の密度・エネルギー・圧力・温度、節点速度、厳密な質量の割合をもつ 4 つのコーナー小セル、厳密な回転体積勾配に沿った外向きのコーナー力をもつ RZ 四辺形">
+        <figcaption>図A. 2D RZ 四辺形 1 つのスタッガード配置と、4 つのコーナー小セル。コーナーベクトル \(\mathbf S_{c,k}\)（コーナー力はこの向きで外向き）とコーナー質量の割合は、描いたセルについて厳密に計算した値である。</figcaption>
       </figure>
     </section>
 
