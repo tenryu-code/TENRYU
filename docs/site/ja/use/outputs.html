@@ -113,7 +113,7 @@
           <tr><th><code>deposited_power</code></th><td>吸収パワー密度 [erg/cm³/s]（= rad_dep/(VΔt)、可視化用）。</td></tr>
           <tr><th><code>fleck_factor</code></th><td>2D FLD のみ。セルの Fleck 因子（診断はグレイ G=1 で有効）。</td></tr>
           <tr><th><code>sn_tau_R</code>, <code>sn_reduced_flux</code>, <code>sn_ap_alpha</code></th><td>2D S<sub>N</sub> のみ。面の流束を S<sub>N</sub> と拡散で混ぜる漸近保存（AP）処理の診断（光学的厚さ・換算流束・混合の重みの各プロキシ）。</td></tr>
-          <tr><th><code>diag_*</code>（12 種）</th><td>1D S<sub>N</sub> の出力専用診断: <code>diag_rad_</code> に続く <code>E_pre</code>/<code>E_post</code>/<code>emission_at_Tn</code>/<code>emission_at_Tnp1</code>/<code>absorption</code> と、<code>diag_</code> に続く <code>clip_energy</code>/<code>clip_full_deficit</code>/<code>chi_opacity</code>/<code>F_first_moment</code>/<code>E_star_flux</code>/<code>stream_theta</code>/<code>ap_alpha_face</code>。リスタートの状態復元には使われない。</td></tr>
+          <tr><th><code>diag_*</code>（12 種）</th><td>1D S<sub>N</sub> の出力専用診断: <code>diag_rad_</code> に続く <code>E_pre</code>/<wbr><code>E_post</code>/<wbr><code>emission_at_Tn</code>/<wbr><code>emission_at_Tnp1</code>/<wbr><code>absorption</code> と、<code>diag_</code> に続く <code>clip_energy</code>/<wbr><code>clip_full_deficit</code>/<wbr><code>chi_opacity</code>/<wbr><code>F_first_moment</code>/<wbr><code>E_star_flux</code>/<wbr><code>stream_theta</code>/<wbr><code>ap_alpha_face</code>。リスタートの状態復元には使われない。</td></tr>
           <tr><th><code>ddmc_flag</code></th><td>退役 <code>imc_ddmc</code> 経路のみ有意。現行 FLD/S<sub>N</sub> では意味を持たない。</td></tr>
         </tbody>
       </table>
@@ -201,7 +201,7 @@
           <tr><th><code>diagnostics/radial_fourier_audit/v1/</code>・<code>_v2/v1/</code></th><td>演算子段ごとの動径フーリエ監査（v1: 最大振幅、v2: 固定した動径モード m と z 方向の行 j の複素係数）。</td></tr>
           <tr><th><code>diagnostics/dt_breakdown_history/</code></th><td><code>Numerics.diagnostics.dt_breakdown_history_enabled</code>（既定で有効）。毎ステップの Δt 内訳と勝者（<a href="../overview/timestep.html">時間刻み制御</a>参照）。</td></tr>
           <tr><th><code>diagnostics/cfl_winner/</code>・<code>corner_bc_audit/v1/</code></th><td>音響 CFL 勝者セルの記録と、その勝者が特定コーナーハローに入った場合の境界値監査。</td></tr>
-          <tr><th><code>diagnostics/fld_substage_audit/v1/</code></th><td>FLD サブステージの動径フーリエ監査（<code>Radiation.multigroup_diffusion.diagnostic_radial_fourier_substage_enabled</code>）。</td></tr>
+          <tr><th><code>diagnostics/fld_substage_audit/v1/</code></th><td>FLD サブステージの動径フーリエ監査（<code>Radiation.<wbr>multigroup_diffusion.<wbr>diagnostic_radial_fourier_substage_enabled</code>）。</td></tr>
           <tr><th><code>diagnostics/per_row_mass/</code>・<code>av_max/</code></th><td>dt 内訳診断の有効時。z 行ごとの質量・密度サマリと、最大人工粘性セルの記録。</td></tr>
           <tr><th><code>diagnostics/conservation/v1/</code></th><td><code>Numerics.diagnostics.conservation.enabled</code>。演算子別の保存残差 ε_E と前後エネルギー。</td></tr>
           <tr><th><code>diagnostics/material_interface/v1/</code></th><td>PLIC（区分線形の界面再構成）による材料界面の診断（属性・サンプルごとの統計・イベント表。<code>schema_version</code> を変えずに追加したグループ）。</td></tr>

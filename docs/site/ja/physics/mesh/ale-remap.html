@@ -61,14 +61,16 @@
       <p>参照 Winslow・障壁族は、初期のオイラーメッシュや等角度球面メッシュといった参照目標への変位を作り、参照メッシュに対する相対下限を課した全体直線探索で混合する。軸近傍の参照障壁や保護区画では、Winslow の提案を初期値として、体積とコーナーヤコビアンの障壁が定める実行可能領域へ射影する。検査されるのは終点だけでなく、ラグランジュメッシュから目標メッシュへ至る経路全体である。</p>
       <p><code>m1_tmop</code> は、明示的に有効化する減衰ガウス–ニュートン法のソルバである。参照計量に対する M1 品質、ラグランジュ位置への係留、極座標行の間隔正則化、行列式が小さいときに作用する障壁項を合わせた目的関数を最小化する。</p>
       $$
-      \mathcal J(\mathbf x)=
+      \begin{aligned}
+      \mathcal J(\mathbf x)={}&
       \frac{\sum_{c,q}\omega_{cq}\det(W_{cq})\,\mu(A_{cq}W_{cq}^{-1};\gamma_{\rm align})}
            {\sum_{c,q}\omega_{cq}\det(W_{cq})}
-      +\frac{\lambda_{\rm tether}}{N_v}\sum_i\frac{\|\mathbf x_i-\mathbf x_i^L\|^2}{h_i^2}
-      +\frac{w_\theta}{N_v}\sum_{i\in\mathcal R}
+      +\frac{\lambda_{\rm tether}}{N_v}\sum_i\frac{\|\mathbf x_i-\mathbf x_i^L\|^2}{h_i^2}\\
+      &\quad+\frac{w_\theta}{N_v}\sum_{i\in\mathcal R}
        \left(\frac{d_{iL}-d_{iR}}{d_{iL}+d_{iR}}\right)^2
       +\beta\sum_{c,q}\left[\det A_{cq}&lt;\sigma_b\det W_{cq}\right]
        \log\frac{\sigma_b\det W_{cq}}{\det A_{cq}}.
+      \end{aligned}
       $$
       <p>ここで \(A_{cq}\)・\(W_{cq}\) はセル \(c\) のガウス点 \(q\) における実メッシュ・参照メッシュのコーナーヤコビアン、\(\omega_{cq}\) はその重み、\(\mu\) は整列重み \(\gamma_{\rm align}\) をもつ形状品質尺度で、ここまでが M1 品質項である。\(\lambda_{\rm tether}\) はラグランジュ位置 \(\mathbf x^L_i\) からの変位を局所スケール \(h_i\) で罰する係留項、\(N_v\) は節点総数、\(w_\theta\) の項は行集合 \(\mathcal R\) 上で左右の隣接距離 \(d_{iL},d_{iR}\) により極方向の行間隔を整える正則化、障壁の重み \(\beta\)（Winslow の計量係数 \(\beta\) とは別の量）をもつ障壁項は \(\det A_{cq}&lt;\sigma_b\det W_{cq}\) で発動する。</p>
       <p>各節点の提案変位は局所的な辺長で頭打ちにされ、最大 12 回の半分刻み直線探索を通る。取引が受理されるのは、候補メッシュの判定器が許容と答え、かつ</p>

@@ -61,14 +61,16 @@
       <p>The reference-Winslow/barrier family constructs displacements toward targets such as the initial Eulerian mesh or an equal-angle spherical mesh, then uses a global line search with reference-relative floors. Near-axis reference barriers and protected patches may use a Winslow proposal as a seed and project it into the feasible volume/corner-J set. The path from the Lagrangian mesh to the endpoint is checked, not merely the endpoint.</p>
       <p><code>m1_tmop</code> is an opt-in damped Gauss–Newton solver. Its objective combines M1 quality relative to a reference metric, a tether to the Lagrangian position, polar-row spacing regularization, and a small-determinant activation barrier:</p>
       $$
-      \mathcal J(\mathbf x)=
+      \begin{aligned}
+      \mathcal J(\mathbf x)={}&
       \frac{\sum_{c,q}\omega_{cq}\det(W_{cq})\,\mu(A_{cq}W_{cq}^{-1};\gamma_{\rm align})}
            {\sum_{c,q}\omega_{cq}\det(W_{cq})}
-      +\frac{\lambda_{\rm tether}}{N_v}\sum_i\frac{\|\mathbf x_i-\mathbf x_i^L\|^2}{h_i^2}
-      +\frac{w_\theta}{N_v}\sum_{i\in\mathcal R}
+      +\frac{\lambda_{\rm tether}}{N_v}\sum_i\frac{\|\mathbf x_i-\mathbf x_i^L\|^2}{h_i^2}\\
+      &\quad+\frac{w_\theta}{N_v}\sum_{i\in\mathcal R}
        \left(\frac{d_{iL}-d_{iR}}{d_{iL}+d_{iR}}\right)^2
       +\beta\sum_{c,q}\left[\det A_{cq}&lt;\sigma_b\det W_{cq}\right]
        \log\frac{\sigma_b\det W_{cq}}{\det A_{cq}}.
+      \end{aligned}
       $$
       <p>Here \(A_{cq}\) and \(W_{cq}\) are the actual and reference corner Jacobians at Gauss point \(q\) of cell \(c\), with weights \(\omega_{cq}\) and the shape-quality measure \(\mu\) at alignment weight \(\gamma_{\rm align}\) — the M1 quality term; \(\lambda_{\rm tether}\) penalizes displacement from the Lagrangian positions \(\mathbf x^L_i\) on the local scale \(h_i\); \(N_v\) is the total node count; the \(w_\theta\) term regularizes polar-row spacing through the left/right neighbor distances \(d_{iL},d_{iR}\) over the row set \(\mathcal R\); and the barrier, with weight \(\beta\) (a different quantity from the Winslow coefficient \(\beta\)), activates where \(\det A_{cq}&lt;\sigma_b\det W_{cq}\).</p>
       <p>Each node proposal is capped by a local edge scale and receives up to 12 line-search halvings. A transaction is accepted only when the candidate-mesh oracle finds the mesh admissible and</p>
