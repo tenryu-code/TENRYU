@@ -40,8 +40,8 @@
       <p>In 2D RZ, each axisymmetric zone is represented by a quadrilateral in the \((R,Z)\) meridian plane. Cell-centered \((\rho,e,P,T)\) is coupled to nodal position and velocity vectors. The authoritative corner vector is the exact gradient of the revolved cell volume, \(\mathbf S_{c,k}=\partial V_c/\partial\mathbf x_{c,k}\). It supplies the geometry for force assembly and the chain-rule volume rate \(\dot V_c=\sum_k\mathbf u_{n_k}\cdot\mathbf S_{c,k}\).</p>
 
       <figure>
-        <img src="../../assets/hydro-staggered-rz.png" width="600" height="450" style="max-width:100%;height:auto" alt="RZ quadrilateral with cell-centered thermodynamic variables, node velocities, corner masses, and corner forces">
-        <figcaption>Figure A. Staggered state and the four corner subcells of a 2D RZ quadrilateral. The drawing is schematic; production geometry uses the exact RZ volume gradients.</figcaption>
+        <img src="../../assets/hydro-staggered-rz.png" width="720" height="480" style="max-width:100%;height:auto" alt="One RZ quadrilateral with cell-centered density, energy, pressure and temperature, node velocities, four corner subcells with their exact mass fractions, and outward corner forces along the exact revolved-volume gradients">
+        <figcaption>Figure A. Staggered state and the four corner subcells of one 2D RZ quadrilateral. The corner vectors \(\mathbf S_{c,k}\), along which the corner forces point outward, and the corner-mass fractions are computed exactly for the drawn cell.</figcaption>
       </figure>
     </section>
 
