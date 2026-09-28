@@ -71,7 +71,7 @@
       </ul>
 
       <figure>
-        <img src="../../../assets/radiation-fld-group-fleck-flow.png" width="980" height="430" style="max-width:100%;height:auto" alt="光子エネルギー群、Fleck 線形化した源、群ごとの FLD 求解、物質エネルギー更新を結ぶ反復の流れ">
+        <img src="../../../assets/radiation-fld-group-fleck-flow.png" width="1000" height="340" style="max-width:100%;height:auto" alt="光子エネルギー群、Fleck 線形化した源、群ごとの FLD 求解、物質エネルギー更新を結ぶ反復の流れ">
         <figcaption>図A. 各群は \(f_gb_ga_{\rm eV}cT_e^4\) に比例する放出を受け取り、陰的に扱った吸収を物質へ返す。更新した \(T_e\) から群重みと係数を評価し直して、外側反復を閉じる。</figcaption>
       </figure>
     </section>
@@ -92,7 +92,7 @@
       <p>1D では、各群の行列は三重対角になる。GPU 上では群数 \(G\) を一括処理の数、セル数を系の大きさとして、<code>cusparseDgtsv2StridedBatch</code> で全群をまとめて解く。2D RZ では各セルが \(R-\)、\(R+\)、\(Z-\)、\(Z+\) の 4 つの面で隣接するセルだけと結合するため、群ごとに CSR の 5 点ステンシルを組み立てる。線形反復は共役勾配法を基礎とする。前処理は、既定の <code>linear_solver_2d="auto"</code> が設定検証の時点で格子形状から解決する：\(n_r\) が 2 の冪かつ \(n_z\ge3\) なら r 方向半粗化の幾何マルチグリッド（GMG）、それ以外で \(n_z\ge3\) なら z ラインのブロックヤコビ前処理（半径ラインごとの三重対角を厳密に解き、\(\Delta z&lt;\Delta r\) の異方ステンシルで伸びる反復を抑える）、どちらも成立しなければヤコビ前処理付き共役勾配法である。局所的なヤコビ前処理は格子が大きくなるほど収束が遅くなるのに対し、GMG は局所前処理が減衰させにくい長波長の誤差成分を粗格子の階層で処理する。解決結果は起動時に 1 回ログへ記録され、凍結後の設定にも解決後の値が入る。</p>
 
       <figure>
-        <img src="../../../assets/radiation-fld-rz-five-point.png" width="820" height="615" style="max-width:100%;height:auto" alt="RZ 構造格子上の中心セルと 4 つの面で隣接するセルからなる保存型 5 点ステンシル">
+        <img src="../../../assets/radiation-fld-rz-five-point.png" width="900" height="480" style="max-width:100%;height:auto" alt="RZ 構造格子上のセルと 4 つの面隣接セルからなる 5 点ステンシルと、その行の 5 つの格納位置">
         <figcaption>図B. 2D RZ の実運用 FLD 行列は、群ごとの 5 点 CSR ステンシルである。各面の係数は \(C_{f,g}=\Delta t\,A_fD_{f,g}/d_f\) で、共有する面には同じ値を使う。</figcaption>
       </figure>
 

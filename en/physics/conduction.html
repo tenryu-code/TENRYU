@@ -66,7 +66,7 @@
       </ul>
 
       <figure>
-        <img src="../../assets/conduction-flux-composition.png" width="920" height="307" style="max-width:100%;height:auto" alt="Flow from the Spitzer–Härm flux and SNB correction through their shared harmonic cap to the final flux">
+        <img src="../../assets/conduction-flux-composition.png" width="960" height="380" style="max-width:100%;height:auto" alt="Flow from the Spitzer–Härm flux and SNB correction through their shared harmonic cap to the final flux">
         <figcaption>Figure A. Flux composition. With <code>nonlocal_model="none"</code>, δq=0 and the path reduces to the established limited SH flux.</figcaption>
       </figure>
     </section>
@@ -136,7 +136,7 @@
       <p>Here \(P(\beta)\) is the cumulative distribution of the Spitzer–Härm heat flux over normalized electron energy — the flux carries a \(\beta^4e^{-\beta}/24\) spectral weight, and \(P\) is its running integral — so the weight ξ<sub>g</sub> is an exact primitive difference, not a numerical quadrature. The total correction is \(\delta q=-\sum_g(\lambda_g^{tr}/3)\nabla H_g\). A cell-centered, volume-integrated FV discretization gives a strictly diagonally dominant tridiagonal system. Groups are solved as a strided batch; face diffusivity is the harmonic mean of neighboring λ<sup>tr</sup> values divided by three, with reflecting closed boundaries.</p>
 
       <figure>
-        <img src="../../assets/conduction-snb-group-ladder.png" width="920" height="690" style="max-width:100%;height:auto" alt="SNB geometric group edges from 0.1 to 20 and group weights obtained as differences of the analytic function P">
+        <img src="../../assets/conduction-snb-group-ladder.png" width="920" height="640" style="max-width:100%;height:auto" alt="SNB geometric group edges from 0.1 to 20 and group weights obtained as differences of the analytic function P">
         <figcaption>Figure B. SNB group ladder. Global β̂ edges map to physical energies, while differences in P at local β=E/(k<sub>B</sub>T<sub>e</sub>) supply the source weights.</figcaption>
       </figure>
 
