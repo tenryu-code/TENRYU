@@ -8,6 +8,19 @@
 flux-limited diffusion と電子物質結合を CUDA 上で解く。FLD は HYDRA-aligned
 Fleck linearization を使い、stiff な物質-放射結合を放射線形系へ入れる。
 
+**1D の実装上の規則（2026-09-29 の監査で記載）**：
+- **幾何**：面積 \(A_f\) は `Mesh.geometry_1d` に従い、球 \(4\pi r_f^2\)、円筒 \(2\pi r_f\)（単位長さ）、平板 1（単位面積）。
+- **群構造**：最初の表不透明度（`tmat`・`table_nlte`、`ionmix` は `table_nlte` の経路）の材料のファイルが群の数と境界を決め、
+  `Radiation.groups` と `bounds_eV` を置き換える（`group_repack_hard_xray` は群数を保って境界を再配置する）。2 つ目以降の表は
+  群数が違うか、境界の相対差が \(10^{-6}\) を超えると `ConfigError`。表が無く全材料が定数不透明度で境界を与えないときは
+  灰色 1 群 \([0,10^6]\) eV を自動設定する。
+- **散乱**：FLD は吸収の不透明度だけで輸送し、物理散乱を持たない（`kappa_s > 0` は 2026-09-29 から `ConfigError`）。
+- **物質 Newton**（Fleck 経路の電子温度の解）：反復の上限と収束の許容値に外側反復の `max_outer_iterations` と `outer_tol` を
+  流用し、1 回の温度の変化を \(\pm\max(T,T_{floor})/2\) に制限する。
+- **外側反復の先回り**：非パイプラインの外側反復（Anderson 以外）は、反復 \(k\) の収束判定を host が非同期に読むあいだに、
+  状態を複製して反復 \(k+1\) を先に起動する。反復 \(k\) が収束していれば複製を書き戻して先回り分を捨てる（逐次の
+  反復と同じ計算になる — 書き戻すのは反復が書き換える全配列（`mutation_spans`）。判定の待ち時間を隠すための実装）。
+
 各 cell \(c\)、group \(g\) の backward-Euler 有限体積式は
 \[
 V_c E^{n+1}_{c,g}
@@ -33,8 +46,9 @@ kernel で §6.1 系の LTE Fleck factor を**群別**に
 \(f_{c,g}=1/(1+\alpha\beta_c c\Delta t\sigma_{a,g})\) として
 table_nlte/tmat と同じ RHS emission/effective-scattering split に適用する
 （\(\beta_c\) は cell 量、\(\sigma_{a,g}\) は群値。constant/power_law opacity
-は周波数非依存で全群同値のため cell 単一 \(f_c\) と一致し、群依存 σ の
-`freq_dep_marshak` 検証 opacity でのみ群別値が現れる。旧記述の
+は周波数非依存で全群同値のため cell 単一 \(f_c\) と一致する。群依存 σ の `freq_dep_marshak` 検証 opacity は、単一材料の
+デッキでは Fleck 線形化そのものを使わず（\(f=1\)）、多材料のデッキではそのセルが共有カーネルの群に共通の Planck 平均の
+\(f\) を使う — 群別の \(f_{c,g}\) が群ごとに異なる値になる経路は現状無い。旧記述の
 「\(\sigma_{a,P}\) 単一 \(f_c\) + McClarren-Urbatsch smooth blend」は実装と
 乖離していた — blend は stiff 極限 \(zf\to0\) の交換凍結のため 1D では退役済み、
 時間形状は既定 `"be"` \(f=1/(1+z)\)（下記 fleck_form 参照）。2026-07-26
@@ -135,7 +149,10 @@ cap 非経由のため挙動不変）。放射エネルギー式に
 > 総エネルギー drift **厳密 0**（fleck 単一パスの 2.1–2.3 倍非保存と対照）、1-D Marshak feature
 > 前線で分割バイアス 0（最細 rung で fleck と同一セル・N=1024 参照 4dx 内、非劣化全 rung）。
 > OFF-bit: exchange_off 配線+ループ再入れ子込みバイナリで GXII golden・HR PASS（既定経路恒等）。
-> **多群（G≤96、2026-07-17 導入 — docs/design/exp_mg_phi1_20260717.md、外部裁定採択）**: 保存超平面上の
+> **多群（G≤96、2026-07-17 導入 — docs/design/exp_mg_phi1_20260717.md、外部裁定採択）**: 群数の上限 96 はセルごとの
+> 作業配列の大きさ（`fld_1d_gpu.cu` の `kMaxG`）。builder は `Radiation(...)` の解析時に deck の群数を、2026-09-29 からは
+> 最初の不透明度表が群数を置き換えた後の最終の群数も検査する（それまでは 96 を超える表が解析時の検査をすり抜け、
+> 実行時に全セルの交換が棄却された）。保存超平面上の
 > 厳密 G×G 対角+rank-1 縮約 \(K=-X-X\gamma\mathbf 1^T\)、\(\Delta E=\varphi_1(K)r\)、
 > \(\Delta U=-\sum_g\Delta E_g\)（構成的保存）。\(\varphi_1\) は認証済み 16 極対有理近似
 > （放物線 Hankel コンター、sup 相対誤差 2.4e-14、tools/gen_phi1_poles.py 生成・phi1_poles.hpp 凍結）
@@ -153,7 +170,7 @@ cap 非経由のため挙動不変）。放射エネルギー式に
 > rank-1 機構の判別的認証）・保存 drift 厳密 0・2 次 slope 135×/8×。灰色 G=1 は従来スカラー kernel を
 > bit 不変で維持。
 
-1D_SPH の面幾何は \(A_f=4\pi r_f^2\)、\(d_f\) は隣接 cell center 間距離である。
+1D_SPH の面幾何は \(A_f=4\pi r_f^2\)（円筒 \(2\pi r_f\)・平板 1、上の規則）、\(d_f\) は隣接 cell center 間距離である。
 2D_RZ では \(N_r\times N_z\) の cell-centered unknown を row-major
 \(c=iN_z+j\) で並べ、R/Z 4-face の有限体積ステンシルを用いる。2D_RZ FLD の面積は
 各 cell が独立に再構成した cell-centered metric ではなく、共有 edge の2端点
@@ -275,19 +292,39 @@ Tr(t) 経路が提供する）。
 **1D_SPH FLD 境界条件（W-B, 2026-07-03）** — 内側 \(r=0\) は球対称により常に
 反射（face flux 0；`boundary.inner_r` は `"reflect"` 以外を `ConfigError` で拒否）。
 外側 \(r=R_{max}\) は `Radiation.multigroup_diffusion.boundary.outer_r` で
-`"vacuum"` / `"reflect"` / `"marshak"` を選ぶ。`"vacuum"` は half-range escape
-\(F_{out}=cE/2\)（従来の 1D 固定挙動と同一 = 既定）、`"reflect"` は face flux 0、
-`"marshak"` は Milne 型 \(F_{out}=(c/4)E - F_{\mathrm{inc}}\) とし、外側セル行の
-diagonal に \(\Delta t\,A(c/4)\)、RHS に \(\Delta t\,A\,F_{\mathrm{inc},g}\) を加える
-（\(A=4\pi R_{max}^2\)）。入射駆動は排他的二択: (i) 黒体駆動
+`"vacuum"` / `"reflect"` / `"marshak"` を選ぶ。`"reflect"` は face flux 0。`"vacuum"`（既定）と
+`"marshak"` は面の値 \(E_f\) に対する Robin 条件 \(F_{out}=h\,(E_f-\theta_g)\) で、`"vacuum"` は half-range
+escape \(h=c/2\)、\(\theta_g=0\)、`"marshak"` は Milne 型 \(h=c/4\)、\(\theta_g=F_{\mathrm{inc},g}/h\)（駆動の放射
+エネルギー密度）とする。面の値は、外側セルの中心から面までの半セルの拡散抵抗 \(d/D_0\) で消去する
+（2026-09-29）。\(D_0=c\,\lambda(R_0)/\sigma_{R,0}\) は外側セル自身の Rosseland 不透明度による flux-limited 係数で、
+\(R_0=|E_{0,g}-E_{1,g}|/(\Delta r\,\sigma_{R,0}\,E_{0,g})\)（\(E_{1,g}\) は内側の隣のセル、\(\Delta r\) は 2 つのセル中心の
+距離、場は内部面の係数と同じ遅れた場。内部の面は 2 つのセルの平均 \(\tfrac12(E_l+E_r)\) で割るが、ここは外側セル自身の
+値で割る）、\(d\) は外側セルの幅の半分で、
+\[
+F_{out}=h_{eff}\left(E_{0,g}-\theta_g\right),\qquad h_{eff}=\frac{h}{1+h\,d/D_0}
+\]
+となる。外側セル行の diagonal に \(\Delta t\,A\,h_{eff}\)、RHS に \(\Delta t\,A\,(h_{eff}/h)\,F_{\mathrm{inc},g}\) を加える
+（\(A\) は外側の面の面積、球では \(4\pi R_{max}^2\)）。\(d/D_0\to0\)（外側セルが光学的に薄く、半セルの中の変化が緩やかなとき）では 2026-09-29 以前の
+セル中心の値で閉じる式 \(F_{out}=h\,(E_{0,g}-\theta_g)\) に戻り、光学的に厚いセルでは面が \(\theta_g\) に保たれる
+（真空では 0）。流束制限が効く \(R_0\gg1\) では \(D_0\approx c\,E_{0,g}\,\Delta r/|E_{0,g}-E_{1,g}|\) となり、光学的厚さに
+よらず \(h\,d/D_0\approx(h/c)(d/\Delta r)\,|E_{0,g}-E_{1,g}|/E_{0,g}\) が残る。内側から急な勾配で放射が届く外側セル
+（\(E_{0,g}\ll E_{1,g}\)）では、外側セルが満ちるまで面の結合が弱い（場は遅れた場で、外側反復の収束判定は物質温度
+の変化だけを見るので、1 回目で収束した刻みではその刻みの間続く）。\(E_{0,g}=0\) で隣が正のとき、分母を \(10^{-300}\) で押さえた \(R_0\) は
+\(E_{1,g}/(\Delta r\,\sigma_{R,0})\) が約 \(2\times10^{8}\)（cgs）を超えると倍精度の範囲を超えて非有限になり、\(\lambda\) は非有限の
+\(R\) を 0 と読むので拡散極限の 1/3 をとる（\(R_0\) が有限に収まるときは \(\lambda\approx0\) で面はほぼ閉じる）。どちらも係数は
+有限で、脱出の集計は行列と同じ \(h_{eff}\) を使うので保存は保たれる。セル中心の値で閉じる式は光学的に厚い外側セルで 1 次の誤差をもち、Marshak の流入と真空への
+脱出を多く見積もっていた（VERIFICATION §23：外側セルの光学的厚さ 0.78 の平板で、面から入った正味のエネルギーが
++18.7 %、真空への脱出が +27 %。新しい式では −4.4 %・+5.5 % で、2 次以上で同じ極限へ収束する）。持続カーネルの
+経路も同じ式を使う。入射駆動は排他的二択: (i) 黒体駆動
 `Radiation.boundary.marshak_Tr_eV` \(>0\) で per-group
 \(F_{\mathrm{inc},g}=(c/4)a_{eV}T_r^4\,b_g(T_r)\)（\(b_g\) は正規化 Planck 重み、
 multigroup 可）、(ii) 灰色定常 flux
 `Radiation.multigroup_diffusion.marshak.flux_erg_per_cm2_s`（`groups=1` 限定、
 `flux_pulse_duration_s` による矩形パルス対応）。両方指定・両方ゼロは
-`ConfigError`。escape tally は `fld_escaped_step`（leak 係数は BC と整合）、
-incoming は \(\Delta t\,A\sum_g F_{\mathrm{inc},g}\) を `fld_marshak_in_step` として
-step energy budget に入る。Z 端キー（`boundary.z/z_bottom/z_top`）は 1D_SPH では
+`ConfigError`。escape tally `fld_escaped_step` は面から出ていく部分流
+\(\Delta t\,A\sum_g\bigl[h_{eff,g}E_{0,g}+(1-h_{eff,g}/h)\,F_{\mathrm{inc},g}\bigr]\)（その刻みの最後の解の行列と同じ
+\(h_{eff}\)）、incoming は \(\Delta t\,A\sum_g F_{\mathrm{inc},g}\) を `fld_marshak_in_step` として step energy budget に
+入り、両者の差が行列の境界項（正味の流出 \(\Delta t\,A\sum_g h_{eff,g}(E_{0,g}-\theta_g)\)）に等しい。Z 端キー（`boundary.z/z_bottom/z_top`）は 1D_SPH では
 無意味なので非既定値を `ConfigError` で拒否する。
 
 **Time-dependent drive (indirect-drive mode, 2026-07-09).** The Marshak
@@ -318,7 +355,8 @@ external source であり、`groups=1` 限定（多群は `ConfigError`）。注
 として step energy budget（`volume_in`）に計上する。
 
 **1D_SPH \(S_N\) 体積線源（2026-08-31 検証済み）** — 同じ namelist キーを
-`sn_transport` でも消費する: sweep の scalar source に等方寄与 \(\dot S/2\)
+`sn_transport` でも消費する（群 0 だけに入る灰色の線源なので FLD と同じく `groups=1` 限定。多群は 2026-09-29 から
+`ConfigError` — それまでは受理して線源の全量を最低の群に入れていた。`volume_source_x_max` \(>0\) も必須）: sweep の scalar source に等方寄与 \(\dot S/2\)
 （GL 規約 \(\sum w=2\) の下で \(\sum_m w_m\,\dot S/2=\dot S\)）、Newton 閉包に
 保持項 \(S_{\Delta t}=\Delta t\,\dot S\)（\(E^+=(E^\* + \lambda_{pe}B +
 S_{\Delta t})/(1+\lambda_{pa})\)）が入り、Newton の全系エネルギー残差は
@@ -341,8 +379,9 @@ solve の注入量と、物質＋放射エネルギーの変化 = 注入 − 流
 \(10^{-10}\)）と、`rad_dep` が書き戻し後の \(E^{n+1}\) を使うことを検査する。
 
 **1D_SPH \(S_N\) 外側 Marshak 境界（W-B2, 2026-07-03）** —
-`Radiation.sn_transport.boundary.outer_r="marshak"`（1D_SPH、
-`spatial_scheme="linear_characteristic"` 必須）。外側ノードの内向き半区間
+`Radiation.sn_transport.boundary.outer_r="marshak"`（1D_SPH。当初は `spatial_scheme="linear_characteristic"` 必須、
+現在は既定の線形不連続法も受け付ける — 線形不連続法は灰色の流束駆動を、離散の半区間の流れが指定の流束になる等方強度
+\(F_{inc,g}/\sum_{\mu<0}w|\mu|\) として与え、黒体駆動は下の \(2F_{inc,g}\)）。外側ノードの内向き半区間
 （\(\mu<0\)）へ等方入射強度 \(\psi^-_g = 2F_{inc,g}\) を与える（GL 規約
 \(\phi=\sum_m w_m\psi_m = cE\), \(\sum w=2\) の下で平衡厳密:
 \(2\cdot(c/4)a_{eV}T_r^4 b_g = \psi_{iso}(T_r)\)）。駆動は FLD 1D と同じ
@@ -382,7 +421,7 @@ Eq. 15–16: 自然分割セル端 \(\mu_{m+1/2}=\mu_{m-1/2}+W_m\)、
 Marshak 入射対応）。検証: 一様黒体平衡は machine precision の離散不動点
 （max_rel 2.8e-16）、冷開始の中心含む球が 1e-6 で plateau 到達（旧 −89%）、
 `sn_1d_marshak_equilibration` gate は outer/max とも 1e-5 に強化して PASS。
-serial（非 LC）デバッグ sweep は旧スキームのまま（production は LC）。
+serial（非 LC）デバッグ sweep は旧スキームのまま（当時の production は LC。1D の既定は 2026-09-25 から線形不連続法、§6.8.4）。
 
 **W-B2 v2 + W-G1 step 5 平面ゲート（2026-07-03）** — marshak 外側面の
 E\*-flux 記帳を Milne 対 \(S^-(cE/2-\psi_{in})\) から**離散整合形**
@@ -407,7 +446,10 @@ Levermore–Pomraning 限流子引数 \(R=|\nabla E|/(\sigma E)\) を**セル中
 \(\sim cE_{cold}\) に絞る → **前線停滞**（planar 平衡ゲートが暴露、球面は
 中心セル微小体積が隠蔽）。修正: 面平均 E と面勾配で **face 上の λ** を評価
 （Turner & Stone 2001 の face-centered D 規約; CASTRO II §6.4）、
-\(\sigma_{face}=\tfrac12(\sigma_L+\sigma_R)\)。滑らか厚極限では旧調和形と
+\(\sigma_{face}=\tfrac12(\sigma_L+\sigma_R)\)（2026-09-23 からはセル幅で重みを付けた
+\(\sigma_{face}=(\sigma_Lw_L+\sigma_Rw_R)/(w_L+w_R)\) — 2 つのセル中心の間の光学的厚さを直列に足した、拡散極限の面の抵抗。
+幅が等しいと算術平均とビット一致。重みの無い平均は幅比 \(w\) で面の伝導を最大 \((w+1)/2\) 倍誤った。下の face-centered
+の段落参照）。滑らか厚極限では旧調和形と
 厳密一致 \(\mathrm{harm}(c/3\sigma_L, c/3\sigma_R)\equiv c/(3\bar\sigma)\)
 のため変化は前線・急勾配領域のみ。自由流極限キャップは構成上厳密
 \(|F|\le cE_{face}\)。GXII golden は前駆加熱の物理変化として再基準化
@@ -465,8 +507,9 @@ harmonic 形 \(\mathrm{harm}(c/3\sigma_L,\,c/3\sigma_R)=c/(3\cdot\tfrac12(\sigma
 残存する既知課題（2026-07-26 カーネルレビュー指摘、face-centered 化は 2D 側の対応範囲）。
 
 > **真空縮退の正則化（2026-08-28）**: \(\sigma_R\) は評価・組み立ての両方で
-> `radiation.multigroup_diffusion.opacity_floor`（既定 **\(10^{-6}\) cm\(^{-1}\)** = mfp 10 km）
-> で floor する。void セル（\(\sigma\to 0\)）かつ一様 \(E\)（\(\nabla E=0\)）の縮退方向では
+> `radiation.multigroup_diffusion.opacity_floor`（既定 **\(10^{-6}\)**）で floor する。単位の扱いは 2 か所で異なる：
+> 組み立て（面の \(\sigma\)・限流子）では \(\sigma_R\ge\) floor [cm\(^{-1}\)]（mfp 10 km）、不透明度の評価（`opacity.cu`、
+> 多材料の `multimat_opacity_1d.cuh`）では質量不透明度として \(\sigma\ge\rho\cdot\)floor（floor [cm\(^2\)/g]）。void セル（\(\sigma\to 0\)）かつ一様 \(E\)（\(\nabla E=0\)）の縮退方向では
 > \(R=0\to\lambda=1/3\) となり limiter が \(D=c/(3\sigma)\) の発散を止められない。旧既定
 > \(10^{-100}\) では tmat opacity が void 密度で underflow すると三重対角係数が
 > \(\sim 10^{98}\) に達し、非 pivoting CR（`gtsv2StridedBatch`）も QR pivoting
@@ -570,8 +613,8 @@ regime（i4a marshak 級）では RGmg の wall 利得は無い（2026-07-10 実
 As of L1b-2 the captured block also covers the z-line and RGMG preconditioner applications (stream-parameterized variants; capture failure still latches the eager loop, and the graph key bakes in every preconditioner buffer pointer so any hierarchy reallocation forces recapture).
 
 `state.rad_E_old`
-は device resident の backward-Euler 履歴で、初回 step と ALE invalidation 後に
-`rad_E` から初期化し、各 radiation step 終端で更新する。
+は device resident の backward-Euler 履歴で、各輻射の解の開始時に `rad_E` を写す（`copy_rad_E_to_old`。前の解の後に
+`gamma_r_43` の hydro 半ステップの支払いが `rad_E` を変えるので、前の解の終端の値では古い）。
 
 物質結合は電子エネルギーのみを更新する。2D_RZ FLD では constrained-B
 conservative closure を用い、matter 側の放射源は FLD RHS に実際に入れた source
@@ -637,9 +680,13 @@ Newton には入れない。
 
 > **W-I AFI モード（2026-07-03）**: `Radiation.multigroup_diffusion.fleck_mode="afi"` は Fleck ブレンドを消費点（assembly の擬似散乱項 + 物質側ブレンド）で無効化し、outer 反復（Picard）が完全陰的 emission \(c\sigma B(T^{n+1})\) を収束させる。Larsen, Kumar & Morel (JCP 238, 2013) により AFI 離散化は任意 \(\Delta t\) で一意解・最大原理・平衡拡散極限を満たす。実測（GXII FLD nr200）: Fleck 既定は生産 \(\Delta t\)（コロナ z≈3）で吸収エネルギーを z→0 極限比 ~35% 抑制し dt 依存が全 metric を汚染、AFI は生産 dt で極限の数%以内（dt×4 でも残差数%）。コロナの Picard 縮小率 ~z/(1+z)≈0.75 のため `max_outer_iterations >= 40` 推奨（未収束は rate-limited warning が出る）。既定は従来 `"fleck_cummings"`（golden 影響なし）。**既定は Fleck を維持（ユーザー決定 2026-07-04）** — AFI は namelist opt-in の検証・測定モードとして存続し、GXII golden の再基準化は行わない。dt 感度の定量（Fleck ~25% vs AFI 4.1%）は VERIFICATION §10.1 に記録済み。
 
-`Radiation.multigroup_diffusion.hydro_coupling` の既定は `"gamma_r_43"`。`"none"` は frozen-density historic behavior への明示 opt-out。`"gamma_r_43"` は opt-in で、1D deterministic FLD の Lagrangian
-hydro half step ごとに \(E_rV^{4/3}\) を保存する gamma_r=4/3 radiation compression と
-\(p_r=\sum_g E_g/3\) の force-side coupling を使う。
+`Radiation.multigroup_diffusion.hydro_coupling` の既定は `"gamma_r_43"`（1D の FLD）。`"none"` は frozen-density historic behavior への
+明示 opt-out。`"gamma_r_43"` は 1D deterministic FLD の Lagrangian hydro half step ごとに、
+\(p_r=\sum_g E_g/3\) を流体の力に加え（force-side coupling）、その力が節点にした実際の仕事 \(W_r\)（運動量更新と同じ半ステップの
+位置の面積・\(\bar u\)・マスク）を輻射場から払う：セルの輻射エネルギーを
+\(\sum_gE_g^{new}V^{new}=\max(0,\ \sum_gE_g^{old}V^{old}-W_r)\) とし、群の比を保って配る（0 への切り上げは \(E_{floor}\) に記帳。
+`rad_gamma_coupling_bodies.cuh`、2026-07-06 の v3 — 力と仕事の共役）。名前の由来の \(E_rV^{4/3}\) を厳密に保つ断熱更新（v1）は、
+有限振幅（衝撃波・人工粘性）で力の仕事と一致せず（下の履歴）、使っていない。群間のドップラー移動は無い。
 Default flipped 2026-07-06, reverted same day (v1 defect), RE-ADOPTED same night after the v3 fix and fresh A/B (R2-1=A). Scope enforcement (2026-07-06): activation additionally requires mode=="multigroup_diffusion" (SnTransport excluded). (History) DEFAULT REVERTED to "none" the same day: the rebaseline combined audit measured cumulative unexplained energy +8.6e9 erg (~10% of absorbed) on the GXII FLD regression with coupling on vs +0.6e9 off — the v1 force-side p_r work and the exact-adiabat V^{4/3} field payment do not cancel at finite amplitude (shocks/AV), a defect class invisible to the smooth-adiabat and linear-ceff gates. Deck opt-outs on compatible_energy decks stay as explicit documentation. Re-adoption path: v2 work-consistent payment (same p_r_half, same swept dV_c on BOTH modes — the design-doc v2 ruling extended to non-compatible mode, whose "v1 stays bit-for-bit" assumption this audit falsified).
 
 
@@ -683,7 +730,8 @@ cells, owned windows, and active closed-domain diffusion.
 `examples/verification/radiation_mesh_advection.py` provides a standard
 table-free example with reflecting radiation boundaries.
 
-Cut-1a/2 では DSA/TSA 加速は使わない。
+DSA/TSA 加速は使わない。1D の外側反復は既定で灰色加速（`outer_accel="auto"` → `"grey"`、上の「1D 外側反復の灰色加速」）、
+`"anderson"` は下記、2D_RZ の既定は加速なし。
 収束判定は
 \(\max_c |\Delta T_{e,c}|/\max(T_{e,c},T_{floor}) <\)
 `Radiation.multigroup_diffusion.outer_tol` である。
@@ -734,8 +782,9 @@ parameters or changing the cgs+eV unit system:
   otherwise records a feature-gap pass using `radiation/energy_density/3`, while
   the strict exported-field gate remains covered by the dedicated RH1
   radiation-pressure diagnostic. This is a diagnostic regime-exposure gate only:
-  v1.0 still does not feed radiation pressure into the matter momentum equation
-  (§1.1.2).
+  the 2D_RZ radiation does not feed radiation pressure into the matter momentum
+  equation (only the 1D FLD with `hydro_coupling="gamma_r_43"` does, §0.5 and
+  §1.1.2).
 - `test_rh1_ale_on_remap_boundary_overshoot_mandatory.cu` compares ALE-on and
   ALE-off planar-radiative-shock \(T_e\) fields with
   `TENRYU_RH1_ALE=1` and `TENRYU_RH1_ALE_EVERY_N_STEPS=5`. The active gate is
@@ -2205,10 +2254,14 @@ multi-material path: `constant`, `none`, `tmat`, `table_nlte`, `power_law`,
 A deck of two identical materials in pure cells repeats the single-material
 step bitwise (`test_sn_1d_multimat`).
 
-1D_SPH and 2D_RZ GPU \(S_N\) production use the cell-local conservative
+The linear-characteristic (LC) \(S_N\) scheme — the 2D_RZ scheme, and the
+1D_SPH scheme before 2026-09-25 (still selectable with
+`spatial_scheme="linear_characteristic"`) — uses the cell-local conservative
 active-set closure. The namelist no longer exposes closure selectors; the
 implementation is hardwired to conservative active set, signed face-flux
-\(E^*\), donor-theta flux limiting, and AP face blending. 2D_RZ uses the same
+\(E^*\), donor-theta flux limiting, and AP face blending. The 1D_SPH default
+since 2026-09-25 is the linear-discontinuous scheme (§6.8.4), which has none of
+the \(E^*\) flux form, donor theta, AP blending, or void anchor. 2D_RZ uses the same
 Phase B material Newton wrapper as 1D_SPH, with `rad_E_out` aliased to
 `rad_E` and `E_star_override` supplied by the 2D finite-volume face-flux update.
 
@@ -2285,13 +2338,14 @@ allows, the driver restores the pre-step snapshot and retries the full step at
 behavior is kept: a WARNING is logged and the run proceeds with the locally
 clamped \(T_e=T_{floor}\) state.
 
-The production 1D_SPH sweep tallies a signed face flux \(F_{f,g}\) on radial
+The 1D_SPH LC sweep tallies a signed face flux \(F_{f,g}\) on radial
 faces, where positive flux is outward (increasing \(r\)). After each Picard
 sweep the center face is forced to zero by spherical symmetry and the outer
-vacuum face is set to
-\[
-F_{N+1/2,g}=\frac{1}{2}cE_{N-1,g}^{sweep}.
-\]
+vacuum face carries the sweep's discrete outgoing tally
+\(F_{N+1/2,g}=\sum_{\mu_m>0}w_m\mu_m\psi_{m,g}^{out}\) (the 2026-07-19 note
+below; the earlier overwrite with the Milne estimate
+\(\tfrac12cE^{sweep}_{N-1,g}\) was twice the discrete half-range flux of a
+near-isotropic field).
 The streaming-only state passed to Phase B is then the finite-volume update
 \[
 E^{*,flux}_{c,g}=E^n_{c,g}
@@ -2467,9 +2521,13 @@ open \(S_N\)-vs-MGD bulk-compression comparison: those \(S_N\) results are
 NOT FLD-contaminated through the blend. The blend machinery remains
 unit-gated (`test_sn_ap_face_blend`) with synthetic opacities; wiring a true
 Rosseland array into the AP gauge would ACTIVATE the blend in production and
-is a user decision (escalated). Boundary faces are not blended:
-\(F^{blend}_{1/2,g}=F^{SN}_{1/2,g}=0\) and the outer vacuum face remains the
-SN-enforced \(F^{SN}_{N+1/2,g}=cE^{sweep}_{N-1,g}/2\).
+is a user decision (escalated). The center face is not blended
+(\(F^{blend}_{1/2,g}=F^{SN}_{1/2,g}=0\)). The outer face is blended one-sidedly
+with the boundary cell on both sides of the gauge: the thick limit takes the
+diffusion boundary flux, the streaming limit the discrete transport tally, and
+the reduced-flux detector is left out there (the free-surface escape flux has
+\(F/cE\approx0.25\) intrinsically) — only the optical-depth and equilibrium
+factors decide (`sn_transport_1d_gpu.cu`, blend kernel).
 For 2D_RZ the same harmonic diffusion formula is applied on every internal R
 and Z face using the corresponding center-to-center R or Z spacing; all R/Z
 boundary faces, including the axis, keep the raw \(S_N\) face flux and have
@@ -2698,9 +2756,11 @@ ordinates, but it must pass the angular-quality gate
 Selecting \(S_8\) emits a warning from namelist validation to make the angular
 accuracy tradeoff explicit.
 
-The production spherical sweep default is the constant-source
-linear-characteristic update
-(`Radiation.sn_transport.spatial_scheme="linear_characteristic"`), with the
+The 1D_SPH default since 2026-09-25 is the linear-discontinuous scheme
+(§6.8.4). The constant-source linear-characteristic update
+(`Radiation.sn_transport.spatial_scheme="linear_characteristic"`, the default
+before that date and the scheme this paragraph and the following ones describe)
+works with the
 Morel-Adams angular redistribution coefficient \(\alpha_{n+1/2}\) represented
 as an effective removal-and-source term inside the same characteristic solve.
 The previous `spatial_scheme="diamond_difference"` path is retained only as a
@@ -3155,8 +3215,9 @@ included. The
 Picard residual is
 \[
 r_k=\max_c\frac{|T^{k+1}_{e,c}-T^{k}_{e,c}|}
-{\max(T^{k+1}_{e,c},T_{floor})}.
+{\max(|T^{k+1}_{e,c}|,10^{-300})}
 \]
+（分母の下限は温度の床ではなく \(10^{-300}\) — `sn_transport_1d_gpu.cu` の `kEnergyFloor`）。
 The effective tolerance is
 \[
 r_{\mathrm{tol}}=\max\left(\texttt{outer\_tol},
@@ -3300,2039 +3361,8 @@ with the upwind face traces \(\hat\psi\) (the neighbour's node on the inflow sid
 
 **Accepted state.** Each iteration's nodal energies follow from the transport's own absorption and the emission that entered its final sweep, \(e_j=e^n_j+\Delta t(A_j-\sum_g(\text{fixed}_g+\kappa_gA^*_j))/\rho\): radiation and matter exchange the same energy, so the step conserves energy for any iterate (to the scattering tolerance; measured step imbalance ≤ \(3\times10^{-15}\) relative). `ee` is the lumped-mass mean, `Te` \(=T(\)`ee`\()\), `Pe` from the EOS; `rad_E` \(=\sum_jM_j\phi_j/(cV)\) (`sn_phi_old` the same mean of \(\phi\)); `rad_dep`/`rad_emit` the absorbed/emitted energy of the step; the face flux is the transport's own current (no blending with a diffusion flux, no limiter, no void-cell energy anchor); the escape is booked gross as in §6.8. A step that did not converge, or that raised a node to the floor energy, requests the driver's retry through `sn_material_retry_flag` (4 Newton, 8 GMRES, 16 scattering, 1 floor). Void cells have no absorption, emission or scattering and keep their matter energy. \(\psi^n\) (every ordinate and node, `radiation_sn/psi_prev`) and the starting-direction histories (`radiation_sn/psi_sd_prev`) are rescaled at the step start per (cell, group) so that \(\sum_jM_j\phi^n_j=cE^nV\) with \(E^n\) the radiation energy the other operators left (compression, remap, a restart), or seeded isotropic and flat in the cell (first step, a size change, a remap, no usable history).
 
-**Namelist.** A 1D deck that does not set `spatial_scheme` runs this scheme; `inner_acceleration="anderson"` is refused with it, and `dsa_enabled`, `inner_graph_unroll`, `outer_tol_stagnation_factor`, `diffusion_fallback_mode`, `tau_diffusion_on/off` apply to the linear-characteristic scheme only.
+**Namelist.** A 1D deck that does not set `spatial_scheme` runs this scheme; `inner_acceleration="anderson"` is refused with it, and `dsa_enabled`, `inner_graph_unroll`, `outer_tol_stagnation_factor` apply to the linear-characteristic scheme only. No \(S_N\) scheme implements the per-group diffusion fallback: `diffusion_fallback_mode` accepts only `"none"` (since 2026-09-29; `"per_group_hysteresis"` used to be accepted and did nothing), and `tau_diffusion_on/off` are read and unused.
 
 **Tests.** ctest `test_sn_1d_ld` (the GPU sweep and moments against a host implementation of the same equations in the three geometries; the P1-accelerated source iteration of thick scattering against a dense direct solution: error ≤ \(2.5\times10^{-12}\)) and `test_sn_1d_ld_step` (the Planck fraction derivative against central differences, worst relative difference \(2.2\times10^{-8}\); the equilibrium fixed point in every geometry, one and three groups, with scattering: change ≤ \(3\times10^{-15}\); the step energy balance with vacuum and Marshak boundaries, scattering, void cells and a flux drive; the Marshak waves above; the slab attenuation study above; six groups with the frequency-dependent opacity (\(\sigma\) from \(10^{8}\) to 26 cm⁻¹, 5 eV matter under a 150 eV drive): every step converged, at most 139 GMRES iterations in a step, run-to-run bitwise identical). Verification: `sn_1d_analytic_marshak`, `sn_1d_su_olson`, `sn_1d_marshak_equilibration` (sphere, slab, cylinder), `sn_1d_planar_transparent_gap`, `sn_1d_origin_symmetry` and `sn_1d_e_old_transient` run this scheme; `sn_1d_planar_slab_attenuation` (the exact attenuation) and `sn_1d_spherical_lathrop_two_region` set `"linear_characteristic"`. The slab equilibration's inner-slab temperature on 8 cells matches a 128-cell run to 0.05 % from 1000 steps on (the linear-characteristic 8-cell run leads it: 49.65 eV at 3000 steps against 47.67), so its step cap is 16000 (it reaches the plateau more slowly than the linear-characteristic run it was set for).
-
----
-
-## 7. DDMC（Discrete Diffusion Monte Carlo） [RETIRED — legacy; 現行輻射は §6.7 FLD / §6.8 \(S_N\)]
-
-> **【CURRENT RADIATION MODEL — 本章 §7 は RETIRED】** DDMC（Discrete Diffusion Monte Carlo）および §7.1.2g HOLO は **RETIRED**（FREEZE-1D-RAD・D1 以降）。現行の輻射輸送は決定論の **FLD（§6.7, `mode="multigroup_diffusion"`）** と **\(S_N\)（§6.8, `mode="sn_transport"`）** のみ。DDMC/HOLO コードは互換のため tree に残るが FLD/\(S_N\) mode で完全 bypass（`ddmc.enabled=False`, `holo.enabled=False` 必須）。以下の §7 全記述は歴史的参照であり現行仕様ではない。詳細は `SPECIFICATION.md` の `mode` 定義参照。
-
-### 7.1 DDMC領域判定（cell×group）— diffusion criterion
-
-DDMCが有効であるためには、セルが十分に拡散的である必要がある。
-τ（光学厚）だけでなく **ω（散乱比）** も条件に含める（Cleveland & Gentile 2015 §2.4準拠）。
-
-#### 7.1.1 指標の定義
-光学厚さ（transport）：
-\[
-\tau_{i,g} = \sigma_{tr,i,g}\, \ell_i \quad [\text{無次元}]
-\]
-ここで \(\sigma_{tr}\) [cm\(^{-1}\)]、\(\ell_i\) [cm]。v1.0既定：
-- \(\sigma_{tr,i,g} \equiv \sigma_{R,i,g}\)（Rosseland）
-  ※物理散乱を入れる場合は \(\sigma_{tr}=\sigma_R+\sigma_s(1-\bar\mu)\) 等へ拡張
-- \(\ell_i\)：セル代表長（既定：\(\ell_i = 2 \min_f d_{center\to f}\)、すなわちセル中心から最近面までの垂直距離の2倍）
-  - **1D_SPH**：\(\ell_i = r_{i+1/2} - r_{i-1/2} = \Delta r_i\)（球殻の厚さ）
-  - **2D_RZ**：セル中心 \(\mathbf{r}_{center}\) から4辺への垂直距離の最小値 \(d_{min}\) を用いて \(\ell_i = 2\,d_{min}\)
-    - **セル中心の定義**：4頂点の算術平均 \(r_c = (r_1+r_2+r_3+r_4)/4\), \(z_c = (z_1+z_2+z_3+z_4)/4\) とする（面積重心ではなく頂点平均）
-    - 辺 \(k\) への垂直距離（**辺長ガード付き**）：
-      辺長 \(L_k = |\mathbf{V}_{k+1}-\mathbf{V}_k|\) を先に計算し、
-      \(L_k < \varepsilon_{geom}\)（退化辺）の場合は \(d_k = |\mathbf{r}_{center}-\mathbf{V}_k|\)（端点距離）で代替する（0除算防止）。
-      \(L_k \ge \varepsilon_{geom}\) の場合：\(d_k = |(\mathbf{r}_{center}-\mathbf{V}_k)\times(\mathbf{V}_{k+1}-\mathbf{V}_k)| / L_k\)
-    - \(d_{min}\) の計算では無限直線までの距離ではなく**有限線分までの距離**を使用する。
-      凸四角形では垂線の足が辺上に常に存在するため、無限直線距離と有限線分距離は一致する。
-      非凸セル（ALE変形後に発生しうる）では、垂線の足が辺の端点外に落ちる場合があり、
-      その場合は端点までの距離を使用する。具体的には：
-      辺 \(k\) のパラメータ \(\hat{t} = (\mathbf{r}_{center}-\mathbf{V}_k)\cdot(\mathbf{V}_{k+1}-\mathbf{V}_k)/|\mathbf{V}_{k+1}-\mathbf{V}_k|^2\) を求め、
-      \(d_k = \begin{cases} d_{infinite} & (0 \le \hat{t} \le 1) \\ \min(|\mathbf{r}_{center}-\mathbf{V}_k|,\; |\mathbf{r}_{center}-\mathbf{V}_{k+1}|) & (\text{otherwise})\end{cases}\)
-    - **退化セル対策**：\(d_{min} < \varepsilon_{geom}\) (\(\varepsilon_{geom} = 10^{-12}\) cm) の退化セルでは \(\ell_i = 2\varepsilon_{geom}\) として DDMC 判定を回避する（IMC に退化）
-    - 正方形セルでは \(\ell_i = \Delta x\)（セル幅）に一致
-
-> **Cleveland & Gentile (2015) からの多群拡張**：
-> Cleveland & Gentile Eq.(21) はgrey総不透明度 \((\kappa+\kappa_s)\) でτを定義している。
-> 多群TENRYUでは、DDMCが拡散方程式（D = 1/(3σ_R)）に基づくため、
-> τの不透明度も **Rosseland** を採用し、拡散係数との整合性を保つ。
-> greyかつ物理散乱なし（v1.0既定）では \(\kappa_P=\kappa_R=\kappa\) となり
-> Cleveland & Gentile原式と一致する。
-
-散乱比（Fleck factorによる実効散乱を含む）：
-\[
-\omega_{i,g} = \frac{\sigma_{s,phys,g} + (1-f_i)\,\sigma_{a,g}}{\sigma_{a,g} + \sigma_{s,phys,g}}
-\]
-
-> **実装ノート**：
-> \(\sigma_{a,g}+\sigma_{s,phys,g}<\epsilon_\sigma\)（\(\epsilon_\sigma = 10^{-30}\,[\mathrm{1/cm}]\)）の場合は、\(\omega_{i,g}=\operatorname{clamp}(1-f_i,0,1)\) を用い、事前判定での NaN を防ぐ。
-
-v1.0既定（\(\sigma_{s,phys}=0\)）では \(\omega_{i,g} = 1-f_i\)。
-
-> 物理的意味：ωが大きい（≈1）ほど衝突が実効散乱支配であり、拡散近似が成り立つ。
-> Fleck factor fが小さい（高温・光学厚）領域で ω→1 となり、DDMCに適する。
-
-#### 7.1.2 diffusion criterion（判定条件）
-セル i × 群 g の baseline transport mode は、以下の優先順で決める。
-
-**DDMC 条件**：
-
-1. **散乱比閾値**：\(\omega_{i,g} \ge \omega_{DDMC}\)（既定 \(\omega_{DDMC}=0.9\)）
-2. **光学厚閾値**：\(\tau_{i,g} \ge \tau_{DDMC}\)（既定 \(\tau_{DDMC}=4.0\)）
-
-> VERIFICATION.md §8-§9 の検証テストでは τ_DDMC = 3.0 を使用する場合がある（全セルDDMCモードを確実にするためのテスト設計上の選択）。
-
-3. **M‑matrix条件**（7.3.3）を満たす
-4. **IMC→DDMC変換確率制約**（7.7.1, 7.7.3）を満たす（\(0 \le \hat{P}(\mu) \le 1\)；v1.0既定の \(\hat{P}\) では条件1により概ね充足されるが、\(\tau \approx \tau_{DDMC}\) の境界領域では §7.7.3 の安全策（クランプ/フォールバック）が必要）
-
-判定：
-- DDMC 条件 1〜4 をすべて満たす ⇒ DDMC
-- それ以外 ⇒ IMC
-
-> **PGRW 注**：`tau_rw` は独立 mode を生成しない。`tau_rw > 0` のとき、
-> `imc_transport_persistent` 内で IMC 粒子に対してのみ 1D_SPH internal PGRW
-> eligibility 判定を行う。mode map 自体は IMC/DDMC の2値である。
-
-> **根拠**：τだけで判定すると、Fleck factor fが大きい（ω小、散乱が弱い）のに拡散として扱い、
-> 非物理な挙動を起こし得る（Cleveland & Gentile 2015, Densmore et al. 2007）。
-> 散乱比を入れることで、DDMCが実際に拡散的に振舞うセルのみに適用される。
->
-> **参考文献**：
-> - Cleveland & Gentile, JCP 291 (2015): diffusion criterion として ω≥0.9, τ_min≥4 を例示
-> - Densmore et al., JCP 222 (2007): P(μ)制約との整合
->
-> **Phase-1 実装注記**：2D_RZ では PGRW を有効化せず、mode map は IMC / DDMC の2値に退化する。
-
-#### 7.1.2a Hybrid diffusion 分類マスク（PR1）
-
-`Radiation.diffusion.enabled=True` かつ 1D_SPH の場合、DDMC mode selection の前にセル単位の diffusion 分類マスクを作る。entry/exit 時の粒子表現と deterministic 表現のエネルギー変換、diffusion セルの local source solve、および PR4 の 1D RKL2 空間 diffusion step を行う。分類マスクは DDMC が diffusion 領域および guard 領域を claim しないようにも使う。
-
-セル \(i\) の Rosseland 平均は、群別 \(\sigma_{R,i,g}\) と Planck fraction \(b_g(T)\) から
-\[
-w_{i,g}=\max\left(\frac{\partial(T^4 b_g)}{\partial T}\bigg|_{T_i},0\right),\qquad
-\bar{\sigma}_{R,i}=\frac{\sum_g w_{i,g}}{\sum_g w_{i,g}/\max(\sigma_{R,i,g},\sigma_{floor})}
-\]
-で評価する。1群では \(w=1\) とし、重み和または分母がゼロの場合は
-\(\max_g\sigma_{R,i,g}\) へフォールバックする。セル光学厚は
-\[
-\tau_{R,i}=\bar{\sigma}_{R,i}\Delta r_i
-\]
-である。
-
-reduced flux は前ステップの IMC face-current tally \(J_{f,g}\) [erg] から
-\[
-F_f = \frac{\sum_g J_{f,g}}{A_f\Delta t_{prev}},\qquad
-R_{F,i}=\frac{\max(|F_{i-1/2}|,|F_{i+1/2}|)}{c\max(\sum_g E_{i,g},E_{floor})}
-\]
-で評価する。face-current は粒子がセル境界面を横切った時だけ加算し、右向きを \(+E_p\)、左向きを \(-E_p\) とする。初回ステップなど前ステップ tally が無い場合は \(R_F=0\) とする。
-ただし raw radiation energy \(\sum_g\max(E_{i,g},0)\le 10^{-20}\) erg/cm³ のセルは、
-拡散させる放射場が無いものとして diffusion entry/継続を禁止し、hold counter をリセットする。
-
-ヒステリシスはセル単位で行うが、新規 entry と exit は異なる cadence で扱う。
-
-- diffusion セルの hard exit は毎 step 評価する。radiation energy floor 以下、void、
-  \(\tau_R<\tau_{off}\)、または \(R_F>R_{F,off}\) なら、その step で diffusion から
-  exit する。さらに実装上の安全条件として \(\tau_R<0.5\tau_{off}\) のセルは
-  classification cadence に関わらず必ず immediate exit する。この条件は通常の
-  \(\tau_R<\tau_{off}\) exit に含まれるが、将来 entry/update cadence を最適化しても
-  低光学厚セルが diffusion に残らないことを保証する invariant とする。
-- 非 diffusion セルの新規 entry は
-  `Radiation.diffusion.mode_update_interval` step ごとにだけ commit する。
-  `mode_update_interval=1` なら従来どおり毎 step entry を許可する。step 0、または
-  restart で previous diffusion mask が無い場合は entry update step として扱う。
-- 非 diffusion セルは radiation energy floor を上回り、かつ
-  \(\tau_R\ge\tau_{on}\) かつ \(R_F\le R_{F,on}\) を満たすと raw entry 候補となる。
-  `mode_hold` と `rate_max` は raw entry 候補に対して従来どおり適用する。
-  entry update step でない場合、条件を満たしても current mask には commit しない。
-- entry update step では、hard exit 後に残った existing diffusion セルと新規 entry
-  候補から desired diffusion mask を作り、1D global cell index で maximal contiguous
-  island を走査する。island は候補セルだけで構成され、void/non-candidate cell で切れる。
-  island length が `Radiation.diffusion.min_diffusion_island_cells` 未満なら、その island
-  全体を非 diffusion とする。existing diffusion セルであっても、小 island と判定された
-  場合は通常の exit 変換で IMC に戻す。
-- `min_diffusion_island_cells=1` は island filter を実質無効化する。MPI 分割時の
-  island length は global cell index で定義し、rank 境界をまたぐ candidate run が
-  local run として誤って短く数えられないよう、境界 run length を隣接 rank と交換する。
-- void セルは常に非 diffusion とする。
-
-分類後、diffusion セルから `imc_guard_cells` 以内の非 diffusion セルを guard セルとし、diffusion セルと guard セルを DDMC selector 後に強制 IMC へ戻す。guard セルは
-`min_diffusion_island_cells` の island size に数えず、island filter 後にだけ生成する。
-`diffusion.enabled=False` では従来挙動を維持する。
-
-#### 7.1.2b Hybrid diffusion entry/exit エネルギー変換（PR2）
-
-diffusion セルの deterministic 放射エネルギーは \(E^D_{i,g}\) [erg/cm³] として `IMC::diff_E_` に保持する。分類直後、輸送前に current mask \(D_i^{n+1}\) と previous mask \(D_i^n\) を比較し、表現変換だけをエネルギー保存形で行う。
-
-entry（\(D_i^{n+1}=1, D_i^n=0\)）では、セル \(i\)、群 \(g\) に存在する全 alive 粒子のエネルギーを GPU scan/atomic add で集計し、
-\[
-E^D_{i,g} = \frac{1}{V_i}\sum_{p:\,cell(p)=i,\,group(p)=g,\,alive(p)} E_p
-\]
-とする。集計した粒子は killed とし、粒子プールは compact する。この PR では LTE 初期化や物質エネルギーからの追加 withdraw は行わない。
-
-継続 diffusion（\(D_i^{n+1}=1, D_i^n=1\)）では、既存の \(E^D_{i,g}\) を保持し、§7.1.2c の source solve と §7.1.2d の RKL2 空間 diffusion step が更新する。
-
-exit（\(D_i^{n+1}=0, D_i^n=1\)）では、各群について
-\[
-E_{\mathrm{tot},i,g}=E^D_{i,g}V_i
-\]
-を計算し、\(E_{\mathrm{tot},i,g}>0\) なら
-\[
-N_{i,g}=\max(1,\texttt{Radiation.diffusion.exit\_particles\_per\_cell\_group})
-\]
-個の IMC 粒子を生成する。粒子エネルギーは総和が \(E_{\mathrm{tot},i,g}\) になるよう割り付け、位置は 1D 球殻体積一様、方向は等方、`time_remain=dt`、mode は IMC とする。生成成功後、exit セルの \(E^D_{i,g}\) は 0 にする。
-
-`IMC::census_energy()` は alive 粒子のエネルギーに \(\sum_{i:D_i=1}\sum_g V_iE^D_{i,g}\) を加える。`state.rad_E` の finalization は particle cell では従来の track-length estimator を使い、diffusion cell では \(E^D_{i,g}\) をそのまま書く。
-
-diffusion exit 粒子の Philox `global_id` は step local-id 空間の高位予約範囲のうち
-\([2^{39},2^{39}+2^{38})\) を rank ごとに等分した subrange から割り当てる。
-PR5 の diffusion-interface spawn 粒子は
-\([2^{39}+2^{38},2^{40})\) を同様に rank 分割して使う。既存 thermal / Marshak /
-volume source は低位 local-id 範囲を使うため、source 粒子の RNG stream とは衝突しない。
-
-#### 7.1.2c Hybrid diffusion cell-local source solve（PR3）
-diffusion セル \(i\) では、thermal source 粒子を生成せず、Radiation 演算子内で
-cell-local な implicit matter-radiation source solve を行う。PR4 以降は Strang split とし、
-IMC/DDMC/RW transport の前に \(\Delta t/2\)、RKL2 空間 diffusion step の後に
-\(\Delta t/2\) の source half-step を実行する。
-
-各 diffusion セルは1 GPU thread が担当する。diffusion 分類はセル単位の
-\(\tau_R\) と reduced flux \(R_F\) により物理的な拡散・平衡領域を選んでいるため、
-source solve は群別の \(\Delta t_s c\sigma^P_{i,g}\) による分岐を行わず、
-常に equilibrium-limit update を使う。透明 window 群は Planck weight が小さいため、
-同じ平衡投影
-\[
-E^{new}_{i,g}(T)=a_{eV}T^4b_g(T)
-\]
-に含める。
-
-未知数は \(T^{new}_i\) の1変数で、Planck fraction が
-\(\sum_g b_g(T)=1\) に正規化されていることから Newton residual は
-\[
-R_i(T)=m_i c_{v,e,i}(T-T_i^{old})
-+V_i\left(a_{eV}T^4-\sum_gE^{old}_{i,g}\right)=0
-\]
-である。Phase-1 kernel は保存済みの \(T_i^{old}\)、\(e_{e,i}^{old}\) と
-ideal-gas mass heat capacity を用い、
-\[
-e_e^{new}(T)=e_{e,i}^{old}+c_{v,e,i}(T-T_i^{old}),\qquad
-\frac{de_e}{dT}=c_{v,e,i}
-\]
-とする。\(c_{v,e,i}\) は `state.cv_e[i]` が正ならそれを使い、未提供時は
-single-material fallback \(k_B/(A m_p(\gamma-1))\) を使う。pressure closure は既存 EOS と同じ
-\[
-P_{e,i}^{new}=(\gamma-1)\rho_i e_{e,i}^{new}
-\]
-である。table EOS の \(e_e(T), c_v(T), P_e(\rho,T)\) 評価は後続 PR に延期し、
-この kernel では未対応とする。
-
-Newton derivative は
-\[
-\frac{dR_i}{dT}=m_i c_{v,e,i}
-+4V_i a_{eV}T^3
-\]
-であり、\(T>0\) で正なので解は一意である。停止条件は
-\[
-|R_i| \le 10^{-10}\max(|m_i c_{v,e,i}(T-T_i^{old})|,
-|V_i(a_{eV}T^4-\sum_gE^{old}_{i,g})|,
-|m_i c_{v,e,i}\max(T,T_i^{old})|,
-V_i\max(|\sum_gE^{old}_{i,g}|,10^{-30}),10^{-30})
-\]
-である。実装は最大30反復の damped Newton を使い、
-負方向 step は \(-0.5T\) で制限し、trial residual が増加または非有限になる場合は
-最大8回まで step を半減する。収束後は全群を
-\[
-\texttt{diff\_E}_{i,g}\leftarrow a_{eV}(T_i^{new})^4b_g(T_i^{new})
-\]
-に設定した後、table 補間された Planck fraction の丸め誤差を補正するため、
-\[
-s_i=\frac{a_{eV}(T_i^{new})^4}
-{\sum_h \max(a_{eV}(T_i^{new})^4 b_h(T_i^{new}),0)}
-\]
-（分子・分母がともに \(10^{-30}\) より大きい場合）で全群を rescale し、
-Newton residual が用いた解析的な全群和 \(a_{eV}T^4\) と一致させる。
-
-最大反復で収束しないセル、非有限 residual、または有効な降下 step が得られないセルは
-未収束として WARNING 診断に数え、`Te`, `ee`, `Pe`, `diff_E` を更新しない。
-kernel 起動前に `Te`, `ee`, `Pe`, `diff_E` は device scratch へ保存し、未収束・
-非有限入力・後述の保存則 gate 失敗ではこの scratch から該当セルを復元する。
-
-収束後の更新は
-\[
-\texttt{diff\_E}_{i,g}\leftarrow E^{new}_{i,g}(T_i^{new}),\quad
-\texttt{ee}_i\leftarrow e_{e,i}^{old}+c_{v,e,i}(T_i^{new}-T_i^{old}),\quad
-\texttt{Te}_i\leftarrow T_i^{new},\quad
-\texttt{Pe}_i\leftarrow P_e^{new}
-\]
-である。ただし書き込み直前に
-\[
-\Delta U_i=m_i(e_{e,i}^{new}-e_{e,i}^{old}),\qquad
-\Delta E_i=V_i\sum_g(E^{new}_{i,g}-E^{old}_{i,g})
-\]
-に対して
-\[
-|\Delta U_i+\Delta E_i|
-\le 10^{-6}\max(|\Delta U_i|,|\Delta E_i|,10^{-30})
-\]
-を満たすことを要求する。満たさない場合は solve を棄却し、保存済み state を復元し、
-`rad_dep` / `rad_emit` も加算しない。diagnostic tally は保存則 gate を通ったセルだけ
-\[
-\texttt{rad\_dep}_{i,g}\mathrel{+}=
-\Delta t_s\,c\,\sigma^{P}_{i,g}E^{new}_{i,g}V_i,\qquad
-\texttt{rad\_emit}_{i,g}\mathrel{+}=
-\Delta t_s\,c\,\sigma^{P}_{i,g}a_{eV}(T_i^{new})^4b_g(T_i^{new})V_i
-\]
-として記録するが、§2.1 の U1 source injection では diffusion セルに再適用しない。
-
-#### 7.1.2d Hybrid diffusion RKL2 空間 step（PR4）
-
-PR4 では 1D_SPH diffusion セルの deterministic 群別放射エネルギー
-\(E^D_{i,g}\) を、凍結 Rosseland 拡散係数
-\[
-D^{raw}_{i,g}=\frac{c}{3\max(\sigma_{R,i,g},\sigma_{floor})},\qquad
-D_{i,g}=\min\left(D^{raw}_{i,g},\frac{c\Delta r_i}{6}\right)
-\]
-で explicit RKL2 super-time-stepping により更新する。RKL2 stage 中は
-\(D_{i,g}\)、diffusion mask、幾何を凍結し、各群は独立に解く。
-この cap は透明な群で mean-free-path がセル幅を大きく超える場合の
-非物理的な拡散係数を制限し、RKL2 の明示限界も同じ \(D_{i,g}\) で評価する。
-
-セル中心 \(r_{c,i}=(r_{i-1/2}+r_{i+1/2})/2\)、面積
-\(A_{i\pm1/2}=4\pi r_{i\pm1/2}^2\)、体積 \(V_i\) とする。diffusion-diffusion
-内部面では
-\[
-D_{i+1/2,g}=
-\frac{2D_{i,g}D_{i+1,g}}{D_{i,g}+D_{i+1,g}},
-\qquad
-F_{i+1/2,g}=
--D_{i+1/2,g}\frac{E^D_{i+1,g}-E^D_{i,g}}{r_{c,i+1}-r_{c,i}}
-\]
-を用い、
-\[
-\mathcal{L}_{i,g}(E)=
-\frac{A_{i-1/2}F_{i-1/2,g}-A_{i+1/2}F_{i+1/2,g}}{V_i}.
-\]
-同じ面 flux を左右セルで符号反対に使うため、reflective 境界かつ source なしでは
-\(\sum_i V_iE^D_{i,g}\) を roundoff まで保存する。
-
-diffusion-IMC interface 面は PR4 では zero-current とする。物理 inner reflective
-境界も \(F=0\)。物理 outer vacuum 境界は free-streaming leakage
-\[
-F_{N+1/2,g}=\frac{c}{4}E^D_{N,g}
-\]
-を使う。inner 側を vacuum と指定した場合は外向き法線に合わせ
-\(F_{1/2,g}=-(c/4)E^D_{1,g}\) とする。
-
-IMC transport で diffusion セルへ入射した packet energy は
-positive face-current source \(J^{in}_{f,g}\) [erg] として別 tally に保持する。
-RKL2 operator を組む前に、diffusion セル \(i\) では隣接セルが非 diffusion の
-interface 面だけを取り込み、
-\[
-E^{D,*}_{i,g}=E^D_{i,g}+
-\frac{\sum_{f\in\partial i,\;neighbor(f)\notin D}J^{in}_{f,g}}{V_i}
-\]
-として first diffusion cell に直接 deposit する。取り込んだ `face_current_in`
-entry は 0 に戻し、RKL2 は \(E^{D,*}\) を初期値として進める。これにより
-RKL2 operator が空、または stability gate で spatial step を skip した場合でも
-\(J^{in}\) は diffusion field に保存される。
-reduced-flux 分類用の `face_current_step` は従来通り右向き crossing を正、
-左向き crossing を負とする signed tally であり、\(J^{in}\) とは分離する。
-RKL2 更新後に負の \(E^D_{i,g}\) が発生した場合は、群ごとに conservative positivity
-limiter を適用する。各群で signed total
-\(S_g=\sum_i V_iE^D_{i,g}\) と positive total
-\(P_g=\sum_i V_i\max(E^D_{i,g},0)\) を計算し、\(P_g>0\) なら正のセルだけを
-\(\max(S_g,0)/P_g\) 倍して負のセルを 0 にする。これにより \(S_g\ge0\) では
-\(\sum_iV_iE^D_{i,g}\) を保存しつつ、positive-only diagnostic energy が負の undershoot
-を無視して人工的に増えることを防ぐ。\(S_g<0\) の群は全 diffusion cell/group を 0
-にする。
-
-RKL2 係数は Legendre 多項式 \(P_j\) の recurrence から host 側で1回計算する。
-super-step \(\tau\) に対し
-\[
-Y_0=E^n,\qquad
-Y_1=Y_0+\tilde\mu_1\tau\mathcal{L}(Y_0),
-\]
-\[
-Y_j=(1-\mu_j-\nu_j)Y_0+\mu_jY_{j-1}+\nu_jY_{j-2}
-+\tilde\mu_j\tau\mathcal{L}(Y_{j-1})
-+\tilde\gamma_j\tau\mathcal{L}(Y_0),\quad 2\le j\le s.
-\]
-undamped RKL2 では \(w_0=1\)、\(w_1=P_s'(1)/P_s''(1)=4/(s^2+s-2)\)、
-\[
-b_j=\frac{P_j''(1)}{(P_j'(1))^2},\quad a_j=1-b_j,\quad
-\mu_j=\frac{2j-1}{j}\frac{b_j}{b_{j-1}},\quad
-\nu_j=-\frac{j-1}{j}\frac{b_j}{b_{j-2}},
-\]
-\[
-\tilde\mu_1=b_1w_1,\quad
-\tilde\mu_j=\mu_jw_1,\quad
-\tilde\gamma_j=-a_{j-1}\tilde\mu_j.
-\]
-実装は damping \(>0\) の場合に \(w_0=1+2\,\mathrm{damping}/(s^2+s)\) とし、
-\(P_j(w_0)\), \(P'_j(w_0)\), \(P''_j(w_0)\) から同じ recurrence を評価する。
-
-明示限界は
-\[
-\Delta t_{exp}=\min_{i,g}
-\frac{V_i}{\sum_f A_f D_{f,g}/\Delta r_f + \sum_{f\in vacuum} A_f c/4}
-\]
-で見積もり、
-\[
-C_s=\frac{s^2+s-2}{4}
-\]
-の undamped RKL2 stability capacity が \(C_s\ge\Delta t/(\Delta t_{exp}\eta)\)
-を満たすよう
-\[
-s=\max\left(2,
-\left\lceil
-\frac{\sqrt{9+16\Delta t/(\Delta t_{exp}\eta)}-1}{2}
-\right\rceil\right),
-\qquad \eta=\texttt{Radiation.diffusion.sts\_subcycle\_eta}.
-\]
-`sts_max_stages>0` かつ必要 stage 数が上限を超える場合は、
-\(\Delta t_{sub}\le \eta\,[(s_{max}^2+s_{max}-2)/4]\Delta t_{exp}\) となるよう diffusion step を
-等分 subcycle する。必要 subcycle 数が 10 を超える場合は current diffusion mask を
-entry/exit 変換前に棄却し、その radiation step では該当セルを IMC として扱う
-（前ステップから diffusion だったセルは通常の exit 変換を行う）。
-
-#### 7.1.2e Hybrid diffusion IMC interface（PR5）
-
-PR5 では 1D_SPH の deterministic diffusion 領域と IMC guard 領域を face-current
-で結合する。IMC packet が cell boundary を越えて destination cell
-\(D_j=1\) に入る場合、packet は diffusion 表現へ変換される。face index は
-左向き crossing で \(f=i\)、右向き crossing で \(f=i+1\) とし、
-\[
-J^{in}_{f,g}\mathrel{+}=E_p,\qquad
-J^{step}_{f,g}\mathrel{+}=s_f E_p,\quad
-s_f=\begin{cases}-1 & \text{left crossing}\\ +1 & \text{right crossing}\end{cases}
-\]
-を atomic tally した後、packet を dead にする。\(J^{in}\) は unsigned energy
-source、\(J^{step}\) は次 step の reduced-flux 判定用 signed current である。
-この face conversion では matter へ deposition しない。
-
-RKL2 空間 step 後、diffusion-IMC interface 面からの outward leakage を
-post-RKL2 の deterministic energy から計算する。Phase-1 は Marshak-like
-partial-current closure
-\[
-J^{out}_{f,g}=
-\frac{cE^D_{i,g}}{4+\frac{3}{2}\sigma_{R,i,g}\Delta x_i}\,
-A_f\Delta t
-\]
-を用いる。ここで \(i\) は interface に隣接する diffusion cell、
-\(\Delta x_i=r_{i+1/2}-r_{i-1/2}\)、\(A_f=4\pi r_f^2\) である。outgoing leakage には
-face ごとの \(0.5\,V_iE^D_{i,g}\) cap も step 全体の 0.5 cap も適用しない。
-cap は \(J^{out}\) ではなく deterministic field の positivity にだけ適用する。
-
-cell/group ごとに、interface faces の desired leakage
-\(J^{des}_{f,g}\) を集計する。\(E^{post}_{i,g}\) を source1、face-current deposit、
-RKL2 内部 diffusion/vacuum leakage、および RKL2 positivity limiter 後の deterministic
-energy とする。この時点の利用可能エネルギーは
-\[
-A_{i,g}=\max\left(V_iE^{post}_{i,g}-V_iE_{floor},0\right)
-\]
-であり、これは同じ step の \(J^{in}\) を含む。すなわち概念的には
-\[
-V_iE^{post}_{i,g}
-=V_iE^{old}_{i,g}+\sum_fJ^{in}_{f,g}
-+\Delta E^{internal}_{i,g}-E^{vacuum}_{i,g}
-+\Delta E^{limiter}_{i,g}
-\]
-である。desired leakage の総和
-\[
-L^{des}_{i,g}=\sum_{f\in interface(i)}J^{des}_{f,g}
-\]
-が \(A_{i,g}\) を超える場合だけ、同じ cell/group から出る全 interface leakage を
-\[
-J^{out}_{f,g}=J^{des}_{f,g}\frac{A_{i,g}}{L^{des}_{i,g}}
-\]
-で scale する。\(L^{des}_{i,g}\le A_{i,g}\) なら \(J^{out}_{f,g}=J^{des}_{f,g}\) とする。
-\(A_{i,g}=0\) の場合は全 outgoing leakage を 0 とする。確定した leakage は
-`face_current_out[f,g]` に保存し、
-\[
-E^D_{i,g}\leftarrow E^{post}_{i,g}
--\frac{\sum_{f\in interface(i)}J^{out}_{f,g}}{V_i}
-\]
-で deterministic field から取り除く。これにより同じ step に入った
-`face_current_in` は outgoing leakage に即時利用可能だが、cell/group energy は
-非負 floor 未満に落ちない。
-
-\(J^{out}_{f,g}>0\) の interface では
-\[
-N_f=\max(1,\texttt{Radiation.diffusion.interface\_particles\_per\_face\_group})
-\]
-個の IMC packet を adjacent IMC cell に生成し、packet energy は総和が
-\(J^{out}_{f,g}\) と一致するよう最後の packet で丸め残差を受ける。位置は
-interface radius \(r_f\)、方向は outward half-space current 分布
-\(|\mu|=\sqrt{\xi}\) とし、符号は diffusion cell から IMC cell へ向ける。
-`time_remain=dt`、mode は IMC、`rng_counter=0` とする。
-
-spawn 後は tail IMC pass を行う。tail 中に packet が diffusion cell へ戻った場合は
-同じ \(J^{in}\) tally に入るが、RKL2 step は既に終了しているため、その energy は
-tail pass 後に \(E^D_{i,g}\) へ直接加算してから後段の \(\Delta t/2\) source solve
-へ渡す。これにより particle + deterministic + escape energy を step 内で保存する。
-
-#### 7.1.2f Hybrid diffusion full 3-mode step ordering（PR6）
-
-`Radiation.diffusion.enabled=True` かつ 1D_SPH では、通常の IMC/DDMC/PGRW
-輸送に deterministic diffusion mode を加え、1 radiation step を次の順序で実行する。
-`Radiation.diffusion.enabled=False` または 2D_RZ では従来の IMC/DDMC/PGRW
-ordering に退化する。
-
-```text
-radiation_step(dt):
-  1.  opacity, Fleck factor, effective opacity を既存経路で評価する。
-  2.  前 step の signed face-current から reduced flux を評価する。existing
-      diffusion セルの hard exit は毎 step 評価し、新規 entry と island filter は
-      mode_update_interval step ごとにだけ commit する。cell-level diffusion mask と
-      IMC guard cell mask を分類する。
-  3.  entry/exit 表現変換を行う。
-      - entry: diffusion cell に入る既存 particle energy を E^D_{i,g} へ畳み込む。
-      - exit: E^D_{i,g} V_i を IMC particle へ変換し、該当 E^D_{i,g}=0 とする。
-  4.  mode map を構築する。
-      - diffusion cell は state.ddmc_mode_map に TransportMode::Diffusion=3 と記録する。
-      - transport kernel へ渡す DDMC mode selector では diffusion cell と guard cell を
-        IMC に強制し、DDMC/PGRW が deterministic 領域を claim しないようにする。
-      - それ以外は既存 DDMC/PGRW selector に従う。
-  5.  particle tally（rad_dep, rad_E_tally, E_escape）と diffusion interface
-      current 入出力 tally をゼロ化する。
-  6.  diffusion cell が存在する場合、cell-local source solve を dt/2 実行する。
-  7.  thermal source particle を生成する。ただし diffusion cell は source mask で
-      skip し、thermal emission は deterministic source solve が担当する。
-      Marshak / volume source は既存 source 経路で生成する。
-  8.  composite sort 後、IMC/DDMC/PGRW transport を実行する。
-      IMC packet が diffusion cell へ入射した場合は packet を kill し、
-      J^{in}_{f,g} と signed J^{step}_{f,g} に tally する。
-  9.  diffusion cell が存在する場合、J^{in}_{f,g} を隣接 diffusion cell へ
-      deposit してから 1D RKL2 deterministic diffusion step を dt 実行する。
-      vacuum leakage は E_rad_esc に加算される。
-  10. diffusion-IMC interface face から outgoing current J^{out}_{f,g} を IMC
-      particle に変換し、spawn した packet だけを tail IMC transport する。
-      tail 中に diffusion cell へ戻った energy は RKL2 を再実行せず E^D_{i,g}
-      へ直接加算する。
-  11. diffusion cell が存在する場合、cell-local source solve を dt/2 実行する。
-  12. rad_E を finalize する。
-      - particle cell: legacy では rad_E_tally / (V_i c dt)
-      - difference cell: E_ref_avg + signed rad_E_tally / (V_i c dt)
-      - diffusion cell: E^D_{i,g}
-  13. signed face-current を rotate する。
-      face_current_step -> face_current_prev、face_current_step=0。
-  14. census combing を既存経路で行う。diffusion cell には粒子を保持しないため
-      combing 対象は particle-owned cell の census のみである。
-  15. current diffusion mask を previous mask として保存し、次 step の entry/exit
-      判定に使う。
-```
-
-energy budget の radiation term は particle census energy に
-\(\sum_{i:D_i=1,g} V_iE^D_{i,g}\) を加えた mixed radiation energy を使う。
-したがって diffusion step の vacuum leakage、IMC/particle escape、Marshak/volume
-input、source/transport numerical loss を同一の step budget で評価する。
-snapshot HDF5 の `radiation/energy_density` は step finalize 後に書き出され、
-particle cell では track-length estimator、diffusion cell では deterministic
-\(E^D_{i,g}\) を保持する。
-
-per-step diagnostic は次の要約を出す。
-
-```text
-[diffusion] step=N n_diff=M n_guard=K mode_update=U forced_exit=H island_reject=R
-            rkl2_stages=S rkl2_subcycles=Q dt_explicit=D rkl2_skipped=B source_iter=I
-            E_diff=X E_in=Y E_out=Z E_particle=W interface_limited=L
-```
-
-ここで \(E_{\rm diff}=\sum_{i:D_i=1,g} V_iE^D_{i,g}\)、`E_in` は
-IMC→diffusion interface energy、`E_out` は diffusion→IMC spawned energy、
-`E_particle` は alive particle census energy である。`mode_update` は新規 entry/island
-filter を commit した step なら 1、そうでなければ 0。`forced_exit` は hard exit で
-IMC に戻した cell 数、`island_reject` は `min_diffusion_island_cells` により非 diffusion
-へ戻した cell 数、`interface_limited` は positivity limiter により outgoing face current
-を scale した cell/group 数である。
-diffusion 有効 step では追加で
-\[
-E^D_{\rm start}+E^{face}_{in}-E^{face}_{out}-E^{vacuum}_{out}
--\Delta U_{\rm source}=E^D_{\rm final}
-\]
-を診断し、相対残差が \(10^{-8}\) を超える場合は critical log を出す。
-\(\Delta U_{\rm source}\) は cell-local source solve で matter が得た正味エネルギー
-（radiation は同量を失う）である。RKL2 内部でも
-\(E_{before}+E^{face}_{in}-E_{vacuum}=E_{after}\) を同じ閾値で診断する。
-さらに `source1`, `rkl2`, `interface_out`, `tail_deposit`, `source2` の各 substep で
-`[diffusion_substep]` diagnostic を出し、substep 前後の \(E^D\)、face input/output、
-vacuum loss、source exchange、source failure count を記録する。任意の substep または
-step finalize で \(E^D\) が
-\(10\times\max(|E_{\rm before}|, |E_{\rm face,in}|, |E_{\rm face,out}|,
-|E_{\rm vacuum}|, |\Delta U_{\rm source}|, |E_{\rm expected}|, 10^{-20})\)
-を超えた場合は safety fallback として current diffusion mask を全て IMC に戻し、
-残った deterministic \(E^D\) を exit particles に変換してから \(E^D\) を 0 にする。
-
-#### 7.1.2g HOLO（High-Order Low-Order）概要 [RETIRED — legacy]
-
-`Radiation.holo.enabled=False` が既定であり、既存の
-IMC/DDMC/PGRW/hybrid diffusion 実行経路を変更しない。`enabled=True` は v1 では
-`Main.dimension="1D_SPH"` のみを対象とし、2D_RZ では WARNING を出して無効化する。
-HOLO は high-order 粒子輸送を従来通り全領域で実行し、low-order (LO)
-物理フレーム放射拡散を解く。通常 HOLO では selector が作る連続 patch ごとに解き、
-DF 併用時は patch 境界 BC を使わず全 mesh を LO solve domain とする。通常 HOLO では
-core cell の material coupling と accepted radiation energy を LO が所有する。radiation
-acceptance は binary であり、blend cell の radiation は HO moment を採用する。
-material source injection だけは従来通り `holo_lo_weight` で LO/HO source を混合する。
-DF 併用時は post-hoc overwrite ではなく DF carried reference reservoir を accepted core
-state へ再中心化し、LO core census residual を kill して DF 内部状態と一致させる。
-LO material coupling の所有は LO core cell のみである。
-patch solve では、patch が物理 outer boundary に達した場合だけ vacuum boundary
-condition を使い、内部 HO/LO patch 境界では high-order face-current tally を boundary
-condition として使う。
-
-LO material coupling mask は solver 境界ではなく、電子内部エネルギー更新の source owner を
-選ぶ cell mask である。mask は Rosseland optical depth の単一閾値
-`Radiation.holo.coupling_tau` と `guard_cells` の膨張だけで作る。opacity 評価後の
-\(\sigma_{R,i,g}\)、電子温度 \(T_{e,i}\)、Planck table から
-\[
-w_{i,g}=\max\left(\frac{\partial(T^4 b_g)}{\partial T}\bigg|_{T_{e,i}},0\right),
-\qquad
-\bar{\sigma}_{R,i}=\frac{\sum_g w_{i,g}}
-{\sum_g w_{i,g}/\max(\sigma_{R,i,g},\sigma_{floor})},
-\qquad
-\tau_{R,i}=\bar{\sigma}_{R,i}\Delta r_i
-\]
-を計算する。1群では \(w=1\) とし、重み和または分母がゼロの場合は
-\(\max_g\sigma_{R,i,g}\) へ fallback する。これにより `[holo_selector]` の
-`tau_R_min/max` は同じ mesh、opacity、temperature state の
-`[diffusion_classify]` と同じ optical-depth proxy を報告する。
-base core mask は hysteresis 無効時には \(\tau_{R,i}\ge\tau_{coupling}\) かつ非 void
-cell で真になる。`tau_on>0` または `tau_off>0` の場合は、前 step で core でなかった
-cell は \(\tau_{R,i}\ge\tau_{on}\) で進入し、前 step で core だった cell は
-\(\tau_{R,i}\ge\tau_{off}\) または `min_dwell_steps` 未満の滞在で維持する。
-core mask は blend 幅だけ非 void cell へ膨張して patch mask を作り、core からの dilation
-距離 \(d\) に対して \(w_i=(N_{blend}-d)/N_{blend}\) を与える。`holo_core_mask` は
-LO material-coupled cell mask、`holo_patch_mask` は LO solve domain である。
-
-low-order 系の未知量は群別の物理フレーム放射エネルギー密度
-\(E^{LO}_{i,g}\) [erg/cm³] である。\(E^{LO}\) は persistent state であり、
-step 間で保持する。サイズ変更または初期状態ではゼロで初期化し、`rad_E` や
-LTE equilibrium へ毎 step reset しない。DF が有効な場合でも LO solve は signed residual
-particle tally を読まず、物理量である \(\sigma_P,\sigma_R,T_e,\rho,V,r\) のみを読む。
-
-material coupling の所有規則は以下で固定する。
-
-\[
-\Delta E^{mat}_i =
-\begin{cases}
-\sum_g(\mathrm{rad\_dep}_{i,g}-\mathrm{rad\_emit}_{i,g}) & i \notin \mathrm{LO\_coupled},\\
-\Delta E^{mat,LO}_i & i \in \mathrm{LO\_coupled}.
-\end{cases}
-\]
-
-`solve_holo_lo_1d_cpu` は swappable low-order backend の v1 実装であり、
-1D_SPH の全 cell で群ごとに backward-Euler 1D spherical diffusion と
-explicit-temperature implicit source を一つの Thomas solve で解く。内部 face
-\(f=i+1/2\) の係数は Rosseland harmonic diffusion coefficient
-\[
-C_{f,g} = A_f\,D_{f,g}/(r_{i+1,c}-r_{i,c}),\qquad
-D_{i,g}=\frac{c}{3\max(\sigma_{R,i,g},10^{-30})},
-\]
-\[
-D_{f,g}=\frac{2D_{i,g}D_{i+1,g}}{D_{i,g}+D_{i+1,g}}
-\]
-である。source は step 開始時の \(T^n_{e,i}\) と opacity を固定して
-\[
-\alpha_{i,g}=c\sigma_{P,i,g}\Delta t,\qquad
-B^n_{i,g}=a_{\mathrm{eV}}(T^n_{e,i})^4b_g(T^n_{e,i})
-\]
-と置く。cell \(i\)、群 \(g\) の線形系は
-\[
-\begin{aligned}
-&\left[\frac{V_i}{\Delta t}(1+\alpha_{i,g})
- + C_{i-1/2,g}+C_{i+1/2,g}+S^{sink}_{i,g}\right]E^{n+1,LO}_{i,g}\\
-&\quad -C_{i-1/2,g}E^{n+1,LO}_{i-1,g}
- -C_{i+1/2,g}E^{n+1,LO}_{i+1,g}
-=\frac{V_i}{\Delta t}\left(E^{n,LO}_{i,g}+\alpha_{i,g}B^n_{i,g}\right)
- +\alpha_C R^{cons}_{i,g}+Q^{bc}_{i,g}.
-\end{aligned}
-\]
-ここで \(R^{cons}_{i,g}\) は same-step predictor-corrector で作る
-HOLO consistency source [erg/s]、\(\alpha_C=\)
-`Radiation.holo.consistency_alpha` は \([0,1]\) の緩和係数である。
-互換用 namelist key `gamma_alpha` は同じ値へ map されるが、前 step defect は
-使用しない。
-patch 内部 face は通常の diffusion coupling を持つ。patch 境界が内部 HO/LO 境界の場合、
-face \(f\) の high-order step-integrated signed current \(J^{HO}_{f,g}\) [erg] を explicit
-source として RHS に加える。face index は \(f=i\) が cell \(i\) の左面で、右向き crossing
-を正とする。patch \([a,b]\) では左境界の流入は \(+J^{HO}_{a,g}\)、右境界の流入は
-\(-J^{HO}_{b+1,g}\) であり、負の流入は positivity limiter により outgoing current として
-制限し `boundary_limited_E` に記録する。DF 有効時は residual face-current と reference
-face-current の cancellation および thick/thin 遷移の patch 境界 closure が不安定に
-なり得るため、LO solve domain を全 mesh に戻し、内部 patch 境界 BC を使わない。
-`cell_active != nullptr` かつ face-current BC が無い patch solve fallback では、patch 外側
-隣接 cell の step 開始 radiation energy density \(E^{n}_{nb,g}\) を固定 Dirichlet 値として、
-通常の Rosseland face coupling \(C_{f,g}\) を境界 face に適用する:
-\[
-C_{f,g}(E^{n+1,LO}_{bdry,g}-E^{n}_{nb,g}).
-\]
-すなわち patch 境界 cell の diagonal に \(C_{f,g}\) を加え、RHS に
-\(C_{f,g}E^{n}_{nb,g}\) を加える。これは implicit face coupling なので
-\(c\Delta t A_f/(4V)\) の制限を持たず、opacity と距離に応じた \(D_fA_f/\Delta r\)
-で境界交換を制御する。patch が cell 0 に達する
-左物理境界は reflecting として source/sink を加えない。
-
-inner physical boundary は reflecting であり sink/source を加えない。outer physical boundary は
-vacuum であり、patch が最外 cell に達する場合だけ
-\[
-S^{vac}_{N-1,g}=A_N c/4
-\]
-を diagonal sink として加え、`holo/E_LO_boundary_out` に
-\(S^{vac}_{N-1,g}E^{n+1,LO}_{N-1,g}\Delta t\) を記録する。
-`holo/E_LO_boundary_in` は face-current または Dirichlet face coupling の incoming term を
-step 積算 energy として記録する。
-
-LO gross 診断の基準値は solve 後に
-\[
-\mathrm{rad\_dep}^{LO}_{i,g}=V_i\alpha_{i,g}E^{n+1,LO}_{i,g},\qquad
-\mathrm{rad\_emit}^{LO}_{i,g}=V_i\alpha_{i,g}B^n_{i,g},
-\]
-である。ただし \(\alpha\gg1\) では
-\(\alpha V(E^{n+1,LO}-B^n)\) が桁落ちし、LO material source と保存性判定を
-破壊するため、実際に適用する net source は同じ離散式から
-\[
-\Delta E^{mat,LO}_{i,g}
-= -V_i(E^{n+1,LO}_{i,g}-E^{n,LO}_{i,g})
-  -\Delta t\,{\cal D}_{i,g}^{n+1}
-\]
-として評価する。ここで
-\[
-{\cal D}_{i,g}^{n+1}
-= C_{i-1/2,g}(E^{n+1,LO}_{i,g}-E^{n+1,LO}_{i-1,g})
- +C_{i+1/2,g}(E^{n+1,LO}_{i,g}-E^{n+1,LO}_{i+1,g})
- +S^{vac}_{i,g}E^{n+1,LO}_{i,g}
-\]
-であり、存在しない face の項は 0、\(S^{vac}_{i,g}\) は最外 cell のみ非ゼロである。
-この式は \(R^{cons}=0\) の線形系を満たす解に対して
-\(V_i\alpha_{i,g}(E^{n+1,LO}_{i,g}-B^n_{i,g})\) と代数的に同値であり、
-\(R^{cons}\neq0\) では同じ離散 balance に入れた補正 source を含む
-（すなわち material 側には \(-\Delta t\,R^{cons}_{i,g}\) が反映される）。
-`holo_rad_dep-holo_rad_emit` はこの安定評価した net source と一致するように、
-非負の gross 診断に roundoff correction を入れて保存する。gross 値自体が大きく
-補正が double 精度で表現できない場合は、net source を正負に分けた非負 split として
-保存し、material source history の net 値を優先する。
-\[
-\Delta E^{mat,LO}_i=
-\sum_g\Delta E^{mat,LO}_{i,g}
-\]
-で定義する。`LO_coupled` cell では \(\Delta E^{mat,LO}_i/m_i\) を `ee` に加え、
-ideal-gas closure では \(T_e=e_e/c_{v,e}\)、表 EOS closure では
-`temperature_from_energy(rho,e_e)` と `pressure(rho,T_e)` で `Te` と `Pe` を閉じ直す。
-非 coupled cell では LO radiation/source solve は実行するが `ee/Te/Pe` は変更せず、
-material update は従来の particle source injection が所有する。source injection kernel は
-LO-coupled cell の `holo_rad_dep-holo_rad_emit` を `delta_E_rad_prev` に記録するが、
-`ee` には再適用しない。
-The 1D `holo.sn_material_coupling=True` + `holo.solver="quasidiffusion_1d"`
-path follows the same direct-update rule because the GPU \(S_N\) sweep supplies
-only the HO \(\chi=P_{rr}/E\) closure and the QD LO solve owns the material
-update.  The 2D \(S_N\) material-coupling path still publishes a deterministic
-source and remains source-injection owned.
-
-solver 全体の LO balance check は material に実際適用した mask 内 source ではなく、
-全 cell の LO source term を用いて
-\[
-\sum_i\Delta E^{mat,LO,global}_i+\Delta E^{rad,LO}
--(E^{LO}_{boundary,in}-E^{LO}_{boundary,out})=0
-\]
-である。ここで \(\Delta E^{rad,LO}=\sum_{i,g}V_i(E^{n+1,LO}_{i,g}-E^{n,LO}_{i,g})\)
-であり、boundary term は physical outer boundary のみを含む。
-
-radiation transport 後、tally finalize 前に step 開始時の `radiation/energy_density`
-\(E^n_{i,g}\) を device buffer に保存し、LO predictor を実行する。predictor は
-`lo_coupled=nullptr`、`consistency_source=nullptr` であり、`State.holo_E_LO` に
-\(E^{LO,p}_{i,g}\) を保存するが、`ee`、`Te`、`Pe` と
-`State.holo_rad_dep` / `State.holo_rad_emit` は commit しない。
-
-tally finalize 後の physical HO moment を \(E^{HO}_{i,g}\) とする。同じ step で
-以下の consistency source を作る:
-\[
-R^t_{i,g} =
-\frac{V_i}{\Delta t}
-\left[(E^{HO}_{i,g}-E^n_{i,g})-(E^{LO,p}_{i,g}-E^n_{i,g})\right]
-=\frac{V_i}{\Delta t}(E^{HO}_{i,g}-E^{LO,p}_{i,g}),
-\]
-\[
-J^{diff}_{f,g}=C_{f,g}\left(E^{HO}_{R(f),g}-E^{HO}_{L(f),g}\right),
-\qquad
-J^{HO}_{f,g}=\frac{J^{MC,step}_{f,g}+J^{ref,step}_{f,g}}{\Delta t},
-\]
-\[
-\gamma^{HO}_{f,g}=J^{HO}_{f,g}-J^{diff}_{f,g},\qquad
-R^{flux}_{i,g}=\gamma^{HO}_{i+1/2,g}-\gamma^{HO}_{i-1/2,g},
-\qquad
-R^{cons}_{i,g}=R^t_{i,g}+R^{flux}_{i,g}.
-\]
-face current は右向きを正とする。DF 無効時は \(J^{ref,step}=0\)、DF 有効時は
-deterministic reference face transport の current を加える。face defect は両隣 cell の
-`holo_lo_weight>0` の内部 face だけで評価し、patch 境界 face では既存の physical
-face-current / Dirichlet boundary closure と二重計上しない。
-
-LO corrector は predictor と同じ \(E^n_{i,g}\) を time term の初期値として再び解き、
-RHS に \(R^{cons}_{i,g}\) [erg/s] を直接加える。corrector だけが
-`holo_core_mask` cell の `ee`、`Te`、`Pe` と LO gross 診断
-`State.holo_rad_dep` / `State.holo_rad_emit` を commit し、
-`State.holo_E_LO` は \(E^{LO,c}_{i,g}\) に更新される。
-`radiation/rad_dep` と `radiation/rad_emit` は particle tallies のまま保持し、
-LO-coupled cell では material coupling に使わない。predictor または corrector が
-失敗した transport step では `State.holo_lo_source_valid=False` とし、LO の部分更新は
-commit しない。この場合、その step の LO-coupled material coupling は通常の particle
-tally (`radiation/rad_dep - radiation/rad_emit`) に fallback する。
-
-HOLO radiation acceptance は binary ownership であり、blend weight は使わない:
-\[
-E^{acc}_{i,g}=
-\begin{cases}
-E^{LO,c}_{i,g}, & \mathrm{holo\_core\_mask}_i=1,\\
-E^{HO}_{i,g}, & \mathrm{holo\_core\_mask}_i=0.
-\end{cases}
-\]
-material source injection では従来通り `holo_lo_weight` による blend を使う。
-DF 併用時は hard DF re-centering として、acceptance 後の \(E^{acc}_{i,g}\) から
-`holo_core_mask[i] != 0` の bin で
-\[
-U^{ref,carried}_{i,g}=E^{acc}_{i,g}V_i
-\]
-を `previous_reference_U_` の device reservoir に直接設定する。加算型 retarget
-\(U^{ref}\mathrel{+}=(E^{acc}-E^{HO})V_i\) は使わない。さらに
-`holo_core_mask[i] != 0` の live census residual 粒子を kill し、次 step 冒頭の
-census residualization が LO core で
-\[
-U^{phys,old}_{i,g}=U^{ref,carried}_{i,g}
-\]
-から始まるようにする。`difference_residual_E` は `holo_core_mask[i] != 0` の bin だけ
-accepted physical field と time-average reference の差
-\(E^{acc}_{i,g}-\bar{E}^{ref}_{i,g}\) に再投影し、non-core bin は tally finalize が作った
-residual density を保持する。
-
-`Radiation.holo.p_rr_tally=True` のとき、通常 IMC path segment の
-track-length tally と同じ場所で passive radial pressure moment を蓄積する。
-\[
-P^{raw}_{rr,i,g}\leftarrow P^{raw}_{rr,i,g}
- + s_p\,\mu_r^2\,\Delta s_E,\qquad
-C^{raw}_{rr,i,g}\leftarrow C^{raw}_{rr,i,g}+\Delta s_E,
-\]
-ここで \(s_p\) は difference particle sign（通常粒子では \(+1\)）、
-\(\Delta s_E\) は `rad_E_tally` に加える energy-weighted path length
-[erg cm]、\(\mu_r\) は segment 開始時の radial direction cosine である。
-PGRW、DDMC、RW residence segments は v1 では信頼できる angular moment を持たないため
-`Prr` から除外し、coverage 診断だけを下げる。finalize は LO-coupled cell×group に対して
-\[
-P^{HO}_{rr,i,g}=\frac{P^{raw}_{rr,i,g}}{V_i c\Delta t},\qquad
-\chi^{HO}_{i,g}=\frac{P^{HO}_{rr,i,g}}{\max(E^{HO}_{i,g},E_{floor})},
-\]
-\[
-\mathrm{coverage}_{i,g}=
-\mathrm{clip}_{[0,1]}\!\left(\frac{C^{raw}_{rr,i,g}}
-{\max(|E^{raw}_{HO,i,g}|,10^{-300})}\right)
-\]
-を出力する。ここで \(E^{raw}_{HO,i,g}\) は同じ step の `rad_E_tally`
-raw 値である。`Prr`、\(\chi^{HO}\)、coverage は diagnostic として保存する。
-さらに `Radiation.holo.solver="quasidiffusion_1d"` では、raw \(\chi^{HO}\) を
-そのまま LO solver に渡さず、`solve_holo_lo_source_ownership` の host handoff で
-filtered closure \(\chi^F\) を作ってから QD face coefficient に渡す。
-`Radiation.holo.sn_closure=True`（既定）の場合は、この MC tally 由来 closure の代わりに
-1D spherical \(S_N\) solver が作る deterministic closure \(\chi^{SN}\) を QD solver に渡す。
-この経路は `Radiation.holo.solver="quasidiffusion_1d"` のときだけ有効であり、
-`implicit_1d` では参照しない。
-
-S_N closure は各 radiation step の LO solve 直前に host で実行する。角度は
-Gauss-Legendre \(S_N\) quadrature（既定 \(N=8\)、偶数のみ）を
-\(\mu_1<\cdots<\mu_N\) の negative-first 順に並べ、
-\(\sum_n w_n=2\)、\(\sum_n w_n\mu_n=0\)、\(\sum_n w_n\mu_n^2=2/3\) を満たす。
-negative-first 順で Lewis-Miller の spherical angular redistribution を非負係数として
-\[
-\alpha_{1/2}=0,\qquad
-\alpha_{n+1/2}=\alpha_{n-1/2}-\mu_n w_n,\qquad
-\alpha_{N+1/2}=0
-\]
-で評価する。cell \(i\) の内外 face 面積を
-\(A_i=4\pi r_i^2\)、\(A_{i+1}=4\pi r_{i+1}^2\)、体積を \(V_i\) とする。
-方向 \(n\) と群 \(g\) の source iteration では前反復 scalar flux
-\(\phi^{old}_{i,g}=\sum_m w_m\bar\psi_{i,m,g}\) を使い、
-\[
-\sigma^{eff}_{a,i,g}=f_i\sigma^P_{a,i,g},\qquad
-\sigma^{eff}_{s,i,g}=(1-f_i)\sigma^P_{a,i,g},\qquad
-\sigma_{t,i,g}=\sigma^P_{a,i,g}
-\]
-を用い、
-\[
-Q_{i,g}=\frac12 c\,\sigma^{eff}_{a,i,g}\,a_{eV}T_{e,i}^4 b_g(T_{e,i})
-       +\frac12\sigma^{eff}_{s,i,g}\phi^{old}_{i,g}
-\]
-を isotropic angular source とする。ここで \(f_i\) は Fleck factor、
-\(\sigma^P_{a,i,g}\) は Planck absorption opacity である。
-空間と角度はいずれも diamond difference を使う。outward sweep
-（\(\mu_n>0\)、内側から外側）では incoming spatial face flux \(\psi_{in}\) と
-angular edge flux \(\tilde\psi_{n-1/2}\) から
-\[
-\bar\psi =
-\frac{VQ + \mu_n(A_i+A_{i+1})\psi_{in}
-      +(\alpha_{n-1/2}+\alpha_{n+1/2})\tilde\psi_{n-1/2}}
-     {2\mu_nA_{i+1}+2\alpha_{n+1/2}+\sigma_t V},
-\]
-\[
-\psi_{out}=2\bar\psi-\psi_{in},\qquad
-\tilde\psi_{n+1/2}=2\bar\psi-\tilde\psi_{n-1/2}.
-\]
-inward sweep（\(\mu_n<0\)、外側から内側）は \(|\mu_n|\) を使い、
-分母の spatial 面積を \(A_i\)、incoming face を外側 face として同じ式を適用する。
-外側境界の inward incoming flux は vacuum で 0、内側境界の outward incoming flux は
-反射方向 \(-\mu_n\) の inner-face outgoing flux とする。diamond difference が負の
-spatial outgoing flux または angular outgoing edge flux を作る場合は、その outgoing
-量を 0 に fixup する。
-
-At \(r=0\), this is the parity boundary condition
-\(\psi(0,+|\mu|)=\psi(0,-|\mu|)\).  The inward sweep through cell 0 stores the
-inner-face outgoing flux for the reflected positive ordinate; the following
-outward sweep through cell 0 is the physical second half of the central
-spherical cell and contributes the positive-angle ordinate to
-\(\sum_n w_n\bar\psi_n\).  It is therefore not a duplicate deposition of the
-negative-angle ordinate.  `Radiation.origin_parity_only` is retained as a
-compatibility flag for the preheat investigation, but the current CPU and GPU
-\(S_N\) sweeps already use this parity form and no alternate transport equation
-is selected by the flag.
-
-source iteration は
-\[
-\epsilon=\max_{i,g}
-\frac{|\phi^{new}_{i,g}-\phi^{old}_{i,g}|}
-     {\max(|\phi^{new}_{i,g}|,10^{-300})}
-\]
-を `1e-6` 以下にするか、200反復で打ち切る。closure-only CPU \(S_N\)
-path では DSA は未実装であり、Fleck effective scattering ratio
-\(\sigma^{eff}_{s}/(\sigma^{eff}_{a}+\sigma^{eff}_{s})\simeq 1-f\) が
-1 に近い optically thick cell では source iteration の収束が遅い。収束後、
-\[
-E^{SN}_{i,g}=\frac1c\sum_n w_n\bar\psi_{i,n,g},\qquad
-P^{SN}_{rr,i,g}=\frac1c\sum_n w_n\mu_n^2\bar\psi_{i,n,g},\qquad
-\chi^{SN}_{i,g}=\frac{P^{SN}_{rr,i,g}}{\max(E^{SN}_{i,g},10^{-300})}.
-\]
-QD handoff では \(S_N\) または HO tally 由来の raw closure を共通の
-QD closure regularizer に渡し、\([1/3,1]\) clamp、same-material spatial smoothing、
-temporal relaxation を適用してから `holo_lo_solver.cpp` に渡す。QD solve は
-spherical origin に接する cell 0 のみ \(\chi=1/3\) とし、他の cell では
-regularized \(\chi^F\) を使う。near-center 判定に domain outer radius は使わない。
-The first internal face adjacent to cell 0 uses the ordinary spherical QD
-geometric correction.  No additional origin-face limiter is applied; reducing
-this term under-drives the convergent spherical radiation coupling.
-
-When `Radiation.holo.sn_material_coupling=True`, the GPU \(S_N\) backend runs
-once per radiation step.  In 1D_SPH with
-`Radiation.holo.solver="quasidiffusion_1d"`, the GPU \(S_N\) solve is used as a
-chi-only high-order closure: it computes \(E^{SN}_{i,g}\), \(P^{SN}_{rr,i,g}\),
-and \(\chi^{SN}_{i,g}\), but does not update `State.Te` or `State.ee`.
-The \(\chi^{SN}\) host handoff uses the same QD closure regularizer as the CPU
-closure path before invoking the existing QD LO solver, which owns the radiation
-energy, face flux, and material-energy update.  In 2D_RZ the QD LO solver is
-still unavailable, so the path remains the direct GPU \(S_N\) deterministic
-source path described below.
-
-The 1D_SPH GPU \(S_N\) closure uses the same spherical diamond-difference sweep
-as the CPU closure, with one CUDA block per energy group and cell-ordered
-sweeps.  Absorption re-emission is fixed explicitly at the step-start
-temperature \(T^n_i\); the transport sweep does not update `State.Te`:
-\[
-Q^{emit,n}_{i,g}=c\,\sigma^{eff}_{a,i,g}a_{eV}(T^n_i)^4 b_g(T^n_i).
-\]
-With this fixed source, streaming and Fleck effective scattering form the
-linear fixed-source transport problem
-\[
-\mu\partial_r\psi_{i,n,g}+\sigma_{t,i,g}\psi_{i,n,g}
-=\frac12 Q^{emit,n}_{i,g}
- +\frac12\sigma^{eff}_{s,i,g}\phi_{i,g},
-\qquad
-\sigma_{t,i,g}=\sigma^{eff}_{a,i,g}+\sigma^{eff}_{s,i,g}
-\]
-and is discretized with the same spherical diamond-difference sweep.  Starting
-from \(\phi^0_{i,g}=0\), the runtime iterates up to 500 source iterations and
-checks
-\[
-\max_{i,g}
-\frac{|\phi^{k+1}_{i,g}-\phi^{k}_{i,g}|}
-     {\max(|\phi^{k+1}_{i,g}|,10^{-300})}.
-\]
-After convergence or the iteration cap,
-\[
-E^{SN}_{i,g}=\phi_{i,g}/c,\qquad
-\chi^{SN}_{i,g}
-  =\frac{P^{SN}_{rr,i,g}}{\max(E^{SN}_{i,g},10^{-300})}
-\]
-defines the QD closure.  The LO solve uses the raw Planck and Rosseland
-opacities, not the Fleck-effective absorption/scattering used by the HO
-closure sweep.  For each group, the QD moment system advances
-\[
-\frac{V_i}{\Delta t}(E^{n+1}_{i,g}-E^n_{i,g})
- + A_{i+1/2}F^{n+1}_{i+1/2,g}
- - A_{i-1/2}F^{n+1}_{i-1/2,g}
- =
-c\,\sigma_{P,i,g}V_i
-\left(B_{i,g}(T^n_i)-E^{n+1}_{i,g}\right),
-\]
-with the QD face relation
-\[
-\left(\frac{1}{c\Delta t}+\sigma_{R,i+1/2,g}\right)F^{n+1}_{i+1/2,g}
-+ c\,\frac{\chi^{SN}_{i+1,g}E^{n+1}_{i+1,g}
-          -\chi^{SN}_{i,g}E^{n+1}_{i,g}}{\Delta r_{i+1/2}}
-=\frac{F^n_{i+1/2,g}}{c\Delta t}+G^{SN}_{i+1/2,g},
-\]
-where \(G^{SN}\) is the existing spherical QD geometric correction.  The LO
-source solve then applies the accumulated matter-energy change to `State.ee`,
-`State.Te`, and `State.Pe`.
-
-2D_RZ GPU \(S_N\) material coupling は収束後の deterministic radiation energy density
-\(E^{SN}_{i,g}\) から
-\[
-\mathrm{rad\_dep}^{SN}_{i,g}
-  = c\,\sigma^{eff}_{a,i,g}E^{SN}_{i,g}V_i\Delta t,\qquad
-\mathrm{rad\_emit}^{SN}_{i,g}
-  = c\,\sigma^{eff}_{a,i,g}a_{eV}(T^n_i)^4b_g(T^n_i)V_i\Delta t
-\]
-を `State.holo_rad_dep` と `State.holo_rad_emit` に publish する。source injection
-は全 cell を HOLO-owned として扱い、particle `rad_dep/rad_emit` ではなく
-\(\sum_g(\mathrm{rad\_dep}^{SN}_{i,g}-\mathrm{rad\_emit}^{SN}_{i,g})\) を electron
-energy update に適用する。MC transport は同じ step で継続し、particle tallies は
-diagnostics/validation 用に保持する。
-
-`Radiation.holo.solver="quasidiffusion_1d"` の LO solve は、各 active contiguous patch
-\([i_0,i_1]\) ごとに cell-center \(E_{i,g}\) と internal face flux
-\(F_{i+1/2,g}\) を同時に解く。未知ベクトルは
-\[
-x_{2m}=E_{i_0+m,g},\qquad
-x_{2m+1}=F_{i_0+m+1/2,g}
-\]
-であり、前者は \(m=0,\ldots,N_{patch}-1\)、後者は
-\(m=0,\ldots,N_{patch}-2\) にだけ存在する。サイズは \(2N_{patch}-1\) である。
-even row は
-\[
-\left(\frac{V_i}{\Delta t}+c\sigma_{P,i,g}V_i\right)E_{i,g}
- + A_{i+1/2}F_{i+1/2,g}-A_{i-1/2}F_{i-1/2,g}
-=\frac{V_i}{\Delta t}E^n_{i,g}+c\sigma_{P,i,g}V_i B_g(T_{e,i})
-\]
-を離散化し、consistency source、face-current 境界、outer vacuum loss
-\(A_{N}cE_{N-1,g}/4\) は従来通りこの row に加える。odd row は physical flux
-\(F\) を未知量にして
-\[
-\left(\frac{1}{c\Delta t}+\sigma_{R,i+1/2,g}\right)F_{i+1/2,g}
- +c\left[
- \frac{\chi_{i+1,g}E_{i+1,g}-\chi_{i,g}E_{i,g}}{\Delta r_{i+1/2}}
- +\frac{3\bar\chi_{i+1/2,g}-1}{2r_{reg,i+1/2}}
-  (E_{i,g}+E_{i+1,g})\right]
-=\frac{F^n_{i+1/2,g}}{c\Delta t}
-\]
-を使う。したがって QD internal face では \(F\) を消去せず、幾何項
-\((3\chi-1)/r\) は odd row の \(E\) off-diagonal だけに現れる。
-The geometric denominator is regularized locally as
-\[
-r_{reg,i+1/2}=\max(r_{i+1/2},\Delta r_{i+1/2}),
-\]
-where \(\Delta r_{i+1/2}\) is the neighboring cell-center spacing.  No
-domain-outer-radius floor is used, so extended laser-corona mesh extent does
-not enlarge the isotropic QD closure region.
-The first internal face adjacent to the origin cell also uses this same
-regularized spherical geometry.  The origin regularization is limited to
-\(\chi_0=1/3\); the face geometric correction is retained because it carries
-the convergent spherical radiation coupling needed for shell compression.
-この interleaved system は通常の tridiagonal として、符号付き pivot を許す
-Thomas elimination で解く。patch 境界が inactive neighbor と接する場合の
-Dirichlet coupling と physical boundary treatment は boundary condition として扱い、
-解後の energy/source accounting は solved \(E,F\) を用いる。
-
-QD spatial solve の線形系は positivity constraint を未知量に含めないため、
-multigroup の高周波 tail で cell-total に対して小さい負の group energy
-undershoot が出ることがある。この場合は
-\[
-\epsilon^-_{i,g} =
-\max\left[
-10^{-2}\max(E^n_{i,g},B_{i,g}),
-5\times10^{-3}\sum_{g'} E^n_{i,g'}
-\right]
-\]
-を許容幅とし、\(-\epsilon^-_{i,g}\le E^{n+1}_{i,g}<0\) なら
-\(E^{n+1}_{i,g}=0\) に clamp する。これより大きい負値、または NaN/Inf は
-spatial solve failure として扱う。clamp 後の \(E^{n+1}\) を用いて
-source accounting と conservation check を行うため、fixup で生じた差分は
-LO material/radiation exchange に含める。
-
-#### 7.1.2g.1 QD closure regularization
-
-`Radiation.holo.solver="quasidiffusion_1d"` の closure input は、MC tally
-由来 \(\chi^{HO}\)、closure-only CPU \(S_N\) 由来 \(\chi^{SN}\)、または
-1D_SPH GPU \(S_N\) material-coupling 経路から host へ渡された
-\(\chi^{SN}\) のいずれであっても同じ regularization を受ける。まず raw
-\(\chi^S\) を \([1/3,1]\) に clamp する。次に
-`Radiation.holo.closure_smooth_passes = N_s` 回、同一 dominant material の連続
-cell run 内で
-\[
-\chi^{(p+1)}_{i,g}
-=(1-\alpha)\chi^{(p)}_{i,g}
- +\frac{\alpha}{2}\left(\chi^{(p)}_{L(i),g}
- +\chi^{(p)}_{R(i),g}\right),
-\]
-を適用する。ここで \(\alpha=\) `Radiation.holo.closure_smooth_alpha`、
-\(L(i)\)、\(R(i)\) は左右隣接 cell であり、void cell、material 境界、domain 境界では
-該当側を \(i\) 自身に反射する。この reflected-boundary stencil は各 contiguous
-same-material run の cell 平均を保存し、入力が \([1/3,1]\) 内なら smoothing 後も
-\([1/3,1]\) 内に残る。
-
-spatial smoothing 後、temporal relaxation を
-\[
-\chi^{F,n}_{i,g}=(1-w)\chi^{F,n-1}_{i,g}+w\chi^{S,n}_{i,g},
-\qquad
-w=\texttt{Radiation.holo.closure\_relax}
-\]
-で行う。履歴が未初期化の cell×group では \(\chi^{F,n}=\chi^{S,n}\) とする。
-predictor solve は保存済みの \(\chi^F\) があればそれを使い、corrector solve は
-新しい MC tally または \(S_N\) closure から \(\chi^F\) を更新する。1D_SPH
-GPU \(S_N\) material-coupling 経路では、GPU sweep 直後の precomputed
-\(\chi^{SN}\) override がこの regularizer を一度だけ通るため、呼び出し元では
-別途 smoothing/relaxation を行わない。`implicit_1d` はこの filtered closure を
-参照せず、従来通り diffusion coefficient \(c/(3\sigma_R)\) を使う。
-`p_rr_tally=False` は MC tally closure 診断を無効化する。`sn_closure=False` かつ
-MC tally closure が利用できない場合、QD closure 入力は diffusion limit
-\(\chi=1/3\) に戻る。
-
-履歴診断 `holo/E_LO_total` は全 LO domain に対する
-\(\sum_i V_i\sum_g E^{LO}_{i,g}\) [erg] である。
-`holo/E_LO_boundary_in`、`holo/E_LO_boundary_out`、`holo/matter_delta`、
-`holo/source_balance_error` は runtime LO solve result から記録する。
-`holo/particle_net_source_core` は LO-coupled cell 内の particle diagnostic
-\(\sum_g(\mathrm{rad\_dep}_{i,g}-\mathrm{rad\_emit}_{i,g})\) [erg] であり、
-material source には使わない。`holo/lo_particle_source_mismatch` は
-`holo/matter_delta - holo/particle_net_source_core` [erg] として、LO-owned material
-source と particle diagnostic source の差だけを記録する。
-`holo/Prr_coverage`、`holo/chi_min`、`holo/chi_mean`、`holo/chi_max` は
-LO-coupled cell×group の passive closure diagnostics から記録する。
-`holo/E_LO_boundary_in` は internal HO/LO patch 境界からの face-current または Dirichlet
-coupling 入射、`holo/E_LO_boundary_out` は同境界への outgoing 成分と outer vacuum
-leakage である。`holo.enabled=False` では mask、global LO solve、source ownership、
-追加 tally は構築しない。
-
-#### 7.1.3 ヒステリシスモード選択器（Hysteresis Mode Selector）
-
-§7.1.2の単一閾値判定では、衝撃波前面や不透明度の急変領域で光学厚 \(\tau\) が
-閾値 \(\tau_{DDMC}\) の近傍を振動し、IMC⇄DDMCモードが毎ステップ切り替わる
-**チャタリング**が生じうる。モード切替は IMC→DDMC で位置・方向の破棄を伴い、
-DDMC→IMC では再サンプル、DDMC→RW では mode handoff を伴うため、
-チャタリングは統計ノイズを増大させる。
-
-ヒステリシスモード選択器はセル×群ごとの**状態機械**として、モード遷移に
-入口条件（entry）と出口条件（exit）を非対称に設定することでチャタリングを抑制する。
-
-**状態遷移ロジック**：
-
-**(a) IMC → DDMC 遷移（entry）**：以下の**全て**を満たす場合のみ遷移：
-1. **ベースライン判定**：§7.1.2の判定（条件1〜4）で DDMC が選択されている
-2. **光学厚閾値**：\(\tau_{i,g} \ge \tau_{on}\)（\(\tau_{on} = \tau_{DDMC}\)）
-3. **散乱比閾値**：\(\omega_{i,g} \ge \omega_{on}\)（\(\omega_{on} = \omega_{DDMC}\)）
-4. **滞留条件**：\(\text{hold\_count}_{i,g} \ge \text{mode\_hold}\)
-5. **変化率制限**：\(|\Delta\tau/\tau| = |\tau^n - \tau^{n-1}|/\tau^{n-1} \le \text{rate\_max}\)
-
-**(b) DDMC → non-DDMC 遷移（exit）**：以下の**いずれか**を満たす場合に遷移：
-1. \(\tau_{i,g} < \tau_{off}\)（\(\tau_{off}\)：DDMC脱出τ閾値）
-2. \(\omega_{i,g} < \omega_{off}\)（\(\omega_{off}\)：DDMC脱出ω閾値）
-3. \(\hat{P}(1) > 1\)（変換確率制約違反、§7.7.3）
-
-exit したセル×群はそのステップの baseline 判定へ戻る。したがって
-\(\tau_{RW} \le \tau < \tau_{DDMC}\) の 1D_SPH セルは DDMC から RW へ降格しうる。
-
-**(c) 安全オーバーライド**：\(\sigma_R < \sigma_{floor}\)（既定 \(10^{-20}\) cm\(^{-1}\)）の場合は
-条件に関わらず強制的にIMCモードとする（真空近似セル）。
-
-**hold\_count 管理**：
-- セル×群ごとに `uint8` カウンタ（最大 255）
-- IMC 状態で毎ステップインクリメント（飽和あり）
-- IMC → DDMC 遷移時：0 にリセット
-- DDMC → non-DDMC 遷移時：0 にリセット
-
-**パラメータ**（SPECIFICATION §6.4.5 `ddmc` ブロック）：
-
-| パラメータ | 既定値 | 説明 |
-|-----------|--------|------|
-| `tau_ddmc_off` | -1.0（\(=\tau_{DDMC}\)と同値） | DDMC脱出τ閾値。\(<0\)で非アクティブ（\(\tau_{off}=\tau_{DDMC}\)）、有効時 \(0.5 \le \tau_{off} \le \tau_{DDMC}\) |
-| `omega_ddmc_off` | -1.0（\(=\omega_{DDMC}\)と同値） | DDMC脱出ω閾値。\(<0\)で非アクティブ（\(\omega_{off}=\omega_{DDMC}\)）、有効時 \(0 \le \omega_{off} \le \omega_{DDMC}\) |
-| `mode_hold` | 0 | IMC→DDMC遷移前の最小滞留ステップ数。0でヒステリシスなし |
-| `rate_max` | \(10^{30}\) | \(|\Delta\tau/\tau|\) の最大許容変化率。\(10^{30}\)で事実上無制限 |
-
-**後方互換性**：全パラメータが既定値の場合、ヒステリシス条件は自明に成立する
-（\(\tau_{off}=\tau_{on}\)、\(\omega_{off}=\omega_{on}\)、\(\text{mode\_hold}=0\)、\(\text{rate\_max}=\infty\)）。
-したがって従来の§7.1.2判定と完全に同一の動作となる。
-
-> **チャタリング検出**：ヒステリシス結果として IMC→DDMC / DDMC→IMC の各遷移回数を
-> ステップごとに集計する。遷移回数が前ステップ比で急増している場合は
-> WARNING を出力し、`tau_ddmc_off` の引き下げまたは `mode_hold` の増大を推奨する。
-
-### 7.2 DDMCの拡散係数
-拡散方程式（群g）：
-\[
-\frac{1}{c}\frac{\partial E_g}{\partial t} - \nabla\cdot(D_g\nabla E_g) + \sigma_{a,eff,g} E_g = S_g
-\]
-拡散係数：
-\[
-D_g = \frac{1}{3\sigma_{tr,g}} = \frac{1}{3\sigma_{R,g}} \quad [\text{cm}]
-\]
-ここで \(\sigma_{R,g}=\rho\kappa_{R,g}\) [1/cm]。注：\(D_g\) は \(c\) を含まない形式（拡散方程式で \(c D_g\) が拡散速度の次元 [cm²/s] を持つ）。
-
-### 7.3 離散化とリーク係数：**符号規約を固定（要修正点）**
-DDMCは離散拡散の結合係数を“リーク率”に変換する。  
-TENRYUでは、拡散離散化が構成する行列を **M‑matrix形式**で扱う規約を固定する。
-
-#### 7.3.1 行列形式（規約）
-セル中心未知量 \(E_{i,g}\) に対して、離散化により
-\[
-\sum_{j\in\mathcal{N}(i)\cup\{i\}} A_{ij,g} E_{j,g} = b_{i,g}
-\]
-を得るとき、TENRYUは以下を満たす実装を **必須**とする：
-
-- オフ対角：\(A_{ij,g}\le 0\)（\(j\ne i\)）
-- 対角：\(A_{ii,g} > 0\)
-- 対角優位：\(A_{ii,g} \ge \sum_{j\ne i} |A_{ij,g}|\)
-
-（この形式は確率化に必要：リーク率が非負になり、確率が正規化できる。）
-
-#### 7.3.2 リーク係数（Leakage opacity）
-上記規約のもと、セル i から近傍 j へのリーク率（単位 1/cm）を
-\[
-\Sigma^{leak}_{i\to j,g} = \frac{-A_{ij,g}}{V_i}
-\]
-と定義する。  
-（オフ対角が負なので \(-A_{ij}\ge 0\) が保証される。）
-
-総リーク率：
-\[
-\Sigma^{out}_{i,g} = \sum_{j\in\mathcal{N}(i)} \Sigma^{leak}_{i\to j,g}
-\]
-
-> 旧仕様の `max(0,A_ij)` のような"符号依存の曖昧さ"を禁止する。
-> 実装の拡散モジュールが別符号で係数を返す場合は、**Materials/Rad側で符号変換してこの規約へ合わせる**。
-> 既定（`m_matrix_check=True`）では、正のオフ対角が1つでもあれば当該セル×群をDDMC禁止（IMCへ）とし、
-> クランプでDDMCを継続しない。`m_matrix_check=False`（検証用）に限り安全クランプ `max(0,-A_ij)` を許可する。
-
-**2D RZ への拡張**：
-v1.0 既定では **Kershaw 9点ステンシル**（Appendix A.10）から導出したリーク係数を使用する
-（`leak_stencil="9_kershaw"`、SPECIFICATION §6.4 参照）。
-Kershaw行列 \(A_{ij,g}\) を \(D_g = 1/(3\sigma_{R,g})\)（§7.2）で構成し、
-§7.3.2 の一般定義 \(\Sigma^{leak}_{i\to j,g} = -A_{ij,g}/V_i\) を適用する。
-これにより歪格子でも正確なリーク率が得られ、面別近似の厚光学極限バイアス（後述）を回避する。
-R9イベントループはトポロジカル面（1D:2面、2D_RZ:4面）を入力とするため、
-2Dの角近傍リーク（NE/NW/SE/SW）は隣接2面へ射影する。各角の射影先面ペア：
-
-| 角方向 | 射影先面ペア \((f_1, f_2)\) |
-|--------|---------------------------|
-| NE (右上) | R\_right (face 1), Z\_top (face 3) |
-| NW (左上) | R\_left (face 0), Z\_top (face 3) |
-| SE (右下) | R\_right (face 1), Z\_bottom (face 2) |
-| SW (左下) | R\_left (face 0), Z\_bottom (face 2) |
-
-角近傍係数 \(\Sigma_{corner}\) は面積重み \(w_{f_1}=A_{f_1}/(A_{f_1}+A_{f_2})\), \(w_{f_2}=A_{f_2}/(A_{f_1}+A_{f_2})\) で
-\((w_{f_1}\Sigma_{corner},\,w_{f_2}\Sigma_{corner})\) に分配する（総和保存）。
-**退化ガード**：\(A_{f_1}+A_{f_2} < \varepsilon_{area}\)（\(\varepsilon_{area} = 10^{-30}\) cm²）の場合は等分配 \(w_{f_1}=w_{f_2}=0.5\) とする。
-
-> **Kershaw ステンシルの再利用**：伝導ソルバ（§4.2）と DDMCリーク（本節）は
-> 同一の Kershaw ステンシル構築カーネル（CUDA_KERNELS C2）を使用するが、
-> 入力する拡散係数が異なる（伝導: \(D_{eff}\)、DDMC: \(D_g = 1/(3\sigma_{R,g})\)）。
-> 多群の場合、C2 を群ごとに呼び出す（群数 \(G\) 回）。
-
-**代替オプション `leak_stencil="4"`**（面別 Densmore 近似）：
-直交格子や検証用途では、面ごとの1D Densmore 近似（§7.3.4）を各面に独立に適用する簡易式が利用可能。
-セル \(i\) の面 \(m\)（\(m = 0,1,2,3\) : R\_left, R\_right, Z\_bottom, Z\_top — CUDA\_KERNELS §6.4.3 面規約）に対し：
-\[
-\Sigma^{leak}_{i\to j_m, g} = \frac{2\, A_m}{3\, V_i\, \sigma_{R,m}^{face}\, (\Delta x_m + 2\lambda_{mfp})}
-\]
-
-ここで：
-- \(A_m = 2\pi \bar{R}_m L_m\) [cm\(^2\)]（面 \(m\) のRZ面積、\(\bar{R}_m\) は面中点R座標、\(L_m\) は面長さ）
-- \(\Delta x_m = V_i / A_m\) [cm]（面に垂直な有効セル幅）
-- \(\sigma_{R,m}^{face}\) [1/cm]：§7.3.4 の面評価規約で算出した面Rosseland不透明度
-- \(\lambda_{mfp} = 1/\sigma_{R,m}^{face}\) [cm]（平均自由行程）— 境界面では §7.3.5 を使用
-
-> **次元検査**：分母 \(\sigma_{R,m}^{face}\,(\Delta x_m + 2\lambda_{mfp})\) は
-> \([1/\text{cm}] \times [\text{cm}] = \) 無次元。
-> 等価な表現：\(\sigma_{R}\Delta x_m + 2\)（光学厚 \(\tau_m\) + 2 平均自由行程を光学厚単位で表現）。
-
-> **記号の区別**：本節の \(\lambda_{mfp}\) [cm]（平均自由行程）と §7.3.5, §7.7.1 の
-> \(\lambda \approx 0.7104\) [無次元]（Milne外挿距離、平均自由行程単位）は
-> 異なる物理量である。混同を避けるため、平均自由行程には添字 \(_{mfp}\) を付す。
-
-> **1D Densmore 公式との関係**：1D公式（§7.3.4 Eqs.20–21）の分母は
-> \(\sigma^+_{R}\Delta x_j + \sigma^-_{R}\Delta x_{j-1}\)（隣接セル幅を明示使用）であるが、
-> 本面別公式は \(\sigma_{R}(\Delta x_m + 2\lambda_{mfp}) = \sigma_{R}\Delta x_m + 2\)
-> で隣接セルの光学厚を2（2平均自由行程）で近似している。
-> 光学的に厚い一様セルでは1D公式が \(1/(3\sigma_R\Delta x^2)\) を与えるのに対し、
-> 本式は \(2/(3\sigma_R\Delta x^2)\) を与え、約2倍の差異がある。
-> これは面別独立近似の帰結であり、`9_kershaw` を既定とする理由の一つである。
-
-この面別公式は4点（面のみ）近似であり、対角隣接は含めない。
-歪格子では `9_kershaw`（既定）を使用すること。
-
-**注意**：\(r = 0\) 軸上の面では \(A_m \to 0\) となるため、\(\Delta x_m \to \infty\)。
-このような面のリーク係数は \(\Sigma^{leak} = 0\) と設定する（軸方向リークなし）。
-
-**不透明度フロアによるDDMC安全策**：
-\(\sigma_{R,g} < \sigma_{floor}\)（既定 \(10^{-20}\) cm\(^{-1}\)、§11.3 参照）のセルは、
-DDMC 光学的厚さ基準（\(\tau < \tau_{DDMC}\)、§7.1.2）を満たさないため自動的に IMC にフォールバックする。
-したがって \(\sigma_{R} = 0\) が DDMC リーク式に現れることはない。
-追加安全策として、リーク係数計算で面Rosseland不透明度に
-\(\sigma_{R,m}^{face} \ge \sigma_{floor}\) のクランプを適用する。
-
-#### 7.3.3 M‑matrix診断（安全策）
-v1.0既定で、各セル×群について以下を検査する：
-- すべてのオフ対角 \(A_{ij}\le 0\)
-- \(A_{ii} \ge \sum_{j\ne i}|A_{ij}| - \epsilon\)（丸め許容）
-- もし違反があれば：
-  1) そのセル×群を **DDMC禁止**にして IMC へフォールバック
-  2) 違反数と場所をdiagnosticsへ出す（回帰で検知）
-
-#### 7.3.4 面評価の不透明度（face-centered opacity）
-
-DDMCのリーク係数に用いる **面のRosseland不透明度** \(\sigma_{R,j+1/2}\) は、
-温度依存が強い場合に非物理な伝搬停止を起こし得る（Densmore et al. 2007 §3.1, Szilard & Pomraning 1992）。
-
-TENRYUでは **面温度** で不透明度を評価する規約を固定する：
-
-> **多群における不透明度種別の規約（grey文献からの拡張）**：
-> Densmore et al. (2007) はgrey（1群）のため、単一の不透明度σ_nを使用している。
-> 多群TENRYUでは、DDMC方程式内で **2種類の不透明度** が必要：
-> - **リーク係数**（拡散離散化由来）：**Rosseland** \(\sigma_{R,g}=\rho\kappa_{R,g}\)（§7.2のD_gと整合）
-> - **吸収/放射項**（Kirchhoff律）：**Planck** \(\sigma_{a,g}=\rho\kappa_{P,g}\)（§6.1のσ_{a,eff}と整合）
->
-> grey（κ_P=κ_R）では両者が一致するため、Densmore式と自然に整合する。
-> 以下、リーク関連の面不透明度は **Rosseland** を使用する。
-
-面温度（放射温度的平均）：
-\[
-T_{n,j+1/2} = \left(\frac{T_{n,j}^4 + T_{n,j+1}^4}{2}\right)^{1/4}
-\]
-
-面でのRosseland不透明度：
-\[
-\sigma_{R,j+1/2}^{\pm} = \rho_{j \text{ or } j+1}\,\kappa_{R,g}(\rho_{j \text{ or } j+1},\, T_{n,j+1/2})
-\]
-
-- \(\sigma^-_{R,j+1/2}\)：面の左側セル j の密度で評価
-- \(\sigma^+_{R,j+1/2}\)：面の右側セル j+1 の密度で評価
-
-リーク係数（Densmore 2007 Eqs.(20)–(21) 準拠、多群ではRosseland）：
-\[
-\sigma_{L,j} = \frac{2}{3\Delta x_j} \frac{1}{\sigma^+_{R,j-1/2}\Delta x_j + \sigma^-_{R,j-1/2}\Delta x_{j-1}}, \quad
-\sigma_{R,j} = \frac{2}{3\Delta x_j} \frac{1}{\sigma^-_{R,j+1/2}\Delta x_j + \sigma^+_{R,j+1/2}\Delta x_{j+1}}
-\]
-
-> **σ^±とΔxの対応規則**：各 σ^± は **自セルのΔxと対**になる。
-> 面 j-1/2 において σ^+_{j-1/2}（セル j の物性）× Δx_j、σ^-_{j-1/2}（セル j-1 の物性）× Δx_{j-1}。
-> これは Eqs.(15)–(18) の導出（各半セルの光学厚が σ×Δx/2 で近似される）から直接従う。
-
-> **根拠**：セル中心温度でセル単位に不透明度を評価すると、
-> 隣接セルの一方の不透明度が極端に大きいとき（冷たい壁など）リーク率がゼロに近づき、
-> 放射が伝搬停止する非物理挙動を起こす。面温度評価はこれを防ぐ。
->
-> **参考文献**：
-> - Densmore et al., JCP 222 (2007) Eq.(23): 面温度の定義
-> - Szilard & Pomraning, Nucl. Sci. Eng. 112 (1992): 面不透明度の理論的根拠
-
-#### 7.3.5 DDMC境界セル（インターフェースセル）のリーク不透明度
-
-DDMCとIMCの境界に隣接するDDMCセル（境界セル、j=1とする）では、
-**asymptotic diffusion-limit BCから導出される修正リーク不透明度**を用いる。
-
-標準の内部セル用σ_L（§7.3.4 Eqs.(20)–(21)）の代わりに、境界セルのIMC側リーク不透明度は：
-\[
-\sigma_{L,1} = \frac{1}{\Delta x_1} \cdot \frac{2}{3\sigma_{R,1}\Delta x_1 + 6\lambda}
-\]
-ここで：
-- \(\sigma_{R,1}\)：境界セルのRosseland不透明度（7.3.4の面評価規約で算出、拡散と整合）
-- \(\Delta x_1\)：境界セルの代表長
-- \(\lambda \approx 0.7104\)：Milne外挿距離（無次元、平均自由行程単位。物理的長さは \(\lambda / \sigma_{tr}\) [cm]）
-
-この修正は、標準のσ_L（隣接セル幅を含む）において隣接セルが存在しない（IMC側）場合に、
-外挿距離λが隣接セル幅の役割を果たすことに対応する。
-
-境界セルのDDMC方程式（Densmore Eq.32、多群ではRosseland/Planck分離）：
-\[
-\frac{1}{c}\dot\phi_1 + (\sigma_{L,1} + \sigma_{R,1} + f_{n,1}\sigma_{a,1})\phi_1
-= f_{n,1}\sigma_{a,1}\,a_{eV}\,c\,T_{n,1}^4
-+ \frac{1}{\Delta x_1}\left(\sigma_{L,2}\phi_2\Delta x_2 + \int_0^1 P(\mu)\mu I_b(\mu,t)\,d\mu\right)
-\]
-ここで \(\sigma_{L,1}, \sigma_{R,1}\) はRosseland由来のリーク不透明度、
-\(f_{n,1}\sigma_{a,1}\) はPlanck由来の実効吸収（= \(\sigma_{a,eff,1}\)、§6.1参照）。
-greyでは \(\sigma_R=\sigma_a\) となりDensmore原式と一致する。
-
-最終項はIMC側からの入射粒子ソースであり、P(μ)と組み合わせてエネルギー保存を保証する（7.7.1参照）。
-
-反対側（内部側）のσ_{R,1}は標準の7.3.4（Eq.21）をそのまま使う。
-
-**DDMC-IMC 界面での面温度** \(T_{n,face}\)：隣接 IMC セルの \(T_e^n\) を用いて §7.3.4 と同じ \(T^4\) 平均で計算する。\(\sigma_{R,1}\) は DDMC セルの密度 \(\rho_1\) と面温度 \(T_{n,face}\) で評価する（セル中心温度ではなく面温度）。
-
-> **重要**：境界セルで標準のσ_L（Eq.20）を使うと、
-> DDMC方程式の係数とP(μ)の導出が不整合になり、インターフェースでのエネルギー保存が崩れる。
-> 必ず修正版σ_{L,1}を使用すること。
->
-> **参考文献**：Densmore et al., JCP 222 (2007) Eqs.(32)–(33)
-
----
-
-### 7.4 境界リーク（vacuum/reflect/Marshak）
-境界面へのリークを “外部セル” へのリークとして扱う。
-
-- vacuum（escape）：境界リークを持ち、リークした粒子は系外へ消滅し流出エネルギーに計上
-- reflect：\(\Sigma^{leak}_{i\to b,g} = 0\)（境界リークなし、完全反射）。
-  境界面でのフラックス \(F = 0\) となる。
-  reflect 境界で反射した IMC 粒子が DDMC セルに再入する場合は、
-  標準の IMC→DDMC 変換（§7.7.1）が適用される。
-- Marshak：検証用途。境界入射を別途IMC粒子として生成（8章）
-
-vacuum境界の既定（拡散外挿：Milne）：
-- 外挿長 \(d_{ext} = 0.7104/\sigma_{tr}\) [cm]
-- 境界フェイスに対するリーク係数は、1Dなら
-\[
-\Sigma^{leak}_{i\to b,g} \approx \frac{D_g A_f}{V_i (d_{cell}+d_{ext})}
-\]
-ここで \(d_{cell} = V_i/A_f\)（面法線方向の代表セル厚、§7.7.4 と同一定義）である。
-（一般RZ歪格子は拡散離散化が返す境界係数をこの形式へ整合させる。）
-
-#### 7.4.1 DDMCセルの implicit diffusion solve（HIMCD Phase-1, optional）
-`ddmc.implicit_diffusion=True` かつ対応条件（1D, LTE, Marshak境界なし, `volume_source_rate=0`）
-では、DDMC セル×群は §7.5 の particle DDMC イベントループではなく、Radiation step 内で
-backward Euler の implicit diffusion solve により更新する。
-
-群 \(g\) の DDMC セル \(i\) について、
-\[
-\frac{E^{n+1}_{i,g} - E^n_{i,g}}{\Delta t}
-= \frac{1}{V_i}\sum_{f\in\partial i} F_{f,g}(E^{n+1})
-- c\,\sigma_{a,eff,i,g}\,E^{n+1}_{i,g}
-+ c\,\sigma_{a,eff,i,g}\,a_{eV}T_i^4 b_g(T_i)
-\]
-を解く。Phase-1 の implicit DDMC diffusion は 2 段の predictor-corrector
-（Picard 1 回）を用いる。まず radiation step 開始時の \(T_i^n\) で全群を解き、
-\[
-\Delta E^{pred}_{i} = \sum_g \left(
-c\,\sigma_{a,eff,i,g}\,E^{pred}_{i,g}V_i\Delta t
-- c\,\sigma_{a,eff,i,g}\,a_{eV}(T_i^n)^4 b_g(T_i^n)V_i\Delta t
-\right)
-\]
-からセル熱容量 \(C_i = \rho_i c_{v,e,i} V_i\) を用いて
-\[
-T_i^{pred} = T_i^n + \Delta E^{pred}_{i}/C_i
-\]
-を作り、\(T_i^{pred}\) で再度 diffusion solve を行って最終解 \(E^{n+1}_{i,g}\) を得る。
-群間散乱は含めない。
-
-1D 球対称の DDMC-DDMC 内部面 \(i+\tfrac{1}{2}\) では、既存 DDMC face opacity
-\(\sigma^{-}_{R,i+1/2,g}, \sigma^{+}_{R,i+1/2,g}\) とセル幅 \(\Delta r_i, \Delta r_{i+1}\) を用いて
-\[
-\mathcal{F}_{i+1/2,g}
-= \frac{2\,A_{i+1/2}\,c}
-       {3\left(\sigma^{-}_{R,i+1/2,g}\Delta r_i + \sigma^{+}_{R,i+1/2,g}\Delta r_{i+1}\right)}
-\]
-を構成し、行列のオフ対角 \(-\mathcal{F}_{i+1/2,g}\)、対角 \(+\mathcal{F}_{i+1/2,g}\) とする。
-DDMC-IMC 界面は Phase-1 でも **zero-flux にしない**。IMC kernel 側は §7.7.1 の
-既存 interface conversion probability をそのまま使い、IMC 粒子は界面到達時に
-DDMC セルへ変換されうる。implicit diffusion solve 側は既存 DDMC の
-interface leak 係数 \(\Sigma^{int}_{i\to IMC,g}\)（実装上 `sigma_leak_left/right`）
-を対角 sink として用いる。
-Phase-1 実装では、IMC→DDMC 変換で生じた step-end DDMC census energy は
-明示的 DDMC 粒子として持ち越さず、step 終了時に `rad_E` へ畳み込んで
-次 step の \(E^n\) に反映する。
-
-vacuum 境界は既存 DDMC の Milne リーク係数 \(\Sigma^{leak}_{i\to b,g}\)、
-DDMC-IMC 界面は既存 interface leak 係数 \(\Sigma^{int}_{i\to IMC,g}\) をそのまま使い、
-\[
-\mathcal{B}_{i,g} = c\,V_i\,\Sigma^{sink}_{i,g},
-\qquad
-\Sigma^{sink}_{i,g} \in \left\{\Sigma^{leak}_{i\to b,g},\ \Sigma^{int}_{i\to IMC,g}\right\}
-\]
-を対角 sink として追加する。vacuum 境界の sink energy は
-\(\Delta E^{esc}_{i,g} = \mathcal{B}_{i,g} E^{n+1}_{i,g}\Delta t\)
-で `E_escape[g]` に加算する。一方、DDMC-IMC 界面の sink energy は
-物理境界流出ではないため `E_escape[g]` へは加算せず、隣接 IMC セルの
-`rad_dep[i_{IMC},g]` に加算する。
-
-solve 後の tally 更新は次のとおり：
-\[
-\texttt{rad\_E\_tally}_{i,g} = c\,E^{n+1}_{i,g} V_i \Delta t,
-\qquad
-\texttt{rad\_dep}_{i,g} \mathrel{+}= c\,\sigma_{a,eff,i,g}\,E^{n+1}_{i,g} V_i \Delta t
-\]
-`rad_emit` は既存 IMC thermal source が
-\(c\,\sigma_{a,eff} a_{eV} T^4 b_g \, V \Delta t\)
-を保持しているため、implicit diffusion path では emission を `rad_dep` に再加算しない。
-ただし predictor-corrector 後は DDMC セル群の `rad_emit[i,g]` を
-最終反復の \(T^{pred}\) で評価した source に上書きし、後段の
-`delta_E_rad_prev` が corrected emission を含む実適用 source と一致するようにする。
-
-> Phase-1 注記：
-> - \(E^n\) には前ステップのセル平均 `rad_E` を使用する
-> - true NLTE, Marshak 境界, volume source を含むケースは particle DDMC にフォールバックする
-> - 2D_RZ への拡張は将来課題
-
-#### 7.4.2 PGRW transport（Phase-1, 1D_SPH only）
-PGRW（partially-gray random walk）は独立 transport mode ではなく、
-`imc_transport_persistent` 内で IMC 粒子に適用される internal acceleration branch
-である。Phase-1 は 1D_SPH のみ対応し、`rad_lite_mesh` 有効 step では無効化する。
-
-セル \(i\) では、Planck weight \(b_g(T_e)\) を使って diffusive cutoff
-\(g_{diff,end,i}\)、collapsed absorption \(\bar{\sigma}_{a,i}\)、collapsed total
-\(\bar{\sigma}_{t,i}\)、diffusion coefficient \(D_i\)、diffusive emission fraction
-\(\gamma_i\) を毎 step host 側で前計算する。群 cutoff は
-\[
-\tau_g = \sigma_{t,i,g}\,\bar{s}_i,\qquad
-\bar{s}_i = \frac{4V_i}{A_i},\qquad
-\tau_g \ge 20\,\tau_{rw}
-\]
-を満たす連続した低群側スライスで定義する。
-
-粒子位置 \(r\)、群 \(g<g_{diff,end,i}\)、残り時間 \(t_{rem}\) に対し、RW sphere 半径は
-\[
-R_0 =
-\begin{cases}
-\min(r-r_{i-1/2},\,r_{i+1/2}-r), & r_{i-1/2}>0 \\
-r_{i+1/2}-r, & r_{i-1/2}=0
-\end{cases}
-\]
-とする。Phase-1 の PGRW eligibility は
-\[
-\sigma^{IMC}_{t,i,g}R_0 > 1,\qquad
-\bar{\sigma}_{t,i}R_0 \ge \tau_{rw},\qquad
-c\,t_{rem} > R_0
-\]
-である。ここで \(\sigma^{IMC}_{t,i,g}=\sigma_{a,eff,i,g}+\sigma_{s,eff,i,g}\) は
-current group の IMC total opacity であり、kernel は通常 IMC の
-\(s_{bdry}, s_{scatter}, s_{cen}\) を評価した後にこの eligibility を判定する。
-
-event time は 3競合で決める：
-1. upscatter:
-\[
-t_{up} = -\frac{\ln \xi}{(1-f_i)(1-\gamma_i)\bar{\sigma}_{a,i}c}
-\]
-2. census: \(t_{cen}=t_{rem}\)
-3. leak: \(\theta=cDt/R_0^2\) を用い、survival
-\[
-S(\theta)=2\sum_{n=1}^{100}(-1)^{n+1}e^{-n^2\pi^2\theta}
-\]
-から \(F(\theta)=1-S(\theta)\) の inverse CDF table（1024点、\(\theta\in[10^{-6},3]\)）
-を引く。
-
-選ばれた event 時刻 \(t_{evt}\) に対する吸収減衰は
-\[
-\tau_{abs}=cf_i\bar{\sigma}_{a,i}t_{evt},\qquad
-\Delta E = E\left(1-e^{-\tau_{abs}}\right)
-\]
-で計算し、`rad_dep` / `rad_E_tally` へ通常 IMC と同じ `warp_tally` を通して加算する。
-signed residual 粒子では通常 IMC と同じく `sign` を掛けた寄与を加算する。
-
-- leak の位置は RW sphere 表面へ移し、方向は leak 点の sphere outward normal に対する
-  cosine-law half-space から再サンプルする
-- census / upscatter の位置は Eq. (22) の
-  \[
-  G(\rho;\theta)=\frac{\int_0^\rho \Psi(r,\theta)r^2dr}{\int_0^{R_0}\Psi(r,\theta)r^2dr}
-  \]
-  を 64×128 の \((\theta,\rho/R_0)\) table で逆補間して決める
-- upscatter の新群は transport-side 群 \([g_{diff,end}, G)\) に制限し、
-  `eta_cdf` の同区間を再正規化した CDF からサンプルする。
-  `eta_cdf` が無い場合は同区間の \(\sigma_a(g)b_g\) 重みで代替する
-
-> Phase-1 注記：
-> - `tau_rw=0` で PGRW は完全無効
-> - legacy `TransportMode::RW` は生成しない
-> - `rw_transport_gpu.cu` は dead code として保持する
-> - `rad_lite_mesh` 有効 step では PGRW を使わない
----
-
-### 7.5 DDMCイベント
-DDMC粒子（cell i, group g, energy E, time t）。
-
-総イベント率：
-\[
-\Sigma^{tot}_{i,g} = \sigma_{a,eff,i,g} + \sigma_{s,eff,i,g}^{(NLTE)} + \Sigma^{out}_{i,g} + \Sigma^{leak}_{i\to b,g}
-\]
-ここで \(\sigma_{s,eff,i,g}^{(NLTE)}\) は true NLTE DDMC でのみ有効な局所実効散乱率
-\((1-f)\sigma^{PA}_{i,g}\) であり、LTE DDMC では 0 とみなす。
-\(\Sigma^{out}_{i,g}\) は全ての **非境界隣接面** のリーク率の和（§7.3.2）、
-\(\Sigma^{leak}_{i\to b,g}\) は全ての **境界面** のリーク率の和（§7.4）である。
-内部セル（全面が内部面）では \(\Sigma^{leak}_{i\to b,g} = 0\) となる。
-面 CDF には内部面と境界面の両方が含まれ、
-境界面が選択された場合はエスケープ（エネルギーを outflow にタリー）、
-内部面が選択された場合はセル遷移（§7.5 後段のリーク処理）となる。
-
-> **Planck/Rosseland混合に関する注記**：
-> \(\Sigma^{tot}\) は **Planck由来の実効吸収**（\(\sigma_{a,eff}=f\sigma_{a,g}\)、§6.1）、
-> true NLTE での **局所実効散乱**（\(\sigma_{s,eff}=(1-f)\sigma_{a,g}\)）と
-> **Rosseland由来のリーク率**（\(\Sigma^{out},\Sigma^{leak}\)、§7.3–7.4）を合算する。
-> これは物理的に正しい：吸収率と局所再放出率は Planck absorption / emissivity で決まり、
-> 拡散/リーク率はRosseland不透明度で決まる。
-> Densmore (2007) Eq.(19) のgrey版（\(\sigma_a=\sigma_R\)）とはこの点で異なるが、
-> 多群では両者の区別が本質的であり、同一視すると吸収/拡散バランスが崩れる。
-
-次イベント時間：
-\[
-\Delta t_{evt} = \frac{-\ln\xi}{c\,\Sigma^{tot}_{i,g}}
-\]
-- **安全ガード**：\(\Sigma^{tot}_{i,g} \le \Sigma_{floor}\)（\(\Sigma_{floor} = 10^{-30}\) cm\(^{-1}\)）の場合、
-  \(\Delta t_{evt} = \infty\) として即座にcensus化する。
-  これは §7.1.2 のDDMC判定基準（\(\tau \ge 4\) 等）により到達不能であるべきだが、
-  数値誤差や不透明度テーブル端の異常値に対する防御ガードである。
-  発生時は `DeviceErrorFlags::ddmc_sigma_tot_zero` を設定する。
-- \(t+\Delta t_{evt} \ge t^{n+1}\) ⇒ census（下記参照）
-- そうでなければイベント実行
-
-**DDMCのcensus処理**：\(t + \Delta t_{evt} \ge t^{n+1}\) の場合：
-1. 残存滞在時間 \(\Delta t_{cen} = t^{n+1} - t\) を計算
-2. 滞在時間寄与をタリーに蓄積：`rad_E_tally[i,g] += c * E * Δt_cen`（§7.6 の規約）
-3. 粒子時刻を \(t \leftarrow t^{n+1}\) に更新
-4. 粒子状態（セル、群、エネルギー、時刻、RNGカウンタ）をcensusプールに保存
-5. 粒子を当該ステップのアクティブ輸送から除外（`time_remain=0`、`alive=1` を維持）
-
-> census到達時にイベント（吸収/リーク）は発生しない。
-> 粒子のエネルギーは保持され、次ステップで追跡が継続される。
-> 滞在時間の寄与が正しくタリーされることにより、
-> ステップ全体の \(\hat{E}_{i,g}\) がcensus粒子分を含む正確な推定量となる。
-
-> **時間連続DDMC（temporally continuous DDMC）**：
-> 上記の指数待ち時間サンプリングは Densmore (2007) §4–§5 の "temporally continuous" 方式に対応する。
-> 代替として "temporally discretized" 方式（backward Euler離散化、時間ステップ内の一様サンプリング）
-> があるが、Densmore (2007) §5 の数値比較では temporally continuous 方式の方が精度・安定性に優れ、
-> 因果律違反（将来の吸収を先取りする問題）を回避できることが実証されている。
-> TENRYUは temporally continuous 方式を採用する。
-
-**DDMC カーネル実行モデル**：1 スレッド = 1 粒子ヒストリー、`block_size = 128`（CUDA_KERNELS §10.3 参照）。粒子はシンプルなインデックスマッピング `thread_id + block_id × block_size` で割り当てる。DDMC はイベント処理が単純（位置・方向追跡不要、~30 レジスタ）でワープ発散が低いため、§6.6 の Persistent Warp モデルは適用せず history-based モデルを使用する。
-
-イベント種別：
-- 吸収確率：
-\[
-P_{abs} = \frac{\sigma_{a,eff}}{\Sigma^{tot}}
-\]
-- true NLTE DDMC の局所実効散乱：
-\[
-P_{scat} = \frac{\sigma_{s,eff}}{\Sigma^{tot}}
-\]
-- リーク（近傍j）：
-\[
-P_{i\to j} = \frac{\Sigma^{leak}_{i\to j}}{\Sigma^{tot}}
-\]
-- 境界リーク：
-\[
-P_{i\to b}=\frac{\Sigma^{leak}_{i\to b}}{\Sigma^{tot}}
-\]
-
-LTE DDMC では \(\sigma_{s,eff}\) をイベントとして使わないため 3 チャネル、
-true NLTE DDMC では \(\sigma_{s,eff}\) を局所再分配イベントとして有効化するため 4 チャネルとなる。
-
-**イベント選択（LTE: 3チャネル, true NLTE: 4チャネル）**：
-
-乱数 \(r = \xi \times \Sigma^{tot}\)（\(\xi \in U(0,1)\)）に対し：
-
-1. \(r < \sigma_{a,eff}\)：**吸収イベント** — エネルギーを `rad_dep[i,g]+=s_p E` に加算、粒子消滅
-2. true NLTE かつ \(\sigma_{a,eff} \le r < \sigma_{a,eff} + \sigma_{s,eff}\)：**局所実効散乱イベント** —
-   outgoing group を `eta_cdf` からサンプルする。
-   target group が DDMC-support ならセル・エネルギー・時刻を保持したまま DDMC を継続し、
-   IMC-only なら same-step DDMC→IMC reinjection（7.7）へ送る
-3. その他の場合で、\(r\) が内部リーク帯に入る：**近傍リークイベント** — 内部面を選択：
-   \[
-   f^* = \min\!\left\{f \in \mathcal{F}_{int} : \sigma_{a,eff} + \sigma_{s,eff} + \sum_{f' \le f} \Sigma^{leak}_{i \to j_{f'}} \ge r\right\}
-   \]
-   ここで \(\mathcal{F}_{int}\) は内部面（非境界面）の集合。
-4. 残余は **境界リークイベント** — 境界面を選択：
-   境界面が複数ある場合（2D RZのコーナーセル等）は、残余 \(r - \sigma_{a,eff} - \sigma_{s,eff} - \Sigma^{out}\) で
-   CDFを走査して対象境界面を決定する。1面の場合はその面を選択。
-   **v1.0簡略化**：R3 で境界面リーク係数は `Σ_leak_bdry` に合算され個別値は保持されない。
-   コーナーセルでは最初の VACUUM/MARSHAK 境界面を選択する（CUDA_KERNELS §6.5 R9 参照）。
-   VACUUM 境界脱出はエネルギー計上（E_escape）のみで面に依存しないため、v1.0 では正確。
-   多面 Marshak BC の正確な面選択（方向依存の入射スペクトル）は将来版で対応する。
-
-> **注意**：LTE では \(P_{abs} + \sum_j P_{i\to j} + P_{i\to b} = 1\)、
-> true NLTE では \(P_{abs} + P_{scat} + \sum_j P_{i\to j} + P_{i\to b} = 1\) を満たす。
-> 内部セル（全面が内部面）では \(\Sigma^{leak}_{i\to b} = 0\) のため境界リークチャネルは発生しない。
-
-処理の詳細：
-- **吸収**：`rad_dep[i,g]+=s_p E`、粒子消滅
-- **局所実効散乱**：`group <- sample(eta_cdf[cell,*])`
-  - sampled group が DDMC-support なら、粒子は同一セル・同一エネルギーのまま DDMC を継続
-  - sampled group が IMC-only なら、同一セル内 volume source とみなして DDMC→IMC 変換し、残余時間を tail IMC phase へ渡す
-- **近傍リーク**（面 \(f^*\) を通過）：cellId←\(j_{f^*}\)
-  - \(j_{f^*}\) がDDMCならDDMC継続
-  - \(j_{f^*}\) がIMCなら **DDMC→IMC変換**（7.7）。サンプリング面は \(f^*\)
-  - **2D セルの面とリーク先の対応**：セル i の面 f (f=0,1,2,3 for R\_left, R\_right, Z\_bottom, Z\_top — CUDA\_KERNELS §6.4.3 面規約) は一意の隣接セル \(j_f\) を持つ
-- **境界リーク**：`E_escape[g]+=s_p E` として流出へ計上、粒子消滅（vacuum）
-
-#### 7.5.1 DDMC粒子の群間再分配（frequency redistribution）
-
-LTE DDMC では粒子の群変更はステップ内で行わず、群間エネルギー再分配は
-IMC と同じ **ソース生成メカニズム**（§6.2）を通じて実現される。
-true NLTE DDMC では Jayenne separate-emissivity に合わせて、ステップ内の局所群再分配を
-`sigma_s_eff + eta_cdf` で表現する。
-
-1. DDMCセルで吸収イベントが発生 → エネルギーは電子系へ沈着（\(T_e\) が上昇）
-2. true NLTE では、同じ step 内で local effective-scatter event が起きた場合に
-   outgoing group を \(s_g\) からサンプルする
-3. 次のタイムステップ冒頭で、§6.2のソース生成が **DDMCセルを含む全セル** に適用される
-4. LTE ではソース粒子の群分配は \(b_g(T_e)\)、true NLTE では \(s_g\) に比例する
-5. 新規ソース粒子がDDMCセル内に生成された場合、そのセルがDDMC条件を満たせば
-   DDMCモードで追跡を開始する
-
-> **IMCとの対比**：IMCでは実効散乱イベント（§6.3.4）により
-> ステップ **内** で群変更が発生する。true NLTE DDMC でも局所 effective scatter に限って
-> 同じ step 内の群変更を許すが、空間 diffusion / leakage operator 自体は各群で独立のまま保持する。
-> したがって追加される群連成はセル局所の rank-1 kernel
-> \((1-f)\sigma^{PA}_{g_{in}} s_{g_{out}}\) に限られ、空間リーク係数の定義は変えない。
->
-> TENRYU は true NLTE DDMC の same-step reinjection を持つ。局所 effective-scatter で
-> `eta_cdf` から引いた outgoing group が DDMC-support なら DDMC のまま継続し、
-> IMC-only group なら **その場で DDMC→IMC 変換**する。
-> この変換では粒子エネルギーと絶対時刻を保持し、位置はセル内一様、方向は等方に再サンプルする。
-> DDMC 後に tail IMC phase を 1 回だけ回し、同一 step の残余時間を IMC で輸送する。
-
-#### 7.5.2 DDMCセルのソース粒子生成
-
-§6.2のソース生成は **DDMCセルにも適用** される。具体的には：
-
-- DDMCセル i × 群 g の放射源 \(S^{emit}_{i,g}\)（§6.2）を計算
-- 粒子数 \(N_{p,i,g}\) を通常のエネルギー比例配分（§6.2）で決定
-- 生成された粒子はまず通常の source particle として生成し、その後 step 冒頭の mode map で DDMC 群へ partition される
-  - 位置・方向は不要（DDMCはセル・群・エネルギー・時刻のみ）
-  - PhotonPool SoA 上の DDMC 粒子の位置・方向フィールドは NaN（`0x7FF8000000000000`）に初期化する。これにより誤って IMC transport で参照された場合に検出できる。DDMC → IMC リーク（§7.7.2）時に新たにサンプルする。RNG ストリームは IMC 粒子と同一の規約（§12.7.1）に従う
-  - DDMCイベントループ（§7.5）に \(t=t^n\)、残存時間 \(\Delta t\) で投入
-
-> **true NLTE の補足**：`rad_lite_mesh` は coarse radiation mesh 上で `eta_cdf` を保持しないため、
-> true NLTE separate-emissivity でも 1D IMC overlay として使用できる。
-> coarse rad cell 上の IMC scatter は単一 coarse `eta_cdf` を使わず、粒子位置から member hydro cell を
-> 逆引きしてその hydro-cell `eta_cdf` を参照する。
-> したがって `rad_lite_mesh` は 1D IMC transport の coarse space operator を保ちつつ、
-> emitted / redistributed spectrum は fine hydro-cell の `s_g` に従う。
-> `Radiation.imc.rad_lite_mesh.nlte_auto = true` のときは、
-> `opacity.model in {"table_nlte","tmat"}` かつ 1D_SPH の step で
-> RadLite overlay を自動有効化する。merge criterion 自体
-> (`can_merge_edge`) は変更せず、適用判定と
-> `sigma_ratio_max \leftarrow \max(\text{user}, 3.0)` だけを緩和して、
-> NLTE/TMAT の急峻なセル間オパシティ変動に対してより強い coarse 化を許す。
-
-> **census粒子との関係**：DDMCセルのcensus粒子（前ステップ終了時に
-> DDMCモードで生存していた粒子）は、新規ソース粒子とともに
-> DDMCイベントループに投入される。census粒子の群は前ステップの値を保持する。
-
----
-
-### 7.6 DDMC推定量（rad_E）
-DDMCでは粒子は方向を持たず“セル滞在時間”を持つ。  
-時間積分されたエネルギー密度の推定量（residence estimator）：
-
-- 粒子がセル i に滞在した時間 \(\Delta t_{res}\) の寄与：
-\[
-\Delta \mathcal{E}_{i,g} = E \,\Delta t_{res}
-\]
-- ステップ平均のエネルギー密度推定：
-\[
-\hat E_{i,g} = \frac{1}{V_i \Delta t}\sum_{events} E\,\Delta t_{res}
-\]
-
-IMCのtrack‑length推定（10章）と一致する（\(\Delta t_{res}=\Delta s/c\)）。
-
-> **実装上の注意（共有タリー配列との整合）**：
-> `tally_finalize`（§10.3, CUDA_KERNELS §6.0e）は IMC/DDMC 共通の `rad_E_tally` 配列を
-> \(/(V \times c \times \Delta t)\) で正規化する。DDMCの生の寄与 \(E \times \Delta t_{res}\) [erg·s] を
-> そのまま蓄積すると、正規化結果が \(c\) 倍ずれる。
-> そのため **実装では \(c \times E \times \Delta t_{res}\) = \(E \times \Delta s\)** [erg·cm] を蓄積し、
-> IMC の track-length 推定量 \(E_{mid} \times \Delta s\) [erg·cm] と同じ単位で共有配列に寄与する。
-> 物理的等価性：\(\frac{1}{V\,\Delta t}\sum E\,\Delta t_{res} = \frac{1}{V\,c\,\Delta t}\sum E\,(c\,\Delta t_{res}) = \frac{1}{V\,c\,\Delta t}\sum E\,\Delta s\)。
-
----
-
-### 7.7 IMC⇄DDMC境界変換（asymptotic diffusion-limit準拠）
-
-従来の **Marshak境界条件** では、入射IMC粒子の角度分布が強く異方的な場合に
-DDMC領域内部の解が不正確になり得る（Densmore 2007 §3.2, Fig.7で実証）。
-
-TENRYUでは **asymptotic diffusion-limit境界条件**（Larsen et al. 1983, Habetler & Matkowsky 1975）
-に基づくインターフェースを採用する。これにより、入射角度分布に依存せず
-DDMC内部で拡散極限として正しい解を得る。
-
-#### 7.7.1 IMC→DDMC（方向依存変換確率 P(μ)）
-
-IMC粒子がDDMCセルの面 m に入射（方向余弦 \(\mu_m > 0\)）したとき、
-**無条件にDDMCへ変換するのではなく**、方向依存の変換確率 \(P(\mu_m)\) で判定する：
-
-\[
-P(\mu_m) = \frac{4}{3\sigma_{R,m}\Delta x_m + 6\lambda}\left(1 + \frac{3}{2}\mu_m\right)
-\]
-
-ここで：
-- \(\sigma_{R,m}\)：面 m のDDMC側セルのRosseland不透明度（7.3.4の面評価規約で算出、拡散と整合）
-- \(\Delta x_m\)：面 m のDDMC側セルの代表長
-- \(\lambda \approx 0.7104\)：外挿距離（Milne問題の漸近値）
-- \(\mu_m\)：面法線に対する方向余弦（\(0 < \mu_m \le 1\)）
-
-処理：
-- 確率 \(P(\mu_m)\) で **DDMCへ変換**：
-  - `mode=DDMC`
-  - 位置・方向はDDMCでは不要（セル・群・エネルギー・時刻のみ保持）
-  - **物理的には** DDMCイベントループ（7.5）へ即座に合流し、残り時間 \(t^{n+1}-t_{current}\) で
-    DDMCイベント処理を開始する（合流タイミングは変換時刻）。
-    **ただし v1.0 実装では**、IMC カーネル（R8）内でモード変換された粒子は
-    当該ステップ内で DDMC カーネル（R9）による再処理は行わない（CUDA_KERNELS §9 起動シーケンス参照）。
-    変換粒子は次ステップの R7（composite\_sort\_and\_partition）で DDMC 領域に正しく分離され、
-    R9 で処理される。この遅延は \(O(\Delta t)\) の分割誤差を含むが、
-    Strang splitting の分割誤差（§2.1）と同等であり、統計的再現性に影響しない
-  - 変換された粒子のエネルギーは、DDMC境界セルの方程式（7.3.5 Eq.32）の
-    入射ソース項 \(\int_0^1 P(\mu)\mu I_b\,d\mu\) に対応する
-- 確率 \(1-P(\mu_m)\) で **IMC側へ等方的に反射**：
-  - 粒子は面 m 上に留まり、IMC側半空間へ等方的に方向を再サンプル
-  - エネルギー・時刻は保持
-
-> **変換確率の制約**（確率化の前提）：
-> \(0 \le P(\mu_m) \le 1\) が **全ての \(\mu_m \in (0,1]\)** で成り立つ必要がある。
-> \(\mu_m=1\)（垂直入射）で最大値をとるため、条件は：
-> \[
-> P(1) = \frac{10}{3\sigma_{R,m}\Delta x_m + 6\lambda} \le 1
-> \quad\Leftrightarrow\quad
-> \sigma_{R,m}\Delta x_m \ge \frac{10 - 6\lambda}{3} \approx 1.91
-> \]
-> この条件を満たさないセル×群は **DDMC不可**（7.1.2 条件4）。
->
-> **参考文献**：
-> - Densmore et al., JCP 222 (2007) Eq.(34): P(μ)の定義
-> - Cleveland & Gentile, JCP 291 (2015) Appendix B: 反射確率とemissivity保存
-
-#### 7.7.2 DDMC→IMC
-
-DDMC粒子がIMCセルへリークしたとき：
-- `mode=IMC`
-- **位置**：リーク面上でサンプル（1D_SPHは等方、2D_RZは既定でR重み付け）
-  - **1D_SPH**：球面 \(r = r_f\) 上で等方位置をサンプル：
-    \(\mu_{pos} = 2\xi_1-1\)、\(\phi_{pos}=2\pi\xi_2\)、
-    \(\mathbf{r}=(r_f\sqrt{1-\mu_{pos}^2}\cos\phi_{pos},\; r_f\sqrt{1-\mu_{pos}^2}\sin\phi_{pos},\; r_f\mu_{pos})\)
-  - **2D_RZ**：辺 \(k\)（頂点 \(\mathbf{V}_k\) と \(\mathbf{V}_{k+1}\) を結ぶ）上で
-    RZ体積要素の \(R\) 因子を考慮した重み付けサンプリング（v1.0既定）：
-    辺の頂点座標 \(R_k, R_{k+1}\) に対し、辺上の面積要素は \(dA \propto R\,dl\) である。
-    逆関数法で \(R\)-重み付き位置をサンプルする：
-    \[
-    t = \frac{-R_k + \sqrt{R_k^2 + \xi(R_{k+1}^2 - R_k^2)}}{R_{k+1} - R_k}, \quad \xi \in U(0,1)
-    \]
-    \(\mathbf{r} = \mathbf{V}_k + t \cdot (\mathbf{V}_{k+1} - \mathbf{V}_k)\)。
-    \(R_k \approx R_{k+1}\)（Z方向の辺）の場合は \(t = \xi\) に退化する。
-    **切替閾値**：\(|R_{k+1} - R_k| < \varepsilon_R\)（\(\varepsilon_R = 10^{-10} \times \max(R_k, R_{k+1}, 10^{-20})\)）の場合に \(t = \xi\) に退化する。
-    オプション `ddmc.rz_face_r_weight=False` で一様サンプル
-    \(\mathbf{r} = \mathbf{V}_k + \xi \cdot (\mathbf{V}_{k+1}-\mathbf{V}_k)\) に切替可能（回帰テスト用）。
-- **方向**：面法線 \(\hat{\mathbf{n}}\) に対してIMC側半空間へ
-  - Interface source angular distribution uses cosine-weighted half-space sampling: \(\mu = \sqrt{\xi}\), consistent with Lambert's cosine law for surface emission.
-  - v1.0既定：**cosine分布**（pdf \(p(\mu) = 2\mu\), \(\mu \in (0,1]\)）
-    - サンプリング：\(\mu = \sqrt{\xi_1}\)（逆関数法）
-    - 方位角：\(\phi = 2\pi\xi_2\)
-    - 方向ベクトル：\(\hat\Omega = \mu\,\hat{\mathbf{n}} + \sqrt{1-\mu^2}(\cos\phi\,\hat{\mathbf{u}}+\sin\phi\,\hat{\mathbf{w}})\)
-    ここで \(\hat{\mathbf{u}}, \hat{\mathbf{w}}\) は面上の正規直交基底
-    - **2D\_RZ での面法線座標系の構築**：セル辺 \(m\) の2端点を \(P_1=(r_1,z_1)\), \(P_2=(r_2,z_2)\) とする。
-      1. 辺方向ベクトル \(\mathbf{t}_{edge} = (r_2-r_1,\; z_2-z_1) / |P_2-P_1|\)
-      2. RZ平面内法線 \(\mathbf{n}_{RZ} = (z_2-z_1,\; -(r_2-r_1)) / |P_2-P_1|\)（セル外向き）
-      3. 面上の位置 \(P\) での3D法線：\(\hat{\mathbf{n}} = (n_{RZ,r}\cos\varphi_P,\; n_{RZ,r}\sin\varphi_P,\; n_{RZ,z})\)
-      4. 接線1：\(\hat{\mathbf{u}} = (t_{edge,r}\cos\varphi_P,\; t_{edge,r}\sin\varphi_P,\; t_{edge,z})\)
-      5. 接線2：\(\hat{\mathbf{w}} = \hat{\mathbf{n}} \times \hat{\mathbf{u}}\)（方位角方向）
-      ここで \(\varphi_P\) は粒子の方位角（DDMC 粒子の場合は \([0, 2\pi)\) から一様サンプル）。
-  - オプション：**half‑range isotropic**（\(\mu\)一様）
-    - \(\mu = \xi_1\)（\(\mu \in (0,1]\)）
-- 群：gを保持
-- E,t は保持
-
-> **v1.0 実装注記**：R9（DDMC）カーネル内でモード変換された粒子（mode=IMC）は、
-> 当該ステップ内で R8（IMC）カーネルによる再処理は行わない。
-> 変換粒子は次ステップの R7（composite\_sort\_and\_partition）で IMC 領域に正しく分離され、
-> R8 で処理される。この遅延は IMC→DDMC 変換（§7.7.1）と対称であり、
-> \(O(\Delta t)\) の分割誤差は Strang splitting の分割誤差（§2.1）と同等である。
-
-> **注**：DDMC→IMCのリーク面で同時にleft-leakageイベントが起きたDDMC粒子は
-> IMC側へ等方的に返される（Densmore 2007 §3.2末尾）。
-
-> 検証で cosine vs half‑range の感度を確認する（VERIFICATION §9.2）。
-
-#### 7.7.3 Emissivity保存補正 \(\hat{P}\)（v1.0既定）
-
-**問題**：標準の変換確率 P（7.7.1）は光学厚 τ の増大とともに 0 に近づく。
-これにより、高光学厚の界面で変換確率と境界セルの σ\_{L,1} が共にほぼゼロとなり、
-IMC⇄DDMC間の放射エネルギー伝搬が**人工的に遮断**される。
-標準Pから得られる離散化 emissivity \(\hat\varepsilon\) は
-解析拡散 emissivity \(\varepsilon'\) より常に小さく、τ増大とともに減少する
-（Densmore, Davidson & Carrington 2006, §4, Eq.45）：
-\[
-\hat\varepsilon = \frac{P\beta}{\beta + \frac{4}{3}P\tau}
-\]
-
-**解決**：解析 emissivity \(\varepsilon'\) をセルサイズに依らず保存する
-修正変換確率 \(\hat{P}\) を導入する（Densmore 2006 §5, Eq.48）。
-
-解析拡散 emissivity（Densmore 2006 Eq.19）
-\[
-\omega \leftarrow \operatorname{clamp}(\omega, 0, 1)
-\varepsilon' = \frac{4}{3}\frac{\sqrt{3(1-\omega)}}{1+\lambda\sqrt{3(1-\omega)}}
-\]
-> **実装ノート**：\(\omega\) は丸め誤差で \(1\) をわずかに超える可能性があるため、\(\varepsilon'\) と \(\beta\) 計算前にクランプして \(1-\omega\ge 0\) を保証する。上式は等価に \(1-\omega \leftarrow \max(1-\omega,0)\) とするものでもよい。
-ここで \(\lambda \approx 0.7104\) は Milne 外挿距離（無次元、平均自由行程単位、§7.3.5参照）。
-
-修正変換確率（Densmore 2006 Eq.48）：
-\[
-\hat{P} = \frac{\varepsilon'\,\beta}{\beta - \frac{4}{3}\varepsilon'\,\tau}
-\]
-\[
-\beta = \frac{3}{2}(1-\omega)\tau^2 + \sqrt{3(1-\omega)\tau^2 + \frac{9}{4}(1-\omega)^2\tau^4}
-\]
-
-ここで：
-- \(\tau = \sigma_{R,m}\Delta x_m\)：DDMC側セルの光学厚（7.7.1 の σ\_{R,m} と同一）
-- \(\omega\)：散乱比（7.1.1 の定義）
-
-**数値安定性と確率保証**：
-\(\hat{P}\) 公式の分母 \(\beta - \frac{4}{3}\varepsilon'\tau\) は、以下の条件で問題を起こしうる：
-
-1. **分母が非正**（\(\beta \le \frac{4}{3}\varepsilon'\tau\)）：\(\omega\) が大きく \(\tau\) が中程度の領域で発生。
-   主因は \(\beta \sim O(\sqrt{1-\omega}\,\tau)\) に対し \(\varepsilon'\tau \sim O(\sqrt{1-\omega}\,\tau)\) が
-   同等以上のオーダーとなること。例：\(\omega = 0.999, \tau = 10\) で分母 < 0。
-2. **\(\hat{P} > 4/5\)**：分母が正だが小さい場合、\(\hat{P}\) が確率制約 \(\hat{P}(1) \le 1\) を超過。
-   例：\(\omega = 0.9, \tau = 4\) で \(\hat{P} \approx 1.05\)。
-3. **\(\omega \to 1\) の漸近**：\(\varepsilon' \to 0\) かつ \(\beta \to 0\) で、正しい極限は \(\hat{P} \to 0\)
-   （純散乱媒質ではemissivityがゼロのため変換確率もゼロ）。\(\hat{P} \to 1\) ではない。
-
-**実装の安全策（v1.0）**：
-1. \(\beta \le \frac{4}{3}\varepsilon'\tau\)（分母 \(\le 0\)）の場合：**標準 P**（§7.7.1）にフォールバック
-2. \(\hat{P} > 4/5\) の場合：\(\hat{P} = 4/5\) にクランプ（\(\hat{P}(1) \le 1\) を保証）
-3. \(\hat{P} < 0\) の場合：標準 P にフォールバック（安全策、条件1で通常捕捉される）
-
-クランプ/フォールバック時は emissivity 保存精度が低下するが、
-標準 P 自体が正しい確率的インターフェースを与えるため物理的に安全である。
-\(\tau\) が十分大きい領域（\(\tau \gtrsim 7\) at \(\omega = 0.9\)）では
-クランプは発生せず、完全な emissivity 保存が得られる。
-
-\(\hat{P}\) を P の代わりに用いた方向依存変換確率：
-\[
-\hat{P}(\mu) = \frac{\hat{P}}{2}\left(1+\frac{3}{2}\mu\right)
-\]
-
-**性質**：
-- \(\tau \to 0\)：\(\hat{P} \to 8/(3\tau+6\lambda) + O(\tau^2) = P\)（標準と同精度、Eq.49）
-- \(\tau \to \infty\)：\(\hat{P} \to \varepsilon' > 0\)（放射が常に界面を透過可能）
-- \(\omega \to 1\)：\(\hat{P} \to 0\)（emissivity \(\varepsilon' \to 0\)）
-- 光学薄セルでは標準Pと同一の1次打ち切り誤差
-
-**確率制約（asymptotic interface method用）**：
-\[
-\hat{P}(1) = \frac{5}{4}\hat{P} \le 1
-\quad\Leftrightarrow\quad
-\hat{P} \le \frac{4}{5}
-\]
-**漸近極限**（\(\tau\to\infty\)）では \(\hat{P} \to \varepsilon'\) であり、\(\varepsilon' \le 4/5\) が必要。
-これは（Densmore 2006 Eq.61）：
-\[
-\omega \ge \omega_{\min} = 1 - \frac{1}{3\left(\frac{5}{3}-\lambda\right)^2} \approx 0.6355
-\]
-TENRYUのDDMC判定条件（7.1.2）は \(\omega \ge 0.9\) を要求するため、
-**漸近極限**（\(\tau \to \infty\)）では確率制約が満たされる。
-
-> **有限τでの注意**：\(\tau\) がDDMCしきい値（\(\tau_{DDMC}=4\)）付近の場合、
-> \(\hat{P}\) は漸近値 \(\varepsilon'\) を超えて \(4/5\) を超過しうる。
-> この場合は上記の安全策（クランプ/フォールバック）が適用される。
-> §7.1.2 の条件4（\(0 \le P(\mu) \le 1\)）はクランプ後に成立する。
-
-**v1.0方針**：
-- 1D球対称では **\(\hat{P}(\mu)\) を既定で使用**（emissivity保存）
-- 標準 P(μ) は `ddmc.emissivity_preserving=False` で選択可能（回帰テスト・比較用）
-- 境界セルの σ\_{L,1}（7.3.5）にも同じ \(\hat{P}\) を適用する
-
-> **参考文献**：
-> - Densmore, Davidson & Carrington, Ann. Nucl. Energy 33 (2006) 583–593:
->   emissivity問題の分析（§4, Eq.45）、\(\hat{P}\) の導出（§5, Eq.48）、制約（§6, Eqs.59–62）
-> - Cleveland & Gentile, JCP 291 (2015) §2.3.2: \(\hat{P}\) をHIMCD実装に採用
-
-#### 7.7.4 2D RZへの幾何拡張
-
-v1.0の \(\hat{P}(\mu)\) 式（7.7.3）は Densmore (2006) の1D slab向け導出に基づく。
-2D RZの一般四辺形セルでは「面法線に対するΔx」の定義が自明でなく、
-面の幾何形状に応じた拡張が必要になる。
-
-**v1.0方針**（セル代表長ベース）：
-\(\hat{P}(\mu)\) 式中の \(\Delta x_m\) として、DDMC側セルの **面法線方向の代表長** を使用する：
-\[
-\Delta x_m = \frac{V_i}{A_m}
-\]
-ここで \(V_i\) はDDMC側セルの体積、\(A_m\) はリーク面 \(m\) の面積。
-
-- **1D_SPH**：\(\Delta x_m = \Delta r_i\)（球殻厚さ）。\(V_i = \frac{4\pi}{3}(r_{i+1/2}^3-r_{i-1/2}^3)\)、\(A_m = 4\pi r_f^2\) だが、
-  \(r_{i+1/2}-r_{i-1/2} \ll r\) の極限で \(\Delta x_m \approx \Delta r_i\) に一致。
-- **2D_RZ**：\(V_i\) はRZ四辺形セルの体積（§3.2.2）、\(A_m = 2\pi \bar{R}_m \cdot L_m\)
-  ここで \(\bar{R}_m\) は辺 \(m\) の平均R座標、\(L_m\) は辺の長さ。
-
-**r=0 軸上のセル**（\(\bar{R}_m \to 0\)）：軸に接する辺 \(m\) の面積 \(A_m = 2\pi\bar{R}_m L_m \to 0\) で \(\Delta x_m \to \infty\)。これは非物理的であるため、\(r=0\) に接する辺については \(\Delta x_m = V_i / (\pi R_{max} L_m)\) とする。ここで \(R_{max} = \max(r_1, r_2, r_3, r_4)\) はセル4頂点の \(r\) 座標の最大値（構造格子では右辺の2頂点の \(r\) 座標の大きい方に等しい）。
-
-> **物理的動機**：\(\pi R_{max} L_m\) は開口角 \(\pi\) のウェッジの面積に相当し、
-> 軸接触セルの実効的な面面積スケールを表す。これにより \(A_m \to 0\) の特異性を
-> 回避しつつ、有限の光学的厚さ \(\tau_m = \sigma_R \cdot \Delta x_m\) を確保する。
-> 結果として得られるリーク率は軸近傍のセル幾何に対して物理的に妥当な値となる。
-
-> **物理的妥当性**：\(V_i/A_m\) は「面 \(m\) を通して見たセルの奥行き」に相当し、
-> 面法線方向の平均自由行程と直接比較可能な量である。
-> 直交格子ではセル幅 \(\Delta x\) に一致する。
-
-Cleveland & Gentile (2015) Appendix B は、任意幾何形状（非構造格子含む）に
-自然に拡張可能なインターフェース定式化を提供する。
-光学厚の定義を面法線ベースに一般化（\(\tau_m = \kappa_{m+1/2}\,\hat{n}_m\cdot\overrightarrow{\Delta X}\)）し、
-\(\hat{P}\) の枠組みをそのまま適用する。
-
-**将来拡張**：
-- Cleveland & Gentile 幾何拡張は `interface_method="cleveland_gentile"` として将来実装
-
-> **参考文献**：
-> - Cleveland & Gentile, JCP 291 (2015) Appendix B: 任意幾何向けemissivity保存インターフェース
-
----
-
-### 7.8 DDMC運動量沈着推定量（rad momentum deposition）
-
-DDMCでは粒子が角度情報を持たないため、**放射運動量沈着**の推定には
-面フラックスを経由する手法を用いる（Densmore et al. 2007 §3.3）。
-
-連続系での運動量沈着率：
-\[
-\mathbf{p}(\mathbf{r},t) = \frac{\sigma_t}{c}\int_{-1}^{1} \mu\, I(\mathbf{r},\mu,t)\, d\mu = \frac{\sigma_t}{c}\, F(\mathbf{r},t)
-\]
-ここで \(\sigma_t = \sigma_{a,eff} + \sigma_R\) [cm\(^{-1}\)] は全相互作用不透明度（Densmore 2007 Eq.(36) に準拠）。
-注：この \(\sigma_t\) はDDMC拡散係数（§7.2）の \(\sigma_R\) を含む運動量沈着専用の定義であり、IMCの \(\sigma_{total}=\sigma_{a,eff}+\sigma_{s,tot}\)（§6.3.1）やDDMCイベントレート（§7.4–§7.5の \(\Sigma^{out}+\sigma_{a,eff}\)）とは異なる。
-
-#### 7.8.1 面フラックスの推定
-
-DDMCの面フラックスは、面を横切るリークイベントのタリーから推定する。
-
-内部面 \(j+1/2\)（DDMCセル \(j\) と \(j+1\) の間）：
-\[
-F_{j+1/2} = \sigma_{R,j}\, \phi_j\, \Delta x_j - \sigma_{L,j+1}\, \phi_{j+1}\, \Delta x_{j+1}
-\]
-ここで \(\phi_j\) はセル平均 scalar intensity（residence estimatorから得る）、
-\(\sigma_{R,j}\), \(\sigma_{L,j+1}\) はリーク不透明度（7.3.2）。
-
-**\(\phi_j\) と residence estimator の関係**：\(\phi_j = c\,\hat{E}_{i,g} / (4\pi)\)。ここで \(\hat{E}_{i,g}\) [erg/cm\(^3\)] は §7.6 の residence estimator が返すエネルギー密度、\(c\) は光速。この変換は \(\phi = cE/(4\pi)\) に基づく。
-
-**\(\phi_j\) の算出タイミング**：\(\phi_j\) はタイムステップ内の全 DDMC イベント完了後にポストプロセスとして算出する。residence estimator の和 \(\sum(E \cdot \Delta t_{res})\) はイベントループ中に累積し、\(\phi_j = c\,\hat{E}_{i,g}/(4\pi)\) は全イベント処理後に一度だけ計算する。したがって運動量沈着（§7.8.2）もイベントループ完了後に算出される。
-
-境界面 \(1/2\)（DDMCとIMCの境界）：
-\[
-F_{1/2} = \int_0^1 \mathcal{P}(\mu)\, \mu\, I_b(\mu,t)\, d\mu - \sigma_{L,1}\, \phi_1\, \Delta x_1
-\]
-\[
-\mathcal{P}(\mu)=
-\begin{cases}
-\hat{P}(\mu) & \text{v1.0既定（`ddmc.emissivity_preserving=True`）} \\
-P(\mu) & \text{比較用（`ddmc.emissivity_preserving=False`）}
-\end{cases}
-\]
-
-#### 7.8.2 セル運動量沈着
-
-セル j の運動量沈着（単位体積・単位時間）：
-\[
-p_j = \frac{1}{2c}\left(\sigma^+_{R,j-1/2}\, F_{j-1/2} + \sigma^-_{R,j+1/2}\, F_{j+1/2}\right)
-\]
-
-面のRosseland不透明度は7.3.4の面評価規約に従う。
-
-**2D_RZ への一般化**：
-各面 \(f\) の寄与にその面の外向き単位法線 \(\hat{\mathbf{n}}_f\) を乗じ、R/Z成分を分離する：
-\[
-\mathbf{p}_{i} = \frac{1}{2c\,V_i}\sum_{f\in\text{faces}(i)} \sigma_{R,f,g}\, F_{f}\, A_f\, \hat{\mathbf{n}}_f
-\]
-ここで \(F_f\) は面 \(f\) を通じたフラックス（§7.8.1の \(F_{j\pm 1/2}\) の多面拡張）、
-\(\hat{\mathbf{n}}_f\) は面の外向き法線ベクトルである。
-1D_SPHでは \(\hat{\mathbf{n}}_f = \hat{r}\)（径方向）に退化し、上式の1D版と一致する。
-
-#### 7.8.3 v1.0での扱い
-
-- v1.0ではDDMCの運動量沈着は **診断出力**として実装する
-- タリー配列 `rad_mom_dep[i]` [dyne·s/cm³]（2D_RZ: [N_cell × 2]（R,Z成分）、1D_SPH: [N_cell × 1]）に上記推定量を蓄積
-- IMCのtrack-length estimator（§10.1）による運動量沈着と合算して出力
-- **注意**：運動量沈着は統計誤差が大きい（Densmore 2007 §4.2, Figs.2,4,6）。
-  分散低減（将来）が入るまでは、診断参考値として扱う
-
-> **参考文献**：
-> - Densmore et al., JCP 222 (2007) Eqs.(36)–(40): DDMC運動量推定
-> - Cleveland & Gentile, JCP 291 (2015) Appendix A, Eq.(A.3): 面フラックス方式
 
 ---

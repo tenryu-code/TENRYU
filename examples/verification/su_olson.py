@@ -48,7 +48,6 @@ Numerics(
         max_s=3.33e-12,
         min_s=1.0e-20,
         growth_factor=1.0,
-        f_min_fleck=0.01,
     ),
     hydro=dict(boundary_1d="reflect", av_C1=0.1, av_C2=1.5),
     conduction=dict(enabled=False),
@@ -66,18 +65,6 @@ Radiation(
     group_bounds_eV=[0.0, 1.0e6],
     volume_source_rate=3.2928e12,
     volume_source_x_max=1.00005e4,
-    imc=dict(
-        alpha=1.0,
-        f_max=1.0,
-        linearized_planck=True,
-        particles_per_cell_group=250,
-        implicit_capture=True,
-        cutoff_fraction=1.0e-4,
-        inelastic_scatter=True,
-        weight_cutoff=1.0e-10,
-        roulette_survival=0.1,
-    ),
-    ddmc=dict(enabled=False),
     boundary=dict(inner_r="reflect", outer_r="vacuum"),
 )
 

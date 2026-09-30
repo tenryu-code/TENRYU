@@ -430,7 +430,10 @@ __device__ inline void map_hydro_to_laser_1d_kernel_body(
     const double ghost_Te_min_eV,
     const int critical_clip,
     const double n_hat_margin,
-    const int fcrit_cell) {
+    const int fcrit_cell,
+    // Dominant material of each hydro cell (multi-material decks; nullptr = one material): the n_e interpolation
+    // below pairs only cells of the same material (NUMERICS §5.7.3(a)).
+    const int* __restrict__ cell_material_index = nullptr) {
   const int i = idx / n_nodes_z;
   const int j = idx - i * n_nodes_z;
   const double R = node_R[i];
@@ -459,8 +462,12 @@ __device__ inline void map_hydro_to_laser_1d_kernel_body(
     double ne_interp = ne_cell_val;
     const double r_c = 0.5 * (r_edges[c] + r_edges[c + 1]);
     int c2 = (r < r_c) ? (c - 1) : (c + 1);
+    // Neighbour of the same material only: across a material interface n_e jumps and the node keeps its cell's
+    // value (the interface was interpolated across until 2026-09-29).
+    const bool same_material =
+        (cell_material_index == nullptr) || (c2 >= 0 && c2 < n_cells && cell_material_index[c2] == cell_material_index[c]);
     if (c2 >= 0 && c2 < n_cells && c2 != c &&
-        cell_is_void[c2] == 0U &&
+        cell_is_void[c2] == 0U && same_material &&
         (outer_surface_cell < 0 || c2 <= outer_surface_cell)) {
       const double r_c2 = 0.5 * (r_edges[c2] + r_edges[c2 + 1]);
       const double dr_cc = r_c2 - r_c;

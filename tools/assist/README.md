@@ -57,8 +57,8 @@ Usage: `tools/assist/assist.py promote-zoning OUTPUT_DIR [--kappa F] [--margin-c
 `lint-deck` runs the solver's validators and reports mesh, intent-lock, and baseline checks. For 1D laser decks the payload carries the solver's physics-derived resolution requirement (`mesh_requirement`, compact `resolution_requirement_summary`) and the lints `ablation-band-resolution` (hard), `resolution-requirement-disabled` (hard), `shock-separation-resolution` (warn), `layer-min-cells` (info).
 Usage: `tools/assist/assist.py lint-deck DECK [--tenryu PATH] [--baseline FROZEN.json] [--intent INTENT.json] [-o FILE] [--keep-tmp]`
 
-`generate-deck` generates a deck from a specification and retries with validator feedback. When a template is given, or from the second iteration on, the prompt carries a `RESOLUTION REQUIREMENTS` section with that summary.
-Usage: `tools/assist/assist.py generate-deck SPEC --out-deck FILE [--tenryu PATH] [--template FILE] [--intent INTENT.json] [--baseline FROZEN.json] [--max-iters N] [--workdir DIR] [--config FILE]`
+`generate-deck` generates a deck from a specification and retries with validator feedback. When a template is given, or from the second iteration on, the prompt carries a `RESOLUTION REQUIREMENTS` section with that summary and the campaign mesh recommendation. `--conditions JSON` supplies a recommendation from the first prompt.
+Usage: `tools/assist/assist.py generate-deck SPEC --out-deck FILE [--tenryu PATH] [--template FILE] [--conditions JSON] [--intent INTENT.json] [--baseline FROZEN.json] [--max-iters N] [--workdir DIR] [--config FILE]`
 
 `freeze-baseline` freezes a deck for later baseline comparison.
 Usage: `tools/assist/assist.py freeze-baseline DECK [--tenryu PATH] [-o FILE]`
@@ -82,9 +82,9 @@ to `~/.tenryu/ask/<UTC stamp>/`; pass the same directory again to ask a follow-u
 turns are included). `--print-prompt` prints the assembled prompt without calling any provider
 and works while the assistant is disabled.
 
-`digest` requires `h5py` for history reductions and gracefully degrades when it is unavailable. `lint-deck` and `freeze-baseline` require a built `tenryu` binary, selected with `--tenryu` or found at `./build/tenryu`.
+`digest` requires `h5py` for history reductions and gracefully degrades when it is unavailable. `lint-deck` and `freeze-baseline` require a built `tenryu` binary, selected with `--tenryu`, `TENRYU_BIN`, or found at `./build/tenryu`.
 
-`generate-deck` requires `enabled = true` and a configured `deck_design` role. Its exit codes are: 0 accepted, 2 failure/disabled/exhausted, and 3 when the model asks a clarifying question (`UNCERTAIN`). Every model call and accepted deck is journaled.
+`generate-deck` requires `enabled = true` and a configured `deck_design` role. Its exit codes are: 0 accepted, 2 failure/disabled/exhausted, and 3 when the model asks a clarifying question (`UNCERTAIN`). Every model call and accepted deck is journaled. Every prompt starts with the deck-authoring skill body (`tools/assist/skills/codex/tenryu-namelist/SKILL.md`, journaled as `deck_skill_context`) before the SPEC section.
 
 Every LLM invocation is journaled as JSONL with model identity and prompt/response hashes. Replay never re-queries an LLM.
 
@@ -143,8 +143,9 @@ Invocation convention: for codex providers prefix the prompt with `$<name>`;
 for Claude providers instruct "Invoke the <name> skill". Current items:
 
 - `tenryu-mesh-1d` — 1D initial-mesh design/revision (mesh work item only).
+- `tenryu-namelist` — complete 1D deck authoring from an experimental specification (block order, key essentials, laser power convention, validate/lint/freeze procedure, error dictionary); its codex variant is the prompt head of `generate-deck`.
 
-Planned items follow the same pattern (full-deck generation, zoning repair,
+Planned items follow the same pattern (zoning repair,
 run forensics, plain-language run reports).
 
 ## TENRYU Studio integration
@@ -158,3 +159,156 @@ options are forwarded via `TENRYU_REMOTE_SSH_OPTS` / `TENRYU_REMOTE_SCP_OPTS` an
 the server mirror, so the server checkout needs only docs/ and src/. Studio workdirs
 live under `generate/<stamp>/` in the app configuration folder. Design:
 docs/design/gui_assistant_integration_20260902.md.
+
+## Mesh recommendations from experimental conditions
+
+`recommend-mesh` reads the shipped convergence table and emits deterministic JSON containing
+`recommendation`, reference IDs/distances/weights, raw and adjusted ceilings, `loo` statistics,
+`confidence`, `flags`, `warnings`, `budget`, validation evidence and a ready-to-paste
+`mesh_block` string. `--mesh-out` also writes that string as a Python block. It needs only the
+standard library (Python 3.9+, retaining the assistant floor); it makes no LLM call.
+
+```bash
+python tools/assist/assist.py recommend-mesh \
+  --conditions tools/assist/examples/mesh_conditions/gxii_gaussian.json \
+  -o recommendation.json --mesh-out mesh.py
+python tools/assist/assist.py recommend-mesh --deck case.py --deck-out recommended.py --tenryu build/tenryu
+python tools/assist/assist.py generate-deck spec.md --conditions conditions.json \
+  --out-deck case.py --tenryu build/tenryu
+```
+
+The conditions JSON fields are (each layer requires explicit `A` and `Z`; missing values
+are errors, never guessed from names; campaign CD uses A=7, Z=3.5, Al uses A=26.98, Z=13):
+
+| Field | Meaning |
+|---|---|
+| `wavelength_nm` | Positive laser wavelength |
+| `geometry` | `planar` (default), `spherical`, or `cylindrical` |
+| `layers` | Inner-to-outer list of `{material, A, Z, rho_gcc, thickness_cm}`; numeric fields finite and positive. A void layer `{material, "void": true, thickness_cm}` (optional `rho_gcc`, default 1e-9) is vacuum inside the target — behind a planar foil with a free rear surface, inside a hollow shell, between layers; it needs no `A`/`Z`, and the outermost layer must be material |
+| `r_min_cm`, `r_max_cm` | Inner radius (default 0); domain outer edge (default target outer edge) |
+| `t_end_s` | Run duration |
+| `pulse` | One of the forms below |
+| `physics` | Optional `{eos, radiation_enabled, temperature_model, conduction_solver}`; defaults to `tmat`, false, `2T`, `implicit` |
+
+`pulse` accepts `shape` (`square`, `gaussian`, `foot_main`, `picket`, `ramp`, `long_low`),
+`peak_intensity_W_cm2`, `duration_s` (default t_end); or replace peak with `energy_J` and
+`spot_radius_cm`/`area_cm2`. Gaussian accepts `fwhm_s`/`center_s`; square and long_low accept
+`rise_s` (default 1e-10). Other named shapes retain the campaign stage ratios. For arbitrary
+levels/timing supply `intensity_table: [[time_s, W_cm2], ...]`, or
+`power_table: [[time_s, W], ...]` with optional `area_cm2`. Times must strictly increase;
+values must be finite and nonnegative. Power defaults to the solver's reference area
+(planar 1 cm2, spherical 4*pi*R_target^2, cylindrical 2*pi*R_target per unit length).
+The spot convention is an equivalent uniform disk. Other spatial profiles need an explicit
+appropriate area. Unknown pulse keys are rejected.
+
+Examples include [GXII Gaussian](examples/mesh_conditions/gxii_gaussian.json),
+[foam on solid](examples/mesh_conditions/foam_on_solid.json),
+[1053 nm foil](examples/mesh_conditions/infrared_foil.json), and
+[Al foil](examples/mesh_conditions/aluminium_foil.json). The learned method, input coverage,
+LOO calibration and exact solver/lint integrity boundary are in
+[the design](../../docs/design/mesh_recommendation_from_campaign_20260908.md).
+
+`--tenryu`, then `TENRYU_BIN`, then `build/tenryu` select the optional binary, as for
+`lint-deck`. With a new binary, --deck uses solver-observed conditions from
+`validate --mesh-preview`; a placeholder uniform mesh is allowed. Offline/old-binary deck
+extraction requires a literal `MESH_EXPERIMENTAL_CONDITIONS = {...}` assignment, otherwise
+use --conditions. Both flags may be combined to validate material definitions in a real
+deck. Conditions-only validation uses a clearly identified ideal-gas mesh-check deck for
+the supplied material atoms; validate the production EOS deck separately. No binary means `unvalidated`.
+A deck's VOID material inside the target (between `r_min` and the first material, or between
+materials) becomes a void layer; before 2026-09-29 such decks were refused with "material Z
+must be finite and positive" (the solver exports void materials with Z = 0). The 1D solver keeps
+the cells of every void run evenly spaced between the faces around it (main 125a94572; before it
+only the exterior padding followed the surface and an interior void aborted the run) but has no
+contact model: a void that closes stops the run. The recommendation carries the flag
+`interior_void` and a warning to make the void wider than the travel of the faces around it
+(decks and measurements in `tests/data/decks/interior_void_1d/`).
+
+The block uses planar areal mass, cylindrical line mass, or spherical cell mass and splits
+the target into three regions. The ablation zone reaches the deeper of the predicted ablated
+depth (mu_abl_total_g_cm2: solver preview, otherwise the Python formation integral) and, for
+learned recommendations, the campaign's laser-side half; its cells are capped at
+0.95*area(R0)*surface ceiling, the ablation rule's reference-area measure, across layers and
+fill. A spherical or cylindrical gas fill (innermost layer below 0.1 of the densest density)
+outside that zone gets no band of the recommender and the 40-cell segment minimum; the
+campaign did not measure stagnation, so an imploding fill needs its own convergence check.
+A void layer inside the target is its own 40-cell segment in no region (uniform cells in a
+planar void, equal-mass cells in a curved one); the payload starts at the innermost material
+layer, depths and features skip the void, and the case is `extrapolation`.
+The unablated payload keeps the local rule rho*dr <= 2e-5 g/cm2 (or the solver's finer shock
+ceiling) through a core and pieces of radius ratio 1.2, the construction the solver uses
+for its injected payload band. With a probe preview the solver's injected caps join the
+count. Interval edges within 1e-6 of the target thickness merge (layer edges win). Each
+segment needs max(40, capped cells + ratio-limited transitions + 2); a segment whose
+requirement exceeds its share of the zoning monitor has its preferred measures scaled down
+(budget.segments[].profile_scale) so the solver's largest-deficit allocation meets it
+without inflating the total. The monitor integrals replicate the solver's quadrature.
+Padding has a constant terminal profile weight and no band. Explicit caps include 5%
+headroom. Inspect recommendation.mu_abl_total_g_cm2, mu_abl_source, budget.segments,
+budget.band_regions and budget.solver_band_regions.
+A capable binary validates the assembled mesh (at most eight attempts). It first folds the
+solver's injected bands, shock ceiling and ablated depth from the preview into the
+construction; band/box/chain and segment-budget certificates rebuild it with margins 1.25,
+1.45, 1.70, then grow counts by 1.5; width conflicts lower dr_min. An ablation-rule
+requirement violation extends the ablation zone to the worst cell's depth. `validated`
+needs exit code 0, no ablation- or shock-rule violation (the solver only reports shock
+violations of zoning_intent decks; the margin ladder refines such a mesh) and an achieved
+surface cell measure at or below the recommendation.
+Attempts include parsed certificate numbers.
+Achieved surface mass is the integrated cell measure divided by the outer reference area. Unknown empirical
+keys trigger `legacy_binary`: keep calibrated enforce plus explicit bands, at the cost of
+possible over-resolution. `unconverged_reference` means even the finest run was not proven
+converged. `extrapolation` means a-priori fallback; run a surface-mass-halving convergence
+pair before production. Without a binary this uses the material-aware calibrated
+formation integral itself (factor 1), with no extra multiplier or ladder cap; the solver's
+own formation ceiling is used when available. The Al example emits 9.131233090608189e-7
+g/cm2, 2381 estimated cells and a 3.382 nm surface width ceiling (`unvalidated`).
+The campaign tool and its design describe the observable tests.
+`sparse_evidence` means nearby measurements reduced the permitted relaxation of the
+a-priori ceiling. Inspect `recommendation.evidence_distance`, `evidence_radius`, and
+`allowed_apriori_factor`: the median training spacing is 0.36537242214822635, with linear
+shrinkage to factor one at that distance. LOO final safety is 22/22 (100%), with zero
+cases above both the a-priori and measured ceilings; the margin is
+0.2840422014231186 dex (90% quantile, 20/22 safe before the gate). Exact matches remain
+0.95*a_conv, as do conditions within a normalized feature distance 0.025 of a converged case
+with the same geometry, layer count and waveform class. Every pulse is first frozen as the
+solver freezes a beam power callable (absolute times k*2^-40 s, bisected up to 7 times where
+the curve bends), and the features, class and duration are read from that table, so a table
+exported by the solver and the conditions it came from give identical numbers even where
+the pulse jumps. A pulse belongs to a waveform class when its peak-normalized shape on its
+own energy window (0.5 %–99.5 % of the pulse energy) is within an L1 distance 0.10, whatever
+the tail cut; coverage requires an effective duration (integral of I over [0, t_end]
+divided by the peak) of 0.54–3.94 ns, so a run continuing after the pulse stays covered.
+The planar low-density unconverged class (C15) applies only when the predicted ablated
+depth reaches a layer of 0.05 g/cc or less.
+LOO is a calibration statistic, not a convergence guarantee.
+These flags are not errors: exit **0** means a recommendation was emitted (inspect validation
+status); exit **2** means bad input, missing explicitly requested binary, or failed validation.
+
+In `--deck` mode, use `--deck-out FILE` to write the fully assembled deck. The JSON
+`mesh_block` and `--mesh-out` already contain preserved Mesh keys such as `motion`;
+do not feed that block through `replace_mesh` again. The assembled output preserves each
+key exactly once. In `--conditions` mode, paste the Mesh block into your own production
+deck and merge the indicated Numerics retry companion. Without `--deck`, `--deck-out`
+writes the synthetic mesh-check candidate only if binary validation ran; otherwise it is
+an input error (exit 2). A failed validation still returns exit 2; any written candidate
+is not a validated production deck.
+
+The recommender, shipped table and binary must come from the same checkout state because
+the table digest is compiled into the binary; `reference_table_mismatch` indicates a stale copy.
+For this flag, the validate loop removes `empirical` and retries with calibrated enforce
+and explicit finer bands. The warning names the tool's digest; the learned efficiency
+benefit is lost until the table and binary agree. Other empirical errors retain the first
+matching log line verbatim in `validation.attempts[].error` (including any diagnostic log
+prefix). The independent `empirical-mesh-integrity` lint explicitly reports the table's
+digest and the differing deck digest; its hard-failure contract is unchanged.
+`lint-deck` independently recomputes empirical provenance/values and rejects
+`empirical-mesh-integrity` violations; `learned-surface-resolution` warns on coarser surface
+cells. The only deck claim the recomputation uses is the a-priori baseline, and only within
+the solver's own 3 % provenance tolerance, so a block computed offline (the tool's replica
+of the ceiling) verifies exactly on the numbers it was computed from. This integrity lint is
+required before production use of empirical relaxation.
+`generate-deck` includes the same recommendation from --conditions, template lint or the
+previous iteration beside its resolution section, with a deterministic context hash in
+the journal. If a failed validation leaves a later lint without a recommendation, retain
+the previous section and record its source in mesh_recommendation_context_fallback. No additional provider call is made.

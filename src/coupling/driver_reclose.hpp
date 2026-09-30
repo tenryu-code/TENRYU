@@ -48,6 +48,13 @@ bool sync_ee_from_Te_device(core::State& state, const core::Config& cfg,
                             const hydro::HydroEOSContext& eos_context,
                             DriverRecloseContext& context);
 
+// The heat capacities cv_e/cv_i of the run's EOS closure at the current
+// temperatures (1T: the electron and ion sum in cv_e; 2T: the electron value),
+// written without touching the energies. state.cv_e and cv_i must be allocated.
+bool refresh_heat_capacity_from_temperature_device(core::State& state, const core::Config& cfg,
+                                                   const hydro::HydroEOSContext& eos_context,
+                                                   DriverRecloseContext& context);
+
 bool apply_conduction_energy_increment_device(
     core::State& state, const core::Config& cfg,
     const hydro::HydroEOSContext& eos_context, DriverRecloseContext& context);

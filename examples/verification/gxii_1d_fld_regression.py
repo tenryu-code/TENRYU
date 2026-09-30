@@ -225,7 +225,6 @@ Numerics(
         min_s=1.0e-20,
         cfl_hydro=0.3,
         cfl_cond=0.25,
-        f_min_fleck=0.01,
     ),
     # driver_full_step_retry: the rebound shock re-compresses the gas/shell
     # interface (cell ~91) hard enough to cross nodes within one step at the

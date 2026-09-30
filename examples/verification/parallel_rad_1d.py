@@ -111,9 +111,7 @@ _RAD_COMMON = dict(
     enabled=True,
     groups=4,
     group_bounds_eV=[0.0, 100.0, 300.0, 1000.0, 1.0e6],
-    imc=dict(enabled=False, two_stage=False, difference=dict(enabled=False)),
-    ddmc=dict(enabled=False),
-    holo=dict(enabled=False),
+    imc=dict(two_stage=False),
     boundary=dict(inner_r="reflect", outer_r="vacuum"),
 )
 

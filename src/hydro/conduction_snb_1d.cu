@@ -167,6 +167,7 @@ __global__ void snb_max_te_kernel(const double* __restrict__ Te,
 __global__ void snb_qsh_face_kernel(double* __restrict__ qsh_face,
                                     const double* __restrict__ Te,
                                     const double* __restrict__ kappa_eff,
+                                    const double* __restrict__ kappa_face,
                                     const double* __restrict__ x_r,
                                     const int n_cells,
                                     const int face_policy_kirchhoff,
@@ -181,9 +182,13 @@ __global__ void snb_qsh_face_kernel(double* __restrict__ qsh_face,
   }
   const int iL = f - 1;
   const int iR = f;
+  // kappa_face (face iL between cells iL and iR) holds the Kirchhoff face conductivities of the step start
+  // T_e^n that the stages use; nullptr evaluates them here, from Te (the SNB probe, which runs at T_e^n).
   const double k_face =
       (face_policy_kirchhoff != 0)
-          ? kirchhoff_face_kappa_spitzer(kappa_eff[iL], kappa_eff[iR], Te[iL], Te[iR])
+          ? ((kappa_face != nullptr)
+                 ? kappa_face[iL]
+                 : kirchhoff_face_kappa_spitzer(kappa_eff[iL], kappa_eff[iR], Te[iL], Te[iR]))
           : harmonic_mean(kappa_eff[iL], kappa_eff[iR]);
   const double dr = cell_center_radius(x_r, iR) - cell_center_radius(x_r, iL);
   double q = 0.0;
@@ -484,6 +489,7 @@ template <int GEOM, bool KIRCHHOFF>
 __global__ void snb_stage_kernel(const double* __restrict__ Te_old,
                                  double* __restrict__ Te_new,
                                  const double* __restrict__ kappa_sh,
+                                 const double* __restrict__ kappa_face,
                                  const double* __restrict__ theta_face,
                                  const double* __restrict__ dq_face,
                                  const double* __restrict__ rho_cv_e,
@@ -518,8 +524,7 @@ __global__ void snb_stage_kernel(const double* __restrict__ Te_old,
   if (i > 0) {
     double k_face;
     if constexpr (KIRCHHOFF) {
-      k_face = kirchhoff_face_kappa_spitzer(kappa_sh[i - 1], kappa_sh[i],
-                                            Te_old[i - 1], Te_old[i]);
+      k_face = kappa_face[i - 1];  // frozen at T_e^n (NUMERICS §4.2)
     } else {
       k_face = harmonic_mean(kappa_sh[i - 1], kappa_sh[i]);
     }
@@ -544,8 +549,7 @@ __global__ void snb_stage_kernel(const double* __restrict__ Te_old,
   if (i + 1 < n_cells) {
     double k_face;
     if constexpr (KIRCHHOFF) {
-      k_face = kirchhoff_face_kappa_spitzer(kappa_sh[i], kappa_sh[i + 1],
-                                            Te_old[i], Te_old[i + 1]);
+      k_face = kappa_face[i];  // frozen at T_e^n (NUMERICS §4.2)
     } else {
       k_face = harmonic_mean(kappa_sh[i], kappa_sh[i + 1]);
     }
@@ -656,6 +660,7 @@ void snb_pass(core::State& state,
               const core::Config& cfg,
               const SnbDeviceWork& work,
               const double* d_kappa_eff,
+              const double* d_kappa_face,
               const double* d_A_eff,
               const std::uint8_t* d_cell_is_void,
               const int n_cells,
@@ -696,7 +701,7 @@ void snb_pass(core::State& state,
 
   const int face_blocks = (n_cells + 1 + kBlockSize - 1) / kBlockSize;
   snb_qsh_face_kernel<<<face_blocks, kBlockSize>>>(
-      work.qsh_face, state.Te.data(), d_kappa_eff, state.x_r.data(), n_cells,
+      work.qsh_face, state.Te.data(), d_kappa_eff, d_kappa_face, state.x_r.data(), n_cells,
       face_policy_kirchhoff ? 1 : 0, work.scalars);
   cuda_check(cudaGetLastError(), "SNB: qsh face launch failed");
 
@@ -764,6 +769,7 @@ void conduction_step_1d_sts_snb(core::State& state,
                                 const core::Config& cfg,
                                 ConductionResult& result,
                                 const double* d_kappa_eff,
+                                const double* d_kappa_face,
                                 const double* d_rho_cv_e,
                                 const std::uint8_t* d_cell_is_void,
                                 const double* d_A_eff,
@@ -868,7 +874,7 @@ void conduction_step_1d_sts_snb(core::State& state,
     double resid0 = 0.0;
     double qsh0 = 0.0;
     double ratio0 = 0.0;
-    snb_pass(state, cfg, work, d_kappa_eff, d_A_eff, d_cell_is_void, n_cells,
+    snb_pass(state, cfg, work, d_kappa_eff, d_kappa_face, d_A_eff, d_cell_is_void, n_cells,
              geom_code, face_policy_kirchhoff, use_outer_cap, t_ref_ev, &resid0,
              &qsh0, &ratio0, zmom_r2);
     // The pass above also produced dq^0 from H(Te^n); keep it as the first
@@ -917,14 +923,14 @@ void conduction_step_1d_sts_snb(core::State& state,
         constexpr int GEOM = decltype(geom_tag)::value;
         if (face_policy_kirchhoff) {
           snb_stage_kernel<GEOM, true><<<cell_blocks, kBlockSize>>>(
-              te_curr, te_next, d_kappa_eff, work.theta_face, work.dq_face,
+              te_curr, te_next, d_kappa_eff, d_kappa_face, work.theta_face, work.dq_face,
               d_rho_cv_e, d_cell_is_void, state.vol.data(), state.x_r.data(),
               n_cells, tau_stage, te_floor, d_clamp_count, d_floor_cells,
               te_ceiling_eff,
               d_ceiling_count, d_ceiling_cells);
         } else {
           snb_stage_kernel<GEOM, false><<<cell_blocks, kBlockSize>>>(
-              te_curr, te_next, d_kappa_eff, work.theta_face, work.dq_face,
+              te_curr, te_next, d_kappa_eff, nullptr, work.theta_face, work.dq_face,
               d_rho_cv_e, d_cell_is_void, state.vol.data(), state.x_r.data(),
               n_cells, tau_stage, te_floor, d_clamp_count, d_floor_cells,
               te_ceiling_eff,
@@ -961,7 +967,7 @@ void conduction_step_1d_sts_snb(core::State& state,
     // Refresh dq/theta from the iterate's end state; converged when the source
     // stopped moving (max-norm, order-independent; design §2.3).
     std::swap(work.dq_face, work.dq_face_prev);
-    snb_pass(state, cfg, work, d_kappa_eff, d_A_eff, d_cell_is_void, n_cells,
+    snb_pass(state, cfg, work, d_kappa_eff, d_kappa_face, d_A_eff, d_cell_is_void, n_cells,
              geom_code, face_policy_kirchhoff, use_outer_cap, t_ref_ev, &resid,
              &qsh_scale, &dq_ratio, zmom_r2);
     const double scale = qsh_scale + dq_ratio * qsh_scale;

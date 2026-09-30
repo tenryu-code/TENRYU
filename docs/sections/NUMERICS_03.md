@@ -16,7 +16,7 @@ W-G 以前のリテラル式と同一の浮動小数点演算順で評価する�
 （因数分解形 \((4\pi/3)(r_1-r_0)(r_1^2+r_1r_0+r_0^2)\) と立方差形
 \((4\pi/3)(r_1^3-r_0^3)\)）が共存し丸めが異なるため、ヘルパも両形を提供し
 各呼び出し箇所は歴史的綴りを維持する。非球面の対応範囲と ConfigError 制約は
-SPECIFICATION §6.4 Mesh（imc_ddmc 不可 / cylindrical+S_N は W-G3 まで不可 /
+SPECIFICATION §6.4 Mesh（cylindrical+S_N は W-G3 まで不可 /
 laser は radial_absorption_1d 限定）。W-G1=平面（全現行物理; 平面 S_N は
 \(\alpha\equiv0\) で角度再配分が恒等的に消え、既知の球面 flux dip と
 無縁）、W-G2=円筒（FLD + 電子熱伝導 — 伝導カーネルは §4.1a の
@@ -304,6 +304,76 @@ CH/351 nm/10¹⁵ W/cm² 実測 1.3–1.6×10⁶ g cm⁻² s⁻¹ に対しモ�
 天井 ≤ 収束値（最小余裕 1.0、最大 9）。1053 nm は 1.2 nm セルでも吸収エネルギー 3 % に
 未収束（表に最終増分を記載）。
 
+**実測に基づく推薦（2026-09-08）**: `tools/assist/assist.py recommend-mesh` は固定参照表の
+22 収束ケースから log-linear ridge trend と近傍残差補間を構成する。既知条件の一致は
+`0.95*a_conv`、補間は leave-one-out 過大予測誤差の 90% 分位 0.2840422014231186 dex を
+差し引く。正規化特徴距離 0.025 以内で幾何・層数・波形クラスが同じ収束ケースも既知条件として
+`0.95*a_conv` を用いる（2026-09-28）。パルスは solver と同じく絶対時刻 \(k\,2^{-40}\) s の格子で
+曲がる所を最大 7 回二分して凍結した表として扱い（`core/namelist/frozen_table.cpp` の複製）、特徴量・
+波形クラス・実効パルス幅はすべてこの表から求める（solver が preview に書き出す表と、それを作った
+条件が同じ数値を与える）。波形クラスは、エネルギーの 0.5 %–99.5 % が入る区間（パルス窓）で時間と
+ピークを正規化した L1 距離が 0.10 以下の最近キャンペーン波形とし（裾をどこで打ち切ったかに
+よらない）、継続時間の適用範囲は `t_end` でなく実効パルス幅 \(\int_0^{t_{end}} I\,dt/I_{peak}\)
+（キャンペーン 0.676–3.15 ns の 1/1.25–1.25 倍）で判定する（パルス後も計算を続ける `t_end` は範囲外に
+しない）。平面の低密度の未収束クラス（C15、0.05 g/cc フォームの中を進むアブレーション前面）は、
+予測アブレート深さが 0.05 g/cc 以下の層に届くときだけ適用する（押し板の裏のガスは該当しない）。
+これらの変更で較正値は余裕 0.2842517181579086 → 0.2840422014231186 dex、ゲート半径
+0.3667918227196686 → 0.36537242214822635 と動いたが、LOO の安全側の件数（ゲート前 20/22、後 22/22、
+先験値・実測値の同時超過 0 件）は変わらない。余裕のみでは 20/22、証拠ゲート適用後は 22/22（100%）が測定天井以下で、
+先験天井と実測値を同時に超える LOO ケースは 0 件（独立検証・収束確率ではない）。
+ゲート半径は学習条件間の最近傍距離の中央値 0.36537242214822635 とし、
+近傍実測/先験比の加重平均を r、最近傍距離を d とすると許容 factor は
+`min(cap, 1+max(0,1-d/d0)*max(0,r-1))`。LOO 各回は保留ケースを半径計算からも除く。
+ゲートで緩和が減る場合は `sparse_evidence` を表示する。内部の目標は
+C02-S1 に基づく未アブレート平面後方の 2e-5 g/cm²。表面天井は外側半分と予測
+アブレート深さの深い方までを対象とし、層境界・fill を越えて適用する。任意の
+`resolution_requirement.empirical` 辞書は参照 SHA-256、ケース ID、`surface_ceiling_g_cm2` と
+`reference_apriori_g_cm2` を保持し、比の上限は較正後天井に対する最大実測比
+9.220252473467259（C28）。C++ は先験天井との整合（3%）、上限、既定較正係数を検査し、
+形成帯・全アブレート帯と独立メッシュ検査に同じ経験的定数天井を適用する。衝撃波天井は維持する。
+`apply="enforce"` の `zoning_intent` デッキで辞書が棄却理由にするのはアブレーション則（形成帯・
+アブレート帯）の違反だけで、衝撃波則と層則は辞書のない `zoning_intent` デッキと同じく報告に
+とどまる（2026-09-28。以前は層則・衝撃波則の違反でも validate/run を拒否していた）。
+`lint-deck` は solver が出力した実条件と同梱表から再計算し、不一致を hard lint
+`empirical-mesh-integrity` とする（数値は相対 1e-6）。SHA-256 単独は認証ではなく、経験的
+緩和を使う production deck は lint を通す必要がある。辞書省略時は従来の計算・節点・frozen
+省略規則を変更しない。未収束クラスは `unconverged_reference` と最細実行段以下、範囲外は
+`extrapolation` と先験モデルへ戻す。バイナリなしでも各層の明示 A/Z から solver と同じ
+電離度・形成積分（吸収率 1、η=0.12、s_abl=1.5、φ_f=0.1、N_res=9）を評価し、
+追加の 0.1 倍や ladder 上限を課さず factor 1 とする。範囲外では未収束クラスの警告が
+併存してもこの先験 fallback を優先する。C++ 実行時に Python を呼ばず、HDF5 schema は変えない。
+詳細・適用範囲は `docs/design/mesh_recommendation_from_campaign_20260908.md`。
+2026-09-28 改訂: 推薦 block の測度は平面 `areal_mass`、円筒 `cylindrical_line_mass`、球
+`spherical_cell_mass`。標的を 3 領域に分ける。(i) アブレーション域 — 外面から深さ
+\(\max(\mu_{abl}, d_{half})\) まで（\(\mu_{abl}\) は solver preview を優先し、なければ Python 形成
+積分の最終アブレート質量。\(d_{half}\) は学習モードでのキャンペーン細分域 = 平面は全層、球・
+円筒は最外層の質量の外側半分。標的を越えない。層境界から標的厚の 1e-6 以内なら境界へ寄せる）。
+上限はセル測度で一定の `0.95*area(R0)*a_s`。アブレーション則の checker はセル質量を固定基準
+面積 area(R0) で面密度へ換算するので、この換算は厳密で半径による損失がない。(ii) fill — 球・
+円筒で最内層の密度が最大層の 0.1 倍未満（ガス fill）でアブレーション域の外なら帯域を置かず
+区間最小の 40 セルで区切る（停滞期の fill の分解能はこの推薦の対象外）。(iii) ペイロード（残る
+未アブレート部）— 局所則 \(\rho\Delta r \le a_{int}\)（\(a_{int}\) は C02-S1 の 2e-5 g/cm²、solver の
+衝撃波天井がより細かければそれ）。平面は `0.95*a_int`、球・円筒は半径比 1.2 以下の副帯に分け
+各 `0.95*area(r_lo)*a_int`（面積で最大 1.44 倍保守的）、中心に達する実心には solver と同じ中心核
+（下記「推奨帯」）を置き `0.95*area(c)*a_int/p`（p = 3 球・2 円筒）とする。
+probe の preview があれば、solver が enforce で注入する帯（builder と同じ換算。下記「推奨帯」）も
+数え上げに入れる。セル数は層・領域・帯の全端点で区間に分け（標的厚の 1e-6 以内の端点は統合し
+層境界を優先）、区間ごとに `ceil(測度/最小上限)`、隣接区間の上限比が 1.3 を超える所に
+`ceil(ln 比/ln 1.3)` の遷移セルを加え、層ごとに `max(40, 合計+2)` とする。総数は合計の 1.10 倍
+から始め、solver と同じ求積（パネル端の統合、Simpson の収束判定 1e-12・bin 判定 1e-10 を複製）
+によるモニタ積分の largest-deficit 配分が全層の必要数を満たすまで増やす。profile の希望セル測度は
+区間の最小上限とし、層の必要セル数（最小セル数の層が配分の比率を超えて取る分、最小セル数の層
+1 つにつき 40 を加える）がその層のモニタ積分を上回る層だけ、層内の希望セル測度を一様に縮める
+（`profile_scale`。層内のセル配置は変わらず配分の比率だけが変わるので、軽い fill のように上限が
+セルの測度よりはるかに大きい層でも総セル数が膨らまない）。profile は区間端に節点を置き
+（切り替えは端の直前、節点間隔は solver の位置許容の 1e3 倍以上）、標的
+外縁で終える（外側の void の詰め物は終端重みの一定延長で 40 セル）。2026-09-29 改訂: 標的内部の void 層（平面の自由後面の背後、中空殻の内側、層間の隙間。条件 JSON の `"void": true`、deck からは solver が書き出す物質の `is_void`）はどの領域にも属さない独立の区間として 40 セルとし（profile の外に置き、隣の重みの延長で配置する）、深さ・特徴量・形成積分・適用範囲の判定からは除く（solver の非 void 深さと同じ）。キャンペーンの標的は固定の内壁に載る平面か fill 入りの殻なので、void 層を含む条件は `extrapolation` とする。1D の流体計算は §2.1 のとおり void の区間の節点を毎回両端の節点の間に等間隔に並べ直すので（main 125a94572、それ以前は外側の区間だけで、標的内部の void は物質の面が動くと隣の void セルが潰れて止まった）、void 層の中の区切りはセル数だけを決める。区間が閉じる場合の接触の扱いは無く止まるので、推薦は `interior_void` の注意（周りの面の移動より厚くする）を付ける。隣接比は preferred・hard max とも 1.3、
+`dr_min` は最小許容幅の 0.05 倍。検証では preview の帯と \(\mu_{abl}\) を取り込んで作り直し、
+予算証明書では余裕率 1.25→1.45→1.70、以後セル数 1.5 倍、アブレーション則の
+`MESH_RESOLUTION_REQUIREMENT_VIOLATED` では最悪セルの深さまでアブレーション域を広げる。合格は
+validate の終了コード 0、アブレーション則と衝撃波則の違反 0（`zoning_intent` デッキの衝撃波則の違反は
+solver が報告だけするので、余裕率の段階でセル数を増やして再試行する）、表面の実達成値 ≤ 推薦値。
+
 **衝撃波分離則**: \(P_a = 40\,\mathrm{Mbar}\,(I_{15}/\lambda_{\mu m})^{2/3}\) の
 時間履歴で、準位 \(P_{max}2^{-k}\)（\(2^{-k}\ge0.01\)）の最初の上向き交差をイベントとし、
 `shock_event_min_separation_frac`·\(t_{end}\) 以内は合流（最早時刻・最大圧力）。連続する
@@ -318,8 +388,21 @@ CH/351 nm/10¹⁵ W/cm² 実測 1.3–1.6×10⁶ g cm⁻² s⁻¹ に対しモ�
 **推奨帯**: 形成帯 \([0, d_f]\)（天井 \(a_{max}(t_f)\)）、`n_bands` 個のアブレート帯
 （\([d_f, \mu_{abl}(t_{end})]\) を等分、天井は帯の浅い端の値 = 帯内最小、保守的）、
 ペイロード帯（衝撃波天井）。`zoning_intent` に `apply="enforce"` で注入するときの測度換算は
-`areal_mass` → \(a\)、`spherical_cell_mass` → \(4\pi r_{lo}^2 a\)、
-`cylindrical_line_mass` → \(2\pi r_{lo} a\)（帯内の厳密セル別上限を超えない、保守的）。
+`areal_mass` → \(a\)。形成帯・アブレート帯は `spherical_cell_mass` → \(4\pi R_0^2 a\)、
+`cylindrical_line_mass` → \(2\pi R_0 a\)（アブレーション則の \(a_i\) はセル質量を基準面積で割った
+量なので厳密）。ペイロード帯は局所の \(\rho_i\Delta r_i\) に課す。区間 \([s, r_{hi}]\) のセル質量を
+\(4\pi s^2 a\)（円筒 \(2\pi s a\)）以下にすれば、\(s\) より外のセルは質量 \(\ge 4\pi s^2\rho_i\Delta r_i\)
+なので \(\rho_i\Delta r_i \le a\) を満たす。そこで帯を半径比 1.2 以下の区分に分け、各区分を内半径で
+換算する（面積で最大 1.44 倍保守的）。中心核を \(c\,\max_{[r_{min},c]}\rho_0 \le a/2\) を満たす最大の
+\(c\)（\(\le r_{hi}\)、zoning の密度領域を内側から辿る。軽いガス fill はその外縁まで核に入る）とし、帯が
+核の内側から始まる場合、または中心に達して \(r_{lo}\) が深さ→半径の逆変換の丸め残差（立方根で
+増幅され \(\sim 5\times10^{-6}R_0\)）にすぎない場合は、先頭に核 \([r_{lo}, c]\) を置いて上限を
+\(4\pi c^2 a/3\)（円筒 \(2\pi c\,a/2\)）とする。核内のセルは \(\rho\Delta r \le c\max\rho_0 \le a/2\) を幾何だけで
+満たし、この上限は核全体を 1 セルに収め（核の質量 \(\le 4\pi c^2 a/6\)）、核の内側から外の高密度側へ
+またがるセルも体積 \(\ge (4\pi/3)c^2\Delta r\) より \(\rho\Delta r \le a\) に保つ。2026-09-28 修正: 以前は全帯を
+\(r_{lo}\) で一括換算しており、アブレーション則の帯は深いほど上限が \((r_{lo}/R_0)^2\) 倍に縮み（fill を
+含む球デッキで `MESH_BAND_BOX_INFEASIBLE`）、中心に達するペイロード帯は丸め残差の \(r_{lo}\) で換算されて
+実心球の enforce デッキが同じ証明書で棄却されていた。
 各推奨帯には、帯内（非 void セル）の最大初期密度 \(\max\rho_0\) に対する許容セル幅
 `width_max_cm` \(= a_{\max}/\max\rho_0\) を併記し、report 全体では帯にわたる最小値
 `dr_min_admissible_cm` を持つ。これを超える明示的な幅下限（`zoning_intent.dr_min`）は天井と
@@ -418,7 +501,9 @@ a_j = -\frac{A_j}{\Delta M_j}\left[(P+Q)_{i} - (P+Q)_{i-1}\right]
 \]
 
 **境界条件**：
-- 中心（\(j=0\)）：\(u_0 = 0\)（対称性）、\(r_0 = 0\) を維持
+- 内側（\(j=0\)）：節点 0 を初期位置 \(r_0=r_{min}\) に固定し \(u_0 = 0\)。`Mesh.r_min=0`（既定）なら対称中心、
+  \(r_{min}>0\)（平板の後面・中空殻の内面など）なら剛体壁で、builder は \(r_{min}>0\) を警告付きで受け付ける
+  （§3.1.11）
 - 外側（\(j=N\)）：自由境界（\(P_{ext}=0\)）or 固定壁（\(u_N=0\)）
 
 **1D odd-even suppression**：
@@ -523,7 +608,9 @@ legacy PdV path で用いる対応 heat はセルごとに
 H^{oe}_i = \mu_i (u_{i+1} - u_i)^2 \ge 0
 \]
 と定義し、full step のエネルギー更新後に既存の人工熱流束 \(H\) と同じ経路で
-比内部エネルギーへ加える。これにより PdV 仕事と人工粘性仕事の定義は変更せず、
+比内部エネルギーへ加える。行き先は人工粘性の仕事と同じ `av_heat_to`：1T は \(e\)、2T の既定はイオン、
+`"electron"` は電子（2026-09-29 から。それまで 2T では `av_heat_to` によらず常にイオンだった）。
+これにより PdV 仕事と人工粘性仕事の定義は変更せず、
 odd-even damping による運動エネルギー散逸だけを非負の heat source として戻す。
 exact compatible path ではこの separate heat は加えず、Corrector 加速度に入った
 cell-pair force \(F^{oe}_{i,L}=+\mu_i(u_{i+1}-u_i)\),
@@ -727,7 +814,7 @@ guard で無効化された pair 数を表す。
   総 work の過大・過小配分＝保存則違反を意味した。実装は当初からこの
   後段正規化を持つ — 2026-07-26 カーネルレビュー指摘）。
   \(\tilde f_e+\tilde f_{iQ}=0\)（または非有限）の退化セルでは 1/2–1/2 とする。
-  v1 では artificial-viscosity pressure work \(Q_i^{n+1/2}\) は常に ion energy へ含める。
+  人工粘性の仕事 \(Q_i^{n+1/2}\) は上の比で `av_heat_to` の側に入る（既定はイオン）。
   TMAT 2T path では compatible work と \(Q_{ei}\) transfer は分離し、
   \(Q_{ei}\) には half-step \(T_e,T_i\) と table 由来の
   \(c_{v,e},c_{v,i}\) を使う。compatible work 後の reclosure は
@@ -747,6 +834,8 @@ guard で無効化された pair 数を表す。
   先に並べたデッキでは表のセルの負エネルギーも切り上げた）、1T では全セルを切り上げていた。
   それ以前は表の cold curve の負エネルギーも 0 へ切り上げて床注入として計上し、
   energy-authoritative 閉包がその 0 を保持するため、負エネルギー域のセルが加熱されていた。
+  非 compatible の 1T 更新（`energy_update_with_old_volume_kernel`）も 2026-09-29 から同じセルごとの規則に従う
+  （それまでは表のセルも含む全セルを切り上げていた）。
   compatible TMAT reclosure の floor/ceiling clamp と bracket failure は device counter で集計し、
   非ゼロなら hydro warning として出力する。
 - `eta_compatible` 診断量
@@ -765,11 +854,11 @@ guard で無効化された pair 数を表す。
   面ごとに一度だけ求め、両隣のセルが同じ値を使う（2026-09-23 是正 — 旧実装は同じカーネルで隣のセルの
   エネルギーを読みながら自セルを更新しており、結果が読み書きの順序に依存し、面の熱流が両隣で食い違いえた）。
   2T ではセルの net \(\Delta e_{tot}^{ps}\) を
-  \(P_e^{n+1/2}/(P_e^{n+1/2}+P_i^{n+1/2})\) と
-  \(P_i^{n+1/2}/(P_e^{n+1/2}+P_i^{n+1/2})\) の比で電子・イオンへ分配する。
-  分母が 0 の退化セルでは 1/2–1/2 とする
-- odd-even damping の legacy compatible heat \(H^{oe}\) も `av_heat_to` で選ばれた同じ熱容量場へ加える。
-  exact compatible path では \(H^{oe}\) を別途加えず、force work \(\Delta E_i^{oe}\) を
+  \(\bar P_e/(\bar P_e+\bar P_i)\) と \(\bar P_i/(\bar P_e+\bar P_i)\) の比で電子・イオンへ分配する。\(\bar P_k\) は
+  Corrector のエネルギー更新と同じ圧力で、既定の `legacy_pc` では \((P_k^n+P_k^{n+1/2})/2\)、`midpoint_v2` では
+  \(P_k^{n+1/2}\)。分母が 0 の退化セルでは 1/2–1/2 とする
+- odd-even damping の legacy compatible heat \(H^{oe}\) も `av_heat_to` で選ばれた同じ熱容量場へ加える
+  （2026-09-29 から。§3.1.4）。exact compatible path では \(H^{oe}\) を別途加えず、force work \(\Delta E_i^{oe}\) を
   同じ熱容量場へ入れる
 - `Numerics.hydro.ee_odd_even_C = C_{ee}^{oe} > 0`（1D_SPH + 2T 専用）のときは、
   hydro の main energy update、人工熱流束 \(H\)、post-shock heat \(H^{ps}\) の後、
@@ -940,8 +1029,15 @@ T_{k,i}^{new} = T_{k,i}^{old} + \frac{\Delta e_{k,i}}{c_{v,k,i}} \quad (k=e,i)
 
 理想気体EOS（\(c_v = \text{const}\)）では反復なしで 1 回目で厳密に収束する。
 
-**1T の全エネルギー再規格化（legacy PdV path）**：1T・`compatible_energy=False`・駆動圧境界なしの
-ステップでは、Corrector の後に活性セルの \(e\) を一律に拡大縮小し（残差は最初の活性セルへ）、
+**1T の全エネルギー再規格化（2026-09-29 に撤去）**：1D の 1T・`compatible_energy=False`・駆動圧境界なしのステップでは、
+Corrector の後の全エネルギーの誤差を、活性セルの \(e\) の一律の拡大縮小（残差は最初の活性セルへ）で消していた。
+非互換の更新の保存誤差を、誤差が生じた場所（衝撃波）ではなく全セルへ内部エネルギーに比例して配るので、遠方の冷たい
+物質の断熱量まで変える（VERIFICATION §3.2s(b) の Sod の遠方場の指紋）。原因（非互換の更新が保存しないこと）を除かずに
+結果だけを期待値へ合わせる状態の補正で、2026-08-31 のユーザー裁定に当たるので、multi-kernel と persistent loop の両経路から
+外した。現在は 1T でも 2T と同じく、非互換の更新の保存誤差は履歴の保存誤差にそのまま現れる。全エネルギーを機械精度で
+保存する必要があるときは保存形の `compatible_energy=True` を使う（1D の Sedov・Noh の検証デッキはこれを使う）。
+2D（`hydro_2d.cu`）には同じ処理が残っている。以下は撤去した処理の記録：
+活性セルの \(e\) を一律に拡大縮小し（残差は最初の活性セルへ）、
 \(E=\sum_i \Delta M_i e_i + K\) を \(E^{target}=E^{n}+W_r+E_{floor}\) に合わせる。\(W_r\) は
 輻射圧（`hydro_coupling="gamma_r_43"`）の力の仕事の総和（ドライバが輻射場から同量を差し引く）、
 \(E_{floor}\) はステップ内の床注入（安全台帳へ計上）。\(K\) は節点形 \(\sum_j \tfrac12 m_j u_j^2\)
@@ -1138,7 +1234,9 @@ W_{osc,i} =
 - 閾値は `verify_gxii_1d_regression` で source-heated front を suppress しつつ、
   Sedov blast の pressure-dominated launch と Noh/Sedov の shock-support で
   `W_shock=1` を維持するよう固定している。
-- 中心ノードでは対称ゴースト \(r_{-1}=-r_1,\;u_{-1}=-u_1\) を用いる。
+- 内側の固定節点では、その節点を挟む鏡映ゴースト \(r_{-1}=2r_0-r_1,\;u_{-1}=-u_1\) を用いる
+  （\(r_0=0\) の中心では \(r_{-1}=-r_1\) とビット一致。2026-09-29 までは常に \(-r_1\) で、\(r_{min}>0\) の剛体壁では
+  ゴーストが壁の外 \(2r_0\) だけずれた位置になり、壁際のセルの勾配を誤っていた）。
   外側境界ノードでは線形外挿ゴースト
   \(r_{N+1}=2r_N-r_{N-1},\;u_{N+1}=2u_N-u_{N-1}\) を用いる。
 - 一様または相似圧縮のような滑らかな流れでは \(\chi_i \to 0\) となり、真の速度不連続でのみ
@@ -1268,6 +1366,13 @@ limiter が引数に対してできるだけ滑らかであることを求めて
 \(\chi_i^{rec}\) が \(O(\delta^2)\) の微小量で、その符号は曲率や丸め誤差で変わるため、粘性がセル
 ごとに 0 と \(f\chi_i^{raw}\) の間を不連続に跳んでいた（勾配が線形に変わる圧縮では全セルに
 \(f\chi_i^{raw}\)、不等間隔格子上の厳密な一様圧縮でも丸め誤差で一部のセルに入る）。
+`csw_zero_uniform_compression=False` では reconstruction limiting を丸ごと
+バイパスし \(\chi_i^{lim} = \chi_i^{raw}\) とする（jump gate なしの生 VNR 相当
+— 診断・比較用。2026-07-26 明文化: 旧正典は False 分岐の
+式を欠いていた）。なお floor は \(\chi_i^{rec}>0\) のときのみ作用するため、
+shock profile が一時的に複数セル線形 ramp 化して \(\chi_i^{rec}=0\) になると
+profile 内部の AV も消える（既知の設計トレードオフ — 独立 shock 確認
+sensor 付きの二段 floor は future work）。
 最終的な粘性圧は
 \[
 Q_i=\rho_i\left(C_2^2\Delta r_i^2(\chi_i^{lim})^2+
@@ -1662,9 +1767,18 @@ scalar AV 係数と比較した上限値で評価する。
 q_j = -\kappa_{eff,j}\,\frac{T_{e,i} - T_{e,i-1}}{r_{c,i} - r_{c,i-1}}
 \]
 ここで \(r_{c,i} = (r_j + r_{j+1})/2\)（セル中心半径）、
-\(\kappa_{eff,j}\) は隣接2セルの伝導率の調和平均にflux limiterを適用したもの（§4.1）。
+\(\kappa_{eff,j}\) は面の伝導率に flux limiter を適用したもの（§4.1）。
 
-**具体的な評価順序**：(1) 各セル \(i\) の Spitzer 伝導率 \(\kappa_{SH,i}\) を計算、(2) 面 \(j\) での調和平均 \(\tilde{\kappa}_j = 2\kappa_{SH,L}\kappa_{SH,R}/(\kappa_{SH,L}+\kappa_{SH,R})\)、(3) 面 \(j\) でのフラックスリミタ適用 \(\kappa_{eff,j} = \tilde{\kappa}_j / (1 + |\tilde{\kappa}_j \nabla T_j| / q_{max,j})\)。すなわち「先に調和平均、後にフラックスリミタ」の順序とする。\(q_{max,j}\) は面両側の物理量の算術平均（\(n_{e,j} = (n_{e,L}+n_{e,R})/2\)、\(T_{e,j} = (T_{e,L}+T_{e,R})/2\)）で評価する。
+**具体的な評価順序**：(1) 各セル \(i\) の Spitzer 伝導率 \(\kappa_{SH,i}\) を計算、(2) 面 \(j\) の伝導率 \(\tilde{\kappa}_j\)：
+既定の `face_kappa_policy="kirchhoff_same_material"` では、両セルの \(\kappa_{0}=\kappa_{SH}/T_e^{5/2}\) の比が \((0.1, 10)\) に入る
+（同じ材料とみなす）面で \(\tilde\kappa_j=\bar\kappa_0\,S_{5/2}\)（\(\bar\kappa_0\) は \(\kappa_0\) の調和平均、\(S_{5/2}=\tfrac27
+(T_R^{7/2}-T_L^{7/2})/(T_R-T_L)\) は Kirchhoff 変換の割線）、それ以外の面と `"harmonic"` では調和平均
+\(2\kappa_{SH,L}\kappa_{SH,R}/(\kappa_{SH,L}+\kappa_{SH,R})\)（§4.1）。STS では \(\tilde\kappa_j\) を伝導ステップの始めの \(T_e^n\) で
+1 回だけ評価し、全サブステップ・全段で固定する（§4.2。2026-09-29 から — それまで各段が段の温度で割線と判定を
+やり直していた）、(3) 面 \(j\) でのフラックスリミタ適用 \(\kappa_{eff,j} = \tilde{\kappa}_j / (1 + |\tilde{\kappa}_j \nabla T_j| / q_{max,j})\)。
+すなわち「先に面の伝導率、後にフラックスリミタ」の順序とする。\(q_{max,j}=f\,n_{e,j}T_{e,j}v_{th}(T_{e,j})\) の
+\(T_{e,j}=(T_{e,L}+T_{e,R})/2\)、\(n_{e,j}=\bar\rho_j\bar Z_j/(A_{h,j}m_p)\)（\(\bar\rho_j,\bar Z_j\) は両側の算術平均、\(A_{h,j}\) は
+\(A_{eff}\) の調和平均）で、両側の \(n_e\) の算術平均とは \(\bar Z\) や \(A\) が跳ぶ面で異なる。
 
 #### 3.1.8 幾何項 \(\mathbf{f}_{geom}\)
 
@@ -1858,7 +1972,7 @@ M_j\,\frac{du_j}{dt} = -A_j\,(p_{q,i} - p_{q,i-1}),\qquad A_j = 4\pi r_j^2
 
 | 境界 | ノード | 速度 | 圧力 |
 |------|--------|------|------|
-| 中心 (\(j=0\)) | \(r_0=0\) 固定 | \(u_0=0\)（対称性） | —（ゴーストセル不要） |
+| 内側 (\(j=0\)) | \(r_0=r_{min}\) 固定（既定 0 = 中心、\(>0\) は剛体壁） | \(u_0=0\) | —（ゴーストセル不要） |
 | 外側 (\(j=N\)) 自由 | 自由移動 | 自由 | \(P_{ext}=0\)（真空） |
 | 外側 (\(j=N\)) 固定壁 | \(r_N\) 固定 | \(u_N=0\) | 反射 |
 
@@ -1886,7 +2000,8 @@ M_j\,\frac{du_j}{dt} = -A_j\,(p_{q,i} - p_{q,i-1}),\qquad A_j = 4\pi r_j^2
 **節点量のゴースト規約（スカラー量とは別系統；
 2026-07-26 明確化）**：AV の slope 再構成（§3.1.6 の \(\sigma_j\)）が参照する仮想
 節点は次で定義する：
-- 中心（\(j=0\)）：鏡映 \(r_{-1} = -r_1\)、\(u_{-1} = -u_1\)
+- 内側（\(j=0\)）：固定節点を挟む鏡映 \(r_{-1} = 2r_0-r_1\)、\(u_{-1} = -u_1\)（\(r_0=0\) では \(-r_1\)。AV・CFL・
+  人工粘性の節点スロープで共通 — `compute_node_sigma_1d`。2026-09-29 から）
 - 外側（\(j=N\)）：線形外挿 \(r_{N+1} = 2r_N - r_{N-1}\)、
   \(u_{N+1} = 2u_N - u_{N-1}\)（全境界種別で共通）
 
@@ -2779,6 +2894,151 @@ CFL, ALE reference barriers, axis rezone, full-patch targets, and boundary
 projection consume `cell_nverts` rather than assuming four active corners.
 The cap apex \(O\) remains pinned at \((R,Z)=(0,0)\).
 
+For `MULTIBLOCK_POLAR_TIER`, the shell radial spacing is
+\[
+h_r = \frac{s_{\max}-s_{\mathrm{match}}}{N_r},
+\]
+and the angular column counts form the exact power-of-two ladder
+\(N_t=N_\theta/2^t\), ending at
+\(N_{\min}=N_{\mathrm{fan}}\). Let
+\(s_m=s_{\mathrm{match}}-m h_r\) denote the inward radial-face ladder.
+The transition from \(N_t\) to \(N_{t+1}=N_t/2\) is snapped to
+\[
+m_t =
+\operatorname{round}\!\left(
+\frac{s_{\mathrm{match}}-\chi_{\mathrm{lo}}h_rN_t/\pi}{h_r}
+\right),
+\]
+with the inner/coarse ring \(A\) at \(s_{m_t+1}\) and the outer/fine ring
+\(B\) at \(s_{m_t}\). The center-fan radius is
+\[
+s_1 =
+\begin{cases}
+h_r/\sin(\pi/N_{\mathrm{fan}}),
+  &\text{if the radius key is zero},\\
+\text{the configured radius},
+  &\text{if the key is positive}.
+\end{cases}
+\]
+Here the radius key is `polar_tier_fan_first_ring_radius_cm`.
+The fan occupies \(0\le s\le s_1\). Each regular tier has its own
+uniform radial ladder with exact endpoint landing. For tier endpoints
+\([s_{\mathrm{inner},t},s_{\mathrm{outer},t}]\), where the inner endpoint
+is the snapped transition radius or \(s_1\) for the innermost tier,
+\[
+L_t=\max\!\left(1,
+\operatorname{round}\!\frac{s_{\mathrm{outer},t}
+-s_{\mathrm{inner},t}}{h_r}\right),\qquad
+h'_{r,t}=\frac{s_{\mathrm{outer},t}-s_{\mathrm{inner},t}}{L_t},
+\]
+\[
+s_{t,k}=s_{\mathrm{inner},t}+k h'_{r,t},
+\qquad k=0,\ldots,L_t .
+\]
+No extra snapped ring is appended. Construction requires
+\(0.5h_r\le h'_{r,t}\le1.5h_r\) for every tier. The radial-nestedness
+threshold uses \(\min_t h'_{r,t}\), not the nominal \(h_r\), as its
+reference spacing.
+Every transition belt replaces one coarse angular interval by the pentagon
+\[
+[A_i,A_{i+1},B_{2i+2},B_{2i+1},B_{2i}],
+\]
+where the belt node \(C_i\) is the Chebyshev center of that pentagon. The
+center is obtained deterministically by enumerating edge-triplet active sets
+and selecting the feasible maximum of the minimum signed edge distance,
+starting from the pentagon centroid only as a deterministic fallback. The
+pentagon is then triangulated as the five-cell fan
+\([C_i,P_j,P_{j+1}]\). The innermost ring is closed by
+\(N_{\mathrm{fan}}\) triangles incident on the exact origin. Stored corner
+order is chosen so every shell quad, tier quad, belt triangle, and fan
+triangle has orientation sign \(+1\); the fan therefore stores each
+geometric sector \([O,x_i,x_{i+1}]\) in the positive finite-volume order
+\([O,x_{i+1},x_i]\).
+
+The topology block order is shell, outermost regular tier, transition belt,
+next regular tier, and so on, followed by the center fan. Its mixed
+three-/four-corner connectivity uses the in-memory `cell_nverts`/CSR contract
+and is routed through the v3 HDF5 topology schema. For tier-row counts
+\(L_t\), the total counts are
+\[
+N_{\mathrm{cell}} =
+N_rN_\theta+\sum_t L_tN_t
++\sum_{t=0}^{T-2}5N_{t+1}+N_{\mathrm{fan}},
+\]
+\[
+N_{\mathrm{node}} =
+(N_r+1)(N_\theta+1)+\sum_t L_t(N_t+1)
++\sum_{t=0}^{T-2}(2N_{t+1}+1)+1.
+\]
+The north half is the sole source of angular coordinates: nodes with
+\(k\le N/2\) are evaluated directly, the equator is assigned exactly
+\(Z=0\), and every southern node is written as the exact sign mirror
+\((R_k,Z_k)=(R_{N-k},-Z_{N-k})\). Belt centers use the corresponding
+interval mirror \(i'=N-1-i\); southern trigonometric coordinates or
+Chebyshev solves are never evaluated independently.
+
+**Multi-row transition belts（opt-in `polar_tier_belt_rows` ∈ {2,3},
+default 1 = the five-triangle construction above, bit-exact）** — each belt
+becomes a 2- or 3-row zipper block joining the 2:1 column ratio gradually.
+For a belt whose coarse side has \(M\) columns the ring column progression
+is \(2M \to 3M/2 \to M\)（rows=2, requires the validation `M mod 4 = 0`）or
+\(2M \to 5M/3 \to 4M/3 \to M\)（rows=3, `M mod 6 = 0`）. rows=3 rows use the
+mirror-safe maximin zipper words `QQFQQQ` / `QQFCFQ` / `FCFCFQ` per
+three-macrosector repeat（6→5→4→3 intervals; reversed words in reflected
+repeats; north-half evaluation + bitwise \(z\) mirror as above）, giving
+\(6M\) cells（\(3M\) quads + \(3M\) triangles）and \(4M+3\) owned nodes per
+belt. Intermediate ring radii sit at the midpoint（rows=2）or exact thirds
+（rows=3）of the belt span. **Tier-row absorption（2026-07-30）**: with
+rows>1 each belt absorbs one radial row from each adjacent tier that can
+donate（donor keeps ≥1 row; the innermost 1-row tier never donates）—
+`tier_radial_rows` decreases and the tier boundary radius moves by exactly
+one `tier_radial_spacing`, so the belt span grows from the legacy inter-tier
+gap to ≈ gap + 2Δr and the per-row height reaches tier-spacing scale.
+Motivation is measured, not aesthetic: at the legacy span the rows=3
+minimum altitude drops below the single-row sliver（0.081 vs 0.106 µm at
+288×192）and the converging-shock death time is unchanged — absolute
+altitude governs shock survival, so the span must widen.
+`polar_tier_belt_thickness_frac>0` is rejected together with rows>1（two
+conflicting span policies）. Topology counts change（`+M` cells, `+2M+2`
+owned nodes per rows=3 belt before absorption; absorption further shifts
+tier row counts）, so checkpoints do not carry across this opt-in setting.
+
+**Static polar dendrite（opt-in `polar_tier_dendrite_enabled`,
+2026-07-31）** — the angular analogue of the radial tier system, removing
+the θ-thin axis-adjacent degree of freedom that collapses at deep
+convergence（measured dose response: 3.75°-wide axis wedges die at
+t≈3.23×10⁻¹⁰ s regardless of tier/resolution; 7.5° survives）. Inside the
+polar cap of `W = 16` master cells（15°, mirrored at both poles）every
+ring's θ ladder is an explicit set of integer master labels
+（θ = label·π/192, north-half evaluation + the bitwise south mirror）:
+shell 16 cap intervals（native）, T1 8, the B1-fed intermediate ladder 4,
+T2 2, and T3/T4/T5 1（15° axis cells）. Two θ-transition rows carry the
+resolution changes: `S_theta`（occupying T1's first radial row, joining
+16→8）and `S_theta2`（T2's first row, 4→2）, built from the same
+Chebyshev five-triangle rosettes as the radial belts（TWO_TO_ONE joins）
+plus 1:1 quads（ONE_TO_ONE）; belts B1/B2 keep 2:1 rosettes throughout
+while B3/B4 switch to 1:1 quads inside the cap. Join descriptors are
+derived by comparing integer master labels per transition — any gap,
+overlap, fractional endpoint, or ratio above two is a ConfigError before
+allocation. Rosette centers are computed for the north half only and
+copied to the south with the exact sign mirror, so the construction-time
+bitwise mirror gate applies unchanged. The dendrite mesh is 13 blocks
+（shell, S_theta, T1, B1, S_theta2, T2, B2, T3, B3, T4, B4, T5, fan）
+with layout-derived counts asserted at build（69,338 cells / 69,371
+nodes at 288×192; measured t=0: min isoperimetric q = 0.217 at the
+S_theta2 cap rosette, above the 0.20 hard gate）. Like every unprotected
+five-triangle row, the new transition rows invert at first shock contact
+unless covered by the band-ALE belt bands（§3.3.7）, which consume the
+construction-exported ring tables on this topology. Construction gates
+check finite and positive geometry, closure, orientation, triangle and quad
+quality, belt altitude, nested radii, angular monotonicity, bitwise
+north/south mirroring, origin placement, boundary classification, bilateral
+interior adjacency, and global volume. They also require every tier ring to
+satisfy \(s\Delta\theta/h_r\ge0.5\) and the fan-triangle altitude to satisfy
+\(s_1\sin(\pi/N_{\mathrm{fan}})\ge0.9h_r\). Phase III-b permits hydro only when
+`polar_tier_hydro_enabled = true` and the mixed-cell AW-compatible
+pressure/subzonal/CSW force trio is selected.
+
 For `Mesh.topology_scheme="multiblock_cart_core_polar_shell"` with
 `Mesh.multiblock_transition_scheme="rounded_half_butterfly"`, the same
 three-block count, bridge \((\ell,k)\) indexing, cell-node CSR, reverse CSR,
@@ -3042,6 +3302,9 @@ triangle-degenerate cells use the exact P1 closed form \(w_k=(r_k+\Sigma r)/(4\S
 The legacy lump remains available as corner_mass_convention=bbsw_radial_v0 (and is the
 permanent resolution of frozen configs predating the knob); the multiblock exact-subpolygon
 ownership masses are a separate contract and are unchanged.
+The `BbswRadialV0` and `KinematicBasisRzV1` conventions apply to STRUCTURED topologies only;
+multiblock topologies use the canonical exact-subpolygon partition when subzonal pressure is
+enabled and the exact-subpolygon fallback when it is disabled, with no convention switch.
 
 For `topology_scheme="multiblock_cart_core_polar_shell"`, all S1 cells are
 four-corner quads but bridge/shell cells are not generally structured
@@ -3933,7 +4196,24 @@ Equivalently, an edge \(e=(a,b)\) with outward length-normal
 Thus an exact-axis corner has zero pressure-work weight while its momentum
 acceleration remains the planar limiting equation.  This is the BBSW
 planar-momentum/RZ-energy representation split.  The subzonal-pressure and
-edge-AV force/work pairs are unchanged.  The opt-in is default-off, and the
+edge-AV WORK terms use the same true-RZ measure: the subzonal work rate weights
+each corner contribution by \(2\pi r_{c,k}\),
+\[
+\dot E^{sub}_c=-\sum_k 2\pi r_{c,k}\,\mathbf{F}^{sub}_{c,k}\mathbin{\cdot}\mathbf{u}_k,
+\]
+and the edge-AV work pairing is
+\[
+\dot E^{av}_e=-\mathbf{F}^{av}_e\mathbin{\cdot}\left(2\pi r_a\mathbf{u}_a-2\pi r_b\mathbf{u}_b\right),
+\]
+so an axis-aligned edge (r_a=r_b=0) deposits exactly zero RZ work while its
+planar momentum force still acts. Momentum consumes the planar forces for all
+three terms. The discrete energy measure of the split is
+\(m^{RZ}_p=2\pi r_pM^A_p\). External drive traction enters momentum and the
+global boundary ledger only, never any cell-internal work sum.
+
+Exact-axis non-origin nodes are geometric markers of the AW representation: their true scheme mass and every energetic weight vanish (\(m^{RZ}_P=2\pi r_PM^A_P=0\)), so their axial velocity relative to the first off-axis neighbor is a zero-energy mode outside the regularity subspace of the planar momentum equation. Each such node \(P\) is therefore ENSLAVED to its unique same-shell first off-axis neighbor \(Q\) (CBSW axis treatment): \(u_{r,P}=0\), \(u_{z,P}=u_{z,Q}-\kappa_P u_{r,Q}\) with \(\kappa_P=(z_Q-z_P)/(r_Q-r_P)\), applied at every integration stage and re-applied after boundary application; after the coordinate update the axis is snapped (\(r_P=0\), \(z_P=z_Q-\kappa_P r_Q\)). The constraint is exactly transparent to spherical motion and inherits the piston stall from \(Q\). Forces, the drive endpoint split, the planar node mass, and the RZ work weights are unchanged; the raw pole residual becomes the constraint-reaction diagnostic.
+
+The opt-in is default-off, and the
 non-AW Svec-based compatible path remains bitwise unchanged.  The former
 AW--subzonal exclusivity was an implementation contract, not a mathematical
 restriction. Preservation of spherical symmetry under the composed force is
@@ -4512,6 +4792,258 @@ instead of 2*pi*r, which vanishes on-axis): the kinetic energy the axis-line
 viscosity removes is deposited as heat in the adjacent cells instead of
 being silently destroyed.
 
+#### 3.2.9d Native pentagon transition cells (statically condensed virtual fan; 2026-07-31)
+
+Opt-in (`Mesh.polar_tier_native_pentagon`, SPEC §6.4): every dendrite
+TWO_TO_ONE join is emitted as ONE five-vertex cell in the legacy rosette
+outer-perimeter winding; the Chebyshev center node ceases to exist. Corner
+storage stride widens to 8 for the whole configuration
+(`core::corner_stride_for_config`). Discretization contract (consultation
+2026-07-31, adopted after CC adjudication):
+
+- **Geometry** (`src/hydro/pentagon_geometry.cuh`): non-dynamical interior
+  point \(x_\star = 0.2[(x_0+x_4)+(x_1+x_3)+x_2]\) (fixed symmetric FP order
+  for north-south mirror determinism), edge midpoints \(m_k\), corner
+  subquads \(Q_k=[x_k, m_k, x_\star, m_{k-1}]\), exact RZ subvolumes
+  \(V^{sub}_{c,k}=\tfrac{\pi}{3}\sum (r_i+r_{i+1})(r_i z_{i+1}-r_{i+1}z_i)\),
+  virtual fan triangles \(T_k=(x_\star,x_k,x_{k+1})\). \(x_\star\) is an
+  algebraic function of the boundary vertices — no mass, velocity, or
+  equation of motion (the rosette center degree of freedom is removed at the
+  root). Quad subpolygon area/volume sums use mirror-invariant pairings so
+  reflected corner values are bitwise mirror-paired.
+- **AWS pressure corner force** (static condensation, planar layer): per fan
+  triangle the qualified 3-corner planar operator
+  `rz::aw_planar_triangle_corner_vectors` returns
+  \((S^{(k)}_\star, S^{(k)}_{k,L}, S^{(k)}_{k+1,R})\); assemble
+  \(\tilde S_k = S^{(k-1)}_{k,R}+S^{(k)}_{k,L}\),
+  \(S_\star=\sum_j S^{(j)}_\star\), condense
+  \(S_{c,k}=\tilde S_k+\tfrac15 S_\star\), close the roundoff residual at the
+  self-mirror corner \(k=2\) with the paired form
+  \(-((S_0+S_1)+(S_3+S_4))\), then apply the usual per-node \(2\pi r_n\)
+  RZ weighting. Exact for force balance and compatible work for every affine
+  velocity field (\(u(x_\star)=\sum\lambda_k u(x_k)\)); an always-on
+  \(128\varepsilon\) closure trap guards the stored vectors. AWS planar
+  nodal mass for \(n_v=5\) lumps \(\rho_c\,|A(Q_k)|\).
+- **Five-corner subzonal pressure** (`anti_hourglass.cu`,
+  `compatible_subzonal_pressure.cu`): corner masses initialize from exact
+  RZ subvolume fractions \(m_{c,k}=M_c V^{sub}_k/\sum_j V^{sub}_j\)
+  (mirror-invariant \(k=2\) residual closure) and are Lagrangian invariants;
+  per-step \(\rho^{sub}_k=m_{c,k}/V^{sub}_k(t)\); corner-EOS perturbations
+  get the volume-weighted common-mode projection
+  \(\delta p_k=\widehat{\delta p}_k-\sum_j w_j\widehat{\delta p}_j\),
+  \(w_j=V^{sub}_j/V_c\) (a uniform corner-pressure offset can produce no
+  shape force); median vectors
+  \(S^{med}_k=s_c\,\pi(r_\star+r_{m_k})(z_{m_k}-z_\star,\,-(r_{m_k}-r_\star))\);
+  cyclic telescoping force
+  \(\delta f_k=M_f[(\delta p_k+\delta p_{k+1})S^{med}_k-(\delta p_k+\delta p_{k-1})S^{med}_{k-1}]\)
+  with the established merit factor (§3.2.9b) — the direct \(n=5\)
+  extension of the quad/tri corner sets. The five subzone-volume signals
+  carry exactly the rank needed for the four non-affine pentagon modes,
+  verified by the rank-4 observability qualification
+  (tests/hydro/test_pentagon_affine_null.cpp: \(H_c=P_V B Z_c\) with
+  \(\chi=\sigma_{\min}/\sigma_{\max}\ge10^{-3}\) on healthy pentagons). The
+  affine-null damping operator
+  \(f^{AN}=-\kappa_{AN}(c_s/h_c)M u^{\perp}\)
+  (`pentagon_affine_null_{enabled,kappa}`, default on at
+  \(\kappa_{AN}=0.03\)) removes only the mass-weighted non-affine velocity
+  residual — exactly zero on affine fields, zero force/torque sums,
+  non-negative compatible heat — and joins the subzonal corner force before
+  a single combined mirror-invariant \(k=2\) closure (the \(\kappa=0\) path
+  is bit-identical to the pure telescoping force). The term is namelist-gated
+  and default-on; the `reale_v2` pilot configuration disables it through the
+  deck environment variable `TENRYU_SMOKE_ANOFF`. A cell whose mass-weighted
+  affine Gram is not positive-definite contributes zero affine-null damping
+  and increments the `an_degenerate_count` reported by the `[pentagon_an]`
+  telemetry line. Re-enabling the term on exact-core meshes (removing `ANOFF`
+  from the pilot environment) is a user-level physics decision.
+- **CSW98 edge AV**: the five active cyclic edges use the existing
+  coefficients; the limiter's opposite-face continuation is quad-only —
+  any other \(n_v\) takes the missing-neighbor \(r=1\) fallback (triangle
+  precedent; geometric continuation selection is a deferred refinement).
+- **Acoustic length** (Stage 5): pentagon cells use
+  \(h_c=\min(2A_c/P_c,\ \min_k 2A(T_k)/\ell_{\max}(T_k))\) in every
+  `cfl_length_2d` mode — never \(\sqrt A\) (a sliver of altitude
+  \(\varepsilon\) must yield \(h_c=O(\varepsilon)\), not
+  \(O(\sqrt\varepsilon)\)). Legacy cells keep their configured length.
+- **Staged fail-louds** (v1): AWS S-vector closure trap; subzonal corner
+  volume positivity; band-ALE respace on native-pentagon transitions is
+  rejected pending the swept-remap stage (fraction-transported corner
+  masses, GCL and bow-tie path-subdivision gates); restart requires an
+  exact v4 corner-stride match (pre-v4 and v1 checkpoints reject stride-8
+  configs).
+
+##### 3.2.9c-追補: RZ-congruent edge lift（`csw_rz_lift_enabled`; consult-5 §2.2 の edge 移植、台帳 A79; 2026-08-01）
+
+csw98 edge AV の従来形は、pair force \(F\)（平面測度、compression switch \(du\cdot S_{C2}<0\)）を対称配分（\(-F@n_0,\ +F@n_1\)）し、AW モードの内部仕事を true-RZ 対 \(w=-F\cdot\Delta(2\pi r\,\mathbf v)\) で測る。この混合測度対の二次形式 \(H=(KD+DK)/2\)（\(K\) = edge 差分行列、\(D=\mathrm{diag}(2\pi R_i)\)）は \(R_0\ne R_1\) で常に不定（\(\det H=-k^2(R_1-R_0)^2/4\)）であり、軸近傍で反散逸モード（\(\lambda_-\simeq-0.21kR\)）を持つ（consultation #5、CC 独立検算）。
+
+**lift（opt-in）**: \(\bar R_e=\tfrac12(R_0+R_1)\) とし、配分を
+\[
+n_0\ \mathrel{-}=\ \frac{\bar R_e}{R_0}F,\qquad n_1\ \mathrel{+}=\ \frac{\bar R_e}{R_1}F
+\]
+に置換、work 対を
+\[
+w=-2\pi\bar R_e\,F\cdot(\mathbf v_1-\mathbf v_0)
+\]
+に置換する。恒等的に (i) \(w\) は配分の true-RZ 仕事と厳密一致し圧縮で \(w\ge0\)、(ii) 純 \(\Delta v\) 形なので boost 不変、(iii) RZ 測度合力 \(\sum_i 2\pi R_iF_i=0\)。**軸障害**: \(R_i=0\) ノードは RZ 測度ゼロで \(-v_0\) 項を配分から生成できず、軸接触 edge の厳密散逸化は構造的に不可能 — guard（\(\bar R_e>g_R\min(R_0,R_1)\)、既定 \(g_R=4\)）内は従来対を温存する（残存欠陥、大きさ \(\sim0.21k\bar R_e\) は第 1 リング半径に比例して微小）。AV-CFL は v1 では不変（\(du_{\rm eff}\) 水準の拘束は lift の影響を受けない; 配分スケールは高々 \(g_R\)）。force producer（switch/大きさ/\(\psi\)）は不変 — 変更は配分と work 対のみ。検証は tests/hydro/test_csw_rz_lift.cu（T1 work 恒等式 5e-13・T2 boost・T3 RZ 合力・T4 従来対の負仕事 exhibit・T5 guard 経路）。
+
+#### 3.2.9e mimetic_tensor_v1: Campbell–Shashkov nonsymmetric mimetic tensor AV (consult-4 §7; 2026-08-01)
+
+`Numerics.hydro.av_model="mimetic_tensor_v1"`（opt-in）。CSW 系 edge AV を**置換**する（併用しない）。連続形は非対称 Campbell–Shashkov 形
+
+\[
+\mathbf f^{vis}=\nabla\cdot(\mu\nabla\mathbf u),\qquad \mu\ge 0,
+\]
+
+（対称化 \(D(u)\) 形ではない — 単純剪断での人工的モード変換を避ける）。離散化はセル局所の多角形 mimetic 剛性行列で、セル \(c\)（active 頂点 \(nv\in[3,8]\)、CSR 順）に対し
+
+\[
+K_c=\mu_c\left[\frac{\mathbf g_R\mathbf g_R^{T}+\mathbf g_Z\mathbf g_Z^{T}}{A_c}+P_c\right],\qquad
+\bar{\mathbf f}_{R}=-K_c\,\mathbf u_R,\ \ \bar{\mathbf f}_{Z}=-K_c\,\mathbf u_Z,
+\]
+
+- \(\mathbf g\): 平面 corner gradients（§3.2.9c の `csw98_planar_corner_gradients` と同一式・同一 winding orientation。tensor TU に逐語複製し、csw98 TU は bit-frozen のまま）。
+- \(A_c\): 平面 shoelace 面積、\(P_c=I-B(B^{T}B)^{-1}B^{T}\)（\(B=[1,\tilde R,\tilde Z]\)、centroid 中心・\(L_c\) スケール、固定順 3×3 LDLT。退化 pivot は \(P_c=0\) + 監査カウンタ `tensor_pc_degenerate`）。\(K_c\mathbf 1=0\)、対称 PSD、三角形では線形 FEM に退化、多角形（pentagon 含む）に分岐なしで適用。
+- 力は**平面測度の corner force** として `corner_force_q_{r,z}`（stride slots）に置き、既存 compatible corner 族と同じ AWS planar-momentum 規約で node へ集約（multiblock は node-mass と同一の reverse-CSR 固定順 walk、atomicAdd 不使用）。
+
+**センサと係数**（v1.1）:
+\[
+q_{c,e}=\max\!\left[0,\ -\frac{\Delta\mathbf u_e\cdot \mathbf S^{med,2D}_{c,e}}{|\mathbf S^{med,2D}_{c,e}|}\right],\quad
+\sigma_c=\max_{e:\,q>0}(1-\psi_e),\quad
+\Delta u_c=\max_e q_{c,e},
+\]
+\[
+a_c=C_2\frac{\gamma+1}{4}\Delta u_c,\qquad
+\mu_c^{raw}=\sigma_c\,\rho_c\,L_c\left[a_c+\sqrt{a_c^2+C_1^2c_{s,c}^2}\right],
+\]
+\(\psi_e\) は csw98 の endpoint-continuation limiter（構造格子は logical-line + axis-slave 反射）を逐語複製で評価（`csw_limiter_enabled=false` なら \(\psi=0\)）。\(C_1,C_2\) は専用 namelist `tensor_av_C1/C2`（既定 1.0、CSW 系の係数と分離）。\(L_c\) は運動量方向 extent（\(|\bar u|\) 微小時は \(\sqrt{A_c}\)）に **2-pass 決定論 Jacobi 平滑化**。**v1.1: \(\mu\) にも同一の 2-pass Jacobi 平滑化**を適用（K3.5 raw-μ → Jacobi×2 → force/CFL が平滑 μ を消費）。理由: セル局所の準二値 σ が shock 背後で μ を checkerboard 化し \(\nabla\mu\cdot\nabla u\) が偶奇モードを増幅する（台帳 A75、ALE 毎ステップ包絡で実測）。
+
+**エネルギー閉包**: セル仕事 \(W_c=-\sum_i \mathbf F_{c,i}\cdot(2\pi R_i)\mathbf u_i\)（AW RZ 対、edge-AV と同一規約）を `work_av_per_cell` に SIGNED で置き、predictor と corrector の両方で（corrector は time-centered 速度で）compatible work 経路が再計算する。**dt**: \(\Delta t_\mu=0.25\,\min_c \rho_cL_c^2/\mu_c\)（センサ〜平滑化 pipeline を純関数として再計算; 既存 AV-CFL スロットで報告）。
+
+**検証状態（2026-08-01, VERIFICATION §18 参照）**: 演算子ゲート 7/7 PASS（平行移動/剛体回転の消去、limiter-on affine で \(\mu\to0\)（丸めまで）、線形厳密性（内部組立力 \(\le10^{-12}\max|F|\)、実測 \(10^{-17}\) 級）、非線形 radial replay の per-ring θ-一様性 \(10^{-10}\)、AW energy pairing 恒等式 \(5\times10^{-13}\)、pentagon 包含 + \(K\mathbf 1=0\)）。**運用資格**: 純 Lagrangian 包絡では csw98 と parity〜+3%（bare polar_tier で死亡が極列から離脱）。**every-step ALE（euler-window axis-core）包絡では shock 背後の偶奇 ringing により早期崩壊が残存（v1.1 の μ 平滑化で緩和するが未根絶; A75/A76）— production 資格なし（production AV は csw_edge_csw98 のまま）**。
+
+#### 3.2.9f Delayed wake-only angular artificial heat flux (`wake_heat_flux_enabled`; consult-6 §3.2–3.12, 台帳 A88; 2026-08-02)
+
+極軸列の entropy 異常（§18 の生産 disk 壁の駆動因）は、entropy stage ledger の実測で
+**csw98 AV work の極前線発火**（per-mass 比 7→164×、consult-6 の grid-aligned front
+corrugation ループ）が堆積者と確定した。前線 AV の振幅調整は両方向とも反証済み
+（floor: 有害 / desens: col0 単調改善だが col1 逆単調）— 前線を触らず、**前線が
+通過した後の wake でのみ**角度方向に熱を混合して縞を平滑化するのが本機構。
+
+**(1) wake 履歴センサー。** 比 AV 加熱率 \(\dot e^{AV}_c=\max(P^{AV}_c,0)/m_c\)
+（\(P^{AV}\)=`work_av_per_cell`、corrector 時点の power）を radial 連結成分（＝角度列）
+内の max で正規化した activity \(a_c\) から
+\[ S^{AV}_c=\mathrm{clamp}\!\left(\frac{a_c-0.01}{0.09},0,1\right),\qquad
+   S^{kin}_c=\mathrm{clamp}\!\left(\frac{M_c-0.03}{0.07}\right)\cdot
+             \mathrm{clamp}\!\left(\frac{J_c-0.05}{0.15}\right),\qquad
+   S_c=\max(S^{AV}_c,S^{kin}_c), \]
+\(M_c\)=radial face 相対法線速度の圧縮 Mach（\(\max_f(-\Delta v_n)_+/(c_{s,c}+c_{s,d})\)）、
+\(J_c\)=radial face 圧力 jump の max。front hard mask は
+\(B_c=[a_c>0.01]\lor[M_c>0.05\land J_c>0.10]\)。
+
+**(2) 遅延 2 状態メモリ。** セル横断時間 \(t_{cross}=\Delta r_c/c_{s,c}\) に対し
+\[ \eta^{n+1}_c=\max\!\big(S_c,\ \eta^n_c e^{-\Delta t/3t_{cross}}\big),\qquad
+   \zeta^{n+1}_c=\mathrm{clamp}\!\big(\zeta^n_c e^{-\Delta t/3t_{cross}}
+     +(1-e^{-\Delta t/0.5t_{cross}})\,\eta^n_c,\ 0,1\big). \]
+\(\zeta\) は**旧** \(\eta^n\) から遅延供給される（前線通過から ~0.5–3 crossing 遅れて
+立ち上がり、wake でのみ >0）。gate は
+\[ G_c=W_{pole}(\theta_c)\ \zeta^n_c\,(1-S_c)^2(1-B_c) \]
+で、**現在前線にいるセルでは厳密に 0**（AV の発火自体には一切介入しない）。
+\(W_{pole}\) は極角 \(d=\min(\theta,\pi-\theta)\) の smoothstep
+（\(d\le\theta_a\) で 1、\(\theta_b\) で 0；`wake_heat_flux_global_theta=True` で
+\(W\equiv1\) — 第一 qualification 形態）。
+
+**(3) 角度方向 face の保存的伝導交換。** 角度方向 face（同一 block で radial 行
+index が等しい face、block 間で J± seam の face — 位相的判定・浮動小数点法線不使用）
+のみ対象に、RZ 厳密の
+\[ A_f=\pi(R_0+R_1)L_f,\quad
+   \kappa_f=C_E\,\rho_f\,c_{v,f}\,c_{s,f}\,\ell_f\,G_f,\quad
+   C_f^{raw}=A_f\kappa_f/d_f, \]
+\(\rho_f,c_{v,f}\)=調和平均、\(c_{s,f}=\min\)、\(G_f=\min(G_c,G_d)\)、
+\(\ell_f\)=セル厚 \(h=V/A_f\) の調和平均、\(d_f\)=法線方向重心距離。per-cell 拡散数
+\(\Lambda_c=\Delta t\sum_f C_f/(m_c c_{v,c})\) に対し \(s_c=\min(1,0.45/\Lambda_c)\)、
+face 適用は \(C_f=\min(s_c,s_d)C_f^{raw}\)（更新が凸結合に留まり新極値を生まない）。
+エネルギー更新は \(\Delta U_f=\Delta t\,C_f(T_d-T_c)\) の pairwise 反対称 gather
+（固定順 CSR・atomicAdd 不使用 — 決定論）で \(\sum U\) を厳密保存、運動量・KE 不変。
+2T では face 温度に熱容量重み平均、セル配分は圧力比（退化時は熱容量比）。適用後に
+EOS 再 closure と音速再計算を行う。
+
+**除外規則（§3.8）**: CENTRAL_CORE block・axis_survival_core disk plateau セル・
+hydro 非活性セル・dominant material 不一致 face・PLIC 界面セル face は \(C_f=0\)。
+v1 は \(\eta,\zeta\) を cell 付着とし remap 輸送しない（生産 disk 構成は殻 remap 恒等
+のため厳密 — `band_ale` / `restart_from` は ConfigError で拒否。§3.4 輸送は follow-up）。
+retry rollback は \(\eta,\zeta\) を step 開始値へ復元する。既定 OFF は確保・演算ゼロで
+既存経路バイト同一。
+
+
+#### 3.2.9g Polar-cohort limiter slaving (`csw_polar_slaving_enabled`; consult-7 P\*, 台帳 E13; 2026-08-02)
+
+極軸列 entropy 異常の全 remedy 実測（D1-D4・mirror・floor・desens・wake-flux =
+§3.2.9f）は、活性化の分解 \(a_{i,j}=\bar a_i+a'_{i,j}\) に対し**角度差動成分
+\(a'\) のみが壁を駆動する**ことを示した（D4 大域 limiter-off = \(a'\equiv0\) が
+唯一の治癒・振幅操作は両方向反証・堆積後輸送は hoop 測度で失権）。本機構は
+Quirk 型 grid-aligned front corrugation の治療として、前線での csw98
+endpoint-継続 limiter を極 cohort 内で角度コヒーレントに射影する。
+
+**Cohort**: POLAR_SHELL block の shock-normal edge instance（同一 radial 行の
+θ 隣接セル間 face の各セル側評価）を \((p,i,\mathrm{role})\)（極・行・
+toward/away-axis — pole-canonical で N/S 鏡映対称）で束ねる。core は
+pole-local 列 \(q<k_{core}\)（既定 4）、feather は \(q<k_{outer}\)（既定 6）。
+
+**前線 gate（limiter 非依存 — §9.6 の差動スイッチ再生成を回避）**:
+\[ \chi_{c,e}=\frac{[-\Delta\mathbf u_e\cdot\mathbf S_{c,e}]_+}{c_{s,e}\lVert\mathbf S_{c,e}\rVert},\qquad
+   G_{p,i,s}=\max_{q<k_{core}} g_F(\chi),\]
+\(g_F\) は \([\chi_0,\chi_1]=[0.08,0.20]\) の C¹ smoothstep。分子分母が同じ面積
+因子を含むため軸近傍でも有限（hoop 測度に依存しない）。
+
+**One-sided 射影**: strict 圧縮（\(\Delta u\cdot S<-10^{-12}c_s\|S\|\)）members
+\(\ge2\) のとき \(\psi^\*=\min_{\mathcal A}\psi^{raw}\)（signed zero は +0 正規化、
+非有限/域外 \(\psi\) は fatal）。各 instance で
+\[ a^{eff}_e=a^{raw}_e+\lambda_e\big[\max(a^{raw}_e,a^\*)-a^{raw}_e\big],\qquad
+   \lambda_e=\mathrm{strength}\cdot w_q\cdot G,\quad a=1-\psi \]
+（\(\lambda\in\{0,1\}\) は厳密分岐）。恒等式 \(0\le a^{raw}\le a^{eff}\le1\) — AV を
+**増やすのみ**で、raw が要求した粘性を決して減らさない。コヒーレント raw cohort
+（厳密球対称・一様圧縮・剛体回転）では \(a^{eff}=a^{raw}\) で厳密不活性 — CSW
+不変量を構成的に保存。Feather 重みは \(w_q=(1-\eta)^2(1+2\eta)\)、
+\(\eta=(q+\tfrac12-k_{core})/(k_{outer}-k_{core})\)。
+
+**消費（single-copy 規則）**: \(\psi^{eff}\) は force
+（\(f\propto\rho_e\mathcal V_e(1-\psi)\)）と **AV-CFL**
+（\(du_{eff}=|\Delta u|(1-\psi)\,\mathrm{proj}\)）の両方が同一 Pass-A 値から消費
+する — limiter の修正版コピーは一つ。work は修正後 force から従来機構で計算
+され compatible 対を保持（運動量: ±f 対で厳密相殺）。state・力方向・圧縮
+switch・\(\rho_e,c_{s,e},\mathcal V_e\)・subzonal は不変。
+
+**実装（決定論 3-pass）**: Pass A — 全 slaved instance で force caller と引数
+同一の limiter 評価 + \(\chi\)/strict-active（1 thread/instance）; Pass B —
+cohort 毎に固定 q 順 serial 縮約（atomicAdd なし）; Pass C — force/CFL の ON
+カーネルが lookup（face-adj CSR index → instance）で \(\psi^{eff}\) を消費、
+非対象 instance は inline 経路。**OFF は host 分岐で既存カーネルを原文のまま
+起動**（削除行は 3 launch サイトの置換のみ — device コード無変更で byte 同一）。
+
+**受理（consult-7 §8 — 壁遅延のみは不合格）**: s1 AV entropy 縞の根絶
+（\(\Sigma_{K,0}/\Sigma_{K,eq}\le3\)、\(\Sigma_{K,1}/\Sigma_{K,eq}\le5\)、feather
+移動禁止）・\(t_{end}=0.7\,\mathrm{ns}\) 生存・壁セル row 内側移動は棄却・極外
+L1 \(\le2\times10^{-3}\)・追加散逸 \(\le2\%\)・P0-DT frozen-timestep replay で
+dt 交絡を排除。
+
+**演算子剛性 AV-CFL 追補（consult-9 §3、E16a; 2026-08-02）**: P* の a_eff 引き上げは
+細長軸セルの陽的 AV 剛性を旧 edge 長 AV-CFL の bound 外へ押し出し、period-2Δt の
+体積呼吸過安定を生む（実測行列: slaving ON+生産 dt でのみ発症・dt/2 で消滅・
+縞根絶は維持）。`csw_polar_slaving_av_stiffness_cfl_enabled` は engaged cohort の
+force と同一凍結量から質量スケール接線剛性 \(\Lambda=\max_n 2\sum_e\kappa_e/M_n\)
+（\(\kappa_e\)=canonical 向き合算 2×2 tangent の spectral norm・\(M_n\)=
+`node_planar_mass`）を評価し \(\Delta t\le\sigma_{nf}/\Lambda\)（σ=0.8, η_nf=1）を
+dt 集約へ加える — 力・仕事・P* 本体は不変の純 dt 拘束。
+
+**P1 block 一般化（2026-08-02）**: 殻縞根絶後、収束前線が未 slaved の内側 tier
+ring（block1 55×192）の極列を同機構で圧潰させる migration を実測（col0 3.2×/
+col1 1.7× の縞を snapshot で確認）。cohort 構築を「`n_j >=
+csw_polar_slaving_min_columns`（既定 96）の POLAR_SHELL/POLAR_TIER 構造化
+quad block 全て」に一般化（pole-local q・row・role は各 block 固有の n_j で定
+義。既定トポロジで blocks {0,1,3} = 1392 cohorts。TRANSITION_BELT と粗環は
+除外 — 粗 Δθ での広角 slaving は §3.1 P(a) の禁止形に接近するため）。
+
+
 #### 3.2.10 エネルギー方程式（保存形）
 
 セル質量 \(\Delta M_c\) に対するエネルギー保存：
@@ -4536,7 +5068,7 @@ being silently destroyed.
 - PdV仕事（電子圧力 \(P_{e,c}\) のみ）
 - 熱伝導（§4参照）
 - レーザー吸収（\(S_L\)）
-- 輻射との交換（\(S_r\)、IMC/DDMCの沈着として計上）
+- 輻射との交換（\(S_r\)、FLD・\(S_N\) の物質 Newton が直接更新する。§6.7・§6.8）
 - e-i緩和（符号反転）
 
 e-i緩和の時間離散化は §3.1.5 の有限\(\Delta t\)解析更新
@@ -4919,6 +5451,11 @@ V_{RZ}(\mathbf{x})={\pi\over3}\sum_{k=0}^{3}
 \qquad k+1\equiv0\pmod4,
 \]
 using the same full cgs volume convention as `Mesh::recompute_geometry`.
+For a multiblock cell, the same sum runs over the active cyclic CSR vertices
+\(k=0,\ldots,\texttt{cell\_nverts}[c]-1\), with wrap modulo the active vertex
+count and multiplication by `cell_orientation_sign[c]`.  The fixed storage
+capacity is eight vertices; the structured quadrilateral branch remains
+unchanged.
 The expression is shoelace-family and flips sign with the node winding, so
 TENRYU multiplies it by the sign of the quad's planar signed area
 (2026-07-26): the orientation is evaluated once from \(\mathbf{x}^n\) and
@@ -5045,12 +5582,10 @@ otherwise the driver keeps strict halving.  The retry loop is bounded by
 a fatal error that reports the step, time, final attempted timestep, first
 failing cell/corner, minimum metric, and failure reason.
 
-The snapshot covers all deterministic `State` fields needed by FLD, SN, HOLO,
+The snapshot covers all deterministic `State` fields needed by FLD, SN,
 hydro, conduction, laser deposition, cumulative energy scalars, ALE/adaptive-AV
-state, and per-step radiation diagnostics.  It intentionally excludes the IMC
-particle pool and IMC class-owned mutable counters.  Therefore driver retry is
-fatal-disabled at driver entry when `radiation.mode == ImcDdmc`; the supported scope is
-deterministic FLD/SN modes.
+state, and per-step radiation diagnostics.  (It never covered the Monte Carlo radiation's particle pool, and driver
+retry was fatal-disabled for `radiation.mode == ImcDdmc`; that mode and its code left the build on 2026-09-29.)
 
 When `driver_full_step_retry_enabled=False`, which is the default, Hydro2D keeps
 the existing diagnostic-only behavior and does not return early.  This preserves
@@ -5322,6 +5857,21 @@ the observer enumerates cells through CSR cell-node connectivity and applies
 `cell_orientation_sign` to the raw RZ volume before classifying negative
 committed volume, so central and fan/shell windings use the same physical
 positive-volume convention.
+
+On general-polygonal committed meshes (`corner_stride != 4`), the same
+observer walks the CSR cell-node table with per-cell active vertex counts
+\(n_c \in [3,16]\). Corner Jacobians are the polygon corner cross products
+\(J_{c,k} = (\mathbf{x}_{c,k+1}-\mathbf{x}_{c,k}) \times
+(\mathbf{x}_{c,k-1}-\mathbf{x}_{c,k})\) (indices mod \(n_c\)) and the cell
+volume is the exact revolved RZ polygon volume
+\(\frac{\pi}{3}\sum_k (r_k z_{k+1} - r_{k+1} z_k)(r_k + r_{k+1})\), both
+multiplied by the cell orientation sign — identical formulas to the
+candidate-mesh admissibility gate, so the diagnostic and the gate cannot drift
+apart. Ratios are current committed mesh vs the reference mesh installed at
+the last accepted ReALE commit (the `x_*_initial` snapshot, re-anchored at
+every commit). The edge-length ratio uses the minimum polygon edge length.
+Gauss-point, altitude, and condition-number diagnostics are quad-only and are
+not observed on such decks.
 
 When `mesh_quality_dt_cfl_enabled=True`, the older endpoint-only
 `trial_volume_cfl_enabled` corrector diagnostic is bypassed.  The mesh-quality
@@ -6816,6 +7366,8 @@ remain open).
 
 ### 3.3 ALE Rezone/Remap（2D RZ）
 
+> **削除済み（2026-08-03）**：旧 `axis_core_transaction_mode="follow_repair"` と専用品質閾値は廃止された。`axis_core_transaction_mode="always_moving"` は保持される。
+
 #### 3.3.1 ALEサイクル
 
 ALE（Arbitrary Lagrangian–Eulerian）はLagrangian計算のメッシュ歪みを緩和する。
@@ -6984,6 +7536,99 @@ trial whose up-to-four incident cells satisfy:
 4-Gauss \(J>\max(\texttt{rezone\_local\_j\_floor\_rel}J_{max,eff},kJFloor)\),
 positive corner-J, positive signed R-Z quad volume, and nonnegative non-axis
 radii.  Only if all local trials reject does that node keep its old position.
+
+**Opt-in M1 TMOP objective solver (2026-07-28):**
+`Numerics.ale.rezone_solver="m1_tmop"` selects the M1 damped
+Gauss--Newton sweep over the objective
+\[
+\mathcal J(\mathbf x)=
+\frac{\sum_{c,q}\omega_{cq}\det(W_{cq})\,
+      \mu(A_{cq}W_{cq}^{-1};\gamma_{\rm align})}
+     {\sum_{c,q}\omega_{cq}\det(W_{cq})}
++\frac{\lambda_{\rm tether}}{N_v}
+ \sum_i\frac{\|\mathbf x_i-\mathbf x_i^L\|^2}{h_i^2}
++\frac{w_\theta}{N_v}
+ \sum_{i\in\mathcal R}
+ \left(\frac{d_{iL}-d_{iR}}{d_{iL}+d_{iR}}\right)^2
++\beta\sum_{c,q}
+ \left[\det(A_{cq})<\sigma_b\det(W_{cq})\right]
+ \log\!\left(
+  \frac{\sigma_b\det(W_{cq})}{\det(A_{cq})}\right).
+\]
+Here \(W_{cq}\) is frozen from `x_r_reference,x_z_reference` for the
+attempt, \(\mathbf x^L\) is the current pre-solve position, and \(h_i\) is
+the RMS of the unique incident reference-edge lengths.  The barrier is an
+*activation-window* penalty (2026-07-28 revision): it contributes only when
+\(\det(A_{cq})\) falls below the fraction
+\(\sigma_b=\texttt{kBarrierActivationFraction}=0.1\) of the reference
+\(\det(W_{cq})\), is exactly zero otherwise (C0 at the threshold), and its
+analytic gradient is gated by the same condition.  The original always-active
+form \(-\beta\sum\log(\det A/J^{\min})\) contributed a constant
+\(\approx-27.6\beta\) per healthy quadrature point (obscuring \(\mathcal J\))
+and injected a global det-equalization gradient with no Gauss--Newton
+curvature counterpart, which inflated proposed node steps by \(O(10^2)\) and
+made every backtracking line search fail.  The hard-invalid rejection at
+\(\det(A_{cq})<J^{\min}_{cq}=10^{-12}\det(W_{cq})\) is unchanged.  Proposed
+node steps are additionally clamped to \(0.25\,h_{\rm inc}\), where
+\(h_{\rm inc}\) is the minimum current-coordinate distance from the node to
+its adjacent vertices in any incident cell, before a backtracking loop of at
+most 12 halvings.  The distances
+\(d_{iL}=\|\mathbf x_i-\mathbf x_{L(i)}\|\) and
+\(d_{iR}=\|\mathbf x_{R(i)}-\mathbf x_i\|\) use the current coordinates.
+For a node-local update, the theta contribution contains all centered terms
+touching that node: its own term when present and the two terms in which it is
+a left or right neighbor.  The analytic derivatives of those three possible
+terms are included in the local gradient and Gauss--Newton Hessian; the global
+theta sum is normalized by \(N_v\).
+
+M1 v1 is QUAD-only at runtime.  Ring centers are constructed only for
+polar-family logical rows: all single-block
+`spherical_polar_halfplane` rows, and each `POLAR_SHELL` block row of a
+multiblock mesh.  A centered term is created only for nodes with both
+within-row neighbors; row endpoints are excluded and no pair crosses a block
+seam.  **Pentagon-belt M1 is production-admitted since 2026-07-29 (ALE P4)**:
+the remap contract lift generalized the M1 dispatcher, the candidate/path
+admissibility oracles, the CSR scalar remap, and the vol-closure/min-quality
+diagnostics to fixed-width stride-{4,8} CSR with `cell_nverts` in [3,8];
+Option-B corner-velocity machinery and the PR4 corner-mass audit remain
+quad-gated (bypassed on stride 8).  Configuration admits belt runtime ALE
+only for `rezone_solver="m1_tmop"` with `conservative_remap_enabled=true`
+(other modes stay staged).  Candidate evaluation must receive the real
+`cell_nverts` array — stride-8 padding slots are not −1, so occupied-slot
+counting misreads quads as octagons. The older generic candidate evaluator's
+near-zero polygon-corner fast path is not the G1 path-safety authority:
+consult-25 reference-flat classification, one-sided orientation, equality
+ordering, and continuous embedding checks above govern typed path-guard and
+max-min-repair acceptance without a relative threshold. Configuration
+validation rejects `m1_tmop` for `rectangular_rz` and `cone_shell` logical
+meshes.
+
+**M1 venue constraint (2026-07-28):** the production M1 path is the
+*multiblock* CSR ALE orchestrator (stride-4 quad meshes): on acceptance the
+rezoned coordinates re-anchor the moving reference and the conservative remap
+transfers the Lagrangian state onto the rezoned mesh (demonstrated on the
+5-block implosion characterization deck, `TENRYU_IMPLO_REZONE_MODE=m1`:
+Lagrangian control dies by edge-AV/axis-margin dt collapse at
+\(t\approx5.0\,\mathrm{ns}\) under a \(10^{10}\,\mathrm{dyn/cm^2}\) drive,
+while the M1 arm completes the \(20\,\mathrm{ns}\) window with ~77% of
+per-step transactions accepted).  Single-block meshes do **not** reach M1
+dynamically: with `conservative_remap_enabled=true` the single-block hydro
+runs the fixed-grid advection form (mesh coordinates never move, no rezone
+dispatch); with it false, the single-block ALE flow is reference-relaxation
+only (the solver output re-anchors `x_r_reference` and never alters the
+physical mesh).  Candidate-mesh admissibility for *annular* polar meshes
+engages the polar-canonical orientation mode of the `Mesh&`-overload quality
+evaluator whenever the mesh is polar-family with complete per-cell `nverts`
+metadata (previously TriFan/Button only; raw mode's absolute positivity check
+rejected every CW-wound cell, vetoing all M1 candidates on annular decks).
+
+One transaction runs exactly `m1_sweeps` sweeps inside `RollbackGuard`.
+The candidate commits only if \(\mathcal J_{\rm after}<
+\mathcal J_{\rm before}\) and the existing reference-relative
+candidate-mesh admissibility oracle passes.  Otherwise the pre-attempt state
+is restored.  Accepted and rejected attempts increment `m1_accepted` and
+`m1_rejected`, respectively, and log both objective values and the number of
+moved nodes.
 
 **Corner-cell aspect protection (2026-05-16):**  The R-Z Winslow kernels apply
 a default-on geometric constraint at annular state-supply z-face corners:
@@ -7595,8 +8240,57 @@ MS2 moment remap applies the same `FixedSign` choice to swept-volume moments,
 and the managed axis-band remap uses the same fixed source sign rather than a
 separate negated polygon convention.
 
-`swept_volume_sign_fixed` is corrected-only since epoch 2 (2026-08-05); the
-legacy convention and its runtime branch have been removed.
+`swept_volume_sign_fixed` is corrected-only since checkpoint epoch 2
+(2026-08-05): the legacy pre-2026-05-11 convention and its runtime branch have
+been removed, the namelist rejects `swept_volume_sign_fixed=false`, and a
+restart from a checkpoint without `metadata/ale_swept_sign_epoch=2` fails
+before state restoration unless the forensic restart mode
+(`TENRYU_I1B_RESTART_FORENSIC=1`) is explicitly enabled.  The field had been
+`true` by default since 2026-07-27.  The 2026-08-17 ruling that shelved this
+removal until the next checkpoint-epoch bump was recorded against
+documentation that predated the epoch-2 removal; the removal is in effect.
+Consequently the `Numerics.profile.legacy_regression@2026-07-27` profile,
+whose validation still requires `swept_volume_sign_fixed=false`, can no longer
+be enabled.  The gcl-audit manifest still logs the configured and active
+convention per run.
+
+**One-pass positivity limiter and the free-stream trade-off (2026-07-29;
+epoch-2 update 2026-08-05):** the CSR hydro remap always runs a
+mass-positivity limiter (its allocation became unconditional with epoch 2):
+per cell, gross outgoing donor mass
+\(\sum_f \rho_d |\Delta V_f|\) is accumulated (`outgoing_mass`), and every flux
+leaving that cell is scaled by
+\(s=\min\!\big(1,\,(m-\rho_{\rm floor}V^{new})/\text{outgoing}\big)\)
+(`mass_flux_scale[losing_cell]`), with no inflow credit (Zalesak
+\(R^-\)-style).  Consequences: (a) conservation is exact (each face's paired
+\(\pm\) fluxes share one \(s\)); (b) whenever the limiter engages
+(\(s<1\)), a uniform free stream is **not** preserved exactly — the volumes
+change fully while the mass flux is truncated, deviating \(\rho\) by
+\(O(1-s)\) in through-flow cells.  Measured driver: on 5-block meshes the
+remap's internally built target adjusts seam-corner nodes by a fixed
+\(\sim2\times10^{-4}\,\mathrm{cm}\) per invocation independent of the flow, so
+gross outgoing can exceed the cell mass on the first remap
+(\(1-s\approx5\%\), \(\rho\) deviation \(\approx7\%\)).  With the legacy
+branch removed no exactly free-stream path remains: the free-stream unit case
+(`tests/hydro/test_axis_rezone_free_stream.cu`) now pins exact conservation
+closure (about \(10^{-15}\) measured) and a field deviation below 0.15
+(0.0724 measured on 2026-08-16), and the companion `[limiter]` case pins
+positivity, conservation, and the same deviation bound.  The pre-epoch-2
+exactness contract (\(5\times10^{-12}\) on the removed branch) no longer
+exists.  Planned reconciliation (2D-arc owned): subcycle the remap into \(N\)
+legs whenever the limiter would engage, so per-leg gross outgoing stays below
+available mass and free-stream exactness is recovered together with
+positivity.
+
+**Structured-template consistency note (2026-07-29):** the structured
+(non-CSR) remap helpers (`flux_r_face_t`/`flux_z_face_t`,
+`compute_intermediate_volume_kernel_t`) normalize the templated `FixedSign`
+swept-volume primitive back to the legacy convention at each consumer entry:
+the `FixedSign=true` instantiation had flipped only the primitive sign while
+donor selection, face offset, flux accumulation, and the intermediate-volume
+update kept legacy-convention formulas, which silently changed physics.  Both
+instantiations are now bit-identical by construction; the knob's physical
+meaning on the structured path is carried by the I/O contract only.
 
 3. **勾配推定とスロープリミッタ**：
    供給セル \(d\) における保存量密度の勾配を Van Leer リミッタで制限する：
@@ -7721,9 +8415,12 @@ boundary volume removes live cell-mean momentum proportionally to corner mass,
 while positive boundary volume adds mass with the same cell-mean velocity and
 target first-moment corner weights.  This is light Stage 4b coverage; full
 boundary smoke coverage is deferred to the production wiring stages.  The
-component then adds any \(\rho_{floor}V^R\) mass deficit as zero-momentum
-corner mass, applies the affine-orthogonal Option B hourglass filter per cell,
-and scatters to separate nodal output buffers with reverse CSR:
+hourglass filter's velocity bound is the cell's own corner velocity range (v1
+ratified contract, 2026-08-17 — the more-limiting, monotone-safe bound;
+expanded donor-stencil bounds remain a recorded refinement behind a future
+adjudication).  The component then adds any \(\rho_{floor}V^R\) mass deficit as
+zero-momentum corner mass, applies the affine-orthogonal Option B hourglass
+filter per cell, and scatters to separate nodal output buffers with reverse CSR:
 \[
 \tilde{\mathbf{u}}_i^R =
 A_i\frac{\sum_{(c,a)\in\mathcal{N}^{-1}(i)}\mathbf{p}_{c,a}}
@@ -8862,6 +9559,12 @@ degeneracy near the axis. It is disabled by default via
 it until the follow-on empirical probes establish cost and remap-limiter
 behavior.
 
+The barrier's candidate-vs-baseline per-corner area metric keeps the legacy
+bbsw-radial basis on both sides by ratified contract (2026-08-17): the basis
+cancels in the comparison, and re-basing would move recorded rollback audit
+values. It is deliberately not wired to `corner_mass_convention` (same
+frozen shelf as the P-C force-based-CFL node mass).
+
 Engagement is trigger based. When enabled, the driver evaluates an axis-margin
 predicate over axis-adjacent cells and a corner-J ratio predicate. The default
 triggers fire when `sin(theta)` near the axis drops below
@@ -9751,7 +10454,6 @@ not a blend toward the uniform reference grid, which is invalid on graded
 meshes. The solve is a minimal correction onto the corner-J-feasible set,
 and a base that is already feasible after the internal axis-spacing repair
 is returned unchanged.
-
 **Axis-edge-collapse topology transaction (opt-in).** When the on-axis edge
 of an active cell directly above an engaged evacuated-contact slot closes
 irreversibly under a measured velocity vice, reducing dt cannot carry the
@@ -9798,7 +10500,6 @@ finite. The transaction, enabled by
   written to checkpoints as optional datasets and restored (with the device
   mirrors rebuilt) on restart; the monitor's sampling window intentionally
   re-arms after restart.
-
 **Cut P1–P0 mortar contact element (rate form).** The evacuated-contact
 face constraint resolves the partially contacting face per quadrature point
 instead of through one aggregated mean row: three Gauss points over the
@@ -10324,6 +11025,16 @@ condition logic:
 \frac{\sum_{c\in\mathcal{N}(v)}m_{cv}^{*}\mathbf{u}_c^*}
      {\sum_{c\in\mathcal{N}(v)}m_{cv}^{*}} .
 \]
+
+The current-mesh corner masses \(m_{cv}^{*}\) used here are (re)built from
+the committed post-remap geometry — a geometric re-partition, not a
+conservative subzonal mass remap. When the subzonal Lagrangian-invariant
+key is on, this overwrites the init-frozen invariant cache; the driver
+warns once per run (`warn_invariant_corner_mass_ke_reinit_once`).
+Conservative subzonal mass remap/flux ("Stage F", shared with the HLLC
+z-flux sibling warning) remains the recorded upgrade path; the current
+behavior is a ratified documented exception (ruling 2026-08-17 — the
+closure is opt-in and default False, so no production profile reaches it).
 
 The actual post-projection per-cell nodal kinetic energy is then
 \[
@@ -11358,11 +12069,20 @@ The final-kick impulse stored for the pseudo-core boundary is
 Its compatible internal-energy increment is evaluated only after the final
 nodal velocity is available:
 \[
-\Delta U_C=-\sum_{k\in\partial C}\mathbf{I}_{C,k}\cdot
+\Delta U_C=-\sum_{k\in\partial C}\alpha_k\mathbf{I}_{C,k}\cdot
 \mathbf{u}_{n_k}^{\sharp},\qquad
 \mathbf{u}_{n_k}^{\sharp}={1\over2}
 (\mathbf{u}_{n_k}^{n}+\mathbf{u}_{n_k}^{n+1}).
 \]
+For `rz_momentum_scheme="volume_weighted"`, \(\alpha_k=1\).  For
+`"area_weighted_symmetric"`, the accelerator divides the planar impulse
+\(\mathbf I^A_{C,k}\) by the planar nodal mass \(M^A_k\), whereas global nodal
+kinetic energy uses the true RZ mass \(M^{RZ}_k\); consequently
+\(\alpha_k=M^{RZ}_k/M^A_k\).  This is the same conjugate factor as the drive
+ledger and makes \(-\Delta U_C\) equal the macro impulse's contribution to the
+actual global nodal-KE change.  Both pooled and stratified-core1d modes book
+this conjugate impulse work into \(U_C\); the stratified path does not replace
+it with a separate \(-\Pi\Delta V\) estimate.
 This is the kinetic-energy-conjugate identity for
 \(|\mathbf{u}^{n+1}|^2-|\mathbf{u}^{n}|^2\); using
 \(\mathbf{u}^n\), \(\mathbf{u}^{n+1}\), or a predictor velocity is not
@@ -11424,6 +12144,9 @@ failed.
 - **r=0軸**：\(r=0\) を維持（軸対称の幾何的要件）
 
 #### 3.3.6 輻射粒子との相互作用
+
+> 退役した方式の記録（光子粒子。コードは 2026-09-29 にビルドから外し `retired/radiation_monte_carlo/` に保管）。
+> FLD・\(S_N\) は rezone の後に `holo_ale_invalidated` を見て格子に依存するキャッシュを作り直す。
 
 rezone後、**IMC粒子のみ**の `cellId` を更新する必要がある（U7: `cell_search_after_rezone`）。
 DDMC粒子は pos=NaN sentinel のため空間探索不可であり、cell_id をそのまま維持する
@@ -11860,6 +12583,427 @@ conservation across the transaction while the per-event deposit is logged.
 Each attempted band transaction also emits one `[band-ale-ledger]` line with
 the band name, step and time, applied flag, accepted sigma, remap mass-closure
 residual, and injected energy floor.
+
+#### 3.3.8 Persistent origin-centered spherical Eulerian core (axis_survival_core; 2026-07-31/08-01)
+
+The third prescribed-target consumer (`euler_window.role="axis_survival_core"`,
+SPEC §6.4) holds an origin-centered spherical disk of the mesh at its
+CONSTRUCTION coordinates for the whole run — the kinematic-description
+change that survives the focal bulk convergence no force/damping operator
+touches (measured: affine-null, pole-tangential and axis-line AV all inert).
+
+- **Structural-unit mask**: the plateau is snapped OUTWARD to complete
+  radial structural units (center-fan rings, tier rows, native-pentagon
+  transition rows are never split); the C1 feather extends unit-by-unit
+  until it spans ≥`feather_min_layers` complete layers, ≥`transition_width`,
+  and every feather mesh edge satisfies \(|\chi_a-\chi_b|\le 0.5\); one
+  guard layer is reserved for band suppression. Hole-free/axis-to-axis/
+  complete-pentagon-row fail-louds run at construction, with one-time
+  mask/χ hash logging.
+- **Static capture**: per-node weights
+  \(\chi=(1-\xi)^2(1+2\xi)\), \(\xi=(s_n^0-s_p)/(s_f-s_p)\) (the factored
+  smoothstep — the raw polynomial cancels to \(-\varepsilon\) at
+  \(\xi\to1\)) and targets \(X^E\) are computed ONCE from
+  `x_r_initial/x_z_initial` (construction geometry; not serialized, hence
+  restart-invariant — the restart continuation gate reproduces the
+  uninterrupted terminal state exactly), north-computed and copied south via
+  the construction-exported mirror node map.
+- **Mandatory per-step transaction**: after the Lagrangian position update
+  the target \(X^{EW}=X^L+\chi\,(X^E-X^L)\) passes the standard candidate
+  admissibility and conservative CSR remap AHEAD of all other ALE
+  operators, all-or-nothing (\(\lambda_{EW}=1\)): a rejected transaction
+  restores the step snapshot and retries with reduced \(\Delta t\) (fatal
+  diagnostics on retry exhaustion — first failing cell, min V, min J, max
+  target displacement); a committed transaction is followed by a bitwise
+  plateau-at-target assert. There is no silent Lagrangian fallback and no
+  finite `t_off` (timed release re-exposes the wall, measured).
+- **Rank-2 prescribed clearance replay (`axis_core_transaction_mode=
+  "clearance_replay"`)**: this active mode leaves the static target above
+  unchanged and replaces only the dispatched target. At run start it reads
+  raw TSV rows `step\tt_j\ts_f_j\tU_f_j`, hashes the raw bytes with
+  FNV-1a-64, requires strictly increasing `t_j` and monotone non-increasing
+  `s_f_j`, constructs monotonicity-preserving PCHIP slopes for `s_f(t)`, and
+  uses positive-clamped linear interpolation for `U_f(t)`. The guard is
+  frozen from the construction geometry as
+  `g_guard = W0 + h95_RPLUS_initial`. At each hydro step,
+
+  \[
+  \tau_{\rm hit}=\frac{s_f(t^n)-R_{\rm acc}^n-g_{\rm guard}}{U_f(t^n)},
+  \qquad
+  R_{\rm cmd}^{n+1}=R_{\rm acc}^{n}
+  -\beta\Phi(t^{n+1/2})U_f(t^{n+1/2})\Delta t_n,
+  \]
+
+  where `tau_hit <= tau_lead` arms STATIC→SPLICING and the quintic
+  `Phi = 10 q^3 - 15 q^4 + 6 q^5`, with
+  `q = clamp((t - t_arm)/tau_splice, 0, 1)`, advances
+  SPLICING→TRACKING. The command always starts from the last accepted fitted
+  radius, so admissibility clipping cannot wind up the controller.
+  For each node, construction data `s_i0 = |x_i0|` and
+  `e_i0 = x_i0/s_i0` are frozen once. The fixed feather is one inside `R0`,
+  is `1 - S5((s_i0 - R0)/W0)` for `R0 < s_i0 < R0 + W0`, and is zero
+  outside.
+  The raw post-Lagrange displacement is
+
+  \[
+  \Delta\mathbf{x}_i^{\rm raw}=\omega_i
+  \left(\frac{R_{\rm cmd}}{R_0}s_i^0
+        -\mathbf{x}_i^L\!\cdot\widehat{\mathbf e}_i^0\right)
+  \widehat{\mathbf e}_i^0.
+  \]
+
+  Thus only the initial radial projection is controlled; tangential
+  post-Lagrange drift is retained. The origin target is exactly the origin,
+  and an initial axis director is axial, so the downstream axis constraint
+  continues to preserve `r=0`. The replay controlled-node set is the
+  geometric set `s_i0 <= R0 + W0`; the pre-existing snapped structural
+  plateau/extended feather/guard sets remain authoritative for band
+  suppression and other window consumers but do not enlarge this active
+  target.
+  The existing orientation-aware eight-bisection admissibility backtrack
+  chooses `sigma` in `[0,1]`, after which the existing prescribed-target
+  conservative transaction is unchanged. From accepted coordinates over the
+  controlled nodes, with `w_i = s_i0^2`,
+
+  \[
+  a_{\rm acc}=\frac{\sum_i w_i s_i^0
+    (\mathbf{x}_i^R\!\cdot\widehat{\mathbf e}_i^0)}
+    {\sum_i w_i(s_i^0)^2},\quad
+  R_{\rm acc}=R_0a_{\rm acc},\quad
+  \beta_{\rm eff}=\frac{R_{\rm acc}^n-R_{\rm acc}^{n+1}}
+    {U_f(t^{n+1/2})\Delta t_n}.
+  \]
+
+  After splice completion, predicted clearance below `g_guard`
+  aborts `CLEARANCE_LOST`; more than 20 consecutive steps with
+  `beta_eff < 0.8` aborts `ADMISSIBILITY_CANNOT_TRACK_FRONT`; the
+  RPLUS late alarm while STATIC aborts `MISSED_PREDICTIVE_TRIGGER`. No value is
+  extrapolated beyond the final table time: `REPLAY_SUPPORT_EXHAUSTED` is
+  logged once, `R_cmd` is held, and support-dependent fail gates stop
+  evaluating while the natural run termination remains available.
+- **Belt Capture-and-Ride (BCR) predictive belt protection (experimental,
+  2026-08-05)**: this opt-in path protects the belt pentagons before their
+  vertex Jacobians become non-positive. It is separate from the prescribed
+  clearance-replay target above and currently consists of the following
+  implementation.
+
+  **Topology sets.** With `TENRYU_I1B_BCR_SETS=1`, \(B_0\) is the set of
+  five-vertex cells whose construction-geometry centroid radius satisfies
+  \(R_{\rm out}<r_c<3\times10^{-3}\,\mathrm{cm}\). \(B_\star\) is the closed
+  nodal star of \(B_0\), and \(B_g\) is the next nodal guard ring outside
+  \(B_\star\). Two more nodal cell expansions form the feather rings \(B_f\).
+  Nodes in \(B_\star\cup B_g\) have \(\omega=1\); a node first reached at
+  feather distance \(d=1,2\) has
+
+  \[
+  \omega(d)=1-S_5(d/3),\qquad
+  S_5(q)=10q^3-15q^4+6q^5,
+  \]
+
+  and all other nodes have \(\omega=0\). A feather cell is an offender if it
+  is not a quadrilateral or shares any node with a pentagon. If offenders are
+  found, the first feather ring is absorbed into \(B_g\) and both feather
+  rings are rebuilt once; any remaining violation produces a loud diagnostic.
+  Thus the intended constraint is that feathering never passes through a
+  pentagon.
+
+  **Vertex-J predictor.** With `TENRYU_I1B_BCR_PREDICTOR=1` (which requires
+  the topology sets), every corner \(k\) of \(B_\star\cup B_g\) is monitored
+  using
+
+  \[
+  J_k=\left(\mathbf{x}_{k+1}-\mathbf{x}_k\right)\mathbin{\times}
+      \left(\mathbf{x}_{k-1}-\mathbf{x}_k\right).
+  \]
+
+  Starting at `TENRYU_I1B_ADOT_FROM` (default step 1700), frozen nodal
+  velocities predict the same quantity at
+  \(\mathbf{x}^{n}+m\,\Delta t\,\mathbf{u}^{n}\), \(m=1,\ldots,8\). The
+  reserve is the first \(m\) for which the predicted Jacobian is non-positive,
+  or 9 if none is found. Protection triggers when the patch minimum reserve
+  is at most 4 and releases when it is at least 8.
+
+  **Pre-Lagrange rezone and same-time remap.** With
+  `TENRYU_I1B_BCR_REZONE=1`, a triggered predictor invokes the rezone at the
+  accepted state \(t^n\), before the normal Lagrange update. If
+  `TENRYU_I1B_BCR_TARGET=1`, a unit-weight least-squares affine map \(F\) is
+  fitted from the \(t=0\) positions of the \(B_\star\) nodes to their one-step
+  frozen-velocity predictions. The implementation computes the polar factors
+  but filters the rotation to the identity in v1, retaining only
+  \(s_b=\sqrt{\max(\det F,10^{-30})}\). For each patch corner, with current
+  edge matrix \(G\) and \(t=0\) edge matrix \(W_0\),
+
+  \[
+  W=s_b W_0,\qquad T=GW^{-1},\qquad
+  \mu_{\rm shape}(T)=\frac{\lVert T\rVert_F^2}{2\det T}-1,
+  \]
+
+  and the objective sums this Knupp shape metric over
+  \(B_\star\cup B_g\). Non-positive \(\det T\) receives a large penalty. The
+  target also adds a \(B_\star\)-node homothety tether about the fitted
+  centroids with \(\lambda_H=0.1\), normalized by each node's initial local
+  edge scale. The target is disabled unless
+  `TENRYU_I1B_BCR_TARGET=1`; without it, \(s_b=1\) and there is no tether.
+
+  The optimizer performs damped, sequential per-node coordinate updates for
+  `TENRYU_I1B_BCR_ITERS` iterations (default 8; the measured coarse-step
+  sweet spot is 4). Each node update uses finite-difference gradients,
+  backtracking, and a cumulative displacement cap \(0.2h_v\); the origin is
+  fixed and axis nodes retain \(r=0\). Whole-field candidate admissibility is
+  then tested at displacement scales \(1,1/2,\ldots,1/16\). If all five
+  attempts fail, the rezone is skipped. Otherwise the accepted coordinates
+  are installed as a temporary reference target and the conservative CSR
+  remap is executed immediately through `ale_remap_2d_rz` at the same time
+  \(t^n\); the persistent reference geometry is restored afterward, and the
+  normal Lagrange step starts from the remapped state.
+
+  **Diagnostics.** `TENRYU_I1B_ADOT_LEDGER=<cell>` enables the `[adot]`
+  corner ledger from `TENRYU_I1B_ADOT_FROM`: it reports cell-point corner
+  areas and their rates, radial/tangential rate components, vertex \(J\) and
+  \(\dot J\), and the cumulative negative logarithmic-strain measure
+
+  \[
+  D^-\mathrel{+}=\max\!\left(0,-\dot A_{\min}/A_{\min}\right)\Delta t.
+  \]
+
+  `[bcr-sets]` reports the topology manifest and patch minimum \(J\),
+  `[bcr-pred]` reports reserve and trigger state, `[bcr-target]` reports the
+  affine fit, and `[bcr-rezone]` reports objective and minimum-J changes,
+  displacements, admissibility halvings, and remap application.
+
+  **Path-constrained geometry guard (G1, consult-19).** With
+  `TENRYU_I1B_PATH_GUARD=1`, every Lagrangian stage motion is checked
+  before commit over ALL active cells along the actual predictor/corrector
+  trajectories \(x(\sigma)=x^n+\sigma\,\Delta x\): regular-reference vertex
+  Jacobians are quadratic in \(\sigma\) (roots in closed form) and exact RZ cell volumes
+  are cubic (first interior root sampled), so a coarse step cannot jump
+  over a transient interior sign change. A violation raises a typed
+  `GeometrySoftFailure{cell, predicate, min, sigma_safe}` instead of the
+  legacy `mesh.cu` hard assert; the driver restores the full-step snapshot
+  and retries with \(\Delta t\to 0.5\,\sigma_{\rm safe}\Delta t\).
+  Repeated failure at one cell escalates a fail-closed recovery ladder:
+  promote the cell into the constraint set \(P\) (with barrier priority)
+  and retry a same-time rezone at the same \(\Delta t\); then rezone+halve
+  per failure; on \(\Delta t\) collapse (\(<10^{-4}\Delta t_0\)) attempt one
+  Vachal-style feasible seed; then fail closed.
+
+  **Reference-flat corner typing (consult-25 Q1 option b).** The immutable
+  construction coordinates classify corner \((a,b,d)\) as
+  `FLAT_REFERENCE` exactly when
+  \(s_c\operatorname{orient}(a,b,d)=0\), both adjacent edges have nonzero
+  squared length, and
+  \((b-a)\mathbin{\cdot}(d-b)>0\). A negative reference turn, a collapsed
+  edge, or a collinear backtrack is not flat. Regular-reference corners keep
+  the pre-existing strict \(J(\sigma)>0\) predicate unchanged. A flat-reference
+  corner instead uses the one-sided closed predicate
+  \(g(\sigma)=s_c\operatorname{orient}(a(\sigma),b(\sigma),d(\sigma))\ge0\).
+  At every zero of \(g\), both edges must remain noncollapsed and their
+  ordering dot product must remain strictly positive. Because node paths are
+  affine, \(g=a\sigma^2+b\sigma+c\); the exact weak interval test checks
+  \(g(0),g(1)\ge0\) and, only when \(-2a<b<0<a\),
+  \(4ac-b^2\ge0\). All coefficient, discriminant, equality-ordering, and
+  reference-class signs are evaluated as exact dyadic-integer predicates;
+  there is no geometric tolerance. `sigma_safe == 0` is a valid witness when
+  a reference-flat corner leaves the admissible half-plane immediately.
+
+  Every cell containing a flat-reference corner also receives the continuous
+  embedding check: each pair of topologically nonincident moving edges must
+  remain disjoint (intersection, touch, and overlap all fail). The four
+  orientation polynomials and the collinear endpoint-order polynomials are
+  exact quadratics. Their exact roots partition \([0,1]\); exact signs are
+  checked at every algebraic event and at a rational point in every open
+  interval. Adjacent edges may meet only at their common topological endpoint,
+  including an exactly ordered adjacent collinear pair at the structural flat
+  node.
+
+  The same type controls `apply_maxmin_untangle_repair`: flat-reference
+  corners are excluded from the max-min quality objective, remain closed
+  affine half-plane constraints \(g\ge0\) in every node LP, and pass the same
+  exact weak path and embedding check during blend backoff. Thus the repair
+  may return \(g=0\); it is not rewarded for lifting a structural flat node to
+  \(g>0\).
+
+  **Physical-time predictor (G2) and latched state machine (G3).** The
+  step-count reserve is not refinement-invariant, so triggering is based on
+  physical times: \(\tau_{\rm watch}\) (first crossing of any monitored
+  quality to the watch level \(q_{\rm watch}=0.25\) along the piecewise
+  path model), \(\tau_{\rm cell}=h_r/\max(|U_{\rm shell}-U_{\rm patch}|,
+  10^{6})\), and (G3.1) \(\tau_{\rm hard}\) (crossing to
+  \(q_{\rm hard}=0.10\)). Qualities are compression-normalized against the
+  fitted shear-free target: \(q_J=J/(s_b^2 J^0)\), \(q_V=V/(s_b^3 V^0)\).
+  The machine latches ARMED→CAPTURE→RIDE→RECOVERY_HOLD→RELEASE_RAMP
+  (trailing-edge clearance to enter HOLD; dwell + quintic ramp to release;
+  \(q_{\rm off}=0.50\)).
+
+  **G3.1 least-action transactional actuation (consult-20).** The frozen
+  G3 direct actuation (rezone+remap every captured step) was rejected as
+  not timestep-family robust; with `TENRYU_I1B_G31_VARIANT=A0|A1|A2` the
+  watch layer only opens a capture EPISODE (`capture_epoch_id`; RIDE→
+  CAPTURE re-entry grants nothing), and a rezone transaction additionally
+  requires a necessity proof
+  \(\mathcal N=(R\le 4)\lor\text{ladder-forced}\lor(q\le q_{\rm hard})
+  \lor(\tau_{\rm hard}\le T_{\rm next})\) — the last term (variants A1+)
+  fires at most once per episode, with
+  \(T_{\rm next}=\max(\Delta t,\,t_{\rm last}+\tau_{\rm cool}-t)+0.25\Delta t\).
+  At most one ordinary committed remap may exist per physical time;
+  variant A2 adds the physical cooldown \(\tau_{\rm cool}=\tau_{\rm cell}
+  (t_{\rm last})\) and the gain-consumption rearm
+  \(q\le q^{+}-\tfrac12\max(g_m,\eta_q)\), \(\eta_q=0.01\), where
+  \(g_m=q^{+}-q^{-}\) is the last certified gain. Every transaction is
+  prepare/validate/commit: Phase A evaluates the candidate GEOMETRY only —
+  certification (normalized patch-corner quality \(J\cdot\det W^{-1}\)
+  must improve by \(\eta_q\), or hold within \(10^{-3}\) with a relative
+  objective gain \(\ge\eta_\Phi=0.01\)), \(B_f\) no-harm (per-cell raw
+  minimum corner Jacobian may not degrade by more than \(10^{-3}\)
+  relative), an optional displacement cap (`TENRYU_I1B_G31_DISP_CAP`), and
+  the feather strain metric \(\kappa_f=\max_e |\Delta d|_e/h_e\) over
+  \(B_f\) edges (logged always; gated by `TENRYU_I1B_G31_KAPPAF_MAX`) —
+  discarding failed candidates without remapping. Phase B performs the
+  single trial remap and checks the stored-mass closure against the
+  existing rejection tolerance; on failure the driver restores the
+  pre-rezone snapshot (when a G3.1 variant is active the per-step retry
+  snapshot is captured BEFORE the same-time rezone, so all step retries
+  roll back to the pre-rezone state and the ladder re-runs the transaction
+  with promoted constraints).
+
+  **Measured status (ensemble verdict, ledger A164–A174).** Replica
+  ensembles with controls at both timestep levels measure the BCR
+  mesh-motion family (sets/predictor/target/rezone/state machine/G3.1
+  transactions) as NULL for physical survival: the no-machinery control
+  lands inside (coarse) or at the center of (fine) every controller arm's
+  death band, and the historic single-run gains (+245 champion, +69 fine
+  ladder) collapse into the controller-created run-to-run lottery band
+  (\(\pm\sim100\) steps at coarse; no-controller runs are bit-repeatable —
+  the band is created by discrete controller decisions amplifying the
+  documented atomicAdd LSB noise). The ONLY component with a real,
+  same-binary-controlled survival effect is the G1 typed guard +
+  dt-retry (+140–185 coarse / +110 fine steps vs no-guard). G3.1's
+  \(B_f\) no-harm gate fail-closes structurally (measured feather strain
+  \(\kappa_f\approx0.7\) per candidate — any useful patch displacement
+  strains a 2-ring feather at \(O(1)\)), so the transactional variants
+  are de-facto no-actuation. The wall itself is the tier-transition
+  (pentagon) row's Lagrangian shock-transit failure at
+  \(t\approx3.10\times10^{-10}\): invariant under 22 released rings,
+  held-boundary position, respace (suppressed by the 12.15 µm disk per
+  the A66 rule), and window enlargement (which relocates an edge crush
+  outward and earlier). The historic composition gate (5116,
+  \(3.447\times10^{-10}\)) predates the A120 pentagon corner-mass
+  correctness fix and was bug-armored — void as physics evidence
+  (bisect-pinned, ledger A173). The D1 geometric feasibility oracle
+  (consult-22 §2.3) classifies the wall as an OPERATOR/TRAJECTORY
+  artifact: four steps before death a placement keeping every tier-motif
+  corner at \(\ge93\%\) of reference exists using only free-node degrees
+  of freedom (\(\gamma^*=0.929\), window-held nodes excluded, certificate
+  volumes positive), while the shipped Knupp-\(\Phi\) rezone objective
+  never finds it (it reduces \(\Phi\) without moving the critical
+  corner's \(J\)). Production disposition per consult-21/22: G1 ON;
+  state machine/predictor/rezone/transactions retired from the
+  production path (preserved as opt-in diagnostics); demand-driven ring
+  release retained as the tuning-free retreat actuator (dormant unless
+  geometry proves demand). The candidate wall remedy is an exact
+  max-min corner-\(J\) (Vachal-class untangling) crisis rezone objective
+  — certified reachable by D1 — with conservative row merging as the
+  general topology-change fallback; both pending adjudication.
+- **Coexistence with band respace**: the core transaction runs first; belt
+  bands whose cells intersect plateau∪feather∪guard are suppressed WHOLE
+  (one-time log), surviving bands and axis-repair pin the core node set,
+  and their transactions merge onto the core's step result. With the
+  production 12.15 µm core all four transition belts lie inside the disk
+  and suppress — measured bit-identical to the disk-only gate.
+- **Measured status** (verdict ledger A59–A66): all inner axis walls
+  (S_theta/tier/fan) are structurally removed; the deterministic exact gate
+  is (step 5116, t=3.447×10⁻¹⁰, cell 1537 — a shell polar-column cell,
+  the remaining open wall); restart continuation and composition
+  suppression are certified byte-exact; terminal death TIMES across dt-path
+  conventions carry ±10 % chaos and are compared only within one
+  convention (the historic PLOT-clipped 3.787/3.816 are convention
+  artifacts).
+
+#### 3.3.9 Tier-row merge transaction (crisis topology change)
+
+`apply_tier_row_merge` is the opt-in, zero-physical-time topology-change
+last resort of the driver retry ladder, after same-time max-min repair and
+ring release cannot produce a viable fixed-topology step.  A typed guard
+witness supplies a valid cell, predicate, and finite minimum; `sigma_safe == 0`
+is admissible.  The rung fires at retry-budget exhaustion or invalid
+\(\Delta t\), immediately before fail-closed termination.
+
+The transaction acts on the full radius-matched tier-row orbit, including all
+north and south mirror transition-belt pairs.  In canonical cell-id order,
+each row cell is paired across the 2:1 interface with its unique active
+radially-inner face neighbor, and partners must be disjoint.  A witness-pair
+failure rejects the orbit; an infeasible non-witness pair may be skipped.
+
+For each pair, removing its unique shared edge forms an oriented union
+polygon \(U\) with at most fourteen vertices.  The lower cell id owns the
+survivor storage.  Exact RZ polygon gates require \(V_U=V_a+V_b\) and additive
+first moments
+\((M_{R,U},M_{Z,U})=(M_{R,a}+M_{R,b},M_{Z,a}+M_{Z,b})\) to
+\(64\epsilon_{\rm mach}\) relative tolerance, with positive orientation and
+volume; proposed output parts must reproduce \(V_U\) to the same tolerance.
+
+The consult-24 closure uses one non-negative corner-to-corner transfer
+operator.  Old and new cell-point subcells are fan-triangulated, intersected
+by Sutherland--Hodgman clipping, and integrated with the exact RZ volume
+formula.  Each transfer amount \(T_{\alpha\beta}\ge0\) transports the
+same source-corner packet: corner mass, both components of corner momentum,
+electron and ion internal energy, and conservative corner kinetic energy.
+For every donor, \(\sum_\beta T_{\alpha\beta}=\mu_\alpha\) at
+\(64\epsilon_{\rm mach}\); negative coefficients or packet fields reject the
+transaction.  Thus mass and both internal-energy species remain non-negative by
+construction rather than through a posteriori flooring.
+
+The closure support is the union of the complete old and new dual stars of
+every affected node; unchanged corners in those stars enter as identity
+transfers.  On each node,
+\(m_n^+=\sum_\alpha T_{\alpha n}\),
+\(\mathbf p_n^+=\sum_\alpha T_{\alpha n}\mathbf u_\alpha\), and the nodal
+velocity is reconstructed as \(\mathbf v_n^+=\mathbf p_n^+/m_n^+\).
+The lost subcorner kinetic energy is the weighted variance
+\[
+ Q_n={1\over2m_n^+}\sum_{\alpha<\gamma}w_\alpha w_\gamma
+       |\mathbf u_\alpha-\mathbf u_\gamma|^2\ge0,
+\]
+which is scattered over the complete new node star with corner-mass weights
+and deposited only into ion internal energy.  At an axis node, radial
+momentum is projected to zero to enforce \(u_r=0\); its projected kinetic
+energy joins \(Q_n\), the absorbed radial impulse is logged as `axis_pr`, and
+the radial momentum audit excludes this axis-boundary flux.
+
+The gate set certifies mass, both momentum components, and total energy over
+the closed dual-star component at \(64\epsilon_{\rm mach}\) times the relevant
+scale.  It also certifies non-negative transfer coefficients, positive mass,
+density, non-negative electron/ion internal energy and \(Q_n\), exact
+mass-weighted scatter of \(Q_n\), and the matching kinetic-energy decrease.
+
+The pair ladder first tries a canonical one-chord two-way split with 3--8
+vertices in each half.  For 9--14-vertex unions it next tries a two-chord
+three-way split, again with 3--8 vertices per part.  Candidates have positive
+oriented area, RZ volume and corner Jacobians and are ordered by valence
+balance then endpoint node ids; their emitted edge multisets must reproduce
+the union boundary and paired chord copies.  A third part uses the lowest
+available slot from the mesh-wide ordered pool of pre-existing inactive cells
+and `keep_union` tombstones, with all tombstones staged before any slot reuse.
+If splitting is infeasible, unions with \(n\le8\) use `keep_union`; infeasible
+non-witness pairs use `skip_merge`, while a witness-pair failure rejects the
+transaction.
+
+All orbit construction, projection, split, conservation, edge-multiset, and
+boundary-rebinding gates run on host scratch copies before any state write.
+Commit installs the complete orbit at once, rebuilds faces by generic
+deterministic edge matching, and rebinds boundary `(cell,local_face)` entries
+while preserving tags by old undirected-edge key.  The persistent
+`merge_tombstone` mask records absorbed `keep_union` slots, clears a slot when
+it is reused, and is the final authority over `hydro_active`: the driver forces
+every marked cell inactive after other topology activation logic.  The driver
+then recaptures the full-step retry snapshot on the new topology, resets the
+retry budget, and re-arms the max-min latch before retrying at the same
+\(\Delta t\).
+
+This operator is crisis-path only; disabled and ordinary accepted steps do not
+enter it.  Sorted orbit blocks/cells, lower-id survivor ownership,
+smallest-node cyclic starts, canonical chord ordering, ordered edge keys, and
+fixed accumulation loops make the topology and projection deterministic.
 
 #### 3.3.13 Young/PLIC material-interface reconstruction
 

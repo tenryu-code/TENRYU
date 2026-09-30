@@ -2168,7 +2168,8 @@ __global__ void energy_update_with_old_volume_kernel(
     const int compatible_energy,
     double* __restrict__ eta_compatible,
     double* __restrict__ E_floor_injected,
-    int* __restrict__ clamp_count) {
+    int* __restrict__ clamp_count,
+    const std::uint8_t* __restrict__ signed_energy_cell) {
   const int i = c_begin + blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= c_end) {
     return;
@@ -2179,7 +2180,7 @@ __global__ void energy_update_with_old_volume_kernel(
   persistent_1d::energy_update_with_old_volume_kernel_body<GEOM>(
       i, ee, e_old, r_new, r_old, u_half, vol, vol_old, mass, P_half,
       Q_half, hydro_active, n_cells, dt, compatible_energy, eta_compatible,
-      nullptr, clamp_count, E_floor_injected);
+      nullptr, clamp_count, E_floor_injected, signed_energy_cell);
 }
 
 template <int GEOM>
@@ -2223,7 +2224,8 @@ __global__ void energy_update_with_old_volume_2t_kernel(
     const double te_floor,
     const double ti_floor,
     const int energy_authoritative,
-    const int apply_exchange) {
+    const int apply_exchange,
+    const double* __restrict__ zmom_r2) {
   const int i = c_begin + blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= c_end) {
     return;
@@ -2238,7 +2240,7 @@ __global__ void energy_update_with_old_volume_2t_kernel(
       hydro_active, n_cells, dt, gamma_eff, A_eff, fallback_z, tab_ion,
       tab_ele, cv_e_arr, cv_i_arr, q_heat_to_electron, compatible_energy,
       eta_compatible, nullptr, clamp_count, qei_multiplier, te_floor,
-      ti_floor, energy_authoritative, apply_exchange, E_floor_injected);
+      ti_floor, energy_authoritative, apply_exchange, E_floor_injected, zmom_r2);
 }
 
 template <int GEOM, bool kColdEquilibrium>
@@ -3478,63 +3480,6 @@ __global__ void apply_post_shock_heat_kernel(
   }
 }
 
-// NOH-DET #17: the renorm sums must be fixed-order. The former
-// atomic_add_double accumulation made the 1T-renorm scale depend on the
-// inter-block atomic arrival order (run-to-run bifurcation at
-// rounding-boundary steps; VERIFICATION 3.2r).
-struct ActiveMassOp {
-  const double* mass = nullptr;
-  const std::int8_t* active = nullptr;
-
-  __host__ __device__ double operator()(const int i) const {
-    const bool is_active = (active == nullptr) || (active[i] != 0);
-    return is_active ? mass[i] : 0.0;
-  }
-};
-
-struct ActiveInternalOp {
-  const double* mass = nullptr;
-  const double* ee = nullptr;
-  const std::int8_t* active = nullptr;
-
-  __host__ __device__ double operator()(const int i) const {
-    const bool is_active = (active == nullptr) || (active[i] != 0);
-    return is_active ? mass[i] * fmax(ee[i], 0.0) : 0.0;
-  }
-};
-
-__global__ void scale_active_energy_kernel(double* __restrict__ ee,
-                                           const std::int8_t* __restrict__ hydro_active,
-                                           const int n_cells,
-                                           const double scale) {
-  const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= n_cells) {
-    return;
-  }
-  persistent_1d::scale_active_energy_kernel_body(i, ee, hydro_active, scale);
-}
-
-__global__ void shift_active_energy_kernel(double* __restrict__ ee,
-                                           const std::int8_t* __restrict__ hydro_active,
-                                           const int n_cells,
-                                           const double de) {
-  const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= n_cells) {
-    return;
-  }
-  persistent_1d::shift_active_energy_kernel_body(i, ee, hydro_active, de);
-}
-
-__global__ void add_first_active_residual_kernel(double* __restrict__ ee,
-                                                 const double* __restrict__ mass,
-                                                 const int first_active,
-                                                 const double residual) {
-  if (threadIdx.x == 0 && blockIdx.x == 0) {
-    persistent_1d::add_first_active_residual_kernel_body(
-        ee, mass, first_active, residual);
-  }
-}
-
 std::string format_scientific(const double value) {
   std::ostringstream oss;
   oss << std::scientific << std::setprecision(16) << value;
@@ -4240,10 +4185,6 @@ void compute_cell_sound_speed(core::CellField1DView cs,
   sync_kernel("Hydro1D compute_sound_speed kernel failed");
 }
 
-bool has_pressure_boundary(const core::Config& cfg) {
-  return parse_boundary_type_1d(cfg) == HydroBoundaryType::PRESSURE;
-}
-
 void compute_odd_even_weight_1d_impl(core::CellField1DView W_oe,
                                      core::ConstCellField1DView rho,
                                      const std::int8_t* hydro_active,
@@ -4442,19 +4383,21 @@ __global__ void follow_void_nodes_1d_kernel(double* __restrict__ x_r,
                                             double* __restrict__ v_r,
                                             double* __restrict__ mass,
                                             const int first_void_cell,
-                                            const int n_cells,
+                                            const int last_node,
                                             const double rho_void) {
   // Void cells carry no forces, so their interior nodes never move on their
-  // own and a Lagrangian edge expanding into the void region inverts cells
-  // Void-interior respacing fix: re-space the nodes uniformly between the plasma
-  // edge node (owned by the last real cell — never touched here) and the
-  // outer boundary node (owned by the free-boundary physics). Void masses
-  // are re-pinned to rho_void * V so the placeholder cells keep their floor
-  // density; they are excluded from physics, so no conserved quantity of a
-  // real cell is affected.
+  // own and a Lagrangian edge moving into or out of a void region inverts cells
+  // Void-interior respacing fix: re-space the nodes of one run of void cells
+  // (cells first_void_cell .. last_node - 1) uniformly between its two bounding
+  // nodes, which other physics owns and which are never touched here: a
+  // material's surface node or a domain boundary node (the plasma edge and the
+  // outer boundary node of the exterior vacuum; the fixed inner node and a
+  // material's rear face for a vacuum behind a foil or inside a shell; two
+  // material faces for a gap). Void masses are re-pinned to rho_void * V so the
+  // placeholder cells keep their floor density; they are excluded from
+  // physics, so no conserved quantity of a real cell is affected.
   const int j = blockIdx.x * blockDim.x + threadIdx.x;
-  const int edge_node = first_void_cell;      // outer node of last real cell
-  const int last_node = n_cells;              // outer boundary node
+  const int edge_node = first_void_cell;      // lower bounding node
   const int n_span = last_node - edge_node;   // number of void cells
   if (n_span <= 1) {
     return;  // zero or one void cell: no interior nodes to manage
@@ -4504,42 +4447,74 @@ void follow_void_region_nodes_1d(core::State& state, const core::Config& cfg) {
   if (n_cells <= 0 || state.cell_is_void.size() != static_cast<std::size_t>(n_cells)) {
     return;
   }
-  // Contiguous trailing void region only (the 1D exterior-vacuum layout).
-  int first_void = n_cells;
-  for (int c = n_cells - 1; c >= 0; --c) {
-    if (state.cell_is_void[static_cast<std::size_t>(c)] != 0U) {
-      first_void = c;
-    } else {
-      break;
-    }
-  }
-  if (first_void >= n_cells) {
-    return;  // no trailing void region
-  }
-  const int n_span = n_cells - first_void;
-  if (n_span <= 1) {
-    return;
-  }
-  const int blocks = (n_span + 255) / 256;
+  // Every run of two or more contiguous void cells (the exterior vacuum, a
+  // vacuum behind a foil or inside a shell, a gap between layers; before
+  // 2026-09-29 only the trailing run, so a material face moving into an
+  // interior void compressed the one void cell next to it until its volume
+  // went non-positive). A run of one void cell has no interior node.
   const int geom_code = state.mesh.geometry_code;
-  switch (geom_code) {
-    case 1:
-      follow_void_nodes_1d_kernel<1><<<blocks, 256>>>(
-          state.x_r.data(), state.v_r.data(), state.mass.data(), first_void,
-          n_cells, cfg.materials.void_config.rho);
-      break;
-    case 2:
-      follow_void_nodes_1d_kernel<2><<<blocks, 256>>>(
-          state.x_r.data(), state.v_r.data(), state.mass.data(), first_void,
-          n_cells, cfg.materials.void_config.rho);
-      break;
-    default:
-      follow_void_nodes_1d_kernel<0><<<blocks, 256>>>(
-          state.x_r.data(), state.v_r.data(), state.mass.data(), first_void,
-          n_cells, cfg.materials.void_config.rho);
-      break;
+  bool launched = false;
+  int c = 0;
+  while (c < n_cells) {
+    if (state.cell_is_void[static_cast<std::size_t>(c)] == 0U) {
+      ++c;
+      continue;
+    }
+    int last = c;
+    while (last + 1 < n_cells && state.cell_is_void[static_cast<std::size_t>(last + 1)] != 0U) {
+      ++last;
+    }
+    const int first_void = c;
+    const int last_node = last + 1;
+    const int n_span = last_node - first_void;
+    c = last_node;
+    if (n_span <= 1) {
+      continue;
+    }
+    const int blocks = (n_span + 255) / 256;
+    switch (geom_code) {
+      case 1:
+        follow_void_nodes_1d_kernel<1><<<blocks, 256>>>(
+            state.x_r.data(), state.v_r.data(), state.mass.data(), first_void,
+            last_node, cfg.materials.void_config.rho);
+        break;
+      case 2:
+        follow_void_nodes_1d_kernel<2><<<blocks, 256>>>(
+            state.x_r.data(), state.v_r.data(), state.mass.data(), first_void,
+            last_node, cfg.materials.void_config.rho);
+        break;
+      default:
+        follow_void_nodes_1d_kernel<0><<<blocks, 256>>>(
+            state.x_r.data(), state.v_r.data(), state.mass.data(), first_void,
+            last_node, cfg.materials.void_config.rho);
+        break;
+    }
+    launched = true;
   }
-  sync_kernel("Hydro1D: follow_void_nodes kernel failed");
+  if (launched) {
+    sync_kernel("Hydro1D: follow_void_nodes kernel failed");
+  }
+}
+
+// The note a non-positive volume failure of a void cell carries: its run of void cells (follow_void_region_nodes_1d
+// keeps the run's interior nodes evenly spaced) has closed between its bounding nodes, i.e. the materials or the
+// boundary on its two sides met; the 1D hydro has no contact model for that.
+static std::string void_cell_volume_note(const core::State& state, const int cell) {
+  const int n_cells = static_cast<int>(state.cell_is_void.size());
+  if (cell < 0 || cell >= n_cells || state.cell_is_void[static_cast<std::size_t>(cell)] == 0U) {
+    return std::string();
+  }
+  int first = cell;
+  while (first > 0 && state.cell_is_void[static_cast<std::size_t>(first - 1)] != 0U) {
+    --first;
+  }
+  int last = cell;
+  while (last + 1 < n_cells && state.cell_is_void[static_cast<std::size_t>(last + 1)] != 0U) {
+    ++last;
+  }
+  return "; a VOID cell: its vacuum region (cells " + std::to_string(first) + ".." + std::to_string(last) +
+         ") closed between the nodes that bound it, and the 1D hydro has no contact model for the materials or"
+         " the boundary meeting across a vacuum";
 }
 
 namespace {
@@ -5138,12 +5113,6 @@ tenryu::coupling::HydroStepResult Hydro1D::lagrangian_step(
   const long long probe_step = static_cast<long long>(state.step) + 1;
   const bool probe_on = hydro_step_hash_active(probe_step);
   refresh_geometry_and_density(state, cfg, d_cell_is_void, d_rho_clamp_count);
-  // TODO(#C-05): still blocked. Boundary PdV is accumulated in coupling/driver.cpp
-  // for diagnostics, but this renormalization path uses compute_energy_budget_1d()
-  // (internal+kinetic only), so re-enabling it for pressure BC would erase physical
-  // pressure-drive work from the hydro state update.
-  const bool apply_1t_energy_renorm =
-      !use_two_temp && !has_pressure_boundary(cfg) && !run_compatible_energy;
   // TENRYU_HYDRO_EBAL=1: log the matter-energy delta of the entry EOS
   // closure projection (velocities untouched by the closure, so the
   // E_total difference isolates the internal-energy rewrite).
@@ -5197,17 +5166,6 @@ tenryu::coupling::HydroStepResult Hydro1D::lagrangian_step(
     core::log_info(ebal_os.str());
   }
   h1d_dump4("e1");
-  // The 1T renormalization measures the kinetic energy on the nodes, the
-  // kinetic energy of the staggered momentum update (and of the radiation
-  // pressure work W_r, dK = F ubar dt per node, paid by the field in the
-  // driver). It used the cell-averaged form except under radiation pressure,
-  // which moved the difference of the two forms into the internal energy
-  // wherever the velocity varies across the cells (2026-09-24).
-  const auto renorm_energy_total = [&]() {
-    const diagnostics::EnergyTotals totals = diagnostics::compute_energy_totals_1d(state);
-    return allreduce_sum_scalar((totals.E_int_e + totals.E_int_i) + totals.E_kin_nodal);
-  };
-  const double E_before = apply_1t_energy_renorm ? renorm_energy_total() : 0.0;
 
   const bool av_eos_aware_active =
       use_vnr_av && cfg.numerics.hydro.av_eos_aware &&
@@ -5915,7 +5873,13 @@ tenryu::coupling::HydroStepResult Hydro1D::lagrangian_step(
       }
     }
   }
-  if (nodal_velocity_damping_enabled && !run_compatible_energy) {
+  // The heat of the nodal velocity damping (odd-even and post-shock damping, H^oe) goes where the AV work goes
+  // (Numerics.hydro.av_heat_to, NUMERICS §3.1): merged into the artificial-heat array (the ions in 2T, e in 1T),
+  // or, with av_heat_to = "electron" in 2T, applied to the electrons on its own after the energy update. Until
+  // 2026-09-29 it always went to the ions in 2T.
+  const bool heat_oe_to_electron =
+      nodal_velocity_damping_enabled && !run_compatible_energy && use_two_temp && q_heat_to_electron != 0;
+  if (nodal_velocity_damping_enabled && !run_compatible_energy && !heat_oe_to_electron) {
     if (!h_half_valid) {
       std::swap(h_half_pingpong_, heat_oe_half_pingpong_);
       h_half_valid = true;
@@ -6269,7 +6233,7 @@ tenryu::coupling::HydroStepResult Hydro1D::lagrangian_step(
             state.eta_compatible.empty() ? nullptr : state.eta_compatible.data(),
             d_floor_cells, d_hydro_clamp_count, cfg.numerics.floors.Te,
             cfg.numerics.floors.Ti, energy_authoritative_update,
-            hydro_applies_exchange);
+            hydro_applies_exchange, state.zmom_active ? state.zmom_r2.data() : nullptr);
         break;
       case 2:
         energy_update_with_old_volume_2t_kernel<2><<<cw.blocks(), 256>>>(
@@ -6285,7 +6249,7 @@ tenryu::coupling::HydroStepResult Hydro1D::lagrangian_step(
             state.eta_compatible.empty() ? nullptr : state.eta_compatible.data(),
             d_floor_cells, d_hydro_clamp_count, cfg.numerics.floors.Te,
             cfg.numerics.floors.Ti, energy_authoritative_update,
-            hydro_applies_exchange);
+            hydro_applies_exchange, state.zmom_active ? state.zmom_r2.data() : nullptr);
         break;
       default:
         energy_update_with_old_volume_2t_kernel<0><<<cw.blocks(), 256>>>(
@@ -6301,7 +6265,7 @@ tenryu::coupling::HydroStepResult Hydro1D::lagrangian_step(
             state.eta_compatible.empty() ? nullptr : state.eta_compatible.data(),
             d_floor_cells, d_hydro_clamp_count, cfg.numerics.floors.Te,
             cfg.numerics.floors.Ti, energy_authoritative_update,
-            hydro_applies_exchange);
+            hydro_applies_exchange, state.zmom_active ? state.zmom_r2.data() : nullptr);
         break;
     }
   } else {
@@ -6313,7 +6277,7 @@ tenryu::coupling::HydroStepResult Hydro1D::lagrangian_step(
             d_hydro_active, cw.begin, cw.end, n_cells, dt,
             legacy_volume_compatible_energy,
             state.eta_compatible.empty() ? nullptr : state.eta_compatible.data(),
-            d_floor_cells, d_hydro_clamp_count);
+            d_floor_cells, d_hydro_clamp_count, d_signed_energy_cell);
         break;
       case 2:
         energy_update_with_old_volume_kernel<2><<<cw.blocks(), 256>>>(
@@ -6322,7 +6286,7 @@ tenryu::coupling::HydroStepResult Hydro1D::lagrangian_step(
             d_hydro_active, cw.begin, cw.end, n_cells, dt,
             legacy_volume_compatible_energy,
             state.eta_compatible.empty() ? nullptr : state.eta_compatible.data(),
-            d_floor_cells, d_hydro_clamp_count);
+            d_floor_cells, d_hydro_clamp_count, d_signed_energy_cell);
         break;
       default:
         energy_update_with_old_volume_kernel<0><<<cw.blocks(), 256>>>(
@@ -6331,7 +6295,7 @@ tenryu::coupling::HydroStepResult Hydro1D::lagrangian_step(
             d_hydro_active, cw.begin, cw.end, n_cells, dt,
             legacy_volume_compatible_energy,
             state.eta_compatible.empty() ? nullptr : state.eta_compatible.data(),
-            d_floor_cells, d_hydro_clamp_count);
+            d_floor_cells, d_hydro_clamp_count, d_signed_energy_cell);
         break;
     }
   }
@@ -6350,6 +6314,13 @@ tenryu::coupling::HydroStepResult Hydro1D::lagrangian_step(
         cw.begin, cw.end, n_cells, dt, d_signed_energy_cell,
         d_floor_cells, d_hydro_clamp_count);
     sync_kernel("Hydro1D: artificial_heat kernel failed");
+  }
+  if (heat_oe_to_electron) {
+    apply_artificial_heat_kernel<<<cw.blocks(), 256>>>(
+        state.ee.data(), heat_oe_half_pingpong_.data(), state.mass.data(), d_hydro_active,
+        cw.begin, cw.end, n_cells, dt, d_signed_energy_cell,
+        d_floor_cells, d_hydro_clamp_count);
+    sync_kernel("Hydro1D: odd_even electron heat kernel failed");
   }
   if (!H_ion_art_half.empty()) {
     apply_artificial_heat_kernel<<<cw.blocks(), 256>>>(
@@ -6429,168 +6400,6 @@ tenryu::coupling::HydroStepResult Hydro1D::lagrangian_step(
     hydro_step_probe(probe_step, "P9_preren",
                      {{"ee", {state.ee.data(), state.ee.size()}}});
   }
-  if (apply_1t_energy_renorm) {
-    const double E_after = renorm_energy_total();
-    // Energy the step exchanges with the rest of the system is not an error
-    // of the step and stays: the kinetic energy the radiation pressure force
-    // gives the matter (its work W_r, which the driver then takes from the
-    // radiation field) and the floor injection (booked by the safety
-    // ledger; every floor write of the step comes after E_before). The
-    // rescaling corrects only the remainder.
-    double* d_exchange = static_cast<double*>(core::device_scratch_acquire(
-        "hydro_1d:lagrangian_step:renorm_exchange", 2 * sizeof(double)));
-    const bool have_rad_work = pq_extra_ptr != nullptr && p_extra_work != nullptr &&
-                               !p_extra_work->empty() && cw.count() > 0;
-    if (have_rad_work) {
-      std::size_t work_temp_bytes = 0U;
-      cuda_check(cub::DeviceReduce::Sum(nullptr, work_temp_bytes,
-                                        p_extra_work->data() + cw.begin,
-                                        d_exchange, cw.count()),
-                 "Hydro1D: radiation work reduce size query failed");
-      void* d_work_temp = core::device_scratch_acquire(
-          "hydro_1d:lagrangian_step:renorm_exchange_temp", work_temp_bytes);
-      cuda_check(cub::DeviceReduce::Sum(d_work_temp, work_temp_bytes,
-                                        p_extra_work->data() + cw.begin,
-                                        d_exchange, cw.count()),
-                 "Hydro1D: radiation work reduce failed");
-    } else {
-      cuda_check(cudaMemsetAsync(d_exchange, 0, sizeof(double)),
-                 "Hydro1D: radiation work zero failed");
-    }
-    core::deterministic_sum(d_floor_cells, n_cells, d_hydro_floor, false);
-    cuda_check(cudaMemcpyAsync(d_exchange + 1, d_hydro_floor, sizeof(double),
-                               cudaMemcpyDeviceToDevice),
-               "Hydro1D: floor energy copy failed");
-    double h_exchange[2] = {0.0, 0.0};
-    cuda_check(cudaMemcpy(h_exchange, d_exchange, sizeof(h_exchange),
-                          cudaMemcpyDeviceToHost),
-               "Hydro1D: exchange energy readback failed");
-    const double E_exchange =
-        allreduce_sum_scalar(h_exchange[0] + std::max(h_exchange[1], 0.0));
-    const double E_target = E_before + E_exchange;
-    const double delta_E = E_target - E_after;
-    if (std::abs(E_before) > 0.0) {
-      const double rel_corr = std::abs(delta_E) / std::abs(E_before);
-      if (rel_corr > 1.0e-12) {
-        tenryu::core::log_debug("Hydro1D energy correction rel=" +
-                                format_scientific(rel_corr));
-      }
-    }
-
-    if (std::abs(delta_E) > 0.0) {
-      double* d_renorm_sums = static_cast<double*>(core::device_scratch_acquire(
-          "hydro_1d:lagrangian_step:d_renorm_sums", 2 * sizeof(double)));
-      using CountingIt = core::CountingInputIterator<int>;
-      CountingIt indices(cw.begin);
-      auto mass_it = core::TransformInputIterator<double, ActiveMassOp, CountingIt>(
-          indices, ActiveMassOp{state.mass.data(), d_hydro_active});
-      auto internal_it =
-          core::TransformInputIterator<double, ActiveInternalOp, CountingIt>(
-              indices, ActiveInternalOp{state.mass.data(), state.ee.data(),
-                                        d_hydro_active});
-      std::size_t mass_bytes = 0U;
-      std::size_t internal_bytes = 0U;
-      cuda_check(cub::DeviceReduce::Sum(nullptr, mass_bytes, mass_it,
-                                        d_renorm_sums, cw.count()),
-                 "Hydro1D: renorm mass reduce size query failed");
-      cuda_check(cub::DeviceReduce::Sum(nullptr, internal_bytes, internal_it,
-                                        d_renorm_sums + 1, cw.count()),
-                 "Hydro1D: renorm internal reduce size query failed");
-      const std::size_t renorm_temp_bytes = std::max(mass_bytes, internal_bytes);
-      void* d_renorm_temp = core::device_scratch_acquire(
-          "hydro_1d:lagrangian_step:d_renorm_reduce_temp", renorm_temp_bytes);
-      std::size_t mass_temp_bytes = renorm_temp_bytes;
-      cuda_check(cub::DeviceReduce::Sum(d_renorm_temp, mass_temp_bytes, mass_it,
-                                        d_renorm_sums, cw.count()),
-                 "Hydro1D: renorm mass reduce failed");
-      std::size_t internal_temp_bytes = renorm_temp_bytes;
-      cuda_check(cub::DeviceReduce::Sum(d_renorm_temp, internal_temp_bytes,
-                                        internal_it, d_renorm_sums + 1, cw.count()),
-                 "Hydro1D: renorm internal reduce failed");
-      sync_kernel("Hydro1D: renorm reductions failed");
-
-      double h_renorm[2] = {0.0, 0.0};
-      cuda_check(cudaMemcpy(h_renorm, d_renorm_sums, sizeof(h_renorm),
-                            cudaMemcpyDeviceToHost),
-                 "Hydro1D: memcpy renorm sums failed");
-      const double active_mass = allreduce_sum_scalar(h_renorm[0]);
-      const double active_internal = allreduce_sum_scalar(h_renorm[1]);
-
-      if (active_internal > 0.0) {
-        const double scale = (active_internal + delta_E) / active_internal;
-        scale_active_energy_kernel<<<cw.blocks(), 256>>>(state.ee.data() + cw.begin,
-                                                          d_hydro_active + cw.begin,
-                                                          cw.count(), scale);
-        sync_kernel("Hydro1D: scale_active_energy kernel failed");
-      } else if (active_mass > 0.0) {
-        const double de = delta_E / active_mass;
-        shift_active_energy_kernel<<<cw.blocks(), 256>>>(state.ee.data() + cw.begin,
-                                                          d_hydro_active + cw.begin,
-                                                          cw.count(), de);
-        sync_kernel("Hydro1D: shift_active_energy kernel failed");
-      }
-
-      int first_active = -1;
-      if (state.hydro_active.empty()) {
-        first_active = 0;
-      } else {
-        for (std::size_t i = static_cast<std::size_t>(cw.begin);
-             i < static_cast<std::size_t>(cw.end) &&
-             i < state.hydro_active.size();
-             ++i) {
-          if (state.hydro_active[i] != 0) {
-            first_active = static_cast<int>(i);
-            break;
-          }
-        }
-      }
-      if (part.n_ranks > 1) {
-        const parallel::Reduction reduction(part.n_ranks);
-        double key = first_active >= 0 ? static_cast<double>(first_active)
-                                       : 1.0e18;
-        key = reduction.allreduce_min(key);
-        first_active = key < 1.0e18 ? static_cast<int>(key) : -1;
-      }
-
-      if (first_active >= 0) {
-        const double E_corrected = renorm_energy_total();
-        const double residual = E_target - E_corrected;
-        // The residual patch targets one global cell; only its owner holds
-        // valid ee/mass and applies the kernel (all ranks agree on the
-        // residual value via the global sums above).
-        const bool owns_first_active =
-            first_active >= cw.begin && first_active < cw.end;
-        if (std::abs(residual) > 0.0 && owns_first_active) {
-          double ee_first = 0.0;
-          double m_first = 0.0;
-          cuda_check(cudaMemcpy(&ee_first,
-                                state.ee.data() + first_active,
-                                sizeof(double),
-                                cudaMemcpyDeviceToHost),
-                     "Hydro1D: copy first_active ee failed");
-          cuda_check(cudaMemcpy(&m_first,
-                                state.mass.data() + first_active,
-                                sizeof(double),
-                                cudaMemcpyDeviceToHost),
-                     "Hydro1D: copy first_active mass failed");
-          if (m_first > 0.0) {
-            const double delta_ee = residual / m_first;
-            const double rel_delta =
-                std::abs(delta_ee) / std::max(std::abs(ee_first), 1.0e-30);
-            if (rel_delta > 0.1) {
-              tenryu::core::log_warning(
-                  "Hydro1D residual correction concentrated in first active cell: rel_delta_ee=" +
-                  format_scientific(rel_delta));
-            }
-          }
-          add_first_active_residual_kernel<<<1, 1>>>(
-              state.ee.data(), state.mass.data(), first_active, residual);
-          sync_kernel("Hydro1D: add_first_active_residual kernel failed");
-        }
-      }
-    }
-  }
-
   if (probe_on) {
     hydro_step_probe(probe_step, "P10_postren",
                      {{"ee", {state.ee.data(), state.ee.size()}}});
@@ -6713,15 +6522,15 @@ tenryu::coupling::HydroStepResult Hydro1D::lagrangian_step(
         core::log_warning(
             "Hydro1D: non-positive cell volume at cell=" +
             std::to_string(failing_cell) + " (vol=" +
-            std::to_string(failing_vol) +
-            "); requesting driver full-step retry");
+            std::to_string(failing_vol) + ")" + void_cell_volume_note(state, failing_cell) +
+            "; requesting driver full-step retry");
         return step_result;
       }
       TENRYU_ASSERT(false,
                     "Hydro1D: non-positive cell volume at cell=" +
                         std::to_string(failing_cell) + " (vol=" +
-                        std::to_string(failing_vol) +
-                        "); enable Numerics.hydro.driver_full_step_retry"
+                        std::to_string(failing_vol) + ")" + void_cell_volume_note(state, failing_cell) +
+                        "; enable Numerics.hydro.driver_full_step_retry"
                         " for soft retry");
     }
   }

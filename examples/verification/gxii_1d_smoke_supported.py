@@ -174,7 +174,6 @@ Numerics(
         min_s=1.0e-22,
         cfl_hydro=0.3,
         cfl_cond=0.25,
-        f_min_fleck=0.01,
     ),
     hydro=dict(
         boundary_1d="free",

@@ -98,7 +98,7 @@ __global__ void update_zbar_fields_kernel(
   const int c = blockIdx.x * blockDim.x + threadIdx.x;
   if (c >= n_cells) return;
   double weighted = 0.0;
-  double frac_sum = 0.0;
+  ZbarMixAccumulator mix;
   for (int m = 0; m < n_materials; ++m) {
     const auto& mat = materials[m];
     if (mat.is_void) continue;
@@ -114,13 +114,10 @@ __global__ void update_zbar_fields_kernel(
     if (n_materials == 1) {
       weighted = value;
     } else {
-      // Match std::max(raw_fraction, 0.0), including its NaN behavior.
-      const double f = reclose_max(volfrac[index], 0.0);
-      frac_sum += f;
-      weighted = zbar_separate_add_product(weighted, f, value);
+      mix.add(volfrac[index], mat.A, value);
     }
   }
-  if (n_materials > 1 && frac_sum > 1.0e-30) weighted /= frac_sum;
+  if (n_materials > 1) weighted = mix.mean();
   // The host evaluates even void cells before zeroing the stored field.
   zbar[c] = cell_is_void[c] != 0U ? 0.0 : weighted;
 }

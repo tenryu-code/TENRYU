@@ -179,6 +179,20 @@ def read_history_series(results_dir: Path, run_id: str, path: str) -> list[float
     return []
 
 
+def history_ledgers_cumulative(results_dir: Path, run_id: str) -> bool:
+    # The history's energy ledgers are cumulative: energy/laser_incident and energy/laser_escaped since 2026-07-29
+    # (2c2ca9f8a; energy/laser_deposited always was), energy/radiation_escaped since 2026-08-30 (78827447f), when
+    # energy/radiation_escaped_step (the per-step escape) was added; that dataset marks such histories. A history
+    # without it is read as per-step records (summed); one written between the two dates would misread the laser.
+    return bool(read_history_series(results_dir, run_id, "energy/radiation_escaped_step"))
+
+
+def ledger_total(series: list[float], cumulative: bool) -> float:
+    if not series:
+        return 0.0
+    return float(series[-1]) if cumulative else float(sum(max(x, 0.0) for x in series))
+
+
 def parse_log_metadata(log_path: Path) -> dict[str, Any]:
     text = log_path.read_text(encoding="utf-8", errors="replace") if log_path.exists() else ""
     out: dict[str, Any] = {"n_clamp": sum(int(match.group("count")) for match in CLAMP_RE.finditer(text))}
@@ -217,8 +231,9 @@ def effective_laser_energies(results_dir: Path, run_id: str, final: Snapshot) ->
     incident_series = read_history_series(results_dir, run_id, "energy/laser_incident")
     escaped_series = read_history_series(results_dir, run_id, "energy/laser_escaped")
     deposited_series = read_history_series(results_dir, run_id, "energy/laser_deposited")
-    incident = sum(max(x, 0.0) for x in incident_series)
-    escaped = sum(max(x, 0.0) for x in escaped_series)
+    cumulative = history_ledgers_cumulative(results_dir, run_id)
+    incident = ledger_total(incident_series, cumulative)
+    escaped = ledger_total(escaped_series, cumulative)
     deposited = deposited_series[-1] if deposited_series else final.E_laser_deposited_state
     if incident > 0.0:
         return incident, deposited, escaped
@@ -256,8 +271,10 @@ def compute_metrics(
     rad1 = compute_E_rad_total(final)
     laser_in, laser_dep, laser_esc = effective_laser_energies(results_dir, run_id, final)
     rad_escaped_series = read_history_series(results_dir, run_id, "energy/radiation_escaped")
-    rad_escaped = final.E_rad_escaped_state if final.E_rad_escaped_state != 0.0 else sum(
-        max(x, 0.0) for x in rad_escaped_series
+    rad_escaped = (
+        final.E_rad_escaped_state
+        if final.E_rad_escaped_state != 0.0
+        else ledger_total(rad_escaped_series, history_ledgers_cumulative(results_dir, run_id))
     )
     initial_total = u0 + k0 + rad0
     final_total_with_escape = u1 + k1 + rad1 + rad_escaped + laser_esc

@@ -313,7 +313,7 @@ int cmd_run(const std::string& namelist_path,
   try {
     tenryu::core::Config cfg;
     tenryu::core::State state;
-    std::optional<tenryu::radiation::PhotonPool> restart_pool;
+    bool restarted_from_checkpoint = false;
     std::filesystem::path resolved_namelist_path;
     std::string case_name;
     std::string effective_restart_for_driver;
@@ -333,10 +333,16 @@ int cmd_run(const std::string& namelist_path,
       validate_s2_multiblock_runtime_features(cfg);
       if (!output_dir_override.empty()) {
         if (!restart_prefix.empty() || !cfg.main.restart_from.empty()) {
+          // A restart writes to the deck's Output.directory and continues the file numbering found there (the
+          // output manager resumes after the highest existing index). The message used to say that a restart
+          // "continues its original output layout", which is true only when the original run also used the deck's
+          // directory (2026-09-29).
           throw tenryu::core::namelist::ConfigError(
               "--output-dir applies to fresh runs only: a restarted run "
-              "(--restart or Main.restart_from) continues its original "
-              "output layout");
+              "(--restart or Main.restart_from) writes to the deck's "
+              "Output.directory and continues the numbering found there; to "
+              "restart a run started with --output-dir, set Output.directory "
+              "in the deck to that directory");
         }
         cfg.output.directory = output_dir_override;
         core::log_info(
@@ -357,7 +363,7 @@ int cmd_run(const std::string& namelist_path,
         tenryu::io::HDF5Reader reader;
         auto checkpoint = reader.read_checkpoint(cfg, effective_restart);
         state = std::move(checkpoint.state);
-        restart_pool = std::move(checkpoint.photon_pool);
+        restarted_from_checkpoint = true;
         per_material_checkpoint_status = checkpoint.per_material_checkpoint_status;
         state.hydro_t_start_eV = runtime.builder().hydro_t_start_eV;
         effective_restart_for_driver = effective_restart;
@@ -479,7 +485,7 @@ int cmd_run(const std::string& namelist_path,
       out.write_frozen_config(case_name, frozen_json);
     }
 
-    if (restart_pool.has_value()) {
+    if (restarted_from_checkpoint) {
       laser::invalidate_global_skip_cache();
       state.laser_dep.fill(0.0);
     }
@@ -498,10 +504,6 @@ int cmd_run(const std::string& namelist_path,
     driver.set_checkpoint_per_material_status(per_material_checkpoint_status);
     if (!effective_restart_for_driver.empty()) {
       driver.set_restart_checkpoint_prefix(effective_restart_for_driver);
-    }
-    if (restart_pool.has_value()) {
-      driver.set_restart_photon_pool(std::move(*restart_pool));
-      restart_pool.reset();
     }
     driver.run(state, cfg, out);
 

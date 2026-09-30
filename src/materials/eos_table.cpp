@@ -498,14 +498,36 @@ EOSTable build_sesame_ion_table(const EOSTable& total, const EOSTable& electron)
   return ion;
 }
 
+EOSTable split_sesame_electron_table(const EOSTable& total,
+                                     const std::function<double(double rho, double T_eV)>& zbar_of) {
+  EOSTable electron = total;
+  electron.cold = nullptr;
+  for (std::size_t j = 0; j < total.n_T(); ++j) {
+    for (std::size_t i = 0; i < total.n_rho(); ++i) {
+      const double z_raw = zbar_of(total.rho_grid[i], total.T_grid_eV[j]);
+      const double z = (std::isfinite(z_raw) && z_raw > 0.0) ? z_raw : 0.0;
+      const double frac = z / (1.0 + z);
+      const std::size_t k = total.flat_index(i, j);
+      electron.P_table[k] = total.P_table[k] * frac;
+      electron.e_table[k] = total.e_table[k] * frac;
+    }
+  }
+  electron.finalize();
+  return electron;
+}
+
 EOSTablePair load_sesame(const std::string& filename,
                          const int mat_id,
                          const double zbar_hint,
-                         const int cold_curve_rows) {
+                         const int cold_curve_rows,
+                         bool* electron_from_304) {
   const SesameData sesame = read_xsesame(filename, mat_id);
 
   EOSTable total = from_sesame_raw(*sesame.table_301_total, cold_curve_rows);
   EOSTable electron;
+  if (electron_from_304 != nullptr) {
+    *electron_from_304 = sesame.table_304_electron.has_value();
+  }
   if (sesame.table_304_electron.has_value()) {
     electron = from_sesame_raw(*sesame.table_304_electron, cold_curve_rows);
   } else {

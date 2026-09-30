@@ -132,7 +132,7 @@ Diagnostics(enabled=True, every=1)</code></pre>
 
     <section aria-labelledby="restart">
       <h2 id="restart">チェックポイントと再開</h2>
-      <p>再開するデッキでは、<code>Main.restart_from</code> にチェックポイントの接頭辞を指定する。たとえば <code>Main(..., restart_from="outputs/minimal_1d/checkpoints/minimal_1d_ckpt_0000")</code> のように、ランクの接尾辞や <code>.h5</code> を除いた接頭辞を渡す。再開は、チェックポイントに保存された状態、時刻、時間刻みを引き継ぎ、元の出力の配置をそのまま続ける。指定した接頭辞に一致するチェックポイントがない場合や、凍結後の設定と整合しない場合（次元・メッシュ・材料・群・seed の不一致）は、開始する前に失敗する。1D の run は、2026-09-26 以降に書いた途中のチェックポイントから再開すると、元の run とビット一致で続く。GXII の FLD・S<sub>N</sub> デッキと燃焼のあるデッキで、履歴の全列が一致することを確かめている。ただし、光線追跡を再利用する run（<code>Laser.raytrace_skip_config.enabled=True</code>）は、再開直後に全光線を追跡し直すので一致しない。2026-09-25 より前の 1D の S<sub>N</sub> の run を再開するときは、<code>Radiation.sn_transport.spatial_scheme="linear_characteristic"</code> を明示すると従来の空間離散化で続く。</p>
+      <p>再開は、元の run と同じデッキファイルを内容を変えずに使い、チェックポイントの接頭辞（ランクの接尾辞や <code>.h5</code> を除いたもの）を <code>--restart</code> で渡す。たとえば <code>./build/tenryu run minimal_1d.py --restart outputs/minimal_1d/checkpoints/minimal_1d_ckpt_0000</code> とする。チェックポイントの凍結設定にはデッキ本文のハッシュと、<code>Main.restart_from</code> を除くすべての設定が入っていて、再開に使うデッキと一致しなければ開始する前に失敗する（<code>checkpoint frozen_config JSON mismatch</code>）。デッキに <code>restart_from</code> を書き足す、<code>t_end</code> を延ばす、出力の間隔を変える、コメントを足すなど、本文を少しでも変えると再開できない。接頭辞をデッキに持たせたいときは、元の run のデッキから <code>restart_from=os.environ.get("RESTART_FROM", "")</code> のように環境変数から読み、本文を変えずに渡す。一致するチェックポイントがない場合も開始する前に失敗する。再開は、チェックポイントに保存された状態、時刻、時間刻みを引き継ぎ、元の出力の配置をそのまま続ける。1D の run は、2026-09-26 以降に書いた途中のチェックポイントから再開すると、元の run とビット一致で続く。GXII の FLD・S<sub>N</sub> デッキと燃焼のあるデッキで、履歴の全列が一致することを確かめている。ただし、光線追跡を再利用する run（<code>Laser.raytrace_skip_config.enabled=True</code>）は、再開直後に全光線を追跡し直すので一致しない。2026-09-25 より前の 1D の S<sub>N</sub> の run を再開するときは、<code>Radiation.sn_transport.spatial_scheme="linear_characteristic"</code> を明示すると従来の空間離散化で続く。</p>
     </section>
 
     <section aria-labelledby="troubleshooting">
@@ -142,7 +142,7 @@ Diagnostics(enabled=True, every=1)</code></pre>
         <tbody>
           <tr><th><code>ConfigError: ... is not a supported key (did you mean 'X'?)</code></th><td>キー名の打ち間違い。候補が出るのでそのまま直す。</td></tr>
           <tr><th><code>ConfigError: eos.file is required for model=sesame</code></th><td>テーブル EOS はファイル必須。入門は <code>ideal_gas</code> にする。</td></tr>
-          <tr><th><code>Radiation.mode="imc_ddmc"</code> でエラー</th><td>旧 Monte Carlo 輸送は退役済み。書かない（= FLD 既定）か <code>sn_transport</code> にする。<code>imc=dict(...)</code>/<code>ddmc=dict(...)</code> も同様に退役経路専用の互換キーである。</td></tr>
+          <tr><th><code>Radiation.mode="imc_ddmc"</code> でエラー</th><td>旧 Monte Carlo 輸送は退役し、2026-09-29 にビルドから外した。書かない（= FLD 既定）か <code>sn_transport</code> にする。<code>imc=dict(...)</code>（<code>two_stage</code> 以外）・<code>ddmc=dict(...)</code>・<code>holo=dict(...)</code> は受理して WARNING を出し、無視する（<code>enabled=True</code> はエラー）。</td></tr>
           <tr><th>実行したのに結果が古いまま</th><td>出力先の衝突で <code>_001</code> の連番ディレクトリへ書かれている。出力先を確認する。</td></tr>
           <tr><th>温度が上がらない / 波が進まない</th><td>まず validate の要約で有効な物理モジュールを確認し、次に <code>config/*_frozen.json</code> で境界・不透明度の実効値を確認する。</td></tr>
           <tr><th>\(\Delta t\) が縮み続けて進まない</th><td>履歴の <code>dt_winner</code>、またはログの limiter 名（<code>Main.verbosity="verbose"</code> のとき出る）で律速カーネルを特定する（<a href="../overview/timestep.html">時間刻み制御</a>）。床（<code>dt.min_s</code>）を割ると FATAL 停止する。</td></tr>

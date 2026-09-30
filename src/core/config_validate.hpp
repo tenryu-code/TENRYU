@@ -1380,15 +1380,6 @@ inline void validate_ale1d_config(const Config& config) {
     throw namelist::ConfigError(
         "Numerics.ale1d.enabled=True requires Main.dim=1");
   }
-  if (radiation.mode == RadiationMode::ImcDdmc ||
-      radiation.imc.enabled ||
-      radiation.ddmc.enabled ||
-      radiation.imc.difference.enabled ||
-      radiation.holo.enabled) {
-    throw namelist::ConfigError(
-        "Numerics.ale1d.enabled=True requires deterministic radiation "
-        "(multigroup_diffusion) or radiation off, not IMC/DDMC/HOLO");
-  }
   // 2026-07-26 review: fail-closed operating boundary for
   // the experimental V3 ALE prototype: the remap has no companion-field
   // registry (S_N angular state and burn inventories are left on the old mesh),

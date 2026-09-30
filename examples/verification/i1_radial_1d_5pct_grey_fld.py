@@ -138,9 +138,7 @@ Radiation(
     mode="multigroup_diffusion",
     groups=1,
     group_bounds_eV=[0.0, 1.0e6],
-    imc=dict(enabled=False, two_stage=False, difference=dict(enabled=False)),
-    ddmc=dict(enabled=False),
-    holo=dict(enabled=False),
+    imc=dict(two_stage=False),
     multigroup_diffusion=dict(
         hydro_coupling="none",  # explicit opt-out: compatible_energy x gamma_r_43 unsupported (v1)
         flux_limiter="levermore_pomraning",
@@ -211,7 +209,6 @@ Numerics(
         growth_factor=DT_GROWTH_FACTOR,
         cfl_hydro=0.15,
         cfl_cond=0.1,
-        f_min_fleck=0.01,
     ),
     hydro=dict(
         enabled=True,

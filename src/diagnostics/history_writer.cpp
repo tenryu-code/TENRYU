@@ -1398,7 +1398,6 @@ void write_dt_breakdown_history(const HistoryAppendFile& file,
                     static_cast<std::int32_t>(record.dt_winner_code),
                     "enum");
   append_scalar_double(file, std::string(base) + "dt_hydro", record.dt_hydro, "s");
-  append_scalar_double(file, std::string(base) + "dt_rad", record.dt_rad, "s");
   append_scalar_double(file, std::string(base) + "dt_cond", record.dt_cond, "s");
   append_scalar_double(
       file, std::string(base) + "dt_post_shock", record.dt_post_shock, "s");
@@ -2158,116 +2157,6 @@ void assert_history_dataset_lengths_consistent(const HistoryAppendFile& file) {
                       " (expected " + std::to_string(static_cast<unsigned long long>(*t_len)) +
                       ", got " + std::to_string(static_cast<unsigned long long>(*len)) + ")");
   }
-
-  constexpr std::array<const char*, 23> kMcPaths = {"mc/n_total",
-                                                     "mc/n_imc",
-                                                     "mc/n_ddmc",
-                                                     "mc/n_census",
-                                                     "mc/n_absorbed",
-                                                     "mc/n_escaped",
-                                                     "mc/n_leaked",
-                                                     "mc/ddmc_fraction",
-                                                     "mc/weight_min",
-                                                     "mc/weight_mean",
-                                                     "mc/weight_max",
-                                                     "mc/overshoot_count",
-                                                     "mc/overshoot_max",
-                                                     "mc/ddmc_mode_count",
-                                                     "mc/imc_mode_count",
-                                                     "mc/mmatrix_violations",
-                                                     "mc/mmatrix_fallback_count",
-                                                     "mc/omega_below_threshold",
-                                                     "mc/interface_transitions",
-                                                     "mc/interface_reflections",
-                                                     "mc/conversion_prob_violations",
-                                                     "mc/ddmc_to_imc_conversions",
-                                                     "mc/rad_momentum_deposition"};
-  static bool warned_migration = false;
-  for (const char* path : kMcPaths) {
-    const auto len = dataset_length_if_exists(file, path);
-    if (!len.has_value()) {
-      continue;
-    }
-    if (*len != *t_len && !warned_migration) {
-      core::log_warning("HistoryWriter: mc/* dataset '" + std::string(path) +
-                        "' length mismatch (expected " +
-                        std::to_string(static_cast<unsigned long long>(*t_len)) + ", got " +
-                        std::to_string(static_cast<unsigned long long>(*len)) +
-                        "); history file migration in progress");
-      warned_migration = true;
-    }
-  }
-
-  constexpr std::array<const char*, 18> kDifferencePaths = {
-      "difference/reference_valid",
-      "difference/eligible_cells",
-      "difference/active_cells",
-      "difference/strong_cells",
-      "difference/hybrid_suppressed_cells",
-      "difference/W_min",
-      "difference/W_mean",
-      "difference/W_max",
-      "difference/tau_min",
-      "difference/tau_mean",
-      "difference/tau_max",
-      "difference/chi_mean",
-      "difference/chi_max",
-      "difference/reduced_flux_max",
-      "difference/knudsen_max",
-      "difference/front_grad_Te_max",
-      "difference/front_grad_rho_max",
-      "difference/E_ref_total"};
-  static bool warned_difference_migration = false;
-  for (const char* path : kDifferencePaths) {
-    const auto len = dataset_length_if_exists(file, path);
-    if (!len.has_value()) {
-      continue;
-    }
-    if (*len != *t_len && !warned_difference_migration) {
-      core::log_warning("HistoryWriter: difference/* dataset '" + std::string(path) +
-                        "' length mismatch (expected " +
-                        std::to_string(static_cast<unsigned long long>(*t_len)) + ", got " +
-                        std::to_string(static_cast<unsigned long long>(*len)) +
-                        "); history file migration in progress");
-      warned_difference_migration = true;
-    }
-  }
-
-  constexpr std::array<const char*, 19> kHoloPaths = {
-      "holo/n_core_cells",
-      "holo/n_entered",
-      "holo/n_exited",
-      "holo/n_hard_exited",
-      "holo/n_island_rejected",
-      "holo/tau_R_min",
-      "holo/tau_R_max",
-      "holo/reduced_flux_max",
-      "holo/E_LO_total",
-      "holo/E_LO_boundary_in",
-      "holo/E_LO_boundary_out",
-      "holo/matter_delta",
-      "holo/source_balance_error",
-      "holo/particle_net_source_core",
-      "holo/lo_particle_source_mismatch",
-      "holo/Prr_coverage",
-      "holo/chi_min",
-      "holo/chi_mean",
-      "holo/chi_max"};
-  static bool warned_holo_migration = false;
-  for (const char* path : kHoloPaths) {
-    const auto len = dataset_length_if_exists(file, path);
-    if (!len.has_value()) {
-      continue;
-    }
-    if (*len != *t_len && !warned_holo_migration) {
-      core::log_warning("HistoryWriter: holo/* dataset '" + std::string(path) +
-                        "' length mismatch (expected " +
-                        std::to_string(static_cast<unsigned long long>(*t_len)) + ", got " +
-                        std::to_string(static_cast<unsigned long long>(*len)) +
-                        "); history file migration in progress");
-      warned_holo_migration = true;
-    }
-  }
 }
 
 #endif
@@ -2627,10 +2516,6 @@ HistoryWriter::PendingHistoryRecord HistoryWriter::build_pending_record(
   rec.t = state.t;
   rec.dt = state.dt;
   rec.step = state.step;
-  rec.mc_group_enabled = mc_group_enabled_;
-  rec.mc_particle_counts_enabled = mc_particle_counts_enabled_;
-  rec.mc_weight_stats_enabled = mc_weight_stats_enabled_;
-  rec.mc_ddmc_fraction_enabled = mc_ddmc_fraction_enabled_;
   rec.phase_resolved_energy_enabled = phase_resolved_energy_enabled_;
   rec.ale_closure_audit_enabled = ale_closure_audit_enabled_;
   rec.icf_enabled = icf_enabled_;
@@ -3653,10 +3538,6 @@ void HistoryWriter::init(const core::Config& cfg, const std::string& output_dir)
   last_flush_time_ = std::chrono::steady_clock::now();
   pending_.clear();
   history_bootstrapped_ = false;
-  mc_group_enabled_ = cfg.diagnostics.mc_stats.enabled;
-  mc_particle_counts_enabled_ = cfg.diagnostics.mc_stats.particle_counts;
-  mc_weight_stats_enabled_ = cfg.diagnostics.mc_stats.weight_stats;
-  mc_ddmc_fraction_enabled_ = cfg.diagnostics.mc_stats.ddmc_fraction;
   phase_resolved_energy_enabled_ = cfg.numerics.diagnostics.phase_resolved_energy;
   ale_closure_audit_enabled_ = cfg.numerics.ale.ke_conservation_closure_audit;
   icf_enabled_ = core::effective_diagnostics_icf_enabled(cfg);
@@ -3954,26 +3835,18 @@ void HistoryWriter::append_record_to_file(
   //   transfer_blocked_power_total,
   //   tail_closure_count, tail_closure_absorbed_power_total,
   //   cbet_exchanged_power_total, cbet_ledger_residual_rel, cbet_iterations,
-  //   cbet_clamp_count,
+  //   cbet_clamp_count, cbet_converged, cbet_convergence_residual, cbet_overflow_rays,
   //   critical_surface_hit_count,
   //   absorbed_fraction_beam_<index>}
-  // - mc/{n_total, n_imc, n_ddmc, n_census, n_absorbed, n_escaped, n_leaked, ddmc_fraction,
-  //   weight_min, weight_mean, weight_max, overshoot_count, overshoot_max, ddmc_mode_count,
-  //   imc_mode_count, mmatrix_violations, mmatrix_fallback_count, omega_below_threshold,
-  //   interface_transitions, interface_reflections, conversion_prob_violations,
-  //   ddmc_to_imc_conversions, rad_momentum_deposition}
-  // - holo/{n_core_cells, n_entered, n_exited, n_hard_exited,
-  //   n_island_rejected, tau_R_min, tau_R_max, reduced_flux_max,
-  //   E_LO_total, E_LO_boundary_in, E_LO_boundary_out, matter_delta,
-  //   source_balance_error, particle_net_source_core, lo_particle_source_mismatch,
-  //   Prr_coverage, chi_min, chi_mean, chi_max}
+  // - radiation/{fld_outer_iterations, fld_outer_residual, fld_outer_converged, sn_outer_iterations,
+  //   sn_inner_iterations, sn_outer_residual, sn_converged, overshoot_count, overshoot_max}
   // - mesh/{ale_rezone_invocations}
   // - safety/clamp_count
 
   // SPECIFICATION §7.3 notes:
   // - Easy 1:1 key-name mismatches are aligned to spec keys below.
-  // - Legacy/internal diagnostics (E_total, dE_total, E_denom, mmatrix_*) are
-  //   still written as extra datasets.
+  // - Legacy/internal diagnostics (E_total, dE_total, E_denom) are still
+  //   written as extra datasets.
   append_scalar_double_compat(
       file, "energy/internal_electron", "energy/E_int_e", rec.snapshot.energy.E_int_e, "erg");
   append_scalar_double_compat(
@@ -4539,6 +4412,18 @@ void HistoryWriter::append_record_to_file(
                     rec.snapshot.laser_pattern.cbet_clamp_count,
                     "count");
   append_scalar_i64(file,
+                    "laser/cbet_converged",
+                    rec.snapshot.laser_pattern.cbet_converged,
+                    "flag");
+  append_scalar_double(file,
+                       "laser/cbet_convergence_residual",
+                       rec.snapshot.laser_pattern.cbet_convergence_residual,
+                       "dimensionless");
+  append_scalar_i64(file,
+                    "laser/cbet_overflow_rays",
+                    rec.snapshot.laser_pattern.cbet_overflow_rays,
+                    "count");
+  append_scalar_i64(file,
                     "laser/critical_surface_hit_count",
                     rec.snapshot.laser_pattern.critical_surface_hit_count,
                     "count");
@@ -4593,214 +4478,18 @@ void HistoryWriter::append_record_to_file(
                       "flag");
   }
 
-  // Legacy runs can have mode counts stored in mc/n_imc and mc/n_ddmc.
-  const bool imc_mode_uses_legacy_path =
-      (tenryu::io::h5_link_exists(file, "mc/n_imc", H5P_DEFAULT) > 0) &&
-      (tenryu::io::h5_link_exists(file, "mc/imc_mode_count", H5P_DEFAULT) <= 0);
-  const bool ddmc_mode_uses_legacy_path =
-      (tenryu::io::h5_link_exists(file, "mc/n_ddmc", H5P_DEFAULT) > 0) &&
-      (tenryu::io::h5_link_exists(file, "mc/ddmc_mode_count", H5P_DEFAULT) <= 0);
-  if (imc_mode_uses_legacy_path || ddmc_mode_uses_legacy_path) {
-    static bool warned_legacy_mode_paths = false;
-    if (!warned_legacy_mode_paths) {
-      core::log_warning("HistoryWriter: detected legacy mc/n_imc or mc/n_ddmc mode-count "
-                        "dataset; particle counts for conflicting paths are skipped to "
-                        "preserve append compatibility");
-      warned_legacy_mode_paths = true;
-    }
-  }
-
-  // Mode-map counts (legacy metrics): write to new names, fallback to old names when appending
-  // pre-rename history files.
-  append_scalar_i64_compat(
-      file, "mc/ddmc_mode_count", "mc/n_ddmc", rec.snapshot.mc.ddmc_mode_count, "count");
-  append_scalar_i64_compat(
-      file, "mc/imc_mode_count", "mc/n_imc", rec.snapshot.mc.imc_mode_count, "count");
-
-  // SPEC fields are always written to preserve fixed schema; disabled channels write zero.
-  const bool write_spec_values = rec.mc_group_enabled;
-  const bool particle_counts_enabled = write_spec_values && rec.mc_particle_counts_enabled;
-  const bool weight_stats_enabled = write_spec_values && rec.mc_weight_stats_enabled;
-  const bool ddmc_fraction_enabled = write_spec_values && rec.mc_ddmc_fraction_enabled;
-
-  const std::int64_t n_total = particle_counts_enabled ? rec.snapshot.mc.n_total : 0;
-  const std::int64_t n_imc = particle_counts_enabled ? rec.snapshot.mc.n_imc_particles : 0;
-  const std::int64_t n_ddmc = particle_counts_enabled ? rec.snapshot.mc.n_ddmc_particles : 0;
-  const std::int64_t n_census = particle_counts_enabled ? rec.snapshot.mc.n_census : 0;
-  const std::int64_t n_absorbed = particle_counts_enabled ? rec.snapshot.mc.n_absorbed : 0;
-  const std::int64_t n_escaped = particle_counts_enabled ? rec.snapshot.mc.n_escaped : 0;
-  const std::int64_t n_leaked = particle_counts_enabled ? rec.snapshot.mc.n_leaked : 0;
-  const double ddmc_fraction = ddmc_fraction_enabled ? rec.snapshot.mc.ddmc_fraction : 0.0;
-  const double weight_min = weight_stats_enabled ? rec.snapshot.mc.weight_min : 0.0;
-  const double weight_mean = weight_stats_enabled ? rec.snapshot.mc.weight_mean : 0.0;
-  const double weight_max = weight_stats_enabled ? rec.snapshot.mc.weight_max : 0.0;
-  const std::int64_t overshoot_count = write_spec_values ? rec.snapshot.mc.overshoot_count : 0;
-  const double overshoot_max = write_spec_values ? rec.snapshot.mc.overshoot_max : 0.0;
-
-  append_scalar_i64(file, "mc/n_total", n_total, "count");
-  if (!imc_mode_uses_legacy_path) {
-    append_scalar_i64(file, "mc/n_imc", n_imc, "count");
-  }
-  if (!ddmc_mode_uses_legacy_path) {
-    append_scalar_i64(file, "mc/n_ddmc", n_ddmc, "count");
-  }
-  append_scalar_i64(file, "mc/n_census", n_census, "count");
-  append_scalar_i64(file, "mc/n_absorbed", n_absorbed, "count");
-  append_scalar_i64(file, "mc/n_escaped", n_escaped, "count");
-  append_scalar_i64(file, "mc/n_leaked", n_leaked, "count");
-  append_scalar_double(file, "mc/ddmc_fraction", ddmc_fraction, "dimensionless");
-  append_scalar_double(file, "mc/weight_min", weight_min, "dimensionless");
-  append_scalar_double(file, "mc/weight_mean", weight_mean, "dimensionless");
-  append_scalar_double(file, "mc/weight_max", weight_max, "dimensionless");
-  append_scalar_i64(file, "mc/overshoot_count", overshoot_count, "count");
-  append_scalar_double(file, "mc/overshoot_max", overshoot_max, "dimensionless");
-
-  // Legacy diagnostics remain unconditional for backward compatibility.
-  append_scalar_i64(file, "mc/mmatrix_violations", rec.snapshot.mc.mmatrix_violations, "count");
-  append_scalar_i64(file,
-                    "mc/mmatrix_fallback_count",
-                    rec.snapshot.mc.mmatrix_fallback_count,
-                    "count");
-  append_scalar_i64(file,
-                    "mc/omega_below_threshold",
-                    rec.snapshot.mc.omega_below_threshold,
-                    "count");
-  append_scalar_i64(file,
-                    "mc/interface_transitions",
-                    rec.snapshot.mc.interface_transitions,
-                    "count");
-  append_scalar_i64(file,
-                    "mc/interface_reflections",
-                    rec.snapshot.mc.interface_reflections,
-                    "count");
-  append_scalar_i64(file,
-                    "mc/conversion_prob_violations",
-                    rec.snapshot.mc.conversion_prob_violations,
-                    "count");
-  append_scalar_i64(file,
-                    "mc/ddmc_to_imc_conversions",
-                    rec.snapshot.mc.ddmc_to_imc_conversions,
-                    "count");
-  append_scalar_double(file,
-                       "mc/rad_momentum_deposition",
-                       rec.snapshot.mc.rad_momentum_deposition,
-                       "g*cm/s");
-
-  append_scalar_i64(file,
-                    "difference/reference_valid",
-                    rec.snapshot.mc.difference_reference_valid,
-                    "count");
-  append_scalar_i64(file,
-                    "difference/eligible_cells",
-                    rec.snapshot.mc.difference_eligible_cells,
-                    "cells");
-  append_scalar_i64(file,
-                    "difference/active_cells",
-                    rec.snapshot.mc.difference_active_cells,
-                    "cells");
-  append_scalar_i64(file,
-                    "difference/strong_cells",
-                    rec.snapshot.mc.difference_strong_cells,
-                    "cells");
-  append_scalar_i64(file,
-                    "difference/hybrid_suppressed_cells",
-                    rec.snapshot.mc.difference_hybrid_suppressed_cells,
-                    "cells");
-  append_scalar_double(file, "difference/W_min", rec.snapshot.mc.difference_W_min, "dimensionless");
-  append_scalar_double(file,
-                       "difference/W_mean",
-                       rec.snapshot.mc.difference_W_mean,
-                       "dimensionless");
-  append_scalar_double(file, "difference/W_max", rec.snapshot.mc.difference_W_max, "dimensionless");
-  append_scalar_double(file,
-                       "difference/tau_min",
-                       rec.snapshot.mc.difference_tau_min,
-                       "dimensionless");
-  append_scalar_double(file,
-                       "difference/tau_mean",
-                       rec.snapshot.mc.difference_tau_mean,
-                       "dimensionless");
-  append_scalar_double(file,
-                       "difference/tau_max",
-                       rec.snapshot.mc.difference_tau_max,
-                       "dimensionless");
-  append_scalar_double(file,
-                       "difference/chi_mean",
-                       rec.snapshot.mc.difference_chi_mean,
-                       "dimensionless");
-  append_scalar_double(file,
-                       "difference/chi_max",
-                       rec.snapshot.mc.difference_chi_max,
-                       "dimensionless");
-  append_scalar_double(file,
-                       "difference/reduced_flux_max",
-                       rec.snapshot.mc.difference_reduced_flux_max,
-                       "dimensionless");
-  append_scalar_double(file,
-                       "difference/knudsen_max",
-                       rec.snapshot.mc.difference_knudsen_max,
-                       "dimensionless");
-  append_scalar_double(file,
-                       "difference/front_grad_Te_max",
-                       rec.snapshot.mc.difference_front_grad_Te_max,
-                       "dimensionless");
-  append_scalar_double(file,
-                       "difference/front_grad_rho_max",
-                       rec.snapshot.mc.difference_front_grad_rho_max,
-                       "dimensionless");
-  append_scalar_double(file,
-                       "difference/E_ref_total",
-                       rec.snapshot.mc.difference_E_ref_total,
-                       "erg");
-  append_scalar_i64(file, "holo/n_core_cells", rec.snapshot.mc.holo_n_core_cells, "cells");
-  append_scalar_i64(file, "holo/n_entered", rec.snapshot.mc.holo_n_entered, "cells");
-  append_scalar_i64(file, "holo/n_exited", rec.snapshot.mc.holo_n_exited, "cells");
-  append_scalar_i64(file,
-                    "holo/n_hard_exited",
-                    rec.snapshot.mc.holo_n_hard_exited,
-                    "cells");
-  append_scalar_i64(file,
-                    "holo/n_island_rejected",
-                    rec.snapshot.mc.holo_n_island_rejected,
-                    "cells");
-  append_scalar_double(file, "holo/tau_R_min", rec.snapshot.mc.holo_tau_R_min, "dimensionless");
-  append_scalar_double(file, "holo/tau_R_max", rec.snapshot.mc.holo_tau_R_max, "dimensionless");
-  append_scalar_double(file,
-                       "holo/reduced_flux_max",
-                       rec.snapshot.mc.holo_reduced_flux_max,
-                       "dimensionless");
-  append_scalar_double(file, "holo/E_LO_total", rec.snapshot.mc.holo_E_LO_total, "erg");
-  append_scalar_double(file,
-                       "holo/E_LO_boundary_in",
-                       rec.snapshot.mc.holo_E_LO_boundary_in,
-                       "erg");
-  append_scalar_double(file,
-                       "holo/E_LO_boundary_out",
-                       rec.snapshot.mc.holo_E_LO_boundary_out,
-                       "erg");
-  append_scalar_double(file, "holo/matter_delta", rec.snapshot.mc.holo_matter_delta, "erg");
-  append_scalar_double(file,
-                       "holo/source_balance_error",
-                       rec.snapshot.mc.holo_source_balance_error,
-                       "erg");
-  append_scalar_double(file,
-                       "holo/particle_net_source_core",
-                       rec.snapshot.mc.holo_particle_net_source_core,
-                       "erg");
-  append_scalar_double(file,
-                       "holo/lo_particle_source_mismatch",
-                       rec.snapshot.mc.holo_lo_particle_source_mismatch,
-                       "erg");
-  append_scalar_double(file,
-                       "holo/Prr_coverage",
-                       rec.snapshot.mc.holo_Prr_coverage,
-                       "dimensionless");
-  append_scalar_double(file, "holo/chi_min", rec.snapshot.mc.holo_chi_min, "dimensionless");
-  append_scalar_double(file,
-                       "holo/chi_mean",
-                       rec.snapshot.mc.holo_chi_mean,
-                       "dimensionless");
-  append_scalar_double(file, "holo/chi_max", rec.snapshot.mc.holo_chi_max, "dimensionless");
+  // Written under mc/ until 2026-09-29, when the Monte Carlo radiation left the build and its other mc/*, holo/*
+  // and difference/* datasets with it: a history file started before then keeps these two columns there.
+  append_scalar_i64_compat(file,
+                           "radiation/overshoot_count",
+                           "mc/overshoot_count",
+                           rec.snapshot.radiation_overshoot.count,
+                           "count");
+  append_scalar_double_compat(file,
+                              "radiation/overshoot_max",
+                              "mc/overshoot_max",
+                              rec.snapshot.radiation_overshoot.max_ratio,
+                              "dimensionless");
 
   assert_history_dataset_lengths_consistent(file);
 }

@@ -229,9 +229,7 @@ Radiation(
     mode="multigroup_diffusion",
     groups=1,
     group_bounds_eV=[0.0, 1.0e6],
-    imc=dict(enabled=False, two_stage=False, difference=dict(enabled=False)),
-    ddmc=dict(enabled=False),
-    holo=dict(enabled=False),
+    imc=dict(two_stage=False),
     multigroup_diffusion=dict(
         flux_limiter="none",
         max_outer_iterations=50,

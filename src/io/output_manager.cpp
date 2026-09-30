@@ -14,7 +14,6 @@
 
 #include "core/error.hpp"
 #include "io/hdf5_writer.hpp"
-#include "radiation/particle_pool.cuh"
 
 namespace tenryu::io {
 namespace {
@@ -366,7 +365,6 @@ void OutputManager::write_snapshot(const tenryu::core::State& state,
 void OutputManager::write_checkpoint(
     const tenryu::core::State& state,
     const tenryu::core::Config& cfg,
-    const tenryu::radiation::PhotonPool& photon_pool,
     const int step,
     const double t,
     const std::string& case_name,
@@ -377,7 +375,7 @@ void OutputManager::write_checkpoint(
   const int file_index = checkpoint_count_++;
   HDF5Writer writer;
   const std::string checkpoint_path = writer.write_checkpoint(
-      state, cfg, photon_pool, file_index, step, t, checkpoint_dir, case_name);
+      state, cfg, file_index, step, t, checkpoint_dir, case_name);
   last_checkpoint_step_ = step;
   last_checkpoint_path_ = checkpoint_path;
   rotate_checkpoints(cfg, case_name, rank);

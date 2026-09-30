@@ -13,69 +13,12 @@ struct LaserMesh;
 
 namespace tenryu::diagnostics {
 
-struct RadiationDiagnostics {
-  // Legacy mode-map counts (cell x group), kept for compatibility.
-  std::int64_t ddmc_mode_count = 0;
-  std::int64_t imc_mode_count = 0;
-  // SPEC §7.3 particle statistics.
-  std::int64_t n_total = 0;
-  std::int64_t n_imc_particles = 0;
-  std::int64_t n_ddmc_particles = 0;
-  std::int64_t n_census = 0;
-  std::int64_t n_absorbed = 0;
-  std::int64_t n_escaped = 0;
-  std::int64_t n_leaked = 0;
-  double ddmc_fraction = 0.0;
-  double weight_min = 0.0;
-  double weight_mean = 0.0;
-  double weight_max = 0.0;
-  std::int64_t overshoot_count = 0;
-  double overshoot_max = 0.0;
-  std::int64_t mmatrix_violations = 0;
-  std::int64_t mmatrix_fallback_count = 0;
-  std::int64_t omega_below_threshold = 0;
-  std::int64_t interface_transitions = 0;
-  std::int64_t interface_reflections = 0;
-  std::int64_t conversion_prob_violations = 0;
-  std::int64_t ddmc_to_imc_conversions = 0;
-  double rad_momentum_deposition = 0.0;
-  std::int64_t difference_reference_valid = 0;
-  std::int64_t difference_eligible_cells = 0;
-  std::int64_t difference_active_cells = 0;
-  std::int64_t difference_strong_cells = 0;
-  std::int64_t difference_hybrid_suppressed_cells = 0;
-  double difference_W_min = 0.0;
-  double difference_W_mean = 0.0;
-  double difference_W_max = 0.0;
-  double difference_tau_min = 0.0;
-  double difference_tau_mean = 0.0;
-  double difference_tau_max = 0.0;
-  double difference_chi_mean = 0.0;
-  double difference_chi_max = 0.0;
-  double difference_reduced_flux_max = 0.0;
-  double difference_knudsen_max = 0.0;
-  double difference_front_grad_Te_max = 0.0;
-  double difference_front_grad_rho_max = 0.0;
-  double difference_E_ref_total = 0.0;
-  std::int64_t holo_n_core_cells = 0;
-  std::int64_t holo_n_entered = 0;
-  std::int64_t holo_n_exited = 0;
-  std::int64_t holo_n_hard_exited = 0;
-  std::int64_t holo_n_island_rejected = 0;
-  double holo_tau_R_min = 0.0;
-  double holo_tau_R_max = 0.0;
-  double holo_reduced_flux_max = 0.0;
-  double holo_E_LO_total = 0.0;
-  double holo_E_LO_boundary_in = 0.0;
-  double holo_E_LO_boundary_out = 0.0;
-  double holo_matter_delta = 0.0;
-  double holo_source_balance_error = 0.0;
-  double holo_particle_net_source_core = 0.0;
-  double holo_lo_particle_source_mismatch = 0.0;
-  double holo_Prr_coverage = 0.0;
-  double holo_chi_min = 0.0;
-  double holo_chi_mean = 0.0;
-  double holo_chi_max = 0.0;
+// Maximum-principle overshoot of the step's radiation phase (NUMERICS §11.8): the cells whose electron temperature
+// after the phase exceeds T_max = max(largest electron temperature before it, Marshak drive temperature), and the
+// largest (T_e - T_max) / T_max (history radiation/overshoot_count, radiation/overshoot_max).
+struct RadiationOvershootDiagnostics {
+  std::int64_t count = 0;
+  double max_ratio = 0.0;
 };
 
 struct ArealDensityDiagnostics {
@@ -109,6 +52,11 @@ struct LaserPatternDiagnostics {
   double cbet_ledger_residual_rel = 0.0;
   std::int64_t cbet_iterations = 0;
   std::int64_t cbet_clamp_count = 0;
+  // The last CBET solve's convergence: 1 converged / 0 not, the final convergence metric, and the rays whose record
+  // capacity overflowed (their tails counted as unabsorbed; NUMERICS §5.10.6).
+  std::int64_t cbet_converged = 1;
+  double cbet_convergence_residual = 0.0;
+  std::int64_t cbet_overflow_rays = 0;
   std::int64_t critical_surface_hit_count = 0;
   double corona_transition_blend = 0.0;
   std::int64_t corona_transition_resolved_cells = 0;

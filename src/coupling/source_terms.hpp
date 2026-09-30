@@ -11,21 +11,6 @@ struct HydroEOSContext;
 
 namespace tenryu::coupling {
 
-double inject_radiation_source_terms(core::State& state,
-                                     const core::Config& cfg,
-                                     double dt,
-                                     double* E_floor_injected = nullptr,
-                                     int* clamp_count = nullptr,
-                                     const std::vector<double>* sigma_R_max = nullptr);
-
-double inject_radiation_source_terms(core::State& state,
-                                     const core::Config& cfg,
-                                     double dt,
-                                     double* E_floor_injected,
-                                     int* clamp_count,
-                                     const std::vector<double>* sigma_R_max,
-                                     const hydro::HydroEOSContext* eos_ctx);
-
 double inject_laser_source_terms(core::State& state,
                                  const core::Config& cfg,
                                  double dt,

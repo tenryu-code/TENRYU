@@ -6,7 +6,6 @@
 
 #include "core/config.hpp"
 #include "core/state.hpp"
-#include "radiation/particle_pool.cuh"
 
 namespace tenryu::io {
 
@@ -82,7 +81,6 @@ class HDF5Writer {
   std::string write_checkpoint(
       const tenryu::core::State& state,
       const tenryu::core::Config& cfg,
-      const tenryu::radiation::PhotonPool& photon_pool,
       int file_index,
       int step,
       double t,

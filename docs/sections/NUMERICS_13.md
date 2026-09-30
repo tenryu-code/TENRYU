@@ -20,18 +20,27 @@ window.
   セル {m_k, e_k, Y_k}、節点 {r_i, u_i}、r_0=0 固定。人工粘性は
   c1·ρ·c_s·|Δu| + c2·ρ·Δu² (c1/c2 は 2D 側と同値既定 0.5/4.0)。
   CFL=0.25 で 2D step 内を subcycle。host 常駐 (GPU コスト零)。
-- **Energy admissibility guard (2026-08-24)**: supported/free 経路は候補
-  dt ごとに compatible ΔU の trial を positivity guard ループ内で評価し、
-  \(e+\Delta U/m \le 64\epsilon\max(|e|,\tfrac12\max u^2,c_s^2)\) なら
-  install せず dt 半減 (受理 step は式恒等で bit 不変・gate_cap22 実証)。
-  \(10^{-22}\) s 割れは `energy_floor` 拒否+dump。無記帳床なし (旧
-  e≥1e-30 clamp は O(1) 残差の隠蔽源だった)。
 - **massless outer face**: 外端フェイスは質量ゼロの運動学拘束
   (V_c 追随)。外殻セル全質量は内側節点へ lump する。質量つき face の
   速度上書きは ±7e4 erg/step 級の slosh 整流注入 (実測)、純力学 face は
   2D 境界から係留喪失 (実測 dV −7e-3 cm³ 発散) — massless が唯一
   健全。
 - 2D への返り圧: `macro_core_pressure` はサブモデル外面の P+q を返す。
+- positivity guard が trial 節点交差を検出した場合は dt を半減し、各 retry
+  で guard 前の速度から momentum kick を再計算する。受理された単一の
+  final dt を速度更新、位置更新、compatible cell work、piston work の全てに
+  用いる。
+- **Energy admissibility guard (2026-08-24, 相談 #16 §6)**: supported/free
+  経路では、候補 dt ごとに compatible な \(\Delta U_j\) の trial を節点交差
+  チェックと同じ guard ループ内で評価し、いずれかのセルで
+  \(e_j+\Delta U_j/m_j \le 64\,\epsilon_{mach}\max(|e_j|, \tfrac12\max(u_j^2,u_{j+1}^2), c_{s,j}^2)\)
+  なら state を install せず dt を半減して再試行する (棄却 trial の
+  \(\Delta U\) は受理時と式恒等のベクトルから commit — 非発火 step は
+  bit 不変、gate_cap22 で end-to-end 実証)。dt が \(10^{-22}\) s を割れば
+  `energy_floor` として substep を拒否し診断 dump を出す。**無記帳の
+  エネルギー床は存在しない** (旧 \(e\ge10^{-30}\) clamp は O(1) 閉合残差の
+  隠蔽源だった)。legacy dynamic_outer 経路 (study-only) は従来の clamp の
+  まま対象外。
 
 ### 13.2 吸収 (handoff) 契約
 - **GASFRONT 球対称スケジュール** (`TENRYU_I1B_SPHERICAL_ABSORB_*`):
@@ -50,16 +59,30 @@ window.
   質量加重マージで受ける。
 
 ### 13.3 エネルギー簿記 (単一所有 pair 契約)
-- 界面仕事は両側が同一の Π·ΔV_c を記帳する (impulse 簿記は正確に
-  半分を計上していた: 実測 W_2d=W_1d/2)。
-- **Compatible total-energy update (W4d-7)**: 各セルの
-  \(\Delta U_j=\Delta t\,\sigma_j(A_j\bar u_j-A_{j+1}\bar u_{j+1})\)
-  (\(\sigma=P+q\)、pre-step 面積、\(\bar u\)=kick 中点速度) — 内部面項は
-  節点 K 更新と厳密に telescope。自由外面は \(-\Delta t P_{ext}A_n\bar u_n\)、
-  massless 結合面は \(-\Delta t\,\sigma_{n-1}A_n u_{bc}\)。旧
-  swept-volume 内部エネルギー形は反射衝撃 tail で +9.5% (dt/chunk
-  細分不変 = 古典的 O(1) shock-crossing 欠陥) — compatible 形で
-  サブモデル台帳は丸め誤差まで閉じる (cap21 tail 実測 resid_rel
+- 2D pooled overlay の界面仕事は §9 の global nodal-KE conjugate impulse
+  \(-\sum_k\alpha_k\mathbf I_k\cdot\mathbf u_k^\sharp\) を一度だけ記帳する。
+  core1d 側の piston ledger は実際の subcycle kick/motion と同じ final dt
+  を使う独立の内部閉包診断であり、2D booking を \(-\Pi\Delta V_c\) で
+  上書きしない。
+- **Compatible total-energy update (W4d-7):** with
+  \(\sigma_j=P_j+q_j\), pre-step face area \(A_i=4\pi r_i^2\), and nodal
+  kick midpoint velocity \(\bar u_i=(u_i^-+u_i^+)/2\), each cell receives
+  \[
+  \Delta U_j=\Delta t\,\sigma_j
+  \left(A_j\bar u_j-A_{j+1}\bar u_{j+1}\right).
+  \]
+  The interior face terms telescope exactly against the nodal kinetic-energy
+  update. At the massive free outer face the remaining boundary work is
+  \(W_{ext}=-\Delta t\,P_{ext}A_n\bar u_n\). At the coupled massless face,
+  the prescribed velocity is the face velocity and the remaining flux is
+  \(W_{face}=-\Delta t\,\sigma_{n-1}A_n u_{bc}\), using the same pre-step
+  area family. The previous swept-volume internal-energy form had the classic
+  O(1) shock-crossing energy defect: the champion reflected-shock tail measured
+  a +9.5% of \(U\) closure residual invariant under substep and chunk
+  refinement. The compatible attribution removes that non-convergent defect;
+  \(q\) is included only through \(\sigma\), with no separate heating term.
+- サブモデル内部は U+K vs (injected + piston work) の台帳で compatible
+  substep の丸め誤差まで閉じる (反射衝撃の tail で実測した相対閉合残差
   −1.9e-14)。
   1 step = 1 advance (rollback+再前進対は K を漏らす: 実測)。
 - 診断: 吸収ガス部分体積はサブモデル殻から直読 (`pc.core1d_V_gas_c`
@@ -104,300 +127,3 @@ window.
   — 旧 I1-B-R #601 (Eulerian/AMR 中央 patch) は独立 capability
   milestone のまま。
   gate 証拠: docs/validation/2d_rz/I1/i1b_tier2_gate_evidence_20260703.md。
-
-## 14. 核燃焼カーネル（nuclear burn、1D_SPH v1）
-（merge train 註 2026-07-18: 統合実施 — 本 §14 採番を採用し、1d 側 §13 と内容照合の上で一本化済み。）
-
-`Burn.enabled=True`（既定 False、SPECIFICATION §6.4.11）で有効化。設計の一次記録は
-`docs/design/burn_kernel_1d_v1_design_20260710.md`（W0–W5 の測定・裁定履歴込み）。
-実装は `src/burn/`（reactivity / network / deposition / partition / burn_stage）＋
-`coupling/driver.cpp` の burn callback。既定 OFF は bit 恒等（§14.6）。
-
-### 14.1 反応チャネルと反応率
-
-v1 チャネル：DT = T(d,n)⁴He、DD 両分岐 = D(d,p)T / D(d,n)³He、D³He = ³He(d,p)⁴He
-（既定 OFF）。T+T は対象外（BH fit 不在、レートは DT 比 ~10⁻² 以下）。
-反応率は Bosch & Hale 1992（NF 32, 611）Eq. 12–14 の Padé パラメタ化
-（Table VII 係数を `burn_constants.hpp` に凍結転写、Table VIII 8 温度×4 反応
-アンカーで rel ≤ 1.5e-3 を単体ゲート G-R0 が常時検証）：
-\[
-\langle\sigma v\rangle = C_1\,\theta\sqrt{\xi/(m_rc^2\,T^3)}\,e^{-3\xi},\quad
-\xi=(B_G^2/4\theta)^{1/3}
-\]
-T は **イオン温度 [keV]**（TENRYU 内部 eV → kernel 入口で 1 回だけ 1e-3 倍。
-keV/eV 混同は G-R0 が桁で検出する設計）。fit 床（DT/DD 0.2 keV、D³He 0.5 keV、
-**両端含む**）未満は rate=0、天井（100/190 keV）超は天井値へクランプ（記録済み仕様）。
-体積反応率は \(r = n_i n_j \langle\sigma v\rangle/(1+\delta_{ij})\)（DD は 1/2）。
-
-**遮蔽補正（v2、`Burn.screening`、既定 "none" = 係数 1.0 恒等）**：反応対ごとに
-\(\langle\sigma v\rangle_{scr} = F_k\,\langle\sigma v\rangle\)、\(F_k=e^{h_k}\ge1\)。
-`"salpeter"` = Salpeter 1954 弱遮蔽（電子込み 2T Debye:
-\(\lambda^{-2}=4\pi e^2[\sum_s n_sZ_s^2/k_BT_i + n_e/k_BT_e]\)、
-\(h=Z_iZ_je^2/(\lambda k_BT_i)\)；非縮退電子 θ_e=1、有効域 h≪1）。
-`"chugunov_dewitt"` = CD 2009 (PRC 80, 014611) Appendix A4 補間
-（イオン遮蔽・剛体電子背景；弱結合で Debye-Hückel A1、強結合で本文 fit へ —
-ICF 燃焼域は Γ_e~0.01-0.14 の弱結合で A4 枝が operative）。両モデルの弱極限比は
-解析関係 \(h_S/h_{CD}\to\sqrt{(\langle Z^2\rangle+\langle Z\rangle)/\langle Z^2\rangle}\)
-（DT で √2 — 電子遮蔽の有無の設計差、ゲートはこの関係を検証する）。混合モーメント
-⟨Z⟩,⟨Z²⟩ はセルの burn 種在庫（ash 込み）から。ICF 帯の大きさ:
-F_CD = 1.002 (10 g/cc, 3 keV) 〜 1.08 (10³ g/cc, 1 keV)。設計・凍結参照値は
-`docs/design/burn_kernel_v2_20260710.md` §B。
-
-> **ガード（2026-07-26）**: Salpeter は非有限/非正の入力
-> （T_i, T_e, n_e）で全反応 F=1 に落として one-shot WARNING、指数は
-> \(h \le h_{max}=2\) にクランプ（弱遮蔽模型の有効域外 — \(e^2\simeq7.4\) 倍で頭打ち、
-> 超過は one-shot WARNING）。2T Debye 形は Salpeter 1954 の平衡理論の
-> **TENRYU 独自 2T 拡張**であり published equilibrium result ではない（§4.2 指摘の明示）。
-
-### 14.2 種ネットワークと Lagrangian 比在庫
-
-種は D, T, ³He, ⁴He, p の 5 種＋中性子（台帳のみ、自由飛行逃逸）。**在庫は比在庫
-\(Y_s = n_s/\rho\) [1/g] で保持**する — 連続の式 ∂n/∂t = −n∇·v + (network) の希釈項は
-Lagrangian セルでは Y_s 不変性に吸収され、レート評価時に \(n_s = Y_s\rho\) を毎ステップ
-再構成する。密度凍結格納は膨張セルで燃料対上限を桁破りする（W5 実測 22,800×、
-gate G0 f_r ≤ 1 が常設番人）。将来の ALE/remap 結合は Y_s の質量保存 remap が前提条件。
-
-ステップ内は温度・密度凍結の per-cell 常微分方程式を RK2（explicit midpoint）で
-subcycle：\(M=\mathrm{clamp}(\lceil dt\,\max_s q_s/\max(n_s, 10^{-9}n_{tot})/\varepsilon_{dep}\rceil, 1, M_{max})\)、
-\(q_s = \max(q_s^+, q_s^-)\)（**総生成と総消費の大きい方** — 2026-07-26 修正:
-旧実装は net \(|\dot n_s|\) を使っており、DD-bred T が DT 消費と
-釣り合うセルで短い turnover が不可視だった。総量制御への修正で純消費燃料
-（pure-DT deck）は bit 不変）。
-制御対象は**有効チャネルの反応物種すべて（成長含む）** — 微量 bred-T（DD→DT 連鎖）の
-分解能欠落は G-R1c（scipy LSODA rtol 1e-12 凍結参照との 3 checkpoint 照合 rel ≤ 1e-6）が
-検出した実障害モードで、消費種限定制御は棄却済み。gross-turnover 回帰は
-G-R1d（R_DDp≒R_DT の人工均衡で required substeps が飽和すること）。
-\(M_{req} > M_{max}\) の飽和は黙認しない（2026-07-26 カーネルレビュー指摘）: 必要数を報告し、
-\(0.9\,dt\,M_{max}/M_{req}\) を burn dt 制限（state.burn_dt_limit_s、次ステップ制御）
-へ畳み込み、rate-limited WARNING を出す。current-step retry 化は driver
-transaction 拡張が必要で escalate 済み（同 dt 内の当該ステップは M_max で受理される
-— 精度契約は次ステップ縮小で回復する設計）。正値性は決定論的 scale-back
-（θ = min n_s/(−Δn_s)、counts を先にスケールし在庫は counts から再構成 — 台帳一次主義）
-＋ sub-ulp ゼロクランプ。反応 counts は RK2 と FP 同一の積で蓄積し、在庫変化との
-化学量論恒等は数 ulp 帯で成立（G-R1a は counts↔He4 在庫の FP 恒等も検証）。
-
-### 14.3 荷電粒子沈着（scheme="fraley"）
-
-α range は Fraley 1974 fit 3d × 電子項 Coulomb-log 密度補正：
-\[
-\rho\lambda_\alpha(T_e,\rho) = \frac{1.5\times10^{-2}\,T_e^{5/4}}{1+8.2\times10^{-3}\,T_e^{5/4}}
-\cdot\frac{1+0.17\ln T_e}{1+0.17\ln(T_e\sqrt{\rho_0/\rho})},\quad \rho_0=0.213
-\]
-（T_e keV、g/cm²。δ(ρ)=1→3 for solid→**絶対密度** 10⁴ g/cm³ を再現、G-K0）。
-非 α 種は電子 drag 域スケーリング \(\lambda_s=\lambda_\alpha\sqrt{m_sE_s/m_\alpha E_\alpha}(Z_\alpha/Z_s)^2\)。
-
-**媒質の組成**（2026-09-23 是正 — 旧実装は組成によらず等モル DT の飛程を使っていた）:
-fit 3d は等モル DT の値なので、\(1/(\rho\lambda)=S_e+S_i\)（電子項
-\(S_e=1/(1.5\times10^{-2}T_e^{5/4})\)、イオン項 \(S_i=8.2\times10^{-3}/1.5\times10^{-2}\)）に分け、
-単位質量あたりの電子数と \(\sum_j Z_j^2/A_j\) の等モル DT 比
-\(f_e=(\bar Z/\bar A)/(\bar Z/\bar A)_{DT}\)、\(f_i=(\overline{Z^2/A}/\bar A)/(\overline{Z^2/A}/\bar A)_{DT}\)
-（上線はイオンあたりの平均）で \(f_eS_e+f_iS_i\) とする。Coulomb-log 密度補正の ρ は DT 換算の
-電子密度に当たる \(f_e\rho\) で置く。組成はステップ開始時のセルの場イオン（§14.7 と同じ定義）。
-等モル DT では \(f_e=f_i=1\) が厳密に成り立ち旧式とビット同一、灰（⁴He・p）が溜まると 1 からずれる。
-純 D は \(f_e=1.249\)・\(f_i=1.497\)（10 keV・固体密度で飛程 0.79 倍）。
-
-幾何は**点源球核**（一様媒質・直線飛行・v 線形電子 drag の前荷重減速
-\(E(s)=E_0(1-s/\lambda)^2\)）：出生半径比 u=r/R_b、τ=R_b ρ̄/ρλ に対する閉形式
-（asinh 1 個の初等関数、G-K1 で凍結求積参照 39 点 abs ≤ 1e-11）。体積平均は古典二分枝
-\[
-f(\tau)=\tfrac{3}{2}\tau-\tfrac{4}{5}\tau^2\ (\tau\le\tfrac12),\qquad
-1-\tfrac{1}{4\tau}+\tfrac{1}{160\tau^3}\ (\tau\ge\tfrac12)
-\]
-に一致（W0 で独立導出・記号/数値検証、G-K2）。燃料域は volFrac 閾値の単一区間、
-R_b = 最外燃料セル外縁、ρ̄ は外向き radial 台形 column の平均密度（一様球で厳密に ρ）。
-保持分 f_pt を出生セルへ沈着、残余は荷電逃逸台帳へ（**escape = released − dep の FP 構成
-＝台帳恒等が構造的**、G4 実測 ≤3e-15）。斜め chord の成層は v1 近似（設計 doc §4.4）。
-
-### 14.4 電子/イオン分配
-
-既定 `partition="li_petrasso"`：LP 1993（PRL 70, 3059）一般化 dE/dx
-（大角散乱 1/lnΛ 補正＋x>1 集団項、量子 p_min、電子 Debye 遮蔽、lnΛ 床 2、
-u²=v_t²+v_f²）を初期化時に減速積分し、
-**(log T_e × log T_i × log n_e) 64×16×16 表 × 生成物 slot** に凍結
-（runtime Python 不使用；slot 毎に std::async 並列 build、書込み範囲が互いに素なので
-bitwise 決定的）。**field 温度は種別**（2026-07-26 修正）:
-電子 field の熱速度は T_e、D/T/³He イオン field は T_i（\(v_f^2=2T_f/m_f\)）。
-旧実装は全 field に T_e を渡しており、\(T_e\ne T_i\) の hot-spot 形成期に
-イオン stopping と e/i 分配が系統的に誤っていた。Debye 長は電子（T_e）のまま。
-lookup は clamped trilinear。G-P1 = LP Table I（{6,19,32,47,64}% @ {1,5,10,20,40} keV、
-T_i=T_e 対角で評価）±3 点＋Python prototype ±1 点の転写忠実帯。
-残存既知事項（escalate 済み）: 積分下限 \(E_{min}=\max(1.5k_BT_e,10^{-3}E_0)\) 未満の
-残差は全体平均で扱う（review §5.3）、背景組成は初期 x_D/x_T/x_He3 凍結（§5.2）。`partition="fraley"`（Eq. 4:
-\(f_i=1/(1+32/T_e[\mathrm{keV}])\)、DT-α 限定、validation 強制）は rung-2 用 knob。
-両者の ~8 点差（10 keV）は実物理差（LP p.3061）であり一致はむしろ危険信号（G-P2）。
-
-### 14.5 結合・台帳・dt
-
-演算子槽は laser 直後・radiation 前（sequential: H-C-L-**B**-R；Strang: L(dt)-**B(dt)**-
-H/2-C-R-H/2、burn は全 dt 陽的源で分割しない）。ステージは host 実行（in-flight mirror
-方式は inject_laser_source_terms 前例踏襲；perf 最適化は将来の別 PR）。沈着は
-\(e_e{+}\!=dE_e/(\rho V)\), \(e_i{+}\!=dE_i/(\rho V)\) 後に Te/Ti/Pe/Pi を再閉包
-（table EOS / cv_override / ideal の全分岐、1T は合算を e_e へ）。沈着と閉包はデバイス上で
-レーザー沈着と同じ閉包を使い、energy_authoritative の表 EOS では表の温度上限を超えた
-エネルギーを高温側の延長（\(T=T_{top}+(e-e_{top})/c_{v,top}\)、\(P=P_{top}T/T_{top}\)、§1）で
-閉じる。沈着の無いセル（\(dE_e=dE_i=0\)）は触らない（2026-09-23 修正: 従来はホストで全セルを
-再閉包しており、反応の無いセルの Te を逆変換の許容誤差だけ動かし、表の上限を超えたセルでは
-Te を \(T_{max}\) に止めていた）。void・質量ゼロのセルへの沈着は skipped として台帳に計上し、
-床注入・クランプ数はセル順の固定順で畳み込む。local スキームで燃焼域（燃料体積分率が vf_threshold を超える最初から最後のセル）に反応しうるセル（\(\rho>0\) かつ \(T_i\ge T_{floor}\)）が無い step は、ステージと沈着を実行せず診断量をゼロにする（沈着ゼロのセルは触らないので結果は実行した場合とbit 同一。2026-09-23、ホスト転送と起動の省略）。核融合エネルギーは
-静止質量起源の**外部源**として budget の source 側 `E_burn_in` に登録（逃逸荷電/中性子は
-流体に入らないので sink ではない）。W5 実測：burn 活性 6 run すべてで
-epsilon_budget ≤ 6e-16。dt 制限は hot-electron 意味論
-\(dt \le f_E\,e_{cell}/P_{dep}\)（lineage "burn"）＋ eps_deplete
-（subcycle 飽和時は \(0.9\,dt\,M_{max}/M_{req}\) を同じ burn dt 制限へ畳み込む —
-§14.2、2026-07-26）。決定論：セル独立
-＋固定順縮約（bit 再現、host-device は FMA 差により rel 1e-13 ゲート）。
-
-### 14.6 契約・制約（v1）
-
-- 既定 OFF bit 恒等：W5 A/B（base=b07ac0c3）で field 53/53・history 164/164 bitwise、
-  frozen_config 差分は additive な burn block のみ。GXII golden rel=0×6。
-- persistent path は拒否（`warn_unsupported_once("burn")`）。1D_SPH+球面限定
-  （validation）。HDF5 は additive（hydro/burn_*、time_state/E_burn_*）で
-  kSchemaVersion 不変。checkpoint restart は burn_n_* 必須（欠損 hard error）。
-- 非目標（設計 doc §1、v2 完了分を注記）：MC α は v2-D（§14.9）、中性子 in-flight 加熱は v2-E（2 線群 first-collision、SPECIFICATION §6.4 Burn.neutron_heating — 1D 専用、2D は fail-closed）で実装済み。EOS 組成 feedback
-  （燃焼率 ≪1 近似、MULTI-IFE 同型）、2D、megakernel。
-
-### 14.7 多群荷電粒子拡散（v2、`Burn.scheme="diffusion"`）
-
-Corman-Loewe-Cooper-Winslow 1975 (NF 15, 377) の忠実実装。生成物 slot 6 種を
-共有 log エネルギー格子（`diffusion_groups` 群、`diffusion_E_min_keV`〜15.5 MeV）
-で追跡:
-\[
-\partial_t N_g = \nabla\cdot(D_g\nabla N_g) - N_g/\tau_g + N_{g+1}/\tau_{g+1} + S_g,\quad
-\tau_g = t_E\tfrac{2}{3}\ln\frac{\gamma t_E+E_{g+1}^{3/2}}{\gamma t_E+E_g^{3/2}}
-\]
-D_g は flux-limited（加算型 limiter + Post-Wilson \(|\bar\mu|^{-1}=1+3e^{-(\lambda/2)|\nabla N/N-3.6/r|}\)、
-前ステップ N で準線形化）。群カスケードは g_max→1 の逐次陰解、群毎に球面 r² FV
-三重対角を cusparseDgtsv2StridedBatch（cached handle + pooled buffer、FLD 様式）で解く。
-境界: 中心 reflect、外面 Milne 逃逸（1/L = 1/(0.71λ)+1/r_J、逃逸流は荷電逃逸台帳へ）。
-係数 t_E（電子 drag、v≪v_te 極限の標準形）・γ（イオン drag）・λ=2vt_D（90° 偏向）は
-明示 NRL 型 Coulomb log で毎セル毎ステップ評価（論文 intro の絶対値 anchor は未印字
-log 処方を含むため転写対象から棄却 — log-free 恒等式 e/i∝E^{3/2}・λ∝E² と 0-D 解析
-減速極限 \(E(t)=[(E_0^{3/2}+\gamma t_E)e^{-3t/2t_E}-\gamma t_E]^{2/3}\) が gate）。
-t_E は電子とのエネルギー緩和時間 \(\dot E = -E/t_E\) で、Corman (1975) p. 380 の
-\(t_E = 3m\theta_e^{3/2}/(8\sqrt{2\pi m_e}\,n_e Z^2 e^4\ln\Lambda_e)\)
-（Spitzer の運動量減速時間の半分。2026-09-23 是正 — 旧実装は分母の 8 を 4 としており
-t_E が 2 倍、電子加熱率が半分だった。`Burn.scheme="diffusion"`（1D・2D）と `"mc"` が共有する）。
-**イオン Coulomb log と γ は (群, セル) 毎**に群中心エネルギーで評価する
-（2026-07-26 修正 — 旧実装は出生エネルギーで 1 回評価し
-全群へ流用しており、最接近距離の E 依存が終端域で欠落していた）。
-**場イオン**（2026-09-23 是正 — 旧実装は全セルで等モル DT に固定し、イオン Coulomb log の
-場イオン密度と質量だけ A=2.5、γ・λ は 2.51505 を使っていた）: γ・λ・イオン Coulomb log の場イオンは
-セル毎の組成から作る。燃焼在庫の D/T/³He/⁴He/p（比在庫 \(Y_s\)、重み \(Y_s m_p\)）と、
-セルの非燃料・非 void 材料（重み \(vf_m/A_m\) — 在庫の初期化と同じく材料の質量分率を体積分率で置く、
-電荷は材料の Z、化合物は平均の Z で代表）を完全電離のイオンとして平均し、\(\bar A\)・\(\overline{Z^2}\)・\(\overline{Z^2/A}\) を得る:
-\(n_i=\rho/(\bar A m_p)\)、γ の \(\sum_j n_jZ_j^2/m_j=n_i\overline{Z^2/A}/m_p\)、λ の
-\(\sum_j n_jZ_j^2=n_i\overline{Z^2}\)、イオン Coulomb log の Debye 項 \(n_i\overline{Z^2}/kT_i\) と換算質量の
-場イオン質量 \(\bar A m_p\)。面の λ は両セルの \(\sum_j n_jZ_j^2\) の平均で評価する。在庫も場の材料も無い
-セル（void）は設定の燃料組成 Burn.x_D/x_T/x_He3 を使う。組成はステップ開始時の在庫で評価し、2D の
-複数ランクでは所有者の値を ghost セルへ交換する。電子項 t_E は従来どおりセルの
-\(n_e=\bar Z\rho/(A_{eff}m_p)\)。
-t_E 非正/非有限のセルは γ が有限なら純イオン drag で減速を継続
-（\(\tau=(2/3)(E_{g+1}^{3/2}-E_g^{3/2})/\gamma\)、分配は全イオン — §6.5 修正;
-旧実装は sink ごと消していた）。
-
-簿記はカスケード転送構成で厳密: 出生は隣接 2 群へ数+エネルギー両保存 binning
-（出生エネルギーが最上位群**中心**を超える超過分 `top_excess` は電子へ即時沈着 —
-既定格子で D³He 14.663 MeV proton は 704 keV=4.80% が該当。2026-07-26 から
-one-shot WARNING で定量報告する。格子再設計（product-aligned grid）は escalate 済み、
-2026-07-26 カーネルレビュー指摘）、
-転送 1 粒子毎に (Ē_{g+1}−Ē_g) を沈着（**e/i 分配は群内のエネルギー重み付き積分
-\(f_i=\frac{1}{\Delta E}\int S_i/F\,dE\)** — 2026-07-26 修正:
-旧実装は滞在時間重み \(\int(S_i/F^2)/\int(1/F)\) で、粗い群の e/i crossover 帯で
-構造的に別の積分だった。本 scheme の分配は内在で `Burn.partition` は不使用）、
-g=1 退場は Ē₁ を全イオンへ（熱化）。**在庫は比スペクトル Y_g = N_g/ρ [1/g] で持続**（§14.2 と同じ Lagrangian
-希釈対策 — 密度持続は膨張系で台帳を 11% 破った実測記録あり、設計 doc §C.3）。
-飛行中エネルギー E_inflight が新台帳項（released = dep + esc + ΔE_inflight、
-実測 2.9e-15；ε_budget は流体側 dep のみ計上で 4.5e-16 恒常）。checkpoint は
-hydro/burn_Ng_slot{0..5} [1/g] + time_state/E_burn_inflight（additive）。
-cross-scheme 帯: 3 keV/ρ10/ρR0.2 で deposited fraction 比 diffusion/fraley =
-0.746（採択帯 [0.60,0.90] — 直線点核 vs 拡散+Milne 逃逸+スペクトル拡散の模型差）。
-
-### 14.8 中性子スペクトル合成診断（v2、read-only）
-
-Brysk 1973 の二 Maxwell 平均モーメント。燃焼重み付き ⟨T_i⟩_burn・⟨v_r²⟩_burn
-（DT / DDn 別、固定順セル和）から:
-平均シフト \(\langle E_n\rangle - \tfrac{m_\alpha}{m_n+m_\alpha}Q =
-\tfrac{m_n}{m_D+m_T}\tfrac{3}{2}\theta + \tfrac{m_\alpha}{m_n+m_\alpha}\langle K\rangle\)
-（⟨K⟩ = 3T_reac−(3/2)θ、T_reac は Brysk Table 1 転写（Reac 列 = ⟨E⟩/3 と解読、
-両公表 anchor 35 keV/336 keV·33/157 keV を実装前検算で再現）、log-T 補間・[1,100] keV clamp）、
-熱幅 σ² = 2m_nθ⟨E_n⟩/(m_n+m_partner)（ガウス分布の標準偏差。Brysk の 336/157 keV は
-1/e 半値半幅 \(\sqrt2\sigma\)。実装は 2026-09-23 まで係数 1/2 を掛け、σ を半分に報告していた）、
-全幅は 4π 平均の流体広がり
-σ_fluid² = 2m_nE_{n0}⟨v_r²⟩/3 を加算（球対称 1D の合成検出器は方向平均 —
-一次モーメントは対称消失、視線スペクトルは v3/Crilly-Munro scope として設計 doc 記録）。
-history `burn/neutron_{Ti_burn,mean_shift,sigma_thermal,sigma_total}_{dt,dd}`
-（burn 有効 run のみ、エネルギー簿記への影響ゼロ）。
-
-### 14.9 MC α 輸送（v2、`Burn.scheme="mc"`、統計モード）
-
-Yuan-Moses-McKenty 2005 型の直線 CSDA Monte Carlo（1D 球面特化、角散乱なし —
-偏向 λ は拡散 scheme のみ）。**停止能係数は §14.7 と同一**（場イオンを含む。corman_tE/γ 共有 —
-scheme 間一致 gate が模型恒等性の検証になる）。イオン Coulomb log は
-**粒子の現在エネルギー**で毎セグメント評価（2026-07-26 修正 —
-旧実装は出生エネルギーで凍結、Bragg-peak 近傍の γ を誤っていた。RNG 消費は不変）。粒子 (r, μ, E, w, slot) は
-ステップ間持続 pool（時間依存近似）、出生は殻内 r³ 一様 + 等方 μ、
-**RNG は Philox / curand_init(seed^global_id, subsequence=step, offset) —
-NUMERICS §12.7.1 凍結契約**（global_id = (cell·6+slot)·N_mc+sample）。
-CSDA 沈着は局所瞬時レート比で e/i 分割、熱化 E≤E_min → イオン、逃逸 → 台帳。
-新しい粒子は pool の既存粒子の後ろに (cell, slot, sample) の順で並ぶ（(cell, slot) ごとの粒子数の排他的走査で
-位置を決める）。セルへの沈着は 128 ビットの固定小数点の整数（64 ビット 2 語、下位語の桁上がりを上位語へ）に
-原子的に足す: そのステップの粒子の総エネルギー E_tot = f·2^e（0.5 ≤ f < 1）に対し 1 単位 = 2^(e−100) で、
-1 回の沈着の丸めは 2^(−100)·E_tot 以下。整数の和は順序に依らず、発生・逃逸・飛行中の集計も
-(cell, slot) または粒子ごとの値の固定順序の和なので、同じ seed の再実行はビット一致する（2026-09-24。
-それまでは浮動小数点の atomicAdd で、pool の並びもスレッドの実行順だった）。負または非有限の沈着が
-あったセルは沈着を NaN で返す。
-per-particle 簿記により台帳恒等 released = dep+esc+ΔE_inflight は RNG に
-依らず厳密（実測 8.5e-15、ε_budget 5.6e-16）。
-**三 scheme 整合（3 keV/ρ10/ρR0.2 実測）**: deposited fraction
-fraley 0.968 / mc 0.928 / diffusion 0.722 — mc（参照級）に対し fraley は
-その解析近似（+4%）、diffusion は Milne 逃逸+スペクトル拡散で低め、と
-物理的序列どおり。CV gate: 同 seed 5 run CV ≤ 1e-3（§0.3 文言。2026-09-24 以降はビット一致）
-+ 異 seed 5 run CV ≤ 5%（統計収束、1/√N 傾向は PERFORMANCE 記帳）。
-
-### 14.10 2D_RZ port（scheme="local"|"diffusion"、2026-07-11）
-
-\`Main.dimension="2D_RZ"\` で Burn.enabled=True が有効（設計記録は
-\`docs/design/2d_burn_port_spec.md\`、実装は src/burn/burn_stage_2d +
-corman_diffusion_2d + driver 2D 配線）。1D との差分のみ記す：
-
-- **scheme 行列**: 2D は \`"local"\`（全量出生セル沈着、LP/fraley 分配）と
-  \`"diffusion"\`（§14.7 の Corman を 2D RZ FV へ一般化）のみ。\`"fraley"\` は
-  点源球核が 1D_SPH 固有のため 2D では ConfigError、\`"mc"\` は未移植で同様。
-  namelist キーは 1D と完全共有（新キーなし）。
-- **種輸送と ALE remap（C-REMAP 契約）**: Y_s [1/g]（cell-major
-  [n_cells×5]、host 主体）は構造格子 swept remap 本体
-  （ale_remap_2d_rz_kernel / apply_hydro_face_flux）で質量 flux と同一の
-  sign·dm に donor 風上で随伴（clamp なし・二次 remap 時も勾配再構成なし）。
-  境界 z-flux は流出のみ随伴（供給流入は組成ゼロ）。実測：uniform-Y は
-  ~80 remap events で 2.9e-15 保存・種総数 drift 0.0 厳密・blob 保存 0.0
-  厳密。診断上の注意：burn dataset は最初の post-step snapshot から出現
-  （burn_enabled_any latch）。
-- **拒否行列（fail-closed）**: burn+ALE は conservative_remap_enabled ∧
-  single_block のみ許可。拒否 = ¬conservative_remap / per_material_conservation
-  / total_energy_remap_2d_rz / axis_band_managed_remap / multiblock /
-  hllc_z_flux_2d_rz / force_rezone_every_n_steps>0 / reference_barrier。
-- **Corman 2D**（scheme="diffusion"）: 体積重み対称 SPD 5 点 FV（面積・中心
-  距離は FLD 幾何 helper の clone）。面 D は §14.7 の limiter を面入力の算術
-  平均（N/ρ/lnΛ_I）で評価 — FLD のセル中心 D+調和平均とは意図的に別規約
-  （RZ↔1D 球対称還元性を優先）。Post-Wilson 幾何項は 3.6/R
-  （R=√(r²+z²)、面法線対数微分の ê_R 射影）で原点中心球に厳密還元。境界：
-  axis/reflect=零 flux、free=面毎 Milne 1/L=1/(0.71λ)+1/R_face（同一の
-  extensive 沈み込み係数を assembly 対角と逃逸 tally で共有 — 台帳恒等は
-  構造的）。ソルバ：burn 自前 Jacobi-CG（5 点 stencil 直接 matvec、固定形状
-  二段 reduce、warm start、rel tol 1e-10（rhs 規格）、cap 500 で fail-closed
-  TENRYU_ASSERT）。飛行中スペクトル Y_g [1/g]（6 slot×G 群）は remap 時に
-  ρ で N へスケール→既存 radiation plane kernel 再利用→post-remap ρ で復元
-  （dm·Y_donor と代数恒等）。実測台帳：非 ALE 4.3e-16、diffusion×ALE×活性
-  燃焼複合 1.38e-13、閉箱 esc_charged 0.0 厳密、10 keV で dep_e/dep_i≈5.5。
-- **2T/per-material 沈着**: dE_e/dE_i の沈着は inject_burn_source_terms
-  （1D 移植）+ per_material_conservation 有効時は FLD と同一の質量比配分
-  （fld_2d_rz_gpu.cu の per-material 沈着規約、max(...,0) clamp、Te/Ti_per_material
-  キャッシュ無効化）。
-- **retry 整合**: DriverRetrySnapshot が burn 在庫・累積台帳・Y_g を
-  capture/restore（STRANG では burn が hydro half より先に走るため必須）。
-  1D 側は同 snapshot に burn 未収載の継承ハザードあり（merge train で解消）。
-- **既知の残余（v1）**: host 主体 Y と per-step mirror の perf 繰延、種は
-  cell-level（per-material 種分解は v2）、Post-Wilson/Milne の非原点中心
-  問題はヒューリスティック帯、Brysk 中性子診断キーは 2D では 0.0 のまま
-  （スペクトル合成は未移植）。

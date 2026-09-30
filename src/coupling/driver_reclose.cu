@@ -105,6 +105,10 @@ struct ConductionEOSDeviceParams {
   // gas closes with the ideal gas of its material (per-cell runs whose
   // exact ideal-gas material comes first, 2026-09-24).
   bool no_tables;
+  // Write only the heat capacities cv_e/cv_i of the closure at the current
+  // temperatures; the energies and pressures are left as they are
+  // (refresh_heat_capacity_from_temperature_device, 2026-09-29).
+  bool heat_capacity_only;
   // Per-cell dominant-material table selection and the matching per-material
   // table ceilings (nullptr => first-material tables/ceilings, see below).
   materials::CellEOSTableSelector cell_tables;
@@ -251,10 +255,13 @@ __global__ void sync_conduction_eos_from_temperature_kernel(
       }
     }
   }
-  ee[i] = e;
-  Pe[i] = P;
   if (cv_e != nullptr) cv_e[i] = cve;
   if (cv_i != nullptr) cv_i[i] = cvi;
+  if (params.heat_capacity_only) {
+    return;
+  }
+  ee[i] = e;
+  Pe[i] = P;
   if (params.two_temp) {
     ei[i] = ion_e;
     Pi[i] = ion_P;
@@ -508,9 +515,14 @@ void capture_conduction_fields_device(DriverRecloseContext& context, const core:
   }
 }
 
-bool sync_ee_from_Te_device(core::State& state, const core::Config& cfg,
-                            const hydro::HydroEOSContext& eos_context,
-                            DriverRecloseContext& context) {
+namespace {
+
+// The closure at the current temperatures (sync_conduction_eos_from_temperature_kernel): with
+// heat_capacity_only the heat capacities alone, otherwise also the energies and pressures.
+bool conduction_eos_from_temperature_device(core::State& state, const core::Config& cfg,
+                                            const hydro::HydroEOSContext& eos_context,
+                                            DriverRecloseContext& context,
+                                            const bool heat_capacity_only) {
   const int first = cfg.materials.first_nonvoid_material_index();
   if (first < 0) return false;
   const auto& mat = cfg.materials.materials[static_cast<std::size_t>(first)];
@@ -529,13 +541,16 @@ bool sync_ee_from_Te_device(core::State& state, const core::Config& cfg,
   // first non-void material with tables, so an ideal gas listed first does not
   // switch the table re-closure off for the tabled cells (2026-09-23).
   const int ref = cfg.materials.eos_table_reference_material_index(cfg.main.dim);
-  if (ref < 0 && !any_exact) return false;
+  // Without tables and exact ideal gases the energy sync is the conduction's
+  // own ideal-gas projection; the heat capacities still come from here.
+  if (ref < 0 && !any_exact && !heat_capacity_only) return false;
   const std::size_t n = state.rho.size();
   if (n == 0) return true;
   state.ensure_cell_material_props(cfg);
   TENRYU_ASSERT(n <= static_cast<std::size_t>(std::numeric_limits<int>::max()),
                 "conduction EOS cell count exceeds kernel limit");
   ConductionEOSDeviceParams params{};
+  params.heat_capacity_only = heat_capacity_only;
   params.te_floor = cfg.numerics.floors.Te;
   params.ti_floor = cfg.numerics.floors.Ti;
   params.gamma = mat.ideal_gas_gamma;
@@ -589,6 +604,20 @@ bool sync_ee_from_Te_device(core::State& state, const core::Config& cfg,
   cuda_check(cudaGetLastError(), "sync_conduction_eos_from_temperature_kernel launch failed");
   cuda_check(core::debug_kernel_sync(), "sync_conduction_eos_from_temperature_kernel failed");
   return true;
+}
+
+}  // namespace
+
+bool sync_ee_from_Te_device(core::State& state, const core::Config& cfg,
+                            const hydro::HydroEOSContext& eos_context,
+                            DriverRecloseContext& context) {
+  return conduction_eos_from_temperature_device(state, cfg, eos_context, context, false);
+}
+
+bool refresh_heat_capacity_from_temperature_device(core::State& state, const core::Config& cfg,
+                                                   const hydro::HydroEOSContext& eos_context,
+                                                   DriverRecloseContext& context) {
+  return conduction_eos_from_temperature_device(state, cfg, eos_context, context, true);
 }
 
 bool apply_conduction_energy_increment_device(

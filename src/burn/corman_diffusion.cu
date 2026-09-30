@@ -642,8 +642,8 @@ CormanStepResult corman_diffusion_step(
           std::to_string(excess_keV) + " keV (" +
           std::to_string(100.0 * excess_keV / E_birth_keV) +
           "% of birth energy) is deposited directly to electrons every step. "
-          "Raise Burn diffusion E_max so the top group CENTER clears the "
-          "highest product birth energy.");
+          "The group grid ends at 15.5 MeV (fixed); raise Burn.diffusion_groups "
+          "so the top group CENTER clears the highest product birth energy.");
     }
   }
   source_tally_kernel<<<1, 1, 0, stream>>>(

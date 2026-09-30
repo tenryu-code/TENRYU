@@ -33,7 +33,6 @@
 #include "parallel/reduction.hpp"
 #include "radiation/amgx_solver.hpp"
 #include "radiation/fld_substage_audit_drain.hpp"
-#include "radiation/fleck.cuh"
 #include "radiation/group_structure.hpp"
 #include "radiation/groups.cuh"
 #include "radiation/nlte_coeffs.cuh"

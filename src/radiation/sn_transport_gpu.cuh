@@ -17,7 +17,6 @@ struct SNTransportGPUConfig {
   double convergence_tol = 1.0e-6;
   double temperature_floor_eV = 1.0e-12;
   int block_threads_2d = 128;
-  bool origin_parity_only = false;
   bool dsa_enabled = true;
   bool z_boundary_reflect = false;
   int z_bottom_boundary = kSNBoundaryVacuum;
@@ -34,21 +33,6 @@ struct SNTransportGPUResult {
   int lo_failures = 0;
   double convergence_error = 0.0;
   bool converged = false;
-};
-
-struct SNTransport1DGPUInputs {
-  const double* sigma_a = nullptr;          // [n_cells * n_groups], [1/cm]
-  const double* sigma_s = nullptr;          // [n_cells * n_groups], [1/cm]
-  const double* source_emission = nullptr;  // [n_cells * n_groups], [erg/cm^3/s]
-  const double* node_r = nullptr;           // [n_cells + 1], [cm]
-  const double* vol = nullptr;              // [n_cells], [cm^3]
-  double* E_out = nullptr;                  // [n_cells * n_groups], [erg/cm^3]
-  double* P_rr_out = nullptr;               // [n_cells * n_groups], [erg/cm^3]
-  double* chi_out = nullptr;                // [n_cells * n_groups]
-  double* psi_bar = nullptr;                // optional [n_groups * n_angles * n_cells]
-  int n_cells = 0;
-  int n_groups = 0;
-  double dt = 0.0;
 };
 
 struct SNTransport2DRZGPUInputs {
@@ -82,22 +66,18 @@ struct SNTransport2DRZGPUInputs {
   int mpi_c_end = 0;
 };
 
+// Inputs of the 2D_RZ S_N solve with its material-source publication (solve_sn_material_coupling_gpu). Its 1D path
+// and the matter-update inputs it read (ee, rho, cv_e, Te_old, electron table, heat-capacity fallbacks) were the
+// HOLO S_N closure of the Monte Carlo radiation, retired 2026-09-29 (retired/radiation_monte_carlo/).
 struct SNMaterialCouplingGPUInputs {
   const double* sigma_a = nullptr;  // [n_cells * n_groups], Fleck effective absorption
   const double* sigma_s = nullptr;  // [n_cells * n_groups], Fleck effective scattering
   const double* source_emission = nullptr; // optional [n_cells * n_groups]
-  double* Te = nullptr;             // [n_cells], [eV], emission/Newton temperature
-  double* ee = nullptr;             // [n_cells], [erg/g]
-  const double* node_r = nullptr;   // 1D: [n_cells + 1], 2D: [(nr + 1) * (nz + 1)]
-  const double* node_z = nullptr;   // 2D only: [(nr + 1) * (nz + 1)]
+  double* Te = nullptr;             // [n_cells], [eV], emission temperature
+  const double* node_r = nullptr;   // [(nr + 1) * (nz + 1)]
+  const double* node_z = nullptr;   // [(nr + 1) * (nz + 1)]
   const double* vol = nullptr;      // [n_cells], [cm^3]
-  const double* rho = nullptr;      // [n_cells], [g/cm^3]
-  const double* cv_e = nullptr;     // optional [n_cells], [erg/(g*eV)]
-  const double* sigma_R = nullptr;  // legacy material-coupling input, ignored by IMEX S_N
-  const double* Te_old = nullptr;   // [n_cells], [eV], pre-Newton temperature
   PlanckTableDeviceView planck{};
-  materials::DeviceEOSTableView electron_eos{}; // optional TMAT electron EOS
-  const PlanckTable* planck_table_cpu = nullptr;
   double* E_out = nullptr;          // [n_cells * n_groups], [erg/cm^3]
   double* P_rr_out = nullptr;       // [n_cells * n_groups], [erg/cm^3]
   double* chi_out = nullptr;        // [n_cells * n_groups]
@@ -113,14 +93,10 @@ struct SNMaterialCouplingGPUInputs {
   unsigned long long* angular_fixup_count = nullptr;   // optional 2D [n_cells * n_groups]
   double* angular_fixup_artificial_abs = nullptr;      // optional 2D [n_cells * n_groups]
   double* coverage = nullptr;       // optional [n_cells * n_groups]
-  int dim = 1;
   int nr = 0;
   int nz = 1;
   int n_groups = 0;
   double dt = 0.0;
-  bool update_material = true;
-  double cv_e_const = 0.0;          // fallback mass heat capacity [erg/(g*eV)]
-  double Cv_e_const = 0.0;          // optional volume heat capacity [erg/(cm^3*eV)]
   // MPI (Option C r-slab, M18c slice-3): owned cell window + comm
   // context. Serial defaults keep the P=1 byte path (mpi_c_end == 0
   // means full range).
@@ -129,10 +105,6 @@ struct SNMaterialCouplingGPUInputs {
   int mpi_c_begin = 0;
   int mpi_c_end = 0;
 };
-
-SNTransportGPUResult solve_sn_transport_1d_gpu(
-    const SNTransport1DGPUInputs& in,
-    const SNTransportGPUConfig& config);
 
 SNTransportGPUResult solve_sn_transport_2d_rz_gpu(
     const SNTransport2DRZGPUInputs& in,

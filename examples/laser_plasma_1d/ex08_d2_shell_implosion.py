@@ -33,6 +33,8 @@ R_MAX = 650.0 * um
 # - Peak implosion velocity is 2.0e7-3.5e7 cm/s.
 # - Stagnation is at 3.6-4.5 ns with convergence 10-20.
 # - Peak rhoR is 0.08-0.20 g/cm^2.
+# Measured 2026-09-29: stagnation at 5.03 ns, so the run ends at 6.5 ns (a 5 ns run stopped
+# 26 ps before it; see README).
 
 mat_d2 = Material(
     name="D2",
@@ -57,7 +59,7 @@ Main(
     name="lp1d_ex08_d2_shell_implosion",
     dimension="1D_SPH",
     temperature_model="2T",
-    t_end=5.0 * ns,
+    t_end=6.5 * ns,
     seed=12345,
     max_steps=10_000_000,
     verbosity="normal",
@@ -118,7 +120,9 @@ Mesh(
 Materials(
     materials=[mat_d2, mat_cd, mat_void],
     opacity_mix_rule="linear_mass",
-    zbar=dict(model="fixed", fixed_value=3.5),
+    # Each cell takes the volume-weighted Z of its materials (D2 1, CD 3.5); a
+    # fixed_value would set every cell, the D2 fill included, to that value.
+    zbar=dict(model="fixed"),
     void_config=dict(rho=1.0e-9, Te=0.1, Ti=0.1),
 )
 

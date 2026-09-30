@@ -5,7 +5,6 @@
 
 ---
 
-
 ## 0. 規約・単位・記号（必読）
 ### 0.1 単位（cgs + eV）
 - 長さ：cm、時間：s、密度：g/cm³、温度：eV
@@ -50,18 +49,24 @@
 ### 0.2 不透明度（致命的事故防止）
 TENRYUは **質量不透明度 κ** と **長さ不透明度 σ** を厳密に区別する。
 
-- テーブル入力（SESAME/IONMIX）が返す：
+- テーブル入力（IONMIX・TMAT-H5）が返す（SESAME の不透明度表 502/505 は読み取れるが、
+  `opacity.model="sesame"` は `ConfigError` で、実行時の不透明度には使われない）：
   - **κ_P,g(ρ,T)**：Planck mean（群別）質量不透明度 \([cm^2/g]\)  
   - **κ_R,g(ρ,T)**：Rosseland mean（群別）質量不透明度 \([cm^2/g]\)
 - 輸送/拡散で使う内部表現：  
-  - **σ_a,g = ρ κ_P,g** \([1/cm]\)（IMC吸収・放射に使用）  
-  - **σ_R,g = ρ κ_R,g** \([1/cm]\)（DDMC拡散係数に使用）
+  - **σ_a,g = ρ κ_P,g** \([1/cm]\)（FLD・S_N の吸収・放射に使用）  
+  - **σ_R,g = ρ κ_R,g** \([1/cm]\)（FLD の拡散係数と流束制限子に使用）
 
 > 重要：σ と κ を混同すると吸収長が **ρ倍ズレる**。  
 > 実装では `Opacity::kappa_*` と `Opacity::sigma_*` を別名で保持し、暗黙の変換を禁止する。
 
 ### 0.3 放射の群（multigroup）
 群境界（eV）：\([E_0, E_1, ..., E_G]\)。群 g は \([E_{g-1},E_g)\)。
+
+群境界の決まり方（builder）：TMAT・IONMIX の表の不透明度（`tmat`・`ionmix`・`table_nlte`）を持つ材料があれば、最初の表の
+群構造が `Radiation.groups` と `bounds_eV` を上書きし、2 枚目以降の表の群境界が最初の表と相対 \(10^{-6}\) を超えて違うと
+`ConfigError`（材料ごとに群を変換しない）。全材料が定数の不透明度で境界を与えないときは灰色 1 群 \([0, 10^6]\) eV を自動設定する。
+境界は \(E_0\ge 0\) の狭義単調増加で、群数の上限は検査しない（`exp_rosenbrock` の源の積分器は 96 群以下、SPECIFICATION §6.4.5）。
 
 - 群代表エネルギー（既定）：幾何平均  
   \(E_g^{rep}=\sqrt{E_{g-1}E_g}\)
@@ -150,6 +155,8 @@ CD material（存在しなければ最初の non-void material）の
 
 ### 0.4 2D_RZにおけるIMC/DDMC粒子の幾何（3D粒子・2Dフィールド） [RETIRED — legacy IMC/DDMC; 現行輻射は §6.7 FLD / §6.8 \(S_N\)]
 
+> 退役した方式の記録（コードは 2026-09-29 にビルドから外し `retired/radiation_monte_carlo/` に保管）。
+
 2D_RZモードでは、IMC/DDMC粒子はレーザーレイトレース（§5.5）と同一の
 **「3D粒子・2Dフィールド」方式** を採用する。
 
@@ -223,12 +230,16 @@ DDMC→IMC変換（§7.7.2）時に3D出射方向をサンプルする：
 ---
 
 ### 0.5 v/c項の扱い（明示）
-v1.0の放射輸送は **静止媒質（lab frame）** 形で、以下のO(v/c)項を無視する：
-- 放射圧仕事 \(\mathbf{P}_r:\nabla\mathbf{u}\)
-- ドップラー（周波数シフト）・アバレーション
+放射輸送は **静止媒質（lab frame）** 形で、以下のO(v/c)項を無視する：
+- ドップラー（周波数シフト）・アバレーション（群間の移動は無い）
 - 速度依存不透明度
 
 ICF典型で \(u/c\ll 1\) を根拠とする。差分要因としてメタデータに記録する。
+
+放射圧は 1 つの経路にだけ入る。1D_SPH の `Radiation.mode="multigroup_diffusion"`（FLD）では既定の
+`hydro_coupling="gamma_r_43"` が、等方の放射圧 \(p_r=\sum_g E_g/3\) を流体の力に加え、その力が各 hydro 半ステップで
+節点にした仕事を輻射場から差し引く（§6.7「hydro_coupling」、1D FLD の既定は 2026-07-06 から）。`"none"` は両方を外す。
+1D の S_N と 2D_RZ の輻射には放射圧の力も仕事も無い。
 
 ---
 
@@ -251,7 +262,8 @@ ICF典型で \(u/c\ll 1\) を根拠とする。差分要因としてメタデー
 \[
 \rho \frac{D\mathbf{u}}{Dt} = -\nabla(P_i + P_e + Q) + \mathbf{f}_{geom}
 \]
-> **v1.0**: 放射力（radiation pressure force）は含めない（§0.5 の O(v/c) 無視方針と整合）。
+> 放射力は 1D_SPH の FLD で既定の `hydro_coupling="gamma_r_43"` のときだけ入り、
+> \(-\nabla p_r\)（\(p_r=\sum_g E_g/3\)）が右辺に加わる（§0.5、§6.7）。1D の S_N と 2D_RZ には無く、
 > 放射運動量沈着は診断出力のみ（§10.1.1）。
 
 #### 1.1.3 エネルギー（2T）
@@ -267,8 +279,10 @@ ICF典型で \(u/c\ll 1\) を根拠とする。差分要因としてメタデー
 \]
 - \(\mathbf{q}_e\)：電子熱流束 [erg/(cm²·s)]（§4参照）
 - \(S_L\)：レーザー吸収 [erg/(cm³·s)]（電子へ、§5参照）
-- \(S_r\)：輻射との交換 [erg/(cm³·s)]（IMC/DDMCの沈着として計上、§6–§7参照）
-- \(S_i,S_e\)：追加源 [erg/(cm³·s)]（v1.0は0）
+- \(S_r\)：輻射との交換 [erg/(cm³·s)]（FLD・S_N の物質–輻射交換、§6.7・§6.8参照）
+- \(S_i,S_e\)：追加源 [erg/(cm³·s)]。核燃焼（§14）があるとき、荷電生成粒子の沈着を Li–Petrasso 分配で
+  電子とイオンに分け（§14.4）、中性子の最初の衝突による加熱（§14.11）もイオンと電子に入る。燃焼が無ければ 0
+- 人工粘性 \(Q\) の熱は既定でイオンに入る（上式）。`Numerics.hydro.av_heat_to="electron"` は電子へ回す（§3.1）
 
 **電子–イオンエネルギー交換 \(Q_{ei}\)**（Spitzer–Braginskii）：
 \[
@@ -325,7 +339,7 @@ until a constant-\(\Lambda_{ei}\) verification override is added.
 > **注意**：上式は \(T_e \gg (m_e/m_i)\,T_i\)（ICF典型条件）の近似。
 > 一般の場合は \(\tau_{eq}\) の分子の \(T_e^{3/2}\) を
 > \(\bigl(T_e/m_e + T_i/(A\,m_p)\bigr)^{3/2}\,m_e^{3/2}\) で置換する
-> （Braginskii 1965）。
+> （Braginskii 1965）。TENRYU はこの一般形を実装しておらず、全経路で上の \(T_e\) 形を使う。
 
 
 #### 1.1.3a 混合プラズマ電荷モーメント補正（TMAT ionization fractions、自動、2026-07-30）
@@ -340,10 +354,12 @@ until a constant-\(\Lambda_{ei}\) verification override is added.
 \((n_i=\rho/(A_{eff}m_p),\ T_e)\) の log-log 双線形（端クランプ）で充填する。
 **表が無ければ何も起きない**（場は未充填・カーネルは legacy 実体 —
 false テンプレート実体はテキスト同一で bit 不変）。消費先と置換:
-(i) §1.1.3 の \(\tau_{eq}\): \(\bar Z^2\to\bar Z^2 r_2\)、
+(i) §1.1.3 の \(\tau_{eq}\): \(\bar Z^2\to\bar Z^2 r_2\)。交換の全経路 — 2T の流体エネルギー更新、compatible energy の交換、
+輻射の熱サブサイクル中の交換 — で使う（2026-09-29 まで compatible energy の交換だけが使い、既定の 2T 更新と
+サブサイクル中の交換は \(r_2=1\) のままだった）、
 (ii) §4.1 Spitzer: \(\bar Z\to\bar Z r_2\)（\(=Z_{\rm eff}\)）、
 (iii) SNB の Z 補間因子: 同上、(iv) §3.1.13 Braginskii イオン粘性:
-\(Z^4\to\bar Z^4 r_4\)。クーロン対数は全消費先で legacy 単一種形を保持
+\(Z^4\to\bar Z^4 r_4\)、(v) §4 のイオン熱伝導の \(\tau_i\): 同上（2026-09-29 から）。クーロン対数は全消費先で legacy 単一種形を保持
 （対数的に弱い）。レーザー IB は §5.4.5(a) の `zeff_model`
 （既定 "auto"。構築時の解決規則は §5.4.5(a)）。制約: 1D 限定（config 構築時に検証、表が無い run は無検証）。
 材料が複数あるデッキでは各セルがその材料の表を使い、表を持たない材料のセルは \(r_2=r_4=1\)
@@ -366,13 +382,21 @@ n_i = \frac{\rho}{A\,m_p} \quad [\text{cm}^{-3}]
 > D\(_2\) は解離後の deuteron で 2（4 ではない）。IONMIX opacity の密度軸
 > （総イオン数密度 \(n_i\)）との整合はこの契約に依存する。誤って分子質量を与えると
 > \(n_i\) が整数倍ずれ、opacity/EOS のテーブル参照が系統的に誤る。
-> TMAT-H5 は `/material/Abar_ion_amu` をファイル側で持つため parser が検証できるが、
-> IONMIX 経路は deck 側の責任（parser は検証不能）。
+> TMAT-H5 は `/material/Abar_ion_amu` をファイル側で持つので、builder は deck の A と比べる
+> （EOS・不透明度のどちらの TMAT ファイルでも。相対差 5 % 超は `ConfigError`、1 % 超は警告 — deck は DT の 2.52 を
+> 2.5 と丸めるなど小さな差を持つ。2026-09-29 から）。IONMIX 経路は deck 側の責任（ファイルが A を持たない）。
 
-**平均電離度 \(\bar{Z}\)**：v1.0では3モデルを提供する。
-1. **fixed**（既定）：\(\bar{Z} = Z\)（ユーザ指定の原子番号 or 有効電荷。完全電離を仮定）
-2. **thomas\_fermi**：More (1985) Table IV の Thomas–Fermi 電離度フィット
-3. **tabular**：IONMIXテーブルから \(\bar{Z}(\rho, T_e)\) を補間取得
+**平均電離度 \(\bar{Z}\)**（`Materials.zbar.model`）：3モデルを提供する。
+1. **fixed**（既定）：\(\bar{Z} = Z\)（ユーザ指定の原子番号 or 有効電荷。完全電離を仮定）。初期化時に 1 回だけ設定し、
+   ステップごとには更新しない（表 EOS の材料でも同じ）。`Materials.zbar.fixed_value` \(\ge0\) を与えると、全材料・全非 void
+   セルの \(\bar Z\) をその 1 値で上書きする（既定 −1 で無効）
+2. **thomas\_fermi**：More (1985) Table IV の Thomas–Fermi 電離度フィット。毎ステップ更新する — 非 void の全材料が
+   TMAT なら GPU で、それ以外は host で評価する
+3. **tabular**：材料の IONMIX または TMAT-H5 の EOS ファイル（無ければ不透明度ファイル、それも無ければ
+   `Materials.zbar.table_file`）の \(\bar{Z}(\rho, T_e)\) 表を補間（表の端でクランプ）。毎ステップ GPU で更新する
+
+非 LTE・Saha・平均原子模型の電離はその場では計算しない（非 LTE は不透明度表の \(\kappa_{PE}\ne\kappa_{PA}\) を通してだけ入る）。
+TMAT の `/ionization` は §1.1.3a の電荷モーメント比にだけ使う。
 
 **Thomas–Fermiモデル**（R. M. More, Adv. At. Mol. Phys. **21**, 305 (1985), Table IV —
 TF 電離状態への近似フィット。QEOS（More, Warren, Young & Zimmerman, Phys. Fluids **31**, 3059 (1988)）
@@ -422,8 +446,11 @@ n_e = \bar{Z}\,n_i = \frac{\bar{Z}\,\rho}{A\,m_p} \quad [\text{cm}^{-3}]
 
 下限値：
 \[
-\ln\Lambda_{ei} \ge \ln\Lambda_{\min} = 2 \quad (\text{SPECIFICATION §6.4.7 coulomb\_log\_floor})
+\ln\Lambda_{ei} \ge \ln\Lambda_{\min} = 2
 \]
+下限 2 はコードに固定されている（電子イオン交換・電子熱伝導・Braginskii 輸送で共通）。`Numerics.coulomb_log_floor` は
+受け付けるが警告を出して無視する。レーザーの逆制動輻射のクーロン対数の下限は別のキー
+`Laser.absorption.coulomb_log_floor`（既定 2、範囲 [1, 30]、§5.4.5）。
 
 #### 1.1.5 状態方程式（EOS）
 
@@ -445,28 +472,25 @@ e_e = \frac{3}{2}\frac{\bar{Z}\,k_B\,T_e}{A\,m_p},\quad
 c_{v,e} = \frac{3}{2}\frac{\bar{Z}\,k_B}{A\,m_p}
 \]
 
-> **注**：\(\bar{Z}\) が温度依存（Thomas–Fermiモデル）の場合、
-> \(c_{v,e} = \partial e_e/\partial T_e = (3k_B/2A m_p)(\bar{Z}+T_e\,d\bar{Z}/dT_e)\)
-> とする。`fixed` \(\bar{Z}\) では上式で十分。
->
-> **\(d\bar{Z}/dT_e\) の数値微分**：Thomas–Fermi モデル（§1.1.4）の \(\bar{Z}(\rho, T_e)\) は
-> 解析的微分が煩雑であるため、中心差分で数値微分する：
-> \[
-> \frac{d\bar{Z}}{dT_e} \approx \frac{\bar{Z}(\rho,\, T_e + \delta T_e) - \bar{Z}(\rho,\, T_e - \delta T_e)}{2\,\delta T_e}
-> \]
-> ステップ幅：\(\delta T_e = \max(\varepsilon_{fd} \cdot T_e,\; T_{floor})\)、\(\varepsilon_{fd} = 10^{-4}\)。
-> \(T_{floor}\) は §1.1.7 の温度フロア値（既定 \(10^{-3}\) eV）。
-> テーブル端での片側差分は §1.1.6 の音速数値微分と同一の規則を適用する。
-> `tabular` モデル（IONMIX \(\bar{Z}\) テーブル）でも同じ数値微分手法を用いる。
+> **注（未実装）**：\(\bar{Z}\) が温度依存（Thomas–Fermi・tabular）のとき、厳密には
+> \(c_{v,e} = \partial e_e/\partial T_e = (3k_B/2A m_p)(\bar{Z}+T_e\,d\bar{Z}/dT_e)\) である。
+> 理想気体の電子比熱は \(T_e\,d\bar Z/dT_e\) 項を含まず、上の \(c_{v,e}=\tfrac32\bar Z k_B/(Am_p)\) をそのまま使う
+> （\(\bar Z\) の温度微分はどこでも評価しない）。表 EOS の材料は表の \(e_e(\rho,T_e)\) の微分を使うので、
+> 表が電離を含んでいれば比熱にも入る。
 
-断熱指数：単原子理想気体として \(\gamma_e = \gamma_i = 5/3\)（無次元）。多原子分子や電離効果は \(\gamma\) に反映しない（v1.0の制約）。
+断熱指数：理想気体の \(\gamma\) は材料ごとの `ideal_gas_gamma`（既定 5/3）で、電子とイオンで共通。上の式の 3/2 は
+\(\gamma=5/3\) のときの \(1/(\gamma-1)\) で、一般には \(c_{v,i}=k_B/[(\gamma-1)Am_p]\)、\(c_{v,e}=\bar Z c_{v,i}\)
+（`cv_e_override` \(>0\) を与えるとその体積比熱 [erg/(cm³·eV)] を \(\rho\) で割って使う）。混合セルは §1.1.5a の
+体積分率平均 \(\gamma_{eff}\) を使う。
 
 **(b) テーブルEOS（SESAME / IONMIX / TMAT）**
 
-TENRYU は **SESAME を既定テーブル EOS** として使用する。IONMIX/TMAT は代替オプション。
-いずれの場合も GPU 上では同一の EOSTable 構造体で補間コードを共有する（SPECIFICATION §6.4.3 参照）。
+EOS の既定は理想気体（`eos.model="ideal_gas"`）で、表 EOS は材料ごとに `"sesame"`・`"ionmix"`・`"tmat"`
+（TMAT-H5）・`"power_law_te"`（固定格子 ρ 0.02–2 g/cc・T 0.05–2000 eV に表化し、格子外は端でクランプ）から選ぶ。
+例題デッキの多くは TMAT を使う。いずれの場合も GPU 上では同一の EOSTable 構造体で補間コードを共有する
+（SPECIFICATION §6.4.3 参照）。
 
-**SESAME（既定）**：xSESAME ASCII 形式（80 文字固定幅、5E15.8）。
+**SESAME**：xSESAME ASCII 形式（80 文字固定幅、5E15.8）。
 テーブル 301（total EOS）と テーブル 304（electron EOS）を読み込む。
 
 単位変換（§0.1 定数表準拠）：
@@ -513,15 +537,20 @@ e_i(\rho_i,T_j) = e_{301}(\rho_i,T_j) - \text{interp}_{\log}(\text{eos\_e},\rho_
 > table inverse を無効化し ideal 閉包へ fallback）と同一グリッド時の split 恒等式
 > \(P_i+P_e=P_{total}\) を壊す。負値ノード数は build 時に 1 回 WARNING でログする。
 
-304 不在時の 1T フォールバック（例：Deuterium mat 5265）：
+304 不在時（例：Deuterium mat 5265）は、全表を節点ごとに理想プラズマの取り分で分ける：
 \[
-P_e = P_{total} \times \frac{\bar{Z}}{1+\bar{Z}},\quad e_e = e_{total} \times \frac{\bar{Z}}{1+\bar{Z}}
+P_e(\rho_i,T_j) = P_{total}(\rho_i,T_j) \times \frac{\bar{Z}_{ij}}{1+\bar{Z}_{ij}},\quad
+e_e(\rho_i,T_j) = e_{total}(\rho_i,T_j) \times \frac{\bar{Z}_{ij}}{1+\bar{Z}_{ij}},\quad
+\bar Z_{ij}=\bar Z(\rho_i,T_j)
 \]
 \[
 P_i = P_{total} - P_e,\quad e_i = e_{total} - e_e
 \]
-> 注：1T フォールバックでは減算が正確（P_e + P_i = P_total が代数的に保証される）ため、
-> positivity guard は不要。
+\(\bar Z(\rho,T)\) はその材料の電離モデル（`Materials.zbar.model`）で評価する — `fixed` は \(Z\)（`fixed_value`\(\ge0\) なら
+その値）、`thomas_fermi` は §1.1.4 のフィット、`tabular` はその材料の \(\bar Z\) 表（`split_sesame_electron_table`、
+builder がログに 1 行記録する）。2026-09-29 までは \(\bar Z=0\) で分けていたため、電子表は全節点で 0、イオン表は全表と
+同じになり、2T の run は電子の EOS を失っていた（電子の逆変換が区間を作れない）。
+> 注：この分割では P_e + P_i = P_total が節点ごとに代数的に成り立つので、positivity guard は不要。
 
 **xSESAME ASCII リーダー擬似コード**：
 ```
@@ -641,6 +670,16 @@ Node-grey conservation does not imply off-grid or spectrally resolved equivalenc
 - `tmat_eos_to_table_triplet()` と `tmat_eos_to_zbar_table()` では `/eos/grid/ni_cm3` を
   \(\rho = n_i A m_p\) で質量密度 [g/cm³] に変換してから EOS/Zbar テーブルを構築する。
 - `tmat_to_ionmix_opacity()` では `ni_cm3` を `IonmixOpacityData.numdens_cm3` に直接コピーし、`A m_p` による変換は行わない。
+- 任意の `/eos/fields/cv_i`・`/eos/fields/cv_e` があれば、有限・正であることを確かめてその表を比熱に使う（無ければ
+  \(e(T)\) の差分から作る）。
+- 非 LTE の不透明度表（`is_lte=0`）は読み込み時に既定で補修する：節点ごとに群の和の比
+  \(\sum_g\kappa_{PE}/\sum_g\kappa_{PA}<0.9\) となる \((\rho,T)\) 節点と、その 1 つ高温側の節点で、全群の \(\kappa_{PE}\) を \(\kappa_{PA}\) に
+  置き換える（放出が吸収より大きく欠ける節点を LTE に寄せる。補修した節点の割合をログに出す）。
+  `opacity.tmat_skip_lte_repair=True` か `tmat_kirchhoff_pe=True`（全節点で \(\kappa_{PE}=\kappa_{PA}\)）では行わない。
+
+不透明度表の補間（IONMIX・TMAT 共通、`ionmix_reader.cuh`）は \((\log n,\log T)\) の双線形で、値は \(\log\kappa\) で補間する
+（\(\kappa\) の下限 \(10^{-100}\)）。4 隅のどれかが \(10^{-30}\) 以下（表の床の値）なら、その隅を除いた \(\kappa\) の線形補間に切り替え、
+使える隅が無ければ 0 を返す。
 
 **共通仕様**：
 
@@ -747,16 +786,12 @@ tail は \(P\propto T\)・\(c_v\) 一定の理想気体延長なので、断熱�
 CFL の時間刻みと人工粘性の一次項に入っていた。tail の anchor が無効な表（天井の
 \(c_v\le0\) など）では閉包と同じく天井のまま。legacy モードと天井以下は bit 不変。2D_RZ は対象外。
 
-> **追補（2026-07-26）**: 1D ALE の post-remap EOS reclosure
-> （`ale_1d_driver.cu::eos_reclosure_kernel`）は上記ファミリ閉鎖から漏れており、
-> closure mode にかかわらず常に表射影を行っていた（super-ceiling 超過の無記帳破棄・
-> 表下端 clamp の無記帳注入）。修正済み: `energy_authoritative` では hydro 閉包と同じ
-> clamp-veto（進化 \(e\) を保持、非有限/負の raw 入力の repair は veto を迂回）+
-> 温度天井の ideal-tail 逆算を適用し、`legacy` は従来挙動を bit 保存する。
-> T-floor 注入は両モードで `State::E_floor_injected`（retry rollback 対象の正典 ledger）
-> へ計上する — 従来この kernel の ledger 引数は唯一の呼び出し点で `nullptr` に
-> 配線されており死んでいた。2D_RZ 側の同型経路（`ale_axis_band_controller`）は
-> 未修正（2D 側への relay）。
+> **追補（2026-07-26、2026-09-23 に置き換え）**: 1D ALE の remap 後の EOS 再閉包は、以前は ALE 専用の核関数
+> （`ale_1d_driver.cu` の `eos_reclosure_kernel`）が行い、1T の run を 2T の式で閉じていた（\(T_i\) を床に置き、
+> 床のエネルギーを \(e_i\) に入れ、\(T_e\) を電子の比熱だけで決めていた）。2026-09-23 からこの核関数は無く、
+> remap の後はセルの材料物性を作り直してから hydro の閉包 `Hydro1D::close_eos_and_sound_speed` で EOS と音速を
+> 閉じる（1T・2T、全 EOS backend で、次の Lagrange step の入口の閉包と同じ状態になる）。2D_RZ 側の同型経路
+> （`ale_axis_band_controller`）は別の核関数のまま。
 
 [2026-09-07] The pressureless all-at-temperature-floor initialization exception
 is restricted to analytic EOS paths (including the explicit exact-ideal-gas
@@ -825,9 +860,8 @@ energy-authoritative の伝導増分 `apply_conduction_energy_increment`（devic
 rho_e 表・Mie–Grüneisen は材料 0 の view を全セルに使う）は従来どおり先頭材料の値のまま。（2026-09-24 に解消 — 下段）単一材料では選ばれる view・天井が従来と同一オブジェクト（同じ
 `DeviceEOSTable::view()`、同じ `T_grid_eV.back()`）なので算術は bit 同一。
 `initialize_eos_fields_if_needed` は同日に先行してセル材料別に修正済み。
-`refresh_mie_gruneisen_thermo_from_energy`（Mie–Grüneisen backend 限定）と 1D ALE の post-remap
-再閉包 `ale_1d_driver.cu::eos_reclosure_kernel`（材料 0 のテーブルと \(A,\gamma\) に意図的に限定、Lagrangian
-デッキでは不使用）は対象外のまま。
+`refresh_mie_gruneisen_thermo_from_energy`（Mie–Grüneisen backend 限定）は対象外のまま。1D ALE の remap 後の
+再閉包は 2026-09-23 から hydro の閉包そのものなので、ここでの材料別の規則に従う。
 
 [2026-09-24] **材料ごとの閉包パラメータ — hydro backend 種別・`cv_e_override`・`eos_T_ref_eV` をセルの材料から**:
 上段の「`cv_e_override` と hydro backend 種別は先頭材料の値のまま」を解消した。1D で非 void 材料どうしが
@@ -1186,20 +1220,18 @@ kirchhoff ケース）。表の根本対策（変換時 `kirchhoff_pe=1`、ま�
 
 **(c) 混合材料セルのEOS**
 
-多材料セルでは全材料が同一 \((\rho, T_e, T_i)\) を共有する（single-state仮定）。
-各材料 \(\alpha\) は独自の \((A_\alpha, Z_\alpha)\) を持ち、EOS量 \(e_\alpha, P_\alpha, C_{v,\alpha}\) は
-それぞれの材料パラメータで評価する（理想気体では §1.1.5(a) の式に \(A_\alpha, \bar{Z}_\alpha\) を適用、
-テーブルでは材料ごとのIONMIXファイルから取得）。
-合成量は質量分率 \(f_{m,\alpha}\) による加重平均：
-\[
-e = \sum_\alpha f_{m,\alpha}\,e_\alpha,\quad
-P = \sum_\alpha f_{m,\alpha}\,P_\alpha,\quad
-C_v = \sum_\alpha f_{m,\alpha}\,C_{v,\alpha}
-\]
+多材料セルでは全材料が同一 \((\rho, T_e, T_i)\) を共有する（single-state仮定）。1D の閉包は材料の EOS を混ぜず、
+各セルをその**支配材料**（体積分率が最大の非 void 材料、`State::cell_material_index`）の EOS だけで閉じる
+（表の選び方は上の 2026-09-14・09-24 の段落。理想気体の材料のセルはその材料の理想気体で、\(A\)・\(\gamma\) は
+§1.1.5a のセル実効値）。質量分率で \(e, P, C_v\) を平均する混合 EOS も、材料間の圧力平衡も無い（1D に圧力平衡の
+緩和は無い。2D の PLIC 界面は §3.3.13）。`Materials.mixture.eos_mix_rule` と `Materials.mixture.fractions` は
+受け付けるが警告を出して無視する（体積分率は常に体積分率として読む）。
 
 **混合材料セルにおけるプラズマ基本量**（§1.1.4 の拡張）：
 
-多材料セルでは、イオン数密度・電子数密度・平均電離度を以下のように材料加重で計算する：
+多材料セルでは、イオン数密度・電子数密度・平均電離度を以下のように材料加重で計算する
+（single-state 仮定では各材料の密度がセル密度に等しいので、質量分率 \(f_{m,\alpha}\) は体積分率 \(f_\alpha\) に等しく、
+実装は体積分率を使う）：
 \[
 n_i = \sum_\alpha \frac{f_{m,\alpha}\,\rho}{A_\alpha\,m_p},\qquad
 n_e = \sum_\alpha \frac{\bar{Z}_\alpha\,f_{m,\alpha}\,\rho}{A_\alpha\,m_p}
@@ -1213,14 +1245,19 @@ n_e = \sum_\alpha \frac{\bar{Z}_\alpha\,f_{m,\alpha}\,\rho}{A_\alpha\,m_p}
 \frac{1}{A_{eff}} = \sum_\alpha \frac{f_{m,\alpha}}{A_\alpha},\qquad
 A_{eff} = \left(\sum_\alpha \frac{f_{m,\alpha}}{A_\alpha}\right)^{-1}
 \]
-これらの \(n_i, n_e, \bar{Z}_{eff}, A_{eff}\) は EOS 混合量（\(e,P,C_v\)）と
-プラズマ基本量の導出に用いる。
-電子熱伝導とソース結合で用いるセル実効量（\(A_{eff}, \gamma_{eff}, n_e, c_{v,e}, c_{v,i}\)）は
-§1.1.5a の体積分率混合則を用いる。
-単一材料セルでは \(f_{m,1}=1\) であり、上式は §1.1.4 の定義に帰着する。
+\(\bar Z_{eff}\) は `materials::ZbarMixAccumulator`（`zbar_math.hpp`）が作る — 初期化（`geometry_eval.cpp`）、
+host のステップ更新（`driver.cpp` の Thomas–Fermi・tabular）、GPU のステップ更新（`zbar_device.cu`）の全経路で
+同じ重み \(f_\alpha/A_\alpha\) を使い、材料が 1 つしか無いセルはその材料の値そのもの（bit 一致）。
+`fixed` モデルでは \(\bar Z_\alpha=Z_\alpha\)。2026-09-29 までは重みが体積分率だけで \(1/A_\alpha\) が無く、重い材料の電荷を
+\(n_e\) に過大に数えていた（完全電離の CH（\(\bar Z=3.5\)、\(A=6.5\)）と DT（\(\bar Z=1\)、\(A=2.5\)）の等体積の混合で、
+上式の \(\bar Z_{eff}=1.69\) に対し旧式は体積平均の 2.25、\(n_e\) で 1.33 倍）。
+\(A_{eff}\) と \(\gamma_{eff}\) は §1.1.5a の規則（調和平均・体積分率平均）で、これらと \(n_e\) を電子熱伝導とソース結合の
+セル実効量に使う。単一材料セルでは \(f_{m,1}=1\) であり、上式は §1.1.4 の定義に帰着する。
 
-**Void 材料の混合則除外**：`is_void = true` の材料は \(\bar{Z}_{eff}\)、\(A_{eff}\)、
-EOS 混合平均（\(e, P, C_v\)）、および質量分率 \(f_{m,\alpha}\) の計算から除外する。
+**Void 材料の混合則除外**：`is_void = true` の材料は \(\bar{Z}_{eff}\)、\(A_{eff}\)、\(\gamma_{eff}\) の平均と支配材料の選択から
+除外する（\(A_{eff}\)・\(\gamma_{eff}\) からの除外は 2026-09-29 から — それまで `State::ensure_cell_material_props` と
+伝導の実効物性は void の体積分率も平均に入れていた。レーザーの源項 `compute_effective_A_gamma` は元から除外していた）。
+非 void の材料を持たないセルと単一材料のデッキは、先頭の非 void 材料の値を使う。
 Void 材料の体積分率は `cell_is_void` マスクの導出にのみ使用される。
 `cell_is_void = 1` のセルでは \(\bar{Z} = 0\) を強制し、Thomas-Fermi モデルの
 評価をスキップする（実装: `geometry_eval.cpp` の Zbar 計算ループ）。
@@ -1283,7 +1320,9 @@ Void 材料の体積分率は `cell_is_void` マスクの導出にのみ使用�
 \[
 f_m \ge 0,\qquad \sum_m f_m = 1
 \]
-を満たす（`Geometry.volfrac` を正規化した値）。
+を満たす（`Geometry.volfrac` を正規化した値）。下の和は非 void の材料だけで取り、その体積分率の和で割り直す
+（void は真空でイオンを持たない。2026-09-29 から — それまで \(A_{eff}\)・\(\gamma_{eff}\) は void の分率も平均に入れて
+いた）。非 void の材料が無いセルは先頭の非 void 材料の値を使う。
 
 **有効原子量（調和平均）**：
 \[
@@ -1411,9 +1450,9 @@ c_s^2 = \gamma\frac{P_e+P_i}{\rho}
 > **注意**：\(\partial P/\partial\rho\big|_T\) のみでは等温音速であり、断熱圧縮の寄与を欠く。
 > 上式の第2項（熱圧力補正項）は高温プラズマで支配的になりうる。
 >
-> **数値安全**：テーブルEOSの数値微分誤差（補間ノイズ等）により \(c_s^2 < 0\) となる場合がある。
-> 実装では \(c_s^2 = \max(c_s^2,\; 0)\) とクランプし、クランプ発生時は
-> `DeviceErrorFlags::sound_speed_negative` を設定する（WARNING）。
+> **数値安全**：テーブルの導関数（補間の勾配）により \(c_s^2 \le 0\) となる場合がある（張力域の冷たい曲線など）。
+> 実装はその表について \(c_s=\sqrt{(5/3)P/\rho}\)（\(P\le0\) なら 0）に置き換える（下の Current GPU path）。
+> エラーフラグも回数の記録も無い（旧設計の `DeviceErrorFlags::sound_speed_negative` は存在しない）。
 > \(c_s = 0\) のセルはCFL計算で \(\Delta t_{hydro} \to \infty\) 相当となり、他セルのCFLで律速される。
 
 > **廃止注記（2026-07-26）**：旧設計の \(\delta\rho\)/\(\delta T\) 対称差分
@@ -1429,9 +1468,8 @@ c_s^2 = \gamma\frac{P_e+P_i}{\rho}
 \]
 ここで \(P = P_e + P_i\)（総圧力）。
 
-代替方式（v1.0既定）：テーブルEOSが \(\gamma_k\) を直接提供する場合はそれを使用する。
-IONMIX形式のテーブルは \(\gamma_k\) フィールドを含むことが多い。
-テーブルに \(\gamma_k\) がない場合は上記の数値微分を使用する。
+表から \(\gamma_k\) を読む方式は実装されていない：`EOSTable` は \(\gamma\) の欄を持たず、IONMIX のブロックは
+1/3/4/7/8 番（\(\bar Z\)・圧力・エネルギー）以外を読み捨てる。表 EOS の音速は常に下の \(\Gamma_1\) 形で評価する。
 
 **Current GPU sound-speed path (Gamma1 form)**:
 For each table (total in 1T, ion/electron separately in 2T), the implementation computes
@@ -1478,11 +1516,14 @@ If \(c_s^2 \le 0\) or non-finite, the implementation falls back to \(\sqrt{(5/3)
 - 適用回数を診断に出力（物理破綻の早期検出）
 - テーブルEOS参照時もフロア値未満にクランプしてから補間
 
-**フロア適用によるエネルギー会計**：フロア適用による注入エネルギー
-\[
-\Delta E_{floor} = \sum_{c:\,T_c^{computed}<T_{floor}} \rho_c\,c_{v,c}(T_{floor})\,(T_{floor} - T_c^{computed})\,V_c
-\]
-をエネルギー収支（§10.2）の \(E_{floor}\) 項として記録する。タイミングは§11.2に従い、各演算子（Hydro, Conduction, Laser, Radiation）の温度更新後にそれぞれクランプを適用し、全クランプ分の \(\Delta E_{floor}\) を累積して計上する。
+**フロア適用によるエネルギー会計**：1D の閉包は温度の床を**温度にだけ**適用し、比内部エネルギーは変えない —
+理想気体は \(T=\max(e/c_v,\,T_{floor})\) で圧力は \(e\) から作り、表 EOS の既定の閉包（`eos_closure_mode=
+"energy_authoritative"`）は逆変換が床や表の端でクランプしてもエネルギーを書き戻さない。したがって温度の床は
+エネルギーを注入せず、\(\rho c_v(T_{floor}-T)V\) を記帳する旧設計の式は使わない。エネルギー収支（§10.2）の
+\(E_{floor}\) 項は、演算子がエネルギーそのものを引き上げた量の和である：hydro 更新が理想気体セルの負の比エネルギーを
+0 に切り上げた分（§3.1.5）、伝導の床制限（§4.2）、入射（レーザー・輻射・燃焼）の閉包、`gamma_r_43` の輻射場の負値の
+切り上げ（§6.7）、ALE の remap の床など。`eos_closure_mode="legacy"` では表の逆変換が下端でクランプしたとき
+エネルギーを表の値へ書き戻し、この差は記帳されない（legacy は旧 golden の再現用）。
 
 ---
 
@@ -1496,13 +1537,15 @@ If \(c_s^2 \le 0\) or non-finite, the implementation falls back to \(\sqrt{(5/3)
 - \(\sigma_{a,g}\)：吸収係数 \([1/cm]\)（定義は0.2）
 - \(\sigma_{t,g}=\sigma_{a,g}+\sigma_{s,g}\)
 - \(B_g(T)\)：群積分したPlanck関数（黒体源）
-- \(\mathcal{S}_{sca}\)：散乱源。v1.0 では物理散乱を実装しない：\(\sigma_{s,g} = 0\)（全セル・全群）。実効散乱 \((1-f)\sigma_{a,g}\)（§6.1）は IMC の暗黙化手法であり、物理散乱とは異なる。将来版で Thomson 散乱等を追加する場合は \(\sigma_{s,g}\) テーブルを導入する
+- \(\mathcal{S}_{sca}\)：散乱源。表の散乱は無い。定数の等方散乱 \(\sigma_{s}=\rho\,\kappa_s\)（`opacity.kappa_s`、全群共通）は
+  S_N だけが使い、FLD は散乱を持たない（FLD で `kappa_s > 0` は 2026-09-29 から `ConfigError`。それまでは黙って 0 と
+  して走った）。Fleck 線形化の実効散乱 \((1-f)\sigma_{a,g}\)（§6.1）は暗黙化の手法であり、物理散乱とは異なる
 
 物質（電子）への交換（連続系の形式として）：
 \[
 S_r = \sum_g c\,\sigma_{a,g}\left(E_g - a_{eV} T_e^4\,b_g(T_e)\right)
 \]
-ただし実装では、IMC/DDMCが **沈着エネルギーを直接タリー**して \(S_r\) を構成する（10章）。
+実装では FLD・S_N の物質更新が同じ離散式から \(S_r\) を作り、輻射と物質の交換を同じ量で記帳する（§6.7・§6.8、10章）。
 
 ---
 
@@ -1516,19 +1559,25 @@ S_r = \sum_g c\,\sigma_{a,g}\left(E_g - a_{eV} T_e^4\,b_g(T_e)\right)
 \mathcal{R}_{\Delta t}\circ
 \mathcal{C}_{\Delta t}\circ
 \mathcal{H}_{\Delta t/2}\circ
+\mathcal{B}_{\Delta t}\circ
 \mathcal{L}_{\Delta t}(\mathcal{U}^{n})
 \]
 - \(\mathcal{H}\)：Hydro（Lagrangian step + BC）— 2D_RZ の ALE rezone/remap は2回目の \(\mathcal{H}(\Delta t/2)\) 後にのみ条件付き実行（§3.3）。1D_SPH は pure Lagrangian（§3.4）
-- \(\mathcal{C}\)：電子熱伝導
+- \(\mathcal{C}\)：電子熱伝導（イオン熱伝導が有効なら同じ位置）
 - \(\mathcal{L}\)：Laser（レイトレース→沈着）
-- \(\mathcal{R}\)：Radiation（IMC–PGRW–DDMC）
+- \(\mathcal{B}\)：核燃焼（§14、`Burn.enabled` のとき。それ以外は恒等）
+- \(\mathcal{R}\)：Radiation（1D は FLD §6.7 または S_N §6.8。IMC/DDMC は退役）
 
-**既定順序**（直ドライブを想定）：
-1. Laser full
-2. Hydro half
-3. Conduction full
-4. Radiation full
-5. Hydro half
+**既定順序**（直ドライブを想定、`execute_split_operators`）：
+1. Laser full（時刻 \(t^n\)）
+2. Burn full（時刻 \(t^n\)）
+3. Hydro half
+4. Conduction full（時刻 \(t^n+\Delta t/2\)）
+5. Radiation full（時刻 \(t^n+\Delta t/2\)）
+6. Hydro half
+
+この順序は固定で、`Numerics.splitting_order` と `Numerics.splitting` は受け付けるが警告を出して無視する。
+driver には逐次の順序（H→C→L→B→R）もあるが、namelist からは選べず試験のコードだけが使う。
 
 > **精度に関する注意**：古典的Strang splitting \(\mathcal{A}_{\Delta t/2}\circ\mathcal{B}_{\Delta t}\circ\mathcal{A}_{\Delta t/2}\)
 > は **2演算子** の場合にのみ \(O(\Delta t^2)\) を保証する。
@@ -1557,11 +1606,14 @@ S_r = \sum_g c\,\sigma_{a,g}\left(E_g - a_{eV} T_e^4\,b_g(T_e)\right)
 | L(Δt) | \(e_e\) via source_injection | H14(\(e_e \to T_e\)) → H13(\(T_e \to P_e, C_v\)) → U2(floor) | 1回目 H(Δt/2) が最新 Te, Pe を必要 |
 | R(Δt) | \(e_e\) via source_injection | H14(\(e_e \to T_e\)) → H13(\(T_e \to P_e, C_v\)) → U2(floor) | 2回目 H(Δt/2) が最新 Te, Pe を必要 |
 
-**ソース注入プロトコル（U1: source_injection）**：レーザー沈着とIMC/DDMC沈着は、統一カーネル U1 を **フェーズ別に2回** 呼び出すことで注入する（ARCHITECTURE §4.7、CUDA_KERNELS §7.1 参照）：
+**ソース注入プロトコル（U1: source_injection）**：レーザー沈着は Laser 演算子の後に
+`inject_laser_source_terms` で電子へ注入する（燃焼の沈着は燃焼段の閉包 §14.5）。1D の輻射（FLD・S_N）は物質の
+エネルギーを輻射の解の中（物質 Newton・Fleck 更新、§6.7・§6.8）で直接更新するので、輻射沈着の注入段は走らない。
+以下の段落は退役した IMC/DDMC モードの手順である（ARCHITECTURE §4.7、CUDA_KERNELS §7.1 参照）：
 - Laser演算子後：`source_injection(laser_dep, rad_dep=nullptr)` — レーザー沈着のみ
 - Radiation演算子後：`source_injection(laser_dep=nullptr, rad_dep)` — 輻射沈着のみ
 
-現行実装では PGRW は `imc_transport_persistent` 内の IMC branch として処理され、
+退役前の実装では PGRW は `imc_transport_persistent` 内の IMC branch として処理され、
 吸収減衰は通常 IMC と同じ `rad_dep` tally に入る。
 したがって source injection は従来どおり
 \(\Delta E = \sum_g \texttt{rad\_dep} - \sum_g \texttt{rad\_emit}\)
@@ -1576,9 +1628,9 @@ smoothing 前に 0 とし、face smoothing の barrier としても扱う。
 
 **Radiation thermal microcycling（optional）**：
 `Numerics.radiation_thermal_subcycle=True` のとき、single-stage Radiation 演算子
-（`Radiation.imc.two_stage=False`）だけを対象に、放射 source injection 後の
+（`Radiation.imc.two_stage=False`）だけを対象に、Radiation 演算子の後の
 compressed cell floor hit を検出して同じ Radiation 演算子を細分化して再試行する。
-Hydro / Laser / IMC transport kernel の離散化は変更しない。Conduction は同じ
+Hydro / Laser の離散化は変更しない。Conduction は同じ
 `conduction_step` を使うが、standalone Strang 位置では呼ばず、thermal substep 内で
 `Radiation -> Qei -> Conduction` として評価する。Qei も同じ扱いで、thermal subcycle が
 走る step（`core::thermal_subcycle_active(cfg)` = `radiation_thermal_subcycle` かつ
@@ -1640,22 +1692,23 @@ Algorithm:
    境界・体積源の step ledger（\(c_v\)・\(\bar Z\)・床注入・クランプ数・再試行要求は
    2026-09-23 に追加。それまでは失敗した試行の値を再試行へ持ち越していた）。
 5. \(n_{sub}=16\) でも floor hit が残る場合は、それ以上の retry は行わず結果を受理する。
-6. 放射解は各回、自分が進めた区間の交換エネルギーで `rad_dep`・`rad_emit`（HOLO 有効時は
-   `holo_rad_dep`・`holo_rad_emit`）を上書きする。step の出力はこれらを step 全体の交換として
-   読む（checkpoint の `rad_dep`・`rad_emit`、`deposited_power` \(=\texttt{rad\_dep}/(V\Delta t)\)、
-   HOLO の源不一致診断）ため、\(n_{sub}>1\) では採用した試行の全 substep の値をデバイス上で
+6. 放射解は各回、自分が進めた区間の交換エネルギーで `rad_dep`・`rad_emit` を上書きする
+   （退役した HOLO では `holo_rad_dep`・`holo_rad_emit` も）。step の出力はこれらを step 全体の交換として
+   読む（checkpoint の `rad_dep`・`rad_emit`、`deposited_power` \(=\texttt{rad\_dep}/(V\Delta t)\)）ため、\(n_{sub}>1\) では採用した試行の全 substep の値をデバイス上で
    合計し、ループの後で書き戻す（two-stage 経路と同じ扱い）。\(n_{sub}=1\) では解が書いた値を
    そのまま使う。履歴の `radiation/fld_outer_iterations`・`fld_outer_residual`・
    `fld_outer_converged` も step の全 FLD 解について集約する（反復数は合計、残差は最大、収束は
    全解が収束したときだけ 1）。巻き戻した試行の値は含めない（2026-09-23 修正: 従来はどれも
    最後の substep の値で、`deposited_power` は \(1/n_{sub}\) 倍になっていた）。
 
-Prototype limitation（IMC 系。deterministic FLD/\(S_N\) は 2026-07-26 の
-transactional 化で解消）: IMC photon pool / census state は復元しない。
-そのため IMC での retry 後 Monte Carlo history は初回試行と bitwise には一致せず、
-`imc.save_census_snapshot()` / restore 相当の導入が必要である（IMC は退役済み）。
+（退役した IMC 系の prototype limitation — photon pool / census state を復元しないため retry 後の Monte Carlo history が
+初回試行と一致しない — はモンテカルロ輻射とともに 2026-09-29 に無くなった。）
 deterministic 経路の残存既知事項: 失敗 attempt が書く診断（fld substage audit
 history 行、conduction step counter）は巻き戻さない（診断専用・prognostic 影響なし）。
+
+（以下「smoothing は無効である」までの正味電子ソースの平滑化・difference 併用時の barrier・勾配適応係数は、退役したモンテカルロ輻射の
+沈着の注入の一部である。コードは 2026-09-29 にビルドから外し `retired/radiation_monte_carlo/` に保管し、
+`Radiation.imc.net_e_source_smoothing` は受理して無視する。）
 
 `Radiation.imc.net_e_source_smoothing.enabled = true` の場合、Radiation 演算子の
 source injection は \(H_c^{raw}=\sum_g(\texttt{rad\_dep}_{c,g}-\texttt{rad\_emit}_{c,g})\)
@@ -1763,7 +1816,19 @@ Hydro演算子 \(\mathcal{H}\) の適用をセル単位で制御する。
   ここで \(\mathcal{N}(j)\) はノード \(j\) に隣接するセル集合。
 - **非活性セルの処理**：`hydro_active_c = false` のセルは圧力・人工粘性による力の寄与をゼロとする。ノードが動くかどうかは下記の `hydro.T_start_inactive_cells` で決まる（既定の `"passive_fill"` では、活性セルに隣接するノードは動き、その先の非活性ノード列も平行移動する）。
 - **Δt への影響**：CFL条件（§2.2 (a)）は活性セルのみを対象とする。全セルが非活性の場合は \(\Delta t_{hydro} = \infty\)（Δt制御から除外）。
-- **GPU実装**：フラグ更新は単純なCUDAカーネル（1スレッド/セル）で行い、非活性セルは `if (!hydro_active[c]) { if (Te[c] >= T_start) hydro_active[c] = 1; }` のみ。活性セルはカーネル内で即座に `return` する。
+- **実装**：フラグ `State::hydro_active` は host の配列で、driver の `update_hydro_active` が \(T_e\) を host へ写して
+  1 セルずつ更新する（非活性セルだけ `if (Te[c] >= T_start) hydro_active[c] = 1;`、void セルは常に非活性）。
+  変化があれば device の写しを古いとして印を付け（`note_hydro_active_host_write`）、次に使うときに写す。
+- **VOID セルの区間（`cell_is_void`、2026-09-29 改訂）**：VOID セルは力を持たないので、その節点は自分では
+  動かない。連続する 2 セル以上の VOID セルの区間ごとに、区間を挟む 2 つの節点（材料の面の節点か境界の
+  節点。例: 外側の真空ではプラズマ端と外側の境界の節点、箔の後ろの真空では固定された内側の節点と箔の
+  後面、層の間の隙間では両側の層の面）の間に、区間の内部の節点を毎回（予測子・修正子の後）等間隔に並べ
+  直し、VOID セルの質量を \(\rho_{void}V\) に置き直す（`follow_void_region_nodes_1d`。VOID セルは物理から
+  除かれているので、実セルの保存量は変わらない）。2026-09-29 までは最外の区間（外側の真空）だけを並べ
+  直していたため、標的の内側の真空（箔の後ろ・殻の内側・層の間）では材料の面が動くと面に接する 1 つの
+  VOID セルだけが圧縮され、その体積が負になって止まった。区間が閉じる（両側の材料や境界が接する）場合の
+  接触の模型はなく、VOID セルの体積が負になった旨とその区間を報告して止まる。persistent loop は外側の
+  区間だけを扱うので、内側に VOID の区間があるデッキでは使わない（通常の経路に戻る）。
 - **非活性セルの扱い（`hydro.T_start_inactive_cells`、2026-09-14 追加）**：
   - `"passive_fill"`（既定、従来の挙動）：非活性セルは圧力・人工粘性の寄与ゼロ、ノードは隣接セルの
     いずれかが活性なら動く（上記の OR 伝播）。活性ノードに続く非活性ノード列は、その活性ノードの変位で
@@ -1789,8 +1854,12 @@ Hydro演算子 \(\mathcal{H}\) の適用をセル単位で制御する。
 
 ### 2.2 Δt制御
 \[
-\Delta t = \min(\Delta t_{hydro},\; \Delta t_{cond},\; \Delta t_{rad},\; \Delta t_{user},\; \Delta t_{output})
+\Delta t = \min(\Delta t_{hydro},\; \Delta t_{cond},\; \Delta t_{visc},\; \Delta t_{burn},\; \Delta t_{hot\text{-}e},\;
+g_{dt}\Delta t^{n}_{ref},\; \Delta t_{max},\; \Delta t_{output})
 \]
+（driver の `compute_dt_lineage`。\(\Delta t_{visc}\) は Braginskii 粘性の陽的安定条件（§3.1.13、無効なら \(\infty\)）、
+\(\Delta t_{burn}\) は燃焼の制限（§14.5）、\(\Delta t_{hot\text{-}e}\) はホット電子の沈着の制限（§5.11）で、後の 2 つは
+前ステップで計算した値を 1 step 遅れで使う。\(g_{dt}\Delta t^n_{ref}\) は下の成長制限。）
 
 > 全セルが `hydro_active_c = false`（§2.1.1）の場合、\(\Delta t_{hydro} = \infty\) として上式から実質的に除外される。
 > 一部セルのみ活性の場合、CFL計算は活性セルのみを対象とする。
@@ -1799,7 +1868,8 @@ Hydro演算子 \(\mathcal{H}\) の適用をセル単位で制御する。
 \[
 \Delta t_{hydro} = C_{CFL}\cdot\min_c\!\left(\frac{\Delta l_c}{|\mathbf{u}_c| + c_{s,c}}\right),\quad C_{CFL}=0.3\;(\text{既定})
 \]
-ここで \(\Delta l_c\) はセル代表長 [cm]（1D: \(\Delta r_i\)、2D: \(\sqrt{A_c}\)、§3.1.9/§3.2.13参照）。
+ここで \(\Delta l_c\) はセル代表長 [cm]（1D: \(\Delta r_i\)、2D: \(\sqrt{A_c}\)、§3.1.9/§3.2.13参照）。上式は概形で、
+1D の実装は §3.1.9 の式 — 分母に \(|u|\) を含まず（Lagrange 格子は流れと動く）、人工粘性の項を加える — である。
 1D_SPH で `post_shock_heat=True` の場合は、上式で得た acoustic/AV 制約に加えて
 §3.1.9 の明示的 post-shock heat flux 制約 \(\Delta t_{ps}\) を評価し、
 \(\Delta t_{hydro} = \min(\Delta t_{acoustic+AV}, \Delta t_{ps})\) とする。
@@ -1902,10 +1972,14 @@ and a suggested retry step
 \]
 with \(f_{shrink}\) given by
 `Numerics.hydro.trial_volume_cfl_shrink_fraction`.
-The current driver has no full-step retry/restore path for split hydro,
-laser, and radiation state, so this implementation is
-diagnostic-only: it warns before the existing geometry refresh/volume assert
-path rather than re-running the step.  The first hydro step is bypassed while
+With `Numerics.hydro.driver_full_step_retry_enabled=True` a rejected trial
+requests the driver's full-step retry (the driver restores the split hydro,
+laser, and radiation state and re-runs the step with a smaller \(\Delta t\));
+with the retry disabled (the default outside the ICF standard profile) it only
+warns before the existing geometry refresh/volume assert path.  The same
+switch governs the 1D hydro, which requests a retry on a non-positive cell
+volume and on a failed viscous (Braginskii) stability audit and aborts
+otherwise.  The first hydro step is bypassed while
 the previous-step sentinel \(\Delta t_{prev}\le0\) is present.  The default is
 off, so existing decks do not enter this path.
 
@@ -1922,6 +1996,11 @@ C_{cond}=0.25\;(\text{既定})
 伝導演算子は自身のCFL制約をSTSで内部処理するため（§4.2.1）、
 グローバルΔtには \(\Delta t_{exp}\) ではなく
 \(s_{max}(s_{max}+1)/2\) 倍に緩和された \(\Delta t_{cond,sts}\) のみが寄与する。
+この上限は §4.2.1 のサブステップ分割の安全係数 \(\eta\)（`sts_subcycle_eta`、既定 0.9）を含まない。伝導で刻みが
+決まるステップでは \(\Delta t=\Delta t_{cond,sts}>\eta\,\Delta t_{cond,sts}\) なので、伝導は常に \(n_{sub}=2\) のサブステップ
+（既定の \(s_{max}=40\) で各 29 段、計 58 段で \(820\,\Delta t_{exp}\)）で進む。計算は安定で正しいが、上限に \(\eta\) を入れて
+1 サブステップ（39 段で \(738\,\Delta t_{exp}\)）で進める場合より、同じ時間を進める段数が約 1.34 倍多い。上限に \(\eta\) を
+入れる変更は時間刻みを変えるので、性能の変更として別に扱う（2026-09-29 の監査で記録）。
 
 **陰的ソルバ**（`conduction.solver="implicit"` for 1D_SPH, `conduction.solver="hypre"` for 2D_RZ）：
 \[
@@ -1955,38 +2034,33 @@ blow-off tip で実測 eps 2.17 → 修正後 6.1e-7）。\(\alpha \equiv 1\)（
 全6変種（1D harmonic/Kirchhoff/secant・1D per-material・2D Kershaw plain/per-material）
 に適用。
 
-**(c) 輻射 Δt**（Fleck factor制約）：
+**(c) 輻射 Δt**（Fleck factor制約）— **退役（2026-09-29）**：
 
-IMCの暗黙化パラメータ（Fleck factor）が極端に小さくならないようΔtを制限する。
-Fleck factor \(f_c\)（§6.1）は：
+退役したモンテカルロ輻射（IMC）は、暗黙化パラメータ（Fleck factor、§6.1）\(f_c = 1/(1+\alpha\,c\,\beta_c\,\sigma_{P,c}\,\Delta t)\)
+が下限 \(f_{\min}\)（`Numerics.dt.f_min_fleck`、既定 0.01）を割らないよう
 \[
-f_c = \frac{1}{1 + \alpha\,c\,\beta_c\,\sigma_{P,c}\,\Delta t}
+\Delta t_{rad} = \min_c\!\left(\frac{1-f_{\min}}{f_{\min}}\cdot\frac{1}{\alpha\,c\,\beta_c\,\sigma_{P,c}}\right)
 \]
-ここで \(\beta_c = 4\,a_{eV}\,T_{e,c}^3 / C_{v,e,c}\)（§6.1 参照）、\(\sigma_{P,c} = \rho_c\,\kappa_{P,c}\)。
-
-\(f_c\) が小さすぎると IMC の実効散乱が増大し分散が悪化するため、下限 \(f_{\min}\) を設ける：
-\[
-\Delta t_{rad} = \min_c\!\left(\frac{1-f_{\min}}{f_{\min}}\cdot\frac{1}{\alpha\,c\,\beta_c\,\sigma_{P,c}}\right),\quad f_{\min}=0.01\;(\text{既定})
-\]
-
-> \(f_{\min}\) が小さいほど制約は緩い。\(f_{\max}\)（SPECIFICATION §6.4.5、Fleck factor上限）とは独立のパラメータ。
-> この下限は IMC 側 Fleck にのみ適用する。FLD 側 Fleck は stiff-cell 極限を保つため下限を使わない。
-> 実装（2026-09-15）: \(\Delta t_{rad}\) を計算する `compute_dt_rad_limit`（`src/radiation/fleck.cu`）は `Radiation.mode = imc_ddmc` のときだけ有限値を返し、`multigroup_diffusion`（FLD）と `sn_transport` では \(+\infty\)（駆動側の \(\Delta t\) 選択に入らない）。persistent loop の複製 `persistent_fld_dt_rad` も同じく \(+\infty\)。それ以前は輻射が有効な全モードで評価されており、表 EOS の電子熱容量が表の床（`EOSTable` の \(10^{-3}\) erg/(g·eV)）にあるセルでは \(\beta_c\) が発散し、冷たく光学的に厚いセルで \(\Delta t_{rad}\sim10^{-21}\) s になって計算が止まっていた（NIF DS 液体 D2 デッキ、SESAME 表、\(T_r=55\) eV：セル 197、\(T_e=25\) meV、\(\rho=0.29\) g/cc、\(\sigma_P=4.8\times10^{10}\) cm\(^{-1}\)、\(\beta=30\)）。既定経路（gxii / cbet 回帰、Marshak 波、灰色 FLD 輻射衝撃波、Hammer–Rosen）では制約が効いていなかったので状態量は bit 一致で、変わるのは履歴の診断列 `diagnostics/dt_breakdown_history/dt_rad`（+∞）だけ。
-
-> **σ_P 陳腐化に関する注意**：\(\sigma_{P,c}\) は Phase 4（Radiation演算子冒頭）で計算される。
-> Phase 5（Hydro 半ステップ後半）で \(T_e\) が変化するため、Phase 6 の \(\Delta t_{rad}\) 計算時には
-> \(\sigma_P\) が陳腐化している。この誤差は成長率制限（\(g_{dt} = 1.2\)）により、1ステップで
-> \(\Delta t\) が急変しないことで実用上吸収される。Phase 5 での \(T_e\) 変化が大きい場合は
-> 次ステップの \(\Delta t_{rad}\) が自動的に小さくなり自己修正される。
+で Δt を制限していた（\(f_c\) が小さすぎると実効散乱が増えて分散が悪化するため）。FLD 側の Fleck は stiff-cell 極限を保つため
+下限を使わず、2026-09-15 からこの制限は `mode = imc_ddmc` のときだけ有限値を返し、FLD・\(S_N\) では \(+\infty\) だった
+（それ以前は全モードで評価され、表 EOS の電子熱容量が表の床にある冷たく光学的に厚いセルで \(\Delta t_{rad}\sim10^{-21}\) s に
+なって計算が止まっていた — NIF DS 液体 D2 デッキ）。2026-09-29 にモンテカルロ輻射とともに Δt の候補から外し（計算していた
+`compute_dt_rad_limit`・`fleck.cu` は `retired/radiation_monte_carlo/` へ）、history の `diagnostics/dt_breakdown_history/dt_rad`
+も削除した。`Numerics.dt.f_min_fleck` は受理して無視する（WARNING）。FLD・\(S_N\) の run の状態量は変わらない
+（この項は常に \(+\infty\) で、min を決めたことがない）。
 
 **(d) レーザー Δt**：独立の CFL 制約は不要（レーザー吸収は hydro Δt のサブステップで処理されるため）。
 v1.0 では `Δt_laser` を独立に算出せず、`Δt_hydro` に包含する。上式の min 項にも含めない。
 
 **(e) ユーザ指定**：`dt.initial_s`（初期Δt）、`dt.max_s`（上限Δt）、`dt.min_s`（下限Δt、既定 \(10^{-20}\) s）を SPECIFICATION §6.4.7 で設定。
-`dt.initial_s` は **step 0 のみ** 使用される（step 0 では前ステップが存在せず成長制限が適用不能なため、ユーザ指定値を初期 Δt とする）。
+`dt.initial_s` は **step 0 のみ** 使用される：step 0 の \(\Delta t\) は `initial_s` と上式の各制限（成長制限を除く）の
+最小値で、`initial_s` \(\le0\) なら \(0.1\,\Delta t_{hydro}\)（hydro が無効なら `max_s`）と各制限の最小値。
 step ≥ 1 では `dt.initial_s` は無視され、通常の CFL + 成長制限が適用される。
 リスタート時はチェックポイントの dt を初期値として使用し、`dt.initial_s` は適用しない。
-\(\Delta t < \Delta t_{min}\) となった場合はシミュレーションを FATAL 停止する（ストーリング防止）。
+\(\Delta t < \Delta t_{min}\) となった場合の扱い：(i) 律速が成長制限で、物理の制限（\(\Delta t_{hydro}\)）が
+\(\Delta t_{min}\) 以上のとき（retry で縮めた後の回復）は \(\Delta t_{min}\) に切り上げて続行する。(ii) それ以外は
+`dt.min_consecutive_steps`（既定 1）回連続したときに FATAL 停止する（ストーリング防止。既定では即停止。回数に
+満たない間は警告を出して \(\Delta t_{min}\) に切り上げる）。2D には中心の環の吸収を待つ例外がある。
 
 **dt floor-stall detector（opt-in）**：`Numerics.dt.floor_stall_max_consecutive_steps=N`
 （既定 0 = disabled）を正値にした場合、driver は成功 commit された step だけを対象に

@@ -36,7 +36,6 @@ struct DtBreakdownHistoryRecord {
   std::string dt_winner = "other";
   int dt_winner_code = 0;
   double dt_hydro = std::numeric_limits<double>::infinity();
-  double dt_rad = std::numeric_limits<double>::infinity();
   double dt_cond = std::numeric_limits<double>::infinity();
   double dt_post_shock = std::numeric_limits<double>::infinity();
   double dt_growth = std::numeric_limits<double>::infinity();
@@ -121,7 +120,7 @@ struct HistorySnapshot {
   HotspotGasDiagnostics hotspot_gas{};
   tenryu::coupling::ProfileObservability* ale_provenance = nullptr;
   std::vector<OperatorResidualEntry> operator_residuals;
-  RadiationDiagnostics mc{};
+  RadiationOvershootDiagnostics radiation_overshoot{};
   DtBreakdownHistoryRecord dt_breakdown{};
   PlasmaViscosityHistoryRecord plasma_viscosity{};
 };
@@ -303,10 +302,6 @@ class HistoryWriter {
     std::int64_t step = 0;
     // Only the dt-breakdown groups (append_dt_breakdown); no t/cycle/dt row.
     bool dt_only = false;
-    bool mc_group_enabled = true;
-    bool mc_particle_counts_enabled = true;
-    bool mc_weight_stats_enabled = true;
-    bool mc_ddmc_fraction_enabled = true;
     bool phase_resolved_energy_enabled = false;
     bool ale_closure_audit_enabled = false;
     bool icf_enabled = false;
@@ -460,10 +455,6 @@ class HistoryWriter {
 #endif
 
   bool enabled_ = false;
-  bool mc_group_enabled_ = true;
-  bool mc_particle_counts_enabled_ = true;
-  bool mc_weight_stats_enabled_ = true;
-  bool mc_ddmc_fraction_enabled_ = true;
   bool phase_resolved_energy_enabled_ = false;
   bool ale_closure_audit_enabled_ = false;
   bool icf_enabled_ = false;

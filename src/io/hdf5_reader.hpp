@@ -4,7 +4,6 @@
 
 #include "core/config.hpp"
 #include "core/state.hpp"
-#include "radiation/particle_pool.cuh"
 
 namespace tenryu::io {
 
@@ -18,7 +17,6 @@ enum class PerMaterialCheckpointReadStatus {
 
 struct CheckpointData {
   tenryu::core::State state;
-  tenryu::radiation::PhotonPool photon_pool;
   PerMaterialCheckpointReadStatus per_material_checkpoint_status =
       PerMaterialCheckpointReadStatus::MissingGroupEnabled;
 };

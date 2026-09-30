@@ -20,36 +20,6 @@ struct NlteCoeffsDeviceResult {
     int nan_inf_count = 0;
 };
 
-/// GPU computation of NLTE radiation coefficients using separate emissivity.
-/// Outputs are written directly to device buffers owned by the caller.
-NlteCoeffsDeviceResult compute_nlte_coefficients_cuda(
-    const double* d_rho,
-    const double* d_Te,
-    const double* d_zbar,
-    const double* d_cv_e,
-    const std::uint8_t* cell_is_void_host,
-    std::size_t cell_is_void_size,
-    const materials::IonmixOpacityDeviceView& table_view,
-    const PlanckTableDeviceView& planck_view,
-    int n_cells, int n_groups,
-    double dt, double A, double alpha,
-    double f_min, double f_max,
-    double fd_delta_rel, double fd_abs_min,
-    double sigma_cap, double cv_e_override,
-    double temperature_floor_eV,
-    double gamma_m1, bool linearized_planck,
-    bool use_freeze_opacity, bool corrected_fleck,
-    double* d_f,
-    double* d_sigma_pa, double* d_sigma_R,
-    double* d_sigma_a_eff, double* d_sigma_s_eff,
-    double* d_eta_cdf,
-    double* d_eta,
-    double* d_lambda_raw,
-    cudaStream_t stream,
-    bool low_density_extrap = false,
-    const int* cell_material_index = nullptr,
-    int material_filter = -1);
-
 /// When pinned_clamp_counts is non-null, it must point to page-locked host memory
 /// with room for 3 ints: slot 0 = negative_alpha, slot 1 = negative_eta, and
 /// slot 2 = nan_inf. The function issues the counter copies asynchronously into

@@ -124,7 +124,6 @@ Numerics(
         growth_factor=1.0,
         cfl_hydro=0.3,
         cfl_cond=0.25,
-        f_min_fleck=0.01,
     ),
     hydro=dict(boundary_1d="free"),
     conduction=dict(enabled=True, f_lim=0.06),

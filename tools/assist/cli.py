@@ -58,11 +58,20 @@ def main(argv: Optional[List[str]] = None) -> int:
     lint_parser.add_argument("-o", "--output")
     lint_parser.add_argument("--keep-tmp", action="store_true")
 
+    recommend_parser = subparsers.add_parser("recommend-mesh")
+    recommend_parser.add_argument("--conditions", help="experimental conditions JSON")
+    recommend_parser.add_argument("--deck", help="deck to inspect and validate with the mesh")
+    recommend_parser.add_argument("--tenryu")
+    recommend_parser.add_argument("-o", "--output")
+    recommend_parser.add_argument("--deck-out", help="write the assembled input deck or synthetic mesh-check candidate after validation")
+    recommend_parser.add_argument("--mesh-out", help="write the ready-to-paste Mesh block")
+
     generate_parser = subparsers.add_parser("generate-deck")
     generate_parser.add_argument("spec")
     generate_parser.add_argument("--out-deck", required=True)
     generate_parser.add_argument("--tenryu")
     generate_parser.add_argument("--template")
+    generate_parser.add_argument("--conditions", help="experimental conditions JSON for the first mesh prompt")
     generate_parser.add_argument("--intent")
     generate_parser.add_argument("--baseline")
     generate_parser.add_argument("--max-iters", type=int, default=10)
@@ -140,6 +149,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         from tools.assist.zoning import main_promote_zoning
 
         return main_promote_zoning(args)
+
+    if args.subcommand == "recommend-mesh":
+        from tools.assist.recommend_mesh import main_recommend_mesh
+
+        if not args.conditions and not args.deck:
+            parser.error("recommend-mesh requires --conditions or --deck")
+        return main_recommend_mesh(args)
 
     if args.subcommand == "lint-deck":
         from tools.assist.deck_lint import main_lint_deck

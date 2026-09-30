@@ -1,7 +1,6 @@
 add_library(tenryu_verification STATIC
   sedov_analytic.cpp
   noh_analytic.cpp
-  diffusion_ref.cpp
   escape_valve_audit.cpp
   tier_threshold.cu
   audit_summary.cpp

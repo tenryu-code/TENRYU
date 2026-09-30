@@ -14,7 +14,9 @@ TENRYU_HOST_DEVICE inline double compute_coulomb_log(const double n_hat,
                                                      const double Zbar,
                                                      const double lambda_cm,
                                                      const double floor_value = 2.0) {
-  const double effective_floor = ::fmax(2.0, floor_value);
+  // Laser.absorption.coulomb_log_floor, validated to [1, 30] by the builder (SPECIFICATION §6.4.6). Until
+  // 2026-09-29 the floor was max(2, floor_value), so values below 2 were accepted and had no effect.
+  const double effective_floor = floor_value;
   if (!(Te_eV > 0.0) || !(Zbar > 0.0) || !(lambda_cm > 0.0)) {
     return effective_floor;
   }

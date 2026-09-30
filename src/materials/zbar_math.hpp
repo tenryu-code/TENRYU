@@ -19,6 +19,37 @@ TENRYU_HOST_DEVICE inline double zbar_separate_add_product(
 #endif
 }
 
+// Mean ionization of a mixed cell from its materials' values (NUMERICS §1.1.5a): the weight of material m is
+// f_m / A_m, its ions per unit volume at the cell density (f_m its volume fraction, A_m its mass number), so that
+// rho Zbar / (A_eff m_p), with the harmonic mean A_eff = sum f / sum (f / A), is the sum of the materials' electron
+// densities. A cell with one present material takes that material's value exactly (bitwise), as with the former
+// volume-fraction weights; fractions that are not positive (and NaN) are skipped. Until 2026-09-29 the weights were
+// the volume fractions alone, which over-weighted the heavier material's charge in n_e.
+struct ZbarMixAccumulator {
+  double weighted = 0.0;
+  double weight_sum = 0.0;
+  double single_value = 0.0;
+  int present = 0;
+
+  TENRYU_HOST_DEVICE void add(const double volume_fraction, const double A_amu, const double value) {
+    if (!(volume_fraction > 0.0)) {
+      return;
+    }
+    const double w = volume_fraction / reclose_max(A_amu, 1.0e-12);
+    weighted = zbar_separate_add_product(weighted, w, value);
+    weight_sum += w;
+    single_value = value;
+    ++present;
+  }
+
+  TENRYU_HOST_DEVICE double mean() const {
+    if (present == 1) {
+      return single_value;
+    }
+    return (present > 1 && weight_sum > 0.0) ? weighted / weight_sum : 0.0;
+  }
+};
+
 // Thomas-Fermi mean ionization, R. M. More, Adv. At. Mol. Phys. 21, 305
 // (1985), Table IV ("an approximate fit to" the TF ionization state), with the
 // TF scaling variables R = rho/(Z A) [g/cm^3] and T0 = T/Z^{4/3} [eV]:

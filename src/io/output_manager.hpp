@@ -5,10 +5,6 @@
 #include "core/config.hpp"
 #include "core/state.hpp"
 
-namespace tenryu::radiation {
-struct PhotonPool;
-}
-
 namespace tenryu::io {
 
 class OutputManager {
@@ -54,7 +50,6 @@ class OutputManager {
                       int rank = 0);
   void write_checkpoint(const tenryu::core::State& state,
                         const tenryu::core::Config& cfg,
-                        const tenryu::radiation::PhotonPool& photon_pool,
                         int step,
                         double t,
                         const std::string& case_name,

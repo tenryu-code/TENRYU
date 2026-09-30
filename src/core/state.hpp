@@ -932,33 +932,9 @@ struct State {
   CellField1D sn_tau_R;         // [n_cells], 2D S_N AP optical-depth diagnostic
   CellField1D sn_reduced_flux;  // [n_cells], 2D S_N AP reduced-flux diagnostic
   CellField1D sn_ap_alpha;      // [n_cells], 2D S_N AP alpha diagnostic
-  CellField1D difference_W;           // [n_cells], optional difference reference weight
-  GroupField1D difference_E_ref;      // [n_cells * G], optional time-average reference density
-  GroupField1D difference_residual_E; // [n_cells * G], optional signed residual density
-  CellField1D delta_E_rad_prev;  // [n_cells], previous step applied net radiation source
-  std::vector<std::int8_t> ddmc_mode_map;
-  bool ddmc_mode_map_valid = false;
-  bool particle_sort_cache_invalidated = false;
-  std::vector<std::uint8_t> holo_core_mask;
-  std::vector<std::uint8_t> holo_patch_mask;
-  std::vector<std::uint8_t> holo_core_prev_mask;
-  std::vector<std::int32_t> holo_hold_count;
-  std::vector<std::int32_t> holo_dwell_count;
-  std::vector<double> holo_tau_R;
-  std::vector<double> holo_reduced_flux;
-  std::vector<double> holo_mass_q;
-  std::vector<double> holo_lo_weight;
-  GroupField1D holo_E_LO;
-  GroupField1D holo_F_LO;  // [(n_cells+1) * G], face radiation flux for QD solver
-  GroupField1D holo_consistency_source;  // [n_cells * G], same-step HOLO RHS source [erg/s]
-  GroupField1D holo_rad_dep;
-  GroupField1D holo_rad_emit;
-  GroupField1D holo_Prr;
-  GroupField1D holo_chi;
-  GroupField1D holo_chi_filtered;  // [n_cells * G], filtered QD closure history
-  GroupField1D holo_Prr_coverage;
-  bool holo_core_mask_valid = false;
-  bool holo_lo_source_valid = false;
+  // Set when a remap has moved the mesh under the radiation fields (1D and 2D ALE): the FLD and S_N solvers
+  // rebuild their mesh-dependent caches and restart their time histories, then clear it. The name dates from the
+  // HOLO acceleration of the Monte Carlo radiation (retired 2026-09-29), which set and read it first.
   bool holo_ale_invalidated = false;
   int fld_outer_iterations = 0;
   bool fld_converged = false;
@@ -1320,7 +1296,6 @@ struct State {
   // Run-cumulative external radiation volume-source energy [erg].
   double E_volume_in = 0.0;
   double E_solver = 0.0;
-  DeviceErrorFlags radiation_device_flags{};
   mutable DispatchCounters dispatch_counters;
 
   // --- Output timing state ---

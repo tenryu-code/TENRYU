@@ -75,10 +75,4 @@ int solve_sn_material_temperature_newton_gpu(
 void solve_sn_material_temperature_newton_2d_legacy_gpu(
     const SnMaterialNewton1DInputs& in);
 
-void solve_sn_material_temperature_newton_gpu(
-    const SNMaterialCouplingGPUInputs& in,
-    int n_cells,
-    int n_groups,
-    double temperature_floor_eV);
-
 }  // namespace tenryu::radiation

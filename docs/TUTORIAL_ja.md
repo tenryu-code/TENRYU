@@ -250,8 +250,8 @@ outputs/<name>/
 | `ConfigError: ... is not a supported key (did you mean 'X'?)` | キー名の打ち間違い。候補が出るのでそのまま直す |
 | `ConfigError: eos.file is required for model=sesame` | テーブル EOS はファイル必須。入門は `ideal_gas` に |
 | `ConfigError: opacity.model="power_law" is grey-only` | 冪乗 opacity は 1 群限定。多群にするなら constant/table へ |
-| `Radiation.mode="imc_ddmc"` でエラー | 旧 Monte Carlo は退役済み（1D では選択不可）。書かない（=FLD 既定）か `sn_transport` に |
-| `imc=dict(...)` / `ddmc=dict(enabled=True)` でエラー | 退役モード専用の互換キー。現行 FLD/S_N では書かない |
+| `Radiation.mode="imc_ddmc"` でエラー | 旧 Monte Carlo 輻射は退役し、2026-09-29 にビルドから外した。書かない（=FLD 既定）か `sn_transport` に |
+| `imc=dict(...)` / `ddmc=dict(...)` で WARNING、`enabled=True` でエラー | 退役したモンテカルロ輻射の設定。受理して無視する（`imc=dict(two_stage=...)` だけが効く）。書かない |
 | 実行したのに結果が古いまま | 出力 dir 衝突で `_001` へ書かれている（§5 Output 注意参照） |
 | 温度が上がらない/波が進まない | まず validate の要約で enabled 群を確認。次に frozen JSON で境界・opacity の実効値を確認 |
 | dt がどんどん小さくなり進まない | ログの dt limiter 名（`hydro`/`conduction`/`braginskii` 等）を確認し、該当物理の設定（床値・格子）を見直す |

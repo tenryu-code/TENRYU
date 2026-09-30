@@ -294,6 +294,8 @@ Kershawステンシル（A.6）は空間離散化のみを定義する。
 
 ### A.10 DDMCリーク係数との接続
 
+> 退役した方式の記録（コードは 2026-09-29 にビルドから外し `retired/radiation_monte_carlo/` に保管）。
+
 Kershawステンシル（A.6）で構成される行列 \(A_{ij}\) から、DDMCリーク係数（§7.3.2）を導出する。
 既定（`m_matrix_check=True`）では：
 \[
@@ -642,8 +644,9 @@ tag = phase_id * 1000 + direction * 100 + field_id
 **[LEGACY — v1 実装対象外（M18 改訂 2026-07）]** IMC/DDMC の退役（正典輻射 =
 FLD §6.7 / SN §6.8 の決定論ソルバ）により、光子粒子の rank 間移動は v1 MPI の
 実装対象外である。本節のプロトコルは将来の MC モード復活に備えた設計記録として
-保持する（`src/parallel/particle_migration.cu` の基盤は存置）。なお 1D burn
-scheme="mc" は MPI 以前に driver assert で停止する既知の死路（本線へ報告済み）。
+保持する（基盤の `particle_migration.cu` は 2026-09-29 に `retired/radiation_monte_carlo/` へ移した。`Parallel.migration` は受理して無視する）。なお燃焼の `Burn.scheme="mc"`（§14.9）は光子の粒子とは
+別の経路で、1D では driver の燃焼段が実行する（ctest `burn_mc_cv` が端から端まで走らせる）。driver の
+「unreachable: 2D burn mc」の assert は 2D の分岐にだけある（以前ここに「1D の mc は assert で止まる」と書いていたのは誤り）。
 
 IMC/DDMCの光子粒子がセル境界を越え、その先が他rankの領域である場合の
 移動（migration）プロトコルを定義する。
@@ -765,11 +768,15 @@ ParticleEmigrant:
 
 1. 各rankが自身の所有セルの動径プロファイル（\(\rho(r), T_e(r), n_e(r)\)）を準備
 2. `MPI_Allgatherv` で全rankのプロファイルを収集（全rankが全動径プロファイルを持つ）
-3. `raytrace_2d` では各rankが独立に **1ビーム分の** レイトレースを実行する（§5.6.4）。
-   `radial_absorption_1d` では rank 0 のみが §5.4a の serial kernel を実行する
-4. `raytrace_2d` では正規化吸収分率を全ビームパワー合計でスケーリングする。
-   `radial_absorption_1d` では rank 0 が得た 1D 沈着パワー配列を既存 Allgatherv 経路で集約する
-5. 局所セル範囲のみ自身のHydroMeshへ適用する
+3. 各rankが同じ全線の入力で、同じレイトレース（`raytrace_2d`、§5.6.4 のビームごとの追跡）または §5.4a の動径積分
+   （`radial_absorption_1d`）を独立に実行する（1D のレーザーは全 rank で複製計算する）
+4. 各rankは全線の沈着パワー配列を自分で持つので、沈着を rank 間で足し合わせない
+   （足し合わせると rank 数倍になる — 以前の Allgatherv の集約はそのため撤去した）
+5. 再分配（§5.8.1）の所有窓のマスクで、局所セル範囲のみ自身のHydroMeshへ適用する
+
+`radial_absorption_1d` は 2026-09-29 まで rank 0 だけが実行しており、集約の関数は呼ばれていなかったので、rank 1 以降が
+持つセルにはレーザーの沈着が入らなかった（未吸収パワーだけを rank 間で足していた）。現在は全 rank が実行し、未吸収は
+複製された値をそのまま使う（試験 `test_radial_absorption_1d` の所有範囲のケース）。
 
 **通信量見積もり**：
 - 1D_SPH、\(N_r = 1000\) セル、3変数（ρ, T_e, n_e）：
@@ -808,9 +815,9 @@ v1.0（`laser_parallel.strategy="replicated"`）では、沈着写像も次元�
 
 - **1D_SPH**：
   レイトレース結果は Hydro 1Dセル吸収パワー [erg/s] として直接得る。
-  rank 間ではこの 1D 配列を `Allgatherv` で同期し、その後に各rankが
+  各rankが同じ全線の配列を複製計算で持つので rank 間の同期は要らず、各rankが
   blocked cell / ghost handoff / transition blend を適用して
-  自rank所有セルの `laser_dep` へ反映する。
+  自rank所有セルの `laser_dep` へ反映する（所有窓の外のセルは 0 にする）。
 - **2D_RZ**：
   レイトレース結果（LaserMeshノード上の吸収パワー [erg/s]）を各rankが保持し、
   **自rank所有セルにのみ** scatter-add する。
@@ -924,18 +931,13 @@ ALE remap（§3.3.4）は rezone後に1回のcellフィールド交換で対応�
   - \(E_{abs}^{total}\)：全セル吸収エネルギー合計
   - \(E_{emit}^{total}\)：全セル放射エネルギー合計
   - \(E_{escape}^{total}\)：境界脱出エネルギー合計
-  - \(E_{census}^{total}\)：census粒子エネルギー合計
-  - \(N_{particles}^{total}\)：全粒子数
-  - \(N_{mode\_switch}^{total}\)：モード変換回数
+  - （退役したモンテカルロ輻射では census 粒子エネルギー合計 \(E_{census}^{total}\)・全粒子数・モード変換回数も集約していた）
 - 収支チェック：§10.2 の \(\varepsilon_{budget}\) 定義に従い、分母に \(E_{denom} = \max(|E_{int,e}^n|+|E_{int,i}^n|+|E_{kin}^n|+|E_{rad}^n|, E_{source}, 10^{-20})\) を使用する（§11.1参照）
 
 **エネルギー収支 MPI_Allreduce のタイミング**：
 
-エネルギー収支の `MPI_Allreduce` は放射ステップの最終粒子移送交換完了**後**に実行する。
-この時点で：
-- 全 emigrant 粒子は受信側ランクで処理済み
-- \(E_{census}^{total}\) は各粒子の現在所在ランクで計上
-- \(E_{escape}\) は各ランクのローカル集計を `Allreduce(SUM)` で合算
+エネルギー収支の `MPI_Allreduce` は放射ステップの完了**後**に実行し、\(E_{escape}\) は各ランクのローカル集計を `Allreduce(SUM)` で合算する
+（退役したモンテカルロ輻射では最終粒子移送交換の後に、census 粒子を現在の所在ランクで計上していた）。
 
 タイミング（正規 reduction リストは CUDA_KERNELS §9 Phase 6 が規範的）：
 ```
@@ -945,7 +947,7 @@ R8/R9 transport → R12 roulette → [MPI] final emigrant exchange →
                       step_E_pdV_bdry, step_E_Marshak_in, step_E_solver,
                       step_laser_dep_total →
 // step_laser_escaped = E_laser_incident - step_laser_dep_total (Allreduce後に算出)
-[MPI] Allreduce(MIN): dt_hydro, dt_cond, dt_rad →
+[MPI] Allreduce(MIN): dt_hydro, dt_cond →
 [MPI] Allreduce(MAX): error_flags →
 energy_budget check
 ```
@@ -1093,11 +1095,12 @@ v1.0では**静的分割**を既定とする。
 - セル数ベースの均等分割（§12.1.1、§12.1.2）
 
 **静的分割の限界**：
-- IMC/DDMC粒子は光学的に厚い領域に集中する傾向があり、
-  粒子数（計算負荷）がセル数に比例しない
 - 爆縮問題では中心部が高密度化し、中心を持つrankに負荷が偏る
+- （退役したモンテカルロ輻射では、光子粒子が光学的に厚い領域に集中して粒子数（計算負荷）がセル数に比例しないことも限界だった）
 
 #### 12.6.2 粒子レベル負荷分散（既定OFF）
+
+> 退役した方式の記録（光子粒子の work-stealing。実装されずに退役し、`Parallel.particle_balance` は受理して無視する）。
 
 粒子数の偏りを軽減するための work-stealing 方式：
 
@@ -1119,13 +1122,19 @@ v1.0では**静的分割**を既定とする。
 
 ### 12.7 再現性（Reproducibility）
 
-モンテカルロ法の性質上、TENRYUは **システム全体としてbitwise再現を要求しない**。
-**統計的再現**（同一seed・同一構成で主要物理量の平均・分散が一致）のみを保証する。
-ただし、**決定論的演算子**（Hydro、Conduction）は同一入力で bitwise 一致が得られる。
-放射フィールド（IMC/DDMC）は Persistent Warp の非決定性および atomicAdd 順序により
-bitwise 一致は保証されず、統計的一致（VERIFICATION §16.8 の CV ≤ 0.1% 基準）を要求する。
+現行の決定論経路（FLD/\(S_N\) の輻射、流体、伝導、1D Lagrangian）は、同一 GPU・同一構成で run-to-run の bitwise 一致を
+検証 gate で確認する（既知の例外は VERIFICATION の noise-band gate：1D の一部の host 集計の台帳 ~1e-15、2D_RZ の atomicAdd 順序の LSB）。
+モンテカルロの要素は燃焼の α 粒子輸送（`Burn.scheme="mc"`、§14.9、既定 OFF）だけで、これは統計的再現を求める。
+
+退役したモンテカルロ輻射（IMC/DDMC）は Persistent Warp の非決定性と atomicAdd 順序のため bitwise 一致を保証せず、
+統計的一致（VERIFICATION §16.8 の CV ≤ 0.1% 基準）を要求していた。§12.7.1〜§12.7.2 の光子粒子の RNG 分割と粒子順序は
+その設計記録（コードは 2026-09-29 にビルドから外し `retired/radiation_monte_carlo/` に保管）。燃焼の α 粒子は `curand_init(Main.seed ^ global_id, step, 0, &state)` で初期化し、`global_id` はセル・スロット・
+標本の番号から作る（`burn/mc_transport.cu` の `mc_transport_global_id`）。`Main.max_steps` の上限 \(2^{24}-1\) は下の光子粒子の
+`global_id` の構成（\(\text{step}\times 2^{40}\) が uint64 に収まる）に由来し、そのまま残している。
 
 #### 12.7.1 RNG分割：cuRAND device API による Philox4x32-10
+
+> 退役した方式の記録（光子粒子の RNG 分割。コードは 2026-09-29 にビルドから外し `retired/radiation_monte_carlo/` に保管）。燃焼の α 粒子の初期化は §12.7 冒頭。
 
 **cuRAND device API**（`curand_kernel.h`、CUDA Toolkit 同梱）の
 `curandStatePhilox4_32_10_t` を使用する。Philox4x32-10 はカウンタベースRNGであり、
@@ -1267,6 +1276,8 @@ bitwise再現は保証されない。統計的再現は各粒子のRNG独立性�
 
 #### 12.7.2 粒子順序：移動後のソート
 
+> 退役した方式の記録（コードは 2026-09-29 にビルドから外し `retired/radiation_monte_carlo/` に保管）。
+
 rank間移動後の粒子ソートは**オプション**（既定OFF）。
 
 - セルソート（§6.5）がキャッシュ局所性を担保するため、global_idソートは再現性目的では不要
@@ -1298,4 +1309,3 @@ size. Changing the cooperative grid size changes the reduction order and is a
 tolerance-class change, like changing `blockDim`.
 
 ---
-

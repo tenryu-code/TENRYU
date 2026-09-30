@@ -406,28 +406,6 @@ State State::allocate(const Config& cfg, const double hydro_t_start_eV) {
   state.sn_tau_R.reset(n_cells);
   state.sn_reduced_flux.reset(n_cells);
   state.sn_ap_alpha.reset(n_cells);
-  state.ddmc_mode_map.assign(n_cells * n_groups, static_cast<std::int8_t>(0));
-  state.ddmc_mode_map_valid = false;
-  state.particle_sort_cache_invalidated = false;
-  state.holo_core_mask.assign(n_cells, static_cast<std::uint8_t>(0));
-  state.holo_patch_mask.assign(n_cells, static_cast<std::uint8_t>(0));
-  state.holo_core_prev_mask.assign(n_cells, static_cast<std::uint8_t>(0));
-  state.holo_hold_count.assign(n_cells, 0);
-  state.holo_dwell_count.assign(n_cells, 0);
-  state.holo_tau_R.assign(n_cells, 0.0);
-  state.holo_reduced_flux.assign(n_cells, 0.0);
-  state.holo_mass_q.assign(n_cells, 0.0);
-  state.holo_lo_weight.assign(n_cells, 0.0);
-  state.holo_E_LO.reset(n_cells * n_groups);
-  state.holo_consistency_source.reset(n_cells * n_groups);
-  state.holo_rad_dep.reset(n_cells * n_groups);
-  state.holo_rad_emit.reset(n_cells * n_groups);
-  state.holo_Prr.reset(n_cells * n_groups);
-  state.holo_chi.reset(n_cells * n_groups);
-  state.holo_chi_filtered.reset(n_cells * n_groups);
-  state.holo_Prr_coverage.reset(n_cells * n_groups);
-  state.holo_core_mask_valid = false;
-  state.holo_lo_source_valid = false;
   state.holo_ale_invalidated = false;
   state.fld_outer_iterations = 0;
   state.fld_converged = false;
@@ -520,7 +498,6 @@ State State::allocate(const Config& cfg, const double hydro_t_start_eV) {
   state.E_Marshak_in = 0.0;
   state.E_volume_in = 0.0;
   state.E_solver = 0.0;
-  state.radiation_device_flags = DeviceErrorFlags{};
   state.corner_mass_initialized = false;
   state.corner_mass_is_lagrangian_invariant = false;
   state.dispatch_counters.reset();
@@ -624,13 +601,6 @@ void State::ensure_cell_material_props(const Config& cfg) {
   constexpr double kMinA = 1.0e-12;
   constexpr double kMinGamma = 1.0 + 1.0e-12;
   const auto& materials = cfg.materials.materials;
-  const auto& mat0 = materials.front();
-  const double A0 = std::max(mat0.A, kMinA);
-  const double gamma0 = std::max(mat0.ideal_gas_gamma, kMinGamma);
-
-  std::vector<double> host_A(n_cells, A0);
-  std::vector<double> host_gamma(n_cells, gamma0);
-
   const std::size_t n_mat = materials.size();
   const std::size_t expected = n_cells * n_mat;
   std::size_t d0 = 0U;
@@ -640,6 +610,14 @@ void State::ensure_cell_material_props(const Config& cfg) {
       break;
     }
   }
+  // Cells without a non-void material (and single-material decks) take the first non-void material's values, as
+  // in the laser source terms (compute_effective_A_gamma).
+  const auto& mat0 = materials[d0];
+  const double A0 = std::max(mat0.A, kMinA);
+  const double gamma0 = std::max(mat0.ideal_gas_gamma, kMinGamma);
+
+  std::vector<double> host_A(n_cells, A0);
+  std::vector<double> host_gamma(n_cells, gamma0);
   std::vector<int> host_mat_index(n_cells, static_cast<int>(d0));
   if (n_mat > 1U && volFrac.size() == expected) {
     std::vector<double> host_volfrac(expected, 0.0);
@@ -661,7 +639,13 @@ void State::ensure_cell_material_props(const Config& cfg) {
         const double frac_raw = host_volfrac[base + m];
         const double frac =
             (std::isfinite(frac_raw) && frac_raw > 0.0) ? frac_raw : 0.0;
-        if (!materials[m].is_void && frac > max_non_void_frac) {
+        // A void material is vacuum: it has no ions and does not enter the mean mass or adiabatic index
+        // (NUMERICS §1.1.5a; the laser source terms' compute_effective_A_gamma already skipped it). Until
+        // 2026-09-29 its fraction was averaged in here.
+        if (materials[m].is_void) {
+          continue;
+        }
+        if (frac > max_non_void_frac) {
           max_non_void_frac = frac;
           host_mat_index[c] = static_cast<int>(m);
         }
@@ -1044,32 +1028,6 @@ void State::reset() {
   sn_tau_R.fill(0.0);
   sn_reduced_flux.fill(0.0);
   sn_ap_alpha.fill(0.0);
-  difference_W.reset(0);
-  difference_E_ref.reset(0);
-  difference_residual_E.reset(0);
-  delta_E_rad_prev.reset(0);
-  std::fill(ddmc_mode_map.begin(), ddmc_mode_map.end(), static_cast<std::int8_t>(0));
-  ddmc_mode_map_valid = false;
-  particle_sort_cache_invalidated = false;
-  std::fill(holo_core_mask.begin(), holo_core_mask.end(), static_cast<std::uint8_t>(0));
-  std::fill(holo_patch_mask.begin(), holo_patch_mask.end(), static_cast<std::uint8_t>(0));
-  std::fill(holo_core_prev_mask.begin(), holo_core_prev_mask.end(), static_cast<std::uint8_t>(0));
-  std::fill(holo_hold_count.begin(), holo_hold_count.end(), 0);
-  std::fill(holo_dwell_count.begin(), holo_dwell_count.end(), 0);
-  std::fill(holo_tau_R.begin(), holo_tau_R.end(), 0.0);
-  std::fill(holo_reduced_flux.begin(), holo_reduced_flux.end(), 0.0);
-  std::fill(holo_mass_q.begin(), holo_mass_q.end(), 0.0);
-  std::fill(holo_lo_weight.begin(), holo_lo_weight.end(), 0.0);
-  holo_E_LO.fill(0.0);
-  holo_consistency_source.fill(0.0);
-  holo_rad_dep.fill(0.0);
-  holo_rad_emit.fill(0.0);
-  holo_Prr.fill(0.0);
-  holo_chi.fill(0.0);
-  holo_chi_filtered.fill(0.0);
-  holo_Prr_coverage.fill(0.0);
-  holo_core_mask_valid = false;
-  holo_lo_source_valid = false;
   holo_ale_invalidated = false;
   fld_outer_iterations = 0;
   fld_converged = false;
@@ -1174,7 +1132,6 @@ void State::reset() {
   E_Marshak_in = 0.0;
   E_volume_in = 0.0;
   E_solver = 0.0;
-  radiation_device_flags = DeviceErrorFlags{};
   dispatch_counters.reset();
   t_next_plot = -1.0;
   t_next_history = -1.0;

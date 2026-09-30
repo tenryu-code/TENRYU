@@ -332,7 +332,8 @@ void compute_effective_material_properties(const core::Config& cfg,
   TENRYU_ASSERT(!cfg.materials.materials.empty(),
                 "Conduction requires at least one material");
   const auto& materials = cfg.materials.materials;
-  const auto& mat0 = materials.front();
+  const int first_nonvoid = std::max(cfg.materials.first_nonvoid_material_index(), 0);
+  const auto& mat0 = materials[static_cast<std::size_t>(first_nonvoid)];
   const double A0 = std::max(mat0.A, kMinEffectiveA);
   const double gamma0 = std::max(mat0.ideal_gas_gamma, kMinEffectiveGamma);
 
@@ -391,6 +392,10 @@ void compute_effective_material_properties(const core::Config& cfg,
     double inv_A_c = 0.0;
     double gamma_c = 0.0;
     for (int m = 0; m < n_mat; ++m) {
+      // Void materials do not enter the means (State::ensure_cell_material_props, 2026-09-29).
+      if (materials[static_cast<std::size_t>(m)].is_void) {
+        continue;
+      }
       const double frac_raw = volfrac[base + static_cast<std::size_t>(m)];
       const double frac =
           (std::isfinite(frac_raw) && frac_raw > 0.0) ? frac_raw : 0.0;
@@ -891,191 +896,436 @@ __device__ inline double cell_center_radius(const double* x_r, const int i) {
   return 0.5 * (x_r[i] + x_r[i + 1]);
 }
 
-__device__ inline void compute_spitzer_deff_1d_kernel_per_material_body(
-    const int tid,
-    const int /*thread_tid*/,
-    double* __restrict__ /*shared*/,
-    double* __restrict__ kappa_face,
-    double* __restrict__ kappa_eff_per_material,
-    double* __restrict__ rho_cv_e,
-    double* __restrict__ min_ratio,
-    double* __restrict__ min_deff,
-    double* __restrict__ max_deff,
-    per_material::PerMaterialAccessorView view,
+// The Spitzer conductivity (with xi(Z)) of one material of a 1D cell at its own density, electron temperature, charge
+// and mass, times the mean-free-path limiter factor with the cell width dl: the cell conductivity of the
+// single-material 1D path (conduction_bodies::compute_spitzer_deff_1d_kernel_body) evaluated for the material; the
+// flux limiter acts on the faces. test_kappa > 0 replaces it as on that path.
+__device__ inline double material_cell_kappa_1d(const double rho_m,
+                                                const double Te_m,
+                                                const double Zbar_m,
+                                                const double A_m,
+                                                const double dl,
+                                                const double test_kappa,
+                                                const double mfp_limiter_C) {
+  if (test_kappa > 0.0) {
+    return test_kappa;
+  }
+  const double rho_pos = fmax(rho_m, 0.0);
+  const double z = fmax(Zbar_m, 0.0);
+  const double te = sanitize_te_for_pow(Te_m);
+  const double A = fmax(A_m, kMinEffectiveA);
+  if (!(rho_pos > 0.0) || !(z > 0.0) || !(te > 0.0)) {
+    return 0.0;
+  }
+  const double n_e = electron_density_formula(rho_pos, z, A);
+  const double ln_lambda = coulomb_log_formula(n_e, te, z);
+  double kappa = fmax(spitzer_kappa_formula(te, z, ln_lambda), 0.0);
+  if (kappa > 0.0 && mfp_limiter_C > 0.0) {
+    kappa *= mfp_limiter_factor_formula(n_e, te, z, ln_lambda, dl, mfp_limiter_C);
+  }
+  return isfinite(kappa) ? kappa : 0.0;
+}
+
+// The 1D per-material path's cell coefficients (NUMERICS §4.1.1). The stages solve one electron temperature per cell
+// with the single-material 1D operator (harmonic face conductivity between the cells, flux limiter on the faces), and
+// the cell's materials enter it only through these coefficients:
+// - kappa[c] = sum over the materials present for conduction of vf_m kappa_m (material_cell_kappa_1d at the material's
+//   density m_m / (vf_m V), its electron temperature from its electron energy and its charge and mass): the materials
+//   conduct in parallel inside the cell. A cell without heat capacity conducts nothing (as on the single-material path).
+// - rho_cv[c] = rho c_v,e with c_v,e the per-material projection state.cv_e (the materials' mass-weighted heat
+//   capacity).
+// - zbar_lim[c], A_lim[c]: the cell's charge and mass for the face flux limiter (compute_1d_flux_limiter_faces_kernel
+//   forms the face electron density from rho, zbar and A as on the single-material path). With several materials
+//   present they are the mean charge sum_m (m_m Z_m / A_m) / sum_m (m_m / A_m) and the mean mass
+//   sum_m m_m / sum_m (m_m / A_m), so rho zbar / (A m_p) is the cell's electron density sum_m m_m Z_m / (A_m m_p V);
+//   with one material they are its charge and mass.
+// Void cells conduct nothing.
+__global__ void per_material_cell_coefficients_1d_kernel(
+    const per_material::PerMaterialAccessorView view,
     const tenryu::materials::DeviceEOSTableView* __restrict__ electron_views,
     const ConductionMaterialParams* __restrict__ material_params,
-    const double* __restrict__ Te,
     const double* __restrict__ rho,
-    const double* __restrict__ vol,
     const double* __restrict__ x_r,
-    const int n_cells,
-    const int n_mat,
+    const double* __restrict__ state_cv_e,
     const std::uint8_t* __restrict__ cell_is_void,
-    const double f_lim,
+    const int c_begin,
+    const int c_end,
     const double test_kappa,
     const double mfp_limiter_C,
-    const double* __restrict__ state_cv_e,
     const double Te_floor,
-    const bool low_density_extrap) {
-  if (tid < n_cells) {
-    const double rho_i = fmax(rho[tid], 0.0);
-    const double cv_e = (state_cv_e != nullptr && state_cv_e[tid] > 0.0)
-                            ? state_cv_e[tid]
-                            : 0.0;
-    rho_cv_e[tid] = rho_i * cv_e;
-  }
-
-  const int n_faces = n_cells - 1;
-  if (tid >= n_faces || n_faces <= 0) {
+    const bool low_density_extrap,
+    double* __restrict__ kappa,
+    double* __restrict__ rho_cv_e,
+    double* __restrict__ zbar_lim,
+    double* __restrict__ A_lim) {
+  const int c = c_begin + blockIdx.x * blockDim.x + threadIdx.x;
+  if (c >= c_end) {
     return;
   }
-  const int iL = tid;
-  const int iR = tid + 1;
-  if ((cell_is_void != nullptr &&
-       (cell_is_void[iL] != static_cast<std::uint8_t>(0) ||
-        cell_is_void[iR] != static_cast<std::uint8_t>(0)))) {
-    kappa_face[tid] = 0.0;
-    for (int m = 0; m < n_mat; ++m) {
-      kappa_eff_per_material[static_cast<std::size_t>(m) * n_faces + tid] = 0.0;
-    }
-    return;
-  }
-
-  const double rcl = cell_center_radius(x_r, iL);
-  const double rcr = cell_center_radius(x_r, iR);
-  const double dr = rcr - rcl;
-  if (!(dr > 0.0)) {
-    kappa_face[tid] = 0.0;
-    for (int m = 0; m < n_mat; ++m) {
-      kappa_eff_per_material[static_cast<std::size_t>(m) * n_faces + tid] = 0.0;
-    }
-    return;
-  }
-
-  double aggregate_kappa = 0.0;
-  double aggregate_kappa_dt = 0.0;
-  for (int m = 0; m < n_mat; ++m) {
-    double kappa_m = 0.0;
-    const int idxL = iL * n_mat + m;
-    const int idxR = iR * n_mat + m;
-    const double vfL = view.volfrac[idxL];
-    const double vfR = view.volfrac[idxR];
-    const double face_fraction_m = 0.5 * (fmax(vfL, 0.0) + fmax(vfR, 0.0));
-    if (face_fraction_m > 0.0 &&
-        (material_present_for_conduction(view, iL, m) ||
-         material_present_for_conduction(view, iR, m))) {
+  const double rho_c = fmax(rho[c], 0.0);
+  const double cv_e = (state_cv_e != nullptr && state_cv_e[c] > 0.0) ? state_cv_e[c] : 0.0;
+  const double rho_cv = rho_c * cv_e;
+  rho_cv_e[c] = rho_cv;
+  double kappa_c = 0.0;
+  double moles = 0.0;      // sum_m m_m / A_m
+  double charges = 0.0;    // sum_m m_m Z_m / A_m
+  double mass_sum = 0.0;   // sum_m m_m
+  int n_present = 0;
+  int m_present = -1;
+  if ((cell_is_void == nullptr || cell_is_void[c] == static_cast<std::uint8_t>(0)) && rho_cv > 0.0) {
+    const double dl = x_r[c + 1] - x_r[c];
+    for (int m = 0; m < view.n_mat; ++m) {
+      const int idx = c * view.n_mat + m;
+      const double vf = view.volfrac[idx];
+      if (!(vf > 0.0) || !material_present_for_conduction(view, c, m)) {
+        continue;
+      }
       const ConductionMaterialParams p = material_params[m];
       const tenryu::materials::DeviceEOSTableView electron_view =
-          (electron_views != nullptr) ? electron_views[m]
-                                      : tenryu::materials::DeviceEOSTableView{};
-      const per_material::PerMaterialThermo eL =
-          per_material::get_electron_thermo_per_material(view,
-                                                         electron_view,
-                                                         iL,
-                                                         m,
-                                                         p.Zbar,
-                                                         p.A,
-                                                         Te_floor,
-                                                         low_density_extrap,
-                                                         p.gamma);
-      const per_material::PerMaterialThermo eR =
-          per_material::get_electron_thermo_per_material(view,
-                                                         electron_view,
-                                                         iR,
-                                                         m,
-                                                         p.Zbar,
-                                                         p.A,
-                                                         Te_floor,
-                                                         low_density_extrap,
-                                                         p.gamma);
-      const double TeL = sanitize_te_for_pow(per_material::get_te(eL));
-      const double TeR = sanitize_te_for_pow(per_material::get_te(eR));
-      const double Te_face = 0.5 * (TeL + TeR);
-      const double grad_Te = (TeR - TeL) / dr;
-      const double rho_m_face =
-          0.5 * (fmax(per_material::get_rho_per_material(view, iL, m), 0.0) +
-                 fmax(per_material::get_rho_per_material(view, iR, m), 0.0));
-      kappa_m = limited_spitzer_kappa_material(rho_m_face,
-                                               Te_face,
-                                               p.Zbar,
-                                               p.A,
-                                               grad_Te,
-                                               dr,
-                                               f_lim,
-                                               test_kappa,
-                                               mfp_limiter_C);
-    }
-    kappa_eff_per_material[static_cast<std::size_t>(m) * n_faces + tid] = kappa_m;
-    const double kappa_weighted_m = face_fraction_m * kappa_m;
-    aggregate_kappa += kappa_weighted_m;
-    if (kappa_weighted_m > 0.0 && isfinite(kappa_weighted_m) &&
-        material_present_for_conduction_dt(view, iL, m) &&
-        material_present_for_conduction_dt(view, iR, m)) {
-      aggregate_kappa_dt += kappa_weighted_m;
+          (electron_views != nullptr) ? electron_views[m] : tenryu::materials::DeviceEOSTableView{};
+      const per_material::PerMaterialThermo e = per_material::get_electron_thermo_per_material(
+          view, electron_view, c, m, p.Zbar, p.A, Te_floor, low_density_extrap, p.gamma);
+      const double rho_m = per_material::get_rho_per_material(view, c, m);
+      const double kappa_m =
+          material_cell_kappa_1d(rho_m, per_material::get_te(e), p.Zbar, p.A, dl, test_kappa, mfp_limiter_C);
+      const double weighted = vf * kappa_m;
+      if (isfinite(weighted)) {
+        kappa_c += weighted;
+      }
+      const double mass_m = view.mass_per_material[idx];
+      const double A_m = fmax(p.A, kMinEffectiveA);
+      if (mass_m > 0.0 && isfinite(mass_m)) {
+        moles += mass_m / A_m;
+        charges += mass_m * fmax(p.Zbar, 0.0) / A_m;
+        mass_sum += mass_m;
+        ++n_present;
+        m_present = m;
+      }
     }
   }
-  if (!isfinite(aggregate_kappa)) {
-    aggregate_kappa = 0.0;
-  }
-  aggregate_kappa_dt =
-      (isfinite(aggregate_kappa_dt) && aggregate_kappa_dt > 0.0)
-          ? aggregate_kappa_dt
-          : 0.0;
-  kappa_face[tid] = fmax(aggregate_kappa, 0.0);
-
-  const double rho_cv_face = harmonic_mean(rho_cv_e[iL], rho_cv_e[iR]);
-  if (aggregate_kappa_dt > 0.0 && rho_cv_face > 0.0) {
-    const double D_eff = aggregate_kappa_dt / rho_cv_face;
-    const double ratio = (dr * dr) / D_eff;
-    if (min_ratio != nullptr && ratio > 0.0 && isfinite(ratio)) {
-      atomic_min_double(min_ratio, ratio);
-    }
-    if (min_deff != nullptr && D_eff > 0.0 && isfinite(D_eff)) {
-      atomic_min_double(min_deff, D_eff);
-    }
-    if (max_deff != nullptr && D_eff > 0.0 && isfinite(D_eff)) {
-      atomic_max_double(max_deff, D_eff);
-    }
+  kappa[c] = (isfinite(kappa_c) && kappa_c > 0.0) ? kappa_c : 0.0;
+  if (n_present == 1) {
+    const ConductionMaterialParams p = material_params[m_present];
+    zbar_lim[c] = fmax(p.Zbar, 0.0);
+    A_lim[c] = fmax(p.A, kMinEffectiveA);
+  } else if (n_present > 1 && moles > 0.0) {
+    zbar_lim[c] = charges / moles;
+    A_lim[c] = fmax(mass_sum / moles, kMinEffectiveA);
+  } else {
+    zbar_lim[c] = 0.0;
+    A_lim[c] = 1.0;
   }
 }
 
-__global__ void compute_spitzer_deff_1d_kernel_per_material(
-    double* __restrict__ kappa_face,
-    double* __restrict__ kappa_eff_per_material,
-    double* __restrict__ rho_cv_e,
-    double* __restrict__ min_ratio,
-    double* __restrict__ min_deff,
-    double* __restrict__ max_deff,
-    per_material::PerMaterialAccessorView view,
-    const tenryu::materials::DeviceEOSTableView* __restrict__ electron_views,
-    const ConductionMaterialParams* __restrict__ material_params,
-    const double* __restrict__ Te,
-    const double* __restrict__ rho,
-    const double* __restrict__ vol,
-    const double* __restrict__ x_r,
-    const int c_begin,
-    const int c_end,
-    const int n_cells,
-    const int n_mat,
-    const std::uint8_t* __restrict__ cell_is_void,
-    const double f_lim,
-    const double test_kappa,
-    const double mfp_limiter_C,
-    const double* __restrict__ state_cv_e,
-    const double Te_floor,
-    const bool low_density_extrap) {
-  const int tid = c_begin + blockIdx.x * blockDim.x + threadIdx.x;
-  const int thread_tid = threadIdx.x;
-  extern __shared__ double shared[];
-  if (tid >= c_end) {
+// The flux limiter's charge and mass of the cells per_material_cell_coefficients_1d_kernel does not reach: 0 and 1 (no
+// electrons, so a face next to such a cell carries no flux limit that an owned cell reads).
+__global__ void per_material_limiter_reset_1d_kernel(double* __restrict__ zbar_lim,
+                                                     double* __restrict__ A_lim,
+                                                     const int n_cells) {
+  for (int c = blockIdx.x * blockDim.x + threadIdx.x; c < n_cells; c += gridDim.x * blockDim.x) {
+    zbar_lim[c] = 0.0;
+    A_lim[c] = 1.0;
+  }
+}
+
+// The explicit conduction limit of the 1D per-material path's cells: the effective diffusivity of the single-material
+// 1D path (conduction_bodies::compute_spitzer_deff_1d_kernel_body — the flux-limited heat flux of the cell's central
+// temperature gradient over rho c_v |grad T|, the flux limit from the face-averaged electron density and temperature of
+// the cell's two faces) with the cell conductivity and heat capacity of per_material_cell_coefficients_1d_kernel and
+// its charge and mass for the flux limiter; the min/max atomics as on that path.
+__global__ void per_material_deff_1d_kernel(const double* __restrict__ kappa,
+                                            const double* __restrict__ rho_cv_e,
+                                            const double* __restrict__ zbar_lim,
+                                            const double* __restrict__ A_lim,
+                                            const double* __restrict__ Te,
+                                            const double* __restrict__ rho,
+                                            const double* __restrict__ vol,
+                                            const double* __restrict__ x_r,
+                                            const std::uint8_t* __restrict__ cell_is_void,
+                                            const int c_begin,
+                                            const int c_end,
+                                            const int n_cells,
+                                            const double f_lim,
+                                            const double test_kappa,
+                                            double* __restrict__ min_ratio,
+                                            double* __restrict__ min_deff,
+                                            double* __restrict__ max_deff) {
+  const int i = c_begin + blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= c_end) {
     return;
   }
+  if (cell_is_void != nullptr && cell_is_void[i] != static_cast<std::uint8_t>(0)) {
+    return;
+  }
+  const double kappa_local = kappa[i];
+  const double rho_cv = rho_cv_e[i];
+  double D_eff = 0.0;
+  if (test_kappa > 0.0) {
+    if (rho_cv > 0.0) {
+      D_eff = kappa_local / rho_cv;
+    }
+  } else if (rho_cv > 0.0 && kappa_local > 0.0) {
+    const double rho_i = fmax(rho[i], 0.0);
+    const double z = fmax(zbar_lim[i], 0.0);
+    const double te = sanitize_te_for_pow(Te[i]);
+    const double A_i = fmax(A_lim[i], kMinEffectiveA);
+    const double D_sh = kappa_local / rho_cv;
+    double grad = 0.0;
+    if (n_cells > 1) {
+      if (i == 0) {
+        const double dr = cell_center_radius(x_r, 1) - cell_center_radius(x_r, 0);
+        grad = (dr > 0.0) ? ((Te[1] - Te[0]) / dr) : 0.0;
+      } else if (i == n_cells - 1) {
+        const double dr = cell_center_radius(x_r, n_cells - 1) - cell_center_radius(x_r, n_cells - 2);
+        grad = (dr > 0.0) ? ((Te[n_cells - 1] - Te[n_cells - 2]) / dr) : 0.0;
+      } else {
+        const double dr = cell_center_radius(x_r, i + 1) - cell_center_radius(x_r, i - 1);
+        grad = (dr > 0.0) ? ((Te[i + 1] - Te[i - 1]) / dr) : 0.0;
+      }
+    }
+    // the face flux limit of compute_1d_flux_limiter_faces_kernel on the cell's faces (the mean of the two)
+    auto face_q_max = [&](const int l, const int r) {
+      const double te_face = 0.5 * (sanitize_te_for_pow(Te[l]) + sanitize_te_for_pow(Te[r]));
+      const double rho_face = 0.5 * (fmax(rho[l], 0.0) + fmax(rho[r], 0.0));
+      const double z_face = 0.5 * (fmax(zbar_lim[l], 0.0) + fmax(zbar_lim[r], 0.0));
+      const double A_l = fmax(A_lim[l], kMinEffectiveA);
+      const double A_r = fmax(A_lim[r], kMinEffectiveA);
+      const double A_face = (A_l == A_r) ? A_l : fmax(harmonic_mean(A_l, A_r), kMinEffectiveA);
+      return q_max_formula(f_lim, electron_density_formula(rho_face, z_face, A_face), te_face);
+    };
+    double q_max = q_max_formula(f_lim, electron_density_formula(rho_i, z, A_i), te);
+    double te_face = te;
+    if (n_cells > 1) {
+      if (i == 0) {
+        q_max = face_q_max(0, 1);
+        te_face = 0.5 * (te + sanitize_te_for_pow(Te[1]));
+      } else if (i == n_cells - 1) {
+        q_max = face_q_max(n_cells - 2, n_cells - 1);
+        te_face = 0.5 * (sanitize_te_for_pow(Te[n_cells - 2]) + te);
+      } else {
+        q_max = 0.5 * (face_q_max(i - 1, i) + face_q_max(i, i + 1));
+        te_face = 0.5 * (0.5 * (sanitize_te_for_pow(Te[i - 1]) + te) + 0.5 * (te + sanitize_te_for_pow(Te[i + 1])));
+      }
+    }
+    const double q_sh = isfinite(kappa_local) ? (-kappa_local * grad) : 0.0;
+    const double q_limited = flux_limiter_formula(isfinite(q_sh) ? q_sh : 0.0, q_max);
+    const double ell_c = cbrt(fmax(vol[i], 1.0e-30));
+    const double eps_grad = fmax(1.0e-10 * te_face / ell_c, 1.0e-30);
+    D_eff = deff_formula(q_limited, rho_cv, 1.0, grad, D_sh, eps_grad);
+    if (!isfinite(D_eff)) {
+      D_eff = 0.0;
+    }
+    D_eff = fmax(D_eff, 0.0);
+  }
+  if (min_ratio != nullptr && D_eff > 0.0) {
+    const double dl = x_r[i + 1] - x_r[i];
+    if (dl > 0.0) {
+      const double ratio = (dl * dl) / D_eff;
+      if (ratio > 0.0 && isfinite(ratio)) {
+        atomic_min_double(min_ratio, ratio);
+      }
+    }
+  }
+  if (min_deff != nullptr && D_eff > 0.0) {
+    atomic_min_double(min_deff, D_eff);
+  }
+  if (max_deff != nullptr && D_eff > 0.0) {
+    atomic_max_double(max_deff, D_eff);
+  }
+}
 
-  compute_spitzer_deff_1d_kernel_per_material_body(
-      tid, thread_tid, shared, kappa_face, kappa_eff_per_material, rho_cv_e,
-      min_ratio, min_deff, max_deff, view, electron_views, material_params, Te,
-      rho, vol, x_r, n_cells, n_mat, cell_is_void, f_lim, test_kappa,
-      mfp_limiter_C, state_cv_e, Te_floor, low_density_extrap);
+// The materials' electron heat capacities m_{c,m} c_{v,e,m} [erg/eV] of a 1D cell at the conduction step's start, from
+// the per-material thermodynamics of the refresh (the cell's rho c_v V is their sum): the weights with which the 1D
+// per-material path gives a heated cell's energy change to its materials (per_material_energy_change_1d_kernel).
+// Materials without mass or not present for conduction get 0.
+__global__ void per_material_electron_heat_capacity_1d_kernel(
+    const per_material::PerMaterialAccessorView view,
+    const tenryu::materials::DeviceEOSTableView* __restrict__ electron_views,
+    const ConductionMaterialParams* __restrict__ material_params,
+    const double Te_floor,
+    const bool low_density_extrap,
+    const int c_begin,
+    const int c_end,
+    double* __restrict__ heat_capacity) {
+  const int c = c_begin + blockIdx.x * blockDim.x + threadIdx.x;
+  if (c >= c_end) {
+    return;
+  }
+  for (int m = 0; m < view.n_mat; ++m) {
+    const int idx = c * view.n_mat + m;
+    double C = 0.0;
+    const double mass_m = view.mass_per_material[idx];
+    if (mass_m > 0.0 && material_present_for_conduction(view, c, m)) {
+      const ConductionMaterialParams p = material_params[m];
+      const tenryu::materials::DeviceEOSTableView electron_view =
+          (electron_views != nullptr) ? electron_views[m] : tenryu::materials::DeviceEOSTableView{};
+      const per_material::PerMaterialThermo e = per_material::get_electron_thermo_per_material(
+          view, electron_view, c, m, p.Zbar, p.A, Te_floor, low_density_extrap, p.gamma);
+      if (e.cv > 0.0 && isfinite(e.cv)) {
+        C = mass_m * e.cv;
+      }
+    }
+    heat_capacity[idx] = C;
+  }
+}
+
+// The electron energy [erg] of material m of cell c at its floor state (the electron floor temperature at the
+// material's density) by the equation of state per_material_electron_heat_capacity_1d_kernel evaluates: the electron
+// table, or the ideal gas of the conduction parameters.
+__device__ inline double material_electron_floor_energy_1d(const per_material::PerMaterialAccessorView& view,
+                                                           const tenryu::materials::DeviceEOSTableView& electron_view,
+                                                           const ConductionMaterialParams& p,
+                                                           const int c,
+                                                           const int m,
+                                                           const double Te_floor,
+                                                           const bool low_density_extrap) {
+  const double mass_m = view.mass_per_material[c * view.n_mat + m];
+  double e = 0.0;
+  if (per_material::use_table_reclosure(electron_view)) {
+    const double rho_m = per_material::get_rho_per_material(view, c, m);
+    e = per_material::table_forward_thermo(electron_view, rho_m, Te_floor, Te_floor, p.Zbar, p.A, low_density_extrap)
+            .energy;
+  } else {
+    e = per_material::ideal_species_cv(p.Zbar, p.A, p.gamma) * fmax(Te_floor, 1.0e-30);
+  }
+  return mass_m * e;
+}
+
+// A material's weight in per_material_energy_change_1d_kernel: its electron heat capacity at the step's start, its
+// electron energy above its floor state, its mass, or its mass whether present for conduction or not; 0 for a material
+// without mass or (except the last) not present for conduction.
+enum class MaterialShare1D { kHeatCapacity, kExcessOverFloor, kMass, kAnyMass };
+
+__device__ inline double material_share_weight_1d(const MaterialShare1D share,
+                                                  const per_material::PerMaterialAccessorView& view,
+                                                  const tenryu::materials::DeviceEOSTableView* __restrict__ electron_views,
+                                                  const ConductionMaterialParams* __restrict__ material_params,
+                                                  const double* __restrict__ heat_capacity,
+                                                  const double* __restrict__ Ee_per_material,
+                                                  const int c,
+                                                  const int m,
+                                                  const double Te_floor,
+                                                  const bool low_density_extrap) {
+  const int idx = c * view.n_mat + m;
+  const double mass_m = view.mass_per_material[idx];
+  if (!(mass_m > 0.0) || !isfinite(mass_m)) {
+    return 0.0;
+  }
+  if (share == MaterialShare1D::kAnyMass) {
+    return mass_m;
+  }
+  if (!material_present_for_conduction(view, c, m)) {
+    return 0.0;
+  }
+  switch (share) {
+    case MaterialShare1D::kHeatCapacity: {
+      const double C = heat_capacity[idx];
+      return (C > 0.0 && isfinite(C)) ? C : 0.0;
+    }
+    case MaterialShare1D::kExcessOverFloor: {
+      const tenryu::materials::DeviceEOSTableView electron_view =
+          (electron_views != nullptr) ? electron_views[m] : tenryu::materials::DeviceEOSTableView{};
+      const double floor = material_electron_floor_energy_1d(view, electron_view, material_params[m], c, m, Te_floor,
+                                                             low_density_extrap);
+      const double excess = Ee_per_material[idx] - floor;
+      return (isfinite(excess) && excess > 0.0) ? excess : 0.0;
+    }
+    default:
+      return mass_m;
+  }
+}
+
+// The 1D per-material path after the stages (NUMERICS §4.1.1): cell c's change of electron energy
+// dE = rho c_v V (T_new - T_old) (the heat capacity and volume the stages used, the floor clamp's raise included) goes
+// to its materials by the rule of the mixed-cell pressure relaxation: dE > 0 in proportion to the materials' electron
+// heat capacities at the step's start (heat_capacity), so their temperatures rise by one amount (by mass among the
+// materials present for conduction when those capacities sum to zero, then among all materials with mass); dE < 0 in
+// proportion to their energies above their floor states (material_electron_floor_energy_1d), each keeping the same
+// fraction of its excess. When the materials hold less excess than -dE, all go to their floor states and the
+// shortfall is added to E_floor_cell[c] (booked with the floor clamps' energy) and counted in shortfall_count; heat
+// that no material can take (no material with mass) is subtracted there and counted. Materials not present for
+// conduction keep their energies (except by the last fallback).
+template <int GEOM>
+__global__ void per_material_energy_change_1d_kernel(
+    const per_material::PerMaterialAccessorView view,
+    const tenryu::materials::DeviceEOSTableView* __restrict__ electron_views,
+    const ConductionMaterialParams* __restrict__ material_params,
+    const double* __restrict__ rho_cv_e,
+    const double* __restrict__ vol,
+    const double* __restrict__ x_r,
+    const std::uint8_t* __restrict__ cell_is_void,
+    const double* __restrict__ T_old,
+    const double* __restrict__ T_new,
+    const double* __restrict__ heat_capacity,
+    const int c_begin,
+    const int c_end,
+    const double Te_floor,
+    const bool low_density_extrap,
+    double* __restrict__ Ee_per_material,
+    double* __restrict__ E_floor_cell,
+    int* __restrict__ shortfall_count) {
+  const int c = c_begin + blockIdx.x * blockDim.x + threadIdx.x;
+  if (c >= c_end) {
+    return;
+  }
+  if (cell_is_void != nullptr && cell_is_void[c] != static_cast<std::uint8_t>(0)) {
+    return;
+  }
+  const double rho_cv = rho_cv_e[c];
+  if (!(rho_cv > 0.0)) {
+    return;
+  }
+  double V;
+  if constexpr (GEOM == 2) {
+    V = fmax(x_r[c + 1] - x_r[c], 1.0e-30);
+  } else {
+    V = fmax(vol[c], 1.0e-30);
+  }
+  const double dE = rho_cv * V * (T_new[c] - T_old[c]);
+  if (dE == 0.0 || !isfinite(dE)) {
+    return;
+  }
+  const int n_mat = view.n_mat;
+  auto weight_sum = [&](const MaterialShare1D share) {
+    double sum = 0.0;
+    for (int m = 0; m < n_mat; ++m) {
+      sum += material_share_weight_1d(share, view, electron_views, material_params, heat_capacity, Ee_per_material, c,
+                                      m, Te_floor, low_density_extrap);
+    }
+    return sum;
+  };
+  MaterialShare1D share = (dE > 0.0) ? MaterialShare1D::kHeatCapacity : MaterialShare1D::kExcessOverFloor;
+  double sum = weight_sum(share);
+  if (dE > 0.0 && !(sum > 0.0)) {
+    share = MaterialShare1D::kMass;
+    sum = weight_sum(share);
+    if (!(sum > 0.0)) {
+      share = MaterialShare1D::kAnyMass;
+      sum = weight_sum(share);
+    }
+  }
+  double applied = dE;
+  if (dE < 0.0 && -dE > sum) {
+    // the materials hold less than the stages removed above their floor states: all go to them, the shortfall booked
+    applied = -sum;
+    E_floor_cell[c] += -dE - sum;
+    atomicAdd(shortfall_count, 1);
+  }
+  if (!(sum > 0.0)) {
+    if (applied != 0.0) {
+      // heat but no material with mass to take it (an inconsistent cell): the energy leaves as a negative floor energy
+      E_floor_cell[c] -= applied;
+      atomicAdd(shortfall_count, 1);
+    }
+    return;
+  }
+  for (int m = 0; m < n_mat; ++m) {
+    const double w = material_share_weight_1d(share, view, electron_views, material_params, heat_capacity,
+                                              Ee_per_material, c, m, Te_floor, low_density_extrap);
+    if (w > 0.0) {
+      Ee_per_material[c * n_mat + m] += applied * (w / sum);
+    }
+  }
 }
 
 __global__ void compute_spitzer_deff_2d_kernel_per_material(
@@ -1633,7 +1883,7 @@ __device__ void conduction_alpha_pass_kirchhoff_cell(
     const int i,
     double* __restrict__ alpha_cells,
     const double* __restrict__ Te_old,
-    const double* __restrict__ kappa_sh,
+    const double* __restrict__ kappa_face,
     const double* __restrict__ flux_limiter_faces,
     const double* __restrict__ rho_cv_e,
     const std::uint8_t* __restrict__ cell_is_void,
@@ -1657,8 +1907,7 @@ __device__ void conduction_alpha_pass_kirchhoff_cell(
 
   double left_term = 0.0;
   if (i > 0) {
-    const double k_face =
-        kirchhoff_face_kappa_spitzer(kappa_sh[i - 1], kappa_sh[i], Te_old[i - 1], Te_old[i]);
+    const double k_face = kappa_face[i - 1];
     const double rcl = cell_center_radius(x_r, i - 1);
     const double rcr = cell_center_radius(x_r, i);
     const double dr = rcr - rcl;
@@ -1680,8 +1929,7 @@ __device__ void conduction_alpha_pass_kirchhoff_cell(
 
   double right_term = 0.0;
   if (i + 1 < n_cells) {
-    const double k_face =
-        kirchhoff_face_kappa_spitzer(kappa_sh[i], kappa_sh[i + 1], Te_old[i], Te_old[i + 1]);
+    const double k_face = kappa_face[i];
     const double rcl = cell_center_radius(x_r, i);
     const double rcr = cell_center_radius(x_r, i + 1);
     const double dr = rcr - rcl;
@@ -1734,7 +1982,7 @@ template <int GEOM>
 __global__ void conduction_alpha_pass_kirchhoff_kernel(
     double* __restrict__ alpha_cells,
     const double* __restrict__ Te_old,
-    const double* __restrict__ kappa_sh,
+    const double* __restrict__ kappa_face,
     const double* __restrict__ flux_limiter_faces,
     const double* __restrict__ rho_cv_e,
     const std::uint8_t* __restrict__ cell_is_void,
@@ -1752,7 +2000,7 @@ __global__ void conduction_alpha_pass_kirchhoff_kernel(
   }
 
   conduction_alpha_pass_kirchhoff_cell<GEOM>(
-      i, alpha_cells, Te_old, kappa_sh, flux_limiter_faces, rho_cv_e,
+      i, alpha_cells, Te_old, kappa_face, flux_limiter_faces, rho_cv_e,
       cell_is_void, vol, x_r, n_cells, tau, Te_floor, floor_limiter_mode);
 }
 
@@ -1760,7 +2008,7 @@ template <int GEOM>
 __global__ void conduction_1d_sts_stage_kirchhoff_kernel(
     const double* __restrict__ Te_old,
     double* __restrict__ Te_new,
-    const double* __restrict__ kappa_sh,
+    const double* __restrict__ kappa_face,
     const double* __restrict__ flux_limiter_faces,
     const double* __restrict__ rho_cv_e,
     const std::uint8_t* __restrict__ cell_is_void,
@@ -1781,7 +2029,7 @@ __global__ void conduction_1d_sts_stage_kirchhoff_kernel(
   }
 
   conduction_bodies::conduction_1d_sts_stage_kirchhoff_kernel_body<GEOM>(
-      i, Te_old, Te_new, kappa_sh, flux_limiter_faces, rho_cv_e, cell_is_void,
+      i, Te_old, Te_new, kappa_face, flux_limiter_faces, rho_cv_e, cell_is_void,
       vol, x_r, n_cells, tau, Te_floor, alpha_cells, clamp_count, nullptr,
       floor_limiter_mode, E_floor);
 }
@@ -1791,7 +2039,7 @@ __global__ void conduction_1d_sts_fused_kirchhoff_kernel(
     double* __restrict__ Te_a,
     double* __restrict__ Te_b,
     double* __restrict__ alpha_cells,
-    const double* __restrict__ kappa_sh,
+    const double* __restrict__ kappa_face,
     const double* __restrict__ flux_limiter_faces,
     const double* __restrict__ rho_cv_e,
     const std::uint8_t* __restrict__ cell_is_void,
@@ -1810,14 +2058,14 @@ __global__ void conduction_1d_sts_fused_kirchhoff_kernel(
     const double tau = stage_tau[stage];
     for (int i = threadIdx.x; i < n_cells; i += blockDim.x) {
       conduction_alpha_pass_kirchhoff_cell<GEOM>(
-          i, alpha_cells, te_curr, kappa_sh, flux_limiter_faces, rho_cv_e,
+          i, alpha_cells, te_curr, kappa_face, flux_limiter_faces, rho_cv_e,
           cell_is_void, vol, x_r, n_cells, tau, Te_floor, floor_limiter_mode);
     }
     __syncthreads();
 
     for (int i = threadIdx.x; i < n_cells; i += blockDim.x) {
       conduction_bodies::conduction_1d_sts_stage_kirchhoff_kernel_body<GEOM>(
-          i, te_curr, te_next, kappa_sh, flux_limiter_faces, rho_cv_e,
+          i, te_curr, te_next, kappa_face, flux_limiter_faces, rho_cv_e,
           cell_is_void, vol, x_r, n_cells, tau, Te_floor, alpha_cells,
           clamp_count, nullptr, floor_limiter_mode, E_floor);
     }
@@ -1827,6 +2075,16 @@ __global__ void conduction_1d_sts_fused_kirchhoff_kernel(
     te_curr = te_next;
     te_next = te_swap;
   }
+}
+
+// The face conductivities of the 1D STS stages at the step start (compute_1d_face_kappa_kernel_body).
+__global__ void compute_1d_face_kappa_kernel(double* __restrict__ kappa_face,
+                                             const double* __restrict__ kappa_sh,
+                                             const double* __restrict__ Te,
+                                             const int n_cells,
+                                             const int kirchhoff) {
+  const int f = blockIdx.x * blockDim.x + threadIdx.x;
+  conduction_bodies::compute_1d_face_kappa_kernel_body(f, kappa_face, kappa_sh, Te, n_cells, kirchhoff != 0);
 }
 
 // W-G2 kirchhoff face_kappa_policy implicit assembly kernel: identical to
@@ -2133,299 +2391,6 @@ __global__ void conduction_1d_sts_stage_secant_kernel(
       i, Te_old, Te_new, rho_cv_e, cell_is_void, vol, x_r, rho, n_cells, tau,
       Te_floor, kappa0, kappa_power, kappa_rho_power, alpha_cells, clamp_count,
       nullptr, floor_limiter_mode, E_floor);
-}
-
-template <int GEOM>
-__global__ void conduction_alpha_pass_kernel_per_material(
-    double* __restrict__ alpha_cells,
-    const double* __restrict__ Te_old,
-    const double* __restrict__ kappa_eff_per_material,
-    const double* __restrict__ volfrac,
-    const double* __restrict__ rho_cv_e,
-    const std::uint8_t* __restrict__ cell_is_void,
-    const double* __restrict__ vol,
-    const double* __restrict__ x_r,
-    const int c_begin,
-    const int c_end,
-    const int n_cells,
-    const int n_mat,
-    const double tau,
-    const double Te_floor,
-    const int floor_limiter_mode) {
-  const int i = c_begin + blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= c_end) {
-    return;
-  }
-
-  alpha_cells[i] = 1.0;
-  if (cell_is_void != nullptr && cell_is_void[i] != static_cast<std::uint8_t>(0)) {
-    return;
-  }
-
-  const int n_faces = n_cells - 1;
-  double V;
-  if constexpr (GEOM == 2) {
-    V = fmax(x_r[i + 1] - x_r[i], 1.0e-30);
-  } else {
-    V = fmax(vol[i], 1.0e-30);
-  }
-  const double rho_cv = rho_cv_e[i];
-  if (!(rho_cv > 0.0)) {
-    return;
-  }
-
-  double net_power = 0.0;
-  double outflow_sum = 0.0;
-  for (int m = 0; m < n_mat; ++m) {
-    double left_term_m = 0.0;
-    if (i > 0) {
-      const int face = i - 1;
-      const double coeff_m = kappa_eff_per_material[static_cast<std::size_t>(m) * n_faces + face];
-      const double vf_face =
-          0.5 * (fmax(volfrac[(i - 1) * n_mat + m], 0.0) +
-                 fmax(volfrac[i * n_mat + m], 0.0));
-      const double rcl = cell_center_radius(x_r, i - 1);
-      const double rcr = cell_center_radius(x_r, i);
-      const double dr = rcr - rcl;
-      if (coeff_m > 0.0 && vf_face > 0.0 && dr > 0.0) {
-        const double grad = (Te_old[i] - Te_old[i - 1]) / dr;
-        double area;
-        if constexpr (GEOM == 0) {
-          area = kFourPi * x_r[i] * x_r[i];
-        } else {
-          area = geometry_1d_face_area(GEOM, x_r[i]);
-        }
-        left_term_m = area * vf_face * coeff_m * grad;
-      }
-    }
-    double right_term_m = 0.0;
-    if (i + 1 < n_cells) {
-      const int face = i;
-      const double coeff_m = kappa_eff_per_material[static_cast<std::size_t>(m) * n_faces + face];
-      const double vf_face =
-          0.5 * (fmax(volfrac[i * n_mat + m], 0.0) +
-                 fmax(volfrac[(i + 1) * n_mat + m], 0.0));
-      const double rcl = cell_center_radius(x_r, i);
-      const double rcr = cell_center_radius(x_r, i + 1);
-      const double dr = rcr - rcl;
-      if (coeff_m > 0.0 && vf_face > 0.0 && dr > 0.0) {
-        const double grad = (Te_old[i + 1] - Te_old[i]) / dr;
-        double area;
-        if constexpr (GEOM == 0) {
-          area = kFourPi * x_r[i + 1] * x_r[i + 1];
-        } else {
-          area = geometry_1d_face_area(GEOM, x_r[i + 1]);
-        }
-        right_term_m = area * vf_face * coeff_m * grad;
-      }
-    }
-    net_power += right_term_m - left_term_m;
-    if (floor_limiter_mode == 1) {
-      outflow_sum +=
-          (isfinite(right_term_m) ? fmax(0.0, -right_term_m) : 0.0) +
-          (isfinite(left_term_m) ? fmax(0.0, left_term_m) : 0.0);
-    }
-  }
-
-  double alpha = 1.0;
-  const double Te_old_i = Te_old[i];
-  if (floor_limiter_mode == 1) {
-    if (!(Te_old_i > Te_floor)) {
-      alpha = 0.0;
-    } else if (tau > 0.0 && outflow_sum > 0.0) {
-      const double e_above = rho_cv * V * (Te_old_i - Te_floor);
-      alpha = fmin(
-          1.0, fmax((e_above / fmax(outflow_sum, kDivEpsilon)) / tau, 0.0));
-    }
-    alpha_cells[i] = alpha;
-    return;
-  }
-  if (tau > 0.0 && Te_old_i > Te_floor && net_power < 0.0) {
-    const double e_above_floor = rho_cv * V * (Te_old_i - Te_floor);
-    const double dt_safe = e_above_floor / fmax(fabs(net_power), kDivEpsilon);
-    alpha = fmin(1.0, fmax(dt_safe / tau, 0.0));
-  }
-  alpha_cells[i] = alpha;
-}
-
-template <int GEOM>
-__global__ void conduction_1d_sts_stage_kernel_per_material(
-    const double* __restrict__ Te_old,
-    double* __restrict__ Te_new,
-    const double* __restrict__ kappa_face,
-    const double* __restrict__ kappa_eff_per_material,
-    double* __restrict__ Ee_per_material,
-    const double* __restrict__ volfrac,
-    const double* __restrict__ rho_cv_e,
-    const std::uint8_t* __restrict__ cell_is_void,
-    const double* __restrict__ vol,
-    const double* __restrict__ x_r,
-    const int c_begin,
-    const int c_end,
-    const int n_cells,
-    const int n_mat,
-    const double tau,
-    const double Te_floor,
-    const double* __restrict__ alpha_cells,
-    int* __restrict__ clamp_count,
-    double* __restrict__ E_floor,
-    const int floor_limiter_mode) {
-  const int i = c_begin + blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= c_end) {
-    return;
-  }
-  if (cell_is_void != nullptr && cell_is_void[i] != static_cast<std::uint8_t>(0)) {
-    Te_new[i] = Te_old[i];
-    return;
-  }
-
-  const int n_faces = n_cells - 1;
-  double V;
-  if constexpr (GEOM == 2) {
-    V = fmax(x_r[i + 1] - x_r[i], 1.0e-30);
-  } else {
-    V = fmax(vol[i], 1.0e-30);
-  }
-  const double rho_cv = rho_cv_e[i];
-  if (!(rho_cv > 0.0)) {
-    Te_new[i] = Te_old[i];
-    return;
-  }
-
-  double net_power = 0.0;
-  for (int m = 0; m < n_mat; ++m) {
-    double left_term_m = 0.0;
-    if (i > 0) {
-      const int face = i - 1;
-      const double coeff_m = kappa_eff_per_material[static_cast<std::size_t>(m) * n_faces + face];
-      const double vf_face =
-          0.5 * (fmax(volfrac[(i - 1) * n_mat + m], 0.0) +
-                 fmax(volfrac[i * n_mat + m], 0.0));
-      const double rcl = cell_center_radius(x_r, i - 1);
-      const double rcr = cell_center_radius(x_r, i);
-      const double dr = rcr - rcl;
-      if (coeff_m > 0.0 && vf_face > 0.0 && dr > 0.0) {
-        const double grad = (Te_old[i] - Te_old[i - 1]) / dr;
-        double area;
-        if constexpr (GEOM == 0) {
-          area = kFourPi * x_r[i] * x_r[i];
-        } else {
-          area = geometry_1d_face_area(GEOM, x_r[i]);
-        }
-        left_term_m = area * vf_face * coeff_m * grad;
-      }
-    }
-    double right_term_m = 0.0;
-    if (i + 1 < n_cells) {
-      const int face = i;
-      const double coeff_m = kappa_eff_per_material[static_cast<std::size_t>(m) * n_faces + face];
-      const double vf_face =
-          0.5 * (fmax(volfrac[i * n_mat + m], 0.0) +
-                 fmax(volfrac[(i + 1) * n_mat + m], 0.0));
-      const double rcl = cell_center_radius(x_r, i);
-      const double rcr = cell_center_radius(x_r, i + 1);
-      const double dr = rcr - rcl;
-      if (coeff_m > 0.0 && vf_face > 0.0 && dr > 0.0) {
-        const double grad = (Te_old[i + 1] - Te_old[i]) / dr;
-        double area;
-        if constexpr (GEOM == 0) {
-          area = kFourPi * x_r[i + 1] * x_r[i + 1];
-        } else {
-          area = geometry_1d_face_area(GEOM, x_r[i + 1]);
-        }
-        right_term_m = area * vf_face * coeff_m * grad;
-      }
-    }
-    const double scale_left = (floor_limiter_mode == 1)
-        ? ((i > 0) ? ((left_term_m > 0.0) ? alpha_cells[i]
-                                               : alpha_cells[i - 1])
-                   : alpha_cells[i])
-        : ((i > 0) ? fmin(alpha_cells[i - 1], alpha_cells[i]) : alpha_cells[i]);
-    const double scale_right = (floor_limiter_mode == 1)
-        ? ((i + 1 < n_cells) ? ((right_term_m > 0.0) ? alpha_cells[i + 1]
-                                                        : alpha_cells[i])
-                             : alpha_cells[i])
-        : ((i + 1 < n_cells) ? fmin(alpha_cells[i], alpha_cells[i + 1])
-                             : alpha_cells[i]);
-    left_term_m *= scale_left;
-    right_term_m *= scale_right;
-    net_power += right_term_m - left_term_m;
-  }
-
-  const double Te_old_i = Te_old[i];
-
-  for (int m = 0; m < n_mat; ++m) {
-    double left_term_m = 0.0;
-    if (i > 0) {
-      const int face = i - 1;
-      const double coeff_m = kappa_eff_per_material[static_cast<std::size_t>(m) * n_faces + face];
-      const double vf_face =
-          0.5 * (fmax(volfrac[(i - 1) * n_mat + m], 0.0) +
-                 fmax(volfrac[i * n_mat + m], 0.0));
-      const double dr = cell_center_radius(x_r, i) - cell_center_radius(x_r, i - 1);
-      if (coeff_m > 0.0 && vf_face > 0.0 && dr > 0.0) {
-        const double grad = (Te_old[i] - Te_old[i - 1]) / dr;
-        double area;
-        if constexpr (GEOM == 0) {
-          area = kFourPi * x_r[i] * x_r[i];
-        } else {
-          area = geometry_1d_face_area(GEOM, x_r[i]);
-        }
-        left_term_m = area * vf_face * coeff_m * grad;
-      }
-    }
-    double right_term_m = 0.0;
-    if (i + 1 < n_cells) {
-      const int face = i;
-      const double coeff_m = kappa_eff_per_material[static_cast<std::size_t>(m) * n_faces + face];
-      const double vf_face =
-          0.5 * (fmax(volfrac[i * n_mat + m], 0.0) +
-                 fmax(volfrac[(i + 1) * n_mat + m], 0.0));
-      const double dr = cell_center_radius(x_r, i + 1) - cell_center_radius(x_r, i);
-      if (coeff_m > 0.0 && vf_face > 0.0 && dr > 0.0) {
-        const double grad = (Te_old[i + 1] - Te_old[i]) / dr;
-        double area;
-        if constexpr (GEOM == 0) {
-          area = kFourPi * x_r[i + 1] * x_r[i + 1];
-        } else {
-          area = geometry_1d_face_area(GEOM, x_r[i + 1]);
-        }
-        right_term_m = area * vf_face * coeff_m * grad;
-      }
-    }
-    const int idx = i * n_mat + m;
-    const double scale_left = (floor_limiter_mode == 1)
-        ? ((i > 0) ? ((left_term_m > 0.0) ? alpha_cells[i]
-                                               : alpha_cells[i - 1])
-                   : alpha_cells[i])
-        : ((i > 0) ? fmin(alpha_cells[i - 1], alpha_cells[i]) : alpha_cells[i]);
-    const double scale_right = (floor_limiter_mode == 1)
-        ? ((i + 1 < n_cells) ? ((right_term_m > 0.0) ? alpha_cells[i + 1]
-                                                        : alpha_cells[i])
-                             : alpha_cells[i])
-        : ((i + 1 < n_cells) ? fmin(alpha_cells[i], alpha_cells[i + 1])
-                             : alpha_cells[i]);
-    left_term_m *= scale_left;
-    right_term_m *= scale_right;
-    const double dE = tau * (right_term_m - left_term_m);
-    if (isfinite(dE)) {
-      Ee_per_material[idx] = fmax(Ee_per_material[idx] + dE, 0.0);
-    }
-  }
-
-  double Te_computed = Te_old_i + tau * net_power / (rho_cv * V);
-  if (!isfinite(Te_computed) || Te_computed < Te_floor) {
-    if (isfinite(Te_computed) && Te_floor > Te_computed) {
-      E_floor[i] += rho_cv * (Te_floor - Te_computed) * V;
-    } else if (!isfinite(Te_computed) && Te_floor > 0.0) {
-      E_floor[i] += rho_cv * Te_floor * V;
-    }
-    Te_new[i] = Te_floor;
-    atomicAdd(clamp_count, 1);
-    return;
-  }
-  (void)kappa_face;
-  Te_new[i] = Te_computed;
 }
 
 __global__ void derive_cell_ee_from_per_material_kernel(double* __restrict__ ee,
@@ -2869,6 +2834,58 @@ __global__ void build_1d_implicit_system_kernel(
   rhs[i] = rhs_i;
 }
 
+// Flux-form booking of the 1D implicit electron solve (NUMERICS §4.2.3; the form of the ion solve,
+// ion_conduction_book_energy_kernel): face f carries G_f = w_f (T_{f+1} - T_f) of the solved temperatures, with
+// w_f = -upper[f] of the assembled system, and cell i moves by dT_i = dt (G_i - G_{i-1}) / (rho c_v V)_i, the
+// heat capacity and volume of its assembled row. The booked energies sum to zero up to rounding whatever the
+// residual of the tridiagonal solve; the driver's reclosure then books rho c_v V dT_i. Before 2026-09-29 the
+// solved temperatures were booked directly, which carried the solve's residual into the energy (the ion solve's
+// note above records ~1e-9 relative in energy for a stiff system). te_flux receives the booked temperatures; a
+// void or decoupled row (no heat capacity) keeps T^n.
+template <int GEOM>
+__global__ void implicit_conduction_flux_form_kernel(double* __restrict__ te_flux,
+                                                     const double* __restrict__ te_solved,
+                                                     const double* __restrict__ te_old,
+                                                     const double* __restrict__ upper,
+                                                     const double* __restrict__ rho_cv_e,
+                                                     const std::uint8_t* __restrict__ cell_is_void,
+                                                     const double* __restrict__ vol,
+                                                     const double* __restrict__ x_r,
+                                                     const int n_cells,
+                                                     const double dt) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n_cells) {
+    return;
+  }
+  const double T_old_i = te_old[i];
+  te_flux[i] = T_old_i;
+  if (cell_is_void != nullptr && cell_is_void[i] != static_cast<std::uint8_t>(0)) {
+    return;
+  }
+  const double rho_cv = rho_cv_e[i];
+  if (!(rho_cv > 0.0) || !(dt > 0.0) || !isfinite(T_old_i)) {
+    return;
+  }
+  double V;
+  if constexpr (GEOM == 2) {
+    V = fmax(x_r[i + 1] - x_r[i], 1.0e-30);
+  } else {
+    V = fmax(vol[i], 1.0e-30);
+  }
+  const double T_i = te_solved[i];
+  double G_right = 0.0;
+  if (i + 1 < n_cells) {
+    G_right = -upper[i] * (te_solved[i + 1] - T_i);
+  }
+  double G_left = 0.0;
+  if (i > 0) {
+    G_left = -upper[i - 1] * (T_i - te_solved[i - 1]);
+  }
+  const double dT = dt * (G_right - G_left) / (rho_cv * V);
+  // A non-finite solution keeps the solved value, so the floor clamp that follows sees and books it as before.
+  te_flux[i] = isfinite(dT) ? (T_old_i + dT) : T_i;
+}
+
 template <int GEOM>
 __global__ void clamp_1d_conduction_solution_kernel(
     double* __restrict__ Te,
@@ -3123,71 +3140,71 @@ __global__ void copy_if_proceed_kernel(double* __restrict__ dst,
   }
 }
 
-ConductionDiagnostics compute_per_material_1d_operator(
-    const core::State& state,
-    const core::Config& cfg,
-    const HydroEOSContext* eos_ctx,
-    double* d_kappa_face,
-    double* d_kappa_eff_per_material,
-    double* d_rho_cv_e) {
+// The 1D per-material path's cell coefficients and explicit conduction limit (NUMERICS §4.1.1):
+// per_material_cell_coefficients_1d_kernel writes the cells' conductivities (d_kappa), heat capacities (d_rho_cv_e) and
+// the flux limiter's charge and mass (scratch buffers, returned through d_zbar_lim_out / d_A_lim_out when given) on the
+// cells the stages read (the owned cells and one ghost cell on each side; the other cells of the limiter's charge and
+// mass are 0 and 1, so their faces carry no flux limit that an owned cell reads), and per_material_deff_1d_kernel the
+// dt diagnostics of the owned cells.
+ConductionDiagnostics compute_per_material_1d_operator(const core::State& state,
+                                                       const core::Config& cfg,
+                                                       const HydroEOSContext* eos_ctx,
+                                                       double* d_kappa,
+                                                       double* d_rho_cv_e,
+                                                       double** d_zbar_lim_out,
+                                                       double** d_A_lim_out) {
   const int n_cells = static_cast<int>(state.rho.size());
   const int n_mat = static_cast<int>(cfg.materials.materials.size());
   TENRYU_ASSERT(n_cells > 0, "per-material 1D conduction requires cells");
   TENRYU_ASSERT(n_mat > 0, "per-material 1D conduction requires materials");
+  TENRYU_ASSERT(d_kappa != nullptr && d_rho_cv_e != nullptr,
+                "per-material 1D conduction requires the coefficient buffers");
 
   const auto view = make_conduction_per_material_view(state, cfg, n_cells, n_mat);
   ConductionMaterialParams* d_params = nullptr;
   copy_material_params_to_device(cfg, &d_params);
-
   const std::uint8_t* d_cell_is_void = conduction_device_cell_is_void(state);
+  const std::size_t cell_bytes = static_cast<std::size_t>(n_cells) * sizeof(double);
+  auto* d_zbar_lim = static_cast<double*>(
+      core::device_scratch_acquire("conduction:compute_per_material_1d_operator:zbar_lim", cell_bytes));
+  auto* d_A_lim = static_cast<double*>(
+      core::device_scratch_acquire("conduction:compute_per_material_1d_operator:A_lim", cell_bytes));
+  per_material_limiter_reset_1d_kernel<<<(n_cells + kBlockSize - 1) / kBlockSize, kBlockSize>>>(d_zbar_lim, d_A_lim,
+                                                                                               n_cells);
+  cuda_check(cudaGetLastError(), "Conduction: per-material limiter reset launch failed");
 
   double* d_diag3 = static_cast<double*>(core::device_scratch_acquire(
       "conduction:compute_per_material_1d_operator:diag3_pack", 3 * sizeof(double)));
-  double* d_min_ratio = d_diag3 + 0;
-  double* d_min_deff = d_diag3 + 1;
-  double* d_max_deff = d_diag3 + 2;
   const double inf = std::numeric_limits<double>::infinity();
   const double h_diag3_init[3] = {inf, inf, 0.0};
-  cuda_check(cudaMemcpy(d_diag3, h_diag3_init, sizeof(h_diag3_init),
-                        cudaMemcpyHostToDevice),
+  cuda_check(cudaMemcpy(d_diag3, h_diag3_init, sizeof(h_diag3_init), cudaMemcpyHostToDevice),
              "Conduction: init per-material diag3 pack failed");
 
   const core::State::LaunchWindow dw = state.owned_cell_window_ghost(n_cells, 1);
+  const core::State::LaunchWindow cw = state.owned_cell_window(n_cells);
   const auto* d_electron_views =
-      (eos_ctx != nullptr && eos_ctx->n_materials >= n_mat) ? eos_ctx->d_electron_views
-                                                            : nullptr;
-  compute_spitzer_deff_1d_kernel_per_material<<<dw.blocks(), kBlockSize>>>(
-      d_kappa_face,
-      d_kappa_eff_per_material,
-      d_rho_cv_e,
-      d_min_ratio,
-      d_min_deff,
-      d_max_deff,
-      view,
-      d_electron_views,
-      d_params,
-      state.Te.data(),
-      state.rho.data(),
-      state.vol.data(),
-      state.x_r.data(),
-      dw.begin,
-      dw.end,
-      n_cells,
-      n_mat,
-      d_cell_is_void,
-      cfg.numerics.conduction.f_lim,
-      cfg.numerics.conduction.test_kappa,
-      cfg.numerics.conduction.mfp_limiter_C,
-      state.cv_e.empty() ? nullptr : state.cv_e.data(),
-      cfg.numerics.floors.Te,
-      cfg.materials.low_density_extrapolation);
-  cuda_check(cudaGetLastError(), "Conduction: per-material 1D Spitzer launch failed");
-  cuda_check(core::debug_kernel_sync(), "Conduction: per-material 1D Spitzer failed");
+      (eos_ctx != nullptr && eos_ctx->n_materials >= n_mat) ? eos_ctx->d_electron_views : nullptr;
+  per_material_cell_coefficients_1d_kernel<<<dw.blocks(), kBlockSize>>>(
+      view, d_electron_views, d_params, state.rho.data(), state.x_r.data(),
+      state.cv_e.empty() ? nullptr : state.cv_e.data(), d_cell_is_void, dw.begin, dw.end,
+      cfg.numerics.conduction.test_kappa, cfg.numerics.conduction.mfp_limiter_C, cfg.numerics.floors.Te,
+      cfg.materials.low_density_extrapolation, d_kappa, d_rho_cv_e, d_zbar_lim, d_A_lim);
+  cuda_check(cudaGetLastError(), "Conduction: per-material 1D coefficient launch failed");
+  per_material_deff_1d_kernel<<<cw.blocks(), kBlockSize>>>(
+      d_kappa, d_rho_cv_e, d_zbar_lim, d_A_lim, state.Te.data(), state.rho.data(), state.vol.data(),
+      state.x_r.data(), d_cell_is_void, cw.begin, cw.end, n_cells, cfg.numerics.conduction.f_lim,
+      cfg.numerics.conduction.test_kappa, d_diag3 + 0, d_diag3 + 1, d_diag3 + 2);
+  cuda_check(cudaGetLastError(), "Conduction: per-material 1D diffusivity launch failed");
+  cuda_check(core::debug_kernel_sync(), "Conduction: per-material 1D coefficients failed");
   const_cast<core::State&>(state).dispatch_counters.per_material_kernel_call_count.fetch_add(
       1, std::memory_order_relaxed);
-
-  ConductionDiagnostics diag = finish_conduction_diag(d_diag3, cfg);
-  return diag;
+  if (d_zbar_lim_out != nullptr) {
+    *d_zbar_lim_out = d_zbar_lim;
+  }
+  if (d_A_lim_out != nullptr) {
+    *d_A_lim_out = d_A_lim;
+  }
+  return finish_conduction_diag(d_diag3, cfg);
 }
 
 ConductionDiagnostics compute_per_material_2d_operator(
@@ -3631,25 +3648,15 @@ ConductionDiagnostics compute_conduction_diagnostics_impl(const core::State& sta
           static_cast<std::size_t>(n_cells) * sizeof(double)));
     }
     if (state.mesh.dim == 1) {
-      const int n_faces = std::max(0, n_cells - 1);
-      double* d_kappa_face = nullptr;
-      double* d_kappa_pm = nullptr;
-      d_kappa_face = static_cast<double*>(core::device_scratch_acquire(
-          "conduction:compute_conduction_diagnostics_impl:d_kappa_face",
-          static_cast<std::size_t>(std::max(1, n_faces)) *
-              sizeof(double)));
-      d_kappa_pm = static_cast<double*>(core::device_scratch_acquire(
-          "conduction:compute_conduction_diagnostics_impl:d_kappa_pm_faces",
-          static_cast<std::size_t>(std::max(1, n_faces * n_mat)) *
-              sizeof(double)));
-      diag = compute_per_material_1d_operator(
-          state, cfg, eos_ctx, d_kappa_face, d_kappa_pm, d_rho_cv_local);
-      if (d_diffusion != nullptr) {
-        cuda_check(cudaMemset(d_diffusion,
-                              0,
-                              static_cast<std::size_t>(n_cells) * sizeof(double)),
-                   "Conduction: cudaMemset per-material diagnostics diffusion failed");
+      // the cells' conductivities go to d_diffusion as on the single-material 1D path
+      double* d_kappa_local = d_diffusion;
+      if (d_kappa_local == nullptr) {
+        d_kappa_local = static_cast<double*>(core::device_scratch_acquire(
+            "conduction:compute_conduction_diagnostics_impl:d_kappa_local_1d",
+            static_cast<std::size_t>(n_cells) * sizeof(double)));
       }
+      diag = compute_per_material_1d_operator(
+          state, cfg, eos_ctx, d_kappa_local, d_rho_cv_local, nullptr, nullptr);
     } else {
       double* d_kappa_local = d_diffusion;
       if (d_kappa_local == nullptr) {
@@ -4259,10 +4266,32 @@ ConductionResult conduction_step_1d_implicit(core::State& state,
   const int geom_code = cfg.numerics.conduction.test_planar
                             ? 2
                             : state.mesh.geometry_code;
+  // The booked temperatures of the solve in flux form (implicit_conduction_flux_form_kernel); state.Te still holds
+  // T^n here. The residual diagnostics keep the raw solution (stage copy above).
+  double* d_te_flux = static_cast<double*>(core::device_scratch_acquire(
+      "conduction:conduction_step_1d_implicit:te_flux", static_cast<std::size_t>(n_cells) * sizeof(double)));
+  auto launch_flux_form = [&](auto geom_tag) {
+    constexpr int GEOM = decltype(geom_tag)::value;
+    implicit_conduction_flux_form_kernel<GEOM><<<blocks, serial_block>>>(
+        d_te_flux, d_rhs, state.Te.data(), d_upper, d_rho_cv_e, d_cell_is_void, state.vol.data(),
+        state.x_r.data(), n_cells, dt);
+  };
+  switch (geom_code) {
+    case 1:
+      launch_flux_form(std::integral_constant<int, 1>{});
+      break;
+    case 2:
+      launch_flux_form(std::integral_constant<int, 2>{});
+      break;
+    default:
+      launch_flux_form(std::integral_constant<int, 0>{});
+      break;
+  }
+  cuda_check(cudaGetLastError(), "Conduction: implicit flux-form booking launch failed");
   auto launch_clamp = [&](auto geom_tag) {
     constexpr int GEOM = decltype(geom_tag)::value;
     clamp_1d_conduction_solution_kernel<GEOM><<<blocks, serial_block>>>(
-        d_rhs,
+        d_te_flux,
         d_rho_cv_e,
         d_cell_is_void,
         state.vol.data(),
@@ -4287,7 +4316,7 @@ ConductionResult conduction_step_1d_implicit(core::State& state,
   cuda_check(cudaGetLastError(), "Conduction: implicit floor clamp launch failed");
   cuda_check(core::debug_kernel_sync(), "Conduction: implicit floor clamp failed");
 
-  copy_if_proceed_kernel<<<blocks, serial_block>>>(state.Te.data(), d_rhs, n_cells, d_proceed);
+  copy_if_proceed_kernel<<<blocks, serial_block>>>(state.Te.data(), d_te_flux, n_cells, d_proceed);
   cuda_check(cudaGetLastError(), "Conduction: implicit Te copy-back launch failed");
   core::deterministic_sum(d_e_floor_cells, n_cells, d_e_floor, false);
 
@@ -4337,260 +4366,6 @@ ConductionResult conduction_step_1d_implicit(core::State& state,
     result.clamp_count = 0;
   }
 
-  if (result.clamp_count > cfg.numerics.safety.clamp_warn_threshold) {
-    core::log_warning("Conduction floor clamp count exceeded warning threshold: " +
-                      std::to_string(result.clamp_count));
-  }
-
-  return result;
-}
-
-ConductionResult conduction_step_1d_sts_per_material(core::State& state,
-                                                     const double dt,
-                                                     const core::Config& cfg,
-                                                     const HydroEOSContext* eos_ctx,
-                                                     const parallel::PartitionInfo& part,
-                                                     parallel::CommBuffers* bufs,
-                                                     cudaStream_t stream) {
-  ConductionResult result;
-  result.energy_closed_by_solve = true;
-  result.dt_cond = std::numeric_limits<double>::infinity();
-  result.dt_exp = std::numeric_limits<double>::infinity();
-  const int floor_limiter_mode =
-      (cfg.numerics.conduction.sts_floor_limiter == "donor") ? 1 : 0;
-
-  const int n_cells = static_cast<int>(state.rho.size());
-  const int n_mat = static_cast<int>(cfg.materials.materials.size());
-  if (n_cells <= 0) {
-    return result;
-  }
-  const bool do_exchange = (part.n_ranks > 1 && bufs != nullptr);
-  auto exchange_te_halo = [&](double* te_ptr) {
-    if (!do_exchange) {
-      return;
-    }
-    double* Te_ptr = te_ptr;
-    parallel::exchange_cell_fields(part, *bufs, &Te_ptr, 1, n_cells, stream, 3);
-  };
-  exchange_te_halo(state.Te.data());
-
-  const int n_faces = std::max(0, n_cells - 1);
-  double* d_kappa_face = nullptr;
-  double* d_kappa_eff_per_material = nullptr;
-  double* d_rho_cv_e = nullptr;
-  d_kappa_face = static_cast<double*>(core::device_scratch_acquire(
-      "conduction:conduction_step_1d_sts_per_material:d_kappa_face",
-      static_cast<std::size_t>(std::max(1, n_faces)) * sizeof(double)));
-  d_kappa_eff_per_material = static_cast<double*>(core::device_scratch_acquire(
-      "conduction:conduction_step_1d_sts_per_material:d_kappa_eff_per_material",
-      static_cast<std::size_t>(std::max(1, n_faces * n_mat)) *
-          sizeof(double)));
-  d_rho_cv_e = static_cast<double*>(core::device_scratch_acquire(
-      "conduction:conduction_step_1d_sts_per_material:d_rho_cv_e",
-      static_cast<std::size_t>(n_cells) * sizeof(double)));
-
-  const auto diag = compute_per_material_1d_operator(
-      state, cfg, eos_ctx, d_kappa_face, d_kappa_eff_per_material, d_rho_cv_e);
-  double global_dt_exp = diag.dt_exp;
-  if (part.n_ranks > 1) {
-    parallel::Reduction red(part.n_ranks);
-    global_dt_exp = (std::isfinite(global_dt_exp) && global_dt_exp > 0.0)
-                        ? red.allreduce_min(global_dt_exp)
-                        : red.allreduce_min(1.0e+30);
-  }
-  result.dt_exp = global_dt_exp;
-  result.dt_cond =
-      compute_dt_cond_from_dt_exp(global_dt_exp, cfg.numerics.conduction.sts_max_stages);
-  result.deff_min = diag.deff_min;
-  result.deff_max = diag.deff_max;
-
-  if (!std::isfinite(global_dt_exp) || !(global_dt_exp > 0.0) ||
-      (part.n_ranks > 1 && !(global_dt_exp < 1.0e+30))) {
-    return result;
-  }
-
-  const int smax = (cfg.numerics.conduction.sts_max_stages > 0)
-                       ? std::max(1, cfg.numerics.conduction.sts_max_stages)
-                       : 100000;
-  int n_sub = 1;
-  double dt_sub = dt;
-  if (cfg.numerics.conduction.sts_max_stages > 0) {
-    const double eta = std::clamp(cfg.numerics.conduction.sts_subcycle_eta, 1.0e-6, 1.0);
-    const double smax_factor =
-        0.5 * static_cast<double>(smax) * static_cast<double>(smax + 1);
-    const double dt_sts_max = smax_factor * global_dt_exp * eta;
-    if (std::isfinite(dt_sts_max) && dt_sts_max > 0.0 && dt > dt_sts_max) {
-      n_sub = ceil_to_int_clamped(dt / dt_sts_max);
-      dt_sub = dt / static_cast<double>(n_sub);
-    }
-  }
-  const int stages_per_sub = conduction::sts_stage_count(dt_sub, global_dt_exp, smax);
-  const long long total_stages =
-      static_cast<long long>(stages_per_sub) * static_cast<long long>(n_sub);
-  const long long sts_total_cap =
-      static_cast<long long>(cfg.numerics.conduction.sts_total_stages_max);
-  if (sts_total_cap > 0 && total_stages > sts_total_cap) {
-    core::log_warning(
-        "[conduction] STS total stage bound tripped: total=" +
-        std::to_string(total_stages) + " (n_sub=" + std::to_string(n_sub) +
-        " x stages=" + std::to_string(stages_per_sub) +
-        ") > sts_total_stages_max=" + std::to_string(sts_total_cap) +
-        " dt=" + format_sci(dt) + " dt_exp=" + format_sci(global_dt_exp) +
-        " — requesting driver full-step retry");
-    result.retry_required = true;
-    result.retry_reason = "sts_total_stages_overflow";
-    result.retry_total_stages = total_stages;
-    result.retry_n_sub = n_sub;
-    result.retry_dt_exp = global_dt_exp;
-    return result;
-  }
-  result.sts_subcycles = n_sub;
-  result.sts_stages = (total_stages > static_cast<long long>(std::numeric_limits<int>::max()))
-                          ? std::numeric_limits<int>::max()
-                          : static_cast<int>(total_stages);
-  result.solver_residual = 0.0;
-  result.solver_iterations = result.sts_stages;
-  result.solver_cond_number_est = 1.0;
-
-  std::vector<double> tau;
-  initialize_sts_taus(
-      tau, dt_sub, global_dt_exp, stages_per_sub, cfg.numerics.conduction.sts_damping);
-  audit_sts_ladder_stability(tau, dt_sub, global_dt_exp,
-                             cfg.numerics.dt.cfl_cond,
-                             cfg.numerics.conduction.sts_damping,
-                             "1d_sts_per_material");
-
-  double* d_te_tmp = nullptr;
-  double* d_alpha_cells = nullptr;
-  const std::uint8_t* d_cell_is_void = nullptr;
-  int* d_clamp_count = nullptr;
-  double* d_e_floor = nullptr;
-  d_te_tmp = static_cast<double*>(core::device_scratch_acquire(
-      "conduction:conduction_step_1d_sts_per_material:d_te_tmp",
-      static_cast<std::size_t>(n_cells) * sizeof(double)));
-  d_alpha_cells = static_cast<double*>(core::device_scratch_acquire(
-      "conduction:alpha_pass:1d_sts_per_material",
-      static_cast<std::size_t>(n_cells) * sizeof(double)));
-  d_cell_is_void = conduction_device_cell_is_void(state);
-  double* d_clampfloor = static_cast<double*>(core::device_scratch_acquire(
-      "conduction:conduction_step_1d_sts_per_material:clampfloor_pack",
-      2 * sizeof(double)));
-  d_e_floor = d_clampfloor + 0;
-  d_clamp_count = reinterpret_cast<int*>(d_clampfloor + 1);
-
-  const double h_clampfloor_init[2] = {0.0, 0.0};
-  cuda_check(cudaMemcpy(d_clampfloor, h_clampfloor_init, sizeof(h_clampfloor_init),
-                        cudaMemcpyHostToDevice),
-             "Conduction: init clampfloor pack (per-material) failed");
-  // Floor-clamp energy per cell over all stages, summed in a fixed order
-  // before the readback (2026-09-24).
-  double* d_e_floor_cells = static_cast<double*>(core::device_scratch_acquire(
-      "conduction:conduction_step_1d_sts_per_material:e_floor_cells",
-      static_cast<std::size_t>(std::max(n_cells, 1)) * sizeof(double)));
-  cuda_check(cudaMemset(d_e_floor_cells, 0,
-                        static_cast<std::size_t>(std::max(n_cells, 1)) * sizeof(double)),
-             "Conduction: per-material floor cells zero failed");
-
-  const core::State::LaunchWindow cw = state.owned_cell_window(n_cells);
-  // Ghost-extended window for alpha/diffusivity passes: interface-face
-  // coefficients need the +-1 ghost cells; their min/max atomics are
-  // idempotent under the duplicated ghost contributions.
-  const core::State::LaunchWindow dwa = state.owned_cell_window_ghost(n_cells, 1);
-  double* te_curr = state.Te.data();
-  double* te_next = d_te_tmp;
-  // W-G2: test_planar is the historic planar alias (verify-only, spherical
-  // meshes); otherwise Mesh.geometry_1d drives via geometry_code.
-  const int geom_code = cfg.numerics.conduction.test_planar
-                            ? 2
-                            : state.mesh.geometry_code;
-  auto launch_stage = [&](auto geom_tag, const double tau_stage) {
-    constexpr int GEOM = decltype(geom_tag)::value;
-    conduction_alpha_pass_kernel_per_material<GEOM><<<dwa.blocks(), kBlockSize>>>(
-        d_alpha_cells,
-        te_curr,
-        d_kappa_eff_per_material,
-        state.volFrac.data(),
-        d_rho_cv_e,
-        d_cell_is_void,
-        state.vol.data(),
-        state.x_r.data(),
-        dwa.begin,
-        dwa.end,
-        n_cells,
-        n_mat,
-        tau_stage,
-        cfg.numerics.floors.Te,
-        floor_limiter_mode);
-    conduction_1d_sts_stage_kernel_per_material<GEOM><<<cw.blocks(), kBlockSize>>>(
-        te_curr,
-        te_next,
-        d_kappa_face,
-        d_kappa_eff_per_material,
-        state.Ee_per_material.data(),
-        state.volFrac.data(),
-        d_rho_cv_e,
-        d_cell_is_void,
-        state.vol.data(),
-        state.x_r.data(),
-        cw.begin,
-        cw.end,
-        n_cells,
-        n_mat,
-        tau_stage,
-        cfg.numerics.floors.Te,
-        d_alpha_cells,
-        d_clamp_count,
-        d_e_floor_cells,
-        floor_limiter_mode);
-  };
-  for (int sub = 0; sub < n_sub; ++sub) {
-    for (const double tau_j : tau) {
-      exchange_te_halo(te_curr);
-      switch (geom_code) {
-        case 1:
-          launch_stage(std::integral_constant<int, 1>{}, tau_j);
-          break;
-        case 2:
-          launch_stage(std::integral_constant<int, 2>{}, tau_j);
-          break;
-        default:
-          launch_stage(std::integral_constant<int, 0>{}, tau_j);
-          break;
-      }
-      cuda_check(cudaGetLastError(), "Conduction: per-material STS stage launch failed");
-      cuda_check(core::debug_kernel_sync(), "Conduction: per-material STS stage failed");
-      std::swap(te_curr, te_next);
-    }
-  }
-  if (te_curr != state.Te.data()) {
-    cuda_check(cudaMemcpy(state.Te.data(),
-                          te_curr,
-                          static_cast<std::size_t>(n_cells) * sizeof(double),
-                          cudaMemcpyDeviceToDevice),
-               "Conduction: per-material copy staged Te back failed");
-  }
-
-  derive_cell_ee_from_per_material_kernel<<<cw.blocks(), kBlockSize>>>(
-      state.ee.data(), state.Ee_per_material.data(), state.mass.data(),
-      cw.begin, cw.end, n_cells, n_mat);
-  cuda_check(cudaGetLastError(), "Conduction: per-material ee reduction launch failed");
-  cuda_check(core::debug_kernel_sync(), "Conduction: per-material ee reduction failed");
-  per_material::refresh_per_material_derived_cell_fields(state, cfg, eos_ctx, true);
-
-  if (part.n_ranks > 1 && bufs != nullptr) {
-    cudaStream_t halo_stream = stream;
-    double* te_ptr[] = {state.Te.data()};
-    parallel::exchange_cell_fields(
-        part, *bufs, te_ptr, 1, state.mesh.topo.n_cells, halo_stream, 4);
-  }
-
-  core::deterministic_sum(d_e_floor_cells, n_cells, d_e_floor, false);
-  double h_clampfloor[2] = {0.0, 0.0};
-  cuda_check(cudaMemcpy(h_clampfloor, d_clampfloor, sizeof(h_clampfloor),
-                        cudaMemcpyDeviceToHost),
-             "Conduction: copy clampfloor pack (per-material) failed");
-  result.E_floor_injected = h_clampfloor[0];
-  std::memcpy(&result.clamp_count, &h_clampfloor[1], sizeof(int));
   if (result.clamp_count > cfg.numerics.safety.clamp_warn_threshold) {
     core::log_warning("Conduction floor clamp count exceeded warning threshold: " +
                       std::to_string(result.clamp_count));
@@ -4900,8 +4675,16 @@ ConductionResult conduction_step_1d_sts(core::State& state,
   if (n_cells <= 0) {
     return result;
   }
-  if (per_material_conduction_ready(state, cfg, eos_ctx)) {
-    return conduction_step_1d_sts_per_material(state, dt, cfg, eos_ctx, part, bufs, stream);
+  // The per-material path (NUMERICS §4.1.1) runs the same stages on its own cell coefficients
+  // (compute_per_material_1d_operator: the materials' conductivities summed in each cell) and gives each cell's change
+  // of electron energy to its materials after them (per_material_energy_change_1d_kernel).
+  const bool per_material = per_material_conduction_ready(state, cfg, eos_ctx);
+  if (per_material) {
+    TENRYU_ASSERT(cfg.numerics.conduction.nonlocal_model != "snb",
+                  "Conduction 1D: the per-material path has no non-local (SNB) model");
+    TENRYU_ASSERT(!cfg.numerics.conduction.test_planar || state.mesh.geometry_code == 2,
+                  "Conduction 1D: the per-material path books the stages' energy in the materials, and the planar "
+                  "alias test_planar on a non-planar mesh gives the stages other volumes than the materials'");
   }
   const bool do_exchange = (part.n_ranks > 1 && bufs != nullptr);
   const std::string& halo_strategy = cfg.numerics.conduction.halo_strategy;
@@ -4926,8 +4709,12 @@ ConductionResult conduction_step_1d_sts(core::State& state,
       "conduction:conduction_step_1d_sts:d_rho_cv_e",
       static_cast<std::size_t>(n_cells) * sizeof(double)));
 
+  double* d_pm_zbar = nullptr;
+  double* d_pm_A = nullptr;
   const auto diag =
-      compute_conduction_diagnostics_impl(state, cfg, d_kappa_eff, d_rho_cv_e, eos_ctx);
+      per_material
+          ? compute_per_material_1d_operator(state, cfg, eos_ctx, d_kappa_eff, d_rho_cv_e, &d_pm_zbar, &d_pm_A)
+          : compute_conduction_diagnostics_impl(state, cfg, d_kappa_eff, d_rho_cv_e, eos_ctx);
   double global_dt_exp = diag.dt_exp;
   if (part.n_ranks > 1) {
     parallel::Reduction red(part.n_ranks);
@@ -5053,6 +4840,30 @@ ConductionResult conduction_step_1d_sts(core::State& state,
   double* te_curr = state.Te.data();
   double* te_next = d_te_tmp;
   const double Te_floor = cfg.numerics.floors.Te;
+  // the per-material path: the step's starting temperatures and the materials' electron heat capacities (the weights of
+  // the heating share of per_material_energy_change_1d_kernel)
+  const int n_mat = static_cast<int>(cfg.materials.materials.size());
+  double* d_te_start = nullptr;
+  double* d_material_heat_capacity = nullptr;
+  ConductionMaterialParams* d_material_params = nullptr;
+  const tenryu::materials::DeviceEOSTableView* d_electron_views = nullptr;
+  if (per_material) {
+    d_te_start = static_cast<double*>(core::device_scratch_acquire(
+        "conduction:conduction_step_1d_sts:te_start", static_cast<std::size_t>(n_cells) * sizeof(double)));
+    cuda_check(cudaMemcpy(d_te_start, state.Te.data(), static_cast<std::size_t>(n_cells) * sizeof(double),
+                          cudaMemcpyDeviceToDevice),
+               "Conduction: per-material step-start Te copy failed");
+    d_material_heat_capacity = static_cast<double*>(core::device_scratch_acquire(
+        "conduction:conduction_step_1d_sts:material_heat_capacity",
+        static_cast<std::size_t>(n_cells) * static_cast<std::size_t>(n_mat) * sizeof(double)));
+    copy_material_params_to_device(cfg, &d_material_params);
+    d_electron_views =
+        (eos_ctx != nullptr && eos_ctx->n_materials >= n_mat) ? eos_ctx->d_electron_views : nullptr;
+    per_material_electron_heat_capacity_1d_kernel<<<cw.blocks(), kBlockSize>>>(
+        make_conduction_per_material_view(state, cfg, n_cells, n_mat), d_electron_views, d_material_params, Te_floor,
+        cfg.materials.low_density_extrapolation, cw.begin, cw.end, d_material_heat_capacity);
+    cuda_check(cudaGetLastError(), "Conduction: per-material heat capacity launch failed");
+  }
   // W-G2: test_planar is the historic planar alias (verify-only, spherical
   // meshes); otherwise Mesh.geometry_1d drives via geometry_code.
   const int geom_code = cfg.numerics.conduction.test_planar
@@ -5062,8 +4873,10 @@ ConductionResult conduction_step_1d_sts(core::State& state,
   double* d_A_eff = nullptr;
   double* d_flux_limiter_faces = nullptr;
   if (use_flux_limiter != 0 && n_cells > 1) {
-    if (state.A_eff.size() == static_cast<std::size_t>(n_cells) &&
-        state.gamma_eff.size() == static_cast<std::size_t>(n_cells)) {
+    if (per_material) {
+      d_A_eff = d_pm_A;  // the per-material cells' mean mass for the face electron density
+    } else if (state.A_eff.size() == static_cast<std::size_t>(n_cells) &&
+               state.gamma_eff.size() == static_cast<std::size_t>(n_cells)) {
       d_A_eff = const_cast<double*>(state.A_eff.data());
     } else {
       std::vector<double> A_eff;
@@ -5103,7 +4916,7 @@ ConductionResult conduction_step_1d_sts(core::State& state,
         state.Te.data(),
         d_kappa_eff,
         state.rho.data(),
-        state.zbar.data(),
+        per_material ? d_pm_zbar : state.zbar.data(),
         d_A_eff,
         state.x_r.data(),
         n_cells,
@@ -5255,6 +5068,8 @@ ConductionResult conduction_step_1d_sts(core::State& state,
        cfg.numerics.conduction.test_kappa > 0.0);
   const double stage_kappa_power =
       stage_kappa_power_active ? std::atof(stage_kappa_power_env) : 0.0;
+  TENRYU_ASSERT(!(per_material && stage_kappa_power_active),
+                "Conduction 1D: the TENRYU_CONDUCTION_TEST_KAPPA_POWER hook is a single-material verification path");
   const char* stage_kappa_rho_power_env =
       std::getenv("TENRYU_CONDUCTION_TEST_KAPPA_RHO_POWER");
   const double stage_kappa_rho_power =
@@ -5312,12 +5127,26 @@ ConductionResult conduction_step_1d_sts(core::State& state,
   const bool stage_face_policy_kirchhoff =
       (face_policy_kirchhoff_base &&
        cfg.numerics.conduction.test_kappa <= 0.0 && !stage_kappa_power_active);
+  // The Kirchhoff face conductivities of the step start T_e^n (state.Te before any stage), held fixed through all
+  // n_sub x s stages like the cell conductivities and the flux limiter (NUMERICS §4.2). Before 2026-09-29 each stage
+  // re-evaluated the closure with its own temperatures against the T_e^n cell conductivities, which recovered
+  // kappa_0 = kappa / T^{5/2} from two different states and could switch a face between the Kirchhoff and the
+  // harmonic branch in the middle of a step.
+  double* d_kappa_face = nullptr;
+  if (stage_face_policy_kirchhoff && n_cells > 1) {
+    d_kappa_face = static_cast<double*>(core::device_scratch_acquire(
+        "conduction:conduction_step_1d_sts:d_kappa_face", static_cast<std::size_t>(n_cells) * sizeof(double)));
+    const int face_blocks = (n_cells - 1 + kBlockSize - 1) / kBlockSize;
+    compute_1d_face_kappa_kernel<<<face_blocks, kBlockSize>>>(d_kappa_face, d_kappa_eff, state.Te.data(),
+                                                              n_cells, 1);
+    cuda_check(cudaGetLastError(), "Conduction: face conductivity launch failed");
+  }
   auto launch_stage_kirchhoff = [&](auto geom_tag, const double tau_stage) {
     constexpr int GEOM = decltype(geom_tag)::value;
     conduction_alpha_pass_kirchhoff_kernel<GEOM><<<dwa.blocks(), kBlockSize>>>(
         d_alpha_cells,
         te_curr,
-        d_kappa_eff,
+        d_kappa_face,
         d_flux_limiter_faces,
         d_rho_cv_e,
         d_cell_is_void,
@@ -5332,7 +5161,7 @@ ConductionResult conduction_step_1d_sts(core::State& state,
     conduction_1d_sts_stage_kirchhoff_kernel<GEOM><<<cw.blocks(), kBlockSize>>>(
         te_curr,
         te_next,
-        d_kappa_eff,
+        d_kappa_face,
         d_flux_limiter_faces,
         d_rho_cv_e,
         d_cell_is_void,
@@ -5378,7 +5207,7 @@ ConductionResult conduction_step_1d_sts(core::State& state,
                             cudaMemcpyHostToDevice),
                  "Conduction: cudaMemcpy d_A_eff (snb) failed");
     }
-    snb::conduction_step_1d_sts_snb(state, cfg, result, d_kappa_eff, d_rho_cv_e,
+    snb::conduction_step_1d_sts_snb(state, cfg, result, d_kappa_eff, d_kappa_face, d_rho_cv_e,
                                     d_cell_is_void, d_A_eff_snb, n_cells,
                                     geom_code, stage_face_policy_kirchhoff,
                                     use_flux_limiter != 0, tau, n_sub, Te_floor,
@@ -5396,7 +5225,7 @@ ConductionResult conduction_step_1d_sts(core::State& state,
           te_curr,
           te_next,
           d_alpha_cells,
-          d_kappa_eff,
+          d_kappa_face,
           d_flux_limiter_faces,
           d_rho_cv_e,
           d_cell_is_void,
@@ -5497,7 +5326,43 @@ ConductionResult conduction_step_1d_sts(core::State& state,
                "Conduction: copy staged Te back failed");
   }
 
-  conduction_sync_eos(state, cfg);
+  int per_material_shortfalls = 0;
+  if (per_material) {
+    // each cell's change of electron energy to its materials, the cells' electron energies from theirs and the
+    // materials' projection of the cells' fields
+    int* d_shortfall = static_cast<int*>(
+        core::device_scratch_acquire("conduction:conduction_step_1d_sts:material_shortfall", sizeof(int)));
+    cuda_check(cudaMemset(d_shortfall, 0, sizeof(int)), "Conduction: per-material shortfall reset failed");
+    const auto view = make_conduction_per_material_view(state, cfg, n_cells, n_mat);
+    auto launch_energy_change = [&](auto geom_tag) {
+      constexpr int GEOM = decltype(geom_tag)::value;
+      per_material_energy_change_1d_kernel<GEOM><<<cw.blocks(), kBlockSize>>>(
+          view, d_electron_views, d_material_params, d_rho_cv_e, state.vol.data(), state.x_r.data(),
+          d_cell_is_void, d_te_start, state.Te.data(), d_material_heat_capacity, cw.begin, cw.end, Te_floor,
+          cfg.materials.low_density_extrapolation, state.Ee_per_material.data(), d_e_floor_cells, d_shortfall);
+    };
+    switch (geom_code) {
+      case 1:
+        launch_energy_change(std::integral_constant<int, 1>{});
+        break;
+      case 2:
+        launch_energy_change(std::integral_constant<int, 2>{});
+        break;
+      default:
+        launch_energy_change(std::integral_constant<int, 0>{});
+        break;
+    }
+    cuda_check(cudaGetLastError(), "Conduction: per-material energy change launch failed");
+    derive_cell_ee_from_per_material_kernel<<<cw.blocks(), kBlockSize>>>(
+        state.ee.data(), state.Ee_per_material.data(), state.mass.data(), cw.begin, cw.end, n_cells, n_mat);
+    cuda_check(cudaGetLastError(), "Conduction: per-material ee reduction launch failed");
+    cuda_check(cudaMemcpy(&per_material_shortfalls, d_shortfall, sizeof(int), cudaMemcpyDeviceToHost),
+               "Conduction: per-material shortfall read failed");
+    per_material::refresh_per_material_derived_cell_fields(state, cfg, eos_ctx, true);
+    result.energy_closed_by_solve = true;
+  } else {
+    conduction_sync_eos(state, cfg);
+  }
   if (part.n_ranks > 1 && bufs != nullptr) {
     cudaStream_t halo_stream = stream;
     double* te_ptr[] = {state.Te.data()};
@@ -5512,6 +5377,8 @@ ConductionResult conduction_step_1d_sts(core::State& state,
              "Conduction: copy clampfloor pack (sts) failed");
   result.E_floor_injected = h_clampfloor[0];
   std::memcpy(&result.clamp_count, &h_clampfloor[1], sizeof(int));
+  // the per-material path's cells whose materials reached their floor states (their energy is in E_floor_injected)
+  result.clamp_count += per_material_shortfalls;
 
   if (result.clamp_count > cfg.numerics.safety.clamp_warn_threshold) {
     core::log_warning("Conduction floor clamp count exceeded warning threshold: " +
@@ -5998,7 +5865,8 @@ constexpr double kBraginskiiIonKappaCoeff = 3.906;
 __device__ inline double braginskii_ion_kappa(const double rho,
                                               const double Ti_eV,
                                               const double A_eff,
-                                              const double zbar) {
+                                              const double zbar,
+                                              const double zmom_r4 = 1.0) {
   const double T = sanitize_te_for_pow(Ti_eV);
   const double A = fmax(A_eff, 1.0);
   const double Z = fmax(zbar, 1.0);
@@ -6009,7 +5877,8 @@ __device__ inline double braginskii_ion_kappa(const double rho,
   const double t32 = T * sqrt(T);
   const double ln_lambda =
       fmax(2.0, 23.0 - log(Z * Z * Z * sqrt(2.0 * n_i) / t32));
-  const double z4 = (Z * Z) * (Z * Z);
+  // <Z^4> = Z^4 r4 of a multi-species cell (NUMERICS §1.1.3a), as in the ion viscosity's tau_i.
+  const double z4 = (Z * Z) * (Z * Z) * zmom_r4;
   const double tau_i = braginskii::kTauI0 * sqrt(A) * t32 / (n_i * z4 * ln_lambda);
   const double kappa = kBraginskiiIonKappaCoeff * n_i * (kEvToErg * T) * tau_i /
                        (A * kProtonMass) * kEvToErg;
@@ -6041,7 +5910,8 @@ __global__ void ion_conduction_coefficients_kernel(
     const double* __restrict__ gamma_eff,
     const double* __restrict__ state_cv_i,
     const std::uint8_t* __restrict__ cell_is_void,
-    const int n_cells) {
+    const int n_cells,
+    const double* __restrict__ zmom_r4) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n_cells) {
     return;
@@ -6053,7 +5923,8 @@ __global__ void ion_conduction_coefficients_kernel(
     kappa_i[i] = 0.0;
     return;
   }
-  kappa_i[i] = braginskii_ion_kappa(rho[i], Ti[i], A_eff[i], zbar[i]);
+  kappa_i[i] = braginskii_ion_kappa(rho[i], Ti[i], A_eff[i], zbar[i],
+                                    (zmom_r4 != nullptr) ? zmom_r4[i] : 1.0);
 }
 
 // Face flux-limiter factors 1 / (1 + |q_SH| / q_max) of the ion solve, the
@@ -6269,50 +6140,37 @@ int sts_stage_count(const double dt,
   return std::min(s, smax);
 }
 
-PerMaterialFaceCoefficients1D compute_per_material_face_coefficients_1d(
+PerMaterialCellCoefficients1D compute_per_material_cell_coefficients_1d(
     core::State& state, const core::Config& cfg, const HydroEOSContext* eos_ctx) {
   TENRYU_ASSERT(per_material_conduction_ready(state, cfg, eos_ctx),
-                "per-material face coefficients require enabled per-material state and EOS context");
-  TENRYU_ASSERT(state.mesh.dim == 1, "per-material face coefficients require 1D mesh");
+                "per-material cell coefficients require enabled per-material state and EOS context");
+  TENRYU_ASSERT(state.mesh.dim == 1, "per-material cell coefficients require 1D mesh");
   const int n_cells = static_cast<int>(state.rho.size());
-  const int n_mat = static_cast<int>(cfg.materials.materials.size());
-  const int n_faces = std::max(0, n_cells - 1);
+  const std::size_t cell_bytes = static_cast<std::size_t>(n_cells) * sizeof(double);
+  auto* d_kappa = static_cast<double*>(
+      core::device_scratch_acquire("conduction:compute_per_material_cell_coefficients_1d:d_kappa", cell_bytes));
+  auto* d_rho_cv_e = static_cast<double*>(
+      core::device_scratch_acquire("conduction:compute_per_material_cell_coefficients_1d:d_rho_cv_e", cell_bytes));
+  double* d_zbar_lim = nullptr;
+  double* d_A_lim = nullptr;
+  const ConductionDiagnostics diag =
+      compute_per_material_1d_operator(state, cfg, eos_ctx, d_kappa, d_rho_cv_e, &d_zbar_lim, &d_A_lim);
 
-  double* d_kappa_face = nullptr;
-  double* d_kappa_pm = nullptr;
-  double* d_rho_cv_e = nullptr;
-  d_kappa_face = static_cast<double*>(core::device_scratch_acquire(
-      "conduction:compute_per_material_face_coefficients_1d:d_kappa_face",
-      static_cast<std::size_t>(std::max(1, n_faces)) * sizeof(double)));
-  d_kappa_pm = static_cast<double*>(core::device_scratch_acquire(
-      "conduction:compute_per_material_face_coefficients_1d:d_kappa_pm",
-      static_cast<std::size_t>(std::max(1, n_faces * n_mat)) *
-          sizeof(double)));
-  d_rho_cv_e = static_cast<double*>(core::device_scratch_acquire(
-      "conduction:compute_per_material_face_coefficients_1d:d_rho_cv_e",
-      static_cast<std::size_t>(n_cells) * sizeof(double)));
-  (void)compute_per_material_1d_operator(
-      state, cfg, eos_ctx, d_kappa_face, d_kappa_pm, d_rho_cv_e);
-
-  PerMaterialFaceCoefficients1D out;
-  out.n_faces = n_faces;
-  out.n_mat = n_mat;
-  out.aggregate_kappa.assign(static_cast<std::size_t>(n_faces), 0.0);
-  out.kappa_eff_per_material.assign(
-      static_cast<std::size_t>(n_faces) * static_cast<std::size_t>(n_mat), 0.0);
-  if (n_faces > 0) {
-    cuda_check(cudaMemcpy(out.aggregate_kappa.data(),
-                          d_kappa_face,
-                          static_cast<std::size_t>(n_faces) * sizeof(double),
-                          cudaMemcpyDeviceToHost),
-               "Conduction: cudaMemcpy test aggregate kappa failed");
-    cuda_check(cudaMemcpy(out.kappa_eff_per_material.data(),
-                          d_kappa_pm,
-                          static_cast<std::size_t>(n_faces) *
-                              static_cast<std::size_t>(n_mat) * sizeof(double),
-                          cudaMemcpyDeviceToHost),
-               "Conduction: cudaMemcpy test per-material kappa failed");
-  }
+  PerMaterialCellCoefficients1D out;
+  out.n_cells = n_cells;
+  out.dt_exp = diag.dt_exp;
+  out.kappa.assign(static_cast<std::size_t>(n_cells), 0.0);
+  out.rho_cv.assign(static_cast<std::size_t>(n_cells), 0.0);
+  out.zbar_limiter.assign(static_cast<std::size_t>(n_cells), 0.0);
+  out.A_limiter.assign(static_cast<std::size_t>(n_cells), 0.0);
+  cuda_check(cudaMemcpy(out.kappa.data(), d_kappa, cell_bytes, cudaMemcpyDeviceToHost),
+             "Conduction: cudaMemcpy per-material cell kappa failed");
+  cuda_check(cudaMemcpy(out.rho_cv.data(), d_rho_cv_e, cell_bytes, cudaMemcpyDeviceToHost),
+             "Conduction: cudaMemcpy per-material cell rho_cv failed");
+  cuda_check(cudaMemcpy(out.zbar_limiter.data(), d_zbar_lim, cell_bytes, cudaMemcpyDeviceToHost),
+             "Conduction: cudaMemcpy per-material limiter charge failed");
+  cuda_check(cudaMemcpy(out.A_limiter.data(), d_A_lim, cell_bytes, cudaMemcpyDeviceToHost),
+             "Conduction: cudaMemcpy per-material limiter mass failed");
   return out;
 }
 
@@ -6642,7 +6500,9 @@ IonConductionResult ion_conduction_step_1d(core::State& state,
   ion_conduction_coefficients_kernel<<<blocks, serial_block>>>(
       d_kappa, d_rho_cv, state.rho.data(), state.Ti.data(), state.zbar.data(),
       state.A_eff.data(), state.gamma_eff.data(),
-      state.cv_i.empty() ? nullptr : state.cv_i.data(), d_cell_is_void, n_cells);
+      state.cv_i.empty() ? nullptr : state.cv_i.data(), d_cell_is_void, n_cells,
+      (state.zmom_active && state.zmom_r4.size() == static_cast<std::size_t>(n_cells)) ? state.zmom_r4.data()
+                                                                                        : nullptr);
   cuda_check(cudaGetLastError(), "Ion conduction: coefficient launch failed");
 
   // The face conductivity closure of the electron solve (the environment
@@ -6843,7 +6703,7 @@ SnbFluxProbe snb_probe_fluxes(core::State& state, const core::Config& cfg,
   double resid = 0.0;
   double qsh_scale = 0.0;
   double dq_ratio = 0.0;
-  snb::snb_pass(state, cfg, work, d_kappa_eff, d_A_eff, d_cell_is_void, n_cells,
+  snb::snb_pass(state, cfg, work, d_kappa_eff, nullptr, d_A_eff, d_cell_is_void, n_cells,
                 geom_code, face_policy_kirchhoff, use_outer_cap, t_ref_ev, &resid,
                 &qsh_scale, &dq_ratio,
                 state.zmom_active ? state.zmom_r2.data() : nullptr);

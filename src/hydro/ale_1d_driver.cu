@@ -53,14 +53,6 @@ __host__ __device__ double volume_coordinate(const double r, const int geom) {
                      : tenryu::mesh::geometry_1d_shell_volume_cubes(geom, 0.0, r);
 }
 
-bool uses_particle_radiation_mode(const core::Config& cfg) {
-  return cfg.radiation.mode == core::RadiationMode::ImcDdmc ||
-         cfg.radiation.imc.enabled ||
-         cfg.radiation.ddmc.enabled ||
-         cfg.radiation.imc.difference.enabled ||
-         cfg.radiation.holo.enabled;
-}
-
 int effective_cell_count(const core::State& state, const core::Config& cfg) {
   if (state.mesh.topo.n_cells > 0) {
     return state.mesh.topo.n_cells;
@@ -271,11 +263,8 @@ void commit_scratch(core::State& state,
 
   state.holo_ale_invalidated = true;
   state.ale_rezoned = true;
-  state.particle_sort_cache_invalidated = true;
   state.rad_dep.fill(0.0);
   state.rad_emit.fill(0.0);
-  state.holo_rad_dep.fill(0.0);
-  state.holo_rad_emit.fill(0.0);
   state.Qvisc.fill(0.0);
 }
 
@@ -289,8 +278,6 @@ const char* to_string(const Ale1dSkipReason r) {
       return "Disabled";
     case Ale1dSkipReason::WrongGeometry:
       return "WrongGeometry";
-    case Ale1dSkipReason::ParticleModeUnsupported:
-      return "ParticleModeUnsupported";
     case Ale1dSkipReason::NTooSmall:
       return "NTooSmall";
     case Ale1dSkipReason::ProtectedFractionTooHigh:
@@ -364,13 +351,9 @@ Ale1dStepResult apply_ale_1d_attempt(core::State& state,
     out.skip_reason = Ale1dSkipReason::WrongGeometry;
     return out;
   }
-  if (uses_particle_radiation_mode(cfg)) {
-    out.skip_reason = Ale1dSkipReason::ParticleModeUnsupported;
-    return out;
-  }
-  // Preconditions of an attempt, checked after the skip conditions (a 2D or
-  // particle-radiation configuration skips before them; test_ale_1d_skeleton
-  // aborted here with a material-less 2D configuration).
+  // Preconditions of an attempt, checked after the skip conditions (a 2D
+  // configuration skips before them; test_ale_1d_skeleton aborted here with a
+  // material-less 2D configuration).
   TENRYU_ASSERT(!cfg.materials.materials.empty(),
                 "ALE1D requires at least one material");
   const auto& mat0 = cfg.materials.materials.front();

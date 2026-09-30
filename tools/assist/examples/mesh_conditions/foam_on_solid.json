@@ -1,0 +1,35 @@
+{
+  "geometry": "planar",
+  "layers": [
+    {
+      "A": 7.0,
+      "Z": 3.5,
+      "material": "CD",
+      "rho_gcc": 1.05,
+      "thickness_cm": 0.002
+    },
+    {
+      "A": 7.0,
+      "Z": 3.5,
+      "material": "CD",
+      "rho_gcc": 0.1,
+      "thickness_cm": 0.0025
+    }
+  ],
+  "physics": {
+    "conduction_solver": "implicit",
+    "eos": "tmat",
+    "radiation_enabled": false,
+    "temperature_model": "2T"
+  },
+  "pulse": {
+    "duration_s": 1.2e-09,
+    "peak_intensity_W_cm2": 300000000000000.0,
+    "rise_s": 1e-10,
+    "shape": "square"
+  },
+  "r_max_cm": 0.0145,
+  "r_min_cm": 0.0,
+  "t_end_s": 1.2e-09,
+  "wavelength_nm": 351.0
+}

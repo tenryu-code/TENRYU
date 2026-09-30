@@ -81,7 +81,7 @@ struct FieldG {
 
     // メモリレイアウト：spatial-major（cell-major）
     // data[i * G + g] = spatial index i, group g の値
-    // → 同一セルの全群が連続 → IMC/DDMCカーネルでキャッシュ効率が良い
+    // → 同一セルの全群が連続 → セル単位で群を回すカーネルでキャッシュ効率が良い
 
     int total_size() const { return n_spatial * G; }
 };
@@ -154,14 +154,13 @@ State はホスト側配置。メンバポインタは全てデバイスメモ�
 
 > **ゴーストセル込みバッファサイズ規約**：
 > MPI並列時、ハロー交換で更新するフィールド（rho, Te, Ti, Pe, Pi, Qvisc, adaptive_av_gate, zbar, vol, face_area,
-> ell_ddmc, volFrac, hydro_active）は `n_cells + n_ghost` 要素で確保する。
+> volFrac, hydro_active）は `n_cells + n_ghost` 要素で確保する。
 > ここで `n_ghost` は `PartitionInfo.n_ghost_cells`（ゴーストセル総数）のエイリアスである。
 > `PartitionInfo.ghost_layers`（レイヤー数 = 1）とは異なるので注意。
 > 2D_RZ 1層ハロー: n_ghost_cells = 2×(nr_local+nz_local)+4。単一GPU時は `n_ghost_cells=0`。
 > カーネルシグネチャで `[n_cells + n_ghost]` と注記されたフィールドは ghost 込みバッファを前提とする。
 > `[n_cells]` のみ注記されたフィールド（mass, ee, ei, Cv_e, Cv_i, delta_l 等）は owned セル専用で
 > ghost 領域は確保しない。FieldG 型（rad_dep, rad_E 等）は owned セル `[n_cells × G]` のみ。
-> ただし ddmc_candidate, ddmc_mode は `[(n_cells+n_ghost) × G]` で確保する（R2/R3 がゴーストセルを処理するため）。
 
 ```cpp
 struct State {
@@ -188,7 +187,7 @@ struct State {
     // --- ファクトリ関数 ---
     // Config と PartitionInfo から全フィールドを確保し初期化する。
     // 確保対象：全 CellField/NodeField/CellFieldG/CellFieldMat、
-    //           hydro_active、PhotonPool、Scratch、DeviceErrorFlags
+    //           hydro_active、Scratch、DeviceErrorFlags
     static State allocate(const Config& cfg, const PartitionInfo& part);
 
     // --- Hydro cell fields ---
@@ -246,12 +245,10 @@ struct State {
     NodeField v_r, v_z;     // ノード速度 [cm/s]
 
     // --- Radiation ---
-    CellFieldG rad_E;       // エネルギー密度推定量 [erg/cm³]（NUMERICS §10.1: IMC track-length、§7.6: DDMC residence）
-    CellFieldG rad_E_tally; // track-length/residence推定量の生タリー [erg·cm]（R8/R9で累積、R10で rad_E へ変換）
-                            // ステップ冒頭ゼロクリア必須。legacy変換: rad_E[i,g] = rad_E_tally[i,g]/(V_i*×c×Δt)
-                            // difference変換: rad_E[i,g] = difference_E_ref[i,g] + rad_E_tally[i,g]/(V_i*×c×Δt)
-    CellFieldG rad_dep;     // セル→物質の放射交換エネルギー [erg]（セルあたり、ステップ中の累積）
-                            // IMC/DDMC の gross absorption tally。PGRW は IMC branch として同じ tally に書き込む
+    CellFieldG rad_E;       // 群ごとの輻射エネルギー密度 [erg/cm³]（FLD・S_N の解。NUMERICS §6.7、§6.8）
+    CellFieldG rad_E_old;   // ステップ初めの rad_E [erg/cm³]（FLD・S_N の時間差分と γ_r=4/3 圧縮の基準）
+    CellFieldG rad_dep;     // 物質が吸収した輻射エネルギー [erg]（セル×群、ステップ内の累積。FLD・S_N が publish）
+    CellFieldG rad_emit;    // 物質が放出した輻射エネルギー [erg]（同上）
     CellFieldG sn_diag_*;   // 1D S_N output-only plateau diagnostics（E pre/post, emission/absorption,
                             // clip rad/full deficit, opacity lag, angular first moment, face-flux E*, stream theta）[N_cell × G]
     FaceFieldG sn_face_flux_raw; // 1D S_N signed radial face flux [N_face × G], positive outward
@@ -268,40 +265,15 @@ struct State {
     CellField sn_tau_R;          // 2D_RZ S_N AP optical-depth diagnostic [N_cell]
     CellField sn_reduced_flux;   // 2D_RZ S_N AP reduced-flux diagnostic [N_cell]
     CellField sn_ap_alpha;       // 2D_RZ S_N AP alpha diagnostic [N_cell]
-    CellField difference_W; // optional difference reference weight W_i [dimensionless]
-    CellFieldG difference_E_ref;      // optional time-average reference density used by PR7 rad_E reconstruction [erg/cm³]
-    CellFieldG difference_residual_E; // optional signed residual density diagnostic [erg/cm³]
-    double* rad_mom_dep;    // 運動量沈着（診断、NUMERICS §7.8）[dyne·s/cm³]
-                            // 2D_RZ: [N_cell × 2]（R,Z成分）、1D_SPH: [N_cell × 1]（径方向のみ）
-                            // 現行コードにこの配列は無く、スナップショットにも出力しない
-                            // （退役した imc_ddmc 経路の値は history の mc/rad_momentum_deposition だけに残る）
-    int8_t* bc_type_rad;    // OWNED [4] deviceメモリ。輻射BC種別（面順: R_low,R_high,Z_low,Z_high）
-                            // 0=vacuum, 1=reflect, 2=marshak。BoundaryConfig 文字列から init() で変換（CUDA_KERNELS §6.0a R3 参照）
-    int8_t* ddmc_candidate; // OWNED [(n_cells+n_ghost) × G] deviceメモリ。DDMC候補フラグ（R2出力、§5.2規約準拠）
-    int8_t* ddmc_mode;      // OWNED [(n_cells+n_ghost) × G] deviceメモリ。transport mode 最終判定（R3出力）。
-                            // 0=IMC, 1=DDMC, 2=RW（legacy enum値。現行 PGRW 実装は 2 を生成しない）, 3=Diffusion（予約。PR1では生成しない）
-    double* face_current_prev; // IMC-owned [(n_cells+1) × G] 前ステップ signed face current [erg]。diffusion用
-    double* face_current_step; // IMC-owned [(n_cells+1) × G] 現ステップ signed face current [erg]。HOLO consistency residual でも使用
-    double* face_current_in;   // IMC-owned [(n_cells+1) × G] 現ステップ IMC→diffusion positive source [erg]
-    double* face_current_out;  // IMC-owned [(n_cells+1) × G] diffusion→IMC outgoing source [erg]
-    std::vector<uint8_t> holo_core_mask, holo_core_prev_mask; // LO material-coupling mask [N_cell]（legacy名）
-    CellFieldG holo_E_LO; // global HOLO low-order physical radiation energy density [erg/cm³];
-                          // persistent across steps; initialized to zero on allocation/resize
-    CellFieldG holo_consistency_source; // same-step HOLO corrector RHS source [erg/s]
-    CellFieldG holo_Prr;  // passive HOLO high-order radial pressure moment [erg/cm³]
-    CellFieldG holo_chi;  // passive HOLO Prr/E closure diagnostic [dimensionless]
-    CellFieldG holo_chi_filtered; // runtime filtered QD closure history [dimensionless]
-    CellFieldG holo_Prr_coverage; // passive HOLO Prr covered track-length fraction [dimensionless]
-    bool holo_lo_source_valid; // 現 radiation stage の LO source ownership が commit 済みなら true
-    bool holo_ale_invalidated; // ALE remap が LO closure を無効化済みなら true。次 HOLO solve で rad_E/LTE から再初期化
-    bool particle_sort_cache_invalidated; // ALE/mesh re-ID 後、次 census sort で cell_id order を再構築する
-    PhotonPool photons;     // IMC + DDMC 粒子プール（legacy enum として RW 値は保持）
+    bool holo_ale_invalidated; // ALE の再マップが輻射場の下の格子を動かしたとき（1D・2D）に立ち、FLD・S_N が格子に依存する
+                               // キャッシュを作り直して時間履歴を始め直してから下ろす（名前は退役した HOLO の名残）
+    // 退役したモンテカルロ輻射の状態（PhotonPool、DDMC のモード判定 ddmc_candidate/ddmc_mode、界面の face current、
+    // HOLO の holo_*、difference 定式化の difference_*、rad_E_tally、rad_mom_dep、bc_type_rad、ell_ddmc）は State に無い
+    // （2026-09-29 に最後の holo_*・difference_* を外した）。
 
     // --- Geometry cache（H7 compute_cell_geometry 出力、ステップ間保持）---
-    double* face_area;      // OWNED [(n_cells+n_ghost) × n_faces] 面面積 A_m [cm²]（§7.7.4, §7.3）。
-                            // n_ghost込み: R2/R3 がゴーストセルの face_area を参照（§5.2 規約準拠。H7 は n_cells のみ計算、ゴーストはハロー交換で充填）
+    double* face_area;      // OWNED [(n_cells+n_ghost) × n_faces] 面面積 A_m [cm²]
     CellField delta_l;      // 特性長 Δl = sqrt(A_cell) [cm]（H10 人工粘性、U4 CFL で使用）
-    CellField ell_ddmc;     // DDMC代表長 ℓ_i [cm]（NUMERICS §7.1.1: 2×min_f d_center→face。R2 DDMC判定で使用。delta_l とは異なる量）
 
     // --- Derived step-lifetime fields ---
     // Phase 間で保持が必要な中間量。State::allocate() で確保、チェックポイントでの保存は任意
@@ -382,143 +354,18 @@ independently.
 > LaserMesh のフィールド（`n_hat`, `Te`, `Zbar`, `grad_n_hat`, `deposit`）は
 > State.laser_dep への転写後に参照されない（NUMERICS §5.7.1）。
 
-### 5.3 PhotonPool（SoA粒子プール） [RETIRED — legacy IMC/DDMC particle pool]
+### 5.3 PhotonPool（SoA粒子プール）— 退役
 
-> **【RETIRED】** PhotonPool・ParticleEmigrant・ParticleMode（`0=IMC, 1=DDMC, 2=RW`）は IMC/DDMC Monte Carlo 粒子輸送専用のデータ構造であり **RETIRED**（FREEZE-1D-RAD・D1 以降）。現行の決定論 **FLD（NUMERICS §6.7, `mode="multigroup_diffusion"`）** / **\(S_N\)（§6.8, `mode="sn_transport"`）** は粒子プールを使わず、cell×group の `rad_E` 場を GPU 上で直接 solve する（ARCHITECTURE §4.5 の `Rad::FLD*`/`Rad::SNTransport*` 参照）。以下は歴史的参照。
-
-IMC/DDMC粒子をStructure-of-Arrays（SoA）で管理する。
-全フィールドは NUMERICS §12.3.4 の `ParticleEmigrant` と整合する。
-
-**粒子状態 enum**：
-
-```cpp
-// 粒子の輸送モード（IMC連続追跡 vs DDMC離散イベント）
-enum class ParticleMode : uint8_t {
-    IMC  = 0,   // IMCモード：連続的な幾何光学追跡（NUMERICS §6）
-    DDMC = 1    // DDMCモード：離散イベント処理（NUMERICS §7）
-};
-
-// 粒子の生死状態
-enum class ParticleStatus : uint8_t {
-    DEAD     = 0,   // 消滅済み（吸収、境界脱出、Russian roulette で除去）
-    ALIVE    = 1,   // 生存中（輸送継続）またはcensus保持（time_remain=0、次ステップで再処理）
-    OVERFLOW = 2    // PhotonPool 容量超過で処理できず（エラーフラグ §10.1 に報告）
-};
-```
-
-```cpp
-struct PhotonPool {
-    // --- 位置・方向（NUMERICS §0.4 準拠）---
-    double* pos_r;          // [capacity] R座標 [cm]
-    double* pos_z;          // [capacity] Z座標 [cm]（1Dでも3D方向追跡で使用、NUMERICS §0.4）
-    double* dir_r;          // [capacity] 方向ベクトル R成分 [dimensionless]
-    double* dir_z;          // [capacity] 方向ベクトル Z成分 [dimensionless]
-    double* dir_phi;        // [capacity] 方向ベクトル φ成分 [dimensionless]（RZ内部表現）
-
-    // --- スカラー量 ---
-    double* energy;         // [capacity] 粒子エネルギー [erg]
-    double* weight;         // [capacity] 統計重み
-    double* time_remain;    // [capacity] 残存時間 [s]
-    double* birth_energy;   // [capacity] 生成時エネルギー [erg]
-                            // Russian roulette/cutoff判定用（NUMERICS §6.3.4）
-                            // census粒子は前ステップの値を引き継ぐ
-    int8_t*  sign;          // [capacity] 粒子符号（+1 or -1）。legacy path は +1
-
-    // --- 識別子・状態 ---
-    uint64_t* global_id;    // [capacity] グローバル粒子ID（RNGストリーム識別用）
-    uint32_t* rng_counter;  // [capacity] cuRAND rng_counter（消費済み乱数数）
-                            // cuRAND state は curand_init(global_id ^ user_seed, step_number, rng_counter)
-                            // でカーネル冒頭に O(1) 復元（NUMERICS §12.7.1 準拠）。
-                            // 内部の Philox key/counter 写像は NVIDIA 実装に委ねる。
-                            // PhotonPool に保存するのは rng_counter（uint32）のみ
-    int32_t*  cell_id;      // [capacity] 所属セルID（**localインデックス**、0 ≤ cell_id < n_cells_local）
-                            // **チェックポイント注意**: 書き込み時は local → global 変換が必要。
-                            // **1D_SPH**: global = cell_id + cell_offset（PartitionInfo::cell_offset）
-                            // **2D_RZ**: local(i,j)=(cell_id/nz_local, cell_id%nz_local) →
-                            //   global = (i + ir_start) * nz_global + (j + jz_start)
-                            //   （単純な +offset では nz_local ≠ nz_global 時にストライド不整合）
-                            // 読み込み時は global → (i_g,j_g) → rank 特定 → local 変換。
-                            // rank数変更リスタートで local ID をそのまま使うと粒子が誤セルに配置される
-    uint16_t* group_id;     // [capacity] 群番号
-    uint8_t*  mode;         // [capacity] ParticleMode enum（上記参照）
-    uint8_t*  alive;        // [capacity] ParticleStatus enum（上記参照）
-
-    // --- プール管理（host側で管理、カーネル起動前に設定）---
-    int capacity;           // 確保済み要素数（全SoA配列の共通サイズ）
-    int n_alive;            // 現在のalive粒子数（compaction後に更新）
-    int n_census;           // census粒子数（前ステップからの引き継ぎ）
-
-    // compaction: Composite Key Sort（§5.4）で alive/dead 分離 + セルソートを一括実行
-    // （旧仕様の CUB DeviceSelect::Flagged は R7 に吸収済み、CUDA_KERNELS §6.0d 参照）
-    void* cub_temp;         // CUB一時バッファ（RadixSort + gather用）
-    size_t cub_temp_bytes;
-
-    // --- SoA ダブルバッファ（Composite Key Sort R7 用）---
-    // fused_soa_gather は src SoA → dst SoA へ permutation 付きコピーを行う。
-    // active_pool_index（0 or 1）が現在の読み取り元を示す。
-    // R7 完了後にフリップ: active_pool_index ^= 1。
-    // 全16フィールドの第2バッファ: pos_r_alt, pos_z_alt, ..., alive_alt
-    // 確保サイズ: 93 bytes × capacity
-    // CUDA_KERNELS §9 注記: active_pool_index のフリップは R7 完了イベント後のみ許可。
-    // R7b (ddmc_to_imc_resample) は gather 完了済みの dst 側を読み書きするため、
-    // R7→flip→R7b→R8/R9 の順序が必須。
-    int active_pool_index = 0;  // 0: primary SoA が active、1: alt SoA が active
-    // alt SoA ポインタ（primary と同一サイズ、State::allocate() で確保）
-    double* pos_r_alt;
-    double* pos_z_alt;
-    double* dir_r_alt;
-    double* dir_z_alt;
-    double* dir_phi_alt;
-    double* energy_alt;
-    double* weight_alt;
-    double* time_remain_alt;
-    double* birth_energy_alt;
-    int8_t*  sign_alt;
-    uint64_t* global_id_alt;
-    uint32_t* rng_counter_alt;
-    int32_t*  cell_id_alt;
-    uint16_t* group_id_alt;
-    uint8_t*  mode_alt;
-    uint8_t*  alive_alt;
-};
-```
-
-**容量管理**：
-- **初期容量**：`initial_capacity = min(particles_per_cell_group * n_local_cells * n_groups * 1.5, max_pool_size)`
-  - `×1.5` は census 粒子 + 新規 source 粒子の同時存在を見込む安全係数（NUMERICS §6.4 準拠）
-  - `max_pool_size` で上限制約（既定 10⁸。SPECIFICATION §6.4.5 参照）
-- **成長戦略**：census + 新規 source が capacity を超える場合、**2倍に拡張**
-  （全SoA配列を新領域に `cudaMemcpyAsync` でコピー）
-- **拡張手順**：`cudaStreamSynchronize` → 16本 `cudaMalloc(2×cap)` → `cudaMemcpyAsync` → sync → `cudaFree(old)` → ポインタ更新。カーネル間ギャップでのみ実行
-- **最大容量**：GPU メモリ予算（§5.6）の 60% を上限とする。
-  超過時は以下の段階的回復手順を実行（§5.6.4 メモリ不足対応と同一プロトコル）：
-    1. 緊急 Russian roulette：weight_cutoff を一時的に max(weight_cutoff×10³, 10⁻⁴) に引き上げ、全 alive 粒子に間引き判定を再実行
-    2. 1回で解消しない場合：w_survive を2倍、N_p を50%削減。最大3ステップまで繰り返し
-    3. 3ステップで未解消 → ERROR 停止
-- **1粒子あたりメモリ**：`5×8(pos/dir) + 4×8(energy/weight/time/birth) + 1(sign) + 8(global_id) + 4(rng_counter,uint32) + 4(cell_id) + 2(group_id) + 1(mode) + 1(alive) = 93 bytes`
-  （+ CUB temp per particle ≈ 4 bytes → 約 97 bytes/particle）
-- **チェックポイント時**（SPECIFICATION §7.4 準拠）：
-  `rng/rng_counter: uint32[N_p]` + `rng/global_id: uint64[N_p]` を保存。
-  リスタート時は `curand_init(global_id ^ user_seed, step_number, rng_counter)` で
-  RNG state を O(1) 復元する（NUMERICS §12.7.1）。
+モンテカルロ輻射の光子粒子プール（`PhotonPool`・`ParticleMode`・`ParticleStatus`・容量と成長の戦略）。2026-09-29 にコードとともに
+退役し、本節の記述を `retired/radiation_monte_carlo/docs/ARCHITECTURE_monte_carlo.md` へ移した。State に粒子プールは無い。
 
 ### 5.4 GPUレイアウト方針
 
 - 原則 **SoA**（coalesced access）：32スレッドが連続アドレスを読む
-- PhotonPool の alive compaction・セルソート・モード分離は **Composite Key Sort**（NUMERICS §6.5、CUDA_KERNELS §0.5）で一括実行：
-  合成キー生成 → CUB RadixSort → Fused SoA Gather の3サブステップで、
-  dead粒子除去 + cell\_id順ソート + IMC/DDMC分離を単一パスに融合
-- 1D Lagrangian mesh 後の finite-position 粒子 cellId 再同定は
-  `radiation/particle_reid.cu` が担当する。kernel は `PhotonPool::cell_id` のみを更新し、
-  DDMC/NaN sentinel 粒子を保持する。coupling driver は re-ID 後に
-  `particle_sort_cache_invalidated` を立て、次の radiation operator の
-  sort/partition が stale cell order を使わないようにする
-- **実行タイミング**：Radiation演算子冒頭、ソース粒子投入後。dead粒子は前ステップから遅延除去される
-- タリー集約は §4.5 `Rad::Tally` 準拠。v1.0 では Stage 1（warp-level `__match_any_sync` 集約）
-  + Stage 3（global atomicAdd）を使用。shared memory 不使用（レジスタのみ）
+- （退役したモンテカルロ輻射の粒子のソート・compaction・再同定・タリー集約の方針は §5.3 と同じく
+  `retired/radiation_monte_carlo/docs/ARCHITECTURE_monte_carlo.md` へ移した）
 
 > **SoAスコープの明確化**：
-> - PhotonPool は SoA レイアウト（§5.3で定義済み）
 > - Field<> は各物理量が独立した連続配列として格納されるため、実質的に SoA 相当
 > - したがって AoS→SoA 変換は不要（設計時点で SoA を採用済み）
 > - M15以降の性能最適化ではカーネルチューニング・メモリアクセスパターン最適化に注力
@@ -532,11 +379,9 @@ struct Scratch {
 
     // 初期化時に全演算子の最大必要量を調査し、maxで確保
     // 主な使用者：
-    //   - CUB RadixSort (Composite Key Sort)        : ~24 * n_particles bytes
     //   - CUB reduction (エネルギー収支)            : ~256 bytes
     //   - Kershaw 9点ステンシル係数一時配列          : ~9 * n_cells * 8 bytes
     //   - ALE Jacobi反復の中間ノード座標            : ~2 * n_nodes * 8 bytes
-    //   - 粒子ソート用一時配列 (CUB RadixSort)     : ~key_size * n_particles bytes
     //   - vol_old (PdV work用体積スナップショット)  : ~n_cells * 8 bytes
     //   - v_r_old, v_z_old (速度スナップショット)  : ~2 * n_nodes * 8 bytes
     //   - x_r_old, x_z_old (座標スナップショット)  : ~2 * n_nodes * 8 bytes
@@ -596,9 +441,8 @@ struct ScratchRequirement {
 //   static ScratchRequirement Conduction::scratch_requirement(const Config& cfg);
 //   static ScratchRequirement ALE::scratch_requirement(const Config& cfg);
 // 初期化時に全モジュールの max(bytes) を確保し、Scratch::buffer に割り当て
-// 典型値 (80K cells, 10M particles, G=16):
-//   CUB RadixSort temp ≈ 24×N_p ≈ 240 MB (dominant), SoA double buffer ≈ 92×N_p ≈ 920 MB,
-//   CUB prefix_sum ≈ 10 MB, Kershaw ≈ 5.8 MB, ALE ≈ 1.3 MB
+// 典型値 (80K cells, G=16): CUB prefix_sum ≈ 10 MB, Kershaw ≈ 5.8 MB, ALE ≈ 1.3 MB
+// （モンテカルロ輻射の粒子ソート用の CUB RadixSort temp ≈ 24×N_p と SoA double buffer ≈ 92×N_p は 2026-09-29 に退役）
 ```
 
 ### 5.6 GPU実行モデル
@@ -609,13 +453,8 @@ struct ScratchRequirement {
 |------------|-----------|-------------------|-----------|------|
 | cell-based（Hydro, EOS, Tally集約） | **256** | `(256, 4)` | `(n_cells + 255) / 256` | レジスタ <32、occupancy ≥75%。CUDA_KERNELS §2 |
 | node-based（座標更新, 加速度） | **256** | `(256, 4)` | `(n_nodes + 255) / 256` | CUDA_KERNELS §2.2 |
-| particle-based IMC（Persistent Warp） | **128** | `(128, 8)` | `n_sm × 8`（固定、SM数依存） | ~60 reg/thread、50% occupancy。NUMERICS §6.6、CUDA_KERNELS §6.4 |
-| particle-based DDMC（History-based） | **128** | `(128, 16)` | `(n_ddmc + 127) / 128` | ~30 reg/thread、100% occupancy。CUDA_KERNELS §6.5 |
 | ray-based（Laser ray trace） | **64** | `(64, 16)` | `(n_rays + 63) / 64` | ~40-46 reg、warp発散対策でblock小。CUDA_KERNELS §5.2 |
 | Kershaw stencil build | **256** | `(256, 2)` | `(n_cells + 255) / 256` | ~45 reg、compute-bound で occupancy 低下を許容。CUDA_KERNELS §4.2 |
-| source R4/R5（エネルギー計算+prefix-sum） | **256** | `(256, 4)` | `(n_cells * G + 255) / 256` | cell-based、NUMERICS §6.2、CUDA_KERNELS §6.2-§6.3 |
-| source R6（体積ソース fill） | **128** | `(128, 8)` | `(n_new_particles + 127) / 128` | particle-based、CUDA_KERNELS §6.3 |
-| source R13（Marshak境界ソース） | **128** | `(128, 8)` | `(n_marshak + 127) / 128` | particle-based、Marshak BC適用時のみ。CUDA_KERNELS §6.0h |
 | pack/unpack（ハロー交換） | **256** | — | `(n_halo + 255) / 256` | メモリバウンド、レジスタ少。CUDA_KERNELS §1.7 |
 
 > **`__launch_bounds__` の役割**：コンパイラにレジスタ割り当て上限を伝え、指定した
@@ -642,75 +481,21 @@ struct StreamManager {
 - v1.0では **3ストリーム**：compute, comm, utility
 - **計算-通信オーバーラップ**（NUMERICS §12.5.5 準拠）：
   - **v1.0既定**：逐次実行（overlap なし）。`cudaStreamSynchronize(compute)` 後に comm 開始
-  - **Phase B**（`Parallel.gpu_optimization.compute_comm_overlap=True` で有効化）：
+  - **Phase B**（設計のみ。有効化の設定だった `Parallel.gpu_optimization.compute_comm_overlap` は受理して無視される）：
     1. 内部セル（ゴースト非依存）のカーネルを compute ストリームで起動
     2. 同時に境界セルのハローパック → MPI通信 → ハローアンパックを comm ストリームで実行
     3. 両ストリーム同期後、境界セル（ゴースト依存）のカーネルを compute ストリームで起動
-  - **適用可能演算子**：Hydro（コーナー力）、Conduction（Kershaw/tridiag）、Radiation（Fleck/mode judge等のセルベースカーネル）
-  - **適用不可**：粒子輸送カーネル（任意セル横断のため内部/境界分割が困難）、Laser（全rank複製でハロー交換なし）
+  - **適用可能演算子**：Hydro（コーナー力）、Conduction（Kershaw/tridiag）、Radiation（セルベースのカーネル）
+  - **適用不可**：Laser（全rank複製でハロー交換なし）
   - **セル分類**：初期化時に `uint8_t cell_zone[n_cells]` を生成（0=内部、1=境界）。
     Kershaw 9点ステンシルの近接1層要件に基づき、MPI区画境界から1層以内の所有セルを境界セルとする（ghost_layers=1 前提）
   - **性能見積もり**：4 GPU時、ステップあたり ~1.2 ms の隠蔽（2–3% 改善）。
     GPU数増加で通信時間が支配的になるため、効果は相対的に増大する
 
-#### 5.6.3 Persistent Warp 実行モデル
+#### 5.6.3 Persistent Warp 実行モデル — 退役
 
-> **[RETIRED — legacy IMC 輸送の persistent-warp 実行モデル（NUMERICS §6.6 と同系）。現行輻射 FLD/S_N はこのモデルを使用しない]**
-IMC輸送カーネル（R8）は **Persistent Warp** モデルで実行する（NUMERICS §6.6）。
-
-**グリッドサイズ決定**：
-```cpp
-int n_sm;
-cudaDeviceGetAttribute(&n_sm, cudaDevAttrMultiProcessorCount, device_id);
-int grid_size = n_sm * 8;  // __launch_bounds__(128, 8) → 8 blocks/SM
-// A100: 108 SM × 8 = 864 blocks × 128 threads = 110,592 persistent threads
-```
-
-**Work Queue**：
-```cpp
-struct PersistentWorkQueue {
-    int* global_counter;    // [1] atomicカウンタ（device memory）
-    int  n_total;           // IMC粒子総数（R7 composite_sort_and_partition後、CUDA_KERNELS §0.5）
-    // 終了判定: acquired_index >= n_total のとき、当該レーンは inactive
-    // 全レーンが inactive (ballot == 0) でワープ終了
-    // 全ワープ終了で grid 終了 (cooperative groups 不要)
-};
-```
-- `global_counter` は `imc_transport_persistent` 起動前に `cudaMemsetAsync(..., 0)` で初期化
-- ワープ単位で32粒子ずつ取得（atomicAdd頻度を最小化）
-- 粒子補充時は `__ballot_sync` + `__popc` で空きレーン数を計算し、一括取得
-- **終了判定**：leader lane（lane 0）が `atomicAdd(global_counter, n_needed)` で取得した base index を `__shfl_sync` で全レーンにブロードキャスト。各レーンは `base + lane_offset` が `n_total` 以上になったら inactive（CUDA_KERNELS §6.4 Ballot Refill 参照）。
-  `__ballot_sync(0xFFFFFFFF, active)` でワープ内の active レーン数を監視し、
-  全レーンが inactive（ballot == 0）になったらワープ終了。grid 全体の同期は不要
-
-**PhotonPool SoA との統合**：
-- Persistent Warp はパーティクルプールの **IMC部分** のみを処理する
-- Composite Key Sort（NUMERICS §6.5、CUDA_KERNELS §0.5）で IMC粒子を SoA 先頭に配置済み
-- 粒子のload/storeは通常のSoAアクセスと同一（追加バッファ不要）
-- 粒子終了時にSoAに書き戻し、新粒子をSoAからロード
-
-**IMC/DDMCモード分離**：
-Persistent Warp の導入により、active transport mode は IMC / DDMC の2値である。
-`TransportMode::RW` は後方互換/予約のため残し、`TransportMode::Diffusion` は
-post-radiation coupling と diagnostics のための cell-map 値として使うが、
-現行 PGRW 実装は `imc_transport_persistent` 内の internal branch であり、
-hybrid diffusion 分類セルも transport kernel では IMC/guard 扱いまたは deterministic `diff_E_` 扱いのため、粒子を独立 RW/Diffusion スライスへ分離しない。実行順序は：
-1. `Radiation.diffusion.enabled=True` かつ 1D_SPH では、分類・entry/exit 表現変換後に `diffusion_source_solve_cuda(dt/2)` を実行し、thermal emission は diffusion cell を skip する
-2. `composite_sort_and_partition`（R7）で dead除去 + セルソート + セルモード→粒子モード同期 + IMC/DDMC分離を一括実行
-3. `imc_transport_persistent`（Persistent Warp）で IMC 粒子 [0..n\_imc-1] を処理
-   ここで `tau_rw>0` かつ 1D_SPH 条件を満たす粒子だけ PGRW branch に入る。destination cell が diffusion cell の boundary crossing は packet を kill し、`face_current_in` と `face_current_step` に tally する
-4. `ddmc_event_loop`（History-based）で DDMC 粒子 [n\_imc..n\_imc+n\_ddmc-1] を処理
-5. `Radiation.diffusion.enabled=True` かつ 1D_SPH では、`deterministic_diffusion_step_1d()` で `diff_E_` を RKL2 更新し、`face_current_in` を source として取り込む。続けて `spawn_imc_from_diffusion_faces()` が diffusion-IMC interface の `face_current_out` を計算し、同量の IMC packet を adjacent IMC cell に生成する
-6. DDMC/RW→IMC または diffusion-interface spawn が発生した場合のみ tail `imc_transport_persistent` を追加実行する。tail 中に diffusion へ戻った packet energy は tail 後に `diff_E_` へ直接加算する
-   ただし `ddmc.implicit_diffusion=True` かつ Phase-1 対応条件では、
-   この段階を `solve_ddmc_diffusion_1d()` に置き換え、DDMC 粒子スライスは破棄する
-7. diffusion 有効時は後段の `diffusion_source_solve_cuda(dt/2)` を実行し、finalization では diffusion cell の `rad_E` に `diff_E_` を書き込む
-
-**根拠**：
-- IMC（~60 reg）と DDMC（~30 reg）のレジスタ要件が大きく異なる
-- 分離により DDMC は `__launch_bounds__(128, 16)` で 100% occupancy を達成
-- Persistent Warp のwork queueはIMC粒子数のみを対象とし、DDMC粒子は含まない
-- ICF問題ではDDMCセルが空間的に集中するため、Composite Key Sortのモード分離は効率的
+IMC 輸送カーネル（R8）の実行モデル（NUMERICS §6.6）。2026-09-29 に退役し、本節の記述を
+`retired/radiation_monte_carlo/docs/ARCHITECTURE_monte_carlo.md` へ移した。
 
 #### 5.6.4 GPUメモリ予算
 
@@ -725,11 +510,7 @@ State fields:
   cell×mat fields (volFrac)                :  1 × 80K × 2 × 8B  =  1.3 MB
   node fields (x_r, x_z, v_r, v_z)        :  4 × 80.6K × 8B    =  2.6 MB
   laser_dep [N_cell]                        :  1 × 80K × 8B      =  0.6 MB
-  rad_mom_dep [N_cell × 2]                  :  1 × 80K × 2 × 8B  =  1.3 MB
-  --- State subtotal                                              ~ 32 MB
-
-PhotonPool (100 particles/cell/group):
-  80K × 16 × 100 × 93B                                          ~11.9 GB
+  --- State subtotal                                              ~ 31 MB
 
 LaserMesh (128×256):
   5 fields × 129 × 257 × 8B                                     ~  1.3 MB
@@ -741,26 +522,18 @@ EOS/Opacity tables (device):
   --- EOS/Opacity subtotal                                       ~  9 MB
 
 CommBuffers + Scratch:
-  halo + emigrant + scratch                                      ~ 50 MB
+  halo + scratch                                                 ~ 50 MB
 
---- 典型合計                                                      ~12.4 GB
+--- 典型合計（この表の項目）                                       ~ 0.1 GB
 ```
 
-> **粒子数がメモリ支配的**：PhotonPool が全体の 95%+ を占める。
-> `particles_per_cell_group` の設定がメモリ使用量を決定する。
-> **ピーク時メモリ**（Composite Key Sort 中）：pool (92N) + double buffer (92N) + comp_key/perm (8N) + CUB temp (24N) = **216 bytes/particle**。
-> 定常時は pool (92N) + CUB temp 分の Scratch ≈ **96 bytes/particle**。
-> A100 (80GB) では定常 ~500M、**ピーク ~350M** 粒子が上限目安。
-> V100 (32GB) では定常 ~200M、**ピーク ~140M** 粒子が上限目安。
-> `max_pool_size` は定常値ではなくピーク値で設定すること。
+（FLD・\(S_N\) の作業配列（群ごとの係数・三重対角系・\(S_N\) の角度束など）はこの表に含まない。退役したモンテカルロ輻射では
+光子粒子プールが全体の 95% 以上を占めていた（100 粒子/セル/群で ~12 GB）— その見積もりは
+`retired/radiation_monte_carlo/docs/ARCHITECTURE_monte_carlo.md` へ移した。）
 
 **メモリ不足時の対応**：
 1. `State::init()` で `cudaMemGetInfo` により空きメモリを取得
 2. 推定使用量が空きの 85% を超える場合、警告を出力
-3. PhotonPool の initial_capacity を空きメモリに収まるよう自動縮小
-4. **縮小後もピーク推定（216 B/particle × capacity + 固定フィールド + Scratch）が空きの 95% を超える場合は ERROR 停止**（初期化時に OOM を検出。ランタイムのnondeterministic abortを防止）
-5. 実行中に PhotonPool 拡張が不可能な場合、緊急 Russian roulette を発動する（NUMERICS §6.4）：
-   \(w_{cutoff}\) を一時的に \(\max(w_{cutoff} \times 10^3,\; 10^{-4})\) に引き上げ、全 alive 粒子に対して間引き判定を再実行して粒子数を抑制する
+（退役したモンテカルロ輻射には、粒子プールの初期容量の自動縮小・ピーク推定による停止・緊急 Russian roulette の手順もあった。）
 
 ---
-

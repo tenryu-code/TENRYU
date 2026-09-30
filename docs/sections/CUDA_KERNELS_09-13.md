@@ -1,7 +1,22 @@
 <!-- 分割元: docs/CUDA_KERNELS.md | このファイルは参照用です。原本（docs/CUDA_KERNELS.md）が権威です。 -->
 ## 9. カーネル起動シーケンス（1タイムステップ）
 
-> **【状態注記 2026-07-10】** 本節の Radiation phase（R2/R6/R7/R7b/R8/R9/R12、粒子 MPI P5/P6、ダブルバッファ遷移）は**退役 imc_ddmc の起動列**（歴史的仕様）。現行 FLD/S_N の放射 phase の起動列は各ソルバ実装（src/radiation/fld_*_gpu.cu / sn_*_gpu.cu、NUMERICS §6.7/§6.8）を正とする。Hydro/Conduction/Laser の phase 構造と単一 compute_stream 方針は現行。
+> **【状態注記 2026-07-10、2026-09-29 更新】** 本節は設計時の起動列で、実装の正は `src/coupling/driver.cpp` の
+> ステップと各演算子のソース（カーネル名は §1.0）。とくに次の点が実装と違う：
+> - Radiation phase（Phase 4）は現行の入口だけを書いた。以前ここにあったモンテカルロ輻射の起動列（R2/R6/R7/R7b/R8/R9/R12、
+>   粒子 MPI P5/P6、ダブルバッファ遷移）は 2026-09-29 に `retired/radiation_monte_carlo/docs/CUDA_KERNELS_monte_carlo.md` へ移した。
+>   現行 FLD/S_N の起動列は §6.7/§6.8 と各ソルバ（`fld_*_gpu.cu`・`sn_*_gpu.cu`）。Phase 0・3-post・5・6 に残る
+>   `rad_E_tally`・`E_escape[G]`・`rad_mom_dep`・`mmatrix_fix_count`、R1・U9 のための EOS 再クロージャ、U7（粒子のセル再同定と
+>   hash grid）、`E_census`、`dt_rad` はモンテカルロ輻射の設計で、実装に無い
+> - Laser phase：L1 `laser_mesh_map`・L2 `compute_density_gradient`・L5 `deposit_lm_to_hydro`・`laser_cache_update` は無い。
+>   1D は `map_from_hydro_1d`（§5.1 の写像カーネル）→ 光線追跡（既定は特性線法、§5.2）が流体セルへ直接沈着 →
+>   host の再配分（`apply_deposit_redistribution_1d`）→ host の省略キャッシュ更新（`RaytraceSkipCache::update_cache`）
+> - H1 `hydro_active_update` は host のループ、U2 `floor_clamp`・U5 `nan_check`・U8 `compute_zbar` は存在しない
+>   （床は各演算子の中、非有限値の検査は `driver_safety_audit.cu` の段の前後の集約、\(\bar Z\) は §7.6 の注記）
+> - fixed の \(\bar Z\) はステップごとに更新しない（下の U8 の「fixed + n_mat>1: 毎ステップ実行」は設計時の記述）
+> - H13/H14 `eos_forward`/`eos_inverse` は無く、表 EOS は各カーネルが §2.4x の device 関数を直接呼ぶ
+>
+> 単一 compute_stream の方針と phase の順序（流体 → 伝導 → レーザー → 輻射 → …）は現行。
 
 1つの Strang splitting ステップ `t^n → t^{n+1}` における全カーネルの実行順序。
 `[SYNC]` はストリーム同期、`[MPI]` はMPI通信を示す。
@@ -10,19 +25,7 @@
 CUDA ストリームのFIFO保証により、同一ストリーム内のカーネル間 RAW/WAR/WAW 依存は
 暗黙に満たされる。`[SYNC]` は D2H 転送やホスト判定が必要な箇所にのみ挿入する。
 **将来 multi-stream 化する場合**、以下の重要 RAW 依存に `cudaEventRecord/WaitEvent` が必要：
-- Phase 4 init (`cudaMemsetAsync`) → R2（ddmc_mode ゼロ初期化）, R8/R9/R12（rad_dep, rad_E_tally はゼロ状態を前提に atomicAdd）
-- R7 `fused_soa_gather` → **R7b** `ddmc_to_imc_resample` → R8/R9（SoA ダブルバッファ所有権遷移。R7b は R7 が gather 完了した pos/dir を読み書きするため、R7→R7b→R8 の順序が必須。active_pool_index のフリップは R7 完了イベント後のみ許可）
-  **ダブルバッファ状態遷移**（ステップ内）:
-  1. 第1R7: gather(src→dst), flip(active=dst) → R8/R9 は dst を読み書き
-  2. P5: dst を読み取り emigrant 抽出
-  3. P6: dst に immigrant 追記
-  4. 第2R7: gather(dst→src), flip(active=src) → 次ステップの第1R7 は src を読み取り
-  **注**: N_alive_post_mpi==0 で第2R7がスキップされた場合、active_pool_index は dst のまま残る。
-  次ステップの第1R7 は `active_pool_index` 変数が指すバッファから gather する（固定の "src" ではない）。
-  実装は `src = pool[active_pool_index], dst = pool[1 - active_pool_index]` とし、各 R7 完了後に flip する。
 - L5 `deposit_lm_to_hydro` → U1 `source_injection`（laser_dep）
-- R8/R9/R12 → U1（rad_dep）
-- MPI `Waitall` → P6 `immigrant_unpack_merge`（recv_buf H2D 完了保証）
 
 ```
 ═══════════════════════════════════════════════════════
@@ -31,7 +34,7 @@ CUDA ストリームのFIFO保証により、同一ストリーム内のカー�
   H1:  hydro_active_update
   U8:  compute_zbar                    // Z̄/A_eff 更新。実行条件:
                                        //   thomas_fermi / tabular: 毎ステップ実行（Z̄ が ρ, Te に依存）
-                                       //   fixed + n_mat>1: 毎ステップ実行（Z̄_eff, A_eff が volFrac に依存、ALE後に変化）
+                                       //   fixed + n_mat>1: （設計時）毎ステップ実行。実装は初期化時だけで、ステップごとには更新しない
                                        //   fixed + n_mat==1: Phase 0 ではスキップ（定数、ARCHITECTURE §8 Step 9b で初期化済み）
                                        // Conduction(C1), Laser(L1), Radiation(R1) が Z̄ を参照するため
                                        // ステップ冒頭で最新化する（NUMERICS §1.1.4, ARCHITECTURE §5.2）
@@ -241,251 +244,15 @@ CUDA ストリームのFIFO保証により、同一ストリーム内のカー�
   [Host: T_max_n = max(Te_max_device, T_boundary)]  // Phase 4 overshoot 検出の基準値
 
 ═══════════════════════════════════════════════════════
- Phase 4: Radiation R(Δt) — 最も計算量が大きい
-                               // radiation.enabled=False の場合は Phase 4 全体をスキップ（rad_dep=0, dt_rad=∞）
+ Phase 4: Radiation R(Δt)
 ═══════════════════════════════════════════════════════
-  if (!radiation.enabled): goto Phase 5  // PhotonPool/opacity テーブル未確保時のアクセス防止
-  --- pre-radiation 準備 ---
-  [MPI] halo_exchange(Te, rho, zbar, vol, ell_ddmc)      // double scalar stride=1
-  [MPI] halo_exchange(volFrac[n_mat])                    // double stride=n_mat（多材料混合則用）
-  [MPI] halo_exchange(face_area[n_faces])                // double stride=n_faces（R2/R3用）
-                                                // NUMERICS §12.2.2 行7：U9 がゴーストセルの opacity を計算するために必要
-                                                // volFrac: 多材料時に U9 の混合則計算でゴーストセル体積分率が必要
-                                                // vol, face_area, ell_ddmc: R2/R3 がゴーストセルを処理するため必要（H7 出力は n_cells のみ）
-  U9:  compute_opacities               // ARCHITECTURE §4.7：σ_a,σ_R,σ_t 前計算（R1 の入力）
-  // 注: R8 の compute_P_hat は面別代表長 Δx_m = vol[c] / face_area[c,f] を
-  //     crossing_face から **インラインで** 算出する（§6.4 疑似コード参照）。
-  //     セル平均 delta_x の事前計算は不要。R2 は ell_ddmc（H7出力）を使用する。
-  --- per-step カウンタ/タリー初期化 ---
-  cudaMemsetAsync: source_total=0, count_imc=0, count_ddmc=0,
-    global_work_counter=0, emigrant_count=0, per_dest_count[8]=0,
-    laser_dep[n_cells]=0,           // U1 二重計上防止（Phase 3 の laser_dep が Phase 4 U1 で再加算されないよう）
-    rad_dep[n_cells×G]=0, rad_E_tally[n_cells×G]=0,   // rad_dep: R4b/R8/R9/R12 がatomicAdd/writeする沈着先（R10は使用しない）
-    rad_mom_dep[n_cells×dim]=0,                       // R8/R9 が atomicAdd する運動量沈着先（NUMERICS §7.8、ARCHITECTURE §5.2）
-    E_escape[G]=0,
-    ddmc_candidate[(n_cells+n_ghost)×G]=0,  // R2 は candidate=1 のみ書き込み、非候補に 0 を明示書きしないためゼロ初期化必須
-    ddmc_mode[(n_cells+n_ghost)×G]=0,  // R3が書く前にゼロ初期化（R2は ddmc_candidate を出力、R3が ddmc_mode を最終確定。ゴーストセル含む。純IMC時も安全）
-    leak_coeff_face[n_cells×n_faces×G]=0,  // R3 は ddmc_candidate==1 セルのみ書き込み。非候補セルの stale 値を防御的にゼロ初期化
-    leak_total_int[n_cells×G]=0,            // 同上。R3 が非候補セルに書き込まないため
-    leak_total_bdry[n_cells×G]=0            // 同上
-    // 注: E_floor_injected, clamp_count, E_numerical_loss は Phase 0 で初期化済み（Phase 1-3 の U2/U1 が累積するため、Phase 4 では初期化しない）
-  R1:  compute_fleck_factor
-  if (cfg.radiation.ddmc_enabled):          // 純IMC構成（ddmc_enabled=False）ではR2/R3/R3bをスキップ
-    [MPI] halo_exchange(f_fleck)         // R2 がゴーストセルの f_fleck を参照するため必要（R1 は n_cells のみ計算）
-    R2:  ddmc_mode_judge (ω, τ, P制約でDDMC候補を抽出)
-    --- R3 前処理: リーク係数の入力準備 ---
-  if (leak_stencil == "9_kershaw"):
-    // C2 を D_g = 1/(3σ_{R,g}) で G 回呼び出し → stencil[(n_cells+n_ghost) × 9 × G]
-    // **ゴーストセル含む**: R3 パスA がゴーストセルを処理するため、C2 もゴーストセル含みで起動
-    // apply_mmatrix_repair=False（R3 が修復前 raw 係数で M-matrix 判定を行うため）
-    // **注**: C2 出力は 9点係数（k=0:C, k=1-8:off-diag）。R3 は indices 1-8 のみ使用（center は無視）
-    for g in 0..G-1:
-      C2: kershaw_stencil_build(D_g=1/(3σ_{R,g}), apply_mmatrix_repair=False, grid=((n_cells+n_ghost)+255)/256) → stencil[...,g]
-  elif (leak_stencil == "4"):
-    // face_sigma_R 生成（R3 "4" 前処理）:
-    //   内部面: owner/neighbor セルの σ_R_cell から face-average を構築
-    //   境界面: owner セルの σ_R_cell をそのまま使用
-    //   入力: sigma_R[(n_cells+n_ghost) × G]（U9 出力）
-    //   出力: face_sigma_R[(n_cells+n_ghost) × n_faces × G]
-    //   block=256, grid=((n_cells+n_ghost)+255)/256（ゴーストセル含む）
-    compute_face_sigma_R → face_sigma_R[(n_cells+n_ghost) × n_faces × G]
-  R3:  ddmc_leak_coeff_kershaw（"9_kershaw"）/ ddmc_leak_coeff_face（"4"）（リーク係数計算 + M-matrix判定 + ddmc_mode最終確定）
-       // "9_kershaw" は geometry==2D_RZ のみ（NUMERICS §7.3.3, Appendix A）。1D_SPH は "4" を使用。
-       // leak_stencil の妥当性は namelist validation で保証済み（SPECIFICATION §6.4）。
-  R3b: ddmc_interface_correct (DDMC-IMCインターフェースセルのリーク修正。R3でddmc_modeが確定した後に起動。§7.3.5)
-  if (cfg.radiation.imc.difference.enabled && LTE nonlinear source path):
-    [Host/GPU] compute/load E_ref_start = W * a_eV * Te^4 * b_g(Te)
-    [Host] PR5 census residualization:
-      U_phys_old = U_ref_old + Σ_p sign_p E_p
-      target residual = U_phys_old - E_ref_start * V
-      scale/rebuild existing census bins exactly; create one residual particle for empty nonzero bins
-    R4b: preseed_reference_absorption   // rad_dep += c * sigma_a_eff * E_ref_start * V * dt
-    if (difference.face_transport):
-      R4c: reference_face_transport_1d   // deterministic ΔU_ref_face → U_ref_end/E_ref_avg; no rad_dep write
-      [D2H] U_ref_end → previous-reference reservoir
-  R4:  compute_source_energy            // legacy: source_E=cσB Vdt; difference PR4: source_E=cσ(B-E_ref)Vdt; source_total=Σ|source_E| (device atomicAdd)
-  [SYNC] → [D2H] source_total          // R5 のホスト起動引数に必要
-  [MPI] MPI_Allreduce(SUM, source_total) → source_total_global  // E_avg = source_total_global / N_p_global（R8/R12 のRussian roulette閾値がランク間で一致するため必要）
-  R5:  source_particle_count(source_total) → CUB ExclusiveSum → offset[n_cells×G+1]
-  [SYNC] → [D2H] n_new_particles       // = offset[n_cells×G]（prefix sum末尾値。R6/R13 のグリッドサイズに必要）
-  [MPI] MPI_Allreduce(SUM, n_new_particles) → N_p_global  // E_avg = source_total_global / N_p_global
-  [Host: E_avg = (N_p_global > 0) ? source_total_global / N_p_global : T_floor * eV_to_erg]
-  // 分母ゼロガード（NUMERICS §6.3.4）: ソース粒子なし → E_avg = T_floor×eV_to_erg
-  // この場合 Russian roulette は事実上不活性（census由来粒子は E ≫ w_cutoff × E_avg）
-  [Host: n_marshak_total = cfg.radiation.boundary.marshak_particles]  // namelist 由来の定数（NUMERICS §8.2, ARCHITECTURE §4.5.2）。MPI分配前の全ランク合計値
-  [Host: pool capacity check]          // n_alive + n_new_particles + n_marshak_total > pool_capacity の場合、
-                                        // cudaMalloc でプール拡張（NUMERICS §6.3.1）。
-                                        // n_marshak_total（全ランク合計）で保守的に検査。per-rank 分配は後段で算出。
-                                        // R6/R13 が OOB 書き込みしないことをホスト側で保証する。
-                                        // pool_capacity は 1.5 × 初期容量 で確保し、不足時は 2倍拡張
-  // --- Marshak 粒子数配分（並列時：NUMERICS §8.2 step 2 + §12.5 準拠）---
-  // **重要**: n_marshak_local は MPI_Exscan の入力に必要なため、Exscan より前に算出すること。
-  // [Host: A_local = Σ_{owned faces f} face_area[f] for Marshak BC faces]
-  // [MPI] MPI_Allreduce(SUM, A_local) → A_global  // 全Marshak面の面積合計（並列時に必須）
-  // [Host: if (A_global <= 0.0) { n_marshak_local = 0; skip N_f calculation below }]
-  // [Host: N_f = round(N_total × A_f / A_global) for each owned face f]
-  // [Host: n_marshak_local = Σ_f N_f]  // R13 グリッドサイズ＋MPI_Exscan の入力
-  // 単一GPU（n_ranks==1）の場合は MPI_Allreduce をスキップし A_global = A_local。
-  // Marshak BC が存在しない場合（全面が vacuum/reflect）は A_global=0, n_marshak_local=0。
-  [MPI] MPI_Exscan((int64_t)(n_new_particles + n_marshak_local), MPI_INT64_T, SUM) → rank_offset  // int64_t 必須（2K+ GPU × 1M粒子/GPU で int32 オーバーフロー）
-  // **MPI_Exscan 注意**: rank 0 の recvbuf は MPI 規格で未定義。
-  // 実装必須: `if (rank == 0) rank_offset = 0;`。
-  // 単一GPU（n_ranks==1）の場合は MPI_Exscan をスキップし rank_offset=0。
-  [Host: step_base = (uint64_t)step * N_max_per_step]  // N_max_per_step = 2^40。Census粒子との global_id 衝突回避（NUMERICS §12.7.1）
-  [Host: global_id_base = step_base + rank_offset]      // global_id = global_id_base + local_index（local_index = 0..N_emit-1）
-  if (n_new_particles > 0):                              // ゼロ粒子時はカーネル起動をスキップ
-    R6:  source_particle_fill(grid=(n_new_particles+127)/128)  // global_id_base を引数に渡す
-  if (n_marshak_local > 0):                              // Marshak BC 非適用ランクではスキップ
-    R13: marshak_source (id_offset = global_id_base + n_new_particles)
-       // R13 の global_id = id_offset + local_thread_idx（R6 と ID 空間が重複しない）
-       // RNG: curand_init offset=0 で初期化。カーネル終了時に rng_counter を消費済み draw 数に更新（§6.0h 準拠）
-  // --- E_Marshak_in 診断（U3 §7.2 エネルギー収支に必要）---
-  // 方式: **解析計算**（ホスト側）。R13 粒子は (a_eV c/4) T_{r,f}⁴ A_f dt / N_f のエネルギーで生成され、
-  //        Σ_p E_p = Σ_f (a_eV c/4) T_{r,f}⁴ A_f dt が保証されるため（NUMERICS §8.2）、
-  //        CUB Sum は不要。ホストが namelist 定数から直接計算する:
-  //        E_Marshak_in = Σ_f (a_eV × c / 4) × T_{r,f}⁴ × A_f × dt（NUMERICS §10.2）
-  注: M5の純IMC構成では R2/R3/R3b は無効化し、R4-R6 はIMCソース生成として使用する。DDMC拡張はM6で有効化。
-       純IMC時は ddmc_mode[(n_cells+n_ghost)×G] を全ゼロ初期化（cudaMemsetAsync、上記初期化ブロック）し、
-       R7 の composite key 生成で全粒子が mode=IMC として分類されることを保証する。
-
-  --- Composite Key Sort（§0.5：R7 = 旧R7+R11+R14 融合）---
-  [Host: N_total = n_census + n_new_particles + n_marshak_local]  // n_census = 前ステップから生存した粒子数（R7 ソート結果の n_alive、step 0 では 0）
-  // **N_total==0 ガード**: census=0 かつ n_new_particles=0 かつ n_marshak=0 の場合、
-  // R7 全サブステップをスキップし count_imc=count_ddmc=0 を設定する。
-  // CUB RadixSort は size=0 で呼び出すと未定義動作の可能性があるため、ホスト側でガードすること。
-  if (N_total > 0):
-    R7:  composite_sort_and_partition
-         サブステップ1: build_composite_key (合成キー生成 + count_imc/count_ddmc atomicAdd)
-         [SYNC] → [D2H] count_imc, count_ddmc  // サブステップ2/3 と R8/R9 のグリッドサイズに必要
-         N_alive = count_imc + count_ddmc（ホスト計算）
-         サブステップ2: CUB RadixSort (comp_key, perm)
-         サブステップ3: fused_soa_gather(N_alive)
-         → 結果: SoA[0..n_imc-1]=IMC(cell順), SoA[n_imc..n_alive-1]=DDMC(cell順)
-         → 前ステップのdead粒子は自動除去（ソート末尾→n_alive以降を無視）
-  else:
-    [Host: count_imc=0, count_ddmc=0, N_alive=0]
-
-  --- DDMC→IMC 遷移粒子再サンプル ---
-  if (n_imc > 0):
-    R7b: ddmc_to_imc_resample (IMC粒子[0..n_imc-1]、§6.0d1)
-    // 前ステップで DDMC だった census 粒子のセルが IMC に遷移した場合、
-    // R7 build_composite_key が mode=IMC に上書きしたが pos/dir は NaN sentinel のまま。
-    // R7b は isnan(pos_r) で遷移粒子を検出し、セル内一様位置 + 等方方向を再サンプルする。
-    // 非遷移粒子（大半）は isnan チェックで即座に return → コストは ~5μs（起動オーバーヘッドのみ）
-
-  --- 輸送 ---
-  if (n_imc > 0):
-    R8:  imc_transport_persistent (Persistent Warp, IMC粒子[0..n_imc-1], grid=n_sm×8)
-  if (n_ddmc > 0):
-    R9:  ddmc_event_loop (History-based, DDMC粒子[n_imc..n_alive-1])
-  [SYNC]
-
-  > **ステップ間 DDMC→IMC モード遷移**：
-  > セルの不透明度変化（τ < τ_DDMC）により ddmc_mode が DDMC→IMC に遷移する場合、
-  > R7 build_composite_key が census 粒子の mode を IMC に上書きするが、
-  > 位置・方向は NaN sentinel のまま残る。R7b がこの遷移を検出し再サンプルする。
-  > 逆（IMC→DDMC）は **2経路** で発生し、いずれも **pos/dir を NaN sentinel に書き換え必須**：
-  > (a) **ステップ境界（R7）**: build_composite_key が ddmc_mode テーブルから mode=DDMC に上書きする際、
-  >     old_mode==IMC なら pos/dir を NaN 化（§6.0d サブステップ1 参照）。
-  > (b) **ステップ内（R8）**: IMC 輸送中に τ≥τ_DDMC セルへ移動し mode=DDMC に変換する際、
-  >     pos/dir を NaN 化（§6.0c R8 処理フロー参照）。
-  > NaN 化が必要な理由：(1) U7 は mode==DDMC でスキップするが、NaN は防御的不変条件（mode 破損時の安全策）、
-  > (2) 次ステップ R7b が isnan(pos_r) で DDMC→IMC 遷移検出に依存、(3) NaN 化しないと stale 位置が残り
-  > セルモード再遷移時に R7b が見逃す。R9 は pos を参照しないため動作上は安全だが、
-  > NaN 不変条件の一貫性のために変換時点で設定する。
-
-  > **ステップ内 R8/R9 モード遷移の扱い（v1.0設計方針）**：
-  > R8 内で IMC→DDMC に変換された粒子（time_remain > 0, mode=DDMC）、および
-  > R9 内で DDMC→IMC に変換された粒子（time_remain > 0, mode=IMC）は、
-  > 当該ステップ内では変換先カーネルで再処理**されない**。
-  > 次ステップの R7（composite_sort_and_partition）で合成キーにより正しく分離され、
-  > R7b（遷移リサンプル）→ R8/R9 で処理される。
-  > これは O(Δt) の誤差を含むが、Strang splitting の分割誤差と同等であり、
-  > 統計的再現性に影響しない（NUMERICS §6.6.3 物理的等価性参照）。
-
-  > **Dead粒子の遅延除去**：R8/R9 内で死亡（census, escape, absorption）した粒子、
-  > および R12 で kill された粒子は `alive=0` に設定されるが、当該ステップ内では
-  > compaction されない。次ステップの R7 composite sort で自動的に末尾に排除される。
-  > これにより1ステップあたりの SoA全体permutation を1回に削減する。
-  > dead粒子が混在する間の余分なソートコスト（~10-20% の粒子数増）は、
-  > 独立compactionパス削減（15可変配列×gather）のコストを大きく下回る。
-
-  R10: tally_finalize                    // difference: rad_E=E_ref_avg+signed_residual/(V c dt)
-  // --- DDMC 運動量沈着ポストプロセス（NUMERICS §7.8 準拠）---
-  // DDMC の rad_mom_dep は R9 イベントループ中ではなく**全イベント完了後**にポストプロセスとして算出する（NUMERICS §7.8: §7.8.2 "イベントループ完了後に算出"）。
-  // R10 が rad_E_tally を正規化して rad_E[c,g] を確定した後、以下の手順で DDMC 運動量沈着を計算:
-  //   1. φ_{i,g} = c × rad_E[i,g] / (4π)（scalar intensity、§7.8.1 residence estimator 由来）
-  //   2. 面フラックス F_f = σ_{R,f,g} × φ_i × Δx_i - σ_{L,f+1,g} × φ_{i+1} × Δx_{i+1}（§7.8.1）
-  //   3. p_i = (1/(2c V_i)) Σ_f σ_{R,f,g} × F_f × A_f × n̂_f（§7.8.2。R/Z成分分離）
-  //   4. atomicAdd(&rad_mom_dep[i*dim + d], p_i_d × V_i × dt)（IMC寄与と同一配列に加算）
-  // **v1.0 実装**: 上記を専用カーネル `ddmc_momentum_postprocess` として実装（block=256, grid=(n_cells+255)/256）。
-  //   入力: rad_E[n_cells×G]（R10出力）, sigma_R[(n_cells+n_ghost)×G], Sigma_leak[n_cells×n_faces×G], vol, face_area, face_normal
-  //   出力: rad_mom_dep[n_cells×dim]（atomicAdd で IMC 寄与に加算）
-  //   DDMC 無効時（ddmc_enabled=False）はスキップ。DDMC セルがゼロの場合もカーネル起動は安全（全セル rad_E=0 で寄与なし）
-  if (cfg.radiation.ddmc_enabled):
-    ddmc_momentum_postprocess(rad_E, sigma_R, Sigma_leak, vol, face_area → rad_mom_dep)
-  if (N_alive > 0):                              // grid=0 起動防止（N_alive=0 のとき R12 は処理対象なし）
-    R12: russian_roulette (census粒子 + DDMC粒子に適用。IMC粒子はR8内でインラインrouletteを受けるため
-         R12の対象外。R12は n_alive 粒子中 mode==DDMC || time_remain==0 のみを処理。
-         条件不成立の粒子は early return)
-  U1:  source_injection(rad_dep → ee)
-  H14: eos_inverse(species=0, ee → Te)  // re-closure: Phase 5 (Hydro) が最新Te/Peを必要とする
-  // --- Temperature maximum-principle monitoring（NUMERICS §11.8）---
-  // T_max_n = max(max_i(Te_i^n), T_boundary) [eV]
-  //   T_boundary = Marshak BC 駆動温度（§8.2）。境界が真空/反射のみの場合は T_boundary=0
-  //   Phase 3 U2 後に CUB Max(Te) → [D2H] → Host 保持。T_boundary は namelist 由来の定数
-  // H14 出力の Te^{n+1} に対し overshoot 検出:
-  //   CUB DeviceReduce::Max(Te) → Te_max_new
-  //   [SYNC] → [D2H] Te_max_new
-  //   [Host: overshoot_max = (Te_max_new - T_max_n) / T_max_n]
-  //   CUB DeviceReduce::Sum(TransformInputIterator(Te, [T_max_n](Te_i){ return Te_i > T_max_n ? 1 : 0; }), overshoot_count, n_cells)
-  //   [SYNC] → [D2H] overshoot_count
-  //   [Host: if overshoot_count > 0 && overshoot_max > ε_warn(0.01): WARNING]
-  //   [Host: if safety.overshoot_fatal_enabled && overshoot_max > ε_fatal(0.10): FATAL]
-  H13: eos_forward(Te → Pe, Cv)         // 圧力・比熱更新
-  U2:  floor_clamp(rho, Te, Ti)
-  // **U2後のPe/ee stale window 注記**: U2 が Te/Ti/ρ をクランプした場合、
-  // Pe/Pi/Cv_e/Cv_i/ee/ei は H13（U2 前）の値のまま stale となる。
-  // Phase 5 Hydro predictor の **H4**（compute_corner_force）が stale P^n を使用するが、
-  // フロアクランプ対象セルは ρ≈ρ_floor, Te≈T_floor であり
-  // 圧力寄与は ΔP ~ ρ_floor × kB × T_floor ≈ 10^{-22} dyne/cm² — 完全に無視可能。
-  // **イオン側も同様**: Pi/Cv_i の staleness による H11 への影響も同程度に無視可能。
-  // 厳密を期す場合は U2→H13 の順序に入れ替え可能だが、v1.0 では現状順序を維持する。
-
-  --- 並列粒子移動 (MPI)（NUMERICS §12.3.2 per-substep 同期プロトコル準拠）---
-  > **v1.0設計**：Persistent Warp (R8) は1ステップ=1サブステップ（time_remain 消費で完結）。
-  > 領域外に脱出した粒子は alive=1, cell_id<0 で R8/R9 を終了し、下記の P5/P6 で移送する。
-  > NUMERICS §12.3.2 の「各トラッキングサブステップ終了後に交換」は、
-  > v1.0 では1回の R8/R9 完了後に1回の P5→MPI→P6 として実現される。
-  > 将来版でサブステップ分割を導入する場合は、R8/R9 内にサブステップ境界を設け、
-  > 各境界で P5→MPI→P6 を挿入する設計に拡張する。
-  P5:  emigrant_detect_pack
-  [SYNC] → [D2H] emigrant_count, per_dest_count  // MPI Isend/Irecv のバッファサイズに必要
-  [Host: n_send = min(emigrant_count, emigrant_capacity)]  // オーバーフロー時のバッファ超過防止
-  [MPI] exchange_emigrants (Isend/Irecv/Waitall, n_send使用)  // n_ranks==1 の場合は P5/MPI/P6 全体をスキップ（emigrant は存在しない）
-  [H2D] cudaMemcpyAsync(device_recv_buf, host_recv_buf, n_recv×104B)  // Waitall完了後に recv_buf をデバイスに転送（P6 がデバイスポインタとして読むため必須）
-  // **P6 容量注記**: R6/R13 前の pool capacity check は n_alive+n_new+n_marshak を対象とし、
-  // n_recv は事前予測不可。P6 時点の pool_capacity 超過は P6 カーネル内で処理する
-  // （pool_offset+tid >= pool_capacity → 書き込みスキップ, particle_overflow=1,
-  // E_numerical_loss 計上。§8.3 参照）。R8/R9 で死亡・emigrant化した粒子分の余裕があるため稀。
-  cudaMemsetAsync: n_recv_accepted=0             // P6 の atomicAdd 先をゼロ初期化（前ステップの残留値防止）
-  if (n_recv > 0):                              // grid=0 起動防止（受信粒子なし時は P6 スキップ）
-    P6:  immigrant_unpack_merge
-  [SYNC] → [D2H] n_recv_accepted  // P6 の atomicAdd 結果を取得（容量超過分を除外した実受理数）
-  [Host: n_emigrant = emigrant_count]  // 全emigrant試行数（alive=0化+alive=2化）。alive=2（overflow）粒子も R7 では dead 扱い（alive!=1）
-  [Host: N_alive_post_mpi = n_alive_pre_mpi - n_emigrant + n_recv_accepted]  // n_emigrant=emigrant_count（overflow含む）。第2R7 のガード用
-  if (N_alive_post_mpi > 0):
-    cudaMemsetAsync: count_imc=0, count_ddmc=0  // 第1R7の値をクリア（第2R7のatomicAddが正しく動作するため）
-    R7:  composite_sort_and_partition (受信粒子含む再ソート+compact+partition, **re-arm無効**)
-  // **重要**: 第2R7の fused_soa_gather では census re-arm を**実行しない**（dt引数=0 または re-arm フラグ=false）。
-  // 理由: R8/R9 が当該ステップで生成した census 粒子（time_remain=0）を、当該ステップの dt で
-  // re-arm すると、次ステップの第1R7 で re-arm が不要と判定され（time_remain>0）、
-  // 次ステップの Δt ではなく当該ステップの Δt でトランスポートされる。
-  // Census 粒子の正規の re-arm 箇所は次ステップの第1R7 の fused_soa_gather のみ。
-    [SYNC] → [D2H] count_imc, count_ddmc  // 受信粒子込みの最終 n_alive を取得
-    [Host: n_alive = count_imc + count_ddmc]  // 次ステップの R5/R6 オフセットと pool 容量管理に必要
-  else:
-    [Host: count_imc=0, count_ddmc=0, n_alive=0]  // 全粒子消滅時（稀だが1D低密度問題で発生しうる）
+  if (!radiation.enabled): skip
+  RadiationStep::step → advance_radiation_step_{fld,sn}_{1d,2d_rz}   // §6.7 / §6.8。カーネル列は各ソルバ。
+                                       // 物質の更新（Te, ee, Pe）と rad_dep / rad_emit の publish を含む
+                                       // （Radiation.imc.two_stage では半ステップずつ 2 回、間で EOS を閉じ直す）
+  overshoot_metrics_kernel             // driver_safety_audit.cu。最大値原理の超過 → history radiation/overshoot_*
+  // 2026-09-29 まで本フェーズに書いていたモンテカルロ輻射の起動列（R2〜R13、粒子の MPI P5/P6、SoA ダブルバッファ遷移）は
+  // retired/radiation_monte_carlo/docs/CUDA_KERNELS_monte_carlo.md へ移した。
 
 ═══════════════════════════════════════════════════════
  Phase 5: Hydro H(Δt/2) — Phase 1と同一
@@ -664,7 +431,7 @@ CUDA ストリームのFIFO保証により、同一ストリーム内のカー�
 | Hydro H(Δt/2) × 2 | ~30 × 2 = ~60 | H4 (corner force), H14 (EOS inverse) |
 | Conduction | ~3 + s（STS） | C2 (Kershaw build ×1) + C3 (apply ×s、s=1–27) |
 | Laser | ~5 | L3/L4 (ray trace) |
-| Radiation | ~12 + CUB ops | **R8/R9 (transport)**、R7 composite sort |
+| Radiation | ソルバーと反復回数による | FLD: 群の三重対角（1D）/ CG（2D）と物質の Newton、S\(_N\): sweep・DSA・物質の Newton（§6.7/§6.8） |
 | Utility | ~10 | — |
 | **合計** | **~100** | |
 
@@ -678,10 +445,9 @@ CUDA ストリームのFIFO保証により、同一ストリーム内のカー�
 
 | パターン | 該当カーネル | 帯域効率 | 最適化手法 |
 |---------|------------|---------|-----------|
-| **Coalesced SoA** | 粒子load/store | 100% | SoAレイアウト |
+| **Coalesced SoA** | セル・節点の場、燃焼の α 粒子 | 100% | SoAレイアウト |
 | **Stencil** | Kershaw, AV, corner force | 80-90% | 構造格子の固定ストライド |
-| **Random cell read** | IMC/DDMC（セルデータ参照） | 30-60% | `__ldg()` + セルソート |
-| **Atomic scatter** | Tally (rad_dep, rad_E_tally) | 20-50% | セルソート + warp集約（§6.4、v1.0既定） |
+| **Random cell read** | レーザー光線（セルデータ参照） | 30-60% | `__ldg()` |
 | **Reduction** | CFL, energy budget | 90%+ | CUB ライブラリ |
 
 ### 10.2 L2キャッシュ戦略
@@ -691,12 +457,9 @@ A100: L2キャッシュ 40MB。
 **キャッシュに収まるデータ**:
 - セルフィールド（125Kセル × 10フィールド × 8B = 10MB）→ 収まる（500×250メッシュ、PERFORMANCE P1-P3準拠）
 - LaserMeshフィールド（32Kノード × 5フィールド × 8B = 1.3MB）→ 収まる
-- ddmc_mode配列（125K × 16群 × 1B = 2.0MB）→ 収まる
 
-**収まらないデータ**:
-- PhotonPool SoA（100万粒子 × 93B = 93MB）→ 収まらない → streaming access
-
-**方針**: セルデータは`__ldg()`で明示的にL2キャッシュを活用。粒子データはstreaming。
+**方針**: セルデータは`__ldg()`で明示的にL2キャッシュを活用。（退役したモンテカルロ輻射の ddmc_mode 配列は収まり、
+光子粒子の SoA（100万粒子 × 93B = 93MB）は収まらないので streaming としていた。）
 
 ### 10.3 レジスタスピル防止と `__launch_bounds__` 仕様
 
@@ -707,9 +470,6 @@ A100: L2キャッシュ 40MB。
 
 | カーネル | block_size | min_blocks | 最大reg/thread | occupancy保証 | 根拠 |
 |---------|-----------|-----------|---------------|-------------|------|
-| `imc_transport` (R8) | 128 | 8 | 64 | 50% (1024 threads/SM) | ~60 reg使用、IMC主ループ |
-| `ddmc_event_loop` (R9) | 128 | 16 | 32 | 100% | ~30 reg、mode partition で R8 と分離 |
-| `source_particle_fill` (R6) | 128 | 8 | 64 | 50% | Philox RNG + position sampling |
 | `kershaw_stencil_build` (C2) | 256 | 2 | 128 | 25% (512 threads/SM) | ~45 reg、compute-bound |
 | `kershaw_apply` (C3) | 256 | 4 | 64 | 50% | ~15 reg、STSステージ内 |
 | `ray_trace_2d` (L3) | 64 | 16 | 64 | 50% | ~40 reg、warp発散対策 |
@@ -730,27 +490,20 @@ A100: L2キャッシュ 40MB。
 
 | カーネル | 共有メモリ/block | 用途 | Phase |
 |---------|----------------|------|-------|
-| `energy_budget` (U3) | 256 × 3 × 8B = 6 KB | 部分和accumulation（E_kin, E_int_e, E_int_i）。E_census/E_escape は CUB Sum で別途算出 | v1.0 |
+| `energy_budget` (U3) | 256 × 3 × 8B = 6 KB | 部分和accumulation（E_kin, E_int_e, E_int_i） | v1.0 |
 | `cfl_reduction` (U4) | 256 × 8B = 2 KB | min reduction | v1.0 |
-| `imc_transport` (R8) | 128 × 20B = 2.5 KB | タリー Stage 2 ビンヒストグラム | 将来拡張 |
-| `ddmc_event_loop` (R9) | 128 × 20B = 2.5 KB | タリー Stage 2 ビンヒストグラム | 将来拡張 |
-
-**将来拡張 タリー共有メモリ内訳**（`tally_mode="warp_block"` 時、v1.0では未使用）:
-- `smem_dep[128]`：double × 128 = 1024 B（吸収沈着集約）
-- `smem_tl[128]`：double × 128 = 1024 B（track-length推定量集約）
-- `smem_keys[128]`：int × 128 = 512 B（セル×群キー）
-- `smem_n_bins`：int × 1 = 4 B（使用中ビン数）
-- **合計**：~2.5 KB/block
 
 **occupancy への影響**（A100: 164 KB shared/SM）:
-- R8/R9 を 8 blocks/SM で起動する場合：2.5 KB × 8 = 20 KB（12%）→ 影響なし
 - U3 (energy_budget) は 1 block/SM あたり 10 KB だが、grid_size が小さいため制約なし
 
 ---
 
 ## 11. パフォーマンス推定
 
-> **【状態注記 2026-07-10】** 本節の見積りは退役 imc_ddmc（粒子輸送、alive 粒子数前提）の歴史的推定。現行の性能実測は `PERFORMANCE.md`（host オーバーヘッド削減系列の wall/steps + host API 呼数）と `ops/runpod/bench/CALIBRATION.md` を正とする。
+> **【状態注記 2026-07-10、2026-09-29 更新】** 本節の見積りは退役したモンテカルロ輻射（粒子輸送、alive 粒子数前提）の歴史的推定で、
+> Radiation の行と粒子数スケーリング・ボトルネック特定フローの粒子の項はそのコードとともに退役した（コードは
+> `retired/radiation_monte_carlo/`）。現行の性能実測は `PERFORMANCE.md`（host オーバーヘッド削減系列の wall/steps + host API 呼数）と
+> `ops/runpod/bench/CALIBRATION.md` を正とする。
 
 ### 11.1 Phase別時間内訳推定
 
@@ -811,15 +564,9 @@ A100: L2キャッシュ 40MB。
 |------|---------|---------|-----------------|
 | Min reduction | `DeviceReduce::Min` | CFL dt, mesh quality | ~256 B |
 | Sum reduction | `DeviceReduce::Sum` | Energy budget (×5) | ~256 B |
-| Prefix sum | `DeviceScan::ExclusiveSum` | Source particle offsets | ~4 × N_cells × G B |
-| ~~Flagged select~~ | ~~`DeviceSelect::Flagged`~~ | ~~PhotonPool compaction~~ | R7に吸収 |
-| Radix sort | `DeviceRadixSort::SortPairs` | Composite Key Sort（R7、§0.5） | ~24 × N_particles B |
-| ~~Partition~~ | ~~`DevicePartition::Flagged`~~ | ~~IMC/DDMC分離~~ | R7に吸収 |
 
-**Scratch buffer最大必要量**: RadixSort (~24 × N) + Fused Gather double buffer (~92 × N)。
-100万粒子で ~116MB。ただし Fused Gather の double buffer は Scratch とは別に
-PhotonPool の `src`/`dst` として確保される（§5.3 の PhotonPool 容量に含まれる）。
-Scratch 単体では RadixSort が支配的 → ~24 × N_particles bytes。
+（モンテカルロ輻射が使っていた Prefix sum（source particle offsets）と Radix sort（Composite Key Sort、~24 × N_particles B）と
+その Scratch の見積りは 2026-09-29 に退役した。）
 
 ---
 
@@ -834,21 +581,16 @@ Scratch 単体では RadixSort が支配的 → ~24 × N_particles bytes。
 | A1-A5 | ALE (mesh_quality_check, winslow_jacobi_step, conservative_remap, project_cell_velocity_to_nodes, normalize_volFrac) | M4 |
 | C1-C4 | Conduction (spitzer_deff, kershaw_stencil_build/apply, 1d_tridiag) | M4 |
 | L1-L7 | Laser (laser_mesh_map, density_gradient, ray_trace_2d/3d, deposit, ray_skip_check, radial_absorption_1d) | M7 |
-| R1 | Fleck factor | M5 |
-| R2-R3 | DDMC mode judge, DDMC leak coeff | M6（DDMC統合） |
-| R4-R6 | Source energy/count/fill（IMC実装 + DDMC拡張） | M5（IMC）, M6（DDMC拡張） |
-| R7 | Composite sort and partition（旧R7+R11+R14融合、§0.5） | M5（IMC）, M6（DDMC統合） |
-| R8-R9 | IMC transport (Persistent Warp), DDMC event loop | M5（IMC）, M6（DDMC統合） |
-| R10,R12,R13 | Tally finalize, russian roulette, marshak source | M5 |
+| R1-R16 | モンテカルロ輻射（M5 IMC、M6 DDMC 統合）— 2026-09-29 に退役 | — |
 | U1 | Source injection | M5 |
 | U2 | floor clamp | M4（Hydro/Conduction） |
-| U7 | cell_search_after_rezone | M4（ALE） |
+| U7 | cell_search_after_rezone — 退役 | M4（ALE） |
 | U3 | Energy budget | M5（放射）, M8（統合拡張） |
 | U4-U5 | CFL reduction, NaN check | M8（統合） |
 | U6 | Q_ei exchange | M4 |
 | U8 | compute_zbar | M05（Materials） |
-| U9 | compute_opacities | M05（放射前準備） |
-| P1-P6 | Parallel (halo pack/unpack cell/node, emigrant detect/pack, immigrant unpack) | M9 |
+| U9 | compute_opacities — 退役 | M05（放射前準備） |
+| P1-P4 | Parallel (halo pack/unpack cell/node)。P5/P6（粒子の rank 間移動）は退役 | M9 |
 
 ---
 
@@ -857,13 +599,7 @@ Scratch 単体では RadixSort が支配的 → ~24 × N_particles bytes。
 ### v1.0 baseline — 設計済み
 以下は v1.0 初版の仕様として本文書内で定義済みである。
 
-1. **Composite Key Sort**（§0.5、NUMERICS §6.5）: 合成キーソートによるセルソート + dead compaction + モード分離の融合。
-   従来の R7+R11+R14（3操作 × 15可変配列個別gather）を R7 単一パイプライン（合成キー生成 → RadixSort → fused gather）に統合し、
-   粒子管理オーバーヘッドを **~60% 削減**
-2. **Warp-level タリー集約**: `__match_any_sync` + `__shfl_down_sync` によるwarp内reduction
-   （§6.4、NUMERICS §10.3.3）。セルソートと不可分で同時有効化される
-   - namelist: `Parallel.gpu_optimization.tally_mode="warp"`（v1.0既定）
-   - 効果：global atomicAdd 回数を最大32分の1に削減
+（1. Composite Key Sort と 2. warp-level タリー集約はモンテカルロ輻射の最適化で、2026-09-29 に退役した。）
 3. **`__launch_bounds__`**: 全主要カーネルに適用（§10.3）
 4. **`__ldg()`**: セルデータの read-only アクセス（§10.2）
 
@@ -871,19 +607,13 @@ Scratch 単体では RadixSort が支配的 → ~24 × N_particles bytes。
 以下は本文書内でアルゴリズムとカーネル仕様を完全に定義しており、実装可能な状態である。
 
 5. **計算-通信オーバーラップ**: 内部セル計算とハロー交換の非同期並列実行（NUMERICS §12.5.5、ARCHITECTURE §5.6.2）
-   - namelist: `Parallel.gpu_optimization.compute_comm_overlap=True`
+   - namelist: 未実装（有効化の設定だった `Parallel.gpu_optimization.compute_comm_overlap` は受理して無視される）
    - 適用: Hydro, Conduction のセルベースカーネル
    - 効果：4 GPU時 ~1.2 ms/step 隠蔽（2-3%改善）、GPU数増加で効果増大
 
 ### 高度な最適化 — 将来検討
 以下は将来の検討事項として記録する。
 
-6. **Block-level タリー集約（将来拡張）**: 共有メモリビンヒストグラム（§6.4、§10.4、NUMERICS §10.3.4）
-   - namelist: `Parallel.gpu_optimization.tally_mode="warp_block"`
-   - 共有メモリ：2.5 KB/block（R8, R9）
-   - Persistent Warpとの整合性課題あり（§6.4 Stage 2 注記参照）
-7. **DDMCへのPersistent Warp拡張**: v1.0ではIMCのみPersistent Warp（§6.4）、DDMCはHistory-based（§6.5）。DDMCにもPersistent Warpを適用し負荷分散を改善
-8. **IMC/DDMC統合Persistent Warp**: IMC/DDMCを単一カーネルに統合（Composite Key Sortによりmode_partitionは既にR7に吸収済みだが、レジスタ要件の差を解消するにはカーネル統合が必要）
 9. **Kernel fusion**: 連続する小カーネルの統合（Hydro predictor-corrector 内）
 10. **Multi-stream execution**: 独立カーネルの並列起動
 11. **FP16 テーブル補間**: EOS/Opacity テーブルをFP16化しメモリ帯域削減

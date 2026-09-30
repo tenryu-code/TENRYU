@@ -1051,34 +1051,4 @@ void solve_sn_material_temperature_newton_2d_legacy_gpu(
   cuda_check(cudaGetLastError(), "SN Newton 2D legacy launch failed");
 }
 
-void solve_sn_material_temperature_newton_gpu(
-    const SNMaterialCouplingGPUInputs& in,
-    const int n_cells,
-    const int n_groups,
-    const double temperature_floor_eV) {
-  SnMaterialNewton1DInputs wrapped{};
-  wrapped.sigma_a = in.sigma_a;
-  wrapped.rad_E = in.E_out;
-  wrapped.rad_E_out = in.E_out;
-  wrapped.rho = in.rho;
-  wrapped.cv_e = in.cv_e;
-  wrapped.vol = in.vol;
-  wrapped.Te_old = in.Te_old;
-  wrapped.Te = in.Te;
-  wrapped.ee = in.ee;
-  wrapped.rad_dep = in.rad_dep;
-  wrapped.rad_emit = in.rad_emit;
-  wrapped.planck = in.planck;
-  wrapped.electron_eos = in.electron_eos;
-  wrapped.n_cells = n_cells;
-  wrapped.n_groups = n_groups;
-  wrapped.dt = in.dt;
-  wrapped.cv_e_const = in.cv_e_const;
-  wrapped.Cv_e_const = in.Cv_e_const;
-  wrapped.temperature_floor_eV = temperature_floor_eV;
-  wrapped.c_begin = in.mpi_c_begin;
-  wrapped.c_end = in.mpi_c_end;
-  solve_sn_material_temperature_newton_gpu(wrapped);
-}
-
 }  // namespace tenryu::radiation

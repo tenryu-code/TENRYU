@@ -343,7 +343,8 @@ DynamicMeshParams1D compute_dynamic_mesh_params_1d(
     const double rmax_n_hat_threshold,
     const double r_max_factor,
     const double target_radius,
-    const int nr_max) {
+    const int nr_max,
+    const double min_outer_radius = 0.0) {
   const core::NvtxRange nvtx_range("laser.dynamic_mesh");
   const int n_cells = static_cast<int>(rho.size());
   TENRYU_ASSERT(static_cast<int>(zbar.size()) == n_cells,
@@ -416,7 +417,7 @@ DynamicMeshParams1D compute_dynamic_mesh_params_1d(
     min_dr_crit = std::max(R_max / 4.0, 1.0e-12);
   }
 
-  R_max = std::max(R_max, 4.0 * min_dr_crit);
+  R_max = std::max({R_max, 4.0 * min_dr_crit, min_outer_radius});
   const double R_crit = std::clamp(R_crit_raw, 0.0, R_max);
   const double dR_fine = std::max(mesh_factor * min_dr_crit, 1.0e-12);
   std::vector<double> node_R =
@@ -467,7 +468,8 @@ __global__ void map_hydro_to_laser_1d_kernel(
     const double ghost_Te_min_eV,
     const int critical_clip,
     const double n_hat_margin,
-    const int fcrit_cell) {
+    const int fcrit_cell,
+    const int* __restrict__ cell_material_index) {
   const int idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx >= n_nodes_total) {
     return;
@@ -479,7 +481,7 @@ __global__ void map_hydro_to_laser_1d_kernel(
       n_cells, n_crit_safe, use_ghost_corona, outer_surface_cell,
       ghost_ne_inner, ghost_scale_length, ghost_ne_min, r_surface_outer,
       r_ghost_outer, Te_anchor, zbar_anchor, ghost_zbar_min, ghost_zbar_max,
-      ghost_Te_min_eV, critical_clip, n_hat_margin, fcrit_cell);
+      ghost_Te_min_eV, critical_clip, n_hat_margin, fcrit_cell, cell_material_index);
 }
 
 void ensure_hydro_mapping_capacity(LaserMesh& mesh, const int n_cells) {
@@ -1818,39 +1820,12 @@ void map_from_hydro_1d(LaserMesh& mesh,
     }
   }
 
-  const DynamicMeshParams1D params = compute_dynamic_mesh_params_1d(
+  DynamicMeshParams1D params = compute_dynamic_mesh_params_1d(
       rho, zbar, r_edges, A_eff_cell, cell_is_void, mesh.n_crit,
       laser_cfg.lasermesh.mesh_factor, laser_cfg.lasermesh.rmax_n_hat_threshold,
       laser_cfg.lasermesh.r_max_factor, mesh.target_radius, laser_cfg.lasermesh.nr_max);
-  mesh.ensure_capacity(params.nr, params.nz);
-  static int prev_nr = 0;
-  static int prev_nz = 0;
-  const bool first_call = (prev_nr == 0 && prev_nz == 0);
-  const bool significant_change =
-      (prev_nr > 0) && (std::abs(params.nr - prev_nr) > std::max(1, prev_nr / 20));
-  if (first_call || significant_change) {
-    const double active_mem_mb = 10.0 * static_cast<double>(params.nr + 1) *
-                                 static_cast<double>(params.nz + 1) * 8.0 /
-                                 (1024.0 * 1024.0);
-    std::ostringstream oss;
-    oss << "LaserMesh1D: nr=" << params.nr << ", nz=" << params.nz << ", R_crit="
-        << std::scientific << std::setprecision(4) << params.R_crit << ", dR_fine="
-        << params.dR_fine << ", nr_max=" << std::defaultfloat << laser_cfg.lasermesh.nr_max
-        << ", active_mem=" << std::fixed << std::setprecision(1) << active_mem_mb << "MB";
-    core::log_info(oss.str());
-    prev_nr = params.nr;
-    prev_nz = params.nz;
-  }
-  mesh.R_max = params.R_max;
-  mesh.Z_min = -params.R_max;
-  mesh.Z_max = params.R_max;
-
-  const std::vector<double>& node_R = params.node_R;
-  const std::vector<double> node_Z = build_mirrored_Z_from_R(node_R);
-  const int n_nodes_total = mesh.n_nodes();
   const int n_cells = static_cast<int>(rho.size());
   const double n_crit_safe = std::max(mesh.n_crit, 1.0e-30);
-
   std::vector<double> ne_raw_cell(static_cast<std::size_t>(n_cells), 0.0);
   for (int c = 0; c < n_cells; ++c) {
     const std::size_t c_idx = static_cast<std::size_t>(c);
@@ -1980,6 +1955,44 @@ void map_from_hydro_1d(LaserMesh& mesh,
           : 0.0;
   mesh.last_ghost_width = ghost_width;
   const double r_ghost_outer = r_surface_outer + ghost_width;
+  // The ghost corona reaches r_surface + W, but the mesh's outer radius R_max came from the real cells only
+  // (r_max_factor x the outermost face above rmax_n_hat_threshold): a wider ghost was cut at R_max, the rays
+  // started inside it and its outer part was never traced (until 2026-09-29). The layout is then rebuilt with
+  // R_max beyond the ghost's outer edge (4 fine cells, at least 5 %), so the rays start in vacuum.
+  if (use_ghost_corona && r_ghost_outer >= params.R_max) {
+    const double R_min_outer = r_ghost_outer + std::max(4.0 * params.dR_fine, 0.05 * r_ghost_outer);
+    params = compute_dynamic_mesh_params_1d(
+        rho, zbar, r_edges, A_eff_cell, cell_is_void, mesh.n_crit, laser_cfg.lasermesh.mesh_factor,
+        laser_cfg.lasermesh.rmax_n_hat_threshold, laser_cfg.lasermesh.r_max_factor, mesh.target_radius,
+        laser_cfg.lasermesh.nr_max, R_min_outer);
+  }
+  mesh.ensure_capacity(params.nr, params.nz);
+  static int prev_nr = 0;
+  static int prev_nz = 0;
+  const bool first_call = (prev_nr == 0 && prev_nz == 0);
+  const bool significant_change =
+      (prev_nr > 0) && (std::abs(params.nr - prev_nr) > std::max(1, prev_nr / 20));
+  if (first_call || significant_change) {
+    const double active_mem_mb = 10.0 * static_cast<double>(params.nr + 1) *
+                                 static_cast<double>(params.nz + 1) * 8.0 /
+                                 (1024.0 * 1024.0);
+    std::ostringstream oss;
+    oss << "LaserMesh1D: nr=" << params.nr << ", nz=" << params.nz << ", R_crit="
+        << std::scientific << std::setprecision(4) << params.R_crit << ", dR_fine="
+        << params.dR_fine << ", nr_max=" << std::defaultfloat << laser_cfg.lasermesh.nr_max
+        << ", active_mem=" << std::fixed << std::setprecision(1) << active_mem_mb << "MB";
+    core::log_info(oss.str());
+    prev_nr = params.nr;
+    prev_nz = params.nz;
+  }
+  mesh.R_max = params.R_max;
+  mesh.Z_min = -params.R_max;
+  mesh.Z_max = params.R_max;
+
+  const std::vector<double>& node_R = params.node_R;
+  const std::vector<double> node_Z = build_mirrored_Z_from_R(node_R);
+  const int n_nodes_total = mesh.n_nodes();
+
   // TENRYU_LASER_GHOST_DIAG=1: one line per 1D map with the surface and
   // ghost-corona parameters (read-only diagnostic).
   static const bool ghost_diag = [] {
@@ -2034,7 +2047,9 @@ void map_from_hydro_1d(LaserMesh& mesh,
       outer_surface_cell, ghost_ne_inner, ghost_scale_length, ghost_ne_min, r_surface_outer,
       r_ghost_outer, Te_anchor, zbar_anchor, mesh.ghost_zbar_min, mesh.ghost_zbar_max,
       mesh.ghost_Te_min_eV, laser_cfg.lasermesh.critical_clip ? 1 : 0,
-      mesh.n_hat_margin, fcrit_cell);
+      mesh.n_hat_margin, fcrit_cell,
+      (state.cell_material_index.size() == static_cast<std::size_t>(n_cells)) ? state.cell_material_index.data()
+                                                                              : nullptr);
   cuda_check(cudaGetLastError(), "map_from_hydro_1d map kernel launch failed");
   if (node_material != nullptr && node_material->cell_material_index != nullptr) {
     if (node_material->node_material.size() < static_cast<std::size_t>(n_nodes_total)) {
@@ -2136,7 +2151,9 @@ void map_trace_profile_1d(LaserMesh& mesh,
       tp.outer_surface_cell, tp.ghost_ne_inner, tp.ghost_scale_length, tp.ghost_ne_min,
       tp.r_surface_outer, tp.r_ghost_outer, tp.Te_anchor, tp.zbar_anchor, mesh.ghost_zbar_min,
       mesh.ghost_zbar_max, mesh.ghost_Te_min_eV, tp.critical_clip, mesh.n_hat_margin,
-      tp.fcrit_cell);
+      tp.fcrit_cell,
+      (state.cell_material_index.size() == static_cast<std::size_t>(n_cells)) ? state.cell_material_index.data()
+                                                                              : nullptr);
   cuda_check(cudaGetLastError(), "map_trace_profile_1d map launch failed");
   if (node_material != nullptr && node_material->cell_material_index != nullptr) {
     if (node_material->radial_node_material.size() < static_cast<std::size_t>(n_profile)) {

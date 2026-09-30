@@ -177,7 +177,7 @@ TENRYU_HOST_DEVICE inline double compute_coulomb_log_ext(
     return compute_coulomb_log(n_hat, Te_eV, Zbar, lambda_cm, coulomb_log_floor);
   }
 
-  const double effective_floor = ::fmax(2.0, coulomb_log_floor);
+  const double effective_floor = coulomb_log_floor;
   if (!(Te_eV > 0.0) || !(Zbar > 0.0) || !(lambda_cm > 0.0)) {
     return effective_floor;
   }
