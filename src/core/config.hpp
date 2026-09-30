@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "core/error.hpp"
+#include "core/mesh_requirement.hpp"
 #include "core/namelist/errors.hpp"
 #include "hydro/bc_2d_rz_semantics.hpp"
 #include "hydro/pressure_drive_perturbation.cuh"
@@ -25,8 +26,8 @@ struct IonmixZbarTable;
 
 namespace tenryu::core {
 
+// The third mode, "imc_ddmc" (Monte Carlo radiation), left the build on 2026-09-29 (retired/radiation_monte_carlo/).
 enum class RadiationMode {
-  ImcDdmc,
   MultigroupDiffusion,
   SnTransport,
 };
@@ -343,6 +344,7 @@ struct Config {
       int min_cells_per_layer = 10;
       double zbar_override = 0.0;
       int n_bands = 6;
+      MeshEmpiricalRequirement empirical;
       // Bands appended to zoning_intent by apply="enforce" (recorded for the frozen config;
       // same fields as ZoningIntentBandNL plus the areal-mass ceiling they came from).
       struct InjectedBand {
@@ -494,8 +496,8 @@ struct Config {
       double A = 0.0;
       double Z = 0.0;
 
-      // Supported models include "ideal_gas", "sesame", "ionmix", and "tmat".
-      // SPEC default is "sesame"; implementation keeps "ideal_gas" for current test compatibility.
+      // Supported models include "ideal_gas", "sesame", "ionmix", "tmat", and "power_law_te";
+      // the default is "ideal_gas" (SPECIFICATION §6.4.3).
       std::string eos_model = "ideal_gas";
       std::string eos_file;
       int sesame_material_id = -1;
@@ -535,8 +537,8 @@ struct Config {
       // Restart safety hash for table EOS identity; 0 indicates ideal_gas/non-tabular EOS.
       std::uint64_t eos_signature = 0;
 
-      // Supported models include "constant", "freq_dep_marshak", "table_nlte", and "tmat".
-      // SPEC default is "ionmix"; implementation keeps "constant" for current test compatibility.
+      // Supported models include "constant", "freq_dep_marshak", "table_nlte" (and "ionmix", converted to
+      // it), "tmat", and "power_law"; the default is "constant" (SPECIFICATION §6.4.3).
       std::string opacity_model = "constant";
       std::string opacity_file;
       bool tmat_skip_lte_repair = false;
@@ -554,12 +556,11 @@ struct Config {
       bool is_void = false;
       std::string opacity_units = "cm2_per_g";
 
-      // Legacy Non-LTE Fleck controls kept for namelist compatibility.
-      // Jayenne separate-emissivity reformulation ignores these at runtime.
-      std::string lambda_method = "finite_difference";
+      // Legacy Non-LTE Fleck controls kept for namelist compatibility: the NLTE coefficient kernels take them and
+      // the Jayenne separate-emissivity reformulation ignores them. Their siblings lambda_method and f_min fed only
+      // the Monte Carlo radiation (retired 2026-09-29); the builder accepts and ignores them.
       double lambda_fd_delta_rel = 1.0e-4;
       double lambda_fd_abs_min = 1.0e-6;
-      double nlte_f_min = 1.0e-4;
       // opacity.model="ionmix" (an LTE IONMIX table): the builder runs it as
       // "table_nlte" and requires the file's emission opacity to equal its
       // absorption opacity (2026-09-24).
@@ -650,127 +651,13 @@ struct Config {
       std::vector<std::vector<double>> b_g;
     };
 
-    struct CensusCombConfig {
-      bool enabled = false;
-      int max_particles = 1000000;
-      int min_per_bin = 1;
-      double trigger_ratio = 1.0;
-      double target_fraction = 0.8;
-      double mode_weight_imc = 1.0;
-      double mode_weight_ddmc = 0.5;
-      bool adaptive_trigger = true;
-      double adaptive_util_start = 0.70;
-      double adaptive_util_end = 0.95;
-      double trigger_ratio_floor = 0.85;
-      double trigger_hysteresis = 0.05;
-      bool ess_floor_enabled = false;
-      double ess_min_tier0 = 16.0;
-      double ess_min_tier1 = 8.0;
-      int max_split_factor = 4;
-    };
-
-    struct RadLiteMeshConfig {
-      bool enabled = false;
-      double sigma_ratio_max = 2.0;
-      bool nlte_auto = false;
-    };
-
+    // Radiation.imc: one key acts on the deterministic modes, two_stage (the radiation operator advances the step in
+    // two halves with an EOS re-closure between them). The dict's other keys, and the Radiation.ddmc,
+    // Radiation.diffusion and Radiation.holo dicts, belonged to the Monte Carlo radiation (mode "imc_ddmc": IMC, DDMC,
+    // random walk, HOLO, difference formulation), which was frozen and on 2026-09-29 moved out of the build to
+    // retired/radiation_monte_carlo/; the builder accepts them and ignores them.
     struct ImcConfig {
-      struct DifferenceConfig {
-        bool enabled = false;
-        double W_max = 1.0;
-        double tau0 = 3.0;
-        double chi0 = 1.0;
-        bool face_transport = true;
-      };
-
-      struct NetElectronSourceSmoothingConfig {
-        bool enabled = false;
-        double alpha = 0.2;
-        double tau_threshold = 4.0;
-        int passes = 1;
-        double grad_Te_scale = 0.3;
-        double grad_rho_scale = 0.5;
-        bool gradient_adaptive = false;
-      };
-
-      struct ConservativeSmootherConfig {
-        bool enabled = false;
-        int passes = 10;
-        double alpha = 0.5;
-      };
-
-      bool enabled = false;
-      double alpha = 1.0;
-      double f_max = 1.0;
-      bool corrected_fleck = false;
-      int particles_per_cell_group = 50;
-      // Parsed for input compatibility; v1.0 transport always uses continuous
-      // absorption (implicit capture effectively hardcoded on).
-      bool implicit_capture = true;
-      double cutoff_fraction = 0.0;
-      bool inelastic_scatter = true;
-      double weight_cutoff = 1e-10;
-      double roulette_survival = 0.1;
-      double weight_split = 1e2;
-      int max_split = 8;
-      bool linearized_planck = false;
-      bool source_tilting = false;
-      bool source_localization = false;
-      double sloc_ema_beta = 0.4;
-      double sloc_sigma_floor = 0.1;
-      double sloc_sigma_cap = 0.5;
-      double sloc_tau_ref = 1.0;
-      double spectral_bias_eta = 0.0;
-      bool opacity_predictor = false;
       bool two_stage = false;
-      DifferenceConfig difference;
-      NetElectronSourceSmoothingConfig net_e_source_smoothing;
-      ConservativeSmootherConfig conservative_smoother;
-      // -1 = disabled (backward compatible), >0 = total particle cap
-      int particle_budget = -1;
-      CensusCombConfig census_comb;
-      RadLiteMeshConfig rad_lite_mesh;
-    };
-
-    struct DdmcConfig {
-      bool enabled = false;
-      bool implicit_diffusion = false;
-      double tau_ddmc = 4.0;
-      double tau_rw = 0.0;
-      double omega_ddmc = 0.9;
-      double tau_ddmc_off = -1.0;
-      double omega_ddmc_off = -1.0;
-      int mode_hold = 0;
-      double rate_max = 1.0e30;
-      std::string leak_stencil = "9_kershaw";
-      // Parsed for compatibility; v1.0 transport implements asymptotic_diffusion_limit only.
-      std::string interface_method = "asymptotic_diffusion_limit";
-      bool emissivity_preserving = true;
-      std::string interface_exit_distribution = "cosine";
-      bool rz_face_r_weight = true;
-      std::string face_opacity_temperature = "radiative_mean";
-      bool m_matrix_check = true;
-    };
-
-    struct DiffusionConfig {
-      bool enabled = false;
-      double tau_on = 5.0;
-      double tau_off = 3.0;
-      double reduced_flux_on = 0.15;
-      double reduced_flux_off = 0.25;
-      int mode_hold = 0;
-      double rate_max = 1.0e30;
-      int mode_update_interval = 10;
-      int min_diffusion_island_cells = 5;
-      int imc_guard_cells = 1;
-      int sts_max_stages = 0;
-      double sts_damping = 0.05;
-      double sts_subcycle_eta = 0.8;
-      int interface_particles_per_face_group = 32;
-      int exit_particles_per_cell_group = 32;
-      bool lte_entry_initialization = false;
-      double lte_entry_energy_fraction_cap = 0.01;
     };
 
     struct MultigroupDiffusionConfig {
@@ -889,8 +776,11 @@ struct Config {
       std::string linear_solver_2d_resolved;
       double rgmg_smoother_omega = 0.67;
       AmgxConfig amgx_config;
-      // Rosseland-opacity floor [1/cm] for the diffusion coefficient D = c*lambda/sigma.
-      // A physically invisible floor (mfp = 10 km >> any lab-scale domain) that
+      // Two uses of one value (SPECIFICATION §6.4.5): the opacity evaluation floors the mass
+      // opacity, sigma >= rho * opacity_floor (multimat_opacity_1d.cuh, opacity.cu), and the
+      // diffusion-coefficient and limiter assembly floors the Rosseland opacity, sigma_R >=
+      // opacity_floor [1/cm] (fld_1d_gpu.cu). The latter is the regularization below:
+      // a physically invisible floor (mfp = 10 km >> any lab-scale domain) that
       // regularizes the degenerate void limit: with sigma -> 0 and uniform E the
       // flux limiter stays at 1/3, D diverges, and the tridiagonal rows reach
       // ~1e98, which overflows both CR and QR solvers into NaN (2026-08-28 root
@@ -958,49 +848,12 @@ struct Config {
       std::string z_boundary = "vacuum";
     };
 
-    // EXPERIMENTAL: HOLO (High-Order Low-Order) radiation acceleration.
-    // Not validated for production use. Use Radiation.imc.difference instead.
-    // Enabling HOLO with difference formulation is not supported.
-    struct HoloConfig {
-      bool enabled = false;  // default OFF; must be explicitly enabled
-      std::string region = "shell";
-      std::string material_group = "shell";
-      double coupling_tau = 5.0;
-      int guard_cells = 3;
-      int blend_cells = 3;
-      int min_lo_cells = 20;
-      double q_min = 0.0;
-      double q_max = 1.0;
-      double tau_on = 5.0;
-      double tau_off = 3.0;
-      double reduced_flux_on = 0.15;
-      double reduced_flux_off = 0.25;
-      int update_interval = 10;
-      int hold_on = 0;
-      int min_dwell_steps = 20;
-      int min_island_cells = 5;
-      int core_margin_cells = 3;
-      std::string solver = "implicit_1d";  // "implicit_1d" or "quasidiffusion_1d"
-      std::string closure = "diffusion";
-      double closure_relax = 0.2;
-      int closure_smooth_passes = 1;
-      double closure_smooth_alpha = 0.5;
-      double consistency_alpha = 1.0;
-      std::string boundary_flux = "physical";
-      bool p_rr_tally = true;
-      bool sn_closure = true;
-      int sn_n_angles = 8;
-      bool sn_material_coupling = false;
-      int residual_particles_per_cell_group = 4;
-    };
-
     struct BoundaryConfig {
       std::string type = "vacuum";
       std::string inner_r = "reflect";
       std::string outer_r = "vacuum";
       std::string bottom_z = "vacuum";
       std::string top_z = "vacuum";
-      int marshak_particles = 1000;
       double marshak_Tr_eV = -1.0;
       CallableInfo marshak_Tr;
       std::map<std::string, CallableInfo> marshak_Tr_map;
@@ -1008,7 +861,6 @@ struct Config {
 
     bool enabled = true;
     RadiationMode mode = RadiationMode::MultigroupDiffusion;
-    bool origin_parity_only = false;
     bool group_repack_hard_xray = false;
     bool diagnose_hard_xray_opacity = false;
     int groups = 1;
@@ -1020,11 +872,8 @@ struct Config {
     double volume_source_rate = 0.0;
     double volume_source_x_max = -1.0;
     ImcConfig imc;
-    DdmcConfig ddmc;
-    DiffusionConfig diffusion;
     MultigroupDiffusionConfig multigroup_diffusion;
     SnTransportConfig sn_transport;
-    HoloConfig holo;
     BoundaryConfig boundary;
   };
 
@@ -1291,7 +1140,7 @@ struct Config {
       double energy_J = -1.0;
     };
 
-    // SPEC default is true; implementation keeps false as a safer default.
+    // Default false (SPECIFICATION §6.4.6).
     bool enabled = false;
     double wavelength_nm = 351.0;
     std::string mode;
@@ -1562,7 +1411,6 @@ struct Config {
       std::string cfl_length_2d = "sqrt_area";
       bool edge_accel_displacement_cfl_enabled = false;
       double cfl_cond = 0.25;
-      double f_min_fleck = 0.01;
       double growth_factor = 1.2;
       double max_s = 1e-9;
       double min_s = 1e-20;
@@ -2939,8 +2787,8 @@ struct Config {
       bool energy_fatal = false;
       bool nan_fatal = true;
       double energy_budget_tol = 1e-3;
-      double opacity_floor = 1e-20;
-      double opacity_cap = 1e20;
+      // opacity_floor / opacity_cap clamped the Monte Carlo radiation's opacities (retired 2026-09-29); the builder
+      // accepts and ignores them. FLD and S_N have their own in Radiation.multigroup_diffusion / sn_transport.
       // v1.0 warning path is wired in conduction; radiation/source floor-clamp
       // counters should be added to the same threshold monitoring in future.
       int clamp_warn_threshold = 100;
@@ -3013,20 +2861,6 @@ struct Config {
       bool critical_surface = true;
       bool per_beam = false;
     };
-    struct McStats {
-      bool enabled = true;
-      bool particle_counts = true;
-      bool weight_stats = true;
-      bool cell_particle_density = false;
-      bool ddmc_fraction = true;
-    };
-    struct FleckDiag {
-      bool enabled = false;
-      int every = 10;
-      std::vector<int> cells;
-      double r_min_cm = -1.0;
-      double r_max_cm = -1.0;
-    };
 
     bool enabled = true;
     int every = 1;
@@ -3046,8 +2880,6 @@ struct Config {
     ArealDensity areal_density;
     Sphericity sphericity;
     LaserPattern laser_pattern;
-    McStats mc_stats;
-    FleckDiag fleck_diag;
     bool overshoot_monitor = true;
   };
 
@@ -3061,17 +2893,11 @@ struct Config {
       std::string gpu_aware_mpi = "auto";
       int ghost_layers = 1;
     };
-    struct Migration {
-      std::string method = "batch";
-      int max_substeps = 32;
-      int emigrant_threshold = 1000;
-      int initial_capacity = 10000;
-      double growth_factor = 1.5;
-    };
+    // Parallel.migration configured the photon-packet migration of the Monte Carlo radiation (retired 2026-09-29);
+    // the builder accepts and ignores it.
 
     Decomposition decomposition;
     Halo halo;
-    Migration migration;
   };
 
   struct MetaConfig {

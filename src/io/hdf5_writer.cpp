@@ -47,7 +47,9 @@
 namespace tenryu::io {
 namespace {
 
-constexpr int kSchemaVersion = 1;
+// 2 (2026-09-29): the Monte Carlo radiation left the build; checkpoints no longer carry /particles (and /rng),
+// and no file carries /holo, /difference, /radiation/ddmc_flag or /radiation/delta_E_rad_prev.
+constexpr int kSchemaVersion = 2;
 
 std::string format_step(const int step) {
   std::ostringstream oss;
@@ -115,7 +117,9 @@ std::string checkpoint_config_signature(const core::Config& cfg) {
   oss << ";n_groups=" << std::max(cfg.radiation.groups, 1);
   oss << ";n_materials=" << cfg.materials.materials.size();
   oss << ";radiation_enabled=" << (cfg.radiation.enabled ? 1 : 0);
-  oss << ";ddmc_enabled=" << (cfg.radiation.ddmc.enabled ? 1 : 0);
+  // Radiation.ddmc.enabled (retired Monte Carlo radiation, 2026-09-29): always 0 for a restartable run, kept
+  // so that signatures of earlier checkpoints still match.
+  oss << ";ddmc_enabled=0";
   oss << ";laser_enabled=" << (cfg.laser.enabled ? 1 : 0);
   oss << ";hydro_enabled=" << (cfg.numerics.hydro.enabled ? 1 : 0);
   oss << ";compatible_energy=" << (cfg.numerics.hydro.compatible_energy ? 1 : 0);
@@ -3305,19 +3309,6 @@ void write_radiation_group(const hid_t file,
   auto sn_angular_fixup_count = copy_field_to_host(state.sn_angular_fixup_count);
   auto sn_angular_fixup_artificial_abs =
       copy_field_to_host(state.sn_angular_fixup_artificial_abs);
-  auto holo_E_LO = copy_field_to_host(state.holo_E_LO);
-  auto holo_consistency_source =
-      copy_field_to_host(state.holo_consistency_source);
-  auto holo_rad_dep = copy_field_to_host(state.holo_rad_dep);
-  auto holo_rad_emit = copy_field_to_host(state.holo_rad_emit);
-  auto holo_Prr = copy_field_to_host(state.holo_Prr);
-  auto holo_chi = copy_field_to_host(state.holo_chi);
-  auto holo_Prr_coverage = copy_field_to_host(state.holo_Prr_coverage);
-  auto difference_W = copy_field_to_host(state.difference_W);
-  auto difference_E_ref = copy_field_to_host(state.difference_E_ref);
-  auto difference_residual_E = copy_field_to_host(state.difference_residual_E);
-  const bool has_delta_E_rad_prev = !state.delta_E_rad_prev.empty();
-  auto delta_E_rad_prev = copy_field_to_host(state.delta_E_rad_prev);
   const auto vol = copy_field_to_host(state.vol);
   const bool is_2d_rz = cfg.main.dim == 2 || cfg.main.dimension == "2D_RZ";
   const bool write_fld_diagnostics =
@@ -3342,25 +3333,6 @@ void write_radiation_group(const hid_t file,
   if (rad_emit.size() != n_cell_groups) {
     core::log_warning("Checkpoint write: radiation/rad_emit size mismatch (state=" +
                       std::to_string(rad_emit.size()) + ", expected=" +
-                      std::to_string(n_cell_groups) +
-                      "); resizing with zero fill.");
-  }
-  if (state.holo_core_mask_valid && holo_E_LO.size() != n_cell_groups) {
-    core::log_warning("Checkpoint write: holo/E_LO size mismatch (state=" +
-                      std::to_string(holo_E_LO.size()) + ", expected=" +
-                      std::to_string(n_cell_groups) +
-                      "); resizing with zero fill.");
-  }
-  if (state.holo_core_mask_valid &&
-      holo_consistency_source.size() != n_cell_groups) {
-    core::log_warning("Checkpoint write: holo/consistency_source size mismatch (state=" +
-                      std::to_string(holo_consistency_source.size()) + ", expected=" +
-                      std::to_string(n_cell_groups) +
-                      "); resizing with zero fill.");
-  }
-  if (state.holo_core_mask_valid && holo_Prr.size() != n_cell_groups) {
-    core::log_warning("Checkpoint write: holo/Prr_HO size mismatch (state=" +
-                      std::to_string(holo_Prr.size()) + ", expected=" +
                       std::to_string(n_cell_groups) +
                       "); resizing with zero fill.");
   }
@@ -3389,16 +3361,6 @@ void write_radiation_group(const hid_t file,
   sn_radial_fixup_artificial_abs.resize(n_cell_groups, 0.0);
   sn_angular_fixup_count.resize(n_cell_groups, 0.0);
   sn_angular_fixup_artificial_abs.resize(n_cell_groups, 0.0);
-  holo_E_LO.resize(n_cell_groups, 0.0);
-  holo_consistency_source.resize(n_cell_groups, 0.0);
-  holo_rad_dep.resize(n_cell_groups, 0.0);
-  holo_rad_emit.resize(n_cell_groups, 0.0);
-  holo_Prr.resize(n_cell_groups, 0.0);
-  holo_chi.resize(n_cell_groups, 0.0);
-  holo_Prr_coverage.resize(n_cell_groups, 0.0);
-  if (has_delta_E_rad_prev) {
-    delta_E_rad_prev.resize(n_cells, 0.0);
-  }
   if (write_sn_diagnostics) {
     sn_tau_R.resize(n_cells, 0.0);
     sn_reduced_flux.resize(n_cells, 0.0);
@@ -3436,16 +3398,6 @@ void write_radiation_group(const hid_t file,
                         rad_emit.data(),
                         "erg",
                         cfg);
-  if (has_delta_E_rad_prev) {
-    write_numeric_dataset(file,
-                          "radiation",
-                          "delta_E_rad_prev",
-                          H5T_NATIVE_DOUBLE,
-                          {static_cast<hsize_t>(n_cells)},
-                          delta_E_rad_prev.data(),
-                          "erg",
-                          cfg);
-  }
   write_numeric_dataset(file,
                         "radiation",
                         "deposited_power",
@@ -3645,178 +3597,6 @@ void write_radiation_group(const hid_t file,
                         sn_angular_fixup_artificial_abs.data(),
                         "erg/cm2/s",
                         cfg);
-
-  if (state.ddmc_mode_map_valid && state.ddmc_mode_map.size() == n_cell_groups) {
-    write_numeric_dataset(file,
-                          "radiation",
-                          "ddmc_flag",
-                          H5T_NATIVE_INT8,
-                          cgdims,
-                          state.ddmc_mode_map.data(),
-                          "flag",
-                          cfg);
-  }
-
-  if (state.holo_core_mask_valid && state.holo_core_mask.size() == n_cells) {
-    write_numeric_dataset(file,
-                          "holo",
-                          "E_LO",
-                          H5T_NATIVE_DOUBLE,
-                          cgdims,
-                          holo_E_LO.data(),
-                          "erg/cm3",
-                          cfg);
-    write_numeric_dataset(file,
-                          "holo",
-                          "consistency_source",
-                          H5T_NATIVE_DOUBLE,
-                          cgdims,
-                          holo_consistency_source.data(),
-                          "erg/s",
-                          cfg);
-    write_numeric_dataset(file,
-                          "holo",
-                          "rad_dep_LO",
-                          H5T_NATIVE_DOUBLE,
-                          cgdims,
-                          holo_rad_dep.data(),
-                          "erg",
-                          cfg);
-    write_numeric_dataset(file,
-                          "holo",
-                          "rad_emit_LO",
-                          H5T_NATIVE_DOUBLE,
-                          cgdims,
-                          holo_rad_emit.data(),
-                          "erg",
-                          cfg);
-    write_numeric_dataset(file,
-                          "holo",
-                          "Prr_HO",
-                          H5T_NATIVE_DOUBLE,
-                          cgdims,
-                          holo_Prr.data(),
-                          "erg/cm3",
-                          cfg);
-    write_numeric_dataset(file,
-                          "holo",
-                          "chi",
-                          H5T_NATIVE_DOUBLE,
-                          cgdims,
-                          holo_chi.data(),
-                          "dimensionless",
-                          cfg);
-    write_numeric_dataset(file,
-                          "holo",
-                          "Prr_coverage",
-                          H5T_NATIVE_DOUBLE,
-                          cgdims,
-                          holo_Prr_coverage.data(),
-                          "dimensionless",
-                          cfg);
-    write_numeric_dataset(file,
-                          "holo",
-                          "core_mask",
-                          H5T_NATIVE_UINT8,
-                          {static_cast<hsize_t>(n_cells)},
-                          state.holo_core_mask.data(),
-                          "flag",
-                          cfg);
-    if (state.holo_core_prev_mask.size() == n_cells) {
-      write_numeric_dataset(file,
-                            "holo",
-                            "prev_core_mask",
-                            H5T_NATIVE_UINT8,
-                            {static_cast<hsize_t>(n_cells)},
-                            state.holo_core_prev_mask.data(),
-                            "flag",
-                            cfg);
-    }
-    if (state.holo_hold_count.size() == n_cells) {
-      write_numeric_dataset(file,
-                            "holo",
-                            "hold_count",
-                            H5T_NATIVE_INT32,
-                            {static_cast<hsize_t>(n_cells)},
-                            state.holo_hold_count.data(),
-                            "count",
-                            cfg);
-    }
-    if (state.holo_dwell_count.size() == n_cells) {
-      write_numeric_dataset(file,
-                            "holo",
-                            "dwell_count",
-                            H5T_NATIVE_INT32,
-                            {static_cast<hsize_t>(n_cells)},
-                            state.holo_dwell_count.data(),
-                            "count",
-                            cfg);
-    }
-    if (state.holo_tau_R.size() == n_cells) {
-      write_numeric_dataset(file,
-                            "holo",
-                            "tau_R",
-                            H5T_NATIVE_DOUBLE,
-                            {static_cast<hsize_t>(n_cells)},
-                            state.holo_tau_R.data(),
-                            "dimensionless",
-                            cfg);
-    }
-    if (state.holo_reduced_flux.size() == n_cells) {
-      write_numeric_dataset(file,
-                            "holo",
-                            "reduced_flux",
-                            H5T_NATIVE_DOUBLE,
-                            {static_cast<hsize_t>(n_cells)},
-                            state.holo_reduced_flux.data(),
-                            "dimensionless",
-                            cfg);
-    }
-    if (state.holo_mass_q.size() == n_cells) {
-      write_numeric_dataset(file,
-                            "holo",
-                            "mass_q",
-                            H5T_NATIVE_DOUBLE,
-                            {static_cast<hsize_t>(n_cells)},
-                            state.holo_mass_q.data(),
-                            "dimensionless",
-                            cfg);
-    }
-  }
-
-  if (cfg.radiation.imc.difference.enabled) {
-    if (difference_W.size() == n_cells) {
-      write_numeric_dataset(file,
-                            "difference",
-                            "W",
-                            H5T_NATIVE_DOUBLE,
-                            {static_cast<hsize_t>(n_cells)},
-                            difference_W.data(),
-                            "dimensionless",
-                            cfg);
-    }
-    if (difference_E_ref.size() == n_cell_groups) {
-      write_numeric_dataset(file,
-                            "difference",
-                            "E_ref",
-                            H5T_NATIVE_DOUBLE,
-                            cgdims,
-                            difference_E_ref.data(),
-                            "erg/cm3",
-                            cfg);
-    }
-    if (difference_residual_E.size() == n_cell_groups) {
-      write_numeric_dataset(file,
-                            "difference",
-                            "residual_energy_density",
-                            H5T_NATIVE_DOUBLE,
-                            cgdims,
-                            difference_residual_E.data(),
-                            "erg/cm3",
-                            cfg);
-    }
-  }
-
 }
 
 void write_laser_mesh_group(const hid_t file,
@@ -4580,7 +4360,6 @@ void write_common_snapshot_content(const hid_t file,
 void write_checkpoint_extras(const hid_t file,
                              const core::State& state,
                              const core::Config& cfg,
-                             const radiation::PhotonPool& pool,
                              const int step,
                              const double t) {
   write_ale_reference_checkpoint_group(file, state, cfg);
@@ -4707,161 +4486,6 @@ void write_checkpoint_extras(const hid_t file,
                             "flag",
                             cfg);
     }
-  }
-
-  const std::size_t n_p = static_cast<std::size_t>(std::max(pool.n_alive, 0));
-  const std::int64_t n_particles_i64 = static_cast<std::int64_t>(n_p);
-  const hid_t particles_group = ensure_group(file, "particles");
-  TENRYU_ASSERT(particles_group >= 0, "HDF5 failed to open particles group");
-  write_scalar_attribute_i64(particles_group, "n_particles", n_particles_i64);
-  warn_h5_close_failure(H5Gclose(particles_group), "H5Gclose",
-                        "HDF5Writer::write_checkpoint_extras(particles_group)");
-
-  const std::int64_t capacity_i64 = static_cast<std::int64_t>(std::max(pool.capacity, 0));
-  write_numeric_dataset(file,
-                        "particles",
-                        "pool_capacity",
-                        H5T_NATIVE_INT64,
-                        {},
-                        &capacity_i64,
-                        "count",
-                        cfg);
-
-  if (n_p > 0) {
-    // Known overhead: checkpoint write materializes many full-size host mirrors
-    // of PhotonPool SoA fields. This favors simple schema writes today; a future
-    // streaming/chunked path can reduce peak transient host memory.
-    const auto pos_r = copy_device_array(pool.pos_r, n_p, "PhotonPool.pos_r");
-    const auto pos_z = copy_device_array(pool.pos_z, n_p, "PhotonPool.pos_z");
-    const auto dir_r = copy_device_array(pool.dir_r, n_p, "PhotonPool.dir_r");
-    const auto dir_z = copy_device_array(pool.dir_z, n_p, "PhotonPool.dir_z");
-    const auto dir_phi = copy_device_array(pool.dir_phi, n_p, "PhotonPool.dir_phi");
-    const auto energy = copy_device_array(pool.energy, n_p, "PhotonPool.energy");
-    const auto birth_energy =
-        copy_device_array(pool.birth_energy, n_p, "PhotonPool.birth_energy");
-    const auto sign = copy_device_array(pool.sign, n_p, "PhotonPool.sign");
-    const auto group_id = copy_device_array(pool.group_id, n_p, "PhotonPool.group_id");
-    const auto cell_id = copy_device_array(pool.cell_id, n_p, "PhotonPool.cell_id");
-    const auto mode = copy_device_array(pool.mode, n_p, "PhotonPool.mode");
-    const auto alive = copy_device_array(pool.alive, n_p, "PhotonPool.alive");
-    const auto global_id = copy_device_array(pool.global_id, n_p, "PhotonPool.global_id");
-    const auto weight = copy_device_array(pool.weight, n_p, "PhotonPool.weight");
-    const auto time_remain =
-        copy_device_array(pool.time_remain, n_p, "PhotonPool.time_remain");
-    const auto rng_counter =
-        copy_device_array(pool.rng_counter, n_p, "PhotonPool.rng_counter");
-
-    const std::vector<hsize_t> pdims = {static_cast<hsize_t>(n_p)};
-
-    write_numeric_dataset(file, "particles", "pos_r", H5T_NATIVE_DOUBLE, pdims, pos_r.data(), "cm", cfg);
-    write_numeric_dataset(file, "particles", "pos_z", H5T_NATIVE_DOUBLE, pdims, pos_z.data(), "cm", cfg);
-    write_numeric_dataset(file, "particles", "dir_r", H5T_NATIVE_DOUBLE, pdims, dir_r.data(), "dimensionless", cfg);
-    write_numeric_dataset(file, "particles", "dir_z", H5T_NATIVE_DOUBLE, pdims, dir_z.data(), "dimensionless", cfg);
-    write_numeric_dataset(file,
-                          "particles",
-                          "dir_phi",
-                          H5T_NATIVE_DOUBLE,
-                          pdims,
-                          dir_phi.data(),
-                          "dimensionless",
-                          cfg);
-    write_numeric_dataset(file,
-                          "particles",
-                          "energy",
-                          H5T_NATIVE_DOUBLE,
-                          pdims,
-                          energy.data(),
-                          "erg",
-                          cfg);
-    write_numeric_dataset(file,
-                          "particles",
-                          "birth_energy",
-                          H5T_NATIVE_DOUBLE,
-                          pdims,
-                          birth_energy.data(),
-                          "erg",
-                          cfg);
-    write_numeric_dataset(file,
-                          "particles",
-                          "sign",
-                          H5T_NATIVE_INT8,
-                          pdims,
-                          sign.data(),
-                          "dimensionless",
-                          cfg);
-    write_numeric_dataset(file,
-                          "particles",
-                          "group_id",
-                          H5T_NATIVE_UINT16,
-                          pdims,
-                          group_id.data(),
-                          "index",
-                          cfg);
-    write_numeric_dataset(file,
-                          "particles",
-                          "cell_id",
-                          H5T_NATIVE_INT32,
-                          pdims,
-                          cell_id.data(),
-                          "index",
-                          cfg);
-    write_numeric_dataset(file,
-                          "particles",
-                          "mode",
-                          H5T_NATIVE_UINT8,
-                          pdims,
-                          mode.data(),
-                          "flag",
-                          cfg);
-    write_numeric_dataset(file,
-                          "particles",
-                          "alive",
-                          H5T_NATIVE_UINT8,
-                          pdims,
-                          alive.data(),
-                          "flag",
-                          cfg);
-    write_numeric_dataset(file,
-                          "particles",
-                          "global_id",
-                          H5T_NATIVE_UINT64,
-                          pdims,
-                          global_id.data(),
-                          "id",
-                          cfg);
-    write_numeric_dataset(file,
-                          "particles",
-                          "weight",
-                          H5T_NATIVE_DOUBLE,
-                          pdims,
-                          weight.data(),
-                          "dimensionless",
-                          cfg);
-    write_numeric_dataset(file,
-                          "particles",
-                          "time_remain",
-                          H5T_NATIVE_DOUBLE,
-                          pdims,
-                          time_remain.data(),
-                          "s",
-                          cfg);
-
-    write_numeric_dataset(file,
-                          "rng",
-                          "rng_counter",
-                          H5T_NATIVE_UINT32,
-                          pdims,
-                          rng_counter.data(),
-                          "count",
-                          cfg);
-    write_numeric_dataset(file,
-                          "rng",
-                          "global_id",
-                          H5T_NATIVE_UINT64,
-                          pdims,
-                          global_id.data(),
-                          "id",
-                          cfg);
   }
 
   write_numeric_dataset(file,
@@ -5397,7 +5021,6 @@ void HDF5Writer::write_snapshot_in_background(const core::State& state,
 std::string HDF5Writer::write_checkpoint(
     const core::State& state,
     const core::Config& cfg,
-    const radiation::PhotonPool& photon_pool,
     const int file_index,
     const int step,
     const double t,
@@ -5419,7 +5042,7 @@ std::string HDF5Writer::write_checkpoint(
     DeferredDeflateChunks deferred(deflate_level(cfg));
     const DeferredDeflateScope deferred_scope(&deferred);
     write_common_snapshot_content(file, state, cfg, step, t, output_dir, case_name);
-    write_checkpoint_extras(file, state, cfg, photon_pool, step, t);
+    write_checkpoint_extras(file, state, cfg, step, t);
     deferred.finish();
   }
 
@@ -5440,7 +5063,6 @@ std::string HDF5Writer::write_checkpoint(
 #else
   (void)state;
   (void)cfg;
-  (void)photon_pool;
   (void)file_index;
   (void)step;
   (void)t;

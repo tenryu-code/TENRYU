@@ -182,7 +182,9 @@ __device__ __forceinline__ double compute_node_sigma_1d_device(
   double r_right = 0.0;
   double u_right = 0.0;
   if (j == 0) {
-    r_left = -node_r[1];
+    // Mirror ghost across the fixed inner wall at node_r[0] (the centre r = 0 or a rigid wall at r_min > 0);
+    // equals -node_r[1] bitwise when node_r[0] = 0. The wall is at rest, so the ghost velocity is -u_1.
+    r_left = 2.0 * node_r[0] - node_r[1];
     u_left = -node_u[1];
   } else {
     r_left = node_r[j - 1];

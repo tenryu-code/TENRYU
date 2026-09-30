@@ -468,7 +468,86 @@ def defaults_diff(frozen: dict, baseline: dict) -> dict:
     return result
 
 
+def learned_mesh_lints(preview, frozen=None):
+    """Recompute from solver-observed conditions, never from deck provenance claims.
+
+    The single exception is the a-priori baseline: a claim within the solver's own 3 %
+    provenance tolerance is used as the recomputation baseline, so an offline block (the
+    tool's replica ceiling) verifies exactly on the numbers it was computed from.
+    """
+    from tools.assist.recommend_mesh import (
+        achieved_surface, conditions_from_preview, recommendation_payload,
+    )
+
+    frozen_empirical = None
+    if isinstance(frozen, dict):
+        mesh = frozen.get("mesh")
+        rr = mesh.get("resolution_requirement") if isinstance(mesh, dict) else None
+        frozen_empirical = rr.get("empirical") if isinstance(rr, dict) else None
+    requirement = preview.get("mesh_requirement") if isinstance(preview, dict) else None
+    if not isinstance(requirement, dict):
+        if frozen_empirical is not None:
+            return None, [dict(id="empirical-mesh-integrity", severity="hard", ok=False,
+                               detail=dict(reason="No solver preview to verify empirical provenance"))]
+        return None, []
+    params = requirement.get("params")
+    empirical = params.get("empirical") if isinstance(params, dict) else None
+    if empirical is None:
+        empirical = frozen_empirical
+    lints = []
+    try:
+        source = conditions_from_preview(preview)
+        basis = requirement
+        # A block computed offline (the tool's replica of the a-priori ceiling) or by another
+        # build differs slightly from this binary's ceiling. Within the solver's own 3 %
+        # provenance tolerance the recommendation is recomputed on the block's baseline, so
+        # every other number must still match exactly.
+        ablation = requirement.get("ablation") if isinstance(requirement.get("ablation"), dict) else {}
+        solver_apriori = ablation.get("apriori_ceiling_formation_g_cm2")
+        claimed_apriori = empirical.get("reference_apriori_g_cm2") if isinstance(empirical, dict) else None
+        if all(isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) and v > 0
+               for v in (solver_apriori, claimed_apriori)) and abs(claimed_apriori / solver_apriori - 1.0) <= 0.03:
+            basis = dict(requirement, ablation=dict(ablation, apriori_ceiling_formation_g_cm2=claimed_apriori))
+        payload = recommendation_payload(source, basis)
+        achieved = achieved_surface(preview, payload["conditions"], payload["recommendation"])
+        expected = payload["recommendation"]["empirical"]
+        if empirical is not None:
+            ok = isinstance(empirical, dict) and expected is not None
+            if ok:
+                for key in ("reference_sha256", "case_ids"):
+                    ok = ok and empirical.get(key) == expected[key]
+                for key in ("surface_ceiling_g_cm2", "reference_apriori_g_cm2"):
+                    value = empirical.get(key)
+                    ok = ok and isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and math.isclose(value, expected[key], rel_tol=1e-6, abs_tol=0)
+                if frozen_empirical is not None:
+                    ok = ok and isinstance(frozen_empirical, dict) and all(frozen_empirical.get(k) == empirical.get(k) for k in expected)
+            reason = "Recomputed from solver conditions and shipped table; rerun recommend-mesh to repair."
+            claimed = next((block.get("reference_sha256") for block in (empirical, frozen_empirical)
+                            if isinstance(block, dict) and block.get("reference_sha256") != payload["reference_sha256"]),
+                           payload["reference_sha256"])
+            if claimed != payload["reference_sha256"]:
+                reason = ("Reference table SHA-256 is " + payload["reference_sha256"] +
+                          "; deck digest differs: " + str(claimed) + ". Regenerate from the same checkout state.")
+            lints.append(dict(id="empirical-mesh-integrity", severity="hard", ok=bool(ok),
+                              detail=dict(expected=expected, actual=empirical,
+                                          reason=reason)))
+        lints.append(dict(id="learned-surface-resolution", severity="warn",
+                          ok=achieved is not None and achieved <= payload["recommendation"]["surface_areal_mass_g_cm2"] * (1 + 1e-6),
+                          detail=dict(achieved_g_cm2=achieved,
+                                      recommended_g_cm2=payload["recommendation"]["surface_areal_mass_g_cm2"], flags=payload["flags"])))
+        # Keep prompts/journals small; full LOO evidence remains in recommend-mesh output.
+        compact = {key: payload[key] for key in ("recommendation", "evidence", "confidence", "flags", "warnings", "budget", "mesh_block", "numerics_note", "reference_sha256")}
+        compact["loo"] = {k: v for k, v in payload["loo"].items() if k != "cases"}
+        return compact, lints
+    except (ValueError, KeyError, TypeError, OSError) as error:
+        if empirical is not None:
+            lints.append(dict(id="empirical-mesh-integrity", severity="hard", ok=False,
+                              detail=dict(reason="Cannot independently recompute: " + str(error))))
+        return None, lints
+
+
 def _resolve_tenryu(requested: Optional[str]) -> Optional[str]:
+    requested = requested or os.environ.get("TENRYU_BIN")
     if requested is None:
         path = _REPO_ROOT / "build" / "tenryu"
     else:
@@ -599,6 +678,8 @@ def run_deck_lint(deck: str, tenryu: str, pins=None, baseline=None, keep_tmp=Fal
                     frozen = loaded
 
         lints = []
+        recommendation, empirical_lints = learned_mesh_lints(preview, frozen)
+        lints.extend(empirical_lints)
         preview_summary = None
         if isinstance(preview, dict):
             r_nodes = preview.get("r_nodes")
@@ -680,6 +761,7 @@ def run_deck_lint(deck: str, tenryu: str, pins=None, baseline=None, keep_tmp=Fal
             },
             "mesh_preview": preview_summary,
             "resolution_requirement_summary": requirement_summary(preview),
+            "mesh_recommendation": recommendation,
             "mesh_requirement": (
                 preview.get("mesh_requirement")
                 if isinstance(preview, dict)

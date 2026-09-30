@@ -44,7 +44,7 @@ Geometry(
 )
 
 Numerics(
-    dt=dict(initial_s=8.33e-12, max_s=8.33e-12, f_min_fleck=1.0e-6),
+    dt=dict(initial_s=8.33e-12, max_s=8.33e-12),
     hydro=dict(enabled=False, boundary_1d="reflect", av_C1=0.1, av_C2=1.5),
     conduction=dict(enabled=False),
     floors=dict(rho_floor_gcc=1.0e-10, Te_floor_eV=1.0, Ti_floor_eV=1.0),
@@ -56,18 +56,6 @@ Radiation(
     groups=1,
     group_bounds_eV="log_uniform",
     compute_T_range_eV=[1.0, 30000.0],
-    imc=dict(
-        alpha=1.0,
-        f_max=1.0,
-        particles_per_cell_group=100,
-        implicit_capture=True,
-        cutoff_fraction=1.0e-3,
-        inelastic_scatter=False,
-        weight_cutoff=1.0e-10,
-        roulette_survival=0.1,
-        linearized_planck=False,
-    ),
-    ddmc=dict(enabled=False),
     multigroup_diffusion=dict(
         boundary=dict(inner_r="reflect", outer_r="marshak")
     ),

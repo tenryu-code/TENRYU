@@ -21,7 +21,7 @@ enum DtLimiterId : int {
   kDtLimiterHydro = 1,
   kDtLimiterConduction = 2,
   kDtLimiterBraginskii = 3,
-  kDtLimiterRadiation = 4,
+  // 4 was the Monte Carlo radiation's time-step limit (retired 2026-09-29).
   kDtLimiterGrowth = 5,
   kDtLimiterOutput = 6,
   kDtLimiterTEnd = 7,
@@ -68,31 +68,10 @@ __host__ __device__ inline double dt_cond_post(const double min_ratio,
   return INFINITY;
 }
 
-__host__ __device__ inline double dt_rad_post(const double dt_rad_reduced,
-                                              const double max_sigma_P,
-                                              const int use_nlte_table,
-                                              const double f_min,
-                                              const double alpha,
-                                              const double c_light) {
-  double dt_rad = dt_rad_reduced;
-  if (use_nlte_table && max_sigma_P > 0.0 &&
-      (!detail::dt_ctrl_finite(dt_rad) || dt_rad <= 0.0)) {
-    const double safety = (1.0 - f_min) / (f_min * alpha);
-    if (safety > 0.0) {
-      const double bound = safety / (c_light * max_sigma_P);
-      if (detail::dt_ctrl_finite(bound) && bound > 0.0) {
-        dt_rad = (bound < dt_rad) ? bound : dt_rad;
-      }
-    }
-  }
-  return dt_rad;
-}
-
 struct DtLadderIn {
   double dt_hydro;
   double dt_cond;
   double dt_visc;
-  double dt_rad;
   double dt_prev;
   double growth_factor;
   double dt_max;
@@ -114,7 +93,6 @@ __host__ __device__ inline DtLadderOut dt_ladder_eval(
   dt_new = (in.dt_hydro < dt_new) ? in.dt_hydro : dt_new;
   dt_new = (in.dt_cond < dt_new) ? in.dt_cond : dt_new;
   dt_new = (in.dt_visc < dt_new) ? in.dt_visc : dt_new;
-  dt_new = (in.dt_rad < dt_new) ? in.dt_rad : dt_new;
   const double dt_growth = in.growth_factor * in.dt_prev;
   dt_new = (dt_growth < dt_new) ? dt_growth : dt_new;
   dt_new = (in.dt_max < dt_new) ? in.dt_max : dt_new;
@@ -129,8 +107,6 @@ __host__ __device__ inline DtLadderOut dt_ladder_eval(
     limiter = kDtLimiterConduction;
   } else if (dt_new == in.dt_visc) {
     limiter = kDtLimiterBraginskii;
-  } else if (dt_new == in.dt_rad) {
-    limiter = kDtLimiterRadiation;
   } else if (dt_new == dt_growth) {
     limiter = kDtLimiterGrowth;
   } else if (dt_new == in.dt_output) {

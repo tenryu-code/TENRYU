@@ -81,7 +81,6 @@ struct PersistentParams {
   int laser_trace = 0;
   volatile int* progress = nullptr;
   double* phase_prof_slab = nullptr;
-  int renorm_active = 0;
   int hydro_enabled = 0;
   int compatible_energy = 0;
   int energy_authoritative = 0;
@@ -190,8 +189,6 @@ struct PersistentParams {
   double laser_beam_f_number = 8.0;
   double laser_beam_focus_lab_z = 0.0;  // Beam::axial_focus_1d() of the beam
   double laser_beam_profile_w0_cm = 0.0;
-  double fld_alpha = 1.0;
-  double fld_f_min = 0.01;
   double growth_factor = 1.2;
   double dt_max = 1.0e-9;
   double r_min = 0.0;
@@ -273,6 +270,7 @@ struct PersistentDeviceBuffers {
   double* cond_rho_cv_e = nullptr;
   double* cond_te_tmp = nullptr;
   double* cond_flux_limiter_faces = nullptr;
+  double* cond_kappa_face = nullptr;
   double* cond_diag3 = nullptr;
   double* cond_A_eff = nullptr;
   double* cond_gamma_eff = nullptr;
@@ -313,6 +311,7 @@ struct PersistentDeviceBuffers {
   double* fld_nlte_eta_cdf_work = nullptr;
   double* fld_nlte_lambda_work = nullptr;
   double* fld_marshak_finc = nullptr;
+  double* fld_outer_transfer = nullptr;  // [h_eff, ratio] per group of the last assembly (fld_1d_outer_transfer)
   double* laser_dep = nullptr;
   double* laser_node_R = nullptr;
   double* laser_node_Z = nullptr;
@@ -361,6 +360,9 @@ struct PersistentDeviceBuffers {
   double* laser_cell_n_hat = nullptr;
   double* laser_widths = nullptr;
   std::uint8_t* laser_cell_is_void = nullptr;
+  // The state's dominant material per cell (multi-material decks, else nullptr): the laser-mesh n_e
+  // interpolation pairs cells of the same material only, as in laser_mesh.cu.
+  const int* laser_cell_material_index = nullptr;
 
   double* grid_reduce_partials = nullptr;
   int* grid_reduce_indices = nullptr;
@@ -381,7 +383,6 @@ struct PersistentDiagRecord {
   double dt = 0.0;
   double cand_hydro = 0.0;
   double cand_cond = 0.0;
-  double cand_rad = 0.0;
   double checksum_u = 0.0;
   double checksum_e = 0.0;
   double fld_outer_residual = 0.0;
@@ -422,7 +423,7 @@ struct PersistentDiagRecord {
   int clamp_count = 0;
 };
 
-static constexpr int kPersistentDiagRecordVersion = 7;
+static constexpr int kPersistentDiagRecordVersion = 8;
 
 // PersistentChunkResult::error_code packs:
 // low 8 bits reason enum:
@@ -430,8 +431,9 @@ static constexpr int kPersistentDiagRecordVersion = 7;
 // 3=hydro non-positive volume, 4=FLD divergence, 5=conduction,
 // 6=non-finite state field (Numerics.safety.nan_fatal).
 // For reason 2, bits 8..15 hold laser flag bits:
-// nan_particle/invalid_cell/invalid_boundary/pool_overflow/
-// opacity_out_of_range/infinite_loop/ddmc_sigma_tot_zero/roulette_kill.
+// nan_particle/invalid_cell/invalid_boundary/-/opacity_out_of_range/infinite_loop/-/-
+// (bits 3, 6 and 7 were the Monte Carlo radiation's pool_overflow, ddmc_sigma_tot_zero and roulette_kill, retired
+// 2026-09-29; the other bits keep their positions).
 constexpr int kPkErrorReasonMask = 0xff;
 constexpr int kPkErrorLaserFlagShift = 8;
 
@@ -448,11 +450,8 @@ enum PkLaserErrorFlagBits {
   kPkLaserFlagNanParticle = 1 << 0,
   kPkLaserFlagInvalidCell = 1 << 1,
   kPkLaserFlagInvalidBoundary = 1 << 2,
-  kPkLaserFlagPoolOverflow = 1 << 3,
   kPkLaserFlagOpacityOutOfRange = 1 << 4,
   kPkLaserFlagInfiniteLoop = 1 << 5,
-  kPkLaserFlagDdmcSigmaTotZero = 1 << 6,
-  kPkLaserFlagRouletteKill = 1 << 7,
 };
 
 __host__ __device__ inline int pk_encode_error_code(const int reason,
@@ -568,20 +567,11 @@ __device__ inline int pk_laser_error_mask_from_flags(
   if (*(volatile const std::int32_t*)&flags->invalid_boundary != 0) {
     mask |= kPkLaserFlagInvalidBoundary;
   }
-  if (*(volatile const std::int32_t*)&flags->pool_overflow != 0) {
-    mask |= kPkLaserFlagPoolOverflow;
-  }
   if (*(volatile const std::int32_t*)&flags->opacity_out_of_range != 0) {
     mask |= kPkLaserFlagOpacityOutOfRange;
   }
   if (*(volatile const std::int32_t*)&flags->infinite_loop != 0) {
     mask |= kPkLaserFlagInfiniteLoop;
-  }
-  if (*(volatile const std::int32_t*)&flags->ddmc_sigma_tot_zero != 0) {
-    mask |= kPkLaserFlagDdmcSigmaTotZero;
-  }
-  if (*(volatile const std::int32_t*)&flags->roulette_kill != 0) {
-    mask |= kPkLaserFlagRouletteKill;
   }
   return mask;
 }
@@ -735,16 +725,10 @@ std::string pk_laser_flag_names(const int mask) {
                             "invalid_cell");
   pk_append_laser_flag_name(out, mask, kPkLaserFlagInvalidBoundary,
                             "invalid_boundary");
-  pk_append_laser_flag_name(out, mask, kPkLaserFlagPoolOverflow,
-                            "pool_overflow");
   pk_append_laser_flag_name(out, mask, kPkLaserFlagOpacityOutOfRange,
                             "opacity_out_of_range");
   pk_append_laser_flag_name(out, mask, kPkLaserFlagInfiniteLoop,
                             "infinite_loop");
-  pk_append_laser_flag_name(out, mask, kPkLaserFlagDdmcSigmaTotZero,
-                            "ddmc_sigma_tot_zero");
-  pk_append_laser_flag_name(out, mask, kPkLaserFlagRouletteKill,
-                            "roulette_kill");
   return out.empty() ? std::string("none") : out;
 }
 
@@ -1030,6 +1014,24 @@ int first_trailing_void_cell(const core::State& state) {
   return first_void;
 }
 
+// A run of two or more contiguous void cells other than the trailing one (the exterior vacuum): a vacuum behind a
+// foil, inside a shell or between layers.
+bool has_non_trailing_void_run(const core::State& state) {
+  const int n_cells = static_cast<int>(state.rho.size());
+  if (n_cells <= 0 || state.cell_is_void.size() != static_cast<std::size_t>(n_cells)) {
+    return false;
+  }
+  const int trailing = first_trailing_void_cell(state);
+  int run = 0;
+  for (int c = 0; c < trailing; ++c) {
+    run = (state.cell_is_void[static_cast<std::size_t>(c)] != 0U) ? run + 1 : 0;
+    if (run >= 2) {
+      return true;
+    }
+  }
+  return false;
+}
+
 int persistent_fld_limiter_id(const std::string& limiter) {
   if (limiter == "larsen") {
     return 1;
@@ -1248,19 +1250,6 @@ __device__ double ghost_pq_device(const PersistentParams& p,
   return b.Pe[last] + b.Pi[last] + b.Qvisc[last];
 }
 
-// I + K of the 1T renormalization (Hydro1D::lagrangian_step), K on the
-// nodes: sum 1/4 m (u_j^2 + u_j+1^2), the staggered scheme's kinetic energy.
-__device__ double block_total_energy_1d(const PersistentParams& p,
-                                        const PersistentDeviceBuffers& b,
-                                        double* smem) {
-  double local = 0.0;
-  for (int c = pk_thread_id(p); c < p.n_cells; c += pk_thread_stride(p)) {
-    local += b.rho[c] * (b.ee[c] + b.ei[c]) * b.vol[c] +
-             0.25 * b.mass[c] * (b.v_r[c] * b.v_r[c] + b.v_r[c + 1] * b.v_r[c + 1]);
-  }
-  return pk_reduce_sum(p, b, local, smem);
-}
-
 // Radiation energy of cell c, sum_g E_g V, as the audit
 // compute_fld_rad_energy_total_device counts it (an entry with a non-finite
 // E_g or V, or V <= 0, contributes zero).
@@ -1305,34 +1294,6 @@ __device__ double pk_rad_energy_total(const PersistentParams& p,
   double local = 0.0;
   for (int c = pk_thread_id(p); c < p.n_cells; c += pk_thread_stride(p)) {
     local += pk_rad_energy_cell(p, b, c);
-  }
-  return pk_reduce_sum(p, b, local, smem);
-}
-
-__device__ double block_active_mass_1d(const PersistentParams& p,
-                                       const PersistentDeviceBuffers& b,
-                                       double* smem) {
-  double local = 0.0;
-  for (int c = pk_thread_id(p); c < p.n_cells; c += pk_thread_stride(p)) {
-    const bool active =
-        (b.hydro_active == nullptr) || (b.hydro_active[c] != 0);
-    if (active) {
-      local += b.mass[c];
-    }
-  }
-  return pk_reduce_sum(p, b, local, smem);
-}
-
-__device__ double block_active_internal_1d(const PersistentParams& p,
-                                           const PersistentDeviceBuffers& b,
-                                           double* smem) {
-  double local = 0.0;
-  for (int c = pk_thread_id(p); c < p.n_cells; c += pk_thread_stride(p)) {
-    const bool active =
-        (b.hydro_active == nullptr) || (b.hydro_active[c] != 0);
-    if (active) {
-      local += b.mass[c] * fmax(b.ee[c], 0.0);
-    }
   }
   return pk_reduce_sum(p, b, local, smem);
 }
@@ -2024,10 +1985,10 @@ __device__ bool persistent_laser_prepare_mesh_1d(
   const double R_crit = fmin(R_max, fmax(0.0, R_crit_raw));
   const double dR_fine = fmax(p.laser_lmesh_mesh_factor * min_dr_crit,
                               1.0e-12);
-  const int nr = persistent_laser_build_graded_nodes_1d(
+  int nr = persistent_laser_build_graded_nodes_1d(
       R_crit, dR_fine, R_max, p.laser_lmesh_nr_max, b.laser_node_R,
       b.laser_node_Z, b.laser_widths);
-  const int nz = 2 * nr;
+  int nz = 2 * nr;
   if (nr > p.laser_lmesh_nr_capacity || nz > p.laser_lmesh_nz_capacity) {
     pk_raise_error(error_flag,
                    pk_encode_error_code(kPkErrorLaserMeshPrep));
@@ -2102,6 +2063,18 @@ __device__ bool persistent_laser_prepare_mesh_1d(
                  1.0e-30)
           : 0.0;
   const double r_ghost_outer = r_surface_outer + ghost_width;
+  // As map_from_hydro_1d (2026-09-29): a ghost corona reaching past the mesh's outer radius rebuilds the nodes
+  // with the outer radius 4 fine cells (at least 5 %) beyond the ghost's outer edge, so the rays start in vacuum.
+  if (use_ghost_corona != 0 && r_ghost_outer >= b.laser_node_R[nr]) {
+    const double R_ext = fmax(R_max, r_ghost_outer + fmax(4.0 * dR_fine, 0.05 * r_ghost_outer));
+    nr = persistent_laser_build_graded_nodes_1d(R_crit, dR_fine, R_ext, p.laser_lmesh_nr_max, b.laser_node_R,
+                                                b.laser_node_Z, b.laser_widths);
+    nz = 2 * nr;
+    if (nr > p.laser_lmesh_nr_capacity || nz > p.laser_lmesh_nz_capacity) {
+      pk_raise_error(error_flag, pk_encode_error_code(kPkErrorLaserMeshPrep));
+      return false;
+    }
+  }
   const double ghost_log_span =
       (use_ghost_corona != 0) ? log(ghost_ne_inner / ghost_ne_min) : 0.0;
   const double ghost_scale_length =
@@ -2429,11 +2402,8 @@ __device__ void persistent_laser_raytrace_1d_folded(
       b.laser_error_flags->nan_particle = 0;
       b.laser_error_flags->invalid_cell = 0;
       b.laser_error_flags->invalid_boundary = 0;
-      b.laser_error_flags->pool_overflow = 0;
       b.laser_error_flags->opacity_out_of_range = 0;
       b.laser_error_flags->infinite_loop = 0;
-      b.laser_error_flags->ddmc_sigma_tot_zero = 0;
-      b.laser_error_flags->roulette_kill = 0;
       b.laser_error_flags->unresolved_quadrature = 0;
     }
     if (b.laser_unabsorbed != nullptr) {
@@ -2533,7 +2503,7 @@ __device__ void persistent_laser_raytrace_1d_folded(
         sh_zbar_anchor, p.laser_lmesh_ghost_zbar_min,
         p.laser_lmesh_ghost_zbar_max,
         p.laser_lmesh_ghost_Te_min_eV, p.laser_lmesh_critical_clip,
-        p.laser_lmesh_n_hat_margin, sh_fcrit_cell);
+        p.laser_lmesh_n_hat_margin, sh_fcrit_cell, b.laser_cell_material_index);
   }
   pk_sync(p);
   persistent_laser_trace_substage(p, local_step, beam_power, "prep_map");
@@ -2572,7 +2542,7 @@ __device__ void persistent_laser_raytrace_1d_folded(
         sh_zbar_anchor, p.laser_lmesh_ghost_zbar_min,
         p.laser_lmesh_ghost_zbar_max,
         p.laser_lmesh_ghost_Te_min_eV, p.laser_lmesh_critical_clip,
-        p.laser_lmesh_n_hat_margin, sh_fcrit_cell);
+        p.laser_lmesh_n_hat_margin, sh_fcrit_cell, b.laser_cell_material_index);
   }
   pk_sync(p);
   for (int i = pk_thread_id(p); i < sh_n_profile; i += pk_thread_stride(p)) {
@@ -3147,6 +3117,10 @@ __device__ void persistent_conduction_flux_limiter_faces(
         face, b.cond_flux_limiter_faces, b.Te, b.cond_kappa_eff, b.rho,
         b.zbar, b.cond_A_eff, b.x_r, p.n_cells, p.conduction_f_lim,
         limiter_face_kirchhoff);
+    // The Kirchhoff face conductivities of the step start, held fixed through the stages (NUMERICS §4.2); the
+    // stage body reads them instead of re-evaluating the closure with the stage temperatures.
+    compute_1d_face_kappa_kernel_body(face, b.cond_kappa_face, b.cond_kappa_eff, b.Te, p.n_cells,
+                                      limiter_face_kirchhoff);
   }
   pk_sync(p);
 }
@@ -3173,7 +3147,7 @@ __device__ void persistent_conduction_stage_geom(const PersistentParams& p,
           b.clamp_count, b.E_floor);
     } else if (kirchhoff) {
       conduction_1d_sts_stage_kirchhoff_legacy_inline_alpha_kernel_body<GEOM>(
-          c, te_curr, te_next, b.cond_kappa_eff, flux_limiter,
+          c, te_curr, te_next, b.cond_kappa_face, flux_limiter,
           b.cond_rho_cv_e, b.cell_is_void, b.vol, b.x_r, p.n_cells, tau,
           p.Te_floor, b.clamp_count, b.E_floor);
     } else {
@@ -3290,17 +3264,6 @@ __device__ void persistent_conduction_step(const PersistentParams& p,
   pk_sync(p);
 }
 
-// Numerics.dt.f_min_fleck is an IMC-only time-step constraint (NUMERICS
-// §2.2 (c)); the persistent FLD loop never applies it, matching
-// compute_dt_rad_limit, which returns +inf unless Radiation.mode = imc_ddmc
-// (2026-09-15). The signature is kept so the dt ladder call site is unchanged.
-__device__ double persistent_fld_dt_rad(const PersistentParams& /*p*/,
-                                        const PersistentDeviceBuffers& /*b*/,
-                                        double* /*smem_v*/,
-                                        int* /*smem_i*/) {
-  return CUDART_INF;
-}
-
 template <int GEOM>
 __device__ void persistent_fld_assemble_geom(const PersistentParams& p,
                                              const PersistentDeviceBuffers& b,
@@ -3316,7 +3279,8 @@ __device__ void persistent_fld_assemble_geom(const PersistentParams& p,
         b.rad_E_old, rad_E_limiter, b.fld_sigma_R, b.fld_lower, b.fld_diag,
         b.fld_upper, b.fld_rhs, p.n_cells, p.n_groups, dt, p.fld_outer_bc,
         b.fld_marshak_finc, p.fld_volume_source_rate,
-        p.fld_volume_source_r_max, p.fld_opacity_floor, p.fld_flux_limiter);
+        p.fld_volume_source_r_max, p.fld_opacity_floor, p.fld_flux_limiter,
+        b.fld_outer_transfer);
   }
   pk_sync(p);
 }
@@ -3486,7 +3450,9 @@ __device__ void persistent_fld_step(const PersistentParams& p,
             b.fld_sigma_a, b.fld_sigma_pe, b.fld_sigma_R,
             b.fld_nlte_sigma_eff_work, b.fld_nlte_sigma_s_eff_work,
             b.fld_nlte_eta_cdf_work, b.fld_eta, b.fld_nlte_lambda_work,
-            p.n_cells, p.n_groups, dt, p.material_A, p.fld_alpha,
+            // alpha = 1: the Fleck factor of the multi-kernel FLD (fld_1d_gpu.cu). Until 2026-09-29 this
+            // loop took Radiation.imc.alpha, the Monte Carlo radiation's Fleck parameter (default 1).
+            p.n_cells, p.n_groups, dt, p.material_A, 1.0,
             p.fld_opacity_cap, p.cv_e_override, p.Te_floor, p.material_gm1);
       }
       pk_sync(p);
@@ -3677,9 +3643,13 @@ __device__ void persistent_fld_step(const PersistentParams& p,
   for (int g = pk_thread_id(p); g < p.n_groups; g += pk_thread_stride(p)) {
     const double E =
         fmax(finite_or_zero(b.rad_E[(p.n_cells - 1) * p.n_groups + g]), 0.0);
+    // the outgoing partial current with the last assembly's transfer coefficients (escaped_energy_kernel_body)
+    const double F_inc = (p.fld_outer_bc == kFld1dOuterMarshak)
+                             ? fmax(finite_or_zero(b.fld_marshak_finc[g]), 0.0)
+                             : 0.0;
     local_escaped +=
         dt * persistent_fld_outer_area(p, b) *
-        fld_1d_outer_leak_coeff(p.fld_outer_bc) * E;
+        (b.fld_outer_transfer[2 * g] * E + (1.0 - b.fld_outer_transfer[2 * g + 1]) * F_inc);
   }
   const double escaped = pk_reduce_sum(p, b, local_escaped, reduce_smem);
 
@@ -3756,10 +3726,6 @@ __device__ void persistent_hydro_half_step(const PersistentParams& p,
   pk_sync(p);
 
   refresh_geometry_density_closure(p, b);
-  // The 1T renormalization measures K on the nodes (Hydro1D, NUMERICS §3.1.5).
-  const double E_before =
-      (p.renorm_active != 0 && p.two_temperature == 0) ? block_total_energy_1d(p, b, smem)
-                                                        : 0.0;
 
   compute_sound_speed_into(p, b, b.cs);
   compute_q_vnr_into(p, b, b.cs, b.Qvisc);
@@ -4017,62 +3983,6 @@ __device__ void persistent_hydro_half_step(const PersistentParams& p,
   pk_sync(p);
   // Boundary-PdV/budget ledgers and positivity history wiring are C3 concerns.
 
-  if (p.renorm_active != 0 && p.two_temperature == 0) {
-    const double E_after = block_total_energy_1d(p, b, smem);
-    const double active_mass = block_active_mass_1d(p, b, smem);
-    const double active_internal = block_active_internal_1d(p, b, smem);
-    // Target E^n + W_r + E_floor as in Hydro1D::lagrangian_step (NUMERICS
-    // §3.1.5): the radiation pressure force's work (the field pays it after
-    // the step) and the floor injection of the step (booked by the safety
-    // ledger) are exchanges, not errors of the step. This path rescaled to
-    // E^n and took both back out of e (2026-09-23).
-    double local_work = 0.0;
-    if (p.rad_gamma43_enabled != 0) {
-      for (int c = pk_thread_id(p); c < p.n_cells; c += pk_thread_stride(p)) {
-        local_work += b.rad_gamma_W_r[c];
-      }
-    }
-    const double work_sum =
-        (p.rad_gamma43_enabled != 0) ? pk_reduce_sum(p, b, local_work, smem) : 0.0;
-    const double floor_sum = *(volatile const double*)b.E_floor;
-    const double E_target = E_before + work_sum + fmax(floor_sum, 0.0);
-    __shared__ int renorm_mode;
-    __shared__ double renorm_value;
-    if (threadIdx.x == 0) {
-      renorm_mode = 0;
-      renorm_value = 0.0;
-      const double delta_E = E_target - E_after;
-      if (fabs(delta_E) > 0.0) {
-        if (active_internal > 0.0) {
-          renorm_mode = 1;
-          renorm_value = (active_internal + delta_E) / active_internal;
-        } else if (active_mass > 0.0) {
-          renorm_mode = 2;
-          renorm_value = delta_E / active_mass;
-        }
-      }
-    }
-    pk_sync(p);
-    for (int c = pk_thread_id(p); c < p.n_cells; c += pk_thread_stride(p)) {
-      if (renorm_mode == 1) {
-        scale_active_energy_kernel_body(c, b.ee, b.hydro_active, renorm_value);
-      } else if (renorm_mode == 2) {
-        shift_active_energy_kernel_body(c, b.ee, b.hydro_active, renorm_value);
-      }
-    }
-    pk_sync(p);
-
-    const double E_corrected =
-        block_total_energy_1d(p, b, smem);
-    if (pk_global_leader(p)) {
-      const double residual = E_target - E_corrected;
-      if (fabs(residual) > 0.0) {
-        add_first_active_residual_kernel_body(b.ee, b.mass, 0, residual);
-      }
-    }
-    pk_sync(p);
-  }
-
   refresh_geometry_density_closure(p, b);
   // The multi-kernel path writes cs_new then moves it into state.cs. C1 writes
   // directly into state.cs because Qvisc reads cs only after the full cs loop sync.
@@ -4116,7 +4026,6 @@ persistent_chunk_kernel(PersistentParams p,
   __shared__ double sh_dt_growth_basis;
   __shared__ double sh_cand_hydro;
   __shared__ double sh_cand_cond;
-  __shared__ double sh_cand_rad;
   __shared__ double sh_fld_residual;
   __shared__ double sh_fld_escaped;
   __shared__ double sh_fld_marshak_in;
@@ -4139,7 +4048,6 @@ persistent_chunk_kernel(PersistentParams p,
     sh_dt_growth_basis = d_t_dt[2];
     sh_cand_hydro = CUDART_INF;
     sh_cand_cond = CUDART_INF;
-    sh_cand_rad = CUDART_INF;
     sh_fld_residual = 0.0;
     sh_fld_escaped = 0.0;
     sh_fld_marshak_in = 0.0;
@@ -4234,7 +4142,6 @@ persistent_chunk_kernel(PersistentParams p,
     (void)min_idx;
 
     persistent_conduction_operator(p, b);
-    const double dt_rad = persistent_fld_dt_rad(p, b, smem_arg, smem_i);
 
     if (threadIdx.x == 0) {
       const double dt_hydro =
@@ -4257,7 +4164,6 @@ persistent_chunk_kernel(PersistentParams p,
                                       p.conduction_sts_max_stages)
                        : CUDART_INF;
       in.dt_visc = CUDART_INF;
-      in.dt_rad = dt_rad;
       in.dt_prev = sh_dt_growth_basis;
       in.growth_factor = p.growth_factor;
       in.dt_max = p.dt_max;
@@ -4265,7 +4171,6 @@ persistent_chunk_kernel(PersistentParams p,
       in.dt_remaining = remaining_end;
       sh_cand_hydro = in.dt_hydro;
       sh_cand_cond = in.dt_cond;
-      sh_cand_rad = in.dt_rad;
       const DtLadderOut out = dt_ladder_eval(in);
       sh_dt = out.dt_chosen;
       sh_dt_growth_basis = out.dt_growth_basis;
@@ -4400,7 +4305,6 @@ persistent_chunk_kernel(PersistentParams p,
         rec.dt = sh_dt;
         rec.cand_hydro = sh_cand_hydro;
         rec.cand_cond = sh_cand_cond;
-        rec.cand_rad = sh_cand_rad;
         rec.checksum_u = ring_sums[0];
         rec.checksum_e = ring_sums[1];
         rec.fld_outer_residual = sh_fld_residual;
@@ -4574,13 +4478,6 @@ PersistentParams make_params(const core::State& state,
   const char* laser_trace_env = std::getenv("TENRYU_PK_LASER_TRACE");
   p.laser_trace =
       (laser_trace_env != nullptr && std::strcmp(laser_trace_env, "1") == 0)
-          ? 1
-          : 0;
-  p.renorm_active =
-      (!cfg.main.two_temperature &&
-       cfg.numerics.hydro.enabled &&
-       cfg.numerics.hydro.boundary_1d != "pressure" &&
-       !cfg.numerics.hydro.compatible_energy)
           ? 1
           : 0;
   p.hydro_enabled = cfg.numerics.hydro.enabled ? 1 : 0;
@@ -4773,8 +4670,6 @@ PersistentParams make_params(const core::State& state,
       laser_mesh.ghost_transition_resolved_nhat;
   p.laser_lmesh_ghost_transition_resolved_cells =
       laser_mesh.ghost_transition_resolved_cells;
-  p.fld_alpha = cfg.radiation.imc.alpha;
-  p.fld_f_min = cfg.numerics.dt.f_min_fleck;
   p.growth_factor = cfg.numerics.dt.growth_factor;
   p.dt_max = cfg.numerics.dt.max_s;
   p.r_min = cfg.mesh.r_min;
@@ -4923,6 +4818,8 @@ PersistentDeviceBuffers make_buffers(core::State& state,
         acquire_device_buffer<double>("persistent_loop:cond_te_tmp", n_cells);
     b.cond_flux_limiter_faces = acquire_device_buffer<double>(
         "persistent_loop:cond_flux_limiter_faces", std::max<std::size_t>(n_cells, 1));
+    b.cond_kappa_face = acquire_device_buffer<double>(
+        "persistent_loop:cond_kappa_face", std::max<std::size_t>(n_cells, 1));
     b.cond_diag3 =
         acquire_device_buffer<double>("persistent_loop:cond_diag3", 3);
     if (state.A_eff.size() == n_cells && state.gamma_eff.size() == n_cells) {
@@ -5033,6 +4930,9 @@ PersistentDeviceBuffers make_buffers(core::State& state,
     b.fld_marshak_finc =
         acquire_device_buffer<double>("persistent_loop:fld_marshak_finc",
                                       n_groups);
+    b.fld_outer_transfer =
+        acquire_device_buffer<double>("persistent_loop:fld_outer_transfer",
+                                      2 * n_groups);
   }
   if (cfg.laser.enabled) {
     b.laser_dep = state.laser_dep.empty() ? nullptr : state.laser_dep.data();
@@ -5114,6 +5014,9 @@ PersistentDeviceBuffers make_buffers(core::State& state,
               1U);
       b.laser_cell_is_void = acquire_device_buffer<std::uint8_t>(
           "persistent_laser:cell_is_void", n_cells);
+      b.laser_cell_material_index = (state.cell_material_index.size() == n_cells)
+                                        ? state.cell_material_index.data()
+                                        : nullptr;
       std::vector<std::uint8_t> cell_is_void_host(n_cells, 0U);
       if (state.cell_is_void.size() == n_cells) {
         std::copy(state.cell_is_void.begin(), state.cell_is_void.end(),
@@ -5486,6 +5389,11 @@ bool persistent_loop_supported_c1(const core::State& state,
   if (part.n_ranks != 1) {
     return warn_unsupported_once("MPI n_ranks != 1");
   }
+  if (has_non_trailing_void_run(state)) {
+    // the persistent void-node follower keeps only the exterior vacuum's nodes evenly spaced
+    // (persistent_follow_void_region_nodes_1d); the multi-kernel path handles every run
+    return warn_unsupported_once("VOID region inside the target (a run of void cells before the exterior vacuum)");
+  }
   if (cfg.output.history_every > 0) {
     return warn_unsupported_once("step-based history cadence configured");
   }
@@ -5527,15 +5435,6 @@ bool persistent_loop_supported_c1(const core::State& state,
     }
     if (cfg.radiation.imc.two_stage) {
       return warn_unsupported_once("two-stage radiation enabled");
-    }
-    if (cfg.radiation.imc.difference.enabled) {
-      return warn_unsupported_once("radiation difference formulation enabled");
-    }
-    if (cfg.radiation.imc.linearized_planck) {
-      return warn_unsupported_once("linearized Planck dt_rad enabled");
-    }
-    if (cfg.radiation.holo.enabled) {
-      return warn_unsupported_once("HOLO radiation enabled");
     }
     const bool use_nlte_table =
         mat.opacity_model == "table_nlte" || mat.opacity_model == "tmat";
@@ -6024,13 +5923,12 @@ PersistentChunkResult run_persistent_chunk(core::State& state,
         char dt_buffer[192];
         std::snprintf(dt_buffer,
                       sizeof(dt_buffer),
-                      "pk_dt s=%d dt=%.3e lim=%d h=%.3e c=%.3e r=%.3e",
+                      "pk_dt s=%d dt=%.3e lim=%d h=%.3e c=%.3e",
                       rec.step,
                       rec.dt,
                       rec.limiter,
                       rec.cand_hydro,
-                      rec.cand_cond,
-                      rec.cand_rad);
+                      rec.cand_cond);
         core::log_info(dt_buffer);
       };
       log_dt_record(ring_host[0]);

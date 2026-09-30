@@ -259,19 +259,6 @@ void enumerate_snapshot_fields(
   TENRYU_SNAPSHOT_FIELD(sn_tau_R);
   TENRYU_SNAPSHOT_FIELD(sn_reduced_flux);
   TENRYU_SNAPSHOT_FIELD(sn_ap_alpha);
-  TENRYU_SNAPSHOT_FIELD(holo_E_LO);
-  TENRYU_SNAPSHOT_FIELD(holo_F_LO);
-  TENRYU_SNAPSHOT_FIELD(holo_consistency_source);
-  TENRYU_SNAPSHOT_FIELD(holo_rad_dep);
-  TENRYU_SNAPSHOT_FIELD(holo_rad_emit);
-  TENRYU_SNAPSHOT_FIELD(holo_Prr);
-  TENRYU_SNAPSHOT_FIELD(holo_chi);
-  TENRYU_SNAPSHOT_FIELD(holo_chi_filtered);
-  TENRYU_SNAPSHOT_FIELD(holo_Prr_coverage);
-  TENRYU_SNAPSHOT_FIELD(difference_W);
-  TENRYU_SNAPSHOT_FIELD(difference_E_ref);
-  TENRYU_SNAPSHOT_FIELD(difference_residual_E);
-  TENRYU_SNAPSHOT_FIELD(delta_E_rad_prev);
   TENRYU_SNAPSHOT_FIELD(state_supply_pre_rho);
   TENRYU_SNAPSHOT_FIELD(state_supply_pre_mass);
   TENRYU_SNAPSHOT_FIELD(state_supply_pre_ee);
@@ -544,16 +531,6 @@ void capture_driver_retry_snapshot(DriverRetrySnapshot& snap,
   // No capture synchronization is needed: the table upload, arena copy, and
   // subsequent step kernels are ordered on the same (normally default) stream.
 
-  snap.ddmc_mode_map = state.ddmc_mode_map;
-  snap.holo_core_mask = state.holo_core_mask;
-  snap.holo_patch_mask = state.holo_patch_mask;
-  snap.holo_core_prev_mask = state.holo_core_prev_mask;
-  snap.holo_hold_count = state.holo_hold_count;
-  snap.holo_dwell_count = state.holo_dwell_count;
-  snap.holo_tau_R = state.holo_tau_R;
-  snap.holo_reduced_flux = state.holo_reduced_flux;
-  snap.holo_mass_q = state.holo_mass_q;
-  snap.holo_lo_weight = state.holo_lo_weight;
   snap.hydro_active = state.hydro_active;
   snap.state_supply_mask = state.state_supply_mask;
   snap.cell_is_void = state.cell_is_void;
@@ -620,11 +597,7 @@ void capture_driver_retry_snapshot(DriverRetrySnapshot& snap,
   snap.adaptive_av_bounce_seen = state.adaptive_av_bounce_seen;
   snap.axis_mass_initial = state.axis_mass_initial;
   snap.axis_inflow_budget = state.axis_inflow_budget;
-  snap.ddmc_mode_map_valid = state.ddmc_mode_map_valid;
-  snap.holo_core_mask_valid = state.holo_core_mask_valid;
-  snap.holo_lo_source_valid = state.holo_lo_source_valid;
   snap.holo_ale_invalidated = state.holo_ale_invalidated;
-  snap.particle_sort_cache_invalidated = state.particle_sort_cache_invalidated;
 
   snap.fld_clamp_hits_step = state.fld_clamp_hits_step;
   snap.fld_clamp_energy_delta_step = state.fld_clamp_energy_delta_step;
@@ -708,7 +681,6 @@ void restore_driver_retry_snapshot(tenryu::core::State& state,
                                    const tenryu::core::Config& cfg,
                                    DriverRetrySnapshot& snap,
                                    const bool restore_transient_topology_masks,
-                                   const bool invalidate_particle_sort_cache,
                                    void* cuda_stream) {
   const cudaStream_t stream = static_cast<cudaStream_t>(cuda_stream);
   TENRYU_ASSERT(snap.valid, "restore_driver_retry_snapshot requires a valid snapshot");
@@ -806,16 +778,6 @@ void restore_driver_retry_snapshot(tenryu::core::State& state,
   state.ring7_pole_cap_validation_dt = 0.0;
   state.ring7_pole_cap_eta_prod_proxy = 0.0;
 
-  state.ddmc_mode_map = snap.ddmc_mode_map;
-  state.holo_core_mask = snap.holo_core_mask;
-  state.holo_patch_mask = snap.holo_patch_mask;
-  state.holo_core_prev_mask = snap.holo_core_prev_mask;
-  state.holo_hold_count = snap.holo_hold_count;
-  state.holo_dwell_count = snap.holo_dwell_count;
-  state.holo_tau_R = snap.holo_tau_R;
-  state.holo_reduced_flux = snap.holo_reduced_flux;
-  state.holo_mass_q = snap.holo_mass_q;
-  state.holo_lo_weight = snap.holo_lo_weight;
   // Keep active/void masks as they stand after any retry-local topology update
   // (Emergency-cell-deactivation persistence.)
   if (restore_transient_topology_masks) {
@@ -888,11 +850,7 @@ void restore_driver_retry_snapshot(tenryu::core::State& state,
   state.adaptive_av_bounce_seen = snap.adaptive_av_bounce_seen;
   state.axis_mass_initial = snap.axis_mass_initial;
   state.axis_inflow_budget = snap.axis_inflow_budget;
-  state.ddmc_mode_map_valid = snap.ddmc_mode_map_valid;
-  state.holo_core_mask_valid = snap.holo_core_mask_valid;
-  state.holo_lo_source_valid = snap.holo_lo_source_valid;
   state.holo_ale_invalidated = snap.holo_ale_invalidated;
-  state.particle_sort_cache_invalidated = snap.particle_sort_cache_invalidated;
 
   state.fld_clamp_hits_step = snap.fld_clamp_hits_step;
   state.fld_clamp_energy_delta_step = snap.fld_clamp_energy_delta_step;
@@ -971,9 +929,6 @@ void restore_driver_retry_snapshot(tenryu::core::State& state,
 
   rebind_mesh_coordinate_fields(state);
   tenryu::hydro::validate_geometry_after_retry_restore(state, cfg);
-  if (invalidate_particle_sort_cache) {
-    state.particle_sort_cache_invalidated = true;
-  }
 }
 
 }  // namespace tenryu::coupling

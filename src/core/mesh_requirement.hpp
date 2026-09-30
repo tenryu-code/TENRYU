@@ -9,6 +9,23 @@
 
 namespace tenryu::core {
 
+// Optional campaign provenance. Absence preserves the original numerical path.
+struct MeshEmpiricalRequirement {
+  bool enabled = false;
+  std::string reference_sha256;
+  std::vector<std::string> case_ids;
+  double surface_ceiling_g_cm2 = 0.0;
+  double reference_apriori_g_cm2 = 0.0;
+};
+
+inline constexpr const char* kMeshConvergenceReferenceSha256 =
+    "9877d1a8c61ead63c6b8a3822ccfc069d149bd849838da79eb5965edd62fd724";
+inline constexpr double kMeshEmpiricalRelaxationCap = 9.220252473467259;
+
+// Empty means valid. The independent assistant lint also verifies the prediction.
+[[nodiscard]] std::string mesh_empirical_validation_error(
+    const MeshEmpiricalRequirement& empirical);
+
 struct MeshRequirementParams {
   bool enabled = true;
   std::string apply = "report";
@@ -24,6 +41,7 @@ struct MeshRequirementParams {
   int min_cells_per_layer = 10;
   double zbar_override = 0.0;
   int n_bands = 6;
+  MeshEmpiricalRequirement empirical;
 };
 
 struct MeshRequirementMaterial {
@@ -46,6 +64,10 @@ struct MeshRequirementInputs {
   std::function<int(double)> material_at;
   std::vector<double> breakpoints;
   double rho_void_cut = 1.0e-6;
+  // Used only for recommendation coverage reporting, never by the model.
+  std::string eos = "unknown", temperature_model = "unknown",
+              conduction_solver = "unknown";
+  bool radiation_enabled = false;
 };
 
 struct MeshRequirementProfilePoint {
@@ -105,6 +127,15 @@ struct MeshRequirementReport {
   std::vector<MeshRequirementBand> bands_recommended;
   std::vector<std::string> notes;
   std::vector<double> table_t_s, table_mu_abl_g_cm2, table_L_c_cm;
+  double apriori_ceiling_formation_g_cm2 = 0.0;
+  struct ConditionLayer {
+    std::string material;
+    double rho_gcc, thickness_cm;
+  };
+  std::vector<ConditionLayer> condition_layers;
+  std::vector<double> condition_intensity_W_cm2;
+  std::string eos, temperature_model, conduction_solver;
+  bool radiation_enabled = false;
 };
 
 struct MeshRequirementRuleCheck {

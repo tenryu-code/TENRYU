@@ -4,7 +4,6 @@
 
 ---
 
-
 ## 1. 設計原則（Design Principles）
 1. **GPU-first（CUDA-only）**  
    主要計算（Hydro更新、FLD/S_N 輻射ソルバ（tridiagonal/CG solve・S_N sweep）、レーザーレイトレース）はNVIDIA GPU上で実行する。  
@@ -51,7 +50,8 @@
 > **cuRAND device API 採用の理由**：Philox4x32-10 RNG をNVIDIA最適化実装で提供する。
 > `curand_kernel.h` はヘッダオンリーであり、`libcurand.so` のリンクは不要（デバイスAPI のみ使用）。
 > カスタムPhilox実装と比較して：(1) NVIDIA による統計品質検証済み、
-> (2) `curand_uniform_double()` は Philox で1語（uint32）消費の \(U(0,1]\) を返し、CPU実装と一致、
+> (2) `curand_uniform_double()` は Philox で1語（uint32）消費の \(U(0,1]\) を返す（退役した輻射 Monte Carlo の CPU 参照実装
+> `philox_cpu.hpp` と一致していた — 同実装は `retired/radiation_monte_carlo/` へ移した）、
 > (3) PTX intrinsics による最適化された乗算ラウンド実装。
 > CUDA Toolkit に同梱されるため追加依存なし。ライセンスはNVIDIA EULA（ヘッダ使用、LICENSE.md参照）。
 
@@ -97,7 +97,6 @@ tenryu/
   src/
     core/
       config_validate.hpp # pybind11-free Config invariant checks shared by Builder/tests
-      rng/
       units/
       profiler/
       namelist/          # CPython埋め込み + Namelist API (Smilei風)
@@ -107,7 +106,7 @@ tenryu/
     hydro/
     radiation/
     laser/
-    parallel/           # MPI領域分割・ハロー交換・粒子移動 (§7)
+    parallel/           # MPI領域分割・ハロー交換 (§7)
     coupling/
     diagnostics/
     verification/
@@ -121,6 +120,9 @@ tenryu/
     validation/
   docs/
   tests/
+  retired/               # ビルドしない退役コードの保管（CMake は参照しない）
+    radiation_monte_carlo/ # 退役した輻射 Monte Carlo 一式（IMC・DDMC・ランダムウォーク・HOLO・difference 定式化）の
+                           # ソース・試験・デッキ。README に最後にビルドと試験が通った状態と復元手順
 ```
 
 **ファイル拡張子規約**：
@@ -152,25 +154,12 @@ setter の初期化や入れ子の更新が呼出し順序に依存する場合�
 ### 4.1 core/
 **責務**：共通ユーティリティ（RNG、単位、プロファイル、エラー）
 
-- `Core::RNG`：**cuRAND device API** による Philox4x32-10（counter-based）
-  - **実装**：`<curand_kernel.h>` の `curandStatePhilox4_32_10_t` を使用
-  - **初期化マッピング**（NUMERICS §12.7.1 準拠）：
-    ```cpp
-    curandStatePhilox4_32_10_t rng_state;  // レジスタ常駐（44B）
-    curand_init(
-        /*seed=*/ global_id ^ user_seed,  // uint64: 粒子固有ID × Main.seed → Philox key（NUMERICS §12.7.1）
-        /*subsequence=*/ step_number,     // uint64: タイムステップ番号 → ストリーム分離
-        /*offset=*/ (uint64_t)rng_counter, // PhotonPool格納はuint32、cuRAND APIへはuint64に昇格 → skipahead（O(1)）
-        &rng_state
-    );
-    ```
-  - **乱数生成**：`double xi = curand_uniform_double(&rng_state);`
-    - Philox 実装では 1語（uint32）消費の \(U(0,1]\)
-    - 1回の呼び出しで1つの倍精度一様乱数を返す
-  - **PhotonPool 格納**：`rng_counter`（uint32）のみ。cuRAND state はカーネル実行中にレジスタ常駐し、PhotonPool には保存しない
-  - **inter-kernel continuity**：IMC→DDMC遷移時、DDMC カーネルは `rng_counter` から cuRAND state を O(1) で復元（Philox skipahead はカウンタ加算）
-  - 並列度に依存しない再現性を保証する（同一 global_id × Main.seed × step_number で同一ストリーム）
-  - `user_seed` は `Config::MainConfig::seed`（SPECIFICATION §6.4.1 既定 12345）から取得。seed変更で独立統計サンプルを生成可能
+- 乱数：**cuRAND device API** の Philox4x32-10（counter-based）を、現行では燃焼の α 粒子 Monte Carlo 輸送
+  （`src/burn/mc_transport.cu`）だけが使う。粒子ごとに `curand_init(Main.seed ^ global_id, step_index, 0, &state)` で
+  初期化し、粒子固有の `global_id` とタイムステップ番号でストリームを分ける（並列度に依存しない再現性、NUMERICS §12.7.1）。
+  - 退役した輻射 Monte Carlo 用の共通部品（`src/core/rng/rng_init.cuh` の `init_philox`・`rng_init_kernel`、
+    CPU 参照実装 `philox_cpu.hpp`、PhotonPool の `rng_counter` から cuRAND state を O(1) で復元する規約）は
+    2026-09-29 に `retired/radiation_monte_carlo/src/core/rng/` へ移した（ビルドしない）。
 - `Core::Units`：cgs+eV単位変換（NUMERICS §0.1 準拠。入力は人間に優しい単位も許容）
 - `Core::Profiler`：NVTXレンジ、CUDA event timer
 - `Core::Error`：NaN検出、assert、fatal、例外境界
@@ -185,6 +174,7 @@ setter の初期化や入れ子の更新が呼出し順序に依存する場合�
 - `Core::MeshRequirement`（`src/core/mesh_requirement.{hpp,cpp}`、NUMERICS §3.1.0c）: 1D 初期メッシュの物理由来分解能要求（レーザー波形・波長・材料層・幾何 → アブレート帯の面密度質量天井プロファイル・衝撃波分離天井・層則・推奨帯）。ホスト専用・Python 非依存。
   - `build_mesh_requirement()`：メッシュ非依存の見積もり（`FrozenTable1D` の出力波形と piecewise 一定の ρ₀(r)/材料(r) を入力）
   - `check_mesh_requirement()`：ノード列とセル別 ρ₀/材料に対する判定、`mesh_requirement_json()`：決定論 JSON
+  - `tools/assist/mesh_recommendation.py` fits the shipped convergence table; `recommend_mesh.py` constructs and validates Mesh blocks. Optional `MeshEmpiricalRequirement` provenance is carried through config, enforce, freeze and JSON; `deck_lint.py` independently recomputes the recommendation. No solver-runtime Python dependency.
   - 呼び出し元: `Namelist::Builder`（`apply="enforce"` の `zoning_intent` 帯注入 — `zoning_intent::measure_fraction_at` で測度分数へ換算）、`drivers/cmd_validate`（`--mesh-preview` の `mesh_requirement` 項と `[mesh-requirement]` 判定）、`drivers/cmd_run`（run 開始時の `mesh_requirement.json`）。ランタイム物理では使用されない。1D ノード列は `mesh::build_1d_radial_nodes()`（`src/mesh/radial_nodes_1d.cuh`、`create_mesh` と同一実装）で得る。
 - `Core::DeviceScratch`（`src/core/device_scratch.{hpp,cu}`、per-call cudaMalloc/cudaFree を scratch pool に置換する host オーバーヘッド削減）：
   プロセス寿命・タグ指名・grow-only のデバイス／ピン止めホスト scratch プール
@@ -334,8 +324,11 @@ struct Config {
         struct MatDef {
             std::string name;               // 材料名（例 "CH", "DT"）。一意必須（SPECIFICATION §6.4.3）
             double A, Z;                    // 質量数 [amu]、原子番号 [dimensionless]
-            std::string eos_model = "sesame";          // "sesame"（既定） / "ionmix" / "ideal_gas"
-            std::string opacity_model = "ionmix";      // "ionmix"（既定） / "sesame" / "constant" / "table_nlte"（M17: Non-LTE IONMIX 3種不透明度）。旧名 "none" は "constant" + kappa=0 に変換、WARNING出力
+            std::string eos_model = "ideal_gas";       // "ideal_gas"（既定） / "sesame" / "ionmix" / "tmat" / "power_law_te"
+            std::string opacity_model = "constant";    // "constant"（既定） / "table_nlte" / "tmat" / "power_law" / "freq_dep_marshak" /
+                                                       // "ionmix"（LTE の IONMIX 表。builder が "table_nlte" の経路へ変換）。
+                                                       // "sesame" は受理されない（502/505 は読めるが実行時の不透明度に使わない）。
+                                                       // 旧名 "none" は "constant" + kappa=0 に変換、WARNING出力
             double ideal_gas_gamma = 5.0/3.0; // [dimensionless] eos_model="ideal_gas"時のγ（SPECIFICATION §6.4.3）
             double cv_e_override = -1.0;    // [erg/(cm³·eV)] 電子比熱オーバーライド（-1=テーブル使用。SPECIFICATION §6.4.3）
             double kappa_a_constant = 0.0;  // [cm²/g] opacity_model="constant" 時の吸収不透明度
@@ -344,21 +337,20 @@ struct Config {
             std::string opacity_file;       // 不透明度テーブルファイルパス
             // SESAME 固有パラメータ（eos_model="sesame" 時のみ使用）
             int sesame_material_id = -1;    // SESAME 材料番号（例: CH=7593, DT=5265）
-            std::string sesame_format = "ascii"; // "ascii"（xSESAME ASCII）。v1.0唯一
-            int sesame_table_total = 301;   // total EOS テーブル番号
-            int sesame_table_electron = 304; // electron EOS テーブル番号。-1 = 不在（1T分割）
+            int sesame_cold_curve_rows = 12; // T=0 の cold curve を保つ合成行の数（0 は従来どおり捨てる。NUMERICS §1.1.5(b)）
+            // 形式（xSESAME ASCII）と表番号（301 total / 304 electron）は固定で、namelist のキーではない
+            // （sesame_format / sesame_table_total / sesame_table_electron は ConfigError）。304 が無い材料は、
+            // 材料の電離モデルの Z̄ で全表を節点ごとに Z̄/(1+Z̄) に分割して電子表を作る（2026-09-29）
             bool is_void = false;           // true = 真空（void）材料。EOS/opacity テーブル不要（SPECIFICATION §6.4.3）
         };
         std::vector<MatDef> materials;      // 材料リスト（最大 MAX_MATERIALS=8）
         MixingRule opacity_mix_rule = MixingRule::LINEAR_MASS; // spec §6.4.3; enum定義は§4.3参照
-        struct MixtureConfig {
-            std::string fraction_type = "volume"; // "volume" | "mass"（SPECIFICATION §6.4.3 mixture.fractions）
-            // Geometry.volfrac が返す値の解釈: "volume"=体積分率, "mass"=質量分率
-            std::string eos_mix_rule = "mass_weighted_same_state"; // EOS混合則（SPECIFICATION §6.4.3 v1.0唯一）
-        } mixture;
+        // Materials.mixture は opacity_mix_rule だけを保持する（MaterialsConfig::opacity_mix_rule）。fractions と
+        // eos_mix_rule は受け付けるが警告を出して無視する — Geometry.volfrac は常に体積分率で、1D の EOS は各セルの
+        // 支配材料で閉じる（NUMERICS §1.1.5(c)）
         struct ZbarConfig {
             std::string model = "fixed";    // "fixed" / "thomas_fermi" / "tabular"（既定 "fixed"、SPECIFICATION §9.1）
-            double fixed_value = -1.0;      // model="fixed" 時の Z̄ 値（既定 -1 → Z_atomic を使用）
+            double fixed_value = -1.0;      // \>= 0 なら全材料・全非 void セルの Z̄ をこの 1 値で上書き（fixed 以外のモデルの初期値にも。既定 -1 は無効）
             std::string table_file;         // model="tabular" 時のテーブルファイルパス
         } zbar;
         struct VoidConfig {
@@ -388,71 +380,19 @@ struct Config {
 
     struct RadiationConfig {
         bool enabled = true;                  // 輻射輸送有効化（SPECIFICATION §6.4.5 既定 True）
-        RadiationMode mode = RadiationMode::MultigroupDiffusion; // "imc_ddmc" / "multigroup_diffusion" / "sn_transport"
+        RadiationMode mode = RadiationMode::MultigroupDiffusion; // "multigroup_diffusion" / "sn_transport"（"imc_ddmc" は ConfigError）
         bool origin_parity_only = false;      // 1D_SPH S_N origin parity investigation flag; no-op when legacy parity sweep is used
         bool group_repack_hard_xray = false;  // optional 80-group hard-X-ray boundary redistribution
         bool diagnose_hard_xray_opacity = false; // startup-only CD kappa_PA audit log
         int groups = 16;
         std::vector<double> group_bounds_eV;   // [eV] 要素数 groups+1; table, user, or hard-X-ray repacked bounds
-        // --- IMC parameters (SPECIFICATION §6.4.5 imc) ---
-        // imc.enabled defaults true; FLD/S_N deterministic modes require imc.enabled=false.
-        double imc_alpha = 1.0;               // [dimensionless] time-centering（NUMERICS §6.1、spec §6.4.5）
-        double imc_f_max = 1.0;              // [dimensionless] Fleck factor上限（NUMERICS §6.1）
-        int particles_per_cell_group = 50;   // SPECIFICATION §6.4.5 既定 50（本番は200+推奨）
-        bool implicit_capture = true;         // Fleck IMC（True）/ analog capture（False）（NUMERICS §6.2）
-        double cutoff_fraction = 0.0;         // [dimensionless] birth energy cutoff（0=無効）（NUMERICS §6.3.4）
-        bool inelastic_scatter = true;        // 非弾性実効散乱による群再サンプリング（NUMERICS §6.2）
-        double weight_cutoff = 1e-10;          // [dimensionless] Russian roulette weight cutoff（NUMERICS §6.3.4、SPECIFICATION §6.4.5）
-        double roulette_survival = 0.1;       // [dimensionless] Russian roulette生存確率（NUMERICS §6.3.4）
-        double weight_split = 1e+2;           // [dimensionless] 粒子分裂閾値（E > weight_split × E_avg で分裂）（NUMERICS §6.3.4、SPECIFICATION §6.4.5）。**v1.0未実装**：値は保持するが分裂判定は実行しない
-        int max_split = 8;                    // 1回の分裂での最大娘粒子数（NUMERICS §6.3.4、SPECIFICATION §6.4.5）。**v1.0未実装**：予約パラメータ
-        // --- DDMC parameters (SPECIFICATION §6.4.5 ddmc) ---
-        bool ddmc_enabled = true;             // DDMC有効化（False = 全IMCモード）
-        double tau_ddmc = 4.0;                // [dimensionless] DDMC遷移閾値（NUMERICS §7.1）
-        double tau_rw = 0.0;                  // [dimensionless] internal PGRW閾値（0で無効。NUMERICS §7.1）
-        double omega_ddmc = 0.9;              // [dimensionless] 散乱比ω下限閾値（NUMERICS §7.1）
-        bool implicit_diffusion = false;      // HIMCD Phase-1: DDMCセルをimplicit diffusionで更新（NUMERICS §7.4.1）
-        std::string leak_stencil = "9_kershaw"; // "4" | "9_kershaw"（NUMERICS §7.3.5, Appendix A）
-        std::string interface_method = "asymptotic_diffusion_limit"; // IMC⇄DDMC境界変換方式（NUMERICS §7.7）
-        bool emissivity_preserving = true;    // Densmore 2006 P̂ 補正（NUMERICS §7.7.3）
-        std::string interface_exit_distribution = "cosine"; // "cosine" | "half_isotropic" DDMC→IMCリーク角度分布（SPECIFICATION §6.4.5）
-        bool rz_face_r_weight = true;         // 2D_RZ DDMCリーク面R重み付け（NUMERICS §7.7.2）
-        std::string face_opacity_temperature = "radiative_mean"; // DDMCリーク面温度規約（NUMERICS §7.3.2、SPECIFICATION §6.4.5）
-        bool m_matrix_check = true;           // M-matrix条件不合格セルはIMCフォールバック（NUMERICS §7.1）
-        // --- Hybrid diffusion classification / conversion (SPECIFICATION §6.4.5 diffusion) ---
-        bool diffusion_enabled = false;       // 1D_SPH diffusion mask と entry/exit energy conversion
-        double diffusion_tau_on = 5.0;
-        double diffusion_tau_off = 3.0;
-        double diffusion_reduced_flux_on = 0.15;
-        double diffusion_reduced_flux_off = 0.25;
-        int diffusion_mode_hold = 0;
-        double diffusion_rate_max = 1.0e30;
-        int diffusion_imc_guard_cells = 1;
-        // --- HOLO global LO coupling (SPECIFICATION §6.4.5 holo, NUMERICS §7.1.2g) ---
-        bool holo_enabled = false;            // 1D_SPHのみ。既定OFFでruntime無影響
-        std::string holo_region = "shell";    // v1はshellのみ
-        double holo_coupling_tau = 5.0;        // LO material-coupling mask threshold
-        int holo_guard_cells = 3;              // mask dilation half-width
-        double holo_tau_on = 5.0;              // deprecated compatibility; selector ignores
-        double holo_tau_off = 3.0;             // deprecated compatibility; selector ignores
-        double holo_reduced_flux_on = 0.15;    // deprecated compatibility; selector ignores
-        double holo_reduced_flux_off = 0.25;   // deprecated compatibility; selector ignores
-        int holo_update_interval = 10;         // deprecated compatibility; selector ignores
-        int holo_min_dwell_steps = 20;         // deprecated compatibility; selector ignores
-        int holo_min_island_cells = 5;         // deprecated compatibility; selector ignores
-        int holo_core_margin_cells = 3;        // deprecated compatibility; selector ignores
-        std::string holo_solver = "implicit_1d"; // "implicit_1d" | "quasidiffusion_1d"
-        std::string holo_closure = "diffusion";
-        double holo_closure_relax = 0.2;
-        int holo_closure_smooth_passes = 1;
-        double holo_closure_smooth_alpha = 0.5;
-        double holo_consistency_alpha = 1.0;
-        std::string holo_boundary_flux = "physical";
-        bool holo_p_rr_tally = true;
-        bool holo_sn_closure = true;
-        int holo_sn_n_angles = 8;
-        bool holo_sn_material_coupling = false;
-        int holo_residual_particles_per_cell_group = 4;
+        // --- Radiation.imc（SPECIFICATION §6.4.5）: 決定論モードに効くのは two_stage だけ ---
+        struct ImcConfig {
+            bool two_stage = false;           // 輻射演算子を半ステップ 2 回で進め、その間で EOS を閉じ直す
+        } imc;
+        // 退役した輻射 Monte Carlo（IMC・DDMC・ランダムウォーク・HOLO・difference 定式化）の設定 — imc の他のキーと
+        // ddmc / diffusion / holo の各 dict — は 2026-09-29 に Config から外した。Builder は受理して無視し（節ごとに
+        // WARNING 1 回）、各手法の enabled=True は ConfigError とする（SPECIFICATION §6.4.5）。
         struct MultigroupDiffusionConfig {
             std::string flux_limiter = "levermore_pomraning";
             int max_outer_iterations = 20;
@@ -512,18 +452,12 @@ struct Config {
             int compute_N_T = 200;              // Planckテーブル温度格子点数（SPECIFICATION §6.4.5 既定 200）
             double compute_T_range_eV[2] = {0.01, 100.0}; // [eV] 温度範囲（SPECIFICATION §6.4.5 既定 [0.01,100]）
         } planck_fraction;
-        int max_pool_size = 100'000'000;       // [particles] PhotonPool最大容量（SPECIFICATION §6.4.5 既定 1e8）
-        // --- common ---
-        double E_avg_global;                   // [erg] computed at step start: S_total / N_p_total
-        bool momentum_deposition = true;       // 診断のみ（output-only）、hydro運動量へのフィードバックなし（SPECIFICATION §6.4.5）
-        // tally_mode は ParallelConfig::GpuOptimization::tally_mode で制御（§4.1.2 parallel 参照）
         struct BoundaryConfig {
             // namelist名: r_inner, r_outer, z_bottom, z_top（SPECIFICATION §6.4.5）
             std::string inner_r = "reflect";   // 1D: inner; 2D RZ: R内側（r=0対称軸、変更不可）
             std::string outer_r = "vacuum";    // 1D: outer; 2D RZ: R外側
             std::string bottom_z = "vacuum";   // 2D RZ only: Z下面（SPECIFICATION §6.4.5 既定 "vacuum"）
             std::string top_z = "vacuum";      // 2D RZ only: Z上面
-            int marshak_particles = 1000;      // Marshak BC 粒子数/step（全面合算、面面積比で配分。NUMERICS §8.2）
             // Marshak 放射温度 T_r(t) [eV]：1D_SPH は単一 FrozenTable1D、2D_RZ は面別 map
             // 1D_SPH: marshak_Tr = FrozenTable1D（callable → 時刻表に凍結、SPECIFICATION §6.4.5）
             // 2D_RZ:  marshak_Tr_map["r_outer"] / ["z_bottom"] / ["z_top"] = FrozenTable1D（SPECIFICATION §6.4.5）
@@ -532,89 +466,63 @@ struct Config {
         } boundary;
     } radiation;
 
-    struct LaserConfig {
-        bool   enabled = true;             // レーザー有効化（SPECIFICATION §6.4.6 既定 True）
+    struct LaserConfig {                     // 実体は src/core/config.hpp（全キーは SPECIFICATION §6.4.6）。主なものだけを示す
+        bool   enabled = false;            // レーザー有効化（既定 False）
         double wavelength_nm = 351.0;      // laser wavelength [nm] (GXII: 3ω Nd:glass)
         // n_crit = π m_e c² / (e² λ²) [cm⁻³]（NUMERICS §5.1 参照）
-        std::string mode;                   // "raytrace_2d" | "raytrace_3d" | "spherical_average" | "radial_absorption_1d"（SPECIFICATION §6.4.6）
-        // 1D_SPH既定: "raytrace_2d"、2D_RZ既定: "raytrace_3d"。
-        // Builder が dimension に応じて既定値を設定する。
-        // 1D_SPH は "raytrace_2d" または "radial_absorption_1d"、2D_RZ は "raytrace_3d" のみ。
+        std::string mode;                   // "raytrace_2d" | "radial_absorption_1d"（1D）/ "raytrace_3d"（2D_RZ）。Builder が次元で既定を置く
         // radial_absorption_1d では rays/profile/f_number/focus/defocus は吸収分布に影響しない。
-        int    rays_per_beam = 1000;       // ビームあたりレイ数（既定: 1D_SPH=1000。2D_RZ未指定時はBuilderで128を適用）
-        // --- absorption ---（SPECIFICATION §6.4.6 absorption dict）
+        int    rays_per_beam = 1000;       // ビームあたりレイ（環）数（\>= 10。2D_RZ 未指定時は Builder で 128）
         struct AbsorptionConfig {
-            std::string model = "inverse_bremsstrahlung"; // v1.0唯一（NUMERICS §5.4）
-            double eps_n = 1e-4;           // 屈折率下限 [無次元]（NUMERICS §5.3）
-            double eps_crit = 1e-4;        // 臨界密度終了判定 [無次元]（NUMERICS §5.2）
-            bool   terminate = true;       // v1.0はTrue固定（False指定はConfigError）
-            double coulomb_log_floor = 2.0;// lnΛ 下限 [無次元]（NUMERICS §5.4）
+            std::string model = "inverse_bremsstrahlung";
+            double eps_n = 1e-4;           // 屈折率下限（(0, 0.1]、NUMERICS §5.3）
+            bool   terminate = true;       // 臨界で終了（True）/ 反射（False、特性曲線積分のみ）。未指定なら特性曲線積分では
+                                           // Builder が False にする（NUMERICS §5.2）
+            std::string terminate_mode = "escape"; // "escape" | "deposit"（臨界に達した残りを臨界隣接セルへ沈着）
+            double coulomb_log_floor = 2.0;// IB の lnΛ 下限（[1, 30]、NUMERICS §5.4.3）
         } absorption;
-        // --- lasermesh ---（SPECIFICATION §6.4.6 lasermesh dict）
         struct LaserMeshConfig {
-            bool   enabled = true;
-            int    nr = 128;               // R方向メッシュ数（SPECIFICATION §9.1 既定 128）
-            int    nz = 256;               // Z方向メッシュ数（SPECIFICATION §9.1 既定 256）
-            double r_max = -1.0;           // [cm] 負値=自動（1.5×R_target）
-            double z_min = -1e30;          // [cm] 自動計算
-            double z_max = +1e30;          // [cm] 自動計算
-            bool   stretch_enabled = true;
-            std::string stretch_method = "density_gradient";
-            double stretch_min_ratio = 0.2;
-            bool   critical_clip = true;
-            double critical_margin = -1.0; // 負値=自動（1-eps_crit）。SPECIFICATION §6.4.6
+            int    nr = 128, nz = 256;     // 2D の格子（\>= 4）。1D は §5.7.2 の規則で毎回作り直す（上限 nr_max = 4096）
+            double r_max_factor = 1.5;     // 1D の外半径の係数（NUMERICS §5.7.2）
+            double mesh_factor = 0.5, rmax_n_hat_threshold = 0.001;
+            bool   critical_clip = true;   // 節点の n̂ を critical_margin で頭打ち（格子の境界ではない、NUMERICS §5.7.1）
+            double critical_margin = NaN;  // 未指定 = 1 − eps_crit
+            std::string stretch_method;    // 受け付けるがどのメッシュも読まない（警告）。min_ratio も同じ
+            GhostCoronaConfig ghost_corona;// 1D のゴーストコロナ（NUMERICS §5.7.5）
         } lasermesh;
-        // --- raytrace ---（SPECIFICATION §6.4.6 raytrace dict）
         struct RaytraceConfig {
-            std::string integrator = "leapfrog"; // v1.0は"leapfrog"固定（"rk2"/"rk4"は将来版予約）
-            double cfl_ray = 0.8;          // [無次元] レイCFL制約（NUMERICS §5.3.4）
-            std::string gradient_interpolation = "bilinear"; // v1.0唯一
-            double intensity_cutoff = 1e-6;// [無次元] 最小強度カットオフ（NUMERICS §5.2）
+            std::string integrator = "auto"; // "auto" → 1D 球の raytrace_2d は "characteristic"（NUMERICS §5.3.6）、それ以外は "leapfrog"
+            double cfl_ray = 0.8, intensity_cutoff = 1e-6, eps_crit = 1e-4; // eps_crit は (0, 0.1]
+            int    max_steps = 100000, azimuthal_rays = 16;               // azimuthal_rays は 1D の円筒・平板
         } raytrace;
-        // --- raytrace_skip ---（SPECIFICATION §6.4.6 raytrace_skip dict）
-        struct RaytraceSkipConfig {
-            bool   enabled = false;        // 2026-08-07 に既定を無効化（NUMERICS §5.9.5）
-            double threshold = 0.01;       // [無次元] 最大相対変化量閾値（NUMERICS §5.9）
-            int    max_consecutive = 10;   // 最大連続スキップ数
-            std::string norm = "max_relative"; // "max_relative" | "l2_relative"
-            double crit_guard = 0.01;      // [無次元] 臨界近傍ガード（NUMERICS §5.9.4）
-        } raytrace_skip;
-        // --- deposit ---（SPECIFICATION §6.4.6 deposit dict）
-        std::string deposit_map = "bilinear_node"; // "bilinear_node"（v1.0唯一）
-        // --- profile ---（全ビーム共通デフォルト、SPECIFICATION §6.4.6 profile dict）
-        std::string profile_model = "gaussian";    // "gaussian" | "super_gaussian" | "flat_top" | "custom"
-        double profile_w0_um = -1.0;       // 1/eビームウェスト半径 [µm]（gaussian/super_gaussian時）
-        int    profile_m = 2;              // super-Gaussian指数
-        // --- beams ---
+        struct RaytraceSkipConfig { bool enabled = false; double threshold = 0.01; int max_consecutive = 10; } raytrace_skip;
+        struct DepositConfig {
+            double conservation_tol = 1e-10;
+            int    deposit_smooth_passes = 0;      // 既定は平滑化なし（診断用。1D の例題デッキの一部は 3 を与える）
+            double deposit_smooth_alpha = 0.25;
+        } deposit;
+        std::string profile_model = "gaussian";    // "gaussian" | "super_gaussian" | "flat_top" | "table" | "custom"（custom は凍結後 table）
+        double profile_w0_um = -1.0;               // 未指定なら R_target / (2 max(F, 1))
+        int    profile_m = 2;
+        // ib（Langdon・Zeff・Coulomb log の拡張）、ra（共鳴吸収）、cbet、port_configuration、hot_electron は §4.6 と NUMERICS §5.4.5/§5.10/§5.11
         struct BeamDef {
-            // 以下は per-beam 必須パラメータ（既定値なし、namelist で必ず指定）
-            double theta;                   // 方向極角 [deg]（必須。namelist direction → theta/phi 変換、SPECIFICATION §6.4.6）
-            double phi;                     // 方向方位角 [deg]（必須）
-            double f_number;                // F値（焦点距離/ビーム径）[dimensionless]（必須）
-            // --- focus / defocus ---（SPECIFICATION §6.4.6: focus と defocus が両方指定された場合は focus 優先）
-            double focus_r = NAN;           // 焦点座標 r [cm]（NAN = 未指定→defocus_DR を使用）
-            double focus_z = NAN;           // 焦点座標 z [cm]（1D_SPH: focus_r のみ使用、focus_z は無視）
-            double defocus_DR = 0.0;        // デフォーカスパラメータ D/R [dimensionless]（既定 0.0 = 焦点合わせ、NUMERICS §5.6.5）
-            // Builder が focus → defocus_DR 変換を実行（focus 優先、SPECIFICATION §6.4.6）:
-            //   focus 指定時: defocus_DR = sign(d) × |d| / R_target（d = 焦点とターゲット中心のビーム軸方向距離）
-            //   focus 未指定時: defocus_DR をそのまま使用
-            // --- per-beam profile ---（未指定時は LaserConfig の profile_model 等を継承、SPECIFICATION §6.4.6）
-            std::string profile_model;      // "" = 未指定（Laser.profile_model を継承）/ "gaussian" / "super_gaussian" / "flat_top" / "custom"
-            double profile_w0_um = -1.0;    // 1/eビームウェスト半径 [µm]（gaussian/super_gaussian 時。-1 = 未指定→Laser.profile_w0_um を継承）
-            int    profile_m = -1;          // super-Gaussian指数（-1 = 未指定→Laser.profile_m を継承）
-            double profile_radius_um = -1.0;// flat_topビーム半径 [µm]（-1 = 未指定→Laser側を継承）
-            FrozenTable1D profile_custom;   // custom プロファイルテーブル（model="custom" 時のみ使用。func から FrozenTable1D 化）
-            FrozenTable1D waveform;         // 凍結済み波形テーブル（namelist の power(t) callable から凍結）
+            std::vector<double> direction;  // ビーム方向（3 成分）。theta/phi（ラジアン）でも与えられる
+            double f_number = 8.0;          // F 値（任意、既定 8.0、\> 0）
+            std::vector<double> focus;      // 焦点の lab 座標（3 成分）。defocus_DR との変換は行わず、1D はビーム軸へ射影（NUMERICS §5.6.3）
+            double defocus_DR = 0.0;        // focus 未指定時の D/R（NUMERICS §5.6.5）
+            double delta_lambda_nm = 0.0;   // CBET の離調
+            std::string profile_model;      // "" = Laser.profile_model を継承。profile_w0_um / profile_m / 表も同様
+            CallableInfo power;             // パワー波形（凍結して表）
+            double energy_J = -1.0;         // \> 0 なら波形を [0, t_end] の積分がこの値になるよう拡大・縮小
         };
         std::vector<BeamDef> beams;        // ビームリスト（enabled=True時は≥1本が必須）
-        // n_beams は beams.size() から取得（冗長フィールド不要）
     } laser;
 
     struct NumericsConfig {
-        std::string splitting_order = "strang"; // v1.0固定: Strang splitting（SPECIFICATION §6.4.7, NUMERICS §2.1）
+        // splitting_order / splitting / coulomb_log_floor / cell_search は namelist で受け付けるが警告を出して無視する:
+        // 演算子の順序は固定（L→B→H/2→C→R→H/2、NUMERICS §2.1）、クーロン対数の下限は 2 に固定（NUMERICS §1.1.4）
         double T_start_eV = 0.0;        // Hydro開始温度 [eV]（既定 0.0）
-        // hydro.T_start_inactive_cells = "passive_fill" | "rigid_wall"（NumericsConfig::HydroConfig の末尾メンバ、既定 "passive_fill"）
-        double coulomb_log_floor = 2.0; // クーロン対数下限（既定 2.0）
+        // hydro.T_start_inactive_cells = "passive_fill" | "rigid_wall" | "cold_equilibrium"（既定 "passive_fill"）
         struct DtConfig {
             double initial_s = 1e-15;       // [s] 初期Δt（SPECIFICATION §6.4.7 既定 1e-15）。
                                             // Python API で None 指定時は Builder が -1.0 に変換し、
@@ -714,14 +622,8 @@ struct Config {
             double energy_budget_tol = 1e-3;    // [dimensionless] 相対許容誤差 |ΔE/E|
                                                 // Python API名: safety.energy_threshold（SPECIFICATION §6.4.7 既定 1e-3）
                                                 // Builder が energy_threshold → energy_budget_tol にマッピング
-            double opacity_floor = 1e-20;    // [cm²/g] 質量不透明度κの下限。
-                                                // 巨視的断面積への変換: σ_floor = ρ × opacity_floor [cm⁻¹]。
-                                                // ただしDDMCリーク係数計算（CUDA_KERNELS §6.0a R3）では
-                                                // 密度非依存の固定値 σ_floor = 1e-20 cm⁻¹ を使用する
-                                                // （NUMERICS §7.3.2「σ_floor = 10⁻²⁰ cm⁻¹」準拠）。
-                                                // これは κ_floor × ρ とは一般に異なるが、いずれも
-                                                // ゼロ除算防止の安全策であり物理的影響はない
-            double opacity_cap = 1e20;       // [cm²/g]
+            // opacity_floor / opacity_cap（退役したモンテカルロ輻射の不透明度の下限・上限）は 2026-09-29 に外した。
+            // Builder は受理して無視する。FLD・S_N の下限・上限は Radiation.multigroup_diffusion / sn_transport にある。
             int clamp_warn_threshold = 100;
             int clamp_fatal_threshold = 10000;
             double overshoot_warn = 0.01;       // [dimensionless] 最大原理違反率 WARNING 閾値（SPECIFICATION §6.4.7、NUMERICS §11.8）
@@ -798,13 +700,7 @@ struct Config {
             bool critical_surface = true;       // 臨界面位置 R_crit(θ)
             bool per_beam = false;              // ビーム別吸収分率
         } laser_pattern;
-        struct McStatsDiag {
-            bool enabled = true;               // SPECIFICATION §6.4.9
-            bool particle_counts = true;       // IMC/DDMC/census/absorbed/escaped/leaked粒子数
-            bool weight_stats = true;          // 粒子重みmin/mean/max
-            bool cell_particle_density = false; // セル毎粒子数分布（大規模時ストレージ注意）
-            bool ddmc_fraction = true;         // DDMC粒子割合
-        } mc_stats;
+        // mc_stats / fleck_diag（退役したモンテカルロ輻射の粒子統計と Fleck 係数のログ）は Config に無い。Builder は受理して無視する。
         bool per_operator_radial_fourier_enabled = false; // 2D_RZ per-Strang-stage radial Fourier audit（SPECIFICATION §6.4.9; default-off）
         double radial_fourier_window_t_start_s = 1.35e-5; // [s] audit start time, inclusive
         double radial_fourier_window_t_end_s = 1.70e-5;   // [s] audit end time, exclusive
@@ -833,39 +729,8 @@ struct Config {
             int ghost_layers = 1;            // ghost cell layers（Kershaw 9点ステンシルに必要な最小値、Appendix A参照）
         } halo;
 
-        // --- migration（粒子移動）---
-        struct Migration {
-            std::string method = "batch";    // v1.0: "batch" のみ
-            int max_substeps = 32;           // バッチ間最大サブステップ数
-            int emigrant_threshold = 1000;   // WARNING閾値
-            int initial_capacity = 10000;    // per-rank emigrant buffer
-            double growth_factor = 1.5;
-        } migration;
-
-        // --- laser_parallel ---
-        struct LaserParallel {
-            std::string strategy = "replicated"; // v1.0: "replicated" のみ
-        } laser_parallel;
-
-        // --- particle_balance ---
-        struct ParticleBalance {
-            bool enabled = false;            // v1.0: static partition
-            double imbalance_threshold = 1.5; // N_max/N_mean 発動閾値
-            std::string method = "work_stealing"; // v1.0: "work_stealing" のみ
-        } particle_balance;
-
-        // --- reproducibility ---
-        struct Reproducibility {
-            std::string mode = "statistical"; // v1.0: "statistical" のみ
-            bool sort_after_migration = false; // デバッグ用 global_id ソート
-        } reproducibility;
-
-        // --- gpu_optimization ---
-        struct GpuOptimization {
-            bool particle_sort_by_cell = true;  // セルソート（NUMERICS §6.5）
-            std::string tally_mode = "warp";    // "global" | "warp"（NUMERICS §10.3）
-            bool compute_comm_overlap = false;  // 計算-通信オーバーラップ（NUMERICS §12.5.5）
-        } gpu_optimization;
+        // migration・laser_parallel・particle_balance・reproducibility・gpu_optimization は Config に無い
+        // （Builder は受理して無視する。migration は退役したモンテカルロ輻射の光子粒子の rank 間移動で、2026-09-29 に外した）。
     } parallel;
 };
 ```

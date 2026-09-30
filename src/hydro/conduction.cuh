@@ -134,14 +134,19 @@ double effective_diffusion(double q_limited,
                            double eps_grad);
 int sts_stage_count(double dt, double dt_exp, int sts_max_stages);
 
-struct PerMaterialFaceCoefficients1D {
-  int n_faces = 0;
-  int n_mat = 0;
-  std::vector<double> aggregate_kappa;
-  std::vector<double> kappa_eff_per_material;
+// The 1D per-material path's cell coefficients (NUMERICS §4.1.1), host copies of n_cells values: the cells'
+// conductivities (the materials' conductivities weighted by their volume fractions and summed), rho c_v,e, and the
+// charge and mass that the face flux limiter uses for the cell's electron density; dt_exp the explicit conduction limit.
+struct PerMaterialCellCoefficients1D {
+  int n_cells = 0;
+  double dt_exp = 0.0;
+  std::vector<double> kappa;
+  std::vector<double> rho_cv;
+  std::vector<double> zbar_limiter;
+  std::vector<double> A_limiter;
 };
 
-PerMaterialFaceCoefficients1D compute_per_material_face_coefficients_1d(
+PerMaterialCellCoefficients1D compute_per_material_cell_coefficients_1d(
     core::State& state, const core::Config& cfg, const HydroEOSContext* eos_ctx);
 
 double per_material_dirichlet_boundary_flux_1d(const core::State& state,

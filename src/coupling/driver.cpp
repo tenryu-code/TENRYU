@@ -112,6 +112,7 @@
 #include "materials/ionmix_reader.hpp"
 #include "materials/material_closure.hpp"
 #include "materials/tmat_reader.hpp"
+#include "materials/zbar_math.hpp"
 #include "materials/zbar_tf.hpp"
 #include "materials/zbar_device.hpp"
 #include "materials/zmoment_state.cuh"
@@ -119,16 +120,13 @@
 #include "mesh/mesh.hpp"
 #include "mesh/z_reflection.hpp"
 #include "parallel/partition.hpp"
-#include "radiation/fleck.cuh"
 #include "radiation/fld_2d_rz_gpu.cuh"
 #include "radiation/group_structure.hpp"
-#include "radiation/imc.hpp"
 #include "radiation/planck_table.cuh"
+#include "radiation/radiation_step.hpp"
 #include "parallel/reduction.hpp"
 #include "parallel/comm_buffers.hpp"
 #include "parallel/halo_exchange.hpp"
-#include "parallel/particle_migration.hpp"
-#include "radiation/particle_reid.hpp"
 #include "verification/escape_valve_audit.hpp"
 #include "verification/positivity_tracker.hpp"
 #include "burn/burn_constants.hpp"
@@ -1047,23 +1045,17 @@ void update_zbar_thomas_fermi(core::State& state, const core::Config& cfg) {
       continue;
     }
 
-    double weighted = 0.0;
-    double frac_sum = 0.0;
+    // Ion-number weights f_m / A_m (materials::ZbarMixAccumulator, as on the device path).
+    materials::ZbarMixAccumulator mix;
     const std::size_t base = c * n_materials;
     for (std::size_t m = 0; m < n_materials; ++m) {
       const auto& mat = cfg.materials.materials[m];
       if (mat.is_void) {
         continue;
       }
-      const double f = std::max(volfrac[base + m], 0.0);
-      frac_sum += f;
-      const double zbar_m = materials::compute_zbar_tf(rho[c], Te[c], mat.Z, mat.A);
-      weighted += f * zbar_m;
+      mix.add(volfrac[base + m], mat.A, materials::compute_zbar_tf(rho[c], Te[c], mat.Z, mat.A));
     }
-    if (frac_sum > 1.0e-30) {
-      weighted /= frac_sum;
-    }
-    zbar[c] = weighted;
+    zbar[c] = mix.mean();
   }
   for (std::size_t c = 0; c < n_cells; ++c) {
     if (state.cell_is_void[c] != 0U) {
@@ -1128,22 +1120,17 @@ void update_zbar_tabular(core::State& state, const core::Config& cfg) {
       continue;
     }
 
-    double weighted = 0.0;
-    double frac_sum = 0.0;
+    // Ion-number weights f_m / A_m (materials::ZbarMixAccumulator, as on the device path).
+    materials::ZbarMixAccumulator mix;
     const std::size_t base = c * n_materials;
     for (std::size_t m = 0; m < n_materials; ++m) {
-      if (cfg.materials.materials[m].is_void) {
+      const auto& mat = cfg.materials.materials[m];
+      if (mat.is_void) {
         continue;
       }
-      const double f = std::max(volfrac[base + m], 0.0);
-      frac_sum += f;
-      const double zbar_m = cfg.materials.zbar_tables[m]->interpolate(rho[c], Te[c]);
-      weighted += f * zbar_m;
+      mix.add(volfrac[base + m], mat.A, cfg.materials.zbar_tables[m]->interpolate(rho[c], Te[c]));
     }
-    if (frac_sum > 1.0e-30) {
-      weighted /= frac_sum;
-    }
-    zbar[c] = weighted;
+    zbar[c] = mix.mean();
   }
   for (std::size_t c = 0; c < n_cells; ++c) {
     if (state.cell_is_void[c] != 0U) {
@@ -2290,23 +2277,6 @@ bool maybe_emit_mesh_degeneracy_forensics(
   return true;
 }
 
-void assert_driver_retry_supported(const core::Config& cfg) {
-  if (cfg.numerics.hydro.driver_full_step_retry_enabled &&
-      cfg.radiation.mode == core::RadiationMode::ImcDdmc) {
-    TENRYU_ASSERT(false,
-                  "Numerics.hydro.driver_full_step_retry_enabled does not support "
-                  "RadiationMode::ImcDdmc (v1 scope: deterministic FLD/SN only). "
-                  "Set retry_enabled=false or change radiation.mode.");
-  }
-  if (hydro::i1b_path_guard_enabled() &&
-      cfg.radiation.mode == core::RadiationMode::ImcDdmc) {
-    TENRYU_ASSERT(false,
-                  "TENRYU_I1B_PATH_GUARD does not support RadiationMode::ImcDdmc "
-                  "because its full-step snapshot retry is deterministic FLD/SN only. "
-                  "Disable the path guard or change radiation.mode.");
-  }
-}
-
 std::string format_elapsed(std::chrono::steady_clock::duration elapsed) {
   using namespace std::chrono;
   const auto elapsed_ms = duration_cast<milliseconds>(elapsed).count();
@@ -2325,169 +2295,6 @@ std::string format_elapsed(std::chrono::steady_clock::duration elapsed) {
   const auto hours = total_seconds / 3600;
   const auto minutes_part = (total_seconds % 3600) / 60;
   return std::to_string(hours) + "h " + std::to_string(minutes_part) + "m";
-}
-
-bool fleck_diag_has_radius_window(const core::Config::DiagnosticsConfig::FleckDiag& cfg) {
-  return cfg.r_min_cm >= 0.0 && cfg.r_max_cm >= 0.0;
-}
-
-bool fleck_diag_requested(const core::Config& cfg) {
-  return cfg.main.verbosity == "verbose" ||
-         (cfg.diagnostics.enabled && cfg.diagnostics.fleck_diag.enabled);
-}
-
-void log_fleck_diagnostics_if_needed(const core::State& state,
-                                     const core::Config& cfg,
-                                     const radiation::IMC& imc) {
-  const auto& diag = cfg.diagnostics.fleck_diag;
-  if (!fleck_diag_requested(cfg)) {
-    return;
-  }
-
-  const bool use_radius = fleck_diag_has_radius_window(diag);
-  const bool has_selection = !diag.cells.empty() || use_radius;
-  if (!has_selection) {
-    if (diag.enabled) {
-      static int warn_count = 0;
-      ++warn_count;
-      if (warn_count == 1 || warn_count % 100 == 0) {
-        core::log_warning(
-            "Diagnostics.fleck_diag is enabled but no cells or radius window were configured");
-      }
-    }
-    return;
-  }
-
-  const int step_number = state.step + 1;
-  if (step_number <= 0 || (step_number % std::max(diag.every, 1)) != 0) {
-    return;
-  }
-
-  if (state.mesh.dim != 1) {
-    static int warn_count = 0;
-    ++warn_count;
-    if (warn_count == 1 || warn_count % 100 == 0) {
-      core::log_warning("Diagnostics.fleck_diag currently supports 1D_SPH only; skipping");
-    }
-    return;
-  }
-
-  const auto* coeffs = imc.last_cell_radiation_coeffs();
-  if (coeffs == nullptr) {
-    static int warn_count = 0;
-    ++warn_count;
-    if (warn_count == 1 || warn_count % 100 == 0) {
-      core::log_warning(
-          "Diagnostics.fleck_diag requested but no NLTE/TMAT cell-radiation coefficients are "
-          "available for this step");
-    }
-    return;
-  }
-
-  const std::size_t n_cells = state.rho.size();
-  TENRYU_ASSERT(coeffs->n_cells == static_cast<int>(n_cells),
-                "fleck_diag coefficient/state cell count mismatch");
-  TENRYU_ASSERT(coeffs->rho_eval.size() == n_cells,
-                "fleck_diag requires rho_eval size == n_cells");
-  TENRYU_ASSERT(coeffs->Te_eval.size() == n_cells,
-                "fleck_diag requires Te_eval size == n_cells");
-  TENRYU_ASSERT(coeffs->cv_e.size() == n_cells,
-                "fleck_diag requires cv_e size == n_cells");
-  TENRYU_ASSERT(coeffs->beta.size() == n_cells,
-                "fleck_diag requires beta size == n_cells");
-  TENRYU_ASSERT(coeffs->sigma_p_em.size() == n_cells,
-                "fleck_diag requires sigma_p_em size == n_cells");
-  TENRYU_ASSERT(coeffs->f.size() == n_cells,
-                "fleck_diag requires f size == n_cells");
-  TENRYU_ASSERT(coeffs->eta_tot.size() == n_cells,
-                "fleck_diag requires eta_tot size == n_cells");
-  TENRYU_ASSERT(state.rad_dep.size() % std::max<std::size_t>(n_cells, 1) == 0,
-                "fleck_diag requires rad_dep size divisible by n_cells");
-  TENRYU_ASSERT(state.rad_emit.empty() || state.rad_emit.size() == state.rad_dep.size(),
-                "fleck_diag requires rad_emit size == rad_dep size when present");
-
-  std::vector<char> selected(n_cells, 0);
-  std::vector<int> cells;
-  cells.reserve(diag.cells.size() + 8);
-
-  int invalid_fixed = 0;
-  for (const int cell : diag.cells) {
-    if (cell < 0 || static_cast<std::size_t>(cell) >= n_cells) {
-      ++invalid_fixed;
-      continue;
-    }
-    if (!selected[static_cast<std::size_t>(cell)]) {
-      selected[static_cast<std::size_t>(cell)] = 1;
-      cells.push_back(cell);
-    }
-  }
-  if (invalid_fixed > 0) {
-    static int warn_count = 0;
-    ++warn_count;
-    if (warn_count == 1 || warn_count % 100 == 0) {
-      core::log_warning("Diagnostics.fleck_diag ignored " + std::to_string(invalid_fixed) +
-                        " out-of-range local cell indices");
-    }
-  }
-
-  if (use_radius) {
-    TENRYU_ASSERT(state.x_r.size() == n_cells + 1,
-                  "fleck_diag requires x_r node count = n_cells + 1 in 1D");
-    std::vector<double> node_r(state.x_r.size(), 0.0);
-    state.x_r.copy_to_host(node_r.data());
-    for (std::size_t c = 0; c < n_cells; ++c) {
-      const double rc = 0.5 * (node_r[c] + node_r[c + 1]);
-      if (rc < diag.r_min_cm || rc > diag.r_max_cm) {
-        continue;
-      }
-      if (!selected[c]) {
-        selected[c] = 1;
-        cells.push_back(static_cast<int>(c));
-      }
-    }
-  }
-
-  if (cells.empty()) {
-    return;
-  }
-
-  std::vector<double> rad_dep(state.rad_dep.size(), 0.0);
-  std::vector<double> rad_emit(state.rad_dep.size(), 0.0);
-  state.rad_dep.copy_to_host(rad_dep.data());
-  if (!state.rad_emit.empty()) {
-    state.rad_emit.copy_to_host(rad_emit.data());
-  }
-  const int n_groups =
-      (n_cells > 0) ? static_cast<int>(state.rad_dep.size() / n_cells) : 0;
-
-  for (const int cell : cells) {
-    const std::size_t c = static_cast<std::size_t>(cell);
-    double dep_sum = 0.0;
-    double E_emit_cell = 0.0;
-    for (int g = 0; g < n_groups; ++g) {
-      const std::size_t idx =
-          c * static_cast<std::size_t>(n_groups) + static_cast<std::size_t>(g);
-      dep_sum += rad_dep[idx];
-      E_emit_cell += rad_emit[idx];
-    }
-    const double delta_E = dep_sum - E_emit_cell;
-
-    std::ostringstream oss;
-    oss << std::scientific << std::setprecision(16);
-    oss << "[fleck_diag] step=" << step_number
-        << " cell=" << cell
-        << " Te=" << coeffs->Te_eval[c]
-        << " rho=" << coeffs->rho_eval[c]
-        << " cv_e=" << coeffs->cv_e[c]
-        << " sigma_p_em=" << coeffs->sigma_p_em[c]
-        << " beta=" << coeffs->beta[c]
-        << " f=" << coeffs->f[c]
-        << " eta_tot=" << coeffs->eta_tot[c]
-        << " E_emit=" << E_emit_cell
-        << " dep_sum=" << dep_sum
-        << " delta_E=" << delta_E;
-    core::log_info(oss.str());
-  }
 }
 
 void clear_laser_ray_output(core::State& state) {
@@ -2538,43 +2345,6 @@ void store_laser_ray_output(core::State& state,
         state.laser_ray_power0.push_back(ray.power0);
         state.laser_ray_beam_id.push_back(group.beam_id);
       }
-    }
-  }
-}
-
-void output_if_needed(core::State& state,
-                      const core::Config& cfg,
-                      io::OutputManager& out,
-                      const radiation::IMC& imc,
-                      const std::string& case_name,
-                      const int rank) {
-  if (out.should_plot(state.step, state.t, state, cfg)) {
-    if (rank == 0) {
-      out.write_snapshot(state, cfg, state.step, state.t, case_name, rank);
-      out.write_run_info(state, cfg);
-      core::log_info("[output] wrote snapshot (step=" + std::to_string(state.step) +
-                     ", t=" + format_sci(state.t) + ")");
-    }
-    update_next_output_time(state.t_next_plot, cfg.output.plot_every_s, state.t);
-  }
-
-  if (out.should_history(state.step, state.t, state, cfg)) {
-    update_next_output_time(state.t_next_history, cfg.output.history_every_s, state.t);
-  }
-
-  if (out.should_checkpoint(state.step, state.t, state, cfg)) {
-    update_next_output_time(state.t_next_checkpoint, cfg.output.checkpoint_every_s,
-                            state.t);
-    if (rank == 0) {
-      out.write_checkpoint(state,
-                           cfg,
-                           imc.photon_pool(),
-                           state.step,
-                           state.t,
-                           case_name,
-                           rank);
-      core::log_info("[output] wrote checkpoint (step=" + std::to_string(state.step) +
-                     ", t=" + format_sci(state.t) + ")");
     }
   }
 }
@@ -3319,6 +3089,44 @@ static void apply_conduction_energy_increment(
                          "driver:apply_cond_incr:push");
 }
 
+// With Numerics.hydro.enabled=False no hydro closure writes the cells' heat
+// capacities (state.cv_e, cv_i), which the conduction solve and its energy
+// booking read (conduction_solve_cv_e). Without them the solve took the 2T
+// ideal-gas electron value in every run: a 1T run conducted with the electron
+// share of the heat capacity, and its first conduction step removed the ion
+// share of the internal energy (half of it for Z = 1); a table run used the
+// ideal gas instead of its table. Before each 1D conduction phase of such a run
+// the heat capacities are taken from the run's EOS closure at the current
+// temperatures (1T: electrons and ions together; 2T: electrons), as the hydro
+// closure provides them when the hydrodynamics runs; the energies are not
+// touched (2026-09-29).
+static void refresh_conduction_heat_capacity_without_hydro(
+    core::State& state, const core::Config& cfg,
+    const hydro::HydroEOSContext& eos_context,
+    DriverRecloseContext& reclose_context) {
+  const std::size_t n = state.rho.size();
+  if (n == 0) {
+    return;
+  }
+  if (state.cv_e.size() != n) {
+    state.cv_e.reset(n);
+  }
+  if (state.cv_i.size() != n) {
+    state.cv_i.reset(n);
+  }
+  if (!refresh_heat_capacity_from_temperature_device(state, cfg, eos_context,
+                                                     reclose_context)) {
+    static bool warned = false;
+    if (!warned) {
+      warned = true;
+      core::log_warning(
+          "Conduction without hydrodynamics: the heat capacities could not be "
+          "evaluated from the EOS tables (no table of the evaluated kind "
+          "uploaded); the conduction uses the ideal-gas electron value.");
+    }
+  }
+}
+
 static void refresh_mie_gruneisen_thermo_from_energy(core::State& state,
                                                      const core::Config& cfg,
                                                      const hydro::HydroEOSContext& eos_ctx,
@@ -3769,33 +3577,6 @@ void flush_i1_operator_profile_dump(I1OperatorProfileDump& dump) {
   dump.rows.clear();
 }
 
-double compute_holo_E_LO_total(const core::State& state, const core::Config& cfg) {
-  const std::size_t n_cells = state.rho.size();
-  const std::size_t n_groups = static_cast<std::size_t>(std::max(cfg.radiation.groups, 1));
-  const std::size_t n_cell_groups = n_cells * n_groups;
-  if (!state.holo_core_mask_valid || state.holo_core_mask.size() != n_cells ||
-      state.holo_E_LO.size() != n_cell_groups || state.vol.size() != n_cells) {
-    return 0.0;
-  }
-
-  const auto E_LO = copy_field_to_host(state.holo_E_LO);
-  const auto vol = copy_field_to_host(state.vol);
-  long double total = 0.0L;
-  for (std::size_t c = 0; c < n_cells; ++c) {
-    const double vol_c = vol[c];
-    if (!std::isfinite(vol_c) || vol_c <= 0.0) {
-      continue;
-    }
-    for (std::size_t g = 0; g < n_groups; ++g) {
-      const double E = E_LO[c * n_groups + g];
-      if (std::isfinite(E)) {
-        total += static_cast<long double>(E) * static_cast<long double>(vol_c);
-      }
-    }
-  }
-  return static_cast<double>(total);
-}
-
 // Run-cumulative energy ledger for the history (SPEC §7.3). Marshak,
 // volume-source, radiation-escape, numerical-loss, boundary-pdV and floor
 // counters accumulate each rank's share, so they are summed over ranks like
@@ -3818,89 +3599,6 @@ diagnostics::EnergyLedgerCumulative cumulative_energy_ledger(
   out.floor_injected = local[5];
   out.safety_injected = state.E_safety;
   out.solver_residual = state.E_solver;
-  return out;
-}
-
-double compute_holo_particle_net_source_core(const core::State& state,
-                                             const core::Config& cfg) {
-  const std::size_t n_cells = state.rho.size();
-  const std::size_t n_groups = static_cast<std::size_t>(std::max(cfg.radiation.groups, 1));
-  const std::size_t n_cell_groups = n_cells * n_groups;
-  if (!state.holo_core_mask_valid || state.holo_core_mask.size() != n_cells ||
-      state.rad_dep.size() != n_cell_groups || state.rad_emit.size() != n_cell_groups) {
-    return 0.0;
-  }
-
-  const auto rad_dep = copy_field_to_host(state.rad_dep);
-  const auto rad_emit = copy_field_to_host(state.rad_emit);
-  long double total = 0.0L;
-  for (std::size_t c = 0; c < n_cells; ++c) {
-    if (state.holo_core_mask[c] == 0U) {
-      continue;
-    }
-    for (std::size_t g = 0; g < n_groups; ++g) {
-      const std::size_t key = c * n_groups + g;
-      const double dep = rad_dep[key];
-      const double emit = rad_emit[key];
-      if (std::isfinite(dep) && std::isfinite(emit)) {
-        total += static_cast<long double>(dep - emit);
-      }
-    }
-  }
-  return static_cast<double>(total);
-}
-
-struct HoloPrrSummary {
-  double coverage = 0.0;
-  double chi_min = 0.0;
-  double chi_mean = 0.0;
-  double chi_max = 0.0;
-};
-
-HoloPrrSummary compute_holo_prr_summary(const core::State& state,
-                                        const core::Config& cfg) {
-  HoloPrrSummary out{};
-  const std::size_t n_cells = state.rho.size();
-  const std::size_t n_groups = static_cast<std::size_t>(std::max(cfg.radiation.groups, 1));
-  const std::size_t n_cell_groups = n_cells * n_groups;
-  if (!state.holo_core_mask_valid || state.holo_core_mask.size() != n_cells ||
-      state.holo_chi.size() != n_cell_groups ||
-      state.holo_Prr_coverage.size() != n_cell_groups) {
-    return out;
-  }
-
-  const auto chi = copy_field_to_host(state.holo_chi);
-  const auto coverage = copy_field_to_host(state.holo_Prr_coverage);
-  long double coverage_sum = 0.0L;
-  long double chi_sum = 0.0L;
-  double chi_min = std::numeric_limits<double>::infinity();
-  double chi_max = -std::numeric_limits<double>::infinity();
-  std::size_t count = 0;
-  for (std::size_t c = 0; c < n_cells; ++c) {
-    if (state.holo_core_mask[c] == 0U) {
-      continue;
-    }
-    for (std::size_t g = 0; g < n_groups; ++g) {
-      const std::size_t key = c * n_groups + g;
-      const double cov = coverage[key];
-      const double chi_value = chi[key];
-      if (!std::isfinite(cov) || !std::isfinite(chi_value)) {
-        continue;
-      }
-      coverage_sum += static_cast<long double>(std::clamp(cov, 0.0, 1.0));
-      chi_sum += static_cast<long double>(chi_value);
-      chi_min = std::min(chi_min, chi_value);
-      chi_max = std::max(chi_max, chi_value);
-      ++count;
-    }
-  }
-  if (count > 0U) {
-    const double inv = 1.0 / static_cast<double>(count);
-    out.coverage = static_cast<double>(coverage_sum) * inv;
-    out.chi_min = chi_min;
-    out.chi_mean = static_cast<double>(chi_sum) * inv;
-    out.chi_max = chi_max;
-  }
   return out;
 }
 
@@ -4118,33 +3816,6 @@ std::int64_t saturating_i64(const std::uint64_t value) {
     return std::numeric_limits<std::int64_t>::max();
   }
   return static_cast<std::int64_t>(value);
-}
-
-void accumulate_device_flags(core::DeviceErrorFlags& acc,
-                             const core::DeviceErrorFlags& step) {
-  acc.nan_particle = std::max(acc.nan_particle, step.nan_particle);
-  acc.invalid_cell = std::max(acc.invalid_cell, step.invalid_cell);
-  acc.invalid_boundary = std::max(acc.invalid_boundary, step.invalid_boundary);
-  acc.pool_overflow = std::max(acc.pool_overflow, step.pool_overflow);
-  acc.opacity_out_of_range = std::max(acc.opacity_out_of_range,
-                                      step.opacity_out_of_range);
-  if (step.infinite_loop > 0) {
-    const auto acc_i64 = static_cast<std::int64_t>(acc.infinite_loop);
-    const auto step_i64 = static_cast<std::int64_t>(step.infinite_loop);
-    const auto sum_i64 = acc_i64 + step_i64;
-    const auto cap_i64 = static_cast<std::int64_t>(std::numeric_limits<std::int32_t>::max());
-    if (sum_i64 > cap_i64) {
-      static bool warned = false;
-      if (!warned) {
-        core::log_warning("DeviceErrorFlags: infinite_loop counter saturated at INT32_MAX");
-        warned = true;
-      }
-    }
-    acc.infinite_loop = static_cast<std::int32_t>(std::min(sum_i64, cap_i64));
-  }
-  acc.ddmc_sigma_tot_zero = std::max(acc.ddmc_sigma_tot_zero,
-                                     step.ddmc_sigma_tot_zero);
-  acc.roulette_kill = std::max(acc.roulette_kill, step.roulette_kill);
 }
 
 // Remap total-mass closure rejection threshold (0 = gate off). Shared by
@@ -4388,8 +4059,6 @@ bool ring7_quotient_effective_enabled(const core::Config& cfg) {
 
 const char* radiation_mode_name(const core::RadiationMode mode) {
   switch (mode) {
-    case core::RadiationMode::ImcDdmc:
-      return "imc_ddmc";
     case core::RadiationMode::MultigroupDiffusion:
       return "multigroup_diffusion";
     case core::RadiationMode::SnTransport:
@@ -5653,7 +5322,6 @@ void write_dt_lineage_jsonl(const core::State& state, const DtLineage& lineage) 
   write_json_number(os, "dt_cond", lineage.dt_cond);
   write_json_number(os, "dt_burn", lineage.dt_burn);
   write_json_number(os, "dt_hot_e", lineage.dt_hot_e);
-  write_json_number(os, "dt_rad", lineage.dt_rad);
   write_json_number(os, "dt_growth", lineage.dt_growth);
   write_json_number(os, "dt_output", lineage.dt_output);
   write_json_number(os, "dt_remaining", lineage.dt_remaining);
@@ -5705,7 +5373,6 @@ void write_dt_lineage_jsonl(const core::State& state, const DtLineage& lineage) 
   os << ",\"cond_argmin_cell\":" << lineage.cond_argmin_cell;
   write_json_number(os, "cond_argmin_deff", lineage.cond_argmin_deff);
   write_json_number(os, "cond_argmin_dl", lineage.cond_argmin_dl);
-  os << ",\"rad_argmin_cell\":" << lineage.rad_argmin_cell;
   os << ",\"ale_attempted\":" << (lineage.ale_attempted ? "true" : "false");
   os << ",\"ale_applied\":" << (lineage.ale_applied ? "true" : "false");
   os << ",\"ale_rezone_triggered\":"
@@ -5942,9 +5609,7 @@ int dt_winner_code(const std::string& winner) {
   if (winner == "hydro") {
     return 1;
   }
-  if (winner == "rad") {
-    return 2;
-  }
+  // 2 was "rad", the Monte Carlo radiation's time-step limit (retired 2026-09-29).
   if (winner == "growth") {
     return 3;
   }
@@ -5988,9 +5653,6 @@ std::string canonical_dt_winner(const DtLineage& lineage) {
   if (lineage.limiter == "conduction") {
     return "cond";
   }
-  if (lineage.limiter == "radiation") {
-    return "rad";
-  }
   if (lineage.limiter == "hydro") {
     if (dt_values_match(lineage.dt_hydro, lineage.dt_hydro_post_shock)) {
       return "post_shock";
@@ -6028,7 +5690,6 @@ diagnostics::DtBreakdownHistoryRecord make_dt_breakdown_history_record(
   record.dt_winner = canonical_dt_winner(lineage);
   record.dt_winner_code = dt_winner_code(record.dt_winner);
   record.dt_hydro = lineage.dt_hydro;
-  record.dt_rad = lineage.dt_rad;
   record.dt_cond = lineage.dt_cond;
   record.dt_post_shock = lineage.dt_hydro_post_shock;
   record.dt_growth = lineage.dt_growth;
@@ -6071,9 +5732,8 @@ DtLineage global_dt_record_lineage(const DtLineage& local,
   if (n_ranks <= 1) {
     return g;
   }
-  double v[14] = {local.dt_chosen,
+  double v[13] = {local.dt_chosen,
                   local.dt_hydro,
-                  local.dt_rad,
                   local.dt_cond,
                   local.dt_hydro_post_shock,
                   local.dt_growth,
@@ -6085,21 +5745,20 @@ DtLineage global_dt_record_lineage(const DtLineage& local,
                   local.dt_hydro_volume_rate,
                   local.dt_hydro_tri_fan_center,
                   local.dt_hydro_corner_j_predict};
-  reducer.allreduce_min(v, 14);
+  reducer.allreduce_min(v, 13);
   g.dt_chosen = v[0];
   g.dt_hydro = v[1];
-  g.dt_rad = v[2];
-  g.dt_cond = v[3];
-  g.dt_hydro_post_shock = v[4];
-  g.dt_growth = v[5];
-  g.dt_output = v[6];
-  g.dt_remaining = v[7];
-  g.dt_max_namelist = v[8];
-  g.dt_hydro_acoustic = v[9];
-  g.dt_hydro_axis_margin = v[10];
-  g.dt_hydro_volume_rate = v[11];
-  g.dt_hydro_tri_fan_center = v[12];
-  g.dt_hydro_corner_j_predict = v[13];
+  g.dt_cond = v[2];
+  g.dt_hydro_post_shock = v[3];
+  g.dt_growth = v[4];
+  g.dt_output = v[5];
+  g.dt_remaining = v[6];
+  g.dt_max_namelist = v[7];
+  g.dt_hydro_acoustic = v[8];
+  g.dt_hydro_axis_margin = v[9];
+  g.dt_hydro_volume_rate = v[10];
+  g.dt_hydro_tri_fan_center = v[11];
+  g.dt_hydro_corner_j_predict = v[12];
   constexpr double kNone = 1.0e18;
   double owners[2] = {local.dt_chosen == g.dt_chosen ? static_cast<double>(rank) : kNone,
                       local.dt_hydro == g.dt_hydro ? static_cast<double>(rank) : kNone};
@@ -6107,7 +5766,7 @@ DtLineage global_dt_record_lineage(const DtLineage& local,
   static const char* const kLimiters[] = {
       "braginskii", "burn",   "conduction", "driver_retry",    "growth",
       "hot_electron", "hydro", "init",     "max",             "output",
-      "radiation",  "rezone_reanchor", "t_end", "unknown"};
+      "rezone_reanchor", "t_end", "unknown"};
   constexpr int kLimiterCount = static_cast<int>(sizeof(kLimiters) / sizeof(kLimiters[0]));
   if (owners[0] < kNone) {
     double code = -1.0;
@@ -6214,9 +5873,7 @@ DtLineage compute_dt_lineage(const core::State& state,
   double dt_hydro = std::numeric_limits<double>::infinity();
   double dt_cond = std::numeric_limits<double>::infinity();
   double dt_brag = std::numeric_limits<double>::infinity();
-  double dt_rad_val = std::numeric_limits<double>::infinity();
   double dt_growth = std::numeric_limits<double>::infinity();
-  radiation::DtRadDiagnostics dt_rad_diag{};
   double dt_init = std::numeric_limits<double>::infinity();
 
   if (state.step == 0) {
@@ -6303,10 +5960,6 @@ DtLineage compute_dt_lineage(const core::State& state,
       dt_brag = hydro::braginskii::compute_dt_braginskii(state, cfg);
       lineage.dt_visc = dt_brag;
       dt_new = std::min(dt_new, dt_brag);
-    }
-    if (cfg.radiation.enabled) {
-      dt_rad_val = radiation::IMC::compute_dt_rad(state, cfg, &dt_rad_diag);
-      dt_new = std::min(dt_new, dt_rad_val);
     }
   }
   const double dt_burn = (state.burn_dt_limit_s > 0.0)
@@ -6399,7 +6052,6 @@ DtLineage compute_dt_lineage(const core::State& state,
         " dt_hydro=" + format_sci17(dt_hydro) +
         " dt_cond=" + format_sci17(dt_cond) +
         " dt_brag=" + format_sci17(dt_brag) +
-        " dt_rad=" + format_sci17(dt_rad_val) +
         " dt_burn=" + format_sci17(dt_burn) +
         " dt_hot_e=" + format_sci17(dt_hot_e) +
         " dt_growth=" + format_sci17(dt_growth) +
@@ -6418,10 +6070,8 @@ DtLineage compute_dt_lineage(const core::State& state,
   lineage.dt_cond = dt_cond;
   lineage.dt_burn = dt_burn;
   lineage.dt_hot_e = dt_hot_e;
-  lineage.dt_rad = dt_rad_val;
   lineage.dt_growth = dt_growth;
   lineage.dt_output = dt_output;
-  lineage.rad_argmin_cell = dt_rad_diag.limiting_cell;
   if (retry_dt_forced) {
     lineage.limiter = "driver_retry";
   } else if (dt_chosen == dt_hydro) {
@@ -6434,8 +6084,6 @@ DtLineage compute_dt_lineage(const core::State& state,
     lineage.limiter = "hot_electron";
   } else if (dt_chosen == lineage.dt_visc) {
     lineage.limiter = "braginskii";
-  } else if (dt_chosen == dt_rad_val) {
-    lineage.limiter = "radiation";
   } else if (dt_chosen == dt_growth) {
     lineage.limiter = "growth";
   } else if (dt_chosen == dt_output) {
@@ -6463,7 +6111,6 @@ DtLineage compute_dt_lineage(const core::State& state,
     in.dt_hydro = dt_hydro;
     in.dt_cond = dt_cond;
     in.dt_visc = lineage.dt_visc;
-    in.dt_rad = dt_rad_val;
     in.dt_prev = (state.dt_growth_ref > 0.0) ? state.dt_growth_ref : state.dt;
     in.growth_factor = cfg.numerics.dt.growth_factor;
     in.dt_max = cfg.numerics.dt.max_s;
@@ -6483,9 +6130,6 @@ DtLineage compute_dt_lineage(const core::State& state,
       }
       if (lineage.limiter == "braginskii") {
         return kDtLimiterBraginskii;
-      }
-      if (lineage.limiter == "radiation") {
-        return kDtLimiterRadiation;
       }
       if (lineage.limiter == "growth") {
         return kDtLimiterGrowth;
@@ -6597,7 +6241,6 @@ DtLineage compute_dt_lineage(const core::State& state,
                         " dt_cond=" + format_sci(dt_cond) +
                         " dt_burn=" + format_sci(dt_burn) +
                         " dt_hot_e=" + format_sci(dt_hot_e) +
-                        " dt_rad=" + format_sci(dt_rad_val) +
                         " dt_growth=" + format_sci(dt_growth) +
                         " dt_output=" + format_sci(dt_output) +
                         " dt_hydro_tri_fan_center=" +
@@ -6674,16 +6317,6 @@ DtLineage compute_dt_lineage(const core::State& state,
             " c_eff=" + format_sci(lineage.tri_fan_center_cfl_c_eff) +
             vertices);
       }
-      if (dt_rad_diag.limiting_cell >= 0) {
-        core::log_warning("[dt_floor_abort_rad_detail] cell=" +
-                          std::to_string(dt_rad_diag.limiting_cell) +
-                          " Te=" + format_sci(dt_rad_diag.limiting_Te) +
-                          " rho=" + format_sci(dt_rad_diag.limiting_rho) +
-                          " sigma_P=" + format_sci(dt_rad_diag.limiting_sigma_P) +
-                          " beta=" + format_sci(dt_rad_diag.limiting_beta) +
-                          " Cv_e=" + format_sci(dt_rad_diag.limiting_Cv_e) +
-                          " dt_rad=" + format_sci(dt_rad_diag.dt_rad));
-      }
     }
     if (defer_dt_floor_abort && remaining > eps) {
       // Caller opted in to handle the abort: it must either rescue the step
@@ -6709,7 +6342,6 @@ DtLineage compute_dt_lineage(const core::State& state,
                    " dt_cond=" + format_sci(dt_cond) +
                    " dt_burn=" + format_sci(dt_burn) +
                    " dt_hot_e=" + format_sci(dt_hot_e) +
-                   " dt_rad=" + format_sci(dt_rad_val) +
                    " dt_growth=" + format_sci(dt_growth) +
                    " dt_max=" + format_sci(cfg.numerics.dt.max_s) +
                    " dt_chosen=" + format_sci(dt_chosen) +
@@ -6744,15 +6376,6 @@ DtLineage compute_dt_lineage(const core::State& state,
                    format_sci(lineage.tri_fan_center_cfl_c_eff) +
                    " tri_fan_center_q_over_p=" +
                    format_sci(lineage.tri_fan_center_cfl_q_over_p));
-    if (dt_rad_diag.limiting_cell >= 0) {
-      core::log_info("[dt_rad_detail] cell=" + std::to_string(dt_rad_diag.limiting_cell) +
-                     " Te=" + format_sci(dt_rad_diag.limiting_Te) +
-                     " rho=" + format_sci(dt_rad_diag.limiting_rho) +
-                     " sigma_P=" + format_sci(dt_rad_diag.limiting_sigma_P) +
-                     " beta=" + format_sci(dt_rad_diag.limiting_beta) +
-                     " Cv_e=" + format_sci(dt_rad_diag.limiting_Cv_e) +
-                     " dt_rad=" + format_sci(dt_rad_diag.dt_rad));
-    }
   }
 
   if (reanchor != nullptr) {
@@ -6761,7 +6384,7 @@ DtLineage compute_dt_lineage(const core::State& state,
       double candidate = lineage.dt_hydro;
       const double other_bounds[] = {
           lineage.dt_cond,     lineage.dt_burn,  lineage.dt_hot_e,
-          lineage.dt_visc,     lineage.dt_rad,   lineage.dt_output,
+          lineage.dt_visc,     lineage.dt_output,
           lineage.dt_remaining, lineage.dt_max_namelist};
       for (const double bound : other_bounds) {
         if (bound > 0.0 && std::isfinite(bound) && bound < candidate) {
@@ -6799,14 +6422,9 @@ double compute_dt(const core::State& state,
   return compute_dt_lineage(state, cfg, t_end).dt_chosen;
 }
 
-void Driver::set_restart_photon_pool(radiation::PhotonPool&& pool) {
-  restart_pool_ = std::move(pool);
-}
-
 void Driver::run(core::State& state, const core::Config& cfg_input) {
   core::Config cfg = cfg_input;
   resolve_temperature_model(cfg, state);
-  assert_driver_retry_supported(cfg);
   io::OutputManager out;
   int io_rank = 0;
 #if TENRYU_ENABLE_MPI
@@ -6827,7 +6445,6 @@ void Driver::run(core::State& state,
                  io::OutputManager& out) {
   core::Config cfg = cfg_input;
   resolve_temperature_model(cfg, state);
-  assert_driver_retry_supported(cfg);
   const double fixed_dt = i1b_fixed_dt();
   if (fixed_dt > 0.0 && fixed_dt < cfg.numerics.dt.min_s) {
     throw core::namelist::ConfigError(
@@ -6921,11 +6538,7 @@ void Driver::run(core::State& state,
   hydro::Hydro1D hydro_1d;
   hydro::Hydro2D hydro_2d;
   hydro::MeshRegimeDeviceCache mesh_regime_cache;
-  radiation::IMC imc;
-  if (restart_pool_.has_value()) {
-    imc.restore_photon_pool(std::move(*restart_pool_));
-    restart_pool_.reset();
-  }
+  radiation::RadiationStep radiation_step;
   laser::LaserMesh laser_mesh;
   if (cfg.laser.enabled) {
     laser_mesh = laser::create_from_config(cfg);
@@ -7387,7 +7000,6 @@ void Driver::run(core::State& state,
       }
     }
   }
-  state.radiation_device_flags = core::DeviceErrorFlags{};
 
   if (cfg.numerics.conduction.enabled &&
       cfg.numerics.conduction.solver == "hypre") {
@@ -7484,8 +7096,7 @@ void Driver::run(core::State& state,
   }
   bool seen_2t_separation = false;
   bool warned_clamp_threshold = false;
-  parallel::EmigrantBuffer emigrants;
-  parallel::EmigrantBuffer immigrants;
+  long long overshoot_warn_count = 0;
 
   const auto h1d_dump7 = [&](const char* phase) {
     const char* dbg = std::getenv("TENRYU_H1D_DEBUG");
@@ -7804,7 +7415,6 @@ void Driver::run(core::State& state,
         const core::NvtxRange nvtx_checkpoint("outputs.write_checkpoint");
         out.write_checkpoint(state,
                              cfg,
-                             imc.photon_pool(),
                              state.step,
                              state.t,
                              case_name,
@@ -8030,7 +7640,7 @@ void Driver::run(core::State& state,
   struct ThermalSubcycleScratch {
     core::CellField1D ee, ei, Te, Ti, Pe, Pi, cv_e, cv_i, zbar, sn_ee_node_offset;
     core::GroupField1D rad_E, rad_E_old, sn_psi_prev, sn_psi_sd_prev;
-    core::GroupField1D rad_dep_total, rad_emit_total, holo_rad_dep_total, holo_rad_emit_total;
+    core::GroupField1D rad_dep_total, rad_emit_total;
   } thermal_subcycle_scratch;
   while (state.t < cfg.main.t_end && state.step < cfg.main.max_steps) {
     const core::NvtxRange nvtx_range("step");
@@ -8111,8 +7721,7 @@ void Driver::run(core::State& state,
         hydro::core_clearance_controller_g31_take_trial_reject()) {
       TENRYU_ASSERT(step_snapshot_wanted,
                     "G3.1 trial reject requires the step retry snapshot");
-      restore_driver_retry_snapshot(state, cfg, retry_snapshot_, false, true,
-                                    nullptr);
+      restore_driver_retry_snapshot(state, cfg, retry_snapshot_, false, nullptr);
       core::log_warning("[g31] step=" + std::to_string(state.step) +
                         " trial remap rejected; pre-rezone state restored");
     }
@@ -8768,9 +8377,6 @@ void Driver::run(core::State& state,
         hydro::i1b_spurious_sensor_enabled();
     const int i1b_spurious_sensor_top_k =
         i1b_spurious_sensor_enabled ? hydro::i1b_spurious_sensor_top_k() : 0;
-    const bool deterministic_radiation_mode =
-        cfg.radiation.mode == core::RadiationMode::MultigroupDiffusion ||
-        cfg.radiation.mode == core::RadiationMode::SnTransport;
     // W-K gamma_r=4/3 radiation-compression coupling (verdict D2).
     // v1 scope: 1D + deterministic FLD only — enforced on cfg.radiation.mode:
     // hydro_coupling is a multigroup_diffusion-subtree key, so with the flipped
@@ -8814,8 +8420,7 @@ void Driver::run(core::State& state,
     // owned window only, so the paid line must be re-globalized from the
     // owners before any full-line consumer (the replicated solve, and the
     // next hydro half's radiation-pressure field) reads it.
-    const bool replicated_radiation_1d =
-        part_info.n_ranks > 1 && is_1d && deterministic_radiation_mode;
+    const bool replicated_radiation_1d = part_info.n_ranks > 1 && is_1d;
     const double replicated_tally_share =
         (replicated_radiation_1d && part_info.rank != 0) ? 0.0 : 1.0;
     // Allgatherv a per-cell line (per_cell entries per cell, cell-major)
@@ -8995,20 +8600,13 @@ void Driver::run(core::State& state,
                     "2D node-field allgatherv H2D failed");
     };
     long E_rad_before_off = -1;
-    if (cfg.radiation.enabled && deterministic_radiation_mode &&
-        wj_arena.mode) {
+    if (cfg.radiation.enabled && wj_arena.mode) {
       E_rad_before_off = wj_defer_rad_capture();
     }
     double E_rad_before =
-        (E_rad_before_off >= 0)
+        (E_rad_before_off >= 0 || !cfg.radiation.enabled)
             ? 0.0
-            : (cfg.radiation.enabled
-                   ? (deterministic_radiation_mode
-                          ? compute_fld_rad_energy_total_device(state, cfg)
-                          : imc.census_energy())
-                   : 0.0);
-    const double rad_esc_before_total =
-        cfg.radiation.enabled ? imc.escaped_energy_total() : 0.0;
+            : compute_fld_rad_energy_total_device(state, cfg);
     std::vector<double> energy_audit_r_before;
     std::vector<double> energy_audit_z_before;
     if (energy_audit_enabled) {
@@ -9048,10 +8646,6 @@ void Driver::run(core::State& state,
     bool cap_energy_audit_rezone_fired = false;
     hydro::I1BSpuriousSensorSummary i1b_hydro_sensor_step{};
     hydro::I1BSpuriousSensorSummary i1b_ale_sensor_step{};
-    double step_holo_boundary_in = 0.0;
-    double step_holo_boundary_out = 0.0;
-    double step_holo_matter_delta = 0.0;
-    double step_holo_source_balance_error = 0.0;
     // FLD outer-iteration history over every FLD solve of the step (a
     // thermal-subcycled step solves once per substep): iterations summed,
     // the largest exit residual, converged only if every solve converged.
@@ -9756,15 +9350,11 @@ void Driver::run(core::State& state,
         s.E_matter_nodal = m.E_thermal_total + m.E_kinetic_total_nodal;
       }
       if (cfg.radiation.enabled) {
-        if (deterministic_radiation_mode) {
-          if (wj_arena.mode) {
-            s.r_off = wj_defer_rad_capture();
-          }
-          if (s.r_off < 0) {
-            s.E_rad = compute_fld_rad_energy_total_device(state, cfg);
-          }
-        } else {
-          s.E_rad = imc.census_energy();
+        if (wj_arena.mode) {
+          s.r_off = wj_defer_rad_capture();
+        }
+        if (s.r_off < 0) {
+          s.E_rad = compute_fld_rad_energy_total_device(state, cfg);
         }
       }
       s.laser_in = step_E_laser_in;
@@ -9856,15 +9446,11 @@ void Driver::run(core::State& state,
           snapshot.matter = compute_energy_totals_for_state(state, cfg);
         }
         if (cfg.radiation.enabled) {
-          if (deterministic_radiation_mode) {
-            if (wj_arena.mode) {
-              snapshot.rad_off = wj_defer_rad_capture();
-            }
-            if (snapshot.rad_off < 0) {
-              snapshot.rad = compute_fld_rad_energy_total_device(state, cfg);
-            }
-          } else {
-            snapshot.rad = imc.census_energy();
+          if (wj_arena.mode) {
+            snapshot.rad_off = wj_defer_rad_capture();
+          }
+          if (snapshot.rad_off < 0) {
+            snapshot.rad = compute_fld_rad_energy_total_device(state, cfg);
           }
         }
       }
@@ -10139,13 +9725,11 @@ void Driver::run(core::State& state,
       const WjOpAuditSnapshot wj_b_hydro =
           wj_op_audit_active ? wj_audit_capture() : WjOpAuditSnapshot{};
       long rad_mesh_E_before_half_off = -1;
-      if (cfg.radiation.enabled && deterministic_radiation_mode &&
-          wj_arena.mode) {
+      if (cfg.radiation.enabled && wj_arena.mode) {
         rad_mesh_E_before_half_off = wj_defer_rad_capture();
       }
       const double rad_mesh_E_before_half =
-          (cfg.radiation.enabled && deterministic_radiation_mode &&
-           rad_mesh_E_before_half_off < 0)
+          (cfg.radiation.enabled && rad_mesh_E_before_half_off < 0)
               ? compute_fld_rad_energy_total_device(state, cfg)
               : 0.0;
       double hydro_E_floor = 0.0;
@@ -10182,9 +9766,9 @@ void Driver::run(core::State& state,
               rad_gamma43_p_r.data(), state.rad_E.data(),
               static_cast<int>(state.rho.size()), rad_gamma43_n_groups);
         }
-        const auto& hk_sigma_R_max = imc.last_sigma_R_max();
-        const std::vector<double>* hk_sigma_R_max_ptr =
-            (hk_sigma_R_max.size() == state.rho.size()) ? &hk_sigma_R_max : nullptr;
+        // The HK velocity damper's optical-depth gate takes a per-cell Rosseland opacity maximum; only the
+        // Monte Carlo radiation (retired 2026-09-29) supplied one, so the damper runs without that gate.
+        const std::vector<double>* hk_sigma_R_max_ptr = nullptr;
         h1d_dump7("d2");
         hydro::entropy_ledger_begin(
             state, cfg, hydro::EntropyLedgerStage::Hydro);
@@ -10262,9 +9846,6 @@ void Driver::run(core::State& state,
           diagnostics::RadialFourierStageId::HydroLag,
           diagnostics::RadialFourierStagePhase::After,
           t_op + dt_op);
-      if (cfg.radiation.imc.difference.enabled) {
-        imc.invalidate_difference_reference();
-      }
       step_E_floor += std::max(hydro_E_floor, 0.0);
       step_clamp_count += std::max(hydro_clamp_count, 0);
       step_clamp_count += std::max(hydro_rho_clamp_count, 0);
@@ -10324,7 +9905,7 @@ void Driver::run(core::State& state,
                               window.begin, window.end, rad_gamma43_n_groups);
         allgatherv_1d_cell_line(state.rad_E.data(), rad_gamma43_n_groups);
       }
-      if (cfg.radiation.enabled && deterministic_radiation_mode) {
+      if (cfg.radiation.enabled) {
         // The radiation energy sums rad_E x vol over the whole line (1D is
         // replicated): the other ranks' cell volumes from their owners after
         // this hydro half (1D MPI; no-op otherwise).
@@ -10483,6 +10064,10 @@ void Driver::run(core::State& state,
       const core::NvtxRange nvtx_range("phase.conduction");
       if (!cfg.numerics.conduction.enabled) {
         return;
+      }
+      if (is_1d && !cfg.numerics.hydro.enabled) {
+        refresh_conduction_heat_capacity_without_hydro(state, cfg, eos_ctx,
+                                                       reclose_ctx);
       }
       static const bool cond_ebal_enabled = [] {
         const char* s = std::getenv("TENRYU_HYDRO_EBAL");
@@ -12024,12 +11609,8 @@ void Driver::run(core::State& state,
           wj_op_audit_active ? wj_audit_capture() : WjOpAuditSnapshot{};
       auto t_rad_subphase = t_phase_start;
       double rad_exchange_ms = 0.0;
-      double rad_imc_ms = 0.0;
-      double rad_migrate_ms = 0.0;
-      double rad_dflags_ms = 0.0;
-      double rad_inject_ms = 0.0;
+      double rad_solve_ms = 0.0;
       double rad_refresh_ms = 0.0;
-      double rad_fleck_log_ms = 0.0;
       double rad_overshoot_ms = 0.0;
       double rad_safety_ms = 0.0;
       double rad_other_ms = 0.0;
@@ -12193,25 +11774,12 @@ void Driver::run(core::State& state,
                                          state.mesh.topo.n_cells, halo_stream, 4);
         }
       };
-      const auto migrate_radiation_particles = [&]() {
-        if (part_info.n_ranks > 1) {
-          cudaStream_t mig_stream = nullptr;
-          parallel::detect_emigrants(imc.photon_pool(), part_info, emigrants, mig_stream);
-          parallel::exchange_emigrants(
-              part_info, comm_buffers, emigrants, immigrants, mig_stream);
-          parallel::merge_immigrants(imc.photon_pool(), immigrants, false, mig_stream);
-        }
-      };
       // drive_time_s: evaluation time of the 1D FLD / S_N boundary drive
       // (Marshak T_r(t), pulsed flux) = midpoint of the interval this stage
       // advances; NaN keeps the solver's historic state.t.
       const auto run_radiation_stage = [&](const double dt_stage,
                                            const double t_stage,
                                            const double drive_time_s) {
-        const bool deterministic_stage =
-            cfg.radiation.mode == core::RadiationMode::MultigroupDiffusion ||
-            cfg.radiation.mode == core::RadiationMode::SnTransport;
-        const double escaped_before = imc.escaped_energy_total();
         mark_rad_subphase(rad_other_ms);
         if (replicated_radiation_1d) {
           allgather_1d_radiation_inputs();
@@ -12223,8 +11791,8 @@ void Driver::run(core::State& state,
             diagnostics::RadialFourierStageId::FldSolve,
             diagnostics::RadialFourierStagePhase::Before,
             t_stage);
-        imc.transport_step(state, cfg, dt_stage, part_info, &comm_buffers,
-                           drive_time_s);
+        radiation_step.step(state, cfg, dt_stage, part_info, &comm_buffers,
+                            drive_time_s);
         if (cfg.radiation.mode == core::RadiationMode::MultigroupDiffusion) {
           ++step_fld_solves;
           step_fld_outer_iterations +=
@@ -12276,70 +11844,17 @@ void Driver::run(core::State& state,
           record_mesh_attr_zero(
               diagnostics::mesh_attribution::MeshDeformSource::SNTransport);
         }
-        mark_rad_subphase(rad_imc_ms);
-        const auto& holo_lo = imc.last_holo_lo_result();
-        step_holo_boundary_in += holo_lo.boundary_E_in;
-        step_holo_boundary_out += holo_lo.boundary_E_out;
-        step_holo_matter_delta += holo_lo.matter_delta;
-        step_holo_source_balance_error += holo_lo.conservation_error;
-        mark_rad_subphase(rad_other_ms);
-        if (!deterministic_stage) {
-          migrate_radiation_particles();
-        }
-        mark_rad_subphase(rad_migrate_ms);
-        accumulate_device_flags(state.radiation_device_flags,
-                                imc.last_device_error_flags());
-        mark_rad_subphase(rad_dflags_ms);
-        const double escaped_after = imc.escaped_energy_total();
-        const double deterministic_escaped =
-            (cfg.radiation.mode == core::RadiationMode::SnTransport)
-                ? state.sn_escaped_step
-                : state.fld_escaped_step;
-        const double deterministic_marshak =
-            (cfg.radiation.mode == core::RadiationMode::MultigroupDiffusion)
-                ? state.fld_marshak_in_step
-                : ((cfg.radiation.mode == core::RadiationMode::SnTransport)
-                       ? state.sn_marshak_in_step
-                       : 0.0);
-        step_E_rad_esc += deterministic_stage
-                              ? replicated_tally_share *
-                                    std::max(deterministic_escaped, 0.0)
-                              : std::max(escaped_after - escaped_before, 0.0);
-        step_E_marshak_in += deterministic_stage
-                                  ? replicated_tally_share *
-                                        std::max(deterministic_marshak, 0.0)
-                                  : std::max(imc.last_marshak_in_step(), 0.0);
-        const double deterministic_volume_in =
-            (cfg.radiation.mode == core::RadiationMode::MultigroupDiffusion)
-                ? state.fld_volume_source_in_step
-                : ((cfg.radiation.mode == core::RadiationMode::SnTransport)
-                       ? state.sn_volume_source_in_step
-                       : 0.0);
-        step_E_volume_in += deterministic_stage
-                                ? replicated_tally_share *
-                                      std::max(deterministic_volume_in, 0.0)
-                                : std::max(imc.last_volume_source_step(), 0.0);
-        step_E_numerical_loss += std::max(imc.last_numerical_loss_step(), 0.0);
-        double source_E_floor = 0.0;
-        int source_clamp_count = 0;
-        mark_rad_subphase(rad_other_ms);
-        // Radiation source-term closure reads state.zbar (single shared Zbar field).
-        if (!deterministic_stage) {
-          emit_radial_fourier_audit(
-              diagnostics::RadialFourierStageId::NewtonSource,
-              diagnostics::RadialFourierStagePhase::Before,
-              t_stage + dt_stage);
-          step_E_numerical_loss += inject_radiation_source_terms(
-              state, cfg, dt_stage, &source_E_floor, &source_clamp_count,
-              &imc.last_sigma_R_max(), &eos_ctx);
-          emit_radial_fourier_audit(
-              diagnostics::RadialFourierStageId::NewtonSource,
-              diagnostics::RadialFourierStagePhase::After,
-              t_stage + dt_stage);
-        }
-        mark_rad_subphase(rad_inject_ms);
-        step_E_floor += std::max(source_E_floor, 0.0);
-        step_clamp_count += std::max(source_clamp_count, 0);
+        mark_rad_subphase(rad_solve_ms);
+        // The replicated 1D solve (MPI) books the boundary flows on rank 0 only.
+        const bool sn_mode = cfg.radiation.mode == core::RadiationMode::SnTransport;
+        step_E_rad_esc += replicated_tally_share *
+                          std::max(sn_mode ? state.sn_escaped_step : state.fld_escaped_step, 0.0);
+        step_E_marshak_in +=
+            replicated_tally_share *
+            std::max(sn_mode ? state.sn_marshak_in_step : state.fld_marshak_in_step, 0.0);
+        step_E_volume_in +=
+            replicated_tally_share *
+            std::max(sn_mode ? state.sn_volume_source_in_step : state.fld_volume_source_in_step, 0.0);
         mark_rad_subphase(rad_other_ms);
       };
       const auto copy_device_field = [](auto& dst, const auto& src,
@@ -12425,8 +11940,8 @@ void Driver::run(core::State& state,
         // attempt has already advanced the radiation prognostic state
         // (rad_E; rad_E_old via the SN stage-end copy; sn_psi_prev = the
         // per-angle backward-Euler time source) and the step-ledger
-        // accumulators (escaped/marshak/volume-source/numerical-loss and
-        // the HOLO LO tallies). Restoring only the six thermodynamic
+        // accumulators (escaped/marshak/volume-source/numerical-loss).
+        // Restoring only the six thermodynamic
         // fields made the retried attempt start from a half-advanced
         // radiation field and double-counted every failed attempt's
         // boundary flows in the step budget. Empty fields (mode-dependent)
@@ -12471,11 +11986,6 @@ void Driver::run(core::State& state,
         const double saved_step_E_marshak_in = step_E_marshak_in;
         const double saved_step_E_volume_in = step_E_volume_in;
         const double saved_step_E_numerical_loss = step_E_numerical_loss;
-        const double saved_step_holo_boundary_in = step_holo_boundary_in;
-        const double saved_step_holo_boundary_out = step_holo_boundary_out;
-        const double saved_step_holo_matter_delta = step_holo_matter_delta;
-        const double saved_step_holo_source_balance_error =
-            step_holo_source_balance_error;
         const int saved_step_fld_solves = step_fld_solves;
         const std::int64_t saved_step_fld_outer_iterations =
             step_fld_outer_iterations;
@@ -12515,11 +12025,6 @@ void Driver::run(core::State& state,
           step_E_marshak_in = saved_step_E_marshak_in;
           step_E_volume_in = saved_step_E_volume_in;
           step_E_numerical_loss = saved_step_E_numerical_loss;
-          step_holo_boundary_in = saved_step_holo_boundary_in;
-          step_holo_boundary_out = saved_step_holo_boundary_out;
-          step_holo_matter_delta = saved_step_holo_matter_delta;
-          step_holo_source_balance_error =
-              saved_step_holo_source_balance_error;
           step_fld_solves = saved_step_fld_solves;
           step_fld_outer_iterations = saved_step_fld_outer_iterations;
           step_fld_outer_residual = saved_step_fld_outer_residual;
@@ -12531,18 +12036,15 @@ void Driver::run(core::State& state,
           step_sn_converged = saved_step_sn_converged;
         };
 
-        // Each radiation solve rewrites rad_dep/rad_emit (and the HOLO LO
-        // tallies) with the energy of the interval it advances, but the
-        // step output reads them as the whole step's exchange (checkpoint
-        // rad_dep/rad_emit, deposited_power = rad_dep / (V dt), the HOLO
-        // source-mismatch diagnostic). With n_sub > 1 the accepted
+        // Each radiation solve rewrites rad_dep/rad_emit with the energy of
+        // the interval it advances, but the step output reads them as the
+        // whole step's exchange (checkpoint rad_dep/rad_emit,
+        // deposited_power = rad_dep / (V dt)). With n_sub > 1 the accepted
         // attempt's substeps are summed on the device and written back after
         // the loop, as the two-stage path does; n_sub = 1 leaves them as the
         // single solve wrote them.
         auto& substep_rad_dep_total = thermal_subcycle_scratch.rad_dep_total;
         auto& substep_rad_emit_total = thermal_subcycle_scratch.rad_emit_total;
-        auto& substep_holo_rad_dep_total = thermal_subcycle_scratch.holo_rad_dep_total;
-        auto& substep_holo_rad_emit_total = thermal_subcycle_scratch.holo_rad_emit_total;
         const auto sum_substep_field = [&](core::GroupField1D& total,
                                            const core::GroupField1D& field,
                                            const bool first_substep) {
@@ -12557,24 +12059,12 @@ void Driver::run(core::State& state,
         const auto sum_substep_tallies = [&](const bool first_substep) {
           sum_substep_field(substep_rad_dep_total, state.rad_dep, first_substep);
           sum_substep_field(substep_rad_emit_total, state.rad_emit, first_substep);
-          if (cfg.radiation.holo.enabled) {
-            sum_substep_field(substep_holo_rad_dep_total, state.holo_rad_dep,
-                              first_substep);
-            sum_substep_field(substep_holo_rad_emit_total, state.holo_rad_emit,
-                              first_substep);
-          }
         };
         const auto publish_substep_tallies = [&]() {
           copy_device_field(state.rad_dep, substep_rad_dep_total,
                             "thermal-subcycle rad_dep total");
           copy_device_field(state.rad_emit, substep_rad_emit_total,
                             "thermal-subcycle rad_emit total");
-          if (cfg.radiation.holo.enabled) {
-            copy_device_field(state.holo_rad_dep, substep_holo_rad_dep_total,
-                              "thermal-subcycle holo_rad_dep total");
-            copy_device_field(state.holo_rad_emit, substep_holo_rad_emit_total,
-                              "thermal-subcycle holo_rad_emit total");
-          }
         };
 
         int n_sub = predict_initial_thermal_substeps();
@@ -12645,58 +12135,24 @@ void Driver::run(core::State& state,
         const double dt_half = 0.5 * dt_op;
         std::vector<double> rad_dep_total;
         std::vector<double> rad_emit_total;
-        std::vector<double> holo_rad_dep_total;
-        std::vector<double> holo_rad_emit_total;
-        std::vector<double> delta_E_rad_total;
-        const std::vector<double> delta_E_rad_prev_saved =
-            copy_field_to_host(state.delta_E_rad_prev);
         auto accumulate_stage_tallies = [&]() {
           const auto stage_rad_dep = copy_field_to_host(state.rad_dep);
           const auto stage_rad_emit = copy_field_to_host(state.rad_emit);
-          const auto stage_holo_rad_dep = copy_field_to_host(state.holo_rad_dep);
-          const auto stage_holo_rad_emit = copy_field_to_host(state.holo_rad_emit);
-          const auto stage_delta_E = copy_field_to_host(state.delta_E_rad_prev);
           if (rad_dep_total.empty()) {
             rad_dep_total.assign(stage_rad_dep.size(), 0.0);
           }
           if (rad_emit_total.empty()) {
             rad_emit_total.assign(stage_rad_emit.size(), 0.0);
           }
-          if (delta_E_rad_total.empty()) {
-            delta_E_rad_total.assign(stage_delta_E.size(), 0.0);
-          }
-          if (cfg.radiation.holo.enabled && holo_rad_dep_total.empty()) {
-            holo_rad_dep_total.assign(stage_holo_rad_dep.size(), 0.0);
-          }
-          if (cfg.radiation.holo.enabled && holo_rad_emit_total.empty()) {
-            holo_rad_emit_total.assign(stage_holo_rad_emit.size(), 0.0);
-          }
           TENRYU_ASSERT(stage_rad_dep.size() == rad_dep_total.size(),
                         "two-stage radiation requires consistent rad_dep size across stages");
           TENRYU_ASSERT(stage_rad_emit.size() == rad_emit_total.size(),
                         "two-stage radiation requires consistent rad_emit size across stages");
-          TENRYU_ASSERT(stage_delta_E.size() == delta_E_rad_total.size(),
-                        "two-stage radiation requires consistent delta_E_rad_prev size across stages");
-          if (cfg.radiation.holo.enabled) {
-            TENRYU_ASSERT(stage_holo_rad_dep.size() == holo_rad_dep_total.size(),
-                          "two-stage radiation requires consistent holo_rad_dep size across stages");
-            TENRYU_ASSERT(stage_holo_rad_emit.size() == holo_rad_emit_total.size(),
-                          "two-stage radiation requires consistent holo_rad_emit size across stages");
-          }
           for (std::size_t i = 0; i < stage_rad_dep.size(); ++i) {
             rad_dep_total[i] += stage_rad_dep[i];
           }
           for (std::size_t i = 0; i < stage_rad_emit.size(); ++i) {
             rad_emit_total[i] += stage_rad_emit[i];
-          }
-          for (std::size_t i = 0; i < stage_delta_E.size(); ++i) {
-            delta_E_rad_total[i] += stage_delta_E[i];
-          }
-          for (std::size_t i = 0; i < holo_rad_dep_total.size(); ++i) {
-            holo_rad_dep_total[i] += stage_holo_rad_dep[i];
-          }
-          for (std::size_t i = 0; i < holo_rad_emit_total.size(); ++i) {
-            holo_rad_emit_total[i] += stage_holo_rad_emit[i];
           }
         };
 
@@ -12705,18 +12161,10 @@ void Driver::run(core::State& state,
         accumulate_stage_tallies();
         mark_rad_subphase(rad_other_ms);
 
-        // Mid-stage EOS re-closure: inject_radiation_source_terms() has already
-        // projected ee -> Te/Pe; sync_ee_from_Te_table refreshes ee/Pe/Cv from Te.
+        // Mid-stage EOS re-closure: sync_ee_from_Te_table refreshes ee/Pe/Cv
+        // from Te.
         sync_ee_from_Te_table(state, cfg, eos_ctx, reclose_ctx);
         refresh_mie_gruneisen_thermo_from_energy(state, cfg, eos_ctx, reclose_ctx);
-        if (delta_E_rad_prev_saved.empty()) {
-          state.delta_E_rad_prev.reset(0);
-        } else {
-          if (state.delta_E_rad_prev.size() != delta_E_rad_prev_saved.size()) {
-            state.delta_E_rad_prev.reset(delta_E_rad_prev_saved.size());
-          }
-          state.delta_E_rad_prev.copy_from_host(delta_E_rad_prev_saved.data());
-        }
         update_zbar_for_step(state, cfg, zbar_device_context);
         mark_rad_subphase(rad_other_ms);
 
@@ -12731,26 +12179,9 @@ void Driver::run(core::State& state,
         if (!rad_emit_total.empty()) {
           state.rad_emit.copy_from_host(rad_emit_total.data());
         }
-        if (!holo_rad_dep_total.empty()) {
-          state.holo_rad_dep.copy_from_host(holo_rad_dep_total.data());
-        }
-        if (!holo_rad_emit_total.empty()) {
-          state.holo_rad_emit.copy_from_host(holo_rad_emit_total.data());
-        }
-        if (!delta_E_rad_total.empty()) {
-          const std::size_t n_cells = state.rho.size();
-          if (state.delta_E_rad_prev.size() != n_cells) {
-            state.delta_E_rad_prev.reset(n_cells);
-          }
-          if (n_cells > 0) {
-            state.delta_E_rad_prev.copy_from_host(delta_E_rad_total.data());
-          }
-        }
         mark_rad_subphase(rad_other_ms);
       } else {
         if (cfg.numerics.radiation_thermal_subcycle) {
-          // TODO: snapshot/restore the IMC census pool so retries restart from
-          // the same photon state instead of only restoring thermodynamics.
           run_single_stage_with_thermal_subcycling();
         } else {
           run_radiation_stage(dt_op, t_op, state.t + 0.5 * dt_op);
@@ -12770,8 +12201,6 @@ void Driver::run(core::State& state,
             diagnostics::RadialFourierStagePhase::After,
             t_op + dt_op);
       }
-      log_fleck_diagnostics_if_needed(state, cfg, imc);
-      mark_rad_subphase(rad_fleck_log_ms);
       if (wj_arena.mode) {
         compute_overshoot_metrics_device_to_slots(
             state.Te.data(),
@@ -12788,7 +12217,7 @@ void Driver::run(core::State& state,
         // The radiation operator ends at t_n + dt (state.t = t_n here).
         const OvershootMetrics overshoot =
             compute_overshoot_metrics(state, cfg, te_max_before, state.t + dt_op);
-        imc.set_last_overshoot_metrics(overshoot.count, overshoot.max_ratio);
+        radiation_step.set_last_overshoot_metrics(overshoot.count, overshoot.max_ratio);
       }
       mark_rad_subphase(rad_overshoot_ms);
       mark_rad_subphase(rad_other_ms);
@@ -12807,13 +12236,9 @@ void Driver::run(core::State& state,
         std::ostringstream oss;
         oss << "[rad_subphase] step=" << state.step
             << std::fixed << std::setprecision(2)
-            << " imc=" << rad_imc_ms
+            << " solve=" << rad_solve_ms
             << " exchange=" << rad_exchange_ms
-            << " migrate=" << rad_migrate_ms
-            << " dflags=" << rad_dflags_ms
-            << " inject=" << rad_inject_ms
             << " refresh=" << rad_refresh_ms
-            << " fleck_log=" << rad_fleck_log_ms
             << " overshoot=" << rad_overshoot_ms
             << " safety=" << rad_safety_ms
             << " other=" << rad_other_ms
@@ -12898,7 +12323,7 @@ void Driver::run(core::State& state,
             std::to_string(
                 cfg.numerics.hydro.driver_full_step_retry_max_attempts));
         restore_driver_retry_snapshot(
-            state, cfg, retry_snapshot_, false, true, nullptr);
+            state, cfg, retry_snapshot_, false, nullptr);
         continue;
       }
       core::log_warning(
@@ -12930,7 +12355,7 @@ void Driver::run(core::State& state,
             std::to_string(
                 cfg.numerics.hydro.driver_full_step_retry_max_attempts));
         restore_driver_retry_snapshot(
-            state, cfg, retry_snapshot_, false, true, nullptr);
+            state, cfg, retry_snapshot_, false, nullptr);
         continue;
       }
       std::ostringstream oss;
@@ -12973,7 +12398,7 @@ void Driver::run(core::State& state,
             std::to_string(
                 cfg.numerics.hydro.driver_full_step_retry_max_attempts));
         restore_driver_retry_snapshot(
-            state, cfg, retry_snapshot_, false, true, nullptr);
+            state, cfg, retry_snapshot_, false, nullptr);
         continue;
       }
       std::ostringstream oss;
@@ -13050,7 +12475,7 @@ void Driver::run(core::State& state,
               cfg.numerics.hydro.driver_full_step_retry_max_attempts) {
         ++maxmin_attempts_this_step;
         restore_driver_retry_snapshot(
-            state, cfg, retry_snapshot_, false, true, nullptr);
+            state, cfg, retry_snapshot_, false, nullptr);
         axis_band_applied_this_attempt = false;
         hydro::ale::reset_remap_mass_closure_step_max();
         const auto repair = hydro::ale::apply_maxmin_untangle_repair(
@@ -13083,7 +12508,7 @@ void Driver::run(core::State& state,
           retry_attempts <
               cfg.numerics.hydro.driver_full_step_retry_max_attempts) {
         restore_driver_retry_snapshot(
-            state, cfg, retry_snapshot_, false, true, nullptr);
+            state, cfg, retry_snapshot_, false, nullptr);
         axis_band_applied_this_attempt = false;
         if (hydro::axis_core_disk_release_one_unit(state, cfg)) {
           ++retry_attempts;
@@ -13120,7 +12545,7 @@ void Driver::run(core::State& state,
           (cfg.numerics.hydro.driver_full_step_retry_enabled ||
            hydro::i1b_path_guard_enabled())) {
         ++row_merge_attempts_this_step;
-        restore_driver_retry_snapshot(state, cfg, retry_snapshot_, false, true, nullptr);
+        restore_driver_retry_snapshot(state, cfg, retry_snapshot_, false, nullptr);
         axis_band_applied_this_attempt = false;
         auto merge = hydro::apply_tier_row_merge(state, cfg, failure.cell);
         if (!merge.committed && merge.reject_reason != nullptr &&
@@ -13203,7 +12628,7 @@ void Driver::run(core::State& state,
       }
 
       restore_driver_retry_snapshot(
-          state, cfg, retry_snapshot_, false, true, nullptr);
+          state, cfg, retry_snapshot_, false, nullptr);
       axis_band_applied_this_attempt = false;
       retry_dt_before = dt;
       ++retry_attempts;
@@ -13291,8 +12716,7 @@ void Driver::run(core::State& state,
         }
         hydro::core_clearance_controller_pre_lagrange_rezone(state, cfg);
         if (hydro::core_clearance_controller_g31_take_trial_reject()) {
-          restore_driver_retry_snapshot(state, cfg, retry_snapshot_, false,
-                                        true, nullptr);
+          restore_driver_retry_snapshot(state, cfg, retry_snapshot_, false, nullptr);
           core::log_warning(
               "[g31] step=" + std::to_string(state.step) +
               " ladder trial remap rejected; snapshot restored");
@@ -13482,7 +12906,7 @@ void Driver::run(core::State& state,
                 state, cfg, last_hydro_result.first_failing_cell)) {
           ++tmop_repairs;
           restore_driver_retry_snapshot(
-              state, cfg, retry_snapshot_, false, true, nullptr);
+              state, cfg, retry_snapshot_, false, nullptr);
           axis_band_applied_this_attempt = false;
           hydro::ale::reset_remap_mass_closure_step_max();
           (void)hydro::ale::apply_pole_axis_radial_order_repair(
@@ -13498,7 +12922,7 @@ void Driver::run(core::State& state,
                 std::to_string(hydro::ale::remap_mass_closure_step_max()) +
                 "; repair discarded");
             restore_driver_retry_snapshot(
-                state, cfg, retry_snapshot_, false, true, nullptr);
+                state, cfg, retry_snapshot_, false, nullptr);
           } else {
             retry_dt_before = dt;
             retry_dt_after = dt;
@@ -13531,7 +12955,7 @@ void Driver::run(core::State& state,
           TENRYU_ASSERT(false, oss.str());
         }
         restore_driver_retry_snapshot(
-            state, cfg, retry_snapshot_, false, true, nullptr);
+            state, cfg, retry_snapshot_, false, nullptr);
         axis_band_applied_this_attempt = false;
         hydro::ale::reset_remap_mass_closure_step_max();
         const auto repair_result =
@@ -13548,7 +12972,7 @@ void Driver::run(core::State& state,
               std::to_string(hydro::ale::remap_mass_closure_step_max()) +
               "; repair discarded, retrying");
           restore_driver_retry_snapshot(
-              state, cfg, retry_snapshot_, false, true, nullptr);
+              state, cfg, retry_snapshot_, false, nullptr);
           retry_attempts += 1;
           continue;
         }
@@ -13595,7 +13019,7 @@ void Driver::run(core::State& state,
       }
       if (is_macro_repair_required_failure(last_hydro_result)) {
         restore_driver_retry_snapshot(
-            state, cfg, retry_snapshot_, false, true, nullptr);
+            state, cfg, retry_snapshot_, false, nullptr);
         axis_band_applied_this_attempt = false;
         const bool extended =
             hydro::pole_angular_derefine::extend_for_adjacent_active_child(
@@ -13678,7 +13102,7 @@ void Driver::run(core::State& state,
       }
       if (ring7_pole_cap_retry_candidate && retry_attempts < retry_limit) {
         restore_driver_retry_snapshot(
-            state, cfg, retry_snapshot_, false, true, nullptr);
+            state, cfg, retry_snapshot_, false, nullptr);
         axis_band_applied_this_attempt = false;
         tenryu::hydro::request_ring7_pole_cap_oracle(
             state, last_hydro_result.first_failing_cell);
@@ -13702,7 +13126,7 @@ void Driver::run(core::State& state,
       }
       if (ring7_seam_retry_candidate && retry_attempts < retry_limit) {
         restore_driver_retry_snapshot(
-            state, cfg, retry_snapshot_, false, true, nullptr);
+            state, cfg, retry_snapshot_, false, nullptr);
         axis_band_applied_this_attempt = false;
         tenryu::hydro::request_ring7_seam_rezone(
             state, last_hydro_result.first_failing_cell);
@@ -13745,7 +13169,7 @@ void Driver::run(core::State& state,
               " dt retries; ring absorption armed; restoring snapshot and "
               "retrying step with a fresh retry budget");
           restore_driver_retry_snapshot(
-              state, cfg, retry_snapshot_, false, true, nullptr);
+              state, cfg, retry_snapshot_, false, nullptr);
           axis_band_applied_this_attempt = false;
           retry_attempts = 0;
           continue;
@@ -13754,7 +13178,7 @@ void Driver::run(core::State& state,
             last_hydro_result.path_source_kind == kPathSourceActiveFineChild &&
             last_hydro_result.path_metric_kind == kPathMetricEdgeCross) {
           restore_driver_retry_snapshot(
-              state, cfg, retry_snapshot_, false, true, nullptr);
+              state, cfg, retry_snapshot_, false, nullptr);
           axis_band_applied_this_attempt = false;
           const bool extended =
               hydro::pole_angular_derefine::extend_for_adjacent_active_child(
@@ -13903,7 +13327,7 @@ void Driver::run(core::State& state,
         }
 
         restore_driver_retry_snapshot(
-            state, cfg, retry_snapshot_, false, true, nullptr);
+            state, cfg, retry_snapshot_, false, nullptr);
         axis_band_applied_this_attempt = false;
 
         tenryu::core::NodeField1D target_r(
@@ -14214,7 +13638,7 @@ void Driver::run(core::State& state,
         }
       }
       restore_driver_retry_snapshot(
-          state, cfg, retry_snapshot_, false, true, nullptr);
+          state, cfg, retry_snapshot_, false, nullptr);
 	      axis_band_applied_this_attempt = false;
 	      if (pending_axis_band.active) {
 	        pending_axis_band.active = false;
@@ -14440,13 +13864,11 @@ void Driver::run(core::State& state,
       }
     }
     if (cap_energy_audit_enabled && cfg.radiation.enabled) {
-      if (deterministic_radiation_mode && wj_arena.mode) {
+      if (wj_arena.mode) {
         E_rad_post_hydro_off = wj_defer_rad_capture();
       }
-      if (deterministic_radiation_mode && E_rad_post_hydro_off < 0) {
+      if (E_rad_post_hydro_off < 0) {
         E_rad_post_hydro = compute_fld_rad_energy_total_device(state, cfg);
-      } else if (!deterministic_radiation_mode) {
-        E_rad_post_hydro = imc.census_energy();
       }
     }
     hydro::ale::log_cell113_substage_trace(state,
@@ -14594,7 +14016,7 @@ void Driver::run(core::State& state,
             "armed; restoring snapshot and retrying step attempt=" +
             std::to_string(retry_attempts));
         restore_driver_retry_snapshot(
-            state, cfg, retry_snapshot_, false, true, nullptr);
+            state, cfg, retry_snapshot_, false, nullptr);
         axis_band_applied_this_attempt = false;
         continue;
       }
@@ -14625,7 +14047,7 @@ void Driver::run(core::State& state,
             (cfg.numerics.hydro.driver_full_step_retry_enabled ||
              hydro::i1b_path_guard_enabled())) {
           restore_driver_retry_snapshot(
-              state, cfg, retry_snapshot_, false, true, nullptr);
+              state, cfg, retry_snapshot_, false, nullptr);
           axis_band_applied_this_attempt = false;
           if (hydro::axis_core_disk_release_one_unit(state, cfg)) {
             ++retry_attempts;
@@ -14658,7 +14080,7 @@ void Driver::run(core::State& state,
             (cfg.numerics.hydro.driver_full_step_retry_enabled ||
              hydro::i1b_path_guard_enabled())) {
           ++row_merge_attempts_this_step;
-          restore_driver_retry_snapshot(state, cfg, retry_snapshot_, false, true, nullptr);
+          restore_driver_retry_snapshot(state, cfg, retry_snapshot_, false, nullptr);
           axis_band_applied_this_attempt = false;
           const auto merge = hydro::apply_tier_row_merge(
               state, cfg, ale_out.first_failing_cell);
@@ -14720,7 +14142,7 @@ void Driver::run(core::State& state,
               " max_target_displacement=" +
               format_sci(ale_out.max_target_displacement));
           restore_driver_retry_snapshot(
-              state, cfg, retry_snapshot_, false, true, nullptr);
+              state, cfg, retry_snapshot_, false, nullptr);
           axis_band_applied_this_attempt = false;
           continue;
         }
@@ -14826,7 +14248,7 @@ void Driver::run(core::State& state,
               "; restoring snapshot and retrying step attempt=" +
               std::to_string(retry_attempts));
           restore_driver_retry_snapshot(
-              state, cfg, retry_snapshot_, false, true, nullptr);
+              state, cfg, retry_snapshot_, false, nullptr);
           axis_band_applied_this_attempt = false;
           continue;
         }
@@ -14948,13 +14370,11 @@ void Driver::run(core::State& state,
     long E_rad_after_off = -1;
     double E_rad_after = 0.0;
     if (cfg.radiation.enabled) {
-      if (deterministic_radiation_mode && wj_arena.mode) {
+      if (wj_arena.mode) {
         E_rad_after_off = wj_defer_rad_capture();
       }
-      if (deterministic_radiation_mode && E_rad_after_off < 0) {
+      if (E_rad_after_off < 0) {
         E_rad_after = compute_fld_rad_energy_total_device(state, cfg);
-      } else if (!deterministic_radiation_mode) {
-        E_rad_after = imc.census_energy();
       }
     }
     // --- S2a drain: ONE async packet D2H + ONE stream sync materializes
@@ -15014,7 +14434,7 @@ void Driver::run(core::State& state,
             wj_arena.h + E_rad_after_off, wj_arena.r_blocks);
       }
       if (deferred_radiation_overshoot) {
-        imc.set_last_overshoot_metrics(
+        radiation_step.set_last_overshoot_metrics(
             wj_arena.h_flags[static_cast<std::size_t>(
                 StepViolationFlag::RadiationOvershootCount)],
             wj_arena.h_scalars[static_cast<std::size_t>(
@@ -15209,11 +14629,6 @@ void Driver::run(core::State& state,
     // Multi-rank note: compute_energy_totals_for_state is expected to sum owned cells
     // only. Global SUM reduction is applied in compute_step_energy_budget via
     // budget_input.reduction below.
-    if (cfg.radiation.enabled && !deterministic_radiation_mode) {
-      const double rad_esc_after_total = imc.escaped_energy_total();
-      step_E_rad_esc = std::max(rad_esc_after_total - rad_esc_before_total, 0.0);
-    }
-
     diagnostics::EnergyBudgetStepInput budget_input{};
     budget_input.before = energy_before;
     budget_input.after = energy_after;
@@ -15249,7 +14664,7 @@ void Driver::run(core::State& state,
     // them into the Allreduce(SUM) inside compute_step_energy_budget.
     const double replicated_rad_budget_share =
         (part_info.n_ranks > 1 && is_1d && cfg.radiation.enabled &&
-         deterministic_radiation_mode && part_info.rank != 0)
+         part_info.rank != 0)
             ? 0.0
             : 1.0;
     budget_input.E_rad_before = replicated_rad_budget_share * E_rad_before;
@@ -15486,6 +14901,27 @@ void Driver::run(core::State& state,
           << ", threshold=" << cfg.numerics.safety.clamp_warn_threshold;
       core::log_warning(oss.str());
       warned_clamp_threshold = true;
+    }
+
+    // Numerics.safety.overshoot_warn (SPECIFICATION §6.4.7, NUMERICS §11.8): the
+    // radiation phase's maximum-principle overshoot of this step (the history's
+    // radiation/overshoot_max) above the threshold warns, at the first occurrence and every
+    // 100th after it. The key was read but never checked before 2026-09-29.
+    if (radiation_step.last_overshoot_max() > cfg.numerics.safety.overshoot_warn) {
+      ++overshoot_warn_count;
+      if (overshoot_warn_count == 1 || overshoot_warn_count % 100 == 0) {
+        std::ostringstream oss;
+        oss << std::scientific << std::setprecision(6);
+        oss << "[SAFETY] step=" << (state.step + 1)
+            << " t=" << (state.t + dt)
+            << " dt=" << dt
+            << ": Temperature overshoot exceeded safety.overshoot_warn: overshoot_max="
+            << radiation_step.last_overshoot_max()
+            << ", overshoot_count=" << radiation_step.last_overshoot_count()
+            << ", threshold=" << cfg.numerics.safety.overshoot_warn
+            << " (warning #" << overshoot_warn_count << ")";
+        core::log_warning(oss.str());
+      }
     }
 
     if (step_clamp_count > cfg.numerics.safety.clamp_fatal_threshold) {
@@ -15893,75 +15329,8 @@ void Driver::run(core::State& state,
       snapshot.phase_energy = phase_energy;
       snapshot.ale_closure_audit = ale_closure_audit;
       if (cfg.radiation.enabled) {
-        snapshot.mc.ddmc_mode_count = imc.last_ddmc_mode_count();
-        snapshot.mc.imc_mode_count = imc.last_imc_mode_count();
-        snapshot.mc.n_total = imc.last_n_total();
-        snapshot.mc.n_imc_particles = imc.last_n_imc_particles();
-        snapshot.mc.n_ddmc_particles = imc.last_n_ddmc_particles();
-        snapshot.mc.n_census = imc.last_n_census();
-        snapshot.mc.n_absorbed = imc.last_n_absorbed();
-        snapshot.mc.n_escaped = imc.last_n_escaped();
-        snapshot.mc.n_leaked = imc.last_ddmc_to_imc_conversions();
-        snapshot.mc.ddmc_fraction = imc.last_ddmc_fraction();
-        snapshot.mc.weight_min = imc.last_weight_min();
-        snapshot.mc.weight_mean = imc.last_weight_mean();
-        snapshot.mc.weight_max = imc.last_weight_max();
-        snapshot.mc.overshoot_count = imc.last_overshoot_count();
-        snapshot.mc.overshoot_max = imc.last_overshoot_max();
-        snapshot.mc.mmatrix_violations = imc.last_mmatrix_violations();
-        snapshot.mc.mmatrix_fallback_count = imc.last_mmatrix_fallback_count();
-        snapshot.mc.omega_below_threshold = imc.last_omega_below_threshold();
-        snapshot.mc.interface_transitions =
-            saturating_i64(imc.last_interface_transitions());
-        snapshot.mc.interface_reflections =
-            saturating_i64(imc.last_interface_reflections());
-        snapshot.mc.conversion_prob_violations =
-            saturating_i64(imc.last_conversion_prob_violations());
-        snapshot.mc.ddmc_to_imc_conversions = imc.last_ddmc_to_imc_conversions();
-        snapshot.mc.rad_momentum_deposition = imc.last_rad_momentum_deposition();
-        const auto& difference_ref = imc.last_reference_field_diagnostics();
-        snapshot.mc.difference_reference_valid = difference_ref.valid ? 1 : 0;
-        snapshot.mc.difference_eligible_cells = difference_ref.eligible_cells;
-        snapshot.mc.difference_active_cells = difference_ref.active_cells;
-        snapshot.mc.difference_strong_cells = difference_ref.strong_cells;
-        snapshot.mc.difference_hybrid_suppressed_cells =
-            difference_ref.hybrid_suppressed_cells;
-        snapshot.mc.difference_W_min = difference_ref.W_min;
-        snapshot.mc.difference_W_mean = difference_ref.W_mean;
-        snapshot.mc.difference_W_max = difference_ref.W_max;
-        snapshot.mc.difference_tau_min = difference_ref.tau_min;
-        snapshot.mc.difference_tau_mean = difference_ref.tau_mean;
-        snapshot.mc.difference_tau_max = difference_ref.tau_max;
-        snapshot.mc.difference_chi_mean = difference_ref.chi_mean;
-        snapshot.mc.difference_chi_max = difference_ref.chi_max;
-        snapshot.mc.difference_reduced_flux_max = difference_ref.reduced_flux_max;
-        snapshot.mc.difference_knudsen_max = difference_ref.knudsen_max;
-        snapshot.mc.difference_front_grad_Te_max = difference_ref.front_grad_Te_max;
-        snapshot.mc.difference_front_grad_rho_max = difference_ref.front_grad_rho_max;
-        snapshot.mc.difference_E_ref_total = difference_ref.E_ref_total;
-        const auto& holo = imc.last_holo_selector_diagnostics();
-        snapshot.mc.holo_n_core_cells = holo.n_core_cells;
-        snapshot.mc.holo_n_entered = holo.n_entered;
-        snapshot.mc.holo_n_exited = holo.n_exited;
-        snapshot.mc.holo_n_hard_exited = holo.n_hard_exited;
-        snapshot.mc.holo_n_island_rejected = holo.n_island_rejected;
-        snapshot.mc.holo_tau_R_min = holo.tau_R_min;
-        snapshot.mc.holo_tau_R_max = holo.tau_R_max;
-        snapshot.mc.holo_reduced_flux_max = holo.reduced_flux_max;
-        snapshot.mc.holo_E_LO_total = compute_holo_E_LO_total(state, cfg);
-        snapshot.mc.holo_E_LO_boundary_in = step_holo_boundary_in;
-        snapshot.mc.holo_E_LO_boundary_out = step_holo_boundary_out;
-        snapshot.mc.holo_matter_delta = step_holo_matter_delta;
-        snapshot.mc.holo_source_balance_error = step_holo_source_balance_error;
-        snapshot.mc.holo_particle_net_source_core =
-            compute_holo_particle_net_source_core(state, cfg);
-        snapshot.mc.holo_lo_particle_source_mismatch =
-            step_holo_matter_delta - snapshot.mc.holo_particle_net_source_core;
-        const HoloPrrSummary holo_prr = compute_holo_prr_summary(state, cfg);
-        snapshot.mc.holo_Prr_coverage = holo_prr.coverage;
-        snapshot.mc.holo_chi_min = holo_prr.chi_min;
-        snapshot.mc.holo_chi_mean = holo_prr.chi_mean;
-        snapshot.mc.holo_chi_max = holo_prr.chi_max;
+        snapshot.radiation_overshoot.count = radiation_step.last_overshoot_count();
+        snapshot.radiation_overshoot.max_ratio = radiation_step.last_overshoot_max();
       }
       if (cfg.diagnostics.areal_density.enabled ||
           cfg.diagnostics.sphericity.enabled) {

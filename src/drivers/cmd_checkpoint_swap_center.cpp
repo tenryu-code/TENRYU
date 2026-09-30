@@ -38,7 +38,6 @@
 #include "io/hdf5_reader.hpp"
 #include "io/hdf5_writer.hpp"
 #include "mesh/mesh.hpp"
-#include "radiation/particle_pool.cuh"
 
 #if TENRYU_ENABLE_HDF5
 #include <hdf5.h>
@@ -4068,10 +4067,8 @@ int cmd_checkpoint_swap_center(
     try {
       hydro::axis_core_set_released_units(0);
       io::HDF5Writer writer;
-      radiation::PhotonPool empty_photon_pool;
       writer.write_checkpoint(checkpoint_b,
                               cfg,
-                              empty_photon_pool,
                               0,
                               checkpoint_b.step,
                               checkpoint_b.t,

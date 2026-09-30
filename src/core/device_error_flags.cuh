@@ -6,15 +6,13 @@ namespace tenryu::core {
 
 // Device-side soft error flags/counters.
 // Most entries are boolean latches set via atomicExch; `infinite_loop` is a per-step counter.
+// The Monte Carlo radiation's pool_overflow, ddmc_sigma_tot_zero and roulette_kill left with it on 2026-09-29.
 struct DeviceErrorFlags {
   int32_t nan_particle = 0;
   int32_t invalid_cell = 0;
   int32_t invalid_boundary = 0;
-  int32_t pool_overflow = 0;
   int32_t opacity_out_of_range = 0;
   int32_t infinite_loop = 0;
-  int32_t ddmc_sigma_tot_zero = 0;
-  int32_t roulette_kill = 0;
   // 1D characteristic ray trace: pieces whose quadrature was accepted at the
   // panel depth or count cap (error estimate above the tolerance); a count,
   // not an error.

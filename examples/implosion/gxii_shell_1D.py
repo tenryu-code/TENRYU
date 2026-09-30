@@ -200,7 +200,6 @@ Numerics(
         initial_s=1.0e-12,
         cfl_hydro=0.3,
         cfl_cond=0.25,
-        f_min_fleck=0.01,
         max_s=1.0e-10,
     ),
     hydro=dict(
@@ -239,5 +238,4 @@ Diagnostics(
     areal_density=dict(enabled=True, angles_deg=[0.0]),
     sphericity=dict(enabled=True, modes=[0, 2, 4]),
     laser_pattern=dict(enabled=True, per_beam=True),
-    mc_stats=dict(enabled=True),
 )

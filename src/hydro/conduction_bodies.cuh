@@ -255,6 +255,27 @@ __device__ inline double kirchhoff_face_kappa_spitzer(const double kap_l,
   return kap0_f * s52;
 }
 
+// The face conductivity of the 1D conduction operator, evaluated once per conduction step from the cell
+// conductivities kappa_sh and the temperatures Te of the step start (T_e^n) and held fixed through all
+// n_sub x s STS stages: the stages apply one linear operator (NUMERICS §4.2, "拡散係数の凍結"). Face f lies
+// between cells f and f+1 (f = 0 .. n_cells-2). kirchhoff selects the same-material Kirchhoff closure
+// (kirchhoff_face_kappa_spitzer); otherwise the harmonic mean of the two cell values. The Kirchhoff closure
+// recovers kappa_0 = kappa / T^{5/2} from each cell, so it needs the temperature at which kappa_sh was
+// evaluated; a stage temperature there would mix two states.
+__device__ inline void compute_1d_face_kappa_kernel_body(const int f,
+                                                         double* __restrict__ kappa_face,
+                                                         const double* __restrict__ kappa_sh,
+                                                         const double* __restrict__ Te,
+                                                         const int n_cells,
+                                                         const bool kirchhoff) {
+  if (f < 0 || f + 1 >= n_cells) {
+    return;
+  }
+  kappa_face[f] = kirchhoff
+                      ? kirchhoff_face_kappa_spitzer(kappa_sh[f], kappa_sh[f + 1], Te[f], Te[f + 1])
+                      : harmonic_mean(kappa_sh[f], kappa_sh[f + 1]);
+}
+
 template <bool kZMom>
 __device__ inline void compute_spitzer_deff_1d_kernel_body(
     const int i,
@@ -670,7 +691,7 @@ __device__ inline void conduction_1d_sts_stage_kirchhoff_kernel_body(
     const int i,
     const double* __restrict__ Te_old,
     double* __restrict__ Te_new,
-    const double* __restrict__ kappa_sh,
+    const double* __restrict__ kappa_face,
     const double* __restrict__ flux_limiter_faces,
     const double* __restrict__ rho_cv_e,
     const std::uint8_t* __restrict__ cell_is_void,
@@ -698,8 +719,7 @@ __device__ inline void conduction_1d_sts_stage_kirchhoff_kernel_body(
 
   double left_term = 0.0;
   if (i > 0) {
-    const double k_face =
-        kirchhoff_face_kappa_spitzer(kappa_sh[i - 1], kappa_sh[i], Te_old[i - 1], Te_old[i]);
+    const double k_face = kappa_face[i - 1];
     const double rcl = cell_center_radius(x_r, i - 1);
     const double rcr = cell_center_radius(x_r, i);
     const double dr = rcr - rcl;
@@ -721,8 +741,7 @@ __device__ inline void conduction_1d_sts_stage_kirchhoff_kernel_body(
 
   double right_term = 0.0;
   if (i + 1 < n_cells) {
-    const double k_face =
-        kirchhoff_face_kappa_spitzer(kappa_sh[i], kappa_sh[i + 1], Te_old[i], Te_old[i + 1]);
+    const double k_face = kappa_face[i];
     const double rcl = cell_center_radius(x_r, i);
     const double rcr = cell_center_radius(x_r, i + 1);
     const double dr = rcr - rcl;
@@ -1123,7 +1142,7 @@ __device__ inline void conduction_1d_sts_stage_kirchhoff_legacy_inline_alpha_ker
     const int i,
     const double* __restrict__ Te_old,
     double* __restrict__ Te_new,
-    const double* __restrict__ kappa_sh,
+    const double* __restrict__ kappa_face,
     const double* __restrict__ flux_limiter_faces,
     const double* __restrict__ rho_cv_e,
     const std::uint8_t* __restrict__ cell_is_void,
@@ -1149,8 +1168,7 @@ __device__ inline void conduction_1d_sts_stage_kirchhoff_legacy_inline_alpha_ker
 
   double left_term = 0.0;
   if (i > 0) {
-    const double k_face =
-        kirchhoff_face_kappa_spitzer(kappa_sh[i - 1], kappa_sh[i], Te_old[i - 1], Te_old[i]);
+    const double k_face = kappa_face[i - 1];
     const double rcl = cell_center_radius(x_r, i - 1);
     const double rcr = cell_center_radius(x_r, i);
     const double dr = rcr - rcl;
@@ -1172,8 +1190,7 @@ __device__ inline void conduction_1d_sts_stage_kirchhoff_legacy_inline_alpha_ker
 
   double right_term = 0.0;
   if (i + 1 < n_cells) {
-    const double k_face =
-        kirchhoff_face_kappa_spitzer(kappa_sh[i], kappa_sh[i + 1], Te_old[i], Te_old[i + 1]);
+    const double k_face = kappa_face[i];
     const double rcl = cell_center_radius(x_r, i);
     const double rcr = cell_center_radius(x_r, i + 1);
     const double dr = rcr - rcl;

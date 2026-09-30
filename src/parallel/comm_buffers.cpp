@@ -166,9 +166,6 @@ void CommBuffers::resize_if_needed(const std::size_t required) {
       host_recv[dir].resize(required);
     }
   }
-
-  emigrant_send.resize(required);
-  emigrant_recv.resize(required);
 }
 
 bool detect_gpu_aware_mpi() {

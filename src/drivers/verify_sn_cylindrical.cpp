@@ -71,10 +71,6 @@ core::Config make_cyl_sn_gate_config(const int n_cells,
   cfg.radiation.mode = core::RadiationMode::SnTransport;
   cfg.radiation.groups = 1;
   cfg.radiation.group_bounds_eV = {0.0, 1.0e4};
-  cfg.radiation.imc.enabled = false;
-  cfg.radiation.ddmc.enabled = false;
-  cfg.radiation.holo.enabled = false;
-  cfg.radiation.imc.difference.enabled = false;
   cfg.radiation.sn_transport.n_angles = 8;
   // The 1D default scheme (the builder's choice for a deck that does not set
   // it); TENRYU_SN_MARSHAK_DIAG_SCHEME selects another.

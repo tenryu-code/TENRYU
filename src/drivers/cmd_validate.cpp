@@ -56,8 +56,6 @@ std::string join_strings(const std::vector<std::string>& values) {
 
 std::string radiation_mode_string(const tenryu::core::RadiationMode mode) {
   switch (mode) {
-    case tenryu::core::RadiationMode::ImcDdmc:
-      return "imc_ddmc";
     case tenryu::core::RadiationMode::MultigroupDiffusion:
       return "multigroup_diffusion";
     case tenryu::core::RadiationMode::SnTransport:
@@ -76,8 +74,6 @@ std::string radiation_inner_boundary(const tenryu::core::Config& cfg) {
       return cfg.radiation.multigroup_diffusion.boundary.inner_r;
     case tenryu::core::RadiationMode::SnTransport:
       return cfg.radiation.sn_transport.boundary.inner_r;
-    case tenryu::core::RadiationMode::ImcDdmc:
-      return cfg.radiation.boundary.inner_r;
   }
   return cfg.radiation.boundary.inner_r;
 }
@@ -88,8 +84,6 @@ std::string radiation_outer_boundary(const tenryu::core::Config& cfg) {
       return cfg.radiation.multigroup_diffusion.boundary.outer_r;
     case tenryu::core::RadiationMode::SnTransport:
       return cfg.radiation.sn_transport.boundary.outer_r;
-    case tenryu::core::RadiationMode::ImcDdmc:
-      return cfg.radiation.boundary.outer_r;
   }
   return cfg.radiation.boundary.outer_r;
 }
@@ -381,6 +375,7 @@ tenryu::core::MeshRequirementParams mesh_requirement_params(
   params.min_cells_per_layer = config.min_cells_per_layer;
   params.zbar_override = config.zbar_override;
   params.n_bands = config.n_bands;
+  params.empirical = config.empirical;
   return params;
 }
 
@@ -610,6 +605,20 @@ std::string build_mesh_requirement_json_for_config(
     inputs.breakpoints.assign(nodes.begin() + 1, nodes.end() - 1);
   }
   inputs.rho_void_cut = cfg.mesh.auto_config.rho_void_cut;
+  inputs.eos = "tmat";
+  for (const auto& material : cfg.materials.materials) {
+    if (!material.is_void && material.eos_model != "tmat") {
+      inputs.eos = material.eos_model;
+      break;
+    }
+    if (!material.is_void && (material.A != 7.0 || material.Z != 3.5)) {
+      inputs.eos = "unknown";
+    }
+  }
+  inputs.radiation_enabled = cfg.radiation.enabled;
+  inputs.temperature_model = cfg.main.temperature_model;
+  inputs.conduction_solver = cfg.numerics.conduction.enabled
+      ? cfg.numerics.conduction.solver : "disabled";
 
   const tenryu::core::MeshRequirementReport report =
       tenryu::core::build_mesh_requirement(
@@ -617,13 +626,23 @@ std::string build_mesh_requirement_json_for_config(
   const tenryu::core::MeshRequirementCheck check =
       tenryu::core::check_mesh_requirement(
           report, inputs, nodes, samples.rho, samples.material);
+  if (report.params.empirical.enabled) {
+    tenryu::core::log_info(
+        "[mesh-requirement] empirical reference_sha256=" +
+        report.params.empirical.reference_sha256 + " apriori_factor=" +
+        std::to_string(report.ceiling_formation_g_cm2 /
+                       report.apriori_ceiling_formation_g_cm2));
+  }
 
   const bool ablation_violation = check.ablation.n_violations > 0;
   const bool shock_violation = check.shock.n_violations > 0;
+  // An empirical block relaxes only the ablation ceiling, so for zoning_intent
+  // decks it makes the ablation rule fatal; the shock and layer rules stay
+  // reported as for any other zoning_intent deck.
   const bool enforce_violation =
       cfg.mesh.resolution_requirement.apply == "enforce" &&
-      !cfg.mesh.zoning_intent.enabled &&
-      (ablation_violation || shock_violation);
+      ((!cfg.mesh.zoning_intent.enabled && (ablation_violation || shock_violation)) ||
+       (cfg.mesh.resolution_requirement.empirical.enabled && ablation_violation));
   std::string violation_message;
   if (enforce_violation) {
     if (ablation_violation) {

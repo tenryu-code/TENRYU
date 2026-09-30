@@ -112,10 +112,9 @@ Mesh(
 
 Materials(
     materials=[mat_dt, mat_cd, mat_void],
-    zbar=dict(
-        model="fixed",
-        fixed_value=3.5,
-    ),
+    # Each cell takes the volume-weighted Z of its materials (DT 1, CD 3.5); a
+    # fixed_value would set every cell, the fill included, to that value.
+    zbar=dict(model="fixed"),
     void_config=dict(
         rho=1.0e-9,
         Te=0.1,

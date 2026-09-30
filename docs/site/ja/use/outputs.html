@@ -114,7 +114,6 @@
           <tr><th><code>fleck_factor</code></th><td>2D FLD のみ。セルの Fleck 因子（診断はグレイ G=1 で有効）。</td></tr>
           <tr><th><code>sn_tau_R</code>, <code>sn_reduced_flux</code>, <code>sn_ap_alpha</code></th><td>2D S<sub>N</sub> のみ。面の流束を S<sub>N</sub> と拡散で混ぜる漸近保存（AP）処理の診断（光学的厚さ・換算流束・混合の重みの各プロキシ）。</td></tr>
           <tr><th><code>diag_*</code>（12 種）</th><td>1D S<sub>N</sub> の出力専用診断: <code>diag_rad_</code> に続く <code>E_pre</code>/<wbr><code>E_post</code>/<wbr><code>emission_at_Tn</code>/<wbr><code>emission_at_Tnp1</code>/<wbr><code>absorption</code> と、<code>diag_</code> に続く <code>clip_energy</code>/<wbr><code>clip_full_deficit</code>/<wbr><code>chi_opacity</code>/<wbr><code>F_first_moment</code>/<wbr><code>E_star_flux</code>/<wbr><code>stream_theta</code>/<wbr><code>ap_alpha_face</code>。リスタートの状態復元には使われない。</td></tr>
-          <tr><th><code>ddmc_flag</code></th><td>退役 <code>imc_ddmc</code> 経路のみ有意。現行 FLD/S<sub>N</sub> では意味を持たない。</td></tr>
         </tbody>
       </table>
 
@@ -131,7 +130,7 @@
           <tr><th><code>rays/trajectory/</code></th><td><code>ray_output_trajectory=True</code> 時。CSR 形式の軌跡（offsets・step_count・位置列・残存パワー列）。可視化で光線を重ねて描くときの元データ。</td></tr>
         </tbody>
       </table>
-      <p><code>mode="radial_absorption_1d"</code> では物理的な光線の軌跡がないため、<code>deposited_power</code> と <code>absorption_fraction</code> は通常どおり出力されるが <code>rays/</code> 系は空または未作成となる。なお <code>holo/</code> と <code>difference/</code> のグループは退役 <code>imc_ddmc</code> 系経路の専用出力であり、現行の FLD/S<sub>N</sub> 実行では対象外である。</p>
+      <p><code>mode="radial_absorption_1d"</code> では物理的な光線の軌跡がないため、<code>deposited_power</code> と <code>absorption_fraction</code> は通常どおり出力されるが <code>rays/</code> 系は空または未作成となる。なお、退役したモンテカルロ輻射の出力（<code>radiation/ddmc_flag</code>・<code>radiation/delta_E_rad_prev</code>・<code>holo/</code>・<code>difference/</code>）は schema 2（2026-09-29）から書かない。それより前のファイルには残っていることがある。</p>
     </section>
 
     <section aria-labelledby="history">
@@ -193,6 +192,7 @@
         <tbody>
           <tr><th><code>radiation/fld_outer_*</code></th><td>常時（FLD 無効時 0）。外側ピカール反復の回数・終了残差・収束フラグ。</td></tr>
           <tr><th><code>radiation/sn_*</code></th><td><code>mode="sn_transport"</code> の run だけ。外側反復（1D の線形不連続法は節点温度のニュートン、ほかは物質のピカール）と内側反復（線形不連続法は GMRES の Krylov 反復、ほかは源反復）のステップ内の合計、外側反復の終了残差、収束フラグ（<code>sn_outer_iterations</code>・<code>sn_inner_iterations</code>・<code>sn_outer_residual</code>・<code>sn_converged</code>）。</td></tr>
+          <tr><th><code>radiation/overshoot_count</code>・<code>overshoot_max</code></th><td>常時（輻射が無効なら 0）。輻射相の最大値原理の超過：相の後の電子温度が \(T_{max}=\max\)（相の前の最大電子温度、Marshak 駆動温度）を超えたセルの数と、最大の \((T_e-T_{max})/T_{max}\)。<code>Numerics.safety.overshoot_warn</code> はこの値で判定する。2026-09-29 までは <code>mc/overshoot_*</code> にあった。</td></tr>
           <tr><th><code>diagnostics/icf/v1/</code></th><td><code>Numerics.diagnostics.icf.enabled</code>。シェル半径・厚さ・IFAR・収束比 CR。</td></tr>
           <tr><th><code>diagnostics/hotspot_gas/v1/</code></th><td><code>Numerics.diagnostics.hotspot_gas.enabled</code>。トレーサガスの質量・半径群（R50…R99、CR 系）・密度/圧力/断熱度・Te/Ti 統計・エネルギーと仕事プロキシ。</td></tr>
           <tr><th><code>diagnostics/ale_provenance/v1/</code></th><td>ALE 来歴。禁止された設定の違反、メッシュの救済処理（セルの緊急無効化や境界の局所修復など。発動回数は <code>escape_valve_activations</code>）、幾何の失敗の各カウンタと、救済処理のイベント表、run 終了時の状態を記す属性（<code>final_claim_level</code>・<code>reached_t_end</code> など）。</td></tr>
@@ -205,7 +205,7 @@
           <tr><th><code>diagnostics/per_row_mass/</code>・<code>av_max/</code></th><td>dt 内訳診断の有効時。z 行ごとの質量・密度サマリと、最大人工粘性セルの記録。</td></tr>
           <tr><th><code>diagnostics/conservation/v1/</code></th><td><code>Numerics.diagnostics.conservation.enabled</code>。演算子別の保存残差 ε_E と前後エネルギー。</td></tr>
           <tr><th><code>diagnostics/material_interface/v1/</code></th><td>PLIC（区分線形の界面再構成）による材料界面の診断（属性・サンプルごとの統計・イベント表。<code>schema_version</code> を変えずに追加したグループ）。</td></tr>
-          <tr><th><code>mc/</code>・<code>difference/</code>・<code>holo/</code></th><td>退役 <code>imc_ddmc</code> 系の互換診断群。現行 FLD/S<sub>N</sub> の実行では意味を持たない。</td></tr>
+          <tr><th><code>mc/</code>・<code>difference/</code>・<code>holo/</code></th><td>2026-09-29（schema 2）に削除した。退役したモンテカルロ輻射の統計で、FLD・S<sub>N</sub> では最大値原理の 2 列（現在の <code>radiation/overshoot_*</code>）を除いて 0 だった。それより前に始めた履歴ファイルへ追記するときは、その 2 列を <code>mc/overshoot_*</code> に書き続ける。</td></tr>
         </tbody>
       </table>
       <p>検証ページで引用される基準回帰の要約指標は、これらの時系列の時間方向の縮約である: <code>rho_peak_max</code> = <code>implosion/rho_peak</code> の最大、<code>rhoR_max</code> = <code>implosion/rho_R</code> の最大、<code>Tc_max</code> = <code>implosion/center_temperature</code> の最大、<code>shell_r_min</code> = <code>implosion/shell_radius_min</code> の最小。</p>
@@ -230,10 +230,10 @@
           <tr><th><code>conduction_state/</code></th><td>熱伝導ソルバの run 全体の累積統計（反復数・残差・条件数の最大など）。</td></tr>
           <tr><th><code>burn_state/specific_inventory</code></th><td>燃焼の比インベントリ \(Y_s\) [1/g]（セルごとに D・T・He3・He4・p の順）。再開は、スナップショットの数密度 <code>hydro/burn_n_*</code> を密度で割った値ではなくこれを使う（2026-09-26 から）。</td></tr>
           <tr><th><code>radiation_sn/</code>（1D S<sub>N</sub>）</th><td>線形不連続法の角度分布（<code>psi_prev</code>・<code>psi_sd_prev</code>）とセル内の電子エネルギーの差（<code>ee_node_offset</code>）。無いチェックポイントからは等方・一様で始める。</td></tr>
-          <tr><th><code>particles/</code></th><td>退役 Monte Carlo 経路の粒子プール（現行 FLD/S<sub>N</sub> では対象外）。</td></tr>
+          <tr><th><code>particles/</code></th><td>schema 1 のチェックポイントだけが持つ、退役したモンテカルロ輻射の粒子プール。空なら読み、粒子があれば再開を拒否する。schema 2（2026-09-29）では書かない。</td></tr>
         </tbody>
       </table>
-      <p>リスタートの互換規約: <code>schema_version</code> が現行と同じなら通常読込、古い（または欠落）なら不足項目を既定値で補う後方互換読込、新しいなら読込拒否。凍結項目（次元・メッシュ・材料・群数・seed・群境界）が不一致なら再開は拒否される。再開の指定方法は<a href="running.html#restart">実行ページ</a>を参照のこと。</p>
+      <p>リスタートの互換規約: <code>schema_version</code>（現行は 2026-09-29 からの 2）が現行と同じなら通常読込、古い（または欠落）なら不足項目を既定値で補う後方互換読込、新しいなら読込拒否。チェックポイントの凍結設定（デッキ本文のハッシュと、<code>Main.restart_from</code> を除くすべての設定）が再開に使うデッキと一致しなければ、再開は拒否される。再開の指定方法は<a href="running.html#restart">実行ページ</a>を参照のこと。</p>
     </section>
 
     <section aria-labelledby="provenance">

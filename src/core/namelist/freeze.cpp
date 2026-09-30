@@ -568,6 +568,15 @@ py::dict serialize_mesh(const Config::MeshConfig& mesh) {
     rr["min_cells_per_layer"] = requirement.min_cells_per_layer;
     rr["zbar_override"] = serialize_double_17g(requirement.zbar_override);
     rr["n_bands"] = requirement.n_bands;
+    if (requirement.empirical.enabled) {
+      const auto& empirical = requirement.empirical;
+      py::dict e;
+      e["reference_sha256"] = empirical.reference_sha256;
+      e["case_ids"] = py::cast(empirical.case_ids);
+      e["surface_ceiling_g_cm2"] = serialize_double_17g(empirical.surface_ceiling_g_cm2);
+      e["reference_apriori_g_cm2"] = serialize_double_17g(empirical.reference_apriori_g_cm2);
+      rr["empirical"] = std::move(e);
+    }
 
     py::list injected_bands;
     for (const auto& band : requirement.injected_bands) {
@@ -667,10 +676,8 @@ py::dict serialize_materials(const Config::MaterialsConfig& materials) {
       m["opacity_power_law_rho_ref_g_cc"] = mat.opacity_power_law_rho_ref_g_cc;
     }
     m["opacity_units"] = mat.opacity_units;
-    m["lambda_method"] = mat.lambda_method;
     m["lambda_fd_delta_rel"] = mat.lambda_fd_delta_rel;
     m["lambda_fd_abs_min"] = mat.lambda_fd_abs_min;
-    m["f_min"] = mat.nlte_f_min;
     material_list.append(std::move(m));
   }
 
@@ -707,114 +714,7 @@ py::dict serialize_geometry(const Config::GeometryConfig& geometry) {
 
 py::dict serialize_radiation(const Config::RadiationConfig& radiation) {
   py::dict imc;
-  py::dict census_comb;
-  census_comb["enabled"] = radiation.imc.census_comb.enabled;
-  census_comb["max_particles"] = radiation.imc.census_comb.max_particles;
-  census_comb["min_per_bin"] = radiation.imc.census_comb.min_per_bin;
-  census_comb["trigger_ratio"] = radiation.imc.census_comb.trigger_ratio;
-  census_comb["target_fraction"] = radiation.imc.census_comb.target_fraction;
-  census_comb["mode_weight_imc"] = radiation.imc.census_comb.mode_weight_imc;
-  census_comb["mode_weight_ddmc"] = radiation.imc.census_comb.mode_weight_ddmc;
-  census_comb["adaptive_trigger"] = radiation.imc.census_comb.adaptive_trigger;
-  census_comb["adaptive_util_start"] = radiation.imc.census_comb.adaptive_util_start;
-  census_comb["adaptive_util_end"] = radiation.imc.census_comb.adaptive_util_end;
-  census_comb["trigger_ratio_floor"] = radiation.imc.census_comb.trigger_ratio_floor;
-  census_comb["trigger_hysteresis"] = radiation.imc.census_comb.trigger_hysteresis;
-  census_comb["ess_floor_enabled"] = radiation.imc.census_comb.ess_floor_enabled;
-  census_comb["ess_min_tier0"] = radiation.imc.census_comb.ess_min_tier0;
-  census_comb["ess_min_tier1"] = radiation.imc.census_comb.ess_min_tier1;
-  census_comb["max_split_factor"] = radiation.imc.census_comb.max_split_factor;
-  imc["enabled"] = radiation.imc.enabled;
-  imc["alpha"] = radiation.imc.alpha;
-  imc["f_max"] = radiation.imc.f_max;
-  imc["corrected_fleck"] = radiation.imc.corrected_fleck;
-  imc["particles_per_cell_group"] = radiation.imc.particles_per_cell_group;
-  imc["implicit_capture"] = radiation.imc.implicit_capture;
-  imc["cutoff_fraction"] = radiation.imc.cutoff_fraction;
-  imc["inelastic_scatter"] = radiation.imc.inelastic_scatter;
-  imc["weight_cutoff"] = radiation.imc.weight_cutoff;
-  imc["roulette_survival"] = radiation.imc.roulette_survival;
-  imc["weight_split"] = radiation.imc.weight_split;
-  imc["max_split"] = radiation.imc.max_split;
-  imc["linearized_planck"] = radiation.imc.linearized_planck;
-  imc["source_tilting"] = radiation.imc.source_tilting;
-  imc["source_localization"] = radiation.imc.source_localization;
-  imc["sloc_ema_beta"] = radiation.imc.sloc_ema_beta;
-  imc["sloc_sigma_floor"] = radiation.imc.sloc_sigma_floor;
-  imc["sloc_sigma_cap"] = radiation.imc.sloc_sigma_cap;
-  imc["sloc_tau_ref"] = radiation.imc.sloc_tau_ref;
-  imc["spectral_bias_eta"] = radiation.imc.spectral_bias_eta;
-  imc["opacity_predictor"] = radiation.imc.opacity_predictor;
   imc["two_stage"] = radiation.imc.two_stage;
-  py::dict difference;
-  difference["enabled"] = radiation.imc.difference.enabled;
-  difference["W_max"] = radiation.imc.difference.W_max;
-  difference["tau0"] = radiation.imc.difference.tau0;
-  difference["chi0"] = radiation.imc.difference.chi0;
-  difference["face_transport"] = radiation.imc.difference.face_transport;
-  imc["difference"] = difference;
-  py::dict net_e_source_smoothing;
-  net_e_source_smoothing["enabled"] = radiation.imc.net_e_source_smoothing.enabled;
-  net_e_source_smoothing["alpha"] = radiation.imc.net_e_source_smoothing.alpha;
-  net_e_source_smoothing["tau_threshold"] =
-      radiation.imc.net_e_source_smoothing.tau_threshold;
-  net_e_source_smoothing["passes"] = radiation.imc.net_e_source_smoothing.passes;
-  net_e_source_smoothing["grad_Te_scale"] =
-      radiation.imc.net_e_source_smoothing.grad_Te_scale;
-  net_e_source_smoothing["grad_rho_scale"] =
-      radiation.imc.net_e_source_smoothing.grad_rho_scale;
-  net_e_source_smoothing["gradient_adaptive"] =
-      radiation.imc.net_e_source_smoothing.gradient_adaptive;
-  imc["net_e_source_smoothing"] = net_e_source_smoothing;
-  imc["particle_budget"] = radiation.imc.particle_budget;
-  imc["census_comb"] = census_comb;
-  py::dict rad_lite_mesh;
-  rad_lite_mesh["enabled"] = radiation.imc.rad_lite_mesh.enabled;
-  rad_lite_mesh["sigma_ratio_max"] = radiation.imc.rad_lite_mesh.sigma_ratio_max;
-  rad_lite_mesh["nlte_auto"] = radiation.imc.rad_lite_mesh.nlte_auto;
-  imc["rad_lite_mesh"] = rad_lite_mesh;
-
-  py::dict ddmc;
-  ddmc["enabled"] = radiation.ddmc.enabled;
-  ddmc["implicit_diffusion"] = radiation.ddmc.implicit_diffusion;
-  ddmc["tau_ddmc"] = radiation.ddmc.tau_ddmc;
-  ddmc["tau_rw"] = radiation.ddmc.tau_rw;
-  ddmc["omega_ddmc"] = radiation.ddmc.omega_ddmc;
-  ddmc["tau_ddmc_off"] = radiation.ddmc.tau_ddmc_off;
-  ddmc["omega_ddmc_off"] = radiation.ddmc.omega_ddmc_off;
-  ddmc["mode_hold"] = radiation.ddmc.mode_hold;
-  ddmc["rate_max"] = radiation.ddmc.rate_max;
-  ddmc["leak_stencil"] = radiation.ddmc.leak_stencil;
-  ddmc["interface_method"] = radiation.ddmc.interface_method;
-  ddmc["emissivity_preserving"] = radiation.ddmc.emissivity_preserving;
-  ddmc["interface_exit_distribution"] = radiation.ddmc.interface_exit_distribution;
-  ddmc["rz_face_r_weight"] = radiation.ddmc.rz_face_r_weight;
-  ddmc["face_opacity_temperature"] = radiation.ddmc.face_opacity_temperature;
-  ddmc["m_matrix_check"] = radiation.ddmc.m_matrix_check;
-
-  py::dict diffusion;
-  diffusion["enabled"] = radiation.diffusion.enabled;
-  diffusion["tau_on"] = radiation.diffusion.tau_on;
-  diffusion["tau_off"] = radiation.diffusion.tau_off;
-  diffusion["reduced_flux_on"] = radiation.diffusion.reduced_flux_on;
-  diffusion["reduced_flux_off"] = radiation.diffusion.reduced_flux_off;
-  diffusion["mode_hold"] = radiation.diffusion.mode_hold;
-  diffusion["rate_max"] = radiation.diffusion.rate_max;
-  diffusion["mode_update_interval"] = radiation.diffusion.mode_update_interval;
-  diffusion["min_diffusion_island_cells"] =
-      radiation.diffusion.min_diffusion_island_cells;
-  diffusion["imc_guard_cells"] = radiation.diffusion.imc_guard_cells;
-  diffusion["sts_max_stages"] = radiation.diffusion.sts_max_stages;
-  diffusion["sts_damping"] = radiation.diffusion.sts_damping;
-  diffusion["sts_subcycle_eta"] = radiation.diffusion.sts_subcycle_eta;
-  diffusion["interface_particles_per_face_group"] =
-      radiation.diffusion.interface_particles_per_face_group;
-  diffusion["exit_particles_per_cell_group"] =
-      radiation.diffusion.exit_particles_per_cell_group;
-  diffusion["lte_entry_initialization"] =
-      radiation.diffusion.lte_entry_initialization;
-  diffusion["lte_entry_energy_fraction_cap"] =
-      radiation.diffusion.lte_entry_energy_fraction_cap;
 
   py::dict fld_boundary;
   fld_boundary["inner_r"] = radiation.multigroup_diffusion.boundary.inner_r;
@@ -928,40 +828,6 @@ py::dict serialize_radiation(const Config::RadiationConfig& radiation) {
   sn_transport["boundary"] = sn_boundary;
   sn_transport["marshak"] = sn_marshak;
 
-  py::dict holo;
-  holo["enabled"] = radiation.holo.enabled;
-  holo["region"] = radiation.holo.region;
-  holo["material_group"] = radiation.holo.material_group;
-  holo["coupling_tau"] = radiation.holo.coupling_tau;
-  holo["guard_cells"] = radiation.holo.guard_cells;
-  holo["blend_cells"] = radiation.holo.blend_cells;
-  holo["min_lo_cells"] = radiation.holo.min_lo_cells;
-  holo["q_min"] = radiation.holo.q_min;
-  holo["q_max"] = radiation.holo.q_max;
-  holo["tau_on"] = radiation.holo.tau_on;
-  holo["tau_off"] = radiation.holo.tau_off;
-  holo["reduced_flux_on"] = radiation.holo.reduced_flux_on;
-  holo["reduced_flux_off"] = radiation.holo.reduced_flux_off;
-  holo["update_interval"] = radiation.holo.update_interval;
-  holo["hold_on"] = radiation.holo.hold_on;
-  holo["min_dwell_steps"] = radiation.holo.min_dwell_steps;
-  holo["min_island_cells"] = radiation.holo.min_island_cells;
-  holo["core_margin_cells"] = radiation.holo.core_margin_cells;
-  holo["solver"] = radiation.holo.solver;
-  holo["closure"] = radiation.holo.closure;
-  holo["closure_relax"] = radiation.holo.closure_relax;
-  holo["closure_smooth_passes"] = radiation.holo.closure_smooth_passes;
-  holo["closure_smooth_alpha"] = radiation.holo.closure_smooth_alpha;
-  holo["consistency_alpha"] = radiation.holo.consistency_alpha;
-  holo["gamma_alpha"] = radiation.holo.consistency_alpha;
-  holo["boundary_flux"] = radiation.holo.boundary_flux;
-  holo["p_rr_tally"] = radiation.holo.p_rr_tally;
-  holo["sn_closure"] = radiation.holo.sn_closure;
-  holo["sn_n_angles"] = radiation.holo.sn_n_angles;
-  holo["sn_material_coupling"] = radiation.holo.sn_material_coupling;
-  holo["residual_particles_per_cell_group"] =
-      radiation.holo.residual_particles_per_cell_group;
-
   py::dict marshak_map;
   for (const auto& [face, callable] : radiation.boundary.marshak_Tr_map) {
     marshak_map[py::str(face)] = serialize_callable(callable);
@@ -973,21 +839,14 @@ py::dict serialize_radiation(const Config::RadiationConfig& radiation) {
   boundary["outer_r"] = radiation.boundary.outer_r;
   boundary["bottom_z"] = radiation.boundary.bottom_z;
   boundary["top_z"] = radiation.boundary.top_z;
-  boundary["marshak_particles"] = radiation.boundary.marshak_particles;
   boundary["marshak_Tr_eV"] = nan_safe(radiation.boundary.marshak_Tr_eV);
   boundary["marshak_Tr"] = serialize_callable(radiation.boundary.marshak_Tr);
   boundary["marshak_Tr_map"] = marshak_map;
 
   py::dict out;
   out["enabled"] = radiation.enabled;
-  out["mode"] = (radiation.mode == RadiationMode::MultigroupDiffusion)
-                    ? "multigroup_diffusion"
-                    : ((radiation.mode == RadiationMode::SnTransport)
-                           ? "sn_transport"
-                           : "imc_ddmc");
-  if (radiation.origin_parity_only) {
-    out["origin_parity_only"] = radiation.origin_parity_only;
-  }
+  out["mode"] = (radiation.mode == RadiationMode::MultigroupDiffusion) ? "multigroup_diffusion"
+                                                                      : "sn_transport";
   if (radiation.group_repack_hard_xray) {
     out["group_repack_hard_xray"] = radiation.group_repack_hard_xray;
   }
@@ -1000,11 +859,8 @@ py::dict serialize_radiation(const Config::RadiationConfig& radiation) {
   out["volume_source_rate"] = radiation.volume_source_rate;
   out["volume_source_x_max"] = radiation.volume_source_x_max;
   out["imc"] = imc;
-  out["ddmc"] = ddmc;
-  out["diffusion"] = diffusion;
   out["multigroup_diffusion"] = multigroup_diffusion;
   out["sn_transport"] = sn_transport;
-  out["holo"] = holo;
   out["boundary"] = boundary;
   return out;
 }
@@ -1291,7 +1147,6 @@ py::dict serialize_numerics(const Config::NumericsConfig& numerics) {
   dt["edge_accel_displacement_cfl_enabled"] =
       numerics.dt.edge_accel_displacement_cfl_enabled;
   dt["cfl_cond"] = numerics.dt.cfl_cond;
-  dt["f_min_fleck"] = numerics.dt.f_min_fleck;
   dt["growth_factor"] = numerics.dt.growth_factor;
   dt["max_s"] = numerics.dt.max_s;
   dt["min_s"] = numerics.dt.min_s;
@@ -3060,8 +2915,6 @@ py::dict serialize_numerics(const Config::NumericsConfig& numerics) {
   safety["energy_fatal"] = numerics.safety.energy_fatal;
   safety["nan_fatal"] = numerics.safety.nan_fatal;
   safety["energy_budget_tol"] = numerics.safety.energy_budget_tol;
-  safety["opacity_floor"] = numerics.safety.opacity_floor;
-  safety["opacity_cap"] = numerics.safety.opacity_cap;
   safety["clamp_warn_threshold"] = numerics.safety.clamp_warn_threshold;
   safety["clamp_fatal_threshold"] = numerics.safety.clamp_fatal_threshold;
   safety["overshoot_warn"] = numerics.safety.overshoot_warn;
@@ -3411,20 +3264,6 @@ py::dict serialize_diagnostics(const Config::DiagnosticsConfig& diagnostics) {
   laser_pattern["critical_surface"] = diagnostics.laser_pattern.critical_surface;
   laser_pattern["per_beam"] = diagnostics.laser_pattern.per_beam;
 
-  py::dict mc_stats;
-  mc_stats["enabled"] = diagnostics.mc_stats.enabled;
-  mc_stats["particle_counts"] = diagnostics.mc_stats.particle_counts;
-  mc_stats["weight_stats"] = diagnostics.mc_stats.weight_stats;
-  mc_stats["cell_particle_density"] = diagnostics.mc_stats.cell_particle_density;
-  mc_stats["ddmc_fraction"] = diagnostics.mc_stats.ddmc_fraction;
-
-  py::dict fleck_diag;
-  fleck_diag["enabled"] = diagnostics.fleck_diag.enabled;
-  fleck_diag["every"] = diagnostics.fleck_diag.every;
-  fleck_diag["cells"] = diagnostics.fleck_diag.cells;
-  fleck_diag["r_min_cm"] = diagnostics.fleck_diag.r_min_cm;
-  fleck_diag["r_max_cm"] = diagnostics.fleck_diag.r_max_cm;
-
   py::dict out;
   out["enabled"] = diagnostics.enabled;
   out["every"] = diagnostics.every;
@@ -3447,8 +3286,6 @@ py::dict serialize_diagnostics(const Config::DiagnosticsConfig& diagnostics) {
   out["areal_density"] = areal_density;
   out["sphericity"] = sphericity;
   out["laser_pattern"] = laser_pattern;
-  out["mc_stats"] = mc_stats;
-  out["fleck_diag"] = fleck_diag;
   out["overshoot_monitor"] = diagnostics.overshoot_monitor;
   return out;
 }
@@ -3463,17 +3300,9 @@ py::dict serialize_parallel(const Config::ParallelConfig& parallel) {
   halo["gpu_aware_mpi"] = parallel.halo.gpu_aware_mpi;
   halo["ghost_layers"] = parallel.halo.ghost_layers;
 
-  py::dict migration;
-  migration["method"] = parallel.migration.method;
-  migration["max_substeps"] = parallel.migration.max_substeps;
-  migration["emigrant_threshold"] = parallel.migration.emigrant_threshold;
-  migration["initial_capacity"] = parallel.migration.initial_capacity;
-  migration["growth_factor"] = parallel.migration.growth_factor;
-
   py::dict out;
   out["decomposition"] = decomposition;
   out["halo"] = halo;
-  out["migration"] = migration;
   return out;
 }
 
@@ -3715,10 +3544,8 @@ void apply_legacy_nlte_defaults(py::dict& root) {
       continue;
     }
     py::dict mat = py::reinterpret_borrow<py::dict>(mat_obj);
-    set_default_if_missing(mat, "lambda_method", py::str(defaults.lambda_method));
     set_default_if_missing(mat, "lambda_fd_delta_rel", py::cast(defaults.lambda_fd_delta_rel));
     set_default_if_missing(mat, "lambda_fd_abs_min", py::cast(defaults.lambda_fd_abs_min));
-    set_default_if_missing(mat, "f_min", py::cast(defaults.nlte_f_min));
   }
 }
 
@@ -3983,9 +3810,6 @@ void apply_legacy_radiation_defaults(py::dict& root) {
   const Config::RadiationConfig radiation_defaults;
   set_default_if_missing(radiation, "mode", py::str("multigroup_diffusion"));
   set_default_if_missing(radiation,
-                         "origin_parity_only",
-                         py::cast(radiation_defaults.origin_parity_only));
-  set_default_if_missing(radiation,
                          "group_repack_hard_xray",
                          py::cast(radiation_defaults.group_repack_hard_xray));
   set_default_if_missing(radiation,
@@ -3995,181 +3819,7 @@ void apply_legacy_radiation_defaults(py::dict& root) {
   py::dict imc;
   if (try_get_child_dict(radiation, "imc", &imc)) {
     const Config::RadiationConfig::ImcConfig imc_defaults;
-    set_default_if_missing(imc, "enabled", py::cast(imc_defaults.enabled));
-    set_default_if_missing(
-        imc, "corrected_fleck", py::cast(imc_defaults.corrected_fleck));
-    set_default_if_missing(imc, "source_tilting", py::cast(imc_defaults.source_tilting));
-    set_default_if_missing(
-        imc, "source_localization", py::cast(imc_defaults.source_localization));
-    set_default_if_missing(imc, "sloc_ema_beta", py::cast(imc_defaults.sloc_ema_beta));
-    set_default_if_missing(
-        imc, "sloc_sigma_floor", py::cast(imc_defaults.sloc_sigma_floor));
-    set_default_if_missing(
-        imc, "sloc_sigma_cap", py::cast(imc_defaults.sloc_sigma_cap));
-    set_default_if_missing(imc, "sloc_tau_ref", py::cast(imc_defaults.sloc_tau_ref));
-    set_default_if_missing(
-        imc, "spectral_bias_eta", py::cast(imc_defaults.spectral_bias_eta));
-    set_default_if_missing(
-        imc, "opacity_predictor", py::cast(imc_defaults.opacity_predictor));
     set_default_if_missing(imc, "two_stage", py::cast(imc_defaults.two_stage));
-    py::dict difference;
-    if (!dict_contains(imc, "difference")) {
-      difference = py::dict();
-      imc[py::str("difference")] = difference;
-    } else if (try_get_child_dict(imc, "difference", &difference)) {
-      // Existing child dict reused below.
-    }
-    if (py::isinstance<py::dict>(imc[py::str("difference")])) {
-      difference = imc[py::str("difference")].cast<py::dict>();
-      const auto difference_defaults = imc_defaults.difference;
-      set_default_if_missing(difference, "enabled",
-                             py::cast(difference_defaults.enabled));
-      set_default_if_missing(difference, "W_max",
-                             py::cast(difference_defaults.W_max));
-      set_default_if_missing(difference, "tau0",
-                             py::cast(difference_defaults.tau0));
-      set_default_if_missing(difference, "chi0",
-                             py::cast(difference_defaults.chi0));
-      set_default_if_missing(difference, "face_transport",
-                             py::cast(difference_defaults.face_transport));
-    }
-    py::dict net_e_source_smoothing;
-    if (!dict_contains(imc, "net_e_source_smoothing")) {
-      net_e_source_smoothing = py::dict();
-      imc[py::str("net_e_source_smoothing")] = net_e_source_smoothing;
-    } else if (try_get_child_dict(imc, "net_e_source_smoothing",
-                                  &net_e_source_smoothing)) {
-      // Existing child dict reused below.
-    }
-    const auto smoothing_defaults = imc_defaults.net_e_source_smoothing;
-    set_default_if_missing(net_e_source_smoothing, "enabled",
-                           py::cast(smoothing_defaults.enabled));
-    set_default_if_missing(net_e_source_smoothing, "alpha",
-                           py::cast(smoothing_defaults.alpha));
-    set_default_if_missing(net_e_source_smoothing, "tau_threshold",
-                           py::cast(smoothing_defaults.tau_threshold));
-    set_default_if_missing(net_e_source_smoothing, "passes",
-                           py::cast(smoothing_defaults.passes));
-    set_default_if_missing(net_e_source_smoothing, "grad_Te_scale",
-                           py::cast(smoothing_defaults.grad_Te_scale));
-    set_default_if_missing(net_e_source_smoothing, "grad_rho_scale",
-                           py::cast(smoothing_defaults.grad_rho_scale));
-    set_default_if_missing(net_e_source_smoothing, "gradient_adaptive",
-                           py::cast(smoothing_defaults.gradient_adaptive));
-    set_default_if_missing(imc, "particle_budget", py::cast(imc_defaults.particle_budget));
-
-    py::dict census_comb;
-    if (!dict_contains(imc, "census_comb")) {
-      census_comb = py::dict();
-      imc[py::str("census_comb")] = census_comb;
-    } else if (try_get_child_dict(imc, "census_comb", &census_comb)) {
-      // Existing dict is updated in-place below.
-    }
-    if (py::isinstance<py::dict>(imc[py::str("census_comb")])) {
-      census_comb = imc[py::str("census_comb")].cast<py::dict>();
-      const Config::RadiationConfig::CensusCombConfig census_defaults;
-      set_default_if_missing(census_comb, "enabled", py::cast(census_defaults.enabled));
-      set_default_if_missing(census_comb, "max_particles", py::cast(census_defaults.max_particles));
-      set_default_if_missing(census_comb, "min_per_bin", py::cast(census_defaults.min_per_bin));
-      set_default_if_missing(census_comb, "trigger_ratio", py::cast(census_defaults.trigger_ratio));
-      set_default_if_missing(
-          census_comb, "target_fraction", py::cast(census_defaults.target_fraction));
-      set_default_if_missing(
-          census_comb, "mode_weight_imc", py::cast(census_defaults.mode_weight_imc));
-      set_default_if_missing(
-          census_comb, "mode_weight_ddmc", py::cast(census_defaults.mode_weight_ddmc));
-      set_default_if_missing(
-          census_comb, "adaptive_trigger", py::cast(census_defaults.adaptive_trigger));
-      set_default_if_missing(
-          census_comb, "adaptive_util_start", py::cast(census_defaults.adaptive_util_start));
-      set_default_if_missing(
-          census_comb, "adaptive_util_end", py::cast(census_defaults.adaptive_util_end));
-      set_default_if_missing(
-          census_comb, "trigger_ratio_floor", py::cast(census_defaults.trigger_ratio_floor));
-      set_default_if_missing(
-          census_comb, "trigger_hysteresis", py::cast(census_defaults.trigger_hysteresis));
-      set_default_if_missing(
-          census_comb, "ess_floor_enabled", py::cast(census_defaults.ess_floor_enabled));
-      set_default_if_missing(
-          census_comb, "ess_min_tier0", py::cast(census_defaults.ess_min_tier0));
-      set_default_if_missing(
-          census_comb, "ess_min_tier1", py::cast(census_defaults.ess_min_tier1));
-      set_default_if_missing(
-          census_comb, "max_split_factor", py::cast(census_defaults.max_split_factor));
-    }
-
-    py::dict rad_lite_mesh;
-    if (!dict_contains(imc, "rad_lite_mesh")) {
-      rad_lite_mesh = py::dict();
-      imc[py::str("rad_lite_mesh")] = rad_lite_mesh;
-    } else if (try_get_child_dict(imc, "rad_lite_mesh", &rad_lite_mesh)) {
-      // Existing dict is updated in-place below.
-    }
-    if (py::isinstance<py::dict>(imc[py::str("rad_lite_mesh")])) {
-      rad_lite_mesh = imc[py::str("rad_lite_mesh")].cast<py::dict>();
-      const Config::RadiationConfig::RadLiteMeshConfig rlm_defaults;
-      set_default_if_missing(rad_lite_mesh, "enabled", py::cast(rlm_defaults.enabled));
-      set_default_if_missing(
-          rad_lite_mesh, "sigma_ratio_max", py::cast(rlm_defaults.sigma_ratio_max));
-      set_default_if_missing(rad_lite_mesh, "nlte_auto", py::cast(rlm_defaults.nlte_auto));
-    }
-  }
-
-  py::dict ddmc;
-  if (try_get_child_dict(radiation, "ddmc", &ddmc)) {
-    const Config::RadiationConfig::DdmcConfig ddmc_defaults;
-    set_default_if_missing(ddmc, "tau_rw", py::cast(ddmc_defaults.tau_rw));
-    set_default_if_missing(ddmc, "tau_ddmc_off", py::cast(ddmc_defaults.tau_ddmc_off));
-    set_default_if_missing(ddmc, "omega_ddmc_off", py::cast(ddmc_defaults.omega_ddmc_off));
-    set_default_if_missing(ddmc, "mode_hold", py::cast(ddmc_defaults.mode_hold));
-    set_default_if_missing(ddmc, "rate_max", py::cast(ddmc_defaults.rate_max));
-  }
-
-  py::dict diffusion;
-  if (!dict_contains(radiation, "diffusion")) {
-    diffusion = py::dict();
-    radiation[py::str("diffusion")] = diffusion;
-  } else if (try_get_child_dict(radiation, "diffusion", &diffusion)) {
-    // Existing dict is updated in-place below.
-  }
-  if (py::isinstance<py::dict>(radiation[py::str("diffusion")])) {
-    diffusion = radiation[py::str("diffusion")].cast<py::dict>();
-    const Config::RadiationConfig::DiffusionConfig diffusion_defaults;
-    set_default_if_missing(diffusion, "enabled", py::cast(diffusion_defaults.enabled));
-    set_default_if_missing(diffusion, "tau_on", py::cast(diffusion_defaults.tau_on));
-    set_default_if_missing(diffusion, "tau_off", py::cast(diffusion_defaults.tau_off));
-    set_default_if_missing(
-        diffusion, "reduced_flux_on", py::cast(diffusion_defaults.reduced_flux_on));
-    set_default_if_missing(
-        diffusion, "reduced_flux_off", py::cast(diffusion_defaults.reduced_flux_off));
-    set_default_if_missing(diffusion, "mode_hold", py::cast(diffusion_defaults.mode_hold));
-    set_default_if_missing(diffusion, "rate_max", py::cast(diffusion_defaults.rate_max));
-    set_default_if_missing(diffusion,
-                           "mode_update_interval",
-                           py::cast(diffusion_defaults.mode_update_interval));
-    set_default_if_missing(diffusion,
-                           "min_diffusion_island_cells",
-                           py::cast(diffusion_defaults.min_diffusion_island_cells));
-    set_default_if_missing(
-        diffusion, "imc_guard_cells", py::cast(diffusion_defaults.imc_guard_cells));
-    set_default_if_missing(
-        diffusion, "sts_max_stages", py::cast(diffusion_defaults.sts_max_stages));
-    set_default_if_missing(
-        diffusion, "sts_damping", py::cast(diffusion_defaults.sts_damping));
-    set_default_if_missing(
-        diffusion, "sts_subcycle_eta", py::cast(diffusion_defaults.sts_subcycle_eta));
-    set_default_if_missing(diffusion,
-                           "interface_particles_per_face_group",
-                           py::cast(diffusion_defaults.interface_particles_per_face_group));
-    set_default_if_missing(diffusion,
-                           "exit_particles_per_cell_group",
-                           py::cast(diffusion_defaults.exit_particles_per_cell_group));
-    set_default_if_missing(diffusion,
-                           "lte_entry_initialization",
-                           py::cast(diffusion_defaults.lte_entry_initialization));
-    set_default_if_missing(diffusion,
-                           "lte_entry_energy_fraction_cap",
-                           py::cast(diffusion_defaults.lte_entry_energy_fraction_cap));
   }
 
   py::dict multigroup_diffusion;
@@ -4396,94 +4046,12 @@ void apply_legacy_radiation_defaults(py::dict& root) {
                              z_default);
     }
   }
-
-  py::dict holo;
-  if (!dict_contains(radiation, "holo")) {
-    holo = py::dict();
-    radiation[py::str("holo")] = holo;
-  } else if (try_get_child_dict(radiation, "holo", &holo)) {
-    // Existing dict is updated in-place below.
-  }
-  if (py::isinstance<py::dict>(radiation[py::str("holo")])) {
-    holo = radiation[py::str("holo")].cast<py::dict>();
-    const Config::RadiationConfig::HoloConfig holo_defaults;
-    set_default_if_missing(holo, "enabled", py::cast(holo_defaults.enabled));
-    set_default_if_missing(holo, "region", py::cast(holo_defaults.region));
-    set_default_if_missing(
-        holo, "material_group", py::cast(holo_defaults.material_group));
-    set_default_if_missing(holo, "coupling_tau", py::cast(holo_defaults.coupling_tau));
-    set_default_if_missing(holo, "guard_cells", py::cast(holo_defaults.guard_cells));
-    set_default_if_missing(holo, "blend_cells", py::cast(holo_defaults.blend_cells));
-    set_default_if_missing(holo, "min_lo_cells", py::cast(holo_defaults.min_lo_cells));
-    set_default_if_missing(holo, "q_min", py::cast(holo_defaults.q_min));
-    set_default_if_missing(holo, "q_max", py::cast(holo_defaults.q_max));
-    set_default_if_missing(holo, "tau_on", py::cast(holo_defaults.tau_on));
-    set_default_if_missing(holo, "tau_off", py::cast(holo_defaults.tau_off));
-    set_default_if_missing(
-        holo, "reduced_flux_on", py::cast(holo_defaults.reduced_flux_on));
-    set_default_if_missing(
-        holo, "reduced_flux_off", py::cast(holo_defaults.reduced_flux_off));
-    set_default_if_missing(
-        holo, "update_interval", py::cast(holo_defaults.update_interval));
-    set_default_if_missing(holo, "hold_on", py::cast(holo_defaults.hold_on));
-    set_default_if_missing(
-        holo, "min_dwell_steps", py::cast(holo_defaults.min_dwell_steps));
-    set_default_if_missing(
-        holo, "min_island_cells", py::cast(holo_defaults.min_island_cells));
-    set_default_if_missing(
-        holo, "core_margin_cells", py::cast(holo_defaults.core_margin_cells));
-    set_default_if_missing(holo, "solver", py::cast(holo_defaults.solver));
-    set_default_if_missing(holo, "closure", py::cast(holo_defaults.closure));
-    set_default_if_missing(
-        holo, "closure_relax", py::cast(holo_defaults.closure_relax));
-    set_default_if_missing(
-        holo, "closure_smooth_passes", py::cast(holo_defaults.closure_smooth_passes));
-    set_default_if_missing(
-        holo, "closure_smooth_alpha", py::cast(holo_defaults.closure_smooth_alpha));
-    if (!dict_contains(holo, "consistency_alpha") && dict_contains(holo, "gamma_alpha")) {
-      holo[py::str("consistency_alpha")] = holo[py::str("gamma_alpha")];
-    }
-    set_default_if_missing(
-        holo, "consistency_alpha", py::cast(holo_defaults.consistency_alpha));
-    set_default_if_missing(
-        holo, "gamma_alpha", py::cast(holo_defaults.consistency_alpha));
-    set_default_if_missing(
-        holo, "boundary_flux", py::cast(holo_defaults.boundary_flux));
-    set_default_if_missing(
-        holo, "p_rr_tally", py::cast(holo_defaults.p_rr_tally));
-    set_default_if_missing(
-        holo, "sn_closure", py::cast(holo_defaults.sn_closure));
-    set_default_if_missing(
-        holo, "sn_n_angles", py::cast(holo_defaults.sn_n_angles));
-    set_default_if_missing(
-        holo, "sn_material_coupling", py::cast(holo_defaults.sn_material_coupling));
-    set_default_if_missing(holo,
-                           "residual_particles_per_cell_group",
-                           py::cast(holo_defaults.residual_particles_per_cell_group));
-  }
 }
 
 void apply_legacy_diagnostics_defaults(py::dict& root) {
   py::dict diagnostics;
   if (!try_get_child_dict(root, "diagnostics", &diagnostics)) {
     return;
-  }
-
-  py::dict fleck_diag;
-  if (!dict_contains(diagnostics, "fleck_diag")) {
-    fleck_diag = py::dict();
-    diagnostics[py::str("fleck_diag")] = fleck_diag;
-  } else if (try_get_child_dict(diagnostics, "fleck_diag", &fleck_diag)) {
-    // Existing dict is updated in-place below.
-  }
-  if (py::isinstance<py::dict>(diagnostics[py::str("fleck_diag")])) {
-    fleck_diag = diagnostics[py::str("fleck_diag")].cast<py::dict>();
-    const Config::DiagnosticsConfig::FleckDiag fleck_defaults;
-    set_default_if_missing(fleck_diag, "enabled", py::cast(fleck_defaults.enabled));
-    set_default_if_missing(fleck_diag, "every", py::cast(fleck_defaults.every));
-    set_default_if_missing(fleck_diag, "cells", py::cast(fleck_defaults.cells));
-    set_default_if_missing(fleck_diag, "r_min_cm", py::cast(fleck_defaults.r_min_cm));
-    set_default_if_missing(fleck_diag, "r_max_cm", py::cast(fleck_defaults.r_max_cm));
   }
 
   const Config::DiagnosticsConfig diagnostics_defaults;
@@ -7066,6 +6634,70 @@ void remove_retired_terminal_takeover_keys(py::dict& root) {
                   py::none());
 }
 
+// The Monte Carlo radiation (Radiation.mode "imc_ddmc": IMC, DDMC, random walk, HOLO, difference formulation) left the
+// build on 2026-09-29 (retired/radiation_monte_carlo/). Its keys have no effect on the deterministic modes that a
+// restartable configuration uses, so checkpoints written before the retirement compare equal to a current
+// configuration without them: Radiation.imc keeps two_stage, and Radiation.ddmc, Radiation.diffusion,
+// Radiation.holo, Radiation.origin_parity_only, Radiation.boundary.marshak_particles, the materials'
+// opacity lambda_method and f_min, Numerics.dt.f_min_fleck, Numerics.safety.opacity_floor and opacity_cap,
+// Diagnostics.mc_stats, Diagnostics.fleck_diag and Parallel.migration go.
+void remove_retired_monte_carlo_radiation_keys(py::dict& root) {
+  py::dict radiation;
+  if (try_get_child_dict(root, "radiation", &radiation)) {
+    radiation.attr("pop")(py::str("origin_parity_only"), py::none());
+    py::dict imc;
+    if (try_get_child_dict(radiation, "imc", &imc)) {
+      py::dict kept;
+      if (dict_contains(imc, "two_stage")) {
+        kept[py::str("two_stage")] = imc[py::str("two_stage")];
+      }
+      radiation[py::str("imc")] = kept;
+    }
+    radiation.attr("pop")(py::str("ddmc"), py::none());
+    radiation.attr("pop")(py::str("diffusion"), py::none());
+    radiation.attr("pop")(py::str("holo"), py::none());
+    py::dict boundary;
+    if (try_get_child_dict(radiation, "boundary", &boundary)) {
+      boundary.attr("pop")(py::str("marshak_particles"), py::none());
+    }
+  }
+  py::dict materials;
+  if (try_get_child_dict(root, "materials", &materials) && dict_contains(materials, "materials")) {
+    const py::object mats_obj = materials[py::str("materials")];
+    if (py::isinstance<py::list>(mats_obj)) {
+      for (const py::handle mat_obj : mats_obj.cast<py::list>()) {
+        if (!py::isinstance<py::dict>(mat_obj)) {
+          continue;
+        }
+        py::dict mat = py::reinterpret_borrow<py::dict>(mat_obj);
+        mat.attr("pop")(py::str("lambda_method"), py::none());
+        mat.attr("pop")(py::str("f_min"), py::none());
+      }
+    }
+  }
+  py::dict numerics;
+  if (try_get_child_dict(root, "numerics", &numerics)) {
+    py::dict dt;
+    if (try_get_child_dict(numerics, "dt", &dt)) {
+      dt.attr("pop")(py::str("f_min_fleck"), py::none());
+    }
+    py::dict safety;
+    if (try_get_child_dict(numerics, "safety", &safety)) {
+      safety.attr("pop")(py::str("opacity_floor"), py::none());
+      safety.attr("pop")(py::str("opacity_cap"), py::none());
+    }
+  }
+  py::dict diagnostics;
+  if (try_get_child_dict(root, "diagnostics", &diagnostics)) {
+    diagnostics.attr("pop")(py::str("mc_stats"), py::none());
+    diagnostics.attr("pop")(py::str("fleck_diag"), py::none());
+  }
+  py::dict parallel;
+  if (try_get_child_dict(root, "parallel", &parallel)) {
+    parallel.attr("pop")(py::str("migration"), py::none());
+  }
+}
+
 void apply_checkpoint_migrations(py::dict& root) {
   int schema_version = read_schema_version_or_default(root, kCheckpointJsonSchemaV1);
   if (schema_version <= 0) {
@@ -7200,6 +6832,7 @@ void apply_checkpoint_migrations(py::dict& root) {
   apply_legacy_numerics_defaults(root);
   apply_current_defaults(root);
   remove_retired_terminal_takeover_keys(root);
+  remove_retired_monte_carlo_radiation_keys(root);
   normalize_mesh_default_elision(root);
 }
 

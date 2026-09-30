@@ -46,7 +46,9 @@ Numerics(
         max_s=1.0e-1,
         min_s=1.0e-20,
     ),
-    hydro=dict(boundary_1d="free", av_C1=0.5, av_C2=1.5),
+    # The conservative (compatible) energy update: the energy gate of this verification (relative 1e-14)
+    # tests the scheme itself (the 1T global renormalization that used to enforce it was removed 2026-09-29).
+    hydro=dict(boundary_1d="free", av_C1=0.5, av_C2=1.5, compatible_energy=True),
     conduction=dict(enabled=False),
     floors=dict(rho_floor_gcc=1.0e-10, Te_floor_eV=1.0e-3, Ti_floor_eV=1.0e-3),
 )

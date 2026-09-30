@@ -783,7 +783,9 @@ __device__ __forceinline__ double compute_node_sigma_1d_device(
   double r_right = 0.0;
   double u_right = 0.0;
   if (j == 0) {
-    r_left = -node_r[1];
+    // Mirror ghost across the fixed inner wall at node_r[0] (the centre r = 0 or a rigid wall at r_min > 0);
+    // equals -node_r[1] bitwise when node_r[0] = 0. The wall is at rest, so the ghost velocity is -u_1.
+    r_left = 2.0 * node_r[0] - node_r[1];
     u_left = -node_u[1];
   } else {
     r_left = node_r[j - 1];
@@ -1362,7 +1364,12 @@ __device__ inline void energy_update_with_old_volume_kernel_body(
     double* __restrict__ eta_compatible,
     double* __restrict__ E_floor_injected,
     int* __restrict__ clamp_count,
-    double* __restrict__ E_floor_cell = nullptr) {
+    double* __restrict__ E_floor_cell = nullptr,
+    // Cells whose closure keeps signed energies (a 1T total table or a Helmholtz closure; NUMERICS §3.1.5):
+    // nonzero keeps a negative specific energy, zero or nullptr clamps it at zero (the ideal gas). Until
+    // 2026-09-29 this 1T update clamped every cell, so the negative cold-curve energies of a table were raised to
+    // zero and booked as floor injection.
+    const std::uint8_t* __restrict__ signed_energy_cell = nullptr) {
   const bool active = (hydro_active == nullptr) || (hydro_active[i] != 0);
   if (!active) {
     ee[i] = e_old[i];
@@ -1390,9 +1397,10 @@ __device__ inline void energy_update_with_old_volume_kernel_body(
     eta_compatible[i] = dV_geom - dV;
   }
   const double e_raw = e_old[i] - (P_half[i] + Q_half[i]) * dV / m;
-  const double e_new = fmax(e_raw, 0.0);
+  const bool keep_signed = (signed_energy_cell != nullptr) && (signed_energy_cell[i] != 0u);
+  const double e_new = keep_signed ? e_raw : fmax(e_raw, 0.0);
   ee[i] = e_new;
-  if (e_raw < 0.0) {
+  if (!keep_signed && e_raw < 0.0) {
     if (E_floor_cell != nullptr) {
       E_floor_cell[i] += m * (e_new - e_raw);
     } else if (E_floor_injected != nullptr) {
@@ -1446,7 +1454,10 @@ __device__ inline void energy_update_with_old_volume_2t_kernel_body(
     // 0 when the radiation thermal subcycle owns the electron-ion exchange
     // (core::thermal_subcycle_active): the update then applies pdV/Q work only.
     const int apply_exchange = 1,
-    double* __restrict__ E_floor_cell = nullptr) {
+    double* __restrict__ E_floor_cell = nullptr,
+    // Cell charge-moment ratio r2 = <Z^2>/<Z>^2 (state.zmom_r2 while the moment tables are active, else nullptr):
+    // the relaxation time takes <Z^2> = Zbar^2 r2 (NUMERICS §1.1.3a), as on the compatible-energy path.
+    const double* __restrict__ zmom_r2 = nullptr) {
   const bool active = (hydro_active == nullptr) || (hydro_active[i] != 0);
   if (!active) {
     ee[i] = ee_old[i];
@@ -1488,13 +1499,21 @@ __device__ inline void energy_update_with_old_volume_2t_kernel_body(
     qei_term = 0.0;
   } else if (tab_ion.n_rho > 0 && tab_ele.n_rho > 0 &&
              cv_e_arr != nullptr && cv_i_arr != nullptr) {
-    qei_term = tenryu::materials::compute_qei_term_with_cv(
-        rho_qei, fmax(Te_half[i], 0.0), fmax(Ti_half[i], 0.0), z, A,
-        fmax(cv_e_arr[i], 0.0), fmax(cv_i_arr[i], 0.0), dt, qei_multiplier);
+    qei_term = (zmom_r2 != nullptr)
+                   ? tenryu::materials::compute_qei_term_with_cv_ext(
+                         rho_qei, fmax(Te_half[i], 0.0), fmax(Ti_half[i], 0.0), z, zmom_r2[i], A,
+                         fmax(cv_e_arr[i], 0.0), fmax(cv_i_arr[i], 0.0), dt, qei_multiplier)
+                   : tenryu::materials::compute_qei_term_with_cv(
+                         rho_qei, fmax(Te_half[i], 0.0), fmax(Ti_half[i], 0.0), z, A,
+                         fmax(cv_e_arr[i], 0.0), fmax(cv_i_arr[i], 0.0), dt, qei_multiplier);
   } else {
-    qei_term = tenryu::materials::compute_qei_term_analytical(
-        rho_qei, fmax(Te_half[i], 0.0), fmax(Ti_half[i], 0.0), z, A, gamma, dt,
-        qei_multiplier);
+    qei_term = (zmom_r2 != nullptr)
+                   ? tenryu::materials::compute_qei_term_analytical_ext(
+                         rho_qei, fmax(Te_half[i], 0.0), fmax(Ti_half[i], 0.0), z, zmom_r2[i], A, gamma,
+                         dt, qei_multiplier)
+                   : tenryu::materials::compute_qei_term_analytical(
+                         rho_qei, fmax(Te_half[i], 0.0), fmax(Ti_half[i], 0.0), z, A, gamma, dt,
+                         qei_multiplier);
   }
 
   // Energy-authoritative bound on the exchange (2026-09-14): the transfer may
@@ -1593,43 +1612,6 @@ __device__ inline void energy_update_with_old_volume_2t_kernel_body(
     }
     if (clamp_count != nullptr) {
       atomicAdd(clamp_count, 1);
-    }
-  }
-}
-
-__device__ inline void scale_active_energy_kernel_body(
-    const int i,
-    double* __restrict__ ee,
-    const std::int8_t* __restrict__ hydro_active,
-    const double scale) {
-  const bool active = (hydro_active == nullptr) || (hydro_active[i] != 0);
-  if (!active) {
-    return;
-  }
-  ee[i] = fmax(ee[i] * scale, 0.0);
-}
-
-__device__ inline void shift_active_energy_kernel_body(
-    const int i,
-    double* __restrict__ ee,
-    const std::int8_t* __restrict__ hydro_active,
-    const double de) {
-  const bool active = (hydro_active == nullptr) || (hydro_active[i] != 0);
-  if (!active) {
-    return;
-  }
-  ee[i] = fmax(ee[i] + de, 0.0);
-}
-
-__device__ inline void add_first_active_residual_kernel_body(
-    double* __restrict__ ee,
-    const double* __restrict__ mass,
-    const int first_active,
-    const double residual) {
-  if (first_active >= 0) {
-    const double m = mass[first_active];
-    if (m > 0.0) {
-      ee[first_active] += residual / m;
     }
   }
 }

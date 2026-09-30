@@ -26,7 +26,6 @@ enum class Ale1dSkipReason {
   None,
   Disabled,
   WrongGeometry,
-  ParticleModeUnsupported,
   NTooSmall,
   ProtectedFractionTooHigh,
   MovableSegmentTooSmall,

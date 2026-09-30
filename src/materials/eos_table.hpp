@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <functional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -66,10 +67,19 @@ struct EOSTableTriplet {
 // isotherm; 0 drops the T <= 0 rows (historic behaviour). NUMERICS §1 (b).
 struct SesameEOSTableRaw;
 EOSTable sesame_table_from_raw(const SesameEOSTableRaw& raw, int cold_curve_rows);
+// electron_from_304 (optional) reports whether the file carries a 304 electron table; without one the electron table
+// is the total scaled node-wise by zbar_hint / (1 + zbar_hint), a single ratio (see split_sesame_electron_table for the
+// per-node split the builder applies to such materials).
 EOSTablePair load_sesame(const std::string& filename,
                          int mat_id,
                          double zbar_hint = 0.0,
-                         int cold_curve_rows = 12);
+                         int cold_curve_rows = 12,
+                         bool* electron_from_304 = nullptr);
+// Electron table of a material whose SESAME file has no 304 table: the total split node by node with the
+// ideal-plasma share P_e/P = e_e/e = Zbar/(1+Zbar), Zbar = zbar_of(rho [g/cm3], T [eV]) from the material's
+// ionization model (NUMERICS §1.1.5, SESAME). The ion table is then total - electron (build_sesame_ion_table).
+EOSTable split_sesame_electron_table(const EOSTable& total,
+                                     const std::function<double(double rho, double T_eV)>& zbar_of);
 // Ion table on the total (301) grid: ion = total - electron with the electron
 // (304) table resampled onto the 301 nodes by the same bilinear-log
 // interpolant used at runtime. 301/304 grids may differ (e.g. Polystyrene

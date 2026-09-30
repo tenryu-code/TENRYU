@@ -400,6 +400,57 @@ __host__ __device__ inline double fld_1d_outer_leak_coeff(const int bc) {
   return 0.0;
 }
 
+// The outer face's transfer coefficient per unit area [cm/s] and its ratio to the boundary kind's Robin coefficient
+// (NUMERICS §6.7 1D BC). The Robin coefficient h (vacuum: the half-range escape c/2; marshak: c/4, the incoming flux
+// F_inc = h theta on the right-hand side; reflect: 0) acts on the face value E_f, which the half-cell diffusion
+// resistance d / D between the outer cell's centre and the face eliminates: h (E_f - theta) = D (E_0 - E_f) / d gives
+// the outward flux h_eff (E_0 - theta) with h_eff = h / (1 + h d / D) and ratio = h_eff / h. D is the outer cell's
+// flux-limited coefficient c lambda(R) / sigma_R (its own opacity; R = |E_0 - E_1| / (dist sigma_R E_0) from the
+// gradient across the last interior face in the field the interior faces take, divided by the outer cell's own energy
+// where the interior faces divide by the two cells' mean), d half the outer cell's width. When d / D -> 0 (an optically
+// thin outer cell with a gentle gradient) this is the cell-centre closure h (E_0 - theta) used before 2026-09-29;
+// optically thick cells hold the face at theta (vacuum: 0). Where the limiter acts (R >> 1),
+// h d / D ~ (h / c) (d / dist) |E_0 - E_1| / E_0 at any optical depth, so an outer cell that radiation reaches over a
+// steep gradient from inside (E_0 << E_1) couples weakly until it fills. With E_0 = 0, R overflows once
+// E_1 / (dist sigma_R) exceeds about 2e8 (cgs) and flux_limiter_lambda reads the non-finite R as 0 (lambda = 1/3);
+// below that lambda is nearly 0 and the face nearly closes. The coefficients stay finite either way.
+struct FldOuterTransfer {
+  double h_eff = 0.0;
+  double ratio = 0.0;
+};
+
+__device__ inline FldOuterTransfer fld_1d_outer_transfer(const int bc,
+                                                         const double* __restrict__ x_r,
+                                                         const double* __restrict__ rad_E,
+                                                         const double* __restrict__ sigma_R,
+                                                         const int n_cells,
+                                                         const int g,
+                                                         const int n_groups,
+                                                         const double sigma_floor,
+                                                         const int limiter) {
+  FldOuterTransfer out;
+  const double h = fld_1d_outer_leak_coeff(bc);
+  if (!(h > 0.0) || n_cells <= 0) {
+    return out;
+  }
+  const int c = n_cells - 1;
+  const int cg = c * n_groups + g;
+  const double sigma = fmax(finite_or_zero(sigma_R[cg]), sigma_floor);
+  double R = 0.0;
+  if (n_cells > 1) {
+    const double E0 = fmax(finite_or_zero(rad_E[cg]), 0.0);
+    const double E1 = fmax(finite_or_zero(rad_E[(c - 1) * n_groups + g]), 0.0);
+    const double dist = fmax(0.5 * (x_r[c] + x_r[c + 1]) - 0.5 * (x_r[c - 1] + x_r[c]), 1.0e-300);
+    R = fabs(E0 - E1) / (dist * sigma * fmax(E0, 1.0e-300));
+  }
+  const double D = core::constants::c_light * flux_limiter_lambda(R, limiter) / sigma;
+  const double d = 0.5 * (x_r[c + 1] - x_r[c]);
+  const double resistance = (D > 0.0 && isfinite(D) && d > 0.0) ? d / D : 0.0;
+  out.ratio = 1.0 / (1.0 + h * resistance);
+  out.h_eff = h * out.ratio;
+  return out;
+}
+
 __device__ inline void build_eta_from_planck_kernel_body(
     const int idx,
     const double* __restrict__ Te,
@@ -688,12 +739,15 @@ __device__ inline void assemble_fld_tridiag_kernel_body(
     double volume_source_rate,
     double volume_source_r_max,
     double sigma_floor,
-    int limiter) {
+    int limiter,
+    double* __restrict__ outer_transfer) {
   const int g = idx / n_cells;
   const int c = idx - g * n_cells;
   const int cg = c * n_groups + g;
   const double V = fmax(finite_or_zero(vol[c]), 0.0);
   const double sigma = fmax(finite_or_zero(sigma_removal[cg]), 0.0);
+  // the outer face (NUMERICS §6.7 1D BC), as in the multi-kernel assembly (fld_1d_gpu.cu)
+  FldOuterTransfer outer;
   double d = V + dt * core::constants::c_light * sigma * V;
   double l = 0.0;
   double u = 0.0;
@@ -727,7 +781,12 @@ __device__ inline void assemble_fld_tridiag_kernel_body(
     const double area =
         (GEOM == 0) ? 4.0 * kPi * r_outer * r_outer
                     : mesh::geometry_1d_face_area(GEOM, r_outer);
-    d += dt * area * fld_1d_outer_leak_coeff(outer_bc);
+    outer = fld_1d_outer_transfer(outer_bc, x_r, rad_E_iter, sigma_R, n_cells, g, n_groups, sigma_floor, limiter);
+    d += dt * area * outer.h_eff;
+    if (outer_transfer != nullptr) {
+      outer_transfer[2 * g] = outer.h_eff;
+      outer_transfer[2 * g + 1] = outer.ratio;
+    }
   }
   lower[idx] = l;
   diag[idx] = d;
@@ -753,7 +812,7 @@ __device__ inline void assemble_fld_tridiag_kernel_body(
     const double area =
         (GEOM == 0) ? 4.0 * kPi * r_outer * r_outer
                     : mesh::geometry_1d_face_area(GEOM, r_outer);
-    rhs_val += dt * area * fmax(finite_or_zero(marshak_finc[g]), 0.0);
+    rhs_val += dt * area * outer.ratio * fmax(finite_or_zero(marshak_finc[g]), 0.0);
   }
   rhs[idx] = rhs_val;
 }

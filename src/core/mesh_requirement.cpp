@@ -13,6 +13,7 @@
 
 #include "core/constants.hpp"
 #include "core/error.hpp"
+#include "core/namelist/errors.hpp"
 #include "materials/zbar_tf.hpp"
 
 namespace tenryu::core {
@@ -301,6 +302,9 @@ struct RadialScan {
                                       const MeshRequirementInputs& in,
                                       const RadialScan& scan,
                                       const double depth) {
+  if (report.params.empirical.enabled) {
+    return report.params.empirical.surface_ceiling_g_cm2;
+  }
   const int material = front_material_at_depth(in, scan, depth);
   const double time =
       std::max(inverse_ablation_time(report, depth), report.t_formation_s);
@@ -480,6 +484,36 @@ double mesh_requirement_cell_areal_mass(const int geometry_code,
   return rho * (r_hi - r_lo);
 }
 
+std::string mesh_empirical_validation_error(const MeshEmpiricalRequirement& e) {
+  if (!e.enabled) {
+    return {};
+  }
+  if (e.reference_sha256 != kMeshConvergenceReferenceSha256) {
+    return "reference_sha256 does not match the shipped convergence table";
+  }
+  if (e.case_ids.empty() || e.case_ids.size() > 5U) {
+    return "case_ids must contain one to five distinct campaign cases";
+  }
+  std::vector<std::string> seen;
+  for (const auto& id : e.case_ids) {
+    if (id.size() != 3U || id[0] != 'C' || id[1] < '0' || id[1] > '2' ||
+        id[2] < '0' || id[2] > '9' || id == "C00" ||
+        std::find(seen.begin(), seen.end(), id) != seen.end()) {
+      return "case_ids must be distinct C01 through C29 (no sanity rows)";
+    }
+    seen.push_back(id);
+  }
+  if (!std::isfinite(e.surface_ceiling_g_cm2) || !(e.surface_ceiling_g_cm2 > 0.0) ||
+      !std::isfinite(e.reference_apriori_g_cm2) || !(e.reference_apriori_g_cm2 > 0.0)) {
+    return "empirical ceilings must be finite and positive";
+  }
+  if (e.surface_ceiling_g_cm2 / e.reference_apriori_g_cm2 >
+      kMeshEmpiricalRelaxationCap * (1.0 + 1.0e-12)) {
+    return "empirical factor exceeds the measured relaxation cap";
+  }
+  return {};
+}
+
 MeshRequirementReport build_mesh_requirement(const MeshRequirementInputs& in,
                                              const MeshRequirementParams& params) {
   MeshRequirementReport report;
@@ -490,6 +524,27 @@ MeshRequirementReport build_mesh_requirement(const MeshRequirementInputs& in,
   report.r_max = in.r_max;
   report.t_end_s = in.t_end;
   report.n_samples = in.power_W.n_points;
+  report.eos = in.eos;
+  report.temperature_model = in.temperature_model;
+  report.conduction_solver = in.conduction_solver;
+  report.radiation_enabled = in.radiation_enabled;
+
+  if (params.empirical.enabled) {
+    const std::string error = mesh_empirical_validation_error(params.empirical);
+    if (!error.empty()) {
+      throw namelist::ConfigError("MESH_EMPIRICAL_INVALID: " + error);
+    }
+    if (!params.enabled || params.apply != "enforce" || !in.laser_enabled ||
+        params.zones_per_scale_length != 9 || params.intensity_exponent != 0.4 ||
+        params.intensity_reference_W_cm2 != 1.0e14 || params.scale_length_factor != 0.12 ||
+        params.ablation_mass_safety != 1.5 || params.formation_ablated_fraction != 0.1 ||
+        params.absorbed_fraction != 1.0 || params.zbar_override != 0.0 ||
+        params.shock_cells_per_separation < 8 || params.min_cells_per_layer < 10 ||
+        params.shock_event_min_separation_frac != 0.05) {
+      throw namelist::ConfigError(
+          "MESH_EMPIRICAL_INVALID: empirical requires enabled laser, enforce and calibrated ablation defaults");
+    }
+  }
 
   if (!params.enabled) {
     report.reason = "disabled_by_deck";
@@ -528,6 +583,19 @@ MeshRequirementReport build_mesh_requirement(const MeshRequirementInputs& in,
     return report;
   }
   report.R0_cm = scan.R0;
+  for (const auto& cell : scan.cells) {
+    if (cell.r_lo >= scan.R0 || !valid_material_index(in, cell.material)) {
+      continue;
+    }
+    const auto& material = in.materials[static_cast<std::size_t>(cell.material)];
+    if (!report.condition_layers.empty() &&
+        report.condition_layers.back().material == material.name &&
+        report.condition_layers.back().rho_gcc == cell.rho) {
+      report.condition_layers.back().thickness_cm += cell.r_hi - cell.r_lo;
+    } else {
+      report.condition_layers.push_back({material.name, cell.rho, cell.r_hi - cell.r_lo});
+    }
+  }
   if (in.geometry_code == 0) {
     report.area_cm2 = 4.0 * std::numbers::pi_v<double> * scan.R0 * scan.R0;
   } else if (in.geometry_code == 1) {
@@ -551,6 +619,7 @@ MeshRequirementReport build_mesh_requirement(const MeshRequirementInputs& in,
       1.0, std::pow(report.peak_intensity_W_cm2 /
                         params.intensity_reference_W_cm2,
                     -params.intensity_exponent));
+  report.condition_intensity_W_cm2 = intensity_W_cm2;
 
   const double wavelength_um = in.wavelength_nm * 1.0e-3;
   const double critical_number_density =
@@ -651,6 +720,23 @@ MeshRequirementReport build_mesh_requirement(const MeshRequirementInputs& in,
       critical_density_for_material(report, report.ablator_material) *
       report.L_c_formation_cm /
       static_cast<double>(params.zones_per_scale_length);
+  report.apriori_ceiling_formation_g_cm2 = report.ceiling_formation_g_cm2;
+  if (params.empirical.enabled) {
+    const double reference = params.empirical.reference_apriori_g_cm2;
+    // The offline table and validate's node-sampled density can differ slightly.
+    // This tolerance binds provenance to physics; the independent lint uses 1e-6.
+    if (!(report.apriori_ceiling_formation_g_cm2 > 0.0) ||
+        std::abs(reference / report.apriori_ceiling_formation_g_cm2 - 1.0) > 0.03 ||
+        params.empirical.surface_ceiling_g_cm2 / report.apriori_ceiling_formation_g_cm2 >
+            kMeshEmpiricalRelaxationCap * (1.0 + 1.0e-12)) {
+      std::ostringstream message;
+      message << std::setprecision(17)
+              << "MESH_EMPIRICAL_APRIORI_MISMATCH: recompute with recommend-mesh; apriori_g_cm2="
+              << report.apriori_ceiling_formation_g_cm2;
+      throw namelist::ConfigError(message.str());
+    }
+    report.ceiling_formation_g_cm2 = params.empirical.surface_ceiling_g_cm2;
+  }
 
   report.profile.reserve(33U);
   std::vector<double> profile_depths;
@@ -935,8 +1021,9 @@ MeshRequirementCheck check_mesh_requirement(
           std::max(full_ablation_time, report.t_formation_s);
       const double scale_length = interpolate(
           report.table_t_s, report.table_L_c_cm, time);
-      const double ceiling =
-          report.intensity_correction_factor *
+      const double ceiling = report.params.empirical.enabled
+          ? report.params.empirical.surface_ceiling_g_cm2
+          : report.intensity_correction_factor *
           critical_density_for_material(report, material_cells[i]) *
           scale_length /
           static_cast<double>(report.params.zones_per_scale_length);
@@ -1018,7 +1105,27 @@ std::string mesh_requirement_json(const MeshRequirementReport& report,
   out << ",\"min_cells_per_layer\":" << report.params.min_cells_per_layer
       << ",\"zbar_override\":";
   emit_double(out, report.params.zbar_override);
-  out << ",\"n_bands\":" << report.params.n_bands << '}';
+  out << ",\"n_bands\":" << report.params.n_bands;
+  if (report.params.empirical.enabled) {
+    const auto& empirical = report.params.empirical;
+    out << ",\"empirical\":{\"reference_sha256\":";
+    emit_string(out, empirical.reference_sha256);
+    out << ",\"case_ids\":[";
+    for (std::size_t i = 0; i < empirical.case_ids.size(); ++i) {
+      if (i > 0U) out << ',';
+      emit_string(out, empirical.case_ids[i]);
+    }
+    out << "],\"surface_ceiling_g_cm2\":";
+    emit_double(out, empirical.surface_ceiling_g_cm2);
+    out << ",\"reference_apriori_g_cm2\":";
+    emit_double(out, empirical.reference_apriori_g_cm2);
+    out << ",\"apriori_factor\":";
+    emit_double(out, empirical.surface_ceiling_g_cm2 / empirical.reference_apriori_g_cm2);
+    out << ",\"relaxation_cap\":";
+    emit_double(out, kMeshEmpiricalRelaxationCap);
+    out << '}';
+  }
+  out << '}';
 
   out << ",\"inputs\":{\"wavelength_nm\":";
   emit_double(out, report.wavelength_nm);
@@ -1079,6 +1186,8 @@ std::string mesh_requirement_json(const MeshRequirementReport& report,
 
   out << ",\"ablation\":{\"intensity_correction_factor\":";
   emit_double(out, report.intensity_correction_factor);
+  out << ",\"apriori_ceiling_formation_g_cm2\":";
+  emit_double(out, report.apriori_ceiling_formation_g_cm2);
   out << ",\"mu_abl_total_g_cm2\":";
   emit_double(out, report.mu_abl_total_g_cm2);
   out << ",\"ablated_mass_fraction\":";
@@ -1231,6 +1340,49 @@ std::string mesh_requirement_json(const MeshRequirementReport& report,
     emit_string(out, report.notes[i]);
   }
   out << "]}";
+
+  if (report.applicable) {
+    out << ",\"experimental_conditions\":{\"wavelength_nm\":";
+    emit_double(out, report.wavelength_nm);
+    out << ",\"geometry\":";
+    emit_string(out, report.geometry_code == 0 ? "spherical" :
+                     report.geometry_code == 1 ? "cylindrical" : "planar");
+    out << ",\"r_min_cm\":";
+    emit_double(out, report.r_min);
+    out << ",\"r_max_cm\":";
+    emit_double(out, report.r_max);
+    out << ",\"t_end_s\":";
+    emit_double(out, report.t_end_s);
+    out << ",\"layers\":[";
+    for (std::size_t i = 0; i < report.condition_layers.size(); ++i) {
+      if (i > 0U) out << ',';
+      const auto& layer = report.condition_layers[i];
+      out << "{\"material\":";
+      emit_string(out, layer.material);
+      out << ",\"rho_gcc\":";
+      emit_double(out, layer.rho_gcc);
+      out << ",\"thickness_cm\":";
+      emit_double(out, layer.thickness_cm);
+      out << '}';
+    }
+    out << "],\"pulse\":{\"intensity_table\":[";
+    for (std::size_t i = 0; i < report.condition_intensity_W_cm2.size(); ++i) {
+      if (i > 0U) out << ',';
+      out << '[';
+      emit_double(out, report.table_t_s[i]);
+      out << ',';
+      emit_double(out, report.condition_intensity_W_cm2[i]);
+      out << ']';
+    }
+    out << "]},\"physics\":{\"eos\":";
+    emit_string(out, report.eos);
+    out << ",\"radiation_enabled\":" << (report.radiation_enabled ? "true" : "false")
+        << ",\"temperature_model\":";
+    emit_string(out, report.temperature_model);
+    out << ",\"conduction_solver\":";
+    emit_string(out, report.conduction_solver);
+    out << "}}";
+  }
 
   if (check != nullptr) {
     out << ",\"requirement_check\":{\"ok\":"

@@ -3,7 +3,6 @@ add_library(tenryu_parallel STATIC
   halo_exchange.cu
   comm_buffers.cpp
   reduction.cpp
-  particle_migration.cu
 )
 
 target_include_directories(tenryu_parallel PUBLIC ${PROJECT_SOURCE_DIR}/src)

@@ -140,7 +140,7 @@ Laser(
 Numerics(
     dt=dict(
         initial_s=1.0e-13, cfl_hydro=0.3, cfl_cond=0.25,
-        f_min_fleck=0.01, max_s=1.0e-10, min_s=1.0e-22,
+        max_s=1.0e-10, min_s=1.0e-22,
     ),
     hydro=dict(
         boundary_1d="free",

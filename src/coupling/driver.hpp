@@ -13,7 +13,6 @@
 #include "hydro/ale_mode.hpp"
 #include "hydro/reference_barrier_ale.hpp"
 #include "io/hdf5_reader.hpp"
-#include "radiation/particle_pool.cuh"
 
 namespace tenryu::io {
 class OutputManager;
@@ -54,7 +53,6 @@ class Driver {
   void run(tenryu::core::State& state,
            const tenryu::core::Config& cfg,
            tenryu::io::OutputManager& out);
-  void set_restart_photon_pool(tenryu::radiation::PhotonPool&& pool);
   void set_restart_checkpoint_prefix(std::string prefix) {
     restart_checkpoint_prefix_ = std::move(prefix);
   }
@@ -71,7 +69,6 @@ class Driver {
 
  private:
   SplittingOrder order_ = SplittingOrder::STRANG;
-  std::optional<tenryu::radiation::PhotonPool> restart_pool_;
   std::string restart_checkpoint_prefix_;
   int initial_plic_interface_cells_observed_ = 0;
   tenryu::io::PerMaterialCheckpointReadStatus checkpoint_per_material_status_ =
@@ -101,7 +98,6 @@ struct DtLineage {
   double dt_burn = 0.0;
   double dt_hot_e = 0.0;
   double dt_visc = 0.0;
-  double dt_rad = 0.0;
   double dt_growth = 0.0;
   double dt_output = 0.0;
   double dt_remaining = 0.0;
@@ -170,7 +166,6 @@ struct DtLineage {
   int cond_argmin_cell = -1;
   double cond_argmin_deff = 0.0;
   double cond_argmin_dl = 0.0;
-  int rad_argmin_cell = -1;
   std::string phase = "primary";
   bool ale_attempted = false;
   bool ale_applied = false;

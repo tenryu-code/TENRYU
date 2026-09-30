@@ -15,7 +15,8 @@ except ImportError:
     np = _NumpyFallback()
 
 # Scientific target: single steady shock through 50 um CD.
-# Breakout at the x=0 free face at t ~ 1.3-1.8 ns.
+# Arrival at the x=0 rear face at t ~ 1.3-1.8 ns; x=0 is the fixed inner node (a rigid
+# wall in every geometry), so the shock reflects there instead of releasing.
 # Expected shock speed ~ 30-45 um/ns.
 
 um = 1.0e-4

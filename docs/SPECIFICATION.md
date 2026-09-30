@@ -4,8 +4,8 @@ ICF向け 輻射流体（rad‑hydro）コード：多群 **決定論的輻射�
 
 > **輻射輸送の現行ステータス（2026-07-10 truth-restoration）**
 > 本番・検証対象は `Radiation.mode="multigroup_diffusion"`（FLD、**既定**）と `"sn_transport"`（決定論 S_N）。
-> 初期設計の **IMC–PGRW–DDMC** Monte Carlo ハイブリッド（`mode="imc_ddmc"`）は**退役**した：
-> コードはツリー内に残存し 2D_RZ でのみ選択可能だが、検証 gate は退役済みで**本番使用不可**（1D_SPH では `ConfigError`）。
+> 初期設計の **IMC–PGRW–DDMC** Monte Carlo ハイブリッド（`mode="imc_ddmc"`、HOLO・difference 定式化を含む）は**退役**した：
+> 2026-07-10 に凍結し、2026-09-29 にコード・試験・デッキをビルドの外の `retired/radiation_monte_carlo/` へ移した（最後にビルドできた状態と戻し方は同ディレクトリの README）。`mode="imc_ddmc"` は `ConfigError`、その設定キーは受理して無視する（§6.4.5）。その出力（history の `mc/*`・`holo/*`・`difference/*`、チェックポイントの `/particles`）は無くなった（§7、HDF5 schema 2）。
 > 本書の一部の節は歴史的経緯として IMC 前提の記述を含む — 該当箇所には退役注記を付す（§3、§5.2–5.3、§6.4.5 参照）。
 
 ## 0. 本書の位置付け
@@ -38,27 +38,26 @@ ICF向け 輻射流体（rad‑hydro）コード：多群 **決定論的輻射�
 ## 2. スコープ / 非スコープ
 ### 2.1 スコープ（v1.0必須：現状は全て存在する前提）
 - 次元：
-  - **1D球対称（1D_SPH）**
+  - **1D（1D_SPH）** — `Mesh.geometry_1d` で球（既定）・円筒（`Main.dimension="1D_CYL"` と同じ）・平板
   - **2D RZ軸対称（2D_RZ）**
   - 3Dは将来追加（本仕様では非対応）
 - 流体：
   - 単一流体（one‑fluid）+ **2温度（T_i, T_e）**
-  - 人工粘性（von Neumann–Richtmyer）
-  - 1DはLagrangian、2DはALE（rezoning + remap含む）
+  - 人工粘性（1D の既定は制限子付きの CSW（Christensen の速度制限子）、VNR と Riemann 型を選択可。2D は VNR ほか §6.4.7）
+  - 1DはLagrangian（実験的な 1D ALE は opt-in）、2DはALE（rezoning + remap含む）
 - 伝導：
   - 電子熱伝導（Spitzer‑Härm + flux limiter）
   - イオン伝導はオプション（既定OFF）
 - 輻射：
   - 多群（multigroup）放射輸送：**FLD（flux-limited diffusion、既定）+ S_N（離散座標、決定論）**（§5.3）
-  - 退役互換経路として IMC–PGRW–DDMC ハイブリッド（`mode="imc_ddmc"`、2D_RZ のみ・本番使用不可 — 冒頭ステータス参照）
+  - 退役した IMC–PGRW–DDMC ハイブリッド（`mode="imc_ddmc"`）は `ConfigError`（2026-09-29 にビルドから外した — 冒頭ステータス参照）
 - レーザー：
   - 幾何光学（Geometric Optics）レイトレース + 逆制動輻射吸収（IB）
   - **外部レイトレース連携は行わない**（TENRYU内部のみ）
   - レイトレースの“思想”（LaserMesh分離、保守的沈着、性能）だけ **xRAGE** を参考にする
 - 物性：
-  - **SESAME を既定 EOS**。xSESAME ASCII 形式をサポート
-  - **IONMIX を代替オプション**（EOS + opacity）
-  - SESAME EOS + IONMIX opacity の混合構成を推奨（SESAME opacity（502/505）は grey のみ）
+  - EOS の既定は**理想気体**（`eos.model="ideal_gas"`）。表 EOS は TMAT-H5（`tmat`、EOS と多群不透明度）・xSESAME ASCII（`sesame`、301/304）・IONMIX（`ionmix`）
+  - 不透明度の既定は定数（`opacity.model="constant"`）。多群の表は TMAT と IONMIX（`table_nlte` を含む）。SESAME の不透明度（502/505）は未実装で `ConfigError`
   - **理想気体EOSモード**（検証/MMS/簡易ラン用）を必須で持つ
 - GPU：
   - **NVIDIA CUDA のみ**（HIP/他GPUバックエンドの公式サポート無し）
@@ -68,16 +67,17 @@ ICF向け 輻射流体（rad‑hydro）コード：多群 **決定論的輻射�
 ### 2.2 非スコープ（現段階では実装しない）
 - LPI の波動レベル第一原理計算（SRS/SBS/TPD の分散関係・成長率解計算）：非スコープ。ただし **CBET（Marozas 型 pairwise ray 交換、1D_SPH opt-in・既定OFF、NUMERICS §5.10）と ホット電子プリヒート（処方源 η_hot + 多群 CSDA 輸送、1D、NUMERICS §5.11）は実装済み**。TPD/SRS 由来の指向性ホット電子源モデル等は将来拡張。
 - 磁場・MHD、非理想MHD。
-- 核燃焼（DT燃焼・α自己加熱）：将来拡張（v1.0はOFF）。
-- Comoving frameの **O(v/c)** 輸送項（ドップラー/放射圧仕事など）：v1.0は無視（明示；詳細はNUMERICS）。
+- 核燃焼（DT燃焼・α自己加熱）は 1D に実装済み（`Burn`、既定 OFF、§6.4.11・NUMERICS §14）。
+- Comoving frameの **O(v/c)** 輸送項のうちドップラー移動（群間の移動）は無い。放射圧の力と仕事は 1D FLD の既定
+  `multigroup_diffusion.hydro_coupling="gamma_r_43"` が流体へ入れる（NUMERICS §6.7）。S\(_N\) と 2D は入れない。
 - **Voidセル**：`is_void: True` フラグ付きの材料として定義される真空領域をサポートする。Void材料は理想気体EOS（低密度）を使用し、opacity=0、radiation/laser/conduction couplingをスキップする。§6.4.3 Materials 参照。
 
 ### 2.3 輻射モデルの適用範囲（v1.0）
 v1.0の輻射モデルは以下の前提に基づく。これらの制限はユーザが意識すべき適用範囲を定める。
 
 - **LTE（局所熱平衡）前提**：放射源は黒体放射 \(aT_e^4\) と Planck分率 \(b_g(T_e)\) に基づく。非LTE（準位population、非平衡イオン化）、散乱支配領域、線スペクトル支配系には適用不可。
-- **物理散乱なし（v1.0既定）**：\(\sigma_{s,phys} = 0\)。散乱はFleck factor由来の実効散乱のみ。Thomson/Compton散乱が重要な高温低Zプラズマでは透過・スペクトル誤差が生じうる。
-- **O(v/c)項の無視**：ドップラーシフト、放射圧仕事、Compton heating/cooling を含まない（§5.5参照）。放射力が流体力学に匹敵する条件（radiation-dominated flow）では精度が不足する。
+- **物理散乱は既定で無し**：\(\sigma_{s,phys} = 0\)。散乱はFleck factor由来の実効散乱のみ。S\(_N\) は定数の散乱不透明度 `opacity.kappa_s` を使えるが、FLD は散乱を持たない（`kappa_s > 0` は `ConfigError`）。Thomson/Compton散乱が重要な高温低Zプラズマでは透過・スペクトル誤差が生じうる。
+- **O(v/c)項**：ドップラーシフトと Compton heating/cooling を含まない（§5.5参照）。放射圧の力と仕事は 1D FLD の既定（`hydro_coupling="gamma_r_43"`）だけが入れる。放射力が流体力学に匹敵する条件（radiation-dominated flow）では、それ以外の構成は精度が不足する。
 - **放射エネルギーの電子結合**：`rad_dep` は電子内部エネルギー \(e_e\) にのみ加算される（ARCHITECTURE §4.5、NUMERICS §10.2）。検証問題（Su-Olson等）での「物質温度」は \(T_e\) を指す。
 
 ---
@@ -260,9 +260,10 @@ c_{v,i} = \frac{k_B}{A_{eff}m_p(\gamma_{eff}-1)}
   \(n_{refr}=\sqrt{\max(\varepsilon_n, 1-n_e/n_{crit})}\)
 - **臨界近傍の数値発散回避を仕様で固定**：
   - \(n_{refr}\) に下限 \(\varepsilon_n\) を導入（既定 1e‑4）
-  - さらに \(n_e/n_{crit}\ge 1-\varepsilon_{crit}\) でレイを終了（既定 \(\varepsilon_{crit}=1e‑4\)）
-  - 残存強度は “未吸収（反射/損失）” としてエネルギー収支へ計上
-- レイトレースは **LaserMesh（独立格子）上で屈折・吸収を計算 → 流体メッシュへ沈着をマップ**
+  - \(n_e/n_{crit}\ge 1-\varepsilon_{crit}\)（既定 \(\varepsilon_{crit}=1e‑4\)）に達したレイは、1D の既定（`raytrace_2d` の特性線法、
+    `critical_handling.terminate` 未指定）では臨界半径で反射して外向きに追跡する。`terminate=True`（leapfrog の既定）では終了し、
+    残存強度は `terminate_mode` に従い “未吸収（反射/損失）” としてエネルギー収支へ計上するか、臨界に隣接するセルへ沈着する（§6.4.6）
+- レイトレースは **LaserMesh（独立格子）上で屈折・吸収を計算 → 流体メッシュへ沈着をマップ**（1D は径方向プロファイル節点の上で追跡し、流体セルへ直接沈着する）
   - 流体セルが void または近似セル中心 \(\hat{n}_c = \rho_c \bar{Z}_c /(A_{\mathrm{eff},c} m_p n_{\mathrm{crit}}) \ge 1\) の場合、そのセルへは沈着しない
   - 1D_SPH では void 側パワーをハンドオフステンシルで亜臨界セルへ再分配し、supercritical 実セルへ落ちた分は外側の亜臨界実セルへ付け替える
   - 1D_SPH では臨界面に隣接する最外の超臨界実セル 1 個を例外受け皿として許可し、臨界面が外側の亜臨界セル内部にある場合はその内側分の沈着をこのセルへ割り当てる
@@ -371,7 +372,7 @@ Parallel(...)
 
 - 各ブロックは **1回だけ**呼ぶ。`Material()` はブロックではなく辞書を返すヘルパーであり、**`Materials(materials=[Material(...), ...])`** のリスト要素としてのみ使用する。リスト内の順序が材料インデックス（0始まり）を決定する。
 - ブロック呼び出し順は原則自由（TENRYU側で整合性検査する）が、推奨は上記。
-- **ファイルパス解決規則**：namelist 内で指定するファイルパス（EOS テーブル、opacity テーブル等）は、**相対パスの場合は namelist ファイルの所在ディレクトリを基準に解決** する。絶対パスはそのまま使用する。`~` はホームディレクトリに展開する。環境変数の展開は行わない。`Main.restart_from` も同一規則（namelist ディレクトリ基準）。`Output.directory` の相対パスは **実行時カレントディレクトリ（CWD）基準** で解決する（出力先はワークフロー依存のため。CLI `--output-dir` 指定時はこの値を上書き）。
+- **ファイルパス解決規則**：namelist 内で指定するファイルパス（`Materials` の `eos.file`・`opacity.file`、`Numerics.ale.euler_window.replay_table_path`）は、**相対パスの場合は `tenryu` を起動したカレントディレクトリ（CWD）を基準に解決** する（内部の `config.meta.namelist_source_dir` がこの CWD。2026-02-26 から。例題はリポジトリ直下の `TMAT-H5/` を指すので、リポジトリ直下から実行する）。絶対パスはそのまま使用する。namelist 内のパスの `~` は展開しない（`~/...` は CWD 直下の `~` ディレクトリとして解決される）。ホームからの指定は deck の中で `os.path.expanduser("~/...")` を使う。環境変数の展開も行わない。`Main.restart_from` の相対パスも CWD 基準。CLI に渡す namelist ファイル自体のパスは `~/...` を展開する。`Output.directory` の相対パスも CWD 基準（CLI `--output-dir` 指定時はこの値を上書き）。解決した表ファイルが存在しないと表の読込みで失敗する（TMAT の表は `validate` の段階で `TMAT_E001: Failed to open TMAT file: <解決後の絶対パス>` の TENRYU_ASSERT により異常終了する）。2026-09-28 修正: 本項は以前「namelist ファイルの所在ディレクトリ基準」「`~` を展開」と記していたが、実装（`core/namelist/runtime.cpp` の `namelist_source_dir` = CWD）と一致していなかった。
 - **ユーザ定義関数**（密度・温度・波形など）は namelist 内で自由に定義して良い。
 - Python↔C++バインディングには **pybind11** を使用する。
   - 選定理由：型安全なC++↔Pythonバインディング、科学計算コミュニティでの広い採用実績、ヘッダオンリー（追加ライブラリ不要）
@@ -446,12 +447,12 @@ Materials(materials=[
 **禁止**：実行中ステップごとにPython関数を呼ぶ設計（性能と再現性が崩れる）。  
 → TENRYUは初期化時に関数を評価して **配列に固定**する。
 
-#### 6.3.2 ベクトル化（性能推奨）
-関数は **NumPy配列入力**にも対応する実装を推奨する：
-- 入力：`r_cm` が `numpy.ndarray`
-- 出力：同shapeの `numpy.ndarray`
-
-TENRYUは初期化時に座標配列を渡して一括評価する（Python呼び出し回数を最小化）。
+#### 6.3.2 評価のしかた
+TENRYU は初期化時に、各セル中心の座標を **スカラー（float）** で渡して関数を 1 回ずつ呼ぶ
+（`core/namelist/geometry_eval.cpp` の `eval_scalar_callable`。座標配列による一括評価はしない）。
+したがって関数は float を受け取って float（有限値）を返せばよい。NumPy の関数を使ってもよいが、
+スカラー引数で動くこと。2026-09-28 修正: 本項は以前「NumPy 配列を渡して一括評価する」と記して
+いたが、実装はセルごとのスカラー評価だった。
 
 #### 6.3.3 多材料セルの指定（体積分率関数）
 Geometryは、点（セル中心）ごとに **材料体積分率（または質量分率）**を返す関数で指定する。
@@ -484,10 +485,13 @@ Geometryと同じnamelist内にあるため、ユーザは “どの領域にど
 - `temperature_model: Literal["1T","2T","auto"]`（既定 `"auto"`）
   - `"1T"`：単温度モード（電子・イオンを単一温度で扱う）
   - `"2T"`：二温度モード（既存挙動）
-  - `"auto"`：初期化時に `"2T"` へ解決（後方互換のための既定）。実行時に WARNING を出力
+  - `"auto"`：初期状態で解決する — \(|T_e-T_i|>10^{-14}\) eV のセルが 1 つでもあれば `"2T"`、無ければ `"1T"`
+    （`driver.cpp`、実行時に WARNING を出力）。解決は初期状態を作った後なので、validate の段階では `"auto"` を 2T とみなさない：
+    2T を要する機能（`conduction.nonlocal_model="snb"`、`conduction.ion_conduction`、`hydro.cold_equilibrium`、`hydro.ion_art_heat_C`、
+    `eos.hydro_backend="mie_gruneisen"`）は `"auto"` のデッキを `ConfigError` にする。これらを使うときは `"2T"` を明示する
 - `t_end: float`：終了時刻 [s]（有効範囲：`> 0`）
 - `seed: int`：64-bit seed（Philox）（既定 `12345`；有効範囲：`0 ≤ seed ≤ 2^64-1`）
-- `restart_from: Optional[str]`：checkpointプレフィックス（既定 `None`）。形式：`<dir>/<case>_ckpt_NNNN`（`<dir>` は通常 `Output.directory` の下の `checkpoints/`、`NNNN` はチェックポイントの 4 桁の通し番号。拡張子 `.h5` は付けても省いてもよい。ランク別ファイルだった旧形式 `<case>_ckpt_NNNNNN_rNNNN.h5` は、ランクサフィックスを省いたプレフィックスで読み込める）。一致するファイルが無い場合は `checkpoint files not found: {prefix}_r*.h5` を出して停止する（`ConfigError` ではなく実行時の assert）。§7.4のリスタート手順に従う。CLI `--restart <checkpoint_prefix>` 指定時はこの値を実行時に上書きする
+- `restart_from: Optional[str]`：checkpointプレフィックス（既定 `None`）。形式：`<dir>/<case>_ckpt_NNNN`（`<dir>` は通常 `Output.directory` の下の `checkpoints/`、`NNNN` はチェックポイントの 4 桁の通し番号。拡張子 `.h5` は付けても省いてもよい。ランク別ファイルだった旧形式 `<case>_ckpt_NNNNNN_rNNNN.h5` は、ランクサフィックスを省いたプレフィックスで読み込める）。一致するファイルが無い場合は `checkpoint files not found: {prefix}_r*.h5` を出して停止する（`ConfigError` ではなく実行時の assert）。§7.4のリスタート手順に従う。CLI `--restart <checkpoint_prefix>` 指定時はこの値を実行時に上書きする。再開の照合にはデッキ本文の sha256 も入るので、再開元をデッキに書くと本文が変わって再開は拒否される — 元の run と同じデッキを変えずに使い、再開元は `--restart` で渡すか、元の run のデッキから環境変数などで読む（§7.4 のパラメータ変更制約）
 - `units: Literal["cgs_eV"]`：既定 `"cgs_eV"`（変更禁止）
 - `max_steps: int`（既定 `10_000_000`）— 最大ステップ数。有効範囲: `[1, 16_777_215]`（= 2²⁴ − 1。global_id = step × N_max_per_step(2⁴⁰) の uint64 オーバーフロー回避、NUMERICS §12.7.1）
 - **停止条件の優先順位**：シミュレーションは `t >= t_end` **または** `step >= max_steps` のいずれか **先に到達した方** で終了する。終了理由は `Output.directory` 直下の `run_info.json` の `termination_reason` に記録される（`"t_end_reached"`・`"max_steps_reached"` など。実行中は `"running"`）。history ファイルには書かない
@@ -511,10 +515,10 @@ Geometryと同じnamelist内にあるため、ユーザは “どの領域にど
   - `nr: int`（有効範囲：`≥ 4`；Kershawステンシル＋ゴースト層に4セル以上必要）
   - `grid: Literal["graded"] | dict`（既定 `"graded"`）
     - 1D_SPH の初期メッシュは常に graded として生成する
-    - `grid="graded"` の場合は `nr`, `r_min`, `r_max` から単一区間の graded メッシュを構成する
+    - `grid="graded"`（segments なし）の場合は `nr`, `r_min`, `r_max` の単一区間を**等幅**に分ける（`grading` を書かないときの端の比は 1、`mesh.cu` の `build_graded_nodes`）
     - `grid=dict(type="graded", segments=[...], grading={...})` の場合は下記 `graded` 指定を用いる
   - `grid_type_r/grid_r` は後方互換のため受理するが、1D_SPH では値に関わらず内部で `"graded"` に固定する
-  - `geometry_1d: Literal["spherical","cylindrical","planar"]`（既定 `"spherical"`；1D の座標幾何を選ぶ: 面積 \(4\pi r^2\) / \(2\pi r\)（単位長） / \(1\)（単位面積）、体積はそれぞれの殻体積。**1D_SPH 専用**（2D_RZ で指定すると `ConfigError`）。非球面の制約: `mode="imc_ddmc"` 不可、`"cylindrical"` の `sn_transport` は積求積（`n_angles` \(=2L^2\)、§6.4 の `n_angles`）。`Laser.mode` は `"radial_absorption_1d"` と（2026-09-24 から）`"raytrace_2d"`（特性曲線積分のみ — `Laser.raytrace.integrator="leapfrog"` は ConfigError; 円柱の軸・平板の法線は lab z で、ビームの `direction` が入射を決める; 円柱の軸に沿う・平板に平行なビームは ConfigError; `Laser.ib.langdon_model` は off（`auto` は off に解決、`legacy_vacuum_map` の明示は ConfigError）; CBET・常駐ループは球のみ; ビームの `power` は円柱で単位長さ、平板で単位面積あたり）。既定 `"spherical"` は非球面の幾何を導入する前と bitwise 同一（NUMERICS §3 の不変契約参照））
+  - `geometry_1d: Literal["spherical","cylindrical","planar"]`（既定 `"spherical"`；1D の座標幾何を選ぶ: 面積 \(4\pi r^2\) / \(2\pi r\)（単位長） / \(1\)（単位面積）、体積はそれぞれの殻体積。**1D_SPH 専用**（2D_RZ で指定すると `ConfigError`）。非球面の制約: `"cylindrical"` の `sn_transport` は積求積（`n_angles` \(=2L^2\)、§6.4 の `n_angles`）。`Laser.mode` は `"radial_absorption_1d"` と（2026-09-24 から）`"raytrace_2d"`（特性曲線積分のみ — `Laser.raytrace.integrator="leapfrog"` は ConfigError; 円柱の軸・平板の法線は lab z で、ビームの `direction` が入射を決める; 円柱の軸に沿う・平板に平行なビームは ConfigError; `Laser.ib.langdon_model` は off（`auto` は off に解決、`legacy_vacuum_map` の明示は ConfigError）; CBET・常駐ループは球のみ; ビームの `power` は円柱で単位長さ、平板で単位面積あたり）。既定 `"spherical"` は非球面の幾何を導入する前と bitwise 同一（NUMERICS §3 の不変契約参照））
 - 2D_RZ：
   - `r_min,r_max,z_min,z_max: float` [cm]（有効範囲：`r_min ≥ 0`, `r_max > r_min`, `z_max > z_min`。**v1.0制約**：`r_min = 0` 必須（R=0対称軸を前提）。`r_min > 0`（円筒空洞）は将来版で対応予定（非軸内壁BCの定義が必要）。`r_min > 0` を指定した場合は `ConfigError("r_min > 0 (cylindrical cavity) is not supported in v1.0")`。放射境界は `Radiation.boundary.r_inner`（§6.4.5）で指定）
     - 2D_RZ `rectangular_rz` の場合、`r_min`, `r_max`, `z_min`, `z_max` は全て **必須パラメータ**（デフォルト値なし）であり、省略時は `ConfigError("2D_RZ requires explicit r_min, r_max, z_min, z_max")` を送出する一方、`polar_in_box` では bounding box を `r_min=0`, `r_max=box_r_max`, `z_min=box_z_min`, `z_max=box_z_max` として派生し、これらを明示する場合は相対許容差 `1e-12` 以内で一致必須。
@@ -532,6 +536,7 @@ Geometryと同じnamelist内にあるため、ユーザは “どの領域にど
   - `auto_zone: dict`（省略可）。auto_regions のアルゴリズム調整: `mass_ratio_max`（既定 1.3、>1）、`n_bridge_min/max`（2/10）、`bridge_frac_max`（0.25）、`rho_void_cut`（1e-6 g/cc）、`dr_min`（1e-8 cm）、`mass_ratio_hard_max`（2.0）、`max_iter`（30）、`bulk_mass_tol`（1e-3）。
   - `zoning_intent: dict`（省略可、**Experimental**、1D 専用）。**宣言的ゾーニング**（`core/zoning_intent`、NUMERICS §3.1.0b）: セルサイズ測度の等分配+硬い制約射影+独立検証でノード列を計算し `explicit_nodes` に格納、`nr` を自動設定する。`auto_regions` / `grid` segments と排他（`explicit_nodes` との併用は frozen 再実行のため許容 — 決定論ソルバ出力が上書き）。キー: `n_cells [int>=1 必須]`、`measure ∈ {"width","areal_mass","cylindrical_line_mass","spherical_cell_mass"}`（既定 `"width"`; `spherical_cell_mass`→`geometry_1d="spherical"` 必須、`cylindrical_line_mass`→`"cylindrical"` 必須、`width`/`areal_mass` は幾何非依存）、`pins [list[dict(r, ratio_jump_allowed)]]`（ノード厳密固定; `ratio_jump_allowed=true` で pin 跨ぎの比上限を免除）、`profile [list[dict(r, w>0)]]`（好ましいセル測度の相対形状、対数線形補間・域外は定数外挿）、`anchors [list[dict(r, half_width>0, log_amplitude)]]`（コンパクト台 cosine 核 K(u)=½(1+cos πu) を ln w に加算; 単核振幅 ≤ ln 1e4、重なり合算 ≤ ln 1e6）、`bands [list[dict(measure_frac_begin, measure_frac_end, cell_measure_min, cell_measure_max)]]`（**全域累積測度の分数**で帯を指定する Lagrangian 不変セレクタ; 帯内セルの測度上下限）、`density_regions [list[dict(r_end, rho)]]`（ゾーニング用 piecewise 一定初期密度; 質量測度で必須・最終 `r_end` は `r_max` 一致必須・境界は自動的に求積イベント化）、`extra_events [list[float]]`、`dr_min [>=0 cm]`、`cell_measure_min/max [>=0]`、`preferred_ratio`（既定 1.3、統計報告のみ）、`ratio_hard_max`（既定 2.0、**(1,2] — 2.0 はソルバ方針の不変上限**）、`min_cells_per_segment`（既定 1）。失敗は 3 クラスの安定コード付き `ConfigError`: 入力不正（`MESH_PIN_OUT_OF_DOMAIN` 等）/ 証明書付き不能（`MESH_DR_MIN_COUNT_INFEASIBLE`・`MESH_SEGMENT_MIN_COUNT_INFEASIBLE`・`MESH_CELL_MEASURE_BOX_INFEASIBLE`・`MESH_CHAIN_SUM_INFEASIBLE` = 比制約×拘束×総測度の実行可能窓 [Σ下限, Σ上限] を数値で明示）/ 数値失敗（`MESH_PROJECTION_STAGNATED`・`MESH_POSTCHECK_*` — 検証器不合格のメッシュは採用されない fail-closed）。診断は `[mesh-zoning-intent]` 行（達成比 max/mean・ソフト超過数・最小幅・求積残差）。frozen config には intent 全体と生成 `explicit_nodes` の両方が凍結される。
   - `resolution_requirement: dict`（省略可、**Experimental**、1D 専用）。**物理由来の初期メッシュ分解能要求**（`core/mesh_requirement`、NUMERICS §3.1.0c）: レーザー波形・波長・材料層・幾何からアブレート帯の面密度質量天井プロファイル・衝撃波分離天井・層あたり最小セル数を決定論的に見積もり、`validate` と run 開始時に判定する。キー: `enabled [bool, 既定 True — Laser.enabled かつ 1D のときのみ有効]`、`apply ∈ {"report","enforce"}`（既定 `"report"`: メッシュ不変・判定を記録; `"enforce"`: `zoning_intent` には推奨帯を硬い `bands` として注入、他形式は違反時に `ConfigError` `[mesh-requirement] MESH_RESOLUTION_REQUIREMENT_VIOLATED`）、`zones_per_scale_length [int>=1, 9]`、`scale_length_factor [>0, 0.12]`、`ablation_mass_safety [>0, 1.5]`、`formation_ablated_fraction [(0,1), 0.1]`、`absorbed_fraction [(0,1], 1.0]`、`shock_cells_per_separation [int>=1, 8]`、`shock_event_min_separation_frac [(0,1), 0.05]`、`min_cells_per_layer [int>=1, 10]`、`zbar_override [>=0, 0 = 自動]`、`n_bands [1..32, 6]`、`intensity_exponent [>=0, 0.4]`、`intensity_reference_W_cm2 [>0, 1e14]`。frozen config にはブロックを書いたデッキでのみ emit され、`enforce` で注入した帯は `injected_bands` に記録される。run 出力に `mesh_requirement.json`（OUTPUT_SCHEMA §1）。enforce 時、`zoning_intent.dr_min` が注入帯の許容セル幅（JSON `ablation.dr_min_admissible_cm`、各帯 `width_max_cm`）を超える場合は求解前に `MESH_RESOLUTION_REQUIREMENT_DR_MIN_CONFLICT` で拒否する（メッセージに許容値を明記）。
+    - `empirical: dict`（省略時は経験的補正なし、2026-09-08）。指定時の必須キーは `reference_sha256: str`（同梱 `mesh_convergence_reference.json` の SHA-256）、`case_ids: list[str]`（重複なしの C01–C29、1–5 件、sanity ID 不可）、`surface_ceiling_g_cm2: float` と `reference_apriori_g_cm2: float`（有限・正）。両天井の比を factor とし、上限 9.220252473467259（C28 の実測/較正天井比）。独立の書換可能な factor キーは設けない。未知キー・不正値は `MESH_EMPIRICAL_INVALID`。`enabled=True`、`apply="enforce"`、有効レーザーと質量測度の `zoning_intent` が必須。アブレーション係数と `shock_event_min_separation_frac` は既定較正値、`shock_cells_per_separation>=8`、`min_cells_per_layer>=10` を要求する。C++ 再計算の先験天井と参照値の差は 3% 以下、実天井に対する比も上限内でなければ `MESH_EMPIRICAL_APRIORI_MISMATCH`。形成・アブレート帯と検査に同じ定数天井を適用し、衝撃波帯を維持する。frozen は辞書指定時だけ全 4 キーを emit（省略時の legacy 補完は不要）。JSON は `params.empirical` に factor/cap、`ablation.apriori_ceiling_formation_g_cm2`、実条件 `experimental_conditions` を追加する。`lint-deck` が実条件から表を再評価し、値・来歴の不一致を hard lint `empirical-mesh-integrity` とする。経験的緩和の採用にはこの lint 検査が必須（SHA-256 だけでは数値の真正性を証明しない）。
   - `topology_scheme: Literal["single_block","multiblock_cart_core_polar_shell","multiblock_half_butterfly_5block","multiblock_half_butterfly_trifan_cap_5block","pentagon_belt_shell","multiblock_polar_tier","multiblock_polar_tier_cart_center"]`（既定 `"single_block"`；単位なし）。`"single_block"` は既存の単一ブロック topology。`"multiblock_cart_core_polar_shell"` は Cartesian core + Hermite bridge + polar shell topology で、equation details are in NUMERICS §3.2 and the runtime ownership/CSR layout is in ARCHITECTURE §4.2. `"multiblock_half_butterfly_5block"` は B-S1 5-block R-Z half-plane half-butterfly (central half-rect core + north/east/south angular fan blocks + polar shell); removes the square-core diagonal-corner rank-loss by replacing it with finite-valence multiblock vertices; opt-in; reuses `multiblock_cart_core_*` sizing params. B-S1 builds the in-memory block/index/node-CSR structure, production central+Coons/TFI-fan+polar-shell coordinates, face adjacency/seam tags, and additive `/mesh/topology/v3` checkpoint metadata. B-S2 retargets hydro consumers to block-role metadata, CSR lookup, and `cell_orientation_sign`, so this topology is hydro-runnable for the accepted gentle closed at-rest smoke. B-S3 seam-flux-under-gradient and B-S4 compression/PAB acceptance remain required before claiming the production compression gate. `"multiblock_half_butterfly_trifan_cap_5block"` is an S3 default-off opt-in value for the pinned tri-fan cap graft. It uses \(N_{\rm cap}=N_c\), cap cells \(4N_cN_{\rm cap}=4N_c^2\), cap nodes \(1+N_{\rm cap}(4N_c+1)\), one pinned apex at \((R,Z)=(0,0)\), first-row triangular cap cells (`cell_nverts=3`), a shared outer cap ring whose node IDs are the fan inner seam IDs, and the existing fan/shell counts. S3 T0-T5 retarget the runtime machinery to the active-slot `cell_nverts` contract: CSR remap/GCL, hydro corner/node mass, pressure force and compatible force-work, CSW AV, subzonal pressure, CFL, ALE barrier/axis/full-patch driver, and pinned-apex projection are cap-aware. The topology remains opt-in and default-off. `"pentagon_belt_shell"`（pentagon belt rings; the polar-tier transition belts share this construction machinery; NUMERICS §3.2）。 `"multiblock_polar_tier"` is the Phase III-a default-off exact-polar center: shell \(N_\theta\), regular 2:1 tiers down to `polar_tier_min_tier_columns`, five-triangle Chebyshev-center belts, and an origin fan. It requires `logical_mesh_2d="spherical_polar_halfplane"` with the canonical equiangular theta ladder, uses mixed `cell_nverts`, all-positive orientation, bitwise north/south mirrors, and `/mesh/topology/v3`; Phase III-a is construction-only and hydro is rejected unless the explicit phase gate is enabled. `"multiblock_polar_tier_cart_center"` is the EQR hybrid (2026-08-21, W3a/b config-side only): a VALID full `multiblock_polar_tier` config plus an integer cut ring — the polar-tier layout truncated at `polar_tier_cart_cut_ring` (keep shell + tier rows/belts wholly at rings ≥ cut; drop fan + everything below) with a Cartesian core box + bridge complex joining at the cut ring (derived `n_c = N_theta(cut)/4`; cart seam radius = realized `r_cut`, never `r_match`). All parent polar-tier validation applies unchanged. As of W3c (2026-08-21) mesh CONSTRUCTION is supported for plain and dendrite parents (`PolarTierLayout` の ring/block schedule descriptor 駆動; kept polar chain + `BRIDGE` + `CENTRAL_CORE`, `/mesh/topology/v3` 読み書き対応、block count = truncated + 2)。`polar_tier_center_kind="trifan_cap"` は bridge 内側だけを pinned-apex equiangular tri-fan cap に置換し、kept polar chain と bridge 外側 seam は変更しない。制約: `multiblock_cart_core_bridge_grading="uniform"` と `multiblock_transition_scheme="hermite_bridge"` のみ (他は `ConfigError`)、`shell_polar_cap_dendrite=true` との併用は svec shell-chain 一般化 wave まで fail-loud 拒否。hydro は親と同一 gate (`polar_tier_hydro_enabled` + mixed-cell force trio) の下でも**未資格** — construction/checkpoint/t=0 出力のみが本 wave の範囲。
   - `pentagon_belt_layers: list[int]` (default `[]`; valid only with `topology_scheme="pentagon_belt_shell"`). The list contains node-ring indices \(b_j\), must be non-empty, strictly increasing, contain at most four entries, and satisfy \(1\le b_j\le nr-2\). For \(K=\mathrm{len}(\texttt{pentagon_belt_layers})\), `nz` must be divisible by \(2^K\) and `nz >> K >= 4`. The belt scheme requires `logical_mesh_2d="spherical_polar_halfplane"` and `polar_center_treatment="annular"`. Uniform-\(\theta\) and `polar_equal_mu_zoning` ladders are accepted; `explicit_nodes_theta`, `grid_segments_theta`, and Radiation `mode="sn_transport"` are staged and rejected.
   - `multiblock_cart_core_r_c: float` [cm]（既定 \(S_{\max}/12\)；有効範囲：`>0` かつ `sqrt(2)*r_c < multiblock_cart_core_r_match`）。Cartesian half-core の半幅。`topology_scheme="multiblock_cart_core_polar_shell"`、`"multiblock_half_butterfly_5block"`、または `"multiblock_half_butterfly_trifan_cap_5block"` の場合のみ有効で、`single_block` または省略時に指定すると `ConfigError`。`"multiblock_polar_tier_cart_center"` でも必須だが、検証は `sqrt(2)*r_c < r_cut`（`r_cut` = cut ring の実現半径。`r_match` ではない）。
@@ -710,7 +715,7 @@ Mesh(
 - 1D_SPH 専用。2D_RZ で指定した場合はエラー
 - **graded 格子の検証規則**：
   - **単調性**：各区間は `r_start < r_end` かつ `nr > 0`
-  - **境界連続性**：隣接区間の境界は `|r_end[k] - r_start[k+1]| < 1e-14 * r_max` 以内で一致すること
+  - **境界連続性**：隣接区間の境界は `|r_start[k+1] - r_end[k]| <= 1e-12 * max(1, r_end[k])` 以内で一致すること（超えると `ConfigError`）
   - **パラメータ範囲**：`edge_ratio ∈ (0,1)`, `sg_sigma ∈ (0,1)`, `sg_order` は偶数かつ `≥ 2`
   - **可解性**：ある区間が両隣境界の目標セル幅を同時に満たせないほど少ないセル数しか持たない場合はエラー
 
@@ -754,7 +759,7 @@ Mesh(
     - `max_iterations: int`（既定 20；有効範囲：`≥ 1`；2D Winslow 平滑化の最大反復回数。NUMERICS §3.3.3）
     - `max_displacement_fraction: float`（既定 0.5；有効範囲：`(0, 1]`；rezone 1回あたりのノード最大変位量）
     - `convergence_tol: float`（既定 `1e-6`；有効範囲：`> 0`；2D Winslow 平滑化の収束許容誤差）
-    - `swept_volume_sign_fixed: bool`（既定 True；True では post-2026-05-11 の corrected ALE swept-volume sign convention を swept-volume primitive at source に適用し、donor/flux/intermediate-volume/MS2 moment/axis-band remap の符号を統一する。False では pre-fix legacy convention を bit-exact に保持する。legacy behavior requires `Numerics.profile.legacy_regression@2026-07-27` or an explicit False。旧 `donor_sign_fixed` は deprecated alias として受理し WARNING を出す。CSR total-energy remap では effective convention が `swept_volume_sign_fixed || total_energy_remap_2d_rz` となり、fixed convention と CSR hydro mass-positivity limiter が有効になる。物理的解釈は NUMERICS.md §3.3.4 "Swept-volume convention (post-2026-05-11 fix)" 参照。Experimental migration gate）
+    - `swept_volume_sign_fixed: bool`（既定 True；True では post-2026-05-11 の corrected ALE swept-volume sign convention を swept-volume primitive at source に適用し、donor/flux/intermediate-volume/MS2 moment/axis-band remap の符号を統一する。**False は `ConfigError`**（旧規約は 2026-08-05 に削除 — "legacy swept-volume sign convention removed 2026-08-05 (epoch 2)"）。このため旧規約を固定する `Numerics.profile.legacy_regression@2026-07-27` も、有効にするとどの設定でも `ConfigError` になり使えない。旧 `donor_sign_fixed` は deprecated alias として受理し WARNING を出す。CSR total-energy remap では effective convention が `swept_volume_sign_fixed || total_energy_remap_2d_rz` となり、fixed convention と CSR hydro mass-positivity limiter が有効になる。物理的解釈は NUMERICS.md §3.3.4 "Swept-volume convention (post-2026-05-11 fix)" 参照。Experimental migration gate）
     - `remap_limiter: Literal["van_leer","minmod"]`（既定 `"van_leer"`）
     - `remap_ms_midpoint: bool`（既定 False）
     - `remap_ms_post_check: bool`（既定 False）
@@ -847,7 +852,7 @@ Mesh(
     - `euler_window.feather_min_layers: int` / `euler_window.guard_layers: int`（defaults `3` / `1`; the feather must span ≥ this many complete structural layers（and ≥ `transition_width`, and per-edge χ jump ≤ 0.5 — extended outward until all three hold, ConfigError if the tier region is exhausted）; the guard is reserved for the Stage-4 respace-suppression halo）
     - `euler_windows: list[dict]`（default `[]`; N additional windows, each with the same keys/validation as `euler_window` incl. per-window time gates. Effective set = legacy `euler_window` (if enabled) + enabled list entries; per-node blend weight is the max over time-active windows (C0 at overlaps — merge overlapping windows by hand). Motivating use: protecting all four polar-tier transition belts（W1 2026-07-30））
     - `euler_window.axis_core_transaction_mode: str`（default `"static"`; allowed `{"static", "always_moving", "clearance_replay"}`. `"static"` keeps the full initial-grid restore unchanged. `"clearance_replay"` is the consult-17 Rank-2 active contracting-core pilot: it consumes a prescribed shell-front table, advances the predictive STATIC→SPLICING→TRACKING controller every hydro step, and sends a radial projected-homothety target through the existing admissibility backtrack and conservative remap. Non-static modes require `enabled=True`, `role="axis_survival_core"`, and reject restart in v1. The removed legacy value `"follow_repair"` remains invalid.）
-    - `euler_window.replay_table_path: str`（default `""`; required and non-empty for `axis_core_transaction_mode="clearance_replay"`. Path is resolved relative to the namelist source directory. The file is raw TSV with exactly `step\tt\ts_f\tU_f` per row, at least two rows, finite positive (s_f), strictly increasing (t), and monotone non-increasing (s_f). The raw bytes are FNV-1a-64 hashed into the active manifest.）
+    - `euler_window.replay_table_path: str`（default `""`; required and non-empty for `axis_core_transaction_mode="clearance_replay"`. A relative path is resolved against the process working directory at launch (see §6.2). The file is raw TSV with exactly `step\tt\ts_f\tU_f` per row, at least two rows, finite positive (s_f), strictly increasing (t), and monotone non-increasing (s_f). The raw bytes are FNV-1a-64 hashed into the active manifest.）
     - `euler_window.replay_tau_lead: float`（default `4.5e-12` s; finite and `>0`; predictive trigger lead time）
     - `euler_window.replay_tau_splice: float`（default `1.4e-12` s; finite and `>0`; quintic velocity-splice duration）
     - `euler_window.replay_beta: float`（default `1.0`; finite and `>=0`; nominal protected-window/shell inward-speed ratio）
@@ -1078,14 +1083,15 @@ Mesh(
     - `rho_floor_gcc: float`（既定 `1e-10`；密度下限 [g/cm³]。有効範囲：`> 0`。NUMERICS §1.1.7参照）
     - `Te_floor_eV: float`（既定 `1e-3`；電子温度下限 [eV]。有効範囲：`> 0`。`Numerics.positivity.Te_min_eV`（非推奨エイリアス）も指定された場合は `max(Te_floor_eV, Te_min_eV)` を適用）
     - `Ti_floor_eV: float`（既定 `1e-3`；イオン温度下限 [eV]。有効範囲：`> 0`）
-    - `Numerics.floors` も同じ 3 キーを受け付け、ソルバーが使う同じ値を書き換える（`Mesh.floors` もその値へ書き写す）。両方に書くと namelist で後に呼ばれたブロックの値が使われるので、どちらか一方（推奨は `Mesh.floors`）だけに書く
+    - 3 つとも `<= 0` は `ValueError`（2026-09-29 から。それまでは 0 を受理していた）
+    - `Numerics.floors` も同じ 3 キーを受け付け、ソルバーが使う同じ値を書き換える（`Mesh.floors` もその値へ書き写すので、凍結設定には実際に使った床が残る。2026-09-29 から — それまでは凍結設定に `Mesh.floors` の既定値が残っていた）。両方に書くと namelist で後に呼ばれたブロックの値が使われるので、どちらか一方（推奨は `Mesh.floors`）だけに書く
 
 #### 6.4.3 Materials(...)
 Materialsは `Material(...)` の配列を受け取る。
 
 - `materials: list[Material]`
 - `mixture: dict`
-  - `fractions: Literal["volume","mass"]`（既定 `"volume"`；Geometry の `volfrac` 関数が返す値の解釈を制御。`"volume"` = 体積分率、`"mass"` = 質量分率。NUMERICS §1.1.5参照）
+  - `fractions: Literal["volume","mass"]`：**受理するが使わない**（WARNING を出す）。Geometry の `volfrac` 関数が返す値は常に体積分率として読む（NUMERICS §1.1.5 (c)）
   - `opacity_mix_rule: Literal["linear_mass","harmonic_mass_R","max"]`（既定 `"linear_mass"`。実装状態 2026-08-31: 定数 κ 材料のみのデッキでは per-cell 混合は体積分率線形加重で Planck/Rosseland 同値（NUMERICS §2 の doc-truth 注記参照; 1D_SPH FLD への per-cell 配線は 2026-08-29 追加 — それ以前は先頭非 void 材料の κ が全セルに適用されていた）。テーブル不透明度を含む多材料 1D_SPH FLD デッキは材料別テーブル評価 — 純セルは支配材料のテーブルを (ρ,T_e) 補間、混合セルは質量分率重み×部分密度評価の厳密合成（NUMERICS §1.1.5 第 3 段）。1D_SPH×radiation 有効×多材料デッキの opacity.model は `constant`/`none`/`tmat` に加え 2026-09-24 から `table_nlte`（`ionmix` を含む）・`power_law`・`freq_dep_marshak` も材料ごとに評価して受理（非 NLTE の材料は混合セル用カーネル `eval_opacity_multimat_kernel`、NLTE の表は材料ごとの NLTE 係数起動。材料が複数あるとき Fleck 線形化はどれかの材料が使えば実行全体で有効で、`freq_dep_marshak` のセルも共有カーネルの Fleck 因子を使う。`sn_transport` も 2026-09-24 から同じ 6 モデルの多材料デッキを受理: 吸収・放射不透明度は同じ混合カーネル（`"harmonic_mass_R"` は Rosseland だけを変えるので S_N の吸収は線形と同じ）、物理散乱は各材料の `kappa_s`（表は 0）の質量分率線形和、NLTE の表が支配するセルはその材料の NLTE 係数、物質温度の Newton は各セルの材料の電子 EOS 表と `cv_e_override`。NUMERICS §6.8）。**3 値とも実装（2026-09-24、1D のみ）**: `"linear_mass"` は Planck・Rosseland とも線形、`"harmonic_mass_R"` は Planck 線形・Rosseland 調和（各材料の \(\kappa_R\) を \(10^{-20}\) cm²/g で下限）、`"max"` は両方とも存在する材料の最大値。重みはテーブルが質量分率×部分密度、定数は質量分率（材料別質量が無ければ体積分率）。2D で `"linear_mass"` 以外は `ConfigError`（2D は線形のみ）、その他の値も `ConfigError`（2026-09-23 までは `"linear_mass"` 以外を拒否、それ以前はどの値も受理して無視していた））
     - **混合則の数式**（NUMERICS §1.1.5 (c) に対応）：
       - `"linear_mass"`（Planck用）：\(\kappa_P = \sum_\alpha f_{m,\alpha}\,\kappa_{P,\alpha}\)
@@ -1093,21 +1099,28 @@ Materialsは `Material(...)` の配列を受け取る。
       - `"max"`：\(\kappa = \max_\alpha(\kappa_\alpha)\)
     - ここで \(f_{m,\alpha}\) は材料 \(\alpha\) の質量分率、\(\kappa\) は質量不透明度 [cm²/g]
     - **Non-LTE 混合則**（M17: `opacity.model="table_nlte"` 時）：\(\kappa^{PA}\) と \(\kappa^{PE}\) はそれぞれ `linear_mass` を適用（吸収・放射とも additive）、\(\kappa_R\) は `harmonic_mass_R` を適用（ARCHITECTURE §4.3.3 参照）
-  - `eos_mix_rule: Literal["mass_weighted_same_state"]`（既定：全材料が同一(ρ,Te,Ti)を共有し、質量分率でe,Pを加重平均。NUMERICS §1.1.5 (c) 参照）
-    - `"mass_weighted_same_state"`：\(P_{mix} = \sum_\alpha f_{m,\alpha}\,P_\alpha(\rho, T)\)。v1.0唯一の選択肢。`"pressure_equilibrium"` は将来版で追加予定
-  - **多材料エネルギー混合則**：\(e_{k,mix} = \sum_\alpha f_{m,\alpha}\,e_{k,\alpha}(\rho, T_k)\)、\(C_{v,mix} = \sum_\alpha f_{m,\alpha}\,C_{v,\alpha}\)（\(k = e, i\)）
+  - `eos_mix_rule`：**受理するが使わない**（WARNING を出す）。多材料セルは材料の EOS を混ぜず、各セルをその支配材料
+    （体積分率が最大の非 void 材料）の EOS で閉じる。理想気体の材料のセルは、その材料の理想気体を下のセル実効量
+    \(A_{eff}\)・\(\gamma_{eff}\) で閉じる。質量分率で \(e, P, C_v\) を平均する混合 EOS と材料間の圧力平衡は無い（NUMERICS §1.1.5 (c)）
   - **伝導/ソース結合のセル実効量（固定仕様、追加キーなし）**（NUMERICS §1.1.5a）：
     - \(A_{eff} = (\sum_\alpha f_\alpha/A_\alpha)^{-1}\)（体積分率調和平均）
     - \(\gamma_{eff} = \sum_\alpha f_\alpha \gamma_\alpha\)（体積分率線形平均）
     - \(n_e = \rho \bar{Z}/(A_{eff}m_p)\)
     - \(c_{v,e} = \bar{Z}k_B/(A_{eff}m_p(\gamma_{eff}-1))\)、\(c_{v,i} = k_B/(A_{eff}m_p(\gamma_{eff}-1))\)
     - `n_mat == 1` では \(A_{eff}=A_0,\ \gamma_{eff}=\gamma_0\)
+- `opacity_mix_rule`：`mixture.opacity_mix_rule` と同じ（`Materials` の直下にも書ける）
+- `low_density_extrapolation: bool`（既定 `False`；True のとき、表の密度の下限より低い密度の電子 EOS を表の端にクランプせず、
+  解析的な理想気体の電子 EOS（\(c_v = \tfrac32 \bar Z k_B/(A m_p)\)、\(e = c_v T\)、\(P=\tfrac23\rho e\)）で評価する。
+  S\(_N\) の物質 Newton と 2D の ALE 後の再閉包などが使う。NUMERICS §1 の `eos_use_low_density_extrapolation` 参照）
 - `zbar: dict`（平均電離度 \(\bar{Z}\) モデル。NUMERICS §1.1.4参照）
   - `model: Literal["fixed","thomas_fermi","tabular"]`（既定 `"fixed"`）
   - `"fixed"`：\(\bar{Z} = Z\)（各Materialの `Z` パラメータを使用。完全電離仮定。
-    多材料時は材料別 Z̄_α = Z_α を混合平均して Z̄_eff を算出、CUDA_KERNELS §7.6 参照）
+    多材料時は材料別 Z̄_α = Z_α をイオン数の重み \(f_\alpha/A_\alpha\)（void を除く）で平均する。`fixed_value` を指定すると
+    全材料・全非 void セルの \(\bar Z\) をその 1 値にする。fixed の \(\bar Z\) は初期化時に決め、ステップごとには更新しない。CUDA_KERNELS §7.6 参照）
+  - `fixed_value: float`（既定 `-1` = 未指定；`model="fixed"` のとき、`>= 0` なら全材料・全非 void セルの \(\bar Z\) をこの値にする（材料の `Z` は使わない）。SESAME の 304 表が無い材料の電子分割にも使う）
+  - `thomas_fermi`・`tabular` の多材料セルも材料ごとの \(\bar Z_\alpha\) を同じイオン数の重みで平均する（2026-09-29 から。それまでは体積分率だけの重みだった。NUMERICS §1.1.5a）
   - `"thomas_fermi"`：More (1985) Table IV の Thomas–Fermi 電離度フィット（相似変数 \(\rho/(ZA)\)、\(T_e/Z^{4/3}\)）により \(\bar{Z}(\rho, T_e)\) を動的計算（2026-09-23 に水素等価変数の旧式から変更; NUMERICS §1.1.4）
-  - `"tabular"`：IONMIXテーブルから \(\bar{Z}(\rho, T_e)\) を補間取得。IONMIXソースの優先順位: (1) `eos.model="ionmix"` の `eos.file`、(2) `opacity.model` が `"table_nlte"` または `"ionmix"` の `opacity.file`、(3) `Materials.zbar.table_file`
+  - `"tabular"`：IONMIX または TMAT の表から \(\bar{Z}(\rho, T_e)\) を補間取得。ソースの優先順位: (1) `eos.model` が `"ionmix"` または `"tmat"` の `eos.file`、(2) `opacity.model` が `"table_nlte"`・`"ionmix"`・`"tmat"` の `opacity.file`、(3) `Materials.zbar.table_file`（`.tmat.h5` で終われば TMAT として読む）。どれも無ければ `ConfigError`
   - `table_file: Optional[str]`（`model="tabular"` 時のフォールバック用IONMIXファイルパス。`eos.model="ionmix"` や `opacity.model="table_nlte"/"ionmix"` が設定されていない場合に使用。NUMERICS §1.1.5 (b) 参照）
 - `void_config: dict`（void材料のデフォルト物理量。`is_void=True` の材料を持つセルに適用）
   - `rho: float`（既定 `1e-10`；void セル密度 [g/cm³]）
@@ -1116,8 +1129,8 @@ Materialsは `Material(...)` の配列を受け取る。
 
 `Material(...)`：
 - `name: str`（例 `"CH"`, `"DD"`）。Material 名は一意でなければならない。重複時は `ConfigError("Duplicate material name: {name}")` を送出。
-- `A: float`（平均原子量 [amu]；有効範囲：`> 0`。例：DT=2.5、CH=6.5）
-- `Z: float`（平均原子番号 or 代表値 [無次元]；有効範囲：`> 0`、`Z ≤ A` 推奨。`zbar.model="fixed"` の場合にそのまま \(\bar{Z}\) として使用。`zbar.model="thomas_fermi"` または `"tabular"` の場合は初期推定値のみ）
+- `A: float`（イオン 1 個あたりの平均質量 [amu]（分子量ではない）；有効範囲：`> 0`。例：DT=2.5、CH=6.5、D2=2。TMAT の表を使う材料では、ファイルの平均イオン質量と 5 % 以上違うと `ConfigError`、1 % 以上で WARNING（表の密度軸はイオン数密度で、`A` で換算するため。2026-09-29 から検査））
+- `Z: float`（平均原子番号 or 代表値 [無次元]；有効範囲：`>= 0`（void 材料の既定が 0）、`Z ≤ A` 推奨。`zbar.model="fixed"` の場合にそのまま \(\bar{Z}\) として使用。`zbar.model="thomas_fermi"` または `"tabular"` の場合は初期推定値のみ）
 - `is_void: bool`（既定 `False`；`True` の場合、この材料は真空（void）として扱われる。EOS/opacity テーブルの読み込みをスキップし、`eos.model="ideal_gas"`, `opacity.model="constant"`, `kappa_a=0`, `kappa_s=0`, `A=1`, `Z=0` がデフォルトで適用される。void材料は `materials[0]`（先頭）に配置不可（`ConfigError`）。少なくとも1つの非void材料が必須。§6.4.4 `cell_is_void` 参照）
 - `eos: dict`
   - `model: Literal["sesame","ionmix","tmat","ideal_gas","power_law_te"]`（既定 `"ideal_gas"`）
@@ -1130,9 +1143,11 @@ Materialsは `Material(...)` の配列を受け取る。
   - `sesame_material_id: Optional[int]`（SESAME 材料番号。`model="sesame"` の場合は必須。例：CH=7593, DT=5265。xSESAME ファイル内の材料 ID と一致すること。不一致時は `ConfigError("SESAME material ID {id} not found in {file}")`）
   - `sesame_cold_curve_rows: int`（既定 `12`；有効範囲 `[0, 60]`；SESAME 表の T = 0 行（cold curve）を保持し、最初の正の等温線との間を T について線形に補間する合成行の本数（\(T_k=T_1/2^k\)）。0 で従来どおり T ≤ 0 の行を捨てる（低温状態は最初の正の等温線へクランプ）。NUMERICS §1 (b) 参照）
   - `cold_reference: dict`（低温平衡構成則の参照状態。`rho_gcc: float`（必須 >0）/ `Te0_eV: float`（必須 >0）/ `Ti0_eV: float`（必須 >0）/ `P0_dyn_cm2: float`（既定 `0.0`；参照全圧）/ `bulk_modulus_dyn_cm2: float`（必須 >0；参照体積弾性率 \(K_0\)）。`Numerics.hydro.T_start_inactive_cells="cold_equilibrium"` のとき全非 void 材料で必須。表の圧力 \(P_N(v)=P_i(v,T_{i0})+P_e(v,T_{e0})\) と参照枝 \(P_{cold}(v)=P_0+K_0(v_0/v-1)\) の差の積分 \(C(v)\) が電子側の自由エネルギー補正になる（NUMERICS §1 (b)）。凍結出力では `cold_reference` dict（`enabled` 付き）として書き出す。文献値の例: 液体 D2（19 K）\(K_T=1.2\times10^9\)、ポリスチレン（極低温）\(K_S=5.8\times10^{10}\) dyn/cm²）
-  - `sesame_format: Literal["ascii"]`（既定 `"ascii"`。xSESAME ASCII 形式。v1.0 では唯一のオプション）
-  - `sesame_table_total: int`（既定 301。SESAME total EOS テーブル番号）
-  - `sesame_table_electron: int`（既定 304。SESAME 電子 EOS テーブル番号。-1 を指定した場合は 1T フォールバック：\(P_e = P_{total} \times \bar{Z}/(1+\bar{Z})\)）
+  - `sesame_format`・`sesame_table_total`・`sesame_table_electron`：**受理されない**（未知のキーとして `ConfigError`）。
+    表番号は固定で、301（全体）と 304（電子）を読む。イオンの表は読み込み時に 301 と 304 の差を 301 の格子の上で作る
+    （差が負の節点はクランプせず保持し、数を 1 回警告する）。ファイルに 304 が無い材料は、301 を節点ごとに
+    \(\bar Z/(1+\bar Z)\) で電子とイオンに分ける — \(\bar Z\) はその材料の `Materials.zbar.model`（fixed は `fixed_value`
+    または材料の `Z`、thomas_fermi、tabular）で評価する（2026-09-29 から。それまでは \(\bar Z=0\) で分け、電子の表が 0 になっていた。NUMERICS §1.1.5）
   - `hydro_backend: Literal["legacy","helmholtz_spline","helmholtz_jet","exact_ideal_gas","rho_e_table","mie_gruneisen"]`（既定 `"legacy"`。Hydro 専用 EOS backend 選択。`"legacy"` は既存の raw `P/e/c_v` テーブルを \((\log\rho,\log T)\) 双線形補間して `e→T` を単調探索で反転する経路、`"helmholtz_spline"` は**互換 key 名**で、実装は raw `total` EOS の `P(\rho,T), e(\rho,T)` を **shape-preserving C¹ tensor-product bicubic Hermite** surrogate に変換し、hydro に効く total pressure / total energy / sound speed をその解析的導関数から評価する。`"helmholtz_jet"` は raw `total` EOS から \(\phi=F/T\) の局所 projected jet を構築し、各セルを biquintic Hermite patch で補間する backend で、nodal \((\phi,\phi_x,\phi_y,\phi_{xx},\phi_{yy},\phi_{xy})\) を用いて total pressure / total energy / sound speed を導出する。`"exact_ideal_gas"` は **1D_SPH 限定の診断 backend** で、raw table は upload したまま 1D hydro kernel 内の EOS closure / sound speed のみを解析 ideal gas
     \[
     T = e/c_v,\qquad P = (\gamma-1)\rho e,\qquad c_s^2 = \gamma P/\rho
@@ -1163,13 +1178,13 @@ Materialsは `Material(...)` の配列を受け取る。
     - IMC Fleck factor (`compute_fleck_kernel`) consumes `state.cv_e` for \(C_{v,e}\). FLD grey/constant-opacity Fleck uses the dedicated `compute_fleck_for_fld` kernel, distinct from the IMC-shared kernel because FLD stiff-cell behavior requires no \(\beta\le1\) cap and no `f_min_fleck` floor.
     - \(Q_{ei}\) exchange uses `compute_qei_term_with_cv` when `cv_e/cv_i` are available from the active hydro-EOS path / source-side thermo refresh.
 - `opacity: dict`
-  - `model: Literal["ionmix","sesame","constant","table_nlte"]`（既定 `"ionmix"`。**推奨構成**: `eos.model="sesame"` + `opacity.model="ionmix"`。SESAME opacity（テーブル502/505）は grey のみのため、多群輸送には IONMIX opacity を推奨。Non-LTE は `"table_nlte"` を使用）
+  - `model: Literal["ionmix","sesame","constant","freq_dep_marshak","table_nlte","tmat","power_law","none"]`（既定 `"constant"`。`"sesame"` は未実装で `ConfigError`。多群輸送には `"tmat"` または `"ionmix"`/`"table_nlte"` の表を使う。`"freq_dep_marshak"` は周波数依存の Marshak 検証問題用の解析不透明度）
   - `"ionmix"`：IonMixテーブルファイルから読み込み（多群 κ_P, κ_R）。**実装状態（2026-09-24）**: LTE の IONMIX 表として `"table_nlte"` と同じ表の経路で評価する（表の放出不透明度が吸収不透明度と一致しない＝非 LTE の表は `ConfigError` — その場合は `"table_nlte"` を使う）。`opacity.file` を省略したとき `eos.model="ionmix"` なら `eos.file` を使う。frozen 設定には `opacity_model="table_nlte"` と `opacity_lte_required=true` が記録される。以前は実行時に拒否していた
   - `"sesame"`：SESAME テーブル 502（Rosseland mean）/ 505（Planck mean）から読み込み。grey のみ（全群同一値）。xSESAME ファイルに 502/505 テーブルが含まれない場合は `ConfigError("SESAME opacity tables (502/505) not found")`。**実装状態（2026-09-24）**: 未実装で `ConfigError`（リポジトリに検証用の SESAME 不透明度データが無い）
   - `"constant"`：一定不透明度（検証テスト用）
     - `kappa_a: float` -- 吸収不透明度 [cm²/g]（`model="constant"` の場合は必須）
     - `kappa_planck: Optional[float]` -- Planck-mean constant override [cm²/g] (default: unset; when unset the Planck constant follows `kappa_a`; Rosseland stays `kappa_a`)
-    - `kappa_s: float` -- 散乱不透明度 [cm²/g]（既定 0.0）
+    - `kappa_s: float` -- 散乱不透明度 [cm²/g]（既定 0.0。S\(_N\) だけが使う。`Radiation.mode="multigroup_diffusion"` で `> 0` は `ConfigError`（FLD は散乱を持たない。2026-09-29 から — それまでは 0 として走っていた））
     - 群依存性なし（全群同一値）
     - Rosseland/Planck 区別なし（κ_R = κ_P = kappa_a）
   - `"power_law"`（2026-07-10 導入、Hammer–Rosen gate 用の解析冪乗 opacity）:
@@ -1178,10 +1193,10 @@ Materialsは `Material(...)` の配列を受け取る。
     - **grey 専用（v1）**: 放射群数 ≠ 1 は `ConfigError`。評価は FLD/S_N の opacity floor/cap（§6.4.5）でクランプ。Fleck 機構上は constant と同格（NUMERICS §6.7）
   - `"table_nlte"`（M17）：Non-LTE テーブル駆動。IONMIX .cn4 ファイルの3種不透明度（Rosseland, Planck absorption, Planck emission）を読み込み、\(\kappa^{PA} \neq \kappa^{PE}\) によるnon-LTE放射輸送を実現（§5.2.1、NUMERICS §6.1.1 参照）
     - `file: str`（必須。IONMIX .cn4 ファイルパス。最低2テーブル（Rosseland + Planck absorption）必須。Planck emission テーブル不在時は LTE フォールバック — §6.4.3 IONMIX 参照）
-    - `lambda_method: Literal["finite_difference", "freeze_opacity"]`（既定 `"finite_difference"`。**後方互換用の no-op**。separate-emissivity 実装では runtime で無視される）
+    - `lambda_method: str`（**効果なし**。退役したモンテカルロ輻射の Non-LTE Fleck 因子の設定。2026-09-29 から Builder は受理して無視し、Config と frozen config にも入れない。既存デッキが書く旧既定 `"finite_difference"` は黙って受理し、それ以外の値は WARNING）
     - `lambda_fd_delta_rel: float`（既定 1e-4。**後方互換用の no-op**）
     - `lambda_fd_abs_min: float`（既定 1e-6 eV。**後方互換用の no-op**）
-    - `f_min: float`（既定 1e-4。**後方互換用の no-op**。`table_nlte` / `tmat` の Fleck は \(\sigma_{p,em}\) から一意に決まる）
+    - `f_min: float`（**効果なし**。退役したモンテカルロ輻射の Non-LTE Fleck 因子の下限。扱いは `lambda_method` と同じ — 旧既定 1e-4 は黙って受理し、それ以外の値は WARNING。`table_nlte` / `tmat` の Fleck は \(\sigma_{p,em}\) から一意に決まる）
     - `tmat_kirchhoff_pe: bool`（既定 `False`。`model="tmat"` 専用。`True` で TMAT 読み込み時に全ノード・全群で \(\kappa^{PE}:=\kappa^{PA}\)（Kirchhoff の法則）— PROPACEOS 由来の表の Wien 裾の \(\kappa^{PE}\) 異常（アンダーフロー・10³ 倍の過大値）で Fleck 因子が桁跳びし FLD 外側反復が収束しない場合の対策。§9.1 の TMAT 項と NUMERICS §2 [2026-09-14 追補 2] 参照）
   - **非推奨（DEPRECATED）**：旧名称 `"none"` は `"constant"` + `kappa_a=0` と等価。`"none"` はv1.0では**非推奨**であり、将来バージョンで削除予定。
     `"none"` は v1.0 で受理されるが `WARNING: opacity.model="none" is deprecated, use model="constant" with kappa_a=0` を出力する。
@@ -1412,20 +1427,15 @@ Material(
 > ただし、材料を分けた密度（部分密度）を与えたい場合は `rho` を省略して `rho_partial[mat]` を与える拡張を将来追加可能（v1.0は非対応）。
 
 #### 6.4.5 Radiation(...)
-- `enabled: bool`（既定 True；False の場合：transport 不実行、`rad_dep=0`、`dt_rad=∞`、全群 \(E_g=0\) 固定。DDMC/IMC 設定は無視される）
-- `mode: Literal["imc_ddmc","multigroup_diffusion","sn_transport"]`（既定 `"multigroup_diffusion"`；DEFAULT-FLD: FREEZE-1D-RAD/FLD-FIX-1 後、既定は deterministic FLD に変更した。`"imc_ddmc"` は従来の IMC/DDMC/PGRW/HOLO/difference 経路。`"multigroup_diffusion"` は 1D_SPH/2D_RZ CUDA FLD 経路。`"sn_transport"` は 1D_SPH/2D_RZ CUDA pure \(S_N\) 経路。FLD/S_N mode は IMC/DDMC/HOLO/difference を完全に bypass し、`imc.enabled=False`, `ddmc.enabled=False`, `holo.enabled=False`, `imc.difference.enabled=False` が必須で、違反時は `ConfigError`。`Main.dimension` により 1D_SPH と 2D_RZ の dispatch を自動選択する）
-  - `mode` 省略時の DEFAULT-FLD では、省略された `imc` / `ddmc` subblock は無効として解釈する。従来 IMC/DDMC を使う namelist は `mode="imc_ddmc"` を明示する。
-  - **1D_SPH 制限**: `Main.dimension="1D_SPH"` の場合、`mode` は
-    `"multigroup_diffusion"` または `"sn_transport"` のみ受理する。`"imc_ddmc"`
-    を 1D_SPH と組み合わせると `ConfigError`。2D_RZ では全モードが利用可能。
-  - `Radiation.imc` / `.ddmc` / `.holo` は internal/test-only mode 用の互換 subblock である。production namelist ではこれらを設定せず、`multigroup_diffusion` または `sn_transport` の mode 専用 subblock を使う。
-- `origin_parity_only: bool`（既定 False；1D_SPH \(S_N\) 原点境界の調査用互換フラグ。現行 CPU/GPU \(S_N\) sweep は既に \(r=0\) parity 境界 \(\psi(0,+|\mu|)=\psi(0,-|\mu|)\) として実装されているため、このフラグは輸送式を変更しない。NUMERICS §8 参照）
+- `enabled: bool`（既定 True；False の場合：transport 不実行、`rad_dep=0`、全群 \(E_g=0\) 固定）
+- `mode: Literal["multigroup_diffusion","sn_transport"]`（既定 `"multigroup_diffusion"`。`"multigroup_diffusion"` は 1D_SPH/2D_RZ の CUDA FLD、`"sn_transport"` は 1D_SPH/2D_RZ の CUDA pure \(S_N\)。`Main.dimension` で 1D_SPH と 2D_RZ の解法を選ぶ。`"imc_ddmc"`（IMC・DDMC・PGRW・HOLO・difference 定式化のモンテカルロ輻射）は 2026-07-10 に凍結、2026-09-29 にビルドから外した（`retired/radiation_monte_carlo/`。最後にビルドできた状態は同ディレクトリの README）。指定すると `ConfigError`（`Radiation.enabled` によらない。それまでは輻射が無効なら受理していた））
+- `origin_parity_only: bool`（**効果なし**。読んでいたのは退役したモンテカルロ輻射の HOLO \(S_N\) 閉包（CPU の 1D \(S_N\)）だけで、現行の GPU \(S_N\) sweep は \(r=0\) を parity 境界 \(\psi(0,+|\mu|)=\psi(0,-|\mu|)\) として常に扱う。2026-09-29 から Builder は受理して無視し（True は WARNING）、frozen config にも入れない。NUMERICS §8 参照）
 - `group_repack_hard_xray: bool`（既定 False；True の場合、既存群数を維持したまま runtime の群境界を hard-X-ray 用に再配置する。80群では 2--5 keV 帯に 20 群以上を割り当て、table opacity は新しい群代表エネルギーへ再標本化される。False では従来通り input table または user 指定の群境界を用いる。NUMERICS §0.3 参照）
 - `diagnose_hard_xray_opacity: bool`（既定 False；True の場合、起動時に一度だけ CD material の \(\kappa^{PA}\) hard-X-ray audit を `[hard_xray_opacity_diag]` として出力する。診断のみで opacity table は変更しない。NUMERICS §0.3 参照）
-- `volume_source_rate: float`（既定 `0.0` [erg/(cm³ s)]；外部輻射体積線源（Su-Olson 級）の一定注入率。IMC では particle source として、1D_SPH `multigroup_diffusion` では W-B 実装の FV RHS source として消費する。1D_SPH FLD では `groups=1` 限定（多群は `ConfigError`）。注入エネルギーは step energy budget の `volume_in`（FLD: `fld_volume_source_in_step`）に計上。NUMERICS §6.7 1D_SPH 体積線源参照。**1D_SPH `sn_transport` でも利用可（2026-08-31 検証済み）**: sweep の等方 scalar source（S/2）+ Newton 閉包の S·Δt 注入で、独立 S₈ 離散化（`tools/su_olson_sn_reference.py`）と一致（ξ=0.01/1.0/3.16 で 0.15%/4.8%/2.3%、Δt=3.33e-13 s。2026-09-23 に Newton の上側ブラケットへ S·Δt を入れる前は 0.2%/5.3%/13.9%）。注入エネルギーは `sn_volume_source_in_step` として `volume_in` に計上（2026-09-23）。外側反復数の制限なし（2026-09-01 に Newton 物質基準を step 開始値へ固定し、多 outer の線源再注入・交換過大適用を根治 — 恒久 ctest: `test_sn_1d_su_olson` の volume-source ケース）
+- `volume_source_rate: float`（既定 `0.0` [erg/(cm³ s)]；外部輻射体積線源（Su-Olson 級）の一定注入率。IMC では particle source として、1D_SPH `multigroup_diffusion` では W-B 実装の FV RHS source として消費する。1D_SPH FLD と 1D_SPH `sn_transport` では `groups=1` 限定（多群は `ConfigError`。S\(_N\) は 2026-09-29 から — それまでは多群のデッキを受理し、線源の全量を群 0 に入れていた）。注入エネルギーは step energy budget の `volume_in`（FLD: `fld_volume_source_in_step`）に計上。NUMERICS §6.7 1D_SPH 体積線源参照。**1D_SPH `sn_transport` でも利用可（2026-08-31 検証済み）**: sweep の等方 scalar source（S/2）+ Newton 閉包の S·Δt 注入で、独立 S₈ 離散化（`tools/su_olson_sn_reference.py`）と一致（ξ=0.01/1.0/3.16 で 0.15%/4.8%/2.3%、Δt=3.33e-13 s。2026-09-23 に Newton の上側ブラケットへ S·Δt を入れる前は 0.2%/5.3%/13.9%）。注入エネルギーは `sn_volume_source_in_step` として `volume_in` に計上（2026-09-23）。外側反復数の制限なし（2026-09-01 に Newton 物質基準を step 開始値へ固定し、多 outer の線源再注入・交換過大適用を根治 — 恒久 ctest: `test_sn_1d_su_olson` の volume-source ケース）
 - `volume_source_x_max: float`（既定 `-1.0` [cm]；線源適用域の上限。セル中心 \(r_c \le x_{max}\)（IMC 平面系では \(x_c\)）のセルに適用。`volume_source_rate > 0` の場合は `> 0` 必須（`ConfigError`））
 - `groups: dict`
-  - `bounds_eV: list[float]`（単調増加 [eV]。長さ \(G+1\)（\(1 \le G \le 80\) 群）。有効範囲：各要素 `> 0`、`bounds_eV[i+1] > bounds_eV[i]`。最低2要素（1群）必須。例：`[0.01, 0.1, 1.0, 10.0, 100.0]` = 4群）。`opacity.model="table_nlte"` の材料が存在する場合、`bounds_eV` は IONMIX ファイルから自動導出され、明示指定は不要。明示指定した場合も IONMIX の値で上書きされる。
+  - `bounds_eV: list[float] | "log_uniform"`（狭義単調増加 [eV]。長さ \(G+1\)。有効範囲：各要素 `>= 0`（先頭の 0 を許す）、`bounds_eV[i+1] > bounds_eV[i]`。群数の上限は検査しない（`multigroup_diffusion.source_integrator="exp_rosenbrock"` は 96 群以下）。最低2要素（1群）必須。例：`[0.01, 0.1, 1.0, 10.0, 100.0]` = 4群）。TMAT/IONMIX の表の不透明度（`tmat`・`ionmix`・`table_nlte`）の材料がある場合、最初の表の群構造が `Radiation.groups` と `bounds_eV` を上書きし、2 枚目以降の表の群境界が最初の表と相対 1e-6 を超えて違うと `ConfigError`。全材料が `opacity.model="constant"` で `bounds_eV` を与えないときは灰色 1 群 \([0, 10^6]\) eV を自動設定する（INFO ログ）。
   - `representative: Literal["geometric_mean"]`（既定。群代表エネルギー \(E_g = \sqrt{E_{g-1/2} \cdot E_{g+1/2}}\)。NUMERICS §0.3参照）
   - `planck_fraction: dict`
     - `method: Literal["compute","tabulate"]`（既定 `"compute"`；`"compute"` = 初期化時に `bounds_eV` と温度グリッドから自動計算。`"tabulate"` = ユーザ提供のテーブルを使う設計だが未実装で、受け付けたうえで WARNING を出し `"compute"` と同じ計算表を使う。NUMERICS §0.3、ARCHITECTURE §4.5参照）
@@ -1434,65 +1444,10 @@ Material(
     - `T_grid_eV: list[float]`（`"tabulate"` 用。受け付けて保存するが、`"tabulate"` が未実装のため使われない。単調増加の温度グリッド [eV]、長さ \(N_T \ge 2\)）
     - `b_g: list[list[float]]`（`"tabulate"` 用。受け付けて保存するが使われない。以下は設計上の約束；形状 \([G][N_T]\)、`b_g[g][k]` = 群gの温度 `T_grid_eV[k]` におけるPlanck分率。各kで \(\sum_g b_g[g][k]=1\) を満たすこと。許容誤差 \(|1-\sum_g|<10^{-12}\) を超える場合は再正規化して警告。再正規化前の欠損率 \(\delta(T_k) = 1 - \sum_g b_g^{raw}\) が \(10^{-3}\) を超える温度点がある場合は WARNING（群境界がPlanck分布の尾部を十分にカバーしていない；NUMERICS §0.3参照）。群設計は \(E_0 \ll T_{min}\)、\(E_G \gg T_{max}\) を推奨）
     - 補間：実行時は表の温度の間で、累積分率 \(C_g=\sum_{g'\le g}b_{g'}\) または裾の和 \(D_g=1-C_g\) の対数を \(\ln T\) の 3 次 Hermite 多項式で補間し、\(b_g\) を隣り合う値の差として得る（和は構成上 1。2026-09-23 まで \(b_g\) を \(T\) の線形で補間していた。NUMERICS §6.1）
-- `imc: dict`
-  - `enabled: bool`（既定 False；internal/test-only の `mode="imc_ddmc"` 従来経路で legacy IMC transport を有効にする互換フラグ。production namelist では `imc` subblock を設定しない。`mode="multigroup_diffusion"` / `"sn_transport"` では True のままなら `ConfigError`）
-  - `alpha: float`（time-centering；既定 1.0 [無次元]。有効範囲：`[0.5, 1.0]`；0.5=Crank-Nicolson、1.0=fully implicit。NUMERICS §6.1参照）
-  - `f_max: float`（Fleck factor上限 [無次元]；既定 1.0（制限なし＝文献準拠）。有効範囲：`(0, 1.0]`。NUMERICS §6.1参照。0.5等で冷領域の拡散改善。`f_min_fleck`（§6.4.7）との関係：`f_max < f_min_fleck` は無効（`ConfigError`））
-  - `corrected_fleck: bool`（既定 False；Cleveland & Wollaber (2018) の Modified Fleck / Corrected IMC を有効化。True のとき \(f = 1/(1+\alpha\beta c\Delta t\,\sigma_P(1+\xi))\) を用い、\(\xi = \frac{1}{4}\partial\ln\sigma_P/\partial\ln T\) を table opacity の有限差分で評価する。`table_nlte` / `tmat` の separate-emissivity path では \(\sigma_P=\sigma_{p,em}\) を使う。安全策：\(\sigma_P < 10^{-30}\) では \(\xi=0\)、\(1+\xi\) は \([0.1, 10]\) に clamp。NUMERICS §6.1参照）
-  - `particles_per_cell_group: int`（既定 50（テスト用）。有効範囲：`≥ 1`。本番計算では 200 以上推奨（§8 GXII基準問題参照）。NUMERICS §6.3参照）
-  - `implicit_capture: bool`（既定 True；False の場合：\(f=1\)、\(\sigma_{s,eff}=0\)、analog capture を使用。検証テスト用。`implicit_capture=False` の場合 `cutoff_fraction` と `weight_cutoff` は無効（粒子はanalog absorptionで消滅）。NUMERICS §6.2参照）
-  - `cutoff_fraction: float`（既定 0.0 [無次元]（無効）；birth energyの割合、0.01等で有効化。有効範囲：`[0, 1)`。0.0 = 使用しない（粒子エネルギーがゼロになるまで追跡）。NUMERICS §6.3.4参照）
-  - `inelastic_scatter: bool`（既定 True；非弾性実効散乱による群再サンプリング。False の場合：群変更なし（\(g_{new}=g_{old}\)）、方向のみ再サンプル。灰色（1群）の場合は効果なし。NUMERICS §6.2参照）
-  - `weight_cutoff: float`（既定 1e-10 [無次元]；Russian roulette閾値（E_avg比：\(E < w_{cutoff} \times E_{avg}\) で判定）。有効範囲：`(0, 1)`。NUMERICS §6.3.4参照）
-  - `roulette_survival: float`（既定 0.1 [無次元]；Russian roulette生存確率。有効範囲：`(0, 1)`。`roulette_survival ≥ weight_cutoff` でなければ `ConfigError`。NUMERICS §6.3.4参照）
-  - `weight_split: float`（既定 1e+2 [無次元]；粒子分裂閾値（E_avg比）。**将来拡張（v1.0未実装）**。v1.0では設定値を保持するが分裂判定は実行しない。`≤ 0` で分裂無効の設定を先行定義。NUMERICS §6.3.4参照）
-  - `max_split: int`（既定 8；1回の分裂での最大娘粒子数。**将来拡張（v1.0未実装）**。有効範囲：`[2, 64]`（予約）。NUMERICS §6.3.4参照）
-  - `max_pool_size: int`（既定 `100_000_000`（10⁸）；PhotonPool最大容量 [粒子数]。超過時は緊急Russian rouletteを発動して粒子数を低減する。有効範囲：`≥ particles_per_cell_group × n_cells × n_groups` かつ `≤ 2,000,000,000`（2×10⁹、int32カウンタ安全上限。CUB API が int 引数を使用するため INT_MAX 以下が必須）。NUMERICS §6.4参照）
-  - `source_tilting: bool`（既定 False；LD-IMC Phase-1 の thermal source tilting を有効化。`True` のとき 1D_SPH thermal emission のセル内位置サンプリングを \(T_e^4\) 勾配に応じて傾け、2D_RZ thermal emission では双線形写像 + \(R/R_{max}\) 棄却重みに \(T_e^4\) 勾配由来の real-space tilt bias を掛ける。放出エネルギー総量 \(S^{emit}_{i,g}V_i\Delta t\) と粒子重みは変更しない。1D tilt 係数は interior cell で \(\delta_i = \operatorname{clamp}\!\left[\frac{\Delta r_i}{2\max(U_i,U_{floor})}\frac{U_{i+1}-U_{i-1}}{r_{c,i+1}-r_{c,i-1}}, -1, 1\right]\)、\(U_i=a_{eV}T_{e,i}^4\) とし、境界セルまたは self/neighbor が void の場合は \(\delta_i=0\)。uniform mesh では \((U_{i+1}-U_{i-1})/(2U_i)\) に退化。2D_RZ では R/Z 方向の中心差分 tilt を L1 正規化して用いる。NUMERICS §6.2, §6.3参照）
-  - `source_localization: bool`（既定 False；1D_SPH thermal source の emit 位置を前ステップ吸収位置のセル別 finite-width PDF へ局所化する。輸送で midpoint accumulators \(W_i^{abs}=\sum r_{mid}\Delta E_{p}^{abs}\)、\(Q_i^{abs}=\sum r_{mid}^2\Delta E_{p}^{abs}\)、\(E_i^{abs}=\sum \Delta E_{p}^{abs}\) を集計し、次ステップは \(\mu_i=\mathrm{EMA}(W_i^{abs}/E_i^{abs})\)、\(\sigma_i=\mathrm{clamp}(\sqrt{Q_i^{abs}/E_i^{abs}-\mu_i^2})\)、\(\alpha_{E,i}=\min(1,E_i^{abs}/(E_i^{abs}+E_{gate}))\) を作る。さらに Rosseland proxy optical depth \(\tau_i=\max_g(\sigma_{R,i,g}\Delta r_i)\) から \(w_{\tau,i}=\tau_i/(\tau_i+\tau_{ref})\) を作り、\(\mu_i\leftarrow r_{c,i}+w_{\tau,i}(\mu_i-r_{c,i})\)、\(\sigma_i\leftarrow \sigma_{uni,i}+w_{\tau,i}(\sigma_i-\sigma_{uni,i})\)、\(\alpha_i=\alpha_{E,i}w_{\tau,i}\) で薄いセルの局所化を弱める。`xi_mix < alpha_i` のとき \(r_p=\operatorname{clamp}(\mu_i+\sigma_i z,r_{i-1/2},r_{i+1/2})\)（\(z\) は Box-Muller の標準正規乱数）、それ以外は `source_tilting=True` なら tilted sampling、無効なら体積一様 sampling を使う。低吸収セル（\(E_i^{abs}\le 0.1E_{gate}\)）は \(\alpha_i=0\) で局所化を止め、セル中心を保持する。放出エネルギー総量 \(S^{emit}_{i,g}V_i\Delta t\) と粒子重みは変更しない。Phase-1 では 1D_SPH のみ対応し、2D_RZ では WARNING を出して従来 sampling へフォールバックする。localized branch 自体は `source_tilting` より優先するが、energy/tau gate で localized branch に入らない粒子は tilted/uniform fallback を使う。NUMERICS §6.2, §6.3参照）
-  - `sloc_ema_beta: float`（既定 0.4 [無次元]；`source_localization` の mean radius に対する時間方向 EMA 係数。有効範囲：`[0,1]`。`0` = 完全に前ステップ値を保持、`1` = raw mean をそのまま採用）
-  - `sloc_sigma_floor: float`（既定 0.1 [無次元]；`source_localization` の emit 幅下限をセル幅 \(\Delta r\) に対する比で与える。有効範囲：`> 0` かつ `<= sloc_sigma_cap`）
-  - `sloc_sigma_cap: float`（既定 0.5 [無次元]；`source_localization` の emit 幅上限をセル幅 \(\Delta r\) に対する比で与える。有効範囲：`> 0` かつ `>= sloc_sigma_floor`）
-  - `sloc_tau_ref: float`（既定 1.0 [無次元]；`source_localization` の optical-depth gate 基準。\(w_{\tau,i}=\tau_i/(\tau_i+\tau_{ref})\)、\(\tau_i=\max_g(\sigma_{R,i,g}\Delta r_i)\) として薄いセルの localized branch を連続的に弱める。有効範囲：`> 0`）
-  - `spectral_bias_eta: float`（既定 0.0 [無次元]；thermal emission の spectral biasing 強度。有効範囲：`[0, 1]`。`0` = 無効、`1` = 完全 Rosseland importance。cell-local に \(p^{P}_{i,g}\propto b_g(T_{e,i})\)、\(\Delta T_i=\max(0.01\,T_{e,i},10^{-3}\,\mathrm{eV})\)、\(\left.\frac{\partial b_g}{\partial T}\right|_i \approx \frac{b_g(T_{e,i}+\Delta T_i)-b_g(\max(T_{e,i}-\Delta T_i,10^{-6}\,\mathrm{eV}))}{2\Delta T_i}\)、\(I_{i,g}=\max(\partial b_g/\partial T,0)/\max(\sigma_{R,i,g},\sigma_{floor})\)、\(q_{i,g}=(1-\eta)p^{P}_{i,g}+\eta I_{i,g}/\sum_h I_{i,h}\) を構築し、**thermal emission の粒子数配分のみ**を \(q_{i,g}\) ベースへ置換する。`source_E[i,g]`、`rad_emit[i,g]`、群積分放出エネルギーは不変で、1粒子エネルギー \(E_p = source_E[i,g]/N_{p,i,g}\) が自動補償する。Stage 1 / Phase-1 では effective-scatter regrouping と PGRW upscatter には適用しない。推奨値は `0.3-0.5`。NUMERICS §6.2参照）
-  - `opacity_predictor: bool`（既定 False；true NLTE (`opacity.model in {"table_nlte","tmat"}`) の係数評価専用の半ステップ温度予測。True のとき、前ステップのセル別 `delta_E_rad_prev`（前ステップで電子エネルギーへ実際に適用した net radiation source）を用いて \(T_e^{pred} = T_e^n + \theta \Delta E_{rad}^{prev}/(\rho c_{v,e} V)\)（\(\theta = 0.5\) 固定）を作り、NLTE 係数評価の評価温度だけを置き換える。クランプ：`Te_floor` 以上、かつ \(|T_e^{pred} - T_e^n| / T_e^n \le 0.5\)。輸送・ソース注入・エネルギー更新は常に実状態 \(T_e^n\) を使うため、エネルギー保存は変更しない。初回ステップや restart 直後で履歴がない場合はそのステップだけ無効。NUMERICS §6.1参照）
-  - `two_stage: bool`（既定 False；True のとき `Radiation` 演算子 \(\mathcal{R}(\Delta t)\) を2つの半ステージへ分割し，`transport_step(Δt/2) → source_injection(Δt/2)` を2回実行する。1段目の source injection 後に EOS 再クロージャで \(T_e,e_e,P_e,C_v\) を同期し，\(\bar{Z}\) を更新してから2段目を実行するため，2段目の opacity / Fleck / NLTE 係数は更新済み状態で再評価される。generic subcycling と異なり，stage 間で物質状態を更新して係数を再構成する。`state.rad_dep`，`state.rad_emit`，`delta_E_rad_prev` は \(\mathcal{R}(\Delta t)\) 終了時に2段の合計を保持し，`delta_E_rad_prev` は各段で電子エネルギーへ適用した net radiation source の合計を表す。NUMERICS §2.1, §6.3 参照）
-  - `difference: dict`（既定 `{"enabled": False, "W_max": 1.0, "tau0": 3.0, "chi0": 1.0, "face_transport": True}`；full difference formulation の段階導入用設定。`enabled=True` のとき、1D_SPH および `face_transport=False` の 2D_RZ LTE nonlinear thermal source を signed residual source \(Q'=c\sigma_{a,eff}(B-E^{ref})V\Delta t\) として transport し、物理 `rad_emit` は \(c\sigma_{a,eff}BV\Delta t\) のまま保持し、reference absorption \(c\sigma_{a,eff}E^{ref}V\Delta t\) を `rad_dep` に preseed する。step 冒頭の census は previous-reference reservoir と signed residual 粒子へ再分割する。1D_SPH の `face_transport=True` では AP-limited deterministic reference face transport を separate reservoir buffers に適用し、境界 reference leakage は radiation escape accounting へ加えるが `rad_dep` へは加えない。`face_transport=False` は PR5 と同じ \(U^{ref,end}=U^{ref,start}\) の挙動であり、2D_RZ ではこの設定が必須。2D_RZ の optical-depth gate は \(\tau_i=\min(\bar\sigma_i h_{R,i},\bar\sigma_i h_{Z,i})\) を使い、empty-bin/census residual 粒子は2D thermal source と同じ双線形写像 + \(R/R_{max}\) 棄却サンプリングで配置する。`rad_E` は \(\bar{E}^{ref}+\mathrm{signed\_rad\_E\_tally}/(Vc\Delta t)\) として再構成し、clamp は final physical `rad_E` のみに適用する。loaded table-opacity path は source/census residualization を適用し、`linearized_planck` path は diagnostics-only。有効範囲：`0 <= W_max <= 1`, `tau0 > 0`, `chi0 > 0`。PR9 gate 完了まで production 推奨は無効で、既定OFFを維持する。NUMERICS §6.1.2参照）
-    - `enabled: bool`（既定 False；difference reference/source split の有効化フラグ）
-    - `W_max: float`（既定 1.0 [無次元]；reference weight の上限）
-    - `tau0: float`（既定 3.0 [無次元]；\(W_i\) の optical-depth gate 基準）
-    - `chi0: float`（既定 1.0 [無次元]；\(W_i\) の radiation-matter mismatch gate 基準）
-    - `face_transport: bool`（既定 True；True で 1D_SPH AP reference face transport を有効化。2D_RZ では True は `ConfigError` で、`difference.enabled=True` と併用する場合は False が必須。False で reference reservoir は step start のまま保持）
-  - `net_e_source_smoothing: dict`（既定 `{"enabled": False, "alpha": 0.2, "tau_threshold": 4.0, "passes": 1, "grad_Te_scale": 0.3, "grad_rho_scale": 0.5, "gradient_adaptive": False}`；Radiation source injection の前に、`H_raw = Σ_g(rad_dep - rad_emit)` に対して 1D_SPH/2D_RZ face-based conservative smoothing を適用する。`enabled=True` のとき、`imc.cpp` が保持する `sigma_R_max[c] = max_g sigma_R[c,g]` と cell mass / node geometry / dominant material / void mask を用いて face flux \(F_{ab}^{(p)}=\alpha_{ab} \lambda_{ab} m_{ab}(H_a^{(p)}/m_a-H_b^{(p)}/m_b)\) を `passes` 回 Jacobi 形式で計算し、\(H^{(passes)}\) を \(e_e\) へ適用する。1D_SPH は左右 face、2D_RZ は R/Z 4-face stencil を使い、2D の optical-depth gate は R face で \(\sigma_{R,\max}h_R\)、Z face で \(\sigma_{R,\max}h_Z\) を使う（area weight は使わない）。`difference.enabled=True` では reference weight \(W_i\ge0.5\) のセルも barrier とし、face は両隣セルが \(W<0.5\) の場合だけ smoothing 対象になる（0.5 は namelist knob ではない v1 互換性定数）。`gradient_adaptive=False` では \(\alpha_{ab}=\alpha\)。`gradient_adaptive=True` では source injection 前の \(T_e,\rho\) から \(G_T=\exp[-(|\Delta\ln T_e|/\texttt{grad_Te_scale})^2]\)、\(G_\rho=\exp[-(|\Delta\ln\rho|/\texttt{grad_rho_scale})^2]\) を作り、barrier 通過 face で \(\alpha_{ab}=\alpha G_T G_\rho\) とする。mask \(\lambda\) は `tau_threshold` と void/material interface で決まり、各 pass の総和 \(\sum H\) は厳密保存。`passes=0` で無効。`alpha` の有効範囲は 1D_SPH または smoothing 無効時 `[0, 0.25]`、2D_RZ で `enabled=True` のとき `[0, 0.125]`。NUMERICS §2.1参照）
-    - `enabled: bool`（既定 False；source smoothing の有効化フラグ）
-    - `alpha: float`（既定 0.2 [無次元]；1-pass conservative exchange の係数。有効範囲：1D_SPH または smoothing 無効時 `[0, 0.25]`、2D_RZ で `enabled=True` のとき `[0, 0.125]`）
-    - `tau_threshold: float`（既定 4.0 [無次元]；face smoothing を許可する optical-depth gate。1D_SPH は各セルで \(\tau_c=\max_g(\sigma_{R,c,g}\Delta r_c)\) を計算し、2D_RZ は R face で \(\tau_{R,c}=\sigma_{R,\max,c}h_{R,c}\)、Z face で \(\tau_{Z,c}=\sigma_{R,\max,c}h_{Z,c}\) を使う。face では `min(tau_left, tau_right) >= tau_threshold` を要求する。有効範囲：`> 0`）
-    - `passes: int`（既定 1；conservative exchange の pass 数。有効範囲：`>= 0`。`0` は smoothing 無効）
-    - `grad_Te_scale: float`（既定 0.3 [無次元]；`gradient_adaptive=True` 時の \(|\Delta\ln T_e|\) Gaussian suppression scale。有効範囲：`> 0`）
-    - `grad_rho_scale: float`（既定 0.5 [無次元]；`gradient_adaptive=True` 時の \(|\Delta\ln\rho|\) Gaussian suppression scale。有効範囲：`> 0`）
-    - `gradient_adaptive: bool`（既定 False；True で face ごとに \(\alpha_{c+1/2}=\alpha G_TG_\rho\) を使い、smooth interior では最大 \(\alpha\)、大きな \(T_e,\rho\) 勾配では連続的に 0 へ近づける。difference 併用時の \(W<0.5\) gate は `gradient_adaptive` の値にかかわらず適用される）
-  - `particle_budget: int`（既定 -1；総粒子数上限（ソース+census合計）。-1で無効（従来動作）、>0で有効。有効時、各ステップのソース生成粒子数を適応的に制御する（NUMERICS §6.2.2参照）。有効範囲：`-1` または `≥ particles_per_cell_group`。`0 < particle_budget < particles_per_cell_group` の場合は `ConfigError`）
-  - `census_comb: dict`（Census Combing 設定。NUMERICS §6.4.1参照）
-    - `enabled: bool`（既定 False；census粒子の個体数制御を有効化。True時、輸送後にcensus粒子数がトリガー条件を超えた場合に重要度重み付きリサンプリングを実行する。True時は予測的個体数コントローラ（NUMERICS §6.2）も自動的に有効化される）
-    - `max_particles: int`（既定 `1_000_000`（10⁶）；census combing のターゲット粒子数上限。有効範囲：`≥ 1000`）
-    - `min_per_bin: int`（既定 1；ビンあたりの最小保持粒子数。有効範囲：`≥ 1`）
-    - `trigger_ratio: float`（既定 1.0 [無次元]；`n_alive > max_particles × trigger_ratio` で発動。有効範囲：`(0, 2.0]`）**[deprecated: 予測コントローラ導入により未使用。後方互換性のためパースは継続]**
-    - `target_fraction: float`（既定 0.8 [無次元]；combing後のターゲット粒子数 = `max_particles × target_fraction`。有効範囲：`(0, 1.0]`。`target_fraction ≥ trigger_ratio` の場合は WARNING（combing が粒子を増やすことになる））**[deprecated: 予測コントローラ導入により未使用。後方互換性のためパースは継続]**
-    - `mode_weight_imc: float`（既定 1.0 [無次元]；IMCビンの重要度重み）
-    - `mode_weight_ddmc: float`（既定 0.5 [無次元]；DDMCビンの重要度重み。DDMCは位置非依存のため、IMCより低い重みが合理的）
-    - `adaptive_trigger: bool`（既定 True；プール利用率に応じてtrigger_ratioを動的調整）**[deprecated: 予測コントローラ導入により未使用。後方互換性のためパースは継続]**
-    - `adaptive_util_start: float`（既定 0.70 [無次元]；適応トリガーの開始利用率。有効範囲：`(0, 1)`）**[deprecated: 予測コントローラ導入により未使用。後方互換性のためパースは継続]**
-    - `adaptive_util_end: float`（既定 0.95 [無次元]；適応トリガーの終了利用率。有効範囲：`(adaptive_util_start, 1]`）**[deprecated: 予測コントローラ導入により未使用。後方互換性のためパースは継続]**
-    - `trigger_ratio_floor: float`（既定 0.85 [無次元]；適応トリガーの下限trigger_ratio。有効範囲：`(0, trigger_ratio]`）**[deprecated: 予測コントローラ導入により未使用。後方互換性のためパースは継続]**
-    - `trigger_hysteresis: float`（既定 0.05 [無次元]；発動/停止間のヒステリシス幅。有効範囲：`[0, 0.5]`）**[deprecated: 予測コントローラ導入により未使用。後方互換性のためパースは継続]**
-    - `ess_floor_enabled: bool`（既定 False；hard-trigger combing の直前に、Rosseland importance 上位群の low-ESS bin を split して粒子統計を底上げする）
-    - `ess_min_tier0: float`（既定 16.0 [粒子数]；Rosseland importance 累積 50% 以内の tier-0 群に要求する最小 ESS。有効範囲：`> 0`）
-    - `ess_min_tier1: float`（既定 8.0 [粒子数]；Rosseland importance 累積 90% 以内の tier-1 群に要求する最小 ESS。有効範囲：`> 0`）
-    - `max_split_factor: int`（既定 4；ESS floor が 1 粒子を複製できる最大分割数。有効範囲：`≥ 1`）
-  - `rad_lite_mesh: dict`（放射メッシュ粗視化設定。1D_SPH専用）
-    - `enabled: bool`（既定 False；放射メッシュ粗視化の有効化）
-    - `sigma_ratio_max: float`（既定 2.0 [無次元]；隣接セルの不透明度比閾値。有効範囲：`> 1.0`）
-    - `nlte_auto: bool`（既定 False；`opacity.model in {"table_nlte","tmat"}` のとき step 単位で RadLite overlay を自動有効化する。`enabled=False` でも auto 条件を満たせば有効。自動有効化時は `sigma_ratio_max = max(user_value, 3.0)` を使い、既存 merge criterion のままより積極的にセル併合を許す。`nlte_auto=False` では従来どおり `enabled` のみで制御される。NUMERICS §7.5.2参照）
+- `imc: dict`（受理するキーは従来どおり。作用するのは `two_stage` だけ）
+  - `two_stage: bool`（既定 False；True のとき輻射演算子 \(\mathcal{R}(\Delta t)\) を 2 つの半ステップに分けて進める。1 段目の後に表 EOS で \(T_e\) から \(e_e, P_e, C_v\) を閉じ直し（`sync_ee_from_Te_table`、Mie–Grüneisen の再評価）、\(\bar{Z}\) を更新してから 2 段目を解くので、2 段目の不透明度・Fleck 係数・NLTE 係数は 1 段目の後の状態で評価される。`state.rad_dep`・`state.rad_emit` は \(\mathcal{R}(\Delta t)\) の終わりに 2 段の合計を持つ。`Numerics.radiation_thermal_subcycle` とは排他（two_stage のときは subcycle しない）。persistent loop は two_stage を受け付けない。NUMERICS §2.1 参照）
+  - それ以外のキー（`enabled`, `alpha`, `f_max`, `corrected_fleck`, `particles_per_cell_group`, `implicit_capture`, `cutoff_fraction`, `inelastic_scatter`, `weight_cutoff`, `roulette_survival`, `weight_split`, `max_split`, `linearized_planck`, `source_tilting`, `source_localization`, `sloc_*`, `spectral_bias_eta`, `opacity_predictor`, `difference`, `net_e_source_smoothing`, `conservative_smoother`, `particle_budget`, `census_comb`, `rad_lite_mesh`）は 2026-09-29 にビルドから外したモンテカルロ輻射（`mode="imc_ddmc"`: IMC・DDMC・ランダムウォーク・HOLO・difference 定式化。`retired/radiation_monte_carlo/`）のもの。旧デッキが読めるように受理し、効果は無い（一覧を 1 行の WARNING に出す。値の検査はしない）。ただし `enabled=True` と `difference.enabled=True` は `ConfigError`（無い手法を求めるデッキを黙って走らせないため。退役前も FLD・S\(_N\) のモードでは拒否していた）。未知のキーは従来どおり `ConfigError`。各キーの意味は退役前（2026-09-28 まで）の本書と `retired/radiation_monte_carlo/src/core/namelist/monte_carlo_radiation_config.cpp` に残る
+  - persistent loop（`Numerics.persistent_loop`）は 2026-09-29 まで Fleck 係数に `alpha` を使っていたが、通常の 1D FLD と同じく 1 を使うようになった（既定 1 のデッキは不変）
 - `multigroup_diffusion: dict`（`mode="multigroup_diffusion"` で使用。NUMERICS §6.7 参照）
   - `flux_limiter: Literal["levermore_pomraning","larsen","none"]`（既定 `"levermore_pomraning"`；Levermore-Pomraning FLD limiter、Larsen limiter、または bare diffusion）
   - `max_outer_iterations: int`（既定 20；matter-radiation Picard 最大反復数。有効範囲：`>= 1`）
@@ -1515,7 +1470,7 @@ Material(
   - `linear_solver_2d: Literal["auto","amgx_cg","jacobi","cusparse_cg_jacobi","cusparse_cg_zline","cusparse_cg_rgmg"]`（既定 `"auto"`；2D_RZ CSR solve。`"auto"` は **namelist validate 時**に格子から解決する: `nr` が 2 の冪かつ `nz>=3` → `"cusparse_cg_rgmg"`、それ以外で `nz>=3` → `"cusparse_cg_zline"`、どちらも不成立 → `"cusparse_cg_jacobi"`（解決結果は 1 回 INFO ログ、frozen config には解決後の値が入る）。solver 整合性契約（外部 AI 裁定前提①）: deck が値を明示したかを追跡し、`linear_solver_2d_requested`（deck 指定値、未指定なら既定）と `linear_solver_2d_resolved`（実際に使う solver）を run_info + HDF5 metadata に記録する — 黙った能力置換は無い。**AmgX が link されていない build で `"amgx_cg"` を明示指定すると ConfigError（fatal）**。`"jacobi"` は `"cusparse_cg_jacobi"` と同じ debug fallback CG の別名。`"cusparse_cg_zline"` は z-line block-Jacobi preconditioned CG（radial line ごとの z-tridiagonal solve、cuSPARSE `cusparseDgtsv2`）。`"cusparse_cg_rgmg"` は r-semi-coarsened geometric multigrid を SPD preconditioner として使う MG-PCG（r 方向のみ半粗化、z-line smoother、Galerkin coarse operator；`nr` 2 冪必須）。既定 flip の検証 battery は VERIFICATION §9.5.6（SPD/直接解/contrast sweep/真残差/tol ladder）を参照）
   - `amgx_config: dict`
     - `preset: Literal["AGGREGATION_JACOBI"]`（既定 `"AGGREGATION_JACOBI"`；同梱 `resources/amgx_fld_config.json` の設定名）
-  - `opacity_floor: float`（既定 `1.0e-6` [cm\(^{-1}\)]；FLD/opacity 評価の下限。有効範囲：`>= 0`。既定は 2026-08-28 に `1.0e-100` から引き上げ: 拡散係数 \(D=c\lambda/\sigma\) は真空極限（void セル、\(\sigma\to 0\) かつ一様 \(E\)）で flux limiter が \(\lambda=1/3\) に留まるため発散し、三重対角行列の係数が \(\sim 10^{98}\) に達して CR/QR いずれの solver も NaN を生成する。mfp 10 km の床は実験室スケールでは物理的に不可視（勾配領域では \(\lambda\sim 1/R\) により \(D\) から \(\sigma\) が相殺されるため、床は縮退方向にのみ作用する）。NUMERICS §7 参照）
+  - `opacity_floor: float`（既定 `1.0e-6`；有効範囲：`>= 0`。1 つの値を 2 か所で使う — (i) 不透明度の評価では質量不透明度の床 [cm²/g] として \(\sigma \ge \rho\,\cdot\)`opacity_floor`（`multimat_opacity_1d.cuh`、`opacity.cu`）、(ii) 面の拡散係数と flux limiter の組み立てでは \(\sigma_R\) の床 [cm\(^{-1}\)]（`fld_1d_gpu.cu`）。下の空の極限の正則化は (ii) の役割。既定は 2026-08-28 に `1.0e-100` から引き上げ: 拡散係数 \(D=c\lambda/\sigma\) は真空極限（void セル、\(\sigma\to 0\) かつ一様 \(E\)）で flux limiter が \(\lambda=1/3\) に留まるため発散し、三重対角行列の係数が \(\sim 10^{98}\) に達して CR/QR いずれの solver も NaN を生成する。mfp 10 km の床は実験室スケールでは物理的に不可視（勾配領域では \(\lambda\sim 1/R\) により \(D\) から \(\sigma\) が相殺されるため、床は縮退方向にのみ作用する）。NUMERICS §7 参照）
   - `opacity_cap: float`（既定 `1.0e20` [cm\(^{-1}\)]；FLD opacity 評価の上限。有効範囲：`> opacity_floor`）
   - `fleck_cv_source: Literal["legacy","table"]`（**既定 `"table"`**、2026-07-10 導入・**2026-07-11 既定フリップ（外部AI裁定、docs/design/fleck_cv_default_flip_20260711.md）**）: FLD Fleck 因子の \(z\) 評価に使う電子比熱の出所。`"table"`（既定） = 電子 EOS テーブルが存在すれば現在 \(T_e\) の table cv を最優先（matter Newton が前進させるエネルギー関数と同一の \(\partial U_e/\partial T_e\) — Fleck–Cummings 1971 の整合要件、NUMERICS §6.7）; テーブル不在時は legacy チェーンに落ちる（matter 側も非テーブル分岐のため整合）。`"legacy"` = 旧チェーン（cv_e_override → state cv_e → ideal-gas fallback）を凍結保存する明示互換モード — 旧 golden の bit 再現・A/B 比較用。table-EOS 材料で legacy を使うと Fleck 線形化と matter 更新が別の熱力学モデルになり、transient 交換率が最大 \(q=C_{legacy}/C_{table}\) 倍歪む（Hammer–Rosen 検証で発見; 0-D 緩和 gate verify_fleck_relaxation_0d が率忠実度を常設検証）。フリップの既存 golden への影響は無し — 本 branch の table-EOS FLD gate 群（Hammer–Rosen / 0-D 緩和）は mode を deck 内で明示 pin 済み、GXII FLD regression は ideal_gas EOS で knob 構造的不活性（table 既定下の golden 再生成が旧 golden と全 6 指標 bit 同一、VERIFICATION §4.z3）。tmat+FLD の無 pin deck（XC probe、2D deck）はフリップで補正物理を継承する。**表不透明度（tmat/table_nlte）のセル（2026-09-23）**: Fleck 因子を作る NLTE 係数カーネルにも 1D FLD では同じ規則（電子 EOS テーブルがあれば現在 \(T_e\) の table cv）を適用する — 以前このカーネルは指定によらず legacy チェーン（cv_e_override → state cv_e → ideal gas）を使っており、tmat 不透明度の 1D デッキでは既定の `"table"` が効いていなかった。2D_RZ の FLD の NLTE 経路は従来どおり legacy チェーン
   - `fleck_beta: Literal["tangent","secant","guard"]`（既定 `"tangent"`、2026-07-14 導入 — flip verdict 繰延 item 1）: Fleck β の線形化点。`"tangent"`（既定・bit 保存） = β = 4a_eV T³/C_v（従来）。`"secant"` = grey 弦 β = ΔB/ΔU_e を 0-D 局所予測子（f_tan·cσ_P(E−B)Δt/C_v、trust region ±0.5T、退化時 tangent へ fallback）の張る区間で評価 — table-EOS セルのみ・**1D FLD のみ**（2D の fleck kernel は独立実装で tangent 固定）。`"guard"` = 片側単調性リミッタ β_used = max(β_tan, β_sec) ⇒ f_used = min(f_tan, f_sec)（裁定 2026-07-15 §9.2；secant と同じ table-EOS/1D 制約・同じ予測子、選択のみ max）。設計・gate 計画 = docs/design/fleck_beta_secant_20260714.md。表不透明度（tmat/table_nlte/ionmix）のセルでは、その Fleck 因子を作る NLTE 係数カーネルも secant/guard を実装する（2026-09-24。予測子の正味加熱は cσ_P,吸収 E − cσ_P,放出 aT⁴、U_e は熱容量を取る電子表。2026-09-23 まで受理して黙って無視、09-23〜24 は `ConfigError`）
@@ -1524,7 +1479,7 @@ Material(
   - `z_boundary: Literal["vacuum","reflect","marshak","state_supply"]`（既定 `"vacuum"`；2D_RZ Z端境界。`boundary.z` と同義の両Z端共通指定。`boundary.z_bottom` / `boundary.z_top` を指定した場合はそれらが各面の実効値になる。`"state_supply"` は両Z端を state-supply にするため、両 hydro z-face も `type="state_supply"` でなければ `ConfigError`）
   - `boundary: dict`
     - `inner_r: Literal["reflect"]`（既定 `"reflect"`；1D_SPH 原点対称 / 2D_RZ R軸反射。他値は `ConfigError`）
-    - `outer_r: Literal["vacuum","reflect","marshak"]`（既定 `"vacuum"`；`"vacuum"` は Marshak-like \(F=cE/2\) escape、`"reflect"` は face flux 0。`"marshak"` は 1D_SPH のみ（W-B）: \(F_{out}=(c/4)E-F_{inc}\)。入射駆動は排他的二択 — `Radiation.boundary.marshak_Tr_eV > 0`（黒体、multigroup 可）または `marshak.flux_erg_per_cm2_s > 0`（灰色 `groups=1` 限定）。両方指定・両方ゼロは `ConfigError`。NUMERICS §6.7 1D_SPH BC 参照）
+    - `outer_r: Literal["vacuum","reflect","marshak"]`（既定 `"vacuum"`；`"vacuum"` は Marshak-like \(F=cE/2\) escape、`"reflect"` は face flux 0。`"marshak"` は 1D_SPH のみ（W-B）: \(F_{out}=(c/4)E-F_{inc}\)。1D_SPH の `"vacuum"`・`"marshak"` の \(E\) は面の値で、外側セルの中心から面までの半セルの拡散抵抗で消去する（2026-09-29 から。それ以前はセル中心の値）。入射駆動は排他的二択 — `Radiation.boundary.marshak_Tr_eV > 0`（黒体、multigroup 可）または `marshak.flux_erg_per_cm2_s > 0`（灰色 `groups=1` 限定）。両方指定・両方ゼロは `ConfigError`。NUMERICS §6.7 1D_SPH BC 参照）
     - `z: Literal["vacuum","reflect","marshak","state_supply"]`（既定 `"vacuum"`；2D_RZ 両Z端境界の共通既定値）
     - `z_bottom: Literal["vacuum","reflect","marshak","state_supply"]`（既定は `boundary.z`；`z=z_min` 面）
     - `z_top: Literal["vacuum","reflect","marshak","state_supply"]`（既定は `boundary.z`；`z=z_max` 面）
@@ -1548,9 +1503,9 @@ Material(
   - `dsa_enabled: bool`（既定 `True`；DSA 加速を有効化する。`False` では source iteration の DSA correction を実行しない。比較検証・収束効果測定用。1D の補正は掃引の空間閉包と整合する面モーメント系（2026-09-24、NUMERICS §6.8）: 光学的に厚いセルでも反復が収束する（従来のセル中心の拡散演算子は \(\sigma_t\Delta r\gtrsim3\) で発散した）。収束解は変わらない）
   - `inner_acceleration: Literal["none","anderson"]`（既定 `"none"`；2026-09-24。`"anderson"` は DSA 補正後の source iteration を直近 `anderson_depth` 個の残差で Anderson 混合する（1D_SPH のみ、2D_RZ は ConfigError。反復の展開グラフは使わない）。NUMERICS §6.8）
   - `anderson_depth: int`（既定 3、範囲 [1, 4]；Anderson 混合に使う残差の数）
-  - `diffusion_fallback_mode: Literal["none","per_group_hysteresis"]`（既定 `"none"`；`"per_group_hysteresis"` は Cut-2+ 予約。Cut-1b production では `"none"` 必須）
-  - `tau_diffusion_on: float`（既定 `10.0`；予約値。有効範囲：`>= 0`）
-  - `tau_diffusion_off: float`（既定 `5.0`；予約値。有効範囲：`>= 0`）
+  - `diffusion_fallback_mode: Literal["none"]`（既定 `"none"`；群ごとの拡散へのフォールバック（`"per_group_hysteresis"`）はどの S\(_N\) ソルバにも実装されていないので、`"none"` 以外は `ConfigError`（2026-09-29 から。それまでは `"per_group_hysteresis"` を受理して何もしなかった））
+  - `tau_diffusion_on: float`（既定 `10.0`；読むだけで使わない。凍結設定の互換のため残す。有効範囲：`>= 0`）
+  - `tau_diffusion_off: float`（既定 `5.0`；読むだけで使わない。有効範囲：`>= 0`）
   - `opacity_floor: float`（既定 `1.0e-100` [cm\(^{-1}\)]；opacity 評価の下限。有効範囲：`>= 0`。評価床は実質ゼロのまま — S_N 輸送は σ=0 で well-posed で、減衰ゲートは exp(−σL) を直接比較するため床を上げられない（2026-08-30 に 1e-6 化を試み減衰ゲート 2 件が赤化して差し戻し）。σ で除算する拡散形（DSA 前処理・AP ブレンド面流束）のみ内部で 1e-6 /cm の分母正則化を持つ — FLD の opacity_floor と同根拠）
   - `opacity_cap: float`（既定 `1.0e20` [cm\(^{-1}\)]；opacity 評価の上限。有効範囲：`> opacity_floor`）
   - `timing_enabled: bool`（既定 `False`；True のとき 1D_SPH \(S_N\) step が 100 radiation steps ごと（環境変数 `TENRYU_SN_TIMING_WINDOW` で変更可）に `[sn_timing]` per-block timing summary を stdout へ出力し、2D_RZ \(S_N\) step は `[sn_2d_rz_timing] outer_iters=...` の反復診断を stdout へ出力する。テスト影響回避のため既定OFF）
@@ -1564,70 +1519,22 @@ Material(
     - `z_top: Literal["vacuum","reflect","marshak"]`（既定は `boundary.z`；`z=z_max` 面）
   - `marshak: dict`
     - `flux_erg_per_cm2_s: float`（既定 `0.0` [erg/(cm² s)]；2D_RZ で `boundary.z_bottom` または `boundary.z_top` が `"marshak"` の場合、駆動は排他的二択 — (i) この灰色定常入射 flux、または (ii) `Radiation.boundary` の Tr(t) 源（indirect-drive 2026-07-11、\(F_{inc}=(c/4)a_{eV}T_r^4\) を既存スカラー slot へ供給）。**SN 2D はどちらの経路も `Radiation.groups != 1` で `ConfigError`**（z 面注入 \(\psi^-=2F_{inc}\) が構造的に灰色のため; 多群 spectral 注入は将来拡張）。Tr 経路で両 z 面 marshak + `marshak_Tr_map` 面別テーブルは `ConfigError`（単一スカラー共有; 定数/スカラー callable 源は両面共通で可）。両方指定・両方ゼロは `ConfigError`。NUMERICS §6.7 の 2D Tr(t) 段落参照）
-- `ddmc: dict`
-  - `enabled: bool`（既定 False；internal/test-only の `mode="imc_ddmc"` 従来経路で DDMC を有効にする互換フラグ。False の場合：全セルが IMC mode map に留まる。`tau_ddmc`, `omega_ddmc`, `leak_stencil` など DDMC 専用パラメータは無視される。`tau_rw` は internal PGRW threshold として引き続き有効。production namelist では `ddmc` subblock を設定しない。実装上は cold-start warm-up として global step `0..9` でも DDMC entry を無効化し、全セルが IMC に留まる）
-  - `implicit_diffusion: bool`（既定 False；HIMCD Phase-1 の切替。True かつ **1D / LTE / Marshak境界なし / volume_source_rate=0** の場合、DDMC セル×群は particle DDMC の代わりに host-side backward Euler implicit diffusion solve で更新する。Phase-1 では DDMC-IMC 界面は zero-flux とし、未対応条件では WARNING を出して従来の particle DDMC にフォールバックする。NUMERICS §7.4.1 参照）
-  - `tau_ddmc: float`（既定 4.0 [無次元]；有効範囲：`≥ 1.0`；DDMC 切替の光学厚下限閾値。NUMERICS §7.1 参照）
-  - `tau_rw: float`（既定 0.0 [無次元]；有効範囲：`≥ 0`；internal PGRW threshold。`tau_rw=0` で PGRW 無効。Phase-1 では 1D_SPH のみ対応し、`rad_lite_mesh` 無効かつ IMC 粒子が per-cell diffusive group cutoff の内側にあり、RW sphere optical depth が `tau_rw` 以上のとき `imc_transport_persistent` 内で PGRW branch を実行する。独立の `TransportMode::RW` は生成しない。NUMERICS §7.4.2 参照）
-  - `omega_ddmc: float`（既定 0.9 [無次元]；有効範囲：`[0, 1)`；DDMC entry に用いる scattering-ratio gate。`0` で無効化できる。NUMERICS §7.1参照）
-  - `leak_stencil: Literal["4","9_kershaw"]`（既定 `"9_kershaw"`；`"4"` = 直接隣接4面のみ（Densmore近似、直交格子向け、NUMERICS §7.3.4）、`"9_kershaw"` = Kershaw 9点差分（歪格子対応、NUMERICS §7.3.5, Appendix A参照））
-  - `interface_method: Literal["asymptotic_diffusion_limit","marshak"]`（既定 `"asymptotic_diffusion_limit"`；IMC⇄DDMC境界変換方式。`"marshak"` は精度が低いが安定（Densmore 2007参照）。将来拡張: `"cleveland_gentile"` 2D RZ幾何拡張。NUMERICS §7.7参照）
-  - `emissivity_preserving: bool`（既定 True；Densmore 2006 の \(\hat{P}\) 補正を使用。Falseで標準P、NUMERICS §7.7.3参照）
-  - `interface_exit_distribution: Literal["cosine","half_isotropic"]`（既定 `"cosine"`；DDMC→IMCリーク時の角度分布。`"cosine"`: \(P(\mu) = 2\mu\) (\(\mu \in [0,1]\))（物理的に正しい拡散流束分布）。`"half_isotropic"`: \(P(\mu) = 1\) (\(\mu \in [0,1]\))（簡略化）。NUMERICS §7.7参照）
-  - `rz_face_r_weight: bool`（既定 True；2D_RZでDDMC→IMCリーク面位置サンプリングにR重み付けを使用。Falseで一様サンプル。1D_SPHでは無視（面は球面のため一意）。NUMERICS §7.7.2参照）
-  - `face_opacity_temperature: Literal["radiative_mean","arithmetic_mean"]`（既定 `"radiative_mean"`；DDMCリーク係数算出時の面温度規約。`"radiative_mean"` = 放射温度による重み平均、`"arithmetic_mean"` = 隣接セル温度の算術平均。NUMERICS §7.3.2参照）
-  - `m_matrix_check: bool`（既定 True；True の場合、M-matrix 条件不合格セルは DDMC ではなく IMC モードにフォールバック。False の場合は §7.1 の M-matrix 条件をスキップ（検証テスト用、歪格子で不安定になりうる））
-  - `momentum_deposition: bool`（既定 True；診断のみ（output-only）。hydro 運動量へのフィードバックなし。スナップショットには出力しない — 値は history の `mc/rad_momentum_deposition` だけに残る）
-  - `tau_ddmc_off: float`（既定 -1.0 [無次元]；DDMC脱出τ閾値。`< 0` で `tau_ddmc` と同値。有効時 `0.5 ≤ tau_ddmc_off ≤ tau_ddmc`。NUMERICS §7.1.3参照）
-  - `omega_ddmc_off: float`（既定 -1.0 [無次元]；DDMC脱出ω閾値。`< 0` で `omega_ddmc` と同値。NUMERICS §7.1.3参照）
-  - `mode_hold: int`（既定 0；IMC→DDMC遷移前の最小滞留ステップ数。0でヒステリシスなし。有効範囲：`[0, 100]`。NUMERICS §7.1.3参照）
-  - `rate_max: float`（既定 1e30 [無次元]；|Δτ/τ|の最大許容変化率。1e30で事実上無制限。有効範囲：`> 0`。NUMERICS §7.1.3参照）
-- `diffusion: dict`
-  - `enabled: bool`（既定 False；1D_SPH の diffusion-cell 分類、entry/exit energy conversion、cell-local matter-radiation source solve、RKL2 空間 diffusion step を有効化する。分類セルと guard セルは DDMC から除外される。2D_RZ では無視。NUMERICS §7.1.2a-d参照）
-  - `tau_on: float`（既定 5.0 [無次元]；diffusion entry の Rosseland 光学厚閾値。有効範囲：`tau_on >= tau_off > 0`）
-  - `tau_off: float`（既定 3.0 [無次元]；diffusion exit の Rosseland 光学厚閾値）
-  - `reduced_flux_on: float`（既定 0.15 [無次元]；entry の reduced flux 上限。有効範囲：`0 <= reduced_flux_on <= reduced_flux_off <= 1`）
-  - `reduced_flux_off: float`（既定 0.25 [無次元]；exit の reduced flux 上限）
-  - `mode_hold: int`（既定 0；entry 条件を満たしてから diffusion へ入るまでの保持ステップ数。0で即時 entry）
-  - `rate_max: float`（既定 1e30 [無次元]；entry 時の \(|\Delta\tau_R/\tau_R|\) 上限。1e30で事実上無制限）
-  - `mode_update_interval: int`（既定 10；新規 diffusion entry と island filter を評価する step 間隔。`1` で毎 step 評価。既存 diffusion セルの hard exit（void/radiation floor/\(\tau_R<\tau_{off}\)/\(R_F>R_{F,off}\)）は毎 step 評価し、この間隔を待たない。有効範囲：`>= 1`）
-  - `min_diffusion_island_cells: int`（既定 5；1D global cell index で連続する diffusion 候補 island がこのセル数未満なら diffusion entry を禁止する。guard セルは island size に数えず、island filter 後に生成する。`1` で island filter を実質無効化。有効範囲：`>= 1`）
-  - `imc_guard_cells: int`（既定 1；diffusion セルの周囲で DDMC を禁止し IMC とする guard セル幅。有効範囲：`>= 1`）
-  - `sts_max_stages: int`（既定 0；1D_SPH RKL2 diffusion の最大 stage 数。0 は上限なし、正値では超過時に subcycle。必要 subcycle 数が 10 を超える場合はその step の diffusion mask を IMC へ戻す。NUMERICS §7.1.2d参照）
-  - `sts_damping: float`（既定 0.05 [無次元]；RKL2 Legendre 引数の damping。有効範囲：`(0, 1)`）
-  - `sts_subcycle_eta: float`（既定 0.8 [無次元]；RKL2 stage 数見積もりと max-stage subcycle の安全係数。有効範囲：`(0, 1]`）
-  - `interface_particles_per_face_group: int`（既定 32；diffusion-IMC interface の outgoing face-current \(J^{out}_{f,g}\) を IMC 粒子へ変換する際の face×group あたり生成粒子数。有効範囲：`>= 1`）
-  - `exit_particles_per_cell_group: int`（既定 32；diffusion exit 時に cell×group あたり生成する IMC 粒子数。有効範囲：`>= 1`）
-  - `lte_entry_initialization: bool`（既定 False；将来の LTE entry 初期化用予約値）
-  - `lte_entry_energy_fraction_cap: float`（既定 0.01 [無次元]；将来の LTE entry 初期化で物質エネルギーから移す上限割合。有効範囲：`>= 0`）
-- `holo: dict`（High-Order Low-Order 放射輸送の internal/test-only 設定。production namelist では `holo` subblock を設定しない。`enabled=False` では既存 IMC/DDMC/PGRW/hybrid diffusion の runtime 経路を変更しない。NUMERICS §7.1.2g 参照）
-  - `enabled: bool`（既定 False；HOLO 有効化フラグ。v1 の LO solver は `Main.dimension="1D_SPH"` のみ対応。`2D_RZ` で True を指定した場合は、`sn_material_coupling=True` の deterministic GPU \(S_N\) material coupling 経路だけを有効とし、それ以外は WARNING を出して False に無効化し、凍結設定にも False として記録する）
-  - `region: Literal["shell"]`（既定 `"shell"`；v1 は shell 領域のみ。将来 PR で材料グループや質量座標 interval へ拡張予定）
-  - `material_group: Literal["shell"]`（既定 `"shell"`；v1 は shell material coupling mask のみ）
-  - `coupling_tau: float`（既定 5.0 [無次元]；LO material-coupling mask の Rosseland 光学厚閾値。有効範囲：`>= 0`）
-  - `guard_cells: int`（既定 3；`coupling_tau` で選ばれた cell mask の膨張 cell 半幅。有効範囲：`>= 0`）
-  - `solver: Literal["implicit_1d","quasidiffusion_1d"]`（既定 `"implicit_1d"`；v1 の low-order solver 名。`quasidiffusion_1d` では high-order \(P_{rr}/E\) closure を使用する）
-  - `closure: Literal["diffusion"]`（既定 `"diffusion"`；v1 closure）
-  - `closure_relax: float`（既定 0.2 [無次元]；`quasidiffusion_1d` の filtered closure temporal relaxation weight。有効範囲：`[0, 1]`）
-  - `closure_smooth_passes: int`（既定 1；`quasidiffusion_1d` の \(P_{rr}/E\) closure に適用する same-material spatial smoothing pass 数。有効範囲：`>= 0`）
-  - `closure_smooth_alpha: float`（既定 0.5 [無次元]；各 spatial smoothing pass の neighbor mixing weight。有効範囲：`[0, 1]`）
-  - `consistency_alpha: float`（既定 1.0 [無次元]；same-step predictor-corrector consistency source を LO corrector RHS へ入れる緩和係数。有効範囲：`[0, 1]`。互換用 key `gamma_alpha` も同じ値として受理する）
-  - `boundary_flux: Literal["physical"]`（既定 `"physical"`；global LO solve は inner reflect / outer vacuum の物理境界だけを使う）
-  - `p_rr_tally: bool`（既定 True；HOLO 有効時に passive radial pressure moment \(P_{rr}\) track-length tally と coverage/chi 診断を出力する。`enabled=False` では runtime 経路に影響しない）
-  - `sn_closure: bool`（既定 True；`solver="quasidiffusion_1d"` の QD closure に 1D spherical \(S_N\) deterministic closure を使う。`solver="implicit_1d"` では runtime 経路に影響しない。False の場合は従来の passive MC \(P_{rr}/E\) tally closure を使う）
-  - `sn_n_angles: int`（既定 8；\(S_N\) angular quadrature order。偶数かつ `>= 2`）
-  - `sn_material_coupling: bool` (default False; when True, run the GPU \(S_N\) solve once per radiation step. In 1D_SPH with `solver="quasidiffusion_1d"`, the GPU \(S_N\) solve is used as a chi-only HO closure, and the existing QD LO solver updates `State.holo_E_LO`, `State.holo_F_LO`, `State.Te`, `State.ee`, and `State.Pe`. In 2D_RZ, the path publishes the deterministic material source as `State.holo_rad_dep - State.holo_rad_emit`, and material source injection applies this deterministic source instead of particle `rad_dep/rad_emit`. MC transport continues for diagnostics/validation but does not own material energy. Requires `sn_closure=True`; supports 1D_SPH and 2D_RZ.)
-  - `residual_particles_per_cell_group: int`（既定 4；将来の residual particle 診断/制御用予約値。有効範囲：`>= 1`）
-  - 互換用 deprecated keys: `q_min`, `q_max`, `tau_on`, `tau_off`, `reduced_flux_on`, `reduced_flux_off`, `update_interval`, `hold_on`, `min_dwell_steps`, `min_island_cells`, `core_margin_cells` は parse/freeze されるが、v1 の LO material-coupling mask では使用しない。
-- `boundary: dict`
+- `ddmc: dict`・`diffusion: dict`・`holo: dict`（退役したモンテカルロ輻射の DDMC、拡散ハイブリッド、HOLO の設定。受理し、効果は無い（WARNING）。`ddmc.enabled=True`・`holo.enabled=True` は `ConfigError`（`diffusion.enabled=True` は退役前も FLD・S\(_N\) で拒否していなかったので受理して無視する）。各キーの意味は退役前（2026-09-28 まで）の本書を参照）
+- `boundary: dict | str`（トップレベルの面の設定。**`multigroup_diffusion` と `sn_transport` は面の値を読まず**、
+  それぞれ `Radiation.multigroup_diffusion.boundary`・`Radiation.sn_transport.boundary` を読む。この 2 モードで下の `type`・面のキーに既定以外の値を
+  書くと `ConfigError`（FLD は以前から、S\(_N\) は 2026-09-29 から — それまでは受理して無視し、`outer_r="marshak"` が黙って真空になっていた）。
+  駆動の値 `marshak_Tr_eV`・`marshak_Tr`・`marshak_Tr_map` はどのモードでもここに書く）
   - `type: Literal["vacuum","reflect","marshak"]`（既定 `"vacuum"`）
-  - `inner: Optional[Literal["vacuum","reflect","marshak"]]`（1D_SPH内側境界；既定 `"reflect"`（r=0対称））
-  - `outer: Optional[Literal["vacuum","reflect","marshak"]]`（1D_SPH外側境界；既定は `type` の値）
-  - `marshak_Tr_eV: Optional[Union[callable, dict[str, callable]]]`（境界放射温度関数 \(T_{r,f}(t)\) [eV]、検証用。1D_SPH: 単一 `callable`（外側境界に適用）。2D_RZ: `dict[str, callable]`（面ごとに指定、例: `{"r_outer": T_func}`、§6.4.5 参照）。各callableのシグネチャ：`T(t_s: float) -> float` [eV]。初期化時に FrozenTable1D 化（サンプリング: 時刻 \(t_k = k\,h\)（\(h = 2^{-40}\) s ≈ 0.909 ps、\(k = 0, \ldots, \lceil t_{end}/h \rceil\)）で評価し、各区間で弦と中点値の差が局所値の \(10^{-6}\) を超える間は 2 分割して中点を加える（最小間隔 \(h/2^7\) ≈ 7.1 fs）。標本時刻も細分の判定もその時刻付近の関数値だけで決まるので、\(t_{end}\) の違う実行でも重なる範囲の表は同一（2026-09-24 に \([0, t_{end}]\) の 10000 等間隔点から変更）。基準点が \(2^{20}\) を超える長時間（\(t_{end} >\) 約 0.95 µs）では \(h\) を 2 倍ずつ広げて \(2^{20}\) 以下に収め、その場合だけ表は \(t_{end}\) の 2 冪の区分に依存する。線形補間テーブルとして凍結）。**端点外挿規則**：\(t < 0\) および \(t > t_{end}\) では \(T_r = 0\) とする（Marshakソース停止と等価））
+  - `inner_r`（別名 `r_inner`）・`outer_r`（`r_outer`）・`bottom_z`（`z_bottom`）・`top_z`（`z_top`）：面ごとの型（既定 `inner_r="reflect"`、他は `"vacuum"`）。
+    `inner`・`outer` の綴りは受理されない（未知のキー）
+  - `marshak_Tr_eV: float`（既定 0；定数の境界放射温度 [eV]。正の値は `marshak_Tr` より優先）
+  - `marshak_Tr: Optional[callable]`・`marshak_Tr_map: Optional[dict[str, callable]]`（時間の関数 \(T_r(t)\) [eV]、面ごとの関数。旧名 `marshak_T` は非推奨で `marshak_Tr` と同じ）
+  - 以下は設計時の記述（callable の `marshak_Tr_eV`）：
+  - `marshak_Tr_eV（設計時）`（境界放射温度関数 \(T_{r,f}(t)\) [eV]、検証用。1D_SPH: 単一 `callable`（外側境界に適用）。2D_RZ: `dict[str, callable]`（面ごとに指定、例: `{"r_outer": T_func}`、§6.4.5 参照）。各callableのシグネチャ：`T(t_s: float) -> float` [eV]。初期化時に FrozenTable1D 化（サンプリング: 時刻 \(t_k = k\,h\)（\(h = 2^{-40}\) s ≈ 0.909 ps、\(k = 0, \ldots, \lceil t_{end}/h \rceil\)）で評価し、各区間で弦と中点値の差が局所値の \(10^{-6}\) を超える間は 2 分割して中点を加える（最小間隔 \(h/2^7\) ≈ 7.1 fs）。標本時刻も細分の判定もその時刻付近の関数値だけで決まるので、\(t_{end}\) の違う実行でも重なる範囲の表は同一（2026-09-24 に \([0, t_{end}]\) の 10000 等間隔点から変更）。基準点が \(2^{20}\) を超える長時間（\(t_{end} >\) 約 0.95 µs）では \(h\) を 2 倍ずつ広げて \(2^{20}\) 以下に収め、その場合だけ表は \(t_{end}\) の 2 冪の区分に依存する。線形補間テーブルとして凍結）。**端点外挿規則**：\(t < 0\) および \(t > t_{end}\) では \(T_r = 0\) とする（Marshakソース停止と等価））
   - `marshak_Tr: Optional[callable]`（Time callable T_r(t) [eV] for the marshak boundary drive; frozen to a table at init. Consumed by the 2D IMC emitter AND (since 2026-07-09) the deterministic 1D FLD/SN marshak outer boundaries (indirect-drive mode). A positive `marshak_Tr_eV` takes precedence. For 1D, exactly one of {`marshak_Tr_eV`, `marshak_Tr`, grey `marshak.flux_erg_per_cm2_s`} must be set when `outer_r="marshak"`.）
-  - `marshak_particles: int`（既定 1000；有効範囲：`≥ n_marshak_faces`（Marshak境界面数。最低1粒子/面保証のため）；Marshak境界のソース粒子数/ステップ。`Radiation.enabled=False` の場合は無視される。`marshak_particles < n_marshak_faces` の場合は `ConfigError("marshak_particles must be >= number of Marshak boundary faces")`。NUMERICS §8.2参照）
+  - `marshak_particles: int`（退役したモンテカルロ輻射の Marshak 境界の粒子数。受理し、効果は無い（WARNING））
   - **境界タイプ別の必須パラメータ**：`"vacuum"` / `"reflect"` は追加パラメータ不要。`"marshak"` は `marshak_Tr_eV`（callable: \(T_{r,f}(t)\) [eV]）が必須。未指定の場合は `ConfigError`
-  - **境界型の優先順位 (1D_SPH)**：
+  - **境界型の優先順位 (1D_SPH、退役した `imc_ddmc` の設計時の記述。キー名は現行では `inner_r`・`outer_r`)**：
     - `type` は `inner` と `outer` の両方のデフォルト値を設定する
     - `inner` と `outer` が個別に指定された場合、`type` を上書きする
     - `inner` のデフォルトは常に `"reflect"` (1D_SPH の原点対称性)。
@@ -1682,7 +1589,7 @@ Numerics(
 - v1.0 では後方互換のため `'reflective'` も受け入れ、`'reflect'` に変換し WARNING 出力。
 
 #### 6.4.6 Laser(...)
-- `enabled: bool`（既定 True；False の場合：レイトレース不実行、`laser_dep=0`、LaserMesh は確保されない。レーザーは独立Δt制約を持たないため（NUMERICS §2.2(d)）、無効化によるΔt変化はない。laser_pattern 診断は自動無効化。LaserBeam 定義は無視される）
+- `enabled: bool`（既定 False；False の場合：レイトレース不実行、`laser_dep=0`、LaserMesh は確保されない。レーザーは独立Δt制約を持たないため（NUMERICS §2.2(d)）、無効化によるΔt変化はない。laser_pattern 診断は自動無効化。LaserBeam 定義は無視される）
 - `wavelength_nm: float`（例 351.0 [nm]；有効範囲：`> 0`。内部で cm に変換（`λ_cm = wavelength_nm × 1e-7`）。ICF典型値：351 nm（3ω）、527 nm（2ω）、1053 nm（1ω）。NUMERICS §5.4参照）
 - `mode: Literal["raytrace_2d","raytrace_3d","spherical_average","radial_absorption_1d"]`（1D_SPH既定 `"raytrace_2d"`、2D_RZ既定 `"raytrace_3d"`；1D_SPH では `"raytrace_2d"` または `"radial_absorption_1d"` を受理し（`Mesh.geometry_1d` の球・円柱・平板のいずれでも — 円柱・平板の `"raytrace_2d"` は 2026-09-24 から、NUMERICS §5.3.6 (g)）、`"spherical_average"` は全ビーム同一条件の場合の検証・回帰テスト用互換モードとして受理する。2D_RZ で `"radial_absorption_1d"` または `"raytrace_2d"` を指定した場合は `ConfigError`。1D_SPH で `"raytrace_3d"` を指定した場合は `ConfigError`。§5.4.1、§5.4.1a、§5.4.2参照）
 - `beams: list[LaserBeam]`（12本など；有効範囲：`≥ 1`。`Laser.enabled=True` の場合は必須（空リスト不可）。各ビームは `LaserBeam(...)` で定義）
@@ -1697,7 +1604,7 @@ Numerics(
     - `eps_crit: float`（既定 1e‑4 [無次元]；有効範囲：`(0, 0.1]`；臨界密度終了判定。`critical_margin < 1 - eps_crit` の場合は **ConfigError**（WARNINGではなくエラー）。NUMERICS §5.2参照）
     - `terminate: bool`（既定: `Laser.raytrace.integrator` が `"characteristic"`（1D_SPH の `raytrace_2d` の既定）なら False、それ以外は True（2026-09-24。`terminate_mode="deposit"` を指定したときは True）。True: 臨界層（解析的尾部閉包の入口、または臨界半径 \(\hat n_{raw}\ge1-\varepsilon_{crit}\)）に達したレイは終了し、残りのパワーは `terminate_mode` に従う。**False（2026-09-24）**: レイは臨界半径で反射して外向きに追跡される（尾部閉包なし、`Laser.raytrace.integrator="characteristic"` 必須 — 行進では ConfigError、`terminate_mode="deposit"` との併用も ConfigError）。2026-09-24 まで False は受理されて無視されていた。NUMERICS §5.2 の反射モード参照）
     - `terminate_mode: Literal["escape","deposit"]`（既定 `"escape"`；`terminate=True` で終了したレイの残りのパワーを未吸収とする（escape）か、臨界隣接セルへ沈着する（deposit）か）
-  - `coulomb_log_floor: float`（既定 2.0 [無次元]；有効範囲：`[1.0, 30.0]`；IB吸収固有のクーロン対数 lnΛ 下限。未指定時は `Numerics.coulomb_log_floor` にフォールバック。NUMERICS §5.4参照）
+  - `coulomb_log_floor: float`（既定 2.0 [無次元]；有効範囲：`[1.0, 30.0]`（2026-09-29 から検査。それまでは `> 0` だけ）；IB吸収固有のクーロン対数 lnΛ 下限。`Numerics.coulomb_log_floor` は読まない。NUMERICS §5.4参照）
   - `debug_dump_lasermesh: bool`（既定 False；デバッグ用。True の場合、2D_RZ `raytrace_3d` で LaserMesh の \(T_e\), \(Zbar\), \(\hat n\), raw \(\hat n\), `smooth_kappa_factor` の一回限りの統計ダンプを出力する。物理・沈着結果には影響しない）
 - `ib: dict`（拡張 IB 物理。`zeff_model` と `langdon_model` は既定 `"auto"`（構築時解決）、`coulomb_log_model` と `ra` は既定 OFF。v1 は 1D_SPH 限定。非対応の `"auto"` はエラーなく `"off"` に解決されるため、非 1D deck は影響を受けない。NUMERICS §5.4.5 参照。2026-07-30 追加）
   - `zeff_model: Literal["auto","off","sequential_strip","table"]`（既定 `"auto"` = 構築時に次の順で解決する（解決時に INFO ログ 1 行）: 材料が TMAT `/ionization` を提供していれば `"table"`、`species` の指定があれば `"sequential_strip"`、全ての非 void 材料が同じ多種組成（TMAT `/material` の Z と数割合、2〜4 種）を持てばその組成を `species` として `"sequential_strip"`、それ以外は `"off"`（非 void 材料に混合物 — 多種の組成、または組成不明で非整数の平均 Z — があれば WARNING 1 行）。`species` と共通組成の 2 規則は `Main.dimension="1D_SPH"` かつ球（`Mesh.geometry_1d="spherical"`）のときだけ適用し、1D の円筒・平板（1D_CYL を含む）と 2D_RZ では表が無ければ警告なしで `"off"`（IB 拡張は球 1D の光線追跡だけ）。単一元素・理想気体単体の run は従来とビット同一。2026-09-23 以前は表が無ければ常に `"off"`（組成の分かる CD などでも黙って平均 \(\bar Z\) を使っていた）；混合プラズマ衝突電荷 \(Z_{\rm eff}=\langle Z^2\rangle/\langle Z\rangle\) の評価法。`"sequential_strip"` は `species` とセル \(\bar Z\) から核電荷昇順の逐次剥離クロージャで評価（完全電離極限で厳密）。`"table"` は TMAT 材料の `/ionization` ブロックから縮約した \(Z_{\rm eff}/\bar Z\) 表（log-log 双線形・端クランプ）で評価 — 単一材料では `/ionization` を持つ tmat 材料がちょうど 1 つ必要（無い場合 ConfigError）、かつ表の (nᵢ, T) 両格子は log 一様必須。**1D_SPH の多材料デッキ（2026-09-24）**: モデルを材料ごとに解決し（`auto`: その材料の `/ionization` → table、`species` 指定 → 全材料 sequential_strip、その材料の TMAT 組成 2〜4 種 → sequential_strip、他は off。明示値は可能な材料だけに適用）、レーザー格子の節点はその材料のモデルで評価、Langdon の \(Z_{\rm coll}\) も材料ごと（組成の完全電離値、無ければ節点の \(\bar Z\)）。電離モーメント（流体）もセルの材料の表で、多材料デッキでの ConfigError を撤廃）
@@ -1717,22 +1624,19 @@ Numerics(
   - `func: Optional[callable]`（`model="custom"` の場合は必須；シグネチャ：`I(r_transverse_cm: float) -> float`（相対強度、無次元、有限かつ `>= 0`）。`model="custom"` 以外で指定すると ConfigError）
   - `r_max_um: float`（`model="custom"` の場合は必須；`func` をテーブル化する横方向半径の上限 [µm]、`> 0`。初期化時に \([0, r_{max}]\) の等間隔 2001 点で `func` を評価し、`model="table"` と同じ区分線形テーブルとして凍結する（\(r \ge r_{max}\) は 0）。frozen config には `"table"` と標本値が記録される。2026-09-24 実装）
   - 1D_SPH の `raytrace_2d` では強度分布はターゲット中心を通る面で定義される。焦点がターゲット中心（`focus` 未指定かつ `defocus_DR = 0`、または `focus=(0,0,0)`）のビームでは全リングが中心の値を受け取り、分布の形は堆積に効かない。gaussian 以外の分布か `w0_um` を指定したビームがこの条件にあると WARNING を出す
-- `spot: dict`（**非推奨（deprecated）**：内部で `profile` に自動変換される。後方互換のため残す。変換規則は `LaserBeam.spot` と同一（下記参照）。常に deprecation WARNING を出力）
+- `spot`：`Laser` の直下では**受理されない**（未知のキーとして `ConfigError`）。全ビーム共通の分布は `profile` で書く（ビームごとの `LaserBeam.spot` は非推奨として受理する）
 - `lasermesh: dict`（`enabled` キーは無い — 指定すると未知キーとして扱う）
-  - `nr: int`（既定 128；有効範囲：`≥ 16`；R方向メッシュ数。1D_SPHでは動的サイジングにより上書きされる（§5.7.1参照）。2D_RZでは静的指定値を使用）
-  - `nz: int`（既定 256；有効範囲：`≥ 16`；Z方向メッシュ数。1D_SPHでは `nz = 2 × nr`（動的）。2D_RZでは静的指定値を使用）
-  - `r_max: float`（R方向の最大値 [cm]；既定 \(1.5 \times R_{target}\)。2D_RZのみ使用）
-  - `z_min: float`（Z方向の最小値 [cm]；既定 \(Z_{center} - 1.5 \times R_{target}\)。2D_RZのみ使用）
-  - `z_max: float`（Z方向の最大値 [cm]；既定 \(Z_{center} + 1.5 \times R_{target}\)。2D_RZのみ使用）
-  - **R_target / Z_center の既定値**：R_target = Mesh.r_max (1D_SPH) or max{r : ρ(r) > ρ_floor × 10} (2D_RZ)。Z_center = (Mesh.z_min + Mesh.z_max) / 2 (2D_RZ) or 0 (1D_SPH)。
-  - `r_max_factor: float`（既定 1.5；有効範囲：`[1.0, 5.0]`；動的メッシュサイジング時の R_max スケール係数。1D_SPHで使用。NUMERICS §5.7.1参照）
+  - `nr: int`（既定 128；有効範囲：`≥ 4`；R方向メッシュ数。1D_SPHでは動的サイジングにより上書きされる（§5.7.1参照）。2D_RZでは静的指定値を使用）
+  - `nz: int`（既定 256；有効範囲：`≥ 4`；Z方向メッシュ数。1D_SPHでは `nz = 2 × nr`（動的）。2D_RZでは静的指定値を使用）
+  - `r_max`・`z_min`・`z_max`・`stretch`：**受理されない**（未知のキーとして `ConfigError`）。範囲は下の係数で決まる：
+    \(R_{max}=\) `r_max_factor` \(\times R_{target}\)、2D_RZ の Z 範囲は \(Z_{center}\pm\) `z_span_factor` \(\times R_{target}\)、1D は \(\pm R_{max}\)。
+    \(R_{target}=\max(|r_{min}|,|r_{max}|)\)（`Mesh` の値）、\(Z_{center}\) は 2D_RZ で `(Mesh.z_min + Mesh.z_max)/2`
+  - `r_max_factor: float`（既定 1.5；有効範囲：`[1.0, 5.0]`（2026-09-29 から検査。それまでは `> 0` だけ）；R_max のスケール係数。NUMERICS §5.7.1参照）
+  - `z_span_factor: float`（既定 1.5；有効範囲：`> 0`；2D_RZ のレーザー格子の Z 方向の半幅 / \(R_{target}\)）
   - `mesh_factor: float`（既定 0.5；有効範囲：`(0, 2.0]`；1D_SPH の動的gradedメッシュで最小セル幅 \(dR_{fine}\) を設定する係数。\(dR_{fine}=\) `mesh_factor` × 臨界面近傍の局所最小流体セル幅（§5.7.2）。小さいほど高解像度だがコスト増）
   - `rmax_n_hat_threshold: float`（既定 0.001；有効範囲：`(0, 1.0)`；R_max を決定する正規化電子密度閾値。\(\hat n \ge\) この値を満たす最外セルの外側エッジからR_maxを決定する。1D_SPHの動的サイジングで使用。NUMERICS §5.7.1参照）
   - `nr_max: int`（既定 4096；有効範囲：`>= 4`；1D_SPH の動的gradedメッシュにおける R方向セル数のハード上限。GPU OOM 安全策。`nz=2*nr`）
-  - `stretch: dict`（格子ストレッチ設定。**v1.0では実質legacy**：1D_SPHでは臨界面中心のpiecewise-geometric gradedメッシュを使用し、`stretch` パラメータはメッシュ生成に影響しない）
-    - `enabled: bool`（既定 True）
-    - `method: Literal["density_gradient"]`（既定 `"density_gradient"`；後方互換のため受理。1D_SPH の実装では内部固定の graded 生成（`g_core=1.08`, `g_corona=1.05`）を使用）
-    - `min_ratio: float`（既定 0.2；有効範囲：`(0, 1]`；後方互換パラメータ。1D_SPH 動的gradedメッシュでは未使用）
+  - `stretch_method`・`min_ratio`：**受理するが使わない**（WARNING を出す。`min_ratio` は `(0, 1]` の範囲だけ検査する）。どのレーザー格子もこれらを読まない — 1D は臨界面を中心とする独自の graded 格子（§5.7.2）、2D は一様格子。2026-09-29 までは警告なしで無視していた
   - `critical_clip: bool`（既定 True；臨界密度以下の領域のみをカバーする）
   - `critical_margin: float`（既定 `1 - eps_crit`（= 0.9999 when eps\_crit=1e‑4）；有効範囲：`(0, 1)`；\(n_e/n_{crit}\) がこの値以下の領域をカバー。**整合性要件**（validate で **ConfigError**）: `critical_margin ≥ 1 - eps_crit` でなければならない。既定値は `eps_crit` に追随するため、ユーザが `eps_crit` のみ変更すれば自動整合する。明示指定時は整合性を検証する。NUMERICS §5.7.1参照）
   - `ghost_corona: dict`（ゴーストコロナ設定。1D_SPH シャープギャップ対応。NUMERICS §5.7.5参照）
@@ -1754,7 +1658,7 @@ Numerics(
   - `azimuthal_rays: int`（既定 16、範囲 [1, 4096]；2026-09-24 導入）: `Mesh.geometry_1d` が `"cylindrical"`・`"planar"` の `raytrace_2d` で、ビーム断面の各輪（`rays_per_beam` 本）をビーム軸まわりに何本のレイへ広げるか（NUMERICS §5.6.3 (a')。レイ数は輪 × 方位角、パワーは輪の重み / 方位角数）。平板の垂直入射では全方位角が同じレイになるので 1 本。球では使わない（輪ごとに 1 本）。frozen config に書く。
   - `lanes_per_ray: int`（既定 `0`、値は 0・32・64・128・256；2026-09-25 導入）: `integrator="characteristic"` で 1 レイを追跡するレーン数（NUMERICS §5.3.6 (c')。各レーンが経路の 1 区間を受け持ち、レイはこの数の区間ずつ進む）。`0` は起動側がバッチのレイ数と GPU から選ぶ: その核関数を GPU が同時に常駐させられるスレッド数（占有率 × SM 数）以内に全レイ × レーン数が収まる最大の 256・128・64、どれも収まらなければ 32。結果の丸めはレーン数に依存する（同じ GPU・同じレイ数なら run の反復は bit で一致。別の種類の GPU と bit で比べるときは値を固定する。常駐ループは 32 で追跡するので、多カーネル経路と和・積の結合順が同じになるのは 32 のとき）。`integrator` が `"characteristic"` 以外で 0 以外を与えると `ConfigError`、他の値は `ValueError`。frozen config に書く（この版より前の checkpoint の frozen config には既定値 0 を補う）。
   - `cfl_ray: float`（既定 0.8 [無次元]；有効範囲：`(0, 1]`；レイステップ制約 \(C_{ray} = \Delta s / \Delta x \le\) cfl_ray。NUMERICS §5.3.4 (d) 参照）
-  - `gradient_interpolation: Literal["bilinear"]`（既定 `"bilinear"`；節点4点双線形補間。v1.0では唯一のオプション。NUMERICS §5.3.4参照）
+  - `gradient_interpolation`：**受理されない**（未知のキーとして `ConfigError`）。2D の勾配の補間は節点 4 点の双線形に固定（NUMERICS §5.3.4）
   - `intensity_cutoff: float`（既定 1e-6 [無次元]；レイの最小強度カットオフ（初期パワー比）。`I < intensity_cutoff * I_0` で終了。`0` で無効。NUMERICS §5.2参照）
   - `ds_adapt_g_target: float`（既定 0.05 [無次元]；有効範囲：`(0, 1]`；適応ステップ幅制御の屈折角変化目標。1ステップで \(|\hat\nabla\hat n| \times \Delta s_{base}\) がこの値以下になるようステップ幅を拡大する。NUMERICS §5.3.2参照）
   - `ds_adapt_tau_target: float`（既定 0.05 [無次元]；有効範囲：`(0, 1]`；適応ステップ幅制御の光学的深さ目標。1ステップで \(\kappa \times \Delta s_{base}\) がこの値以下になるようステップ幅を拡大する。NUMERICS §5.3.2参照）
@@ -1774,7 +1678,7 @@ Numerics(
     (b) いずれかのビームの direction ベクトルの L2 ノルム変化 \(> 10^{-10}\)
     (c) 現ステップで ALE rezone が実行された
 - `cbet: dict`（Cross-Beam Energy Transfer、Marozas/DRACO 型 v1。**1D_SPH + mode="raytrace_2d" または 2D_RZ + mode="raytrace_3d" 専用、単一 MPI rank 必須**。NUMERICS §5.10 参照）
-  - `enable: bool`（既定 False；CBET 有効化。False で全既存挙動と bit 恒等。True は `(Main.dimension="1D_SPH" and Laser.mode="raytrace_2d")` または `(Main.dimension="2D_RZ" and Laser.mode="raytrace_3d")` のみ受理）
+  - `enable: bool`（既定 False；CBET 有効化。False で全既存挙動と bit 恒等。True は `(Main.dimension="1D_SPH" and Mesh.geometry_1d="spherical" and Laser.mode="raytrace_2d")` または `(Main.dimension="2D_RZ" and Laser.mode="raytrace_3d")` のみ受理。角度グループの数（ビーム × 分岐 × `n_impact_bins`）は 32767 以下（超えると実行時に停止）。`geometry_mode="port_section"` の展開した対の数（ポート × 2 × `n_impact_bins` の群の \(G(G-1)/2\)）は 65536 以下で、超えると `ConfigError`（2026-09-29 から。それまでは最初の CBET の解で停止した））
   - `f_cbet: float`（既定 1.0；有効範囲：`> 0`；偏光/較正係数 \(\eta_{pol}=f_{cbet}[1+(\hat k_q\cdot\hat k_p)^2]/4\)）
   - `alpha_iaw: float`（既定 0.2；有効範囲：`> 0`；無次元イオン音波減衰率 \(\nu_a/(|k_a|c_a)\)）
   - `theta_cap: float`（既定 0.3；有効範囲：`(0, 1)`；donor cap — 1 交差あたり相対損失上限）
@@ -1830,7 +1734,7 @@ Numerics(
       - `eta_inf: float`（既定 機構依存；有効範囲：`(0, 1)`；漸近効率 \(\eta_\infty\)）
       - `eta_hard_cap: float`（既定 機構依存；有効範囲：`(0, 1)`；チャネル個別上限）
       - `shape_coefficient: float`（既定 1.0；有効範囲：`> 0`；飽和形状係数 \(a_k\)）
-      - `relaxation_model: Literal["vu2012","fixed"]`（既定 機構依存；緩和時定数則）
+      - `relaxation_model: Literal["vu2012","fixed"]`（既定 機構依存；緩和時定数則。`"vu2012"` は TPD の近似式なので、SRS のチャネルに与えると `ConfigError`（2026-09-29 から。それまでは黙って固定時間を使っていた））
       - `relaxation_tau_s: float`（既定 6.0e-12；有効範囲：`> 0`；`"fixed"` の τ [s]）
       - `relaxation_tau_min_s: float` / `relaxation_tau_max_s: float`（既定 3.0e-12 / 1.0e-11；`0 < min ≤ max`；`"vu2012"` の clip 範囲 [s]）
   - `tpd_overlap_mode: Literal["single_beam","common_wave_cluster"]`（既定 `"single_beam"`；`"common_wave_cluster"` = Michel 2013 Eq.(1) 等角クラスタの overlap 強度（設計 §4/§11、**S3 で物理有効化**）。要件: `port_configuration.ports` 非空・`eta_mode="model"`・`common_wave_delta_theta_deg` 指定）
@@ -1845,17 +1749,17 @@ Numerics(
     - `n_mu: int` / `n_phi: int`（既定 6 / 8；`≥ 1`）
   - **制約**：`enable=True` は `Main.dimension="1D_SPH"`（`Laser.mode in {"radial_absorption_1d","raytrace_2d"}`）または `"2D_RZ"`（`Laser.mode="raytrace_3d"`、単一 MPI rank）を要求する。`Laser.cbet.enable` と相互排他（**例外: `cbet.geometry_mode=\"port_section\"` かつ `eta_mode=\"model\"` のみ併用可 — capture は CBET 後 power で実行、NUMERICS §5.10.8**）。1D では `angular_model="cone"` は `Mesh.geometry_1d="cylindrical"` で拒否される。2D_RZ では `angular_model="radial"` と明示 `inner_bc`（既定以外）は拒否される（1D 専用概念）。multiblock 格子は hote 層で対応済み（2026-07-17 — MeshView2D multiblock builder、三角セル含む全 scheme、unit-gated；NUMERICS §5.11.2）— ただし multiblock の載る `logical_mesh_2d="spherical_polar_halfplane"` が現在 hydro-only（Laser 自体を validate で拒否）のため、deck 到達性は上流 laser-on-spherical-polar フェーズ待ち。hot-e 有効時は raytrace-skip cache が無効化される。persistent kernel は `hot_electron` 有効時に拒否する。`sources` は最大 4 チャネル・空リスト不可；機構外 key（tpd 系 knob を cone/srs へ等）は parse エラー。frozen config には `sources` 使用時のみ `sources` ブロックが出力される（機構に応じた key 集合；未使用 deck の frozen 出力は byte 恒等）。**`eta_mode="model"` の追加制約**：`Main.dimension="1D_SPH"` のみ（2D_RZ は capture が segment-start power のため設計文書 §17.1 により拒否）；`sources` 必須（scalar shorthand 不可）；全チャネル `mechanism in {"tpd","srs"}`（`"cone"` 不可）；`subtract_from_laser=True` 必須；チャネル `eta`/`eta_table` の指定は拒否（model が η を所有）；frozen config には `eta_mode` と `eta_model` ブロック・チャネル model key 群は `eta_mode="model"` のときのみ出力（legacy frozen 出力は byte 恒等）。
 - `deposit: dict`
-  - `map: Literal["bilinear_node","conservative_overlap"]`（既定 `"bilinear_node"`；近傍4節点への双線形分配）
-    - v1.0 で `"conservative_overlap"` を指定した場合: `ConfigError("conservative_overlap is not available until v1.1")` を送出。
+  - `map`：**受理されない**（未知のキーとして `ConfigError`）。転写の方式は固定 — 1D は光線追跡が流体セルへ直接沈着し、2D_RZ はセル中心でのレーザー格子の双線形補間（`transfer_2d_kernel`、NUMERICS §5.8.1）
   - `deposit_smooth_passes: int`（既定 0；有効範囲：`>= 0`。1D_SPH/2D_RZ の Hydro cell への転写時に適用する診断用の保存的 smoothing パス数。1D_SPH は mass-weighted、2D_RZ は 4 近傍 Jacobi smoothing。`0` で無効。NUMERICS §5.8.1 参照）
   - `deposit_smooth_alpha: float`（既定 0.25 [無次元]；有効範囲：`[0, 0.5]`。診断用 deposit smoothing の 1 パスあたり重み。`0` で無効。void/blocked 隣接セルでは自動的に抑制される。NUMERICS §5.8.1 参照）
 
 `LaserBeam(...)`：
 - `name: str`（任意；既定 `"beam_0"`, `"beam_1"`, ... 自動付番。有効文字: `[a-zA-Z0-9_-]`、最大長: 64）
-- `direction: tuple[float,float,float]`（入射方向単位ベクトル (dx, dy, dz)；ビーム軸の方向。**必須**。初期化時にユニット長に正規化。\(|\mathbf{direction}| < 10^{-10}\) の場合は `ConfigError`。内部表現では極角 θ / 方位角 φ [deg] に変換して ARCHITECTURE §4.1 Config::LaserConfig の BeamDef.theta / BeamDef.phi に格納）
+- `direction: tuple[float,float,float]`（入射方向ベクトル (dx, dy, dz)；ビーム軸の方向。`direction` か `theta`・`phi` の組のどちらかが**必須**。初期化時にユニット長に正規化。長さが \(10^{-10}\) 未満か非有限なら `ConfigError`（2026-09-29 から。それまではゼロベクトルが黙って +z になっていた））
+- `theta: float`・`phi: float`（`direction` を書かないときの極角・方位角 [**rad**]；方向は \((\sin\theta\cos\phi, \sin\theta\sin\phi, \cos\theta)\)。両方の指定が必要）
 - `focus: tuple[float,float,float]`（焦点座標 [cm]；ビーム軸上の集光位置。`focus` と `defocus` が両方指定された場合は **`focus` が優先**）
-- `f_number: float`（F値 [無次元]；**必須**。すべてのビームで指定が必要。focus/defocus 設定に関わらず、ビーム初期化と幾何計算に使用される。有効範囲：`[1.0, 50.0]`。レンズ焦点距離とレンズ径の比 \(f/D_{lens}\)。ICF典型値：1.0-10.0。NUMERICS §5.6参照）
-- `defocus: Optional[float]`（デフォーカスパラメータ D/R（無次元）；`focus` 未指定時に使用。D = 集光位置とターゲット中心のビーム軸方向符号付き距離、R = ターゲット外半径。**符号規約**: D/R < 0：ターゲット手前に集光（over-focused、実験で最も一般的）、D/R > 0：ターゲット奥に集光（under-focused）、D/R = 0：ターゲット中心に集光。NUMERICS §5.6.5参照）
+- `f_number: float`（F値 [無次元]；既定 8.0。focus/defocus 設定に関わらず、ビーム初期化と幾何計算に使用される。有効範囲：`[1.0, 50.0]`（2026-09-29 から検査。それまでは `> 0` だけ）。レンズ焦点距離とレンズ径の比 \(f/D_{lens}\)。ICF典型値：1.0-10.0。NUMERICS §5.6参照）
+- `defocus_DR: Optional[float]`（既定 0；デフォーカスパラメータ D/R（無次元）；`focus` 未指定時に使用。`defocus` の綴りは受理されない（未知のキー）。D = 集光位置とターゲット中心のビーム軸方向符号付き距離、R = ターゲット外半径。**符号規約**: D/R < 0：ターゲット手前に集光（over-focused、実験で最も一般的）、D/R > 0：ターゲット奥に集光（under-focused）、D/R = 0：ターゲット中心に集光。NUMERICS §5.6.5参照）
 - `power: callable`（時間波形。**必須**。シグネチャ：`P_W(t_s: float) -> float`（入力 [s]、出力 [W]）。初期化時に FrozenTable1D に変換される。サンプリング: 時刻 \(t_k = k\,h\)（\(h = 2^{-40}\) s ≈ 0.909 ps、\(k = 0, \ldots, \lceil t_{end}/h \rceil\)）で評価し、各区間で弦と中点値の差が局所値の \(10^{-6}\) を超える間は 2 分割して中点を加える（最小間隔 \(h/2^7\) ≈ 7.1 fs）。標本時刻も細分の判定もその時刻付近の関数値だけで決まるので、\(t_{end}\) の違う実行でも重なる範囲の表は同一（2026-09-24 に \([0, t_{end}]\) の 10000 等間隔点から変更）。基準点が \(2^{20}\) を超える長時間（\(t_{end} >\) 約 0.95 µs）では \(h\) を 2 倍ずつ広げて \(2^{20}\) 以下に収め、その場合だけ表は \(t_{end}\) の 2 冪の区分に依存する。線形補間テーブルとして凍結。boundary_pressure と同じ方式（§6.4.7 参照））
   - **2026-07-12 doc-truth 訂正**: 旧記載の dict 形式 `{"type":"piecewise_linear","t_s":[...],"P_W":[...]}` は実装に存在しない（builder は callable のみ受理 — GUI Studio golden gate が SPEC/実装乖離を検出、M4 報告）。区分線形波形は callable で表現する（GUI Studio は同等の `_gui_pwl` callable を生成して deck に埋め込む）。dict 形式の実装追加は未計画（要望が出た時点で判断）
   - **端点外挿規則**：凍結範囲 \([0, t_{end}]\) 外は \(P = 0\) とする
@@ -1867,8 +1771,9 @@ Numerics(
     4. E_computed < 10⁻³⁰ J の場合: ConfigError("Laser.beams[i].energy_J: zero-integral waveform cannot be normalized")
 - `profile: Optional[dict]`（ビーム強度プロファイル；未指定時はLaser全体の `profile` を使用）
   - `model: Literal["gaussian","super_gaussian","flat_top","table","custom"]`
-  - `w0_um: float`（1/eビームウェスト半径 [µm]）
+  - `w0_um: float`（1/eビームウェスト半径 [µm]。gaussian・super_gaussian で未指定なら \(0.5\,R_{target}/\max(f_\#,1)\)）
   - `m: int`（super-Gaussian指数）
+  - 同じ内容は平たいキー `profile_model`・`profile_w0_um`・`profile_m` でも書ける
   - `r_um: list[float]`（`model="table"` 専用・必須；半径格子 [µm]、狭義単調増加・先頭 >= 0）
   - `I_rel: list[float]`（`model="table"` 専用・必須；相対強度 >= 0（少なくとも 1 点 > 0）。区分線形補間、r < r_um[0] は I_rel[0]、r > r_um[-1] は 0（有限ビーム径）。正規化は不要 — 解析モデル同様 ray 初期化側で規格化される。2026-07-17 導入、docs/design/laser_profile_table_20260717.md）
   - `radius_um: float`（flat_topビーム半径 [µm]；`w0_um` も同じ半径として受理）
@@ -1880,26 +1785,25 @@ Numerics(
     - `spot.model='gaussian'` → `profile = {'model': 'gaussian', 'w0_um': spot.radius_um}`
     - `spot.model='flat_top'` → `profile = {'model': 'flat_top', 'radius_um': spot.radius_um}`
     - `spot.model='super_gaussian'` → `profile = {'model': 'super_gaussian', 'w0_um': spot.radius_um, 'm': spot.m}`
-- `rays_per_beam: Optional[int]`（ビーム個別のレイ本数；未指定時はLaser全体の `rays_per_beam` を使用）
 - `delta_lambda_nm: float`（既定 0.0 [nm]；ビーム毎の波長 detuning \(\Delta\lambda_b\)。\(\omega_b=2\pi c/(\lambda_0+\Delta\lambda_b)\) として CBET の g にのみ入る（\(|k|\)・\(n_{crit}\) は共通 \(\lambda_0\) で凍結）。CBET 無効時は無視。NUMERICS §5.10.1 参照）
-- `polarization: Optional[str]`（`"s"` / `"p"` / `"circular"` / `"unpolarized"`；将来実装用。v1.0 で指定した場合、値を frozen config に保存し無視（INFO メッセージ出力）。既定 `None`）
-- `pointing_error: Optional[float]`（[μm]；将来実装用。v1.0 で指定した場合、値を frozen config に保存し無視（INFO メッセージ出力）。既定 `None`）
-- **必須フィールドまとめ**：`power`、`direction`、`f_number`。`name`、`rays_per_beam` は任意
+- ビームごとの `rays_per_beam`・`polarization`・`pointing_error`：**受理されない**（未知のキーとして `ConfigError`）。レイ本数は `Laser.rays_per_beam` で全ビーム共通
+- **必須フィールドまとめ**：`power`、および `direction` または `theta`・`phi`。`name`・`f_number`・`focus`/`defocus_DR`・`profile` は任意
 
 #### 6.4.7 Numerics(...)
 - `dt: dict`
   - **削除済み（2026-08-03）**：旧 `focus_window_t_on_s` / `focus_window_t_off_s` / `focus_window_beta` は廃止され、指定すると unknown key の `ConfigError` になる。
   - `initial_s: Optional[float]`（既定 `1e-15`；初期タイムステップ [s]。float指定時の有効範囲：`> 0`。ICF爆縮では初期の急速加熱で小さな値が必要。`None` 指定時は自動計算：\(\Delta t_0 = 0.1 \times \min_c(\Delta l_c / c_{s,c})\)（CFL安定性に基づく自動推定）。成長率 1.2 は内部定数）
   - `max_s: float`（既定 `1e-9`；タイムステップ上限 [s]。有効範囲：`≥ initial_s`）
-  - `min_s: float`（既定 `1e-20`；タイムステップ下限 [s]。有効範囲：`> 0`。\(\Delta t < \text{min\_s}\) で FATAL 停止（ストーリング防止）。NUMERICS §2.2(e) 参照）
-  - `growth_factor: float`（既定 `1.2` [無次元]；有効範囲：`(1.0, 2.0]`；連続ステップ間のΔt成長率上限 \(\Delta t^{n+1} \le growth\_factor \times \Delta t^n\)。NUMERICS §2.2参照）
+  - `min_s: float`（既定 `1e-20`；タイムステップ下限 [s]。有効範囲：`> 0`。\(\Delta t < \text{min\_s}\) が `min_consecutive_steps` 回続くと FATAL 停止（ストーリング防止）。NUMERICS §2.2(e) 参照）
+  - `min_consecutive_steps: int`（既定 `1`；有効範囲：`>= 1`；\(\Delta t<\) `min_s` のステップがこの回数続いたときに停止する。1 は最初の 1 回で停止（従来の動作）。有限時間の壁は単調に続くので K ステップ以内に止まり、角の幾何による 1 ステップの一時的な落ち込みは生き残る）
+  - `growth_factor: float`（既定 `1.2` [無次元]；有効範囲：`[1.0, 2.0]`（1.0 は受理して WARNING。上限は 2026-09-29 から検査）；連続ステップ間のΔt成長率上限 \(\Delta t^{n+1} \le growth\_factor \times \Delta t^n\)。NUMERICS §2.2参照）
   - `floor_stall_max_consecutive_steps: int`（既定 `0`；有効範囲：`>= 0`。0 で無効。正値では、commit 済み step の \(\Delta t\) が \((1+10^{-6})\text{min\_s}\) 以下に連続して張り付き、残り時刻が \(10^3\text{min\_s}\) より大きく、limiter が `output` / `t_end` でない場合に D4-class floor-stall として FATAL 停止する。NUMERICS §2.2(e) 参照）
   - `cfl_hydro: float`（既定 0.3 [無次元]；有効範囲：`(0, 1]`；流体CFL数。NUMERICS §2.2 (a) 参照）
   - `cfl_length_2d: Literal["sqrt_area","min_altitude"]`（既定 `"sqrt_area"`；2D hydro-CFL の non-button cell characteristic length。`"sqrt_area"` は legacy \(\sqrt{A_c}\)、`"min_altitude"` は `mesh/topology/v2` cell-node CSR polygon の \(\min(2A/P,\text{centroid-fan minimum altitude})\) を使い、CSR 不在または degenerate polygon では silent に \(\sqrt{A_c}\) へ fallback する。NUMERICS §3.2.13 参照）
   - `edge_accel_displacement_cfl_enabled: bool`（既定 `False`；2D edge の速度と前 step の節点加速度から Eq.25 型の closing-displacement CFL を追加し、係数には既存 `cfl_hydro` を再利用する。axis-line edge を含む全 edge を対象とする。NUMERICS §3.2.13 参照）
   - `cfl_cond: float`（既定 0.25 [無次元]；有効範囲：`(0, 1]`；伝導CFL数。STSの内部明示的CFL限界 \(\Delta t_{exp}\) の係数として使用。グローバルΔtには \(s_{max}(s_{max}+1)/2\) 倍に緩和された \(\Delta t_{cond,sts}\) が寄与する。`conduction.enabled=False` の場合は無視。NUMERICS §2.2 (b), §4.2.1 参照）
-  - `f_min_fleck: float`（既定 `0.01` [無次元]；有効範囲：`(0, 1]`；IMC側 Fleck factor下限によるΔt_rad制約。FLD側 Fleck は stiff-cell 極限を保つためこの下限を適用しない。`Radiation.mode` が `imc_ddmc` 以外（`multigroup_diffusion` / `sn_transport`）では Δt_rad 制約自体を評価しない（常に +∞、2026-09-15）。`Radiation.enabled=False` の場合は無視。NUMERICS §2.2 (c) 参照）
-  - **相互整合チェック（Phase 2）**：`dt.min_s >= dt.max_s` → `ConfigError("dt.min_s must be < dt.max_s (got min_s={min_s}, max_s={max_s})")`
+  - `f_min_fleck: float`（退役したモンテカルロ輻射の Fleck 因子下限による Δt 制約（NUMERICS §2.2 (c)）。受理し、効果は無い（WARNING）。FLD・S\(_N\) では 2026-09-15 から評価していなかった）
+  - **相互整合チェック（Phase 2）**：`dt.min_s > dt.max_s` → `ConfigError("Numerics.dt.min_s must be <= max_s")`（等しい値は受理する）
 - `persistent_loop: dict`（1D の persistent megakernel `src/coupling/persistent_loop.cu`。受理判定 `persistent_loop_supported_c1` を通った run は、1 回の cooperative launch で最大 `chunk_steps` step を進める（dt 制御・レーザー・流体・伝導・FLD を 1 カーネル内で実行）。実装していない設定を含む run は WARNING を 1 回出して multi-kernel path で実行する — 拒否する設定は、非 ideal-gas EOS、fixed 以外の `Materials.zbar.model`、レーザーの IB/RA 拡張（Langdon・実効電荷・Coulomb 対数・共鳴吸収・臨界面への沈着）と表のビーム強度分布、`qei_multiplier≠1`、`time_integrator≠"legacy_pc"`、非局所伝導、1T の `cv_e_override`、`kappa_planck` 上書き、`Numerics.safety.overshoot_fatal_enabled`、燃焼、熱副段 など。受理した run の出力は multi-kernel path と同じ規約で書く：履歴の各行の `energy/*_step`・`conservation_error`・clamp 数は直前 step の値（step のエネルギー収支は `compute_step_energy_budget` で組む）、累積の台帳（レーザー・輻射の脱出・Marshak 入射・体積源・床注入）、`write_final_snapshot` の最終スナップショット、`run_info.json` の `termination_reason`。`Numerics.safety.nan_fatal` の非有限値検査は各 step の終わりにカーネル内で行い（FATAL 停止）、`energy_fatal` と clamp の閾値（`clamp_warn_threshold`・`clamp_fatal_threshold`）は chunk の終了後に step ごとに判定する（2026-09-23）。）
   - `enabled: bool`（既定 False；persistent megakernel の opt-in。False で全既存挙動と bit 恒等）
   - `chunk_steps: int`（既定 128；有効範囲：`≥ 1`；persistent-kernel launch あたり step 数 \(K\)）
@@ -2205,7 +2109,8 @@ Numerics(
     これは Sedov blast の強 shock support を保ちながら、GXII shell の source-heated front を
     人工粘性で過剰加熱しないための実装上の固定値である（NUMERICS §3.1.6）。
   - `boundary`：次元に応じて型が異なる（ARCHITECTURE §4.1 Config::HydroConfig 参照）。
-    - **1D_SPH**：`boundary: Literal["free","fixed","reflect","pressure"]`（既定 `"free"`；外側境界条件。`"free"` = P_ext=0（ICF標準）、`"fixed"` = 速度固定壁（v=0）、`"reflect"` = スリップ壁（v_n=0、v_t自由）、`"pressure"` = 外部駆動圧力。NUMERICS §8.1参照）
+    - **1D_SPH**：`boundary: Literal["free","fixed","reflect","pressure"]`（既定 `"free"`；外側境界条件。`"free"` = P_ext=0（ICF標準）、`"fixed"` = 速度固定壁（v=0）、`"reflect"` = スリップ壁（v_n=0、v_t自由）、`"pressure"` = 外部駆動圧力。`"axis"` は 1D で `ConfigError`。同じ値を `boundary_1d` のキーでも指定できる。NUMERICS §8.1参照）
+      - 内側の境界は指定できず、常に速度 0・位置 `r_min` の固定壁（`src/hydro/boundary.cu`）。`Mesh.r_min=0` では中心、`r_min>0`（平板の後面、中空の殻など）では剛体の壁になる
     - **2D_RZ**：`boundary: dict`（per-face 指定）
       - `r_inner: Literal["axis"]`（既定 `"axis"`、変更不可：R=0 対称軸、v_r=0 強制。ARCHITECTURE §4.1 Config::HydroConfig）
       - `r_outer: Literal["free","fixed","reflect","pressure"]`（既定 `"free"`）。Multiblock physical outer-shell mesh-vector constraints use `"fixed"` = both components zero, `"reflect"` = spherical-normal component removed, and `"free"`/`"pressure"` = no normal-motion clamp.
@@ -2241,10 +2146,7 @@ Numerics(
   - `sts_total_stages_max: int`（既定 200000；有効範囲：`>= 0`、0 = 上限なし（legacy）；1 回の伝導適用が起動する総ステージ数 \(n_{sub}\times s\) の liveness 上限。潰れセルの \(\Delta t_{exp}\) 崩壊で \(n_{sub}\) が非有界化して実質ハングに至るのを防ぐ。超過時は state 未変更のまま driver full-step retry（dt/2）を要求し、予算枯渇時は診断付き abort。NUMERICS §4.2.1 参照）
   - `hypre_rtol: float`（既定 1e-8 [無次元]；有効範囲：`(0, 1)`；`solver="hypre"` 時のみ使用。PCG相対収束判定 \(\|r_k\|/\|r_0\| \le rtol\)。NUMERICS §4.2.3参照）
   - `hypre_max_iter: int`（既定 50；有効範囲：`[1, 500]`；`solver="hypre"` 時のみ使用。PCG最大反復数。NUMERICS §4.2.3参照）
-  - `hypre_amg_coarsen: int`（既定 10；`solver="hypre"` 時のみ使用。BoomerAMG粗視化タイプ。10=HMIS（GPU向き）。NUMERICS §4.2.3参照）
-  - `hypre_amg_relax: int`（既定 18；`solver="hypre"` 時のみ使用。BoomerAMG緩和タイプ。18=l1-Jacobi（GPU向き、atomic不要）。NUMERICS §4.2.3参照）
-  - `hypre_amg_interp: int`（既定 6；`solver="hypre"` 時のみ使用。BoomerAMG補間タイプ。6=ext+i（Kershaw行列の対角優位性に適合）。NUMERICS §4.2.3参照）
-  - `hypre_amg_levels: int`（既定 25；有効範囲：`[2, 50]`；`solver="hypre"` 時のみ使用。BoomerAMG最大レベル数。通常変更不要。NUMERICS §4.2.3参照）
+  - `hypre_amg_coarsen`・`hypre_amg_relax`・`hypre_amg_interp`・`hypre_amg_levels`：**受理されない**（未知のキーとして `ConfigError`）。設計時に予定した BoomerAMG の設定キーで、実装には無い
   - `halo_strategy: Literal["every","adaptive"]`（既定 `"every"`；`solver="sts"` 時のSTS各ステージ間のハロー交換戦略。`"every"` = 毎ステージ交換（安全優先、v1.0推奨）、`"adaptive"` = s≤4で毎回、s>4で条件付き（|ΔT/T|>0.1超過時のみ追加交換）。NUMERICS §12.2.3参照）
   - `face_kappa_policy | string | "kirchhoff_same_material" | 面伝導率閉包: "kirchhoff_same_material"（同材料滑面 S_{5/2} 割線、界面/void/κ₀ 跳び >10x は調和 fallback）/ "harmonic"（歴史閉包; NUMERICS §4.1）`
     - Default flipped 2026-07-06 per user decision (rebaseline sprint).
@@ -2256,7 +2158,7 @@ Numerics(
   - `snb_picard_max_iters: int`（既定 8；有効範囲：`[2, ∞)`；`nonlocal_model="snb"` 時のみ使用。iSNB Picard（Cao 2015 §IV）反復上限。収束せず上限到達時は warn + 診断記録の上で最終反復を採用（沈黙しない）。NUMERICS §4.4（1D）・§4.5（2D_RZ）参照）
   - `snb_picard_rtol: float`（既定 0.01；有効範囲：`(0, ∞)`；`nonlocal_model="snb"` 時のみ使用。Picard 収束判定（max-norm の δq 変化 ≤ rtol × max(|q_sh|+|δq|)、Cao の α 判定に相当）。NUMERICS §4.4（1D）・§4.5（2D_RZ）参照）
 - `ale1d: dict`（1D_SPH solution-adaptive ALE V3。既定 `enabled=False`。現行版では GPU sensors、feature list API、monitor、common node mask、scratch candidate rezone、MUSCL/minmod remap scratch API、velocity projection scratch API、scratch diagnostics、および hard-tolerance gated two-phase commit driver を提供する。**動作境界（2026-07-26 fail-closed 化、カーネルレビュー指摘）**: `enabled=True` は 単一材料・`eos_model="ideal_gas"` または表 EOS・radiation は off または `multigroup_diffusion`・`Burn.enabled=False` を要求し、違反は `ConfigError`（`sn_transport` は角度状態 ψ が、burn は在庫場が remap 随伴されないため）。commit 後の EOS 閉包と音速は流体の閉包（1T/2T、全 EOS backend）で行う（2026-09-23。それまでは ALE 独自の成分別再閉包で、1T を 2T 式で閉じていた）。V3 は default-off の研究 prototype であり、この境界外での使用は certify されていない）
-  - `enabled: bool`（実験的。既定 `False`。NUMERICS §3.4 の localized moving feature cases に限って opt-in 推奨。True は `Main.dimension="1D_SPH"` かつ deterministic radiation `mode in {"multigroup_diffusion","sn_transport"}` のみ有効。`mode="imc_ddmc"` は `ConfigError`）
+  - `enabled: bool`（実験的。既定 `False`。NUMERICS §3.4 の localized moving feature cases に限って opt-in 推奨。True は `Main.dimension="1D_SPH"`、単一材料、radiation は off または `mode="multigroup_diffusion"` のときだけ有効。`"sn_transport"`・`Burn.enabled=True`・複数材料は `ConfigError`（上の動作境界））
   - trigger: `every_n_steps=100`（cadence）, `min_steps_between_ale=50`（前回の適用からこの step 数未満の試行は skip `TooSoon`）, `emergency_enabled=True`, `emergency_max_dr_ratio=1.25`（品質トリガ：隣接セル幅比の最大がこれを超えると発火。`>= 1`。2026-09-23 追加 — それまでは `candidate_dt_penalty_max` をこの閾値に流用していた）, `enable_benefit_gate=True`, `benefit_min_dt_gain=1.5`, `candidate_dt_penalty_max=1.25`（この 2 つは `>= 1`）。候補の判定は音響 dt 上限 \(\Delta t_{ac}=\min_i \Delta r_i/c_{s,i}\)（候補セルは重なる現メッシュのセルの最大 \(c_s\)）で行う：\(\Delta t_{ac}^{cur}/\Delta t_{ac}^{cand}\) が `candidate_dt_penalty_max` を超える候補は skip `DtPenaltyTooLarge`、cadence だけで発火した試行は `enable_benefit_gate=True` のとき \(\Delta t_{ac}^{cand}\ge\) `benefit_min_dt_gain` \(\times\Delta t_{ac}^{cur}\) を要求し未満は skip `BenefitTooSmall`（品質・min-width floor トリガは効果判定の対象外）。NUMERICS §3.4.1 参照（2026-09-23 に実装 — それまで判定は行われていなかった）
   - eligibility: `min_cells=256`, `protected_fraction_max=0.25`, `min_movable_segment_warn=24`, `min_movable_segment_hard=8`, `max_node_displacement_fraction_mu=0.35`, `max_node_displacement_fraction_r=0.35`
   - tolerances are `{soft, hard}` dictionaries: `total_mass_tol={1e-12,1e-9}`, `material_mass_tol={1e-11,1e-8}`, `radiation_group_energy_tol={1e-8,1e-5}`, `material_internal_energy_tol={1e-8,1e-5}`, `total_material_energy_tol={1e-7,1e-5}`, `global_total_energy_tol={1e-6,1e-4}`, `kinetic_energy_drift_tol={1e-7,1e-5}`. For all tolerances `soft <= hard` is required.
@@ -2269,8 +2171,8 @@ Numerics(
   - `rezone: dict`: `monitor_floor=1.0`, `monitor_wmax_ratio=50.0`, `monitor_smoothing_iterations=2`, `monitor_smooth_across_protected_faces=False`, `min_floor_fraction=0.55`, `gaussian_truncation_sigma=3.0`, `spatial_monitor_enabled=True`, `spatial_target_cells_fraction=0.067`, `spatial_power=2.0`, laser spatial \(\Delta r\) clip `2.5e-5..2.0e-4` cm, ablation `1.5e-5..1.2e-4` cm, shock `1.0e-5..8.0e-5` cm.
   - `remap: dict`: `reject_multicell_sweeps=True`, `high_order_enabled=True`, `limiter_theta=1.5`, `high_order_ramp_cells=2`, `radiation_high_order_ramp_cells=2`, `fallback_to_first_order_on_bounds_fail=True`, `reject_strict_zero_flux_on_moving_protected_face=True`. `high_order_enabled=False` keeps the Week 4 first-order donor remap path.
   - validation: `protected_fraction_max` and both displacement fractions must be in `(0,0.5)`, `min_movable_segment_hard >= 4`, and `min_movable_segment_warn >= min_movable_segment_hard`. Rezone monitor floor, truncation, spatial power, and spatial \(\Delta r\) bounds must be positive; `monitor_wmax_ratio >= 1`, `min_floor_fraction in (0,1)`, and `spatial_target_cells_fraction in [0,1)`. Remap `limiter_theta` must be positive, and remap ramp cell counts must be nonnegative.
-- `coulomb_log_floor: float`（既定 `2.0` [無次元]；有効範囲：`[1.0, 30.0]`；クーロン対数 \(\ln\Lambda\) の全体的な下限値。電子-イオン緩和（NUMERICS §1.1.3）、熱伝導（NUMERICS §4.1）、レーザーIB吸収（NUMERICS §5.4）の全てに適用。`Laser.absorption.coulomb_log_floor` が別途指定された場合は IB 吸収のみをその値で上書きする。未指定の場合は `Numerics.coulomb_log_floor` にフォールバック）
-- `splitting: dict`
+- `coulomb_log_floor: float`：**受理するが使わない**（WARNING を出す）。電子-イオン緩和（NUMERICS §1.1.3）、熱伝導（§4.1）、SNB、Braginskii 粘性の \(\ln\Lambda\) の下限は実装に固定の 2、レーザー IB 吸収（§5.4）の下限は `Laser.absorption.coulomb_log_floor`（既定 2.0）
+- `splitting: dict`（**受理するが使わない**（WARNING を出す）。演算子の順序は実装に固定で、以下は固定の順序の説明）
   - `order: Literal["strang"]`（既定 `"strang"`；`L(Δt) → H(Δt/2) → C(Δt) → R(Δt) → H(Δt/2)`。Laser はステップ先頭で full-step 外部ソースとして1回のみ適用。Hydro↔(C-R)結合は2次精度、Laser↔(H-C-R) および C-R 相互間は1次精度（Lie splitting）。NUMERICS §2.1参照）
 - `positivity: dict`
   - `clamp: bool`（既定 True；温度・密度フロアへのクランプを有効化。False の場合は負温度・負密度が発生しうる（デバッグ用のみ推奨）。NUMERICS §1.1.7参照）
@@ -2284,9 +2186,7 @@ Numerics(
   - `overshoot_fatal_enabled: bool`（既定 False；True で `overshoot_fatal` 閾値超過時に FATAL 停止。NUMERICS §11.8参照）
   - `clamp_warn_threshold: int`（既定 100；1ステップ内のフロアクランプ回数がこの閾値を超えた場合 WARNING 出力。ARCHITECTURE §4.1.2 SafetyConfig 準拠）
   - `clamp_fatal_threshold: int`（既定 10000；1ステップ内のフロアクランプ回数がこの閾値を超えた場合 FATAL 停止。ARCHITECTURE §4.1.2 SafetyConfig 準拠）
-  - `opacity_floor: float`（既定 `1e-20` [cm²/g]；不透明度の下限。ゼロ不透明度による0除算を防止）
-  - `opacity_cap: float`（既定 `1e20` [cm²/g]；不透明度の上限。数値オーバーフロー防止）
-  - **相互整合チェック（Phase 2）**：`opacity_floor >= opacity_cap` → `ConfigError("safety.opacity_floor must be < safety.opacity_cap (got floor={floor}, cap={cap})")`
+  - `opacity_floor: float` / `opacity_cap: float`（**効果なし**。退役したモンテカルロ輻射（IMC/DDMC の係数と Non-LTE Fleck 因子）の不透明度の下限・上限。2026-09-29 から Builder は受理して無視し（WARNING）、Config と frozen config にも入れない。両者の大小の検査もしない。FLD と S\(_N\) の下限・上限は `Radiation.multigroup_diffusion`・`Radiation.sn_transport` の `opacity_floor` / `opacity_cap`）
 - `diagnostics_every: int`（既定 1；有効範囲：`≥ 1`；Numericsレベルの診断計算頻度 [サイクル]。`Diagnostics.every` と独立に設定可能。`diagnostics_every` は内部安全チェック（フロアカウンタ等）の頻度、`Diagnostics.every` は出力頻度を制御）
 - `diagnostics: dict`
   - `refinement_estimator: dict`（設計 doc §18 C1 の read-only modified-Lohner 検出場。hydro state へは feedback しない）
@@ -2380,8 +2280,8 @@ Numerics(
     - `allowed_when_enabled: dict`：`ale_enabled_required_value=True`, `ale_axis_repair_mode_required_value="full_winslow"`, `ale_remap_scheme_allowed_values=["legacy_split","ms2_moments"]`, `ale_donor_sign_fixed_allowed_values: list<bool>`（既定 `[]` = both allowed；legacy profile key name, constrains `Numerics.ale.swept_volume_sign_fixed`）, `hydro_driver_full_step_retry_enabled_required_value=True`
     - `forbidden_when_enabled: dict`：`hydro_dispatcher_state_sensitive_bypass_enabled_forbidden_value=True`, `ale_local_boundary_repair_enabled_forbidden_value=True`, `ale_multi_node_boundary_repair_enabled_forbidden_value=True`, `ale_multi_node_interior_repair_enabled_forbidden_value=True`, `ale_axis_variational_projection_enabled_forbidden_value=True`, `ale_emergency_cell_deactivation_enabled_forbidden_value=True`, `hydro_driver_retry_active_mesh_repair_enabled_forbidden_value=True`
     - `escape_valves: dict`：`allow_nonstandard_mesh_rescue=False`, `require_deck_reason=True`, `mark_run_nonstandard=True`
-  - `legacy_regression: dict`（既定 `enabled=False, revision="2026-07-27"`；bit-changing 数値規約を凍結する versioned regression profile。この revision は `Numerics.ale.swept_volume_sign_fixed=False`（legacy donor convention）を pin し、`icf_standard_ale` との併用を禁止する。有効化時は CI/regression 専用の warning を出力する。False では既存 path と bitwise 同一）
-- `cell_search: dict`
+  - `legacy_regression: dict`（既定 `enabled=False, revision="2026-07-27"`；bit-changing 数値規約を凍結する versioned regression profile。この revision は `Numerics.ale.swept_volume_sign_fixed=False`（legacy donor convention）を pin し、`icf_standard_ale` との併用を禁止する。**2026-08-05 に旧規約が削除されたので、有効にすると必ず `ConfigError`**（規約を上書きしないと「False が必要」、False を書くと「旧規約は削除済み」）。`enabled=False`（既定）は既存 path と bitwise 同一）
+- `cell_search: dict`（**受理するが使わない**（WARNING を出す）。退役した `imc_ddmc` の粒子のセル探索の設定）
   - `max_rings: int`（既定 3；有効範囲：`[1, 10]`；stencil walk失敗時のring expansion最大半径。値が大きいほどフォールバック成功率が上がるが計算コスト増。NUMERICS §9.4参照）
   - `fatal: bool`（既定 True；global fallbackでも未発見の場合に `FATAL` エラーで `MPI_Abort`。False の場合は粒子を消滅させ WARNING を出力）
 
@@ -2391,10 +2291,10 @@ Numerics(
 - `plot_every: int`（既定 100；有効範囲：`≥ 1`；スナップショット出力間隔 [サイクル]。§7.2参照）
 - `history_every: int`（既定 1；有効範囲：`≥ 1`；時系列出力間隔 [サイクル]。§7.3参照）
 - `checkpoint_every: int`（既定 1000；有効範囲：`≥ 1`；チェックポイント出力間隔 [サイクル]。§7.4参照）
-- `plot_every_s: float`（既定 -1.0 [s]；`> 0.0` で有効、`-1.0` で無効、`0.0` は `ConfigError`。有効時、Δtが出力時刻に整合される（NUMERICS §2.2 (f)）。`plot_every` とのOR論理で評価）
+- `plot_every_s: float`（既定 -1.0 [s]；`> 0.0` で有効、`-1.0` で無効、`0.0` は `ConfigError`。有効時、Δtが出力時刻に整合される（NUMERICS §2.2 (f)）。`plot_every` を明示したときは `plot_every` とのOR論理で評価し、`plot_every` を指定しないときは既定のサイクル間隔（100）を無効にして時間間隔だけで出力する（`builder.cpp` の `plot_every_explicit`））
 - `write_final_snapshot: bool`（default `False`; when the run terminates (t_end/max_steps) and the last cadence plot did not land on the final step, write one closing snapshot at the final state. Opt-in because snapshot-counting gates rely on cadence-only output.）
-- `history_every_s: float`（既定 -1.0 [s]；`> 0.0` で有効、`-1.0` で無効、`0.0` は `ConfigError`。有効時、Δtが出力時刻に整合される（NUMERICS §2.2 (f)）。`history_every` とのOR論理で評価）
-- `checkpoint_every_s: float`（既定 -1.0 [s]；`> 0.0` で有効、`-1.0` で無効、`0.0` は `ConfigError`。`X_every_s > t_end - t_current` の場合 WARNING（`t_current` は初回実行時=0、リスタート時=checkpoint時刻）。`checkpoint_every` とのOR論理で評価）
+- `history_every_s: float`（既定 -1.0 [s]；`> 0.0` で有効、`-1.0` で無効、`0.0` は `ConfigError`。有効時、Δtが出力時刻に整合される（NUMERICS §2.2 (f)）。`history_every` を明示したときは `history_every` とのOR論理で評価し、指定しないときは既定のサイクル間隔を無効にして時間間隔だけで出力する）
+- `checkpoint_every_s: float`（既定 -1.0 [s]；`> 0.0` で有効、`-1.0` で無効、`0.0` は `ConfigError`。`X_every_s > t_end - t_current` の場合 WARNING（`t_current` は初回実行時=0、リスタート時=checkpoint時刻）。`checkpoint_every` を明示したときは `checkpoint_every` とのOR論理で評価し、指定しないときは既定のサイクル間隔を無効にして時間間隔だけで出力する）
 - `checkpoint_keep_last: int`（既定 2；有効範囲：`≥ 1`；保持するチェックポイント数。古いものから自動削除）
 - `compression: Literal["none","gzip"]`（既定 `"gzip"`；HDF5データセット圧縮方式。§7.5参照）
 - `compression_level: int`（既定 4；有効範囲：`[0, 9]`；gzip圧縮レベル。0=無圧縮（gzipヘッダのみ）、9=最大圧縮。`compression="none"` の場合は無視）
@@ -2428,24 +2328,7 @@ Numerics(
   - `absorbed_power_profile: bool`（既定 True；臨界面近傍の吸収パワー密度分布を出力）
   - `critical_surface: bool`（既定 True；臨界面位置 \(R_{crit}(\theta)\) を出力（2D_RZ時は角度分解、1D_SPHではスカラー））
   - `per_beam: bool`（既定 False；True でビーム毎の吸収分率を個別出力。既定はグループ合計のみ）
-- `mc_stats: dict`（モンテカルロ粒子統計）
-  - `enabled: bool`（既定 True）
-  - `particle_counts: bool`（既定 True；IMC/DDMC/census/absorbed/escaped/leaked の粒子数をステップ毎に出力）
-  - `weight_stats: bool`（既定 True；粒子重みの min/mean/max をステップ毎に出力）
-  - `cell_particle_density: bool`（既定 False；True でセル毎の粒子数分布をsnapshot出力に含める。大規模計算ではストレージ増加に注意）
-  - `ddmc_fraction: bool`（既定 True；全粒子中のDDMC粒子割合を出力）
-- `fleck_diag: dict`（1D_SPH 向けの Fleck/NLTE ステップ診断。標準出力へ構造化1行ログを出す）
-  - `enabled: bool`（既定 False；`Main.verbosity="verbose"` でも有効化可能）
-  - `every: int`（既定 10；有効範囲：`≥ 1`；`[fleck_diag]` ログの出力頻度 [step]）
-  - `cells: list[int]`（既定 `[]`；監視するローカルセル番号の固定リスト）
-  - `r_min_cm: float`（既定 -1.0；`r_max_cm` と対で指定。セル中心半径がこの下限以上のセルを監視）
-  - `r_max_cm: float`（既定 -1.0；`r_min_cm` と対で指定。セル中心半径がこの上限以下のセルを監視）
-  - `cells` と半径窓は併用可能で、選択セルの和集合を監視する。半径指定は cgs 長さ単位 [cm] を用いる（例：55–58 μm は `5.5e-3`–`5.8e-3` cm）
-  - 出力形式：
-    ```text
-    [fleck_diag] step=N cell=C Te=X rho=X cv_e=X sigma_p_em=X beta=X f=X eta_tot=X E_emit=X dep_sum=X delta_E=X
-    ```
-    ここで `Te`, `rho`, `cv_e`, `beta`, `sigma_p_em`, `f`, `eta_tot` はその放射ステップで係数評価に使用した値、`E_emit`, `dep_sum`, `delta_E` は同ステップのセル別放射エネルギー収支
+- `mc_stats: dict`・`fleck_diag: dict`（退役したモンテカルロ輻射の粒子統計と、IMC の Fleck 係数のログ。受理し、効果は無い（WARNING）。history の `mc/*` は 2026-09-29 に無くなった — §7.3）
 - `per_operator_radial_fourier_enabled: bool`（既定 False；2D_RZ の Strang-stage 境界で radial-null-mode Fourier audit を実行する。診断専用で状態更新には書き込まない）
 - `radial_fourier_window_t_start_s: float`（既定 `1.35e-5` [s]；audit 有効時間窓の開始、inclusive）
 - `radial_fourier_window_t_end_s: float`（既定 `1.70e-5` [s]；audit 有効時間窓の終了、exclusive。有効範囲：`>= radial_fourier_window_t_start_s`）
@@ -2457,7 +2340,7 @@ Numerics(
   - Build-time `TENRYU_RFA_V2_MODE` further gates this v2 path: `OFF` and `STUB` must not launch v2 kernels or append v2 HDF5 rows; `DUMMY_BUFFER` launches kernels but suppresses HDF5 append; `FULL` preserves the schema and behavior above.
 - `overshoot_monitor: bool`（既定 True；放射演算子後の温度最大原理違反を監視。NUMERICS §11.8参照）
 
-**HDF5出力パスマッピング**：`energy_budget` → `energy/*`、`mc_stats` → `mc_stats/*`（= `mc/*` in history）、`areal_density` → snapshot `/diagnostics/areal_density/v1/{rhoR,rhoR_hotspot_tracer}`（history `implosion/rho_R`, optional `implosion/rho_R_hotspot_tracer`）。各診断は `every` ステップごとに出力。
+**HDF5出力パスマッピング**：`energy_budget` → `energy/*`、`areal_density` → snapshot `/diagnostics/areal_density/v1/{rhoR,rhoR_hotspot_tracer}`（history `implosion/rho_R`, optional `implosion/rho_R_hotspot_tracer`）。各診断は `every` ステップごとに出力。
 
 #### 6.4.10 Parallel(...)
 MPI並列計算の設定。数理詳細は NUMERICS §12、モジュール設計は ARCHITECTURE §7 参照。
@@ -2467,7 +2350,9 @@ MPI並列計算の設定。数理詳細は NUMERICS §12、モジュール設計
   決定論ソルバ（FLD/SN/burn/laser）の rank 結合（VERIFICATION §16 gate 群）。
 - 2D の z 分割・cartesian 分割はハロー機構としては動作するが物理 gate 未検証、
   かつレーザー/deposit の全域 gather は r-slab を FATAL assert で要求する。
-- `migration.*` / `particle_balance.*` は IMC 退役により **LEGACY-inactive**
+- `migration`・`laser_parallel`・`particle_balance`・`reproducibility`・`gpu_optimization` は Builder が受理して
+  無視する（WARNING、Config にも frozen config にも入れない）。`migration` を除く 4 つは以前から無視していた。
+  `migration` は退役したモンテカルロ輻射の光子粒子の rank 間移動の設定で、2026-09-29 から無視する
   （光子粒子は存在しない。NUMERICS §12.3 の LEGACY 注記参照）。
 - `reproducibility.mode="statistical"` の記述は §16 の tier 体系
   （T-bit / T-sum / T-noise、VERIFICATION §16）に置き換えられた：決定論経路は
@@ -2483,28 +2368,11 @@ MPI並列計算の設定。数理詳細は NUMERICS §12、モジュール設計
   - `min_cells_per_rank: int`（既定 8；有効範囲：`[4, nr]`；1rankあたりの最小セル数。Kershawステンシル＋ゴースト1層の安全余裕。`N_cells_total / N_ranks < min_cells_per_rank` の場合は `ConfigError("Too many ranks for mesh size")`。`validate` では `--n-ranks` 指定時のみ厳密チェック。NUMERICS §12.1参照）
 - `halo: dict`（ハロー交換設定）
   - `gpu_aware_mpi: Literal["auto","force","disable"]`（既定 `"auto"`；`"auto"`はCMake検出結果（`TENRYU_GPU_AWARE_MPI`）に従う、`"force"`は強制使用（非対応環境ではセグフォルト可能性あり）、`"disable"`はhost-staging強制（安全だが低速）。ARCHITECTURE §7.3参照）
-- `migration: dict`（粒子移動設定）
-  - `method: Literal["batch"]`（既定 `"batch"`；サブステップ末バッチ送信。v1.0では唯一のオプション。NUMERICS §12.3.1参照）
-  - `max_substeps: int`（既定 32；有効範囲：`≥ 1`；バッチ間の最大サブステップ数。超過時：未配送粒子のエネルギーを **`E_numerical_loss`** として計上し消滅（物理的境界流出 `E_escaped` とは区別する）。`E_numerical_loss` は history 出力の `energy/numerical_loss` に記録される。全粒子の 0.1% を超える場合は `FATAL`（verify モード）または `ERROR`（通常モード））
-  - `emigrant_threshold: int`（既定 1000；有効範囲：`≥ 1`；1回のバッチでこの数を超える場合に WARNING を出力。チューニング指標：閾値を頻繁に超える場合は `dt.max_s` の縮小か `max_substeps` の増加を検討。ARCHITECTURE §7.1参照）
-  - `initial_capacity: int`（既定 10000；有効範囲：`≥ 1024`；rankごとの emigration バッファ初期容量）
-  - `growth_factor: float`（既定 1.5；有効範囲：`(1.0, 4.0]`；容量不足時の拡張倍率）
-- `laser_parallel: dict`（LaserMesh並列戦略）
-  - `strategy: Literal["replicated"]`（既定 `"replicated"`；全rank複製方式。v1.0では唯一のオプション。将来 `"distributed"` 追加予定。NUMERICS §12.4.2参照）
-- `particle_balance: dict`（粒子負荷分散）
-  - `enabled: bool`（既定 False；work-stealing方式の有効化。単一GPU（1 rank）では無効化推奨（オーバーヘッドのみ））
-  - `imbalance_threshold: float`（既定 1.5 [無次元]；有効範囲：`(1.0, 10.0]`；N_max / N_mean がこの値を超えた場合に発動。`particle_balance.enabled=False` の場合は無視。NUMERICS §12.6.2参照）
-  - `method: Literal["work_stealing"]`（既定 `"work_stealing"`；v1.0では唯一のオプション。`particle_balance.enabled=False` の場合は無視。NUMERICS §12.6.2参照）
-- `reproducibility: dict`（並列再現性設定）
-  - `mode: Literal["statistical"]`（既定 `"statistical"`；統計的再現（主要量の平均・分散が一致）を保証。v1.0では唯一のオプション。将来 `"bitwise"` 追加予定。NUMERICS §12.7参照）
-  - `sort_after_migration: bool`（既定 False；移動後のglobal_idソート。セルソート（`gpu_optimization.particle_sort_by_cell`）が局所性を担保するため、再現性目的のソートは不要。True にするとデバッグ時に粒子追跡が容易になるが計算コスト増。NUMERICS §12.3参照）
-- `gpu_optimization: dict`（GPU性能最適化設定）
-  - `particle_sort_by_cell: bool`（既定 True；輻射演算子冒頭での Composite Key Sort（NUMERICS §6.5）。合成キーソートによりセルソート + dead compaction + IMC/DDMC分離を単一パスに融合し、粒子管理オーバーヘッドを~60%削減。False でフォールバック（CUB個別呼び出し：mode sync + NaN化 + CompactFlag + Partition + R7b resample。デバッグ用。mode sync/NaN化/R7b は NaN sentinel 不変条件の保証に必須）。**注意**: `tally_mode="warp"` と不可分 — `particle_sort_by_cell=False` かつ `tally_mode="warp"` は `ConfigError`）
-  - `tally_mode: Literal["global","warp"]`（既定 `"warp"`；タリー集約方式。NUMERICS §10.3）
-    - `"global"`：Stage 3のみ（global atomicAdd直接）。CC 7.0未満のフォールバック、デバッグ用
-    - `"warp"`：Stage 1+3（warp-level `__match_any_sync` 集約 → global atomicAdd）。v1.0既定。CC 7.0+（Volta以降）必須。CC 7.0未満のGPUで `tally_mode="warp"` が指定された場合は自動的に `"global"` に降格し `WARNING("tally_mode='warp' requires CC>=7.0, falling back to 'global'")` を出力。セルソート（`particle_sort_by_cell=True`）と不可分
-    - ~~`"warp_block"`~~：将来拡張（Persistent Warp との設計上の緊張あり、NUMERICS §10.3.4参照）。v1.0では選択不可
-  - `compute_comm_overlap: bool`（既定 False；計算-通信オーバーラップ。NUMERICS §12.5.5参照。True で内部セル計算とハロー交換を非同期並列化。`gpu_aware_mpi="disable"` との併用は非推奨（host-staging がオーバーラップのメリットを大幅に減少させるため WARNING 出力）。ARCHITECTURE §5.6.2参照）
+- `migration: dict`、`laser_parallel: dict`、`particle_balance: dict`、`reproducibility: dict`、`gpu_optimization: dict`
+  （**効果なし** — 上の v1 実装状態の注記参照。中のキーは検査しない）。以前の意味：`migration` は光子粒子の rank 間の
+  バッチ移動（`max_substeps` 超過分を `E_numerical_loss` として消滅させる等）、`laser_parallel` は LaserMesh の並列戦略
+  （`"replicated"` のみ）、`particle_balance` は粒子数の work-stealing 負荷分散、`reproducibility` はモンテカルロの
+  統計的再現、`gpu_optimization` は粒子のセルソートとタリー集約方式（`tally_mode`）と計算-通信オーバーラップ。
 
 #### 6.4.11 Burn(...)
 核燃焼カーネル（1D_SPH v1）。数理は NUMERICS §14、設計記録は
@@ -2541,7 +2409,8 @@ MPI並列計算の設定。数理詳細は NUMERICS §12、モジュール設計
 - `neutron_heating: bool`（既定 False；v2-E。DT-n 14.049 / DD-n 2.449 MeV の
   2 線群・単一飛行 first-collision 加熱。燃料 D/T 在庫でのみ減衰（shell 材
   kerma は v3）。凍結断面積と設計は
-  docs/design/burn_kernel_v2_20260710.md §E）
+  docs/design/burn_kernel_v2_20260710.md §E。`partition="fraley"` との併用は `ConfigError`
+  — Fraley の式は DT の α の局所沈着の近似で、中性子の弾性反跳（D/T）を分配できないため `"li_petrasso"` を使う）
 - `neutron_heating_n_mu: int`（既定 16；偶数、[2,64]。等方放出の
   Gauss-Legendre μ 求積次数）
 
@@ -2586,8 +2455,6 @@ TENRYU {LEVEL} [{module}]: {description} (got {value}, expected {constraint})
   - `dimension="1D_SPH"` なのに `nz > 1` → エラー
   - `opacity.model="ionmix"` なのに `opacity.file` 未指定、かつ `eos.model` が `"ionmix"` でない（`eos.file` からのフォールバック不可）→ エラー（§6.4.3 `opacity.file` の条件付き省略規則参照）
   - `zbar.model="tabular"` かつ IONMIX ソースが不在（`eos.model≠"ionmix"` かつ `opacity.model` が `"table_nlte"`/`"ionmix"` でない かつ `zbar.table_file` 未指定）→ `ConfigError("zbar.model='tabular' requires IONMIX source: eos.model='ionmix', opacity.model in {'ionmix','table_nlte'}, or zbar.table_file")`
-  - `safety.opacity_floor >= safety.opacity_cap` → `ConfigError`
-- `radiation.enabled=False` なのに `ddmc.enabled=True` → 警告（DDMCは無視される）
 - ファイル存在チェック：EOS/opacityテーブルファイルのパスを検証
 - FrozenTable1D callable validation: 全ての callable（`LaserBeam.power`, `marshak_Tr_eV`, `boundary_pressure`）について、FrozenTable1D 構築時に全サンプル点で `isfinite` を検証。`NaN`/`Inf` が検出された場合は `ConfigError("Callable {name} returned non-finite value at t={t_sample}")` を送出。さらに `LaserBeam.power` と `marshak_Tr_eV` は非負を要求し、負値は `ConfigError("Callable {name} returned negative value at t={t_sample}")` を送出
 - 整合性エラー：`ConfigError` を送出
@@ -2740,9 +2607,9 @@ TENRYU {LEVEL} [{module}]: {description} (got {value}, expected {constraint})
 │       └── hotspot_work_definition string
 │
 ├── radiation/
-│   ├── energy_density              float64[N_cell, G]    E_g [erg/cm³]（legacy particle cell では track-length estimator、difference cell では \(\bar{E}^{ref}\)+signed residual estimator、hybrid diffusion cell では deterministic \(E^D_{i,g}\)）
-│   ├── rad_dep                     float64[N_cell, G]    放射-物質交換エネルギー [erg]（当該ステップ累積；IMC/DDMC の gross absorption tally。PGRW は IMC kernel 内で同じ tally に加算する。`radiation_thermal_subcycle` で \(n_{sub}>1\) の step は採用した試行の全 substep の合計（NUMERICS §2.1）。NUMERICS §10.2参照）
-│   ├── rad_emit                    float64[N_cell, G]    particle emission diagnostic [erg]（当該ステップ累積；thermal subcycle の扱いは `rad_dep` と同じ）
+│   ├── energy_density              float64[N_cell, G]    E_g [erg/cm³]（FLD・S\(_N\) の解。退役したモンテカルロ輻射では track-length 推定量などだった）
+│   ├── rad_dep                     float64[N_cell, G]    放射-物質交換エネルギー [erg]（当該ステップ累積の吸収 \(c\sigma^{PA}_g E_g V\Delta t\)（FLD・S\(_N\)。1D FLD の `source_integrator="exp_rosenbrock"` では交換の正の部分）。`radiation_thermal_subcycle` で \(n_{sub}>1\) の step は採用した試行の全 substep の合計（NUMERICS §2.1）。NUMERICS §10.2参照）
+│   ├── rad_emit                    float64[N_cell, G]    放出エネルギー [erg]（当該ステップ累積；thermal subcycle の扱いは `rad_dep` と同じ）
 │   ├── deposited_power             float64[N_cell, G]    吸収パワー密度 [erg/cm³/s]（= rad_dep / (V × Δt)；可視化・解析用）
 │   ├── fleck_factor                float64[N_cell]       2D_RZ FLD only。FLD material coupling で使った per-cell Fleck factor \(f_i\) [dimensionless]。現行の診断意味は gray \(G=1\) で有効；multigroup FLD の per-group Fleck index 修正は別作業。
 │   ├── sn_tau_R                    float64[N_cell]       2D_RZ \(S_N\) only。AP face_blend 診断用 cell-local Rosseland optical-depth proxy（群・セル幅の最小）[dimensionless]
@@ -2759,29 +2626,8 @@ TENRYU {LEVEL} [{module}]: {description} (got {value}, expected {constraint})
 │   ├── diag_F_first_moment         float64[N_cell, G]    1D S_N diagnostic: angular first moment Σ_n w_n μ_n ψ_n [erg/cm²/s]
 │   ├── diag_E_star_flux            float64[N_cell, G]    1D S_N diagnostic: face-flux \(E^*\) override [erg/cm³]
 │   ├── diag_stream_theta           float64[N_cell, G]    1D S_N diagnostic: donor-theta limiter weight [dimensionless]
-│   ├── diag_ap_alpha_face          float64[N_face, G]    1D S_N diagnostic: AP face_blend weight [dimensionless]
-│   └── ddmc_flag                   int8[N_cell, G]       0=IMC, 1=DDMC, 2=RW, 3=Diffusion（現行 PGRW 実装は 2 を生成しない）
-│
-├── holo/                            （Radiation.holo.enabled=True かつ selector state 有効時のみ）
-│   ├── E_LO                        float64[N_cell, G]    global low-order 物理フレーム放射エネルギー密度 \(E^{LO}_{i,g}\) [erg/cm³]。step 間で persistent、初期/resize 時は 0
-│   ├── consistency_source          float64[N_cell, G]    same-step LO corrector RHS source \(R^{cons}_{i,g}\) [erg/s]
-│   ├── rad_dep_LO                  float64[N_cell, G]    LO gross absorption diagnostic [erg]
-│   ├── rad_emit_LO                 float64[N_cell, G]    LO gross emission diagnostic [erg]
-│   ├── Prr_HO                      float64[N_cell, G]    passive high-order radial pressure moment \(P^{HO}_{rr,i,g}\) [erg/cm³]
-│   ├── chi                         float64[N_cell, G]    \(P^{HO}_{rr,i,g}/\max(E^{HO}_{i,g},E_{floor})\) [dimensionless]
-│   ├── Prr_coverage                float64[N_cell, G]    \(P_{rr}\) covered track-length fraction [dimensionless]
-│   ├── core_mask                   uint8[N_cell]         現ステップ LO material-coupling mask（legacy dataset名）
-│   ├── prev_core_mask              uint8[N_cell]         selector 更新前の LO material-coupling mask（legacy dataset名）
-│   ├── hold_count                  int32[N_cell]         entry hysteresis hold counter
-│   ├── dwell_count                 int32[N_cell]         exit dwell counter
-│   ├── tau_R                       float64[N_cell]       selector Rosseland optical-depth proxy [dimensionless]
-│   ├── reduced_flux                float64[N_cell]       selector reduced-flux proxy [dimensionless]
-│   └── mass_q                      float64[N_cell]       shell mass coordinate \(q_i\) [dimensionless]
-│
-├── difference/                      （Radiation.imc.difference.enabled=True時のみ）
-│   ├── W                           float64[N_cell]       reference weight \(W_i\) [dimensionless]
-│   ├── E_ref                       float64[N_cell, G]    `rad_E` reconstruction に使った time-average reference density \(\bar{E}^{ref}_{i,g}\) [erg/cm³]
-│   └── residual_energy_density     float64[N_cell, G]    signed residual estimator \(\mathrm{rad\_E\_tally}_{i,g}/(V_i c\Delta t)\) [erg/cm³]
+│   └── diag_ap_alpha_face          float64[N_face, G]    1D S_N diagnostic: AP face_blend weight [dimensionless]
+│   （schema 2（2026-09-29）で `ddmc_flag` と、グループ `holo/`・`difference/` を廃止。いずれも退役したモンテカルロ輻射（DDMC・HOLO・difference 定式化）が動いた run だけの出力）
 │
 └── laser/                          （laser.enabled=True時のみ）
     ├── deposited_power             float64[N_cell]       レーザー沈着パワー密度 [erg/cm³/s]
@@ -2851,7 +2697,7 @@ TENRYU {LEVEL} [{module}]: {description} (got {value}, expected {constraint})
 │   ├── kinetic                     float64[N_step]       運動エネルギー合計 E_kin [erg]
 │   ├── internal_electron           float64[N_step]       電子内部エネルギー合計 E_int_e [erg]
 │   ├── internal_ion                float64[N_step]       イオン内部エネルギー合計 E_int_i [erg]
-│   ├── radiation_field             float64[N_step]       放射場エネルギー E_rad [erg]（通常は census粒子エネルギー合計。difference path では deterministic reference reservoir + signed residual census）
+│   ├── radiation_field             float64[N_step]       放射場エネルギー E_rad [erg]（\(\sum_i V_i\sum_g E_{i,g}\)）
 │   ├── numerical_loss              float64[N_step]       数値的喪失エネルギー累積 E_numerical_loss [erg]（粒子移送失敗等）
 │   ├── numerical_loss_step         float64[N_step]       その step の数値的喪失エネルギー [erg]
 │   ├── floor_injected              float64[N_step]       フロア補正注入累積 E_floor_injected [erg]（診断専用、保存誤差の分子に含めない）
@@ -2973,7 +2819,7 @@ TENRYU {LEVEL} [{module}]: {description} (got {value}, expected {constraint})
 │   ├── dt_breakdown_history/       optional; `Numerics.diagnostics.dt_breakdown_history_enabled=True` の場合に毎ステップ作成
 │   │   ├── cycle                   int64[N]               `[dt_breakdown] step` と同じ pre-step cycle
 │   │   ├── t_s                     float64[N]             pre-step 時刻 [s]
-│   │   ├── dt_chosen, dt_hydro, dt_rad, dt_cond, dt_post_shock, dt_growth, dt_max, dt_output, dt_remaining float64[N] [s]
+│   │   ├── dt_chosen, dt_hydro, dt_cond, dt_post_shock, dt_growth, dt_max, dt_output, dt_remaining float64[N] [s]（`dt_rad` は 2026-09-29 に削除 — 退役したモンテカルロ輻射の Δt 制約で、FLD・S\(_N\) では常に +∞ だった）
 │   │   ├── dt_hydro_acoustic, dt_hydro_axis_margin, dt_hydro_volume_rate float64[N] [s]
 │   │   └── dt_winner, dt_winner_code string/int32[N]      `hydro/rad/growth/max/cond/post_shock/volume_rate/output/t_end/init/driver_retry/other`
 │   ├── cfl_winner/                 optional; dt_breakdown history と同じ行数
@@ -3039,72 +2885,10 @@ TENRYU {LEVEL} [{module}]: {description} (got {value}, expected {constraint})
 │   ├── sn_inner_iterations         int64[N_step]         S_N の内側反復（線形不連続法は吸収率密度の GMRES の Krylov 反復、他は source iteration）の step 内合計 [count]
 │   ├── sn_outer_residual           float64[N_step]       S_N の外側反復の終了時残差の step 内最大 [dimensionless]（NaN があれば NaN）
 │   ├── sn_converged                int64[N_step]         step 内の全 S_N 解が収束したとき 1
+│   ├── overshoot_count             int64[N_step]         輻射相の最大値原理の超過セル数（相の後の \(T_e\) が \(T_{max}=\max\)(相の前の最大 \(T_e\), Marshak 駆動温度) を超えたセル）[count]。輻射が無効なら 0。NUMERICS §11.8
+│   └── overshoot_max               float64[N_step]       最大超過率 \(\delta_{max}=\max(T_e-T_{max})/T_{max}\) [dimensionless]（2026-09-29 まで `mc/overshoot_*` で、`Diagnostics.mc_stats.enabled=False` のデッキでは 0 を書いていた。それより前に始めた history ファイルへの追記は `mc/` の下に書き続ける）
 │
-├── mc/
-│   ├── n_total                     int64[N_step]         全粒子数
-│   ├── n_imc                       int64[N_step]         IMC粒子数
-│   ├── n_ddmc                      int64[N_step]         DDMC粒子数
-│   ├── n_census                    int64[N_step]         census粒子数
-│   ├── n_absorbed                  int64[N_step]         吸収粒子数（ステップ内）
-│   ├── n_escaped                   int64[N_step]         境界流出粒子数
-│   ├── n_leaked                    int64[N_step]         DDMC→IMCリーク数
-│   ├── ddmc_fraction               float64[N_step]       DDMC粒子割合
-│   ├── weight_min                  float64[N_step]       粒子重み最小値
-│   ├── weight_mean                 float64[N_step]       粒子重み平均値
-│   ├── weight_max                  float64[N_step]       粒子重み最大値
-│   ├── overshoot_count             int64[N_step]         最大原理違反セル数
-│   ├── overshoot_max               float64[N_step]       最大超過率 \(\delta_{max}\)
-│   ├── ddmc_mode_count             int64[N_step]         DDMCモードセル数（互換診断）
-│   ├── imc_mode_count              int64[N_step]         IMCモードセル数（互換診断）
-│   ├── mmatrix_violations          int64[N_step]         M-matrix違反検出数（互換診断）
-│   ├── mmatrix_fallback_count      int64[N_step]         fallback発生回数（互換診断）
-│   ├── omega_below_threshold       int64[N_step]         ωしきい値未満セル数（互換診断）
-│   ├── interface_transitions       int64[N_step]         IMC/DDMC境界遷移数（互換診断）
-│   ├── interface_reflections       int64[N_step]         IMC/DDMC境界反射数（互換診断）
-│   ├── conversion_prob_violations  int64[N_step]         変換確率制約違反数（互換診断）
-│   ├── ddmc_to_imc_conversions     int64[N_step]         DDMC→IMC変換数（互換診断）
-│   └── rad_momentum_deposition     float64[N_step]       放射運動量沈着（互換診断）[g*cm/s]
-│
-├── difference/
-│   ├── reference_valid             int64[N_step]         reference diagnostics 有効フラグ [count]
-│   ├── eligible_cells              int64[N_step]         非void対象セル数 [cells]
-│   ├── active_cells                int64[N_step]         \(W_i>0\) セル数 [cells]
-│   ├── strong_cells                int64[N_step]         \(W_i\ge 0.5\) セル数 [cells]
-│   ├── hybrid_suppressed_cells     int64[N_step]         hybrid diffusion mask で \(W_i=0\) にしたセル数 [cells]
-│   ├── W_min                       float64[N_step]       reference weight 最小値 [dimensionless]
-│   ├── W_mean                      float64[N_step]       reference weight 平均値 [dimensionless]
-│   ├── W_max                       float64[N_step]       reference weight 最大値 [dimensionless]
-│   ├── tau_min                     float64[N_step]       Rosseland optical depth 最小値 [dimensionless]
-│   ├── tau_mean                    float64[N_step]       Rosseland optical depth 平均値 [dimensionless]
-│   ├── tau_max                     float64[N_step]       Rosseland optical depth 最大値 [dimensionless]
-│   ├── chi_mean                    float64[N_step]       radiation-matter mismatch 平均値 [dimensionless]
-│   ├── chi_max                     float64[N_step]       radiation-matter mismatch 最大値 [dimensionless]
-│   ├── reduced_flux_max            float64[N_step]       face reduced-flux proxy 最大値 [dimensionless]
-│   ├── knudsen_max                 float64[N_step]       face Knudsen proxy 最大値 [dimensionless]
-│   ├── front_grad_Te_max           float64[N_step]       \(|\Delta\ln T_e|\) 最大値 [dimensionless]
-│   ├── front_grad_rho_max          float64[N_step]       \(|\Delta\ln\rho|\) 最大値 [dimensionless]
-│   └── E_ref_total                 float64[N_step]       \(\sum_i V_i\sum_g E^{ref}_{i,g}\) [erg]
-│
-├── holo/
-│   ├── n_core_cells                int64[N_step]         LO material-coupled cell 数 [cells]（legacy metric名）
-│   ├── n_entered                   int64[N_step]         当該 selector 更新で LO coupling mask に入った cell 数 [cells]
-│   ├── n_exited                    int64[N_step]         当該 selector 更新で LO coupling mask から出た cell 数 [cells]
-│   ├── n_hard_exited               int64[N_step]         hard-exit した cell 数 [cells]
-│   ├── n_island_rejected           int64[N_step]         island filter で拒否された cell 数 [cells]
-│   ├── tau_R_min                   float64[N_step]       selector \(\tau_R\) 最小値 [dimensionless]
-│   ├── tau_R_max                   float64[N_step]       selector \(\tau_R\) 最大値 [dimensionless]
-│   ├── reduced_flux_max            float64[N_step]       selector reduced-flux 最大値 [dimensionless]
-│   ├── E_LO_total                  float64[N_step]       \(\sum_i V_i\sum_g E^{LO}_{i,g}\) [erg]（global LO domain）
-│   ├── E_LO_boundary_in            float64[N_step]       physical inner reflect boundary の LO 境界流入エネルギー [erg]（v1 は 0）
-│   ├── E_LO_boundary_out           float64[N_step]       physical outer vacuum boundary の LO 境界流出エネルギー [erg]
-│   ├── matter_delta                float64[N_step]       LO source solve が物質へ与えたエネルギー [erg]
-│   ├── source_balance_error        float64[N_step]       LO source/boundary energy balance residual [erg]
-│   ├── particle_net_source_core    float64[N_step]       LO-coupled cell 内の particle diagnostic net source \(\sum(\mathrm{rad\_dep}-\mathrm{rad\_emit})\) [erg]
-│   ├── lo_particle_source_mismatch float64[N_step]       `matter_delta - particle_net_source_core`。LO-owned source と particle diagnostic source の差 [erg]
-│   ├── Prr_coverage                float64[N_step]       LO-coupled cell×group の \(P_{rr}\) coverage 平均 [dimensionless]
-│   ├── chi_min                     float64[N_step]       LO-coupled cell×group の \(P_{rr}/E\) 最小値 [dimensionless]
-│   ├── chi_mean                    float64[N_step]       LO-coupled cell×group の \(P_{rr}/E\) 平均値 [dimensionless]
-│   └── chi_max                     float64[N_step]       LO-coupled cell×group の \(P_{rr}/E\) 最大値 [dimensionless]
+│   （`mc/*`（23 列）・`difference/*`（18 列）・`holo/*`（19 列）は退役したモンテカルロ輻射の統計で、2026-09-29 に削除した。現行の FLD・S\(_N\) では最大値原理の 2 列を除いて 0 だった）
 │
 └── safety/
     └── clamp_count                 int64[N_step]         温度/エネルギークランプ発生回数 [count]
@@ -3115,15 +2899,13 @@ TENRYU {LEVEL} [{module}]: {description} (got {value}, expected {constraint})
 - 旧履歴ファイル追記時は `energy/E_*` 系の旧キー（例: `energy/E_int_e`, `energy/E_rad_esc`, `energy/epsilon_budget`）へフォールバックする場合がある。
 - `energy/{marshak_in, E_volume_in, numerical_loss, pdv_boundary, floor_injected, safety_injected, solver_residual}` は 2026-09-23 から run 累積値（`time_state/E_*` と同じ量。rank 別の寄与は全 rank で合算）で、それ以前の build が書いた行は その step の値である（`energy/radiation_escaped` は 2026-08-30 に同じ変更）。step の値は対応する `*_step` dataset にある。reader は `energy/marshak_in_step` の有無で新旧を判定できる。旧履歴ファイルへ追記すると、同じ dataset の中で追記点から意味が変わり、`*_step` は追記点から作成される（長さ不一致は migration warning）。`time_state/E_volume_in` の無い checkpoint から再開した場合、`energy/E_volume_in` は再開時点からの累積になる。
 - 後方互換として `implosion/rhoR_deg_<angle_mdeg>`（角度別スカラー）と `modes/a<ell>`（モード別スカラー）も併記される。hotspot tracer rhoR が有効な場合は `implosion/rhoR_hotspot_tracer_deg_<angle_mdeg>` も併記される。
-- `difference/*` は PR3 で追加された optional history group である。旧履歴ファイルには存在しない場合があり、reader は欠損を disabled/zero diagnostics として扱う。旧ファイルへ追記する場合は追加後の step から dataset が作成され、長さ不一致は migration warning として扱う。
-- `radiation/rad_emit` は particle emission diagnostic である。旧 checkpoint に存在しない場合、restart reader は 0 で補完する。
+- `radiation/rad_emit` は放出エネルギーの診断である。旧 checkpoint に存在しない場合、restart reader は 0 で補完する。
 - `radiation/diag_*` は 1D S_N plateau investigation 用の output-only diagnostics である。restart reader は solver state として要求せず、旧 snapshot/checkpoint で欠損しても物理状態復元には影響しない。
-- `holo/*` は HOLO selector/LO state 用の optional group である。checkpoint では `holo/E_LO` と `holo/consistency_source` に加えて LO gross source diagnostics `holo/rad_dep_LO` と `holo/rad_emit_LO`、passive closure diagnostics `holo/Prr_HO`、`holo/chi`、`holo/Prr_coverage` を保存できる。旧 snapshot/checkpoint にこれらが存在しない場合、restart reader は対応する `State.holo_*` field を 0 で補完する。旧 `holo/gamma` は前 step defect なので same-step corrector では restart 入力に使わず、欠損/存在のどちらでも `State.holo_consistency_source` は 0 から再生成する。旧履歴ファイルに HOLO 診断（`particle_net_source_core` / `lo_particle_source_mismatch` を含む）が存在しない場合は 0 diagnostics として扱い、追記時の長さ不一致は migration warning として扱う。
 - `polar_center_treatment="button"` snapshots/checkpoints add compatible per-cell topology flags: `/hydro_flags/hydro_active`, `/hydro_flags/cell_is_void`, and `/mesh/topology/v1/cell_nverts`. The button cell reports the seam-polygon vertex count, dormant cells report `cell_is_void=1` and `cell_nverts=0`, and non-button output omits these additions to preserve existing deck output.
 
 ### 7.4 チェックポイントHDF5レイアウト（`<case>_ckpt_NNNN.h5`）
 
-チェックポイントファイルは **スナップショットの全データ** に加え、粒子プールとRNG状態を含む。
+チェックポイントファイルは **スナップショットの全データ** に加え、再開に要る状態を含む（schema 1 にあったモンテカルロ輻射の粒子プール `particles/` と RNG 状態 `rng/` は schema 2（2026-09-29）で廃止）。
 
 ```
 /
@@ -3158,33 +2940,6 @@ TENRYU {LEVEL} [{module}]: {description} (got {value}, expected {constraint})
 │
 ├── radiation_sn/                    1D S_N の状態（NUMERICS §6.8、2026-09-23〜。S_N が 1 回以上解いた run のみ）
 │   └── psi_prev                    float64[N_cells·N_groups·N_angles]  前ステップの角度強度（時間項の記憶、layout `(cell*n_groups+g)*n_angles+n`）。大きさが一致すれば再開でそのまま使い、不在・不一致なら等方に再シード
-│
-├── particles/                       粒子プール（SoA形式）
-│   │  attrs: n_particles (int64)
-│   ├── pool_capacity               int64          プール容量（PhotonPool.capacity。再開時メタデータ復元に使用）
-│   ├── pos_r                       float64[N_p]    R座標 [cm]（1D: r座標）
-│   ├── pos_z                       float64[N_p]    Z座標 [cm]（1D: 3D方向追跡で使用）
-│   ├── dir_r                       float64[N_p]    方向ベクトル Ω_r
-│   ├── dir_z                       float64[N_p]    方向ベクトル Ω_z
-│   ├── dir_phi                     float64[N_p]    方向ベクトル Ω_φ
-│   │  注：内部表現（R,Z,φ）で保存。ARCHITECTURE §5.3 PhotonPool SoA フィールド名と1:1対応。
-│   ├── energy                      float64[N_p]    粒子エネルギー [erg]
-│   ├── birth_energy                float64[N_p]    生成時エネルギー [erg]
-│   ├── sign                        int8[N_p]       粒子符号（+1 or -1）。旧checkpointで不在の場合は +1 として復元
-│   ├── group_id                    uint16[N_p]     所属群インデックス（ARCHITECTURE §5.3 PhotonPool の uint16_t 準拠）
-│   ├── cell_id                     int32[N_p]      所属セル **グローバル** インデックス。ランク数変更リスタート時に新パーティションへの再配布に必要。DDMC粒子は pos=NaN のため位置ベース再同定不可。
-│   │                                               **1D_SPH**: `global = cell_id_local + cell_offset`
-│   │                                               **2D_RZ**: `local(i,j) = (cell_id/nz_local, cell_id%nz_local)` →
-│   │                                                 `global = (i + ir_start) * nz_global + (j + jz_start)`
-│   │                                               （単純な +offset は nz_local ≠ nz_global 時にストライド不整合。ARCHITECTURE §5.3 参照）
-│   ├── mode                        uint8[N_p]      0=IMC, 1=DDMC, 2=RW（legacy enum値。現行 PGRW 実装は 2 を生成しない）
-│   ├── global_id                   uint64[N_p]     大域一意ID（再現性用）
-│   ├── weight                      float64[N_p]    統計的重み [無次元]
-│   └── time_remain                 float64[N_p]    残存時間 [s]（t^{n+1} - t_p）
-│
-├── rng/                             RNG状態（Philox4x32-10）
-│   ├── rng_counter                 uint32[N_p]     粒子ごとの乱数消費カウンタ（PhotonPool.rng_counter と1:1対応）
-│   └── global_id                   uint64[N_p]     大域一意ID（curand_init(seed=global_id ^ user_seed, subsequence=step_number, offset=rng_counter) で復元。user_seed = Main.seed。NUMERICS §12.7.1準拠）
 │
 ├── output_state/                    出力タイミング状態（時間間隔ベース出力用）
 │   ├── t_next_plot              float64     次回plot出力時刻 [s]（-1.0=無効）
@@ -3264,14 +3019,13 @@ fallback/migration は行わない。fixed mode では group 欠落を従来通�
 **リスタート手順**：
 1. チェックポイント読み込み → mesh/hydro/radiation の全場を復元
 2. hydro_flags/ から `hydro_active` フラグを復元（一方向スイッチ状態の保持に必須）
-3. particles/ から粒子プールを再構築（SoA形式のまま）。`particles/sign` が不在の旧チェックポイントは全粒子 `sign=+1` として補完する。**DDMC NaN sentinel 検証**: 復元後、`mode==DDMC` の粒子に対し `pos_r/pos_z/dir_r/dir_z/dir_phi` が NaN であることをアサートする。NaN でない場合は強制的に NaN を設定し WARNING を出力する（旧チェックポイントとの後方互換を維持しつつ、NaN 不変条件を保証。CUDA_KERNELS §6.0d サブステップ1 参照）。**メタデータ再構築**: N_total はHDF5データセット次元から取得、チェックポイントは alive 粒子のみ保存するため復元後に alive[i]=1 を全粒子に設定し n_alive = N_total、n_census = n_alive（再開直後は全alive粒子がcensus扱い）、capacity はチェックポイントの particles/pool_capacity から復元
-4. rng/ から rng_counter + global_id を復元し、`curand_init(seed=global_id ^ user_seed, subsequence=step+1, offset=rng_counter)` で各粒子のRNGストリームを再構築。**注: subsequence は checkpoint の step（最後に完了したステップ）+ 1** — 再開ステップのストリームを開始する（step そのままだとチェックポイント直前のステップと同一ストリームになり、乱数が重複する）。user_seed = time_state/user_seed（チェックポイント保存値）。現在の namelist の Main.seed と不一致の場合は `ConfigError`（RNGストリーム連続性の破壊を防止。ARCHITECTURE §8.4、NUMERICS §12.7.1準拠）
+3.–4.（schema 1 の手順: `particles/` から光子プール、`rng/` から粒子の RNG ストリームを復元していた。2026-09-29 に廃止。schema 1 のチェックポイントの `particles/` は空でなければならず、粒子があれば退役した `imc_ddmc` の run として再開を拒否する）
 5. output_state/ から `t_next_plot`, `t_next_history`, `t_next_checkpoint` を復元。グループ不在（旧checkpoint）の場合は `t + X_every_s` で再初期化。output パラメータが変更された場合（「調整可」）は `t_next_X = t + new_X_every_s` で再計算
 6. time_state/ から `t`, `step`, `dt`, `ale_last_applied_step`, `axis_mass_initial`, `axis_inflow_budget`, `E_safety`, `E_numerical_loss`, `E_laser_deposited`, `E_laser_escaped`, `E_rad_escaped`, `E_floor_injected`, `E_pdV_bdry`, `E_Marshak_in`, `E_volume_in`, `E_solver` と adaptive AV tracker scalars を復元。dt は NUMERICS §2.2 の成長制限（≤1.2×dt）を尊重するために必須。`ale_last_applied_step` は 1D V3 ALE の min-step gate continuity を保証し、旧チェックポイントでは -1 として扱う。Phase 9 の `axis_mass_initial` / `axis_inflow_budget` は旧チェックポイントで不在なら empty として扱い、budget gate が必要になった時点で lazy-init する。累積診断値はエネルギー収支の連続性を保証。旧チェックポイント（E_pdV_bdry、adaptive AV tracker scalars 等が不在）の場合は 0.0 で初期化（後方互換）
 7. `laser_cache_valid = false` に設定し、`laser_dep_frac` をクリア（リスタート直後のステップで必ず full raytrace を実行。ARCHITECTURE §4.6、CUDA_KERNELS §9 Phase 3 準拠）
 7a. `radiation_sn/psi_prev` があれば `State::sn_psi_prev` へ復元する。S_N は最初の解で大きさ（\(N_{cells}N_{groups}N_{angles}\)）が一致すればそのまま使い、不一致なら等方に再シードする（NUMERICS §6.8）。`rad_E_old` は保存せず、S_N・FLD とも毎回の解の冒頭で `rad_E` からコピーする
 7b. 1D のチェックポイントは状態方程式の閉包が作る `hydro/cv_e`・`hydro/cv_i`・`hydro/cs` を `hydro/ee`・`ei`・`Te`・`Ti`・`Pe`・`Pi` と一緒に保存する（2026-09-25 から。per-material 保存が有効な run は従来から snapshot の hydro 群に含む）。`hydro/cs` のあるチェックポイントからの 1D の再開は、run 開始時の閉包（初期音速の準備）を行わず、復元した状態をそのまま使う（`State::closure_fields_restored`）。閉包はビット単位では冪等でなく、閉包済みの状態をもう一度閉じると ee・Te・Pe が丸め誤差だけ動き、再開した run が元の run と一致しなかった。`hydro/cs` の無い旧チェックポイントは従来どおり閉包してから始める。空セルの印 `hydro_flags/cell_is_void`（is_void 材料のセル。初期化が材料から設定し、再開では作り直されない）も 1D のチェックポイントに保存し、再開で復元する（2026-09-25 まで保存されず、再開した run は空セルなしで続いた。レーザーは最外の空セルを標的表面とみなして ghost corona を失っていた）。熱伝導ソルバーの run 累積統計（`conduction_state/{solver_steps_total, solver_residual_max, solver_iter_max, solver_cond_number_max, bc_heat_flux_integrated, snb_steps_total, snb_picard_iters_max, snb_nonconverged_steps, snb_cap_theta_min_run, snb_dq_over_qsh_max_run}`）も復元する（無ければ再開時点から数える）。GXII の FLD デッキ（レーザー・熱伝導・多群 FLD）と ghost corona のある小デッキで、途中のチェックポイントから再開した run は元の run とビット一致する（ctest `restart_bitwise_gxii_1d`）。`Laser.raytrace_skip_config.enabled=True` の run は項目 7 により再開直後に必ず全光線追跡を行うため、キャッシュを再利用していた元の run とは一致しない
-8. 凍結設定を現在のnamelistと比較（凍結項目の不一致は `ConfigError`、調整可能項目は INFO/WARNING）
+8. 凍結設定（`metadata/frozen_config` の正準 JSON）を、再開に使うデッキの凍結設定と比較する。`Main.restart_from` を除く違いがあれば `ConfigError`（下のパラメータ変更制約）
 
 `eos_signature` checkpoint validation (implementation note):
 - Checkpoints store per-material EOS signatures at `/metadata/eos/eos_signature` (`uint64` array, hash over EOS model/path/grid metadata).
@@ -3282,8 +3036,10 @@ fallback/migration は行わない。fixed mode では group 欠落を従来通�
 
 | 区分 | パラメータ | 変更可否 |
 |------|-----------|---------|
-| 凍結（ConfigError）| dimension, mesh, materials, n_groups, group_bounds_eV, Main.seed | 変更不可 |
-| 調整可（INFO）| t_end, dt, output, diagnostics | 変更可 |
+| 照合する（ConfigError）| `Main.restart_from` を除くすべての設定（dimension, mesh, materials, n_groups, group_bounds_eV, Main.seed, t_end, dt, output, diagnostics ほか）と、デッキ本文の sha256（`_namelist_source_hash`） | 変更不可 |
+| 照合しない | `Main.restart_from`（CLI `--restart` も） | 変更可 |
+
+再開は元の run と同じデッキファイルを内容を変えずに使う（`tenryu run <deck.py> --restart <prefix>`）。デッキに `restart_from` を書き足す、`t_end` を延ばす、出力の間隔を変える、コメントを足すなど、本文の変更はすべて `ConfigError: checkpoint frozen_config JSON mismatch` になる（2026-09-30 に sod_planar で実測: 同じデッキと `--restart` の再開は 300 ステップ目のチェックポイントが連続実行とビット一致、`restart_from` を書き足したデッキと `t_end` だけ変えたデッキは拒否。再開元を環境変数から読むデッキは再開でき、ビット一致）。以前の版の本表は t_end・dt・output・diagnostics を「調整可」としていたが、実装はそれらも照合する。照合を外す `TENRYU_I1B_RESTART_ALLOW_CONFIG_DRIFT=1` は診断用で、その結果は本番の比較に使えない。
 | 調整可（WARNING）| radiation, laser, numerics | 変更可（物理的整合性に注意） |
 
 メッシュ変更は `ConfigError` で禁止。変更が必要な場合は新規シミュレーションとして開始すること。
@@ -3291,14 +3047,15 @@ fallback/migration は行わない。fixed mode では group 欠落を従来通�
 \(|old-new| \le \max(10^{-12}\max(|old|,|new|),\;10^{-14}\,\mathrm{eV})\)
 を満たさなければ `ConfigError("group_bounds_eV mismatch: checkpoint has {old}, namelist has {new}")` を送出。
 
-**ランク数変更時のリスタート**：rank 0 が全データを読み込み → 再分割 → 再配置 → 粒子再配布。ランク数変更時も統計的再現を保証（Persistent Warp モデルにより、同一ランク数であってもbitwise再現は保証しない）
+**ランク数変更時のリスタート**：rank 0 が全データを読み込み → 再分割 → 再配置（粒子の再配布と、Persistent Warp による統計的再現の規定は退役したモンテカルロ輻射のもの）
 
 ### 7.5 出力の互換性規約
-- **スキーマバージョン**：ルートグループの `attrs: schema_version` に整数を格納（v1.0は `1`）
+- **スキーマバージョン**：ルートグループの `attrs: schema_version` に整数を格納（v1.0 は `1`、2026-09-29 から `2`）
 - **後方互換**：データセットの追加は許可するが、既存データセットの名前変更・型変更・削除は禁止
 - **スキーマ変更ログ**：初期の ALE 整理で 1D ALE diagnostics の
   `/diagnostics/ale_center/` は出力対象から削除された。Legacy output に存在する場合は
   解析側で optional group として扱う。
+  - schema 2（2026-09-29、モンテカルロ輻射の退役）: チェックポイントの `particles/`・`rng/`、snapshot・チェックポイントの `radiation/ddmc_flag`・`radiation/delta_E_rad_prev`・`holo/`・`difference/`（後の 4 つは FLD・S\(_N\) の run では書かれていなかった）、history の `mc/*`・`holo/*`・`difference/*`・`diagnostics/dt_breakdown_history/dt_rad` を削除し、`mc/overshoot_count`・`mc/overshoot_max` を `radiation/overshoot_count`・`radiation/overshoot_max` へ移した。frozen config からはモンテカルロ輻射だけが読んでいたキー（`Radiation.imc` の `two_stage` 以外、`Radiation.ddmc`・`diffusion`・`holo`・`origin_parity_only`・`boundary.marshak_particles`、材料の `opacity.lambda_method`・`f_min`、`Numerics.dt.f_min_fleck`・`Numerics.safety.opacity_floor`・`opacity_cap`、`Diagnostics.mc_stats`・`fleck_diag`、`Parallel.migration`）を外した。移行規則: reader は schema 1 のチェックポイントを読む（`particles/` は空でなければならない。他の削除した群は読まない。`metadata/frozen_config` の比較は両側から上の退役したキーを除いて行う）。history は既存ファイルへ追記するとき `mc/overshoot_*` に書き続ける。
 - **読込時のバージョン規約**：
   - `schema_version == current`：通常読込
   - `schema_version < current` または属性欠落（v0）：後方互換リーダーで既定値補完し WARNING
@@ -3398,8 +3155,12 @@ TENRYUの実アプリ基準として、GEKKO XII（GXII）同等の **12ビー�
 ## 9. 安全な既定値（Defaults）
 ### 9.1 既定値（推奨）
 
+2026-09-08 Revision 1: 推薦・独立 lint に条件間距離による経験的緩和ゲートを追加。条件ファイルの各層 A/Z を必須化し、範囲外の先験 fallback は材料依存・factor 1 とする。namelist キーと C++ hook は変更なし。
+
+2026-09-08: `Mesh.resolution_requirement.empirical`（省略既定）と `recommend-mesh` を追加。指定時だけ参照表に基づく定数アブレーション天井を適用し、factor 上限 9.220252473467259 と独立 lint を要求。省略時の節点・frozen 規則は不変、HDF5 schema 変更なし。
+
 **Mesh / floors**：
-- geometry_1d="spherical"（非球面は 1D_SPH 専用: imc_ddmc 不可 / cylindrical の sn_transport は積求積 / laser は radial_absorption_1d と raytrace_2d（特性曲線積分、2026-09-24））
+- geometry_1d="spherical"（非球面は 1D_SPH 専用: cylindrical の sn_transport は積求積 / laser は radial_absorption_1d と raytrace_2d（特性曲線積分、2026-09-24））
 - floors：rho_floor_gcc=1e-10, Te_floor_eV=1e-3, Ti_floor_eV=1e-3（NUMERICS §1.1.7準拠）
 - motion：lagrangian（1D）、ale（2D）
 - graded grid：edge_ratio=`0.1`, sg_order=`4`, sg_sigma=`0.7`
@@ -3409,7 +3170,7 @@ TENRYUの実アプリ基準として、GEKKO XII（GXII）同等の **12ビー�
 - cone_shell wall/map defaults: `cone_shell_alpha`/`cone_shell_wall_thickness`/`cone_shell_tip_radius`/`cone_shell_tip_z`/`cone_shell_wall_length` は unset、`cone_shell_tip_radius_kind="inner_face"`, `cone_shell_axis_sign=1`, `cone_shell_n_cells=10`, `cone_shell_n_growth=1.25`, `cone_shell_tip_size_factor=3.0`, `cone_shell_base_size_factor=8.0`, `cone_shell_tip_hold=unset -> 4*t_w`, `cone_shell_grading_length=unset -> min(0.35*L_w,20*t_w)`, `cone_shell_l_ratio_max=1.12`, `cone_shell_tip_rotation_length=unset -> 3*t_w`, `cone_shell_base_cut="planar"`, `cone_shell_base_rotation_length=unset -> cone_shell_tip_rotation_length`, `cone_shell_farfield_target_measure="station_uniform"`。
 - cone_shell strip defaults: outer `(first_factor,layers,growth)=(0.8,10,1.18)`; inner `(1.0,10,1.15)`; end `(1.0,10,1.15)`。factor は wall face width \(h_{n,0}\) に対する無次元比。
 - cone_shell C4 builder-derived storage defaults: `cone_shell_cavity_cells=0`, `cone_shell_exterior_cells=0`, `cone_shell_tip_fill_layers=0`（いずれも deck key ではなく frozen config には出力しない。builder がそれぞれ `[6,32]`, `[6,32]`, `[6,48]` の topology count へ派生）。
-	- rezoning / ale：enabled=False（2D_RZ ALE 用）, reale_short_edge_collapse_rel=3.0e-2, reale_subdomain_rezone=False, reale_subdomain_frac_max=0.6, reale_overlay_additivity_tol=1.0e-4, ale_identity_mode=False, ale_mover_diag=False, ale_preserve_lagrangian_velocity_carry=False, every_n_steps=5, force_rezone_every_n_steps=0, warmup_steps=0, relaxation=0.2, spacing_ratio_threshold=1.5, quality_threshold=0.2, max_iterations=20, max_displacement_fraction=0.5, remap_limiter=`"van_leer"`, remap_ms_midpoint=False, remap_ms_post_check=False, remap_ms_post_max_iter=3, remap_ms_rescale_floor=0.01, ke_fixup=True, ke_conservation_closure=False, ke_conservation_closure_audit=False, ke_closure_redistribute_floor=False, debug_per_remap_log=False, shock_sensor_guard_cells=2, density_jump_threshold=0.1, Te_jump_threshold=0.2, preventive_axis_guard_fraction=0.1, axis_z_motion=`"fixed"`, winslow_axis_kappa=0.7, button_morph={enabled=False, t_start_s=0.0, t_end_s=0.0, max_step_fraction=0.05, every_n_steps=1}, reference_barrier_enabled=False, reference_target=`"none"`, reference_blend_default=1.0, reference_volume_floor_rel=1e-8, reference_corner_j_floor_rel=1e-8, reference_gauss_j_floor_rel=1e-8, reference_linesearch_max_iters=24, reference_force_engage_every_step=False, reference_trigger_axis_margin_enabled=True, reference_trigger_axis_margin_threshold=1e-2, reference_trigger_corner_j_ratio_enabled=True, reference_trigger_corner_j_ratio_threshold=0.5, driver_retry_reference_barrier_enabled=False, driver_retry_reference_barrier_K_axis=4, driver_retry_reference_barrier_eta_axis=0.05, driver_retry_reference_barrier_max_attempts=6, driver_retry_reference_barrier_same_sig_max=3, driver_retry_reference_barrier_cell_window=2, driver_retry_reference_barrier_dt_collapse_rel=1e-3, driver_retry_reference_barrier_lambda_collapse_threshold=1e-3, driver_retry_reference_barrier_lambda_collapse_count=2, driver_retry_reference_barrier_quality_progress_factor=1.25, driver_retry_reference_barrier_quality_progress_count=2, driver_retry_reference_barrier_rezone_freq_warn_fraction=0.20, driver_retry_reference_barrier_rezone_freq_window=200, driver_retry_reference_barrier_chi=0.8, driver_retry_reference_barrier_q_retry=0.5, remap_damage_gate_enabled=False, remap_damage_dmax=0.05, remap_damage_axis_eta=0.02, remap_damage_axis_budget_enabled=False, remap_damage_axis_budget_factor=2.0, predictive_acceptance_enabled=False, predictive_acceptance_axis_floor_fraction=0.0, predictive_acceptance_cell_vol_floor_fraction=0.0, safe_backtrack_enabled=False, safe_backtrack_min_exp=20, safe_backtrack_binary_iters=8, mesh_epoch_enabled=False, mesh_epoch_max_per_step=16, euler_window.enabled=False, euler_window.shape=`"rectangle"`, euler_window.transition_width=0.0, band_ale={enabled=False, aspect_trigger=0.25, release_hysteresis=1.5, chi=0.5, respace_move_cap_frac=0.5, estimator_band_hold_mach=0.30, bands=`"belts_axis"`, belt_target=`"ring_mean"`, center_target=`"line"`, compose_with_rezone=False, axis_target=`"z_laplacian"`, axis_segment_halfwidth=4, axis_shell_block_enabled=False, sigma_linesearch_enabled=True, transaction_energy_closure_enabled=False, estimator_band_cut=0.5, estimator_band_shock_hold=0.90, estimator_band_front_hold_margin_rows=16.0, estimator_band_axis=`"auto"`, estimator_band_in_rows=4, estimator_band_out_rows=4, estimator_band_eta_on=1.5, estimator_band_eta_off=1.15, estimator_band_per_column=False, estimator_band_pc_filter_halfwidth=3, estimator_band_pc_slope_limit=0.35, estimator_band_pc_slope_reject=0.50, estimator_band_pc_curvature_limit=0.50, estimator_band_pc_chi_max=0.25, estimator_band_pc_chi_step=0.10, estimator_band_pc_sigma_floor=0.25, estimator_band_pc_coverage_full=0.80, estimator_band_pc_coverage_min=0.50, estimator_band_pc_cooldown_events=2, estimator_band_pc_phase_b=False, estimator_band_pc_tube_dilate_rows=5, estimator_band_pc_tube_dilate_cols_extra=2, estimator_band_pc_ambiguous_hold_fraction=0.20, closure_catchment_enabled=False, closure_catchment_forced_active=False, closure_catchment_s_catch_cm=6.0e-4, closure_catchment_s_protect_cm=1.0e-3, closure_catchment_spacing_floor_cm=3.0e-6, closure_catchment_ratio_max=1.05, closure_catchment_nu_max=0.25, closure_catchment_max_bites=1, closure_catchment_shock_hold=0.30, closure_catchment_eta_h_arm=0.80, closure_catchment_eta_h_full=0.65, closure_catchment_eta_m_arm=0.75, closure_catchment_eta_m_full=0.60, closure_catchment_reset_eta=0.90, closure_catchment_support_core_rows=4, closure_catchment_support_taper_rows=2, closure_catchment_accum_frac=0.02, closure_catchment_rearm_drop=0.10, pole_theta_enabled=False, pole_theta_routine_enabled=False, pole_theta_phys_lp=0, pole_theta_phys_lc=4, pole_theta_noise_floor=1.0e-5, pole_theta_noise_ceiling=1.0e-3, pole_theta_h_arm=0.70, pole_theta_h_fire=0.55, pole_theta_h_hard=0.35, pole_theta_h_release=0.80, pole_theta_kappa_arm=2.5, pole_theta_kappa_fire=3.5, pole_theta_kappa_hard=6.0, pole_theta_alpha=0.30, pole_theta_alpha_hard=0.60, pole_theta_deadband_frac=0.05, pole_theta_move_limit_frac=0.35, pole_theta_move_limit_hard_frac=0.75, pole_theta_cooldown_s=1.0e-12, pole_theta_cooldown_base_s=1.0e-12, pole_theta_predict_window_s=2.0e-12, pole_theta_predict_horizon_s=5.0e-12, pole_theta_halo_columns=2, pole_theta_halo_rows=2, pole_theta_post_h_floor=0.65, pole_theta_curve_preserving=False, pole_theta_protected_modes=`""`, pole_theta_fit_order=12, pole_theta_shock_hold=0.30, shell_window_in_rows=8, shell_window_out_rows=4, shell_boundary_guard_rows=2, shell_min_spacing_frac=0.5, shell_front_metric=`"grad_rho"`, shell_target=`"respace"`, axis_repair_enabled=False, axis_repair_eta_on=0.85, axis_repair_eta_off=0.95, axis_repair_cap_rel=0.05; frozen-config emitted only when enabled}, evacuated_cell={enabled=False, every_n_steps=50, arm_mass_fraction=1.0e-6, off_mass_fraction=1.0e-8, rho_vacuum_policy_g_per_cc=1.0e-10, off_hold_evaluations=2, laser_ne_over_ncrit_max=1.0e-3, laser_wavelength_nm=351.0, coupling_fraction_max=1.0e-8, max_cells_per_event=4, rematerialize_enabled=True, rematerialize_after_evaluations=10, rematerialize_volume_fraction=0.05, rematerialize_neighbor_change_max=5.0e-2, rematerialize_dwell_evaluations=5, closure_contact={enabled=True, gap_floor_fraction=0.02, gap_arm_fraction=0.04, live_mass_gate=0.05, live_volume_gate=0.02, refill_min_mass_fraction=0.05, refill_min_density_ratio=0.2, release_force_c=1.0e-3, release_persistence_stages=2, reengage_gap_margin=0.01}; frozen-config always emitted}, rezone_solver=`"legacy_winslow"`, m1_gamma_align=0.0, m1_lambda_tether=0.0, m1_theta_reg=0.0, m1_sweeps=8, m1_min_j_dec_rel=0.0, m1_barrier_beta=1e-3, rezone_local_admissibility_linesearch=False, rezone_local_j_floor_rel=1e-8, rezone_local_linesearch_max_halves=8, reject_zero_gauss_j=False, zero_gauss_j_floor_rel=1e-8, lambda_sweep_diagnostic_enabled=False, lambda_sweep_target_cell_c=-1, lambda_sweep_target_cell_i=-1, lambda_sweep_target_cell_j=-1, lambda_sweep_max_exp=20, corner_jacobian_post_tangle_enabled=True, corner_post_tangle_strict_floor_enabled=False, local_boundary_repair_enabled=False, multi_node_boundary_repair_enabled=False, multi_node_interior_repair_enabled=False, axis_variational_projection_enabled=False, multiblock_cross_seam_rezone_enabled=False, multiblock_scaled_reference_enabled=False, multiblock_differential_reference_enabled=False, multiblock_differential_reference_band_count=64, multiblock_differential_reference_smoothing_g0=0.03, multiblock_differential_reference_nu=0.10, multiblock_differential_reference_eps_v=0.03, multiblock_differential_reference_s_cap_min_rel=1e-3, multiblock_differential_reference_xi_seam_tol=1e-9, multiblock_differential_reference_sigma_warn_floor=0.5, multiblock_lagrangian_bulk_center_patch_reference_enabled=False, multiblock_center_patch_ring_max=4, multiblock_center_patch_xi_center=0.0, multiblock_center_patch_halo_layers=2, multiblock_center_patch_vol_on=0.05, multiblock_center_patch_vol_off=0.10, multiblock_center_patch_cornerj_on=0.03, multiblock_center_patch_cornerj_off=0.08, multiblock_center_patch_gaussj_on=0.03, multiblock_center_patch_gaussj_off=0.08, multiblock_path_admissibility_enabled=False, path_admissibility_floor=0.01, dt_rejection_factor=0.5, max_dt_rejections=8, axis_band_managed_remap_enabled=False, axis_band_managed_remap_width=3, axis_band_managed_remap_max_width=6, axis_band_managed_remap_every_hydro_half_step=True, axis_band_managed_remap_margin_trigger=1e-4, axis_band_managed_remap_equal_volume=True, axis_band_managed_remap_include_radiation_groups=True, axis_rezone_enabled=False, axis_rezone_trigger_edge_fraction=0.1, axis_rezone_trigger_min_altitude_fraction=0.1, axis_rezone_eta_floor=1e-2, emergency_cell_deactivation_enabled=False, axis_repair_mode=`"full_winslow"`, remap_scheme=`"legacy_split"`, remap_ms2_limiter=`"van_leer"`, swept_volume_sign_fixed=True, convergence_tol=1e-6; the six M1 keys are emitted by frozen-config serialization only when `rezone_solver="m1_tmop"`; legacy behavior requires `Numerics.profile.legacy_regression@2026-07-27` or an explicit False.
+	- rezoning / ale：enabled=False（2D_RZ ALE 用）, reale_short_edge_collapse_rel=3.0e-2, reale_subdomain_rezone=False, reale_subdomain_frac_max=0.6, reale_overlay_additivity_tol=1.0e-4, ale_identity_mode=False, ale_mover_diag=False, ale_preserve_lagrangian_velocity_carry=False, every_n_steps=5, force_rezone_every_n_steps=0, warmup_steps=0, relaxation=0.2, spacing_ratio_threshold=1.5, quality_threshold=0.2, max_iterations=20, max_displacement_fraction=0.5, remap_limiter=`"van_leer"`, remap_ms_midpoint=False, remap_ms_post_check=False, remap_ms_post_max_iter=3, remap_ms_rescale_floor=0.01, ke_fixup=True, ke_conservation_closure=False, ke_conservation_closure_audit=False, ke_closure_redistribute_floor=False, debug_per_remap_log=False, shock_sensor_guard_cells=2, density_jump_threshold=0.1, Te_jump_threshold=0.2, preventive_axis_guard_fraction=0.1, axis_z_motion=`"fixed"`, winslow_axis_kappa=0.7, button_morph={enabled=False, t_start_s=0.0, t_end_s=0.0, max_step_fraction=0.05, every_n_steps=1}, reference_barrier_enabled=False, reference_target=`"none"`, reference_blend_default=1.0, reference_volume_floor_rel=1e-8, reference_corner_j_floor_rel=1e-8, reference_gauss_j_floor_rel=1e-8, reference_linesearch_max_iters=24, reference_force_engage_every_step=False, reference_trigger_axis_margin_enabled=True, reference_trigger_axis_margin_threshold=1e-2, reference_trigger_corner_j_ratio_enabled=True, reference_trigger_corner_j_ratio_threshold=0.5, driver_retry_reference_barrier_enabled=False, driver_retry_reference_barrier_K_axis=4, driver_retry_reference_barrier_eta_axis=0.05, driver_retry_reference_barrier_max_attempts=6, driver_retry_reference_barrier_same_sig_max=3, driver_retry_reference_barrier_cell_window=2, driver_retry_reference_barrier_dt_collapse_rel=1e-3, driver_retry_reference_barrier_lambda_collapse_threshold=1e-3, driver_retry_reference_barrier_lambda_collapse_count=2, driver_retry_reference_barrier_quality_progress_factor=1.25, driver_retry_reference_barrier_quality_progress_count=2, driver_retry_reference_barrier_rezone_freq_warn_fraction=0.20, driver_retry_reference_barrier_rezone_freq_window=200, driver_retry_reference_barrier_chi=0.8, driver_retry_reference_barrier_q_retry=0.5, remap_damage_gate_enabled=False, remap_damage_dmax=0.05, remap_damage_axis_eta=0.02, remap_damage_axis_budget_enabled=False, remap_damage_axis_budget_factor=2.0, predictive_acceptance_enabled=False, predictive_acceptance_axis_floor_fraction=0.0, predictive_acceptance_cell_vol_floor_fraction=0.0, safe_backtrack_enabled=False, safe_backtrack_min_exp=20, safe_backtrack_binary_iters=8, mesh_epoch_enabled=False, mesh_epoch_max_per_step=16, euler_window.enabled=False, euler_window.shape=`"rectangle"`, euler_window.transition_width=0.0, band_ale={enabled=False, aspect_trigger=0.25, release_hysteresis=1.5, chi=0.5, respace_move_cap_frac=0.5, estimator_band_hold_mach=0.30, bands=`"belts_axis"`, belt_target=`"ring_mean"`, center_target=`"line"`, compose_with_rezone=False, axis_target=`"z_laplacian"`, axis_segment_halfwidth=4, axis_shell_block_enabled=False, sigma_linesearch_enabled=True, transaction_energy_closure_enabled=False, estimator_band_cut=0.5, estimator_band_shock_hold=0.90, estimator_band_front_hold_margin_rows=16.0, estimator_band_axis=`"auto"`, estimator_band_in_rows=4, estimator_band_out_rows=4, estimator_band_eta_on=1.5, estimator_band_eta_off=1.15, estimator_band_per_column=False, estimator_band_pc_filter_halfwidth=3, estimator_band_pc_slope_limit=0.35, estimator_band_pc_slope_reject=0.50, estimator_band_pc_curvature_limit=0.50, estimator_band_pc_chi_max=0.25, estimator_band_pc_chi_step=0.10, estimator_band_pc_sigma_floor=0.25, estimator_band_pc_coverage_full=0.80, estimator_band_pc_coverage_min=0.50, estimator_band_pc_cooldown_events=2, estimator_band_pc_phase_b=False, estimator_band_pc_tube_dilate_rows=5, estimator_band_pc_tube_dilate_cols_extra=2, estimator_band_pc_ambiguous_hold_fraction=0.20, closure_catchment_enabled=False, closure_catchment_forced_active=False, closure_catchment_s_catch_cm=6.0e-4, closure_catchment_s_protect_cm=1.0e-3, closure_catchment_spacing_floor_cm=3.0e-6, closure_catchment_ratio_max=1.05, closure_catchment_nu_max=0.25, closure_catchment_max_bites=1, closure_catchment_shock_hold=0.30, closure_catchment_eta_h_arm=0.80, closure_catchment_eta_h_full=0.65, closure_catchment_eta_m_arm=0.75, closure_catchment_eta_m_full=0.60, closure_catchment_reset_eta=0.90, closure_catchment_support_core_rows=4, closure_catchment_support_taper_rows=2, closure_catchment_accum_frac=0.02, closure_catchment_rearm_drop=0.10, pole_theta_enabled=False, pole_theta_routine_enabled=False, pole_theta_phys_lp=0, pole_theta_phys_lc=4, pole_theta_noise_floor=1.0e-5, pole_theta_noise_ceiling=1.0e-3, pole_theta_h_arm=0.70, pole_theta_h_fire=0.55, pole_theta_h_hard=0.35, pole_theta_h_release=0.80, pole_theta_kappa_arm=2.5, pole_theta_kappa_fire=3.5, pole_theta_kappa_hard=6.0, pole_theta_alpha=0.30, pole_theta_alpha_hard=0.60, pole_theta_deadband_frac=0.05, pole_theta_move_limit_frac=0.35, pole_theta_move_limit_hard_frac=0.75, pole_theta_cooldown_s=1.0e-12, pole_theta_cooldown_base_s=1.0e-12, pole_theta_predict_window_s=2.0e-12, pole_theta_predict_horizon_s=5.0e-12, pole_theta_halo_columns=2, pole_theta_halo_rows=2, pole_theta_post_h_floor=0.65, pole_theta_curve_preserving=False, pole_theta_protected_modes=`""`, pole_theta_fit_order=12, pole_theta_shock_hold=0.30, shell_window_in_rows=8, shell_window_out_rows=4, shell_boundary_guard_rows=2, shell_min_spacing_frac=0.5, shell_front_metric=`"grad_rho"`, shell_target=`"respace"`, axis_repair_enabled=False, axis_repair_eta_on=0.85, axis_repair_eta_off=0.95, axis_repair_cap_rel=0.05; frozen-config emitted only when enabled}, evacuated_cell={enabled=False, every_n_steps=50, arm_mass_fraction=1.0e-6, off_mass_fraction=1.0e-8, rho_vacuum_policy_g_per_cc=1.0e-10, off_hold_evaluations=2, laser_ne_over_ncrit_max=1.0e-3, laser_wavelength_nm=351.0, coupling_fraction_max=1.0e-8, max_cells_per_event=4, rematerialize_enabled=True, rematerialize_after_evaluations=10, rematerialize_volume_fraction=0.05, rematerialize_neighbor_change_max=5.0e-2, rematerialize_dwell_evaluations=5, closure_contact={enabled=True, gap_floor_fraction=0.02, gap_arm_fraction=0.04, live_mass_gate=0.05, live_volume_gate=0.02, refill_min_mass_fraction=0.05, refill_min_density_ratio=0.2, release_force_c=1.0e-3, release_persistence_stages=2, reengage_gap_margin=0.01}; frozen-config always emitted}, rezone_solver=`"legacy_winslow"`, m1_gamma_align=0.0, m1_lambda_tether=0.0, m1_theta_reg=0.0, m1_sweeps=8, m1_min_j_dec_rel=0.0, m1_barrier_beta=1e-3, rezone_local_admissibility_linesearch=False, rezone_local_j_floor_rel=1e-8, rezone_local_linesearch_max_halves=8, reject_zero_gauss_j=False, zero_gauss_j_floor_rel=1e-8, lambda_sweep_diagnostic_enabled=False, lambda_sweep_target_cell_c=-1, lambda_sweep_target_cell_i=-1, lambda_sweep_target_cell_j=-1, lambda_sweep_max_exp=20, corner_jacobian_post_tangle_enabled=True, corner_post_tangle_strict_floor_enabled=False, local_boundary_repair_enabled=False, multi_node_boundary_repair_enabled=False, multi_node_interior_repair_enabled=False, axis_variational_projection_enabled=False, multiblock_cross_seam_rezone_enabled=False, multiblock_scaled_reference_enabled=False, multiblock_differential_reference_enabled=False, multiblock_differential_reference_band_count=64, multiblock_differential_reference_smoothing_g0=0.03, multiblock_differential_reference_nu=0.10, multiblock_differential_reference_eps_v=0.03, multiblock_differential_reference_s_cap_min_rel=1e-3, multiblock_differential_reference_xi_seam_tol=1e-9, multiblock_differential_reference_sigma_warn_floor=0.5, multiblock_lagrangian_bulk_center_patch_reference_enabled=False, multiblock_center_patch_ring_max=4, multiblock_center_patch_xi_center=0.0, multiblock_center_patch_halo_layers=2, multiblock_center_patch_vol_on=0.05, multiblock_center_patch_vol_off=0.10, multiblock_center_patch_cornerj_on=0.03, multiblock_center_patch_cornerj_off=0.08, multiblock_center_patch_gaussj_on=0.03, multiblock_center_patch_gaussj_off=0.08, multiblock_path_admissibility_enabled=False, path_admissibility_floor=0.01, dt_rejection_factor=0.5, max_dt_rejections=8, axis_band_managed_remap_enabled=False, axis_band_managed_remap_width=3, axis_band_managed_remap_max_width=6, axis_band_managed_remap_every_hydro_half_step=True, axis_band_managed_remap_margin_trigger=1e-4, axis_band_managed_remap_equal_volume=True, axis_band_managed_remap_include_radiation_groups=True, axis_rezone_enabled=False, axis_rezone_trigger_edge_fraction=0.1, axis_rezone_trigger_min_altitude_fraction=0.1, axis_rezone_eta_floor=1e-2, emergency_cell_deactivation_enabled=False, axis_repair_mode=`"full_winslow"`, remap_scheme=`"legacy_split"`, remap_ms2_limiter=`"van_leer"`, swept_volume_sign_fixed=True（False は 2026-08-05 から ConfigError）, convergence_tol=1e-6; the six M1 keys are emitted by frozen-config serialization only when `rezone_solver="m1_tmop"`.
 		- Axis-edge-collapse monitor defaults: `Numerics.ale.evacuated_cell.closure_contact.axis_edge_collapse={enabled=False, ulp_count=4096.0, h_ref_fraction=1.0e-6, release_hysteresis=4.0, persistence_window=8, persistence_min_closing=7, repair_recurrence_steps=16, repair_futility_fraction=0.25}`.
 		- Flank-tangential-strip monitor defaults: `Numerics.ale.evacuated_cell.closure_contact.flank_tangential_strip={enabled=False, untangler_enabled=True, band_layers=2, band_halfwidth_j=6, arm_quality_ratio=0.25, release_quality_ratio=0.60, min_progress_factor=10.0, lead_steps=32, release_persistence_steps=32, release_shear_number=0.02, slip_handoff_ratio=0.5, slip_patch_enabled=False}`.
 		- Seam-interface-owner default: `Numerics.ale.evacuated_cell.closure_contact.seam_interface_owner_enabled=False`.
@@ -3450,7 +3211,7 @@ TENRYUの実アプリ基準として、GEKKO XII（GXII）同等の **12ビー�
 		- Tier-A butterfly-center authority harness default: no runtime/default namelist state. It is available only through the opt-in CTest target `test_butterfly_authority_tier_a`; normal single-block, three-block, five-block hydro, and tri_fan runs do not enter it.
 	- hydro I1-B tri_fan center-stability defaults: av_qcap_over_p=0.0, av_qcap_center_band_only=False, tri_fan_center_cfl_enabled=False, tri_fan_center_cfl_safety=0.5, tri_fan_center_cfl_band_radial_index=3, tri_fan_center_perturbation_diag_enabled=False, av_qcap_scope="global", center_cfl_scope="disabled", center_perturbation_diag_scope="disabled", center_perturbation_diag_radial_bins=2
 	- `Numerics.ale.corner_cell_aspect_protection_enabled=True`, `Numerics.ale.corner_cell_aspect_eta=0.5`
-	- `Numerics.ale.swept_volume_sign_fixed = True`; legacy behavior requires `Numerics.profile.legacy_regression@2026-07-27` or an explicit False.
+	- `Numerics.ale.swept_volume_sign_fixed = True`; an explicit False is a `ConfigError` since 2026-08-05 (the legacy convention was removed), so `Numerics.profile.legacy_regression@2026-07-27` cannot be enabled.
 	- DGCL additive gate defaults: `Numerics.ale.dgcl_commit_gate=False`, `Numerics.ale.dgcl_commit_rtol=1.0e-11`.
 	- `Numerics.ale.transaction_failure_inject_point = 0`.
 - ale1d：enabled=False, every_n_steps=100, min_steps_between_ale=50, enable_benefit_gate=True, benefit_min_dt_gain=1.5, candidate_dt_penalty_max=1.25, emergency_enabled=True, emergency_max_dr_ratio=1.25, min_cells=256, protected_fraction_max=0.25, min_movable_segment_warn=24, min_movable_segment_hard=8, max_node_displacement_fraction_mu=0.35, max_node_displacement_fraction_r=0.35, diagnostics_enabled=True。Sensor defaults: laser target=0.060N sigma=4..16 cells peak=0.35 conf=0.10..0.40; ablation target=0.080N sigma=3..14 peak=0.40 ρ_ref=1.05 ρ_gate=0.07±0.02 Te_gate=0.5..2.0eV conf=0.10..0.35; shock target=0.040N sigma=2..8 peak=0.35 Q_conf=0.03..0.10 χ_conf=0.03..0.15; interface target=0.033N total cap=0.067N max_features=8 separation=4 jump=0.05..0.25 sigma=2..4 pin=True; center target=0.053N sigma=6..20 search_x=0.12. Rezone defaults: W0=1, Wmax=50W0, smoothing=2, floor fraction=0.55, Gaussian truncation=3σ, spatial monitor enabled with target=0.067N, p=2, laser/ablation/shock spatial Δr clips of 2.5e-5..2.0e-4 / 1.5e-5..1.2e-4 / 1.0e-5..8.0e-5 cm. Remap defaults: reject multicell sweeps=True, high_order_enabled=True, limiter_theta=1.5, high_order_ramp_cells=2, radiation_high_order_ramp_cells=2, fallback_to_first_order_on_bounds_fail=True, reject_strict_zero_flux_on_moving_protected_face=True. min_width_floor defaults (experimental-incomplete): enabled=False, floor_cm=0.0, target_factor=1.25, relief_halfwidth_cells=3, max_growth_factor=1.8, retrigger_cooldown_steps=0 (validation: floor_cm>0, target_factor>1, relief_halfwidth_cells>=1, 1<max_growth_factor<=2, retrigger_cooldown_steps>=0 when enabled).
@@ -3596,11 +3357,11 @@ Langdon default-on (2026-08-10): `Laser.ib.langdon_model` gains `"auto"` (new de
 - eos.model in {`sesame`, `ionmix`, `tmat`, `ideal_gas`}（既定 `ideal_gas`）
 - eos.hydro_backend in {`legacy`, `helmholtz_spline`, `helmholtz_jet`, `exact_ideal_gas`, `rho_e_table`, `mie_gruneisen`}（既定 `legacy`；tabular EOS の hydro-only backend。`exact_ideal_gas` と `rho_e_table` は 1D_SPH 専用、`mie_gruneisen` は 1D_SPH + 2T 専用）
 - eos.cv_e_override と eos.eos_T_ref_eV は既定で未指定（検証用。§6.4.3）
-- sesame settings（when `eos.model=sesame`）：sesame_format=ascii、sesame_table_total=301、sesame_table_electron=304
-- opacity.model=ionmix（既定。推奨構成: SESAME EOS + IONMIX opacity）
+- sesame settings（when `eos.model=sesame`）：表番号は固定で 301（全体）と 304（電子）。`sesame_format`・`sesame_table_*` のキーは受理されない
+- opacity.model=constant（既定）
 - opacity.kappa_planck is unset by default (Planck constant follows `kappa_a`; Rosseland stays `kappa_a`)
-- zbar：model=fixed（完全電離仮定。多材料時は材料別 Z̄_α = Z_α を混合平均。thomas_fermi, tabularも選択可）
-- opacity_mix_rule=linear_mass, eos_mix_rule=mass_weighted_same_state
+- zbar：model=fixed（完全電離仮定。多材料時は材料別 Z̄_α = Z_α をイオン数の重み f/A で平均。fixed_value=-1（未指定）。thomas_fermi, tabularも選択可）
+- opacity_mix_rule=linear_mass、low_density_extrapolation=False。`mixture.eos_mix_rule`・`mixture.fractions` は受理するが使わない
 
 **Materials（TMAT-H5 追加）**：
 - eos.model=tmat（`.tmat.h5` から EOS を読み込む。既存 `sesame` / `ionmix` / `ideal_gas` と選択）
@@ -3635,7 +3396,7 @@ Langdon default-on (2026-08-10): `Laser.ib.langdon_model` gains `"auto"` (new de
 - hydro qei_heat_capacity="ideal_gas"（許可値 `{"ideal_gas","table"}`；NUMERICS [2026-09-14 追補 2] 準拠）
 - hydro corner_mass_convention = "kinematic_basis_rz_v1"
 - hydro time_integration = "midpoint_v1", total_energy_identity_check = False
-- hydro av_type="vnr", rz_momentum_scheme="volume_weighted", axis_node_mass_convention="corner_subzonal", av_C1=0.1, av_C2=1.5, csw98_degenerate_side_floor_rel=1.0e-2, csw98_damper_impulse_beta=0.0, csw98_axisline_av_mode="off", csw98_axisline_d1prime_cfl_enabled=True（added 2026-08-19）, csw98_limiter_shock_floor_enabled=False, csw98_axisline_work_planar_enabled=False, av_cfl_coefficient=0.25, axis_motion_floor_fraction=0.0, axis_margin_dt_floor_fraction=0.0, volume_rate_cfl_enabled=False, volume_rate_cfl_threshold=0.5, corner_j_predict_cfl_enabled=False, corner_j_predict_cfl_safety=0.5, corner_j_predict_floor_frac=0.05, corner_j_predict_max_shrink=0.25, corner_j_predict_shell_rings=4, rz_geometric_cfl_enabled=False, rz_geometric_cfl_etaV=0.5, rz_geometric_cfl_r_floor=1e-10, rz_geometric_cfl_cumulative_protection_enabled=True, rz_geometric_cfl_v_initial_floor=0.1, rz_geometric_cfl_precise_u_half_enabled=False, trial_volume_cfl_enabled=False, trial_volume_cfl_floor_fraction=0.05, trial_volume_cfl_shrink_fraction=0.5, corner_jacobian_ale_trigger_enabled=False, corner_jacobian_floor_eps=1e-6, corner_jacobian_ale_trigger_scale=0.5, in_hydro_corner_j_guard_enabled=False, in_hydro_gauss_j_guard_enabled=False, in_hydro_rz_volume_guard_enabled=False, in_hydro_gauss_j_floor_rel=1e-8, in_hydro_rz_volume_floor_rel=1e-8, mesh_quality_dt_cfl_enabled=False, mesh_quality_dt_safety_alpha=0.5, mesh_quality_dt_corner_j_enabled=True, mesh_quality_dt_gauss_j_enabled=True, mesh_quality_dt_rz_volume_enabled=True, mesh_quality_dt_axis_margin_additive=True, mesh_quality_dt_corner_j_floor_rel=1e-8, mesh_quality_dt_gauss_j_floor_rel=1e-8, mesh_quality_dt_rz_volume_floor_rel=1e-8, ring7_quotient_enabled=False, regime_aware_corner_j_guard_enabled=False, axis_margin_guard_enabled=False, axis_margin_additive_in_action8_enabled=False, axis_guard_band_cells=2, driver_full_step_retry_enabled=False, driver_full_step_retry_max_attempts=3, driver_retry_active_mesh_repair_enabled=False, driver_retry_corner_balance_threshold=0.01, cascade_on_hydro_retry_enabled=False, driver_retry_use_suggested_dt_enabled=False, geometric_retry_stagnation={enabled=False, same_cell_count_threshold=3, sigma_rel_tol=0.25, dt_drop_factor=1e-4, force_diagnostic_dump=True}, dispatcher_state_sensitive_bypass_enabled=False, dispatcher_state_sensitive_repair_cap_per_step=3, strategy_first_retry_enabled=False, strategy_first_max_same_dt_attempts=2, mesh_geometry_soft_fail_enabled=False, qei_evaluate_at_t_n=True, qei_multiplier=1.0, total_energy_remap_2d_rz=False, work_split_audit_2d_rz=False, work_split_audit_cell_every_n_steps=0, work_split_audit_all_rows=False, hllc_z_flux_2d_rz=False, hllc_z_flux_audit_2d_rz=False, hllc_z_flux_hlle_fallback=True, hllc_z_flux_strict_quasi_1d=False, bbs_axis_policy_enabled=False, subzonal_mass_enabled=False, subzonal_mass_lagrangian_invariant_enabled=False, anti_hourglass_kappa=0.05, subzonal_pressure_mode="uniform_cell", hourglass.enabled=False, hourglass.scale=0.05, hourglass.compatible_work_enabled=True, hourglass.activation_corner_j_ratio_threshold=0.5, hourglass.activation_hourglass_amplitude_threshold=0.01, hourglass.subzonal_pressure_model="linearized", hourglass.max_force_per_node_fraction=0.2, csw_C1=0.5, csw_C2=2.0, csw_limiter="van_leer", csw_limiter_enabled=True, csw_shock_limiter_floor=0.65, csw_zero_uniform_compression=True, csw_diagnostics=False, av_limiter_J=1.0, av_heat_C=0.0, ion_art_heat_C=0.0, post_shock_heat=False, post_shock_heat_C=0.1, post_shock_heat_decay=3.0, post_shock_velocity_damping_C=0.0, bulk_viscosity_C=0.0, crossing_dt_safety=0.5, time_integrator="legacy_pc", adaptive_av.enabled=False, adaptive_av.hysteresis_tau=0.0, av_eos_aware=False, av_eos_gamma1_ref=5/3, av_eos_boost_max=3.0, odd_even_damping_C=0.0, anti_hourglass_C=0.0, ee_odd_even_C=0.0, hk_velocity_damper_C=0.0, hk_velocity_damper_tau_min=8.0, hk_velocity_damper_grad_Te_max=0.2, hk_velocity_damper_grad_rho_max=0.3, hk_velocity_damper_guard_cells=25, compatible_energy=False, rho_e_linear_grid=False, eos_writeback=True, eos_closure_mode="energy_authoritative", exact_override="none"（NUMERICS §3.1.4, §3.1.5, §3.1.6, §3.1.9, §3.2.5, §3.2.9, §3.2.9b, §3.2.9c, §3.2.12a, §3.2.13, §3.2.13a, §3.2.13b準拠）
+- hydro av_type="vnr"（1D_SPH で未指定のときは "csw"）, rz_momentum_scheme="volume_weighted", axis_node_mass_convention="corner_subzonal", av_C1=0.1, av_C2=1.5, csw98_degenerate_side_floor_rel=1.0e-2, csw98_damper_impulse_beta=0.0, csw98_axisline_av_mode="off", csw98_axisline_d1prime_cfl_enabled=True（added 2026-08-19）, csw98_limiter_shock_floor_enabled=False, csw98_axisline_work_planar_enabled=False, av_cfl_coefficient=0.25, axis_motion_floor_fraction=0.0, axis_margin_dt_floor_fraction=0.0, volume_rate_cfl_enabled=False, volume_rate_cfl_threshold=0.5, corner_j_predict_cfl_enabled=False, corner_j_predict_cfl_safety=0.5, corner_j_predict_floor_frac=0.05, corner_j_predict_max_shrink=0.25, corner_j_predict_shell_rings=4, rz_geometric_cfl_enabled=False, rz_geometric_cfl_etaV=0.5, rz_geometric_cfl_r_floor=1e-10, rz_geometric_cfl_cumulative_protection_enabled=True, rz_geometric_cfl_v_initial_floor=0.1, rz_geometric_cfl_precise_u_half_enabled=False, trial_volume_cfl_enabled=False, trial_volume_cfl_floor_fraction=0.05, trial_volume_cfl_shrink_fraction=0.5, corner_jacobian_ale_trigger_enabled=False, corner_jacobian_floor_eps=1e-6, corner_jacobian_ale_trigger_scale=0.5, in_hydro_corner_j_guard_enabled=False, in_hydro_gauss_j_guard_enabled=False, in_hydro_rz_volume_guard_enabled=False, in_hydro_gauss_j_floor_rel=1e-8, in_hydro_rz_volume_floor_rel=1e-8, mesh_quality_dt_cfl_enabled=False, mesh_quality_dt_safety_alpha=0.5, mesh_quality_dt_corner_j_enabled=True, mesh_quality_dt_gauss_j_enabled=True, mesh_quality_dt_rz_volume_enabled=True, mesh_quality_dt_axis_margin_additive=True, mesh_quality_dt_corner_j_floor_rel=1e-8, mesh_quality_dt_gauss_j_floor_rel=1e-8, mesh_quality_dt_rz_volume_floor_rel=1e-8, ring7_quotient_enabled=False, regime_aware_corner_j_guard_enabled=False, axis_margin_guard_enabled=False, axis_margin_additive_in_action8_enabled=False, axis_guard_band_cells=2, driver_full_step_retry_enabled=False, driver_full_step_retry_max_attempts=3, driver_retry_active_mesh_repair_enabled=False, driver_retry_corner_balance_threshold=0.01, cascade_on_hydro_retry_enabled=False, driver_retry_use_suggested_dt_enabled=False, geometric_retry_stagnation={enabled=False, same_cell_count_threshold=3, sigma_rel_tol=0.25, dt_drop_factor=1e-4, force_diagnostic_dump=True}, dispatcher_state_sensitive_bypass_enabled=False, dispatcher_state_sensitive_repair_cap_per_step=3, strategy_first_retry_enabled=False, strategy_first_max_same_dt_attempts=2, mesh_geometry_soft_fail_enabled=False, qei_evaluate_at_t_n=True, qei_multiplier=1.0, total_energy_remap_2d_rz=False, work_split_audit_2d_rz=False, work_split_audit_cell_every_n_steps=0, work_split_audit_all_rows=False, hllc_z_flux_2d_rz=False, hllc_z_flux_audit_2d_rz=False, hllc_z_flux_hlle_fallback=True, hllc_z_flux_strict_quasi_1d=False, bbs_axis_policy_enabled=False, subzonal_mass_enabled=False, subzonal_mass_lagrangian_invariant_enabled=False, anti_hourglass_kappa=0.05, subzonal_pressure_mode="uniform_cell", hourglass.enabled=False, hourglass.scale=0.05, hourglass.compatible_work_enabled=True, hourglass.activation_corner_j_ratio_threshold=0.5, hourglass.activation_hourglass_amplitude_threshold=0.01, hourglass.subzonal_pressure_model="linearized", hourglass.max_force_per_node_fraction=0.2, csw_C1=0.5, csw_C2=2.0, csw_limiter="van_leer", csw_limiter_enabled=True, csw_shock_limiter_floor=0.65, csw_zero_uniform_compression=True, csw_diagnostics=False, av_limiter_J=1.0, av_heat_C=0.0, ion_art_heat_C=0.0, post_shock_heat=False, post_shock_heat_C=0.1, post_shock_heat_decay=3.0, post_shock_velocity_damping_C=0.0, bulk_viscosity_C=0.0, crossing_dt_safety=0.5, time_integrator="legacy_pc", adaptive_av.enabled=False, adaptive_av.hysteresis_tau=0.0, av_eos_aware=False, av_eos_gamma1_ref=5/3, av_eos_boost_max=3.0, odd_even_damping_C=0.0, anti_hourglass_C=0.0, ee_odd_even_C=0.0, hk_velocity_damper_C=0.0, hk_velocity_damper_tau_min=8.0, hk_velocity_damper_grad_Te_max=0.2, hk_velocity_damper_grad_rho_max=0.3, hk_velocity_damper_guard_cells=25, compatible_energy=False, rho_e_linear_grid=False, eos_writeback=True, eos_closure_mode="energy_authoritative", exact_override="none"（NUMERICS §3.1.4, §3.1.5, §3.1.6, §3.1.9, §3.2.5, §3.2.9, §3.2.9b, §3.2.9c, §3.2.12a, §3.2.13, §3.2.13a, §3.2.13b準拠）
 - `Numerics.hydro.plasma_viscosity = {enabled: False, model: "braginskii", species: "ion", eta_const: 0.0, eta0_scale: 1.0, mfp_cap_cells: 20.0, lnlambda_fixed: 0.0, dt_safety: 0.3}` (scope: 1D (all geometries) and 2D RZ)
 - Phase 4 AV/subzonal defaults: `Numerics.hydro.av_model="scalar_vnr_legacy"` and `Numerics.hydro.rz_momentum_scheme="volume_weighted"` for every topology, `subzonal_pressure_enabled=False`, `aw_compatible_force_work=False`, `subzonal_band_mode="off"`, `subzonal_band_feather_layers=2`, `av_cfl_coefficient=0.25`, `csw_limiter_enabled=True`, `subzonal_merit_mode="caramana_auto"`, `subzonal_alpha1=1.4142135623730951`, `subzonal_alpha2=0.1`, `subzonal_merit_power=2`, and `subzonal_merit_constant=1.0`. Frozen-config default completion fills `"volume_weighted"` for legacy input; the default-off AW-compatible key is elided. `csw_edge` requires explicit `subzonal_pressure_enabled=True`; no topology default enables it implicitly. If `csw_edge` is selected and `av_C1`/`av_C2` are omitted, their namelist defaults are `1.0/1.0` for the edge AV package while legacy VNR defaults remain `0.1/1.5`. The same conditional `1.0/1.0` defaulting applies to `csw_edge_csw98` (identical Kuropatenko kernel). `csw_edge_csw98` is NOT paired-validated with subzonal pressure (runs with either setting); central pseudo-core accepts either edge mode but still requires subzonal. `csw_pole_floor_*` defaults: `enabled=False`, `sigma0=1.0`, `theta0_rad=thetaf_rad=0.033`, frozen-config elided at default-off. `csw_rz_lift_*` defaults: `enabled=False`, `guard_ratio=4.0`, frozen-config elided at default-off. `mimetic_tensor_v1` defaults: `tensor_av_C1=1.0`, `tensor_av_C2=1.0`, both frozen-config elided at their defaults (existing frozen configs keep byte identity); the mode itself requires the full AW compatible trio (`aw_compatible_force_work=True`, `rz_momentum_scheme="area_weighted_symmetric"`, `subzonal_pressure_enabled=True`, 2D) and is accepted by the polar-tier / central-pseudo-core / AW trio validations alongside the CSW pair.
 - plic：enabled=False, normal_estimator=`"youngs_seeded_LVIRA"`, t0_volume_cut_method=`"adaptive_subdivision_2x2"`, in_run_disabled=False, rho_material_aware_donor=False
@@ -3678,92 +3439,35 @@ Langdon default-on (2026-08-10): `Laser.ib.langdon_model` gains `"auto"` (new de
 - diagnostics.conservation.enabled=False
 - diagnostics.ale_provenance_emission.enabled=False
 
-**Radiation / IMC**：
+**Radiation**：
 - radiation enabled=True
-- radiation mode=`"multigroup_diffusion"`（DEFAULT-FLD: FREEZE-1D-RAD/FLD-FIX-1 後の既定。1D_SPH/2D_RZ production radiation は `"multigroup_diffusion"` と `"sn_transport"` のみ受理する。`"imc_ddmc"`（従来 IMC/DDMC/PGRW/HOLO/difference 経路）は 1D_SPH/2D_RZ production namelist では `ConfigError`。`"sn_transport"` は 1D_SPH/2D_RZ CUDA pure \(S_N\) で、FLD/S_N は IMC/DDMC/HOLO/difference 有効時に `ConfigError`）
-- origin_parity_only=False, group_repack_hard_xray=False, diagnose_hard_xray_opacity=False（legacy 既定はすべてOFF）
+- radiation mode=`"multigroup_diffusion"`（受理するのは `"multigroup_diffusion"` と `"sn_transport"`。`"imc_ddmc"`（モンテカルロ輻射）は 2026-09-29 にビルドから外し、`ConfigError`）
+- group_repack_hard_xray=False, diagnose_hard_xray_opacity=False（legacy 既定はすべてOFF。origin_parity_only は 2026-09-29 から効果なし）
 - volume_source_rate=0.0 [erg/(cm³ s)], volume_source_x_max=-1.0 [cm]（外部体積線源 OFF。1D_SPH FLD は W-B 実装、`rate > 0` は `groups=1` かつ `x_max > 0` 必須）
 - planck_fraction：method=compute, compute_N_T=200, compute_T_range_eV は未指定時に EOS table 温度範囲から自動導出
-- IMC enabled=False（internal/test-only。`mode="imc_ddmc"` の legacy 経路で必要な場合は明示的に有効化する。production namelist では `imc` subblock を設定しない）
-- IMC time-centering α=1.0（fully implicit）
-- IMC f_max=1.0（Fleck factor上限、制限なし）
-- IMC corrected_fleck=False（既定。True で Cleveland & Wollaber (2018) の修正 Fleck factor）
-- IMC emission particles：50 / cell / group（テスト用；本番は増やす）
-- IMC implicit_capture=True, inelastic_scatter=True
-- IMC cutoff_fraction=0.0（無効）
-- IMC weight_cutoff=1e-10, roulette_survival=0.1, weight_split=1e+2, max_split=8（weight_split/max_split は v1.0 では予約）
-- IMC max_pool_size=100,000,000（1億粒子、GPUメモリ60%上限との min で制約）
-- IMC source_tilting=False（既定OFF。True で 1D_SPH/2D_RZ thermal source の emit 位置だけを \(T_e^4\) 勾配で傾ける）
-- IMC source_localization=False（既定OFF。True で前ステップ吸収 midpoint の mean/variance から 1D_SPH thermal source を finite-width PDF へ局所化する）
-- IMC sloc_ema_beta=0.4（source_localization の mean radius に対する時間方向 EMA）
-- IMC sloc_sigma_floor=0.1, sloc_sigma_cap=0.5（source_localization の emit 幅の cell-width 比 floor/cap）
-- IMC sloc_tau_ref=1.0（source_localization の optical-depth gate 基準）
-- IMC spectral_bias_eta=0.0（既定OFF。`0.3-0.5` で thermal emission の window-group biasing を有効化）
-- IMC opacity_predictor=False（既定。true NLTE の係数評価だけで半ステップ温度予測を使う）
-- IMC two_stage=False（既定。True で `R(Δt)` を `Δt/2 + Δt/2` へ分割し，中間で EOS / Zbar を再同期）
-- IMC difference={enabled=False, W_max=1.0, tau0=3.0, chi0=1.0, face_transport=True}（既定OFF。1D_SPH および `face_transport=False` の 2D_RZ LTE nonlinear thermal source を signed residual source に置換し、物理 `rad_emit` と reference absorption preseed を保持し、step 冒頭の census を previous-reference reservoir と signed residual 粒子へ再分割する。`face_transport=True` は 1D_SPH のみ AP reference face transport で \(U^{ref,end}\) を更新し、2D_RZ では ConfigError。`rad_E` は reference average と signed residual estimator の和として再構成する。PR9 gate 完了まで production 推奨は行わない）
-- IMC net_e_source_smoothing={enabled=False, alpha=0.2, tau_threshold=4.0, passes=1, grad_Te_scale=0.3, grad_rho_scale=0.5, gradient_adaptive=False}（既定OFF。1D_SPH/2D_RZ の optically thick かつ非interface face で net electron source を conservative に平滑化。2D_RZ で enabled=True の alpha 上限は 0.125、その他は 0.25。difference 併用時は \(W\ge0.5\) セルを smoothing barrier とする。gradient_adaptive=True では \(T_e,\rho\) の対数勾配で face 係数を連続的に弱める）
-- IMC particle_budget=-1（無効。>0で有効化。検証テストでは使用しない）
-- IMC census_comb：enabled=False, max_particles=1,000,000, min_per_bin=1, trigger_ratio=1.0, target_fraction=0.8, mode_weight_imc=1.0, mode_weight_ddmc=0.5, adaptive_trigger=True, adaptive_util_start=0.70, adaptive_util_end=0.95, trigger_ratio_floor=0.85, trigger_hysteresis=0.05, ess_floor_enabled=False, ess_min_tier0=16.0, ess_min_tier1=8.0, max_split_factor=4
-- IMC rad_lite_mesh：enabled=False, sigma_ratio_max=2.0, nlte_auto=False（1D_SPH専用）
+- imc：two_stage=False（既定。True で `R(Δt)` を `Δt/2 + Δt/2` へ分割し、中間で EOS / Zbar を再同期）。`imc` のその他のキー、`ddmc`・`diffusion`・`holo`、`boundary.marshak_particles` は退役したモンテカルロ輻射のもので、受理して無視する（§6.4.5）
 - FLD multigroup_diffusion：flux_limiter=`"levermore_pomraning"`, max_outer_iterations=20, outer_tol=1e-5, fleck_mode=`"fleck_cummings"`（allowed: `"afi"`）, hydro_coupling=`"gamma_r_43"`（allowed: `"none"`, `"conservative_advection"`; passive transport opt-in, 1D Lagrangian host loop only）, state_supply_boundary_policy=`"local_D_current"`, diagnostic_radial_fourier_substage_enabled=False, cg_inner_tol=1.0e-10, cg_tol_norm=`"r0"`, outer_accel=`"auto"`（1D→`"grey"`、2D_RZ→`"none"`）, limiter_evaluation=`"predictor"`, anderson_m=2, anderson_beta=1.0, cg_max_iter=500, cap_exit_policy=`"warn"`（allowed: `"fail"`）, rgmg_smoother_omega=0.67, linear_solver_1d=`"cusparse_tridiag"`, linear_solver_2d=`"auto"`（allowed: `"auto"`, `"amgx_cg"`, `"jacobi"`, `"cusparse_cg_jacobi"`, `"cusparse_cg_zline"`, `"cusparse_cg_rgmg"`；`"auto"` は nr 2 冪かつ nz>=3 → rgmg / nz>=3 → zline / else jacobi に validate 時解決。**明示 `"amgx_cg"` の AmgX 未 link build は ConfigError（fatal）**。requested/resolved を run_info+HDF5 metadata に記録）, amgx_config.preset=`"AGGREGATION_JACOBI"`, opacity_floor=1e-6, opacity_cap=1e20, z_boundary=`"vacuum"`（`"state_supply"` は default-off）, boundary.inner_r=`"reflect"`, boundary.outer_r=`"vacuum"`, boundary.z=`"vacuum"`, boundary.z_bottom=`"vacuum"`, boundary.z_top=`"vacuum"`, marshak.flux_erg_per_cm2_s=0, marshak.flux_pulse_duration_s=-1（`mode="multigroup_diffusion"` で使用）
 - S_N sn_transport：n_angles=16, angular_quadrature=`"level_symmetric_16"`, spatial_scheme=`"linear_characteristic"`（1D は `"linear_discontinuous"`、2026-09-25）, max_outer_iterations=20, max_inner_iterations=100, outer_tol=1e-4, outer_tol_stagnation_factor=0.5, outer_tol_hydro_error_scale=1e-5, inner_tol=1e-6, grey_preconditioner=`"auto"`, inner_graph_unroll=5, dsa_enabled=True, inner_acceleration=`"none"`, anderson_depth=3, diffusion_fallback_mode=`"none"`, tau_diffusion_on=10.0, tau_diffusion_off=5.0, opacity_floor=1e-100, opacity_cap=1e20, timing_enabled=False, z_boundary=`"vacuum"`, boundary.inner_r=`"reflect_parity"`, boundary.outer_r=`"vacuum"`, boundary.z=`"vacuum"`, boundary.z_bottom=`"vacuum"`, boundary.z_top=`"vacuum"`, marshak.flux_erg_per_cm2_s=0（`mode="sn_transport"` で使用。1D_SPH/2D_RZ closure は conservative active set + face flux + donor theta + AP face blend に固定。`"diamond_difference"` は deprecated regression option）
-- radiation boundary：type=vacuum, inner=reflect（1D_SPH）, marshak_particles=1000
-
-**Radiation / DDMC**：
-- DDMC enabled=False（internal/test-only。`mode="imc_ddmc"` の legacy 経路で必要な場合は明示的に有効化する。production namelist では `ddmc` subblock を設定しない）
-- DDMC implicit_diffusion=False（既定OFF。HIMCD Phase-1 は 1D LTE 限定）
-- tau_ddmc=4.0, tau_rw=0.0, omega_ddmc=0.9
-- DDMC leak_stencil=9_kershaw（Kershaw 9点差分）
-- DDMC interface_method=asymptotic_diffusion_limit
-- DDMC emissivity_preserving=True（Densmore 2006 \(\hat{P}\) 補正）
-- DDMC interface_exit_distribution=cosine（μ比例）
-- DDMC face_opacity_temperature=radiative_mean
-- DDMC m_matrix_check=True
-- DDMC momentum_deposition=True
-- DDMC rz_face_r_weight=True（2D_RZ面位置サンプリングのR重み付け）
-- DDMC tau_ddmc_off=-1.0、omega_ddmc_off=-1.0
-- DDMC mode_hold=0（ヒステリシスなし）、rate_max=1e30（無制限）
-
-**Radiation / Diffusion**：
-- diffusion enabled=False
-- tau_on=5.0, tau_off=3.0
-- reduced_flux_on=0.15, reduced_flux_off=0.25
-- mode_hold=0, rate_max=1e30
-- mode_update_interval=10, min_diffusion_island_cells=5
-- imc_guard_cells=1
-- sts_max_stages=0, sts_damping=0.05, sts_subcycle_eta=0.8
-- interface_particles_per_face_group=32, exit_particles_per_cell_group=32
-- lte_entry_initialization=False, lte_entry_energy_fraction_cap=0.01
-
-**Radiation / HOLO**：
-- holo enabled=False（internal/test-only。production namelist では `holo` subblock を設定しない。既存 physics runtime 経路を変更しない）
-- region=shell, material_group=shell
-- coupling_tau=5.0, guard_cells=3
-- deprecated compatibility: tau_on=5.0, tau_off=3.0, reduced_flux_on=0.15, reduced_flux_off=0.25
-- deprecated compatibility: update_interval=10, min_dwell_steps=20, min_island_cells=5, core_margin_cells=3
-- solver=implicit_1d, closure=diffusion, closure_relax=0.2, closure_smooth_passes=1, closure_smooth_alpha=0.5, consistency_alpha=1.0（`gamma_alpha` は互換 alias）
-- boundary_flux=physical
-- p_rr_tally=True
-- sn_closure=True, sn_n_angles=8, sn_material_coupling=False
-- residual_particles_per_cell_group=4
+- radiation boundary：type=vacuum, inner=reflect（1D_SPH）
 
 **Laser**：
+- laser enabled=False
 - laser mode：raytrace_2d（1D_SPH）、raytrace_3d（2D_RZ）
 - laser mode option：radial_absorption_1d（1D_SPH専用、全ビームパワーを inward radial flux として合算）
 - laser rays_per_beam=1000（1D_SPH）、128（2D_RZ）
 - laser ray_output_count=0, ray_output_trajectory=False, ray_output_max_steps=10000
 - laser profile：model=gaussian
-- laser critical：eps_n=1e‑4, eps_crit=1e‑4, terminate=True
+- laser critical：eps_n=1e‑4, eps_crit=1e‑4, terminate は integrator が "characteristic"（1D の raytrace_2d の既定）なら False（臨界で反射）、それ以外は True
 - laser coulomb_log_floor=2.0, absorption.debug_dump_lasermesh=False
-- laser raytrace：integrator=auto（1D_SPH の `raytrace_2d` で characteristic、それ以外で leapfrog、§6.4）, azimuthal_rays=16（1D の円柱・平板）, lanes_per_ray=0（characteristic のレーン数を起動側が選ぶ）, cfl_ray=0.8, gradient_interpolation=bilinear, intensity_cutoff=1e-6, debug_one_ray=False
-- laser mesh（2D_RZ）：enabled=True, nr=128, nz=256, r_max=1.5×R_target, z_min/z_max=Z_center±1.5×R_target
+- laser raytrace：integrator=auto（1D_SPH の `raytrace_2d` で characteristic、それ以外で leapfrog、§6.4）, azimuthal_rays=16（1D の円柱・平板）, lanes_per_ray=0（characteristic のレーン数を起動側が選ぶ）, cfl_ray=0.8, intensity_cutoff=1e-6, debug_one_ray=False（2D の勾配補間は双線形に固定、キーは無い）
+- laser mesh（2D_RZ）：nr=128, nz=256, r_max_factor=1.5（R_max=1.5×R_target）, z_span_factor=1.5（Z_center±1.5×R_target）
 - laser mesh（1D_SPH動的）：mesh_factor=0.5, rmax_n_hat_threshold=0.001, nr_max=4096, R_crit中心piecewise-geometric graded（g_core=1.08, g_corona=1.05）, nz=2×nr
 - laser mesh：critical_clip=True, critical_margin=1-eps_crit（= 0.9999）
 - laser mesh ghost_corona：enabled=False, n_out=12, ne_min_frac=0.03, ne_max_frac=0.99, Te_min_eV=50, zbar_min=1.0, zbar_max=4.0, handoff_cells=4, handoff_decay=1.5, transition_enabled=False, transition_resolved_nhat=0.9, transition_resolved_cells=3, transition_density_exponent=1.0
-- laser deposit：bilinear_node（近傍4節点双線形分配）, deposit_smooth_passes=0（1D_SPH/2D_RZ とも既定で無効）, deposit_smooth_alpha=0.25
+- laser deposit：1D は流体セルへ直接、2D_RZ はセル中心の双線形補間（方式を選ぶキーは無い）, deposit_smooth_passes=0（1D_SPH/2D_RZ とも既定で無効）, deposit_smooth_alpha=0.25
 - laser raytrace_skip：enabled=False (2026-08-07 に既定 OFF 化 — 旧既定 True は crit ガード不発により全デッキで実質不活性だったため挙動互換), threshold=0.01, max_consecutive=10, norm=max_relative, crit_guard=0.01（crit ガードは 2026-08-07 にキャッシュ相対の帯域横断判定へ改定 — NUMERICS §5.9.4）
 - laser cbet：enable=False（**既定 OFF・bit 恒等**）, f_cbet=1.0, alpha_iaw=0.2, theta_cap=0.3, tol=1e-3, max_iters=50, n_impact_bins=16, n_phi=8, ne_frac_cutoff=0.95, k_a_floor=1e-6, max_segments_per_ray=0(auto), test_chi=-1(off)；beam 毎 delta_lambda_nm=0.0, geometry_mode=legacy, n_section_phi=16
+- laser beams：f_number=8.0, defocus_DR=0, focus=absent, profile=absent（`Laser.profile` を使う）, energy_J=absent, delta_lambda_nm=0.0
 - laser port_configuration：absent（既定）；normalization=sum_weights_one, port 毎 roll_deg=0.0, delta_lambda_nm=0.0, beam_class="", polarization=unpolarized（port_id/direction/power_weight は必須）
 - laser hot_electron（多ビーム overlap）：tpd_overlap_mode=single_beam, srs_overlap_mode=per_beam_class, illumination_metric=fixed, common_wave_delta_theta_deg=-1（cluster 時必須）
 - laser hot_electron：enable=False, source_nc_fraction=0.25, eta_hot=0.0, eta_hot_table=absent, eta_mode=legacy, eta_model={ln_filter_tau_s=5.0e-12, eta_total_cap=0.08}, T_hot_eV=5.0e4（eV）, n_energy_groups=30, E_min_over_Th=0.2, E_max_over_Th=8.0, angular_model=cone, theta_div_deg=60.0, n_mu=6, n_phi=8, subtract_from_laser=True, inner_bc=deposit_residual, explicit_source_limit=0.2, sources=absent
@@ -3791,11 +3495,7 @@ Laser(
 **Parallel**：
 - parallel decomposition：method=slab(1D)/cartesian(2D), dims=None（自動決定）, min_cells_per_rank=8
 - parallel halo：gpu_aware_mpi=auto
-- parallel migration：method=batch, max_substeps=32, emigrant_threshold=1000
-- parallel laser_parallel：strategy=replicated
-- parallel particle_balance：enabled=False, imbalance_threshold=1.5, method=work_stealing
-- parallel reproducibility：mode=statistical, sort_after_migration=False
-- parallel gpu_optimization：particle_sort_by_cell=True, tally_mode=warp, compute_comm_overlap=False
+- parallel migration / laser_parallel / particle_balance / reproducibility / gpu_optimization：効果なし（§6.4.10）
 
 **Output**：
 - output directory="./output", format=hdf5, plot_every=100, history_every=1, checkpoint_every=1000, checkpoint_keep_last=2

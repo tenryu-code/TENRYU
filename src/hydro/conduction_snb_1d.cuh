@@ -48,10 +48,13 @@ void snb_fill_t_ref(core::State& state, const std::uint8_t* d_cell_is_void,
 // advancing the temperature (one coefficient pass + H-solve). Returns the
 // max-norm change vs dq_face_prev in *resid_out and the |dq|/|qsh| scale in
 // *dq_ratio_out. Counters/theta stats are left in work.counters/work.scalars.
+// d_kappa_face: the Kirchhoff face conductivities of the step start (face f between cells f and f+1), the ones the
+// stages use; nullptr evaluates the Kirchhoff closure from the current state.Te (valid only at the step start).
 void snb_pass(core::State& state,
               const core::Config& cfg,
               const SnbDeviceWork& work,
               const double* d_kappa_eff,
+              const double* d_kappa_face,
               const double* d_A_eff,
               const std::uint8_t* d_cell_is_void,
               int n_cells,
@@ -67,11 +70,13 @@ void snb_pass(core::State& state,
 // Full SNB Picard conduction super-step on the STS path. Overwrites state.Te.
 // Fills the snb_* fields of `result` (declared in conduction.cuh). The clamp
 // pack (d_clamp_count/d_e_floor) is reset at the start of every Picard iterate
-// so it reports the accepted (final) solve only.
+// so it reports the accepted (final) solve only. d_kappa_face (required when face_policy_kirchhoff) holds the
+// Kirchhoff face conductivities of T_e^n, held fixed through all stages and Picard iterates.
 void conduction_step_1d_sts_snb(core::State& state,
                                 const core::Config& cfg,
                                 ConductionResult& result,
                                 const double* d_kappa_eff,
+                                const double* d_kappa_face,
                                 const double* d_rho_cv_e,
                                 const std::uint8_t* d_cell_is_void,
                                 const double* d_A_eff,

@@ -14,6 +14,7 @@
 #include "core/namelist/builder.hpp"
 #include "core/namelist/geometry_eval_volume_cut.hpp"
 #include "materials/ionmix_reader.hpp"
+#include "materials/zbar_math.hpp"
 #include "materials/zbar_tf.hpp"
 
 #if TENRYU_ENABLE_PYTHON
@@ -361,38 +362,32 @@ GeometrySummary evaluate_geometry_from_callables(const Config& cfg,
       if (cfg.materials.zbar.fixed_value >= 0.0) {
         host_zbar[c] = cfg.materials.zbar.fixed_value;
       } else {
-        double weighted = 0.0;
-        double weight_sum = 0.0;
+        // Ion-number weights f_m / A_m (NUMERICS §1.1.5a, materials::ZbarMixAccumulator).
+        tenryu::materials::ZbarMixAccumulator mix;
         for (std::size_t m = 0; m < n_mat; ++m) {
-          if (cfg.materials.materials[m].is_void) {
+          const auto& mat = cfg.materials.materials[m];
+          if (mat.is_void) {
             continue;
           }
-          const double weight = host_volFrac[c * n_mat + m];
-          weighted += weight * cfg.materials.materials[m].Z;
-          weight_sum += weight;
+          mix.add(host_volFrac[c * n_mat + m], mat.A, mat.Z);
         }
-        host_zbar[c] = (weight_sum > kFracTol) ? (weighted / weight_sum) : 0.0;
+        host_zbar[c] = mix.mean();
       }
     } else if (cfg.materials.zbar.model == "thomas_fermi") {
-      double weighted = 0.0;
-      double weight_sum = 0.0;
+      tenryu::materials::ZbarMixAccumulator mix;
       for (std::size_t m = 0; m < n_mat; ++m) {
         const auto& mat = cfg.materials.materials[m];
         if (mat.is_void) {
           continue;
         }
-        const double weight = host_volFrac[c * n_mat + m];
-        const double zbar_m =
-            tenryu::materials::compute_zbar_tf(host_rho[c], host_Te[c], mat.Z, mat.A);
-        weighted += weight * zbar_m;
-        weight_sum += weight;
+        mix.add(host_volFrac[c * n_mat + m], mat.A,
+                tenryu::materials::compute_zbar_tf(host_rho[c], host_Te[c], mat.Z, mat.A));
       }
-      host_zbar[c] = (weight_sum > kFracTol) ? (weighted / weight_sum) : 0.0;
+      host_zbar[c] = mix.mean();
     } else if (cfg.materials.zbar.model == "tabular") {
       TENRYU_ASSERT(cfg.materials.zbar_tables.size() == n_mat,
                     "tabular Zbar tables not loaded");
-      double weighted = 0.0;
-      double weight_sum = 0.0;
+      tenryu::materials::ZbarMixAccumulator mix;
       for (std::size_t m = 0; m < n_mat; ++m) {
         const auto& mat = cfg.materials.materials[m];
         if (mat.is_void) {
@@ -400,11 +395,10 @@ GeometrySummary evaluate_geometry_from_callables(const Config& cfg,
         }
         TENRYU_ASSERT(cfg.materials.zbar_tables[m] != nullptr,
                       "tabular Zbar table missing for non-void material");
-        const double weight = host_volFrac[c * n_mat + m];
-        weighted += weight * cfg.materials.zbar_tables[m]->interpolate(host_rho[c], host_Te[c]);
-        weight_sum += weight;
+        mix.add(host_volFrac[c * n_mat + m], mat.A,
+                cfg.materials.zbar_tables[m]->interpolate(host_rho[c], host_Te[c]));
       }
-      host_zbar[c] = (weight_sum > kFracTol) ? (weighted / weight_sum) : 0.0;
+      host_zbar[c] = mix.mean();
     } else {
       TENRYU_ASSERT(false, "Unknown materials.zbar.model");
     }

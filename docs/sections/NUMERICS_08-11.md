@@ -70,6 +70,10 @@ R\(_{max}\), Z\(_{min}\), Z\(_{max}\) の各面は種別を面ごとに独立に
 
 ### 8.2 輻射
 
+> 本節の粒子の境界処理（vacuum の脱出、reflect の鏡面反射、Marshak の境界ソース粒子）は退役したモンテカルロ輻射の記述（コードは 2026-09-29 にビルドから外し `retired/radiation_monte_carlo/` に保管）。
+> FLD・\(S_N\) の輻射境界（vacuum・reflect・marshak）は §6.7・§6.8 と SPECIFICATION §6.4.5 を参照
+> （`Radiation.boundary.marshak_particles` は受理して無視する）。
+
 **vacuum**：境界到達で粒子消滅、流出エネルギーに計上（`E_escape += E_p`）。
 ここで \(E_p\) は **境界面到達時点の粒子エネルギー**（最終セグメントの連続吸収適用後の値）であり、
 重み調整（Russian roulette等）が先行して適用されている場合はその結果を反映した値である。
@@ -134,9 +138,10 @@ N_{p,f} = \text{round}\!\left(N_{marshak\_total} \times \frac{A_f}{\sum_f A_f}\r
 
 ---
 
-
 ## 9. 移動メッシュと粒子セル再同定
 Lagrangian/ALEでメッシュが動くため、粒子の空間座標は固定でも cellId が変わりうる。
+
+> §9.1〜§9.7（光子粒子のセル再同定）は退役したモンテカルロ輻射の記述（コードは 2026-09-29 にビルドから外し `retired/radiation_monte_carlo/` に保管）。§9c（球極座標の半平面論理格子）は現行。
 
 ### 9c. Spherical-Polar Halfplane Logical Mesh (Phase 6 Foundation)
 
@@ -292,7 +297,8 @@ angular shock anisotropy \(\le5\%\). The rectangular H3 Sedov radius-similarity
 ctest applies the same run-log Hydro2D energy-correction gate when those entries
 are present.
 
-**再同定の必要条件**：
+**再同定の必要条件**（以下は退役したモンテカルロ輻射の光子粒子の記述。コードは 2026-09-29 にビルドから外し
+`retired/radiation_monte_carlo/` に保管）：
 - **2D ALE rezone 後（§3.3）**：rezoneはメッシュを非Lagrangian的に移動させるため、**IMC粒子**の cellId を再同定する（U7: `cell_search_after_rezone`、CUDA_KERNELS §9 Phase 5）。DDMC粒子は位置座標が NaN sentinel（§7.7.3）であり空間探索が不可能なためスキップする。DDMC粒子の cellId は R7 composite key sort（§6.5）がセルモードテーブルから決定するため、U7 での再同定は不要。
 - **Lagrangian ステップ後（§3.2）**：1DではIMC transport stepの冒頭、source emission・DDMC/RW partition・RadLite remapより前に、current mesh node \(x_r\) に対してcensus粒子の cellId をGPU上で再同定する。圧縮セルでは粒子位置が保存済み cellId の境界外へ出る場合があり、古い cellId のまま吸収・放出係数を参照すると非物理的なエネルギー授受を生む。2D RZでのLagrangian後再同定は未実装であり、既存の輸送中面交差追跡に従う。
 
@@ -483,6 +489,8 @@ diagnostics に出力する。
 
 ## 10. 推定量とエネルギー収支（rad_E, budgets）
 ### 10.1 IMCのtrack‑length推定量（rad_E）
+
+> 退役した方式の記録（コードは 2026-09-29 にビルドから外し `retired/radiation_monte_carlo/` に保管）。FLD・\(S_N\) の `rad_E` は各ソルバの解そのもの（§6.7・§6.8）。
 IMC粒子のセル内セグメント長 \(\Delta s\) に対し、滞在時間 \(\Delta t=\Delta s/c\)。
 時間平均エネルギー密度推定：
 \[
@@ -564,14 +572,14 @@ DDMCの運動量沈着（§7.8.2）と合算して出力する。
 | \(E_{CBET,IAW}\) | CBET でイオン音波へ渡るエネルギー | CBET の交換でレーザーから除かれ、イオン音波に渡る分（`E_cbet_iaw`。CBET 有効時のみ非ゼロ） |
 | \(E_{Marshak,in}\) | Marshak境界入射エネルギー | \(\sum_f \frac{a_{eV}\,c}{4}\,T_{r,f}^4\,A_f\,\Delta t\)（§8.2 per-face合計） |
 | \(E_{volume,in}\) | 放射の体積源エネルギー | FLD・S_N の体積源で入った放射エネルギー（`E_volume_in`） |
-| \(E_{burn,in}\) | 核融合の沈着エネルギー | 燃焼で生じた荷電粒子が電子・イオンへ沈着したエネルギー（`E_burn_in`） |
+| \(E_{burn,in}\) | 核融合の沈着エネルギー | 燃焼で生じた荷電粒子が電子・イオンへ沈着したエネルギーと、中性子の最初の衝突による加熱（`Burn.neutron_heating`、§14.11）の和（`E_burn_in`） |
 | \(E_{rad,esc}\) | 放射境界流出 | 境界から出た放射エネルギー（退役した imc_ddmc 経路では脱出粒子のエネルギー `E_escape[g]` の全群合算）|
 | \(E_{rad,mesh\_adv}\) | 格子の動きによる放射エネルギー変化 | 流体の半ステップの前後での \(\sum_{i,g}E_{g,i}V_i\) の変化（`E_rad_mesh_advection`）。保存的なセル移流では丸め誤差まで 0。`Radiation.multigroup_diffusion.hydro_coupling="none"` では凍結した放射エネルギー密度が体積変化で生む分を含み、物理的な境界流束ではない（§6.7） |
 | \(E_{pdV}^{boundary}\) | 境界PdV仕事 | 外側境界面での \(P\,dV\) |
 | \(E_{floor}\) | フロア補正注入（実装名: `E_floor_injected`） | \(\sum_c \Delta E_{floor,c}\)（§1.1.7 温度・密度フロア + §11.7 安全検査で注入） |
 | \(E_{safety}\) | 伝導安全補正 | §4.2.2 の負温度clampで注入されたエネルギー |
 | \(E_{redistribution\_unresolved}\) | ALE positivity redistribution 未解決分 | `Numerics.ale.ke_closure_redistribute_floor=true` で \(C_{tot}<D_{tot}\) のときの \(D_{tot}-C_{tot}\)。通常は0 |
-| \(E_{solver}\) | Hypre残差エネルギー | \(\sum_c C_{v,c}(T_{e,c}^{n+1}-T_{e,c}^n)V_c - \Delta t\sum_c(\nabla\cdot q)_c V_c\)（§4.2.3 参照。Hypre無効時は0） |
+| \(E_{solver}\) | 陰的伝導の解の残差エネルギー（欄のみ） | \(\sum_c C_{v,c}(T_{e,c}^{n+1}-T_{e,c}^n)V_c - \Delta t\sum_c(\nabla\cdot q)_c V_c\)。どの経路も加算しないので常に 0（§4.2.3。1D の陰解法は流束形の記帳で残差を台帳から除く） |
 
 > **人工補正項の分離**：\(E_{floor}\)、\(E_{safety}\)、\(E_{redistribution\_unresolved}\)、\(E_{solver}\) は物理的なエネルギー源ではなく数値安全策・ソルバ残差による注入量である。
 > 保存誤差の診断時にはこれらを明示的に分離し、\(\varepsilon_{budget}\) の分子には含めない（下記参照）。
@@ -602,7 +610,8 @@ E_{artificial}=E_{floor}+\max(E_{safety}-E_{floor},0)+E_{redistribution\_unresol
 
 **出力**：各ステップで \(\varepsilon_{budget}\)、\(E_{floor}\)、\(E_{safety}\)、\(E_{redistribution\_unresolved}\)、\(E_{solver}\)、\(E_{numerical\_loss}\) を history ファイルに記録する。
 
-**放射サブシステムのエネルギー恒等式**（per-operator保存チェック）：
+**放射サブシステムのエネルギー恒等式**（per-operator保存チェック）— 退役したモンテカルロ輻射の記述
+（コードは 2026-09-29 にビルドから外し `retired/radiation_monte_carlo/` に保管。FLD・\(S_N\) の輻射の台帳は §6.7・§6.8）：
 放射輸送ステップ（Phase 4）単独でのエネルギー保存を独立に検証する：
 \[
 E_{emit} + E_{census}^{n} = E_{abs} + E_{esc} + E_{census}^{n+1} + E_{numerical\_loss}
@@ -637,6 +646,8 @@ HDF5スナップショット出力時に以下の変換を行う：
 `deposited_power` は可視化・解析用の派生量であり、保存検証には使用しない。
 
 ### 10.3 タリー集約のGPU階層並列化
+
+> 退役した方式の記録（コードは 2026-09-29 にビルドから外し `retired/radiation_monte_carlo/` に保管）。
 
 §10.1, §10.2 のタリー（`rad_dep`, `rad_E_tally`, `E_escape`）は、粒子カーネル内で
 `atomicAdd(double*)` により全粒子からの寄与を累積する。GPU上では数千〜数百万のスレッドが
@@ -820,6 +831,8 @@ for (int s = threadIdx.x; s < N_BINS; s += blockDim.x) {
 
 ### 10.4 イベントカウンタ（診断）
 
+> 退役した方式の記録（コードは 2026-09-29 にビルドから外し `retired/radiation_monte_carlo/` に保管）。
+
 IMC輸送カーネル（R8）内で以下の6種類のイベントカウンタをスレッドローカルに蓄積し、
 粒子の追跡終了時にグローバルカウンタへ `atomicAdd` で集約する。
 カウンタは `unsigned long long`（64ビット）で管理し、オーバーフローの心配はない。
@@ -983,15 +996,18 @@ estimator の single-block 対応にかかわらず、この tracker は multibl
 
 ### 11.3 不透明度・断面積
 - opacity：κ[cm²/g]→σ[1/cm] 変換を明示し、単位混同を防止（§0.2）
-- テーブル範囲外：外挿禁止、clamp＋警告
-- **不透明度テーブル範囲外処理**：入力クランプ方式。\((\rho, T)\) をテーブルの定義域 \([\rho_{min}, \rho_{max}] \times [T_{min}, T_{max}]\) にクランプしてから補間を行う。クランプ発生時は WARNING を出力する（1ステップあたり最大10回まで出力し、超過分はカウントのみ記録）。
-
-不透明度クランプ WARNING はランクあたり・ステップあたり最大 10 件出力する。
-11件目以降はカウントのみ。ステップ終了時、total > 10 の場合：
-`"WARNING: opacity clamp triggered N times this step (first 10 shown)"`
-カウントは Planck / Rosseland 区別なく合算。ステップ毎にリセット。
+- テーブル範囲外の扱いは経路で異なる（2026-09-29 の監査で実装を記載）：
+  - 単一材料の表不透明度（非 LTE の係数カーネル）：\(T>T_{max}\) と最小イオン密度より下で \(\log\kappa\) を外挿する（§6.1 系の記述と同じ）
+  - 多材料セルで支配材料が LTE の表を持つ場合：定義域 \([\rho_{min},\rho_{max}]\times[T_{min},T_{max}]\) にクランプしてから補間する
+    （同じ表でもデッキの構成で扱いが変わる）
+  - EOS：既定の `energy_authoritative` 閉包は表の温度の天井より上を理想気体の延長で閉じる（§1.1.5 の高温側の延長）。
+    それ以外は表の端でクランプ
+  - 件数の集計と 1 ステップごとの警告は無い：host の IONMIX 読み取りの警告はプロセスあたり 10 件で止まり、device の参照は
+    黙ってクランプする（旧設計の「ステップあたり最大 10 件＋件数」の警告は実装されていない）
 
 ### 11.4 DDMC安全策
+
+> 退役した方式の記録（コードは 2026-09-29 にビルドから外し `retired/radiation_monte_carlo/` に保管）。
 - M‑matrix診断に違反するセル×群はDDMC禁止（IMCへ）（§7.3.3）
 - diffusion criterion（ω≥0.9 かつ τ≥4 かつ P(μ)制約）を満たさないセル×群はIMCへ（§7.1.2）
 - 面Rosseland不透明度は面温度 \(T_{j+1/2}=((T_j^4+T_{j+1}^4)/2)^{1/4}\) で評価し、伝搬停止を回避（§7.3.4）
@@ -1002,9 +1018,10 @@ estimator の single-block 対応にかかわらず、この tracker は multibl
 
 ### 11.5 レーザー安全策
 - \(\varepsilon_n\) 下限 + クリティカル終了でIB発散を抑止（§5.2）
-- LaserMeshは臨界密度以下の領域のみカバー（`critical_clip`）し、臨界面付近のレイ発散を未然に防止（§5.7.1）
+- `critical_clip` は節点の \(\hat n\) を \(\hat n_{margin}\) で頭打ちにする値の上限（1D の格子は臨界面より奥も含む。§5.7.1）。
+  臨界面付近のレイの発散は §5.2 の終了・反射で防ぐ
 - Leapfrog安定性条件 \(C_{ray} = c\Delta t_{ray}/\Delta x \le\) `cfl_ray`（既定0.8）（§5.3.2）
-- クーロン対数 \(\ln\Lambda\) に下限2を設定し非物理値を回避（§5.4.3）
+- クーロン対数 \(\ln\Lambda\) に下限（`Laser.absorption.coulomb_log_floor`、既定 2、[1, 30]）を設定し非物理値を回避（§5.4.3）
 - エネルギー沈着の空間分配は次元依存（1D_SPH: Hydro 1Dセル direct、2D_RZ: 4-node bilinear）（§5.5）
 - 1D_SPH は direct deposit→再配分、2D_RZ は transfer 前後のエネルギー保存を検証（§5.8.2）
 
@@ -1060,7 +1077,7 @@ T_{max}^{n} \equiv \max\!\left(\max_i T_{e,i}^n,\; T_{boundary}\right)
 \]
 - \(\delta_{overshoot,i} > 0\) のセルをオーバーシュート違反としてカウント
 
-**診断出力**（各ステップ）：
+**診断出力**（各ステップ。history の `radiation/overshoot_count`・`radiation/overshoot_max`、2026-09-29 まで `mc/overshoot_*`）：
 - `overshoot_count`：違反セル数
 - `overshoot_max`：\(\max_i \delta_{overshoot,i}\)（最大超過率）
 

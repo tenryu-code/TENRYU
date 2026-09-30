@@ -53,17 +53,6 @@ Numerics(
 Radiation(
     enabled=True,
     groups=1,
-    imc=dict(
-        alpha=1.0,
-        f_max=1.0,
-        particles_per_cell_group=100,
-        implicit_capture=True,
-        cutoff_fraction=0.0,
-        inelastic_scatter=True,
-        weight_cutoff=1.0e-10,
-        roulette_survival=0.1,
-    ),
-    ddmc=dict(enabled=False),
     boundary=dict(inner_r="reflect", outer_r="vacuum"),
 )
 

@@ -13,9 +13,8 @@ struct Config;
 
 namespace tenryu::coupling {
 
-// Bit-exact rollback container for tenryu::core::State, scoped to deterministic
-// radiation/conduction modes (FLD / SN / HOLO). This intentionally excludes the
-// IMC particle pool and RNG counters; Commit 2 will reject IMC + retry.
+// Bit-exact rollback container for tenryu::core::State (the deterministic
+// radiation modes FLD / S_N and conduction).
 // Carrier fields are excluded because rezone installation happens after
 // commit, outside the retry envelope, so rollback cannot span a carrier
 // update.
@@ -89,12 +88,6 @@ struct DriverRetrySnapshot {
   double E_hot_e_escaped = 0.0;
   bool hot_e_enabled_any = false;
 
-  // HOLO host vectors and DDMC mode map.
-  std::vector<std::int8_t> ddmc_mode_map;
-  std::vector<std::uint8_t> holo_core_mask, holo_patch_mask;
-  std::vector<std::uint8_t> holo_core_prev_mask;
-  std::vector<std::int32_t> holo_hold_count, holo_dwell_count;
-  std::vector<double> holo_tau_R, holo_reduced_flux, holo_mass_q, holo_lo_weight;
   std::vector<std::int8_t> hydro_active;
   std::vector<std::int8_t> state_supply_mask;
   std::vector<std::uint8_t> cell_is_void;
@@ -139,12 +132,8 @@ struct DriverRetrySnapshot {
   // Axis budget host vectors.
   std::vector<double> axis_mass_initial, axis_inflow_budget;
 
-  // HOLO valid flags + DDMC valid + ALE flags.
-  bool ddmc_mode_map_valid = false;
-  bool holo_core_mask_valid = false;
-  bool holo_lo_source_valid = false;
+  // ALE flags.
   bool holo_ale_invalidated = false;
-  bool particle_sort_cache_invalidated = false;
 
   // _step accumulators (FLD diagnostics).
   int fld_clamp_hits_step = 0;
@@ -236,7 +225,6 @@ void restore_driver_retry_snapshot(tenryu::core::State& state,
                                    const tenryu::core::Config& cfg,
                                    DriverRetrySnapshot& snap,
                                    bool restore_transient_topology_masks = false,
-                                   bool invalidate_particle_sort_cache = true,
                                    void* cuda_stream = nullptr);
 
 }  // namespace tenryu::coupling

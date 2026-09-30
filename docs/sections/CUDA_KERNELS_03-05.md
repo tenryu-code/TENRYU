@@ -180,6 +180,10 @@ __global__ void compute_spitzer_deff(
   この相対的閾値により、ほぼ均一温度領域で D_eff の非物理的発散を防ぐ
 - **レジスタ**: ~20
 - **メモリ**: 隣接セルの Te 読み込み（2D: 4近傍 → 構造格子固定ストライド）、`__ldg()` でセルデータ参照
+- **1D の実装**（`compute_spitzer_deff_1d_kernel`、`conduction_bodies.cuh`）：出力はセルの Spitzer–Härm 伝導率 \(\kappa_{SH}\)
+  （と伝導率の床・上限）で、\(D_\mathrm{eff}\) は陽的な安定刻み \(\Delta t_\mathrm{exp}\) の見積もりにだけ使う。流束制限は
+  `compute_1d_flux_limiter_faces_kernel` が面ごとに与え、面の係数は `compute_1d_face_kappa_kernel` がステップの始めの
+  \(T_e^n\) で一度だけ評価する（既定 `face_kappa_policy="kirchhoff_same_material"`、NUMERICS §4.2.1）
 
 ### 4.2 C2: kershaw_stencil_build（2D RZ専用、最重要）
 
@@ -216,7 +220,7 @@ __global__ __launch_bounds__(256, 2) void kershaw_stencil_build(
      境界セル（i=0, i=nr-1, j=0, j=nz-1）で、ドメイン外を向く隣接係数を処理:
      - **Reflect/Neumann**（face_bc_type=1）: φ_ghost = φ_interior に相当 → a_C += a_boundary; a_boundary = 0。
        コーナー係数（a_NE等）もドメイン外ならば同様に折り込む。行和ゼロ維持
-     - **Vacuum/Robin**（face_bc_type=2、DDMC R3用）: φ_ghost = -φ_interior × (d_ext-Δx/2)/(d_ext+Δx/2)
+     - **Vacuum/Robin**（face_bc_type=2、設計時は退役した DDMC の R3 用）: φ_ghost = -φ_interior × (d_ext-Δx/2)/(d_ext+Δx/2)
        に相当 → a_C += a_boundary × (-(d_ext-Δx/2)/(d_ext+Δx/2)); a_boundary = 0。d_ext = 0.7104/σ_tr
      - **内部/MPI**（face_bc_type=0）: 折り込みなし（MPI ghost cell を C3 が読む）
      - r=0軸は RZ重み付け（step 5）で σ=0 となり、反射BCが自然に実現済み（追加処理不要）
@@ -233,7 +237,7 @@ __global__ __launch_bounds__(256, 2) void kershaw_stencil_build(
   5. fix_count > 0.1 × n_cells の場合、ホスト側で WARNING 出力（メッシュ品質劣化の兆候）
   - **2つの呼び出しモード**:
     - `apply_mmatrix_repair=True`（伝導用、Phase 2）: 修復後の係数を出力し安定な explicit 更新を行う
-    - `apply_mmatrix_repair=False`（輻射R3用、Phase 4）: 修復前の raw 係数を出力。R3 `ddmc_leak_coeff` が M-matrix 違反を検出し、違反セル×群を IMC にフォールバックする（NUMERICS §7.3.3）
+    - `apply_mmatrix_repair=False`（設計時は退役した DDMC の R3 用、Phase 4）: 修復前の raw 係数を出力。R3 `ddmc_leak_coeff` が M-matrix 違反を検出し、違反セル×群を IMC にフォールバックしていた（NUMERICS §7.3.3。DDMC とともに退役）
 
 ### 4.3 C3: kershaw_apply
 
@@ -248,10 +252,7 @@ __global__ __launch_bounds__(256, 4) void kershaw_apply(
     double dt_sub,                   // サブステップ幅
     double T_floor,
     int nr, int nz,
-    int* __restrict__ clamp_count,   // 温度フロア適用回数（atomic）
-    double* __restrict__ E_safety    // [1] out (atomicAdd): §4.2.2 安全スケーリングによるエネルギー注入 [erg]
-                                     // α<1 適用時の非対称性 ΔE = Σ_c ρc_v(T_new-T_old)V - Δt·Σ_c(∇·q)V
-                                     // NUMERICS §10.2 E_{safety} に計上。Hypre使用時は0
+    int* __restrict__ clamp_count    // 温度フロア適用回数（atomic）
 );
 ```
 
@@ -268,14 +269,28 @@ __global__ __launch_bounds__(256, 4) void kershaw_apply(
   - D_eff と Kershaw 係数はスーパーステップ開始時に凍結（C1→C2 は1回のみ、C3 を s 回実行）
   - ダブルバッファ swap はホスト側のポインタ交換のみ（カーネル内操作なし）
 - **負温度防止**: `Te_new = max(Te_new, T_floor)` + clamp_count 加算
-- **局所安全策**: フラックスが過大な場合のスケーリング `α = min(1, Δt_safe/τ_j) — Δt_safe = Δl²/(2 D_eff) はセル固有の明示的安定タイムステップ（NUMERICS §4.2.2）` でフラックスを抑制。α < 1 適用時のエネルギー非対称性は `E_safety` として計上
+- **局所安全策**（NUMERICS §4.2.2、実装は `conduction_alpha_pass*_kernel`）: セルの床より上のエネルギー
+  \(\rho c_v (T - T_\mathrm{floor})\) を、正味の流出（`sts_floor_limiter="net"`、既定）または流出の和（`"donor"`）で割った
+  時間を \(\tau_j\) と比べて \(\alpha_c = \min(1, \cdot/\tau_j)\) を作り、面の流束を両側で同じ係数（net は
+  \(\min(\alpha_c,\alpha_{nb})\)、donor は流出側のセルの \(\alpha\)）でスケーリングする。対の反対称が保たれるので
+  スケーリング自体はエネルギーを作らない。旧設計の `Δt_safe = Δl²/(2 D_eff)` と、非対称分を `E_safety` に計上する方式は
+  無い。エネルギーの計上が生じるのは最後の床クランプ（`E_floor_injected`）だけ
 - **レジスタ**: ~15
 - **同期**: STS の全ステージは同一 compute ストリーム上で起動されるため、CUDA ストリーム順序保証によりカーネル間は自動的に逐次実行される。ダブルバッファ swap（ホスト側ポインタ交換）に明示的 `cudaStreamSynchronize` は不要。ただし MPI halo exchange が介在する場合は、P1(pack) カーネル完了後に MPI 送信が必要なため、halo exchange ルーチン内部で `cudaStreamSynchronize(compute)` を実行する
 
 ### 4.4 C4: conduction_1d_tridiag（1D_SPH用）
 
-1D球対称では Kershaw が3点トリダイアゴナルに退化する。
-cyclic reduction または Thomas 法で直接解法も可能だが、v1.0は STS（NUMERICS §4.2.1）で統一する。
+> **実装**：このカーネルは存在しない。1D の電子伝導は次の 2 経路（`conduction.cu`）：
+> - **STS**（既定）：`conduction_1d_sts_stage_kernel`（調和平均の面）、`_kirchhoff_kernel`・`_secant_kernel`（割線の面）、
+>   `conduction_1d_sts_fused_kirchhoff_kernel`。面の係数はステップの始めの値で固定し、ステージは `kappa_face` を読む。
+>   面積は形状ごと（球 \(4\pi r^2\)、円筒・平板は `geometry_1d_face_area`）
+> - **陰解法**（`Numerics.conduction.solver="implicit"`）：`build_1d_implicit_system{,_kirchhoff}_kernel` で三重対角を組み、
+>   cuSPARSE `gtsv2` で温度 \(T^*\) を解く。エネルギーは `implicit_conduction_flux_form_kernel` が面の流束
+>   \(G_f = -u_f\,(T^*_{f+1}-T^*_f)\)（\(u_f\) は組んだ行列の上対角）の形で記帳する
+>   （\(\Delta T_i = \Delta t\,(G_i-G_{i-1})/(\rho c_v V)_i\)、NUMERICS §4.2.3）
+>
+> イオン伝導は `ion_conduction_*_kernel`（`ion_conduction_pcr_solve_kernel` の並列巡回縮約）、非局所伝導（SNB）は
+> `conduction_snb_1d.cu` の `snb_*_kernel`。以下は設計時の記述。
 
 ```cpp
 __global__ void conduction_1d_tridiag(
@@ -334,107 +349,44 @@ __global__ void conduction_1d_tridiag(
 
 ## 5. Laser カーネル群
 
-### 5.1 L1: laser_mesh_map
+### 5.1 レーザー格子への写像（現行）
 
-```cpp
-__global__ void laser_mesh_map(
-    double* __restrict__ nhat_LM,    // [N_LM] out: n_e/n_crit（クリップ済み ≤1）
-    double* __restrict__ nhat_raw_LM,// [N_LM] out: n_e/n_crit 生値（クリップなし、>1 許容 — dual-field、NUMERICS §5.2）
-    double* __restrict__ Te_LM,      // [N_LM] out
-    double* __restrict__ Zbar_LM,    // [N_LM] out
-    const double* __restrict__ rho_hydro,  // [n_cells]
-    const double* __restrict__ Te_hydro,
-    const double* __restrict__ Zbar_hydro,
-    const double* __restrict__ x_r_hydro,  // [n_nodes]
-    const double* __restrict__ x_z_hydro,
-    /* LaserMesh geometry */
-    const double* __restrict__ r_LM,       // [nr_LM+1] LaserMeshノードR座標
-    const double* __restrict__ z_LM,       // [nz_LM+1] LaserMeshノードZ座標
-    int nr_LM, int nz_LM,
-    int nr_hydro, int nz_hydro
-);
-```
+> **設計時の L1 `laser_mesh_map`・L2 `compute_density_gradient`・L5 `deposit_lm_to_hydro` は実装に存在しない。**
+> 現行の写像と沈着の経路は次のとおり（ARCHITECTURE §4.6、NUMERICS §5.7–§5.8）。
 
-1D_SPH の実装は専用カーネルで HydroMesh device field を直接読む：
+**1D**（`laser_mesh.cu` の `map_from_hydro_1d` → `map_trace_profile_1d`、写像のたびに節点を作り直す）：
 
 ```cpp
 __global__ void map_hydro_to_laser_1d_kernel(
-    const double* __restrict__ node_R,       // [n_nodes_r] LaserMesh R nodes
-    const double* __restrict__ node_Z,       // [n_nodes_z] LaserMesh Z nodes
-    const double* __restrict__ rho,          // [n_cells] HydroMesh device rho
-    const double* __restrict__ Te,           // [n_cells] HydroMesh device Te
-    const double* __restrict__ zbar,         // [n_cells] HydroMesh device Zbar
+    const double* __restrict__ node_R,       // 節点の R（2 回目の起動では径方向プロファイル節点の r）
+    const double* __restrict__ node_Z,       // 節点の Z（2 回目は 0 を指す 1 要素）
+    const double* __restrict__ rho, const double* __restrict__ Te, const double* __restrict__ zbar,
     const double* __restrict__ A_eff,        // [n_cells] device scratch
     const uint8_t* __restrict__ cell_is_void,// [n_cells] device scratch
-    const double* __restrict__ r_edges,      // [n_cells+1] HydroMesh node radii
-    double* __restrict__ n_hat,              // [N_LM] out: clipped n_e/n_crit
-    double* __restrict__ n_hat_raw,          // [N_LM] out: unclipped n_e/n_crit
-    double* __restrict__ Te_LM,              // [N_LM] out
-    double* __restrict__ Zbar_LM,            // [N_LM] out
+    const double* __restrict__ r_edges,      // [n_cells+1] 流体の節点の半径
+    double* __restrict__ n_hat, double* __restrict__ n_hat_raw,
+    double* __restrict__ Te_LM, double* __restrict__ Zbar_LM,
     int n_nodes_total, int n_nodes_z, int n_cells,
-    /* n_crit, ghost corona, critical reconstruction, clip scalars */
-);
+    /* n_crit, ghost corona, critical reconstruction, clip scalars */);
 ```
 
-- **block**: 256, **grid**: `(N_LM_nodes+255)/256`
-- **処理**: 各LaserMeshノードの(R,Z)座標に対応するHydroMeshセルを特定し、双線形補間（NUMERICS §5.2）
-  - 1D_SPH: `idx = blockIdx.x * blockDim.x + threadIdx.x`、`i = idx / n_nodes_z`、`j = idx % n_nodes_z`。`r = sqrt(R² + Z²)` で1D球メッシュの対応セルを device-side 二分探索し、密度正規化、臨界隣接セル対の対数線形プロファイル（NUMERICS §5.7.3(a)）、ghost corona、critical clip を各ノードで評価する。出力は LaserMesh device arrays に直接書き込む（host側の節点フィールド生成とH2D転送は行わない）
-  - 2D_RZ: LaserMeshとHydroMeshが同じRZ座標系 → 直接的な双線形補間
-- **step 間平滑化なし**: 1D_SPH の clipped \(\hat n\) は写像した値そのもの（`ema_smooth_n_hat_radial_kernel` は 2026-09-24 に撤去、NUMERICS §5.7.4）
-- **レジスタ**: ~15（補間重み4、HydroMeshセルインデックス、一時変数）
-- **メモリ**: HydroMesh フィールドへの読み込みは scattered（各 LaserMesh ノードが異なる HydroMesh セルを参照）。`__ldg()` で L2 キャッシュ活用
+- **block**: 256。1 スレッド = 1 節点。\(r=\sqrt{R^2+Z^2}\) で流体セルを device 上の二分探索で特定し、密度の正規化、
+  臨界に隣接するセル対の対数線形プロファイル（NUMERICS §5.7.3(a)）、ゴーストコロナ、critical clip を評価する
+- **2 回起動する**：(1) 2D レーザー格子の節点（`n_nodes_r × n_nodes_z`）、(2) `build_trace_profile_nodes_1d_parallel_kernel`
+  （`<<<1, kTraceProfileBlock>>>`）が置いた径方向プロファイル節点（面・臨界の対・プロファイルの節点）。節点数は host へ
+  1 回だけ返す。(2) の後に `map_node_material_1d_kernel`（同じ材料の \(n_e\) 補間用の節点の材料）、
+  `compute_radial_gradient_kernel`（\(d\hat n/dr\)）、`compute_smooth_kappa{,_ext}_kernel`（逆制動輻射の smooth 係数）
+- **step 間平滑化なし**: 1D の clipped \(\hat n\) は写像した値そのもの（`ema_smooth_n_hat_radial_kernel` は 2026-09-24 に撤去、NUMERICS §5.7.4）
 
-### 5.1b L2: compute_density_gradient
+**2D_RZ**（`map_from_hydro_2d`）：流体セルからレーザー格子の節点への補間は host で行い（`map_from_hydro_2d_impl`）、
+device へ写したあと `compute_gradient_kernel`（中心差分の \(\partial\hat n/\partial R\)、\(\partial\hat n/\partial Z\)、軸で
+\(\partial\hat n/\partial R=0\)、端は片側差分）と smooth 係数のカーネルを起動する。
 
-```cpp
-__global__ void compute_density_gradient(
-    double* __restrict__ grad_nhat_r,       // [N_LM_nodes] out: ∂(n̂)/∂R
-    double* __restrict__ grad_nhat_z,       // [N_LM_nodes] out: ∂(n̂)/∂Z
-    const double* __restrict__ nhat,        // [N_LM_nodes] in: n_e/n_crit（L1出力）
-    const double* __restrict__ r_LM,        // [nr_LM+1] LaserMeshノードR座標
-    const double* __restrict__ z_LM,        // [nz_LM+1] LaserMeshノードZ座標
-    int nr_LM, int nz_LM
-);
-// Central difference: ∂n/∂R = (n[i+1,j] - n[i-1,j]) / (2*ΔR_i)   // ΔR_i = 局所格子間隔（ストレッチ格子対応、NUMERICS §5.5(a)）
-//                     ∂n/∂Z = (n[i,j+1] - n[i,j-1]) / (2*ΔZ_j)   // ΔZ_j = 局所格子間隔
-// 境界:
-//   R=0軸 (i=0): ∂n/∂R = 0 (対称性、ミラー拡張と等価)
-//   i=nr_LM-1:   one-sided difference (backward)
-//   Z境界: one-sided difference (forward/backward)
-```
-
-- **block**: 256, **grid**: `(N_LM_nodes+255)/256`
-- **レジスタ**: ~10
-- **メモリ**: coalesced read（nhat配列）、coalesced write（grad_nhat_r, grad_nhat_z）
-
-### 5.1c L5: deposit_lm_to_hydro
-
-```cpp
-__global__ void deposit_lm_to_hydro(
-    double* __restrict__ laser_dep,     // [n_cells] out: セル沈着エネルギー [erg]（NUMERICS §5.8.1）
-    const double* __restrict__ deposit, // [N_LM_nodes] in: LaserMesh沈着パワー [erg/s]
-    const double* __restrict__ r_LM,    // [nr_LM+1] LaserMesh R座標
-    const double* __restrict__ z_LM,    // [nz_LM+1] LaserMesh Z座標
-    const double* __restrict__ r_cell,  // [n_cells] HydroMeshセル中心 R座標
-    const double* __restrict__ z_cell,  // [n_cells] HydroMeshセル中心 Z座標
-    double dt,                          // 流体タイムステップ幅 [s]（パワー→エネルギー変換に使用）
-    int nr_LM, int nz_LM, int n_cells
-);
-// block=256, grid=次元依存: 2D_RZ=(n_cells+255)/256, 1D_SPH=(N_LM_nodes+255)/256
-// 2D_RZ: 各 HydroMesh セルの中心 (r_c, z_c) を LaserMesh 上で逆引き
-// bilinear interpolation で LaserMesh ノード deposit から HydroMesh セル沈着を計算
-// パワー→エネルギー変換: laser_dep[c] = (Σ w_ij deposit_ij) × dt  [erg]（NUMERICS §5.8.1）
-// パワー保存: |Σ_c P_c - Σ_{ij} deposit_{ij}| / Σ_{ij} deposit_{ij} ≤ 1e-10（相対誤差、NUMERICS §5.8.2 準拠）
-// **MPI注意**: Σ_c P_c は各rankのローカル合計。マルチGPU時は MPI_Allreduce(SUM) でグローバル合算後に
-// LaserMesh deposit 総和（replicated→全rank同一値）と比較すること（Phase 3 Allreduce 参照）
-```
-
-- **block**: 256, **grid**: **次元依存**（下記参照）
-- **処理**（**次元依存**、NUMERICS §5.8.1 準拠）:
-  - **2D_RZ**: grid = `(n_cells+255)/256`（1スレッド=1 HydroMeshセル）。各HydroMeshセルの中心 `(r_c, z_c)` をLaserMeshのノード座標上に射影し、4隣接ノードの deposit 値から双線形補間でセル沈着パワー `P_c` [erg/s] を算出。その後 `laser_dep[c] = P_c × dt` [erg] としてエネルギーに変換（Δt乗算はここで1回のみ）
-  - **1D_SPH**: grid = `(N_LM_nodes+255)/256`（1スレッド=1 LaserMeshノード）。各LaserMeshノード `(R_i, Z_j)` に対し半径 `r = √(R_i² + Z_j²)` を計算し、1D球座標メッシュのセル `k`（`r_{k-1/2} ≤ r < r_{k+1/2}`）に `deposit_{i,j}` を `atomicAdd` で集約。転写後 `laser_dep[k] = (Σ deposit) × dt` [erg]。双線形補間ではなくr-bin sum方式（NUMERICS §5.8.1 (a)）。**注**: 2D_RZ とはスレッディングモデルが異なる（セルベース→ノードベース）
-- **レジスタ**: ~15（補間重み4、LaserMeshインデックス2、deposit一時変数）
-- **パワー保存検証**: ×Δt変換 **前** のパワー値 `P_c` の総和とLaserMesh deposit 総和の差分を後段で CUB `DeviceReduce::Sum` により確認（単位: [erg/s]）。検証はパワー段で行い、エネルギー変換は最終ステップで実施。**MPI**: `Σ_c P_c` はローカル合計 → `MPI_Allreduce(SUM)` でグローバル合算後に LaserMesh 総和と比較（deposit は replicated で全 rank 同一値）
+**沈着の転写**：
+- 1D の光線追跡は吸収したパワーを流体セルへ直接積む（`deposit_power_cell`、レーザー格子の節点を経由しない）。
+  臨界付近の再配分（`apply_deposit_redistribution_1d`、`deposit_transfer.cu`）は host で行い、\(\Delta t\) を掛けて
+  `laser_dep` [erg] にする。`transfer_to_1d` は試験だけが呼ぶ
+- 2D_RZ は `transfer_2d_kernel`（1 スレッド = 1 流体セル、セル中心でのレーザー格子の双線形補間 × \(\Delta t\)）
 
 ### 5.1d L6: ray_skip_check
 
@@ -471,39 +423,18 @@ __global__ void ray_skip_check_kernel(      // src/laser/raytrace_skip.cu
 - **後段**: `crit_hit` が 1 なら再計算する。そうでなければ δ をホストへ転送し、ホストで max_relative は最大値、l2_relative は \(\sqrt{\sum/(3N)}\) を求め、`Laser.raytrace_skip.threshold`（既定 0.01）未満ならレイトレースを省略する
 - **レジスタ**: ~8
 
-### 5.1e helper: laser_cache_update
+### 5.1e レイトレース省略のキャッシュ更新
 
-```cpp
-__global__ void laser_cache_update(
-    double* __restrict__ rho_cached,         // [n_LM_cells] out: L6用 ρ キャッシュ
-    double* __restrict__ Te_cached,          // [n_LM_cells] out: L6用 Te キャッシュ
-    double* __restrict__ Zbar_cached,        // [n_LM_cells] out: L6用 Z̄ キャッシュ
-    double* __restrict__ laser_dep,          // [n_cells] inout: 全グループ累積沈着 [erg]（+= laser_dep_g）
-    double* __restrict__ laser_dep_frac,     // [n_groups * n_cells] out: f̂_g_cached（skip再構成用、グループ毎）
-    const double* __restrict__ laser_dep_g,  // [n_cells] in: 当該グループ g の沈着 [erg]
-    const double* __restrict__ rho,          // [n_cells] in
-    const double* __restrict__ Te,           // [n_cells] in
-    const double* __restrict__ Zbar,         // [n_cells] in
-    const int32_t* __restrict__ lm_to_hydro, // [n_LM_cells] in: LMセル→HydroMeshセル
-    double P_g_dt,                           // グループ g のビームパワー合計 × Δt [erg]
-    int group_idx,                           // グループインデックス g（f̂ 配列オフセット用）
-    int n_LM_cells, int n_cells
-);
-```
-
-- **block**: 256, **grid**: `(max(n_cells, n_LM_cells)+255)/256`（2パスの最大要素数でグリッドサイズを決定。n_LM_cells > n_cells の場合に pass 1 のキャッシュ更新漏れを防止）
-- **処理**（2パス構成、各パスで独立にガード）:
-  1. **LMセル部分** (`if (tid < n_LM_cells)`): `hydro_c = lm_to_hydro[tid]` → `rho/Te/Z̄` キャッシュ更新
-  2. **全セル** (`if (tid < n_cells)`): `laser_dep_frac[group_idx * n_cells + tid] = laser_dep_g[tid] / P_g_dt`（`P_g_dt<=0` は 0）、`laser_dep[tid] += laser_dep_g[tid]`（累積）
-- **ρ/Te/Z̄ キャッシュ**: 全グループ共通（最終グループで上書きされるが、値は同一ステップ内で不変のため問題なし）
-- **per-group f̂ + 累積**: f̂ 計算と laser_dep 累積をフュージングし、グループループ内でカーネル起動を1回に抑える。NUMERICS §5.9.3「グループ毎にキャッシュ」準拠。n_groups=1（GXII等）は従来と同一動作
+> **実装**：設計時の `laser_cache_update` カーネルは無い。キャッシュの更新は host の `RaytraceSkipCache::update_cache`
+> （`raytrace_skip.cu`）が行う：\(\rho, T_e, \bar Z\) を device 間コピーで保存し、群ごとの沈着の比 \(\hat f_g\)（host で
+> セルの吸収パワー ÷ 群の入射パワー \(P_g\) として作る）を device へ写す（NUMERICS §5.9.3）。
 
 ### 5.1f helper: reconstruct_laser_dep
 
 ```cpp
-__global__ void reconstruct_laser_dep(
-    double* __restrict__ laser_dep,               // [n_cells] out: 再構成沈着エネルギー [erg]（呼び出し前にゼロ初期化）
-    const double* __restrict__ laser_dep_frac,    // [n_groups * n_cells] in: f̂_g_cached [無次元]
+__global__ void reconstruct_laser_dep_kernel(     // src/laser/raytrace_skip.cu
+    double* __restrict__ laser_dep,               // [n_cells] out: 再構成沈着エネルギー [erg]
+    const double* __restrict__ f_hat,             // [n_groups * n_cells] in: f̂_g_cached [無次元]
     const double* __restrict__ P_g_dt,            // [n_groups] in: グループ g の P_g(t_now)×Δt [erg]
     int n_groups, int n_cells
 );
@@ -511,10 +442,20 @@ __global__ void reconstruct_laser_dep(
 
 - **block**: 256, **grid**: `(n_cells+255)/256`
 - **処理**: per-cell 変換カーネル。`laser_dep[c] = Σ_g f̂_g[g * n_cells + c] × P_g_dt[g]` を計算し、skip path 用の沈着配列を再構成する（NUMERICS §5.9.3）
-- **呼び出し前**: ホスト側で `cudaMemsetAsync(laser_dep, 0)` を実行すること
+- **初期化**: カーネルが各セルの和を書き込む（加算ではない）ので、呼び出し前のゼロ初期化は不要
 - **n_groups=1**: `laser_dep[c] = f̂_cached[c] × P_total_dt` に退化（従来動作と同一）
 
 ### 5.2 L3/L4: ray_trace（最重要レーザーカーネル）
+
+> **現行の 1D（2026-09-29）**：1D の既定の積分法は特性線法（`Laser.raytrace.integrator="auto"` → `"characteristic"`、
+> `ray_trace_1d_characteristic`、NUMERICS §5.3.6）。球対称場では角運動量 \(B=|x\times v|\) が保存されるので、全光線で共有する
+> 区切り（径方向節点・流体の面・臨界に隣接する分割半径）と光線ごとの事象半径の間の区間ごとに、弧長・極角の増分・光学的厚さを
+> 適応 Gauss–Kronrod (3,7) 求積で積分する（転回点の近くでは \(u=\sqrt{r-r_0}\) に変数変換）。`kTile` 本のレーン（1、32、
+> 64〜256、光線数と GPU からランチャが選ぶ）で 1 本の光線の区間を並列に評価し、前置和・前置積で各区間の入口の極角とパワーを得る。
+> 臨界半径に達した光線は既定（`critical_handling.terminate` を指定しないとき）で反射して外向きに追跡する。1D の円筒・平板は
+> この積分法だけが扱う。`integrator="leapfrog"` の `ray_trace_1d_sph` は刻み幅可変の Verlet（leapfrog）で球だけを扱い、既定で臨界で
+> 終了する。どちらの 1D カーネルも吸収したパワーを流体セルへ直接積む。下の擬似コードのレーザー格子の 4 節点への沈着と固定刻みは、
+> 2D_RZ の `ray_trace_3d`（と検証用の `ray_trace_2d`）のもの。
 
 ```cpp
 // 2D version (1D_SPH用)
@@ -662,7 +603,8 @@ void ray_trace_3d(
 ### 5.4 L7: radial_absorption_1d_kernel
 
 ```cpp
-__global__ __launch_bounds__(1, 1)
+template <bool kHotECapture>
+__global__ __launch_bounds__(256, 1)
 void radial_absorption_1d_kernel(
     double P_total,                              // 入射総パワー Σ_b P_b(t) [erg/s]
     const double* __restrict__ hydro_r_edges,    // [n_hydro_cells+1] Hydro 1D cell edges [cm]
@@ -676,26 +618,24 @@ void radial_absorption_1d_kernel(
     int n_hydro_cells,
     int n_radial_nodes,
     double* __restrict__ deposit_power_cell,     // [n_hydro_cells] out: 吸収パワー [erg/s]
-    double* __restrict__ P_unabsorbed,           // [1] out: 未吸収パワー [erg/s]（atomicAdd）
+    double* __restrict__ P_unabsorbed,           // [1] out: 未吸収パワー [erg/s]
     unsigned long long* __restrict__ critical_surface_hit_count,
-    DeviceErrorFlags* __restrict__ error_flags
+    DeviceErrorFlags* __restrict__ error_flags,
+    const HotECaptureParams hot_e_params,        // 熱電子の捕捉（kHotECapture のとき）
+    double* __restrict__ hot_e_capture
 );
 ```
 
-- **launch**: `<<<1, 1, 0, stream>>>`。1D_SPH `radial_absorption_1d` の rank0 のみが起動する
-- **処理**: 単一スレッドで外側 Hydro cell から内側 cell へ serial 積分する（NUMERICS §5.4a）
-  - `P_total = Σ_b P_b(t)` を1本の inward radial flux として扱う
-  - セル幅 `dr = hydro_r_edges[c+1] - hydro_r_edges[c]`
-  - radial lookup で `n_hat`, `n_hat_raw`, `radial_smooth_kappa` を線形補間
-  - `n_hat_raw >= 1 - eps_crit` で臨界到達、残存 `P` を `P_unabsorbed` へ加算
-  - `τ = compute_optical_depth(κ, κ, dr)`、`ΔP = absorbed_power_expm1(P, τ, P_next)`
-  - `deposit_power_cell[c] += ΔP`、`P = P_next`
-  - 最内セル到達後または `P < intensity_cutoff * P_total` で残存 `P` を `P_unabsorbed` へ加算
-- **出力**: `deposit_power_cell` は [erg/s] のまま既存 1D deposit path へ渡され、後段で `Δt` を掛けて `laser_dep` [erg] へ変換する
-- **並行性**: 単一スレッド serial 積分。`P_unabsorbed` は既存 tally と同じ `atomicAdd` を使う
-- **理由**: 1D球対称1本積分の計算量は \(O(n_{\mathrm{cells}})\) で GPU 並列化の利益が小さい。
-  既存 device-side インフラ（`LaserMesh` radial arrays, IB helper, `deposit_power_cell`）を再利用するため CUDA kernel として保持する
-- **error_flags**: 不正な入力/半径/κ/τ で `invalid_cell`、非有限パワーで `nan_particle` を設定し、残存パワーを未吸収へ戻す
+- **launch**: `<<<1, 256, 0, stream>>>`（`kRadialAbsorptionBlock = 256`）。1D の `Laser.mode="radial_absorption_1d"` で、
+  全 rank が同じ入力で起動する（沈着は rank 間で同一。2026-09-29 以前は rank 0 だけが起動し、他の rank は沈着が 0 だった）
+- **処理**（NUMERICS §5.4a）：外側の流体セルから内側へ、1 本の内向きの流束として積分する
+  - 1024 セルずつ（`kRadialAbsorptionChunk`）、256 スレッドが各セルの入力（中点の `n_hat`・`n_hat_raw`、逆制動輻射の κ、
+    光学的厚さ \(\tau\)、セルの状態）を並列に評価して共有メモリへ置き、スレッド 0 がセルの順にパワーを運ぶ
+    （以前の 1 スレッドのループと同じ算術で、結果はビット一致）
+  - `n_hat_raw >= 1 - eps_crit` で臨界到達、残りの \(P\) を `P_unabsorbed` へ
+  - `ΔP = absorbed_power_expm1(P, τ, P_next)`、`deposit_power_cell[c] += ΔP`
+  - 最内セルに達するか `P < intensity_cutoff * P_total` で残りを `P_unabsorbed` へ
+- **出力**: `deposit_power_cell` は [erg/s] のまま 1D の沈着経路へ渡り、後段で \(\Delta t\) を掛けて `laser_dep` [erg] になる
+- **error_flags**: 不正な入力・半径・κ・τ で `invalid_cell`、非有限のパワーで `nan_particle` を立て、残りのパワーを未吸収へ戻す
 
 ---
-

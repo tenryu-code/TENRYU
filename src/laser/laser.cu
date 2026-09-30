@@ -1638,46 +1638,6 @@ void log_laser_flags(const core::DeviceErrorFlags& flags) {
   }
 }
 
-void synchronize_1d_deposit_allgatherv(std::vector<double>& total_dep_lm,
-                                       const parallel::Reduction& reduction,
-                                       const int n_ranks) {
-  if (n_ranks <= 1 || total_dep_lm.empty()) {
-    return;
-  }
-  TENRYU_ASSERT(total_dep_lm.size() <=
-                    static_cast<std::size_t>(std::numeric_limits<int>::max()),
-                "laser_step 1D allgatherv sendcount exceeds MPI int range");
-  TENRYU_ASSERT(
-      total_dep_lm.size() <=
-          (std::numeric_limits<std::size_t>::max() /
-           static_cast<std::size_t>(std::max(1, n_ranks))),
-      "laser_step 1D allgatherv receive buffer size overflow");
-
-  const int sendcount = static_cast<int>(total_dep_lm.size());
-  TENRYU_ASSERT(sendcount <=
-                    (std::numeric_limits<int>::max() / std::max(1, n_ranks)),
-                "laser_step 1D allgatherv displacements exceed MPI int range");
-  std::vector<int> recvcounts(static_cast<std::size_t>(n_ranks), sendcount);
-  std::vector<int> displs(static_cast<std::size_t>(n_ranks), 0);
-  for (int r = 1; r < n_ranks; ++r) {
-    displs[static_cast<std::size_t>(r)] =
-        displs[static_cast<std::size_t>(r - 1)] +
-        recvcounts[static_cast<std::size_t>(r - 1)];
-  }
-  std::vector<double> gathered(
-      total_dep_lm.size() * static_cast<std::size_t>(n_ranks), 0.0);
-  reduction.allgatherv(total_dep_lm.data(), sendcount, gathered.data(),
-                       recvcounts.data(), displs.data());
-
-  std::fill(total_dep_lm.begin(), total_dep_lm.end(), 0.0);
-  for (int r = 0; r < n_ranks; ++r) {
-    const std::size_t base = static_cast<std::size_t>(r) * total_dep_lm.size();
-    for (std::size_t i = 0; i < total_dep_lm.size(); ++i) {
-      total_dep_lm[i] += gathered[base + i];
-    }
-  }
-}
-
 void build_port_section_diagnostics(
     LaserMesh& lmesh,
     const Beam& beam,
@@ -3075,8 +3035,16 @@ void laser_step(core::State& state,
         (reduction != nullptr && part.n_ranks > 1)
             ? reduction->allreduce_sum(dep_power_local)
             : dep_power_local;
-    lmesh.last_trace_unabsorbed_power = std::max(0.0, total_power - dep_power);
-    lmesh.last_unabsorbed_power = std::max(0.0, total_power - dep_power);
+    // The driver books the blocked power (no receiver cell) as a numerical loss, so the unabsorbed power of a
+    // skipped step leaves it out (2026-09-29; it was counted in both). 1D: the redistribution above recomputed it
+    // for this step. 2D: no transfer runs here and the scaled deposit already lacks it, so the value left from the
+    // last traced step is cleared instead of being booked again.
+    if (state.mesh.dim != 1) {
+      lmesh.last_transfer_blocked_power = 0.0;
+    }
+    const double skip_blocked_power = std::max(lmesh.last_transfer_blocked_power, 0.0);
+    lmesh.last_trace_unabsorbed_power = std::max(0.0, total_power - dep_power - skip_blocked_power);
+    lmesh.last_unabsorbed_power = std::max(0.0, total_power - dep_power - skip_blocked_power);
     lmesh.last_tail_closure_count = 0;
     lmesh.last_tail_closure_absorbed_power = 0.0;
     lmesh.last_critical_surface_hit_count = 0;
@@ -3346,15 +3314,16 @@ void laser_step(core::State& state,
                           state.laser_dep.size() * sizeof(double), stream),
           "laser_step memset d_deposit_1d failed before radial_absorption_1d");
       double* d_hot_e_capture_radial = nullptr;
-      if (part.n_ranks <= 1 || part.rank == 0) {
-        check_or_fail(
-            launch_radial_absorption_1d(
-                total_power, lmesh, laser, state.x_r.data(),
-                static_cast<int>(state.laser_dep.size()), state.laser_dep.data(),
-                d_unabsorbed, d_error_flags, d_critical_surface_hit_count, stream,
-                hot_e_params, &d_hot_e_capture_radial),
-            "laser_step radial_absorption_1d launch failed");
-      }
+      // Every rank evaluates the whole line, as the 1D ray trace does (its inputs are line-gathered at the
+      // driver); the ownership masking of the redistribution keeps each rank's cells. Until 2026-09-29 only rank 0
+      // launched it, so under MPI the cells of the other ranks received no laser energy.
+      check_or_fail(
+          launch_radial_absorption_1d(
+              total_power, lmesh, laser, state.x_r.data(),
+              static_cast<int>(state.laser_dep.size()), state.laser_dep.data(),
+              d_unabsorbed, d_error_flags, d_critical_surface_hit_count, stream,
+              hot_e_params, &d_hot_e_capture_radial),
+          "laser_step radial_absorption_1d launch failed");
       const auto dep_power_cell = copy_cell_deposit_to_host(state.laser_dep, stream);
       if (hot_e_capture_on && d_hot_e_capture_radial != nullptr) {
         std::vector<double> cap(3 * static_cast<std::size_t>(hot_e_params.n_channels), 0.0);
@@ -4554,7 +4523,7 @@ void laser_step(core::State& state,
     // OPEN-GXII-LASER (design doc §6o.2): NO deposit sum-assembly here. The
     // 1D trace is REPLICATED — every rank already holds the identical
     // full-line total_dep_1d (inputs are line-gathered at the driver), so
-    // the former synchronize_1d_deposit_allgatherv added every rank's full
+    // the former deposit Allgatherv (removed with its helper 2026-09-29) added every rank's full
     // copy and multiplied the deposit by n_ranks (measured exactly 2x at
     // the r_outer absorption cell under P2; the 1D twin of the 2D phantom
     // Allreduce removed in M18d). Ownership masking downstream
@@ -5511,9 +5480,6 @@ void laser_step(core::State& state,
     }
   }
   P_unabsorbed_trace = std::max(0.0, P_unabsorbed_trace + skipped_unabsorbed_power);
-  if (radial_absorption_1d && reduction != nullptr && part.n_ranks > 1) {
-    P_unabsorbed_trace = std::max(0.0, reduction->allreduce_sum(P_unabsorbed_trace));
-  }
   lmesh.last_trace_unabsorbed_power = P_unabsorbed_trace;
   lmesh.last_ra_power =
       (phys_ext_active && phys_ext_options.ra_enable != 0)
@@ -5547,10 +5513,10 @@ void laser_step(core::State& state,
   const double hot_e_escaped_power =
       (dt > 0.0) ? std::max(state.hot_e_escaped_step, 0.0) / dt : 0.0;
   const double cbet_iaw_sink = port_section ? cbet_iaw_power : 0.0;
-  if (radial_absorption_1d) {
-    lmesh.last_transfer_blocked_power = 0.0;
-    lmesh.last_unabsorbed_power = P_unabsorbed_trace;
-  } else if (ps_hot_e_capture_on || state.mesh.dim == 1) {
+  // radial_absorption_1d books like the 1D trace (2026-09-29): its deposit goes through the same redistribution,
+  // whose blocked power (no receiver cell) is a numerical loss, not unabsorbed power; it used to be reset to 0
+  // here, which dropped it from the ledger, and the ledger check skipped the radial mode.
+  if (ps_hot_e_capture_on || state.mesh.dim == 1) {
     lmesh.last_unabsorbed_power = P_unabsorbed_trace;
   } else {
     const double P_unabsorbed = std::max(
@@ -5559,7 +5525,7 @@ void laser_step(core::State& state,
                           std::max(lmesh.last_transfer_blocked_power, 0.0)));
     lmesh.last_unabsorbed_power = P_unabsorbed;
   }
-  if (state.mesh.dim == 1 && !radial_absorption_1d && !ps_hot_e_capture_on) {
+  if (state.mesh.dim == 1 && !ps_hot_e_capture_on) {
     const double residual = total_power - dep_power - P_unabsorbed_trace -
                             hot_e_escaped_power -
                             std::max(lmesh.last_transfer_blocked_power, 0.0) - cbet_iaw_sink;

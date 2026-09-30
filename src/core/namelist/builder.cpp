@@ -41,6 +41,7 @@
 #include "materials/eos_table.hpp"
 #include "materials/ionmix_reader.hpp"
 #include "materials/tmat_reader.hpp"
+#include "materials/zbar_tf.hpp"
 
 namespace tenryu::core::namelist {
 namespace {
@@ -67,6 +68,7 @@ static MeshRequirementParams to_mesh_requirement_params(
   params.min_cells_per_layer = config.min_cells_per_layer;
   params.zbar_override = config.zbar_override;
   params.n_bands = config.n_bands;
+  params.empirical = config.empirical;
   return params;
 }
 
@@ -1977,7 +1979,43 @@ void validate_band_ale_config(
 
 void warn_ignored_key(std::string_view key_path) {
   tenryu::core::log_warning(std::string(key_path) +
-                            " is accepted for compatibility and ignored in M01");
+                            " is accepted for compatibility and has no effect");
+}
+
+// The Monte Carlo radiation (Radiation.mode "imc_ddmc": IMC, DDMC, random walk, HOLO, difference formulation) left the
+// build on 2026-09-29; its code is kept under retired/radiation_monte_carlo/ (its README records where it last
+// built). Its keys (Radiation.imc except two_stage, Radiation.ddmc, Radiation.diffusion, Radiation.holo) are
+// accepted and have no effect, so decks that carry them keep loading; enabled=True of a retired method is an error,
+// as it was for the deterministic modes before the retirement.
+constexpr const char* kRetiredMonteCarloRadiation =
+    "the Monte Carlo radiation (IMC, DDMC, random walk, HOLO, difference formulation) was retired on 2026-09-29 "
+    "and is kept under retired/radiation_monte_carlo/ outside the build";
+
+void reject_retired_radiation_method_enabled(const py::dict& section, const std::string& key_path) {
+  if (has_key(section, "enabled") && strict_bool(section["enabled"], key_path + ".enabled")) {
+    throw ConfigError(key_path + ".enabled=True requests a method that no longer exists: " +
+                      kRetiredMonteCarloRadiation);
+  }
+}
+
+// One warning per section naming the keys that have no effect (a present enabled=False is not named).
+void warn_retired_radiation_keys(const py::dict& section,
+                                 const std::string& key_path,
+                                 const std::set<std::string>& live_keys) {
+  std::string ignored;
+  for (const auto item : section) {
+    const std::string key = py::str(item.first).cast<std::string>();
+    if (live_keys.count(key) != 0) {
+      continue;
+    }
+    if (key == "enabled" && py::isinstance<py::bool_>(item.second) && !item.second.cast<bool>()) {
+      continue;
+    }
+    ignored += (ignored.empty() ? "" : ", ") + key;
+  }
+  if (!ignored.empty()) {
+    tenryu::core::log_warning(key_path + ": " + ignored + " have no effect; " + kRetiredMonteCarloRadiation);
+  }
 }
 
 std::string normalize_boundary_mode(std::string mode, std::string_view key_path) {
@@ -2313,10 +2351,6 @@ bool is_runtime_supported_opacity_model(const std::string& value) {
          value == "table_nlte" || value == "tmat" || value == "power_law";
 }
 
-bool is_lambda_method(const std::string& value) {
-  return value == "finite_difference" || value == "freeze_opacity";
-}
-
 bool is_boundary_type(const std::string& value) {
   return value == "vacuum" || value == "reflect" || value == "marshak";
 }
@@ -2324,23 +2358,6 @@ bool is_boundary_type(const std::string& value) {
 bool is_hydro_boundary(const std::string& value) {
   return value == "free" || value == "fixed" || value == "reflect" || value == "pressure" ||
          value == "axis" || value == "state_supply";
-}
-
-bool is_ddmc_leak_stencil(const std::string& value) {
-  return value == "4" || value == "9_kershaw";
-}
-
-bool is_ddmc_interface_method(const std::string& value) {
-  return value == "asymptotic_diffusion_limit" || value == "marshak" ||
-         value == "cleveland_gentile";
-}
-
-bool is_ddmc_interface_exit_distribution(const std::string& value) {
-  return value == "cosine" || value == "half_isotropic";
-}
-
-bool is_ddmc_face_opacity_temperature(const std::string& value) {
-  return value == "radiative_mean";
 }
 
 bool is_hydro_av_type(const std::string& value) {
@@ -3067,8 +3084,8 @@ void Builder::set_main(py::dict kwargs) {
   if (has_key(kwargs, "max_steps")) {
     main.max_steps = strict_int32(kwargs["max_steps"], "Main.max_steps");
     ensure_int_ge(main.max_steps, 1, "Main.max_steps");
-    // 2^24 - 1: Philox RNG counter-based splitting uses step in upper bits.
-    // Exceeding this risks RNG stream aliasing (NUMERICS §12.7.1).
+    // 2^24 - 1: the photon global_id of the retired Monte Carlo radiation put the step in its upper bits (step x 2^40
+    // must fit in uint64, NUMERICS §12.7.1); the bound is kept as it was.
     constexpr int kMaxStepsUpperBound = 16'777'215;
     if (main.max_steps > kMaxStepsUpperBound) {
       throw ConfigError(format_range_error(
@@ -4160,19 +4177,19 @@ void Builder::set_mesh(py::dict kwargs) {
     if (has_key(floors, "rho_floor_gcc")) {
       mesh.floors.rho_floor_gcc = numeric_as_double(floors["rho_floor_gcc"],
                                                     "Mesh.floors.rho_floor_gcc");
-      ensure_non_negative(mesh.floors.rho_floor_gcc, "Mesh.floors.rho_floor_gcc");
+      ensure_positive(mesh.floors.rho_floor_gcc, "Mesh.floors.rho_floor_gcc");
       config.numerics.floors.rho = mesh.floors.rho_floor_gcc;
     }
     if (has_key(floors, "Te_floor_eV")) {
       mesh.floors.Te_floor_eV =
           numeric_as_double(floors["Te_floor_eV"], "Mesh.floors.Te_floor_eV");
-      ensure_non_negative(mesh.floors.Te_floor_eV, "Mesh.floors.Te_floor_eV");
+      ensure_positive(mesh.floors.Te_floor_eV, "Mesh.floors.Te_floor_eV");
       config.numerics.floors.Te = mesh.floors.Te_floor_eV;
     }
     if (has_key(floors, "Ti_floor_eV")) {
       mesh.floors.Ti_floor_eV =
           numeric_as_double(floors["Ti_floor_eV"], "Mesh.floors.Ti_floor_eV");
-      ensure_non_negative(mesh.floors.Ti_floor_eV, "Mesh.floors.Ti_floor_eV");
+      ensure_positive(mesh.floors.Ti_floor_eV, "Mesh.floors.Ti_floor_eV");
       config.numerics.floors.Ti = mesh.floors.Ti_floor_eV;
     }
   }
@@ -4502,9 +4519,44 @@ void Builder::set_mesh(py::dict kwargs) {
          "formation_ablated_fraction", "absorbed_fraction",
          "shock_cells_per_separation",
          "shock_event_min_separation_frac", "min_cells_per_layer",
-         "zbar_override", "n_bands"});
+         "zbar_override", "n_bands", "empirical"});
     auto& rr = mesh.resolution_requirement;
     rr.detected = true;
+    if (has_key(requirement, "empirical")) {
+      if (!py::isinstance<py::dict>(requirement["empirical"])) {
+        throw_value_type_error("Mesh.resolution_requirement.empirical", "dict",
+                               requirement["empirical"]);
+      }
+      const py::dict empirical = requirement["empirical"].cast<py::dict>();
+      enforce_known_keys(empirical, "Mesh.resolution_requirement.empirical",
+                         {"reference_sha256", "case_ids", "surface_ceiling_g_cm2",
+                          "reference_apriori_g_cm2"});
+      for (const char* key : {"reference_sha256", "case_ids",
+                              "surface_ceiling_g_cm2", "reference_apriori_g_cm2"}) {
+        if (!has_key(empirical, key)) {
+          throw ConfigError(std::string("Mesh.resolution_requirement.empirical missing ") + key);
+        }
+      }
+      rr.empirical.enabled = true;
+      rr.empirical.reference_sha256 = strict_string(
+          empirical["reference_sha256"], "Mesh.resolution_requirement.empirical.reference_sha256");
+      if (!py::isinstance<py::list>(empirical["case_ids"])) {
+        throw_value_type_error("Mesh.resolution_requirement.empirical.case_ids", "list",
+                               empirical["case_ids"]);
+      }
+      for (const auto item : empirical["case_ids"].cast<py::list>()) {
+        rr.empirical.case_ids.push_back(strict_string(
+            item, "Mesh.resolution_requirement.empirical.case_ids[]"));
+      }
+      rr.empirical.surface_ceiling_g_cm2 = numeric_as_double(
+          empirical["surface_ceiling_g_cm2"], "Mesh.resolution_requirement.empirical.surface_ceiling_g_cm2");
+      rr.empirical.reference_apriori_g_cm2 = numeric_as_double(
+          empirical["reference_apriori_g_cm2"], "Mesh.resolution_requirement.empirical.reference_apriori_g_cm2");
+      const std::string error = mesh_empirical_validation_error(rr.empirical);
+      if (!error.empty()) {
+        throw ConfigError("MESH_EMPIRICAL_INVALID: " + error);
+      }
+    }
     if (has_key(requirement, "enabled")) {
       rr.enabled = strict_bool(requirement["enabled"],
                                "Mesh.resolution_requirement.enabled");
@@ -4630,6 +4682,9 @@ void Builder::set_mesh(py::dict kwargs) {
     if (rr.n_bands < 1 || rr.n_bands > 32) {
       throw ConfigError(
           "Mesh.resolution_requirement.n_bands must be in [1, 32]");
+    }
+    if (rr.empirical.enabled && (!rr.enabled || rr.apply != "enforce")) {
+      throw ConfigError("MESH_EMPIRICAL_INVALID: empirical requires enabled=True and apply=enforce");
     }
   }
   const auto parse_explicit_nodes = [&](const char* key,
@@ -5198,15 +5253,13 @@ void Builder::set_materials(py::dict kwargs) {
             strict_string(opacity["units"],
                           "Materials.materials[" + std::to_string(i) + "].opacity.units");
       }
+      // lambda_method and f_min set the Non-LTE Fleck factor of the Monte Carlo radiation; decks carry them at their
+      // former defaults, which pass silently, and any other value draws a warning that it has no effect.
       if (has_key(opacity, "lambda_method")) {
-        def.lambda_method = strict_string(
-            opacity["lambda_method"],
-            "Materials.materials[" + std::to_string(i) + "].opacity.lambda_method");
-        if (!is_lambda_method(def.lambda_method)) {
-          throw ValueError(
-              "Materials.materials[" + std::to_string(i) +
-              "].opacity.lambda_method must be one of {\"finite_difference\", \"freeze_opacity\"}, got " +
-              def.lambda_method);
+        const std::string key_path =
+            "Materials.materials[" + std::to_string(i) + "].opacity.lambda_method";
+        if (strict_string(opacity["lambda_method"], key_path) != "finite_difference") {
+          tenryu::core::log_warning(key_path + " has no effect; " + kRetiredMonteCarloRadiation);
         }
       }
       if (has_key(opacity, "lambda_fd_delta_rel")) {
@@ -5222,9 +5275,10 @@ void Builder::set_materials(py::dict kwargs) {
                 "].opacity.lambda_fd_abs_min");
       }
       if (has_key(opacity, "f_min")) {
-        def.nlte_f_min = numeric_as_double(
-            opacity["f_min"],
-            "Materials.materials[" + std::to_string(i) + "].opacity.f_min");
+        const std::string key_path = "Materials.materials[" + std::to_string(i) + "].opacity.f_min";
+        if (numeric_as_double(opacity["f_min"], key_path) != 1.0e-4) {
+          tenryu::core::log_warning(key_path + " has no effect; " + kRetiredMonteCarloRadiation);
+        }
       }
       if (def.opacity_model == "power_law") {
         if (!has_key(opacity, "kappa0_cm2_g")) {
@@ -5279,9 +5333,8 @@ void Builder::set_materials(py::dict kwargs) {
       def.Z = 0.0;
     }
     if (def.opacity_model != "table_nlte" && def.opacity_model != "tmat") {
-      if (def.lambda_method != "finite_difference" || def.lambda_fd_delta_rel != 1.0e-4 ||
-          def.lambda_fd_abs_min != 1.0e-6 || def.nlte_f_min != 1.0e-4) {
-        std::cerr << "[WARN] NLTE knobs (lambda_method/fd_delta_rel/fd_abs_min/f_min) "
+      if (def.lambda_fd_delta_rel != 1.0e-4 || def.lambda_fd_abs_min != 1.0e-6) {
+        std::cerr << "[WARN] NLTE knobs (lambda_fd_delta_rel/lambda_fd_abs_min) "
                      "are set but opacity.model is not table_nlte/tmat; they will be ignored\n";
       }
     }
@@ -5404,35 +5457,29 @@ void Builder::set_radiation(py::dict kwargs) {
   };
   bool use_log_uniform_bounds = false;
   const bool mode_explicit = has_key(kwargs, "mode");
-  const bool imc_explicit = has_key(kwargs, "imc");
-  const bool ddmc_explicit = has_key(kwargs, "ddmc");
   if (has_key(kwargs, "enabled")) {
     radiation.enabled = strict_bool(kwargs["enabled"], "Radiation.enabled");
   }
   if (mode_explicit) {
     const std::string mode = strict_string(kwargs["mode"], "Radiation.mode");
-    if (mode == "imc_ddmc") {
-      radiation.mode = RadiationMode::ImcDdmc;
-    } else if (mode == "multigroup_diffusion") {
+    if (mode == "multigroup_diffusion") {
       radiation.mode = RadiationMode::MultigroupDiffusion;
     } else if (mode == "sn_transport") {
       radiation.mode = RadiationMode::SnTransport;
+    } else if (mode == "imc_ddmc") {
+      throw ConfigError(std::string("Radiation.mode=\"imc_ddmc\" is not available: ") +
+                        kRetiredMonteCarloRadiation +
+                        "; use \"multigroup_diffusion\" or \"sn_transport\"");
     } else {
       throw ConfigError(
-          "Radiation.mode must be \"imc_ddmc\", \"multigroup_diffusion\", or \"sn_transport\"");
+          "Radiation.mode must be \"multigroup_diffusion\" or \"sn_transport\"");
     }
   }
-  if (!mode_explicit && radiation.mode == RadiationMode::MultigroupDiffusion) {
-    if (!imc_explicit) {
-      radiation.imc.enabled = false;
-    }
-    if (!ddmc_explicit) {
-      radiation.ddmc.enabled = false;
-    }
-  }
-  if (has_key(kwargs, "origin_parity_only")) {
-    radiation.origin_parity_only =
-        strict_bool(kwargs["origin_parity_only"], "Radiation.origin_parity_only");
+  // origin_parity_only switched the origin condition of the HOLO S_N closure (Monte Carlo radiation).
+  if (has_key(kwargs, "origin_parity_only") &&
+      strict_bool(kwargs["origin_parity_only"], "Radiation.origin_parity_only")) {
+    tenryu::core::log_warning(std::string("Radiation.origin_parity_only has no effect; ") +
+                              kRetiredMonteCarloRadiation);
   }
   if (has_key(kwargs, "group_repack_hard_xray")) {
     radiation.group_repack_hard_xray = strict_bool(
@@ -5604,6 +5651,8 @@ void Builder::set_radiation(py::dict kwargs) {
                                                       "Radiation.volume_source_x_max");
   }
 
+  // Radiation.imc keeps one key that acts on the deterministic modes, two_stage; the rest of the dict and the
+  // Radiation.ddmc, Radiation.diffusion and Radiation.holo dicts belonged to the retired Monte Carlo radiation.
   if (has_key(kwargs, "imc")) {
     const py::handle imc_obj = kwargs["imc"];
     if (!py::isinstance<py::dict>(imc_obj)) {
@@ -5626,477 +5675,37 @@ void Builder::set_radiation(py::dict kwargs) {
                         "conservative_smoother",
                         "particle_budget",
                         "census_comb", "rad_lite_mesh"});
-    if (has_key(imc, "enabled")) {
-      radiation.imc.enabled = strict_bool(imc["enabled"], "Radiation.imc.enabled");
-    }
-    if (has_key(imc, "alpha")) {
-      radiation.imc.alpha = numeric_as_double(imc["alpha"], "Radiation.imc.alpha");
-      if (!(radiation.imc.alpha > 0.0)) {
-        throw ValueError("Radiation.imc.alpha must be > 0");
-      }
-    }
-    if (has_key(imc, "f_max")) {
-      radiation.imc.f_max = numeric_as_double(imc["f_max"], "Radiation.imc.f_max");
-    }
-    if (has_key(imc, "corrected_fleck")) {
-      radiation.imc.corrected_fleck =
-          strict_bool(imc["corrected_fleck"], "Radiation.imc.corrected_fleck");
-    }
-    if (has_key(imc, "particles_per_cell_group")) {
-      radiation.imc.particles_per_cell_group = strict_int32(
-          imc["particles_per_cell_group"],
-          "Radiation.imc.particles_per_cell_group");
-    }
-    if (has_key(imc, "implicit_capture")) {
-      radiation.imc.implicit_capture =
-          strict_bool(imc["implicit_capture"], "Radiation.imc.implicit_capture");
-    }
-    if (has_key(imc, "cutoff_fraction")) {
-      radiation.imc.cutoff_fraction = numeric_as_double(
-          imc["cutoff_fraction"], "Radiation.imc.cutoff_fraction");
-    }
-    if (has_key(imc, "inelastic_scatter")) {
-      radiation.imc.inelastic_scatter =
-          strict_bool(imc["inelastic_scatter"], "Radiation.imc.inelastic_scatter");
-    }
-    if (has_key(imc, "weight_cutoff")) {
-      radiation.imc.weight_cutoff =
-          numeric_as_double(imc["weight_cutoff"], "Radiation.imc.weight_cutoff");
-    }
-    if (has_key(imc, "roulette_survival")) {
-      radiation.imc.roulette_survival = numeric_as_double(
-          imc["roulette_survival"], "Radiation.imc.roulette_survival");
-    }
-    if (has_key(imc, "weight_split")) {
-      radiation.imc.weight_split =
-          numeric_as_double(imc["weight_split"], "Radiation.imc.weight_split");
-    }
-    if (has_key(imc, "max_split")) {
-      radiation.imc.max_split =
-          strict_int32(imc["max_split"], "Radiation.imc.max_split");
-    }
-    if (has_key(imc, "linearized_planck")) {
-      radiation.imc.linearized_planck =
-          strict_bool(imc["linearized_planck"], "Radiation.imc.linearized_planck");
-    }
-    if (has_key(imc, "source_tilting")) {
-      radiation.imc.source_tilting =
-          strict_bool(imc["source_tilting"], "Radiation.imc.source_tilting");
-    }
-    if (has_key(imc, "source_localization")) {
-      radiation.imc.source_localization = strict_bool(
-          imc["source_localization"], "Radiation.imc.source_localization");
-    }
-    if (has_key(imc, "sloc_ema_beta")) {
-      radiation.imc.sloc_ema_beta = numeric_as_double(
-          imc["sloc_ema_beta"], "Radiation.imc.sloc_ema_beta");
-    }
-    if (has_key(imc, "sloc_sigma_floor")) {
-      radiation.imc.sloc_sigma_floor = numeric_as_double(
-          imc["sloc_sigma_floor"], "Radiation.imc.sloc_sigma_floor");
-    }
-    if (has_key(imc, "sloc_sigma_cap")) {
-      radiation.imc.sloc_sigma_cap = numeric_as_double(
-          imc["sloc_sigma_cap"], "Radiation.imc.sloc_sigma_cap");
-    }
-    if (has_key(imc, "sloc_tau_ref")) {
-      radiation.imc.sloc_tau_ref = numeric_as_double(
-          imc["sloc_tau_ref"], "Radiation.imc.sloc_tau_ref");
-    }
-    if (has_key(imc, "spectral_bias_eta")) {
-      radiation.imc.spectral_bias_eta = numeric_as_double(
-          imc["spectral_bias_eta"], "Radiation.imc.spectral_bias_eta");
-    }
-    if (has_key(imc, "opacity_predictor")) {
-      radiation.imc.opacity_predictor =
-          strict_bool(imc["opacity_predictor"], "Radiation.imc.opacity_predictor");
-    }
     if (has_key(imc, "two_stage")) {
       radiation.imc.two_stage =
           strict_bool(imc["two_stage"], "Radiation.imc.two_stage");
     }
+    reject_retired_radiation_method_enabled(imc, "Radiation.imc");
     if (has_key(imc, "difference")) {
       const py::handle difference_obj = imc["difference"];
       if (!py::isinstance<py::dict>(difference_obj)) {
         throw_value_type_error("Radiation.imc.difference", "dict", difference_obj);
       }
-      const py::dict difference = py::reinterpret_borrow<py::dict>(difference_obj);
-      enforce_known_keys(difference, "Radiation.imc.difference",
-                         {"enabled", "W_max", "tau0", "chi0", "face_transport"});
-      if (has_key(difference, "enabled")) {
-        radiation.imc.difference.enabled =
-            strict_bool(difference["enabled"], "Radiation.imc.difference.enabled");
-      }
-      if (has_key(difference, "W_max")) {
-        radiation.imc.difference.W_max =
-            numeric_as_double(difference["W_max"], "Radiation.imc.difference.W_max");
-      }
-      if (has_key(difference, "tau0")) {
-        radiation.imc.difference.tau0 =
-            numeric_as_double(difference["tau0"], "Radiation.imc.difference.tau0");
-      }
-      if (has_key(difference, "chi0")) {
-        radiation.imc.difference.chi0 =
-            numeric_as_double(difference["chi0"], "Radiation.imc.difference.chi0");
-      }
-      if (has_key(difference, "face_transport")) {
-        radiation.imc.difference.face_transport = strict_bool(
-            difference["face_transport"], "Radiation.imc.difference.face_transport");
-      }
+      reject_retired_radiation_method_enabled(py::reinterpret_borrow<py::dict>(difference_obj),
+                                              "Radiation.imc.difference");
     }
-    if (has_key(imc, "net_e_source_smoothing")) {
-      const py::handle smoothing_obj = imc["net_e_source_smoothing"];
-      if (!py::isinstance<py::dict>(smoothing_obj)) {
-        throw_value_type_error("Radiation.imc.net_e_source_smoothing", "dict",
-                               smoothing_obj);
-      }
-      const py::dict smoothing = py::reinterpret_borrow<py::dict>(smoothing_obj);
-      enforce_known_keys(smoothing, "Radiation.imc.net_e_source_smoothing",
-                         {"enabled", "alpha", "tau_threshold", "passes",
-                          "grad_Te_scale", "grad_rho_scale", "gradient_adaptive"});
-      if (has_key(smoothing, "enabled")) {
-        radiation.imc.net_e_source_smoothing.enabled =
-            strict_bool(smoothing["enabled"],
-                        "Radiation.imc.net_e_source_smoothing.enabled");
-      }
-      if (has_key(smoothing, "alpha")) {
-        radiation.imc.net_e_source_smoothing.alpha =
-            numeric_as_double(smoothing["alpha"],
-                              "Radiation.imc.net_e_source_smoothing.alpha");
-      }
-      if (has_key(smoothing, "tau_threshold")) {
-        radiation.imc.net_e_source_smoothing.tau_threshold =
-            numeric_as_double(
-                smoothing["tau_threshold"],
-                "Radiation.imc.net_e_source_smoothing.tau_threshold");
-      }
-      if (has_key(smoothing, "passes")) {
-        radiation.imc.net_e_source_smoothing.passes =
-            strict_int32(smoothing["passes"],
-                         "Radiation.imc.net_e_source_smoothing.passes");
-      }
-      if (has_key(smoothing, "grad_Te_scale")) {
-        radiation.imc.net_e_source_smoothing.grad_Te_scale =
-            numeric_as_double(
-                smoothing["grad_Te_scale"],
-                "Radiation.imc.net_e_source_smoothing.grad_Te_scale");
-      }
-      if (has_key(smoothing, "grad_rho_scale")) {
-        radiation.imc.net_e_source_smoothing.grad_rho_scale =
-            numeric_as_double(
-                smoothing["grad_rho_scale"],
-                "Radiation.imc.net_e_source_smoothing.grad_rho_scale");
-      }
-      if (has_key(smoothing, "gradient_adaptive")) {
-        radiation.imc.net_e_source_smoothing.gradient_adaptive =
-            strict_bool(
-                smoothing["gradient_adaptive"],
-                "Radiation.imc.net_e_source_smoothing.gradient_adaptive");
-      }
-    }
-    if (has_key(imc, "conservative_smoother")) {
-      const py::handle smoother_obj = imc["conservative_smoother"];
-      if (!py::isinstance<py::dict>(smoother_obj)) {
-        throw_value_type_error("Radiation.imc.conservative_smoother", "dict",
-                               smoother_obj);
-      }
-      const py::dict smoother = py::reinterpret_borrow<py::dict>(smoother_obj);
-      enforce_known_keys(smoother, "Radiation.imc.conservative_smoother",
-                         {"enabled", "passes", "alpha"});
-      if (has_key(smoother, "enabled")) {
-        radiation.imc.conservative_smoother.enabled =
-            strict_bool(smoother["enabled"],
-                        "Radiation.imc.conservative_smoother.enabled");
-      }
-      if (has_key(smoother, "passes")) {
-        radiation.imc.conservative_smoother.passes =
-            strict_int32(smoother["passes"],
-                         "Radiation.imc.conservative_smoother.passes");
-      }
-      if (has_key(smoother, "alpha")) {
-        radiation.imc.conservative_smoother.alpha =
-            numeric_as_double(smoother["alpha"],
-                              "Radiation.imc.conservative_smoother.alpha");
-      }
-    }
-    if (has_key(imc, "particle_budget")) {
-      radiation.imc.particle_budget = strict_int32(
-          imc["particle_budget"], "Radiation.imc.particle_budget");
-    }
-    if (has_key(imc, "census_comb")) {
-      const py::handle census_comb_obj = imc["census_comb"];
-      if (!py::isinstance<py::dict>(census_comb_obj)) {
-        throw_value_type_error("Radiation.imc.census_comb", "dict", census_comb_obj);
-      }
-      const py::dict census_comb = py::reinterpret_borrow<py::dict>(census_comb_obj);
-      enforce_known_keys(census_comb, "Radiation.imc.census_comb",
-                         {"enabled", "max_particles", "min_per_bin", "trigger_ratio",
-                          "target_fraction", "mode_weight_imc", "mode_weight_ddmc",
-                          "adaptive_trigger", "adaptive_util_start", "adaptive_util_end",
-                          "trigger_ratio_floor", "trigger_hysteresis",
-                          "ess_floor_enabled", "ess_min_tier0",
-                          "ess_min_tier1", "max_split_factor"});
-      if (has_key(census_comb, "enabled")) {
-        radiation.imc.census_comb.enabled =
-            strict_bool(census_comb["enabled"], "Radiation.imc.census_comb.enabled");
-      }
-      if (has_key(census_comb, "max_particles")) {
-        radiation.imc.census_comb.max_particles = strict_int32(
-            census_comb["max_particles"], "Radiation.imc.census_comb.max_particles");
-      }
-      if (has_key(census_comb, "min_per_bin")) {
-        radiation.imc.census_comb.min_per_bin = strict_int32(
-            census_comb["min_per_bin"], "Radiation.imc.census_comb.min_per_bin");
-      }
-      if (has_key(census_comb, "trigger_ratio")) {
-        radiation.imc.census_comb.trigger_ratio = numeric_as_double(
-            census_comb["trigger_ratio"], "Radiation.imc.census_comb.trigger_ratio");
-      }
-      if (has_key(census_comb, "target_fraction")) {
-        radiation.imc.census_comb.target_fraction = numeric_as_double(
-            census_comb["target_fraction"], "Radiation.imc.census_comb.target_fraction");
-      }
-      if (has_key(census_comb, "mode_weight_imc")) {
-        radiation.imc.census_comb.mode_weight_imc = numeric_as_double(
-            census_comb["mode_weight_imc"], "Radiation.imc.census_comb.mode_weight_imc");
-      }
-      if (has_key(census_comb, "mode_weight_ddmc")) {
-        radiation.imc.census_comb.mode_weight_ddmc = numeric_as_double(
-            census_comb["mode_weight_ddmc"], "Radiation.imc.census_comb.mode_weight_ddmc");
-      }
-      if (has_key(census_comb, "adaptive_trigger")) {
-        radiation.imc.census_comb.adaptive_trigger = strict_bool(
-            census_comb["adaptive_trigger"], "Radiation.imc.census_comb.adaptive_trigger");
-      }
-      if (has_key(census_comb, "adaptive_util_start")) {
-        radiation.imc.census_comb.adaptive_util_start = numeric_as_double(
-            census_comb["adaptive_util_start"], "Radiation.imc.census_comb.adaptive_util_start");
-      }
-      if (has_key(census_comb, "adaptive_util_end")) {
-        radiation.imc.census_comb.adaptive_util_end = numeric_as_double(
-            census_comb["adaptive_util_end"], "Radiation.imc.census_comb.adaptive_util_end");
-      }
-      if (has_key(census_comb, "trigger_ratio_floor")) {
-        radiation.imc.census_comb.trigger_ratio_floor = numeric_as_double(
-            census_comb["trigger_ratio_floor"], "Radiation.imc.census_comb.trigger_ratio_floor");
-      }
-      if (has_key(census_comb, "trigger_hysteresis")) {
-        radiation.imc.census_comb.trigger_hysteresis = numeric_as_double(
-            census_comb["trigger_hysteresis"], "Radiation.imc.census_comb.trigger_hysteresis");
-      }
-      if (has_key(census_comb, "ess_floor_enabled")) {
-        radiation.imc.census_comb.ess_floor_enabled = strict_bool(
-            census_comb["ess_floor_enabled"], "Radiation.imc.census_comb.ess_floor_enabled");
-      }
-      if (has_key(census_comb, "ess_min_tier0")) {
-        radiation.imc.census_comb.ess_min_tier0 = numeric_as_double(
-            census_comb["ess_min_tier0"], "Radiation.imc.census_comb.ess_min_tier0");
-      }
-      if (has_key(census_comb, "ess_min_tier1")) {
-        radiation.imc.census_comb.ess_min_tier1 = numeric_as_double(
-            census_comb["ess_min_tier1"], "Radiation.imc.census_comb.ess_min_tier1");
-      }
-      if (has_key(census_comb, "max_split_factor")) {
-        radiation.imc.census_comb.max_split_factor = strict_int32(
-            census_comb["max_split_factor"], "Radiation.imc.census_comb.max_split_factor");
-      }
-    }
-    if (has_key(imc, "rad_lite_mesh")) {
-      const py::handle rlm_obj = imc["rad_lite_mesh"];
-      if (!py::isinstance<py::dict>(rlm_obj)) {
-        throw_value_type_error("Radiation.imc.rad_lite_mesh", "dict", rlm_obj);
-      }
-      const py::dict rlm = py::reinterpret_borrow<py::dict>(rlm_obj);
-      enforce_known_keys(rlm, "Radiation.imc.rad_lite_mesh",
-                         {"enabled", "sigma_ratio_max", "nlte_auto"});
-      if (has_key(rlm, "enabled")) {
-        radiation.imc.rad_lite_mesh.enabled =
-            strict_bool(rlm["enabled"], "Radiation.imc.rad_lite_mesh.enabled");
-      }
-      if (has_key(rlm, "sigma_ratio_max")) {
-        radiation.imc.rad_lite_mesh.sigma_ratio_max = numeric_as_double(
-            rlm["sigma_ratio_max"], "Radiation.imc.rad_lite_mesh.sigma_ratio_max");
-        if (!(radiation.imc.rad_lite_mesh.sigma_ratio_max > 1.0)) {
-          throw ValueError("Radiation.imc.rad_lite_mesh.sigma_ratio_max must be > 1.0");
-        }
-      }
-      if (has_key(rlm, "nlte_auto")) {
-        radiation.imc.rad_lite_mesh.nlte_auto =
-            strict_bool(rlm["nlte_auto"], "Radiation.imc.rad_lite_mesh.nlte_auto");
-      }
-    }
+    warn_retired_radiation_keys(imc, "Radiation.imc", {"two_stage"});
   }
-
-  if (has_key(kwargs, "ddmc")) {
-    const py::handle ddmc_obj = kwargs["ddmc"];
-    if (!py::isinstance<py::dict>(ddmc_obj)) {
-      throw_value_type_error("Radiation.ddmc", "dict", ddmc_obj);
+  for (const char* section : {"ddmc", "diffusion", "holo"}) {
+    if (!has_key(kwargs, section)) {
+      continue;
     }
-    const py::dict ddmc = py::reinterpret_borrow<py::dict>(ddmc_obj);
-    enforce_known_keys(ddmc, "Radiation.ddmc",
-                       {"enabled", "implicit_diffusion", "tau_ddmc", "tau_rw", "omega_ddmc", "leak_stencil",
-                        "tau_ddmc_off", "omega_ddmc_off", "mode_hold", "rate_max",
-                        "interface_method", "emissivity_preserving",
-                        "interface_exit_distribution", "rz_face_r_weight",
-                        "face_opacity_temperature", "m_matrix_check"});
-    if (has_key(ddmc, "enabled")) {
-      radiation.ddmc.enabled = strict_bool(ddmc["enabled"], "Radiation.ddmc.enabled");
+    const std::string key_path = std::string("Radiation.") + section;
+    const py::handle section_obj = kwargs[section];
+    if (!py::isinstance<py::dict>(section_obj)) {
+      throw_value_type_error(key_path, "dict", section_obj);
     }
-    if (has_key(ddmc, "implicit_diffusion")) {
-      radiation.ddmc.implicit_diffusion = strict_bool(
-          ddmc["implicit_diffusion"], "Radiation.ddmc.implicit_diffusion");
+    const py::dict section_dict = py::reinterpret_borrow<py::dict>(section_obj);
+    // Radiation.diffusion.enabled (the Monte Carlo hybrid's diffusion regions) was not rejected under the
+    // deterministic modes before the retirement either.
+    if (std::string_view(section) != "diffusion") {
+      reject_retired_radiation_method_enabled(section_dict, key_path);
     }
-    if (has_key(ddmc, "tau_ddmc")) {
-      radiation.ddmc.tau_ddmc =
-          numeric_as_double(ddmc["tau_ddmc"], "Radiation.ddmc.tau_ddmc");
-    }
-    if (has_key(ddmc, "tau_rw")) {
-      radiation.ddmc.tau_rw =
-          numeric_as_double(ddmc["tau_rw"], "Radiation.ddmc.tau_rw");
-    }
-    if (has_key(ddmc, "omega_ddmc")) {
-      radiation.ddmc.omega_ddmc =
-          numeric_as_double(ddmc["omega_ddmc"], "Radiation.ddmc.omega_ddmc");
-    }
-    if (has_key(ddmc, "tau_ddmc_off")) {
-      radiation.ddmc.tau_ddmc_off =
-          numeric_as_double(ddmc["tau_ddmc_off"], "Radiation.ddmc.tau_ddmc_off");
-    }
-    if (has_key(ddmc, "omega_ddmc_off")) {
-      radiation.ddmc.omega_ddmc_off = numeric_as_double(
-          ddmc["omega_ddmc_off"], "Radiation.ddmc.omega_ddmc_off");
-    }
-    if (has_key(ddmc, "mode_hold")) {
-      radiation.ddmc.mode_hold = strict_int32(ddmc["mode_hold"], "Radiation.ddmc.mode_hold");
-    }
-    if (has_key(ddmc, "rate_max")) {
-      radiation.ddmc.rate_max =
-          numeric_as_double(ddmc["rate_max"], "Radiation.ddmc.rate_max");
-    }
-    if (has_key(ddmc, "leak_stencil")) {
-      radiation.ddmc.leak_stencil =
-          strict_string(ddmc["leak_stencil"], "Radiation.ddmc.leak_stencil");
-    }
-    if (has_key(ddmc, "interface_method")) {
-      radiation.ddmc.interface_method =
-          strict_string(ddmc["interface_method"],
-                        "Radiation.ddmc.interface_method");
-    }
-    if (has_key(ddmc, "emissivity_preserving")) {
-      radiation.ddmc.emissivity_preserving = strict_bool(
-          ddmc["emissivity_preserving"], "Radiation.ddmc.emissivity_preserving");
-    }
-    if (has_key(ddmc, "interface_exit_distribution")) {
-      radiation.ddmc.interface_exit_distribution =
-          strict_string(ddmc["interface_exit_distribution"],
-                        "Radiation.ddmc.interface_exit_distribution");
-    }
-    if (has_key(ddmc, "rz_face_r_weight")) {
-      radiation.ddmc.rz_face_r_weight =
-          strict_bool(ddmc["rz_face_r_weight"], "Radiation.ddmc.rz_face_r_weight");
-    }
-    if (has_key(ddmc, "face_opacity_temperature")) {
-      radiation.ddmc.face_opacity_temperature =
-          strict_string(ddmc["face_opacity_temperature"],
-                        "Radiation.ddmc.face_opacity_temperature");
-    }
-    if (has_key(ddmc, "m_matrix_check")) {
-      radiation.ddmc.m_matrix_check = strict_bool(ddmc["m_matrix_check"],
-                                                  "Radiation.ddmc.m_matrix_check");
-    }
-  }
-
-  if (has_key(kwargs, "diffusion")) {
-    const py::handle diffusion_obj = kwargs["diffusion"];
-    if (!py::isinstance<py::dict>(diffusion_obj)) {
-      throw_value_type_error("Radiation.diffusion", "dict", diffusion_obj);
-    }
-    const py::dict diffusion = py::reinterpret_borrow<py::dict>(diffusion_obj);
-    enforce_known_keys(diffusion, "Radiation.diffusion",
-                       {"enabled", "tau_on", "tau_off",
-                        "reduced_flux_on", "reduced_flux_off",
-                        "mode_hold", "rate_max",
-                        "mode_update_interval", "min_diffusion_island_cells",
-                        "imc_guard_cells",
-                        "sts_max_stages", "sts_damping", "sts_subcycle_eta",
-                        "interface_particles_per_face_group",
-                        "exit_particles_per_cell_group",
-                        "lte_entry_initialization",
-                        "lte_entry_energy_fraction_cap"});
-    if (has_key(diffusion, "enabled")) {
-      radiation.diffusion.enabled =
-          strict_bool(diffusion["enabled"], "Radiation.diffusion.enabled");
-    }
-    if (has_key(diffusion, "tau_on")) {
-      radiation.diffusion.tau_on =
-          numeric_as_double(diffusion["tau_on"], "Radiation.diffusion.tau_on");
-    }
-    if (has_key(diffusion, "tau_off")) {
-      radiation.diffusion.tau_off =
-          numeric_as_double(diffusion["tau_off"], "Radiation.diffusion.tau_off");
-    }
-    if (has_key(diffusion, "reduced_flux_on")) {
-      radiation.diffusion.reduced_flux_on = numeric_as_double(
-          diffusion["reduced_flux_on"], "Radiation.diffusion.reduced_flux_on");
-    }
-    if (has_key(diffusion, "reduced_flux_off")) {
-      radiation.diffusion.reduced_flux_off = numeric_as_double(
-          diffusion["reduced_flux_off"], "Radiation.diffusion.reduced_flux_off");
-    }
-    if (has_key(diffusion, "mode_hold")) {
-      radiation.diffusion.mode_hold =
-          strict_int32(diffusion["mode_hold"], "Radiation.diffusion.mode_hold");
-    }
-    if (has_key(diffusion, "rate_max")) {
-      radiation.diffusion.rate_max =
-          numeric_as_double(diffusion["rate_max"], "Radiation.diffusion.rate_max");
-    }
-    if (has_key(diffusion, "mode_update_interval")) {
-      radiation.diffusion.mode_update_interval = strict_int32(
-          diffusion["mode_update_interval"],
-          "Radiation.diffusion.mode_update_interval");
-    }
-    if (has_key(diffusion, "min_diffusion_island_cells")) {
-      radiation.diffusion.min_diffusion_island_cells = strict_int32(
-          diffusion["min_diffusion_island_cells"],
-          "Radiation.diffusion.min_diffusion_island_cells");
-    }
-    if (has_key(diffusion, "imc_guard_cells")) {
-      radiation.diffusion.imc_guard_cells = strict_int32(
-          diffusion["imc_guard_cells"], "Radiation.diffusion.imc_guard_cells");
-    }
-    if (has_key(diffusion, "sts_max_stages")) {
-      radiation.diffusion.sts_max_stages = strict_int32(
-          diffusion["sts_max_stages"], "Radiation.diffusion.sts_max_stages");
-    }
-    if (has_key(diffusion, "sts_damping")) {
-      radiation.diffusion.sts_damping = numeric_as_double(
-          diffusion["sts_damping"], "Radiation.diffusion.sts_damping");
-    }
-    if (has_key(diffusion, "sts_subcycle_eta")) {
-      radiation.diffusion.sts_subcycle_eta = numeric_as_double(
-          diffusion["sts_subcycle_eta"], "Radiation.diffusion.sts_subcycle_eta");
-    }
-    if (has_key(diffusion, "interface_particles_per_face_group")) {
-      radiation.diffusion.interface_particles_per_face_group = strict_int32(
-          diffusion["interface_particles_per_face_group"],
-          "Radiation.diffusion.interface_particles_per_face_group");
-    }
-    if (has_key(diffusion, "exit_particles_per_cell_group")) {
-      radiation.diffusion.exit_particles_per_cell_group = strict_int32(
-          diffusion["exit_particles_per_cell_group"],
-          "Radiation.diffusion.exit_particles_per_cell_group");
-    }
-    if (has_key(diffusion, "lte_entry_initialization")) {
-      radiation.diffusion.lte_entry_initialization = strict_bool(
-          diffusion["lte_entry_initialization"],
-          "Radiation.diffusion.lte_entry_initialization");
-    }
-    if (has_key(diffusion, "lte_entry_energy_fraction_cap")) {
-      radiation.diffusion.lte_entry_energy_fraction_cap = numeric_as_double(
-          diffusion["lte_entry_energy_fraction_cap"],
-          "Radiation.diffusion.lte_entry_energy_fraction_cap");
-    }
+    warn_retired_radiation_keys(section_dict, key_path, {});
   }
 
   if (has_key(kwargs, "multigroup_diffusion")) {
@@ -6608,154 +6217,6 @@ void Builder::set_radiation(py::dict kwargs) {
     }
   }
 
-  if (has_key(kwargs, "holo")) {
-    const py::handle holo_obj = kwargs["holo"];
-    if (!py::isinstance<py::dict>(holo_obj)) {
-      throw_value_type_error("Radiation.holo", "dict", holo_obj);
-    }
-    const py::dict holo = py::reinterpret_borrow<py::dict>(holo_obj);
-    const bool holo_has_tau_on = has_key(holo, "tau_on");
-    const bool holo_has_tau_off = has_key(holo, "tau_off");
-    enforce_known_keys(holo, "Radiation.holo",
-                       {"enabled", "region", "material_group", "q_min", "q_max",
-                        "coupling_tau", "guard_cells", "blend_cells",
-                        "min_lo_cells",
-                        "tau_on", "tau_off",
-                        "reduced_flux_on", "reduced_flux_off",
-                        "update_interval", "hold_on", "min_dwell_steps",
-                        "min_island_cells", "core_margin_cells",
-                        "solver", "closure", "closure_relax",
-                        "closure_smooth_passes", "closure_smooth_alpha",
-                        "consistency_alpha", "gamma_alpha", "boundary_flux", "p_rr_tally",
-                        "sn_closure", "sn_n_angles",
-                        "sn_material_coupling",
-                        "residual_particles_per_cell_group"});
-    if (has_key(holo, "enabled")) {
-      radiation.holo.enabled = strict_bool(holo["enabled"], "Radiation.holo.enabled");
-    }
-    if (has_key(holo, "region")) {
-      radiation.holo.region = strict_string(holo["region"], "Radiation.holo.region");
-    }
-    if (has_key(holo, "material_group")) {
-      radiation.holo.material_group =
-          strict_string(holo["material_group"], "Radiation.holo.material_group");
-    }
-    if (has_key(holo, "coupling_tau")) {
-      radiation.holo.coupling_tau =
-          numeric_as_double(holo["coupling_tau"], "Radiation.holo.coupling_tau");
-    }
-    if (has_key(holo, "guard_cells")) {
-      radiation.holo.guard_cells =
-          strict_int32(holo["guard_cells"], "Radiation.holo.guard_cells");
-    }
-    if (has_key(holo, "blend_cells")) {
-      radiation.holo.blend_cells =
-          strict_int32(holo["blend_cells"], "Radiation.holo.blend_cells");
-    }
-    if (has_key(holo, "min_lo_cells")) {
-      radiation.holo.min_lo_cells =
-          strict_int32(holo["min_lo_cells"], "Radiation.holo.min_lo_cells");
-    }
-    if (has_key(holo, "q_min")) {
-      radiation.holo.q_min =
-          numeric_as_double(holo["q_min"], "Radiation.holo.q_min");
-    }
-    if (has_key(holo, "q_max")) {
-      radiation.holo.q_max =
-          numeric_as_double(holo["q_max"], "Radiation.holo.q_max");
-    }
-    if (holo_has_tau_on) {
-      radiation.holo.tau_on =
-          numeric_as_double(holo["tau_on"], "Radiation.holo.tau_on");
-    }
-    if (holo_has_tau_off) {
-      radiation.holo.tau_off =
-          numeric_as_double(holo["tau_off"], "Radiation.holo.tau_off");
-    }
-    if (!holo_has_tau_on) {
-      radiation.holo.tau_on = radiation.holo.coupling_tau;
-    }
-    if (has_key(holo, "reduced_flux_on")) {
-      radiation.holo.reduced_flux_on = numeric_as_double(
-          holo["reduced_flux_on"], "Radiation.holo.reduced_flux_on");
-    }
-    if (has_key(holo, "reduced_flux_off")) {
-      radiation.holo.reduced_flux_off = numeric_as_double(
-          holo["reduced_flux_off"], "Radiation.holo.reduced_flux_off");
-    }
-    if (has_key(holo, "update_interval")) {
-      radiation.holo.update_interval = strict_int32(
-          holo["update_interval"], "Radiation.holo.update_interval");
-    }
-    if (has_key(holo, "hold_on")) {
-      radiation.holo.hold_on = strict_int32(
-          holo["hold_on"], "Radiation.holo.hold_on");
-    }
-    if (has_key(holo, "min_dwell_steps")) {
-      radiation.holo.min_dwell_steps = strict_int32(
-          holo["min_dwell_steps"], "Radiation.holo.min_dwell_steps");
-    }
-    if (has_key(holo, "min_island_cells")) {
-      radiation.holo.min_island_cells = strict_int32(
-          holo["min_island_cells"], "Radiation.holo.min_island_cells");
-    }
-    if (has_key(holo, "core_margin_cells")) {
-      radiation.holo.core_margin_cells = strict_int32(
-          holo["core_margin_cells"], "Radiation.holo.core_margin_cells");
-    }
-    if (has_key(holo, "solver")) {
-      radiation.holo.solver = strict_string(holo["solver"], "Radiation.holo.solver");
-    }
-    if (has_key(holo, "closure")) {
-      radiation.holo.closure = strict_string(holo["closure"], "Radiation.holo.closure");
-    }
-    if (has_key(holo, "closure_relax")) {
-      radiation.holo.closure_relax =
-          numeric_as_double(holo["closure_relax"], "Radiation.holo.closure_relax");
-    }
-    if (has_key(holo, "closure_smooth_passes")) {
-      radiation.holo.closure_smooth_passes = strict_int32(
-          holo["closure_smooth_passes"], "Radiation.holo.closure_smooth_passes");
-    }
-    if (has_key(holo, "closure_smooth_alpha")) {
-      radiation.holo.closure_smooth_alpha = numeric_as_double(
-          holo["closure_smooth_alpha"], "Radiation.holo.closure_smooth_alpha");
-    }
-    if (has_key(holo, "gamma_alpha")) {
-      radiation.holo.consistency_alpha =
-          numeric_as_double(holo["gamma_alpha"], "Radiation.holo.gamma_alpha");
-    }
-    if (has_key(holo, "consistency_alpha")) {
-      radiation.holo.consistency_alpha = numeric_as_double(
-          holo["consistency_alpha"], "Radiation.holo.consistency_alpha");
-    }
-    if (has_key(holo, "boundary_flux")) {
-      radiation.holo.boundary_flux =
-          strict_string(holo["boundary_flux"], "Radiation.holo.boundary_flux");
-    }
-    if (has_key(holo, "p_rr_tally")) {
-      radiation.holo.p_rr_tally =
-          strict_bool(holo["p_rr_tally"], "Radiation.holo.p_rr_tally");
-    }
-    if (has_key(holo, "sn_closure")) {
-      radiation.holo.sn_closure =
-          strict_bool(holo["sn_closure"], "Radiation.holo.sn_closure");
-    }
-    if (has_key(holo, "sn_n_angles")) {
-      radiation.holo.sn_n_angles =
-          strict_int32(holo["sn_n_angles"], "Radiation.holo.sn_n_angles");
-    }
-    if (has_key(holo, "sn_material_coupling")) {
-      radiation.holo.sn_material_coupling = strict_bool(
-          holo["sn_material_coupling"], "Radiation.holo.sn_material_coupling");
-    }
-    if (has_key(holo, "residual_particles_per_cell_group")) {
-      radiation.holo.residual_particles_per_cell_group = strict_int32(
-          holo["residual_particles_per_cell_group"],
-          "Radiation.holo.residual_particles_per_cell_group");
-    }
-  }
-
   if (!has_key(kwargs, "boundary")) {
     return;
   }
@@ -6829,9 +6290,8 @@ void Builder::set_radiation(py::dict kwargs) {
   parse_face_boundary("bottom_z", "z_bottom", radiation.boundary.bottom_z, "bottom_z");
   parse_face_boundary("top_z", "z_top", radiation.boundary.top_z, "top_z");
   if (has_key(boundary, "marshak_particles")) {
-    radiation.boundary.marshak_particles =
-        strict_int32(boundary["marshak_particles"],
-                     "Radiation.boundary.marshak_particles");
+    // The Monte Carlo Marshak source's particle count (retired radiation).
+    warn_ignored_key("Radiation.boundary.marshak_particles");
   }
   if (has_key(boundary, "marshak_Tr_eV")) {
     radiation.boundary.marshak_Tr_eV =
@@ -7014,13 +6474,18 @@ void Builder::set_laser(py::dict kwargs) {
       laser.lasermesh.critical_margin =
           numeric_as_double(lmesh["critical_margin"], "Laser.lasermesh.critical_margin");
     }
+    // No laser mesh reads these (the 1D mesh is graded by its own rule, NUMERICS §5.7.2; the 2D one is uniform):
+    // they are kept readable for frozen configs and decks that set them, with a warning that they have no effect
+    // (they were validated and silently unused until 2026-09-29).
     if (has_key(lmesh, "stretch_method")) {
       laser.lasermesh.stretch_method =
           strict_string(lmesh["stretch_method"], "Laser.lasermesh.stretch_method");
+      warn_ignored_key("Laser.lasermesh.stretch_method");
     }
     if (has_key(lmesh, "min_ratio")) {
       laser.lasermesh.min_ratio =
           numeric_as_double(lmesh["min_ratio"], "Laser.lasermesh.min_ratio");
+      warn_ignored_key("Laser.lasermesh.min_ratio");
     }
     if (has_key(lmesh, "mesh_factor")) {
       laser.lasermesh.mesh_factor =
@@ -7980,6 +7445,15 @@ void Builder::set_laser(py::dict kwargs) {
         throw ValueError("Laser.beams[" + std::to_string(i) +
                          "].direction must have exactly 3 elements");
       }
+      // SPECIFICATION §6.4.6: |direction| < 1e-10 is a ConfigError. Before 2026-09-29 it was accepted and the
+      // normalization (laser/coordinate_transform.cuh) turned a zero vector into +z without a message.
+      const double direction_norm = std::sqrt(out.direction[0] * out.direction[0] +
+                                              out.direction[1] * out.direction[1] +
+                                              out.direction[2] * out.direction[2]);
+      if (!(std::isfinite(direction_norm) && direction_norm >= 1.0e-10)) {
+        throw ConfigError("Laser.beams[" + std::to_string(i) +
+                          "].direction must be a finite vector of length >= 1e-10");
+      }
     }
     if (has_key(beam, "theta")) {
       out.theta =
@@ -7992,7 +7466,10 @@ void Builder::set_laser(py::dict kwargs) {
     if (has_key(beam, "f_number")) {
       out.f_number = numeric_as_double(
           beam["f_number"], "Laser.beams[" + std::to_string(i) + "].f_number");
-      ensure_positive(out.f_number, "Laser.beams.f_number");
+      // SPECIFICATION §6.4.6 range [1, 50] (only > 0 was checked before 2026-09-29).
+      if (!(out.f_number >= 1.0 && out.f_number <= 50.0)) {
+        throw ValueError("Laser.beams[" + std::to_string(i) + "].f_number must be in [1, 50]");
+      }
     }
     if (has_key(beam, "focus")) {
       out.focus =
@@ -9414,8 +8891,8 @@ void Builder::set_numerics(py::dict kwargs) {
       numerics.dt.cfl_cond = numeric_as_double(dt["cfl_cond"], "Numerics.dt.cfl_cond");
     }
     if (has_key(dt, "f_min_fleck")) {
-      numerics.dt.f_min_fleck =
-          numeric_as_double(dt["f_min_fleck"], "Numerics.dt.f_min_fleck");
+      // The Fleck-factor floor of the retired Monte Carlo radiation's time-step limit (NUMERICS §2.2 (c)).
+      warn_ignored_key("Numerics.dt.f_min_fleck");
     }
     if (has_key(dt, "growth_factor")) {
       numerics.dt.growth_factor =
@@ -10844,6 +10321,13 @@ void Builder::set_numerics(py::dict kwargs) {
       numerics.hydro.av_quadratic =
           numeric_as_double(hydro["av_quadratic"], "Numerics.hydro.av_quadratic");
     }
+    // SPECIFICATION §6.4.7 range [0, 10] for both spellings (not checked before 2026-09-29).
+    if (av_c1_explicit && !(numerics.hydro.av_linear >= 0.0 && numerics.hydro.av_linear <= 10.0)) {
+      throw ValueError("Numerics.hydro.av_C1 (av_linear) must be in [0, 10]");
+    }
+    if (av_c2_explicit && !(numerics.hydro.av_quadratic >= 0.0 && numerics.hydro.av_quadratic <= 10.0)) {
+      throw ValueError("Numerics.hydro.av_C2 (av_quadratic) must be in [0, 10]");
+    }
     if (has_key(hydro, "csw98_degenerate_side_floor_rel")) {
       numerics.hydro.csw98_degenerate_side_floor_rel = numeric_as_double(
           hydro["csw98_degenerate_side_floor_rel"],
@@ -11520,10 +11004,18 @@ void Builder::set_numerics(py::dict kwargs) {
     if (has_key(conduction, "f_lim")) {
       numerics.conduction.f_lim =
           numeric_as_double(conduction["f_lim"], "Numerics.conduction.f_lim");
+      // SPECIFICATION §6.4.7 range (0, 1]; f_lim <= 0 used to switch the conduction off silently (the face
+      // limiter became 0).
+      if (!(numerics.conduction.f_lim > 0.0 && numerics.conduction.f_lim <= 1.0)) {
+        throw ValueError("Numerics.conduction.f_lim must be in (0, 1]");
+      }
     }
     if (has_key(conduction, "mfp_limiter_C")) {
       numerics.conduction.mfp_limiter_C = numeric_as_double(
           conduction["mfp_limiter_C"], "Numerics.conduction.mfp_limiter_C");
+      if (!(numerics.conduction.mfp_limiter_C >= 0.0) || !std::isfinite(numerics.conduction.mfp_limiter_C)) {
+        throw ValueError("Numerics.conduction.mfp_limiter_C must be finite and >= 0");
+      }
     }
     if (has_key(conduction, "spitzer_z_correction")) {
       const std::string spitzer_z_correction = strict_string(
@@ -11547,14 +11039,26 @@ void Builder::set_numerics(py::dict kwargs) {
     if (has_key(conduction, "sts_damping")) {
       numerics.conduction.sts_damping = numeric_as_double(
           conduction["sts_damping"], "Numerics.conduction.sts_damping");
+      if (!(numerics.conduction.sts_damping > 0.0 && numerics.conduction.sts_damping < 1.0)) {
+        throw ValueError("Numerics.conduction.sts_damping must be in (0, 1)");
+      }
     }
     if (has_key(conduction, "sts_max_stages")) {
       numerics.conduction.sts_max_stages = strict_int32(
           conduction["sts_max_stages"], "Numerics.conduction.sts_max_stages");
+      // SPECIFICATION §6.4.7 range [1, 200]; a value <= 0 used to remove the conduction time-step limit and let a
+      // step run up to 100000 stages.
+      if (numerics.conduction.sts_max_stages < 1 || numerics.conduction.sts_max_stages > 200) {
+        throw ValueError("Numerics.conduction.sts_max_stages must be in [1, 200]");
+      }
     }
     if (has_key(conduction, "sts_subcycle_eta")) {
       numerics.conduction.sts_subcycle_eta = numeric_as_double(
           conduction["sts_subcycle_eta"], "Numerics.conduction.sts_subcycle_eta");
+      // (0, 1]; the solver clamped values outside to [1e-6, 1] without a message.
+      if (!(numerics.conduction.sts_subcycle_eta > 0.0 && numerics.conduction.sts_subcycle_eta <= 1.0)) {
+        throw ValueError("Numerics.conduction.sts_subcycle_eta must be in (0, 1]");
+      }
     }
     if (has_key(conduction, "sts_total_stages_max")) {
       numerics.conduction.sts_total_stages_max = strict_int32(
@@ -14592,17 +14096,26 @@ void Builder::set_numerics(py::dict kwargs) {
     const py::dict floors = py::reinterpret_borrow<py::dict>(floors_obj);
     enforce_known_keys(floors, "Numerics.floors",
                        {"rho_floor_gcc", "Te_floor_eV", "Ti_floor_eV"});
+    // The same keys as Mesh.floors (SPECIFICATION §6.4.2): the solver's values, also written to Mesh.floors so the
+    // frozen configuration records the floors the run used (it recorded the Mesh.floors defaults until
+    // 2026-09-29), with the same range check.
     if (has_key(floors, "rho_floor_gcc")) {
       numerics.floors.rho =
           numeric_as_double(floors["rho_floor_gcc"], "Numerics.floors.rho_floor_gcc");
+      ensure_positive(numerics.floors.rho, "Numerics.floors.rho_floor_gcc");
+      config.mesh.floors.rho_floor_gcc = numerics.floors.rho;
     }
     if (has_key(floors, "Te_floor_eV")) {
       numerics.floors.Te =
           numeric_as_double(floors["Te_floor_eV"], "Numerics.floors.Te_floor_eV");
+      ensure_positive(numerics.floors.Te, "Numerics.floors.Te_floor_eV");
+      config.mesh.floors.Te_floor_eV = numerics.floors.Te;
     }
     if (has_key(floors, "Ti_floor_eV")) {
       numerics.floors.Ti =
           numeric_as_double(floors["Ti_floor_eV"], "Numerics.floors.Ti_floor_eV");
+      ensure_positive(numerics.floors.Ti, "Numerics.floors.Ti_floor_eV");
+      config.mesh.floors.Ti_floor_eV = numerics.floors.Ti;
     }
   }
 
@@ -14666,13 +14179,14 @@ void Builder::set_numerics(py::dict kwargs) {
       numerics.safety.energy_budget_tol = numeric_as_double(
           safety["energy_budget_tol"], "Numerics.safety.energy_budget_tol");
     }
-    if (has_key(safety, "opacity_floor")) {
-      numerics.safety.opacity_floor =
-          numeric_as_double(safety["opacity_floor"], "Numerics.safety.opacity_floor");
-    }
-    if (has_key(safety, "opacity_cap")) {
-      numerics.safety.opacity_cap =
-          numeric_as_double(safety["opacity_cap"], "Numerics.safety.opacity_cap");
+    // The opacity clamp of the Monte Carlo radiation; FLD and S_N take Radiation.multigroup_diffusion and
+    // Radiation.sn_transport opacity_floor / opacity_cap.
+    for (const char* key : {"opacity_floor", "opacity_cap"}) {
+      if (has_key(safety, key)) {
+        const std::string key_path = std::string("Numerics.safety.") + key;
+        (void)numeric_as_double(safety[key], key_path);
+        tenryu::core::log_warning(key_path + " has no effect; " + kRetiredMonteCarloRadiation);
+      }
     }
     if (has_key(safety, "clamp_warn_threshold")) {
       numerics.safety.clamp_warn_threshold = strict_int32(
@@ -14699,7 +14213,7 @@ void Builder::set_numerics(py::dict kwargs) {
     }
     if (has_key(safety, "cell_search_fatal")) {
       tenryu::core::log_warning(
-          "Numerics.safety.cell_search_fatal is accepted for compatibility and ignored in M01");
+          "Numerics.safety.cell_search_fatal is accepted for compatibility and has no effect");
     }
   }
   validate_production_audit_config(numerics);
@@ -14959,79 +14473,10 @@ void Builder::set_diagnostics(py::dict kwargs) {
           strict_bool(laser["per_beam"], "Diagnostics.laser_pattern.per_beam");
     }
   }
-  if (has_key(kwargs, "mc_stats")) {
-    const py::handle mc_obj = kwargs["mc_stats"];
-    if (!py::isinstance<py::dict>(mc_obj)) {
-      throw_value_type_error("Diagnostics.mc_stats", "dict", mc_obj);
-    }
-    const py::dict mc = py::reinterpret_borrow<py::dict>(mc_obj);
-    enforce_known_keys(mc, "Diagnostics.mc_stats",
-                       {"enabled", "particle_counts", "weight_stats",
-                        "cell_particle_density", "ddmc_fraction"});
-    if (has_key(mc, "enabled")) {
-      diagnostics.mc_stats.enabled =
-          strict_bool(mc["enabled"], "Diagnostics.mc_stats.enabled");
-    }
-    if (has_key(mc, "particle_counts")) {
-      diagnostics.mc_stats.particle_counts =
-          strict_bool(mc["particle_counts"], "Diagnostics.mc_stats.particle_counts");
-    }
-    if (has_key(mc, "weight_stats")) {
-      diagnostics.mc_stats.weight_stats =
-          strict_bool(mc["weight_stats"], "Diagnostics.mc_stats.weight_stats");
-    }
-    if (has_key(mc, "cell_particle_density")) {
-      diagnostics.mc_stats.cell_particle_density = strict_bool(
-          mc["cell_particle_density"], "Diagnostics.mc_stats.cell_particle_density");
-    }
-    if (has_key(mc, "ddmc_fraction")) {
-      diagnostics.mc_stats.ddmc_fraction =
-          strict_bool(mc["ddmc_fraction"], "Diagnostics.mc_stats.ddmc_fraction");
-    }
-  }
-  if (has_key(kwargs, "fleck_diag")) {
-    const py::handle fleck_obj = kwargs["fleck_diag"];
-    if (!py::isinstance<py::dict>(fleck_obj)) {
-      throw_value_type_error("Diagnostics.fleck_diag", "dict", fleck_obj);
-    }
-    const py::dict fleck = py::reinterpret_borrow<py::dict>(fleck_obj);
-    enforce_known_keys(fleck, "Diagnostics.fleck_diag",
-                       {"enabled", "every", "cells", "r_min_cm", "r_max_cm"});
-    if (has_key(fleck, "enabled")) {
-      diagnostics.fleck_diag.enabled =
-          strict_bool(fleck["enabled"], "Diagnostics.fleck_diag.enabled");
-    }
-    if (has_key(fleck, "every")) {
-      diagnostics.fleck_diag.every =
-          strict_int32(fleck["every"], "Diagnostics.fleck_diag.every");
-      ensure_int_ge(diagnostics.fleck_diag.every, 1, "Diagnostics.fleck_diag.every");
-    }
-    if (has_key(fleck, "cells")) {
-      diagnostics.fleck_diag.cells =
-          strict_int_vector(fleck["cells"], "Diagnostics.fleck_diag.cells");
-      for (const int cell : diagnostics.fleck_diag.cells) {
-        if (cell < 0) {
-          throw ValueError("Diagnostics.fleck_diag.cells entries must be >= 0");
-        }
-      }
-    }
-    if (has_key(fleck, "r_min_cm")) {
-      diagnostics.fleck_diag.r_min_cm = numeric_as_double(
-          fleck["r_min_cm"], "Diagnostics.fleck_diag.r_min_cm");
-    }
-    if (has_key(fleck, "r_max_cm")) {
-      diagnostics.fleck_diag.r_max_cm = numeric_as_double(
-          fleck["r_max_cm"], "Diagnostics.fleck_diag.r_max_cm");
-    }
-
-    const bool has_r_min = diagnostics.fleck_diag.r_min_cm >= 0.0;
-    const bool has_r_max = diagnostics.fleck_diag.r_max_cm >= 0.0;
-    if (has_r_min != has_r_max) {
-      throw ConfigError(
-          "Diagnostics.fleck_diag requires both r_min_cm and r_max_cm when using radius selection");
-    }
-    if (has_r_min && diagnostics.fleck_diag.r_max_cm < diagnostics.fleck_diag.r_min_cm) {
-      throw ValueError("Diagnostics.fleck_diag.r_max_cm must be >= r_min_cm");
+  // The particle statistics and the Fleck-factor log of the retired Monte Carlo radiation.
+  for (const char* section : {"mc_stats", "fleck_diag"}) {
+    if (has_key(kwargs, section)) {
+      warn_ignored_key(std::string("Diagnostics.") + section);
     }
   }
 }
@@ -15093,35 +14538,9 @@ void Builder::set_parallel(py::dict kwargs) {
           strict_int32(halo["ghost_layers"], "Parallel.halo.ghost_layers");
     }
   }
+  // The photon-packet migration between ranks of the Monte Carlo radiation.
   if (has_key(kwargs, "migration")) {
-    const py::handle migration_obj = kwargs["migration"];
-    if (!py::isinstance<py::dict>(migration_obj)) {
-      throw_value_type_error("Parallel.migration", "dict", migration_obj);
-    }
-    const py::dict migration = py::reinterpret_borrow<py::dict>(migration_obj);
-    enforce_known_keys(migration, "Parallel.migration",
-                       {"method", "max_substeps", "emigrant_threshold",
-                        "initial_capacity", "growth_factor"});
-    if (has_key(migration, "method")) {
-      parallel.migration.method =
-          strict_string(migration["method"], "Parallel.migration.method");
-    }
-    if (has_key(migration, "max_substeps")) {
-      parallel.migration.max_substeps =
-          strict_int32(migration["max_substeps"], "Parallel.migration.max_substeps");
-    }
-    if (has_key(migration, "emigrant_threshold")) {
-      parallel.migration.emigrant_threshold = strict_int32(
-          migration["emigrant_threshold"], "Parallel.migration.emigrant_threshold");
-    }
-    if (has_key(migration, "initial_capacity")) {
-      parallel.migration.initial_capacity = strict_int32(
-          migration["initial_capacity"], "Parallel.migration.initial_capacity");
-    }
-    if (has_key(migration, "growth_factor")) {
-      parallel.migration.growth_factor = numeric_as_double(
-          migration["growth_factor"], "Parallel.migration.growth_factor");
-    }
+    tenryu::core::log_warning(std::string("Parallel.migration has no effect; ") + kRetiredMonteCarloRadiation);
   }
 }
 
@@ -15319,12 +14738,6 @@ void Builder::validate() {
   auto& numerics = config.numerics;
   auto& parallel = config.parallel;
   auto& burn = config.burn;
-  const bool radiation_block_called =
-      blocks_called.test(static_cast<std::size_t>(Block::Radiation));
-  if (!radiation_block_called && radiation.mode == RadiationMode::MultigroupDiffusion) {
-    radiation.imc.enabled = false;
-    radiation.ddmc.enabled = false;
-  }
 
   if (!main_name_explicit && main.name == "unnamed") {
     const std::filesystem::path source_path(config.meta.namelist_source_path);
@@ -15529,19 +14942,6 @@ void Builder::validate() {
       }
     }
   }
-  if ((is_dimension_1d(main.dimension) || main.dimension == "2D_RZ") &&
-      radiation.enabled) {
-    const bool mode_ok =
-        radiation.mode == RadiationMode::MultigroupDiffusion ||
-        radiation.mode == RadiationMode::SnTransport;
-    if (!mode_ok) {
-      throw ConfigError(
-          "1D_SPH and 2D_RZ production radiation support only "
-          "Radiation.mode=\"multigroup_diffusion\" or \"sn_transport\". "
-          "Other modes (\"imc_ddmc\" including IMC/DDMC/HOLO/difference "
-          "formulations) are frozen.");
-    }
-  }
   if (laser.enabled) {
     const auto& ports = laser.port_configuration.ports;
     if (!ports.empty()) {
@@ -15629,6 +15029,17 @@ void Builder::validate() {
         throw ConfigError(
             "Laser.cbet.n_section_phi must be in [4, 64] when "
             "Laser.cbet.geometry_mode=\"port_section\"");
+      }
+      // The expanded pair count of port_section v1 (build_chi_ps, NUMERICS §5.10): G = ports x 2 direction
+      // branches x n_impact_bins groups and G(G-1)/2 pairs, at most 65536. It is a configuration limit, checked
+      // here since 2026-09-29 (before, the first CBET solve aborted the run).
+      const std::int64_t groups_ps =
+          static_cast<std::int64_t>(ports.size()) * 2 * static_cast<std::int64_t>(laser.cbet.n_impact_bins);
+      const std::int64_t pairs_ps = groups_ps * (groups_ps - 1) / 2;
+      if (pairs_ps > 65536) {
+        throw ConfigError("Laser.cbet.geometry_mode=\"port_section\" supports at most 65536 expanded pairs "
+                          "(ports x 2 x n_impact_bins groups, G(G-1)/2 pairs); this deck has " +
+                          std::to_string(pairs_ps) + ": reduce the ports or Laser.cbet.n_impact_bins");
       }
     }
   }
@@ -15868,6 +15279,12 @@ void Builder::validate() {
             channel.relaxation_model != "fixed") {
           throw ConfigError(
               path + ".relaxation_model must be \"vu2012\" or \"fixed\"");
+        }
+        // The vu2012 relaxation time is the fit for the two-plasmon-decay channel (hot_e_eta_model.cpp
+        // relaxation_tau_s); an SRS channel set to it used the fixed time without a message until 2026-09-29.
+        if (channel.relaxation_model == "vu2012" && channel.mechanism == "srs") {
+          throw ConfigError(path + ".relaxation_model=\"vu2012\" is the TPD fit; an SRS channel takes "
+                                   "\"fixed\" (relaxation_tau_s)");
         }
         if (!(channel.relaxation_tau_s > 0.0)) {
           throw ConfigError(path + ".relaxation_tau_s must be > 0");
@@ -16690,6 +16107,11 @@ void Builder::validate() {
       mesh.resolution_requirement.detected) {
     throw ConfigError("Mesh.resolution_requirement is 1D only");
   }
+  if (mesh.resolution_requirement.empirical.enabled &&
+      (!config.laser.enabled || !mesh.zoning_intent.enabled ||
+       mesh.zoning_intent.measure == "width")) {
+    throw ConfigError("MESH_EMPIRICAL_INVALID: empirical requires laser and a mass-measure zoning_intent");
+  }
   if (mesh.zoning_intent.enabled) {
     const auto& zoning = mesh.zoning_intent;
     if (!mesh.auto_regions.empty()) {
@@ -16840,6 +16262,9 @@ void Builder::validate() {
       }
 
       if (beam_tables.empty()) {
+        if (mesh.resolution_requirement.empirical.enabled) {
+          throw ConfigError("MESH_EMPIRICAL_INVALID: no beam power callable");
+        }
         tenryu::core::log_warning(
             "[mesh-requirement] enforce requested but no beam power callable; "
             "nothing injected");
@@ -16907,6 +16332,9 @@ void Builder::validate() {
                 inputs,
                 to_mesh_requirement_params(mesh.resolution_requirement));
         if (!report.applicable) {
+          if (mesh.resolution_requirement.empirical.enabled) {
+            throw ConfigError("MESH_EMPIRICAL_INVALID: " + report.reason);
+          }
           tenryu::core::log_info(
               "[mesh-requirement] enforce: not applicable (" +
               report.reason + ")");
@@ -16921,87 +16349,168 @@ void Builder::validate() {
           };
           std::vector<DrMinConflict> dr_min_conflicts;
           std::size_t injected = 0;
+          // Radius ratio of the pieces a payload band is split into in the
+          // spherical and cylindrical measures (area ratio 1.44).
+          constexpr double kPayloadPieceRadiusRatio = 1.2;
+          struct BandPiece {
+            double r_lo_cm, r_hi_cm, conversion_radius_cm, factor;
+          };
+          const bool radial_measure =
+              zic.measure == tenryu::core::ZoningMeasure::kSphericalCellMass ||
+              zic.measure == tenryu::core::ZoningMeasure::kCylindricalLineMass;
+          // Measure exponent p: cell mass is area(r) * rho * dr at leading order
+          // and (area(r) / p) * rho * r at the centre.
+          const double measure_power =
+              zic.measure == tenryu::core::ZoningMeasure::kSphericalCellMass
+                  ? 3.0
+                  : 2.0;
+          // Payload core: the largest radius c <= r_hi with
+          // c * max(rho0 on [r_min, c]) <= a / 2, walking the zoning density
+          // regions outward (rho0 extends the last region beyond its r_end).
+          const auto payload_core_radius = [&](const double a,
+                                               const double r_hi) {
+            double rho_max = 0.0;
+            double r_begin = mesh.r_min;
+            for (const auto& region : zoning.density_regions) {
+              if (!(region.r_end > r_begin)) {
+                continue;
+              }
+              rho_max = std::max(rho_max, region.rho);
+              const double limit =
+                  rho_max > 0.0 ? 0.5 * a / rho_max
+                                : std::numeric_limits<double>::infinity();
+              if (limit < std::min(region.r_end, r_hi)) {
+                return std::max(r_begin, limit);
+              }
+              if (!(region.r_end < r_hi)) {
+                return r_hi;
+              }
+              r_begin = region.r_end;
+            }
+            const double limit =
+                rho_max > 0.0 ? 0.5 * a / rho_max
+                              : std::numeric_limits<double>::infinity();
+            return std::min(r_hi, std::max(r_begin, limit));
+          };
           for (const auto& band : report.bands_recommended) {
             if (!std::isfinite(band.areal_mass_max_g_cm2) ||
                 !(band.areal_mass_max_g_cm2 > 0.0) ||
                 !(band.r_lo_cm < band.r_hi_cm)) {
               continue;
             }
-            const double fraction_begin = std::clamp(
-                tenryu::core::measure_fraction_at(
-                    mesh.r_min, mesh.r_max, zic, rho0, band.r_lo_cm),
-                0.0, 1.0);
-            const double fraction_end = std::clamp(
-                tenryu::core::measure_fraction_at(
-                    mesh.r_min, mesh.r_max, zic, rho0, band.r_hi_cm),
-                0.0, 1.0);
-            if (!(fraction_end > fraction_begin)) {
-              continue;
-            }
 
-            double cell_measure_max = band.areal_mass_max_g_cm2;
-            if (zic.measure ==
-                tenryu::core::ZoningMeasure::kSphericalCellMass) {
-              cell_measure_max =
-                  4.0 * kPi * band.r_lo_cm * band.r_lo_cm *
-                  band.areal_mass_max_g_cm2;
-            } else if (zic.measure ==
-                       tenryu::core::ZoningMeasure::kCylindricalLineMass) {
-              cell_measure_max = 2.0 * kPi * band.r_lo_cm *
-                                 band.areal_mass_max_g_cm2;
-            }
-            if (!(cell_measure_max > 0.0) ||
-                !std::isfinite(cell_measure_max)) {
-              tenryu::core::log_warning(
-                  "[mesh-requirement] skipped band '" + band.kind +
-                  "' (r_lo=" + std::to_string(band.r_lo_cm) +
-                  " cm): its cell-measure bound degenerates to 0 in this "
-                  "measure");
-              continue;
-            }
-            zic.bands.push_back(
-                {fraction_begin, fraction_end, 0.0, cell_measure_max});
-            mesh.resolution_requirement.injected_bands.push_back(
-                {band.kind, fraction_begin, fraction_end, cell_measure_max,
-                 band.areal_mass_max_g_cm2, band.r_lo_cm, band.r_hi_cm});
-            ++injected;
-
-            if (zic.dr_min > 0.0) {
-              double width_admissible =
-                  std::numeric_limits<double>::infinity();
-              for (int j = 0; j <= 64; ++j) {
-                const double r =
-                    band.r_lo_cm + static_cast<double>(j) *
-                                           (band.r_hi_cm - band.r_lo_cm) /
-                                           64.0;
-                const double rho = rho0(r);
-                if (!(rho > 0.0) || !std::isfinite(rho)) {
-                  continue;
+            // The ablation rule measures a cell by its reference areal mass
+            // (cell mass over the reference area 4 pi R0^2 or 2 pi R0, see
+            // mesh_requirement_cell_areal_mass), so formation and ablation
+            // ceilings convert with R0 exactly. The payload (shock) rule bounds
+            // the local areal mass rho * dr: a cell mass bound of area(s) * a
+            // implies rho * dr <= a for every cell above s, so the band is
+            // split into pieces of radius ratio <= 1.2, each converted at its
+            // inner radius. Inside the payload core (see payload_core_radius)
+            // every cell has rho * dr <= a / 2 without a bound; the core piece
+            // is bounded by area(c) * a / p, which admits the whole core as one
+            // cell and keeps rho * dr <= a for a cell reaching from inside the
+            // core into denser material beyond it. The band's own r_lo at the
+            // centre is a round-off residue of the depth-to-radius inversion
+            // (a cube root), never a conversion radius.
+            std::vector<BandPiece> pieces;
+            if (band.kind != "payload" || !radial_measure) {
+              pieces.push_back({band.r_lo_cm, band.r_hi_cm, report.R0_cm, 1.0});
+            } else {
+              double r = band.r_lo_cm;
+              const double core =
+                  payload_core_radius(band.areal_mass_max_g_cm2, band.r_hi_cm);
+              if (!(r > 0.0) || r < core) {
+                if (core > r) {
+                  pieces.push_back({r, core, core, 1.0 / measure_power});
                 }
-                double width = band.areal_mass_max_g_cm2 / rho;
-                if (zic.measure ==
-                    tenryu::core::ZoningMeasure::kSphericalCellMass) {
-                  if (r == 0.0) {
-                    continue;
-                  }
-                  width = cell_measure_max /
-                          (4.0 * kPi * r * r * rho);
-                } else if (zic.measure ==
-                           tenryu::core::ZoningMeasure::kCylindricalLineMass) {
-                  if (r == 0.0) {
-                    continue;
-                  }
-                  width = cell_measure_max / (2.0 * kPi * r * rho);
-                }
-                if (std::isfinite(width)) {
-                  width_admissible = std::min(width_admissible, width);
-                }
+                r = std::max(r, core);
               }
-              if (std::isfinite(width_admissible) &&
-                  width_admissible < zic.dr_min) {
-                dr_min_conflicts.push_back(
-                    {band.kind, band.areal_mass_max_g_cm2, cell_measure_max,
-                     width_admissible});
+              while (r > 0.0 && r < band.r_hi_cm) {
+                const double end =
+                    std::min(band.r_hi_cm, r * kPayloadPieceRadiusRatio);
+                pieces.push_back({r, end, r, 1.0});
+                r = end;
+              }
+            }
+
+            for (const BandPiece& piece : pieces) {
+              const double fraction_begin = std::clamp(
+                  tenryu::core::measure_fraction_at(
+                      mesh.r_min, mesh.r_max, zic, rho0, piece.r_lo_cm),
+                  0.0, 1.0);
+              const double fraction_end = std::clamp(
+                  tenryu::core::measure_fraction_at(
+                      mesh.r_min, mesh.r_max, zic, rho0, piece.r_hi_cm),
+                  0.0, 1.0);
+              if (!(fraction_end > fraction_begin)) {
+                continue;
+              }
+              const double conversion_radius = piece.conversion_radius_cm;
+              double cell_measure_max = band.areal_mass_max_g_cm2;
+              if (zic.measure ==
+                  tenryu::core::ZoningMeasure::kSphericalCellMass) {
+                cell_measure_max =
+                    4.0 * kPi * conversion_radius * conversion_radius *
+                    band.areal_mass_max_g_cm2 * piece.factor;
+              } else if (zic.measure ==
+                         tenryu::core::ZoningMeasure::kCylindricalLineMass) {
+                cell_measure_max = 2.0 * kPi * conversion_radius *
+                                   band.areal_mass_max_g_cm2 * piece.factor;
+              }
+              if (!(cell_measure_max > 0.0) ||
+                  !std::isfinite(cell_measure_max)) {
+                tenryu::core::log_warning(
+                    "[mesh-requirement] skipped band '" + band.kind +
+                    "' (r_lo=" + std::to_string(piece.r_lo_cm) +
+                    " cm): its cell-measure bound degenerates to 0 in this "
+                    "measure");
+                continue;
+              }
+              zic.bands.push_back(
+                  {fraction_begin, fraction_end, 0.0, cell_measure_max});
+              mesh.resolution_requirement.injected_bands.push_back(
+                  {band.kind, fraction_begin, fraction_end, cell_measure_max,
+                   band.areal_mass_max_g_cm2, piece.r_lo_cm, piece.r_hi_cm});
+              ++injected;
+
+              if (zic.dr_min > 0.0) {
+                double width_admissible =
+                    std::numeric_limits<double>::infinity();
+                for (int j = 0; j <= 64; ++j) {
+                  const double r =
+                      piece.r_lo_cm + static_cast<double>(j) *
+                                              (piece.r_hi_cm - piece.r_lo_cm) /
+                                              64.0;
+                  const double rho = rho0(r);
+                  if (!(rho > 0.0) || !std::isfinite(rho)) {
+                    continue;
+                  }
+                  double width = band.areal_mass_max_g_cm2 / rho;
+                  if (zic.measure ==
+                      tenryu::core::ZoningMeasure::kSphericalCellMass) {
+                    if (r == 0.0) {
+                      continue;
+                    }
+                    width = cell_measure_max /
+                            (4.0 * kPi * r * r * rho);
+                  } else if (zic.measure ==
+                             tenryu::core::ZoningMeasure::kCylindricalLineMass) {
+                    if (r == 0.0) {
+                      continue;
+                    }
+                    width = cell_measure_max / (2.0 * kPi * r * rho);
+                  }
+                  if (std::isfinite(width)) {
+                    width_admissible = std::min(width_admissible, width);
+                  }
+                }
+                if (std::isfinite(width_admissible) &&
+                    width_admissible < zic.dr_min) {
+                  dr_min_conflicts.push_back(
+                      {band.kind, band.areal_mass_max_g_cm2, cell_measure_max,
+                       width_admissible});
+                }
               }
             }
           }
@@ -17031,6 +16540,13 @@ void Builder::validate() {
           tenryu::core::log_info(
               "[mesh-requirement] enforce injected " +
               std::to_string(injected) + " bands into zoning_intent");
+          if (report.params.empirical.enabled) {
+            tenryu::core::log_info(
+                "[mesh-requirement] empirical reference_sha256=" +
+                report.params.empirical.reference_sha256 + " apriori_factor=" +
+                std::to_string(report.ceiling_formation_g_cm2 /
+                               report.apriori_ceiling_formation_g_cm2));
+          }
         }
       }
     }
@@ -17361,6 +16877,69 @@ void Builder::validate() {
   // TMAT material, from its /material block; empty when not a TMAT material.
   // Feeds the Laser.ib.zeff_model="auto" resolution below.
   std::vector<SpeciesComposition> tmat_compositions(materials.materials.size());
+  // The deck's mass number against the TMAT file's mean ion mass (NUMERICS §1.1.4): the tables' density axis is the
+  // ion number density, converted with the deck's A, so a molecular mass (D2 = 4 instead of 2) shifts every lookup
+  // by an integer factor. More than 5 % apart is a ConfigError, more than 1 % a warning (decks round A, e.g. DT 2.5
+  // against 2.52). Not checked before 2026-09-29.
+  const auto check_tmat_mass_number = [&](const auto& cmat, const materials::TmatFile& tfile,
+                                          const std::string& path) {
+    const double A_file = tfile.material.Abar_ion_amu;
+    const double rel = std::abs(cmat.A - A_file) / A_file;
+    if (rel > 0.05) {
+      throw ConfigError("Materials.materials[\"" + cmat.name + "\"].A=" + std::to_string(cmat.A) +
+                        " differs from the mean ion mass " + std::to_string(A_file) + " of the TMAT file \"" +
+                        path + "\" by " + std::to_string(100.0 * rel) +
+                        " %: A is the mean mass per ion (CH 6.5, D2 2, DT 2.5), not a molecular mass");
+    }
+    if (rel > 0.01) {
+      tenryu::core::log_warning("Materials.materials[\"" + cmat.name + "\"].A=" + std::to_string(cmat.A) +
+                                " differs from the mean ion mass " + std::to_string(A_file) +
+                                " of the TMAT file \"" + path + "\" by " + std::to_string(100.0 * rel) + " %");
+    }
+  };
+  // The tabular Zbar table of a non-void material (zbar.model = "tabular"): from its IONMIX/TMAT EOS file, else
+  // its IONMIX/TMAT/table_nlte opacity file, else Materials.zbar.table_file. Used by the Zbar tables below and by
+  // the electron split of a SESAME material without a 304 table.
+  const auto load_tabular_zbar_table = [&](const auto& zmat) {
+    std::string zbar_source;
+    bool zbar_source_is_tmat = false;
+    if ((zmat.eos_model == "ionmix" || zmat.eos_model == "tmat") && !zmat.eos_file.empty()) {
+      zbar_source = zmat.eos_file;
+      zbar_source_is_tmat = (zmat.eos_model == "tmat");
+    } else if ((zmat.opacity_model == "table_nlte" || zmat.opacity_model == "ionmix" ||
+                zmat.opacity_model == "tmat") &&
+               !zmat.opacity_file.empty()) {
+      zbar_source = zmat.opacity_file;
+      zbar_source_is_tmat = (zmat.opacity_model == "tmat");
+    } else if (!materials.zbar.table_file.empty()) {
+      zbar_source = materials.zbar.table_file;
+      zbar_source_is_tmat = zbar_source.ends_with(".tmat.h5");
+    }
+    if (zbar_source.empty()) {
+      throw ConfigError("zbar.model='tabular' for material '" + zmat.name +
+                        "' requires tabular source: eos.model in {'ionmix','tmat'}, "
+                        "opacity.model in {'ionmix','table_nlte','tmat'}, or "
+                        "zbar.table_file");
+    }
+    try {
+      materials::IonmixZbarTable table;
+      if (zbar_source_is_tmat) {
+        const materials::TmatFile tmat = materials::load_tmat(zbar_source);
+        if (!tmat.eos.has_value()) {
+          throw ConfigError("TMAT source '" + zbar_source +
+                            "' for zbar.model='tabular' does not contain /eos payload");
+        }
+        table = materials::tmat_eos_to_zbar_table(*tmat.eos, zmat.A);
+      } else {
+        const materials::IonmixEOSData eos_data = materials::load_ionmix_binary_eos(zbar_source);
+        table = materials::ionmix_eos_to_zbar_table(eos_data, zmat.A);
+      }
+      return table;
+    } catch (const std::exception& ex) {
+      throw ConfigError("Failed to build tabular Zbar table for material '" + zmat.name + "' from source '" +
+                        zbar_source + "': " + ex.what());
+    }
+  };
   std::set<std::string> names;
   for (std::size_t material_index = 0;
        material_index < materials.materials.size();
@@ -17471,6 +17050,7 @@ void Builder::validate() {
                           mat.name + "\"].eos.file=\"" + mat.eos_file + "\": " +
                           ex.what());
       }
+      check_tmat_mass_number(mat, tmat, mat.eos_file);
       if (!tmat.eos.has_value()) {
         throw ConfigError("TMAT file \"" + mat.eos_file +
                           "\" has eos.model='tmat' but does not contain /eos payload");
@@ -17590,8 +17170,33 @@ void Builder::validate() {
       // ion table resamples 304 onto the 301 grid before differencing
       // (build_sesame_ion_table) — node-wise subtraction across differently
       // shaped arrays would be out-of-bounds.
+      bool electron_from_304 = true;
       auto [total, electron] = materials::load_sesame(
-          mat.eos_file, mat.sesame_material_id, 0.0, mat.sesame_cold_curve_rows);
+          mat.eos_file, mat.sesame_material_id, 0.0, mat.sesame_cold_curve_rows, &electron_from_304);
+      if (!electron_from_304) {
+        // No 304 table: split the total node by node with the ideal-plasma share Zbar/(1+Zbar) of this material's
+        // ionization model (NUMERICS §1.1.5). Until 2026-09-29 the split used Zbar = 0, so the electron table was
+        // zero everywhere and a 2T run lost the electron EOS.
+        std::function<double(double, double)> zbar_of;
+        if (materials.zbar.model == "thomas_fermi") {
+          const double Z_nuc = mat.Z;
+          const double A_amu = mat.A;
+          zbar_of = [Z_nuc, A_amu](const double rho, const double T_eV) {
+            return materials::compute_zbar_tf(rho, T_eV, Z_nuc, A_amu);
+          };
+        } else if (materials.zbar.model == "tabular") {
+          auto table = std::make_shared<const materials::IonmixZbarTable>(load_tabular_zbar_table(mat));
+          zbar_of = [table](const double rho, const double T_eV) { return table->interpolate(rho, T_eV); };
+        } else {
+          const double z_fixed = (materials.zbar.fixed_value >= 0.0) ? materials.zbar.fixed_value : mat.Z;
+          zbar_of = [z_fixed](const double, const double) { return z_fixed; };
+        }
+        electron = materials::split_sesame_electron_table(total, zbar_of);
+        tenryu::core::log_info("SESAME material '" + mat.name +
+                               "' has no 304 electron table: the electron EOS is the total split node by node by "
+                               "Zbar/(1+Zbar) of Materials.zbar.model=\"" +
+                               materials.zbar.model + "\"");
+      }
       materials::EOSTable ion = materials::build_sesame_ion_table(total, electron);
       mat.eos_tables = std::make_shared<const materials::EOSTableTriplet>(
           materials::EOSTableTriplet{std::move(ion), std::move(electron), std::move(total)});
@@ -17666,11 +17271,6 @@ void Builder::validate() {
         throw ConfigError("Materials.materials[\"" + mat.name +
                           "\"].opacity.file is required for model=" + mat.opacity_model);
       }
-      if (!is_lambda_method(mat.lambda_method)) {
-        throw ConfigError("Materials.materials[\"" + mat.name +
-                          "\"].opacity.lambda_method must be one of "
-                          "{\"finite_difference\", \"freeze_opacity\"}");
-      }
       if (!(mat.lambda_fd_delta_rel > 0.0)) {
         throw ValueError("Materials.materials[\"" + mat.name +
                          "\"].opacity.lambda_fd_delta_rel must be > 0");
@@ -17678,10 +17278,6 @@ void Builder::validate() {
       if (!(mat.lambda_fd_abs_min > 0.0)) {
         throw ValueError("Materials.materials[\"" + mat.name +
                          "\"].opacity.lambda_fd_abs_min must be > 0");
-      }
-      if (!(mat.nlte_f_min > 0.0 && mat.nlte_f_min <= 1.0)) {
-        throw ValueError("Materials.materials[\"" + mat.name +
-                         "\"].opacity.f_min must be in (0, 1]");
       }
 
       materials::IonmixOpacityData ionmix_opacity;
@@ -17704,6 +17300,7 @@ void Builder::validate() {
       } else {
         try {
           const materials::TmatFile tmat = materials::load_tmat(mat.opacity_file);
+          check_tmat_mass_number(mat, tmat, mat.opacity_file);
           if (!tmat.opacity.has_value()) {
             throw ConfigError("TMAT file \"" + mat.opacity_file +
                               "\" has opacity.model='tmat' but does not contain "
@@ -17801,45 +17398,8 @@ void Builder::validate() {
             std::make_shared<const materials::IonmixZbarTable>(make_zero_zbar_table()));
         continue;
       }
-      std::string zbar_source;
-      bool zbar_source_is_tmat = false;
-      if ((mat.eos_model == "ionmix" || mat.eos_model == "tmat") &&
-          !mat.eos_file.empty()) {
-        zbar_source = mat.eos_file;
-        zbar_source_is_tmat = (mat.eos_model == "tmat");
-      } else if ((mat.opacity_model == "table_nlte" || mat.opacity_model == "ionmix" ||
-                  mat.opacity_model == "tmat") &&
-                 !mat.opacity_file.empty()) {
-        zbar_source = mat.opacity_file;
-        zbar_source_is_tmat = (mat.opacity_model == "tmat");
-      } else if (!materials.zbar.table_file.empty()) {
-        zbar_source = materials.zbar.table_file;
-        zbar_source_is_tmat = zbar_source.ends_with(".tmat.h5");
-      }
-
-      TENRYU_ASSERT(!zbar_source.empty(),
-                    "tabular Zbar source must be set after validation");
-
-      try {
-        materials::IonmixZbarTable table;
-        if (zbar_source_is_tmat) {
-          const materials::TmatFile tmat = materials::load_tmat(zbar_source);
-          if (!tmat.eos.has_value()) {
-            throw ConfigError("TMAT source '" + zbar_source +
-                              "' for zbar.model='tabular' does not contain /eos payload");
-          }
-          table = materials::tmat_eos_to_zbar_table(*tmat.eos, mat.A);
-        } else {
-          const materials::IonmixEOSData eos_data =
-              materials::load_ionmix_binary_eos(zbar_source);
-          table = materials::ionmix_eos_to_zbar_table(eos_data, mat.A);
-        }
-        materials.zbar_tables.push_back(
-            std::make_shared<const materials::IonmixZbarTable>(std::move(table)));
-      } catch (const std::exception& ex) {
-        throw ConfigError("Failed to build tabular Zbar table for material '" + mat.name +
-                          "' from source '" + zbar_source + "': " + ex.what());
-      }
+      materials.zbar_tables.push_back(
+          std::make_shared<const materials::IonmixZbarTable>(load_tabular_zbar_table(mat)));
     }
   }
 
@@ -17915,273 +17475,6 @@ void Builder::validate() {
           "log span when E_0 <= 0)");
     }
   }
-  if (!(radiation.imc.alpha > 0.0)) {
-    throw ValueError("Radiation.imc.alpha must be > 0");
-  }
-  if (radiation.imc.particles_per_cell_group < 1) {
-    throw ConfigError("Radiation.imc.particles_per_cell_group must be >= 1");
-  }
-  if (radiation.imc.particle_budget > 0 &&
-      radiation.imc.particle_budget < radiation.imc.particles_per_cell_group) {
-    throw ConfigError(
-        "Radiation.imc.particle_budget must be >= particles_per_cell_group or -1 (disabled)");
-  }
-  if (!(radiation.imc.difference.W_max >= 0.0 &&
-        radiation.imc.difference.W_max <= 1.0)) {
-    throw ValueError("Radiation.imc.difference.W_max must be in [0, 1]");
-  }
-  if (!(radiation.imc.difference.tau0 > 0.0)) {
-    throw ValueError("Radiation.imc.difference.tau0 must be > 0");
-  }
-  if (!(radiation.imc.difference.chi0 > 0.0)) {
-    throw ValueError("Radiation.imc.difference.chi0 must be > 0");
-  }
-  if (radiation.imc.difference.enabled) {
-    if (main.dimension == "2D_RZ" && radiation.imc.difference.face_transport) {
-      throw ConfigError(
-          "Radiation.imc.difference.face_transport=True is not yet supported for "
-          "Main.dimension=\"2D_RZ\". Use face_transport=False.");
-    }
-    if (main.dimension != "1D_SPH" && main.dimension != "2D_RZ") {
-      throw ConfigError(
-          "Radiation.imc.difference.enabled currently requires "
-          "Main.dimension=\"1D_SPH\" or \"2D_RZ\"");
-    }
-  }
-  if (!(radiation.imc.spectral_bias_eta >= 0.0 &&
-        radiation.imc.spectral_bias_eta <= 1.0)) {
-    throw ValueError("Radiation.imc.spectral_bias_eta must be in [0, 1]");
-  }
-  if (!(radiation.imc.sloc_ema_beta >= 0.0 &&
-        radiation.imc.sloc_ema_beta <= 1.0)) {
-    throw ValueError("Radiation.imc.sloc_ema_beta must be in [0, 1]");
-  }
-  if (!(radiation.imc.sloc_sigma_floor > 0.0)) {
-    throw ValueError("Radiation.imc.sloc_sigma_floor must be > 0");
-  }
-  if (!(radiation.imc.sloc_sigma_cap > 0.0)) {
-    throw ValueError("Radiation.imc.sloc_sigma_cap must be > 0");
-  }
-  if (radiation.imc.sloc_sigma_floor > radiation.imc.sloc_sigma_cap) {
-    throw ValueError(
-        "Radiation.imc.sloc_sigma_floor must be <= Radiation.imc.sloc_sigma_cap");
-  }
-  if (!(radiation.imc.sloc_tau_ref > 0.0)) {
-    throw ValueError("Radiation.imc.sloc_tau_ref must be > 0");
-  }
-  const double net_e_source_smoothing_alpha_max =
-      (main.dimension == "2D_RZ" &&
-       radiation.imc.net_e_source_smoothing.enabled)
-          ? 0.125
-          : 0.25;
-  if (!(radiation.imc.net_e_source_smoothing.alpha >= 0.0 &&
-        radiation.imc.net_e_source_smoothing.alpha <=
-            net_e_source_smoothing_alpha_max)) {
-    throw ValueError(
-        "Radiation.imc.net_e_source_smoothing.alpha must be in [0, " +
-        std::to_string(net_e_source_smoothing_alpha_max) + "]");
-  }
-  if (!(radiation.imc.net_e_source_smoothing.tau_threshold > 0.0)) {
-    throw ValueError(
-        "Radiation.imc.net_e_source_smoothing.tau_threshold must be > 0");
-  }
-  if (radiation.imc.net_e_source_smoothing.passes < 0) {
-    throw ValueError("Radiation.imc.net_e_source_smoothing.passes must be >= 0");
-  }
-  if (!(radiation.imc.net_e_source_smoothing.grad_Te_scale > 0.0)) {
-    throw ValueError(
-        "Radiation.imc.net_e_source_smoothing.grad_Te_scale must be > 0");
-  }
-  if (!(radiation.imc.net_e_source_smoothing.grad_rho_scale > 0.0)) {
-    throw ValueError(
-        "Radiation.imc.net_e_source_smoothing.grad_rho_scale must be > 0");
-  }
-  if (radiation.imc.conservative_smoother.passes < 0) {
-    throw ValueError("Radiation.imc.conservative_smoother.passes must be >= 0");
-  }
-  if (!(radiation.imc.conservative_smoother.alpha > 0.0)) {
-    throw ValueError("Radiation.imc.conservative_smoother.alpha must be > 0");
-  }
-  if (radiation.boundary.marshak_particles < 1) {
-    tenryu::core::log_warning(
-        "Radiation.boundary.marshak_particles < 1; clamping to 1");
-    radiation.boundary.marshak_particles = 1;
-  }
-  if (!(radiation.ddmc.tau_ddmc >= 1.0)) {
-    throw ValueError("Radiation.ddmc.tau_ddmc must be >= 1");
-  }
-  if (!(radiation.ddmc.tau_rw >= 0.0)) {
-    throw ValueError("Radiation.ddmc.tau_rw must be >= 0");
-  }
-  if (radiation.ddmc.tau_ddmc_off >= 0.0 &&
-      !(radiation.ddmc.tau_ddmc_off >= 0.5 &&
-        radiation.ddmc.tau_ddmc_off <= radiation.ddmc.tau_ddmc)) {
-    throw ValueError("Radiation.ddmc.tau_ddmc_off must satisfy "
-                     "tau_ddmc_off < 0 or (0.5 <= tau_ddmc_off <= tau_ddmc)");
-  }
-  if (radiation.ddmc.omega_ddmc_off >= 0.0 &&
-      !(radiation.ddmc.omega_ddmc_off >= 0.0 &&
-        radiation.ddmc.omega_ddmc_off <= radiation.ddmc.omega_ddmc)) {
-    throw ValueError("Radiation.ddmc.omega_ddmc_off must satisfy "
-                     "omega_ddmc_off < 0 or (0 <= omega_ddmc_off <= omega_ddmc)");
-  }
-  if (radiation.ddmc.mode_hold < 0 || radiation.ddmc.mode_hold > 100) {
-    throw ValueError("Radiation.ddmc.mode_hold must satisfy 0 <= mode_hold <= 100");
-  }
-  if (!(radiation.ddmc.rate_max > 0.0)) {
-    throw ValueError("Radiation.ddmc.rate_max must be > 0");
-  }
-  if (!(radiation.diffusion.tau_on >= radiation.diffusion.tau_off &&
-        radiation.diffusion.tau_off > 0.0)) {
-    throw ValueError(
-        "Radiation.diffusion must satisfy tau_on >= tau_off > 0");
-  }
-  if (!(radiation.diffusion.reduced_flux_on >= 0.0 &&
-        radiation.diffusion.reduced_flux_on <= radiation.diffusion.reduced_flux_off &&
-        radiation.diffusion.reduced_flux_off <= 1.0)) {
-    throw ValueError(
-        "Radiation.diffusion must satisfy 0 <= reduced_flux_on <= reduced_flux_off <= 1");
-  }
-  if (radiation.diffusion.mode_update_interval < 1) {
-    throw ValueError("Radiation.diffusion.mode_update_interval must be >= 1");
-  }
-  if (radiation.diffusion.min_diffusion_island_cells < 1) {
-    throw ValueError("Radiation.diffusion.min_diffusion_island_cells must be >= 1");
-  }
-  if (radiation.diffusion.imc_guard_cells < 1) {
-    throw ValueError("Radiation.diffusion.imc_guard_cells must be >= 1");
-  }
-  if (radiation.diffusion.sts_max_stages < 0) {
-    throw ValueError("Radiation.diffusion.sts_max_stages must be >= 0");
-  }
-  if (!(radiation.diffusion.sts_damping > 0.0 &&
-        radiation.diffusion.sts_damping < 1.0)) {
-    throw ValueError("Radiation.diffusion.sts_damping must be in (0, 1)");
-  }
-  if (!(radiation.diffusion.sts_subcycle_eta > 0.0 &&
-        radiation.diffusion.sts_subcycle_eta <= 1.0)) {
-    throw ValueError("Radiation.diffusion.sts_subcycle_eta must be in (0, 1]");
-  }
-  if (radiation.diffusion.interface_particles_per_face_group < 1) {
-    throw ValueError(
-        "Radiation.diffusion.interface_particles_per_face_group must be >= 1");
-  }
-  if (radiation.diffusion.exit_particles_per_cell_group < 1) {
-    throw ValueError(
-        "Radiation.diffusion.exit_particles_per_cell_group must be >= 1");
-  }
-  if (!(radiation.diffusion.lte_entry_energy_fraction_cap >= 0.0)) {
-    throw ValueError(
-        "Radiation.diffusion.lte_entry_energy_fraction_cap must be >= 0");
-  }
-  if (!(radiation.holo.coupling_tau >= 0.0)) {
-    throw ValueError("Radiation.holo.coupling_tau must be >= 0");
-  }
-  if (radiation.holo.guard_cells < 0) {
-    throw ValueError("Radiation.holo.guard_cells must be >= 0");
-  }
-  if (radiation.holo.blend_cells < 0) {
-    throw ValueError("Radiation.holo.blend_cells must be >= 0");
-  }
-  if (radiation.holo.min_lo_cells < 0) {
-    throw ValueError("Radiation.holo.min_lo_cells must be >= 0");
-  }
-  if (!(radiation.holo.q_min >= 0.0 &&
-        radiation.holo.q_min <= radiation.holo.q_max &&
-        radiation.holo.q_max <= 1.0)) {
-    throw ValueError("Radiation.holo must satisfy 0 <= q_min <= q_max <= 1");
-  }
-  const bool holo_legacy_tau =
-      radiation.holo.tau_on == 0.0 && radiation.holo.tau_off == 0.0;
-  if (!holo_legacy_tau &&
-      !(radiation.holo.tau_on >= radiation.holo.tau_off &&
-        radiation.holo.tau_off > 0.0)) {
-    throw ValueError(
-        "Radiation.holo must satisfy tau_on >= tau_off > 0, or tau_on=tau_off=0");
-  }
-  if (!(radiation.holo.reduced_flux_on >= 0.0 &&
-        radiation.holo.reduced_flux_on <= radiation.holo.reduced_flux_off &&
-        radiation.holo.reduced_flux_off <= 1.0)) {
-    throw ValueError(
-        "Radiation.holo must satisfy 0 <= reduced_flux_on <= reduced_flux_off <= 1");
-  }
-  if (radiation.holo.update_interval < 1) {
-    throw ValueError("Radiation.holo.update_interval must be >= 1");
-  }
-  if (radiation.holo.hold_on < 0) {
-    throw ValueError("Radiation.holo.hold_on must be >= 0");
-  }
-  if (radiation.holo.min_dwell_steps < 0) {
-    throw ValueError("Radiation.holo.min_dwell_steps must be >= 0");
-  }
-  if (radiation.holo.min_island_cells < 1) {
-    throw ValueError("Radiation.holo.min_island_cells must be >= 1");
-  }
-  if (radiation.holo.core_margin_cells < 0) {
-    throw ValueError("Radiation.holo.core_margin_cells must be >= 0");
-  }
-  if (radiation.holo.region != "shell") {
-    throw ConfigError("Radiation.holo.region must be \"shell\" in v1");
-  }
-  if (radiation.holo.material_group != "shell") {
-    throw ConfigError("Radiation.holo.material_group must be \"shell\" in v1");
-  }
-  if (radiation.holo.solver != "implicit_1d" &&
-      radiation.holo.solver != "quasidiffusion_1d") {
-    throw ConfigError(
-        "Radiation.holo.solver must be \"implicit_1d\" or \"quasidiffusion_1d\"");
-  }
-  if (radiation.holo.closure != "diffusion") {
-    throw ConfigError("Radiation.holo.closure must be \"diffusion\" in v1");
-  }
-  if (!(radiation.holo.closure_relax >= 0.0 &&
-        radiation.holo.closure_relax <= 1.0)) {
-    throw ValueError("Radiation.holo.closure_relax must be in [0, 1]");
-  }
-  if (radiation.holo.closure_smooth_passes < 0) {
-    throw ValueError("Radiation.holo.closure_smooth_passes must be >= 0");
-  }
-  if (!(radiation.holo.closure_smooth_alpha >= 0.0 &&
-        radiation.holo.closure_smooth_alpha <= 1.0)) {
-    throw ValueError("Radiation.holo.closure_smooth_alpha must be in [0, 1]");
-  }
-  if (!(radiation.holo.consistency_alpha >= 0.0 &&
-        radiation.holo.consistency_alpha <= 1.0)) {
-    throw ValueError("Radiation.holo.consistency_alpha must be in [0, 1]");
-  }
-  if (radiation.holo.boundary_flux != "physical") {
-    throw ConfigError(
-        "Radiation.holo.boundary_flux must be \"physical\" in v1");
-  }
-  if (radiation.holo.sn_n_angles < 2 || (radiation.holo.sn_n_angles % 2) != 0) {
-    throw ValueError("Radiation.holo.sn_n_angles must be an even integer >= 2");
-  }
-  if (radiation.holo.sn_material_coupling && !radiation.holo.sn_closure) {
-    throw ValueError(
-        "Radiation.holo.sn_material_coupling requires Radiation.holo.sn_closure=true");
-  }
-  if (radiation.holo.residual_particles_per_cell_group < 1) {
-    throw ValueError(
-        "Radiation.holo.residual_particles_per_cell_group must be >= 1");
-  }
-  if (radiation.holo.enabled) {
-    tenryu::core::log_warning(
-        "Radiation.holo.enabled=true: HOLO is experimental and not validated "
-        "for production use. Use Radiation.imc.difference for production "
-        "oscillation reduction.");
-    if (radiation.imc.difference.enabled) {
-      throw ValueError("Radiation.holo.enabled and Radiation.imc.difference.enabled "
-                       "cannot both be true. HOLO+DF simultaneous operation is not "
-                       "supported. Use difference formulation (DF) only for production.");
-    }
-  }
-  if (radiation.holo.enabled && main.dimension == "2D_RZ" &&
-      !radiation.holo.sn_material_coupling) {
-    tenryu::core::log_warning(
-        "Radiation.holo.enabled=True is only supported for Main.dimension=\"1D_SPH\" "
-        "in v1; disabling HOLO for 2D_RZ");
-    radiation.holo.enabled = false;
-  }
   if (!radiation.compute_T_range_eV.empty() &&
       radiation.compute_T_range_eV.size() != 2U) {
     throw ConfigError("Radiation.compute_T_range_eV must be list[2] when specified");
@@ -18208,6 +17501,15 @@ void Builder::validate() {
       !valid_temperature_range(radiation.planck_fraction.compute_T_range_eV)) {
     throw ValueError(
         "Radiation.groups.planck_fraction.compute_T_range_eV must satisfy [Tmin>0, Tmax>Tmin]");
+  }
+  // The group count is final here: the first TMAT/IONMIX opacity table replaced Radiation.groups above. The
+  // per-cell workspace of the exponential Rosenbrock source integrator holds at most 96 groups (fld_1d_gpu.cu
+  // kMaxG), so the parse-time check on the deck's own group count is repeated on the final one (before
+  // 2026-09-29 a table with more groups passed and every cell's exchange was rejected at run time).
+  if (radiation.multigroup_diffusion.source_integrator == "exp_rosenbrock" && radiation.groups > 96) {
+    throw ConfigError("Radiation.multigroup_diffusion.source_integrator=\"exp_rosenbrock\" supports at most 96 "
+                      "groups; the opacity table sets " +
+                      std::to_string(radiation.groups));
   }
   if (!radiation.group_bounds_eV.empty()) {
     const std::size_t expected_bounds_size =
@@ -18508,7 +17810,7 @@ void Builder::validate() {
   // Radiation.boundary face settings are silently ignored in FLD mode
   // (the GXII deck hides this by keeping both consistent). Reject
   // non-default top-level faces under FLD so decks cannot diverge
-  // silently. The top-level marshak_Tr_eV/marshak_particles VALUE
+  // silently. The top-level marshak_Tr_eV/marshak_Tr VALUE
   // channels remain legal (consumed by the marshak machinery).
   if (radiation.enabled &&
       radiation.mode == RadiationMode::MultigroupDiffusion) {
@@ -18520,6 +17822,30 @@ void Builder::validate() {
           "Radiation.mode=\"multigroup_diffusion\" ignores the top-level"
           " Radiation.boundary face settings; set"
           " Radiation.multigroup_diffusion.boundary instead");
+    }
+  }
+  // The FLD transports with the absorption opacities only (the diffusion coefficient and the limiter use the
+  // Rosseland absorption opacity; multimat_opacity_1d.cuh): a constant scattering opacity is used by the S_N solvers
+  // alone. Until 2026-09-29 an FLD deck with kappa_s > 0 ran as if it were 0.
+  if (radiation.enabled && radiation.mode == RadiationMode::MultigroupDiffusion) {
+    for (const auto& mat : materials.materials) {
+      if (!mat.is_void && mat.kappa_s_constant > 0.0) {
+        throw ConfigError("Materials.materials[\"" + mat.name + "\"].opacity.kappa_s > 0 is not used by "
+                          "Radiation.mode=\"multigroup_diffusion\" (the FLD has no scattering); set it to 0 or use "
+                          "sn_transport");
+      }
+    }
+  }
+  // The S_N solvers honor only Radiation.sn_transport.boundary as well: the top-level face settings were
+  // accepted and ignored in S_N mode until 2026-09-29 (a deck with outer_r="marshak" there ran a vacuum outer
+  // face). The marshak_Tr_eV/marshak_Tr value channels stay legal, as under FLD.
+  if (radiation.enabled && radiation.mode == RadiationMode::SnTransport) {
+    const auto& b = radiation.boundary;
+    if (b.type != "vacuum" || b.inner_r != "reflect" || b.outer_r != "vacuum" || b.bottom_z != "vacuum" ||
+        b.top_z != "vacuum") {
+      throw ConfigError(
+          "Radiation.mode=\"sn_transport\" ignores the top-level Radiation.boundary face settings; set"
+          " Radiation.sn_transport.boundary instead");
     }
   }
   // wk finding (b): a Z=0 (neutral) material under the deterministic
@@ -18649,11 +17975,12 @@ void Builder::validate() {
         "Radiation.sn_transport.n_angles=8 selected; verify S8/S16 angular "
         "error is acceptable for production use");
   }
-  if (radiation.sn_transport.diffusion_fallback_mode != "none" &&
-      radiation.sn_transport.diffusion_fallback_mode != "per_group_hysteresis") {
+  // No S_N solver reads the diffusion-fallback keys: "per_group_hysteresis" was accepted and did nothing until
+  // 2026-09-29. Only "none" is accepted now; tau_diffusion_on/off stay readable (frozen configs carry them).
+  if (radiation.sn_transport.diffusion_fallback_mode != "none") {
     throw ConfigError(
-        "Radiation.sn_transport.diffusion_fallback_mode must be \"none\" or "
-        "\"per_group_hysteresis\"");
+        "Radiation.sn_transport.diffusion_fallback_mode must be \"none\": the per-group diffusion fallback "
+        "(\"per_group_hysteresis\") is not implemented in any S_N solver");
   }
   if (!(radiation.sn_transport.tau_diffusion_on >= 0.0)) {
     throw ValueError("Radiation.sn_transport.tau_diffusion_on must be >= 0");
@@ -18808,24 +18135,6 @@ void Builder::validate() {
       throw ConfigError(
           "Radiation.mode=multigroup_diffusion requires Main.dimension=\"1D_SPH\" or \"2D_RZ\"");
     }
-    const auto reject_conflict = [](const char* which) {
-      throw ConfigError(std::string(
-          "Radiation.mode=multigroup_diffusion requires imc/ddmc/holo/difference "
-          "all disabled; got ") +
-                        which + "=True");
-    };
-    if (radiation.imc.enabled) {
-      reject_conflict("Radiation.imc.enabled");
-    }
-    if (radiation.ddmc.enabled) {
-      reject_conflict("Radiation.ddmc.enabled");
-    }
-    if (radiation.holo.enabled) {
-      reject_conflict("Radiation.holo.enabled");
-    }
-    if (radiation.imc.difference.enabled) {
-      reject_conflict("Radiation.imc.difference.enabled");
-    }
   }
   if (radiation.mode == RadiationMode::SnTransport) {
     if (radiation.enabled &&
@@ -18837,103 +18146,7 @@ void Builder::validate() {
       throw ConfigError(
           "Radiation.mode=sn_transport requires diffusion_fallback_mode=\"none\" in Cut-1b");
     }
-    const auto reject_conflict = [](const char* which) {
-      throw ConfigError(std::string(
-          "Radiation.mode=sn_transport requires imc/ddmc/holo/difference "
-          "all disabled; got ") +
-                        which + "=True");
-    };
-    if (radiation.imc.enabled) {
-      reject_conflict("Radiation.imc.enabled");
-    }
-    if (radiation.ddmc.enabled) {
-      reject_conflict("Radiation.ddmc.enabled");
-    }
-    if (radiation.holo.enabled) {
-      reject_conflict("Radiation.holo.enabled");
-    }
-    if (radiation.imc.difference.enabled) {
-      reject_conflict("Radiation.imc.difference.enabled");
-    }
   }
-  if (!is_ddmc_leak_stencil(radiation.ddmc.leak_stencil)) {
-    throw ConfigError(
-        "Radiation.ddmc.leak_stencil must be \"4\" or \"9_kershaw\"");
-  }
-  if (!is_ddmc_interface_method(radiation.ddmc.interface_method)) {
-    throw ConfigError("Radiation.ddmc.interface_method must be one of "
-                      "{\"asymptotic_diffusion_limit\", \"marshak\", "
-                      "\"cleveland_gentile\"}");
-  }
-  if (!is_ddmc_interface_exit_distribution(radiation.ddmc.interface_exit_distribution)) {
-    throw ConfigError(
-        "Radiation.ddmc.interface_exit_distribution must be \"cosine\" or \"half_isotropic\"");
-  }
-  if (!is_ddmc_face_opacity_temperature(radiation.ddmc.face_opacity_temperature)) {
-    throw ConfigError(
-        "Radiation.ddmc.face_opacity_temperature must be \"radiative_mean\"");
-  }
-  if (!radiation.enabled && radiation.ddmc.enabled) {
-    tenryu::core::log_warning(
-        "Radiation.enabled=False with ddmc.enabled=True; DDMC settings will be ignored");
-  }
-  if (radiation.ddmc.interface_method != "asymptotic_diffusion_limit") {
-    tenryu::core::log_warning(
-        "Radiation.ddmc.interface_method=\"" + radiation.ddmc.interface_method +
-        "\" is parsed but not implemented in v1.0; using asymptotic_diffusion_limit");
-  }
-  if (radiation.imc.census_comb.enabled) {
-    if (radiation.imc.census_comb.max_particles < 1) {
-      throw ConfigError("Radiation.imc.census_comb.max_particles must be >= 1");
-    }
-    if (radiation.imc.census_comb.min_per_bin < 1) {
-      throw ConfigError("Radiation.imc.census_comb.min_per_bin must be >= 1");
-    }
-    if (!(radiation.imc.census_comb.trigger_ratio > 0.0)) {
-      throw ValueError("Radiation.imc.census_comb.trigger_ratio must be > 0");
-    }
-    if (!(radiation.imc.census_comb.target_fraction > 0.0 &&
-          radiation.imc.census_comb.target_fraction <= 1.0)) {
-      throw ValueError("Radiation.imc.census_comb.target_fraction must be in (0, 1]");
-    }
-    if (!(radiation.imc.census_comb.mode_weight_imc > 0.0)) {
-      throw ValueError("Radiation.imc.census_comb.mode_weight_imc must be > 0");
-    }
-    if (!(radiation.imc.census_comb.mode_weight_ddmc > 0.0)) {
-      throw ValueError("Radiation.imc.census_comb.mode_weight_ddmc must be > 0");
-    }
-    if (!(radiation.imc.census_comb.adaptive_util_start >= 0.0 &&
-          radiation.imc.census_comb.adaptive_util_start <
-              radiation.imc.census_comb.adaptive_util_end &&
-          radiation.imc.census_comb.adaptive_util_end <= 1.0)) {
-      throw ValueError(
-          "Radiation.imc.census_comb adaptive util must satisfy 0 <= start < end <= 1");
-    }
-    if (!(radiation.imc.census_comb.trigger_ratio >=
-          radiation.imc.census_comb.trigger_ratio_floor)) {
-      throw ValueError("Radiation.imc.census_comb.trigger_ratio must be >= trigger_ratio_floor");
-    }
-    if (!(radiation.imc.census_comb.trigger_ratio_floor >=
-          radiation.imc.census_comb.target_fraction +
-              radiation.imc.census_comb.trigger_hysteresis)) {
-      throw ValueError(
-          "Radiation.imc.census_comb.trigger_ratio_floor must be >= "
-          "target_fraction + trigger_hysteresis");
-    }
-    if (!(radiation.imc.census_comb.trigger_hysteresis >= 0.0)) {
-      throw ValueError("Radiation.imc.census_comb.trigger_hysteresis must be >= 0");
-    }
-    if (!(radiation.imc.census_comb.ess_min_tier0 > 0.0)) {
-      throw ValueError("Radiation.imc.census_comb.ess_min_tier0 must be > 0");
-    }
-    if (!(radiation.imc.census_comb.ess_min_tier1 > 0.0)) {
-      throw ValueError("Radiation.imc.census_comb.ess_min_tier1 must be > 0");
-    }
-    if (!(radiation.imc.census_comb.max_split_factor >= 1)) {
-      throw ConfigError("Radiation.imc.census_comb.max_split_factor must be >= 1");
-    }
-  }
-
   if (laser.mode.empty()) {
     laser.mode = (main.dimension == "2D_RZ") ? "raytrace_3d" : "raytrace_2d";
   }
@@ -18970,11 +18183,13 @@ void Builder::validate() {
   if (laser.ray_output_max_steps < 1 || laser.ray_output_max_steps > 100000) {
     throw ValueError("Laser.ray_output_max_steps must be in [1, 100000]");
   }
-  if (!(laser.absorption.eps_n > 0.0 && laser.absorption.eps_n < 1.0)) {
-    throw ValueError("Laser.absorption.eps_n must be in (0, 1)");
+  // (0, 0.1] (SPECIFICATION §6.4.6): the refractive-index floor and the critical margin are small parameters;
+  // values up to 1 were accepted until 2026-09-29.
+  if (!(laser.absorption.eps_n > 0.0 && laser.absorption.eps_n <= 0.1)) {
+    throw ValueError("Laser.absorption.eps_n must be in (0, 0.1]");
   }
-  if (!(laser.absorption.coulomb_log_floor > 0.0)) {
-    throw ValueError("Laser.absorption.coulomb_log_floor must be > 0");
+  if (!(laser.absorption.coulomb_log_floor >= 1.0 && laser.absorption.coulomb_log_floor <= 30.0)) {
+    throw ValueError("Laser.absorption.coulomb_log_floor must be in [1, 30]");
   }
   if (!(laser.lasermesh.nr >= 4 && laser.lasermesh.nz >= 4)) {
     throw ValueError("Laser.lasermesh.nr/nz must be >= 4");
@@ -18982,8 +18197,13 @@ void Builder::validate() {
   if (!(laser.lasermesh.nr_max >= 4)) {
     throw ValueError("Laser.lasermesh.nr_max must be >= 4");
   }
-  if (!(laser.lasermesh.r_max_factor > 0.0 && laser.lasermesh.z_span_factor > 0.0)) {
-    throw ValueError("Laser.lasermesh.r_max_factor/z_span_factor must be > 0");
+  // SPECIFICATION §6.4.6 range [1, 5]: below 1 the laser mesh does not reach the target's outer radius (only > 0
+  // was checked before 2026-09-29).
+  if (!(laser.lasermesh.r_max_factor >= 1.0 && laser.lasermesh.r_max_factor <= 5.0)) {
+    throw ValueError("Laser.lasermesh.r_max_factor must be in [1, 5]");
+  }
+  if (!(laser.lasermesh.z_span_factor > 0.0)) {
+    throw ValueError("Laser.lasermesh.z_span_factor must be > 0");
   }
   if (!(laser.lasermesh.min_ratio > 0.0 && laser.lasermesh.min_ratio <= 1.0)) {
     throw ValueError("Laser.lasermesh.min_ratio must be in (0, 1]");
@@ -19001,8 +18221,8 @@ void Builder::validate() {
   if (!(laser.raytrace.intensity_cutoff >= 0.0)) {
     throw ValueError("Laser.raytrace.intensity_cutoff must be >= 0");
   }
-  if (!(laser.raytrace.eps_crit > 0.0 && laser.raytrace.eps_crit < 1.0)) {
-    throw ValueError("Laser.raytrace.eps_crit must be in (0, 1)");
+  if (!(laser.raytrace.eps_crit > 0.0 && laser.raytrace.eps_crit <= 0.1)) {
+    throw ValueError("Laser.raytrace.eps_crit must be in (0, 0.1]");
   }
   if (laser.raytrace.max_steps < 1) {
     throw ValueError("Laser.raytrace.max_steps must be >= 1");
@@ -19418,16 +18638,24 @@ void Builder::validate() {
     }
   }
 
+  // The 1D S_N schemes add the external volume source to group 0 only (sn_transport_1d_gpu.cu,
+  // sn_ld_1d_gpu.cu): like the 1D FLD (above), the source is grey. Until 2026-09-29 a multigroup S_N deck was
+  // accepted and ran with the whole source in the lowest group.
+  if (main.dimension == "1D_SPH" && radiation.enabled && radiation.mode == RadiationMode::SnTransport &&
+      radiation.volume_source_rate > 0.0) {
+    if (radiation.groups != 1) {
+      throw ConfigError("Radiation.volume_source_rate requires groups=1 (grey) for 1D_SPH sn_transport");
+    }
+    if (!(radiation.volume_source_x_max > 0.0)) {
+      throw ConfigError("Radiation.volume_source_x_max must be > 0 when Radiation.volume_source_rate > 0");
+    }
+  }
+
   // W-G: non-spherical 1D geometry support boundaries.
   if (config.mesh.geometry_1d != "spherical") {
     if (main.dimension != "1D_SPH") {
       throw ConfigError(
           "Mesh.geometry_1d is 1D-only; remove it for Main.dimension=\"2D_RZ\"");
-    }
-    if (radiation.enabled && radiation.mode == RadiationMode::ImcDdmc) {
-      throw ConfigError(
-          "Mesh.geometry_1d != \"spherical\" is not supported for the legacy"
-          " imc_ddmc radiation mode");
     }
     if (config.mesh.geometry_1d == "cylindrical" && radiation.enabled &&
         radiation.mode == RadiationMode::SnTransport) {
@@ -20532,19 +19760,14 @@ void Builder::validate() {
         "Numerics.diagnostics.mesh_degeneracy_forensics."
         "velocity_history_max_records must be >= 0");
   }
-  if (!(numerics.dt.f_min_fleck > 0.0 && numerics.dt.f_min_fleck <= 1.0)) {
-    throw ValueError("Numerics.dt.f_min_fleck must be in (0, 1]");
-  }
-  if (radiation.imc.f_max < numerics.dt.f_min_fleck) {
-    throw ConfigError("f_max < f_min_fleck is invalid");
-  }
 
-  ensure_non_negative(mesh.floors.rho_floor_gcc, "Mesh.floors.rho_floor_gcc");
-  ensure_non_negative(mesh.floors.Te_floor_eV, "Mesh.floors.Te_floor_eV");
-  ensure_non_negative(mesh.floors.Ti_floor_eV, "Mesh.floors.Ti_floor_eV");
-  ensure_non_negative(numerics.floors.rho, "Numerics.floors.rho");
-  ensure_non_negative(numerics.floors.Te, "Numerics.floors.Te");
-  ensure_non_negative(numerics.floors.Ti, "Numerics.floors.Ti");
+  // SPECIFICATION §6.4.2: the floors are > 0 (>= 0 was accepted before 2026-09-29).
+  ensure_positive(mesh.floors.rho_floor_gcc, "Mesh.floors.rho_floor_gcc");
+  ensure_positive(mesh.floors.Te_floor_eV, "Mesh.floors.Te_floor_eV");
+  ensure_positive(mesh.floors.Ti_floor_eV, "Mesh.floors.Ti_floor_eV");
+  ensure_positive(numerics.floors.rho, "Numerics.floors.rho");
+  ensure_positive(numerics.floors.Te, "Numerics.floors.Te");
+  ensure_positive(numerics.floors.Ti, "Numerics.floors.Ti");
   if (config.output.directory.empty()) {
     throw ConfigError("Output.directory must not be empty");
   }
@@ -20582,15 +19805,6 @@ void Builder::validate() {
   if (parallel.halo.ghost_layers < 1) {
     throw ConfigError("Parallel.halo.ghost_layers must be >= 1");
   }
-  if (parallel.migration.max_substeps < 1) {
-    throw ConfigError("Parallel.migration.max_substeps must be >= 1");
-  }
-  if (parallel.migration.emigrant_threshold < 1) {
-    throw ConfigError("Parallel.migration.emigrant_threshold must be >= 1");
-  }
-  if (parallel.migration.initial_capacity < 1) {
-    throw ConfigError("Parallel.migration.initial_capacity must be >= 1");
-  }
 
   // dt cross-field consistency
   if (!(numerics.dt.initial_s > 0.0 || numerics.dt.initial_s < 0.0)) {
@@ -20605,8 +19819,10 @@ void Builder::validate() {
   if (numerics.dt.min_s > numerics.dt.max_s) {
     throw ConfigError("Numerics.dt.min_s must be <= max_s");
   }
-  if (!(numerics.dt.growth_factor >= 1.0)) {
-    throw ValueError("Numerics.dt.growth_factor must be >= 1.0");
+  // [1, 2] (SPECIFICATION §6.4.7; 1 is accepted with the warning below); the upper bound was not checked before
+  // 2026-09-29.
+  if (!(numerics.dt.growth_factor >= 1.0 && numerics.dt.growth_factor <= 2.0)) {
+    throw ValueError("Numerics.dt.growth_factor must be in [1.0, 2.0]");
   }
   if (numerics.dt.growth_factor <= 1.0) {
     tenryu::core::log_warning(
@@ -20616,11 +19832,6 @@ void Builder::validate() {
   }
   if (numerics.dt.floor_stall_max_consecutive_steps < 0) {
     throw ValueError("Numerics.dt.floor_stall_max_consecutive_steps must be >= 0");
-  }
-
-  // opacity clamp consistency
-  if (numerics.safety.opacity_floor > numerics.safety.opacity_cap) {
-    throw ConfigError("Numerics.safety.opacity_floor must be <= opacity_cap");
   }
 
   const auto validate_time_callable_numeric =

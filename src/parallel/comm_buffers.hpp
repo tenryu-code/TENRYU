@@ -76,8 +76,6 @@ struct CommBuffers {
   DeviceArray recv_halo[MAX_NEIGHBORS];
   PinnedArray host_send[MAX_NEIGHBORS];
   PinnedArray host_recv[MAX_NEIGHBORS];
-  DeviceArray emigrant_send;
-  DeviceArray emigrant_recv;
 
   void resize_if_needed(std::size_t required);
   bool gpu_aware_mpi = false;

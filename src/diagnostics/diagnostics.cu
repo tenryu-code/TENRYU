@@ -1084,6 +1084,9 @@ LaserPatternDiagnostics compute_laser_pattern(const core::State& state,
     out.cbet_ledger_residual_rel = laser_mesh->last_cbet_ledger_residual;
     out.cbet_iterations = static_cast<std::int64_t>(laser_mesh->last_cbet_iterations);
     out.cbet_clamp_count = std::max<std::int64_t>(0, laser_mesh->last_cbet_clamp_count);
+    out.cbet_converged = laser_mesh->last_cbet_converged ? 1 : 0;
+    out.cbet_convergence_residual = laser_mesh->last_cbet_conv_final;
+    out.cbet_overflow_rays = std::max<std::int64_t>(0, laser_mesh->last_cbet_overflow_rays);
     out.critical_surface_hit_count =
         std::max<std::int64_t>(0, laser_mesh->last_critical_surface_hit_count);
     if (out.commanded_power_total > 0.0) {

@@ -243,8 +243,6 @@ core::Config mg_make_config(const int n_cells,
   cfg.radiation.mode = core::RadiationMode::MultigroupDiffusion;
   cfg.radiation.groups = static_cast<int>(bounds_eV.size()) - 1;
   cfg.radiation.group_bounds_eV = bounds_eV;
-  cfg.radiation.imc.enabled = false;
-  cfg.radiation.ddmc.enabled = false;
   cfg.radiation.multigroup_diffusion.flux_limiter = "levermore_pomraning";
   cfg.radiation.multigroup_diffusion.outer_tol = 1.0e-10;
   cfg.radiation.multigroup_diffusion.max_outer_iterations = 8;

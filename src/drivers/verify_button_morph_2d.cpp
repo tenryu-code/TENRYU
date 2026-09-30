@@ -177,8 +177,6 @@ core::Config make_button_morph_config(const char* name,
   cfg.diagnostics.areal_density.enabled = false;
   cfg.diagnostics.sphericity.enabled = false;
   cfg.diagnostics.laser_pattern.enabled = false;
-  cfg.diagnostics.mc_stats.enabled = false;
-  cfg.diagnostics.fleck_diag.enabled = false;
   cfg.diagnostics.overshoot_monitor = false;
   cfg.numerics.diagnostics.dt_breakdown_history_enabled = false;
   cfg.numerics.diagnostics.shock_approach.enabled = false;

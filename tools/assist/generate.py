@@ -26,6 +26,27 @@ Rules:
 - Satisfy every requirement in the SPEC section. Do not invent physics settings the spec does not imply; prefer omitting a key so solver defaults apply.
 - If a requirement is ambiguous or missing information you need, output instead a single line starting with 'UNCERTAIN: ' followed by one concise question. Do not guess.
 """
+DECK_SKILL_RELPATH = "tools/assist/skills/codex/tenryu-namelist/SKILL.md"
+DECK_SKILL_HEADER = "DECK AUTHORING SKILL (tenryu-namelist)"
+
+
+def load_deck_skill_body(repo_root=None):
+    """Return the deck-authoring skill body without YAML frontmatter, or "" when absent."""
+    if repo_root is None:
+        repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    path = os.path.join(repo_root, DECK_SKILL_RELPATH)
+    try:
+        with open(path, encoding="utf-8") as stream:
+            text = stream.read()
+    except OSError:
+        return ""
+    if text.startswith("---"):
+        end = text.find("\n---", 3)
+        if end != -1:
+            text = text[end + 4 :]
+    return text.strip()
+
+
 FEEDBACK_HEADER = (
     "ITERATION-FEEDBACK (previous attempt failed validation; fix ONLY what is needed):"
 )
@@ -47,7 +68,13 @@ def build_feedback_text(payload, limit=6000):
 
 
 REQUIREMENT_HEADER = "RESOLUTION REQUIREMENTS (deterministic; computed by the solver from the laser waveform, wavelength, target layering and geometry)"
+RECOMMENDATION_HEADER = "MESH RECOMMENDATION FROM CONVERGENCE MEASUREMENTS"
 REQUIREMENT_GUIDE = """Interpretation: the numbers below are hard resolution targets for THIS deck's laser and target.
+When a campaign recommendation follows this section, copy its Mesh block and empirical
+provenance exactly. Merge its Numerics retry companion. Do not edit empirical numbers or
+case IDs; empirical-mesh-integrity recomputes them from the actual experimental conditions.
+For unconverged_reference, state in a deck comment that convergence is not proven.
+For extrapolation, require a two-level convergence pair before production.
 Express them with the mesh vocabulary, never by hand-placed nodes:
 - use `zoning_intent` with a mass measure (`areal_mass`, or the geometry mass measure) and set
   `resolution_requirement=dict(apply="enforce")` so the solver injects the recommended bands itself;
@@ -96,6 +123,7 @@ def generate_deck(
     max_iters=10,
     lint_fn=None,
     invoke_fn=None,
+    conditions=None,
 ) -> dict:
     """Generate and validate a TENRYU deck, feeding lint failures back."""
     if lint_fn is None:
@@ -112,6 +140,13 @@ def generate_deck(
     previous_deck = ""
     last_lint = None
     requirement_context = None
+    recommendation_context = None
+    if conditions is not None:
+        from tools.assist.recommend_mesh import recommendation_payload
+        full = recommendation_payload(conditions)
+        compact = {key: full[key] for key in ("recommendation", "evidence", "confidence", "flags", "warnings", "budget", "mesh_block", "numerics_note")}
+        compact["loo"] = {k: v for k, v in full["loo"].items() if k != "cases"}
+        recommendation_context = (compact, "conditions")
 
     if template_text is not None:
         template_path = os.path.join(workdir, "template_input.py")
@@ -124,17 +159,34 @@ def generate_deck(
                 {"error": template_payload["error"]},
             )
         elif isinstance(template_payload, dict):
+            if isinstance(template_payload.get("mesh_recommendation"), dict):
+                recommendation_context = (template_payload["mesh_recommendation"], "template")
             summary = template_payload.get("resolution_requirement_summary")
             if isinstance(summary, dict) and summary.get("applicable") is True:
                 requirement_context = (summary, "template")
 
+    skill_body = load_deck_skill_body()
+    if skill_body:
+        journal.append("deck_skill_context", {"relpath": DECK_SKILL_RELPATH, "sha256": sha256_hex(skill_body)})
+
     for i in range(max_iters):
-        if i > 0 and isinstance(last_lint, dict):
-            summary = last_lint.get("resolution_requirement_summary")
+        if i > 0:
+            latest = last_lint if isinstance(last_lint, dict) else {}
+            if isinstance(latest.get("mesh_recommendation"), dict):
+                recommendation_context = (latest["mesh_recommendation"], "iteration-{0}".format(i - 1))
+            elif recommendation_context is not None:
+                journal.append("mesh_recommendation_context_fallback", {
+                    "iteration": i, "source": recommendation_context[1],
+                    "reason": "latest lint has no mesh_recommendation; retained previous context",
+                })
+            summary = latest.get("resolution_requirement_summary")
             if isinstance(summary, dict) and summary.get("applicable") is True:
                 requirement_context = (summary, "iteration-{0}".format(i - 1))
 
-        prompt = PROMPT_HEADER + "\n== SPEC ==\n" + spec_text
+        prompt = PROMPT_HEADER
+        if skill_body:
+            prompt += "\n== " + DECK_SKILL_HEADER + " ==\n" + skill_body + "\n"
+        prompt += "\n== SPEC ==\n" + spec_text
         if template_text is not None and i == 0:
             prompt += (
                 "\n== STARTING TEMPLATE (modify as needed) ==\n" + template_text
@@ -158,6 +210,15 @@ def generate_deck(
                     "sha256": sha256_hex(summary_text),
                 },
             )
+        if recommendation_context is not None:
+            recommendation, source = recommendation_context
+            recommendation_text = json.dumps(recommendation, sort_keys=True)
+            if requirement_context is None:
+                prompt += "\n== " + REQUIREMENT_HEADER + " ==\n" + REQUIREMENT_GUIDE
+            prompt += "\n== " + RECOMMENDATION_HEADER + " ==\n" + recommendation_text
+            journal.append("mesh_recommendation_context", {
+                "iteration": i, "source": source, "sha256": sha256_hex(recommendation_text),
+            })
         if i > 0:
             prompt += (
                 "\n== "
@@ -299,7 +360,13 @@ def main_generate_deck(args, lint_fn=None) -> int:
 
     try:
         pins, baseline = _load_lint_inputs(args.intent, args.baseline)
-    except ValueError as error:
+        conditions = None
+        if getattr(args, "conditions", None):
+            with open(args.conditions, encoding="utf-8") as stream:
+                conditions = json.load(stream)
+            from tools.assist.mesh_recommendation import normalize_conditions
+            normalize_conditions(conditions)
+    except (ValueError, OSError, KeyError, TypeError) as error:
         print("assist generate-deck: {0}".format(error), file=sys.stderr)
         return 2
 
@@ -319,6 +386,7 @@ def main_generate_deck(args, lint_fn=None) -> int:
             template_text=template_text,
             max_iters=args.max_iters,
             lint_fn=lint_fn,
+            conditions=conditions,
         )
     except (RuntimeError, AssistDisabledError) as error:
         print("assist generate-deck: {0}".format(error), file=sys.stderr)

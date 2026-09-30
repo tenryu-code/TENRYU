@@ -1878,15 +1878,9 @@ void advance_radiation_step_sn_2d_rz(
     in.sigma_s = state.sn_sigma_s.data();
     in.source_emission = use_nlte ? state.sn_eta.data() : nullptr;
     in.Te = state.Te.data();
-    in.ee = state.ee.data();
     in.node_r = state.x_r.data();
     in.node_z = state.x_z.data();
     in.vol = state.vol.data();
-    in.rho = state.rho.data();
-    in.cv_e =
-        (state.cv_e.size() == static_cast<std::size_t>(n_cells)) ? state.cv_e.data()
-                                                                 : nullptr;
-    in.Te_old = state.sn_Te_old.data();
     in.planck = planck.device_view();
     in.E_out = state.rad_E.data();
     in.P_rr_out = state.sn_Prr.data();
@@ -1903,13 +1897,10 @@ void advance_radiation_step_sn_2d_rz(
         d_angular_fixup_artificial_abs.as<double>();
     in.rad_dep = state.rad_dep.data();
     in.rad_emit = state.rad_emit.data();
-    in.dim = 2;
     in.nr = nr;
     in.nz = nz;
     in.n_groups = n_groups;
     in.dt = dt;
-    in.update_material = false;
-    in.cv_e_const = mat.cv_e_override;
     in.mpi_part = &part;
     in.mpi_bufs = bufs;
     const auto sn_mpi_cw = state.owned_cell_window(n_cells);

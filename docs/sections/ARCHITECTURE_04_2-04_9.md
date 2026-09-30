@@ -1,11 +1,14 @@
-<\!-- 分割元: docs/ARCHITECTURE.md | このファイルは参照用です。原本（docs/ARCHITECTURE.md）が権威です。 -->
+<!-- 分割元: docs/ARCHITECTURE.md | このファイルは参照用です。原本（docs/ARCHITECTURE.md）が権威です。 -->
 ### 4.2 mesh/
 **責務**：計算格子（ALE/Lagrangian）と幾何演算、近傍構造
 
 - `Mesh::Topology`：論理構造格子のインデックスとフラグ管理
 - `Mesh::Geometry`：体積、面積、法線、中心、RZ回転体積（2πr）など
-- `Mesh::Search`：粒子セル同定（局所探索 + フォールバック、NUMERICS §9）
+- `Mesh::Search`：退役（光子粒子のセル同定。§4.2.3）
 - `Mesh::Remap`：rezoning後の保存的remap（v1.0で必須、NUMERICS §3.3.4）
+
+`Mesh::VoronoiRZ` emits a global `node_r`/`node_z` table and per-cell CCW `node_indices`, while retaining compatibility coordinate cycles populated from that table. Interior generator triples, boundary generator-pair/segment tuples, and input domain-corner vertex indices are canonical keys whose coordinates are computed once (domain corners are copied verbatim), so shared topology is bitwise deterministic and reciprocity and valence collapse operate on node ids. The v1 cocircular policy accepts roundoff-scale sliver edges from distinct generator triples, merges only bitwise zero-length edges before collapse, and retains unreferenced nodes without compaction.
+
 - `Mesh::PolygonMesh`（`src/mesh/polygon_mesh.{hpp,cpp}`、ALE P0A F1）：トポロジ可変
   多角形 mesh の canonical host 状態 — 次数上限付き CSR（`kMaxPolygonDegree`=8）、
   stable cell/node ID + 単調 allocator、AMR-ready lineage（parent id／lineage epoch）、
@@ -27,6 +30,14 @@
   contraction-immune 2 層規約（関数内明示 fma + 公開関数の最終積 fma(a,b,0.0)）で
   host≡device bitwise（sm_89 実測、memcmp ctest 常設）。既存
   `hydro::ale::detail::rz_signed_quad_volume` の置換統合は後続 wave。
+- `Mesh::ReferenceFlatPath` (`src/mesh/reference_flat_path.{hpp,cpp}`):
+  construction-coordinate corner typing and host exact predicates shared by
+  the Hydro G1 predictor/corrector path guard and max-min repair. It owns the
+  adaptive exact reference orientation certificate, exact-dyadic quadratic
+  interval/equality-order tests, and continuous nonincident-edge collision
+  root isolation for cells containing structural flat corners. CUDA receives
+  only the resulting immutable flat-corner byte mask; regular-corner strict
+  evaluation remains in `Hydro::CornerJacobianQuality`.
 
 #### 4.2.1 Mesh::Topology — 論理構造格子
 
@@ -96,7 +107,6 @@ enum NodeFlag : uint8_t {
 **single-block の面（Face）はデータ構造を持たない**：構造格子では面は暗黙的に定義される。
 セル `(i,j)` の4面は隣接セル `(i±1,j)`, `(i,j±1)` との間の面であり、
 面積・法線はジオメトリ計算時にon-the-flyで算出する。
-DDMCリーク係数（NUMERICS §7.3）で必要な面情報もこの方式で取得する。
 Multiblock では `MultiBlockTopology` の CSR vectors が cell-to-node と
 face-adjacency の source of truth になる。`cell_block_id` と
 `cell_id_stable` は block-major order の stable cell identity を保持し、
@@ -448,30 +458,8 @@ struct Mesh {
 
 #### 4.2.3 Mesh::Search — ハッシュグリッドセル探索
 
-粒子のセル同定（NUMERICS §9）に使用するハッシュグリッド構造体。
-背景グリッド（NUMERICS §9.5）として機能し、ALE rezone 後に再構築する。
-
-```cpp
-struct HashGrid {
-    double cell_size;           // hash cell size = max(Δr, Δz) × 1.1 [cm]（NUMERICS §9.5）
-    int* table;                 // OWNED [n_buckets]: hash table: cell_idx per hash bucket (device)
-    int n_buckets;              // prime number >= hash_table_factor * n_cells（既定 factor=4）
-};
-__device__ int find_cell(double r, double z, int cell_hint,
-                         const Mesh& mesh, const HashGrid& hash);
-```
-
-- `find_cell` はまず `cell_hint`（前回のセルID）から局所探索を試み、
-  失敗時にハッシュグリッドフォールバックを使用する（NUMERICS §9.3–§9.5）
-- `HashGrid::table` は初期化時に構築し、ALE rezone 後に再構築する
-- ハッシュ関数：`hash(i_r, i_z) = (i_r * 73856093 ^ i_z * 19349669) % n_buckets`
-- 衝突解決：線形探索（open addressing、stride=1）
-  - 空バケット sentinel：`table[bucket] = -1`（初期化時に `cudaMemset(-1)` で設定）
-  - 挿入：`bucket = hash(i_r, i_z)` から stride=1 で空き（`-1`）を探し `table[bucket] = cell_idx` を格納
-  - 探索：`bucket = hash(i_r, i_z)` から stride=1 で巡回し、格納セルの包含判定を実行。
-    空バケット（`-1`）に到達したら探索失敗。最大探索回数 = `n_buckets`（full scan防止、NUMERICS §9.5）
-  - 探索失敗時：`DeviceErrorFlags::invalid_cell` を設定し、`cell_id = -1` を返す（§10.1 で host 側が処理）
-  - 負荷率：`n_cells / n_buckets ≤ 1/hash_table_factor = 0.25`（既定）で衝突確率を低減
+退役：モンテカルロ輻射の光子粒子のセル同定（NUMERICS §9）のためのハッシュグリッド。粒子の再同定（`particle_reid.cu`）とともに
+2026-09-29 に退役し、記述を `retired/radiation_monte_carlo/docs/ARCHITECTURE_monte_carlo.md` へ移した。
 
 #### 4.2.4 Mesh::Remap — ALE rezone後の保存的転写
 
@@ -554,12 +542,6 @@ remap 直後に以下の reclosure シーケンスを実行する：
 6. `compute_sound_speed`（H15）：Pe, Pi, ρ_new → c_s
 7. `floor_clamp`（U2）：安全策適用
 
-**remap後の粒子再配置**：
-rezone でセル形状が変わるため、**IMC粒子のみ**の `cellId` を再同定する（U7: `cell_search_after_rezone`）。
-DDMC粒子は pos=NaN sentinel のため空間探索不可であり、cell_id をそのまま維持する
-（ALE rezone はセル番号を変えないため再同定不要。NUMERICS §9.6、CUDA_KERNELS §9 Phase 5 参照）。
-Mesh::Search（NUMERICS §9.3–§9.5）を使用。粒子の物理座標は変化しない。
-
 **データ所有**
 - Node：`x_r, x_z`（1Dは `x_r` のみ）、`v_r, v_z`、`node_flags`
 - Cell：centroid（キャッシュ）、volume、surface metrics
@@ -627,168 +609,66 @@ Mesh::Search（NUMERICS §9.3–§9.5）を使用。粒子の物理座標は変�
 
 #### 4.3.1 EOS GPU実行モデル
 
-EOS評価はセル毎の独立計算であり、**2つの形態**で実装する：
+EOS 評価はセル毎の独立計算で、表 EOS は `__device__` 関数（`materials/eos_device_table.cuh`）を各演算子のカーネルが
+インラインで呼ぶ。独立の EOS カーネル（旧設計の `eos_forward` / `eos_inverse`、CUDA_KERNELS H13/H14）は存在しない。
 
-1. **`__device__` 関数**（コア実装）：他のカーネル（hydro、radiation等）内でインライン呼び出し
-2. **`__global__` カーネル**（ラッパー）：独立したEOS評価ステップとして起動（CUDA_KERNELS H13/H14）
-
-```cpp
-// === コア実装（__device__ 関数）===
-// 他カーネル内からインライン呼び出しされる
-
-// device function: 温度 → (比内部エネルギー, 圧力, 比熱) 正方向
-__device__ void eos_forward_impl(
-    double rho, double T, double Zbar,
-    const EOSTable* table,          // deviceグローバルメモリ上のテーブルポインタ
-    int eos_model,                  // 0=ideal, 1=ionmix, 2=sesame
-    double& e_out, double& P_out, double& Cv_out
-);
-
-// device function: 比内部エネルギー → 温度 逆方向（Newton反復）
-__device__ double eos_inverse_impl(
-    double rho, double e_target, double Zbar,
-    const EOSTable* table,
-    int eos_model,                  // 0=ideal, 1=ionmix, 2=sesame
-    double T_guess                  // 前ステップの温度を初期推定値に使用
-);
-
-// === スタンドアロンカーネル（__global__）===
-// 明示的なEOS評価ステップ（例：初期化時の e→T 変換、ステップ末の状態更新）
-
-// H13: 全セルに対する正方向EOS評価（1スレッド = 1セル）
-// 2温度モデル: 電子/イオンそれぞれの (e, P, Cv) を同時計算
-__global__ void eos_forward(
-    double* ee, double* ei,              // [n_cells] out: 比内部エネルギー
-    double* Pe, double* Pi,              // [n_cells] out: 圧力
-    double* Cv_e, double* Cv_i,          // [n_cells] out: 比熱容量
-    const double* rho,                   // [n_cells]
-    const double* Te, const double* Ti,  // [n_cells] 電子/イオン温度
-    const double* Zbar,                  // [n_cells]
-    const EOSTable* eos_e,               // 電子EOS（SESAME 304 / IONMIX electron）
-    const EOSTable* eos_i,               // イオンEOS（SESAME 301=total / IONMIX ion）
-    int eos_model,                       // 0=ideal, 1=ionmix, 2=sesame
-    DeviceErrorFlags* error_flags,       // §0.6: Cv≤0 クランプ等
-    int n_cells
-);
-
-// H14: 全セルに対する逆方向EOS評価（1スレッド = 1セル）
-// 種別ごとに呼ぶ。SESAMEイオンでは eos_secondary=eos_e（CUDA_KERNELS §2.4 参照）
-__global__ void eos_inverse(
-    double* T_out,                       // [n_cells] out
-    const double* rho,
-    const double* e_target,
-    const double* T_guess,               // 前ステップのTを初期推定
-    const double* Zbar,
-    const EOSTable* eos_primary,         // 主テーブル（IONMIX: eos_e or eos_i、SESAME電子: eos_e）
-    const EOSTable* eos_secondary,       // SESAMEイオン時のみ非null: eos_e（差分評価用）
-    int eos_model,                       // 0=ideal, 1=ionmix, 2=sesame
-    DeviceErrorFlags* error_flags,       // MAX_ITER到達 → eos_newton_nonconverge
-    int n_cells
-);
-```
-
-> **使い分け**：hydro カーネル内では `__device__` 版を直接呼び出し（カーネル起動オーバーヘッド回避）。
-> 独立したEOS評価ステップ（初期条件設定、ステップ末の熱力学量更新）では `__global__` 版を使用。
-
-**EOSテーブルのGPU配置**：
-- テーブルデータは **deviceグローバルメモリ** に配置する（`cudaMalloc`）
-- テクスチャメモリは不使用（2D補間のハードウェアサポートが限定的であり、
-  custom bilinear/bicubic 補間を直接実装する方がデバッグ・精度制御が容易）
-- 理想気体EOS（NUMERICS §1.1.5 (a)）は解析式のためテーブル不要
-- 逆方向（`e→T`）はNewton法（NUMERICS §1.1.5 (b) 準拠）：
-  - 反復回数上限：20回（MAX_ITER=20、NUMERICS §1.1.5 (b) step 3、CUDA_KERNELS §2.4 準拠）
-  - 収束判定：`|T^{(m+1)} - T^{(m)}| / T^{(m)} < 1e-8`（相対温度残差）
-  - 初期推定：`T^{(0)} = T_old`（前ステップの温度）
-  - 非収束時：最終 `T^{(m)}` を採用し `DeviceErrorFlags::eos_newton_nonconverge` を設定（CUDA_KERNELS §0.6 準拠）。
-    加えて `DiagOutput::clamp_count` にもインクリメントする（診断用）。理想気体EOS（`C_v = const`）では1回で厳密収束
+- **表の device 配置**：host の `EOSTable`（`materials/eos_table.hpp`）を `DeviceEOSTable::upload` が device へ写し、
+  カーネルは `DeviceEOSTableView`（格子・\(P, e, c_v\) の表・任意の cold branch）を受け取る。多材料のデッキでは材料別の
+  view 配列とセルの支配材料の添字（`CellEOSTableSelector`）でセルごとに表を選ぶ（NUMERICS §1.1.5）。
+- **順方向**（\(T\to e, P, c_v\)）：`device_eos_energy` / `device_eos_pressure` / `device_eos_cv`（\((\log\rho,\log T)\) の双線形、
+  表の端でクランプ。低密度の延長と energy_authoritative の高温側の延長は別関数）。
+- **逆方向**（\(e\to T\)）：`device_inverse_reclose`。Newton 反復ではなく、温度の節点の上で根を含む区間を単調に探して
+  区間内の線形の式で解く（反復なし）。床・表の端でのクランプと区間を作れない場合（bracket failure）は結果の構造体の
+  フラグで返し、閉包が回数を数える（旧設計の `eos_newton_nonconverge` などのエラーフラグは無い）。
+- **音速**：`device_eos_sound_speed`（補間関数の解析導関数からの \(\Gamma_1\) 形。\(c_s^2\le0\) なら \(\sqrt{(5/3)P/\rho}\)、
+  NUMERICS §1.1.6）。
+- **呼び出し元**：hydro の閉包（`enforce_1t/2t_closure_kernel`）・音速・エネルギー更新、伝導後の再閉包、FLD/S\(_N\) の物質更新、
+  レーザー・燃焼・輻射の入射の閉包が、それぞれのカーネルの中で上の関数を呼ぶ。
+- 理想気体EOS（NUMERICS §1.1.5 (a)）は解析式のためテーブル不要。
 
 #### 4.3.2 EOSTable / OpacityTable 構造体
 
-EOS/opacityのテーブルデータをGPUデバイスメモリ上に保持するための構造体。
-テーブル補間は `(log ρ, log T)` 空間での双線形補間（NUMERICS §1.1.5 (b)）。
+表は host の構造体で読み込み、device へ写して view でカーネルへ渡す。補間は `(log ρ, log T)` の双線形
+（NUMERICS §1.1.5 (b)）。
 
 ```cpp
-// EOS テーブル（SESAME/IONMIX）— deviceグローバルメモリに配置
-// NUMERICS §1.1.5 (b) 準拠。SESAME は単位変換後（eV, dyne/cm², erg/g）で同一構造体を使用
+// materials/eos_table.hpp（host）。1 本の表 = 1 つの成分（ion / electron / total）
 struct EOSTable {
-    // --- 独立変数グリッド（log空間）---
-    double* log_rho_grid;       // [n_rho] log10(ρ) の格子点 [g/cm³]
-    double* log_T_grid;         // [n_T]   log10(T) の格子点 [eV]
-    int     n_rho;              // 密度方向の格子点数
-    int     n_T;                // 温度方向の格子点数
-
-    // --- 物性テーブル（種別: electron / ion）---
-    // メモリレイアウト：T-major [i_T * n_rho + i_rho]（T方向が外側ループ、NUMERICS §1.1.5準拠）
-    double* e_table;            // [n_rho × n_T] 比内部エネルギー [erg/g]
-    double* P_table;            // [n_rho × n_T] 圧力 [dyne/cm²]
-    double* Cv_table;           // [n_rho × n_T] 比熱 [erg/(g·eV)]
-    double* gamma_table;        // [n_rho × n_T] 断熱指数 γ [dimensionless]（IONMIXが提供する場合）
-    bool    has_gamma;          // gamma_table が有効か
-
-    // --- テーブル範囲（clamp用）---
-    double  rho_min, rho_max;   // [g/cm³]
-    double  T_min, T_max;       // [eV]
-
-    // device function: (log_rho, log_T) → bilinear interpolation
-    // テーブル範囲外は境界値にクランプ（NUMERICS §1.1.5 (b)）
-    __device__ double interp(const double* table, double log_rho, double log_T) const;
+    std::vector<double> rho_grid, T_grid_eV;       // 密度 [g/cm³]・温度 [eV] の格子（log 格子も保持）
+    std::vector<double> P_table, e_table, cv_table; // T-major [j_T * n_rho + i_rho]。cv は e の差分（TMAT の cv 欄があればそれ）、下限 1e-3
+    const ColdEquilibriumTable* cold = nullptr;     // 低温平衡構成則の補正（電子の表だけ。NUMERICS §1 (b)）
+    void finalize();                                // 導出量の作成
 };
+struct EOSTableTriplet { EOSTable ion, electron, total; };   // 材料ごと（MatDef::eos_tables、shared_ptr）
+// device: DeviceEOSTable::upload → DeviceEOSTableView（materials/eos_device_table.cuh、§4.3.1）
+// 断熱指数 γ の表は無い（表 EOS の音速は補間関数の導関数から、NUMERICS §1.1.6）
 
-// Opacity テーブル（SESAME/IONMIX）— 群別、deviceグローバルメモリに配置
-// NUMERICS §0.2 準拠：κ [cm²/g]（質量不透明度）でテーブル保持
-// SESAME opacity（502/505）は grey → n_groups=1 で全群同一値として展開
-struct OpacityTable {
-    // --- 独立変数グリッド（log空間、EOSTableと共有可）---
-    double* log_rho_grid;       // [n_rho] log10(ρ [g/cm³]) の格子点
-    double* log_T_grid;         // [n_T]   log10(T [eV]) の格子点
-    int     n_rho;
-    int     n_T;
-    int     n_groups;           // 群数 G
-
-    // --- 群別不透明度テーブル ---
-    // メモリレイアウト：group-major — kappa_P[g * n_rho * n_T + i * n_T + j]
-    double* kappa_P;            // [G × n_rho × n_T] Planck mean κ_P,g [cm²/g]
-    double* kappa_R;            // [G × n_rho × n_T] Rosseland mean κ_R,g [cm²/g]
-
-    // --- テーブル範囲（clamp用）---
-    double  rho_min, rho_max;   // [g/cm³]
-    double  T_min, T_max;       // [eV]
-
-    // device function: 群g の κ を (log_rho, log_T) で bilinear 補間
-    __device__ double interp_kappa_P(int g, double log_rho, double log_T) const;
-    __device__ double interp_kappa_R(int g, double log_rho, double log_T) const;
+// materials/ionmix_reader.hpp（host）/ ionmix_reader.cuh（device view）。群別の不透明度表（IONMIX・TMAT 共通）
+struct IonmixOpacityData {
+    std::vector<double> numdens_cm3, temps_eV;      // 密度軸はイオン数密度 n_i（TMAT も同じ）
+    int ngroups; std::vector<double> bounds_eV;     // 群の数と境界（最初の表が Radiation.groups を決める、NUMERICS §6.7）
+    std::vector<double> kappa_PA, kappa_PE, kappa_R; // [g][n_i][T]、質量不透明度 [cm²/g]
 };
+// 補間は log κ の双線形（隅が 1e-30 以下なら κ の線形へ切替）、表の範囲でクランプ（NUMERICS §1.1.5 (b)・§11.3）
 ```
-
-> **設計方針**：
-> - EOSTable は電子用・イオン用の2インスタンスを Materials が管理する
-> - OpacityTable は材料種毎に1インスタンス（多材料の場合は配列）
-> - テーブルの host→device 転送は `Materials::init()` 時に1回実行
-> - 理想気体EOS（NUMERICS §1.1.5 (a)）はテーブル不要で解析式のみ使用
-> - 混合材料セルでは各材料のテーブルを個別に引き、質量分率で合成（§4.3.3）
 
 > **EOS テーブル管理（2T モデル）**：
 >
-> **SESAME（既定）**：テーブル 301（total EOS）とテーブル 304（electron EOS）を**独立グリッド**で
-> 2つの EOSTable に格納する（NUMERICS §1.1.5 (b) 準拠）。
-> 301 と 304 はグリッドサイズが異なりうる（例: Polystyrene 73×41 vs 63×33）ため、
-> 要素ごと減算は不可。
->   - `eos_total[mat]`：テーブル 301 のグリッドで構築（`e_table = e_total`, `P_table = P_total`）
->   - `eos_e[mat]`：テーブル 304 のグリッドで構築（`e_table = e_e`, `P_table = P_e`）
->   - イオン EOS：クエリ時に `P_i(ρ,T) = max(0, interp(eos_total,ρ,T) - interp(eos_e,ρ,T))` で算出（非負ガード。クランプ発生時は `eos_ion_negative` フラグ設定、CUDA_KERNELS §2.4a 準拠）
->   - 304 不在時（`sesame_table_electron = -1`）：1T 等価分割（`P_e = P_total × Z̄/(1+Z̄)`）
+> **SESAME**：テーブル 301（total EOS）とテーブル 304（electron EOS）を**独立グリッド**で読む（NUMERICS §1.1.5 (b)）。
+>   - `total`：301 のグリッド。`electron`：304 のグリッド（304 が無い材料は、材料の電離モデルの \(\bar Z\) で 301 を節点ごとに
+>     \(\bar Z/(1+\bar Z)\) に分けた表 — `split_sesame_electron_table`、2026-09-29）
+>   - `ion`：読み込み時に 301 のグリッド上で `build_sesame_ion_table` が作る（304 を実行時と同じ双線形・対数補間で 301 の節点へ
+>     写して差を取る）。負の節点はクランプせずに保持し、数を 1 回警告する（旧設計の `max(0, …)` と `eos_ion_negative` は無い）
+>   - 不透明度表 502/505 は `sesame_reader` が読めるが、実行時の不透明度には使わない（`opacity.model="sesame"` は `ConfigError`）
 >
 > **IONMIX**：IONMIX v4/v6 .cn4 バイナリファイルは `e_i, P_i`（イオン）と `e_e, P_e`（電子）を1ファイルに格納する。
 > 密度軸はイオン数密度 \(n_i\) [cm⁻³]（SPECIFICATION §6.4.3 参照）。EOS 単位は J/g, J/cm³ で、cgs 変換（×10⁷）が必要。
-> `materials_init` で単一ファイルを読み込み、2つの EOSTable インスタンスに分割する：
->   - `eos_e[mat]`：`e_table = e_e`, `P_table = P_e`, `Cv_table = Cv_e`（数値微分 `∂e_e/∂T` で生成）
->   - `eos_i[mat]`：`e_table = e_i`, `P_table = P_i`, `Cv_table = Cv_i`
+> 読み込み時に \(\rho=n_iAm_p\) へ変換して `ion`・`electron`・`total` の 3 表を作る（比熱は数値微分）。
 >
-> **共通**：
-> Zbar テーブルは別配列 `zbar_table[mat]` に格納（材料ごとに1インスタンス）。
-> EOSTable 構造体自体は electron/ion/total の区別を持たない
-> （同一構造体を複数インスタンス使い分ける設計）。
-> SESAME では `eos_total` + `eos_e` の2テーブル、IONMIX では `eos_e` + `eos_i` の2テーブルを保持。
+> **TMAT-H5**：`/eos/fields` の \(P_i, P_e, e_i, e_e, \bar Z\)（任意で `cv_i`・`cv_e`）から同じ 3 表を作る（§4.3.2b）。
+>
+> **共通**：Zbar テーブルは材料ごとの別の表（`MaterialsConfig::zbar_tables`）。混合セルは各セルの支配材料の表で閉じる
+> （質量分率での合成はしない、NUMERICS §1.1.5 (c)）。
 
 #### 4.3.2a NLTEOpacityTable 構造体（M17: IONMIX 3種不透明度 Non-LTE）
 
@@ -849,10 +729,10 @@ struct NLTEOpacityTable {
 >   TENRYU 内部の質量密度 \(\rho\) [g/cm³] からの変換: \(n_i = \rho / (A \cdot m_p)\)
 > - **κ^PE 不在時の LTE フォールバック**: IONMIX ファイルに Planck emission テーブル（3番目）が
 >   存在しない場合、\(\kappa^{PE} = \kappa^{PA}\) と仮定する（WARNING 出力、`is_lte = true` に設定）
-> - κ^PA, κ^PE, κ_R ≥ 0 のクランプはロード時（全要素検査）と実行時（interp結果）の2段で実施
+> - 負の κ^PA, κ^PE, κ_R はロード時の全要素検査で拒否する（クランプしない — `ionmix_reader.cpp` がエラーで止める）
 > - Fortran レコードマーカーの整合性チェックを実施（不整合時は `ConfigError`）
 > - **η_g はテーブルに格納しない**: η_g = σ^PE_g × c × a_eV × T^4 × b_g(T) として
->   実行時に CellRadiationCoeffs 生成時に動的に構成する（NUMERICS §6.1.1 参照）
+>   実行時に構成する（1D FLD の不透明度・放出の評価、NUMERICS §6.7。`CellRadiationCoeffs` は退役した IMC の構造体）
 
 #### 4.3.2b TMAT-H5 Material Table
 
@@ -905,20 +785,23 @@ material.tmat.h5
 
 #### 4.3.3 Mixture mixing rules
 
-多材料セルの混合則（NUMERICS §1.1.5 (c)）：
-- `linear_mass`（既定）：\(\kappa_{mix} = \sum_m Y_m \kappa_m\)（\(Y_m\) = 質量分率）
-- `harmonic_mass_R`（Rosseland）：\(1/\kappa_{R,mix} = \sum_m Y_m / \kappa_{R,m}\)
+多材料セルの不透明度の混合則（`Materials.mixture.opacity_mix_rule`、NUMERICS §1.1.5 (c)）：
+- `linear_mass`（既定）：Planck・Rosseland とも \(\kappa_{mix} = \sum_m Y_m \kappa_m\)（\(Y_m\) = 質量分率、未追跡なら体積分率）
+- `harmonic_mass_R`：Planck は線形、Rosseland は調和 \(1/\kappa_{R,mix} = \sum_m Y_m / \kappa_{R,m}\)
+- `max`：両方とも存在する材料の最大値
+- 表の材料は各材料の部分密度で評価して合成する（1D FLD の `eval_opacity_multimat_kernel`）
 
 **Non-LTE 不透明度の混合則**（M17）：
 - \(\kappa^{PA}_{mix,g} = \sum_m Y_m \kappa^{PA}_{m,g}\)（質量分率線形、吸収は additive）
 - \(\kappa^{PE}_{mix,g} = \sum_m Y_m \kappa^{PE}_{m,g}\)（質量分率線形、ソース η_g に直結するため additive が物理的に正しい）
 - \(\kappa_{R,mix,g}\)：既存の `harmonic_mass_R` を適用（Rosseland 平均は調和平均）
-- これらの混合不透明度は `compute_opacities` カーネル内で適用され、`CellRadiationCoeffs` 生成の入力となる
+- 上の Non-LTE の記述は退役した IMC の設計で、`compute_opacities` カーネルと `CellRadiationCoeffs` は存在しない（1D FLD の非 LTE の
+  混合は NUMERICS §1.1.5 (c) の「第 2 段」「第 3 段」）
 
-EOS混合は `mass_weighted_same_state`：各材料が同一 \((\rho_{mix}, T)\) で評価され、
-\(e_{mix} = \sum_m Y_m\,e_m(\rho_{mix}, T)\)。
+EOS は混ぜない：1D の閉包は各セルを支配材料（体積分率が最大の非 void 材料）の EOS だけで閉じる（NUMERICS §1.1.5 (c)。
+`Materials.mixture.eos_mix_rule` は受け付けるが無視する）。
 
-伝導・ソース結合向けのセル実効量は体積分率 \(f_m\) で評価する（NUMERICS §1.1.5a）：
+伝導・ソース結合向けのセル実効量は非 void 材料の体積分率 \(f_m\)（その和で割り直す）で評価する（NUMERICS §1.1.5a）：
 - \(A_{eff} = (\sum_m f_m/A_m)^{-1}\)（調和平均）
 - \(\gamma_{eff} = \sum_m f_m \gamma_m\)（線形平均）
 - \(n_e = \rho \bar{Z}/(A_{eff} m_p)\)
@@ -928,8 +811,7 @@ EOS混合は `mass_weighted_same_state`：各材料が同一 \((\rho_{mix}, T)\)
 #### 4.3.4 Materials トップレベル関数シグネチャ
 
 Materials モジュールは「ステップ関数」を持たず、他モジュールのカーネル内で
-`__device__` 関数として呼び出される（§4.3.1）。ホスト側APIは初期化と
-不透明度の前計算を提供する。
+`__device__` 関数として呼び出される（§4.3.1）。ホスト側APIは初期化を提供する。
 
 ```cpp
 // Materials 初期化：テーブルファイル読込 → deviceメモリへ転送
@@ -945,30 +827,13 @@ void materials_init(
                                     // model="table_nlte" の材料のみ非NULL、それ以外はNULL
     int n_groups                    // 放射群数
 );
-
-// 不透明度の前計算：各セルの σ_a,g, σ_R,g を State から一括計算
-// 各ステップの Radiation 呼び出し前に実行
-// **M17 Note**: opacity.model="table_nlte" の場合、σ_a,g と σ_R,g は
-//   NLTEOpacityTable から補間される（OpacityTable からではない）。
-//   DDMCリーク係数は σ_R ベースで変更なし（アルゴリズム不変）だが、
-//   データ供給源が NLTEOpacityTable に切り替わるためコードパスは変更される。
-//   CellRadiationCoeffs 生成時に σ^PA_g, σ^PE_g の分離も同時に行う。
-__global__ void compute_opacities(
-    const double* rho,              // [n_cells] 密度 [g/cm³]
-    const double* Te,               // [n_cells] 電子温度 [eV]
-    const double* volFrac,          // [n_cells × n_mat] 体積分率 [dimensionless]
-    const OpacityTable* tables,     // [n_materials] LTE不透明度テーブル
-    const NLTEOpacityTable* nlte_tables,  // [n_materials] Non-LTE不透明度（NULLならLTEパス）
-    double* sigma_a,                // [n_cells × G] 出力：ρ κ^PA_g [1/cm]（LTE時: ρ κ_P,g）
-    double* sigma_R,                // [n_cells × G] 出力：ρ κ_R,g [1/cm]
-    double* sigma_pe,               // [n_cells × G] 出力：ρ κ^PE_g [1/cm]（LTE時: = sigma_a）
-    double* sigma_t,                // [n_cells × G] 出力：σ_a + σ_s [1/cm]（v1.0: σ_t=σ_a）
-    int n_cells, int n_groups, int n_materials,
-    MixingRule mixing_rule          // enum（GPU上での文字列比較を回避）
-);
 ```
 
-出力4バッファ：`sigma_a[n_cells×G] = ρκ^PA`、`sigma_R[n_cells×G] = ρκ_R`、`sigma_pe[n_cells×G] = ρκ^PE`（LTE時: = sigma_a）、`sigma_t[n_cells×G] = σ_a + σ_s`（v1.0: σ_t=σ_a）。
+不透明度の評価は輻射ソルバーの中で行う（IMC 時代の前計算カーネル `compute_opacities`（U9）と `CellRadiationCoeffs` は
+退役し、記述を `retired/radiation_monte_carlo/docs/ARCHITECTURE_monte_carlo.md` へ移した）：1D は `fld_1d_gpu.cu` の
+`evaluate_fld_opacity_and_emission`・`sn_transport_1d_gpu.cu` の `evaluate_opacity_and_emission`（材料ごとの記述と部分密度で
+混合する `eval_opacity_multimat_kernel`、表の非 LTE 係数は `nlte_coeffs.cu` の `compute_nlte_coefficients_cuda_with_pe`・
+`_pure_sn`）、2D_RZ は `fld_2d_rz_gpu.cu` の `evaluate_fld_opacity_and_emission`・`sn_transport_2d_gpu.cu` の `evaluate_opacity`。
 
 **MixingRule enum**（`const char*` はGPUカーネルに渡せないため enum を使用）：
 
@@ -1035,7 +900,7 @@ Config パース時に文字列→enum変換を行う。
 - `Hydro::ALE1D`（`src/hydro/ale_1d_driver.{cuh,cu}`, `ale_1d_types.cuh`, `ale_1d_sensor.{cuh,cu}`, `ale_1d_rezone.{cuh,cu}`, `ale_1d_remap.{cuh,cu}`, `ale_1d_velocity_project.{cuh,cu}`, `ale_1d_diagnostics.{cuh,cu}`）
   - 1D_SPH solution-adaptive ALE V3 の public API と skip-path diagnostics を保持する。現行版では GPU sensor が `compute_features` で feature list を構築し、`ale_1d_rezone` が monitor、common node mask、CPU equidistribution scratch candidate を構築し、`ale_1d_remap` が volume-coordinate MUSCL/minmod remap（first-order donor fallback と cosine protected-face taper 付き）を caller-owned scratch に書き、`ale_1d_velocity_project` が mass remap の受理済み面質量流束（`Ale1dRemapScratch::mass_flux`）と mass phi を使い、各セルの両端節点速度の組を比量として移流する half-index-shift 法（Benson 1992 §3.5.5）で節点速度 scratch を構築する（2026-09-23 に cell momentum remap + mass-weighted node projection から置換）。`ale_1d_diagnostics` が scratch diagnostics を評価し、`apply_ale_1d` は hard 許容誤差を満たした場合だけ二相 commit で state を更新する。
   - V3 1D ALE は opt-in / experimental。既定は `numerics.ale1d.enabled=False` で、通常の GXII short-pulse は pure Lagrangian を使う。
-  - runtime scope は 1D_SPH + deterministic radiation (FLD/S_N) のみ。IMC/DDMC は config validation で `ConfigError` とし、runtime guard は defensive skip として残す。
+  - runtime scope は 1D_SPH + deterministic radiation (FLD/S_N) のみ（モンテカルロ輻射は 2026-09-29 にビルドから外した）。
 - `Hydro::PLIC` (`src/hydro/plic_geometry.{cuh,cu}`,
   `src/hydro/plic_normal.{cuh,cu}`, `src/hydro/plic_fast_path.{cuh,cu}`,
   `src/hydro/plic_remap.{cuh,cu}`)
@@ -1094,6 +959,9 @@ Config パース時に文字列→enum変換を行う。
     force-predicted \(\mathbf{u}^{1/2}\) instead of the current state velocity.
 - `Hydro::CornerJacobianQuality`（`src/hydro/corner_jacobian_quality.{cuh,cu}`）
   - 2D_RZ cell corner の signed Jacobian を評価し、default-off の pre-hydro ALE trigger と Hydro2D pre-commit diagnostic に共有 predicate を提供する（NUMERICS §3.2.13）
+  - G1 multiblock path guard は `Mesh::ReferenceFlatPath` の immutable typed
+    mask を受け、regular corner の既存 strict quadratic を維持しながら
+    reference-flat corner とその cell embedding を host exact predicate で合成する。
   - retry active mesh repair 用に、current corner-J の same-cell balance \(q_{bal}=\min J/\max J\) を GPU reduction で評価し、非正・非有限 corner と 100:1 既定 imbalance を dt-independent に検出する（NUMERICS §3.2.13b）
 - `Hydro::Ring7SeamQuotientRemap` (`src/hydro/ring7_seam_quotient_remap.{cuh,cu}`)
   - I1-B `Ring7OuterSeamQuotientRemap` の default-off module. Increment 1 defines RZ face/swept-volume primitives, fixed-order compensated packet accumulation, ring-7 seam patch discovery, and diagnostic-only q/eta scanning.
@@ -1323,7 +1191,7 @@ Config パース時に文字列→enum変換を行う。
 **HydroEOSContext lifecycle (current implementation)**:
 - Created in `coupling::Driver::run` as a stack object: `HydroEOSContext eos_ctx; eos_ctx.initialize(cfg);`
 - `initialize(cfg)` uploads per-material raw table EOS (`mat.eos_tables`) into owned `DeviceEOSTable` containers and, when requested by `mat.hydro_eos_backend == "rho_e_table"`, builds the hydro-side direct `total P/T(\rho,e)` table using either the default log grid or the diagnostic linear grid selected by `cfg.numerics.hydro.rho_e_linear_grid`, then uploads it into `total_rho_e`; when requested by `mat.hydro_eos_backend == "helmholtz_spline"`, it builds the hydro-side bicubic `total P/e` surrogate and uploads it into `total_helmholtz`; when requested by `mat.hydro_eos_backend == "helmholtz_jet"`, it builds the hydro-side projected-jet biquintic `total` surrogate and uploads it into `total_helmholtz_jet`; when requested by `mat.hydro_eos_backend == "mie_gruneisen"`, it builds the branchwise affine `P_{ref}(\rho), e_{ref}(\rho), \Gamma(\rho)` fit and uploads it into `mie_gruneisen`; when requested by `mat.hydro_eos_backend == "exact_ideal_gas"`, it keeps the raw tables uploaded but marks the material for analytic ideal-gas closure inside the 1D hydro table-kernel path.
-- Hydro entry points query `HydroEOSContext` once per step to select either the legacy raw-table path, the `exact_ideal_gas` path, the `rho_e_table` path, the `helmholtz_spline` path, the `helmholtz_jet` path, or the `mie_gruneisen` path; ALE post-remap reclosure also consumes the context for table-backed electron/ion inverse reclosure and otherwise keeps the ideal-gas fallback. Table backends now keep the hydro-updated `ee/ei` by default and only repair NaN / Inf / negative energies with table/surrogate-clamped values, while `cfg.numerics.hydro.eos_writeback=true` restores legacy every-step `e(\rho,T)` writeback. The `mie_gruneisen` path is 1D/2T-only and differs in one important way: predictor/corrector hydro uses only the uploaded affine closure for `Pe/Pi/cs`, while `Driver` refreshes raw-table `Te/Ti/cv_e/cv_i` outside hydro after hydro/source phases. In 1D, `cfg.numerics.hydro.exact_override` can further replace one post-closure quantity (`pressure`, `sound_speed`, or `temperature`) with a diagnostic ideal-gas value on table backends, and `exact_override="no_writeback"` forces writeback off for compatibility. Radiation/opacity modules continue to use the raw table data directly.
+- Hydro entry points query `HydroEOSContext` once per step to select either the legacy raw-table path, the `exact_ideal_gas` path, the `rho_e_table` path, the `helmholtz_spline` path, the `helmholtz_jet` path, or the `mie_gruneisen` path; ALE post-remap reclosure also consumes the context for table-backed electron/ion inverse reclosure and otherwise keeps the ideal-gas fallback. Table backends write the closed energy back by default (`cfg.numerics.hydro.eos_writeback=true`; under the default `eos_closure_mode="energy_authoritative"` a closure that clamps at a table edge or floor keeps the hydro-updated energy instead), and `eos_writeback=false` keeps the hydro-updated `ee/ei` and only repairs NaN / Inf / negative energies with table/surrogate-clamped values. The `mie_gruneisen` path is 1D/2T-only and differs in one important way: predictor/corrector hydro uses only the uploaded affine closure for `Pe/Pi/cs`, while `Driver` refreshes raw-table `Te/Ti/cv_e/cv_i` outside hydro after hydro/source phases. In 1D, `cfg.numerics.hydro.exact_override` can further replace one post-closure quantity (`pressure`, `sound_speed`, or `temperature`) with a diagnostic ideal-gas value on table backends, and `exact_override="no_writeback"` forces writeback off for compatibility. Radiation/opacity modules continue to use the raw table data directly.
 - Passed by pointer to hydro entry points (`prepare_initial_sound_speed`, `lagrangian_step`) for both 1D and 2D hydro paths, and to `Hydro::ALE` for 2D_RZ post-remap reclosure.
 - `HydroEOSContext` owns GPU memory via RAII (`destroy()` + destructor + move support). Memory is released automatically when `Driver::run` exits.
 
@@ -1439,18 +1307,20 @@ struct HypreSolver {
 
 #### 4.4.3 Hydro 安定化・エネルギー制御機能
 
-以下の機能はすべて `src/hydro/hydro_1d.cu` に実装。各機能は Config フラグで独立に有効/無効化可能。
+以下の機能はすべて `src/hydro/hydro_1d.cu` に実装。各機能は Config フラグで独立に有効/無効化可能。「既定」は namelist で
+指定しないときの値（2026-09-29 の監査で実装に合わせた。GXII の例題デッキ `gxii_solid_1D_fld.py` などは
+`av_type="csw"`・`compatible_energy=True`・`odd_even_damping_C=1.0`・`ee_odd_even_C=0.5`・`deposit_smooth_passes=3` を与える）。
 
-| 機能 | ファイル | Config パラメータ | 本番状態 |
+| 機能 | ファイル | Config パラメータ | 既定 |
 |------|---------|-----------------|---------|
-| **VNR 人工粘性** | `artificial_viscosity.cu` | `av_type="vnr"`, `av_linear`, `av_quadratic` | ON (本番) |
-| **Adaptive AV gate** | `shock_tracker.cu`, `adaptive_av_gate.cu`, `artificial_viscosity.cu` | `adaptive_av.enabled` | OFF (診断/改善用) |
-| **Riemann 人工粘性** | `artificial_viscosity.cu` | `av_type="riemann"` | OFF (検証中) |
-| **CSW 人工粘性** | `artificial_viscosity.cu` | `av_type="csw"` | OFF (検証中) |
+| **CSW 人工粘性** | `artificial_viscosity.cu` | `av_type="csw"` | 1D の既定（`av_type` 未指定なら builder が `"csw"`、2026-08-03） |
+| **VNR 人工粘性** | `artificial_viscosity.cu` | `av_type="vnr"`, `av_linear`, `av_quadratic` | 明示すれば使える |
+| **Adaptive AV gate** | `shock_tracker.cu`, `adaptive_av_gate.cu`, `artificial_viscosity.cu` | `adaptive_av.enabled` | OFF (診断/改善用、VNR 専用) |
+| **Riemann 人工粘性** | `artificial_viscosity.cu` | `av_type="riemann"` / `"riemann_compatible"` | OFF |
 | **1D mesh motion** | `hydro_1d.cu`; optional V3 sensors in `ale_1d_sensor.cu` | `mesh.motion="lagrangian"`; `numerics.ale1d.enabled` | ON for pure Lagrangian; optional solution-adaptive ALE path OFF by default |
-| **Odd-even 圧力フィルタ** | `hydro_1d.cu` | `odd_even_damping_C` | ON (C=1.0) |
-| **電子 odd-even ダンピング** | `hydro_1d.cu` | `ee_odd_even_C` | ON (C=0.15) |
-| **Compatible-energy 2T** | `hydro_1d.cu` | `compatible_energy` | OFF (散逸不足) |
+| **Odd-even 圧力フィルタ** | `hydro_1d.cu` | `odd_even_damping_C` | OFF（既定 0。GXII デッキは 1.0） |
+| **電子 odd-even ダンピング** | `hydro_1d.cu` | `ee_odd_even_C` | OFF（既定 0。GXII デッキは 0.5） |
+| **Compatible-energy 2T** | `hydro_1d.cu` | `compatible_energy` | OFF（既定。GXII デッキは True） |
 | **高波数速度ダンパー** | `hydro_1d.cu` | `hk_velocity_damper_C` | OFF (フロント近接) |
 | **イオン人工熱伝導** | `hydro_1d.cu` | `ion_art_heat_C` | OFF (Pe支配で無効) |
 
@@ -1470,28 +1340,37 @@ struct HypreSolver {
 
 | Config | 値 |
 |--------|-----|
-| `deposit_smooth_passes` | 3 (本番) |
+| `deposit_smooth_passes` | 0（既定 = 平滑化なし。1D の例題デッキの一部は 3） |
 | `deposit_smooth_alpha` | 0.25 |
 
 ---
 
 ### 4.5 radiation/
 
-> **【CURRENT RADIATION MODEL】** 採用モデルは決定論の **FLD（`mode="multigroup_diffusion"`, NUMERICS §6.7）** と **\(S_N\)（`mode="sn_transport"`, NUMERICS §6.8）** の2つのみ。現行構成：`Rad::FLD1D`/`Rad::FLD2DRZ`（`fld_1d_gpu`/`fld_2d_rz_gpu`, `driver_fld_energy`；線形 solver は cuSPARSE tridiag (1D) / AmgX-CG・cuSPARSE CG variants (2D)）と `Rad::SNTransport1D`/`Rad::SNTransport2DRZ`（`sn_transport_1d_gpu`/`sn_transport_2d_gpu`, `sn_dsa`, `sn_material_newton`；加速は DSA + RKL2/AMGX）。**IMC / DDMC / HOLO / difference（`Rad::IMC`, `Rad::DDMC`, hybrid `Rad::Diffusion*`, PhotonPool §5.3, ParticleEmigrant, IMC⇄DDMC leak, ParticleMode `0=IMC,1=DDMC`）は RETIRED**（FREEZE-1D-RAD・D1 以降）。互換のためコードは tree に残るが FLD/\(S_N\) mode で完全 bypass（`imc.enabled=False`, `ddmc.enabled=False`, `holo.enabled=False` 必須）。以下の IMC/DDMC/HOLO 記述は歴史的参照。詳細は `SPECIFICATION.md` の `mode` 定義参照。
+> **【現行の輻射モデル】** 採用モデルは決定論の **FLD（`mode="multigroup_diffusion"`, NUMERICS §6.7）** と **\(S_N\)（`mode="sn_transport"`, NUMERICS §6.8）** の 2 つ。構成：`Rad::FLD1D`/`Rad::FLD2DRZ`（`fld_1d_gpu`/`fld_2d_rz_gpu`, `driver_fld_energy`；線形 solver は cuSPARSE tridiag (1D) / AmgX-CG・cuSPARSE CG variants (2D)）と `Rad::SNTransport1D`/`Rad::SNTransport2DRZ`（`sn_transport_1d_gpu`/`sn_transport_2d_gpu`, `sn_dsa`, `sn_material_newton`；加速は DSA + RKL2/AMGX）。driver からの入口は `Rad::RadiationStep`。退役したモンテカルロ輻射（IMC・DDMC・ランダムウォーク・HOLO・difference 定式化：`Rad::IMC`・`Rad::DDMC`・`Rad::Diffusion*`・`Rad::Tally`・PhotonPool 等）は 2026-09-29 にビルドから外し、コード・試験・デッキを `retired/radiation_monte_carlo/` へ、本節にあったその設計記述（モジュール・`CellRadiationCoeffs`・旧トップレベル関数・カーネル起動仕様・分散低減・ハイブリッド輸送）を `retired/radiation_monte_carlo/docs/ARCHITECTURE_monte_carlo.md` へ移した。
 
-**責務**：1D_SPH/2D_RZ multigroup **FLD**（現行既定, DEFAULT-FLD）、1D_SPH/2D_RZ pure **\(S_N\)**（現行）、放射源生成、沈着・推定量集計。IMC/DDMC/HOLO 輸送は **[RETIRED]** legacy（互換保持のため tree に残るが FLD/\(S_N\) mode で bypass）。
+**責務**：1D_SPH/2D_RZ multigroup **FLD**（既定）と 1D_SPH/2D_RZ pure **\(S_N\)**。群構造と Planck 分率、不透明度の評価、物質との結合（Newton）、沈着 `rad_dep`・放出 `rad_emit` の publish。
+
+- `Rad::RadiationStep`（`src/radiation/radiation_step.hpp`, `radiation_step.cpp`）：driver が輻射演算子 \(\mathcal{R}(\Delta t)\) として呼ぶ入口
+  （2026-09-29 まで `radiation::IMC::transport_step` がこの役を兼ねていた）。輻射が無効・\(\Delta t \le 0\)・セルや材料が無いときは
+  何もしない。2D_RZ では境界の組（内側 reflect、外側 vacuum/reflect、z 面 vacuum/reflect/marshak）を検査する。群境界は
+  `group_bounds_eV`、無ければ `compute_T_range_eV` の対数等分。`PlanckTable` は群境界・温度範囲・`compute_N_T` が変わったときだけ
+  作り直す（run の最初の輻射ステップで作る）。mode と次元で `advance_radiation_step_fld_1d` / `_fld_2d_rz` / `_sn_1d` /
+  `_sn_2d_rz` を呼ぶ。最大値原理の超過（NUMERICS §11.8）は driver が輻射の後に測って `set_last_overshoot_metrics` で渡し、
+  history の `radiation/overshoot_count`・`radiation/overshoot_max` と `Numerics.safety.overshoot_warn` の判定に使う。
 
 - `Rad::Groups`：群境界（eV）、代表値、Planck fraction b_g(T)（計算/テーブル）
   - GPU側問い合わせ：`__device__ double planck_fraction(int g, double T, const PlanckTable* table)`
-  - テーブルは初期化時に温度グリッド（200点、log-uniform、0.01–100.0 eV）で計算し deviceメモリに保持（SPECIFICATION §6.4.5 既定）
-  - 実行中は温度方向に線形補間
+  - テーブルは温度グリッド（既定 200 点、log-uniform、0.01–100.0 eV）で計算し device メモリに保持（SPECIFICATION §6.4.5 既定）
+  - 実行中は \(\ln T\) の 3 次 Hermite 多項式で累積分率 \(C_g\)（または裾の和 \(D_g=1-C_g\)）の対数を補間し、\(b_g\) を隣り合う値の差として得る
+    （和は構成上 1。2026-09-23 まで \(b_g\) を \(T\) の線形で補間していた。NUMERICS §6.1）
 - `Rad::GroupStructure`（`src/radiation/group_structure.hpp`, `group_structure.cu`）：
   optional hard-X-ray group-boundary repacking and host-side opacity-table resampling.
   It depends on `materials::IonmixOpacityData` and preserves the existing group count.
 - `Rad::FLD1D`（`src/radiation/fld_1d_gpu.cuh`, `fld_1d_gpu.cu`,
   `nlte_coeffs.cu`）：
   `Radiation.mode="multigroup_diffusion"` 専用の 1D_SPH multigroup flux-limited diffusion 経路。
-  IMC/DDMC/HOLO/difference を bypass し、cell×group の `rad_E` と persistent
+  cell×group の `rad_E` と persistent
   `rad_E_old` を有限体積 backward Euler で更新する。群ごとの三重対角系は
   cuSPARSE `gtsvStridedBatch` で GPU 上に solve し、HYDRA-aligned Fleck linearization
   (`f·σ^PA` total removal diagonal、`f·η + (1-f)·c·σ^PA·E^n` RHS) で stiff な
@@ -1542,7 +1421,7 @@ struct HypreSolver {
   吸収率密度の GMRES、節点物質更新（線形化と物質更新は節点ごとに 1 warp、群の Planck 項を
   レーンで並列、EOS の逆算は warp 並列の二分法）をすべて GPU 上で行う（host は GMRES の
   Hessenberg 小行列と収束判定のみ。NUMERICS §6.8.4）。以下は `"linear_characteristic"` の記述。
-  IMC/DDMC/HOLO/difference を bypass し、group-parallel/angle-serial
+  group-parallel/angle-serial
   spherical sweep、group-batched DSA tridiagonal solve、GPU Newton material
   coupling を CUDA 上で実行する。
   Pure SN は Fleck linearization を bypass し（\(f=1\)、Fleck-derived effective
@@ -1579,414 +1458,42 @@ struct HypreSolver {
   へ per-cell transition diagnostics を publish する。
   Cut-2 では機能検証優先であり、GXII-scale 2D \(S_N\) 性能最適化は別タスクである。
 
-**PlanckTable 構造体**：
+**PlanckTable**（`src/radiation/planck_table.cuh`）：host のクラス `PlanckTable`（`build(groups, n_T, T_min_eV, T_max_eV)`、
+picket-fence 用の `build_constant_fractions`）が温度格子とその対数、群ごとの \(b_g\)・累積分率 \(C_g\)・裾の和 \(D_g\)、
+\(\ln C_g\)・\(\ln D_g\) とその \(\ln T\) 微分を device に置き、kernel へは `PlanckTableDeviceView`（`interpolate_b(g, T)`、
+多群を同じ温度で引く `locate_b(T)`）として渡す。表の範囲外の温度は端の値に丸める（host 側の評価は最初の 1 回だけ WARNING を出す）。
+`planck_fraction.method="tabulate"` は受理して保存するが使われず、計算した分率に戻す（WARNING。SPECIFICATION §6.4.5）。
 
-```cpp
-struct PlanckTable {
-    double* T_grid;        // [N_T] 温度グリッド（log-uniform）[eV]、deviceメモリ
-    double* cumulative;    // [N_T × (G+1)] 累積Planck分率、deviceメモリ
-                           // cumulative[t*(G+1) + g] = ∫_0^{ν_g} B(ν,T_t)dν / ∫_0^∞ B(ν,T)dν
-    int     N_T;           // 温度グリッド点数（既定 200、SPECIFICATION §6.4.5 準拠）
-    double  T_min, T_max;  // [eV] グリッド範囲（既定 [0.01, 100.0]）
-    int     G;             // 群数
-
-    // デバイス関数：群 g の Planck 分率 b_g(T) を返す
-    __device__ double fraction(int g, double T_eV) const;
-    // 実装：T_eV をそのまま用い、T_grid 内で二分探索 → 線形(T)補間
-    // T < T_min: T_min の値を使用（クランプ）、out_of_range カウンタをインクリメント
-    // T > T_max: T_max の値を使用（クランプ）、out_of_range カウンタをインクリメント
-
-    // 範囲外アクセス診断（NUMERICS §0.3 準拠）
-    int*    n_out_of_range;  // [1] deviceメモリ、atomicAdd でカウント
-    double* max_overshoot;   // [1] deviceメモリ、atomicMax で最大超過率を記録
-};
-```
-**初期化タイミング**：Step 3（FrozenTable1D と同時。Config構築フェーズ）で計算。
-PlanckTable は群構造（group_bounds_eV）のみに依存する Config 派生テーブルであり、
-シミュレーション状態に依存しないため、リスタート時も Step 3 で再構築される
-（Steps 9-10 のスキップ対象外）。
-`planck_fraction` 設定が `"compute"` の場合にテーブルを構築し、
-`"tabulate"` の場合はユーザ提供テーブルを使用（SPECIFICATION §6.4.5参照）。
-Note: log-T 補間は粗い温度グリッドで精度改善の余地があり、将来拡張候補である。
-
-**CellRadiationCoeffs 構造体**（M17: f 整合の構造的保証）：
-
-```cpp
-// セル毎の放射係数バンドル — NUMERICS §6.1.1 準拠
-// R演算子冒頭で全セルに対して1回だけ生成（one-shot）
-// 同一ステップ内ではこの構造体のみを参照し、f/σ を個別に再計算してはならない
-struct CellRadiationCoeffs {
-    // deviceメモリ上のフラット配列（SoA）
-    double* f;                  // [n_cells] Fleck factor
-    double* sigma_pa;           // [n_cells × G] σ^PA_g [1/cm]（Planck absorption）
-    double* sigma_pe;           // [n_cells × G] σ^PE_g [1/cm]（Planck emission; LTE時は σ^PA と同一）
-    double* sigma_a_eff;        // [n_cells × G] f × σ^PA_g
-    double* sigma_s_eff;        // [n_cells × G] (1-f) × σ^PA_g
-    double* eta;                // [n_cells × G] η_g = σ^PE_g c a_eV T^4 b_g [erg/(cm³·s)]
-    double* eta_tot;            // [n_cells] Σ_g η_g
-    double* eta_cdf;            // [n_cells × G] 群再サンプル用 CDF
-    double* emission_bias_cdf;  // [n_cells × G] thermal emission 用 spectral-bias CDF（任意）
-    int     n_cells;
-    int     G;                  // 群数
-
-    // index helper: cell c, group g → c * G + g
-};
-```
-
-> **生成タイミング**：R演算子冒頭で1カーネル（R2相当）として全セルを並列計算。
-> LTE モードでは既存の Fleck factor 計算を CellRadiationCoeffs 形式に拡張。
-> Non-LTE モードでは NLTETable からの補間結果を使用する。
-> `emission_bias_cdf` は `sigma_R` と Planck table から host 側で組み立てて
-> `PersistentCoeffBuffers` へ転送する補助配列であり、Phase-1 では thermal source の count allocation のみが参照する。
-> **メモリ**: (8×G+2) × n_cells × 8 bytes。G=100, n_cells=10000 で ~64 MB。Scratch 領域に配置可。
-
-- `Rad::IMC` **[RETIRED — legacy IMC Monte Carlo; 現行輻射は §4.5 冒頭 banner の FLD/\(S_N\)]**
-  - 粒子プール（SoA）、census管理
-  - Fleck factor計算（LTE: Planck重み平均のσ_a,P、Non-LTE: Λベース — NUMERICS §6.1.1）
-  - difference reference の scalar helper（`difference_reference_weight`,
-    `difference_reference_cell_sigma`）は PR9 unit test から直接呼べる pure function とし、
-    transport state や GPU buffer を変更しない
-  - implicit capture（連続吸収）と実効散乱
-  - 追跡カーネル（境界交差/衝突/散乱/census）
-  - diffusion 分類マスク（current/previous/hold、\(\tau_R\)、reduced flux）、deterministic \(E^D_{i,g}\) buffer、前ステップ signed face-current buffer、IMC↔diffusion interface face-current buffers を保持する
-  - **FREEZE-1D-RAD (2026-04-26)**: IMC/DDMC/HOLO/difference 経路は
-    1D_SPH では namelist validation で `ConfigError` とし、2D_RZ 用コードとして保持する。
-    1D_SPH production radiation は `multigroup_diffusion` と `sn_transport` のみ。
-- `Rad::DifferenceResidualization`（`src/radiation/difference_residualization.cu`, `difference_residualization.cuh`）
-  - difference formulation の census 残差化を GPU 上で実行し、cell×group bin の signed/absolute energy、scale/rebuild/kill/empty 判定、残差 PhotonPool 再構築を担当する
-  - `previous_reference_U` は device-resident reservoir として維持し、empty bin 残差粒子も host roundtrip なしで生成する
-- `Rad::DiffusionConversion`（`src/radiation/diffusion_conversion.cu`, `diffusion_conversion.cuh`）
-  - diffusion entry セルの alive 粒子を cell×group accumulator へ fold し、`IMC::diff_E_` [erg/cm³] へ変換する
-  - diffusion exit セルの `diff_E_` を IMC 粒子へ戻し、予約済み high local-id range の exit subrange から `global_id` を割り当てる
-- `Rad::DiffusionInterface`（`src/radiation/diffusion_interface.cu`, `diffusion_interface.cuh`）
-  - IMC packet が diffusion cell へ入る boundary crossing を positive `face_current_in` source と signed `face_current_step` に分離して tally する
-  - RKL2 後の diffusion-IMC interface leakage を `face_current_out` に保存し、`diff_E_` から差し引いた energy と同量の IMC packet を adjacent IMC cell に生成する
-  - interface spawn 粒子は exit subrange と disjoint な high local-id subrange から `global_id` を割り当てる
-  - tail IMC pass 後に diffusion へ戻った interface packet energy を `diff_E_` へ直接加算する
-- `Rad::DiffusionSourceSolve`（`src/radiation/diffusion_source_solve.cu`, `diffusion_source_solve.cuh`）
-  - diffusion セルだけを1 thread/cell で処理し、cell-local Newton solve により `diff_E_`, `Te`, `ee`, `Pe` を Radiation step 内で更新する（NUMERICS §7.1.2c）
-  - `rad_dep` / `rad_emit` には gross absorption/emission 診断を加算するが、後段 `Coupling::SourceTerms` では diffusion セルに再適用しない
-- `Num::RKL2STS`（`src/numerics/rkl2_sts.cu`, `rkl2_sts.hpp`）
-  - Legendre recurrence から RKL2 stage 係数を host 側で生成し、stage 数を \(\sqrt{\Delta t/\Delta t_{exp}}\) scaling で見積もる（NUMERICS §7.1.2d）
-- `Rad::DeterministicDiffusion1D`（`src/radiation/deterministic_diffusion_1d.cu`, `deterministic_diffusion_1d.cuh`）
-  - 1D_SPH diffusion セルの `diff_E_` を frozen Rosseland face stencil と RKL2 super-time-stepping で更新する
-  - diffusion-diffusion 内部面は antisymmetric finite-volume flux、RKL2 内の diffusion-IMC interface は zero-current、outer vacuum は \(cE/4\) leakage を使う。PR5 の diffusion-IMC outward leakage は RKL2 後に `Rad::DiffusionInterface` が処理する
-- `Rad::DDMC` **[RETIRED — legacy DDMC/HOLO; 現行輻射は §4.5 冒頭 banner の FLD/\(S_N\)]**
-  - セル×群モード判定（τ **かつ** ω、NUMERICS §7.1.2準拠。σ_R ベースで f/η/σ^PA とは独立）
-  - diffusion離散（Kershaw係数）→リーク係数生成
-  - **M‑matrix診断**（オフ対角 ≤0、正値確率を保証できないセルはDDMC無効化）
-  - DDMCイベント（リーク/吸収/census）
-- `Rad::Interface`
-  - IMC⇄DDMC変換（位置・方向サンプル）
-  - interface bc の選択（cosine / half_isotropic）
-- `Rad::Tally`
-  - 沈着（rad_dep[cell,g]）
-  - 推定量（rad_E[cell,g]：track‑length/residence estimator）
-  - 境界流出、エネルギー収支
-  - difference formulation の deterministic reference face transport buffers
-    （`diff_ref_face_delta_U_`, `diff_U_ref_end_`, `diff_E_ref_avg_`）。これらは
-    `rad_dep`/`rad_E_tally` とは別に保持し、`diff_U_ref_end_` を次 step の
-    previous-reference reservoir、`diff_E_ref_avg_` を PR7 の `rad_E`
-    reconstruction に使う
-  - **タリーは本モジュールに集約**し、他モジュール（Hydro/Laser等）が直接atomic操作しない
-  - **GPU集約戦略（3段階、NUMERICS §10.3 準拠）**：
-    1. **Stage 1: warp-level**（`tally_mode="warp"` or `"warp_block"`）：
-       - セルソート済み（NUMERICS §6.5）の粒子に対し、`__match_any_sync`（CC 7.0+）で
-         warp内の同一セル×群ピアグループを検出
-       - 全ピアレーンが `__shfl_down_sync(peers, ...)` で segmented reduction を実行し、リーダーが1回の atomicAdd で書き出す
-         （**注意**: リーダーのみが `__shfl_sync` を呼ぶパターンはCUDA仕様§B.15で未定義動作。CUDA_KERNELS §6.4参照）
-       - 削減率：最大32倍（warpサイズ分）。セルソート済みで典型的に 28–32倍
-       - レジスタ増加：~4（peers, leader, others, src）→ occupancy影響なし
-    2. **Stage 2: block-level**（`tally_mode="warp_block"`）：
-       - shared memory上のビンヒストグラム（`smem_dep[N_BINS]`, `smem_tl[N_BINS]`, `smem_keys[N_BINS]`）
-       - Stage 1のワープリーダー出力を `atomicAdd_block`（ブロックスコープ atomic）で共有メモリに蓄積
-       - ブロック末尾で `__syncthreads()` 後、一括 flush（`atomicAdd` → global）
-       - 共有メモリ：128 × 20B = 2.5 KB/block（`smem_dep` 8B + `smem_tl` 8B + `smem_keys` 4B）。A100で8 blocks/SM → 20 KB（12%）
-       - ビンオーバーフロー時は global atomicAdd にフォールバック
-    3. **Stage 3: global atomicAdd**（全モード共通の最終書き出し）：
-       - `atomicAdd(double*, ...)` で `rad_dep[cell*G+g]` へ直接加算
-       - CC 6.0+（Pascal）でハードウェアサポート。v1.0最低要件（CUDA 12.0+）で充足
-  - **v1.0既定**：`tally_mode="warp"`（Stage 1+3）。セルソート（NUMERICS §6.5）と不可分で同時有効化される。
-    `"warp_block"`（Stage 1+2+3）はPersistent Warp（NUMERICS §6.6）との設計上の緊張があるため将来拡張とする
-  - **namelist制御**：`Parallel.gpu_optimization.tally_mode`（既定 `"warp"`）
-  - **セルソート**：輻射演算子冒頭で粒子を `cell_id` でRadixSort（NUMERICS §6.5）。
-    Stage 1/2 の前提条件。`Parallel.gpu_optimization.particle_sort_by_cell`（既定 True）で制御
-  - IMC / DDMC / PGRW は共通の `rad_E_tally` を共有する。PGRW は `imc_transport_persistent` 内の IMC branch で処理され、吸収減衰は通常 IMC と同じ `rad_dep` / `rad_E_tally` へ加算する
-- `Rad::FaceGeometry`（`src/radiation/face_geometry_2d.cuh`）
-  - 2D_RZ セルの辺端点からの幾何計算を一元化するヘッダ
-  - `FaceGeom2D` 構造体：面端点 \((R_1,Z_1), (R_2,Z_2)\)、法線 \(\hat{n}\)、
-    接線 \(\hat{t}\)、面長 \(L\)、中点R座標 \(\bar{R}\) を保持
-  - `compute_face_geom()`：4頂点と面ID (0-3) から FaceGeom2D をon-the-flyで計算
-    - 法線方向は CCW トポロジ（CUDA_KERNELS §6.4.2 の辺→物理面マッピング）から決定
-    - 外向き法線 \(\hat{n} = (\Delta Z, -\Delta R) / L\)
-  - IMC transport（`imc_transport_2d.cu`）、DDMC transport（`ddmc_transport_2d.cpp`）、
-    境界距離計算（`boundary_distance_2d.cuh`）の3箇所で共有される
-  - Hydro の Svec（NUMERICS §3.2.6）とは独立。Svec はコーナー力用、FaceGeom2D は輻射面幾何用
-- `Rad::BC`（`src/radiation/boundary.cuh`, `boundary.cu`）
-  - vacuum：境界到達で粒子消滅、`E_escape` に計上
-  - reflect：鏡面反射（方向ベクトルの**面法線**成分反転。一般法線 \(\hat{n}\) を使用）
-  - Marshak：境界放射源の粒子生成（NUMERICS §8.2）
-- `Rad::CompositeSort`（`src/radiation/composite_sort.cu`, `composite_sort.cuh`）
-  - 64ビット合成キーによるソート＋compaction＋モード分離の融合（NUMERICS §6.5）
-  - `composite_sort_and_partition()`：フルRadixSortパス
-  - `compact_alive_only()`：全IMC時の O(N) atomic compaction 最適化パス。persistent scratch pool と
-    device counter を再利用し、mapping gather + pool swap でSoA copy-backを一括化
-  - dead粒子のエネルギー回収（`E_numerical_loss` 計上）
-- `Rad::CensusComb`（`src/radiation/census_comb.cu`, `census_comb.cuh`）
-  - Census粒子の個体数制御（NUMERICS §6.4.1）
-  - `census_comb_gpu()`：hybrid CPU/GPU パイプライン
-  - detect_bins -> CUB scan -> D2H -> CPU importance-weighted selection -> H2D -> gather
-- `Rad::ModeSelector`（`src/radiation/mode_selector.cpp`, `mode_selector.hpp`）
-  - セル*群のIMC/DDMCモード判定（NUMERICS §7.1.2）
-  - ヒステリシスモード選択器（NUMERICS §7.1.3）
-  - `apply_hysteresis()`：状態機械による遷移制御
-  - diffusion mask は selector 後の force-IMC mask として適用し、diffusion/guard セルを DDMC から除外する
-- `Rad::DDMCDiffusion1D`（`src/radiation/ddmc_diffusion_1d.cu`, `ddmc_diffusion_1d.cuh`）
-  - HIMCD Phase-1 の 1D implicit radiation diffusion solve（NUMERICS §7.4.1）
-  - DDMC セル×群だけを抽出し、host-side tridiagonal solve で `rad_E_tally` / `rad_dep` / `E_escape` を更新
-  - DDMC-IMC 界面は zero-flux、vacuum 境界は既存 DDMC leak coefficient を sink として再利用
-- `Rad::RWTransport1D`（`src/radiation/rw_transport_gpu.cu`, `rw_transport_gpu.cuh`）
-  - legacy external RW path。`TransportMode::RW` を生成しないため現行フローでは dead code
-  - active な PGRW 実装は `src/radiation/imc_transport_persistent.cu` の internal branch（NUMERICS §7.4.2）
-- `Rad::RadLiteMesh`（`src/radiation/rad_lite_mesh.cu`, `rad_lite_mesh.hpp`）
-  - 放射メッシュ粗視化（1D_SPH専用、未アクティブ）
-  - 隣接セルの不透明度比に基づくセル結合
 
 #### 4.5.1 Radiation トップレベル関数シグネチャ
 
 ```cpp
-struct RadiationResult {
-    double E_absorbed;          // [erg] 総吸収エネルギー（このステップ）
-    double E_emitted;           // [erg] 総放出エネルギー（ソース粒子）
-    double E_escaped;           // [erg] 境界脱出エネルギー（物理的境界流出のみ）
-    double E_numerical_loss;    // [erg] 数値的喪失エネルギー（粒子移送失敗等のアルゴリズム限界。E_escapedとは別計上）
-    double E_census;            // [erg] census粒子のエネルギー合計
-    int n_particles_end;        // ステップ終了時の生存粒子数
-    int n_roulette_kills;       // Russian roulette で除去された粒子数
-    double dt_rad;              // [s] 放射CFL制約から算出された推奨Δt
+// 輻射演算子 R(Δt)（NUMERICS §2.1、§6.7、§6.8）。driver が 1 ステップに 1 回（Radiation.imc.two_stage では
+// 半ステップずつ 2 回）呼ぶ。物質の更新（Te, ee, Pe）と rad_dep / rad_emit の publish は各ソルバーの中で行う。
+class RadiationStep {
+ public:
+  void step(core::State& state, const core::Config& cfg, double dt,
+            const parallel::PartitionInfo& part = {},    // MPI の分割（2D_RZ の r-slab）
+            parallel::CommBuffers* bufs = nullptr,       // n_ranks > 1 では必須
+            double drive_time_s = NaN);                  // 1D の時間依存の境界駆動を引く時刻（NaN = state.t）
+  void set_last_overshoot_metrics(std::int64_t count, double max_ratio);  // step() が 0 に戻す
+  std::int64_t last_overshoot_count() const;             // history radiation/overshoot_count
+  double last_overshoot_max() const;                     // history radiation/overshoot_max
 };
-```
-
-```cpp
-// Radiationフルステップ（Strang splitting R(Δt)）— NUMERICS §6, §7
-RadiationResult radiation_step(
-    State& state,                       // 流体場・PhotonPool・タリー配列
-    const OpacityTable* opacity,        // 不透明度テーブル（device）
-    const EOSTable* eos_e,              // 電子EOS（Fleck factor計算用）
-    const PlanckTable* planck,          // Planck分率テーブル（device）
-    double dt,                          // フルステップ幅 Δt [s]
-    const Config::RadiationConfig& rad, // 群境界、粒子数、DDMC閾値
-    const PartitionInfo& part,          // 並列情報
-    CommBuffers& comm,                  // 粒子移動バッファ
-    cudaStream_t stream
-);
 ```
 
 #### 4.5.2 Radiation GPU カーネル起動仕様
 
-放射輸送モジュールの主要カーネルと起動設定：
-
-| カーネル名 | 粒度 | block_size | grid_size | shared memory | 備考 |
-|-----------|------|-----------|-----------|--------------|------|
-| `compute_opacities` (U9) | 1スレッド=1セル（群ループ内） | **256** | `((n_cells+n_ghost)+255)/256` | なし | σ_a,σ_s,σ_R,σ_P,σ_t 一括前計算（ARCHITECTURE §4.7、CUDA_KERNELS §7.7） |
-| `compute_fleck_factor` (R1) | 1スレッド=1セル（群ループ内） | **256** | `(n_cells+255)/256` | なし | R1: Fleck因子。ゴーストセルの f_fleck は halo_exchange で取得（CUDA_KERNELS §6.1 注記） |
-| `ddmc_mode_judge` (R2) + `ddmc_leak_coeff` (R3) | 1スレッド=1セル（群ループ内） | **256** | `((n_cells+n_ghost)+255)/256` | なし | R2: DDMCモード判定, R3: リーク係数+M-matrix。ゴーストセル含む（R3b が隣接 ddmc_mode 参照。M08ではR2/R3無効） |
-| `compute_source_energy` (R4) + `source_particle_count` (R5) + `source_particle_fill` (R6) + `marshak_source` (R13) | R4/R5: 1スレッド=1セル（群ループ内）, R6/R13: 1スレッド=1粒子 | R4/R5: **256**, R6/R13: **128** | 標準 | なし | R4: source_E [erg] 計算, R5: CUB prefix-sum, R6: 体積ソース生成, R13: Marshak境界ソース生成（BC適用時のみ） |
-| `imc_transport_persistent` | Persistent Warp（1warp=1粒子ストリーム） | **128** | `n_sm × blocks_per_sm`（SM数依存、固定） | なし（Stage 1はレジスタのみ） | IMC追跡ループ。`__launch_bounds__(128, 8)` 指定。§5.6.1参照 |
-| `ddmc_event_loop` | 1スレッド = 1粒子 | **128** | `(n_ddmc + 127)/128` | なし（Stage 1はレジスタのみ） | DDMCイベントループ。`__launch_bounds__(128, 16)` 指定（CUDA_KERNELS §6.5準拠） |
-| `tally_finalize` (R10) | 1スレッド = 1セル×1群 | **256** | `(n_cells*G + 255)/256` | なし | 1スレッド=1(cell,group): legacy は rad_E_tally/(V×c×dt)、difference は E_ref_avg + signed residual を `rad_E` へ正規化（CUDA_KERNELS §6.0e） |
-
-**`imc_transport_persistent` 詳細**（NUMERICS §6.3 準拠、CUDA_KERNELS §6.4）：
-> **注**: 以下のシグネチャは主要引数を示す。完全な引数リスト（ddmc_mode, sigma_R, mesh node座標, PlanckTable, birth_energy, global_id, step, user_seed, boundary_type 等）は CUDA_KERNELS §6.4 を参照。R8 は per-face Δx_m をメッシュノード座標からインライン計算する。
-
-```cpp
-// IMC粒子追跡カーネル（Persistent Warp）
-// 1warp = 1粒子ストリーム、各粒子が独立にイベントループを実行
-__global__ void imc_transport_persistent(
-    // --- 粒子データ（SoA、PhotonPool）---
-    double* pos_r, double* pos_z,
-    double* dir_r, double* dir_z, double* dir_phi,
-    double* energy, double* weight, double* time_remain,
-    int32_t* cell_id, uint16_t* group_id,
-    uint8_t* mode, uint8_t* alive,
-    uint32_t* rng_counter,
-    int n_particles,
-    // --- メッシュ・物性（read-only）---
-    const Mesh* mesh,
-    const double* sigma_a_eff,      // [n_cells × G] 実効吸収 [1/cm]（Fleck factor適用済み）
-    const double* sigma_s_eff,      // [n_cells × G] 実効散乱 [1/cm]（Fleck factor適用済み）
-    // --- タリー出力（atomic書き込み、thread-unsafe: atomicAddで排他）---
-    double* rad_dep,                // [n_cells × G] 吸収沈着 [erg]
-    double* rad_E_tally,            // [n_cells × G] track-length推定量の蓄積 [erg·cm]（NUMERICS §10.1）
-                                    // カーネル内で Σ E_mid × Δs を atomicAdd で蓄積。
-                                    // ステップ末に rad_E[i,g] = rad_E_tally[i,g] / (V_i^{*} × c × Δt) [erg/cm³] へ変換
-    double* face_current_step,      // [(n_cells+1) × G] 1D diffusion reduced-flux用の signed face current [erg]
-    uint8_t* diff_cell,             // [n_cells] deterministic diffusion cell mask
-    double* diff_face_current_in,   // [(n_cells+1) × G] IMC→diffusion positive source [erg]
-    double* E_escape,               // [n_groups] 群別境界流出エネルギー [erg]（CUDA_KERNELS §6.4 参照）
-    double* rad_mom_dep,            // [n_cells × D_mom] 運動量沈着（診断のみ、momentum_deposition=true時）。Δp = ΔE/c × Ω̂
-    // --- 制御パラメータ ---
-    double dt,                      // [s] タイムステップ幅
-    double t_end,                   // [s] ステップ終了時刻
-    int interface_method,           // IMC→DDMC変換方式: 0=asymptotic_diffusion_limit, 1=marshak（CUDA_KERNELS §6.4）
-    int dim,                        // 1=1D_SPH, 2=2D_RZ
-    DeviceErrorFlags* error_flags,  // §10.1 準拠
-    double* E_numerical_loss_dev    // [1] MAX_EVENTS強制終了時の残余エネルギー計上先（atomicAdd）
-);
-```
-
-- **タリー集約**（§4.5 Rad::Tally、NUMERICS §10.3 準拠）：
-  - v1.0（`tally_mode="warp"`、既定）：warp-level `__match_any_sync` + `__shfl_sync` 集約 → global atomicAdd。
-    セルソート済み粒子に対しwarp内同一セル×群のピアを検出し、リーダーが1回の atomicAdd で書き出す。
-    shared memory 不使用（レジスタ ~4個追加のみ）。global atomicAdd 回数を最大 32分の1 に削減
-  - フォールバック（`tally_mode="global"`）：各スレッドが直接 `atomicAdd` で global `rad_dep[]` へ書き込む。CC 7.0未満用
-- **イベントループ**：各スレッドが `while(alive && time_remain > 0)` で
-  境界交差/散乱/census の最短イベントを逐次処理
-- **DDMC遷移**：IMC粒子がDDMCセルに入った場合、`mode` を1に変更し
-  `imc_transport_persistent` を終了。当該ステップでは再処理せず、次ステップの `composite_sort_and_partition`（R7）で再分配後に `ddmc_event_loop` で処理される
-
-**`ddmc_event_loop` 詳細**（NUMERICS §7.5 準拠、CUDA_KERNELS §6.5 参照）：
-
-> **注**: 以下のシグネチャは主要引数を示す。完全な引数リスト（rad_mom_dep, Sigma_out, Sigma_leak_bdry, ddmc_mode, global_id, step, user_seed, boundary_type, DeviceErrorFlags, E_numerical_loss_dev 等）は CUDA_KERNELS §6.5 を参照。DDMC運動量沈着（rad_mom_dep）は R9 内のリークイベントで隣接面法線方向に atomicAdd で蓄積する（NUMERICS §7.8 DDMC寄与、CUDA_KERNELS §6.5）。
-
-```cpp
-// DDMCイベント処理カーネル
-// 1スレッド = 1粒子（DDMCモードのみ）、History-based（Persistent Warp不使用）
-__global__ void ddmc_event_loop(
-    // 粒子データ（SoA）+ タリー出力（imc_transport_persistent と同一レイアウト）
-    // ...省略（imc_transport_persistent と同一引数群）...
-    double* pos_r, double* pos_z,       // [n_particles] 位置（DDMC→IMC変換時に書き戻し）
-    double* dir_r, double* dir_z, double* dir_phi,
-    double* energy, double* time_remain,
-    uint32_t* rng_counter,
-    int32_t* cell_id, uint16_t* group_id,
-    uint8_t* mode, uint8_t* alive,
-    int n_ddmc,
-    // --- タリー出力（atomic書き込み、thread-unsafe: atomicAddで排他）---
-    double* rad_dep,                    // [n_cells × G] 吸収沈着 [erg]
-    double* rad_E_tally,                // [n_cells × G] track-length推定量の蓄積 [erg·cm]（NUMERICS §7.6）
-                                        // カーネル内で Σ c × E × Δt_res を atomicAdd で蓄積。
-                                        // ステップ末に rad_E[i,g] = rad_E_tally[i,g] / (V_i^{*} × c × Δt) [erg/cm³] へ変換
-    double* E_escape,                   // [n_groups] 群別境界流出エネルギー [erg]（CUDA_KERNELS §6.5 参照）
-    // --- DDMC固有 ---
-    const double* leak_coeff,       // [n_cells × n_faces × G] リーク係数 Σ^leak [1/cm]（NUMERICS §7.3）
-                                    // イベント時間: Δt = -ln(ξ)/(c × Σ^tot) で c を乗じて [1/s] へ変換
-                                    // メモリレイアウト：cell-major → face → group
-                                    // 1D: [n_cells×2×G]（左/右）、idx = cell*2*G + face*G + g
-                                    // 2D: [n_cells×4×G]（R_left/R_right/Z_bottom/Z_top の4面、idx = cell*4*G + face*G + g — §6.4.3 面規約）
-                                    // 注：Kershaw 9-point ステンシルは8近傍だが、DDMCリーク面はトポロジカル面(4面)のみ。
-                                    //   角近傍のリーク寄与は隣接する2面に分配される（NUMERICS §7.3.5）
-    const double* sigma_a_eff,      // [n_cells × G] 実効吸収 [1/cm]
-    // --- 制御パラメータ ---
-    double dt,                      // [s] タイムステップ幅
-    int nr, int nz, int n_groups, int n_faces  // メッシュ次元（CUDA_KERNELS §6.5 準拠）
-);
-```
-
-- **イベント処理**：総イベント率 \(\Sigma^{tot}\) から指数分布で時刻を進め、
-  リーク/吸収/census を確率的に選択（NUMERICS §7.5）
-- **IMC遷移**：DDMCセルからIMCセルへリークした場合、
-  `cell_id` をリーク先IMCセルに更新し（CUDA_KERNELS §6.5 参照）、出射方向をサンプルし
-  `mode` を0に変更。次ステップの `imc_transport_persistent` で追跡継続
-
-**ソース粒子生成パイプライン詳細**（NUMERICS §6.2 準拠、CUDA_KERNELS §6.0b-§6.3 参照）：
-
-v1.0 では4カーネルパイプラインで構成する：
-1. **R4** `compute_source_energy`: 各セル×群の source_E [erg] = S^{emit} × V × Δt を計算
-2. **R5** `source_particle_count`: 既定は `max(1, round(N_p_total × source_E / source_total))`。`spectral_bias_eta>0` のときは cell-local `emission_bias_cdf` を参照し、`source_cell_total × q_g / source_total` へ粒子数配分のみを切り替える → CUB prefix-sum
-3. **R6** `source_particle_fill`: `E_p = source_E[c,g] / N_p[c,g]` で粒子エネルギーを決定し、位置・方向をサンプル
-4. **R13** `marshak_source`（Marshak BC適用時のみ）: 境界面ごとに入射粒子を生成（NUMERICS §8.2、CUDA_KERNELS §6.0h）。`global_id_base` は R6 の末尾ID+1 から割り当て（RNGストリーム独立性を保証）
-
-```cpp
-// R6: source_particle_fill（CUDA_KERNELS §6.3）
-// 1スレッド = 1粒子：particle_offsets から (cell, group) を逆引きし、
-// セル内の位置・方向をサンプルしPhotonPoolに書き込み
-__global__ void source_particle_fill(
-    PhotonPool pool,                // 書き込み先（SoA）
-    int pool_offset,                // census粒子の後に配置
-    const double* source_E,         // [n_cells × G] ソースエネルギー [erg]（R4出力、V×Δtを含む）
-    const int* particle_offsets,    // [n_cells × G + 1] prefix sum（R5出力）
-    const Mesh* mesh,               // 位置サンプリング用
-    uint64_t step,                  // RNGシード用ステップ番号
-    uint64_t global_id_base,        // MPI offset = step_base + rank_offset（NUMERICS §12.7.1）
-    int n_cells, int n_groups, int dim
-);
-```
-
-`global_id[k] = global_id_base + k`。`global_id_base = step × N_max_per_step + MPI_Exscan(N_emit, SUM)`（N_max_per_step = 2^40、NUMERICS §12.7.1）。
+現行の FLD・\(S_N\) のカーネルと起動設定は CUDA_KERNELS §6.7（FLD）・§6.8（\(S_N\)）を参照。
+（本節にあった IMC/DDMC のカーネル起動仕様は `retired/radiation_monte_carlo/docs/ARCHITECTURE_monte_carlo.md` へ移した。）
 
 #### 4.5.3 放射輸送の分散低減・加速機能
 
-| 機能 | ファイル | Config | 本番状態 |
-|------|---------|--------|---------|
-| **差分定式化（DF）** | `imc.cpp`, `difference_residualization.cu`, `tally.cu` | `difference.enabled` | **ON** (本番) |
-| **正味電子ソーススムージング** | `source_terms.cu` | `net_e_source_smoothing.*` | **ON** (α=0.25, τ=6) |
-| **スペクトルバイアス** | `imc.cpp`, `source.cu` | `spectral_bias_eta` | ON (η=0.3) |
-| **ソースティルティング** | `source.cu` | `source_tilting` | ON |
-| **PGRW** | `imc_transport_persistent.cu` | `tau_rw` | ON (τ=5) |
-| **Census ESS フロア** | `census_comb.cu` | `ess_floor_enabled` | OFF |
-| **ソース局在化** | `source.cu`, `imc.cpp` | `source_localization` | OFF |
-| **勾配適応フィルタ** | `source_terms.cu` | `gradient_adaptive` | OFF |
-| **HOLO global LO solver/coupling mask** | `config.hpp`, `builder.cpp`, `freeze.cpp`, `imc_transport_persistent.cu`, `holo_geometry.hpp`, `holo_selector.cpp`, `holo_lo_state.cu`, `holo_lo_solver.cpp`, `sn_transport_1d.cpp`, `sn_transport_gpu.cu` | `holo.enabled` | OFF |
-
-**差分定式化（DF）**: 一般化参照場 W = W_max × τ²/(τ²+τ0²) × 1/(1+(χ/χ0)⁴) で近平衡殻の MCノイズを根本低減。signed particles（`PhotonPool::sign`）、census 残差化（ビンレベル再利用/スケーリング）、AP制限面輸送 ψ(τ) = tanh(3τ/4)/(3τ/4)。W≥0.5 セルではソーススムージングを自動無効化。設計: `docs/design/difference_formulation_full.md`。
-
-**正味電子ソーススムージング**: H = Σ_g(rad_dep - rad_emit) を保存的フェイス交換で平滑化。IMC 沈着ノイズが電子圧力に入る前にフィルタリング。xRAGE のカプセルデポジションスムーザーに類似。マルチパス対応（ping-pong GPU バッファ）、勾配適応α対応。
-
-**Census ESS フロア**: Window群（Rosseland 重要度高）のセンサスESS を閾値以上に維持するためにスプリット。ただし偽証テストで starvation仮説が棄却されたため本番では無効。
-
-**HOLO LO solver**: `holo_lo_solver.cpp` は v1 の swappable backend であり、
-1D_SPH 全 cell に対して CPU Thomas 法で global physical-frame LO diffusion/source solve を
-毎 radiation step 実行する。内部 HOLO 境界と high-order face-current boundary condition は
-使わず、inner reflect と outer vacuum の物理境界だけを適用する。API は geometry dimension
-付き host pointer view（`HoloLOInputs`/`HoloLOResult`）で、ideal-gas と electron table
-EOS（TMAT 由来 table を含む）closure を扱う。`holo_selector.cpp` は
-Rosseland optical depth 閾値と guard cell 膨張で LO material-coupling mask を作るだけで、
-solver domain は制限しない。`imc.cpp` は transport 後に global LO solve を呼び、
-`source_terms.cu` が mask cell の material source を
-`State.holo_rad_dep - State.holo_rad_emit` の LO 診断へ切り替える。particle
-`rad_dep/rad_emit` は出力用 raw diagnostic として保持し、mask cell では material
-energy へ再適用しない。非 mask cell は従来通り particle source で material update する。
-LO solve 失敗時は `State.holo_lo_source_valid=False` のまま warning を出して継続し、
-その step の mask cell material source は通常の particle `rad_dep/rad_emit` へ fallback する。
-`holo_geometry.hpp` は selector/solver に共通の geometry dimension を定義する。v1 runtime
-の LO solver は `Spherical1D` のみを有効化し、2D_RZ は namelist validation で無効化する。
-`sn_transport_1d.cpp` は QD closure 専用の standalone CPU backend であり、
-`holo.solver="quasidiffusion_1d"` かつ `holo.sn_closure=True` のとき、
-LO solve 直前に IMC と同じ host opacity/Fleck/Planck source data から
-noise-free \(P_{rr}/E\) closure を作る。MC transport、DDMC、PGRW の particle path とは
-独立で、CUDA kernel は持たない。`sn_transport_gpu.cu` は 1D_SPH と 2D_RZ の
-group-parallel CUDA \(S_N\) backend である。When
-`holo.sn_material_coupling=True`, 1D_SPH QD runs use it as a chi-only HO closure.
-`solve_holo_sn_material_coupling`
-launches the GPU \(S_N\) sweep with material update disabled, copies
-`State.holo_chi` to host, and calls `solve_holo_lo_source_ownership` with that
-precomputed closure. `solve_holo_lo_source_ownership` applies the common QD
-closure regularizer (`closure_smooth_passes`, `closure_smooth_alpha`,
-`closure_relax`) for MC tally closure, CPU \(S_N\) closure, and GPU \(S_N\)
-precomputed closure before assembling `HoloLOInputs` and invoking
-`solve_holo_lo_1d_cpu(..., true)`.  The LO solver then writes
-`State.holo_E_LO`, `State.holo_F_LO`, `State.Te`, `State.ee`, and `State.Pe`.
-2D_RZ still bypasses LO/QD and generates the deterministic material source
-`State.holo_rad_dep - State.holo_rad_emit` for all cells.
-`source_terms.cu` treats the 1D SN+QD LO path as direct material ownership, so
-the published LO source is recorded in `delta_E_rad_prev` for diagnostics but
-is not applied to `ee` a second time.  The 2D_RZ \(S_N\) path remains
-source-injection owned.
+退役（モンテカルロ輻射の分散低減・加速機能。記述は `retired/radiation_monte_carlo/docs/ARCHITECTURE_monte_carlo.md` へ移した）。
 
 #### 4.5.4 ハイブリッド輸送（研究ブランチ、本番 OFF）
 
-3モード構成: IMC（薄い領域）+ DDMC/PGRW（中間）+ RKL2 決定論的拡散（厚い殻）。
-
-| コンポーネント | ファイル |
-|---|---|
-| セル分類 | `imc.cpp`（τ_R, reduced flux, ヒステリシス） |
-| エントリ/エグジット変換 | `diffusion_conversion.cu` |
-| セルローカルソース解法 | `diffusion_source_solve.cu` |
-| RKL2 STS 拡散 | `deterministic_diffusion_1d.cu`, `rkl2_sts.cu` |
-| IMC↔拡散界面 | `diffusion_interface.cu` |
-
-**無効化理由**: 移動界面、モードチャタリング（5,900 入退出）、境界ソースクロージャが振動を 50-80% 悪化。設計: `docs/design/hybrid_transport_plan.md`。
+退役（IMC + DDMC/PGRW + 決定論拡散の 3 モード構成。記述は `retired/radiation_monte_carlo/docs/ARCHITECTURE_monte_carlo.md` へ移した）。
 
 ---
 
@@ -2010,8 +1517,10 @@ source-injection owned.
   - 1D_SPH：ray trace 用に midplane から radial side arrays
     \((r,\hat n,\hat n_{raw},A_{smooth},d\hat n/dr)\) も併せて保持
   - 2D_RZ：2D_RZ HydroMeshの \(\rho(R,Z), T_e(R,Z), \bar Z(R,Z)\) を直接マッピング（NUMERICS §5.7.3 (b)）
-  - **臨界密度以下の領域のみ** をカバー（`critical_clip`）
-  - **ストレッチ格子**：密度勾配が大きい領域で自動的にメッシュを細かくする（`density_gradient` 方式）
+  - `critical_clip`：節点の \(\hat n\) を `critical_margin` で頭打ちにする（値の上限。1D の格子は臨界面より奥も含む）
+  - 1D は写像のたびに節点を作り直す：臨界面の近くを細かく、内外へ幾何級数で粗くする graded 配置（NUMERICS §5.7.2）。
+    ゴーストコロナが外半径を超えると外半径を広げて作り直す（2026-09-29）。2D は初期化時の一様格子。
+    （密度勾配で伸縮する格子は無い — `stretch_method`・`min_ratio` はどのメッシュも読まず、指定すると警告）
   - 節点（node-centered）に \(\hat n = n_e/n_{crit}\), \(T_e\), \(\bar Z\), \(\nabla\hat n\) を保持
   - 節点での中心差分による密度勾配 \(\nabla(n_e/n_{crit})\) の計算
 - `Laser::Cbet`（`cbet.cu/.cuh`、v1 = 1D_SPH `raytrace_2d` + 2D_RZ `raytrace_3d` opt-in）：Marozas 型保存的 pairwise CBET
@@ -2019,7 +1528,10 @@ source-injection owned.
   - CbetWorkspace（grow-only device 常駐）上で決定論的固定点反復（tally → 反対称交換+donor cap → IB/2·CBET·IB/2 propagate）
   - 沈着・未吸収は per-ray 行 + 固定順 reduction でビーム毎に集計し、既存の deposit 再配分・skip cache 経路へ接続（NUMERICS §5.10）
   - 2D_RZ CBET は theta-group ごとの record-mode trace → joint exchange solve → per-group LaserMesh node deposit を生成し、既存の 2D transfer path に接続する。Workspace singleton は 1D と共有し、recorder template 実体化は defining TU に閉じる；nvcc+RDC では header 側 template declaration を増やすと OFF path まで再実体化されるため、新規宣言は wrapper/header isolation で分離する。
-- `Laser::HotElectron1D`（`hot_electron_1d.cuh/.cpp`）：1D hot-electron preheat: capture reduction, cone quadrature, chord walkers, CSDA pipelines（host; device-ready header）
+- `Laser::HotElectron1D`（`hot_electron_1d.cuh/.cpp`、`hot_electron_1d_gpu.cu`）：1D hot-electron preheat: capture reduction, cone quadrature, chord walkers, CSDA pipelines。本番の cone の経路は device（`hot_electron_1d_gpu.cu`、`laser.cu` から起動）、host の実装は参照用
+- `Laser::HotEEtaModel`（`hot_e_eta_model.cpp`）：\(\eta(t)\) の閾値モデルと緩和（NUMERICS §5.11.3）
+- `Laser::PortSection`（`port_geometry`、`port_section_chi`、`port_section_overlap`、`sector_phase_space`、`sector_adapter`）：
+  実ポート配置の多ビーム CBET（`cbet.geometry_mode="port_section"`、NUMERICS §5.10.8）
 - `Laser::HotElectron2D`（`hot_electron_2d.cuh/.cpp`）：2D RZ hot-electron transport: topology-agnostic MeshView2D, revolved-face chord walker, 3D band quadrature, capture reduction, host cone pipeline（reference path）
 - `Laser::HotElectron2DGpu`（`hot_electron_2d_gpu.cuh/.cu`）：device chord pipeline（1 thread/chord, deterministic host fold）+ scratch-pooled staging
 
@@ -2047,21 +1559,32 @@ struct LaserMesh {
 
     // --- 節点物理量（node-centered、deviceメモリ）---
     // メモリレイアウト：row-major [i * n_nodes_z + j]（i=R方向, j=Z方向）
-    double* n_e_hat;                // [(nr+1)×(nz+1)] 正規化電子密度 n_e/n_crit [dimensionless]
+    double* n_e_hat;                // [(nr+1)×(nz+1)] 正規化電子密度 n_e/n_crit（臨界でクリップ）[dimensionless]
+    double* n_e_hat_raw;            // [(nr+1)×(nz+1)] クリップ前の n_e/n_crit [dimensionless]
     double* T_e;                    // [(nr+1)×(nz+1)] 電子温度 [eV]
     double* Zbar;                   // [(nr+1)×(nz+1)] 平均電荷数 [dimensionless]
+    double* smooth_kappa_factor;    // [(nr+1)×(nz+1)] 逆制動輻射の smooth 係数（事前計算）
 
     // --- 密度勾配（node-centered、中心差分で計算）---
     double* grad_n_hat_R;           // [(nr+1)×(nz+1)] ∂(n_e/n_crit)/∂R [1/cm]
     double* grad_n_hat_Z;           // [(nr+1)×(nz+1)] ∂(n_e/n_crit)/∂Z [1/cm]
 
-    // --- 1D_SPH radial lookup side arrays ---
-    double* radial_node_r;          // [nr+1] radial node position r [cm]
-    double* radial_n_hat;           // [nr+1] clipped n̂ on Z=0
-    double* radial_n_hat_raw;       // [nr+1] raw n̂ on Z=0
-    double* radial_smooth_kappa;    // [nr+1] smooth-kappa factor on Z=0
-    double* radial_dn_dr;           // [nr+1] d(n̂)/dr on Z=0 [1/cm]
-    int     radial_n_nodes;         // = nr+1（1D_SPH path）
+    // --- 1D の光線追跡の径方向プロファイル [radial_n_nodes ≤ radial_capacity] ---
+    // 2026-09-24 以降は map_from_hydro_1d が hydro セルに結び付けて作る節点
+    // （面・臨界の対・プロファイルの節点、laser_mesh_bodies::build_trace_profile_nodes_1d）。
+    // それ以前は 2D レーザー格子の軸の列（Z=0 上の [nr+1]）だった。
+    double* radial_node_r;          // 節点の半径 r [cm]
+    double* radial_n_hat;           // クリップ後の n̂
+    double* radial_n_hat_raw;       // クリップ前の n̂
+    double* radial_smooth_kappa;    // smooth 係数（compute_smooth_kappa が埋める）
+    double* radial_T_e;             // 電子温度 [eV]
+    double* radial_Zbar;            // 平均電荷数
+    double* radial_dn_dr;           // d(n̂)/dr [1/cm]
+    int     radial_n_nodes;         // 使用中の節点数
+    int     radial_capacity;        // 確保済みの節点数
+    bool    trace_profile_1d;       // map_from_hydro_1d が設定（プロファイルを使う）
+    TraceProfileMap1D trace_profile_map; // 直近の 1D 写像の入力（外表面・臨界のセル、ゴーストの幅・密度など）
+    int     geometry_code;          // 写像した流体の Mesh.geometry_1d（0 球、1 円筒、2 平板）
 
     // --- 沈着配列（node-centered）---
     double* deposit;                // [(nr+1)×(nz+1)] 吸収パワー [erg/s]（NUMERICS §5.5）
@@ -2120,7 +1643,10 @@ struct LaserMesh {
 > **所有権**：`LaserMesh` は Laser モジュールが `init()` 時に確保し、ステップ毎に
 > 物理量を HydroMesh から再マッピングする（NUMERICS §5.7.4）。
 > State のメンバーではない（§5.2 の注記参照）。
-> 格子点配置は初期化時に固定され、ステップ中は変更しない。
+> 2D の格子点配置は初期化時に固定。1D は写像のたびに節点を作り直し（`map_from_hydro_1d`、NUMERICS §5.7.2）、
+> 径方向の配列は hydro セルに結び付いた節点（面・臨界の対・プロファイルの節点）を持つ。上の構造体は主要な欄だけを示し、
+> 容量の管理（`*_capacity`）、ステップごとの作業領域（`scratch_*`）、CBET の診断（`last_cbet_*`）などは
+> `src/laser/laser_mesh.cuh` を参照。
 
 - `Laser::RayInit`：レイ初期条件の生成
   - 1D_SPH：F値と集光位置からレイの初期位置（R方向1D配列）・方向を計算（NUMERICS §5.6.3 (a)）
@@ -2130,17 +1656,20 @@ struct LaserMesh {
   - ビームプロファイルからレイのパワー重みを計算（1D_SPH：環状面積 \(2\pi R\Delta R\)、2D_RZ：断面面積 \(\Delta u\Delta w\)）
   - 2D_RZ：極角θとパラメータによるビームグループ化（NUMERICS §5.6.4）
 - `Laser::RayTrace`：幾何光学（屈折）+ IB吸収
-  - 1D_SPH：2Dベクトル \((R,Z)\) でLeapfrog追跡（既定、NUMERICS §5.3.2）
+  - 1D_SPH `raytrace_2d`：既定の `integrator="auto"` は特性曲線積分（`ray_trace_characteristic.cuh`、NUMERICS §5.3.6）で、
+    臨界半径で反射する（`terminate=False` が既定）。`integrator="leapfrog"` は 2D ベクトル \((R,Z)\) の刻み幅可変の Verlet 行進
+    （NUMERICS §5.3.2、臨界で終了）。円筒・平板の 1D は特性曲線積分だけ
     - 場参照は 2D bilinear ではなく radial side array への 1D linear lookup
     - 勾配は \(d\hat n/dr\) から \((\partial\hat n/\partial R,\partial\hat n/\partial Z)\) を再構成
-    - 吸収パワーは Hydro の 1Dセル配列へ直接 atomic 蓄積
-  - 1D_SPH `radial_absorption_1d`：レイ初期化を行わず、全ビームパワー合計を `launch_radial_absorption_1d` へ渡して外側セルから内側セルへ serial 積分する
+    - 吸収パワーは Hydro の 1Dセル配列へ直接蓄積（決定論の固定順）
+  - 1D_SPH `radial_absorption_1d`：レイ初期化を行わず、全ビームパワー合計を `launch_radial_absorption_1d` へ渡して外側セルから
+    内側セルへ動径積分する（256 スレッドで 1024 セルずつ並列に評価。MPI では全 rank が同じ全線を計算し、所有窓で適用 — 2026-09-29）
   - 2D_RZ：**3Dベクトル \((x,y,z)\)** でLeapfrog追跡（NUMERICS §5.3.4）
     - 2D勾配→3D変換：\(\partial\hat n/\partial x = (\partial\hat n/\partial R)(x/R)\) 等
     - R=0特異性処理：\(R < R_{floor}\) で勾配の横方向成分を零とする
   - 任意点での場参照は次元依存（1D_SPH: radial 1D linear、2D_RZ: 2D bilinear）
   - IB吸収は台形公式による光学厚 \(S\) 計算（NUMERICS §5.4準拠）
-  - 臨界処理は2段階
+  - 臨界処理は2段階（`terminate=True` の経路。1D の特性曲線積分の既定は反射）
     - 通常は \(\varepsilon_{crit}\) 面までセグメントを切り詰めて terminate する（NUMERICS §5.2）
     - 臨界近傍では `critical-layer mode` に切り替え、carried \(\kappa\) から再構成した \(A_{entry}\) と \(|\nabla \hat n|\) で解析 tail 光学厚 \(\tau_{tail}\) を計算し、1D_SPH は entry 半径を含む Hydro 1Dセル、2D_RZ は entry 点の bilinear nodes に沈着して終了する（NUMERICS §5.4.4）
 - `Laser::DepositMap`：LaserMesh → HydroMesh の写像
@@ -2148,7 +1677,8 @@ struct LaserMesh {
   - 2D_RZ：3D中間位置 \((x,y,z)\) → \((R,Z)=(\sqrt{x^2+y^2},z)\) でLaserMeshセルを特定して分配
   - 1D_SPH：ray trace または `radial_absorption_1d` 中に Hydro の 1Dセル配列へ直接沈着し、その後 host 側で blocked/ghost handoff を適用
   - 2D_RZ：LaserMesh沈着を **直接** 2D_RZ HydroMeshへ双線形補間で分配（NUMERICS §5.8.1 (b)、1D球座標転写は不要）
-  - **1ビーム計算→多ビーム重ね合わせ**：正規化吸収分率をグループ内パワー合計でスケーリング（NUMERICS §5.6.4）
+  - 多ビーム：1D は各ビームをそれぞれのパワーで追跡し、全ビームのキーが一致するときだけ 1 回の追跡を使い回す。
+    2D は極角グループごとに追跡してグループ内パワー合計でスケーリング（NUMERICS §5.6.4）
   - エネルギー保存検証（転写前後の差分 ≤ \(10^{-10}\)）
   - `laser_dep` の `ee` 注入は Coupling 側 `inject_laser_source_terms` で実施し、
     \(e_e \leftrightarrow T_e\) クロージャにはセルごとの \(A_{eff},\gamma_{eff}\)（§4.3.3）を用いる
@@ -2188,15 +1718,22 @@ void laser_step(
   - `field_ions.hpp`：減速の場イオン `FieldIons`（イオンあたりの平均 A・Z・Z²・Z²/A）、
     燃焼在庫と材料の体積分率からのセル毎の組成 `cell_field_ions()`（host）、
     局所 range の媒質係数 `fraley_range_medium()`、Corman/MC カーネル用のセル配列 `FieldIonCells`
-  - `partition.hpp/.cpp`（host）：LP 減速積分の初期化時タブレーション
-    （64×16 log 格子 × 6 生成物 slot）、Fraley Eq.4 knob。表の構築は、減速項を
+  - `partition.hpp/.cpp`（host）/ `partition_device.cuh`：LP 減速積分の初期化時タブレーション
+    （\(T_e\) 64 × \(T_i\) 16 × \(n_e\) 16 の log 格子 × 10 slot — 荷電生成物 6 と中性子の弾性反跳 4）、Fraley Eq.4 knob。表の構築は、減速項を
     エネルギーごとに 1 回評価して各軸で使い回し（電子の減速は Ti に、イオンの速度項は
     ne によらない）、生成物 slot × Te の作業を優先度の低いスレッド群で並列に計算する。
     driver は初期化時に `std::shared_future` で背景構築を始め、燃焼の段が最初に表を
     要するときに待つ（局所沈着は燃料が反応しうるまで段を飛ばす）。1 項ずつの定義と
     ビット一致を `tests/burn/test_burn_partition_table.cpp` で検査（2026-09-25）
-  - `burn_stage.hpp/.cpp`（host）：`compute_burn_step_1d()` — 燃料域/column 幾何、
-    ネットワーク呼び出し、per-cell 沈着/分配、台帳（プレーン配列 in/out、単体テスト可能）
+  - `burn_stage.hpp/.cpp`：`compute_burn_step_1d()` — 燃料域/column 幾何、
+    ネットワーク呼び出し、per-cell 沈着/分配、台帳（プレーン配列 in/out、単体テスト可能）。既定では
+    `burn_stage_gpu.cu/.cuh` の `compute_burn_step_1d_device_stage` が同じ段を GPU で実行し、host の実装は
+    `TENRYU_BURN_HOST_STAGE=1` のときと参照・試験用（host/device の一致は `test_burn_stage_gpu_parity`、rel 1e-12）
+  - `corman_diffusion.cu/.cuh`：1D の多群荷電粒子拡散（`Burn.scheme="diffusion"`、NUMERICS §14.7）
+  - `mc_transport.cu/.cuh`：直線 CSDA の MC α 輸送（`Burn.scheme="mc"`、NUMERICS §14.9）
+  - `neutron_heating.hpp/.cpp`・`neutron_heating_device.cuh`：中性子の最初の衝突による加熱（`Burn.neutron_heating`、NUMERICS §14.11）
+  - `neutron_moments.hpp/.cpp`：Brysk の中性子スペクトルのモーメント（診断、NUMERICS §14.8）
+  - `screening.hpp/.cpp`・`screening_device.cuh`：Salpeter / Chugunov–DeWitt の遮蔽（NUMERICS §14.1）
 - driver 結線（coupling/ 所有）：`callbacks.burn`（laser 直後・radiation 前）、
   比在庫 `State::burn_n_host` [1/g]、`inject_burn_source_terms`（source_terms.cu、
   2T 再閉包）、dt lineage "burn"、budget `E_burn_in`
@@ -2240,12 +1777,11 @@ void laser_step(
     - H = Hydro（Lagrangian step + BC）— セル単位で `hydro_active[c]` に基づき力を計算。ALE は **2回目の H(Δt/2) 後にのみ** 条件付きで実行（2D_RZ: NUMERICS §3.3、1D_SPH: NUMERICS §3.4）
     - C = Conduction（Spitzer-Härm 電子/イオン熱伝導。Q_ei e-i緩和はHydro Corrector内で適用、NUMERICS §1.1.3）
     - L = Laser（ray trace + deposition。ステップ先頭で full-step を1回だけ適用）
-    - R = Radiation（IMC/DDMC transport + tally → source term injection）
-  - `IMC::last_sigma_R_max()` は radiation source smoothing または
-    `hk_velocity_damper_C>0` のとき更新され、`Coupling::Driver` が
-    SourceTerms と 1D Hydro high-k velocity damper へ渡す。Strang 先頭の
-    Hydro half-step では直近 radiation stage の値を使うため、1 radiation stage
-    stale になりうる（NUMERICS §3.1.4）。
+    - R = Radiation（`Rad::RadiationStep::step`：FLD または \(S_N\) が輻射場と物質（`Te`, `ee`, `Pe`）を同時に進め、
+      `rad_dep`・`rad_emit` を診断として publish する。沈着を後から物質へ注入する段は無い）
+  - 1D Hydro の high-k velocity damper の光学的厚さのゲートはセルごとの Rosseland 不透明度の最大値を受け取るが、
+    それを与えていたのは退役したモンテカルロ輻射（`IMC::last_sigma_R_max()`）だけで、2026-09-29 から damper は
+    このゲートなしで動く（NUMERICS §3.1.4）。
   - 各演算子の前後でハロー交換を挿入（NUMERICS §12.2.3）
   - **演算子間 EOS 再クロージャ**（NUMERICS §2.1、CUDA_KERNELS §9 参照）：各演算子が Te/ee を更新した後、後続演算子向けに EOS 同期を実行する。C(Δt) 後：U2→H13(Te→ee,Pe,Cv)。L(Δt) 後：H14(ee→Te)→H13→U2。R(Δt) 後：H14→H13→U2。
   - `src/coupling/driver_safety_audit.{hpp,cu}` provides the device-side
@@ -2266,8 +1802,7 @@ void laser_step(
   - `src/coupling/driver_retry_snapshot.{hpp,cu}` provides the State
     snapshot/restore primitive for driver-level full-step retry on an
     inadmissible hydro corrector.
-    Scope is deterministic radiation modes (FLD/SN/HOLO); it does not snapshot
-    the IMC particle pool.
+    Scope is the deterministic radiation modes (FLD/SN).
   - `src/coupling/dispatcher_decision.{hpp,cpp}` provides the pure free-function
     retry dispatcher classifier consumed by `Driver::run` when
     `Numerics.hydro.dispatcher_state_sensitive_bypass_enabled=True`.
@@ -2304,30 +1839,14 @@ void laser_step(
     PUBLIC links `tenryu_verification` for the shared audit data model.
 
 - `Coupling::SourceTerms`
-  - laser/rad の沈着を e_e へ加える（保存性を保証）
-  - `inject_laser_source_terms` / `inject_radiation_source_terms` は
-    `source_injection` 後の \(e_e \leftrightarrow T_e\) クロージャで
-    セルごとの \(A_{eff},\gamma_{eff}\) から構成した \(c_{v,e}\) を用いる（NUMERICS §1.1.5a）
-  - `inject_laser_source_terms` は cell-local な `laser_dep[c]` をそのまま
-    \(e_e\) へ注入し、退化セルでは `E_numerical_loss` へ退避する。
-  - `inject_radiation_source_terms` は host 側で
-    \(H_c^{raw}=\sum_g(\texttt{rad\_dep}_{c,g}-\texttt{rad\_emit}_{c,g})\) を構成し、
-    `TransportMode::Diffusion` セルではこれを smoothing 前に 0 として barrier 扱いし、
-    difference reference weight \(W_c\ge0.5\) のセルも difference 併用時の smoothing
-    barrier に加え、
-    `Radiation.imc.net_e_source_smoothing.enabled` のときだけ
-    IMC が保持した `sigma_R_max[c]` を受け取って 1D GPU kernel を起動し、
-    \[
-    F_{c+1/2}=\alpha\,\lambda_{c+1/2}\,m_{c+1/2}
-    \left(\frac{H_c^{raw}}{m_c}-\frac{H_{c+1}^{raw}}{m_{c+1}}\right),\qquad
-    H_c^{apply}=H_c^{raw}+F_{c-1/2}-F_{c+1/2}
-    \]
-    を計算する。`lambda` は optical-depth gate と void/material interface で決まり、
-    `delta_E_rad_prev` には raw tally ではなく \(H^{apply}\) を保存する。
-  - radiation source の electron update は `ee[c] += H_apply[c] / mass[c]` を用い、
-    laser source は従来どおり `rho[c] * vol[c]` ベースの direct deposition を使う。
-  - per-group `rad_dep[c,g]` / `rad_emit[c,g]` は raw tally のまま保持し、群別診断は温存する
-  - **保存性検証**：injection前後の `Σ(ρ·ee·V)` の差と `Σ(laser_dep + rad_dep)` の一致を
+  - レーザー・燃焼の沈着を e_e へ加える（保存性を保証）
+  - `inject_laser_source_terms` は `source_injection` 後の \(e_e \leftrightarrow T_e\) クロージャで
+    セルごとの \(A_{eff},\gamma_{eff}\) から構成した \(c_{v,e}\) を用い（NUMERICS §1.1.5a）、cell-local な `laser_dep[c]` を
+    そのまま \(e_e\) へ注入し、退化セルでは `E_numerical_loss` へ退避する。燃焼の沈着は `inject_burn_source_terms`。
+  - 輻射の沈着は注入しない：FLD・\(S_N\) は物質の更新を自分の Newton の中で行う。モンテカルロ輻射の沈着を注入していた
+    `inject_radiation_source_terms`（正味電子ソースの平滑化を含む）は 2026-09-29 に退役し、
+    `retired/radiation_monte_carlo/src/coupling/source_terms_radiation.cu` に保管した。
+  - **保存性検証**：injection前後の `Σ(ρ·ee·V)` の差と注入量（`Σ laser_dep` 等）の一致を
     Kahan summation で計算し、`|差| / |入力| < 1e-14` を assert
 
 > **注**：電子熱伝導の物理実装（Spitzer-Härm + flux limiter + STS + 負温度防止）は
@@ -2345,6 +1864,7 @@ void laser_step(
 - `Diag::LaserPattern`：吸収分布、臨界終了統計、入射角
 - `Diag::MCStats`：分散推定、粒子数統計、CI計算
 - `Diag::TemperatureMaximumPrinciple`：放射演算子後の温度最大原理違反（`overshoot_count`, `overshoot_max`）の検出・記録
+- `corner_collapse_ledger.{cu,hpp}`：`TENRYU_I1B_COLLAPSE_LEDGER` で有効化する read-only の geometry-collapse 診断。
 - `Diag::MeshDeformAttribution`（`src/diagnostics/mesh_deform_attribution.{hpp,cuh,cu}`）：default-off の 2D_RZ mesh failure root-cause diagnostics。`Hydro2D::lagrangian_step` invocation ごとに opt-in workspace が start node positions と per-source displacement buffers を所有し、failure 時だけ `mesh_failure_attribution.jsonl` に per-source corner-J degradation を書く。HDF5 schema と `dt_lineage.jsonl` format は変更しない。
 - `Diag::MeshDegeneracyForensics`（`src/diagnostics/mesh_degeneracy_forensics.{hpp,cu}`）：default-off の repeated pre-commit `mesh_quality_*` / `in_hydro_*` failure diagnostics。`Hydro2D` は opt-in 時だけ failing cell の4 node position/velocity/acceleration sample を `HydroStepResult` に載せ、`Coupling::Driver` retry path が同一 `(cell, corner, stage)` count と `sigma_safe` threshold を評価して `mesh_degeneracy_forensics.jsonl` へ J(σ), nodal velocity, hourglass amplitude, material/work context を追記する。HDF5 schema と physics state は変更しない。
 - `Diag::IcfShellDiagnostics`, `Diag::HotspotGasDiagnostics`, と `Diag::OperatorEnergyResiduals`（`src/diagnostics/diagnostics.{hpp,cu}`, `operator_energy_residuals.{hpp,cu}`）：default-off の ICF shell IFAR/CR、inert gas-hotspot tracer compression metrics、per-operator energy residual。`Coupling::Driver` が history cadence で初期 shell 半径、hotspot tracer state、operator 境界、明示的 `delta_E_ext` を渡し、`HistoryWriter` が `/diagnostics/icf/v1/`, `/diagnostics/hotspot_gas/v1/`, `/diagnostics/conservation/v1/`, `/diagnostics/ale_provenance/v1/` に path-versioned HDF5 series を追記する。HDF5 root `schema_version` は変更しない。
@@ -2413,7 +1933,7 @@ struct DiagOutput {
     double E_kinetic;            // 運動エネルギー [erg]
     double E_internal_e;         // 電子内部エネルギー [erg]
     double E_internal_i;         // イオン内部エネルギー [erg]
-    double E_radiation;          // 放射エネルギー [erg] = E_census = Σ alive粒子 E_p（NUMERICS §10.2）
+    double E_radiation;          // 放射エネルギー [erg] = Σ_c Σ_g rad_E[c,g] V_c（FLD・S_N の場。NUMERICS §10.2）
     double rhoR_avg;             // 面密度 [g/cm²]
     double shell_radius_mean;    // 殻平均半径 [cm]
     double shell_radius_min;     // 殻最小半径 [cm] (ρ > 0.1*ρ_max の最小 r_c)
@@ -2423,11 +1943,9 @@ struct DiagOutput {
     double T_e_max;              // 最大電子温度 [eV]
     double T_i_max;              // 最大イオン温度 [eV]
     double rho_max;              // 最大密度 [g/cm³]
-    int n_alive;                 // 生存粒子数
-    int n_census;                // census 粒子数
     int clamp_count;             // フロアクランプ回数 (per step, reset each step)
-    int overshoot_count;         // 最大原理違反セル数 (per step, Radiation直後)
-    double overshoot_max;        // 最大超過率 δ_max (per step, Radiation直後)
+    int overshoot_count;         // 最大原理違反セル数 (per step, Radiation直後。history radiation/overshoot_count)
+    double overshoot_max;        // 最大超過率 δ_max (per step, Radiation直後。history radiation/overshoot_max)
     // --- 累積量（State のメンバーから読み出し — §5.2 Cumulative diagnostics）---
     double E_laser_deposited;    // = State.E_laser_deposited [erg]
     double E_laser_escaped;      // = State.E_laser_escaped [erg]
@@ -2454,7 +1972,7 @@ DiagOutput compute_diagnostics(
 **責務**：入出力、再始動、メタデータ
 
 - `IO::HDF5Writer`：HDF5 出力（rank 0 だけが書き、MPI-IO は使わない）。snapshot と checkpoint の deflate 付き dataset のうち 64 KiB 以上は、プロセス共通の圧縮スレッド群（`DeflatePool`。スレッド数は使える CPU 数 − 2、最低 2。使える CPU 数は Linux ではプロセスの affinity と cgroup の CPU 上限で制限する — RunPod の pod はハードウェアスレッド 128・上限 13.6 CPU）が圧縮（zlib `compress2`、HDF5 の deflate フィルタと同じ形式・同じレベル）し、ファイルを閉じる前に `H5Dwrite_chunk` で書く（`DeferredDeflateChunks`、2026-09-25）。512 KiB を超える dataset は第 1 次元に沿って約 256 KiB のチャンクに分けて保存する（端のチャンクは 0 で埋める）。時間ループの snapshot（`OutputManager::write_snapshot`）は `HDF5Writer::write_snapshot_in_background` で書く: ファイルの作成・群・属性・小さい dataset の書き込みと大きい dataset のチャンクの圧縮依頼までを行って返り（データはこの時点で複製済み）、完了（圧縮の待ち・チャンクの書き込み・close・`.tmp` からの rename による公開）は 1 本の完了スレッド（`SnapshotFinisher`）が書いた順に行う（2026-09-25。完了待ちは 2 個まで、超えると書き込み側が待つ。完了スレッドのエラーは次の書き込みか `HDF5Writer::wait_for_snapshot_writes` で再送出され、driver は run の最後の snapshot の後で待つ）。`HDF5Writer::write_snapshot` は同じ書き込みの後、公開まで待ってから返る（戻った時点でファイルがある）。HDF5 の呼び出しはプロセス共通の再帰ロック（`core::hdf5_mutex`）で直列化する（完了スレッドも同じロックの下で書く）。スナップショットの各群は NVTX 区間 `io.snapshot.*`（完了スレッドの close は `io.snapshot.close`）で計測できる
-- `IO::Checkpoint`：State + Mesh + census粒子（容量対策含む）
+- `IO::Checkpoint`：State + Mesh（schema 2。schema 1 にあった光子粒子 `particles/` と RNG 状態 `rng/` は 2026-09-29 に廃止）
 - `IO::Restart`
 - `IO::Schema`：互換性ルール（スキーマ破壊禁止）
 
@@ -2555,7 +2073,7 @@ namespace IO {
     // /hydro/volFrac      : double[n_cells x n_mat] — 体積分率 (State.volFrac)
     // /radiation/energy_density    : double[n_cells x G] — E_g [erg/cm³]
     // /radiation/rad_dep           : double[n_cells x G] — [erg] (当該ステップ累積)
-    // /radiation/rad_emit          : double[n_cells x G] — particle emission diagnostic [erg]
+    // /radiation/rad_emit          : double[n_cells x G] — emission diagnostic [erg]（当該ステップ累積）
     // /radiation/deposited_power   : double[n_cells x G] — [erg/cm³/s] = rad_dep / (V × dt)
     // /radiation/fleck_factor      : double[n_cells] — 2D_RZ FLD Fleck factor f_i [-]
     // /radiation/sn_tau_R, sn_reduced_flux, sn_ap_alpha
@@ -2566,21 +2084,10 @@ namespace IO {
     // /radiation/diag_chi_opacity, diag_F_first_moment, diag_E_star_flux, diag_stream_theta
     //     : double[n_cells x G] — 1D S_N plateau investigation diagnostics (output-only)
     // /radiation/diag_ap_alpha_face : double[n_faces x G] — AP face_blend weight (output-only)
-    // /radiation/ddmc_flag         : int8[n_cells x G]（0=IMC, 1=DDMC, 2=RW。2はlegacy enum値）
-    // /holo/E_LO                  : double[n_cells x G] — HOLO low-order E [erg/cm³]（optional）
-    // /holo/consistency_source    : double[n_cells x G] — same-step HOLO RHS source [erg/s]（optional）
-    // /holo/rad_dep_LO            : double[n_cells x G] — LO gross absorption diagnostic [erg]（optional）
-    // /holo/rad_emit_LO           : double[n_cells x G] — LO gross emission diagnostic [erg]（optional）
-    // /holo/Prr_HO                : double[n_cells x G] — passive HO Prr moment [erg/cm³]（optional）
-    // /holo/chi                   : double[n_cells x G] — passive Prr/E diagnostic [-]（optional）
-    // /holo/Prr_coverage          : double[n_cells x G] — passive Prr coverage fraction [-]（optional）
-    // /holo/core_mask             : uint8[n_cells] — LO material-coupling mask, legacy dataset name（optional）
-    // /holo/prev_core_mask        : uint8[n_cells] — previous LO material-coupling mask（optional）
+    // （schema 2（2026-09-29）で /radiation/ddmc_flag・/radiation/delta_E_rad_prev・/holo/*・/difference/* を廃止。
+    //  いずれも退役したモンテカルロ輻射の出力。OUTPUT_SCHEMA・SPECIFICATION §7.5）
     //
     // Checkpoint: 上記 + 以下を追加（SPECIFICATION §7.4 準拠）
-    // particles/*               : alive 粒子の SoA フィールド (15 arrays, SPECIFICATION §7.4準拠)
-    // rng/rng_counter            : uint32[N_p] (粒子ごとの描画カウンタ、SPECIFICATION §7.4 rng/)
-    // rng/global_id             : uint64[N_p] (大域一意ID、RNG key復元用、SPECIFICATION §7.4 rng/)
     // hydro_flags/hydro_active  : int8[n_cells]（SPECIFICATION §7.4 準拠、State は int8_t*）
     // config_hash               : uint64 attrs (frozen config の hash — restart 時検証)
     // time_state/*              : E_laser_deposited, E_laser_escaped, E_rad_escaped,
@@ -2590,9 +2097,9 @@ namespace IO {
     // output_state/t_next_*     : double × 3（SPECIFICATION §7.4 出力タイミング状態）
     // time_state/t              : float64（現在時刻 [s]、State.t と対応）
     // time_state/step           : int32（**最後に完了したステップ番号**、State.step と対応。
-    //                              リスタート時は step+1 から実行再開する。RNG subsequence =
-    //                              step_number は Philox の独立性に必須であり、off-by-one は
-    //                              ストリーム重複を引き起こすため、この契約を厳守すること）
+    //                              リスタート時は step+1 から実行再開する。燃焼の α 粒子 Monte Carlo は
+    //                              step を Philox の subsequence に使うので、off-by-one はストリーム重複を
+    //                              引き起こす — この契約を厳守すること）
     // time_state/dt             : float64（タイムステップ幅 [s]、NUMERICS §2.2 Δt成長制限復元用）
     // time_state/ale_last_applied_step : int32（1D V3 ALE の最後の commit step。
     //                              旧checkpointでは -1 で補完）
@@ -2609,8 +2116,7 @@ namespace IO {
     void write_snapshot(const std::string& path, const State& state,
                         const Mesh& mesh, const Config& cfg, int step, double time);
     void write_checkpoint(const std::string& path, const State& state,
-                          const Mesh& mesh, const PhotonPool& pool,
-                          const Config& cfg, int step, double time);
+                          const Mesh& mesh, const Config& cfg, int step, double time);
     State load_checkpoint(const std::string& path, const Config& cfg,
                           const PartitionInfo& part);
     // 出力は rank 0 だけが書く（MPI-IO・collective write は使わない）
@@ -2624,8 +2130,9 @@ namespace IO {
 **責務**：verification references, audit policy data models, and validation-facing summaries
 
 - Existing analytic/reference modules remain in `src/verification/`:
-  `marshak.cu`, `sedov_analytic.cpp`, `noh_analytic.cpp`,
-  `diffusion_ref.cpp`, and `laser_analytic.cu`.
+  `marshak.cu`, `sedov_analytic.cpp`, `noh_analytic.cpp`, and `laser_analytic.cu`
+  (`diffusion_ref.cpp`, the diffusion reference of the retired DDMC gates, moved to
+  `retired/radiation_monte_carlo/` on 2026-09-29).
 - `Verification::TierThreshold` (`src/verification/tier_threshold.{hpp,cu}`):
   The 9-tier threshold framework.
 - `Verification::AuditSummary` (`src/verification/audit_summary.{hpp,cpp}`):
