@@ -43,7 +43,7 @@
       \qquad
       \beta=\frac{4a_{\rm eV}T_e^3}{C_{v,e}}
       $$
-      <p>から構成する。この物質側の線形化に使う基本量は、FLD と S<sub>N</sub> が共有する。標準的な Fleck 係数は \(f=(1+\alpha\beta c\Delta t\,\sigma_{a,P})^{-1}\) である。現在の一定不透明度の FLD 経路ではこれを群別に \(f_{c,g}=(1+\alpha\beta_c c\Delta t\,\sigma_{a,c,g})^{-1}\)（この \(\sigma_{a,c,g}\) は下の群拡散方程式の吸収項 \(\sigma^{PA}_{c,g}\) と同じ量である）とし、表・NLTE の経路では放出平均に基づく係数を使う。\(f\) が小さいほど、その時間刻み内での放出と再吸収の硬い部分を実効的な散乱として線形化し、陽的な温度応答を弱める。FLD と S<sub>N</sub> は \(f\) に下限を課さない。\(f\) を <code>Numerics.dt.f_min_fleck</code>（既定 0.01）より上に保つ時間刻みの制限は、退役した <code>imc_ddmc</code> 経路だけのものである（<a href="../../overview/timestep.html">時間刻み制御と CFL</a> 参照）。</p>
+      <p>から構成する。この物質側の線形化に使う基本量は、FLD と S<sub>N</sub> が共有する。標準的な Fleck 係数は \(f=(1+\alpha\beta c\Delta t\,\sigma_{a,P})^{-1}\) である。現在の一定不透明度の FLD 経路ではこれを群別に \(f_{c,g}=(1+\alpha\beta_c c\Delta t\,\sigma_{a,c,g})^{-1}\)（この \(\sigma_{a,c,g}\) は下の群拡散方程式の吸収項 \(\sigma^{PA}_{c,g}\) と同じ量である）とし、表・NLTE の経路では放出平均に基づく係数を使う。\(f\) が小さいほど、その時間刻み内での放出と再吸収の硬い部分を実効的な散乱として線形化し、陽的な温度応答を弱める。FLD と S<sub>N</sub> は \(f\) に下限を課さず、\(f\) から時間刻みを制限しない（\(f\) を <code>Numerics.dt.f_min_fleck</code> より上に保つ制限は退役したモンテカルロ輻射のもので、2026-09-29 に外した。<a href="../../overview/timestep.html">時間刻み制御と CFL</a> 参照）。</p>
       <p>各群の後退オイラー有限体積の方程式は、同じ線形化した源を用いて次の形になる。</p>
       $$
       \begin{aligned}

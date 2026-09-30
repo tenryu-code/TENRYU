@@ -19,7 +19,7 @@
       <h3 id="at-a-glance">要点</h3>
       <ul>
         <li>大域則は \(\Delta t=\min(\Delta t_{hydro},\Delta t_{cond},\Delta t_{rad},\Delta t_{burn},\Delta t_{hot\,e},\Delta t_{visc},\ldots)\) に、成長率制限・上限 <code>dt.max_s</code>・出力時刻への着地・残り時間を重ねたものである。勝った制約の名前（<code>hydro</code>/<code>conduction</code>/<code>radiation</code>…）が limiter としてログ（<code>Main.verbosity="verbose"</code> のとき）と診断に記録される。</li>
-        <li>流体は音響 CFL（\(C_{CFL}=0.3\)）。熱伝導は、陽的な安定限界をスーパータイムステッピング（STS）で \(s_{max}(s_{max}+1)/2\) 倍 — 既定 \(s_{max}=40\) で 820 倍 — に緩めた値を提案し、陰解法では ∞（制約から外れる）。輻射は現行の FLD と S<sub>N</sub> では上限を提案しない（∞）。Fleck 因子の下限 \(f_{min}=0.01\) から導く上限は、退役した <code>imc_ddmc</code> 経路だけのものである。</li>
+        <li>流体は音響 CFL（\(C_{CFL}=0.3\)）。熱伝導は、陽的な安定限界をスーパータイムステッピング（STS）で \(s_{max}(s_{max}+1)/2\) 倍 — 既定 \(s_{max}=40\) で 820 倍 — に緩めた値を提案し、陰解法では ∞（制約から外れる）。輻射（FLD と S<sub>N</sub>）は上限を提案しない（∞）。Fleck 因子の下限から導く上限は、退役したモンテカルロ輻射のもので、2026-09-29 にコードとともに外した。</li>
         <li>レーザーと CBET は独立の \(\Delta t\) を持たない。核燃焼とホット電子は「前ステップの沈着」から次ステップを制限する後追い型である。</li>
         <li>MPI 実行では、ランク局所の最小値を 1 回の <code>MPI_Allreduce(MPI_MIN)</code> で全ランク共有の \(\Delta t\) にする。</li>
       </ul>
@@ -62,7 +62,7 @@
         <tbody>
           <tr><th><a href="../physics/hydrodynamics.html">流体</a></th><td>\(C_{CFL}\min_c[\Delta l_c/(|\mathbf u_c|+c_{s,c})]\)</td><td><code>cfl_hydro</code> = 0.3</td><td>音響 CFL。\(\Delta l_c\) は 1D でセル幅、2D で \(\sqrt{A_c}\)。<a href="#hydro-guards">保護族は後述</a>。</td></tr>
           <tr><th><a href="../physics/conduction.html">電子熱伝導</a></th><td>STS: \(\dfrac{s_{max}(s_{max}+1)}{2}\Delta t_{exp}\)<br>陰解法・Hypre: \(\infty\)</td><td>\(C_{cond}\)（<code>cfl_cond</code>）= 0.25、<code>sts_max_stages</code> = 40</td><td>\(\Delta t_{exp}=C_{cond}\min_c[(\Delta l_c)^2/D_{eff,c}]\)。既定では陽的限界の 820 倍まで緩和。</td></tr>
-          <tr><th><a href="../physics/radiation/index.html">輻射</a></th><td>FLD・S<sub>N</sub>: \(\infty\)<br>退役した <code>imc_ddmc</code>: \(\min_c\!\left[\dfrac{1-f_{min}}{f_{min}}\cdot\dfrac{1}{\alpha c\,\beta_c\sigma_{P,c}}\right]\)</td><td><code>f_min_fleck</code> = 0.01</td><td>Fleck 因子が \(f_{min}\) を下回らない上限。退役した <code>imc_ddmc</code> 経路で、輻射が有効で吸収性の材料があるときだけ評価する。</td></tr>
+          <tr><th><a href="../physics/radiation/index.html">輻射</a></th><td>FLD・S<sub>N</sub>: \(\infty\)</td><td>—</td><td>輻射は大域 \(\Delta t\) を制約しない。Fleck 因子の下限から導く上限は、退役したモンテカルロ輻射とともに 2026-09-29 に外した（<code>Numerics.dt.f_min_fleck</code> は受理して無視する）。</td></tr>
           <tr><th><a href="../physics/viscosity.html">Braginskii 粘性</a></th><td>\(\texttt{dt\_safety}\cdot\dfrac{\rho\,\Delta l^2}{(8/3)\,\eta_{\rm eff}}\)</td><td><code>dt_safety</code> = 0.3</td><td>陽的な運動量拡散の安定限界。粘性有効時のみ。</td></tr>
           <tr><th><a href="../physics/burn.html">核燃焼</a></th><td>\(0.9\,\Delta t\,M_{max}/M_{req}\) と \(f_E\,e_{cell}/P_{dep}\) の min</td><td><code>explicit_source_limit</code> = 0.2</td><td>前ステップの燃焼段が計算した後追い型の制限。部分サイクル逼迫と自己加熱の双方を抑える。</td></tr>
           <tr><th><a href="../physics/hot-electrons.html">ホット電子</a></th><td>\(f_E\min_{P_i>0}(m_ie_{e,i}/P_i)\)</td><td><code>explicit_source_limit</code> = 0.2</td><td>前ステップの付与パワーからの後追い型の制限。</td></tr>
@@ -109,19 +109,15 @@
     </section>
 
     <section aria-labelledby="radiation-dt">
-      <h2 id="radiation-dt">輻射：Fleck 因子の下限から導く上限</h2>
+      <h2 id="radiation-dt">輻射：大域 Δt を制約しない</h2>
       <p>輻射と物質の結合は Fleck 線形化（<a href="../physics/radiation/fld.html">FLD ページ</a>参照）の Fleck 因子</p>
       $$
       f_c=\frac{1}{1+\alpha\,c\,\beta_c\,\sigma_{P,c}\,\Delta t},\qquad
       \beta_c=\frac{4a_{\rm eV}T_{e,c}^3}{C_{v,e,c}},\qquad
       \sigma_{P,c}=\rho_c\kappa_{P,c}
       $$
-      <p>で特徴づけられる。\(\alpha\) は Fleck 線形化の時間中心化パラメータ（陰的パラメータ。既定 1 = 完全陰的、0.5 が Crank–Nicolson 相当）である。\(\Delta t\) が大きいほど \(f_c\) は小さくなり、刻み内の放出・再吸収を実効散乱として表す割合が増える。極端に小さい \(f_c\) を避けるため、下限 \(f_{min}\)（<code>Numerics.dt.f_min_fleck</code>、既定 0.01）を課すことと等価な上限</p>
-      $$
-      \Delta t_{rad}=\min_c\!\left(\frac{1-f_{min}}{f_{min}}\cdot
-      \frac{1}{\alpha\,c\,\beta_c\,\sigma_{P,c}}\right)
-      $$
-      <p>を提案する。この制限を評価するのは、退役した <code>imc_ddmc</code> 経路で輻射が有効かつ吸収性の材料（定数 \(\kappa_a&gt;0\) またはテーブル系の不透明度）があるときだけである。現行の FLD と S<sub>N</sub> はこの下限を使わない（FLD は硬いセルの極限を保つために Fleck 因子へ下限を課さない）ので、\(\Delta t_{rad}\) は ∞ となり、輻射は大域 \(\Delta t\) を制約しない。なお \(\sigma_{P,c}\) は輻射演算子の冒頭で計算された値であり、後続の流体半ステップで \(T_e\) が変わるため、\(\Delta t_{rad}\) の評価時点では 1 ステップぶん古い。この誤差は成長率制限（\(g_{dt}=1.2\)）が \(\Delta t\) の急変を抑えることで実用上吸収され、\(T_e\) が大きく動けば次ステップの \(\Delta t_{rad}\) が自動的に縮んで自己修正される。</p>
+      <p>で特徴づけられる。\(\alpha\) は Fleck 線形化の時間中心化パラメータで、FLD と S<sub>N</sub> では 1（完全陰的）である。\(\Delta t\) が大きいほど \(f_c\) は小さくなり、刻み内の放出・再吸収を実効散乱として表す割合が増える。FLD と S<sub>N</sub> は \(f_c\) に下限を課さない（FLD は硬いセルの極限を保つため）ので、輻射は大域 \(\Delta t\) の候補を出さない。</p>
+      <p>下限 \(f_{min}\)（<code>Numerics.dt.f_min_fleck</code>、既定 0.01）を割らないように \(\Delta t_{rad}=\min_c[(1-f_{min})/f_{min}\cdot 1/(\alpha c\,\beta_c\sigma_{P,c})]\) で刻みを制限していたのは、退役したモンテカルロ輻射（<code>Radiation.mode="imc_ddmc"</code>）である。FLD と S<sub>N</sub> では 2026-09-15 から常に ∞ で、2026-09-29 にモンテカルロ輻射とともに時間刻みの候補と履歴の <code>dt_rad</code> から外した。<code>Numerics.dt.f_min_fleck</code> は受理して WARNING を出し、無視する。</p>
     </section>
 
     <section aria-labelledby="source-dt">
@@ -153,7 +149,7 @@
       <ul>
         <li><strong>履歴の <code>/dt</code>：</strong>採用された \(\Delta t\) の時系列は常に <code>&lt;case&gt;_history.h5</code> に記録される（<a href="../use/outputs.html">出力と解析</a>）。</li>
         <li><strong>ログの limiter 名：</strong><code>Main.verbosity="verbose"</code> で実行すると、実行ログの <code>[dt_breakdown]</code> 行に、そのステップの \(\Delta t\) と勝った制約の名前（<code>dt_winner=</code>）が毎ステップ出る。まずここを見る。</li>
-        <li><strong>dt 内訳診断（既定で有効）：</strong><code>Numerics.diagnostics.dt_breakdown_history_enabled</code>（既定 True）が有効なら、履歴に <code>diagnostics/dt_breakdown_history/</code> が毎ステップ書かれ（1D で毎ステップ書くのはこの群と後述の <code>diagnostics/cfl_winner/</code> だけで、他の系列の行は <code>Output.history_every</code> に従う）、<code>dt_chosen</code>・<code>dt_hydro</code>・<code>dt_rad</code>・<code>dt_cond</code>・<code>dt_post_shock</code>・<code>dt_growth</code>・<code>dt_max</code>・<code>dt_output</code>・<code>dt_remaining</code> と、hydro 内訳（acoustic・axis_margin・volume_rate）、勝者名 <code>dt_winner</code> を記録する。あわせて <code>diagnostics/cfl_winner/</code> が音響 CFL の勝者セル（位置・\(\Delta l\)・\(c_s\)・\(\rho\)）を残す。</li>
+        <li><strong>dt 内訳診断（既定で有効）：</strong><code>Numerics.diagnostics.dt_breakdown_history_enabled</code>（既定 True）が有効なら、履歴に <code>diagnostics/dt_breakdown_history/</code> が毎ステップ書かれ（1D で毎ステップ書くのはこの群と後述の <code>diagnostics/cfl_winner/</code> だけで、他の系列の行は <code>Output.history_every</code> に従う）、<code>dt_chosen</code>・<code>dt_hydro</code>・<code>dt_cond</code>・<code>dt_post_shock</code>・<code>dt_growth</code>・<code>dt_max</code>・<code>dt_output</code>・<code>dt_remaining</code> と、hydro 内訳（acoustic・axis_margin・volume_rate）、勝者名 <code>dt_winner</code> を記録する（2026-09-29 まであった <code>dt_rad</code> の列は、退役したモンテカルロ輻射の上限の列で、削除した）。あわせて <code>diagnostics/cfl_winner/</code> が音響 CFL の勝者セル（位置・\(\Delta l\)・\(c_s\)・\(\rho\)）を残す。</li>
       </ul>
       <p>典型的な読み方：律速が <code>hydro</code> で <code>cfl_winner</code> が特定セルに張り付くなら、そのセルの格子（つぶれ・微小セル）か音速（過熱・床）を疑う。<code>conduction</code> ならコロナの \(D_{eff}\) 急増（<a href="../physics/conduction.html">伝導ページ</a>の κ∝\(T^{5/2}\)）、<code>growth</code> が続くだけなら単に立ち上がり中である。</p>
     </section>
