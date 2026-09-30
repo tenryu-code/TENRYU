@@ -114,7 +114,6 @@
           <tr><th><code>fleck_factor</code></th><td>2D FLD only: per-cell Fleck factor (diagnostic meaning valid at grey G=1).</td></tr>
           <tr><th><code>sn_tau_R</code>, <code>sn_reduced_flux</code>, <code>sn_ap_alpha</code></th><td>2D S<sub>N</sub> only: diagnostics of the asymptotic-preserving (AP) blend of S<sub>N</sub> and diffusion face fluxes (optical-depth, reduced-flux, and blend-weight proxies).</td></tr>
           <tr><th><code>diag_*</code> (12 kinds)</th><td>1D S<sub>N</sub> output-only diagnostics: <code>diag_rad_</code> followed by <code>E_pre</code>/<wbr><code>E_post</code>/<wbr><code>emission_at_Tn</code>/<wbr><code>emission_at_Tnp1</code>/<wbr><code>absorption</code>, and <code>diag_</code> followed by <code>clip_energy</code>/<wbr><code>clip_full_deficit</code>/<wbr><code>chi_opacity</code>/<wbr><code>F_first_moment</code>/<wbr><code>E_star_flux</code>/<wbr><code>stream_theta</code>/<wbr><code>ap_alpha_face</code>. Never used to restore restart state.</td></tr>
-          <tr><th><code>ddmc_flag</code></th><td>Meaningful only on the retired <code>imc_ddmc</code> path; carries no meaning under production FLD/S<sub>N</sub>.</td></tr>
         </tbody>
       </table>
 
@@ -131,7 +130,7 @@
           <tr><th><code>rays/trajectory/</code></th><td>With <code>ray_output_trajectory=True</code>: CSR-format trajectories (offsets, step counts, position columns, residual power) — the source data for ray overlays.</td></tr>
         </tbody>
       </table>
-      <p>Under <code>mode="radial_absorption_1d"</code> there are no physical ray trajectories: <code>deposited_power</code> and <code>absorption_fraction</code> are written as usual but the <code>rays/</code> family is empty or absent. The <code>holo/</code> and <code>difference/</code> groups belong exclusively to the retired <code>imc_ddmc</code> paths and do not apply to production FLD/S<sub>N</sub> runs.</p>
+      <p>Under <code>mode="radial_absorption_1d"</code> there are no physical ray trajectories: <code>deposited_power</code> and <code>absorption_fraction</code> are written as usual but the <code>rays/</code> family is empty or absent. The outputs of the retired Monte Carlo radiation (<code>radiation/ddmc_flag</code>, <code>radiation/delta_E_rad_prev</code>, <code>holo/</code>, <code>difference/</code>) are no longer written from schema 2 (2026-09-29); files written before may still hold them.</p>
     </section>
 
     <section aria-labelledby="history">
@@ -193,6 +192,7 @@
         <tbody>
           <tr><th><code>radiation/fld_outer_*</code></th><td>Always (zero when FLD is off): outer Picard iteration count, exit residual, convergence flag.</td></tr>
           <tr><th><code>radiation/sn_*</code></th><td>Only in <code>mode="sn_transport"</code> runs: the step totals of the outer iterations (Newton on the nodal temperatures in the 1D linear-discontinuous scheme, matter Picard otherwise) and the inner iterations (GMRES Krylov steps in the linear-discontinuous scheme, source iterations otherwise), the outer exit residual, and the convergence flag (<code>sn_outer_iterations</code>, <code>sn_inner_iterations</code>, <code>sn_outer_residual</code>, <code>sn_converged</code>).</td></tr>
+          <tr><th><code>radiation/overshoot_count</code>, <code>overshoot_max</code></th><td>Always (zero when radiation is off): the maximum-principle overshoot of the radiation phase — the number of cells whose electron temperature after the phase exceeds \(T_{max}=\max\)(largest electron temperature before it, Marshak drive temperature), and the largest \((T_e-T_{max})/T_{max}\). <code>Numerics.safety.overshoot_warn</code> tests this value. Until 2026-09-29 these were <code>mc/overshoot_*</code>.</td></tr>
           <tr><th><code>diagnostics/icf/v1/</code></th><td><code>Numerics.diagnostics.icf.enabled</code>: shell radius, thickness, IFAR, convergence ratio CR.</td></tr>
           <tr><th><code>diagnostics/hotspot_gas/v1/</code></th><td><code>Numerics.diagnostics.hotspot_gas.enabled</code>: tracer-gas mass, radius family (R50…R99 and CR variants), density/pressure/adiabat summaries, Te/Ti statistics, energies, and work proxies.</td></tr>
           <tr><th><code>diagnostics/ale_provenance/v1/</code></th><td>ALE provenance: counters of forbidden-configuration violations, of mesh-rescue repairs such as emergency cell deactivation and local boundary repair (<code>escape_valve_activations</code>), and of geometry failures; the rescue event table; and end-of-run attributes such as <code>final_claim_level</code> and <code>reached_t_end</code>.</td></tr>
@@ -205,7 +205,7 @@
           <tr><th><code>diagnostics/per_row_mass/</code>, <code>av_max/</code></th><td>With the dt-breakdown diagnostics: per-z-row mass/density summaries and the maximum-AV cell record.</td></tr>
           <tr><th><code>diagnostics/conservation/v1/</code></th><td><code>Numerics.diagnostics.conservation.enabled</code>: per-operator conservation residuals ε_E with before/after energies.</td></tr>
           <tr><th><code>diagnostics/material_interface/v1/</code></th><td>Material-interface diagnostics of the PLIC (piecewise-linear interface calculation) reconstruction: attributes, per-sample statistics, and event tables (a group added without changing <code>schema_version</code>).</td></tr>
-          <tr><th><code>mc/</code>, <code>difference/</code>, <code>holo/</code></th><td>Compatibility diagnostics of the retired <code>imc_ddmc</code> paths; meaningless under production FLD/S<sub>N</sub> runs.</td></tr>
+          <tr><th><code>mc/</code>, <code>difference/</code>, <code>holo/</code></th><td>Removed on 2026-09-29 (schema 2). They were the statistics of the retired Monte Carlo radiation and held zeros under FLD and S<sub>N</sub>, apart from the two maximum-principle columns (now <code>radiation/overshoot_*</code>). A history file started before keeps writing those two columns under <code>mc/overshoot_*</code>.</td></tr>
         </tbody>
       </table>
       <p>The golden-regression summary metrics quoted on the verification page are time reductions of these series: <code>rho_peak_max</code> = max of <code>implosion/rho_peak</code>, <code>rhoR_max</code> = max of <code>implosion/rho_R</code>, <code>Tc_max</code> = max of <code>implosion/center_temperature</code>, <code>shell_r_min</code> = min of <code>implosion/shell_radius_min</code>.</p>
@@ -230,10 +230,10 @@
           <tr><th><code>conduction_state/</code></th><td>Run-cumulative statistics of the conduction solver (maxima of the iteration count, the residual, and the condition number, among others).</td></tr>
           <tr><th><code>burn_state/specific_inventory</code></th><td>Burn specific inventories \(Y_s\) [1/g] (per cell D, T, He3, He4, p). A restart uses these rather than the snapshot number densities <code>hydro/burn_n_*</code> divided by the density (since 2026-09-26).</td></tr>
           <tr><th><code>radiation_sn/</code> (1D S<sub>N</sub>)</th><td>Angular distributions of the linear-discontinuous scheme (<code>psi_prev</code>, <code>psi_sd_prev</code>) and the in-cell electron-energy offset (<code>ee_node_offset</code>); without them a run starts isotropic and flat in the cell.</td></tr>
-          <tr><th><code>particles/</code></th><td>Particle pool of the retired Monte Carlo paths (not applicable to production FLD/S<sub>N</sub>).</td></tr>
+          <tr><th><code>particles/</code></th><td>Only in schema-1 checkpoints: the particle pool of the retired Monte Carlo radiation. Read when empty; a checkpoint holding particles is refused. Not written from schema 2 (2026-09-29).</td></tr>
         </tbody>
       </table>
-      <p>Restart compatibility: a checkpoint with the current <code>schema_version</code> is read normally, one with an older (or missing) version is read with backward-compatible defaults, and one with a newer version is refused. A restart is refused when the frozen items (dimension, mesh, materials, group count, seed, group bounds) do not match. The <a href="running.html#restart">running page</a> explains how to specify a restart.</p>
+      <p>Restart compatibility: a checkpoint with the current <code>schema_version</code> (2 since 2026-09-29) is read normally, one with an older (or missing) version is read with backward-compatible defaults, and one with a newer version is refused. A restart is refused when the checkpoint's frozen configuration (the hash of the deck text and every setting except <code>Main.restart_from</code>) does not match the restarting deck. The <a href="running.html#restart">running page</a> explains how to specify a restart.</p>
     </section>
 
     <section aria-labelledby="provenance">
