@@ -1,5 +1,6 @@
 #pragma once
 
+#include <optional>
 #include <string>
 
 #include <CLI/CLI.hpp>
@@ -34,9 +35,18 @@ std::string build_mesh_requirement_json_for_config(
     std::string* violation_message_out);
 #endif
 
+// Run control of `tenryu run` for a restart: the end time and the step limit of the continued run. They override
+// Main.t_end and Main.max_steps of the deck, which stays unchanged, so the checkpoint's frozen configuration still
+// matches it (SPECIFICATION §7.4). Refused on a fresh run.
+struct RunControlOverrides {
+  std::optional<double> t_end;
+  std::optional<int> max_steps;
+};
+
 int cmd_run(const std::string& namelist_path,
             const std::string& restart_prefix = "",
-            const std::string& output_dir_override = "");
+            const std::string& output_dir_override = "",
+            const RunControlOverrides& run_control = {});
 int cmd_validate(const std::string& namelist_path, bool mesh_preview = false);
 int cmd_freeze(const std::string& namelist_path, const std::string& output_path);
 int cmd_verify(const std::string& test_name, bool generate_golden = false);

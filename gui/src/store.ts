@@ -19,6 +19,14 @@ import { parseTmatGroupBounds } from "@tenryu-common/core/results/tmatBounds";
 import { isTerminal, parseStatusFile, type RunRecord } from "@tenryu-common/core/runstate";
 import { joinRemote, shQuotePath } from "@tenryu-common/core/ssh";
 import { toCanonical } from "./core/units";
+import {
+  continuationArgs,
+  continuationIssues,
+  latestCheckpointPrefix,
+  mergeHistorySegments,
+  sortRunOutputFiles,
+  type RunContinuation,
+} from "./core/runContinuation";
 import { parseValidateOutput, type ValidateResult } from "./core/validateParse";
 import {
   buildAskScript,
@@ -311,6 +319,9 @@ export interface AppState {
   testConnection(p: ServerProfile): Promise<void>;
   startRun(override?: { deck: string; name: string }): Promise<void>;
   restartRun(runId: string): Promise<void>;
+  /** Restart from the latest checkpoint with the unchanged deck, optionally to a later end time or step limit
+   *  (`tenryu run --t-end` / `--max-steps`). */
+  continueRun(runId: string, continuation: RunContinuation): Promise<void>;
   pollRunOnce(runId: string): Promise<void>;
   pollActiveRuns(): Promise<void>;
   stopRun(runId: string): Promise<void>;
@@ -391,6 +402,18 @@ const initialAssistMirror: AppState["assistMirror"] = {
 export const useApp = create<AppState>()((set, get) => {
   function patchRun(runId: string, patch: Partial<RunRecord>): void {
     set({ runs: get().runs.map((r) => (r.id === runId ? { ...r, ...patch } : r)) });
+  }
+
+  /** Drops the loaded history and snapshot data of a run, so that a continuation's output is read again. */
+  function forgetRunResults(runId: string): void {
+    const histories = { ...get().histories };
+    delete histories[runId];
+    const profileLists = { ...get().profileLists };
+    delete profileLists[runId];
+    const profileSnaps = Object.fromEntries(
+      Object.entries(get().profileSnaps).filter(([key]) => !key.startsWith(`${runId}:`)),
+    );
+    set({ histories, profileLists, profileSnaps });
   }
 
   function stopAssistJournalTimer(): void {
@@ -2288,6 +2311,10 @@ export const useApp = create<AppState>()((set, get) => {
     },
 
     async restartRun(runId) {
+      await get().continueRun(runId, { tEndS: null, maxSteps: null });
+    },
+
+    async continueRun(runId, continuation) {
       const s = get();
       const rec = s.runs.find((r) => r.id === runId);
       if (!rec || rec.runDir === "" || !isTerminal(rec.state) || s.starting) return;
@@ -2297,6 +2324,14 @@ export const useApp = create<AppState>()((set, get) => {
         patchRun(runId, { launchError: t().server.binMissing });
         return;
       }
+      // A refused request launches nothing, so the run keeps its state and shows why.
+      const issues = continuationIssues(continuation, rec);
+      if (issues.length > 0) {
+        patchRun(runId, { launchError: issues.map((issue) => t().run.continueIssues[issue]).join(" / ") });
+        return;
+      }
+      const extraArgs = continuationArgs(continuation);
+      logOp(`continueRun ${rec.name}${extraArgs.length > 0 ? ` ${extraArgs.join(" ")}` : ""}`);
       const root = await resolveRepoRoot(profile);
       set({ starting: true });
       try {
@@ -2305,35 +2340,35 @@ export const useApp = create<AppState>()((set, get) => {
           ["bash", "-lc", `find ${shQuotePath(rec.runDir)} -name '*_ckpt_*.h5' 2>/dev/null`],
           { timeoutMs: 20000 },
         );
-        const checkpoints = ls.stdout
-          .split("\n")
-          .map((path) => {
-            const trimmedPath = path.trim();
-            const match = trimmedPath.match(/_ckpt_(\d+)(?:_r\d+)?\.h5$/);
-            return match ? { path: trimmedPath, index: Number(match[1]) } : null;
-          })
-          .filter((item): item is { path: string; index: number } => item !== null);
-        if (checkpoints.length === 0) {
-          patchRun(runId, { state: "failed", launchError: t().run.noCheckpoints });
+        // The latest output directory holds the latest checkpoint: each restart writes to <dir>_001, _002, ...
+        // with the file numbering starting again, so the highest index over all directories is not the latest.
+        const restartPrefix = latestCheckpointPrefix(ls.stdout.split("\n"));
+        if (restartPrefix === null) {
+          patchRun(runId, { launchError: t().run.noCheckpoints });
           set({ starting: false });
           await persistRuns();
           return;
         }
-        const latest = checkpoints.reduce((a, b) => (b.index > a.index ? b : a));
-        const restartPrefix = latest.path.replace(/(?:_r\d+)?\.h5$/, "");
         const scriptPath = joinRemote(rec.runDir, "run_detached.sh");
         const deckPath = joinRemote(rec.runDir, "deck.py");
+        // The wrapper uploaded with the original launch may predate the pass-through of tenryu run arguments.
+        await be().uploadText(profile, scriptPath, RUN_DETACHED_SH);
         const startEpoch = Math.floor(Date.now() / 1000);
         const r = await be().exec(
           profile,
-          withRepoEnv(root, ["bash", scriptPath, rec.runDir, profile.tenryuBin, deckPath, restartPrefix]),
+          withRepoEnv(root, [
+            "bash",
+            scriptPath,
+            rec.runDir,
+            profile.tenryuBin,
+            deckPath,
+            restartPrefix,
+            ...extraArgs,
+          ]),
           { timeoutMs: 30000 },
         );
         if (r.code !== 0) {
-          patchRun(runId, {
-            state: "failed",
-            launchError: (r.stderr || r.stdout).trim() || `exit=${r.code}`,
-          });
+          patchRun(runId, { launchError: (r.stderr || r.stdout).trim() || `exit=${r.code}` });
         } else {
           const statusPath = r.stdout.trim().split("\n").pop() ?? "";
           patchRun(runId, {
@@ -2344,14 +2379,17 @@ export const useApp = create<AppState>()((set, get) => {
             startEpoch,
             endEpoch: null,
             launchError: null,
+            tEnd: continuation.tEndS ?? rec.tEnd,
+            maxSteps: continuation.maxSteps ?? rec.maxSteps,
             statusPath: statusPath.endsWith("status.json")
               ? statusPath
               : joinRemote(rec.runDir, "status.json"),
           });
+          forgetRunResults(runId);
           await get().pollRunOnce(runId);
         }
       } catch (err) {
-        patchRun(runId, { state: "failed", launchError: String(err) });
+        patchRun(runId, { launchError: String(err) });
       }
       set({ starting: false });
       await persistRuns();
@@ -2469,17 +2507,26 @@ export const useApp = create<AppState>()((set, get) => {
       if (!profile) return;
       set({ histories: { ...get().histories, [runId]: { status: "loading" } } });
       try {
+        // A continued run has one history file per output directory (<dir>, <dir>_001, ...): joined in order.
         const ls = await be().exec(
           profile,
-          ["bash", "-c", `ls ${rec.runDir}/outputs/*/results/*_history.h5 2>/dev/null | head -1`],
+          ["bash", "-c", `ls ${rec.runDir}/outputs/*/results/*_history.h5 2>/dev/null`],
           { timeoutMs: 20000 },
         );
-        const path = ls.stdout.trim().split("\n").pop() ?? "";
-        if (ls.code !== 0 || !path.endsWith("_history.h5")) {
+        const paths = sortRunOutputFiles(
+          ls.stdout
+            .split("\n")
+            .map((line) => line.trim())
+            .filter((line) => line.endsWith("_history.h5")),
+        );
+        if (ls.code !== 0 || paths.length === 0) {
           throw new Error(ls.stderr.trim() || "history.h5 not found");
         }
-        const bytes = await be().readBinary(profile, path);
-        const data = await parseHistory(bytes);
+        const segments: HistorySeries[] = [];
+        for (const path of paths) {
+          segments.push(await parseHistory(await be().readBinary(profile, path)));
+        }
+        const data = mergeHistorySegments(segments);
         set({ histories: { ...get().histories, [runId]: { status: "ready", data } } });
       } catch (err) {
         set({ histories: { ...get().histories, [runId]: { status: "error", error: String(err) } } });
@@ -2495,24 +2542,20 @@ export const useApp = create<AppState>()((set, get) => {
       if (!profile) return;
       set({ profileLists: { ...get().profileLists, [runId]: { status: "loading" } } });
       try {
+        // Snapshots of every output directory of the run (a continued run writes <dir>_001, ... with the file
+        // numbering starting again), in the order they were written.
         const ls = await be().exec(
           profile,
-          ["bash", "-c", `ls ${rec.runDir}/outputs/*/results/ 2>/dev/null`],
+          ["bash", "-c", `ls ${rec.runDir}/outputs/*/results/*.h5 2>/dev/null`],
           { timeoutMs: 20000 },
         );
-        const dirLine = await be().exec(
-          profile,
-          ["bash", "-c", `ls -d ${rec.runDir}/outputs/*/results 2>/dev/null | head -1`],
-          { timeoutMs: 20000 },
+        const paths = sortRunOutputFiles(
+          ls.stdout
+            .split("\n")
+            .map((line) => line.trim())
+            .filter((line) => /_\d{4}\.h5$/.test(line)),
         );
-        const dir = dirLine.stdout.trim().split("\n").pop() ?? "";
-        const paths = ls.stdout
-          .split("\n")
-          .map((s) => s.trim())
-          .filter((s) => /_\d{4}\.h5$/.test(s))
-          .sort()
-          .map((s) => `${dir}/${s}`);
-        if (dir === "" || paths.length === 0) {
+        if (paths.length === 0) {
           throw new Error("no profile snapshots found");
         }
         set({ profileLists: { ...get().profileLists, [runId]: { status: "ready", paths } } });

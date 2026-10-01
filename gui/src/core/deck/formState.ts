@@ -349,6 +349,9 @@ export interface FormState {
     plotEveryS: Q | null;
     historyEveryS: Q | null;
     checkpointEveryS: Q | null;
+    /** Output.write_final_checkpoint: a checkpoint of the final step, so that the run can be continued past its end
+     *  from the run history. On by default in the GUI (the solver's default is off). */
+    writeFinalCheckpoint: boolean;
   };
   customPythonBlock: string;
   /** Optional v1 extension; absent on old GUI decks. */
@@ -649,6 +652,7 @@ export function defaultFormState(): FormState {
       plotEveryS: q(50, "ps"),
       historyEveryS: null,
       checkpointEveryS: null,
+      writeFinalCheckpoint: true,
     },
     customPythonBlock: "",
   };

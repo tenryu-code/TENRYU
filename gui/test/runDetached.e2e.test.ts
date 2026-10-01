@@ -10,8 +10,8 @@ const GUI_DIR = path.resolve(__dirname, "..");
 const SCRIPT = path.join(GUI_DIR, "src", "core", "assets", "run_detached.sh");
 const MOCK_TENRYU = path.join(GUI_DIR, "dev-bridge", "mock-bin", "tenryu");
 
-function launch(runDir: string, env: NodeJS.ProcessEnv): string {
-  const out = execFileSync("bash", [SCRIPT, runDir, MOCK_TENRYU, path.join(runDir, "deck.py")], {
+function launch(runDir: string, env: NodeJS.ProcessEnv, extra: string[] = []): string {
+  const out = execFileSync("bash", [SCRIPT, runDir, MOCK_TENRYU, path.join(runDir, "deck.py"), ...extra], {
     encoding: "utf8",
     env: { ...process.env, ...env },
     timeout: 20000,
@@ -64,6 +64,46 @@ describe("run_detached.sh contract (local bash + mock tenryu)", () => {
     expect(fin.exit_code).toBe(9);
     const log = fs.readFileSync(path.join(dir, "run.log"), "utf8");
     expect(log).toContain("TENRYU ERROR [mock]: injected failure");
+  }, 30000);
+
+  it("a restart passes the checkpoint and the tenryu run arguments after it", async () => {
+    const dir = mkRun("tenryu-rd-restart-");
+    const prefix = path.join(dir, "outputs", "case", "checkpoints", "case_ckpt_0001");
+    const statusPath = launch(dir, { TENRYU_MOCK_STEPS: "2", TENRYU_MOCK_SLEEP_MS: "20", TENRYU_MOCK_ARGV: "1" }, [
+      prefix,
+      "--t-end",
+      "4e-9",
+      "--max-steps",
+      "200000",
+    ]);
+    const fin = await waitTerminal(statusPath, 15000);
+    expect(fin.state).toBe("finished");
+    const log = fs.readFileSync(path.join(dir, "run.log"), "utf8");
+    const argv = log.match(/\[mock\] argv: (.+)/);
+    expect(argv).not.toBeNull();
+    expect(JSON.parse(argv![1])).toEqual([
+      "run",
+      path.join(dir, "deck.py"),
+      "--restart",
+      prefix,
+      "--t-end",
+      "4e-9",
+      "--max-steps",
+      "200000",
+    ]);
+  }, 30000);
+
+  it("a restart without further arguments passes only the checkpoint", async () => {
+    const dir = mkRun("tenryu-rd-restart-plain-");
+    const prefix = path.join(dir, "outputs", "case", "checkpoints", "case_ckpt_0000");
+    const statusPath = launch(dir, { TENRYU_MOCK_STEPS: "2", TENRYU_MOCK_SLEEP_MS: "20", TENRYU_MOCK_ARGV: "1" }, [
+      prefix,
+    ]);
+    const fin = await waitTerminal(statusPath, 15000);
+    expect(fin.state).toBe("finished");
+    const log = fs.readFileSync(path.join(dir, "run.log"), "utf8");
+    const argv = log.match(/\[mock\] argv: (.+)/);
+    expect(JSON.parse(argv![1])).toEqual(["run", path.join(dir, "deck.py"), "--restart", prefix]);
   }, 30000);
 
   it("stop path: kill -TERM -- -pid ends as failed(143) via the child trap", async () => {

@@ -7426,6 +7426,26 @@ void Driver::run(core::State& state,
     }
   };
 
+  // Output.write_final_checkpoint: one checkpoint of the state the run ends
+  // with, unless the cadence already wrote one at the final step, so that
+  // `tenryu run --restart ... --t-end/--max-steps` continues from the end of
+  // the run (SPECIFICATION §7.4). Written by rank 0 as the cadence
+  // checkpoints are, and counted by Output.checkpoint_keep_last.
+  const auto write_final_checkpoint_if_requested = [&]() {
+    if (!cfg.output.write_final_checkpoint || part_info.rank != 0 ||
+        out.last_checkpoint_step() == state.step) {
+      return;
+    }
+    const core::NvtxRange nvtx_checkpoint("outputs.write_final_checkpoint");
+    out.write_checkpoint(state, cfg, state.step, state.t, case_name,
+                         part_info.rank);
+    if (out.last_checkpoint_step() == state.step) {
+      core::log_info("[output] wrote final checkpoint (step=" +
+                     std::to_string(state.step) +
+                     ", t=" + format_sci(state.t) + ")");
+    }
+  };
+
   if (persistent_loop_active && cfg.laser.enabled) {
     const bool persistent_lmesh_setup =
         state.mesh.dim == 1 && cfg.laser.mode == "raytrace_2d";
@@ -7562,6 +7582,7 @@ void Driver::run(core::State& state,
                      std::to_string(state.step) +
                      ", t=" + format_sci(state.t) + ")");
     }
+    write_final_checkpoint_if_requested();
     if ((cfg.main.t_end - state.t) <=
         1.0e-14 * std::max(std::abs(state.t), std::abs(cfg.main.t_end))) {
       out.set_termination_reason("t_end_reached");
@@ -15541,6 +15562,7 @@ void Driver::run(core::State& state,
                    std::to_string(state.step) +
                    ", t=" + format_sci(state.t) + ")");
   }
+  write_final_checkpoint_if_requested();
   // Snapshots are published by a worker thread (io::HDF5Writer): the run ends
   // with every snapshot on disk.
   out.wait_for_snapshots();

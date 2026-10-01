@@ -195,6 +195,14 @@ int main(int argc, char** argv) {
                       "Checkpoint prefix (<dir>/<case>_ckpt_NNNN) to restart from");
   run_cmd->add_option("--output-dir", run_output_dir,
                       "Override Output.directory from the deck (fresh runs only)");
+  std::string run_t_end;
+  std::string run_max_steps;
+  run_cmd->add_option("--t-end", run_t_end,
+                      "End time [s] of a restarted run, overriding Main.t_end of the unchanged deck "
+                      "(restarts only)");
+  run_cmd->add_option("--max-steps", run_max_steps,
+                      "Step limit of a restarted run, overriding Main.max_steps of the unchanged deck "
+                      "(restarts only)");
 
   std::string verify_test;
   bool verify_generate_golden = false;
@@ -303,7 +311,15 @@ int main(int argc, char** argv) {
   MpiSession mpi_session(needs_mpi);
 
   if (run_cmd->parsed()) {
-    return tenryu::drivers::cmd_run(run_input, run_restart, run_output_dir);
+    tenryu::drivers::RunControlOverrides run_control;
+    try {
+      run_control.t_end = parse_optional_double(run_t_end, "--t-end");
+      run_control.max_steps = parse_optional_int(run_max_steps, "--max-steps");
+    } catch (const std::exception& error) {
+      std::cerr << "TENRYU ERROR [run]: " << error.what() << '\n';
+      return 2;
+    }
+    return tenryu::drivers::cmd_run(run_input, run_restart, run_output_dir, run_control);
   }
   if (verify_cmd->parsed()) {
     if (verify_test.empty()) {

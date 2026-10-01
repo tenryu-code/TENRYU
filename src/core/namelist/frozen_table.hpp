@@ -55,6 +55,11 @@ inline constexpr double kFrozenTimeRelTol = 1.0e-6;
 // through that power of two.
 inline constexpr long long kFrozenTimeMaxBaseIntervals = 1LL << 20;
 
+// Base step of the time tables for a run ending at t_end: kFrozenTimeBaseStep_s, doubled while more than
+// kFrozenTimeMaxBaseIntervals base intervals would be needed. A continued run (`tenryu run --t-end`) keeps the samples
+// of the earlier tables where the ranges overlap only while this step is unchanged.
+double frozen_time_table_step(double t_end);
+
 // name labels the ConfigError of a non-finite (or, with require_non_negative,
 // negative) sample: "Callable {name} returned non-finite value at t=...".
 FrozenTable1D create_frozen_time_table_from_sampler(

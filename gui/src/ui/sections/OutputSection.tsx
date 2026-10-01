@@ -71,6 +71,12 @@ export default function OutputSection() {
         />
       )}
       <p className="text-xs" style={{ color: "var(--fg-secondary)" }}>{m.form.checkpointEveryNote}</p>
+      <SwitchField
+        label={m.form.writeFinalCheckpoint}
+        checked={form.output.writeFinalCheckpoint}
+        onChange={(b) => update((f) => { f.output.writeFinalCheckpoint = b; })}
+        hint={m.form.writeFinalCheckpointNote}
+      />
       <h2 className="mt-3 text-sm font-semibold">{m.form.customBlockTitle}</h2>
       <textarea
         value={form.customPythonBlock}

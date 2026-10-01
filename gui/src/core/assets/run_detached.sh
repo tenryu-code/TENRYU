@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # TENRYU Studio run wrapper — detached run + JSON status-file contract.
-# Usage:  run_detached.sh <run_dir> <tenryu_bin> <deck_path>
+# Usage:  run_detached.sh <run_dir> <tenryu_bin> <deck_path> [<restart_prefix> [<tenryu run args>...]]
+#   <restart_prefix>   : checkpoint to restart from (`tenryu run <deck> --restart <prefix>`)
+#   <tenryu run args>  : passed after --restart, e.g. `--t-end 4e-09 --max-steps 200000` to continue the run past
+#                        the deck's Main.t_end / Main.max_steps with the unchanged deck (SPECIFICATION 7.4)
 # Contract (GUI plan §1/§5 + Addendum 1):
 #   - <run_dir>/status.json : the single authority for state/pid/exit_code
 #       {"schema":1,"state":"running|finished|failed","pid":N,"exit_code":N|null,
@@ -9,8 +12,9 @@
 #       the child gates on its existence so the final write can never lose the race.
 #   - <run_dir>/run.log     : combined stdout+stderr of `tenryu run`
 #   - Solver CWD = <run_dir>, so a deck-relative Output.directory
-#     (e.g. "outputs/<case>") lands inside <run_dir> (`tenryu run` has no
-#     --output-dir flag; Output.directory resolves against CWD by spec §6.4.8).
+#     (e.g. "outputs/<case>") lands inside <run_dir> (Output.directory resolves
+#     against CWD by spec §6.4.8; a restart writes to <dir>_001, <dir>_002, ...
+#     next to it, since `tenryu run --output-dir` is refused on a restart).
 #   - stdout of this script : single line = path of status.json
 #   - stop                  : kill -TERM -- -<pid>  (pid = process-group leader:
 #       setsid on Linux, job-control (set -m) fallback where setsid(1) is absent
@@ -32,6 +36,8 @@ EOF
 
 if [ "${1:-}" = "--child" ]; then
   RUN_DIR="$2"; BIN="$3"; DECK="$4"; START_EPOCH="$5"; RESTART="${6:-}"
+  shift $(( $# < 6 ? $# : 6 ))
+  EXTRA=("$@")
   # start gate: wait for the parent's "running" status write
   for _ in $(seq 1 100); do
     [ -f "$RUN_DIR/status.json" ] && break
@@ -39,7 +45,8 @@ if [ "${1:-}" = "--child" ]; then
   done
   cd "$RUN_DIR" || exit 10
   if [ -n "$RESTART" ]; then
-    "$BIN" run "$DECK" --restart "$RESTART" >> "$RUN_DIR/run.log" 2>&1 &
+    # ${EXTRA[@]+...}: an empty array under set -u is an error in bash 3.2 (macOS).
+    "$BIN" run "$DECK" --restart "$RESTART" ${EXTRA[@]+"${EXTRA[@]}"} >> "$RUN_DIR/run.log" 2>&1 &
   else
     "$BIN" run "$DECK" >> "$RUN_DIR/run.log" 2>&1 &
   fi
@@ -58,11 +65,13 @@ if [ "${1:-}" = "--child" ]; then
 fi
 
 if [ $# -lt 3 ]; then
-  echo "usage: run_detached.sh <run_dir> <tenryu_bin> <deck_path>" >&2
+  echo "usage: run_detached.sh <run_dir> <tenryu_bin> <deck_path> [<restart_prefix> [<tenryu run args>...]]" >&2
   exit 2
 fi
 
 RUN_DIR="$1"; BIN="$2"; DECK="$3"; RESTART="${4:-}"
+shift $(( $# < 4 ? $# : 4 ))
+EXTRA=("$@")
 
 case "$RUN_DIR" in
   /*) : ;;
@@ -76,14 +85,14 @@ START_EPOCH=$(date +%s)
 SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 
 if command -v setsid >/dev/null 2>&1; then
-  setsid bash "$SELF" --child "$RUN_DIR" "$BIN" "$DECK" "$START_EPOCH" "$RESTART" < /dev/null >> "$RUN_DIR/run.log" 2>&1 &
+  setsid bash "$SELF" --child "$RUN_DIR" "$BIN" "$DECK" "$START_EPOCH" "$RESTART" ${EXTRA[@]+"${EXTRA[@]}"} < /dev/null >> "$RUN_DIR/run.log" 2>&1 &
   PID=$!
 else
   # macOS has no setsid(1). Job control (set -m) gives the background child
   # its own process group (pgid == child pid), preserving the stop contract;
   # a non-interactive parent exit does not HUP the detached group.
   set -m
-  bash "$SELF" --child "$RUN_DIR" "$BIN" "$DECK" "$START_EPOCH" "$RESTART" < /dev/null >> "$RUN_DIR/run.log" 2>&1 &
+  bash "$SELF" --child "$RUN_DIR" "$BIN" "$DECK" "$START_EPOCH" "$RESTART" ${EXTRA[@]+"${EXTRA[@]}"} < /dev/null >> "$RUN_DIR/run.log" 2>&1 &
   PID=$!
   set +m
 fi

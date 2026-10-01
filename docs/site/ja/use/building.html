@@ -57,6 +57,7 @@ cd TENRYU</code></pre>
       <pre><code>cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 ninja -C build</code></pre>
       <p>ソースやビルド設定を変更したあとの差分ビルドは、通常 <code>ninja -C build</code> を実行し直せば十分である。CMake のオプションを変える場合は、構成のコマンドを新しいオプション付きで実行し直してから Ninja を走らせる。CMake の診断でパッケージが見つからないと出た場合は、そのパッケージを導入したうえで、同じ構成コマンドを実行し直すこと。</p>
+      <p>Ninja は既定で CPU 数 + 2 個のコンパイルを同時に走らせ、使うメモリもその数とともに増える。CPU 数に比べてメモリの少ない計算機（コンテナのメモリ上限を含む）ではコンパイラがメモリ不足で強制終了され、ログに <code>Killed</code> と出てビルドが止まることがある。その場合は <code>ninja -C build -j 8</code> のように同時実行数を減らして実行し直す。</p>
       <p>ビルドが通ったら、時間ループまで含めた最小の動作確認として、登録済みの解析解ケースを 1 本走らせる。</p>
       <pre><code>./build/tenryu --help          # CLI が起動すること
 ./build/tenryu verify noh      # 解析解ケースが PASS すること（GPU を使う）</code></pre>

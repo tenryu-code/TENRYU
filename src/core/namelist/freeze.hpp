@@ -1,9 +1,11 @@
 #pragma once
 
+#include <cstddef>
 #include <filesystem>
 #include <map>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include "core/config.hpp"
 
@@ -46,6 +48,14 @@ class Freeze {
   static std::string to_checkpoint_json(const NamelistConfig& config);
   static bool configs_equivalent(const std::string& json_a,
                                  const std::string& json_b);
+  // The key paths (dotted, e.g. "main.t_end"; list elements as "[i]") at which
+  // a checkpoint's frozen configuration and the current one differ in the
+  // restart comparison, in sorted key order and at most max_paths of them.
+  // Empty exactly when configs_equivalent is true.
+  static std::vector<std::string> config_difference_paths(
+      const std::string& checkpoint_json,
+      const std::string& current_json,
+      std::size_t max_paths);
   static std::string to_json(const NamelistConfig& config,
                              const FreezeExtras* extras = nullptr);
   static void write(const NamelistConfig& config,

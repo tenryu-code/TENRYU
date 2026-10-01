@@ -3084,9 +3084,7 @@ void Builder::set_main(py::dict kwargs) {
   if (has_key(kwargs, "max_steps")) {
     main.max_steps = strict_int32(kwargs["max_steps"], "Main.max_steps");
     ensure_int_ge(main.max_steps, 1, "Main.max_steps");
-    // 2^24 - 1: the photon global_id of the retired Monte Carlo radiation put the step in its upper bits (step x 2^40
-    // must fit in uint64, NUMERICS §12.7.1); the bound is kept as it was.
-    constexpr int kMaxStepsUpperBound = 16'777'215;
+    constexpr int kMaxStepsUpperBound = Config::MainConfig::kMaxStepsUpperBound;
     if (main.max_steps > kMaxStepsUpperBound) {
       throw ConfigError(format_range_error(
           "Main.max_steps",
@@ -14224,7 +14222,7 @@ void Builder::set_output(py::dict kwargs) {
   enforce_known_keys(kwargs, "Output",
                      {"directory", "format", "plot_every", "history_every",
                       "checkpoint_every", "plot_every_s", "history_every_s",
-                      "checkpoint_every_s", "write_final_snapshot",
+                      "checkpoint_every_s", "write_final_snapshot", "write_final_checkpoint",
                       "checkpoint_keep_last", "compression", "compression_level",
                       "save_namelist_copy", "save_frozen_config", "plot_fields"});
 
@@ -14256,6 +14254,10 @@ void Builder::set_output(py::dict kwargs) {
   if (has_key(kwargs, "write_final_snapshot")) {
     output.write_final_snapshot = strict_bool(
         kwargs["write_final_snapshot"], "Output.write_final_snapshot");
+  }
+  if (has_key(kwargs, "write_final_checkpoint")) {
+    output.write_final_checkpoint = strict_bool(
+        kwargs["write_final_checkpoint"], "Output.write_final_checkpoint");
   }
   if (has_key(kwargs, "history_every_s")) {
     output.history_every_s =

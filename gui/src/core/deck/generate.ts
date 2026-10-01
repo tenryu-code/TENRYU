@@ -623,14 +623,17 @@ export function generateDeck(f: FormState): string {
         L.push(`        boundary=dict(inner_r="reflect_parity", outer_r=${pyStr(r.outerR)}),`);
       }
       L.push("    ),");
+      // As under FLD, the top-level boundary carries only the Marshak temperature: S_N reads its faces from
+      // sn_transport.boundary, and the solver refuses face settings at the top level (since 2026-09-29; the
+      // outer_r="marshak" written here before then was ignored).
       if (r.outerR === "marshak") {
+        L.push("    boundary=dict(");
         if (r.marshakMode === "table") {
-          L.push(`    boundary=dict(inner_r="reflect", outer_r=${pyStr(r.outerR)}, marshak_Tr=gui_marshak_tr),`);
+          L.push("        marshak_Tr=gui_marshak_tr,");
         } else {
-          L.push(`    boundary=dict(inner_r="reflect", outer_r=${pyStr(r.outerR)}, marshak_Tr_eV=${pyNum(r.marshakTrEV)}),`);
+          L.push(`        marshak_Tr_eV=${pyNum(r.marshakTrEV)},`);
         }
-      } else {
-        L.push(`    boundary=dict(inner_r="reflect", outer_r=${pyStr(r.outerR)}),`);
+        L.push("    ),");
       }
     }
     L.push(")");
@@ -906,6 +909,8 @@ export function generateDeck(f: FormState): string {
   L.push(
     `    checkpoint_every_s=${f.output.checkpointEveryS ? numC(sec(f.output.checkpointEveryS), f.output.checkpointEveryS) : "-1.0,"}`,
   );
+  // Written only when on: a tenryu built before 2026-09-30 does not know the key.
+  if (f.output.writeFinalCheckpoint) L.push("    write_final_checkpoint=True,");
   L.push(")");
   L.push("");
   L.push("Diagnostics(enabled=True)");

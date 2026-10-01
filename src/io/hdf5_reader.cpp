@@ -2173,11 +2173,32 @@ int validate_schema_and_frozen_config(const hid_t file,
       const bool drift_ok = (allow_drift != nullptr && std::string_view(allow_drift) == "1");
       const bool equivalent = core::namelist::Freeze::configs_equivalent(
           frozen_config, cfg.meta.frozen_config_json);
+      // The keys that differ, so that the message names what changed (an
+      // edited deck text, a longer t_end, another output directory, ...).
+      std::string differing_keys;
+      if (!equivalent) {
+        constexpr std::size_t kListedKeys = 8;
+        const std::vector<std::string> paths =
+            core::namelist::Freeze::config_difference_paths(
+                frozen_config, cfg.meta.frozen_config_json, kListedKeys + 1);
+        for (std::size_t i = 0; i < std::min(paths.size(), kListedKeys); ++i) {
+          differing_keys += (i == 0 ? "" : ", ") + paths[i];
+          if (paths[i] == "_namelist_source_hash") {
+            differing_keys += " (the sha256 of the deck file text)";
+          }
+        }
+        if (paths.size() > kListedKeys) {
+          differing_keys += ", ...";
+        }
+      }
       if (!equivalent && drift_ok) {
-        core::log_warning("[restart] frozen-config mismatch OVERRIDDEN by TENRYU_I1B_RESTART_ALLOW_CONFIG_DRIFT=1 (diagnostic use only; results are NOT production-comparable)");
+        core::log_warning("[restart] frozen-config mismatch OVERRIDDEN by TENRYU_I1B_RESTART_ALLOW_CONFIG_DRIFT=1 (diagnostic use only; results are NOT production-comparable); differs at: " + differing_keys);
       } else {
         TENRYU_ASSERT(equivalent,
-            "ConfigError: checkpoint frozen_config JSON mismatch between checkpoint and namelist");
+            "ConfigError: checkpoint frozen_config JSON mismatch between checkpoint and namelist (differs at: " +
+                differing_keys +
+                "). A restart runs the deck file of the original run unchanged; to continue past its end, "
+                "pass --t-end <time> or --max-steps <steps> to tenryu run (SPECIFICATION 7.4)");
       }
     } else {
       core::log_warning(

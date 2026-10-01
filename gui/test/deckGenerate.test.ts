@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { defaultFormState, makeHotEChannel, validateFormState } from "../src/core/deck/formState";
+import { defaultFormState, makeHotEChannel, migrateFormState, validateFormState, type FormState } from "../src/core/deck/formState";
 import { generateDeck, pyList, pyNum, pyStr } from "../src/core/deck/generate";
 import { extractGuiState } from "../src/core/deck/roundtrip";
 import { defaultShape2D } from "../src/core/geometry2d";
@@ -499,5 +499,41 @@ describe("generateDeck", () => {
     f.output.checkpointEveryS = q(0.5, "ns");
     expect(generateDeck(f)).toContain("checkpoint_every_s=5e-10");
     expect(generateDeck(defaultFormState())).toContain("checkpoint_every_s=-1.0");
+  });
+
+  it("S_N writes its faces in sn_transport.boundary and only the Marshak temperature at the top level", () => {
+    // The solver refuses face settings in the top-level Radiation.boundary under S_N (since 2026-09-29).
+    const f = defaultFormState();
+    f.radiation.enabled = true;
+    f.radiation.mode = "sn_transport";
+    f.radiation.outerR = "marshak";
+    f.radiation.marshakTrEV = 120;
+    const marshak = generateDeck(f);
+    expect(marshak).toContain('boundary=dict(inner_r="reflect_parity", outer_r="marshak")');
+    expect(marshak).toMatch(/\n {4}boundary=dict\(\n {8}marshak_Tr_eV=120,\n {4}\),/);
+    expect(marshak).not.toMatch(/\n {4}boundary=dict\(inner_r=/);
+    f.radiation.outerR = "reflect";
+    const reflect = generateDeck(f);
+    expect(reflect).toContain('boundary=dict(inner_r="reflect_parity", outer_r="reflect")');
+    expect(reflect).not.toMatch(/\n {4}boundary=dict\(/);
+  });
+
+  it("writes Output.write_final_checkpoint by default and omits the key when turned off", () => {
+    const f = defaultFormState();
+    expect(f.output.writeFinalCheckpoint).toBe(true);
+    const on = generateDeck(f);
+    expect(on).toMatch(/Output\([\s\S]*\n {4}write_final_checkpoint=True,\n\)/);
+    f.output.writeFinalCheckpoint = false;
+    // Off is the solver's default, and a tenryu built before 2026-09-30 does not know the key.
+    expect(generateDeck(f)).not.toContain("write_final_checkpoint");
+  });
+
+  it("an older GUI state without the switch gets the default (on)", () => {
+    const raw = structuredClone(defaultFormState()) as FormState;
+    delete (raw.output as Partial<FormState["output"]>).writeFinalCheckpoint;
+    expect(migrateFormState(raw).output.writeFinalCheckpoint).toBe(true);
+    const off = structuredClone(defaultFormState());
+    off.output.writeFinalCheckpoint = false;
+    expect(migrateFormState(off).output.writeFinalCheckpoint).toBe(false);
   });
 });
