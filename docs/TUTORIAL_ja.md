@@ -2,8 +2,8 @@
 
 本書は **初めて TENRYU を使う人**のための入門書です。ビルド → 最初の計算 →
 namelist（入力ファイル）の書き方 → 結果の見方 → よくあるエラー、の順に進みます。
-網羅的なリファレンスは `docs/USER_MANUAL.md`（使い方全般）と
-`docs/SPECIFICATION.md` §6.4（全キーの正典）にあります。本書は「最短で動かして
+網羅的なリファレンスは公開サイトの[「TENRYU を使う」](https://tenryu-code.github.io/TENRYU/ja/use/)
+（使い方全般）と `docs/SPECIFICATION.md` §6.4（全キーの正典）にあります。本書は「最短で動かして
 仕組みを理解する」ことに絞ります。
 
 ---
@@ -124,7 +124,8 @@ mat = Material(
 Materials(materials=[mat])
 ```
 - 入門は `ideal_gas` + `constant` で十分。実験解析では SESAME/IONMIX の
-  テーブルを使います（USER_MANUAL §4）。
+  テーブルを使います（公開サイトの
+  [「EOS・不透明度・電離」](https://tenryu-code.github.io/TENRYU/ja/physics/eos-opacity.html)の頁）。
 - 多材料（シェル+燃料など）は materials のリストに並べ、Geometry の
   volfrac で空間配置します。
 
@@ -161,7 +162,8 @@ Laser(enabled=True, wavelength_nm=351.0,
                        power=pulse)])                  # power は時間 [s] の関数
 ```
 - 1D 入門は `radial_absorption_1d`（ビーム形状に依存しない径方向吸収）が
-  最も簡単。レイトレースが要るときは `raytrace_2d`（USER_MANUAL §7）。
+  最も簡単。レイトレースが要るときは `raytrace_2d`（公開サイトの
+  [「レーザー駆動と吸収」](https://tenryu-code.github.io/TENRYU/ja/physics/laser.html)の頁）。
 - CBET・ホット電子プリヒートは opt-in（`Laser.cbet` / `Laser.hot_electron`、
   SPECIFICATION §6.4 参照）。まずは OFF のままで。
 
@@ -279,7 +281,8 @@ opt-in 群は「書かなければ完全に不活性（結果はビット単位�
 
 ## 10. 次のステップ
 
-- リファレンス: `docs/USER_MANUAL.md`（運用全般）→ `docs/SPECIFICATION.md` §6.4（全キー）
+- リファレンス: 公開サイトの[「TENRYU を使う」](https://tenryu-code.github.io/TENRYU/ja/use/)（運用全般）
+  → `docs/SPECIFICATION.md` §6.4（全キー）
 - 物理と離散化の正典: `docs/NUMERICS.md`
 - 検証済みの例: `examples/verification/`（各 gate の実物 deck）
 - うまくいかないとき: ①validate ②frozen JSON ③`log/` の warning、の順に見る
