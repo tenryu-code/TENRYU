@@ -293,6 +293,9 @@ export function mapRecordedDeck(record: DeckRecord): { form: FormState; bindings
   if (Array.isArray(b.Burn?.fuels)) for (const fuel of ["DT","DD","D3He"] as const) f.burn.fuels[fuel] = b.Burn.fuels.includes(fuel);
   put("burn.fuelMaterials", ["Burn","fuel_materials"], v=>Array.isArray(v)?v.join(","):undefined);
   put("output.directory", ["Output","directory"]);
+  // Absent from the source deck means the solver's default (off), not the GUI's default (on).
+  f.output.writeFinalCheckpoint = false;
+  put("output.writeFinalCheckpoint", ["Output","write_final_checkpoint"], v=>typeof v==="boolean" ? v : undefined);
   for (const [key, src] of Object.entries({ plotEveryS:"plot_every_s", historyEveryS:"history_every_s", checkpointEveryS:"checkpoint_every_s" })) {
     put(`output.${key}`, ["Output",src], v=>typeof v==="number" ? v>0?q(v,"s"):null : undefined);
   }

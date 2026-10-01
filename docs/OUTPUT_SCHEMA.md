@@ -11,6 +11,8 @@
 
 パスは `Output.directory` からの相対です（`run_info.json` と `mesh_requirement.json` は `Output.directory` 直下、`<case>_frozen.json` は `config/`）。`NNNN` はスナップショットとチェックポイントそれぞれの 4 桁ゼロ埋めの通し番号で（0 から数え、出力先に既存のファイルがあれば、再開かどうかによらずその最大番号の次から続ける）、cycle 番号ではありません。cycle 番号はルート属性 `cycle` にあります。停止理由は `run_info.json` の `termination_reason` に記録されます。
 
+`run_info.json` の中身（run の開始時・スナップショットのたび・終了時に書き直す）: `step`、`t`、`dt`、`t_end`・`max_steps`（実際に使った終了時刻と step 上限。`--t-end`・`--max-steps` で延長した run ではその値、2026-09-30 追加）、`termination_reason`、`solver_requested`・`solver_resolved`、`cg_cap_exit_unconverged`・`newton_cap_exit_unconverged`。
+
 ## 2. Snapshot (`<case>_NNNN.h5`)
 
 主な構成:
@@ -61,6 +63,8 @@
 
 ## 4. Checkpoint (`<case>_ckpt_NNNN.h5`)
 
+cadence（`checkpoint_every`・`checkpoint_every_s`）で書くほか、`Output.write_final_checkpoint=True` のときは、最後の cadence のチェックポイントが最終 step でなければ、run の終了時に最終状態のチェックポイントを 1 つ書く（2026-09-30。`checkpoint_keep_last` の数に入る）。`--t-end`・`--max-steps` による run の延長（SPECIFICATION §7.4）はこれから始められる。延長した run が書くチェックポイントの `metadata/frozen_config` はデッキの値（`t_end`・`max_steps`）のまま。
+
 snapshot内容に加えて以下を保存:
 - `/hydro_flags/hydro_active`
 - `/time_state/*` (`t`, `step`, `dt`, 累積エネルギー項, `user_seed`)
@@ -110,7 +114,7 @@ h5ls checkpoints/<case>_ckpt_0001.h5/radiation_sn
 - `/radiation/diag_*` は output-only diagnostics です。`diag_E_star_flux` は SN face-flux \(E^*\) 診断、`diag_stream_theta` は donor-theta streaming limiter 診断、`diag_ap_alpha_face` は AP face_blend の face weight 診断です。旧snapshot/checkpointで欠損してもrestartの物理状態復元には使いません。
 - Topology compatibility is path-versioned: single-block files omit `/mesh/topology`, 3-block multiblock files use `/mesh/topology/v2`, and half-butterfly 5-block files use `/mesh/topology/v3`. Readers check v3 first, then v2, then the v1 single-block fallback.
 
-凍結項目（dimension/mesh/materials/groups/seed/group_bounds）が不一致なら再開不可です。
+チェックポイントの `metadata/frozen_config` と再開に使うデッキの凍結設定（デッキ本文の sha256 と、`Main.restart_from` を除くすべての設定）が一致しなければ再開不可です（`checkpoint frozen_config JSON mismatch`。メッセージは違うキーを並べる）。元の run と同じデッキを変えずに使い、終了時刻や step 上限は `--t-end`・`--max-steps` で延ばします（SPECIFICATION §7.4。2026-09-30 訂正: 以前は照合する項目を dimension・mesh・materials・groups・seed・group_bounds と記していた）。
 
 ## 8. Material-interface diagnostics group (additive)
 

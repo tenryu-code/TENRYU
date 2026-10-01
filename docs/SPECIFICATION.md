@@ -339,7 +339,8 @@ TENRYUは **すべてのシミュレーション条件を1つのPythonファイ�
 - 通常実行：
   - `tenryu run <namelist.py>`
   - `tenryu run <namelist.py> --restart <checkpoint_prefix>`（任意。`Main.restart_from` の実行時オーバーライド）
-  - `tenryu run <namelist.py> --output-dir <dir>`（任意、2026-07-12 追加 — GUI Studio M3 報告の解消。`Output.directory` の実行時オーバーライド。**新規 run 専用**: `--restart` または `Main.restart_from` との併用は `ConfigError`（restart は元の出力レイアウトを継続するため）。上書き後の値は frozen config に自己記述される）
+  - `tenryu run <namelist.py> --output-dir <dir>`（任意、2026-07-12 追加 — GUI Studio M3 報告の解消。`Output.directory` の実行時オーバーライド。**新規 run 専用**: `--restart` または `Main.restart_from` との併用は `ConfigError`。再開した run はデッキの `Output.directory`（既にあれば `_001` などの通し番号付き）に書く。チェックポイントの凍結設定 `metadata/frozen_config` はデッキの値を持つので、`--output-dir` で始めた run も変えないデッキで再開する。上書き後の値は `config/<case>_frozen.json` に記録される）
+  - `tenryu run <namelist.py> --restart <checkpoint_prefix> --t-end <s>` / `--max-steps <N>`（任意、2026-09-30 追加。再開した run の終了時刻と step 上限。デッキの `Main.t_end`・`Main.max_steps` を実行時に上書きし、デッキは変えない。**再開専用**: 新規 run での指定は `ConfigError`。§7.4 の「run の延長」）
 - 検証：
   - `tenryu verify all`
   - `tenryu verify <case>`
@@ -1765,7 +1766,7 @@ Numerics(
   - **端点外挿規則**：凍結範囲 \([0, t_{end}]\) 外は \(P = 0\) とする
 - `energy_J: Optional[float]`（既定 `None`；与えた場合は `power` の波形形状を保ったまま積分エネルギーが `energy_J` に一致するようにリスケールする [J]。有効範囲：`> 0`。`power` は波形形状の指定として必須であり、`energy_J` と `power` の同時指定は正当な使用法）
   - energy_J が指定された場合のスケーリング手順（2026-09-24 実装。frozen config にはキーを与えたビームだけ `energy_J` を記録）:
-    1. 凍結した区分線形テーブルを \([0, t_{end}]\) で厳密に積分: E_computed = ∫₀^{t_end} P(t) dt [J]（P は W）
+    1. 凍結した区分線形テーブルを \([0, t_{end}]\) で厳密に積分: E_computed = ∫₀^{t_end} P(t) dt [J]（P は W）。\(t_{end}\) はデッキの `Main.t_end` で、`--t-end` で終了時刻を変えた run でも変えない（表は `[0, max(--t-end, Main.t_end)]` で作るが、正規化の区間はデッキのまま。§7.4 の「run の延長」、2026-09-30）
     2. スケール係数: s = energy_J / E_computed
     3. P_scaled(t) = s × P(t)（`run`・`verify`・`validate` とメッシュ分解能要求の全ての表に適用）
     4. E_computed < 10⁻³⁰ J の場合: ConfigError("Laser.beams[i].energy_J: zero-integral waveform cannot be normalized")
@@ -2293,6 +2294,7 @@ Numerics(
 - `checkpoint_every: int`（既定 1000；有効範囲：`≥ 1`；チェックポイント出力間隔 [サイクル]。§7.4参照）
 - `plot_every_s: float`（既定 -1.0 [s]；`> 0.0` で有効、`-1.0` で無効、`0.0` は `ConfigError`。有効時、Δtが出力時刻に整合される（NUMERICS §2.2 (f)）。`plot_every` を明示したときは `plot_every` とのOR論理で評価し、`plot_every` を指定しないときは既定のサイクル間隔（100）を無効にして時間間隔だけで出力する（`builder.cpp` の `plot_every_explicit`））
 - `write_final_snapshot: bool`（default `False`; when the run terminates (t_end/max_steps) and the last cadence plot did not land on the final step, write one closing snapshot at the final state. Opt-in because snapshot-counting gates rely on cadence-only output.）
+- `write_final_checkpoint: bool`（既定 `False`；2026-09-30 追加。run の終了時（`t_end`・`max_steps` への到達とその他のループの終了）に、最後の cadence のチェックポイントが最終 step でなければ、最終状態のチェックポイントを 1 つ書く。書くのは cadence のチェックポイントと同じく rank 0 で、`checkpoint_keep_last` の数に入る。`--t-end`・`--max-steps` による run の延長（§7.4）の起点になる。この項目の無い旧チェックポイントは既定値 `False` として照合する）
 - `history_every_s: float`（既定 -1.0 [s]；`> 0.0` で有効、`-1.0` で無効、`0.0` は `ConfigError`。有効時、Δtが出力時刻に整合される（NUMERICS §2.2 (f)）。`history_every` を明示したときは `history_every` とのOR論理で評価し、指定しないときは既定のサイクル間隔を無効にして時間間隔だけで出力する）
 - `checkpoint_every_s: float`（既定 -1.0 [s]；`> 0.0` で有効、`-1.0` で無効、`0.0` は `ConfigError`。`X_every_s > t_end - t_current` の場合 WARNING（`t_current` は初回実行時=0、リスタート時=checkpoint時刻）。`checkpoint_every` を明示したときは `checkpoint_every` とのOR論理で評価し、指定しないときは既定のサイクル間隔を無効にして時間間隔だけで出力する）
 - `checkpoint_keep_last: int`（既定 2；有効範囲：`≥ 1`；保持するチェックポイント数。古いものから自動削除）
@@ -2303,7 +2305,7 @@ Numerics(
 
 > **出力頻度の指定方式**：ステップ数ベース（`plot_every` 等）と時間間隔ベース（`plot_every_s` 等 [s]）を
 > 同時に有効化可能（OR論理：いずれかの条件が成立すれば出力）。時間間隔ベースではΔtが出力時刻に整合される（NUMERICS §2.2 (f)）。
-> ステップ0は常に出力。最終ステップは cadence が一致した場合のみ出力される（歴史的にこの段落は「最終ステップも常に出力」と述べていたが、その動作は実装されていない）。終端スナップショットが必要な場合は `write_final_snapshot=True`（opt-in、2026-09-02 追加）を指定する。ファイル名の番号はサイクル番号ではなく、出力の種類ごとの 4 桁の通し番号（`NNNN`）である（§7.1）。
+> ステップ0は常に出力。最終ステップは cadence が一致した場合のみ出力される（歴史的にこの段落は「最終ステップも常に出力」と述べていたが、その動作は実装されていない）。終端スナップショットが必要な場合は `write_final_snapshot=True`（opt-in、2026-09-02 追加）を、終端のチェックポイントが必要な場合は `write_final_checkpoint=True`（opt-in、2026-09-30 追加）を指定する。ファイル名の番号はサイクル番号ではなく、出力の種類ごとの 4 桁の通し番号（`NNNN`）である（§7.1）。
 
 #### 6.4.9 Diagnostics(...)
 - `enabled: bool`（既定 True；False で全診断無効化）
@@ -3020,12 +3022,12 @@ fallback/migration は行わない。fixed mode では group 欠落を従来通�
 1. チェックポイント読み込み → mesh/hydro/radiation の全場を復元
 2. hydro_flags/ から `hydro_active` フラグを復元（一方向スイッチ状態の保持に必須）
 3.–4.（schema 1 の手順: `particles/` から光子プール、`rng/` から粒子の RNG ストリームを復元していた。2026-09-29 に廃止。schema 1 のチェックポイントの `particles/` は空でなければならず、粒子があれば退役した `imc_ddmc` の run として再開を拒否する）
-5. output_state/ から `t_next_plot`, `t_next_history`, `t_next_checkpoint` を復元。グループ不在（旧checkpoint）の場合は `t + X_every_s` で再初期化。output パラメータが変更された場合（「調整可」）は `t_next_X = t + new_X_every_s` で再計算
+5. output_state/ から `t_next_plot`, `t_next_history`, `t_next_checkpoint` を復元。グループ不在（旧checkpoint）の場合は `t + X_every_s` で再初期化（出力の間隔は照合の対象なので、再開で変わることはない。以前の版は「output パラメータが変更された場合（調整可）は再計算」と記していたが、その経路は無い）
 6. time_state/ から `t`, `step`, `dt`, `ale_last_applied_step`, `axis_mass_initial`, `axis_inflow_budget`, `E_safety`, `E_numerical_loss`, `E_laser_deposited`, `E_laser_escaped`, `E_rad_escaped`, `E_floor_injected`, `E_pdV_bdry`, `E_Marshak_in`, `E_volume_in`, `E_solver` と adaptive AV tracker scalars を復元。dt は NUMERICS §2.2 の成長制限（≤1.2×dt）を尊重するために必須。`ale_last_applied_step` は 1D V3 ALE の min-step gate continuity を保証し、旧チェックポイントでは -1 として扱う。Phase 9 の `axis_mass_initial` / `axis_inflow_budget` は旧チェックポイントで不在なら empty として扱い、budget gate が必要になった時点で lazy-init する。累積診断値はエネルギー収支の連続性を保証。旧チェックポイント（E_pdV_bdry、adaptive AV tracker scalars 等が不在）の場合は 0.0 で初期化（後方互換）
 7. `laser_cache_valid = false` に設定し、`laser_dep_frac` をクリア（リスタート直後のステップで必ず full raytrace を実行。ARCHITECTURE §4.6、CUDA_KERNELS §9 Phase 3 準拠）
 7a. `radiation_sn/psi_prev` があれば `State::sn_psi_prev` へ復元する。S_N は最初の解で大きさ（\(N_{cells}N_{groups}N_{angles}\)）が一致すればそのまま使い、不一致なら等方に再シードする（NUMERICS §6.8）。`rad_E_old` は保存せず、S_N・FLD とも毎回の解の冒頭で `rad_E` からコピーする
 7b. 1D のチェックポイントは状態方程式の閉包が作る `hydro/cv_e`・`hydro/cv_i`・`hydro/cs` を `hydro/ee`・`ei`・`Te`・`Ti`・`Pe`・`Pi` と一緒に保存する（2026-09-25 から。per-material 保存が有効な run は従来から snapshot の hydro 群に含む）。`hydro/cs` のあるチェックポイントからの 1D の再開は、run 開始時の閉包（初期音速の準備）を行わず、復元した状態をそのまま使う（`State::closure_fields_restored`）。閉包はビット単位では冪等でなく、閉包済みの状態をもう一度閉じると ee・Te・Pe が丸め誤差だけ動き、再開した run が元の run と一致しなかった。`hydro/cs` の無い旧チェックポイントは従来どおり閉包してから始める。空セルの印 `hydro_flags/cell_is_void`（is_void 材料のセル。初期化が材料から設定し、再開では作り直されない）も 1D のチェックポイントに保存し、再開で復元する（2026-09-25 まで保存されず、再開した run は空セルなしで続いた。レーザーは最外の空セルを標的表面とみなして ghost corona を失っていた）。熱伝導ソルバーの run 累積統計（`conduction_state/{solver_steps_total, solver_residual_max, solver_iter_max, solver_cond_number_max, bc_heat_flux_integrated, snb_steps_total, snb_picard_iters_max, snb_nonconverged_steps, snb_cap_theta_min_run, snb_dq_over_qsh_max_run}`）も復元する（無ければ再開時点から数える）。GXII の FLD デッキ（レーザー・熱伝導・多群 FLD）と ghost corona のある小デッキで、途中のチェックポイントから再開した run は元の run とビット一致する（ctest `restart_bitwise_gxii_1d`）。`Laser.raytrace_skip_config.enabled=True` の run は項目 7 により再開直後に必ず全光線追跡を行うため、キャッシュを再利用していた元の run とは一致しない
-8. 凍結設定（`metadata/frozen_config` の正準 JSON）を、再開に使うデッキの凍結設定と比較する。`Main.restart_from` を除く違いがあれば `ConfigError`（下のパラメータ変更制約）
+8. 凍結設定（`metadata/frozen_config` の正準 JSON）を、再開に使うデッキの凍結設定と比較する。`Main.restart_from` を除く違いがあれば `ConfigError`（下のパラメータ変更制約）。メッセージは違うキーの経路（`main.t_end`・`output.directory`・デッキ本文の sha256 の `_namelist_source_hash` など、キーの順に最大 8 個）を並べ、`--t-end`・`--max-steps` による延長を案内する（2026-09-30 から）
 
 `eos_signature` checkpoint validation (implementation note):
 - Checkpoints store per-material EOS signatures at `/metadata/eos/eos_signature` (`uint64` array, hash over EOS model/path/grid metadata).
@@ -3038,9 +3040,26 @@ fallback/migration は行わない。fixed mode では group 欠落を従来通�
 |------|-----------|---------|
 | 照合する（ConfigError）| `Main.restart_from` を除くすべての設定（dimension, mesh, materials, n_groups, group_bounds_eV, Main.seed, t_end, dt, output, diagnostics ほか）と、デッキ本文の sha256（`_namelist_source_hash`） | 変更不可 |
 | 照合しない | `Main.restart_from`（CLI `--restart` も） | 変更可 |
+| 照合しない（CLI） | `--t-end`・`--max-steps`（再開した run の終了時刻と step 上限。デッキの `Main.t_end`・`Main.max_steps` を上書きする。下の「run の延長」） | 指定可 |
 
-再開は元の run と同じデッキファイルを内容を変えずに使う（`tenryu run <deck.py> --restart <prefix>`）。デッキに `restart_from` を書き足す、`t_end` を延ばす、出力の間隔を変える、コメントを足すなど、本文の変更はすべて `ConfigError: checkpoint frozen_config JSON mismatch` になる（2026-09-30 に sod_planar で実測: 同じデッキと `--restart` の再開は 300 ステップ目のチェックポイントが連続実行とビット一致、`restart_from` を書き足したデッキと `t_end` だけ変えたデッキは拒否。再開元を環境変数から読むデッキは再開でき、ビット一致）。以前の版の本表は t_end・dt・output・diagnostics を「調整可」としていたが、実装はそれらも照合する。照合を外す `TENRYU_I1B_RESTART_ALLOW_CONFIG_DRIFT=1` は診断用で、その結果は本番の比較に使えない。
-| 調整可（WARNING）| radiation, laser, numerics | 変更可（物理的整合性に注意） |
+再開は元の run と同じデッキファイルを内容を変えずに使う（`tenryu run <deck.py> --restart <prefix>`）。デッキに `restart_from` を書き足す、`t_end` を延ばす、出力の間隔を変える、コメントを足すなど、本文の変更はすべて `ConfigError: checkpoint frozen_config JSON mismatch` になる（2026-09-30 に sod_planar で実測: 同じデッキと `--restart` の再開は 300 ステップ目のチェックポイントが連続実行とビット一致、`restart_from` を書き足したデッキと `t_end` だけ変えたデッキは拒否。再開元を環境変数から読むデッキは再開でき、ビット一致）。以前の版の本表は t_end・dt・output・diagnostics を「調整可」としていたが、実装はそれらも照合する。照合を外す `TENRYU_I1B_RESTART_ALLOW_CONFIG_DRIFT=1` は診断用で、その結果は本番の比較に使えない。（2026-09-30 訂正: 同日の書き換えで旧表の 3 行目「調整可（WARNING）| radiation, laser, numerics」がこの段落の後ろに残っていた。radiation・laser・numerics も照合の対象である。）
+
+**run の延長（`t_end`・`max_steps` を延ばして続ける、2026-09-30 追加）**：
+
+終えた run、または途中のチェックポイントから、終了時刻や step 上限を延ばして続けるには、元の run と同じデッキを変えずに使い、新しい値を CLI で渡す。
+
+```bash
+tenryu run <deck.py> --restart <checkpoint> --t-end <新しい終了時刻 [s]>
+tenryu run <deck.py> --restart <checkpoint> --max-steps <新しい step 上限>
+```
+
+- 終えた run から続けるには、元の run のデッキに `Output.write_final_checkpoint=True` を入れておく（終了した step のチェックポイントが残る）。延長した run が書いたチェックポイントから、さらに延ばすときも同じデッキと新しい値を使う。
+- 照合：`--t-end`・`--max-steps` はデッキの凍結設定を変えない。再開の照合と、延長した run が書くチェックポイントの `metadata/frozen_config` はデッキの値（`t_end`・`max_steps`）のまま。実際に使った値は `run_info.json` の `t_end`・`max_steps` と `config/<case>_frozen.json` の `main` に記録する。
+- 開始前に拒否する場合（`ConfigError`）：新規 run での `--t-end`・`--max-steps`、0 以下の `--t-end`、`[1, 16_777_215]` の外の `--max-steps`、チェックポイントの時刻が終了時刻に達している場合（\(t_{end} - t \le 10^{-14}\max(|t|, |t_{end}|)\)、ドライバーの終了判定と同じ。メッセージは `--t-end` を案内する）、チェックポイントの step が上限に達している場合（`--max-steps` を案内する）。数値でない値・有限でない `--t-end`・int の範囲外の `--max-steps` は、CLI の解析で `TENRYU ERROR [run]` として止まる（終了コード 2）。
+- 時間の表：ビーム出力・Marshak の駆動温度・境界圧力・高速電子の変換効率の時間表は、`[0, max(--t-end, デッキの Main.t_end)]` で作り直す（デッキより早い `--t-end` でも、下の `energy_J` の正規化区間を表が覆うように）。表の刻みは \(2^{-40}\) s で、run が約 0.95 µs を超えるときだけ 2 倍ずつ粗くする（点の数の上限 \(2^{20}\)）。それより短い延長では元の区間の表の点は元の run と同じで、波形の値は変わらない。0.95 µs を超えて延ばすと元の区間も粗く標本化されるので WARNING を出す。
+- `LaserBeam.energy_J`：出力の正規化はデッキの `Main.t_end` までの区間 `[0, Main.t_end]` のまま（延長した run は元の run の出力の履歴を保つ）。波形がデッキの `Main.t_end` の後も続くと、延長した区間でさらにエネルギーが入る。その量を WARNING で知らせる（`energy_J` は延長した run の総エネルギーではなくなる）。
+- step 数による出力の間隔（`checkpoint_every`・`history_every`・`plot_every`）は通しの step 番号で判定し、時間による間隔は `output_state/` の次の出力時刻から続けるので、延長した run は元の run と同じ出力の予定を続ける。出力先はデッキの `Output.directory`（既にあれば通し番号付き）。
+- 一致：デッキの `Main.t_end` より前のチェックポイントから延長した run は、延長後の値をデッキに書いた連続の run とビット一致する（ctest `restart_continuation_1d`: GXII の FLD smoke デッキで step 上限の延長 30→60→90 と終了時刻の延長 2e-11→4e-11 s、persistent ループの grey FLD デッキで 1e-12→2e-12 s。チェックポイントの `metadata/` 以外の全データセットと、再開後の履歴の全列）。デッキの `Main.t_end` ちょうどの最終チェックポイントから延長した run は、元の run が最後の step を `t_end` に合わせて短くしたぶん、連続の run とは一致しない（1D では次の step の刻みは短くする前の刻みから伸ばす、NUMERICS §2.2）。
 
 メッシュ変更は `ConfigError` で禁止。変更が必要な場合は新規シミュレーションとして開始すること。
 `group_bounds_eV` は各境界で
@@ -3242,6 +3261,7 @@ TENRYUの実アプリ基準として、GEKKO XII（GXII）同等の **12ビー�
 - 2026-08-30: Hard-lane effectiveness audit + futility cooldown: fires commit only when the trial demonstrably improves the weighted quality or the minimum subzonal altitude and passes the swept-gradient damage gate; dynamic-significance weights exclude near-vacuum cells from the maintenance objective only.
 - 2026-08-31: z_reflection enforce mode removed (user ruling: answer-shaping state corrections forbidden); audit unchanged.
 - 2026-09-02: Output.write_final_snapshot (default False) — opt-in closing snapshot at termination; used by the L2 first-shock strict gate.
+- 2026-09-30: Output.write_final_checkpoint (default False) — opt-in closing checkpoint at termination, the starting point for continuing a run past its end with `tenryu run <deck> --restart <checkpoint> --t-end <s>` / `--max-steps <N>` (restarts only; the deck stays unchanged and its frozen configuration keeps Main.t_end and Main.max_steps, §7.4). Legacy frozen-config default completion now fills `output.write_final_snapshot` and `output.write_final_checkpoint` with False (a checkpoint written before 2026-09-02 has no `write_final_snapshot` and failed the restart equivalence check); `run_info.json` gains `t_end` and `max_steps` (the values in effect); no HDF5 schema change.
 - 2026-09-04: mesh requirement JSON adds per-band `rho_max_gcc` / `width_max_cm` and `ablation.dr_min_admissible_cm`; enforce rejects an incompatible `zoning_intent.dr_min` before solving with `MESH_RESOLUTION_REQUIREMENT_DR_MIN_CONFLICT`; no HDF5 schema change.
 - 2026-08-29: `Numerics.hydro.boundary_2d.z_bottom/z_top.drive_t_end_s` (optional, default +inf) — finite drive window for `state_supply` z-faces: the face stops SOURCING at the configured time and continues as the rigid wall it already geometrically is (HLLC ghost resolves to REFLECT host-side post-window). Motivation: the contact smoke vehicle's sustained pistons inject work forever, so after the seam engages the slab cells between piston and held interface must collapse; a finite drive demonstrates engagement + trapped-compression hold instead. Incompatible with an FLD `state_supply` z-boundary (ConfigError).
 - 2026-08-26: Adds default-off `Numerics.hydro.pressure_drive_perturbation.{enabled,legendre_modes,ring_spots,random_seed,random_l_min,random_l_max,random_rms}`; the builder resolves deterministic random Legendre modes, validates positivity on the endpoint-inclusive 4097-point angular grid, and frozen configs serialize the resolved modes with `random_rms=0.0` to prevent restart redraws.
@@ -3502,6 +3522,7 @@ Laser(
 - output plot_every_s=-1.0, history_every_s=-1.0, checkpoint_every_s=-1.0
 - output compression=gzip, compression_level=4
 - save_namelist_copy=True, save_frozen_config=True
+- write_final_snapshot=False, write_final_checkpoint=False（2026-09-30 追加。終了時のチェックポイントは `tenryu run --restart ... --t-end/--max-steps` による延長の起点、§7.4）
 - restart compatibility checks include both `/metadata/eos/eos_signature` and `/metadata/frozen_config`
 
 **Diagnostics**：

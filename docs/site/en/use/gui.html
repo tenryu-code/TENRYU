@@ -69,7 +69,7 @@
 
     <section aria-labelledby="server-execution">
       <h2 id="server-execution">Validate and run on a server</h2>
-      <p>Define an execution profile and TENRYU binary in the “Servers” view, then select that profile in the header. “Run validate” in the validation panel sends a temporary deck to the selected server and performs dry-run validation there. “Run ▶” submits the validated setup to the same server. The “Run history” view keeps each run's status (queued, running, completed, or failed) and provides access to its results. Without a configured server, deck generation and saving still work; run the saved file with the TENRYU command line on a suitable host.</p>
+      <p>Define an execution profile and TENRYU binary in the “Servers” view, then select that profile in the header. “Run validate” in the validation panel sends a temporary deck to the selected server and performs dry-run validation there. “Run ▶” submits the validated setup to the same server. The “Run history” view keeps each run's status (queued, running, completed, or failed) and provides access to its results. “Continue…” on a finished run restarts it from its latest checkpoint with the same deck, to a later end time or step limit (“Checkpoint at the end of the run” in the output tab is on by default; the server needs a TENRYU from 2026-09-30 or later; see <a href="running.html#continue">continuing a run</a>). Without a configured server, deck generation and saving still work; run the saved file with the TENRYU command line on a suitable host.</p>
     </section>
 
     <aside class="planned" aria-labelledby="full-manual">

@@ -32,4 +32,5 @@ TENRYU Studio のサーバ設定に登録してください。
 
 - pybind11 が見つからない: `python3 -m pip install pybind11`
 - HDF5 が見つからない: Debian/Ubuntu では `libhdf5-dev` を導入
+- コンパイルが `Killed` で止まる: メモリ不足でコンパイラが強制終了されています。Ninja は既定で CPU 数 + 2 個のコンパイルを同時に走らせ、使うメモリもその数とともに増えるため、CPU 数に比べてメモリの少ない計算機（コンテナのメモリ上限を含む）で起こります。`ninja -C build -j 8 tenryu` のように同時実行数を減らして実行し直してください
 - GPU architecture: 既定では configure 時に `nvidia-smi` でローカル GPU を検出し、その compute capability のみをビルドします（GPU が見えないホストでは可搬既定 `70;80;89;90`）。明示指定するときは CMake に `-DCMAKE_CUDA_ARCHITECTURES=<num>` を追加

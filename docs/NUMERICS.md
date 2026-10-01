@@ -18465,7 +18465,9 @@ Langdon の強度、指令エネルギー台帳 \(\bar P\Delta t\)、再トレ�
 
 \(w_0\)（`w0_um`）を与えない gaussian・super_gaussian・flat_top は \(w_0=R_{target}/(2\max(F,1))\) を使う。
 ビームの `energy_J` \(>0\) を与えると、パワー波形を \([0,t_{end}]\) の積分がその値になるよう一様に拡大・縮小する
-（積分が 0 の波形は `ConfigError`）。
+（積分が 0 の波形は `ConfigError`）。\(t_{end}\) はデッキの `Main.t_end` で、`--t-end` で延長した run（SPECIFICATION §7.4）
+でも同じ区間で正規化する — 延長した run は元の run のパワーの履歴を保ち、波形がデッキの `Main.t_end` の後も続けば、
+延長した区間の分だけ総エネルギーが `energy_J` を超える（その量を WARNING で知らせる）。
 
 > **1/e² 規約**：Gaussian の指数が \(-2(R/w_0)^2\) であることに注意。
 > \(R=w_0\) で \(I/I_0 = e^{-2} \approx 0.135\) となる。

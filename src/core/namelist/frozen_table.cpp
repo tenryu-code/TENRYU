@@ -150,6 +150,16 @@ void refine_time_interval(const TimeSampler& sampler,
 
 }  // namespace
 
+double frozen_time_table_step(const double t_end) {
+  // Base step 2^-40 s, doubled only while more than kFrozenTimeMaxBaseIntervals base intervals would be needed (runs
+  // longer than about 0.95 us), so the grid is independent of t_end below that length.
+  double h = kFrozenTimeBaseStep_s;
+  while (std::ceil(t_end / h) > static_cast<double>(kFrozenTimeMaxBaseIntervals)) {
+    h *= 2.0;
+  }
+  return h;
+}
+
 FrozenTable1D create_frozen_time_table_from_sampler(
     const std::function<double(double)>& raw_sampler, const double t_end,
     const std::string& name, const bool require_non_negative) {
@@ -158,14 +168,8 @@ FrozenTable1D create_frozen_time_table_from_sampler(
   const TimeSampler sampler{raw_sampler, name, require_non_negative};
   TENRYU_ASSERT(std::isfinite(t_end) && t_end >= 0.0,
                 "create_frozen_time_table requires a finite t_end >= 0");
-  // Base step 2^-40 s, doubled only while more than kFrozenTimeMaxBaseIntervals
-  // base intervals would be needed (runs longer than about 0.95 us), so the
-  // grid is independent of t_end below that length. k * h is exact (h is a
-  // power of two and k < 2^53).
-  double h = kFrozenTimeBaseStep_s;
-  while (std::ceil(t_end / h) > static_cast<double>(kFrozenTimeMaxBaseIntervals)) {
-    h *= 2.0;
-  }
+  // k * h is exact (h is a power of two and k < 2^53).
+  const double h = frozen_time_table_step(t_end);
   const long long n_intervals =
       static_cast<long long>(std::max(std::ceil(t_end / h), 1.0));
 

@@ -290,6 +290,10 @@ void OutputManager::write_run_info(const tenryu::core::State& state,
   ofs << "  \"step\": " << state.step << ",\n";
   ofs << "  \"t\": " << state.t << ",\n";
   ofs << "  \"dt\": " << state.dt << ",\n";
+  // The end time and the step limit in effect: Main.t_end and Main.max_steps
+  // of the deck, or --t-end / --max-steps of a continued run (SPEC §7.4).
+  ofs << "  \"t_end\": " << cfg.main.t_end << ",\n";
+  ofs << "  \"max_steps\": " << cfg.main.max_steps << ",\n";
   ofs << "  \"termination_reason\": \""
       << escape_json_string(termination_reason_) << "\",\n";
   ofs << "  \"solver_requested\": \""

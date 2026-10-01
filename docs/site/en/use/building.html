@@ -57,6 +57,7 @@ cd TENRYU</code></pre>
       <pre><code>cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 ninja -C build</code></pre>
       <p>After changing sources, an incremental <code>ninja -C build</code> is normally sufficient. When changing a CMake option, rerun the configure command with the new option before invoking Ninja. If configuration reports a missing dependency, install that package and repeat the same configure command.</p>
+      <p>By default Ninja runs as many compilations at once as the CPU count plus two, and the memory the build uses grows with that number. On a machine with little memory for its CPU count (a container's memory limit included) the compiler can be killed for lack of memory, and the build stops with <code>Killed</code> in its log. Rerun with fewer parallel jobs, for example <code>ninja -C build -j 8</code>.</p>
       <p>Once the build succeeds, run one registered analytic case as the minimal end-to-end smoke check, time loop included:</p>
       <pre><code>./build/tenryu --help          # the CLI starts
 ./build/tenryu verify noh      # an analytic case PASSes (uses the GPU)</code></pre>

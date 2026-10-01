@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 // Mock tenryu for run-lifecycle tests: emits real-format [progress] lines.
 // Env: TENRYU_MOCK_STEPS (default 5), TENRYU_MOCK_SLEEP_MS (default 60),
-//      TENRYU_MOCK_FAIL=1 -> exit 9 halfway.
+//      TENRYU_MOCK_FAIL=1 -> exit 9 halfway,
+//      TENRYU_MOCK_ARGV=1 -> print the arguments as one JSON line ("[mock] argv: [...]").
 "use strict";
 
 const steps = Number(process.env.TENRYU_MOCK_STEPS || 5);
@@ -19,6 +20,9 @@ async function main() {
   if (sub !== "run") {
     process.stderr.write(`mock tenryu: unsupported subcommand ${String(sub)}\n`);
     process.exit(64);
+  }
+  if (process.env.TENRYU_MOCK_ARGV) {
+    process.stdout.write(`[mock] argv: ${JSON.stringify(process.argv.slice(2))}\n`);
   }
   line("TENRYU starting (mock)");
   for (let k = 1; k <= steps; k++) {

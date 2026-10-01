@@ -61,7 +61,7 @@ document map from `assist.py docmap --keys-out keys.json` lists every accepted k
 | `Laser` | `enabled=True`, `wavelength_nm`, `mode="radial_absorption_1d"`, `rays_per_beam=8000`, `absorption=dict(model="inverse_bremsstrahlung")`, `lasermesh=dict(..., ghost_corona=dict(enabled=True, ...))` (§3), `deposit=dict(...)`, `beams=[LaserBeam(...)]`, `cbet=dict(enable=False)`, `hot_electron=dict(enable=False)` | A target that starts as bare solid needs the ghost corona (§3): without it the laser deposits nothing. `LaserBeam(name, direction, power=<callable t_s -> W>, f_number, focus, profile=dict(model="super_gaussian", w0_um, m))`; `power`, `direction`, `f_number` are required; `energy_J` rescales the waveform to a total energy. See §3 for the power convention. `Laser(enabled=False)` when the drive is radiative |
 | `Burn` | `Burn(enabled=False)` unless the specification asks for fusion burn | |
 | `Numerics` | `dt=dict(initial_s=1e-13, max_s=1e-10, cfl_hydro=0.3, cfl_cond=0.25)`, `hydro=dict(boundary_1d="free", driver_full_step_retry_enabled=True)`, `conduction=dict(enabled=True, solver="implicit", f_lim=0.06)`, `positivity=dict(clamp=True)`, `safety=dict(nan_fatal=True)`, `diagnostics_every=100` | These are the minimum for a deck written from scratch. When you start from an example (§4), keep that example's whole `Numerics` block (some add artificial-viscosity and odd-even damping terms, more retry attempts or another `f_lim`) and change only what the specification requires. `boundary_1d` sets the **outer** node only (§3). The implicit conduction solver and the full-step retry are the suite conventions (low-density buffers and fine ablator cells). Never set `nan_fatal=False` |
-| `Output` | `directory="outputs/<case>"`, `format="hdf5"`, `plot_every_s`, `history_every_s` [s], `checkpoint_every`, `checkpoint_keep_last=2`, `save_namelist_copy=True`, `save_frozen_config=True`; `write_final_snapshot=True` when the final state is needed | A time cadence alone (`plot_every_s` without `plot_every`, likewise history and checkpoint) replaces the step cadence; give both to write at either. `*_every_s=0.0` is an error (use -1.0 to disable); a unique directory per case |
+| `Output` | `directory="outputs/<case>"`, `format="hdf5"`, `plot_every_s`, `history_every_s` [s], `checkpoint_every`, `checkpoint_keep_last=2`, `save_namelist_copy=True`, `save_frozen_config=True`; `write_final_snapshot=True` when the final state is needed; `write_final_checkpoint=True` when the run may be continued past its end | A time cadence alone (`plot_every_s` without `plot_every`, likewise history and checkpoint) replaces the step cadence; give both to write at either. `*_every_s=0.0` is an error (use -1.0 to disable); a unique directory per case |
 | `Diagnostics` | `enabled=True`, `every=1`, `energy_budget=dict(enabled=True, warn_threshold=1e-3)` | Keep the energy budget on for every production deck |
 
 ## 3. Conventions that decks get wrong
@@ -210,9 +210,15 @@ document map from `assist.py docmap --keys-out keys.json` lists every accepted k
 - A restart runs the original deck file, unchanged, with `tenryu run <deck.py> --restart <prefix>`.
   The checkpoint's frozen configuration includes the deck's sha256 and every key but
   `Main.restart_from`, so any edit of the deck (adding `restart_from`, a longer `t_end`, another
-  output cadence, even a comment) is refused (`checkpoint frozen_config JSON mismatch`). To keep
-  the prefix in the deck, read it from the environment, e.g.
+  output cadence, even a comment) is refused (`checkpoint frozen_config JSON mismatch`, which
+  lists the differing keys). To keep the prefix in the deck, read it from the environment, e.g.
   `restart_from=os.environ.get("RESTART_FROM", "")`, in the deck of the original run too.
+- To continue a run to a later end time or step limit, keep the deck unchanged and pass the new
+  value: `tenryu run <deck.py> --restart <checkpoint> --t-end <s>` (or `--max-steps <N>`;
+  restarts only). `Output.write_final_checkpoint=True` in the original deck keeps a checkpoint of
+  the final step to continue from. `LaserBeam.energy_J` keeps normalizing over the deck's
+  `t_end`, so a pulse that goes on after it adds energy in the extended interval (reported in a
+  WARNING); do not edit `t_end` or `energy_J` in the deck for a continuation.
 
 ## 6. Validate errors and the fix
 
@@ -226,7 +232,8 @@ document map from `assist.py docmap --keys-out keys.json` lists every accepted k
 | `plot_every_s`/`history_every_s` `= 0.0` | Use a positive interval or -1.0 |
 | `TMAT_E001: Failed to open TMAT file: <path>` (abort, exit 134) | The printed path is the resolved one: launch from the directory that holds `TMAT-H5/`, or give an absolute path (`os.path.expanduser` for `~`), or switch to the ideal-gas smoke form |
 | `checkpoint files not found: <prefix>_r*.h5` | Fix `restart_from` (prefix without the rank suffix) |
-| `checkpoint frozen_config JSON mismatch between checkpoint and namelist` | Restart with the original deck file unchanged and pass the prefix with `--restart` |
+| `checkpoint frozen_config JSON mismatch between checkpoint and namelist` | Restart with the original deck file unchanged and pass the prefix with `--restart`; for a later end time or step limit pass `--t-end` / `--max-steps` instead of editing the deck |
+| `the checkpoint is at t=... at or after the end time ...` / `... at or beyond the step limit ...` | Pass `--t-end <later time>` / `--max-steps <larger limit>` with the restart |
 | `Mesh.resolution_requirement is 1D only`, `MESH_*` certificates | Mesh work item (`tenryu-mesh-1d`) |
 | `radiation.mode` rejected for 1D_SPH | Use `multigroup_diffusion` or `sn_transport` |
 

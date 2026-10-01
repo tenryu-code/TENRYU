@@ -7,6 +7,9 @@ import HistoryChart from "./HistoryChart";
 import ProfilePanel from "./ProfilePanel";
 import { AssistError, KvTable, RawFold } from "./AssistBits";
 import { Badge, Button } from "@tenryu-common/ui/kit";
+import { NumInput, QInput } from "./fields";
+import { q, toCanonical, type Q } from "../core/units";
+import { continuationIssues, type RunContinuation } from "../core/runContinuation";
 
 function stateTone(s: RunUiState): "ok" | "err" | "warn" | "muted" {
   switch (s) {
@@ -58,10 +61,65 @@ function compactJson(value: unknown): string {
   return json.length > 160 ? `${json.slice(0, 160)}…` : json;
 }
 
+/** The end time in a unit that reads well (ps, ns or µs). */
+function timeQuantity(seconds: number): Q {
+  const unit = seconds >= 1e-6 ? "µs" : seconds >= 1e-9 ? "ns" : "ps";
+  const factor = unit === "µs" ? 1e-6 : unit === "ns" ? 1e-9 : 1e-12;
+  return q(Number((seconds / factor).toPrecision(12)), unit);
+}
+
+/** A value equal to the run's (the end time within rounding) is passed as unchanged (null). */
+function requestedContinuation(rec: RunRecord, tEnd: Q, maxSteps: number | null): RunContinuation {
+  let tEndS: number;
+  try {
+    tEndS = toCanonical(tEnd, "time");
+  } catch {
+    tEndS = Number.NaN;
+  }
+  const sameTEnd = Number.isFinite(tEndS) && Math.abs(tEndS - rec.tEnd) <= 1e-12 * Math.abs(rec.tEnd);
+  const sameSteps = maxSteps === null || maxSteps === rec.maxSteps;
+  return { tEndS: sameTEnd ? null : tEndS, maxSteps: sameSteps ? null : maxSteps };
+}
+
+/** Continue a finished run from its latest checkpoint, to a later end time or step limit if changed. */
+function ContinuePanel({ rec, onClose }: { rec: RunRecord; onClose: () => void }) {
+  const m = t();
+  const continueRun = useApp((s) => s.continueRun);
+  const starting = useApp((s) => s.starting);
+  const [tEnd, setTEnd] = useState<Q>(() => timeQuantity(rec.tEnd));
+  const [maxSteps, setMaxSteps] = useState<number | null>(rec.maxSteps > 0 ? rec.maxSteps : null);
+  const request = requestedContinuation(rec, tEnd, maxSteps);
+  const issues = continuationIssues(request, rec);
+  return (
+    <div
+      className="mt-2 flex flex-col gap-1 rounded border p-2"
+      style={{ borderColor: "var(--separator)", background: "var(--bg-inset)" }}
+    >
+      <QInput label={m.run.continueTEnd} kind="time" value={tEnd} onChange={setTEnd} />
+      <NumInput int allowEmpty label={m.run.continueMaxSteps} value={maxSteps} onChange={setMaxSteps} />
+      <p className="text-xs" style={{ color: "var(--fg-secondary)" }}>{m.run.continueNote}</p>
+      {issues.map((issue) => (
+        <p key={issue} className="text-xs" style={{ color: "var(--err)" }}>{m.run.continueIssues[issue]}</p>
+      ))}
+      <div className="flex gap-2">
+        <Button
+          onClick={() => {
+            void continueRun(rec.id, request);
+            onClose();
+          }}
+          disabled={starting || issues.length > 0}
+        >
+          {m.run.continueStart}
+        </Button>
+        <Button onClick={onClose}>{m.common.close}</Button>
+      </div>
+    </div>
+  );
+}
+
 function RunCard({ rec, nowSec }: { rec: RunRecord; nowSec: number }) {
   const m = t();
   const stopRun = useApp((s) => s.stopRun);
-  const restartRun = useApp((s) => s.restartRun);
   const fetchLog = useApp((s) => s.fetchLog);
   const deleteRunRecord = useApp((s) => s.deleteRunRecord);
   const starting = useApp((s) => s.starting);
@@ -72,6 +130,7 @@ function RunCard({ rec, nowSec }: { rec: RunRecord; nowSec: number }) {
   const runAssistDiag = useApp((s) => s.runAssistDiag);
   const diag = useApp((s) => s.assistDiag[rec.id]);
   const [handoffNote, setHandoffNote] = useState<string | null>(null);
+  const [continueOpen, setContinueOpen] = useState(false);
 
   const pct =
     rec.lastProgress !== null
@@ -98,8 +157,8 @@ function RunCard({ rec, nowSec }: { rec: RunRecord; nowSec: number }) {
         )}
         {isTerminal(rec.state) && (
           <>
-            <Button onClick={() => void restartRun(rec.id)} disabled={starting}>
-              {m.run.restartLatest}
+            <Button onClick={() => setContinueOpen((open) => !open)} disabled={starting}>
+              {m.run.continueOpen}
             </Button>
             <Button onClick={() => void deleteRunRecord(rec.id)}>{m.run.deleteRecord}</Button>
           </>
@@ -116,6 +175,9 @@ function RunCard({ rec, nowSec }: { rec: RunRecord; nowSec: number }) {
       </div>
       {handoffNote !== null && (
         <div className="mb-1 text-xs" style={{ color: "var(--fg-secondary)" }}>{handoffNote}</div>
+      )}
+      {continueOpen && isTerminal(rec.state) && (
+        <ContinuePanel rec={rec} onClose={() => setContinueOpen(false)} />
       )}
       <Bar pct={pct} />
       <div className="mt-1 flex items-center gap-3 text-xs" style={{ color: "var(--fg-secondary)", fontFamily: "var(--mono)" }}>

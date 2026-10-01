@@ -103,6 +103,32 @@ describe("handwritten decks and edit fidelity",()=>{
     expect(recorded.blocks.Main).toEqual({name:"minimal",t_end:1e-9,seed:77});
     expect(recorded.blocks).not.toHaveProperty("Mesh");
   },120000);
+  it("a deck without Output.write_final_checkpoint imports it as off; the switch adds only that key",()=>{
+    const filename = path.join(tmp,"final_checkpoint_off.py");
+    const form = imported('from tenryu_namelist import *\nMain(name="final_checkpoint_off",t_end=1e-9)\nLaser(enabled=False)\nOutput(directory="outputs/fc")\n',filename);
+    expect(form.output.writeFinalCheckpoint).toBe(false);
+    const outputOf = () => {
+      const recorded = evaluate(generateDeck(form),filename);
+      expect(recorded.ok,recorded.error).toBe(true);
+      return recorded.blocks.Output;
+    };
+    expect(outputOf()).toEqual({directory:"outputs/fc"});
+    form.output.writeFinalCheckpoint = true;
+    expect(outputOf()).toEqual({directory:"outputs/fc",write_final_checkpoint:true});
+  },120000);
+  it("Output.write_final_checkpoint=True imports as on and the switch turns it off",()=>{
+    const filename = path.join(tmp,"final_checkpoint_on.py");
+    const form = imported('from tenryu_namelist import *\nMain(name="final_checkpoint_on",t_end=1e-9)\nLaser(enabled=False)\nOutput(directory="outputs/fc",write_final_checkpoint=True)\n',filename);
+    expect(form.output.writeFinalCheckpoint).toBe(true);
+    const outputOf = () => {
+      const recorded = evaluate(generateDeck(form),filename);
+      expect(recorded.ok,recorded.error).toBe(true);
+      return recorded.blocks.Output;
+    };
+    expect(outputOf()).toEqual({directory:"outputs/fc",write_final_checkpoint:true});
+    form.output.writeFinalCheckpoint = false;
+    expect(outputOf().write_final_checkpoint ?? false).toBe(false);
+  },120000);
   it("repeated nested setters retain their original order",()=>{
     const filename = path.join(tmp,"repeated.py");
     const source = 'from tenryu_namelist import *\nMain(t_end=1e-9)\nNumerics(hydro=dict(enabled=False))\nNumerics(hydro=dict(boundary_1d="reflect"))\n';

@@ -198,6 +198,10 @@ struct Config {
   };
 
   struct MainConfig {
+    // Upper bound of max_steps (Main.max_steps, `tenryu run --max-steps`), 2^24 - 1: the photon global_id of the
+    // retired Monte Carlo radiation put the step in its upper bits (step x 2^40 must fit in uint64, NUMERICS
+    // §12.7.1); the bound is kept as it was.
+    static constexpr int kMaxStepsUpperBound = 16'777'215;
     // Parser may replace this with namelist filename stem when Main.name is omitted.
     std::string name = "unnamed";
     std::string dimension = "1D_SPH";
@@ -207,7 +211,7 @@ struct Config {
     int dim = 1;
     double t_end = 0.0;
     std::uint64_t seed = 12345;
-    int max_steps = 10'000'000;
+    int max_steps = 10'000'000;  // at most kMaxStepsUpperBound
     std::string verbosity = "normal";
     std::string restart_from;
     std::string units = "cgs_eV";
@@ -1137,6 +1141,7 @@ struct Config {
       CallableInfo power;
       // > 0: the frozen power table is rescaled so that its integral over
       // [0, Main.t_end] equals this pulse energy [J] (shape from `power`).
+      // Main.t_end of the deck, also in a run continued with --t-end.
       double energy_J = -1.0;
     };
 
@@ -2831,6 +2836,9 @@ struct Config {
     // did not land on the final step (opt-in; gates that count snapshots
     // rely on the historical cadence-only behavior).
     bool write_final_snapshot = false;
+    // Write one checkpoint at run termination when the last cadence write did not land on the final step (opt-in),
+    // so that `tenryu run --restart ... --t-end` can continue from the end of the run (SPECIFICATION §7.4).
+    bool write_final_checkpoint = false;
     int checkpoint_keep_last = 2;
     std::string compression = "gzip";
     int compression_level = 4;

@@ -8,7 +8,9 @@
 #include <cmath>
 #include <ctime>
 #include <fstream>
+#include <set>
 #include <string>
+#include <vector>
 
 #include <pybind11/embed.h>
 #include <pybind11/stl.h>
@@ -3230,6 +3232,7 @@ py::dict serialize_output(const Config::OutputConfig& output) {
   out["checkpoint_every"] = output.checkpoint_every;
   out["plot_every_s"] = output.plot_every_s;
   out["write_final_snapshot"] = output.write_final_snapshot;
+  out["write_final_checkpoint"] = output.write_final_checkpoint;
   out["history_every_s"] = output.history_every_s;
   out["checkpoint_every_s"] = output.checkpoint_every_s;
   out["checkpoint_keep_last"] = output.checkpoint_keep_last;
@@ -3782,6 +3785,14 @@ void apply_legacy_laser_defaults(py::dict& root) {
 // applied the S_N grey preconditioner; the restarted run follows the new
 // defaults, which change the results at the rounding level.)
 void apply_current_defaults(py::dict& root) {
+  // Output keys added after checkpoints were first written: Output.write_final_snapshot (2026-09-02) and
+  // Output.write_final_checkpoint (2026-09-30). A checkpoint without them was written with their defaults.
+  py::dict output;
+  if (try_get_child_dict(root, "output", &output)) {
+    const Config::OutputConfig output_defaults;
+    set_default_if_missing(output, "write_final_snapshot", py::cast(output_defaults.write_final_snapshot));
+    set_default_if_missing(output, "write_final_checkpoint", py::cast(output_defaults.write_final_checkpoint));
+  }
   py::dict laser;
   if (try_get_child_dict(root, "laser", &laser)) {
     py::dict raytrace;
@@ -6836,12 +6847,83 @@ void apply_checkpoint_migrations(py::dict& root) {
   normalize_mesh_default_elision(root);
 }
 
-bool py_objects_equal(const py::object& lhs, const py::object& rhs) {
+bool py_objects_equal(const py::handle& lhs, const py::handle& rhs) {
   const int result = PyObject_RichCompareBool(lhs.ptr(), rhs.ptr(), Py_EQ);
   if (result < 0) {
     throw py::error_already_set();
   }
   return result == 1;
+}
+
+// A frozen configuration as the restart comparison sees it: migrated to the
+// current schema and without the operational restart source
+// (Main.restart_from).
+py::dict normalized_for_restart_comparison(const std::string& json_str) {
+  py::dict normalized = parse_checkpoint_json_or_throw(json_str);
+  apply_checkpoint_migrations(normalized);
+  py::dict main;
+  if (try_get_child_dict(normalized, "main", &main)) {
+    main.attr("pop")(py::str("restart_from"), py::none());
+  }
+  return normalized;
+}
+
+// Walks two normalized configurations as the Python equality of the whole
+// dict does (same keys, equal values; lists element by element when their
+// lengths agree) and records the paths where they differ.
+void collect_difference_paths(const py::handle& checkpoint_value,
+                              const py::handle& current_value,
+                              const std::string& path,
+                              const std::size_t max_paths,
+                              std::vector<std::string>* paths) {
+  if (paths->size() >= max_paths) {
+    return;
+  }
+  if (py::isinstance<py::dict>(checkpoint_value) &&
+      py::isinstance<py::dict>(current_value)) {
+    const auto checkpoint_dict = py::reinterpret_borrow<py::dict>(checkpoint_value);
+    const auto current_dict = py::reinterpret_borrow<py::dict>(current_value);
+    std::set<std::string> keys;
+    for (const auto item : checkpoint_dict) {
+      keys.insert(py::str(item.first).cast<std::string>());
+    }
+    for (const auto item : current_dict) {
+      keys.insert(py::str(item.first).cast<std::string>());
+    }
+    for (const std::string& key : keys) {
+      if (paths->size() >= max_paths) {
+        return;
+      }
+      const std::string child = path.empty() ? key : path + "." + key;
+      const py::str py_key(key);
+      const bool in_checkpoint = checkpoint_dict.contains(py_key);
+      const bool in_current = current_dict.contains(py_key);
+      if (in_checkpoint && in_current) {
+        collect_difference_paths(checkpoint_dict[py_key], current_dict[py_key],
+                                 child, max_paths, paths);
+      } else {
+        paths->push_back(child + (in_checkpoint ? " (in the checkpoint only)"
+                                                : " (in the namelist only)"));
+      }
+    }
+    return;
+  }
+  if (py::isinstance<py::list>(checkpoint_value) &&
+      py::isinstance<py::list>(current_value)) {
+    const auto checkpoint_list = py::reinterpret_borrow<py::list>(checkpoint_value);
+    const auto current_list = py::reinterpret_borrow<py::list>(current_value);
+    if (py::len(checkpoint_list) == py::len(current_list)) {
+      for (std::size_t i = 0; i < py::len(checkpoint_list); ++i) {
+        collect_difference_paths(checkpoint_list[i], current_list[i],
+                                 path + "[" + std::to_string(i) + "]",
+                                 max_paths, paths);
+      }
+      return;
+    }
+  }
+  if (!py_objects_equal(checkpoint_value, current_value)) {
+    paths->push_back(path.empty() ? std::string("(root)") : path);
+  }
 }
 
 }  // namespace
@@ -6858,20 +6940,25 @@ bool Freeze::configs_equivalent(const std::string& json_a, const std::string& js
     throw ConfigError("Python interpreter is not initialized");
   }
   try {
-    py::dict normalized_a = parse_checkpoint_json_or_throw(json_a);
-    py::dict normalized_b = parse_checkpoint_json_or_throw(json_b);
-    apply_checkpoint_migrations(normalized_a);
-    apply_checkpoint_migrations(normalized_b);
-    // Ignore the operational restart source when comparing frozen configurations.
-    py::dict main_a;
-    if (try_get_child_dict(normalized_a, "main", &main_a)) {
-      main_a.attr("pop")(py::str("restart_from"), py::none());
-    }
-    py::dict main_b;
-    if (try_get_child_dict(normalized_b, "main", &main_b)) {
-      main_b.attr("pop")(py::str("restart_from"), py::none());
-    }
-    return py_objects_equal(normalized_a, normalized_b);
+    return py_objects_equal(normalized_for_restart_comparison(json_a),
+                            normalized_for_restart_comparison(json_b));
+  } catch (const py::error_already_set& e) {
+    throw ConfigError(std::string("Failed to compare checkpoint frozen_config JSON: ") + e.what());
+  }
+}
+
+std::vector<std::string> Freeze::config_difference_paths(const std::string& checkpoint_json,
+                                                         const std::string& current_json,
+                                                         const std::size_t max_paths) {
+  if (!Py_IsInitialized()) {
+    throw ConfigError("Python interpreter is not initialized");
+  }
+  try {
+    std::vector<std::string> paths;
+    collect_difference_paths(normalized_for_restart_comparison(checkpoint_json),
+                             normalized_for_restart_comparison(current_json),
+                             std::string{}, max_paths, &paths);
+    return paths;
   } catch (const py::error_already_set& e) {
     throw ConfigError(std::string("Failed to compare checkpoint frozen_config JSON: ") + e.what());
   }
@@ -6924,6 +7011,15 @@ std::string Freeze::to_checkpoint_json(const NamelistConfig&) {
 
 bool Freeze::configs_equivalent(const std::string& json_a, const std::string& json_b) {
   return json_a == json_b;
+}
+
+std::vector<std::string> Freeze::config_difference_paths(const std::string& checkpoint_json,
+                                                         const std::string& current_json,
+                                                         const std::size_t max_paths) {
+  if (checkpoint_json == current_json || max_paths == 0) {
+    return {};
+  }
+  return {"(the frozen configuration text)"};
 }
 
 std::string Freeze::to_json(const NamelistConfig&, const FreezeExtras*) {

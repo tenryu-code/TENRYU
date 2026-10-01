@@ -4,9 +4,11 @@
 #include <array>
 #include <cmath>
 #include <filesystem>
+#include <iomanip>
 #include <iostream>
 #include <map>
 #include <optional>
+#include <sstream>
 
 #if TENRYU_ENABLE_MPI
 #include <mpi.h>
@@ -174,6 +176,72 @@ void validate_laser_waveform_integral(const std::string& callable_path,
   }
 }
 
+std::string format_time(const double t_s) {
+  std::ostringstream oss;
+  oss << std::setprecision(12) << t_s;
+  return oss.str();
+}
+
+// --t-end / --max-steps (restarts only): Main.t_end and Main.max_steps of the continued run. The deck stays unchanged,
+// and cfg.meta.frozen_config_json was frozen from it before this point, so the checkpoint comparison and the frozen
+// configuration of the checkpoints this run writes keep the deck's values (as for --output-dir); the frozen JSON file
+// in config/ and run_info.json record the values in effect.
+void apply_run_control_overrides(tenryu::core::Config& cfg,
+                                 const RunControlOverrides& run_control,
+                                 const bool is_restart) {
+  if (!run_control.t_end.has_value() && !run_control.max_steps.has_value()) {
+    return;
+  }
+  if (!is_restart) {
+    throw tenryu::core::namelist::ConfigError(
+        "--t-end and --max-steps apply to restarts only (--restart or Main.restart_from): a fresh run takes "
+        "Main.t_end and Main.max_steps from the deck");
+  }
+  if (run_control.t_end.has_value()) {
+    const double t_end = *run_control.t_end;
+    if (!(std::isfinite(t_end) && t_end > 0.0)) {
+      throw tenryu::core::namelist::ConfigError("--t-end must be a finite time > 0 s, got " + format_time(t_end));
+    }
+    tenryu::core::log_info("[TENRYU] Main.t_end of the continued run set by --t-end: " +
+                           format_time(cfg.main.t_end) + " s in the deck -> " + format_time(t_end) + " s");
+    cfg.main.t_end = t_end;
+  }
+  if (run_control.max_steps.has_value()) {
+    const int max_steps = *run_control.max_steps;
+    constexpr int kUpper = tenryu::core::Config::MainConfig::kMaxStepsUpperBound;
+    if (max_steps < 1 || max_steps > kUpper) {
+      throw tenryu::core::namelist::ConfigError("--max-steps must be in [1, " + std::to_string(kUpper) +
+                                                "], got " + std::to_string(max_steps));
+    }
+    tenryu::core::log_info("[TENRYU] Main.max_steps of the continued run set by --max-steps: " +
+                           std::to_string(cfg.main.max_steps) + " in the deck -> " + std::to_string(max_steps));
+    cfg.main.max_steps = max_steps;
+  }
+}
+
+// A restart that would stop before its first step (the checkpoint at or after the end time, or at the step limit) is
+// refused with the option that continues it, instead of ending without a step.
+void require_steps_left(const tenryu::core::Config& cfg,
+                        const RunControlOverrides& run_control,
+                        const tenryu::core::State& checkpoint_state) {
+  const double t = checkpoint_state.t;
+  const double t_end = cfg.main.t_end;
+  // The driver's own end-of-run test (driver.cpp): within 1e-14 relative of t_end counts as reached.
+  if ((t_end - t) <= 1.0e-14 * std::max(std::abs(t), std::abs(t_end))) {
+    throw tenryu::core::namelist::ConfigError(
+        "the checkpoint is at t=" + format_time(t) + " s, at or after the end time " + format_time(t_end) + " s (" +
+        (run_control.t_end.has_value() ? std::string("--t-end") : std::string("Main.t_end of the deck")) +
+        "): pass --t-end <later time> to continue the run");
+  }
+  if (checkpoint_state.step >= cfg.main.max_steps) {
+    throw tenryu::core::namelist::ConfigError(
+        "the checkpoint is at step " + std::to_string(checkpoint_state.step) + ", at or beyond the step limit " +
+        std::to_string(cfg.main.max_steps) + " (" +
+        (run_control.max_steps.has_value() ? std::string("--max-steps") : std::string("Main.max_steps of the deck")) +
+        "): pass --max-steps <larger limit> to continue the run");
+  }
+}
+
 std::optional<tenryu::core::namelist::FrozenTable1D> maybe_make_time_table(
     const tenryu::core::namelist::Builder& builder,
     const std::string& callable_path,
@@ -191,18 +259,51 @@ std::optional<tenryu::core::namelist::FrozenTable1D> maybe_make_time_table(
   return table;
 }
 
+// The time tables span the run: [0, Main.t_end]. energy_window_t_end is the end of the window over which
+// LaserBeam.energy_J normalizes the beam power: the deck's Main.t_end, also for a run whose end --t-end moved, so that
+// run keeps the power history of the run that wrote the checkpoint (SPECIFICATION §7.4). The tables then span the
+// longer of the two, so the window is always inside them (an earlier --t-end would otherwise cut the window short and
+// change the normalization), and their samples on the shared range are those of the original run's tables while the
+// table step is unchanged.
 TableMap build_frozen_tables(const tenryu::core::Config& cfg,
-                             const tenryu::core::namelist::Builder& builder) {
+                             const tenryu::core::namelist::Builder& builder,
+                             const double energy_window_t_end) {
   TableMap tables;
+  const double table_t_end = std::max(cfg.main.t_end, energy_window_t_end);
+  const bool extended = cfg.main.t_end > energy_window_t_end;
+  if (tenryu::core::namelist::frozen_time_table_step(table_t_end) !=
+      tenryu::core::namelist::frozen_time_table_step(energy_window_t_end)) {
+    tenryu::core::log_warning(
+        "[TENRYU] --t-end " + format_time(cfg.main.t_end) +
+        " s makes the time tables (beam power, Marshak drive, boundary pressure, hot-electron eta) sample every " +
+        format_time(tenryu::core::namelist::frozen_time_table_step(table_t_end)) + " s instead of " +
+        format_time(tenryu::core::namelist::frozen_time_table_step(energy_window_t_end)) +
+        " s (runs longer than about 0.95 us): the waveforms up to the deck's Main.t_end are sampled more coarsely "
+        "than in the run that wrote the checkpoint");
+  }
 
   for (std::size_t i = 0; i < cfg.laser.beams.size(); ++i) {
     const std::string path = "Laser.beams[" + std::to_string(i) + "].power";
-    auto table = maybe_make_time_table(builder, path, cfg.main.t_end, true,
+    auto table = maybe_make_time_table(builder, path, table_t_end, true,
                                        /*require_non_negative=*/true);
     if (table.has_value()) {
       tenryu::core::namelist::normalize_beam_power_table(
-          *table, cfg.main.t_end, cfg.laser.beams[i].energy_J,
+          *table, energy_window_t_end, cfg.laser.beams[i].energy_J,
           ("Laser.beams[" + std::to_string(i) + "]").c_str());
+      if (extended && cfg.laser.beams[i].energy_J > 0.0) {
+        const double extra_J = tenryu::core::namelist::integrate_frozen_table(
+            *table, energy_window_t_end, cfg.main.t_end);
+        if (extra_J > 0.0) {
+          std::ostringstream oss;
+          oss << std::setprecision(6) << "[TENRYU][laser] Laser.beams[" << i
+              << "]: the waveform is still on after the deck's Main.t_end=" << format_time(energy_window_t_end)
+              << " s; energy_J=" << cfg.laser.beams[i].energy_J
+              << " J normalizes it over [0, Main.t_end] only, so the power before that time is unchanged and the "
+                 "continued run delivers another "
+              << extra_J << " J up to --t-end=" << format_time(cfg.main.t_end) << " s";
+          tenryu::core::log_warning(oss.str());
+        }
+      }
       std::optional<double> declared_total_energy;
       const auto callable_it = builder.callable_objects.find(path);
       if (callable_it != builder.callable_objects.end()) {
@@ -217,7 +318,7 @@ TableMap build_frozen_tables(const tenryu::core::Config& cfg,
 
   if (cfg.radiation.boundary.marshak_Tr.detected) {
     const auto table = maybe_make_time_table(
-        builder, "Radiation.boundary.marshak_Tr", cfg.main.t_end, true,
+        builder, "Radiation.boundary.marshak_Tr", table_t_end, true,
         /*require_non_negative=*/true);
     if (table.has_value()) {
       tables.emplace("radiation.marshak_Tr", *table);
@@ -226,7 +327,7 @@ TableMap build_frozen_tables(const tenryu::core::Config& cfg,
 
   if (cfg.laser.hot_electron.eta_hot_table.detected) {
     const auto table = maybe_make_time_table(
-        builder, "Laser.hot_electron.eta_hot_table", cfg.main.t_end, true);
+        builder, "Laser.hot_electron.eta_hot_table", table_t_end, true);
     if (table.has_value()) {
       tables.emplace("laser.hot_e_eta", *table);
     }
@@ -239,7 +340,7 @@ TableMap build_frozen_tables(const tenryu::core::Config& cfg,
       const auto channel_table = maybe_make_time_table(
           builder,
           "Laser.hot_electron.sources[" + std::to_string(si) + "].eta_table",
-          cfg.main.t_end, true);
+          table_t_end, true);
       if (channel_table.has_value()) {
         tables.emplace("laser.hot_e_eta_ch" + std::to_string(si), *channel_table);
       }
@@ -248,7 +349,7 @@ TableMap build_frozen_tables(const tenryu::core::Config& cfg,
 
   for (const auto& [face, _] : cfg.radiation.boundary.marshak_Tr_map) {
     const std::string path = "Radiation.boundary.marshak_Tr_map." + face;
-    const auto table = maybe_make_time_table(builder, path, cfg.main.t_end, true,
+    const auto table = maybe_make_time_table(builder, path, table_t_end, true,
                                              /*require_non_negative=*/true);
     if (table.has_value()) {
       tables.emplace("radiation.marshak_Tr_map." + face, *table);
@@ -257,7 +358,7 @@ TableMap build_frozen_tables(const tenryu::core::Config& cfg,
 
   if (cfg.numerics.hydro.pressure_drive_1d.detected) {
     const auto table = maybe_make_time_table(
-        builder, "Numerics.hydro.boundary_pressure", cfg.main.t_end, true);
+        builder, "Numerics.hydro.boundary_pressure", table_t_end, true);
     if (table.has_value()) {
       tables.emplace("hydro.boundary_pressure", *table);
     }
@@ -308,7 +409,8 @@ tenryu::core::namelist::FreezeExtras make_freeze_extras(
 
 int cmd_run(const std::string& namelist_path,
             const std::string& restart_prefix,
-            const std::string& output_dir_override) {
+            const std::string& output_dir_override,
+            const RunControlOverrides& run_control) {
 #if TENRYU_ENABLE_PYTHON
   try {
     tenryu::core::Config cfg;
@@ -337,12 +439,16 @@ int cmd_run(const std::string& namelist_path,
           // output manager resumes after the highest existing index). The message used to say that a restart
           // "continues its original output layout", which is true only when the original run also used the deck's
           // directory (2026-09-29).
+          // The checkpoint's frozen configuration holds the deck's Output.directory (the override is applied
+          // after it is frozen), so a run started with --output-dir restarts with the unchanged deck and writes to
+          // the deck's directory; editing Output.directory in the deck would change the deck and refuse the restart
+          // (the advice of this message until 2026-09-30).
           throw tenryu::core::namelist::ConfigError(
               "--output-dir applies to fresh runs only: a restarted run "
               "(--restart or Main.restart_from) writes to the deck's "
-              "Output.directory and continues the numbering found there; to "
-              "restart a run started with --output-dir, set Output.directory "
-              "in the deck to that directory");
+              "Output.directory (numbered _001, _002, ... when it exists), also "
+              "when the run that wrote the checkpoint used --output-dir; restart "
+              "with the unchanged deck");
         }
         cfg.output.directory = output_dir_override;
         core::log_info(
@@ -357,11 +463,14 @@ int cmd_run(const std::string& namelist_path,
       const std::string effective_restart =
           restart_prefix.empty() ? cfg.main.restart_from : restart_prefix;
       const bool is_restart = !effective_restart.empty();
+      const double deck_t_end = cfg.main.t_end;
+      apply_run_control_overrides(cfg, run_control, is_restart);
 
       tenryu::core::namelist::GeometrySummary geometry_summary;
       if (is_restart) {
         tenryu::io::HDF5Reader reader;
         auto checkpoint = reader.read_checkpoint(cfg, effective_restart);
+        require_steps_left(cfg, run_control, checkpoint.state);
         state = std::move(checkpoint.state);
         restarted_from_checkpoint = true;
         per_material_checkpoint_status = checkpoint.per_material_checkpoint_status;
@@ -399,7 +508,7 @@ int cmd_run(const std::string& namelist_path,
         tenryu::radiation::apply_initial_radiation_field(state, cfg);
       }
 
-      const auto tables = build_frozen_tables(cfg, runtime.builder());
+      const auto tables = build_frozen_tables(cfg, runtime.builder(), deck_t_end);
       state.laser_waveforms.assign(cfg.laser.beams.size(),
                                    tenryu::core::namelist::FrozenTable1D{});
       for (std::size_t i = 0; i < cfg.laser.beams.size(); ++i) {
@@ -517,6 +626,8 @@ int cmd_run(const std::string& namelist_path,
 #else
   (void)namelist_path;
   (void)restart_prefix;
+  (void)output_dir_override;
+  (void)run_control;
   tenryu::core::log_error("TENRYU was built without Python support (TENRYU_ENABLE_PYTHON=OFF)");
   return 1;
 #endif
