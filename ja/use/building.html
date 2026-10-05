@@ -60,7 +60,7 @@ ninja -C build</code></pre>
       <p>構成が <code>No CMAKE_CUDA_COMPILER could be found</code> で止まるときは、<code>nvcc</code> にパスが通っていない。NVIDIA の手順で導入した CUDA ツールキットは <code>nvcc</code> を <code>/usr/local/cuda/bin</code> に置くので、<code>export PATH=/usr/local/cuda/bin:$PATH</code> を実行してから構成し直すか、構成のコマンドに <code>-DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc</code> を付ける。</p>
       <p>Ninja は既定で CPU 数 + 2 個のコンパイルを同時に走らせ、使うメモリもその数とともに増える。CPU 数に比べてメモリの少ない計算機（コンテナのメモリ上限を含む）ではコンパイラがメモリ不足で強制終了され、ログに <code>Killed</code> と出てビルドが止まることがある。その場合は <code>ninja -C build -j 8</code> のように同時実行数を減らして実行し直す。</p>
       <p>ビルドが通ったら、時間ループまで含めた最小の動作確認として、登録済みの解析解ケースを 1 本走らせる。</p>
-      <pre><code>./build/tenryu --help          # CLI が起動すること
+      <pre><code>./build/tenryu validate examples/verification/sod_planar.py   # 入力を検査して設定の要約を表示する（計算はしない）
 ./build/tenryu verify noh      # 解析解ケースが PASS すること（GPU を使う）</code></pre>
       <p>ここまで通れば、<a href="running.html">シミュレーションの実行</a>のテンプレート完走へ進める。</p>
     </section>
