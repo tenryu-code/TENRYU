@@ -515,6 +515,44 @@ void capture_conduction_fields_device(DriverRecloseContext& context, const core:
   }
 }
 
+void capture_conduction_ee_device(DriverRecloseContext& context, const core::State& state) {
+  const std::size_t n = state.ee.size();
+  context.conduction_ee_before.reset(n);
+  if (n == 0) return;
+  cuda_check(cudaMemcpyAsync(context.conduction_ee_before.data(), state.ee.data(),
+                             n * sizeof(double), cudaMemcpyDeviceToDevice),
+             "conduction ee-before D2D failed");
+}
+
+namespace {
+
+__global__ void conduction_energy_rate_kernel(const double* __restrict__ ee_before,
+                                              const double* __restrict__ ee_after,
+                                              const double* __restrict__ rho, const int n,
+                                              const double dt, double* __restrict__ rate) {
+  const int c = blockIdx.x * blockDim.x + threadIdx.x;
+  if (c < n) {
+    rate[c] = __ddiv_rn(__dmul_rn(__dsub_rn(ee_after[c], ee_before[c]), rho[c]), dt);
+  }
+}
+
+}  // namespace
+
+void conduction_energy_rate_device(const DriverRecloseContext& context, core::State& state,
+                                   const double dt) {
+  const std::size_t n = state.ee.size();
+  TENRYU_ASSERT(context.conduction_ee_before.size() == n && state.rho.size() == n &&
+                    state.conduction_e_rate.size() == n,
+                "conduction energy-rate export: field sizes differ");
+  if (n == 0) return;
+  constexpr int kBlock = 256;
+  const int n_cells = static_cast<int>(n);
+  conduction_energy_rate_kernel<<<(n_cells + kBlock - 1) / kBlock, kBlock>>>(
+      context.conduction_ee_before.data(), state.ee.data(), state.rho.data(), n_cells, dt,
+      state.conduction_e_rate.data());
+  cuda_check(cudaGetLastError(), "conduction energy-rate kernel launch failed");
+}
+
 namespace {
 
 // The closure at the current temperatures (sync_conduction_eos_from_temperature_kernel): with

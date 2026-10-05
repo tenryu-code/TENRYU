@@ -17,7 +17,9 @@
 
 #include "core/constants.hpp"
 #include "core/deterministic_sum.hpp"
+#include "core/device_ordered_sum.cuh"
 #include "core/device_scratch.hpp"
+#include "core/glibc_libm_device.cuh"
 #include "core/error.hpp"
 #include "core/kernel_guard.hpp"
 #include "core/launch_shape.hpp"
@@ -486,49 +488,92 @@ struct LaserInjectionSummary {
   int first_negative_cell = -1;
 };
 
-// One thread, cells in order (the backward carry is serial); the restrict
-// qualifiers let the loads run ahead of the stores.
+constexpr int kInjectionBlock = 256;
+constexpr int kInjectionPerThread = 4;
+
+// One block. The deposits clipped at zero (the first negative cell noted), then the backward carry
+// of the void cells' deposits into the next non-void cell inward, then the redirected fraction:
+// the former one-thread loops, with the clipping in parallel and the ordered parts in the same
+// order. In the backward walk only void cells and the cell just inward of a void cell act (a
+// non-void cell with a void outer neighbour can receive the carry; elsewhere the carry is zero or
+// not positive and a non-void cell does nothing), so warp 0 walks 32 cells at a time and lane 0
+// visits the cells of a chunk only when the chunk holds a void cell or starts with a positive
+// carry.
 __global__ void prepare_laser_injection_kernel(
     const double* __restrict__ deposition, const std::uint8_t* __restrict__ cell_is_void,
     double* __restrict__ redirected, const int n, LaserInjectionSummary* __restrict__ summary) {
-  if (blockIdx.x != 0 || threadIdx.x != 0) return;
-  LaserInjectionSummary result;
-  for (int c = 0; c < n; ++c) {
+  __shared__ double sh_values[kInjectionBlock * kInjectionPerThread];
+  __shared__ int sh_scan[kInjectionBlock];
+  __shared__ int sh_first_negative;
+  __shared__ int sh_need_total;
+  __shared__ double sh_redirected_void_energy;
+  const int t = static_cast<int>(threadIdx.x);
+  LaserInjectionSummary result;  // thread 0's is the kernel's
+  if (t == 0) {
+    sh_first_negative = n;
+  }
+  __syncthreads();
+  for (int c = t; c < n; c += kInjectionBlock) {
     double dep = deposition[c];
     if (dep < 0.0) {
-      if (result.first_negative_cell < 0) {
-        result.first_negative_cell = c;
-        result.negative_deposit = dep;
-      }
+      atomicMin(&sh_first_negative, c);
       dep = 0.0;
     }
     redirected[c] = dep;
   }
-  double carry = 0.0;
-  for (int c = n - 1; c >= 0; --c) {
-    const double dep = redirected[c];
-    if (cell_is_void[c] != 0U) {
-      if (dep > 0.0) {
-        ++result.redirected_void_cells;
-        result.redirected_void_energy += dep;
+  __syncthreads();
+  if (t < 32) {
+    const int lane = t;
+    double carry = 0.0;
+    for (int chunk_top = n - 1; chunk_top >= 0; chunk_top -= 32) {
+      const int c_lane = chunk_top - lane;
+      const bool lane_void = c_lane >= 0 && cell_is_void[c_lane] != 0U;
+      const unsigned any_void = __ballot_sync(0xffffffffU, lane_void);
+      if (lane == 0 && (any_void != 0U || carry > 0.0)) {
+        const int chunk_bottom = ::max(chunk_top - 31, 0);
+        for (int c = chunk_top; c >= chunk_bottom; --c) {
+          if (cell_is_void[c] != 0U) {
+            const double dep = redirected[c];
+            if (dep > 0.0) {
+              ++result.redirected_void_cells;
+              result.redirected_void_energy += dep;
+            }
+            carry += dep;
+            redirected[c] = 0.0;
+          } else if (carry > 0.0) {
+            redirected[c] += carry;
+            carry = 0.0;
+          }
+        }
       }
-      carry += dep;
-      redirected[c] = 0.0;
-    } else if (carry > 0.0) {
-      redirected[c] += carry;
-      carry = 0.0;
+      carry = __shfl_sync(0xffffffffU, carry, 0);
+    }
+    if (lane == 0) {
+      if (carry > 0.0) {
+        result.unrecoverable_void_energy = carry;
+        result.skipped_energy += carry;
+      }
+      if (sh_first_negative < n) {
+        result.first_negative_cell = sh_first_negative;
+        result.negative_deposit = deposition[sh_first_negative];
+      }
+      sh_need_total =
+          (result.redirected_void_cells > 0 || result.unrecoverable_void_energy > 0.0) ? 1 : 0;
+      sh_redirected_void_energy = result.redirected_void_energy;
     }
   }
-  if (carry > 0.0) {
-    result.unrecoverable_void_energy = carry;
-    result.skipped_energy += carry;
+  __syncthreads();
+  if (sh_need_total != 0) {
+    const double total =
+        core::device_ordered::block_ordered_sum_nonzero<kInjectionBlock, kInjectionPerThread>(
+            redirected, n, sh_redirected_void_energy, sh_values, sh_scan);
+    if (t == 0) {
+      result.redirected_fraction = total > 0.0 ? result.redirected_void_energy / total : 0.0;
+    }
   }
-  if (result.redirected_void_cells > 0 || result.unrecoverable_void_energy > 0.0) {
-    double total = result.redirected_void_energy;
-    for (int c = 0; c < n; ++c) total += redirected[c];
-    result.redirected_fraction = total > 0.0 ? result.redirected_void_energy / total : 0.0;
+  if (t == 0) {
+    *summary = result;
   }
-  *summary = result;
 }
 
 __device__ void laser_injection_material_properties(
@@ -560,6 +605,9 @@ __device__ void laser_injection_material_properties(
   }
 }
 
+// T4HostRounding: the analytic T^4 closure takes the host's pow(x, 1/4) (core::glibc_libm), so
+// that decks with that closure get the host's values bit for bit; else CUDA's pow.
+template <bool T4HostRounding>
 __global__ void inject_laser_source_cells_kernel(
     const LaserInjectionDeviceParams params, const int n,
     const std::uint8_t* cell_is_void, const LaserInjectionMaterial* material_params,
@@ -655,7 +703,11 @@ __global__ void inject_laser_source_cells_kernel(
     const double T_ref3 = T_ref * T_ref * T_ref;
     const double alpha0 = cv_override_c / (4.0 * T_ref3);
     const double arg = ee[c_idx] * rho_safe / alpha0;
-    Te_raw = (arg > 0.0) ? ::pow(arg, 0.25) : 0.0;
+    if constexpr (T4HostRounding) {
+      Te_raw = (arg > 0.0) ? core::glibc_libm::pow(arg, 0.25) : 0.0;
+    } else {
+      Te_raw = (arg > 0.0) ? ::pow(arg, 0.25) : 0.0;
+    }
     if (!::isfinite(Te_raw)) {
       Te_raw = 0.0;
     }
@@ -754,26 +806,45 @@ __global__ void inject_laser_source_cells_kernel(
   ledger[c].clamp_count = local_clamp_count;
 }
 
+// One block. Fixed cell order, electron then ion, exactly as in the host ledger: the floor energy
+// adds the positive floor terms (2 per cell) and the skipped energy the skipped cells' energies,
+// each in that order from the summary's value (core::device_ordered, the zero terms skipped: both
+// sums start at +0 or a positive value); the clamp count is an integer sum.
 __global__ void fold_laser_injection_ledger_kernel(
     const LaserInjectionCellLedger* __restrict__ ledger, const int n,
     LaserInjectionSummary* __restrict__ summary) {
-  if (blockIdx.x != 0 || threadIdx.x != 0) return;
-  // Fixed cell order, electron then ion, exactly as in the host ledger. The
-  // sums are held in registers from the summary's values (the same additions
-  // in the same order): with the summary updated in memory every cell, each
-  // cell's loads waited for the previous store.
-  double floor_energy = summary->floor_energy;
-  double skipped_energy = summary->skipped_energy;
-  int clamp_count = summary->clamp_count;
-  for (int c = 0; c < n; ++c) {
-    if (ledger[c].floor_e > 0.0) floor_energy += ledger[c].floor_e;
-    if (ledger[c].floor_i > 0.0) floor_energy += ledger[c].floor_i;
-    if (ledger[c].skipped) skipped_energy += ledger[c].skipped_energy;
-    clamp_count += ledger[c].clamp_count;
+  __shared__ double sh_values[kInjectionBlock * kInjectionPerThread];
+  __shared__ int sh_scan[kInjectionBlock];
+  __shared__ int sh_clamp;
+  const int t = static_cast<int>(threadIdx.x);
+  if (t == 0) {
+    sh_clamp = 0;
   }
-  summary->floor_energy = floor_energy;
-  summary->skipped_energy = skipped_energy;
-  summary->clamp_count = clamp_count;
+  __syncthreads();
+  int local_clamp = 0;
+  for (int c = t; c < n; c += kInjectionBlock) {
+    local_clamp += ledger[c].clamp_count;
+  }
+  atomicAdd(&sh_clamp, local_clamp);
+  const auto floor_term = [ledger](const int i) {
+    const LaserInjectionCellLedger& cell = ledger[i / 2];
+    const double value = (i % 2 == 0) ? cell.floor_e : cell.floor_i;
+    return (value > 0.0) ? value : 0.0;
+  };
+  const double floor_energy =
+      core::device_ordered::block_ordered_sum_nonzero_terms<kInjectionBlock, kInjectionPerThread>(
+          2 * n, summary->floor_energy, floor_term, sh_values, sh_scan);
+  const auto skipped_term = [ledger](const int c) {
+    return ledger[c].skipped ? ledger[c].skipped_energy : 0.0;
+  };
+  const double skipped_energy =
+      core::device_ordered::block_ordered_sum_nonzero_terms<kInjectionBlock, kInjectionPerThread>(
+          n, summary->skipped_energy, skipped_term, sh_values, sh_scan);
+  if (t == 0) {
+    summary->floor_energy = floor_energy;
+    summary->skipped_energy = skipped_energy;
+    summary->clamp_count += sh_clamp;
+  }
 }
 
 double inject_laser_source_terms_device(
@@ -781,7 +852,7 @@ double inject_laser_source_terms_device(
     const core::Config::MaterialsConfig::MatDef& mat0,
     const bool has_table_eos, const bool use_first_cv_override,
     double* E_floor_injected, int* clamp_count,
-    const hydro::HydroEOSContext* eos_ctx) {
+    const hydro::HydroEOSContext* eos_ctx, const bool t4_host_rounding) {
   static LaserInjectionDeviceCache cache;
   const std::size_t n = state.rho.size();
   if (cache.cached_cell_is_void != state.cell_is_void) {
@@ -839,22 +910,31 @@ double inject_laser_source_terms_device(
       "source_terms:laser_cell_ledger", n * sizeof(LaserInjectionCellLedger)));
   auto* summary = static_cast<LaserInjectionSummary*>(core::device_scratch_acquire(
       "source_terms:laser_summary", sizeof(LaserInjectionSummary)));
-  prepare_laser_injection_kernel<<<1, 1>>>(
+  prepare_laser_injection_kernel<<<1, kInjectionBlock>>>(
       state.laser_dep.data(), cache.cell_is_void.data(), redirected,
       static_cast<int>(n), summary);
   cuda_check(cudaGetLastError(), "prepare_laser_injection_kernel launch failed");
   cuda_check(core::debug_kernel_sync(), "prepare_laser_injection_kernel failed");
   const int threads = core::serial_cell_block_size(static_cast<int>(n));
-  inject_laser_source_cells_kernel<<<core::serial_cell_blocks(static_cast<int>(n)), threads>>>(
-      params, static_cast<int>(n), cache.cell_is_void.data(), cache.materials.data(),
-      valid_volfrac ? state.volFrac.data() : nullptr,
-      state.rho.data(), state.vol.data(), state.zbar.data(),
-      state.cv_e.empty() ? nullptr : state.cv_e.data(), redirected,
-      state.ee.data(), state.Te.data(), state.Pe.data(), state.ei.data(),
-      state.Ti.data(), state.Pi.data(), ledger);
+  const int blocks = core::serial_cell_blocks(static_cast<int>(n));
+  const double* volfrac = valid_volfrac ? state.volFrac.data() : nullptr;
+  const double* cv_e = state.cv_e.empty() ? nullptr : state.cv_e.data();
+  if (t4_host_rounding) {
+    inject_laser_source_cells_kernel<true><<<blocks, threads>>>(
+        params, static_cast<int>(n), cache.cell_is_void.data(), cache.materials.data(), volfrac,
+        state.rho.data(), state.vol.data(), state.zbar.data(), cv_e, redirected,
+        state.ee.data(), state.Te.data(), state.Pe.data(), state.ei.data(),
+        state.Ti.data(), state.Pi.data(), ledger);
+  } else {
+    inject_laser_source_cells_kernel<false><<<blocks, threads>>>(
+        params, static_cast<int>(n), cache.cell_is_void.data(), cache.materials.data(), volfrac,
+        state.rho.data(), state.vol.data(), state.zbar.data(), cv_e, redirected,
+        state.ee.data(), state.Te.data(), state.Pe.data(), state.ei.data(),
+        state.Ti.data(), state.Pi.data(), ledger);
+  }
   cuda_check(cudaGetLastError(), "inject_laser_source_cells_kernel launch failed");
   cuda_check(core::debug_kernel_sync(), "inject_laser_source_cells_kernel failed");
-  fold_laser_injection_ledger_kernel<<<1, 1>>>(ledger, static_cast<int>(n), summary);
+  fold_laser_injection_ledger_kernel<<<1, kInjectionBlock>>>(ledger, static_cast<int>(n), summary);
   cuda_check(cudaGetLastError(), "fold_laser_injection_ledger_kernel launch failed");
   cuda_check(core::debug_kernel_sync(), "fold_laser_injection_ledger_kernel failed");
   LaserInjectionSummary result;
@@ -1109,11 +1189,12 @@ __global__ void fold_burn_injection_ledger_kernel(
   *summary = result;
 }
 
-double inject_burn_source_terms_device(
+// The burn deposits d_dE_e, d_dE_i (device, n_cells each) into the cells.
+double inject_burn_source_terms_device_deposits(
     core::State& state, const core::Config& cfg,
     const core::Config::MaterialsConfig::MatDef& mat0,
     const bool has_table_eos, const bool use_first_cv_override,
-    const std::vector<double>& dE_e, const std::vector<double>& dE_i,
+    const double* d_dE_e, const double* d_dE_i,
     double* E_floor_injected, int* clamp_count,
     const hydro::HydroEOSContext* eos_ctx) {
   static LaserInjectionDeviceCache cache;
@@ -1157,12 +1238,6 @@ double inject_burn_source_terms_device(
   params.energy_authoritative =
       (cfg.numerics.hydro.eos_closure_mode == "energy_authoritative");
 
-  auto* d_dep = static_cast<double*>(core::device_scratch_acquire(
-      "source_terms:burn_deposit", 2 * n * sizeof(double)));
-  cuda_check(cudaMemcpy(d_dep, dE_e.data(), n * sizeof(double), cudaMemcpyHostToDevice),
-             "inject_burn_source_terms dE_e upload failed");
-  cuda_check(cudaMemcpy(d_dep + n, dE_i.data(), n * sizeof(double), cudaMemcpyHostToDevice),
-             "inject_burn_source_terms dE_i upload failed");
   auto* ledger = static_cast<BurnInjectionCellLedger*>(core::device_scratch_acquire(
       "source_terms:burn_cell_ledger", n * sizeof(BurnInjectionCellLedger)));
   auto* summary = static_cast<BurnInjectionSummary*>(core::device_scratch_acquire(
@@ -1171,7 +1246,7 @@ double inject_burn_source_terms_device(
   inject_burn_source_cells_kernel<<<core::serial_cell_blocks(static_cast<int>(n)), threads>>>(
       params, static_cast<int>(n), cache.cell_is_void.data(), cache.materials.data(),
       valid_volfrac ? state.volFrac.data() : nullptr, state.rho.data(), state.vol.data(),
-      state.zbar.data(), state.cv_e.empty() ? nullptr : state.cv_e.data(), d_dep, d_dep + n,
+      state.zbar.data(), state.cv_e.empty() ? nullptr : state.cv_e.data(), d_dE_e, d_dE_i,
       state.ee.data(), state.Te.data(), state.Pe.data(), state.ei.data(), state.Ti.data(),
       state.Pi.data(), ledger);
   cuda_check(cudaGetLastError(), "inject_burn_source_cells_kernel launch failed");
@@ -1184,6 +1259,25 @@ double inject_burn_source_terms_device(
   accumulate_floor_and_clamp(E_floor_injected, clamp_count, result.floor_energy,
                             result.clamp_count);
   return result.skipped_energy;
+}
+
+double inject_burn_source_terms_device(
+    core::State& state, const core::Config& cfg,
+    const core::Config::MaterialsConfig::MatDef& mat0,
+    const bool has_table_eos, const bool use_first_cv_override,
+    const std::vector<double>& dE_e, const std::vector<double>& dE_i,
+    double* E_floor_injected, int* clamp_count,
+    const hydro::HydroEOSContext* eos_ctx) {
+  const std::size_t n = state.rho.size();
+  auto* d_dep = static_cast<double*>(core::device_scratch_acquire(
+      "source_terms:burn_deposit", 2 * n * sizeof(double)));
+  cuda_check(cudaMemcpy(d_dep, dE_e.data(), n * sizeof(double), cudaMemcpyHostToDevice),
+             "inject_burn_source_terms dE_e upload failed");
+  cuda_check(cudaMemcpy(d_dep + n, dE_i.data(), n * sizeof(double), cudaMemcpyHostToDevice),
+             "inject_burn_source_terms dE_i upload failed");
+  return inject_burn_source_terms_device_deposits(state, cfg, mat0, has_table_eos,
+                                                  use_first_cv_override, d_dep, d_dep + n,
+                                                  E_floor_injected, clamp_count, eos_ctx);
 }
 
 __global__ void qei_coupling_substep_kernel(
@@ -1894,8 +1988,9 @@ double inject_laser_source_terms(core::State& state,
 
   const int n_cells = static_cast<int>(state.rho.size());
   const char* host_path = std::getenv("TENRYU_LASER_SOURCE_HOST");
-  // CUDA pow(x, 0.25) does not reproduce the legacy host libm bitwise.
-  // Keep that analytic override on its original path; tabular 2T takes priority.
+  // Decks with the analytic T^4 closure (and no tabular 2T, which takes priority) are held to the
+  // host's values bit for bit, which CUDA's pow(x, 0.25) does not give: their device kernel takes
+  // the host's pow (2026-10-02; the host computed the injection before).
   bool any_t4_closure = use_first_cv_override && mat0.eos_T_ref_eV > 0.0;
   if (materials::material_closure_params_vary(cfg)) {
     for (const auto& mat : materials) {
@@ -1903,14 +1998,13 @@ double inject_laser_source_terms(core::State& state,
                                           mat.eos_T_ref_eV > 0.0);
     }
   }
-  const bool legacy_t4_closure = any_t4_closure &&
-                                 !(cfg.main.two_temperature && has_table_eos);
+  const bool t4_host_rounding = any_t4_closure &&
+                                !(cfg.main.two_temperature && has_table_eos);
   if (cfg.main.dimension == "1D_SPH" &&
-      !legacy_t4_closure &&
       !(host_path != nullptr && host_path[0] == '1')) {
     return inject_laser_source_terms_device(
         state, cfg, mat0, has_table_eos, use_first_cv_override,
-        E_floor_injected, clamp_count, eos_ctx);
+        E_floor_injected, clamp_count, eos_ctx, t4_host_rounding);
   }
   std::vector<double> A_eff;
   std::vector<double> gamma_eff;
@@ -2450,6 +2544,53 @@ double inject_burn_source_terms(core::State& state,
     state.Ti_per_material_valid.assign(n_cell_mat, static_cast<std::uint8_t>(0));
   }
   return skipped_energy;
+}
+
+double inject_burn_source_terms(core::State& state,
+                                const core::Config& cfg,
+                                const double* d_dE_e,
+                                const double* d_dE_i,
+                                double* E_floor_injected,
+                                int* clamp_count,
+                                const hydro::HydroEOSContext* eos_ctx) {
+  if (state.rho.empty() || cfg.materials.materials.empty()) {
+    return 0.0;
+  }
+  const std::size_t n = state.rho.size();
+  const std::size_t n_mat_sz = cfg.materials.materials.size();
+  const bool per_material_deposit =
+      cfg.numerics.materials.per_material_conservation_enabled &&
+      cfg.main.two_temperature && state.Ee_per_material.size() == n * n_mat_sz &&
+      state.Ei_per_material.size() == n * n_mat_sz &&
+      state.mass_per_material.size() == n * n_mat_sz;
+  if (per_material_deposit) {
+    std::vector<double> dE_e(n, 0.0);
+    std::vector<double> dE_i(n, 0.0);
+    cuda_check(cudaMemcpy(dE_e.data(), d_dE_e, n * sizeof(double), cudaMemcpyDeviceToHost),
+               "inject_burn_source_terms dE_e copy failed");
+    cuda_check(cudaMemcpy(dE_i.data(), d_dE_i, n * sizeof(double), cudaMemcpyDeviceToHost),
+               "inject_burn_source_terms dE_i copy failed");
+    return inject_burn_source_terms(state, cfg, dE_e, dE_i, E_floor_injected, clamp_count,
+                                    eos_ctx);
+  }
+  assert_common_source_state_sizes(state, "inject_burn_source_terms");
+  const auto& materials = cfg.materials.materials;
+  const int first_nonvoid = cfg.materials.first_nonvoid_material_index();
+  TENRYU_ASSERT(first_nonvoid >= 0,
+                "inject_burn_source_terms requires at least one non-void material");
+  const auto& mat0 = materials[static_cast<std::size_t>(first_nonvoid)];
+  const bool has_table_eos = source_table_eos_enabled(cfg, mat0);
+  bool any_cv_e_override = false;
+  for (const auto& mat : materials) {
+    if (mat.cv_e_override > 0.0) {
+      any_cv_e_override = true;
+      break;
+    }
+  }
+  const bool use_first_cv_override = any_cv_e_override && mat0.cv_e_override > 0.0;
+  return inject_burn_source_terms_device_deposits(state, cfg, mat0, has_table_eos,
+                                                  use_first_cv_override, d_dE_e, d_dE_i,
+                                                  E_floor_injected, clamp_count, eos_ctx);
 }
 
 }  // namespace tenryu::coupling

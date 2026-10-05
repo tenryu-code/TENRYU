@@ -593,6 +593,25 @@ struct CharacteristicPieces {
   const int* count = nullptr;  // number of pieces (device scalar)
 };
 
+// The inward leg's integrals of a piece, kept per ray for the outward leg,
+// which crosses the same pieces back to the profile edge: the arc length,
+// polar angle and optical depth of a piece depend on its radius interval only
+// (Laser.raytrace.reuse_inward_integrals, NUMERICS 5.3.6 (c'')). One row of
+// characteristic_piece_capacity entries per ray, indexed by the piece.
+struct InwardPieceIntegrals {
+  double a = 0.0;  // the traversed part [a, b] of the piece
+  double b = 0.0;
+  double ds = 0.0;
+  double dphi = 0.0;
+  double tau0 = 0.0;
+  double r_centroid = 0.0;
+  double frac_centroid = 0.5;
+  int panels = 0;
+  int unresolved = 0;
+  int valid = 0;  // 0: no inward integral of this piece in this trace
+  int pad = 0;
+};
+
 // Pieces are at most (radial nodes) + (hydro faces) + (split) - 1.
 __host__ __device__ inline int characteristic_piece_capacity(const int n_radial_nodes,
                                                              const int n_hydro_cells) {
@@ -734,7 +753,9 @@ __device__ inline PrefetchedPiece prefetch_piece(const CharacteristicPieces& pie
                                                  const double eps_n,
                                                  const double test_kappa_cm_inv,
                                                  const bool check_trigger,
-                                                 const bool check_entry_critical = true) {
+                                                 const bool check_entry_critical = true,
+                                                 const InwardPieceIntegrals* __restrict__
+                                                     inward_cache = nullptr) {
   PrefetchedPiece out;
   out.j = pieces.interval[k];
   out.cell = pieces.cell[k];
@@ -824,6 +845,22 @@ __device__ inline PrefetchedPiece prefetch_piece(const CharacteristicPieces& pie
     const double r_near = (out.b > out.a) ? regularising_root(nf, inv, out.a, out.b) : -1.0;
     if (r_near >= 0.0 && (out.r0 < 0.0 || r_near > out.r0)) {
       out.r0 = r_near;
+    }
+  }
+  if (!inward && inward_cache != nullptr) {
+    // The inward leg integrated this piece over the same interval: its values
+    // (r0 above stays the outward leg's, for the hot-electron sub-pieces).
+    const InwardPieceIntegrals& c = inward_cache[k];
+    if (c.valid != 0 && c.a == out.a && c.b == out.b) {
+      out.ds = c.ds;
+      out.dphi = c.dphi;
+      out.tau0 = c.tau0;
+      out.r_centroid = c.r_centroid;
+      out.frac_centroid = c.frac_centroid;
+      out.panels = c.panels;
+      out.unresolved = c.unresolved;
+      out.valid = 1;
+      return out;
     }
   }
   const PieceIntegrals pi =
@@ -1312,7 +1349,8 @@ __device__ inline void ray_trace_1d_characteristic_body(
     const int per_ray_row_base = 0,
     const int reflect_at_critical = 0,
     const int geometry = 0,
-    const double* __restrict__ ray_vA0 = nullptr) {
+    const double* __restrict__ ray_vA0 = nullptr,
+    InwardPieceIntegrals* __restrict__ inward_cache = nullptr) {
   using namespace characteristic_detail;
   // Mesh.geometry_1d (mesh::Geometry1D): 0 sphere, 1 cylinder, 2 slab.
   // (R, Z) is the ray's position in the plane of the trace: the orbital plane
@@ -1812,6 +1850,14 @@ __device__ inline void ray_trace_1d_characteristic_body(
     turning_point_resonance_absorption();
   };
 
+  // This trace's cache starts empty (the buffer is reused across traces).
+  if (inward_cache != nullptr) {
+    for (int k = lane; k < n_pieces; k += kTile) {
+      inward_cache[k].valid = 0;
+    }
+    tile_sync<kTile>();
+  }
+
   while (true) {
     // ---- Chunk: up to kTile consecutive pieces along the path from r_cur ----
     const int k_first = inward ? count_less(pieces.r, n_breakpoints, r_cur) - 1
@@ -1836,7 +1882,7 @@ __device__ inline void ray_trace_1d_characteristic_body(
                             radial_smooth_kappa, radial_dn_dr, inv, eps_crit, eps_n,
                             test_kappa_cm_inv,
                             !reflect_critical && !(lane == 0 && skip_first_trigger),
-                            !(lane == 0 && skip_first_entry_critical));
+                            !(lane == 0 && skip_first_entry_critical), inward_cache);
     }
     skip_first_trigger = false;
     skip_first_entry_critical = false;
@@ -1982,6 +2028,25 @@ __device__ inline void ray_trace_1d_characteristic_body(
     const int n_applied = tile_count<kTile>(apply);
     if (apply && mine.unresolved != 0 && error_flags != nullptr) {
       atomicAdd(&error_flags->unresolved_quadrature, 1);
+    }
+
+    // The inward leg keeps the integrals of the pieces it crossed for the
+    // outward leg (the lanes up to the first event lane integrated the part
+    // the ray crosses: [r_stop, b]; lanes that stopped at their entry did not).
+    if (inward_cache != nullptr && inward && active && lane <= s1 && mine.valid != 0 &&
+        mine.entry_invalid == 0 && mine.entry_critical == 0 && mine.entry_trigger == 0 &&
+        mine.r_stop < mine.b) {
+      InwardPieceIntegrals& c = inward_cache[k_first - lane];
+      c.a = mine.r_stop;
+      c.b = mine.b;
+      c.ds = mine.ds;
+      c.dphi = mine.dphi;
+      c.tau0 = mine.tau0;
+      c.r_centroid = mine.r_centroid;
+      c.frac_centroid = mine.frac_centroid;
+      c.panels = mine.panels;
+      c.unresolved = mine.unresolved;
+      c.valid = 1;
     }
 
     // Deposits, per-cell runs summed across the lanes (the run's last lane adds).

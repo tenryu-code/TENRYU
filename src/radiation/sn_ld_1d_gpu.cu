@@ -17,6 +17,7 @@
 #include "mesh/geometry_1d.cuh"
 #include "radiation/material_electron_eos_1d.hpp"
 #include "radiation/planck_table.cuh"
+#include "radiation/rounded_hypot.cuh"
 #include "radiation/sn_electron_eos.cuh"
 #include "radiation/sn_material_newton_gpu.cuh"
 #include "radiation/sn_transport_1d_internal.hpp"
@@ -441,6 +442,341 @@ __global__ void sweep_kernel(const double* __restrict__ cells,
     }
     __syncwarp();
   }
+}
+
+// The sweep with each ordinate's recursion over the cells done as a scan
+// (2026-10-02). For one ordinate, a cell's outflow trace is affine in its
+// inflow trace, x_out = a x_in + d, with a and d from the cell's operands and
+// the angular edge the previous ordinate left in the cell. One block per
+// group; thread t holds the positions t k .. t k + k - 1 of the sweep (k cells
+// per thread: k = 1 while the cells fit a block of the one-cell instance, whose
+// registers bound the block: 512 threads in the CUDA 12.6 sm_89 build). Per
+// ordinate the thread composes its cells' maps, the block scans the threads'
+// maps in the sweep's order, and every thread applies the maps below it to the
+// boundary inflow: that is the inflow of its first cell, from which it solves
+// its cells with the sequential sweep's arithmetic. The cells' inflows come
+// from the composed maps, so the results differ from the sequential sweep's
+// (sweep_kernel, TENRYU_SN_LD_SEQUENTIAL_SWEEP=1) by rounding. Ordinates
+// follow one another as in the sequential sweep: the starting direction, the
+// inward half, the outward half.
+
+// Inclusive scan of the maps (a, d) (x -> a x + d) over the block's threads:
+// on return a thread holds the composition of its map with the maps of all
+// lower threads (lower first), and out = the image of x0 under it; inflow is
+// the image of x0 under the composition of the lower threads' maps (x0 for
+// thread 0). sh_a, sh_d: 32 doubles each.
+__device__ inline void scan_affine_maps_block(double& a, double& d, const double x0, double& out,
+                                              double& inflow, double* sh_a, double* sh_d) {
+  const int lane = static_cast<int>(threadIdx.x) & (kWarp - 1);
+  const int warp = static_cast<int>(threadIdx.x) / kWarp;
+  const int n_warps = (static_cast<int>(blockDim.x) + kWarp - 1) / kWarp;
+#pragma unroll
+  for (int off = 1; off < kWarp; off <<= 1) {
+    const double a_up = __shfl_up_sync(0xffffffffu, a, off);
+    const double d_up = __shfl_up_sync(0xffffffffu, d, off);
+    if (lane >= off) {
+      d = a * d_up + d;
+      a = a * a_up;
+    }
+  }
+  if (lane == kWarp - 1) {
+    sh_a[warp] = a;
+    sh_d[warp] = d;
+  }
+  __syncthreads();
+  if (warp == 0) {
+    double wa = (lane < n_warps) ? sh_a[lane] : 1.0;
+    double wd = (lane < n_warps) ? sh_d[lane] : 0.0;
+#pragma unroll
+    for (int off = 1; off < kWarp; off <<= 1) {
+      const double a_up = __shfl_up_sync(0xffffffffu, wa, off);
+      const double d_up = __shfl_up_sync(0xffffffffu, wd, off);
+      if (lane >= off) {
+        wd = wa * d_up + wd;
+        wa = wa * a_up;
+      }
+    }
+    if (lane < n_warps) {
+      sh_a[lane] = wa;
+      sh_d[lane] = wd;
+    }
+  }
+  __syncthreads();
+  if (warp > 0) {
+    const double pa = sh_a[warp - 1];
+    const double pd = sh_d[warp - 1];
+    d = a * pd + d;
+    a = a * pa;
+  }
+  out = a * x0 + d;
+  inflow = __shfl_up_sync(0xffffffffu, out, 1);
+  if (lane == 0) {
+    inflow = (warp == 0) ? x0 : (sh_a[warp - 1] * x0 + sh_d[warp - 1]);
+  }
+  __syncthreads();
+}
+
+// kOneCell: every thread holds at most one cell (n <= blockDim.x) and keeps
+// its operands from the composition to the solve; otherwise the solve loads
+// them again.
+template <bool kOneCell>
+__global__ void scan_sweep_kernel(const double* __restrict__ cells,
+                                  const double* __restrict__ inv,
+                                  const double* __restrict__ sd_inv,
+                                  const double* __restrict__ q,
+                                  const double* __restrict__ psi_prev,
+                                  const double* __restrict__ sd_prev,
+                                  const double* __restrict__ psi_in_g,
+                                  const double* __restrict__ mu,
+                                  const double* __restrict__ weight,
+                                  const double* __restrict__ alpha,
+                                  const double* __restrict__ tau,
+                                  const double* __restrict__ sd_mu,
+                                  double* __restrict__ psi,
+                                  double* __restrict__ sd,
+                                  const int n,
+                                  const int G,
+                                  const int N,
+                                  const int n_chains,
+                                  const int chain_len,
+                                  const double inv_cdt,
+                                  const int curved,
+                                  const int k_cells) {
+  const int g = blockIdx.x;
+  const int t = static_cast<int>(threadIdx.x);
+  if (g >= G) {
+    return;
+  }
+  extern __shared__ double shared[];
+  double* eL = shared;
+  double* eR = shared + n;
+  const int half = chain_len / 2;
+  double* centre = shared + 2 * n;  // [half]
+  double* sh_a = centre + half;     // [kWarp]
+  double* sh_d = sh_a + kWarp;      // [kWarp]
+  const std::size_t two_n = 2 * static_cast<std::size_t>(n);
+  const double* qg = q + static_cast<std::size_t>(g) * two_n;
+  const double psi_in = (psi_in_g != nullptr) ? fmax(finite_or_zero(psi_in_g[g]), 0.0) : 0.0;
+  const int p_begin = t * k_cells;
+  const int p_end = min(p_begin + k_cells, n);
+  // The thread holding the last position (the sweep's outflow).
+  const int t_last = (n - 1) / k_cells;
+  SweepOperands held;  // kOneCell: the operands of the thread's cell
+  for (int k = 0; k < n_chains; ++k) {
+    const int base = k * chain_len;
+    // Starting direction of the chain (curved geometries), inflow at the
+    // outer face; cell c = n - 1 - p.
+    if (curved != 0) {
+      const double s = (sd_mu != nullptr) ? fmin(fmax(sd_mu[k], 1.0e-12), 1.0) : 1.0;
+      const std::size_t sd_base = (static_cast<std::size_t>(g) * n_chains + k) * two_n;
+      const double* sd_hist = (sd_prev != nullptr) ? sd_prev + sd_base : nullptr;
+      const double* sinv =
+          sd_inv + (static_cast<std::size_t>(g) * n_chains + k) * n * kInvStride;
+      double ma = 1.0;
+      double md = 0.0;
+      for (int p = p_begin; p < p_end; ++p) {
+        const SweepOperands cur = load_sweep_operands(cells, sinv, qg, sd_hist, n - 1 - p, true);
+        if (kOneCell) {
+          held = cur;
+        }
+        double qL = cur.qL;
+        double qR = cur.qR;
+        if (sd_hist != nullptr) {
+          qL += inv_cdt * cur.pL;
+          qR += inv_cdt * cur.pR;
+        }
+        // xL = inv0 b0 + inv1 (0.5 h qR + s x_in): x_out = xL.
+        const double b0 = 0.5 * cur.h * qL;
+        const double b1f = 0.5 * cur.h * qR;
+        const double a = cur.inv[1] * s;
+        const double d = cur.inv[0] * b0 + cur.inv[1] * b1f;
+        md = a * md + d;
+        ma = a * ma;
+      }
+      double out = 0.0;
+      double inflow = 0.0;
+      scan_affine_maps_block(ma, md, psi_in, out, inflow, sh_a, sh_d);
+      for (int p = p_begin; p < p_end; ++p) {
+        const int c = n - 1 - p;
+        const SweepOperands cur =
+            kOneCell ? held : load_sweep_operands(cells, sinv, qg, sd_hist, c, true);
+        const double h = cur.h;
+        double qL = cur.qL;
+        double qR = cur.qR;
+        if (sd_hist != nullptr) {
+          qL += inv_cdt * cur.pL;
+          qR += inv_cdt * cur.pR;
+        }
+        const double b0 = 0.5 * h * qL;
+        const double b1 = 0.5 * h * qR + s * inflow;
+        const double xL = cur.inv[0] * b0 + cur.inv[1] * b1;
+        const double xR = cur.inv[2] * b0 + cur.inv[3] * b1;
+        eL[c] = xL;
+        eR[c] = xR;
+        if (sd != nullptr) {
+          sd[sd_base + 2 * c] = xL;
+          sd[sd_base + 2 * c + 1] = xR;
+        }
+        inflow = xL;
+      }
+      __syncthreads();
+    }
+    // Inward half: ordinate base + j, inflow at the outer face; cell c = n - 1 - p.
+    for (int j = 0; j < half; ++j) {
+      const int m = base + j;
+      const double mu_m = mu[m];
+      const double w_m = weight[m];
+      const double tw = fmin(fmax(tau[m], 1.0e-6), 1.0);
+      const double fac = alpha[m + 1] * (1.0 - tw) / (w_m * tw) + alpha[m] / w_m;
+      const double one_minus_tw = 1.0 - tw;
+      const double inv_tw = 1.0 / tw;
+      const std::size_t p_base = (static_cast<std::size_t>(g) * N + m) * two_n;
+      const double* hist = (psi_prev != nullptr) ? psi_prev + p_base : nullptr;
+      const double* minv = inv + (static_cast<std::size_t>(g) * N + m) * n * kInvStride;
+      double ma = 1.0;
+      double md = 0.0;
+      for (int p = p_begin; p < p_end; ++p) {
+        const int c = n - 1 - p;
+        const SweepOperands cur = load_sweep_operands(cells, minv, qg, hist, c, true);
+        if (kOneCell) {
+          held = cur;
+        }
+        double qL = cur.qL;
+        double qR = cur.qR;
+        if (hist != nullptr) {
+          qL += inv_cdt * cur.pL;
+          qR += inv_cdt * cur.pR;
+        }
+        // b1 = b1f - mu A_in x_in: pL = inv0 b0 + inv1 b1; x_out = pL.
+        double b0 = cur.ML * qL;
+        double b1f = cur.MR * qR;
+        if (curved != 0) {
+          b0 += fac * cur.NL * eL[c];
+          b1f += fac * cur.NR * eR[c];
+        }
+        const double a = -(cur.inv[1] * (mu_m * cur.A_in));
+        const double d = cur.inv[0] * b0 + cur.inv[1] * b1f;
+        md = a * md + d;
+        ma = a * ma;
+      }
+      double out = 0.0;
+      double incoming = 0.0;
+      scan_affine_maps_block(ma, md, psi_in, out, incoming, sh_a, sh_d);
+      for (int p = p_begin; p < p_end; ++p) {
+        const int c = n - 1 - p;
+        const SweepOperands cur =
+            kOneCell ? held : load_sweep_operands(cells, minv, qg, hist, c, true);
+        double qL = cur.qL;
+        double qR = cur.qR;
+        if (hist != nullptr) {
+          qL += inv_cdt * cur.pL;
+          qR += inv_cdt * cur.pR;
+        }
+        // mu < 0: the inflow enters at the right face (node R's row).
+        double b0 = cur.ML * qL;
+        double b1 = cur.MR * qR - mu_m * cur.A_in * incoming;
+        if (curved != 0) {
+          b0 += fac * cur.NL * eL[c];
+          b1 += fac * cur.NR * eR[c];
+        }
+        const double pL = cur.inv[0] * b0 + cur.inv[1] * b1;
+        const double pR = cur.inv[2] * b0 + cur.inv[3] * b1;
+        psi[p_base + 2 * c] = pL;
+        psi[p_base + 2 * c + 1] = pR;
+        if (curved != 0) {
+          eL[c] = (pL - one_minus_tw * eL[c]) * inv_tw;
+          eR[c] = (pR - one_minus_tw * eR[c]) * inv_tw;
+        }
+        incoming = pL;
+      }
+      if (t == t_last) {
+        centre[j] = incoming;  // outflow of cell 0 at the centre (node L)
+      }
+      __syncthreads();
+    }
+    // Outward half: ordinate base + half + j, inflow at the centre from its
+    // reflection partner (chain index half - 1 - j); cell c = p.
+    for (int j = 0; j < half; ++j) {
+      const int m = base + half + j;
+      const double mu_m = mu[m];
+      const double w_m = weight[m];
+      const double tw = fmin(fmax(tau[m], 1.0e-6), 1.0);
+      const double fac = alpha[m + 1] * (1.0 - tw) / (w_m * tw) + alpha[m] / w_m;
+      const double one_minus_tw = 1.0 - tw;
+      const double inv_tw = 1.0 / tw;
+      const double x0 = centre[half - 1 - j];
+      const std::size_t p_base = (static_cast<std::size_t>(g) * N + m) * two_n;
+      const double* hist = (psi_prev != nullptr) ? psi_prev + p_base : nullptr;
+      const double* minv = inv + (static_cast<std::size_t>(g) * N + m) * n * kInvStride;
+      double ma = 1.0;
+      double md = 0.0;
+      for (int p = p_begin; p < p_end; ++p) {
+        const SweepOperands cur = load_sweep_operands(cells, minv, qg, hist, p, false);
+        if (kOneCell) {
+          held = cur;
+        }
+        double qL = cur.qL;
+        double qR = cur.qR;
+        if (hist != nullptr) {
+          qL += inv_cdt * cur.pL;
+          qR += inv_cdt * cur.pR;
+        }
+        // b0 = b0f + mu A_in x_in: pR = inv2 b0 + inv3 b1; x_out = pR.
+        double b0f = cur.ML * qL;
+        double b1 = cur.MR * qR;
+        if (curved != 0) {
+          b0f += fac * cur.NL * eL[p];
+          b1 += fac * cur.NR * eR[p];
+        }
+        const double a = cur.inv[2] * (mu_m * cur.A_in);
+        const double d = cur.inv[2] * b0f + cur.inv[3] * b1;
+        md = a * md + d;
+        ma = a * ma;
+      }
+      double out = 0.0;
+      double incoming = 0.0;
+      scan_affine_maps_block(ma, md, x0, out, incoming, sh_a, sh_d);
+      for (int p = p_begin; p < p_end; ++p) {
+        const int c = p;
+        const SweepOperands cur =
+            kOneCell ? held : load_sweep_operands(cells, minv, qg, hist, c, false);
+        double qL = cur.qL;
+        double qR = cur.qR;
+        if (hist != nullptr) {
+          qL += inv_cdt * cur.pL;
+          qR += inv_cdt * cur.pR;
+        }
+        // mu > 0: the inflow enters at the left face (node L's row).
+        double b0 = cur.ML * qL + mu_m * cur.A_in * incoming;
+        double b1 = cur.MR * qR;
+        if (curved != 0) {
+          b0 += fac * cur.NL * eL[c];
+          b1 += fac * cur.NR * eR[c];
+        }
+        const double pL = cur.inv[0] * b0 + cur.inv[1] * b1;
+        const double pR = cur.inv[2] * b0 + cur.inv[3] * b1;
+        psi[p_base + 2 * c] = pL;
+        psi[p_base + 2 * c + 1] = pR;
+        if (curved != 0) {
+          eL[c] = (pL - one_minus_tw * eL[c]) * inv_tw;
+          eR[c] = (pR - one_minus_tw * eR[c]) * inv_tw;
+        }
+        incoming = pR;
+      }
+      __syncthreads();
+    }
+  }
+}
+
+// The largest block of a scan sweep instance, a multiple of the warp size: its
+// maxThreadsPerBlock (bounded by the registers its threads use) capped at 1024.
+template <typename Kernel>
+int scan_sweep_max_threads(Kernel kernel) {
+  cudaFuncAttributes attributes{};
+  cuda_check(cudaFuncGetAttributes(&attributes, kernel), "sn_ld scan sweep attributes failed");
+  const int limit = std::min(attributes.maxThreadsPerBlock, 1024);
+  TENRYU_ASSERT(limit >= kWarp, "sn_ld scan sweep: a block smaller than a warp");
+  return (limit / kWarp) * kWarp;
 }
 
 // phi per (group, node) in ordinate order; face currents per (group, face).
@@ -872,24 +1208,69 @@ void sweep_prepared(const double* cells, const double* inverse, const double* q,
                     quad.n_chains * quad.chain_len == quad.n_angles,
                 "sn_ld sweep: chains of at most 64 ordinates covering the quadrature");
   const int curved = (geom == static_cast<int>(mesh::Geometry1D::kPlanar)) ? 0 : 1;
-  const std::size_t shared =
-      (2 * static_cast<std::size_t>(n_cells) + static_cast<std::size_t>(quad.chain_len / 2)) *
-      sizeof(double);
-  static std::size_t configured_shared = 0;
-  if (shared > 48U * 1024U && shared > configured_shared) {
-    cuda_check(cudaFuncSetAttribute(sweep_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                    static_cast<int>(shared)),
-               "sn_ld sweep shared memory attribute failed");
-    configured_shared = shared;
-  }
   const std::size_t n_ord = static_cast<std::size_t>(n_groups) *
                             static_cast<std::size_t>(quad.n_angles) *
                             static_cast<std::size_t>(n_cells);
-  sweep_kernel<<<n_groups, kWarp, shared, stream>>>(
-      cells, inverse, inverse + n_ord * kInvStride, q, psi_prev, sd_prev, psi_in, quad.mu,
-      quad.weight, quad.alpha, quad.tau, quad.sd_mu, psi, sd, n_cells, n_groups, quad.n_angles,
-      quad.n_chains, quad.chain_len, inv_cdt, curved);
-  cuda_check(cudaGetLastError(), "sn_ld sweep launch failed");
+  // TENRYU_SN_LD_SEQUENTIAL_SWEEP=1 (read once): the sequential sweep
+  // (sweep_kernel) in place of the scan over the cells.
+  static const bool sequential_sweep = [] {
+    const char* v = std::getenv("TENRYU_SN_LD_SEQUENTIAL_SWEEP");
+    return v != nullptr && v[0] == '1';
+  }();
+  if (sequential_sweep) {
+    const std::size_t shared =
+        (2 * static_cast<std::size_t>(n_cells) + static_cast<std::size_t>(quad.chain_len / 2)) *
+        sizeof(double);
+    static std::size_t configured_shared = 0;
+    if (shared > 48U * 1024U && shared > configured_shared) {
+      cuda_check(cudaFuncSetAttribute(sweep_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                      static_cast<int>(shared)),
+                 "sn_ld sweep shared memory attribute failed");
+      configured_shared = shared;
+    }
+    sweep_kernel<<<n_groups, kWarp, shared, stream>>>(
+        cells, inverse, inverse + n_ord * kInvStride, q, psi_prev, sd_prev, psi_in, quad.mu,
+        quad.weight, quad.alpha, quad.tau, quad.sd_mu, psi, sd, n_cells, n_groups,
+        quad.n_angles, quad.n_chains, quad.chain_len, inv_cdt, curved);
+    cuda_check(cudaGetLastError(), "sn_ld sweep launch failed");
+    return;
+  }
+  // A block holds at most the threads its registers allow (the kernel's
+  // maxThreadsPerBlock: 512 threads for the one-cell instance and 640 for the
+  // other in the CUDA 12.6 sm_89 build; asking for 1024 failed to launch
+  // beyond 512 cells until this was fixed). One thread per cell while the
+  // cells fit the one-cell instance's block, else the other instance's
+  // largest block with k cells per thread.
+  static const int max_threads_one_cell = scan_sweep_max_threads(scan_sweep_kernel<true>);
+  static const int max_threads_k_cells = scan_sweep_max_threads(scan_sweep_kernel<false>);
+  const int one_cell_threads = ((n_cells + kWarp - 1) / kWarp) * kWarp;
+  const bool one_cell = one_cell_threads <= max_threads_one_cell;
+  const int threads = one_cell ? one_cell_threads : max_threads_k_cells;
+  const int k_cells = (n_cells + threads - 1) / threads;
+  const std::size_t shared = (2 * static_cast<std::size_t>(n_cells) +
+                              static_cast<std::size_t>(quad.chain_len / 2) + 2 * kWarp) *
+                             sizeof(double);
+  if (one_cell) {
+    // At most 1024 cells: (2 n + chain_len / 2 + 64) doubles stay under 48 KiB.
+    scan_sweep_kernel<true><<<n_groups, threads, shared, stream>>>(
+        cells, inverse, inverse + n_ord * kInvStride, q, psi_prev, sd_prev, psi_in, quad.mu,
+        quad.weight, quad.alpha, quad.tau, quad.sd_mu, psi, sd, n_cells, n_groups,
+        quad.n_angles, quad.n_chains, quad.chain_len, inv_cdt, curved, k_cells);
+  } else {
+    static std::size_t configured_shared_scan = 0;
+    if (shared > 48U * 1024U && shared > configured_shared_scan) {
+      cuda_check(cudaFuncSetAttribute(scan_sweep_kernel<false>,
+                                      cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                      static_cast<int>(shared)),
+                 "sn_ld scan sweep shared memory attribute failed");
+      configured_shared_scan = shared;
+    }
+    scan_sweep_kernel<false><<<n_groups, threads, shared, stream>>>(
+        cells, inverse, inverse + n_ord * kInvStride, q, psi_prev, sd_prev, psi_in, quad.mu,
+        quad.weight, quad.alpha, quad.tau, quad.sd_mu, psi, sd, n_cells, n_groups,
+        quad.n_angles, quad.n_chains, quad.chain_len, inv_cdt, curved, k_cells);
+  }
+  cuda_check(cudaGetLastError(), "sn_ld scan sweep launch failed");
 }
 
 void sweep(const double* cells, const double* sigma_t, const double* q, const double* psi_prev,
@@ -1380,6 +1761,12 @@ __global__ void opacity_post_kernel(const std::uint8_t* __restrict__ is_void,
 // (1 - kbar) sigma_a,xi + 1/(c dt); the GMRES scale of every node
 // sum_g sigma_a,g (|phi_ref| + c B) and the initial absorption-rate density
 // sum_g sigma_a,g phi_ref.
+// Doubles of shared memory per group and warp of linearize_kernel.
+constexpr int kLinearizeShared = 7;
+// ... and of matter_update_kernel: b_g, d(T^4 b_g)/dT and the four boundary
+// arrays of planck_boundaries_warp.
+constexpr int kMatterUpdateShared = 6;
+
 template <bool EOS_TAIL>
 __global__ void linearize_kernel(const ClosureArgs a,
                                  const std::uint8_t* __restrict__ is_void,
@@ -1403,9 +1790,11 @@ __global__ void linearize_kernel(const ClosureArgs a,
                                  const int G,
                                  const double dt,
                                  const double inv_cdt) {
-  // One warp per node: the Planck terms of the groups in parallel over the
-  // lanes (shared memory, 3 G doubles per warp), the sums over the groups in
-  // the group order by every lane.
+  // One warp per node: the Planck terms of the groups and the groups' terms of
+  // the sums in parallel over the lanes (shared memory, kLinearizeShared G
+  // doubles per warp), the sums over the groups in the group order by every
+  // lane, each the same additions as when every lane formed every term
+  // (until 2026-10-02: a group's divisions were repeated on all 32 lanes).
   extern __shared__ double warp_shared[];
   const int lane = static_cast<int>(threadIdx.x) & (kWarp - 1);
   const int warp = static_cast<int>(threadIdx.x) / kWarp;
@@ -1414,9 +1803,14 @@ __global__ void linearize_kernel(const ClosureArgs a,
   if (node >= two_n) {
     return;
   }
-  double* sh_cP = warp_shared + static_cast<std::size_t>(warp) * 3 * static_cast<std::size_t>(G);
+  double* sh_cP = warp_shared +
+                  static_cast<std::size_t>(warp) * kLinearizeShared * static_cast<std::size_t>(G);
   double* sh_cdP = sh_cP + G;
   double* sh_B = sh_cdP + G;
+  double* sh_sa = sh_B + G;   // sigma_a of the group
+  double* sh_ph = sh_sa + G;  // the reference scalar flux (0 without one)
+  double* sh_sc = sh_ph + G;  // |phi| + c B (the scale's term)
+  double* sh_st = sh_sc + G;  // sigma_a + sigma_s
   const int c = node >> 1;
   const double cl_light = core::constants::c_light;
   const bool vd = cell_void(is_void, c);
@@ -1439,6 +1833,14 @@ __global__ void linearize_kernel(const ClosureArgs a,
     sh_cP[g] = cl_light * spe * B;
     sh_cdP[g] = cl_light * spe * Bp;
     sh_B[g] = B;
+    const std::size_t gi = static_cast<std::size_t>(g) * two_n + node;
+    const std::size_t ci = static_cast<std::size_t>(c) * G + g;
+    const double sa = sigma_a[ci];
+    const double ph = (phi_ref != nullptr) ? phi_ref[gi] : 0.0;
+    sh_sa[g] = sa;
+    sh_ph[g] = ph;
+    sh_sc[g] = fabs(ph) + cl_light * B;
+    sh_st[g] = sa + sigma_s[ci];
   }
   __syncwarp();
   double sum_P = 0.0;
@@ -1447,18 +1849,12 @@ __global__ void linearize_kernel(const ClosureArgs a,
   double sc = 0.0;
   double sum_t = 0.0;
   for (int g = 0; g < G; ++g) {
-    const std::size_t gi = static_cast<std::size_t>(g) * two_n + node;
-    const std::size_t ci = static_cast<std::size_t>(c) * G + g;
-    const double sa = sigma_a[ci];
-    const double cP = sh_cP[g];
-    const double cdP = sh_cdP[g];
-    const double B = sh_B[g];
-    sum_P += cP;
-    sum_dP += cdP;
-    const double ph = (phi_ref != nullptr) ? phi_ref[gi] : 0.0;
-    A0 += sa * ph;
-    sc += sa * (fabs(ph) + cl_light * B);
-    sum_t += sa + sigma_s[ci];
+    const double sa = sh_sa[g];
+    sum_P += sh_cP[g];
+    sum_dP += sh_cdP[g];
+    A0 += sa * sh_ph[g];
+    sc += sa * sh_sc[g];
+    sum_t += sh_st[g];
   }
   double D = 0.0;
   double W = 0.0;
@@ -1468,11 +1864,13 @@ __global__ void linearize_kernel(const ClosureArgs a,
     W = dt * sum_P + cl.rho * (e_k[node] - e_n[node]);
   }
   const bool coupled = !vd && isfinite(D) && D > 0.0;
-  double kb = 0.0;
-  double sxi = 0.0;
-  double sxa = 0.0;
-  double sxinv = 0.0;
-  for (int g = 0; g < G; ++g) {
+  // The groups' terms in parallel over the lanes (kappa, xi and xi / sigma_e
+  // over the Planck slots, which the sums above no longer read).
+  double* sh_kap = sh_B;
+  double* sh_xi = sh_sc;
+  double* sh_xinv = sh_st;
+  __syncwarp();
+  for (int g = lane; g < G; g += kWarp) {
     const std::size_t gi = static_cast<std::size_t>(g) * two_n + node;
     const std::size_t ci = static_cast<std::size_t>(c) * G + g;
     const double cP = sh_cP[g];
@@ -1483,16 +1881,25 @@ __global__ void linearize_kernel(const ClosureArgs a,
       f = cP - chi * W / D;
       kap = chi * dt / D;
     }
-    if ((g & (kWarp - 1)) == lane) {
-      fixed[gi] = f;
-      kappa[gi] = kap;
-    }
-    kb += kap;
-    const double sa = sigma_a[ci];
+    fixed[gi] = f;
+    kappa[gi] = kap;
+    const double sa = sh_sa[g];
     const double xi = kap / (sa + inv_cdt);
+    sh_kap[g] = kap;
+    sh_xi[g] = xi;
+    sh_xinv[g] = xi / (sa + sigma_s[ci] + inv_cdt);
+  }
+  __syncwarp();
+  double kb = 0.0;
+  double sxi = 0.0;
+  double sxa = 0.0;
+  double sxinv = 0.0;
+  for (int g = 0; g < G; ++g) {
+    const double xi = sh_xi[g];
+    kb += sh_kap[g];
     sxi += xi;
-    sxa += xi * sa;
-    sxinv += xi / (sa + sigma_s[ci] + inv_cdt);
+    sxa += xi * sh_sa[g];
+    sxinv += sh_xinv[g];
   }
   if (lane != 0) {
     return;
@@ -1721,14 +2128,6 @@ __global__ void fill_kernel(double* __restrict__ v, const double value, const in
   }
 }
 
-__global__ void scale_vector_kernel(const double* __restrict__ w, const double alpha,
-                                    double* __restrict__ v, const int m) {
-  const int k = blockIdx.x * blockDim.x + threadIdx.x;
-  if (k < m) {
-    v[k] = alpha * w[k];
-  }
-}
-
 // x += s * sum_i y[i] Z_i.
 __global__ void solution_update_kernel(const double* __restrict__ Z,
                                        const std::size_t ld,
@@ -1803,6 +2202,182 @@ __global__ void matvec_finish_kernel(const double* __restrict__ z,
   }
 }
 
+// ---------------------------------------------------------------------------------------------
+// The emission GMRES's small algebra on the device: the start of a restart cycle (beta, the
+// reference norm and the target of the first cycle, the decision), one Arnoldi column (the
+// Hessenberg column from the two Gram-Schmidt passes' coefficients, the Givens rotations, the
+// rotated right-hand side, the decision) and the back substitution, by one thread in the order of
+// the host loop they replace, each product and sum rounded on its own (the __d*_rn intrinsics:
+// this file is compiled with multiply-add contraction allowed). The host reads only the decision.
+//
+// The control block (doubles): the scalars below, then H ((m + 1) rows of m), the Givens cosines
+// and sines (m each), the rotated right-hand side g (m + 1), the solution coefficients y (m) and
+// the preconditioner audit's residual ratios (kCtlAuditMax).
+constexpr int kCtlDotR = 0;       // |r|^2 (dots_kernel)
+constexpr int kCtlDotT1 = 1;      // |T x / s|^2, first cycle
+constexpr int kCtlDotT2 = 2;      // |x / s|^2, first cycle
+constexpr int kCtlBeta = 3;
+constexpr int kCtlRef = 4;        // < 0 until the first cycle sets it
+constexpr int kCtlTarget = 5;
+constexpr int kCtlRes = 6;        // beta / ref of the last cycle start
+constexpr int kCtlStatus = 7;     // 0 go on, 1 converged, 2 stop
+constexpr int kCtlInvScale = 8;   // 1 / beta or 1 / h_{j+1,j}
+constexpr int kCtlScaleOk = 9;    // 1 when the next Krylov vector is formed
+constexpr int kCtlAuditBeta0 = 10;
+constexpr int kCtlAuditCount = 11;
+constexpr int kCtlHeader = 16;
+constexpr int kCtlAuditMax = 8;
+
+struct GmresCtlLayout {
+  int m;
+  __host__ __device__ int H(const int i, const int j) const { return kCtlHeader + i * m + j; }
+  __host__ __device__ int cs(const int i) const { return kCtlHeader + (m + 1) * m + i; }
+  __host__ __device__ int sn(const int i) const { return kCtlHeader + (m + 1) * m + m + i; }
+  __host__ __device__ int g(const int i) const { return kCtlHeader + (m + 1) * m + 2 * m + i; }
+  __host__ __device__ int y(const int i) const {
+    return kCtlHeader + (m + 1) * m + 3 * m + 1 + i;
+  }
+  __host__ __device__ int audit(const int i) const {
+    return kCtlHeader + (m + 1) * m + 4 * m + 1 + i;
+  }
+  __host__ __device__ int size() const { return audit(kCtlAuditMax); }
+};
+
+// std::sqrt(std::max(h, 0.0))
+__device__ inline double sqrt_nonneg(const double h) { return sqrt((h < 0.0) ? 0.0 : h); }
+
+// A new solve: the reference norm unset, no audit entries.
+__global__ void gmres_reset_kernel(double* __restrict__ ctl) {
+  ctl[kCtlRef] = -1.0;
+  ctl[kCtlAuditBeta0] = -1.0;
+  ctl[kCtlAuditCount] = 0.0;
+  ctl[kCtlStatus] = 0.0;
+  ctl[kCtlScaleOk] = 0.0;
+}
+
+// The start of a restart cycle from |r|^2 (and, in the first cycle, |T x / s|^2 and |x / s|^2):
+// beta = |r|; in the first cycle ref = max(|T x / s|, |x / s|) (1 when not positive and finite)
+// and target = max(inner_tol beta, 1e-14 ref) — this Newton iteration's initial residual reduced
+// by inner_tol (so that every iteration is a Newton step, also when the previous solution already
+// satisfies the new system loosely), down to the rounding level of the solution; converged when
+// beta <= target, stop when beta / ref is not finite or its >= max_inner; otherwise the Krylov
+// basis starts from r / beta with g = beta e_0.
+__global__ void gmres_start_kernel(double* __restrict__ ctl, const int m, const int its,
+                                   const int max_inner, const double inner_tol) {
+  const GmresCtlLayout L{m};
+  const double beta = sqrt_nonneg(ctl[kCtlDotR]);
+  double ref = ctl[kCtlRef];
+  double target = ctl[kCtlTarget];
+  if (ref < 0.0) {
+    const double n1 = sqrt_nonneg(ctl[kCtlDotT1]);
+    const double n2 = sqrt_nonneg(ctl[kCtlDotT2]);
+    ref = (n1 < n2) ? n2 : n1;
+    if (!(ref > 0.0) || !isfinite(ref)) {
+      ref = 1.0;
+    }
+    const double t1 = __dmul_rn(inner_tol, beta);
+    const double t2 = __dmul_rn(1.0e-14, ref);
+    target = (t1 < t2) ? t2 : t1;
+    ctl[kCtlRef] = ref;
+    ctl[kCtlTarget] = target;
+  }
+  const double res = beta / ref;
+  ctl[kCtlBeta] = beta;
+  ctl[kCtlRes] = res;
+  if (ctl[kCtlAuditBeta0] < 0.0) {
+    ctl[kCtlAuditBeta0] = (beta > 0.0) ? beta : 1.0;
+  }
+  double status = 0.0;
+  if (beta <= target) {
+    status = 1.0;
+  } else if (!isfinite(res) || its >= max_inner) {
+    status = 2.0;
+  }
+  ctl[kCtlStatus] = status;
+  ctl[kCtlScaleOk] = (status == 0.0) ? 1.0 : 0.0;
+  if (status == 0.0) {
+    ctl[kCtlInvScale] = 1.0 / beta;
+    ctl[L.g(0)] = beta;
+    for (int i = 1; i <= m; ++i) {
+      ctl[L.g(i)] = 0.0;
+    }
+  }
+}
+
+// Arnoldi column j from the two passes' coefficients h1, h2 (nv = j + 1 projections and, last,
+// |w|^2 of the second pass): H(i, j) = h1[i] + h2[i], h_{j+1,j} = sqrt(max(|w|^2 - sum h2[i]^2,
+// 0)) (the next Krylov vector w / h_{j+1,j} when it is positive and finite), the earlier rotations
+// on the column, the new rotation (hypot) and g; stop when |g_{j+1}| <= target or no next vector.
+__global__ void gmres_arnoldi_kernel(double* __restrict__ ctl, const double* __restrict__ h1,
+                                     const double* __restrict__ h2, const int j, const int m,
+                                     const int audit) {
+  const GmresCtlLayout L{m};
+  const int nv = j + 1;
+  double proj2 = 0.0;
+  for (int i = 0; i < nv; ++i) {
+    ctl[L.H(i, j)] = __dadd_rn(h1[i], h2[i]);
+    proj2 = __dadd_rn(proj2, __dmul_rn(h2[i], h2[i]));
+  }
+  const double hn = sqrt_nonneg(__dsub_rn(h2[nv], proj2));
+  ctl[L.H(j + 1, j)] = hn;
+  const bool next_ok = hn > 0.0 && isfinite(hn);
+  ctl[kCtlScaleOk] = next_ok ? 1.0 : 0.0;
+  if (next_ok) {
+    ctl[kCtlInvScale] = 1.0 / hn;
+  }
+  for (int i = 0; i < j; ++i) {
+    const double a0 = ctl[L.H(i, j)];
+    const double a1 = ctl[L.H(i + 1, j)];
+    const double c = ctl[L.cs(i)];
+    const double sv = ctl[L.sn(i)];
+    ctl[L.H(i, j)] = __dadd_rn(__dmul_rn(c, a0), __dmul_rn(sv, a1));
+    ctl[L.H(i + 1, j)] = __dadd_rn(__dmul_rn(-sv, a0), __dmul_rn(c, a1));
+  }
+  const double a0 = ctl[L.H(j, j)];
+  const double a1 = ctl[L.H(j + 1, j)];
+  const double rr = rounded_hypot(a0, a1);  // std::hypot on the host before
+  const double cj = (rr > 0.0) ? a0 / rr : 1.0;
+  const double sj = (rr > 0.0) ? a1 / rr : 0.0;
+  ctl[L.cs(j)] = cj;
+  ctl[L.sn(j)] = sj;
+  ctl[L.H(j, j)] = rr;
+  ctl[L.H(j + 1, j)] = 0.0;
+  const double gj = ctl[L.g(j)];
+  const double gj1 = __dmul_rn(-sj, gj);
+  ctl[L.g(j + 1)] = gj1;
+  ctl[L.g(j)] = __dmul_rn(cj, gj);
+  const int count = static_cast<int>(ctl[kCtlAuditCount]);
+  if (audit != 0 && count < kCtlAuditMax) {
+    ctl[L.audit(count)] = fabs(gj1) / ctl[kCtlAuditBeta0];
+    ctl[kCtlAuditCount] = static_cast<double>(count + 1);
+  }
+  ctl[kCtlStatus] = (fabs(gj1) <= ctl[kCtlTarget] || !next_ok) ? 2.0 : 0.0;
+}
+
+// y from H y = g over the first jj columns (upper triangular after the rotations); 0 for a zero
+// pivot.
+__global__ void gmres_backsub_kernel(double* __restrict__ ctl, const int jj, const int m) {
+  const GmresCtlLayout L{m};
+  for (int i = jj - 1; i >= 0; --i) {
+    double acc = ctl[L.g(i)];
+    for (int k = i + 1; k < jj; ++k) {
+      acc = __dsub_rn(acc, __dmul_rn(ctl[L.H(i, k)], ctl[L.y(k)]));
+    }
+    const double d = ctl[L.H(i, i)];
+    ctl[L.y(i)] = (d != 0.0) ? acc / d : 0.0;
+  }
+}
+
+// v = (1 / beta or 1 / h_{j+1,j}) w from the control block, when the vector is formed.
+__global__ void scale_vector_ctl_kernel(const double* __restrict__ w,
+                                        const double* __restrict__ ctl,
+                                        double* __restrict__ v, const int m) {
+  const int k = blockIdx.x * blockDim.x + threadIdx.x;
+  if (k < m && ctl[kCtlScaleOk] != 0.0) {
+    v[k] = ctl[kCtlInvScale] * w[k];
+  }
+}
+
 // Scattering source iteration: the DSA source sigma_s (phi_half - phi_s).
 __global__ void scatter_residual_kernel(const double* __restrict__ sigma_s,
                                         const double* __restrict__ phi_half,
@@ -1843,6 +2418,107 @@ __global__ void scatter_update_kernel(const double* __restrict__ sigma_s,
   phi_s[idx] = nv;
 }
 
+// The group Planck fractions b_g and their temperature slopes db_g strictly
+// inside a table interval, by a full warp, with each group boundary evaluated
+// once: PlanckTableDeviceView::interpolate_b_and_dT forms group g from the
+// cumulative C or tail D value (and slope) at its two boundaries g - 1 and g,
+// so every boundary was evaluated for both groups beside it (2026-10-02).
+// planck_boundaries_warp evaluates, per boundary k, C_k (value and slope)
+// where group k or k + 1 takes the cumulative form and D_k where group k takes
+// the tail form (planck_log_hermite / planck_log_hermite_dT, as
+// planck_fraction_in_interval and planck_fraction_slope_in_interval do);
+// planck_fraction_from_boundaries forms each group's b_g and db_g from them
+// with those functions' branches. sh_bd: 4 (n_groups - 1) doubles.
+__device__ inline void planck_boundaries_warp(const PlanckTableDeviceView& planck,
+                                              const PlanckTableDeviceView::Location& loc,
+                                              const double T, const int lane,
+                                              double* __restrict__ sh_bd) {
+  const int n_groups = planck.n_groups;
+  const int nb = n_groups - 1;
+  const int base0 = loc.lo * n_groups;
+  const int base1 = loc.hi * n_groups;
+  const double du = loc.du;
+  const double w = loc.w;
+  const double wc = fmin(fmax(w, 0.0), 1.0);
+  const auto value = [&](const double* x, const double* ln_x, const double* dln_x, const int k) {
+    if (w <= 0.0) {
+      return x[base0 + k];
+    }
+    if (w >= 1.0) {
+      return x[base1 + k];
+    }
+    return planck_log_hermite(ln_x, dln_x, base0 + k, base1 + k, du, w);
+  };
+  for (int k = lane; k < nb; k += kWarp) {
+    const bool cum_k = planck.cdf_g[base0 + k] < 0.5 && planck.cdf_g[base1 + k] < 0.5;
+    const bool cum_k1 = k + 1 < nb && planck.cdf_g[base0 + k + 1] < 0.5 &&
+                        planck.cdf_g[base1 + k + 1] < 0.5;
+    if (cum_k || cum_k1) {
+      sh_bd[k] = value(planck.cdf_g, planck.ln_cdf_g, planck.dln_cdf_g, k);
+      sh_bd[nb + k] = planck_log_hermite_dT(planck.ln_cdf_g, planck.dln_cdf_g, base0 + k,
+                                            base1 + k, du, wc, T);
+    }
+    if (!cum_k) {
+      sh_bd[2 * nb + k] = value(planck.tail_g, planck.ln_tail_g, planck.dln_tail_g, k);
+      sh_bd[3 * nb + k] = planck_log_hermite_dT(planck.ln_tail_g, planck.dln_tail_g, base0 + k,
+                                                base1 + k, du, wc, T);
+    }
+  }
+}
+
+__device__ inline void planck_fraction_from_boundaries(const PlanckTableDeviceView& planck,
+                                                       const PlanckTableDeviceView::Location& loc,
+                                                       const int g,
+                                                       const double* __restrict__ sh_bd,
+                                                       double& b, double& db) {
+  const int n_groups = planck.n_groups;
+  const int nb = n_groups - 1;
+  const int base0 = loc.lo * n_groups;
+  const int base1 = loc.hi * n_groups;
+  const auto cumulative_side = [&](const int k) {
+    return k < 0 ||
+           (k < n_groups - 1 && planck.cdf_g[base0 + k] < 0.5 && planck.cdf_g[base1 + k] < 0.5);
+  };
+  const double* C = sh_bd;
+  const double* dC = sh_bd + nb;
+  const double* D = sh_bd + 2 * nb;
+  const double* dD = sh_bd + 3 * nb;
+  const bool g_cum = cumulative_side(g);
+  const bool gm1_cum = cumulative_side(g - 1);
+  double fraction = 0.0;
+  if (g_cum) {
+    const double C_g = C[g];
+    const double C_gm1 = (g == 0) ? 0.0 : C[g - 1];
+    fraction = C_g - C_gm1;
+  } else if (!gm1_cum) {
+    const double D_g = (g == n_groups - 1) ? 0.0 : D[g];
+    const double D_gm1 = D[g - 1];
+    fraction = D_gm1 - D_g;
+  } else {
+    const double D_g = (g == n_groups - 1) ? 0.0 : D[g];
+    const double C_gm1 = (g == 0) ? 0.0 : C[g - 1];
+    fraction = (1.0 - D_g) - C_gm1;
+  }
+  b = fmax(fraction, 0.0);
+  if (b <= 0.0) {
+    db = 0.0;
+    return;
+  }
+  if (g_cum) {
+    const double dC_g = dC[g];
+    const double dC_gm1 = (g == 0) ? 0.0 : dC[g - 1];
+    db = dC_g - dC_gm1;
+  } else if (!gm1_cum) {
+    const double dD_g = (g == n_groups - 1) ? 0.0 : dD[g];
+    const double dD_gm1 = dD[g - 1];
+    db = dD_gm1 - dD_g;
+  } else {
+    const double dD_g = (g == n_groups - 1) ? 0.0 : dD[g];
+    const double dC_gm1 = (g == 0) ? 0.0 : dC[g - 1];
+    db = -dD_g - dC_gm1;
+  }
+}
+
 // The node's own energy balance with its absorption-rate density held,
 // f(T) = rho (e(T) - e^n) + dt sum_g c sigma_pe,g B_g(T) - dt A, increasing in
 // T: its root is the next linearization point of the Newton iteration. It is
@@ -1857,33 +2533,43 @@ __device__ double node_balance_temperature(const CellClosure<EOS_TAIL>& cl,
                                            const double* __restrict__ sigma_pe_c, const int G,
                                            const double e_n, const double A, const double dt,
                                            const double T_guess, double* __restrict__ sh_b,
-                                           double* __restrict__ sh_db, const int lane) {
+                                           double* __restrict__ sh_db,
+                                           double* __restrict__ sh_bd, const int lane) {
   const double k_emit = dt * core::constants::c_light * core::constants::a_eV;
   // Called by the whole warp with the same arguments: the group fractions
-  // in parallel over the lanes, the sums in the group order by every lane.
+  // and the groups' derivative terms in parallel over the lanes, the sums in
+  // the group order by every lane (until 2026-10-02 every lane also formed
+  // every group's derivative term; the sums are the same additions).
   const auto eval = [&](const double T, double& fp) {
     const PlanckTableDeviceView::Location loc = planck.locate_b(T);
     const double T3 = T * T * T;
     const double T4 = T3 * T;
+    const bool by_boundary = G != 1 && loc.kind == 2 && planck.n_groups == G;
+    if (by_boundary) {
+      planck_boundaries_warp(planck, loc, T, lane, sh_bd);
+      __syncwarp();
+    }
     for (int g = lane; g < G; g += kWarp) {
       double b = 1.0;
       double db = 0.0;
       if (G != 1) {
-        planck.interpolate_b_and_dT(g, loc, T, b, db);
+        if (by_boundary) {
+          planck_fraction_from_boundaries(planck, loc, g, sh_bd, b, db);
+        } else {
+          planck.interpolate_b_and_dT(g, loc, T, b, db);
+        }
         b = fmax(b, 0.0);
       }
       sh_b[g] = b;
-      sh_db[g] = db;
+      sh_db[g] = fmax(4.0 * T3 * b + T4 * db, 0.0);  // d(T^4 b_g)/dT, clipped at 0
     }
     __syncwarp();
     double P = 0.0;
     double dP = 0.0;
     for (int g = 0; g < G; ++g) {
-      const double b = sh_b[g];
-      const double db = sh_db[g];
       const double sg = sigma_pe_c[g];
-      P += sg * b;
-      dP += sg * fmax(4.0 * T3 * b + T4 * db, 0.0);
+      P += sg * sh_b[g];
+      dP += sg * sh_db[g];
     }
     __syncwarp();
     fp = cl.rho * cl.heat_capacity(T) + k_emit * dP;
@@ -1963,7 +2649,7 @@ __global__ void matter_update_kernel(const ClosureArgs a,
                                      const int G,
                                      const double dt) {
   // One warp per node (the balance temperature's group sums in parallel
-  // over the lanes, 2 G doubles of shared memory per warp); lane 0 writes.
+  // over the lanes, 6 G doubles of shared memory per warp); lane 0 writes.
   extern __shared__ double warp_shared[];
   const int lane = static_cast<int>(threadIdx.x) & (kWarp - 1);
   const int warp = static_cast<int>(threadIdx.x) / kWarp;
@@ -1972,8 +2658,10 @@ __global__ void matter_update_kernel(const ClosureArgs a,
   if (node >= two_n) {
     return;
   }
-  double* sh_b = warp_shared + static_cast<std::size_t>(warp) * 2 * static_cast<std::size_t>(G);
+  double* sh_b = warp_shared + static_cast<std::size_t>(warp) * kMatterUpdateShared *
+                                    static_cast<std::size_t>(G);
   double* sh_db = sh_b + G;
+  double* sh_bd = sh_db + G;  // 4 (G - 1) boundary values and slopes
   const int c = node >> 1;
   if (cell_void(is_void, c)) {
     if (lane == 0) {
@@ -2014,7 +2702,7 @@ __global__ void matter_update_kernel(const ClosureArgs a,
   // point, and far from it the balance with them overshoots.
   const double T_bal = node_balance_temperature(
       cl, planck, sigma_pe + static_cast<std::size_t>(c) * G, G, e_start, fmax(A, 0.0), dt,
-      T_cons, sh_b, sh_db, lane);
+      T_cons, sh_b, sh_db, sh_bd, lane);
   const double step = fmin(fmax(T_bal, T_old / kPointStep), T_old * kPointStep) - T_old;
   double om = om_prev;
   const bool alternating =
@@ -2444,18 +3132,6 @@ void advance_step_impl(core::State& state, const core::Config& cfg, const Planck
     cuda_check(cudaMemcpy(out, d_small, 2 * sizeof(double), cudaMemcpyDeviceToHost),
                "sn_ld max reduction copy failed");
   };
-  auto dots = [&](const double* V, const int nvec, const double* v, double* host_out) {
-    dots_kernel<<<nvec, kReduceThreads>>>(V, two_n, v, d_small, static_cast<int>(two_n));
-    cuda_check(cudaGetLastError(), "sn_ld dot launch failed");
-    cuda_check(cudaMemcpy(host_out, d_small, static_cast<std::size_t>(nvec) * sizeof(double),
-                          cudaMemcpyDeviceToHost),
-               "sn_ld dot copy failed");
-  };
-  auto norm2 = [&](const double* v) {
-    double h = 0.0;
-    dots(v, 1, v, &h);
-    return std::sqrt(std::max(h, 0.0));
-  };
 
   bool has_scatter = false;
   int total_sweeps = 0;
@@ -2532,80 +3208,91 @@ void advance_step_impl(core::State& state, const core::Config& cfg, const Planck
   int gmres_iterations = 0;
   bool use_precond = true;
   std::vector<double> audit_ratios;
-  double audit_beta0 = -1.0;
+  // The small algebra (norms, the Hessenberg columns and their rotations, the back substitution)
+  // runs on the device in the control block ctl; the host reads the decision after each cycle
+  // start and each Arnoldi column.
+  const GmresCtlLayout ctl_layout{m_restart};
+  double* ctl = scratch_doubles("sn_ld:gmres_ctl", static_cast<std::size_t>(ctl_layout.size()));
+  auto read_ctl = [&](const int first, const int count, double* out) {
+    cuda_check(cudaMemcpy(out, ctl + first, static_cast<std::size_t>(count) * sizeof(double),
+                          cudaMemcpyDeviceToHost),
+               "sn_ld GMRES control copy failed");
+  };
+  // Z_j = M V_j: the grey low-order correction (or a copy without it).
+  auto precondition = [&](const int j) {
+    const double* vj = Vk + static_cast<std::size_t>(j) * two_n;
+    double* zj = Zk + static_cast<std::size_t>(j) * two_n;
+    if (!use_precond) {
+      cuda_check(cudaMemcpyAsync(zj, vj, two_n * sizeof(double), cudaMemcpyDeviceToDevice),
+                 "sn_ld unpreconditioned copy failed");
+    } else {
+      precond_rhs_kernel<<<node_grid, kBlock>>>(kbar, scale, vj, rhs1, static_cast<int>(two_n));
+      cuda_check(cudaGetLastError(), "sn_ld preconditioner source launch failed");
+      p1_apply(p1_pre, rhs1, Phi1, n, 1);
+      precond_apply_kernel<<<node_grid, kBlock>>>(vj, sabar, Phi1, scale, zj,
+                                                  static_cast<int>(two_n));
+      cuda_check(cudaGetLastError(), "sn_ld preconditioner launch failed");
+    }
+  };
   auto solve_emission = [&](const double* phi_start, bool& converged) {
     converged = false;
     int its = 0;
     audit_ratios.clear();
-    audit_beta0 = -1.0;
-    std::vector<double> H(static_cast<std::size_t>(m_restart + 1) * m_restart, 0.0);
-    std::vector<double> cs(static_cast<std::size_t>(m_restart), 0.0);
-    std::vector<double> sn_rot(static_cast<std::size_t>(m_restart), 0.0);
-    std::vector<double> gv(static_cast<std::size_t>(m_restart + 1), 0.0);
-    std::vector<double> h1(static_cast<std::size_t>(m_restart + 2), 0.0);
-    std::vector<double> h2(static_cast<std::size_t>(m_restart + 2), 0.0);
-    std::vector<double> y(static_cast<std::size_t>(m_restart), 0.0);
-    const auto Hij = [&](const int i, const int j) -> double& {
-      return H[static_cast<std::size_t>(i) * m_restart + j];
-    };
+    gmres_reset_kernel<<<1, 1>>>(ctl);
+    cuda_check(cudaGetLastError(), "sn_ld GMRES reset launch failed");
     transport(true, x, nullptr, psi_aff, sd_aff, phi_aff, A_aff, phi_start);
-    double ref = -1.0;
-    double target = 0.0;
+    bool first = true;
     double res = std::numeric_limits<double>::infinity();
     while (true) {
       residual_kernel<<<node_grid, kBlock>>>(A_aff, x, scale, r, tmp1, tmp2,
                                              static_cast<int>(two_n));
       cuda_check(cudaGetLastError(), "sn_ld residual launch failed");
-      const double beta = norm2(r);
-      if (ref < 0.0) {
-        ref = std::max(norm2(tmp1), norm2(tmp2));
-        if (!(ref > 0.0) || !std::isfinite(ref)) {
-          ref = 1.0;
-        }
-        // Reduce this Newton iteration's initial residual by inner_tol (so
-        // that every iteration is a Newton step, also when the previous
-        // solution already satisfies the new system loosely), down to the
-        // rounding level of the solution.
-        target = std::max(inner_tol * beta, 1.0e-14 * ref);
+      // |r|^2 and, in the first cycle, the reference norms' squares (each one block of
+      // dots_kernel, as before)
+      dots_kernel<<<1, kReduceThreads>>>(r, two_n, r, ctl + kCtlDotR, static_cast<int>(two_n));
+      if (first) {
+        dots_kernel<<<1, kReduceThreads>>>(tmp1, two_n, tmp1, ctl + kCtlDotT1,
+                                           static_cast<int>(two_n));
+        dots_kernel<<<1, kReduceThreads>>>(tmp2, two_n, tmp2, ctl + kCtlDotT2,
+                                           static_cast<int>(two_n));
       }
-      res = beta / ref;
-      if (audit_beta0 < 0.0) {
-        audit_beta0 = (beta > 0.0) ? beta : 1.0;
+      cuda_check(cudaGetLastError(), "sn_ld norm launch failed");
+      first = false;
+      gmres_start_kernel<<<1, 1>>>(ctl, m_restart, its, max_inner, inner_tol);
+      cuda_check(cudaGetLastError(), "sn_ld GMRES start launch failed");
+      // V_0 and its preconditioned Z_0 are queued before the host reads the
+      // decision, and each column queues the next column's Z before reading
+      // its own, so the device has work while the host waits for the copy
+      // (2026-10-02). They write only V_0, Z_j and the preconditioner's
+      // scratch (rhs1, Phi1), which nothing reads when the decision ends the
+      // cycle or the solve: the device runs the same kernels in the same
+      // order, with the same values, whenever the iteration continues.
+      const bool first_column = m_restart > 0 && its < max_inner;
+      if (first_column) {
+        scale_vector_ctl_kernel<<<node_grid, kBlock>>>(r, ctl, Vk, static_cast<int>(two_n));
+        cuda_check(cudaGetLastError(), "sn_ld Krylov start launch failed");
+        precondition(0);
       }
-      if (beta <= target) {
+      double decision[2] = {0.0, 0.0};  // res, status
+      read_ctl(kCtlRes, 2, decision);
+      res = decision[0];
+      if (decision[1] == 1.0) {
         converged = true;
         break;
       }
-      if (!std::isfinite(res) || its >= max_inner) {
+      if (decision[1] != 0.0) {
         break;
       }
-      scale_vector_kernel<<<node_grid, kBlock>>>(r, 1.0 / beta, Vk, static_cast<int>(two_n));
-      cuda_check(cudaGetLastError(), "sn_ld Krylov start launch failed");
-      std::fill(gv.begin(), gv.end(), 0.0);
-      gv[0] = beta;
       int jj = 0;
       for (int j = 0; j < m_restart && its < max_inner; ++j) {
-        double* vj = Vk + static_cast<std::size_t>(j) * two_n;
         double* zj = Zk + static_cast<std::size_t>(j) * two_n;
-        if (!use_precond) {
-          cuda_check(cudaMemcpyAsync(zj, vj, two_n * sizeof(double), cudaMemcpyDeviceToDevice),
-                     "sn_ld unpreconditioned copy failed");
-        } else {
-          precond_rhs_kernel<<<node_grid, kBlock>>>(kbar, scale, vj, rhs1,
-                                                    static_cast<int>(two_n));
-          cuda_check(cudaGetLastError(), "sn_ld preconditioner source launch failed");
-          p1_apply(p1_pre, rhs1, Phi1, n, 1);
-          precond_apply_kernel<<<node_grid, kBlock>>>(vj, sabar, Phi1, scale, zj,
-                                                      static_cast<int>(two_n));
-          cuda_check(cudaGetLastError(), "sn_ld preconditioner launch failed");
-        }
         transport(false, zj, scale, psi_hom, nullptr, phi_hom, A_hom, nullptr);
         matvec_finish_kernel<<<node_grid, kBlock>>>(zj, A_hom, scale, w, static_cast<int>(two_n));
         cuda_check(cudaGetLastError(), "sn_ld operator launch failed");
         // Classical Gram-Schmidt with one reorthogonalization, both passes on
         // the device (each pass: the projections on V_0..V_j and |w|^2 in one
-        // reduction, then w -= V h from the device coefficients); one copy of
-        // both passes' coefficients to the host. The norm of the rest from
+        // reduction, then w -= V h from the device coefficients); the Hessenberg
+        // column from both passes' coefficients, the norm of the rest from
         // |w|^2 - |h|^2 of the second pass.
         const int nv = j + 1;
         dots_norm_kernel<<<nv + 1, kReduceThreads>>>(Vk, two_n, w, d_small, nv,
@@ -2620,71 +3307,42 @@ void advance_step_impl(core::State& state, const core::Config& cfg, const Planck
         orth_update_kernel<<<node_grid, kBlock>>>(Vk, two_n, d_small2, nv, w,
                                                   static_cast<int>(two_n));
         cuda_check(cudaGetLastError(), "sn_ld orthogonalization launch failed");
-        cuda_check(cudaMemcpy(h1.data(), d_small, static_cast<std::size_t>(nv + 1) * sizeof(double),
-                              cudaMemcpyDeviceToHost),
-                   "sn_ld projection copy failed");
-        cuda_check(cudaMemcpy(h2.data(), d_small2, static_cast<std::size_t>(nv + 1) * sizeof(double),
-                              cudaMemcpyDeviceToHost),
-                   "sn_ld projection copy failed");
-        double proj2 = 0.0;
-        for (int i = 0; i < nv; ++i) {
-          Hij(i, j) = h1[static_cast<std::size_t>(i)] + h2[static_cast<std::size_t>(i)];
-          proj2 += h2[static_cast<std::size_t>(i)] * h2[static_cast<std::size_t>(i)];
+        gmres_arnoldi_kernel<<<1, 1>>>(ctl, d_small, d_small2, j, m_restart,
+                                       precond_audit ? 1 : 0);
+        cuda_check(cudaGetLastError(), "sn_ld Arnoldi column launch failed");
+        scale_vector_ctl_kernel<<<node_grid, kBlock>>>(
+            w, ctl, Vk + static_cast<std::size_t>(j + 1) * two_n, static_cast<int>(two_n));
+        cuda_check(cudaGetLastError(), "sn_ld Krylov vector launch failed");
+        if (j + 1 < m_restart && its + 1 < max_inner) {
+          precondition(j + 1);
         }
-        const double hn = std::sqrt(std::max(h2[static_cast<std::size_t>(nv)] - proj2, 0.0));
-        Hij(j + 1, j) = hn;
-        if (hn > 0.0 && std::isfinite(hn)) {
-          scale_vector_kernel<<<node_grid, kBlock>>>(
-              w, 1.0 / hn, Vk + static_cast<std::size_t>(j + 1) * two_n, static_cast<int>(two_n));
-          cuda_check(cudaGetLastError(), "sn_ld Krylov vector launch failed");
-        }
-        for (int i = 0; i < j; ++i) {
-          const double a0 = Hij(i, j);
-          const double a1 = Hij(i + 1, j);
-          Hij(i, j) = cs[static_cast<std::size_t>(i)] * a0 + sn_rot[static_cast<std::size_t>(i)] * a1;
-          Hij(i + 1, j) =
-              -sn_rot[static_cast<std::size_t>(i)] * a0 + cs[static_cast<std::size_t>(i)] * a1;
-        }
-        const double a0 = Hij(j, j);
-        const double a1 = Hij(j + 1, j);
-        const double rr = std::hypot(a0, a1);
-        const double cj = (rr > 0.0) ? a0 / rr : 1.0;
-        const double sj = (rr > 0.0) ? a1 / rr : 0.0;
-        cs[static_cast<std::size_t>(j)] = cj;
-        sn_rot[static_cast<std::size_t>(j)] = sj;
-        Hij(j, j) = rr;
-        Hij(j + 1, j) = 0.0;
-        gv[static_cast<std::size_t>(j + 1)] = -sj * gv[static_cast<std::size_t>(j)];
-        gv[static_cast<std::size_t>(j)] = cj * gv[static_cast<std::size_t>(j)];
-        if (precond_audit && audit_ratios.size() < 8U) {
-          audit_ratios.push_back(std::fabs(gv[static_cast<std::size_t>(j + 1)]) / audit_beta0);
-        }
+        double status = 0.0;
+        read_ctl(kCtlStatus, 1, &status);
         ++gmres_iterations;
         ++its;
         jj = j + 1;
-        if (std::fabs(gv[static_cast<std::size_t>(j + 1)]) <= target || !(hn > 0.0) ||
-            !std::isfinite(hn)) {
+        if (status != 0.0) {
           break;
         }
       }
       if (jj == 0) {
         break;
       }
-      for (int i = jj - 1; i >= 0; --i) {
-        double acc = gv[static_cast<std::size_t>(i)];
-        for (int k = i + 1; k < jj; ++k) {
-          acc -= Hij(i, k) * y[static_cast<std::size_t>(k)];
-        }
-        const double d = Hij(i, i);
-        y[static_cast<std::size_t>(i)] = (d != 0.0) ? acc / d : 0.0;
-      }
-      cuda_check(cudaMemcpy(d_small + m_restart + 2, y.data(),
-                            static_cast<std::size_t>(jj) * sizeof(double), cudaMemcpyHostToDevice),
-                 "sn_ld solution coefficient upload failed");
-      solution_update_kernel<<<node_grid, kBlock>>>(Zk, two_n, d_small + m_restart + 2, jj, scale,
+      gmres_backsub_kernel<<<1, 1>>>(ctl, jj, m_restart);
+      cuda_check(cudaGetLastError(), "sn_ld back substitution launch failed");
+      solution_update_kernel<<<node_grid, kBlock>>>(Zk, two_n, ctl + ctl_layout.y(0), jj, scale,
                                                     x, static_cast<int>(two_n));
       cuda_check(cudaGetLastError(), "sn_ld solution update launch failed");
       transport(true, x, nullptr, psi_aff, sd_aff, phi_aff, A_aff, phi_aff);
+    }
+    if (precond_audit) {
+      double audit_count = 0.0;
+      read_ctl(kCtlAuditCount, 1, &audit_count);
+      const int count = static_cast<int>(audit_count);
+      if (count > 0) {
+        audit_ratios.resize(static_cast<std::size_t>(count));
+        read_ctl(ctl_layout.audit(0), count, audit_ratios.data());
+      }
     }
     return res;
   };
@@ -2718,7 +3376,8 @@ void advance_step_impl(core::State& state, const core::Config& cfg, const Planck
       p1_factor(cells, sigma_e_dsa, state.sn_sigma_s.data(), quad, p1_dsa, n, G, geom);
     }
     const double* phi_ref = (k == 0) ? phi_hist : phi_aff;
-    const NodeWarpLaunch lin_launch = node_warp_launch(linearize_kernel<EOS_TAIL>, two_n, G, 3);
+    const NodeWarpLaunch lin_launch =
+        node_warp_launch(linearize_kernel<EOS_TAIL>, two_n, G, kLinearizeShared);
     linearize_kernel<EOS_TAIL><<<lin_launch.blocks, lin_launch.threads, lin_launch.shared>>>(
         closure, d_void, planck.device_view(), state.sn_sigma_a.data(), state.sn_sigma_pe.data(),
         state.sn_sigma_s.data(), e_n, e_k, T_k, phi_ref, fixed, kappa, kbar, sabar, se_node,
@@ -2754,7 +3413,8 @@ void advance_step_impl(core::State& state, const core::Config& cfg, const Planck
       }
       core::log_info(os.str());
     }
-    const NodeWarpLaunch mu_launch = node_warp_launch(matter_update_kernel<EOS_TAIL>, two_n, G, 2);
+    const NodeWarpLaunch mu_launch =
+        node_warp_launch(matter_update_kernel<EOS_TAIL>, two_n, G, kMatterUpdateShared);
     matter_update_kernel<EOS_TAIL><<<mu_launch.blocks, mu_launch.threads, mu_launch.shared>>>(
         closure, d_void, planck.device_view(), state.sn_sigma_a.data(), state.sn_sigma_pe.data(),
         phi_aff, fixed, kappa, x, e_n, e_acc, e_k, T_k, dT_rel, step_prev, omega, clip, d_flags,

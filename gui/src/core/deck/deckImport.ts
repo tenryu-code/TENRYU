@@ -5,6 +5,8 @@ import { BEAM_PRESETS, expandedPairCount, PAIR_CAP } from "./beamPresets";
 import IMPORT_RUNTIME from "../../../../tools/assist/deck_import_runtime.py?raw";
 import { t } from "../../i18n";
 import { computeShapeRadialRegions, computeShapeZSegments } from "./meshAuto";
+import { mesh1dErrors, type EmpiricalForm } from "./mesh1d";
+import { empiricalFromDict, zoningIntentFromDict } from "./meshRecommend";
 
 export type DeckPath = Array<string | number>;
 export interface ImportRule {
@@ -102,6 +104,42 @@ export function mapRecordedDeck(record: DeckRecord): { form: FormState; bindings
     f.mesh.segments = mesh.grid.segments.map((s: Recorded) => ({ rEnd: q(s.r_end, "cm"), nr: s.nr }));
     bind("mesh.segments", ["Mesh", "grid", "segments"]);
     fields("mesh.grading", ["Mesh", "grid", "grading"], { edgeRatio: "edge_ratio", sgOrder: "sg_order", sgSigma: "sg_sigma" });
+  }
+  // 1D zoning_intent, explicit node lists and the resolution requirement (mesh1d.ts methods).
+  const plainDict = (v: unknown): v is Recorded => typeof v === "object" && v !== null && !Array.isArray(v) && !(v as Recorded)._type;
+  if (f.main.dimension === "1D_SPH" && plainDict(mesh.zoning_intent)) {
+    try {
+      f.mesh.zoningIntent = zoningIntentFromDict(mesh.zoning_intent);
+      f.mesh.grid1d = "zoning_intent";
+    } catch {
+      /* a zoning_intent the form cannot hold stays in the source */
+    }
+    bind("mesh.zoningIntent", ["Mesh", "zoning_intent"]);
+    bind("mesh.grid1d", ["Mesh", "zoning_intent"]);
+  } else if (
+    f.main.dimension === "1D_SPH" &&
+    Array.isArray(mesh.explicit_nodes) &&
+    !Array.isArray(mesh.auto_regions) &&
+    mesh.explicit_nodes.every((v: unknown) => typeof v === "number")
+  ) {
+    f.mesh.explicitNodes = { nodesCm: mesh.explicit_nodes, source: record.filename ?? "" };
+    f.mesh.grid1d = "explicit";
+    bind("mesh.explicitNodes", ["Mesh", "explicit_nodes"]);
+    bind("mesh.grid1d", ["Mesh", "explicit_nodes"]);
+  }
+  const requirement = mesh.resolution_requirement;
+  if (f.main.dimension === "1D_SPH" && plainDict(requirement)) {
+    let empirical: EmpiricalForm | null = null;
+    try {
+      empirical = empiricalFromDict(requirement.empirical);
+    } catch {
+      empirical = null;
+    }
+    f.mesh.resolutionRequirement = {
+      apply: requirement.apply === "enforce" ? "enforce" : "report",
+      empirical,
+    };
+    bind("mesh.resolutionRequirement", ["Mesh", "resolution_requirement"]);
   }
   if (Array.isArray(mesh.auto_regions) && f.main.dimension === "2D_RZ") {
     f.mesh.nr = mesh.auto_regions.reduce((n: number, r: Recorded) => n + r.nz, 0);
@@ -203,13 +241,33 @@ export function mapRecordedDeck(record: DeckRecord): { form: FormState; bindings
   bind("hydro.inactiveCells", ["Numerics", "hydro", "cold_equilibrium"]);
   put("hydro.boundary1d", ["Numerics", "hydro", "boundary_1d"], choice("free", "reflect", "pressure"));
   const pressure = b.Numerics?.hydro?.boundary_pressure?.curve;
-  if (pressure?.kind === "constant") f.hydro.boundaryPressure.value = q(pressure.value*1e-12, "Mbar");
-  table(["Numerics", "hydro", "boundary_pressure"], "hydro.boundaryPressure.mode", "hydro.boundaryPressure.points", 1e-12);
+  if (pressure?.kind === "constant") {
+    // A constant pressure stays a constant (the form writes it as a constant callable).
+    f.hydro.boundaryPressure.value = q(pressure.value*1e-12, "Mbar");
+    f.hydro.boundaryPressure.mode = "constant";
+  } else {
+    table(["Numerics", "hydro", "boundary_pressure"], "hydro.boundaryPressure.mode", "hydro.boundaryPressure.points", 1e-12);
+  }
   bind("hydro.boundaryPressure", ["Numerics", "hydro", "boundary_pressure"]);
   fields("hydro.plasmaVisc", ["Numerics", "hydro", "plasma_viscosity"], { enabled: "enabled", model: "model", species: "species", etaConst: "eta_const", eta0Scale: "eta0_scale", mfpCapCells: "mfp_cap_cells", lnLambdaFixed: "lnlambda_fixed", dtSafety: "dt_safety" });
+  put("conduction.solver", ["Numerics", "conduction", "solver"], choice("sts", "implicit"));
   fields("conduction", ["Numerics", "conduction"], { enabled: "enabled", fLim: "f_lim", ionConduction: "ion_conduction", ionFLim: "ion_f_lim", nonlocalModel: "nonlocal_model", snbNGroups: "snb_n_groups", snbEMaxOverTe: "snb_E_max_over_Te", snbMfp: "snb_mfp", snbEfield: "snb_efield", snbPicardMaxIters: "snb_picard_max_iters", snbPicardRtol: "snb_picard_rtol" });
   fields("laser", ["Laser"], { enabled: "enabled", wavelengthNm: "wavelength_nm", raysPerBeam: "rays_per_beam", rayOutputTrajectory: "ray_output_trajectory", rayOutputCount: "ray_output_count" });
   put("laser.mode", ["Laser", "mode"], choice("radial_absorption_1d", "raytrace_2d"));
+  // Laser.lasermesh with the ghost corona: keys the source leaves out take the solver's defaults
+  // (SPECIFICATION 6.4.6), which differ from the example-suite values the form proposes.
+  const laserMesh = b.Laser?.lasermesh;
+  if (plainDict(laserMesh) && plainDict(laserMesh.ghost_corona) && laserMesh.ghost_corona.enabled === true) {
+    f.laser.ghostCorona = {
+      enabled: true, nOut: 12, neMinFrac: 0.03, neMaxFrac: 0.99, TeMinEV: 50.0, zbarMin: 1.0, zbarMax: 4.0,
+      handoffCells: 4, handoffDecay: 1.5, transitionEnabled: false, transitionResolvedNhat: 0.9,
+      transitionResolvedCells: 3, transitionDensityExponent: 1.0, meshFactor: 0.5, rmaxNHatThreshold: 0.001,
+    };
+    fields("laser.ghostCorona", ["Laser", "lasermesh", "ghost_corona"], { nOut: "n_out", neMinFrac: "ne_min_frac", neMaxFrac: "ne_max_frac", TeMinEV: "Te_min_eV", zbarMin: "zbar_min", zbarMax: "zbar_max", handoffCells: "handoff_cells", handoffDecay: "handoff_decay", transitionEnabled: "transition_enabled", transitionResolvedNhat: "transition_resolved_nhat", transitionResolvedCells: "transition_resolved_cells", transitionDensityExponent: "transition_density_exponent" });
+    fields("laser.ghostCorona", ["Laser", "lasermesh"], { meshFactor: "mesh_factor", rmaxNHatThreshold: "rmax_n_hat_threshold" });
+  }
+  bind("laser.ghostCorona", ["Laser", "lasermesh"]);
+  fields("laser", ["Laser", "deposit"], { depositSmoothPasses: "deposit_smooth_passes", depositSmoothAlpha: "deposit_smooth_alpha" });
   const beams = b.Laser?.beams;
   if (Array.isArray(beams) && beams.length) {
     f.laser.beams = beams.map(() => ({ ...defaultFormState().laser.beams[0] }));
@@ -334,6 +392,10 @@ export function mapRecordedDeck(record: DeckRecord): { form: FormState; bindings
     if (f.laser.cbet.enabled) placeholder("laser.cbet.enabled",false);
   }
   if (f.burn.enabled && (f.main.dimension!=="1D_SPH" || f.main.geometry1d!=="spherical")) placeholder("burn.enabled",false);
+  // A zoning_intent or node list the form's checks refuse (end nodes off r_min/r_max, say)
+  // stays in the source; the form shows a uniform placeholder mesh.
+  if ((f.mesh.grid1d === "zoning_intent" || f.mesh.grid1d === "explicit") && mesh1dErrors(f).length) placeholder("mesh.grid1d","uniform");
+  if (f.mesh.resolutionRequirement.empirical !== null && mesh1dErrors(f).length) placeholder("mesh.resolutionRequirement",{apply:"default",empirical:null});
   if (f.laser.cbet.enabled && expandedPairCount(BEAM_PRESETS[f.laser.cbet.portPreset].ports.length,f.laser.cbet.nImpactBins)>PAIR_CAP) placeholder("laser.cbet.nImpactBins",d.laser.cbet.nImpactBins);
   // Modes the form cannot represent (a non-TMAT EOS or an incomplete reference
   // state under cold_equilibrium, 1D-only settings in 2D) keep the source value.

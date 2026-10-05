@@ -42,13 +42,15 @@ class OutputManager {
   void write_mesh_requirement(const std::string& json) const;
   void write_frozen_config(const std::string& case_name,
                            const std::string& frozen_json) const;
-  void write_snapshot(const tenryu::core::State& state,
+  // Both bring the host copies of the 1D burn arrays up to date first
+  // (State::sync_burn_arrays_to_host).
+  void write_snapshot(tenryu::core::State& state,
                       const tenryu::core::Config& cfg,
                       int step,
                       double t,
                       const std::string& case_name,
                       int rank = 0);
-  void write_checkpoint(const tenryu::core::State& state,
+  void write_checkpoint(tenryu::core::State& state,
                         const tenryu::core::Config& cfg,
                         int step,
                         double t,

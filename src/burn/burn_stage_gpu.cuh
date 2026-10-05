@@ -16,4 +16,15 @@ BurnStageResult compute_burn_step_1d_device_stage(
     double& dt_limit_subcycle, unsigned int& screening_warning_flags,
     std::vector<double>* neutron_births = nullptr);
 
+// The 1D stage on the device-resident arrays (BurnDeviceInputs, BurnDeviceArrays): the same
+// kernels as compute_burn_step_1d_device_stage, the cells' velocities and range fit factors
+// formed on the device, the result packet the only copy to the host; then eps_cum and the
+// neutron count updated on the device.
+BurnStageResult compute_burn_step_1d_resident(const BurnDeviceInputs& in,
+                                              const BurnStageParams& p,
+                                              const PartitionTable& table,
+                                              const BurnDeviceArrays& out,
+                                              double& dt_limit_subcycle,
+                                              unsigned int& screening_warning_flags);
+
 }  // namespace tenryu::burn

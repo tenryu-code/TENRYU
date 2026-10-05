@@ -372,8 +372,10 @@ __global__ void map_hydro_to_laser_1d_kernel(
 
 - **block**: 256。1 スレッド = 1 節点。\(r=\sqrt{R^2+Z^2}\) で流体セルを device 上の二分探索で特定し、密度の正規化、
   臨界に隣接するセル対の対数線形プロファイル（NUMERICS §5.7.3(a)）、ゴーストコロナ、critical clip を評価する
-- **2 回起動する**：(1) 2D レーザー格子の節点（`n_nodes_r × n_nodes_z`）、(2) `build_trace_profile_nodes_1d_parallel_kernel`
-  （`<<<1, kTraceProfileBlock>>>`）が置いた径方向プロファイル節点（面・臨界の対・プロファイルの節点）。節点数は host へ
+- **2 回起動する**：(1) 2D レーザー格子の節点（`n_nodes_r × n_nodes_z`）、(2) `place_trace_profile_nodes_1d`
+  （判定・区分ごとの節点数・最後の区分の尾部の節点数・CUB の前置和・区分の書き込み・尾部の書き込み・仕上げ。区分の
+  数え上げと書き込みと尾部の書き込みは多数のブロック、判定と尾部の数え上げは 1 ブロック、順の配置に戻るときは 1 スレッド）
+  が置いた径方向プロファイル節点（面・臨界の対・プロファイルの節点）。節点数は host へ
   1 回だけ返す。(2) の後に `map_node_material_1d_kernel`（同じ材料の \(n_e\) 補間用の節点の材料）、
   `compute_radial_gradient_kernel`（\(d\hat n/dr\)）、`compute_smooth_kappa{,_ext}_kernel`（逆制動輻射の smooth 係数）
 - **step 間平滑化なし**: 1D の clipped \(\hat n\) は写像した値そのもの（`ema_smooth_n_hat_radial_kernel` は 2026-09-24 に撤去、NUMERICS §5.7.4）

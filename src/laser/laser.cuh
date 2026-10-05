@@ -56,6 +56,25 @@ void laser_step(core::State& state,
                 bool collect_density_diag = true,
                 const std::string& output_dir = {});
 
+// Copies the 1D laser diagnostics that stay on the device during the steps into the State before a
+// snapshot or checkpoint is written: the CBET exchange maps (State::cbet_gross_exchange,
+// cbet_net_to_inbound), and in port_section the phase-space intensity map (State::ps_ray_map and
+// its shell radii), the outgoing power and the hot-electron capture per port. Diagnostics no step
+// has computed leave the State's vectors as they are.
+void sync_laser_snapshot_fields(core::State& state, const LaserMesh& lmesh);
+
+namespace port_section {
+struct S1DeviceInput;
+struct S1DeviceTable;
+}  // namespace port_section
+
+// The device input and device table of the last port_section phase-space table build of
+// `lmesh` (false before the first build), for the tests that compare the table with the host
+// reference. The pointers stay valid until the next laser_step.
+bool last_port_section_table_build(const LaserMesh& lmesh,
+                                   port_section::S1DeviceInput* input,
+                                   port_section::S1DeviceTable* table);
+
 void invalidate_global_skip_cache();
 
 }  // namespace tenryu::laser

@@ -56,7 +56,7 @@ python3 -m tools.tenryu_plot profile outputs/template_1d_slab_radiation</code></
         <li><a href="requirements.html">動作環境と要求スペック</a>で GPU・ツールチェーンの前提を確認する。</li>
         <li><a href="building.html">ビルド</a>で、バイナリと <code>ctest</code> の通る環境を作る。</li>
         <li><a href="running.html">シミュレーションの実行</a>の手順どおり、テンプレートを validate → run で完走させる。</li>
-        <li><a href="examples.html">例題とプリセット</a>の検証済みプリセット — まずは <code>laser_capsule</code> — を、配布された条件のまま実行する。</li>
+        <li><a href="examples.html">例題とプリセット</a>の検証済みプリセット — まずは球殻の直接照射爆縮 <code>laser_shell_implosion</code> — を、配布された条件のまま実行する。</li>
         <li><a href="outputs.html">出力と解析</a>に沿って結果を読む。吸収率はエネルギーの台帳（入射と沈着の比）から、爆縮のピークはステップごとの履歴 <code>implosion/rho_peak</code> から読み取る。</li>
       </ol>
       <p>物理の詳細が必要になったら<a href="../physics/index.html">物理カーネル</a>の該当ページへ。各ページの「物理機構」の節が、式に入る前の背景を説明する。時間刻みの決まり方は<a href="../overview/timestep.html">時間刻み制御と CFL</a> にまとめてある。</p>

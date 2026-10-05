@@ -26,13 +26,18 @@
 #include "core/device_error_flags.cuh"
 #include "core/device_scratch.hpp"
 #include "core/error.hpp"
+#include "core/field.hpp"
 #include "laser/beams.cuh"
 #include "laser/bilinear_interpolation.cuh"
 #include "laser/cbet_lm_fields.cuh"
 #include "laser/deposit_transfer.cuh"
 #include "laser/cbet.cuh"
+#include "laser/cbet_stage_gpu.cuh"
 #include "laser/fast_trace_1d.cuh"
 #include "laser/hot_e_eta_model.hpp"
+#include "laser/deposit_1d_gpu.cuh"
+#include "laser/hot_e_inputs_gpu.cuh"
+#include "laser/hot_e_transport_1d_gpu.cuh"
 #include "laser/hot_electron_1d.cuh"
 #include "laser/hot_electron_1d_gpu.cuh"
 #include "laser/hot_electron_2d.cuh"
@@ -41,6 +46,7 @@
 #include "laser/port_geometry.hpp"
 #include "laser/port_section_chi.hpp"
 #include "laser/port_section_overlap.hpp"
+#include "laser/port_section_s1_gpu.cuh"
 #include "laser/ray_init.cuh"
 #include "laser/ray_trace.cuh"
 #include "laser/raytrace_skip.cuh"
@@ -53,10 +59,22 @@ namespace {
 
 struct PortSectionState {
   port_geom::PortTable ports;
-  sector_ps::PhaseSpaceTable table;
-  std::vector<sector_ps::RayAnnotation> annotations;
-  sector_ps::ExclusionLedger ledger{};
-  std::vector<std::int32_t> ray_bin;
+  // The phase-space table of the last step, built on the device (port_section_s1_gpu.cuh).
+  std::unique_ptr<::tenryu::laser::port_section::S1DeviceWorkspace> s1_ws;
+  ::tenryu::laser::port_section::S1DeviceTable device_table{};
+  ::tenryu::laser::port_section::S1DeviceInput device_input{};  // the input of the last build
+  bool device_table_valid = false;
+  core::DeviceArray<double> ray_map_device;  // [n_shells * 64 * 2] snapshot intensity map
+  core::DeviceArray<double> shell_r_device;  // [n_shells] the table's shell radii (build time)
+  bool ray_map_valid = false;
+  // The hot-electron model's sky map of the last step that computed one (hot_e_inputs), kept on
+  // the device until a snapshot: I_tot, I_cw [erg/s/cm^2] and n_sigma on the mu-major grid.
+  core::DeviceArray<double> sky_I_tot_device;
+  core::DeviceArray<double> sky_I_cw_device;
+  core::DeviceArray<double> sky_n_sigma_device;
+  std::vector<double> sky_mu;
+  std::vector<double> sky_phi;
+  bool sky_valid = false;
   std::unique_ptr<::tenryu::laser::port_section::ChiDeviceWorkspace> chi_ws;
   std::vector<std::int16_t> pair_p;
   std::vector<std::int16_t> pair_q;
@@ -69,27 +87,8 @@ struct PortSectionState {
   sector_adapter::S1Audit audit{};
 };
 
-struct IncidentAttenuationContext {
-  const std::vector<double>* rec_S = nullptr;
-};
-
 static double g_ps_timing_sum[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
 static long g_ps_timing_calls = 0;
-
-double apply_incident_attenuation(const double power_in,
-                                  const std::int64_t record_index,
-                                  const void* context) {
-  const auto* attenuation =
-      static_cast<const IncidentAttenuationContext*>(context);
-  const double S_half =
-      0.5 * (*attenuation->rec_S)[static_cast<std::size_t>(record_index)];
-  double power = power_in;
-  const double dP_first = -power * std::expm1(-S_half);
-  power -= dP_first;
-  const double dP_second = -power * std::expm1(-S_half);
-  power -= dP_second;
-  return power;
-}
 
 inline void cuda_check(const cudaError_t err, const char* message) {
   TENRYU_ASSERT(err == cudaSuccess, message);
@@ -635,211 +634,105 @@ __global__ void replay_fold_tallies_kernel(void* tally_slab,
 
 int locate_cell_1d(const std::vector<double>& edges, double r);
 
-int nearest_shell_index(const std::vector<double>& shell_r,
-                        const double radius) {
-  TENRYU_ASSERT(!shell_r.empty(),
-                "nearest_shell_index requires a non-empty shell grid");
-  const auto upper =
-      std::lower_bound(shell_r.begin(), shell_r.end(), radius);
-  if (upper == shell_r.begin()) {
-    return 0;
-  }
-  if (upper == shell_r.end()) {
-    return static_cast<int>(shell_r.size() - 1U);
-  }
-  const auto lower = upper - 1;
-  // Exact midpoint ties choose the lower shell.
-  return (radius - *lower <= *upper - radius)
-             ? static_cast<int>(lower - shell_r.begin())
-             : static_cast<int>(upper - shell_r.begin());
+// The checks of the device CBET output stages (cbet_stage_gpu.cuh), with the messages of the host
+// loops they replace.
+void check_cbet_step_flags(const int flags) {
+  TENRYU_ASSERT((flags & kCbetFlagClosure) == 0,
+                "CBET final-iteration dQ+IAW violates per-cell action closure");
+  TENRYU_ASSERT((flags & kCbetFlagCellVolume) == 0,
+                "CBET visualization requires a positive finite cell volume");
+  TENRYU_ASSERT((flags & kCbetFlagRecordOffsets) == 0,
+                "port_section outgoing record offset/count mismatch");
+  TENRYU_ASSERT((flags & kCbetFlagCaptureChannel) == 0,
+                "port_section hot-e capture config index out of range");
+  TENRYU_ASSERT((flags & kCbetFlagCaptureCell) == 0,
+                "port_section hot-e capture cell hint out of range");
 }
 
-void fill_cbet_viz_fields(core::State& state,
-                          const CbetSolveResult& result,
-                          const CbetWorkspace& workspace,
-                          sector_adapter::S1Audit* audit) {
-  TENRYU_ASSERT(result.dq_G > 0,
-                "CBET visualization requires a positive dQ state dimension");
-  TENRYU_ASSERT(
-      result.dq_n_bins > 0 && result.dq_n_branches > 0,
-      "CBET visualization requires positive branch/bin dimensions");
-  const std::size_t n_cells =
-      result.dq_host.size() / static_cast<std::size_t>(result.dq_G);
-  TENRYU_ASSERT(
-      result.dq_host.size() ==
-          n_cells * static_cast<std::size_t>(result.dq_G) &&
-          n_cells == state.rho.size() &&
-          n_cells == static_cast<std::size_t>(workspace.n_cells),
-      "CBET visualization dQ/cell dimensions are inconsistent");
-
-  std::vector<double> cell_vol(n_cells, 0.0);
-  std::vector<double> iaw_cell(n_cells, 0.0);
-  cuda_check(cudaMemcpy(cell_vol.data(), workspace.cell_vol,
-                        cell_vol.size() * sizeof(double),
-                        cudaMemcpyDeviceToHost),
-             "CBET visualization cell_vol D2H failed");
-  if (result.dq_n_ports > 0) {
-    cuda_check(cudaMemcpy(iaw_cell.data(), workspace.iaw_cell,
-                          iaw_cell.size() * sizeof(double),
-                          cudaMemcpyDeviceToHost),
-               "CBET visualization iaw_cell D2H failed");
-  }
-  state.cbet_gross_exchange.assign(n_cells, 0.0);
-  state.cbet_net_to_inbound.assign(n_cells, 0.0);
-  if (audit != nullptr) {
-    audit->dq_abs_max = 0.0;
-    audit->dq_abs_sum = 0.0;
-    // No host L copy is available here without an additional D2H transfer.
-    audit->L_ps_abs_max = -1.0;
-  }
-  constexpr double kClosureTiny = 1.0e-300;
-  for (std::size_t cell = 0; cell < n_cells; ++cell) {
-    double sum = 0.0;
-    double sum_abs = 0.0;
-    double sum_inbound = 0.0;
-    const std::size_t row =
-        cell * static_cast<std::size_t>(result.dq_G);
-    for (int g = 0; g < result.dq_G; ++g) {
-      const double dq = result.dq_host[row + static_cast<std::size_t>(g)];
-      const double dq_abs = std::abs(dq);
-      if (audit != nullptr) {
-        audit->dq_abs_max = std::max(audit->dq_abs_max, dq_abs);
-        audit->dq_abs_sum += dq_abs;
-      }
-      sum += dq;
-      sum_abs += dq_abs;
-      const int branch =
-          (g % (result.dq_n_branches * result.dq_n_bins)) /
-          result.dq_n_bins;
-      if (branch == 0) {
-        sum_inbound += dq;
-      }
-    }
-    TENRYU_ASSERT(
-        std::abs(sum + iaw_cell[cell]) <=
-            1.0e-9 *
-                std::max(sum_abs + std::abs(iaw_cell[cell]), kClosureTiny),
-        "CBET final-iteration dQ+IAW violates per-cell action closure");
-    TENRYU_ASSERT(
-        std::isfinite(cell_vol[cell]) && cell_vol[cell] > 0.0,
-        "CBET visualization requires a positive finite cell volume");
-    state.cbet_gross_exchange[cell] =
-        0.5 * sum_abs / cell_vol[cell];
-    state.cbet_net_to_inbound[cell] =
-        sum_inbound / cell_vol[cell];
-  }
+// The device workspace of the hot-electron model inputs (one per process, as the CBET workspace;
+// deliberately leaked: CUDA teardown order at exit makes destructor-time frees unsafe).
+hot_e_inputs::Workspace& hot_e_inputs_workspace() {
+  static auto* ws = new hot_e_inputs::Workspace();
+  return *ws;
 }
 
-void fill_port_section_ray_map(
-    core::State& state,
-    const sector_ps::PhaseSpaceTable& table,
-    const std::vector<double>& shell_r) {
-  constexpr int kThetaBins = 64;
-  constexpr double kPi = 3.14159265358979323846;
-  constexpr double kErgPerSToW = 1.0e-7;
-  const std::size_t n_shells = shell_r.size();
-  state.ps_ray_map.assign(
-      n_shells * static_cast<std::size_t>(kThetaBins) * 2U, 0.0);
-  state.ps_ray_map_shell_r = shell_r;
-  for (std::size_t shell = 0; shell < n_shells; ++shell) {
-    for (int sheet = 0; sheet < 2; ++sheet) {
-      std::array<double, kThetaBins> weighted_intensity{};
-      std::array<double, kThetaBins> power{};
-      for (const sector_ps::CrossingView& crossing :
-           sector_ps::crossings(table, static_cast<int>(shell), sheet)) {
-        const double scaled =
-            std::clamp(crossing.theta, 0.0, kPi) *
-            static_cast<double>(kThetaBins) / kPi;
-        const int bin = std::clamp(
-            static_cast<int>(std::floor(scaled)), 0, kThetaBins - 1);
-        const double intensity = crossing.P / crossing.area;
-        weighted_intensity[static_cast<std::size_t>(bin)] +=
-            crossing.P * intensity;
-        power[static_cast<std::size_t>(bin)] += crossing.P;
-      }
-      for (int bin = 0; bin < kThetaBins; ++bin) {
-        const std::size_t index =
-            (shell * static_cast<std::size_t>(kThetaBins) +
-             static_cast<std::size_t>(bin)) *
-                2U +
-            static_cast<std::size_t>(sheet);
-        if (power[static_cast<std::size_t>(bin)] > 0.0) {
-          state.ps_ray_map[index] =
-              weighted_intensity[static_cast<std::size_t>(bin)] /
-              power[static_cast<std::size_t>(bin)] * kErgPerSToW;
-        }
-      }
-    }
-  }
+// The device workspaces of the 1D laser mesh map (laser_map_1d_gpu.cuh) and of the step's cell
+// deposit (deposit_1d_gpu.cuh), one per process and deliberately leaked as the others.
+laser_map_1d::Workspace& laser_map_workspace() {
+  static auto* ws = new laser_map_1d::Workspace();
+  return *ws;
 }
 
-void fill_port_section_sky_map(
-    core::State& state,
-    const port_section::CommonWaveDriveGridOutput& grid) {
-  constexpr double kErgPerSToW = 1.0e-7;
-  state.ps_sky_mu = grid.mu;
-  state.ps_sky_phi = grid.phi;
-  state.ps_sky_I_tot.resize(grid.I_tot.size());
-  state.ps_sky_I_cw.resize(grid.I_cw.size());
-  state.ps_sky_n_sigma = grid.n_sigma;
-  for (std::size_t index = 0; index < grid.I_tot.size(); ++index) {
-    state.ps_sky_I_tot[index] = grid.I_tot[index] * kErgPerSToW;
-    state.ps_sky_I_cw[index] = grid.I_cw[index] * kErgPerSToW;
-  }
+deposit_1d::Workspace& deposit_workspace() {
+  static auto* ws = new deposit_1d::Workspace();
+  return *ws;
 }
 
-void fill_port_section_outgoing_power(core::State& state,
-                                      const CbetWorkspace& workspace) {
-  const int n_rays = workspace.n_rays_total;
-  std::vector<std::int32_t> rec_count(static_cast<std::size_t>(n_rays));
-  std::vector<std::int64_t> ray_rec_offset(
-      static_cast<std::size_t>(n_rays) + 1U);
-  cuda_check(cudaMemcpy(rec_count.data(), workspace.rec_count,
-                        rec_count.size() * sizeof(std::int32_t),
-                        cudaMemcpyDeviceToHost),
-             "port_section outgoing rec_count D2H failed");
-  cuda_check(cudaMemcpy(ray_rec_offset.data(), workspace.ray_rec_offset,
-                        ray_rec_offset.size() * sizeof(std::int64_t),
-                        cudaMemcpyDeviceToHost),
-             "port_section outgoing ray_rec_offset D2H failed");
-
-  const std::size_t records_per_port =
-      static_cast<std::size_t>(n_rays) *
-      static_cast<std::size_t>(workspace.cap_per_ray);
-  std::vector<double> rec_w_port(records_per_port, 0.0);
-  state.ps_port_outgoing_power.assign(
-      static_cast<std::size_t>(workspace.n_ports), 0.0);
-  for (int port = 0; port < workspace.n_ports; ++port) {
-    cuda_check(
-        cudaMemcpy(
-            rec_w_port.data(),
-            workspace.rec_w_ps +
-                static_cast<std::size_t>(port) * records_per_port,
-            rec_w_port.size() * sizeof(double), cudaMemcpyDeviceToHost),
-        "port_section final rec_w_ps D2H failed");
-    double sum = 0.0;
-    for (int ray = 0; ray < n_rays; ++ray) {
-      const std::int64_t offset_count =
-          ray_rec_offset[static_cast<std::size_t>(ray) + 1U] -
-          ray_rec_offset[static_cast<std::size_t>(ray)];
-      TENRYU_ASSERT(
-          offset_count ==
-              static_cast<std::int64_t>(
-                  rec_count[static_cast<std::size_t>(ray)]),
-          "port_section outgoing record offset/count mismatch");
-      const int count = rec_count[static_cast<std::size_t>(ray)];
-      if (count <= 0) {
-        continue;
-      }
-      const std::size_t final_record =
-          static_cast<std::size_t>(ray) *
-              static_cast<std::size_t>(workspace.cap_per_ray) +
-          static_cast<std::size_t>(count - 1);
-      sum += rec_w_port[final_record];
-    }
-    state.ps_port_outgoing_power[static_cast<std::size_t>(port)] = sum;
-  }
+// The device workspace of the 1D hot-electron transport (hot_e_transport_1d_gpu.cuh), one per
+// process and deliberately leaked as the others.
+hot_e_transport_1d::Workspace& hot_e_transport_workspace() {
+  static auto* ws = new hot_e_transport_1d::Workspace();
+  return *ws;
 }
+
+// apply_deposit_redistribution_1d on the device for the deposit accumulated in
+// deposit_workspace() (overwritten), with the host function's bookkeeping of the laser mesh and
+// its warnings; m is this step's map of the same state. Returns the sum of the energies written to
+// state.laser_dep (zero when dt is not positive).
+double redistribute_deposit_1d(core::State& state,
+                               LaserMesh& mesh,
+                               const laser_map_1d::MapScalars& m,
+                               const double* hot_e_extra_device,
+                               const double dt,
+                               const double conservation_tol,
+                               const parallel::PartitionInfo& part,
+                               const int smooth_passes,
+                               const double smooth_alpha,
+                               cudaStream_t stream) {
+  TENRYU_ASSERT(smooth_passes >= 0,
+                "apply_deposit_redistribution_1d smooth_passes must be >= 0");
+  TENRYU_ASSERT(smooth_alpha >= 0.0 && smooth_alpha <= 0.5,
+                "apply_deposit_redistribution_1d smooth_alpha must be in [0, 0.5]");
+  mesh.last_ghost_transition_blend = 0.0;
+  mesh.last_ghost_transition_resolved_cells = 0;
+  mesh.last_transfer_blocked_power = 0.0;
+  if (!(dt > 0.0)) {
+    state.laser_dep.fill(0.0);
+    return 0.0;
+  }
+  const int n_cells = static_cast<int>(state.laser_dep.size());
+  deposit_1d::Inputs in;
+  in.dt = dt;
+  in.conservation_tol = conservation_tol;
+  in.smooth_passes = smooth_passes;
+  in.smooth_alpha = smooth_alpha;
+  in.ghost_enabled = mesh.ghost_corona_enabled ? 1 : 0;
+  in.transition_enabled = mesh.ghost_transition_enabled ? 1 : 0;
+  in.handoff_cells = mesh.ghost_handoff_cells;
+  in.handoff_decay = mesh.ghost_handoff_decay;
+  in.transition_resolved_nhat = mesh.ghost_transition_resolved_nhat;
+  in.transition_resolved_cells = mesh.ghost_transition_resolved_cells;
+  in.transition_density_exponent = mesh.ghost_transition_density_exponent;
+  in.n_crit = mesh.n_crit;
+  in.owned_begin = (part.n_ranks > 1) ? part.local_cell_range[0][0] : 0;
+  in.owned_end = (part.n_ranks > 1) ? part.local_cell_range[0][1] : n_cells;
+  const deposit_1d::Result r = deposit_1d::redistribute(
+      deposit_workspace(), state, laser_map_workspace(), m, hot_e_extra_device, in, stream);
+  mesh.last_ghost_transition_blend = r.transition_blend;
+  mesh.last_ghost_transition_resolved_cells = r.resolved_cells;
+  mesh.last_transfer_blocked_power = r.blocked_power;
+  if (r.smoothing_ran != 0 && std::abs(r.smoothing_sum_before) > 1.0e-20 &&
+      r.smoothing_rel > conservation_tol) {
+    core::log_warning("Laser deposit smoothing conservation check failed: rel=" +
+                      std::to_string(r.smoothing_rel));
+  }
+  if (std::abs(r.sum_input) > 1.0e-20 && r.conservation_rel > conservation_tol) {
+    core::log_warning("Laser transfer conservation check failed: rel=" +
+                      std::to_string(r.conservation_rel));
+  }
+  return r.energy_sum;
+}
+
 
 template <typename CheckFn, typename MsFn>
 void emit_per_ray_step_stats(const LaserMesh& lmesh,
@@ -1638,227 +1531,92 @@ void log_laser_flags(const core::DeviceErrorFlags& flags) {
   }
 }
 
-void build_port_section_diagnostics(
-    LaserMesh& lmesh,
-    const Beam& beam,
-    const HydroMirror1D& hydro,
-    const CbetWorkspace& cbet_ws,
-    const int n_rays,
-    const bool verbose) {
+// The phase-space table of the step's reference trace, built on the device from the CBET ray
+// records (port_section_s1_gpu.cuh; NUMERICS §5.10.8). Only the S1 audit and ledger scalars come
+// back to the host; the snapshot's intensity map stays on the device until a snapshot is written.
+void build_port_section_table_device(LaserMesh& lmesh,
+                                     const Beam& beam,
+                                     const core::State& state,
+                                     const CbetWorkspace& cbet_ws,
+                                     const int n_rays,
+                                     const bool verbose,
+                                     cudaStream_t stream) {
   auto* const port_state =
       static_cast<PortSectionState*>(lmesh.port_section_state.get());
   TENRYU_ASSERT(port_state != nullptr,
-                "port_section diagnostics require initialized host state");
-  if (n_rays <= 0) {
-    std::memset(&port_state->audit, 0, sizeof(port_state->audit));
-    return;
+                "port_section table build requires initialized host state");
+  TENRYU_ASSERT(n_rays >= 0, "port_section table build: negative ray count");
+  const int n_cells = static_cast<int>(state.rho.size());
+  // The effective mass number of the cells, staged on the device for the CBET cell fields of this
+  // step (cbet_stage_cell_A_eff_device).
+  TENRYU_ASSERT(cbet_ws.cell_A_eff != nullptr &&
+                    cbet_ws.cap_cell_outputs >= static_cast<std::size_t>(n_cells),
+                "port_section table build: cell A_eff not staged");
+  if (!port_state->s1_ws) {
+    port_state->s1_ws =
+        std::make_unique<::tenryu::laser::port_section::S1DeviceWorkspace>();
   }
 
-  const int cap_per_ray = cbet_ws.cap_per_ray;
-  const std::size_t stripe_size =
-      static_cast<std::size_t>(n_rays) *
-      static_cast<std::size_t>(cap_per_ray);
-  std::vector<std::int32_t> rec_count(static_cast<std::size_t>(n_rays));
-  std::vector<std::int32_t> stripe_cell(stripe_size);
-  std::vector<float> stripe_mu(stripe_size);
-  std::vector<double> stripe_ds(stripe_size);
-  std::vector<double> stripe_S(stripe_size);
-  std::vector<double> ray_P0(static_cast<std::size_t>(n_rays));
-  std::vector<std::int32_t> ray_group_base(
-      static_cast<std::size_t>(n_rays));
-
-  cuda_check(cudaMemcpy(rec_count.data(), cbet_ws.rec_count,
-                        rec_count.size() * sizeof(std::int32_t),
-                        cudaMemcpyDeviceToHost),
-             "port_section rec_count D2H failed");
-  cuda_check(cudaMemcpy(stripe_cell.data(), cbet_ws.rec_cell,
-                        stripe_cell.size() * sizeof(std::int32_t),
-                        cudaMemcpyDeviceToHost),
-             "port_section rec_cell D2H failed");
-  cuda_check(cudaMemcpy(stripe_mu.data(), cbet_ws.rec_mu,
-                        stripe_mu.size() * sizeof(float),
-                        cudaMemcpyDeviceToHost),
-             "port_section rec_mu D2H failed");
-  cuda_check(cudaMemcpy(stripe_ds.data(), cbet_ws.rec_ds,
-                        stripe_ds.size() * sizeof(double),
-                        cudaMemcpyDeviceToHost),
-             "port_section rec_ds D2H failed");
-  cuda_check(cudaMemcpy(stripe_S.data(), cbet_ws.rec_S,
-                        stripe_S.size() * sizeof(double),
-                        cudaMemcpyDeviceToHost),
-             "port_section rec_S D2H failed");
-  cuda_check(cudaMemcpy(ray_P0.data(), cbet_ws.ray_P0,
-                        ray_P0.size() * sizeof(double),
-                        cudaMemcpyDeviceToHost),
-             "port_section ray_P0 D2H failed");
-  cuda_check(cudaMemcpy(ray_group_base.data(), cbet_ws.ray_group_base,
-                        ray_group_base.size() * sizeof(std::int32_t),
-                        cudaMemcpyDeviceToHost),
-             "port_section ray_group_base D2H failed");
-
-  std::vector<std::int64_t> ray_rec_offset(
-      static_cast<std::size_t>(n_rays) + 1, 0);
-  for (int ray = 0; ray < n_rays; ++ray) {
-    const int count =
-        std::clamp(static_cast<int>(rec_count[static_cast<std::size_t>(ray)]),
-                   0, cap_per_ray);
-    ray_rec_offset[static_cast<std::size_t>(ray) + 1] =
-        ray_rec_offset[static_cast<std::size_t>(ray)] + count;
-  }
-  const std::size_t n_records =
-      static_cast<std::size_t>(ray_rec_offset.back());
-  std::vector<std::int32_t> rec_cell(n_records);
-  std::vector<float> rec_mu(n_records);
-  std::vector<double> rec_ds(n_records);
-  std::vector<double> rec_S(n_records);
-  for (int ray = 0; ray < n_rays; ++ray) {
-    const std::size_t source =
-        static_cast<std::size_t>(ray) *
-        static_cast<std::size_t>(cap_per_ray);
-    const std::size_t destination = static_cast<std::size_t>(
-        ray_rec_offset[static_cast<std::size_t>(ray)]);
-    const std::size_t count = static_cast<std::size_t>(
-        ray_rec_offset[static_cast<std::size_t>(ray) + 1] -
-        ray_rec_offset[static_cast<std::size_t>(ray)]);
-    if (count == 0) {
-      continue;
-    }
-    std::copy_n(stripe_cell.data() + source, count,
-                rec_cell.data() + destination);
-    std::copy_n(stripe_mu.data() + source, count,
-                rec_mu.data() + destination);
-    std::copy_n(stripe_ds.data() + source, count,
-                rec_ds.data() + destination);
-    std::copy_n(stripe_S.data() + source, count,
-                rec_S.data() + destination);
-  }
-
-  const int n_cells = static_cast<int>(hydro.rho.size());
-  std::vector<double> cell_r_center(static_cast<std::size_t>(n_cells));
-  std::vector<double> cell_eps(static_cast<std::size_t>(n_cells));
-  for (int cell = 0; cell < n_cells; ++cell) {
-    const std::size_t index = static_cast<std::size_t>(cell);
-    cell_r_center[index] =
-        0.5 * (hydro.r_edges[index] + hydro.r_edges[index + 1]);
-    const double zbar = std::max(hydro.zbar[index], 0.0);
-    const double A_eff = std::max(hydro.A_eff[index], 1.0e-30);
-    const double ne =
-        hydro.rho[index] * zbar /
-        (A_eff * core::constants::proton_mass);
-    cell_eps[index] = std::max(0.0, 1.0 - ne / lmesh.n_crit);
-  }
-
-  std::vector<double> impact_parameter(static_cast<std::size_t>(n_rays));
+  ::tenryu::laser::port_section::S1DeviceInput input;
+  input.n_rays = n_rays;
+  input.cap_per_ray = cbet_ws.cap_per_ray;
+  input.n_cells = n_cells;
+  input.n_bins = cbet_ws.n_bins;
+  input.rec_count = cbet_ws.rec_count;
+  input.rec_cell = cbet_ws.rec_cell;
+  input.rec_mu = cbet_ws.rec_mu;
+  input.rec_ds = cbet_ws.rec_ds;
+  input.rec_S = cbet_ws.rec_S;
+  input.ray_P0 = cbet_ws.ray_P0;
+  input.ray_group_base = cbet_ws.ray_group_base;
+  input.r_edges = state.x_r.data();
+  input.rho = state.rho.data();
+  input.zbar = state.zbar.data();
+  input.A_eff = cbet_ws.cell_A_eff;
+  input.n_crit = lmesh.n_crit;
   const double R_beam =
       std::abs(lmesh.Z_max - beam.axial_focus_1d()) /
       (2.0 * std::max(beam.f_number, 1.0e-12));
-  const double dR = R_beam / static_cast<double>(n_rays);
-  for (int ray = 0; ray < n_rays; ++ray) {
-    impact_parameter[static_cast<std::size_t>(ray)] =
-        dR * (static_cast<double>(ray) + 0.5);
-  }
+  input.impact_spacing = n_rays > 0 ? R_beam / static_cast<double>(n_rays) : 0.0;
 
-  const IncidentAttenuationContext attenuation_context{&rec_S};
-  sector_adapter::AdapterInput adapter_input{};
-  adapter_input.n_rays = n_rays;
-  adapter_input.ray_rec_offset = ray_rec_offset.data();
-  adapter_input.rec_cell = rec_cell.data();
-  adapter_input.rec_mu = rec_mu.data();
-  adapter_input.rec_ds = rec_ds.data();
-  adapter_input.ray_P0 = ray_P0.data();
-  adapter_input.ray_impact_parameter = impact_parameter.data();
-  adapter_input.cell_r_center = cell_r_center.data();
-  adapter_input.r_edges = hydro.r_edges.data();
-  adapter_input.cell_eps = cell_eps.data();
-  adapter_input.n_cells = n_cells;
-  adapter_input.attenuate = apply_incident_attenuation;
-  adapter_input.attenuation_context = &attenuation_context;
-  std::vector<int> source_ray_indices;
-  const std::vector<sector_ps::RayPath> ray_paths =
-      sector_adapter::build_ray_paths(adapter_input, &source_ray_indices);
-  port_state->ray_bin.resize(source_ray_indices.size());
-  for (std::size_t ray = 0; ray < source_ray_indices.size(); ++ray) {
-    const int source_ray = source_ray_indices[ray];
-    // build_keys adds n_bins only for mu>0 records. Phase-space sheet 0 is
-    // the incoming (mu<0) leg, so beam-0 group_base carries the bin only.
-    const int bin =
-        ray_group_base[static_cast<std::size_t>(source_ray)] % cbet_ws.n_bins;
-    TENRYU_ASSERT(bin >= 0 && bin < cbet_ws.n_bins,
-                  "port_section ray impact bin out of range");
-    port_state->ray_bin[ray] = bin;
+  const ::tenryu::laser::port_section::S1DeviceSummary summary =
+      ::tenryu::laser::port_section::build_s1_table_device(
+          input, *port_state->s1_ws, stream, &port_state->device_table);
+  TENRYU_ASSERT((summary.error_flags & 1) == 0,
+                "port_section ray impact bin out of range");
+  // The table keeps the radii it was built on (the hydro nodes move before it is read again).
+  if (port_state->shell_r_device.size() != state.x_r.size()) {
+    port_state->shell_r_device.reset(state.x_r.size());
   }
-  int crossings_shell0 = 0;
-  const double shell0 = hydro.r_edges.front();
-  for (const sector_ps::RayPath& path : ray_paths) {
-    for (std::size_t node = 0; node + 1 < path.r.size(); ++node) {
-      if (path.r[node] != path.r[node + 1] &&
-          shell0 >= std::min(path.r[node], path.r[node + 1]) &&
-          shell0 <= std::max(path.r[node], path.r[node + 1])) {
-        ++crossings_shell0;
-      }
-    }
-  }
+  cuda_check(cudaMemcpyAsync(port_state->shell_r_device.data(), state.x_r.data(),
+                             state.x_r.size() * sizeof(double),
+                             cudaMemcpyDeviceToDevice, stream),
+             "port_section shell radii copy failed");
+  port_state->device_table.shell_r = port_state->shell_r_device.data();
+  port_state->device_input = input;
+  port_state->device_table_valid = true;
 
-  std::vector<double> shell_eps(hydro.r_edges.size(), 0.0);
-  for (std::size_t shell = 0; shell < hydro.r_edges.size(); ++shell) {
-    const double radius = hydro.r_edges[shell];
-    if (radius <= cell_r_center.front()) {
-      shell_eps[shell] = cell_eps.front();
-      continue;
-    }
-    if (radius >= cell_r_center.back()) {
-      shell_eps[shell] = cell_eps.back();
-      continue;
-    }
-    const auto upper =
-        std::upper_bound(cell_r_center.begin(), cell_r_center.end(), radius);
-    const std::size_t hi =
-        static_cast<std::size_t>(upper - cell_r_center.begin());
-    const std::size_t lo = hi - 1;
-    const double weight =
-        (radius - cell_r_center[lo]) /
-        (cell_r_center[hi] - cell_r_center[lo]);
-    shell_eps[shell] =
-        cell_eps[lo] + weight * (cell_eps[hi] - cell_eps[lo]);
+  const std::size_t map_size =
+      static_cast<std::size_t>(port_state->device_table.n_shells) *
+      static_cast<std::size_t>(::tenryu::laser::port_section::kRayMapThetaBins) * 2U;
+  if (port_state->ray_map_device.size() != map_size) {
+    port_state->ray_map_device.reset(map_size);
   }
+  ::tenryu::laser::port_section::build_ray_map_device(
+      port_state->device_table, port_state->ray_map_device.data(), stream);
+  port_state->ray_map_valid = true;
 
-  // Record-granularity audit tolerances (2026-07-31): per-record mu +
-  // cell-edge radii give a coarse B reconstruction (floor ~0.3 on the
-  // S1 fixture); the library defaults are precision-fixture numbers and
-  // would trip the internal audit assert in Debug builds. 0.5 matches
-  // the external catastrophic-breakage gate.
-  sector_ps::PhaseSpaceParams s1_audit_params{};
-  s1_audit_params.bouguer_tol = 0.5;
-  s1_audit_params.bouguer_tol_fd = 0.5;
-  port_state->table =
-      sector_ps::build_table(ray_paths, hydro.r_edges, shell_eps,
-                             s1_audit_params, port_state->annotations);
-  port_state->ledger = sector_ps::exclusion_ledger(port_state->table);
-  long long total_nodes = 0;
-  for (const sector_ps::RayPath& path : ray_paths) {
-    total_nodes += static_cast<long long>(path.r.size());
-  }
-  long long total_crossings = 0;
-  for (std::size_t shell = 0; shell < hydro.r_edges.size(); ++shell) {
-    for (int sheet = 0; sheet < 2; ++sheet) {
-      total_crossings += static_cast<long long>(
-          sector_ps::crossings(port_state->table,
-                               static_cast<int>(shell), sheet).size());
-    }
-  }
-  double bouguer_drift_max = 0.0;
-  for (const sector_ps::RayAnnotation& annotation :
-       port_state->annotations) {
-    bouguer_drift_max =
-        std::max(bouguer_drift_max, annotation.bouguer_max_drift);
-  }
   std::memset(&port_state->audit, 0, sizeof(port_state->audit));
+  if (n_rays == 0) {
+    // A step without rays leaves an empty table and a zero intensity map; the audit of the
+    // former host build stayed zero and was not counted as a build.
+    return;
+  }
   port_state->audit.n_rays = n_rays;
-  port_state->audit.total_nodes = total_nodes;
-  port_state->audit.total_crossings = total_crossings;
-  port_state->audit.excluded_frac =
-      port_state->ledger.excluded_power_fraction;
-  port_state->audit.bouguer_drift_max = bouguer_drift_max;
+  port_state->audit.total_nodes = summary.total_nodes;
+  port_state->audit.total_crossings = summary.total_crossings;
+  port_state->audit.excluded_frac = summary.excluded_power_fraction;
+  port_state->audit.bouguer_drift_max = summary.bouguer_drift_max;
   ++port_state->build_count;
 
   if (verbose) {
@@ -1866,9 +1624,10 @@ void build_port_section_diagnostics(
     oss.setf(std::ios::scientific);
     oss << std::setprecision(3)
         << "port_section_s1: rays=" << port_state->audit.n_rays
+        << " paths=" << summary.n_paths
         << " excluded_frac=" << port_state->audit.excluded_frac
         << " bouguer_drift=" << port_state->audit.bouguer_drift_max
-        << " crossings_shell0=" << crossings_shell0
+        << " crossings=" << summary.total_crossings
         << " ports=" << port_state->ports.ports.size()
         << " pairs=" << port_state->ports.pairs.size();
     core::log_info(oss.str());
@@ -2131,6 +1890,49 @@ const S1Audit* last_s1_audit(const LaserMesh& mesh) {
 
 }  // namespace sector_adapter
 
+bool last_port_section_table_build(const LaserMesh& lmesh,
+                                   port_section::S1DeviceInput* input,
+                                   port_section::S1DeviceTable* table) {
+  const auto* const port_state =
+      static_cast<const PortSectionState*>(lmesh.port_section_state.get());
+  if (port_state == nullptr || !port_state->device_table_valid) {
+    return false;
+  }
+  *input = port_state->device_input;
+  *table = port_state->device_table;
+  return true;
+}
+
+void sync_laser_snapshot_fields(core::State& state, const LaserMesh& lmesh) {
+  // The 1D CBET exchange maps and the port_section outgoing power and capture per port.
+  cbet_sync_output_fields(state, global_cbet_workspace());
+  const auto* const port_state =
+      static_cast<const PortSectionState*>(lmesh.port_section_state.get());
+  if (port_state == nullptr) {
+    return;
+  }
+  if (port_state->sky_valid) {
+    // The hot-electron model's sky map, in W/cm^2 as the host's fill_port_section_sky_map wrote it.
+    constexpr double kErgPerSToW = 1.0e-7;
+    state.ps_sky_mu = port_state->sky_mu;
+    state.ps_sky_phi = port_state->sky_phi;
+    port_state->sky_I_tot_device.copy_to_host(state.ps_sky_I_tot);
+    port_state->sky_I_cw_device.copy_to_host(state.ps_sky_I_cw);
+    port_state->sky_n_sigma_device.copy_to_host(state.ps_sky_n_sigma);
+    for (std::size_t i = 0; i < state.ps_sky_I_tot.size(); ++i) {
+      state.ps_sky_I_tot[i] *= kErgPerSToW;
+      state.ps_sky_I_cw[i] *= kErgPerSToW;
+    }
+  }
+  if (!port_state->ray_map_valid) {
+    return;
+  }
+  state.ps_ray_map.resize(port_state->ray_map_device.size());
+  port_state->ray_map_device.copy_to_host(state.ps_ray_map);
+  state.ps_ray_map_shell_r.resize(port_state->shell_r_device.size());
+  port_state->shell_r_device.copy_to_host(state.ps_ray_map_shell_r);
+}
+
 void laser_step(core::State& state,
                 LaserMesh& lmesh,
                 const core::Config::LaserConfig& laser,
@@ -2255,7 +2057,15 @@ void laser_step(core::State& state,
   std::fill(state.hot_e_ch_in_step.begin(), state.hot_e_ch_in_step.end(), 0.0);
   std::fill(state.hot_e_ch_deposited_step.begin(), state.hot_e_ch_deposited_step.end(), 0.0);
   std::fill(state.hot_e_ch_escaped_step.begin(), state.hot_e_ch_escaped_step.end(), 0.0);
-  state.ray_density.fill(0.0);
+  // Zeroed on the device in the legacy default stream, ordered like the
+  // copy Field1D::fill made (from a host array of zeros, which waited for the
+  // device every step) before the readers: finalize_ray_density and the
+  // output copies, all on that stream.
+  if (!state.ray_density.empty()) {
+    cuda_check(cudaMemsetAsync(state.ray_density.data(), 0,
+                               state.ray_density.size() * sizeof(double), nullptr),
+               "laser_step ray_density zero failed");
+  }
   if (collect_trajectory) {
     state.ray_traj_offsets.clear();
     state.ray_traj_step_counts.clear();
@@ -2520,8 +2330,8 @@ void laser_step(core::State& state,
   int hot_e_n_config_channels = 0;
   bool hot_e_capture_on = false;
   bool ps_hot_e_capture_on = false;
-  std::vector<double> hot_e_model_cell_nhat;
-  std::vector<double> hot_e_model_cell_r;
+  // n_e / n_c of the cells for the port_section capture thresholds (device, hot_e_inputs).
+  const double* hot_e_model_cell_nhat_device = nullptr;
   if (hot_e_on && total_power > 0.0) {
     const auto& he_cfg = laser.hot_electron;
     const auto clamp_eta = [](const double eta_raw) {
@@ -2568,32 +2378,17 @@ void laser_step(core::State& state,
         state.hot_e_eta_diag_n_sigma.assign(n_ch, 0.0);
       }
 
-      HydroMirror1D em;
-      build_hydro_mirror_1d(lmesh, state, em);
-      std::vector<double> h_Te(state.Te.size());
-      state.Te.copy_to_host(h_Te.data());
-      const int n_cells = static_cast<int>(em.rho.size());
-      hot_e_model_cell_r.assign(static_cast<std::size_t>(n_cells), 0.0);
-      hot_e_model_cell_nhat.assign(static_cast<std::size_t>(n_cells), 0.0);
-      std::vector<double> n_e(static_cast<std::size_t>(n_cells), 0.0);
-      for (int c = 0; c < n_cells; ++c) {
-        const std::size_t s = static_cast<std::size_t>(c);
-        hot_e_model_cell_r[s] =
-            0.5 * (em.r_edges[s] + em.r_edges[s + 1U]);
-        if (em.cell_is_void[s] != 0U) {
-          n_e[s] = 0.0;
-        } else {
-          n_e[s] =
-              std::max(0.0, em.rho[s]) * std::max(0.0, em.zbar[s]) /
-              (std::max(em.A_eff[s], 1.0e-30) *
-               core::constants::proton_mass);
-        }
-      }
-      const double n_crit_safe = std::max(lmesh.n_crit, 1.0e-30);
-      for (int c = 0; c < n_cells; ++c) {
-        const std::size_t s = static_cast<std::size_t>(c);
-        hot_e_model_cell_nhat[s] = n_e[s] / n_crit_safe;
-      }
+      // The model's inputs on the device (hot_e_inputs_gpu.cuh): the cells' n_e / n_c and centres,
+      // and per channel the evaluation surface, its temperature, nearest shell and fitted density
+      // scale; in port_section, with the previous step's phase-space table, the illumination metric
+      // and the common-wave drive with the sky map.
+      auto& he_inputs = hot_e_inputs_workspace();
+      auto& cbet_cells = global_cbet_workspace();
+      cbet_stage_cell_A_eff_device(cbet_cells, state, lmesh.material_A,
+                                   lmesh.material_A_list, stream);
+      hot_e_inputs::stage_cells(he_inputs, state, cbet_cells.cell_A_eff,
+                                lmesh.n_crit, stream);
+      hot_e_model_cell_nhat_device = hot_e_inputs::cell_n_hat(he_inputs);
 
       hot_e_eta::ModelParams model_params;
       model_params.ln_filter_tau_s = he_cfg.eta_model.ln_filter_tau_s;
@@ -2607,94 +2402,74 @@ void laser_step(core::State& state,
           break;
         }
       }
+      auto* const port_state =
+          port_section
+              ? static_cast<PortSectionState*>(lmesh.port_section_state.get())
+              : nullptr;
+      // The previous step's table, as the host consumers read it (a table exists once a step
+      // with rays has built one).
+      const bool have_table = port_state != nullptr &&
+                              port_state->build_count > 0 &&
+                              port_state->device_table_valid;
+      std::vector<hot_e_inputs::ChannelSpec> specs(n_ch);
+      for (int ci = 0; ci < hot_e_n_config_channels; ++ci) {
+        const auto& source = he_cfg.sources[static_cast<std::size_t>(ci)];
+        auto& spec = specs[static_cast<std::size_t>(ci)];
+        spec.eval_nc_fraction = source.eval_nc_fraction;
+        spec.illumination =
+            port_section && he_cfg.illumination_metric == "equivalent_area";
+        spec.common_wave = port_section && source.mechanism == "tpd" &&
+                           he_cfg.tpd_overlap_mode == "common_wave_cluster";
+        spec.sky_map = port_section && ci == sky_eval_channel;
+        spec.delta_theta_deg = he_cfg.common_wave_delta_theta_deg;
+      }
+      if (have_table) {
+        hot_e_inputs::stage_ports(he_inputs, port_state->ports);
+      }
+      const std::vector<hot_e_inputs::ChannelResult> he_results =
+          hot_e_inputs::evaluate_channels(
+              he_inputs, state, specs,
+              have_table ? &port_state->device_table : nullptr, lmesh.n_crit,
+              stream);
+      if (port_state != nullptr) {
+        const std::size_t n_sky = static_cast<std::size_t>(hot_e_inputs::kCommonWaveMuGrid) *
+                                  static_cast<std::size_t>(hot_e_inputs::kCommonWavePhiGrid);
+        if (port_state->sky_I_tot_device.size() != n_sky) {
+          port_state->sky_I_tot_device.reset(n_sky);
+          port_state->sky_I_cw_device.reset(n_sky);
+          port_state->sky_n_sigma_device.reset(n_sky);
+        }
+        if (hot_e_inputs::copy_sky_map(he_inputs, port_state->sky_I_tot_device.data(),
+                                       port_state->sky_I_cw_device.data(),
+                                       port_state->sky_n_sigma_device.data(), stream)) {
+          port_state->sky_mu = hot_e_inputs::sky_mu(he_inputs);
+          port_state->sky_phi = hot_e_inputs::sky_phi(he_inputs);
+          port_state->sky_valid = true;
+        }
+      }
       for (int ci = 0; ci < hot_e_n_config_channels; ++ci) {
         const std::size_t s = static_cast<std::size_t>(ci);
         const auto& source = he_cfg.sources[s];
+        const hot_e_inputs::ChannelResult& he_result = he_results[s];
         state.hot_e_eta_diag_I14_lower[s] = 0.0;
         state.hot_e_eta_diag_I14_upper[s] = 0.0;
         state.hot_e_eta_diag_n_sigma[s] = 0.0;
         hot_e_eta::ChannelInputs inputs;
-        const double n_tgt =
-            source.eval_nc_fraction * n_crit_safe;
-        int eval_c = -1;
-        double alpha = 0.0;
-        for (int c = n_cells - 1; c >= 1; --c) {
-          const std::size_t outer = static_cast<std::size_t>(c);
-          const std::size_t inner = static_cast<std::size_t>(c - 1);
-          if (em.cell_is_void[outer] != 0U ||
-              em.cell_is_void[inner] != 0U ||
-              !(n_e[outer] > 0.0) || !(n_e[inner] > 0.0)) {
-            continue;
-          }
-          if (n_e[outer] < n_tgt && n_e[inner] >= n_tgt) {
-            eval_c = c;
-            alpha =
-                (n_tgt - n_e[outer]) / (n_e[inner] - n_e[outer]);
-            break;
-          }
-        }
-
-        double Te_s_eV = 0.0;
-        double kappa_um = 0.0;
-        double eval_radius_cm = 0.0;
-        int eval_shell = -1;
-        bool valid = (eval_c >= 1);
-        if (valid) {
-          const std::size_t outer = static_cast<std::size_t>(eval_c);
-          const std::size_t inner = static_cast<std::size_t>(eval_c - 1);
-          Te_s_eV = (1.0 - alpha) * h_Te[outer] + alpha * h_Te[inner];
-          eval_radius_cm =
-              hot_e_model_cell_r[outer] +
-              alpha * (hot_e_model_cell_r[inner] -
-                       hot_e_model_cell_r[outer]);
-          eval_shell = nearest_shell_index(em.r_edges, eval_radius_cm);
-          const double r_s_um =
-              eval_radius_cm * 1.0e4;
-          const int fit_begin = std::max(0, eval_c - 4);
-          const int fit_end = std::min(n_cells - 1, eval_c + 2);
-          std::vector<double> fit_r_um;
-          std::vector<double> fit_ne;
-          fit_r_um.reserve(static_cast<std::size_t>(fit_end - fit_begin + 1));
-          fit_ne.reserve(static_cast<std::size_t>(fit_end - fit_begin + 1));
-          for (int c = fit_begin; c <= fit_end; ++c) {
-            const std::size_t fit_s = static_cast<std::size_t>(c);
-            if (em.cell_is_void[fit_s] != 0U || !(n_e[fit_s] > 0.0)) {
-              continue;
-            }
-            fit_r_um.push_back(hot_e_model_cell_r[fit_s] * 1.0e4);
-            fit_ne.push_back(n_e[fit_s]);
-          }
-          kappa_um = hot_e_eta::fit_kappa_abs_um(
-              fit_r_um.data(), fit_ne.data(), fit_r_um.size(), r_s_um);
-          if (!(kappa_um > 0.0)) {
-            valid = false;
-          }
-        }
+        // As the host search left them: set once an evaluation surface exists (zero otherwise),
+        // whether or not the fitted scale is positive.
+        const double Te_s_eV = he_result.Te_s_eV;
+        const double kappa_um = he_result.kappa_um;
+        const int eval_shell = he_result.eval_shell;
+        bool valid = he_result.valid;
 
         double f_illum = 1.0;
-        const auto* const port_state =
-            port_section
-                ? static_cast<const PortSectionState*>(
-                      lmesh.port_section_state.get())
-                : nullptr;
-        const bool collect_sky_grid =
-            port_section && ci == sky_eval_channel &&
-            port_state != nullptr && port_state->build_count > 0 &&
-            eval_shell >= 0;
         if (port_section &&
             he_cfg.illumination_metric == "equivalent_area") {
-          if (port_state != nullptr && port_state->build_count > 0 &&
-              eval_shell >= 0) {
-            const ::tenryu::laser::port_section::IlluminationInput
-                illumination_input{
-                    &port_state->ports, &port_state->table, eval_shell};
-            const port_geom::IlluminationResult illumination =
-                ::tenryu::laser::port_section::illumination_at_shell(
-                    illumination_input);
-            f_illum = illumination.f_illum2;
+          if (have_table && eval_shell >= 0 && he_result.illumination_valid) {
+            f_illum = he_result.f_illum2;
             if (ci == sky_eval_channel) {
-              state.ps_f_illum2 = illumination.f_illum2;
-              state.ps_f_union = illumination.f_union;
+              state.ps_f_illum2 = he_result.f_illum2;
+              state.ps_f_union = he_result.f_union;
             }
             if (!(std::isfinite(f_illum) && f_illum > 0.0)) {
               valid = false;
@@ -2721,26 +2496,17 @@ void laser_step(core::State& state,
         }
         if (port_section && source.mechanism == "tpd" &&
             he_cfg.tpd_overlap_mode == "common_wave_cluster") {
-          ::tenryu::laser::port_section::CommonWaveDriveResult drive{};
-          ::tenryu::laser::port_section::CommonWaveDriveGridOutput
-              grid_output;
-          if (port_state != nullptr && port_state->build_count > 0 &&
-              eval_shell >= 0) {
-            const ::tenryu::laser::port_section::CommonWaveDriveInput
-                drive_input{
-                    &port_state->ports,
-                    &port_state->table,
-                    eval_shell,
-                    he_cfg.common_wave_delta_theta_deg};
-            drive =
-                ::tenryu::laser::port_section::common_wave_drive(
-                    drive_input,
-                    collect_sky_grid ? &grid_output : nullptr);
-            if (collect_sky_grid) {
-              fill_port_section_sky_map(state, grid_output);
-            }
-            if (std::isfinite(drive.I_drive) && drive.I_drive > 0.0) {
-              I14 = drive.I_drive / 1.0e7 / 1.0e14;
+          double I_lower = 0.0;
+          double I_drive = 0.0;
+          double I_upper = 0.0;
+          int n_sigma_mode = 0;
+          if (have_table && eval_shell >= 0 && he_result.drive_computed) {
+            I_drive = he_result.I_drive;
+            I_lower = he_result.I_lower;
+            I_upper = he_result.I_upper;
+            n_sigma_mode = he_result.n_sigma_mode;
+            if (std::isfinite(I_drive) && I_drive > 0.0) {
+              I14 = I_drive / 1.0e7 / 1.0e14;
             } else {
               valid = false;
             }
@@ -2751,29 +2517,16 @@ void laser_step(core::State& state,
           drive_oss.setf(std::ios::scientific);
           drive_oss << std::setprecision(6)
                     << "hot_e_tpd_common_wave: ch=" << ci
-                    << " lower=" << drive.I_lower
-                    << " drive=" << drive.I_drive
-                    << " upper=" << drive.I_upper;
+                    << " lower=" << I_lower
+                    << " drive=" << I_drive
+                    << " upper=" << I_upper;
           core::log_info(drive_oss.str());
           state.hot_e_eta_diag_I14_lower[s] =
-              drive.I_lower / 1.0e7 / 1.0e14;
+              I_lower / 1.0e7 / 1.0e14;
           state.hot_e_eta_diag_I14_upper[s] =
-              drive.I_upper / 1.0e7 / 1.0e14;
+              I_upper / 1.0e7 / 1.0e14;
           state.hot_e_eta_diag_n_sigma[s] =
-              static_cast<double>(drive.n_sigma_mode);
-        } else if (collect_sky_grid) {
-          const ::tenryu::laser::port_section::CommonWaveDriveInput
-              drive_input{
-                  &port_state->ports,
-                  &port_state->table,
-                  eval_shell,
-                  he_cfg.common_wave_delta_theta_deg};
-          ::tenryu::laser::port_section::CommonWaveDriveGridOutput
-              grid_output;
-          static_cast<void>(
-              ::tenryu::laser::port_section::common_wave_drive(
-                  drive_input, &grid_output));
-          fill_port_section_sky_map(state, grid_output);
+              static_cast<double>(n_sigma_mode);
         }
         if (!(Te_s_eV > 0.0)) {
           valid = false;
@@ -2902,9 +2655,13 @@ void laser_step(core::State& state,
               : 1.0;
     }
   }
+  // The few captures made on the host (radial_absorption_1d, port_section). The 1D transport runs
+  // on the device (hot_e_transport_1d_gpu.cuh), where the trace's capture rows are staged.
   std::vector<std::vector<tenryu::laser::hot_electron::RayCapture>>
       hot_e_captures_by_channel(static_cast<std::size_t>(hot_e_n_config_channels));
-  std::vector<double> hot_e_capture_stage;
+  if (hot_e_transport_on && state.mesh.dim == 1) {
+    hot_e_transport_1d::begin_step(hot_e_transport_workspace(), hot_e_n_config_channels, stream);
+  }
   int hot_e_capture_beams = 0;
   // 1D beam folding: beams that replay the anchor's trace also replay its
   // hot-electron capture rows (identical keys give identical rays and captures).
@@ -2932,7 +2689,7 @@ void laser_step(core::State& state,
       group_powers[b] = std::max(0.0, beams.items[b].get_average_power(t, t + dt));
     }
     if (skip_cache != nullptr) {
-      f_hat_groups.assign(group_powers.size(), std::vector<double>(state.laser_dep.size(), 0.0));
+      // the normalised deposits are kept on the device (RaytraceSkipCache::f_hat_step)
       skip_group_powers = group_powers;
     }
   } else {
@@ -2968,6 +2725,8 @@ void laser_step(core::State& state,
   HydroCellLocator2D hydro_locator_2d(state);
 
   bool skip_raytrace = false;
+  double skip_energy_sum_1d = 0.0;
+  bool skip_energy_sum_valid = false;
   if (!radial_absorption_1d && !hot_e_on && skip_cache != nullptr && !cbet_on_2d) {
     skip_cache->ensure_capacity(static_cast<int>(state.laser_dep.size()),
                                 std::max(1, static_cast<int>(skip_group_powers.size())));
@@ -2982,7 +2741,7 @@ void laser_step(core::State& state,
         state, laser, lmesh.n_crit, lmesh.n_hat_margin, lmesh.material_A_list,
         A_eff_uniform, skip_group_powers, beam_dirs, beam_focuses, beam_defocus,
         state.ale_rezoned, stream, rho_floor, Te_floor, &local_skip_metric,
-        &local_skip_eligible, &local_crit_hit, cbet_on);
+        &local_skip_eligible, &local_crit_hit, cbet_on, state.mesh.dim == 1);
     if (use_global_skip_sync) {
       const double all_skip_eligible =
           reduction->allreduce_min(local_skip_eligible ? 1.0 : 0.0);
@@ -3015,22 +2774,28 @@ void laser_step(core::State& state,
       // so the scaled deposit goes through the same redistribution with the
       // current hydro state as a traced step (it used to be written to
       // laser_dep as it was, void and supercritical cells included).
-      build_hydro_mirror_1d(lmesh, state, hydro_mirror);
-      std::vector<double> skip_power_cell =
-          copy_cell_deposit_to_host(state.laser_dep, stream);
-      for (double& power : skip_power_cell) {
-        power /= dt;
-      }
-      apply_deposit_redistribution_1d(state, lmesh, hydro_mirror, skip_power_cell, dt,
-                                      laser.deposit.conservation_tol, part,
-                                      laser.deposit.deposit_smooth_passes,
-                                      laser.deposit.deposit_smooth_alpha);
+      // Map and redistribution on the device (laser_map_1d, deposit_1d).
+      auto& skip_cells = global_cbet_workspace();
+      cbet_stage_cell_A_eff_device(skip_cells, state, lmesh.material_A,
+                                   lmesh.material_A_list, stream);
+      const laser_map_1d::MapScalars skip_map = laser_map_1d::map_scalars(
+          laser_map_workspace(), state, skip_cells.cell_A_eff,
+          map_inputs_1d(lmesh, state, laser), stream);
+      auto& skip_deposit = deposit_workspace();
+      deposit_1d::begin(skip_deposit, static_cast<int>(state.laser_dep.size()), stream);
+      deposit_1d::assign_divided(skip_deposit, state.laser_dep.data(), dt, stream);
+      skip_energy_sum_1d = redistribute_deposit_1d(
+          state, lmesh, skip_map, nullptr, dt, laser.deposit.conservation_tol, part,
+          laser.deposit.deposit_smooth_passes, laser.deposit.deposit_smooth_alpha, stream);
+      skip_energy_sum_valid = true;
     }
     if (part.n_ranks > 1) {
       // Keep skip-path deposition ownership consistent with transfer_to_1d/transfer_to_2d.
       mask_non_owned_skip_deposit(state, part);
     }
-    const double dep_power_local = sum_field_energy(state.laser_dep) / dt;
+    // 1D: the redistribution's sum of the written energies (the owned cells, as the mask above).
+    const double dep_power_local =
+        (skip_energy_sum_valid ? skip_energy_sum_1d : sum_field_energy(state.laser_dep)) / dt;
     const double dep_power =
         (reduction != nullptr && part.n_ranks > 1)
             ? reduction->allreduce_sum(dep_power_local)
@@ -3061,6 +2826,9 @@ void laser_step(core::State& state,
     return;
   }
   t_skip_end = Clock::now();
+  if (state.mesh.dim == 1 && skip_cache != nullptr) {
+    skip_cache->begin_fhat_1d(stream);
+  }
 
   const double lambda_cm = laser.wavelength_nm * 1.0e-7;
   CbetLmFields cbet_lm;
@@ -3079,20 +2847,23 @@ void laser_step(core::State& state,
     phys_ext_options.zeff_materials = st.descriptors.data();
     phys_ext_options.n_zeff_materials = static_cast<int>(st.descriptors.size());
   }
+  laser_map_1d::MapScalars map_1d;
   if (state.mesh.dim == 1) {
-    build_hydro_mirror_1d(lmesh, state, hydro_mirror);
+    // The map's scalar part on the device (laser_map_1d_gpu.cuh), from the device A_eff.
+    auto& map_cells = global_cbet_workspace();
+    cbet_stage_cell_A_eff_device(map_cells, state, lmesh.material_A, lmesh.material_A_list,
+                                 stream);
+    map_1d = map_from_hydro_1d_device(lmesh, state, laser, map_cells.cell_A_eff,
+                                      laser_map_workspace(), stream, node_material_args);
+    // The ray-density diagnostic still reads a host mirror.
+    if (collect_density_diag) {
+      build_hydro_mirror_1d(lmesh, state, hydro_mirror);
+    }
     if (phys_ext_options.langdon_model != 0 &&
         phys_ext_options.n_species == 0 && !material_zeff_on) {
-      const std::vector<std::uint8_t>& cell_is_void =
-          hydro_mirror.cell_is_void.empty() ? state.cell_is_void
-                                            : hydro_mirror.cell_is_void;
-      for (int c = static_cast<int>(hydro_mirror.zbar.size()) - 1;
-           c >= 0; --c) {
-        if (cell_is_void[static_cast<std::size_t>(c)] == 0U) {
-          phys_ext_options.langdon_zcoll =
-              hydro_mirror.zbar[static_cast<std::size_t>(c)];
-          break;
-        }
+      // Zbar of the outermost real cell
+      if (map_1d.outer_zbar_cell >= 0) {
+        phys_ext_options.langdon_zcoll = map_1d.outer_zbar;
       }
       static bool logged_langdon_zcoll_fallback = false;
       if (!logged_langdon_zcoll_fallback) {
@@ -3103,7 +2874,6 @@ void laser_step(core::State& state,
         logged_langdon_zcoll_fallback = true;
       }
     }
-    map_from_hydro_1d(lmesh, state, laser, hydro_mirror, stream, node_material_args);
     if (node_material_args != nullptr && phys_ext_options.langdon_model != 0) {
       phys_ext_options.langdon_zcoll_radial = node_material_args->radial_zcoll.data();
     }
@@ -3296,18 +3066,17 @@ void laser_step(core::State& state,
   std::vector<double> node_Z;
 
   double skipped_unabsorbed_power = 0.0;
+  // 1D: the sum of the energies the device redistribution wrote to laser_dep.
+  double step_energy_sum_1d = 0.0;
+  bool step_energy_sum_valid = false;
   if (state.mesh.dim == 1) {
-    const std::vector<std::uint8_t>& cell_is_void =
-        hydro_mirror.cell_is_void.empty() ? state.cell_is_void : hydro_mirror.cell_is_void;
-    const AllowedSupercriticalCell1D allowed_supercritical =
-        (hydro_mirror.rho.size() == state.laser_dep.size() &&
-         hydro_mirror.zbar.size() == state.laser_dep.size() &&
-         hydro_mirror.A_eff.size() == state.laser_dep.size())
-            ? find_allowed_supercritical_cell_1d(cell_is_void, hydro_mirror.rho,
-                                                 hydro_mirror.zbar, hydro_mirror.A_eff,
-                                                 hydro_mirror.r_edges, lmesh.n_crit)
-            : AllowedSupercriticalCell1D{};
-    std::vector<double> total_dep_1d(state.laser_dep.size(), 0.0);
+    // find_allowed_supercritical_cell_1d, from the device map
+    const AllowedSupercriticalCell1D allowed_supercritical{
+        map_1d.allowed_cell, map_1d.critical_adjacent_subcritical_cell, map_1d.r_crit_allowed,
+        map_1d.fallback_only != 0};
+    // The step's cell deposit, accumulated on the device (the beams in order).
+    auto& step_deposit = deposit_workspace();
+    deposit_1d::begin(step_deposit, static_cast<int>(state.laser_dep.size()), stream);
     if (radial_absorption_1d) {
       check_or_fail(
           cudaMemsetAsync(state.laser_dep.data(), 0,
@@ -3324,7 +3093,6 @@ void laser_step(core::State& state,
               d_unabsorbed, d_error_flags, d_critical_surface_hit_count, stream,
               hot_e_params, &d_hot_e_capture_radial),
           "laser_step radial_absorption_1d launch failed");
-      const auto dep_power_cell = copy_cell_deposit_to_host(state.laser_dep, stream);
       if (hot_e_capture_on && d_hot_e_capture_radial != nullptr) {
         std::vector<double> cap(3 * static_cast<std::size_t>(hot_e_params.n_channels), 0.0);
         if (laser_pack_enabled) {
@@ -3366,9 +3134,7 @@ void laser_step(core::State& state,
           }
         }
       }
-      for (std::size_t c = 0; c < dep_power_cell.size(); ++c) {
-        total_dep_1d[c] += dep_power_cell[c];
-      }
+      deposit_1d::add(step_deposit, state.laser_dep.data(), stream);
     } else {
       CbetWorkspace* cbet_ws = nullptr;
       int cbet_ray_cursor = 0;
@@ -3437,7 +3203,6 @@ void laser_step(core::State& state,
 
       bool fold_armed = false;
       FoldKey fold_key{};
-      std::vector<double> fold_dep;
       double fold_d_unabsorbed = 0.0;
       double fold_d_ra_power = 0.0;
       unsigned long long fold_d_tail_count = 0ULL;
@@ -3447,10 +3212,11 @@ void laser_step(core::State& state,
       lmesh.ray_steps_previous.resize(beams.items.size());
       lmesh.ray_steps_output.resize(beams.items.size());
       lmesh.ray_order.resize(beams.items.size());
-      hot_e_capture_stage.assign(static_cast<std::size_t>(beams.items.size()) *
-                                     static_cast<std::size_t>(rays_1d_per_beam) * 4 *
-                                     static_cast<std::size_t>(hot_e_params.n_channels),
-                                 0.0);
+      if (hot_e_capture_on) {
+        hot_e_transport_1d::begin_trace(hot_e_transport_workspace(), hot_e_params.n_channels,
+                                        static_cast<int>(beams.items.size()), rays_1d_per_beam,
+                                        stream);
+      }
       double* d_traj_pos1 = nullptr;
       double* d_traj_pos2 = nullptr;
       double* d_traj_power = nullptr;
@@ -3502,13 +3268,10 @@ void laser_step(core::State& state,
       }
       if (fold_enabled && fold_armed &&
           fold_keys_equal(make_fold_key(beam, P_beam), fold_key)) {
-        for (std::size_t c = 0; c < fold_dep.size(); ++c) {
-          total_dep_1d[c] += fold_dep[c];
-        }
+        deposit_1d::add_fold(step_deposit, stream);
         if (skip_cache != nullptr) {
-          for (std::size_t c = 0; c < fold_dep.size(); ++c) {
-            f_hat_groups[b][c] = fold_dep[c] / std::max(P_beam, 1.0e-30);
-          }
+          skip_cache->set_fhat_1d(static_cast<int>(b), deposit_1d::fold(step_deposit), P_beam,
+                                  stream);
         }
         ++fold_replays;
         fold_replayed_beams.push_back(b);
@@ -3637,56 +3400,9 @@ void laser_step(core::State& state,
         cbet_ray_cursor += rays.n_rays;
       }
       if (phys_ext_options.ra_enable != 0) {
-        phys_ext_options.ra_r_crit_cm = -1.0;
-        phys_ext_options.ra_ln_cm = -1.0;
-        const int n_cells =
-            static_cast<int>(hydro_mirror.rho.size());
-        std::vector<double> n_hat_cell(
-            static_cast<std::size_t>(n_cells), 0.0);
-        const double n_crit_safe = std::max(lmesh.n_crit, 1.0e-30);
-        for (int c = 0; c < n_cells; ++c) {
-          const std::size_t s = static_cast<std::size_t>(c);
-          if (cell_is_void[s] != 0U) {
-            continue;
-          }
-          const double A_eff =
-              std::max(hydro_mirror.A_eff[s], 1.0e-30);
-          const double n_e =
-              std::max(0.0, hydro_mirror.rho[s]) *
-              std::max(0.0, hydro_mirror.zbar[s]) /
-              (A_eff * core::constants::proton_mass);
-          n_hat_cell[s] = std::max(0.0, n_e / n_crit_safe);
-        }
-        int c_out = -1;
-        for (int c = n_cells - 2; c >= 0; --c) {
-          if (n_hat_cell[static_cast<std::size_t>(c)] >= 1.0 &&
-              n_hat_cell[static_cast<std::size_t>(c + 1)] < 1.0) {
-            c_out = c;
-            break;
-          }
-        }
-        if (c_out >= 0) {
-          const std::size_t inner = static_cast<std::size_t>(c_out);
-          const std::size_t outer = static_cast<std::size_t>(c_out + 1);
-          const double r_inner =
-              0.5 * (hydro_mirror.r_edges[inner] +
-                     hydro_mirror.r_edges[inner + 1U]);
-          const double r_outer =
-              0.5 * (hydro_mirror.r_edges[outer] +
-                     hydro_mirror.r_edges[outer + 1U]);
-          const double n_inner = n_hat_cell[inner];
-          const double n_outer = n_hat_cell[outer];
-          const double alpha =
-              (1.0 - n_inner) / (n_outer - n_inner);
-          phys_ext_options.ra_r_crit_cm =
-              r_inner + alpha * (r_outer - r_inner);
-          const double dln =
-              std::log(std::max(n_outer, 1.0e-12)) -
-              std::log(std::max(n_inner, 1.0e-12));
-          phys_ext_options.ra_ln_cm =
-              std::clamp(std::abs((r_outer - r_inner) / dln),
-                         1.0e-5, 1.0);
-        }
+        // The outermost downward crossing of n_c, from the device map (-1 when none).
+        phys_ext_options.ra_r_crit_cm = map_1d.ra_r_crit_cm;
+        phys_ext_options.ra_ln_cm = map_1d.ra_ln_cm;
       }
       // Opt-in until the S1.1 physics-accuracy pass closes the march parity gap;
       // see NUMERICS §5.3.5 (2026-08-04 Bouguer fast path).
@@ -3718,8 +3434,8 @@ void laser_step(core::State& state,
       const bool characteristic_trace_1d =
           !use_fast_trace_1d && (laser.raytrace.integrator == "characteristic" ||
                                  laser.raytrace.integrator == "auto");
-      const int* h_ray_order = nullptr;
-      int* h_ray_steps_out = nullptr;
+      const int* d_ray_order = nullptr;
+      int* d_ray_steps_out = nullptr;
       int max_ray_steps_override = 0;
       if (!use_fast_trace_1d && !characteristic_trace_1d) {
         const core::NvtxRange nvtx_order_range("laser.ray_ordering");
@@ -3730,34 +3446,25 @@ void laser_step(core::State& state,
           const char* s = std::getenv("TENRYU_LASER_NO_SPIKE_CAP");
           return s != nullptr && std::strcmp(s, "1") == 0;
         }();
-        if (!spike_cap_disabled && !previous_steps.empty() &&
-            previous_steps.size() == static_cast<std::size_t>(rays.n_rays)) {
-          std::vector<int> step_counts_scratch(previous_steps);
-          const std::size_t p90_idx =
-              ((step_counts_scratch.size() - 1) * 9) / 10;
-          std::nth_element(step_counts_scratch.begin(),
-                           step_counts_scratch.begin() +
-                               static_cast<std::ptrdiff_t>(p90_idx),
-                           step_counts_scratch.end());
-          const int p90 = step_counts_scratch[p90_idx];
+        const std::size_t n_rays_sz = static_cast<std::size_t>(rays.n_rays);
+        const bool have_previous = previous_steps.size() == n_rays_sz && n_rays_sz > 0U;
+        const bool cap_steps = !spike_cap_disabled && have_previous;
+        // The longest-first order and the 90th percentile of the previous step counts on the
+        // device (the host stable sort and nth_element's results; one integer comes back).
+        ray_order.reset(n_rays_sz);
+        int p90 = 0;
+        check_traj_or_cleanup(
+            order_rays_by_previous_steps(previous_steps.data(), rays.n_rays,
+                                         !ray_sort_disabled() && have_previous,
+                                         ray_order.data(), cap_steps ? &p90 : nullptr, stream),
+            "laser_step ray ordering failed");
+        if (cap_steps) {
           const int dynamic_cap = std::max(20000, 10 * p90);
-          max_ray_steps_override =
-              std::min(laser.raytrace.max_steps, dynamic_cap);
+          max_ray_steps_override = std::min(laser.raytrace.max_steps, dynamic_cap);
         }
-        ray_order.resize(static_cast<std::size_t>(rays.n_rays));
-        std::iota(ray_order.begin(), ray_order.end(), 0);
-        if (!ray_sort_disabled() &&
-            previous_steps.size() == static_cast<std::size_t>(rays.n_rays)) {
-          std::stable_sort(
-              ray_order.begin(), ray_order.end(),
-              [&](const int lhs, const int rhs) {
-                return previous_steps[static_cast<std::size_t>(lhs)] >
-                       previous_steps[static_cast<std::size_t>(rhs)];
-              });
-        }
-        steps_output.resize(static_cast<std::size_t>(rays.n_rays));
-        h_ray_order = ray_order.data();
-        h_ray_steps_out = steps_output.data();
+        steps_output.reset(n_rays_sz);
+        d_ray_order = ray_order.data();
+        d_ray_steps_out = steps_output.data();
       }
       const auto t_kernel_start = verbose ? Clock::now() : Clock::time_point{};
       double* d_hot_e_capture_rays = nullptr;
@@ -3793,7 +3500,7 @@ void laser_step(core::State& state,
               phys_ext_active && phys_ext_options.ra_enable != 0
                   ? d_ra_power_total
                   : nullptr,
-              h_ray_order, h_ray_steps_out, max_ray_steps_override,
+              d_ray_order, d_ray_steps_out, max_ray_steps_override,
               d_tau_shell_out, d_pabs_per_ray_out);
       check_traj_or_cleanup(trace_status,
                             "laser_step 1D spherical trace launch failed");
@@ -3916,18 +3623,8 @@ void laser_step(core::State& state,
         ray_steps_pending[b] = 1U;
       }
       if (hot_e_capture_on && d_hot_e_capture_rays != nullptr) {
-        const std::size_t stage_row_doubles =
-            static_cast<std::size_t>(rays_1d_per_beam) * 4 *
-            static_cast<std::size_t>(hot_e_params.n_channels);
-        const std::size_t copy_doubles =
-            static_cast<std::size_t>(rays.n_rays) * 4 *
-            static_cast<std::size_t>(hot_e_params.n_channels);
-        const std::size_t off = static_cast<std::size_t>(b) * stage_row_doubles;
-        check_or_fail(cudaMemcpyAsync(hot_e_capture_stage.data() + off,
-                                      d_hot_e_capture_rays,
-                                      copy_doubles * sizeof(double),
-                                      cudaMemcpyDeviceToHost, stream),
-                      "laser_step hot_e capture async D2H failed");
+        hot_e_transport_1d::stage_beam(hot_e_transport_workspace(), static_cast<int>(b),
+                                       d_hot_e_capture_rays, rays.n_rays, stream);
         ++hot_e_capture_beams;
       }
       if (verbose) {
@@ -4015,20 +3712,15 @@ void laser_step(core::State& state,
         release_traj_buffers();
       }
       if (!cbet_on) {
-        const auto dep_power_cell = copy_cell_deposit_to_host(state.laser_dep, stream);
+        deposit_1d::add(step_deposit, state.laser_dep.data(), stream);
+        if (skip_cache != nullptr) {
+          skip_cache->set_fhat_1d(static_cast<int>(b), state.laser_dep.data(), P_beam, stream);
+        }
         if (verbose) {
           transfer_ms += ms(t_payload_transfer_start, Clock::now());
         }
-        for (std::size_t c = 0; c < dep_power_cell.size(); ++c) {
-          total_dep_1d[c] += dep_power_cell[c];
-        }
-        if (skip_cache != nullptr) {
-          for (std::size_t c = 0; c < dep_power_cell.size(); ++c) {
-            f_hat_groups[b][c] = dep_power_cell[c] / std::max(P_beam, 1.0e-30);
-          }
-        }
         if (fold_enabled && !fold_armed) {
-          fold_dep = dep_power_cell;
+          deposit_1d::keep_fold(step_deposit, state.laser_dep.data(), stream);
           if (laser_pack_enabled) {
             check_or_fail(
                 cudaMemcpyAsync(lmesh.scratch_step_pack_device +
@@ -4065,19 +3757,14 @@ void laser_step(core::State& state,
       }
     }
     if (cbet_on) {
-      cbet_stage_cell_fields(*cbet_ws, state, hydro_mirror, laser, lambda_cm, stream);
+      cbet_stage_cell_A_eff_device(*cbet_ws, state, lmesh.material_A,
+                                   lmesh.material_A_list, stream);
+      cbet_stage_cell_fields_device(*cbet_ws, state, laser, lambda_cm, stream);
       if (port_section) {
         const auto t_ps_s1_start = Clock::now();
-        build_port_section_diagnostics(
-            lmesh, beams.items.front(), hydro_mirror, *cbet_ws,
-            cbet_ray_cursor, verbose);
-        const auto* const port_state =
-            static_cast<const PortSectionState*>(
-                lmesh.port_section_state.get());
-        TENRYU_ASSERT(port_state != nullptr,
-                      "port_section ray map requires initialized host state");
-        fill_port_section_ray_map(
-            state, port_state->table, hydro_mirror.r_edges);
+        build_port_section_table_device(
+            lmesh, beams.items.front(), state, *cbet_ws, cbet_ray_cursor,
+            verbose, stream);
         ps_s1_ms += ms(t_ps_s1_start, Clock::now());
       }
       CbetSolveResult cbet_res;
@@ -4091,12 +3778,14 @@ void laser_step(core::State& state,
         const auto t_ps_chi_d2h_start = Clock::now();
         ps_chi_d2h_ms += ms(t_ps_chi_d2h_start, Clock::now());
 
+        TENRYU_ASSERT(port_state->device_table_valid,
+                      "port_section chi build requires the step's phase-space table");
         const ::tenryu::laser::port_section::ChiBuildInput chi_input{
             &port_state->ports,
-            &port_state->table,
+            nullptr,
             laser.cbet.n_impact_bins,
-            port_state->ray_bin.data(),
-            static_cast<int>(port_state->ray_bin.size()),
+            nullptr,
+            port_state->device_table.n_paths,
             n_cells,
             nullptr,
             nullptr,
@@ -4107,7 +3796,8 @@ void laser_step(core::State& state,
             laser.cbet.alpha_iaw,
             laser.cbet.k_a_floor,
             laser.cbet.n_section_phi,
-            laser.wavelength_nm};
+            laser.wavelength_nm,
+            &port_state->device_table};
         const ::tenryu::laser::port_section::ChiDeviceCellFields dev_fields{
             cbet_ws->cell_chi_pref,
             cbet_ws->cell_c_a,
@@ -4184,10 +3874,8 @@ void laser_step(core::State& state,
               cbet_ws->ps_n_channels ==
                   static_cast<int>(hot_e_channels.size()),
               "port_section hot-e channel/workspace size mismatch");
-          TENRYU_ASSERT(
-              hot_e_model_cell_nhat.size() ==
-                  static_cast<std::size_t>(n_cells),
-              "port_section hot-e cell n_hat size mismatch");
+          TENRYU_ASSERT(hot_e_model_cell_nhat_device != nullptr,
+                        "port_section hot-e cell n_hat not staged");
           ps_one_minus_eta.resize(hot_e_channels.size(), 1.0);
           for (std::size_t k = 0; k < hot_e_channels.size(); ++k) {
             const ResolvedHotEChannel& channel = hot_e_channels[k];
@@ -4197,11 +3885,10 @@ void laser_step(core::State& state,
                     : 1.0;
           }
           cuda_check(cudaMemcpyAsync(
-                         cbet_ws->ps_cell_nhat,
-                         hot_e_model_cell_nhat.data(),
-                         hot_e_model_cell_nhat.size() * sizeof(double),
-                         cudaMemcpyHostToDevice, stream),
-                     "port_section hot-e cell n_hat H2D failed");
+                         cbet_ws->ps_cell_nhat, hot_e_model_cell_nhat_device,
+                         static_cast<std::size_t>(n_cells) * sizeof(double),
+                         cudaMemcpyDeviceToDevice, stream),
+                     "port_section hot-e cell n_hat D2D failed");
           cuda_check(cudaMemcpyAsync(
                          cbet_ws->ps_capture_thresh,
                          port_state->ps_capture_thresh.data(),
@@ -4257,7 +3944,7 @@ void laser_step(core::State& state,
         ps_chi_post_ms += ms(t_ps_chi_post_start, Clock::now());
         const auto t_ps_solve_start = Clock::now();
         cbet_res = cbet_solve_and_deposit(
-            *cbet_ws, laser.cbet, stream, &ps_args, true);
+            *cbet_ws, laser.cbet, stream, &ps_args, false);
         ps_solve_ms += ms(t_ps_solve_start, Clock::now());
         const auto t_ps_traj_transfer_start =
             verbose ? Clock::now() : Clock::time_point{};
@@ -4284,88 +3971,46 @@ void laser_step(core::State& state,
               ms(t_ps_traj_transfer_start, Clock::now());
         }
         const auto t_ps_capture_start = Clock::now();
-        fill_port_section_outgoing_power(state, *cbet_ws);
-        state.ps_port_capture_pcross.assign(
-            static_cast<std::size_t>(cbet_ws->n_ports) *
-                static_cast<std::size_t>(hot_e_n_config_channels),
-            0.0);
+        // The exchange maps, the outgoing power of each port and the hot-electron capture sums,
+        // on the device (cbet_stage_gpu.cuh); the capture sums come back for the hot-electron
+        // source below, with the stages' checks.
+        cbet_begin_step_outputs(*cbet_ws, hot_e_n_config_channels, stream);
+        cbet_viz_fields_device(*cbet_ws, cbet_res.dq_G, cbet_res.dq_n_branches,
+                               cbet_res.dq_n_bins, true, stream);
+        ps_outputs_device(*cbet_ws, state.x_r.data(), n_cells, hot_e_n_config_channels,
+                          ps_hot_e_capture_on, stream);
+        const CbetStepReadback step_out =
+            cbet_read_step_outputs(*cbet_ws, hot_e_n_config_channels, stream);
+        check_cbet_step_flags(step_out.flags);
+        port_state->audit.dq_abs_max = step_out.dq_abs_max;
+        port_state->audit.dq_abs_sum = step_out.dq_abs_sum;
+        // No L copy is read back for the audit.
+        port_state->audit.L_ps_abs_max = -1.0;
         if (ps_hot_e_capture_on) {
-          const std::size_t capture_doubles =
-              static_cast<std::size_t>(cbet_ws->n_ports) *
-              static_cast<std::size_t>(cbet_ws->n_rays_total) *
-              static_cast<std::size_t>(cbet_ws->ps_n_channels) * 4U;
-          std::vector<double> capture_stage(capture_doubles, 0.0);
-          cuda_check(cudaMemcpy(
-                         capture_stage.data(), cbet_ws->ps_capture_stage,
-                         capture_stage.size() * sizeof(double),
-                         cudaMemcpyDeviceToHost),
-                     "port_section hot-e capture stage D2H failed");
-          std::vector<double> sum_Pmu(
-              static_cast<std::size_t>(hot_e_n_config_channels), 0.0);
-          for (int port = 0; port < cbet_ws->n_ports; ++port) {
-            for (int ray = 0; ray < cbet_ws->n_rays_total; ++ray) {
-              for (int k = 0; k < cbet_ws->ps_n_channels; ++k) {
-                const std::size_t row =
-                    ((static_cast<std::size_t>(port) *
-                          static_cast<std::size_t>(
-                              cbet_ws->n_rays_total) +
-                      static_cast<std::size_t>(ray)) *
-                         static_cast<std::size_t>(
-                             cbet_ws->ps_n_channels) +
-                     static_cast<std::size_t>(k)) *
-                    4U;
-                const double* const capture =
-                    capture_stage.data() + row;
-                if (!(capture[0] > 0.5) || !(capture[1] > 0.0)) {
-                  continue;
-                }
-                const int config_index =
-                    port_state->ps_capture_order[
-                        static_cast<std::size_t>(k)];
-                const int cell = static_cast<int>(capture[3]);
-                TENRYU_ASSERT(
-                    config_index >= 0 &&
-                        config_index < hot_e_n_config_channels,
-                    "port_section hot-e capture config index out of range");
-                TENRYU_ASSERT(
-                    cell >= 0 &&
-                        static_cast<std::size_t>(cell) <
-                            hot_e_model_cell_r.size(),
-                    "port_section hot-e capture cell hint out of range");
-                const std::size_t channel =
-                    static_cast<std::size_t>(config_index);
-                state.ps_port_capture_pcross[
-                    static_cast<std::size_t>(port) *
-                            static_cast<std::size_t>(
-                                hot_e_n_config_channels) +
-                        channel] += capture[1];
-                hot_e_model_sum_P[channel] += capture[1];
-                hot_e_model_sum_Pr[channel] +=
-                    hot_e_model_cell_r[static_cast<std::size_t>(cell)] *
-                    capture[1];
-                sum_Pmu[channel] += capture[2] * capture[1];
-                ps_banked_hot_e_power +=
-                    capture[1] *
-                    (1.0 -
-                     ps_one_minus_eta[static_cast<std::size_t>(k)]);
-              }
-            }
-          }
           for (int config_index = 0;
                config_index < hot_e_n_config_channels;
                ++config_index) {
             const std::size_t channel =
                 static_cast<std::size_t>(config_index);
+            // port_section has no trace-side capture: these sums start from zero here.
+            TENRYU_ASSERT(hot_e_model_sum_P[channel] == 0.0 &&
+                              hot_e_model_sum_Pr[channel] == 0.0,
+                          "port_section hot-e capture sums not empty");
+            hot_e_model_sum_P[channel] = step_out.capture_sum_P[channel];
+            hot_e_model_sum_Pr[channel] = step_out.capture_sum_Pr[channel];
             const double P_cross = hot_e_model_sum_P[channel];
             const double eta = state.hot_e_eta_state_eta[channel];
             if (eta > 0.0 && P_cross > 0.0) {
               hot_e_captures_by_channel[channel].push_back(
                   tenryu::laser::hot_electron::RayCapture{
                       hot_e_model_sum_Pr[channel] / P_cross,
-                      sum_Pmu[channel] / P_cross,
+                      step_out.capture_sum_Pmu[channel] / P_cross,
                       eta * P_cross});
             }
           }
+          TENRYU_ASSERT(ps_banked_hot_e_power == 0.0,
+                        "port_section banked hot-e power not empty");
+          ps_banked_hot_e_power = step_out.capture_banked_power;
         }
         ps_capture_ms += ms(t_ps_capture_start, Clock::now());
         g_ps_timing_sum[0] += ps_s1_ms;
@@ -4390,15 +4035,13 @@ void laser_step(core::State& state,
       } else {
         cbet_res =
             cbet_solve_and_deposit(
-                *cbet_ws, laser.cbet, stream, nullptr, true);
+                *cbet_ws, laser.cbet, stream, nullptr, false);
+        // The exchange maps on the device (cbet_stage_gpu.cuh), with their checks.
+        cbet_begin_step_outputs(*cbet_ws, 0, stream);
+        cbet_viz_fields_device(*cbet_ws, cbet_res.dq_G, cbet_res.dq_n_branches,
+                               cbet_res.dq_n_bins, false, stream);
+        check_cbet_step_flags(cbet_read_step_outputs(*cbet_ws, 0, stream).flags);
       }
-      fill_cbet_viz_fields(
-          state, cbet_res, *cbet_ws,
-          port_section
-              ? &static_cast<PortSectionState*>(
-                     lmesh.port_section_state.get())
-                     ->audit
-              : nullptr);
       cbet_iaw_power = cbet_res.E_iaw_rate;
       state.E_cbet_iaw_step += cbet_iaw_power * dt;
       lmesh.last_cbet_exchanged_power = cbet_res.exchanged_power;
@@ -4428,14 +4071,11 @@ void laser_step(core::State& state,
                 d_unabsorbed, nullptr, count,
                 static_cast<int>(state.laser_dep.size()), stream),
             "laser_step cbet per-beam reduce failed");
-        const auto dep_power_cell = copy_cell_deposit_to_host(state.laser_dep, stream);
-        // Same step-averaged power the 1D rays were launched with.
-        const double P_beam_b = std::max(0.0, beams.items[b].get_average_power(t, t + dt));
-        for (std::size_t c = 0; c < dep_power_cell.size(); ++c) {
-          total_dep_1d[c] += dep_power_cell[c];
-          if (skip_cache != nullptr) {
-            f_hat_groups[b][c] = dep_power_cell[c] / std::max(P_beam_b, 1.0e-30);
-          }
+        deposit_1d::add(step_deposit, state.laser_dep.data(), stream);
+        if (skip_cache != nullptr) {
+          // Same step-averaged power the 1D rays were launched with.
+          const double P_beam_b = std::max(0.0, beams.items[b].get_average_power(t, t + dt));
+          skip_cache->set_fhat_1d(static_cast<int>(b), state.laser_dep.data(), P_beam_b, stream);
         }
       }
       std::ostringstream cbet_oss;
@@ -4529,43 +4169,42 @@ void laser_step(core::State& state,
     // Allreduce removed in M18d). Ownership masking downstream
     // (transfer_to_1d) keeps the owned windows.
 
-    if (hot_e_capture_on && hot_e_capture_beams > 0) {
-      check_or_fail(cudaStreamSynchronize(stream),
-                    "laser_step hot_e capture stage sync failed");
-      const std::size_t row_doubles =
-          static_cast<std::size_t>(rays_1d_per_beam) * 4 *
-          static_cast<std::size_t>(hot_e_params.n_channels);
-      // A folded beam replays the anchor's deposit without tracing; its
-      // captures are the anchor's (they used to be left empty, losing those
-      // beams' hot-electron source).
-      for (const std::size_t replayed : fold_replayed_beams) {
-        std::copy_n(hot_e_capture_stage.data() + fold_anchor_beam * row_doubles,
-                    row_doubles,
-                    hot_e_capture_stage.data() + replayed * row_doubles);
+    bool hot_e_any_captures = false;
+    if (hot_e_transport_on) {
+      auto& he_ws = hot_e_transport_workspace();
+      const bool trace_captures = hot_e_capture_on && hot_e_capture_beams > 0;
+      if (trace_captures) {
+        // A folded beam replays the anchor's deposit without tracing; its
+        // captures are the anchor's (they used to be left empty, losing those
+        // beams' hot-electron source).
+        for (const std::size_t replayed : fold_replayed_beams) {
+          hot_e_transport_1d::replay_beam(he_ws, static_cast<int>(fold_anchor_beam),
+                                          static_cast<int>(replayed), stream);
+        }
+        std::vector<int> capture_config_index(hot_e_channels.size());
+        std::vector<double> capture_eta_eff(hot_e_channels.size());
+        for (std::size_t k = 0; k < hot_e_channels.size(); ++k) {
+          capture_config_index[k] = hot_e_channels[k].config_index;
+          capture_eta_eff[k] = hot_e_channels[k].eta_eff;
+        }
+        hot_e_transport_1d::collect_trace_captures(he_ws, capture_config_index, capture_eta_eff,
+                                                   hot_e_model, stream);
       }
-      for (int b = 0; b < static_cast<int>(beams.items.size()); ++b) {
-        const double* base = hot_e_capture_stage.data() +
-                             static_cast<std::size_t>(b) * row_doubles;
-        for (int rr = 0; rr < rays_1d_per_beam; ++rr) {
-          for (int k = 0; k < hot_e_params.n_channels; ++k) {
-            const double* cap = base +
-                (static_cast<std::size_t>(rr) * hot_e_params.n_channels +
-                 static_cast<std::size_t>(k)) * 4;
-            if (cap[0] > 0.5 && cap[3] > 0.0) {
-              const ResolvedHotEChannel& rch = hot_e_channels[static_cast<std::size_t>(k)];
-              if (hot_e_model) {
-                hot_e_model_sum_P[static_cast<std::size_t>(rch.config_index)] +=
-                    cap[3];
-                hot_e_model_sum_Pr[static_cast<std::size_t>(rch.config_index)] +=
-                    cap[1] * cap[3];
-              }
-              if (rch.eta_eff > 0.0) {
-                hot_e_captures_by_channel[static_cast<std::size_t>(rch.config_index)]
-                    .push_back(tenryu::laser::hot_electron::RayCapture{
-                        cap[1], cap[2], rch.eta_eff * cap[3]});
-              }
-            }
-          }
+      for (int ci = 0; ci < hot_e_n_config_channels; ++ci) {
+        const auto& host_caps = hot_e_captures_by_channel[static_cast<std::size_t>(ci)];
+        if (!host_caps.empty()) {
+          hot_e_transport_1d::add_host_captures(he_ws, ci, host_caps);
+        }
+      }
+      std::vector<double> trace_sum_P;
+      std::vector<double> trace_sum_Pr;
+      hot_e_transport_1d::read_capture_state(he_ws, &trace_sum_P, &trace_sum_Pr,
+                                             &hot_e_any_captures, stream);
+      if (trace_captures && hot_e_model) {
+        for (int ci = 0; ci < hot_e_n_config_channels; ++ci) {
+          const std::size_t s = static_cast<std::size_t>(ci);
+          hot_e_model_sum_P[s] += trace_sum_P[s];
+          hot_e_model_sum_Pr[s] += trace_sum_Pr[s];
         }
       }
     }
@@ -4582,21 +4221,37 @@ void laser_step(core::State& state,
     }
 
     t_trace_end = Clock::now();
-    std::vector<double> hot_e_power_cell;
-    bool hot_e_any_captures = false;
-    for (const auto& channel_caps : hot_e_captures_by_channel) {
-      if (!channel_caps.empty()) {
-        hot_e_any_captures = true;
-        break;
-      }
-    }
+    const double* hot_e_power_device = nullptr;
     if (hot_e_transport_on && hot_e_any_captures) {
       namespace he = tenryu::laser::hot_electron;
-      const std::size_t n_c = hydro_mirror.rho.size();
-      hot_e_power_cell.assign(n_c, 0.0);
+      auto& he_ws = hot_e_transport_workspace();
       state.hot_e_ch_in_step.assign(static_cast<std::size_t>(hot_e_n_config_channels), 0.0);
       state.hot_e_ch_deposited_step.assign(static_cast<std::size_t>(hot_e_n_config_channels), 0.0);
       state.hot_e_ch_escaped_step.assign(static_cast<std::size_t>(hot_e_n_config_channels), 0.0);
+      std::vector<he::HotEChannelSpec> hot_e_specs(
+          static_cast<std::size_t>(hot_e_n_config_channels));
+      for (int ci = 0; ci < hot_e_n_config_channels; ++ci) {
+        hot_e_specs[static_cast<std::size_t>(ci)] =
+            laser.hot_electron.sources_specified
+                ? he::make_channel_spec(laser.hot_electron,
+                                        laser.hot_electron.sources[static_cast<std::size_t>(ci)])
+                : he::make_channel_spec_from_shorthand(laser.hot_electron);
+      }
+      const bool hot_e_cone = laser.hot_electron.angular_model == "cone";
+      // The radial march reads the laser's effective mass number of the cells; the cone chords
+      // read the State's.
+      const double* hot_e_A_eff_radial = nullptr;
+      if (!hot_e_cone) {
+        auto& radial_cells = global_cbet_workspace();
+        cbet_stage_cell_A_eff_device(radial_cells, state, lmesh.material_A,
+                                     lmesh.material_A_list, stream);
+        hot_e_A_eff_radial = radial_cells.cell_A_eff;
+      }
+      const std::vector<hot_e_transport_1d::ChannelResult> hot_e_results =
+          hot_e_transport_1d::transport(he_ws, state, hot_e_specs, state.mesh.geometry_code,
+                                        hot_e_cone, state.A_eff.data(), hot_e_A_eff_radial,
+                                        stream);
+      hot_e_power_device = hot_e_transport_1d::power_cell(he_ws);
       double total_P_hot = 0.0;
       double total_deposited = 0.0;
       double total_residual = 0.0;
@@ -4605,43 +4260,9 @@ void laser_step(core::State& state,
       double max_conservation_resid = 0.0;
       int total_substep_cap_hits = 0;
       bool hot_e_any_active = false;
-      std::vector<double> hot_e_Te_host;  // radial mode only, fetched once
       for (int ci = 0; ci < hot_e_n_config_channels; ++ci) {
-        const auto& channel_caps = hot_e_captures_by_channel[static_cast<std::size_t>(ci)];
-        if (channel_caps.empty()) {
-          continue;
-        }
-        const std::vector<he::HotESource> hot_e_sources =
-            he::reduce_captures(channel_caps, hydro_mirror.r_edges);
-        if (hot_e_sources.empty()) {
-          continue;
-        }
-        const he::HotEChannelSpec spec =
-            laser.hot_electron.sources_specified
-                ? he::make_channel_spec(laser.hot_electron,
-                                        laser.hot_electron.sources[static_cast<std::size_t>(ci)])
-                : he::make_channel_spec_from_shorthand(laser.hot_electron);
-        he::DepositResult hot_e_res;
-        if (laser.hot_electron.angular_model == "cone") {
-          TENRYU_ASSERT(state.mesh.geometry_code != 1,
-                        "hot_electron cone with cylindrical geometry (validation gap)");
-          const he::Geometry1D geom = (state.mesh.geometry_code == 2)
-                                          ? he::Geometry1D::planar
-                                          : he::Geometry1D::spherical;
-          hot_e_res = he::deposit_hot_electrons_cone_1d_device(
-              spec, geom, hot_e_sources, state.rho.data(),
-              state.zbar.data(), state.A_eff.data(), state.Te.data(),
-              hydro_mirror.cell_is_void, state.x_r.data(),
-              static_cast<int>(state.x_r.size()), stream, hot_e_power_cell);
-        } else {
-          if (hot_e_Te_host.empty()) {
-            hot_e_Te_host = copy_cell_deposit_to_host(state.Te, stream);
-          }
-          hot_e_res = he::deposit_hot_electrons_radial_1d(
-              spec, hot_e_sources, hydro_mirror.rho,
-              hydro_mirror.zbar, hydro_mirror.A_eff, hot_e_Te_host,
-              hydro_mirror.cell_is_void, hydro_mirror.r_edges, hot_e_power_cell);
-        }
+        const hot_e_transport_1d::ChannelResult& hot_e_res =
+            hot_e_results[static_cast<std::size_t>(ci)];
         if (!hot_e_res.active) {
           continue;
         }
@@ -4678,40 +4299,9 @@ void laser_step(core::State& state,
         state.hot_e_escaped_step = total_escaped * dt;
         state.hot_e_source_r = (total_P_hot > 0.0) ? (total_Pr / total_P_hot) : 0.0;
         state.hot_e_conservation_resid = max_conservation_resid;
-        // per-cell diagnostics + explicit-source dt limit
-        const auto vol_host = copy_cell_deposit_to_host(state.vol, stream);
-        const auto ee_host = copy_cell_deposit_to_host(state.ee, stream);
-        if (state.hot_e_Q_host.size() != n_c) {
-          state.hot_e_Q_host.assign(n_c, 0.0);
-        }
-        if (state.hot_e_eps_cum_host.size() != n_c) {
-          state.hot_e_eps_cum_host.assign(n_c, 0.0);
-        }
-        double dt_lim = std::numeric_limits<double>::infinity();
-        for (std::size_t c = 0; c < n_c; ++c) {
-          const double P_cell = hot_e_power_cell[c];
-          if (!(P_cell > 0.0)) {
-            state.hot_e_Q_host[c] = 0.0;
-            continue;
-          }
-          const double vol_c = vol_host[c];
-          const double rho_c = hydro_mirror.rho[c];
-          if (vol_c > 0.0) {
-            state.hot_e_Q_host[c] = P_cell / vol_c;
-            if (rho_c > 0.0) {
-              state.hot_e_eps_cum_host[c] += P_cell * dt / (rho_c * vol_c);
-              const double e_cell = rho_c * vol_c * std::max(ee_host[c], 0.0);
-              if (e_cell > 0.0) {
-                const double cand =
-                    laser.hot_electron.explicit_source_limit * e_cell / P_cell;
-                if (cand < dt_lim) {
-                  dt_lim = cand;
-                }
-              }
-            }
-          }
-        }
-        state.hot_e_dt_limit_s = dt_lim;
+        // per-cell diagnostics + explicit-source dt limit, on the device
+        state.hot_e_dt_limit_s = hot_e_transport_1d::diagnostics(
+            he_ws, state, dt, laser.hot_electron.explicit_source_limit, stream);
       }
     }
     static const bool transfer_audit_enabled = [] {
@@ -4720,18 +4310,23 @@ void laser_step(core::State& state,
     }();
     long double audit_in = 0.0L;
     if (transfer_audit_enabled) {
-      for (const double deposit : total_dep_1d) {
+      std::vector<double> total_dep_host(state.laser_dep.size(), 0.0);
+      check_or_fail(cudaMemcpyAsync(total_dep_host.data(), deposit_1d::total(step_deposit),
+                                    total_dep_host.size() * sizeof(double),
+                                    cudaMemcpyDeviceToHost, stream),
+                    "laser_step transfer audit D2H failed");
+      check_or_fail(cudaStreamSynchronize(stream), "laser_step transfer audit sync failed");
+      for (const double deposit : total_dep_host) {
         audit_in += static_cast<long double>(deposit);
       }
     }
-    apply_deposit_redistribution_1d(state, lmesh, hydro_mirror, total_dep_1d, dt,
-                                    laser.deposit.conservation_tol, part,
-                                    laser.deposit.deposit_smooth_passes,
-                                    laser.deposit.deposit_smooth_alpha,
-                                    (hot_e_transport_on &&
-                                     !hot_e_power_cell.empty())
-                                        ? &hot_e_power_cell
-                                        : nullptr);
+    // The hot-electron power per cell of the transport above (device).
+    TENRYU_ASSERT(hot_e_power_device == nullptr || state.rho.size() == state.laser_dep.size(),
+                  "apply_deposit_redistribution_1d hot_e_extra_power size mismatch");
+    step_energy_sum_1d = redistribute_deposit_1d(
+        state, lmesh, map_1d, hot_e_power_device, dt, laser.deposit.conservation_tol, part,
+        laser.deposit.deposit_smooth_passes, laser.deposit.deposit_smooth_alpha, stream);
+    step_energy_sum_valid = true;
     if (transfer_audit_enabled) {
       const auto audit_dep_host =
           copy_cell_deposit_to_host(state.laser_dep, stream);
@@ -5476,7 +5071,7 @@ void laser_step(core::State& state,
   }
   for (std::size_t b = 0; b < ray_steps_pending.size(); ++b) {
     if (ray_steps_pending[b] != 0U) {
-      lmesh.ray_steps_previous[b].swap(lmesh.ray_steps_output[b]);
+      std::swap(lmesh.ray_steps_previous[b], lmesh.ray_steps_output[b]);
     }
   }
   P_unabsorbed_trace = std::max(0.0, P_unabsorbed_trace + skipped_unabsorbed_power);
@@ -5496,7 +5091,9 @@ void laser_step(core::State& state,
   if (part.n_ranks > 1) {
     mask_non_owned_skip_deposit(state, part);
   }
-  const double dep_power_local = sum_field_energy(state.laser_dep) / dt;
+  // 1D: the redistribution's sum of the written energies (the owned cells, as the mask above).
+  const double dep_power_local =
+      (step_energy_sum_valid ? step_energy_sum_1d : sum_field_energy(state.laser_dep)) / dt;
   const double dep_power =
       (reduction != nullptr && part.n_ranks > 1)
           ? reduction->allreduce_sum(dep_power_local)
@@ -5604,8 +5201,8 @@ void laser_step(core::State& state,
       skip_cache->update_cache(state, f_hat_total, skip_group_powers, beam_dirs, beam_focuses,
                                beam_defocus, stream);
     } else {
-      skip_cache->update_cache(state, f_hat_groups, skip_group_powers, beam_dirs, beam_focuses,
-                               beam_defocus, stream);
+      skip_cache->update_cache_1d(state, skip_group_powers, beam_dirs, beam_focuses, beam_defocus,
+                                  stream);
     }
   }
 

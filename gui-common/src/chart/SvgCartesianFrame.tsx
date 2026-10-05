@@ -17,6 +17,7 @@ export function SvgCartesianFrame({
   xRange,
   yRange,
   yLog = false,
+  xLog = false,
   xLabel,
   yLabel,
   children,
@@ -26,12 +27,14 @@ export function SvgCartesianFrame({
   xRange: [number, number];
   yRange: [number, number];
   yLog?: boolean;
+  /** x values are log10 of the quantity (tick labels as powers of ten), like yLog. */
+  xLog?: boolean;
   xLabel?: string;
   yLabel?: string;
   children: (x: (value: number) => number, y: (value: number) => number, clipId: string) => ReactNode;
 }) {
   const clipId = `svg-frame-clip-${useId().replace(/:/g, "")}`;
-  const [xMin, xMax] = paddedRange(xRange[0], xRange[1]);
+  const [xMin, xMax] = paddedRange(xRange[0], xRange[1], xLog);
   const [yMin, yMax] = paddedRange(yRange[0], yRange[1], yLog);
   const plotRight = width - PLOT_MARGIN_RIGHT;
   const plotBottom = height - PLOT_MARGIN_BOTTOM;
@@ -40,7 +43,8 @@ export function SvgCartesianFrame({
   const x = (value: number) => PLOT_GUTTER_LEFT + ((value - xMin) / (xMax - xMin)) * plotWidth;
   const y = (value: number) => plotBottom - ((value - yMin) / (yMax - yMin)) * plotHeight;
   const yFormat = yLog ? formatLogTick : formatTick;
-  const xTicks = ticksWithEndpoints(xMin, xMax, x, formatTick, "horizontal");
+  const xFormat = xLog ? formatLogTick : formatTick;
+  const xTicks = ticksWithEndpoints(xMin, xMax, x, xFormat, "horizontal");
   const yTicks = ticksWithEndpoints(yMin, yMax, y, yFormat, "vertical");
   return (
     <svg viewBox={`0 0 ${width} ${height}`} style={{ width: "100%" }}>
@@ -65,7 +69,7 @@ export function SvgCartesianFrame({
             style={{ fontSize: "var(--fs-chart-tick)" }}
             fill="var(--fg-secondary)"
           >
-            {formatTick(tick)}
+            {xFormat(tick)}
           </text>
         </g>
       ))}

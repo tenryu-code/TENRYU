@@ -50,6 +50,22 @@ struct ZbarMixAccumulator {
   }
 };
 
+// The coefficients of the Thomas-Fermi fit below (More 1985, Table IV), shared with its device
+// evaluation in the host's rounding (zbar_tf_host_rounding.cuh).
+namespace zbar_tf_fit {
+inline constexpr double kAlpha = 14.3139;
+inline constexpr double kBeta = 0.6624;
+inline constexpr double kA1 = 0.003323;
+inline constexpr double kA2 = 0.9718;
+inline constexpr double kA3 = 9.26148e-5;
+inline constexpr double kA4 = 3.10165;
+inline constexpr double kB0 = -1.7630;
+inline constexpr double kB1 = 1.43175;
+inline constexpr double kB2 = 0.31546;
+inline constexpr double kC1 = -0.366667;
+inline constexpr double kC2 = 0.983333;
+}  // namespace zbar_tf_fit
+
 // Thomas-Fermi mean ionization, R. M. More, Adv. At. Mol. Phys. 21, 305
 // (1985), Table IV ("an approximate fit to" the TF ionization state), with the
 // TF scaling variables R = rho/(Z A) [g/cm^3] and T0 = T/Z^{4/3} [eV]:
@@ -65,17 +81,7 @@ TENRYU_HOST_DEVICE inline double zbar_tf_value(
   const double Z = reclose_max(Z_nuc, 0.0);
   const double A = reclose_max(A_amu, 1.0e-30);
   if (!(Z > 0.0)) return 0.0;
-  constexpr double kAlpha = 14.3139;
-  constexpr double kBeta = 0.6624;
-  constexpr double kA1 = 0.003323;
-  constexpr double kA2 = 0.9718;
-  constexpr double kA3 = 9.26148e-5;
-  constexpr double kA4 = 3.10165;
-  constexpr double kB0 = -1.7630;
-  constexpr double kB1 = 1.43175;
-  constexpr double kB2 = 0.31546;
-  constexpr double kC1 = -0.366667;
-  constexpr double kC2 = 0.983333;
+  using namespace zbar_tf_fit;
   const double rho_c = (rho > 0.0 && rho < 1.0e300) ? rho : 1.0e-30;
   const double T_c = (Te_eV > 0.0 && Te_eV < 1.0e300) ? Te_eV : 0.0;
   const double R = reclose_max(rho_c / (Z * A), 1.0e-300);

@@ -128,7 +128,7 @@ T_i=T_e 対角で評価）±3 点＋Python prototype ±1 点の転写忠実帯�
 
 演算子槽は laser 直後・radiation 前（sequential: H-C-L-**B**-R；Strang: L(dt)-**B(dt)**-
 H/2-C-R-H/2、burn は全 dt 陽的源で分割しない）。ステージは既定で GPU（`compute_burn_step_1d_device_stage`、
-`burn_stage_gpu.cu`）で実行し、環境変数 `TENRYU_BURN_HOST_STAGE=1` のときだけ host の実装を使う。沈着は
+`burn_stage_gpu.cu`）で実行し、環境変数 `TENRYU_BURN_HOST_STAGE=1` のときだけ host の実装を使う。1D では段を device 常駐で実行する（`compute_burn_step_1d_resident`、局所沈着 2026-10-02、拡散・MC の誕生源 2026-10-02）: 入力は State の device の場、燃料在庫・\(\epsilon_{cum}\)・中性子数・診断（反応率・\(Q_e, Q_i\)）は device の写し（`State::burn_*_dev`）、燃焼域の範囲（燃料物質の一覧は device）・セル速度・燃料イオン組成（物質の表は device、物質数の上限なし）と Fraley 係数（§14.3）・\(\epsilon_{cum}\) と中性子数の更新も device（`burn_inputs_1d_gpu.cu`、積和を融合せず host のループと同じ値）で、host へ戻るのは段のスカラーだけ。拡散・MC（§14.7、§14.9）は段の誕生源とセルの燃料イオン組成を device に置き、輸送の電子密度、粒子のあるスロットの判定、輸送後の付与（中性子加熱の付与を加える）・\(\epsilon_{cum}\)・\(Q_e, Q_i\)・陽的源の dt 上限（付与の和はセル順、上限は host の `std::min` と同じ規則）も device で計算する（MC の粒子の詰め直しの添字も device の排他的接頭和）。host の写しは出力の直前に同期し、step のやり直しの退避は device の写しと同期の状態も複写する。host 段（`TENRYU_BURN_HOST_STAGE=1`）は段だけを host の写しで計算し、拡散・MC の輸送とその後は同じ device の計算を通る。沈着は
 \(e_e{+}\!=dE_e/(\rho V)\), \(e_i{+}\!=dE_i/(\rho V)\) 後に Te/Ti/Pe/Pi を再閉包
 （table EOS / cv_override / ideal の全分岐、1T は合算を e_e へ）。沈着と閉包はデバイス上で
 レーザー沈着と同じ閉包を使い、energy_authoritative の表 EOS では表の温度上限を超えた

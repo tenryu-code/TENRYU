@@ -18,6 +18,7 @@
 
 #include <cuda_runtime.h>
 #include <cusparse.h>
+#include <math_constants.h>
 
 #include "core/device_block_primitives.cuh"
 #include "core/device_pack.hpp"
@@ -128,6 +129,155 @@ double tridiagonal_relative_residual(const std::vector<double>& lower,
     return std::sqrt(static_cast<double>(r2));
   }
   return std::sqrt(static_cast<double>(r2 / b2));
+}
+
+// The implicit solve's diagnostics on the device, from the staged system (lower, diag, upper, rhs
+// and the solution x, n values each): out[0] the relative residual ||A x - b|| / ||b|| (||A x - b||
+// when b = 0), its products and sums in double-double where the host loop summed in long double
+// (the residual is at round-off level, so the two evaluations differ beyond the last place); out[1]
+// the diagonal ratio max|d| / min|d| over the finite nonzero diagonal (0 when there is none), as
+// diagonal_ratio_condition_estimate gives it. One block. A sum or product that is not finite is kept
+// as (value, 0), as the host's long double sum keeps an infinity (the error terms would be NaN). This
+// file is compiled with multiply-add contraction allowed, so the double-double steps use the
+// __dadd_rn / __dsub_rn / __dmul_rn intrinsics, which are never merged into an FMA (a product merged
+// into the following sum would break the error-free transformations).
+constexpr int kSolveDiagThreads = 256;
+
+struct SolveDD {
+  double hi;
+  double lo;
+};
+
+__device__ inline SolveDD solve_two_sum(const double a, const double b) {
+  const double s = __dadd_rn(a, b);
+  if (!isfinite(s)) {
+    return SolveDD{s, 0.0};
+  }
+  const double bb = __dsub_rn(s, a);
+  return SolveDD{s, __dadd_rn(__dsub_rn(a, __dsub_rn(s, bb)), __dsub_rn(b, bb))};
+}
+
+__device__ inline SolveDD solve_quick_two_sum(const double a, const double b) {
+  const double s = __dadd_rn(a, b);
+  if (!isfinite(s)) {
+    return SolveDD{s, 0.0};
+  }
+  return SolveDD{s, __dsub_rn(b, __dsub_rn(s, a))};
+}
+
+__device__ inline SolveDD solve_two_prod(const double a, const double b) {
+  const double p = __dmul_rn(a, b);
+  if (!isfinite(p)) {
+    return SolveDD{p, 0.0};
+  }
+  return SolveDD{p, __fma_rn(a, b, -p)};
+}
+
+__device__ inline SolveDD solve_dd_add(const SolveDD x, const SolveDD y) {
+  SolveDD s = solve_two_sum(x.hi, y.hi);
+  const SolveDD t = solve_two_sum(x.lo, y.lo);
+  s.lo = __dadd_rn(s.lo, t.hi);
+  s = solve_quick_two_sum(s.hi, s.lo);
+  s.lo = __dadd_rn(s.lo, t.lo);
+  return solve_quick_two_sum(s.hi, s.lo);
+}
+
+__device__ inline SolveDD solve_dd_square(const SolveDD x) {
+  SolveDD p = solve_two_prod(x.hi, x.hi);
+  if (!isfinite(p.hi)) {
+    return p;
+  }
+  p.lo = __fma_rn(__dmul_rn(2.0, x.hi), x.lo, p.lo);
+  return solve_quick_two_sum(p.hi, p.lo);
+}
+
+// a / b (an infinite or NaN quotient or divisor gives the plain quotient)
+__device__ inline double solve_dd_div(const SolveDD a, const SolveDD b) {
+  const double q1 = a.hi / b.hi;
+  if (!isfinite(q1) || !isfinite(b.hi)) {
+    return q1;
+  }
+  const SolveDD p = solve_two_prod(q1, b.hi);
+  const SolveDD pb = solve_dd_add(p, SolveDD{__dmul_rn(q1, b.lo), 0.0});
+  const SolveDD r = solve_dd_add(a, SolveDD{-pb.hi, -pb.lo});
+  return __dadd_rn(q1, r.hi / b.hi);
+}
+
+// The implicit solve's residual and condition estimate (pack[6], pack[7]): the partial sums of
+// kSolveDiagThreads threads, thread t over the rows t, t + kSolveDiagThreads, ... in that order,
+// then added by a fixed tree. The partial sums run one warp per block (kSolveDiagThreads / 32
+// blocks), so that their double-precision work spreads over the SMs;
+// implicit_solve_diagnostics_kernel adds them. partial = [6][kSolveDiagThreads]: r2 hi, lo, b2 hi,
+// lo, the smallest and the largest diagonal magnitude.
+__global__ void implicit_solve_diagnostics_partial_kernel(const double* __restrict__ stage,
+                                                          const int n,
+                                                          double* __restrict__ partial) {
+  const double* lower = stage;
+  const double* diag = stage + n;
+  const double* upper = stage + 2 * static_cast<long long>(n);
+  const double* rhs = stage + 3 * static_cast<long long>(n);
+  const double* x = stage + 4 * static_cast<long long>(n);
+  const int t = static_cast<int>(blockIdx.x) * 32 + static_cast<int>(threadIdx.x);
+  SolveDD r2{0.0, 0.0};
+  SolveDD b2{0.0, 0.0};
+  double min_diag = CUDART_INF;
+  double max_diag = 0.0;
+  for (int i = t; i < n; i += kSolveDiagThreads) {
+    SolveDD ax = solve_two_prod(diag[i], x[i]);
+    if (i > 0) {
+      ax = solve_dd_add(ax, solve_two_prod(lower[i], x[i - 1]));
+    }
+    if (i + 1 < n) {
+      ax = solve_dd_add(ax, solve_two_prod(upper[i], x[i + 1]));
+    }
+    const SolveDD r = solve_dd_add(ax, SolveDD{-rhs[i], 0.0});
+    r2 = solve_dd_add(r2, solve_dd_square(r));
+    b2 = solve_dd_add(b2, solve_two_prod(rhs[i], rhs[i]));
+    const double mag = fabs(diag[i]);
+    if (isfinite(mag) && mag > 0.0) {
+      min_diag = (mag < min_diag) ? mag : min_diag;
+      max_diag = (max_diag < mag) ? mag : max_diag;
+    }
+  }
+  partial[t] = r2.hi;
+  partial[kSolveDiagThreads + t] = r2.lo;
+  partial[2 * kSolveDiagThreads + t] = b2.hi;
+  partial[3 * kSolveDiagThreads + t] = b2.lo;
+  partial[4 * kSolveDiagThreads + t] = min_diag;
+  partial[5 * kSolveDiagThreads + t] = max_diag;
+}
+
+__global__ void implicit_solve_diagnostics_kernel(const double* __restrict__ partial,
+                                                  double* __restrict__ out) {
+  __shared__ SolveDD sh_r2[kSolveDiagThreads];
+  __shared__ SolveDD sh_b2[kSolveDiagThreads];
+  __shared__ double sh_min[kSolveDiagThreads];
+  __shared__ double sh_max[kSolveDiagThreads];
+  const int t = threadIdx.x;
+  sh_r2[t] = SolveDD{partial[t], partial[kSolveDiagThreads + t]};
+  sh_b2[t] = SolveDD{partial[2 * kSolveDiagThreads + t], partial[3 * kSolveDiagThreads + t]};
+  sh_min[t] = partial[4 * kSolveDiagThreads + t];
+  sh_max[t] = partial[5 * kSolveDiagThreads + t];
+  __syncthreads();
+  for (int stride = kSolveDiagThreads / 2; stride > 0; stride >>= 1) {
+    if (t < stride) {
+      sh_r2[t] = solve_dd_add(sh_r2[t], sh_r2[t + stride]);
+      sh_b2[t] = solve_dd_add(sh_b2[t], sh_b2[t + stride]);
+      sh_min[t] = (sh_min[t + stride] < sh_min[t]) ? sh_min[t + stride] : sh_min[t];
+      sh_max[t] = (sh_max[t] < sh_max[t + stride]) ? sh_max[t + stride] : sh_max[t];
+    }
+    __syncthreads();
+  }
+  if (t != 0) {
+    return;
+  }
+  const SolveDD r2_total = sh_r2[0];
+  const SolveDD b2_total = sh_b2[0];
+  out[0] = (b2_total.hi > 0.0) ? sqrt(solve_dd_div(r2_total, b2_total))
+                               : sqrt(__dadd_rn(r2_total.hi, r2_total.lo));
+  const double lo = sh_min[0];
+  const double hi = sh_max[0];
+  out[1] = (isfinite(lo) && lo > 0.0 && hi > 0.0) ? hi / lo : 0.0;
 }
 
 double kershaw_diagonal_ratio_condition_estimate(const core::State& state,
@@ -3976,7 +4126,7 @@ ConductionResult conduction_step_1d_implicit(core::State& state,
   const std::size_t n_stage = static_cast<std::size_t>(n_cells) * 5;
   double* d_diag_stage = static_cast<double*>(core::device_scratch_acquire(
       "conduction:conduction_step_1d_implicit:stage_pack",
-      (n_stage + 6) * sizeof(double)));
+      (n_stage + 8) * sizeof(double)));
   double* d_pack = d_diag_stage + n_stage;
   double* d_diag3 = d_pack;
   double* d_clampfloor = d_pack + 3;
@@ -4320,12 +4470,16 @@ ConductionResult conduction_step_1d_implicit(core::State& state,
   cuda_check(cudaGetLastError(), "Conduction: implicit Te copy-back launch failed");
   core::deterministic_sum(d_e_floor_cells, n_cells, d_e_floor, false);
 
+  // The solve's residual and condition estimate on the device (pack[6], pack[7]); only the pack
+  // comes back.
   const bool staged = n_cells >= 3;
-  std::vector<double> h_stage((staged ? n_stage : 0) + 6);
-  cuda_check(cudaMemcpy(h_stage.data(), staged ? d_diag_stage : d_pack,
-                        h_stage.size() * sizeof(double), cudaMemcpyDeviceToHost),
-             "Conduction: implicit stage/pack copy failed");
-  const double* h_pack = h_stage.data() + (staged ? n_stage : 0);
+  if (staged) {
+    conduction::implicit_solve_diagnostics_device(d_diag_stage, n_cells, d_pack + 6);
+    cuda_check(cudaGetLastError(), "Conduction: implicit solve diagnostics launch failed");
+  }
+  double h_pack[8] = {};
+  cuda_check(cudaMemcpy(h_pack, d_pack, sizeof(h_pack), cudaMemcpyDeviceToHost),
+             "Conduction: implicit pack copy failed");
   const ConductionDiagnostics diag = conduction_diagnostics_from_diag3(h_pack, cfg);
   result.dt_exp = diag.dt_exp;
   result.deff_min = diag.deff_min;
@@ -4343,16 +4497,9 @@ ConductionResult conduction_step_1d_implicit(core::State& state,
     result.solver_cond_number_est = 1.0;
   }
   if (staged) {
-    const auto n = static_cast<std::ptrdiff_t>(n_cells);
-    const std::vector<double> h_lower(h_stage.begin(), h_stage.begin() + n);
-    const std::vector<double> h_diag(h_stage.begin() + n, h_stage.begin() + 2 * n);
-    const std::vector<double> h_upper(h_stage.begin() + 2 * n, h_stage.begin() + 3 * n);
-    const std::vector<double> h_rhs(h_stage.begin() + 3 * n, h_stage.begin() + 4 * n);
-    const std::vector<double> h_sol(h_stage.begin() + 4 * n, h_stage.begin() + 5 * n);
-    result.solver_residual =
-        tridiagonal_relative_residual(h_lower, h_diag, h_upper, h_rhs, h_sol);
+    result.solver_residual = h_pack[6];
     result.solver_iterations = 1;
-    result.solver_cond_number_est = diagonal_ratio_condition_estimate(h_diag);
+    result.solver_cond_number_est = h_pack[7];
   }
 
   conduction_sync_eos(state, cfg);
@@ -6086,6 +6233,16 @@ bool ion_conduction_audit_enabled() {
 }  // namespace
 
 namespace conduction {
+
+void implicit_solve_diagnostics_device(const double* d_stage, const int n, double* d_out) {
+  if (n <= 0) {
+    return;
+  }
+  auto* partial = static_cast<double*>(core::device_scratch_acquire(
+      "conduction:implicit_solve_diagnostics:partial", 6U * kSolveDiagThreads * sizeof(double)));
+  implicit_solve_diagnostics_partial_kernel<<<kSolveDiagThreads / 32, 32>>>(d_stage, n, partial);
+  implicit_solve_diagnostics_kernel<<<1, kSolveDiagThreads>>>(partial, d_out);
+}
 
 double coulomb_log(const double n_e, const double Te_eV, const double Zbar) {
   return coulomb_log_formula(n_e, Te_eV, Zbar);

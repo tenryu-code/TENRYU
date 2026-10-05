@@ -88,6 +88,8 @@ struct PhaseSpaceTable {
   friend FlatTable flatten_table(const PhaseSpaceTable& table);
   friend void flatten_table_into(const PhaseSpaceTable& table,
                                  FlatTable& flat);
+  friend PhaseSpaceTable table_from_flat(const FlatTable& flat,
+                                         const std::vector<double>& shell_r);
 };
 
 PhaseSpaceTable build_table(const std::vector<RayPath>& rays,
@@ -124,5 +126,10 @@ const std::vector<CrossingView>& crossings(const PhaseSpaceTable& table,
 
 FlatTable flatten_table(const PhaseSpaceTable& table);
 void flatten_table_into(const PhaseSpaceTable& table, FlatTable& flat);
+
+// The table of a flat table whose bins are already sorted (the inverse of flatten_table; the
+// exclusion ledger is left empty). Used for the host consumers of a table built on the device.
+PhaseSpaceTable table_from_flat(const FlatTable& flat,
+                                const std::vector<double>& shell_r);
 
 }  // namespace tenryu::laser::sector_ps

@@ -106,22 +106,9 @@ add_library(tenryu_hydro STATIC
   corner_mass_remap_audit.cu
   ke_fixup_deposit.cu
   local_rezone.cu
-  ale_1d_driver.cu
-  ale_1d_diagnostics.cu
-  ale_1d_sensor.cu
-  ale_1d_rezone.cu
-  ale_1d_remap.cu
-  ale_1d_velocity_project.cu
   kershaw_geometry.cuh
   kershaw_stencil.cuh
   kershaw_boundary.cuh
-  ale_1d_types.cuh
-  ale_1d_driver.cuh
-  ale_1d_diagnostics.cuh
-  ale_1d_sensor.cuh
-  ale_1d_rezone.cuh
-  ale_1d_remap.cuh
-  ale_1d_velocity_project.cuh
   axis_ale_rezone.cuh
   ale_rezone.cuh
   ale_scaled_reference.cuh

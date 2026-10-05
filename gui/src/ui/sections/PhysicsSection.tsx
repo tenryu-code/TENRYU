@@ -145,6 +145,17 @@ export default function PhysicsSection() {
       />
       {form.conduction.enabled && (
         <>
+          {(form.main.dimension === "1D_SPH" || form.conduction.solver === "implicit") && (
+            <SelectField
+              label={m.form.condSolver}
+              value={form.conduction.solver}
+              options={[
+                { value: "sts", label: m.form.condSolverSts },
+                { value: "implicit", label: m.form.condSolverImplicit },
+              ]}
+              onChange={(v) => update((f) => { f.conduction.solver = v as "sts" | "implicit"; })}
+            />
+          )}
           {form.main.dimension === "1D_SPH" && form.main.temperatureModel === "2T" && (
             <SelectField
               label={m.form.snbModel}

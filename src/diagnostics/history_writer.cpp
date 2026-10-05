@@ -24,6 +24,7 @@
 #include "core/config_validate.hpp"
 #include "core/device_pack.hpp"
 #include "core/error.hpp"
+#include "diagnostics/history_1d_gpu.cuh"
 #include "coupling/profile_observability.hpp"
 
 #if TENRYU_ENABLE_HDF5
@@ -2619,15 +2620,25 @@ HistoryWriter::PendingHistoryRecord HistoryWriter::build_pending_record(
   if (state.mesh.dim == 1 && n > 0 &&
       n <= static_cast<std::size_t>(std::numeric_limits<int>::max()) &&
       state.mass.size() == n && state.Te.size() == n && state.zbar.size() == n) {
-    std::vector<double> fields(4 * n);
-    const double* sources[4] = {state.rho.data(), state.mass.data(),
-                                state.Te.data(), state.zbar.data()};
-    core::pack_pull_fields(sources, 4, static_cast<int>(n), fields.data(),
-                           "history:plasma_implosion:pull");
-    rec.plasma_diag = compute_plasma_history_diagnostics(
-        state, fields.data() + 3 * n, fields.data() + n);
-    rec.implosion_diag = compute_implosion_history_diagnostics(
-        state, fields.data(), fields.data() + n, fields.data() + 2 * n);
+    // the reductions on the device (history_1d_gpu.cuh); the cell centres are the mesh's device
+    // copy of the host ones
+    const history_1d::Plasma plasma = history_1d::plasma(state);
+    rec.plasma_diag.valid = plasma.valid;
+    rec.plasma_diag.zbar_mean = plasma.zbar_mean;
+    rec.plasma_diag.zbar_max = plasma.zbar_max;
+    const bool has_centroid_r = state.mesh.cell_centroid_r.size() == n &&
+                                state.mesh.cell_centroid_r_device.size() == n;
+    const history_1d::Implosion implosion = history_1d::implosion(
+        state, has_centroid_r ? state.mesh.cell_centroid_r_device.data() : nullptr);
+    rec.implosion_diag.valid = true;
+    rec.implosion_diag.rho_peak = implosion.rho_peak;
+    if (implosion.shell_valid) {
+      rec.implosion_diag.shell_radius_mean = implosion.shell_radius_mean;
+    }
+    rec.implosion_diag.shell_radius_min = rec.implosion_diag.shell_radius_mean;  // 1D
+    if (implosion.has_center) {
+      rec.implosion_diag.center_temperature = implosion.center_temperature;
+    }
   } else {
     rec.plasma_diag = compute_plasma_history_diagnostics(state);
     rec.implosion_diag = compute_implosion_history_diagnostics(state);

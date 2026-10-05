@@ -2,6 +2,7 @@
 #include "core/nvtx_range.hpp"
 #include "laser/laser_mesh_bodies.cuh"
 
+#include <cub/device/device_scan.cuh>
 #include <algorithm>
 #include <climits>
 #include <cmath>
@@ -568,30 +569,33 @@ __global__ void compute_smooth_kappa_ext_kernel(
 }
 
 // The profile nodes of laser_mesh_bodies::build_trace_profile_nodes_1d placed
-// by one block in parallel over the hydro cells: the same nodes, bitwise, as
-// the serial pass (which the persistent loop's leader thread runs). The serial
-// pass places each node after the previous one, but where a cell lies inside
-// the profile's outer radius and is at least 16 subdiv minimum gaps wide
-// (relative to its outer face), its nodes do not depend on the nodes before it
-// once the cell before it is such a cell too: that cell's node below the upper
-// face lies above its other nodes and at least 4 minimum gaps below this
-// cell's lower face, so the serial pass places the face as a new node, and
-// every later node of the cell is decided against the cell's own nodes (the
-// merge rule's condition on the node before the last applies only to a node
-// of higher rank than the last, and a face has the highest). The same holds
-// for the first cell that crosses the outer radius: the serial pass drops the
-// nodes beyond the radius without changing its state, so that cell, the cells
-// beyond it (whose nodes are all dropped) and the tail (the hydro end, the
-// graded nodes beyond it, the outer radius) form one last segment placed in
-// order from its first node. The block places the segments -- the profile's
-// start through cell 0 as the serial pass does, every further cell inside the
-// radius, the last segment -- in two passes: it counts each thread's
-// consecutive segments, scans the counts, and writes the segments at their
-// offsets. A profile starting below r = 0, a narrow or non-increasing cell
-// inside the radius, cell 0 crossing the radius, fewer than two cells or a
-// count above capacity take the serial pass in thread 0. Before, one thread
-// placed the nodes: about 0.46 ms per step late in the GXII FLD deck (FP64
-// latency of one dependent chain).
+// in parallel over the hydro cells: the same nodes, bitwise, as the serial
+// pass (which the persistent loop's leader thread runs). The serial pass places
+// each node after the previous one, but where a cell lies inside the profile's
+// outer radius and is at least 16 subdiv minimum gaps wide (relative to its
+// outer face), its nodes do not depend on the nodes before it once the cell
+// before it is such a cell too: that cell's node below the upper face lies
+// above its other nodes and at least 4 minimum gaps below this cell's lower
+// face, so the serial pass places the face as a new node, and every later node
+// of the cell is decided against the cell's own nodes (the merge rule's
+// condition on the node before the last applies only to a node of higher rank
+// than the last, and a face has the highest). The same holds for the first cell
+// that crosses the outer radius: the serial pass drops the nodes beyond the
+// radius without changing its state, so that cell, the cells beyond it (whose
+// nodes are all dropped) and the tail (the hydro end, the graded nodes beyond
+// it, the outer radius) form one last segment placed in order from its first
+// node. The segments -- the profile's start through cell 0 as the serial pass
+// does, every further cell inside the radius, the last segment -- are placed
+// one thread per segment in two passes over many blocks: the segments' node
+// counts, their exclusive scan, and the segments written at their offsets
+// (trace_profile_plan_1d_kernel, trace_profile_count_1d_kernel, the scan,
+// trace_profile_write_1d_kernel, trace_profile_finish_1d_kernel). A profile
+// starting below r = 0, a narrow or non-increasing cell inside the radius, cell
+// 0 crossing the radius, fewer than two cells or a count above capacity take
+// the serial pass in one thread. Before, one thread placed the nodes (about
+// 0.46 ms per step late in the GXII FLD deck: FP64 latency of one dependent
+// chain), then one block of 1024 threads over the segments (130 to 195 us per
+// step on the GXII decks and the CBET preset, its FP64 work on one SM).
 constexpr int kTraceProfileBlock = 1024;
 
 __device__ inline laser_mesh_bodies::TraceProfileCursor trace_profile_segment_cursor(
@@ -619,7 +623,9 @@ __device__ inline laser_mesh_bodies::TraceProfileCursor trace_profile_segment_cu
 // Segment `segment` of the profile: 0 the profile's start through cell 0; 1 ..
 // c_cross - 1 one cell each; c_cross the cells c_cross .. c_last (the first
 // cell crossing the outer radius and those beyond it; none when every cell is
-// inside) and the tail.
+// inside) and the hydro region's outer face, after which the last segment's
+// graded nodes and the outer radius follow (trace_profile_tail_count_1d_kernel,
+// trace_profile_tail_write_1d_kernel).
 __device__ inline void trace_profile_place_segment(laser_mesh_bodies::TraceProfileCursor& cur,
                                                    const int segment,
                                                    const int c_cross,
@@ -642,11 +648,53 @@ __device__ inline void trace_profile_place_segment(laser_mesh_bodies::TraceProfi
     for (int c = c_cross; c <= c_last; ++c) {
       laser_mesh_bodies::trace_profile_push_cell(cur, r_edges, c, pair_r, n_pair, parts);
     }
-    laser_mesh_bodies::trace_profile_push_tail(cur, r_edges[c_last + 1], graded_r, n_graded);
+    laser_mesh_bodies::trace_profile_push_ranked(cur, r_edges[c_last + 1], 2);
   }
 }
 
-__global__ __launch_bounds__(kTraceProfileBlock) void build_trace_profile_nodes_1d_parallel_kernel(
+// The parallel placement's plan: whether the serial pass places the profile, the pair's nodes, the
+// first cell whose upper face is not inside the outer radius (the last segment's first cell) and the
+// profile's last hydro cell; then the last segment's cursor after the hydro region's outer face (its
+// node count, the last two nodes and the last one's rank) and the form of its tail (tail_simple: the
+// graded nodes from tail_k0 on follow in order, then the outer radius when tail_outer; else one
+// thread continues the cursor).
+struct TraceProfilePlan1D {
+  int serial;
+  int n_pair;
+  int c_cross;
+  int c_last;
+  int tail_cells_count;
+  int tail_last_rank;
+  int tail_simple;
+  int tail_k0;
+  int tail_outer;
+  double tail_last;
+  double tail_before_last;
+  double pair[laser_mesh_bodies::kTracePairNodesMax + 1];
+};
+
+// The last segment's cursor after the hydro region's outer face, writing to out (the segment's
+// first node) with the given capacity.
+__device__ inline laser_mesh_bodies::TraceProfileCursor trace_profile_tail_cursor(
+    const TraceProfilePlan1D& plan, double* out, const int capacity, const bool clip,
+    const double r_outer) {
+  laser_mesh_bodies::TraceProfileCursor cur;
+  cur.out = out;
+  cur.capacity = capacity;
+  cur.count = plan.tail_cells_count;
+  cur.rule_count_base = 2;
+  cur.last_rank = plan.tail_last_rank;
+  cur.last = plan.tail_last;
+  cur.before_last = plan.tail_before_last;
+  cur.clip = clip;
+  cur.r_outer = r_outer;
+  return cur;
+}
+
+// Segments per block of the count and write passes (warps spread over the SMs).
+constexpr int kTraceProfileSegmentBlock = 32;
+
+__global__ __launch_bounds__(kTraceProfileBlock) void trace_profile_plan_1d_kernel(
     const double* __restrict__ r_edges,
     const std::uint8_t* __restrict__ cell_is_void,
     const int n_cells,
@@ -660,16 +708,10 @@ __global__ __launch_bounds__(kTraceProfileBlock) void build_trace_profile_nodes_
     const double n_hat_margin,
     const double* __restrict__ graded_r,
     const int n_graded,
-    double* __restrict__ out,
-    const int capacity,
-    int* __restrict__ count_out,
     const int subdiv,
-    const int planar) {
-  __shared__ double sh_pair[laser_mesh_bodies::kTracePairNodesMax + 1];
-  __shared__ int sh_n_pair;
+    TraceProfilePlan1D* __restrict__ plan) {
   __shared__ int sh_serial;
   __shared__ int sh_c_cross;
-  __shared__ int sh_scan[kTraceProfileBlock];
   const int tid = static_cast<int>(threadIdx.x);
   const int nthreads = static_cast<int>(blockDim.x);
   const int parts = subdiv > 1 ? subdiv : 1;
@@ -680,16 +722,18 @@ __global__ __launch_bounds__(kTraceProfileBlock) void build_trace_profile_nodes_
                     : -1;
   if (tid == 0) {
     sh_serial = (c_last < 1) ? 1 : 0;
-    sh_n_pair = 0;
+    int n_pair = 0;
     sh_c_cross = c_last + 1;
     if (c_last >= 1) {
-      sh_n_pair = laser_mesh_bodies::trace_profile_pair_nodes_1d(
+      n_pair = laser_mesh_bodies::trace_profile_pair_nodes_1d(
           r_edges, cell_is_void, n_cells, c_last, fcrit_cell, rho, zbar, A_eff_cell, n_crit_safe,
-          critical_clip, n_hat_margin, sh_pair);
+          critical_clip, n_hat_margin, plan->pair);
       if (!(r_edges[0] >= 0.0)) {
         sh_serial = 1;
       }
     }
+    plan->n_pair = n_pair;
+    plan->c_last = c_last;
   }
   __syncthreads();
   // The first cell whose upper face is not inside the outer radius (a NaN face
@@ -712,61 +756,237 @@ __global__ __launch_bounds__(kTraceProfileBlock) void build_trace_profile_nodes_
     sh_serial = 1;
   }
   __syncthreads();
-  if (sh_serial != 0) {
-    if (tid == 0) {
-      *count_out = laser_mesh_bodies::build_trace_profile_nodes_1d(
-          r_edges, cell_is_void, n_cells, outer_surface_cell, fcrit_cell, rho, zbar, A_eff_cell,
-          n_crit_safe, critical_clip, n_hat_margin, graded_r, n_graded, out, capacity, subdiv,
-          planar != 0);
-    }
-    return;
-  }
-  const int n_pair = sh_n_pair;
-  const bool is_planar = planar != 0;
-  // Segments: 0 the profile's start through cell 0, 1 .. c_cross - 1 the cells
-  // inside the outer radius, c_cross the rest.
-  const int n_seg = c_cross + 1;
-  const int chunk = (n_seg + nthreads - 1) / nthreads;
-  const int s_begin = min(n_seg, tid * chunk);
-  const int s_end = min(n_seg, s_begin + chunk);
-  int my_count = 0;
-  for (int seg = s_begin; seg < s_end; ++seg) {
-    laser_mesh_bodies::TraceProfileCursor cur =
-        trace_profile_segment_cursor(seg, nullptr, INT_MAX, clip, r_outer);
-    trace_profile_place_segment(cur, seg, c_cross, c_last, r_edges, graded_r, n_graded, sh_pair,
-                                n_pair, parts, is_planar);
-    my_count += cur.count;
-  }
-  // Inclusive scan of the threads' counts (fixed order).
-  sh_scan[tid] = my_count;
-  __syncthreads();
-  for (int step = 1; step < nthreads; step <<= 1) {
-    const int add = (tid >= step) ? sh_scan[tid - step] : 0;
-    __syncthreads();
-    sh_scan[tid] += add;
-    __syncthreads();
-  }
-  const int total = sh_scan[nthreads - 1];
-  if (total > capacity) {
-    if (tid == 0) {
-      *count_out = laser_mesh_bodies::build_trace_profile_nodes_1d(
-          r_edges, cell_is_void, n_cells, outer_surface_cell, fcrit_cell, rho, zbar, A_eff_cell,
-          n_crit_safe, critical_clip, n_hat_margin, graded_r, n_graded, out, capacity, subdiv,
-          planar != 0);
-    }
-    return;
-  }
-  int offset = sh_scan[tid] - my_count;
-  for (int seg = s_begin; seg < s_end; ++seg) {
-    laser_mesh_bodies::TraceProfileCursor cur =
-        trace_profile_segment_cursor(seg, out + offset, capacity - offset, clip, r_outer);
-    trace_profile_place_segment(cur, seg, c_cross, c_last, r_edges, graded_r, n_graded, sh_pair,
-                                n_pair, parts, is_planar);
-    offset += cur.count;
-  }
   if (tid == 0) {
-    *count_out = total;
+    plan->serial = sh_serial;
+    plan->c_cross = c_cross;
   }
+}
+
+// Segment seg's node count (one thread per segment: 0 the profile's start through cell 0, 1 ..
+// c_cross - 1 the cells inside the outer radius, c_cross the rest); 0 past the last segment, when
+// the serial pass places the profile, and in the extra entry counts[n_slots] (the scan's total).
+__global__ void trace_profile_count_1d_kernel(TraceProfilePlan1D* __restrict__ plan,
+                                              const double* __restrict__ r_edges,
+                                              const double* __restrict__ graded_r,
+                                              const int n_graded,
+                                              const int subdiv,
+                                              const int planar,
+                                              const int n_slots,
+                                              int* __restrict__ counts) {
+  __shared__ double sh_pair[laser_mesh_bodies::kTracePairNodesMax + 1];
+  const int n_pair = plan->n_pair;
+  for (int i = static_cast<int>(threadIdx.x); i < n_pair; i += static_cast<int>(blockDim.x)) {
+    sh_pair[i] = plan->pair[i];
+  }
+  __syncthreads();
+  const int seg = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+  if (seg > n_slots) {
+    return;
+  }
+  const int c_cross = plan->c_cross;
+  if (seg == n_slots || plan->serial != 0 || seg > c_cross) {
+    counts[seg] = 0;
+    return;
+  }
+  const bool clip = n_graded > 0;
+  const double r_outer = clip ? graded_r[n_graded - 1] : 0.0;
+  const int parts = subdiv > 1 ? subdiv : 1;
+  laser_mesh_bodies::TraceProfileCursor cur =
+      trace_profile_segment_cursor(seg, nullptr, INT_MAX, clip, r_outer);
+  trace_profile_place_segment(cur, seg, c_cross, plan->c_last, r_edges, graded_r, n_graded, sh_pair,
+                              n_pair, parts, planar != 0);
+  counts[seg] = cur.count;
+  if (seg == c_cross) {
+    plan->tail_cells_count = cur.count;
+    plan->tail_last_rank = cur.last_rank;
+    plan->tail_last = cur.last;
+    plan->tail_before_last = cur.before_last;
+  }
+}
+
+// The last segment's graded nodes beyond the hydro region's outer face and the outer radius
+// (laser_mesh_bodies::trace_profile_push_graded continuing the segment's cursor). A rank-0 node
+// never replaces the cursor's last node (its rank is >= 0), so each graded node beyond the face is
+// either kept as a new node or dropped without changing the cursor. When the graded radii increase
+// strictly, the nodes before the first one j that passes the cursor's tests against the cursor's
+// last node are dropped, and when every node after j passes them against the node before it, the
+// nodes j .. n_graded - 1 are kept in order, then the outer radius when it passes the same tests.
+// Otherwise one thread continues the cursor as the serial pass does. Sets counts[c_cross] to the
+// whole last segment's count. One block.
+__global__ __launch_bounds__(kTraceProfileBlock) void trace_profile_tail_count_1d_kernel(
+    TraceProfilePlan1D* __restrict__ plan,
+    const double* __restrict__ r_edges,
+    const double* __restrict__ graded_r,
+    const int n_graded,
+    int* __restrict__ counts) {
+  __shared__ int sh_first[kTraceProfileBlock];
+  if (plan->serial != 0) {
+    return;
+  }
+  const int tid = static_cast<int>(threadIdx.x);
+  const int nthreads = static_cast<int>(blockDim.x);
+  const int c_cross = plan->c_cross;
+  const double r_end = r_edges[plan->c_last + 1];
+  const bool clip = n_graded > 0;
+  const double r_outer = clip ? graded_r[n_graded - 1] : 0.0;
+  const double face_last = plan->tail_last;
+  // trace_profile_push_ranked's tests of a rank-0 node r against the last kept node prev
+  const auto kept_after = [&](const double r, const double prev) {
+    return r >= 0.0 && !(clip && r > r_outer) && r > prev &&
+           r - prev > laser_mesh_bodies::kTraceProfileMinGap * r;
+  };
+  // the first node beyond the face that passes against the cursor's last node
+  int first = n_graded;
+  bool simple = plan->tail_last_rank >= 0;
+  for (int k = tid; k < n_graded; k += nthreads) {
+    const double r = graded_r[k];
+    if (k > 0 && !(r > graded_r[k - 1])) {
+      simple = false;
+    }
+    if (r > r_end && kept_after(r, face_last) && k < first) {
+      first = k;
+    }
+  }
+  sh_first[tid] = first;
+  __syncthreads();
+  for (int stride = nthreads / 2; stride > 0; stride >>= 1) {
+    if (tid < stride && sh_first[tid + stride] < sh_first[tid]) {
+      sh_first[tid] = sh_first[tid + stride];
+    }
+    __syncthreads();
+  }
+  const int j = sh_first[0];
+  // every node after j against the node before it
+  for (int k = j + 1 + tid; k < n_graded; k += nthreads) {
+    if (!kept_after(graded_r[k], graded_r[k - 1])) {
+      simple = false;
+    }
+  }
+  simple = __syncthreads_and(simple ? 1 : 0) != 0;
+  if (tid != 0) {
+    return;
+  }
+  if (simple) {
+    const int n_in = n_graded - j;
+    const double last = (n_in > 0) ? graded_r[n_graded - 1] : face_last;
+    const int outer = (clip && kept_after(r_outer, last)) ? 1 : 0;
+    plan->tail_simple = 1;
+    plan->tail_k0 = j;
+    plan->tail_outer = outer;
+    counts[c_cross] = plan->tail_cells_count + n_in + outer;
+    return;
+  }
+  plan->tail_simple = 0;
+  laser_mesh_bodies::TraceProfileCursor cur =
+      trace_profile_tail_cursor(*plan, nullptr, INT_MAX, clip, r_outer);
+  laser_mesh_bodies::trace_profile_push_graded(cur, r_end, graded_r, n_graded);
+  counts[c_cross] = cur.count;
+}
+
+// Segment seg's nodes at its offset (offsets[n_slots] is the total; nothing when the serial pass
+// places the profile or the total exceeds the capacity).
+__global__ void trace_profile_write_1d_kernel(const TraceProfilePlan1D* __restrict__ plan,
+                                              const double* __restrict__ r_edges,
+                                              const double* __restrict__ graded_r,
+                                              const int n_graded,
+                                              const int subdiv,
+                                              const int planar,
+                                              const int n_slots,
+                                              const int* __restrict__ offsets,
+                                              double* __restrict__ out,
+                                              const int capacity) {
+  __shared__ double sh_pair[laser_mesh_bodies::kTracePairNodesMax + 1];
+  const int n_pair = plan->n_pair;
+  for (int i = static_cast<int>(threadIdx.x); i < n_pair; i += static_cast<int>(blockDim.x)) {
+    sh_pair[i] = plan->pair[i];
+  }
+  __syncthreads();
+  const int seg = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+  const int c_cross = plan->c_cross;
+  if (seg >= n_slots || plan->serial != 0 || seg > c_cross || offsets[n_slots] > capacity) {
+    return;
+  }
+  const bool clip = n_graded > 0;
+  const double r_outer = clip ? graded_r[n_graded - 1] : 0.0;
+  const int parts = subdiv > 1 ? subdiv : 1;
+  const int offset = offsets[seg];
+  laser_mesh_bodies::TraceProfileCursor cur =
+      trace_profile_segment_cursor(seg, out + offset, capacity - offset, clip, r_outer);
+  trace_profile_place_segment(cur, seg, c_cross, plan->c_last, r_edges, graded_r, n_graded, sh_pair,
+                              n_pair, parts, planar != 0);
+}
+
+// The last segment's graded nodes and outer radius at their places (the plan's tail form; nothing
+// when the serial pass places the profile or the total exceeds the capacity). One thread per graded
+// node and one for the outer radius, or one thread continuing the cursor.
+__global__ void trace_profile_tail_write_1d_kernel(const TraceProfilePlan1D* __restrict__ plan,
+                                                   const double* __restrict__ r_edges,
+                                                   const double* __restrict__ graded_r,
+                                                   const int n_graded,
+                                                   const int n_slots,
+                                                   const int* __restrict__ offsets,
+                                                   double* __restrict__ out,
+                                                   const int capacity) {
+  if (plan->serial != 0 || offsets[n_slots] > capacity) {
+    return;
+  }
+  const int k = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+  const int offset = offsets[plan->c_cross];
+  const bool clip = n_graded > 0;
+  const double r_outer = clip ? graded_r[n_graded - 1] : 0.0;
+  if (plan->tail_simple != 0) {
+    const int k0 = plan->tail_k0;
+    double* const tail_out = out + offset + plan->tail_cells_count;
+    if (k >= k0 && k < n_graded) {
+      tail_out[k - k0] = graded_r[k];
+    } else if (k == n_graded && plan->tail_outer != 0) {
+      tail_out[n_graded - k0] = r_outer;
+    }
+    return;
+  }
+  if (k != 0) {
+    return;
+  }
+  laser_mesh_bodies::TraceProfileCursor cur =
+      trace_profile_tail_cursor(*plan, out + offset, capacity - offset, clip, r_outer);
+  laser_mesh_bodies::trace_profile_push_graded(cur, r_edges[plan->c_last + 1], graded_r, n_graded);
+}
+
+// The count of the profile's nodes, or the serial pass when the plan asks for it or the segments'
+// total exceeds the capacity.
+__global__ void trace_profile_finish_1d_kernel(const TraceProfilePlan1D* __restrict__ plan,
+                                               const int n_slots,
+                                               const int* __restrict__ offsets,
+                                               const double* __restrict__ r_edges,
+                                               const std::uint8_t* __restrict__ cell_is_void,
+                                               const int n_cells,
+                                               const int outer_surface_cell,
+                                               const int fcrit_cell,
+                                               const double* __restrict__ rho,
+                                               const double* __restrict__ zbar,
+                                               const double* __restrict__ A_eff_cell,
+                                               const double n_crit_safe,
+                                               const int critical_clip,
+                                               const double n_hat_margin,
+                                               const double* __restrict__ graded_r,
+                                               const int n_graded,
+                                               double* __restrict__ out,
+                                               const int capacity,
+                                               int* __restrict__ count_out,
+                                               const int subdiv,
+                                               const int planar) {
+  if (blockIdx.x != 0 || threadIdx.x != 0) {
+    return;
+  }
+  const int total = offsets[n_slots];
+  if (plan->serial != 0 || total > capacity) {
+    *count_out = laser_mesh_bodies::build_trace_profile_nodes_1d(
+        r_edges, cell_is_void, n_cells, outer_surface_cell, fcrit_cell, rho, zbar, A_eff_cell,
+        n_crit_safe, critical_clip, n_hat_margin, graded_r, n_graded, out, capacity, subdiv,
+        planar != 0);
+    return;
+  }
+  *count_out = total;
 }
 
 __global__ void map_node_material_1d_kernel(
@@ -2087,6 +2307,178 @@ void map_from_hydro_1d(LaserMesh& mesh,
   mesh.dx_min = params.dR_fine;
 }
 
+laser_map_1d::MapInputs map_inputs_1d(LaserMesh& mesh,
+                                      const core::State& state,
+                                      const core::Config::LaserConfig& laser_cfg) {
+  laser_map_1d::MapInputs in;
+  in.n_crit = mesh.n_crit;
+  in.mesh_factor = laser_cfg.lasermesh.mesh_factor;
+  in.rmax_n_hat_threshold = laser_cfg.lasermesh.rmax_n_hat_threshold;
+  in.r_max_factor = laser_cfg.lasermesh.r_max_factor;
+  in.target_radius = mesh.target_radius;
+  in.nr_max = laser_cfg.lasermesh.nr_max;
+  in.ghost_enabled = mesh.ghost_corona_enabled ? 1 : 0;
+  in.ghost_n_out = mesh.ghost_n_out;
+  in.ghost_ne_min_frac = mesh.ghost_ne_min_frac;
+  in.ghost_ne_max_frac = mesh.ghost_ne_max_frac;
+  in.ghost_Te_min_eV = mesh.ghost_Te_min_eV;
+  in.ghost_zbar_min = mesh.ghost_zbar_min;
+  in.ghost_zbar_max = mesh.ghost_zbar_max;
+  in.ghost_transition_resolved_nhat = mesh.ghost_transition_resolved_nhat;
+  in.ghost_transition_resolved_cells = mesh.ghost_transition_resolved_cells;
+  in.material_A = mesh.material_A;
+  if (mesh.laser_turn_on_s < 0.0) {
+    mesh.laser_turn_on_s = laser_turn_on_time_s(state);
+  }
+  in.t_since_turn_on = std::max(state.t - mesh.laser_turn_on_s, 0.0);
+  return in;
+}
+
+laser_map_1d::MapScalars map_from_hydro_1d_device(LaserMesh& mesh,
+                                                  const core::State& state,
+                                                  const core::Config::LaserConfig& laser_cfg,
+                                                  const double* A_eff_device,
+                                                  laser_map_1d::Workspace& map_ws,
+                                                  cudaStream_t stream,
+                                                  LaserNodeMaterial1D* node_material) {
+  const core::NvtxRange nvtx_range("laser.map_hydro");
+  TENRYU_ASSERT(mesh.is_allocated(), "map_from_hydro_1d_device requires allocated LaserMesh");
+  TENRYU_ASSERT(state.mesh.dim == 1, "map_from_hydro_1d_device expects 1D_SPH state");
+  const int n_cells = static_cast<int>(state.rho.size());
+  TENRYU_ASSERT(state.cell_is_void.empty() ||
+                    state.cell_is_void.size() == static_cast<std::size_t>(n_cells),
+                "map_from_hydro_1d_device cell_is_void size mismatch");
+  const laser_map_1d::MapInputs in = map_inputs_1d(mesh, state, laser_cfg);
+  const laser_map_1d::MapScalars m =
+      laser_map_1d::map_scalars(map_ws, state, A_eff_device, in, stream);
+  TENRYU_ASSERT((m.nonfinite_flags & 1) == 0, "map_from_hydro_1d encountered non-finite rho");
+  TENRYU_ASSERT((m.nonfinite_flags & 2) == 0, "map_from_hydro_1d encountered non-finite zbar");
+  TENRYU_ASSERT((m.nonfinite_flags & 4) == 0, "map_from_hydro_1d encountered non-finite Te");
+
+  // The rest as map_from_hydro_1d after its scalar part.
+  mesh.last_ghost_width = m.ghost_width;
+  mesh.ensure_capacity(m.nr, m.nz);
+  static int prev_nr = 0;
+  static int prev_nz = 0;
+  const bool first_call = (prev_nr == 0 && prev_nz == 0);
+  const bool significant_change =
+      (prev_nr > 0) && (std::abs(m.nr - prev_nr) > std::max(1, prev_nr / 20));
+  if (first_call || significant_change) {
+    const double active_mem_mb = 10.0 * static_cast<double>(m.nr + 1) *
+                                 static_cast<double>(m.nz + 1) * 8.0 /
+                                 (1024.0 * 1024.0);
+    std::ostringstream oss;
+    oss << "LaserMesh1D: nr=" << m.nr << ", nz=" << m.nz << ", R_crit="
+        << std::scientific << std::setprecision(4) << m.R_crit << ", dR_fine="
+        << m.dR_fine << ", nr_max=" << std::defaultfloat << laser_cfg.lasermesh.nr_max
+        << ", active_mem=" << std::fixed << std::setprecision(1) << active_mem_mb << "MB";
+    core::log_info(oss.str());
+    prev_nr = m.nr;
+    prev_nz = m.nz;
+  }
+  mesh.R_max = m.R_max;
+  mesh.Z_min = -m.R_max;
+  mesh.Z_max = m.R_max;
+  const int n_nodes_total = mesh.n_nodes();
+
+  // TENRYU_LASER_GHOST_DIAG=1: one line per 1D map with the surface and
+  // ghost-corona parameters (read-only diagnostic).
+  static const bool ghost_diag = [] {
+    const char* v = std::getenv("TENRYU_LASER_GHOST_DIAG");
+    return v != nullptr && v[0] == '1';
+  }();
+  if (ghost_diag) {
+    std::ostringstream oss;
+    oss << std::scientific << std::setprecision(6) << "[laser-ghost] t=" << state.t
+        << " step=" << state.step << " outer_cell=" << m.outer_surface_cell
+        << " fcrit_cell=" << m.fcrit_cell << " outer_n_hat=" << m.outer_n_hat
+        << " r_surface=" << m.r_surface_outer << " configured=" << m.ghost_configured
+        << " fade=" << m.ghost_fade << " use=" << m.use_ghost_corona
+        << " ne_inner=" << m.ghost_ne_inner << " width=" << m.ghost_width
+        << " Te_anchor=" << m.Te_anchor << " zbar_anchor=" << m.zbar_anchor
+        << " cs=" << m.ghost_cs << " t_on=" << in.t_since_turn_on
+        << " dR_fine=" << m.dR_fine << " R_crit=" << m.R_crit;
+    if (m.outer_surface_cell >= 1) {
+      oss << " n_hat[outer-1]=" << m.n_hat_outer_minus_1;
+    }
+    core::log_info(oss.str());
+  }
+
+  cuda_check(cudaMemcpyAsync(mesh.node_R, laser_map_1d::node_R(map_ws),
+                             static_cast<std::size_t>(m.nr + 1) * sizeof(double),
+                             cudaMemcpyDeviceToDevice, stream),
+             "map_from_hydro_1d_device node_R copy failed");
+  cuda_check(cudaMemcpyAsync(mesh.node_Z, laser_map_1d::node_Z(map_ws),
+                             static_cast<std::size_t>(2 * m.nr + 1) * sizeof(double),
+                             cudaMemcpyDeviceToDevice, stream),
+             "map_from_hydro_1d_device node_Z copy failed");
+  ensure_hydro_mapping_capacity(mesh, n_cells);
+  cuda_check(cudaMemcpyAsync(mesh.hydro_A_eff_device, A_eff_device,
+                             static_cast<std::size_t>(n_cells) * sizeof(double),
+                             cudaMemcpyDeviceToDevice, stream),
+             "map_from_hydro_1d_device A_eff copy failed");
+  if (state.cell_is_void.empty()) {
+    cuda_check(cudaMemsetAsync(mesh.hydro_cell_is_void_device, 0,
+                               static_cast<std::size_t>(n_cells) * sizeof(std::uint8_t), stream),
+               "map_from_hydro_1d_device cell_is_void reset failed");
+  } else {
+    cuda_check(cudaMemcpyAsync(mesh.hydro_cell_is_void_device,
+                               core::device_cell_is_void(state.cell_is_void),
+                               static_cast<std::size_t>(n_cells) * sizeof(std::uint8_t),
+                               cudaMemcpyDeviceToDevice, stream),
+               "map_from_hydro_1d_device cell_is_void copy failed");
+  }
+
+  const double n_crit_safe = std::max(mesh.n_crit, 1.0e-30);
+  const int block = 256;
+  const int grid = (n_nodes_total + block - 1) / block;
+  map_hydro_to_laser_1d_kernel<<<grid, block, 0, stream>>>(
+      mesh.node_R, mesh.node_Z, state.rho.data(), state.Te.data(), state.zbar.data(),
+      mesh.hydro_A_eff_device, mesh.hydro_cell_is_void_device, state.x_r.data(),
+      mesh.n_e_hat, mesh.n_e_hat_raw, mesh.T_e, mesh.Zbar, n_nodes_total,
+      mesh.n_nodes_z, n_cells, n_crit_safe, m.use_ghost_corona,
+      m.outer_surface_cell, m.ghost_ne_inner, m.ghost_scale_length, m.ghost_ne_min,
+      m.r_surface_outer, m.r_ghost_outer, m.Te_anchor, m.zbar_anchor, mesh.ghost_zbar_min,
+      mesh.ghost_zbar_max, mesh.ghost_Te_min_eV, laser_cfg.lasermesh.critical_clip ? 1 : 0,
+      mesh.n_hat_margin, m.fcrit_cell,
+      (state.cell_material_index.size() == static_cast<std::size_t>(n_cells)) ? state.cell_material_index.data()
+                                                                              : nullptr);
+  cuda_check(cudaGetLastError(), "map_from_hydro_1d_device map kernel launch failed");
+  if (node_material != nullptr && node_material->cell_material_index != nullptr) {
+    if (node_material->node_material.size() < static_cast<std::size_t>(n_nodes_total)) {
+      node_material->node_material.reset(static_cast<std::size_t>(n_nodes_total));
+      node_material->node_zcoll.reset(static_cast<std::size_t>(n_nodes_total));
+    }
+    map_node_material_1d_kernel<<<grid, block, 0, stream>>>(
+        mesh.node_R, mesh.node_Z, state.x_r.data(), mesh.hydro_cell_is_void_device,
+        node_material->cell_material_index, mesh.Zbar, n_nodes_total, mesh.n_nodes_z,
+        n_cells, m.use_ghost_corona, m.outer_surface_cell, m.r_surface_outer,
+        m.r_ghost_outer, node_material->zeff_materials, node_material->n_materials,
+        node_material->node_material.data(), node_material->node_zcoll.data());
+    cuda_check(cudaGetLastError(),
+               "map_from_hydro_1d_device node material kernel launch failed");
+  }
+
+  mesh.geometry_code = state.mesh.geometry_code;
+  LaserMesh::TraceProfileMap1D& tp = mesh.trace_profile_map;
+  tp.n_cells = n_cells;
+  tp.outer_surface_cell = m.outer_surface_cell;
+  tp.fcrit_cell = m.fcrit_cell;
+  tp.use_ghost_corona = m.use_ghost_corona;
+  tp.critical_clip = laser_cfg.lasermesh.critical_clip ? 1 : 0;
+  tp.n_crit_safe = n_crit_safe;
+  tp.ghost_ne_inner = m.ghost_ne_inner;
+  tp.ghost_scale_length = m.ghost_scale_length;
+  tp.ghost_ne_min = m.ghost_ne_min;
+  tp.r_surface_outer = m.r_surface_outer;
+  tp.r_ghost_outer = m.r_ghost_outer;
+  tp.Te_anchor = m.Te_anchor;
+  tp.zbar_anchor = m.zbar_anchor;
+  map_trace_profile_1d(mesh, state, 1, stream, node_material);
+  mesh.dx_min = m.dR_fine;
+  return m;
+}
+
 void place_trace_profile_nodes_1d(const double* r_edges,
                                   const std::uint8_t* cell_is_void,
                                   const int n_cells,
@@ -2106,11 +2498,48 @@ void place_trace_profile_nodes_1d(const double* r_edges,
                                   const int subdiv,
                                   const bool planar,
                                   cudaStream_t stream) {
-  build_trace_profile_nodes_1d_parallel_kernel<<<1, kTraceProfileBlock, 0, stream>>>(
+  // Segments 0 .. c_cross with c_cross <= n_cells (the plan's), one slot to spare, and the scan's
+  // total behind them.
+  const int n_slots = n_cells + 2;
+  auto* plan = static_cast<TraceProfilePlan1D*>(
+      core::device_scratch_acquire("laser_mesh:trace_profile_plan", sizeof(TraceProfilePlan1D)));
+  auto* counts = static_cast<int*>(core::device_scratch_acquire(
+      "laser_mesh:trace_profile_counts", static_cast<std::size_t>(n_slots + 1) * sizeof(int)));
+  auto* offsets = static_cast<int*>(core::device_scratch_acquire(
+      "laser_mesh:trace_profile_offsets", static_cast<std::size_t>(n_slots + 1) * sizeof(int)));
+  std::size_t scan_bytes = 0;
+  cuda_check(cub::DeviceScan::ExclusiveSum(nullptr, scan_bytes, counts, offsets, n_slots + 1, stream),
+             "place_trace_profile_nodes_1d scan size failed");
+  void* scan_storage = core::device_scratch_acquire("laser_mesh:trace_profile_scan",
+                                                    std::max<std::size_t>(scan_bytes, 1));
+  const int planar_flag = planar ? 1 : 0;
+  const int segment_blocks = (n_slots + 1 + kTraceProfileSegmentBlock - 1) / kTraceProfileSegmentBlock;
+  trace_profile_plan_1d_kernel<<<1, kTraceProfileBlock, 0, stream>>>(
       r_edges, cell_is_void, n_cells, outer_surface_cell, fcrit_cell, rho, zbar, A_eff_cell,
-      n_crit_safe, critical_clip, n_hat_margin, graded_r, n_graded, out, capacity, d_count,
-      subdiv, planar ? 1 : 0);
-  cuda_check(cudaGetLastError(), "place_trace_profile_nodes_1d launch failed");
+      n_crit_safe, critical_clip, n_hat_margin, graded_r, n_graded, subdiv, plan);
+  cuda_check(cudaGetLastError(), "place_trace_profile_nodes_1d plan launch failed");
+  trace_profile_count_1d_kernel<<<segment_blocks, kTraceProfileSegmentBlock, 0, stream>>>(
+      plan, r_edges, graded_r, n_graded, subdiv, planar_flag, n_slots, counts);
+  cuda_check(cudaGetLastError(), "place_trace_profile_nodes_1d count launch failed");
+  trace_profile_tail_count_1d_kernel<<<1, kTraceProfileBlock, 0, stream>>>(plan, r_edges, graded_r,
+                                                                          n_graded, counts);
+  cuda_check(cudaGetLastError(), "place_trace_profile_nodes_1d tail count launch failed");
+  cuda_check(cub::DeviceScan::ExclusiveSum(scan_storage, scan_bytes, counts, offsets, n_slots + 1,
+                                           stream),
+             "place_trace_profile_nodes_1d scan failed");
+  trace_profile_write_1d_kernel<<<segment_blocks, kTraceProfileSegmentBlock, 0, stream>>>(
+      plan, r_edges, graded_r, n_graded, subdiv, planar_flag, n_slots, offsets, out, capacity);
+  cuda_check(cudaGetLastError(), "place_trace_profile_nodes_1d write launch failed");
+  constexpr int kTailBlock = 256;
+  trace_profile_tail_write_1d_kernel<<<(n_graded + 1 + kTailBlock - 1) / kTailBlock, kTailBlock, 0,
+                                       stream>>>(plan, r_edges, graded_r, n_graded, n_slots, offsets,
+                                                 out, capacity);
+  cuda_check(cudaGetLastError(), "place_trace_profile_nodes_1d tail write launch failed");
+  trace_profile_finish_1d_kernel<<<1, 1, 0, stream>>>(
+      plan, n_slots, offsets, r_edges, cell_is_void, n_cells, outer_surface_cell, fcrit_cell, rho,
+      zbar, A_eff_cell, n_crit_safe, critical_clip, n_hat_margin, graded_r, n_graded, out, capacity,
+      d_count, subdiv, planar_flag);
+  cuda_check(cudaGetLastError(), "place_trace_profile_nodes_1d finish launch failed");
 }
 
 void map_trace_profile_1d(LaserMesh& mesh,

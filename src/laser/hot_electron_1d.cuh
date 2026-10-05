@@ -81,7 +81,12 @@ TENRYU_HOTE_HOST_DEVICE inline double stopping_power_erg_cm2_per_g(
 // with adaptive substeps (energy-change target f_sub). Returns the energy
 // LEAVING the region (>= 0): 0.0 when thermalized (E <= E_floor) or when the
 // substep cap trips (conservative fallback; increments *cap_counter);
-// E_in unchanged when stopping is zero.
+// E_in unchanged when stopping is zero. The stopping functor may be host-only (a host lambda) or
+// device code; the execution-space check is off for this template, whose host and device
+// instantiations call only functors of their own side.
+#ifdef __CUDACC__
+#pragma nv_exec_check_disable
+#endif
 template <class StoppingFn>
 TENRYU_HOTE_HOST_DEVICE inline double march_cell(
     const double E_in, const double dSigma, StoppingFn&& S_of_E,

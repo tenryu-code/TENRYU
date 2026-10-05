@@ -121,7 +121,7 @@ Laser(
     wavelength_nm=527.0,
     mode="raytrace_2d",
     # The characteristic ray integrator: 1000 rays give the 16000-ray result
-    # (absorbed fraction to 2e-5, peak density within 7e-4; PERFORMANCE 19.3).
+    # (absorbed fraction to 2e-5, peak density within 7e-4).
     rays_per_beam=1000,
     ray_output_count=200,
     ray_output_trajectory=True,

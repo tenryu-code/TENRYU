@@ -15,8 +15,10 @@
 #include <vector>
 
 #include <cuda_runtime.h>
+#include <math_constants.h>
 
 #include "core/config.hpp"
+#include "core/device_ordered_sum.cuh"
 #include "core/device_scratch.hpp"
 #include "core/state.hpp"
 #include "mesh/geometry_1d.cuh"
@@ -951,16 +953,11 @@ double compute_dt_braginskii(const core::State& state, const core::Config& cfg) 
       state.x_r.size() != static_cast<std::size_t>(n_cells + 1)) {
     return inf;
   }
-  std::int8_t* d_active = nullptr;
-  if (!state.hydro_active.empty() &&
-      state.hydro_active.size() == static_cast<std::size_t>(n_cells)) {
-    d_active = static_cast<std::int8_t*>(core::device_scratch_acquire(
-        "braginskii:dt:hydro_active", n_cells * sizeof(std::int8_t)));
-    brag_cuda_check(cudaMemcpy(d_active, state.hydro_active.data(),
-                               n_cells * sizeof(std::int8_t),
-                               cudaMemcpyHostToDevice),
-                    "braginskii: copy hydro_active failed");
-  }
+  // The device mirror of hydro_active (uploaded when the host flags change).
+  const std::int8_t* d_active =
+      (state.hydro_active.size() == static_cast<std::size_t>(n_cells))
+          ? state.hydro_active_device_ptr()
+          : nullptr;
   const double dt = compute_dt_braginskii_raw(
       state.x_r.data(), state.rho.data(),
       state.Ti.empty() ? nullptr : state.Ti.data(),
@@ -969,6 +966,191 @@ double compute_dt_braginskii(const core::State& state, const core::Config& cfg) 
       state.zbar.empty() ? nullptr : state.zbar.data(), d_active, n_cells, p,
       state.zmom_active ? state.zmom_r4.data() : nullptr);
   return dt;
+}
+
+namespace {
+
+// The history reduction of the 1D diagnostics (compute_history_diagnostics), as the host loop
+// over the cells in order formed it before.
+struct HistoryReduction {
+  int n_active = 0;
+  int n_ratio = 0;
+  int n_e_dom = 0;
+  int n_i_dom = 0;
+  int n_mixed = 0;
+  double eta_i_max = 0.0;
+  double eta_e_max = 0.0;
+  double eta_eff_max = 0.0;
+  double r_min = 0.0;
+  double r_max = 0.0;
+  double heat_i_tot = 0.0;
+  double heat_e_tot = 0.0;
+  double sum_m_lnr = 0.0;
+  double sum_m = 0.0;
+};
+
+constexpr int kHistoryReduceBlock = 256;
+constexpr int kHistorySumPerThread = 4;
+
+// The mass-weighted ratio terms of each cell with eta_i > 0 and eta_e > 0 (the inactive cells
+// carry eta_i = -1): m ln(eta_e / eta_i) with its product rounded on its own, and m; zero for
+// the other cells.
+__global__ void braginskii_history_terms_1d_kernel(const double* __restrict__ eta_i,
+                                                   const double* __restrict__ eta_e,
+                                                   const double* __restrict__ mass,
+                                                   const int n_cells, double* __restrict__ m_ln_r,
+                                                   double* __restrict__ m_ratio) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n_cells) {
+    return;
+  }
+  const double ei = eta_i[i];
+  const double ee = eta_e[i];
+  if (ei > 0.0 && ee > 0.0) {
+    const double m = mass[i];
+    m_ln_r[i] = __dmul_rn(m, log(ee / ei));
+    m_ratio[i] = m;
+  } else {
+    m_ln_r[i] = 0.0;
+    m_ratio[i] = 0.0;
+  }
+}
+
+// One block: each thread folds a contiguous run of cells in order (the active cells are those
+// with !(eta_i < 0)), then the runs are combined in order; the sums are added in cell order
+// (core::device_ordered, zero entries skipped, which leaves a sum from +0 unchanged).
+__global__ void history_diag_reduce_1d_kernel(
+    const double* __restrict__ eta_i, const double* __restrict__ eta_e,
+    const double* __restrict__ eta_eff, const double* __restrict__ heat_i,
+    const double* __restrict__ heat_e, const double* __restrict__ m_ln_r,
+    const double* __restrict__ m_ratio, const int n_cells,
+    HistoryReduction* __restrict__ result) {
+  const double kNaN = CUDART_NAN;
+  __shared__ double sh_values[kHistoryReduceBlock * kHistorySumPerThread];
+  __shared__ int sh_scan[kHistoryReduceBlock];
+  __shared__ double sh_ext[5][kHistoryReduceBlock];
+  __shared__ int sh_count[5][kHistoryReduceBlock];
+  const int t = static_cast<int>(threadIdx.x);
+  const int run = (n_cells + kHistoryReduceBlock - 1) / kHistoryReduceBlock;
+  const int begin = t * run;
+  const int end = min(begin + run, n_cells);
+  // NaN: nothing folded yet (fmax_like_glibc / fmin_like_glibc pass it over)
+  double ext[5] = {kNaN, kNaN, kNaN, kNaN, kNaN};  // eta_i, eta_e, eta_eff max; r min, max
+  int count[5] = {0, 0, 0, 0, 0};                     // active, ratio, e-dom, i-dom, mixed
+  for (int i = begin; i < end; ++i) {
+    const double ei = eta_i[i];
+    if (ei < 0.0) {
+      continue;
+    }
+    ++count[0];
+    const double ee = eta_e[i];
+    ext[0] = core::device_ordered::fmax_like_glibc(ext[0], ei);
+    ext[1] = core::device_ordered::fmax_like_glibc(ext[1], ee);
+    ext[2] = core::device_ordered::fmax_like_glibc(ext[2], eta_eff[i]);
+    if (ei > 0.0 && ee > 0.0) {
+      const double r = ee / ei;
+      ++count[1];
+      ext[3] = core::device_ordered::fmin_like_glibc(ext[3], r);
+      ext[4] = core::device_ordered::fmax_like_glibc(ext[4], r);
+      if (r >= 10.0) {
+        ++count[2];
+      } else if (r <= 0.1) {
+        ++count[3];
+      } else {
+        ++count[4];
+      }
+    }
+  }
+  for (int k = 0; k < 5; ++k) {
+    sh_ext[k][t] = ext[k];
+    sh_count[k][t] = count[k];
+  }
+  __syncthreads();
+  const double sum_heat_i = core::device_ordered::block_ordered_sum_nonzero<
+      kHistoryReduceBlock, kHistorySumPerThread>(heat_i, n_cells, 0.0, sh_values, sh_scan);
+  const double sum_heat_e = core::device_ordered::block_ordered_sum_nonzero<
+      kHistoryReduceBlock, kHistorySumPerThread>(heat_e, n_cells, 0.0, sh_values, sh_scan);
+  const double sum_m_lnr = core::device_ordered::block_ordered_sum_nonzero<
+      kHistoryReduceBlock, kHistorySumPerThread>(m_ln_r, n_cells, 0.0, sh_values, sh_scan);
+  const double sum_m = core::device_ordered::block_ordered_sum_nonzero<
+      kHistoryReduceBlock, kHistorySumPerThread>(m_ratio, n_cells, 0.0, sh_values, sh_scan);
+  if (t == 0) {
+    HistoryReduction out;
+    // the host loop's starting values: 0 for the maxima, +inf for the ratio minimum
+    double total_ext[5] = {0.0, 0.0, 0.0, CUDART_INF, 0.0};
+    int total_count[5] = {0, 0, 0, 0, 0};
+    for (int u = 0; u < kHistoryReduceBlock; ++u) {
+      total_ext[0] = core::device_ordered::fmax_like_glibc(total_ext[0], sh_ext[0][u]);
+      total_ext[1] = core::device_ordered::fmax_like_glibc(total_ext[1], sh_ext[1][u]);
+      total_ext[2] = core::device_ordered::fmax_like_glibc(total_ext[2], sh_ext[2][u]);
+      total_ext[3] = core::device_ordered::fmin_like_glibc(total_ext[3], sh_ext[3][u]);
+      total_ext[4] = core::device_ordered::fmax_like_glibc(total_ext[4], sh_ext[4][u]);
+      for (int k = 0; k < 5; ++k) {
+        total_count[k] += sh_count[k][u];
+      }
+    }
+    out.n_active = total_count[0];
+    out.n_ratio = total_count[1];
+    out.n_e_dom = total_count[2];
+    out.n_i_dom = total_count[3];
+    out.n_mixed = total_count[4];
+    out.eta_i_max = total_ext[0];
+    out.eta_e_max = total_ext[1];
+    out.eta_eff_max = total_ext[2];
+    out.r_min = total_ext[3];
+    out.r_max = total_ext[4];
+    out.heat_i_tot = sum_heat_i;
+    out.heat_e_tot = sum_heat_e;
+    out.sum_m_lnr = sum_m_lnr;
+    out.sum_m = sum_m;
+    *result = out;
+  }
+}
+
+}  // namespace
+
+HistoryDiagnostics reduce_history_diagnostics_1d(const double* eta_i, const double* eta_e,
+                                                 const double* eta_eff, const double* heat_i,
+                                                 const double* heat_e, const double* mass,
+                                                 const int n_cells) {
+  HistoryDiagnostics out;
+  if (n_cells <= 0) {
+    return out;
+  }
+  const std::size_t n = static_cast<std::size_t>(n_cells);
+  // The ratio terms per cell, then the extrema, counts and sums in cell order in one block.
+  double* d_terms = static_cast<double*>(
+      core::device_scratch_acquire("braginskii:history:terms", 2 * n * sizeof(double)));
+  double* d_mlnr = d_terms;
+  double* d_m = d_terms + n;
+  braginskii_history_terms_1d_kernel<<<(n_cells + 255) / 256, 256>>>(eta_i, eta_e, mass,
+                                                                     n_cells, d_mlnr, d_m);
+  brag_cuda_check(cudaGetLastError(), "braginskii: history terms kernel failed");
+  auto* d_result = static_cast<HistoryReduction*>(core::device_scratch_acquire(
+      "braginskii:history:reduction", sizeof(HistoryReduction)));
+  history_diag_reduce_1d_kernel<<<1, kHistoryReduceBlock>>>(eta_i, eta_e, eta_eff, heat_i,
+                                                            heat_e, d_mlnr, d_m, n_cells,
+                                                            d_result);
+  brag_cuda_check(cudaGetLastError(), "braginskii: history reduction kernel failed");
+  HistoryReduction red;
+  brag_cuda_check(cudaMemcpy(&red, d_result, sizeof(red), cudaMemcpyDeviceToHost),
+                  "braginskii: copy history reduction failed");
+  out.n_cells_active = red.n_active;
+  out.n_cells_e_dom = red.n_e_dom;
+  out.n_cells_i_dom = red.n_i_dom;
+  out.n_cells_mixed = red.n_mixed;
+  out.eta_i_max = red.eta_i_max;
+  out.eta_e_max = red.eta_e_max;
+  out.eta_eff_max = red.eta_eff_max;
+  out.heat_rate_i_tot = red.heat_i_tot;
+  out.heat_rate_e_tot = red.heat_e_tot;
+  if (red.n_ratio > 0) {
+    out.ratio_min = red.r_min;
+    out.ratio_max = red.r_max;
+    out.ratio_geomean_masswt =
+        (red.sum_m > 0.0) ? std::exp(red.sum_m_lnr / red.sum_m) : 0.0;
+  }
+  return out;
 }
 
 HistoryDiagnostics compute_history_diagnostics(const core::State& state,
@@ -1000,16 +1182,10 @@ HistoryDiagnostics compute_history_diagnostics(const core::State& state,
   double* d_eta_eff = d_buf + 2 * n;
   double* d_heat_i = d_buf + 3 * n;
   double* d_heat_e = d_buf + 4 * n;
-  std::int8_t* d_active = nullptr;
-  if (!state.hydro_active.empty() &&
-      state.hydro_active.size() == static_cast<std::size_t>(n_cells)) {
-    d_active = static_cast<std::int8_t*>(core::device_scratch_acquire(
-        "braginskii:history:hydro_active", n_cells * sizeof(std::int8_t)));
-    brag_cuda_check(cudaMemcpy(d_active, state.hydro_active.data(),
-                               n_cells * sizeof(std::int8_t),
-                               cudaMemcpyHostToDevice),
-                    "braginskii: copy diag hydro_active failed");
-  }
+  const std::int8_t* d_active =
+      (state.hydro_active.size() == static_cast<std::size_t>(n_cells))
+          ? state.hydro_active_device_ptr()
+          : nullptr;
   DeviceParams p_run = to_device_params(p);
   // 2026-07-26 kernel review: the "physical channel" diagnostics
   // must be the uncapped, unscaled classical Braginskii values with the NRL
@@ -1031,56 +1207,9 @@ HistoryDiagnostics compute_history_diagnostics(const core::State& state,
       state.A_eff.empty() ? nullptr : state.A_eff.data(),
       state.zbar.empty() ? nullptr : state.zbar.data(), state.vol.data(),
       d_active, n_cells, state.mesh.geometry_code, p.species, p_run, p_phys);
-  brag_sync("braginskii: history diag kernel failed");
-  std::vector<double> h(5 * n, 0.0);
-  brag_cuda_check(
-      cudaMemcpy(h.data(), d_buf, 5 * bytes, cudaMemcpyDeviceToHost),
-      "braginskii: copy diag failed");
-  std::vector<double> mass_h(n, 0.0);
-  brag_cuda_check(cudaMemcpy(mass_h.data(), state.mass.data(), bytes,
-                             cudaMemcpyDeviceToHost),
-                  "braginskii: copy diag mass failed");
-  // Deterministic host reduction (fixed cell order, no atomics).
-  double r_min = std::numeric_limits<double>::infinity();
-  double r_max = 0.0;
-  double sum_m_lnr = 0.0;
-  double sum_m = 0.0;
-  bool any_ratio = false;
-  for (std::size_t i = 0; i < n; ++i) {
-    const double ei = h[i];
-    if (ei < 0.0) {
-      continue;  // inactive cell
-    }
-    ++out.n_cells_active;
-    const double ee = h[n + i];
-    out.eta_i_max = std::fmax(out.eta_i_max, ei);
-    out.eta_e_max = std::fmax(out.eta_e_max, ee);
-    out.eta_eff_max = std::fmax(out.eta_eff_max, h[2 * n + i]);
-    out.heat_rate_i_tot += h[3 * n + i];
-    out.heat_rate_e_tot += h[4 * n + i];
-    if (ei > 0.0 && ee > 0.0) {
-      const double r = ee / ei;
-      any_ratio = true;
-      r_min = std::fmin(r_min, r);
-      r_max = std::fmax(r_max, r);
-      const double m = mass_h[i];
-      sum_m_lnr += m * std::log(r);
-      sum_m += m;
-      if (r >= 10.0) {
-        ++out.n_cells_e_dom;
-      } else if (r <= 0.1) {
-        ++out.n_cells_i_dom;
-      } else {
-        ++out.n_cells_mixed;
-      }
-    }
-  }
-  if (any_ratio) {
-    out.ratio_min = r_min;
-    out.ratio_max = r_max;
-    out.ratio_geomean_masswt =
-        (sum_m > 0.0) ? std::exp(sum_m_lnr / sum_m) : 0.0;
-  }
+  brag_cuda_check(cudaGetLastError(), "braginskii: history diag kernel failed");
+  out = reduce_history_diagnostics_1d(d_eta_i, d_eta_e, d_eta_eff, d_heat_i, d_heat_e,
+                                      state.mass.data(), n_cells);
   out.valid = true;
   return out;
 }

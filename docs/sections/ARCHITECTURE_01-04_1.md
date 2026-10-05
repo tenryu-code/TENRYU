@@ -187,6 +187,18 @@ setter の初期化や入れ子の更新が呼出し順序に依存する場合�
   no-op（プール解放禁止）、move はタグごと移譲、pooled Field1D の `resize()`
   （prefix 保存 grow）は grow-only プールと両立しないため assert 禁止。タグは呼び出し点毎に一意
   （同時生存バッファは別タグ必須）、既定コンストラクタの非 pooled 経路はビット恒等で不変。
+- `core/device_ordered_sum.cuh`（2026-10-02 に laser/ から移動）：host のループの順序を再現する device の部品 —
+  ブロック内の排他的接頭和、ゼロを飛ばした添字順の和（+0 から始まる和は不変）、x86-64 の glibc と同じ規則の
+  fmax/fmin（NaN は無視、等しい 2 値は後者）。1D の laser・burn・diagnostics・hydro（粘性の history 集約）・
+  S_N（体積源）が使う。
+- `core/glibc_libm_device.cuh`・`core/glibc_libm_host.hpp`（2026-10-02）：x86-64 の glibc（2.28 以降。ifunc が FMA と
+  AVX2 の CPU で選ぶ FMA 版）の exp・log・pow と同じ結果を返す device 関数（Arm optimized-routines v19.11 の
+  アルゴリズムと表、MIT。表の 931 値は glibc 2.39 の libm と一致を確認、積和の融合は glibc 2.39 の機械語に合わせる）。
+  27 億点の引数（全ビットパターン・端点・指数ごとの範囲）で NaN の中身までビット一致（RTX 4090、glibc 2.39）。host の
+  計算を device へ移して結果を変えないために使う（TMAT 以外の材料の Thomas–Fermi \(\bar Z\)、レーザー注入の解析的 \(T^4\)
+  閉包、高波数速度ダンパーの front mask、S\(_N\) 1D の Marshak 境界。1D ALE の再配置 candidate も使っていたが、1D ALE は
+  同日に退役した）。
+  `host_has_reproduced_build()` はその host（glibc ≥ 2.28 の x86-64、FMA と AVX2）かを返し、host と比べる試験が使う。
 - `Core::FieldMeasure`（`src/core/field_measure.{hpp,cpp}`、ALE P0A F2 — 設計
   `docs/design/ale_asymmetric_robust_design_20260727.md` §2 F2）：場ごとの転送契約
   （support／測度／保存則／bounds／再構成次数／転送種別／epoch 依存）を宣言する

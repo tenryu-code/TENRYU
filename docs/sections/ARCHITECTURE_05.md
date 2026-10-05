@@ -175,7 +175,7 @@ struct State {
     bool   ale_rezoned = false;       // 直近ステップでALE rezoneが発動したか
     int    ale_rezone_invocations = 0; // 累積history診断用（checkpoint必須ではない）
     int    ale_remaps_applied = 0;     // accepted 2D ALE remap counter（checkpoint必須ではない）
-    int    ale_last_applied_step = -1; // 1D V3 ALE cadence/min-step gate 用
+    int    ale_last_applied_step = -1; // ALE が最後に rezone を commit した step（2D_RZ が書く。1D V3 ALE の cadence/min-step gate が読んでいた — 2026-10-02 に退役）
 
     // --- 出力タイミング状態（時間間隔ベース出力用）---
     // checkpoint 保存・復元対象（SPECIFICATION §7.4 output_state/）。

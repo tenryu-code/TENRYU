@@ -10,6 +10,7 @@
 #include <cuda_runtime.h>
 #include <math_constants.h>
 
+#include "burn/burn_inputs_1d_gpu.cuh"
 #include "burn/deposition.cuh"
 #include "burn/neutron_heating_device.cuh"
 #include "burn/partition_device.cuh"
@@ -783,6 +784,146 @@ __global__ void burn_stage_reduce_1d_kernel(
   }
 }
 
+// Every cell's tallies at their start values (the host stage call packed them).
+__global__ void init_cell_tallies_kernel(const int n_cells, CellTallies* __restrict__ tallies) {
+  const int c = blockIdx.x * blockDim.x + threadIdx.x;
+  if (c < n_cells) {
+    tallies[c] = empty_cell_tallies();
+  }
+}
+
+// The device pointers of one stage call: inputs, outputs and scratch.
+struct StagePointers {
+  double* burn_y = nullptr;
+  double* dE_e = nullptr;
+  double* dE_i = nullptr;
+  double* rate_diag = nullptr;
+  double* Qe_diag = nullptr;
+  double* Qi_diag = nullptr;
+  double* S_birth = nullptr;
+  double* nh_emit = nullptr;
+  double* neutron_births = nullptr;
+  const double* rho = nullptr;
+  const double* Ti_eV = nullptr;
+  const double* Te_eV = nullptr;
+  const double* zbar = nullptr;
+  const double* A_eff = nullptr;
+  const double* vol = nullptr;
+  const double* r_node = nullptr;
+  const double* ee = nullptr;
+  const double* ei = nullptr;
+  const double* v_r = nullptr;
+  const double* range_fe = nullptr;
+  const double* range_fi = nullptr;
+  const double* mu = nullptr;
+  const double* mu_weight = nullptr;
+  double* S_out = nullptr;
+  CellTallies* cell_tallies = nullptr;
+  double* neutron_nD = nullptr;
+  double* neutron_nT = nullptr;
+  double* neutron_dep_e_by_source = nullptr;
+  double* neutron_dep_i_by_source = nullptr;
+  NeutronHeatingTallies* neutron_tallies = nullptr;
+  ResultPacket* result = nullptr;
+};
+
+// The stage's kernels over the burn region [first, last]: the column density suffix sums, the
+// reactions and the local or in-flight deposition of every cell, the neutron heating, and the
+// reduction into the result packet.
+void launch_stage_1d(const StagePointers& d, const int n_cells, const int first, const int last,
+                     const BurnStageParams& p, const PartitionTableDeviceView& partition_table,
+                     const bool have_neutron, const bool neutron_mu_valid) {
+  burn_suffix_sum_1d_kernel<<<1, 1>>>(first, last, d.r_node, d.rho, d.S_out);
+  CUDA_CHECK(cudaGetLastError());
+  constexpr int kBlock = 128;
+  const int active_cells = last - first + 1;
+  const int active_grid = (active_cells + kBlock - 1) / kBlock;
+  burn_stage_main_1d_kernel<<<active_grid, kBlock>>>(
+      n_cells, first, last, p, partition_table, d.rho, d.Ti_eV, d.Te_eV, d.zbar, d.A_eff, d.vol,
+      d.r_node, d.ee, d.ei, d.v_r, d.range_fe, d.range_fi, d.S_out, d.burn_y, d.dE_e, d.dE_i,
+      d.rate_diag, d.Qe_diag, d.Qi_diag, d.S_birth, d.nh_emit, d.cell_tallies,
+      d.neutron_births);
+  CUDA_CHECK(cudaGetLastError());
+  if (have_neutron && neutron_mu_valid) {
+    const int cell_grid = (n_cells + kBlock - 1) / kBlock;
+    burn_neutron_targets_1d_kernel<<<cell_grid, kBlock>>>(n_cells, d.rho, d.burn_y,
+                                                          d.neutron_nD, d.neutron_nT);
+    CUDA_CHECK(cudaGetLastError());
+    burn_neutron_transport_1d_kernel<<<cell_grid, kBlock>>>(
+        n_cells, p.neutron_heating_n_mu, p.use_fraley_partition, partition_table, d.r_node,
+        d.rho, d.Te_eV, d.Ti_eV, d.zbar, d.A_eff, d.neutron_nD, d.neutron_nT, d.nh_emit, d.mu,
+        d.mu_weight, d.neutron_dep_e_by_source, d.neutron_dep_i_by_source, d.neutron_tallies);
+    CUDA_CHECK(cudaGetLastError());
+    burn_neutron_finalize_1d_kernel<<<cell_grid, kBlock>>>(
+        n_cells, p, d.rho, d.vol, d.ee, d.ei, d.neutron_dep_e_by_source,
+        d.neutron_dep_i_by_source, d.dE_e, d.dE_i, d.Qe_diag, d.Qi_diag, d.cell_tallies);
+    CUDA_CHECK(cudaGetLastError());
+  }
+  burn_stage_reduce_1d_kernel<<<1, kReductionBlock>>>(n_cells, d.dE_e, d.dE_i, d.cell_tallies,
+                                                      d.neutron_tallies, have_neutron,
+                                                      neutron_mu_valid, d.result);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+// The stage result of the burn region [first, last] from its packet.
+BurnStageResult result_from_packet(const ResultPacket& packet, const BurnStageParams& p,
+                                   const int first, const int last, double& dt_limit_subcycle,
+                                   unsigned int& screening_warning_flags) {
+  BurnStageResult result;
+  result.burn_region_first = first;
+  result.burn_region_last = last;
+  result.released_charged = packet.released_charged;
+  result.released_neutron = packet.released_neutron;
+  result.dep_e = packet.dep_e;
+  result.dep_i = packet.dep_i;
+  result.n_neutrons_dt = packet.n_neutrons_dt;
+  result.n_neutrons_dd = packet.n_neutrons_dd;
+  result.w_dt = packet.w_dt;
+  result.w_dd = packet.w_dd;
+  result.wTi_dt = packet.wTi_dt;
+  result.wTi_dd = packet.wTi_dd;
+  result.wvr2_dt = packet.wvr2_dt;
+  result.wvr2_dd = packet.wvr2_dd;
+  result.dt_limit_s = packet.dt_limit_s;
+  result.max_substeps = packet.max_substeps;
+  result.max_substeps_required = packet.max_substeps_required;
+  result.subcycle_saturated_cells = packet.subcycle_saturated_cells;
+  result.nh_dep_e = packet.nh_dep_e;
+  result.nh_dep_i = packet.nh_dep_i;
+  result.nh_degraded = packet.nh_degraded;
+  result.nh_escaped = packet.nh_escaped;
+  result.nh_conservation_resid = packet.nh_conservation_resid;
+  result.esc_charged =
+      (p.scheme == 1)
+          ? 0.0
+          : (packet.released_charged - packet.charged_dep_e -
+             packet.charged_dep_i);
+  result.esc_neutron =
+      packet.released_neutron - packet.nh_dep_e - packet.nh_dep_i;
+  TENRYU_ASSERT(packet.neutron_heating_invalid_mu == 0,
+                "neutron_heating requires an even n_mu >= 2");
+  dt_limit_subcycle = packet.dt_limit_subcycle;
+  screening_warning_flags = packet.screening_warning_flags;
+  return result;
+}
+
+// The Gauss-Legendre directions and weights of the neutron heating (n_mu even), as the host stage
+// call computed them.
+void neutron_mu_quadrature(const int n_mu, std::vector<double>& mu,
+                           std::vector<double>& weight) {
+  mu.assign(static_cast<std::size_t>(n_mu), 0.0);
+  weight.assign(static_cast<std::size_t>(n_mu), 0.0);
+  const int half = n_mu / 2;
+  for (int k = 0; k < half; ++k) {
+    double w = 0.0;
+    neutron_heating_device_detail::gauss_legendre_node_weight(
+        n_mu, k, &mu[static_cast<std::size_t>(k)],
+        &mu[static_cast<std::size_t>(n_mu - 1 - k)], &w);
+    weight[static_cast<std::size_t>(k)] = w;
+    weight[static_cast<std::size_t>(n_mu - 1 - k)] = w;
+  }
+}
+
 }  // namespace
 
 BurnStageResult compute_burn_step_1d_device_stage(
@@ -985,40 +1126,39 @@ BurnStageResult compute_burn_step_1d_device_stage(
   ResultPacket* const d_result =
       packed_ptr<ResultPacket>(device_base, layout.result);
 
-  burn_suffix_sum_1d_kernel<<<1, 1>>>(first, last, d_r_node, d_rho, d_S_out);
-  CUDA_CHECK(cudaGetLastError());
-  constexpr int kBlock = 128;
-  const int active_cells = last - first + 1;
-  const int active_grid = (active_cells + kBlock - 1) / kBlock;
-  burn_stage_main_1d_kernel<<<active_grid, kBlock>>>(
-      n_cells, first, last, p, partition_table, d_rho, d_Ti_eV, d_Te_eV,
-      d_zbar, d_A_eff, d_vol, d_r_node, d_ee, d_ei, d_v_r, d_range_fe,
-      d_range_fi, d_S_out, d_burn_y, d_dE_e, d_dE_i, d_rate_diag, d_Qe_diag,
-      d_Qi_diag,
-      d_S_birth, d_nh_emit, d_cell_tallies, d_neutron_births);
-  CUDA_CHECK(cudaGetLastError());
-  if (have_neutron && neutron_mu_valid) {
-    const int cell_grid = (n_cells + kBlock - 1) / kBlock;
-    burn_neutron_targets_1d_kernel<<<cell_grid, kBlock>>>(
-        n_cells, d_rho, d_burn_y, d_neutron_nD, d_neutron_nT);
-    CUDA_CHECK(cudaGetLastError());
-    burn_neutron_transport_1d_kernel<<<cell_grid, kBlock>>>(
-        n_cells, p.neutron_heating_n_mu, p.use_fraley_partition,
-        partition_table, d_r_node, d_rho, d_Te_eV, d_Ti_eV, d_zbar,
-        d_A_eff, d_neutron_nD, d_neutron_nT, d_nh_emit, d_mu,
-        d_mu_weight, d_neutron_dep_e_by_source,
-        d_neutron_dep_i_by_source, d_neutron_tallies);
-    CUDA_CHECK(cudaGetLastError());
-    burn_neutron_finalize_1d_kernel<<<cell_grid, kBlock>>>(
-        n_cells, p, d_rho, d_vol, d_ee, d_ei,
-        d_neutron_dep_e_by_source, d_neutron_dep_i_by_source, d_dE_e,
-        d_dE_i, d_Qe_diag, d_Qi_diag, d_cell_tallies);
-    CUDA_CHECK(cudaGetLastError());
-  }
-  burn_stage_reduce_1d_kernel<<<1, kReductionBlock>>>(
-      n_cells, d_dE_e, d_dE_i, d_cell_tallies, d_neutron_tallies,
-      have_neutron, neutron_mu_valid, d_result);
-  CUDA_CHECK(cudaGetLastError());
+  StagePointers d;
+  d.burn_y = d_burn_y;
+  d.dE_e = d_dE_e;
+  d.dE_i = d_dE_i;
+  d.rate_diag = d_rate_diag;
+  d.Qe_diag = d_Qe_diag;
+  d.Qi_diag = d_Qi_diag;
+  d.S_birth = d_S_birth;
+  d.nh_emit = d_nh_emit;
+  d.neutron_births = d_neutron_births;
+  d.rho = d_rho;
+  d.Ti_eV = d_Ti_eV;
+  d.Te_eV = d_Te_eV;
+  d.zbar = d_zbar;
+  d.A_eff = d_A_eff;
+  d.vol = d_vol;
+  d.r_node = d_r_node;
+  d.ee = d_ee;
+  d.ei = d_ei;
+  d.v_r = d_v_r;
+  d.range_fe = d_range_fe;
+  d.range_fi = d_range_fi;
+  d.mu = d_mu;
+  d.mu_weight = d_mu_weight;
+  d.S_out = d_S_out;
+  d.cell_tallies = d_cell_tallies;
+  d.neutron_nD = d_neutron_nD;
+  d.neutron_nT = d_neutron_nT;
+  d.neutron_dep_e_by_source = d_neutron_dep_e_by_source;
+  d.neutron_dep_i_by_source = d_neutron_dep_i_by_source;
+  d.neutron_tallies = d_neutron_tallies;
+  d.result = d_result;
+  launch_stage_1d(d, n_cells, first, last, p, partition_table, have_neutron, neutron_mu_valid);
 
   CUDA_CHECK(cudaMemcpy(host_base, device_base, layout.output_bytes,
                         cudaMemcpyDeviceToHost));
@@ -1047,54 +1187,17 @@ BurnStageResult compute_burn_step_1d_device_stage(
 
   ResultPacket packet;
   std::memcpy(&packet, host_base + layout.result, sizeof(packet));
-  result.released_charged = packet.released_charged;
-  result.released_neutron = packet.released_neutron;
-  result.dep_e = packet.dep_e;
-  result.dep_i = packet.dep_i;
-  result.n_neutrons_dt = packet.n_neutrons_dt;
-  result.n_neutrons_dd = packet.n_neutrons_dd;
-  result.w_dt = packet.w_dt;
-  result.w_dd = packet.w_dd;
-  result.wTi_dt = packet.wTi_dt;
-  result.wTi_dd = packet.wTi_dd;
-  result.wvr2_dt = packet.wvr2_dt;
-  result.wvr2_dd = packet.wvr2_dd;
-  result.dt_limit_s = packet.dt_limit_s;
-  result.max_substeps = packet.max_substeps;
-  result.max_substeps_required = packet.max_substeps_required;
-  result.subcycle_saturated_cells = packet.subcycle_saturated_cells;
-  result.nh_dep_e = packet.nh_dep_e;
-  result.nh_dep_i = packet.nh_dep_i;
-  result.nh_degraded = packet.nh_degraded;
-  result.nh_escaped = packet.nh_escaped;
-  result.nh_conservation_resid = packet.nh_conservation_resid;
-  result.esc_charged =
-      (p.scheme == 1)
-          ? 0.0
-          : (packet.released_charged - packet.charged_dep_e -
-             packet.charged_dep_i);
-  result.esc_neutron =
-      packet.released_neutron - packet.nh_dep_e - packet.nh_dep_i;
-  TENRYU_ASSERT(packet.neutron_heating_invalid_mu == 0,
-                "neutron_heating requires an even n_mu >= 2");
-  dt_limit_subcycle = packet.dt_limit_subcycle;
-  screening_warning_flags = packet.screening_warning_flags;
-  return result;
+  return result_from_packet(packet, p, first, last, dt_limit_subcycle,
+                            screening_warning_flags);
 }
 
 namespace {
 
-constexpr int kMaxRegionFuelMaterials = 16;
-
-struct RegionFuelMaterials {
-  int m[kMaxRegionFuelMaterials];
-  int n;
-};
-
 __global__ void burn_region_bounds_kernel(const double* __restrict__ volfrac,
                                           const int n_cells,
                                           const int n_mat,
-                                          const RegionFuelMaterials fuel,
+                                          const int* __restrict__ fuel_mats,
+                                          const int n_fuel,
                                           const double vf_threshold,
                                           int* __restrict__ bounds) {
   const int c = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1103,8 +1206,8 @@ __global__ void burn_region_bounds_kernel(const double* __restrict__ volfrac,
   }
   // Same summation order as the stage's host loop.
   double fuel_frac = 0.0;
-  for (int i = 0; i < fuel.n; ++i) {
-    fuel_frac += volfrac[static_cast<std::size_t>(c) * n_mat + fuel.m[i]];
+  for (int i = 0; i < n_fuel; ++i) {
+    fuel_frac += volfrac[static_cast<std::size_t>(c) * n_mat + fuel_mats[i]];
   }
   if (fuel_frac > vf_threshold) {
     atomicMin(&bounds[0], c);
@@ -1138,25 +1241,16 @@ __global__ void burn_region_reacting_kernel(const double* __restrict__ rho,
 
 }  // namespace
 
-bool burn_1d_region_may_react(const double* d_rho,
-                              const double* d_Ti_eV,
-                              const double* d_volfrac,
-                              const int n_cells,
-                              const int n_mat,
-                              const std::vector<int>& fuel_mats,
-                              const double vf_threshold,
-                              const double T_floor_keV) {
-  if (n_cells <= 0 || fuel_mats.empty()) {
-    return false;
+BurnRegion burn_1d_region(const double* d_rho, const double* d_Ti_eV, const double* d_volfrac,
+                          const int n_cells, const int n_mat, const int* d_fuel_mats,
+                          const int n_fuel, const double vf_threshold, const double T_floor_keV) {
+  BurnRegion region;
+  if (n_cells <= 0 || n_fuel <= 0) {
+    return region;
   }
-  if (static_cast<int>(fuel_mats.size()) > kMaxRegionFuelMaterials ||
-      d_volfrac == nullptr || d_rho == nullptr || d_Ti_eV == nullptr) {
-    return true;  // cannot decide here: run the stage
-  }
-  RegionFuelMaterials fuel{};
-  fuel.n = static_cast<int>(fuel_mats.size());
-  for (int i = 0; i < fuel.n; ++i) {
-    fuel.m[i] = fuel_mats[static_cast<std::size_t>(i)];
+  if (d_fuel_mats == nullptr || d_volfrac == nullptr || d_rho == nullptr || d_Ti_eV == nullptr) {
+    region.decided = false;  // cannot decide here
+    return region;
   }
   auto* d_bounds = static_cast<int*>(
       core::device_scratch_acquire("burn:region_may_react", 3 * sizeof(int)));
@@ -1164,14 +1258,225 @@ bool burn_1d_region_may_react(const double* d_rho,
   CUDA_CHECK(cudaGetLastError());
   constexpr int kBlock = 128;
   const int grid = (n_cells + kBlock - 1) / kBlock;
-  burn_region_bounds_kernel<<<grid, kBlock>>>(d_volfrac, n_cells, n_mat, fuel,
+  burn_region_bounds_kernel<<<grid, kBlock>>>(d_volfrac, n_cells, n_mat, d_fuel_mats, n_fuel,
                                               vf_threshold, d_bounds);
   CUDA_CHECK(cudaGetLastError());
   burn_region_reacting_kernel<<<grid, kBlock>>>(d_rho, d_Ti_eV, T_floor_keV, d_bounds);
   CUDA_CHECK(cudaGetLastError());
   int result[3] = {0, 0, 0};
   CUDA_CHECK(cudaMemcpy(result, d_bounds, sizeof(result), cudaMemcpyDeviceToHost));
-  return result[2] != 0;
+  if (result[1] >= 0) {
+    region.first = result[0];
+    region.last = result[1];
+  }
+  region.may_react = result[2] != 0;
+  return region;
+}
+
+bool burn_1d_region_may_react(const double* d_rho,
+                              const double* d_Ti_eV,
+                              const double* d_volfrac,
+                              const int n_cells,
+                              const int n_mat,
+                              const int* d_fuel_mats,
+                              const int n_fuel,
+                              const double vf_threshold,
+                              const double T_floor_keV) {
+  const BurnRegion region = burn_1d_region(d_rho, d_Ti_eV, d_volfrac, n_cells, n_mat,
+                                           d_fuel_mats, n_fuel, vf_threshold, T_floor_keV);
+  return !region.decided || region.may_react;  // run the stage when it cannot be decided here
+}
+
+namespace {
+
+// The scratch of a device-resident stage call: the cells' velocities and range fit factors, the
+// column densities, the tallies, the neutron heating's arrays and the result packet.
+struct ResidentLayout {
+  std::size_t bytes = 0U;
+  std::size_t v_r = 0U;
+  std::size_t range_fe = 0U;
+  std::size_t range_fi = 0U;
+  std::size_t S_out = 0U;
+  std::size_t cell_tallies = 0U;
+  std::size_t births = 0U;
+  std::size_t nh_emit = 0U;
+  std::size_t mu = 0U;
+  std::size_t mu_weight = 0U;
+  std::size_t neutron_nD = 0U;
+  std::size_t neutron_nT = 0U;
+  std::size_t neutron_dep_e_by_source = 0U;
+  std::size_t neutron_dep_i_by_source = 0U;
+  std::size_t neutron_tallies = 0U;
+  std::size_t result = 0U;
+
+  template <typename T>
+  std::size_t take(const std::size_t count) {
+    bytes = align_up(bytes, alignof(T));
+    const std::size_t offset = bytes;
+    bytes += count * sizeof(T);
+    return offset;
+  }
+
+  ResidentLayout(const std::size_t n, const bool range_medium, const bool have_births,
+                 const bool have_neutron, const std::size_t n_mu) {
+    v_r = take<double>(n);
+    if (range_medium) {
+      range_fe = take<double>(n);
+      range_fi = take<double>(n);
+    }
+    S_out = take<double>(n);
+    cell_tallies = take<CellTallies>(n);
+    if (have_births) {
+      births = take<double>(n);
+    }
+    if (have_neutron) {
+      nh_emit = take<double>(n * static_cast<std::size_t>(kNumNeutronLines));
+      mu = take<double>(n_mu);
+      mu_weight = take<double>(n_mu);
+      neutron_nD = take<double>(n);
+      neutron_nT = take<double>(n);
+      const std::size_t contribution_count = static_cast<std::size_t>(kNumNeutronLines) * n * n;
+      neutron_dep_e_by_source = take<double>(contribution_count);
+      neutron_dep_i_by_source = take<double>(contribution_count);
+      neutron_tallies = take<NeutronHeatingTallies>(n);
+    }
+    result = take<ResultPacket>(1U);
+  }
+};
+
+}  // namespace
+
+BurnStageResult compute_burn_step_1d_resident(const BurnDeviceInputs& in,
+                                              const BurnStageParams& p,
+                                              const PartitionTable& table,
+                                              const BurnDeviceArrays& out,
+                                              double& dt_limit_subcycle,
+                                              unsigned int& screening_warning_flags) {
+  TENRYU_ASSERT(p.scheme == 0 || (p.scheme == 1 && out.S_birth != nullptr),
+                "the device-resident 1D burn stage takes the local deposition scheme or the "
+                "birth sources of the transport (scheme 1, with S_birth)");
+  const int n_cells = in.n_cells;
+  const std::size_t n = static_cast<std::size_t>(n_cells > 0 ? n_cells : 0);
+  dt_limit_subcycle = std::numeric_limits<double>::infinity();
+  screening_warning_flags = 0U;
+  BurnStageResult result;
+  result.dt_limit_s = std::numeric_limits<double>::infinity();
+  if (n == 0U) {
+    return result;
+  }
+  // The outputs start at zero, as the host stage call's did.
+  CUDA_CHECK(cudaMemset(out.dE_e, 0, n * sizeof(double)));
+  CUDA_CHECK(cudaMemset(out.dE_i, 0, n * sizeof(double)));
+  CUDA_CHECK(cudaMemset(out.rate_diag, 0, n * sizeof(double)));
+  CUDA_CHECK(cudaMemset(out.Qe_diag, 0, n * sizeof(double)));
+  CUDA_CHECK(cudaMemset(out.Qi_diag, 0, n * sizeof(double)));
+  const bool have_birth_source = p.scheme == 1;
+  if (have_birth_source) {
+    CUDA_CHECK(cudaMemset(out.S_birth, 0, 6U * n * sizeof(double)));
+  }
+  if (in.first < 0) {
+    // No fuel cell: no reaction, eps_cum and the neutron count unchanged. The field ions are
+    // still those of the cells (the transport slows its particles down on them).
+    if (in.range_medium && out.field_ion_cells != nullptr) {
+      auto* const medium = static_cast<double*>(
+          core::device_scratch_acquire("burn:stage1d:resident_medium", 2U * n * sizeof(double)));
+      range_medium_1d_device(out.burn_y, in.volFrac, in.field_ions, n_cells, medium, medium + n,
+                             out.field_ion_cells);
+    }
+    return result;
+  }
+
+  const bool have_neutron = p.neutron_heating;
+  const bool neutron_mu_valid =
+      p.neutron_heating_n_mu >= 2 && (p.neutron_heating_n_mu % 2) == 0;
+  const bool have_births = out.neutron_cum != nullptr;
+  const std::size_t n_mu =
+      (have_neutron && neutron_mu_valid) ? static_cast<std::size_t>(p.neutron_heating_n_mu) : 0U;
+  const ResidentLayout layout(n, in.range_medium, have_births, have_neutron, n_mu);
+  auto* const base = static_cast<unsigned char*>(
+      core::device_scratch_acquire("burn:stage1d:resident", layout.bytes));
+  // zero, as the packed arena of the host stage call
+  CUDA_CHECK(cudaMemset(base, 0, layout.bytes));
+
+  StagePointers d;
+  d.burn_y = out.burn_y;
+  d.dE_e = out.dE_e;
+  d.dE_i = out.dE_i;
+  d.rate_diag = out.rate_diag;
+  d.Qe_diag = out.Qe_diag;
+  d.Qi_diag = out.Qi_diag;
+  d.rho = in.rho;
+  d.Ti_eV = in.Ti_eV;
+  d.Te_eV = in.Te_eV;
+  d.zbar = in.zbar;
+  d.A_eff = in.A_eff;
+  d.vol = in.vol;
+  d.r_node = in.r_node;
+  d.ee = in.ee;
+  d.ei = in.ei;
+  double* const v_r = packed_ptr<double>(base, layout.v_r);
+  d.v_r = v_r;
+  d.S_out = packed_ptr<double>(base, layout.S_out);
+  d.cell_tallies = packed_ptr<CellTallies>(base, layout.cell_tallies);
+  d.result = packed_ptr<ResultPacket>(base, layout.result);
+  if (have_births) {
+    d.neutron_births = packed_ptr<double>(base, layout.births);
+  }
+  if (have_neutron) {
+    d.nh_emit = packed_ptr<double>(base, layout.nh_emit);
+    d.neutron_nD = packed_ptr<double>(base, layout.neutron_nD);
+    d.neutron_nT = packed_ptr<double>(base, layout.neutron_nT);
+    d.neutron_dep_e_by_source = packed_ptr<double>(base, layout.neutron_dep_e_by_source);
+    d.neutron_dep_i_by_source = packed_ptr<double>(base, layout.neutron_dep_i_by_source);
+    d.neutron_tallies = packed_ptr<NeutronHeatingTallies>(base, layout.neutron_tallies);
+    if (neutron_mu_valid) {
+      std::vector<double> mu;
+      std::vector<double> mu_weight;
+      neutron_mu_quadrature(p.neutron_heating_n_mu, mu, mu_weight);
+      double* const d_mu = packed_ptr<double>(base, layout.mu);
+      double* const d_mu_weight = packed_ptr<double>(base, layout.mu_weight);
+      CUDA_CHECK(cudaMemcpy(d_mu, mu.data(), n_mu * sizeof(double), cudaMemcpyHostToDevice));
+      CUDA_CHECK(cudaMemcpy(d_mu_weight, mu_weight.data(), n_mu * sizeof(double),
+                            cudaMemcpyHostToDevice));
+      d.mu = d_mu;
+      d.mu_weight = d_mu_weight;
+    }
+  }
+  // The cells' velocities from the nodes' (zero without node velocities, as the host call's).
+  if (in.v_node != nullptr) {
+    cell_velocities_1d_device(in.v_node, n_cells, v_r);
+  }
+  // The field ions of the cells at the start of the step and their range fit factors.
+  if (in.range_medium) {
+    double* const fe = packed_ptr<double>(base, layout.range_fe);
+    double* const fi = packed_ptr<double>(base, layout.range_fi);
+    range_medium_1d_device(out.burn_y, in.volFrac, in.field_ions, n_cells, fe, fi,
+                           out.field_ion_cells);
+    d.range_fe = fe;
+    d.range_fi = fi;
+  }
+  if (have_birth_source) {
+    d.S_birth = out.S_birth;
+  }
+  constexpr int kBlock = 128;
+  init_cell_tallies_kernel<<<(n_cells + kBlock - 1) / kBlock, kBlock>>>(n_cells,
+                                                                        d.cell_tallies);
+  CUDA_CHECK(cudaGetLastError());
+
+  const bool need_partition_table =
+      !p.use_fraley_partition && (p.scheme != 1 || have_neutron);
+  const PartitionTableDeviceView partition_table =
+      partition_table_device_view(table, need_partition_table);
+  launch_stage_1d(d, n_cells, in.first, in.last, p, partition_table, have_neutron,
+                  neutron_mu_valid);
+
+  ResultPacket packet;
+  CUDA_CHECK(cudaMemcpy(&packet, d.result, sizeof(packet), cudaMemcpyDeviceToHost));
+  // eps_cum and the neutron count (the host loops after the stage before)
+  burn_cumulative_1d_device(in.rho, in.vol, out.dE_e, out.dE_i, d.neutron_births, n_cells,
+                            out.eps_cum, out.neutron_cum);
+  return result_from_packet(packet, p, in.first, in.last, dt_limit_subcycle,
+                            screening_warning_flags);
 }
 
 }  // namespace tenryu::burn

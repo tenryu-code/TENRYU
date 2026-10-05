@@ -36,7 +36,10 @@ You are invoked non-interactively (often by an automated harness in a scratch wo
    python tools/assist/assist.py recommend-mesh --conditions conditions.json \
      -o recommendation.json --mesh-out mesh.py
    # With an authorized binary, also pass --tenryu PATH.
-   # Existing deck: --deck DECK --deck-out recommended.py (uniform placeholder allowed).
+   # Existing deck: --deck DECK --deck-out recommended.py (a placeholder mesh is allowed, but it
+   # needs a node at every material interface: the solver samples the layers at the placeholder's
+   # cell centres, so an interface between two nodes is read at a node of the placeholder — a
+   # uniform 2 µm mesh read a 243 µm D2/CD interface as 244 µm).
    ```
    A new binary extracts actual conditions. Without one, --deck only accepts a literal
    `MESH_EXPERIMENTAL_CONDITIONS` dictionary; otherwise use --conditions. In a headless

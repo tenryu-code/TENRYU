@@ -9,6 +9,8 @@
 
 namespace tenryu::laser::port_section {
 
+struct S1DeviceTable;  // port_section_s1_gpu.cuh
+
 struct ChiBuildInput {
   const port_geom::PortTable* ports;
   const sector_ps::PhaseSpaceTable* table;
@@ -26,6 +28,14 @@ struct ChiBuildInput {
   double k_a_floor;
   int n_section_phi;
   double lambda0_nm;
+  // The phase-space table already on the device (build_s1_table_device). When set, `table` and
+  // `ray_bin` are not read and nothing is flattened or uploaded; build_chi_ps_device_ws only.
+  const S1DeviceTable* device_table = nullptr;
+  // The device build's reference kernel (one thread per (cell, pair), the bins scanned) instead
+  // of the production one (one warp per (cell, seed state, pump port), its sums shared over the
+  // pump states that differ only in the impact bin); the two give the same chi bit for bit. For
+  // the tests.
+  bool per_pair_reference = false;
 };
 
 struct ChiBuildResult {

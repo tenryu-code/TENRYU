@@ -20,7 +20,7 @@
       <ul>
         <li>3 種の HDF5: スナップショット <code>&lt;name&gt;_NNNN.h5</code>、履歴 <code>&lt;name&gt;_history.h5</code>（追記型）、チェックポイント <code>&lt;name&gt;_ckpt_NNNN.h5</code>。出力間隔は「N ステップごと」（<code>plot_every</code> 等）と「T 秒ごと」（<code>plot_every_s</code> 等）の OR で発火する。</li>
         <li>全数値データセットに <code>units</code> 属性が付く。<code>mesh/</code>・<code>hydro/</code> のデータセット名は内部の State フィールド名と 1:1 対応する。</li>
-        <li>爆縮の停滞期のピークは短い — GXII 級の <code>laser_capsule</code> プリセットでは約 15 ps — ため、ピーク値はスナップショットではなくステップごとの履歴（<code>implosion/*</code>）から読む。</li>
+        <li>爆縮の停滞期のピークは短い — 2026-07-31 の GXII 級のレーザー爆縮の計算では約 15 ps — ため、ピーク値はスナップショットではなくステップごとの履歴（<code>implosion/*</code>）から読む。</li>
         <li>同じ出力ディレクトリへ再実行すると、上書きせず <code>_001</code> のような連番ディレクトリに書かれる。「結果が変わらない」と思ったらまず出力先を確認する。</li>
       </ul>
     </aside>
@@ -211,7 +211,7 @@
       <p>検証ページで引用される基準回帰の要約指標は、これらの時系列の時間方向の縮約である: <code>rho_peak_max</code> = <code>implosion/rho_peak</code> の最大、<code>rhoR_max</code> = <code>implosion/rho_R</code> の最大、<code>Tc_max</code> = <code>implosion/center_temperature</code> の最大、<code>shell_r_min</code> = <code>implosion/shell_radius_min</code> の最小。</p>
       <aside class="planned" aria-labelledby="cadence-warning">
         <h3 id="cadence-warning">警告: 出力間隔によるピークの取り逃がし</h3>
-        <p>スナップショットの出力間隔はデッキごとに設定するが、爆縮の停滞期のピークは非常に短いことがある — GXII 級の <code>laser_capsule</code> プリセットでの実測（2026-07-31）では約 15 ps。出力の時刻がピークの前後に来てしまうと、スナップショット中の最大密度は真のピークを大きく過小評価する。鋭いピークの値とその時刻はステップごとの履歴にある <code>implosion/rho_peak</code> から読み、スナップショットはピーク前後の空間構造を調べるために使うこと。</p>
+        <p>スナップショットの出力間隔はデッキごとに設定するが、爆縮の停滞期のピークは非常に短いことがある — GXII 級のレーザー爆縮の計算での実測（2026-07-31）では約 15 ps。出力の時刻がピークの前後に来てしまうと、スナップショット中の最大密度は真のピークを大きく過小評価する。鋭いピークの値とその時刻はステップごとの履歴にある <code>implosion/rho_peak</code> から読み、スナップショットはピーク前後の空間構造を調べるために使うこと。</p>
       </aside>
     </section>
 

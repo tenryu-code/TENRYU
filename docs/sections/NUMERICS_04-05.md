@@ -369,7 +369,14 @@ History output appends the per-history-sample values under
 For the serial 1D implicit path, `solver_residual` is the post-solve relative
 tridiagonal residual \(\|Ax-b\|_2/\|b\|_2\), `solver_iter=1` because cuSPARSE
 `Dgtsv2` is a direct tridiagonal solve, and `solver_cond_number` is a
-diagonal-ratio estimate \(\max_i |A_{ii}|/\min_i |A_{ii}|\).  For the 2D RZ C1
+diagonal-ratio estimate \(\max_i |A_{ii}|/\min_i |A_{ii}|\).  Both are
+evaluated on the device from the staged system (2026-10-01; a copy of the system
+came to the host for every solve before): the residual's products and sums in
+double-double where the host loop summed in long double.  The residual sits at
+round-off level, where the host's 64-bit-mantissa products leave it only a few
+correct digits, so the two evaluations differ beyond the last place (relative
+differences up to 3e-4 on the GXII 1D decks); infinite and NaN entries give inf
+and NaN as on the host.  The diagonal ratio is exact.  For the 2D RZ C1
 production STS path, no linear algebra solve is performed; `solver_residual=0`
 by definition for the algebraic solve diagnostic, `solver_iter` is the number of
 applied STS stages in that conduction operator call, and `solver_cond_number`
@@ -989,7 +996,7 @@ Phys. Plasmas 7, 4238 (2000); Sherlock, Brodrick & Ridgers, Phys. Plasmas 24, 08
 Cao, Moses & Delettrez, Phys. Plasmas 22, 082308 (2015)。
 
 **モデル（operative form）**：エネルギー群 g（大域エッジ E_0=0<…<E_{N_g}、毎伝導ステップ
-β̂=E/(k_B max T_e) の幾何級数 [0.1, `snb_E_max_over_Te`] で再構築）ごとに
+β̂=E/(k_B max T_e) の幾何級数 [0.1, `snb_E_max_over_Te`] で再構築。β̂ の級数は設定だけで決まるので 1 回だけ作って device に置き、各ステップの \(k_B \max T_e\) を掛ける積は device で計算する、2026-10-02）ごとに
 \[
 \frac{H_g}{\lambda_g^{abs}} - \nabla\!\cdot\!\Big(\frac{\lambda_g^{tr}}{3}\nabla H_g\Big)
  = -\nabla\!\cdot\! U_g,\qquad
@@ -1881,6 +1888,33 @@ bit で一致する。別の種類の GPU や別のレイ数では \(L\) が変�
 多カーネル経路と和と積の結合順が同じになるのは \(L=32\) のとき（1 レーン形は同じ算法の逐次形で、
 和と積の丸め順だけが異なる）。
 
+**(c'') 復路の区間積分の再利用（`Laser.raytrace.reuse_inward_integrals`、既定 True、2026-10-03）**：
+区間の \(\Delta s\)・\(\Delta\phi\)・\(\tau\)（Langdon 因子を掛ける前）は半径区間だけで決まり、
+往路と復路は同じ区間を通る。往路の各レーンは通過した部分 \([r_{stop},b]\) の積分（吸収の
+重心、パネル数、上限到達の印を含む）をレイごとの表（区間番号で引く。追跡ごとに空にする）に置き、
+復路のレーンは自分の区間 \([a,b]\) が表の区間と bit で一致するときに求積を省いて表の値を使う。
+転回点を含む区間は往路が \([r_t,b]\) を積分し、復路の最初の区間も同じ \([r_t,b]\) なので表の値が
+使われる（臨界半径での反射も同様）。転回点の無いレイ（臨界で反射するレイ）では往路と復路の
+正則化の中心が同じ（区間自身の近い根）なので、結果は再利用の有無で bit 一致する。転回するレイ
+（中心を抜けるレイでは \(r_t=0\)）の転回点から離れた区間では往路が \(r\)、復路が
+\(u=\sqrt{r-r_t}\) を変数にするので、再利用は復路の求積を往路の求積で置き換える。\(\Delta s\)・
+\(\Delta\phi\)・\(\tau\) は同じ積分を同じ許容誤差で収束させたもので、パネルの許容誤差（区間の
+\(10^{-7}\) 倍）の範囲で変わる。Langdon 因子を評価する吸収の重心（光学的厚さで重み付けた求積変数の
+平均。半径と、極角を線形補間する区間内の割合）は往路の変数 \(r\) での平均になり、\(u\) の平均を
+半径に戻した値より \(u\) の分散だけ大きい（幅 \(w\)・転回点からの距離 \(d\) の区間で約
+\(w^2/(48d)\)、区間幅の 2 次で、区間ごとに 1 点で因子を評価する近似の誤差と同じ次数）。Langdon 因子が
+無効なら重心は使われない。GXII の 1D の本番デッキ（Langdon 因子が有効）では、結果の差は初期の時間刻みや
+レーザーエネルギーを 12 桁目で変えた計算どうしのばらつきと同じ大きさである。
+作業量 \(n_{steps}\) は再利用した区間にも往路のパネル数を数える（再利用で作業量が 0 にならない）ので、
+`max_steps` の上限と段の統計は再利用した区間を含めて数える（転回するレイでは往路と復路のパネル数の違いの
+分だけ数が変わりうる）。
+hot-electron 捕獲で区間を分ける復路のレーンは、従来どおり部分区間を求積し直す。
+`reuse_inward_integrals=False` で復路も毎回求積する（2026-10-03 より前の算法と bit 一致）。
+常駐ループも同じ表を使う。表は 1 区間 72 バイトで、起動のバッチのレイごとに（プロファイルの径方向節点 + hydro セル + 1）
+区間分を device scratch に取る（常駐ループはレイごとにプロファイルの容量分）。プロファイルの節点は最大
+3 × セル数 + レーザー格子の径方向節点 + 166 なので、GXII の本番デッキ（300 セル、1000 レイ）で最大 128 MB
+（実測で GPU メモリが約 100 MiB 増える。Studio の laserShell プリセット（1426 セル、1000 レイ）では約 400 MiB）。
+
 **(d) 行進との対応（互換規約）**：
 - 臨界層の解析的尾部閉包（§5.2、`try_tail_closure_1d`）は行進と同じ判定と入力
   （\(\hat n_{raw}\ge0.5\)・方向・到達ギャップ・帯域 \(1-\hat n_{raw}<A/g\)）を
@@ -2492,6 +2526,9 @@ R_k = \left(k+\tfrac12\right)\Delta R,\qquad
 旧仕様の node-based 配置 \(R_k=k\Delta R\) は最外半リング
 \([R_{beam}-\Delta R/2,\,R_{beam}]\) を欠き、profile モーメントを内向きに
 \(O(1/N_R)\) 偏らせていた（2026-07-26 カーネルレビュー指摘）。
+輪の重み・その和・輪のパワーと球の光線は毎 step device（`ray_init_1d_gpu.cu`）で作る：FMA 縮約なしに
+host と同じ演算順で、重みの和は輪の順に 1 スレッドで足す。profile の exp・pow は device のもので、
+host と末位で異なりうる（2026-10-01）。
 
 **(a') 1D の円柱・平板：輪 × 方位角（2026-09-24）**
 
@@ -2785,6 +2822,13 @@ Z = \{-R_{nr},\dots,-R_1,0,R_1,\dots,R_{nr}\}
 \]
 とし、常に \(nz=2nr\) とする。
 
+**(e) 実行（2026-10-01）**：(a)〜(d)、§5.7.5 のゴーストコロナのパラメータ、§5.8.1 (a) の例外受け皿、
+共鳴吸収の入力（最外の \(\hat n\) の下向き交差）は device 上で求める（`laser_map_1d_gpu.cu`。host への
+流体量の写しを作らない）。セルごとの量と最外のセルの探索は並列、それ以外は host と同じ演算順で、
+\(nr\) の 40 段の二分探索は host と同じ中点の列をたどる（8 段分の中点のセル数を並列に数えてから道を
+たどる）。臨界半径の対数補間とゴーストの尺度長の log は device の関数で、host の値と末位で異なり
+うる（それを通して節点配置も同じ程度に）。
+
 #### 5.7.3 物理量のLaserMeshへのマッピング
 
 **(a) 1D_SPH：球対称プロファイルのRZ展開**
@@ -2851,7 +2895,7 @@ HydroMeshから再マッピングする（Strang splitting中に1回）。
 1D_SPH ではさらに、ray trace が参照する 1D 断面（`radial_node_r`, `radial_n_hat`,
 `radial_n_hat_raw`, `radial_T_e`, `radial_Zbar`, `radial_smooth_kappa`, `radial_dn_dr`）を
 流体セルに固定した節点の上で作る（`laser_mesh_bodies::build_trace_profile_nodes_1d`、
-2026-09-24。多カーネル経路では 1 ブロックがセルごとに並列に置き（2026-09-25、下の並列配置）、
+2026-09-24。多カーネル経路ではセルごとに並列に置き（2026-09-25、下の並列配置）、
 persistent loop は同じ関数を 1 スレッドで順に実行する。両者の節点は bit で同じ）。
 節点は、最外実セルまでの各実セルについて内側 face・セル中心・外側 face の直下
 （face から \(\max(10^{-6}\Delta r_{cell},\,4\times10^{-9} r)\) 内側）、§5.7.3(a) の
@@ -2880,13 +2924,23 @@ clip 値（`critical_clip` なら `n_hat_margin`、他は 1）に達する折れ
 上にあり、次のセルの内側 face から統合間隔の 4 倍以上離れているので、順の配置でも内側 face は必ず
 新しい節点になり、以後の節点はセル自身の節点だけで決まる。外端をまたぐ最初のセルからは、外端より
 先の節点を捨てるだけで状態を変えないので、そのセル・その外側のセル・尾部（流体の外端、その外側の
-LaserMesh 節点、外端）を 1 つの区分として順に置く。1 ブロック（1024 スレッド）が、断面の始点から
-セル 0 まで・内側の各セル・最後の区分をスレッドに割り当て、各スレッドの節点数の前置和で書き込み位置を
-決めて書く。中心より内側から始まる断面、条件を満たさないセル（狭い、または面が増加しない）、
+LaserMesh 節点、外端）を 1 つの区分として順に置く。区分（断面の始点からセル 0 まで・内側の各セル・
+最後の区分）ごとに 1 スレッドを多数のブロックに割り当て、区分ごとの節点数の前置和で書き込み位置を
+決めて書く（2026-10-02。それまでは 1 ブロック（1024 スレッド）が区分を担い、区分の FP64 の仕事が
+1 つの SM に集まり、尾部の LaserMesh 節点は 1 スレッドが数える段と書く段で 2 回順に置いていた）。
+最後の区分の尾部（流体の外端より外の LaserMesh 節点と外端）では、
+順位 0 の節点は直前の節点を置き換えないので、各節点は新しい節点になるか、状態を変えずに捨てられる。
+LaserMesh 節点の半径が狭義に増加するとき、流体の外端の後の節点に対して統合の判定を最初に通る節点
+\(j\) より前は捨てられ、\(j\) より後の各節点が直前の節点に対して判定を通るなら \(j\) 以降がすべて
+順に新しい節点になる（外端も同じ判定）ので、節点ごとに 1 スレッドで書く。そうでないときは 1 スレッドが
+順に置く。中心より内側から始まる断面、条件を満たさないセル（狭い、または面が増加しない）、
 セル 0 が外端をまたぐ、セルが 2 未満、容量超過のときは、1 スレッドの順の配置に戻る
 （`tests/laser/test_trace_profile_nodes.cu` がこれらの場合を含む乱数格子で順の配置と bit で比べる）。
 RTX 4090 の GXII FLD 後半（1.85 ns から 300 ステップ）で、1 スレッドの配置の 0.46 ms/step（FP64 の
-依存連鎖の待ち）が 0.12 ms/step になった（最初の 300 ステップでは 0.33 → 0.13 ms/step）。
+依存連鎖の待ち）が 1 ブロックの配置で 0.12 ms/step になった（最初の 300 ステップでは 0.33 → 0.13
+ms/step）。多数のブロックと並列の尾部では、GXII solid FLD の最初の 300 ステップで 0.129 → 0.025
+ms/step、GXII solid S_N の最初の 150 ステップで 0.136 → 0.018、CBET プリセット（2600 セル）で
+0.195 → 0.033 ms/step（判定・数え上げ・尾部・CUB の前置和・書き込み・仕上げの 8 つの起動の合計）。
 
 2026-09-24 までは LaserMesh の `node_Z=0` 列（§5.7.4 の \(R_{\mathrm{crit}}\) に細帯を置いた
 等比格子）を抽出していた。この節点は流体セルに対して位置が決まらず、線形補間が \(n_e\) の
@@ -3209,6 +3263,17 @@ M_{k+\frac{1}{2}} = \min(m_k, m_{k+1})
 \(\alpha =\) `deposit_smooth_alpha` である。face flux がペアごとに相殺されるため、
 平滑化は全吸収パワーを保存する。
 
+**実行（2026-10-01）**：1D_SPH のビームの付着の合算（ビームの順）、受け皿への付け替え・ハンドオフ・
+平滑化・高速電子のパワーの加算・保存の検査は device 上で行う（`deposit_1d_gpu.cu`）。順序で丸めが
+変わる付け替えの加算は 1 スレッドが host と同じセルの順に行い（パワーを動かすのはパワーのある
+受け皿でないセルだけなので、32 セルずつ warp で調べ、そのセルを含む組だけを順に回る。2026-10-02）、
+平滑化は各セルが下の face、上の face
+の順に flux を加える（host の face のループと同じ演算順）。ハンドオフの重みの exp と pow は device の
+関数で、host の値と末位で異なりうる。受け皿の無いパワー、保存の検査の和、`laser_dep` に書いた
+エネルギーの和（step の吸収パワーと未吸収パワーの台帳に入る）は、host の long double の和に代えて
+double-double の和（受け皿の無いパワーは付け替えと同じ順、ほかは固定の木の順）で、double に丸めた
+値は host と末位で異なりうる。
+
 **(b) 2D_RZ：LaserMesh上の直接沈着**
 
 2D_RZでは LaserMesh が流体対称軸に沿っている（§5.7.1）ため、
@@ -3359,6 +3424,12 @@ ICFシミュレーションでは、プラズマ条件（ρ, T_e, Z̄）は流�
 この再配分は付着について線形なので、トレースしたステップと同じ流体状態なら結果は一致する。
 以前はスケーリングした値をそのまま書いており、void・超臨界セルに付着が残った（ゴーストコロナの
 ある 1D デッキでは、省略したステップの付着のほぼ全量が void セルに入っていた）。
+
+**1D の実行（2026-10-01）**：1D の \(\hat f\)（ビームの付着 \(/\max(P_b, 10^{-30})\)、折り返したビームは
+基準ビームの付着から）は device 上でキャッシュへ書き、省略の判定のセルの変化量の縮約
+（§5.9.4 の max 規範は厳密に、`l2_relative` の和はセルの順に double-double で）も device で行う。
+step 中に host へ戻るのは判定の数値と臨界帯横断の印だけ。`l2_relative` の和は以前の host の
+long double の和と末位で異なりうる。2D の \(\hat f\) と判定は host のまま。
 
 物理的妥当性：
 - レイ軌道は ∇n̂ に依存し、δ < threshold で変化が保証される
@@ -3744,16 +3815,45 @@ Phys. Plasmas **32**, 022709 (2025)）。物理ビームは `Laser.port_configur
   bouguer_drift_max < 0.5 を維持する。turning–caustic 間（in_limiter_zone）の交差は場評価
   （lookup・profile）から除外する（Follett field-limiter の v1 施行）;
   診断 enumeration には残る。
+  実行は毎 step の CUDA カーネル列（`port_section_s1_gpu.cu`: ray 毎の path 構築、
+  殻交差の数え上げ・CUB 走査・bin 内の (θ, ray 番号) 順の整列。FP atomics 不使用で
+  run-to-run ビット決定的）で、host 参照実装（`sector_adapter::build_ray_paths` +
+  `sector_ps::build_table`、試験用に保持）と演算の順まで同じにし、FMA への縮約を外して
+  組む。path の構築・注記と交差の数え上げ・書き出しは 1 path（交差は path の 1 sheet）を
+  1 warp で扱う（2026-10-02）: θ の Simpson 増分の和と record ごとの減衰は 1 lane が record の
+  順に足し、順に依らない項（節点の半径と μ、増分、expm1、最小半径の節点、caustic、Bouguer の
+  監査）は lane で分ける。交差数は (path, 殻, sheet) ごとに 2 で飽和する整数を語の比較交換で
+  数え（順に依らない）、残す path の交差は 1 つずつ専用の枠に書くので書き出しの順は結果を
+  変えない。差は device の asin・sin・cos・expm1 の ULP 級に限られ、試験は整数の配列
+  （bin 境界・ray 番号・limiter 印）の一致と実数値の相対差 1e-11 以内で照合する。
+  ray の無い step は交差 0 の表になる。
 - **拡張状態空間（S2）**: 状態 = (port i, leg σ, impact bin β)、
   G_ps = N_port × 2 n_bins。record キー/セグメントは参照群 G_ref のまま、
   tally/propagate は port スライス毎の remap 双子カーネル（原本カーネルは
   無改変・legacy 経路ゼロ差分）。rec_w の port スライス初期値は
   w_i × rec_w。deposit は port 昇順 final pass の累積和。
+  実行（2026-10-02）: 各 pass は全 port を 1 回の起動で計算する（(ray, port) に 1 スレッド、
+  32 スレッドのブロック）。final pass は半 record ごとの沈着と (ray, port) ごとの未吸収・clamp
+  の値を保存し、別のカーネルが ray ごとに port 昇順・record 順・前半後半の順に行へ加える
+  （port ごとに起動していたときと同じ加算順）。IB の expm1(−S/2) は solve の初めに record
+  ごとに 1 度求め（同じ式）、収束判定の和は 256 本の部分和を warp ごとに求めてから同じ木で
+  足す。
 - **対結合係数**: chi_ps[c,{A,B}] は solve 前に一括計算し反復間
   不変（幾何は位相空間 table 由来で L の μ̄ 平均に依存しないため）。
-  実行は CUDA カーネル（(cell,pair) 毎 1 スレッド・FP atomics 不使用で
-  run-to-run ビット決定的; host 参照実装 build_chi_ps はテスト用に保持、
-  device との一致は超越関数 ULP 級で許容差ゲート）。
+  実行は CUDA カーネル（FP atomics 不使用で run-to-run ビット決定的; host 参照実装
+  build_chi_ps はテスト用に保持、device との一致は超越関数 ULP 級で許容差ゲート）。
+  pump 状態 B は port（フレームと周波数）と枝 σ_B（lookup の bin と pump の向き）だけで
+  χ に入り impact bin には依らないので、(cell, seed 状態 A, pump の port) 毎 1 warp が
+  その port の 2 枝について和を作り、枝内の全 pair (A, B > A) に書く。和の項（seed record x
+  と section 方位 m の組）は warp の 32 lane が並列に作り（pump の極角・方位角は 2 枝で共有、
+  lookup は bin 内を二分探索 — bin の record は (θ, ray) 順）、lane 0 が参照カーネルと同じ
+  順序（x の table 順、次に m）と同じ演算で足す。warp は (cell, A, port) の仕事を巡回し、
+  mask で外れたセルは読み飛ばす。(cell, pair) 毎 1 スレッドが和を逐次に作り bin を走査する
+  参照カーネル（2026-10-01 までの本番）と χ とカウンタはビット一致（2026-10-02、試験と
+  cbetHotElectrons プリセット 600 step で照合）。同プリセットでは table の record を持つ
+  セルが 1 つ（各枝 200 record、bin あたり 50）で、参照カーネルは 4560 スレッドがそれぞれ
+  400 項を逐次に回し 1 回 31–39 ms、warp 版は 0.5–0.75 ms。χ の構築の合計は 500 回で
+  9.1–9.3 s から 0.39 s、時間ループは 21.8–22.1 s から 7.95–7.99 s（RTX 4090、各 3 回）。
   chi_ps = χ_pref(c) · Σ_x Σ_m ŵ_A(x) Î_B η_pol P(g) / Σ_x Σ_m ŵ_A(x) Î_B。
   x = seed 状態の shell 交差（ŵ_A は power 正規化）、m = section 方位
   （n_section_phi 中点、[0,2π)）。pump は seed 位置を port j フレームへ
@@ -3906,6 +4006,17 @@ collisional angular scattering なし、
 |P_{dep}+P_{esc}-P_h|/P_h
 \]
 が構成上 machine precision で閉じる（GXII-derived smoke で実測 ≤ \(7\times10^{-15}\)）。
+
+**実行（1D、2026-10-01）**：捕獲の収集（トレースの捕獲行は device に置き、チャンネルごとのモデルの和
+\(\sum P\)・\(\sum rP\) と捕獲の並びをビーム・光線・捕獲チャンネルの順に 1 スレッドで作る）、
+\((source\ cell,\ \mu_{axis})\) ビンへの集約と源の並び、cone の chord の列挙（面内 chord の発射セルへの
+付与を含む）、`radial` の行進、セルごとの診断（\(Q\)、\(\varepsilon_{cum}\)、上の dt 上限）は device
+（`hot_e_transport_1d_gpu.cu`）で行う。FMA 縮約なしに旧 host の計算と同じ演算順で、順序のある和は
+同じ順に 1 スレッドで足す（cone のセルへの付与と和は、それまで使っていた device の chord の経路の順）。
+`radial` の停止能の erf・exp・log は device のもので、host と末位で異なりうる。step 中に host へ戻るのは
+チャンネルごとの数値と、セルの \(Q\)・\(\varepsilon_{cum}\)（State の host の写しを毎 step 更新し、
+snapshot・checkpoint・step の再試行はそれを使う）。host の実装（`reduce_captures`、
+`deposit_hot_electrons_radial_1d` など）は試験の参照。
 
 #### 5.11.1 機構別指向性源チャネル（TPD / SRS、multi-channel v2）
 

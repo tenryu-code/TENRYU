@@ -508,4 +508,28 @@ void flatten_table_into(const PhaseSpaceTable& table, FlatTable& flat) {
   }
 }
 
+PhaseSpaceTable table_from_flat(const FlatTable& flat,
+                                const std::vector<double>& shell_r) {
+  assert(flat.n_shells == static_cast<int>(shell_r.size()));
+  assert(flat.offsets.size() ==
+         2U * static_cast<std::size_t>(flat.n_shells) + 1U);
+  auto impl = std::make_shared<PhaseSpaceTable::Impl>();
+  impl->shell_r = shell_r;
+  impl->bins.resize(2U * static_cast<std::size_t>(flat.n_shells));
+  for (std::size_t bin = 0; bin < impl->bins.size(); ++bin) {
+    const int begin = flat.offsets[bin];
+    const int end = flat.offsets[bin + 1];
+    impl->bins[bin].reserve(static_cast<std::size_t>(end - begin));
+    for (int i = begin; i < end; ++i) {
+      const std::size_t k = static_cast<std::size_t>(i);
+      impl->bins[bin].push_back(CrossingView{
+          flat.theta[k], flat.alpha[k], flat.P[k], flat.area[k],
+          static_cast<int>(flat.ray_index[k]), flat.in_limiter[k] != 0U});
+    }
+  }
+  PhaseSpaceTable table;
+  table.impl_ = std::move(impl);
+  return table;
+}
+
 }  // namespace tenryu::laser::sector_ps

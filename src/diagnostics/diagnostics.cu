@@ -15,6 +15,7 @@
 #include "core/device_pack.hpp"
 #include "core/device_scratch.hpp"
 #include "core/error.hpp"
+#include "diagnostics/history_1d_gpu.cuh"
 #include "laser/laser_mesh.cuh"
 
 namespace tenryu::diagnostics {
@@ -616,6 +617,9 @@ double sum_laser_dep(const core::State& state) {
   if (state.laser_dep.empty()) {
     return 0.0;
   }
+  if (state.mesh.dim == 1) {
+    return history_1d::laser_dep_sum(state);  // on the device (double-double)
+  }
   const auto dep = to_host(state.laser_dep);
   long double sum = 0.0L;
   for (const double value : dep) {
@@ -716,27 +720,11 @@ double compute_absorption_weighted_r_1d(const core::State& state) {
   if (state.mesh.dim != 1 || state.laser_dep.empty() || state.x_r.empty()) {
     return 0.0;
   }
-  const auto dep = to_host(state.laser_dep);
-  const auto nodes = to_host(state.x_r);
-  if (nodes.size() != dep.size() + 1) {
+  if (state.x_r.size() != state.laser_dep.size() + 1) {
     return 0.0;
   }
-
-  long double weighted_sum = 0.0L;
-  long double dep_sum = 0.0L;
-  for (std::size_t c = 0; c < dep.size(); ++c) {
-    const double q = dep[c];
-    if (!(q > 0.0)) {
-      continue;
-    }
-    const double r_center = 0.5 * (nodes[c] + nodes[c + 1]);
-    weighted_sum += static_cast<long double>(q) * static_cast<long double>(r_center);
-    dep_sum += static_cast<long double>(q);
-  }
-  if (!(dep_sum > 0.0L)) {
-    return 0.0;
-  }
-  return static_cast<double>(weighted_sum / dep_sum);
+  // Σ q r_c / Σ q over the cells with q > 0, on the device (double-double sums)
+  return history_1d::absorption_weighted_r(state);
 }
 
 double compute_absorption_weighted_r_2d(const core::State& state) {
@@ -992,19 +980,13 @@ bool compute_shape_history_1d(const core::State& state,
   }
   const bool has_hotspot_tracer =
       areal != nullptr && state.gas_tracer_initialized && state.gas_tracer_Y.size() == n;
-  // One readback: rho, the lower and upper node radius of every cell (x_r
-  // shifted by one node) and the gas tracer.
-  const double* srcs[4] = {state.rho.data(), state.x_r.data(), state.x_r.data() + 1,
-                           has_hotspot_tracer ? state.gas_tracer_Y.data() : nullptr};
-  const int k = has_hotspot_tracer ? 4 : 3;
-  std::vector<double> pack(static_cast<std::size_t>(k) * n);
-  core::pack_pull_fields(srcs, k, static_cast<int>(n), pack.data(),
-                         "diagnostics:shape_history_1d:pull");
-  const double* rho = pack.data();
-  const double* node_lo = rho + n;
-  const double* node_hi = node_lo + n;
-  const double* gas_tracer_Y = has_hotspot_tracer ? node_hi + n : nullptr;
-  const double rho_max = *std::max_element(rho, rho + n);
+  // The reductions on the device: the peak density, the areal density (the host's double sum in
+  // the cells' order), the tracer-weighted one and the shell radius.
+  const bool shell_only =
+      areal != nullptr && (cfg.diagnostics.areal_density.r_range == "shell");
+  const history_1d::Shape shape = history_1d::shape(
+      state, shell_only, has_hotspot_tracer ? state.gas_tracer_Y.data() : nullptr,
+      cfg.diagnostics.sphericity.rho_threshold);
 
   if (areal != nullptr) {
     ArealDensityDiagnostics out{};
@@ -1016,16 +998,10 @@ bool compute_shape_history_1d(const core::State& state,
     if (has_hotspot_tracer) {
       out.rhoR_hotspot_tracer.assign(out.angles_deg.size(), 0.0);
     }
-    const bool shell_only = (cfg.diagnostics.areal_density.r_range == "shell");
-    const double shell_threshold = 0.1 * rho_max;
-    const double rhoR = integrate_rhoR_1d_host(rho, node_lo, node_hi, n, shell_only,
-                                               shell_threshold, nullptr);
-    std::fill(out.rhoR.begin(), out.rhoR.end(), rhoR);
+    std::fill(out.rhoR.begin(), out.rhoR.end(), shape.rhoR);
     if (has_hotspot_tracer) {
-      const double rhoR_hotspot = integrate_rhoR_1d_host(
-          rho, node_lo, node_hi, n, false, shell_threshold, gas_tracer_Y);
       std::fill(out.rhoR_hotspot_tracer.begin(), out.rhoR_hotspot_tracer.end(),
-                rhoR_hotspot);
+                shape.rhoR_hotspot);
     }
     *areal = std::move(out);
   }
@@ -1036,11 +1012,8 @@ bool compute_shape_history_1d(const core::State& state,
       out.modes = {0, 2, 4};
     }
     out.coefficients.assign(out.modes.size(), 0.0);
-    const double rho_threshold =
-        std::max(cfg.diagnostics.sphericity.rho_threshold, 0.1 * rho_max);
-    const double radius = find_shell_radius_1d_host(rho, node_hi, n, rho_threshold);
     for (std::size_t m = 0; m < out.modes.size(); ++m) {
-      out.coefficients[m] = (out.modes[m] == 0) ? radius : 0.0;
+      out.coefficients[m] = (out.modes[m] == 0) ? shape.shell_radius : 0.0;
     }
     *sphericity = std::move(out);
   }

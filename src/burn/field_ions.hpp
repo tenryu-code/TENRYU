@@ -28,15 +28,19 @@ struct IonKind {
   double Z = 0.0;
 };
 
-// Per-ion means of a mixture. The weights are normalized before the sums,
-// so equal weights of D and T give field_ions_equimolar_dt() bit for bit.
-// Returns `fallback` when no kind has a positive weight.
-TENRYU_HOST_DEVICE inline FieldIons field_ions_from_kinds(
-    const IonKind* kinds, const int n_kinds, const FieldIons& fallback) {
+// Per-ion means of a mixture whose k-th kind (k < n_kinds) is kind_at(k).
+// The weights are normalized before the sums, so equal weights of D and T
+// give field_ions_equimolar_dt() bit for bit. A kind without a positive
+// weight and mass number takes no part. Returns `fallback` when no kind has a
+// positive weight.
+template <typename KindAt>
+TENRYU_HOST_DEVICE inline FieldIons field_ions_from_kind_source(
+    const KindAt& kind_at, const int n_kinds, const FieldIons& fallback) {
   double total = 0.0;
   for (int k = 0; k < n_kinds; ++k) {
-    if (kinds[k].w > 0.0 && kinds[k].A > 0.0) {
-      total += kinds[k].w;
+    const IonKind ion = kind_at(k);
+    if (ion.w > 0.0 && ion.A > 0.0) {
+      total += ion.w;
     }
   }
   if (!(total > 0.0)) {
@@ -48,7 +52,7 @@ TENRYU_HOST_DEVICE inline FieldIons field_ions_from_kinds(
   f.z2_bar = 0.0;
   f.z2_over_A_bar = 0.0;
   for (int k = 0; k < n_kinds; ++k) {
-    const IonKind& ion = kinds[k];
+    const IonKind ion = kind_at(k);
     if (!(ion.w > 0.0 && ion.A > 0.0)) {
       continue;
     }
@@ -60,6 +64,18 @@ TENRYU_HOST_DEVICE inline FieldIons field_ions_from_kinds(
     f.z2_over_A_bar += x * (z2 / ion.A);
   }
   return f;
+}
+
+// The kinds of an array.
+struct IonKindArray {
+  const IonKind* kinds = nullptr;
+  TENRYU_HOST_DEVICE IonKind operator()(const int k) const { return kinds[k]; }
+};
+
+// Per-ion means of the mixture kinds[0 .. n_kinds - 1].
+TENRYU_HOST_DEVICE inline FieldIons field_ions_from_kinds(
+    const IonKind* kinds, const int n_kinds, const FieldIons& fallback) {
+  return field_ions_from_kind_source(IonKindArray{kinds}, n_kinds, fallback);
 }
 
 TENRYU_HOST_DEVICE inline FieldIons field_ions_equimolar_dt() {

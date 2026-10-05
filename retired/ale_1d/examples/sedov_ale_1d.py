@@ -1,0 +1,85 @@
+"""A deck that runs the retired 1D ALE (Numerics.ale1d) at 6d62bf929, the last commit that builds it.
+
+examples/verification/sedov.py with the 1D ALE on: the cadence, mesh-quality and min-width-floor triggers
+(floor 10 um), no benefit gate and min_cells lowered to the deck's 200 cells, history every step (the run
+reaches t_end in about 70 steps).
+
+A current build refuses Numerics.ale1d.enabled=True; see ../README.md.
+"""
+
+from tenryu_namelist import *
+
+Main(
+    name="sedov",
+    dimension="1D_SPH",
+    t_end=1.0,
+    max_steps=600,
+    seed=12345,
+    verbosity="quiet",
+)
+
+Mesh(
+    r_min=0.0,
+    r_max=2.0,
+    nr=200,
+    grid="uniform",
+)
+
+Materials(
+    materials=[
+        Material(
+            name="fuel",
+            A=1.0,
+            Z=0.0,
+            eos=dict(model="ideal_gas", ideal_gas=dict(gamma=5.0 / 3.0)),
+            opacity=dict(model="constant", kappa_a=0.0, kappa_s=0.0, units="cm2_per_g"),
+        )
+    ]
+)
+
+Geometry(
+    volfrac=dict(fuel=lambda r: 1.0),
+    rho=lambda r: 1.0,
+    Te=lambda r: 1.0e-3,
+    Ti=lambda r: 1.0e-3,
+    velocity=lambda r: 0.0,
+    radiation_field="zero",
+)
+
+Numerics(
+    dt=dict(
+        initial_s=1.0e-6,
+        cfl_hydro=0.3,
+        growth_factor=1.2,
+        max_s=1.0e-1,
+        min_s=1.0e-20,
+    ),
+    # The conservative (compatible) energy update, as in the verification deck.
+    hydro=dict(boundary_1d="free", av_C1=0.1, av_C2=1.5, compatible_energy=True),
+    conduction=dict(enabled=False),
+    floors=dict(rho_floor_gcc=1.0e-10, Te_floor_eV=1.0e-3, Ti_floor_eV=1.0e-3),
+    ale1d=dict(
+        enabled=True,
+        min_cells=128,  # the default 256 is above this deck's 200 cells, which would skip every attempt
+        every_n_steps=25,
+        emergency_enabled=True,
+        emergency_max_dr_ratio=1.3,
+        enable_benefit_gate=False,
+        min_width_floor=dict(enabled=True, floor_cm=1.0e-3),
+    ),
+)
+
+Output(
+    directory="./output_sedov_ale_1d",
+    format="hdf5",
+    plot_every=100,
+    history_every=1,
+    checkpoint_every=0,
+    plot_every_s=-1.0,
+    history_every_s=-1.0,
+    checkpoint_every_s=-1.0,
+)
+
+Radiation(enabled=False)
+Laser(enabled=False)
+Diagnostics(enabled=True)

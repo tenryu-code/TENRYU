@@ -5,6 +5,37 @@ export interface MeshPreviewPolar {
   equalMu: boolean;
 }
 
+/** One band of the solver's resolution requirement (mesh_requirement.bands_recommended). */
+export interface MeshRequirementBandView {
+  kind: string;
+  rLoCm: number;
+  rHiCm: number;
+  arealMassMaxGcm2: number;
+}
+
+/** Outcome of one rule of the requirement check (mesh_requirement.requirement_check). */
+export interface MeshRequirementRuleView {
+  applicable: boolean;
+  nChecked: number;
+  nViolations: number;
+  maxRatio: number | null;
+  worstCell: number;
+}
+
+/** The parts of the 1D mesh_requirement JSON (SPECIFICATION 6.4.2, OUTPUT_SCHEMA) the mesh
+ *  diagnostics use. */
+export interface MeshRequirementView {
+  applicable: boolean;
+  reason: string;
+  apply: string;
+  R0Cm: number | null;
+  areaCm2: number | null;
+  bands: MeshRequirementBandView[];
+  drMinAdmissibleCm: number | null;
+  ablation: MeshRequirementRuleView | null;
+  shock: MeshRequirementRuleView | null;
+}
+
 export interface MeshPreviewData {
   dim: number;
   dimension: string;
@@ -14,11 +45,64 @@ export interface MeshPreviewData {
   nz: number;
   rMin: number;
   rMax: number;
-  zMin: number;
-  zMax: number;
+  /** null for 1D, where the solver writes no axial extent. */
+  zMin: number | null;
+  zMax: number | null;
   polar: MeshPreviewPolar | null;
   rNodes: number[] | null;
   zNodes: number[] | null;
+  /** 1D: initial density of each cell as the solver samples it, and its material index. */
+  rho0Cells?: number[] | null;
+  materialCells?: number[] | null;
+  requirement?: MeshRequirementView | null;
+}
+
+function finiteOrNull(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function ruleView(value: unknown): MeshRequirementRuleView | null {
+  if (typeof value !== "object" || value === null) return null;
+  const rule = value as Record<string, unknown>;
+  const worst = (rule.worst ?? {}) as Record<string, unknown>;
+  return {
+    applicable: rule.applicable === true,
+    nChecked: typeof rule.n_checked === "number" ? rule.n_checked : 0,
+    nViolations: typeof rule.n_violations === "number" ? rule.n_violations : 0,
+    maxRatio: finiteOrNull(rule.max_ratio),
+    worstCell: typeof worst.cell === "number" ? worst.cell : -1,
+  };
+}
+
+export function parseRequirementView(value: unknown): MeshRequirementView | null {
+  if (typeof value !== "object" || value === null) return null;
+  const req = value as Record<string, unknown>;
+  const params = (req.params ?? {}) as Record<string, unknown>;
+  const inputs = (req.inputs ?? {}) as Record<string, unknown>;
+  const ablation = (req.ablation ?? {}) as Record<string, unknown>;
+  const check = (req.requirement_check ?? null) as Record<string, unknown> | null;
+  const bands = Array.isArray(req.bands_recommended)
+    ? req.bands_recommended.flatMap((band) => {
+        if (typeof band !== "object" || band === null) return [];
+        const b = band as Record<string, unknown>;
+        const lo = finiteOrNull(b.r_lo_cm);
+        const hi = finiteOrNull(b.r_hi_cm);
+        const cap = finiteOrNull(b.areal_mass_max_g_cm2);
+        if (lo === null || hi === null || cap === null) return [];
+        return [{ kind: typeof b.kind === "string" ? b.kind : "", rLoCm: lo, rHiCm: hi, arealMassMaxGcm2: cap }];
+      })
+    : [];
+  return {
+    applicable: req.applicable === true,
+    reason: typeof req.reason === "string" ? req.reason : "",
+    apply: typeof params.apply === "string" ? params.apply : "",
+    R0Cm: finiteOrNull(inputs.R0_cm),
+    areaCm2: finiteOrNull(inputs.area_cm2),
+    bands,
+    drMinAdmissibleCm: finiteOrNull(ablation.dr_min_admissible_cm),
+    ablation: check === null ? null : ruleView(check.ablation),
+    shock: check === null ? null : ruleView(check.shock),
+  };
 }
 
 const MARKER = "TENRYU-MESH-PREVIEW: ";
@@ -54,12 +138,14 @@ export function parseMeshPreview(stdout: string): MeshPreviewData | null {
       typeof value.logical_mesh_2d !== "string" ||
       typeof value.geometry_1d !== "string" ||
       typeof value.r_min !== "number" ||
-      typeof value.r_max !== "number" ||
-      typeof value.z_min !== "number" ||
-      typeof value.z_max !== "number"
+      typeof value.r_max !== "number"
     ) {
       return null;
     }
+    // A 1D deck has no axial extent: the solver writes z_min and z_max as null there.
+    const zMin = typeof value.z_min === "number" ? value.z_min : null;
+    const zMax = typeof value.z_max === "number" ? value.z_max : null;
+    if (value.dim !== 1 && (zMin === null || zMax === null)) return null;
     if (
       value.r_nodes !== null &&
       !finiteNumberArray(value.r_nodes, value.nr + 1)
@@ -106,11 +192,14 @@ export function parseMeshPreview(stdout: string): MeshPreviewData | null {
       nz: value.nz,
       rMin: value.r_min,
       rMax: value.r_max,
-      zMin: value.z_min,
-      zMax: value.z_max,
+      zMin,
+      zMax,
       polar,
       rNodes: value.r_nodes as number[] | null,
       zNodes: value.z_nodes as number[] | null,
+      rho0Cells: finiteNumberArray(value.rho0_cells, value.nr) ? value.rho0_cells : null,
+      materialCells: finiteNumberArray(value.material_cells, value.nr) ? value.material_cells : null,
+      requirement: parseRequirementView(value.mesh_requirement),
     };
   } catch {
     return null;

@@ -210,7 +210,9 @@ LOO calibration and exact solver/lint integrity boundary are in
 
 `--tenryu`, then `TENRYU_BIN`, then `build/tenryu` select the optional binary, as for
 `lint-deck`. With a new binary, --deck uses solver-observed conditions from
-`validate --mesh-preview`; a placeholder uniform mesh is allowed. Offline/old-binary deck
+`validate --mesh-preview`; a placeholder mesh is allowed if every material interface is one of its
+nodes (the preview samples the layers at the placeholder's cell centres, so an interface between two
+nodes moves to a node: a uniform 2 µm mesh read a 243 µm interface as 244 µm). Offline/old-binary deck
 extraction requires a literal `MESH_EXPERIMENTAL_CONDITIONS = {...}` assignment, otherwise
 use --conditions. Both flags may be combined to validate material definitions in a real
 deck. Conditions-only validation uses a clearly identified ideal-gas mesh-check deck for

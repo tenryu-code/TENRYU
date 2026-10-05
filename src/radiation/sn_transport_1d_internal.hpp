@@ -32,4 +32,11 @@ sn_ld::QuadratureView quadrature(int n_angles, int geom);
 // diagnostics, reduction scratch).
 void ensure_buffers(core::State& state, int n_cells, int n_groups, int n_angles);
 
+// The external volume source of the step (Radiation.volume_source_rate / volume_source_x_max), on
+// the device: source[c] = rate where the cell center 0.5 (x_r[c] + x_r[c + 1]) <= x_max, else 0;
+// returns the energy it injects over dt, the sum over those cells of dt max(V, 0) rate (a
+// non-finite V counts 0) in cell order (one copy to the host). x_r, vol, source: device arrays.
+double volume_source(const double* x_r, const double* vol, int n_cells, double rate,
+                     double x_max, double dt, double* source);
+
 }  // namespace tenryu::radiation::sn1d_internal

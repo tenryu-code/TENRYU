@@ -348,35 +348,10 @@ BurnStageResult compute_burn_step_1d_host(const BurnStageInputs& in,
   return result;
 }
 
-BurnStageResult compute_burn_step_1d(const BurnStageInputs& in,
-                                     const BurnStageParams& p,
-                                     const PartitionTable& table,
-                                     std::vector<double>& burn_y,
-                                     std::vector<double>& dE_e,
-                                     std::vector<double>& dE_i,
-                                     std::vector<double>& rate_diag,
-                                     std::vector<double>& Qe_diag,
-                                     std::vector<double>& Qi_diag,
-                                     std::vector<double>* S_birth,
-                                     std::vector<double>* neutron_births) {
-  const char* const host_stage_env = std::getenv("TENRYU_BURN_HOST_STAGE");
-  const bool force_host =
-      host_stage_env != nullptr && std::strcmp(host_stage_env, "1") == 0;
-  if (force_host || in.n_cells <= 0) {
-    return compute_burn_step_1d_host(in, p, table, burn_y, dE_e, dE_i,
-                                     rate_diag, Qe_diag, Qi_diag, S_birth,
-                                     neutron_births);
-  }
+namespace {
 
-  std::vector<double> nh_emit;
-  double dt_limit_subcycle = std::numeric_limits<double>::infinity();
-  unsigned int screening_warning_flags = 0U;
-  BurnStageResult result = compute_burn_step_1d_device_stage(
-      in, p, table, burn_y, dE_e, dE_i, rate_diag, Qe_diag, Qi_diag,
-      S_birth, nh_emit, dt_limit_subcycle, screening_warning_flags,
-      neutron_births);
-  burn_screening_emit_warnings(screening_warning_flags);
-
+// The subcycle saturation warning of the device stage calls (one count for both entries).
+void warn_subcycle_saturation(const BurnStageResult& result) {
   if (result.subcycle_saturated_cells > 0) {
     static int warned_subcycle_saturation = 0;
     ++warned_subcycle_saturation;
@@ -391,7 +366,55 @@ BurnStageResult compute_burn_step_1d(const BurnStageInputs& in,
           "engaged");
     }
   }
+}
 
+}  // namespace
+
+bool burn_1d_host_stage_forced() {
+  const char* const host_stage_env = std::getenv("TENRYU_BURN_HOST_STAGE");
+  return host_stage_env != nullptr && std::strcmp(host_stage_env, "1") == 0;
+}
+
+BurnStageResult compute_burn_step_1d_device_resident(const BurnDeviceInputs& in,
+                                                     const BurnStageParams& p,
+                                                     const PartitionTable& table,
+                                                     const BurnDeviceArrays& out) {
+  double dt_limit_subcycle = std::numeric_limits<double>::infinity();
+  unsigned int screening_warning_flags = 0U;
+  BurnStageResult result = compute_burn_step_1d_resident(
+      in, p, table, out, dt_limit_subcycle, screening_warning_flags);
+  burn_screening_emit_warnings(screening_warning_flags);
+  warn_subcycle_saturation(result);
+  return result;
+}
+
+BurnStageResult compute_burn_step_1d(const BurnStageInputs& in,
+                                     const BurnStageParams& p,
+                                     const PartitionTable& table,
+                                     std::vector<double>& burn_y,
+                                     std::vector<double>& dE_e,
+                                     std::vector<double>& dE_i,
+                                     std::vector<double>& rate_diag,
+                                     std::vector<double>& Qe_diag,
+                                     std::vector<double>& Qi_diag,
+                                     std::vector<double>* S_birth,
+                                     std::vector<double>* neutron_births) {
+  const bool force_host = burn_1d_host_stage_forced();
+  if (force_host || in.n_cells <= 0) {
+    return compute_burn_step_1d_host(in, p, table, burn_y, dE_e, dE_i,
+                                     rate_diag, Qe_diag, Qi_diag, S_birth,
+                                     neutron_births);
+  }
+
+  std::vector<double> nh_emit;
+  double dt_limit_subcycle = std::numeric_limits<double>::infinity();
+  unsigned int screening_warning_flags = 0U;
+  BurnStageResult result = compute_burn_step_1d_device_stage(
+      in, p, table, burn_y, dE_e, dE_i, rate_diag, Qe_diag, Qi_diag,
+      S_birth, nh_emit, dt_limit_subcycle, screening_warning_flags,
+      neutron_births);
+  burn_screening_emit_warnings(screening_warning_flags);
+  warn_subcycle_saturation(result);
   return result;
 }
 

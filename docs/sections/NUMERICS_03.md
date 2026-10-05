@@ -473,7 +473,8 @@ arithmetic verbatim (bitwise regime), with 1D_SPH bit-neutrality anchored by
 `tests/hydro/test_1d_sph_bitwise_golden.cu`.  Since 2026-09-24 the builder maps
 `"1D_CYL"` to `"1D_SPH"` with `Mesh.geometry_1d="cylindrical"` (the same
 `geometry_code`), so the physics of the cylindrical 1D geometry (FLD/S_N
-radiation, conduction, the radial laser absorption, ALE) is available; the
+radiation, conduction, the radial laser absorption) is available (the 1D ALE,
+available here too until its retirement on 2026-10-02, is gone); the
 initial scope was the pure hydro core, with radiation, laser, conduction, and
 ale1d rejected at validation.  The boundary-PdV energy-audit diagnostic is
 geometry-aware.  The Sedov gate is
@@ -661,6 +662,8 @@ Q_c^{half}>0,\quad \texttt{cell\_is\_void}_c,\quad
 \(F_c\) を `hk_velocity_damper_guard_cells` cell 半幅（既定 25）で展開して
 `near_front` を作り、pair \((i,i+1)\) は `near_front[i]` が真なら無効化する。
 gradient 閾値の既定は \(T_e\) が 0.2、\(\rho\) が 0.3 である。
+front mask・`near_front` と材料境界の判定に使う dominant material は device で作る（2026-10-02 まで host。対数は host の
+`log` と同じ結果の `core::glibc_libm::log` なので同じ cell になる）。
 - half-step 粘性 \(Q_c^{half}=(Q_c^n+Q_c^{n+1/2})/2\) について
   \(Q_{i-1}^{half},Q_i^{half},Q_{i+1}^{half}=0\)（shock/AV active stencil では secondary guard として無効）
 - cell optical depth \(\theta_c=\max(\sigma_{R,\max,c},0)\Delta r_c\) から
@@ -1698,7 +1701,7 @@ J_P > 0.02 \;\lor\; J_\rho > 0.01
 未定義だった。実装は上記の論理和である）
 
 leading cluster は \(\sum_i Q_i^{probe}\) 最大で選ぶ。5% 以内の tie では、
-bounce 前は小さい \(r_s\)、bounce 後は大きい \(r_s\) を選ぶ。cluster 中心は
+bounce 前は小さい \(r_s\)、bounce 後は大きい \(r_s\) を選ぶ（probe の走査 — 最大値・shock 判定・殻の平均発散・cluster とその重み和・leading cluster の選択 — と、下記の gate と係数のセルごとの計算は device で行う、2026-10-02。和はセル順で cluster 内は 1 スレッドが順に足し、積は各々丸める — 以前の host のループと同じ値。初期半径の確定と bounce の判定は host のスカラー処理）。cluster 中心は
 \[
 r_s = \frac{\sum_i Q_i^{probe} r_i}{\sum_i Q_i^{probe}},\qquad
 U_s =
@@ -2181,7 +2184,7 @@ Physical-viscosity module adding unmagnetized Braginskii shear viscosity (ion + 
 
 **Gershgorin 安定性監査（fail-closed、2026-07-26 カーネルレビュー）**: 上記スカラー式は縦拡散のみをステップ開始状態で束縛する。球/円筒の hoop 剛性 \(\alpha(\pi_{rr}-\pi_{tt})/r\)（原点近傍で縦成分の最大 ~2.5 倍）と、ステップ内の \(\eta\propto T^{5/2}\) 成長（predictor 衝撃加熱の T 倍化で corrector 剛性 ~5.7 倍）は見えない。このため 1D Lagrangian step の終端で、組立済みノード加速度演算子（`braginskii_add_accel_1d_kernel` の凍結 η 線形化 — 一様平面格子で \(2/\lambda_G\) がスカラー式の安定限界に厳密一致）の Gershgorin 行和 \(\lambda_G\) を評価し、\(\Delta t \le 2/\lambda_G\) を監査する（`compute_viscous_gershgorin_lambda_1d`）。既定 `dt_safety=0.3` では常に合格（bit 中立）。違反時は non-positive-volume ガードと同型の soft retry（`driver_full_step_retry_enabled` 時、`suggested_dt = dt_safety · 2/\lambda_G`）または fail-fast。**入力検証**: `TENRYU_BRAG_*` env と namelist の両起点で strict parse（完全 parse・有限性）+ 範囲検証（負の `eta0_scale` は反拡散、`dt_safety<=0` は dt 無効化）+ 未知 model/species の reject を `validate_params` が enabled 時に強制する（fail-open の黙認廃止）。**診断の物理値純化**: history 診断の `eta_{i,e}_phys` は uncapped・unscaled・NRL-log の古典値に固定（cap 既定 20 cells が regime 地図へ格子依存を持ち込まないため）。構成値 channel（`eta_eff`・heat rate）は従来どおり run の knob を反映する。scratch-pool 化（scratch-pool 規約準拠、旧 per-call cudaMalloc/Free の除去）も同時に実施。
 
-**history 診断（診断バンドル原則、2026-07-12; dim==2 は 2026-07-17）**: enabled 時、history cadence で `/diagnostics/plasma_viscosity_history/` に {cycle, t_s, eta_i_max, eta_e_max, eta_eff_max, ratio_{min,geomean_masswt,max}, n_cells_{e_dom,i_dom,mixed,active}, heat_rate_{i,e}_tot} を追記する。eta_i/eta_e と R 統計は**物理 channel 値**（model/species 非依存 — legacy ion run でも regime 地図が見える）、eta_eff と heat rate は構成値。regime 分類（R≥10 で e_dom / R≤0.1 で i_dom）は診断専用定数で物理への feedback なし。還元は device per-cell 配列の host 逐次集約（atomics 不使用 — bitwise 再現性域に非決定を持ち込まない）。積算器は持たない（瞬時 rate のみ — Strang retry 安全）。dim==2 は同一場のセマンティクスで、歪み演算子は 2D 応力 kernel の shoelace-gradient + hoop 分解、cap 長は dt kernel と同じ最小 active 辺長（`compute_history_diagnostics_2d`、structured/multiblock 両対応）。
+**history 診断（診断バンドル原則、2026-07-12; dim==2 は 2026-07-17）**: enabled 時、history cadence で `/diagnostics/plasma_viscosity_history/` に {cycle, t_s, eta_i_max, eta_e_max, eta_eff_max, ratio_{min,geomean_masswt,max}, n_cells_{e_dom,i_dom,mixed,active}, heat_rate_{i,e}_tot} を追記する。eta_i/eta_e と R 統計は**物理 channel 値**（model/species 非依存 — legacy ion run でも regime 地図が見える）、eta_eff と heat rate は構成値。regime 分類（R≥10 で e_dom / R≤0.1 で i_dom）は診断専用定数で物理への feedback なし。還元は 1D では device で行う（2026-10-02、`reduce_history_diagnostics_1d`）: 最大・最小は x86-64 の glibc の fmax/fmin と同じ規則（NaN は無視、等しい 2 値は後者 — 0 の符号まで一致）で連続区間ごとに畳んでから区間の順に結合し、和はセル順（`core/device_ordered_sum.cuh`）、atomics 不使用 — 以前の host 逐次集約と同じ値。ただし ratio_geomean_masswt の対数は device の log で、host の値と稀な引数で最後の桁が異なりうる。dim==2 は device per-cell 配列の host 逐次集約。積算器は持たない（瞬時 rate のみ — Strang retry 安全）。dim==2 は同一場のセマンティクスで、歪み演算子は 2D 応力 kernel の shoelace-gradient + hoop 分解、cap 長は dt kernel と同じ最小 active 辺長（`compute_history_diagnostics_2d`、structured/multiblock 両対応）。
 
 **2D RZ port**:
 
@@ -11074,7 +11077,8 @@ do not modify \(e_i\) at all; the clamped raws
 weights and the negative-deposit removable clip. Flooring can therefore never
 raise a cell above its own input. For non-negative (ideal-gas) inputs every
 path is bit-identical to the historic all-clamp behavior. This mirrors the
-1D ALE KE-closure contract fix (`ale_1d_velocity_project.cu`).
+1D ALE KE-closure contract fix (`ale_1d_velocity_project.cu`, kept under
+`retired/ale_1d/` since the 1D ALE was retired on 2026-10-02).
 
 When `Numerics.ale.ke_closure_redistribute_floor=true`, the closure instead
 uses a conservative two-pass positivity correction. First compute the
@@ -13603,9 +13607,9 @@ projection uses only persistent physical masters and physical slaves.  A
 successful diagnostic line adds `subdomain=i/n cells=N`, while `[p3_diag]`
 retains its classifier format.
 
-### 3.4 1D_SPH pure Lagrangian hydro and optional V3 ALE
+### 3.4 1D_SPH pure Lagrangian hydro [V3 ALE: RETIRED 2026-10-02]
 
-既定では 1D_SPH は pure Lagrangian であり、旧 `numerics.ale` による 1D rezone/remap は実行しない。球対称 1D mesh はセル tangling を起こさないため、従来の step 終端 mesh relaxation は不要である。一方、V3 の `numerics.ale1d` は solution-adaptive resolution を目的とする別経路で、既定無効、1D_SPH + deterministic radiation のみを対象にする。
+1D_SPH は pure Lagrangian であり、旧 `numerics.ale` による 1D rezone/remap は実行しない。球対称 1D mesh はセル tangling を起こさないため、従来の step 終端 mesh relaxation は不要である。V3 の `numerics.ale1d`（solution-adaptive resolution を目的とする別経路。既定無効の実験機能で、1D_SPH + deterministic radiation のみを対象にした）は 2026-10-02 に退役した。コードはビルドから外し `retired/ale_1d/` に保管し（最後にビルドして試験が通った状態と戻し方は `retired/ale_1d/README.md`）、`Numerics.ale1d` は受理して効果を持たず、`enabled=True` は ConfigError である。退役の理由: 例題・検証・GUI のどのデッキも有効にしておらず、\(S_N\)・燃焼・2 材料以上を拒否するため ICF の計算に使えず、2026-08-07 時点の記録ではベンチデッキでの実適用に達していなかった（§3.4.1 の「現状」）。1D でメッシュの再配置と状態量の remap を行うのはこの経路だけだったので、1D の run はどちらも行わない。§3.4.1 の V3 の段落と §3.4.3〜§3.4.5 は退役した方式の記録である。
 
 #### 3.4.1 1D 方針
 
@@ -13613,11 +13617,15 @@ retains its classifier format.
 
 したがって `numerics.ale.enabled` は 2D_RZ ALE のみを制御する。1D_SPH では `mesh.motion="lagrangian"` を用い、`mesh.motion="ale"` は許可しない。旧 1D 専用 ALE の設定面および実装面は削除された。
 
-V3 solution-adaptive ALE は `numerics.ale1d.enabled` でのみ制御する。これは旧 1D ALE の復活ではなく、feature sensor、monitor equidistribution、conservative remap、velocity projection を二相 commit で行う独立機能である。現行版では `apply_ale_1d` が 21-step data flow を実装し、sensor/rezone/remap/projection/diagnostics は scratch にのみ書き、hard 許容誤差を満たした場合だけ mesh・保存量・速度を commit する。
+> 退役した方式の記録（コードは 2026-10-02 にビルドから外し `retired/ale_1d/` に保管）。
+
+V3 solution-adaptive ALE は `numerics.ale1d.enabled` でのみ制御する（再配置の candidate — monitor、等分配、節点の拘束、
+min-width floor の candidate、境界節点、幾何の検査、音響 dt の上限 — は device で作り、host 実装と同じ演算順と丸め
+（exp・pow は `core::glibc_libm`）でビット一致する。2026-10-02、`TENRYU_ALE1D_HOST=1` で host 実装）。これは旧 1D ALE の復活ではなく、feature sensor、monitor equidistribution、conservative remap、velocity projection を二相 commit で行う独立機能である。現行版では `apply_ale_1d` が 21-step data flow を実装し、sensor/rezone/remap/projection/diagnostics は scratch にのみ書き、hard 許容誤差を満たした場合だけ mesh・保存量・速度を commit する。
 
 > **運用注意**：`Ale1dConfig::enabled=false` / `numerics.ale1d.enabled=False` が既定であり、1D ALE V3 は実験的な opt-in 機能として、long-pulse ablation front penetration や multi-shock systems など localized moving feature がある場合に限って検討する。
 
-**発火条件と候補の判定（2026-09-23）**：試行は cadence（`every_n_steps` の倍数の step）、品質（`emergency_enabled` かつ隣接セル幅比の最大 \(\max_i\max(\Delta r_i/\Delta r_{i+1},\Delta r_{i+1}/\Delta r_i)\) が `emergency_max_dr_ratio` を超える）、min-width floor（下記）のいずれかで発火し、前回の適用から `min_steps_between_ale` step 未満なら skip する（`TooSoon`）。候補メッシュは remap の前に音響 dt 上限
+**発火条件と候補の判定（2026-09-23）**：試行は cadence（`every_n_steps` の倍数の step）、品質（`emergency_enabled` かつ隣接セル幅比の最大 \(\max_i\max(\Delta r_i/\Delta r_{i+1},\Delta r_{i+1}/\Delta r_i)\) が `emergency_max_dr_ratio` を超える）、min-width floor（下記）のいずれかで発火し（隣接セル幅比の最大と最小セル幅は device の縮約 1 回で求める、2026-10-02）、前回の適用から `min_steps_between_ale` step 未満なら skip する（`TooSoon`）。候補メッシュは remap の前に音響 dt 上限
 \[
 \Delta t_{ac}=\min_i\frac{r_{i+1}-r_i}{c_{s,i}}\qquad(c_{s,i}>0\ \text{のセル})
 \]
@@ -13659,7 +13667,9 @@ restart 直後は floor を一度再評価し、不適用なら再装填され�
 
 2D_RZ の ALE rezone/remap は §3.3 のまま維持する。2D production runs では `mesh.motion="ale"` かつ `numerics.ale.enabled=True` の場合に、2D Winslow rezone、保存的 remap、node velocity projection、EOS reclosure を実行する。この post-remap reclosure は `HydroEOSContext` を受け取り、table-backed EOS では `sn_material_newton_gpu` と同じ `Materials.low_density_extrapolation` policy（below-table analytic extrapolation / table-edge clamp）を用いる。EOS context がない、または該当成分に table がない場合は従来の理想気体 reclosure を維持する。
 
-#### 3.4.3 V3 1D solution-adaptive ALE sensors
+#### 3.4.3 V3 1D solution-adaptive ALE sensors [RETIRED 2026-10-02]
+
+> 退役した方式の記録（コードは 2026-10-02 にビルドから外し `retired/ale_1d/` に保管）。
 
 Week 2 の sensor は device resident な 1D cell/node fields から `Ale1dFeature` を作る。field 全体を host へコピーせず、max/sum/argmax と component 統計は GPU reduction で求め、host へ戻すのは feature 個数に比例する小さなメタデータのみである。半径は cm、温度は eV、密度は g/cc、圧力・人工粘性は erg/cc の cgs+eV 規約を維持する。
 
@@ -13740,7 +13750,9 @@ S_{C,i}=\exp[-(x_i/x_{\rm search})^2]\left[
 +0.25\frac{T_{i,i}}{T_{i,\max}+\epsilon}\right].
 \]
 
-#### 3.4.4 V3 1D monitor and scratch rezone
+#### 3.4.4 V3 1D monitor and scratch rezone [RETIRED 2026-10-02]
+
+> 退役した方式の記録（コードは 2026-10-02 にビルドから外し `retired/ale_1d/` に保管）。
 
 The rezone stage builds a cell monitor in normalized mass coordinate \(x\) and computes candidate node radii in scratch buffers only. For each emitted feature \(k\),
 \[
@@ -13799,7 +13811,9 @@ The resulting mass-coordinate location is mapped back to radius by linear interp
 
 If the smoothed/clipped monitor is uniform to roundoff, the scratch rezone is the identity candidate after eligibility checks. This preserves the no-feature path exactly and avoids changing resolution when \(W_i=W_0\) everywhere.
 
-#### 3.4.5 V3 1D MUSCL/minmod remap and velocity projection
+#### 3.4.5 V3 1D MUSCL/minmod remap and velocity projection [RETIRED 2026-10-02]
+
+> 退役した方式の記録（コードは 2026-10-02 にビルドから外し `retired/ale_1d/` に保管）。
 
 The 1D_SPH ALE remap is conservative in spherical volume coordinate
 \[

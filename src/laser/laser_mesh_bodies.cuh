@@ -127,7 +127,7 @@ TENRYU_HOST_DEVICE inline double trace_profile_cell_n_hat_raw(const double* rho,
 // last one. rule_count_base is the number of nodes placed before the cursor's
 // first (the "fewer than two nodes" condition of the merge rule counts them):
 // 0 for the whole profile, 2 for a cell or the tail placed on its own by
-// build_trace_profile_nodes_1d_parallel (whose first node the whole profile
+// the parallel placement in laser_mesh.cu (whose first node the whole profile
 // always places as a new node).
 struct TraceProfileCursor {
   double* out = nullptr;
@@ -301,14 +301,12 @@ TENRYU_HOST_DEVICE inline void trace_profile_push_cell(TraceProfileCursor& cur,
   trace_profile_push_ranked(cur, below, 0);
 }
 
-// The nodes after the hydro region: its outer face, the laser mesh's graded
-// nodes beyond it (the ghost corona and the vacuum) and the profile's outer
-// radius.
-TENRYU_HOST_DEVICE inline void trace_profile_push_tail(TraceProfileCursor& cur,
-                                                      const double r_hydro_end,
-                                                      const double* graded_r,
-                                                      const int n_graded) {
-  trace_profile_push_ranked(cur, r_hydro_end, 2);
+// The laser mesh's graded nodes beyond the hydro region's outer face (the
+// ghost corona and the vacuum) and the profile's outer radius.
+TENRYU_HOST_DEVICE inline void trace_profile_push_graded(TraceProfileCursor& cur,
+                                                        const double r_hydro_end,
+                                                        const double* graded_r,
+                                                        const int n_graded) {
   for (int k = 0; k < n_graded; ++k) {
     if (graded_r[k] > r_hydro_end) {
       trace_profile_push_ranked(cur, graded_r[k], 0);
@@ -319,8 +317,18 @@ TENRYU_HOST_DEVICE inline void trace_profile_push_tail(TraceProfileCursor& cur,
   }
 }
 
+// The nodes after the hydro region: its outer face, then the graded nodes
+// beyond it and the outer radius.
+TENRYU_HOST_DEVICE inline void trace_profile_push_tail(TraceProfileCursor& cur,
+                                                      const double r_hydro_end,
+                                                      const double* graded_r,
+                                                      const int n_graded) {
+  trace_profile_push_ranked(cur, r_hydro_end, 2);
+  trace_profile_push_graded(cur, r_hydro_end, graded_r, n_graded);
+}
+
 // A cell whose nodes the serial pass decides from the cell's own nodes (see
-// build_trace_profile_nodes_1d_parallel_kernel, laser_mesh.cu): finite faces
+// the parallel placement in laser_mesh.cu, place_trace_profile_nodes_1d): finite faces
 // and a width of at least 16 parts minimum gaps relative to the upper face.
 // The node below the upper face then lies above the cell's other nodes (the
 // gap it keeps below the face, max(1e-6 w, 4 kTraceProfileMinGap b), is under

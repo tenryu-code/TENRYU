@@ -15,6 +15,9 @@
 #     (e.g. "outputs/<case>") lands inside <run_dir> (Output.directory resolves
 #     against CWD by spec §6.4.8; a restart writes to <dir>_001, <dir>_002, ...
 #     next to it, since `tenryu run --output-dir` is refused on a restart).
+#   - Tables                : with TENRYU_REPO set, <run_dir>/TMAT-H5 and <run_dir>/SESAME link to
+#       the checkout's directories when missing, so relative table paths resolve as from the
+#       repository root
 #   - stdout of this script : single line = path of status.json
 #   - stop                  : kill -TERM -- -<pid>  (pid = process-group leader:
 #       setsid on Linux, job-control (set -m) fallback where setsid(1) is absent
@@ -44,6 +47,9 @@ if [ "${1:-}" = "--child" ]; then
     sleep 0.05
   done
   cd "$RUN_DIR" || exit 10
+  # tenryu buffers a log that is not a terminal (4 MiB, flushed every 30 s by default);
+  # Studio reads the progress from run.log, so the run flushes every 2 s unless set otherwise.
+  export TENRYU_LOG_FLUSH_EVERY_S="${TENRYU_LOG_FLUSH_EVERY_S:-2}"
   if [ -n "$RESTART" ]; then
     # ${EXTRA[@]+...}: an empty array under set -u is an error in bash 3.2 (macOS).
     "$BIN" run "$DECK" --restart "$RESTART" ${EXTRA[@]+"${EXTRA[@]}"} >> "$RUN_DIR/run.log" 2>&1 &
@@ -80,6 +86,18 @@ esac
 mkdir -p "$RUN_DIR" || exit 6
 [ -x "$BIN" ] || { echo "tenryu binary not executable: $BIN" >&2; exit 3; }
 [ -f "$DECK" ] || { echo "deck not found: $DECK" >&2; exit 4; }
+
+# The solver resolves a deck's relative table paths (TMAT-H5/..., SESAME/...) from <run_dir>, its
+# working directory. TENRYU Studio passes the checkout of the server binary as TENRYU_REPO; link the
+# checkout's table directories into <run_dir> when it does not have them, so that a deck written for
+# the repository root runs unchanged.
+if [ -n "${TENRYU_REPO:-}" ]; then
+  for TABLE_DIR in TMAT-H5 SESAME; do
+    if [ -d "$TENRYU_REPO/$TABLE_DIR" ] && [ ! -e "$RUN_DIR/$TABLE_DIR" ]; then
+      ln -s "$TENRYU_REPO/$TABLE_DIR" "$RUN_DIR/$TABLE_DIR"
+    fi
+  done
+fi
 
 START_EPOCH=$(date +%s)
 SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"

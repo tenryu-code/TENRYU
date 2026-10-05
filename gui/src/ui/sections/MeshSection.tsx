@@ -7,7 +7,9 @@ import { useApp } from "../../store";
 import { NumInput, QInput, SelectField, SwitchField, TextField } from "../fields";
 import { Button } from "@tenryu-common/ui/kit";
 import InitialProfile2D from "../InitialProfile2D";
-import MeshMassChart from "../MeshMassChart";
+import MeshDiagnostics from "../mesh/MeshDiagnostics";
+import MeshMethodPanel1d, { ConvergencePairPanel } from "../mesh/MeshMethodPanel1d";
+import { switchMesh1dMethod, type MeshMethod1d } from "../../core/deck/mesh1d";
 import MeshPreview2D from "../MeshPreview2D";
 
 export default function MeshSection() {
@@ -65,13 +67,13 @@ export default function MeshSection() {
       )}
       {form.main.dimension === "1D_SPH" && (
         <SelectField
-          label={m.form.gridType}
+          label={m.mesh1d.ui.methodLabel}
           value={form.mesh.grid1d}
-          options={[
-            { value: "uniform", label: m.form.gridUniform },
-            { value: "graded", label: m.form.gridGraded },
-          ]}
-          onChange={(v) => update((f) => { f.mesh.grid1d = v as never; })}
+          options={(["uniform", "graded", "recommended", "layers", "explicit", "zoning_intent"] as const).map((value) => ({
+            value,
+            label: m.mesh1d.ui.methods[value],
+          }))}
+          onChange={(v) => update((f) => { switchMesh1dMethod(f, v as MeshMethod1d); })}
         />
       )}
       {(form.mesh.grid1d === "uniform" || form.main.dimension === "2D_RZ") &&
@@ -243,6 +245,7 @@ export default function MeshSection() {
           </details>
         </>
       )}
+      <MeshMethodPanel1d />
       {form.main.dimension !== "2D_RZ" && (
         <>
           <h2 className="mt-3 text-sm font-semibold">{m.form.regionsTitle}</h2>
@@ -339,7 +342,8 @@ export default function MeshSection() {
           )}
         </>
       )}
-      <MeshMassChart form={form} />
+      {form.main.dimension === "1D_SPH" && <MeshDiagnostics form={form} />}
+      {form.main.dimension === "1D_SPH" && <ConvergencePairPanel />}
       {form.main.dimension === "2D_RZ" && (
         <>
           <h2 className="mt-3 text-sm font-semibold">{m.geo2d.shapesTitle}</h2>

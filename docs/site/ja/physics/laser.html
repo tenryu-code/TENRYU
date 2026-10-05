@@ -91,6 +91,7 @@
       <p>を半径について積分すればよい（\(\phi\) は子午面内の極角）。経路はレーザー格子の半径節点と流体セルの面などで区間に区切り、各区間の中で転回点（\(Q=0\)）、臨界、中心を事象として厳密に求める。区間の光路長・角度・光学的厚さは適応 Gauss–Kronrod 求積で求め、転回点（半径 \(r_t\)）の近くでは \(u=\sqrt{r-r_t}\) を変数にして \(1/\sqrt Q\) の特異性を取り除く。各区間はひとつの流体セルに収まるので、吸収はそのセルへ直接入る。行進の刻み幅による誤差と、転回点に近づくと刻みが細かくなる負荷がない。</p>
       <p>この積分器では、臨界半径（\(\hat n=1-\varepsilon_{\rm crit}\)、\(\varepsilon_{\rm crit}\) は <code>Laser.absorption.eps_crit</code>）に達した光線は既定で反射し（<code>Laser.absorption.critical_handling.terminate=False</code>）、同じ区間を外向きにたどって往復で吸収される。<code>terminate=True</code> では、行進と同じく臨界層の裾を解析的に閉じて終端する。1D の円筒・平面（<code>Mesh.geometry_1d</code>）でも同じ形で、円筒では断面内の角運動量と軸方向の速度、平面では横方向の速度が保存量になる（ビームの <code>power</code> は円筒で単位長さ、平面で単位面積あたり）。</p>
       <p>GPU では 1 本の光線を 32・64・128・256 レーンで追跡し、各レーンが経路に沿った 1 区間を受け持つ（<code>Laser.raytrace.lanes_per_ray</code>。既定の 0 は、全光線 × レーン数が GPU の同時に動かせるスレッド数に収まる最大の幅を選び、収まらなければ 32）。和の順序がレーン数で変わるので結果の丸めはレーン数によるが、同じ GPU・同じ光線数なら run の反復はビット一致する。別の種類の GPU とビットで比べるときはレーン数を固定する。</p>
+      <p>光線は内向きと外向きで同じ区間を通り、区間の光路長・角度・光学的厚さは半径の区間だけで決まるので、外向きの区間は内向きで求めた値をそのまま使う（<code>Laser.raytrace.reuse_inward_integrals</code>、既定 <code>True</code>）。臨界半径で反射する光線では、求積し直した場合とビット単位で同じ結果になる。転回点で折り返す光線では、転回点から離れた区間を内向きは \(r\)、外向きは \(u=\sqrt{r-r_t}\) を変数として求積していたので、同じ積分を同じ許容誤差（区間の \(10^{-7}\) 倍）で求めた別の値に置き換わり、Langdon 因子を評価する吸収の重心も区間幅の 2 次の大きさで動く。GXII の 1D の爆縮では、結果の差は初期の時間刻みやレーザーエネルギーを 12 桁目で変えた計算どうしのばらつきと同じ大きさで、計算時間は 7〜12 % 短くなる。値の表に GPU のメモリを区間 1 つあたり 72 バイト × 光線数だけ使う（300 セル・1000 光線で約 100 MiB）。<code>False</code> では外向きの区間も求積する。</p>
     </section>
 
     <section aria-labelledby="pipeline">
@@ -139,6 +140,7 @@
           <tr><th><code>Laser.rays_per_beam</code></th><td>1D 既定 1000、2D 既定 128</td><td>1D では環の数、2D ではビーム断面配列の 1 辺の点数。</td></tr>
           <tr><th><code>Laser.raytrace.integrator</code></th><td><code>"auto"</code></td><td>1D の光線の積分器。<code>"auto"</code> は 1D で特性曲線積分（<code>"characteristic"</code>）、それ以外で行進（<code>"leapfrog"</code>）。</td></tr>
           <tr><th><code>Laser.raytrace.lanes_per_ray</code></th><td><code>0</code></td><td>特性曲線積分で 1 本の光線を追跡するレーン数（32・64・128・256）。0 は光線数と GPU から自動で選ぶ。</td></tr>
+          <tr><th><code>Laser.raytrace.reuse_inward_integrals</code></th><td><code>True</code></td><td>特性曲線積分で、外向きの区間に内向きで求めた積分を使う。<code>False</code> では外向きも求積する（2026-10-03 より前と同じ結果）。</td></tr>
           <tr><th><code>Laser.absorption.critical_handling.terminate</code></th><td>特性曲線積分で <code>False</code>（<code>terminate_mode="deposit"</code> では <code>True</code>）、ほかは <code>True</code></td><td><code>False</code> では臨界半径で光線を反射させる（特性曲線積分のみ）。</td></tr>
           <tr><th><code>Laser.beams[]</code></th><td>1 本以上</td><td>各ビームの <code>direction</code>、<code>power</code>、<code>f_number</code>、焦点・デフォーカスを定義する。</td></tr>
           <tr><th><code>Laser.beams[].profile</code></th><td><code>w0_um</code>, <code>m</code></td><td><code>super_gaussian</code> による横方向の強度分布。\(m=1\) はガウス型である。</td></tr>

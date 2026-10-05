@@ -1,3 +1,7 @@
+// TENRYU Studio carries a TypeScript copy of this zoning (gui/src/core/deck/zoningIntent.ts) to draw
+// a zoning_intent's mesh without running the solver. gui/test/zoningIntent.test.ts holds a digest
+// of this file and zoning_intent.hpp and fails after a change here until the copy and its fixtures
+// (gui/scripts/zoningIntentGolden.cpp, gui/scripts/presetZoningNodes.py) are brought in step.
 #include "core/zoning_intent.hpp"
 
 #include <algorithm>

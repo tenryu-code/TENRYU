@@ -357,6 +357,9 @@ struct PersistentDeviceBuffers {
   double* laser_piece_r = nullptr;
   int* laser_piece_ints = nullptr;
   int laser_piece_capacity = 0;
+  // The inward legs' piece integrals (Laser.raytrace.reuse_inward_integrals):
+  // one row of laser_piece_capacity entries per ray, nullptr when off.
+  laser::ray_trace_bodies::InwardPieceIntegrals* laser_inward_cache = nullptr;
   double* laser_cell_n_hat = nullptr;
   double* laser_widths = nullptr;
   std::uint8_t* laser_cell_is_void = nullptr;
@@ -2631,7 +2634,11 @@ __device__ void persistent_laser_raytrace_1d_folded(
           b.laser_critical_surface_hit_count, b.laser_error_flags,
           laser::CbetRecordDeviceArgs{}, laser::HotECaptureParams{}, nullptr,
           laser::LaserPhysExtOptions{}, nullptr, nullptr, nullptr, 0,
-          p.laser_reflect_at_critical);
+          p.laser_reflect_at_critical, 0, nullptr,
+          b.laser_inward_cache != nullptr
+              ? b.laser_inward_cache + static_cast<std::size_t>(ray) *
+                                           static_cast<std::size_t>(b.laser_piece_capacity)
+              : nullptr);
     }
   }
   for (int ray = pk_thread_id(p);
@@ -5006,6 +5013,13 @@ PersistentDeviceBuffers make_buffers(core::State& state,
       b.laser_piece_ints = acquire_device_buffer<int>(
           "persistent_laser:piece_ints",
           2U * static_cast<std::size_t>(b.laser_piece_capacity) + 1U);
+      if (cfg.laser.raytrace.reuse_inward_integrals) {
+        b.laser_inward_cache =
+            acquire_device_buffer<laser::ray_trace_bodies::InwardPieceIntegrals>(
+                "persistent_laser:inward_cache",
+                static_cast<std::size_t>(n_rays) *
+                    static_cast<std::size_t>(b.laser_piece_capacity));
+      }
       b.laser_cell_n_hat = acquire_device_buffer<double>(
           "persistent_laser:cell_n_hat", n_cells);
       b.laser_widths = acquire_device_buffer<double>(

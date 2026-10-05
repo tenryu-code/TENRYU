@@ -1000,6 +1000,7 @@ py::dict serialize_laser(const Config::LaserConfig& laser) {
   raytrace["integrator"] = laser.raytrace.integrator;
   raytrace["azimuthal_rays"] = laser.raytrace.azimuthal_rays;
   raytrace["lanes_per_ray"] = laser.raytrace.lanes_per_ray;
+  raytrace["reuse_inward_integrals"] = laser.raytrace.reuse_inward_integrals;
   raytrace["test_kappa"] = laser.raytrace.test_kappa;
   raytrace["ds_adapt_g_target"] = laser.raytrace.ds_adapt_g_target;
   raytrace["ds_adapt_tau_target"] = laser.raytrace.ds_adapt_tau_target;
@@ -2722,192 +2723,6 @@ py::dict serialize_numerics(const Config::NumericsConfig& numerics) {
   materials["conservation_residual_hard_warning_threshold_rel"] =
       numerics.materials.conservation_residual_hard_warning_threshold_rel;
 
-  auto serialize_tol = [](const auto& tol) {
-    py::dict out;
-    out["soft"] = tol.soft;
-    out["hard"] = tol.hard;
-    return out;
-  };
-
-  py::dict ale1d;
-  ale1d["enabled"] = numerics.ale1d.enabled;
-  ale1d["every_n_steps"] = numerics.ale1d.every_n_steps;
-  ale1d["min_steps_between_ale"] = numerics.ale1d.min_steps_between_ale;
-  ale1d["enable_benefit_gate"] = numerics.ale1d.enable_benefit_gate;
-  ale1d["benefit_min_dt_gain"] = numerics.ale1d.benefit_min_dt_gain;
-  ale1d["candidate_dt_penalty_max"] =
-      numerics.ale1d.candidate_dt_penalty_max;
-  ale1d["emergency_enabled"] = numerics.ale1d.emergency_enabled;
-  ale1d["emergency_max_dr_ratio"] = numerics.ale1d.emergency_max_dr_ratio;
-  ale1d["min_cells"] = numerics.ale1d.min_cells;
-  ale1d["protected_fraction_max"] = numerics.ale1d.protected_fraction_max;
-  ale1d["min_movable_segment_warn"] =
-      numerics.ale1d.min_movable_segment_warn;
-  ale1d["min_movable_segment_hard"] =
-      numerics.ale1d.min_movable_segment_hard;
-  ale1d["max_node_displacement_fraction_mu"] =
-      numerics.ale1d.max_node_displacement_fraction_mu;
-  ale1d["max_node_displacement_fraction_r"] =
-      numerics.ale1d.max_node_displacement_fraction_r;
-  ale1d["ke_conservation_closure"] =
-      numerics.ale1d.ke_conservation_closure;
-  ale1d["total_mass_tol"] = serialize_tol(numerics.ale1d.total_mass_tol);
-  ale1d["material_mass_tol"] = serialize_tol(numerics.ale1d.material_mass_tol);
-  ale1d["radiation_group_energy_tol"] =
-      serialize_tol(numerics.ale1d.radiation_group_energy_tol);
-  ale1d["material_internal_energy_tol"] =
-      serialize_tol(numerics.ale1d.material_internal_energy_tol);
-  ale1d["total_material_energy_tol"] =
-      serialize_tol(numerics.ale1d.total_material_energy_tol);
-  ale1d["global_total_energy_tol"] =
-      serialize_tol(numerics.ale1d.global_total_energy_tol);
-  ale1d["kinetic_energy_drift_tol"] =
-      serialize_tol(numerics.ale1d.kinetic_energy_drift_tol);
-  ale1d["diagnostics_enabled"] = numerics.ale1d.diagnostics_enabled;
-  ale1d["diagnostics_log_every_n_steps"] =
-      numerics.ale1d.diagnostics_log_every_n_steps;
-  ale1d["diagnostics_collect_step_result"] =
-      numerics.ale1d.diagnostics_collect_step_result;
-  ale1d["diagnostics_fail_on_unexpected_apply"] =
-      numerics.ale1d.diagnostics_fail_on_unexpected_apply;
-  py::dict laser_sensor;
-  laser_sensor["enabled"] = numerics.ale1d.laser_sensor.enabled;
-  laser_sensor["target_cells_fraction"] =
-      numerics.ale1d.laser_sensor.target_cells_fraction;
-  laser_sensor["sigma_min_cells"] = numerics.ale1d.laser_sensor.sigma_min_cells;
-  laser_sensor["sigma_max_cells"] = numerics.ale1d.laser_sensor.sigma_max_cells;
-  laser_sensor["peak_fraction"] = numerics.ale1d.laser_sensor.peak_fraction;
-  laser_sensor["conf_low"] = numerics.ale1d.laser_sensor.conf_low;
-  laser_sensor["conf_high"] = numerics.ale1d.laser_sensor.conf_high;
-  ale1d["laser_sensor"] = laser_sensor;
-
-  py::dict ablation_sensor;
-  ablation_sensor["enabled"] = numerics.ale1d.ablation_sensor.enabled;
-  ablation_sensor["target_cells_fraction"] =
-      numerics.ale1d.ablation_sensor.target_cells_fraction;
-  ablation_sensor["sigma_min_cells"] =
-      numerics.ale1d.ablation_sensor.sigma_min_cells;
-  ablation_sensor["sigma_max_cells"] =
-      numerics.ale1d.ablation_sensor.sigma_max_cells;
-  ablation_sensor["peak_fraction"] =
-      numerics.ale1d.ablation_sensor.peak_fraction;
-  ablation_sensor["reference_density_gcc"] =
-      numerics.ale1d.ablation_sensor.reference_density_gcc;
-  ablation_sensor["rho_gate_frac"] =
-      numerics.ale1d.ablation_sensor.rho_gate_frac;
-  ablation_sensor["rho_gate_width"] =
-      numerics.ale1d.ablation_sensor.rho_gate_width;
-  ablation_sensor["te_gate_low_eV"] =
-      numerics.ale1d.ablation_sensor.te_gate_low_eV;
-  ablation_sensor["te_gate_high_eV"] =
-      numerics.ale1d.ablation_sensor.te_gate_high_eV;
-  ablation_sensor["conf_low"] = numerics.ale1d.ablation_sensor.conf_low;
-  ablation_sensor["conf_high"] = numerics.ale1d.ablation_sensor.conf_high;
-  ale1d["ablation_sensor"] = ablation_sensor;
-
-  py::dict shock_sensor;
-  shock_sensor["enabled"] = numerics.ale1d.shock_sensor.enabled;
-  shock_sensor["target_cells_fraction"] =
-      numerics.ale1d.shock_sensor.target_cells_fraction;
-  shock_sensor["sigma_min_cells"] = numerics.ale1d.shock_sensor.sigma_min_cells;
-  shock_sensor["sigma_max_cells"] = numerics.ale1d.shock_sensor.sigma_max_cells;
-  shock_sensor["peak_fraction"] = numerics.ale1d.shock_sensor.peak_fraction;
-  shock_sensor["qvisc_conf_low"] = numerics.ale1d.shock_sensor.qvisc_conf_low;
-  shock_sensor["qvisc_conf_high"] = numerics.ale1d.shock_sensor.qvisc_conf_high;
-  shock_sensor["du_cs_conf_low"] = numerics.ale1d.shock_sensor.du_cs_conf_low;
-  shock_sensor["du_cs_conf_high"] = numerics.ale1d.shock_sensor.du_cs_conf_high;
-  ale1d["shock_sensor"] = shock_sensor;
-
-  py::dict interface_sensor;
-  interface_sensor["enabled"] = numerics.ale1d.interface_sensor.enabled;
-  interface_sensor["target_cells_fraction"] =
-      numerics.ale1d.interface_sensor.target_cells_fraction;
-  interface_sensor["target_cells_cap_fraction"] =
-      numerics.ale1d.interface_sensor.target_cells_cap_fraction;
-  interface_sensor["max_features"] = numerics.ale1d.interface_sensor.max_features;
-  interface_sensor["min_separation_cells"] =
-      numerics.ale1d.interface_sensor.min_separation_cells;
-  interface_sensor["jump_low"] = numerics.ale1d.interface_sensor.jump_low;
-  interface_sensor["jump_high"] = numerics.ale1d.interface_sensor.jump_high;
-  interface_sensor["sigma_min_cells"] =
-      numerics.ale1d.interface_sensor.sigma_min_cells;
-  interface_sensor["sigma_max_cells"] =
-      numerics.ale1d.interface_sensor.sigma_max_cells;
-  interface_sensor["pin_interfaces"] =
-      numerics.ale1d.interface_sensor.pin_interfaces;
-  ale1d["interface_sensor"] = interface_sensor;
-
-  py::dict center_sensor;
-  center_sensor["enabled"] = numerics.ale1d.center_sensor.enabled;
-  center_sensor["target_cells_fraction"] =
-      numerics.ale1d.center_sensor.target_cells_fraction;
-  center_sensor["sigma_min_cells"] = numerics.ale1d.center_sensor.sigma_min_cells;
-  center_sensor["sigma_max_cells"] = numerics.ale1d.center_sensor.sigma_max_cells;
-  center_sensor["search_x"] = numerics.ale1d.center_sensor.search_x;
-  ale1d["center_sensor"] = center_sensor;
-
-  py::dict ale1d_rezone;
-  ale1d_rezone["monitor_floor"] = numerics.ale1d.rezone.monitor_floor;
-  ale1d_rezone["monitor_wmax_ratio"] =
-      numerics.ale1d.rezone.monitor_wmax_ratio;
-  ale1d_rezone["monitor_smoothing_iterations"] =
-      numerics.ale1d.rezone.monitor_smoothing_iterations;
-  ale1d_rezone["monitor_smooth_across_protected_faces"] =
-      numerics.ale1d.rezone.monitor_smooth_across_protected_faces;
-  ale1d_rezone["min_floor_fraction"] =
-      numerics.ale1d.rezone.min_floor_fraction;
-  ale1d_rezone["gaussian_truncation_sigma"] =
-      numerics.ale1d.rezone.gaussian_truncation_sigma;
-  ale1d_rezone["spatial_monitor_enabled"] =
-      numerics.ale1d.rezone.spatial_monitor_enabled;
-  ale1d_rezone["spatial_target_cells_fraction"] =
-      numerics.ale1d.rezone.spatial_target_cells_fraction;
-  ale1d_rezone["spatial_power"] = numerics.ale1d.rezone.spatial_power;
-  ale1d_rezone["laser_spatial_dr_min_cm"] =
-      numerics.ale1d.rezone.laser_spatial_dr_min_cm;
-  ale1d_rezone["laser_spatial_dr_max_cm"] =
-      numerics.ale1d.rezone.laser_spatial_dr_max_cm;
-  ale1d_rezone["ablation_spatial_dr_min_cm"] =
-      numerics.ale1d.rezone.ablation_spatial_dr_min_cm;
-  ale1d_rezone["ablation_spatial_dr_max_cm"] =
-      numerics.ale1d.rezone.ablation_spatial_dr_max_cm;
-  ale1d_rezone["shock_spatial_dr_min_cm"] =
-      numerics.ale1d.rezone.shock_spatial_dr_min_cm;
-  ale1d_rezone["shock_spatial_dr_max_cm"] =
-      numerics.ale1d.rezone.shock_spatial_dr_max_cm;
-  ale1d["rezone"] = ale1d_rezone;
-
-  py::dict ale1d_min_width_floor;
-  ale1d_min_width_floor["enabled"] =
-      numerics.ale1d.min_width_floor.enabled;
-  ale1d_min_width_floor["floor_cm"] =
-      numerics.ale1d.min_width_floor.floor_cm;
-  ale1d_min_width_floor["target_factor"] =
-      numerics.ale1d.min_width_floor.target_factor;
-  ale1d_min_width_floor["relief_halfwidth_cells"] =
-      numerics.ale1d.min_width_floor.relief_halfwidth_cells;
-  ale1d_min_width_floor["max_growth_factor"] =
-      numerics.ale1d.min_width_floor.max_growth_factor;
-  ale1d_min_width_floor["retrigger_cooldown_steps"] =
-      numerics.ale1d.min_width_floor.retrigger_cooldown_steps;
-  ale1d["min_width_floor"] = ale1d_min_width_floor;
-
-  py::dict ale1d_remap;
-  ale1d_remap["reject_multicell_sweeps"] =
-      numerics.ale1d.remap.reject_multicell_sweeps;
-  ale1d_remap["high_order_enabled"] =
-      numerics.ale1d.remap.high_order_enabled;
-  ale1d_remap["limiter_theta"] = numerics.ale1d.remap.limiter_theta;
-  ale1d_remap["high_order_ramp_cells"] =
-      numerics.ale1d.remap.high_order_ramp_cells;
-  ale1d_remap["radiation_high_order_ramp_cells"] =
-      numerics.ale1d.remap.radiation_high_order_ramp_cells;
-  ale1d_remap["fallback_to_first_order_on_bounds_fail"] =
-      numerics.ale1d.remap.fallback_to_first_order_on_bounds_fail;
-  ale1d_remap["reject_strict_zero_flux_on_moving_protected_face"] =
-      numerics.ale1d.remap.reject_strict_zero_flux_on_moving_protected_face;
-  ale1d["remap"] = ale1d_remap;
-
   py::dict floors;
   floors["rho"] = numerics.floors.rho;
   floors["Te"] = numerics.floors.Te;
@@ -3212,7 +3027,6 @@ py::dict serialize_numerics(const Config::NumericsConfig& numerics) {
   out["ale"] = ale;
   out["plic"] = plic;
   out["materials"] = materials;
-  out["ale1d"] = ale1d;
   out["floors"] = floors;
   out["positivity_clamp"] = numerics.positivity_clamp;
   out["safety"] = safety;
@@ -3800,6 +3614,8 @@ void apply_current_defaults(py::dict& root) {
       const Config::LaserConfig::RaytraceConfig raytrace_defaults;
       set_default_if_missing(raytrace, "lanes_per_ray",
                              py::cast(raytrace_defaults.lanes_per_ray));
+      set_default_if_missing(raytrace, "reuse_inward_integrals",
+                             py::cast(raytrace_defaults.reuse_inward_integrals));
     }
   }
   py::dict radiation;
@@ -4151,34 +3967,6 @@ void apply_legacy_numerics_defaults(py::dict& root) {
         persistent_loop,
         "chunk_steps",
         py::cast(persistent_loop_defaults.chunk_steps));
-  }
-
-  // Numerics.ale1d keys added after the V3 introduction: a legacy frozen
-  // config takes the struct defaults (min_width_floor 2026-08-07 and its
-  // retrigger_cooldown_steps 2026-08-10, emergency_max_dr_ratio 2026-09-23),
-  // so a restart from an older checkpoint compares equal.
-  py::dict ale1d;
-  if (try_get_child_dict(numerics, "ale1d", &ale1d)) {
-    const Config::NumericsConfig::Ale1dConfig ale1d_defaults;
-    set_default_if_missing(ale1d, "emergency_max_dr_ratio",
-                           py::cast(ale1d_defaults.emergency_max_dr_ratio));
-    if (!dict_contains(ale1d, "min_width_floor")) {
-      ale1d[py::str("min_width_floor")] = py::dict();
-    }
-    py::dict min_width_floor;
-    if (try_get_child_dict(ale1d, "min_width_floor", &min_width_floor)) {
-      const auto& floor_defaults = ale1d_defaults.min_width_floor;
-      set_default_if_missing(min_width_floor, "enabled", py::cast(floor_defaults.enabled));
-      set_default_if_missing(min_width_floor, "floor_cm", py::cast(floor_defaults.floor_cm));
-      set_default_if_missing(min_width_floor, "target_factor",
-                             py::cast(floor_defaults.target_factor));
-      set_default_if_missing(min_width_floor, "relief_halfwidth_cells",
-                             py::cast(floor_defaults.relief_halfwidth_cells));
-      set_default_if_missing(min_width_floor, "max_growth_factor",
-                             py::cast(floor_defaults.max_growth_factor));
-      set_default_if_missing(min_width_floor, "retrigger_cooldown_steps",
-                             py::cast(floor_defaults.retrigger_cooldown_steps));
-    }
   }
 
   py::dict z_reflection;
@@ -6709,6 +6497,16 @@ void remove_retired_monte_carlo_radiation_keys(py::dict& root) {
   }
 }
 
+// The 1D ALE (Numerics.ale1d) left the build on 2026-10-02 (retired/ale_1d/). A deck with
+// Numerics.ale1d.enabled=True is refused, so a checkpoint whose run can be continued had it disabled, and its
+// frozen configuration compares equal to a current configuration without the section.
+void remove_retired_ale_1d_keys(py::dict& root) {
+  py::dict numerics;
+  if (try_get_child_dict(root, "numerics", &numerics)) {
+    numerics.attr("pop")(py::str("ale1d"), py::none());
+  }
+}
+
 void apply_checkpoint_migrations(py::dict& root) {
   int schema_version = read_schema_version_or_default(root, kCheckpointJsonSchemaV1);
   if (schema_version <= 0) {
@@ -6844,6 +6642,7 @@ void apply_checkpoint_migrations(py::dict& root) {
   apply_current_defaults(root);
   remove_retired_terminal_takeover_keys(root);
   remove_retired_monte_carlo_radiation_keys(root);
+  remove_retired_ale_1d_keys(root);
   normalize_mesh_default_elision(root);
 }
 

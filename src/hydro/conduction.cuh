@@ -134,6 +134,13 @@ double effective_diffusion(double q_limited,
                            double eps_grad);
 int sts_stage_count(double dt, double dt_exp, int sts_max_stages);
 
+// The 1D implicit solve's diagnostics on the device (conduction_step_1d_implicit, NUMERICS §4): from
+// the staged tridiagonal system d_stage = [lower | diag | upper | rhs | x] (n values each),
+// d_out[0] = ||A x - b|| / ||b|| (||A x - b|| when ||b|| = 0, products and sums in double-double)
+// and d_out[1] = max|d| / min|d| over the finite nonzero diagonal entries (0 when there are none).
+// One block on the default stream; nothing is launched when n <= 0.
+void implicit_solve_diagnostics_device(const double* d_stage, int n, double* d_out);
+
 // The 1D per-material path's cell coefficients (NUMERICS §4.1.1), host copies of n_cells values: the cells'
 // conductivities (the materials' conductivities weighted by their volume fractions and summed), rho c_v,e, and the
 // charge and mass that the face flux limiter uses for the cell's electron density; dt_exp the explicit conduction limit.

@@ -2,120 +2,21 @@ import { defaultFormState, ensureBackgroundGas, type FormState } from "./deck/fo
 import { defaultShape2D } from "./geometry2d";
 import { q } from "./units";
 
-export interface PresetDef {
-  key:
-    | "blank"
-    | "slab"
-    | "laserSphere"
-    | "indirect"
-    | "blank2d"
-    | "polarSphere2d"
-    | "polarCapsule2d"
-    | "slabRad2d"
-    | "laserCyl2d";
-  build: () => FormState;
-}
-
-function logspaceBounds(loEV: number, hiEV: number, nGroups: number): number[] {
-  const out: number[] = [];
-  const a = Math.log10(loEV);
-  const b = Math.log10(hiEV);
-  for (let i = 0; i <= nGroups; i++) out.push(10 ** (a + ((b - a) * i) / nGroups));
-  return out;
-}
-
-export function presetBlank(): FormState {
-  return defaultFormState();
-}
-
-/** 平面 1D 放射スラブ: 灰色 FLD + Marshak 120 eV、流体 OFF。
- *  κ=2000 cm²/g・cv_e_override=3e11 erg/(cm³·eV)（体積あたり）で 1 ns に壁 ~104 eV・前線 ~35 µm・前方冷域が立つ実証済み構成。 */
-export function presetSlabRadiation(): FormState {
-  const f = defaultFormState();
-  f.main.name = "slab_radiation";
-  f.main.geometry1d = "planar";
-  f.main.temperatureModel = "1T";
-  f.main.tEnd = q(1.0, "ns");
-  f.mesh.rMax = q(0.01, "cm");
-  f.mesh.nr = 200;
-  f.materials[0].name = "ch_slab";
-  f.materials[0].cvEOverride = 3.0e11;
-  f.materials[0].kappaA = 2000.0;
-  f.geometry.regions[0].materialName = "ch_slab";
-  f.geometry.regions[0].rOuter = q(0.01, "cm");
-  f.geometry.regions[0].rho = 0.2;
-  f.geometry.radiationField = "zero";
-  f.radiation.outerR = "marshak";
-  f.radiation.marshakMode = "constant";
-  f.radiation.marshakTrEV = 120.0;
-  f.hydro.enabled = false;
-  f.conduction.enabled = false;
-  f.numerics.floors.TeFloorEV = 1.0;
-  f.numerics.floors.TiFloorEV = 1.0;
-  return f;
-}
-
-/** 球 1D 直接照射カプセル (GXII 検証レジーム): DT ガス + CH シェル + コロナ ramp + VOID 外側、
- *  raytrace 10 TW × 1 ns。gxii_1d_fld_regression と同一の物理条件系。 */
-export function presetLaserSphere(): FormState {
-  const f = defaultFormState();
-  f.main.name = "laser_capsule";
-  f.main.maxSteps = 2_000_000;
-  f.mesh.nr = 200;
-  f.materials = [
-    { name: "CH", A: 6.5, Z: 3.5, eosModel: "ideal_gas", gamma: 5 / 3, cvEOverride: undefined, eosFile: "", opacityModel: "constant", kappaA: 100.0, kappaS: 0.0, opacityFile: "" },
-    { name: "DT", A: 2.5, Z: 1.0, eosModel: "ideal_gas", gamma: 5 / 3, cvEOverride: undefined, eosFile: "", opacityModel: "constant", kappaA: 100.0, kappaS: 0.0, opacityFile: "" },
-  ];
-  f.geometry.regions = [
-    { materialName: "DT", rOuter: q(230, "µm"), rho: 0.010, Te: q(0.025, "eV"), Ti: q(0.025, "eV") },
-    { materialName: "CH", rOuter: q(250, "µm"), rho: 1.05, Te: q(0.025, "eV"), Ti: q(0.025, "eV") },
-  ];
-  f.geometry.vacuumOutside1d = true;
-  f.geometry.coronaRamp1d = { enabled: true, scaleUm: 2.0, extentUm: 10.0, rho0: 0.05, rhoMin: 3.0e-4 };
-  f.radiation.groups = 20;
-  f.radiation.groupBoundsEV = logspaceBounds(0.01, 100.0, 20);
-  f.laser.enabled = true;
-  f.laser.mode = "raytrace_2d";
-  f.laser.powerW = q(10.0, "TW");
-  f.laser.pulseDuration = q(1.0, "ns");
-  f.laser.riseTime = q(10, "ps");
-  f.laser.fallTime = q(10, "ps");
-  f.laser.beams[0].fNumber = 3.0;
-  f.laser.beams[0].w0Um = 200.0;
-  f.numerics.dtInitial = q(1e-15, "s");
-  f.numerics.dtMax = q(1e-11, "s");
-  return f;
-}
-
-/** 球 1D 間接照射 (テンプレ③ 相当): Tr(t) 折れ線 Marshak 駆動、fuel+ablator。 */
-export function presetIndirectTr(): FormState {
-  const f = defaultFormState();
-  f.main.name = "indirect_tr";
-  f.main.tEnd = q(5.0, "ns");
-  f.mesh.rMax = q(0.033, "cm");
-  f.mesh.nr = 200;
-  f.materials = [
-    { name: "fuel", A: 2.5, Z: 1.0, eosModel: "ideal_gas", gamma: 5 / 3, cvEOverride: undefined, eosFile: "", opacityModel: "constant", kappaA: 1.0, kappaS: 0.0, opacityFile: "" },
-    { name: "ablator", A: 6.5, Z: 3.5, eosModel: "ideal_gas", gamma: 5 / 3, cvEOverride: undefined, eosFile: "", opacityModel: "constant", kappaA: 2000.0, kappaS: 0.0, opacityFile: "" },
-  ];
-  f.geometry.regions = [
-    { materialName: "fuel", rOuter: q(300, "µm"), rho: 0.01, Te: q(1e-3, "eV"), Ti: q(1e-3, "eV") },
-    { materialName: "ablator", rOuter: q(0.033, "cm"), rho: 1.05, Te: q(1e-3, "eV"), Ti: q(1e-3, "eV") },
-  ];
-  f.geometry.radiationField = "zero";
-  f.radiation.outerR = "marshak";
-  f.radiation.marshakMode = "table";
-  f.radiation.marshakPoints = [
-    { t: 0, v: 120 },
-    { t: 0.5, v: 120 },
-    { t: 1, v: 200 },
-    { t: 5, v: 200 },
-  ];
-  f.numerics.dtInitial = q(1e-15, "s");
-  f.numerics.floors.TeFloorEV = 1e-3;
-  f.numerics.floors.TiFloorEV = 1e-3;
-  return f;
-}
+// 1D presets: presets1d.ts.
+export {
+  presetBlank,
+  presetBurnPusher,
+  presetCbetHotElectrons,
+  presetColdEquilibriumLayers,
+  presetIndirectCapsule,
+  presetLaserFoil,
+  presetLaserShell,
+  presetMarshakWave,
+  presetPressureShock,
+  presetSnbFoil,
+  presetSnRadiationFoil,
+  presetTableRadiationFoil,
+} from "./presets1d";
 
 export function preset2dBlank(): FormState {
   const f = defaultFormState();

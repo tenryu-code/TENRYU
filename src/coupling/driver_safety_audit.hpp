@@ -1,5 +1,8 @@
 #pragma once
 
+#include <cstdint>
+#include <vector>
+
 #include "core/state.hpp"
 
 namespace tenryu::coupling {
@@ -63,5 +66,14 @@ DeviceTemperatureAudit audit_temperatures_host(const core::State& state);
 // the boolean is bit-equivalent for any scheduling.
 bool all_active_cells_collapsed_device(const core::State& state,
                                        double te_floor);
+
+// Device twin of update_hydro_active's temperature rule: the cells inactive in the
+// State's device mirror of hydro_active whose Te >= t_start_eV (the host
+// comparison: a NaN Te stays inactive). Returns their number (one small copy to
+// the host); when it is nonzero, reached (n_cells) holds 1 for those cells and 0
+// elsewhere, else it is left empty.
+int hydro_active_t_start_reached_device(const core::State& state,
+                                        double t_start_eV,
+                                        std::vector<std::uint8_t>& reached);
 
 }  // namespace tenryu::coupling

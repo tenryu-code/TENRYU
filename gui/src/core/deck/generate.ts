@@ -15,6 +15,7 @@ import {
 import { t } from "../../i18n";
 import { BEAM_PRESETS } from "./beamPresets";
 import { generateImportedDeck } from "./deckImport";
+import { emitExplicitMesh, emitZoningIntentMesh } from "./meshEmit";
 
 export class GeneratorError extends Error {}
 
@@ -197,6 +198,10 @@ export function generateDeck(f: FormState): string {
     L.push('    grid="uniform", motion="lagrangian",');
     L.push("))");
     L.push("Mesh(**MESH_KW)");
+  } else if (!is2d && (f.mesh.grid1d === "recommended" || f.mesh.grid1d === "zoning_intent")) {
+    L.push(...emitZoningIntentMesh(f, numC(cm(f.mesh.rMin), f.mesh.rMin), numC(cm(f.mesh.rMax), f.mesh.rMax)));
+  } else if (!is2d && (f.mesh.grid1d === "layers" || f.mesh.grid1d === "explicit")) {
+    L.push(...emitExplicitMesh(f));
   } else {
     L.push("Mesh(");
     L.push(`    r_min=${numC(cm(f.mesh.rMin), f.mesh.rMin)}`);
@@ -544,8 +549,9 @@ export function generateDeck(f: FormState): string {
     cn.nonlocalModel === "snb"
       ? `, nonlocal_model="snb", snb_n_groups=${pyNum(cn.snbNGroups)}, snb_E_max_over_Te=${pyNum(cn.snbEMaxOverTe)}, snb_mfp=${pyStr(cn.snbMfp)}, snb_efield=${pyStr(cn.snbEfield)}, snb_picard_max_iters=${pyNum(cn.snbPicardMaxIters)}, snb_picard_rtol=${pyNum(cn.snbPicardRtol)}`
       : "";
+  const condSolver = !is2d && cn.solver === "implicit" ? `, solver="implicit"` : "";
   L.push(
-    `    conduction=dict(enabled=${pyBool(cn.enabled)}, f_lim=${pyNum(cn.fLim)}${ionCond}${snb}),`,
+    `    conduction=dict(enabled=${pyBool(cn.enabled)}${condSolver}, f_lim=${pyNum(cn.fLim)}${ionCond}${snb}),`,
   );
   const flo = f.numerics.floors;
   L.push(
@@ -710,6 +716,31 @@ export function generateDeck(f: FormState): string {
       );
       L.push("    ray_output_trajectory=True,");
       L.push(`    ray_output_count=${pyNum(rayOutputCount)},`);
+    }
+    if (!is2d && f.laser.ghostCorona.enabled) {
+      const gc = f.laser.ghostCorona;
+      L.push("    lasermesh=dict(");
+      L.push(`        mesh_factor=${pyNum(gc.meshFactor)},`);
+      L.push(`        rmax_n_hat_threshold=${pyNum(gc.rmaxNHatThreshold)},`);
+      L.push("        ghost_corona=dict(");
+      L.push(
+        `            enabled=True, n_out=${pyNum(gc.nOut)}, ne_min_frac=${pyNum(gc.neMinFrac)}, ne_max_frac=${pyNum(gc.neMaxFrac)},`,
+      );
+      L.push(`            Te_min_eV=${pyNum(gc.TeMinEV)}, zbar_min=${pyNum(gc.zbarMin)}, zbar_max=${pyNum(gc.zbarMax)},`);
+      L.push(
+        `            handoff_cells=${pyNum(gc.handoffCells)}, handoff_decay=${pyNum(gc.handoffDecay)}, transition_enabled=${pyBool(gc.transitionEnabled)},`,
+      );
+      L.push(
+        `            transition_resolved_nhat=${pyNum(gc.transitionResolvedNhat)}, transition_resolved_cells=${pyNum(gc.transitionResolvedCells)},`,
+      );
+      L.push(`            transition_density_exponent=${pyNum(gc.transitionDensityExponent)},`);
+      L.push("        ),");
+      L.push("    ),");
+    }
+    if (!is2d && f.laser.depositSmoothPasses > 0) {
+      L.push(
+        `    deposit=dict(deposit_smooth_passes=${pyNum(f.laser.depositSmoothPasses)}, deposit_smooth_alpha=${pyNum(f.laser.depositSmoothAlpha)}),`,
+      );
     }
     L.push("    beams=[");
     const emittedBeams = is2d

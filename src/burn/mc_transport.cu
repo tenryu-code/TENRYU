@@ -4,7 +4,6 @@
 #include <cmath>
 #include <cstddef>
 #include <limits>
-#include <vector>
 
 #include <cub/device/device_scan.cuh>
 #include <curand_kernel.h>
@@ -458,6 +457,18 @@ __global__ void compact_kernel(
   alive_out[out] = 1U;
 }
 
+// counts[i] = 1 for a live particle i < old_count, 0 for a dead one and for i = old_count.
+__global__ void alive_counts_kernel(const int old_count,
+                                    const unsigned char* __restrict__ alive,
+                                    int* __restrict__ counts) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < old_count) {
+    counts[i] = (alive[i] != 0U) ? 1 : 0;
+  } else if (i == old_count) {
+    counts[i] = 0;
+  }
+}
+
 void compact_particles(const int old_count, int* live_count_inout,
                        double* r_p, double* mu_p, double* E_p, double* w_p,
                        int* slot_p, unsigned char* alive_p,
@@ -467,22 +478,31 @@ void compact_particles(const int old_count, int* live_count_inout,
     return;
   }
 
-  std::vector<unsigned char> alive(static_cast<std::size_t>(old_count), 0U);
-  cuda_check(cudaMemcpyAsync(alive.data(), alive_p,
-                             alive.size() * sizeof(unsigned char),
-                             cudaMemcpyDeviceToHost, stream),
-             "MC transport copy alive flags failed");
-  cuda_check(cudaStreamSynchronize(stream),
-             "MC transport alive flag synchronize failed");
-
-  std::vector<int> index(static_cast<std::size_t>(old_count), -1);
+  // The new place of every live particle, in particle order: the exclusive scan of the alive
+  // flags (its entry old_count is the live count). Only the live count comes to the host.
+  const std::size_t n_entries = static_cast<std::size_t>(old_count) + 1U;
+  int* d_counts = static_cast<int*>(
+      core::device_scratch_acquire("burn_mc:alive_counts", n_entries * sizeof(int)));
+  int* d_index = static_cast<int*>(
+      core::device_scratch_acquire("burn_mc:compaction_index", n_entries * sizeof(int)));
+  alive_counts_kernel<<<static_cast<int>((n_entries + kBlock - 1U) / kBlock), kBlock, 0,
+                        stream>>>(old_count, alive_p, d_counts);
+  cuda_check(cudaGetLastError(), "MC transport alive count kernel launch failed");
+  std::size_t scan_bytes = 0;
+  cuda_check(cub::DeviceScan::ExclusiveSum(nullptr, scan_bytes, d_counts, d_index,
+                                           old_count + 1, stream),
+             "MC transport compaction scan size query failed");
+  void* d_scan_temp = core::device_scratch_acquire("burn_mc:compaction_scan_temp",
+                                                   std::max<std::size_t>(scan_bytes, 1U));
+  cuda_check(cub::DeviceScan::ExclusiveSum(d_scan_temp, scan_bytes, d_counts, d_index,
+                                           old_count + 1, stream),
+             "MC transport compaction scan failed");
   int live_count = 0;
-  for (int i = 0; i < old_count; ++i) {
-    if (alive[static_cast<std::size_t>(i)] != 0U) {
-      index[static_cast<std::size_t>(i)] = live_count;
-      ++live_count;
-    }
-  }
+  cuda_check(cudaMemcpyAsync(&live_count, d_index + old_count, sizeof(int),
+                             cudaMemcpyDeviceToHost, stream),
+             "MC transport copy live count failed");
+  cuda_check(cudaStreamSynchronize(stream),
+             "MC transport live count synchronize failed");
   if (live_count == old_count) {
     *live_count_inout = live_count;
     return;
@@ -492,9 +512,6 @@ void compact_particles(const int old_count, int* live_count_inout,
     return;
   }
 
-  // v2 perf follow-up: replace this host-assisted path with device compaction.
-  DeviceTemp<int> d_index(static_cast<std::size_t>(old_count),
-                          "MC transport allocate compaction index failed");
   DeviceTemp<double> d_r(static_cast<std::size_t>(live_count),
                          "MC transport allocate compact r failed");
   DeviceTemp<double> d_mu(static_cast<std::size_t>(live_count),
@@ -509,13 +526,9 @@ void compact_particles(const int old_count, int* live_count_inout,
       static_cast<std::size_t>(live_count),
       "MC transport allocate compact alive failed");
 
-  cuda_check(cudaMemcpyAsync(d_index.ptr, index.data(),
-                             index.size() * sizeof(int),
-                             cudaMemcpyHostToDevice, stream),
-             "MC transport upload compaction index failed");
   const int grid = (old_count + kBlock - 1) / kBlock;
   compact_kernel<<<grid, kBlock, 0, stream>>>(
-      old_count, d_index.ptr, r_p, mu_p, E_p, w_p, slot_p, alive_p, d_r.ptr,
+      old_count, d_index, r_p, mu_p, E_p, w_p, slot_p, alive_p, d_r.ptr,
       d_mu.ptr, d_E.ptr, d_w.ptr, d_slot.ptr, d_alive.ptr);
   cuda_check(cudaGetLastError(), "MC transport compaction kernel launch failed");
 

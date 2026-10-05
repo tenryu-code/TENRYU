@@ -920,7 +920,7 @@ distance（polar family は radial arc factors、rectangular single-block は重
 
 `Numerics.diagnostics.conduction_energy_rate_export.enabled=True` では、conduction
 operator 前後の authoritative `ee` 差に operator 後の `rho` を掛けて `dt` で割った
-energy rate per volume を `hydro/conduction_e_rate` [erg/cm3/s] に出力する。この
+energy rate per volume を `hydro/conduction_e_rate` [erg/cm3/s] に出力する（前の `ee` の保持と差・積・商は device、host のループと同じ演算順、2026-10-02）。この
 operator-level difference は floor/clamp injection を構成上含む。
 
 設計 doc §18.1 items 5--8 の W3a SHADOW autopilot は、structured blocks の

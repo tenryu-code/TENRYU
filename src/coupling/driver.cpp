@@ -55,8 +55,6 @@
 #include "diagnostics/positivity_history.hpp"
 #include "diagnostics/radial_fourier_audit.hpp"
 #include "diagnostics/shock_approach.hpp"
-#include "hydro/ale_1d_driver.cuh"
-#include "hydro/ale_1d_types.cuh"
 #include "hydro/ale_gcl.hpp"
 #include "hydro/ale_axis_band_controller.cuh"
 #include "hydro/ale_driver.cuh"
@@ -198,15 +196,10 @@ double charged_species_Z(const int species) {
   return (species == burn::kHe3 || species == burn::kHe4) ? 2.0 : 1.0;
 }
 
-// Field ions of each cell (NUMERICS §14.3, §14.7): the burn inventory
-// species and the cell's non-fuel, non-void materials by volume fraction;
-// cells with neither take the configured fuel mixture Burn.x_D/x_T/x_He3.
-void burn_cell_field_ions(const core::Config& cfg,
-                          const std::vector<int>& fuel_mats,
-                          const std::vector<double>& burn_Y,
-                          const std::vector<double>& volFrac,
-                          const int n_cells,
-                          std::vector<burn::FieldIons>& out) {
+// The materials of the field-ion mixture (NUMERICS §14.7): every material
+// with its A and Z; the ions of the non-fuel, non-void ones join the field.
+std::vector<burn::FieldIonMaterial> burn_field_ion_materials(
+    const core::Config& cfg, const std::vector<int>& fuel_mats) {
   const int n_mat = static_cast<int>(cfg.materials.materials.size());
   std::vector<burn::FieldIonMaterial> materials(
       static_cast<std::size_t>(n_mat));
@@ -219,6 +212,21 @@ void burn_cell_field_ions(const core::Config& cfg,
                 std::find(fuel_mats.begin(), fuel_mats.end(), m) ==
                     fuel_mats.end();
   }
+  return materials;
+}
+
+// Field ions of each cell (NUMERICS §14.3, §14.7): the burn inventory
+// species and the cell's non-fuel, non-void materials by volume fraction;
+// cells with neither take the configured fuel mixture Burn.x_D/x_T/x_He3.
+void burn_cell_field_ions(const core::Config& cfg,
+                          const std::vector<int>& fuel_mats,
+                          const std::vector<double>& burn_Y,
+                          const std::vector<double>& volFrac,
+                          const int n_cells,
+                          std::vector<burn::FieldIons>& out) {
+  const int n_mat = static_cast<int>(cfg.materials.materials.size());
+  const std::vector<burn::FieldIonMaterial> materials =
+      burn_field_ion_materials(cfg, fuel_mats);
   const bool have_volfrac =
       n_cells > 0 && volFrac.size() >= static_cast<std::size_t>(n_cells) *
                                            static_cast<std::size_t>(n_mat);
@@ -919,66 +927,55 @@ void update_hydro_active(core::State& state, const core::Config&) {
     return;
   }
 
-  bool changed = false;
-  if (state.hydro_t_start_eV <= 0.0) {
-    changed = std::any_of(state.hydro_active.begin(), state.hydro_active.end(),
-                          [](const std::int8_t active) { return active != 1; });
-    std::fill(state.hydro_active.begin(), state.hydro_active.end(), static_cast<std::int8_t>(1));
-  } else {
+  // Each cell's flag from the rules in their order of precedence (the temperature rule, then void
+  // cells off, then the button cells on and the dormant cells off, then tombstoned cells off), and
+  // the device mirror marked stale only when a flag ends up different from what it was. (Every
+  // step used to mark it stale on decks with void cells: their flags were set to 1 and back to 0,
+  // which re-uploaded the mask each step.)
+  // The temperature rule's test on the device: the inactive cells with Te >= T_start (empty when
+  // there are none).
+  std::vector<std::uint8_t> t_start_reached;
+  if (state.hydro_t_start_eV > 0.0) {
     TENRYU_ASSERT(state.hydro_active.size() == state.Te.size(),
                   "hydro_active/Te size mismatch");
-
-    std::vector<double> host_Te(state.Te.size(), 0.0);
-    state.Te.copy_to_host(host_Te.data());
-
-    for (std::size_t i = 0; i < state.hydro_active.size(); ++i) {
-      if (state.hydro_active[i] != 0) {
-        continue;
-      }
-      if (host_Te[i] >= state.hydro_t_start_eV) {
-        state.hydro_active[i] = 1;
-        changed = true;
-      }
-    }
+    hydro_active_t_start_reached_device(state, state.hydro_t_start_eV, t_start_reached);
   }
-
-  if (!state.cell_is_void.empty()) {
-    for (std::size_t i = 0; i < state.hydro_active.size(); ++i) {
-      if (state.cell_is_void[i] != 0U) {
-        if (state.hydro_active[i] != 0) {
-          changed = true;
-        }
-        state.hydro_active[i] = 0;
-      }
-    }
-  }
-
-  if (state.mesh.button_center && state.mesh.button_center->enabled) {
-    for (std::size_t i = 0; i < state.hydro_active.size(); ++i) {
-      const int c = static_cast<int>(i);
-      if (state.mesh.is_button_cell(c)) {
-        if (state.hydro_active[i] != 1) {
-          changed = true;
-        }
-        state.hydro_active[i] = 1;
-      } else if (state.mesh.is_dormant_cell(c)) {
-        if (state.hydro_active[i] != 0) {
-          changed = true;
-        }
-        state.hydro_active[i] = 0;
-      }
-    }
-  }
+  const bool has_void = !state.cell_is_void.empty();
+  const bool button = state.mesh.button_center && state.mesh.button_center->enabled;
   if (!state.merge_tombstone.empty()) {
     TENRYU_ASSERT(state.merge_tombstone.size() == state.hydro_active.size(),
                   "merge_tombstone/hydro_active size mismatch");
-    for (std::size_t i = 0; i < state.hydro_active.size(); ++i) {
-      if (state.merge_tombstone[i] != 0U) {
-        if (state.hydro_active[i] != 0) {
-          changed = true;
-        }
-        state.hydro_active[i] = 0;
+  }
+  bool changed = false;
+  for (std::size_t i = 0; i < state.hydro_active.size(); ++i) {
+    std::int8_t target = 1;
+    if (state.hydro_t_start_eV > 0.0) {
+      // an active cell keeps its flag; an inactive one becomes active once Te >= T_start
+      if (state.hydro_active[i] != 0) {
+        target = state.hydro_active[i];
+      } else {
+        target = (!t_start_reached.empty() && t_start_reached[i] != 0U)
+                     ? static_cast<std::int8_t>(1)
+                     : static_cast<std::int8_t>(0);
       }
+    }
+    if (has_void && state.cell_is_void[i] != 0U) {
+      target = 0;
+    }
+    if (button) {
+      const int c = static_cast<int>(i);
+      if (state.mesh.is_button_cell(c)) {
+        target = 1;
+      } else if (state.mesh.is_dormant_cell(c)) {
+        target = 0;
+      }
+    }
+    if (!state.merge_tombstone.empty() && state.merge_tombstone[i] != 0U) {
+      target = 0;
+    }
+    if (state.hydro_active[i] != target) {
+      state.hydro_active[i] = target;
+      changed = true;
     }
   }
   if (changed) {
@@ -1148,14 +1145,17 @@ void update_zbar_for_step(core::State& state, const core::Config& cfg,
     return;
   }
   const char* host_path = std::getenv("TENRYU_ZBAR_HOST");
-  // CUDA transcendental rounding fails the strict non-TMAT TF parity gate.
-  // TMAT paths retain the separately accepted ULP-scale arithmetic contract.
-  const bool legacy_tf = cfg.materials.zbar.model == "thomas_fermi" &&
+  // Decks with a non-TMAT material are held to the host's Thomas-Fermi values bit for bit (CUDA's
+  // pow and exp differ from glibc's in the last place): the device evaluates the fit in the
+  // host's rounding for them (2026-10-02; the host computed it before). TMAT-only decks keep
+  // CUDA's pow and exp under their accepted last-place contract.
+  const bool tf_host_rounding = cfg.materials.zbar.model == "thomas_fermi" &&
       !std::all_of(cfg.materials.materials.begin(), cfg.materials.materials.end(),
                    [](const auto& mat) { return mat.is_void || mat.eos_model == "tmat"; });
-  if (cfg.main.dimension == "1D_SPH" && !legacy_tf &&
-      !(host_path != nullptr && host_path[0] == '1')) {
-    materials::update_zbar_fields_device(device_context, state, cfg);
+  if (cfg.main.dimension == "1D_SPH" && !(host_path != nullptr && host_path[0] == '1')) {
+    materials::update_zbar_fields_device(
+        device_context, state, cfg,
+        tf_host_rounding ? materials::ZbarTfRounding::host : materials::ZbarTfRounding::cuda_math);
     return;
   }
   update_zbar_thomas_fermi(state, cfg);
@@ -5802,6 +5802,41 @@ DtLineage global_dt_record_lineage(const DtLineage& local,
   return g;
 }
 
+// The device-to-device copies of a list of fields (each dst resized to its
+// src, empty sources skipped), by core::copy_device_arrays with up to eight
+// fields per launch in place of a cudaMemcpy per field (the thermal subcycle's
+// backups).
+class DeviceFieldCopies {
+ public:
+  template <typename Dst, typename Src>
+  void add(Dst& dst, const Src& src) {
+    dst.reset(src.size());
+    if (src.empty()) {
+      return;
+    }
+    TENRYU_ASSERT(n_ < kMax, "DeviceFieldCopies: too many fields");
+    TENRYU_ASSERT(src.size() <= static_cast<std::size_t>(std::numeric_limits<int>::max()),
+                  "DeviceFieldCopies: field too large");
+    dsts_[n_] = dst.data();
+    srcs_[n_] = src.data();
+    counts_[n_] = static_cast<int>(src.size());
+    ++n_;
+  }
+  void launch() {
+    for (int a = 0; a < n_; a += 8) {
+      core::copy_device_arrays(dsts_ + a, srcs_ + a, counts_ + a, std::min(8, n_ - a));
+    }
+    n_ = 0;
+  }
+
+ private:
+  static constexpr int kMax = 16;
+  double* dsts_[kMax] = {};
+  const double* srcs_[kMax] = {};
+  int counts_[kMax] = {};
+  int n_ = 0;
+};
+
 }  // namespace
 
 DtLineage compute_dt_lineage(const core::State& state,
@@ -6559,14 +6594,13 @@ void Driver::run(core::State& state,
                    })
             .share();
   };
-  core::DeviceBuffer<double> burn_r_node_dev;
-  core::DeviceBuffer<double> burn_vol_dev;
-  core::DeviceBuffer<double> burn_rho_dev;
-  core::DeviceBuffer<double> burn_Te_dev;
-  core::DeviceBuffer<double> burn_Ti_dev;
   core::DeviceBuffer<double> burn_ne_dev;
   core::DeviceBuffer<double> burn_S_birth_dev;
   core::DeviceBuffer<double> burn_field_ions_dev;
+  // The 1D burn stage's fuel material indices and field-ion materials
+  // (burn::pack_field_ion_materials) in device memory, set with the burn setup.
+  core::DeviceBuffer<int> burn_fuel_mats_dev;
+  core::DeviceBuffer<double> burn_field_materials_dev;
   // --- Nuclear burn init: fuel material indices, species inventories,
   //     LP partition table (init-time; no runtime Python) ---
   if (cfg.burn.scheme != "diffusion") {
@@ -6962,6 +6996,18 @@ void Driver::run(core::State& state,
     if (state.mesh.dim == 1 && state.burn_neutron_cum_host.empty()) {
       state.burn_neutron_cum_host.assign(n_cells, 0.0);
     }
+    state.note_burn_host_write();  // the setup wrote the host arrays
+    // The 1D burn stage works on the device copies: sized here, so that the retry snapshot's
+    // entries keep their sizes from the first step on.
+    state.sync_burn_arrays_to_device();
+    burn_fuel_mats_dev.reset(burn_fuel_mats.size());
+    burn_fuel_mats_dev.copy_from_host(burn_fuel_mats);
+    {
+      std::vector<double> packed;
+      burn::pack_field_ion_materials(burn_field_ion_materials(cfg, burn_fuel_mats), packed);
+      burn_field_materials_dev.reset(packed.size());
+      burn_field_materials_dev.copy_from_host(packed);
+    }
     if (cfg.burn.scheme == "diffusion" && !state.burn_Ng.empty()) {
       const std::size_t expected_burn_Ng_size =
           6U * static_cast<std::size_t>(cfg.burn.diffusion_groups) *
@@ -7338,6 +7384,9 @@ void Driver::run(core::State& state,
   consolidate_1d_owned_lines();
   // Write initial snapshot (t=0) before main loop
   if (state.step == 0 && part_info.rank == 0) {
+    if (cfg.laser.enabled) {
+      laser::sync_laser_snapshot_fields(state, laser_mesh);
+    }
     out.write_snapshot(state, cfg, state.step, state.t, case_name, part_info.rank);
     out.write_run_info(state, cfg);
     core::log_info("[output] wrote initial snapshot (step=0, t=" + format_sci(state.t) + ")");
@@ -7391,6 +7440,9 @@ void Driver::run(core::State& state,
     if (out.should_plot(state.step, state.t, state, cfg)) {
       if (part_info.rank == 0) {
         const core::NvtxRange nvtx_snapshot("outputs.write_snapshot");
+        if (cfg.laser.enabled) {
+          laser::sync_laser_snapshot_fields(state, laser_mesh);
+        }
         out.write_snapshot(state, cfg, state.step, state.t, case_name, part_info.rank);
         last_plot_step = state.step;
         out.write_run_info(state, cfg);
@@ -7413,6 +7465,9 @@ void Driver::run(core::State& state,
                               state.t);
       if (part_info.rank == 0) {
         const core::NvtxRange nvtx_checkpoint("outputs.write_checkpoint");
+        if (cfg.laser.enabled) {
+          laser::sync_laser_snapshot_fields(state, laser_mesh);
+        }
         out.write_checkpoint(state,
                              cfg,
                              state.step,
@@ -7437,6 +7492,9 @@ void Driver::run(core::State& state,
       return;
     }
     const core::NvtxRange nvtx_checkpoint("outputs.write_final_checkpoint");
+    if (cfg.laser.enabled) {
+      laser::sync_laser_snapshot_fields(state, laser_mesh);
+    }
     out.write_checkpoint(state, cfg, state.step, state.t, case_name,
                          part_info.rank);
     if (out.last_checkpoint_step() == state.step) {
@@ -7575,6 +7633,9 @@ void Driver::run(core::State& state,
     // 2026-09-23).
     if (cfg.output.write_final_snapshot && part_info.rank == 0 &&
         last_plot_step != state.step) {
+      if (cfg.laser.enabled) {
+        laser::sync_laser_snapshot_fields(state, laser_mesh);
+      }
       out.write_snapshot(state, cfg, state.step, state.t, case_name,
                          part_info.rank);
       out.write_run_info(state, cfg);
@@ -8413,7 +8474,6 @@ void Driver::run(core::State& state,
         cfg.radiation.multigroup_diffusion.hydro_coupling == "conservative_advection";
     TENRYU_ASSERT(!rad_cell_advection_on ||
                       (is_1d && cfg.mesh.motion == "lagrangian" &&
-                       !cfg.numerics.ale1d.enabled &&
                        cfg.radiation.mode == core::RadiationMode::MultigroupDiffusion &&
                        !rad_gamma::gamma_r_43_enabled_from_env()),
                   "conservative_advection requires 1D Lagrangian FLD and no gamma override");
@@ -10146,9 +10206,8 @@ void Driver::run(core::State& state,
       const WjOpAuditSnapshot wj_b_cond =
           wj_op_audit_active ? wj_audit_capture() : WjOpAuditSnapshot{};
       cudaStream_t cond_stream = nullptr;
-      std::vector<double> conduction_ee_before;
       if (cfg.numerics.diagnostics.conduction_energy_rate_export.enabled) {
-        conduction_ee_before = copy_field_to_host(state.ee);
+        capture_conduction_ee_device(reclose_ctx, state);
       }
       const hydro::ConductionResult conduction_result =
           hydro::conduction_step(
@@ -10220,18 +10279,7 @@ void Driver::run(core::State& state,
         sync_ee_from_Te_table(state, cfg, eos_ctx, reclose_ctx);
       }
       if (cfg.numerics.diagnostics.conduction_energy_rate_export.enabled) {
-        const std::vector<double> conduction_ee_after =
-            copy_field_to_host(state.ee);
-        const std::vector<double> conduction_rho_after =
-            copy_field_to_host(state.rho);
-        std::vector<double> conduction_e_rate(
-            conduction_ee_before.size(), 0.0);
-        for (std::size_t c = 0; c < conduction_e_rate.size(); ++c) {
-          conduction_e_rate[c] =
-              (conduction_ee_after[c] - conduction_ee_before[c]) *
-              conduction_rho_after[c] / dt_op;
-        }
-        state.conduction_e_rate.copy_from_host(conduction_e_rate);
+        conduction_energy_rate_device(reclose_ctx, state, dt_op);
       }
       if (cond_ebal_enabled) {
         const double cond_ebal_U2 =
@@ -10582,6 +10630,363 @@ void Driver::run(core::State& state,
       state.ensure_cell_material_props(cfg);
       const int n_cells = static_cast<int>(state.rho.size());
       const int n_mat = static_cast<int>(cfg.materials.materials.size());
+      const auto contains_fuel = [&](const char* fuel) {
+        return std::find(cfg.burn.fuels.begin(),
+                         cfg.burn.fuels.end(),
+                         std::string(fuel)) != cfg.burn.fuels.end();
+      };
+      burn::BurnStageParams bp;
+      bp.channels = {contains_fuel("DT"), contains_fuel("DD"), contains_fuel("D3He")};
+      bp.use_fraley_partition = (cfg.burn.partition == "fraley");
+      if (cfg.burn.screening == "salpeter") {
+        bp.screening_mode = static_cast<int>(burn::ScreeningMode::kSalpeter);
+      } else if (cfg.burn.screening == "chugunov_dewitt") {
+        bp.screening_mode = static_cast<int>(burn::ScreeningMode::kChugunovDeWitt);
+      } else {
+        bp.screening_mode = static_cast<int>(burn::ScreeningMode::kNone);
+      }
+      bp.T_floor_keV = cfg.burn.T_floor_keV;
+      bp.eps_deplete = cfg.burn.eps_deplete;
+      bp.subcycle_max = cfg.burn.subcycle_max;
+      bp.vf_threshold = cfg.burn.vf_threshold;
+      bp.explicit_source_limit = cfg.burn.explicit_source_limit;
+      bp.dt_s = dt_op;
+      bp.neutron_heating = cfg.burn.neutron_heating;
+      bp.neutron_heating_n_mu = cfg.burn.neutron_heating_n_mu;
+      const auto store_burn_neutron_diagnostics =
+          [&](const burn::BurnStageResult& r) {
+            if (r.w_dt > 0.0) {
+              state.burn_Ti_burn_dt_eV = r.wTi_dt / r.w_dt;
+              state.burn_vr2_burn_dt = r.wvr2_dt / r.w_dt;
+              const burn::BryskMoments moments = burn::brysk_moments(
+                  0, state.burn_Ti_burn_dt_eV * 1.0e-3,
+                  state.burn_vr2_burn_dt);
+              state.burn_neutron_mean_shift_dt_keV = moments.mean_shift_keV;
+              state.burn_neutron_sigma_thermal_dt_keV =
+                  moments.sigma_thermal_keV;
+              state.burn_neutron_sigma_total_dt_keV = moments.sigma_total_keV;
+            }
+            if (r.w_dd > 0.0) {
+              state.burn_Ti_burn_dd_eV = r.wTi_dd / r.w_dd;
+              state.burn_vr2_burn_dd = r.wvr2_dd / r.w_dd;
+              const burn::BryskMoments moments = burn::brysk_moments(
+                  1, state.burn_Ti_burn_dd_eV * 1.0e-3,
+                  state.burn_vr2_burn_dd);
+              state.burn_neutron_mean_shift_dd_keV = moments.mean_shift_keV;
+              state.burn_neutron_sigma_thermal_dd_keV =
+                  moments.sigma_thermal_keV;
+              state.burn_neutron_sigma_total_dd_keV = moments.sigma_total_keV;
+            }
+          };
+      // The default (local) scheme's bookkeeping after the stage and the injection.
+      const auto book_local_burn = [&](const burn::BurnStageResult& r, const double skipped,
+                                       const double burn_E_floor, const int burn_clamps) {
+        refresh_mie_gruneisen_thermo_from_energy(state, cfg, eos_ctx, reclose_ctx);
+        state.burn_enabled_any = true;
+        state.burn_released_step =
+            burn_tally_share * (r.released_charged + r.released_neutron);
+        state.burn_dep_e_step = burn_tally_share * r.dep_e;
+        state.burn_dep_i_step = burn_tally_share * r.dep_i;
+        state.burn_esc_charged_step = burn_tally_share * r.esc_charged;
+        state.burn_esc_neutron_step = burn_tally_share * r.esc_neutron;
+        state.burn_nh_dep_e_step = burn_tally_share * r.nh_dep_e;
+        state.burn_nh_dep_i_step = burn_tally_share * r.nh_dep_i;
+        state.burn_nh_degraded_step = burn_tally_share * r.nh_degraded;
+        state.burn_nh_escaped_step = burn_tally_share * r.nh_escaped;
+        state.burn_dt_limit_s = r.dt_limit_s;
+        state.E_burn_released += state.burn_released_step;
+        state.E_burn_dep_e += burn_tally_share * r.dep_e;
+        state.E_burn_dep_i += burn_tally_share * r.dep_i;
+        state.E_burn_esc_charged += burn_tally_share * r.esc_charged;
+        state.E_burn_esc_neutron += burn_tally_share * r.esc_neutron;
+        state.N_burn_neutrons_dt += burn_tally_share * r.n_neutrons_dt;
+        state.N_burn_neutrons_dd += burn_tally_share * r.n_neutrons_dd;
+        step_E_numerical_loss += burn_tally_share * skipped;
+        step_E_floor += burn_tally_share * std::max(burn_E_floor, 0.0);
+        step_clamp_count += std::max(burn_clamps, 0);
+        step_E_burn_in += burn_tally_share * (r.dep_e + r.dep_i);
+        const double burn_delta_E_ext =
+            std::max(r.dep_e + r.dep_i - skipped, 0.0) + std::max(burn_E_floor, 0.0);
+        record_operator_energy("burn", op_energy_before, burn_delta_E_ext);
+      };
+      // The charged-product transport of the diffusion and MC schemes (NUMERICS §14.7, §14.9)
+      // and the bookkeeping after it, on the device after either stage path: the stage left its
+      // birth sources in d_S_birth, the field ions of the cells at the start of the step in
+      // field_cells and its neutron-heating deposits in d_nh_e / d_nh_i (added when
+      // Burn.neutron_heating), and the device copies of the burn arrays are current. The
+      // transport reads the State's device fields.
+      const auto run_burn_transport_1d = [&](const burn::BurnStageResult& r,
+                                             const double* d_S_birth,
+                                             const burn::FieldIonCells field_cells,
+                                             const double* d_nh_e, const double* d_nh_i) {
+        const bool diffusion = (cfg.burn.scheme == "diffusion");
+        const std::size_t n_cells_sz = static_cast<std::size_t>(n_cells);
+        const burn::FieldIons burn_field_uniform = burn::field_ions_from_fractions(
+            cfg.burn.x_D, cfg.burn.x_T, cfg.burn.x_He3);
+        ensure_device_buffer_capacity(burn_ne_dev, n_cells_sz, "burn transport ne");
+        burn::electron_density_1d_device(state.zbar.data(), state.rho.data(),
+                                         state.A_eff.data(), n_cells, burn_ne_dev.data());
+        if (state.burn_dep_e_dev.size() != n_cells_sz) {
+          state.burn_dep_e_dev.reset(n_cells_sz);
+        }
+        if (state.burn_dep_i_dev.size() != n_cells_sz) {
+          state.burn_dep_i_dev.reset(n_cells_sz);
+        }
+        double escaped_total = 0.0;
+        double inflight_total = 0.0;
+        if (diffusion) {
+          burn::CormanParams cp;
+          cp.n_groups = cfg.burn.diffusion_groups;
+          cp.E_min_keV = cfg.burn.diffusion_E_min_keV;
+          cp.E_max_keV = 15500.0;
+          cp.lnL_e = 0.0;
+          cp.lnL_I = 0.0;
+          cp.field = burn_field_uniform;
+          cp.field_cells = field_cells;
+
+          const std::size_t n_groups_sz = static_cast<std::size_t>(cp.n_groups);
+          const std::size_t slot_cells = n_cells_sz;
+          const std::size_t slot_ng_cells = n_groups_sz * n_cells_sz;
+          const std::size_t burn_Ng_size = 6U * slot_ng_cells;
+          if (state.burn_Ng.size() != burn_Ng_size) {
+            state.burn_Ng.reset(burn_Ng_size);
+          }
+          if (state.burn_Ng_work.size() != burn_Ng_size) {
+            state.burn_Ng_work.reset(burn_Ng_size);
+          }
+          zero_device_buffer_prefix(state.burn_dep_e_dev, n_cells_sz, "burn diffusion dep_e");
+          zero_device_buffer_prefix(state.burn_dep_i_dev, n_cells_sz, "burn diffusion dep_i");
+          ensure_device_buffer_capacity(
+              state.burn_corman_scratch,
+              burn::corman_diffusion_scratch_bytes(cp.n_groups, n_cells),
+              "burn diffusion Corman scratch");
+          // The slots with a birth source or particles in flight (one small copy to the host).
+          int slot_flags[12];
+          burn::slot_nonzero_flags_1d_device(d_S_birth, state.burn_Ng.data(), n_cells,
+                                             cp.n_groups, slot_flags);
+          constexpr int kChargedSpecies[6] = {
+              burn::kHe4, burn::kT, burn::kP, burn::kHe3, burn::kHe4, burn::kP};
+          constexpr double kChargedMeV[6] = {
+              3.540, 1.010, 3.023, 0.820, 3.690, 14.663};
+          for (int slot = 0; slot < 6; ++slot) {
+            const std::size_t source_offset = static_cast<std::size_t>(slot) * slot_cells;
+            const std::size_t Ng_offset = static_cast<std::size_t>(slot) * slot_ng_cells;
+            if (slot_flags[slot] == 0 && slot_flags[6 + slot] == 0) {
+              continue;
+            }
+            const int species = kChargedSpecies[slot];
+            double* const Ng_density = state.burn_Ng_work.data() + Ng_offset;
+            burn::scale_rows_by_cell(Ng_density, state.burn_Ng.data() + Ng_offset,
+                                     state.rho.data(), cp.n_groups, n_cells);
+            const burn::CormanStepResult cr = burn::corman_diffusion_step(
+                cp, n_cells, burn::species_A(species), charged_species_Z(species),
+                kChargedMeV[slot] * 1000.0, state.x_r.data(), state.vol.data(),
+                state.rho.data(), state.Te.data(), state.Ti.data(), burn_ne_dev.data(),
+                d_S_birth + source_offset, dt_op, Ng_density, state.burn_dep_e_dev.data(),
+                state.burn_dep_i_dev.data(), state.burn_corman_scratch.data(),
+                state.burn_corman_scratch.size(), nullptr);
+            burn::divide_rows_by_cell(state.burn_Ng.data() + Ng_offset, Ng_density,
+                                      state.rho.data(), cp.n_groups, n_cells);
+            escaped_total += cr.escaped_erg;
+            inflight_total += cr.inflight_erg;
+          }
+        } else {
+          const std::size_t mc_capacity_size =
+              burn_mc_pool_capacity_size(n_cells, cfg.burn.mc_particles_per_cell);
+          const int mc_capacity = static_cast<int>(mc_capacity_size);
+          TENRYU_ASSERT(state.burn_mc_live >= 0 && state.burn_mc_live <= mc_capacity,
+                        "burn MC live count outside pool capacity");
+          const std::size_t mc_live = static_cast<std::size_t>(state.burn_mc_live);
+          ensure_burn_mc_pool_field(state.burn_mc_r, mc_capacity_size, mc_live,
+                                    "burn MC r pool");
+          ensure_burn_mc_pool_field(state.burn_mc_mu, mc_capacity_size, mc_live,
+                                    "burn MC mu pool");
+          ensure_burn_mc_pool_field(state.burn_mc_E, mc_capacity_size, mc_live,
+                                    "burn MC E pool");
+          ensure_burn_mc_pool_field(state.burn_mc_w, mc_capacity_size, mc_live,
+                                    "burn MC w pool");
+          ensure_burn_mc_pool_field(state.burn_mc_slot, mc_capacity_size, mc_live,
+                                    "burn MC slot pool");
+          ensure_burn_mc_pool_field(state.burn_mc_alive, mc_capacity_size, mc_live,
+                                    "burn MC alive pool");
+          zero_device_buffer_prefix(state.burn_dep_e_dev, n_cells_sz, "burn MC dep_e");
+          zero_device_buffer_prefix(state.burn_dep_i_dev, n_cells_sz, "burn MC dep_i");
+
+          burn::McParams mp;
+          mp.E_min_keV = cfg.burn.diffusion_E_min_keV;
+          mp.particles_per_cell = cfg.burn.mc_particles_per_cell;
+          mp.seed = static_cast<unsigned long long>(cfg.main.seed);
+          mp.field = burn_field_uniform;
+          mp.field_cells = field_cells;
+          const burn::McStepResult mr = burn::mc_transport_step(
+              mp, n_cells, static_cast<long long>(state.step), state.x_r.data(),
+              state.rho.data(), state.Te.data(), state.Ti.data(), burn_ne_dev.data(), d_S_birth,
+              state.vol.data(), dt_op, state.burn_mc_r.data(), state.burn_mc_mu.data(),
+              state.burn_mc_E.data(), state.burn_mc_w.data(), state.burn_mc_slot.data(),
+              state.burn_mc_alive.data(), mc_capacity, &state.burn_mc_live,
+              state.burn_dep_e_dev.data(), state.burn_dep_i_dev.data(), nullptr);
+          TENRYU_ASSERT(!mr.overflow, "burn MC particle pool capacity overflow");
+          escaped_total = mr.escaped_erg;
+          inflight_total = mr.inflight_erg;
+        }
+
+        // The deposits with the neutron heating's, eps_cum, the heating rates and the
+        // explicit-source dt limit, before the injection changes the energies they read.
+        const bool add_neutron_heating = cfg.burn.neutron_heating;
+        const burn::BurnTransportTotals totals = burn::burn_transport_finish_1d_device(
+            state.burn_dep_e_dev.data(), state.burn_dep_i_dev.data(),
+            add_neutron_heating ? d_nh_e : nullptr, add_neutron_heating ? d_nh_i : nullptr,
+            state.rho.data(), state.vol.data(), state.ee.data(), state.ei.data(), n_cells, dt_op,
+            cfg.burn.explicit_source_limit, state.burn_eps_cum_dev.data(),
+            state.burn_Q_e_dev.data(), state.burn_Q_i_dev.data());
+        state.note_burn_device_write();
+        const double dep_e_total = totals.dep_e;
+        const double dep_i_total = totals.dep_i;
+
+        double burn_E_floor = 0.0;
+        int burn_clamps = 0;
+        const double skipped = inject_burn_source_terms(
+            state, cfg, state.burn_dep_e_dev.data(), state.burn_dep_i_dev.data(), &burn_E_floor,
+            &burn_clamps, &eos_ctx);
+        refresh_mie_gruneisen_thermo_from_energy(state, cfg, eos_ctx, reclose_ctx);
+        state.burn_enabled_any = true;
+        if (diffusion) {
+          state.burn_diffusion_any = true;
+        } else {
+          state.burn_mc_any = true;
+        }
+        state.burn_released_step =
+            burn_tally_share * (r.released_charged + r.released_neutron);
+        state.burn_dep_e_step = burn_tally_share * dep_e_total;
+        state.burn_dep_i_step = burn_tally_share * dep_i_total;
+        state.burn_esc_charged_step = burn_tally_share * escaped_total;
+        state.burn_esc_neutron_step = burn_tally_share * r.esc_neutron;
+        state.burn_nh_dep_e_step = burn_tally_share * r.nh_dep_e;
+        state.burn_nh_dep_i_step = burn_tally_share * r.nh_dep_i;
+        state.burn_nh_degraded_step = burn_tally_share * r.nh_degraded;
+        state.burn_nh_escaped_step = burn_tally_share * r.nh_escaped;
+        // The reaction stage's own limit (fuel depletion beyond subcycle_max
+        // substeps, neutron-heating deposition) applies here too.
+        state.burn_dt_limit_s = std::min(totals.dt_limit, r.dt_limit_s);
+        state.E_burn_released += state.burn_released_step;
+        state.E_burn_dep_e += burn_tally_share * dep_e_total;
+        state.E_burn_dep_i += burn_tally_share * dep_i_total;
+        state.E_burn_esc_charged += burn_tally_share * escaped_total;
+        state.E_burn_esc_neutron += burn_tally_share * r.esc_neutron;
+        state.E_burn_inflight = burn_tally_share * inflight_total;
+        state.N_burn_neutrons_dt += burn_tally_share * r.n_neutrons_dt;
+        state.N_burn_neutrons_dd += burn_tally_share * r.n_neutrons_dd;
+        step_E_numerical_loss += burn_tally_share * skipped;
+        step_E_floor += burn_tally_share * std::max(burn_E_floor, 0.0);
+        step_clamp_count += std::max(burn_clamps, 0);
+        step_E_burn_in += burn_tally_share * (dep_e_total + dep_i_total);
+        const double burn_delta_E_ext =
+            std::max(dep_e_total + dep_i_total - skipped, 0.0) +
+            std::max(burn_E_floor, 0.0);
+        record_operator_energy("burn", op_energy_before, burn_delta_E_ext);
+      };
+      const bool transport_scheme =
+          (cfg.burn.scheme == "diffusion" || cfg.burn.scheme == "mc");
+      const int n_fuel = static_cast<int>(burn_fuel_mats_dev.size());
+      // The stage on the device-resident arrays (NUMERICS §14): the State's device fields are
+      // the inputs, the device copies of the burn arrays (inventory, eps_cum, neutron count,
+      // diagnostics) the state of the stage, and only the stage's scalars come to the host; the
+      // diffusion and MC schemes continue with the transport on the device. The host stage
+      // (TENRYU_BURN_HOST_STAGE=1) takes the host path below.
+      if (!burn::burn_1d_host_stage_forced() && n_cells > 0) {
+        const burn::BurnRegion region = burn::burn_1d_region(
+            state.rho.data(), state.Ti.data(), state.volFrac.data(), n_cells, n_mat,
+            burn_fuel_mats_dev.data(), n_fuel, cfg.burn.vf_threshold, cfg.burn.T_floor_keV);
+        if (region.decided) {
+          state.sync_burn_arrays_to_device();
+          const std::size_t n = static_cast<std::size_t>(n_cells);
+          // The diffusion and MC schemes keep their in-flight populations and always run.
+          if (!transport_scheme && !region.may_react) {
+            // No reacting cell: the step's zero diagnostics (see the skip below).
+            for (core::DeviceBuffer<double>* diag :
+                 {&state.burn_rate_dev, &state.burn_Q_e_dev, &state.burn_Q_i_dev}) {
+              const cudaError_t err = cudaMemset(diag->data(), 0, diag->size() * sizeof(double));
+              TENRYU_ASSERT(err == cudaSuccess, "burn diagnostics reset failed");
+            }
+            state.note_burn_device_write();
+            refresh_mie_gruneisen_thermo_from_energy(state, cfg, eos_ctx, reclose_ctx);
+            state.burn_enabled_any = true;
+            record_operator_energy("burn", op_energy_before, 0.0);
+            wj_audit_log("burn", wj_b_burn);
+            log_phase_energy("burn_callback", e_before_phase);
+            return;
+          }
+          burn::BurnDeviceInputs din;
+          din.n_cells = n_cells;
+          din.n_mat = n_mat;
+          din.first = region.first;
+          din.last = region.last;
+          din.r_node = state.x_r.data();
+          din.v_node = (state.v_r.size() >= n + 1U) ? state.v_r.data() : nullptr;
+          din.rho = state.rho.data();
+          din.vol = state.vol.data();
+          din.Te_eV = state.Te.data();
+          din.Ti_eV = state.Ti.data();
+          din.zbar = state.zbar.data();
+          din.A_eff = state.A_eff.data();
+          din.ee = state.ee.data();
+          din.ei = state.ei.data();
+          din.volFrac = (state.volFrac.size() >= n * static_cast<std::size_t>(n_mat))
+                            ? state.volFrac.data()
+                            : nullptr;
+          // the field-ion mixture of burn_cell_field_ions
+          din.range_medium = true;
+          din.field_ions.n_mat = n_mat;
+          din.field_ions.materials = burn_field_materials_dev.data();
+          din.field_ions.fallback =
+              burn::field_ions_from_fractions(cfg.burn.x_D, cfg.burn.x_T, cfg.burn.x_He3);
+          auto* const d_deposit = static_cast<double*>(core::device_scratch_acquire(
+              "driver:burn_1d:deposits", 2 * n * sizeof(double)));
+          burn::BurnDeviceArrays dout;
+          dout.burn_y = state.burn_n_dev.data();
+          dout.dE_e = d_deposit;
+          dout.dE_i = d_deposit + n;
+          dout.rate_diag = state.burn_rate_dev.data();
+          dout.Qe_diag = state.burn_Q_e_dev.data();
+          dout.Qi_diag = state.burn_Q_i_dev.data();
+          dout.eps_cum = state.burn_eps_cum_dev.data();
+          dout.neutron_cum =
+              (state.burn_neutron_cum_dev.size() == n) ? state.burn_neutron_cum_dev.data() : nullptr;
+          if (transport_scheme) {
+            // The birth sources and the field ions for the transport; eps_cum follows the
+            // transport's deposits.
+            bp.scheme = 1;
+            ensure_device_buffer_capacity(burn_S_birth_dev, 6U * n, "burn transport S_birth");
+            ensure_device_buffer_capacity(
+                burn_field_ions_dev, static_cast<std::size_t>(burn::kFieldIonCellValues) * n,
+                "burn transport field ions");
+            dout.eps_cum = nullptr;
+            dout.S_birth = burn_S_birth_dev.data();
+            dout.field_ion_cells = burn_field_ions_dev.data();
+          }
+          const burn::BurnStageResult r = burn::compute_burn_step_1d_device_resident(
+              din, bp, burn_partition_table(), dout);
+          state.note_burn_device_write();
+          store_burn_neutron_diagnostics(r);
+          if (transport_scheme) {
+            burn::FieldIonCells field_cells;
+            field_cells.values = burn_field_ions_dev.data();
+            run_burn_transport_1d(r, burn_S_birth_dev.data(), field_cells, dout.dE_e, dout.dE_i);
+          } else {
+            double burn_E_floor = 0.0;
+            int burn_clamps = 0;
+            const double skipped = inject_burn_source_terms(
+                state, cfg, dout.dE_e, dout.dE_i, &burn_E_floor, &burn_clamps, &eos_ctx);
+            book_local_burn(r, skipped, burn_E_floor, burn_clamps);
+          }
+          wj_audit_log("burn", wj_b_burn);
+          log_phase_energy("burn_callback", e_before_phase);
+          return;
+        }
+      }
+      // The host path: the host copies of the burn arrays are the working ones from here.
+      state.sync_burn_arrays_to_host();
+      state.note_burn_host_write();
       // Local scheme with no reacting cell (every region cell has rho <= 0 or
       // Ti below T_floor): the stage would deposit nothing and leave the
       // inventories as they are, and the injection leaves cells without a
@@ -10592,7 +10997,8 @@ void Driver::run(core::State& state,
       if (cfg.burn.scheme != "diffusion" && cfg.burn.scheme != "mc" &&
           !burn::burn_1d_region_may_react(
               state.rho.data(), state.Ti.data(), state.volFrac.data(), n_cells,
-              n_mat, burn_fuel_mats, cfg.burn.vf_threshold, cfg.burn.T_floor_keV)) {
+              n_mat, burn_fuel_mats_dev.data(), n_fuel, cfg.burn.vf_threshold,
+              cfg.burn.T_floor_keV)) {
         const std::size_t n = static_cast<std::size_t>(n_cells);
         state.burn_rate_host.assign(n, 0.0);
         state.burn_Q_e_host.assign(n, 0.0);
@@ -10686,29 +11092,6 @@ void Driver::run(core::State& state,
         cells.values = burn_field_ions_dev.data();
         return cells;
       };
-      const auto contains_fuel = [&](const char* fuel) {
-        return std::find(cfg.burn.fuels.begin(),
-                         cfg.burn.fuels.end(),
-                         std::string(fuel)) != cfg.burn.fuels.end();
-      };
-      burn::BurnStageParams bp;
-      bp.channels = {contains_fuel("DT"), contains_fuel("DD"), contains_fuel("D3He")};
-      bp.use_fraley_partition = (cfg.burn.partition == "fraley");
-      if (cfg.burn.screening == "salpeter") {
-        bp.screening_mode = static_cast<int>(burn::ScreeningMode::kSalpeter);
-      } else if (cfg.burn.screening == "chugunov_dewitt") {
-        bp.screening_mode = static_cast<int>(burn::ScreeningMode::kChugunovDeWitt);
-      } else {
-        bp.screening_mode = static_cast<int>(burn::ScreeningMode::kNone);
-      }
-      bp.T_floor_keV = cfg.burn.T_floor_keV;
-      bp.eps_deplete = cfg.burn.eps_deplete;
-      bp.subcycle_max = cfg.burn.subcycle_max;
-      bp.vf_threshold = cfg.burn.vf_threshold;
-      bp.explicit_source_limit = cfg.burn.explicit_source_limit;
-      bp.dt_s = dt_op;
-      bp.neutron_heating = cfg.burn.neutron_heating;
-      bp.neutron_heating_n_mu = cfg.burn.neutron_heating_n_mu;
       std::vector<double> dE_e;
       std::vector<double> dE_i;
       // Neutrons born in each cell this step, added to the cumulative
@@ -10724,32 +11107,7 @@ void Driver::run(core::State& state,
           state.burn_neutron_cum_host[c] += neutron_births[c];
         }
       };
-      const auto store_burn_neutron_diagnostics =
-          [&](const burn::BurnStageResult& r) {
-            if (r.w_dt > 0.0) {
-              state.burn_Ti_burn_dt_eV = r.wTi_dt / r.w_dt;
-              state.burn_vr2_burn_dt = r.wvr2_dt / r.w_dt;
-              const burn::BryskMoments moments = burn::brysk_moments(
-                  0, state.burn_Ti_burn_dt_eV * 1.0e-3,
-                  state.burn_vr2_burn_dt);
-              state.burn_neutron_mean_shift_dt_keV = moments.mean_shift_keV;
-              state.burn_neutron_sigma_thermal_dt_keV =
-                  moments.sigma_thermal_keV;
-              state.burn_neutron_sigma_total_dt_keV = moments.sigma_total_keV;
-            }
-            if (r.w_dd > 0.0) {
-              state.burn_Ti_burn_dd_eV = r.wTi_dd / r.w_dd;
-              state.burn_vr2_burn_dd = r.wvr2_dd / r.w_dd;
-              const burn::BryskMoments moments = burn::brysk_moments(
-                  1, state.burn_Ti_burn_dd_eV * 1.0e-3,
-                  state.burn_vr2_burn_dd);
-              state.burn_neutron_mean_shift_dd_keV = moments.mean_shift_keV;
-              state.burn_neutron_sigma_thermal_dd_keV =
-                  moments.sigma_thermal_keV;
-              state.burn_neutron_sigma_total_dd_keV = moments.sigma_total_keV;
-            }
-          };
-      if (cfg.burn.scheme == "diffusion") {
+      if (transport_scheme) {
         bp.scheme = 1;
         std::vector<double> S_birth;
         const burn::BurnStageResult r =
@@ -10766,406 +11124,25 @@ void Driver::run(core::State& state,
                                        &neutron_births);
         store_burn_neutron_diagnostics(r);
         accumulate_burn_neutron_births();
-        std::vector<double> nh_dE_e;
-        std::vector<double> nh_dE_i;
-        if (cfg.burn.neutron_heating) {
-          nh_dE_e = dE_e;
-          nh_dE_i = dE_i;
+        // The transport and the bookkeeping after it work on the device copies of the burn
+        // arrays, with the stage's outputs uploaded.
+        state.note_burn_host_write();
+        state.sync_burn_arrays_to_device();
+        copy_host_to_device_prefix(burn_S_birth_dev, S_birth, "burn transport S_birth");
+        const burn::FieldIonCells field_cells =
+            upload_burn_field_ions("burn transport field ions");
+        const std::size_t n = static_cast<std::size_t>(n_cells);
+        auto* const d_nh = static_cast<double*>(core::device_scratch_acquire(
+            "driver:burn_1d:deposits", std::max<std::size_t>(2U * n, 1U) * sizeof(double)));
+        if (n > 0U) {
+          const cudaError_t err_e =
+              cudaMemcpy(d_nh, dE_e.data(), n * sizeof(double), cudaMemcpyHostToDevice);
+          const cudaError_t err_i =
+              cudaMemcpy(d_nh + n, dE_i.data(), n * sizeof(double), cudaMemcpyHostToDevice);
+          TENRYU_ASSERT(err_e == cudaSuccess && err_i == cudaSuccess,
+                        "burn neutron-heating deposit upload failed");
         }
-
-        burn::CormanParams cp;
-        cp.n_groups = cfg.burn.diffusion_groups;
-        cp.E_min_keV = cfg.burn.diffusion_E_min_keV;
-        cp.E_max_keV = 15500.0;
-        cp.lnL_e = 0.0;
-        cp.lnL_I = 0.0;
-        cp.field = burn_field_uniform;
-        cp.field_cells = upload_burn_field_ions("burn diffusion field ions");
-
-        const std::size_t n_cells_sz = static_cast<std::size_t>(n_cells);
-        const std::size_t n_groups_sz =
-            static_cast<std::size_t>(cp.n_groups);
-        const std::size_t slot_cells = n_cells_sz;
-        const std::size_t slot_ng_cells = n_groups_sz * n_cells_sz;
-        const std::size_t burn_Ng_size = 6U * slot_ng_cells;
-        if (state.burn_Ng.size() != burn_Ng_size) {
-          state.burn_Ng.reset(burn_Ng_size);
-        }
-        if (state.burn_Ng_work.size() != burn_Ng_size) {
-          state.burn_Ng_work.reset(burn_Ng_size);
-        }
-        if (state.burn_dep_e_dev.size() != n_cells_sz) {
-          state.burn_dep_e_dev.reset(n_cells_sz);
-        }
-        if (state.burn_dep_i_dev.size() != n_cells_sz) {
-          state.burn_dep_i_dev.reset(n_cells_sz);
-        }
-        zero_device_buffer_prefix(state.burn_dep_e_dev, n_cells_sz,
-                                  "burn diffusion dep_e");
-        zero_device_buffer_prefix(state.burn_dep_i_dev, n_cells_sz,
-                                  "burn diffusion dep_i");
-        ensure_device_buffer_capacity(
-            state.burn_corman_scratch,
-            burn::corman_diffusion_scratch_bytes(cp.n_groups, n_cells),
-            "burn diffusion Corman scratch");
-
-        std::vector<double> ne_h(n_cells_sz, 0.0);
-        for (int c = 0; c < n_cells; ++c) {
-          const double denom = A_eff_h[static_cast<std::size_t>(c)] *
-                               core::constants::proton_mass;
-          ne_h[static_cast<std::size_t>(c)] =
-              (denom > 0.0)
-                  ? zbar_h[static_cast<std::size_t>(c)] *
-                        rho_h[static_cast<std::size_t>(c)] / denom
-                  : 0.0;
-        }
-        copy_host_to_device_prefix(burn_r_node_dev, x_r_h,
-                                   "burn diffusion r_node");
-        copy_host_to_device_prefix(burn_vol_dev, vol_h,
-                                   "burn diffusion vol");
-        copy_host_to_device_prefix(burn_rho_dev, rho_h,
-                                   "burn diffusion rho");
-        copy_host_to_device_prefix(burn_Te_dev, Te_h,
-                                   "burn diffusion Te");
-        copy_host_to_device_prefix(burn_Ti_dev, Ti_h,
-                                   "burn diffusion Ti");
-        copy_host_to_device_prefix(burn_ne_dev, ne_h,
-                                   "burn diffusion ne");
-        copy_host_to_device_prefix(burn_S_birth_dev, S_birth,
-                                   "burn diffusion S_birth");
-
-        std::vector<double> burn_Ng_h;
-        state.burn_Ng.copy_to_host(burn_Ng_h);
-        constexpr int kChargedSpecies[6] = {
-            burn::kHe4, burn::kT, burn::kP, burn::kHe3, burn::kHe4, burn::kP};
-        constexpr double kChargedMeV[6] = {
-            3.540, 1.010, 3.023, 0.820, 3.690, 14.663};
-        double escaped_total = 0.0;
-        double inflight_total = 0.0;
-        double sourced_total = 0.0;
-        for (int slot = 0; slot < 6; ++slot) {
-          const std::size_t source_offset =
-              static_cast<std::size_t>(slot) * slot_cells;
-          const std::size_t Ng_offset =
-              static_cast<std::size_t>(slot) * slot_ng_cells;
-          const bool has_source =
-              any_nonzero_span(S_birth, source_offset, slot_cells);
-          const bool has_inflight =
-              any_nonzero_span(burn_Ng_h, Ng_offset, slot_ng_cells);
-          if (!has_source && !has_inflight) {
-            continue;
-          }
-          const int species = kChargedSpecies[slot];
-          double* const Ng_density = state.burn_Ng_work.data() + Ng_offset;
-          burn::scale_rows_by_cell(
-              Ng_density,
-              state.burn_Ng.data() + Ng_offset,
-              burn_rho_dev.data(),
-              cp.n_groups,
-              n_cells);
-          const burn::CormanStepResult cr = burn::corman_diffusion_step(
-              cp,
-              n_cells,
-              burn::species_A(species),
-              charged_species_Z(species),
-              kChargedMeV[slot] * 1000.0,
-              burn_r_node_dev.data(),
-              burn_vol_dev.data(),
-              burn_rho_dev.data(),
-              burn_Te_dev.data(),
-              burn_Ti_dev.data(),
-              burn_ne_dev.data(),
-              burn_S_birth_dev.data() + source_offset,
-              dt_op,
-              Ng_density,
-              state.burn_dep_e_dev.data(),
-              state.burn_dep_i_dev.data(),
-              state.burn_corman_scratch.data(),
-              state.burn_corman_scratch.size(),
-              nullptr);
-          burn::divide_rows_by_cell(
-              state.burn_Ng.data() + Ng_offset,
-              Ng_density,
-              burn_rho_dev.data(),
-              cp.n_groups,
-              n_cells);
-          escaped_total += cr.escaped_erg;
-          inflight_total += cr.inflight_erg;
-          sourced_total += cr.sourced_erg;
-        }
-        (void)sourced_total;
-
-        state.burn_dep_e_dev.copy_to_host(dE_e);
-        state.burn_dep_i_dev.copy_to_host(dE_i);
-        if (cfg.burn.neutron_heating && !nh_dE_e.empty()) {
-          for (int c = 0; c < n_cells; ++c) {
-            const std::size_t idx = static_cast<std::size_t>(c);
-            dE_e[idx] += nh_dE_e[idx];
-            dE_i[idx] += nh_dE_i[idx];
-          }
-        }
-        double dep_e_total = 0.0;
-        double dep_i_total = 0.0;
-        for (int c = 0; c < n_cells; ++c) {
-          const std::size_t idx = static_cast<std::size_t>(c);
-          dep_e_total += dE_e[idx];
-          dep_i_total += dE_i[idx];
-          const double denom = rho_h[idx] * vol_h[idx];
-          if (denom > 1.0e-30) {
-            state.burn_eps_cum_host[idx] += (dE_e[idx] + dE_i[idx]) / denom;
-          }
-          if (vol_h[idx] > 0.0 && dt_op > 0.0) {
-            state.burn_Q_e_host[idx] = dE_e[idx] / (vol_h[idx] * dt_op);
-            state.burn_Q_i_host[idx] = dE_i[idx] / (vol_h[idx] * dt_op);
-          } else {
-            state.burn_Q_e_host[idx] = 0.0;
-            state.burn_Q_i_host[idx] = 0.0;
-          }
-        }
-
-        double dt_limit = std::numeric_limits<double>::infinity();
-        for (int c = 0; c < n_cells; ++c) {
-          const std::size_t idx = static_cast<std::size_t>(c);
-          const double P_dep_c = (dE_e[idx] + dE_i[idx]) / dt_op;
-          if (P_dep_c > 0.0) {
-            const double e_cell =
-                rho_h[idx] * vol_h[idx] * std::max(ee_h[idx] + ei_h[idx], 0.0);
-            if (e_cell > 0.0) {
-              const double cand =
-                  cfg.burn.explicit_source_limit * e_cell / P_dep_c;
-              dt_limit = std::min(dt_limit, cand);
-            }
-          }
-        }
-
-        double burn_E_floor = 0.0;
-        int burn_clamps = 0;
-        const double skipped = inject_burn_source_terms(
-            state, cfg, dE_e, dE_i, &burn_E_floor, &burn_clamps, &eos_ctx);
-        refresh_mie_gruneisen_thermo_from_energy(state, cfg, eos_ctx, reclose_ctx);
-        state.burn_enabled_any = true;
-        state.burn_diffusion_any = true;
-        state.burn_released_step =
-            burn_tally_share * (r.released_charged + r.released_neutron);
-        state.burn_dep_e_step = burn_tally_share * dep_e_total;
-        state.burn_dep_i_step = burn_tally_share * dep_i_total;
-        state.burn_esc_charged_step = burn_tally_share * escaped_total;
-        state.burn_esc_neutron_step = burn_tally_share * r.esc_neutron;
-        state.burn_nh_dep_e_step = burn_tally_share * r.nh_dep_e;
-        state.burn_nh_dep_i_step = burn_tally_share * r.nh_dep_i;
-        state.burn_nh_degraded_step = burn_tally_share * r.nh_degraded;
-        state.burn_nh_escaped_step = burn_tally_share * r.nh_escaped;
-        // The reaction stage's own limit (fuel depletion beyond subcycle_max
-        // substeps, neutron-heating deposition) applies here too.
-        state.burn_dt_limit_s = std::min(dt_limit, r.dt_limit_s);
-        state.E_burn_released += state.burn_released_step;
-        state.E_burn_dep_e += burn_tally_share * dep_e_total;
-        state.E_burn_dep_i += burn_tally_share * dep_i_total;
-        state.E_burn_esc_charged += burn_tally_share * escaped_total;
-        state.E_burn_esc_neutron += burn_tally_share * r.esc_neutron;
-        state.E_burn_inflight = burn_tally_share * inflight_total;
-        state.N_burn_neutrons_dt += burn_tally_share * r.n_neutrons_dt;
-        state.N_burn_neutrons_dd += burn_tally_share * r.n_neutrons_dd;
-        step_E_numerical_loss += burn_tally_share * skipped;
-        step_E_floor += burn_tally_share * std::max(burn_E_floor, 0.0);
-        step_clamp_count += std::max(burn_clamps, 0);
-        step_E_burn_in += burn_tally_share * (dep_e_total + dep_i_total);
-        const double burn_delta_E_ext =
-            std::max(dep_e_total + dep_i_total - skipped, 0.0) +
-            std::max(burn_E_floor, 0.0);
-        record_operator_energy("burn", op_energy_before, burn_delta_E_ext);
-      } else if (cfg.burn.scheme == "mc") {
-        bp.scheme = 1;
-        std::vector<double> S_birth;
-        const burn::BurnStageResult r =
-            burn::compute_burn_step_1d(bin,
-                                       bp,
-                                       burn_partition_table(),
-                                       state.burn_n_host,
-                                       dE_e,
-                                       dE_i,
-                                       state.burn_rate_host,
-                                       state.burn_Q_e_host,
-                                       state.burn_Q_i_host,
-                                       &S_birth,
-                                       &neutron_births);
-        store_burn_neutron_diagnostics(r);
-        accumulate_burn_neutron_births();
-        std::vector<double> nh_dE_e;
-        std::vector<double> nh_dE_i;
-        if (cfg.burn.neutron_heating) {
-          nh_dE_e = dE_e;
-          nh_dE_i = dE_i;
-        }
-
-        const std::size_t n_cells_sz = static_cast<std::size_t>(n_cells);
-        const std::size_t mc_capacity_size =
-            burn_mc_pool_capacity_size(n_cells,
-                                       cfg.burn.mc_particles_per_cell);
-        const int mc_capacity = static_cast<int>(mc_capacity_size);
-        TENRYU_ASSERT(state.burn_mc_live >= 0 &&
-                          state.burn_mc_live <= mc_capacity,
-                      "burn MC live count outside pool capacity");
-        const std::size_t mc_live =
-            static_cast<std::size_t>(state.burn_mc_live);
-        ensure_burn_mc_pool_field(state.burn_mc_r, mc_capacity_size, mc_live,
-                                  "burn MC r pool");
-        ensure_burn_mc_pool_field(state.burn_mc_mu, mc_capacity_size, mc_live,
-                                  "burn MC mu pool");
-        ensure_burn_mc_pool_field(state.burn_mc_E, mc_capacity_size, mc_live,
-                                  "burn MC E pool");
-        ensure_burn_mc_pool_field(state.burn_mc_w, mc_capacity_size, mc_live,
-                                  "burn MC w pool");
-        ensure_burn_mc_pool_field(state.burn_mc_slot, mc_capacity_size, mc_live,
-                                  "burn MC slot pool");
-        ensure_burn_mc_pool_field(state.burn_mc_alive, mc_capacity_size, mc_live,
-                                  "burn MC alive pool");
-        if (state.burn_dep_e_dev.size() != n_cells_sz) {
-          state.burn_dep_e_dev.reset(n_cells_sz);
-        }
-        if (state.burn_dep_i_dev.size() != n_cells_sz) {
-          state.burn_dep_i_dev.reset(n_cells_sz);
-        }
-        zero_device_buffer_prefix(state.burn_dep_e_dev, n_cells_sz,
-                                  "burn MC dep_e");
-        zero_device_buffer_prefix(state.burn_dep_i_dev, n_cells_sz,
-                                  "burn MC dep_i");
-
-        std::vector<double> ne_h(n_cells_sz, 0.0);
-        for (int c = 0; c < n_cells; ++c) {
-          const double denom = A_eff_h[static_cast<std::size_t>(c)] *
-                               core::constants::proton_mass;
-          ne_h[static_cast<std::size_t>(c)] =
-              (denom > 0.0)
-                  ? zbar_h[static_cast<std::size_t>(c)] *
-                        rho_h[static_cast<std::size_t>(c)] / denom
-                  : 0.0;
-        }
-        copy_host_to_device_prefix(burn_r_node_dev, x_r_h,
-                                   "burn MC r_node");
-        copy_host_to_device_prefix(burn_vol_dev, vol_h,
-                                   "burn MC vol");
-        copy_host_to_device_prefix(burn_rho_dev, rho_h,
-                                   "burn MC rho");
-        copy_host_to_device_prefix(burn_Te_dev, Te_h,
-                                   "burn MC Te");
-        copy_host_to_device_prefix(burn_Ti_dev, Ti_h,
-                                   "burn MC Ti");
-        copy_host_to_device_prefix(burn_ne_dev, ne_h,
-                                   "burn MC ne");
-        copy_host_to_device_prefix(burn_S_birth_dev, S_birth,
-                                   "burn MC S_birth");
-
-        burn::McParams mp;
-        mp.E_min_keV = cfg.burn.diffusion_E_min_keV;
-        mp.particles_per_cell = cfg.burn.mc_particles_per_cell;
-        mp.seed = static_cast<unsigned long long>(cfg.main.seed);
-        mp.field = burn_field_uniform;
-        mp.field_cells = upload_burn_field_ions("burn MC field ions");
-        const burn::McStepResult mr = burn::mc_transport_step(
-            mp,
-            n_cells,
-            static_cast<long long>(state.step),
-            burn_r_node_dev.data(),
-            burn_rho_dev.data(),
-            burn_Te_dev.data(),
-            burn_Ti_dev.data(),
-            burn_ne_dev.data(),
-            burn_S_birth_dev.data(),
-            burn_vol_dev.data(),
-            dt_op,
-            state.burn_mc_r.data(),
-            state.burn_mc_mu.data(),
-            state.burn_mc_E.data(),
-            state.burn_mc_w.data(),
-            state.burn_mc_slot.data(),
-            state.burn_mc_alive.data(),
-            mc_capacity,
-            &state.burn_mc_live,
-            state.burn_dep_e_dev.data(),
-            state.burn_dep_i_dev.data(),
-            nullptr);
-        TENRYU_ASSERT(!mr.overflow, "burn MC particle pool capacity overflow");
-
-        state.burn_dep_e_dev.copy_to_host(dE_e);
-        state.burn_dep_i_dev.copy_to_host(dE_i);
-        if (cfg.burn.neutron_heating && !nh_dE_e.empty()) {
-          for (int c = 0; c < n_cells; ++c) {
-            const std::size_t idx = static_cast<std::size_t>(c);
-            dE_e[idx] += nh_dE_e[idx];
-            dE_i[idx] += nh_dE_i[idx];
-          }
-        }
-        double dep_e_total = 0.0;
-        double dep_i_total = 0.0;
-        for (int c = 0; c < n_cells; ++c) {
-          const std::size_t idx = static_cast<std::size_t>(c);
-          dep_e_total += dE_e[idx];
-          dep_i_total += dE_i[idx];
-          const double denom = rho_h[idx] * vol_h[idx];
-          if (denom > 1.0e-30) {
-            state.burn_eps_cum_host[idx] += (dE_e[idx] + dE_i[idx]) / denom;
-          }
-          if (vol_h[idx] > 0.0 && dt_op > 0.0) {
-            state.burn_Q_e_host[idx] = dE_e[idx] / (vol_h[idx] * dt_op);
-            state.burn_Q_i_host[idx] = dE_i[idx] / (vol_h[idx] * dt_op);
-          } else {
-            state.burn_Q_e_host[idx] = 0.0;
-            state.burn_Q_i_host[idx] = 0.0;
-          }
-        }
-
-        double dt_limit = std::numeric_limits<double>::infinity();
-        for (int c = 0; c < n_cells; ++c) {
-          const std::size_t idx = static_cast<std::size_t>(c);
-          const double P_dep_c = (dE_e[idx] + dE_i[idx]) / dt_op;
-          if (P_dep_c > 0.0) {
-            const double e_cell =
-                rho_h[idx] * vol_h[idx] * std::max(ee_h[idx] + ei_h[idx], 0.0);
-            if (e_cell > 0.0) {
-              const double cand =
-                  cfg.burn.explicit_source_limit * e_cell / P_dep_c;
-              dt_limit = std::min(dt_limit, cand);
-            }
-          }
-        }
-
-        double burn_E_floor = 0.0;
-        int burn_clamps = 0;
-        const double skipped = inject_burn_source_terms(
-            state, cfg, dE_e, dE_i, &burn_E_floor, &burn_clamps, &eos_ctx);
-        refresh_mie_gruneisen_thermo_from_energy(state, cfg, eos_ctx, reclose_ctx);
-        state.burn_enabled_any = true;
-        state.burn_mc_any = true;
-        state.burn_released_step =
-            burn_tally_share * (r.released_charged + r.released_neutron);
-        state.burn_dep_e_step = burn_tally_share * dep_e_total;
-        state.burn_dep_i_step = burn_tally_share * dep_i_total;
-        state.burn_esc_charged_step = burn_tally_share * mr.escaped_erg;
-        state.burn_esc_neutron_step = burn_tally_share * r.esc_neutron;
-        state.burn_nh_dep_e_step = burn_tally_share * r.nh_dep_e;
-        state.burn_nh_dep_i_step = burn_tally_share * r.nh_dep_i;
-        state.burn_nh_degraded_step = burn_tally_share * r.nh_degraded;
-        state.burn_nh_escaped_step = burn_tally_share * r.nh_escaped;
-        // The reaction stage's own limit (fuel depletion beyond subcycle_max
-        // substeps, neutron-heating deposition) applies here too.
-        state.burn_dt_limit_s = std::min(dt_limit, r.dt_limit_s);
-        state.E_burn_released += state.burn_released_step;
-        state.E_burn_dep_e += burn_tally_share * dep_e_total;
-        state.E_burn_dep_i += burn_tally_share * dep_i_total;
-        state.E_burn_esc_charged += burn_tally_share * mr.escaped_erg;
-        state.E_burn_esc_neutron += burn_tally_share * r.esc_neutron;
-        state.E_burn_inflight = burn_tally_share * mr.inflight_erg;
-        state.N_burn_neutrons_dt += burn_tally_share * r.n_neutrons_dt;
-        state.N_burn_neutrons_dd += burn_tally_share * r.n_neutrons_dd;
-        step_E_numerical_loss += burn_tally_share * skipped;
-        step_E_floor += burn_tally_share * std::max(burn_E_floor, 0.0);
-        step_clamp_count += std::max(burn_clamps, 0);
-        step_E_burn_in += burn_tally_share * (dep_e_total + dep_i_total);
-        const double burn_delta_E_ext =
-            std::max(dep_e_total + dep_i_total - skipped, 0.0) +
-            std::max(burn_E_floor, 0.0);
-        record_operator_energy("burn", op_energy_before, burn_delta_E_ext);
+        run_burn_transport_1d(r, burn_S_birth_dev.data(), field_cells, d_nh, d_nh + n);
       } else {
         const burn::BurnStageResult r =
             burn::compute_burn_step_1d(bin,
@@ -11191,34 +11168,7 @@ void Driver::run(core::State& state,
         int burn_clamps = 0;
         const double skipped = inject_burn_source_terms(
             state, cfg, dE_e, dE_i, &burn_E_floor, &burn_clamps, &eos_ctx);
-        refresh_mie_gruneisen_thermo_from_energy(state, cfg, eos_ctx, reclose_ctx);
-        state.burn_enabled_any = true;
-        state.burn_released_step =
-            burn_tally_share * (r.released_charged + r.released_neutron);
-        state.burn_dep_e_step = burn_tally_share * r.dep_e;
-        state.burn_dep_i_step = burn_tally_share * r.dep_i;
-        state.burn_esc_charged_step = burn_tally_share * r.esc_charged;
-        state.burn_esc_neutron_step = burn_tally_share * r.esc_neutron;
-        state.burn_nh_dep_e_step = burn_tally_share * r.nh_dep_e;
-        state.burn_nh_dep_i_step = burn_tally_share * r.nh_dep_i;
-        state.burn_nh_degraded_step = burn_tally_share * r.nh_degraded;
-        state.burn_nh_escaped_step = burn_tally_share * r.nh_escaped;
-        state.burn_dt_limit_s = r.dt_limit_s;
-        state.E_burn_released += state.burn_released_step;
-        state.E_burn_dep_e += burn_tally_share * r.dep_e;
-        state.E_burn_dep_i += burn_tally_share * r.dep_i;
-        state.E_burn_esc_charged += burn_tally_share * r.esc_charged;
-        state.E_burn_esc_neutron += burn_tally_share * r.esc_neutron;
-        state.N_burn_neutrons_dt += burn_tally_share * r.n_neutrons_dt;
-        state.N_burn_neutrons_dd += burn_tally_share * r.n_neutrons_dd;
-        step_E_numerical_loss += burn_tally_share * skipped;
-        step_E_floor += burn_tally_share * std::max(burn_E_floor, 0.0);
-        step_clamp_count += std::max(burn_clamps, 0);
-        step_E_burn_in += burn_tally_share * (r.dep_e + r.dep_i);
-        const double burn_delta_E_ext =
-            std::max(r.dep_e + r.dep_i - skipped, 0.0) +
-            std::max(burn_E_floor, 0.0);
-        record_operator_energy("burn", op_energy_before, burn_delta_E_ext);
+        book_local_burn(r, skipped, burn_E_floor, burn_clamps);
       }
       wj_audit_log("burn", wj_b_burn);
       log_phase_energy("burn_callback", e_before_phase);
@@ -11950,12 +11900,15 @@ void Driver::run(core::State& state,
         auto& backup_Ti = thermal_subcycle_scratch.Ti;
         auto& backup_Pe = thermal_subcycle_scratch.Pe;
         auto& backup_Pi = thermal_subcycle_scratch.Pi;
-        copy_device_field(backup_ee, state.ee, "thermal-subcycle backup ee");
-        copy_device_field(backup_ei, state.ei, "thermal-subcycle backup ei");
-        copy_device_field(backup_Te, state.Te, "thermal-subcycle backup Te");
-        copy_device_field(backup_Ti, state.Ti, "thermal-subcycle backup Ti");
-        copy_device_field(backup_Pe, state.Pe, "thermal-subcycle backup Pe");
-        copy_device_field(backup_Pi, state.Pi, "thermal-subcycle backup Pi");
+        // The backups below are copied together (DeviceFieldCopies) once all
+        // of them are listed.
+        DeviceFieldCopies backup_copies;
+        backup_copies.add(backup_ee, state.ee);
+        backup_copies.add(backup_ei, state.ei);
+        backup_copies.add(backup_Te, state.Te);
+        backup_copies.add(backup_Ti, state.Ti);
+        backup_copies.add(backup_Pe, state.Pe);
+        backup_copies.add(backup_Pi, state.Pi);
         // 2026-07-26 review: the retry rollback must be
         // transactional for the deterministic FLD/S_N lanes. A failed
         // attempt has already advanced the radiation prognostic state
@@ -11983,9 +11936,9 @@ void Driver::run(core::State& state,
         auto& backup_cv_e = thermal_subcycle_scratch.cv_e;
         auto& backup_cv_i = thermal_subcycle_scratch.cv_i;
         auto& backup_zbar = thermal_subcycle_scratch.zbar;
-        copy_device_field(backup_cv_e, state.cv_e, "thermal-subcycle backup cv_e");
-        copy_device_field(backup_cv_i, state.cv_i, "thermal-subcycle backup cv_i");
-        copy_device_field(backup_zbar, state.zbar, "thermal-subcycle backup zbar");
+        backup_copies.add(backup_cv_e, state.cv_e);
+        backup_copies.add(backup_cv_i, state.cv_i);
+        backup_copies.add(backup_zbar, state.zbar);
         const double saved_step_E_floor = step_E_floor;
         const int saved_step_clamp_count = step_clamp_count;
         const bool saved_conduction_retry_requested = conduction_retry_requested;
@@ -11993,16 +11946,12 @@ void Driver::run(core::State& state,
         // The S_N material Newton ORs its full-step rejection request into
         // this flag; a discarded attempt's request must not reject the step.
         const int saved_sn_material_retry_flag = state.sn_material_retry_flag;
-        copy_device_field(backup_rad_E, state.rad_E,
-                          "thermal-subcycle backup rad_E");
-        copy_device_field(backup_rad_E_old, state.rad_E_old,
-                          "thermal-subcycle backup rad_E_old");
-        copy_device_field(backup_sn_psi_prev, state.sn_psi_prev,
-                          "thermal-subcycle backup sn_psi_prev");
-        copy_device_field(backup_sn_psi_sd_prev, state.sn_psi_sd_prev,
-                          "thermal-subcycle backup sn_psi_sd_prev");
-        copy_device_field(backup_sn_ee_node_offset, state.sn_ee_node_offset,
-                          "thermal-subcycle backup sn_ee_node_offset");
+        backup_copies.add(backup_rad_E, state.rad_E);
+        backup_copies.add(backup_rad_E_old, state.rad_E_old);
+        backup_copies.add(backup_sn_psi_prev, state.sn_psi_prev);
+        backup_copies.add(backup_sn_psi_sd_prev, state.sn_psi_sd_prev);
+        backup_copies.add(backup_sn_ee_node_offset, state.sn_ee_node_offset);
+        backup_copies.launch();
         const double saved_step_E_rad_esc = step_E_rad_esc;
         const double saved_step_E_marshak_in = step_E_marshak_in;
         const double saved_step_E_volume_in = step_E_volume_in;
@@ -13918,45 +13867,7 @@ void Driver::run(core::State& state,
         force_rezone_every_n_steps > 0 &&
         (state.step % force_rezone_every_n_steps) == 0;
 
-    if (is_1d && cfg.numerics.hydro.enabled && cfg.numerics.ale1d.enabled) {
-      // 1D V3 ALE is a conservative remap between hydro steps. Unlike the
-      // pure Lagrangian 1D hydro update, state.mass may change after this call.
-      hydro::entropy_ledger_begin(
-          state, cfg, hydro::EntropyLedgerStage::Ale);
-      const auto ale1d_out = hydro::ale1d::apply_ale_1d(state, cfg, &eos_ctx);
-      hydro::entropy_ledger_end(
-          state, cfg, hydro::EntropyLedgerStage::Ale);
-      static int ale1d_reject_logged = 0;
-      if ((ale1d_out.cadence_triggered || ale1d_out.quality_triggered ||
-           ale1d_out.floor_triggered) &&
-          !ale1d_out.applied && ale1d_reject_logged < 5) {
-        std::ostringstream message;
-        message << std::scientific << std::setprecision(3)
-                << "[ale1d] step=" << state.step << " triggered(cad="
-                << (ale1d_out.cadence_triggered ? 1 : 0)
-                << " qual=" << (ale1d_out.quality_triggered ? 1 : 0)
-                << " floor=" << (ale1d_out.floor_triggered ? 1 : 0)
-                << ") NOT applied: reason="
-                << hydro::ale1d::to_string(ale1d_out.skip_reason)
-                << " remap_rejected=" << (ale1d_out.remap_rejected ? 1 : 0)
-                << " candidate_dt_gain=" << ale1d_out.candidate_dt_gain
-                << " mass_err=" << ale1d_out.mass_conservation_rel_err
-                << " energy_err=" << ale1d_out.energy_conservation_rel_err
-                << " radiation_conservation_rel_err="
-                << ale1d_out.radiation_conservation_rel_err
-                << " kinetic_energy_drift_rel="
-                << ale1d_out.kinetic_energy_drift_rel;
-        core::log_info(message.str());
-        ++ale1d_reject_logged;
-      }
-      state.ale_rezoned = ale1d_out.applied;
-      if (state.ale_rezoned) {
-        state.ale_rezone_invocations += 1;
-        // Remap moves volFrac between cells; the shared per-cell effective
-        // material properties must be rebuilt before the next closure.
-        state.invalidate_cell_material_props();
-      }
-	    } else if (is_2d && cfg.numerics.hydro.enabled &&
+    if (is_2d && cfg.numerics.hydro.enabled &&
 	               cfg.mesh.motion == "ale" && cfg.numerics.ale.enabled &&
 	               cfg.numerics.ale.conservative_remap_enabled &&
 	               !hydro::ale::ale_identity_mode_enabled(cfg) &&
@@ -15555,6 +15466,9 @@ void Driver::run(core::State& state,
 
   if (cfg.output.write_final_snapshot && part_info.rank == 0 &&
       last_plot_step != state.step) {
+    if (cfg.laser.enabled) {
+      laser::sync_laser_snapshot_fields(state, laser_mesh);
+    }
     out.write_snapshot(state, cfg, state.step, state.t, case_name,
                        part_info.rank);
     out.write_run_info(state, cfg);

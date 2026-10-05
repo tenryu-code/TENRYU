@@ -7,6 +7,7 @@ import { defaultFormState, type FormState } from "../src/core/deck/formState";
 import { generateDeck } from "../src/core/deck/generate";
 import { mapRecordedDeck, type DeckRecord, type ImportRule } from "../src/core/deck/deckImport";
 import { UNIT_CHOICES, toCanonical, type UnitKind } from "../src/core/units";
+import { computeMeshNodes1d, isMassMeasure, zoningDensityRegions, zoningPins } from "../src/core/deck/mesh1d";
 
 export const root = path.resolve("..");
 
@@ -75,6 +76,39 @@ function comparableForm(form: FormState): unknown {
     f.mesh.nz = defaultFormState().mesh.nz;
   }
   if (f.mesh.grid1d === "graded") f.mesh.nr = f.mesh.segments.reduce((n,s)=>n+s.nr,0);
+  // 1D mesh methods: a headerless deck carries the nodes of a per-layer table (explicit_nodes)
+  // and the zoning_intent of a recommendation, not the table or the recommendation record.
+  if (f.main.dimension === "1D_SPH") {
+    const d = defaultFormState().mesh;
+    if (f.mesh.grid1d === "layers") {
+      f.mesh.explicitNodes = { nodesCm: computeMeshNodes1d(f) ?? [], source: "" };
+      f.mesh.grid1d = "explicit";
+    }
+    if (f.mesh.grid1d === "recommended") f.mesh.grid1d = "zoning_intent";
+    if (f.mesh.grid1d === "zoning_intent") {
+      const z = f.mesh.zoningIntent;
+      const written = z.densityRegions.length > 0 || isMassMeasure(z.measure);
+      f.mesh.zoningIntent = {
+        ...z,
+        densityRegions: written ? (zoningDensityRegions(f, z) ?? []) : [],
+        pins: zoningPins(f, z),
+        pinInterfaces: false,
+      };
+    }
+    if (f.mesh.grid1d === "explicit") f.mesh.explicitNodes.source = "";
+    f.mesh.recommendation = null;
+    if (f.mesh.grid1d !== "uniform" && f.mesh.grid1d !== "graded") f.mesh.nr = d.nr;
+    f.mesh.layerZoning = d.layerZoning;
+    if (f.mesh.grid1d !== "explicit") f.mesh.explicitNodes = d.explicitNodes;
+    if (f.mesh.grid1d !== "zoning_intent") f.mesh.zoningIntent = d.zoningIntent;
+    if (f.mesh.grid1d === "uniform" || f.mesh.grid1d === "graded") f.mesh.resolutionRequirement = d.resolutionRequirement;
+    else if (f.mesh.resolutionRequirement.apply === "default" && f.mesh.resolutionRequirement.empirical !== null) {
+      f.mesh.resolutionRequirement.apply = "report";
+    }
+  }
+  if (f.hydro.boundaryPressure.mode !== "table") f.hydro.boundaryPressure.points = defaultFormState().hydro.boundaryPressure.points;
+  if (!f.laser.ghostCorona.enabled) f.laser.ghostCorona = defaultFormState().laser.ghostCorona;
+  if (f.laser.depositSmoothPasses === 0) f.laser.depositSmoothAlpha = defaultFormState().laser.depositSmoothAlpha;
   // Reference states and cold-equilibrium parameters are written only in that mode.
   if (f.hydro.inactiveCells !== "cold_equilibrium") {
     f.hydro.coldEquilibrium = defaultFormState().hydro.coldEquilibrium;

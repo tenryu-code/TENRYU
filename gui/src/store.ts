@@ -5,6 +5,13 @@ import type { Backend, ExecResult, DeckImportSettings } from "@tenryu-common/bac
 import RUN_DETACHED_SH from "./core/assets/run_detached.sh?raw";
 import { logLine, logOp } from "@tenryu-common/core/applog";
 import { defaultFormState, validateFormState, type FormState } from "./core/deck/formState";
+import { nodesFromFrozenConfig, recommendationConditionsKey } from "./core/deck/mesh1d";
+import {
+  applyRecommendation,
+  parseRecommendation,
+  placeholderForRecommendation,
+  refinedForConvergence,
+} from "./core/deck/meshRecommend";
 import { extractGuiState } from "./core/deck/roundtrip";
 import { generateDeck, generateDeckForSave } from "./core/deck/generate";
 import { loadDeckText as readDeckText, parseImportEnvironment } from "./core/deck/loadDeck";
@@ -17,7 +24,7 @@ import { parseProfile, type ProfileSnapshot } from "@tenryu-common/core/results/
 import { parseSnapshotMesh, type SnapshotMesh2D } from "@tenryu-common/core/results/snapshotMesh";
 import { parseTmatGroupBounds } from "@tenryu-common/core/results/tmatBounds";
 import { isTerminal, parseStatusFile, type RunRecord } from "@tenryu-common/core/runstate";
-import { joinRemote, shQuotePath } from "@tenryu-common/core/ssh";
+import { joinRemote, shQuote, shQuotePath } from "@tenryu-common/core/ssh";
 import { toCanonical } from "./core/units";
 import {
   continuationArgs,
@@ -163,6 +170,24 @@ function withRepoEnv(root: string | null, argv: string[]): string[] {
   return root === null ? argv : ["env", `TENRYU_REPO=${root}`, ...argv];
 }
 
+/** Like withRepoEnv, and run from the checkout itself, so that a deck's relative table paths
+ *  (TMAT-H5/...) resolve as they do from the repository root (validate writes no files). A
+ *  relative path argument (a profile's binary or run directory written relative to the login
+ *  directory) keeps meaning the same file: it is anchored at the login directory before the cd. */
+export function inRepoRoot(root: string | null, argv: string[]): string[] {
+  if (root === null) return argv;
+  const quote = (arg: string) =>
+    arg.includes("/") && !arg.startsWith("/") && !arg.startsWith("~") && !arg.startsWith("-")
+      ? `"$TENRYU_LOGIN_DIR"/${shQuote(arg)}`
+      : shQuotePath(arg);
+  const command = argv.map(quote).join(" ");
+  return [
+    "bash",
+    "-lc",
+    `TENRYU_LOGIN_DIR=$PWD; cd ${shQuotePath(root)} && exec env TENRYU_REPO=${shQuotePath(root)} ${command}`,
+  ];
+}
+
 /** Expand a leading ~ against the profile's remote home (ssh) — local requires absolute. */
 async function absRemotePath(profile: ServerProfile, p: string): Promise<string> {
   if (!p.startsWith("~")) return p;
@@ -210,8 +235,19 @@ export interface AppState {
   validateResult: ValidateResult | null;
   validateSentTo: string | null;
   meshPreview: MeshPreviewData | null;
+  /** The deck text meshPreview was made from (the preview is current while it equals deck). */
+  meshPreviewDeck: string | null;
   meshPreviewBusy: boolean;
   meshPreviewError: string | null;
+  /** recommend-mesh on the server for the form (the "recommended" 1D mesh method). */
+  meshRecommend: { status: "idle" | "running" | "error" | "done"; error?: string; detail?: string };
+  recommendMesh(): Promise<void>;
+  /** Node radii [cm] of a run: its frozen configuration's explicit nodes, or validate --mesh-preview
+   *  of the deck it ran. */
+  readRunNodes(runId: string): Promise<{ nodes: number[]; source: string } | { error: string }>;
+  /** The finer member of a convergence pair (refinedForConvergence): save it, or run it. */
+  saveFinePair(): Promise<boolean>;
+  runFinePair(): Promise<void>;
   meshSnapshot: SnapshotMesh2D | null;
   meshSnapshotBusy: boolean;
   meshSnapshotError: string | null;
@@ -489,7 +525,7 @@ export const useApp = create<AppState>()((set, get) => {
       await be().uploadText(profile, remoteDeck, deckText);
       const r: ExecResult = await be().exec(
         profile,
-        withRepoEnv(root, [profile.tenryuBin, "validate", remoteDeck]),
+        inRepoRoot(root, [profile.tenryuBin, "validate", remoteDeck]),
         { timeoutMs: 120000 },
       );
       return {
@@ -557,8 +593,10 @@ export const useApp = create<AppState>()((set, get) => {
     validateResult: null,
     validateSentTo: null,
     meshPreview: null,
+    meshPreviewDeck: null,
     meshPreviewBusy: false,
     meshPreviewError: null,
+    meshRecommend: { status: "idle" },
     meshSnapshot: null,
     meshSnapshotBusy: false,
     meshSnapshotError: null,
@@ -2050,7 +2088,7 @@ export const useApp = create<AppState>()((set, get) => {
         await be().uploadText(profile, remoteDeck, s.deck);
         const r: ExecResult = await be().exec(
           profile,
-          withRepoEnv(root, [profile.tenryuBin, "validate", remoteDeck, "--mesh-preview"]),
+          inRepoRoot(root, [profile.tenryuBin, "validate", remoteDeck, "--mesh-preview"]),
           { timeoutMs: 120000 },
         );
         const data = parseMeshPreview(r.stdout);
@@ -2063,11 +2101,134 @@ export const useApp = create<AppState>()((set, get) => {
         } else if (data === null) {
           set({ meshPreviewError: t().meshPreview.parseError, meshPreviewBusy: false });
         } else {
-          set({ meshPreview: data, meshPreviewError: null, meshPreviewBusy: false });
+          set({ meshPreview: data, meshPreviewDeck: s.deck, meshPreviewError: null, meshPreviewBusy: false });
         }
       } catch (err) {
         set({ meshPreviewError: String(err), meshPreviewBusy: false });
       }
+    },
+
+    async recommendMesh() {
+      const s = get();
+      const profile = currentProfile(s);
+      const fail = (error: string, detail?: string) => set({ meshRecommend: { status: "error", error, detail } });
+      if (!profile) return fail("NO_PROFILE");
+      if (profileBinMissing(profile)) return fail("NO_BIN");
+      if (s.form.main.dimension !== "1D_SPH" || !s.form.laser.enabled) return fail("NEEDS_LASER");
+      // The recommender reads the target's layers from the solver's samples; a material corona
+      // ramp (density falling continuously outside the surface) would enter as dozens of thin layers
+      // in place of the bare surface its evidence assumes (the ghost corona plays that role).
+      if (s.form.geometry.vacuumOutside1d && s.form.geometry.coronaRamp1d.enabled) return fail("CORONA_RAMP");
+      // The recommender replaces the Mesh block of a deck with any valid mesh; the form's own
+      // mesh may be a stale recommendation, so the deck it reads has a uniform placeholder.
+      const placeholder = placeholderForRecommendation(s.form);
+      const errors = validateFormState(placeholder);
+      if (errors.length > 0) return fail("FORM_INVALID", errors.join("\n"));
+      const key = recommendationConditionsKey(s.form);
+      try {
+        const root = await resolveRepoRoot(profile);
+        if (root === null) return fail("NO_TOOLS");
+        if (!(await probeRemoteAssist(profile, root))) return fail("NO_ASSIST");
+        set({ meshRecommend: { status: "running" } });
+        const base = await absRemotePath(
+          profile,
+          joinRemote(profile.runDir, `validate_scratch/${s.form.main.name}_recommend_mesh`),
+        );
+        const binary = await absRemotePath(profile, profile.tenryuBin);
+        await be().uploadText(profile, `${base}.py`, generateDeck(placeholder));
+        // A stale result must not be read as this run's output.
+        await be().exec(profile, ["rm", "-f", `${base}.json`], { timeoutMs: 15000 });
+        const r = await be().exec(
+          profile,
+          [
+            "bash",
+            "-lc",
+            buildRemoteAssistScript(root, [
+              "recommend-mesh",
+              "--deck",
+              `${base}.py`,
+              "--deck-out",
+              `${base}_out.py`,
+              "-o",
+              `${base}.json`,
+              "--tenryu",
+              binary,
+            ]),
+          ],
+          { timeoutMs: 900000 },
+        );
+        let text = "";
+        try {
+          text = await be().readText(profile, `${base}.json`, 8 * 1024 * 1024);
+        } catch {
+          text = "";
+        }
+        if (text.trim().length === 0) return fail("RECOMMEND_FAILED", (r.stderr || r.stdout).slice(-1200));
+        const rec = parseRecommendation(text);
+        if (rec.status === "failed") {
+          return fail("NOT_VALIDATED", [...rec.attemptErrors, (r.stderr || "").slice(-600)].filter((x) => x.length > 0).join("\n"));
+        }
+        if (recommendationConditionsKey(get().form) !== key) return fail("FORM_CHANGED");
+        get().updateForm((f) => applyRecommendation(f, rec, key, binary, new Date().toISOString()));
+        set({ meshRecommend: { status: "done" } });
+      } catch (err) {
+        fail("EXEC_FAILED", String(err));
+      }
+    },
+
+    async readRunNodes(runId) {
+      const rec = get().runs.find((r) => r.id === runId);
+      if (!rec || rec.runDir === "") return { error: "NO_RUN" };
+      const profile = get().profiles.find((p) => p.id === rec.profileId);
+      if (!profile) return { error: "NO_PROFILE" };
+      try {
+        const latest = await be().exec(profile, ["bash", "-lc", buildLatestOutputDirScript(rec.runDir)], {
+          timeoutMs: 20000,
+        });
+        const dir = latest.stdout.split("\n").map((line) => line.trim()).filter((line) => line.length > 0).pop() ?? "";
+        if (dir !== "") {
+          try {
+            // The solver writes the frozen configuration as <output dir>/config/<case>_frozen.json.
+            const found = await be().exec(
+              profile,
+              ["bash", "-lc", `ls -1 ${shQuotePath(dir)}/config/*_frozen.json 2>/dev/null | head -n 1`],
+              { timeoutMs: 20000 },
+            );
+            const frozen = found.stdout.trim();
+            if (frozen !== "") {
+              const text = await be().readText(profile, frozen, 64 * 1024 * 1024);
+              const nodes = nodesFromFrozenConfig(JSON.parse(text));
+              if (nodes !== null) return { nodes, source: `${rec.name}: ${frozen.split("/").pop()}` };
+            }
+          } catch {
+            /* no frozen configuration, or one without explicit nodes: ask the solver */
+          }
+        }
+        if (profileBinMissing(profile)) return { error: "NO_BIN" };
+        const root = await resolveRepoRoot(profile);
+        const r = await be().exec(
+          profile,
+          inRepoRoot(root, [profile.tenryuBin, "validate", joinRemote(rec.runDir, "deck.py"), "--mesh-preview"]),
+          { timeoutMs: 120000 },
+        );
+        const data = parseMeshPreview(r.stdout);
+        if (data === null || data.rNodes === null) return { error: "NO_NODES" };
+        return { nodes: data.rNodes, source: `${rec.name}: validate --mesh-preview` };
+      } catch (err) {
+        return { error: String(err) };
+      }
+    },
+
+    async saveFinePair() {
+      const fine = refinedForConvergence(get().form);
+      if (validateFormState(fine).length > 0) return false;
+      return await get().saveTextAs(`${fine.main.name}.py`, generateDeck(fine));
+    },
+
+    async runFinePair() {
+      const fine = refinedForConvergence(get().form);
+      if (validateFormState(fine).length > 0) return;
+      await get().startRun({ deck: generateDeck(fine), name: fine.main.name });
     },
 
     async fetchMeshSnapshot() {

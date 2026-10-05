@@ -82,6 +82,13 @@ struct CbetWorkspace {
   int n_ports = 0;  // canonical port count
   int G_ref = 0;    // reference groups = n_branches * n_bins (keys/segments stay G_ref)
   double* rec_w_ps = nullptr;    // [n_ports * n_rays_total * cap_per_ray]
+  double* rec_em1 = nullptr;     // [n_rays_total * cap_per_ray] expm1(-S/2) of each record
+  // final pass: the IB deposit of each half record [n_ports * live records * 2] and the
+  // unabsorbed and clamp-injected power of each (port, ray) [n_ports * n_rays_total], added to the
+  // rows in port order by cbet_ps_deposit_rows_kernel
+  double* ps_dep_terms = nullptr;
+  double* ps_port_unabs = nullptr;
+  double* ps_port_clamp = nullptr;
   double* port_weight = nullptr; // [n_ports] device copy of power weights
   // ps-mode hot-e capture (port_section + eta_mode=model only)
   int ps_n_channels = 0;                 // config channels (<= kMaxSources)
@@ -148,6 +155,7 @@ struct CbetWorkspace {
   double* clamp_rows = nullptr;  // [n_rays_total] final-pass clamp-injected power per ray
   // device scalars/counters
   double* d_scalars = nullptr;                 // [8]
+  double* stats_partial = nullptr;             // [5 * 256] partial sums of the iteration statistics
   double* d_iaw_sum = nullptr;                 // [1]
   unsigned long long* d_counters = nullptr;    // [4]
   // host-side beam bookkeeping
@@ -171,12 +179,76 @@ struct CbetWorkspace {
   std::size_t cap_rows = 0;
   std::size_t cap_dep_nodes = 0;
   std::size_t cap_rec_w_ps = 0;
+  std::size_t cap_rec_em1 = 0;
+  std::size_t cap_ps_dep_terms = 0;
+  std::size_t cap_ps_port_unabs = 0;
+  std::size_t cap_ps_port_clamp = 0;
   std::size_t cap_port_weight = 0;
   std::size_t cap_ps_cell_nhat = 0;
   std::size_t cap_ps_capture_thresh = 0;
   std::size_t cap_ps_capture_order = 0;
   std::size_t cap_ps_one_minus_eta = 0;
   std::size_t cap_ps_capture_stage = 0;
+
+  // --- 1D step stages on the device and their outputs (cbet_stage_gpu.cuh) ---
+  double* cell_A_eff = nullptr;          // [n_cells] effective mass number of the cell
+  double* material_A_device = nullptr;   // [n_materials] the laser mesh's material A list
+  std::vector<double> material_A_uploaded;  // host copy of material_A_device
+  double* viz_gross = nullptr;           // [n_cells] 0.5 sum_g |dQ| / V of the final iteration
+  double* viz_net_inbound = nullptr;     // [n_cells] sum of dQ over the inbound groups / V
+  double* viz_dq_abs_cell = nullptr;     // [n_cells] sum_g |dQ| (audit)
+  double* viz_dq_max_cell = nullptr;     // [n_cells] max_g |dQ| (audit)
+  double* ps_outgoing = nullptr;         // [n_ports] outgoing power per port [erg/s]
+  double* ps_capture_pcross = nullptr;   // [n_ports * n config channels] captured power [erg/s]
+  std::int32_t* ps_capture_row_config = nullptr;  // [capture rows] config channel a row adds to, or -1
+  double* step_out = nullptr;            // device side of the step readback (cbet_read_step_outputs)
+  int* step_flags = nullptr;             // device error flags of the step stages
+  double* step_out_host = nullptr;       // pinned host side of step_out
+  int* step_flags_host = nullptr;        // pinned host side of step_flags
+  std::size_t cap_cell_outputs = 0;      // cell_A_eff
+  std::size_t cap_viz = 0;               // viz_gross, viz_net_inbound, viz_dq_abs_cell, viz_dq_max_cell
+  std::size_t cap_material_A = 0;
+  std::size_t cap_ps_outgoing = 0;
+  std::size_t cap_ps_capture_pcross = 0;
+  std::size_t cap_ps_capture_row_config = 0;
+  std::size_t cap_step_out = 0;
+  int ps_capture_config_channels = 0;    // config channels of ps_capture_pcross
+  bool viz_valid = false;                // viz_* hold a step's maps
+  bool ps_outputs_valid = false;         // ps_outgoing / ps_capture_pcross hold a step's values
+  // port_section tables staged for the solve: uploaded again only when the values or the device
+  // array change (a legacy-mode preparation writes the same arrays and resets these).
+  template <typename T>
+  struct StagedUpload {
+    std::vector<T> values;
+    const void* device = nullptr;
+  };
+  StagedUpload<double> ps_staged_omega;
+  StagedUpload<double> ps_staged_weight;
+  StagedUpload<std::int16_t> ps_staged_pair_p;
+  StagedUpload<std::int16_t> ps_staged_pair_q;
+  StagedUpload<std::int32_t> ps_staged_pair_index;
+  // Legacy mode: the beams' frequencies on the device, from which a kernel fills omega_group.
+  double* beam_omega_device = nullptr;   // [n_beams]
+  std::size_t cap_beam_omega = 0;
+  StagedUpload<double> legacy_staged_beam_omega;
+  // The solve's scalar readbacks: the record total after the scan (device), and the pinned host
+  // side of the per-iteration statistics and of the final counters and sums.
+  struct SolveReadback {
+    std::int64_t records_total;
+    double stats[5];
+    unsigned long long counters[4];  // [0] clamps, [1] capped pairs, [2] overflowed rays
+    double iaw_sum;
+    double clamped_power;
+  };
+  std::int64_t* d_records_total = nullptr;  // [1]
+  SolveReadback* solve_host = nullptr;      // pinned
+  void reset_ps_staged_uploads() {
+    ps_staged_omega = {};
+    ps_staged_weight = {};
+    ps_staged_pair_p = {};
+    ps_staged_pair_q = {};
+    ps_staged_pair_index = {};
+  }
 
   CbetWorkspace() = default;
   ~CbetWorkspace();
@@ -269,8 +341,22 @@ void cbet_stage_ray_meta(CbetWorkspace& ws,
                          const double* d_ray_power,
                          cudaStream_t stream = nullptr);
 
+// Constants of the per-cell plasma pack for a laser wavelength (shared by the host and device
+// stages so that both use the same values).
+struct CbetCellFieldConstants {
+  double c = 0.0;            // speed of light [cm/s]
+  double eV = 0.0;           // erg per eV
+  double omega0 = 0.0;       // laser angular frequency [1/s]
+  double n_crit = 0.0;       // critical electron density [cm^-3]
+  double lam_pref = 0.0;     // lambda0 e^2 / (c^3 m_e) [cm s]
+  double proton_mass = 0.0;  // [g]
+};
+CbetCellFieldConstants cbet_cell_field_constants(double lambda0_cm);
+
 // Builds the per-cell plasma pack from the 1D hydro mirror + State (Ti, node
 // velocities, cell volumes are copied device->host->device here; all cgs+eV).
+// The production 1D step uses cbet_stage_cell_fields_device (cbet_stage_gpu.cuh); this host
+// version is the reference of its tests.
 void cbet_stage_cell_fields(CbetWorkspace& ws,
                             const core::State& state,
                             const HydroMirror1D& mirror,

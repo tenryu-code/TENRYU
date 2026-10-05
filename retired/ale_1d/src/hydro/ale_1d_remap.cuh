@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <vector>
 
 #include <cuda_runtime.h>
@@ -169,6 +170,16 @@ Ale1dRemapResult remap_v3(
     const std::vector<double>& r_candidate,
     const NodeConstraintMask& node_mask,
     const std::vector<int>& additional_protected_faces,
+    Ale1dRemapScratch& scratch);
+
+// remap_v3 with the candidate on the device: its n + 1 node radii, the node mask (1 where pinned)
+// and the protected faces (1 for the end nodes, the pinned nodes and the features' faces).
+Ale1dRemapResult remap_v3_device(
+    const core::State& state,
+    const core::Config& cfg,
+    const double* d_r_candidate,
+    const std::uint8_t* d_pinned,
+    const std::uint8_t* d_protected_face,
     Ale1dRemapScratch& scratch);
 
 Ale1dRemapResult remap_first_order(const core::State& state,

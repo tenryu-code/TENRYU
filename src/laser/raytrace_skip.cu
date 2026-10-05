@@ -1,7 +1,10 @@
 #include "laser/raytrace_skip.cuh"
 
+#include <math_constants.h>
+
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <limits>
 #include <numeric>
 #include <vector>
@@ -129,6 +132,73 @@ __global__ void ray_skip_check_kernel(double* __restrict__ delta_max_cell,
                              use_l2_relative, n_cells);
 }
 
+// One row of the 1D normalised deposits: deposit / divisor (laser.cu's former host loop, the
+// divisor max(P, 1e-30) made on the host).
+__global__ void fhat_row_kernel(double* __restrict__ row, const double* __restrict__ deposit,
+                                const double divisor, const int n_cells) {
+  const int c = blockIdx.x * blockDim.x + threadIdx.x;
+  if (c < n_cells) {
+    row[c] = deposit[c] / divisor;
+  }
+}
+
+constexpr int kMetricThreads = 256;
+
+// should_skip's metric of the cells' changes, one block (the former host loop over a copy): the
+// largest change, or sqrt(sum / (3 n)) with the sum in the cells' order in double-double (the host
+// summed in long double); a change that is not finite makes the metric infinite.
+__global__ void skip_metric_kernel(const double* __restrict__ delta, const int n_cells,
+                                   const int use_l2_relative, double* __restrict__ metric) {
+  __shared__ double sh_max[kMetricThreads];
+  __shared__ int sh_bad[kMetricThreads];
+  const int t = threadIdx.x;
+  double m = 0.0;
+  int bad = 0;
+  for (int c = t; c < n_cells; c += blockDim.x) {
+    const double d = delta[c];
+    if (!isfinite(d)) {
+      bad = 1;
+    } else {
+      m = (m < d) ? d : m;  // std::max(metric, d)
+    }
+  }
+  sh_max[t] = m;
+  sh_bad[t] = bad;
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (t < stride) {
+      sh_max[t] = (sh_max[t] < sh_max[t + stride]) ? sh_max[t + stride] : sh_max[t];
+      sh_bad[t] = sh_bad[t] | sh_bad[t + stride];
+    }
+    __syncthreads();
+  }
+  if (t != 0) {
+    return;
+  }
+  if (sh_bad[0] != 0) {
+    *metric = CUDART_INF;
+    return;
+  }
+  if (use_l2_relative == 0) {
+    *metric = sh_max[0];
+    return;
+  }
+  double hi = 0.0;
+  double lo = 0.0;
+  for (int c = 0; c < n_cells; ++c) {
+    const double d = delta[c];
+    // two_sum(hi, d), then the low parts
+    const double s = hi + d;
+    const double bb = s - hi;
+    const double err = (hi - (s - bb)) + (d - bb);
+    const double l = lo + err;
+    hi = s + l;
+    lo = l - (hi - s);
+  }
+  const int n_div = (n_cells > 1) ? n_cells : 1;
+  *metric = sqrt((hi + lo) / (3.0 * static_cast<double>(n_div)));
+}
+
 __global__ void reconstruct_laser_dep_kernel(double* __restrict__ laser_dep,
                                              const double* __restrict__ f_hat,
                                              const double* __restrict__ P_g_dt,
@@ -175,6 +245,25 @@ void RaytraceSkipCache::release() {
   if (d_crit_hit != nullptr) {
     cuda_check(cudaFree(d_crit_hit), "RaytraceSkipCache::release cudaFree d_crit_hit failed");
     d_crit_hit = nullptr;
+  }
+  if (f_hat_step != nullptr) {
+    cuda_check(cudaFree(f_hat_step), "RaytraceSkipCache::release cudaFree f_hat_step failed");
+    f_hat_step = nullptr;
+  }
+  cap_f_hat_step = 0;
+  if (d_metric != nullptr) {
+    cuda_check(cudaFree(d_metric), "RaytraceSkipCache::release cudaFree d_metric failed");
+    d_metric = nullptr;
+  }
+  if (d_A_mat != nullptr) {
+    cuda_check(cudaFree(d_A_mat), "RaytraceSkipCache::release cudaFree d_A_mat failed");
+    d_A_mat = nullptr;
+  }
+  cap_A_mat = 0;
+  A_mat_uploaded.clear();
+  if (readback != nullptr) {
+    cuda_check(cudaFreeHost(readback), "RaytraceSkipCache::release cudaFreeHost readback failed");
+    readback = nullptr;
   }
 
   n_cells = 0;
@@ -256,7 +345,8 @@ bool RaytraceSkipCache::should_skip(const core::State& state,
                                     double* metric_out,
                                     bool* eligible_out,
                                     bool* crit_hit_out,
-                                    const bool cbet_active) {
+                                    const bool cbet_active,
+                                    const bool metric_on_device) {
   if (metric_out != nullptr) {
     *metric_out = std::numeric_limits<double>::infinity();
   }
@@ -408,12 +498,34 @@ bool RaytraceSkipCache::should_skip(const core::State& state,
        static_cast<std::size_t>(n_cells) * static_cast<std::size_t>(n_mat_total));
   const int n_mat_kernel = use_multimat_Aeff ? n_mat_total : std::min(1, n_mat_total);
   const double* volfrac_ptr = use_multimat_Aeff ? state.volFrac.data() : nullptr;
-  double* d_A_mat = nullptr;
-  if (n_mat_kernel > 0) {
-    cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_A_mat),
+  double* d_A_mat_call = nullptr;
+  if (n_mat_kernel > 0 && metric_on_device) {
+    // kept on the device, uploaded when the materials' A change
+    const std::size_t n_A = static_cast<std::size_t>(n_mat_kernel);
+    const bool changed = A_mat_uploaded.size() != n_A || d_A_mat == nullptr ||
+                         std::memcmp(A_mat_uploaded.data(), material_A.data(),
+                                     n_A * sizeof(double)) != 0;
+    if (changed) {
+      if (n_A > cap_A_mat) {
+        if (d_A_mat != nullptr) {
+          cuda_check(cudaFree(d_A_mat), "RaytraceSkipCache::should_skip cudaFree d_A_mat failed");
+          d_A_mat = nullptr;
+        }
+        cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_A_mat), n_A * sizeof(double)),
+                   "RaytraceSkipCache::should_skip cudaMalloc d_A_mat failed");
+        cap_A_mat = n_A;
+      }
+      A_mat_uploaded.assign(material_A.begin(), material_A.begin() + n_mat_kernel);
+      cuda_check(cudaMemcpyAsync(d_A_mat, A_mat_uploaded.data(), n_A * sizeof(double),
+                                 cudaMemcpyHostToDevice, stream),
+                 "RaytraceSkipCache::should_skip memcpyAsync d_A_mat failed");
+    }
+    d_A_mat_call = d_A_mat;
+  } else if (n_mat_kernel > 0) {
+    cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_A_mat_call),
                           static_cast<std::size_t>(n_mat_kernel) * sizeof(double)),
                "RaytraceSkipCache::should_skip cudaMalloc d_A_mat failed");
-    cuda_check(cudaMemcpyAsync(d_A_mat, material_A.data(),
+    cuda_check(cudaMemcpyAsync(d_A_mat_call, material_A.data(),
                                static_cast<std::size_t>(n_mat_kernel) * sizeof(double),
                                cudaMemcpyHostToDevice, stream),
                "RaytraceSkipCache::should_skip memcpyAsync d_A_mat failed");
@@ -423,12 +535,57 @@ bool RaytraceSkipCache::should_skip(const core::State& state,
              "RaytraceSkipCache::should_skip memset d_crit_hit failed");
   ray_skip_check_kernel<<<grid, block, 0, stream>>>(delta, d_crit_hit, state.rho.data(),
                                                      state.Te.data(), state.zbar.data(),
-                                                     volfrac_ptr, d_A_mat, n_mat_kernel,
+                                                     volfrac_ptr, d_A_mat_call, n_mat_kernel,
                                                      rho_cached, Te_cached, Zbar_cached,
                                                      rho_floor_use, Te_floor_use, Zbar_floor,
                                                      n_crit, n_hat_margin, skip_cfg.crit_guard,
                                                      A_eff_uniform, use_l2_relative, n_cells);
   cuda_check(cudaGetLastError(), "RaytraceSkipCache::should_skip kernel launch failed");
+
+  if (metric_on_device) {
+    // the metric on the device: two numbers come back instead of the cells' changes
+    if (d_metric == nullptr) {
+      cuda_check(cudaMalloc(reinterpret_cast<void**>(&d_metric), sizeof(double)),
+                 "RaytraceSkipCache::should_skip cudaMalloc d_metric failed");
+    }
+    if (readback == nullptr) {
+      cuda_check(cudaMallocHost(reinterpret_cast<void**>(&readback), 16),
+                 "RaytraceSkipCache::should_skip cudaMallocHost readback failed");
+    }
+    skip_metric_kernel<<<1, kMetricThreads, 0, stream>>>(delta, n_cells, use_l2_relative,
+                                                          d_metric);
+    cuda_check(cudaGetLastError(), "RaytraceSkipCache::should_skip metric kernel launch failed");
+    cuda_check(cudaMemcpyAsync(readback, d_metric, sizeof(double), cudaMemcpyDeviceToHost, stream),
+               "RaytraceSkipCache::should_skip memcpy metric D2H failed");
+    cuda_check(cudaMemcpyAsync(readback + 8, d_crit_hit, sizeof(int), cudaMemcpyDeviceToHost,
+                               stream),
+               "RaytraceSkipCache::should_skip memcpy crit_hit D2H failed");
+    cuda_check(cudaStreamSynchronize(stream),
+               "RaytraceSkipCache::should_skip stream synchronize failed");
+    double metric = 0.0;
+    int crit_hit = 0;
+    std::memcpy(&metric, readback, sizeof(double));
+    std::memcpy(&crit_hit, readback + 8, sizeof(int));
+    if (crit_hit != 0) {
+      if (crit_hit_out != nullptr) {
+        *crit_hit_out = true;
+      }
+      ++ctr_veto_crit;
+      consecutive_skip_count = 0;
+      return false;
+    }
+    if (metric_out != nullptr) {
+      *metric_out = metric;
+    }
+    if (metric < skip_cfg.threshold) {
+      ++ctr_fires;
+      ++consecutive_skip_count;
+      return true;
+    }
+    ++ctr_veto_metric;
+    consecutive_skip_count = 0;
+    return false;
+  }
 
   std::vector<double> h_delta(static_cast<std::size_t>(n_cells), 0.0);
   int crit_hit = 0;
@@ -439,8 +596,8 @@ bool RaytraceSkipCache::should_skip(const core::State& state,
              "RaytraceSkipCache::should_skip memcpy crit_hit D2H failed");
   cuda_check(cudaStreamSynchronize(stream),
              "RaytraceSkipCache::should_skip stream synchronize failed");
-  if (d_A_mat != nullptr) {
-    cuda_check(cudaFree(d_A_mat), "RaytraceSkipCache::should_skip cudaFree d_A_mat failed");
+  if (d_A_mat_call != nullptr) {
+    cuda_check(cudaFree(d_A_mat_call), "RaytraceSkipCache::should_skip cudaFree d_A_mat failed");
   }
 
   if (crit_hit != 0) {
@@ -566,6 +723,78 @@ void RaytraceSkipCache::update_cache(const core::State& state,
              "RaytraceSkipCache::update_cache memcpy f_hat H2D failed");
   cuda_check(cudaStreamSynchronize(stream),
              "RaytraceSkipCache::update_cache stream synchronize failed");
+
+  cached_group_powers.assign(static_cast<std::size_t>(n_groups), 0.0);
+  for (int g = 0; g < n_groups; ++g) {
+    if (g < static_cast<int>(group_powers.size())) {
+      cached_group_powers[static_cast<std::size_t>(g)] =
+          std::max(0.0, group_powers[static_cast<std::size_t>(g)]);
+    }
+  }
+  cached_total_power =
+      std::accumulate(cached_group_powers.begin(), cached_group_powers.end(), 0.0);
+  cached_beam_dirs = beam_dirs;
+  cached_beam_focuses = beam_focuses;
+  cached_beam_defocus = beam_defocus;
+  valid = true;
+  consecutive_skip_count = 0;
+}
+
+void RaytraceSkipCache::begin_fhat_1d(cudaStream_t stream) {
+  if (n_cells <= 0 || n_groups <= 0) {
+    return;
+  }
+  const std::size_t n = static_cast<std::size_t>(n_cells) * static_cast<std::size_t>(n_groups);
+  if (n > cap_f_hat_step || f_hat_step == nullptr) {
+    if (f_hat_step != nullptr) {
+      cuda_check(cudaFree(f_hat_step), "RaytraceSkipCache::begin_fhat_1d cudaFree failed");
+      f_hat_step = nullptr;
+    }
+    cap_f_hat_step = 0;
+    cuda_check(cudaMalloc(reinterpret_cast<void**>(&f_hat_step), n * sizeof(double)),
+               "RaytraceSkipCache::begin_fhat_1d cudaMalloc failed");
+    cap_f_hat_step = n;
+  }
+  cuda_check(cudaMemsetAsync(f_hat_step, 0, n * sizeof(double), stream),
+             "RaytraceSkipCache::begin_fhat_1d memset failed");
+}
+
+void RaytraceSkipCache::set_fhat_1d(const int group, const double* deposit,
+                                    const double group_power, cudaStream_t stream) {
+  if (group < 0 || group >= n_groups || f_hat_step == nullptr) {
+    return;  // as the host rows: a group beyond the cache's is not stored
+  }
+  const double divisor = std::max(group_power, 1.0e-30);
+  const int block = 256;
+  fhat_row_kernel<<<(n_cells + block - 1) / block, block, 0, stream>>>(
+      f_hat_step + static_cast<std::size_t>(group) * static_cast<std::size_t>(n_cells), deposit,
+      divisor, n_cells);
+  cuda_check(cudaGetLastError(), "RaytraceSkipCache::set_fhat_1d launch failed");
+}
+
+void RaytraceSkipCache::update_cache_1d(const core::State& state,
+                                        const std::vector<double>& group_powers,
+                                        const std::vector<Vec3>& beam_dirs,
+                                        const std::vector<Vec3>& beam_focuses,
+                                        const std::vector<double>& beam_defocus,
+                                        cudaStream_t stream) {
+  if (n_cells <= 0 || n_groups <= 0 || f_hat_step == nullptr) {
+    invalidate();
+    return;
+  }
+  const std::size_t cell_bytes = static_cast<std::size_t>(n_cells) * sizeof(double);
+  cuda_check(cudaMemcpyAsync(rho_cached, state.rho.data(), cell_bytes, cudaMemcpyDeviceToDevice,
+                             stream),
+             "RaytraceSkipCache::update_cache_1d memcpy rho D2D failed");
+  cuda_check(cudaMemcpyAsync(Te_cached, state.Te.data(), cell_bytes, cudaMemcpyDeviceToDevice,
+                             stream),
+             "RaytraceSkipCache::update_cache_1d memcpy Te D2D failed");
+  cuda_check(cudaMemcpyAsync(Zbar_cached, state.zbar.data(), cell_bytes, cudaMemcpyDeviceToDevice,
+                             stream),
+             "RaytraceSkipCache::update_cache_1d memcpy Zbar D2D failed");
+  cuda_check(cudaMemcpyAsync(f_hat, f_hat_step, cell_bytes * static_cast<std::size_t>(n_groups),
+                             cudaMemcpyDeviceToDevice, stream),
+             "RaytraceSkipCache::update_cache_1d memcpy f_hat D2D failed");
 
   cached_group_powers.assign(static_cast<std::size_t>(n_groups), 0.0);
   for (int g = 0; g < n_groups; ++g) {

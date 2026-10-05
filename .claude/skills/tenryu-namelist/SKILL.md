@@ -178,7 +178,8 @@ document map from `assist.py docmap --keys-out keys.json` lists every accepted k
 3. **Write the deck**: constants → materials → blocks in the order of §2; a header comment
    with the scientific target, the expected observable window, and the conventions used.
 4. **Mesh**: run `python tools/assist/assist.py recommend-mesh --conditions <json>` (or
-   `--deck <deck> --deck-out <deck>` with a placeholder mesh) and paste the block; keep
+   `--deck <deck> --deck-out <deck>` with a placeholder mesh that has a node at every material
+   interface) and paste the block; keep
    `resolution_requirement=dict(apply="enforce", ...)` and the retry companion. A pasted
    `--conditions` block carries no `motion` or `floors`: add the deck's own (the `--deck`
    route keeps them). With a binary, finish with `recommend-mesh --deck <deck> --deck-out

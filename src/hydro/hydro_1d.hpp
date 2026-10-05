@@ -7,6 +7,7 @@
 #include "core/config.hpp"
 #include "core/state.hpp"
 #include "coupling/hydro_step_result.hpp"
+#include "hydro/adaptive_av_gate.hpp"
 #include "parallel/comm_buffers.hpp"
 #include "parallel/partition.hpp"
 
@@ -31,8 +32,9 @@ class Hydro1D {
   // The EOS closure (1T or 2T, every EOS backend) and the cell sound speed
   // of the current conserved fields, as at the entry of the Lagrangian
   // step. For operators that replace the conserved fields between hydro
-  // steps (the 1D ALE commit), so that the state they leave is the one the
-  // hydro would close.
+  // steps, so that the state they leave is the one the hydro would close
+  // (the 1D ALE commit used it until the 1D ALE was retired on 2026-10-02;
+  // the closure tests of test_hydro_1d_step call it).
   void close_eos_and_sound_speed(core::State& state,
                                  const core::Config& cfg,
                                  const HydroEOSContext* eos_ctx = nullptr) const;
@@ -84,6 +86,9 @@ class Hydro1D {
   mutable core::CellField1D heat_oe_half_pingpong_;
   mutable core::CellField1D q_probe_persist_;
   mutable core::CellField1D div_u_probe_persist_;
+  // The adaptive-AV coefficient fields (Numerics.hydro.adaptive_av), kept across calls so that the
+  // five arrays are sized once instead of allocated and freed on every call.
+  mutable AdaptiveAVFields adaptive_av_fields_;
 };
 
 }  // namespace tenryu::hydro

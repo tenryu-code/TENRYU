@@ -349,7 +349,7 @@ void OutputManager::write_frozen_config(const std::string& case_name,
   TENRYU_ASSERT(!ofs.fail(), "Failed to close frozen config JSON");
 }
 
-void OutputManager::write_snapshot(const tenryu::core::State& state,
+void OutputManager::write_snapshot(tenryu::core::State& state,
                                    const tenryu::core::Config& cfg,
                                    const int step,
                                    const double t,
@@ -358,6 +358,7 @@ void OutputManager::write_snapshot(const tenryu::core::State& state,
   if (cfg.output.format != "hdf5") {
     return;
   }
+  state.sync_burn_arrays_to_host();
   const int file_index = snapshot_count_++;
   HDF5Writer writer;
   // Published by the writer's worker thread; the driver waits for it at the
@@ -367,7 +368,7 @@ void OutputManager::write_snapshot(const tenryu::core::State& state,
 }
 
 void OutputManager::write_checkpoint(
-    const tenryu::core::State& state,
+    tenryu::core::State& state,
     const tenryu::core::Config& cfg,
     const int step,
     const double t,
@@ -376,6 +377,7 @@ void OutputManager::write_checkpoint(
   if (cfg.output.format != "hdf5") {
     return;
   }
+  state.sync_burn_arrays_to_host();
   const int file_index = checkpoint_count_++;
   HDF5Writer writer;
   const std::string checkpoint_path = writer.write_checkpoint(

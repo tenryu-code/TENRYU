@@ -37,6 +37,18 @@ struct RaytraceSkipCache {
   std::vector<Vec3> cached_beam_focuses;
   std::vector<double> cached_beam_defocus;
 
+  // The 1D laser step on the device (laser.cu): the normalised deposits of the current trace,
+  // f_hat_step [n_groups * n_cells] (row g: group g's deposit / max(P_g, 1e-30), zero for a group
+  // without power), stored by update_cache_1d; should_skip's reduction of the cells' changes
+  // (metric_on_device). 2D keeps its host rows.
+  double* f_hat_step = nullptr;
+  std::size_t cap_f_hat_step = 0;
+  double* d_metric = nullptr;   // [1]
+  double* d_A_mat = nullptr;    // the materials' A as last uploaded
+  std::size_t cap_A_mat = 0;
+  std::vector<double> A_mat_uploaded;
+  unsigned char* readback = nullptr;  // pinned: the metric and the critical-crossing flag
+
   RaytraceSkipCache() = default;
   ~RaytraceSkipCache();
   RaytraceSkipCache(const RaytraceSkipCache&) = delete;
@@ -65,7 +77,8 @@ struct RaytraceSkipCache {
                                  double* metric_out = nullptr,
                                  bool* eligible_out = nullptr,
                                  bool* crit_hit_out = nullptr,
-                                 bool cbet_active = false);
+                                 bool cbet_active = false,
+                                 bool metric_on_device = false);
 
   void scale_deposit(core::State& state,
                      const std::vector<double>& group_powers,
@@ -79,6 +92,18 @@ struct RaytraceSkipCache {
                     const std::vector<Vec3>& beam_focuses,
                     const std::vector<double>& beam_defocus,
                     cudaStream_t stream = nullptr);
+
+  // 1D: zeroes f_hat_step (after ensure_capacity); sets group g's row from a device deposit
+  // [n_cells] and the group's power; update_cache with f_hat_step as the rows.
+  void begin_fhat_1d(cudaStream_t stream = nullptr);
+  void set_fhat_1d(int group, const double* deposit, double group_power,
+                   cudaStream_t stream = nullptr);
+  void update_cache_1d(const core::State& state,
+                       const std::vector<double>& group_powers,
+                       const std::vector<Vec3>& beam_dirs,
+                       const std::vector<Vec3>& beam_focuses,
+                       const std::vector<double>& beam_defocus,
+                       cudaStream_t stream = nullptr);
 };
 
 }  // namespace tenryu::laser

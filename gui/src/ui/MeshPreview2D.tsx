@@ -449,9 +449,10 @@ export default function MeshPreview2D({ form }: { form: FormState }) {
           : (j * Math.PI) / data.nz,
       )
     : [];
+  // The local preview of a 2D form always has an axial extent.
   const zl = isPolar
     ? []
-    : (data.zNodes ?? linspace(data.zMin, data.zMax, data.nz + 1));
+    : (data.zNodes ?? linspace(data.zMin as number, data.zMax as number, data.nz + 1));
   const rMax = rl[rl.length - 1];
   const zMin = isPolar ? -rMax : zl[0];
   const zMax = isPolar ? rMax : zl[zl.length - 1];

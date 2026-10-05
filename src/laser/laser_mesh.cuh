@@ -11,6 +11,7 @@
 #include "core/device_error_flags.cuh"
 #include "core/state.hpp"
 #include "laser/bilinear_interpolation.cuh"
+#include "laser/laser_map_1d_gpu.cuh"
 #include "parallel/partition.hpp"
 #include "parallel/reduction.hpp"
 
@@ -168,9 +169,11 @@ struct LaserMesh {
   std::int64_t last_cbet_overflow_rays = 0;
   int last_cbet_iterations = 0;
   bool last_cbet_converged = true;
-  std::vector<std::vector<int>> ray_steps_previous;
-  std::vector<std::vector<int>> ray_steps_output;
-  std::vector<std::vector<int>> ray_order;
+  // Per beam, on the device (Laser.raytrace.integrator="leapfrog" in 1D): the march's per-ray
+  // step counts of the previous trace and of this one, and the longest-first ray order.
+  std::vector<core::DeviceArray<int>> ray_steps_previous;
+  std::vector<core::DeviceArray<int>> ray_steps_output;
+  std::vector<core::DeviceArray<int>> ray_order;
 
   LaserMesh() = default;
   ~LaserMesh();
@@ -278,10 +281,28 @@ void map_from_hydro_1d(LaserMesh& mesh,
                        cudaStream_t stream = nullptr,
                        LaserNodeMaterial1D* node_material = nullptr);
 
+// The inputs of the device map (laser_map_1d_gpu.cuh) for this mesh, configuration and state (sets
+// mesh.laser_turn_on_s on first use, as map_from_hydro_1d does).
+laser_map_1d::MapInputs map_inputs_1d(LaserMesh& mesh,
+                                      const core::State& state,
+                                      const core::Config::LaserConfig& laser_cfg);
+
+// map_from_hydro_1d with its scalar part on the device (laser_map_1d::map_scalars on the device
+// state and the cells' A_eff [n_cells], no hydro mirror): the same layout, ghost corona, mapped
+// fields and trace profile; returns the map's scalars (the allowed supercritical cell, the
+// resonance-absorption inputs and the outermost real cell's Zbar among them).
+laser_map_1d::MapScalars map_from_hydro_1d_device(LaserMesh& mesh,
+                                                  const core::State& state,
+                                                  const core::Config::LaserConfig& laser_cfg,
+                                                  const double* A_eff_device,
+                                                  laser_map_1d::Workspace& map_ws,
+                                                  cudaStream_t stream = nullptr,
+                                                  LaserNodeMaterial1D* node_material = nullptr);
+
 // The nodes of the 1D traces' radial profile
-// (laser_mesh_bodies::build_trace_profile_nodes_1d) placed on the device by one
-// block in parallel over the hydro cells, bitwise the serial placement (which
-// runs for meshes outside the parallel placement's conditions): device inputs
+// (laser_mesh_bodies::build_trace_profile_nodes_1d) placed on the device in
+// parallel over the hydro cells, bitwise the serial placement (which runs for
+// meshes outside the parallel placement's conditions): device inputs
 // as build_trace_profile_nodes_1d takes them, the nodes into out (at most
 // capacity) and their count into *d_count.
 void place_trace_profile_nodes_1d(const double* r_edges,

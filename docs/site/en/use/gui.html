@@ -27,7 +27,7 @@
         <li>Editing the center form immediately updates the Python deck in the right pane.</li>
         <li>Pass both form validation and server-side <code>tenryu validate</code> before saving or running.</li>
         <li>Keep the <code>TENRYU-GUI-STATE</code> comment to restore the complete form from a saved deck.</li>
-        <li>Three physics presets were run to completion on an RTX 4090 on 2026-07-31.</li>
+        <li>Every 1D preset but the CBET one was run to its end time on an RTX 4090 on 2026-10-01 and checked against a run on a twice finer mesh.</li>
       </ul>
     </aside>
 
@@ -58,13 +58,13 @@
 
     <section aria-labelledby="presets">
       <h2 id="presets">Run-validated 1D presets</h2>
-      <p>In addition to a blank setup, the 1D tab under Presets provides three physics presets. These were not merely accepted by the schema: each was run to its endpoint on an RTX 4090 on 2026-07-31 and checked for its characteristic physical result.</p>
+      <p>The 1D tab under Presets has six basic presets (the blank one included) and six that use optional kernels. Every preset but the CBET one was not merely accepted by the schema: it was run to its end time on an RTX 4090 on 2026-10-01 and checked against the same setup run on a twice finer mesh. Each card shows the kernels it uses, how its mesh was made (a recommended mesh or a per-layer table), the material tables it needs, how heavy it is, and the result of its verification run.</p>
       <ul>
-        <li><strong>Radiation slab:</strong> a 120 eV Marshak drive and grey FLD produce a heat front near 35 µm at 1 ns, with a cold region still ahead of it.</li>
-        <li><strong>Laser implosion capsule:</strong> a <a href="../verification/index.html#gxii">GXII</a>-class 10 TW × 1 ns drive (GXII: the GEKKO XII laser — see the linked benchmark definition), DT + CH target, corona ramp, and 20-group FLD gave about 86% absorption and maximum compression near 1.4 ns when the preset was validated on 2026-07-31. This preset's ≈86% is not comparable with the regression deck's ≈93% or the ≈45% of the cross-code benchmark against HELIOS — <a href="examples.html#absorption-numbers">the Examples page</a> lists the three conditions.</li>
-        <li><strong>Indirect-drive Tr(t):</strong> with a Marshak waveform rising from a 120 eV foot to 200 eV, the run follows stagnation at 4.2–4.5 ns and the subsequent rebound.</li>
+        <li><strong>Basic:</strong> blank, a pressure-driven shock (comparable with the exact Rankine-Hugoniot values), a radiation heat wave (Marshak wave), a laser-driven planar foil, a direct-drive shell implosion (GXII class), and an indirect-drive implosion driven by a radiation temperature.</li>
+        <li><strong>Optional kernels:</strong> a radiation-driven planar foil (S_N transport), nonlocal electron transport (SNB), direct drive with CBET and hot electrons, a burning exploding pusher, material tables with multigroup radiation, and a two-layer target in cold equilibrium.</li>
+        <li><strong>Known problems</strong> are written on the cards with the results: the outermost boundary cell that keeps accelerating on finer meshes under a spherical Marshak drive, the mesh dependence of the absorbed energy in the SNB foil (7 %), the clamped values in the table foil, and the 0.6 % density difference behind the pressure-driven shock. The CBET preset is expensive and has not been run to its end time yet.</li>
       </ul>
-      <p><a href="examples.html">The Examples &amp; presets page</a> records the numerical inputs and measured values. When modifying a case, first retain an unmodified short reference run, then vary one input at a time, so that changes in absorption, compression, and output cadence become easier to identify.</p>
+      <p>The presets' numerical conditions and results are collected on <a href="examples.html">the Examples page</a>, which also explains <a href="examples.html#absorption-numbers">why the absorption figures differ between conditions</a>. When changing conditions, save the unchanged preset first as a short reference run and then vary one input at a time; this makes differences in absorption, compression, and output timing easier to trace.</p>
     </section>
 
     <section aria-labelledby="server-execution">

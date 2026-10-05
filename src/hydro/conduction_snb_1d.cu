@@ -13,6 +13,7 @@
 #include "core/deterministic_sum.hpp"
 #include "core/device_scratch.hpp"
 #include "core/error.hpp"
+#include "core/field.hpp"
 #include "core/macros.hpp"
 #include "hydro/conduction.cuh"
 #include "hydro/conduction_bodies.cuh"
@@ -648,6 +649,37 @@ std::vector<double> group_edges_beta(const int n_groups, const double e_max_over
   return edges;
 }
 
+namespace {
+
+// edges[k] = beta[k] kEvToErg t_ref [erg], each product rounded on its own (the host loop's).
+__global__ void snb_edges_kernel(const double* __restrict__ beta, const int n_edges,
+                                 const double t_ref_ev, double* __restrict__ edges) {
+  const int k = blockIdx.x * blockDim.x + threadIdx.x;
+  if (k < n_edges) {
+    edges[k] = __dmul_rn(__dmul_rn(beta[k], conduction_bodies::kEvToErg), t_ref_ev);
+  }
+}
+
+// The reduced group edges (group_edges_beta) of the run in device memory: they depend on the
+// configuration only, so they are formed and uploaded once (again only if the configuration
+// changes).
+const double* device_beta_edges(const int n_groups, const double e_max_over_te) {
+  static int cached_n_groups = -1;
+  static double cached_e_max = std::numeric_limits<double>::quiet_NaN();
+  static core::DeviceArray<double> beta;
+  if (cached_n_groups != n_groups ||
+      std::memcmp(&cached_e_max, &e_max_over_te, sizeof(double)) != 0) {
+    const std::vector<double> host_beta = group_edges_beta(n_groups, e_max_over_te);
+    beta.reset(host_beta.size());
+    beta.copy_from_host(host_beta);
+    cached_n_groups = n_groups;
+    cached_e_max = e_max_over_te;
+  }
+  return beta.data();
+}
+
+}  // namespace
+
 void snb_fill_t_ref(core::State& state, const std::uint8_t* d_cell_is_void,
                     const int n_cells, double* work_scalars) {
   const int blocks = (n_cells + kBlockSize - 1) / kBlockSize;
@@ -677,15 +709,11 @@ void snb_pass(core::State& state,
   const int mfp_variant = (sc.snb_mfp == "original") ? 1 : 0;
   const int efield_local = (sc.snb_efield == "local") ? 1 : 0;
 
-  // Host group edges in erg from the frozen reduced ladder.
-  const std::vector<double> beta_edges = group_edges_beta(n_groups, sc.snb_E_max_over_Te);
-  std::vector<double> edges_erg(beta_edges.size(), 0.0);
-  for (std::size_t k = 0; k < beta_edges.size(); ++k) {
-    edges_erg[k] = beta_edges[k] * conduction_bodies::kEvToErg * t_ref_ev;
-  }
-  cuda_check(cudaMemcpy(work.edges, edges_erg.data(),
-                        edges_erg.size() * sizeof(double), cudaMemcpyHostToDevice),
-             "SNB: edges upload failed");
+  // The group edges in erg from the frozen reduced ladder, on the device.
+  const int n_edges = n_groups + 1;
+  snb_edges_kernel<<<(n_edges + kBlockSize - 1) / kBlockSize, kBlockSize>>>(
+      device_beta_edges(n_groups, sc.snb_E_max_over_Te), n_edges, t_ref_ev, work.edges);
+  cuda_check(cudaGetLastError(), "SNB: edges kernel launch failed");
 
   // Zero the per-pass reduction slots (resid/qsh/dq) and counters; keep TRef.
   const double zeros3[3] = {0.0, 0.0, 0.0};

@@ -5,6 +5,18 @@ import { t } from "../../i18n";
 import { computeRegionSegments2d, computeShapeRadialRegions } from "./meshAuto";
 import { BEAM_PRESETS, expandedPairCount, PAIR_CAP } from "./beamPresets";
 import type { DeckImportState } from "./deckImport";
+import {
+  defaultLayerZoning,
+  defaultResolutionRequirement,
+  defaultZoningIntent,
+  mesh1dErrors,
+  type ExplicitNodesForm,
+  type LayerZoningForm,
+  type MeshMethod1d,
+  type MeshRecommendationMeta,
+  type ResolutionRequirementForm,
+  type ZoningIntentForm,
+} from "./mesh1d";
 
 // Flux-limiter default per electron-transport model. 0.06 is the tuned local
 // (Spitzer-Harm) limiter. Under SNB the cap is a safety guard only (NUMERICS
@@ -122,6 +134,50 @@ export type HotEChannelForm = {
   relaxationTauMaxS: number;
 };
 
+/** Laser.lasermesh.ghost_corona (SPECIFICATION 6.4.6, NUMERICS 5.7.5): a laser-only synthetic
+ *  under-dense profile outside a bare solid surface, so that the laser deposits from the start of
+ *  the pulse. The defaults are the values of the example suite and of the mesh-convergence
+ *  campaign behind recommend-mesh (examples/laser_plasma_1d/ex01_cd_foil_breakout.py), not the
+ *  solver's defaults; meshFactor and rmaxNHatThreshold are the Laser.lasermesh sizing keys written
+ *  together with it. */
+export interface GhostCoronaForm {
+  enabled: boolean;
+  nOut: number;
+  neMinFrac: number;
+  neMaxFrac: number;
+  TeMinEV: number;
+  zbarMin: number;
+  zbarMax: number;
+  handoffCells: number;
+  handoffDecay: number;
+  transitionEnabled: boolean;
+  transitionResolvedNhat: number;
+  transitionResolvedCells: number;
+  transitionDensityExponent: number;
+  meshFactor: number;
+  rmaxNHatThreshold: number;
+}
+
+export function defaultGhostCorona(): GhostCoronaForm {
+  return {
+    enabled: false,
+    nOut: 12,
+    neMinFrac: 0.03,
+    neMaxFrac: 0.99,
+    TeMinEV: 50.0,
+    zbarMin: 1.0,
+    zbarMax: 4.0,
+    handoffCells: 6,
+    handoffDecay: 2.0,
+    transitionEnabled: true,
+    transitionResolvedNhat: 0.9,
+    transitionResolvedCells: 3,
+    transitionDensityExponent: 1.0,
+    meshFactor: 0.1,
+    rmaxNHatThreshold: 0.001,
+  };
+}
+
 export function makeHotEChannel(mechanism: "cone" | "tpd" | "srs"): HotEChannelForm {
   const captureNcFraction = mechanism === "srs" ? 0.18 : 0.25;
   return {
@@ -181,11 +237,19 @@ export interface FormState {
     pibTailRatio: number;
     polarCenterTreatment: "annular" | "tri_fan";
     polarKappa: number;
-    grid1d: "uniform" | "graded";
+    /** 1D mesh method (mesh1d.ts). */
+    grid1d: MeshMethod1d;
     segmentSource: "manual" | "regions";
     segments: MeshSegmentForm[];
     regionNrOverrides: Array<number | null>;
     grading: { edgeRatio: number; sgOrder: number; sgSigma: number };
+    /** Per-layer table of the "layers" method, by layer index (regions, corona, void padding). */
+    layerZoning: LayerZoningForm[];
+    explicitNodes: ExplicitNodesForm;
+    /** zoning_intent of the "zoning_intent" and "recommended" methods. */
+    zoningIntent: ZoningIntentForm;
+    resolutionRequirement: ResolutionRequirementForm;
+    recommendation: MeshRecommendationMeta | null;
   };
   materials: MaterialForm[];
   zbarFixedValue: number | null;
@@ -219,6 +283,11 @@ export interface FormState {
     enabled: boolean;
     wavelengthNm: number;
     mode: "radial_absorption_1d" | "raytrace_2d";
+    /** Laser.lasermesh.ghost_corona and the laser-mesh sizing written with it (1D only). */
+    ghostCorona: GhostCoronaForm;
+    /** Laser.deposit smoothing of the deposited power (0 = off, the solver default). */
+    depositSmoothPasses: number;
+    depositSmoothAlpha: number;
     raysPerBeam: number;
     rayOutputTrajectory: boolean;
     rayOutputCount: number;
@@ -275,6 +344,8 @@ export interface FormState {
   };
   conduction: {
     enabled: boolean;
+    /** Numerics.conduction.solver: "sts" (the solver default) or the 1D implicit solve. */
+    solver: "sts" | "implicit";
     fLim: number;
     ionConduction: boolean;
     /** Numerics.conduction.ion_f_lim (emitted only with ion conduction on). */
@@ -454,6 +525,11 @@ export function defaultFormState(): FormState {
       segments: [],
       regionNrOverrides: [],
       grading: { edgeRatio: 0.1, sgOrder: 4, sgSigma: 0.7 },
+      layerZoning: [defaultLayerZoning()],
+      explicitNodes: { nodesCm: [], source: "" },
+      zoningIntent: defaultZoningIntent(),
+      resolutionRequirement: defaultResolutionRequirement(),
+      recommendation: null,
     },
     materials: [
       {
@@ -502,6 +578,9 @@ export function defaultFormState(): FormState {
       enabled: false,
       wavelengthNm: 351.0,
       mode: "radial_absorption_1d",
+      ghostCorona: defaultGhostCorona(),
+      depositSmoothPasses: 0,
+      depositSmoothAlpha: 0.25,
       raysPerBeam: 1000,
       rayOutputTrajectory: false,
       rayOutputCount: 200,
@@ -577,6 +656,7 @@ export function defaultFormState(): FormState {
     },
     conduction: {
       enabled: true,
+      solver: "sts",
       fLim: 0.06,
       ionConduction: false,
       ionFLim: 1.0,
@@ -696,6 +776,18 @@ export function migrateFormState(raw: FormState): FormState {
       regionNrOverrides: Array.isArray(raw.mesh?.regionNrOverrides)
         ? raw.mesh.regionNrOverrides.map((x: unknown) => (typeof x === "number" ? x : null))
         : d.mesh.regionNrOverrides,
+      grid1d: (["uniform", "graded", "recommended", "layers", "explicit", "zoning_intent"] as const).includes(
+        raw.mesh?.grid1d as MeshMethod1d,
+      )
+        ? (raw.mesh.grid1d as MeshMethod1d)
+        : d.mesh.grid1d,
+      layerZoning: Array.isArray(raw.mesh?.layerZoning)
+        ? raw.mesh.layerZoning.map((spec) => ({ ...defaultLayerZoning(), ...spec }))
+        : d.mesh.layerZoning,
+      explicitNodes: { ...d.mesh.explicitNodes, ...raw.mesh?.explicitNodes },
+      zoningIntent: { ...d.mesh.zoningIntent, ...raw.mesh?.zoningIntent },
+      resolutionRequirement: { ...d.mesh.resolutionRequirement, ...raw.mesh?.resolutionRequirement },
+      recommendation: raw.mesh?.recommendation ?? null,
     },
     geometry: {
       ...d.geometry,
@@ -758,10 +850,12 @@ export function migrateFormState(raw: FormState): FormState {
           : d.laser.hotE.channels,
       },
       cbet: { ...d.laser.cbet, ...raw.laser?.cbet },
+      ghostCorona: { ...d.laser.ghostCorona, ...raw.laser?.ghostCorona },
     },
     conduction: {
       ...d.conduction,
       ...raw.conduction,
+      solver: raw.conduction?.solver === "implicit" ? "implicit" : d.conduction.solver,
       fLim:
         raw.conduction && typeof raw.conduction.fLim === "number"
           ? raw.conduction.fLim
@@ -919,10 +1013,13 @@ export function validateFormState(f: FormState): string[] {
   const rMax = toCm(f.mesh.rMax);
   if (!(rMin >= 0)) errs.push(v.rMinNonNeg);
   if (!(rMax > rMin)) errs.push(v.rMaxGtRMin);
-  if (
-    !(f.main.dimension === "2D_RZ" && f.mesh.meshMode2d === "polar_in_box") &&
-    !(Number.isInteger(f.mesh.nr) && f.mesh.nr >= 4 && f.mesh.nr <= 2_000_000)
-  ) {
+  // nr is the cell count of the 2D rectangular mesh and of the 1D uniform and graded forms; the
+  // other 1D methods take their cell count from their own fields.
+  const usesNr =
+    f.main.dimension === "2D_RZ"
+      ? f.mesh.meshMode2d !== "polar_in_box"
+      : f.mesh.grid1d === "uniform" || f.mesh.grid1d === "graded";
+  if (usesNr && !(Number.isInteger(f.mesh.nr) && f.mesh.nr >= 4 && f.mesh.nr <= 2_000_000)) {
     errs.push(v.nrInt);
   }
   if (f.main.dimension === "2D_RZ") {
@@ -935,6 +1032,9 @@ export function validateFormState(f: FormState): string[] {
     }
     if (rMin !== 0) errs.push(v.rz2dRMinZero);
     if (f.mesh.grid1d === "graded") errs.push(v.gradedIs1d);
+    else if (f.mesh.grid1d !== "uniform") errs.push(t().mesh1d.errors.methodIs1d);
+    if (f.conduction.solver === "implicit") errs.push(t().mesh1d.errors.implicitConduction1d);
+    if (f.laser.ghostCorona.enabled) errs.push(t().mesh1d.errors.ghostCorona1d);
     const materialNames = new Set(f.materials.map((material) => material.name));
     for (const [i, shape] of f.geometry.shapes2d.entries()) {
       if (!materialNames.has(shape.materialName)) errs.push(v.shapeMaterialUnknown(i + 1));
@@ -1059,6 +1159,7 @@ export function validateFormState(f: FormState): string[] {
     if (!(Number.isInteger(g.sgOrder) && g.sgOrder >= 2 && g.sgOrder % 2 === 0)) errs.push(v.sgOrderEven);
     if (!(g.sgSigma > 0 && g.sgSigma < 1)) errs.push(v.sgSigmaRange);
   }
+  errs.push(...mesh1dErrors(f));
 
   if (f.materials.length === 0) errs.push(v.needMaterial);
   const seen = new Set<string>();
@@ -1312,6 +1413,7 @@ export function validateFormState(f: FormState): string[] {
   const cn = f.conduction;
   if (cn.nonlocalModel === "snb") {
     if (!cn.enabled) errs.push(v.snbNeedsConduction);
+    if (cn.solver === "implicit") errs.push(t().mesh1d.errors.snbNeedsSts);
     if (f.main.dimension !== "1D_SPH") errs.push(v.snb1dOnly);
     if (f.main.temperatureModel !== "2T") errs.push(v.snbNeeds2T);
     if (!(Number.isInteger(cn.snbNGroups) && cn.snbNGroups >= 2)) errs.push(v.snbGroupsInt);
@@ -1333,6 +1435,33 @@ export function validateFormState(f: FormState): string[] {
     !(Number.isInteger(f.laser.rayOutputCount) && f.laser.rayOutputCount >= 1 && f.laser.rayOutputCount <= 100_000)
   ) {
     errs.push(v.rayOutputCountRange);
+  }
+  const gc = f.laser.ghostCorona;
+  if (f.laser.enabled && gc.enabled && f.main.dimension === "1D_SPH") {
+    const intOk = (x: number) => Number.isInteger(x) && x >= 1;
+    if (
+      !intOk(gc.nOut) ||
+      !(gc.neMinFrac > 0 && gc.neMinFrac < 1) ||
+      !(gc.neMaxFrac > gc.neMinFrac && gc.neMaxFrac < 1) ||
+      !(gc.TeMinEV > 0) ||
+      !(gc.zbarMin > 0 && gc.zbarMax >= gc.zbarMin) ||
+      !intOk(gc.handoffCells) ||
+      !(gc.handoffDecay > 0) ||
+      !(gc.transitionResolvedNhat > 0) ||
+      !intOk(gc.transitionResolvedCells) ||
+      !(gc.transitionDensityExponent >= 0) ||
+      !(gc.meshFactor > 0 && gc.meshFactor <= 2) ||
+      !(gc.rmaxNHatThreshold > 0 && gc.rmaxNHatThreshold < 1)
+    ) {
+      errs.push(t().mesh1d.errors.ghostCoronaRange);
+    }
+  }
+  if (
+    f.laser.enabled &&
+    !(Number.isInteger(f.laser.depositSmoothPasses) && f.laser.depositSmoothPasses >= 0 &&
+      f.laser.depositSmoothAlpha >= 0 && f.laser.depositSmoothAlpha <= 0.5)
+  ) {
+    errs.push(t().mesh1d.errors.depositSmoothRange);
   }
   if (f.laser.enabled && f.laser.mode === "raytrace_2d") {
     if (f.main.geometry1d !== "spherical") errs.push(v.raytraceSphericalOnly);

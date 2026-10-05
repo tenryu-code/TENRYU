@@ -948,6 +948,9 @@ struct Config {
       // width sets the rounding order of the trace's lane sums (NUMERICS
       // 5.3.6 (c')).
       int lanes_per_ray = 0;
+      // The characteristic trace's outward leg reuses the inward leg's piece
+      // integrals (NUMERICS 5.3.6 (c'')); False integrates every piece again.
+      bool reuse_inward_integrals = true;
       double test_kappa = -1.0;
       double ds_adapt_g_target = 0.05;
       double ds_adapt_tau_target = 0.05;
@@ -2592,159 +2595,6 @@ struct Config {
       double conservation_residual_hard_warning_threshold_rel = 1.0e-10;
     };
 
-    struct Ale1dConfig {
-      struct LaserSensorConfig {
-        bool enabled = true;
-        double target_cells_fraction = 0.060;
-        int sigma_min_cells = 4;
-        int sigma_max_cells = 16;
-        double peak_fraction = 0.35;
-        double conf_low = 0.10;
-        double conf_high = 0.40;
-      };
-
-      struct AblationSensorConfig {
-        bool enabled = true;
-        double target_cells_fraction = 0.080;
-        int sigma_min_cells = 3;
-        int sigma_max_cells = 14;
-        double peak_fraction = 0.40;
-        double reference_density_gcc = 1.05;
-        double rho_gate_frac = 0.07;
-        double rho_gate_width = 0.02;
-        double te_gate_low_eV = 0.5;
-        double te_gate_high_eV = 2.0;
-        double conf_low = 0.10;
-        double conf_high = 0.35;
-      };
-
-      struct ShockSensorConfig {
-        bool enabled = true;
-        double target_cells_fraction = 0.040;
-        int sigma_min_cells = 2;
-        int sigma_max_cells = 8;
-        double peak_fraction = 0.35;
-        double qvisc_conf_low = 0.03;
-        double qvisc_conf_high = 0.10;
-        double du_cs_conf_low = 0.03;
-        double du_cs_conf_high = 0.15;
-      };
-
-      struct InterfaceSensorConfig {
-        bool enabled = true;
-        double target_cells_fraction = 0.033;
-        double target_cells_cap_fraction = 0.067;
-        int max_features = 8;
-        int min_separation_cells = 4;
-        double jump_low = 0.05;
-        double jump_high = 0.25;
-        int sigma_min_cells = 2;
-        int sigma_max_cells = 4;
-        bool pin_interfaces = true;
-      };
-
-      struct CenterSensorConfig {
-        bool enabled = true;
-        double target_cells_fraction = 0.053;
-        int sigma_min_cells = 6;
-        int sigma_max_cells = 20;
-        double search_x = 0.12;
-      };
-
-      struct RezoneConfig {
-        double monitor_floor = 1.0;
-        double monitor_wmax_ratio = 50.0;
-        int monitor_smoothing_iterations = 2;
-        bool monitor_smooth_across_protected_faces = false;
-        double min_floor_fraction = 0.55;
-        double gaussian_truncation_sigma = 3.0;
-
-        bool spatial_monitor_enabled = true;
-        double spatial_target_cells_fraction = 0.067;
-        double spatial_power = 2.0;
-        double laser_spatial_dr_min_cm = 2.5e-5;
-        double laser_spatial_dr_max_cm = 2.0e-4;
-        double ablation_spatial_dr_min_cm = 1.5e-5;
-        double ablation_spatial_dr_max_cm = 1.2e-4;
-        double shock_spatial_dr_min_cm = 1.0e-5;
-        double shock_spatial_dr_max_cm = 8.0e-5;
-      };
-
-      struct MinWidthFloorConfig {
-        bool enabled = false;
-        double floor_cm = 0.0;          // trigger + guarantee: no cell below this after rezone
-        double target_factor = 1.25;    // respace target = target_factor * floor_cm
-        int relief_halfwidth_cells = 3;  // half-width of the minimum-cell relief neighborhood
-        double max_growth_factor = 1.8;  // per-application cap: no cell grows more than this per rezone
-        int retrigger_cooldown_steps = 0;  // after a floor-triggered attempt is not applied, skip the floor-trigger evaluation for this many steps (0 = evaluate every step)
-      };
-
-      struct RemapConfig {
-        bool reject_multicell_sweeps = true;
-        bool high_order_enabled = true;
-        double limiter_theta = 1.5;
-        int high_order_ramp_cells = 2;
-        int radiation_high_order_ramp_cells = 2;
-        bool fallback_to_first_order_on_bounds_fail = true;
-        bool reject_strict_zero_flux_on_moving_protected_face = true;
-      };
-
-      bool enabled = false;  // EXPERIMENTAL: opt-in only
-
-      // Trigger
-      int every_n_steps = 100;
-      int min_steps_between_ale = 50;
-      // Candidate gates on the acoustic time-step bound min_i dr_i / c_s,i
-      // (NUMERICS §3.4.1): an attempt triggered by the cadence alone must
-      // raise it by benefit_min_dt_gain when enable_benefit_gate, and no
-      // candidate may lower it by more than candidate_dt_penalty_max.
-      bool enable_benefit_gate = true;
-      double benefit_min_dt_gain = 1.5;
-      double candidate_dt_penalty_max = 1.25;
-      // Mesh-quality trigger: the largest adjacent cell-width ratio above
-      // emergency_max_dr_ratio (2026-09-23; this used
-      // candidate_dt_penalty_max as the threshold).
-      bool emergency_enabled = true;
-      double emergency_max_dr_ratio = 1.25;
-
-      // Eligibility guards
-      int min_cells = 256;
-      double protected_fraction_max = 0.25;
-      int min_movable_segment_warn = 24;
-      int min_movable_segment_hard = 8;
-      double max_node_displacement_fraction_mu = 0.35;
-      double max_node_displacement_fraction_r = 0.35;
-      bool ke_conservation_closure = false;
-
-      // Conservation tolerances
-      struct Tol {
-        double soft = 0.0;
-        double hard = 0.0;
-      };
-      Tol total_mass_tol{1e-12, 1e-9};
-      Tol material_mass_tol{1e-11, 1e-8};
-      Tol radiation_group_energy_tol{1e-8, 1e-5};
-      Tol material_internal_energy_tol{1e-8, 1e-5};
-      Tol total_material_energy_tol{1e-7, 1e-5};
-      Tol global_total_energy_tol{1e-6, 1e-4};
-      Tol kinetic_energy_drift_tol{1e-7, 1e-5};
-
-      // Diagnostics
-      bool diagnostics_enabled = true;
-      int diagnostics_log_every_n_steps = 100;
-      bool diagnostics_collect_step_result = true;
-      bool diagnostics_fail_on_unexpected_apply = false;
-
-      LaserSensorConfig laser_sensor;
-      AblationSensorConfig ablation_sensor;
-      ShockSensorConfig shock_sensor;
-      InterfaceSensorConfig interface_sensor;
-      CenterSensorConfig center_sensor;
-      RezoneConfig rezone;
-      MinWidthFloorConfig min_width_floor;
-      RemapConfig remap;
-    };
-
     struct ProfileConfig {
       struct IcfStandardAleConfig {
         bool enabled = false;
@@ -2811,7 +2661,6 @@ struct Config {
     AleConfig ale;
     PlicConfig plic;
     MaterialsSubConfig materials;
-    Ale1dConfig ale1d;
     ProfileConfig profile;
     FloorsConfig floors;
     bool positivity_clamp = true;

@@ -20,7 +20,7 @@
       <ul>
         <li>Three HDF5 kinds: snapshots <code>&lt;name&gt;_NNNN.h5</code>, the history <code>&lt;name&gt;_history.h5</code> (append-only), and checkpoints <code>&lt;name&gt;_ckpt_NNNN.h5</code>. Cadence fires on step-based (<code>plot_every</code> …) OR seconds-based (<code>plot_every_s</code> …) triggers.</li>
         <li>Every numeric dataset carries a <code>units</code> attribute. <code>mesh/</code> and <code>hydro/</code> dataset names map 1:1 to the internal State field names.</li>
-        <li>Stagnation peaks are short — about 15 ps for the GXII-class <code>laser_capsule</code> preset — so peak values are read from the per-step history (<code>implosion/*</code>), not from snapshots.</li>
+        <li>Stagnation peaks are short — about 15 ps in a GXII-class laser implosion run of 2026-07-31 — so peak values are read from the per-step history (<code>implosion/*</code>), not from snapshots.</li>
         <li>Re-running into the same output directory does not overwrite: results go to a numbered sibling like <code>_001</code>. If "nothing changed", check the output location first.</li>
       </ul>
     </aside>
@@ -211,7 +211,7 @@
       <p>The golden-regression summary metrics quoted on the verification page are time reductions of these series: <code>rho_peak_max</code> = max of <code>implosion/rho_peak</code>, <code>rhoR_max</code> = max of <code>implosion/rho_R</code>, <code>Tc_max</code> = max of <code>implosion/center_temperature</code>, <code>shell_r_min</code> = min of <code>implosion/shell_radius_min</code>.</p>
       <aside class="planned" aria-labelledby="cadence-warning">
         <h3 id="cadence-warning">Warning: cadence can miss the peak</h3>
-        <p>Snapshot cadence is per-deck, but stagnation peaks can be very short — about 15 ps measured (2026-07-31) for the GXII-class <code>laser_capsule</code> preset. When output times straddle the peak, the maximum density among snapshots badly underestimates the true peak. Read sharp peak values and times from the per-step history (<code>implosion/rho_peak</code>) and use snapshots for the spatial structure around the peak.</p>
+        <p>Snapshot cadence is per-deck, but stagnation peaks can be very short — about 15 ps measured (2026-07-31) in a GXII-class laser implosion run. When output times straddle the peak, the maximum density among snapshots badly underestimates the true peak. Read sharp peak values and times from the per-step history (<code>implosion/rho_peak</code>) and use snapshots for the spatial structure around the peak.</p>
       </aside>
     </section>
 

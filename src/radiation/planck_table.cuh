@@ -495,6 +495,15 @@ class PlanckTable {
                                        n_groups_, lo, hi, dl, w, g);
   }
 
+  // The once-per-run warning interpolate_b_host gives for a temperature outside the table, for
+  // callers that interpolate on the device (planck_fraction_host_rounding): the same conditions.
+  void warn_if_outside_range(const double T_eV) const {
+    if (n_groups_ <= 1 || n_T_ <= 1 || constant_in_T_) {
+      return;
+    }
+    warn_if_temperature_clamped(T_eV);
+  }
+
   [[nodiscard]] PlanckTableDeviceView device_view() const noexcept {
     PlanckTableDeviceView v;
     v.T_grid = d_T_grid_;

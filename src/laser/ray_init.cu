@@ -9,6 +9,7 @@
 
 #include "core/device_scratch.hpp"
 #include "laser/coordinate_transform.cuh"
+#include "laser/ray_init_1d_gpu.cuh"
 
 namespace tenryu::laser {
 namespace {
@@ -473,6 +474,78 @@ RayArray1D initialize_rays_1d(const Beam& beam,
                               cudaStream_t stream,
                               const int azimuthal_rays) {
   const core::NvtxRange nvtx_range("laser.ray_initialization");
+  RayArray1D out;
+  if (rays_per_beam <= 0 || !(beam_power > 0.0)) {
+    return out;
+  }
+  // The ring layout's scalars here; the weights, their sum and the ring powers on the device
+  // (ray_init_1d_gpu.cuh), as ring_layout_1d computes them.
+  const ray_init_1d::RingLayout layout =
+      ray_init_1d::ring_layout(beam, lmesh.Z_max, rays_per_beam);
+  const double Z_init = layout.Z_init;
+  const double z_focus = layout.z_focus;
+  const double dR = layout.dR;
+  double* d_ring_power = static_cast<double*>(core::device_scratch_acquire(
+      "ray_init:ring_power", static_cast<std::size_t>(rays_per_beam) * sizeof(double)));
+  ray_init_1d::ring_powers(beam, layout, rays_per_beam, beam_power, d_ring_power, stream);
+
+  if (lmesh.geometry_code != 0) {
+    // Cylinder (axis g = lab z) or slab (normal g = lab z, the vacuum side
+    // at +g): the beam's lab direction sets the incidence.
+    const Vec3d g = v3(0.0, 0.0, 1.0);
+    Vec3d p = v3_unit(v3(beam.dir_x, beam.dir_y, beam.dir_z));
+    BeamFrame1D frame;
+    frame.planar = (lmesh.geometry_code == 2) ? 1 : 0;
+    if (frame.planar != 0 && p.z > 0.0) {
+      p.z = -p.z;  // the beam comes from the vacuum side
+    }
+    frame.p = p;
+    const Vec3d gxp = v3_cross(g, p);
+    const bool along_g = v3_dot(gxp, gxp) < 1.0e-24;
+    frame.e1 = along_g ? v3(1.0, 0.0, 0.0) : v3_unit(gxp);
+    frame.e2 = v3_cross(p, frame.e1);
+    frame.Z_init = Z_init;
+    frame.dz = Z_init - z_focus;
+    frame.focus = v3_scale(p, -z_focus);
+    frame.profile_end = lmesh.R_max;  // the profile ends at the laser mesh radius
+    if (frame.planar != 0) {
+      // Plane (lateral, height): lateral along the beam's tilt.
+      frame.z_axis = g;
+      const Vec3d tilt = v3_add(p, v3_scale(g, -v3_dot(p, g)));
+      frame.r_axis = (v3_dot(tilt, tilt) > 1.0e-24) ? v3_unit(tilt) : v3(1.0, 0.0, 0.0);
+      frame.a_axis = v3_cross(g, frame.r_axis);
+    } else {
+      // Cross-section plane: Z back toward the source (the rays travel toward
+      // -Z, as on a sphere), A along the cylinder axis.
+      const Vec3d p_perp = v3(p.x, p.y, 0.0);
+      frame.z_axis = v3_unit(v3_scale(p_perp, -1.0));
+      frame.r_axis = v3_cross(g, frame.z_axis);
+      frame.a_axis = g;
+    }
+    // A slab at normal incidence: every azimuth gives the same ray.
+    const int n_azimuth = (frame.planar != 0 && along_g) ? 1 : std::max(azimuthal_rays, 1);
+    const int n_rays = rays_per_beam * n_azimuth;
+    out.allocate_pooled(n_rays);
+    const int block = 128;
+    initialize_rays_1d_geometry_kernel<<<(n_rays + block - 1) / block, block, 0, stream>>>(
+        frame, d_ring_power, rays_per_beam, n_azimuth, dR, out.R0, out.Z0, out.vR0, out.vZ0,
+        out.vA0, out.power, out.power0);
+    cuda_check(cudaGetLastError(), "initialize_rays_1d geometry kernel launch failed");
+    return out;
+  }
+
+  out.allocate_pooled(rays_per_beam);
+  ray_init_1d::sphere_rays(layout, rays_per_beam, d_ring_power, out.R0, out.Z0, out.vR0, out.vZ0,
+                           out.vA0, out.power, out.power0, stream);
+  return out;
+}
+
+RayArray1D initialize_rays_1d_host_reference(const Beam& beam,
+                                             const LaserMesh& lmesh,
+                                             const int rays_per_beam,
+                                             const double beam_power,
+                                             cudaStream_t stream,
+                                             const int azimuthal_rays) {
   RayArray1D out;
   if (rays_per_beam <= 0 || !(beam_power > 0.0)) {
     return out;

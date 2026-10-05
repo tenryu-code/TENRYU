@@ -6,6 +6,7 @@
 #include <array>
 #include <bit>
 #include <cfloat>
+#include <climits>
 #include <cstdio>
 #include <cstdint>
 #include <cmath>
@@ -98,14 +99,6 @@ MeshGeometryResult make_geometry_failure(
   result.min_cell_area = min_cell_area;
   result.reason = reason;
   return result;
-}
-
-bool has_nonfinite_1d_node_coordinate(const Mesh& mesh, const int c) {
-  std::array<double, 2> r{};
-  cuda_check(cudaMemcpy(r.data(), mesh.node_r + c, r.size() * sizeof(double),
-                        cudaMemcpyDeviceToHost),
-             "Mesh geometry check memcpy 1D node_r failed");
-  return !finite_double(r[0]) || !finite_double(r[1]);
 }
 
 bool has_nonfinite_2d_node_coordinate(const Mesh& mesh, const int c) {
@@ -407,39 +400,117 @@ void dump_multiblock_geometry_failure(const Mesh& mesh,
   }
 }
 
-MeshGeometryResult validate_1d_geometry(
-    const Mesh& mesh,
-    const MeshGeometryCheckOptions& opts) {
-  MeshGeometryResult result{};
-  double min_cell_vol = 0.0;
-  bool min_initialized = false;
-  const std::size_t n_cells = mesh.cell_vol.size();
-  for (std::size_t c_u = 0; c_u < n_cells; ++c_u) {
-    if (!cell_in_geometry_check_window(static_cast<int>(c_u))) {
-      continue;
-    }
-    const double vol = mesh.cell_vol[c_u];
-    if (finite_double(vol) && (!min_initialized || vol < min_cell_vol)) {
-      min_cell_vol = vol;
-      min_initialized = true;
-    }
-    if (!(vol > opts.volume_floor)) {
-      const int c = static_cast<int>(c_u);
-      const MeshGeometryFailureKind kind =
-          has_nonfinite_1d_node_coordinate(mesh, c)
-              ? MeshGeometryFailureKind::NonFiniteNodeCoordinate
-              : (!finite_double(vol)
-                     ? MeshGeometryFailureKind::NonFiniteCellVolume
-                     : MeshGeometryFailureKind::NonPositiveCellVolume);
-      result = make_geometry_failure(kind, c, c, -1, vol, min_cell_vol, 0.0,
-                                     "cell_volume");
-      if (opts.policy == MeshGeometryFailurePolicy::HardAssert) {
-        assert_geometry_failure(result);
-      }
-      return result;
+// The 1D geometry check on the device, from the device volumes and node radii: over the cells c of
+// the check window, the first c with !(vol[c] > floor) and, over the window's cells up to it (all of
+// them when none fails), the least finite volume, the first of equal values (as a loop over the
+// cells in order with a strict comparison keeps it). out[0] the failing cell (-1 when none), out[1]
+// its volume, out[2] its kind (1 a non-finite node coordinate, 2 a non-finite volume, 3 a volume not
+// above the floor), out[3] the least finite volume (0 when there is none), out[4] 1 when there is
+// one. One block.
+constexpr int kGeometryCheckThreads = 256;
+constexpr int kGeometryCheckValues = 5;
+
+__global__ void validate_1d_geometry_kernel(const double* __restrict__ vol,
+                                            const double* __restrict__ node_r, const int n,
+                                            const int window_begin, const int window_end,
+                                            const double volume_floor,
+                                            double* __restrict__ out) {
+  __shared__ int sh_first[kGeometryCheckThreads];
+  __shared__ double sh_min[kGeometryCheckThreads];
+  __shared__ int sh_min_cell[kGeometryCheckThreads];
+  const int t = static_cast<int>(threadIdx.x);
+  const auto in_window = [&](const int c) {
+    return window_end < 0 || (c >= window_begin && c < window_end);
+  };
+  int first = INT_MAX;
+  for (int c = t; c < n; c += kGeometryCheckThreads) {
+    if (in_window(c) && !(vol[c] > volume_floor)) {
+      first = c;
+      break;
     }
   }
-  result.min_cell_vol = min_initialized ? min_cell_vol : 0.0;
+  sh_first[t] = first;
+  __syncthreads();
+  for (int stride = kGeometryCheckThreads / 2; stride > 0; stride >>= 1) {
+    if (t < stride && sh_first[t + stride] < sh_first[t]) {
+      sh_first[t] = sh_first[t + stride];
+    }
+    __syncthreads();
+  }
+  const int failing = sh_first[0];
+  const int last = (failing == INT_MAX) ? n - 1 : failing;
+  double best = 0.0;
+  int best_cell = -1;
+  for (int c = t; c <= last; c += kGeometryCheckThreads) {
+    const double v = vol[c];
+    if (in_window(c) && isfinite(v) && (best_cell < 0 || v < best)) {
+      best = v;
+      best_cell = c;
+    }
+  }
+  sh_min[t] = best;
+  sh_min_cell[t] = best_cell;
+  __syncthreads();
+  for (int stride = kGeometryCheckThreads / 2; stride > 0; stride >>= 1) {
+    if (t < stride) {
+      const int bc = sh_min_cell[t + stride];
+      if (bc >= 0) {
+        const int ac = sh_min_cell[t];
+        const double a = sh_min[t];
+        const double b = sh_min[t + stride];
+        if (ac < 0 || b < a || (!(a < b) && bc < ac)) {
+          sh_min[t] = b;
+          sh_min_cell[t] = bc;
+        }
+      }
+    }
+    __syncthreads();
+  }
+  if (t == 0) {
+    const bool has_min = sh_min_cell[0] >= 0;
+    out[3] = has_min ? sh_min[0] : 0.0;
+    out[4] = has_min ? 1.0 : 0.0;
+    if (failing == INT_MAX) {
+      out[0] = -1.0;
+      out[1] = 0.0;
+      out[2] = 0.0;
+    } else {
+      const double v = vol[failing];
+      out[0] = static_cast<double>(failing);
+      out[1] = v;
+      out[2] = (!isfinite(node_r[failing]) || !isfinite(node_r[failing + 1])) ? 1.0
+               : !isfinite(v)                                                  ? 2.0
+                                                                               : 3.0;
+    }
+  }
+}
+
+void launch_validate_1d_geometry(const double* vol, const double* node_r, const int n,
+                                 const MeshGeometryCheckOptions& opts, double* out) {
+  validate_1d_geometry_kernel<<<1, kGeometryCheckThreads>>>(
+      vol, node_r, n, g_geometry_check_begin, g_geometry_check_end, opts.volume_floor, out);
+  cuda_check(cudaGetLastError(), "Mesh 1D geometry check launch failed");
+}
+
+// The 1D geometry result from the device check's values (validate_1d_geometry_kernel): a failure
+// at the first failing cell with the least finite volume up to it, or the least finite volume.
+MeshGeometryResult validate_1d_geometry_result(const double* check,
+                                               const MeshGeometryCheckOptions& opts) {
+  MeshGeometryResult result{};
+  const int failing = static_cast<int>(check[0]);
+  if (failing >= 0) {
+    const MeshGeometryFailureKind kind =
+        (check[2] == 1.0)   ? MeshGeometryFailureKind::NonFiniteNodeCoordinate
+        : (check[2] == 2.0) ? MeshGeometryFailureKind::NonFiniteCellVolume
+                            : MeshGeometryFailureKind::NonPositiveCellVolume;
+    result = make_geometry_failure(kind, failing, failing, -1, check[1], check[3], 0.0,
+                                   "cell_volume");
+    if (opts.policy == MeshGeometryFailurePolicy::HardAssert) {
+      assert_geometry_failure(result);
+    }
+    return result;
+  }
+  result.min_cell_vol = (check[4] != 0.0) ? check[3] : 0.0;
   return result;
 }
 
@@ -11337,11 +11408,21 @@ MeshGeometryResult Mesh::sync_device_geometry_to_host_checked(
                     d_persistent_capacity_ >= n_cells,
                 "Mesh::sync_device_geometry_to_host requires device-only geometry first");
 
-  std::vector<double> geo_pack(3 * static_cast<std::size_t>(n_cells));
-  const double* srcs[3] = {state_vol, d_cell_centroid_r_persistent_,
-                           d_cell_centroid_z_persistent_};
-  core::pack_pull_fields(srcs, 3, n_cells, geo_pack.data(),
-                         "mesh:sync_device_geometry:pull");
+  // The volumes, the centroids and the geometry check (on the device) in one readback.
+  const int n = static_cast<int>(n_cells);
+  auto* stage = static_cast<double*>(core::device_scratch_acquire(
+      "mesh:sync_device_geometry:stage",
+      (3 * n_cells + kGeometryCheckValues) * sizeof(double)));
+  double* const dsts[3] = {stage, stage + n_cells, stage + 2 * n_cells};
+  const double* const srcs[3] = {state_vol, d_cell_centroid_r_persistent_,
+                                 d_cell_centroid_z_persistent_};
+  const int counts[3] = {n, n, n};
+  core::copy_device_arrays(dsts, srcs, counts, 3);
+  launch_validate_1d_geometry(state_vol, node_r, n, opts, stage + 3 * n_cells);
+  std::vector<double> geo_pack(3 * n_cells + kGeometryCheckValues);
+  cuda_check(cudaMemcpy(geo_pack.data(), stage, geo_pack.size() * sizeof(double),
+                        cudaMemcpyDeviceToHost),
+             "Mesh::sync_device_geometry_to_host readback failed");
   std::memcpy(cell_vol.data(), geo_pack.data(), n_cells * sizeof(double));
   std::memcpy(cell_centroid_r.data(), geo_pack.data() + n_cells,
               n_cells * sizeof(double));
@@ -11353,7 +11434,7 @@ MeshGeometryResult Mesh::sync_device_geometry_to_host_checked(
                         cudaMemcpyDeviceToDevice),
              "Mesh::sync_device_geometry_to_host centroid_r D2D failed");
 
-  return validate_1d_geometry(*this, opts);
+  return validate_1d_geometry_result(geo_pack.data() + 3 * n_cells, opts);
 }
 
 void Mesh::sync_device_geometry_to_host(const double* state_vol) {
@@ -11420,7 +11501,14 @@ MeshGeometryResult Mesh::recompute_geometry_checked(
     cell_centroid_r_device.reset(n_cells);
     cell_centroid_r_device.copy_from_host(cell_centroid_r);
 
-    return validate_1d_geometry(*this, opts);
+    // The geometry check on the device.
+    auto* check = static_cast<double*>(core::device_scratch_acquire(
+        "mesh:recompute_geometry:check", kGeometryCheckValues * sizeof(double)));
+    launch_validate_1d_geometry(d_cell_vol, node_r, static_cast<int>(n_cells), opts, check);
+    double h_check[kGeometryCheckValues] = {};
+    cuda_check(cudaMemcpy(h_check, check, sizeof(h_check), cudaMemcpyDeviceToHost),
+               "Mesh::recompute_geometry 1D check readback failed");
+    return validate_1d_geometry_result(h_check, opts);
   }
 
   TENRYU_ASSERT(node_z != nullptr,

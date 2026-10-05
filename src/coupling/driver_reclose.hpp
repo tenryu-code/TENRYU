@@ -30,6 +30,8 @@ struct DriverRecloseContext {
   std::vector<std::uint8_t> cached_cell_is_void;
   core::DeviceArray<double> conduction_Te_old;
   core::DeviceArray<double> conduction_cv_old;
+  // ee before the conduction phase, for the energy-rate export.
+  core::DeviceArray<double> conduction_ee_before;
   // Per-material table temperature ceilings (T_grid_eV.back(); 0 when the
   // material has no table), indexed by the Config material slot. Uploaded
   // once from Config so the per-cell tail extension uses each cell's own
@@ -43,6 +45,14 @@ struct DriverRecloseContext {
 };
 
 void capture_conduction_fields_device(DriverRecloseContext& context, const core::State& state);
+
+// The conduction energy-rate export (Numerics.diagnostics.conduction_energy_rate_export) on the
+// device: capture_conduction_ee_device keeps ee before the conduction phase, and
+// conduction_energy_rate_device writes state.conduction_e_rate[c] =
+// (ee[c] - ee_before[c]) rho[c] / dt (the host loop's arithmetic).
+void capture_conduction_ee_device(DriverRecloseContext& context, const core::State& state);
+void conduction_energy_rate_device(const DriverRecloseContext& context, core::State& state,
+                                   double dt);
 
 bool sync_ee_from_Te_device(core::State& state, const core::Config& cfg,
                             const hydro::HydroEOSContext& eos_context,

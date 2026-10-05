@@ -1164,10 +1164,6 @@ struct State {
   int ale_remaps_applied = 0;
   int ale_last_applied_step = -1;
   std::uint64_t reale_rezone_skipped = 0;
-  // ALE1D min-width-floor retrigger cooldown: remaining steps for which the
-  // floor-trigger evaluation is skipped after a rejected floor-triggered
-  // attempt. In-memory only (not checkpointed).
-  int ale1d_floor_cooldown_remaining = 0;
   double axis_margin_initial = -1.0;
   bool plic_remap_sticky_fallback = false;
   int plic_consecutive_drift_triggers = 0;
@@ -1277,6 +1273,31 @@ struct State {
   // Cumulative neutrons born in each cell (DD and DT neutron branches,
   // absolute number; 1D burn stage only, empty otherwise).
   std::vector<double> burn_neutron_cum_host;
+  // Device copies of the six arrays above for the 1D burn stage on the device (NUMERICS §14):
+  // the 1D burn phase works on these and the host vectors are their output and restart form.
+  // burn_host_current / burn_device_current say which copy holds the latest values (at least
+  // one does): sync_burn_arrays_to_device() uploads the host vectors when the device copies are
+  // not current, sync_burn_arrays_to_host() downloads the device copies when the host vectors are
+  // not (before the output writes); a writer of the host vectors calls note_burn_host_write(),
+  // the device stage note_burn_device_write(). 2D runs keep working on the host vectors.
+  DeviceBuffer<double> burn_n_dev;
+  DeviceBuffer<double> burn_rate_dev;
+  DeviceBuffer<double> burn_Q_e_dev;
+  DeviceBuffer<double> burn_Q_i_dev;
+  DeviceBuffer<double> burn_eps_cum_dev;
+  DeviceBuffer<double> burn_neutron_cum_dev;
+  bool burn_host_current = true;
+  bool burn_device_current = false;
+  void note_burn_host_write() {
+    burn_host_current = true;
+    burn_device_current = false;
+  }
+  void note_burn_device_write() {
+    burn_device_current = true;
+    burn_host_current = false;
+  }
+  void sync_burn_arrays_to_device();
+  void sync_burn_arrays_to_host();
   DeviceBuffer<double> burn_Ng;           // [6*G*n_cells] specific diffusion in-flight spectra Y_g [1/g]
   DeviceBuffer<double> burn_Ng_work;      // [6*G*n_cells] diffusion density view scratch [1/cm3]
   DeviceBuffer<double> burn_dep_e_dev;    // [n_cells] diffusion deposition scratch

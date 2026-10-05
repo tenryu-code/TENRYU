@@ -519,4 +519,55 @@ bool all_active_cells_collapsed_device(const core::State& state,
   return counts[0] > 0 && counts[1] == counts[0];
 }
 
+namespace {
+
+__global__ void t_start_reached_kernel(const double* __restrict__ Te,
+                                       const std::int8_t* __restrict__ active,
+                                       const double t_start_eV,
+                                       const int n_cells,
+                                       std::uint8_t* __restrict__ reached,
+                                       int* __restrict__ count) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n_cells) {
+    return;
+  }
+  const bool hit = (active[i] == 0) && (Te[i] >= t_start_eV);
+  reached[i] = hit ? static_cast<std::uint8_t>(1) : static_cast<std::uint8_t>(0);
+  if (hit) {
+    atomicAdd(count, 1);
+  }
+}
+
+}  // namespace
+
+int hydro_active_t_start_reached_device(const core::State& state,
+                                        const double t_start_eV,
+                                        std::vector<std::uint8_t>& reached) {
+  reached.clear();
+  const int n_cells = static_cast<int>(state.Te.size());
+  if (n_cells == 0 || state.hydro_active.size() != static_cast<std::size_t>(n_cells)) {
+    return 0;
+  }
+  const std::int8_t* d_active = state.hydro_active_device_ptr();
+  auto* d_reached = static_cast<std::uint8_t*>(core::device_scratch_acquire(
+      "hydro_active:t_start:reached", static_cast<std::size_t>(n_cells)));
+  auto* d_count = static_cast<int*>(
+      core::device_scratch_acquire("hydro_active:t_start:count", sizeof(int)));
+  cuda_check(cudaMemset(d_count, 0, sizeof(int)), "T_start count reset failed");
+  constexpr int kBlock = 256;
+  t_start_reached_kernel<<<(n_cells + kBlock - 1) / kBlock, kBlock>>>(
+      state.Te.data(), d_active, t_start_eV, n_cells, d_reached, d_count);
+  cuda_check(cudaGetLastError(), "T_start kernel launch failed");
+  int count = 0;
+  cuda_check(cudaMemcpy(&count, d_count, sizeof(int), cudaMemcpyDeviceToHost),
+             "T_start count readback failed");
+  if (count > 0) {
+    reached.resize(static_cast<std::size_t>(n_cells));
+    cuda_check(cudaMemcpy(reached.data(), d_reached, static_cast<std::size_t>(n_cells),
+                          cudaMemcpyDeviceToHost),
+               "T_start flags readback failed");
+  }
+  return count;
+}
+
 }  // namespace tenryu::coupling

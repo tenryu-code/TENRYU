@@ -82,11 +82,12 @@ FLD とは別物で、2026-09-29 に `retired/radiation_monte_carlo/` へ移し�
 | kernel | 目的 | thread mapping |
 |---|---|---|
 | `compute_cells_kernel` | セルの幾何（h、集中質量 \(M_{L,R}\)、角度再配分の重み \(N_{L,R}\)、面積） | 1 thread/cell |
-| `sweep_kernel` | 全群のスイープ（セルごとの 2×2 の LD 行列、曲がった形状は重み付きダイヤモンドの角度閉包と出発方向） | **1 block=1 群、1 warp**（`<<<n_groups, 32, shared>>>`） |
+| `scan_sweep_kernel<kOneCell>` | 全群のスイープ（既定、2026-10-02）。出発方向・内向き・外向きの順序方向を順に、各順序方向のセル方向の漸化式をスキャンで解く：セルの流出の値は流入の値のアフィン写像（係数はセルの演算量と前の順序方向が残した角度の端の値から）で、各スレッドが自分のセル（1 セル版のブロック（レジスタで決まり、CUDA 12.6 の sm_89 のビルドでは 512 スレッド）に収まるまで 1 セル、それを超えると連続する k セル）の写像を合成し、ブロックがスレッドの写像をスイープの順に走査し、各スレッドは自分の最初のセルの流入から逐次版と同じ式でセルを解く。逐次版とは丸めで異なる（NUMERICS §6.8.4） | **1 block=1 群**、`⌈n/32⌉×32` threads（`kOneCell`、1 セル版の上限まで）、それを超えると複数セル版の上限の threads（`maxThreadsPerBlock` を実行時に問い合わせる） |
+| `sweep_kernel` | 逐次版のスイープ（`TENRYU_SN_LD_SEQUENTIAL_SWEEP=1`）。セルごとの 2×2 の LD 行列、曲がった形状は重み付きダイヤモンドの角度閉包と出発方向、半分の順序方向をセル方向の対角の波面で | 1 block=1 群、1 warp（`<<<n_groups, 32, shared>>>`） |
 | `sweep_matrix_kernel` | 同じ断面積で何度もスイープするときの逆行列の前計算 | per element |
 | `moments_kernel` | 節点のスカラー流束、面の流れ、\(P_{rr}\) | per element |
 | `p1_assemble_kernel`・`p1_factor_kernel`・`p1_apply_kernel` | スイープと整合する P1 低次系（ブロック三重対角）：散乱の拡散合成加速と放出結合の灰色前処理 | per system |
-| `linearize_kernel`・`matter_setup_kernel`・`matter_update_kernel`・`cell_temperature_kernel` | 節点の電子温度のまわりの放出の線形化と、輸送自身の吸収・放出からの保存的な物質更新 | 1 warp/節点 |
+| `linearize_kernel`・`matter_setup_kernel`・`matter_update_kernel`・`cell_temperature_kernel` | 節点の電子温度のまわりの放出の線形化と、輸送自身の吸収・放出からの保存的な物質更新 | 1 warp/節点（群ごとの項は群のレーンで、群についての和は群の順に全レーンで。`matter_update_kernel` の Planck 分率とその温度微分は、群の境界の累積側・裾側の値を境界ごとに 1 回評価して群の差に組み合わせる（2026-10-02、同じ値）） |
 | `dots_kernel`・`orth_update_kernel`・`residual_kernel`・`solution_update_kernel` ほか | 放出結合の GMRES（節点の吸収率密度 \(\sum_g\sigma_{a,g}\phi_g\) の上） | per element |
 | `outer_current_kernel`・`history_kernel` | 外面の流束、角度の履歴の次ステップへの持ち越し | per element |
 

@@ -4,6 +4,7 @@
 
 #include <cuda_runtime.h>
 
+#include "burn/burn_inputs_1d_gpu.cuh"
 #include "burn/network.cuh"
 #include "burn/partition.hpp"
 
@@ -94,6 +95,73 @@ BurnStageResult compute_burn_step_1d(const BurnStageInputs& in,
                                      std::vector<double>* S_birth = nullptr,
                                      std::vector<double>* neutron_births = nullptr);
 
+// The 1D burn stage with its inputs and outputs in device memory (the State's fields and the
+// device copies of the burn arrays, State::burn_*_dev): the local deposition scheme (scheme 0)
+// or the birth sources of the charged-product transport (scheme 1). The burn region
+// [first, last] comes from burn_1d_region.
+struct BurnDeviceInputs {
+  int n_cells = 0;
+  int n_mat = 0;
+  int first = -1;
+  int last = -1;
+  const double* r_node = nullptr;  // [n_cells + 1]
+  const double* v_node = nullptr;  // [n_cells + 1] node velocities; nullptr: none (zero)
+  const double* rho = nullptr;
+  const double* vol = nullptr;
+  const double* Te_eV = nullptr;
+  const double* Ti_eV = nullptr;
+  const double* zbar = nullptr;
+  const double* A_eff = nullptr;
+  const double* ee = nullptr;
+  const double* ei = nullptr;
+  const double* volFrac = nullptr;  // [n_cells * n_mat]; nullptr: none
+  // The field ions of the cells at the start of the step and their local range fit factors
+  // (NUMERICS §14.3, §14.7): computed when set, from the inventory and these materials.
+  bool range_medium = false;
+  FieldIonSetup field_ions;
+};
+
+struct BurnDeviceArrays {
+  double* burn_y = nullptr;       // [n_cells * kNumSpecies] specific inventories, in/out
+  double* dE_e = nullptr;         // [n_cells] out
+  double* dE_i = nullptr;         // [n_cells] out
+  double* rate_diag = nullptr;    // [n_cells] out
+  double* Qe_diag = nullptr;      // [n_cells] out
+  double* Qi_diag = nullptr;      // [n_cells] out
+  // [n_cells] in/out: += (dE_e + dE_i) / (rho vol); nullptr: not updated (scheme 1: the
+  // driver adds the transport's deposits)
+  double* eps_cum = nullptr;
+  double* neutron_cum = nullptr;  // [n_cells] in/out: += the neutrons born; nullptr: none
+  double* S_birth = nullptr;      // [6 * n_cells] out (scheme 1): birth sources, slot-major
+  // [kFieldIonCellValues * n_cells] out (with range_medium): the field ions of the cells at the
+  // start of the step, as pack_field_ion_cells packs them; nullptr: not written
+  double* field_ion_cells = nullptr;
+};
+
+// compute_burn_step_1d_resident (burn_stage_gpu.cuh) with the warnings compute_burn_step_1d
+// emits (screening, subcycle saturation).
+BurnStageResult compute_burn_step_1d_device_resident(const BurnDeviceInputs& in,
+                                                     const BurnStageParams& p,
+                                                     const PartitionTable& table,
+                                                     const BurnDeviceArrays& out);
+
+// TENRYU_BURN_HOST_STAGE=1: the 1D stage on the host (compute_burn_step_1d_host).
+bool burn_1d_host_stage_forced();
+
+// The 1D burn region from device inputs (d_fuel_mats: the n_fuel fuel material indices, in
+// device memory): the first and last cell whose summed fuel volume fraction exceeds vf_threshold
+// (-1 and -1 when none), and whether a cell of it can react (burn_1d_region_may_react). decided
+// is false when an input is missing. One small copy to the host.
+struct BurnRegion {
+  int first = -1;
+  int last = -1;
+  bool may_react = false;
+  bool decided = true;
+};
+BurnRegion burn_1d_region(const double* d_rho, const double* d_Ti_eV, const double* d_volfrac,
+                          int n_cells, int n_mat, const int* d_fuel_mats, int n_fuel,
+                          double vf_threshold, double T_floor_keV);
+
 // True when some cell of the 1D burn region can react this step: the region
 // is the first to last cell whose summed fuel volume fraction exceeds
 // vf_threshold (as compute_burn_step_1d forms it) and a cell reacts unless
@@ -105,7 +173,8 @@ bool burn_1d_region_may_react(const double* d_rho,
                               const double* d_volfrac,
                               int n_cells,
                               int n_mat,
-                              const std::vector<int>& fuel_mats,
+                              const int* d_fuel_mats,
+                              int n_fuel,
                               double vf_threshold,
                               double T_floor_keV);
 

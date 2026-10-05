@@ -14,11 +14,7 @@
 namespace tenryu::laser::hot_electron {
 namespace {
 
-struct ChordJob {
-  double r_s;      // launch radius / planar x
-  double mu_dir;   // direction cosine to radial/slab axis
-  double P_chord;  // erg/s carried by this chord (source P_hot * node weight)
-};
+using ChordJob = ConeChordJob;
 
 inline void hot_e_cuda_check(const cudaError_t err, const char* message) {
   TENRYU_ASSERT(err == cudaSuccess, message);
@@ -139,6 +135,37 @@ __global__ void hot_e_reduce_rows_kernel(
 
 }  // namespace
 
+void cone_chords_device(const ConeChordJob* jobs, const int n_jobs, const GroupSpec* groups,
+                        const int n_groups, const double* rho, const double* zbar,
+                        const double* A_eff, const double* Te_eV,
+                        const std::uint8_t* cell_is_void, const double* r_nodes,
+                        const int n_nodes, const bool planar, const double T_h_erg, double* rows,
+                        double* escaped, int* caps, double* out_cell, cudaStream_t stream) {
+  const int n_cells = n_nodes - 1;
+  const int n_rows = n_jobs * n_groups;
+  hot_e_cuda_check(cudaMemsetAsync(rows, 0,
+                                   static_cast<std::size_t>(n_rows) *
+                                       static_cast<std::size_t>(n_cells) * sizeof(double),
+                                   stream),
+                   "hot_electron cone device rows memset failed");
+  hot_e_cuda_check(cudaMemsetAsync(escaped, 0, static_cast<std::size_t>(n_rows) * sizeof(double),
+                                   stream),
+                   "hot_electron cone device escaped memset failed");
+  hot_e_cuda_check(cudaMemsetAsync(caps, 0, static_cast<std::size_t>(n_rows) * sizeof(int), stream),
+                   "hot_electron cone device caps memset failed");
+  constexpr int kBlock = 128;
+  if (n_rows > 0) {
+    hot_e_cone_chord_kernel<<<(n_rows + kBlock - 1) / kBlock, kBlock, 0, stream>>>(
+        jobs, n_jobs, groups, n_groups, rho, zbar, A_eff, Te_eV, cell_is_void, r_nodes, n_nodes,
+        planar ? 1 : 0, T_h_erg, core::constants::proton_mass, core::constants::eV_to_erg, rows,
+        escaped, caps);
+    hot_e_cuda_check(cudaGetLastError(), "hot_electron cone chord kernel launch failed");
+  }
+  hot_e_reduce_rows_kernel<<<(n_cells + kBlock - 1) / kBlock, kBlock, 0, stream>>>(
+      rows, n_rows, n_cells, out_cell);
+  hot_e_cuda_check(cudaGetLastError(), "hot_electron cone reduce kernel launch failed");
+}
+
 DepositResult deposit_hot_electrons_cone_1d_device(
     const HotEChannelSpec& spec,
     const Geometry1D geom,
@@ -253,26 +280,9 @@ DepositResult deposit_hot_electrons_cone_1d_device(
   hot_e_cuda_check(cudaMemcpyAsync(d_void, cell_is_void_host.data(), void_bytes,
                                    cudaMemcpyHostToDevice, stream),
                    "hot_electron cone device void H2D failed");
-  hot_e_cuda_check(cudaMemsetAsync(d_rows, 0, rows_bytes, stream),
-                   "hot_electron cone device rows memset failed");
-  hot_e_cuda_check(cudaMemsetAsync(d_escaped, 0, escaped_bytes, stream),
-                   "hot_electron cone device escaped memset failed");
-  hot_e_cuda_check(cudaMemsetAsync(d_caps, 0, caps_bytes, stream),
-                   "hot_electron cone device caps memset failed");
-
-  constexpr int kBlock = 128;
-  const int chord_grid = (n_rows + kBlock - 1) / kBlock;
-  hot_e_cone_chord_kernel<<<chord_grid, kBlock, 0, stream>>>(
-      d_jobs, n_jobs, d_groups, n_groups, d_rho, d_zbar, d_A_eff, d_Te_eV,
-      d_void, d_r_nodes, n_nodes, (geom == Geometry1D::planar) ? 1 : 0,
-      T_h_erg, core::constants::proton_mass, core::constants::eV_to_erg,
-      d_rows, d_escaped, d_caps);
-  hot_e_cuda_check(cudaGetLastError(), "hot_electron cone chord kernel launch failed");
-
-  const int reduce_grid = (n_cells + kBlock - 1) / kBlock;
-  hot_e_reduce_rows_kernel<<<reduce_grid, kBlock, 0, stream>>>(
-      d_rows, n_rows, n_cells, d_out);
-  hot_e_cuda_check(cudaGetLastError(), "hot_electron cone reduce kernel launch failed");
+  cone_chords_device(d_jobs, n_jobs, d_groups, n_groups, d_rho, d_zbar, d_A_eff, d_Te_eV, d_void,
+                     d_r_nodes, n_nodes, geom == Geometry1D::planar, T_h_erg, d_rows, d_escaped,
+                     d_caps, d_out, stream);
 
   std::vector<double> out_cell(static_cast<std::size_t>(n_cells), 0.0);
   std::vector<double> escaped(static_cast<std::size_t>(n_rows), 0.0);

@@ -66,6 +66,10 @@ struct DriverRetrySnapshot {
   std::vector<double> burn_n_host, burn_rate_host, burn_Q_e_host;
   std::vector<double> burn_Q_i_host, burn_eps_cum_host;
   std::vector<double> burn_neutron_cum_host;
+  // Which of the burn arrays' copies held the latest values (the device copies
+  // are snapshot entries).
+  bool burn_host_current = true;
+  bool burn_device_current = false;
   double E_burn_released = 0.0;
   double E_burn_dep_e = 0.0;
   double E_burn_dep_i = 0.0;

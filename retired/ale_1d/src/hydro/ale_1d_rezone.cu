@@ -10,8 +10,8 @@
 namespace tenryu::hydro::ale1d {
 namespace {
 
-constexpr double kTiny = 1.0e-30;
-constexpr double kKernelIntegralFloor = 1.0e-14;
+using rezone_detail::kKernelIntegralFloor;
+using rezone_detail::kTiny;
 
 struct MassMap {
   std::vector<double> node_x;

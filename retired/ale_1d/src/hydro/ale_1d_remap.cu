@@ -1518,42 +1518,17 @@ bool Ale1dRemapScratch::size_matches(const int n_cells,
          fallback_flags.size() == n && mass_flux.size() == n + 1U;
 }
 
-Ale1dRemapResult remap_v3(const core::State& state,
-                          const core::Config& cfg,
-                          const std::vector<double>& r_candidate,
-                          const NodeConstraintMask& node_mask,
-                          const std::vector<int>& additional_protected_faces,
-                          Ale1dRemapScratch& scratch) {
+// remap_v3 from a candidate already on the device: its n + 1 node radii, node mask (1 where
+// pinned) and protected faces.
+static Ale1dRemapResult remap_v3_device_candidate(const core::State& state,
+                                                  const core::Config& cfg,
+                                                  const int n,
+                                                  const int geom,
+                                                  const double* d_r_candidate,
+                                                  const std::uint8_t* d_pinned,
+                                                  const std::uint8_t* d_protected_face,
+                                                  Ale1dRemapScratch& scratch) {
   Ale1dRemapResult result;
-
-  if (cfg.main.dimension != "1D_SPH" || cfg.main.dim != 1 ||
-      state.mesh.dim != 1) {
-    result.skip_reason = Ale1dSkipReason::WrongGeometry;
-    return result;
-  }
-
-  const int n = effective_cell_count(state, cfg);
-  if (n <= 0) {
-    result.skip_reason = Ale1dSkipReason::NTooSmall;
-    return result;
-  }
-  const int geom = state.mesh.geometry_code;
-  if (r_candidate.size() != static_cast<std::size_t>(n + 1)) {
-    result.skip_reason = Ale1dSkipReason::CandidateInvalid;
-    result.n_invalid_sweeps = 1;
-    return result;
-  }
-  TENRYU_ASSERT(node_mask.pinned.size() == static_cast<std::size_t>(n + 1),
-                "ALE1D remap node mask must have n_cells+1 entries");
-
-  for (const int face : additional_protected_faces) {
-    if (face < 0 || face > n) {
-      result.skip_reason = Ale1dSkipReason::CandidateInvalid;
-      result.n_invalid_sweeps = 1;
-      return result;
-    }
-  }
-
   const int n_groups = std::max(0, cfg.radiation.groups);
   const int n_mat = static_cast<int>(cfg.materials.materials.size());
   TENRYU_ASSERT(state.x_r.size() >= static_cast<std::size_t>(n + 1),
@@ -1580,43 +1555,6 @@ Ale1dRemapResult remap_v3(const core::State& state,
                 "ALE1D remap scratch size mismatch");
 
   cudaStream_t stream = nullptr;
-  DeviceBuffer<double> d_r_candidate("ale1d_remap:remap_v3:d_r_candidate", static_cast<std::size_t>(n + 1));
-  cuda_check(cudaMemcpyAsync(d_r_candidate.data(),
-                             r_candidate.data(),
-                             static_cast<std::size_t>(n + 1) * sizeof(double),
-                             cudaMemcpyHostToDevice,
-                             stream),
-             "ALE1D remap r_candidate upload failed");
-
-  std::vector<std::uint8_t> pinned(static_cast<std::size_t>(n + 1), 0U);
-  std::vector<std::uint8_t> protected_face(static_cast<std::size_t>(n + 1),
-                                           0U);
-  protected_face.front() = 1U;
-  protected_face.back() = 1U;
-  for (std::size_t j = 0; j < pinned.size(); ++j) {
-    pinned[j] = node_mask.pinned[j] ? 1U : 0U;
-    if (node_mask.pinned[j]) {
-      protected_face[j] = 1U;
-    }
-  }
-  for (const int face : additional_protected_faces) {
-    protected_face[static_cast<std::size_t>(face)] = 1U;
-  }
-
-  DeviceBuffer<std::uint8_t> d_pinned("ale1d_remap:remap_v3:d_pinned", static_cast<std::size_t>(n + 1));
-  cuda_check(cudaMemcpyAsync(d_pinned.data(),
-                             pinned.data(),
-                             pinned.size() * sizeof(std::uint8_t),
-                             cudaMemcpyHostToDevice,
-                             stream),
-             "ALE1D remap node mask upload failed");
-  DeviceBuffer<std::uint8_t> d_protected_face("ale1d_remap:remap_v3:d_protected_face", static_cast<std::size_t>(n + 1));
-  cuda_check(cudaMemcpyAsync(d_protected_face.data(),
-                             protected_face.data(),
-                             protected_face.size() * sizeof(std::uint8_t),
-                             cudaMemcpyHostToDevice,
-                             stream),
-             "ALE1D remap protected-face upload failed");
 
   DeviceBuffer<int> d_invalid_count("ale1d_remap:remap_v3:d_invalid_count", 1);
   cuda_check(cudaMemsetAsync(d_invalid_count.data(), 0, sizeof(int), stream),
@@ -1624,8 +1562,8 @@ Ale1dRemapResult remap_v3(const core::State& state,
 
   build_faces_kernel<<<blocks_for(n + 1), kBlockSize, 0, stream>>>(
       state.x_r.data(),
-      d_r_candidate.data(),
-      d_pinned.data(),
+      d_r_candidate,
+      d_pinned,
       scratch.delta_Y.data(),
       scratch.donor.data(),
       d_invalid_count.data(),
@@ -1635,7 +1573,7 @@ Ale1dRemapResult remap_v3(const core::State& state,
   cuda_check(cudaGetLastError(), "ALE1D remap face kernel launch failed");
 
   build_new_volumes_kernel<<<blocks_for(n), kBlockSize, 0, stream>>>(
-      d_r_candidate.data(), scratch.vol_new.data(), d_invalid_count.data(), n,
+      d_r_candidate, scratch.vol_new.data(), d_invalid_count.data(), n,
       geom);
   cuda_check(cudaGetLastError(), "ALE1D remap volume kernel launch failed");
 
@@ -1664,13 +1602,13 @@ Ale1dRemapResult remap_v3(const core::State& state,
   DeviceBuffer<double> d_radiation_phi("ale1d_remap:remap_v3:d_radiation_phi", static_cast<std::size_t>(n + 1));
   if (high_order) {
     build_phi_kernel<<<blocks_for(n + 1), kBlockSize, 0, stream>>>(
-        d_protected_face.data(),
+        d_protected_face,
         scratch.phi_face.data(),
         n,
         cfg.numerics.ale1d.remap.high_order_ramp_cells);
     cuda_check(cudaGetLastError(), "ALE1D remap phi kernel launch failed");
     build_phi_kernel<<<blocks_for(n + 1), kBlockSize, 0, stream>>>(
-        d_protected_face.data(),
+        d_protected_face,
         d_radiation_phi.data(),
         n,
         cfg.numerics.ale1d.remap.radiation_high_order_ramp_cells);
@@ -1708,7 +1646,7 @@ Ale1dRemapResult remap_v3(const core::State& state,
       scratch.donor.data(),
       scratch.phi_face.data(),
       d_zero_phi.data(),
-      d_protected_face.data(),
+      d_protected_face,
       d_q.data(),
       scratch.mass_new.data(),
       d_slope.data(),
@@ -1800,7 +1738,7 @@ Ale1dRemapResult remap_v3(const core::State& state,
                                         scratch.donor.data(),
                                         scratch.phi_face.data(),
                                         d_zero_phi.data(),
-                                        d_protected_face.data(),
+                                        d_protected_face,
                                         d_q.data(),
                                         scratch.mass_new.data(),
                                         d_slope.data(),
@@ -1852,7 +1790,7 @@ Ale1dRemapResult remap_v3(const core::State& state,
                                                    scratch.donor.data(),
                                                    scratch.phi_face.data(),
                                                    d_zero_phi.data(),
-                                                   d_protected_face.data(),
+                                                   d_protected_face,
                                                    d_q.data(),
                                                    ee_specific,
                                                    state.mass.data(),
@@ -1896,7 +1834,7 @@ Ale1dRemapResult remap_v3(const core::State& state,
                                                    scratch.donor.data(),
                                                    scratch.phi_face.data(),
                                                    d_zero_phi.data(),
-                                                   d_protected_face.data(),
+                                                   d_protected_face,
                                                    d_q.data(),
                                                    ei_specific,
                                                    state.mass.data(),
@@ -1972,7 +1910,7 @@ Ale1dRemapResult remap_v3(const core::State& state,
           scratch.donor.data(),
           scratch.phi_face.data(),
           d_zero_phi.data(),
-          d_protected_face.data(),
+          d_protected_face,
           d_q.data(),
           d_material_ext.data(),
           d_slope.data(),
@@ -2018,7 +1956,7 @@ Ale1dRemapResult remap_v3(const core::State& state,
           scratch.donor.data(),
           d_radiation_phi.data(),
           d_zero_phi.data(),
-          d_protected_face.data(),
+          d_protected_face,
           d_q.data(),
           d_rad_new.data(),
           d_slope.data(),
@@ -2057,7 +1995,7 @@ Ale1dRemapResult remap_v3(const core::State& state,
         scratch.donor.data(),
         d_radiation_phi.data(),
         d_zero_phi.data(),
-        d_protected_face.data(),
+        d_protected_face,
         d_q.data(),
         scratch.ke_remap.data(),
         d_slope.data(),
@@ -2100,6 +2038,106 @@ Ale1dRemapResult remap_v3(const core::State& state,
   result.n_bound_fallback_cells = fallback_cells;
   result.n_bound_fallback_fields = fallback_fields;
   return result;
+}
+
+
+Ale1dRemapResult remap_v3(const core::State& state,
+                          const core::Config& cfg,
+                          const std::vector<double>& r_candidate,
+                          const NodeConstraintMask& node_mask,
+                          const std::vector<int>& additional_protected_faces,
+                          Ale1dRemapScratch& scratch) {
+  Ale1dRemapResult result;
+
+  if (cfg.main.dimension != "1D_SPH" || cfg.main.dim != 1 ||
+      state.mesh.dim != 1) {
+    result.skip_reason = Ale1dSkipReason::WrongGeometry;
+    return result;
+  }
+
+  const int n = effective_cell_count(state, cfg);
+  if (n <= 0) {
+    result.skip_reason = Ale1dSkipReason::NTooSmall;
+    return result;
+  }
+  const int geom = state.mesh.geometry_code;
+  if (r_candidate.size() != static_cast<std::size_t>(n + 1)) {
+    result.skip_reason = Ale1dSkipReason::CandidateInvalid;
+    result.n_invalid_sweeps = 1;
+    return result;
+  }
+  TENRYU_ASSERT(node_mask.pinned.size() == static_cast<std::size_t>(n + 1),
+                "ALE1D remap node mask must have n_cells+1 entries");
+
+  for (const int face : additional_protected_faces) {
+    if (face < 0 || face > n) {
+      result.skip_reason = Ale1dSkipReason::CandidateInvalid;
+      result.n_invalid_sweeps = 1;
+      return result;
+    }
+  }
+
+  cudaStream_t stream = nullptr;
+  DeviceBuffer<double> d_r_candidate("ale1d_remap:remap_v3:d_r_candidate", static_cast<std::size_t>(n + 1));
+  cuda_check(cudaMemcpyAsync(d_r_candidate.data(),
+                             r_candidate.data(),
+                             static_cast<std::size_t>(n + 1) * sizeof(double),
+                             cudaMemcpyHostToDevice,
+                             stream),
+             "ALE1D remap r_candidate upload failed");
+
+  std::vector<std::uint8_t> pinned(static_cast<std::size_t>(n + 1), 0U);
+  std::vector<std::uint8_t> protected_face(static_cast<std::size_t>(n + 1),
+                                           0U);
+  protected_face.front() = 1U;
+  protected_face.back() = 1U;
+  for (std::size_t j = 0; j < pinned.size(); ++j) {
+    pinned[j] = node_mask.pinned[j] ? 1U : 0U;
+    if (node_mask.pinned[j]) {
+      protected_face[j] = 1U;
+    }
+  }
+  for (const int face : additional_protected_faces) {
+    protected_face[static_cast<std::size_t>(face)] = 1U;
+  }
+
+  DeviceBuffer<std::uint8_t> d_pinned("ale1d_remap:remap_v3:d_pinned", static_cast<std::size_t>(n + 1));
+  cuda_check(cudaMemcpyAsync(d_pinned.data(),
+                             pinned.data(),
+                             pinned.size() * sizeof(std::uint8_t),
+                             cudaMemcpyHostToDevice,
+                             stream),
+             "ALE1D remap node mask upload failed");
+  DeviceBuffer<std::uint8_t> d_protected_face("ale1d_remap:remap_v3:d_protected_face", static_cast<std::size_t>(n + 1));
+  cuda_check(cudaMemcpyAsync(d_protected_face.data(),
+                             protected_face.data(),
+                             protected_face.size() * sizeof(std::uint8_t),
+                             cudaMemcpyHostToDevice,
+                             stream),
+             "ALE1D remap protected-face upload failed");
+  return remap_v3_device_candidate(state, cfg, n, geom, d_r_candidate.data(), d_pinned.data(),
+                                   d_protected_face.data(), scratch);
+}
+
+Ale1dRemapResult remap_v3_device(const core::State& state,
+                                 const core::Config& cfg,
+                                 const double* d_r_candidate,
+                                 const std::uint8_t* d_pinned,
+                                 const std::uint8_t* d_protected_face,
+                                 Ale1dRemapScratch& scratch) {
+  Ale1dRemapResult result;
+  if (cfg.main.dimension != "1D_SPH" || cfg.main.dim != 1 ||
+      state.mesh.dim != 1) {
+    result.skip_reason = Ale1dSkipReason::WrongGeometry;
+    return result;
+  }
+  const int n = effective_cell_count(state, cfg);
+  if (n <= 0) {
+    result.skip_reason = Ale1dSkipReason::NTooSmall;
+    return result;
+  }
+  return remap_v3_device_candidate(state, cfg, n, state.mesh.geometry_code, d_r_candidate,
+                                   d_pinned, d_protected_face, scratch);
 }
 
 Ale1dRemapResult remap_first_order(const core::State& state,

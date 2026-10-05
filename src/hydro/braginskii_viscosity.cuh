@@ -186,6 +186,16 @@ struct HistoryDiagnostics {
 HistoryDiagnostics compute_history_diagnostics(const core::State& state,
                                                const core::Config& cfg);
 
+// The reduction of the 1D compute_history_diagnostics on the device, from its per-cell arrays
+// (device, n_cells each): eta_i (-1 marks an inactive cell), eta_e, eta_eff, the heating rates
+// and the cell masses. Every field is the host loop's in cell order (fmax/fmin as glibc returns
+// them, the sums in cell order) except ratio_geomean_masswt, whose logarithms are the device's
+// (equal to the host's but for a last-place difference in rare arguments). valid stays false.
+HistoryDiagnostics reduce_history_diagnostics_1d(const double* eta_i, const double* eta_e,
+                                                 const double* eta_eff, const double* heat_i,
+                                                 const double* heat_e, const double* mass,
+                                                 int n_cells);
+
 // dim==2 implementation (braginskii_viscosity_2d.cu): identical field
 // semantics; the strain operator is the 2D shoelace-gradient + hoop split
 // of the stress kernel and the mfp-cap length is the min active cell edge

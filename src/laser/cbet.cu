@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <string>
 
 #include <thrust/device_ptr.h>
@@ -146,22 +147,29 @@ __global__ void cbet_tally_kernel(const std::int64_t* __restrict__ seg_offsets,
   ds_max_gc[s] = dmax;
 }
 
+// A port's record weights start as the port weight times the reference weights. One warp per
+// (ray, port = grid row), the ray's records only (the slots past rec_count are not read).
 __global__ void cbet_init_rec_w_ps_kernel(
     const double* __restrict__ rec_w,
     const double* __restrict__ port_weight,
+    const std::int32_t* __restrict__ rec_count,
     double* __restrict__ rec_w_ps,
     const std::int64_t n_records_capacity,
-    const int n_ports) {
-  const std::int64_t idx =
-      blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
-  const std::int64_t total =
-      static_cast<std::int64_t>(n_ports) * n_records_capacity;
-  if (idx >= total) {
+    const int cap_per_ray,
+    const int n_rays) {
+  const std::int64_t thread = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
+  const int ray = static_cast<int>(thread / 32);
+  const int lane = static_cast<int>(thread % 32);
+  if (ray >= n_rays) {
     return;
   }
-  const int port = static_cast<int>(idx / n_records_capacity);
-  const std::int64_t slot = idx % n_records_capacity;
-  rec_w_ps[idx] = port_weight[port] * rec_w[slot];
+  const int port = static_cast<int>(blockIdx.y);
+  const int cnt = rec_count[ray];
+  const std::int64_t slot0 = static_cast<std::int64_t>(ray) * cap_per_ray;
+  const std::int64_t idx0 = static_cast<std::int64_t>(port) * n_records_capacity + slot0;
+  for (int k = lane; k < cnt; k += 32) {
+    rec_w_ps[idx0 + k] = port_weight[port] * rec_w[slot0 + k];
+  }
 }
 
 // ps-mode remap twin of cbet_tally_kernel; keep in lockstep.
@@ -176,7 +184,7 @@ __global__ void cbet_tally_ps_kernel(
     double* __restrict__ ds_max_gc,
     const std::int64_t n_segments,
     const std::int64_t n_records_capacity,
-    const int port,
+    const int port_arg,
     const int G_ref,
     const int G_ps) {
   const std::int64_t s =
@@ -184,6 +192,8 @@ __global__ void cbet_tally_ps_kernel(
   if (s >= n_segments) {
     return;
   }
+  // port < 0: every port, one per grid row (the ports write disjoint L, Mmu and ds_max_gc slices).
+  const int port = (port_arg >= 0) ? port_arg : static_cast<int>(blockIdx.y);
   double l = 0.0;
   double m = 0.0;
   double dmax = 0.0;
@@ -535,12 +545,37 @@ __global__ void cbet_propagate_kernel(const std::int32_t* __restrict__ rec_cell,
   }
 }
 
-// ps-mode remap twin of cbet_propagate_kernel; keep in lockstep.
+// expm1(-S/2) of every record, the IB attenuation of each half record (the same for every port and
+// pass of a solve; the propagate passes evaluated it per record and pass with this expression).
+// One warp per ray.
+__global__ void cbet_record_em1_kernel(const std::int32_t* __restrict__ rec_count,
+                                       const double* __restrict__ rec_S,
+                                       double* __restrict__ rec_em1, const int cap_per_ray,
+                                       const int n_rays) {
+  const std::int64_t thread = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
+  const int ray = static_cast<int>(thread / 32);
+  const int lane = static_cast<int>(thread % 32);
+  if (ray >= n_rays) {
+    return;
+  }
+  const int cnt = rec_count[ray];
+  const std::int64_t base = static_cast<std::int64_t>(ray) * cap_per_ray;
+  for (int k = lane; k < cnt; k += 32) {
+    const double S_half = 0.5 * rec_S[base + k];
+    rec_em1[base + k] = ::expm1(-S_half);
+  }
+}
+
+// ps-mode remap twin of cbet_propagate_kernel; keep in lockstep. The IB attenuation of a half
+// record comes from rec_em1 (cbet_record_em1_kernel). The final pass writes each half record's
+// deposit to dep_terms and the ray's unabsorbed and clamp-injected power to port_unabs and
+// port_clamp, which cbet_ps_deposit_rows_kernel adds to the rows in port order (the former final
+// pass added them to the rows, one launch per port).
 __global__ void cbet_propagate_ps_kernel(
     const std::int32_t* __restrict__ rec_cell,
     const float* __restrict__ rec_mu,
     const double* __restrict__ rec_ds,
-    const double* __restrict__ rec_S,
+    const double* __restrict__ rec_em1,
     double* __restrict__ rec_w_ps,
     const std::int32_t* __restrict__ rec_count,
     const std::int32_t* __restrict__ ray_group_base,
@@ -550,10 +585,12 @@ __global__ void cbet_propagate_ps_kernel(
     const double* __restrict__ L,
     const std::uint8_t* __restrict__ cell_mask,
     const double* __restrict__ port_weight,
-    double* __restrict__ dep_rows,
-    double* __restrict__ unabs_rows,
+    double* __restrict__ dep_terms,
+    const std::int64_t* __restrict__ ray_rec_offset,
+    const std::int64_t n_records_live,
+    double* __restrict__ port_unabs,
     unsigned long long* __restrict__ clamp_count,
-    double* __restrict__ clamp_rows,
+    double* __restrict__ port_clamp,
     const double* __restrict__ ps_cell_nhat,
     const double* __restrict__ ps_capture_thresh,
     const std::int32_t* __restrict__ ps_capture_order,
@@ -567,7 +604,7 @@ __global__ void cbet_propagate_ps_kernel(
     const int G_ps,
     const int n_cells,
     const int n_rays,
-    const int port,
+    const int port_arg,
     const long long traj_ray_offset,
     const int traj_n_output_rays,
     const int traj_output_stride,
@@ -578,15 +615,19 @@ __global__ void cbet_propagate_ps_kernel(
   if (ray >= n_rays) {
     return;
   }
+  // port < 0: every port, one per grid row (the ports write disjoint slices and read the shared
+  // arrays only).
+  const int port = (port_arg >= 0) ? port_arg : static_cast<int>(blockIdx.y);
   const int cnt = rec_count[ray];
   double P = port_weight[port] * ray_P0[ray];
   if (!::isfinite(P) || P < 0.0) {
     P = 0.0;
   }
   double P_ref = P;
-  double* dep_row = (final_pass != 0)
-                        ? dep_rows + static_cast<std::int64_t>(ray) * n_cells
-                        : nullptr;
+  double* dep_term =
+      (final_pass != 0 && dep_terms != nullptr)
+          ? dep_terms + 2 * (static_cast<std::int64_t>(port) * n_records_live + ray_rec_offset[ray])
+          : nullptr;
   const std::int64_t n_records_capacity =
       static_cast<std::int64_t>(n_rays) * cap_per_ray;
   const std::int64_t base =
@@ -617,7 +658,7 @@ __global__ void cbet_propagate_ps_kernel(
     const std::int64_t ref_slot =
         static_cast<std::int64_t>(ray) * static_cast<std::int64_t>(cap_per_ray) + k;
     const int c = rec_cell[ref_slot];
-    const double S_half = 0.5 * rec_S[ref_slot];
+    const double em1 = rec_em1[ref_slot];
     if (output_slot >= 0) {
       traj_rec_ratio[static_cast<std::int64_t>(output_slot) * cap_per_ray + k] =
           (P_ref > 0.0) ? (P / P_ref) : 1.0;
@@ -647,14 +688,14 @@ __global__ void cbet_propagate_ps_kernel(
     }
     // IB first half
     {
-      const double dP = -P * ::expm1(-S_half);
-      if (dep_row != nullptr && c >= 0 && c < n_cells) {
-        dep_row[c] += dP;
+      const double dP = -P * em1;
+      if (dep_term != nullptr && c >= 0 && c < n_cells) {
+        dep_term[2 * k] = dP;
       }
       P -= dP;
     }
     if (track_ref) {
-      const double dP_ref = -P_ref * ::expm1(-S_half);
+      const double dP_ref = -P_ref * em1;
       P_ref -= dP_ref;
     }
     // CBET exchange (share of the group's net dQ by previous-iteration weight)
@@ -678,21 +719,93 @@ __global__ void cbet_propagate_ps_kernel(
     rec_w_ps[slot] = P;
     // IB second half
     {
-      const double dP = -P * ::expm1(-S_half);
-      if (dep_row != nullptr && c >= 0 && c < n_cells) {
-        dep_row[c] += dP;
+      const double dP = -P * em1;
+      if (dep_term != nullptr && c >= 0 && c < n_cells) {
+        dep_term[2 * k + 1] = dP;
       }
       P -= dP;
     }
     if (track_ref) {
-      const double dP_ref = -P_ref * ::expm1(-S_half);
+      const double dP_ref = -P_ref * em1;
       P_ref -= dP_ref;
     }
   }
   if (final_pass != 0) {
-    unabs_rows[ray] += (::isfinite(P) && P > 0.0) ? P : 0.0;
+    const std::int64_t row = static_cast<std::int64_t>(port) * n_rays + ray;
+    port_unabs[row] = (::isfinite(P) && P > 0.0) ? P : 0.0;
+    port_clamp[row] = clamp_acc;
+  }
+}
+
+// The final pass's deposits added to the rows in the former order: per ray (one warp), the ports
+// in order, a port's records in order and a record's two halves in order, from the row's value
+// (zeroed before); then the ports' unabsorbed and clamp-injected power in port order. The lanes
+// take 32 records at a time; the lanes whose records are in the same cell form a group
+// (__match_any_sync) whose lowest lane adds the group's terms in record order, and groups of
+// different cells add at the same time.
+constexpr int kDepositRowsThreads = 128;
+__global__ void cbet_ps_deposit_rows_kernel(const std::int32_t* __restrict__ rec_cell,
+                                            const std::int32_t* __restrict__ rec_count,
+                                            const std::int64_t* __restrict__ ray_rec_offset,
+                                            const std::int64_t n_records_live,
+                                            const double* __restrict__ dep_terms,
+                                            const double* __restrict__ port_unabs,
+                                            const double* __restrict__ port_clamp,
+                                            double* __restrict__ dep_rows,
+                                            double* __restrict__ unabs_rows,
+                                            double* __restrict__ clamp_rows,
+                                            const int cap_per_ray, const int n_cells,
+                                            const int n_rays, const int n_ports) {
+  constexpr unsigned kAll = 0xffffffffU;
+  __shared__ double sh_terms[kDepositRowsThreads / 32][2][32];
+  const std::int64_t thread = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
+  const int ray = static_cast<int>(thread / 32);
+  const int lane = static_cast<int>(thread % 32);
+  const int warp = static_cast<int>(threadIdx.x) / 32;
+  // the same for the warp's lanes, which return together
+  if (ray >= n_rays) {
+    return;
+  }
+  const int cnt = rec_count[ray];
+  const std::int64_t ref_base = static_cast<std::int64_t>(ray) * cap_per_ray;
+  double* const dep_row = dep_rows + static_cast<std::int64_t>(ray) * n_cells;
+  for (int port = 0; port < n_ports; ++port) {
+    const double* const terms =
+        dep_terms + 2 * (static_cast<std::int64_t>(port) * n_records_live + ray_rec_offset[ray]);
+    for (int k0 = 0; k0 < cnt; k0 += 32) {
+      const int k = k0 + lane;
+      const int c = (k < cnt) ? rec_cell[ref_base + k] : -1;
+      const bool adds = k < cnt && c >= 0 && c < n_cells;
+      if (adds) {
+        sh_terms[warp][0][lane] = terms[2 * k];
+        sh_terms[warp][1][lane] = terms[2 * k + 1];
+      }
+      const unsigned group = __match_any_sync(kAll, adds ? c : -1 - lane);
+      __syncwarp();
+      if (adds && lane == __ffs(group) - 1) {
+        double d = dep_row[c];
+        for (unsigned rest = group; rest != 0U; rest &= rest - 1U) {
+          const int l = __ffs(rest) - 1;
+          d += sh_terms[warp][0][l];
+          d += sh_terms[warp][1][l];
+        }
+        dep_row[c] = d;
+      }
+      __syncwarp();
+    }
+  }
+  if (lane == 0) {
+    double unabs = unabs_rows[ray];
+    for (int port = 0; port < n_ports; ++port) {
+      unabs += port_unabs[static_cast<std::int64_t>(port) * n_rays + ray];
+    }
+    unabs_rows[ray] = unabs;
     if (clamp_rows != nullptr) {
-      clamp_rows[ray] += clamp_acc;
+      double clamp = clamp_rows[ray];
+      for (int port = 0; port < n_ports; ++port) {
+        clamp += port_clamp[static_cast<std::int64_t>(port) * n_rays + ray];
+      }
+      clamp_rows[ray] = clamp;
     }
   }
 }
@@ -744,33 +857,68 @@ __global__ void cbet_scale_traj_power_kernel(
 // Fused deterministic reductions over the [n_cells*G] tallies.
 // out[0] = sum |L - L_prev|, out[1] = sum L_prev, out[2] = sum dQ,
 // out[3] = sum |dQ|, out[4] = sum exch_partial.
-__global__ void cbet_iter_stats_kernel(const double* __restrict__ L,
-                                       const double* __restrict__ L_prev,
-                                       const double* __restrict__ dQ,
-                                       const double* __restrict__ exch_partial,
-                                       double* __restrict__ out,
-                                       const std::int64_t n) {
-  __shared__ double sh[5][256];
-  const int t = threadIdx.x;
-  double a0 = 0.0;
-  double a1 = 0.0;
-  double a2 = 0.0;
-  double a3 = 0.0;
-  double a4 = 0.0;
-  for (std::int64_t i = t; i < n; i += 256) {
-    a0 += ::fabs(L[i] - L_prev[i]);
-    a1 += L_prev[i];
-    a2 += dQ[i];
-    a3 += ::fabs(dQ[i]);
-    a4 += exch_partial[i];
+// Partial sum t (t < kStatsPartials) adds the elements t, t + kStatsPartials, ... in that order;
+// cbet_iter_stats_tree_kernel then adds the partial sums by a fixed tree. One warp per 32 partial
+// sums and quantity (grid kStatsPartials / 32 x 5), so that the additions spread over the SMs
+// (one block of kStatsPartials threads ran them on one SM's double-precision units).
+constexpr int kStatsPartials = 256;
+constexpr int kStatsUnroll = 8;
+__global__ void cbet_iter_stats_partial_kernel(const double* __restrict__ L,
+                                               const double* __restrict__ L_prev,
+                                               const double* __restrict__ dQ,
+                                               const double* __restrict__ exch_partial,
+                                               double* __restrict__ partial,
+                                               const std::int64_t n) {
+  const int t = static_cast<int>(blockIdx.x) * 32 + static_cast<int>(threadIdx.x);
+  const int quantity = static_cast<int>(blockIdx.y);
+  const double* const x = (quantity == 0 || quantity == 1) ? L_prev
+                          : (quantity == 4)                 ? exch_partial
+                                                            : dQ;
+  double a = 0.0;
+  std::int64_t i = t;
+  // the loads of kStatsUnroll elements ahead of their additions, which keep the order
+  for (; i + static_cast<std::int64_t>(kStatsUnroll - 1) * kStatsPartials < n;
+       i += static_cast<std::int64_t>(kStatsUnroll) * kStatsPartials) {
+    double v[kStatsUnroll];
+    double l[kStatsUnroll];
+#pragma unroll
+    for (int u = 0; u < kStatsUnroll; ++u) {
+      const std::int64_t j = i + static_cast<std::int64_t>(u) * kStatsPartials;
+      v[u] = x[j];
+      l[u] = (quantity == 0) ? L[j] : 0.0;
+    }
+#pragma unroll
+    for (int u = 0; u < kStatsUnroll; ++u) {
+      if (quantity == 0) {
+        a += ::fabs(l[u] - v[u]);
+      } else if (quantity == 3) {
+        a += ::fabs(v[u]);
+      } else {
+        a += v[u];
+      }
+    }
   }
-  sh[0][t] = a0;
-  sh[1][t] = a1;
-  sh[2][t] = a2;
-  sh[3][t] = a3;
-  sh[4][t] = a4;
+  for (; i < n; i += kStatsPartials) {
+    if (quantity == 0) {
+      a += ::fabs(L[i] - x[i]);
+    } else if (quantity == 3) {
+      a += ::fabs(x[i]);
+    } else {
+      a += x[i];
+    }
+  }
+  partial[static_cast<std::int64_t>(quantity) * kStatsPartials + t] = a;
+}
+
+__global__ void cbet_iter_stats_tree_kernel(const double* __restrict__ partial,
+                                            double* __restrict__ out) {
+  __shared__ double sh[5][kStatsPartials];
+  const int t = threadIdx.x;
+  for (int q = 0; q < 5; ++q) {
+    sh[q][t] = partial[q * kStatsPartials + t];
+  }
   __syncthreads();
-  for (int stride = 128; stride > 0; stride >>= 1) {
+  for (int stride = kStatsPartials / 2; stride > 0; stride >>= 1) {
     if (t < stride) {
       sh[0][t] += sh[0][t + stride];
       sh[1][t] += sh[1][t + stride];
@@ -1134,6 +1282,101 @@ __global__ void cbet_sum_rows_kernel(const double* __restrict__ rows,
   }
 }
 
+// Ray group of each ray of a beam: the beam's group base plus its impact bin
+// (bin = k * n_bins / count, the ray's position in the beam).
+__global__ void cbet_ray_group_base_kernel(std::int32_t* __restrict__ group_base,
+                                           const int count,
+                                           const int n_bins,
+                                           const int base) {
+  const int k = blockIdx.x * blockDim.x + threadIdx.x;
+  if (k >= count) {
+    return;
+  }
+  const int bin = ::min(n_bins - 1,
+                        static_cast<int>((static_cast<long long>(k) * n_bins) /
+                                         ::max(count, 1)));
+  group_base[k] = base + bin;
+}
+
+// The pair tables of G groups (legacy mode, formerly built on the host every step): the pairs
+// (p, q), p < q, numbered in the order of p and then q; pair_index holds the number of the pair of
+// (p, q) and of (q, p), and -1 on the diagonal. One thread per (p, q).
+__global__ void cbet_pair_tables_kernel(const int G,
+                                        std::int16_t* __restrict__ pair_p,
+                                        std::int16_t* __restrict__ pair_q,
+                                        std::int32_t* __restrict__ pair_index) {
+  const long long idx = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx >= static_cast<long long>(G) * G) {
+    return;
+  }
+  const int p = static_cast<int>(idx / G);
+  const int q = static_cast<int>(idx % G);
+  if (p == q) {
+    pair_index[idx] = -1;
+    return;
+  }
+  const long long lo = (p < q) ? p : q;
+  const long long hi = (p < q) ? q : p;
+  // rows 0 .. lo-1 hold G-1-r pairs each
+  const long long pair = lo * (G - 1) - lo * (lo - 1) / 2 + (hi - lo - 1);
+  pair_index[idx] = static_cast<std::int32_t>(pair);
+  if (p < q) {
+    pair_p[pair] = static_cast<std::int16_t>(p);
+    pair_q[pair] = static_cast<std::int16_t>(q);
+  }
+}
+
+// Legacy mode: the frequency of each group is its beam's.
+__global__ void cbet_omega_group_kernel(const int G,
+                                        const int groups_per_beam,
+                                        const double* __restrict__ beam_omega,
+                                        double* __restrict__ omega_group) {
+  const int g = blockIdx.x * blockDim.x + threadIdx.x;
+  if (g >= G) {
+    return;
+  }
+  omega_group[g] = beam_omega[g / groups_per_beam];
+}
+
+// The record total after the exclusive scan of the per-ray counts: written behind the last
+// offset and into *total for the readback.
+__global__ void cbet_scan_total_kernel(const std::int32_t* __restrict__ rec_count,
+                                       std::int64_t* __restrict__ ray_rec_offset,
+                                       const int n_rays,
+                                       std::int64_t* __restrict__ total) {
+  if (blockIdx.x != 0 || threadIdx.x != 0) {
+    return;
+  }
+  const std::int64_t value =
+      ray_rec_offset[n_rays - 1] + static_cast<std::int64_t>(rec_count[n_rays - 1]);
+  ray_rec_offset[n_rays] = value;
+  *total = value;
+}
+
+// The number of rays that overflowed their record capacity (one block; an integer sum, so the
+// order does not matter).
+__global__ void cbet_count_overflow_kernel(const std::uint8_t* __restrict__ ray_overflow,
+                                           const int n_rays,
+                                           unsigned long long* __restrict__ out) {
+  __shared__ unsigned long long sh[256];
+  const int t = threadIdx.x;
+  unsigned long long a = 0ULL;
+  for (int i = t; i < n_rays; i += 256) {
+    a += static_cast<unsigned long long>(ray_overflow[i]);
+  }
+  sh[t] = a;
+  __syncthreads();
+  for (int stride = 128; stride > 0; stride >>= 1) {
+    if (t < stride) {
+      sh[t] += sh[t + stride];
+    }
+    __syncthreads();
+  }
+  if (t == 0) {
+    *out = sh[0];
+  }
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -1161,6 +1404,10 @@ void CbetWorkspace::release() {
   free_ptr(&rec_S);
   free_ptr(&rec_w);
   free_ptr(&rec_w_ps);
+  free_ptr(&rec_em1);
+  free_ptr(&ps_dep_terms);
+  free_ptr(&ps_port_unabs);
+  free_ptr(&ps_port_clamp);
   free_ptr(&ps_cell_nhat);
   free_ptr(&ps_capture_thresh);
   free_ptr(&ps_capture_order);
@@ -1202,12 +1449,48 @@ void CbetWorkspace::release() {
   free_ptr(&unabs_rows);
   free_ptr(&clamp_rows);
   free_ptr(&d_scalars);
+  free_ptr(&stats_partial);
   free_ptr(&d_iaw_sum);
   free_ptr(&d_counters);
+  free_ptr(&cell_A_eff);
+  free_ptr(&material_A_device);
+  free_ptr(&viz_gross);
+  free_ptr(&viz_net_inbound);
+  free_ptr(&viz_dq_abs_cell);
+  free_ptr(&viz_dq_max_cell);
+  free_ptr(&ps_outgoing);
+  free_ptr(&ps_capture_pcross);
+  free_ptr(&ps_capture_row_config);
+  free_ptr(&step_out);
+  free_ptr(&step_flags);
+  if (step_out_host != nullptr) {
+    static_cast<void>(cudaFreeHost(step_out_host));
+    step_out_host = nullptr;
+  }
+  if (step_flags_host != nullptr) {
+    static_cast<void>(cudaFreeHost(step_flags_host));
+    step_flags_host = nullptr;
+  }
+  free_ptr(&beam_omega_device);
+  free_ptr(&d_records_total);
+  if (solve_host != nullptr) {
+    static_cast<void>(cudaFreeHost(solve_host));
+    solve_host = nullptr;
+  }
+  cap_beam_omega = 0;
+  legacy_staged_beam_omega = {};
+  material_A_uploaded.clear();
+  cap_cell_outputs = cap_viz = cap_material_A = cap_ps_outgoing = cap_ps_capture_pcross = cap_step_out = 0;
+  cap_ps_capture_row_config = 0;
+  ps_capture_config_channels = 0;
+  viz_valid = false;
+  ps_outputs_valid = false;
+  reset_ps_staged_uploads();
   cap_records = cap_rays = cap_gc = cap_chi = cap_cells = cap_rows = 0;
   cap_pair_list = cap_pair_index = cap_omega = 0;
   cap_dep_nodes = 0;
   cap_rec_w_ps = cap_port_weight = 0;
+  cap_rec_em1 = cap_ps_dep_terms = cap_ps_port_unabs = cap_ps_port_clamp = 0;
   cap_ps_cell_nhat = cap_ps_capture_thresh = cap_ps_capture_order = 0;
   cap_ps_one_minus_eta = cap_ps_capture_stage = 0;
   n_rays_total = cap_per_ray = n_cells = n_beams = n_bins = n_groups = n_pairs = 0;
@@ -1385,6 +1668,11 @@ void cbet_workspace_prepare(CbetWorkspace& ws,
   if (ws.ps_mode) {
     ensure_device_capacity(&ws.rec_w_ps, &ws.cap_rec_w_ps, n_rec_ps,
                            "cbet rec_w_ps alloc");
+    ensure_device_capacity(&ws.rec_em1, &ws.cap_rec_em1, n_rec, "cbet rec_em1 alloc");
+    ensure_device_capacity(&ws.ps_port_unabs, &ws.cap_ps_port_unabs,
+                           static_cast<std::size_t>(n_ports) * n_ray, "cbet port unabs alloc");
+    ensure_device_capacity(&ws.ps_port_clamp, &ws.cap_ps_port_clamp,
+                           static_cast<std::size_t>(n_ports) * n_ray, "cbet port clamp alloc");
     ensure_device_capacity(&ws.port_weight, &ws.cap_port_weight,
                            static_cast<std::size_t>(n_ports),
                            "cbet port_weight alloc");
@@ -1536,43 +1824,41 @@ void cbet_workspace_prepare(CbetWorkspace& ws,
     ensure_device_capacity(&ws.d_counters, &cap, static_cast<std::size_t>(4),
                            "cbet counters alloc");
   }
+  if (ws.stats_partial == nullptr) {
+    std::size_t cap = 0;
+    ensure_device_capacity(&ws.stats_partial, &cap, static_cast<std::size_t>(5 * kStatsPartials),
+                           "cbet stats partial alloc");
+  }
   if (ws.d_iaw_sum == nullptr) {
     std::size_t cap = 0;
     ensure_device_capacity(&ws.d_iaw_sum, &cap, static_cast<std::size_t>(1),
                            "cbet iaw sum alloc");
   }
+  if (ws.d_records_total == nullptr) {
+    std::size_t cap = 0;
+    ensure_device_capacity(&ws.d_records_total, &cap, static_cast<std::size_t>(1),
+                           "cbet records total alloc");
+  }
+  if (ws.solve_host == nullptr) {
+    cbet_check(cudaMallocHost(reinterpret_cast<void**>(&ws.solve_host),
+                              sizeof(CbetWorkspace::SolveReadback)),
+               "cbet solve readback pinned alloc");
+  }
+  if (!ws.ps_mode) {
+    ensure_device_capacity(&ws.beam_omega_device, &ws.cap_beam_omega,
+                           static_cast<std::size_t>(n_beams), "cbet beam omega alloc");
+  }
 
   if (!ws.ps_mode) {
-    // static pair tables (host build, H2D)
-    std::vector<std::int16_t> h_pair_p;
-    std::vector<std::int16_t> h_pair_q;
-    h_pair_p.reserve(static_cast<std::size_t>(ws.n_pairs));
-    h_pair_q.reserve(static_cast<std::size_t>(ws.n_pairs));
-    std::vector<std::int32_t> h_pair_index(
-        static_cast<std::size_t>(ws.n_groups) * ws.n_groups, -1);
-    int pair = 0;
-    for (int p = 0; p < ws.n_groups; ++p) {
-      for (int q = p + 1; q < ws.n_groups; ++q) {
-        h_pair_p.push_back(static_cast<std::int16_t>(p));
-        h_pair_q.push_back(static_cast<std::int16_t>(q));
-        h_pair_index[static_cast<std::size_t>(p) * ws.n_groups + q] = pair;
-        h_pair_index[static_cast<std::size_t>(q) * ws.n_groups + p] = pair;
-        ++pair;
-      }
-    }
-    TENRYU_ASSERT(pair == ws.n_pairs, "cbet pair table construction mismatch");
-    cbet_check(cudaMemcpyAsync(ws.pair_p, h_pair_p.data(),
-                               h_pair_p.size() * sizeof(std::int16_t),
-                               cudaMemcpyHostToDevice, stream),
-               "cbet pair_p H2D failed");
-    cbet_check(cudaMemcpyAsync(ws.pair_q, h_pair_q.data(),
-                               h_pair_q.size() * sizeof(std::int16_t),
-                               cudaMemcpyHostToDevice, stream),
-               "cbet pair_q H2D failed");
-    cbet_check(cudaMemcpyAsync(ws.pair_index, h_pair_index.data(),
-                               h_pair_index.size() * sizeof(std::int32_t),
-                               cudaMemcpyHostToDevice, stream),
-               "cbet pair_index H2D failed");
+    // static pair tables, built on the device; a port_section solve stages its own again
+    ws.reset_ps_staged_uploads();
+    const long long n_pair_entries = static_cast<long long>(ws.n_groups) * ws.n_groups;
+    constexpr int kPairBlock = 256;
+    cbet_pair_tables_kernel<<<static_cast<unsigned int>((n_pair_entries + kPairBlock - 1) /
+                                                        kPairBlock),
+                              kPairBlock, 0, stream>>>(ws.n_groups, ws.pair_p, ws.pair_q,
+                                                       ws.pair_index);
+    cbet_check(cudaGetLastError(), "cbet pair tables launch failed");
   }
   cbet_check(cudaMemsetAsync(ws.rec_count, 0,
                              static_cast<std::size_t>(n_rays_total) * sizeof(std::int32_t),
@@ -1591,9 +1877,6 @@ void cbet_workspace_prepare(CbetWorkspace& ws,
                                  sizeof(std::int32_t),
                              stream),
              "cbet ray_group_base memset failed");
-  // pair tables H2D are consumed by later kernels on the same stream; the host
-  // vectors go out of scope here, so block until the copies land.
-  cbet_check(cudaStreamSynchronize(stream), "cbet prepare stream sync failed");
   ws.beam_ray_offset.assign(static_cast<std::size_t>(n_beams), 0);
   ws.beam_ray_count.assign(static_cast<std::size_t>(n_beams), 0);
   ws.beam_omega.assign(static_cast<std::size_t>(n_beams), 0.0);
@@ -1618,23 +1901,28 @@ void cbet_stage_ray_meta(CbetWorkspace& ws,
   if (count == 0) {
     return;
   }
-  std::vector<std::int32_t> h_base(static_cast<std::size_t>(count));
   const int base = beam_index * ws.n_branches * ws.n_bins;
-  for (int k = 0; k < count; ++k) {
-    const int bin = std::min(ws.n_bins - 1,
-                             static_cast<int>((static_cast<long long>(k) * ws.n_bins) /
-                                              std::max(count, 1)));
-    h_base[static_cast<std::size_t>(k)] = base + bin;
-  }
-  cbet_check(cudaMemcpyAsync(ws.ray_group_base + ray_offset, h_base.data(),
-                             h_base.size() * sizeof(std::int32_t),
-                             cudaMemcpyHostToDevice, stream),
-             "cbet group_base H2D failed");
+  constexpr int block = 128;
+  cbet_ray_group_base_kernel<<<(count + block - 1) / block, block, 0, stream>>>(
+      ws.ray_group_base + ray_offset, count, ws.n_bins, base);
+  cbet_check(cudaGetLastError(), "cbet group_base launch failed");
   cbet_check(cudaMemcpyAsync(ws.ray_P0 + ray_offset, d_ray_power,
                              static_cast<std::size_t>(count) * sizeof(double),
                              cudaMemcpyDeviceToDevice, stream),
              "cbet ray_P0 D2D failed");
-  cbet_check(cudaStreamSynchronize(stream), "cbet stage_ray_meta stream sync failed");
+}
+
+CbetCellFieldConstants cbet_cell_field_constants(const double lambda0_cm) {
+  CbetCellFieldConstants k;
+  k.c = core::constants::c_light;
+  k.eV = core::constants::eV_to_erg;
+  k.omega0 = 2.0 * kPi * k.c / lambda0_cm;
+  k.n_crit = kElectronMass * k.omega0 * k.omega0 /
+             (4.0 * kPi * kElementaryCharge * kElementaryCharge);
+  k.lam_pref = lambda0_cm * kElementaryCharge * kElementaryCharge /
+               (k.c * k.c * k.c * kElectronMass);
+  k.proton_mass = kProtonMass;
+  return k;
 }
 
 void cbet_stage_cell_fields(CbetWorkspace& ws,
@@ -1648,13 +1936,12 @@ void cbet_stage_cell_fields(CbetWorkspace& ws,
                     static_cast<int>(mirror.zbar.size()) == n_cells &&
                     static_cast<int>(mirror.A_eff.size()) == n_cells,
                 "cbet_stage_cell_fields mirror size mismatch");
-  const double c = core::constants::c_light;
-  const double eV = core::constants::eV_to_erg;
-  const double omega0 = 2.0 * kPi * c / lambda0_cm;
-  const double n_crit = kElectronMass * omega0 * omega0 /
-                        (4.0 * kPi * kElementaryCharge * kElementaryCharge);
-  const double lam_pref = lambda0_cm * kElementaryCharge * kElementaryCharge /
-                          (c * c * c * kElectronMass);
+  const CbetCellFieldConstants constants = cbet_cell_field_constants(lambda0_cm);
+  const double c = constants.c;
+  const double eV = constants.eV;
+  const double omega0 = constants.omega0;
+  const double n_crit = constants.n_crit;
+  const double lam_pref = constants.lam_pref;
   const double eps_n = laser.absorption.eps_n;
   const double cutoff = laser.cbet.ne_frac_cutoff;
 
@@ -1893,6 +2180,24 @@ CbetSolveResult cbet_solve_and_deposit(CbetWorkspace& ws,
     result.dq_n_ports = ws.n_ports;
   }
 
+  // The state frequencies, port weights and pair tables (port_section) and the beam frequencies
+  // (legacy mode) depend only on the port layout, the beams and the wavelength: they are uploaded
+  // when they differ from the last upload (the device arrays keep them between steps).
+  const auto stage = [&](auto* device, const auto* host, const std::size_t count,
+                         auto& staged, const char* message) {
+    if (staged.device == device && staged.values.size() == count &&
+        (count == 0 ||
+         std::memcmp(staged.values.data(), host,
+                     count * sizeof(staged.values[0])) == 0)) {
+      return;
+    }
+    staged.values.assign(host, host + count);
+    staged.device = device;
+    cbet_check(cudaMemcpyAsync(device, staged.values.data(),
+                               count * sizeof(staged.values[0]),
+                               cudaMemcpyHostToDevice, stream),
+               message);
+  };
   if (ps != nullptr) {
     const std::size_t n_chi =
         static_cast<std::size_t>(n_cells) * ws.n_pairs;
@@ -1909,66 +2214,47 @@ CbetSolveResult cbet_solve_and_deposit(CbetWorkspace& ws,
                                  cudaMemcpyHostToDevice, stream),
                  "cbet port_section chi H2D failed");
     }
-    cbet_check(cudaMemcpyAsync(ws.omega_group, ps->omega_state_host,
-                               static_cast<std::size_t>(G) * sizeof(double),
-                               cudaMemcpyHostToDevice, stream),
-               "cbet port_section omega H2D failed");
-    cbet_check(cudaMemcpyAsync(ws.port_weight, ps->port_weight_host,
-                               static_cast<std::size_t>(ws.n_ports) *
-                                   sizeof(double),
-                               cudaMemcpyHostToDevice, stream),
-               "cbet port_section weight H2D failed");
-    cbet_check(cudaMemcpyAsync(ws.pair_p, ps->pair_p,
-                               static_cast<std::size_t>(ws.n_pairs) *
-                                   sizeof(std::int16_t),
-                               cudaMemcpyHostToDevice, stream),
-               "cbet port_section pair_p H2D failed");
-    cbet_check(cudaMemcpyAsync(ws.pair_q, ps->pair_q,
-                               static_cast<std::size_t>(ws.n_pairs) *
-                                   sizeof(std::int16_t),
-                               cudaMemcpyHostToDevice, stream),
-               "cbet port_section pair_q H2D failed");
-    cbet_check(cudaMemcpyAsync(ws.pair_index, ps->pair_index,
-                               n_pair_index * sizeof(std::int32_t),
-                               cudaMemcpyHostToDevice, stream),
-               "cbet port_section pair_index H2D failed");
-    cbet_check(cudaStreamSynchronize(stream),
-               "cbet port_section table stage sync failed");
+    stage(ws.omega_group, ps->omega_state_host, static_cast<std::size_t>(G),
+          ws.ps_staged_omega, "cbet port_section omega H2D failed");
+    stage(ws.port_weight, ps->port_weight_host,
+          static_cast<std::size_t>(ws.n_ports), ws.ps_staged_weight,
+          "cbet port_section weight H2D failed");
+    stage(ws.pair_p, ps->pair_p, static_cast<std::size_t>(ws.n_pairs),
+          ws.ps_staged_pair_p, "cbet port_section pair_p H2D failed");
+    stage(ws.pair_q, ps->pair_q, static_cast<std::size_t>(ws.n_pairs),
+          ws.ps_staged_pair_q, "cbet port_section pair_q H2D failed");
+    stage(ws.pair_index, ps->pair_index, n_pair_index,
+          ws.ps_staged_pair_index, "cbet port_section pair_index H2D failed");
   } else {
-    // omega per group from beam bookkeeping
-    std::vector<double> h_omega_g(static_cast<std::size_t>(G), 0.0);
-    for (int g = 0; g < G; ++g) {
-      const int b = g / (ws.n_branches * ws.n_bins);
-      h_omega_g[static_cast<std::size_t>(g)] =
-          ws.beam_omega[static_cast<std::size_t>(b)];
-    }
-    cbet_check(cudaMemcpyAsync(ws.omega_group, h_omega_g.data(),
-                               h_omega_g.size() * sizeof(double),
-                               cudaMemcpyHostToDevice, stream),
-               "cbet omega_group H2D failed");
-    cbet_check(cudaStreamSynchronize(stream), "cbet omega stage sync failed");
+    // omega per group from the beams' frequencies, on the device
+    TENRYU_ASSERT(ws.beam_omega_device != nullptr &&
+                      ws.beam_omega.size() == static_cast<std::size_t>(ws.n_beams) &&
+                      G == ws.n_beams * ws.n_branches * ws.n_bins,
+                  "cbet legacy omega staging: beam bookkeeping mismatch");
+    stage(ws.beam_omega_device, ws.beam_omega.data(), ws.beam_omega.size(),
+          ws.legacy_staged_beam_omega, "cbet beam omega H2D failed");
+    ws.ps_staged_omega = {};
+    constexpr int kOmegaBlock = 128;
+    cbet_omega_group_kernel<<<(G + kOmegaBlock - 1) / kOmegaBlock, kOmegaBlock, 0, stream>>>(
+        G, ws.n_branches * ws.n_bins, ws.beam_omega_device, ws.omega_group);
+    cbet_check(cudaGetLastError(), "cbet omega_group launch failed");
   }
 
-  // exclusive scan of rec_count -> ray_rec_offset, live record count
+  // exclusive scan of rec_count -> ray_rec_offset; the total behind the last offset and, for the
+  // sizes of the sort below, on the host
   {
     thrust::device_ptr<const std::int32_t> cnt(ws.rec_count);
     thrust::device_ptr<std::int64_t> off(ws.ray_rec_offset);
     thrust::exclusive_scan(thrust::cuda::par.on(stream), cnt, cnt + n_rays, off,
                            static_cast<std::int64_t>(0));
-    std::int64_t last_off = 0;
-    std::int32_t last_cnt = 0;
-    cbet_check(cudaMemcpyAsync(&last_off, ws.ray_rec_offset + (n_rays - 1),
+    cbet_scan_total_kernel<<<1, 1, 0, stream>>>(ws.rec_count, ws.ray_rec_offset, n_rays,
+                                                ws.d_records_total);
+    cbet_check(cudaGetLastError(), "cbet scan total launch failed");
+    cbet_check(cudaMemcpyAsync(&ws.solve_host->records_total, ws.d_records_total,
                                sizeof(std::int64_t), cudaMemcpyDeviceToHost, stream),
-               "cbet scan tail D2H failed");
-    cbet_check(cudaMemcpyAsync(&last_cnt, ws.rec_count + (n_rays - 1),
-                               sizeof(std::int32_t), cudaMemcpyDeviceToHost, stream),
-               "cbet count tail D2H failed");
+               "cbet scan total D2H failed");
     cbet_check(cudaStreamSynchronize(stream), "cbet scan sync failed");
-    ws.n_records_live = last_off + last_cnt;
-    const std::int64_t total = ws.n_records_live;
-    cbet_check(cudaMemcpyAsync(ws.ray_rec_offset + n_rays, &total,
-                               sizeof(std::int64_t), cudaMemcpyHostToDevice, stream),
-               "cbet scan total H2D failed");
+    ws.n_records_live = ws.solve_host->records_total;
   }
 
   if (ws.n_records_live > 0) {
@@ -2017,17 +2303,23 @@ CbetSolveResult cbet_solve_and_deposit(CbetWorkspace& ws,
   const int grid_rays = (n_rays + block - 1) / block;
   const std::int64_t n_records_capacity =
       static_cast<std::int64_t>(n_rays) * ws.cap_per_ray;
+  // port_section: one thread per (ray, port) in the propagate passes, 32 to a block (the chains of
+  // double-precision arithmetic along the rays spread over the SMs)
+  constexpr int kPsRayBlock = 32;
+  const int grid_rays_ps = (n_rays + kPsRayBlock - 1) / kPsRayBlock;
+  const int grid_ray_warps = static_cast<int>((static_cast<std::int64_t>(n_rays) * 32 + block - 1) / block);
   if (ps != nullptr) {
-    const std::int64_t n_rec_ps =
-        static_cast<std::int64_t>(ws.n_ports) * n_records_capacity;
-    const std::int64_t grid_rec_ps =
-        (n_rec_ps + block - 1) / block;
-    cbet_init_rec_w_ps_kernel<<<static_cast<unsigned int>(grid_rec_ps), block,
-                               0, stream>>>(
-        ws.rec_w, ws.port_weight, ws.rec_w_ps, n_records_capacity,
-        ws.n_ports);
+    cbet_init_rec_w_ps_kernel<<<dim3(static_cast<unsigned int>(grid_ray_warps),
+                                     static_cast<unsigned int>(ws.n_ports)),
+                                block, 0, stream>>>(
+        ws.rec_w, ws.port_weight, ws.rec_count, ws.rec_w_ps, n_records_capacity,
+        ws.cap_per_ray, n_rays);
     cbet_check(cudaGetLastError(),
                "cbet port_section rec_w init launch failed");
+    cbet_record_em1_kernel<<<grid_ray_warps, block, 0, stream>>>(
+        ws.rec_count, ws.rec_S, ws.rec_em1, ws.cap_per_ray, n_rays);
+    cbet_check(cudaGetLastError(),
+               "cbet port_section record attenuation launch failed");
   }
 
   double h_stats[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
@@ -2042,15 +2334,14 @@ CbetSolveResult cbet_solve_and_deposit(CbetWorkspace& ws,
                  "cbet L_prev copy failed");
     }
     if (ps != nullptr) {
-      for (int port = 0; port < ws.n_ports; ++port) {
-        cbet_tally_ps_kernel<<<static_cast<unsigned int>(grid_gc_ref), block,
-                               0, stream>>>(
-            ws.seg_offsets, ws.sort_slot, ws.rec_w_ps, ws.rec_ds, ws.rec_mu,
-            ws.L, ws.Mmu, ws.ds_max_gc, n_gc_ref, n_records_capacity, port,
-            G_ref, G);
-        cbet_check(cudaGetLastError(),
-                   "cbet port_section tally launch failed");
-      }
+      cbet_tally_ps_kernel<<<dim3(static_cast<unsigned int>(grid_gc_ref),
+                                  static_cast<unsigned int>(ws.n_ports)),
+                             block, 0, stream>>>(
+          ws.seg_offsets, ws.sort_slot, ws.rec_w_ps, ws.rec_ds, ws.rec_mu,
+          ws.L, ws.Mmu, ws.ds_max_gc, n_gc_ref, n_records_capacity, -1,
+          G_ref, G);
+      cbet_check(cudaGetLastError(),
+                 "cbet port_section tally launch failed");
       cbet_losscap_kernel<<<static_cast<unsigned int>(grid_gc), block, 0,
                             stream>>>(
           ws.L, ws.ds_max_gc, ws.chi, ws.pair_index, ws.cell_vol,
@@ -2104,13 +2395,17 @@ CbetSolveResult cbet_solve_and_deposit(CbetWorkspace& ws,
           ws.d_counters + 1, ps != nullptr ? 1 : 0, G, ws.n_pairs, n_cells);
     }
     cbet_check(cudaGetLastError(), "cbet dQ launch failed");
-    cbet_iter_stats_kernel<<<1, 256, 0, stream>>>(ws.L, ws.L_prev, ws.dQ,
-                                                  ws.exch_partial, ws.d_scalars, n_gc);
+    cbet_iter_stats_partial_kernel<<<dim3(kStatsPartials / 32, 5), 32, 0, stream>>>(
+        ws.L, ws.L_prev, ws.dQ, ws.exch_partial, ws.stats_partial, n_gc);
+    cbet_check(cudaGetLastError(), "cbet stats partial launch failed");
+    cbet_iter_stats_tree_kernel<<<1, kStatsPartials, 0, stream>>>(ws.stats_partial,
+                                                                  ws.d_scalars);
     cbet_check(cudaGetLastError(), "cbet stats launch failed");
-    cbet_check(cudaMemcpyAsync(h_stats, ws.d_scalars, 5 * sizeof(double),
+    cbet_check(cudaMemcpyAsync(ws.solve_host->stats, ws.d_scalars, 5 * sizeof(double),
                                cudaMemcpyDeviceToHost, stream),
                "cbet stats D2H failed");
     cbet_check(cudaStreamSynchronize(stream), "cbet stats sync failed");
+    std::memcpy(h_stats, ws.solve_host->stats, sizeof(h_stats));
     if (m > 1) {
       const double denom = std::max(h_stats[1], 1.0e-300);
       result.conv_final = h_stats[0] / denom;
@@ -2127,21 +2422,22 @@ CbetSolveResult cbet_solve_and_deposit(CbetWorkspace& ws,
       break;
     }
     if (ps != nullptr) {
-      for (int port = 0; port < ws.n_ports; ++port) {
-        cbet_propagate_ps_kernel<<<grid_rays, block, 0, stream>>>(
-            ws.rec_cell, ws.rec_mu, ws.rec_ds, ws.rec_S, ws.rec_w_ps,
-            ws.rec_count, ws.ray_group_base, ws.ray_P0, ws.ray_overflow,
-            ws.dQ, ws.L, ws.cell_mask, ws.port_weight, ws.dep_rows,
-            ws.unabs_rows, ws.d_counters, ws.clamp_rows, ws.ps_cell_nhat,
-            ws.ps_capture_thresh, ws.ps_capture_order,
-            ws.ps_one_minus_eta,
-            ws.ps_capture_stage, ps->traj_rec_ratio, ws.ps_n_channels,
-            ws.cap_per_ray, ws.n_bins, G_ref, G, n_cells, n_rays, port,
-            ps->traj_ray_offset, ps->traj_n_output_rays,
-            ps->traj_output_stride, ps->viz_port, 0);
-        cbet_check(cudaGetLastError(),
-                   "cbet port_section propagate launch failed");
-      }
+      cbet_propagate_ps_kernel<<<dim3(static_cast<unsigned int>(grid_rays_ps),
+                                      static_cast<unsigned int>(ws.n_ports)),
+                                 kPsRayBlock, 0, stream>>>(
+          ws.rec_cell, ws.rec_mu, ws.rec_ds, ws.rec_em1, ws.rec_w_ps,
+          ws.rec_count, ws.ray_group_base, ws.ray_P0, ws.ray_overflow,
+          ws.dQ, ws.L, ws.cell_mask, ws.port_weight, nullptr,
+          ws.ray_rec_offset, ws.n_records_live, ws.ps_port_unabs, ws.d_counters,
+          ws.ps_port_clamp, ws.ps_cell_nhat,
+          ws.ps_capture_thresh, ws.ps_capture_order,
+          ws.ps_one_minus_eta,
+          ws.ps_capture_stage, ps->traj_rec_ratio, ws.ps_n_channels,
+          ws.cap_per_ray, ws.n_bins, G_ref, G, n_cells, n_rays, -1,
+          ps->traj_ray_offset, ps->traj_n_output_rays,
+          ps->traj_output_stride, ps->viz_port, 0);
+      cbet_check(cudaGetLastError(),
+                 "cbet port_section propagate launch failed");
     } else if (ws.dim2d) {
       cbet_propagate_2d_kernel<<<grid_rays, block, 0, stream>>>(
           ws.rec_cell, ws.rec_mu, ws.rec_c, ws.rec_w00, ws.rec_w10, ws.rec_w01,
@@ -2222,21 +2518,38 @@ CbetSolveResult cbet_solve_and_deposit(CbetWorkspace& ws,
                      capture_doubles * sizeof(double), stream),
                  "cbet port_section capture stage memset failed");
     }
-    for (int port = 0; port < ws.n_ports; ++port) {
-      cbet_propagate_ps_kernel<<<grid_rays, block, 0, stream>>>(
-          ws.rec_cell, ws.rec_mu, ws.rec_ds, ws.rec_S, ws.rec_w_ps,
-          ws.rec_count, ws.ray_group_base, ws.ray_P0, ws.ray_overflow,
-          ws.dQ, ws.L, ws.cell_mask, ws.port_weight, ws.dep_rows,
-          ws.unabs_rows, ws.d_counters, ws.clamp_rows, ws.ps_cell_nhat,
-          ws.ps_capture_thresh, ws.ps_capture_order,
-          ws.ps_one_minus_eta,
-          ws.ps_capture_stage, ps->traj_rec_ratio, ws.ps_n_channels,
-          ws.cap_per_ray, ws.n_bins, G_ref, G, n_cells, n_rays, port,
-          ps->traj_ray_offset, ps->traj_n_output_rays,
-          ps->traj_output_stride, ps->viz_port, 1);
-      cbet_check(cudaGetLastError(),
-                 "cbet port_section final propagate launch failed");
+    // the ports' final passes at once, their deposits kept per half record, then added to the
+    // rows in port order
+    const std::size_t n_dep_terms =
+        2U * static_cast<std::size_t>(ws.n_ports) * static_cast<std::size_t>(ws.n_records_live);
+    if (n_dep_terms > ws.cap_ps_dep_terms || ws.ps_dep_terms == nullptr) {
+      ensure_device_capacity(&ws.ps_dep_terms, &ws.cap_ps_dep_terms,
+                             n_dep_terms + n_dep_terms / 4U + 1U, "cbet port_section deposit terms alloc");
     }
+    cbet_propagate_ps_kernel<<<dim3(static_cast<unsigned int>(grid_rays_ps),
+                                    static_cast<unsigned int>(ws.n_ports)),
+                               kPsRayBlock, 0, stream>>>(
+        ws.rec_cell, ws.rec_mu, ws.rec_ds, ws.rec_em1, ws.rec_w_ps,
+        ws.rec_count, ws.ray_group_base, ws.ray_P0, ws.ray_overflow,
+        ws.dQ, ws.L, ws.cell_mask, ws.port_weight, ws.ps_dep_terms,
+        ws.ray_rec_offset, ws.n_records_live, ws.ps_port_unabs, ws.d_counters,
+        ws.ps_port_clamp, ws.ps_cell_nhat,
+        ws.ps_capture_thresh, ws.ps_capture_order,
+        ws.ps_one_minus_eta,
+        ws.ps_capture_stage, ps->traj_rec_ratio, ws.ps_n_channels,
+        ws.cap_per_ray, ws.n_bins, G_ref, G, n_cells, n_rays, -1,
+        ps->traj_ray_offset, ps->traj_n_output_rays,
+        ps->traj_output_stride, ps->viz_port, 1);
+    cbet_check(cudaGetLastError(),
+               "cbet port_section final propagate launch failed");
+    const int grid_deposit_rows = static_cast<int>(
+        (static_cast<std::int64_t>(n_rays) * 32 + kDepositRowsThreads - 1) / kDepositRowsThreads);
+    cbet_ps_deposit_rows_kernel<<<grid_deposit_rows, kDepositRowsThreads, 0, stream>>>(
+        ws.rec_cell, ws.rec_count, ws.ray_rec_offset, ws.n_records_live, ws.ps_dep_terms,
+        ws.ps_port_unabs, ws.ps_port_clamp, ws.dep_rows, ws.unabs_rows, ws.clamp_rows,
+        ws.cap_per_ray, n_cells, n_rays, ws.n_ports);
+    cbet_check(cudaGetLastError(),
+               "cbet port_section final deposit rows launch failed");
   } else if (ws.dim2d) {
     cbet_propagate_2d_kernel<<<grid_rays, block, 0, stream>>>(
         ws.rec_cell, ws.rec_mu, ws.rec_c, ws.rec_w00, ws.rec_w10, ws.rec_w01,
@@ -2278,19 +2591,27 @@ CbetSolveResult cbet_solve_and_deposit(CbetWorkspace& ws,
                                               ws.d_scalars + 5);
   cbet_check(cudaGetLastError(), "cbet clamp reduce launch failed");
 
-  unsigned long long h_counters[4] = {0ULL, 0ULL, 0ULL, 0ULL};
-  double h_iaw_rate = 0.0;
-  cbet_check(cudaMemcpyAsync(h_counters, ws.d_counters, 4 * sizeof(unsigned long long),
+  // The rays that overflowed their record capacity (counters[2]); then one readback of the
+  // counters, the IAW sum and the clamped power.
+  cbet_count_overflow_kernel<<<1, 256, 0, stream>>>(ws.ray_overflow, n_rays, ws.d_counters + 2);
+  cbet_check(cudaGetLastError(), "cbet overflow count launch failed");
+  CbetWorkspace::SolveReadback& readback = *ws.solve_host;
+  readback.iaw_sum = 0.0;
+  cbet_check(cudaMemcpyAsync(readback.counters, ws.d_counters, 4 * sizeof(unsigned long long),
                              cudaMemcpyDeviceToHost, stream),
              "cbet counters D2H failed");
   if (ps != nullptr) {
-    cbet_check(cudaMemcpyAsync(&h_iaw_rate, ws.d_iaw_sum, sizeof(double),
+    cbet_check(cudaMemcpyAsync(&readback.iaw_sum, ws.d_iaw_sum, sizeof(double),
                                cudaMemcpyDeviceToHost, stream),
                "cbet iaw rate D2H failed");
   }
+  cbet_check(cudaMemcpyAsync(&readback.clamped_power, ws.d_scalars + 5, sizeof(double),
+                             cudaMemcpyDeviceToHost, stream),
+             "cbet clamped_power D2H failed");
   cbet_check(cudaStreamSynchronize(stream), "cbet final sync failed");
-  result.clamp_count = h_counters[0];
-  result.capped_pairs = h_counters[1];
+  const double h_iaw_rate = readback.iaw_sum;
+  result.clamp_count = readback.counters[0];
+  result.capped_pairs = readback.counters[1];
   // rec_w [erg/s] and ds [cm] give L [erg cm/s]; chi [cm s/erg]
   // times L_l*L_g divided by cell volume [cm^3] gives each dQ and IAW
   // cell ledger directly in erg/s. The deterministic cell total therefore
@@ -2302,12 +2623,7 @@ CbetSolveResult cbet_solve_and_deposit(CbetWorkspace& ws,
           ? std::fabs(h_stats[2] + h_iaw_rate) /
                 std::max(h_stats[3] + std::fabs(h_iaw_rate), 1.0e-300)
           : std::fabs(h_stats[2]) / std::max(h_stats[3], 1.0e-300);
-  {
-    thrust::device_ptr<const std::uint8_t> ov(ws.ray_overflow);
-    result.overflow_rays = thrust::reduce(thrust::cuda::par.on(stream), ov, ov + n_rays,
-                                          static_cast<long long>(0),
-                                          thrust::plus<long long>());
-  }
+  result.overflow_rays = static_cast<long long>(readback.counters[2]);
   // Record-capacity overflow (2026-07-26 review; requantified 2026-07-31):
   // an overflowed ray keeps its prefix records (their IB
   // deposit replays normally), its truncated tail is classified
@@ -2338,14 +2654,7 @@ CbetSolveResult cbet_solve_and_deposit(CbetWorkspace& ws,
                       "capacity — capacity sizing bug; raise "
                       "Laser.cbet.max_segments_per_ray (0 = auto)");
   }
-  {
-    double h_clamped = 0.0;
-    cbet_check(cudaMemcpyAsync(&h_clamped, ws.d_scalars + 5, sizeof(double),
-                               cudaMemcpyDeviceToHost, stream),
-               "cbet clamped_power D2H failed");
-    cbet_check(cudaStreamSynchronize(stream), "cbet clamped_power sync failed");
-    result.clamped_power = h_clamped;
-  }
+  result.clamped_power = readback.clamped_power;
   return result;
 }
 

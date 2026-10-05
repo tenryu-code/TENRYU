@@ -259,11 +259,20 @@ void ray_trace_3d(double* __restrict__ deposit,
     const laser::LaserPhysExtOptions* phys_ext = nullptr,
     const double* d_radial_T_e = nullptr,
     double* d_ra_power_total = nullptr,
-    const int* h_ray_order = nullptr,
-    int* h_ray_steps_out = nullptr,
+    const int* d_ray_order = nullptr,      // device: the longest-first order of the march
+    int* d_ray_steps_out_dest = nullptr,  // device: receives the per-ray step counts
     const int max_ray_steps_override = 0,
     double* d_tau_shell_out = nullptr,
     double* d_pabs_per_ray_out = nullptr);
+
+// The march's longest-first ray order on the device (Laser.raytrace.integrator="leapfrog"): order =
+// the ray indices sorted by previous_steps, larger first, ties in index order (the host
+// std::stable_sort's), or 0, 1, ... when sort is false. With p90 given, *p90 = the
+// ((n_rays - 1) * 9 / 10)-th smallest of previous_steps (the host nth_element's; one copy to the
+// host). previous_steps and order: device arrays of n_rays.
+[[nodiscard]] cudaError_t order_rays_by_previous_steps(const int* previous_steps, int n_rays,
+                                                       bool sort, int* order, int* p90,
+                                                       cudaStream_t stream);
 
 [[nodiscard]] cudaError_t launch_radial_absorption_1d(
     double P_total,

@@ -433,6 +433,9 @@ struct Mesh {
     // 1D_SPH hydro fast path: State.vol の device buffer へ直接体積を書き、
     // Mesh の host geometry cache は更新しない。host consumer の前には
     // sync_device_geometry_to_host() または recompute_geometry() による同期を行う。
+    // 1D の幾何検査（検査窓のセルで最初に体積が下限を超えないセルと、そこまでの最小の
+    // 有限体積）は device のカーネルで行い、その値は host への写しと同じ readback で
+    // 戻る（2026-10-01、それまでは host の写しをセル順に走査していた）。
     void recompute_geometry_device_only(double* state_vol);
     void sync_device_geometry_to_host(const double* state_vol);
 
@@ -580,9 +583,11 @@ remap 直後に以下の reclosure シーケンスを実行する：
   evaluation preserve ordered material mixing. Tabular clamp warnings share the
   host reader's ordered warning budget through a bounded device summary. The
   fixed-ionization path remains a no-op, and `TENRYU_ZBAR_HOST=1` selects the
-  original per-step host update for bisection. Non-TMAT Thomas–Fermi decks retain
-  that host update because their strict bitwise gate rejects CUDA transcendental
-  rounding; the device TF dispatch requires every non-void material to use TMAT.
+  original per-step host update for bisection. Decks with a non-TMAT material
+  evaluate the Thomas–Fermi fit in the host's rounding (`zbar_tf_host_rounding.cuh`:
+  glibc's pow and exp from `core::glibc_libm`, each operation rounded separately),
+  which gives the host values bit for bit (they ran the host update until
+  2026-10-02); TMAT-only decks keep CUDA's pow and exp.
 - `Materials::EOSRhoETable`（`src/materials/eos_rho_e_table.hpp`, `eos_rho_e_table.cpp`, `eos_rho_e_device.hpp`, `eos_rho_e_device.cuh`, `eos_rho_e_device.cu`）：
   hydro-only total-EOS direct table on either \((\log\rho,\log e)\) or \((\rho,e)\). CPU
   initialization resamples raw `total` `P(\rho,T), e(\rho,T)` into `P(\rho,e), T(\rho,e)` on
@@ -897,10 +902,7 @@ Config パース時に文字列→enum変換を行う。
     \(c_s\)). The host launcher owns temporary lazy-cache valid-flag device
     mirrors and local dispatch counters, and exposes cache invalidation
     helpers for the per-material mutation sites.
-- `Hydro::ALE1D`（`src/hydro/ale_1d_driver.{cuh,cu}`, `ale_1d_types.cuh`, `ale_1d_sensor.{cuh,cu}`, `ale_1d_rezone.{cuh,cu}`, `ale_1d_remap.{cuh,cu}`, `ale_1d_velocity_project.{cuh,cu}`, `ale_1d_diagnostics.{cuh,cu}`）
-  - 1D_SPH solution-adaptive ALE V3 の public API と skip-path diagnostics を保持する。現行版では GPU sensor が `compute_features` で feature list を構築し、`ale_1d_rezone` が monitor、common node mask、CPU equidistribution scratch candidate を構築し、`ale_1d_remap` が volume-coordinate MUSCL/minmod remap（first-order donor fallback と cosine protected-face taper 付き）を caller-owned scratch に書き、`ale_1d_velocity_project` が mass remap の受理済み面質量流束（`Ale1dRemapScratch::mass_flux`）と mass phi を使い、各セルの両端節点速度の組を比量として移流する half-index-shift 法（Benson 1992 §3.5.5）で節点速度 scratch を構築する（2026-09-23 に cell momentum remap + mass-weighted node projection から置換）。`ale_1d_diagnostics` が scratch diagnostics を評価し、`apply_ale_1d` は hard 許容誤差を満たした場合だけ二相 commit で state を更新する。
-  - V3 1D ALE は opt-in / experimental。既定は `numerics.ale1d.enabled=False` で、通常の GXII short-pulse は pure Lagrangian を使う。
-  - runtime scope は 1D_SPH + deterministic radiation (FLD/S_N) のみ（モンテカルロ輻射は 2026-09-29 にビルドから外した）。
+- `Hydro::ALE1D`（1D_SPH の solution-adaptive ALE V3、`src/hydro/ale_1d_*`）は 2026-10-02 に退役した。コードはビルドから外し `retired/ale_1d/` に保管し、この項の記述は `retired/ale_1d/docs/ARCHITECTURE_ale_1d.md` へ移した。1D_SPH は pure Lagrangian で、1D にメッシュの再配置と状態量の remap は無い。
 - `Hydro::PLIC` (`src/hydro/plic_geometry.{cuh,cu}`,
   `src/hydro/plic_normal.{cuh,cu}`, `src/hydro/plic_fast_path.{cuh,cu}`,
   `src/hydro/plic_remap.{cuh,cu}`)
@@ -1317,7 +1319,7 @@ struct HypreSolver {
 | **VNR 人工粘性** | `artificial_viscosity.cu` | `av_type="vnr"`, `av_linear`, `av_quadratic` | 明示すれば使える |
 | **Adaptive AV gate** | `shock_tracker.cu`, `adaptive_av_gate.cu`, `artificial_viscosity.cu` | `adaptive_av.enabled` | OFF (診断/改善用、VNR 専用) |
 | **Riemann 人工粘性** | `artificial_viscosity.cu` | `av_type="riemann"` / `"riemann_compatible"` | OFF |
-| **1D mesh motion** | `hydro_1d.cu`; optional V3 sensors in `ale_1d_sensor.cu` | `mesh.motion="lagrangian"`; `numerics.ale1d.enabled` | ON for pure Lagrangian; optional solution-adaptive ALE path OFF by default |
+| **1D mesh motion** | `hydro_1d.cu` | `mesh.motion="lagrangian"` | ON: pure Lagrangian (the solution-adaptive 1D ALE, `numerics.ale1d`, was retired on 2026-10-02; `retired/ale_1d/`) |
 | **Odd-even 圧力フィルタ** | `hydro_1d.cu` | `odd_even_damping_C` | OFF（既定 0。GXII デッキは 1.0） |
 | **電子 odd-even ダンピング** | `hydro_1d.cu` | `ee_odd_even_C` | OFF（既定 0。GXII デッキは 0.5） |
 | **Compatible-energy 2T** | `hydro_1d.cu` | `compatible_energy` | OFF（既定。GXII デッキは True） |
@@ -1411,7 +1413,8 @@ struct HypreSolver {
   `sn_transport_1d_gpu.cu`, `sn_dsa_1d_gpu.cu`,
   `sn_material_newton_gpu.cu`; 線形不連続法 `sn_ld_1d_gpu.{cuh,cu}`,
   共有部 `sn_transport_1d_internal.hpp`（不透明度評価・角度求積・状態配列）と
-  `sn_electron_eos.cuh`（電子 EOS の尾部・逆算・比熱））：
+  `sn_electron_eos.cuh`（電子 EOS の尾部・逆算・比熱）、吸収率密度の GMRES の Givens 回転の
+  `rounded_hypot.cuh`（device の正しく丸めた \(\sqrt{a^2+b^2}\)））：
   `Radiation.mode="sn_transport"` 専用の 1D_SPH pure \(S_N\) production 経路。
   `spatial_scheme="linear_discontinuous"`（1D の既定、2026-09-25）は
   `advance_radiation_step_sn_1d` が Marshak 入射・体積源の設定後に
@@ -1462,6 +1465,9 @@ struct HypreSolver {
 picket-fence 用の `build_constant_fractions`）が温度格子とその対数、群ごとの \(b_g\)・累積分率 \(C_g\)・裾の和 \(D_g\)、
 \(\ln C_g\)・\(\ln D_g\) とその \(\ln T\) 微分を device に置き、kernel へは `PlanckTableDeviceView`（`interpolate_b(g, T)`、
 多群を同じ温度で引く `locate_b(T)`）として渡す。表の範囲外の温度は端の値に丸める（host 側の評価は最初の 1 回だけ WARNING を出す）。
+`planck_host_rounding.cuh` の `planck_fraction_host_rounding` は host の `interpolate_b_host` を device で同じ丸めで評価する
+（log・exp は `core::glibc_libm`、ビット一致。S\(_N\) 1D の Marshak 境界が使い、範囲外の WARNING は host の
+`warn_if_outside_range` が出す。2026-10-02）。
 `planck_fraction.method="tabulate"` は受理して保存するが使われず、計算した分率に戻す（WARNING。SPECIFICATION §6.4.5）。
 
 
@@ -1523,15 +1529,19 @@ class RadiationStep {
     （密度勾配で伸縮する格子は無い — `stretch_method`・`min_ratio` はどのメッシュも読まず、指定すると警告）
   - 節点（node-centered）に \(\hat n = n_e/n_{crit}\), \(T_e\), \(\bar Z\), \(\nabla\hat n\) を保持
   - 節点での中心差分による密度勾配 \(\nabla(n_e/n_{crit})\) の計算
-- `Laser::Cbet`（`cbet.cu/.cuh`、v1 = 1D_SPH `raytrace_2d` + 2D_RZ `raytrace_3d` opt-in）：Marozas 型保存的 pairwise CBET
+- `Laser::Cbet`（`cbet.cu/.cuh`、`cbet_stage_gpu.cu/.cuh`、`cbet_stage_host.cpp/.hpp`、v1 = 1D_SPH `raytrace_2d` + 2D_RZ `raytrace_3d` opt-in）：Marozas 型保存的 pairwise CBET
   - trace kernel の record モード（`template<bool kCbetRecord>`、OFF 実体化は従来と構造同一）が ray 毎のセル横断記録を生成
+  - 1D の毎 step の前処理と後処理は device 上（`cbet_stage_gpu.cu`、FMA 縮約なしで旧 host ループと同じ演算順）: セルの有効質量数とプラズマ量（chi 前因子・音速・流速・波数・体積・有効セルの印）を device の State から作り、解の後の交換量の地図（セルごとの |dQ| 総和と内向き群の dQ）と作用量の閉じの検査、port_section のポートごとの出射パワーと高速電子の捕捉の集計を device で行う。step 中に host へ戻るのは検査の旗と捕捉の和だけで、地図とポートごとの量は snapshot・checkpoint の直前に `sync_laser_snapshot_fields` で State へ写す。旧 host ループは試験の参照として `cbet_stage_host.cpp` と `cbet_stage_cell_fields` に残る
   - CbetWorkspace（grow-only device 常駐）上で決定論的固定点反復（tally → 反対称交換+donor cap → IB/2·CBET·IB/2 propagate）
   - 沈着・未吸収は per-ray 行 + 固定順 reduction でビーム毎に集計し、既存の deposit 再配分・skip cache 経路へ接続（NUMERICS §5.10）
   - 2D_RZ CBET は theta-group ごとの record-mode trace → joint exchange solve → per-group LaserMesh node deposit を生成し、既存の 2D transfer path に接続する。Workspace singleton は 1D と共有し、recorder template 実体化は defining TU に閉じる；nvcc+RDC では header 側 template declaration を増やすと OFF path まで再実体化されるため、新規宣言は wrapper/header isolation で分離する。
-- `Laser::HotElectron1D`（`hot_electron_1d.cuh/.cpp`、`hot_electron_1d_gpu.cu`）：1D hot-electron preheat: capture reduction, cone quadrature, chord walkers, CSDA pipelines。本番の cone の経路は device（`hot_electron_1d_gpu.cu`、`laser.cu` から起動）、host の実装は参照用
-- `Laser::HotEEtaModel`（`hot_e_eta_model.cpp`）：\(\eta(t)\) の閾値モデルと緩和（NUMERICS §5.11.3）
-- `Laser::PortSection`（`port_geometry`、`port_section_chi`、`port_section_overlap`、`sector_phase_space`、`sector_adapter`）：
+- `Laser::HotElectron1D`（`hot_electron_1d.cuh/.cpp`、`hot_electron_1d_gpu.cu`、`hot_e_transport_1d_gpu.cu/.cuh`）：1D hot-electron preheat: capture reduction, cone quadrature, chord walkers, CSDA pipelines。本番の経路は device: `hot_e_transport_1d_gpu.cu` がトレースの捕獲行の収集・源への集約・cone の chord の列挙と `radial` の行進・セルごとの診断と dt 上限を行い（NUMERICS §5.11）、cone の chord は `hot_electron_1d_gpu.cu` の `cone_chords_device` が進める。step 中に host へ戻るのはチャンネルごとの数値とセルの \(Q\)・\(\varepsilon_{cum}\)。host の実装と `deposit_hot_electrons_cone_1d_device` は試験の参照
+- `Laser::HotEEtaModel`（`hot_e_eta_model.cpp`、`hot_e_inputs_gpu.cu/.cuh`）：\(\eta(t)\) の閾値モデルと緩和（NUMERICS §5.11.3）
+  - モデルの入力は 1D の毎 step device 上で作る（`hot_e_inputs_gpu.cu`、FMA 縮約なしで旧 host 計算と同じ演算順）: セルの \(n_e\)・\(n_e/n_c\)・中心半径、チャンネルごとの評価面（\(n_e\) が \(n_c\) の指定割合を横切る最も外側の位置）とそこでの \(T_e\)・最寄りの殻・重み付き当てはめの密度尺度、port_section では前 step の device の位相空間表から参照ビームの角度分布、ポート配置の照度指標と共通波駆動（snapshot 用の天球の地図を含む）。step 中に host へ戻るのはチャンネルごとの数値だけで（\(\eta\) の緩和の更新は host のスカラー計算）、天球の地図は snapshot・checkpoint の直前に `sync_laser_snapshot_fields` で State へ写す。device の超越関数（exp・log・acos・atan2・sin・cos）の末位の差の分だけ旧 host 計算と異なりうる
+- `Laser::PortSection`（`port_geometry`、`port_section_chi`、`port_section_overlap`、`port_section_s1_gpu`、`port_section_s1_host`、`sector_phase_space`、`sector_adapter`）：
   実ポート配置の多ビーム CBET（`cbet.geometry_mode="port_section"`、NUMERICS §5.10.8）
+  - 位相空間表（参照ビームの ray path と殻の交差、NUMERICS §5.10.8 S1）は毎 step `port_section_s1_gpu.cu` が CbetWorkspace の ray 記録から device 上で組み、chi の構築（`port_section_chi.cu`、`ChiBuildInput::device_table`）は device の表をそのまま読む。step 中に host へ戻るのは監査と除外台帳の数値だけで、snapshot 用の強度地図（`State::ps_ray_map`）は driver が snapshot・checkpoint を書く直前に `sync_laser_snapshot_fields` で State へ写す
+  - host の `sector_adapter::build_ray_paths` と `sector_ps::build_table` は device の表と比べる試験の参照（`port_section_s1_host.cpp`）に、1 殻分の表の host への写し（`host_table_for_shell`）は高速電子の照度指標と共通波駆動の host 関数（`port_section_overlap`）を device の入力と比べる試験に使う
 - `Laser::HotElectron2D`（`hot_electron_2d.cuh/.cpp`）：2D RZ hot-electron transport: topology-agnostic MeshView2D, revolved-face chord walker, 3D band quadrature, capture reduction, host cone pipeline（reference path）
 - `Laser::HotElectron2DGpu`（`hot_electron_2d_gpu.cuh/.cu`）：device chord pipeline（1 thread/chord, deterministic host fold）+ scratch-pooled staging
 
@@ -1649,7 +1659,7 @@ struct LaserMesh {
 > `src/laser/laser_mesh.cuh` を参照。
 
 - `Laser::RayInit`：レイ初期条件の生成
-  - 1D_SPH：F値と集光位置からレイの初期位置（R方向1D配列）・方向を計算（NUMERICS §5.6.3 (a)）
+  - 1D_SPH：F値と集光位置からレイの初期位置（R方向1D配列）・方向を計算（NUMERICS §5.6.3 (a)）。輪の重み・輪のパワー・球の光線は device（`ray_init_1d_gpu.cu/.cuh`）、host の計算は試験の参照（`initialize_rays_1d_host_reference`）
   - 2D_RZ：ビーム軸直交平面上の2D断面配列としてレイを初期化（NUMERICS §5.6.3 (b)）
     - 正規直交基底 \((\hat{\mathbf{u}},\hat{\mathbf{w}})\) 上の格子点座標 → 3D Lab座標への変換
     - 初期方向は3D焦点座標に向かうベクトル
@@ -1658,7 +1668,9 @@ struct LaserMesh {
 - `Laser::RayTrace`：幾何光学（屈折）+ IB吸収
   - 1D_SPH `raytrace_2d`：既定の `integrator="auto"` は特性曲線積分（`ray_trace_characteristic.cuh`、NUMERICS §5.3.6）で、
     臨界半径で反射する（`terminate=False` が既定）。`integrator="leapfrog"` は 2D ベクトル \((R,Z)\) の刻み幅可変の Verlet 行進
-    （NUMERICS §5.3.2、臨界で終了）。円筒・平板の 1D は特性曲線積分だけ
+    （NUMERICS §5.3.2、臨界で終了。前の trace の各レイのステップ数による最長順の並べ替えと、ステップ上限
+    \(\max(20000, 10\,p_{90})\) の \(p_{90}\) は device で求め（CUB の安定な基数ソート、2026-10-02）、
+    ステップ数はビームごとの device 配列で次の step へ持ち越す）。円筒・平板の 1D は特性曲線積分だけ
     - 場参照は 2D bilinear ではなく radial side array への 1D linear lookup
     - 勾配は \(d\hat n/dr\) から \((\partial\hat n/\partial R,\partial\hat n/\partial Z)\) を再構成
     - 吸収パワーは Hydro の 1Dセル配列へ直接蓄積（決定論の固定順）
@@ -1675,7 +1687,8 @@ struct LaserMesh {
 - `Laser::DepositMap`：LaserMesh → HydroMesh の写像
   - 吸収パワーの空間分配は次元依存（1D_SPH: 1D cell direct、2D_RZ: 4-node bilinear）
   - 2D_RZ：3D中間位置 \((x,y,z)\) → \((R,Z)=(\sqrt{x^2+y^2},z)\) でLaserMeshセルを特定して分配
-  - 1D_SPH：ray trace または `radial_absorption_1d` 中に Hydro の 1Dセル配列へ直接沈着し、その後 host 側で blocked/ghost handoff を適用
+  - 1D_SPH：ray trace または `radial_absorption_1d` 中に Hydro の 1Dセル配列へ直接沈着し、ビームの付着を device 上で合算して blocked/ghost handoff・平滑化を device で適用（`deposit_1d_gpu.cu/.cuh`、NUMERICS §5.8.1 (a)。host の `apply_deposit_redistribution_1d` は試験の参照）
+  - 1D_SPH の写像のスカラー部（節点配置・臨界面・ゴーストコロナ・例外受け皿・共鳴吸収の入力、NUMERICS §5.7.2 (e)）も device（`laser_map_1d_gpu.cu/.cuh`、`map_from_hydro_1d_device`）。host への流体量の写し（`build_hydro_mirror_1d`）は光線密度の診断だけが使う
   - 2D_RZ：LaserMesh沈着を **直接** 2D_RZ HydroMeshへ双線形補間で分配（NUMERICS §5.8.1 (b)、1D球座標転写は不要）
   - 多ビーム：1D は各ビームをそれぞれのパワーで追跡し、全ビームのキーが一致するときだけ 1 回の追跡を使い回す。
     2D は極角グループごとに追跡してグループ内パワー合計でスケーリング（NUMERICS §5.6.4）
@@ -1728,14 +1741,21 @@ void laser_step(
   - `burn_stage.hpp/.cpp`：`compute_burn_step_1d()` — 燃料域/column 幾何、
     ネットワーク呼び出し、per-cell 沈着/分配、台帳（プレーン配列 in/out、単体テスト可能）。既定では
     `burn_stage_gpu.cu/.cuh` の `compute_burn_step_1d_device_stage` が同じ段を GPU で実行し、host の実装は
-    `TENRYU_BURN_HOST_STAGE=1` のときと参照・試験用（host/device の一致は `test_burn_stage_gpu_parity`、rel 1e-12）
+    `TENRYU_BURN_HOST_STAGE=1` のときと参照・試験用（host/device の一致は `test_burn_stage_gpu_parity`、rel 1e-12）。
+    1D では `compute_burn_step_1d_resident` が device の場と device 常駐の燃焼配列で同じカーネルを実行する
+    （局所沈着と拡散・MC の誕生源、2026-10-02、旧経路とのビット一致も `test_burn_stage_gpu_parity`）
+  - `burn_inputs_1d_gpu.cu/.cuh`：1D の段と輸送の前後で driver が host で計算していたセルごとの量（セル速度、燃料イオン
+    組成と Fraley 係数、\(\epsilon_{cum}\) と中性子数の更新、輸送の電子密度、粒子のあるスロット、輸送後の付与・加熱率・
+    陽的源の dt 上限）を device で計算する（-fmad=false、`test_burn_inputs_1d_gpu`）
   - `corman_diffusion.cu/.cuh`：1D の多群荷電粒子拡散（`Burn.scheme="diffusion"`、NUMERICS §14.7）
-  - `mc_transport.cu/.cuh`：直線 CSDA の MC α 輸送（`Burn.scheme="mc"`、NUMERICS §14.9）
+  - `mc_transport.cu/.cuh`：直線 CSDA の MC α 輸送（`Burn.scheme="mc"`、NUMERICS §14.9。粒子の詰め直しの添字は
+    device の排他的接頭和、2026-10-02）
   - `neutron_heating.hpp/.cpp`・`neutron_heating_device.cuh`：中性子の最初の衝突による加熱（`Burn.neutron_heating`、NUMERICS §14.11）
   - `neutron_moments.hpp/.cpp`：Brysk の中性子スペクトルのモーメント（診断、NUMERICS §14.8）
   - `screening.hpp/.cpp`・`screening_device.cuh`：Salpeter / Chugunov–DeWitt の遮蔽（NUMERICS §14.1）
 - driver 結線（coupling/ 所有）：`callbacks.burn`（laser 直後・radiation 前）、
-  比在庫 `State::burn_n_host` [1/g]、`inject_burn_source_terms`（source_terms.cu、
+  比在庫 `State::burn_n_host` [1/g]（1D では device の写し `State::burn_n_dev` などが作業用で、host の写しは出力・再開用。
+  `sync_burn_arrays_to_host/to_device` と同期の状態、2026-10-02）、`inject_burn_source_terms`（source_terms.cu、
   2T 再閉包）、dt lineage "burn"、budget `E_burn_in`
 - テスト：`tests/burn/`（reactivity anchors / network closed-forms / deposition
   kernel / stage synthetic spheres / rung-2 6-run 実 run ctest）
@@ -1864,6 +1884,7 @@ void laser_step(
 - `Diag::LaserPattern`：吸収分布、臨界終了統計、入射角
 - `Diag::MCStats`：分散推定、粒子数統計、CI計算
 - `Diag::TemperatureMaximumPrinciple`：放射演算子後の温度最大原理違反（`overshoot_count`, `overshoot_max`）の検出・記録
+- `Diag::History1D`（`src/diagnostics/history_1d_gpu.{cuh,cu}`）：1D の history 行のセル走査を device で行う（レーザーのエネルギーと吸収重み付き半径、質量重み平均 Zbar と最大 Zbar、ピーク密度・殻平均半径・中心の電子温度、ρR と殻半径）。最大・最小・中心のセルは厳密、ρR の double の和はセルの順に 1 スレッドでビット一致、host が long double で足した和は double-double（末位で異なりうる。inf と NaN は host と同じ）。host へ戻るのは数値だけ
 - `corner_collapse_ledger.{cu,hpp}`：`TENRYU_I1B_COLLAPSE_LEDGER` で有効化する read-only の geometry-collapse 診断。
 - `Diag::MeshDeformAttribution`（`src/diagnostics/mesh_deform_attribution.{hpp,cuh,cu}`）：default-off の 2D_RZ mesh failure root-cause diagnostics。`Hydro2D::lagrangian_step` invocation ごとに opt-in workspace が start node positions と per-source displacement buffers を所有し、failure 時だけ `mesh_failure_attribution.jsonl` に per-source corner-J degradation を書く。HDF5 schema と `dt_lineage.jsonl` format は変更しない。
 - `Diag::MeshDegeneracyForensics`（`src/diagnostics/mesh_degeneracy_forensics.{hpp,cu}`）：default-off の repeated pre-commit `mesh_quality_*` / `in_hydro_*` failure diagnostics。`Hydro2D` は opt-in 時だけ failing cell の4 node position/velocity/acceleration sample を `HydroStepResult` に載せ、`Coupling::Driver` retry path が同一 `(cell, corner, stage)` count と `sigma_safe` threshold を評価して `mesh_degeneracy_forensics.jsonl` へ J(σ), nodal velocity, hourglass amplitude, material/work context を追記する。HDF5 schema と physics state は変更しない。
@@ -2101,8 +2122,9 @@ namespace IO {
     //                              step を Philox の subsequence に使うので、off-by-one はストリーム重複を
     //                              引き起こす — この契約を厳守すること）
     // time_state/dt             : float64（タイムステップ幅 [s]、NUMERICS §2.2 Δt成長制限復元用）
-    // time_state/ale_last_applied_step : int32（1D V3 ALE の最後の commit step。
-    //                              旧checkpointでは -1 で補完）
+    // time_state/ale_last_applied_step : int32（ALE が最後に rezone を commit した step。2D_RZ の
+    //                              ALE が書く。判定に読んでいたのは 1D V3 ALE の cadence・最小間隔
+    //                              だけで、1D ALE は 2026-10-02 に退役。旧checkpointでは -1 で補完）
     // time_state/E_safety            : float64（伝導安全補正累積、State.E_safety と対応）
     // time_state/E_numerical_loss    : float64（退化セル損失累積、State.E_numerical_loss と対応）
     // time_state/E_laser_deposited   : float64（レーザー沈着累積、State.E_laser_deposited と対応）

@@ -13,11 +13,14 @@
 #include <vector>
 
 #include <cuda_runtime.h>
+#include <math_constants.h>
 
+#include "core/device_scratch.hpp"
 #include "core/error.hpp"
 #include "hydro/ale_1d_diagnostics.cuh"
 #include "hydro/ale_1d_remap.cuh"
 #include "hydro/ale_1d_rezone.cuh"
+#include "hydro/ale_1d_rezone_device.cuh"
 #include "hydro/ale_1d_sensor.cuh"
 #include "hydro/ale_1d_velocity_project.cuh"
 #include "hydro/boundary.hpp"
@@ -29,8 +32,6 @@ namespace tenryu::hydro::ale1d {
 namespace {
 
 constexpr int kBlockSize = 256;
-constexpr double kFourPiOverThree =
-    4.188790204786390984616857844372670512262892532500141094646;
 
 inline void cuda_check(const cudaError_t err, const char* message) {
   TENRYU_ASSERT(err == cudaSuccess, message);
@@ -48,11 +49,6 @@ bool closure_dump_enabled() {
   return enabled;
 }
 
-__host__ __device__ double volume_coordinate(const double r, const int geom) {
-  return (geom == 0) ? (kFourPiOverThree * r * r * r)
-                     : tenryu::mesh::geometry_1d_shell_volume_cubes(geom, 0.0, r);
-}
-
 int effective_cell_count(const core::State& state, const core::Config& cfg) {
   if (state.mesh.topo.n_cells > 0) {
     return state.mesh.topo.n_cells;
@@ -65,24 +61,77 @@ bool outer_boundary_is_fixed(const core::Config& cfg) {
          cfg.numerics.hydro.boundary_1d == "reflect";
 }
 
-double current_max_dr_ratio(const core::State& state, const int n_cells) {
-  if (n_cells <= 1 || state.x_r.size() < static_cast<std::size_t>(n_cells + 1)) {
-    return 1.0;
-  }
-  std::vector<double> r(static_cast<std::size_t>(n_cells + 1), 0.0);
-  state.x_r.copy_to_host(r.data());
+// The node-width statistics of the triggers, from the device node radii in one block: the
+// largest ratio max(a / b, b / a) of adjacent cell widths, folded from 1 as std::max does (any
+// width a or b that is not positive makes it infinity), and the smallest width, folded from
+// infinity as std::min does (a NaN width is passed over). result = {ratio, min width}.
+constexpr int kWidthStatsBlock = 256;
+
+__global__ void node_width_stats_kernel(const double* __restrict__ r, const int n_cells,
+                                        double* __restrict__ result) {
+  __shared__ double sh_ratio[kWidthStatsBlock];
+  __shared__ double sh_min[kWidthStatsBlock];
+  __shared__ int sh_bad[kWidthStatsBlock];
+  const int t = static_cast<int>(threadIdx.x);
   double ratio = 1.0;
-  for (int i = 0; i + 1 < n_cells; ++i) {
-    const double a = r[static_cast<std::size_t>(i + 1)] -
-                     r[static_cast<std::size_t>(i)];
-    const double b = r[static_cast<std::size_t>(i + 2)] -
-                     r[static_cast<std::size_t>(i + 1)];
-    if (!(a > 0.0) || !(b > 0.0)) {
-      return std::numeric_limits<double>::infinity();
+  double min_width = CUDART_INF;
+  int bad = 0;
+  for (int i = t; i < n_cells; i += kWidthStatsBlock) {
+    const double a = r[i + 1] - r[i];
+    min_width = (a < min_width) ? a : min_width;
+    if (i + 1 < n_cells) {
+      const double b = r[i + 2] - r[i + 1];
+      if (!(a > 0.0) || !(b > 0.0)) {
+        bad = 1;
+      } else {
+        const double q = a / b;
+        const double q_inv = b / a;
+        const double m = (q < q_inv) ? q_inv : q;
+        ratio = (ratio < m) ? m : ratio;
+      }
     }
-    ratio = std::max(ratio, std::max(a / b, b / a));
   }
-  return ratio;
+  sh_ratio[t] = ratio;
+  sh_min[t] = min_width;
+  sh_bad[t] = bad;
+  __syncthreads();
+  for (int offset = kWidthStatsBlock / 2; offset > 0; offset >>= 1) {
+    if (t < offset) {
+      const double other_ratio = sh_ratio[t + offset];
+      sh_ratio[t] = (sh_ratio[t] < other_ratio) ? other_ratio : sh_ratio[t];
+      const double other_min = sh_min[t + offset];
+      sh_min[t] = (other_min < sh_min[t]) ? other_min : sh_min[t];
+      sh_bad[t] = sh_bad[t] | sh_bad[t + offset];
+    }
+    __syncthreads();
+  }
+  if (t == 0) {
+    result[0] = (sh_bad[0] != 0) ? CUDART_INF : sh_ratio[0];
+    result[1] = sh_min[0];
+  }
+}
+
+struct NodeWidthStats {
+  double max_dr_ratio = 1.0;
+  double min_width = std::numeric_limits<double>::infinity();
+};
+
+// One launch and one small copy to the host (the host loops read the node radii back).
+NodeWidthStats node_width_stats(const core::State& state, const int n_cells) {
+  NodeWidthStats stats;
+  if (n_cells <= 0 || state.x_r.size() < static_cast<std::size_t>(n_cells + 1)) {
+    return stats;
+  }
+  auto* const d_result = static_cast<double*>(
+      core::device_scratch_acquire("ale1d:node_width_stats", 2 * sizeof(double)));
+  node_width_stats_kernel<<<1, kWidthStatsBlock>>>(state.x_r.data(), n_cells, d_result);
+  TENRYU_ASSERT(cudaGetLastError() == cudaSuccess, "ALE1D node width stats launch failed");
+  double host[2] = {1.0, 0.0};
+  TENRYU_ASSERT(cudaMemcpy(host, d_result, sizeof(host), cudaMemcpyDeviceToHost) == cudaSuccess,
+                "ALE1D node width stats copy failed");
+  stats.max_dr_ratio = (n_cells <= 1) ? 1.0 : host[0];
+  stats.min_width = host[1];
+  return stats;
 }
 
 void enforce_boundary_candidate(std::vector<double>& r_candidate,
@@ -120,7 +169,7 @@ bool validate_candidate_geometry(const std::vector<double>& r_candidate,
       return false;
     }
     const double dx = r1 - r0;
-    const double vol = volume_coordinate(r1, geom) - volume_coordinate(r0, geom);
+    const double vol = ale1d_volume_coordinate(r1, geom) - ale1d_volume_coordinate(r0, geom);
     if (!(dx > 0.0) || !(vol > 0.0) || !std::isfinite(vol)) {
       return false;
     }
@@ -201,9 +250,10 @@ Ale1dDriverScratch& driver_scratch() {
   return *scratch;
 }
 
+// d_r_candidate: the candidate node radii on the device (n_cells + 1).
 void commit_scratch(core::State& state,
                     const core::Config& cfg,
-                    const std::vector<double>& r_candidate,
+                    const double* d_r_candidate,
                     const Ale1dRemapScratch& remap,
                     const Ale1dVelocityProjectScratch& velocity,
                     const HydroEOSContext* eos_ctx) {
@@ -212,9 +262,12 @@ void commit_scratch(core::State& state,
   const int n_materials = static_cast<int>(cfg.materials.materials.size());
   const int blocks = blocks_for(n_cells);
 
-  TENRYU_ASSERT(state.x_r.size() == r_candidate.size(),
+  TENRYU_ASSERT(state.x_r.size() == static_cast<std::size_t>(n_cells + 1),
                 "ALE1D commit x_r size mismatch");
-  state.x_r.copy_from_host(r_candidate);
+  cuda_check(cudaMemcpy(state.x_r.data(), d_r_candidate,
+                        static_cast<std::size_t>(n_cells + 1) * sizeof(double),
+                        cudaMemcpyDeviceToDevice),
+             "ALE1D commit x_r copy failed");
   copy_device_array_to_state_field(state.mass, remap.mass_new,
                                    "ALE1D commit mass size mismatch");
   copy_device_array_to_state_field(state.ee, remap.ee_new,
@@ -266,6 +319,58 @@ void commit_scratch(core::State& state,
   state.rad_dep.fill(0.0);
   state.rad_emit.fill(0.0);
   state.Qvisc.fill(0.0);
+}
+
+// TENRYU_ALE1D_HOST=1: the rezone candidate is built on the host (rezone, the min-width floor
+// candidate, the boundary nodes, the geometry check and the acoustic time-step bounds of the
+// host path); else on the device (ale_1d_rezone_device.cuh), with the same values.
+bool candidate_on_host() {
+  static const bool on_host = [] {
+    const char* value = std::getenv("TENRYU_ALE1D_HOST");
+    return value != nullptr && value[0] == '1';
+  }();
+  return on_host;
+}
+
+// The host-built candidate on the device for the remap and the commit: the node radii, the node
+// mask, and the protected faces (the end nodes, the pinned nodes and the features' faces).
+struct HostCandidateUpload {
+  const double* r_candidate = nullptr;
+  const std::uint8_t* pinned = nullptr;
+  const std::uint8_t* protected_face = nullptr;
+};
+
+HostCandidateUpload upload_host_candidate(const std::vector<double>& r_candidate,
+                                          const NodeConstraintMask& node_mask,
+                                          const std::vector<int>& protected_faces) {
+  const std::size_t n_nodes = r_candidate.size();
+  std::vector<std::uint8_t> pinned(n_nodes, 0U);
+  std::vector<std::uint8_t> protected_face(n_nodes, 0U);
+  protected_face.front() = 1U;
+  protected_face.back() = 1U;
+  for (std::size_t j = 0; j < n_nodes; ++j) {
+    pinned[j] = node_mask.pinned[j] ? 1U : 0U;
+    if (node_mask.pinned[j]) {
+      protected_face[j] = 1U;
+    }
+  }
+  for (const int face : protected_faces) {
+    protected_face[static_cast<std::size_t>(face)] = 1U;
+  }
+  auto* d_r = static_cast<double*>(
+      core::device_scratch_acquire("ale1d:host_candidate_r", n_nodes * sizeof(double)));
+  auto* d_pinned = static_cast<std::uint8_t*>(
+      core::device_scratch_acquire("ale1d:host_candidate_pinned", n_nodes));
+  auto* d_faces = static_cast<std::uint8_t*>(
+      core::device_scratch_acquire("ale1d:host_candidate_faces", n_nodes));
+  cuda_check(cudaMemcpy(d_r, r_candidate.data(), n_nodes * sizeof(double),
+                        cudaMemcpyHostToDevice),
+             "ALE1D host candidate upload failed");
+  cuda_check(cudaMemcpy(d_pinned, pinned.data(), n_nodes, cudaMemcpyHostToDevice),
+             "ALE1D host node mask upload failed");
+  cuda_check(cudaMemcpy(d_faces, protected_face.data(), n_nodes, cudaMemcpyHostToDevice),
+             "ALE1D host protected-face upload failed");
+  return {d_r, d_pinned, d_faces};
 }
 
 }  // namespace
@@ -370,13 +475,13 @@ Ale1dStepResult apply_ale_1d_attempt(core::State& state,
     return out;
   }
 
-  out.max_dr_ratio = current_max_dr_ratio(state, n_cells);
+  const NodeWidthStats width_stats = node_width_stats(state, n_cells);
+  out.max_dr_ratio = width_stats.max_dr_ratio;
   out.cadence_triggered =
       state.step > 0 && ale.every_n_steps > 0 &&
       (state.step % ale.every_n_steps) == 0;
   out.quality_triggered =
       ale.emergency_enabled && out.max_dr_ratio > ale.emergency_max_dr_ratio;
-  std::vector<double> floor_r_nodes;
   if (ale.min_width_floor.enabled) {
     if (state.ale1d_floor_cooldown_remaining > 0) {
       // Cooling down after a rejected floor-triggered attempt: skip the
@@ -384,16 +489,7 @@ Ale1dStepResult apply_ale_1d_attempt(core::State& state,
       // unaffected; any applied rezone resets the cooldown (see wrapper).
       --state.ale1d_floor_cooldown_remaining;
     } else {
-      floor_r_nodes.assign(static_cast<std::size_t>(n_cells + 1), 0.0);
-      state.x_r.copy_to_host(floor_r_nodes.data());
-      double min_dl = std::numeric_limits<double>::infinity();
-      for (int i = 0; i < n_cells; ++i) {
-        min_dl = std::min(
-            min_dl,
-            floor_r_nodes[static_cast<std::size_t>(i + 1)] -
-                floor_r_nodes[static_cast<std::size_t>(i)]);
-      }
-      out.floor_triggered = min_dl < ale.min_width_floor.floor_cm;
+      out.floor_triggered = width_stats.min_width < ale.min_width_floor.floor_cm;
     }
   }
   if (!out.cadence_triggered && !out.quality_triggered &&
@@ -407,63 +503,109 @@ Ale1dStepResult apply_ale_1d_attempt(core::State& state,
   }
 
   std::vector<Ale1dFeature> features = compute_features(state, cfg, state.dt);
-  Ale1dRezoneResult rezone_result;
-  if (out.floor_triggered) {
-    std::vector<bool> pinned(static_cast<std::size_t>(n_cells + 1), false);
-    pinned.front() = true;
-    pinned.back() = true;
-    for (const Ale1dFeature& feature : features) {
-      const int face = feature.peak_cell_or_face;
-      if (feature.pinned_face && face >= 0 && face <= n_cells) {
-        pinned[static_cast<std::size_t>(face)] = true;
+  // The candidate's node radii, node mask and protected faces on the device, and the acoustic
+  // time-step bounds of its gates.
+  const double* d_r_candidate = nullptr;
+  const std::uint8_t* d_pinned = nullptr;
+  const std::uint8_t* d_protected_face = nullptr;
+  Ale1dAcousticDtBounds bounds;
+  if (candidate_on_host()) {
+    Ale1dRezoneResult rezone_result;
+    if (out.floor_triggered) {
+      std::vector<double> floor_r_nodes(static_cast<std::size_t>(n_cells + 1), 0.0);
+      state.x_r.copy_to_host(floor_r_nodes.data());
+      std::vector<bool> pinned(static_cast<std::size_t>(n_cells + 1), false);
+      pinned.front() = true;
+      pinned.back() = true;
+      for (const Ale1dFeature& feature : features) {
+        const int face = feature.peak_cell_or_face;
+        if (feature.pinned_face && face >= 0 && face <= n_cells) {
+          pinned[static_cast<std::size_t>(face)] = true;
+        }
       }
+      std::vector<double> rho_host(static_cast<std::size_t>(n_cells), 0.0);
+      state.rho.copy_to_host(rho_host.data());
+      std::vector<bool> eligible(static_cast<std::size_t>(n_cells), false);
+      // Never remap density-floored corona cells: near-zero extensive fields fail remap validators, and relief there is physically meaningless.
+      for (int i = 0; i < n_cells; ++i) {
+        eligible[static_cast<std::size_t>(i)] =
+            rho_host[static_cast<std::size_t>(i)] >
+            100.0 * cfg.numerics.floors.rho;
+      }
+      MinWidthFloorCandidateResult floor_result =
+          build_min_width_floor_candidate(
+              floor_r_nodes,
+              pinned,
+              eligible,
+              ale.min_width_floor.floor_cm,
+              ale.min_width_floor.target_factor,
+              ale.min_width_floor.relief_halfwidth_cells,
+              ale.min_width_floor.max_growth_factor);
+      if (!floor_result.success) {
+        out.skip_reason = Ale1dSkipReason::CandidateInvalid;
+        return out;
+      }
+      if (floor_result.no_relief_available) {
+        out.skip_reason = Ale1dSkipReason::BenefitTooSmall;
+        return out;
+      }
+      rezone_result.r_candidate = std::move(floor_result.r_candidate);
+      rezone_result.node_mask.pinned = std::move(pinned);
+      rezone_result.node_mask.n_protected_nodes = static_cast<int>(std::count(
+          rezone_result.node_mask.pinned.begin(),
+          rezone_result.node_mask.pinned.end(), true));
+      rezone_result.success = true;
+    } else {
+      rezone_result = rezone(state, cfg, features);
     }
-    std::vector<double> rho_host(static_cast<std::size_t>(n_cells), 0.0);
-    state.rho.copy_to_host(rho_host.data());
-    std::vector<bool> eligible(static_cast<std::size_t>(n_cells), false);
-    // Never remap density-floored corona cells: near-zero extensive fields fail remap validators, and relief there is physically meaningless.
-    for (int i = 0; i < n_cells; ++i) {
-      eligible[static_cast<std::size_t>(i)] =
-          rho_host[static_cast<std::size_t>(i)] >
-          100.0 * cfg.numerics.floors.rho;
+    if (!rezone_result.success) {
+      out.skip_reason = rezone_result.skip_reason;
+      return out;
     }
-    MinWidthFloorCandidateResult floor_result =
-        build_min_width_floor_candidate(
-            floor_r_nodes,
-            pinned,
-            eligible,
-            ale.min_width_floor.floor_cm,
-            ale.min_width_floor.target_factor,
-            ale.min_width_floor.relief_halfwidth_cells,
-            ale.min_width_floor.max_growth_factor);
-    if (!floor_result.success) {
+    enforce_boundary_candidate(rezone_result.r_candidate, rezone_result.node_mask, cfg);
+    out.n_protected_nodes = rezone_result.node_mask.n_protected_nodes;
+    if (!validate_candidate_geometry(rezone_result.r_candidate,
+                                     n_cells,
+                                     state.mesh.geometry_code)) {
       out.skip_reason = Ale1dSkipReason::CandidateInvalid;
       return out;
     }
-    if (floor_result.no_relief_available) {
+    std::vector<double> r_current(static_cast<std::size_t>(n_cells + 1), 0.0);
+    state.x_r.copy_to_host(r_current.data());
+    std::vector<double> cs_current;
+    if (state.cs.size() == static_cast<std::size_t>(n_cells)) {
+      cs_current.assign(static_cast<std::size_t>(n_cells), 0.0);
+      state.cs.copy_to_host(cs_current.data());
+    }
+    bounds = acoustic_dt_bounds(r_current, cs_current, rezone_result.r_candidate);
+    const HostCandidateUpload upload =
+        upload_host_candidate(rezone_result.r_candidate, rezone_result.node_mask,
+                              protected_faces_from_features(features, n_cells));
+    d_r_candidate = upload.r_candidate;
+    d_pinned = upload.pinned;
+    d_protected_face = upload.protected_face;
+  } else {
+    const Ale1dDeviceCandidate candidate =
+        out.floor_triggered ? floor_candidate_device(state, cfg, features)
+                            : rezone_candidate_device(state, cfg, features);
+    if (out.floor_triggered && candidate.no_relief_available) {
       out.skip_reason = Ale1dSkipReason::BenefitTooSmall;
       return out;
     }
-    rezone_result.r_candidate = std::move(floor_result.r_candidate);
-    rezone_result.node_mask.pinned = std::move(pinned);
-    rezone_result.node_mask.n_protected_nodes = static_cast<int>(std::count(
-        rezone_result.node_mask.pinned.begin(),
-        rezone_result.node_mask.pinned.end(), true));
-    rezone_result.success = true;
-  } else {
-    rezone_result = rezone(state, cfg, features);
-  }
-  if (!rezone_result.success) {
-    out.skip_reason = rezone_result.skip_reason;
-    return out;
-  }
-  enforce_boundary_candidate(rezone_result.r_candidate, rezone_result.node_mask, cfg);
-  out.n_protected_nodes = rezone_result.node_mask.n_protected_nodes;
-  if (!validate_candidate_geometry(rezone_result.r_candidate,
-                                   n_cells,
-                                   state.mesh.geometry_code)) {
-    out.skip_reason = Ale1dSkipReason::CandidateInvalid;
-    return out;
+    if (!candidate.success) {
+      out.skip_reason = candidate.skip_reason;
+      return out;
+    }
+    out.n_protected_nodes = candidate.n_protected_nodes;
+    if (!candidate.geometry_valid) {
+      out.skip_reason = Ale1dSkipReason::CandidateInvalid;
+      return out;
+    }
+    bounds.current = candidate.dt_current;
+    bounds.candidate = candidate.dt_candidate;
+    d_r_candidate = candidate.r_candidate;
+    d_pinned = candidate.pinned;
+    d_protected_face = protected_faces_device(candidate, n_cells);
   }
 
   // Candidate gates on the acoustic time-step bound (NUMERICS §3.4.1): no
@@ -473,15 +615,6 @@ Ale1dStepResult apply_ale_1d_attempt(core::State& state,
   // min-width-floor triggers respond to a mesh defect and are exempt). The
   // parameters were read but never evaluated (2026-09-23).
   {
-    std::vector<double> r_current(static_cast<std::size_t>(n_cells + 1), 0.0);
-    state.x_r.copy_to_host(r_current.data());
-    std::vector<double> cs_current;
-    if (state.cs.size() == static_cast<std::size_t>(n_cells)) {
-      cs_current.assign(static_cast<std::size_t>(n_cells), 0.0);
-      state.cs.copy_to_host(cs_current.data());
-    }
-    const Ale1dAcousticDtBounds bounds =
-        acoustic_dt_bounds(r_current, cs_current, rezone_result.r_candidate);
     const bool bounded =
         std::isfinite(bounds.current) && std::isfinite(bounds.candidate) &&
         bounds.current > 0.0 && bounds.candidate > 0.0;
@@ -507,15 +640,8 @@ Ale1dStepResult apply_ale_1d_attempt(core::State& state,
   scratch.ensure_size(
       n_cells, n_groups, n_materials, ke_conservation_closure);
 
-  const std::vector<int> protected_faces =
-      protected_faces_from_features(features, n_cells);
   const Ale1dRemapResult remap_result =
-      remap_v3(state,
-               cfg,
-               rezone_result.r_candidate,
-               rezone_result.node_mask,
-               protected_faces,
-               scratch.remap);
+      remap_v3_device(state, cfg, d_r_candidate, d_pinned, d_protected_face, scratch.remap);
   out.mass_conservation_rel_err = remap_result.mass_conservation_rel_err;
   out.radiation_conservation_rel_err =
       remap_result.radiation_conservation_rel_err;
@@ -578,7 +704,7 @@ Ale1dStepResult apply_ale_1d_attempt(core::State& state,
 
   commit_scratch(state,
                  cfg,
-                 rezone_result.r_candidate,
+                 d_r_candidate,
                  scratch.remap,
                  scratch.velocity,
                  eos_ctx);

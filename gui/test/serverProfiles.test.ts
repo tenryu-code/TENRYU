@@ -246,14 +246,14 @@ describe("server profiles", () => {
       (argv) => argv[0] === "bash" && argv[1] === "-lc" && argv[2].includes("mesh_planner"),
     );
     expect(probes).toHaveLength(1);
-    const validates = fake.execs.filter((argv) => argv[0] === "env");
+    // validate runs from the checkout, so that relative table paths (TMAT-H5/...) resolve.
+    const validates = fake.execs.filter(
+      (argv) => argv[0] === "bash" && argv[1] === "-lc" && argv[2].includes(" validate "),
+    );
     expect(validates).toHaveLength(2);
-    expect(validates[0].slice(0, 4)).toEqual([
-      "env",
-      "TENRYU_REPO=/repo",
-      "/repo/build/tenryu",
-      "validate",
-    ]);
+    expect(validates[0][2]).toMatch(
+      /^TENRYU_LOGIN_DIR=\$PWD; cd \/repo && exec env TENRYU_REPO=\/repo \/repo\/build\/tenryu validate \S+$/,
+    );
   });
 
   it("pib without tools/ on the server yields NO_TOOLS", async () => {

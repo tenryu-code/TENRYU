@@ -5,8 +5,26 @@
 #include "core/config.hpp"
 #include "core/state.hpp"
 #include "hydro/ale_1d_types.cuh"
+#include "mesh/geometry_1d.cuh"
 
 namespace tenryu::hydro::ale1d {
+
+// Constants of the rezone shared by the host build and the device build
+// (ale_1d_rezone_device.cu): the smallest length scale and the smallest kernel integral the
+// monitor keeps.
+namespace rezone_detail {
+inline constexpr double kTiny = 1.0e-30;
+inline constexpr double kKernelIntegralFloor = 1.0e-14;
+}  // namespace rezone_detail
+
+// The volume coordinate V(r) of the candidate geometry check (4 pi r^3 / 3 in spherical geometry,
+// the shell volume from 0 otherwise).
+__host__ __device__ inline double ale1d_volume_coordinate(const double r, const int geom) {
+  constexpr double kFourPiOverThree =
+      4.188790204786390984616857844372670512262892532500141094646;
+  return (geom == 0) ? (kFourPiOverThree * r * r * r)
+                     : tenryu::mesh::geometry_1d_shell_volume_cubes(geom, 0.0, r);
+}
 
 using Ale1dRezoneConfig =
     core::Config::NumericsConfig::Ale1dConfig::RezoneConfig;

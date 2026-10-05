@@ -791,7 +791,7 @@ CFL の時間刻みと人工粘性の一次項に入っていた。tail の anch
 > 床のエネルギーを \(e_i\) に入れ、\(T_e\) を電子の比熱だけで決めていた）。2026-09-23 からこの核関数は無く、
 > remap の後はセルの材料物性を作り直してから hydro の閉包 `Hydro1D::close_eos_and_sound_speed` で EOS と音速を
 > 閉じる（1T・2T、全 EOS backend で、次の Lagrange step の入口の閉包と同じ状態になる）。2D_RZ 側の同型経路
-> （`ale_axis_band_controller`）は別の核関数のまま。
+> （`ale_axis_band_controller`）は別の核関数のまま。1D ALE は 2026-10-02 に退役した（§3.4）。
 
 [2026-09-07] The pressureless all-at-temperature-floor initialization exception
 is restricted to analytic EOS paths (including the explicit exact-ideal-gas
@@ -861,7 +861,7 @@ rho_e 表・Mie–Grüneisen は材料 0 の view を全セルに使う）は従
 `DeviceEOSTable::view()`、同じ `T_grid_eV.back()`）なので算術は bit 同一。
 `initialize_eos_fields_if_needed` は同日に先行してセル材料別に修正済み。
 `refresh_mie_gruneisen_thermo_from_energy`（Mie–Grüneisen backend 限定）は対象外のまま。1D ALE の remap 後の
-再閉包は 2026-09-23 から hydro の閉包そのものなので、ここでの材料別の規則に従う。
+再閉包は 2026-09-23 から hydro の閉包そのものなので、ここでの材料別の規則に従っていた（1D ALE は 2026-10-02 に退役、§3.4）。
 
 [2026-09-24] **材料ごとの閉包パラメータ — hydro backend 種別・`cv_e_override`・`eos_T_ref_eV` をセルの材料から**:
 上段の「`cv_e_override` と hydro backend 種別は先頭材料の値のまま」を解消した。1D で非 void 材料どうしが
@@ -1809,6 +1809,7 @@ Hydro演算子 \(\mathcal{H}\) の適用をセル単位で制御する。
 
 - **一方向性**：一度 `hydro_active_c = true` になったセルは以降判定を行わない。温度比較の計算コストを省き、揺動による断続的ON/OFFも回避する。
 - **初期条件**：`hydro_active_c⁰ = (T_start_eV == 0.0)` — 閾値 0 なら全セルが最初から有効。
+- **判定の計算**：非活性セルの \(T_{e,c}^{n} \ge T_{\text{start}}\) の判定は device で行い（`hydro_active` の device の写しを使う）、該当するセルの数だけを host へ読む。該当があるときだけセルごとの判定を読み、フラグの更新の規則（void・button・tombstone の優先順）は host のまま（2026-10-02）。
 - **ノードへの伝播**：ノード \(j\) は、隣接セルのうち少なくとも1つが `hydro_active` であれば移動対象とする。
   \[
   \text{node\_active}_j = \bigvee_{c \in \mathcal{N}(j)} \text{hydro\_active}_c

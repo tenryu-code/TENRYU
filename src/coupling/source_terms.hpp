@@ -29,6 +29,17 @@ double inject_burn_source_terms(core::State& state,
                                 int* clamp_count,
                                 const hydro::HydroEOSContext* eos_ctx = nullptr);
 
+// inject_burn_source_terms with the deposits in device memory (d_dE_e, d_dE_i: n_cells each,
+// the 1D burn stage on the device). The per-material deposit option copies them to the host and
+// takes the path above.
+double inject_burn_source_terms(core::State& state,
+                                const core::Config& cfg,
+                                const double* d_dE_e,
+                                const double* d_dE_i,
+                                double* E_floor_injected,
+                                int* clamp_count,
+                                const hydro::HydroEOSContext* eos_ctx = nullptr);
+
 void apply_qei_coupling_substep(core::State& state,
                                 const core::Config& cfg,
                                 double dt_sub,

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { computeGradedWidths } from "../src/ui/MeshMassChart";
+import { computeGradedWidths } from "../src/core/deck/mesh1d";
 
 const GRADING = { edgeRatio: 0.1, sgOrder: 4, sgSigma: 0.7 };
 

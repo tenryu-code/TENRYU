@@ -13,6 +13,7 @@
 #include "core/state.hpp"
 #include "materials/ionmix_reader.hpp"
 #include "materials/zbar_math.hpp"
+#include "materials/zbar_tf_host_rounding.cuh"
 
 namespace tenryu::materials {
 namespace {
@@ -89,7 +90,9 @@ struct ZbarClampSummary {
   ZbarClampWarning records[kZbarWarningRecords];
 };
 
-template <bool Tabular>
+// TfHostRounding: the Thomas-Fermi fit in the host's rounding (zbar_tf_value_host_rounding),
+// else with CUDA's pow and exp (zbar_tf_value).
+template <bool Tabular, bool TfHostRounding>
 __global__ void update_zbar_fields_kernel(
     const double* rho, const double* Te, const double* volfrac,
     const std::uint8_t* cell_is_void, const ZbarMaterialDevice* materials,
@@ -108,6 +111,8 @@ __global__ void update_zbar_fields_kernel(
       const ZbarClampedInput input = zbar_clamp_input(mat.zbar, rho[c], Te[c]);
       value = zbar_tabular_value(mat.zbar, input);
       if (clamped_inputs != nullptr) clamped_inputs[index] = input.clamped ? 1U : 0U;
+    } else if constexpr (TfHostRounding) {
+      value = zbar_tf_value_host_rounding(rho[c], Te[c], mat.Z, mat.A);
     } else {
       value = zbar_tf_value(rho[c], Te[c], mat.Z, mat.A);
     }
@@ -122,20 +127,53 @@ __global__ void update_zbar_fields_kernel(
   zbar[c] = cell_is_void[c] != 0U ? 0.0 : weighted;
 }
 
+// The first kZbarWarningRecords clamped (cell, material) inputs, in the order
+// of the cells and, within a cell, of the materials. One block: each thread
+// counts the clamped entries of its contiguous run of entries, the block scans
+// the counts, and each clamped entry ranked below the cap writes its record
+// at its rank (one thread looped over every entry until 2026-10-02; the same
+// records in the same order).
+constexpr int kZbarCollectThreads = 256;
+
 __global__ void collect_zbar_clamp_warnings_kernel(
     const double* rho, const double* Te, const std::uint8_t* clamped_inputs,
     const ZbarMaterialDevice* materials, const int n_cells, const int n_materials,
     ZbarClampSummary* summary) {
-  if (blockIdx.x != 0 || threadIdx.x != 0) return;
-  summary->count = 0;
-  for (int c = 0; c < n_cells; ++c) {
-    for (int m = 0; m < n_materials; ++m) {
-      if (materials[m].is_void ||
-          clamped_inputs[static_cast<std::size_t>(c) * n_materials + m] == 0U) continue;
-      const auto used = zbar_clamp_input(materials[m].zbar, rho[c], Te[c]);
-      summary->records[summary->count++] = {rho[c], Te[c], used.rho, used.T};
-      if (summary->count == kZbarWarningRecords) return;
-    }
+  __shared__ int sh_count[kZbarCollectThreads];
+  const int t = static_cast<int>(threadIdx.x);
+  const long long n_entries = static_cast<long long>(n_cells) * n_materials;
+  const long long per_thread = (n_entries + kZbarCollectThreads - 1) / kZbarCollectThreads;
+  const long long begin = static_cast<long long>(t) * per_thread;
+  const long long end = (begin + per_thread < n_entries) ? begin + per_thread : n_entries;
+  const auto clamped = [&](const long long e) {
+    const int m = static_cast<int>(e % n_materials);
+    return !materials[m].is_void && clamped_inputs[e] != 0U;
+  };
+  int count = 0;
+  for (long long e = begin; e < end; ++e) {
+    count += clamped(e) ? 1 : 0;
+  }
+  sh_count[t] = count;
+  __syncthreads();
+  // Inclusive scan of the counts (Hillis-Steele over the block).
+  for (int off = 1; off < kZbarCollectThreads; off <<= 1) {
+    const int add = (t >= off) ? sh_count[t - off] : 0;
+    __syncthreads();
+    sh_count[t] += add;
+    __syncthreads();
+  }
+  int rank = sh_count[t] - count;
+  for (long long e = begin; e < end && rank < kZbarWarningRecords; ++e) {
+    if (!clamped(e)) continue;
+    const int c = static_cast<int>(e / n_materials);
+    const int m = static_cast<int>(e % n_materials);
+    const auto used = zbar_clamp_input(materials[m].zbar, rho[c], Te[c]);
+    summary->records[rank] = {rho[c], Te[c], used.rho, used.T};
+    ++rank;
+  }
+  if (t == kZbarCollectThreads - 1) {
+    const int total = sh_count[t];
+    summary->count = (total < kZbarWarningRecords) ? total : kZbarWarningRecords;
   }
 }
 
@@ -187,7 +225,8 @@ ZbarDeviceContext::ZbarDeviceContext() = default;
 ZbarDeviceContext::~ZbarDeviceContext() = default;
 
 void update_zbar_fields_device(ZbarDeviceContext& context,
-                               core::State& state, const core::Config& cfg) {
+                               core::State& state, const core::Config& cfg,
+                               const ZbarTfRounding tf_rounding) {
   const bool tabular = cfg.materials.zbar.model == "tabular";
   const core::NvtxRange nvtx_range(tabular ? "material.zbar_tabular" : "material.zbar_tf");
   if (!tabular && cfg.materials.zbar.model != "thomas_fermi") return;
@@ -249,19 +288,23 @@ void update_zbar_fields_device(ZbarDeviceContext& context,
   const int threads = core::serial_cell_block_size(cells);
   const int blocks = core::serial_cell_blocks(cells);
   if (tabular) {
-    update_zbar_fields_kernel<true><<<blocks, threads>>>(
+    update_zbar_fields_kernel<true, false><<<blocks, threads>>>(
         state.rho.data(), state.Te.data(), state.volFrac.data(), cache.cell_is_void.data(),
         cache.materials.data(), cells, materials_count, state.zbar.data(),
         collect_warnings ? cache.clamped_inputs.data() : nullptr);
+  } else if (tf_rounding == ZbarTfRounding::host) {
+    update_zbar_fields_kernel<false, true><<<blocks, threads>>>(
+        state.rho.data(), state.Te.data(), state.volFrac.data(), cache.cell_is_void.data(),
+        cache.materials.data(), cells, materials_count, state.zbar.data(), nullptr);
   } else {
-    update_zbar_fields_kernel<false><<<blocks, threads>>>(
+    update_zbar_fields_kernel<false, false><<<blocks, threads>>>(
         state.rho.data(), state.Te.data(), state.volFrac.data(), cache.cell_is_void.data(),
         cache.materials.data(), cells, materials_count, state.zbar.data(), nullptr);
   }
   cuda_check(cudaGetLastError(), "update_zbar_fields_kernel launch failed");
   cuda_check(core::debug_kernel_sync(), "update_zbar_fields_kernel failed");
   if (collect_warnings) {
-    collect_zbar_clamp_warnings_kernel<<<1, 1>>>(
+    collect_zbar_clamp_warnings_kernel<<<1, kZbarCollectThreads>>>(
         state.rho.data(), state.Te.data(), cache.clamped_inputs.data(),
         cache.materials.data(), cells, materials_count, cache.clamp_summary.data());
     cuda_check(cudaGetLastError(), "collect_zbar_clamp_warnings_kernel launch failed");

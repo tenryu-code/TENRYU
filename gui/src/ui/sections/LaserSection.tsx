@@ -90,6 +90,77 @@ export default function LaserSection() {
                   onChange={(n) => update((f) => { f.laser.raysPerBeam = n ?? 1000; })}
                 />
               )}
+              {!is1d && form.laser.ghostCorona.enabled && (
+                // A 1D form switched to 2D keeps its ghost corona (a form error there): let it be
+                // switched off where the error is shown.
+                <SwitchField
+                  label={m.form.ghostCorona}
+                  checked
+                  onChange={(b) => update((f) => { f.laser.ghostCorona.enabled = b; })}
+                />
+              )}
+              {is1d && (
+                <>
+                  <SwitchField
+                    label={m.form.ghostCorona}
+                    checked={form.laser.ghostCorona.enabled}
+                    onChange={(b) => update((f) => { f.laser.ghostCorona.enabled = b; })}
+                  />
+                  <p className="text-xs" style={{ color: "var(--fg-secondary)" }}>{m.form.ghostCoronaHelp}</p>
+                  {!form.laser.ghostCorona.enabled &&
+                    !(form.geometry.vacuumOutside1d && form.geometry.coronaRamp1d.enabled) && (
+                      <p className="text-xs" style={{ color: "var(--warn)" }}>{m.form.laserNoCoronaWarn}</p>
+                    )}
+                  {form.laser.ghostCorona.enabled && (
+                    <details>
+                      <summary>{m.form.ghostCoronaDetails}</summary>
+                      {(
+                        [
+                          ["nOut", m.form.gcNOut, true],
+                          ["neMinFrac", m.form.gcNeMin, false],
+                          ["neMaxFrac", m.form.gcNeMax, false],
+                          ["TeMinEV", m.form.gcTeMin, false],
+                          ["zbarMin", m.form.gcZbarMin, false],
+                          ["zbarMax", m.form.gcZbarMax, false],
+                          ["handoffCells", m.form.gcHandoffCells, true],
+                          ["handoffDecay", m.form.gcHandoffDecay, false],
+                          ["transitionResolvedNhat", m.form.gcResolvedNhat, false],
+                          ["transitionResolvedCells", m.form.gcResolvedCells, true],
+                          ["transitionDensityExponent", m.form.gcDensityExp, false],
+                          ["meshFactor", m.form.gcMeshFactor, false],
+                          ["rmaxNHatThreshold", m.form.gcRmaxThreshold, false],
+                        ] as const
+                      ).map(([key, label, int]) => (
+                        <NumInput
+                          key={key}
+                          int={int}
+                          label={label}
+                          value={form.laser.ghostCorona[key]}
+                          onChange={(n) => update((f) => { f.laser.ghostCorona[key] = n ?? Number.NaN; })}
+                        />
+                      ))}
+                      <SwitchField
+                        label={m.form.gcTransition}
+                        checked={form.laser.ghostCorona.transitionEnabled}
+                        onChange={(b) => update((f) => { f.laser.ghostCorona.transitionEnabled = b; })}
+                      />
+                    </details>
+                  )}
+                  <NumInput
+                    int
+                    label={m.form.depositSmoothPasses}
+                    value={form.laser.depositSmoothPasses}
+                    onChange={(n) => update((f) => { f.laser.depositSmoothPasses = n ?? 0; })}
+                  />
+                  {form.laser.depositSmoothPasses > 0 && (
+                    <NumInput
+                      label={m.form.depositSmoothAlpha}
+                      value={form.laser.depositSmoothAlpha}
+                      onChange={(n) => update((f) => { f.laser.depositSmoothAlpha = n ?? 0.25; })}
+                    />
+                  )}
+                </>
+              )}
               <SwitchField
                 label={m.form.rayOutputTrajectory}
                 checked={form.laser.rayOutputTrajectory}

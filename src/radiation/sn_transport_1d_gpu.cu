@@ -19,6 +19,7 @@
 
 #include "core/deterministic_sum.hpp"
 #include "core/constants.hpp"
+#include "core/device_ordered_sum.cuh"
 #include "core/device_scratch.hpp"
 #include "core/error.hpp"
 #include "materials/ionmix_reader.cuh"
@@ -34,6 +35,7 @@
 #include "radiation/material_electron_eos_1d.hpp"
 #include "radiation/multimat_opacity_1d.cuh"
 #include "radiation/nlte_coeffs.cuh"
+#include "radiation/planck_host_rounding.cuh"
 #include "radiation/planck_table.cuh"
 #include "radiation/sn_cyl_quadrature_1d.hpp"
 #include "radiation/sn_dsa_1d_gpu.cuh"
@@ -4118,6 +4120,124 @@ void launch_inner_graph(SnInnerGraphCache& cache) {
              "SN inner source-iteration graph launch failed");
 }
 
+// The volume source per cell and its injected energy per cell (zero outside the source).
+__global__ void volume_source_kernel(const double* __restrict__ x_r,
+                                     const double* __restrict__ vol, const int n_cells,
+                                     const double rate, const double x_max, const double dt,
+                                     double* __restrict__ source, double* __restrict__ energy) {
+  const int c = blockIdx.x * blockDim.x + threadIdx.x;
+  if (c >= n_cells) {
+    return;
+  }
+  const double x_center = __dmul_rn(0.5, __dadd_rn(x_r[c], x_r[c + 1]));
+  if (x_center <= x_max) {
+    source[c] = rate;
+    const double V = vol[c];
+    const double V_used = isfinite(V) ? ((V < 0.0) ? 0.0 : V) : 0.0;
+    energy[c] = __dmul_rn(__dmul_rn(dt, V_used), rate);
+  } else {
+    source[c] = 0.0;
+    energy[c] = 0.0;
+  }
+}
+
+constexpr int kVolumeSourceSumBlock = 256;
+constexpr int kVolumeSourceSumPerThread = 4;
+
+// The injected energy summed in cell order (zero entries skipped, which leaves a sum from +0
+// unchanged).
+__global__ void volume_source_sum_kernel(const double* __restrict__ energy, const int n_cells,
+                                         double* __restrict__ total) {
+  __shared__ double sh_values[kVolumeSourceSumBlock * kVolumeSourceSumPerThread];
+  __shared__ int sh_scan[kVolumeSourceSumBlock];
+  const double sum = core::device_ordered::block_ordered_sum_nonzero<kVolumeSourceSumBlock,
+                                                                      kVolumeSourceSumPerThread>(
+      energy, n_cells, 0.0, sh_values, sh_scan);
+  if (threadIdx.x == 0) {
+    *total = sum;
+  }
+}
+
+// sum_{mu<0} w |mu| of the step's angular quadrature (the discrete half-range moment of the outer
+// Marshak boundary): the Gauss-Legendre set, or in cylindrical geometry the product set the
+// cylindrical sweep integrates with. Computed when the geometry or the angle count changes (the
+// quadrature is the same every step).
+double sn_negative_half_range_moment(const int geom, const int n_angles) {
+  static int cached_geom = -1;
+  static int cached_angles = -1;
+  static double cached_moment = 0.0;
+  if (geom != cached_geom || n_angles != cached_angles) {
+    std::vector<double> h_mu;
+    std::vector<double> h_w;
+    if (geom == 1) {
+      const SnCylQuadrature1D cyl_quad = build_sn_cyl_quadrature_1d(n_angles);
+      h_mu = cyl_quad.mu;
+      h_w = cyl_quad.weight;
+    } else {
+      compute_gauss_legendre(n_angles, h_mu, h_w);
+    }
+    double S_neg = 0.0;
+    for (int m = 0; m < n_angles; ++m) {
+      if (h_mu[m] < 0.0) {
+        S_neg += h_w[m] * (-h_mu[m]);
+      }
+    }
+    cached_moment = S_neg;
+    cached_geom = geom;
+    cached_angles = n_angles;
+  }
+  return cached_moment;
+}
+
+// The outer Marshak boundary (NUMERICS §6.8 1D BC), one block: per group the incoming flux F_inc
+// (the blackbody drive c a T_r^4 b_g(T_r) / 4, else the grey flux drive in group 0) and the
+// persistent incoming intensity psi_in, then the injected energy dt A(r_outer) sum_g S_neg psi_in,g
+// summed in group order. Each operation rounded separately in the host's order and the Planck
+// fraction in the host's rounding: the values the host computed before 2026-10-02.
+// flux_scaled: the linear-discontinuous scheme's flux drive (F_inc / S_neg, else 2 F_inc).
+__global__ void sn_marshak_inflow_1d_kernel(const PlanckTableDeviceView planck,
+                                            const double T_r_eV,
+                                            const double const_flux,
+                                            const int n_groups,
+                                            const int flux_scaled,
+                                            const double S_neg,
+                                            const double* __restrict__ x_r,
+                                            const int n_cells,
+                                            const int geom,
+                                            const double dt,
+                                            double* __restrict__ psi_in,
+                                            double* __restrict__ injected) {
+  const bool flux_drive = !(T_r_eV > 0.0);
+  for (int g = static_cast<int>(threadIdx.x); g < n_groups; g += static_cast<int>(blockDim.x)) {
+    double F_inc = 0.0;
+    if (T_r_eV > 0.0) {
+      const double T4 = __dmul_rn(__dmul_rn(__dmul_rn(T_r_eV, T_r_eV), T_r_eV), T_r_eV);
+      double b = 1.0;
+      if (n_groups != 1) {
+        const double fraction = planck_fraction_host_rounding(planck, g, T_r_eV);
+        b = (fraction < 0.0) ? 0.0 : fraction;  // std::max(fraction, 0.0)
+      }
+      F_inc = __dmul_rn(
+          __dmul_rn(__dmul_rn(__dmul_rn(0.25, core::constants::c_light), core::constants::a_eV),
+                    T4),
+          b);
+    } else if (g == 0) {
+      F_inc = (const_flux < 0.0) ? 0.0 : const_flux;  // std::max(const_flux, 0.0)
+    }
+    psi_in[g] = (flux_scaled != 0 && flux_drive && S_neg > 0.0) ? __ddiv_rn(F_inc, S_neg)
+                                                               : __dmul_rn(2.0, F_inc);
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    double F_discrete_total = 0.0;
+    for (int g = 0; g < n_groups; ++g) {
+      F_discrete_total = __dadd_rn(F_discrete_total, __dmul_rn(S_neg, psi_in[g]));
+    }
+    *injected = __dmul_rn(__dmul_rn(dt, tenryu::mesh::geometry_1d_face_area(geom, x_r[n_cells])),
+                          F_discrete_total);
+  }
+}
+
 }  // namespace
 
 void compute_sn_E_star_flux_1d_gpu(
@@ -4356,26 +4476,10 @@ void advance_radiation_step_sn_1d(
   state.sn_volume_source_in_step = 0.0;
   if (cfg.radiation.volume_source_rate > 0.0 &&
       cfg.radiation.volume_source_x_max > 0.0) {
-    std::vector<double> h_x_r;
-    state.x_r.copy_to_host(h_x_r);
-    std::vector<double> h_vol;
-    state.vol.copy_to_host(h_vol);
-    std::vector<double> h_source_ext(static_cast<std::size_t>(n_cells), 0.0);
-    for (int c = 0; c < n_cells; ++c) {
-      const double x_center =
-          0.5 * (h_x_r[static_cast<std::size_t>(c)] +
-                 h_x_r[static_cast<std::size_t>(c + 1)]);
-      if (x_center <= cfg.radiation.volume_source_x_max) {
-        h_source_ext[static_cast<std::size_t>(c)] =
-            cfg.radiation.volume_source_rate;
-        const double V = h_vol[static_cast<std::size_t>(c)];
-        state.sn_volume_source_in_step +=
-            dt * (std::isfinite(V) ? std::max(V, 0.0) : 0.0) *
-            cfg.radiation.volume_source_rate;
-      }
-    }
     source_ext_device.reset(static_cast<std::size_t>(n_cells));
-    source_ext_device.copy_from_host(h_source_ext);
+    state.sn_volume_source_in_step = sn1d_internal::volume_source(
+        state.x_r.data(), state.vol.data(), n_cells, cfg.radiation.volume_source_rate,
+        cfg.radiation.volume_source_x_max, dt, source_ext_device.data());
     static bool warned_volsrc = false;
     if (!warned_volsrc) {
       warned_volsrc = true;
@@ -4414,63 +4518,28 @@ void advance_radiation_step_sn_1d(
         t_drive >= sn.marshak.flux_pulse_duration_s) {
       const_flux = 0.0;  // pulsed grey drive expired
     }
-    std::vector<double> h_mu;
-    std::vector<double> h_w;
-    if (geom == 1) {
-      // W-G3: the marshak ledger's discrete half-range moment must come
-      // from the same product set the cylindrical sweep integrates with.
-      const SnCylQuadrature1D cyl_quad = build_sn_cyl_quadrature_1d(n_angles);
-      h_mu = cyl_quad.mu;
-      h_w = cyl_quad.weight;
-    } else {
-      compute_gauss_legendre(n_angles, h_mu, h_w);
-    }
-    double S_neg = 0.0;
-    for (int m = 0; m < n_angles; ++m) {
-      if (h_mu[m] < 0.0) {
-        S_neg += h_w[m] * (-h_mu[m]);
-      }
-    }
+    // The ledger's discrete half-range moment comes from the quadrature the sweep integrates with
+    // (the product set in cylindrical geometry).
+    const double S_neg = sn_negative_half_range_moment(geom, n_angles);
     S_neg_marshak = S_neg;
-    std::vector<double> psi_in(static_cast<std::size_t>(n_groups), 0.0);
-    double F_discrete_total = 0.0;
-    for (int g = 0; g < n_groups; ++g) {
-      double F_inc = 0.0;
-      if (T_r_eV > 0.0) {
-        const double T4 = T_r_eV * T_r_eV * T_r_eV * T_r_eV;
-        const double b =
-            (n_groups == 1)
-                ? 1.0
-                : std::max(planck.interpolate_b_host(g, T_r_eV), 0.0);
-        F_inc = 0.25 * core::constants::c_light * core::constants::a_eV * T4 * b;
-      } else if (g == 0) {
-        F_inc = std::max(const_flux, 0.0);
-      }
-      // The blackbody drive enters as the Planck intensity 2 F_inc = c B / 2
-      // (equilibrium-exact). The linear-discontinuous scheme takes a
-      // flux drive as the isotropic intensity whose discrete half-range
-      // current is the specified flux, F_inc / sum_{mu<0} w |mu|; the older
-      // schemes keep 2 F_inc there too.
-      const bool flux_drive = !(T_r_eV > 0.0);
-      psi_in[static_cast<std::size_t>(g)] =
-          (linear_discontinuous && flux_drive && S_neg > 0.0) ? F_inc / S_neg : 2.0 * F_inc;
-      F_discrete_total += S_neg * psi_in[static_cast<std::size_t>(g)];
+    // The blackbody drive enters as the Planck intensity 2 F_inc = c B / 2 (equilibrium-exact).
+    // The linear-discontinuous scheme takes a flux drive as the isotropic intensity whose
+    // discrete half-range current is the specified flux, F_inc / sum_{mu<0} w |mu|; the older
+    // schemes keep 2 F_inc there too. The device computes psi_in and the injected energy
+    // (sn_marshak_inflow_1d_kernel); the host reads back the energy for the ledger.
+    if (T_r_eV > 0.0 && n_groups != 1) {
+      planck.warn_if_outside_range(T_r_eV);
     }
-    cuda_check(cudaMemcpy(state.sn_outer_marshak_psi_in.data(),
-                          psi_in.data(),
-                          sizeof(double) * psi_in.size(),
-                          cudaMemcpyHostToDevice),
-               "SN marshak psi_in upload failed");
+    auto* d_injected = static_cast<double*>(
+        core::device_scratch_acquire("sn_1d:marshak_injected", sizeof(double)));
+    sn_marshak_inflow_1d_kernel<<<1, 256>>>(
+        planck.device_view(), T_r_eV, const_flux, n_groups, linear_discontinuous ? 1 : 0, S_neg,
+        state.x_r.data(), n_cells, geom, dt, state.sn_outer_marshak_psi_in.data(), d_injected);
+    cuda_check(cudaGetLastError(), "SN marshak inflow kernel launch failed");
     outer_psi_in = state.sn_outer_marshak_psi_in.data();
-    double r_outer = 0.0;
-    cuda_check(cudaMemcpy(&r_outer,
-                          state.x_r.data() + n_cells,
-                          sizeof(double),
+    cuda_check(cudaMemcpy(&state.sn_marshak_in_step, d_injected, sizeof(double),
                           cudaMemcpyDeviceToHost),
-               "SN marshak outer radius copy failed");
-    state.sn_marshak_in_step =
-        dt * tenryu::mesh::geometry_1d_face_area(geom, r_outer) *
-        F_discrete_total;
+               "SN marshak injected energy copy failed");
   }
 
   // Radiation.sn_transport.spatial_scheme = "linear_discontinuous"
@@ -5076,6 +5145,27 @@ sn_ld::QuadratureView quadrature(const int n_angles, const int geom) {
 void ensure_buffers(core::State& state, const int n_cells, const int n_groups,
                     const int n_angles) {
   ensure_state_buffers(state, n_cells, n_groups, n_angles);
+}
+
+double volume_source(const double* x_r, const double* vol, const int n_cells, const double rate,
+                     const double x_max, const double dt, double* source) {
+  if (n_cells <= 0) {
+    return 0.0;
+  }
+  auto* const energy = static_cast<double*>(core::device_scratch_acquire(
+      "sn_1d:volume_source:energy",
+      (static_cast<std::size_t>(n_cells) + 1U) * sizeof(double)));
+  double* const total = energy + n_cells;
+  constexpr int kBlock = 256;
+  volume_source_kernel<<<(n_cells + kBlock - 1) / kBlock, kBlock>>>(x_r, vol, n_cells, rate,
+                                                                     x_max, dt, source, energy);
+  cuda_check(cudaGetLastError(), "SN volume source kernel launch failed");
+  volume_source_sum_kernel<<<1, kVolumeSourceSumBlock>>>(energy, n_cells, total);
+  cuda_check(cudaGetLastError(), "SN volume source sum launch failed");
+  double injected = 0.0;
+  cuda_check(cudaMemcpy(&injected, total, sizeof(double), cudaMemcpyDeviceToHost),
+             "SN volume source energy copy failed");
+  return injected;
 }
 
 }  // namespace sn1d_internal

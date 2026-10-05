@@ -8,6 +8,8 @@
 #include <map>
 #include <type_traits>
 
+#include <cub/device/device_radix_sort.cuh>
+
 #include "core/device_scratch.hpp"
 #include "core/error.hpp"
 #include "laser/bilinear_interpolation.cuh"
@@ -1570,7 +1572,9 @@ void ray_trace_1d_characteristic(const ray_trace_bodies::CharacteristicPieces pi
                                  double* __restrict__ tau_shell_out,
                                  const int reflect_at_critical,
                                  const int geometry,
-                                 const double* __restrict__ ray_vA0) {
+                                 const double* __restrict__ ray_vA0,
+                                 ray_trace_bodies::InwardPieceIntegrals* __restrict__ inward_cache,
+                                 const int inward_cache_stride) {
   extern __shared__ double rt_smem[];
   const int n_slab =
       (n_radial_nodes > n_hydro_cells + 1) ? n_radial_nodes : n_hydro_cells + 1;
@@ -1625,7 +1629,11 @@ void ray_trace_1d_characteristic(const ray_trace_bodies::CharacteristicPieces pi
       step_histogram, step_count, ray_steps_out, P_unabsorbed, tail_closure_count,
       tail_closure_absorbed_power, critical_surface_hit_count, error_flags, cbet_args,
       hot_e_params, hot_e_capture, phys_opt, body_radial_T_e, ra_per_ray, tau_shell_out,
-      ray_begin, reflect_at_critical, geometry, ray_vA0);
+      ray_begin, reflect_at_critical, geometry, ray_vA0,
+      inward_cache != nullptr
+          ? inward_cache + static_cast<std::size_t>(ray - ray_begin) *
+                               static_cast<std::size_t>(inward_cache_stride)
+          : nullptr);
 }
 
 
@@ -1991,7 +1999,7 @@ template __global__ void ray_trace_1d_sph<true, true, true>(
     const double* __restrict__, double* __restrict__, double* __restrict__,
     const int, const int);
 #define TENRYU_CHARACTERISTIC_INSTANTIATION(LANES, CBET, HOTE, PHYS)                         \
-  template __global__ void ray_trace_1d_characteristic<LANES, CBET, HOTE, PHYS>(const ray_trace_bodies::CharacteristicPieces, double* __restrict__, double* __restrict__, double* __restrict__, double* __restrict__, const double* __restrict__, const double* __restrict__, const double* __restrict__, const double* __restrict__, const double* __restrict__, const double* __restrict__, const int, const int, const double, const double* __restrict__, const double* __restrict__, const double* __restrict__, const double* __restrict__, const double* __restrict__, const double* __restrict__, const double, const double, const double, const double, const double, const int, const int, const int, const int, const int, const int, const int, double* __restrict__, double* __restrict__, double* __restrict__, int* __restrict__, const int, const int, const int, int* __restrict__, int* __restrict__, int* __restrict__, double* __restrict__, unsigned long long* __restrict__, double* __restrict__, unsigned long long* __restrict__, core::DeviceErrorFlags* __restrict__, const CbetRecordDeviceArgs, const HotECaptureParams, double* __restrict__, const laser::LaserPhysExtOptions, const double* __restrict__, double* __restrict__, double* __restrict__, const int, const int, const double* __restrict__);
+  template __global__ void ray_trace_1d_characteristic<LANES, CBET, HOTE, PHYS>(const ray_trace_bodies::CharacteristicPieces, double* __restrict__, double* __restrict__, double* __restrict__, double* __restrict__, const double* __restrict__, const double* __restrict__, const double* __restrict__, const double* __restrict__, const double* __restrict__, const double* __restrict__, const int, const int, const double, const double* __restrict__, const double* __restrict__, const double* __restrict__, const double* __restrict__, const double* __restrict__, const double* __restrict__, const double, const double, const double, const double, const double, const int, const int, const int, const int, const int, const int, const int, double* __restrict__, double* __restrict__, double* __restrict__, int* __restrict__, const int, const int, const int, int* __restrict__, int* __restrict__, int* __restrict__, double* __restrict__, unsigned long long* __restrict__, double* __restrict__, unsigned long long* __restrict__, core::DeviceErrorFlags* __restrict__, const CbetRecordDeviceArgs, const HotECaptureParams, double* __restrict__, const laser::LaserPhysExtOptions, const double* __restrict__, double* __restrict__, double* __restrict__, const int, const int, const double* __restrict__, ray_trace_bodies::InwardPieceIntegrals* __restrict__, const int);
 #define TENRYU_CHARACTERISTIC_INSTANTIATIONS(LANES)                                          \
   TENRYU_CHARACTERISTIC_INSTANTIATION(LANES, false, false, false)                            \
   TENRYU_CHARACTERISTIC_INSTANTIATION(LANES, false, false, true)                             \
@@ -3709,8 +3717,8 @@ cudaError_t launch_ray_trace_1d_sph(const RayArray1D& rays,
                                     const laser::LaserPhysExtOptions* phys_ext,
                                     const double* d_radial_T_e,
                                     double* d_ra_power_total,
-                                    const int* h_ray_order,
-                                    int* h_ray_steps_out,
+                                    const int* d_ray_order_in,
+                                    int* d_ray_steps_out_dest,
                                     const int max_ray_steps_override,
                                     double* d_tau_shell_out,
                                     double* d_pabs_per_ray_out) {
@@ -3803,20 +3811,10 @@ cudaError_t launch_ray_trace_1d_sph(const RayArray1D& rays,
       static_cast<std::size_t>(rays.n_rays) * sizeof(int);
   int* d_ray_steps_out = static_cast<int*>(core::device_scratch_acquire(
       "ray_trace_1d_sph:ray_steps_out", ray_index_bytes));
-  int* d_ray_order = static_cast<int*>(core::device_scratch_acquire(
-      "ray_trace_1d_sph:ray_order", ray_index_bytes));
-  const int* kernel_ray_order = nullptr;
   // The march's longest-first ray order spans all rays: used only when one
   // launch traces them all.
-  if (h_ray_order != nullptr && batch_rays == rays.n_rays) {
-    const cudaError_t order_status =
-        cudaMemcpyAsync(d_ray_order, h_ray_order, ray_index_bytes,
-                        cudaMemcpyHostToDevice, stream);
-    if (order_status != cudaSuccess) {
-      return order_status;
-    }
-    kernel_ray_order = d_ray_order;
-  }
+  const int* kernel_ray_order =
+      (d_ray_order_in != nullptr && batch_rays == rays.n_rays) ? d_ray_order_in : nullptr;
 
   // One kernel per (CBET records, hot-electron capture, extended physics):
   // Laser.raytrace.integrator="characteristic" integrates the rays along their
@@ -3825,6 +3823,8 @@ cudaError_t launch_ray_trace_1d_sph(const RayArray1D& rays,
   const bool characteristic = laser_cfg.raytrace.integrator == "characteristic" ||
                               laser_cfg.raytrace.integrator == "auto";
   ray_trace_bodies::CharacteristicPieces pieces{};
+  ray_trace_bodies::InwardPieceIntegrals* d_inward_cache = nullptr;
+  int inward_cache_stride = 0;
   if (characteristic) {
     const int capacity =
         ray_trace_bodies::characteristic_piece_capacity(mesh.radial_n_nodes, n_hydro_cells);
@@ -3850,6 +3850,16 @@ cudaError_t launch_ray_trace_1d_sph(const RayArray1D& rays,
         critical_adjacent_split_r, d_piece_interval, d_piece_cell, capacity);
     pieces = ray_trace_bodies::CharacteristicPieces{d_piece_r, d_piece_interval, d_piece_cell,
                                                     d_piece_count};
+    if (laser_cfg.raytrace.reuse_inward_integrals) {
+      // The inward legs' piece integrals, one row per ray of a batch
+      // (Laser.raytrace.reuse_inward_integrals).
+      inward_cache_stride = capacity;
+      d_inward_cache = static_cast<ray_trace_bodies::InwardPieceIntegrals*>(
+          core::device_scratch_acquire(
+              "ray_trace_1d_characteristic:inward_cache",
+              static_cast<std::size_t>(batch_rays) * static_cast<std::size_t>(capacity) *
+                  sizeof(ray_trace_bodies::InwardPieceIntegrals)));
+    }
   }
   int batch_begin = 0;
   int batch_end = rays.n_rays;
@@ -3888,7 +3898,8 @@ cudaError_t launch_ray_trace_1d_sph(const RayArray1D& rays,
             d_unabsorbed, d_tail_closure_count, d_tail_closure_absorbed_power,
             d_critical_surface_hit_count, d_error_flags, cbet_args, he_params, he_capture, px,
             radial_T_e, ra_per_ray, d_tau_shell_out,
-            laser_cfg.absorption.terminate ? 0 : 1, mesh.geometry_code, rays.vA0);
+            laser_cfg.absorption.terminate ? 0 : 1, mesh.geometry_code, rays.vA0,
+            d_inward_cache, inward_cache_stride);
       };
       switch (characteristic_lanes_per_ray<kCbet, kHotE, kPhys>(
           laser_cfg.raytrace.lanes_per_ray, batch_count, requested_ray_trace_shared_bytes)) {
@@ -3981,15 +3992,88 @@ cudaError_t launch_ray_trace_1d_sph(const RayArray1D& rays,
           d_ra_per_ray != nullptr ? d_ra_power_total : nullptr);
     }
   }
-  if (h_ray_steps_out != nullptr) {
+  if (d_ray_steps_out_dest != nullptr) {
     const cudaError_t steps_status =
-        cudaMemcpyAsync(h_ray_steps_out, d_ray_steps_out, ray_index_bytes,
-                        cudaMemcpyDeviceToHost, stream);
+        cudaMemcpyAsync(d_ray_steps_out_dest, d_ray_steps_out, ray_index_bytes,
+                        cudaMemcpyDeviceToDevice, stream);
     if (steps_status != cudaSuccess) {
       return steps_status;
     }
   }
   return cudaGetLastError();
+}
+
+namespace {
+
+__global__ void ray_index_iota_kernel(int* __restrict__ out, const int n) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) {
+    out[i] = i;
+  }
+}
+
+}  // namespace
+
+cudaError_t order_rays_by_previous_steps(const int* previous_steps, const int n_rays,
+                                         const bool sort, int* order, int* p90,
+                                         cudaStream_t stream) {
+  if (n_rays <= 0) {
+    return cudaSuccess;
+  }
+  const std::size_t n = static_cast<std::size_t>(n_rays);
+  constexpr int kBlock = 256;
+  const int grid = static_cast<int>((n + kBlock - 1) / kBlock);
+  int* d_index = order;
+  if (sort) {
+    d_index = static_cast<int*>(
+        core::device_scratch_acquire("ray_order:index", n * sizeof(int)));
+  }
+  ray_index_iota_kernel<<<grid, kBlock, 0, stream>>>(d_index, n_rays);
+  cudaError_t status = cudaGetLastError();
+  if (status != cudaSuccess) {
+    return status;
+  }
+  if (!sort && p90 == nullptr) {
+    return cudaSuccess;
+  }
+  // The keys sorted, larger first (CUB's radix sort is stable: equal keys keep the index order).
+  int* d_keys = static_cast<int*>(core::device_scratch_acquire("ray_order:keys", n * sizeof(int)));
+  std::size_t temp_bytes = 0;
+  if (sort) {
+    status = cub::DeviceRadixSort::SortPairsDescending(nullptr, temp_bytes, previous_steps,
+                                                       d_keys, d_index, order, n_rays, 0,
+                                                       static_cast<int>(8 * sizeof(int)),
+                                                       stream);
+  } else {
+    status = cub::DeviceRadixSort::SortKeysDescending(nullptr, temp_bytes, previous_steps,
+                                                      d_keys, n_rays, 0,
+                                                      static_cast<int>(8 * sizeof(int)), stream);
+  }
+  if (status != cudaSuccess) {
+    return status;
+  }
+  void* d_temp = core::device_scratch_acquire("ray_order:temp", std::max<std::size_t>(temp_bytes, 1U));
+  if (sort) {
+    status = cub::DeviceRadixSort::SortPairsDescending(d_temp, temp_bytes, previous_steps,
+                                                       d_keys, d_index, order, n_rays, 0,
+                                                       static_cast<int>(8 * sizeof(int)),
+                                                       stream);
+  } else {
+    status = cub::DeviceRadixSort::SortKeysDescending(d_temp, temp_bytes, previous_steps,
+                                                      d_keys, n_rays, 0,
+                                                      static_cast<int>(8 * sizeof(int)), stream);
+  }
+  if (status != cudaSuccess || p90 == nullptr) {
+    return status;
+  }
+  // The p90_index-th smallest is the (n - 1 - p90_index)-th largest.
+  const std::size_t p90_index = ((n - 1) * 9) / 10;
+  status = cudaMemcpyAsync(p90, d_keys + (n - 1 - p90_index), sizeof(int),
+                           cudaMemcpyDeviceToHost, stream);
+  if (status != cudaSuccess) {
+    return status;
+  }
+  return cudaStreamSynchronize(stream);
 }
 
 cudaError_t launch_radial_absorption_1d(double P_total,

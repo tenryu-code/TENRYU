@@ -2,6 +2,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <cmath>
@@ -12,6 +13,8 @@
 
 #include "core/constants.hpp"
 #include "core/error.hpp"
+#include "laser/port_section_chi_lookup.cuh"
+#include "laser/port_section_s1_gpu.cuh"
 
 namespace tenryu::laser::port_section {
 namespace {
@@ -92,19 +95,28 @@ __device__ DeviceVec2 device_meridional_direction(const double alpha,
   return {radial, ::sin(alpha)};
 }
 
-__device__ DeviceVec3 device_lab_dir(const double* frame,
-                                     const double theta,
-                                     const double phi,
-                                     const double alpha,
-                                     const int sheet) {
+// The radial and polar unit vectors of the port frame at (theta, phi).
+struct DeviceFrameAngles {
+  DeviceVec3 r_hat;
+  DeviceVec3 theta_hat;
+};
+
+__device__ DeviceFrameAngles device_frame_angles(const double theta,
+                                                 const double phi) {
   const double sin_theta = ::sin(theta);
   const double cos_theta = ::cos(theta);
   const double cos_phi = ::cos(phi);
   const double sin_phi = ::sin(phi);
-  const DeviceVec3 r_hat{
-      sin_theta * cos_phi, sin_theta * sin_phi, cos_theta};
-  const DeviceVec3 theta_hat{
-      cos_theta * cos_phi, cos_theta * sin_phi, -sin_theta};
+  return {{sin_theta * cos_phi, sin_theta * sin_phi, cos_theta},
+          {cos_theta * cos_phi, cos_theta * sin_phi, -sin_theta}};
+}
+
+__device__ DeviceVec3 device_lab_dir_from(const double* frame,
+                                          const DeviceFrameAngles& angles,
+                                          const double alpha,
+                                          const int sheet) {
+  const DeviceVec3& r_hat = angles.r_hat;
+  const DeviceVec3& theta_hat = angles.theta_hat;
   const DeviceVec2 meridional =
       device_meridional_direction(alpha, sheet);
   const DeviceVec3 local{
@@ -114,69 +126,17 @@ __device__ DeviceVec3 device_lab_dir(const double* frame,
   return device_to_lab(frame, local);
 }
 
-__device__ bool device_lookup(const int* offsets,
-                              const double* theta,
-                              const double* alpha,
-                              const double* power,
-                              const double* area,
-                              const std::uint8_t* in_limiter,
-                              const int bin,
-                              const double theta_p,
-                              double* intensity_out,
-                              double* alpha_out) {
-  const int begin = offsets[bin];
-  const int end = offsets[bin + 1];
-  int first = begin;
-  while (first < end && in_limiter[first] != 0) {
-    ++first;
-  }
-  if (first == end) {
-    return false;
-  }
-
-  int last = end - 1;
-  while (last >= first && in_limiter[last] != 0) {
-    --last;
-  }
-  if (theta_p > theta[last]) {
-    return false;
-  }
-
-  if (theta_p <= theta[first]) {
-    *intensity_out = power[first] / area[first];
-    *alpha_out = alpha[first];
-    return true;
-  }
-
-  int hi = first + 1;
-  while (hi < end &&
-         (in_limiter[hi] != 0 || theta[hi] < theta_p)) {
-    ++hi;
-  }
-  if (hi == end) {
-    return false;
-  }
-  if (theta[hi] == theta_p) {
-    *intensity_out = power[hi] / area[hi];
-    *alpha_out = alpha[hi];
-    return true;
-  }
-
-  int lo = hi - 1;
-  while (in_limiter[lo] != 0) {
-    --lo;
-  }
-  const double weight =
-      (theta_p - theta[lo]) / (theta[hi] - theta[lo]);
-  const double lower_intensity = power[lo] / area[lo];
-  const double upper_intensity = power[hi] / area[hi];
-  *intensity_out =
-      lower_intensity + weight * (upper_intensity - lower_intensity);
-  *alpha_out = alpha[lo] + weight * (alpha[hi] - alpha[lo]);
-  return true;
+__device__ DeviceVec3 device_lab_dir(const double* frame,
+                                     const double theta,
+                                     const double phi,
+                                     const double alpha,
+                                     const int sheet) {
+  return device_lab_dir_from(frame, device_frame_angles(theta, phi), alpha,
+                             sheet);
 }
 
-__global__ void build_chi_ps_kernel(
+// The reference kernel: one thread per (cell, pair) (ChiBuildInput::per_pair_reference).
+__global__ void build_chi_ps_pair_kernel(
     const int* __restrict__ offsets,
     const double* __restrict__ theta,
     const double* __restrict__ alpha,
@@ -288,8 +248,8 @@ __global__ void build_chi_ps_kernel(
         double pump_intensity = 0.0;
         double pump_alpha = 0.0;
         const int bq = 2 * cell + sheet_q;
-        if (!device_lookup(offsets, theta, alpha, power, area, in_limiter,
-                           bq, theta_q, &pump_intensity, &pump_alpha)) {
+        if (!chi_lookup_linear(offsets, theta, alpha, power, area, in_limiter,
+                               bq, theta_q, &pump_intensity, &pump_alpha)) {
           continue;
         }
         has_pump = true;
@@ -327,6 +287,267 @@ __global__ void build_chi_ps_kernel(
   }
   if (denominator > 0.0) {
     chi[t] = cell_chi_pref[cell] * numerator / denominator;
+  }
+}
+
+// The pump state q enters chi only through its port (frame and frequency) and its sheet (the
+// table bin of the lookup and the pump's direction), not through its impact bin: the pairs
+// (p, q) whose q differ only in the impact bin have the same chi. One warp per (cell, seed
+// state p, pump port) forms the per-pair kernel's sums for the port's two sheets and writes
+// each sheet's value to every pair (p, q) of its states q > p. The terms of the sums, one per
+// (seed record, section angle), are formed by the warp's lanes in parallel with the per-pair
+// kernel's operations (the pump's angles in the port frame once for both sheets, the lookup
+// bisecting the bin, chi_lookup), and lane 0 adds them in the per-pair kernel's order (seed
+// records in table order, then section angles) with the per-pair kernel's accumulation. Equal to
+// the per-pair kernel bit for bit, counters included. (A thread per pair ran the whole term loop
+// alone: with one cell holding the table's records, 4560 threads did 400 terms each in sequence,
+// 35 ms per build in the cbetHotElectrons preset.)
+constexpr int kChiWarpsPerBlock = 4;
+constexpr int kChiThreadsPerBlock = 32 * kChiWarpsPerBlock;
+// The warps stride over the (cell, entry) work: most cells are masked (a launch of a warp per
+// work item spent 0.3 ms on them per build).
+constexpr int kChiMaxBlocks = 4096;
+
+struct ChiTerm {
+  double seed_weight;
+  double pump_intensity[2];
+  double polarization[2];
+  double Pg[2];
+  int flags;  // bit 2 s: the pump lookup of sheet s succeeded; bit 2 s + 1: its numerator term
+};
+
+__global__ void build_chi_ps_warp_kernel(
+    const int* __restrict__ offsets,
+    const double* __restrict__ theta,
+    const double* __restrict__ alpha,
+    const double* __restrict__ power,
+    const double* __restrict__ area,
+    const std::int32_t* __restrict__ ray_index,
+    const std::uint8_t* __restrict__ in_limiter,
+    const std::int32_t* __restrict__ ray_bin,
+    const double* __restrict__ cell_chi_pref,
+    const double* __restrict__ cell_c_a,
+    const double* __restrict__ cell_u_r,
+    const double* __restrict__ cell_k_bar,
+    const std::uint8_t* __restrict__ cell_mask,
+    const double* __restrict__ frames9,
+    const double* __restrict__ omega_state,
+    const std::int16_t* __restrict__ entry_p,
+    const std::int16_t* __restrict__ entry_port,
+    double* __restrict__ chi,
+    unsigned long long* __restrict__ counters,
+    const double f_cbet,
+    const double alpha_iaw,
+    const double k_a_floor,
+    const int n_section_phi,
+    const int G_ref,
+    const int n_impact_bins,
+    const int G_ps,
+    const int n_entries,
+    const int n_pairs,
+    const int n_cells) {
+  __shared__ ChiTerm sh_terms[kChiWarpsPerBlock][32];
+  const int lane = static_cast<int>(threadIdx.x) & 31;
+  const int warp_in_block = static_cast<int>(threadIdx.x) >> 5;
+  const std::int64_t total = static_cast<std::int64_t>(n_cells) * n_entries;
+  const std::int64_t warp_stride = static_cast<std::int64_t>(gridDim.x) * kChiWarpsPerBlock;
+  ChiTerm* const terms = sh_terms[warp_in_block];
+  for (std::int64_t work = static_cast<std::int64_t>(blockIdx.x) * kChiWarpsPerBlock +
+                           warp_in_block;
+       work < total; work += warp_stride) {
+    const int cell = static_cast<int>(work / n_entries);
+    const int entry = static_cast<int>(work % n_entries);
+    if (cell_mask[cell] == 0) {
+      continue;
+    }
+
+    const int p = entry_p[entry];
+    const int port_q = entry_port[entry];
+    const int port_p = p / G_ref;
+    const int reference_p = p % G_ref;
+    const int sheet_p = reference_p / n_impact_bins;
+    const int bin_p = reference_p % n_impact_bins;
+
+    // The port's two sheets: the pump states q of sheet s are [(2 port_q + s) nb, + nb); those
+    // above p are the pairs this warp writes.
+    bool sheet_on[2];
+    int q_begin[2];
+    int q_end[2];
+    int n_q = 0;
+#pragma unroll
+    for (int s = 0; s < 2; ++s) {
+      const int group = 2 * port_q + s;
+      q_begin[s] = max(group * n_impact_bins, p + 1);
+      q_end[s] = (group + 1) * n_impact_bins;
+      sheet_on[s] = q_begin[s] < q_end[s];
+      n_q += sheet_on[s] ? q_end[s] - q_begin[s] : 0;
+    }
+
+    // every lane forms the seed power as the per-pair kernel does
+    const int bp = 2 * cell + sheet_p;
+    const int seed_begin = offsets[bp];
+    const int seed_end = offsets[bp + 1];
+    double seed_power = 0.0;
+    bool has_seed = false;
+    for (int k = seed_begin; k < seed_end; ++k) {
+      if (in_limiter[k] != 0) {
+        continue;
+      }
+      if (ray_bin[ray_index[k]] != bin_p) {
+        continue;
+      }
+      has_seed = true;
+      seed_power += power[k];
+    }
+    if (lane == 0 && has_seed) {
+      atomicAdd(&counters[0], static_cast<unsigned long long>(n_q));
+    }
+
+    double numerator[2] = {0.0, 0.0};
+    double denominator[2] = {0.0, 0.0};
+    bool has_pump[2] = {false, false};
+    if (seed_power > 0.0) {
+      const double* frame_p = frames9 + 9 * port_p;
+      const double* frame_q = frames9 + 9 * port_q;
+      for (int chunk = seed_begin; chunk < seed_end; chunk += 32) {
+        const int k_lane = chunk + lane;
+        const bool seed_record = k_lane < seed_end && in_limiter[k_lane] == 0 &&
+                                 ray_bin[ray_index[k_lane]] == bin_p;
+        const unsigned int records = __ballot_sync(0xffffffffU, seed_record);
+        const int n_items = __popc(records) * n_section_phi;
+        for (int item_base = 0; item_base < n_items; item_base += 32) {
+          const int item = item_base + lane;
+          if (item < n_items) {
+            ChiTerm term;
+            term.flags = 0;
+            // the (item / n_section_phi)-th seed record of the chunk, in table order
+            unsigned int remaining = records;
+            for (int skip = item / n_section_phi; skip > 0; --skip) {
+              remaining &= remaining - 1U;
+            }
+            const int k = chunk + __ffs(static_cast<int>(remaining)) - 1;
+            const int m = item % n_section_phi;
+            const double seed_weight = power[k] / seed_power;
+            term.seed_weight = seed_weight;
+            const double phi =
+                (static_cast<double>(m) + 0.5) * 2.0 * kPi /
+                static_cast<double>(n_section_phi);
+            const DeviceVec3 position =
+                device_lab_pos_dir(frame_p, theta[k], phi);
+            const DeviceVec3 seed_direction =
+                device_lab_dir(frame_p, theta[k], phi, alpha[k], sheet_p);
+
+            const double v1 =
+                position.x * frame_q[0] + position.y * frame_q[1] +
+                position.z * frame_q[2];
+            const double v2 =
+                position.x * frame_q[3] + position.y * frame_q[4] +
+                position.z * frame_q[5];
+            const double vb =
+                position.x * frame_q[6] + position.y * frame_q[7] +
+                position.z * frame_q[8];
+            const double theta_q =
+                ::acos(::fmin(::fmax(vb, -1.0), 1.0));
+            const double phi_q = ::atan2(v2, v1);
+            const DeviceFrameAngles q_angles = device_frame_angles(theta_q, phi_q);
+            const double mu_p = device_dot(seed_direction, position);
+            // Not unrolled: the body is the per-pair kernel's, so the compiler contracts the same
+            // multiply-adds (an unrolled pair of sheets changed the contraction of one sum).
+#pragma unroll 1
+            for (int s = 0; s < 2; ++s) {
+              term.pump_intensity[s] = 0.0;
+              term.polarization[s] = 0.0;
+              term.Pg[s] = 0.0;
+              if (!sheet_on[s]) {
+                continue;
+              }
+              double pump_intensity = 0.0;
+              double pump_alpha = 0.0;
+              const int bq = 2 * cell + s;
+              if (!chi_lookup(offsets, theta, alpha, power, area, in_limiter,
+                              bq, theta_q, &pump_intensity, &pump_alpha)) {
+                continue;
+              }
+              term.flags |= 1 << (2 * s);
+              term.pump_intensity[s] = pump_intensity;
+
+              const DeviceVec3 pump_direction =
+                  device_lab_dir_from(frame_q, q_angles, pump_alpha, s);
+              const double cos_psi =
+                  device_dot(seed_direction, pump_direction);
+              const double mu_q = device_dot(pump_direction, position);
+              const double ka2 = ::fmax(2.0 * (1.0 - cos_psi), 0.0);
+              const double ka = cell_k_bar[cell] * ::sqrt(ka2);
+              if (ka < k_a_floor * cell_k_bar[cell] || ka <= 0.0) {
+                continue;
+              }
+
+              // every state of the port has the port's frequency
+              const double g =
+                  (omega_state[q_begin[s]] - omega_state[p] -
+                   cell_k_bar[cell] * cell_u_r[cell] * (mu_q - mu_p)) /
+                  (ka * ::fmax(cell_c_a[cell], 1.0e-30));
+              const double ga = g * alpha_iaw;
+              const double one_g2 = 1.0 - g * g;
+              const double Pg = ga / (ga * ga + one_g2 * one_g2);
+              const double polarization =
+                  0.25 * f_cbet * (1.0 + cos_psi * cos_psi);
+              term.flags |= 1 << (2 * s + 1);
+              term.polarization[s] = polarization;
+              term.Pg[s] = Pg;
+            }
+            terms[lane] = term;
+          }
+          __syncwarp();
+          if (lane == 0) {
+            const int count = min(32, n_items - item_base);
+            for (int j = 0; j < count; ++j) {
+              const ChiTerm& term = terms[j];
+              const double seed_weight = term.seed_weight;
+#pragma unroll 1
+              for (int s = 0; s < 2; ++s) {
+                if ((term.flags & (1 << (2 * s))) == 0) {
+                  continue;
+                }
+                const double pump_intensity = term.pump_intensity[s];
+                has_pump[s] = true;
+                denominator[s] += seed_weight * pump_intensity;
+                if ((term.flags & (1 << (2 * s + 1))) == 0) {
+                  continue;
+                }
+                const double polarization = term.polarization[s];
+                const double Pg = term.Pg[s];
+                numerator[s] +=
+                    seed_weight * pump_intensity * polarization * Pg;
+              }
+            }
+          }
+          __syncwarp();
+        }
+      }
+    }
+    if (lane == 0) {
+      // pair index of (p, q) = pair_base + q (the pairs in the order p, then q > p)
+      const std::int64_t pair_base = static_cast<std::int64_t>(p) * G_ps -
+                                     static_cast<std::int64_t>(p) * (p + 1) / 2 - p - 1;
+      const std::int64_t cell_base = static_cast<std::int64_t>(cell) * n_pairs;
+#pragma unroll
+      for (int s = 0; s < 2; ++s) {
+        if (!sheet_on[s]) {
+          continue;
+        }
+        if (has_pump[s]) {
+          atomicAdd(&counters[1], static_cast<unsigned long long>(q_end[s] - q_begin[s]));
+        }
+        if (denominator[s] > 0.0) {
+          const double value = cell_chi_pref[cell] * numerator[s] / denominator[s];
+          for (int q = q_begin[s]; q < q_end[s]; ++q) {
+            chi[cell_base + pair_base + q] = value;
+          }
+        }
+      }
+    }
+    __syncwarp();
   }
 }
 
@@ -394,6 +615,8 @@ struct ChiDeviceWorkspace::Impl {
   double* d_weight_state = nullptr;
   std::int16_t* d_pair_p = nullptr;
   std::int16_t* d_pair_q = nullptr;
+  std::int16_t* d_entry_p = nullptr;
+  std::int16_t* d_entry_port = nullptr;
   double* d_chi = nullptr;
   unsigned long long* d_readback = nullptr;
 
@@ -415,6 +638,8 @@ struct ChiDeviceWorkspace::Impl {
   std::size_t cap_weight_state = 0;
   std::size_t cap_pair_p = 0;
   std::size_t cap_pair_q = 0;
+  std::size_t cap_entry_p = 0;
+  std::size_t cap_entry_port = 0;
   std::size_t cap_chi = 0;
   std::size_t cap_readback = 0;
 
@@ -424,6 +649,9 @@ struct ChiDeviceWorkspace::Impl {
   std::vector<double> weight_state;
   std::vector<std::int16_t> pair_p;
   std::vector<std::int16_t> pair_q;
+  // the (seed state p, pump port) entries of build_chi_ps_warp_kernel: the ports holding a q > p
+  std::vector<std::int16_t> entry_p;
+  std::vector<std::int16_t> entry_port;
   std::vector<double> port_delta_lambda_nm;
   std::vector<double> port_power_weight;
   std::array<unsigned long long, 4> host_readback{};
@@ -489,6 +717,12 @@ struct ChiDeviceWorkspace::Impl {
     }
     if (d_pair_q != nullptr) {
       static_cast<void>(cudaFree(d_pair_q));
+    }
+    if (d_entry_p != nullptr) {
+      static_cast<void>(cudaFree(d_entry_p));
+    }
+    if (d_entry_port != nullptr) {
+      static_cast<void>(cudaFree(d_entry_port));
     }
     if (d_chi != nullptr) {
       static_cast<void>(cudaFree(d_chi));
@@ -572,6 +806,14 @@ ChiBuildDeviceView build_chi_ps_device_ws(
         workspace->pair_q.push_back(static_cast<std::int16_t>(q));
       }
     }
+    for (int p = 0; p < G_ps; ++p) {
+      for (int port = 0; port < n_ports; ++port) {
+        if ((port + 1) * static_cast<int>(G_ref) > p + 1) {  // a state q > p in the port
+          workspace->entry_p.push_back(static_cast<std::int16_t>(p));
+          workspace->entry_port.push_back(static_cast<std::int16_t>(port));
+        }
+      }
+    }
 
     ensure_device_capacity(
         &workspace->d_frames9, &workspace->cap_frames9,
@@ -588,6 +830,12 @@ ChiBuildDeviceView build_chi_ps_device_ws(
     ensure_device_capacity(
         &workspace->d_pair_q, &workspace->cap_pair_q,
         workspace->pair_q.size(), "chi ws pair_q allocation failed");
+    ensure_device_capacity(
+        &workspace->d_entry_p, &workspace->cap_entry_p,
+        workspace->entry_p.size(), "chi ws entry_p allocation failed");
+    ensure_device_capacity(
+        &workspace->d_entry_port, &workspace->cap_entry_port,
+        workspace->entry_port.size(), "chi ws entry_port allocation failed");
     copy_to_device_async(
         workspace->d_frames9, workspace->frames9.data(),
         workspace->frames9.size(), stream, "chi ws frames upload failed");
@@ -603,6 +851,12 @@ ChiBuildDeviceView build_chi_ps_device_ws(
     copy_to_device_async(
         workspace->d_pair_q, workspace->pair_q.data(),
         workspace->pair_q.size(), stream, "chi ws pair_q upload failed");
+    copy_to_device_async(
+        workspace->d_entry_p, workspace->entry_p.data(),
+        workspace->entry_p.size(), stream, "chi ws entry_p upload failed");
+    copy_to_device_async(
+        workspace->d_entry_port, workspace->entry_port.data(),
+        workspace->entry_port.size(), stream, "chi ws entry_port upload failed");
     workspace->initialized = true;
   } else {
     bool unchanged =
@@ -625,65 +879,97 @@ ChiBuildDeviceView build_chi_ps_device_ws(
     TENRYU_ASSERT(unchanged, "chi ws: port geometry changed mid-run");
   }
 
-  sector_ps::flatten_table_into(*input.table, workspace->flat);
-  TENRYU_ASSERT(workspace->flat.n_shells >= input.n_cells,
-                "chi device: table/shell count mismatch");
+  // Table arrays the kernel reads: the device-built table as is, or the host table flattened
+  // and uploaded into the workspace.
+  const int* d_table_offsets = nullptr;
+  const double* d_table_theta = nullptr;
+  const double* d_table_alpha = nullptr;
+  const double* d_table_power = nullptr;
+  const double* d_table_area = nullptr;
+  const std::int32_t* d_table_ray_index = nullptr;
+  const std::uint8_t* d_table_in_limiter = nullptr;
+  const std::int32_t* d_table_ray_bin = nullptr;
+  if (input.device_table != nullptr) {
+    const S1DeviceTable& table = *input.device_table;
+    TENRYU_ASSERT(table.n_shells >= input.n_cells,
+                  "chi device: table/shell count mismatch");
+    d_table_offsets = table.offsets;
+    d_table_theta = table.theta;
+    d_table_alpha = table.alpha;
+    d_table_power = table.power;
+    d_table_area = table.area;
+    d_table_ray_index = table.ray_index;
+    d_table_in_limiter = table.in_limiter;
+    d_table_ray_bin = table.ray_bin;
+  } else {
+    sector_ps::flatten_table_into(*input.table, workspace->flat);
+    TENRYU_ASSERT(workspace->flat.n_shells >= input.n_cells,
+                  "chi device: table/shell count mismatch");
 
-  ensure_device_capacity(
-      &workspace->d_offsets, &workspace->cap_offsets,
-      workspace->flat.offsets.size(), "chi ws offsets allocation failed");
-  ensure_device_capacity(
-      &workspace->d_theta, &workspace->cap_theta,
-      workspace->flat.theta.size(), "chi ws theta allocation failed");
-  ensure_device_capacity(
-      &workspace->d_alpha, &workspace->cap_alpha,
-      workspace->flat.alpha.size(), "chi ws alpha allocation failed");
-  ensure_device_capacity(
-      &workspace->d_P, &workspace->cap_P, workspace->flat.P.size(),
-      "chi ws power allocation failed");
-  ensure_device_capacity(
-      &workspace->d_area, &workspace->cap_area,
-      workspace->flat.area.size(), "chi ws area allocation failed");
-  ensure_device_capacity(
-      &workspace->d_ray_index, &workspace->cap_ray_index,
-      workspace->flat.ray_index.size(),
-      "chi ws ray_index allocation failed");
-  ensure_device_capacity(
-      &workspace->d_in_limiter, &workspace->cap_in_limiter,
-      workspace->flat.in_limiter.size(),
-      "chi ws limiter allocation failed");
-  ensure_device_capacity(
-      &workspace->d_ray_bin, &workspace->cap_ray_bin,
-      static_cast<std::size_t>(input.n_rays),
-      "chi ws ray_bin allocation failed");
+    ensure_device_capacity(
+        &workspace->d_offsets, &workspace->cap_offsets,
+        workspace->flat.offsets.size(), "chi ws offsets allocation failed");
+    ensure_device_capacity(
+        &workspace->d_theta, &workspace->cap_theta,
+        workspace->flat.theta.size(), "chi ws theta allocation failed");
+    ensure_device_capacity(
+        &workspace->d_alpha, &workspace->cap_alpha,
+        workspace->flat.alpha.size(), "chi ws alpha allocation failed");
+    ensure_device_capacity(
+        &workspace->d_P, &workspace->cap_P, workspace->flat.P.size(),
+        "chi ws power allocation failed");
+    ensure_device_capacity(
+        &workspace->d_area, &workspace->cap_area,
+        workspace->flat.area.size(), "chi ws area allocation failed");
+    ensure_device_capacity(
+        &workspace->d_ray_index, &workspace->cap_ray_index,
+        workspace->flat.ray_index.size(),
+        "chi ws ray_index allocation failed");
+    ensure_device_capacity(
+        &workspace->d_in_limiter, &workspace->cap_in_limiter,
+        workspace->flat.in_limiter.size(),
+        "chi ws limiter allocation failed");
+    ensure_device_capacity(
+        &workspace->d_ray_bin, &workspace->cap_ray_bin,
+        static_cast<std::size_t>(input.n_rays),
+        "chi ws ray_bin allocation failed");
 
-  copy_to_device_async(
-      workspace->d_offsets, workspace->flat.offsets.data(),
-      workspace->flat.offsets.size(), stream, "chi ws offsets upload failed");
-  copy_to_device_async(
-      workspace->d_theta, workspace->flat.theta.data(),
-      workspace->flat.theta.size(), stream, "chi ws theta upload failed");
-  copy_to_device_async(
-      workspace->d_alpha, workspace->flat.alpha.data(),
-      workspace->flat.alpha.size(), stream, "chi ws alpha upload failed");
-  copy_to_device_async(
-      workspace->d_P, workspace->flat.P.data(),
-      workspace->flat.P.size(), stream, "chi ws power upload failed");
-  copy_to_device_async(
-      workspace->d_area, workspace->flat.area.data(),
-      workspace->flat.area.size(), stream, "chi ws area upload failed");
-  copy_to_device_async(
-      workspace->d_ray_index, workspace->flat.ray_index.data(),
-      workspace->flat.ray_index.size(), stream,
-      "chi ws ray_index upload failed");
-  copy_to_device_async(
-      workspace->d_in_limiter, workspace->flat.in_limiter.data(),
-      workspace->flat.in_limiter.size(), stream,
-      "chi ws limiter upload failed");
-  copy_to_device_async(
-      workspace->d_ray_bin, input.ray_bin,
-      static_cast<std::size_t>(input.n_rays), stream,
-      "chi ws ray_bin upload failed");
+    copy_to_device_async(
+        workspace->d_offsets, workspace->flat.offsets.data(),
+        workspace->flat.offsets.size(), stream, "chi ws offsets upload failed");
+    copy_to_device_async(
+        workspace->d_theta, workspace->flat.theta.data(),
+        workspace->flat.theta.size(), stream, "chi ws theta upload failed");
+    copy_to_device_async(
+        workspace->d_alpha, workspace->flat.alpha.data(),
+        workspace->flat.alpha.size(), stream, "chi ws alpha upload failed");
+    copy_to_device_async(
+        workspace->d_P, workspace->flat.P.data(),
+        workspace->flat.P.size(), stream, "chi ws power upload failed");
+    copy_to_device_async(
+        workspace->d_area, workspace->flat.area.data(),
+        workspace->flat.area.size(), stream, "chi ws area upload failed");
+    copy_to_device_async(
+        workspace->d_ray_index, workspace->flat.ray_index.data(),
+        workspace->flat.ray_index.size(), stream,
+        "chi ws ray_index upload failed");
+    copy_to_device_async(
+        workspace->d_in_limiter, workspace->flat.in_limiter.data(),
+        workspace->flat.in_limiter.size(), stream,
+        "chi ws limiter upload failed");
+    copy_to_device_async(
+        workspace->d_ray_bin, input.ray_bin,
+        static_cast<std::size_t>(input.n_rays), stream,
+        "chi ws ray_bin upload failed");
+    d_table_offsets = workspace->d_offsets;
+    d_table_theta = workspace->d_theta;
+    d_table_alpha = workspace->d_alpha;
+    d_table_power = workspace->d_P;
+    d_table_area = workspace->d_area;
+    d_table_ray_index = workspace->d_ray_index;
+    d_table_in_limiter = workspace->d_in_limiter;
+    d_table_ray_bin = workspace->d_ray_bin;
+  }
 
   const double* d_cell_chi_pref = dev_fields.d_chi_pref;
   const double* d_cell_c_a = dev_fields.d_c_a;
@@ -774,16 +1060,35 @@ ChiBuildDeviceView build_chi_ps_device_ws(
     constexpr int threads_per_block = 256;
     const int blocks = static_cast<int>(
         (total + threads_per_block - 1) / threads_per_block);
-    build_chi_ps_kernel<<<blocks, threads_per_block, 0, stream>>>(
-        workspace->d_offsets, workspace->d_theta, workspace->d_alpha,
-        workspace->d_P, workspace->d_area, workspace->d_ray_index,
-        workspace->d_in_limiter, workspace->d_ray_bin, d_cell_chi_pref,
-        d_cell_c_a, d_cell_u_r, d_cell_k_bar, d_cell_mask,
-        workspace->d_frames9, workspace->d_omega_state,
-        workspace->d_pair_p, workspace->d_pair_q, workspace->d_chi,
-        workspace->d_readback, input.f_cbet, input.alpha_iaw,
-        input.k_a_floor, input.n_section_phi, static_cast<int>(G_ref),
-        input.n_impact_bins, n_pairs, input.n_cells);
+    if (input.per_pair_reference) {
+      build_chi_ps_pair_kernel<<<blocks, threads_per_block, 0, stream>>>(
+          d_table_offsets, d_table_theta, d_table_alpha,
+          d_table_power, d_table_area, d_table_ray_index,
+          d_table_in_limiter, d_table_ray_bin, d_cell_chi_pref,
+          d_cell_c_a, d_cell_u_r, d_cell_k_bar, d_cell_mask,
+          workspace->d_frames9, workspace->d_omega_state,
+          workspace->d_pair_p, workspace->d_pair_q, workspace->d_chi,
+          workspace->d_readback, input.f_cbet, input.alpha_iaw,
+          input.k_a_floor, input.n_section_phi, static_cast<int>(G_ref),
+          input.n_impact_bins, n_pairs, input.n_cells);
+    } else {
+      const int n_entries = static_cast<int>(workspace->entry_p.size());
+      const std::int64_t entry_warps =
+          static_cast<std::int64_t>(input.n_cells) * n_entries;
+      const int warp_blocks = static_cast<int>(std::min<std::int64_t>(
+          (entry_warps + kChiWarpsPerBlock - 1) / kChiWarpsPerBlock, kChiMaxBlocks));
+      build_chi_ps_warp_kernel<<<warp_blocks, kChiThreadsPerBlock, 0, stream>>>(
+          d_table_offsets, d_table_theta, d_table_alpha,
+          d_table_power, d_table_area, d_table_ray_index,
+          d_table_in_limiter, d_table_ray_bin, d_cell_chi_pref,
+          d_cell_c_a, d_cell_u_r, d_cell_k_bar, d_cell_mask,
+          workspace->d_frames9, workspace->d_omega_state,
+          workspace->d_entry_p, workspace->d_entry_port,
+          workspace->d_chi, workspace->d_readback, input.f_cbet,
+          input.alpha_iaw, input.k_a_floor, input.n_section_phi,
+          static_cast<int>(G_ref), input.n_impact_bins, G_ps, n_entries, n_pairs,
+          input.n_cells);
+    }
     chi_device_check(cudaGetLastError(), "chi device kernel launch failed");
 
     audit_chi_kernel<<<blocks, threads_per_block, 0, stream>>>(

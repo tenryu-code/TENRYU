@@ -2600,6 +2600,48 @@ __device__ inline void ray_trace_1d_sph_body(const int ray,
 }
 
 
+// v[0] + v[stride] + ... + v[(n - 1) stride], added one by one in index order
+// from +0 (the one-row loop's sum), with the loads issued ahead of the
+// additions: the next 16 values are loaded before the current 16 are added,
+// so the chain of additions does not wait for each batch's loads (2026-10-02;
+// eight rows loaded and then added took 72 us per call over 1000 rays).
+__device__ inline double ordered_strided_sum(const double* __restrict__ v,
+                                             const std::size_t stride, const int n) {
+  constexpr int kBatch = 16;
+  double acc = 0.0;
+  int r = 0;
+  if (n >= kBatch) {
+    double cur[kBatch];
+#pragma unroll
+    for (int i = 0; i < kBatch; ++i) {
+      cur[i] = v[static_cast<std::size_t>(i) * stride];
+    }
+    for (r = kBatch; r + kBatch <= n; r += kBatch) {
+      double next[kBatch];
+#pragma unroll
+      for (int i = 0; i < kBatch; ++i) {
+        next[i] = v[static_cast<std::size_t>(r + i) * stride];
+      }
+#pragma unroll
+      for (int i = 0; i < kBatch; ++i) {
+        acc += cur[i];
+      }
+#pragma unroll
+      for (int i = 0; i < kBatch; ++i) {
+        cur[i] = next[i];
+      }
+    }
+#pragma unroll
+    for (int i = 0; i < kBatch; ++i) {
+      acc += cur[i];
+    }
+  }
+  for (; r < n; ++r) {
+    acc += v[static_cast<std::size_t>(r) * stride];
+  }
+  return acc;
+}
+
 __device__ inline void reduce_per_ray_tallies_1d_body(
     const int c,
     const double* __restrict__ deposit_per_ray,
@@ -2617,44 +2659,16 @@ __device__ inline void reduce_per_ray_tallies_1d_body(
   // owns exactly one output slot, so the trailing atomic adds have a single
   // writer per launch and beam launches accumulate in stream order.
   if (c < n_cells) {
-    // Eight rows' loads issued together, then added in ray order (the same
-    // sum as the one-row loop; 2026-09-25: the loop was latency-bound).
-    double acc = 0.0;
-    const std::size_t stride = static_cast<std::size_t>(n_cells);
-    const double* __restrict__ column = deposit_per_ray + static_cast<std::size_t>(c);
-    int r = 0;
-    for (; r + 8 <= n_rays; r += 8) {
-      const std::size_t o = static_cast<std::size_t>(r) * stride;
-      const double v0 = column[o];
-      const double v1 = column[o + stride];
-      const double v2 = column[o + 2 * stride];
-      const double v3 = column[o + 3 * stride];
-      const double v4 = column[o + 4 * stride];
-      const double v5 = column[o + 5 * stride];
-      const double v6 = column[o + 6 * stride];
-      const double v7 = column[o + 7 * stride];
-      acc += v0;
-      acc += v1;
-      acc += v2;
-      acc += v3;
-      acc += v4;
-      acc += v5;
-      acc += v6;
-      acc += v7;
-    }
-    for (; r < n_rays; ++r) {
-      acc += column[static_cast<std::size_t>(r) * stride];
-    }
+    // Cell c's column of the rows, in ray order.
+    const double acc = ordered_strided_sum(deposit_per_ray + static_cast<std::size_t>(c),
+                                           static_cast<std::size_t>(n_cells), n_rays);
     if (acc != 0.0) {
       atomic_add_double(&deposit_1d[c], acc);
     }
     return;
   }
   if (c == n_cells && unabsorbed_per_ray != nullptr && P_unabsorbed != nullptr) {
-    double acc = 0.0;
-    for (int r = 0; r < n_rays; ++r) {
-      acc += unabsorbed_per_ray[r];
-    }
+    const double acc = ordered_strided_sum(unabsorbed_per_ray, 1, n_rays);
     if (acc != 0.0) {
       atomic_add_double(P_unabsorbed, acc);
     }
@@ -2662,19 +2676,13 @@ __device__ inline void reduce_per_ray_tallies_1d_body(
   }
   if (c == n_cells + 1 && tail_power_per_ray != nullptr &&
       tail_closure_absorbed_power != nullptr) {
-    double acc = 0.0;
-    for (int r = 0; r < n_rays; ++r) {
-      acc += tail_power_per_ray[r];
-    }
+    const double acc = ordered_strided_sum(tail_power_per_ray, 1, n_rays);
     if (acc != 0.0) {
       atomic_add_double(tail_closure_absorbed_power, acc);
     }
   }
   if (c == n_cells + 2 && ra_per_ray != nullptr && d_ra_total != nullptr) {
-    double acc = 0.0;
-    for (int r = 0; r < n_rays; ++r) {
-      acc += ra_per_ray[r];
-    }
+    const double acc = ordered_strided_sum(ra_per_ray, 1, n_rays);
     if (acc != 0.0) {
       atomic_add_double(d_ra_total, acc);
     }

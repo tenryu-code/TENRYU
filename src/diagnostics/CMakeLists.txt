@@ -1,5 +1,6 @@
 add_library(tenryu_diagnostics STATIC
   diagnostics.cu
+  history_1d_gpu.cu
   history_shape_diag_device.cu
   energy_budget.cu
   operator_energy_residuals.cu
@@ -12,7 +13,7 @@ add_library(tenryu_diagnostics STATIC
   history_writer.cpp
 )
 
-set_source_files_properties(history_shape_diag_device.cu
+set_source_files_properties(history_shape_diag_device.cu history_1d_gpu.cu
   PROPERTIES COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CUDA>:-fmad=false>"
 )
 

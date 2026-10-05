@@ -116,13 +116,13 @@ Strang splitting 内は逐次のため同時使用なし。
 
 | モジュール | ファイル | 主なカーネル |
 |---|---|---|
-| 流体（Lagrange） | `hydro/hydro_1d.cu` | `predictor_update_kernel`・`corrector_update_kernel`・`compute_acceleration_1d_kernel`・`compute_density_kernel`・`energy_update_with_old_volume{,_2t}_kernel`・`compatible_energy_update_1d_kernel`・`enforce_1t/2t_closure_kernel`・`compute_sound_speed_1t/2t{,_split}_kernel`・`apply_qei_transfer_2t_kernel`・`find_nonpositive_volume_1d_kernel`・`follow_void_nodes_1d_kernel`・`signed_energy_cells_kernel` ほか |
+| 流体（Lagrange） | `hydro/hydro_1d.cu` | `predictor_update_kernel`・`corrector_update_kernel`・`compute_acceleration_1d_kernel`・`compute_density_kernel`・`energy_update_with_old_volume{,_2t}_kernel`・`compatible_energy_update_1d_kernel`・`enforce_1t/2t_closure_kernel`・`compute_sound_speed_1t/2t{,_split}_kernel`・`apply_qei_transfer_2t_kernel`・`find_nonpositive_volume_1d_kernel`・`follow_void_nodes_1d_kernel`・`signed_energy_cells_kernel`・`hk_dominant_material_1d_kernel`・`hk_velocity_front_cells_1d_kernel`・`hk_velocity_near_front_1d_kernel` ほか |
 | 人工粘性 | `hydro/artificial_viscosity.cu` | `compute_node_sigma_1d_kernel`・`compute_q_1d_kernel`（VNR）・`compute_q_csw_1d_kernel`（既定）・`compute_q_riemann{,_compatible}_1d_kernel`・`compute_artificial_heat_1d_kernel`・`add_bulk_viscosity_1d_kernel` |
 | 時間刻み | `hydro/cfl.cu` | `cfl_1d_kernel`・`cfl_1d_lineage_argmin_kernel`・`volume_rate_cfl_*_kernel` |
 | 電子・イオン熱伝導 | `hydro/conduction.cu`、`hydro/conduction_snb_1d.cu` | `compute_spitzer_deff_1d_kernel`・`compute_1d_face_kappa_kernel`・`conduction_1d_sts_stage{,_kirchhoff,_secant}_kernel`・`conduction_1d_sts_fused_kirchhoff_kernel`・`build_1d_implicit_system{,_kirchhoff}_kernel`・`implicit_conduction_flux_form_kernel`・`ion_conduction_*_kernel`・`snb_*_kernel` |
-| 平均電荷 | `materials/zbar_device.cu` | `update_zbar_fields_kernel` |
+| 平均電荷 | `materials/zbar_device.cu` | `update_zbar_fields_kernel`（TMAT 以外の材料を含む Thomas–Fermi は host の丸め: `zbar_tf_host_rounding.cuh`） |
 | FLD | `radiation/fld_1d_gpu.cu` | `assemble_fld_tridiag_kernel`・`update_matter_kernel`・`fld_grey_*_kernel`（灰色加速）・`compute_fleck_for_fld_kernel`・`compute_marshak_finc_kernel` ほか |
-| S\(_N\) | `radiation/sn_ld_1d_gpu.cu`（LD、既定）、`radiation/sn_transport_1d_gpu.cu`（LC 系）、`radiation/sn_dsa_1d_gpu.cu` | `sweep_kernel`・`moments_kernel`・`p1_*_kernel`（前処理）・`matter_update_kernel`／`sn_sweep_spherical_lc_kernel`・`sn_sweep_spherical_serial_kernel` ほか／`assemble_sn_dsa_consistent_kernel` |
+| S\(_N\) | `radiation/sn_ld_1d_gpu.cu`（LD、既定）、`radiation/sn_transport_1d_gpu.cu`（LC 系）、`radiation/sn_dsa_1d_gpu.cu` | `scan_sweep_kernel`・`sweep_kernel`・`moments_kernel`・`p1_*_kernel`（前処理）・`matter_update_kernel`／`sn_sweep_spherical_lc_kernel`・`sn_sweep_spherical_serial_kernel`・`sn_marshak_inflow_1d_kernel` ほか／`assemble_sn_dsa_consistent_kernel` |
 | レーザー | `laser/*.cu` | §1.4 の表 |
 | 燃焼 | `burn/burn_stage_gpu.cu`、`burn/network_gpu.cu`、`burn/mc_transport.cu`、`burn/corman_diffusion.cu` | `burn_stage_main_1d_kernel`・`burn_network_apply_1d_kernel`・`burn_neutron_*_1d_kernel`・MC α の `spawn/transport/compact_kernel`・多群拡散の `assemble_group_kernel` ほか |
 | 安全検査 | `coupling/driver_safety_audit.cu` | `temperature_audit_kernel`・`phase_safety_violation_kernel`・`overshoot_metrics_kernel` |
@@ -180,10 +180,10 @@ Strang splitting 内は逐次のため同時使用なし。
 
 | ファイル | カーネル | 役割 |
 |---|---|---|
-| `laser_mesh.cu` | `map_hydro_to_laser_1d_kernel`・`map_node_material_1d_kernel`・`build_trace_profile_nodes_1d_parallel_kernel` | 1D の写像（2D レーザー格子の節点と、光線追跡用の径方向プロファイル節点） |
+| `laser_mesh.cu` | `map_hydro_to_laser_1d_kernel`・`map_node_material_1d_kernel`・`trace_profile_{plan,count,tail_count,write,tail_write,finish}_1d_kernel` | 1D の写像（2D レーザー格子の節点と、光線追跡用の径方向プロファイル節点） |
 | `laser_mesh.cu` | `compute_radial_gradient_kernel`・`compute_gradient_kernel`・`compute_smooth_kappa{,_ext}_kernel`・`extract_radial_profile_kernel`・`extract_radial_te_kernel` | 勾配、逆制動輻射の smooth 係数、軸の列の取り出し |
 | `ray_init.cu` | `initialize_rays_1d_geometry_kernel` | 1D の円筒・平板の光線の初期化 |
-| `ray_trace.cu` | `ray_trace_1d_characteristic`（1D 既定）・`build_characteristic_breakpoints_kernel`・`build_characteristic_piece_info_kernel` | 特性線に沿った区間ごとの求積（NUMERICS §5.3.6） |
+| `ray_trace.cu` | `ray_trace_1d_characteristic`（1D 既定）・`build_characteristic_breakpoints_kernel`・`build_characteristic_piece_info_kernel` | 特性線に沿った区間ごとの求積（NUMERICS §5.3.6）。復路は往路の区間積分をレイごとの表から使う（`Laser.raytrace.reuse_inward_integrals`、§5.3.6 (c'')） |
 | `ray_trace.cu` | `ray_trace_1d_sph`（`integrator="leapfrog"`）・`reduce_per_ray_tallies_1d_kernel`・`sum_absorbed_power_per_ray_1d_kernel` | 刻み幅可変の Verlet（leapfrog）積分と光線ごとの集計 |
 | `ray_trace.cu` | `ray_trace_3d`（2D_RZ の光線追跡、レーザー格子の節点へ沈着）・`ray_trace_2d`（検証ハーネス `tenryu verify` だけが呼ぶ） | |
 | `ray_trace.cu` | `radial_absorption_1d_kernel` | `mode="radial_absorption_1d"`（§5.4） |
@@ -192,7 +192,7 @@ Strang splitting 内は逐次のため同時使用なし。
 | `raytrace_skip.cu` | `ray_skip_check_kernel`・`reconstruct_laser_dep_kernel` | レイトレースの省略判定と沈着の再構成 |
 | `deposit_transfer.cu` | `transfer_2d_kernel` | 2D_RZ のレーザー格子 → 流体セル |
 | `cbet.cu` | `cbet_*_kernel`（19 本） | CBET の記録・交換・伝播（1D と 2D_RZ） |
-| `port_section_chi.cu` | `build_chi_ps_kernel`・`audit_chi_kernel` | 断面ポートの CBET 相空間 |
+| `port_section_chi.cu` | `build_chi_ps_warp_kernel`（参照: `build_chi_ps_pair_kernel`）・`audit_chi_kernel` | 断面ポートの CBET 相空間 |
 | `hot_electron_1d_gpu.cu`・`hot_electron_2d_gpu.cu` | `hot_e_cone_chord_kernel`・`hot_e_reduce_rows_kernel`・`hot_e_cone_2d_chord_kernel` | 熱電子の円錐の弦に沿った沈着 |
 
 ### 1.5 Radiation

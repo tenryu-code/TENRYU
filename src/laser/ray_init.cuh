@@ -77,6 +77,16 @@ RayArray1D initialize_rays_1d(const Beam& beam,
                               cudaStream_t stream = nullptr,
                               int azimuthal_rays = 1);
 
+// initialize_rays_1d with the ring weights, their sum and the sphere's rays computed on the host
+// (the production function computes them on the device, ray_init_1d_gpu.cuh): the reference of the
+// tests.
+RayArray1D initialize_rays_1d_host_reference(const Beam& beam,
+                                             const LaserMesh& lmesh,
+                                             int rays_per_beam,
+                                             double beam_power,
+                                             cudaStream_t stream = nullptr,
+                                             int azimuthal_rays = 1);
+
 // Most rays initialize_rays_1d returns per beam for the mesh's geometry.
 int max_rays_1d_per_beam(const LaserMesh& lmesh, int rays_per_beam, int azimuthal_rays);
 

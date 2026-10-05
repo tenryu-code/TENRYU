@@ -168,6 +168,13 @@ void enumerate_snapshot_fields(
   TENRYU_SNAPSHOT_FIELD(burn_mc_w);
   TENRYU_SNAPSHOT_FIELD(burn_mc_slot);
   TENRYU_SNAPSHOT_FIELD(burn_mc_alive);
+  // The 1D burn stage's device copies (sized at setup in a 1D burn run, empty otherwise).
+  TENRYU_SNAPSHOT_FIELD(burn_n_dev);
+  TENRYU_SNAPSHOT_FIELD(burn_rate_dev);
+  TENRYU_SNAPSHOT_FIELD(burn_Q_e_dev);
+  TENRYU_SNAPSHOT_FIELD(burn_Q_i_dev);
+  TENRYU_SNAPSHOT_FIELD(burn_eps_cum_dev);
+  TENRYU_SNAPSHOT_FIELD(burn_neutron_cum_dev);
   TENRYU_SNAPSHOT_FIELD(x_r);
   TENRYU_SNAPSHOT_FIELD(x_z);
   TENRYU_SNAPSHOT_FIELD(x_r_reference);
@@ -447,6 +454,8 @@ void capture_driver_retry_snapshot(DriverRetrySnapshot& snap,
   snap.burn_Q_i_host = state.burn_Q_i_host;
   snap.burn_eps_cum_host = state.burn_eps_cum_host;
   snap.burn_neutron_cum_host = state.burn_neutron_cum_host;
+  snap.burn_host_current = state.burn_host_current;
+  snap.burn_device_current = state.burn_device_current;
   snap.E_burn_released = state.E_burn_released;
   snap.E_burn_dep_e = state.E_burn_dep_e;
   snap.E_burn_dep_i = state.E_burn_dep_i;
@@ -732,6 +741,8 @@ void restore_driver_retry_snapshot(tenryu::core::State& state,
   state.burn_Q_i_host = snap.burn_Q_i_host;
   state.burn_eps_cum_host = snap.burn_eps_cum_host;
   state.burn_neutron_cum_host = snap.burn_neutron_cum_host;
+  state.burn_host_current = snap.burn_host_current;
+  state.burn_device_current = snap.burn_device_current;
   state.E_burn_released = snap.E_burn_released;
   state.E_burn_dep_e = snap.E_burn_dep_e;
   state.E_burn_dep_i = snap.E_burn_dep_i;
@@ -789,6 +800,8 @@ void restore_driver_retry_snapshot(tenryu::core::State& state,
       core::log_warning(log.str());
     }
     state.hydro_active = snap.hydro_active;
+    // The device mirror may hold the flags the failed attempt wrote: re-upload it.
+    state.note_hydro_active_host_write();
     state.state_supply_mask = snap.state_supply_mask;
     state.cell_is_void = snap.cell_is_void;
   }

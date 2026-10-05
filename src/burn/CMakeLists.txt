@@ -3,6 +3,8 @@ add_library(tenryu_burn STATIC
   burn_stage.hpp
   burn_stage_gpu.cu
   burn_stage_gpu.cuh
+  burn_inputs_1d_gpu.cu
+  burn_inputs_1d_gpu.cuh
   burn_stage_2d.cpp
   burn_stage_2d.hpp
   neutron_heating.cpp
@@ -37,6 +39,12 @@ target_link_libraries(tenryu_burn PUBLIC tenryu_core tenryu_parallel
 
 target_compile_options(tenryu_burn PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
+)
+
+# The field-ion means and the cumulative burn heating repeat the host loops' arithmetic: no
+# multiply-add contraction.
+set_source_files_properties(burn_inputs_1d_gpu.cu
+  PROPERTIES COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CUDA>:-fmad=false>"
 )
 
 set_target_properties(tenryu_burn PROPERTIES CUDA_SEPARABLE_COMPILATION ON)

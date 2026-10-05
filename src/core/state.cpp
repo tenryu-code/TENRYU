@@ -160,6 +160,36 @@ void apply_button_dormant_storage_mask(State& state,
 
 }  // namespace
 
+void State::sync_burn_arrays_to_device() {
+  if (burn_device_current) {
+    return;
+  }
+  const auto upload = [](DeviceBuffer<double>& dev, const std::vector<double>& host) {
+    dev.reset(host.size());
+    dev.copy_from_host(host);
+  };
+  upload(burn_n_dev, burn_n_host);
+  upload(burn_rate_dev, burn_rate_host);
+  upload(burn_Q_e_dev, burn_Q_e_host);
+  upload(burn_Q_i_dev, burn_Q_i_host);
+  upload(burn_eps_cum_dev, burn_eps_cum_host);
+  upload(burn_neutron_cum_dev, burn_neutron_cum_host);
+  burn_device_current = true;
+}
+
+void State::sync_burn_arrays_to_host() {
+  if (burn_host_current) {
+    return;
+  }
+  burn_n_dev.copy_to_host(burn_n_host);
+  burn_rate_dev.copy_to_host(burn_rate_host);
+  burn_Q_e_dev.copy_to_host(burn_Q_e_host);
+  burn_Q_i_dev.copy_to_host(burn_Q_i_host);
+  burn_eps_cum_dev.copy_to_host(burn_eps_cum_host);
+  burn_neutron_cum_dev.copy_to_host(burn_neutron_cum_host);
+  burn_host_current = true;
+}
+
 const std::int8_t* State::hydro_active_device_ptr() const {
   if (hydro_active.empty()) {
     return nullptr;
@@ -473,7 +503,6 @@ State State::allocate(const Config& cfg, const double hydro_t_start_eV) {
   state.ale_remaps_applied = 0;
   state.ale_last_applied_step = -1;
   state.reale_rezone_skipped = 0;
-  state.ale1d_floor_cooldown_remaining = 0;
   state.diff_ref_diag_baseline_initialized = false;
   state.diff_ref_diag_gas_mesh_volume_initial = 0.0;
   state.diff_ref_diag_gas_rho_p50_initial = 0.0;
@@ -1083,7 +1112,6 @@ void State::reset() {
   ale_remaps_applied = 0;
   ale_last_applied_step = -1;
   reale_rezone_skipped = 0;
-  ale1d_floor_cooldown_remaining = 0;
   diff_ref_diag_baseline_initialized = false;
   diff_ref_diag_gas_mesh_volume_initial = 0.0;
   diff_ref_diag_gas_rho_p50_initial = 0.0;

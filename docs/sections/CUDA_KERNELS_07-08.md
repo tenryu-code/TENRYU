@@ -6,6 +6,8 @@
 現行の注入はレーザーと燃焼の沈着だけ（`coupling/source_terms.cu`）：`prepare_laser_injection_kernel` がセルの
 \(c_{v,e}\) の閉包を用意し、`inject_laser_source_cells_kernel` が `laser_dep[c]` を \(e_e\) へ加え、退化セル
 （\(\rho V\) が小さすぎるセル）の分は `E_numerical_loss` に回す。`fold_laser_injection_ledger_kernel` が台帳を畳む。
+解析的 \(T^4\) 閉包（`cv_e_override` と `eos_T_ref_eV`、tabular 2T でないデッキ）のセルは host の `pow(x, 1/4)`
+（`core::glibc_libm`）で閉じる（`inject_laser_source_cells_kernel<true>`。2026-10-02 まで host で注入していた）。
 燃焼は `inject_burn_source_cells_kernel`。輻射の沈着 `rad_dep` は注入しない — FLD・\(S_N\) は物質の更新を自分の
 Newton の中で行う。本節にあった設計（`laser_dep` と `rad_dep` を合わせて注入する `source_injection` と、その
 二重計上防止プロトコル）は、モンテカルロ輻射の沈着の注入とともに退役し、
