@@ -1,6 +1,6 @@
 # xc5a_capsule_burnoff — XC-5a indirect-drive capsule implosion, burn OFF (TENRYU side).
 # MULTI pair: ops/xc/cases/xc5a_capsule_burnoff/multi.input.
-# Design: docs/design/xc_tenryu_multiife_1d_comparison_design_20260710.md §XC-5a.
+# Design: the internal design note xc_tenryu_multiife_1d_comparison_design_20260710.md §XC-5a.
 #
 # Synthetic 3-layer capsule with 2015IND-derived dimensions (doped layer merged
 # into the ablator): DT vapor fill 980 um @ 3e-4 | DT fuel 50 um @ 0.22053 |

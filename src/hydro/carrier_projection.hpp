@@ -3,7 +3,7 @@
 // Mass-orthogonal constrained projection of remapped boundary velocities onto
 // the carrier constraint space, per consult-29 response §11
 // (~/ai-consult/20260809-2254-ale-p2-consult29/response.md) and the C1 contract
-// docs/design/boundary_carrier_c1_20260810.md. This is standalone C2 machinery
+// the internal design note boundary_carrier_c1_20260810.md. This is standalone C2 machinery
 // with no dependence on State/StagedMesh; the parent wave wires it into the
 // ReALE epoch.
 

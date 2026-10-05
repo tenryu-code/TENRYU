@@ -51,7 +51,7 @@ enum class MultiblockTransitionScheme {
 
 // 1D radial geometry family selector, derived from Main.dimension
 // ("1D_SPH" -> Spherical, "1D_CYL" -> Cylindrical; B1 spec
-// docs/design/b1_1d_cyl_mode_spec.md). Cylindrical is per unit length
+// the internal design note b1_1d_cyl_mode_spec.md). Cylindrical is per unit length
 // in z: V = pi (r1^2 - r0^2), A(r) = 2 pi r.
 enum class Geometry1D {
   Spherical,
@@ -488,7 +488,7 @@ struct Config {
     // load-bearing for the seam-GCL constant-state gates; under strong drive
     // it deletes tangential restoring forces on the outer arc every step and
     // destabilizes the pole-adjacent outer cells
-    // (docs/design/bug25_csr_pole_axis_node_dynamics_20260720.md). Follow-up:
+    // (the internal design note bug25_csr_pole_axis_node_dynamics_20260720.md). Follow-up:
     // replace with a boundary-acceleration projection, then default-flip.
     bool multiblock_outer_svec_tangent_balance = true;
     FloorsConfig floors;
@@ -707,7 +707,7 @@ struct Config {
       // Heat-capacity source for the Fleck stiffness beta = 4*a_eV*Te^3/C_e.
       // "table": C_e from the SAME electron-EOS table the matter Newton
       // advances (Fleck & Cummings consistency; default since the 2026-07-11
-      // 2026-07-11 review — docs/design/fleck_cv_default_flip_20260711.md).
+      // 2026-07-11 review — the internal design note fleck_cv_default_flip_20260711.md).
       // "legacy": the pre-flip cv chain (override -> state cv -> ideal gas),
       // kept byte-identical as the explicit frozen compatibility mode.
       std::string fleck_cv_source = "table";
@@ -723,7 +723,7 @@ struct Config {
       // fixed-radiation scalar relaxation; 0 < f <= 1 and the stiff limit
       // keeps z*f -> 1 (the retired exp(-z) blend's z*f -> 0 failure mode
       // does not apply). 1D FLD only (2D fleck kernel is an independent
-      // implementation). Design: docs/design/fleck_exp_source_20260716.md.
+      // implementation). Design: the internal design note fleck_exp_source_20260716.md.
       std::string fleck_form = "be";
       // Matter-radiation source integrator for the 1D FLD step. "fleck"
       // (frozen default): the monolithic semi-implicit outer loop with the
@@ -735,8 +735,8 @@ struct Config {
       // diffusion solve with the exchange terms stripped; no outer Picard.
       // Second-order; 1-D Marshak feature gate green 2026-07-17 (still
       // opt-in — default flip is a user decision). Design:
-      // docs/design/fleck_exp_source_20260716.md section 3 and
-      // docs/design/exp_mg_phi1_20260717.md.
+      // the internal design note fleck_exp_source_20260716.md section 3 and
+      // the internal design note exp_mg_phi1_20260717.md.
       std::string source_integrator = "fleck";
       std::string state_supply_boundary_policy = "local_D_current";
       bool diagnostic_radial_fourier_substage_enabled = false;
@@ -1016,7 +1016,7 @@ struct Config {
     };
 
     // Multi-beam port table for the single-trace superposition modes
-    // (design doc docs/design/multibeam_1d_superposition_20260727.md §5;
+    // (the internal design note multibeam_1d_superposition_20260727.md §5;
     // Follett PoP 32, 022709 (2025) sector/section ray tracing).
     struct LaserPortConfig {
       int port_id = -1;                      // required, unique, >= 0
@@ -1052,7 +1052,7 @@ struct Config {
     };
 
     // Per-channel directional hot-electron source (multi-channel v2; design
-    // docs/design/hote_directional_sources_20260710.md §2). Struct
+    // the internal design note hote_directional_sources_20260710.md §2). Struct
     // initializers hold the "cone" defaults; mechanism-dependent defaults
     // (tpd/srs) are applied at parse time before per-key extraction.
     // eta_table wins over eta when detected (same precedence as the scalar
@@ -1086,7 +1086,7 @@ struct Config {
     };
 
     // Physics-model eta(t) shared knobs (eta_mode="model"; design doc
-    // docs/design/external-ai-responses/20260727-hote-eta-model-advice.md §18).
+    // the internal design note external-ai-responses/20260727-hote-eta-model-advice.md §18).
     struct HotEEtaModelConfig {
       double ln_filter_tau_s = 5.0e-12;  // EMA time constant for 1/L_n
       double eta_total_cap = 0.08;       // cap on the channel-sum efficiency
@@ -1202,7 +1202,7 @@ struct Config {
 
   // Nuclear burn kernel (1D_SPH): Bosch-Hale reactivities, per-cell
   // depletion network, Fraley or charged-product diffusion deposition.
-  // Design: docs/design/burn_kernel_1d_v1_design_20260710.md. Default OFF;
+  // Design: the internal design note burn_kernel_1d_v1_design_20260710.md. Default OFF;
   // enabled=false must be bitwise-identical to pre-burn binaries.
   struct BurnConfig {
     bool enabled = false;
@@ -1370,7 +1370,7 @@ struct Config {
       // Shock-approach detector (shock-ahead reorientation S-A, read-only):
       // every N steps, bin the theta-averaged cell pressure radially, locate
       // the |dp/ds| ridge, and log the fitted inward speed and the predicted
-      // arrival time at target_radius_cm (docs/design/
+      // arrival time at target_radius_cm (the internal design notes
       // shock_ahead_button_reorientation_20260720.md).
       struct ShockApproachConfig {
         bool enabled = false;
@@ -1903,7 +1903,7 @@ struct Config {
       std::string solver = "sts";  // "sts" | "implicit" | "hypre"
       // "net" (legacy): alpha from net power, pairs scaled by min(alpha_c, alpha_nb).
       // "donor": alpha from the outflow sum, each pair scaled by its donor's alpha —
-      // guarantees Te_trial >= floor (Te-floor guarantee fix, docs/design/bug18_...20260712.md).
+      // guarantees Te_trial >= floor (Te-floor guarantee fix, the internal design note bug18_...20260712.md).
       std::string sts_floor_limiter = "net";
       // Braginskii ion heat conduction (1D, 2T): an implicit solve of the ion
       // temperature after the electron conduction, flux-limited to ion_f_lim
@@ -1934,8 +1934,8 @@ struct Config {
       // analytically identical under both policies).
       std::string face_kappa_policy = "kirchhoff_same_material";
       // SNB nonlocal electron heat transport (1D + 2D_RZ opt-in; designs
-      // docs/design/snb_nonlocal_1d_20260710.md and
-      // docs/design/2d_snb_port_spec.md). "none" preserves the legacy
+      // the internal design note snb_nonlocal_1d_20260710.md and
+      // the internal design note 2d_snb_port_spec.md). "none" preserves the legacy
       // local Spitzer-Harm + flux-limiter path bit-for-bit.
       std::string nonlocal_model = "none";  // "none" | "snb"
       int snb_n_groups = 24;
@@ -2007,7 +2007,7 @@ struct Config {
       // "lagrangian": placeholder for unconstrained Lagrangian axis motion (NOT IMPLEMENTED).
       std::string axis_z_motion = "fixed";
       double winslow_axis_kappa = 0.7;
-      // Shock-ahead button morph (S-C, docs/design/shock_ahead_button_reorientation_20260720.md):
+      // Shock-ahead button morph (S-C, the internal design note shock_ahead_button_reorientation_20260720.md):
       // time-scheduled conservative reorientation of the multiblock button core+bridge toward
       // the Shirley-Chiu equal-volume spherical target. Runs inside the multiblock CSR ALE step
       // as a prescribed-target transactional rezone+remap; default OFF (bit-frozen).

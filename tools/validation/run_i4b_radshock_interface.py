@@ -8,7 +8,7 @@ Tiers:
     because the mesh advects by tens of cm under Lagrangian-dominant motion.
   cert (campaign): legs A+B across a resolution pair, LE08 anchor, and
     shock-windowed L2 comparison against a fine reference; see
-    docs/design/i4_mm_rad_interface_spec.md Addendum 6.
+    the internal design note i4_mm_rad_interface_spec.md Addendum 6.
 """
 
 from __future__ import annotations

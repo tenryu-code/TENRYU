@@ -2,7 +2,7 @@
 """Generate static-material grey S_N radiative-shock references.
 
 This is the I3 W0 in-house reference from
-``docs/design/i3_sn_equation_audit.md`` section 7.  It solves the steady
+the internal design note i3_sn_equation_audit.md section 7.  It solves the steady
 shock-frame, radiation-momentum-free system
 
     mu_l d psi_l / dz = sigma_a (0.5 c a T**4 - psi_l)
@@ -10,7 +10,7 @@ shock-frame, radiation-momentum-free system
 with TENRYU's azimuth-summed polar Gauss-Legendre normalization, sum(w)=2.
 The default closure is S_N; ``--closure ced`` is a strict adapter to the
 existing constant-Eddington generator and exists only for the self-identity
-check in ``docs/design/i3_sn_radshock_spec.md`` section 4.1.
+check in the internal design note i3_sn_radshock_spec.md section 4.1.
 """
 
 from __future__ import annotations

@@ -39,7 +39,7 @@ grid_size は原則 `(N + block_size - 1) / block_size` で算出する。
 
 ### 0.2b 型安全・オーバーフロー制約
 
-- **粒子数**: `N_p_total`, `N_total` は `int`（int32）。v1.0 の最大粒子数は 2^31-1 ≈ 21.5億。PERFORMANCE P1-P3 の上限 ~10M 粒子では十分。将来 >2B 粒子が必要な場合は `int64_t` 移行を検討
+- **粒子数**: `N_p_total`, `N_total` は `int`（int32）。v1.0 の最大粒子数は 2^31-1 ≈ 21.5億。社内の性能記録 P1-P3 の上限 ~10M 粒子では十分。将来 >2B 粒子が必要な場合は `int64_t` 移行を検討
 - **セルインデックス算術**: `cell_id * G + group_id` は int32 算術。有効範囲: n_cells × G < 2^31。v1.0 想定の n_cells=125K, G=48 では ~6M（十分）
 - **step_base**: `(uint64_t)step << 40`。step < 2^24 = 16,777,216 で有効（ICF標準: 10K-100K steps）
 - **rng_counter**: `uint32_t`。1ステップあたりの最大 RNG 描画数 ~10^3/粒子で 2^32 には到達しない

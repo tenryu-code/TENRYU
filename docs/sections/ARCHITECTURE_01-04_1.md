@@ -13,7 +13,7 @@
 3. **明確なモジュール境界**  
    Hydro / Radiation / Laser / Materials / Mesh / Coupling / Diagnostics / IO / Driver を分離し、依存方向を固定（循環禁止）。
 4. **再現性（Reproducibility）**
-   現行の決定論輸送（FLD/S_N）+ 1D Lagrangian 経路は同一GPU・同一構成で run-to-run bit 恒等を検証 gate で確認する（既知例外は文書化: 1D の一部 host 集計 ledger ~1e-15 帯、2D_RZ の atomicAdd 順序由来 LSB 帯 — VERIFICATION の noise-band gate）。
+   現行の決定論輸送（FLD/S_N）+ 1D Lagrangian 経路は同一GPU・同一構成で run-to-run bit 恒等を検証 gate で確認する（既知例外は文書化: 1D の一部 host 集計 ledger ~1e-15 帯、2D_RZ の atomicAdd 順序由来 LSB 帯 — 社内の検証記録 の noise-band gate）。
    （旧原則: 退役 imc_ddmc モードでは MC の性質上 bitwise 再現を要求せず、同一seed・同一GPU構成での統計的再現（平均・分散一致）のみを保証していた。）
 5. **入力は単一Python namelist（Smilei方式）**  
    すべてのシミュレーション条件は1つの `.py` に書く。  
@@ -81,6 +81,10 @@
   - `-DTENRYU_ENABLE_NVTX=ON`
   - `-DTENRYU_ENABLE_HYPRE=ON`（オプション、既定OFF。Hypre陰的拡散ソルバを有効化。FindHypre.cmake でパス検出。`HYPRE_DIR` 環境変数で手動指定可）
   - `-DTENRYU_RFA_V2_MODE={OFF,STUB,DUMMY_BUFFER,FULL}`（既定 `FULL`。radial Fourier audit v2 Heisenbug isolation builds: compiled out, no-op, dummy GPU buffer, or normal HDF5 output）
+
+#### 2.3.0 Source revision for `tenryu --version`
+- `cmake/SourceRevision.cmake` writes `${build}/src/drivers/generated/tenryu_source_revision.hpp` (the macro `TENRYU_SOURCE_REVISION`) at every build through the custom target `tenryu_source_revision`, a dependency of the `tenryu` executable; it rewrites the header only when the revision changes. Only the `tenryu` executable compiles `src/drivers/version_banner.cpp`, the one file that includes the header, so a new revision recompiles that file and relinks the executable; the libraries and the test executables do not change.
+- The revision is the first line of a `SOURCE_REVISION` file at the top of the source tree (`tools/beta_export.sh` writes the exported commit there), else the commit of the git work tree whose top is the source tree (`+modified` when tracked files differ), else `unknown`. `version_banner()` (`drivers/version_banner.hpp`) appends it to the version for `--version`; `tenryu_version_string()` (`core/version.hpp`), written into the frozen configuration, does not carry it.
 
 #### 2.3.1 Config/State ABI dependency policy
 - `src/core/config.hpp` and `src/core/state.hpp` define host-side ABI-sensitive structs that are consumed by several C++ and CUDA translation units.
@@ -200,14 +204,14 @@ setter の初期化や入れ子の更新が呼出し順序に依存する場合�
   同日に退役した）。
   `host_has_reproduced_build()` はその host（glibc ≥ 2.28 の x86-64、FMA と AVX2）かを返し、host と比べる試験が使う。
 - `Core::FieldMeasure`（`src/core/field_measure.{hpp,cpp}`、ALE P0A F2 — 設計
-  `docs/design/ale_asymmetric_robust_design_20260727.md` §2 F2）：場ごとの転送契約
+  社内の設計メモ ale_asymmetric_robust_design_20260727.md §2 F2）：場ごとの転送契約
   （support／測度／保存則／bounds／再構成次数／転送種別／epoch 依存）を宣言する
   fail-loud レジストリと 11 エントリの中核 seed table。二重質量分離
   （`subcell_mass`=overlay 積分保存 vs `kinematic_node_mass`=基底再構築）と FIX-2 測度
   教訓（物理 RZ 体積と平面面積は交換不能）をコード上の契約として固定する。宣言のみ
   （P0A）— transaction 転送層への enforcement 接続は P0B。
 - `Core::MeshTransaction`（`src/core/mesh_transaction.{hpp,cu}`、ALE P0A F3 — Layer-T
-  scaffold、`docs/design/q10_shadow_transaction_layerT_20260727.md`）：typed mesh event
+  scaffold、社内の設計メモ q10_shadow_transaction_layerT_20260727.md）：typed mesh event
   （7 種 `MeshEventKind` + client kind 対応表 + per-kind 契約 C_e）と `ShadowTransaction`
   （単一 256B 整列 device arena への byte-exact D2D capture／commit、discard=rollback、
   fail-closed gate 台帳、transaction-scoped telemetry、failure-injection plumbing、

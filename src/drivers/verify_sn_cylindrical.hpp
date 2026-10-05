@@ -7,7 +7,7 @@ namespace tenryu::drivers {
 // axis cell included), the decisive conservative-streaming operator probe;
 // Phase B — cold-start equilibration to the Tr plateau (parity with the
 // spherical/planar gates). Design:
-// docs/design/wg3_sn_cylindrical_quadrature_design.md.
+// the internal design note wg3_sn_cylindrical_quadrature_design.md.
 bool run_sn_1d_cylindrical_marshak_equilibration_verify();
 
 }  // namespace tenryu::drivers

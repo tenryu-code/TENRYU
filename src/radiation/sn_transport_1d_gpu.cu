@@ -3364,7 +3364,7 @@ struct SnQuadratureDeviceCache {
     }
     if (cylindrical) {
       // W-G3: 1D cylindrical product quadrature (Morel & Montry 1984
-      // appendix); see docs/design/wg3_sn_cylindrical_quadrature_design.md.
+      // appendix); see the internal design note wg3_sn_cylindrical_quadrature_design.md.
       const SnCylQuadrature1D host_quad =
           build_sn_cyl_quadrature_1d(requested_angles);
       mu.reset(host_quad.mu.size());
@@ -4446,7 +4446,7 @@ void advance_radiation_step_sn_1d(
   TENRYU_ASSERT(planck.n_groups() == n_groups,
                 "SN requires Planck table group count to match Radiation.groups");
   // W-G3: 1D cylindrical S_N (product quadrature; design doc
-  // docs/design/wg3_sn_cylindrical_quadrature_design.md).
+  // the internal design note wg3_sn_cylindrical_quadrature_design.md).
 #ifdef TENRYU_DEBUG_LANE_PARALLEL
   TENRYU_ASSERT(geom != 1,
                 "cylindrical S_N is not supported under "

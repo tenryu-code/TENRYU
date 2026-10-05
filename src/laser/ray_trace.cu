@@ -1014,7 +1014,7 @@ __device__ __forceinline__ TailClosureStatus try_tail_closure_1d(
 }
 
 // ---- CBET v1 recorder helpers (only referenced from the kCbetRecord=true
-// instantiation; see docs/design/cbet_1d_v1_design_20260707.md §4.1) ----
+// instantiation; see the internal design note cbet_1d_v1_design_20260707.md §4.1) ----
 
 // Mirrors the cell-target selection of accumulate_deposit_1d (must stay in sync).
 __device__ __forceinline__ int cbet_locate_deposit_cell_1d(

@@ -1,4 +1,4 @@
-# MPI LaserMesh gather / partition-of-unity gate deck (VERIFICATION
+# MPI LaserMesh gather / partition-of-unity gate deck (the internal verification record
 # §16.6, M18d). 2D RZ raytrace_3d: one axial beam (e_z, F/3, 1 TW) onto
 # a CH sphere (R_out = 0.025 cm, rho = 1.05 g/cm3) in a thin background.
 # Hydro 200x400 over R in [0, 0.05] cm, Z in [-0.05, 0.05] cm; LaserMesh
@@ -10,7 +10,7 @@
 #     ranks and vs the P=1 run;
 #   - the raytrace and the HydroMesh deposit follow bit-for-bit
 #     (owned-slab dumps via TENRYU_MPI_DUMP_OWNED, compare rtol 0).
-# Spec docs/design/mpi_m18d_laser_burn_spec.md §2 d1.
+# the internal design note mpi_m18d_laser_burn_spec.md §2 d1.
 #
 # Env knobs:
 #   TENRYU_PLM2D_NR / TENRYU_PLM2D_NZ  hydro mesh (default 200 x 400)

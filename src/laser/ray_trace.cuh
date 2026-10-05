@@ -15,7 +15,7 @@ struct LaserPhysExtOptions;
 namespace tenryu::laser {
 
 
-// CBET v1 recorder outputs (design docs/design/cbet_1d_v1_design_20260707.md §4.1).
+// CBET v1 recorder outputs (the internal design note cbet_1d_v1_design_20260707.md §4.1).
 // When rec_cell != nullptr the 1D_SPH trace kernel runs in record mode: it appends
 // per-cell-crossing records (merged consecutive same-cell substeps) instead of
 // being the deposition authority. All ledgers written by the record-mode kernel
@@ -39,7 +39,7 @@ struct CbetRecordDeviceArgs {
 };
 
 // Multi-channel hot-electron capture parameters (design
-// docs/design/hote_directional_sources_20260710.md §4.2). Channels are
+// the internal design note hote_directional_sources_20260710.md §4.2). Channels are
 // host-sorted by ascending threshold — the physical crossing order along the
 // inward march — so a segment crossing several thresholds fires them
 // lower-first, each later channel reading the ray power AFTER the upstream

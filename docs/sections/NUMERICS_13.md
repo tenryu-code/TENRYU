@@ -100,7 +100,7 @@ window.
   abort が必然だった。
 - **終端 takeover の廃止**: 2D メッシュを凍結して core1d tail へ移譲する
   終端吸収機構は廃止された
-  (`docs/design/terminal_takeover_removal_20260827.md`)。
+  (社内の設計メモ terminal_takeover_removal_20260827.md)。
 
 ### 13.5 remap 質量閉包ゲート
 - 全 CSR remap は総質量閉包 (Σm_post−Σm_pre)/Σm_pre を無条件計測する

@@ -112,7 +112,7 @@ kR = \pi \,|\, j_{1,1} \,|\, \alpha\ (\tan\alpha=\alpha)
 \]
 を直接駆動し、L2 の loglog 次数 \(\in[1.8,2.2]\)・総電子エネルギー恒等式
 \(|\Delta E|/E \le 10^{-14}\)・固有値 runtime 自己検証を課す。実測次数：
-球面 2.055 / 平面 2.107 / 円筒は VERIFICATION §4.7 参照。この族が球面
+球面 2.055 / 平面 2.107 / 円筒は 社内の検証記録 §4.7 参照。この族が球面
 演算子の 1D 解析ゲート（従来 heat_diffusion は test_planar 経由の平面
 演算子のみ）・implicit 経路・per-material 経路の解析被覆を初めて与える。
 また 16 桁精度ログにより template 化前後の bit 同一（rel=0）を測定した
@@ -135,7 +135,7 @@ Kirchhoff 割線
 （\(\kappa\propto T^p\) の flux 厳密面係数; 等温極限で調和平均と一致、
 p=0 は厳密に \(\kappa_0\)）を用い、Pattle 伝播を front 冪 0.9-1.5% /
 プロファイル L2 6-9×10⁻⁴ / 次数 2.28(球)/2.16(円筒)/1.45(平面) で回復する
-（VERIFICATION §4.8）。この発見の時点（2026-07-04）では生産 Spitzer 経路は調和平均のままだった（材料界面・
+（社内の検証記録 §4.8）。この発見の時点（2026-07-04）では生産 Spitzer 経路は調和平均のままだった（材料界面・
 void 断熱の設計要件）。2026-07-06 から生産の既定は下の `kirchhoff_same_material`（同じ材料の滑らかな面だけ割線、
 界面と void は調和平均）。
 
@@ -173,7 +173,7 @@ Kirchhoff 閉包下の急峻 front（例: 3000 eV↔1 eV 隣接セル）では
 Kirchhoff \(q_{SH}^{kir}\gg q_{max}\)（XC-0b 条件で \(\sim10^4\times\)）となり、
 limiter が守るべき自由流上限が事実上未適用だった（未解像 front の過伝播:
 XC-0b z1 nc=400 で front +13% vs 収束参照解; MULTI-IFE 交差比較 XC-0b が検出、
-`docs/design/xc_tenryu_multiife_1d_comparison_design_20260710.md` Addendum 4）。
+社内の設計メモ xc_tenryu_multiife_1d_comparison_design_20260710.md Addendum 4）。
 上記面診断の \(R_{eff}\) 代数（深飽和で \(R_{eff}\to1\) = 両閉包とも
 \(q_{max}\) 頭打ち）は整合適用を前提としており、本契約はその実装化である。
 適用箇所: STS/implicit 両経路 + persistent kernel の
@@ -194,7 +194,7 @@ two-material Timeout の真因 — 当時の GPU 競合仮 triage を訂正）�
 \(dl^2/D_{eff}\) は \(x_r\) 由来で元来免疫、そちらへ自然 fallback）。生産
 state は常に \(vol>0\) のため健常 dt_exp は bit 恒等。診断確定は gdb 直接
 測定（\(\kappa_{eff}\)/\(\rho c_v\) 健全・\(vol\equiv0\) を実測、委譲文書
-`HANDOFF_BUG20_BUG21_20260713.md` の容疑 1/2 は共に棄却）。回帰: 同上
+社内の引き継ぎメモ HANDOFF_BUG20_BUG21_20260713.md の容疑 1/2 は共に棄却）。回帰: 同上
 ctest へ零体積 property test（零 vol=無寄与 sentinel + 真球殻 vol=有限比）
 を追加、#845 green 化。
 
@@ -646,7 +646,7 @@ Opt-in `"donor"` mode computes alpha from the sum of unthrottled outflow
 magnitudes and scales each pair by the donor cell's alpha.  The donor's total
 realized outflow is therefore bounded by its energy above the floor, which
 guarantees $T_{e,trial}\ge T_{e,floor}$ while preserving pair antisymmetry.
-See `docs/design/bug18_conduction_floor_pumping_fix_20260712.md`.
+See the internal design note bug18_conduction_floor_pumping_fix_20260712.md.
 
 **擬似コード**：
 ```
@@ -991,7 +991,7 @@ thermal energy \(\rho c_vVT\) を更新し、per-cell energy を \(dt\times\nabl
 `Numerics.conduction.nonlocal_model="snb"`（既定 `"none"` = 本節不活性・従来経路 bit 恒等）で、
 Schurtz–Nicolaï–Busquet (SNB) 型多群拡散の非局所補正を 1D（planar/cylindrical/spherical）の
 電子熱伝導に適用する。設計・変種裁定・導出の全記録は
-`docs/design/snb_nonlocal_1d_20260710.md`（binding）。一次文献: Schurtz, Nicolaï & Busquet,
+社内の設計メモ snb_nonlocal_1d_20260710.md（binding）。一次文献: Schurtz, Nicolaï & Busquet,
 Phys. Plasmas 7, 4238 (2000); Sherlock, Brodrick & Ridgers, Phys. Plasmas 24, 082706 (2017);
 Cao, Moses & Delettrez, Phys. Plasmas 22, 082308 (2015)。
 
@@ -1083,7 +1083,7 @@ outer cap を θ→0 に飽和させ q_SH ごと伝導を窒息させる — 平
 検証: 修正前に決定論的だった 3step abort が t_end 完走に転じ、per-phase overshoot
 検出器（safety.overshoot_fatal=1.0 装備 run）無発火を確認（2026-07-31）。
 
-**検証（VERIFICATION §7.9）**：G1 OFF-bit（GXII FLD golden rel=0 ×6 指標）/ G2 局所極限
+**検証（社内の検証記録 §7.9）**：G1 OFF-bit（GXII FLD golden rel=0 ×6 指標）/ G2 局所極限
 （|R−R_disc|≤5.5e-8 実測 @tol 1e-3、二次法則勾配 1.986、tanh ramp 2 rung が導出曲率 bound 内・
 二次 gain 100.7）/ G3 Epperlein–Short 分散（Tier A 離散解析一致 ≤7.2e-7 @gate 3e-3、
 Tier B Marocchino 2013 OSHUN band）/ G4 保存台帳 ≤7.4e-17 @gate 1e-14（planar/cyl/sph）
@@ -1102,8 +1102,8 @@ ceiling 台帳込み全区間エネルギー閉包 ≤1e-13、guard 実発動の
 モデル（(SNB-H)/(SNB-Q)、ξ_g の厳密 primitive P(β)、群構造 β̂∈[0.1,20] 幾何
 級数・群中心規約、mfp 変種 `geometric_r2`/`original`、iSNB Picard 結合、
 `nonlocal_model` 系 namelist キー）は 1D 設計
-`docs/design/snb_nonlocal_1d_20260710.md`（merge 後の §4.4）と同一。本節は
-2D_RZ 離散化の差分のみ（設計正典 `docs/design/2d_snb_port_spec.md`、実装
+社内の設計メモ snb_nonlocal_1d_20260710.md（merge 後の §4.4）と同一。本節は
+2D_RZ 離散化の差分のみ（設計正典 社内の設計メモ 2d_snb_port_spec.md、実装
 `src/hydro/conduction_snb_2d.cu`）。
 
 **離散化（pair-power 形式）** — 2D 伝導の更新は既に対毎の反対称 power
@@ -1140,7 +1140,7 @@ Kershaw 9 点、`symmetric_pair_power`）で書かれており、SNB は同じ�
   （CBET・ホット電子の単一 rank の制限も同じく実行時）。`snb_efield="local"`
   は 2D で ConfigError（fail-closed、1D のみ）。
 
-**検証（VERIFICATION §4.10、実測 2026-07-11）**: G2 z-mode ladder
+**検証（社内の検証記録 §4.10、実測 2026-07-11）**: G2 z-mode ladder
 |R−R_disc| = 5.5e-8/5.3e-9/5.9e-10（1D gate と同値クラス）、slope 1.986、
 集約 tanh-ramp 二乗則 gain 100.3；G3 E-S 分散 Tier A worst ~2.4e-4
 （gate 3e-3、Z∈{1,4}×kλ_ei∈{0.05..0.5}×nz ladder）；G4 保存
@@ -1789,11 +1789,11 @@ block の**固定形状 tree reduction**（atomics 不使用・run 反復 bit �
 契約。march の ray 昇順とは加算順が異なる。staging が 512 MiB を超える
 場合は 8192-ray の逐次バッチで固定順を保存）。
 
-検証（VERIFICATION 参照）: 単体ゲート = 線形 profile の解析 16/15 則・
+検証（社内の検証記録 参照）: 単体ゲート = 線形 profile の解析 16/15 則・
 斜入射 cos⁵(b) 則・転回半径恒等 \(r_t=b/n(r_t)\)・台帳 1e-14・run 反復
 bit 同一（5 case / 133 assertions PASS 2026-08-04）+ 3step フル A/B
 （march 比の吸収・バング・ρ_peak 一致 — 実測値はコミット時点の
-VERIFICATION 記録を正とする）。
+社内の検証記録 記録を正とする）。
 
 #### 5.3.6 1D_SPH の特性曲線積分（`raytrace.integrator="characteristic"`、2026-09-24）
 
@@ -3783,7 +3783,7 @@ uses new headers only for 2D additions.
 `Laser.cbet.geometry_mode="port_section"`（既定 `"legacy"` は §5.10.2 の方位角
 平均経路と bit 恒等）で、§5.10.2 の未解像方位角平均を **実ポート配置の
 sector/section 位相空間写像**に置き換える（設計
-`docs/design/multibeam_1d_superposition_20260727.md` §13、Follett et al.,
+社内の設計メモ multibeam_1d_superposition_20260727.md §13、Follett et al.,
 Phys. Plasmas **32**, 022709 (2025)）。物理ビームは `Laser.port_configuration`
 のポート表（単位方向・roll・power_weight・δλ、正準 port_id 昇順）で与え、
 トレースは単一 prototype ビーム 1 本のみ（`len(beams)==1` を検証で強制）。
@@ -4027,7 +4027,7 @@ snapshot・checkpoint・step の再試行はそれを使う）。host の実装�
 角度分布を持つ。v1 のスカラー key 群は単一 `cone` チャネルの shorthand として
 厳密に後方互換（同一値の `sources=[cone]` deck と出力 bitwise 恒等、両形の
 併用は parse エラー）。設計・文献根拠は
-`docs/design/hote_directional_sources_20260710.md`。
+社内の設計メモ hote_directional_sources_20260710.md。
 
 **捕獲**：各 traced ray はチャネル毎に独立へ最初の上向き
 \(n_e=f_{s,k}n_{crit}\) 交差で capture する。チャネルは host 側で
@@ -4093,7 +4093,7 @@ G3 機構傾向（planar 200-cell slab、\(T_h,\eta,f_s\) を全 leg で固定�
 
 ---
 
-### 5.11.2 2D RZ 輸送（feature/2d-hote：spec docs/design/2d_hote_port_spec.md）
+### 5.11.2 2D RZ 輸送（feature/2d-hote：社内の設計メモ 2d_hote_port_spec.md）
 
 1D モデル（スペクトル・多群レイアウト・阻止能・CSDA marcher・µ-band 角度求積・
 チャネル定義・E_floor・dt リミッタ式）は §5.11 のまま共有し、輸送幾何のみを
@@ -4184,7 +4184,7 @@ G3 機構傾向（planar 200-cell slab、\(T_h,\eta,f_s\) を全 leg で固定�
 `Laser.hot_electron.eta_mode="model"`（既定 `"legacy"`）で、チャネルごとの変換
 効率 η を定数/table の処方から**局所プラズマ条件で駆動される一次緩和 ODE**に
 置き換える（設計文書
-`docs/design/external-ai-responses/20260727-hote-eta-model-advice.md` の
+社内の設計メモ external-ai-responses/20260727-hote-eta-model-advice.md の
 推奨モデル案 1）。`"legacy"` 経路は bit 恒等のまま — model 分岐は解決段
 （host）にのみ入り、capture kernel は不変（η=0 チャネルは
 `one_minus_eta=1.0` で交差記録のみ行う）。1D_SPH 専用・`sources`

@@ -7,7 +7,7 @@
 #include "mesh/boundary_carrier.hpp"
 
 // C1-w3b hydro constraint machinery over the persistent boundary carrier,
-// implementing consult-29 §6 and docs/design/boundary_carrier_c1_20260810.md §4.
+// implementing consult-29 §6 and the internal design note boundary_carrier_c1_20260810.md §4.
 // This module is host-only, deterministic, and tunable-free; all loops are sequential
 // in caller-provided order. v1 assumes one boundary component; multi-component decks
 // will require one cyclic-tridiagonal block per component in a future wave.

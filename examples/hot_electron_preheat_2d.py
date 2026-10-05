@@ -1,6 +1,6 @@
 """2D RZ hot-electron preheat example (i7a-derived axis-disk ablation deck).
 
-Hot-electron preheat: NUMERICS §5.11 (model) + its 2D subsection (transport); spec docs/design/2d_hote_port_spec.md.
+Hot-electron preheat: NUMERICS §5.11 (model) + its 2D subsection (transport); the internal design note 2d_hote_port_spec.md.
 """
 
 import math

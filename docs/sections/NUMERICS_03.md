@@ -255,7 +255,7 @@ bitwise 一致・幅下限・隣接比（pin 跨ぎは `ratio_jump_allowed` で�
 `core/mesh_requirement`（`build_mesh_requirement` / `check_mesh_requirement`）は、デッキの
 レーザー波形・波長・材料層（密度・A・Z）・幾何から、初期メッシュが満たすべき分解能要求を
 決定論的に見積もるスケーリング則モデルである（設計記録
-docs/design/mesh_resolution_requirement_20260903.md）。probe run 後の質量形ゾーニング判定
+社内の設計メモ mesh_resolution_requirement_20260903.md）。probe run 後の質量形ゾーニング判定
 （`tools/assist zoning-report`）を置き換えるものではなく、最初の probe より前の情報を与え、
 probe との比較で係数を較正するためのものである。
 
@@ -298,7 +298,7 @@ CH/351 nm/10¹⁵ W/cm² 実測 1.3–1.6×10⁶ g cm⁻² s⁻¹ に対しモ�
 `tools/validation/mesh_convergence_campaign.py` による 29 ケース（波形 8 種 × 波長
 351/527/1053 nm × 初期密度 0.05–2.5 g/cc・層状・球シェル）の格子収束実測
 （`docs/validation/mesh_convergence_reference.md`、設計記録
-`docs/design/mesh_convergence_campaign_20260903.md`）: 一様参照 4.9×10⁻⁷ g/cm² に対する
+社内の設計メモ mesh_convergence_campaign_20260903.md）: 一様参照 4.9×10⁻⁷ g/cm² に対する
 収束面密度質量と先験天井の比は幾何平均 1.26（0.39–5.28）で、10¹⁵ W/cm² では天井が緩すぎ
 （0.4）、緩やかな波形・低密度・527 nm では保守的（2–5）だった。補正後は測定した全ケースで
 天井 ≤ 収束値（最小余裕 1.0、最大 9）。1053 nm は 1.2 nm セルでも吸収エネルギー 3 % に
@@ -342,7 +342,7 @@ C02-S1 に基づく未アブレート平面後方の 2e-5 g/cm²。表面天井�
 電離度・形成積分（吸収率 1、η=0.12、s_abl=1.5、φ_f=0.1、N_res=9）を評価し、
 追加の 0.1 倍や ladder 上限を課さず factor 1 とする。範囲外では未収束クラスの警告が
 併存してもこの先験 fallback を優先する。C++ 実行時に Python を呼ばず、HDF5 schema は変えない。
-詳細・適用範囲は `docs/design/mesh_recommendation_from_campaign_20260908.md`。
+詳細・適用範囲は 社内の設計メモ mesh_recommendation_from_campaign_20260908.md。
 2026-09-28 改訂: 推薦 block の測度は平面 `areal_mass`、円筒 `cylindrical_line_mass`、球
 `spherical_cell_mass`。標的を 3 領域に分ける。(i) アブレーション域 — 外面から深さ
 \(\max(\mu_{abl}, d_{half})\) まで（\(\mu_{abl}\) は solver preview を優先し、なければ Python 形成
@@ -1035,7 +1035,7 @@ T_{k,i}^{new} = T_{k,i}^{old} + \frac{\Delta e_{k,i}}{c_{v,k,i}} \quad (k=e,i)
 **1T の全エネルギー再規格化（2026-09-29 に撤去）**：1D の 1T・`compatible_energy=False`・駆動圧境界なしのステップでは、
 Corrector の後の全エネルギーの誤差を、活性セルの \(e\) の一律の拡大縮小（残差は最初の活性セルへ）で消していた。
 非互換の更新の保存誤差を、誤差が生じた場所（衝撃波）ではなく全セルへ内部エネルギーに比例して配るので、遠方の冷たい
-物質の断熱量まで変える（VERIFICATION §3.2s(b) の Sod の遠方場の指紋）。原因（非互換の更新が保存しないこと）を除かずに
+物質の断熱量まで変える（社内の検証記録 §3.2s(b) の Sod の遠方場の指紋）。原因（非互換の更新が保存しないこと）を除かずに
 結果だけを期待値へ合わせる状態の補正で、2026-08-31 のユーザー裁定に当たるので、multi-kernel と persistent loop の両経路から
 外した。現在は 1T でも 2T と同じく、非互換の更新の保存誤差は履歴の保存誤差にそのまま現れる。全エネルギーを機械精度で
 保存する必要があるときは保存形の `compatible_energy=True` を使う（1D の Sedov・Noh の検証デッキはこれを使う）。
@@ -2140,7 +2140,7 @@ voidゾーン：等半径間隔 \(\Delta r = (r_{out} - r_{in}) / N\)。
 
 #### 3.1.13 Braginskii プラズマ粘性（イオン channel 2026-07-04 / 電子 channel 2026-07-12 / 2D species port 2026-07-17）
 
-Physical-viscosity module adding unmagnetized Braginskii shear viscosity (ion + electron channels, single-fluid \(V_e=V_i\)) to the 1D (all geometries) and 2D RZ Lagrangian steps (**default OFF** — namelist `Numerics.hydro.plasma_viscosity`; diagnostic env hooks `TENRYU_BRAG_{ENABLE,MODEL,SPECIES,ETA_CONST,ETA0_SCALE,MFP_CAP_CELLS,LNLAMBDA_FIXED,DT_SAFETY}` remain available; all unset leaves the module inactive and bit-identical. `species="ion"` (default) is bit-identical to the pre-electron ion-only trajectories in BOTH dims — the kernels are SPECIES-templated with a source-identical ion branch). Implementation: `src/hydro/braginskii_viscosity.{cuh,cu}`, `src/hydro/braginskii_viscosity_device.cuh` (shared coefficient device functions), and `src/hydro/braginskii_viscosity_2d.cu`; designs: `docs/design/wh_braginskii_viscosity_design.md` (ion), `docs/design/2d_visc_port_spec.md` (2D RZ), `docs/design/electron_viscosity_1d_20260712.md` (electron channel + regime adjudication, landed on feature/1d-brushup), `docs/design/visc_2d_parity_20260717.md` (this branch's port + 2D species extension); literature: Braginskii 1965（原典照合 2026-07-12: τ_e=Eq.(2.5e)、η₀^e=Eq.(2.25) "(Z=1)" 明記、η₀^i=Eq.(2.22)）/ Whitney PoP 6, 816 (1999)（η₀₀^e(Z)、一次文献は調達依頼中）/ Velikovich, Whitney & Thornhill PoP 8, 4524 (2001)（電子粘性 shock 加熱の物理; η₀₀^e(Z) 転写元 Eq.(3)）/ Hunana ApJS (2022)（η₀₀^e=0.73094 近代追認）/ Vold et al. PoP 22, 112708 (2015) (1D spherical reference implementation) / Manheimer & Colombant LPB 25, 541 (2007) (coefficient transcription) / Mason et al. PoP 21, 022705 (2014) (mfp cap) / Miller CF 210, 104672 (2020) / Haines PoP 31, 050501 (2024).
+Physical-viscosity module adding unmagnetized Braginskii shear viscosity (ion + electron channels, single-fluid \(V_e=V_i\)) to the 1D (all geometries) and 2D RZ Lagrangian steps (**default OFF** — namelist `Numerics.hydro.plasma_viscosity`; diagnostic env hooks `TENRYU_BRAG_{ENABLE,MODEL,SPECIES,ETA_CONST,ETA0_SCALE,MFP_CAP_CELLS,LNLAMBDA_FIXED,DT_SAFETY}` remain available; all unset leaves the module inactive and bit-identical. `species="ion"` (default) is bit-identical to the pre-electron ion-only trajectories in BOTH dims — the kernels are SPECIES-templated with a source-identical ion branch). Implementation: `src/hydro/braginskii_viscosity.{cuh,cu}`, `src/hydro/braginskii_viscosity_device.cuh` (shared coefficient device functions), and `src/hydro/braginskii_viscosity_2d.cu`; designs: 社内の設計メモ wh_braginskii_viscosity_design.md (ion), 社内の設計メモ 2d_visc_port_spec.md (2D RZ), 社内の設計メモ electron_viscosity_1d_20260712.md (electron channel + regime adjudication, landed on feature/1d-brushup), 社内の設計メモ visc_2d_parity_20260717.md (this branch's port + 2D species extension); literature: Braginskii 1965（原典照合 2026-07-12: τ_e=Eq.(2.5e)、η₀^e=Eq.(2.25) "(Z=1)" 明記、η₀^i=Eq.(2.22)）/ Whitney PoP 6, 816 (1999)（η₀₀^e(Z)、一次文献は調達依頼中）/ Velikovich, Whitney & Thornhill PoP 8, 4524 (2001)（電子粘性 shock 加熱の物理; η₀₀^e(Z) 転写元 Eq.(3)）/ Hunana ApJS (2022)（η₀₀^e=0.73094 近代追認）/ Vold et al. PoP 22, 112708 (2015) (1D spherical reference implementation) / Manheimer & Colombant LPB 25, 541 (2007) (coefficient transcription) / Mason et al. PoP 21, 022705 (2014) (mfp cap) / Miller CF 210, 104672 (2020) / Haines PoP 31, 050501 (2024).
 
 **係数（cgs+eV 凍結系）**:
 
@@ -2231,7 +2231,7 @@ For 2D, let \(L_c=\min_k|\mathbf x_{k+1}-\mathbf x_k|\). The explicit limit and 
 \tau_{eff}=\min\left(\tau_s,\frac{\mathrm{mfp\_cap\_cells}\,L_c}{v_{th,s}}\right),\quad s\in\{i,e\}.
 \]
 
-**2D species extension (2026-07-17, `docs/design/visc_2d_parity_20260717.md`)**: the 2D corner-force and dt kernels are `SPECIES`-templated with fully separated `if constexpr` branches exactly like the 1D kernels — SPECIES=0 keeps the ion-only load order and expressions source-identical (bitwise contract in both dims), SPECIES=1 evaluates \(\eta_e(T_e)\), SPECIES=2 composes \(\eta_\mathrm{eff}=\eta_i+\eta_e\) additively (`model="constant"` splits `eta_const` half/half, the 1D convention). Per-channel heat rates land in `visc_heat_rate_per_cell` (ion) and `visc_heat_rate_e_per_cell` (electron; allocated only when `species != "ion"`). The corner-force expression itself is built from \(\eta_\mathrm{eff}\) in every branch, so the adjointness / per-cell z-momentum / null identities hold for every species by construction.
+**2D species extension (2026-07-17, the internal design note visc_2d_parity_20260717.md)**: the 2D corner-force and dt kernels are `SPECIES`-templated with fully separated `if constexpr` branches exactly like the 1D kernels — SPECIES=0 keeps the ion-only load order and expressions source-identical (bitwise contract in both dims), SPECIES=1 evaluates \(\eta_e(T_e)\), SPECIES=2 composes \(\eta_\mathrm{eff}=\eta_i+\eta_e\) additively (`model="constant"` splits `eta_const` half/half, the 1D convention). Per-channel heat rates land in `visc_heat_rate_per_cell` (ion) and `visc_heat_rate_e_per_cell` (electron; allocated only when `species != "ion"`). The corner-force expression itself is built from \(\eta_\mathrm{eff}\) in every branch, so the adjointness / per-cell z-momentum / null identities hold for every species by construction.
 
 The v1 exclusions are fail-closed: 2D per-material conservation with viscosity enabled raises `ConfigError`; `button_center`, `central_pseudo_core`, and `pole_angular_derefine` are guarded by runtime assertions. The `wj` mesh-forensics decomposition excludes viscosity (the force remains in the total), and reflect walls use one-sided viscous stress with no mirror-cell flux.
 
@@ -2508,7 +2508,7 @@ the larger cell at the first adjacent-size violation until
 Because \(\det(\tau,\nu)=-\sigma_z\), the logical \(j\) direction uses the
 normal ladder unchanged for \(\sigma_z=-1\) and reversed for
 \(\sigma_z=+1\); the standard cell-node order therefore remains
-counterclockwise. See `docs/design/cone_shell_multiblock_20260719.md` for the
+counterclockwise. See the internal design note cone_shell_multiblock_20260719.md for the
 full derivation and staged topology design.
 
 #### 3.2.0c Cone-shell Stage C2 near-face strips
@@ -3087,7 +3087,7 @@ duplicated. Coordinate identity is checked with tolerance
 per coordinate. Mesh construction asserts positive RZ volume for every cell.
 Verification tests check refinement-convergent total volume against the
 analytic spherical volume for the shell outer radius; golden updates require
-the verification process in VERIFICATION.md.
+the verification process in the internal verification record.
 
 #### 3.2.0b Multiblock geometry and CSR connectivity
 
@@ -3129,7 +3129,7 @@ consumes it — dendrite bodies truncate through the same path, with
 shell-chain generalization).  Construction-only in this wave: hydro on the
 hybrid remains gated exactly like the parent (`polar_tier_hydro_enabled` +
 the mixed-cell force trio) and is unqualified.  Design and rulings:
-docs/design/epoch_quad_remesh_20260820.md §12–§14.
+the internal design note epoch_quad_remesh_20260820.md §12–§14.
 
 The bridge uses scalar blend levels between cap radius \(r_c\) and seam radius
 \(r_{\rm cut}\).  The default `multiblock_cart_core_bridge_grading="uniform"`
@@ -3370,7 +3370,7 @@ recache. The pentagon partition (5-way midpoint-center RZ subquads,
 Σ-normalized; the CSR-remap audit variant additionally shifts the roundoff
 remainder into slot 2) and the belt star-P1 partition are
 invariant-flag-independent. Full per-topology matrix and gap register:
-docs/design/a124b_corner_mass_contract_20260815.md.
+the internal design note a124b_corner_mass_contract_20260815.md.
 A124(b) ruling addendum (2026-08-15, user-adopted P-A/P-B/P-C): the
 DIAGNOSTIC corner-mass recompute paths follow the dynamical basis rather
 than the legacy bbsw default — the 2D energy-budget kinetic basis without an
@@ -3402,7 +3402,7 @@ spherical-polar axis wedge (both side means equal the half off-axis
 radius) while the exact subvolumes split ~1:3 angularly, which baked raw
 corner densities of exactly \(2\bar\rho\) and \((2/3)\bar\rho\) into every
 axis-wedge cell (design record
-docs/design/polar_tier_center_20260723.md §5.7). Non-AW structured cells
+the internal design note polar_tier_center_20260723.md §5.7). Non-AW structured cells
 keep the BBSW weights bit-identically.
 
 Volume-convention note (BINDING): on spherical-polar meshes the cell
@@ -3472,7 +3472,7 @@ compatible energy theorem to hold. Corner masses are therefore:
   the exact 4/3 axis-node over-acceleration that seeds the pole impedance;
   `"equal_split"` matches the structured polar convention without changing
   non-axis node masses or any corner-mass cache. See
-  `docs/design/bug25_csr_pole_axis_node_dynamics_20260720.md`.
+  the internal design note bug25_csr_pole_axis_node_dynamics_20260720.md.
   After CSR ALE remap, finite active multiblock node sums at the compatible
   acceleration mass floor are positivity-floored as a roundoff guard.  For the
   five-block half-butterfly central Cartesian core only, a roundoff-scale
@@ -4281,7 +4281,7 @@ despite the historical label, this vector is the face's own
 lateral-revolution area vector, NOT the CSW98 Eq. 16 median-mesh vector;
 for logically-grid-aligned compression it is perpendicular to
 \(\Delta\mathbf{u}_e\) and the force is structurally zero -- see
-docs/design/i1b_csw_edge_av_structural_zero_defect.md. The mode is kept
+the internal design note i1b_csw_edge_av_structural_zero_defect.md. The mode is kept
 bit-identical for certification continuity; `av_model="csw_edge_csw98"`
 (§3.2.9c) is the corrected formulation.)  The edge is
 compressive for that cell iff
@@ -4355,7 +4355,7 @@ displaced angular edge, whose ratio behaves as \(U(s{+}h)/U(s)\) and flips
 sign at any radial stagnation, collapsing \(\psi\) exactly at flow reversal
 and firing the Kuropatenko kernel of the geometric turning
 \(|\Delta u|=|U|\Delta\theta\) tangentially (the reversal-time axis-column
-injection; design record `docs/design/front_conforming_ale_20260826.md`
+injection; design record the internal design note front_conforming_ale_20260826.md
 §9.9.6-9.9.8).  The legacy face-adjacency limiter remains compiled as the
 read-only negative control of the `TENRYU_CSW98_EDGE_DIAG` diagnostic
 (`psi_legacy` vs `psi_new`).
@@ -4403,7 +4403,7 @@ changes (bitwise regression anchor:
 tests/hydro/test_csw98_bit_identity_old_mode.cu).
 
 Side vectors (C2 form, decision 2026-07-04,
-docs/design/i1b_csw98_rz_eq16_decision.md): with the exact
+the internal design note i1b_csw98_rz_eq16_decision.md): with the exact
 revolution-volume corner gradients \(a_k=dV/dx_k\) (same polynomial family
 as `cell_Svec`) and \(b_k=a_k-\mathrm{mean}(a)\), the cyclic system
 \[
@@ -4451,7 +4451,7 @@ with \(q_{Kur,e}=\rho_e W_e|d\mathbf{v}_e|\)). 旧版は
 \(f_e\to0\) as \(d\mathbf{v}_e\cdot S_e\to0^-\).
 
 Degenerate-side guard (2026-08-17;
-`docs/design/reale_freestream_defect_20260817.md` §6.2): csw98 AV may
+the internal design note reale_freestream_defect_20260817.md §6.2): csw98 AV may
 fire only when \(l_e^2\ge\eta^2 A_c\), where \(A_c\) is the absolute
 shoelace area and
 \(\eta=\texttt{csw98\_degenerate\_side\_floor\_rel}\) defaults to
@@ -4747,7 +4747,7 @@ compatible-force-work mode, an edge whose both endpoints lie on the exact
 axis contributes neither edge-AV force nor an AV CFL bound: axis-line edges
 connect zero-mass axis nodes, and any AV impulse on them seeds spurious
 angular motion at the pole (consult-6; design record
-docs/design/polar_tier_center_20260723.md §5.6). Structured meshes test the
+the internal design note polar_tier_center_20260723.md §5.6). Structured meshes test the
 logical axis lines (radial edges at \(j=0\) / \(j=n_z\) with the
 corresponding axis slave active, from the first slaved column outward);
 multiblock/CSR meshes carry no \((i,j)\) indexing, so the test is geometric
@@ -4922,7 +4922,7 @@ a_c=C_2\frac{\gamma+1}{4}\Delta u_c,\qquad
 
 **エネルギー閉包**: セル仕事 \(W_c=-\sum_i \mathbf F_{c,i}\cdot(2\pi R_i)\mathbf u_i\)（AW RZ 対、edge-AV と同一規約）を `work_av_per_cell` に SIGNED で置き、predictor と corrector の両方で（corrector は time-centered 速度で）compatible work 経路が再計算する。**dt**: \(\Delta t_\mu=0.25\,\min_c \rho_cL_c^2/\mu_c\)（センサ〜平滑化 pipeline を純関数として再計算; 既存 AV-CFL スロットで報告）。
 
-**検証状態（2026-08-01, VERIFICATION §18 参照）**: 演算子ゲート 7/7 PASS（平行移動/剛体回転の消去、limiter-on affine で \(\mu\to0\)（丸めまで）、線形厳密性（内部組立力 \(\le10^{-12}\max|F|\)、実測 \(10^{-17}\) 級）、非線形 radial replay の per-ring θ-一様性 \(10^{-10}\)、AW energy pairing 恒等式 \(5\times10^{-13}\)、pentagon 包含 + \(K\mathbf 1=0\)）。**運用資格**: 純 Lagrangian 包絡では csw98 と parity〜+3%（bare polar_tier で死亡が極列から離脱）。**every-step ALE（euler-window axis-core）包絡では shock 背後の偶奇 ringing により早期崩壊が残存（v1.1 の μ 平滑化で緩和するが未根絶; A75/A76）— production 資格なし（production AV は csw_edge_csw98 のまま）**。
+**検証状態（2026-08-01, 社内の検証記録 §18 参照）**: 演算子ゲート 7/7 PASS（平行移動/剛体回転の消去、limiter-on affine で \(\mu\to0\)（丸めまで）、線形厳密性（内部組立力 \(\le10^{-12}\max|F|\)、実測 \(10^{-17}\) 級）、非線形 radial replay の per-ring θ-一様性 \(10^{-10}\)、AW energy pairing 恒等式 \(5\times10^{-13}\)、pentagon 包含 + \(K\mathbf 1=0\)）。**運用資格**: 純 Lagrangian 包絡では csw98 と parity〜+3%（bare polar_tier で死亡が極列から離脱）。**every-step ALE（euler-window axis-core）包絡では shock 背後の偶奇 ringing により早期崩壊が残存（v1.1 の μ 平滑化で緩和するが未根絶; A75/A76）— production 資格なし（production AV は csw_edge_csw98 のまま）**。
 
 #### 3.2.9f Delayed wake-only angular artificial heat flux (`wake_heat_flux_enabled`; consult-6 §3.2–3.12, 台帳 A88; 2026-08-02)
 
@@ -9616,7 +9616,7 @@ production activation.
 
 The button morph uses the Shirley-Chiu equal-volume core target and circular
 bridge target defined by
-`docs/design/shock_ahead_button_reorientation_20260720.md`.
+the internal design note shock_ahead_button_reorientation_20260720.md.
 The optional per-sector shock-approach extension divides
 \(\theta\in[0,\pi]\) into equal-theta sectors, extracts one radial pressure
 ridge per sector, and advances an independent quadratic arrival tracker.
@@ -9628,7 +9628,7 @@ the diagnostic morph deadline is
 \(t_{end}=\min_k[t_{arr,k}-\nu\sigma_{t,k}-N_g h_{cell}/|v_k|]-\Delta t_{scan}\),
 with defaults \(\nu=2.75\) and \(N_g=9\). The committed deadline can move only
 earlier and remains diagnostic-only in W1; see
-`docs/design/asym_runtime_ale_controller_20260721.md` §2.
+the internal design note asym_runtime_ale_controller_20260721.md §2.
 The committed deadline only accepts candidates that lie in the future and come
 from a tracker with at least 8 samples; immature candidates are logged
 (`deadline_immature=1`) but not committed.
@@ -9704,7 +9704,7 @@ and button-morph runs recapture it at the first evaluation at or after
 `button_morph.t_end_s`.  W2 does not modify the timestep, mesh, ALE decision,
 or physics state.  With the monitor disabled it launches no kernel, captures no
 snapshot, and emits no history group.  See
-`docs/design/asym_runtime_ale_controller_20260721.md` §2 and §4 W2.
+the internal design note asym_runtime_ale_controller_20260721.md §2 and §4 W2.
 
 **Runtime ALE target construction (asym arc W3a; no motion):**
 
@@ -11928,7 +11928,7 @@ canonicalize and the raw transported install (both physics-breaking), the
 frozen-basis TER measurement, the macro-band rezone taper + lifts, the
 incremental KE-fixup deposit, the F-basis momentum projection, and the
 Option-B subzonal-basis gather (catastrophic in composite). Full
-adjudication: docs/design/20260612-i1b-corner-mass-basis-adjudication.md.
+adjudication: the internal design note 20260612-i1b-corner-mass-basis-adjudication.md.
 
 *Basis-coherent Option-B bookkeeping chain — "coherent-lite"
 (`TENRYU_I1B_OPTIONB_COHERENT`, default-off; supersedes and hard-gates off
@@ -11967,7 +11967,7 @@ velocity gradients and crushes the gas-shell interface ~1 ns early), and
 per-install \(M/M'\) velocity ripple wrecks the converging-core mesh;
 the projection trade momentum↔uniform-flow is irreducible because
 V-pairing is not comoving under node motion). Adjudication record:
-docs/design/20260612-i1b-optionb-basis-coherent-redesign.md.
+the internal design note 20260612-i1b-optionb-basis-coherent-redesign.md.
 
 The aggregate volume is the current sum of member RZ volumes,
 \[
@@ -13493,7 +13493,7 @@ and all of its certificates remain unchanged.
 Near-cocircular quadruples in polar lattices can emit vertex pairs separated by
 \(10^{-10}\) to \(2\times10^{-7}\,\mathrm{cm}\); the resulting zero-length
 faces poison the compatible hydro.  See
-`docs/design/reale_freestream_defect_20260817.md` for the defect dossier.  A
+the internal design note reale_freestream_defect_20260817.md for the defect dossier.  A
 full ReALE v2 NUMERICS chapter remains an open documentation debt tracked in
 that dossier §7.
 
@@ -13660,7 +13660,7 @@ restart 直後は floor を一度再評価し、不適用なら再装填され�
 **現状**: 採用候補が remap_v3 の extensive-field 検証で棄却される未同定の
 段が残っており（ConservationRejected）、ベンチデッキでの実適用は未達成。
 本モードは default-OFF の research prototype であり、後続開発の起点は
-`docs/design/perf_1d_wave5_20260807.md` B1 節を参照。
+社内の設計メモ perf_1d_wave5_20260807.md B1 節を参照。
 > 典型的な GXII short-pulse cases では ALE off の pure Lagrangian を推奨する。120J/6ns FLD 評価では中央収束領域が広く局在 feature ではないため、ALE による speedup は確認されていない。
 
 #### 3.4.2 2D ALE との境界

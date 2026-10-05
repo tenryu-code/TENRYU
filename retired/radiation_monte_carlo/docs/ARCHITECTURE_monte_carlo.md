@@ -329,7 +329,7 @@ __global__ void source_particle_fill(
 | **勾配適応フィルタ** | `source_terms.cu` | `gradient_adaptive` | OFF |
 | **HOLO global LO solver/coupling mask** | `config.hpp`, `builder.cpp`, `freeze.cpp`, `imc_transport_persistent.cu`, `holo_geometry.hpp`, `holo_selector.cpp`, `holo_lo_state.cu`, `holo_lo_solver.cpp`, `sn_transport_1d.cpp`, `sn_transport_gpu.cu` | `holo.enabled` | OFF |
 
-**差分定式化（DF）**: 一般化参照場 W = W_max × τ²/(τ²+τ0²) × 1/(1+(χ/χ0)⁴) で近平衡殻の MCノイズを根本低減。signed particles（`PhotonPool::sign`）、census 残差化（ビンレベル再利用/スケーリング）、AP制限面輸送 ψ(τ) = tanh(3τ/4)/(3τ/4)。W≥0.5 セルではソーススムージングを自動無効化。設計: `docs/design/difference_formulation_full.md`。
+**差分定式化（DF）**: 一般化参照場 W = W_max × τ²/(τ²+τ0²) × 1/(1+(χ/χ0)⁴) で近平衡殻の MCノイズを根本低減。signed particles（`PhotonPool::sign`）、census 残差化（ビンレベル再利用/スケーリング）、AP制限面輸送 ψ(τ) = tanh(3τ/4)/(3τ/4)。W≥0.5 セルではソーススムージングを自動無効化。設計: 社内の設計メモ difference_formulation_full.md。
 
 **正味電子ソーススムージング**: H = Σ_g(rad_dep - rad_emit) を保存的フェイス交換で平滑化。IMC 沈着ノイズが電子圧力に入る前にフィルタリング。xRAGE のカプセルデポジションスムーザーに類似。マルチパス対応（ping-pong GPU バッファ）、勾配適応α対応。
 
@@ -386,7 +386,7 @@ source-injection owned.
 | RKL2 STS 拡散 | `deterministic_diffusion_1d.cu`, `rkl2_sts.cu` |
 | IMC↔拡散界面 | `diffusion_interface.cu` |
 
-**無効化理由**: 移動界面、モードチャタリング（5,900 入退出）、境界ソースクロージャが振動を 50-80% 悪化。設計: `docs/design/hybrid_transport_plan.md`。
+**無効化理由**: 移動界面、モードチャタリング（5,900 入退出）、境界ソースクロージャが振動を 50-80% 悪化。設計: 社内の設計メモ hybrid_transport_plan.md。
 
 ---
 

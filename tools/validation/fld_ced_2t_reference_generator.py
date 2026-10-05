@@ -7,7 +7,7 @@ species plus comoving FLD flux as the total-energy invariant, radiation
 coupling to electrons only, AV/shock heating to ions (kernel
 av_heat_to='ion'), an electron-adiabat subshock, and no O(v/c) terms.
 
-Citations: docs/design/i5_2t_refgen_spec.md; src/materials/eos_device.cuh:111-181;
+Citations: the internal design note i5_2t_refgen_spec.md; src/materials/eos_device.cuh:111-181;
 src/hydro/hydro_2d.cu:2104-2127; src/radiation/fld_2d_rz_gpu.cu:3664-3670;
 NUMERICS section 1.1.3/1.1.4.
 """

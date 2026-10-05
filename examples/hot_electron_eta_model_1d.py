@@ -2,7 +2,7 @@
 
 eta evolves per channel from local plasma conditions using the
 threshold-saturation-relaxation model (NUMERICS §5.11.3; design doc
-docs/design/external-ai-responses/20260727-hote-eta-model-advice.md).
+the internal design note external-ai-responses/20260727-hote-eta-model-advice.md).
 Production defaults target OMEGA TPD ~1% / NIF SRS 0.5-5% envelopes, NOT a
 single-shot fit.
 

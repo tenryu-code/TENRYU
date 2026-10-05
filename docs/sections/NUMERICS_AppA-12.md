@@ -437,7 +437,7 @@ PartitionInfo:
 #### 12.1.4a Option C 実装レイアウト（v1 正規、M18 実装 2026-07）
 
 v1 実装は上記のローカル圧縮配列ではなく **Option C（global-size 配列）** を採用する
-（設計記録: docs/design/mpi_m18_20_20260717.md）。本項が §12.1.4 のローカル配列
+（設計記録: 社内の設計メモ mpi_m18_20_20260717.md）。本項が §12.1.4 のローカル配列
 記述に優先する。
 
 - **全 rank が global サイズの配列を保持**する。セルは flat 添字 \(c = i\,n_z + j\)
@@ -840,7 +840,7 @@ v1.0（`laser_parallel.strategy="replicated"`）では、沈着写像も次元�
 #### 12.5.0 v1 実装正規（Option C、M18 実装 2026-07）
 
 以下が実装された正規プロトコルであり、後続の各小節の M18 前設計記述に優先する
-（実装詳細・測定は docs/design/mpi_m18_20_20260717.md §6g–§6n）：
+（実装詳細・測定は 社内の設計メモ mpi_m18_20_20260717.md §6g–§6n）：
 
 - **Hydro 2D（コーナー力）**: 力の producer/scatter は ghost 含み窓（fw）で
   全 rank が両側寄与を積む（コーナー力専用 MPI 交換なし）。前提となる ghost
@@ -1123,11 +1123,11 @@ v1.0では**静的分割**を既定とする。
 ### 12.7 再現性（Reproducibility）
 
 現行の決定論経路（FLD/\(S_N\) の輻射、流体、伝導、1D Lagrangian）は、同一 GPU・同一構成で run-to-run の bitwise 一致を
-検証 gate で確認する（既知の例外は VERIFICATION の noise-band gate：1D の一部の host 集計の台帳 ~1e-15、2D_RZ の atomicAdd 順序の LSB）。
+検証 gate で確認する（既知の例外は 社内の検証記録 の noise-band gate：1D の一部の host 集計の台帳 ~1e-15、2D_RZ の atomicAdd 順序の LSB）。
 モンテカルロの要素は燃焼の α 粒子輸送（`Burn.scheme="mc"`、§14.9、既定 OFF）だけで、これは統計的再現を求める。
 
 退役したモンテカルロ輻射（IMC/DDMC）は Persistent Warp の非決定性と atomicAdd 順序のため bitwise 一致を保証せず、
-統計的一致（VERIFICATION §16.8 の CV ≤ 0.1% 基準）を要求していた。§12.7.1〜§12.7.2 の光子粒子の RNG 分割と粒子順序は
+統計的一致（社内の検証記録 §16.8 の CV ≤ 0.1% 基準）を要求していた。§12.7.1〜§12.7.2 の光子粒子の RNG 分割と粒子順序は
 その設計記録（コードは 2026-09-29 にビルドから外し `retired/radiation_monte_carlo/` に保管）。燃焼の α 粒子は `curand_init(Main.seed ^ global_id, step, 0, &state)` で初期化し、`global_id` はセル・スロット・
 標本の番号から作る（`burn/mc_transport.cu` の `mc_transport_global_id`）。`Main.max_steps` の上限 \(2^{24}-1\) は下の光子粒子の
 `global_id` の構成（\(\text{step}\times 2^{40}\) が uint64 に収まる）に由来し、そのまま残している。

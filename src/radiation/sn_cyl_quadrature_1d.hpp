@@ -5,7 +5,7 @@
 namespace tenryu::radiation {
 
 // W-G3: product angular quadrature for 1D cylindrical S_N.
-// Design: docs/design/wg3_sn_cylindrical_quadrature_design.md; authority:
+// Design: the internal design note wg3_sn_cylindrical_quadrature_design.md; authority:
 // Morel & Montry 1984 (TTSP 13(5) 615) appendix Eqs. A1-A4.
 //
 // Flattened layout: level-major, mu ascending within each level. Level l

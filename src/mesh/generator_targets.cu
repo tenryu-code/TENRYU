@@ -329,7 +329,7 @@ TargetResult build_generator_targets(
           before_sweep[index], tessellation.cells[index],
           ordered[index].axis);
     }
-    // d1 certified skip (SS8-T2d-d1, docs/design/
+    // d1 certified skip (SS8-T2d-d1, the internal design notes
     // t2_d1_certified_lloyd_skip_20260815.md): when no predicate of the
     // warm DT can flip under the proposed displacements, the proposal's
     // Delaunay topology provably equals the current one — the iteration

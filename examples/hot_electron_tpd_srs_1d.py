@@ -1,7 +1,7 @@
 """GXII solid CD sphere, 1D_SPH, with mechanism-resolved hot-electron channels.
 
 Demonstrates Laser.hot_electron.sources (NUMERICS §5.11.1; design
-docs/design/hote_directional_sources_20260710.md): a TPD ring channel
+the internal design note hote_directional_sources_20260710.md): a TPD ring channel
 captured at quarter critical plus a forward SRS channel captured in the
 sub-quarter-critical band. eta / T_hot / angle knobs are CALIBRATION inputs;
 the values below are literature-plausible placeholders, not predictions.

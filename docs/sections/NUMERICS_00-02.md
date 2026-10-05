@@ -749,7 +749,7 @@ Node-grey conservation does not imply off-grid or spectrally resolved equivalenc
 セルについて、従来（`"legacy"`、bit 凍結・旧既定）は内部エネルギーを clamp 後の表値
 \(e_{\rm tab}\) で無条件に上書きしていた。laser 加熱で table 温度天井を超えた blowoff コロナ
 セルではこれが**超過エネルギーの毎ステップ無記帳破棄**になる（GXII 級 solid FLD 実測で累積
-−362 J = 吸収の 21%、docs/design/bug24_hydro_entry_eos_projection_20260718.md）。
+−362 J = 吸収の 21%、社内の設計メモ bug24_hydro_entry_eos_projection_20260718.md）。
 `"energy_authoritative"`（2026-07-18 ユーザー裁定以降の**既定**、production 再基準化済み —
 `config.hpp` の default と一致）は進化させた \(e\) を権威量として保持し、clamp セルでは
 `eos_writeback` の roundtrip 上書きも含め \(e\) を書き換えない（\(T,P,c_v\) は clamp 逆算値 =

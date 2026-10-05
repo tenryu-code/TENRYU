@@ -99,7 +99,7 @@ TENRYU_HOST_DEVICE inline BoschHaleFit bosch_hale_fit(int k) {
 // neutron_MeV's kinematic splits: line 0 = DT-n 14.049 MeV, line 1 =
 // DD-n 2.449 MeV. Targets: 0 = D, 1 = T (subset of Species; He3/He4/p
 // scattering is a documented v2 omission). Provenance and uncertainty
-// bands: docs/design/burn_kernel_v2_20260710.md section E.2 (Navratil
+// bands: the internal design note burn_kernel_v2_20260710.md section E.2 (Navratil
 // LLNL-TR-423504 appendix table; Frenje PRL 107, 122502; Miller PRC 106,
 // 024001 figure-derived; Hale PRC 42, 438). sigma in barns; convert at
 // the use site (1 b = 1e-24 cm^2).

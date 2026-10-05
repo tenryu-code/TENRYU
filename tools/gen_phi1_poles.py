@@ -10,7 +10,7 @@ Midpoint quadrature uses u_j = (j + 1/2)h for j = -M, ..., M - 1,
 theta_j = s(u_j), W_j = exp(theta_j) * s'(u_j)h / (2*pi*i), and
 omega_j = W_j / theta_j.  The locked parameters are M = 16, mu = 6.45,
 and h = 0.141; they come from the certified prototype sweep recorded in
-docs/design/exp_mg_phi1_20260717.md section 3 on 2026-07-17.
+the internal design note exp_mg_phi1_20260717.md section 3 on 2026-07-17.
 
 The certificate is the maximum relative error on the 4000-point grid
 z = -logspace(-8, 8), the absolute residuals of the three imposed moments,
@@ -101,7 +101,7 @@ def emit_header(
 // moment residuals = [{moment_residuals[0]:.17e}, {moment_residuals[1]:.17e},
 //                     {moment_residuals[2]:.17e}],
 // half-form error = {cert['half_form_error']:.17e}.
-// Provenance: docs/design/exp_mg_phi1_20260717.md section 3.
+// Provenance: the internal design note exp_mg_phi1_20260717.md section 3.
 #pragma once
 
 namespace tenryu::radiation::phi1poles {{

@@ -25,7 +25,7 @@ struct TargetResult {
   bool valid = false;
   std::string reject_reason;
   int cvt_iterations_used = 0;
-  // d1 certified skip telemetry (docs/design/
+  // d1 certified skip telemetry (the internal design notes
   // t2_d1_certified_lloyd_skip_20260815.md): set when the certified
   // predicate-margin exit ended the Lloyd loop, with the iteration index.
   bool lloyd_d1_fired = false;

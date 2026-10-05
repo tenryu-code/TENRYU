@@ -1,6 +1,6 @@
 # xc2b_streaming — XC-2b closure envelope: optically thin gap + thick wall (TENRYU side).
 # MULTI pair: ops/xc/cases/xc2b_streaming/multi.input.
-# Design: docs/design/xc_tenryu_multiife_1d_comparison_design_20260710.md §XC-2b,
+# Design: the internal design note xc_tenryu_multiife_1d_comparison_design_20260710.md §XC-2b,
 # promoted after the Addendum-5 finding (MULTI two-stream D = c/4kappa*rho).
 #
 # Constant Tr = 200 eV Marshak drive at the OUTER (right) boundary, transparent

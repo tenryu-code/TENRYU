@@ -60,7 +60,8 @@ ninja -C build</code></pre>
       <p>If configuration stops with <code>No CMAKE_CUDA_COMPILER could be found</code>, <code>nvcc</code> is not on <code>PATH</code>. A CUDA Toolkit installed by NVIDIA's instructions puts <code>nvcc</code> in <code>/usr/local/cuda/bin</code>: run <code>export PATH=/usr/local/cuda/bin:$PATH</code> and configure again, or add <code>-DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc</code> to the configure command.</p>
       <p>By default Ninja runs as many compilations at once as the CPU count plus two, and the memory the build uses grows with that number. On a machine with little memory for its CPU count (a container's memory limit included) the compiler can be killed for lack of memory, and the build stops with <code>Killed</code> in its log. Rerun with fewer parallel jobs, for example <code>ninja -C build -j 8</code>.</p>
       <p>Once the build succeeds, run one registered analytic case as the minimal end-to-end smoke check, time loop included:</p>
-      <pre><code>./build/tenryu validate examples/verification/sod_planar.py   # checks the deck and prints a summary of the setup (no run)
+      <pre><code>./build/tenryu --version   # prints the version and the source revision
+./build/tenryu validate examples/verification/sod_planar.py   # checks the deck and prints a summary of the setup (no run)
 ./build/tenryu verify noh      # an analytic case PASSes (uses the GPU)</code></pre>
       <p>With these passing, continue to the template walkthrough on <a href="running.html">Running simulations</a>.</p>
     </section>

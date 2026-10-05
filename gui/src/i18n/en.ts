@@ -424,7 +424,7 @@ export const en: Messages = {
     tab1d: "1D",
     tab2d: "2D",
     intro1d:
-      "Every preset but the CBET one was run to its end time and checked against a run on a twice finer mesh (the results are on each card, under \"Verification run\"). The meshes come from the mesh skill (tenryu-mesh-1d): laser-driven presets carry the recommended mesh that the recommender built and validated with the server's tenryu; presets driven by a radiation temperature or a pressure use a per-layer table built by the skill's rules.",
+      "Every preset was run to its end time and checked against a run on a twice finer mesh, to the end time for all but the CBET one and to 0.5 ns for the CBET one (the results are on each card, under \"Verification run\"). The meshes come from the mesh skill (tenryu-mesh-1d): laser-driven presets carry the recommended mesh that the recommender built and validated with the server's tenryu; presets driven by a radiation temperature or a pressure use a per-layer table built by the skill's rules.",
     groupBasic: "Basic",
     groupOption: "Optional kernels",
     kernelsLabel: "Kernels",
@@ -475,7 +475,7 @@ export const en: Messages = {
         title: "Direct drive with CBET and hot electrons",
         desc: "Direct drive with the 12 GXII ports: cross-beam energy transfer (CBET) and hot electrons from two-plasmon decay (TPD) and stimulated Raman scattering (SRS) with the threshold model. A 20 µm CD shell, 351 nm at 5e14 W/cm² for 1 ns. Look at the absorption and the conversion to hot electrons. CBET is expensive, so the preset traces 200 rays per beam and stops just after the pulse (1.2 ns).",
         kernels: "CBET (port layout), hot electrons (TPD, SRS), laser ray tracing, hydro, electron conduction",
-        result: "No verification run to the end time (1.2 ns) yet. The CBET and hot-electron parts have been checked only over the first tens of picoseconds of the pulse.",
+        result: "Run to 1.2 ns (2.6 h and 110 000 steps on an RTX 4090; a step takes about 5 ms at the start of the pulse and grows with the corona to about 200 ms at the end). Absorption 74 %. The CBET iteration converged on every step (3 iterations on average); the sum over beam pairs of the absolute exchanged power, integrated over time, is 170 J (3.9 % of the incident energy). No hot electrons arise in this setup: the TPD threshold measure I14·Ln·λ/(82 Te) peaks at 0.79 (1.1 ns), below 1, so the conversion stays 0 throughout. Against the twice finer mesh, compared up to 0.5 ns: the absorbed energy is 1.3 % lower on the finer mesh (the gap forms before 0.4 ns; the absorption over 0.45-0.5 ns is 77.2 % and 77.4 %), and the mean shell radius differs by 0.2 %, the peak density by 1.6 %, ρR by 0.4 % and the TPD threshold measure by 2.0 %. A comparison to the end time is not done yet: the finer run takes about 11 h.",
       },
       burnPusher: {
         title: "Burning exploding pusher",

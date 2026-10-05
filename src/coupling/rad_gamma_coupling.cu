@@ -1,5 +1,5 @@
 // W-K gamma_r = 4/3 radiation-compression kernels. See the header and
-// docs/design/wk_gamma_r_coupling_design.md.
+// the internal design note wk_gamma_r_coupling_design.md.
 
 #include "coupling/rad_gamma_coupling.cuh"
 #include "coupling/rad_gamma_coupling_bodies.cuh"

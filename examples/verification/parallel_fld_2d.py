@@ -1,9 +1,9 @@
-# MPI rank-count agreement gate deck (VERIFICATION §16.3, M18c).
+# MPI rank-count agreement gate deck (the internal verification record §16.3, M18c).
 # 2D RZ multigroup FLD: a hot disk at the domain center diffuses radiation
 # radially ACROSS the r-slab rank interface (and in z), with 2T matter
 # coupling active. Owned-slab dumps from P in {2,4} and P=1 runs are
 # compared field-max-normalized (tools/validation/compare_owned_dump.py
-# --rtol). Two deck classes (VERIFICATION §16.3):
+# --rtol). Two deck classes (the internal verification record §16.3):
 #   diffusion-limit (default, kappa_a=50): stiff hot-disk edge; gate =
 #     two-tier — steps=1 <=1e-8 (defect detector) and steps=25 <=1e-4
 #     (trajectory band; CG dot-reorder seeds ~1e-12, the stiff Newton
@@ -16,7 +16,7 @@
 # cap makes iteration counts data-dependent and the 25-step comparison
 # chaos-dominated (measured: cap=400 -> 1e-4..1e-2). Do not "fix" the cap.
 # Tier numbers are provisional pending user ratification — design doc
-# docs/design/mpi_m18_20_20260717.md §6h; spec mpi_m18c_fld2d_cg_spec.md.
+# the internal design note mpi_m18_20_20260717.md §6h; spec mpi_m18c_fld2d_cg_spec.md.
 #
 # Env knobs:
 #   TENRYU_PFLD2D_SOLVER    linear_solver_2d (default cusparse_cg_zline;

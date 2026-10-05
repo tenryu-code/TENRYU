@@ -1,6 +1,6 @@
 # xc3_radiative_ablation — XC-3 subsonic radiative ablation (TENRYU side).
 # MULTI pair: ops/xc/cases/xc3_rad_ablation/multi.input.
-# Design: docs/design/xc_tenryu_multiife_1d_comparison_design_20260710.md §XC-3.
+# Design: the internal design note xc_tenryu_multiife_1d_comparison_design_20260710.md §XC-3.
 #
 # Constant Tr = 150 eV Marshak drive onto a solid Be-like ideal-gas slab
 # (Z=4 fixed, A=9, rho=1.85, gamma=5/3), constant grey kappa = 3e3 cm^2/g

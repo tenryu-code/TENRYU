@@ -12,7 +12,7 @@
 
 namespace tenryu::laser {
 
-// CBET v1 (design: docs/design/cbet_1d_v1_design_20260707.md).
+// CBET v1 (design: the internal design note cbet_1d_v1_design_20260707.md).
 // Conservative pairwise cell exchange between angular ray groups on the 1D_SPH
 // ray bundle, with a 2D_RZ mode that recomputes pair coupling and deposits to
 // LaserMesh nodes. All floating-point tallies are atomic-free / fixed-order and

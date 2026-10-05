@@ -520,7 +520,7 @@ struct State {
   // flat ranges are contiguous). Zero-initialized = "full range": the
   // owned_* helpers below then return [0, n), so single-rank launch
   // parameters are bit-identical to the undecomposed code.
-  // (docs/design/mpi_m18_20_20260717.md §3/§4.1)
+  // (the internal design note mpi_m18_20_20260717.md §3/§4.1)
   int owned_cell_begin = 0;
   int owned_cell_end = 0;
   int owned_node_begin = 0;
@@ -662,7 +662,7 @@ struct State {
   CellField1D wake_heat_flux_eta;
   CellField1D wake_heat_flux_zeta;
   // 2D Braginskii viscosity corner forces / work tally
-  // (docs/design/2d_visc_port_spec.md §2.3; sized n_cells*4 / n_cells,
+  // (the internal design note 2d_visc_port_spec.md §2.3; sized n_cells*4 / n_cells,
   // allocated only when plasma_viscosity.enabled).
   CellField1D corner_force_visc_r;
   CellField1D corner_force_visc_z;

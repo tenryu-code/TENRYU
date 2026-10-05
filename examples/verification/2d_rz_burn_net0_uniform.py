@@ -1,4 +1,4 @@
-"""G2D-NET0: uniform DT box, burn scheme=local plumbing gate (spec docs/design/2d_burn_port_spec.md section 10 item 3)."""
+"""G2D-NET0: uniform DT box, burn scheme=local plumbing gate (the internal design note 2d_burn_port_spec.md section 10 item 3)."""
 
 from tenryu_namelist import *
 

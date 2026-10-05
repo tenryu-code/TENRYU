@@ -2,6 +2,31 @@
 
 配布スナップショットの更新記録です。日付はスナップショット作成日。
 
+## 2026-10-05（コマンドラインのヘルプと版の表示、ビルドの手順、公開物の参照、Studio の CBET のプリセットの実測）
+
+- **`tenryu --help`・`tenryu --version`・引数なしの `tenryu` が何も表示しなかったのを直しました。** 標準出力の 4 MiB
+  のバッファがプログラムの終了処理の途中で先に解放され、最後の書き出しの前に失われていました（run と validate の
+  出力は、ログの仕組みが終了前に書き出していたので、失われていませんでした）。ヘルプは使い方とサブコマンドを、
+  `--version` は版（`1.0.0-beta.1`）と元のソースの版（公開物では書き出したコミット、git の作業木ではそのコミット）
+  を表示します。
+- 出力の凍結設定（`metadata/frozen_config`）の `_tenryu_version` が `0.0.1` から `1.0.0-beta.1` になりました。
+  checkpoint からの再開の比較には含まれないので、以前の checkpoint からも再開できます。
+- BUILD.md: CUDA Toolkit の nvcc にパスを通す手順を加えました（NVIDIA の手順で導入した CUDA 12.6 は nvcc を
+  `/usr/local/cuda/bin` に置くので、そのままでは configure が `No CMAKE_CUDA_COMPILER could be found` で止まって
+  いました）。pybind11 は導入済みのものを使い、無ければ CMake が configure 時に取得すると書き直しました（取得できない
+  計算機では、Ubuntu 24.04 の `pybind11-dev` か pip で先に導入します）。
+- 公開物の文書とソースのコメントに残っていた、同梱しない社内の記録（設計メモ・検証記録・性能記録・引き継ぎメモ）
+  への参照を、社内の記録であることが分かる書き方にしました。モジュール構成（`docs/ARCHITECTURE.md`）と GPU
+  カーネルの一覧（`docs/CUDA_KERNELS.md`。どちらもこれまで `docs/sections/` に章ごとに分けて同梱）と、物性表
+  TMAT-H5 の形式（`docs/TMAT_H5_SPEC.md`）を同梱しました。
+- Studio の試験（`gui` の `npm test`）のうち、公開物に含まれない入力デッキ（リポジトリの `tests/` の下）を読む
+  4 本が失敗していたのを、その入力が無いときは飛ばすようにしました。
+- Studio の CBET と高速電子のプリセットを、RTX 4090 で終了時刻（1.2 ns）まで計算しました（2.6 時間、約 11 万 step）。
+  1 step の時間は照射の始めの約 5 ms から、コロナが広がるにつれて長くなり、終わりには約 200 ms です（2026-10-01 の
+  節の「1 step が約 0.3 秒」は今の版には当てはまりません）。吸収率は 74 % です。この条件では高速電子のしきい値に
+  届かず（TPD のしきい値の指標の最大 0.79）、高速電子は生じません。2 倍細かいメッシュとは 0.5 ns まで比べました。
+  カードの「検証の run」、Studio のマニュアル、サイトの GUI の頁に結果を載せました。
+
 ## 2026-10-03（1D のレイトレースの高速化、Studio: 推薦メッシュの格子の図をサーバーで確かめる前から表示）
 
 - **1D の特性曲線のレイトレース（`Laser.raytrace.integrator="characteristic"`、1D の既定）で、復路の区間の積分（弧長・
@@ -575,7 +600,7 @@ GUI（TENRYU Studio）の英語表示の不具合を直しました。ソルバ�
 
 ### 機能追加
 
-- **物理由来の初期メッシュ分解能要求（1D、実験的）。** `Mesh.resolution_requirement` により、デッキのレーザー波形・波長・材料層・幾何からアブレート帯の面密度質量天井プロファイル・衝撃波分離天井・層あたり最小セル数を決定論的に見積もり、`validate` と run 開始時に判定します（`apply="report"` 既定はメッシュ不変、`apply="enforce"` は `zoning_intent` に推奨帯を注入／他形式は違反時に拒否）。run 出力に `mesh_requirement.json`、`validate --mesh-preview` に全 1D 形式の節点列と要求・判定を追加。アシスタントの `lint-deck` は要求違反を hard lint として反復フィードバックし、`generate-deck` はプロンプトに要求を提示、`zoning-report` は probe 実測との比を報告します（NUMERICS §3.1.0c、設計 docs/design/mesh_resolution_requirement_20260903.md）。
+- **物理由来の初期メッシュ分解能要求（1D、実験的）。** `Mesh.resolution_requirement` により、デッキのレーザー波形・波長・材料層・幾何からアブレート帯の面密度質量天井プロファイル・衝撃波分離天井・層あたり最小セル数を決定論的に見積もり、`validate` と run 開始時に判定します（`apply="report"` 既定はメッシュ不変、`apply="enforce"` は `zoning_intent` に推奨帯を注入／他形式は違反時に拒否）。run 出力に `mesh_requirement.json`、`validate --mesh-preview` に全 1D 形式の節点列と要求・判定を追加。アシスタントの `lint-deck` は要求違反を hard lint として反復フィードバックし、`generate-deck` はプロンプトに要求を提示、`zoning-report` は probe 実測との比を報告します（NUMERICS §3.1.0c）。
 - **格子収束の実測キャンペーンと較正。** `tools/validation/mesh_convergence_campaign.py`（29 ケース×表面面密度質量の梯子、観測量抽出と収束判定、参照表出力）を追加し、その結果（`docs/validation/mesh_convergence_reference.md`、`tools/assist/data/mesh_convergence_reference.json`）から `Mesh.resolution_requirement` の既定を較正（`zones_per_scale_length` 9、強度補正 `intensity_exponent` 0.4）。
 - **`dr_min` と要求天井の衝突検査。** 要求 JSON に帯ごとの `width_max_cm` と `ablation.dr_min_admissible_cm`（注入天井と両立する最大の `dr_min`）を追加。`apply="enforce"` で `zoning_intent.dr_min` がこれを超える場合は求解前に `MESH_RESOLUTION_REQUIREMENT_DR_MIN_CONFLICT` で拒否します（メッセージに許容値を明記）。アシスタントの要求サマリ・生成ガイド・スキルにも反映。
 - `tools/assist`: new `docmap` verb (deterministic document map + namelist key index from the `enforce_known_keys` lists in `src/core/namelist/builder.cpp`) and `ask` verb (question answering about TENRYU from the checkout's documents and source, with automatic checks that cited paths and namelist keys exist). New role `question_answering`; read-only provider examples in `tools/assist/assistant.example.toml`. Each user runs it with their own CLI login or API key.

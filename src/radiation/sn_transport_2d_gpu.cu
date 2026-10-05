@@ -39,7 +39,7 @@ inline void cuda_check(const cudaError_t err, const char* message) {
 }
 
 // Indirect-drive Tr(t) resolution for the deterministic 2D marshak z faces
-// (docs/design/2d_tr_drive_port_spec.md §2). IMC-2D precedence verbatim
+// (the internal design note 2d_tr_drive_port_spec.md §2). IMC-2D precedence verbatim
 // (source.cu emit_marshak): the per-face table (canonical key, then alias)
 // wins over the constant marshak_Tr_eV (>0), which wins over the scalar
 // marshak_Tr table. Solve-entry time; tables are frozen at init (no runtime
@@ -1826,7 +1826,7 @@ void advance_radiation_step_sn_2d_rz(
   const int z_top_bc = sn_boundary_code(sn.boundary.z_top);
   const int r_outer_bc = sn_boundary_code(sn.boundary.outer_r);
   double marshak_flux = std::max(sn.marshak.flux_erg_per_cm2_s, 0.0);
-  // Indirect-drive Tr(t) marshak z boundary (grey v1; spec docs/design/
+  // Indirect-drive Tr(t) marshak z boundary (grey v1; the internal design notes
   // 2d_tr_drive_port_spec.md §4): resolved once at solve entry with the
   // IMC-2D precedence and fed through the existing scalar slot — the sweep
   // kernels are unchanged. Builder validation guarantees
@@ -1856,7 +1856,7 @@ void advance_radiation_step_sn_2d_rz(
     evaluate_opacity(state, cfg, planck, mat, n_cells, n_groups, dt);
     SNTransportGPUConfig gpu_cfg{};
     // I3 quadrature-ladder verification requires a true S_4 rung
-    // (polar-order n_angles=4; docs/design/i3_sn_radshock_spec.md §4.4,
+    // (polar-order n_angles=4; the internal design note i3_sn_radshock_spec.md §4.4,
     // main ruling D1 2026-07-04). Clamp change is a bitwise no-op for every
     // existing deck: none requests n_angles < 8.
     gpu_cfg.n_angles = std::max(sn.n_angles, 4);

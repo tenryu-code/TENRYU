@@ -36,7 +36,7 @@ Outputs land in `outputs/<deck name>/`.
   the table-opacity variants section below. The shipped decks stay on gray
   constants for reproducibility. Mixed cells evaluate each contributing
   material's table at its partial density and combine with mass-fraction
-  weights (`docs/design/multimaterial_table_opacity_20260829.md`). Table
+  weights (the internal design note multimaterial_table_opacity_20260829.md). Table
   EOS (`eos.model="tmat"`) is fine in any deck.
 
 ## Examples and measured commissioning metrics
@@ -96,7 +96,7 @@ LTE tables are fine for pure radiative-hydro (EX-05/EX-08 class).
   0.044 g/cc; CD: 5.0e3 — the CD-table Planck mean at 1.05 g/cc, 100–150 eV,
   i.e. the surface-absorption regime; D2/DT: 1). Precursor lengths, drive coupling, and
   burn timing shift accordingly; the table-opacity upgrade
-  (docs/design/multimaterial_table_opacity_20260829.md) is the fix path.
+  (the internal design note multimaterial_table_opacity_20260829.md) is the fix path.
 - **History note**: runs performed before commit 48bce971b silently applied
   the FIRST non-void material's opacity to the whole mesh in 1D; any archived
   results from before that commit are superseded by reruns.

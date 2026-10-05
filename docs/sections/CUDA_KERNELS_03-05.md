@@ -539,7 +539,7 @@ void ray_trace_2d(
 #### Diagnostic per-ray step counts
 
 The `ray_trace_*` launcher wrappers accept an optional `d_step_count` device
-array for Phase 0 diagnostics (see `docs/design/laser_kernel_rewrite_plan.md`
+array for Phase 0 diagnostics (see the internal design note laser_kernel_rewrite_plan.md
 v2 §2.1). The parameter is null-by-default; passing `nullptr` is the production
 path. When present, the kernel writes each ray's final loop count at
 termination. This is diagnostic-only and does not affect deposition, ray

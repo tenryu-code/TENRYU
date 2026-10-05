@@ -33,7 +33,7 @@ Materials(
 
 Geometry(
     volfrac=dict(plasma=lambda r: 1.0),
-    # VERIFICATION §6.11 corona profile:
+    # the internal verification record §6.11 corona profile:
     # rho(r)=rho0*exp(-(r-R_crit)/H), rho0=1.0 g/cc, R_crit=0.025 cm, H=50 um.
     rho=lambda r: exp(-(r - 0.025) / (50.0e-4)),
     Te=lambda r: 100.0,

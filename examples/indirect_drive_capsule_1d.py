@@ -1,7 +1,7 @@
 # Indirect-drive capsule example: a hohlraum-equivalent radiation temperature waveform Tr(t) drives a CH-like
 # shell around a low-density fuel-like fill; the ablation front launches the compression. Input = Tr(t) via
 # Radiation.boundary.marshak_Tr (frozen to a table at init); see
-# docs/design/indirect_drive_tr_boundary_20260709.md.
+# the internal design note indirect_drive_tr_boundary_20260709.md.
 from tenryu_namelist import *
 
 Main(

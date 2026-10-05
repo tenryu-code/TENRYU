@@ -4,7 +4,7 @@
 // moment residuals = [1.25607396694702013e-15, 1.11022302462515654e-16,
 //                     7.94410929039127398e-15],
 // half-form error = 1.22124532708767219e-15.
-// Provenance: docs/design/exp_mg_phi1_20260717.md section 3.
+// Provenance: the internal design note exp_mg_phi1_20260717.md section 3.
 #pragma once
 
 namespace tenryu::radiation::phi1poles {

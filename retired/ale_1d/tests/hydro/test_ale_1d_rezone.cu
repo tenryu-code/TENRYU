@@ -398,7 +398,7 @@ TEST_CASE("ALE1D min-width floor candidate respects a pinned partition wall",
 }
 
 // SKIPPED (wave-5): bench engagement blocked by an unidentified remap
-// extensive-field validation failure; see docs/design/perf_1d_wave5_20260807.md B1.
+// extensive-field validation failure; see the internal design note perf_1d_wave5_20260807.md B1.
 TEST_CASE("ALE1D min-width floor candidate converges progressively",
           "[hydro][ale1d][rezone][min-width-floor][.]") {
   constexpr int n = 60;
@@ -478,7 +478,7 @@ TEST_CASE("ALE1D min-width floor candidate is sweep-safe",
 }
 
 // SKIPPED (wave-5): bench engagement blocked by an unidentified remap
-// extensive-field validation failure; see docs/design/perf_1d_wave5_20260807.md B1.
+// extensive-field validation failure; see the internal design note perf_1d_wave5_20260807.md B1.
 TEST_CASE("ALE1D min-width floor candidate is sweep-safe under progressive "
           "taper relief",
           "[hydro][ale1d][rezone][min-width-floor][.]") {

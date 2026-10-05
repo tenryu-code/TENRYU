@@ -108,12 +108,11 @@ void setup_file_logging(const std::string& log_dir) {
         static_cast<long long>(flush_every_s * 1000.0)));
   }
   // Normal-exit completeness for the buffered stdout sink: drain the
-  // enlarged stdout buffer while its storage (a function-local static in
-  // main.cpp) is still alive — teardown ordering otherwise loses the tail
-  // (observed: run.log truncated to pre-logger lines on a clean exit).
-  // Registered after that static's construction, so it runs before the
-  // static's destructor in the LIFO atexit order. Crash paths flush
-  // explicitly in core/error.cpp.
+  // enlarged stdout buffer before the static objects are torn down
+  // (observed before the buffer was made permanent: run.log truncated to
+  // pre-logger lines on a clean exit). main.cpp no longer frees that buffer,
+  // so stdio's own final flush is safe as well; this keeps the drain ahead
+  // of the other teardown. Crash paths flush explicitly in core/error.cpp.
   (void)std::atexit([] { std::fflush(stdout); });
 }
 

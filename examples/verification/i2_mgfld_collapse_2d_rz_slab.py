@@ -6,7 +6,7 @@ because multigroup (groups>1) forbids state_supply/marshak radiation
 z-boundaries (builder ConfigError; SPECIFICATION §6.4.5) — the I2 coupled
 runs are a propagating two-state Riemann radiative shock in a closed
 reflecting box, grey comparator (groups=1) run under the byte-identical
-configuration. Spec: docs/design/i2_mgfld_collapse_spec.md (v3.1).
+configuration. Spec: the internal design note i2_mgfld_collapse_spec.md (v3.1).
 """
 
 import bisect

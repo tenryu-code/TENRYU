@@ -128,7 +128,7 @@ N_{p,f} = \text{round}\!\left(N_{marshak\_total} \times \frac{A_f}{\sum_f A_f}\r
 - 面上の位置：面上で一様ランダム（1 RNG draw for face-local coordinate）
 - 方向：cos-weighted half-space（2 RNG draws、NUMERICS §6.2）
 
-> **注意**：Marshak BCはMarshak wave検証問題（VERIFICATION §7.2）で使用される。
+> **注意**：Marshak BCはMarshak wave検証問題（社内の検証記録 §7.2）で使用される。
 > 本番ICFシミュレーションでは通常 vacuum BC を使用する。
 
 ### 8.3 レーザー
@@ -626,7 +626,7 @@ E_{emit} + E_{census}^{n} = E_{abs} + E_{esc} + E_{census}^{n+1} + E_{numerical\
 - \(E_{numerical\_loss}\)：移送失敗（R8 MAX\_EVENTS 超過）・退化セル未注入（U1 `ρV < 10^{-30}`）・粒子喪失（P6）等による数値的喪失。**注**: Russian roulette（R8 step 7 / R12）で消滅した粒子のエネルギーは `rad_dep` に沈着され \(E_{abs}\) に含まれるため、\(E_{numerical\_loss}\) には計上しない
 
 放射サブシステム保存誤差：\(\varepsilon_{rad} = |LHS - RHS| / \max(E_{emit} + E_{census}^{n},\, 10^{-20})\)。
-各ステップで \(\varepsilon_{rad}\) を history に記録し、VERIFICATION §2.3 の閾値（1ステップ \(10^{-6}\)）を適用する。
+各ステップで \(\varepsilon_{rad}\) を history に記録し、社内の検証記録 §2.3 の閾値（1ステップ \(10^{-6}\)）を適用する。
 
 **rad_dep と deposited_power の変換規約**：
 内部タリー量 `rad_dep[i,g]` は **当該ステップ \(\Delta t\) 中に群 g でセル i が受け取った放射交換エネルギー [erg]** である。

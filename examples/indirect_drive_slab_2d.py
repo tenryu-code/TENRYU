@@ -3,7 +3,7 @@
 A CH-like slab is driven from the z_bottom face by a blackbody radiation
 temperature ramp (0 -> 150 eV over 0.05 ns, then hold). Multigroup FLD; the
 Tr(t) route supplies per-group Planck weights (grey constant-flux drive would
-be groups=1 only). See docs/design/2d_tr_drive_port_spec.md and NUMERICS §6.7.
+be groups=1 only). See the internal design note 2d_tr_drive_port_spec.md and NUMERICS §6.7.
 
 Run:  ./build/tenryu run examples/indirect_drive_slab_2d.py
 """

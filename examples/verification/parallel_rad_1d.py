@@ -1,4 +1,4 @@
-# MPI 1D deterministic-radiation replication gate deck (VERIFICATION
+# MPI 1D deterministic-radiation replication gate deck (the internal verification record
 # §16.4, M18c). 1D spherical thin shell at large radius (r in [100.0,
 # 100.6] cm — planar-like), three regions: hot wall layer (300 eV, r <
 # 100.1) | mid layer | cold bath (10 eV), 2T, hydro on, constant opacity.
@@ -13,7 +13,7 @@
 # interface = cell 96 both sit inside the gap cells 64..127). True-void
 # contracts stay covered by the P=1 ctest gate
 # sn_1d_planar_transparent_gap; this deck gates rank-count invariance.
-# Design doc docs/design/mpi_m18_20_20260717.md §6h.
+# the internal design note mpi_m18_20_20260717.md §6h.
 #
 # Env knobs:
 #   TENRYU_PRAD1D_MODE      "multigroup_diffusion" (default) |

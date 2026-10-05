@@ -62,7 +62,7 @@ SMOKE_SHOCK_WINDOW_DZ = 5.0
 RHO_SLAB_DEFAULT_GCC = 1.0
 SMOKE_SHOCK_RHO_JUMP_MIN_GCC = 0.05 * RHO_SLAB_DEFAULT_GCC
 # Measured population: 0.045 clean .. 5.9 polluted .. 2160 runaway;
-# docs/design/2d_campaign_plan_20260708.md Addendum 12 exec-record 6.
+# the internal design note 2d_campaign_plan_20260708.md Addendum 12 exec-record 6.
 FLOOR_RUNAWAY_RATIO = 50.0
 FLOOR_POLLUTED_RATIO = 0.5
 REPLICA_BAND_TOL = {

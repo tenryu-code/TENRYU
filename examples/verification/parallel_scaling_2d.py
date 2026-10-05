@@ -1,4 +1,4 @@
-# MPI M20 scaling deck (VERIFICATION SS16.11): the parallel_fld_2d gate
+# MPI M20 scaling deck (the internal verification record SS16.11): the parallel_fld_2d gate
 # physics (hydro + FLD diffusion-limit) on a scalable mesh. Weak scaling
 # grows NR with the rank count (r_max grows with it so the cell size and
 # time step stay fixed); strong scaling fixes the global mesh.

@@ -173,7 +173,7 @@ bool verify_cuda_available(const char* verify_name) {
 int verify_not_implemented(const std::string& verify_name,
                            const std::string& verification_section) {
   std::cout << "[SKIP] " << verify_name
-            << ": not yet implemented (VERIFICATION "
+            << ": not yet implemented (the internal verification record "
             << verification_section << ")\n";
   return 0;
 }
@@ -2613,9 +2613,9 @@ bool run_sedov_verify() {
   const double rs_numeric = estimate_sedov_shock_radius(state);
   const double rs_rel = std::abs(rs_numeric - rs_analytic) / rs_analytic;
 
-  // VERIFICATION §3.1: Sedov shock-front position acceptance.
+  // the internal verification record §3.1: Sedov shock-front position acceptance.
   constexpr double kShockRadiusRelTol = 0.02;
-  // VERIFICATION §2.3 / §3.1: deterministic hydro energy conservation threshold.
+  // the internal verification record §2.3 / §3.1: deterministic hydro energy conservation threshold.
   constexpr double kEnergyRelTol = 1.0e-14;
   const bool pass_radius = rs_rel <= kShockRadiusRelTol;
   const bool pass_energy = energy_rel <= kEnergyRelTol;
@@ -2914,7 +2914,7 @@ bool run_sod_planar_verify() {
   return pass;
 }
 
-// W-G2 sod_cylindrical (design: docs/design/wg2_sod_cylindrical_design.md).
+// W-G2 sod_cylindrical (design: the internal design note wg2_sod_cylindrical_design.md).
 // Part A: quasi-planar annulus limit — cylindrical r0=10/20 vs a planar
 // reference run through the SAME deck, each compared to the Toro exact
 // solution in local coordinates; the geometry excess must be positive and
@@ -3247,7 +3247,7 @@ bool run_noh_impl(const std::string& label, const std::string& namelist_path, co
       }
     }
   } else {
-    // Historic spherical measures (VERIFICATION §3.2):
+    // Historic spherical measures (the internal verification record §3.2):
     // density max sits ~6 cells behind the front and the wall-heating sag
     // makes windowed medians read low, so the max IS the plateau measure.
     rs_numeric = std::max(
@@ -3256,7 +3256,7 @@ bool run_noh_impl(const std::string& label, const std::string& namelist_path, co
   }
 
   // Plateau median measure for the resolution-convergence study
-  // (VERIFICATION 3.2r): median over the (0.5, 0.9)*R_front window measured
+  // (the internal verification record 3.2r): median over the (0.5, 0.9)*R_front window measured
   // from the half-height front crossing — behind the face ringing, ahead of
   // the wall-heated core.
   double rho_plateau_median_diag = -1.0;
@@ -3292,7 +3292,7 @@ bool run_noh_impl(const std::string& label, const std::string& namelist_path, co
   const double v_outer = host_vr.back();
   const double v_outer_rel = std::abs(v_outer + kV0) / kV0;
 
-  // VERIFICATION §3.2: Noh shock-radius acceptance. Cylindrical at nr=200
+  // the internal verification record §3.2: Noh shock-radius acceptance. Cylindrical at nr=200
   // shows a genuine ~2.5% front lead (paired with a +2.5% plateau — normal
   // VNR/wall-heating scheme error at this resolution; spherical shows the
   // same magnitude with opposite sign), so its bound is 3.5% pending the
@@ -3300,15 +3300,15 @@ bool run_noh_impl(const std::string& label, const std::string& namelist_path, co
   // still trip it.
   const double kShockRadiusRelTol =
       (geometry == "cylindrical") ? 0.035 : 0.02;
-  // VERIFICATION §3.2: Noh density plateau acceptance.
+  // the internal verification record §3.2: Noh density plateau acceptance.
   // CSW98-default recalibration 2026-08-07: deck nr=400 measured median
   // rel_err 5.70e-2 with convergence order 0.93/0.97 on the 200/400/800
   // ladder; the max-based VNR-era metric stays logged as a diagnostic.
   constexpr double kPlateauRelTolMedianSph = 0.07;
   constexpr double kPlateauRelTol = 0.05;
-  // VERIFICATION §2.3 / §3.2: deterministic hydro energy conservation threshold.
+  // the internal verification record §2.3 / §3.2: deterministic hydro energy conservation threshold.
   constexpr double kEnergyRelTol = 1.0e-14;
-  // VERIFICATION §3.2: free-outer-boundary velocity retention tolerance.
+  // the internal verification record §3.2: free-outer-boundary velocity retention tolerance.
   constexpr double kOuterVelocityRelTol = 0.02;
   const bool pass_radius = rs_rel <= kShockRadiusRelTol;
   const bool pass_plateau =
@@ -5273,14 +5273,14 @@ bool run_su_olson_verify() {
   const double E_denom = std::max(std::max(std::abs(E_total0), E_source), 1.0e-20);
   const double energy_rel = std::abs((E_total1 - E_total0) - E_source) / E_denom;
 
-  // VERIFICATION §7.1: Su-Olson temperature profile tolerance.
+  // the internal verification record §7.1: Su-Olson temperature profile tolerance.
   constexpr double kTempRelTol = 0.20;
   const bool pass_temp = max_rel <= kTempRelTol;
   // energy_rel uses state.rad_E from the track-length estimator
   // (rad_E_tally / (V * c * dt)), which is a time-averaged quantity, not census
   // photon energy.  This introduces an O(sigma_a_eff * c * dt / 2) bias versus
   // census energy (~4.5% for Su-Olson), plus MC statistical noise (~1-2%).
-  // VERIFICATION §7.1 / §2.3: cumulative energy tolerance for Su-Olson IMC runs.
+  // the internal verification record §7.1 / §2.3: cumulative energy tolerance for Su-Olson IMC runs.
   constexpr double kEnergyRelTol = 0.10;
   const bool pass_energy = energy_rel <= kEnergyRelTol;
   const bool pass = pass_temp && pass_energy;
@@ -5383,17 +5383,17 @@ bool run_marshak_verify(const bool run_su_olson_regression) {
     su_olson_ok = run_su_olson_verify();
   }
 
-  // VERIFICATION §7.2: Marshak probe-sampled profile tolerance gate.
+  // the internal verification record §7.2: Marshak probe-sampled profile tolerance gate.
   constexpr double kL2RelTol = 0.22;
   const bool pass_l2 = (l2_rel <= kL2RelTol);
-  // VERIFICATION §7.2: Marshak pointwise gate — heated-zone L_inf (x <= 1.5 cm).
+  // the internal verification record §7.2: Marshak pointwise gate — heated-zone L_inf (x <= 1.5 cm).
   // Back-slab (x >= 2 cm) excluded: known Fleck-scattering wavefront diffusion
   // in 1-group IMC produces O(1) systematic errors beyond the thermal front.
   constexpr double kLinfHeatedTol = 0.10;
   const bool pass_linf = (linf_heated <= kLinfHeatedTol);
   // (The statistical-error ceiling of the Monte Carlo Marshak source, 1/sqrt(particles), left with the Monte Carlo
   // radiation on 2026-09-29; the deck runs the deterministic FLD.)
-  // VERIFICATION §2.3: deterministic driver time-integration closure tolerance.
+  // the internal verification record §2.3: deterministic driver time-integration closure tolerance.
   constexpr double kTimeRelTol = 1.0e-10;
   const bool pass_t = (t_rel <= kTimeRelTol);
   const bool pass = pass_l2 && pass_linf && pass_t && su_olson_ok;
@@ -6956,7 +6956,7 @@ int cmd_verify(const std::string& test_name, const bool generate_golden) {
   try {
     core::namelist::PythonGuard python_guard;
 
-    // Verification test-name drift map (VERIFICATION.md -> current CLI key):
+    // Verification test-name drift map (the internal verification record -> current CLI key):
     // - `beer_lambert` -> `laser_beer_lambert` (deprecated alias still accepted)
     // - the Monte Carlo radiation targets (imc_ddmc_*, ddmc_*, nlte_*, mmatrix_fallback,
     //   void_passthrough, gxii_1d_regression, and the photon-transport stubs

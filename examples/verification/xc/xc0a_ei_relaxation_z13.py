@@ -1,5 +1,5 @@
 # XC-0a leg z1 — electron-ion relaxation coefficient probe (TENRYU side).
-# Cross-comparison vs MULTI-IFE per docs/design/xc_tenryu_multiife_1d_comparison_design_20260710.md
+# Cross-comparison vs MULTI-IFE per the internal design note xc_tenryu_multiife_1d_comparison_design_20260710.md
 # MULTI pair: ops/xc/cases/xc0a_z13/ (identical rho/Te/Ti/A/Z, ihydro=0, iradia=0, iheation=0).
 # Uniform state => conduction and hydro inert by construction (hydro must stay ENABLED:
 # TENRYU applies Q_ei inside the hydro step — see Numerics comment). Deliverable:

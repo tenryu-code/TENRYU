@@ -619,7 +619,7 @@ if CENTRAL_PSEUDO_CORE_ENABLED:
             central_pseudo_core_absorb_watch_rows=int(
                 _env_float(PREFIX + "DECK_PC_WATCH_ROWS", 2)),
             # terminal endgame retired (user ruling 2026-08-27; see
-            # docs/design/terminal_takeover_removal_20260827.md): CASE D verifies
+            # the internal design note terminal_takeover_removal_20260827.md): CASE D verifies
             # the absorption schedules and the remap conservation gate through the
             # pre-terminal window only.
             remap_mass_closure_reject_tol=_env_float(

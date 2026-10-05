@@ -3,7 +3,7 @@
 # (hydro_1d apply_1t_energy_renorm requires !use_two_temp). With Z=0 there
 # are no electrons, so the dynamics are identical to the 1T deck; only the
 # global ee renorm smear is absent. Used via TENRYU_SOD_DIAG_DECK for the
-# clean convergence ladder (VERIFICATION.md 3.2s). Not wired as a default gate.
+# clean convergence ladder (the internal verification record 3.2s). Not wired as a default gate.
 from tenryu_namelist import *
 
 Main(

@@ -1,6 +1,6 @@
 // 2D RZ Braginskii viscosity kernels, ion + electron channels
-// (docs/design/2d_visc_port_spec.md; electron species extension
-// docs/design/visc_2d_parity_20260717.md).
+// (the internal design note 2d_visc_port_spec.md; electron species extension
+// the internal design note visc_2d_parity_20260717.md).
 
 #include "hydro/braginskii_viscosity.cuh"
 #include "hydro/braginskii_viscosity_device.cuh"

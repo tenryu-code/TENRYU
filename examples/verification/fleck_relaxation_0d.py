@@ -4,7 +4,7 @@
 # the exact coupled radiation-matter ODE.  Large-A legs isolate the
 # electron-radiation system; A=1 legs are used by the coalescence gate where
 # legacy and table modes must share identical physics.
-# Design: docs/design/fleck_cv_default_flip_20260711.md section 5 W2.
+# Design: the internal design note fleck_cv_default_flip_20260711.md section 5 W2.
 import os
 
 from tenryu_namelist import *

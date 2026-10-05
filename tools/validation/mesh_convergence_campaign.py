@@ -1890,7 +1890,7 @@ def render_markdown(results: dict[str, Any], payload: dict[str, Any]) -> str:
         (
             "Empirical grid-convergence reference for the 1D laser-ablation "
             "mesh generator (campaign design: "
-            "docs/design/mesh_convergence_campaign_20260903.md). Each case "
+            "the internal design note mesh_convergence_campaign_20260903.md). Each case "
             "was run over a ladder of surface areal-mass zonings; `a_conv` "
             "is the coarsest surface cell areal mass [g/cm^2] for which every "
             "finer level stays within the tolerances (P_a 5 %, m_abl 10 %, "
@@ -1901,7 +1901,7 @@ def render_markdown(results: dict[str, Any], payload: dict[str, Any]) -> str:
             "{corr}); `r_c` = a_conv / predicted ceiling. Calibration keys in "
             "the JSON payload are relative to those recorded parameters; the "
             "adopted defaults are documented in "
-            "docs/design/mesh_resolution_requirement_20260903.md §7.3."
+            "the internal design note mesh_resolution_requirement_20260903.md §7.3."
         ).format(zones=zones, corr=correction),
         "",
         "| ID | Description | lambda [nm] | Waveform | rho0 profile | verdict obs. | rho_c [g/cc] | Predicted ceiling [g/cm^2] | a_conv nominal [g/cm^2] | a_conv achieved [g/cm^2] | a_conv lenient | a_conv strict (with rho_R) | r_c | r_c strict | last increment P_a | rate | Levels run | Converged? | Notes |",

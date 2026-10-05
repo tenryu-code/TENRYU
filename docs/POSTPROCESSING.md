@@ -3,7 +3,7 @@
 The standard visualization package for TENRYU 1D (`Main.dimension="1D_SPH"`)
 run outputs. One CLI, nine subcommands, all reading the frozen HDF5 output
 schema. Design and as-built record:
-`docs/design/plot1d_standard_package_20260709.md`.
+the internal design note plot1d_standard_package_20260709.md.
 
 ```
 tools/tenryu-plot <subcommand> <run-dir> [options]          # from the repo root

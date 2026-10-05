@@ -68,9 +68,11 @@ describe("headerless GUI decks: binary-free equivalence", () => {
   },120000);
 });
 
+// The fixtures live under tests/, which the public beta does not ship.
+const deckImportFixtures = path.join(root,"tests/tools/fixtures/deck_import");
 describe("handwritten decks and edit fidelity",()=>{
-  for (const fixture of ["handwritten.py","waveforms.py","polar_in_box.py"]) it(fixture,()=>{
-    const filename = path.join(root,"tests/tools/fixtures/deck_import",fixture);
+  for (const fixture of ["handwritten.py","waveforms.py","polar_in_box.py"]) it.skipIf(!fs.existsSync(deckImportFixtures))(fixture,()=>{
+    const filename = path.join(deckImportFixtures,fixture);
     const form = imported(fs.readFileSync(filename,"utf8"),filename);
     expect(form.deckImport!.rules.some(r=>r.kind==="passthrough")).toBe(true);
     if (fixture==="handwritten.py") {

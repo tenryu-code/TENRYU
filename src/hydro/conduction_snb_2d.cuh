@@ -20,7 +20,7 @@ namespace tenryu::hydro::snb2d {
 // the OFF apply); d_kappa_eff is the same mfp-capped Spitzer cell array the
 // stencil was built from (used only for the theta cap's flux reconstruction).
 // The clamp pack is reset every Picard iterate so it reports the accepted
-// (final) solve only. Design: docs/design/2d_snb_port_spec.md §3.
+// (final) solve only. Design: the internal design note 2d_snb_port_spec.md §3.
 void conduction_step_2d_sts_snb(core::State& state,
                                 const core::Config& cfg,
                                 ConductionResult& result,

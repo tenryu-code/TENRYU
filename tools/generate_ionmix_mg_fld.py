@@ -8,7 +8,7 @@ One-shot reproducible generation (run from anywhere):
 
 writes tests/data/ionmix_mg_fld_g4.cn4.
 
-Design (docs/VERIFICATION.md §7.5): bounds {1, 50, 150, 400, 1500} eV chosen
+Design (the internal verification record §7.5): bounds {1, 50, 150, 400, 1500} eV chosen
 so every group carries b_g >= 3e-2 at the gate plateau T = 50 eV; per-group
 kappa {30, 100, 300, 1000} cm^2/g CONSTANT over the whole (rho, T) grid so
 the bilinear log-log table interpolation is exact at any state point;

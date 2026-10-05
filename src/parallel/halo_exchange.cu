@@ -84,7 +84,7 @@ struct CommProfTimer {
 namespace tenryu::parallel {
 namespace {
 
-// Option C layout (docs/design/mpi_m18_20_20260717.md §3): all field arrays
+// Option C layout (the internal design note mpi_m18_20_20260717.md §3): all field arrays
 // are GLOBAL-size on every rank. Halo exchange sends the owned edge strips
 // and receives the neighbor-owned strips, both addressed at their natural
 // global indices. Regions below are therefore expressed in global (i, j)

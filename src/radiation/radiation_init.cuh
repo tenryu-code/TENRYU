@@ -18,7 +18,7 @@ void initialize_radiation_field_planck_gpu(
 // (equilibrium at local Te, or uniform-Tr Planck). No-op when radiation is
 // disabled or radiation_field=="zero". Shared by cmd_run and the verify
 // loader so the two entry points cannot diverge
-// (docs/design/verify_radiation_field_init_fix_20260712.md).
+// (the internal design note verify_radiation_field_init_fix_20260712.md).
 void apply_initial_radiation_field(core::State& state,
                                    const core::Config& cfg);
 

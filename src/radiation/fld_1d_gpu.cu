@@ -1632,7 +1632,7 @@ __global__ void update_matter_kernel(
 
 // rung-2 exp_rosenbrock source substep (grey): exact frozen-coefficient
 // direct transfer q = h*phi_1(-(1+beta)h)*(E - aT^4) applied symmetrically
-// (E -= q, U_e += q) — design docs/design/fleck_exp_source_20260716.md §3.
+// (E -= q, U_e += q) — the internal design note fleck_exp_source_20260716.md §3.
 // Coefficient chain and ee/Pe closure mirror update_matter_body; the phi_1
 // evaluator is the shared fld_1d_bodies::fleck_form_phi1 (phi_1(-x)).
 template <bool EOS_TAIL>
@@ -1804,7 +1804,7 @@ __global__ void exp_source_transfer_kernel(
 }
 
 // rung-2 multigroup exp_rosenbrock source substep (design doc
-// docs/design/exp_mg_phi1_20260717.md §1): exact conservative transfer on
+// the internal design note exp_mg_phi1_20260717.md §1): exact conservative transfer on
 // the conserved hyperplane via the G x G diagonal-plus-rank-one reduction,
 //   K = -X - X*gamma*1^T (dimensionless), r_g = xi_g (b_g B_n - E_g),
 //   dE = phi1(K) r,  dU = -sum_g dE_g,

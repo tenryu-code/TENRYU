@@ -1,4 +1,763 @@
-<!-- 分割元: docs/ARCHITECTURE.md | このファイルは参照用です。原本（docs/ARCHITECTURE.md）が権威です。 -->
+# TENRYU — ARCHITECTURE.md
+本書はTENRYUの全体設計（モジュール境界、依存方向、データ所有権、並列/ GPU実行モデル）を定義する。
+
+---
+
+## 1. 設計原則（Design Principles）
+1. **GPU-first（CUDA-only）**  
+   主要計算（Hydro更新、FLD/S_N 輻射ソルバ（tridiagonal/CG solve・S_N sweep）、レーザーレイトレース）はNVIDIA GPU上で実行する。  
+   公式サポートは **CUDAのみ**（他GPU/他バックエンドは対象外）。（旧原則の「IMC/DDMC粒子追跡」は退役 — §4.5 の現行輻射モデル注記参照。）
+2. **局所性（Locality）**  
+   大域通信（MPI）を減らす。（旧原則「DDMCは疎行列ソルバを避け厚領域を局所イベント処理へ落とす」は退役 — 現行 FLD/S_N は cuSPARSE tridiagonal / CG（AMGXオプション）等の線形解法を意図的に採用する。）
+3. **明確なモジュール境界**  
+   Hydro / Radiation / Laser / Materials / Mesh / Coupling / Diagnostics / IO / Driver を分離し、依存方向を固定（循環禁止）。
+4. **再現性（Reproducibility）**
+   現行の決定論輸送（FLD/S_N）+ 1D Lagrangian 経路は同一GPU・同一構成で run-to-run bit 恒等を検証 gate で確認する（既知例外は文書化: 1D の一部 host 集計 ledger ~1e-15 帯、2D_RZ の atomicAdd 順序由来 LSB 帯 — 社内の検証記録 の noise-band gate）。
+   （旧原則: 退役 imc_ddmc モードでは MC の性質上 bitwise 再現を要求せず、同一seed・同一GPU構成での統計的再現（平均・分散一致）のみを保証していた。）
+5. **入力は単一Python namelist（Smilei方式）**  
+   すべてのシミュレーション条件は1つの `.py` に書く。  
+   C++側はCPythonを埋め込み、namelistを実行して設定を構築する（実行中にPythonを呼ばない）。
+6. **段階的拡張**  
+   3D・LPI 波動レベル計算・核燃焼等は将来拡張。v1.0の境界/抽象化は将来追加を阻害しないように設計する。（FLD は現行の既定輻射モデルとして、CBET・ホット電子プリヒートは opt-in 機能として実装済み — 「将来拡張」リストから卒業。）
+
+---
+
+## 2. 実装言語・ビルド
+### 2.1 言語
+- **C++20**（必須）
+- GPU：**CUDA C++**（必須）
+- Python：**入力namelistの実行（埋め込みCPython）**、後処理・最適化で使用
+
+### 2.2 主要依存
+
+| ライブラリ | 最低バージョン | 備考 |
+|-----------|--------------|------|
+| CUDA Toolkit | **12.0+** | `atomicAdd(double*)` は compute capability 6.0+ で必須。12.0以降の CUDA driver API を想定 |
+| C++ compiler | **C++20対応**（GCC 12+, Clang 15+, NVCC host compiler） | concepts, `<format>` は使用しない（fmt代替） |
+| MPI | **MPI-3.1+** | `MPI_Iallreduce`, `MPI_Neighbor_alltoallv` を使用。GPU-aware MPI 推奨 |
+| HDF5 | **1.12+** | 逐次版・並列版のどちらでもよい（出力は rank 0 だけが書き、MPI-IO・collective I/O は使わない。並列版を検出すると MPI をリンクする） |
+| Python3 + 開発ヘッダ | **3.10+** | namelist埋め込み用 |
+| **pybind11** | **≥ 2.11** | Python namelist → C++ Config 変換。ヘッダオンリー |
+| fmt | 9.0+ | ログフォーマット |
+| spdlog | 1.12+ | ログバックエンド |
+| Catch2 | 3.0+ | 単体テスト |
+| **CLI11** | **2.4+** | サブコマンドCLIパーサー。ヘッダオンリー。MITライセンス。FetchContent で取得 |
+| NVTX | CUDA Toolkit同梱 | プロファイル用 |
+| **cuRAND device API** | CUDA Toolkit同梱 | `curand_kernel.h` ヘッダオンリー。Philox4x32-10 デバイスRNG。`libcurand.so` リンク不要 |
+| **Hypre**（オプション） | **2.25+** | 陰的拡散ソルバ（BoomerAMG + PCG）。`-DTENRYU_ENABLE_HYPRE=ON` で有効化。`--with-cuda --with-gpu-aware-mpi` ビルド必須。MIT/Apache-2.0 デュアルライセンス |
+
+> **cuRAND device API 採用の理由**：Philox4x32-10 RNG をNVIDIA最適化実装で提供する。
+> `curand_kernel.h` はヘッダオンリーであり、`libcurand.so` のリンクは不要（デバイスAPI のみ使用）。
+> カスタムPhilox実装と比較して：(1) NVIDIA による統計品質検証済み、
+> (2) `curand_uniform_double()` は Philox で1語（uint32）消費の \(U(0,1]\) を返す（退役した輻射 Monte Carlo の CPU 参照実装
+> `philox_cpu.hpp` と一致していた — 同実装は `retired/radiation_monte_carlo/` へ移した）、
+> (3) PTX intrinsics による最適化された乗算ラウンド実装。
+> CUDA Toolkit に同梱されるため追加依存なし。ライセンスはNVIDIA EULA（ヘッダ使用、LICENSE.md参照）。
+
+> **Hypre 採用の理由**：Kershaw 9点拡散方程式の陰的解法を提供する。
+> STS（明示的、§4.4参照）ではコロナ領域の極端な剛性（\(N_{sub} > s_{max}^2/2\)）で
+> ステージ数が上限に達する場合がある。Hypre の BoomerAMG（代数的マルチグリッド）+
+> PCG は \(O(N)\) ソルバであり、Δtに対する伝導CFL制約を完全に除去する。
+> GPU対応（HYPRE_MEMORY_DEVICE、`--with-cuda` ビルド）によりデバイスメモリ上で直接解ける。
+> MIT/Apache-2.0 デュアルライセンスであり、BSD-3-Clause（TENRYU）と完全互換。
+> LLNL による exascale 実証済み（Frontier, Summit）。
+
+> **pybind11 採用の理由**：namelistのPython→C++橋渡しにpybind11を使用する。
+> ヘッダオンリーライブラリであり、ビルド依存は最小限。
+> `PyObject*` の直接操作（`PyDict_GetItemString` 等）と比較して、
+> 型安全な変換とエラーハンドリングが自動化され、Namelist::Builder のコード量を大幅に削減できる。
+> Python callable の評価は初期化時1回のみであるため、実行時オーバーヘッドは問題にならない。
+
+> 注：Kokkos等の抽象化は **公式には採用しない**（CUDA-only方針を明確化するため）。  
+> もし導入する場合も “CUDA backend固定” とし、他バックエンドはビルド無効にする。
+
+### 2.3 ビルド（CMake）
+- CMake + Ninja
+- 代表：
+  - `-DTENRYU_ENABLE_MPI=ON`
+  - `-DTENRYU_ENABLE_HDF5=ON`
+  - `-DTENRYU_ENABLE_PYTHON=ON`
+  - `-DTENRYU_ENABLE_NVTX=ON`
+  - `-DTENRYU_ENABLE_HYPRE=ON`（オプション、既定OFF。Hypre陰的拡散ソルバを有効化。FindHypre.cmake でパス検出。`HYPRE_DIR` 環境変数で手動指定可）
+  - `-DTENRYU_RFA_V2_MODE={OFF,STUB,DUMMY_BUFFER,FULL}`（既定 `FULL`。radial Fourier audit v2 Heisenbug isolation builds: compiled out, no-op, dummy GPU buffer, or normal HDF5 output）
+
+#### 2.3.0 Source revision for `tenryu --version`
+- `cmake/SourceRevision.cmake` writes `${build}/src/drivers/generated/tenryu_source_revision.hpp` (the macro `TENRYU_SOURCE_REVISION`) at every build through the custom target `tenryu_source_revision`, a dependency of the `tenryu` executable; it rewrites the header only when the revision changes. Only the `tenryu` executable compiles `src/drivers/version_banner.cpp`, the one file that includes the header, so a new revision recompiles that file and relinks the executable; the libraries and the test executables do not change.
+- The revision is the first line of a `SOURCE_REVISION` file at the top of the source tree (`tools/beta_export.sh` writes the exported commit there), else the commit of the git work tree whose top is the source tree (`+modified` when tracked files differ), else `unknown`. `version_banner()` (`drivers/version_banner.hpp`) appends it to the version for `--version`; `tenryu_version_string()` (`core/version.hpp`), written into the frozen configuration, does not carry it.
+
+#### 2.3.1 Config/State ABI dependency policy
+- `src/core/config.hpp` and `src/core/state.hpp` define host-side ABI-sensitive structs that are consumed by several C++ and CUDA translation units.
+- The HydroConfig/AleConfig stale-object regression scope attaches explicit object dependencies through `cmake/ConfigAbiDeps.cmake` using `tenryu_attach_config_state_abi_deps(<target>)`.
+- The helper appends CMake `OBJECT_DEPENDS` edges from each selected target source object to both headers. This supplements compiler depfiles so CMake/Ninja rebuilds affected objects when Config or State layout changes, without requiring manual object deletion.
+- Extend the helper to any additional target where `ninja -d explain` or `ninja -t deps` shows Config/State ABI users are not rebuilt by compiler depfiles.
+
+---
+
+## 3. トップレベル構成（提案）
+```
+tenryu/
+  CMakeLists.txt
+  src/
+    core/
+      config_validate.hpp # pybind11-free Config invariant checks shared by Builder/tests
+      units/
+      profiler/
+      namelist/          # CPython埋め込み + Namelist API (Smilei風)
+      error/
+    mesh/
+    materials/
+    hydro/
+    radiation/
+    laser/
+    parallel/           # MPI領域分割・ハロー交換 (§7)
+    coupling/
+    diagnostics/
+    verification/
+    io/
+    drivers/
+  examples/
+    implosion/
+    verification/
+    perf/
+  tools/                 # Python後処理・最適化
+    validation/
+  docs/
+  tests/
+  retired/               # ビルドしない退役コードの保管（CMake は参照しない）
+    radiation_monte_carlo/ # 退役した輻射 Monte Carlo 一式（IMC・DDMC・ランダムウォーク・HOLO・difference 定式化）の
+                           # ソース・試験・デッキ。README に最後にビルドと試験が通った状態と復元手順
+```
+
+**ファイル拡張子規約**：
+- CUDA ソースファイル：`.cu`
+- CUDA ヘッダファイル：`.cuh`
+- 純C++ヘッダ（CUDA非依存）：`.hpp`（例：Config構造体、ユーティリティ）
+- 理由：NVIDIA標準規約に準拠。nvcc、IDE、Nsight全てが `.cuh` を正しく認識する
+
+---
+
+### 3.1 Studio deck import
+
+`gui/src/core/deck/loadDeck.ts` は、ファイル読込と貼付けによる取込を共通化する。
+v1 の状態ヘッダがある場合は従来の復元経路を使い、ヘッダがない場合は同梱の
+`tools/assist/assist.py import-deck` をタイムアウト付きの Python 子プロセスで実行する。
+`gui/src/ui/DeckLoadDialog.tsx` で作業ディレクトリー・環境変数・実行先を指定し、
+ローカルまたは選択中のサーバーで評価する。サーバーでは同梱ハーネスを一時転送する。
+評価設定は取込状態と保存ヘッダに記録する。`deckImport.ts` は記録した kwargs をフォームへ対応付け、
+対応付け・標本点での検証・元ソースでの保持・省略の対象を管理する。
+`deck_import_runtime.py` は元ソースの保持または省略規則が必要な場合だけ
+生成 deck に埋め込み、入力の初期化時に実際の namelist ブロックを呼び出す。
+フォームの値は取込時に固定し、元ソースで保持する設定は solver 実行時の
+作業ディレクトリーと環境に従う。再実行ヘルパーはこれらを変更しない。
+setter の初期化や入れ子の更新が呼出し順序に依存する場合は、反復呼出しの
+順序も保持する。solver の時間ループと C++ namelist API は変更しない。
+プロトコルと忠実度の検証範囲は `docs/gui/DECK_IMPORT.md` を参照。
+
+## 4. モジュール一覧と責務
+### 4.1 core/
+**責務**：共通ユーティリティ（RNG、単位、プロファイル、エラー）
+
+- 乱数：**cuRAND device API** の Philox4x32-10（counter-based）を、現行では燃焼の α 粒子 Monte Carlo 輸送
+  （`src/burn/mc_transport.cu`）だけが使う。粒子ごとに `curand_init(Main.seed ^ global_id, step_index, 0, &state)` で
+  初期化し、粒子固有の `global_id` とタイムステップ番号でストリームを分ける（並列度に依存しない再現性、NUMERICS §12.7.1）。
+  - 退役した輻射 Monte Carlo 用の共通部品（`src/core/rng/rng_init.cuh` の `init_philox`・`rng_init_kernel`、
+    CPU 参照実装 `philox_cpu.hpp`、PhotonPool の `rng_counter` から cuRAND state を O(1) で復元する規約）は
+    2026-09-29 に `retired/radiation_monte_carlo/src/core/rng/` へ移した（ビルドしない）。
+- `Core::Units`：cgs+eV単位変換（NUMERICS §0.1 準拠。入力は人間に優しい単位も許容）
+- `Core::Profiler`：NVTXレンジ、CUDA event timer
+- `Core::Error`：NaN検出、assert、fatal、例外境界
+- `Core::RadiationGroupStructure`（`src/core/radiation_group_structure.hpp`）：
+  namelist validation and restart-safe config derivation for pure radiation
+  group-boundary math. It contains no runtime radiation state and has no
+  dependency on `radiation/`.
+- `Core::AutoZone`：1D_SPH用自動等質量ゾーニング（NUMERICS §3.1.12）
+  - `auto_zone.hpp`：`AutoZoneRegion`, `AutoZoneConfig`, `AutoZoneDiagnostics` 構造体、`compute_auto_zone_nodes()` API
+  - `auto_zone.cpp`：等質量球殻分割、非対称幾何級数ブリッジ、二分法 \(q\) 求解、制約調整、ファイナライゼーション
+  - 初期化時に `Namelist::Builder` から呼び出され、生成されたノード配列を `MeshConfig::explicit_nodes` に格納。ランタイムでは使用されない
+- `Core::MeshRequirement`（`src/core/mesh_requirement.{hpp,cpp}`、NUMERICS §3.1.0c）: 1D 初期メッシュの物理由来分解能要求（レーザー波形・波長・材料層・幾何 → アブレート帯の面密度質量天井プロファイル・衝撃波分離天井・層則・推奨帯）。ホスト専用・Python 非依存。
+  - `build_mesh_requirement()`：メッシュ非依存の見積もり（`FrozenTable1D` の出力波形と piecewise 一定の ρ₀(r)/材料(r) を入力）
+  - `check_mesh_requirement()`：ノード列とセル別 ρ₀/材料に対する判定、`mesh_requirement_json()`：決定論 JSON
+  - `tools/assist/mesh_recommendation.py` fits the shipped convergence table; `recommend_mesh.py` constructs and validates Mesh blocks. Optional `MeshEmpiricalRequirement` provenance is carried through config, enforce, freeze and JSON; `deck_lint.py` independently recomputes the recommendation. No solver-runtime Python dependency.
+  - 呼び出し元: `Namelist::Builder`（`apply="enforce"` の `zoning_intent` 帯注入 — `zoning_intent::measure_fraction_at` で測度分数へ換算）、`drivers/cmd_validate`（`--mesh-preview` の `mesh_requirement` 項と `[mesh-requirement]` 判定）、`drivers/cmd_run`（run 開始時の `mesh_requirement.json`）。ランタイム物理では使用されない。1D ノード列は `mesh::build_1d_radial_nodes()`（`src/mesh/radial_nodes_1d.cuh`、`create_mesh` と同一実装）で得る。
+- `Core::DeviceScratch`（`src/core/device_scratch.{hpp,cu}`、per-call cudaMalloc/cudaFree を scratch pool に置換する host オーバーヘッド削減）：
+  プロセス寿命・タグ指名・grow-only のデバイス／ピン止めホスト scratch プール
+  （`device_scratch_acquire(tag, bytes)` / `host_pinned_scratch_acquire`、内容はゼロ化されない
+  = cudaMalloc と同一契約、単一ホストスレッド前提、解放は `device_scratch_shutdown()` のみ）。
+  1D は step 経路の生 cudaMalloc/cudaFree 対を直接置換（最初の scratch-pool 適用）。その 2D 拡張（2026-07-07）は
+  RAII ラッパ三種（`core::Field1D<Tag>` / `core::DeviceArray<T>` / `parallel::DeviceArray`）に
+  **opt-in の pool-tag コンストラクタ**を追加する形で行う：`core::CellField1D f{"mod:purpose"};`
+  は reset()/operator= がプールから取得し（ゼロ初期化契約は明示 memset で維持）、デストラクタは
+  no-op（プール解放禁止）、move はタグごと移譲、pooled Field1D の `resize()`
+  （prefix 保存 grow）は grow-only プールと両立しないため assert 禁止。タグは呼び出し点毎に一意
+  （同時生存バッファは別タグ必須）、既定コンストラクタの非 pooled 経路はビット恒等で不変。
+- `core/device_ordered_sum.cuh`（2026-10-02 に laser/ から移動）：host のループの順序を再現する device の部品 —
+  ブロック内の排他的接頭和、ゼロを飛ばした添字順の和（+0 から始まる和は不変）、x86-64 の glibc と同じ規則の
+  fmax/fmin（NaN は無視、等しい 2 値は後者）。1D の laser・burn・diagnostics・hydro（粘性の history 集約）・
+  S_N（体積源）が使う。
+- `core/glibc_libm_device.cuh`・`core/glibc_libm_host.hpp`（2026-10-02）：x86-64 の glibc（2.28 以降。ifunc が FMA と
+  AVX2 の CPU で選ぶ FMA 版）の exp・log・pow と同じ結果を返す device 関数（Arm optimized-routines v19.11 の
+  アルゴリズムと表、MIT。表の 931 値は glibc 2.39 の libm と一致を確認、積和の融合は glibc 2.39 の機械語に合わせる）。
+  27 億点の引数（全ビットパターン・端点・指数ごとの範囲）で NaN の中身までビット一致（RTX 4090、glibc 2.39）。host の
+  計算を device へ移して結果を変えないために使う（TMAT 以外の材料の Thomas–Fermi \(\bar Z\)、レーザー注入の解析的 \(T^4\)
+  閉包、高波数速度ダンパーの front mask、S\(_N\) 1D の Marshak 境界。1D ALE の再配置 candidate も使っていたが、1D ALE は
+  同日に退役した）。
+  `host_has_reproduced_build()` はその host（glibc ≥ 2.28 の x86-64、FMA と AVX2）かを返し、host と比べる試験が使う。
+- `Core::FieldMeasure`（`src/core/field_measure.{hpp,cpp}`、ALE P0A F2 — 設計
+  社内の設計メモ ale_asymmetric_robust_design_20260727.md §2 F2）：場ごとの転送契約
+  （support／測度／保存則／bounds／再構成次数／転送種別／epoch 依存）を宣言する
+  fail-loud レジストリと 11 エントリの中核 seed table。二重質量分離
+  （`subcell_mass`=overlay 積分保存 vs `kinematic_node_mass`=基底再構築）と FIX-2 測度
+  教訓（物理 RZ 体積と平面面積は交換不能）をコード上の契約として固定する。宣言のみ
+  （P0A）— transaction 転送層への enforcement 接続は P0B。
+- `Core::MeshTransaction`（`src/core/mesh_transaction.{hpp,cu}`、ALE P0A F3 — Layer-T
+  scaffold、社内の設計メモ q10_shadow_transaction_layerT_20260727.md）：typed mesh event
+  （7 種 `MeshEventKind` + client kind 対応表 + per-kind 契約 C_e）と `ShadowTransaction`
+  （単一 256B 整列 device arena への byte-exact D2D capture／commit、discard=rollback、
+  fail-closed gate 台帳、transaction-scoped telemetry、failure-injection plumbing、
+  非 support 領域の FNV-1a device hash）。単独基盤のみ — reference-barrier の移行は
+  T-v1a（別コミット）。
+
+#### 4.1.1 core/namelist（最重要）
+**責務**：単一 `.py` namelist を実行し、C++側の `Config` を構築する。
+
+- `Namelist::Runtime`
+  - CPython初期化（`Py_Initialize`）
+  - `sys.path` 設定（namelistのディレクトリ、TENRYUのpythonモジュール）
+  - namelist実行（例外を捕捉し、ユーザ向けに整形して出す）
+- `Namelist::API`（Pythonへ公開する関数群）
+  - `Main(...)`, `Mesh(...)`, `Materials(...)`, `Geometry(...)`, `Radiation(...)`, `Laser(...)`, `Numerics(...)`, `Output(...)`, `Diagnostics(...)`, `Parallel(...)`
+  - これらは呼び出されるとC++側のBuilderへ値を格納する（Smileiのブロック方式）
+- `Namelist::Builder`
+  - バリデーション（型・必須引数・単位・範囲）
+  - pybind11 非依存の cross-field invariant は `core/config_validate.hpp` の helper を呼ぶ
+  - 既定値の適用
+  - python callable（密度/温度/波形）の “凍結”
+- `Namelist::Freeze`
+  - 実行したnamelistの原文コピー
+  - すべての設定を"純データ（JSON）"に落とした frozen config を生成
+  - 出力HDF5へ保存（再現性）
+- `Namelist::GeometryVolumeCut`
+  (`src/core/namelist/geometry_eval_volume_cut.{hpp,cpp}`)
+  - The PLIC-enabled t0 material volume-cut sampler.  It is called only
+    from initial geometry evaluation, samples already-frozen geometry
+    callables, and writes volume-averaged rho/Te/Ti/material fractions into
+    `State`; it has no runtime Python dependency.
+
+**重要方針：実行中にPythonを呼ばない**
+
+Python callable は初期化時に **一括評価しテーブル化** する。3種類の凍結パターン：
+
+| callable種別 | 凍結方法 | テーブル型 | 補間方法 |
+|-------------|---------|----------|---------|
+| geometry関数（`density(r)`, `temperature(r,z)` 等） | メッシュ座標配列を渡し一括評価 | **直接State配列** | 補間なし（セル値として直接格納） |
+| laser波形（`power(t)`） | 時間グリッドでサンプル → テーブル化 | `FrozenTable1D` | piecewise linear |
+| 境界温度（`T_{r,f}(t)` Marshak用、面別） | 時間グリッドでサンプル → テーブル化 | `FrozenTable1D` | piecewise linear |
+
+> **開発マイルストーン注記**：M01 では callable 評価をまだ行わず、識別メタデータのみを freeze 出力する。
+> 本表の「一括評価しテーブル化」は M02 以降の挙動を示す。
+
+```cpp
+// 1D piecewise linear テーブル（device上で使用可能）
+struct FrozenTable1D {
+    double* x;       // 独立変数（時刻等）[n_points]、deviceメモリ [s]
+    double* y;       // 関数値            [n_points]、deviceメモリ [erg/s] or [eV] etc.
+    int     n_points;
+    double  x_min, x_max;  // clamp用範囲 [s]（x[0], x[n_points-1] と一致）
+
+    // device function: piecewise linear interpolation
+    __device__ double eval(double xi) const;
+};
+```
+
+**サンプリングパラメータ**：
+- laser波形：時刻 \(k \cdot 2^{-40}\) s（\(k = 0..\lceil t_{end}/2^{-40}\rceil\)）に局所細分（弦と中点の差 > 局所値の 1e-6、最小 \(2^{-47}\) s）を加えた標本（`core/namelist/frozen_table.cpp` `create_frozen_time_table`）
+- 境界温度：同上。検証用途のため精度よりもシンプルさを優先
+- geometry関数：メッシュ座標数 = セル数（or ノード数）の一括評価。テーブル化不要
+
+→ これにより「性能」と「決定性」を守る。
+
+#### 4.1.2 Config 構造体
+
+`Config` は namelist のパース結果を保持する中心データ構造であり、全モジュールの初期化入力となる。
+各namelist block（SPECIFICATION.md §6.4）に対応するサブ構造体を持つ。
+
+```cpp
+struct Config {
+    // --- SPECIFICATION.md §6.4 の各ブロックに対応 ---
+    struct MainConfig {
+        std::string name;        // シミュレーション名
+        int    dim;              // 1 or 2
+        std::string geometry;    // "1D_SPH" or "2D_RZ"
+        double t_end;            // 終了時刻 [s]
+        int    max_steps = 10000000; // 最大ステップ数（既定 10^7、SPECIFICATION §9.1）
+        uint64_t seed = 12345;       // RNG グローバルシード（既定 12345、SPECIFICATION §9.1）
+        std::string restart_from; // リスタートファイルパス（空=新規実行）
+        std::string units = "cgs_eV";       // 単位系（v1.0固定、ドキュメント用。SPECIFICATION §9.1）
+        std::string verbosity = "normal";   // "quiet" | "normal" | "verbose" | "debug"（SPECIFICATION §9.1）
+    } main;
+
+    struct MeshConfig {
+        int    nr, nz;           // セル数（1Dではnzは無視）
+        double r_min, r_max;     // 動径範囲 [cm]
+        double z_min, z_max;     // 軸方向範囲（2Dのみ）[cm]
+        std::string grid_type_r = "graded";   // 1D_SPH は常に graded、2D_RZ は uniform 固定
+        std::string grid_type_z = "uniform";  // 2D RZ only
+        std::vector<GridSegment> grid_segments;
+        GradingConfig grading;
+        std::string motion = "lagrangian";   // "lagrangian" | "ale"（SPECIFICATION §6.4.2）
+        std::string logical_mesh_2d = "rectangular_rz"; // "rectangular_rz" | "spherical_polar_halfplane"
+        std::string polar_center_treatment = "annular"; // "annular" | "tri_fan" for spherical_polar_halfplane
+        // 注: SPECIFICATION §9.1 の次元依存既定: 1D_SPH="lagrangian", 2D_RZ="ale"
+        // init時に Config::apply_dimension_defaults(dim) で上書きされる
+        struct RezoningConfig {
+            bool enabled = false;            // 2D_RZ ALE rezoning有効化（motion="ale"時のみ使用。既定は無効）
+            int every_n_steps = 5;           // rezoning頻度 [cycles]（SPECIFICATION §6.4.2 既定 5）
+            int warmup_steps = 0;            // reserved guard [cycles]（SPECIFICATION §6.4.2 既定 0）
+            double relaxation = 0.2;         // reserved relaxation factor
+            double spacing_ratio_threshold = 1.5; // reserved mesh-spacing threshold
+            int max_iterations = 20;         // Winslow Jacobi最大反復数（SPECIFICATION §6.4.2 既定 20）
+            double quality_threshold = 0.2;  // [dimensionless] メッシュ品質閾値（SPECIFICATION §6.4.2 既定 0.2）
+            double max_displacement_fraction = 0.5; // [dimensionless] 最大変位率（SPECIFICATION §6.4.2 既定 0.5）
+            std::string remap_limiter = "van_leer";
+            bool remap_ms_midpoint = false;
+            bool remap_ms_post_check = false;
+            int remap_ms_post_max_iter = 3;
+            double remap_ms_rescale_floor = 0.01;
+            bool conservative_remap_enabled = false;
+            std::string conservative_remap_target = "reference";
+            bool conservative_remap_radiation_enabled = true;
+            bool multiblock_cross_seam_rezone_enabled = false;
+            bool ke_fixup = true;
+            int shock_sensor_guard_cells = 2;
+            double density_jump_threshold = 0.1;
+            double Te_jump_threshold = 0.2;
+            double convergence_tol = 1e-6;   // [dimensionless] 収束判定（SPECIFICATION §6.4.2 既定 1e-6、NUMERICS §3.3.3）
+        } rezoning;
+    } mesh;
+
+    struct MaterialsConfig {
+        struct MatDef {
+            std::string name;               // 材料名（例 "CH", "DT"）。一意必須（SPECIFICATION §6.4.3）
+            double A, Z;                    // 質量数 [amu]、原子番号 [dimensionless]
+            std::string eos_model = "ideal_gas";       // "ideal_gas"（既定） / "sesame" / "ionmix" / "tmat" / "power_law_te"
+            std::string opacity_model = "constant";    // "constant"（既定） / "table_nlte" / "tmat" / "power_law" / "freq_dep_marshak" /
+                                                       // "ionmix"（LTE の IONMIX 表。builder が "table_nlte" の経路へ変換）。
+                                                       // "sesame" は受理されない（502/505 は読めるが実行時の不透明度に使わない）。
+                                                       // 旧名 "none" は "constant" + kappa=0 に変換、WARNING出力
+            double ideal_gas_gamma = 5.0/3.0; // [dimensionless] eos_model="ideal_gas"時のγ（SPECIFICATION §6.4.3）
+            double cv_e_override = -1.0;    // [erg/(cm³·eV)] 電子比熱オーバーライド（-1=テーブル使用。SPECIFICATION §6.4.3）
+            double kappa_a_constant = 0.0;  // [cm²/g] opacity_model="constant" 時の吸収不透明度
+            double kappa_s_constant = 0.0;  // [cm²/g] opacity_model="constant" 時の散乱不透明度
+            std::string eos_file;           // テーブルファイルパス（SESAME xSESAME ASCII / IONMIX v4/v6 .cn4 バイナリ）
+            std::string opacity_file;       // 不透明度テーブルファイルパス
+            // SESAME 固有パラメータ（eos_model="sesame" 時のみ使用）
+            int sesame_material_id = -1;    // SESAME 材料番号（例: CH=7593, DT=5265）
+            int sesame_cold_curve_rows = 12; // T=0 の cold curve を保つ合成行の数（0 は従来どおり捨てる。NUMERICS §1.1.5(b)）
+            // 形式（xSESAME ASCII）と表番号（301 total / 304 electron）は固定で、namelist のキーではない
+            // （sesame_format / sesame_table_total / sesame_table_electron は ConfigError）。304 が無い材料は、
+            // 材料の電離モデルの Z̄ で全表を節点ごとに Z̄/(1+Z̄) に分割して電子表を作る（2026-09-29）
+            bool is_void = false;           // true = 真空（void）材料。EOS/opacity テーブル不要（SPECIFICATION §6.4.3）
+        };
+        std::vector<MatDef> materials;      // 材料リスト（最大 MAX_MATERIALS=8）
+        MixingRule opacity_mix_rule = MixingRule::LINEAR_MASS; // spec §6.4.3; enum定義は§4.3参照
+        // Materials.mixture は opacity_mix_rule だけを保持する（MaterialsConfig::opacity_mix_rule）。fractions と
+        // eos_mix_rule は受け付けるが警告を出して無視する — Geometry.volfrac は常に体積分率で、1D の EOS は各セルの
+        // 支配材料で閉じる（NUMERICS §1.1.5(c)）
+        struct ZbarConfig {
+            std::string model = "fixed";    // "fixed" / "thomas_fermi" / "tabular"（既定 "fixed"、SPECIFICATION §9.1）
+            double fixed_value = -1.0;      // \>= 0 なら全材料・全非 void セルの Z̄ をこの 1 値で上書き（fixed 以外のモデルの初期値にも。既定 -1 は無効）
+            std::string table_file;         // model="tabular" 時のテーブルファイルパス
+        } zbar;
+        struct VoidConfig {
+            double rho = 1e-10;             // [g/cm³] void セル密度下限（SPECIFICATION §6.4.3）
+            double Te  = 1e-3;              // [eV] void セル電子温度下限
+            double Ti  = 1e-3;              // [eV] void セルイオン温度下限
+        } void_config;
+    } materials;
+    // --- Void helper ---
+    // int first_nonvoid_material_index() const;
+    //   materials.materials[] で最初の !is_void な材料のインデックスを返す。
+    //   全材料がvoidの場合は -1 を返す。
+    //   EOS/opacity テーブル参照が単一材料前提のコールサイトで使用（SPECIFICATION §6.4.3）。
+
+    struct GeometryConfig {
+        // 凍結済み初期条件（evaluate後にState配列へ直接格納）
+        // Builder がPython callable を評価し、結果の配列をここに保持
+        std::vector<double> density;        // [n_cells] セル毎の初期密度 [g/cm³]
+        std::vector<double> Te, Ti;         // [n_cells] セル毎の初期温度 [eV]
+        std::vector<double> velocity_r, velocity_z;  // [n_nodes] ノード毎の初期速度 [cm/s]
+        std::string radiation_field = "equilibrium";  // "equilibrium" / "zero"（SPECIFICATION §6.4.4 既定 "equilibrium"）
+        // --- 多材料初期条件（SPECIFICATION §6.4.4、NUMERICS §1.1.5 (c)）---
+        bool enforce_sum_to_one = true;     // 体積分率 sum=1 制約を強制するか（SPECIFICATION §6.4.4 既定 True）
+        std::vector<std::vector<double>> volfrac; // [n_mat][n_cells] 材料体積分率。enforce_sum_to_one=True で正規化（SPECIFICATION §6.4.4 volfrac）
+                                                  // Builder で Python callable を評価し、State.volFrac へ投入（Step 9）
+    } geometry;
+
+    struct RadiationConfig {
+        bool enabled = true;                  // 輻射輸送有効化（SPECIFICATION §6.4.5 既定 True）
+        RadiationMode mode = RadiationMode::MultigroupDiffusion; // "multigroup_diffusion" / "sn_transport"（"imc_ddmc" は ConfigError）
+        bool origin_parity_only = false;      // 1D_SPH S_N origin parity investigation flag; no-op when legacy parity sweep is used
+        bool group_repack_hard_xray = false;  // optional 80-group hard-X-ray boundary redistribution
+        bool diagnose_hard_xray_opacity = false; // startup-only CD kappa_PA audit log
+        int groups = 16;
+        std::vector<double> group_bounds_eV;   // [eV] 要素数 groups+1; table, user, or hard-X-ray repacked bounds
+        // --- Radiation.imc（SPECIFICATION §6.4.5）: 決定論モードに効くのは two_stage だけ ---
+        struct ImcConfig {
+            bool two_stage = false;           // 輻射演算子を半ステップ 2 回で進め、その間で EOS を閉じ直す
+        } imc;
+        // 退役した輻射 Monte Carlo（IMC・DDMC・ランダムウォーク・HOLO・difference 定式化）の設定 — imc の他のキーと
+        // ddmc / diffusion / holo の各 dict — は 2026-09-29 に Config から外した。Builder は受理して無視し（節ごとに
+        // WARNING 1 回）、各手法の enabled=True は ConfigError とする（SPECIFICATION §6.4.5）。
+        struct MultigroupDiffusionConfig {
+            std::string flux_limiter = "levermore_pomraning";
+            int max_outer_iterations = 20;
+            double outer_tol = 1e-5;
+            std::string linear_solver_1d = "cusparse_tridiag";
+            std::string linear_solver_2d = "amgx_cg"; // "amgx_cg" | "cusparse_cg_jacobi" | "cusparse_cg_zline"
+            struct AmgxConfig {
+                std::string preset = "AGGREGATION_JACOBI";
+            } amgx_config;
+            double opacity_floor = 1e-100;
+            double opacity_cap = 1e20;
+            std::string state_supply_boundary_policy = "local_D_current"; // "local_D_current" | diagnostic-only "harmonic_ghost_D_test" | "radial_mean_D_test"
+            bool diagnostic_radial_fourier_substage_enabled = false; // FLD substage audit; default-off
+            double cg_inner_tol = 1e-10; // 2D_RZ FLD CG inner tolerance
+            struct BoundaryConfig {
+                std::string inner_r = "reflect";
+                std::string outer_r = "vacuum"; // "vacuum" | "reflect"
+                std::string z = "vacuum"; // 2D_RZ common: "vacuum" | "reflect" | "marshak"
+                std::string z_bottom = "vacuum";
+                std::string z_top = "vacuum";
+            } boundary;
+            struct MarshakConfig {
+                double flux_erg_per_cm2_s = 0.0;
+                double flux_pulse_duration_s = -1.0;
+            } marshak;
+            std::string z_boundary = "vacuum"; // alias for boundary.z
+        } multigroup_diffusion;
+        struct SnTransportConfig {
+            int n_angles = 16;
+            std::string angular_quadrature = "level_symmetric_16";
+            int max_outer_iterations = 20;
+            int max_inner_iterations = 100;
+            double outer_tol = 1e-5;
+            double inner_tol = 1e-6;
+            bool dsa_enabled = true;
+            std::string diffusion_fallback_mode = "none";
+            double tau_diffusion_on = 10.0;
+            double tau_diffusion_off = 5.0;
+            double opacity_floor = 1e-100;
+            double opacity_cap = 1e20;
+            bool timing_enabled = false;
+            struct BoundaryConfig {
+                std::string inner_r = "reflect_parity";
+                std::string outer_r = "vacuum";
+                std::string z = "vacuum"; // 2D_RZ common: "vacuum" | "reflect" | "marshak"
+                std::string z_bottom = "vacuum";
+                std::string z_top = "vacuum";
+            } boundary;
+            struct MarshakConfig {
+                double flux_erg_per_cm2_s = 0.0;
+            } marshak;
+            std::string z_boundary = "vacuum"; // alias for boundary.z
+        } sn_transport;
+        // --- Planck fraction table (SPECIFICATION §6.4.5 planck_fraction) ---
+        struct PlanckFractionConfig {
+            std::string method = "compute";     // "compute" | "tabulate"（SPECIFICATION §6.4.5 既定 "compute"）
+            int compute_N_T = 200;              // Planckテーブル温度格子点数（SPECIFICATION §6.4.5 既定 200）
+            double compute_T_range_eV[2] = {0.01, 100.0}; // [eV] 温度範囲（SPECIFICATION §6.4.5 既定 [0.01,100]）
+        } planck_fraction;
+        struct BoundaryConfig {
+            // namelist名: r_inner, r_outer, z_bottom, z_top（SPECIFICATION §6.4.5）
+            std::string inner_r = "reflect";   // 1D: inner; 2D RZ: R内側（r=0対称軸、変更不可）
+            std::string outer_r = "vacuum";    // 1D: outer; 2D RZ: R外側
+            std::string bottom_z = "vacuum";   // 2D RZ only: Z下面（SPECIFICATION §6.4.5 既定 "vacuum"）
+            std::string top_z = "vacuum";      // 2D RZ only: Z上面
+            // Marshak 放射温度 T_r(t) [eV]：1D_SPH は単一 FrozenTable1D、2D_RZ は面別 map
+            // 1D_SPH: marshak_Tr = FrozenTable1D（callable → 時刻表に凍結、SPECIFICATION §6.4.5）
+            // 2D_RZ:  marshak_Tr_map["r_outer"] / ["z_bottom"] / ["z_top"] = FrozenTable1D（SPECIFICATION §6.4.5）
+            FrozenTable1D marshak_Tr;                          // 1D_SPH 用（2D_RZ では未使用）
+            std::map<std::string, FrozenTable1D> marshak_Tr_map; // 2D_RZ 用（面名 → 温度テーブル）
+        } boundary;
+    } radiation;
+
+    struct LaserConfig {                     // 実体は src/core/config.hpp（全キーは SPECIFICATION §6.4.6）。主なものだけを示す
+        bool   enabled = false;            // レーザー有効化（既定 False）
+        double wavelength_nm = 351.0;      // laser wavelength [nm] (GXII: 3ω Nd:glass)
+        // n_crit = π m_e c² / (e² λ²) [cm⁻³]（NUMERICS §5.1 参照）
+        std::string mode;                   // "raytrace_2d" | "radial_absorption_1d"（1D）/ "raytrace_3d"（2D_RZ）。Builder が次元で既定を置く
+        // radial_absorption_1d では rays/profile/f_number/focus/defocus は吸収分布に影響しない。
+        int    rays_per_beam = 1000;       // ビームあたりレイ（環）数（\>= 10。2D_RZ 未指定時は Builder で 128）
+        struct AbsorptionConfig {
+            std::string model = "inverse_bremsstrahlung";
+            double eps_n = 1e-4;           // 屈折率下限（(0, 0.1]、NUMERICS §5.3）
+            bool   terminate = true;       // 臨界で終了（True）/ 反射（False、特性曲線積分のみ）。未指定なら特性曲線積分では
+                                           // Builder が False にする（NUMERICS §5.2）
+            std::string terminate_mode = "escape"; // "escape" | "deposit"（臨界に達した残りを臨界隣接セルへ沈着）
+            double coulomb_log_floor = 2.0;// IB の lnΛ 下限（[1, 30]、NUMERICS §5.4.3）
+        } absorption;
+        struct LaserMeshConfig {
+            int    nr = 128, nz = 256;     // 2D の格子（\>= 4）。1D は §5.7.2 の規則で毎回作り直す（上限 nr_max = 4096）
+            double r_max_factor = 1.5;     // 1D の外半径の係数（NUMERICS §5.7.2）
+            double mesh_factor = 0.5, rmax_n_hat_threshold = 0.001;
+            bool   critical_clip = true;   // 節点の n̂ を critical_margin で頭打ち（格子の境界ではない、NUMERICS §5.7.1）
+            double critical_margin = NaN;  // 未指定 = 1 − eps_crit
+            std::string stretch_method;    // 受け付けるがどのメッシュも読まない（警告）。min_ratio も同じ
+            GhostCoronaConfig ghost_corona;// 1D のゴーストコロナ（NUMERICS §5.7.5）
+        } lasermesh;
+        struct RaytraceConfig {
+            std::string integrator = "auto"; // "auto" → 1D 球の raytrace_2d は "characteristic"（NUMERICS §5.3.6）、それ以外は "leapfrog"
+            double cfl_ray = 0.8, intensity_cutoff = 1e-6, eps_crit = 1e-4; // eps_crit は (0, 0.1]
+            int    max_steps = 100000, azimuthal_rays = 16;               // azimuthal_rays は 1D の円筒・平板
+        } raytrace;
+        struct RaytraceSkipConfig { bool enabled = false; double threshold = 0.01; int max_consecutive = 10; } raytrace_skip;
+        struct DepositConfig {
+            double conservation_tol = 1e-10;
+            int    deposit_smooth_passes = 0;      // 既定は平滑化なし（診断用。1D の例題デッキの一部は 3 を与える）
+            double deposit_smooth_alpha = 0.25;
+        } deposit;
+        std::string profile_model = "gaussian";    // "gaussian" | "super_gaussian" | "flat_top" | "table" | "custom"（custom は凍結後 table）
+        double profile_w0_um = -1.0;               // 未指定なら R_target / (2 max(F, 1))
+        int    profile_m = 2;
+        // ib（Langdon・Zeff・Coulomb log の拡張）、ra（共鳴吸収）、cbet、port_configuration、hot_electron は §4.6 と NUMERICS §5.4.5/§5.10/§5.11
+        struct BeamDef {
+            std::vector<double> direction;  // ビーム方向（3 成分）。theta/phi（ラジアン）でも与えられる
+            double f_number = 8.0;          // F 値（任意、既定 8.0、\> 0）
+            std::vector<double> focus;      // 焦点の lab 座標（3 成分）。defocus_DR との変換は行わず、1D はビーム軸へ射影（NUMERICS §5.6.3）
+            double defocus_DR = 0.0;        // focus 未指定時の D/R（NUMERICS §5.6.5）
+            double delta_lambda_nm = 0.0;   // CBET の離調
+            std::string profile_model;      // "" = Laser.profile_model を継承。profile_w0_um / profile_m / 表も同様
+            CallableInfo power;             // パワー波形（凍結して表）
+            double energy_J = -1.0;         // \> 0 なら波形を [0, t_end] の積分がこの値になるよう拡大・縮小
+        };
+        std::vector<BeamDef> beams;        // ビームリスト（enabled=True時は≥1本が必須）
+    } laser;
+
+    struct NumericsConfig {
+        // splitting_order / splitting / coulomb_log_floor / cell_search は namelist で受け付けるが警告を出して無視する:
+        // 演算子の順序は固定（L→B→H/2→C→R→H/2、NUMERICS §2.1）、クーロン対数の下限は 2 に固定（NUMERICS §1.1.4）
+        double T_start_eV = 0.0;        // Hydro開始温度 [eV]（既定 0.0）
+        // hydro.T_start_inactive_cells = "passive_fill" | "rigid_wall" | "cold_equilibrium"（既定 "passive_fill"）
+        struct DtConfig {
+            double initial_s = 1e-15;       // [s] 初期Δt（SPECIFICATION §6.4.7 既定 1e-15）。
+                                            // Python API で None 指定時は Builder が -1.0 に変換し、
+                                            // auto (0.1 * min(Δl/c_s))（NUMERICS §2.2）を Step 1 で計算
+            double cfl_hydro = 0.3;         // [dimensionless] CFL係数（SPECIFICATION §6.4.7 既定 0.3）
+            double cfl_cond = 0.25;         // [dimensionless] 伝導CFL数（SPECIFICATION §6.4.7 既定 0.25、NUMERICS §2.2(b)）。STS Δt_exp の係数として使用
+            double f_min_fleck = 0.01;      // [dimensionless] Fleck factor下限によるΔt_rad制約（SPECIFICATION §6.4.7 既定 0.01、NUMERICS §2.2(c)）
+            // cfl_ray は LaserConfig::RaytraceConfig に配置（SPECIFICATION §6.4.6）。DtConfig では管理しない
+            double growth_factor = 1.2;     // [dimensionless] dt成長倍率制限
+            double max_s = 1e-9;            // [s] dt上限（SPECIFICATION §6.4.7 dt.max_s 既定 1e-9）
+            double min_s = 1e-20;           // [s] dt下限（SPECIFICATION §6.4.7 dt.min_s 既定 1e-20）。Δt < min_s で FATAL 停止（ストーリング防止、NUMERICS §2.2(e)）
+        } dt;
+        struct HydroConfig {
+            // 1D: string; 2D RZ: per-face struct
+            bool rho_e_linear_grid = false;  // rho_e_table diagnostic: false -> (log rho, log e), true -> (rho, e)
+            bool eos_writeback = false;      // table EOS closure: false -> keep hydro-updated e, true -> legacy e(rho,T) re-projection
+            std::string exact_override = "none"; // "none" | "pressure" | "sound_speed" | "temperature"（1D table-backend diagnostic）
+            std::string boundary_1d = "free"; // "free" | "fixed" | "reflect" | "pressure"（SPECIFICATION §6.4.7）
+            struct Boundary2D {
+                std::string r_inner = "axis";        // "axis"（既定、変更不可：R=0対称軸、v_r=0強制）。SPECIFICATION §6.4.7
+                std::string r_outer = "free";
+                struct ZFaceConfig {
+                    std::string type = "free";       // "free" | "fixed" | "reflect" | "pressure" | "state_supply"
+                    double supply_rho_g_per_cc = 0.0;
+                    double supply_u_z_cm_per_s = 0.0;
+                    double supply_T_eV = 0.0;
+                } z_bottom_cfg, z_top_cfg;
+                std::string z_bottom = "free";       // legacy mirror of z_bottom_cfg.type
+                std::string z_top = "free";          // legacy mirror of z_top_cfg.type
+                std::string mesh_tangential_target = "lagrangian"; // "lagrangian" | "reference"（SPECIFICATION §6.4.7）
+                std::string state_supply_donor_mode = "interior_per_i"; // "interior_per_i" | "interior_radial_average"
+                hydro::BC2DRZConfig bc_config;       // explicit normal/tangential material/mesh semantics
+                FrozenTable1D pressure_drive;       // [dyne/cm²] 時間依存駆動圧力 P_drive(t)（"pressure" type 時に使用。NUMERICS §8.1、SPECIFICATION §6.4.7）
+                // namelist の boundary_pressure callable から初期化時に FrozenTable1D 化（時刻表、線形補間）
+            } boundary_2d;
+            std::string av_type = "vnr";    // "vnr" | "riemann"（"riemann" は 1D_SPH 限定。SPECIFICATION §6.4.7）
+            // namelist名: av_C1, av_C2, av_limiter_J, av_heat_C（SPECIFICATION §6.4.7）
+            double av_linear = 0.1;          // [dimensionless] 線形人工粘性係数 C₁（= av_C1、NUMERICS §3.1.6；既定0.1）
+            double av_quadratic = 1.5;       // [dimensionless] 二次人工粘性係数 C₂（= av_C2、NUMERICS §3.1.6；既定1.5、式中はC₂²で使用）
+            double av_limiter_J = 1.0;       // [dimensionless] 1D Christensen速度リミタ係数 J（NUMERICS §3.1.6, §3.1.9；既定1.0、2Dでは未使用）
+            double av_heat_C = 0.0;          // [dimensionless] 1D人工熱流束係数 C_H（NUMERICS §3.1.6；既定0.0、2Dでは未使用）
+            double hk_velocity_damper_C = 0.0;              // [dimensionless] 1D high-k nodal velocity damper strength（NUMERICS §3.1.4；0で無効）
+            double hk_velocity_damper_tau_min = 8.0;        // [dimensionless] damper optical-depth gate τ_min
+            double hk_velocity_damper_grad_Te_max = 0.2;    // [dimensionless] front mask / secondary max adjacent |Δln Te|
+            double hk_velocity_damper_grad_rho_max = 0.3;   // [dimensionless] front mask / secondary max adjacent |Δln ρ|
+            int hk_velocity_damper_guard_cells = 25;        // [cells] front mask expansion half-width
+            std::string av_heat_to = "ion";  // "ion" | "electron" | "split"（v1.0: "split"→ConfigError。SPECIFICATION §6.4.7）
+            bool compatible_energy = false;  // [flag] 1D_SPH ideal-gas exact compatible force-work energy update（NUMERICS §3.1.5；既定false）
+            // 1D shock sensor の閾値（pressure jump / density jump / RH整合性 / odd-even / support floor）
+            // は artificial_viscosity.cu 内の内部定数で保持し、v1.0 では namelist 非公開
+            FrozenTable1D pressure_drive_1d; // [dyne/cm²] 1D_SPH pressure BC用 P_drive(t)（SPECIFICATION §6.4.7。boundary_1d="pressure"時使用）
+        } hydro;
+        struct ConductionConfig {
+            bool enabled = true;             // 電子熱伝導の有効/無効
+            enum class Solver : uint8_t { STS = 0, IMPLICIT = 1, HYPRE = 2 };
+            Solver solver = Solver::STS;     // "sts"（既定）| "implicit"（1D三重対角陰解法）| "hypre"（NUMERICS §4.2.1/§4.2.3）
+            bool ion_conduction = false;     // Braginskii イオン熱伝導、1D・2T（SPECIFICATION §6.4.7 既定 False、NUMERICS §4.6）
+            double ion_f_lim = 1.0;          // [dimensionless] イオン熱流束の制限係数（イオン自由流束の倍数、NUMERICS §4.6）
+            double f_lim = 0.06;             // [dimensionless] flux limiter（NUMERICS §4.1）
+            double mfp_limiter_C = 0.0;      // [dimensionless] mean-free-path limiter係数（NUMERICS §4.1）
+            // STS パラメータ（solver=STS 時のみ使用）
+            double sts_damping = 0.01;       // [dimensionless] STSダンピングパラメータ ν（NUMERICS §4.2.1）
+            int sts_max_stages = 40;         // STS最大ステージ数 s_max（NUMERICS §4.2.1）
+            std::string halo_strategy = "every"; // "every"（既定）| "adaptive"（NUMERICS §12.2.3）
+            // Hypre パラメータ（solver=HYPRE 時のみ使用、§4.2.3）
+            double hypre_rtol = 1e-8;        // [dimensionless] PCG相対収束判定
+            int hypre_max_iter = 50;         // PCG最大反復数
+            int hypre_amg_coarsen = 10;      // BoomerAMG粗視化タイプ（HMIS=10）
+            int hypre_amg_relax = 18;        // BoomerAMG緩和タイプ（l1-Jacobi=18、GPU向き）
+            int hypre_amg_interp = 6;        // BoomerAMG補間タイプ（ext+i=6）
+            int hypre_amg_levels = 25;       // BoomerAMG最大レベル数
+            // SNB 非局所電子熱輸送（1D opt-in、NUMERICS §4.4、SPECIFICATION §6.4.7）
+            std::string nonlocal_model = "none";       // "none"（既定、bit 恒等）| "snb"
+            int snb_n_groups = 24;                     // SNB エネルギー群数
+            double snb_E_max_over_Te = 20.0;           // 群構造上限 E_max/(k_B max T_e)
+            std::string snb_mfp = "geometric_r2";      // "geometric_r2" | "original"
+            std::string snb_efield = "none";           // "none" | "local"
+            int snb_picard_max_iters = 8;              // iSNB Picard 反復上限
+            double snb_picard_rtol = 0.01;             // Picard 収束判定（max-norm）
+        } conduction;
+        struct FloorsConfig {
+            // namelist path: Mesh.floors.rho_floor_gcc / Te_floor_eV / Ti_floor_eV（SPECIFICATION §6.4.2）
+            // Builder が Mesh.floors → NumericsConfig.floors にマッピングする
+            double rho = 1e-10;             // 密度下限 [g/cm³]（NUMERICS §1.1.7）
+            double Te = 1e-3;               // 電子温度下限 [eV]（NUMERICS §11.2）
+            double Ti = 1e-3;               // イオン温度下限 [eV]（NUMERICS §11.2）
+        } floors;
+        bool radiation_thermal_subcycle = false; // [flag] Radiation callback thermal microcycling（SPECIFICATION §6.4.7、NUMERICS §2.1）
+        bool positivity_clamp = true;        // [flag] 温度・密度フロアへのクランプ有効化（SPECIFICATION §6.4.7 positivity.clamp 既定 True）
+        // False の場合は負温度・負密度が発生しうる（デバッグ用のみ推奨）
+        // 注：旧 PositivityConfig は FloorsConfig に統合済み。
+        // 下位互換のため namelist で positivity.rho_floor_gcc 等が指定された場合は
+        // Builder が floors.rho/Te/Ti にマッピングし WARNING を出力する。
+        struct SafetyConfig {
+            bool energy_fatal = false;        // [flag] エネルギー保存違反時に fatal 停止するか（SPECIFICATION §6.4.7 既定 False）
+            bool nan_fatal = true;            // [flag] NaN/Inf検出時に fatal 停止するか（既定 True。energy_fatal とは独立制御）
+            double energy_budget_tol = 1e-3;    // [dimensionless] 相対許容誤差 |ΔE/E|
+                                                // Python API名: safety.energy_threshold（SPECIFICATION §6.4.7 既定 1e-3）
+                                                // Builder が energy_threshold → energy_budget_tol にマッピング
+            // opacity_floor / opacity_cap（退役したモンテカルロ輻射の不透明度の下限・上限）は 2026-09-29 に外した。
+            // Builder は受理して無視する。FLD・S_N の下限・上限は Radiation.multigroup_diffusion / sn_transport にある。
+            int clamp_warn_threshold = 100;
+            int clamp_fatal_threshold = 10000;
+            double overshoot_warn = 0.01;       // [dimensionless] 最大原理違反率 WARNING 閾値（SPECIFICATION §6.4.7、NUMERICS §11.8）
+            double overshoot_fatal = 0.10;      // [dimensionless] 最大原理違反率 FATAL 閾値（overshoot_fatal_enabled=true 時のみ有効）
+            bool overshoot_fatal_enabled = false; // [flag] overshoot_fatal 超過時に FATAL 停止するか（SPECIFICATION §6.4.7 既定 False）
+            // cell_search_fatal は CellSearchConfig::fatal に移動済み（SPECIFICATION §6.4.7 cell_search.fatal）。
+            // Builder が safety.cell_search_fatal を cell_search.fatal にマッピングし WARNING を出力する（後方互換）。
+        } safety;
+        struct CellSearchConfig {
+            int hash_table_factor = 4;      // ハッシュテーブルサイズ係数（NUMERICS §9.5）
+            int max_walk = 20;              // 最大歩行数（NUMERICS §9.3）
+            int max_rings = 3;              // リング拡張探索の最大半径（NUMERICS §9.4、SPECIFICATION §6.4.7 既定 3）
+            bool fatal = true;              // 全探索失敗時にfatal停止するか（SPECIFICATION §6.4.7 cell_search.fatal、NUMERICS §9.5）
+        } cell_search;
+        int diagnostics_every = 1;           // [cycles] 内部安全チェック頻度（SPECIFICATION §6.4.7 既定 1）
+        // Diagnostics.every（出力頻度）とは独立に設定可能。
+        // diagnostics_every は内部安全チェック（フロアカウンタ等）の頻度を制御する。
+        // STSConfig は不要（cfl_cond は DtConfig に統合、STS固有パラメータは ConductionConfig に配置）
+    } numerics;
+
+    struct OutputConfig {
+        std::string directory = "./output";   // 出力先（存在しなければ作成）
+        std::string format = "hdf5";          // 出力形式（SPECIFICATION §6.4.8 既定 "hdf5"、v1.0唯一）
+        int plot_every = 100;
+        int history_every = 1;
+        int checkpoint_every = 1000;           // SPECIFICATION §6.4.8 既定 1000；有効範囲 ≥ 1
+        double plot_every_s = -1.0;            // [s] 時間間隔ベース出力（-1.0=無効、>0.0 で有効、0.0 は ConfigError）
+        double history_every_s = -1.0;         // [s] SPECIFICATION §6.4.8、NUMERICS §2.2 (f)
+        double checkpoint_every_s = -1.0;      // [s] SPECIFICATION §6.4.8
+        int checkpoint_keep_last = 2;          // 保持するチェックポイント数（SPECIFICATION §6.4.8 既定 2）
+        std::string compression = "gzip";      // HDF5圧縮方式 "none" / "gzip"（SPECIFICATION §6.4.8 既定 "gzip"）
+        int compression_level = 4;             // gzip圧縮レベル [0-9]（SPECIFICATION §6.4.8 既定 4）
+        bool save_namelist_copy = true;        // namelist源ファイルのコピー保存（SPECIFICATION §6.4.8 既定 True）
+        bool save_frozen_config = true;        // 凍結設定（JSON）の保存（SPECIFICATION §6.4.8 既定 True）
+        std::vector<std::string> plot_fields = {
+            "rho", "Te", "Ti", "ee", "ei", "Pe", "Pi", "Qvisc",
+            "mass", "vol", "zbar", "energy_density"
+        };
+        // HDF5 group structure: /hydro/rho, /mesh/x_r, /radiation/energy_density, etc.
+        // データセット名は State フィールド名と 1:1 対応（SPECIFICATION §7.2 準拠）
+    } output;
+
+    struct DiagnosticsConfig {
+        bool enabled = true;                  // 全診断無効化スイッチ（SPECIFICATION §6.4.9 既定 True）
+        int every = 1;
+        struct EnergyBudget {
+            bool enabled = true;
+            std::vector<std::string> components = {
+                "kinetic", "internal_electron", "internal_ion", "radiation_field",
+                "laser_incident", "laser_deposited", "laser_escaped",
+                "marshak_in", "radiation_escaped",
+                "pdv_boundary", "numerical_loss",
+                "floor_injected", "safety_injected", "solver_residual"
+            };  // NUMERICS §10.2 恒等式の全成分。SPECIFICATION §6.4.9 + §7.2 HDF5スキーマ準拠
+            double warn_threshold = 1e-3;  // 保存誤差の警告閾値（SPECIFICATION §6.4.9 既定 1e-3）
+        } energy_budget;
+        struct ArealDensity {
+            bool enabled = true;              // ρR面密度診断の有効化（SPECIFICATION §6.4.9 既定 True）
+            std::string r_range = "shell";    // "full" | "shell"（SPECIFICATION §6.4.9 既定 "shell"）
+            std::vector<double> angles_deg = {0, 45, 90};  // 対称軸からの角度 [deg]（SPECIFICATION §6.4.9 既定 [0,45,90]）
+        } areal_density;
+        struct Sphericity {
+            bool enabled = true;             // 球面性診断の有効化（SPECIFICATION §6.4.9 既定 True）
+            std::string surface = "isodensity"; // "isodensity" | "material_interface"（SPECIFICATION §6.4.9 既定 "isodensity"）
+            double rho_threshold = 10.0;     // [g/cm³]（SPECIFICATION §6.4.9 既定 10.0。-1.0 = auto: 0.1×ρ_max を使用）
+            std::vector<int> modes = {0, 2, 4};  // Legendre モード次数（SPECIFICATION §6.4.9 既定 [0,2,4]）
+        } sphericity;
+        struct ShellTracking {
+            double rho_threshold_factor = 0.1; // cells with ρ > factor * ρ_max
+        } shell;
+        struct LaserPatternDiag {
+            bool enabled = true;               // laser.enabled=True時のみ有効（SPECIFICATION §6.4.9）
+            bool absorbed_power_profile = true; // 臨界面近傍吸収パワー密度分布
+            bool critical_surface = true;       // 臨界面位置 R_crit(θ)
+            bool per_beam = false;              // ビーム別吸収分率
+        } laser_pattern;
+        // mc_stats / fleck_diag（退役したモンテカルロ輻射の粒子統計と Fleck 係数のログ）は Config に無い。Builder は受理して無視する。
+        bool per_operator_radial_fourier_enabled = false; // 2D_RZ per-Strang-stage radial Fourier audit（SPECIFICATION §6.4.9; default-off）
+        double radial_fourier_window_t_start_s = 1.35e-5; // [s] audit start time, inclusive
+        double radial_fourier_window_t_end_s = 1.70e-5;   // [s] audit end time, exclusive
+        int radial_fourier_max_mode = -1;                 // -1 = all radial modes through Nyquist; otherwise max mode index audited
+        bool per_operator_radial_fourier_complex_enabled = false; // PR G2-A fixed-mode complex coefficient audit; emits radial_fourier_audit_v2/v1
+        vector<int> per_operator_radial_fourier_complex_m_targets = {14,15,16};
+        vector<int> per_operator_radial_fourier_complex_j_targets = {507,508,509,510,511};
+        vector<string> per_operator_radial_fourier_complex_fields; // hidden-variable field list; unavailable fields skipped
+        bool overshoot_monitor = true;     // 放射演算子後の温度最大原理違反を監視（SPECIFICATION §6.4.9 既定 True、NUMERICS §11.8）。
+                                            // false 時は Phase 4 の CUB Max + overshoot 検出をスキップ
+    } diagnostics;
+
+    struct ParallelConfig {
+        // --- decomposition（SPECIFICATION §6.4.10）---
+        struct Decomposition {
+            std::string method = "slab";     // "slab" | "cartesian"
+            // 注: SPECIFICATION §9.1 の次元依存既定: 1D_SPH="slab", 2D_RZ="cartesian"
+            // init時に Config::apply_dimension_defaults(dim) で上書きされる
+            std::vector<int> dims = {};      // [P_r, P_z]; empty = auto
+            int min_cells_per_rank = 8;      // Kershaw stencil + ghost 安全余裕
+        } decomposition;
+
+        // --- halo ---
+        struct Halo {
+            std::string gpu_aware_mpi = "auto"; // "auto" | "force" | "disable"
+            int ghost_layers = 1;            // ghost cell layers（Kershaw 9点ステンシルに必要な最小値、Appendix A参照）
+        } halo;
+
+        // migration・laser_parallel・particle_balance・reproducibility・gpu_optimization は Config に無い
+        // （Builder は受理して無視する。migration は退役したモンテカルロ輻射の光子粒子の rank 間移動で、2026-09-29 に外した）。
+    } parallel;
+};
+```
+
+> **設計方針**：
+> - `Config` はhost側のPOD的構造体。GPU側へは必要なフィールドのみ個別にコピーする
+> - `Config` の生成後にPython関連リソースは全て解放される（`Py_Finalize`）
+> - `Config` は frozen JSON として HDF5 に保存され、再現性に使用される
+> - 各モジュールの `init()` 関数は `const Config&` を受け取り、自身の内部状態を構築する
+
+---
+
 ### 4.2 mesh/
 **責務**：計算格子（ALE/Lagrangian）と幾何演算、近傍構造
 
@@ -2183,5 +2942,1072 @@ namespace IO {
 - `tools/validation/reproducibility_check.py` evaluates same-architecture byte
   reproducibility, cross-architecture tolerance, and emits
   `cross_arch_metadata.json`.
+
+---
+
+## 5. データモデル（State）
+計算状態は `State` が一括保持し、各モジュールは必要ビューを受け取って更新する。
+
+### 5.1 Field\<\> テンプレート
+
+GPUデバイスメモリ上のフィールドデータを管理する薄いRAIIラッパー群。
+タグ型でインデックス次元を静的に区別する。
+
+> **旧 `Field<Tag>` / `Field<Tag1,Tag2>` からの変更**：
+> C++ では同名クラステンプレートのパラメータ数違い（1引数 vs 2引数）は
+> 部分特殊化ではなく **再定義** となり、コンパイルエラーになる。
+> `Field1D` / `Field2D` / `FieldG` に分離することで衝突を回避し、
+> 1D/2D切替も明示的になる。
+
+```cpp
+// 1Dフィールド（1D_SPH: セルまたはノード単位）
+// メモリ確保：cudaMalloc でGPUデバイスメモリに配置。ホストミラーは持たない。
+// I/O（HDF5出力）時は copy_to_host() でピン留めホストバッファへ転送し、
+// HDF5 への書き込み後にホストバッファを解放する。
+template<typename Tag>
+struct Field1D {
+    double* data;     // [n] deviceメモリ（cudaMalloc で確保）
+    int     n;
+
+    // host↔device転送
+    void copy_to_host(double* host_dst) const;
+    void copy_from_host(const double* host_src);
+
+    // size変更（破壊的realloc + ゼロ初期化）
+    void reset(int new_size);
+    // size変更（データ保持）
+    void resize(int new_size);
+
+    // ムーブセマンティクス（コピー禁止）
+    Field1D(Field1D&& other) noexcept;
+    Field1D& operator=(Field1D&& other) noexcept;
+    Field1D(const Field1D&) = delete;
+    Field1D& operator=(const Field1D&) = delete;
+
+    // デストラクタで cudaFree
+    ~Field1D();
+};
+
+// 2Dフィールド（2D_RZ: セルまたはノード単位）
+// メモリ確保：cudaMalloc でGPUデバイスメモリに配置（Field1D と同一方針）。
+template<typename Tag>
+struct Field2D {
+    double* data;     // [nr × nz] deviceメモリ（cudaMalloc）（row-major: data[i*nz + j], i=r方向, j=z方向）
+    int     nr, nz;
+
+    // host↔device転送
+    void copy_to_host(double* host_dst) const;
+    void copy_from_host(const double* host_src);
+
+    // size変更（realloc）
+    void resize(int new_nr, int new_nz);
+
+    // ムーブセマンティクス（コピー禁止）
+    Field2D(Field2D&& other) noexcept;
+    Field2D& operator=(Field2D&& other) noexcept;
+    Field2D(const Field2D&) = delete;
+    Field2D& operator=(const Field2D&) = delete;
+
+    // デストラクタで cudaFree
+    ~Field2D();
+};
+// **ゴーストセル対応**：MPI並列時、ghost付きフィールド（§5.2 で [n_cells+n_ghost] と注記されるもの）は
+// data = cudaMalloc(sizeof(double) * (nr*nz + n_ghost)) で確保する。Field2D.nr/nz は **interior 次元** であり
+// 確保サイズは nr*nz + n_ghost。resize(nr, nz) もこの拡張サイズを考慮すること。
+// ghost アクセス: data[n_cells + ghost_offset]（CUDA_KERNELS §2.2 H4 ゴーストセル契約参照）。
+// single-GPU (n_ghost=0) では nr*nz == n_cells。
+
+// 群依存フィールド（放射エネルギー密度など）
+// メモリ確保：cudaMalloc でGPUデバイスメモリに配置（Field1D と同一方針）。
+template<typename Tag>
+struct FieldG {
+    double* data;     // [n_spatial × G] deviceメモリ（cudaMalloc）（1D: n_spatial=n_cells, 2D: n_spatial=nr*nz）
+    int     n_spatial; // セル数: n_cells (1D) or nr*nz (2D)
+    int     G;         // 群数
+
+    // メモリレイアウト：spatial-major（cell-major）
+    // data[i * G + g] = spatial index i, group g の値
+    // → 同一セルの全群が連続 → セル単位で群を回すカーネルでキャッシュ効率が良い
+
+    int total_size() const { return n_spatial * G; }
+};
+
+// タグ型（ゼロコスト識別）
+struct CellTag {};
+struct NodeTag {};
+
+// エイリアス
+using CellField1D = Field1D<CellTag>;
+using NodeField1D = Field1D<NodeTag>;
+using CellField2D = Field2D<CellTag>;
+using NodeField2D = Field2D<NodeTag>;
+using CellFieldG  = FieldG<CellTag>;  // rad_dep, rad_E 等
+```
+dim=1 の場合は `Field1D` を使用し、dim=2 の場合は `Field2D` を使用する。
+コンパイル時ディスパッチは以下の `#ifdef` で処理：
+
+```cpp
+// --- v1.0 設計方針: コンパイル時ディスパッチ ---
+// TENRYU_2D マクロは CMake オプション -DTENRYU_DIM=2 で設定される。
+// 1D バイナリと 2D バイナリを別々にビルドする（dim はコンパイル時定数）。
+// Config::MainConfig::dim は Python 入力からの読み込み値であり、
+// コンパイル時定数 TENRYU_DIM と一致しない場合は ConfigError を送出する。
+// if constexpr (TENRYU_DIM == 2) による分岐で 1D/2D コードを選択する。
+// これにより未使用次元のコードがコンパイル時に除去され、
+// レジスタ圧力の低減と分岐コストの排除が実現できる。
+
+#ifdef TENRYU_2D
+  using CellField = CellField2D;
+  using NodeField = NodeField2D;
+#else
+  using CellField = CellField1D;
+  using NodeField = NodeField1D;
+#endif
+
+// 多材料フィールド：cells × n_mat の2D配列。群依存フィールド (FieldG) と同構造だが
+// 第2軸が群数ではなく材料数。FieldG<CellTag> を再利用し n_group の代わりに n_mat を渡す。
+using CellFieldMat = FieldG<CellTag>;  // data[cell * n_mat + mat]
+
+// --- 型安全に関する注記（v1.0 設計判断）---
+// v1.0: n_mat は最大 MAX_MATERIALS=8 で固定、G は最大 80
+// CellFieldG は group 用、CellFieldMat は material 用として別名定義：
+//   using CellFieldG   = FieldG<CellTag>;  // [n_cells × G] group-indexed
+//   using CellFieldMat = FieldG<CellTag>;  // [n_cells × n_mat] material-indexed
+// 注意: CellFieldG と CellFieldMat は同じ型。意味的区別はコンテキストとコメントで管理。
+// 将来の型安全強化では GroupTag/MatTag テンプレート引数を追加し、
+//   FieldG<CellTag, GroupTag> / FieldG<CellTag, MatTag> のように区別する予定。
+```
+
+**設計判断**：
+- `thrust::device_vector` は不使用。薄いラッパーでメモリ管理を明示化し、
+  不要なhost-device同期を回避する
+- **所有権**：`State` が全 Field を所有する。モジュールは `double*` ポインタを受け取って操作する
+- **群依存フィールドはcell-major**：`data[cell * G + group]`。
+  粒子カーネルは1粒子が1セルの全群を参照するため、群方向が連続だとキャッシュヒット率が高い
+
+> **導入タイミング**：Field テンプレート群は **M03（1D SPH基本実装）から導入**する。
+> 理由：コンパイル時型安全はゼロランタイムコスト。後からの導入は全ファイルのリファクタが必要になる。
+> M03の時点で CellTag / NodeTag タグ型を定義し、以降のマイルストーンで一貫して使用する。
+>
+> **メモリモードのフェーズ展開**：
+> - **M03（Hydro検証）**：`std::vector<double>` ベースのホストメモリモード。CUDAカーネル不使用のため `data()` で生ポインタ取得。
+> - **M04以降（GPU化）**：`cudaMalloc` デバイスメモリへ移行。Field API（`operator[]`, `data()`, `size()`）は共通のため、呼び出し側コード変更は不要。
+> - 移行時の変更点：`std::vector` → デバイスポインタ + `cudaMemcpy` ヘルパー。State のアロケータを切り替えるだけで完了。
+
+### 5.2 State 構造体
+
+State はホスト側配置。メンバポインタは全てデバイスメモリ。カーネルへは個別ポインタ引数展開で渡す。
+
+> **ゴーストセル込みバッファサイズ規約**：
+> MPI並列時、ハロー交換で更新するフィールド（rho, Te, Ti, Pe, Pi, Qvisc, adaptive_av_gate, zbar, vol, face_area,
+> volFrac, hydro_active）は `n_cells + n_ghost` 要素で確保する。
+> ここで `n_ghost` は `PartitionInfo.n_ghost_cells`（ゴーストセル総数）のエイリアスである。
+> `PartitionInfo.ghost_layers`（レイヤー数 = 1）とは異なるので注意。
+> 2D_RZ 1層ハロー: n_ghost_cells = 2×(nr_local+nz_local)+4。単一GPU時は `n_ghost_cells=0`。
+> カーネルシグネチャで `[n_cells + n_ghost]` と注記されたフィールドは ghost 込みバッファを前提とする。
+> `[n_cells]` のみ注記されたフィールド（mass, ee, ei, Cv_e, Cv_i, delta_l 等）は owned セル専用で
+> ghost 領域は確保しない。FieldG 型（rad_dep, rad_E 等）は owned セル `[n_cells × G]` のみ。
+
+```cpp
+struct State {
+    Mesh mesh;              // 計算格子（Topology + Geometry）
+
+    // --- 時間・ステップ管理 ---
+    // allocate() で初期化。main loop で毎ステップ更新。
+    // checkpoint 保存・復元対象。ただしhistory専用カウンタは復元必須ではない。
+    double t = 0.0;         // 現在時刻 [s]
+    int    step = 0;        // 現在ステップ番号
+    double dt = 0.0;        // 現在タイムステップ幅 [s]
+    bool   ale_rezoned = false;       // 直近ステップでALE rezoneが発動したか
+    int    ale_rezone_invocations = 0; // 累積history診断用（checkpoint必須ではない）
+    int    ale_remaps_applied = 0;     // accepted 2D ALE remap counter（checkpoint必須ではない）
+    int    ale_last_applied_step = -1; // ALE が最後に rezone を commit した step（2D_RZ が書く。1D V3 ALE の cadence/min-step gate が読んでいた — 2026-10-02 に退役）
+
+    // --- 出力タイミング状態（時間間隔ベース出力用）---
+    // checkpoint 保存・復元対象（SPECIFICATION §7.4 output_state/）。
+    // -1.0 = 対応する X_every_s が無効。
+    double t_next_plot = -1.0;       // [s] 次回plot出力時刻
+    double t_next_history = -1.0;    // [s] 次回history出力時刻
+    double t_next_checkpoint = -1.0; // [s] 次回checkpoint出力時刻
+
+    // --- ファクトリ関数 ---
+    // Config と PartitionInfo から全フィールドを確保し初期化する。
+    // 確保対象：全 CellField/NodeField/CellFieldG/CellFieldMat、
+    //           hydro_active、Scratch、DeviceErrorFlags
+    static State allocate(const Config& cfg, const PartitionInfo& part);
+
+    // --- Hydro cell fields ---
+    // CellField / NodeField は §5.1 の #ifdef TENRYU_2D で
+    // CellField1D/CellField2D, NodeField1D/NodeField2D に解決される。
+    CellField rho;          // 質量密度 [g/cm³]
+    CellField zbar;         // 平均電離度 Z̄ [dimensionless]（NUMERICS §1.1.4）。Hydro ステップ冒頭で更新
+    CellField A_eff;        // 有効原子量 [dimensionless]（NUMERICS §1.1.5a）。U8 compute_zbar 出力。
+                            // 多材料: 体積分率加重調和平均 1/A_eff = Σ f_α/A_α。単一材料: A_ion。
+                            // H15(compute_sound_speed), U6(qei_exchange), C1(compute_spitzer_deff) が参照。
+                            // チェックポイント保存推奨（リスタート時は post-restart U8 で再計算可能）
+    CellField mass;         // セル質量 [g] = ρ×V
+    CellField vol;          // セル体積 [cm³]（Mesh.recompute_geometry() 後に Mesh.cell_vol からコピー。§4.2.2 同期契約参照）
+    CellField cell_vol_initial; // IC 時セル体積 [cm³]。2D_RZ geometric CFL cumulative floor の固定基準
+    std::vector<uint8_t> center_patch_latch; // HOST runtime-only center/quality-patch hysteresis bitmask; restart re-seeds from geometry
+    CellField Te, Ti;       // 電子/イオン温度 [eV]
+    int8_t* hydro_active;   // OWNED [n_cells + n_ghost] deviceメモリ。セル単位Hydro活性フラグ（一方向、NUMERICS §2.1.1）。
+                            // n_ghost込み: ハロー交換対象（§5.2 ゴーストセル込みバッファサイズ規約、CUDA_KERNELS §9 Phase 1 halo_exchange 参照）
+    std::vector<int8_t> state_supply_mask; // HOST [n_cells] z-face state_supply row mask
+    CellField state_supply_pre_rho, state_supply_pre_mass, state_supply_pre_ee,
+              state_supply_pre_ei, state_supply_pre_uz; // reservoir tally pre-state snapshots
+    double state_supply_dM_cumulative, state_supply_dE_cumulative, state_supply_dPz_cumulative;
+    double state_supply_dM_step, state_supply_dE_step, state_supply_dPz_step;
+    CellField ee, ei;       // 電子/イオン比内部エネルギー [erg/g]
+    CellField Pe, Pi;       // 電子/イオン圧力 [dyne/cm²]
+    CellField Cv_e, Cv_i;   // 電子/イオン比熱 [erg/(g·eV)]（H13 eos_forward 出力。R1 Fleck因子、C1 D_eff で使用）
+    CellField Qvisc;        // 人工粘性圧 [dyne/cm²]（NUMERICS §3.1.6, §3.2.9）
+    CellField hllc_mom_z_cell; // optional experimental z-HLLC authoritative cell z momentum [g cm/s]
+    CellField corner_mass, corner_volume, corner_pressure; // optional 2D_RZ Phase 3 flat corner/subzone state [g, cm³, dyne/cm²]（runtime-only、checkpoint対象外）
+    CentralPseudoCoreState central_pseudo_core; // runtime-only virtual center macro overlay
+    PoleAngularDerefineState pole_angular_derefine; // runtime-only I1-B polar-shell angular macro overlay
+    CellField subzonal_mass_corner0, subzonal_mass_corner1,
+              subzonal_mass_corner2, subzonal_mass_corner3; // 2D_RZ hourglass runtime subzonal masses [g]（default-off、checkpoint対象外、NUMERICS §3.2.9b）
+    CellField adaptive_av_gate; // optional adaptive AV gate 履歴 g_i [-]（adaptive_av.enabled=True）
+    CellField eta_compatible; // optional legacy compatible-volume mismatch [cm³]（exact force-work path では保存機構に未使用）
+    CellFieldMat volFrac;   // [dimensionless] 体積分率 [(n_cells+n_ghost) × n_mat]（§5.1 CellFieldMat、NUMERICS §1.1.5 (c)）。
+                            // n_ghost込み: U9 がゴーストセルの opacity 混合則に volFrac を参照（§5.2 規約準拠）
+    std::vector<std::uint8_t> cell_is_void; // [n_cells] void セルマスク（1=void, 0=通常）。
+                            // geometry_eval で体積分率から導出: nonvoid_sum ≤ 1e-12 → void。
+                            // Fleck (f=1), 伝導 (κ=0), カップリング (deposit skip) で参照。
+                            // ALE remap 後に再計算（driver.cpp）。
+    double adaptive_av_r0, adaptive_av_last_rs, adaptive_av_last_us, adaptive_av_rs_min; // adaptive AV tracker scalars
+    int adaptive_av_tracker_steps, adaptive_av_mode;                 // tracker warm-up and mode trace
+    bool adaptive_av_tracker_valid, adaptive_av_bounce_seen;         // adaptive AV state machine latches
+
+    // --- Node fields ---
+    // エイリアス契約：Mesh.node_r/node_z は State.x_r.data/x_z.data の
+    // 借用ポインタ（non-owning）である（§4.2.2 参照）。
+    // State が x_r/x_z の所有権を持ち、Mesh は参照のみ。
+    // Lagrangian 移動や ALE rezone で x_r/x_z を更新した後は、
+    // Mesh.recompute_geometry() を呼び出して体積・重心・面積を再計算すること。
+    // Mesh.node_r ポインタの再設定は不要（同一バッファを指し続ける）。
+    NodeField x_r, x_z;    // ノード座標 [cm]（1Dでは x_z 未使用）
+    NodeField x_r_reference, x_z_reference; // IC reference mesh coordinates for 2D_RZ BC/ALE targeting
+    NodeField v_r, v_z;     // ノード速度 [cm/s]
+
+    // --- Radiation ---
+    CellFieldG rad_E;       // 群ごとの輻射エネルギー密度 [erg/cm³]（FLD・S_N の解。NUMERICS §6.7、§6.8）
+    CellFieldG rad_E_old;   // ステップ初めの rad_E [erg/cm³]（FLD・S_N の時間差分と γ_r=4/3 圧縮の基準）
+    CellFieldG rad_dep;     // 物質が吸収した輻射エネルギー [erg]（セル×群、ステップ内の累積。FLD・S_N が publish）
+    CellFieldG rad_emit;    // 物質が放出した輻射エネルギー [erg]（同上）
+    CellFieldG sn_diag_*;   // 1D S_N output-only plateau diagnostics（E pre/post, emission/absorption,
+                            // clip rad/full deficit, opacity lag, angular first moment, face-flux E*, stream theta）[N_cell × G]
+    FaceFieldG sn_face_flux_raw; // 1D S_N signed radial face flux [N_face × G], positive outward
+    FaceFieldG sn_face_flux_limited; // donor-theta limited radial face flux [N_face × G]
+    FaceFieldG sn_face_flux_diff;    // AP face_blend FLD-style diffusion face flux [N_face × G]
+    FaceFieldG sn_face_alpha;        // AP face_blend weight [N_face × G]
+    CellFieldG sn_stream_theta;      // donor streaming limiter theta [N_cell × G]
+    CellFieldG sn_E_star_flux;   // 1D S_N face-flux streaming state [N_cell × G]
+    CellField fld_fleck;         // 2D_RZ FLD output-only Fleck factor diagnostic [N_cell]
+    double fld_state_supply_in_cumulative, fld_state_supply_out_cumulative,
+           fld_state_supply_net_cumulative; // 2D_RZ FLD state_supply Dirichlet boundary tally [erg]
+    double fld_state_supply_in_step, fld_state_supply_out_step,
+           fld_state_supply_net_step;       // current FLD stage state_supply tally [erg]
+    CellField sn_tau_R;          // 2D_RZ S_N AP optical-depth diagnostic [N_cell]
+    CellField sn_reduced_flux;   // 2D_RZ S_N AP reduced-flux diagnostic [N_cell]
+    CellField sn_ap_alpha;       // 2D_RZ S_N AP alpha diagnostic [N_cell]
+    bool holo_ale_invalidated; // ALE の再マップが輻射場の下の格子を動かしたとき（1D・2D）に立ち、FLD・S_N が格子に依存する
+                               // キャッシュを作り直して時間履歴を始め直してから下ろす（名前は退役した HOLO の名残）
+    // 退役したモンテカルロ輻射の状態（PhotonPool、DDMC のモード判定 ddmc_candidate/ddmc_mode、界面の face current、
+    // HOLO の holo_*、difference 定式化の difference_*、rad_E_tally、rad_mom_dep、bc_type_rad、ell_ddmc）は State に無い
+    // （2026-09-29 に最後の holo_*・difference_* を外した）。
+
+    // --- Geometry cache（H7 compute_cell_geometry 出力、ステップ間保持）---
+    double* face_area;      // OWNED [(n_cells+n_ghost) × n_faces] 面面積 A_m [cm²]
+    CellField delta_l;      // 特性長 Δl = sqrt(A_cell) [cm]（H10 人工粘性、U4 CFL で使用）
+
+    // --- Derived step-lifetime fields ---
+    // Phase 間で保持が必要な中間量。State::allocate() で確保、チェックポイントでの保存は任意
+    // （リスタート時は初期化プロローグで再計算可能）。
+    CellField c_s;          // 音速 [cm/s]（H15 出力。H10 人工粘性、U4 CFL で使用。
+                            //   初期化: State::allocate() 後に H13→H15 で算出。チェックポイント保存推奨）
+    CellField D_eff;        // 実効拡散係数 [cm²/s]（C1 出力。U4 dt_cond で使用。
+                            //   Scratch ではなく State に保持する理由: C1(Phase 2) → U4(Phase 6) で
+                            //   Phase 3-5 のオペレータが Scratch をリセットするため）
+
+    // --- Laser ---
+    CellField laser_dep;    // 全ビーム合算後の沈着 [erg]
+    double* laser_dep_frac; // OWNED [n_laser_groups * n_cells] per-group レーザー沈着パワー分率 f̂_g [無次元]
+                             // （skip mode用、CUDA_KERNELS §5.1e、ステップ間保持。NUMERICS §5.9.3 グループ毎キャッシュ）
+                             // n_laser_groups = Builder がビームパラメータ同一性から導出（NUMERICS §5.4）。GXII等の全ビーム同一パラメータ構成では 1
+                             // LaserConfig.beams から (θ, F#, profile) の一致で自動グループ化（§8.2 init Step 2）
+    bool laser_cache_valid = false; // レーザーキャッシュ有効フラグ。step=0/リスタート直後は false。
+                                     // laser_cache_update 後に true。Phase 3 で false の場合 L6 バイパス（CUDA_KERNELS §9 Phase 0 注記）。
+                                     // チェックポイント保存対象: laser_dep_frac とともに保存/復元するか、
+                                     // リスタート時に false で初期化し初回ステップで full raytrace を強制するか、
+                                     // いずれかの方式を選択する。v1.0推奨: リスタート時 false 初期化（実装が単純）
+
+    // --- Cumulative diagnostics（ステップ間で累積、チェックポイントに保存 §4.9 checkpoint）---
+    // **命名規約（per-step vs cumulative の二重ライフサイクル）**:
+    // デバイス側には同名の per-step アキュムレータ（double* [1] deviceメモリ）が存在し、
+    // Phase 0 で cudaMemsetAsync ゼロ初期化される。Phase 1-6 の U2/U1/R8 等が atomicAdd で累積する。
+    // Phase 6 で D2H 転送後、ホスト側で以下の累積フィールドに加算する:
+    //   State.E_floor_injected += step_E_floor_injected_dev;  // etc.
+    // **実装注意**: デバイスper-stepバッファとホスト累積変数は別物。リセットタイミングを混同しないこと。
+    // デバイスバッファ名の推奨: `dev_step_E_floor_injected` 等で接頭辞区別。
+    //
+    // **MPI セマンティクス**: 累積値は **global-per-rank**（全 rank 同一値）で保持する。
+    // Phase 6 で per-step デバイス値を D2H した後、MPI_Allreduce(SUM) でグローバル合計を算出し、
+    // 全 rank が同一の step 値を State の累積フィールドに加算する（CUDA_KERNELS §9 Phase 6 準拠）。
+    // これにより追加の MPI_Reduce なしでエネルギー収支出力が可能。
+    // **checkpoint**: rank 0 が time_state/ グループにスカラー値を書き込む（SPECIFICATION §7.4）。
+    // 全 rank が同一値を保持するため、rank 数変更時の再合算は不要 — 全 rank が同じ値を復元する。
+    //
+    // **スレッド安全性**: ホスト累積変数は main time loop の単一スレッドからのみ更新される。
+    // HDF5 出力は同一ステップの Phase 6 完了後に実行され、累積変数の read/write が重複しない。
+    // 将来非同期出力を導入する場合は、出力前にスナップショットコピーを作成すること。
+    double E_safety = 0.0;           // [erg] 伝導安全補正の累積値（NUMERICS §4.2.2, §10.2）。
+                                     // 負温度クランプ時のフラックススケーリング非対称性エネルギー ΔE_scaling を加算。
+    double E_numerical_loss = 0.0;   // [erg] 退化セル（ρV < 1e-30）で注入できなかったエネルギーの累積値。
+                                     // source_injection（§4.7）でゼロ除算ガードに引っかかった場合に加算。
+    double E_laser_deposited = 0.0;  // [erg] レーザー沈着エネルギーの累積値（各ステップで laser_dep の総和を加算）
+    double E_laser_escaped = 0.0;    // [erg] レーザー脱出エネルギーの累積値（臨界面未到達レイのエネルギー）
+    double E_rad_escaped = 0.0;      // [erg] 放射脱出エネルギーの累積値（VACUUM/MARSHAK 境界から脱出した輻射エネルギー）
+    double E_floor_injected = 0.0;   // [erg] フロア注入エネルギーの累積値（floor_clamp で追加されたエネルギー）
+    double E_pdV_bdry = 0.0;         // [erg] 境界PdV仕事の累積値（NUMERICS §10.2: Σ P_f A_f v_{n,f} Δt）
+                                      // Phase 1/5 H(Δt/2) Corrector 後にホスト側で計算・加算
+    double E_Marshak_in = 0.0;       // [erg] Marshak境界入射エネルギーの累積値（NUMERICS §10.2: Σ (a_eV c/4) T_{r,f}⁴ A_f Δt）
+    double E_solver = 0.0;           // [erg] Hypre残差エネルギーの累積値（v1.0=0、Hypre有効時のみ非ゼロ。NUMERICS §10.2）
+
+    // --- Error ---
+    DeviceErrorFlags* error_flags;  // OWNED [1] deviceメモリ。GPUカーネルからのエラー報告（§10.1）。
+                                    // State::allocate() で cudaMalloc、各ステップ開始時に cudaMemsetAsync で 0 クリア。
+                                    // カーネル完了後に cudaMemcpy D2H でホスト側コピーを取得しチェック
+
+    // --- Scratch ---
+    Scratch scratch;        // 一時ワークスペース（§5.5）。各Strangオペレータが排他的に使用
+};
+```
+
+Runtime macro overlays for 2D_RZ multiblock hydro are runtime `State`
+subobjects, not checkpoint/HDF5 schema.  `src/hydro/pole_angular_derefine.{cuh,cu}`
+owns the I1-B polar-shell angular overlay: dyadic one-row macro descriptors,
+proactive criterion-driven span maintenance, reactive same-pole active-child
+span extension, the shared member/inactive cell masks, boundary-node masks,
+flattened macro boundary loops, and pressure-work impulse buffers.  CSR mesh
+topology remains unchanged.  Hydro, CFL, path admissibility, compatible
+force/work, CSW edge AV, ALE remap, and remap audit/fixup paths consume the
+module's inactive mask or effective active mask instead of discovering members
+independently.
+
+> **LaserMesh の所有権**：LaserMesh は **Laser モジュールが管理**する内部データ構造であり、
+> State のメンバーではない。Laser::Mesh が `init()` 時に確保し、ステップ毎に更新する。
+> LaserMesh のフィールド（`n_hat`, `Te`, `Zbar`, `grad_n_hat`, `deposit`）は
+> State.laser_dep への転写後に参照されない（NUMERICS §5.7.1）。
+
+### 5.3 PhotonPool（SoA粒子プール）— 退役
+
+モンテカルロ輻射の光子粒子プール（`PhotonPool`・`ParticleMode`・`ParticleStatus`・容量と成長の戦略）。2026-09-29 にコードとともに
+退役し、本節の記述を `retired/radiation_monte_carlo/docs/ARCHITECTURE_monte_carlo.md` へ移した。State に粒子プールは無い。
+
+### 5.4 GPUレイアウト方針
+
+- 原則 **SoA**（coalesced access）：32スレッドが連続アドレスを読む
+- （退役したモンテカルロ輻射の粒子のソート・compaction・再同定・タリー集約の方針は §5.3 と同じく
+  `retired/radiation_monte_carlo/docs/ARCHITECTURE_monte_carlo.md` へ移した）
+
+> **SoAスコープの明確化**：
+> - Field<> は各物理量が独立した連続配列として格納されるため、実質的に SoA 相当
+> - したがって AoS→SoA 変換は不要（設計時点で SoA を採用済み）
+> - M15以降の性能最適化ではカーネルチューニング・メモリアクセスパターン最適化に注力
+
+### 5.5 Scratch（一時ワークスペース）
+
+```cpp
+struct Scratch {
+    void*   buffer;         // 汎用一時バッファ（deviceメモリ）
+    size_t  buffer_size;    // 確保済みバイト数
+
+    // 初期化時に全演算子の最大必要量を調査し、maxで確保
+    // 主な使用者：
+    //   - CUB reduction (エネルギー収支)            : ~256 bytes
+    //   - Kershaw 9点ステンシル係数一時配列          : ~9 * n_cells * 8 bytes
+    //   - ALE Jacobi反復の中間ノード座標            : ~2 * n_nodes * 8 bytes
+    //   - vol_old (PdV work用体積スナップショット)  : ~n_cells * 8 bytes
+    //   - v_r_old, v_z_old (速度スナップショット)  : ~2 * n_nodes * 8 bytes
+    //   - x_r_old, x_z_old (座標スナップショット)  : ~2 * n_nodes * 8 bytes
+    //   - P_i_old, P_e_old, Q_old (圧力スナップショット) : ~3 * n_cells * 8 bytes
+    //     Predictor前に vol/v/x/P/Q → *_old をコピーし、
+    //     Corrector H5 が v^n + Δt·a^{pred}、H6 が r^n + Δt·v、
+    //     H11/H12 が ΔV = V^{corrector} - V^n、P_mid = (P^n+P^{pred})/2 を計算
+};
+```
+
+**確保戦略**：`State::init()` 時に全モジュールの `scratch_requirement()` を呼び出し、
+最大値で一括確保する。ステップ中は再確保しない（固定サイズ）。
+各演算子は `scratch.buffer` を自身のデータ型にキャストして使用する。
+同一ステップ内で複数演算子が同時に scratch を使うことはない（逐次実行のため）。
+
+**サブアロケーション・アリーナ**：
+
+```cpp
+struct ScratchArena {
+    void*  base;       // Scratch::buffer の先頭（deviceメモリ、256-byte aligned）
+    size_t offset;     // 現在のオフセット [bytes]（alloc() で前進）
+    size_t capacity;   // 全容量 [bytes]（初期化時に確定、以後不変）
+
+    // アライメント付きサブアロケーション
+    template<typename T>
+    T* alloc(int count) {
+        size_t align = alignof(T);
+        offset = (offset + align - 1) & ~(align - 1);  // アライメント
+        T* ptr = reinterpret_cast<T*>(static_cast<char*>(base) + offset);
+        offset += sizeof(T) * count;
+        assert(offset <= capacity);  // オーバーフローチェック
+        return ptr;
+    }
+
+    void reset() { offset = 0; }  // オペレータ開始時にリセット
+};
+```
+
+各 Strang オペレータの開始時に `arena.reset()` を呼び、オペレータ内では
+`arena.alloc<double>(n)` で一時バッファを確保する。
+オペレータ間でスクラッチメモリは共有されない（排他使用）。
+`ScratchArena` は `Scratch::buffer` のサブ領域を返すだけであり、
+`cudaMalloc` / `cudaFree` は発生しない（ゼロオーバーヘッド）。
+
+**scratch メモリ要求インターフェース**：
+
+```cpp
+// 各モジュールが必要とする scratch メモリの申告
+struct ScratchRequirement {
+    size_t bytes;           // 必要バイト数
+    size_t alignment = 256; // アライメント (CUDA 推奨)
+    const char* label;      // デバッグ用ラベル ("CUB_prefix_sum", "Kershaw_temp", etc.)
+};
+// 各モジュールは static メソッドで要求量を申告:
+//   static ScratchRequirement Radiation::scratch_requirement(const Config& cfg);
+//   static ScratchRequirement Hydro::scratch_requirement(const Config& cfg);
+//   static ScratchRequirement Conduction::scratch_requirement(const Config& cfg);
+//   static ScratchRequirement ALE::scratch_requirement(const Config& cfg);
+// 初期化時に全モジュールの max(bytes) を確保し、Scratch::buffer に割り当て
+// 典型値 (80K cells, G=16): CUB prefix_sum ≈ 10 MB, Kershaw ≈ 5.8 MB, ALE ≈ 1.3 MB
+// （モンテカルロ輻射の粒子ソート用の CUB RadixSort temp ≈ 24×N_p と SoA double buffer ≈ 92×N_p は 2026-09-29 に退役）
+```
+
+### 5.6 GPU実行モデル
+
+#### 5.6.1 カーネル起動設定
+
+| カーネル種別 | block_size | `__launch_bounds__` | grid_size | 備考 |
+|------------|-----------|-------------------|-----------|------|
+| cell-based（Hydro, EOS, Tally集約） | **256** | `(256, 4)` | `(n_cells + 255) / 256` | レジスタ <32、occupancy ≥75%。CUDA_KERNELS §2 |
+| node-based（座標更新, 加速度） | **256** | `(256, 4)` | `(n_nodes + 255) / 256` | CUDA_KERNELS §2.2 |
+| ray-based（Laser ray trace） | **64** | `(64, 16)` | `(n_rays + 63) / 64` | ~40-46 reg、warp発散対策でblock小。CUDA_KERNELS §5.2 |
+| Kershaw stencil build | **256** | `(256, 2)` | `(n_cells + 255) / 256` | ~45 reg、compute-bound で occupancy 低下を許容。CUDA_KERNELS §4.2 |
+| pack/unpack（ハロー交換） | **256** | — | `(n_halo + 255) / 256` | メモリバウンド、レジスタ少。CUDA_KERNELS §1.7 |
+
+> **`__launch_bounds__` の役割**：コンパイラにレジスタ割り当て上限を伝え、指定した
+> `min_blocks` 数を保証する。例：`__launch_bounds__(128, 8)` は1SMあたり最低8ブロック
+> （= 1024スレッド = 50% occupancy）を保証し、レジスタ数を 65536/1024 = 64 以下に制約する。
+> 全主要カーネルに `__launch_bounds__` を付与し、コンパイラによるレジスタスピルを防止する
+> （CUDA_KERNELS §10.3 参照）。
+
+#### 5.6.2 CUDAストリーム管理
+
+```cpp
+struct StreamManager {
+    cudaStream_t compute;       // 主計算ストリーム（全演算子のカーネル実行）
+    cudaStream_t comm;          // 通信用ストリーム（halo pack/unpack + MPI）
+    cudaStream_t utility;       // ユーティリティ（diagnostics, I/O staging）
+
+    cudaEvent_t evt_compute_done, evt_comm_done, evt_utility_done;
+    // cudaEventCreateWithFlags(cudaEventDisableTiming) — timing不要でオーバーヘッド最小化
+    // cudaStreamWaitEvent() でストリーム間依存を設定する（§5.6.2 compute-comm overlap）
+};
+```
+
+**方針**：
+- v1.0では **3ストリーム**：compute, comm, utility
+- **計算-通信オーバーラップ**（NUMERICS §12.5.5 準拠）：
+  - **v1.0既定**：逐次実行（overlap なし）。`cudaStreamSynchronize(compute)` 後に comm 開始
+  - **Phase B**（設計のみ。有効化の設定だった `Parallel.gpu_optimization.compute_comm_overlap` は受理して無視される）：
+    1. 内部セル（ゴースト非依存）のカーネルを compute ストリームで起動
+    2. 同時に境界セルのハローパック → MPI通信 → ハローアンパックを comm ストリームで実行
+    3. 両ストリーム同期後、境界セル（ゴースト依存）のカーネルを compute ストリームで起動
+  - **適用可能演算子**：Hydro（コーナー力）、Conduction（Kershaw/tridiag）、Radiation（セルベースのカーネル）
+  - **適用不可**：Laser（全rank複製でハロー交換なし）
+  - **セル分類**：初期化時に `uint8_t cell_zone[n_cells]` を生成（0=内部、1=境界）。
+    Kershaw 9点ステンシルの近接1層要件に基づき、MPI区画境界から1層以内の所有セルを境界セルとする（ghost_layers=1 前提）
+  - **性能見積もり**：4 GPU時、ステップあたり ~1.2 ms の隠蔽（2–3% 改善）。
+    GPU数増加で通信時間が支配的になるため、効果は相対的に増大する
+
+#### 5.6.3 Persistent Warp 実行モデル — 退役
+
+IMC 輸送カーネル（R8）の実行モデル（NUMERICS §6.6）。2026-09-29 に退役し、本節の記述を
+`retired/radiation_monte_carlo/docs/ARCHITECTURE_monte_carlo.md` へ移した。
+
+#### 5.6.4 GPUメモリ予算
+
+初期化時にデバイスメモリの使用量を推算し、空きメモリの **85%** を上限とする。
+
+```
+メモリ予算の内訳（代表的な 2D_RZ、nr=200, nz=400, G=16群, 2材料）：
+
+State fields:
+  cell fields (ρ,m,V,Te,Ti,ee,ei,Pe,Pi,Q) : 10 × 80K × 8B  =   6.4 MB
+  cell×group fields (rad_E, rad_dep)       :  2 × 80K × 16 × 8B = 20.5 MB
+  cell×mat fields (volFrac)                :  1 × 80K × 2 × 8B  =  1.3 MB
+  node fields (x_r, x_z, v_r, v_z)        :  4 × 80.6K × 8B    =  2.6 MB
+  laser_dep [N_cell]                        :  1 × 80K × 8B      =  0.6 MB
+  --- State subtotal                                              ~ 31 MB
+
+LaserMesh (128×256):
+  5 fields × 129 × 257 × 8B                                     ~  1.3 MB
+
+EOS/Opacity tables (device):
+  SESAME: 2材料 × (301+304) × (n_ρ×n_T) × 8B  (73×41=24K)     ~  3 MB
+  IONMIX opacity: 2材料 × G × (n_ρ×n_T) × 8B                   ~  6 MB
+  Planck fraction table: 200 pts × 8B                            ~  0 MB
+  --- EOS/Opacity subtotal                                       ~  9 MB
+
+CommBuffers + Scratch:
+  halo + scratch                                                 ~ 50 MB
+
+--- 典型合計（この表の項目）                                       ~ 0.1 GB
+```
+
+（FLD・\(S_N\) の作業配列（群ごとの係数・三重対角系・\(S_N\) の角度束など）はこの表に含まない。退役したモンテカルロ輻射では
+光子粒子プールが全体の 95% 以上を占めていた（100 粒子/セル/群で ~12 GB）— その見積もりは
+`retired/radiation_monte_carlo/docs/ARCHITECTURE_monte_carlo.md` へ移した。）
+
+**メモリ不足時の対応**：
+1. `State::init()` で `cudaMemGetInfo` により空きメモリを取得
+2. 推定使用量が空きの 85% を超える場合、警告を出力
+（退役したモンテカルロ輻射には、粒子プールの初期容量の自動縮小・ピーク推定による停止・緊急 Russian roulette の手順もあった。）
+
+---
+
+## 6. 依存方向（Dependency Direction）
+循環禁止。依存は“矢印の方向”のみ。
+
+```
+core       ->  (none)
+mesh       ->  (none)
+parallel   ->  (core, mesh)
+materials  ->  (core)
+hydro      ->  (mesh, materials, core, parallel)
+radiation  ->  (mesh, materials, core, parallel)
+laser      ->  (mesh, materials, core, parallel)
+coupling   ->  (hydro, radiation, laser, materials, mesh, core, parallel, verification)
+diagnostics -> (state views including mesh geometry, core, verification)
+verification -> (core, parallel)
+io         ->  (state views only, core, parallel)
+drivers    ->  (coupling, io, diagnostics, materials, core, parallel)
+```
+
+### 6.1 Hydro::ALE retry repair modes
+
+`Hydro::ALE` owns the 2D_RZ rezone/remap path and the driver-requested local
+repair ladder. `AleMode::AxisVariationalProjection` is the
+axis-band escalation mode, default-off via
+`Numerics.ale.axis_variational_projection_enabled` (SPECIFICATION §6.4.2).
+Its ladder position is:
+
+AxisSpinePlusLocal (first rung) → AxisVariationalProjection (the
+axis-band escalation rung) → InteriorMultiNodeProjection (the interior
+multi-node projection rung) → FullWinslow (terminal).
+
+`AxisVariationalProjection` is implemented as a deterministic projection-style
+half-space feasibility operator in `src/hydro/local_rezone.{cuh,cu}`. The
+algorithm, constraint set, Picard schedule, telemetry
+`record_kind="axis_projection_attempt"`, and documented carry-over items are
+specified in NUMERICS §3.3.5 (Rezone制約 — axis variational projection 系小節).
+
+（注記 2026-07-10: 本節は doc 監査で docs/sections/ARCHITECTURE_06-10.md split
+にのみ存在していた孤児記述を正典へ移植したもの。）
+
+### 6.1 Hydro::ALE retry repair modes
+
+`Hydro::ALE` owns the 2D_RZ rezone/remap path and the driver-requested local
+repair ladder. `AleMode::AxisVariationalProjection` is the
+axis-band escalation mode, default-off via
+`Numerics.ale.axis_variational_projection_enabled` (SPECIFICATION §6.4.2).
+Its ladder position is:
+
+AxisSpinePlusLocal (first rung) → AxisVariationalProjection (the
+axis-band escalation rung) → InteriorMultiNodeProjection (the interior
+multi-node projection rung) → FullWinslow (terminal).
+
+`AxisVariationalProjection` is implemented as a deterministic projection-style
+half-space feasibility operator in `src/hydro/local_rezone.{cuh,cu}`. The
+algorithm, constraint set, Picard schedule, telemetry
+`record_kind="axis_projection_attempt"`, and documented carry-over items are
+specified in NUMERICS_03 §3.3.5a.
+
+---
+
+## 7. 並列モデル（MPI + CUDA）
+
+**基本方針**：1 MPI rank = 1 GPU。空間メッシュの領域分割に基づく並列化。
+数理詳細は NUMERICS.md §12 に定義。
+
+**§7.0 v1 実装正規（Option C、M18 2026-07）**：v1 実装は NUMERICS §12.1.4a の
+Option C（global-size 配列 + 所有窓 + 自然位置 ghost 帯）である。本節の
+local 配列・local↔global 写像の記述は M18 前の設計案（写像は恒等）。
+実装 API の対応：分割 = `parallel::PartitionInfo`（`split_axis` 均等分割）、
+交換 = `src/parallel/halo_exchange.cu`（`exchange_cell_fields` /
+`exchange_node_fields`（owner-overwrite）/ `exchange_cell_strips_scaled`
+（per-cell 多要素）/ `sendrecv_add_planes(_asym)`（SN 界面 face 和完成））、
+縮約 = `parallel::Reduction`（`allreduce_sum` / `allgatherv`）、
+rank→GPU binding = local rank による `cudaSetDevice`。ghost_layers = 2
+（NUMERICS §12.2.1）。光子粒子の移送モジュール（`particle_migration`）は退役したモンテカルロ輻射とともに 2026-09-29 に
+`retired/radiation_monte_carlo/` へ移した。
+1D の出力の集約（2026-09-26）：1D はスナップショット・チェックポイント・履歴をランク 0 が全長の配列から書くので、step 0 の出力の前と各ステップの終わり（エネルギーの集計の前）に、所有窓で更新される場（流体・閉包・セルとともに動く放射エネルギー・節点・流体の開始のフラグ）を全ランクで持ち主の値に集める（driver の `consolidate_1d_owned_lines`）。1D の熱伝導の陰解法とイオン熱伝導は、全ランクで全線を解く前に物質の線を集める（`conduction_replicate_1d_matter_lines`、係数は全線で計算）。
+
+### 7.1 並列モジュール（`src/parallel/`）
+
+並列化機能は `src/parallel/` に集約する。以下の4モジュールで構成（§7.1.3 は退役）：
+
+#### 7.1.1 `Parallel::Partition`
+- 領域分割の計算と分割メタデータ（`PartitionInfo`）の管理
+- 1D_SPH：動径スラブ分割（NUMERICS §12.1.1）
+- 2D_RZ：2Dデカルト分割（NUMERICS §12.1.2）、`MPI_Cart_create`
+- 入力パラメータ：`parallel.decomposition.*`（SPECIFICATION §6.4.10）
+- 最小セル数制約の検証（`min_cells_per_rank`）
+- local↔global ID写像の提供
+
+**PartitionInfo 構造体**（NUMERICS §12.1.4 準拠）：
+
+```cpp
+struct PartitionInfo {
+    int rank;                       // MPI rank番号
+    int n_ranks;                    // 総rank数
+    int cart_coords[2];             // 2Dカート座標 [p_r, p_z]（1Dでは[p, 0]）
+    int cart_dims[2];               // カートトポロジ [P_r, P_z]（1Dでは[P, 1]）
+
+    // ローカルセル範囲（global indexing）
+    int local_cell_range[2][2];     // [[ir_start, ir_end), [jz_start, jz_end)]
+    int local_node_range[2][2];     // セル範囲+1（節点範囲）
+
+    int ghost_layers;               // ゴーストレイヤー数（= 2、NUMERICS §12.2.1）
+    int n_ghost_cells;              // ゴーストセル総数（derived: local_array_nr*local_array_nz - nr_local*nz_local）
+                                    // 2D_RZ 1層: 2*(nr_local+nz_local)+4。1D_SPH 1層: 2。
+                                    // **重要**: カーネルシグネチャ・バッファサイズ注記の `n_ghost` は
+                                    // この `n_ghost_cells` のエイリアスであり、`ghost_layers` ではない。
+    int nr_local, nz_local;         // ローカルセル数（ゴースト除く）
+
+    // --- セルゾーン分類（compute-comm overlap 用）---
+    // Phase B（§5.6.2）で使用。v1.0既定では逐次実行のため参照されないが、
+    // Parallel.gpu_optimization.compute_comm_overlap=True で有効化される。
+    uint8_t* cell_zone;             // [n_cells_local] deviceメモリ
+                                    //   0 = 内部セル（ハロー非依存）
+                                    //   1 = 境界セル（ハロー依存）
+    // Parallel::Partition::init() で計算し、以後不変。
+    // ALE はトポロジー変更なし → cell_zone の再計算不要。
+    // 境界セル: Kershaw 9点ステンシルの近接1層要件に基づき、外周 ghost_layers 層のセル。
+    // 1D_SPH: 左端/右端の ghost_layers セルが境界、残りが内部。
+    // 2D_RZ: 四辺の外周 ghost_layers 層が境界、残りが内部。
+
+    // 近傍rank（-1 = 物理境界で隣接rankなし）
+    // 2D: 8方向（face 4 + corner 4）
+    int neighbor_ranks[8];          // [left, right, bottom, top, NE, NW, SE, SW]
+
+    // local↔global写像
+    int global_offset_r, global_offset_z;  // local_i = global_i - global_offset
+    int local_array_nr, local_array_nz;    // nr_local + 2*ghost_layers, nz_local + 2*ghost_layers
+
+    MPI_Comm cart_comm;             // MPI_Cart_create で生成したコミュニケータ
+
+    // 境界判定ヘルパー
+    bool has_left_boundary() const { return neighbor_ranks[0] < 0; }
+    bool has_right_boundary() const { return neighbor_ranks[1] < 0; }
+    bool has_axis() const { return cart_coords[0] == 0; }  // R=0軸を持つか
+};
+```
+
+**ファイル**：`src/parallel/partition.cuh`, `partition.cu`
+
+**MPIタグ規約**（NUMERICS §12.2.5 準拠）：`tag = phase_id * 1000 + direction * 100 + field_id`。field_id は v1.0 ではパック交換のため常に 0。face方向は direction=0-3（LEFT, RIGHT, BOTTOM, TOP）、corner方向は direction=4-7（NE, NW, SE, SW）。phase_id はセルハロー=1, ノードハロー=2, cell_conduction=3, cell_radiation=4, cell_radiation_f_fleck=5, cell_ALE=6, emigrant=7, DDMCリーク=8。コーナー名との対応は `TR→NE(4)`, `TL→NW(5)`, `BR→SE(6)`, `BL→SW(7)` を固定する。
+
+#### 7.1.2 `Parallel::HaloExchange`
+- ゴーストセル/ゴースト節点のハロー交換管理
+- Pack/Isend/Irecv/Waitall/Unpackの一連のパイプライン
+- cell-centered交換とnode-centered交換の両方に対応
+- フィールド選択的な交換（フェーズ毎に異なるフィールド集合を指定）
+- GPU-aware MPI / host-staging フォールバックの自動切替
+
+**ファイル**：`src/parallel/halo_exchange.cuh`, `halo_exchange.cu`
+
+**主要API**：
+```cpp
+// パッキングレイアウト: cell-major（1スレッドが1ゴーストセルの全フィールドをパック）
+// send_buf[i * n_fields + f] = field_ptrs[f][ghost_cell_index[i]]
+// ここで ghost_cell_index は PartitionInfo のローカル配列範囲から計算される。
+// ゴーストセルインデックス: face方向の最初の ghost_layers 行/列のセルID。
+// field_ptrs は pinned host memory に配置された device ポインタ配列。
+// pack カーネルが gather（デバイス→送信バッファ）、
+// unpack カーネルが scatter（受信バッファ→デバイス）を実行する。
+// cell-major レイアウトの理由: 1スレッドが1ゴーストセルの全フィールドを連続パック
+// することでコアレスドアクセスを実現し、MPI 送受信は方向ごとに1回で転送できる。
+void exchange_cell_fields(
+    const PartitionInfo& part,
+    CommBuffers& buffers,
+    const double* const* field_ptrs,  // n_fields 個のデバイスポインタ配列（ホスト側 pinned memory）
+    int n_fields,                     // フィールド数
+    int field_size,                   // 各フィールドの要素数（ghost含む）
+    cudaStream_t stream
+);
+
+// int8 フィールド（hydro_active 等）は exchange_cell_fields (double) とは別経路で交換する。
+// hydro_active は各ステップ冒頭で int8 → double 昇格してバッファに含めるか、
+// 専用の exchange_int8_fields を用いる（NUMERICS §12.2.2 hydro フェーズ参照）。
+void exchange_int8_fields(
+    const PartitionInfo& part,
+    CommBuffers& buffers,
+    const int8_t* const* field_ptrs,
+    int n_fields,
+    int field_size,
+    cudaStream_t stream
+);
+
+void exchange_node_fields(
+    const PartitionInfo& part,
+    CommBuffers& buffers,
+    const double* const* field_ptrs,  // n_fields 個のデバイスポインタ配列（ホスト側 pinned memory）
+    int n_fields,                     // フィールド数
+    int field_size,                   // 各フィールドの要素数（ghost含む）
+    cudaStream_t stream
+);
+```
+
+#### 7.1.3 `Parallel::ParticleMigration` — 退役
+
+光子粒子（IMC・DDMC）の rank 間移動（EMIGRANT の検出・パック・交換・展開、`ParticleEmigrant`・`EmigrantBuffer`）。
+2026-09-29 にコード（`particle_migration.{hpp,cu}`）とともに退役し、本節の記述を
+`retired/radiation_monte_carlo/docs/ARCHITECTURE_monte_carlo.md` へ移した。
+
+#### 7.1.4 `Parallel::CommBuffers`
+- 送受信バッファの事前確保と動的拡張
+- cell/nodeハロー用バッファを管理
+- GPU-aware MPI時はデバイスメモリ、フォールバック時はpinned hostメモリ
+
+**ファイル**：`src/parallel/comm_buffers.hpp`, `comm_buffers.cpp`
+
+**基本型定義**：
+
+```cpp
+// RAIIラッパー：cudaMalloc 管理
+struct DeviceArray {
+    void*   ptr;            // デバイスメモリポインタ（cudaMalloc）
+    size_t  size;           // 使用中バイト数 [bytes]
+    size_t  capacity;       // 確保済みバイト数 [bytes]
+
+    void resize(size_t new_capacity);   // 不足時にcudaFree+cudaMalloc（非同期不可）
+    template<typename T> T* as() { return static_cast<T*>(ptr); }
+    ~DeviceArray();         // cudaFree（RAIIで自動解放）
+};
+
+// RAIIラッパー：cudaMallocHost（page-locked）管理
+struct PinnedArray {
+    void*   ptr;            // ホストpinnedメモリポインタ（cudaMallocHost）
+    size_t  size;           // 使用中バイト数 [bytes]
+    size_t  capacity;       // 確保済みバイト数 [bytes]
+
+    void resize(size_t new_capacity);   // 不足時にcudaFreeHost+cudaMallocHost
+    template<typename T> T* as() { return static_cast<T*>(ptr); }
+    ~PinnedArray();         // cudaFreeHost（RAIIで自動解放）
+};
+```
+
+**CommBuffers 構造体**：
+
+```cpp
+// 近傍方向定数（PartitionInfo::neighbor_ranks と同一順序）
+enum Direction : int {
+    LEFT = 0, RIGHT = 1, BOTTOM = 2, TOP = 3,
+    NE = 4, NW = 5, SE = 6, SW = 7
+};
+static constexpr int MAX_NEIGHBORS = 8;  // face 4 + corner 4
+
+struct CommBuffers {
+    // ハロー交換用（8方向：face 4 + corner 4）
+    DeviceArray send_halo[MAX_NEIGHBORS];
+    DeviceArray recv_halo[MAX_NEIGHBORS];
+    // host staging（GPU-aware MPI非対応時のフォールバック）
+    PinnedArray host_send[MAX_NEIGHBORS];
+    PinnedArray host_recv[MAX_NEIGHBORS];
+
+    void resize_if_needed(size_t required);
+    bool gpu_aware_mpi;         // CMake検出結果
+
+    // 1Dではdirection 0,1 のみ使用。2Dでは0-7 全使用。
+    // neighbor_ranks[dir] < 0 の方向はバッファを確保しない（物理境界）。
+};
+```
+
+> **8方向の根拠**：Kershaw 9点ステンシル（Appendix A）は対角隣接セルを参照するため、
+> 2Dデカルト分割ではコーナーゴーストセルが必要。face方向（4）のハロー交換後に
+> コーナー方向（4）を交換する2段階方式とする（NUMERICS §12.2.5）。
+> 1D_SPHでは LEFT/RIGHT の2方向のみ使用。
+
+#### 7.1.5 `Parallel::Reduction`
+- MPI_Allreduce（エネルギー収支、粒子統計）
+- MPI_Exscan（global_id offset計算、§12.7.1）
+- 全rank一致チェック（分割メタデータ検証）
+
+**MPI Reduction方式**：
+
+標準 `MPI_Allreduce`（`MPI_SUM`）を使用する。浮動小数点加算の結合順序は
+MPI実装依存であり最下位ビットの変動があり得るが、モンテカルロ法の統計的再現に影響しない。
+
+> **旧設計からの変更**：bitwise再現のための Gather + Root逐次加算プロトコルは廃止。
+> 標準 `MPI_Allreduce` の O(log P) レイテンシを活用する。
+
+**適用箇所**：
+- エネルギー収支の全ランク合計
+- LaserMesh の Allreduce
+- 粒子統計の全ランク集約
+
+**ファイル**：`src/parallel/reduction.cuh`, `reduction.cu`
+
+### 7.2 依存方向の更新
+
+`parallel` モジュールの追加により、依存グラフ（§6）に以下の変更が入る：
+
+- `parallel` は `core` と `mesh` に依存（分割にメッシュ情報が必要）
+- `hydro`, `radiation`, `laser` は `parallel` に依存（ハロー交換・粒子移動を呼ぶ）
+- `coupling` は `parallel` に依存（Strang splitting内の交換タイミング制御）
+- `io` は `parallel` に依存（出力を書く rank 0 の判定に rank 情報を使う）
+- `drivers` は `parallel` に依存（MPI初期化/終了）
+
+> 注：`parallel` を含む最新の依存グラフ全体は §6 を参照。
+
+### 7.3 GPU-aware MPI要件
+
+- **検出（2段階）**：
+  1. **コンパイル時**：CMake `try_compile` で `MPI_Send` にデバイスポインタを渡す小テスト
+     → `TENRYU_GPU_AWARE_MPI_COMPILE` マクロ定義
+  2. **ランタイム時**：`MPI_Init` 後に `MPIX_Query_cuda_support()`（OpenMPI）または
+     環境変数 `MPICH_GPU_SUPPORT_ENABLED`（MPICH/Cray）をチェック
+     → コンパイル時検出がTRUEでもランタイム検出がFALSEなら host-staging フォールバック
+  - 最終結果を `CommBuffers::gpu_aware_mpi` フラグに格納
+- **推奨環境**：
+  - NVIDIA HPC SDK（OpenMPI + CUDA-aware）
+  - Spectrum MPI（POWER系）
+  - MVAPICH2-GDR
+- **フォールバック**：GPU-aware MPI が利用不可の場合は host-staging
+  （cudaMemcpy Device→Host→MPI→Host→Device）で動作
+  - 性能低下は想定されるが、正確性には影響しない
+
+### 7.4 バッファ管理
+
+`CommBuffers`（§7.1.4）のメモリ管理方針：
+
+- **初期確保**：分割メタデータから必要なハローバッファサイズを計算し確保
+  - cell halo: \(n_{ghost} \times \max(n_r^{local}, n_z^{local}) \times n_{fields} \times 8\) bytes
+  - node halo: 同上（節点数はセル数+1）
+- **再利用**：バッファはステップ間で再利用（毎ステップ確保/解放しない）
+
+### 7.5 ディレクトリ構造
+
+```
+src/parallel/
+├── partition.hpp          # PartitionInfo, 分割計算API
+├── partition.cpp          # 分割計算実装
+├── halo_exchange.hpp      # ハロー交換API
+├── halo_exchange.cu       # pack/exchange/unpack実装
+├── comm_buffers.hpp       # バッファ管理API
+├── comm_buffers.cpp       # バッファ確保/拡張実装
+├── reduction.hpp          # Allreduce/Exscan API
+└── reduction.cpp          # MPI Allreduce/Exscan実装
+```
+
+---
+
+## 8. Namelist→Config→Run のフロー（実行時シーケンス）
+
+```
+ 0. MPI_Init(&argc, &argv)
+    └── CUDA device選択: cudaSetDevice(local_rank % n_devices)
+ 1. tenryu run namelist.py  → コマンドライン引数解析
+ 2. Core::Namelist が CPython を起動 (Py_Initialize) し namelist を実行
+ 3. Builder が全ブロックを検証し Config を構築（§4.1.2）
+    3a. Python callable を評価し FrozenTable1D を構築（laser波形、Marshak温度、初期条件）
+    3b. FrozenTable1D のデバイスメモリを確保し、データをコピー
+    3c. Config 構造体を構築（PlanckTable は `cmd_run` の初期放射場設定、および Radiation driver の step-local cache で構築）
+ 4. Py_Finalize（以後Pythonは呼ばれない — この時点で全 callable は凍結済み）
+ 5. Freeze が namelist原文コピー + frozen config JSON を生成
+ 6. Parallel::Partition が Config.parallel から PartitionInfo を構築
+    └── MPI_Cart_create、近傍rank特定、最小セル数検証
+ 7. Mesh 初期化：Config.mesh + PartitionInfo からローカルメッシュ構築
+    └── ゴーストセル/ノードの確保、境界フラグ設定
+ 8. Materials 初期化：EOS/opacity テーブルロード → deviceメモリへ転送
+    └── SESAME: xSESAME ASCII パース → 単位変換（K→eV, GPa→dyne/cm², MJ/kg→erg/g）→ EOSTable構築
+    └── IONMIX: IONMIX v4 パース → EOSTable構築
+    └── 推奨構成: SESAME EOS + IONMIX opacity（混合ロード）
+ 8a. State::allocate(cfg, part) で全フィールド確保（§5.2 ファクトリ関数）
+    └── CellField/NodeField/CellFieldG/CellFieldMat、hydro_active、Scratch、DeviceErrorFlags
+    └── 全 CellField/NodeField/CellFieldG を **cudaMemset ゼロ初期化**（Qvisc=0, c_s=0, D_eff=0 等を保証。
+        未初期化メモリの読み出しを防止。Step 9b の H13→H15 で c_s を正しい値に上書きする）
+    └── laser_cache_valid=false（レーザーキャッシュ無効状態で開始）
+ 8b. [条件分岐] Main.restart_from が非空の場合 → リスタートモード:
+    └── IO::load_checkpoint(restart_from) でチェックポイントHDF5を読み込み
+    └── State フィールド（全 CellField/NodeField/CellFieldG）を復元
+    └── schema 1 のチェックポイント（2026-09-29 より前）は、光子粒子 `particles/` が空であれば読み、粒子があれば
+        退役した `imc_ddmc` の run として再開を拒否する（`/holo`・`/difference`・`radiation/ddmc_flag`・
+        `radiation/delta_E_rad_prev` は読まない。SPECIFICATION §7.5。光子粒子プールと RNG 状態の復元の手順は
+        モンテカルロ輻射とともに退役した）
+    └── hydro_active フラグを復元
+    └── 時間管理状態を復元（t, step, dt, t_next_plot, t_next_history, t_next_checkpoint）
+    └── 累積診断値を復元（E_safety, E_numerical_loss, E_laser_deposited, E_laser_escaped, E_rad_escaped, E_floor_injected, E_pdV_bdry, E_Marshak_in, E_solver）
+    └── Config の frozen パラメータを検証（メッシュサイズ、群数、材料数、**Main.seed** が一致することを確認）
+    └── Main.seed 不一致の場合 ConfigError を送出（燃焼の α 粒子 Monte Carlo の RNG ストリームの連続性を守る。NUMERICS §12.7.1）
+    └── laser_cache_valid = false, laser_dep_frac をゼロクリア（リスタート時は必ず初回 full raytrace を実行。
+        laser_dep_frac は stale キャッシュであり再構成が必要。SPECIFICATION §7.4 step 7、v1.0 必須ルール）
+    └── Steps 9-10 をスキップ（チェックポイント値を使用）
+        ただしこれは初期条件の幾何/場設定を省略する意味であり、幾何導出量（face_area/delta_l）は
+        Step 14b で node 座標から再計算する
+    └── Step 11 へ進む（reclosure は Step 14b で実行 — CommBuffers/halo が必要なため）
+    └── 詳細手順は SPECIFICATION §7.4 restart 8-step プロトコル参照
+    [非リスタート（新規実行）の場合 → Steps 9-10 で初期化:]
+ 9. Geometry関数の結果（Config.geometry の配列）を State フィールドへ格納
+    └── ρ, Te, Ti, velocity, volFrac → 対応する CellField / NodeField / CellFieldMat へコピー
+    └── H7(compute_cell_geometry) → vol, face_area, delta_l を計算（14b でゴースト充填後に再実行。ここでは owned セルの初期化）
+    └── **mass 初期化**: mass[c] = rho[c] × vol[c]（Lagrangian保存量。Phase 1 H2 が読むため必須。
+        block=256, grid=(n_cells+255)/256 の単純カーネル）
+ 9a. hydro_active フラグ初期化（NUMERICS §2.1.1）：
+    └── T_start_eV == 0.0 → 全セル hydro_active = 1（常時有効）
+    └── T_start_eV > 0.0  → 全セル hydro_active = 0（初期非活性）
+    └── int8_t* を cudaMalloc で確保し、cudaMemset で初期化
+ 9b. Z̄ / A_eff 初期化 + EOS順方向評価：
+    └── U8 compute_zbar<<<grid,256>>>: Z̄ と A_eff を初期化（fixed モード: n_mat==1 は Zbar_fixed を全セルに書込、
+        n_mat>1 は材料別 Z̄_α = Z_α を混合平均。thomas_fermi/tabular モード: テーブル補間。
+        H13 が Z̄ を参照するため **H13 より前に必須**。CUDA_KERNELS §7.6 参照）
+    └── eos_forward<<<grid,256>>>（H13）：Te,Ti → ee,ei,Pe,Pi,Cv_e,Cv_i
+    └── compute_sound_speed<<<grid,256>>>（H15）：Pe, Pi, ρ → c_s
+    └── floor_clamp<<<grid,256>>>（U2）：ρ, Te, Ti のフロアクランプ（防御的安全ネット）
+        Builder が初期条件 Te/Ti ≥ floor を検証するため（SPECIFICATION §6.4.2）通常はクランプ不要だが、
+        浮動小数点変換誤差や callable の数値ノイズに対する安全策として実行する
+    └── 初期温度から内部エネルギー・圧力・比熱・音速・フロアクランプを設定
+    └── **注意**: C1(compute_spitzer_deff) は Step 14b で実行する（ghost Te が必要なため、
+        Step 14 halo exchange の後でなければならない）
+10. 初期放射場の設定：
+    └── `cmd_run` が `evaluate_geometry(...)` の直後、最初の `Driver::run(...)` / 初期snapshot書き込み前に実行する
+    └── "equilibrium"：PlanckTable を構築し、`rad_E[i,g] = b_g(Te[i]) × a_eV × Te[i]⁴`、`rad_E_old[i,g] = rad_E[i,g]`（熱平衡）
+    └── "zero"：allocation のゼロ値を保持する（真空初期化）
+    └── restart 時は checkpoint の `rad_E`/`rad_E_old` を使用し、この初期化をスキップする
+11. Laser/BC 初期化（FrozenTable1D は Step 3 で凍結済み）
+    └── Config 内の FrozenTable1D（既にデバイス上）を Laser/BC モジュールに参照渡し
+    └── LaserMesh のグリッド構築
+    └── 初期時刻 t=0 での波形評価（FrozenTable1D::eval(0.0)）
+12. CommBuffers の初期確保（§7.4）
+13. Scratch の確保（§5.5：全モジュールの最大必要量）
+14. 初回ハロー交換（State フィールドの全交換。リスタート・非リスタート共通で実行）
+14b. Post-halo 初期設定（halo exchange 後に ghost セルが充填された状態で実行）：
+    └── [restart only] U8(compute_zbar)：A_eff 再計算（A_eff はチェックポイント非保存。
+        Z̄ はチェックポイントから復元済みだが、U8 は A_eff も出力するため実行必須）
+    └── [restart only] H13(eos_forward) → H15(compute_sound_speed)：
+        Cv_e/Cv_i/c_s はチェックポイント非保存のため再計算が必要（ee/Pe は HDF5 hydro/ から復元済みだが、
+        H13 で EOS 整合性を保証し Cv_e を取得する。C1 が Cv_e を参照するため H13 は C1 より前に必須）
+    └── [ALL paths] H7(compute_cell_geometry)：x_r, x_z → vol, face_area, delta_l を再計算。
+        チェックポイントは node 座標と vol のみ保存し、face_area/delta_l は保存しない（導出量のため）。
+        リスタート時は復元した node 座標から再計算が必須。新規実行時は Step 9 で実行済みだが、
+        Step 14 halo exchange でゴースト node が充填された後に再実行することで境界セルの幾何量も正確になる
+    └── [ALL paths] C1(compute_spitzer_deff)：Te, ρ, Z̄, Cv_e, A_eff → D_eff。
+        C1 は隣接セル Te から |∇T| を計算するため ghost データが必要（Step 14 後に実行必須）。
+        D_eff=0 のまま Step 15 に進むと dt_cond=∞ となり伝導支配問題の初回ステップが過大になる
+15. 初期 dt 計算：
+    └── [新規実行] dt = min(dt_initial, CFL constraints)（NUMERICS §2.2(e)、dt_initial = dt.initial_s）
+    └── [restart]  dt = min(checkpoint_dt, CFL constraints)（NUMERICS §2.2(e)、dt.initial_s は適用しない）
+16. 初期 diagnostics 出力（step=0 の状態）
+17. 初期 HDF5 出力（snapshot + frozen config + namelist copy）
+18. main time loop（Coupling::Driver）
+    └── §4.7 の Strang splitting を time step 毎に繰り返す
+19. 最終出力 + checkpoint
+20. MPI_Finalize
+```
+
+> **MPI_Init と CPython の順序**：MPI_Init は CPython 起動前に実行する。
+> CPython が MPI を内部的に使用する可能性は低いが、
+> rank番号に基づく出力制御（rank 0 のみ stdout）を namelist 実行前に確立するため。
+
+---
+
+## 9. 互換性ポリシー（入力API）
+- `tenryu_namelist` のブロックAPIは **破壊的変更禁止**
+- 既存引数の意味変更・削除は不可。追加のみ許可。
+- 互換性は `examples/verification/namelist_api_smoke.py` でCIに組み込み、破壊を即検出する。
+
+---
+
+## 10. エラーハンドリングアーキテクチャ
+
+### 10.1 GPUカーネルからのエラー報告
+
+GPUカーネル内でのエラー（非有限の粒子・光線状態、不正セル等）は device-side assert ではなく
+**エラーフラグ方式** で host に報告する（`src/core/device_error_flags.cuh`）：
+
+```cpp
+// 光線追跡と不透明度評価のカーネルが書き込む。
+// フラグ項目は atomicExch で 1 を立て、infinite_loop と unresolved_quadrature は atomicAdd で数える。
+// 呼び出し側がカーネル段の前に cudaMemset で 0 クリアする。
+struct DeviceErrorFlags {
+  int32_t nan_particle = 0;          // 非有限の粒子・光線状態
+  int32_t invalid_cell = 0;          // 不正なセル番号・補間状態
+  int32_t invalid_boundary = 0;      // 未知の境界コード
+  int32_t opacity_out_of_range = 0;  // 不透明度評価で ρ ≤ 0 をクランプ
+  int32_t infinite_loop = 0;         // MAX_RAY_STEPS の上限に達した回数
+  int32_t unresolved_quadrature = 0; // 1D 特性線の光線追跡で、求積のパネル上限で受理した区間の数（誤差ではない）
+};
+// モンテカルロ輻射の pool_overflow・ddmc_sigma_tot_zero・roulette_kill は 2026-09-29 に外した
+// （persistent loop の error_code のビット 3・6・7 は欠番。他のビットの位置は変えていない）。
+```
+
+**プロトコル**：
+1. 呼び出し側（レーザーの光線追跡、不透明度評価）が段の前に `cudaMemset` でクリアする
+2. カーネルは異常を見つけてもスレッドを中断せず、フラグを立てて処理を続ける
+3. 段の後に host へ転送し、呼び出し側が判定する：
+   - レーザー光線追跡（`log_laser_flags`、`laser.cu`）：`infinite_loop` は WARNING、`unresolved_quadrature` は WARNING
+     （最初の 10 回と 1000 回ごと）、`invalid_cell` は WARNING（該当光線は未吸収として扱う）、`nan_particle` は
+     WARNING のあと停止（`TENRYU_ASSERT`）。persistent loop ではフラグのビットを `error_code`（理由 2）に詰めて
+     chunk を止める
+   - 不透明度評価（`copy_and_check_flags`、`opacity.cu`）：`opacity_out_of_range` は WARNING
+
+旧設計の表にあった他の検査はフラグ構造体ではなく、次の仕組みで行う：
+- **状態量の非有限値と温度の行き過ぎ**：`driver_safety_audit.cu` が各物理段の前後で \(T_e, T_i, \rho, e_e, e_i\) の
+  非有限値と \(\max T_e\) を GPU 上で集約する。`Numerics.safety.nan_fatal`（既定 True）なら非有限値で停止、
+  `overshoot_fatal_enabled`（既定 False）なら \(\delta = (\max T_e^{n+1} - T_{\max}^n)/T_{\max}^n\) が
+  `overshoot_fatal` を超えたとき停止する（NUMERICS §11.8）。輻射段の行き過ぎ（セル数と最大値）は history の
+  `radiation/overshoot_count`・`radiation/overshoot_max`（2026-09-29 まで `mc/overshoot_*`）に記録し、`overshoot_warn` を超えたステップは WARNING
+  （最初と 100 回ごと。persistent loop はこの量を計算しない）
+- **エネルギー収支**：各ステップの `epsilon_budget` を history に記録し、`energy_fatal`（既定 False）なら
+  `energy_budget_tol` を超えたとき停止する（NUMERICS §11.1）
+- **床クランプ**：ステップのクランプ数が `clamp_warn_threshold` を超えると WARNING（1 回）、
+  `clamp_fatal_threshold` を超えると停止する
+- **1D の体積が非正（節点の交差）**：流体段が失敗を返し、driver がステップ前の状態へ戻して \(\Delta t/2\) で
+  やり直す（`driver_full_step_retry_*`、上限回数または `dt.min_s` で停止）。persistent loop では理由 3 で止まる
+- **EOS の逆変換の非収束**：閉包へフラグで返し、閉包が回数を数える（§4.3、`eos_newton_nonconverge` の
+  フラグは無い）
+- **SESAME のイオン圧の差が負**：クランプせずに保持し、節点の数を 1 回警告する（`eos_ion_negative` と
+  `max(0, …)` は無い）
+- 旧設計の `mesh_tangle`・`energy_violation`・`temperature_overshoot`・`sound_speed_negative`・
+  `volfrac_degenerate`・`negative_source_dep`・`emigrant_*`・`ddmc_reflect_leak`・`invalid_cell_id`・
+  `invalid_boundary_code` はフラグとして存在しない
+
+> **device-side assert を使わない理由**：`__assert_fail` はデバイス全体を停止させるため、
+> マルチGPU実行でデッドロックを引き起こす。エラーフラグ方式は graceful degradation を実現する。
+
+### 10.2 Host側エラー階層
+
+```
+FATAL   → MPI_Abort（全rank停止）。回復不能エラー（MPI通信失敗、メモリ確保失敗）
+ERROR   → 現ステップを中断し checkpoint 書き出し後に終了
+WARNING → spdlog + diagnostics 記録。実行継続
+INFO    → 通常ログ出力（rank 0 のみ stdout、全rank ファイル）
+```
+
+**ERROR手順**：flag設定 → Allreduce伝播 → `cudaDeviceSync` → checkpoint書出 → `Barrier` → ログ → `MPI_Finalize` → `exit(1)`。
+**FATAL**：checkpoint省略 → `MPI_Abort`。
+
+### 10.3 CUDA APIエラーチェック
+
+全CUDA API呼び出しを `CUDA_CHECK` マクロで保護する。非同期エラーは `cudaGetLastError()` で捕捉。CUDAエラー → FATAL。
 
 ---

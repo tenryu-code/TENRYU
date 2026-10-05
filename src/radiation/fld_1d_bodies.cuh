@@ -513,7 +513,7 @@ __device__ inline double fld_face_diffusion_coeff(
 
 // Exponential-Rosenbrock Fleck-factor form: f = phi_1(-z) = (1 - exp(-z))/z.
 // Exact retention for the fixed-radiation scalar relaxation (design doc
-// docs/design/fleck_exp_source_20260716.md section 2). 0 < f <= 1 for z >= 0
+// the internal design note fleck_exp_source_20260716.md section 2). 0 < f <= 1 for z >= 0
 // and z*f -> 1 as z -> inf, so stiff cells still equilibrate (unlike the
 // retired exp(-z) blend). Series below the crossover avoids the 0/0; the
 // z^3/24 term at z = 1e-6 is ~4e-20 relative.
@@ -603,7 +603,7 @@ __device__ inline void compute_fleck_for_fld_kernel_body(
     // 0-D local predictor for T_pred; U_e via the SAME table accessor the
     // matter Newton linearizes (consistency by construction). Every guard
     // falls back to the tangent beta above. Design:
-    // docs/design/fleck_beta_secant_20260714.md section 3.1.
+    // the internal design note fleck_beta_secant_20260714.md section 3.1.
     double E_grey = 0.0;
     double sp_num = 0.0;
     double sp_den = 0.0;

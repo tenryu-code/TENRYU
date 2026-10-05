@@ -11,7 +11,7 @@
 
 namespace tenryu::hydro {
 
-// B1 1D geometry family (docs/design/b1_1d_cyl_mode_spec.md).
+// B1 1D geometry family (the internal design note b1_1d_cyl_mode_spec.md).
 // Spherical branches reproduce the historical per-site arithmetic
 // verbatim (bitwise regime); Cylindrical is per unit length in z.
 inline constexpr double kGeom1dFourPi = 12.566370614359172953850573533118;

@@ -17482,7 +17482,7 @@ AleRemap2DRZResult conservative_remap_csr(
   const bool remap_hot_e_eps =
       !state.hot_e_eps_cum_host.empty() &&
       state.hot_e_eps_cum_host.size() == static_cast<std::size_t>(n_cells);
-  // Pseudo-core and pole-derefine non-transfer ruling: docs/design/hote_2d_completion_20260717.md.
+  // Pseudo-core and pole-derefine non-transfer ruling: the internal design note hote_2d_completion_20260717.md.
   const bool remap_burn_eps =
       !state.burn_eps_cum_host.empty() &&
       state.burn_eps_cum_host.size() == static_cast<std::size_t>(n_cells);

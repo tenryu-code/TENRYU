@@ -158,7 +158,7 @@ options are forwarded via `TENRYU_REMOTE_SSH_OPTS` / `TENRYU_REMOTE_SCP_OPTS` an
 `RSYNC_RSH`. TENRYU Studio bundles this directory as an app resource and copies it onto
 the server mirror, so the server checkout needs only docs/ and src/. Studio workdirs
 live under `generate/<stamp>/` in the app configuration folder. Design:
-docs/design/gui_assistant_integration_20260902.md.
+the internal design note gui_assistant_integration_20260902.md.
 
 ## Mesh recommendations from experimental conditions
 
@@ -206,7 +206,7 @@ Examples include [GXII Gaussian](examples/mesh_conditions/gxii_gaussian.json),
 [1053 nm foil](examples/mesh_conditions/infrared_foil.json), and
 [Al foil](examples/mesh_conditions/aluminium_foil.json). The learned method, input coverage,
 LOO calibration and exact solver/lint integrity boundary are in
-[the design](../../docs/design/mesh_recommendation_from_campaign_20260908.md).
+the design (the internal design note mesh_recommendation_from_campaign_20260908.md).
 
 `--tenryu`, then `TENRYU_BIN`, then `build/tenryu` select the optional binary, as for
 `lint-deck`. With a new binary, --deck uses solver-observed conditions from

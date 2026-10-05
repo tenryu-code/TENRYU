@@ -1,4 +1,4 @@
-"""1D planar slab for the grid convergence of the FLD outer boundary closure (NUMERICS §6.7 1D BC, VERIFICATION §23).
+"""1D planar slab for the grid convergence of the FLD outer boundary closure (NUMERICS §6.7 1D BC, the internal verification record §23).
 
 The 1D counterpart of examples/indirect_drive_slab_2d.py: CH-like ideal gas (A 6.5, Z 3.5), rho 1 g/cc, constant
 kappa_a 100 cm^2/g (sigma 100 /cm), 8 Planck groups, 2T, Lagrangian hydro, the slab on r in [0, 0.5] cm with a

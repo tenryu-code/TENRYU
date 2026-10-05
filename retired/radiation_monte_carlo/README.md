@@ -40,8 +40,8 @@ The extracts are reference copies of code cut out of files that stayed in the bu
 
 The numerics of the retired methods stay in `docs/NUMERICS.md` under retired banners (§0.4, §6.1.2, §6.2–§6.6,
 §7, §8.2, §9.1–§9.7, §10.1, §10.3, §10.4, §11.4, §12.3, §12.6.2, §12.7.1–§12.7.2, Appendix A.10), with their input
-keys in `docs/SPECIFICATION.md` §6.4.5 and their gates in `docs/VERIFICATION.md` (§5.4, §7.1–§7.3, §8, §9) and
-`docs/PERFORMANCE.md` (P1–P3, P5).
+keys in `docs/SPECIFICATION.md` §6.4.5 and their gates in the internal verification record (§5.4, §7.1–§7.3, §8, §9) and
+the internal performance record (P1–P3, P5).
 
 ## What the build keeps
 

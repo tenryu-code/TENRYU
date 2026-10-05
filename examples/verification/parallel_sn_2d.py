@@ -1,13 +1,13 @@
 # MPI rank-count agreement deck for coupled SN-2D (M18c slice-3c,
-# INFORMATIONAL companion to VERIFICATION §16.5 — the §16.5 binding gates
+# INFORMATIONAL companion to the internal verification record §16.5 — the §16.5 binding gates
 # are the STATIC transport decks driven via 2d_rz_r2_sn_only.py; this deck
 # adds 2T matter coupling + hydro so the KBA pipeline is exercised on an
 # EVOLVING medium. Same geometry/coupling class as parallel_fld_2d.py:
 # hot disk (300 eV, r<0.25 cm, |z|<0.15 cm) in a 10 eV bath, rho=1,
 # kappa_a=50 cm2/g, 64x32, 4 groups, dt=2e-13 fixed. Owned-slab dumps
 # from P in {2,4} vs P=1 (tools/validation/compare_owned_dump.py).
-# Design doc docs/design/mpi_m18_20_20260717.md §6h; KBA spec
-# docs/design/mpi_m18c_sn2d_kba_spec.md.
+# the internal design note mpi_m18_20_20260717.md §6h; KBA spec
+# the internal design note mpi_m18c_sn2d_kba_spec.md.
 #
 # Env knobs:
 #   TENRYU_PSN2D_SCHEME    sn spatial_scheme (default

@@ -7,7 +7,7 @@
 
 namespace tenryu::mesh::tess {
 
-// d1 certified Lloyd-skip certifier (docs/design/
+// d1 certified Lloyd-skip certifier (the internal design notes
 // t2_d1_certified_lloyd_skip_20260815.md). Decides, in pure double
 // arithmetic, whether a per-site displacement field provably cannot flip
 // the sign of any exact predicate certifying the triangulation: triangle

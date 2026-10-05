@@ -442,7 +442,7 @@ __device__ inline double atomic_add_double(double* address, const double val) {
 #endif
 }
 
-// NOH-DET intra-step probe (docs/design/nohdet_reproducer_sweep_design_20260707.md):
+// NOH-DET intra-step probe (the internal design note nohdet_reproducer_sweep_design_20260707.md):
 // env-gated, read-only order-independent XOR-fold of device arrays at bracket
 // points inside the 1D Lagrangian step. TENRYU_HYDRO_STEP_HASH=1 enables;
 // TENRYU_HYDRO_STEP_HASH_MIN / _MAX (inclusive, 1-based like [state_hash])

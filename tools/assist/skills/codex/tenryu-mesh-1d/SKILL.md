@@ -95,7 +95,7 @@ You are invoked non-interactively (often by an automated harness in a scratch wo
    `sparse_evidence` means nearby measurements limited relaxation; inspect the reported
    evidence distance and allowed factor, and retain the returned ceiling.
    Use `tools/validation/mesh_convergence_campaign.py` and
-   `docs/design/mesh_convergence_campaign_20260903.md` for ladder/verdict procedures; for an
+   the internal design note mesh_convergence_campaign_20260903.md for ladder/verdict procedures; for an
    existing campaign case, `gen --root DIR --cases C28 --levels 4,5` generates a pair.
    Do not launch a run or allocate a compute venue unless the task authorizes it.
 6. After an authorized probe, use `zoning-report OUTPUT_DIR` and the campaign observables.
@@ -137,7 +137,7 @@ when the predicted ablated depth reaches such a layer (not to a gas behind a pus
 The Al fallback example (`tools/assist/examples/mesh_conditions/aluminium_foil.json`)
 now yields 9.131233090608189e-7 g/cm2, 2381 estimated cells, a 3.382 nm surface width
 ceiling, and `extrapolation`/`unvalidated`; it still needs the convergence pair.
-See `docs/design/mesh_recommendation_from_campaign_20260908.md` for the model and limitations.
+See the internal design note mesh_recommendation_from_campaign_20260908.md for the model and limitations.
 
 The block uses planar areal_mass, cylindrical cylindrical_line_mass and spherical
 spherical_cell_mass and splits the target into three regions. The ablation zone runs from

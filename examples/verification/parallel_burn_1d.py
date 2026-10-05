@@ -5,8 +5,8 @@
 # the burn inputs are line-gathered and the host stage runs the full
 # line on every rank, so owned-slab dumps must be BITWISE identical to
 # P=1 (tools/validation/compare_owned_dump.py --rtol 0).
-# Design doc docs/design/mpi_m18_20_20260717.md §6k; spec
-# docs/design/mpi_m18d_laser_burn_spec.md §2 d2.
+# the internal design note mpi_m18_20_20260717.md §6k; spec
+# the internal design note mpi_m18d_laser_burn_spec.md §2 d2.
 #
 # Env knobs:
 #   TENRYU_PBURN1D_SCHEME    Burn scheme (default "fraley"; "mc" probes

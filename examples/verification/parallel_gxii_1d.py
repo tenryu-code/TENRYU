@@ -1,4 +1,4 @@
-# MPI 1D laser+SN replication gate deck (VERIFICATION SS16.4 extension /
+# MPI 1D laser+SN replication gate deck (the internal verification record SS16.4 extension /
 # design doc §6o.3): gxii_solid_1D_sn truncated for the mpi_gate battery.
 # The full deck exposed the 1D deposit ×n_ranks phantom (§6o.2/§6o.3) that
 # the radiation-only decks could never see — this deck pins the whole

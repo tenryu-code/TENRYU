@@ -29,7 +29,7 @@ struct ConductionResult {
   double solver_cond_number_est = 0.0; // diagonal-ratio estimate
   // SNB nonlocal conduction diagnostics (nonlocal_model="snb" only; defaults
   // inert). 2D pairs are counted where 1D counted faces (names kept for
-  // cross-dimension consistency; see docs/design/2d_snb_port_spec.md §5).
+  // cross-dimension consistency; see the internal design note 2d_snb_port_spec.md §5).
   int snb_picard_iters = 0;
   bool snb_converged = true;
   double snb_picard_resid = 0.0;

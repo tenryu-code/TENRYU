@@ -7724,7 +7724,7 @@ void log_fld_face_global_max(core::State& state,
 }
 
 // Indirect-drive Tr(t) resolution for the deterministic 2D marshak z faces
-// (docs/design/2d_tr_drive_port_spec.md §2). IMC-2D precedence verbatim
+// (the internal design note 2d_tr_drive_port_spec.md §2). IMC-2D precedence verbatim
 // (source.cu emit_marshak): the per-face table (canonical key, then alias)
 // wins over the constant marshak_Tr_eV (>0), which wins over the scalar
 // marshak_Tr table. Solve-entry time; tables are frozen at init (no runtime
@@ -8327,7 +8327,7 @@ void advance_radiation_step_fld_2d_rz(
       state.t >= fld.marshak.flux_pulse_duration_s) {
     marshak_flux = 0.0;
   }
-  // Indirect-drive Tr(t) marshak z faces (spec docs/design/
+  // Indirect-drive Tr(t) marshak z faces (the internal design notes
   // 2d_tr_drive_port_spec.md): resolve once per radiation call (outer-
   // iteration invariant); per-group F_inc = 0.25*c*a_eV*Tr^4*b_g with the
   // 1D-marshak Planck weighting (grey bypass b=1). Builder validation

@@ -823,7 +823,7 @@ materials::IonmixOpacityDeviceView persistent_loop_nlte_opacity_view(
   return cache.device.view();
 }
 
-// NOH-DET (VERIFICATION 3.2r): order-independent XOR-fold of a device double
+// NOH-DET (the internal verification record 3.2r): order-independent XOR-fold of a device double
 // array's bit patterns, for paired-run first-divergence localization.
 // Env-gated (TENRYU_STATE_HASH=1), read-only, default-inert.
 static unsigned long long state_hash_xor_fold(const double* device_ptr,
@@ -6675,7 +6675,7 @@ void Driver::run(core::State& state,
       state.burn_neutron_cum_host.assign(n_cells, 0.0);
     }
   }
-  // v1 MPI decomposition is r-slab only (docs/design/mpi_m18_20_20260717.md
+  // v1 MPI decomposition is r-slab only (the internal design note mpi_m18_20_20260717.md
   // §3): the flat cell index is r-major, so r-slab ownership is a contiguous
   // flat range and every kernel restriction is a uniform [begin, end) window.
   // 2D auto decomposition is forced to dims=[P, 1]; an explicit non-r-slab
@@ -8818,7 +8818,7 @@ void Driver::run(core::State& state,
             " E_redistribution_unresolved_rel=" +
             format_sci(E_redistribution_unresolved_rel));
       }
-      // Endgame guard (verdict #5 Q4 / HANDOFF section 15): a remap mass-floor
+      // Endgame guard (verdict #5 Q4 / the internal handoff note section 15): a remap mass-floor
       // injection means a cell is being crushed against a broken/degenerate
       // target (measured: 7 silent injections = +3% total mass at 2.5 ns,
       // then runaway absorption). Convert the silent rescue into the designed
@@ -9375,7 +9375,7 @@ void Driver::run(core::State& state,
     const bool embed_conduction_in_thermal_subcycle =
         core::thermal_subcycle_active(cfg);
     const bool phase_energy_trace_enabled = (cfg.main.verbosity == "verbose");
-    // W-J (VERIFICATION 10.1 drive-phase eps audit): per-operator energy
+    // W-J (the internal verification record 10.1 drive-phase eps audit): per-operator energy
     // ledger closure, read-only and default-inert. Enable with
     // TENRYU_ENERGY_OPERATOR_AUDIT=1; TENRYU_ENERGY_OPERATOR_AUDIT_TMAX
     // (seconds, default 1.2e-9) limits logging to t < TMAX (<=0: no limit).

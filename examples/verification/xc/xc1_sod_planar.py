@@ -1,5 +1,5 @@
 # XC-1 — Sod shock tube (TENRYU side), hydro operator + AV comparison vs MULTI-IFE.
-# Design: docs/design/xc_tenryu_multiife_1d_comparison_design_20260710.md (XC-1)
+# Design: the internal design note xc_tenryu_multiife_1d_comparison_design_20260710.md (XC-1)
 # MULTI pair: ops/xc/cases/xc1_sod/multi.input (identical states, gamma=1.4 tables).
 # Differences from the standing sod_planar_2t gate deck: Z=1 (electrons live, e-i
 # exchange stiff-locked Te=Ti — matching MULTI, which cannot disable exchange) and

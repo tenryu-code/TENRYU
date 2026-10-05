@@ -66,7 +66,7 @@ cap 非経由のため挙動不変）。放射エネルギー式に
 
 > **fleck_cv_source（2026-07-10 導入；既定フリップ 2026-07-11）**: 本カーネルの \(\beta=4a_{\rm eV}T_e^3/(\rho c_{v,e})\)
 > に入る電子比熱の出所は `Radiation.multigroup_diffusion.fleck_cv_source` で選ぶ。
-> `"table"`（**既定**、2026-07-11 フリップ — 外部AI裁定、docs/design/fleck_cv_default_flip_20260711.md）は
+> `"table"`（**既定**、2026-07-11 フリップ — 外部AI裁定、社内の設計メモ fleck_cv_default_flip_20260711.md）は
 > 電子 EOS テーブル存在時に現在 \(T_e\) の `device_eos_cv`（matter 更新 `update_matter_body` と
 > 同一の cv）を最優先する — Fleck 線形化の \(\beta\) は matter Newton が前進させるエネルギー
 > 関数と同一の \(\partial U_e/\partial T_e\) を要する（Fleck–Cummings 1971 の整合要件）。
@@ -81,7 +81,7 @@ cap 非経由のため挙動不変）。放射エネルギー式に
 > \(q=C_{\rm legacy}/C_{\rm table}\) 倍歪む）。率忠実度は 0-D 緩和 gate
 > `verify_fleck_relaxation_0d`（厳密 ODE 参照）が常設検証。フリップの既存 golden への
 > 影響は無し（table-EOS gate 群は deck 内 pin 済み、GXII FLD regression は ideal_gas で
-> knob 不活性 — golden 再生成 bit 同一で実証、VERIFICATION §4.z3）。
+> knob 不活性 — golden 再生成 bit 同一で実証、社内の検証記録 §4.z3）。
 > 冪乗 opacity `power_law`（SPEC §6.4.3）はこの constant 経路と同格に扱われる（eta 構築・
 > Fleck blend とも σ 配列値のみが異なる）。冪乗 EOS `power_law_te` は初期化時 tabulation で
 > table-EOS 経路に乗る（新規離散化なし）。
@@ -101,7 +101,7 @@ cap 非経由のため挙動不変）。放射エネルギー式に
 > Planck 平均の吸収係数による群共通の \(f\) を使う（単一材料の表が NLTE カーネルから得る灰色の \(f\) と同じ形。
 > 群ごとの \(f_g\) を使うと、同じ材料でも他の材料の有無で Fleck 因子が変わっていた）。
 >
-> **fleck_beta（2026-07-14 導入；外部裁定 2026-07-15、docs/design/fleck_beta_secant_20260714.md §7-8）**:
+> **fleck_beta（2026-07-14 導入；外部裁定 2026-07-15、社内の設計メモ fleck_beta_secant_20260714.md §7-8）**:
 > β の線形化点は `Radiation.multigroup_diffusion.fleck_beta` で選ぶ。`"tangent"`（**既定**、bit 凍結）
 > = 上式の接線 β。`"secant"`（opt-in、table-EOS セル・1D FLD のみ — 2D fleck kernel は独立実装で
 > tangent 固定）= 灰色弦 \(\beta_{\rm sec}=\Delta B/\Delta U_e\) を 0-D 局所予測子
@@ -123,7 +123,7 @@ cap 非経由のため挙動不変）。放射エネルギー式に
 > 注意: 収束後の fleck_cummings step は f(β) を保持するため、Picard 不動点は β 非依存**ではない**
 > （β 選択間の終端差 ~O(h·Δf)、実測 ~1.5e-3 of span @ h~1 は正しい振る舞い）。
 
-> **fleck_form（2026-07-16 導入；設計 docs/design/fleck_exp_source_20260716.md §2 — β_sec 後続裁定 §12 の係数レバー）**:
+> **fleck_form（2026-07-16 導入；社内の設計メモ fleck_exp_source_20260716.md §2 — β_sec 後続裁定 §12 の係数レバー）**:
 > Fleck 因子の時間形状は `Radiation.multigroup_diffusion.fleck_form` で選ぶ。`"be"`（**既定**、bit 凍結）
 > = 標準 backward-Euler 形 \(f=1/(1+z)\)。`"exp_phi1"`（opt-in、1D FLD のみ — persistent path 含む・
 > table EOS 不要）= \(f=\varphi_1(-z)=(1-e^{-z})/z\)（\(z<10^{-6}\) は級数 \(1-z/2+z^2/6\)）。固定輻射
@@ -138,18 +138,18 @@ cap 非経由のため挙動不変）。放射エネルギー式に
 > crossover 連続）= ctest "fleck form exp_phi1"。OFF-bit 認証: fleck_form 実装込みバイナリで
 > GXII golden regression・Hammer–Rosen PASS（2026-07-16、既定経路 golden 恒等）。
 
-> **source_integrator（2026-07-16/17 導入 — rung-2、docs/design/fleck_exp_source_20260716.md §3）**:
+> **source_integrator（2026-07-16/17 導入 — rung-2、社内の設計メモ fleck_exp_source_20260716.md §3）**:
 > 1D FLD の物質–輻射ソース積分器を `Radiation.multigroup_diffusion.source_integrator` で選ぶ。
 > `"fleck"`（**既定**、bit 凍結） = 従来のモノリシック半陰的 outer ループ。`"exp_rosenbrock"`
 > （opt-in、灰色 v1・fleck_beta tangent 限定・afi/exp_phi1 非互換・persistent 非対応）= Lie 分割:
 > (1) 凍結係数の厳密直接移送 \(q=h\varphi_1(-(1+\beta)h)(E-aT^4)\) を両側対称適用（E−=q, U_e+=q —
 > 局所保存が構成的に厳密）、(2) 交換項を除いた純拡散陰解（D_face の σ_R は輸送係数として保持）、
-> outer Picard なし。実測（VERIFICATION §7.10 gate (j) + verify_marshak_feature_1d、2026-07-17）:
+> outer Picard なし。実測（社内の検証記録 §7.10 gate (j) + verify_marshak_feature_1d、2026-07-17）:
 > 0-D 一段誤差比 err/err_be = 0.430/0.293/0.186/0.109（8/4/2/1e-15 s、多 step で 2 次収束）、
 > 総エネルギー drift **厳密 0**（fleck 単一パスの 2.1–2.3 倍非保存と対照）、1-D Marshak feature
 > 前線で分割バイアス 0（最細 rung で fleck と同一セル・N=1024 参照 4dx 内、非劣化全 rung）。
 > OFF-bit: exchange_off 配線+ループ再入れ子込みバイナリで GXII golden・HR PASS（既定経路恒等）。
-> **多群（G≤96、2026-07-17 導入 — docs/design/exp_mg_phi1_20260717.md、外部裁定採択）**: 群数の上限 96 はセルごとの
+> **多群（G≤96、2026-07-17 導入 — 社内の設計メモ exp_mg_phi1_20260717.md、外部裁定採択）**: 群数の上限 96 はセルごとの
 > 作業配列の大きさ（`fld_1d_gpu.cu` の `kMaxG`）。builder は `Radiation(...)` の解析時に deck の群数を、2026-09-29 からは
 > 最初の不透明度表が群数を置き換えた後の最終の群数も検査する（それまでは 96 を超える表が解析時の検査をすり抜け、
 > 実行時に全セルの交換が棄却された）。保存超平面上の
@@ -165,7 +165,7 @@ cap 非経由のため挙動不変）。放射エネルギー式に
 > \(\Delta E_g\leftarrow\max(\Delta E_g,-E_g)\) にクランプする（ΔU はクランプ後の ΔE から集計 =
 > 構成的保存を厳密維持。根拠: 2026-07-18 生産 A/B smoke で棄却が全て最外殻セル・最高群
 > g≥70・E_g ~ 1e-106〜1e-61 erg/cc の丸め偽負性と実測特定 — 群別判定×セル全体棄却が駆動相の
-> 表面セル交換を飛ばす偏りを除去、docs/design/exp_mg_phi1_20260717.md）。gate (k)（G=4 等 σ・1 step）: **周辺化恒等 |E_tot^{mg}−E_tot^{grey}| ≤ 1.9e-16**
+> 表面セル交換を飛ばす偏りを除去、社内の設計メモ exp_mg_phi1_20260717.md）。gate (k)（G=4 等 σ・1 step）: **周辺化恒等 |E_tot^{mg}−E_tot^{grey}| ≤ 1.9e-16**
 > （等 σ・Σb=1・Σdb/dT=0 で多群凍結系の総和は灰色凍結系へ厳密周辺化 — 別経路計算の 1 ulp 一致が
 > rank-1 機構の判別的認証）・保存 drift 厳密 0・2 次 slope 135×/8×。灰色 G=1 は従来スカラー kernel を
 > bit 不変で維持。
@@ -257,7 +257,7 @@ F_{\mathrm{out},f} = {c\over 4}E_{c,g}^{n+1}-F_{\mathrm{inc}}
 Tr(t) 経路が提供する）。
 
 **2D_RZ 決定論 Marshak z 面の時間依存黒体駆動（indirect-drive Tr(t),
-2026-07-11, 設計 docs/design/2d_tr_drive_port_spec.md）** — FLD/SN の
+2026-07-11, 社内の設計メモ 2d_tr_drive_port_spec.md）** — FLD/SN の
 `z_bottom`/`z_top="marshak"` 面は、灰色定常 flux に代えて `Radiation.boundary`
 の Tr 源（定数 `marshak_Tr_eV` / 時間 callable `marshak_Tr` / 面別 dict
 `marshak_Tr_map` — IMC と共有の初期化時凍結テーブル、runtime Python なし）
@@ -283,7 +283,7 @@ Tr(t) 経路が提供する）。
   共有のため; 定数/スカラーテーブル源は両面共通で可）。ledger
   `sn_marshak_in_step` は flux×面積×\(\Delta t\) の既存定義のまま正しい。
 
-検証（VERIFICATION §7.10、deck 資産 tmp/tr2d_gate/）: 定数-vs-テーブル-vs-面
+検証（社内の検証記録 §7.10、deck 資産 tmp/tr2d_gate/）: 定数-vs-テーブル-vs-面
 テーブル bit 恒等（FLD grey/MG、SN grey）、flux 等価（FLD rel ≤2e-16 =
 加算順序差のみ、SN は bitwise）、Tr 階段 100→200 eV で per-step
 `marshak_in` 比 16.0000 厳密（両ソルバ同値）、MG/grey ledger 比 1.00000000
@@ -313,7 +313,7 @@ F_{out}=h_{eff}\left(E_{0,g}-\theta_g\right),\qquad h_{eff}=\frac{h}{1+h\,d/D_0}
 \(E_{1,g}/(\Delta r\,\sigma_{R,0})\) が約 \(2\times10^{8}\)（cgs）を超えると倍精度の範囲を超えて非有限になり、\(\lambda\) は非有限の
 \(R\) を 0 と読むので拡散極限の 1/3 をとる（\(R_0\) が有限に収まるときは \(\lambda\approx0\) で面はほぼ閉じる）。どちらも係数は
 有限で、脱出の集計は行列と同じ \(h_{eff}\) を使うので保存は保たれる。セル中心の値で閉じる式は光学的に厚い外側セルで 1 次の誤差をもち、Marshak の流入と真空への
-脱出を多く見積もっていた（VERIFICATION §23：外側セルの光学的厚さ 0.78 の平板で、面から入った正味のエネルギーが
+脱出を多く見積もっていた（社内の検証記録 §23：外側セルの光学的厚さ 0.78 の平板で、面から入った正味のエネルギーが
 +18.7 %、真空への脱出が +27 %。新しい式では −4.4 %・+5.5 % で、2 次以上で同じ極限へ収束する）。持続カーネルの
 経路も同じ式を使う。入射駆動は排他的二択: (i) 黒体駆動
 `Radiation.boundary.marshak_Tr_eV` \(>0\) で per-group
@@ -457,7 +457,7 @@ Levermore–Pomraning 限流子引数 \(R=|\nabla E|/(\sigma E)\) を**セル中
 厳密一致 \(\mathrm{harm}(c/3\sigma_L, c/3\sigma_R)\equiv c/(3\bar\sigma)\)
 のため変化は前線・急勾配領域のみ。自由流極限キャップは構成上厳密
 \(|F|\le cE_{face}\)。GXII golden は前駆加熱の物理変化として再基準化
-（ρ_peak 74→50 g/cc 等、VERIFICATION §10.1）。2D_RZ FLD は同型パターン
+（ρ_peak 74→50 g/cc 等、社内の検証記録 §10.1）。2D_RZ FLD は同型パターン
 （cell 中心 λ + 調和平均）— 2D セッションへ引き継ぎ。
 
 
@@ -612,7 +612,7 @@ R=P^T 厳密、Galerkin RAP 厳密、最粗 nr=1 厳密解、per-apply 固定線
 z-line SPD anchor、assembled-G2 leg。(iii) tol ladder（i4b 300-step / capsule
 3000-step、cg_inner_tol 1e-4..1e-10、U_lin ≤ 0.1 ΔQ_accept）。CG 費用が非支配の
 regime（i4a marshak 級）では RGmg の wall 利得は無い（2026-07-10 実測、中立）。
-詳細: docs/design/rgmg_verification_battery_20260711.md、VERIFICATION §9.5.6。
+詳細: 社内の設計メモ rgmg_verification_battery_20260711.md、社内の検証記録 §9.5.6。
 
 As of L1b-2 the captured block also covers the z-line and RGMG preconditioner applications (stream-parameterized variants; capture failure still latches the eager loop, and the graph key bakes in every preconditioner buffer pointer so any hierarchy reallocation forces recapture).
 
@@ -682,7 +682,7 @@ Newton には入れない。
 > 2026-09-14: 2D_RZ の物質 Newton も同じ \(\sigma^{PE}\) 混同を持っていたため同時に \(\sigma^{PA}\) へ統一
 > （2D の `rad_emit` 記帳は元から assembly の source と同じ \(\sigma^{PA}\) だった）。
 
-> **W-I AFI モード（2026-07-03）**: `Radiation.multigroup_diffusion.fleck_mode="afi"` は Fleck ブレンドを消費点（assembly の擬似散乱項 + 物質側ブレンド）で無効化し、outer 反復（Picard）が完全陰的 emission \(c\sigma B(T^{n+1})\) を収束させる。Larsen, Kumar & Morel (JCP 238, 2013) により AFI 離散化は任意 \(\Delta t\) で一意解・最大原理・平衡拡散極限を満たす。実測（GXII FLD nr200）: Fleck 既定は生産 \(\Delta t\)（コロナ z≈3）で吸収エネルギーを z→0 極限比 ~35% 抑制し dt 依存が全 metric を汚染、AFI は生産 dt で極限の数%以内（dt×4 でも残差数%）。コロナの Picard 縮小率 ~z/(1+z)≈0.75 のため `max_outer_iterations >= 40` 推奨（未収束は rate-limited warning が出る）。既定は従来 `"fleck_cummings"`（golden 影響なし）。**既定は Fleck を維持（ユーザー決定 2026-07-04）** — AFI は namelist opt-in の検証・測定モードとして存続し、GXII golden の再基準化は行わない。dt 感度の定量（Fleck ~25% vs AFI 4.1%）は VERIFICATION §10.1 に記録済み。
+> **W-I AFI モード（2026-07-03）**: `Radiation.multigroup_diffusion.fleck_mode="afi"` は Fleck ブレンドを消費点（assembly の擬似散乱項 + 物質側ブレンド）で無効化し、outer 反復（Picard）が完全陰的 emission \(c\sigma B(T^{n+1})\) を収束させる。Larsen, Kumar & Morel (JCP 238, 2013) により AFI 離散化は任意 \(\Delta t\) で一意解・最大原理・平衡拡散極限を満たす。実測（GXII FLD nr200）: Fleck 既定は生産 \(\Delta t\)（コロナ z≈3）で吸収エネルギーを z→0 極限比 ~35% 抑制し dt 依存が全 metric を汚染、AFI は生産 dt で極限の数%以内（dt×4 でも残差数%）。コロナの Picard 縮小率 ~z/(1+z)≈0.75 のため `max_outer_iterations >= 40` 推奨（未収束は rate-limited warning が出る）。既定は従来 `"fleck_cummings"`（golden 影響なし）。**既定は Fleck を維持（ユーザー決定 2026-07-04）** — AFI は namelist opt-in の検証・測定モードとして存続し、GXII golden の再基準化は行わない。dt 感度の定量（Fleck ~25% vs AFI 4.1%）は 社内の検証記録 §10.1 に記録済み。
 
 `Radiation.multigroup_diffusion.hydro_coupling` の既定は `"gamma_r_43"`（1D の FLD）。`"none"` は frozen-density historic behavior への
 明示 opt-out。`"gamma_r_43"` は 1D deterministic FLD の Lagrangian hydro half step ごとに、
@@ -1544,7 +1544,7 @@ mismatch.
 ##### 2026-07-15 gate revision — Richardson \(D_\infty^{fit}\) retired to diagnostic; fine-pair peak-gap contraction gate (gate8b)
 
 A two-bisect root-cause investigation of the 2026-07 gate8 failure
-(campaign ledger `docs/design/2d_campaign_plan_20260708.md`, exec-records
+(campaign ledger the internal design note 2d_campaign_plan_20260708.md, exec-records
 16–21) found that the strict \(D_\infty^{fit}\) window above is not an
 asymptotic estimate on this ladder: adjacent-pair fits of the same
 rational model disagree by more than a factor of two in every measured era
@@ -1686,7 +1686,7 @@ and does not feed back into the FLD solve or material update.
 #### 6.7.4 §I2-aux Phase B: 1D_SPH FLD-CED Multigroup Grey-Collapse Limit
 
 > **SUPERSEDED (2026-07-04 adjudication, Q7 of
-> `docs/design/i2_mgfld_collapse_spec.md` v3.1).** The 1D_SPH aux gate
+> the internal design note i2_mgfld_collapse_spec.md v3.1).** The 1D_SPH aux gate
 > specified below was never implemented (no deck/harness/ctest was ever
 > committed on any branch). Its verification intent is covered by (a) the
 > 1D solver-level multigroup gates `fld_1d_mg_planar_marshak_spectrum` /
@@ -1800,7 +1800,7 @@ unit-system change is introduced.
 #### 6.7.5 §I2 2D RZ multigroup FLD grey-collapse production gate
 
 Object `I2_2D_RZ_MULTIGROUP_FLD_GREY_COLLAPSE` (roadmap §10 row; design spec
-`docs/design/i2_mgfld_collapse_spec.md` v3.1, adjudicated 2026-07-04).
+the internal design note i2_mgfld_collapse_spec.md v3.1, adjudicated 2026-07-04).
 Grey is the \(N_g=1\) operation of the same multigroup kernels (no separate
 grey path; dispatch branches on dimension only), so the collapse comparison
 verifies the group-partition machinery — b_g weights (renormalized
@@ -1890,7 +1890,7 @@ PENDING — see roadmap §10 carry-over registry row
 
 #### 6.7.7 §I4 2D RZ multi-material radiation-interface production gate
 
-Design record: `docs/design/i4_mm_rad_interface_spec.md` (A1–A5 + Addenda).
+Design record: the internal design note i4_mm_rad_interface_spec.md (A1–A5 + Addenda).
 
 **Per-material opacity (G-1, frozen convention A1).** The shared radiation
 opacity path fills per-cell effective opacities from the material mixture:
@@ -2083,7 +2083,7 @@ reduced branch and as the direct full-system residual on the full branch.
 #### 6.7.9 §I6 2D RZ multigroup S_N grey-collapse production gate
 
 Registry row `I6_2D_RZ_MULTIGROUP_SN_GREY_COLLAPSE` (roadmap §10). Design spec:
-`docs/design/i6_sn_mg_collapse_spec.md` (grounding facts F1-F15 + Addenda 1-2).
+the internal design note i6_sn_mg_collapse_spec.md (grounding facts F1-F15 + Addenda 1-2).
 
 **Object.** Grey \(S_N\) is \(N_g=1\) of the same multigroup kernels (single dispatch,
 no grey-specific branch; `sn_transport_2d_gpu.cu` threads `n_groups` end-to-end with the
@@ -2130,7 +2130,7 @@ G2-cert queued for the batched campaign** (registry row stays PARTIAL until then
 
 #### 6.7.10 §I7 2D RZ coupled-stack ICF baseline production gate
 
-Design record: `docs/design/i7a_coupled_stack_spec.md` (F1–F6 + Addenda 1–3).
+Design record: the internal design note i7a_coupled_stack_spec.md (F1–F6 + Addenda 1–3).
 
 **I7a (planar laser-ablation coupled stack).** Deck
 `i7a_coupled_stack_2d_rz_slab.py`: axis disk (r_min=0, on-axis raytrace_3d beam —

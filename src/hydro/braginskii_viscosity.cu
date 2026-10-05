@@ -1,7 +1,7 @@
 // Braginskii plasma shear viscosity kernels (1D planar / cylindrical /
 // spherical), ion + electron channels. See braginskii_viscosity.cuh,
-// docs/design/wh_braginskii_viscosity_design.md and
-// docs/design/electron_viscosity_1d_20260712.md for the derivations.
+// the internal design note wh_braginskii_viscosity_design.md and
+// the internal design note electron_viscosity_1d_20260712.md for the derivations.
 
 #include "hydro/braginskii_viscosity.cuh"
 #include "hydro/braginskii_viscosity_device.cuh"

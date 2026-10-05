@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Grid convergence gate of the 1D FLD outer boundary closure (NUMERICS §6.7 1D BC, VERIFICATION §23).
+"""Grid convergence gate of the 1D FLD outer boundary closure (NUMERICS §6.7 1D BC, the internal verification record §23).
 
 Runs examples/verification/fld_1d_outer_closure_slab.py with a Marshak face and with a vacuum face on a ladder of grids
 (default 64, 128, 256 and 2048 cells; the outer cell's optical depth is 0.78 at 64 cells) and compares the net

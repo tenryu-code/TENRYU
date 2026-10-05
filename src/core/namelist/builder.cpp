@@ -14403,7 +14403,7 @@ void Builder::validate() {
     if (main.dimension == "2D_RZ" && numerics.conduction.snb_efield != "none") {
       throw ConfigError(
           "Numerics.conduction.snb_efield=\"local\" is not available in 2D_RZ"
-          " v1 (fail-closed; docs/design/2d_snb_port_spec.md §2)");
+          " v1 (fail-closed; the internal design note 2d_snb_port_spec.md §2)");
     }
     if (numerics.conduction.snb_picard_max_iters < 2) {
       throw ConfigError("Numerics.conduction.snb_picard_max_iters must be >= 2");
@@ -17218,7 +17218,7 @@ void Builder::validate() {
         "Radiation.multigroup_diffusion.marshak.flux_pulse_duration_s must be >= 0 or -1");
   }
   if (fld_has_marshak) {
-    // Indirect-drive Tr(t) route (docs/design/2d_tr_drive_port_spec.md §5):
+    // Indirect-drive Tr(t) route (the internal design note 2d_tr_drive_port_spec.md §5):
     // exactly one of {a Radiation.boundary marshak_Tr source, the constant
     // marshak.flux_erg_per_cm2_s > 0} drives the marshak z faces (the 1D
     // 819368bc pattern). The Tr route supplies per-group Planck weighting,
@@ -17548,7 +17548,7 @@ void Builder::validate() {
         "Radiation.sn_transport.marshak.flux_erg_per_cm2_s must be >= 0");
   }
   if (sn_has_marshak) {
-    // Indirect-drive Tr(t) route (docs/design/2d_tr_drive_port_spec.md
+    // Indirect-drive Tr(t) route (the internal design note 2d_tr_drive_port_spec.md
     // §4-§5): exactly-one drive form; the 2D SN marshak injection is
     // structurally grey, so groups==1 binds on BOTH routes in v1.
     const auto sn_z_face_has_tr_table = [&](const char* key,
@@ -17580,7 +17580,7 @@ void Builder::validate() {
       throw ConfigError(
           "Radiation.sn_transport marshak boundary is currently supported"
           " only for groups=1 (the 2D SN marshak injection is structurally"
-          " grey; spec docs/design/2d_tr_drive_port_spec.md §4.2)");
+          " grey; the internal design note 2d_tr_drive_port_spec.md §4.2)");
     }
     if (has_tr && sn_bottom_marshak && sn_top_marshak &&
         (sn_z_face_has_tr_table("bottom_z", "z_bottom") ||
@@ -17615,7 +17615,7 @@ void Builder::validate() {
           throw ConfigError(
               "multi-material radiation requires opacity.model=constant for all non-void materials "
               "(per-material blending of freq_dep/NLTE is future work; "
-              "docs/design/i4_mm_rad_interface_spec.md)");
+              "the internal design note i4_mm_rad_interface_spec.md)");
         }
       }
     }

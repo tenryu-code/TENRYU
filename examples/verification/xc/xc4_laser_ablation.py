@@ -2,7 +2,7 @@
 # MULTI pair: ops/xc/cases/xc4_laser_ablation/multi.input (CPC88-heritage numbers:
 # Al-like foil, 3e14 W/cm^2, 300 ps FWHM sin^2, 0.44 um — the 2015CPC example
 # reduced to a single synthetic ideal-gas material).
-# Design: docs/design/xc_tenryu_multiife_1d_comparison_design_20260710.md §XC-4.
+# Design: the internal design note xc_tenryu_multiife_1d_comparison_design_20260710.md §XC-4.
 #
 # Quasi-planar shell at R0 = 10 cm (tier-0 finding: TENRYU's planar
 # radial_absorption_1d power convention is ill-defined; the spherical

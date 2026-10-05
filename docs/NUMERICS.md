@@ -748,7 +748,7 @@ Node-grey conservation does not imply off-grid or spectrally resolved equivalenc
 セルについて、従来（`"legacy"`、bit 凍結・旧既定）は内部エネルギーを clamp 後の表値
 \(e_{\rm tab}\) で無条件に上書きしていた。laser 加熱で table 温度天井を超えた blowoff コロナ
 セルではこれが**超過エネルギーの毎ステップ無記帳破棄**になる（GXII 級 solid FLD 実測で累積
-−362 J = 吸収の 21%、docs/design/bug24_hydro_entry_eos_projection_20260718.md）。
+−362 J = 吸収の 21%、社内の設計メモ bug24_hydro_entry_eos_projection_20260718.md）。
 `"energy_authoritative"`（2026-07-18 ユーザー裁定以降の**既定**、production 再基準化済み —
 `config.hpp` の default と一致）は進化させた \(e\) を権威量として保持し、clamp セルでは
 `eos_writeback` の roundtrip 上書きも含め \(e\) を書き換えない（\(T,P,c_v\) は clamp 逆算値 =
@@ -2384,7 +2384,7 @@ bitwise 一致・幅下限・隣接比（pin 跨ぎは `ratio_jump_allowed` で�
 `core/mesh_requirement`（`build_mesh_requirement` / `check_mesh_requirement`）は、デッキの
 レーザー波形・波長・材料層（密度・A・Z）・幾何から、初期メッシュが満たすべき分解能要求を
 決定論的に見積もるスケーリング則モデルである（設計記録
-docs/design/mesh_resolution_requirement_20260903.md）。probe run 後の質量形ゾーニング判定
+社内の設計メモ mesh_resolution_requirement_20260903.md）。probe run 後の質量形ゾーニング判定
 （`tools/assist zoning-report`）を置き換えるものではなく、最初の probe より前の情報を与え、
 probe との比較で係数を較正するためのものである。
 
@@ -2427,7 +2427,7 @@ CH/351 nm/10¹⁵ W/cm² 実測 1.3–1.6×10⁶ g cm⁻² s⁻¹ に対しモ�
 `tools/validation/mesh_convergence_campaign.py` による 29 ケース（波形 8 種 × 波長
 351/527/1053 nm × 初期密度 0.05–2.5 g/cc・層状・球シェル）の格子収束実測
 （`docs/validation/mesh_convergence_reference.md`、設計記録
-`docs/design/mesh_convergence_campaign_20260903.md`）: 一様参照 4.9×10⁻⁷ g/cm² に対する
+社内の設計メモ mesh_convergence_campaign_20260903.md）: 一様参照 4.9×10⁻⁷ g/cm² に対する
 収束面密度質量と先験天井の比は幾何平均 1.26（0.39–5.28）で、10¹⁵ W/cm² では天井が緩すぎ
 （0.4）、緩やかな波形・低密度・527 nm では保守的（2–5）だった。補正後は測定した全ケースで
 天井 ≤ 収束値（最小余裕 1.0、最大 9）。1053 nm は 1.2 nm セルでも吸収エネルギー 3 % に
@@ -2471,7 +2471,7 @@ C02-S1 に基づく未アブレート平面後方の 2e-5 g/cm²。表面天井�
 電離度・形成積分（吸収率 1、η=0.12、s_abl=1.5、φ_f=0.1、N_res=9）を評価し、
 追加の 0.1 倍や ladder 上限を課さず factor 1 とする。範囲外では未収束クラスの警告が
 併存してもこの先験 fallback を優先する。C++ 実行時に Python を呼ばず、HDF5 schema は変えない。
-詳細・適用範囲は `docs/design/mesh_recommendation_from_campaign_20260908.md`。
+詳細・適用範囲は 社内の設計メモ mesh_recommendation_from_campaign_20260908.md。
 2026-09-28 改訂: 推薦 block の測度は平面 `areal_mass`、円筒 `cylindrical_line_mass`、球
 `spherical_cell_mass`。標的を 3 領域に分ける。(i) アブレーション域 — 外面から深さ
 \(\max(\mu_{abl}, d_{half})\) まで（\(\mu_{abl}\) は solver preview を優先し、なければ Python 形成
@@ -3164,7 +3164,7 @@ T_{k,i}^{new} = T_{k,i}^{old} + \frac{\Delta e_{k,i}}{c_{v,k,i}} \quad (k=e,i)
 **1T の全エネルギー再規格化（2026-09-29 に撤去）**：1D の 1T・`compatible_energy=False`・駆動圧境界なしのステップでは、
 Corrector の後の全エネルギーの誤差を、活性セルの \(e\) の一律の拡大縮小（残差は最初の活性セルへ）で消していた。
 非互換の更新の保存誤差を、誤差が生じた場所（衝撃波）ではなく全セルへ内部エネルギーに比例して配るので、遠方の冷たい
-物質の断熱量まで変える（VERIFICATION §3.2s(b) の Sod の遠方場の指紋）。原因（非互換の更新が保存しないこと）を除かずに
+物質の断熱量まで変える（社内の検証記録 §3.2s(b) の Sod の遠方場の指紋）。原因（非互換の更新が保存しないこと）を除かずに
 結果だけを期待値へ合わせる状態の補正で、2026-08-31 のユーザー裁定に当たるので、multi-kernel と persistent loop の両経路から
 外した。現在は 1T でも 2T と同じく、非互換の更新の保存誤差は履歴の保存誤差にそのまま現れる。全エネルギーを機械精度で
 保存する必要があるときは保存形の `compatible_energy=True` を使う（1D の Sedov・Noh の検証デッキはこれを使う）。
@@ -4269,7 +4269,7 @@ voidゾーン：等半径間隔 \(\Delta r = (r_{out} - r_{in}) / N\)。
 
 #### 3.1.13 Braginskii プラズマ粘性（イオン channel 2026-07-04 / 電子 channel 2026-07-12 / 2D species port 2026-07-17）
 
-Physical-viscosity module adding unmagnetized Braginskii shear viscosity (ion + electron channels, single-fluid \(V_e=V_i\)) to the 1D (all geometries) and 2D RZ Lagrangian steps (**default OFF** — namelist `Numerics.hydro.plasma_viscosity`; diagnostic env hooks `TENRYU_BRAG_{ENABLE,MODEL,SPECIES,ETA_CONST,ETA0_SCALE,MFP_CAP_CELLS,LNLAMBDA_FIXED,DT_SAFETY}` remain available; all unset leaves the module inactive and bit-identical. `species="ion"` (default) is bit-identical to the pre-electron ion-only trajectories in BOTH dims — the kernels are SPECIES-templated with a source-identical ion branch). Implementation: `src/hydro/braginskii_viscosity.{cuh,cu}`, `src/hydro/braginskii_viscosity_device.cuh` (shared coefficient device functions), and `src/hydro/braginskii_viscosity_2d.cu`; designs: `docs/design/wh_braginskii_viscosity_design.md` (ion), `docs/design/2d_visc_port_spec.md` (2D RZ), `docs/design/electron_viscosity_1d_20260712.md` (electron channel + regime adjudication, landed on feature/1d-brushup), `docs/design/visc_2d_parity_20260717.md` (this branch's port + 2D species extension); literature: Braginskii 1965（原典照合 2026-07-12: τ_e=Eq.(2.5e)、η₀^e=Eq.(2.25) "(Z=1)" 明記、η₀^i=Eq.(2.22)）/ Whitney PoP 6, 816 (1999)（η₀₀^e(Z)、一次文献は調達依頼中）/ Velikovich, Whitney & Thornhill PoP 8, 4524 (2001)（電子粘性 shock 加熱の物理; η₀₀^e(Z) 転写元 Eq.(3)）/ Hunana ApJS (2022)（η₀₀^e=0.73094 近代追認）/ Vold et al. PoP 22, 112708 (2015) (1D spherical reference implementation) / Manheimer & Colombant LPB 25, 541 (2007) (coefficient transcription) / Mason et al. PoP 21, 022705 (2014) (mfp cap) / Miller CF 210, 104672 (2020) / Haines PoP 31, 050501 (2024).
+Physical-viscosity module adding unmagnetized Braginskii shear viscosity (ion + electron channels, single-fluid \(V_e=V_i\)) to the 1D (all geometries) and 2D RZ Lagrangian steps (**default OFF** — namelist `Numerics.hydro.plasma_viscosity`; diagnostic env hooks `TENRYU_BRAG_{ENABLE,MODEL,SPECIES,ETA_CONST,ETA0_SCALE,MFP_CAP_CELLS,LNLAMBDA_FIXED,DT_SAFETY}` remain available; all unset leaves the module inactive and bit-identical. `species="ion"` (default) is bit-identical to the pre-electron ion-only trajectories in BOTH dims — the kernels are SPECIES-templated with a source-identical ion branch). Implementation: `src/hydro/braginskii_viscosity.{cuh,cu}`, `src/hydro/braginskii_viscosity_device.cuh` (shared coefficient device functions), and `src/hydro/braginskii_viscosity_2d.cu`; designs: 社内の設計メモ wh_braginskii_viscosity_design.md (ion), 社内の設計メモ 2d_visc_port_spec.md (2D RZ), 社内の設計メモ electron_viscosity_1d_20260712.md (electron channel + regime adjudication, landed on feature/1d-brushup), 社内の設計メモ visc_2d_parity_20260717.md (this branch's port + 2D species extension); literature: Braginskii 1965（原典照合 2026-07-12: τ_e=Eq.(2.5e)、η₀^e=Eq.(2.25) "(Z=1)" 明記、η₀^i=Eq.(2.22)）/ Whitney PoP 6, 816 (1999)（η₀₀^e(Z)、一次文献は調達依頼中）/ Velikovich, Whitney & Thornhill PoP 8, 4524 (2001)（電子粘性 shock 加熱の物理; η₀₀^e(Z) 転写元 Eq.(3)）/ Hunana ApJS (2022)（η₀₀^e=0.73094 近代追認）/ Vold et al. PoP 22, 112708 (2015) (1D spherical reference implementation) / Manheimer & Colombant LPB 25, 541 (2007) (coefficient transcription) / Mason et al. PoP 21, 022705 (2014) (mfp cap) / Miller CF 210, 104672 (2020) / Haines PoP 31, 050501 (2024).
 
 **係数（cgs+eV 凍結系）**:
 
@@ -4360,7 +4360,7 @@ For 2D, let \(L_c=\min_k|\mathbf x_{k+1}-\mathbf x_k|\). The explicit limit and 
 \tau_{eff}=\min\left(\tau_s,\frac{\mathrm{mfp\_cap\_cells}\,L_c}{v_{th,s}}\right),\quad s\in\{i,e\}.
 \]
 
-**2D species extension (2026-07-17, `docs/design/visc_2d_parity_20260717.md`)**: the 2D corner-force and dt kernels are `SPECIES`-templated with fully separated `if constexpr` branches exactly like the 1D kernels — SPECIES=0 keeps the ion-only load order and expressions source-identical (bitwise contract in both dims), SPECIES=1 evaluates \(\eta_e(T_e)\), SPECIES=2 composes \(\eta_\mathrm{eff}=\eta_i+\eta_e\) additively (`model="constant"` splits `eta_const` half/half, the 1D convention). Per-channel heat rates land in `visc_heat_rate_per_cell` (ion) and `visc_heat_rate_e_per_cell` (electron; allocated only when `species != "ion"`). The corner-force expression itself is built from \(\eta_\mathrm{eff}\) in every branch, so the adjointness / per-cell z-momentum / null identities hold for every species by construction.
+**2D species extension (2026-07-17, the internal design note visc_2d_parity_20260717.md)**: the 2D corner-force and dt kernels are `SPECIES`-templated with fully separated `if constexpr` branches exactly like the 1D kernels — SPECIES=0 keeps the ion-only load order and expressions source-identical (bitwise contract in both dims), SPECIES=1 evaluates \(\eta_e(T_e)\), SPECIES=2 composes \(\eta_\mathrm{eff}=\eta_i+\eta_e\) additively (`model="constant"` splits `eta_const` half/half, the 1D convention). Per-channel heat rates land in `visc_heat_rate_per_cell` (ion) and `visc_heat_rate_e_per_cell` (electron; allocated only when `species != "ion"`). The corner-force expression itself is built from \(\eta_\mathrm{eff}\) in every branch, so the adjointness / per-cell z-momentum / null identities hold for every species by construction.
 
 The v1 exclusions are fail-closed: 2D per-material conservation with viscosity enabled raises `ConfigError`; `button_center`, `central_pseudo_core`, and `pole_angular_derefine` are guarded by runtime assertions. The `wj` mesh-forensics decomposition excludes viscosity (the force remains in the total), and reflect walls use one-sided viscous stress with no mirror-cell flux.
 
@@ -4637,7 +4637,7 @@ the larger cell at the first adjacent-size violation until
 Because \(\det(\tau,\nu)=-\sigma_z\), the logical \(j\) direction uses the
 normal ladder unchanged for \(\sigma_z=-1\) and reversed for
 \(\sigma_z=+1\); the standard cell-node order therefore remains
-counterclockwise. See `docs/design/cone_shell_multiblock_20260719.md` for the
+counterclockwise. See the internal design note cone_shell_multiblock_20260719.md for the
 full derivation and staged topology design.
 
 #### 3.2.0c Cone-shell Stage C2 near-face strips
@@ -5216,7 +5216,7 @@ duplicated. Coordinate identity is checked with tolerance
 per coordinate. Mesh construction asserts positive RZ volume for every cell.
 Verification tests check refinement-convergent total volume against the
 analytic spherical volume for the shell outer radius; golden updates require
-the verification process in VERIFICATION.md.
+the verification process in the internal verification record.
 
 #### 3.2.0b Multiblock geometry and CSR connectivity
 
@@ -5258,7 +5258,7 @@ consumes it — dendrite bodies truncate through the same path, with
 shell-chain generalization).  Construction-only in this wave: hydro on the
 hybrid remains gated exactly like the parent (`polar_tier_hydro_enabled` +
 the mixed-cell force trio) and is unqualified.  Design and rulings:
-docs/design/epoch_quad_remesh_20260820.md §12–§14.
+the internal design note epoch_quad_remesh_20260820.md §12–§14.
 
 The bridge uses scalar blend levels between cap radius \(r_c\) and seam radius
 \(r_{\rm cut}\).  The default `multiblock_cart_core_bridge_grading="uniform"`
@@ -5499,7 +5499,7 @@ recache. The pentagon partition (5-way midpoint-center RZ subquads,
 Σ-normalized; the CSR-remap audit variant additionally shifts the roundoff
 remainder into slot 2) and the belt star-P1 partition are
 invariant-flag-independent. Full per-topology matrix and gap register:
-docs/design/a124b_corner_mass_contract_20260815.md.
+the internal design note a124b_corner_mass_contract_20260815.md.
 A124(b) ruling addendum (2026-08-15, user-adopted P-A/P-B/P-C): the
 DIAGNOSTIC corner-mass recompute paths follow the dynamical basis rather
 than the legacy bbsw default — the 2D energy-budget kinetic basis without an
@@ -5531,7 +5531,7 @@ spherical-polar axis wedge (both side means equal the half off-axis
 radius) while the exact subvolumes split ~1:3 angularly, which baked raw
 corner densities of exactly \(2\bar\rho\) and \((2/3)\bar\rho\) into every
 axis-wedge cell (design record
-docs/design/polar_tier_center_20260723.md §5.7). Non-AW structured cells
+the internal design note polar_tier_center_20260723.md §5.7). Non-AW structured cells
 keep the BBSW weights bit-identically.
 
 Volume-convention note (BINDING): on spherical-polar meshes the cell
@@ -5601,7 +5601,7 @@ compatible energy theorem to hold. Corner masses are therefore:
   the exact 4/3 axis-node over-acceleration that seeds the pole impedance;
   `"equal_split"` matches the structured polar convention without changing
   non-axis node masses or any corner-mass cache. See
-  `docs/design/bug25_csr_pole_axis_node_dynamics_20260720.md`.
+  the internal design note bug25_csr_pole_axis_node_dynamics_20260720.md.
   After CSR ALE remap, finite active multiblock node sums at the compatible
   acceleration mass floor are positivity-floored as a roundoff guard.  For the
   five-block half-butterfly central Cartesian core only, a roundoff-scale
@@ -6410,7 +6410,7 @@ despite the historical label, this vector is the face's own
 lateral-revolution area vector, NOT the CSW98 Eq. 16 median-mesh vector;
 for logically-grid-aligned compression it is perpendicular to
 \(\Delta\mathbf{u}_e\) and the force is structurally zero -- see
-docs/design/i1b_csw_edge_av_structural_zero_defect.md. The mode is kept
+the internal design note i1b_csw_edge_av_structural_zero_defect.md. The mode is kept
 bit-identical for certification continuity; `av_model="csw_edge_csw98"`
 (§3.2.9c) is the corrected formulation.)  The edge is
 compressive for that cell iff
@@ -6484,7 +6484,7 @@ displaced angular edge, whose ratio behaves as \(U(s{+}h)/U(s)\) and flips
 sign at any radial stagnation, collapsing \(\psi\) exactly at flow reversal
 and firing the Kuropatenko kernel of the geometric turning
 \(|\Delta u|=|U|\Delta\theta\) tangentially (the reversal-time axis-column
-injection; design record `docs/design/front_conforming_ale_20260826.md`
+injection; design record the internal design note front_conforming_ale_20260826.md
 §9.9.6-9.9.8).  The legacy face-adjacency limiter remains compiled as the
 read-only negative control of the `TENRYU_CSW98_EDGE_DIAG` diagnostic
 (`psi_legacy` vs `psi_new`).
@@ -6532,7 +6532,7 @@ changes (bitwise regression anchor:
 tests/hydro/test_csw98_bit_identity_old_mode.cu).
 
 Side vectors (C2 form, decision 2026-07-04,
-docs/design/i1b_csw98_rz_eq16_decision.md): with the exact
+the internal design note i1b_csw98_rz_eq16_decision.md): with the exact
 revolution-volume corner gradients \(a_k=dV/dx_k\) (same polynomial family
 as `cell_Svec`) and \(b_k=a_k-\mathrm{mean}(a)\), the cyclic system
 \[
@@ -6580,7 +6580,7 @@ with \(q_{Kur,e}=\rho_e W_e|d\mathbf{v}_e|\)). 旧版は
 \(f_e\to0\) as \(d\mathbf{v}_e\cdot S_e\to0^-\).
 
 Degenerate-side guard (2026-08-17;
-`docs/design/reale_freestream_defect_20260817.md` §6.2): csw98 AV may
+the internal design note reale_freestream_defect_20260817.md §6.2): csw98 AV may
 fire only when \(l_e^2\ge\eta^2 A_c\), where \(A_c\) is the absolute
 shoelace area and
 \(\eta=\texttt{csw98\_degenerate\_side\_floor\_rel}\) defaults to
@@ -6876,7 +6876,7 @@ compatible-force-work mode, an edge whose both endpoints lie on the exact
 axis contributes neither edge-AV force nor an AV CFL bound: axis-line edges
 connect zero-mass axis nodes, and any AV impulse on them seeds spurious
 angular motion at the pole (consult-6; design record
-docs/design/polar_tier_center_20260723.md §5.6). Structured meshes test the
+the internal design note polar_tier_center_20260723.md §5.6). Structured meshes test the
 logical axis lines (radial edges at \(j=0\) / \(j=n_z\) with the
 corresponding axis slave active, from the first slaved column outward);
 multiblock/CSR meshes carry no \((i,j)\) indexing, so the test is geometric
@@ -7051,7 +7051,7 @@ a_c=C_2\frac{\gamma+1}{4}\Delta u_c,\qquad
 
 **エネルギー閉包**: セル仕事 \(W_c=-\sum_i \mathbf F_{c,i}\cdot(2\pi R_i)\mathbf u_i\)（AW RZ 対、edge-AV と同一規約）を `work_av_per_cell` に SIGNED で置き、predictor と corrector の両方で（corrector は time-centered 速度で）compatible work 経路が再計算する。**dt**: \(\Delta t_\mu=0.25\,\min_c \rho_cL_c^2/\mu_c\)（センサ〜平滑化 pipeline を純関数として再計算; 既存 AV-CFL スロットで報告）。
 
-**検証状態（2026-08-01, VERIFICATION §18 参照）**: 演算子ゲート 7/7 PASS（平行移動/剛体回転の消去、limiter-on affine で \(\mu\to0\)（丸めまで）、線形厳密性（内部組立力 \(\le10^{-12}\max|F|\)、実測 \(10^{-17}\) 級）、非線形 radial replay の per-ring θ-一様性 \(10^{-10}\)、AW energy pairing 恒等式 \(5\times10^{-13}\)、pentagon 包含 + \(K\mathbf 1=0\)）。**運用資格**: 純 Lagrangian 包絡では csw98 と parity〜+3%（bare polar_tier で死亡が極列から離脱）。**every-step ALE（euler-window axis-core）包絡では shock 背後の偶奇 ringing により早期崩壊が残存（v1.1 の μ 平滑化で緩和するが未根絶; A75/A76）— production 資格なし（production AV は csw_edge_csw98 のまま）**。
+**検証状態（2026-08-01, 社内の検証記録 §18 参照）**: 演算子ゲート 7/7 PASS（平行移動/剛体回転の消去、limiter-on affine で \(\mu\to0\)（丸めまで）、線形厳密性（内部組立力 \(\le10^{-12}\max|F|\)、実測 \(10^{-17}\) 級）、非線形 radial replay の per-ring θ-一様性 \(10^{-10}\)、AW energy pairing 恒等式 \(5\times10^{-13}\)、pentagon 包含 + \(K\mathbf 1=0\)）。**運用資格**: 純 Lagrangian 包絡では csw98 と parity〜+3%（bare polar_tier で死亡が極列から離脱）。**every-step ALE（euler-window axis-core）包絡では shock 背後の偶奇 ringing により早期崩壊が残存（v1.1 の μ 平滑化で緩和するが未根絶; A75/A76）— production 資格なし（production AV は csw_edge_csw98 のまま）**。
 
 #### 3.2.9f Delayed wake-only angular artificial heat flux (`wake_heat_flux_enabled`; consult-6 §3.2–3.12, 台帳 A88; 2026-08-02)
 
@@ -11745,7 +11745,7 @@ production activation.
 
 The button morph uses the Shirley-Chiu equal-volume core target and circular
 bridge target defined by
-`docs/design/shock_ahead_button_reorientation_20260720.md`.
+the internal design note shock_ahead_button_reorientation_20260720.md.
 The optional per-sector shock-approach extension divides
 \(\theta\in[0,\pi]\) into equal-theta sectors, extracts one radial pressure
 ridge per sector, and advances an independent quadratic arrival tracker.
@@ -11757,7 +11757,7 @@ the diagnostic morph deadline is
 \(t_{end}=\min_k[t_{arr,k}-\nu\sigma_{t,k}-N_g h_{cell}/|v_k|]-\Delta t_{scan}\),
 with defaults \(\nu=2.75\) and \(N_g=9\). The committed deadline can move only
 earlier and remains diagnostic-only in W1; see
-`docs/design/asym_runtime_ale_controller_20260721.md` §2.
+the internal design note asym_runtime_ale_controller_20260721.md §2.
 The committed deadline only accepts candidates that lie in the future and come
 from a tracker with at least 8 samples; immature candidates are logged
 (`deadline_immature=1`) but not committed.
@@ -11833,7 +11833,7 @@ and button-morph runs recapture it at the first evaluation at or after
 `button_morph.t_end_s`.  W2 does not modify the timestep, mesh, ALE decision,
 or physics state.  With the monitor disabled it launches no kernel, captures no
 snapshot, and emits no history group.  See
-`docs/design/asym_runtime_ale_controller_20260721.md` §2 and §4 W2.
+the internal design note asym_runtime_ale_controller_20260721.md §2 and §4 W2.
 
 **Runtime ALE target construction (asym arc W3a; no motion):**
 
@@ -14057,7 +14057,7 @@ canonicalize and the raw transported install (both physics-breaking), the
 frozen-basis TER measurement, the macro-band rezone taper + lifts, the
 incremental KE-fixup deposit, the F-basis momentum projection, and the
 Option-B subzonal-basis gather (catastrophic in composite). Full
-adjudication: docs/design/20260612-i1b-corner-mass-basis-adjudication.md.
+adjudication: the internal design note 20260612-i1b-corner-mass-basis-adjudication.md.
 
 *Basis-coherent Option-B bookkeeping chain — "coherent-lite"
 (`TENRYU_I1B_OPTIONB_COHERENT`, default-off; supersedes and hard-gates off
@@ -14096,7 +14096,7 @@ velocity gradients and crushes the gas-shell interface ~1 ns early), and
 per-install \(M/M'\) velocity ripple wrecks the converging-core mesh;
 the projection trade momentum↔uniform-flow is irreducible because
 V-pairing is not comoving under node motion). Adjudication record:
-docs/design/20260612-i1b-optionb-basis-coherent-redesign.md.
+the internal design note 20260612-i1b-optionb-basis-coherent-redesign.md.
 
 The aggregate volume is the current sum of member RZ volumes,
 \[
@@ -15622,7 +15622,7 @@ and all of its certificates remain unchanged.
 Near-cocircular quadruples in polar lattices can emit vertex pairs separated by
 \(10^{-10}\) to \(2\times10^{-7}\,\mathrm{cm}\); the resulting zero-length
 faces poison the compatible hydro.  See
-`docs/design/reale_freestream_defect_20260817.md` for the defect dossier.  A
+the internal design note reale_freestream_defect_20260817.md for the defect dossier.  A
 full ReALE v2 NUMERICS chapter remains an open documentation debt tracked in
 that dossier §7.
 
@@ -15789,7 +15789,7 @@ restart 直後は floor を一度再評価し、不適用なら再装填され�
 **現状**: 採用候補が remap_v3 の extensive-field 検証で棄却される未同定の
 段が残っており（ConservationRejected）、ベンチデッキでの実適用は未達成。
 本モードは default-OFF の research prototype であり、後続開発の起点は
-`docs/design/perf_1d_wave5_20260807.md` B1 節を参照。
+社内の設計メモ perf_1d_wave5_20260807.md B1 節を参照。
 > 典型的な GXII short-pulse cases では ALE off の pure Lagrangian を推奨する。120J/6ns FLD 評価では中央収束領域が広く局在 feature ではないため、ALE による speedup は確認されていない。
 
 #### 3.4.2 2D ALE との境界
@@ -16143,7 +16143,7 @@ kR = \pi \,|\, j_{1,1} \,|\, \alpha\ (\tan\alpha=\alpha)
 \]
 を直接駆動し、L2 の loglog 次数 \(\in[1.8,2.2]\)・総電子エネルギー恒等式
 \(|\Delta E|/E \le 10^{-14}\)・固有値 runtime 自己検証を課す。実測次数：
-球面 2.055 / 平面 2.107 / 円筒は VERIFICATION §4.7 参照。この族が球面
+球面 2.055 / 平面 2.107 / 円筒は 社内の検証記録 §4.7 参照。この族が球面
 演算子の 1D 解析ゲート（従来 heat_diffusion は test_planar 経由の平面
 演算子のみ）・implicit 経路・per-material 経路の解析被覆を初めて与える。
 また 16 桁精度ログにより template 化前後の bit 同一（rel=0）を測定した
@@ -16166,7 +16166,7 @@ Kirchhoff 割線
 （\(\kappa\propto T^p\) の flux 厳密面係数; 等温極限で調和平均と一致、
 p=0 は厳密に \(\kappa_0\)）を用い、Pattle 伝播を front 冪 0.9-1.5% /
 プロファイル L2 6-9×10⁻⁴ / 次数 2.28(球)/2.16(円筒)/1.45(平面) で回復する
-（VERIFICATION §4.8）。この発見の時点（2026-07-04）では生産 Spitzer 経路は調和平均のままだった（材料界面・
+（社内の検証記録 §4.8）。この発見の時点（2026-07-04）では生産 Spitzer 経路は調和平均のままだった（材料界面・
 void 断熱の設計要件）。2026-07-06 から生産の既定は下の `kirchhoff_same_material`（同じ材料の滑らかな面だけ割線、
 界面と void は調和平均）。
 
@@ -16204,7 +16204,7 @@ Kirchhoff 閉包下の急峻 front（例: 3000 eV↔1 eV 隣接セル）では
 Kirchhoff \(q_{SH}^{kir}\gg q_{max}\)（XC-0b 条件で \(\sim10^4\times\)）となり、
 limiter が守るべき自由流上限が事実上未適用だった（未解像 front の過伝播:
 XC-0b z1 nc=400 で front +13% vs 収束参照解; MULTI-IFE 交差比較 XC-0b が検出、
-`docs/design/xc_tenryu_multiife_1d_comparison_design_20260710.md` Addendum 4）。
+社内の設計メモ xc_tenryu_multiife_1d_comparison_design_20260710.md Addendum 4）。
 上記面診断の \(R_{eff}\) 代数（深飽和で \(R_{eff}\to1\) = 両閉包とも
 \(q_{max}\) 頭打ち）は整合適用を前提としており、本契約はその実装化である。
 適用箇所: STS/implicit 両経路 + persistent kernel の
@@ -16225,7 +16225,7 @@ two-material Timeout の真因 — 当時の GPU 競合仮 triage を訂正）�
 \(dl^2/D_{eff}\) は \(x_r\) 由来で元来免疫、そちらへ自然 fallback）。生産
 state は常に \(vol>0\) のため健常 dt_exp は bit 恒等。診断確定は gdb 直接
 測定（\(\kappa_{eff}\)/\(\rho c_v\) 健全・\(vol\equiv0\) を実測、委譲文書
-`HANDOFF_BUG20_BUG21_20260713.md` の容疑 1/2 は共に棄却）。回帰: 同上
+社内の引き継ぎメモ HANDOFF_BUG20_BUG21_20260713.md の容疑 1/2 は共に棄却）。回帰: 同上
 ctest へ零体積 property test（零 vol=無寄与 sentinel + 真球殻 vol=有限比）
 を追加、#845 green 化。
 
@@ -16677,7 +16677,7 @@ Opt-in `"donor"` mode computes alpha from the sum of unthrottled outflow
 magnitudes and scales each pair by the donor cell's alpha.  The donor's total
 realized outflow is therefore bounded by its energy above the floor, which
 guarantees $T_{e,trial}\ge T_{e,floor}$ while preserving pair antisymmetry.
-See `docs/design/bug18_conduction_floor_pumping_fix_20260712.md`.
+See the internal design note bug18_conduction_floor_pumping_fix_20260712.md.
 
 **擬似コード**：
 ```
@@ -17022,7 +17022,7 @@ thermal energy \(\rho c_vVT\) を更新し、per-cell energy を \(dt\times\nabl
 `Numerics.conduction.nonlocal_model="snb"`（既定 `"none"` = 本節不活性・従来経路 bit 恒等）で、
 Schurtz–Nicolaï–Busquet (SNB) 型多群拡散の非局所補正を 1D（planar/cylindrical/spherical）の
 電子熱伝導に適用する。設計・変種裁定・導出の全記録は
-`docs/design/snb_nonlocal_1d_20260710.md`（binding）。一次文献: Schurtz, Nicolaï & Busquet,
+社内の設計メモ snb_nonlocal_1d_20260710.md（binding）。一次文献: Schurtz, Nicolaï & Busquet,
 Phys. Plasmas 7, 4238 (2000); Sherlock, Brodrick & Ridgers, Phys. Plasmas 24, 082706 (2017);
 Cao, Moses & Delettrez, Phys. Plasmas 22, 082308 (2015)。
 
@@ -17114,7 +17114,7 @@ outer cap を θ→0 に飽和させ q_SH ごと伝導を窒息させる — 平
 検証: 修正前に決定論的だった 3step abort が t_end 完走に転じ、per-phase overshoot
 検出器（safety.overshoot_fatal=1.0 装備 run）無発火を確認（2026-07-31）。
 
-**検証（VERIFICATION §7.9）**：G1 OFF-bit（GXII FLD golden rel=0 ×6 指標）/ G2 局所極限
+**検証（社内の検証記録 §7.9）**：G1 OFF-bit（GXII FLD golden rel=0 ×6 指標）/ G2 局所極限
 （|R−R_disc|≤5.5e-8 実測 @tol 1e-3、二次法則勾配 1.986、tanh ramp 2 rung が導出曲率 bound 内・
 二次 gain 100.7）/ G3 Epperlein–Short 分散（Tier A 離散解析一致 ≤7.2e-7 @gate 3e-3、
 Tier B Marocchino 2013 OSHUN band）/ G4 保存台帳 ≤7.4e-17 @gate 1e-14（planar/cyl/sph）
@@ -17133,8 +17133,8 @@ ceiling 台帳込み全区間エネルギー閉包 ≤1e-13、guard 実発動の
 モデル（(SNB-H)/(SNB-Q)、ξ_g の厳密 primitive P(β)、群構造 β̂∈[0.1,20] 幾何
 級数・群中心規約、mfp 変種 `geometric_r2`/`original`、iSNB Picard 結合、
 `nonlocal_model` 系 namelist キー）は 1D 設計
-`docs/design/snb_nonlocal_1d_20260710.md`（merge 後の §4.4）と同一。本節は
-2D_RZ 離散化の差分のみ（設計正典 `docs/design/2d_snb_port_spec.md`、実装
+社内の設計メモ snb_nonlocal_1d_20260710.md（merge 後の §4.4）と同一。本節は
+2D_RZ 離散化の差分のみ（設計正典 社内の設計メモ 2d_snb_port_spec.md、実装
 `src/hydro/conduction_snb_2d.cu`）。
 
 **離散化（pair-power 形式）** — 2D 伝導の更新は既に対毎の反対称 power
@@ -17171,7 +17171,7 @@ Kershaw 9 点、`symmetric_pair_power`）で書かれており、SNB は同じ�
   （CBET・ホット電子の単一 rank の制限も同じく実行時）。`snb_efield="local"`
   は 2D で ConfigError（fail-closed、1D のみ）。
 
-**検証（VERIFICATION §4.10、実測 2026-07-11）**: G2 z-mode ladder
+**検証（社内の検証記録 §4.10、実測 2026-07-11）**: G2 z-mode ladder
 |R−R_disc| = 5.5e-8/5.3e-9/5.9e-10（1D gate と同値クラス）、slope 1.986、
 集約 tanh-ramp 二乗則 gain 100.3；G3 E-S 分散 Tier A worst ~2.4e-4
 （gate 3e-3、Z∈{1,4}×kλ_ei∈{0.05..0.5}×nz ladder）；G4 保存
@@ -17820,11 +17820,11 @@ block の**固定形状 tree reduction**（atomics 不使用・run 反復 bit �
 契約。march の ray 昇順とは加算順が異なる。staging が 512 MiB を超える
 場合は 8192-ray の逐次バッチで固定順を保存）。
 
-検証（VERIFICATION 参照）: 単体ゲート = 線形 profile の解析 16/15 則・
+検証（社内の検証記録 参照）: 単体ゲート = 線形 profile の解析 16/15 則・
 斜入射 cos⁵(b) 則・転回半径恒等 \(r_t=b/n(r_t)\)・台帳 1e-14・run 反復
 bit 同一（5 case / 133 assertions PASS 2026-08-04）+ 3step フル A/B
 （march 比の吸収・バング・ρ_peak 一致 — 実測値はコミット時点の
-VERIFICATION 記録を正とする）。
+社内の検証記録 記録を正とする）。
 
 #### 5.3.6 1D_SPH の特性曲線積分（`raytrace.integrator="characteristic"`、2026-09-24）
 
@@ -19814,7 +19814,7 @@ uses new headers only for 2D additions.
 `Laser.cbet.geometry_mode="port_section"`（既定 `"legacy"` は §5.10.2 の方位角
 平均経路と bit 恒等）で、§5.10.2 の未解像方位角平均を **実ポート配置の
 sector/section 位相空間写像**に置き換える（設計
-`docs/design/multibeam_1d_superposition_20260727.md` §13、Follett et al.,
+社内の設計メモ multibeam_1d_superposition_20260727.md §13、Follett et al.,
 Phys. Plasmas **32**, 022709 (2025)）。物理ビームは `Laser.port_configuration`
 のポート表（単位方向・roll・power_weight・δλ、正準 port_id 昇順）で与え、
 トレースは単一 prototype ビーム 1 本のみ（`len(beams)==1` を検証で強制）。
@@ -20058,7 +20058,7 @@ snapshot・checkpoint・step の再試行はそれを使う）。host の実装�
 角度分布を持つ。v1 のスカラー key 群は単一 `cone` チャネルの shorthand として
 厳密に後方互換（同一値の `sources=[cone]` deck と出力 bitwise 恒等、両形の
 併用は parse エラー）。設計・文献根拠は
-`docs/design/hote_directional_sources_20260710.md`。
+社内の設計メモ hote_directional_sources_20260710.md。
 
 **捕獲**：各 traced ray はチャネル毎に独立へ最初の上向き
 \(n_e=f_{s,k}n_{crit}\) 交差で capture する。チャネルは host 側で
@@ -20124,7 +20124,7 @@ G3 機構傾向（planar 200-cell slab、\(T_h,\eta,f_s\) を全 leg で固定�
 
 ---
 
-### 5.11.2 2D RZ 輸送（feature/2d-hote：spec docs/design/2d_hote_port_spec.md）
+### 5.11.2 2D RZ 輸送（feature/2d-hote：社内の設計メモ 2d_hote_port_spec.md）
 
 1D モデル（スペクトル・多群レイアウト・阻止能・CSDA marcher・µ-band 角度求積・
 チャネル定義・E_floor・dt リミッタ式）は §5.11 のまま共有し、輸送幾何のみを
@@ -20215,7 +20215,7 @@ G3 機構傾向（planar 200-cell slab、\(T_h,\eta,f_s\) を全 leg で固定�
 `Laser.hot_electron.eta_mode="model"`（既定 `"legacy"`）で、チャネルごとの変換
 効率 η を定数/table の処方から**局所プラズマ条件で駆動される一次緩和 ODE**に
 置き換える（設計文書
-`docs/design/external-ai-responses/20260727-hote-eta-model-advice.md` の
+社内の設計メモ external-ai-responses/20260727-hote-eta-model-advice.md の
 推奨モデル案 1）。`"legacy"` 経路は bit 恒等のまま — model 分岐は解決段
 （host）にのみ入り、capture kernel は不変（η=0 チャネルは
 `one_minus_eta=1.0` で交差記録のみ行う）。1D_SPH 専用・`sources`
@@ -20401,7 +20401,7 @@ C_{v,e} = \rho \left.\frac{\partial e_e}{\partial T_e}\right|_\rho
 \[
 C_{v,e} = \text{cv\_e\_override} \quad [\text{erg}\,\text{cm}^{-3}\,\text{eV}^{-1}]
 \]
-定数値をそのまま使用する。Marshak wave（VERIFICATION §7.2）等の解析解が定数 \(C_v\) を要求する検証ケース向け。
+定数値をそのまま使用する。Marshak wave（社内の検証記録 §7.2）等の解析解が定数 \(C_v\) を要求する検証ケース向け。
 Marshak wave で `eos_T_ref_eV > 0` かつ `cv_e_override > 0` を指定した場合、
 1T の物質 EOS 変換は
 \[
@@ -21854,7 +21854,7 @@ n_b=\min(n_b^\*,\ n_b^{raw})
 > 3. **f_max上限**（§6.1）：\(f_{max} < 1\) とすることで最低限の実効散乱を確保し、
 >    ストリーミング伝搬を部分的に抑制できる（ただしエネルギー保存バイアスに注意）。
 >
-> **検証**：Su-Olson問題（VERIFICATION §7.1）の残差がΔt依存であることを確認し、
+> **検証**：Su-Olson問題（社内の検証記録 §7.1）の残差がΔt依存であることを確認し、
 > Δt半減でMarshal wave front 位置の誤差が \(O(\Delta t)\) で減少することを検証する。
 >
 > **参考文献**：
@@ -21944,7 +21944,7 @@ n_b=\min(n_b^\*,\ n_b^{raw})
 | **合計** | **~2.6 ms** | |
 
 従来の3操作合計 ~7.0 ms/100万粒子に対し **~63% 削減**。
-純IMCベンチマーク（PERFORMANCE P2）でスループット **20–40%** の改善が期待される（セルソート効果）。
+純IMCベンチマーク（社内の性能記録 P2）でスループット **20–40%** の改善が期待される（セルソート効果）。
 
 **実行タイミング**：Radiation演算子の冒頭、ソース粒子投入（§6.2）+ Marshak源投入後、輸送ループ（§6.3）前。
 MPI粒子移動（§12.3）後にも composite sort を再実行する。
@@ -22115,7 +22115,7 @@ cap 非経由のため挙動不変）。放射エネルギー式に
 
 > **fleck_cv_source（2026-07-10 導入；既定フリップ 2026-07-11）**: 本カーネルの \(\beta=4a_{\rm eV}T_e^3/(\rho c_{v,e})\)
 > に入る電子比熱の出所は `Radiation.multigroup_diffusion.fleck_cv_source` で選ぶ。
-> `"table"`（**既定**、2026-07-11 フリップ — 外部AI裁定、docs/design/fleck_cv_default_flip_20260711.md）は
+> `"table"`（**既定**、2026-07-11 フリップ — 外部AI裁定、社内の設計メモ fleck_cv_default_flip_20260711.md）は
 > 電子 EOS テーブル存在時に現在 \(T_e\) の `device_eos_cv`（matter 更新 `update_matter_body` と
 > 同一の cv）を最優先する — Fleck 線形化の \(\beta\) は matter Newton が前進させるエネルギー
 > 関数と同一の \(\partial U_e/\partial T_e\) を要する（Fleck–Cummings 1971 の整合要件）。
@@ -22130,7 +22130,7 @@ cap 非経由のため挙動不変）。放射エネルギー式に
 > \(q=C_{\rm legacy}/C_{\rm table}\) 倍歪む）。率忠実度は 0-D 緩和 gate
 > `verify_fleck_relaxation_0d`（厳密 ODE 参照）が常設検証。フリップの既存 golden への
 > 影響は無し（table-EOS gate 群は deck 内 pin 済み、GXII FLD regression は ideal_gas で
-> knob 不活性 — golden 再生成 bit 同一で実証、VERIFICATION §4.z3）。
+> knob 不活性 — golden 再生成 bit 同一で実証、社内の検証記録 §4.z3）。
 > 冪乗 opacity `power_law`（SPEC §6.4.3）はこの constant 経路と同格に扱われる（eta 構築・
 > Fleck blend とも σ 配列値のみが異なる）。冪乗 EOS `power_law_te` は初期化時 tabulation で
 > table-EOS 経路に乗る（新規離散化なし）。
@@ -22150,7 +22150,7 @@ cap 非経由のため挙動不変）。放射エネルギー式に
 > Planck 平均の吸収係数による群共通の \(f\) を使う（単一材料の表が NLTE カーネルから得る灰色の \(f\) と同じ形。
 > 群ごとの \(f_g\) を使うと、同じ材料でも他の材料の有無で Fleck 因子が変わっていた）。
 >
-> **fleck_beta（2026-07-14 導入；外部裁定 2026-07-15、docs/design/fleck_beta_secant_20260714.md §7-8）**:
+> **fleck_beta（2026-07-14 導入；外部裁定 2026-07-15、社内の設計メモ fleck_beta_secant_20260714.md §7-8）**:
 > β の線形化点は `Radiation.multigroup_diffusion.fleck_beta` で選ぶ。`"tangent"`（**既定**、bit 凍結）
 > = 上式の接線 β。`"secant"`（opt-in、table-EOS セル・1D FLD のみ — 2D fleck kernel は独立実装で
 > tangent 固定）= 灰色弦 \(\beta_{\rm sec}=\Delta B/\Delta U_e\) を 0-D 局所予測子
@@ -22172,7 +22172,7 @@ cap 非経由のため挙動不変）。放射エネルギー式に
 > 注意: 収束後の fleck_cummings step は f(β) を保持するため、Picard 不動点は β 非依存**ではない**
 > （β 選択間の終端差 ~O(h·Δf)、実測 ~1.5e-3 of span @ h~1 は正しい振る舞い）。
 
-> **fleck_form（2026-07-16 導入；設計 docs/design/fleck_exp_source_20260716.md §2 — β_sec 後続裁定 §12 の係数レバー）**:
+> **fleck_form（2026-07-16 導入；社内の設計メモ fleck_exp_source_20260716.md §2 — β_sec 後続裁定 §12 の係数レバー）**:
 > Fleck 因子の時間形状は `Radiation.multigroup_diffusion.fleck_form` で選ぶ。`"be"`（**既定**、bit 凍結）
 > = 標準 backward-Euler 形 \(f=1/(1+z)\)。`"exp_phi1"`（opt-in、1D FLD のみ — persistent path 含む・
 > table EOS 不要）= \(f=\varphi_1(-z)=(1-e^{-z})/z\)（\(z<10^{-6}\) は級数 \(1-z/2+z^2/6\)）。固定輻射
@@ -22187,18 +22187,18 @@ cap 非経由のため挙動不変）。放射エネルギー式に
 > crossover 連続）= ctest "fleck form exp_phi1"。OFF-bit 認証: fleck_form 実装込みバイナリで
 > GXII golden regression・Hammer–Rosen PASS（2026-07-16、既定経路 golden 恒等）。
 
-> **source_integrator（2026-07-16/17 導入 — rung-2、docs/design/fleck_exp_source_20260716.md §3）**:
+> **source_integrator（2026-07-16/17 導入 — rung-2、社内の設計メモ fleck_exp_source_20260716.md §3）**:
 > 1D FLD の物質–輻射ソース積分器を `Radiation.multigroup_diffusion.source_integrator` で選ぶ。
 > `"fleck"`（**既定**、bit 凍結） = 従来のモノリシック半陰的 outer ループ。`"exp_rosenbrock"`
 > （opt-in、灰色 v1・fleck_beta tangent 限定・afi/exp_phi1 非互換・persistent 非対応）= Lie 分割:
 > (1) 凍結係数の厳密直接移送 \(q=h\varphi_1(-(1+\beta)h)(E-aT^4)\) を両側対称適用（E−=q, U_e+=q —
 > 局所保存が構成的に厳密）、(2) 交換項を除いた純拡散陰解（D_face の σ_R は輸送係数として保持）、
-> outer Picard なし。実測（VERIFICATION §7.10 gate (j) + verify_marshak_feature_1d、2026-07-17）:
+> outer Picard なし。実測（社内の検証記録 §7.10 gate (j) + verify_marshak_feature_1d、2026-07-17）:
 > 0-D 一段誤差比 err/err_be = 0.430/0.293/0.186/0.109（8/4/2/1e-15 s、多 step で 2 次収束）、
 > 総エネルギー drift **厳密 0**（fleck 単一パスの 2.1–2.3 倍非保存と対照）、1-D Marshak feature
 > 前線で分割バイアス 0（最細 rung で fleck と同一セル・N=1024 参照 4dx 内、非劣化全 rung）。
 > OFF-bit: exchange_off 配線+ループ再入れ子込みバイナリで GXII golden・HR PASS（既定経路恒等）。
-> **多群（G≤96、2026-07-17 導入 — docs/design/exp_mg_phi1_20260717.md、外部裁定採択）**: 群数の上限 96 はセルごとの
+> **多群（G≤96、2026-07-17 導入 — 社内の設計メモ exp_mg_phi1_20260717.md、外部裁定採択）**: 群数の上限 96 はセルごとの
 > 作業配列の大きさ（`fld_1d_gpu.cu` の `kMaxG`）。builder は `Radiation(...)` の解析時に deck の群数を、2026-09-29 からは
 > 最初の不透明度表が群数を置き換えた後の最終の群数も検査する（それまでは 96 を超える表が解析時の検査をすり抜け、
 > 実行時に全セルの交換が棄却された）。保存超平面上の
@@ -22214,7 +22214,7 @@ cap 非経由のため挙動不変）。放射エネルギー式に
 > \(\Delta E_g\leftarrow\max(\Delta E_g,-E_g)\) にクランプする（ΔU はクランプ後の ΔE から集計 =
 > 構成的保存を厳密維持。根拠: 2026-07-18 生産 A/B smoke で棄却が全て最外殻セル・最高群
 > g≥70・E_g ~ 1e-106〜1e-61 erg/cc の丸め偽負性と実測特定 — 群別判定×セル全体棄却が駆動相の
-> 表面セル交換を飛ばす偏りを除去、docs/design/exp_mg_phi1_20260717.md）。gate (k)（G=4 等 σ・1 step）: **周辺化恒等 |E_tot^{mg}−E_tot^{grey}| ≤ 1.9e-16**
+> 表面セル交換を飛ばす偏りを除去、社内の設計メモ exp_mg_phi1_20260717.md）。gate (k)（G=4 等 σ・1 step）: **周辺化恒等 |E_tot^{mg}−E_tot^{grey}| ≤ 1.9e-16**
 > （等 σ・Σb=1・Σdb/dT=0 で多群凍結系の総和は灰色凍結系へ厳密周辺化 — 別経路計算の 1 ulp 一致が
 > rank-1 機構の判別的認証）・保存 drift 厳密 0・2 次 slope 135×/8×。灰色 G=1 は従来スカラー kernel を
 > bit 不変で維持。
@@ -22306,7 +22306,7 @@ F_{\mathrm{out},f} = {c\over 4}E_{c,g}^{n+1}-F_{\mathrm{inc}}
 Tr(t) 経路が提供する）。
 
 **2D_RZ 決定論 Marshak z 面の時間依存黒体駆動（indirect-drive Tr(t),
-2026-07-11, 設計 docs/design/2d_tr_drive_port_spec.md）** — FLD/SN の
+2026-07-11, 社内の設計メモ 2d_tr_drive_port_spec.md）** — FLD/SN の
 `z_bottom`/`z_top="marshak"` 面は、灰色定常 flux に代えて `Radiation.boundary`
 の Tr 源（定数 `marshak_Tr_eV` / 時間 callable `marshak_Tr` / 面別 dict
 `marshak_Tr_map` — IMC と共有の初期化時凍結テーブル、runtime Python なし）
@@ -22332,7 +22332,7 @@ Tr(t) 経路が提供する）。
   共有のため; 定数/スカラーテーブル源は両面共通で可）。ledger
   `sn_marshak_in_step` は flux×面積×\(\Delta t\) の既存定義のまま正しい。
 
-検証（VERIFICATION §7.10、deck 資産 tmp/tr2d_gate/）: 定数-vs-テーブル-vs-面
+検証（社内の検証記録 §7.10、deck 資産 tmp/tr2d_gate/）: 定数-vs-テーブル-vs-面
 テーブル bit 恒等（FLD grey/MG、SN grey）、flux 等価（FLD rel ≤2e-16 =
 加算順序差のみ、SN は bitwise）、Tr 階段 100→200 eV で per-step
 `marshak_in` 比 16.0000 厳密（両ソルバ同値）、MG/grey ledger 比 1.00000000
@@ -22362,7 +22362,7 @@ F_{out}=h_{eff}\left(E_{0,g}-\theta_g\right),\qquad h_{eff}=\frac{h}{1+h\,d/D_0}
 \(E_{1,g}/(\Delta r\,\sigma_{R,0})\) が約 \(2\times10^{8}\)（cgs）を超えると倍精度の範囲を超えて非有限になり、\(\lambda\) は非有限の
 \(R\) を 0 と読むので拡散極限の 1/3 をとる（\(R_0\) が有限に収まるときは \(\lambda\approx0\) で面はほぼ閉じる）。どちらも係数は
 有限で、脱出の集計は行列と同じ \(h_{eff}\) を使うので保存は保たれる。セル中心の値で閉じる式は光学的に厚い外側セルで 1 次の誤差をもち、Marshak の流入と真空への
-脱出を多く見積もっていた（VERIFICATION §23：外側セルの光学的厚さ 0.78 の平板で、面から入った正味のエネルギーが
+脱出を多く見積もっていた（社内の検証記録 §23：外側セルの光学的厚さ 0.78 の平板で、面から入った正味のエネルギーが
 +18.7 %、真空への脱出が +27 %。新しい式では −4.4 %・+5.5 % で、2 次以上で同じ極限へ収束する）。持続カーネルの
 経路も同じ式を使う。入射駆動は排他的二択: (i) 黒体駆動
 `Radiation.boundary.marshak_Tr_eV` \(>0\) で per-group
@@ -22506,7 +22506,7 @@ Levermore–Pomraning 限流子引数 \(R=|\nabla E|/(\sigma E)\) を**セル中
 厳密一致 \(\mathrm{harm}(c/3\sigma_L, c/3\sigma_R)\equiv c/(3\bar\sigma)\)
 のため変化は前線・急勾配領域のみ。自由流極限キャップは構成上厳密
 \(|F|\le cE_{face}\)。GXII golden は前駆加熱の物理変化として再基準化
-（ρ_peak 74→50 g/cc 等、VERIFICATION §10.1）。2D_RZ FLD は同型パターン
+（ρ_peak 74→50 g/cc 等、社内の検証記録 §10.1）。2D_RZ FLD は同型パターン
 （cell 中心 λ + 調和平均）— 2D セッションへ引き継ぎ。
 
 
@@ -22661,7 +22661,7 @@ R=P^T 厳密、Galerkin RAP 厳密、最粗 nr=1 厳密解、per-apply 固定線
 z-line SPD anchor、assembled-G2 leg。(iii) tol ladder（i4b 300-step / capsule
 3000-step、cg_inner_tol 1e-4..1e-10、U_lin ≤ 0.1 ΔQ_accept）。CG 費用が非支配の
 regime（i4a marshak 級）では RGmg の wall 利得は無い（2026-07-10 実測、中立）。
-詳細: docs/design/rgmg_verification_battery_20260711.md、VERIFICATION §9.5.6。
+詳細: 社内の設計メモ rgmg_verification_battery_20260711.md、社内の検証記録 §9.5.6。
 
 As of L1b-2 the captured block also covers the z-line and RGMG preconditioner applications (stream-parameterized variants; capture failure still latches the eager loop, and the graph key bakes in every preconditioner buffer pointer so any hierarchy reallocation forces recapture).
 
@@ -22731,7 +22731,7 @@ Newton には入れない。
 > 2026-09-14: 2D_RZ の物質 Newton も同じ \(\sigma^{PE}\) 混同を持っていたため同時に \(\sigma^{PA}\) へ統一
 > （2D の `rad_emit` 記帳は元から assembly の source と同じ \(\sigma^{PA}\) だった）。
 
-> **W-I AFI モード（2026-07-03）**: `Radiation.multigroup_diffusion.fleck_mode="afi"` は Fleck ブレンドを消費点（assembly の擬似散乱項 + 物質側ブレンド）で無効化し、outer 反復（Picard）が完全陰的 emission \(c\sigma B(T^{n+1})\) を収束させる。Larsen, Kumar & Morel (JCP 238, 2013) により AFI 離散化は任意 \(\Delta t\) で一意解・最大原理・平衡拡散極限を満たす。実測（GXII FLD nr200）: Fleck 既定は生産 \(\Delta t\)（コロナ z≈3）で吸収エネルギーを z→0 極限比 ~35% 抑制し dt 依存が全 metric を汚染、AFI は生産 dt で極限の数%以内（dt×4 でも残差数%）。コロナの Picard 縮小率 ~z/(1+z)≈0.75 のため `max_outer_iterations >= 40` 推奨（未収束は rate-limited warning が出る）。既定は従来 `"fleck_cummings"`（golden 影響なし）。**既定は Fleck を維持（ユーザー決定 2026-07-04）** — AFI は namelist opt-in の検証・測定モードとして存続し、GXII golden の再基準化は行わない。dt 感度の定量（Fleck ~25% vs AFI 4.1%）は VERIFICATION §10.1 に記録済み。
+> **W-I AFI モード（2026-07-03）**: `Radiation.multigroup_diffusion.fleck_mode="afi"` は Fleck ブレンドを消費点（assembly の擬似散乱項 + 物質側ブレンド）で無効化し、outer 反復（Picard）が完全陰的 emission \(c\sigma B(T^{n+1})\) を収束させる。Larsen, Kumar & Morel (JCP 238, 2013) により AFI 離散化は任意 \(\Delta t\) で一意解・最大原理・平衡拡散極限を満たす。実測（GXII FLD nr200）: Fleck 既定は生産 \(\Delta t\)（コロナ z≈3）で吸収エネルギーを z→0 極限比 ~35% 抑制し dt 依存が全 metric を汚染、AFI は生産 dt で極限の数%以内（dt×4 でも残差数%）。コロナの Picard 縮小率 ~z/(1+z)≈0.75 のため `max_outer_iterations >= 40` 推奨（未収束は rate-limited warning が出る）。既定は従来 `"fleck_cummings"`（golden 影響なし）。**既定は Fleck を維持（ユーザー決定 2026-07-04）** — AFI は namelist opt-in の検証・測定モードとして存続し、GXII golden の再基準化は行わない。dt 感度の定量（Fleck ~25% vs AFI 4.1%）は 社内の検証記録 §10.1 に記録済み。
 
 `Radiation.multigroup_diffusion.hydro_coupling` の既定は `"gamma_r_43"`（1D の FLD）。`"none"` は frozen-density historic behavior への
 明示 opt-out。`"gamma_r_43"` は 1D deterministic FLD の Lagrangian hydro half step ごとに、
@@ -23593,7 +23593,7 @@ mismatch.
 ##### 2026-07-15 gate revision — Richardson \(D_\infty^{fit}\) retired to diagnostic; fine-pair peak-gap contraction gate (gate8b)
 
 A two-bisect root-cause investigation of the 2026-07 gate8 failure
-(campaign ledger `docs/design/2d_campaign_plan_20260708.md`, exec-records
+(campaign ledger the internal design note 2d_campaign_plan_20260708.md, exec-records
 16–21) found that the strict \(D_\infty^{fit}\) window above is not an
 asymptotic estimate on this ladder: adjacent-pair fits of the same
 rational model disagree by more than a factor of two in every measured era
@@ -23735,7 +23735,7 @@ and does not feed back into the FLD solve or material update.
 #### 6.7.4 §I2-aux Phase B: 1D_SPH FLD-CED Multigroup Grey-Collapse Limit
 
 > **SUPERSEDED (2026-07-04 adjudication, Q7 of
-> `docs/design/i2_mgfld_collapse_spec.md` v3.1).** The 1D_SPH aux gate
+> the internal design note i2_mgfld_collapse_spec.md v3.1).** The 1D_SPH aux gate
 > specified below was never implemented (no deck/harness/ctest was ever
 > committed on any branch). Its verification intent is covered by (a) the
 > 1D solver-level multigroup gates `fld_1d_mg_planar_marshak_spectrum` /
@@ -23849,7 +23849,7 @@ unit-system change is introduced.
 #### 6.7.5 §I2 2D RZ multigroup FLD grey-collapse production gate
 
 Object `I2_2D_RZ_MULTIGROUP_FLD_GREY_COLLAPSE` (roadmap §10 row; design spec
-`docs/design/i2_mgfld_collapse_spec.md` v3.1, adjudicated 2026-07-04).
+the internal design note i2_mgfld_collapse_spec.md v3.1, adjudicated 2026-07-04).
 Grey is the \(N_g=1\) operation of the same multigroup kernels (no separate
 grey path; dispatch branches on dimension only), so the collapse comparison
 verifies the group-partition machinery — b_g weights (renormalized
@@ -23939,7 +23939,7 @@ PENDING — see roadmap §10 carry-over registry row
 
 #### 6.7.7 §I4 2D RZ multi-material radiation-interface production gate
 
-Design record: `docs/design/i4_mm_rad_interface_spec.md` (A1–A5 + Addenda).
+Design record: the internal design note i4_mm_rad_interface_spec.md (A1–A5 + Addenda).
 
 **Per-material opacity (G-1, frozen convention A1).** The shared radiation
 opacity path fills per-cell effective opacities from the material mixture:
@@ -24132,7 +24132,7 @@ reduced branch and as the direct full-system residual on the full branch.
 #### 6.7.9 §I6 2D RZ multigroup S_N grey-collapse production gate
 
 Registry row `I6_2D_RZ_MULTIGROUP_SN_GREY_COLLAPSE` (roadmap §10). Design spec:
-`docs/design/i6_sn_mg_collapse_spec.md` (grounding facts F1-F15 + Addenda 1-2).
+the internal design note i6_sn_mg_collapse_spec.md (grounding facts F1-F15 + Addenda 1-2).
 
 **Object.** Grey \(S_N\) is \(N_g=1\) of the same multigroup kernels (single dispatch,
 no grey-specific branch; `sn_transport_2d_gpu.cu` threads `n_groups` end-to-end with the
@@ -24179,7 +24179,7 @@ G2-cert queued for the batched campaign** (registry row stays PARTIAL until then
 
 #### 6.7.10 §I7 2D RZ coupled-stack ICF baseline production gate
 
-Design record: `docs/design/i7a_coupled_stack_spec.md` (F1–F6 + Addenda 1–3).
+Design record: the internal design note i7a_coupled_stack_spec.md (F1–F6 + Addenda 1–3).
 
 **I7a (planar laser-ablation coupled stack).** Deck
 `i7a_coupled_stack_2d_rz_slab.py`: axis disk (r_min=0, on-axis raytrace_3d beam —
@@ -25485,7 +25485,7 @@ v1.0既定（\(\sigma_{s,phys}=0\)）では \(\omega_{i,g} = 1-f_i\)。
 1. **散乱比閾値**：\(\omega_{i,g} \ge \omega_{DDMC}\)（既定 \(\omega_{DDMC}=0.9\)）
 2. **光学厚閾値**：\(\tau_{i,g} \ge \tau_{DDMC}\)（既定 \(\tau_{DDMC}=4.0\)）
 
-> VERIFICATION.md §8-§9 の検証テストでは τ_DDMC = 3.0 を使用する場合がある（全セルDDMCモードを確実にするためのテスト設計上の選択）。
+> 社内の検証記録 §8-§9 の検証テストでは τ_DDMC = 3.0 を使用する場合がある（全セルDDMCモードを確実にするためのテスト設計上の選択）。
 
 3. **M‑matrix条件**（7.3.3）を満たす
 4. **IMC→DDMC変換確率制約**（7.7.1, 7.7.3）を満たす（\(0 \le \hat{P}(\mu) \le 1\)；v1.0既定の \(\hat{P}\) では条件1により概ね充足されるが、\(\tau \approx \tau_{DDMC}\) の境界領域では §7.7.3 の安全策（クランプ/フォールバック）が必要）
@@ -27245,7 +27245,7 @@ DDMC粒子がIMCセルへリークしたとき：
 > **注**：DDMC→IMCのリーク面で同時にleft-leakageイベントが起きたDDMC粒子は
 > IMC側へ等方的に返される（Densmore 2007 §3.2末尾）。
 
-> 検証で cosine vs half‑range の感度を確認する（VERIFICATION §9.2）。
+> 検証で cosine vs half‑range の感度を確認する（社内の検証記録 §9.2）。
 
 #### 7.7.3 Emissivity保存補正 \(\hat{P}\)（v1.0既定）
 
@@ -27585,7 +27585,7 @@ N_{p,f} = \text{round}\!\left(N_{marshak\_total} \times \frac{A_f}{\sum_f A_f}\r
 - 面上の位置：面上で一様ランダム（1 RNG draw for face-local coordinate）
 - 方向：cos-weighted half-space（2 RNG draws、NUMERICS §6.2）
 
-> **注意**：Marshak BCはMarshak wave検証問題（VERIFICATION §7.2）で使用される。
+> **注意**：Marshak BCはMarshak wave検証問題（社内の検証記録 §7.2）で使用される。
 > 本番ICFシミュレーションでは通常 vacuum BC を使用する。
 
 ### 8.3 レーザー
@@ -28083,7 +28083,7 @@ E_{emit} + E_{census}^{n} = E_{abs} + E_{esc} + E_{census}^{n+1} + E_{numerical\
 - \(E_{numerical\_loss}\)：移送失敗（R8 MAX\_EVENTS 超過）・退化セル未注入（U1 `ρV < 10^{-30}`）・粒子喪失（P6）等による数値的喪失。**注**: Russian roulette（R8 step 7 / R12）で消滅した粒子のエネルギーは `rad_dep` に沈着され \(E_{abs}\) に含まれるため、\(E_{numerical\_loss}\) には計上しない
 
 放射サブシステム保存誤差：\(\varepsilon_{rad} = |LHS - RHS| / \max(E_{emit} + E_{census}^{n},\, 10^{-20})\)。
-各ステップで \(\varepsilon_{rad}\) を history に記録し、VERIFICATION §2.3 の閾値（1ステップ \(10^{-6}\)）を適用する。
+各ステップで \(\varepsilon_{rad}\) を history に記録し、社内の検証記録 §2.3 の閾値（1ステップ \(10^{-6}\)）を適用する。
 
 **rad_dep と deposited_power の変換規約**：
 内部タリー量 `rad_dep[i,g]` は **当該ステップ \(\Delta t\) 中に群 g でセル i が受け取った放射交換エネルギー [erg]** である。
@@ -28997,7 +28997,7 @@ PartitionInfo:
 #### 12.1.4a Option C 実装レイアウト（v1 正規、M18 実装 2026-07）
 
 v1 実装は上記のローカル圧縮配列ではなく **Option C（global-size 配列）** を採用する
-（設計記録: docs/design/mpi_m18_20_20260717.md）。本項が §12.1.4 のローカル配列
+（設計記録: 社内の設計メモ mpi_m18_20_20260717.md）。本項が §12.1.4 のローカル配列
 記述に優先する。
 
 - **全 rank が global サイズの配列を保持**する。セルは flat 添字 \(c = i\,n_z + j\)
@@ -29400,7 +29400,7 @@ v1.0（`laser_parallel.strategy="replicated"`）では、沈着写像も次元�
 #### 12.5.0 v1 実装正規（Option C、M18 実装 2026-07）
 
 以下が実装された正規プロトコルであり、後続の各小節の M18 前設計記述に優先する
-（実装詳細・測定は docs/design/mpi_m18_20_20260717.md §6g–§6n）：
+（実装詳細・測定は 社内の設計メモ mpi_m18_20_20260717.md §6g–§6n）：
 
 - **Hydro 2D（コーナー力）**: 力の producer/scatter は ghost 含み窓（fw）で
   全 rank が両側寄与を積む（コーナー力専用 MPI 交換なし）。前提となる ghost
@@ -29683,11 +29683,11 @@ v1.0では**静的分割**を既定とする。
 ### 12.7 再現性（Reproducibility）
 
 現行の決定論経路（FLD/\(S_N\) の輻射、流体、伝導、1D Lagrangian）は、同一 GPU・同一構成で run-to-run の bitwise 一致を
-検証 gate で確認する（既知の例外は VERIFICATION の noise-band gate：1D の一部の host 集計の台帳 ~1e-15、2D_RZ の atomicAdd 順序の LSB）。
+検証 gate で確認する（既知の例外は 社内の検証記録 の noise-band gate：1D の一部の host 集計の台帳 ~1e-15、2D_RZ の atomicAdd 順序の LSB）。
 モンテカルロの要素は燃焼の α 粒子輸送（`Burn.scheme="mc"`、§14.9、既定 OFF）だけで、これは統計的再現を求める。
 
 退役したモンテカルロ輻射（IMC/DDMC）は Persistent Warp の非決定性と atomicAdd 順序のため bitwise 一致を保証せず、
-統計的一致（VERIFICATION §16.8 の CV ≤ 0.1% 基準）を要求していた。§12.7.1〜§12.7.2 の光子粒子の RNG 分割と粒子順序は
+統計的一致（社内の検証記録 §16.8 の CV ≤ 0.1% 基準）を要求していた。§12.7.1〜§12.7.2 の光子粒子の RNG 分割と粒子順序は
 その設計記録（コードは 2026-09-29 にビルドから外し `retired/radiation_monte_carlo/` に保管）。燃焼の α 粒子は `curand_init(Main.seed ^ global_id, step, 0, &state)` で初期化し、`global_id` はセル・スロット・
 標本の番号から作る（`burn/mc_transport.cu` の `mc_transport_global_id`）。`Main.max_steps` の上限 \(2^{24}-1\) は下の光子粒子の
 `global_id` の構成（\(\text{step}\times 2^{40}\) が uint64 に収まる）に由来し、そのまま残している。
@@ -29971,7 +29971,7 @@ window.
   abort が必然だった。
 - **終端 takeover の廃止**: 2D メッシュを凍結して core1d tail へ移譲する
   終端吸収機構は廃止された
-  (`docs/design/terminal_takeover_removal_20260827.md`)。
+  (社内の設計メモ terminal_takeover_removal_20260827.md)。
 
 ### 13.5 remap 質量閉包ゲート
 - 全 CSR remap は総質量閉包 (Σm_post−Σm_pre)/Σm_pre を無条件計測する
@@ -30003,7 +30003,7 @@ window.
 （merge train 註 2026-07-18: 統合実施 — 本 §14 採番を採用し、1d 側 §13 と内容照合の上で一本化済み。）
 
 `Burn.enabled=True`（既定 False、SPECIFICATION §6.4.11）で有効化。設計の一次記録は
-`docs/design/burn_kernel_1d_v1_design_20260710.md`（W0–W5 の測定・裁定履歴込み）。
+社内の設計メモ burn_kernel_1d_v1_design_20260710.md（W0–W5 の測定・裁定履歴込み）。
 実装は `src/burn/`（reactivity / network / deposition / partition / burn_stage）＋
 `coupling/driver.cpp` の burn callback。既定 OFF は bit 恒等（§14.6）。
 
@@ -30035,7 +30035,7 @@ ICF 燃焼域は Γ_e~0.01-0.14 の弱結合で A4 枝が operative）。両モ�
 （DT で √2 — 電子遮蔽の有無の設計差、ゲートはこの関係を検証する）。混合モーメント
 ⟨Z⟩,⟨Z²⟩ はセルの burn 種在庫（ash 込み）から。ICF 帯の大きさ:
 F_CD = 1.002 (10 g/cc, 3 keV) 〜 1.08 (10³ g/cc, 1 keV)。設計・凍結参照値は
-`docs/design/burn_kernel_v2_20260710.md` §B。
+社内の設計メモ burn_kernel_v2_20260710.md §B。
 
 > **ガード（2026-07-26）**: 遮蔽は非正または NaN の入力（T_i, T_e, n_e）では全反応 F=1 に落とす（警告なし — 入口の
 > 判定で遮蔽の計算そのものを飛ばす）。+∞ の入力は Salpeter の中で F=1 に落として one-shot WARNING。指数は
@@ -30256,12 +30256,12 @@ fraley 0.968 / mc 0.928 / diffusion 0.722 — mc（参照級）に対し fraley 
 その解析近似（+4%）、diffusion は Milne 逃逸+スペクトル拡散で低め、と
 物理的序列どおり。mc と diffusion の値は 2026-09-23 の変更（電子とのエネルギー緩和時間の係数 8、セル自身のイオン組成での
 減速）の前のもので、変更後は測り直していない（§14.7 の帯と同じ）。CV gate: 同 seed 5 run CV ≤ 1e-3（§0.3 文言。2026-09-24 以降はビット一致）
-+ 異 seed 5 run CV ≤ 5%（統計収束、1/√N 傾向は PERFORMANCE 記帳）。
++ 異 seed 5 run CV ≤ 5%（統計収束、1/√N 傾向は 社内の性能記録 記帳）。
 
 ### 14.10 2D_RZ port（scheme="local"|"diffusion"、2026-07-11）
 
 \`Main.dimension="2D_RZ"\` で Burn.enabled=True が有効（設計記録は
-\`docs/design/2d_burn_port_spec.md\`、実装は src/burn/burn_stage_2d +
+社内の設計メモ 2d_burn_port_spec.md、実装は src/burn/burn_stage_2d +
 corman_diffusion_2d + driver 2D 配線）。1D との差分のみ記す：
 
 - **scheme 行列**: 2D は \`"local"\`（全量出生セル沈着、LP/fraley 分配）と
@@ -30309,7 +30309,7 @@ corman_diffusion_2d + driver 2D 配線）。1D との差分のみ記す：
 
 `Burn.neutron_heating=True`（既定 False）で、DT-n（14.049 MeV）と DD-n（2.449 MeV）の 2 本の中性子線について、1 回の飛行の
 最初の衝突だけを扱う加熱を加える（host `deposit_neutron_heating_1d`、GPU のステージは `neutron_heating_device.cuh`）。凍結した
-断面積と設計の記録は `docs/design/burn_kernel_v2_20260710.md` §E。
+断面積と設計の記録は 社内の設計メモ burn_kernel_v2_20260710.md §E。
 
 - **放出**：各セル・各線で、そのステップの反応が生んだ中性子のエネルギー \(E^{emit}_{c,l}\)（反応率 × 線のエネルギー × \(V\Delta t\)）を
   セル中心の半径 \(r_0\) から等方に出す。方向は \(\mu\in[-1,1]\) の偶数次 Gauss–Legendre 求積（`neutron_heating_n_mu`、既定 16、
@@ -30327,9 +30327,9 @@ corman_diffusion_2d + driver 2D 配線）。1D との差分のみ記す：
 
 ## 15. ReALE v2: exact tessellation, conservative overlay remap, and the persistent boundary carrier
 
-Design canon: `docs/design/amm_reale_plan_20260806.md` (program),
-`docs/design/tessellator_core_contract_20260808.md` (exact core),
-`docs/design/boundary_carrier_c1_20260810.md` (carrier; consult-29 adoption A229).
+Design canon: the internal design note amm_reale_plan_20260806.md (program),
+the internal design note tessellator_core_contract_20260808.md (exact core),
+the internal design note boundary_carrier_c1_20260810.md (carrier; consult-29 adoption A229).
 Ledger of record: `tmp/ale_p2_briefs/killer_p2b_verdict.md` (A199-A270).
 Design rule (a user ruling): thresholds are machine-epsilon-derived bounds or
 absolute predicates, not tunables. The current code does not meet the rule
@@ -30395,7 +30395,7 @@ Lloyd iterations).
   + 8 scratch slots): measured nvcc misallocation of many live 520-byte
   aggregate locals in the fully-inlined kernel (distinct expansions sharing one
   local slot; correct under `-G` only) forbids compiler-managed FixedExp
-  locals — see `docs/design/t2gpu_port_design_20260815.md`.
+  locals — see the internal design note t2gpu_port_design_20260815.md.
 - Determinism: pure per-triangle map, no atomics, fixed-stride writes;
   host-side consumption is order-identical to the host path. Buffers come from
   the persistent device/pinned scratch pools (no per-call cudaMalloc).
@@ -30692,7 +30692,7 @@ The `reale_v2` rezone fires on need, not cadence: at step \(n\) it runs when (a)
 
 The target builder's Lloyd/CVT refinement is likewise need-based: the loop (ceiling kLloydMax = 4) exits early when every proposed site move is below that site's own coordinate representation-spacing scale \(\delta_i=\mathrm{ulp}(|r_i|)+\mathrm{ulp}(|z_i|)\) — the same derived representation-spacing family as the weld's \(\delta_e\) — since such an iteration polishes below the floating-point noise floor of the stored coordinates while paying a full tessellation. The exit is evaluated before the proposal's tessellation is built, and the iteration ceiling is unchanged.
 
-The primary exit ahead of that floor is the d1 certified predicate-margin skip (`certify_lloyd_noop`, `src/mesh/tessellation/lloyd_skip.cpp`; derivation in `docs/design/t2_d1_certified_lloyd_skip_20260815.md`): before tessellating a proposal, every certificate of the current warm Delaunay triangulation — triangle orientations, interior-edge incircle tests, and hull convexity triples — is checked in pure double arithmetic for a positive filtered slack \(s=|\tilde D|-E\) (the sos_policy Shewchuk A-bounds with their 2x contraction safety) against an interval-propagated bound \(\Delta_D\) on the determinant's change under the proposed per-site displacements (product rule \(\Delta_{xy}\le U_x\Delta_y+U_y\Delta_x\) mirrored over the predicate's own expression tree); the certificate fires only when \(2\Delta_D\le s\) for every predicate, which proves no exact predicate sign can flip along the whole displacement path and hence that the proposal's Delaunay topology equals the current one — the iteration is structurally a no-op and the loop breaks without adopting it, exactly the d2 break action. The d2 floor remains as the fallback when d1 refuses (degenerate slack on exactly-cocircular or collinear sub-configurations, mismatched warm base, or the `TENRYU_LLOYD_D1_DISABLE` off-switch). Conservativeness only reduces skips, so correctness is unconditional; the certified skip matters in a measured regime the floor cannot serve: relaxed configurations whose Lloyd feedback limit-cycles at a total move near \(10^{-14}\) — above the representation floor, so d2 never fires — while the certified margin (typically \(10^{-6}\)-\(10^{-4}\) of the local spacing) fires immediately and stops the loop from paying its full four tessellations every rezone. Fires log one `[lloyd_d1]` line and are exposed as `lloyd_d1_fired`/`lloyd_d1_iteration` in the target result; no tunables are introduced.
+The primary exit ahead of that floor is the d1 certified predicate-margin skip (`certify_lloyd_noop`, `src/mesh/tessellation/lloyd_skip.cpp`; derivation in the internal design note t2_d1_certified_lloyd_skip_20260815.md): before tessellating a proposal, every certificate of the current warm Delaunay triangulation — triangle orientations, interior-edge incircle tests, and hull convexity triples — is checked in pure double arithmetic for a positive filtered slack \(s=|\tilde D|-E\) (the sos_policy Shewchuk A-bounds with their 2x contraction safety) against an interval-propagated bound \(\Delta_D\) on the determinant's change under the proposed per-site displacements (product rule \(\Delta_{xy}\le U_x\Delta_y+U_y\Delta_x\) mirrored over the predicate's own expression tree); the certificate fires only when \(2\Delta_D\le s\) for every predicate, which proves no exact predicate sign can flip along the whole displacement path and hence that the proposal's Delaunay topology equals the current one — the iteration is structurally a no-op and the loop breaks without adopting it, exactly the d2 break action. The d2 floor remains as the fallback when d1 refuses (degenerate slack on exactly-cocircular or collinear sub-configurations, mismatched warm base, or the `TENRYU_LLOYD_D1_DISABLE` off-switch). Conservativeness only reduces skips, so correctness is unconditional; the certified skip matters in a measured regime the floor cannot serve: relaxed configurations whose Lloyd feedback limit-cycles at a total move near \(10^{-14}\) — above the representation floor, so d2 never fires — while the certified margin (typically \(10^{-6}\)-\(10^{-4}\) of the local spacing) fires immediately and stops the loop from paying its full four tessellations every rezone. Fires log one `[lloyd_d1]` line and are exposed as `lloyd_d1_fired`/`lloyd_d1_iteration` in the target result; no tunables are introduced.
 
 After each committed rezone the dt controller may re-anchor the growth ladder once, upward only: the first post-commit chosen dt is raised to the minimum of all non-growth bounds and the last pre-spike chosen dt (the most recent chosen dt whose limiter was not the hydro bound). A spike edge that the rezone has removed is not a persistent constraint, so the ladder's memory of it is stale by construction; the pre-spike ceiling makes the trigger/re-anchor pair converge to the pre-spike operating point rather than oscillate, and a genuinely degraded mesh (hydro bound still low) keeps full ladder protection because the raise is bounded by the current hydro term. The lineage limiter records `rezone_reanchor` when the raise applies.
 

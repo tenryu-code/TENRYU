@@ -49,7 +49,7 @@ constexpr double kTwoSqrtTwo = 2.8284271247461902909;  // 2*sqrt(2)
 constexpr double kBetaMin = 0.1;  // first interior reduced-energy edge (design §3.2)
 
 // Internal solver constants (documented in the design doc, NOT namelist knobs;
-// spec docs/design/2d_snb_port_spec.md §3.3 / §8.8).
+// the internal design note 2d_snb_port_spec.md §3.3 / §8.8).
 constexpr double kSnbCgRtol = 1.0e-10;
 constexpr int kSnbCgMaxIters = 1000;
 

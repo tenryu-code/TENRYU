@@ -3,7 +3,7 @@
 （merge train 註 2026-07-18: 統合実施 — 本 §14 採番を採用し、1d 側 §13 と内容照合の上で一本化済み。）
 
 `Burn.enabled=True`（既定 False、SPECIFICATION §6.4.11）で有効化。設計の一次記録は
-`docs/design/burn_kernel_1d_v1_design_20260710.md`（W0–W5 の測定・裁定履歴込み）。
+社内の設計メモ burn_kernel_1d_v1_design_20260710.md（W0–W5 の測定・裁定履歴込み）。
 実装は `src/burn/`（reactivity / network / deposition / partition / burn_stage）＋
 `coupling/driver.cpp` の burn callback。既定 OFF は bit 恒等（§14.6）。
 
@@ -35,7 +35,7 @@ ICF 燃焼域は Γ_e~0.01-0.14 の弱結合で A4 枝が operative）。両モ�
 （DT で √2 — 電子遮蔽の有無の設計差、ゲートはこの関係を検証する）。混合モーメント
 ⟨Z⟩,⟨Z²⟩ はセルの burn 種在庫（ash 込み）から。ICF 帯の大きさ:
 F_CD = 1.002 (10 g/cc, 3 keV) 〜 1.08 (10³ g/cc, 1 keV)。設計・凍結参照値は
-`docs/design/burn_kernel_v2_20260710.md` §B。
+社内の設計メモ burn_kernel_v2_20260710.md §B。
 
 > **ガード（2026-07-26）**: 遮蔽は非正または NaN の入力（T_i, T_e, n_e）では全反応 F=1 に落とす（警告なし — 入口の
 > 判定で遮蔽の計算そのものを飛ばす）。+∞ の入力は Salpeter の中で F=1 に落として one-shot WARNING。指数は
@@ -256,12 +256,12 @@ fraley 0.968 / mc 0.928 / diffusion 0.722 — mc（参照級）に対し fraley 
 その解析近似（+4%）、diffusion は Milne 逃逸+スペクトル拡散で低め、と
 物理的序列どおり。mc と diffusion の値は 2026-09-23 の変更（電子とのエネルギー緩和時間の係数 8、セル自身のイオン組成での
 減速）の前のもので、変更後は測り直していない（§14.7 の帯と同じ）。CV gate: 同 seed 5 run CV ≤ 1e-3（§0.3 文言。2026-09-24 以降はビット一致）
-+ 異 seed 5 run CV ≤ 5%（統計収束、1/√N 傾向は PERFORMANCE 記帳）。
++ 異 seed 5 run CV ≤ 5%（統計収束、1/√N 傾向は 社内の性能記録 記帳）。
 
 ### 14.10 2D_RZ port（scheme="local"|"diffusion"、2026-07-11）
 
 \`Main.dimension="2D_RZ"\` で Burn.enabled=True が有効（設計記録は
-\`docs/design/2d_burn_port_spec.md\`、実装は src/burn/burn_stage_2d +
+社内の設計メモ 2d_burn_port_spec.md、実装は src/burn/burn_stage_2d +
 corman_diffusion_2d + driver 2D 配線）。1D との差分のみ記す：
 
 - **scheme 行列**: 2D は \`"local"\`（全量出生セル沈着、LP/fraley 分配）と
@@ -309,7 +309,7 @@ corman_diffusion_2d + driver 2D 配線）。1D との差分のみ記す：
 
 `Burn.neutron_heating=True`（既定 False）で、DT-n（14.049 MeV）と DD-n（2.449 MeV）の 2 本の中性子線について、1 回の飛行の
 最初の衝突だけを扱う加熱を加える（host `deposit_neutron_heating_1d`、GPU のステージは `neutron_heating_device.cuh`）。凍結した
-断面積と設計の記録は `docs/design/burn_kernel_v2_20260710.md` §E。
+断面積と設計の記録は 社内の設計メモ burn_kernel_v2_20260710.md §E。
 
 - **放出**：各セル・各線で、そのステップの反応が生んだ中性子のエネルギー \(E^{emit}_{c,l}\)（反応率 × 線のエネルギー × \(V\Delta t\)）を
   セル中心の半径 \(r_0\) から等方に出す。方向は \(\mu\in[-1,1]\) の偶数次 Gauss–Legendre 求積（`neutron_heating_n_mu`、既定 16、
@@ -327,9 +327,9 @@ corman_diffusion_2d + driver 2D 配線）。1D との差分のみ記す：
 
 ## 15. ReALE v2: exact tessellation, conservative overlay remap, and the persistent boundary carrier
 
-Design canon: `docs/design/amm_reale_plan_20260806.md` (program),
-`docs/design/tessellator_core_contract_20260808.md` (exact core),
-`docs/design/boundary_carrier_c1_20260810.md` (carrier; consult-29 adoption A229).
+Design canon: the internal design note amm_reale_plan_20260806.md (program),
+the internal design note tessellator_core_contract_20260808.md (exact core),
+the internal design note boundary_carrier_c1_20260810.md (carrier; consult-29 adoption A229).
 Ledger of record: `tmp/ale_p2_briefs/killer_p2b_verdict.md` (A199-A270).
 Design rule (a user ruling): thresholds are machine-epsilon-derived bounds or
 absolute predicates, not tunables. The current code does not meet the rule
@@ -395,7 +395,7 @@ Lloyd iterations).
   + 8 scratch slots): measured nvcc misallocation of many live 520-byte
   aggregate locals in the fully-inlined kernel (distinct expansions sharing one
   local slot; correct under `-G` only) forbids compiler-managed FixedExp
-  locals — see `docs/design/t2gpu_port_design_20260815.md`.
+  locals — see the internal design note t2gpu_port_design_20260815.md.
 - Determinism: pure per-triangle map, no atomics, fixed-stride writes;
   host-side consumption is order-identical to the host path. Buffers come from
   the persistent device/pinned scratch pools (no per-call cudaMalloc).
@@ -692,7 +692,7 @@ The `reale_v2` rezone fires on need, not cadence: at step \(n\) it runs when (a)
 
 The target builder's Lloyd/CVT refinement is likewise need-based: the loop (ceiling kLloydMax = 4) exits early when every proposed site move is below that site's own coordinate representation-spacing scale \(\delta_i=\mathrm{ulp}(|r_i|)+\mathrm{ulp}(|z_i|)\) — the same derived representation-spacing family as the weld's \(\delta_e\) — since such an iteration polishes below the floating-point noise floor of the stored coordinates while paying a full tessellation. The exit is evaluated before the proposal's tessellation is built, and the iteration ceiling is unchanged.
 
-The primary exit ahead of that floor is the d1 certified predicate-margin skip (`certify_lloyd_noop`, `src/mesh/tessellation/lloyd_skip.cpp`; derivation in `docs/design/t2_d1_certified_lloyd_skip_20260815.md`): before tessellating a proposal, every certificate of the current warm Delaunay triangulation — triangle orientations, interior-edge incircle tests, and hull convexity triples — is checked in pure double arithmetic for a positive filtered slack \(s=|\tilde D|-E\) (the sos_policy Shewchuk A-bounds with their 2x contraction safety) against an interval-propagated bound \(\Delta_D\) on the determinant's change under the proposed per-site displacements (product rule \(\Delta_{xy}\le U_x\Delta_y+U_y\Delta_x\) mirrored over the predicate's own expression tree); the certificate fires only when \(2\Delta_D\le s\) for every predicate, which proves no exact predicate sign can flip along the whole displacement path and hence that the proposal's Delaunay topology equals the current one — the iteration is structurally a no-op and the loop breaks without adopting it, exactly the d2 break action. The d2 floor remains as the fallback when d1 refuses (degenerate slack on exactly-cocircular or collinear sub-configurations, mismatched warm base, or the `TENRYU_LLOYD_D1_DISABLE` off-switch). Conservativeness only reduces skips, so correctness is unconditional; the certified skip matters in a measured regime the floor cannot serve: relaxed configurations whose Lloyd feedback limit-cycles at a total move near \(10^{-14}\) — above the representation floor, so d2 never fires — while the certified margin (typically \(10^{-6}\)-\(10^{-4}\) of the local spacing) fires immediately and stops the loop from paying its full four tessellations every rezone. Fires log one `[lloyd_d1]` line and are exposed as `lloyd_d1_fired`/`lloyd_d1_iteration` in the target result; no tunables are introduced.
+The primary exit ahead of that floor is the d1 certified predicate-margin skip (`certify_lloyd_noop`, `src/mesh/tessellation/lloyd_skip.cpp`; derivation in the internal design note t2_d1_certified_lloyd_skip_20260815.md): before tessellating a proposal, every certificate of the current warm Delaunay triangulation — triangle orientations, interior-edge incircle tests, and hull convexity triples — is checked in pure double arithmetic for a positive filtered slack \(s=|\tilde D|-E\) (the sos_policy Shewchuk A-bounds with their 2x contraction safety) against an interval-propagated bound \(\Delta_D\) on the determinant's change under the proposed per-site displacements (product rule \(\Delta_{xy}\le U_x\Delta_y+U_y\Delta_x\) mirrored over the predicate's own expression tree); the certificate fires only when \(2\Delta_D\le s\) for every predicate, which proves no exact predicate sign can flip along the whole displacement path and hence that the proposal's Delaunay topology equals the current one — the iteration is structurally a no-op and the loop breaks without adopting it, exactly the d2 break action. The d2 floor remains as the fallback when d1 refuses (degenerate slack on exactly-cocircular or collinear sub-configurations, mismatched warm base, or the `TENRYU_LLOYD_D1_DISABLE` off-switch). Conservativeness only reduces skips, so correctness is unconditional; the certified skip matters in a measured regime the floor cannot serve: relaxed configurations whose Lloyd feedback limit-cycles at a total move near \(10^{-14}\) — above the representation floor, so d2 never fires — while the certified margin (typically \(10^{-6}\)-\(10^{-4}\) of the local spacing) fires immediately and stops the loop from paying its full four tessellations every rezone. Fires log one `[lloyd_d1]` line and are exposed as `lloyd_d1_fired`/`lloyd_d1_iteration` in the target result; no tunables are introduced.
 
 After each committed rezone the dt controller may re-anchor the growth ladder once, upward only: the first post-commit chosen dt is raised to the minimum of all non-growth bounds and the last pre-spike chosen dt (the most recent chosen dt whose limiter was not the hydro bound). A spike edge that the rezone has removed is not a persistent constraint, so the ladder's memory of it is stale by construction; the pre-spike ceiling makes the trigger/re-anchor pair converge to the pre-spike operating point rather than oscillate, and a genuinely degraded mesh (hydro bound still low) keeps full ladder protection because the raise is bounded by the current hydro term. The lineage limiter records `rezone_reanchor` when the raise applies.
 

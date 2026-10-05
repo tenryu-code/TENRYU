@@ -9,7 +9,7 @@
 
 namespace tenryu::parallel {
 
-// Decomposition layout (Option C, docs/design/mpi_m18_20_20260717.md §3):
+// Decomposition layout (Option C, the internal design note mpi_m18_20_20260717.md §3):
 // every rank allocates and initializes the GLOBAL-size arrays; the rank
 // computes only its owned slab [local_cell_range); ghost cells are the
 // neighbor-owned one-layer strips adjacent to the owned slab, stored at

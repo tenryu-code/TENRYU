@@ -13,7 +13,7 @@
 // route is barred: under nvcc 12.0 -rdc whole-program device linking its
 // cub::DeviceReduce instantiation yields a corrupted kernel image
 // (deterministic SIGTRAP at an undecodable SASS pc; see
-// tmp/repro_pool/ + docs/design/nohdet_cuda13_closure notes).
+// tmp/repro_pool/ + the internal design note nohdet_cuda13_closure notes).
 
 namespace tenryu::core {
 

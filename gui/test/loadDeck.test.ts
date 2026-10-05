@@ -116,12 +116,14 @@ describe("shared file/paste loader",()=>{
     expect(form.deckImport?.rules).toContainEqual(expect.objectContaining({path:["Geometry","rho"],kind:"passthrough"}));
     expect(generateDeck(form)).toContain('math.log(r)');
   },60000);
-  it("uses the chosen cwd and environment, records them, and replays the runtime context",async()=>{
+  // The fixture lives under tests/, which the public beta does not ship.
+  const environmentFixture = path.join(root,"tests/tools/fixtures/deck_import/environment.py");
+  it.skipIf(!fs.existsSync(environmentFixture))("uses the chosen cwd and environment, records them, and replays the runtime context",async()=>{
     const {b} = backend();
     const directory = path.join(tmp,"run directory");
     fs.mkdirSync(directory);
     fs.writeFileSync(path.join(directory,"case.json"),JSON.stringify({t_end:2e-9,rho:1.5,plot_every:7}));
-    const filename = path.join(root,"tests/tools/fixtures/deck_import/environment.py");
+    const filename = environmentFixture;
     const source = fs.readFileSync(filename,"utf8");
     const environment = parseImportEnvironment("TENRYU_IMPORT_CONFIG=case.json\nTENRYU_IMPORT_NAME=chosen");
     await expect(loadDeckText(b,source,filename)).rejects.toThrow(/Traceback/);

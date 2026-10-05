@@ -2,8 +2,8 @@
 
 // W-K: gamma_r = 4/3 radiation-field compression coupling for the 1D
 // Lagrangian step (2026-07-04 external review,
-// docs/design/external-ai-responses/20260704-conduction-kirchhoff-radiation-gammar-verdict.md;
-// design docs/design/wk_gamma_r_coupling_design.md).
+// the internal design note external-ai-responses/20260704-conduction-kirchhoff-radiation-gammar-verdict.md;
+// the internal design note wk_gamma_r_coupling_design.md).
 //
 // Comoving gray zeroth moment with P_r = (E_r/3) I gives
 // DE_r/Dt = -(4/3) E_r div(u), i.e. E_r V^{4/3} = const per Lagrangian

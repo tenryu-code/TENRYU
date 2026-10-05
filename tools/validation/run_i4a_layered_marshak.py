@@ -11,7 +11,7 @@ Tiers:
     profile gates (eps_L2_E, interface flux continuity, mass conservation) over
     k in {3,10,30}. The deck is dt-limiter-bound (dt ~3e-17 s at the driven boundary),
     so cert is POST-CODE-COMPLETION CAMPAIGN tier — do not run it as a dev-time check.
-    See docs/design/i4_mm_rad_interface_spec.md Addendum 5.
+    See the internal design note i4_mm_rad_interface_spec.md Addendum 5.
   cert --tier pre-crossing: pre-interface Tier 2 profile comparison over the
     boundary-trimmed front window.
 """

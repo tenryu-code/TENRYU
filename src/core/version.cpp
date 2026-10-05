@@ -3,7 +3,7 @@
 namespace tenryu::core {
 
 std::string tenryu_version_string() {
-  return "0.0.1";
+  return "1.0.0-beta.1";
 }
 
 int tenryu_version_major() {

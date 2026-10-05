@@ -648,7 +648,7 @@ def gate_bump(runs: dict[str, RunData]) -> bool:
 
 
 def gate_form(runs: dict[str, RunData]) -> bool:
-    # phi_1 form stress gate (design doc docs/design/fleck_exp_source_20260716.md
+    # phi_1 form stress gate (the internal design note fleck_exp_source_20260716.md
     # section 2 W2): same one-step E_rad endpoint metric as gate (f), families
     # tan (fleck_form="be" baseline, reusing the bump_tan legs) vs exp
     # (fleck_form="exp_phi1", tangent beta) — isolates the time-shape form.

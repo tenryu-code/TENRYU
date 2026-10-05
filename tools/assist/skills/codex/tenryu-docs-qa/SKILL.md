@@ -20,9 +20,9 @@ Scope: answer one question about TENRYU — how to build and run it, what a name
 | Time-step control | `docs/site/ja/overview/timestep.html` | `docs/NUMERICS.md` §2.2 |
 | Output files, HDF5 layout, plotting | `docs/site/ja/use/outputs.html`; `docs/OUTPUT_SCHEMA.md`; `docs/POSTPROCESSING.md` | `src/io/` |
 | Studio GUI | `gui/manual/` | `docs/site/ja/use/gui.html` |
-| Verification, golden references | `docs/site/ja/verification/`; `docs/VERIFICATION.md` | `examples/verification/`, `tests/` |
+| Verification, golden references | `docs/site/ja/verification/`; the internal verification record | `examples/verification/`, `tests/` |
 | Example decks | `examples/**/*.py` (listed in the map) | — |
-| What the code does in a given situation | `src/` via grep; cite `file:line` | design notes under `docs/design/` |
+| What the code does in a given situation | `src/` via grep; cite `file:line` | internal design notes (not included in the beta) |
 | Architecture, module map | `docs/site/ja/overview/architecture.html`; `docs/ARCHITECTURE.md` | — |
 
 ## Procedure

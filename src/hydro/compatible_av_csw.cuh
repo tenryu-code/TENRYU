@@ -104,7 +104,7 @@ __host__ __device__ inline bool csw98_median_svec_rz(const double r_a,
 }
 
 // --- C2 side vectors (decision 2026-07-04,
-// docs/design/i1b_csw98_rz_eq16_decision.md): telescoped from the exact
+// the internal design note i1b_csw98_rz_eq16_decision.md): telescoped from the exact
 // revolution-volume corner gradients a_k = dV/dx_k. With
 // b_k = a_k - mean(a), the cyclic system S_{k-1} - S_k = b_k with gauge
 // sum_k S_k = 0 has the unique solution

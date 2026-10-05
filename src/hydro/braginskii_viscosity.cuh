@@ -1,10 +1,10 @@
 #pragma once
 
 // Braginskii plasma shear viscosity for the Lagrangian hydro
-// (docs/design/wh_braginskii_viscosity_design.md; 2D RZ port
-// docs/design/2d_visc_port_spec.md), extended with the electron channel
-// (docs/design/electron_viscosity_1d_20260712.md, ported by
-// docs/design/visc_2d_parity_20260717.md).
+// (the internal design note wh_braginskii_viscosity_design.md; 2D RZ port
+// the internal design note 2d_visc_port_spec.md), extended with the electron channel
+// (the internal design note electron_viscosity_1d_20260712.md, ported by
+// the internal design note visc_2d_parity_20260717.md).
 //
 // Physics: unmagnetized Braginskii viscosity, single-fluid V_e = V_i.
 //   ion:      eta_i = 0.96 n_i kT_i tau_i                (Braginskii Eq. 2.22)
@@ -206,7 +206,7 @@ HistoryDiagnostics compute_history_diagnostics_2d(const core::State& state,
 double compute_dt_braginskii_2d(const core::State& state,
                                 const core::Config& cfg);
 
-// ---- 2D RZ (docs/design/2d_visc_port_spec.md) ----
+// ---- 2D RZ (the internal design note 2d_visc_port_spec.md) ----
 
 // Mesh topology handle for the 2D kernels. Structured tensor-product
 // meshes: set nr/nz and leave the pointers null. Multiblock: set n_cells /

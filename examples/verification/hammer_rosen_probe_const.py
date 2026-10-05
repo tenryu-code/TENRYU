@@ -2,7 +2,7 @@
 # Paper case: J.H. Hammer and M.D. Rosen, Phys. Plasmas 10, 1829 (2003),
 # Eq. 31 material fit with the Fig. 2a radiation-temperature drive; this is
 # the paper's Fig. 2 HYDRA comparison configuration.
-# Design: docs/design/hammer_rosen_supersonic_gate_20260710.md.
+# Design: the internal design note hammer_rosen_supersonic_gate_20260710.md.
 #
 # Ion/electron isolation is by parameter choice, not a qei switch: A=1.0e5 and
 # fixed zbar=1.0 suppress cv_i and the qei rate while leaving the power-law

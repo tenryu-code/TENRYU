@@ -1,8 +1,8 @@
-# MPI rank-count agreement gate deck (VERIFICATION §16.2 class, M18 W2).
+# MPI rank-count agreement gate deck (the internal verification record §16.2 class, M18 W2).
 # 1D spherical Sedov-type blast, hydro-only, deterministic: owned-slab dumps
 # from P=1 and P>1 runs must agree BITWISE
 # (tools/validation/compare_owned_dump.py; design doc
-# docs/design/mpi_m18_20_20260717.md §5.4).
+# the internal design note mpi_m18_20_20260717.md §5.4).
 
 from tenryu_namelist import *
 

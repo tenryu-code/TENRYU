@@ -976,7 +976,7 @@ bool run_nlte_sanity_verify() {
   const double rel =
       std::abs(delta_U + expected_emit) / std::max(std::abs(expected_emit), 1.0e-30);
   // NLTE sanity: analytical rel ~O(1e-7) due to Monte Carlo noise.
-  // Tightened from 1e-4 (original) to 1e-6 (VERIFICATION §5.4 target 1e-12
+  // Tightened from 1e-4 (original) to 1e-6 (the internal verification record §5.4 target 1e-12
   // not achievable without increasing particle count).
   constexpr double kRelTol = 1.0e-6;
   constexpr double kAnalyticRelTol = 5.0e-2;
@@ -1157,7 +1157,7 @@ bool run_nlte_lte_regression_verify() {
     }
   }
 
-  // VERIFICATION §5.4.2: NLTE-vs-LTE profile agreement tolerance (1%).
+  // the internal verification record §5.4.2: NLTE-vs-LTE profile agreement tolerance (1%).
   constexpr double kL2RelTol = 1.0e-2;
   // Coefficient-level LTE regression tolerance for Fleck and sigma_a_eff.
   constexpr double kCoeffRelTol = 5.0e-2;
@@ -1232,7 +1232,7 @@ bool run_nlte_cooling_mms_verify() {
                      cfg.numerics.floors.Te);
   }
   const double rel = std::abs(T_sim - T_ref) / std::max(std::abs(T_ref), 1.0e-30);
-  // VERIFICATION §5.4.3: one-zone Jayenne cooling relative-temperature tolerance.
+  // the internal verification record §5.4.3: one-zone Jayenne cooling relative-temperature tolerance.
   constexpr double kRelTol = 2.0e-2;
   const bool pass = (rel <= kRelTol);
 
@@ -1598,7 +1598,7 @@ bool run_nlte_energy_conservation_verify() {
   const auto coarse = run_case(dt, n_steps);
   const auto fine = run_case(0.5 * dt, n_steps * 2);
 
-  // VERIFICATION §2.3 / §5.4.6: Monte Carlo per-step energy conservation threshold.
+  // the internal verification record §2.3 / §5.4.6: Monte Carlo per-step energy conservation threshold.
   constexpr double kStepEnergyRelTol = 1.0e-6;
   constexpr double kGroupBalanceRelTol = 5.0e-2;
   constexpr double kCumulativeDriftRelTol = 1.0e-3;
@@ -1701,9 +1701,9 @@ bool run_nlte_group_resample_verify() {
     chi2 += diff * diff / std::max(exp, 1.0);
   }
 
-  // VERIFICATION §5.4.7: require enough samples for chi-square goodness-of-fit.
+  // the internal verification record §5.4.7: require enough samples for chi-square goodness-of-fit.
   constexpr int kMinSamples = 200;
-  // VERIFICATION §5.4.7: use significance level p=0.01 for chi-square rejection.
+  // the internal verification record §5.4.7: use significance level p=0.01 for chi-square rejection.
   const int dof = cfg.radiation.groups - 1;
   const double chi2_crit = chi_square_critical_p01(dof);
   const bool pass_counts = (pool.n_alive > kMinSamples);
@@ -1748,12 +1748,12 @@ bool run_imc_ddmc_hybrid_verify() {
 
   const bool pass_modes = (result.ddmc_count > 0) &&
                           (result.ddmc_count < cfg.mesh.nr);
-  // VERIFICATION §9.1: interface continuity check for mixed IMC/DDMC layer.
+  // the internal verification record §9.1: interface continuity check for mixed IMC/DDMC layer.
   constexpr double kInterfaceJumpTol = 1.0;
   const bool pass_interface = result.rad_profile[14] > 0.0 &&
                               result.rad_profile[15] > 0.0 &&
                               right_jump <= kInterfaceJumpTol;
-  // VERIFICATION §9.1 / §2.3: Monte Carlo cumulative energy tolerance (0.1%).
+  // the internal verification record §9.1 / §2.3: Monte Carlo cumulative energy tolerance (0.1%).
   constexpr double kEnergyRelTol = 1.0e-3;
   const bool pass_energy = (result.conservation_rel <= kEnergyRelTol);
   const bool pass = pass_modes && pass_interface && pass_energy;
@@ -1802,9 +1802,9 @@ bool run_imc_ddmc_angular_verify() {
   const bool pass_interface =
       (result_hat.interface_transitions > 0) &&
       (result_std.interface_transitions > 0);
-  // VERIFICATION §9.2: reject degenerate near-identical profiles.
+  // the internal verification record §9.2: reject degenerate near-identical profiles.
   constexpr double kMinDistinguishableL2Rel = 1.0e-6;
-  // VERIFICATION §9.2: angular-model profile agreement tolerance.
+  // the internal verification record §9.2: angular-model profile agreement tolerance.
   constexpr double kL2RelTol = 0.20;
   const bool pass_non_degenerate = (l2_rel_te >= kMinDistinguishableL2Rel);
   const bool pass_profile = (l2_rel_te <= kL2RelTol);
@@ -1866,9 +1866,9 @@ bool run_imc_ddmc_tau_scan_verify() {
   const double l2_rel_te = relative_l2_profile_difference(result_ddmc.Te, result_imc.Te);
   const bool pass_modes = (result_ddmc.ddmc_count == 20) &&
                           (result_imc.ddmc_count == 0);
-  // VERIFICATION §9.3: tau_ddmc sweep profile tolerance vs IMC reference.
+  // the internal verification record §9.3: tau_ddmc sweep profile tolerance vs IMC reference.
   constexpr double kL2RelTol = 0.10;
-  // VERIFICATION §9.3 / §2.3: cumulative energy tolerance for Monte Carlo runs (0.5%).
+  // the internal verification record §9.3 / §2.3: cumulative energy tolerance for Monte Carlo runs (0.5%).
   constexpr double kEnergyRelTol = 5.0e-3;
   const bool pass_profile = (l2_rel_te <= kL2RelTol);
   const bool pass_energy = (result_ddmc.conservation_rel <= kEnergyRelTol) &&
@@ -2364,14 +2364,14 @@ bool run_ddmc_diffusion_verify() {
   const std::int64_t total_modes =
       static_cast<std::int64_t>(n_cells) * static_cast<std::int64_t>(n_groups);
   const bool pass_mode = (ddmc_count_initial == total_modes) && (ddmc_count_final > 0);
-  // VERIFICATION §8.1: pure-DDMC diffusion profile sanity gates.
+  // the internal verification record §8.1: pure-DDMC diffusion profile sanity gates.
   constexpr double kRadMonotonicMin = 0.60;
   constexpr double kTeMonotonicMin = 0.55;
   constexpr double kRatioMin = 1.0;
   const bool pass_profile =
       (rad_monotonic >= kRadMonotonicMin) && (te_monotonic >= kTeMonotonicMin) &&
       (rad_ratio > kRatioMin) && (Te_ratio >= kRatioMin);
-  // VERIFICATION §8.1: retained-energy envelope for finite-step diffusion runs.
+  // the internal verification record §8.1: retained-energy envelope for finite-step diffusion runs.
   // Keep a 1% window: tighter than the historical 5% gate, while still allowing MC variance.
   constexpr double kRetainedFractionMin = -0.01;
   constexpr double kRetainedFractionMax = 1.01;
@@ -2523,7 +2523,7 @@ bool run_ddmc_leak_normalization_verify() {
       radiation::check_mmatrix_condition(coefficients, mode_for_mmatrix, sigma_a_eff);
   const bool all_ddmc =
       (mode_selector.count_ddmc() == static_cast<std::int64_t>(n_cells) * n_groups);
-  // VERIFICATION §8.2: DDMC leak-probability normalization tolerance.
+  // the internal verification record §8.2: DDMC leak-probability normalization tolerance.
   constexpr double kNormalizationTol = 1.0e-14;
   const bool pass = all_ddmc && checked > 0 && max_norm_err <= kNormalizationTol &&
                     min_prob >= -kNormalizationTol && mmatrix.total_violations == 0;
@@ -2624,7 +2624,7 @@ bool run_mmatrix_fallback_verify() {
   }
   const double energy_rel = std::abs(E1 - E0) / std::max(std::abs(E0), 1.0);
 
-  // VERIFICATION §8.4: mixed-mode fallback run energy stability tolerance (0.1%).
+  // the internal verification record §8.4: mixed-mode fallback run energy stability tolerance (0.1%).
   constexpr double kEnergyRelTol = 1.0e-3;
   const bool pass = (mmatrix.total_violations >= 1) &&
                     (mmatrix.off_diagonal_violations >= 1) && others_ddmc &&
@@ -2728,7 +2728,7 @@ bool run_ddmc_multigroup_verify() {
       max_rel_coeff_A = std::max(max_rel_coeff_A, std::max(rel_left, rel_right));
     }
   }
-  // VERIFICATION §8.3: grey-vs-multigroup coefficient consistency tolerance.
+  // the internal verification record §8.3: grey-vs-multigroup coefficient consistency tolerance.
   constexpr double kCoeffRelTol = 1.0e-12;
   const bool pass_A = all_ddmc_A && (max_rel_coeff_A <= kCoeffRelTol);
 
@@ -2759,7 +2759,7 @@ bool run_ddmc_multigroup_verify() {
   const double E1_g1 = E0_g1;
   const double err_g0 = std::abs(E1_g0 - E0_g0) / std::max(std::abs(E0_g0), 1.0);
   const double err_g1 = std::abs(E1_g1 - E0_g1) / std::max(std::abs(E0_g1), 1.0);
-  // VERIFICATION §8.3: per-group energy tolerance (0.1%).
+  // the internal verification record §8.3: per-group energy tolerance (0.1%).
   constexpr double kGroupEnergyRelTol = 1.0e-3;
   const bool pass_energy_B = (err_g0 <= kGroupEnergyRelTol) && (err_g1 <= kGroupEnergyRelTol);
 
@@ -2770,7 +2770,7 @@ bool run_ddmc_multigroup_verify() {
       ++ddmc_group1;
     }
   }
-  // VERIFICATION §8.3: DDMC event-count separation between groups.
+  // the internal verification record §8.3: DDMC event-count separation between groups.
   constexpr double kDdmcGroupRatioMin = 100.0;
   const bool ratio_ok = (ddmc_group1 == 0) ||
                         (static_cast<double>(ddmc_group0) / ddmc_group1 >= kDdmcGroupRatioMin);

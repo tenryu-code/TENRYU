@@ -52,7 +52,21 @@ if(TENRYU_ENABLE_PYTHON)
   set_target_properties(tenryu_namelist_embed PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS OFF)
 endif()
 
-add_executable(tenryu main.cpp)
+# The source revision shown by `tenryu --version` (cmake/SourceRevision.cmake), regenerated at
+# every build and rewritten only when it changes. Only the tenryu executable compiles
+# version_banner.cpp, which includes it, so a new revision relinks the executable alone (not
+# the libraries or the test executables).
+set(TENRYU_SOURCE_REVISION_HEADER ${CMAKE_CURRENT_BINARY_DIR}/generated/tenryu_source_revision.hpp)
+add_custom_target(tenryu_source_revision ALL
+  COMMAND ${CMAKE_COMMAND} -DSOURCE_DIR=${PROJECT_SOURCE_DIR}
+          -DOUTPUT=${TENRYU_SOURCE_REVISION_HEADER}
+          -P ${PROJECT_SOURCE_DIR}/cmake/SourceRevision.cmake
+  BYPRODUCTS ${TENRYU_SOURCE_REVISION_HEADER}
+  VERBATIM)
+
+add_executable(tenryu main.cpp version_banner.cpp)
+add_dependencies(tenryu tenryu_source_revision)
+target_include_directories(tenryu PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
 
 target_link_libraries(tenryu PRIVATE tenryu_drivers)
 

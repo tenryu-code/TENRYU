@@ -2,7 +2,7 @@
 
 TENRYU の namelist(deck) 作成とリモート実行を行う Mac GUI。
 Tauri 2 + React/TypeScript の Web コア分離型 (設計は
-`docs/design/gui_mac_namelist_runner_plan_20260711.md` と同 Addendum 1 が正典)。
+社内の設計メモ gui_mac_namelist_runner_plan_20260711.md と同 Addendum 1 が正典)。
 
 - Web コア (`src/`) は純 Web — Linux で `npm run dev` / `npm test` 可能。
 - ssh はアプリに実装しない: システム `ssh`/`scp` を Tauri plugin-shell (Mac 本番) /
@@ -38,4 +38,4 @@ Mac に TENRYU チェックアウトを置く必要はなく、「文書とソ�
 - このために Tauri shell 許可に bash が追加されている (ssh/scp と同格のローカル実行
   権限。webview は同梱コードのみを実行する)。
 
-設計: docs/design/gui_assistant_integration_20260902.md
+設計: 社内の設計メモ gui_assistant_integration_20260902.md

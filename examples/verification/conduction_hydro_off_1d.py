@@ -2,7 +2,7 @@
 
 A hot region (2 keV) next to cold DT (20 eV) at 0.1 g/cm^3, Spitzer conductivity with the default Kirchhoff face
 closure and the STS solver, flux limiter 0.06, Numerics.hydro.enabled=False, no radiation or laser. Used for the
-time-step ladder of the STS face conductivity in VERIFICATION §4.z5: dt.max_s from 1e-13 s to 1e-10 s against a run
+time-step ladder of the STS face conductivity in the internal verification record §4.z5: dt.max_s from 1e-13 s to 1e-10 s against a run
 at 1e-14 s, below the explicit limit. tests/hydro/conduction_hydro_off_energy_check.py runs it in 1T and 2T and
 checks that the total energy stays at its initial value.
 

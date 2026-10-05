@@ -8,12 +8,11 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
-#include <vector>
 
 #include <CLI/CLI.hpp>
 
-#include "core/version.hpp"
 #include "drivers/cmd_checkpoint_swap_center.hpp"
+#include "drivers/version_banner.hpp"
 
 #if TENRYU_ENABLE_MPI
 #include <cuda_runtime.h>
@@ -172,15 +171,17 @@ int main(int argc, char** argv) {
     }
     if (log_buf_mb > 0.0) {
       const std::size_t n = static_cast<std::size_t>(log_buf_mb * 1048576.0);
-      static std::vector<char> log_buf;
-      log_buf.resize(n);
-      std::setvbuf(stdout, log_buf.data(), _IOFBF, n);
+      // Intentionally leaked: exit() destroys static objects before stdio's
+      // final flush, so a static buffer was freed while it still held the
+      // output written without a flush (the help and version texts were lost).
+      char* log_buf = new char[n];
+      std::setvbuf(stdout, log_buf, _IOFBF, n);
     }
   }
   CLI::App app{"TENRYU radiation-hydrodynamics simulation code", "tenryu"};
   app.require_subcommand(0, 1);
-  app.set_version_flag("--version", tenryu::core::tenryu_version_string(),
-                       "Show version and exit");
+  app.set_version_flag("--version", "tenryu " + tenryu::drivers::version_banner(),
+                       "Show the version and the source revision, and exit");
 
   tenryu::drivers::CliOptions common_options;
   tenryu::drivers::add_common_cli_options(app, common_options);

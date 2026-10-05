@@ -82,4 +82,4 @@ Laser diagnostics:
 tools/tenryu-plot laser outputs/gxii_solid_1D_fld --times 0.5ns,1.0ns,1.5ns
 ```
 
-Design reference: `docs/design/plot1d_standard_package_20260709.md`.
+Design reference: the internal design note plot1d_standard_package_20260709.md.

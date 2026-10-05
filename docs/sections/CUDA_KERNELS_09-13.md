@@ -455,7 +455,7 @@ CUDA ストリームのFIFO保証により、同一ストリーム内のカー�
 A100: L2キャッシュ 40MB。
 
 **キャッシュに収まるデータ**:
-- セルフィールド（125Kセル × 10フィールド × 8B = 10MB）→ 収まる（500×250メッシュ、PERFORMANCE P1-P3準拠）
+- セルフィールド（125Kセル × 10フィールド × 8B = 10MB）→ 収まる（500×250メッシュ、社内の性能記録 P1-P3準拠）
 - LaserMeshフィールド（32Kノード × 5フィールド × 8B = 1.3MB）→ 収まる
 
 **方針**: セルデータは`__ldg()`で明示的にL2キャッシュを活用。（退役したモンテカルロ輻射の ddmc_mode 配列は収まり、
@@ -502,7 +502,7 @@ A100: L2キャッシュ 40MB。
 
 > **【状態注記 2026-07-10、2026-09-29 更新】** 本節の見積りは退役したモンテカルロ輻射（粒子輸送、alive 粒子数前提）の歴史的推定で、
 > Radiation の行と粒子数スケーリング・ボトルネック特定フローの粒子の項はそのコードとともに退役した（コードは
-> `retired/radiation_monte_carlo/`）。現行の性能実測は `PERFORMANCE.md`（host オーバーヘッド削減系列の wall/steps + host API 呼数）と
+> `retired/radiation_monte_carlo/`）。現行の性能実測は 社内の性能記録（host オーバーヘッド削減系列の wall/steps + host API 呼数）と
 > `ops/runpod/bench/CALIBRATION.md` を正とする。
 
 ### 11.1 Phase別時間内訳推定
@@ -524,7 +524,7 @@ A100: L2キャッシュ 40MB。
 | MPI通信 | ~1 ms | halo + particle migration |
 | **合計** | **~50 ms/step** | |
 
-> Radiation が全体の ~80% を占める。KPI目標（PERFORMANCE.md 参照: ≥2×10⁹ events/s）に対し:
+> Radiation が全体の ~80% を占める。KPI目標（社内の性能記録 参照: ≥2×10⁹ events/s）に対し:
 > 100万粒子 × 20イベント = 2×10⁷ events、40ms → 5×10⁸ events/s。
 > 目標達成には粒子数増加（10⁶→10⁷）または最適化が必要。
 

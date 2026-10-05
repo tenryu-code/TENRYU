@@ -3439,7 +3439,7 @@ struct DvclpClassifyCounters {
 };
 
 // SS8-w2fix23: three-layer consensus classification (design doc
-// docs/design/dvclp_eq52_floor_20260813.md).  Layer 0: exact zero budgets.
+// the internal design note dvclp_eq52_floor_20260813.md).  Layer 0: exact zero budgets.
 // Layer 1 (eq. 52'): every feasible value of the component provably rounds
 // to the stored component mean.  Layer 2 (C2): the mean collapse differs
 // from every feasible completion by less than the energy ledger's own
@@ -3770,7 +3770,7 @@ DvclpProjectionResult project_dvclp_velocities_core(
   std::vector<char> consensus_constrained(budgets.size(), false);
   // SS8-w2fix23: local, Galilean-consistent, component-proof classification
   // (exact zero contraction + eq. 52' representable quotient + ledger-resolution
-  // collapse); see docs/design/dvclp_eq52_floor_20260813.md.
+  // collapse); see the internal design note dvclp_eq52_floor_20260813.md.
   const DvclpClassifyCounters classify_counters =
       classify_dvclp_consensus_edges(
           target_mesh, budgets, nodal_mass, node_vr, node_vz, node_count,
