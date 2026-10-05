@@ -35,7 +35,7 @@
         <thead><tr><th>カーネル</th><th>1D</th><th>2D RZ</th><th>既定 / 有効化</th></tr></thead>
         <tbody>
           <tr><th><a href="hydrodynamics.html">ラグランジュ流体</a></th><td>球・円筒・平面</td><td>対応</td><td><code>Numerics.hydro.enabled=True</code> が既定（中核）。</td></tr>
-          <tr><th><a href="mesh/ale-remap.html">ALE リゾーン・リマップ</a></th><td>純ラグランジュ（実験的な解適応の経路 <code>Numerics.ale1d</code> のみ明示指定）</td><td>対応</td><td>2D で <code>Numerics.ale.enabled=True</code> の明示指定。</td></tr>
+          <tr><th><a href="mesh/ale-remap.html">ALE リゾーン・リマップ</a></th><td>純ラグランジュ（実験的な解適応の経路 <code>Numerics.ale1d</code> は 2026-10-02 に退役）</td><td>対応</td><td>2D で <code>Numerics.ale.enabled=True</code> の明示指定。</td></tr>
           <tr><th><a href="radiation/fld.html">多群 FLD</a></th><td>球・円筒・平面</td><td>対応</td><td><code>Radiation.enabled=True</code>・<code>mode="multigroup_diffusion"</code> が既定。</td></tr>
           <tr><th><a href="radiation/sn.html">S<sub>N</sub> 輸送</a></th><td>球・平面（円筒は直積型の求積）</td><td>対応</td><td><code>Radiation.mode="sn_transport"</code> で選択。</td></tr>
           <tr><th><a href="conduction.html">電子熱伝導（Spitzer–Härm）</a></th><td>球・円筒・平面</td><td>対応（Kershaw 9 点）</td><td><code>Numerics.conduction.enabled=True</code> が既定。イオン伝導は明示指定（1D・2 温度のみ）。</td></tr>

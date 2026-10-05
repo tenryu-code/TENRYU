@@ -18,7 +18,7 @@
     <header>
       <h1>TENRYU Studio User Manual (1D)</h1>
       <p class="lead">A GUI for safely building input decks for TENRYU 1D radiation-hydrodynamics simulations using forms alone.</p>
-      <p class="meta">Generated: 2026-09-02</p>
+      <p class="meta">Generated: 2026-10-01</p>
       <a class="language-link" href="index_ja.html" lang="ja">日本語版</a>
     </header>
 
@@ -27,7 +27,7 @@
       <ol>
         <li><a href="#overview">Overview and workflow</a></li>
         <li><a href="#quickstart">Three-minute quick start</a></li>
-        <li><a href="#presets">1D presets (run-verified)</a></li>
+        <li><a href="#presets">1D presets (with verification runs)</a></li>
         <li><a href="#basic">Basic settings</a></li>
         <li><a href="#materials">Materials</a></li>
         <li><a href="#geometry">Geometry: mesh and regions</a></li>
@@ -87,37 +87,86 @@
     </section>
 
     <section id="presets">
-      <h2>3. 1D presets (run-verified)</h2>
-      <p>Studio provides three physics presets plus a blank preset. All three physics presets completed successfully on actual hardware (RTX 4090) and were confirmed to produce physically valid results on 2026-07-31.</p>
+      <h2>3. 1D presets (with verification runs)</h2>
+      <p>The 1D tab of the presets has six basic presets (the blank one included) and six that use optional kernels. Every preset but the CBET one was run to its end time on an RTX 4090 on 2026-10-01 and checked against a run on a twice finer mesh; each card shows the result under "Verification run". The meshes come from the mesh skill (tenryu-mesh-1d): the laser-driven presets carry a recommended mesh, those driven by a radiation temperature or a pressure a per-layer table (§6). The card mark "Needs the tables" means the preset reads TMAT-H5 tables; "Heavy run" means hours on one GPU.</p>
 
       <div class="table-wrap">
         <table>
           <thead>
             <tr>
               <th>Preset</th>
-              <th>Physics</th>
-              <th>Verified result</th>
+              <th>Kernels</th>
+              <th>Verification run in brief</th>
             </tr>
           </thead>
           <tbody>
+            <tr><th colspan="3">Basic</th></tr>
             <tr>
-              <td>Radiation slab (planar 1D)</td>
-              <td>Gray FLD + Marshak 120 eV, hydro OFF, κ=2000 cm²/g, <code>cv_e_override</code>=3×10<sup>11</sup> erg/(cm³·eV) (electron heat capacity per unit volume), ρ=0.2 g/cm³, L=100 µm, 1 ns</td>
-              <td>Wall temperature about 104 eV and radiation heat-front position about 35 µm, with a cold region remaining ahead: a textbook profile.</td>
+              <td>Blank</td>
+              <td>hydro, conduction (defaults only)</td>
+              <td>—</td>
             </tr>
             <tr>
-              <td>Laser implosion capsule (direct drive)</td>
-              <td>GXII class. DT gas at 0.01 g/cc / 230 µm + CH shell at 250 µm + corona ramp; 351 nm ray tracing at 10 TW × 1 ns (10 ps ramp); 2T + 20-group FLD</td>
-              <td>About 86% absorption, bang at about 1.4 ns, and ρ<sub>peak</sub> about 120 g/cc in per-step history. Completes in about 22 seconds on an RTX 4090.</td>
+              <td>Pressure-driven shock</td>
+              <td>hydro, pressure boundary condition</td>
+              <td>The shock speed matches the exact Rankine-Hugoniot value within 0.01 %. The density behind the shock is 0.6 % high and does not improve on a finer mesh (cause not identified).</td>
             </tr>
             <tr>
-              <td>Indirect-drive Tr(t)</td>
-              <td>Piecewise-linear Tr(t) at the outer Marshak boundary: 120 eV foot (0.5 ns) → ramp to 200 eV by 1 ns → hold through 5 ns. Ablator κ=2000 cm²/g</td>
-              <td>Bang at about 4.2–4.5 ns and minimum radius about 10 µm (CR≈30), capturing stagnation and rebound.</td>
+              <td>Radiation heat wave (Marshak wave)</td>
+              <td>radiation diffusion (FLD)</td>
+              <td>At 1 ns the electron temperature at the wall is 104 eV and the front is 37.9 µm from the wall; mesh difference 0.16 %.</td>
+            </tr>
+            <tr>
+              <td>Laser-driven planar foil</td>
+              <td>hydro, two-temperature electron conduction, radial laser absorption, ghost corona</td>
+              <td>Absorption 89 %, the shock reaches the rear wall at 0.62 ns, ablation pressure 17 Mbar; mesh difference of the absorbed energy 3.3 %.</td>
+            </tr>
+            <tr>
+              <td>Direct-drive shell implosion (GXII class)</td>
+              <td>hydro, two-temperature electron conduction, laser ray tracing, ghost corona</td>
+              <td>Absorption 67 %, stagnation at 1.83 ns, convergence ratio 5.0, peak density 141 g/cm³; mesh differences within 0.5 %.</td>
+            </tr>
+            <tr>
+              <td>Indirect-drive implosion (radiation temperature drive)</td>
+              <td>hydro, radiation diffusion (FLD), Marshak boundary, electron conduction</td>
+              <td>Stagnation at 2.42 ns, minimum radius 47 µm, convergence ratio 6.7. On a finer mesh the outermost boundary cell keeps accelerating (a known defect); the drive ends at 2.6 ns.</td>
+            </tr>
+            <tr><th colspan="3">Optional kernels</th></tr>
+            <tr>
+              <td>Radiation-driven planar foil (S_N transport)</td>
+              <td>radiation S_N transport (4 groups, 16 directions), hydro, electron conduction</td>
+              <td>The shock reaches the rear wall at 0.74 ns; ablated mass 3.1 mg/cm²; the S_N iteration converged at every step.</td>
+            </tr>
+            <tr>
+              <td>Nonlocal electron transport (SNB)</td>
+              <td>nonlocal electron conduction (SNB), hydro, radial laser absorption, ghost corona</td>
+              <td>Absorption 86 %, ablation pressure 58 Mbar. The absorbed energy differs by 7.0 % on a finer mesh, outside the convergence target (3 %).</td>
+            </tr>
+            <tr>
+              <td>Direct drive with CBET and hot electrons</td>
+              <td>CBET (port layout), hot electrons (TPD, SRS), laser ray tracing, hydro, electron conduction</td>
+              <td>No verification run to the end time yet (the run is expensive). CBET and the hot electrons have been checked only over the first tens of picoseconds.</td>
+            </tr>
+            <tr>
+              <td>Burning exploding pusher</td>
+              <td>fusion burn (DT), plasma viscosity, ion conduction, radiation diffusion (8 groups), hydro</td>
+              <td>DT neutron yield 3.9e10, bang time 2.74 ns; mesh difference of the yield 1.5 %. The known outer-boundary defect appears on a finer mesh.</td>
+            </tr>
+            <tr>
+              <td>Material tables and multigroup radiation</td>
+              <td>table equation of state, table opacity, multigroup radiation diffusion (FLD), hydro, laser</td>
+              <td>Absorption 87 %, the shock reaches the rear wall at 0.64 ns. Values are clamped 9.4 million times during the run; which quantity is clamped has not been identified.</td>
+            </tr>
+            <tr>
+              <td>Two-layer target in cold equilibrium (CD on liquid D2)</td>
+              <td>cold-equilibrium constitutive branch, table equation of state, hydro, laser</td>
+              <td>Absorption 88 %, the shock reaches the rear wall at 1.36 ns; every compared quantity within 2.4 % on a finer mesh.</td>
             </tr>
           </tbody>
         </table>
       </div>
+
+      <p>In the planar presets the rear face (r = 0) is a rigid wall: the mid-plane of a foil driven from both sides. The compression after the shock reaches the wall comes from the shock reflected there; it is not an implosion's stagnation.</p>
 
       <aside class="tip">
         <strong>Tip:</strong> Every field remains editable after a preset is applied. A safe workflow is to establish a working case with a preset first, then vary its conditions.
@@ -164,12 +213,92 @@
     <section id="geometry">
       <h2>6. Geometry: mesh and regions</h2>
       <figure>
-        <img src="img/en/05_mesh.png" alt="Mesh and material-region settings">
-        <figcaption>Configure the 1D Lagrangian mesh and material regions stacked from the inside outward.</figcaption>
+        <img src="img/en/05_mesh.png" alt="Geometry of the spherical-shell preset with its recommended mesh">
+        <figcaption>Choose how the mesh is built and stack the material regions from the inside outward. The figure shows the direct-drive shell preset and the state of its recommended mesh (validated by the server's tenryu, cell count, the measurements it rests on, the surface-cell ceiling and the achieved value, and its flags).</figcaption>
       </figure>
 
-      <h3>Mesh</h3>
-      <p>Specify <code>r_max</code>, the cell count <code>nr</code>, and a mesh type such as <code>uniform</code>. This is a Lagrangian mesh that moves with the fluid.</p>
+      <h3>Mesh methods (1D)</h3>
+      <p>The 1D mesh is a Lagrangian mesh that moves with the fluid. Choose one of six methods under “Mesh method”. Switching methods keeps the settings of the others.</p>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Method</th>
+              <th>Written to the deck</th>
+              <th>Use</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Uniform</td>
+              <td><code>nr</code>, <code>grid="uniform"</code></td>
+              <td>Trial runs. Not for runs that need fine cells at the surface.</td>
+            </tr>
+            <tr>
+              <td>Graded</td>
+              <td>Cell counts per segment and <code>grading</code></td>
+              <td>The earlier specification, kept for existing decks.</td>
+            </tr>
+            <tr>
+              <td>Recommended mesh</td>
+              <td><code>zoning_intent</code> and <code>resolution_requirement</code> (<code>apply="enforce"</code> with the empirical ceiling <code>empirical</code>)</td>
+              <td>Laser-driven decks. The recommender builds it on the server and the server's tenryu validates it.</td>
+            </tr>
+            <tr>
+              <td>Per-layer table</td>
+              <td><code>explicit_nodes</code> (nodes computed by Studio)</td>
+              <td>Decks driven by a radiation temperature or a pressure; conditions far outside the recommender's range.</td>
+            </tr>
+            <tr>
+              <td>Imported node coordinates</td>
+              <td><code>explicit_nodes</code></td>
+              <td>Reusing another code's zoning or the mesh of an earlier run.</td>
+            </tr>
+            <tr>
+              <td>Declarative zoning (zoning_intent)</td>
+              <td><code>zoning_intent</code></td>
+              <td>Editing a recommended mesh; writing the measure, bands, pins and weight profile directly.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>Recommended mesh</h3>
+      <p>“Make the recommended mesh (server)” runs TENRYU's mesh recommender (<code>tools/assist/assist.py recommend-mesh</code>, the same tool the Claude Code skill <code>tenryu-mesh-1d</code> uses) on the selected server. The recommender has the server's tenryu read the target and the laser of the form (<code>validate --mesh-preview</code>), sets the ceiling on the areal mass of the surface cells from a campaign that measured mesh convergence, builds a <code>zoning_intent</code>, and validates it with the server's tenryu before returning it. A recommendation that fails validation is not put into the form.</p>
+      <ul>
+        <li>The panel shows the validation status, the cell count, the measurements the recommendation rests on, the surface-cell ceiling and the value achieved in validation, the flags, and the recommender's warnings. The flag <code>extrapolation</code> means the conditions lie outside the measurements and a calibrated a-priori ceiling was used; check convergence with the <a href="#convergence-pair">convergence pair</a> then.</li>
+        <li>A recommendation belongs to the geometry and domain, the target's layers (radii, densities, materials), the laser wavelength and waveform, the end time, the temperature model, and the radiation and conduction settings. Changing any of them after the recommendation shows “conditions changed”; recommend again.</li>
+        <li>Laser-driven 1D decks only (the solver's resolution requirement follows from the laser conditions). The recommender assumes a bare target surface, so it does not work with a material corona ramp; use the laser's ghost corona (<a href="#drive">§8</a>).</li>
+        <li>The server needs a TENRYU checkout (<code>tools/assist</code>) above the tenryu binary and python3 (3.9 or later).</li>
+        <li>“Adjust it as a declarative zoning” moves the recommended <code>zoning_intent</code> to the editable method (the panel records that it was edited by hand).</li>
+      </ul>
+
+      <h3>Per-layer table</h3>
+      <figure>
+        <img src="img/en/05c_mesh_layers.png" alt="Per-layer mesh table">
+        <figcaption>The per-layer table. The indirect-drive preset refines the DT gas toward its outer edge and the CH ablator at both edges, with 0.05 µm end cells.</figcaption>
+      </figure>
+      <p>For each layer (a material region, a corona layer, the outer vacuum) choose the cell count and the spacing: equal width, equal mass, or geometric. A geometric layer takes its ratio from the ratio between neighbouring widths, from the width of the end cell, or from matching the mass of the neighbouring layer's end cell, and refines its outer edge, inner edge, or both. Studio computes the nodes and writes them to the deck as <code>explicit_nodes</code>, so the mesh shown is exactly the mesh that runs. Each layer shows its smallest cell width and the adjacent ratio at its fine edge.</p>
+
+      <h3>Imported node coordinates</h3>
+      <p>Paste node coordinates (one per line, or separated by commas or spaces; for a table choose the column, and choose the unit) or read them from a file (<code>.txt</code>, <code>.csv</code>, <code>.dat</code>, or a run's frozen configuration <code>config/&lt;case&gt;_frozen.json</code>). “Use the mesh checked on the server” takes the mesh last checked on the server (the one the solver built from a recommended mesh or a declarative zoning) as a node list. Choosing a run in the run history takes that run's mesh (the node list of its frozen configuration, or else the mesh the server builds from the run's deck). Importing sets <code>r_min</code> and <code>r_max</code> to the first and last nodes.</p>
+
+      <h3>Declarative zoning (zoning_intent)</h3>
+      <p>Edit the solver's declarative zoning directly: the cell count <code>n_cells</code>, the measure to equidistribute <code>measure</code> (width, areal mass, line mass, cell mass), density intervals for zoning, pins at material interfaces, the weight profile, local refinements, bands (lower and upper bounds on the cell measure over ranges of the cumulative measure), the minimum cell width, the preferred and maximum adjacent ratios, and the minimum cells per segment. The solver computes the nodes; the <a href="#mesh-diagnostics">mesh diagnostics</a> show the mesh of the nodes Studio computes the same way, replaced by the solver's mesh after a check on the server.</p>
+
+      <h3>Resolution requirement (resolution_requirement)</h3>
+      <p>For laser-driven decks the solver computes an upper limit on cell size from an ablation rule and a shock rule (the resolution requirement). “Do not write” leaves the solver default (report only), “Report only” writes <code>apply="report"</code>, and “Stop if not met” writes <code>apply="enforce"</code>. A recommended mesh writes <code>enforce</code> with the empirical ceiling (<code>empirical</code>) the recommendation rests on.</p>
+
+      <h3 id="mesh-diagnostics">Mesh diagnostics</h3>
+      <figure>
+        <img src="img/en/05b_mesh_diagnostics.png" alt="Mesh diagnostics plot">
+        <figcaption>The recommended mesh of the shell preset as cell mass divided by the reference area against depth below the surface (log). The red dashed lines are the resolution-requirement ceilings computed by the server's tenryu; the cells within about 3 µm of the surface lie under the ceiling of 7.3×10<sup>−7</sup> g/cm².</figcaption>
+      </figure>
+      <p>The properties of the mesh are shown as a plot and as numbers. The quantity can be the cell width, the areal mass ρΔr, the requirement measure (cell mass divided by the reference area of the surface), the mass ratio to the next cell, or the cell mass; the horizontal axis can be the position r, the depth below the surface (log), or the cell index. Below the plot are the cell count, the smallest width, the largest adjacent mass ratio, the surface cell, and the mass ratios at material interfaces.</p>
+      <p>“Check the mesh and the requirement on the server” runs <code>tenryu validate --mesh-preview</code> on the selected server and overlays, on the mesh the solver builds, the requirement ceilings (red dashed) and the cells above them (red dots). The solver computes the nodes of the recommended mesh and of the declarative zoning; before this check the plot shows the nodes Studio computes with the same zoning as the solver, or the solver's error when it refuses the <code>zoning_intent</code>. With the requirement on <code>enforce</code>, the solver adds the requirement ceilings to the <code>zoning_intent</code> before zoning, so its final mesh differs from the plot where they are stricter than the intent's bands (a note under the plot says so). When the form changes, the panel marks the shown server result as out of date.</p>
+
+      <h3 id="convergence-pair">Convergence pair</h3>
+      <p>Makes a deck whose surface cells (and all cells) carry half the mass: uniform and graded meshes double their cell counts; a per-layer table doubles its cell counts, takes the square root of its ratios and halves its end widths; imported nodes split every cell into two of equal volume; a recommended mesh or a declarative zoning doubles its cell count and halves its bands, its measure bounds and its minimum width. The case name and the output directory get <code>_fine</code>. Run it next to the original and check that the observables (ablation pressure, ablated mass, absorbed energy, the time the shock reaches the rear, the stagnation time, and so on) do not change. It is required before production when the recommendation is outside the measurements (<code>extrapolation</code>) and for meshes from the per-layer table or imported nodes. Use “Save the finer deck”, “Run the finer deck”, or “Open the finer deck in the form”.</p>
 
       <h3>Regions</h3>
       <p>Stack material regions from the inside outward. Each region specifies a material, outer radius <code>rOuter</code>, density, initial electron temperature Te, and initial ion temperature Ti. By default, the final region's <code>rOuter</code> must equal <code>r_max</code>.</p>
@@ -181,7 +310,7 @@
       <p>When Outer vacuum is enabled, you can also enable the corona ramp. It places a low-density corona that decays exponentially from the final region's surface, specified by scale length L, extent, ρ<sub>0</sub>, and density floor.</p>
 
       <aside class="warn">
-        <strong>Important:</strong> If the corona ramp is disabled in a laser deck, rays reflect at the critical surface at the cold solid edge. Absorption drops to about 0.04%, and nothing happens because there is no inverse-bremsstrahlung path length. Always enable the ramp for direct laser drive. The defaults (L=2 µm / extent 10 µm / ρ<sub>0</sub>=0.05 g/cm³ / floor 3×10<sup>−4</sup> g/cm³) are the verified GXII configuration itself.
+        <strong>Important:</strong> A laser deck needs either the laser's ghost corona (<a href="#drive">§8</a>; the laser presets use it) or the material corona ramp. With neither, rays reflect at the critical surface at the cold solid edge; absorption drops to about 0.04%, and nothing happens because there is no inverse-bremsstrahlung path length. The form warns in that case. The ramp defaults (L=2 µm / extent 10 µm / ρ<sub>0</sub>=0.05 g/cm³ / floor 3×10<sup>−4</sup> g/cm³) are the earlier verified GXII configuration. The recommended mesh does not work with the ramp.
       </aside>
 
       <figure>
@@ -210,6 +339,8 @@
 
       <p>The SNB defaults are 24 energy groups, E<sub>max</sub>/(k<sub>B</sub>T<sub>e</sub>)=20, group-mfp variant <code>geometric_r2</code> (Sherlock 2017), no electric-field correction, Picard iteration limit 8, and <code>rtol</code>=0.01. The electric-field correction is already folded into the r=2 calibration; combining it with <code>local</code> would count the correction twice.</p>
 
+      <p>The conduction solver is STS (explicit super time stepping, the solver default) or implicit (1D only). The implicit solver puts no conduction limit on the time step; the laser-driven example decks and most presets use it. The SNB nonlocal model is solved only with STS, so SNB with the implicit solver is a form error.</p>
+
       <ul>
         <li><strong>Ion thermal conduction:</strong> Solves Braginskii ion heat conduction after the electron conduction (1D and 2T only; in 2D or 1T the form reports an error). When on, the ion flux-limiter coefficient <code>ion_f_lim</code> (default 1 = the ion free-streaming flux) can be set.</li>
         <li><strong>Hydrodynamics:</strong> Set enabled/disabled, the outer boundary (<code>free</code> / <code>reflect</code> / <code>pressure</code>), and the hydro start temperature <code>T_start</code> [eV] (a cell starts hydrodynamics when its electron temperature reaches this value; 0 = always on).</li>
@@ -225,6 +356,8 @@
 
       <h3>Direct laser drive</h3>
       <p>Set wavelength, ray tracing, waveform, power, and pulse duration. In 1D, only the optics of a single reference beam are specified; direction, beam count, and power allocation are omitted because they have no meaning in 1D. Available waveforms are rectangular with rise/fall, Gaussian, and a piecewise-linear table.</p>
+
+      <p>“Use the ghost corona” places, outside the bare solid surface, a dilute corona that exists only on the laser mesh, so that the laser is absorbed from the start of the pulse (NUMERICS §5.7.5). It replaces the material corona ramp; all laser presets use it. The defaults (12 ghost cells, density fractions 0.03 to 0.99, electron temperature floor 50 eV, Z̄ from 1 to 4, a hand-off over 6 cells with decay length 2, the blow-off transition model on, laser-mesh refinement <code>mesh_factor</code> 0.1, and outer-edge density fraction 0.001) are the settings of the example suite and of the convergence campaign behind the recommended mesh. The deposit smoothing sets the number of passes and the weight per pass of a mass-weighted, conservative smoothing between neighbouring cells applied when the laser deposit is handed to the hydro cells; the presets use 3 passes with weight 0.25 (0 passes disables it, the solver default).</p>
 
       <figure>
         <img src="img/en/09_laser.png" alt="Direct laser-drive settings">
