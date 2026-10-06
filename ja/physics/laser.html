@@ -140,7 +140,7 @@
           <tr><th><code>Laser.rays_per_beam</code></th><td>1D 既定 1000、2D 既定 128</td><td>1D では環の数、2D ではビーム断面配列の 1 辺の点数。</td></tr>
           <tr><th><code>Laser.raytrace.integrator</code></th><td><code>"auto"</code></td><td>1D の光線の積分器。<code>"auto"</code> は 1D で特性曲線積分（<code>"characteristic"</code>）、それ以外で行進（<code>"leapfrog"</code>）。</td></tr>
           <tr><th><code>Laser.raytrace.lanes_per_ray</code></th><td><code>0</code></td><td>特性曲線積分で 1 本の光線を追跡するレーン数（32・64・128・256）。0 は光線数と GPU から自動で選ぶ。</td></tr>
-          <tr><th><code>Laser.raytrace.reuse_inward_integrals</code></th><td><code>True</code></td><td>特性曲線積分で、外向きの区間に内向きで求めた積分を使う。<code>False</code> では外向きも求積する（2026-10-03 より前と同じ結果）。</td></tr>
+          <tr><th><code>Laser.raytrace.reuse_inward_integrals</code></th><td><code>True</code></td><td>特性曲線積分で、外向きの区間に内向きで求めた積分を使う。<code>False</code> では外向きも求積する（2026-10-03 より前と同じ算法。核の引数が増えたので、以前の build とビット単位で同じ結果になるかはコンパイラによる: CUDA 12.6 の nvcc では同じ、12.0 では積和の融合が変わり末尾の桁で違う）。</td></tr>
           <tr><th><code>Laser.absorption.critical_handling.terminate</code></th><td>特性曲線積分で <code>False</code>（<code>terminate_mode="deposit"</code> では <code>True</code>）、ほかは <code>True</code></td><td><code>False</code> では臨界半径で光線を反射させる（特性曲線積分のみ）。</td></tr>
           <tr><th><code>Laser.beams[]</code></th><td>1 本以上</td><td>各ビームの <code>direction</code>、<code>power</code>、<code>f_number</code>、焦点・デフォーカスを定義する。</td></tr>
           <tr><th><code>Laser.beams[].profile</code></th><td><code>w0_um</code>, <code>m</code></td><td><code>super_gaussian</code> による横方向の強度分布。\(m=1\) はガウス型である。</td></tr>
