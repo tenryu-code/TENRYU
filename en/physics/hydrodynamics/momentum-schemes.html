@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en" data-lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RZ momentum schemes — TENRYU Documentation</title>
+  <link rel="stylesheet" href="../../../style.css">
+  <script src="../../../theme.js"></script>
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>RZ momentum schemes</h1>
+    <p class="abstract">The 2D RZ momentum equation has two forms: volume-weighted (<code>volume_weighted</code>) and area-weighted (<code>area_weighted_symmetric</code>). This page describes how they differ, why the area-weighted form is the default, the compatible work (<code>aw_compatible_force_work</code>), the kinetic energy measured with the BBSW corner mass, and the constraints on combining the scheme with other settings. Terms specific to this calculation are defined in the <a href="#terms">terms section</a>.</p>
+
+    <section aria-labelledby="terms">
+      <h2 id="terms">Terms used in this calculation</h2>
+      <p>The 2D RZ momentum equation obtains the acceleration of a node from corner vectors, corner masses, and corner forces. The symbols \(c\), \(k\), and \(n\) (cell, corner number, node) and the definitions of these quantities are in the <a href="discretization.html#terms-corner">terms section of the spatial discretization page</a>. This section defines the terms specific to the momentum schemes.</p>
+
+      <h3 id="terms-momentum">Area-weighted and volume-weighted momentum schemes, and the BBSW corner mass</h3>
+      <p>The <strong>volume-weighted momentum scheme</strong> sums, at each node, the corner forces built from the volume-gradient corner vectors \(\mathbf S_{c,k}\) and divides by the true RZ nodal mass \(m_n\) built from the corner masses to obtain the acceleration of the node. Because the force and the volume rate share the same vector, compatibility holds.</p>
+      <p>The <strong>area-weighted momentum scheme</strong> sums, at each node, the corner forces \(\mathbf F^A_{c,k}=(P_c+Q_c)\,\mathbf S^A_{c,k}\) built in the planar R–Z plane and divides by the planar nodal mass \(M^A_n\) (by default built from the BBSW corner masses defined below) to obtain the acceleration of the node. The reason for adopting it is given in <a href="#momentum-schemes">RZ momentum schemes</a>. It is the default when a 2D RZ deck omits the key (<code>rz_momentum_scheme="area_weighted_symmetric"</code>).</p>
+      <p>The <strong>BBSW corner mass</strong> \(m^B_{c,k}\) is the mass with which the compatible area-weighted momentum scheme measures the kinetic energy; it follows the definition of Barlow–Burton–Shashkov–Wendroff [1].</p>
+      $$
+      m^B_{c,k}=M_c\,\frac{r_kA^k_c}{\sum_jr_jA^j_c},
+      \qquad
+      A^k_c=\frac{T_{k-1}+T_k}{3}+\frac{A_c}{12}.
+      $$
+      <p>Here \(M_c\) is the cell mass, \(r_k\) is the radius of the node of the corner \(k\), \(T_k\) is the area of the triangle whose vertices are the two nodes of the edge \(k\) (between the corners \(k\) and \(k+1\)) and the vertex mean of the cell, and \(A_c=\sum_kT_k\) is the planar area of the cell (the expression for \(A^k_c\) is that of a quadrilateral). \(\sum_km^B_{c,k}=M_c\), and \(m^B_{c,k}=0\) at a corner whose node is on the axis. The mass of a node is \(M^B_n=\sum_{(c,k)\to n}m^B_{c,k}\), the planar nodal mass is \(M^A_n=M^B_n/(2\pi r_n)\), and the kinetic energy is measured as \(K^B=\tfrac12\sum_nM^B_n|\mathbf u_n|^2\). With this mass and the work weight \(2\pi r\) of the internal-energy work, \(\Delta K^B+\sum_c\Delta U_c=W_{ext}\) holds at every stage. <code>aw_kinetic_measure="bbsw_subzonal"</code> is the default when the key is omitted, and <code>"planar_v1"</code> is the earlier measure, which does not close this identity.</p>
+    </section>
+
+    <section aria-labelledby="momentum-schemes">
+      <h2 id="momentum-schemes">RZ momentum schemes</h2>
+      <p>Two momentum schemes exist in 2D RZ (defined in the <a href="#terms-momentum">terms section</a>). <code>volume_weighted</code> uses the volume-gradient corner vectors, the exact gradients of the revolved cell volume, and the true RZ nodal masses built from the corner masses. <code>area_weighted_symmetric</code> uses planar corner vectors built in the planar R–Z plane and a planar nodal mass. When <code>rz_momentum_scheme</code> is omitted, the default is <code>area_weighted_symmetric</code> in a 2D RZ deck and <code>volume_weighted</code> in the structure default (a Config built in C++ code).</p>
+      <p>For a spherically symmetric state on an equal-angle polar mesh, the area-weighted force points radially at every node. The volume-weighted force has an angular component at nodes next to the polar axis (the lines \(\theta=0\) and \(\theta=\pi\) of a spherical-polar mesh), and an expanding blast tangles the cells around them. The area-weighted scheme is adopted to avoid this tangling.</p>
+      <p>With <code>aw_compatible_force_work=True</code> (the default when a 2D RZ deck omits the key), momentum uses the planar corner force, and the internal-energy work uses the same force multiplied by \(2\pi r\) to give the force of the revolved cell. The kinetic energy is measured with the node mass built from the <a href="#terms-momentum">BBSW corner masses</a> (<code>aw_kinetic_measure="bbsw_subzonal"</code>, the default when the key is omitted). This pair is constructed to satisfy \(\Delta K^B+\sum_c\Delta U_c=W_{ext}\) at every stage, where \(\Delta K^B\) is the change of the kinetic energy measured with the BBSW node mass, \(\sum_c\Delta U_c\) is the sum of the changes of the cell internal energies, and \(W_{ext}\) is the external work. <code>aw_kinetic_measure="planar_v1"</code> is the earlier measure and does not close this identity.</p>
+      <p><code>aw_compatible_force_work=True</code> requires <code>av_model</code> to be <code>csw_edge</code>, <code>csw_edge_csw98</code>, <code>mimetic_tensor_v1</code>, or <code>mimetic_tensor_rz_v2</code>, and requires <code>subzonal_pressure_enabled=True</code>. With <code>False</code>, <code>av_model="scalar_vnr_legacy"</code> is required and subzonal pressure must be disabled. The internal energy is then updated, as before, with the true-RZ geometric \(p\,dV\), so the total energy is not conserved by an identity of the construction (the scheme is not compatible). Diagnostics, timestep estimates, and remap use the true RZ node mass. Because the default <code>midpoint_v1</code> requires the compatible work, a deck that sets <code>aw_compatible_force_work=False</code> in the area-weighted momentum scheme must also set <code>time_integration="pc_v0"</code>; input validation rejects the combination with <code>midpoint_v1</code>.</p>
+      <p><code>area_weighted_symmetric</code> is available only in 2D RZ, for structured single-block meshes and multiblock CSR meshes. With <code>aw_compatible_force_work=False</code>, a multiblock mesh must consist of quadrilaterals only. Input validation rejects multiblock meshes with a tri-fan cap (a polar cap made of triangular fans; <code>multiblock_half_butterfly_trifan_cap_5block</code>) and runs that enable <code>Numerics.hydro.plasma_viscosity</code>. With <code>aw_compatible_force_work=True</code>, it also rejects a <code>Mesh.polar_center_treatment</code> of <code>tri_fan</code> or <code>button</code>. A deck that needs these sets <code>rz_momentum_scheme="volume_weighted"</code> and <code>aw_compatible_force_work=False</code> explicitly. Studio writes these two keys, together with <code>av_model="scalar_vnr_legacy"</code> and <code>subzonal_pressure_enabled=False</code>, only in decks with <code>logical_mesh_2d="polar_in_box"</code> (whose center is a tri-fan). For other 2D RZ decks, Studio does not write these hydrodynamics keys, so they run with the defaults for omitted keys.</p>
+    </section>
+
+    <section aria-labelledby="controls">
+      <h2 id="controls">Namelist controls</h2>
+      <p>The following are selected keys under <code>Numerics.hydro</code>. A default is the value used when the deck omits the key. Where a 2D RZ deck that omits the key and the structure default (the value of a Config built in C++ code) differ, both are given. Except for meshes with <code>logical_mesh_2d="polar_in_box"</code>, Studio does not write the keys of this table for 2D RZ, so Studio decks run with the defaults for omitted 2D RZ keys. See the <a href="../../use/namelist.html">namelist reference</a> for all keys and their validation rules.</p>
+      <table class="quick-facts">
+        <thead>
+          <tr><th>Key</th><th>Default</th><th>Purpose</th></tr>
+        </thead>
+        <tbody>
+          <tr><th><code>rz_momentum_scheme</code></th><td><code>"area_weighted_symmetric"</code> when a 2D RZ deck omits it; the structure default is <code>"volume_weighted"</code></td><td>Momentum scheme. The constraints of <code>area_weighted_symmetric</code> are given in the previous section.</td></tr>
+          <tr><th><code>aw_compatible_force_work</code></th><td><code>True</code> when a 2D RZ deck omits it; the structure default is <code>False</code></td><td>Makes the internal-energy work of the area-weighted scheme from the same force as the momentum (compatible). <code>True</code> requires an edge or tensor viscosity in <code>av_model</code> and <code>subzonal_pressure_enabled=True</code>.</td></tr>
+          <tr><th><code>aw_kinetic_measure</code></th><td><code>"bbsw_subzonal"</code> when the deck omits it; the structure default is <code>"planar_v1"</code></td><td>Node mass with which the compatible area-weighted scheme measures the kinetic energy: <code>bbsw_subzonal</code> uses the BBSW corner masses, <code>planar_v1</code> is the earlier measure.</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section aria-labelledby="references">
+      <h2 id="references">References</h2>
+      <ol class="references">
+        <li>A. Barlow, D. Burton, M. Shashkov, and B. Wendroff, "Compatible, Energy and Symmetry Preserving 2D Lagrangian Hydrodynamics in rz-Cylindrical Coordinates," Los Alamos National Laboratory report LA-UR 09-08130.</li>
+      </ol>
+    </section>
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["$$", "$$"], ["\\[", "\\]"]] } };</script>
+  <script defer src="../../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../../nav.js" data-page="hydro-momentum" data-root="../../"></script>
+</body>
+</html>

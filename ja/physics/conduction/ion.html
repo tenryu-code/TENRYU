@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="ja" data-lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>イオン熱伝導 — TENRYU ドキュメント</title>
+  <link rel="stylesheet" href="../../../style.css">
+  <script src="../../../theme.js"></script>
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>イオン熱伝導</h1>
+    <p class="abstract">イオン熱伝導は、2 温度モデルでイオン温度 T<sub>i</sub> の熱伝導を解くオプションである。Braginskii の非磁化プラズマのイオン熱伝導率に、イオンの自由飛行の流束を上限とする調和型の流束制限（harmonic flux limiter）を掛け、電子熱伝導とそのエネルギーの記帳のあとに、イオンの内部エネルギーへ記帳する。1D（平面・円筒・球）では、後退オイラー法（backward Euler method）の三重対角（tridiagonal）系を 1 回解く。2D RZ では、電子熱伝導と同じ節点局所の演算子（node-local operator）にイオンの係数を入れ、電子と同じスーパータイムステッピング（super-time-stepping、STS）で解く。既定では無効である。</p>
+
+    <aside class="planned" aria-labelledby="at-a-glance">
+      <h3 id="at-a-glance">要点</h3>
+      <ul>
+        <li><strong>物理：</strong>Braginskii の非磁化プラズマのイオン熱伝導率に、イオンの自由飛行の流束を上限とする調和型の流束制限を掛ける。</li>
+        <li><strong>次元：</strong>1D（平面・円筒・球）と 2D RZ。2 温度モデル（<code>Main.temperature_model="2T"</code>）が必須で、1 温度は入力検査が拒否する。</li>
+        <li><strong>時間積分：</strong>1D は後退オイラー法の三重対角系で、伝導による時間刻みの制約はない。2D RZ は電子と同じ STS（<code>sts_scheme</code> で RKL2 も選べる）で、時間刻みの上限がある。</li>
+        <li><strong>保存：</strong>動いた熱をイオンの内部エネルギーに記帳し、EOS の再クロージャでイオン温度と圧力を求め直す。</li>
+        <li><strong>既定：</strong>無効（<code>ion_conduction=False</code>）。</li>
+      </ul>
+    </aside>
+
+    <section aria-labelledby="ion-overview">
+      <h2 id="ion-overview">概要</h2>
+      <p><code>ion_conduction=True</code>（2 温度モデルの 1D と 2D RZ）は、電子の熱伝導の後に、Braginskii のイオン熱伝導率 κ<sub>i</sub>=3.906 n<sub>i</sub>T<sub>i</sub>τ<sub>i</sub>/m<sub>i</sub>（τ<sub>i</sub> はイオンの衝突時間）でイオン温度を解く。1D では、後退オイラー法の三重対角系を 1 回解く。面の κ は電子と同じ <code>face_kappa_policy</code> で作り、面の流束は電子と同じ調和型の流束制限で抑える。2D RZ では、電子と同じ節点局所の演算子にイオンの係数を入れ、電子と同じ STS で解く。セルの伝導率には、セルの \(T_i\) の勾配の大きさで同じ調和型の流束制限を掛け、Kirchhoff 割線の設定（<code>face_kappa_policy</code>）も電子と同じである。流束の上限は、どちらもイオンの自由飛行の流束 n<sub>i</sub>T<sub>i</sub>(T<sub>i</sub>/m<sub>i</sub>)<sup>1/2</sup> の <code>ion_f_lim</code> 倍（既定 1）である。動いた熱はイオンの内部エネルギーに記帳し、流体と同じ再クロージャで T<sub>i</sub> を求め直すので、エネルギーは丸め誤差まで保存される。Z=1 では κ<sub>i</sub> は電子の κ<sub>SH</sub> のおよそ 1/(25√A) と小さいので、イオン熱伝導は既定では無効である。ただし、衝撃波の収束直後の中心のように T<sub>i</sub>≫T<sub>e</sub> となる領域ではイオンが熱を運ぶ主体になる。2D RZ では、イオンの陽的な安定限界から決まる刻みの上限も、電子のそれと並んで大域ステップを制限する。</p>
+    </section>
+
+    <section aria-labelledby="mechanism">
+      <h2 id="mechanism">物理機構</h2>
+      <p>イオンの熱伝導は、通常は電子の熱伝導よりはるかに小さい。イオンの熱速度が電子より (m<sub>e</sub>/m<sub>i</sub>)<sup>1/2</sup> 倍遅いためで、Z=1 では κ<sub>i</sub> は電子の κ<sub>SH</sub> のおよそ 1/(25√A) になる。そのため電子と同じ温度（T<sub>i</sub>≈T<sub>e</sub>）の領域では、イオンの熱伝導は既定で無効にしてよい。</p>
+      <p>イオンが熱を運ぶ主体になるのは、T<sub>i</sub>≫T<sub>e</sub> となる領域である。衝撃波の収束直後の中心がその例で、衝撃波はイオンだけを加熱するので、中心のイオン温度は電子温度より高くなる。2 温度モデルではイオン温度が独立の変数なので、この領域の熱の輸送を表すにはイオンの熱伝導の方程式が要る。</p>
+      <p>κ<sub>i</sub> は電子の Spitzer–Härm 伝導率と同じく T<sub>i</sub><sup>5/2</sup> にほぼ比例するので、局所の温度勾配が急なところでは、局所の拡散近似の流束がイオンの自由飛行の流束を超えうる。電子の熱伝導と同じ形の調和型の流束制限が、この超過を抑える。ただし、制限の係数 <code>ion_f_lim</code> の既定値は 1 で、電子の <code>f_lim</code> の既定値 0.06 と違い、上限をイオンの自由飛行の流束そのものにする。調和型の制限は、局所の流束の大きさが上限に等しいとき、流束を上限の半分にする。</p>
+      <p>扱わないものは、磁場による伝導率の異方性と、イオンの非局所輸送である。混合したセルは、実効質量数 A と平均電離度 Z̄ の 1 組で表す。</p>
+    </section>
+
+    <section aria-labelledby="conductivity">
+      <h2 id="conductivity">伝導率</h2>
+      <p>非磁化プラズマの Braginskii のイオン熱伝導率は次のとおりである。</p>
+      $$
+      \kappa_i=3.906\,\frac{n_iT_i\tau_i}{m_i},\qquad
+      \tau_i=2.0852\times10^{7}\,\frac{\sqrt A\,T_i^{3/2}}{n_iZ^4\ln\Lambda_{ii}}\ \mathrm{s},\qquad
+      \ln\Lambda_{ii}=\max\!\left(2,\ 23-\ln\frac{Z^3\sqrt{2n_i}}{T_i^{3/2}}\right).
+      $$
+      <p>ここで τ<sub>i</sub> はイオンの衝突時間、ln Λ<sub>ii</sub> はイオン–イオンのクーロン対数、n<sub>i</sub>=ρ/(A m<sub>p</sub>) はイオンの数密度（cm<sup>−3</sup>）、m<sub>i</sub>=A m<sub>p</sub> はイオンの質量、T<sub>i</sub> は τ<sub>i</sub> と ln Λ<sub>ii</sub> の式では eV で表す。A はセルの実効質量数、Z はセルの平均電離度 Z̄ で、どちらも 1 で下から切る。衝突時間とクーロン対数は、イオン粘性（<a href="../hydrodynamics/plasma-viscosity.html">粘性</a>の頁）と同じ式である。κ<sub>i</sub> の式の T<sub>i</sub> を erg で評価し、eV あたりの温度勾配に対する値（erg/(s cm eV)）に直すので、単位は電子の Spitzer 伝導率と同じである。数値では κ<sub>i</sub>≈1.25×10<sup>8</sup> T<sub>i</sub><sup>5/2</sup>/(√A Z<sup>4</sup> ln Λ<sub>ii</sub>) erg/(s cm eV)（T<sub>i</sub> は eV）になる。</p>
+      <ul>
+        <li><strong>電荷モーメントの補正：</strong>1D で、電荷モーメントの表（<a href="../eos-opacity/ionization.html#ionization">EOS・不透明度・電離</a>参照）がある材料のセルは、イオン粘性と同じく Z<sup>4</sup> を Z̄<sup>4</sup>r<sub>4</sub> に置き換える（r<sub>4</sub> は電荷の 4 次のモーメントの比）。2D RZ の係数は r<sub>4</sub>=1 である。</li>
+        <li><strong>ボイドと退避済みのセル：</strong>ボイドのセルは κ<sub>i</sub>=0 とする。2D RZ では、退避済み（evacuated）のセルも κ<sub>i</sub>=0 とする。</li>
+        <li><strong>熱容量：</strong>イオンの比熱 c<sub>v,i</sub> は、EOS の閉包が保持する値が有限で正ならその値、そうでなければ理想気体の値 (eV→erg の換算)/(A m<sub>p</sub>(γ−1)) を使う。γ はセルの実効比熱比である。</li>
+      </ul>
+    </section>
+
+    <section aria-labelledby="flux-limiter">
+      <h2 id="flux-limiter">流束制限</h2>
+      <p>流束制限は電子と同じ調和型で、イオンの自由飛行の流束 n<sub>i</sub>T<sub>i</sub>(T<sub>i</sub>/m<sub>i</sub>)<sup>1/2</sup> の <code>ion_f_lim</code> 倍を上限 q<sub>max</sub> とする。</p>
+      $$
+      \phi=\frac{1}{1+|q_{SH}|/q_{max}},\qquad
+      q_{max}=f_i\,n_iT_i\sqrt{T_i/m_i}.
+      $$
+      <p>ここで q<sub>SH</sub> は制限前の流束 κ<sub>i</sub>∇T<sub>i</sub>、f<sub>i</sub> は <code>ion_f_lim</code>、T<sub>i</sub> は q<sub>max</sub> では erg である。1D では、面ごとに、ステップ入口の T<sub>i</sub><sup>n</sup> で φ を 1 回評価する。q<sub>SH</sub> は面の伝導率とセル中心の温度差から作り、q<sub>max</sub> の ρ と T<sub>i</sub> は左右のセルの算術平均、A は調和平均で評価する。2D RZ では、セルごとに、セルの伝導率を κ<sub>i</sub> から κ=κ<sub>i</sub>/(1+κ<sub>i</sub>|∇T<sub>i</sub>|/q<sub>max</sub>) に置き換える。|∇T<sub>i</sub>| は、電子の局所モデルと同じ節点の勾配から作ったセルの勾配の大きさで、q<sub>max</sub> の A は 1 で下から切る。<code>ion_f_lim</code> は有限で 0 より大きいことが必要で、入力検査が確かめる。</p>
+    </section>
+
+    <section aria-labelledby="solver-1d">
+      <h2 id="solver-1d">1D の離散化と解法</h2>
+      <p>1D のイオンの方程式は、電子の陰解法と同じ後退オイラー法の有限体積式である。添字の i はイオン、j はセルを表す。</p>
+      $$
+      -w_{j-1/2}\,T_{i,j-1}^{n+1}
+      +\left(\frac{\rho c_{v,i}V_j}{\Delta t}+w_{j-1/2}+w_{j+1/2}\right)T_{i,j}^{n+1}
+      -w_{j+1/2}\,T_{i,j+1}^{n+1}
+      =\frac{\rho c_{v,i}V_j}{\Delta t}\,T_{i,j}^{n},\qquad
+      w_{j+1/2}=\frac{A_{j+1/2}\,\kappa_{j+1/2}\,\phi_{j+1/2}}{\Delta r_{j+1/2}}.
+      $$
+      <p>ここで A<sub>j+1/2</sub> は面の面積、κ<sub>j+1/2</sub> は面のイオンの伝導率、Δr<sub>j+1/2</sub> は隣り合うセル中心の間隔、V<sub>j</sub> はセルの体積である。面の伝導率は電子と同じ <code>face_kappa_policy</code> で作る。既定の <code>kirchhoff_same_material</code> では、κ<sub>i</sub> も T<sup>5/2</sup> の法則に従うので、電子と同じ割線を使う（<a href="discretization.html#terms-face-kappa">面の伝導率の作り方</a>）。両端は零熱流束で、<code>cell_is_void</code> のセルは恒等行にする。係数行列は M 行列なので、解は min T<sub>i</sub><sup>n</sup> ≤ T<sub>i</sub><sup>n+1</sup> ≤ max T<sub>i</sub><sup>n</sup> を満たす。</p>
+      <p>系は、結合した行の対角に ρc<sub>v,i</sub>V/Δt&gt;0 があるので、狭義対角優位であり、ピボット選択が要らない。線のセル数が 640 以下のときは、1 つの CUDA ブロックの並列巡回縮約（parallel cyclic reduction）で、それより長い線は cuSPARSE の <code>cusparseDgtsv2</code> で解く。解法による違いは丸め誤差の程度である。電子の <code>solver</code> の値（STS または陰解法）によらず、1D のイオンは常にこの三重対角系で解く。陰解法なので、イオン熱伝導は大域の時間刻みを制限しない。</p>
+      <p>解いたあと、面の熱流 w<sub>j+1/2</sub>(T<sub>i,j+1</sub>−T<sub>i,j</sub>) を、隣り合う 2 つのセルに符号だけ反転して渡す形で、イオンの比内部エネルギーに記帳する。各面の熱流は 1 回だけ定義するので、記帳したエネルギーの総和は、三重対角系の解の残差によらず丸め誤差まで 0 になる。環境変数 <code>TENRYU_ION_CONDUCTION_AUDIT=1</code> を設定したときだけ、記帳したエネルギーの総和と絶対値の和を計算し、総和が絶対値の和の 10<sup>−10</sup> 倍を超えたら警告する。この監査は、読み戻しの同期を通常の実行に入れないために、既定では行わない。記帳のあとに、1D の流体と同じ EOS の閉包でイオン温度と圧力を記帳したエネルギーから求め直す。MPI 実行では、全ランクが全線を解くので、解く前に必要な量を所有ランクの値で集め直す。</p>
+    </section>
+
+    <section aria-labelledby="solver-2d">
+      <h2 id="solver-2d">2D RZ の離散化と解法</h2>
+      <p>2D RZ のイオンは、電子の 2D 熱伝導と同じ<a href="discretization.html#terms-node-local">節点局所の演算子</a>に、イオンの係数を入れて組む。セルの係数は上の流束制限で置き換えた κ、熱容量は ρc<sub>v,i</sub> である。ボイドのセルと退避済みのセルは伝導しない。面の伝導率の方針 <code>face_kappa_policy</code> が <code>"kirchhoff_same_material"</code> のときは、κ<sub>i</sub>∝T<sub>i</sub><sup>5/2</sup> に対する割線（指数 5/2）を各対に掛け、<code>"harmonic"</code> のときは掛けない（指数 0）。<code>state_supply</code> を指定した z_bottom と z_top の側は、電子と同じく、供給温度に保つ（単一ブロックのメッシュ）。</p>
+      <p>時間積分は、電子の 2D 熱伝導と同じ STS の段列（<code>sts_*</code> のキー。<code>sts_scheme</code> が RKL2 を選ぶときは RKL2 の段列）を、イオン温度 T<sub>i</sub> に対して回す。陽的な安定限界は、演算子の Gershgorin の上界 λ<sub>G</sub> から求める。</p>
+      $$
+      \Delta t_{exp}=\frac{4\,C_{cond}}{\lambda_G},\qquad C_{cond}=\texttt{Numerics.dt.cfl\_cond}.
+      $$
+      <p>ここで C<sub>cond</sub> は安全係数（<a href="time-integration.html#terms-sts">STS の用語</a>）である。割線を使うときの上界は計算に使った温度での値なので、各段の上界を、計画に使った値の 1+<code>sts_bound_margin</code> 倍と比べる。超えた段があれば、計画を立て直してステップをやり直す。やり直しは <code>sts_bound_retries_max</code> 回までで、それでも超えるときは、ドライバに全ステップの再試行を要求する（<a href="time-integration.html#sts">スーパータイムステッピング</a>の手順 6 と同じ）。段の総数が <code>sts_total_stages_max</code> を超えたときも、全ステップの再試行を要求する。</p>
+      <p><strong>時間刻みの上限。</strong>2D の熱伝導が大域ステップに課す上限は、電子側の上限とイオン側の上限の小さいほうである。電子側が <code>solver="dmp_implicit"</code> のときは、電子の上限は無限大になり、イオン側の上限だけが残る。イオンは <code>dmp_implicit</code> では解かず、常に STS（または RKL2）で解くからである。</p>
+      <p><strong>記帳。</strong>解いた温度の変化から、各セルのイオンエネルギーの変化 ρc<sub>v,i</sub>V(T<sub>i</sub><sup>new</sup>−T<sub>i</sub><sup>old</sup>) を求め、単一の材料のセルでは、質量で割って e<sub>i</sub> に記帳する。供給温度に保った側へ入る熱は、電子の熱伝導と同じ形で、<code>bc_flux_z_bottom</code> と <code>bc_flux_z_top</code> の伝導の記帳に足す。イオン温度の下限（<code>floors.Ti</code>）で加えたエネルギーとクランプの数は、そのステップの下限の記帳に入る。解いたあとに、2D の流体の閉包を作り直してイオン温度、圧力、音速を求め直す。2D のイオン熱伝導は 1 ランクだけで実行できる（実行時の表明が 2 ランク以上で停止する）。</p>
+    </section>
+
+    <section aria-labelledby="coupling">
+      <h2 id="coupling">ステップの中の位置と、併用の条件</h2>
+      <p>イオンの熱伝導は、電子の熱伝導とその EOS の閉包のあとに、同じ演算子の中で解く。2D では、電子側が全ステップの再試行を要求したステップは、イオンを解かない。イオン側が全ステップの再試行を要求する理由は 2 つで、STS の上界の検査が使い果たされたとき（<code>sts_bound_exceeded</code>）と、混合セルの材料を評価できなかったときである。</p>
+      <p>入力検査は、<code>ion_conduction=True</code> と <code>conduction.enabled=True</code> の組に、次を要求する（<code>enabled</code> が偽のときは、イオンの熱伝導は働かない）。</p>
+      <ul>
+        <li>次元は 1D_SPH（<code>Mesh.geometry_1d</code> で平面・円筒・球）または 2D_RZ であること。</li>
+        <li>2 温度モデル（<code>Main.temperature_model="2T"</code>）であること。</li>
+        <li>1D では、<code>Numerics.materials.per_material_conservation_enabled</code> が無効であること（イオンの解法はセルのイオンエネルギーを記帳し、材料のエネルギーを記帳しない）。</li>
+        <li>2D では、材料別の保存モードと併用するときは <code>mixed_cell_closure="pressure_relaxation"</code> であること。このとき混合セルのイオンエネルギーの変化は、圧力緩和の規則で材料に配る。</li>
+        <li><code>eos.hydro_backend="mie_gruneisen"</code> の材料がないこと（その閉包はイオンエネルギーからイオン温度を定めない）。</li>
+        <li><code>ion_f_lim</code> が有限で 0 より大きいこと。</li>
+      </ul>
+    </section>
+
+    <section aria-labelledby="controls">
+      <h2 id="controls">namelist による制御</h2>
+      <p>以下は <code>Numerics.conduction</code> のうち、イオン熱伝導のキーである。2D RZ のイオンの時間積分は、<a href="time-integration.html#controls">時間積分の頁</a>の <code>sts_*</code> のキーに従う。全項目と検証規則は <a href="../../use/namelist.html">namelist リファレンス</a>を参照のこと。表の既定値は、デッキで指定しないときの値である。</p>
+      <table class="quick-facts">
+        <thead>
+          <tr><th>キー</th><th>既定値</th><th>用途</th></tr>
+        </thead>
+        <tbody>
+          <tr><th><code>ion_conduction</code></th><td><code>False</code></td><td>Braginskii のイオン熱伝導（2 温度の 1D と 2D RZ。Studio が受け付けるのは 1D だけ）を電子の後に解く。</td></tr>
+          <tr><th><code>ion_f_lim</code></th><td><code>1.0</code></td><td>イオン熱流束の上限（イオンの自由飛行の流束の倍数）。</td></tr>
+        </tbody>
+      </table>
+
+    </section>
+
+    <section aria-labelledby="verification">
+      <h2 id="verification">検証</h2>
+      <ul>
+        <li><strong>1D（<code>test_conduction_ion_1d</code>）：</strong>平面の離散固有モードが、解析的に導いた Braginskii の伝導率の減衰率で減衰すること（1 ステップで振幅が 1/2 になる設定で、振幅比が 0.5 から 10<sup>−5</sup> 以内。64 セルの 1 ブロックの縮約と、1024 セルの cuSPARSE の両方）。電子の場がビット単位で変わらないこと。球の高温点を陽的な安定限界の約 10<sup>4</sup> 倍の時間刻みで進めても、エネルギーの総和が絶対値の和の 10<sup>−12</sup> 倍以下で保存され、温度が初期の最小値と最大値の範囲を出ないこと。温度の段差の面を通る熱が上限 q<sub>max</sub>Δt を超えず、上限の 0.8 倍以上になり、制限がなければ上限の 10 倍を超えること。ボイドのセルを越えて熱が伝わらないこと（ボイドのセルを挟むと、低温側が得るエネルギーは相対 10<sup>−13</sup> 以下、挟まないと 10<sup>−3</sup> 以上）。2 セルの長い時間刻みで、質量平均の温度に 10<sup>−3</sup> 以内で平衡すること。</li>
+        <li><strong>2D RZ（<code>test_conduction_ion_2d</code>）：</strong>一様なイオン温度がビット単位で保たれ、電子が変わらず、キーがなければ何も起きないこと。1 ステップの結果を、Braginskii の伝導率を定義から書いたホスト側の実装と、段の列（チェビシェフと RKL2）で突き合わせ、エネルギーの記帳を検査すること（e<sub>i</sub> への記帳が c<sub>v,i</sub>(T<sub>new</sub>−T<sub>old</sub>) に一致し、温度の振幅で規格化した差が 10<sup>−13</sup> 以下。イオンの全エネルギーの変化が相対 10<sup>−13</sup> 以下）。小さなガウス分布の線形拡散の厳密解との比較（誤差の許容値 0.01）。点状の解放から広がる非線形の熱波の相似解（Barenblatt–Pattle 型）との比較（形の誤差と波面の位置が 5% 以下、エネルギーが 10<sup>−12</sup> 以下の相対誤差で保存）。ステップごとの上界の検査が、割線の段列を計画の範囲に保つこと。流束制限が解に効くこと（急な前面で制限なしの 0.5 倍未満、緩い勾配では 0.95 倍超）と、ビット単位の再現。演算子の非対角の符号と、床の温度の背景の中の高温のセル。混合セルの圧力緩和で、同じ材料の 2 つの組が 1 つの材料の計算を再現すること。</li>
+      </ul>
+    </section>
+
+    <section aria-labelledby="references">
+      <h2 id="references">参考文献</h2>
+      <ol class="references">
+        <li>S. I. Braginskii, "Transport Processes in a Plasma," Reviews of Plasma Physics 1, 205–311 (1965).</li>
+      </ol>
+    </section>
+
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["$$", "$$"], ["\\[", "\\]"]] } };</script>
+  <script defer src="../../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../../nav.js" data-page="conduction-ion" data-root="../../"></script>
+</body>
+</html>

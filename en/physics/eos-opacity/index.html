@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en" data-lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>EOS, opacity and ionization — TENRYU Documentation</title>
+  <link rel="stylesheet" href="../../../style.css">
+  <script src="../../../theme.js"></script>
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>EOS, opacity and ionization <span class="badge">reference</span></h1>
+    <p class="abstract">TENRYU's material closure connects the material composition, the equation of state (EOS), the mean ionization, and the opacity to one cell state. The EOS closes the temperature, pressure, and specific heat, and the ionization model supplies the electron number density. The electron density feeds the conduction and laser physics, and the opacity, together with the Planck fractions, becomes the group coefficients used by radiation transport. This page describes the physical mechanism of the whole material closure, the data flow, where the closures are called, and the void materials. The details of the EOS, the ionization, and the opacity are split over the three pages below.</p>
+
+    <aside class="planned" aria-labelledby="at-a-glance">
+      <h3 id="at-a-glance">At a glance</h3>
+      <ul>
+        <li><code>ideal_gas</code> is an analytic two-temperature (2T) EOS; <code>tmat</code> interpolates \(P,e,c_v\) tables and provides a \(T(\rho,e)\) <a href="eos.html#terms-reclosure">inverse map</a>.</li>
+        <li>\(n_e=\bar Z\rho/(A m_p)\) is the central link from EOS and ionization to conduction and laser coefficients.</li>
+        <li>Opacity \(\kappa\) is a mass opacity in cm²/g. Transport uses the distinct length opacity \(\sigma=\rho\kappa\) in cm⁻¹.</li>
+        <li><code>PlanckTable</code> builds the Planck fractions \(b_g(T)\) on finite group bounds and diagnoses the spectral tails that fall outside the groups (the <a href="opacity.html#terms-planck">tail deficit</a>). A temperature outside the table range is <a href="../../overview/numerics-foundations.html#floors-safety">clamped</a> to the value at the nearer end.</li>
+      </ul>
+    </aside>
+
+    <div class="card-grid">
+      <a class="card" href="eos.html"><h3>Equation of state</h3><p>The ideal-gas and TMAT-H5 tabulated EOS, the temperature recovery by the inverse map, and the treatment of energies above the table.</p></a>
+      <a class="card" href="ionization.html"><h3>Ionization and collisional effective charge</h3><p>The mean-ionization models, the collisional effective charge, and sequential stripping.</p></a>
+      <a class="card" href="opacity.html"><h3>Opacity</h3><p>Constant and tabulated opacities, the mixing rules of mixed cells, the Planck fractions, and the tail deficit.</p></a>
+    </div>
+
+    <section aria-labelledby="mechanism">
+      <h2 id="mechanism">Physical mechanism</h2>
+      <p>The evolution operators advance conserved quantities; everything else needed by the physics — \(P\), \(T\), \(c_v\), \(\bar Z\), and \(\kappa\) — must be reconstructed from material closures at the cell state. High-energy-density matter can span an enormous range within one shot, from cold solid to multi-keV plasma, while opacity changes by orders of magnitude. The analytic-versus-tabulated choice is therefore a per-material choice between clarity and fidelity.</p>
+      <p>The analytic baseline is a two-temperature ideal gas with independent electron and ion branches, whereas real target materials use TMAT-H5 tables of \(P\), \(e\), and \(c_v\) (TMAT-H5 is TENRYU's tabulated-material format and its HDF5 container, specified in the repository's <code>docs/TMAT_H5_SPEC.md</code>; see the <a href="eos.html#terms-tmat">terms section</a>). The <a href="eos.html#terms-reclosure">inverse map</a> \(T(\rho,e)\) is the workhorse because hydro closes energy, not temperature: every <a href="../../overview/numerics-foundations.html#operator-splitting">re-closure</a> performs a monotone binary search of the energy row at a fixed density bracket, then interpolates in \(\log T\). The GPU path is deliberately Newton-free — robust, deterministic, and free of a convergence branch. An energy below the table's lowest temperature clamps to the end temperature; an energy above the highest temperature is closed by an ideal-gas extension rather than clamped in the default 1D closure (see <a href="eos.html#eos-models">Ideal-gas and TMAT equations of state</a>).</p>
+      <p>Mean ionization is the key coupling quantity. The mean ionization \(\bar Z\) sets \(n_e=\bar Z\rho/(A m_p)\), and \(n_e\) enters Spitzer conduction, inverse-bremsstrahlung (IB) collision rates, the electron EOS branch, and radiation–matter coupling. TENRYU can use fixed \(\bar Z=Z\), the Thomas–Fermi More fit, or tabular \(\bar Z(\rho,T_e)\); dynamic models are reevaluated at the conduction and radiation entrances so each operator sees ionization consistent with its starting state. Collision rates weight \(Z^2\), not \(Z\): when charge-state fractions are available, \(r_2=\langle Z^2\rangle/\bar Z^2\) upgrades the Spitzer and SNB (Schurtz–Nicolaï–Busquet nonlocal electron conduction — see <a href="../conduction/snb.html#snb">Conduction</a>) charge factors to the <a href="ionization.html#terms-zeff">collisional effective charge</a> \(Z_{\rm eff}=\bar Zr_2\).</p>
+      <p>Transport needs the Rosseland mean, a flux-weighted mean of \(1/\kappa_\nu\) (a harmonic mean of the opacity). Radiation flows through all frequency channels simultaneously — in parallel — so, exactly as with parallel resistors, the easiest path dominates: transparent spectral windows control the Rosseland mean. Emission and absorption instead need Planck means, linear emission-weighted means of \(\kappa_\nu\) in which strong spectral lines dominate. The <a href="opacity.html#terms-mixed">mixed-cell</a> rule <code>"harmonic_mass_R"</code> follows the same physics: Planck opacities add mass-linearly as absorbers, while Rosseland opacities combine harmonically through transparent paths. Planck fractions \(b_g(T)\) close the finite group structure by summing to one, and the tail that falls outside the groups is diagnosed as a deficit (<a href="opacity.html#terms-planck">Groups, Planck fraction, and tail deficit</a>). An IONMIX table (the <code>.cn4</code> material-table format of the collisional-radiative code Ionmix) without an emission-opacity block is taken as an LTE (local-thermodynamic-equilibrium) table, with a warning and \(\kappa^{PE}=\kappa^{PA}\).</p>
+    </section>
+
+    <section aria-labelledby="closure-flow">
+      <h2 id="closure-flow">From material data to transport coefficients</h2>
+      <p><code>Material.A</code> is the mean mass per ion in amu, while <code>Material.Z</code> is the mean atomic number or representative charge. For one material, \(n_i=\rho/(A m_p)\) and \(n_e=\bar Z n_i\), where \(m_p=1.6726\times10^{-24}\) g is the proton mass. TENRYU deliberately treats the atomic mass unit as \(m_p\), a convention that fixes its set of physical constants; the ≈0.73% offset from the true amu is absorbed into the material's effective \(A\). For a compound, \(A\) is the number-fraction mean ion mass, not the molecular mass: equiatomic CH uses 6.5 and CD uses 7. This convention aligns the EOS and opacity density axes with downstream particle-density calculations.</p>
+      <p>The EOS closes pressure, temperature, and heat capacity; ionization supplies \(\bar Z\) (<a href="#fig-eos-opacity-flow">Figure A</a>). The resulting \(n_e\) drives electron conduction and inverse-bremsstrahlung laser absorption. On a separate branch, opacity combines with temperature-dependent Planck fractions to produce group coefficients for <a href="../radiation/fld.html">flux-limited diffusion (FLD)</a> or <a href="../radiation/sn.html">discrete ordinates method (\(S_N\))</a> radiation transport. All branches share the material state but remain independently testable.</p>
+      <ul>
+        <li>\(A\) — the number-fraction mean ion mass: CH uses 6.5 and CD uses 7. This density-axis convention keeps EOS, opacity, and particle densities consistent.</li>
+        <li>\(n_e=\bar Z\rho/(A m_p)\) — the electron density passed from composition and ionization into collisional transport and coupling coefficients.</li>
+        <li>\(\kappa\) versus \(\sigma=\rho\kappa\) — mass opacity is stored in cm²/g; transport consumes the distinct length opacity in cm⁻¹.</li>
+        <li><code>cv_e_override</code> — a volumetric heat capacity in erg/(cm³·eV). It feeds the same constant to the Fleck factor (the linearization coefficient that couples radiation emission and absorption implicitly — see <a href="../radiation/fld.html">FLD</a>) as a verification convention, not as a material-fitting knob.</li>
+        <li>\(r_2=\langle Z^2\rangle/\bar Z^2\) — clamped to 1–10 before forming the collisional \(Z_{\rm eff}=\bar Zr_2\) (<a href="ionization.html#terms-zeff">terms</a>). The clamp is a numerical safeguard, not physics: \(r_2\ge1\) holds by construction (it is a variance ratio), and the ceiling of 10 bounds the correction against degenerate or corrupt fraction tables.</li>
+        <li>\(10^{-20}\) cm²/g — the floor (see <a href="../../overview/numerics-foundations.html#floors-safety">Floors, clamps, and safety guards</a>) applied to each component's Rosseland opacity before the harmonic mean of <code>"harmonic_mass_R"</code>. It sits many orders below any physical opacity and exists solely to keep the harmonic combination finite when a component is exactly zero.</li>
+      </ul>
+
+      <figure id="fig-eos-opacity-flow">
+        <img src="../../../assets/eos-opacity-flow-en.png" width="960" height="560" style="max-width:100%;height:auto" alt="Data flow from material data and cell state through the EOS re-closure (temperature, pressure, heat capacity), ionization, electron density, and collisional effective charge to conduction, laser absorption, and the electron EOS; and from opacity and Planck fractions to group coefficients and radiation transport. The dashed box at the bottom describes void materials">
+        <figcaption>Figure A. Material-closure data flow. Solid boxes are steps or quantities, arrows give the data direction, and color gives the role (gray: inputs; blue: EOS, ionization, electron density; yellow: opacity and group coefficients; green: the physics that consumes them); the dashed box is the material exception (void). Ionization and opacity read the EOS-closed \(\rho,T_e\), and opacity with the Planck fractions forms the group radiation coefficients. Energy above the table's top temperature is closed, in the 1D default closure, by an ideal-gas continuation of the top row; legacy and 2D RZ clamp at the top temperature. This is a schematic of the text, not a computed figure.</figcaption>
+      </figure>
+    </section>
+
+    <section aria-labelledby="pipeline">
+      <h2 id="pipeline">Where the closures are called, step by step</h2>
+      <ol>
+        <li><p><strong>Initialize.</strong> Load the material tables, tabulate the configured Python callables and <a href="../../use/running.html#terms-freeze">freeze</a> the configuration, and build <code>PlanckTable</code> on the radiation-group bounds.</p></li>
+        <li><p><strong>Re-close after each hydro half-step.</strong> Recover \(T\) from the evolved \((\rho,e)\) with the <a href="eos.html#terms-reclosure">inverse map</a>, then evaluate \(P\) and \(c_v\) forward while reusing the same density bracket.</p></li>
+        <li><p><strong>Enter conduction.</strong> Refresh dynamic \(\bar Z\), form \(n_e=\bar Z\rho/(A m_p)\), and evaluate the conductivity coefficients from that entrance state.</p></li>
+        <li><p><strong>Enter radiation.</strong> Refresh \(\bar Z\) and \(Z_{\rm eff}\), evaluate \(\kappa_R\), \(\kappa^{PA}\), and \(\kappa^{PE}\) at \((\rho,T_e)\), convert each mass opacity to \(\sigma=\rho\kappa\), and evaluate \(b_g(T_e)\).</p></li>
+        <li><p><strong>Mix material contributions.</strong> In mixed cells, combine the material opacities by <code>Materials.opacity_mix_rule</code>, evaluating each material's table at its <a href="opacity.html#terms-mixed">partial density</a>; a cell whose <a href="opacity.html#terms-mixed">dominant material</a> is NLTE takes that material's NLTE coefficients.</p></li>
+        <li><p><strong>Apply the safeguards.</strong> Raise a non-positive \(c_v\) to a floor (with a single warning when the table is built), clamp table-domain accesses to the end values, and apply the Rosseland opacity floor. In the default 1D closure, an energy above the table's value at its highest temperature is closed by an ideal-gas extension rather than clamped (see <a href="eos.html#eos-models">Ideal-gas and TMAT equations of state</a>).</p></li>
+      </ol>
+    </section>
+
+    <section aria-labelledby="void-materials">
+      <h2 id="void-materials">Void materials</h2>
+      <p>A void is a material that represents a region without matter, such as the vacuum outside the target, on the grid. A material with <code>is_void=True</code> (a void material) skips EOS and opacity table loading. Its EOS is fixed to an ideal gas, its opacity to <code>kappa_a=kappa_s=0</code>, and its \(Z\) to 0; \(A\) is 1 unless given. A cell whose non-void volume fractions sum to at most \(10^{-12}\) is a void cell, and its <code>cell_is_void</code> mask is set to 1 at initialization. A void material is excluded from the mixed-cell averages \(\bar Z_{\rm eff}\) and \(A_{\rm eff}\) (<a href="ionization.html#terms-zeff">terms</a>; these are mixture averages — distinct from the collisional \(Z_{\rm eff}=\bar Zr_2\) above), from the EOS averages, and from mass-fraction mixing; its volume fraction only derives the <code>cell_is_void</code> mask. A void cell forces \(\bar Z=0\) and skips the Thomas–Fermi evaluation. In a void cell the thermal conductivity is set to zero, so the cell is adiabatic; the absorption and emission coefficients are set to zero, so radiation and matter exchange no energy; and the electron density is zero, so the laser is neither absorbed nor refracted. The initial \(\rho,T_e,T_i\) of a void cell come from <code>Materials.void_config</code>, not from the deck's <code>Geometry.rho</code>, <code>Te</code>, and <code>Ti</code>.</p>
+    </section>
+
+    <section aria-labelledby="controls">
+      <h2 id="controls">Namelist controls</h2>
+      <p>The table lists the controls for the material composition and for voids. The keys of the EOS, the ionization, and the opacity are in the namelist section of each page. See the <a href="../../use/namelist.html">namelist reference</a> for complete validation rules.</p>
+      <table class="quick-facts">
+        <thead>
+          <tr><th>Key</th><th>Value/default</th><th>Purpose</th></tr>
+        </thead>
+        <tbody>
+          <tr><th><code>Material.A</code>, <code>Material.Z</code></th><td>per material</td><td>Mean ion mass [amu] and representative nuclear charge.</td></tr>
+          <tr><th><code>Material.is_void</code></th><td><code>False</code></td><td>Makes the material a void (defined in <a href="#void-materials">the section below</a>); no EOS or opacity table is loaded, and it is excluded from the coupling to conduction, radiation, and the laser.</td></tr>
+          <tr><th><code>Materials.void_config</code></th><td><code>rho</code>, <code>Te</code>, <code>Ti</code> = \(10^{-10}\) g/cm³, \(10^{-3}\) eV, \(10^{-3}\) eV</td><td>Initial density and temperatures of void cells. They take precedence over the deck's <code>Geometry.rho</code>, <code>Te</code>, and <code>Ti</code>.</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["$$", "$$"], ["\\[", "\\]"]] } };</script>
+  <script defer src="../../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../../nav.js" data-page="eos-opacity" data-root="../../"></script>
+</body>
+</html>

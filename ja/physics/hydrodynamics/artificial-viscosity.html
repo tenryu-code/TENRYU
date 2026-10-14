@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="ja" data-lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>人工粘性と砂時計モードの制御 — TENRYU ドキュメント</title>
+  <link rel="stylesheet" href="../../../style.css">
+  <script src="../../../theme.js"></script>
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>人工粘性と砂時計モードの制御</h1>
+    <p class="abstract">衝撃波の捕捉（shock capturing）に使う人工粘性（artificial viscosity、AV）として、スカラー vNR（von Neumann–Richtmyer）粘性、1D の CSW 形式、2D RZ の CSW98（Caramana–Shashkov–Whalen 1998）の辺人工粘性を述べる。あわせて、双一次四辺形に生じるゼロエネルギーの砂時計モード（hourglass mode）を抑えるサブゾーン圧力と、従来の砂時計抑制の経路を述べる。この計算に固有の用語（サブゾーン圧力、辺人工粘性）は<a href="#terms">用語の節</a>で説明する。</p>
+
+    <section aria-labelledby="terms">
+      <h2 id="terms">この計算で使う用語</h2>
+      <p>サブゾーン圧力と辺人工粘性は、四辺形セルの力を節点へ配る単位として、コーナー、サブゾーン、辺を使う。ここに挙げる用語は、TENRYU の実装に固有の意味で使うので、まとめて定義する。記号 \(c\)、\(k\)、\(n\)（セル、コーナーの番号、節点）と、コーナー、サブゾーン、コーナー質量、メディアンメッシュは、<a href="discretization.html#terms">空間離散化の頁の用語の節</a>で定義する。</p>
+
+      <h3 id="terms-subzonal-pressure">サブゾーン圧力</h3>
+      <p><strong>サブゾーン圧力（subzonal pressure）</strong>は、サブゾーンごとの密度のずれから作る圧力の摂動で、砂時計モードに抵抗する力を与える（Caramana–Shashkov [3]）。ラグランジュ運動のあいだコーナー質量 \(m_{c,k}\) を固定すると、サブゾーンの密度 \(\rho^{sub}_{c,k}\) はサブゾーンの体積だけで決まる。この密度とセルの比内部エネルギーから EOS で圧力 \(p^{sub}_{c,k}\) を求め、セルの圧力 \(P_c\) との差 \(\delta p_{c,k}=p^{sub}_{c,k}-P_c\) を作る。コーナー \(k\) に働く力は、メディアンメッシュのベクトル \(\mathbf S^{med}_k\)（辺 \(k\to k+1\) の分）を使って次のように書ける。</p>
+      $$
+      \begin{aligned}
+      \delta\mathbf f^{sub}_{c,k}=M_f\Bigl[&(\delta p_{c,k}+\delta p_{c,k+1})\,\mathbf S^{med}_k\\
+      &-(\delta p_{c,k}+\delta p_{c,k-1})\,\mathbf S^{med}_{k-1}\Bigr].
+      \end{aligned}
+      $$
+      <p>丸め誤差で残るセル平均の力を引いて、\(\sum_k\delta\mathbf f^{sub}_{c,k}=0\) にする。\(M_f\) は、サブゾーンの密度のずれ \(x_c=(\max_k\rho^{sub}_{c,k}-\rho_c)/\rho_c\) が 0 のとき 0 で、\(x_c\) とともに増える重み（merit factor）である。既定（<code>subzonal_merit_mode="caramana_auto"</code>）では、\(x_c\le2\alpha_2\) で \(M_f=\bigl[\tfrac{\alpha_1}{2}\bigl(1-\cos\tfrac{\pi x_c}{2\alpha_2}\bigr)\bigr]^n\)、\(x_c>2\alpha_2\) で \(M_f=\alpha_1^n\) とする。\(\alpha_1=\sqrt2\)、\(\alpha_2=0.1\)、\(n=2\) が既定で、キーは <code>subzonal_alpha1</code>、<code>subzonal_alpha2</code>、<code>subzonal_merit_power</code> である。この力は、セルの形が歪んでサブゾーンの体積の比が変わるときにだけ働き、一様な膨張・収縮では 0 である。</p>
+      <p>サブゾーン圧力の力の剛性（stiffness）は、時間刻みの上限 \(\Delta t_c\le s\,\theta_*/\omega_c\) を与える。\(\omega_c\) は、サブゾーン圧力の力が作る振動の振動数の上界（<code>subzonal_dt_length_mode="corner_bound"</code>、既定）、\(s\) は <code>subzonal_dt_spectral_safety</code>（既定 0.5）、\(\theta_*\) は <code>subzonal_dt_omega_dt_limit</code>（既定 2）である。この上限は <code>subzonal_dt_limiter_enabled=False</code> で外せる。サブゾーン圧力を有効にすると、この上限が計算の時間刻みにも効く。</p>
+      <p>ここに書いたサブゾーン圧力の力は、省略したときの既定のモデル（<code>subzonal_force_model="legacy_median"</code>）のものである。このキーは、ほかに <code>hourglass_potential</code> と <code>merit_potential_v1</code> を受け付ける。<code>hourglass_potential</code> は、サブゾーンの密度のずれではなく、四辺形の砂時計モードの大きさに対する剛性ポテンシャル（stiffness potential）から力を作るモデルで、<code>aw_compatible_force_work=True</code> を要する（剛性の係数は <code>hourglass_potential_kappa</code>、既定 0.1）。<code>merit_potential_v1</code> は、サブゾーンのエネルギーの厳密な勾配を力とするモデルで、面積重み付きの運動量式とは組めず、入力検証が拒否する。<code>work_conjugate_v1</code> は名前だけが認識され、実装されておらず、入力検証が拒否する。</p>
+
+      <h3 id="terms-edge-av">辺人工粘性</h3>
+      <p><strong>辺人工粘性（edge-centered artificial viscosity）</strong>は、セルの辺ごとに、辺の両端の節点の速度差 \(\Delta\mathbf v_e\) の向きに働く粘性の力である（CSW98 [2]）。辺 \(e\) の両端の節点に、大きさが等しく向きが逆の力として配るので、粘性は運動量を保ち、運動エネルギーを内部エネルギーへ移すだけで、逆向きの移動は起こさない。辺が圧縮しているときだけ働き、膨張では 0 である。</p>
+      <p><strong>辺ベクトル（edge vector）</strong>\(\mathbf S_e\) は、辺 \(e\) のメディアンメッシュのベクトルである。平面では \(R(-90^\circ)(\mathbf x_c-\mathbf m_e)\)（\(\mathbf x_c\) はセル中心、\(\mathbf m_e\) は辺の中点）に等しい。2D RZ では、回転体の体積勾配 \(\mathbf a_k=\partial V/\partial\mathbf x_k\) から \(\mathbf b_k=\mathbf a_k-\bar{\mathbf a}\)（\(\bar{\mathbf a}\) は 4 つの \(\mathbf a_k\) の平均）を作り、\(\mathbf S_{k-1}-\mathbf S_k=\mathbf b_k\) と \(\sum_k\mathbf S_k=0\) を満たすベクトルとして定める。これにより、各辺の速度差 \(\Delta\mathbf v_k\) との積の和 \(\sum_k\mathbf S_k\cdot\Delta\mathbf v_k\) は、セルの体積変化率から、半径方向の一様な並進による寄与を除いた量に等しくなる。</p>
+      <p><strong>圧縮側スイッチ（compression switch）</strong>は、辺の粘性力を働かせる条件 \(\Delta\mathbf v_e\cdot\mathbf S_e&lt;0\) である。左辺は、セルの体積変化率（RZ では並進の寄与を除いた量）への辺 \(e\) の寄与なので、負のとき辺は圧縮している。力は \(\Delta\mathbf v_e\cdot\mathbf S_e\to0^-\) で連続に 0 になる。</p>
+      <p><strong>制限関数（limiter）</strong>\(\psi_e\) は、辺の粘性力を \((1-\psi_e)\) 倍に弱める係数で、\(\psi_e=\max\bigl[0,\min\bigl(1,\,2r_L,\,2r_R,\,\tfrac12(r_L+r_R)\bigr)\bigr]\) と書ける（CSW98 [2] の式 12、18）。\(r_L\)、\(r_R\) は、同じ論理線（メッシュの同じ格子線）上で辺の両隣にある 2 本の辺の速度勾配を、この辺の速度勾配で割った比である。速度が座標の線形関数（自己相似圧縮、剛体回転、線形ずり）のとき \(r_L=r_R=1\) となって \(\psi_e=1\)、辺の力は 0 になる。隣の辺が圧縮していない衝撃波の足元や後端では \(\psi_e\) が 0 に近づき、粘性が全力で働く。</p>
+      <p><strong>Kuropatenko 波速（Kuropatenko wave speed）</strong>\(W_e\) は、辺の粘性力の大きさを決める速さで、辺の力は \(\Delta\mathbf v_e\cdot\mathbf S_e&lt;0\) のとき次の式で与えられ、ほかでは 0 である。</p>
+      $$
+      \begin{aligned}
+      W_e&=C_2\frac{\gamma+1}{4}|\Delta\mathbf v_e|+\sqrt{\Bigl(C_2\frac{\gamma+1}{4}\Bigr)^2|\Delta\mathbf v_e|^2+C_1^2c_{s,e}^2},\\
+      \mathbf f_e&=\rho_eW_e\,(1-\psi_e)\,(\Delta\mathbf v_e\cdot\mathbf S_e)\,\widehat{\Delta\mathbf v}_e.
+      \end{aligned}
+      $$
+      <p>弱い圧縮（\(|\Delta\mathbf v_e|\to0\)）で \(W_e\to C_1c_{s,e}\)、強い圧縮で \(W_e\to2C_2\frac{\gamma+1}{4}|\Delta\mathbf v_e|\) となる [4]。\(\widehat{\Delta\mathbf v}_e\) は \(\Delta\mathbf v_e\) 方向の単位ベクトル、\(\rho_e\) と \(c_{s,e}\) は辺を共有する 2 セルの密度と音速の調和平均（harmonic mean。物理境界ではそのセルの値）、\(\gamma\) は比熱比（ratio of specific heats、<code>ideal_gas_gamma</code>。2D の多材料（multi-material）のクロージャではセルごとの有効な \(\gamma\) の調和平均）である。</p>
+      <p>辺人工粘性は <code>av_model="csw_edge_csw98"</code> で選ぶ（2D RZ のデッキで省略したときの既定）。係数 \(C_1\)、\(C_2\) は <code>av_C1</code>、<code>av_C2</code> で、2D の辺モデルで省略したときの既定は 1 である。辺の力は別の配列に保持し、同じ力から内部エネルギーへの仕事を作る。時間刻みには、力が 0 でない辺が \(\Delta t_e=C_{av}|\Delta\mathbf x_e|/\bigl[|\Delta\mathbf v_e|(1-\psi_e)\,|\widehat{\Delta\mathbf v}_e\cdot\hat{\mathbf S}_e|\bigr]\) の上限を課す（\(C_{av}\) は <code>av_cfl_coefficient</code>、既定 0.25。\(\Delta\mathbf x_e\) は辺のベクトル、\(\hat{\mathbf S}_e\) は \(\mathbf S_e\) の単位ベクトル）。節点の剛性から決まる上限（<code>csw98_dt_stiffness_safety</code>、既定 1）がさらに加わる。</p>
+
+    </section>
+
+    <section aria-labelledby="artificial-viscosity">
+      <h2 id="artificial-viscosity">人工粘性</h2>
+      <p>従来のスカラー von Neumann–Richtmyer 粘性 [1] は圧縮時にのみ働く。以下は 2D RZ の <code>scalar_vnr_legacy</code> の式である。TENRYU の 2 次項の係数は \(C_2\) ではなく \(C_2^2\) である。</p>
+      $$
+      Q_c=
+      \begin{cases}
+      \rho_c\left[C_2^2(\Delta l_c)^2(\nabla\!\cdot\!\mathbf u_c)^2
+      +C_1\Delta l_c\,c_{s,c}\lvert\nabla\!\cdot\!\mathbf u_c\rvert\right],
+      &amp; \nabla\!\cdot\!\mathbf u_c&lt;0,\\
+      0, &amp; \text{otherwise},
+      \end{cases}
+      \qquad \Delta l_c=\sqrt{A_c}.
+      $$
+      <p>ここで \(c_{s,c}\) はセルの音速、\(\nabla\!\cdot\mathbf u_c\) はセル平均の速度発散、\(C_1\)・\(C_2\) は直後に既定値を示す線形・2 次の係数である。1D の <code>vnr</code> は、この式の \(\nabla\!\cdot\mathbf u_c\) の代わりに、節点の傾きを制限して再構成した速度から作る圧縮速度（compression rate。セルの速度勾配の負の部分、単位 1/s）を使い、衝撃波の判定に基づく重みを掛ける。</p>
+      <p>一般的な既定値は <code>av_C1=0.1</code>、<code>av_C2=1.5</code> である。1D では <code>av_type</code> が <code>vnr</code>、任意選択のリーマン形式（Riemann-solver-based AV）、1D の CSW 形式を切り替え、1D のデッキで指定しないときは CSW 形式になる（構造体の既定は <code>vnr</code>）。1D の CSW 形式（<code>av_type="csw"</code>）は、CSW98 の制限関数を使う 1 次元の粘性である。節点の傾きを制限して再構成したセル端の速度から圧縮速度 \(\chi\) を作るので、速度が線形な圧縮では粘性が 0 になる。圧縮しているセルでは、この圧縮速度に、生の圧縮速度の \(f\,(1-\psi)\) 倍の下限を課す（\(f\) は <code>csw_shock_limiter_floor</code>、既定 0.65。\(\psi\) は CSW98 の式 12 の Christensen の制限関数で、隣のセルが圧縮していない衝撃波の足元・後端で 0、3 セルにわたって速度が線形な圧縮で 1）。\(\psi\) は速度の連続関数なので、粘性も速度の連続関数になる。2D では <code>av_model</code> が、従来の <code>scalar_vnr_legacy</code> か、エネルギー整合な辺力モデルかを選ぶ。2D RZ のデッキで省略したときの既定は <code>csw_edge_csw98</code> である。</p>
+      <p><code>csw_edge_csw98</code> は、旧実装 <code>csw_edge</code> の欠陥 — 辺ベクトルに、原典のメディアンメッシュのベクトルではなく辺自身の面積ベクトルを使っていたため、格子に整列した圧縮では力が構造的にゼロになる — を正した、2D RZ の既定のエネルギー整合な辺人工粘性である。<a href="#terms-edge-av">メディアンメッシュ上の辺ベクトル</a>に、厳密な圧縮側スイッチ、Kuropatenko の波速、符号付きのエネルギー整合な仕事を組み合わせて、辺の力を作る。連続辺（同じ論理線上で隣り合う辺）の制限関数は速度勾配を比較し、自己相似圧縮・剛体回転・線形な格子ずりでは制限比が 1 となって人工散逸（artificial dissipation）を抑える。2D の CSW 辺モデル（<code>csw_edge</code>、<code>csw_edge_csw98</code>）で <code>av_C1</code>・<code>av_C2</code> を省略した場合は、原論文と同じ \(C_1=C_2=1\) を使う。旧来の <code>csw_edge</code> は、過去の検証結果を引き継げるように、ビット単位で同一のまま保持している。名前だけ用意されている namelist 値 <code>csw_edge_plus_tensor_limited</code> は未実装で、入力検証が拒否する。</p>
+    </section>
+
+    <section aria-labelledby="subzonal-hourglass">
+      <h2 id="subzonal-hourglass">サブゾーン圧力と砂時計モード制御</h2>
+      <p>双一次のラグランジュ四辺形には、ゼロエネルギーの市松模様、すなわち砂時計モードが生じ得る。これを抑える機構は 2 つある。Caramana–Shashkov のサブゾーン圧力（<code>subzonal_pressure_enabled</code>）は、2D RZ のデッキで省略したときの既定で有効である。従来の <code>hourglass.enabled</code> の経路は、既定で無効である。サブゾーン圧力（定義と式は<a href="#terms-subzonal-pressure">用語の節</a>）は、ラグランジュ更新のあいだコーナー質量を固定したうえで、サブゾーンの現在の体積から各サブゾーンの密度を求め、EOS による圧力の摂動を評価して、セル内で正味 0 となるコーナー力を構成する。速度に対するフィルタではなくサブゾーンの体積変化に応答し、仕事も同じ力から計算する。</p>
+      <p>これとは別系統の従来経路 <code>hourglass.enabled</code> は、線形化したサブゾーン圧力による復元力、力の制限、エネルギー整合な仕事を用いる。並進やアフィンな伸縮・ずりを変えないまま、双一次の市松成分だけを抑える。この経路は、サブゾーン圧力を無効にしたときだけ働く。いずれも衝撃波捕捉用の人工粘性の代用ではない。サブゾーン圧力の力は、セルコーナー力を別々の配列に分けて随伴仕事でエネルギーを閉じるエネルギー整合な経路の上でのみ組み立てられる。このため、サブゾーン圧力は <code>av_model="scalar_vnr_legacy"</code> と組めず、<code>csw_edge</code>、<code>csw_edge_csw98</code>、<code>mimetic_tensor_v1</code>、<code>mimetic_tensor_rz_v2</code> のいずれかを要する。<code>csw_edge_csw98</code> 自体は、サブゾーン圧力の有無どちらでも実行できる。</p>
+    </section>
+
+    <section aria-labelledby="controls">
+      <h2 id="controls">namelist による制御</h2>
+      <p>以下は <code>Numerics.hydro</code> の主要キーの抜粋である。既定値は、デッキで省略したときの値である。2D RZ のデッキで省略したときと、構造体の既定（C++ のコードで組む Config の値）とで値の違うキーには、両方を書く。Studio は、<code>logical_mesh_2d="polar_in_box"</code> のメッシュを除いて、2D RZ の流体にこの表のキーを書かないので、Studio のデッキは 2D RZ で省略したときの既定で走る。全項目と検証規則は <a href="../../use/namelist.html">namelist リファレンス</a>を参照のこと。</p>
+      <table class="quick-facts">
+        <thead>
+          <tr><th>キー</th><th>既定値</th><th>用途</th></tr>
+        </thead>
+        <tbody>
+          <tr><th><code>av_type</code></th><td><code>"vnr"</code>（1D で未指定なら <code>"csw"</code>）</td><td>1D の衝撃波捕捉方式の選択：<code>vnr</code>、<code>riemann</code>、<code>riemann_compatible</code>、<code>csw</code>。</td></tr>
+          <tr><th><code>csw_C1</code> / <code>csw_C2</code></th><td><code>0.5</code> / <code>2.0</code></td><td>1D の CSW 形式の線形・2 次の係数（<code>av_C1</code>・<code>av_C2</code> とは別）。</td></tr>
+          <tr><th><code>csw_shock_limiter_floor</code></th><td><code>0.65</code></td><td>1D の CSW 形式の衝撃波での下限 \(f\)。下限は \(f(1-\psi)\) 倍の生の圧縮速度。</td></tr>
+          <tr><th><code>av_model</code></th><td>2D RZ のデッキで省略したとき <code>"csw_edge_csw98"</code>、構造体の既定は <code>"scalar_vnr_legacy"</code></td><td>2D RZ の衝撃波捕捉方式。<code>scalar_vnr_legacy</code>、<code>csw_edge</code>、<code>csw_edge_csw98</code>、<code>mimetic_tensor_v1</code>、<code>mimetic_tensor_rz_v2</code> から選ぶ（<code>csw_edge_plus_tensor_limited</code> は未実装で拒否される）。<code>csw_edge_csw98</code> は上記の欠陥を修正したエネルギー整合な CSW98 辺人工粘性である。</td></tr>
+          <tr><th><code>av_C1</code></th><td><code>0.1</code></td><td>線形人工粘性の係数。2D の CSW 辺モデルで省略した場合は 1.0（2D RZ のデッキで <code>av_model</code> も省略したときを含む）。</td></tr>
+          <tr><th><code>av_C2</code></th><td><code>1.5</code></td><td>2 次人工粘性の係数。スカラー vNR では \(C_2^2\) として入り、2D の CSW 辺モデルで省略した場合は 1.0。</td></tr>
+          <tr><th><code>subzonal_pressure_enabled</code></th><td>2D RZ のデッキで省略したとき <code>True</code>、構造体の既定は <code>False</code></td><td>Caramana–Shashkov のサブゾーン圧力の力（エネルギー整合）を有効化する。</td></tr>
+          <tr><th><code>hourglass.enabled</code></th><td><code>False</code></td><td>2D RZ における従来の線形化砂時計モード抑制経路を有効化する。サブゾーン圧力を無効にしたときだけ働く。</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section aria-labelledby="verification">
+      <h2 id="verification">検証</h2>
+      <ul>
+        <li>Noh・Sod 系の解析解による検査は、強衝撃波の位置と密度のプラトー、平面の厳密リーマン解における三波構造、質量と力積の収支、1D のエネルギー保存を確認する。2D RZ の検証デッキ <code>2d_rz_h1_sod_planar</code> と <code>2d_rz_h2_noh_cyl</code> は、平面 Sod と円筒 Noh の配置を実行する。</li>
+      </ul>
+    </section>
+
+    <section aria-labelledby="references">
+      <h2 id="references">参考文献</h2>
+      <ol class="references">
+        <li>J. von Neumann and R. D. Richtmyer, "A Method for the Numerical Calculation of Hydrodynamic Shocks," J. Appl. Phys. 21, 232–237 (1950). <a href="https://doi.org/10.1063/1.1699639">doi:10.1063/1.1699639</a></li>
+        <li>E. J. Caramana, M. J. Shashkov, and P. P. Whalen, "Formulations of Artificial Viscosity for Multi-dimensional Shock Wave Computations," J. Comput. Phys. 144, 70–97 (1998). <a href="https://doi.org/10.1006/jcph.1998.5989">doi:10.1006/jcph.1998.5989</a></li>
+        <li>E. J. Caramana and M. J. Shashkov, "Elimination of Artificial Grid Distortion and Hourglass-Type Motions by Means of Lagrangian Subzonal Masses and Pressures," J. Comput. Phys. 142, 521–561 (1998). <a href="https://doi.org/10.1006/jcph.1998.5952">doi:10.1006/jcph.1998.5952</a></li>
+        <li>V. F. Kuropatenko, "On Difference Methods for the Equations of Hydrodynamics," in <i>Difference Methods for Solutions of Problems of Mathematical Physics, I</i>, edited by N. N. Janenko (American Mathematical Society, Providence, 1967), p. 116.</li>
+      </ol>
+    </section>
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["$$", "$$"], ["\\[", "\\]"]] } };</script>
+  <script defer src="../../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../../nav.js" data-page="hydro-av" data-root="../../"></script>
+</body>
+</html>

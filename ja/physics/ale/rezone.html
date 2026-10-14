@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="ja" data-lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>リゾーン — TENRYU ドキュメント</title>
+  <link rel="stylesheet" href="../../../style.css">
+  <script src="../../../theme.js"></script>
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>リゾーン</h1>
+    <p class="abstract">ALE のリゾーン（rezoning）は、ラグランジュ計算のあとで、物質を動かさずに節点座標だけを提案する。ソルバは、<code>rezone_solver</code> が選ぶ Winslow 系（既定の <code>legacy_winslow</code> と完全 R-Z 計量版）と M1/TMOP（target-matrix optimization paradigm [3]）の目的関数ソルバ、および参照障壁（reference barrier）である。どのソルバの提案も、<a href="index.html#admissibility">許容性の判定</a>を通ってから保存的リマップへ渡る。この頁は、各ソルバの式と探索の手順を述べ、参照メッシュ・参照目標・参照障壁・M1 の目的関数を<a href="#terms">用語の節</a>で定義する。</p>
+
+    <section aria-labelledby="terms">
+      <h2 id="terms">この計算で使う用語</h2>
+      <p>この節は、リゾーンソルバが使う参照メッシュ・参照目標・参照障壁と、M1 の目的関数を定義する。メッシュの品質を表す量（コーナーヤコビアン、ガウス点ヤコビアンなど）は<a href="../mesh/index.html#terms-admissibility">メッシュと幾何</a>の頁で、受理の判定は<a href="index.html#admissibility">ALE の概要の頁</a>で定義する。</p>
+
+      <h3 id="terms-reference">参照メッシュ、参照目標、参照障壁</h3>
+      <p><strong>参照メッシュ（reference mesh）</strong>は、状態が保持する節点座標（<code>x_r_reference</code>、<code>x_z_reference</code>）である。多ブロックのメッシュでは、初期化時のメッシュの座標を保持し、取引のたびには更新しない。リマップの目標メッシュは、取引の間だけこの座標の位置に置かれ、リマップの後に元の座標が戻される。M1 の形状尺度と、参照障壁の相対下限は、この座標を基準にする。</p>
+      <p><strong>参照目標（reference target）</strong>は、参照障壁のリゾーンが節点を寄せる先のメッシュで、<code>reference_target</code> で選ぶ。<code>"none"</code>（既定）は変位を作らない。<code>"eulerian_initial"</code> は初期メッシュの座標（オイラー格子）である。<code>"spherical_equal_angle"</code> は、初期メッシュの殻 \(i\) の半径 \(s_i\)（節点 \((i,0)\) の原点からの距離）を保ち、軸方向に等しい角度 \(\theta_j=\pi j/n_z\) で並べた球面のメッシュ \((r,z)=(s_i\sin\theta_j,\;s_i\cos\theta_j)\) である。</p>
+      <p><strong>参照障壁（reference barrier）</strong>は、実行間隔を待たずに起動する保護的なリゾーンである（<code>reference_barrier_enabled</code>、既定 False）。現在のメッシュから参照目標へ向かう変位 \(\Delta\mathbf x\) を、混合率 \(\lambda\) で加える。\(\lambda\) は、<code>reference_blend_default</code>（既定 1.0）から半分ずつ小さくして最大 <code>reference_linesearch_max_iters</code>（既定 24）回まで試し、RZ 体積・コーナーヤコビアン・ガウス点ヤコビアンが、参照メッシュの値に対する相対下限（既定 1.0e-8）を割らない最大の値を採る。起動の条件は 2 つで、どちらも既定で有効である。(a) セル重心の \(\sin\theta=|r_c|/\sqrt{r_c^2+z_c^2}\)（\(\theta\) は +z 軸からの極角）の最小値が、<code>reference_trigger_axis_margin_threshold</code>（既定 1.0e-2）を下回る。この \(\sin\theta\) は、軸マージン（単位 cm²）とは別の量である。(b) コーナーヤコビアンの比（各コーナーの現在の値を初期メッシュでの値で割った値）と、対角コーナーの辺長の比（セルの 1 つのコーナーに接する 2 辺の長さの平均 \(b_{\rm eff}\) の、初期メッシュに対する比）の最小値が、<code>reference_trigger_corner_j_ratio_threshold</code>（既定 0.5）を下回る。</p>
+
+      <h3 id="terms-m1">M1 の目的関数</h3>
+      <p><strong>M1 の目的関数（M1 objective）</strong>は、リゾーンソルバ <code>m1_tmop</code> が最小化する、メッシュの品質の関数である。「M1」は、この目的関数のキーの接頭辞（<code>m1_*</code>）で、TMOP（target-matrix optimization paradigm [3]）の考え方による。式は<a href="#rezone-solvers">リゾーンソルバ族</a>に示す。4 つの項の和で、重みの既定は、整列重み \(\gamma_{\rm align}\)（<code>m1_gamma_align</code>）が 0、係留の重み \(\lambda_{\rm tether}\)（<code>m1_lambda_tether</code>）が 0、極方向の行の間隔の重み \(w_\theta\)（<code>m1_theta_reg</code>）が 0、障壁の重み \(\beta\)（<code>m1_barrier_beta</code>）が 1.0e-3 である。</p>
+      <p>形状品質の項（M1 品質項）は、セルの各求積点で、実メッシュのヤコビ行列 \(A_{cq}\) を参照メッシュのヤコビ行列 \(W_{cq}\) に対して測った行列 \(T=A_{cq}W_{cq}^{-1}\) の形状尺度 \(\mu=\|T\|_F^2/(2\det T)\) を、重み \(\omega_{cq}\det W_{cq}\) で平均する。\(\mu\) は、セルの形が参照メッシュの対応するセルの形（拡大と回転を除く）に近いほど小さく、最小値は 1 である。整列重み \(\gamma_{\rm align}\) は \(\gamma_{\rm align}\|T-I\|_F^2\) を足し、セルを参照メッシュのセルの大きさと向きにも近づける。係留の項は、節点がラグランジュ位置から動くことを罰する。極方向の行の間隔の項は、極座標型のブロックの行で隣り合う節点までの距離のかたよりを罰する。障壁項（barrier term）は、\(\det A_{cq}\) が参照の値の 0.1 倍を下回る求積点でだけ作用し、セルがつぶれる（行列式が 0 に近づく）ことを強く罰する。</p>
+      <p>M1 の取引は、全節点の更新を <code>m1_sweeps</code>（既定 8）回繰り返した候補を、そのまま判定にかける。混合率の探索はない。候補が許容性の判定を通り、かつ目的関数が相対で <code>m1_min_j_dec_rel</code>（既定 0.0）を超えて減ったときだけ受理され、そうでなければ取引の前へ巻き戻す。</p>
+    </section>
+
+    <section aria-labelledby="rezone-solvers">
+      <h2 id="rezone-solvers">リゾーンソルバ族</h2>
+      <p><code>legacy_winslow</code> は、既定である簡略化直交 Winslow 更新 [1] をビット単位で従来どおりに保つ。論理格子（logical grid）上の計量係数（metric coefficients）を現在の座標から 1 反復遅らせてヤコビ反復（Jacobi iteration）し、交差微分項（cross derivative term）を省いた式（ここでの \(\alpha\)・\(\beta\) は Winslow の計量係数であり、輻射ページの同名記号とは無関係である）</p>
+      $$
+      r_{i,j}^{new}=\frac{\alpha(r_{i+1,j}+r_{i-1,j})+\beta(r_{i,j+1}+r_{i,j-1})}
+      {2(\alpha+\beta)}
+      $$
+      <p>を \(z\) にも適用する。明示的に有効化する完全 R-Z 計量版（<code>rezone_solver="rz_full_metric_winslow"</code>）は、混合微分項（mixed derivative term）と R 重み付き候補を含み、節点に接するセルのガウス点ヤコビアン、コーナーヤコビアン、符号付き RZ 体積、軸以外での半径を調べる節点局所の直線探索を、<code>rezone_local_admissibility_linesearch=True</code>（既定 False）のときに利用できる。</p>
+      <p><a href="#terms-reference">参照障壁</a>のソルバは、初期のオイラーメッシュや等角度球面メッシュといった参照目標への変位を作り、参照メッシュに対する相対下限を課した全体直線探索（global line search）で混合する。この直線探索は、混合率 \(\lambda\) を <code>reference_blend_default</code>（既定 1.0）から半分ずつ小さくして最大 <code>reference_linesearch_max_iters</code>（既定 24）回まで試し、候補メッシュの RZ 体積・コーナーヤコビアン・ガウス点ヤコビアンが、参照メッシュの値に対する相対下限（<code>reference_volume_floor_rel</code>、<code>reference_corner_j_floor_rel</code>、<code>reference_gauss_j_floor_rel</code>。既定はいずれも 1.0e-8）を割らない最大の \(\lambda\) を採る。この判定のガウス点ヤコビアンは、セル中心でのヤコビアン（4 つのコーナーヤコビアンの平均）で評価する。多ブロックの中心パッチ（<code>multiblock_lagrangian_bulk_center_patch_reference_enabled</code>、既定 False）では、Winslow 平滑化の提案を、体積とコーナーヤコビアンの下限が作る実行可能領域（feasible region）の内側へ障壁最適化（barrier optimization）で寄せてから、同じ種類の全体直線探索にかける。</p>
+      <p><code>m1_tmop</code> は、明示的に有効化する減衰ガウス–ニュートン法（damped Gauss–Newton method）のソルバである。M1 の目的関数（<a href="#terms-m1">M1 objective</a>）、すなわち、参照計量（reference metric）に対する M1 品質、ラグランジュ位置への係留（tether）、極座標の行の間隔の正則化（regularization）、行列式が小さいときに作用する障壁項を合わせた関数を最小化する。</p>
+      $$
+      \begin{aligned}
+      \mathcal J(\mathbf x)={}&
+      \frac{\sum_{c,q}\omega_{cq}\det(W_{cq})\,\mu(A_{cq}W_{cq}^{-1};\gamma_{\rm align})}
+           {\sum_{c,q}\omega_{cq}\det(W_{cq})}
+      +\frac{\lambda_{\rm tether}}{N_v}\sum_i\frac{\|\mathbf x_i-\mathbf x_i^L\|^2}{h_i^2}\\
+      &\quad+\frac{w_\theta}{N_v}\sum_{i\in\mathcal R}
+       \left(\frac{d_{iL}-d_{iR}}{d_{iL}+d_{iR}}\right)^2
+      +\beta\sum_{c,q}\left[\det A_{cq}&lt;\sigma_b\det W_{cq}\right]
+       \log\frac{\sigma_b\det W_{cq}}{\det A_{cq}}.
+      \end{aligned}
+      $$
+      <p>ここで \(A_{cq}\)・\(W_{cq}\) はセル \(c\) の求積点 \(q\)（四辺形では 2×2 のガウス点）における、実メッシュ・参照メッシュの写像のヤコビ行列（\(\det A_{cq}\) がその点のガウス点ヤコビアン）、\(\omega_{cq}\) はその重み、\(\mu\) は整列重み \(\gamma_{\rm align}\) をもつ形状品質尺度（Knupp の形状尺度 [2] の逆数に整列の項を加えたもの）で、ここまでが M1 品質項である。\(\lambda_{\rm tether}\) はラグランジュ位置 \(\mathbf x^L_i\) からの変位を局所スケール \(h_i\)（節点 \(i\) に接する参照メッシュの辺の長さの二乗平均平方根）で罰する係留項、\(N_v\) は節点総数、\(w_\theta\) の項は行集合 \(\mathcal R\) 上で左右の隣接距離 \(d_{iL},d_{iR}\) により極方向の行間隔を整える正則化、障壁の重み \(\beta\)（Winslow の計量係数 \(\beta\) とは別の量。既定 1.0e-3）をもつ障壁項は、\(\det A_{cq}&lt;\sigma_b\det W_{cq}\) のとき、すなわち \(\det A_{cq}\) が参照の値の \(\sigma_b=0.1\)（実装の定数）倍を下回るときにだけ作用する。</p>
+      <p>節点ごとの更新は、各節点の提案変位を、その節点に接するセルの隣接節点までの最短距離の 1/4 で頭打ちにし、局所の目的関数が下がるまで最大 12 回半分にする直線探索を通す。この更新を全節点に対して <code>m1_sweeps</code>（既定 8）回繰り返す。取引が受理されるのは、候補メッシュの判定器が許容と答え、かつ</p>
+      $$
+      \frac{\mathcal J_{before}-\mathcal J_{after}}
+           {\max(|\mathcal J_{before}|,10^{-300})}
+      &gt;\texttt{m1\_min\_j\_dec\_rel}
+      $$
+      <p>を満たすときだけである。既定値 0.0 は目的関数の狭義減少（strict decrease）を要求しつつ、わずかでも有益な改善は受け入れる。多ブロックの経路では、参照メッシュは初期化時のメッシュの座標を保持する固定の参照であり、受理のたびには動かない。受理した座標は、保存的リマップの目標メッシュとして参照の位置に一時的に置いてからリマップへ渡し、リマップの後に元の参照へ戻す。<code>rezone_solver="m1_tmop"</code> は、論理メッシュが <code>rectangular_rz</code> または <code>cone_shell</code> のときは設定の検査が拒否する（エラー文はこの制限を「M1 v1」の範囲と呼ぶ）。極方向の行の間隔の項は、極座標型のブロックの行にだけ作用する。</p>
+    </section>
+
+    <section aria-labelledby="controls">
+      <h2 id="controls">namelist による制御</h2>
+      <p>以下は <code>Numerics.ale</code> の主要キーの抜粋である。全項目と検証規則は <a href="../../use/namelist.html">namelist リファレンス</a>を参照のこと。</p>
+      <table class="quick-facts">
+        <thead>
+          <tr><th>キー</th><th>既定値</th><th>用途</th></tr>
+        </thead>
+        <tbody>
+          <tr><th><code>rezone_solver</code></th><td><code>"legacy_winslow"</code></td><td><code>"legacy_winslow"</code>（従来の Winslow 系）、<code>"rz_full_metric_winslow"</code>（完全 R-Z 計量版）、<code>"m1_tmop"</code>（M1 の目的関数のソルバ）。後の 2 つは明示的に有効化する。</td></tr>
+          <tr><th><code>m1_min_j_dec_rel</code></th><td><code>0.0</code></td><td>M1 の取引に要求する目的関数の相対減少量の下限。</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section aria-labelledby="references">
+      <h2 id="references">参考文献</h2>
+      <ol class="references">
+        <li>A. M. Winslow, "Numerical Solution of the Quasilinear Poisson Equation in a Nonuniform Triangle Mesh," J. Comput. Phys. 1, 149–172 (1966). <a href="https://doi.org/10.1016/0021-9991(66)90001-5">doi:10.1016/0021-9991(66)90001-5</a></li>
+        <li>P. M. Knupp, "Algebraic Mesh Quality Metrics," SIAM J. Sci. Comput. 23, 193–218 (2001). <a href="https://doi.org/10.1137/S1064827500371499">doi:10.1137/S1064827500371499</a></li>
+        <li>V. A. Dobrev, P. Knupp, T. V. Kolev, K. Mittal, and V. Z. Tomov, "The Target-Matrix Optimization Paradigm for High-Order Meshes," SIAM J. Sci. Comput. 41, B50–B68 (2019). <a href="https://doi.org/10.1137/18M1167206">doi:10.1137/18M1167206</a></li>
+      </ol>
+    </section>
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["$$", "$$"], ["\\[", "\\]"]] } };</script>
+  <script defer src="../../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../../nav.js" data-page="ale-rezone" data-root="../../"></script>
+</body>
+</html>

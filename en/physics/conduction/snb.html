@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="en" data-lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SNB nonlocal model — TENRYU Documentation</title>
+  <link rel="stylesheet" href="../../../style.css">
+  <script src="../../../theme.js"></script>
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>SNB nonlocal model</h1>
+    <p class="abstract">The SNB (Schurtz–Nicolaï–Busquet) model is a reduced kinetic model that computes the nonlocal correction of electron heat conduction in electron-energy groups (multigroup). It is enabled explicitly with <code>nonlocal_model="snb"</code> in 1D planar, cylindrical, and spherical geometry and in 2D RZ. The correction is added to the local SH flux, and the corrected flux passes through the single common harmonic flux limiter. In time it is coupled by the implicit-SNB (iSNB) Picard iteration of Cao et al. This page describes the group structure, the transport-field equation, the mean free paths, and the correction procedure.</p>
+
+    <section aria-labelledby="terms">
+      <h2 id="terms">Terms used in this calculation</h2>
+      <p>SNB uses several words in the sense of TENRYU's implementation: the group, the group weight, the transport field, the group mean free path, the nonlocal correction, and the iSNB Picard iteration. They are defined together here.</p>
+
+      <h3 id="terms-snb">Quantities of SNB</h3>
+      <p>A <strong>group</strong> is an interval of electron energy \(E\). SNB solves the nonlocal transport for each energy group. The group edges are laid out in the energy \(\hat\beta=E/(k_B\max T_e)\), normalized by the largest electron temperature \(\max T_e\) of the step (the maximum over all cells). The lowest group is \([0,\,0.1]\), and the edges above it form a geometric progression from 0.1 to \(\hat\beta_{max}\). The number of groups is <code>snb_n_groups</code> (default 24, at least 2), and the upper end \(\hat\beta_{max}\) is <code>snb_E_max_over_Te</code> (default 20, larger than 1). The group edges of \(\hat\beta\) multiplied by \(k_B\max T_e\) give physical energies \(E_g\), which are held for the step. The representative energy of a group is \(\varepsilon_g=(E_{g-1}+E_g)/2\).</p>
+      <p>The <strong>group weight</strong> \(\xi_g\) is the fraction of the local SH flux that the electrons of group \(g\) carry (the group edges and weights are plotted in <a href="#fig-conduction-snb-groups">Figure B</a>). The SH flux has the weight \(\beta^4e^{-\beta}/24\) (\(\beta=E/(k_BT_e)\)) in energy, so \(\xi_g=P(\beta_g)-P(\beta_{g-1})\), with \(P(\beta)=1-e^{-\beta}(\beta^4+4\beta^3+12\beta^2+24\beta+24)/24\), a difference of an analytic cumulative distribution (no numerical quadrature is used). Here \(\beta_g=E_g/(k_BT_e)\) is the group edge \(E_g\) normalized by the local temperature of the cell. For the same \(E_g\), the colder the cell, the larger \(\beta_g\), and the weight concentrates in groups of lower energy. It is a different quantity from the Z-dependent correction \(\xi(\bar Z)\).</p>
+      <p>The <strong>transport field</strong> \(H_g\) is the field of the heat flux that the electrons of group \(g\) carry nonlocally (dimensionally a heat flux). It is obtained, for each group, by solving a diffusion-type equation (<a href="#snb">SNB section</a>) whose source is the group's share of the local SH flux, \(U_g=\xi_gq_{SH}\). \(H_g\) is the distribution that results when the source spreads to its surroundings over the scale of the group's mean free path.</p>
+      <p>The <strong>group mean free paths</strong> \(\lambda_g^{abs}\) and \(\lambda_g^{tr}\) are the two lengths in the equation for \(H_g\). \(\lambda_g^{abs}\) (the superscript abs stands for absorption) sets, through the term \(H_g/\lambda_g^{abs}\), the distance over which \(H_g\) decays away from the source. \(\lambda_g^{tr}\) (tr stands for transport) sets, through the coefficient \(\lambda_g^{tr}/3\) of the diffusion term, how fast \(H_g\) spreads. Both equal the mean free path \(\lambda_g\) of electrons of the representative energy \(\varepsilon_g\) (formula in the <a href="#snb">SNB section</a>, key <code>snb_mfp</code>). With <code>snb_efield="local"</code>, however, only the transport side is shortened, by adding a local electrostatic-field term to \(1/\lambda_g^{tr}\).</p>
+      <p>The <strong>nonlocal correction</strong> \(\delta q\) is the correction of the heat flux built from the gradients of \(H_g\), \(\delta q=-\sum_g(\lambda_g^{tr}/3)\nabla H_g\). It is added to the local SH flux to give the flux before limiting, \(q_{raw}=q_{SH}+\delta q\). At points of steep gradient \(\delta q\) reduces the SH flux (flux inhibition), and ahead of them it carries heat (preheat).</p>
+      <p>The <strong>iSNB (implicit-SNB) Picard iteration</strong> is the iteration that couples the nonlocal correction in time (the method of Cao et al.). It fixes the correction \(\delta q\) and the limiting factor \(\theta\), redoes the whole STS superstep from \(T_e^n\), and recomputes the correction with the temperatures at the end of the interval. It repeats until the largest change of the correction is at most <code>snb_picard_rtol</code> (default 0.01) times the sum of the largest SH flux and the largest correction. The iteration runs at least 2 and at most <code>snb_picard_max_iters</code> (default 8, at least 2) times. At convergence the amplification factor lies in (0, 1) for every \(\Delta t\).</p>
+    </section>
+
+    <section aria-labelledby="snb">
+      <h2 id="snb">SNB multigroup nonlocal model</h2>
+      <p><code>nonlocal_model="snb"</code> adds the opt-in Schurtz–Nicolaï–Busquet correction to electron conduction in 1D planar, cylindrical, or spherical geometry and in 2D RZ. The tridiagonal discretization below is the 1D one. In 2D RZ, each group's equation is assembled with the node-local operator (with \(\lambda_g^{tr}/3\) as the conductivity of the diffusion term and \(V/\lambda_g^{abs}\) added to the diagonal), and all groups are solved together with a Jacobi-preconditioned conjugate-gradient method; <code>snb_efield="local"</code> is rejected in 2D RZ. Each conduction step rebuilds the group edges in the normalized electron energy β̂=E/(k<sub>B</sub> max T<sub>e</sub>). The lowest group is [0, 0.1], and the edges above it divide the range from 0.1 to <code>snb_E_max_over_Te</code> geometrically (24 groups by default, 23 of them geometric intervals). The group edges are laid out in the global \(\hat\beta\), then mapped to physical energies \(E_g\) and held there; when the weights \(\xi_g\) are evaluated, the edges are reread in each cell's local-temperature \(\beta_g=E_g/(k_BT_e)\) to evaluate \(P\) (1D faces use the face-averaged \(T_e\), and in 2D RZ each pair of cells uses the pair-averaged \(T_e\)). Each group then solves the following diffusion-type equation for its transport field \(H_g\) (dimensionally a heat flux). The source on the right-hand side is the divergence of \(U_g\), the group's share of the local SH flux; \(H_g\) is that injected source spread out over the scale of the mean free path, and its gradient rebuilds the nonlocal correction defined below:</p>
+      $$
+      \frac{H_g}{\lambda_g^{abs}}-
+      \nabla\!\cdot\!\left(\frac{\lambda_g^{tr}}{3}\nabla H_g\right)
+      =-\nabla\!\cdot U_g,\qquad U_g=\xi_g q_{SH},
+      $$
+      $$
+      \xi_g=P(\beta_g)-P(\beta_{g-1}),\qquad
+      P(\beta)=1-\frac{e^{-\beta}}{24}
+      (\beta^4+4\beta^3+12\beta^2+24\beta+24).
+      $$
+      <p>Here \(P(\beta)\) is the cumulative distribution of the Spitzer–Härm heat flux over normalized electron energy — the flux carries a \(\beta^4e^{-\beta}/24\) spectral weight, and \(P\) is its running integral — so the weight ξ<sub>g</sub> is an exact difference of the antiderivative, not a numerical quadrature. The total correction is \(\delta q=-\sum_g(\lambda_g^{tr}/3)\nabla H_g\). In 1D, the cell-centered finite-volume equation for H<sub>g</sub>, integrated over the cell volume, is a strictly diagonally dominant tridiagonal system, and all groups are solved as a strided batch. The face diffusivity is the harmonic mean of the neighboring λ<sup>tr</sup> values divided by three, and closed boundaries impose a reflecting condition.</p>
+
+      <figure id="fig-conduction-snb-groups">
+        <img src="../../../assets/conduction-snb-group-ladder-en.png" width="920" height="640" style="max-width:100%;height:auto" alt="Top: the global group edges. The lowest group g=1 is [0, 0.1]; groups g=2 to 24 are geometric from 0.1 to 20, with g=12 in darker blue. Lower left: the cumulative distribution P(β) (thick blue line) and the spectral weight w(β) (grey line), with ticks at the group edges for local temperature max T_e (blue ticks) and 0.25 max T_e (orange ticks) and the weight ξ12 of group 12. Lower right: bars of the weight ξ_g of each of the 24 groups; the colder case (orange) puts its weight in groups of lower energy">
+        <figcaption>Figure B. SNB group edges and group weights. Top: the global group edges in β̂=E/(k<sub>B</sub>max T<sub>e</sub>) for the default 24 groups (the lowest group g=1 is [0, 0.1]; the 23 groups g=2–24 are geometric from 0.1 to 20; the upper axis is the energy for max T<sub>e</sub>=2 keV). Lower left: each edge E<sub>g</sub> is read at the local β=E/(k<sub>B</sub>T<sub>e</sub>), and differences of P give the group weights ξ<sub>g</sub> (blue: T<sub>e</sub>=max T<sub>e</sub>; orange: T<sub>e</sub>=0.25 max T<sub>e</sub>; ticks are the group edges, the grey line is w(β)=β<sup>4</sup>e<sup>−β</sup>/24, and ξ<sub>12</sub> is the weight of group 12). Lower right: ξ<sub>g</sub> of every group with the same colors. For T<sub>e</sub>=max T<sub>e</sub> the weights sum to P(20)=0.99998; the missing part is the flux above the upper end β̂=20.</figcaption>
+      </figure>
+
+      <p>The representative energy \(\varepsilon_g=(E_{g-1}+E_g)/2\) is evaluated in erg. The group mean free path \(\lambda_g\) has two variants. Both \(\lambda_g^{abs}\) and \(\lambda_g^{tr}\) equal \(\lambda_g\) unless the E-field option below shortens the transport one:</p>
+      $$
+      \lambda_g=
+      \begin{cases}
+      \dfrac{2\sqrt2\,\varepsilon_g^2}
+      {4\pi n_e e^4\ln\Lambda\,\sqrt{\bar Z\varphi}},
+      &amp; \texttt{geometric_r2}\quad(\text{Sherlock 2017; default}),\\[6pt]
+      \dfrac{2\,\varepsilon_g^2}
+      {4\pi n_e e^4\ln\Lambda\,\sqrt{\bar Z+1}},
+      &amp; \texttt{original}\quad(\text{Schurtz 2000}),
+      \end{cases}
+      \qquad \varphi=\frac{\bar Z+4.2}{\bar Z+0.24}.
+      $$
+      <p>Normally λ<sup>abs</sup>=λ<sup>tr</sup>. <code>snb_efield="local"</code> shortens only the transport-side mean free path through \(1/\lambda_g^{tr}\mathrel{+}=|e\mathcal E|/\varepsilon_g\), where \(\mathcal E\) (script, to avoid clashing with the energies \(E\)) is the local electrostatic field magnitude evaluated from the plasma state; the option defaults to <code>none</code> because the r=2 calibration already incorporates electric-field suppression, so adding it can double count the effect.</p>
+      <h3>The SNB correction, step by step</h3>
+      <ol>
+        <li><p><strong>Rebuild the groups.</strong> At every conduction step, use max \(T_e\) to reconstruct the global β̂ group edges (the lowest group is [0, 0.1], and the edges above it form a geometric progression from 0.1 to <code>snb_E_max_over_Te</code>) and form the weights ξ<sub>g</sub> as exact differences of the antiderivative P.</p></li>
+        <li><p><strong>Evaluate mean free paths.</strong> Compute each λ<sub>g</sub> from the local electron density, Coulomb logarithm, charge state, and group-center energy, using <code>geometric_r2</code> by default or the <code>original</code> Schurtz form.</p></li>
+        <li><p><strong>Assemble.</strong> In 1D, for every group, volume-integrate the cell-centered finite-volume equation into a strictly diagonally dominant tridiagonal system. Reflecting boundaries close the domain; voids receive identity rows and zero adjacent diffusivity. In 2D RZ, each group's operator is assembled with the node-local operator, and \(V/\lambda_g^{abs}\) is added to the diagonal. The boundaries are reflecting, and the rows of void cells, of cells with \(\rho c_v\le0\), and of cells without a mean free path are identity rows (\(H_g=0\)).</p></li>
+        <li><p><strong>Solve all groups.</strong> In 1D, run the groups together as a strided-batch tridiagonal solve for \(H_g\). In 2D RZ, solve all groups together with a Jacobi-preconditioned conjugate-gradient method. The relative-residual tolerance is \(10^{-10}\) and the iteration limit is 1000; both are fixed values without keys. If the limit is reached without convergence, a warning is issued and the last iterate is accepted.</p></li>
+        <li>
+          <p><strong>Reconstruct the correction.</strong> Accumulate groups in fixed order:</p>
+          $$
+          \delta q=-\sum_g\frac{\lambda_g^{tr}}{3}\nabla H_g.
+          $$
+        </li>
+        <li><p><strong>Compose the raw flux.</strong> In 1D, form \(q_{raw}=q_{SH}+\delta q\) using the same face κ as the local SH path. In 2D RZ, the node-local operator that builds the base SH flux uses neither a flux limit nor a secant (it uses \(\kappa_{SH}\)), and the pair power of the nonlocal correction is added to its pair power.</p></li>
+        <li><p><strong>Apply the shared flux limiter.</strong> Evaluate \(\theta=1/(1+|q_{raw}|/q_{max})\) once and apply \(q=\theta q_{raw}\); SNB adds no second flux limiter. In 2D RZ, \(\theta_c\) is formed per cell (\(q_{raw}\) is \(-\kappa_{SH}\nabla T_e-\sum_g(\lambda_g^{tr}/3)\nabla H_g\), evaluated from the mean of the cell's node gradients), and the pair power of cells \(c\) and \(d\) is multiplied by \(\min(\theta_c,\theta_d)\).</p></li>
+        <li><p><strong>Close the iSNB Picard loop.</strong> Fix (θ, δq), repeat the full STS superstep from \(T_e^n\), and recompute the correction at the endpoint. Run at least two iterations and test the relative flux max norm against <code>snb_picard_rtol</code>, up to <code>snb_picard_max_iters</code>. Nonconvergence is reported and the final iterate is accepted; at convergence the amplification factor is in (0,1) for every Δt.</p></li>
+      </ol>
+      <p>With SNB, <code>f_lim</code> is set to a loose 0.5. SNB itself computes how strongly the flux is suppressed, so this value does not tune the nonlocal strength; the loose flux limiter acts only when the composite flux, with the nonlocal correction added, becomes anomalously large. The GUI (<a href="../../use/gui.html">Studio</a>) switches to this value when SNB is selected, but the solver default stays 0.06 with SNB, so a hand-written deck sets 0.5 explicitly.</p>
+    </section>
+
+    <section aria-labelledby="controls">
+      <h2 id="controls">Namelist controls</h2>
+      <p>These are the keys of the nonlocal model under <code>Numerics.conduction</code>. See the <a href="../../use/namelist.html">namelist reference</a> for all keys and their validation rules. The defaults in the table are the values used when the deck does not set the key. The input check requires of <code>nonlocal_model="snb"</code> that the dimension be 1D_SPH or 2D_RZ, that <code>solver="sts"</code>, that the temperature model be two-temperature, that <code>conduction.enabled=True</code>, and that the per-material conservation mode be off.</p>
+      <table class="quick-facts">
+        <thead>
+          <tr><th>Key</th><th>Default</th><th>Purpose</th></tr>
+        </thead>
+        <tbody>
+          <tr><th><code>nonlocal_model</code></th><td><code>"none"</code></td><td><code>"none"</code> or <code>"snb"</code> (1D and 2D RZ). Studio writes only the 1D case.</td></tr>
+          <tr><th><code>snb_n_groups</code></th><td><code>24</code></td><td>Number of SNB energy groups (including the lowest group [0, 0.1]; at least 2).</td></tr>
+          <tr><th><code>snb_E_max_over_Te</code></th><td><code>20</code></td><td>Upper edge of the group edges (the largest β̂; larger than 1). The range from 0.1 to the upper edge is divided geometrically.</td></tr>
+          <tr><th><code>snb_mfp</code></th><td><code>"geometric_r2"</code></td><td>Sherlock r=2 default or <code>"original"</code>.</td></tr>
+          <tr><th><code>snb_efield</code></th><td><code>"none"</code></td><td>Optional local electric-field correction of the mean free path is <code>"local"</code>.</td></tr>
+          <tr><th><code>snb_picard_max_iters</code></th><td><code>8</code></td><td>iSNB Picard cap, with at least two iterations.</td></tr>
+          <tr><th><code>snb_picard_rtol</code></th><td><code>0.01</code></td><td>Relative flux max-norm convergence tolerance.</td></tr>
+        </tbody>
+      </table>
+
+    </section>
+
+    <section aria-labelledby="verification">
+      <h2 id="verification">Verification</h2>
+      <ul>
+        <li><strong>SNB local limit (<code>snb_local_limit_1d</code>):</strong> SNB reduces to local SH as the mean free path λ→0. This is tested with the flux-reduction ratio for a sinusoidal temperature perturbation (the dispersion response) \(R(k)=\sum_g\xi_g/(1+\lambda_g^{abs}\lambda_g^{tr}k^2/3)\), and the discrete operator's \(R_{disc}\) is held to ∣R−R<sub>disc</sub>∣≤5.5×10<sup>−8</sup> at tolerance 10<sup>−3</sup>. The small-k asymptote \((1-R)\propto k^2\) is also checked, with a log–log slope of 1.986 (≈2). For two tanh temperature ramps whose widths differ by a factor of 10, the relative departures of the SNB flux from the SH flux each stay within the derived face-local curvature bound, and the ratio of the two departures, 100.7, matches the quadratic-law expectation of the local limit (≈100).</li>
+        <li><strong>SNB comparison with the analytic solution (<code>snb_dispersion_1d</code>):</strong> SNB matches the discrete Epperlein–Short solution within 7.2×10<sup>−7</sup> (tolerance 3×10<sup>−3</sup>; the dispersion check covers the band \(k\lambda_{ei}&lt;0.5\)).</li>
+        <li><strong>SNB conservation (<code>snb_conservation_1d_planar</code>, <code>snb_conservation_1d_spherical</code>, <code>snb_conservation_1d_cylindrical</code>):</strong> the energy budgets of the planar, cylindrical, and spherical cases close to 7.4×10<sup>−17</sup> against a tolerance of 10<sup>−14</sup>.</li>
+        <li><strong>SNB maximum principle (<code>snb_max_principle_1d</code>):</strong> on a spherical hot spot with a dilute receiving band, every step keeps the largest electron temperature at or below its value on entry; the energy closes to 10<sup>−13</sup> over the run with the energy removed by the clamp to the entry maximum temperature included; and a control run without the dilute band shows that this clamp never fires.</li>
+      </ul>
+    </section>
+
+    <section aria-labelledby="references">
+      <h2 id="references">References</h2>
+      <ol class="references">
+        <li>E. M. Epperlein and R. W. Short, "A Practical Nonlocal Model for Electron Heat Transport in Laser Plasmas," Phys. Fluids B 3, 3092–3098 (1991). <a href="https://doi.org/10.1063/1.859789">doi:10.1063/1.859789</a></li>
+        <li>G. P. Schurtz, Ph. D. Nicolaï, and M. Busquet, "A Nonlocal Electron Conduction Model for Multidimensional Radiation Hydrodynamics Codes," Phys. Plasmas 7, 4238–4249 (2000). <a href="https://doi.org/10.1063/1.1289512">doi:10.1063/1.1289512</a></li>
+        <li>M. Sherlock, J. P. Brodrick, and C. P. Ridgers, "A Comparison of Non-Local Electron Transport Models for Laser-Plasmas Relevant to Inertial Confinement Fusion," Phys. Plasmas 24, 082706 (2017). <a href="https://doi.org/10.1063/1.4986095">doi:10.1063/1.4986095</a></li>
+        <li>D. Cao, G. Moses, and J. Delettrez, "Improved Non-Local Electron Thermal Transport Model for Two-Dimensional Radiation Hydrodynamics Simulations," Phys. Plasmas 22, 082308 (2015). <a href="https://doi.org/10.1063/1.4928445">doi:10.1063/1.4928445</a></li>
+        <li>A. Marocchino, M. Tzoufras, S. Atzeni, et al., "Comparison for Non-Local Hydrodynamic Thermal Conduction Models," Phys. Plasmas 20, 022702 (2013). <a href="https://doi.org/10.1063/1.4789878">doi:10.1063/1.4789878</a></li>
+      </ol>
+    </section>
+
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["$$", "$$"], ["\\[", "\\]"]] } };</script>
+  <script defer src="../../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../../nav.js" data-page="conduction-snb" data-root="../../"></script>
+</body>
+</html>

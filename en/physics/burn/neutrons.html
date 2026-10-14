@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en" data-lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Neutron heating — TENRYU Documentation</title>
+  <link rel="stylesheet" href="../../../style.css">
+  <script src="../../../theme.js"></script>
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>Neutron heating</h1>
+    <p class="abstract">This page describes the heating of the fuel by DT and DD neutrons. The model is recoil heating by a <a href="#terms-first-collision">single-flight first collision</a> of neutrons in two spectral lines, and it is 1D-only. Terms specific to this calculation are defined in the <a href="#terms">terms section</a>.</p>
+
+    <section aria-labelledby="neutrons">
+      <h2 id="neutrons">Neutron heating</h2>
+      <p>With <code>neutron_heating=True</code> (1D only), DT-n at 14.049 MeV and DD-n at 2.449 MeV are emitted isotropically. A <code>neutron_heating_n_mu</code>-point Gauss–Legendre quadrature traces shell chords. Attenuation uses the elastic-scattering cross sections of fuel D and T only. The first collision deposits the mean recoil energy locally (<a href="#terms-first-collision">First collision and single flight</a>), and the Li–Petrasso table partitions the recoil D/T energy between electrons and ions. Residual scattered-neutron energy is recorded as <em>degraded</em>; energy crossing the outer boundary is recorded as <em>escaped</em>.</p>
+      <p>This model is single-flight. It omits subsequent flights of degraded neutrons, shell-material kerma, (n,2n) breakup, time-of-flight retardation, and recoil-spectrum width. Its spatial heating profile should therefore be read as a first-collision fuel-self-heating approximation.</p>
+    </section>
+
+    <section aria-labelledby="terms">
+      <h2 id="terms">Terms used in this calculation</h2>
+      <p>Neutron heating is built from a treatment specific to this calculation. The terms below carry meanings specific to TENRYU's implementation, so they are defined here together.</p>
+
+      <h3 id="terms-first-collision">First collision and single flight</h3>
+      <p>The <strong>first collision</strong> is the first elastic scattering of a neutron on a fuel D or T.</p>
+      <p><strong>Single flight</strong> is the treatment in which each neutron flies once, along one straight chord from its emission point to the outer surface of the sphere, and the neutron scattered in the first collision is not followed any further.</p>
+      <p>Neutrons are emitted in two lines, 14.049 MeV from DT and 2.449 MeV from DD. From the radius of the center of the emitting cell, they are emitted isotropically, in direction cosines \(\mu\) discretized by an even-order Gauss–Legendre quadrature (the number of \(\mu\) points is <code>neutron_heating_n_mu</code>; default 16, an even number from 2 to 64), and the chord of each direction is followed shell by shell. The fraction that collides in a shell interval \(\Delta s\) is \(T_{rem}(1-e^{-\Sigma\Delta s})\), where \(\Sigma=n_D\sigma_D+n_T\sigma_T\) is the macroscopic elastic-scattering cross section of fuel D and T (the number densities \(n_D\) and \(n_T\) are built from the inventory \(\rho Y_s\)) and \(T_{rem}\) is the transmission up to that point. Materials other than the fuel, ⁴He, and p are treated as transparent. The mean fraction \(f\) of the colliding neutron's energy that goes to the recoiling nucleus is deposited in the cell of that shell and partitioned between electrons and ions with the recoil entries of the Li–Petrasso table. The remaining \(1-f\) is carried away by the scattered neutron, is not followed, and is booked in the ledger as degraded. The part that does not collide is booked as escaped.</p>
+      <p>The cross sections \(\sigma\) and the mean fractions \(f\) are the following values, fixed in the code.</p>
+      <table class="quick-facts">
+        <thead><tr><th>Neutron line</th><th>Target</th><th>Elastic-scattering cross section \(\sigma\) [b]</th><th>Mean fraction \(f\) to the recoiling nucleus</th></tr></thead>
+        <tbody>
+          <tr><th rowspan="2">DT, 14.049 MeV</th><td>D</td><td>0.63</td><td>0.3157</td></tr>
+          <tr><td>T</td><td>0.94</td><td>0.2053</td></tr>
+          <tr><th rowspan="2">DD, 2.449 MeV</th><td>D</td><td>2.31</td><td>0.4447</td></tr>
+          <tr><td>T</td><td>2.30</td><td>0.3756</td></tr>
+        </tbody>
+      </table>
+      <p>The model approximates the first-collision contribution to fuel self-heating; it is not a solution of neutron transport. It is 1D only and cannot be combined with <code>partition="fraley"</code>.</p>
+    </section>
+
+    <section aria-labelledby="controls">
+      <h2 id="controls">Namelist controls</h2>
+      <p>These are the keys of the top-level <code>Burn</code> block that concern neutron heating. The keys that concern burn as a whole are on the <a href="index.html#controls">overview page</a>. The defaults in the table are the values used when a deck does not set the key.</p>
+      <table class="quick-facts">
+        <thead><tr><th>Key</th><th>Default</th><th>Purpose</th></tr></thead>
+        <tbody>
+          <tr><th><code>neutron_heating</code></th><td><code>False</code></td><td>Enables two-line first-collision neutron heating. 1D only; 2D RZ rejects it.</td></tr>
+          <tr><th><code>neutron_heating_n_mu</code></th><td><code>16</code></td><td>Number of μ quadrature points for the isotropic-emission chords (an even number from 2 to 64).</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section aria-labelledby="verification">
+      <h2 id="verification">Verification</h2>
+      <ul>
+        <li>The unit test <code>test_burn_neutron_heating</code> checks the constants fixed for neutron heating (cross sections and recoil fractions), the thin limit, analytic spherical attenuation, and emitted = deposited + degraded + escaped.</li>
+      </ul>
+    </section>
+
+    <section aria-labelledby="references">
+      <h2 id="references">References</h2>
+      <ol class="references">
+        <li>H. Brysk, "Fusion Neutron Energies and Spectra," Plasma Phys. 15, 611–617 (1973). <a href="https://doi.org/10.1088/0032-1028/15/7/001">doi:10.1088/0032-1028/15/7/001</a></li>
+      </ol>
+    </section>
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["$$", "$$"], ["\\[", "\\]"]] } };</script>
+  <script defer src="../../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../../nav.js" data-page="burn-neutrons" data-root="../../"></script>
+</body>
+</html>

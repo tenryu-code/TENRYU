@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en" data-lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Lagrangian hydrodynamics — TENRYU Documentation</title>
+  <link rel="stylesheet" href="../../../style.css">
+  <script src="../../../theme.js"></script>
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>Lagrangian hydrodynamics <span class="badge">reference</span></h1>
+    <p class="abstract">TENRYU advances material motion with a staggered Lagrangian scheme in 1D — spherical, cylindrical, or planar measures via <code>Mesh.geometry_1d</code> — and 2D axisymmetric RZ geometry. Thermodynamic state lives in cells and kinematics lives at nodes; on the 2D compatible path, the force on a node and the work used by the internal-energy update are built from the same discrete force, so the total energy is conserved by construction. This page describes the physical mechanism of the hydrodynamics; spatial discretization, time integration, artificial viscosity and hourglass control, the RZ momentum schemes, and plasma viscosity are covered on the five pages below.</p>
+
+    <aside class="planned" aria-labelledby="at-a-glance">
+      <h3 id="at-a-glance">At a glance</h3>
+      <ul>
+        <li>Staggered compatible layout: cell-centered density ρ, specific internal energy e, pressure P, and temperature T, and node-centered position x and velocity u.</li>
+        <li><a href="discretization.html#terms-corner">Corner masses and corner forces</a> make the kinetic–internal energy exchange conservative by construction.</li>
+        <li><code>midpoint_v1</code> is a second-order midpoint scheme with exactly one corrector pass; <code>pc_v0</code> is the legacy predictor–corrector. When <code>time_integration</code> is omitted, the default is <code>midpoint_v1</code> on a single-block mesh and <code>pc_v0</code> on a multiblock mesh (<a href="time-integration.html">time integration</a>).</li>
+        <li>Shock support includes the legacy scalar vNR (von Neumann–Richtmyer) artificial viscosity (AV) and the CSW98 (Caramana–Shashkov–Whalen 1998 [3]) edge AV. When a 2D RZ <a href="../../use/namelist.html#terms-deck">deck</a> omits the keys, the defaults are the CSW98 edge AV (<code>av_model="csw_edge_csw98"</code>), the area-weighted compatible momentum scheme (<code>rz_momentum_scheme="area_weighted_symmetric"</code> with <code>aw_compatible_force_work=True</code>), and subzonal pressure (<code>subzonal_pressure_enabled=True</code>). Subzonal pressure suppresses the hourglass mode. These terms are defined in the terms sections of the <a href="artificial-viscosity.html#terms">artificial viscosity page</a> and the <a href="momentum-schemes.html#terms">momentum schemes page</a>.</li>
+      </ul>
+    </aside>
+
+    <div class="card-grid">
+      <a class="card" href="discretization.html"><h3>Spatial discretization</h3><p>The layout of the state variables and nodes, the distribution of corner masses, and the compatible corner forces.</p></a>
+      <a class="card" href="time-integration.html"><h3>Time integration</h3><p>The 1D and 2D RZ integrators, the steps of one hydro half-step, and the candidate time steps.</p></a>
+      <a class="card" href="artificial-viscosity.html"><h3>Artificial viscosity and hourglass control</h3><p>The scalar vNR and CSW98 edge artificial viscosities, and hourglass suppression by subzonal pressure.</p></a>
+      <a class="card" href="momentum-schemes.html"><h3>RZ momentum schemes</h3><p>The volume-weighted and area-weighted momentum equations, and the BBSW corner mass.</p></a>
+      <a class="card" href="plasma-viscosity.html"><h3>Plasma viscosity</h3><p>Physical shear stress, momentum diffusion, and viscous heating from unmagnetized Braginskii coefficients, with selectable ion and electron channels.</p></a>
+    </div>
+
+    <section aria-labelledby="mechanism">
+      <h2 id="mechanism">Physical mechanism</h2>
+      <p>A Lagrangian mesh moves with the material, so material interfaces and contact discontinuities remain on cell boundaries instead of diffusing through them. Converging shells retain their resolution — a 1000× volumetric compression compresses the cells with the material — and there is no advection term to discretize. The price is mesh distortion in 2D: shear and vorticity can tangle a moving mesh. That is the subject of the companion <a href="../ale/index.html">ALE (arbitrary Lagrangian–Eulerian) page</a>, not this one.</p>
+      <p>The placement of thermodynamic state in cells and kinematics at nodes is the classic von Neumann staggering. Compatible hydrodynamics in the sense of Caramana–Burton–Shashkov–Whalen [2] builds the corner force on a node and the cell \(p\,dV\) work from the same corner vector, \(\mathbf S_{c,k}=\partial V_c/\partial\mathbf x_{c,k}\) (\(c\) is the cell and \(k\) the corner index). What the kinetic energy gains through "force × node velocity" and what the internal energy loses through "pressure × volume rate" then become two readings of one and the same discrete quantity — the momentum and internal-energy equations are transposes (adjoints) of each other — so the kinetic-energy change and the internal-energy change cancel identically, and total energy is conserved to round-off by construction rather than by an a posteriori fix. In RZ, the same construction uses the exact gradient of the revolved volume.</p>
+      <p>An inviscid staggered scheme has no mechanism to produce the entropy required across a shock. Artificial viscosity supplies a dissipative pressure confined to compression, so captured shocks satisfy the Rankine–Hugoniot jump conditions over a few cells: its quadratic term handles strong shocks and its linear term handles the weak-shock tail. Scalar vNR [1] ignores direction and therefore over-damps converging and shearing flows; the CSW98 <a href="artificial-viscosity.html#terms-edge-av">edge AV</a> measures compression edge by edge on the <a href="discretization.html#terms-median">median mesh</a> — the auxiliary mesh of the segments that connect cell centers to edge midpoints — and its limiter switches dissipation off for self-similar compression, rigid rotation, and linear shear. Bilinear quadrilaterals also admit a zero-energy checkerboard, or hourglass, mode that is invisible to cell-average divergence. <a href="artificial-viscosity.html#terms-subzonal-pressure">Subzonal pressures</a> resist it with zero-net corner forces; they are a stabilizer, not a substitute for shock AV.</p>
+      <p>The default integrator on a 2D RZ single-block mesh is a midpoint scheme whose corrector runs exactly once. That fixed operation count makes runs bitwise reproducible, unlike correctors that iterate to a tolerance. The measured smooth-flow orders (2026-07-27, verification deck <code>2d_rz_v3_smooth_temporal</code>) are \(p_\rho=2.0000\) for density and \(p_e=1.9999\) for energy, versus about 1.0007 for the legacy predictor–corrector, whose stale pressure closure (the pressure that the EOS returns for the density and internal energy of that moment) during compression costs a full order. At driver level, within the <a href="../../overview/numerics-foundations.html#operator-splitting">operator splitting</a>, hydro runs as two hydro half-steps around the field operators (a hydro half-step advances the Lagrangian hydrodynamics by half of the outer step, \(\Delta t/2\)), with an EOS <a href="../../overview/numerics-foundations.html#operator-splitting">re-closure</a> — recomputing temperature, pressure, and specific heat from the EOS — before every operator that reads the state.</p>
+    </section>
+
+    <section aria-labelledby="verification">
+      <h2 id="verification">Verification</h2>
+      <ul>
+        <li><code>verify_gxii_1d_fld_regression</code> is the active <a href="../../verification/index.html#gxii">GXII (GEKKO XII)</a> golden regression, gating absorbed energy and four history-based metrics: bang time (the time of maximum compression), peak density, areal density, and central temperature.</li>
+      </ul>
+    </section>
+
+    <section aria-labelledby="references">
+      <h2 id="references">References</h2>
+      <ol class="references">
+        <li>J. von Neumann and R. D. Richtmyer, "A Method for the Numerical Calculation of Hydrodynamic Shocks," J. Appl. Phys. 21, 232–237 (1950). <a href="https://doi.org/10.1063/1.1699639">doi:10.1063/1.1699639</a></li>
+        <li>E. J. Caramana, D. E. Burton, M. J. Shashkov, and P. P. Whalen, "The Construction of Compatible Hydrodynamics Algorithms Utilizing Conservation of Total Energy," J. Comput. Phys. 146, 227–262 (1998). <a href="https://doi.org/10.1006/jcph.1998.6029">doi:10.1006/jcph.1998.6029</a></li>
+        <li>E. J. Caramana, M. J. Shashkov, and P. P. Whalen, "Formulations of Artificial Viscosity for Multi-dimensional Shock Wave Computations," J. Comput. Phys. 144, 70–97 (1998). <a href="https://doi.org/10.1006/jcph.1998.5989">doi:10.1006/jcph.1998.5989</a></li>
+      </ol>
+    </section>
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["$$", "$$"], ["\\[", "\\]"]] } };</script>
+  <script defer src="../../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../../nav.js" data-page="hydrodynamics" data-root="../../"></script>
+</body>
+</html>

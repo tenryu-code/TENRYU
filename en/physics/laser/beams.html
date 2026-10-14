@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en" data-lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Beams &amp; ray launch — TENRYU Documentation</title>
+  <link rel="stylesheet" href="../../../style.css">
+  <script src="../../../theme.js"></script>
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>Beams &amp; ray launch <span class="badge">reference</span></h1>
+    <p class="abstract">This page covers the path from the beam input to the launch of the rays. The power of each beam is read from a time-waveform table frozen at initialization, and the transverse intensity profile is evaluated at the radius on the plane through the target center. In 1D, the aperture on the launch plane is divided into rings of equal width, and one ray per ring is launched along the straight line through the on-axis focus. In 2D RZ, the same profile is applied to a circular two-dimensional array on the plane perpendicular to the beam axis. Terms specific to this calculation are defined in the <a href="#terms">terms section</a>.</p>
+
+    <section aria-labelledby="terms">
+      <h2 id="terms">Terms used in this calculation</h2>
+      <p>A 1D fluid carries only radial profiles, but the laser follows each ray along its own path in a beam-fixed \((R,Z)\) plane and counts the absorption on the way (<a href="raytrace.html#chord-raytrace">ray-tracing page</a>). TENRYU divides the beam aperture into the units below and launches the rays from them. These terms carry meanings specific to this calculation, and to TENRYU's implementation in particular, so they are defined here together.</p>
+
+      <h3 id="terms-launch">Chord, ring, and launch plane</h3>
+      <p>A <strong>chord</strong> is the path of one ray in the \((R,Z)\) plane that contains the beam axis and the target center (the meridional plane). \(R\) is the distance from the beam axis, and \(Z\) is the coordinate along the beam axis, with the target center as the origin and the source side positive. In vacuum a chord is a straight line (a chord of the sphere); in the plasma the ray refracts and the path curves. The 1D fluid quantities depend only on the radius \(r=\sqrt{R^2+Z^2}\), so each ray needs to be followed in this one plane only.</p>
+      <p>A <strong>ring</strong> is one of the concentric rings of equal width into which the aperture on the launch plane (next paragraph) is divided about the beam axis. The aperture radius is \(R_{\rm beam}=|Z_{\rm init}-z_f|/(2F)\), where \(F\) is the F-number, \(Z_{\rm init}\) is the position of the launch plane, and \(z_f\) is the position of the focus (<a href="#terms-impact">next subsection</a>). Dividing \(R_{\rm beam}\) into \(N_{\rm ray}\) equal widths \(\Delta R=R_{\rm beam}/N_{\rm ray}\) gives the rings \(k=0,1,\dots,N_{\rm ray}-1\). For each ring one ray is launched from the point at the ring-center radius \(R_k=(k+1/2)\Delta R\), along the straight line through the focus. The ring area \(\Delta A_k=\pi[(k+1)^2-k^2]\Delta R^2\) and the intensity profile set the weight \(w_k\) of the ring's power, which the ray carries (<a href="#beam-optics">beam optics</a>). The division into rings and the direction of the rays are shown in the top panel of <a href="#fig-laser-launch-geometry">Figure A</a>.</p>
+      <p>The number of rings \(N_{\rm ray}\) is <code>Laser.rays_per_beam</code>; its 1D default is 1000 (Studio's default is also 1000), and it must be at least 10. Finer rings improve the resolution of the intensity profile and of the refraction and absorption that differ from ray to ray, but the cost grows in proportion to the number of rays traced. In the 1D cylinder and slab, each ring is also divided in azimuth about the beam axis into <code>Laser.raytrace.azimuthal_rays</code> parts (default 16), and that many rays are traced per ring. In 2D RZ, <code>rays_per_beam</code> (default 128) is not a ring count but the number of points per side of the 2D array that covers the beam cross-section.</p>
+      <p>The <strong>launch plane</strong> is the plane \(Z=Z_{\rm init}\), perpendicular to the beam axis, from which the rays are launched. It lies \(Z_{\rm init}\) from the target center toward the source, at the outer end \(R_{\rm max}\) of the <a href="raytrace.html#terms-lasermesh">LaserMesh</a>. The LaserMesh is rebuilt at every call to follow the fluid state, so the launch plane moves outward as the corona expands. Between the launch plane and the plasma surface is vacuum, where a ray travels in a straight line; it refracts after it enters the plasma.</p>
+
+      <h3 id="terms-impact">Impact parameter, launch radius, and radius on the plane through the target center</h3>
+      <p>The <strong>impact parameter</strong> is the distance \(b\) between the target center and the line of a ray when the ray is taken as a straight line without refraction. For a ray entering from vacuum it equals the Bouguer invariant \(B\) (<a href="raytrace.html#chord-raytrace">next section</a>), which is conserved along the path. In a spherically symmetric plasma with a given profile, the impact parameter alone fixes the radius at which the ray turns (<a href="raytrace.html#fig-laser-chord-geometry">Figure A of the ray-tracing page</a>).</p>
+      <p>In 1D, besides the impact parameter, two radii measure a distance from the beam axis for each ray. They are easily confused, so they are distinguished here for the ray of ring \(k\).</p>
+      <p>The <strong>launch radius</strong> \(R_k=(k+1/2)\Delta R\) is the distance from the beam axis of the point from which the ray of ring \(k\) is launched.</p>
+      <p>The <strong>radius on the plane through the target center</strong>, \(R_{{\rm ref},k}\), is the distance from the beam axis of the point at which the line of the ray crosses the plane \(Z=0\), which passes through the target center perpendicular to the beam axis. The intensity profile is evaluated at this radius. Unlike the launch plane, this plane does not move, so the weights do not change as the corona expands. <a href="#fig-laser-launch-geometry">Figure A</a> compares the three quantities, with the focus off and on the target center and with the launch plane moved.</p>
+      <p>A ray travels from the point at launch radius \(R_k\) along the straight line through the focus \((R,Z)=(0,z_f)\) on the axis, so the radius on the plane through the target center and the impact parameter are</p>
+      $$
+      R_{{\rm ref},k}=R_k\frac{|z_f|}{|Z_{\rm init}-z_f|},\qquad
+      b_k=\frac{|z_f|\,R_k}{\sqrt{R_k^2+(Z_{\rm init}-z_f)^2}}.
+      $$
+      <p>Here \(z_f\) is the position of the focus, measured from the target center along the beam axis with the source side positive. For a beam that travels toward \(-z\) (Studio's default) it equals the z coordinate of <code>Laser.beams[].focus</code>. Studio's default is 0 µm, the target center.</p>
+      <p>Neither \(R_{{\rm ref},k}\) nor \(b_k\) depends on the position \(Z_{\rm init}\) of the launch plane: \(R_{{\rm ref},k}=(k+1/2)|z_f|/(2FN_{\rm ray})\) and \(b_k=|z_f|\sin\theta_k\) with \(\tan\theta_k=(k+1/2)/(2FN_{\rm ray})\), where \(\theta_k\) is the angle between the ray and the beam axis, so they are set by the position of the focus, the F-number, and the ring number alone. When the focus is not at the target center (\(z_f\neq0\)), both increase monotonically with \(k\). In general \(b_k\) equals neither the launch radius \(R_k\) nor \(R_{{\rm ref},k}\).</p>
+      <p>If the focus is at the target center (\(z_f=0\)), every ray passes through the center, so \(b_k=0\) and \(R_{{\rm ref},k}=0\) for all rings, and the intensity profile does not change the weights (the ring areas alone set them). The input validation warns when an intensity profile is given in this case.</p>
+    </section>
+
+    <section aria-labelledby="beam-optics">
+      <h2 id="beam-optics">Beam optics, spot profile, and waveform</h2>
+      <p>The F-number \(F=f_{\rm focal}/D_{\rm lens}\) gives half-angle \(\theta_{\rm beam}=\tan^{-1}(1/2F)\), and the aperture radius on the launch plane is \(R_{\rm beam}=|Z_{\rm init}-z_f|/(2F)\) (\(Z_{\rm init}\) is the position of the launch plane and \(z_f\) the position of the focus; <a href="#terms-launch">terms</a>). In 1D the aperture is divided without gaps into \(N_{\rm ray}\) rings; the ray of ring \(k\) is launched from the launch radius \(R_k=(k+1/2)\Delta R\) along the line through the focus, with \(\Delta R=R_{\rm beam}/N_{\rm ray}\) and ring area \(\Delta A_k=\pi[(k+1)^2-k^2]\Delta R^2\) (the geometry is in <a href="#fig-laser-launch-geometry">Figure A</a>).</p>
+      <p>The Gaussian or super-Gaussian relative intensity \(I\) and the weight \(w_k\) of ring \(k\) are given in terms of the radius \(R_{\rm ref}\) on the plane through the target center (<a href="#terms-impact">terms</a>):</p>
+      $$
+      I(R_{\rm ref})\propto \exp\!\left[-2\left(\frac{R_{\rm ref}}{w_0}\right)^{2m}\right],\qquad
+      w_k=\frac{I(R_{{\rm ref},k})\Delta A_k}{\sum_j I(R_{{\rm ref},j})\Delta A_j}.
+      $$
+      <p>Here \(R_{{\rm ref},k}=R_k|z_f|/|Z_{\rm init}-z_f|\) is the distance from the beam axis of the point where the line of ray \(k\) crosses the plane through the target center perpendicular to the beam axis. \(w_0\) is the radius at which the intensity falls to \(e^{-2}\) on this plane. \(m=1\) is Gaussian; larger \(m\) flattens the top. If the focus is at the target center (\(z_f=0\)), \(R_{{\rm ref},k}=0\) for all rings and the profile does not change the weights. In 2D RZ, the profile is sampled on a circular array normal to the beam axis.</p>
+      <p><code>LaserBeam.power(t_s)</code> accepts seconds and returns watts. Initialization samples it through <code>Main.t_end</code> into a frozen linear table. Studio generates a square pulse with optional rise/fall, a Gaussian from peak or energy plus FWHM and center, or a piecewise-linear point/CSV table.</p>
+
+      <figure id="fig-laser-launch-geometry">
+        <img src="../../../assets/laser-launch-geometry-en.png" width="880" height="900" style="max-width:100%;height:auto" alt="Top: a schematic of the meridional plane (R,Z). The aperture on the launch plane Z=Z_init is divided into 8 rings of equal width; from the launch radius R_k at the center of each ring a blue straight line passes through the on-axis focus (0, z_f). For the outermost ring, dimension lines show the launch radius R_k (blue), the radius R_ref,k on the plane Z=0 through the target center (orange), and the impact parameter b_k (purple), the length of the perpendicular from the target center to the line. Bottom: R_k (blue circles), R_ref,k (orange squares), and b_k (purple diamonds) against the ring index k, for the focus z_f=300 um (left) and z_f=0 (right). Launch planes Z_init=900 um (solid, filled) and 1500 um (dotted, open) are overlaid. For z_f=300 um only R_k changes with Z_init, while R_ref,k and b_k coincide. For z_f=0, R_ref,k and b_k are 0 for every k.">
+        <figcaption>Figure A. Launch radius \(R_k\), radius on the plane through the target center \(R_{{\rm ref},k}\), and impact parameter \(b_k\) (see the terms for <a href="#terms-launch">ring</a> and <a href="#terms-impact">impact parameter</a>). Top: the meridional plane \((R,Z)\) with 8 rings, F-number 0.75, focus position \(z_f\)=300 µm, and launch plane position \(Z_{\rm init}\)=900 µm; the target (a circle of radius 200 µm) is gray. The thin blue lines are the rays of the rings and the thick one is the ray of ring \(k=7\); the drawing is a schematic with straight lines and no refraction (\(R\) is drawn negative on the other side of the axis, and radii are absolute values). \(R_k\) (blue), \(R_{{\rm ref},k}\) (orange, along the \(Z=0\) plane), and \(b_k\) (purple, the perpendicular from the target center to the line) are computed from \(R_{{\rm ref},k}=R_k|z_f|/|Z_{\rm init}-z_f|\) and \(b_k=|z_f|R_k/\sqrt{R_k^2+(Z_{\rm init}-z_f)^2}\); with these settings (\(|z_f|&lt;|Z_{\rm init}-z_f|\)) \(b_k&lt;R_{{\rm ref},k}&lt;R_k\), while a focus nearer the launch plane, \(|z_f|&gt;|Z_{\rm init}-z_f|\), gives \(R_{{\rm ref},k}&gt;R_k\). Bottom: the same \(F\) with \(Z_{\rm init}\) set to 900 µm (solid, filled) and 1500 µm (dotted, open). Changing \(Z_{\rm init}\) widens the aperture and changes \(R_k\), but \(R_{{\rm ref},k}\) and \(b_k\) do not change. The right panel is \(z_f\)=0 (the Studio default), where \(R_{{\rm ref},k}\) and \(b_k\) are 0 for every \(k\). The F-number 0.75 was chosen to make the difference between \(b_k\) and \(R_{{\rm ref},k}\) visible; it is not a default (the Studio default is 6.7 and the core default is 8.0).</figcaption>
+      </figure>
+    </section>
+
+    <section aria-labelledby="controls">
+      <h2 id="controls">Namelist controls</h2>
+      <p>The table lists the controls most directly involved in laser drive. See the <a href="../../use/namelist.html">namelist reference</a> for the full validation rules.</p>
+      <table class="quick-facts">
+        <thead><tr><th>Key</th><th>Value / unit</th><th>Purpose</th></tr></thead>
+        <tbody>
+          <tr><th><code>Laser.rays_per_beam</code></th><td>1D default 1000; 2D default 128 (at least 10 in both)</td><td>Number of 1D rings, or points per side of the 2D beam-plane array.</td></tr>
+          <tr><th><code>Laser.beams[]</code></th><td>one or more</td><td>Define each beam's <code>direction</code>, <code>power</code>, <code>f_number</code>, and focus / defocus.</td></tr>
+          <tr><th><code>Laser.beams[].profile</code></th><td><code>w0_um</code>, <code>m</code></td><td>Transverse <code>super_gaussian</code> profile; \(m=1\) is Gaussian.</td></tr>
+          <tr><th>Studio waveform</th><td>square / Gaussian / table</td><td>Generate a per-beam callable from a rise/fall pulse, FWHM Gaussian, or point table.</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["$$", "$$"], ["\\[", "\\]"]] } };</script>
+  <script defer src="../../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../../nav.js" data-page="laser-beams" data-root="../../"></script>
+</body>
+</html>

@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en" data-lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Charged-product transport and deposition — TENRYU Documentation</title>
+  <link rel="stylesheet" href="../../../style.css">
+  <script src="../../../theme.js"></script>
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>Charged-product transport and deposition</h1>
+    <p class="abstract">This page describes where the energy of the charged products of burn goes: the product-transport schemes (<code>fraley</code>, <code>diffusion</code>, <code>mc</code>, <code>local</code>), the electron/ion partition, and the burn energy ledger. Terms specific to this calculation are defined in the <a href="#terms">terms section</a>.</p>
+
+    <section aria-labelledby="products">
+      <h2 id="products">Product transport and electron/ion partition</h2>
+      <p>The default <code>scheme="fraley"</code> combines the Fraley alpha-range fit with a point-source spherical kernel [1] (<a href="#terms-fraley">Point-source sphere kernel and retained fraction</a>). It computes the locally retained fraction from the fuel-sphere areal density and the birth radius, deposits that fraction in the birth cell, and sends the remainder to the charged-escape ledger. <code>scheme="diffusion"</code> uses the Corman 1975 [3] multigroup equations to track the <a href="#terms-ledger">in-flight</a> specific spectra of six products — the charged products of each channel: the DT alpha; the DD proton, triton, and helion (the ³He nucleus); and the D³He proton and alpha — and deposits the energy lost during group-to-group slowing. <code>scheme="mc"</code> keeps straight-line CSDA particles between steps, of the same type as the Monte Carlo tracking of Yuan et al. [4], and samples <code>mc_particles_per_cell</code> particles per product, cell, and step. MC tallies are statistical, but the counter-based random-number streams (Philox4x32-10) remain independent through particle global IDs. <code>local</code> is for 2D RZ only (1D rejects it); it transports no product energy and deposits it entirely in the birth cell (the electron/ion partition is shared with the other schemes).</p>
+      <p>The default local-deposition split, <code>partition="li_petrasso"</code>, tabulates Li–Petrasso stopping over \(T_e,T_i,n_e\) during initialization; runtime performs only interpolation. The alternative Fraley law, \(f_i=1/(1+32/T_e[\mathrm{keV}])\), is restricted to DT alphas; when <code>scheme</code> is <code>fraley</code> or <code>local</code>, it is rejected with DD or D³He. It is also rejected with neutron heating (<code>neutron_heating</code>), because the law is a fit for the DT alpha and cannot partition the energy of the recoiling D and T between electrons and ions. Multigroup diffusion and Monte Carlo each include a stopping partition of their own and do not use this key.</p>
+
+      <figure>
+        <img src="../../../assets/burn-reaction-partition-en.png" width="960" height="470" style="max-width:100%;height:auto" alt="Flow from DT, DD, and D3He products through charged-particle transport or neutron heating into electron and ion energy">
+        <figcaption>Figure A. Reaction counts branch into distinct energy paths. Multigroup diffusion and MC are charged-product transport schemes; neutron heating is the separate two-line first-collision model.</figcaption>
+      </figure>
+    </section>
+
+    <section aria-labelledby="terms">
+      <h2 id="terms">Terms used in this calculation</h2>
+      <p>The retained fraction of the charged products and the bookkeeping of their energy are built from quantities specific to this calculation. The terms below carry meanings specific to TENRYU's implementation, so they are defined here together.</p>
+
+      <h3 id="terms-fraley">Point-source sphere kernel and retained fraction</h3>
+      <p>The <strong>fuel sphere</strong> is the contiguous range from the innermost to the outermost of the cells whose summed fuel-material volume fraction exceeds <code>vf_threshold</code> (default \(10^{-3}\)), the fuel cells. Cells inside the range that fall at or below the threshold stay in the range. The radius of the outer edge of the outermost cell is \(R_b\).</p>
+      <p>The <strong>point-source sphere kernel</strong> gives, in closed form, the fraction of a charged product's energy that is deposited inside the fuel sphere. A product is assumed to start from a point source at the center of its birth cell, to be emitted isotropically, to travel in a straight line through a uniform medium, and to slow down under an electron drag that is linear in velocity, \(E(s)=E_0(1-s/\lambda)^2\) (\(E_0\) is the birth energy, \(s\) the flight distance, and \(\lambda\) the range). With \(r\) the radius of the birth point, \(u=r/R_b\), and \(\mu\) the cosine of the angle between the flight direction and the outward radial direction, the distance from the birth point to the surface of the fuel sphere is \(L(\mu)=-u\mu+\sqrt{1-u^2+u^2\mu^2}\) in units of \(R_b\). With \(\tau=R_b\bar\rho/(\rho\lambda)\), the fuel-sphere radius divided by the range, the deposited fraction \(f(u,\tau)\) is</p>
+      $$
+      f(u,\tau)=\frac12\int_{-1}^{1}\Bigl\{1-\bigl[1-\min\bigl(\tau L(\mu),1\bigr)\bigr]^2\Bigr\}\,d\mu .
+      $$
+      <p>Here \(\bar\rho\) is the trapezoidal radial mean of the density from the center of the birth cell to \(R_b\) [g/cm³], and \(\rho\lambda\) is the product's range expressed as an areal density [g/cm²] (\(\rho\lambda/\bar\rho\) is the range as a length).</p>
+      <p>The <strong>retained fraction</strong> is this \(f(u,\tau)\). The retained part \(f\) is deposited in the birth cell (the split between electrons and ions follows <code>partition</code>), and the rest, \(1-f\), is booked in the charged-escape ledger as energy that leaves the fuel sphere. At the center (\(u=0\)), \(f=1-[1-\min(\tau,1)]^2\), which equals 1 for \(\tau\ge1\). At the surface of the fuel sphere (\(u=1\)), \(f\) only approaches 1/2 as \(\tau\) grows (the half of the emission that goes outward escapes). Averaged over sources distributed uniformly in a uniform sphere, \(f\) reduces to the classical expression \(f(\tau)=\tfrac32\tau-\tfrac45\tau^2\) for \(\tau\le\tfrac12\) and \(f(\tau)=1-\tfrac1{4\tau}+\tfrac1{160\tau^3}\) for \(\tau\ge\tfrac12\).</p>
+      <p>The <strong>range</strong> of the 3.54-MeV DT alpha is given by the Fraley fit [1]</p>
+      $$
+      \rho\lambda_\alpha=\frac{1.5\times10^{-2}\,T_e^{5/4}}{1+8.2\times10^{-3}\,T_e^{5/4}}\cdot\frac{1+0.17\ln T_e}{1+0.17\ln\bigl(T_e\sqrt{\rho_0/\rho}\bigr)}\ \ [\mathrm{g/cm^2}],\qquad \rho_0=0.213\ \mathrm{g/cm^3}
+      $$
+      <p>(\(T_e\) in keV and \(\rho\) in g/cm³; \(T_e\) is limited to at least 0.1 keV and each of the two logarithmic factors to at least 0.15). The ranges of the other products are scaled from the alpha by \(\lambda_s=\lambda_\alpha\sqrt{A_sE_s/(A_\alpha E_\alpha)}\,(Z_\alpha/Z_s)^2\) (\(A\) is the mass, \(E\) the birth energy, and \(Z\) the charge). The electron term and the ion term of the fit are corrected for the composition of the cell (fuel and ash); the correction is 1 for equimolar DT. Because the kernel assumes straight flight, a uniform medium, and a radial mean density, it does not represent the layering of the density along oblique chords.</p>
+      <p>The kernel estimates, cheaply in a 1D spherical calculation and without tracking the flights, how much of the charged-product energy heats the fuel and how much escapes. The default <code>scheme="fraley"</code> (1D only) uses it, and the retained fraction fixes the energy deposited in electrons and ions and the energy that escapes, and so the strength of self-heating and the ignition margin. The smaller \(\tau\) is (the longer the range compared with the fuel sphere), the larger the escaping fraction. For example, \(f=0.75\) for \(u=0\) and \(\tau=0.5\), and \(f=0.94\) for \(u=0.5\) and \(\tau=1\).</p>
+
+      <h3 id="terms-ledger">In flight and the burn ledger</h3>
+      <p>The <strong>in-flight</strong> energy \(E_{inflight}\) is the energy carried by charged products that have been produced but have neither been deposited in a cell nor escaped from the system. Multigroup diffusion carries it into the next step as the specific spectra \(Y_g=N_g/\rho\) [1/g] (\(N_g\) is the particle number density of group \(g\), stored per unit mass like the specific inventory), and Monte Carlo carries it as the particles kept across steps. With <code>fraley</code> and <code>local</code>, a product is either deposited or escapes within the step that produces it, so \(E_{inflight}=0\).</p>
+      <p>The <strong>burn ledger</strong> books where the energy released by burn goes, and is part of the overall <a href="../../overview/numerics-foundations.html#energy-ledger">energy ledger</a>. For the charged products, each step enforces the following identity to within rounding (released = deposited + escaped + change in in-flight energy).</p>
+      $$
+      E_{rel}=E_{dep}+E_{esc}+\Delta E_{inflight}.
+      $$
+      <p>Here \(E_{rel}\) is the energy released by the charged products, \(E_{dep}\) the energy deposited in electrons and ions, \(E_{esc}\) the energy that leaves the system (the part leaving the fuel sphere for <code>fraley</code>, the part leaving through the outer surface for <code>diffusion</code> and <code>mc</code>), and \(\Delta E_{inflight}\) the change of the in-flight energy over the step. For neutrons, all the released energy counts as escaped when <code>neutron_heating</code> is off; when it is on, the identity emitted = deposited + degraded + escaped is enforced (<a href="neutrons.html#terms-first-collision">First collision and single flight</a>). The overall energy ledger receives only the energy deposited in the fluid, as an external source; escaped energy and neutrons never enter the fluid, so they are not counted as losses. The history channels <code>burn/released</code>, <code>burn/dep_e</code>, <code>burn/dep_i</code>, <code>burn/esc_charged</code>, <code>burn/esc_neutron</code>, the cumulative channels such as <code>burn/E_released_cum</code>, and <code>burn/E_inflight</code> (<code>diffusion</code> and <code>mc</code> only) are this ledger (<a href="../../use/outputs/history.html#history">History channels</a>).</p>
+    </section>
+
+    <section aria-labelledby="controls">
+      <h2 id="controls">Namelist controls</h2>
+      <p>These are the keys of the top-level <code>Burn</code> block that concern the transport and partition of the charged products. The keys that concern burn as a whole are on the <a href="index.html#controls">overview page</a>. The defaults in the table are the values used when a deck does not set the key. Studio allows burn only in 1D spherical runs and writes <code>fraley</code>, <code>diffusion</code>, or <code>mc</code>.</p>
+      <table class="quick-facts">
+        <thead><tr><th>Key</th><th>Default</th><th>Purpose</th></tr></thead>
+        <tbody>
+          <tr><th><code>scheme</code></th><td><code>"fraley"</code></td><td>Charged-product treatment: <code>fraley</code>, <code>diffusion</code>, or <code>mc</code> in 1D; <code>local</code> or <code>diffusion</code> in 2D RZ. The default <code>fraley</code> is rejected in 2D, so a 2D deck cannot omit the key and must name one.</td></tr>
+          <tr><th><code>partition</code></th><td><code>"li_petrasso"</code></td><td>Local-deposition e/i split; <code>fraley</code> is DT-alpha-only and cannot be combined with <code>neutron_heating</code>.</td></tr>
+          <tr><th><code>vf_threshold</code></th><td><code>1e-3</code></td><td>Threshold that identifies fuel cells (a value above 0 and below 1). A cell is a fuel cell when the sum of the volume fractions of the fuel materials exceeds it. In 1D only the cells between the innermost and the outermost fuel cell react, and the outer edge of the outermost cell is the radius of the fuel sphere (<a href="#terms-fraley">terms</a>). In 2D only fuel cells react.</td></tr>
+          <tr><th><code>diffusion_groups / diffusion_E_min_keV</code></th><td><code>30 / 20.0</code></td><td>Charged-particle group count and the bottom edge of the group grid: a product slowed below it deposits its remaining energy locally. The default 20 keV sits far below the MeV birth energies, and the range left below it is negligible.</td></tr>
+          <tr><th><code>mc_particles_per_cell</code></th><td><code>16</code></td><td>Monte Carlo samples per product, cell, and step.</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section aria-labelledby="verification">
+      <h2 id="verification">Verification</h2>
+      <ul>
+        <li>In the unit test <code>test_burn_deposition</code>, sections G-K0, G-K1, and G-K2 (<a href="../../verification/index.html#tag-legend">test tags</a>) cover the Fraley range anchors, the point-source sphere kernel identity, and the sphere-average closed form, and sections G-P1 and G-P2 cover the published Li–Petrasso stopping-power reference values (their Table I [2]) and the intentionally different Fraley partition. The six-run microsphere test <code>burn_rung2_microsphere</code> combines the fuel-pair bound, rate scaling, and early alpha-recapture self-heating.</li>
+        <li>MC separately gates fixed-seed CV ≤0.1% (CV: coefficient of variation, \(\sigma/|\mu|\)), cross-seed CV ≤5%, and Philox stream independence.</li>
+      </ul>
+    </section>
+
+    <section aria-labelledby="references">
+      <h2 id="references">References</h2>
+      <ol class="references">
+        <li>G. S. Fraley, E. J. Linnebur, R. J. Mason, and R. L. Morse, "Thermonuclear Burn Characteristics of Compressed Deuterium-Tritium Microspheres," Phys. Fluids 17, 474–489 (1974). <a href="https://doi.org/10.1063/1.1694739">doi:10.1063/1.1694739</a></li>
+        <li>C.-K. Li and R. D. Petrasso, "Charged-Particle Stopping Powers in Inertial Confinement Fusion Plasmas," Phys. Rev. Lett. 70, 3059–3062 (1993). <a href="https://doi.org/10.1103/PhysRevLett.70.3059">doi:10.1103/PhysRevLett.70.3059</a></li>
+        <li>E. G. Corman, W. E. Loewe, G. W. Cooper, and A. M. Winslow, "Multi-Group Diffusion of Energetic Charged Particles," Nucl. Fusion 15, 377–386 (1975). <a href="https://doi.org/10.1088/0029-5515/15/3/003">doi:10.1088/0029-5515/15/3/003</a></li>
+        <li>J. Yuan, G. A. Moses, and P. W. McKenty, "Monte Carlo Charged-Particle Tracking and Energy Deposition on a Lagrangian Mesh," Phys. Rev. E 72, 046706 (2005). <a href="https://doi.org/10.1103/PhysRevE.72.046706">doi:10.1103/PhysRevE.72.046706</a></li>
+      </ol>
+    </section>
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["$$", "$$"], ["\\[", "\\]"]] } };</script>
+  <script defer src="../../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../../nav.js" data-page="burn-products" data-root="../../"></script>
+</body>
+</html>

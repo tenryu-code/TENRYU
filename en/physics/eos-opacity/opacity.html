@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en" data-lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Opacity — TENRYU Documentation</title>
+  <link rel="stylesheet" href="../../../style.css">
+  <script src="../../../theme.js"></script>
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>Opacity</h1>
+    <p class="abstract">TENRYU's opacity gives the mass opacity used by radiation transport from the density and temperature of a cell. A constant coefficient or a tabulated coefficient such as TMAT-H5 can be selected, and transport converts it to an opacity per unit length. A mixing rule applies to mixed cells, in which two or more materials share the volume. The Planck fractions, which distribute the radiative emission over the groups, are tabulated at initialization. This page describes the opacity models, the treatment of mixed cells, the Planck-fraction table, and the diagnostic of the tail that falls outside the groups. Terms specific to this calculation are defined in the <a href="#terms">terms section</a>.</p>
+
+    <aside class="planned" aria-labelledby="at-a-glance">
+      <h3 id="at-a-glance">At a glance</h3>
+      <ul>
+        <li><strong>Models:</strong> <code>constant</code> takes the absorption <code>kappa_a</code> and the scattering <code>kappa_s</code> in cm²/g, and the tabulated models read the Rosseland mean, the Planck absorption, and the Planck emission. Transport converts them to \(\sigma=\rho\kappa\) [cm⁻¹].</li>
+        <li><strong>Mixed cells:</strong> the default of <code>Materials.opacity_mix_rule</code> is <code>"linear_mass"</code>. The two nonlinear rules (<code>"harmonic_mass_R"</code> and <code>"max"</code>) exist in 1D only.</li>
+        <li><strong>Multi-material 1D:</strong> in a pure cell the dominant material selects the table, and an interface mixed cell combines the tables of all materials evaluated at their partial densities.</li>
+        <li><strong>Planck fractions:</strong> the group sum is normalized to 1. Initialization warns when the tail deficit exceeds \(10^{-3}\) at every temperature of the table.</li>
+      </ul>
+    </aside>
+
+    <section aria-labelledby="opacity">
+      <h2 id="opacity">Opacity and material mixing</h2>
+      <p><code>opacity.model="constant"</code> supplies absorption <code>kappa_a</code> and scattering <code>kappa_s</code> in cm²/g and assigns them to every group. The 1D \(S_N\) solver uses <code>kappa_s</code> as the physical scattering opacity. FLD has no physical scattering, so it rejects a <code>kappa_s</code> greater than zero as an input error. The 2D \(S_N\) solver sets physical scattering to zero and does not consume it. A table model supplies density-, temperature-, and group-dependent Rosseland \(\kappa_R\), Planck absorption \(\kappa^{PA}\), and, when present, Planck emission \(\kappa^{PE}\). Transport converts each mass opacity to \(\sigma=\rho\kappa\). An IONMIX table without an emission-opacity block is taken as an LTE table, with a warning and \(\kappa^{PE}=\kappa^{PA}\) (Kirchhoff's law).</p>
+      <p>In a mixed cell, <code>Materials.opacity_mix_rule</code> selects how the material opacities combine, with mass-fraction weights (volume fractions when the material masses are not tracked). The default <code>"linear_mass"</code> mixes both the Planck and the Rosseland opacity linearly, as in \(\kappa_{P,mix}=\sum_\alpha f_{m,\alpha}\kappa_{P,\alpha}\). <code>"harmonic_mass_R"</code> keeps the Planck mixing linear and takes the Rosseland harmonic mean, \(1/\kappa_{R,mix}=\sum_\alpha f_{m,\alpha}/\kappa_{R,\alpha}\), and <code>"max"</code> takes the largest material opacity for both. The two non-linear rules exist in 1D only; 2D accepts only <code>"linear_mass"</code>. The diagnostic environment switch <code>TENRYU_MM_OPACITY_MIX=harmonic</code> mixes constant opacities harmonically for both means.</p>
+      <h3 id="per-material-table-opacities">Per-material table opacities (multi-material 1D)</h3>
+      <p>In a <code>1D_SPH</code> multigroup-diffusion deck, each non-void material may carry its own <code>tmat</code> opacity table — an LTE table, or a non-LTE (NLTE) table with an emission opacity independent of the absorption — or a constant. A material may also use <code>table_nlte</code> (an IONMIX table), <code>power_law</code>, or <code>freq_dep_marshak</code>, and <code>sn_transport</code> decks accept the same per-material models. In a pure cell the <a href="#terms-mixed">dominant material</a>, meaning the one with the largest volume fraction, selects the table, whose group opacities are interpolated at the cell's \((\rho,T_e)\). Mixed interface cells combine every contributing material exactly — under the default linear rule, \(\sigma = \rho \sum_m w_m \kappa_m(\rho_m, T_e)\) with mass-fraction weights \(w_m\) (volume fractions as fallback), each material's table evaluated at its <a href="#terms-mixed">partial density</a> \(\rho_m = \rho\,w_m/f_m\). Only cells whose dominant material is NLTE are filled by the NLTE kernel under the dominant-material approximation. In 2D, a multi-material \(S_N\) deck requires constant opacities for every non-void material, whereas the 2D FLD evaluates each material's opacity (the model may differ per material) at its partial density and mixes them; only the <code>"linear_mass"</code> rule is available.</p>
+    </section>
+
+    <section aria-labelledby="planck-table">
+      <h2 id="planck-table">PlanckTable and group-coverage diagnostics</h2>
+      <p>For group \(g=[E_{g-1},E_g)\), the Planck fraction is the in-group blackbody integral divided by the integral over the full spectrum:</p>
+      $$
+      b_g(T)=\frac{15}{\pi^4}\int_{E_{g-1}/T}^{E_g/T}\frac{x^3}{e^x-1}\,dx.
+      $$
+      <p>With <code>planck_fraction.method="compute"</code>, initialization evaluates this integral on a temperature grid; at run time <code>PlanckTable</code> interpolates the logarithms of the cumulative fractions (or of their complementary tails) with cubic Hermite polynomials in \(\ln T\) through their exact slopes and takes \(b_g\) as differences, so the fractions sum to one by construction. Finite photon bounds can make the raw sum smaller than one, so production weights are renormalized to \(\sum_gb_g=1\). Renormalization does not recover missing spectrum: TENRYU also records the tail deficit \(\delta(T)=1-\sum_gb_g^{raw}(T)\) and reports its maximum over the table grid. It warns when the deficit exceeds \(10^{-3}\) at every table temperature; otherwise it logs the temperature interval in which the deficit is at most \(10^{-3}\) together with the maximum deficit.</p>
+      <p><code>compute_T_range_eV</code> defines the Planck table's temperature axis. If omitted, it is derived from active electron-EOS tables, then opacity tables, then the fallback [0.01, 1000] eV. A Studio deck with radiation enabled always writes it, from the smaller of the lowest group bound and 0.1 eV to the larger of the highest group bound and \(10^5\) eV. A runtime temperature outside this interval is clamped to the value at the nearer end (no extrapolation). The number of such accesses and the amount by which they exceed the range are not recorded. A warning appears only on the host-side path that evaluates \(b_g\) at the drive temperature \(T_r\) of the radiation Marshak boundary, and only once. This temperature axis is distinct from the photon group bounds \([E_0,E_G]\). When the group bounds are generated with <code>"log_uniform"</code>, or when neither group bounds nor a table group structure is given, the group bounds are built log-uniformly from this temperature range (with a lower end of at least \(10^{-3}\) eV), so the two ranges coincide. When the group structure of an opacity table or an explicit <code>group_bounds_eV</code> is used, the two ranges are independent. Design the group bounds to cover the expected plasma spectrum and the temperature axis to cover the temperatures needed for interpolation.</p>
+    </section>
+
+    <section aria-labelledby="terms">
+      <h2 id="terms">Terms used in this calculation</h2>
+      <p>The grids of groups and temperatures, the Planck fraction, and the treatment of mixed cells carry meanings specific to TENRYU's implementation, so they are defined here.</p>
+
+      <h3 id="terms-planck">Groups, Planck fraction, and tail deficit</h3>
+      <p>A <strong>group</strong> is an interval \([E_{g-1},E_g)\) into which radiation transport divides the photon energy, numbered \(g=1,\dots,G\). The bounds \(E_0&lt;E_1&lt;\dots&lt;E_G\) [eV] are given by <code>Radiation.group_bounds_eV</code> (a list of numbers, or <code>"log_uniform"</code>) and the number of groups \(G\) by <code>Radiation.groups</code> (default 1). With one group the calculation is gray. Both the opacity coefficients and the radiation energy are defined, and transported, group by group.</p>
+      <p>The <strong>Planck fraction</strong> \(b_g(T)\) is the fraction of the blackbody spectrum at temperature \(T\) that falls in group \(g\) (the formula is in <a href="#planck-table">PlanckTable and group-coverage diagnostics</a>). It serves as the weight that distributes the radiative emission source among the groups, and it is normalized so that its sum over the groups is 1. At initialization it is computed and tabulated on a temperature grid (<code>planck_fraction.compute_N_T</code> points, default 200, spaced log-uniformly over the temperature range) as the <code>PlanckTable</code>. The temperature range is given by <code>Radiation.compute_T_range_eV</code>. If it is omitted, it is derived from the active electron-EOS tables, then the opacity tables, then the fallback [0.01, 1000] eV. A Studio deck with radiation enabled always writes <code>compute_T_range_eV</code> (for the default group bounds [0.1, \(10^5\)] eV it is [0.1, \(10^5\)] eV).</p>
+      <p>The <strong>tail deficit</strong> \(\delta(T)=1-\sum_g b_g^{raw}(T)\) is the fraction of the blackbody spectrum that falls outside the full range \([E_0,E_G]\) of the groups. Here \(b_g^{raw}\) is \(b_g\) before normalization. Because the photon-energy range is finite, the sum of \(b_g^{raw}\) can be smaller than one. Normalization does not recover the missing spectrum; it only redistributes the part that fell outside into the groups, so a narrow group range makes the radiative emission more concentrated in the group range than it really is. At initialization, therefore, the maximum of \(\delta(T)\) over the whole temperature grid is found and recorded. A warning is issued when the temperatures at which \(\delta\) exceeds \(10^{-3}\) cover every temperature of the table; otherwise the temperature interval where \(\delta\le10^{-3}\) and the maximum are logged as information. With one group, \(b_1=1\) and the deficit is not checked.</p>
+
+      <h3 id="terms-mixed">Mixed cell, dominant material, and partial density</h3>
+      <p>A <strong>mixed cell</strong> is a cell whose volume is shared by two or more materials. The volume fraction \(f_m\) of material \(m\) (the normalized <code>Geometry.volfrac</code>, summing to 1) is the share of the cell volume that material \(m\) occupies. A void (<a href="index.html#void-materials">defined here</a>) is a vacuum without ions, so it is left out of the material averages, which are renormalized by the sum of the volume fractions of the non-void materials. A cell in which only one non-void material has a volume fraction is called a pure cell.</p>
+      <p>The <strong>dominant material</strong> is the non-void material with the largest volume fraction in the cell (the lower-numbered material on a tie, and the first non-void material in a cell where no non-void volume fraction is positive). In a pure cell the dominant material selects the opacity table. A cell whose dominant material uses an NLTE (non-LTE) table, even a mixed cell, is filled by that material's NLTE computation from the dominant material's table alone (the dominant-material approximation).</p>
+      <p>The <strong>partial density</strong> is the density of material \(m\) itself, the mass of material \(m\) divided by the volume it occupies, \(\rho_m=\rho\,w_m/f_m\). Here \(w_m\) is the mass fraction (the volume fraction when the material masses are not tracked). Because a material's table is a function of density, in a mixed cell each table is read at the material's partial density rather than the cell density. A material with \(f_m\le10^{-12}\) takes the cell density as its partial density (to avoid division by zero). Under the default linear rule <code>Materials.opacity_mix_rule="linear_mass"</code> (Studio does not write this key) the length opacity of a mixed cell is \(\sigma=\rho\sum_mw_m\kappa_m(\rho_m,T_e)\) (<a href="#opacity">Opacity and material mixing</a>).</p>
+    </section>
+
+    <section aria-labelledby="controls">
+      <h2 id="controls">Namelist controls</h2>
+      <p>The table lists the controls that relate directly to the opacity. See the <a href="../../use/namelist.html">namelist reference</a> for complete validation rules.</p>
+      <table class="quick-facts">
+        <thead>
+          <tr><th>Key</th><th>Value/default</th><th>Purpose</th></tr>
+        </thead>
+        <tbody>
+          <tr><th><code>opacity.model</code></th><td><code>constant</code> (default) | <code>tmat</code> | <code>table_nlte</code> | <code>ionmix</code> | <code>power_law</code> | <code>freq_dep_marshak</code> | <code>free_free</code></td><td>A group-constant coefficient (<code>constant</code>), table coefficients (<code>tmat</code> is a TMAT-H5 table; <code>table_nlte</code> is a table in the <code>.cn4</code> format “IONMIX” of the collisional-radiative code Ionmix; <code>ionmix</code> takes an LTE IONMIX table whose emission and absorption opacities agree, by the same route as <code>table_nlte</code>), a power law (<code>power_law</code>), an analytic opacity for the frequency-dependent Marshak verification problem (<code>freq_dep_marshak</code>), or free–free absorption (<code>free_free</code>, 2D FLD only). <code>sesame</code> is accepted but not implemented, so it is an input error. <code>none</code> is deprecated and is read as <code>constant</code> with <code>kappa_a</code> and <code>kappa_s</code> equal to 0. Studio writes only <code>constant</code> and <code>tmat</code>.</td></tr>
+          <tr><th><code>kappa_a</code>, <code>kappa_s</code></th><td>0.0 / 0.0</td><td>Constant absorption and scattering mass opacities. Omitting <code>kappa_a</code> gives a warning and a value of 0 (a transparent medium). Only \(S_N\) uses <code>kappa_s</code>; FLD rejects a value above 0.</td></tr>
+          <tr><th><code>opacity.units</code></th><td><code>"cm2_per_g"</code></td><td>Fixed mass-opacity unit.</td></tr>
+          <tr><th><code>Materials.opacity_mix_rule</code></th><td><code>"linear_mass"</code></td><td>Mixed-cell rule: <code>"linear_mass"</code> (both means linear), <code>"harmonic_mass_R"</code> (Rosseland harmonic), or <code>"max"</code>; 2D accepts only <code>"linear_mass"</code>.</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section aria-labelledby="verification">
+      <h2 id="verification">Verification</h2>
+      <ul>
+        <li>The Planck sum gate covers 1, 4, 16, and 64 groups over \(T=1\ldots10^5\) eV, checking normalized weights, the terminal cumulative distribution function (CDF), and the group-summed \(aT^4\). Separately, initialization reports the maximum tail deficit; accesses outside the Planck table's temperature range are not recorded.</li>
+        <li>Opacity-parity benchmarks must align physical assumptions. The LTE parity A/B against the radiation-hydrodynamics code HELIOS uses a TENRYU Kirchhoff's-law branch with <code>kappa_PE := kappa_PA</code>, separating that matched LTE treatment from the raw CRE (collisional-radiative-equilibrium) non-LTE emission table.</li>
+      </ul>
+    </section>
+
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["$$", "$$"], ["\\[", "\\]"]] } };</script>
+  <script defer src="../../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../../nav.js" data-page="opacity" data-root="../../"></script>
+</body>
+</html>

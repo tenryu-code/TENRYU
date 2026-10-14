@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="ja" data-lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ビームと光線の打ち出し — TENRYU ドキュメント</title>
+  <link rel="stylesheet" href="../../../style.css">
+  <script src="../../../theme.js"></script>
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>ビームと光線の打ち出し <span class="badge">reference</span></h1>
+    <p class="abstract">この頁は、ビームの入力から光線の打ち出しまでを述べる。ビーム 1 本のパワーは、初期化時に凍結した時間波形の表から参照し、横方向の強度分布は、標的中心を通る面での半径で評価する。1D では、打ち出し面の開口を等しい幅の環（ring）に分け、環ごとに 1 本の光線を、軸上の焦点を通る直線に沿って打ち出す。2D RZ では、同じ強度分布を、ビーム軸に直交する面上の円形の 2 次元配列へ適用する。この計算に固有の用語は<a href="#terms">用語の節</a>で説明する。</p>
+
+    <section aria-labelledby="terms">
+      <h2 id="terms">この計算で使う用語</h2>
+      <p>1D の流体量は半径 \(r\) だけの関数だが、レーザーは、ビームに固定した \((R,Z)\) 面の中で光線 1 本ずつの経路を求めて吸収を数える（<a href="raytrace.html#chord-raytrace">光線追跡の頁</a>）。TENRYU はビームの開口を、以下の単位に分けて光線を打ち出す。ここに挙げる用語は、このページの計算、とくに TENRYU の実装に固有の意味で使うので、まとめて定義する。</p>
+
+      <h3 id="terms-launch">弦、環、打ち出し面</h3>
+      <p><strong>弦（chord）</strong>は、1 本の光線の、ビーム軸と標的中心を含む \((R,Z)\) 面（子午面、meridional plane）の中の経路である。\(R\) はビーム軸からの距離、\(Z\) はビーム軸に沿った座標で、標的中心を原点とし、光源の側を正とする。真空中の弦は直線（球を横切る弦）で、プラズマの中では光線が屈折して曲がる。1D の流体量は半径 \(r=\sqrt{R^2+Z^2}\) だけの関数なので、光線の経路はこの 1 つの面の中で求めれば足りる。</p>
+      <p><strong>環（ring）</strong>は、打ち出し面（次の段落）上の開口を、ビーム軸のまわりの同心円で等しい幅に分けた輪である。開口の半径は \(R_{\rm beam}=|Z_{\rm init}-z_f|/(2F)\) で、\(F\) は F 値（F-number）、\(Z_{\rm init}\) は打ち出し面の位置、\(z_f\) は焦点の位置（<a href="#terms-impact">次の項</a>）である。\(R_{\rm beam}\) を \(N_{\rm ray}\) 等分した幅 \(\Delta R=R_{\rm beam}/N_{\rm ray}\) の環 \(k=0,1,\dots,N_{\rm ray}-1\) を作り、環 \(k\) ごとに 1 本の光線を、環の中心の半径 \(R_k=(k+1/2)\Delta R\) の点から、軸上の焦点を通る直線に沿って打ち出す。環の面積 \(\Delta A_k=\pi[(k+1)^2-k^2]\Delta R^2\) と強度分布が環のパワーの重み \(w_k\) を決め、光線はその環のパワーを運ぶ（<a href="#beam-optics">ビーム光学</a>）。環の分け方と光線の向きは<a href="#fig-laser-launch-geometry">図A</a>の上段に示す。</p>
+      <p>環の数 \(N_{\rm ray}\) は <code>Laser.rays_per_beam</code> で、1D の既定は 1000（Studio の既定も 1000）、10 以上でなければならない。環を細かくするほど、強度分布と、光線ごとに異なる屈折・吸収の分解能が上がるが、追跡する光線の本数に比例して計算量が増える。1D の円筒・平板では、環をビーム軸のまわりの方位角にも <code>Laser.raytrace.azimuthal_rays</code>（既定 16）等分して、環ごとにその数の光線を追跡する。2D RZ の <code>rays_per_beam</code>（既定 128）は、環の数ではなく、ビーム断面を覆う 2 次元配列の 1 辺の点数である。</p>
+      <p><strong>打ち出し面（launch plane）</strong>は、光線を打ち出す、ビーム軸に直交する面 \(Z=Z_{\rm init}\) である。標的中心から光源の側へ \(Z_{\rm init}\) だけ離れ、<a href="raytrace.html#terms-lasermesh">LaserMesh</a> の外側の端 \(R_{\rm max}\) に取る。LaserMesh は流体の状態に合わせて呼び出しごとに作り直すので、コロナが広がると打ち出し面も外へ動く。打ち出し面とプラズマの表面のあいだは真空で、光線は直線で進み、プラズマに入ってから屈折する。</p>
+
+      <h3 id="terms-impact">衝突径数、打ち出し半径、標的中心を通る面での半径</h3>
+      <p><strong>衝突径数（impact parameter）</strong>は、光線を屈折のない直線とみなしたときの、その直線と標的中心との距離 \(b\) である。真空から入射する光線では、光路に沿って保存される Bouguer 不変量 \(B\)（<a href="raytrace.html#chord-raytrace">次節</a>）が衝突径数に等しい。球対称のプラズマでは、密度などの分布が同じなら、衝突径数だけで光線の転回点の半径が決まる（<a href="raytrace.html#fig-laser-chord-geometry">光線追跡の頁の図A</a>）。</p>
+      <p>1D の光線について、衝突径数のほかに、ビーム軸からの距離を表す半径が 2 つある。混同しやすいので、環 \(k\) の光線について区別して書く。</p>
+      <p><strong>打ち出し半径（launch radius）</strong> \(R_k=(k+1/2)\Delta R\) は、環 \(k\) の光線を打ち出す点の、ビーム軸からの距離である。</p>
+      <p><strong>標的中心を通る面での半径</strong> \(R_{{\rm ref},k}\) は、光線の直線が、標的中心を通りビーム軸に直交する面 \(Z=0\) を横切る点の、ビーム軸からの距離である。強度分布はこの半径で評価する。この面は打ち出し面と違って動かないので、コロナが広がっても重みは変わらない。3 つの量の違いは<a href="#fig-laser-launch-geometry">図A</a>に、焦点が標的中心にある場合とない場合、打ち出し面の位置を変えた場合を並べて示す。</p>
+      <p>光線は、打ち出し半径 \(R_k\) の点から、軸上の焦点 \((R,Z)=(0,z_f)\) を通る直線に沿って進むので、標的中心を通る面での半径と衝突径数は次のとおりである。</p>
+      $$
+      R_{{\rm ref},k}=R_k\frac{|z_f|}{|Z_{\rm init}-z_f|},\qquad
+      b_k=\frac{|z_f|\,R_k}{\sqrt{R_k^2+(Z_{\rm init}-z_f)^2}}.
+      $$
+      <p>\(z_f\) は焦点の位置で、標的中心を原点に、ビーム軸に沿って光源の側を正とする。ビームが \(-z\) 向きに進むデッキ（Studio の既定）では、<code>Laser.beams[].focus</code> の z 座標に等しい。Studio の既定は 0 µm（標的中心）である。</p>
+      <p>\(R_{{\rm ref},k}\) と \(b_k\) は、打ち出し面の位置 \(Z_{\rm init}\) によらない。\(R_{{\rm ref},k}=(k+1/2)|z_f|/(2FN_{\rm ray})\)、\(b_k=|z_f|\sin\theta_k\)（\(\tan\theta_k=(k+1/2)/(2FN_{\rm ray})\)、\(\theta_k\) は光線とビーム軸のなす角）と書けるので、焦点の位置、F 値、環の番号だけで決まる。焦点が標的中心にないとき（\(z_f\neq0\)）、どちらも \(k\) とともに単調に増える。\(b_k\) は打ち出し半径 \(R_k\) とも \(R_{{\rm ref},k}\) とも一般に等しくない。</p>
+      <p>焦点が標的中心にある（\(z_f=0\)）と、すべての光線が標的中心を通るので、すべての環で \(b_k=0\)、\(R_{{\rm ref},k}=0\) となり、強度分布は重みを変えない（環の面積だけが重みを決める）。この場合に強度分布を指定すると、入力の検証が警告を出す。</p>
+    </section>
+
+    <section aria-labelledby="beam-optics">
+      <h2 id="beam-optics">ビーム光学、スポット、波形</h2>
+      <p>F 値は \(F=f_{\rm focal}/D_{\rm lens}\)、集光円錐の半角は \(\theta_{\rm beam}=\tan^{-1}(1/2F)\) である。打ち出し面から焦点までの距離が与えられると、打ち出し面での開口半径は \(R_{\rm beam}=|Z_{\rm init}-z_f|/(2F)\) になる（\(Z_{\rm init}\) は打ち出し面の位置、\(z_f\) は焦点の位置。<a href="#terms-launch">用語</a>）。1D ではこの開口を隙間なく \(N_{\rm ray}\) 個の環へ分け、環 \(k\) の光線を、打ち出し半径 \(R_k=(k+1/2)\Delta R\) の点から、焦点を通る直線に沿って打ち出す。ここで \(\Delta R=R_{\rm beam}/N_{\rm ray}\) であり、環の面積は \(\Delta A_k=\pi[(k+1)^2-k^2]\Delta R^2\) である（幾何は<a href="#fig-laser-launch-geometry">図A</a>）。</p>
+      <p>ガウス型・スーパーガウス型（super-Gaussian）の相対強度 \(I\) と、環 \(k\) の重み \(w_k\) は、標的中心を通る面での半径 \(R_{\rm ref}\)（<a href="#terms-impact">用語</a>）を使って次式で与える。</p>
+      $$
+      I(R_{\rm ref})\propto \exp\!\left[-2\left(\frac{R_{\rm ref}}{w_0}\right)^{2m}\right],\qquad
+      w_k=\frac{I(R_{{\rm ref},k})\Delta A_k}{\sum_j I(R_{{\rm ref},j})\Delta A_j}.
+      $$
+      <p>ここで \(R_{{\rm ref},k}\) は、環 \(k\) の光線の直線が標的中心を通りビーム軸に直交する面を横切る点の、ビーム軸からの距離で、\(R_{{\rm ref},k}=R_k|z_f|/|Z_{\rm init}-z_f|\) である。\(w_0\) は、この面で強度が \(e^{-2}\) となる半径で、\(m=1\) がガウス型、\(m\) を大きくするほど頂部が平坦で縁の急な分布になる。焦点が標的中心にある（\(z_f=0\)）と、すべての環で \(R_{{\rm ref},k}=0\) になり、強度分布は重みを変えない。2D RZ では、同じ分布をビーム軸に直交する面上の円形の 2 次元配列へ適用する。</p>
+      <p><code>LaserBeam.power(t_s)</code> は、秒を受け取って W を返す関数である。初期化時に 0 から <code>Main.t_end</code> までを標本化し、線形補間する凍結された表へ変換する。TENRYU Studio は、(1) 一定の頂部に任意の直線的な立ち上がり・立ち下がりを付けた矩形、(2) ピークパワーまたは総エネルギー、半値全幅（full width at half maximum、FWHM）、中心時刻で指定するガウス型、(3) CSV または点の編集による折れ線の表、という 3 形式を関数として生成する。</p>
+
+      <figure id="fig-laser-launch-geometry">
+        <img src="../../../assets/laser-launch-geometry-ja.png" width="880" height="900" style="max-width:100%;height:auto" alt="上段は子午面 (R,Z) の模式図。打ち出し面 Z=Z_init の開口を等しい幅の 8 個の環に分け、各環の中心の打ち出し半径 R_k から、軸上の焦点 (0, z_f) を通る直線を青で引く。最外の環の光線について、打ち出し半径 R_k（青）、標的中心を通る面 Z=0 での半径 R_ref,k（橙）、標的中心からその直線への垂線の長さである衝突径数 b_k（紫）を寸法線で示す。下段は環の番号 k に対する R_k（青の丸）、R_ref,k（橙の四角）、b_k（紫の菱形）で、左は焦点 z_f=300 µm、右は z_f=0。打ち出し面 Z_init=900 µm（実線、塗りつぶし）と 1500 µm（点線、白抜き）を重ねる。z_f=300 µm では R_k だけが Z_init で変わり、R_ref,k と b_k は重なる。z_f=0 では R_ref,k と b_k がすべての k で 0 になる。">
+        <figcaption>図A. 打ち出し半径 \(R_k\)、標的中心を通る面での半径 \(R_{{\rm ref},k}\)、衝突径数 \(b_k\) の区別（<a href="#terms-launch">環</a>と<a href="#terms-impact">衝突径数</a>の用語を参照）。上：子午面 \((R,Z)\) で、環の数を 8、F 値を 0.75、焦点の位置を \(z_f\)＝300 µm、打ち出し面の位置を \(Z_{\rm init}\)＝900 µm とし、標的（半径 200 µm の円）を灰色で示した。青の細線が各環の光線、太線が環 \(k=7\) の光線で、屈折のない直線として描いた模式図である（\(R\) は軸の反対側で負として描き、半径は絶対値）。\(R_k\)（青）、\(R_{{\rm ref},k}\)（橙、\(Z=0\) の面に沿う）、\(b_k\)（紫、標的中心から直線への垂線）は \(R_{{\rm ref},k}=R_k|z_f|/|Z_{\rm init}-z_f|\)、\(b_k=|z_f|R_k/\sqrt{R_k^2+(Z_{\rm init}-z_f)^2}\) で計算した。この条件（\(|z_f|&lt;|Z_{\rm init}-z_f|\)）では \(b_k&lt;R_{{\rm ref},k}&lt;R_k\) で、焦点が打ち出し面に近く \(|z_f|&gt;|Z_{\rm init}-z_f|\) のときは \(R_{{\rm ref},k}&gt;R_k\) になる。下：同じ \(F\) で \(Z_{\rm init}\) を 900 µm（実線、塗りつぶし）と 1500 µm（点線、白抜き）にした場合を重ねた。\(Z_{\rm init}\) を変えると開口が広がって \(R_k\) は変わるが、\(R_{{\rm ref},k}\) と \(b_k\) は変わらない。右は \(z_f\)＝0（Studio の既定）で、\(R_{{\rm ref},k}\) と \(b_k\) がすべての \(k\) で 0 になる。F 値 0.75 は \(b_k\) と \(R_{{\rm ref},k}\) の差を見せるために選んだ値で、既定値ではない（Studio の既定は 6.7、コアの既定は 8.0）。</figcaption>
+      </figure>
+    </section>
+
+    <section aria-labelledby="controls">
+      <h2 id="controls">namelist による制御</h2>
+      <p>以下は、レーザー駆動に直接関係するキーの抜粋である。検証規則の全体は <a href="../../use/namelist.html">namelist リファレンス</a>を参照のこと。</p>
+      <table class="quick-facts">
+        <thead><tr><th>キー</th><th>値 / 単位</th><th>用途</th></tr></thead>
+        <tbody>
+          <tr><th><code>Laser.rays_per_beam</code></th><td>1D 既定 1000、2D 既定 128（いずれも 10 以上）</td><td>1D では環の数、2D ではビーム断面配列の 1 辺の点数。</td></tr>
+          <tr><th><code>Laser.beams[]</code></th><td>1 本以上</td><td>各ビームの <code>direction</code>、<code>power</code>、<code>f_number</code>、焦点・デフォーカスを定義する。</td></tr>
+          <tr><th><code>Laser.beams[].profile</code></th><td><code>w0_um</code>, <code>m</code></td><td><code>super_gaussian</code> による横方向の強度分布。\(m=1\) はガウス型である。</td></tr>
+          <tr><th>Studio の波形</th><td>矩形 / ガウス型 / 表</td><td>立ち上がり・立ち下がり付きの矩形、半値全幅で指定するガウス型、点列の表を、ビームごとの関数として生成する。</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["$$", "$$"], ["\\[", "\\]"]] } };</script>
+  <script defer src="../../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../../nav.js" data-page="laser-beams" data-root="../../"></script>
+</body>
+</html>

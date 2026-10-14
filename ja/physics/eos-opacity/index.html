@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="ja" data-lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>EOS・不透明度・電離 — TENRYU ドキュメント</title>
+  <link rel="stylesheet" href="../../../style.css">
+  <script src="../../../theme.js"></script>
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>EOS・不透明度・電離 <span class="badge">reference</span></h1>
+    <p class="abstract">TENRYU の材料クロージャ（material closure）は、材料組成、状態方程式（equation of state、EOS）、平均電離度（mean ionization）、不透明度（opacity）を同じセルの状態へ結び付ける。EOS が温度・圧力・比熱を閉じ、電離モデルが電子数密度を与える。電子数密度は熱伝導とレーザーの物理へ渡り、不透明度はプランク分率（Planck fraction）とともに、輻射輸送（radiation transport）で使う群ごとの係数になる。この頁は、材料クロージャ全体の物理機構、データの流れ、クロージャを呼ぶ場所、ボイド材料を述べる。EOS・電離・不透明度の詳細は下の 3 頁に分けて書く。</p>
+
+    <aside class="planned" aria-labelledby="at-a-glance">
+      <h3 id="at-a-glance">要点</h3>
+      <ul>
+        <li><code>ideal_gas</code> は解析的な 2 温度 EOS、<code>tmat</code> は \(P,e,c_v\) の表補間と、\(T(\rho,e)\) を求める<a href="eos.html#terms-reclosure">逆写像（inverse map）</a>を提供する。</li>
+        <li>\(n_e=\bar Z\rho/(A m_p)\) が、EOS と電離モデルを熱伝導・レーザーの物理へつなぐ中心的な量である。</li>
+        <li>不透明度 \(\kappa\) は cm²/g の質量不透明度である。輸送で使う長さあたりの不透明度は \(\sigma=\rho\kappa\) [cm⁻¹] であり、両者を明確に区別する。</li>
+        <li><code>PlanckTable</code> は有限な群境界の上でプランク分率 \(b_g(T)\) を構築して規格化し、群の外へこぼれる裾（<a href="opacity.html#terms-planck">裾の欠損</a>）を診断する。温度範囲外の参照は端の値へ<a href="../../overview/numerics-foundations.html#floors-safety">クランプ（clamp）</a>する。</li>
+      </ul>
+    </aside>
+
+    <div class="card-grid">
+      <a class="card" href="eos.html"><h3>状態方程式</h3><p>理想気体 EOS と TMAT-H5 の表形式 EOS、逆写像による温度の復元、表の上端を超えるエネルギーの扱い。</p></a>
+      <a class="card" href="ionization.html"><h3>電離と衝突に効く有効電荷</h3><p>平均電離度のモデル、衝突に効く有効電荷、逐次剥離。</p></a>
+      <a class="card" href="opacity.html"><h3>不透明度</h3><p>定数と表形式の不透明度、混合セルの混合則、プランク分率と裾の欠損。</p></a>
+    </div>
+
+    <section aria-labelledby="mechanism">
+      <h2 id="mechanism">物理機構</h2>
+      <p>各時間発展の演算子が進めるのは保存量であり、物理が必要とするそれ以外の量 — \(P\)、\(T\)、\(c_v\)、\(\bar Z\)、\(\kappa\) — は、セルの状態から材料クロージャによって再構成しなければならない。高エネルギー密度（high-energy-density、HED）の物質は、ひとつのショットのなかでも冷たい固体から数 keV のプラズマまで巨大な範囲を横断し、不透明度も桁違いに変化する。したがって、解析式と表のどちらを使うかは、見通しのよさと忠実さのどちらを重視するかを材料ごとに決める選択になる。</p>
+      <p>解析的な基準となるのは、電子側とイオン側を独立に扱う 2 温度の理想気体だが、実在する標的材料には \(P\)、\(e\)、\(c_v\) の TMAT-H5 の表を使う（TMAT-H5 は TENRYU の表形式物質フォーマットとその HDF5 コンテナで、リポジトリの <code>docs/TMAT_H5_SPEC.md</code> が仕様書である。<a href="eos.html#terms-tmat">用語</a>参照）。流体側が閉じるのは温度ではなくエネルギーなので、<a href="eos.html#terms-reclosure">逆写像</a> \(T(\rho,e)\) が中心的な役割を担う。<a href="../../overview/numerics-foundations.html#operator-splitting">再クロージャ（re-closure）</a>のたびに、密度を固定した区間でエネルギーの行を単調性を利用して二分探索（binary search）し、\(\log T\) で補間する。GPU 上の経路は意図的にニュートン反復（Newton iteration）を使わない形にしてあり、頑健で決定論的、収束の分岐をもたない。表の最低温度より低いエネルギーは端の温度へクランプし、最高温度より高いエネルギーは、1D の既定の閉じ方ではクランプせず理想気体の延長で閉じる（<a href="eos.html#eos-models">理想気体 EOS と TMAT の表形式 EOS</a>参照）。</p>
+      <p>平均電離度は、各物理を結ぶ結合の要である。平均電離度 \(\bar Z\) が \(n_e=\bar Z\rho/(A m_p)\) を定め、\(n_e\) は Spitzer の熱伝導（Spitzer conduction）、逆制動輻射（inverse bremsstrahlung、IB）の衝突率、電子側の EOS、輻射と物質の結合のすべてに入る。TENRYU は、固定の \(\bar Z=Z\)、Thomas–Fermi モデル（Thomas–Fermi model）に対する More の近似式、または表形式の \(\bar Z(\rho,T_e)\) を選べる。動的なモデルは熱伝導と輻射の各演算子の入口で評価し直されるため、各演算子は開始時の状態と整合した電離度を見る。衝突率の重みは \(Z\) ではなく \(Z^2\) であり、電離段の分率が得られる場合は \(r_2=\langle Z^2\rangle/\bar Z^2\) によって、Spitzer と SNB（Schurtz–Nicolaï–Busquet の非局所（nonlocal）電子熱伝導 — <a href="../conduction/snb.html#snb">伝導</a>参照）の電荷因子を、衝突に効く有効電荷（<a href="ionization.html#terms-zeff">\(Z_{\rm eff}=\bar Zr_2\)</a>）へ拡張する。</p>
+      <p>輸送が必要とするロスランド平均（Rosseland mean）は、流束で重み付けした \(1/\kappa_\nu\) の平均（調和平均、harmonic mean）である。輻射は全周波数チャネルを並列に流れるので、並列抵抗の合成と同じく最も通りやすい経路 — 透明なスペクトルの窓（spectral window）— が全体を支配する。一方、放出と吸収が必要とするプランク平均（Planck mean）は放出で重み付けした \(\kappa_\nu\) の線形平均であり、こちらは強いスペクトル線（spectral line）が支配する。<a href="opacity.html#terms-mixed">混合セル（mixed cell）</a>の規則 <code>"harmonic_mass_R"</code> も同じ物理に従い、プランク不透明度は吸収体の足し合わせとして質量について線形に、ロスランド不透明度は透明な経路の足し合わせとして調和的に混合する。プランク分率 \(b_g(T)\) は、有限の群構造（group structure）の上で総和を 1 に閉じ、群の外へこぼれる裾を欠損として診断する（<a href="opacity.html#terms-planck">群、プランク分率、裾の欠損</a>）。放出不透明度のブロックをもたない IONMIX（衝突輻射コード Ionmix の <code>.cn4</code> 形式の物質表）の表は、LTE（local thermodynamic equilibrium、局所熱力学平衡）の表とみなし、警告を出して \(\kappa^{PE}=\kappa^{PA}\) とする。</p>
+    </section>
+
+    <section aria-labelledby="closure-flow">
+      <h2 id="closure-flow">材料から輸送係数まで</h2>
+      <p><code>Material.A</code> はイオン 1 個あたりの平均質量 [amu]、<code>Material.Z</code> は平均原子番号または代表値である。単一材料では \(n_i=\rho/(A m_p)\)、\(n_e=\bar Z n_i\) となる。ここで \(m_p=1.6726\times10^{-24}\) g は陽子質量である。TENRYU は原子質量単位（atomic mass unit、amu）を意図的に \(m_p\) と同一視する。これは物理定数の組を固定する取り決めであり、真の amu との約 0.73% のずれは材料の実効 \(A\) に吸収される。化合物の \(A\) は分子量ではなく、数分率（number fraction）で平均したイオン質量である。たとえば原子数が等しい CH は 6.5、CD は 7 になる。この規約により、EOS と不透明度の表の密度軸、および下流の衝突係数が、同じ粒子数密度に対応する。</p>
+      <p>EOS が圧力・温度・比熱を閉じ、電離モデルが \(\bar Z\) を与える（<a href="#fig-eos-opacity-flow">図A</a>）。そこから得られる \(n_e\) が、電子熱伝導とレーザーの逆制動輻射吸収に使われる。もう一方の枝である不透明度は、温度に依存するプランク分率と組み合わされ、<a href="../radiation/fld.html">流束制限拡散（flux-limited diffusion、FLD）</a>または<a href="../radiation/sn.html">離散座標法（discrete ordinates method、\(S_N\)）</a>の輻射輸送で使う群ごとの係数になる。この分離により、同じ材料の状態を共有しながら、EOS、衝突輸送、輻射係数を個別に検証できる。</p>
+      <ul>
+        <li>\(A\) — 数分率で平均したイオン質量で、CH は 6.5、CD は 7 である。この密度軸の規約により、EOS、不透明度、粒子数密度が一貫する。</li>
+        <li>\(n_e=\bar Z\rho/(A m_p)\) — 組成と電離度から、衝突輸送と結合係数へ渡される電子数密度である。</li>
+        <li>\(\kappa\) と \(\sigma=\rho\kappa\) — 質量不透明度は cm²/g で保持し、輸送では別の量である長さあたりの不透明度 cm⁻¹ を使う。</li>
+        <li><code>cv_e_override</code> — 単位が erg/(cm³·eV) の体積比熱である。同じ定数を Fleck 係数（Fleck factor。輻射の放出・吸収を陰的に結合する線形化の係数 — <a href="../radiation/fld.html">FLD</a>参照）にも渡す検証用の規約であり、材料を合わせ込むための調整つまみではない。</li>
+        <li>\(r_2=\langle Z^2\rangle/\bar Z^2\) — 衝突用の \(Z_{\rm eff}=\bar Zr_2\)（<a href="ionization.html#terms-zeff">用語</a>）を作る前に、1〜10 の範囲へクランプする。このクランプは物理ではなく数値安全策（numerical safeguard）である：\(r_2\ge1\) は分散比なので構成上成り立ち、上限 10 は退化・破損した分率表に対して補正を抑える。</li>
+        <li>\(10^{-20}\) cm²/g — <code>"harmonic_mass_R"</code> のロスランド調和平均で 0 除算が起きないよう、混合の前に各成分へ課す床（floor。<a href="../../overview/numerics-foundations.html#floors-safety">床・クランプ・数値安全策</a>参照）である。あらゆる物理的不透明度より何桁も小さく、成分が厳密に 0 のときに調和結合を有限に保つためだけに存在する。</li>
+      </ul>
+
+      <figure id="fig-eos-opacity-flow">
+        <img src="../../../assets/eos-opacity-flow-ja.png" width="960" height="560" style="max-width:100%;height:auto" alt="材料データとセルの状態から EOS の再クロージャで温度・圧力・比熱を閉じ、電離度、電子数密度、衝突に効く有効電荷を経て、熱伝導・レーザー吸収・電子の EOS へ渡す流れと、不透明度とプランク分率から群ごとの係数を作って輻射輸送へ渡す流れ。下端の破線の枠はボイド材料の扱い">
+        <figcaption>図A. 材料クロージャにおけるデータの流れ。実線の箱は処理または量、矢印はデータの向き、色は役割（灰：入力、青：EOS・電離・電子数密度、黄：不透明度と群の係数、緑：結合先の物理）、破線の箱は材料の例外（ボイド）である。EOS が閉じた \(\rho,T_e\) を電離と不透明度が読み、不透明度とプランク分率が群ごとの輻射の係数を作る。表の最高温度を超えるエネルギーは、1D の既定の閉じ方では最上行につないだ理想気体の延長で閉じ、legacy と 2D RZ では最高温度でクランプする。計算した図ではなく、本文の記述の模式図である。</figcaption>
+      </figure>
+    </section>
+
+    <section aria-labelledby="pipeline">
+      <h2 id="pipeline">クロージャを呼ぶ場所と順序</h2>
+      <ol>
+        <li><p><strong>初期化。</strong>材料の表を読み込み、設定された Python の関数を表にして設定を<a href="../../use/running.html#terms-freeze">凍結（freeze）</a>し、輻射の群境界の上で <code>PlanckTable</code> を構築する。</p></li>
+        <li><p><strong>流体の各半ステップ後の再クロージャ。</strong>時間発展した \((\rho,e)\) から<a href="eos.html#terms-reclosure">逆写像</a>で \(T\) を復元し、同じ密度の区間を再利用して \(P\) と \(c_v\) を順方向に評価する。</p></li>
+        <li><p><strong>熱伝導の入口。</strong>動的な \(\bar Z\) を更新し、\(n_e=\bar Z\rho/(A m_p)\) を作り、その入口の状態から伝導率を評価する。</p></li>
+        <li><p><strong>輻射の入口。</strong>\(\bar Z\) と \(Z_{\rm eff}\) を更新し、\((\rho,T_e)\) で \(\kappa_R\)、\(\kappa^{PA}\)、\(\kappa^{PE}\) を評価し、各質量不透明度を \(\sigma=\rho\kappa\) へ変換して \(b_g(T_e)\) を評価する。</p></li>
+        <li><p><strong>材料ごとの寄与の混合。</strong>混合セルでは、材料ごとの不透明度を <code>Materials.opacity_mix_rule</code> に従って混合し、各材料の表はその<a href="opacity.html#terms-mixed">部分密度</a>で評価する。<a href="opacity.html#terms-mixed">支配材料</a>が NLTE のセルは、その材料の NLTE 係数で埋める。</p></li>
+        <li><p><strong>安全策を適用する。</strong>正でない \(c_v\) には床を課し（表を作るときに 1 回だけ警告する）、表の定義域の外の参照には端点の値へクランプし、ロスランド不透明度には床を課す。1D の既定の閉じ方では、エネルギーが表の最高温度での値を超えてもクランプせず、理想気体の延長で閉じる（<a href="eos.html#eos-models">理想気体 EOS と TMAT の表形式 EOS</a>参照）。</p></li>
+      </ol>
+    </section>
+
+    <section aria-labelledby="void-materials">
+      <h2 id="void-materials">ボイド材料</h2>
+      <p>ボイド（void）は、外側の真空のような、物質のない領域を格子の上で表すための材料である。<code>is_void=True</code> の材料（ボイド材料）は、EOS と不透明度の表を読み込まない。EOS は理想気体、不透明度は <code>kappa_a=kappa_s=0</code>、\(Z=0\) に固定され、\(A\) は指定がなければ 1 になる。ボイドでない材料の体積分率の和が \(10^{-12}\) 以下のセルがボイドセルで、初期化のときに <code>cell_is_void</code> のマスクが 1 になる。ボイド材料は、混合セルの平均 \(\bar Z_{\rm eff}\)・\(A_{\rm eff}\)（<a href="ionization.html#terms-zeff">用語</a>。これらは混合平均であり、上の衝突用 \(Z_{\rm eff}=\bar Zr_2\) とは別物である）、EOS の平均、質量分率の混合から除外され、その体積分率は <code>cell_is_void</code> のマスクを導くためだけに使われる。ボイドセルでは \(\bar Z=0\) を強制し、Thomas–Fermi の評価を省く。ボイドセルは、熱伝導率を 0 にして断熱とし、吸収係数と放出係数を 0 にして輻射と物質のエネルギー交換をなくし、電子数密度が 0 なのでレーザーを吸収も屈折もしない。ボイドセルの初期の \(\rho,T_e,T_i\) は、デッキの <code>Geometry.rho</code>、<code>Te</code>、<code>Ti</code> ではなく <code>Materials.void_config</code> で与える。</p>
+    </section>
+
+    <section aria-labelledby="controls">
+      <h2 id="controls">namelist による制御</h2>
+      <p>以下は、材料の組成とボイドの設定である。EOS・電離・不透明度のキーは、各頁の namelist の節にある。検証規則の全体は <a href="../../use/namelist.html">namelist リファレンス</a>を参照のこと。</p>
+      <table class="quick-facts">
+        <thead>
+          <tr><th>キー</th><th>値・既定</th><th>用途</th></tr>
+        </thead>
+        <tbody>
+          <tr><th><code>Material.A</code>, <code>Material.Z</code></th><td>材料ごとに指定</td><td>平均イオン質量 [amu] と代表的な核電荷。\(n_i\)、\(\bar Z\)、\(n_e\) の基礎になる。</td></tr>
+          <tr><th><code>Material.is_void</code></th><td><code>False</code></td><td>材料をボイドにする（定義は<a href="#void-materials">下の節</a>）。EOS・不透明度の表を読み込まず、熱伝導・輻射・レーザーとの結合から除く。</td></tr>
+          <tr><th><code>Materials.void_config</code></th><td><code>rho</code>、<code>Te</code>、<code>Ti</code> = \(10^{-10}\) g/cm³、\(10^{-3}\) eV、\(10^{-3}\) eV</td><td>ボイドセルの初期の密度・電子温度・イオン温度。デッキの <code>Geometry.rho</code>、<code>Te</code>、<code>Ti</code> より優先する。</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["$$", "$$"], ["\\[", "\\]"]] } };</script>
+  <script defer src="../../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../../nav.js" data-page="eos-opacity" data-root="../../"></script>
+</body>
+</html>

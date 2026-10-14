@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="ja" data-lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>電離と衝突に効く有効電荷 — TENRYU ドキュメント</title>
+  <link rel="stylesheet" href="../../../style.css">
+  <script src="../../../theme.js"></script>
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>電離と衝突に効く有効電荷</h1>
+    <p class="abstract">平均電離度（mean ionization）\(\bar Z\) は電子数密度 \(n_e\) を定め、\(n_e\) は熱伝導、レーザーの逆制動輻射、電子側の EOS、輻射と物質の結合に入る。TENRYU は、固定の \(\bar Z=Z\)、Thomas–Fermi 電離度に対する More の近似式、表形式の \(\bar Z(\rho,T_e)\) を選べる。電子とイオンの衝突率は \(Z\) ではなく \(Z^2\) に比例するので、電離段の分率が得られるときは、衝突に効く有効電荷（collisional effective charge）\(Z_{\rm eff}\) を熱伝導とレーザーの吸収に使う。この頁は電離度のモデルと有効電荷の求め方を述べる。この計算に固有の用語は<a href="#terms">用語の節</a>で説明する。</p>
+
+    <aside class="planned" aria-labelledby="at-a-glance">
+      <h3 id="at-a-glance">要点</h3>
+      <ul>
+        <li><strong>電離度のモデル：</strong><code>Materials.zbar.model</code> の既定は <code>fixed</code> で、\(\bar Z=Z\)（完全電離）とする。<code>thomas_fermi</code> と <code>tabular</code> も選べる。</li>
+        <li><strong>評価の時点：</strong>動的なモデルは、流体の各半ステップと熱伝導・輻射の各演算子の入口で評価し直される。</li>
+        <li><strong>熱伝導への効果：</strong>TMAT に電離段の分率があるとき、Spitzer 熱伝導と SNB の電荷因子を \(Z_{\rm eff}\) に置き換える。この経路は <code>1D_SPH</code> に限る。</li>
+        <li><strong>レーザーへの効果：</strong>逆制動輻射の \(Z_{\rm eff}\) は <code>Laser.ib.zeff_model</code>（既定は <code>auto</code>）が選ぶ。</li>
+      </ul>
+    </aside>
+
+    <section aria-labelledby="ionization">
+      <h2 id="ionization">平均電離度と衝突に効く有効電荷</h2>
+      <p><code>Materials.zbar.model</code> の既定である <code>fixed</code> は、<code>Materials.zbar.fixed_value</code>（既定は未指定）を与えなければ \(\bar Z=Z\) とし、完全電離（full ionization）を仮定する。0 以上の <code>fixed_value</code> を与えると、その値をボイドでないすべてのセルの \(\bar Z\) にする。状態に依存する選択肢は、Thomas–Fermi 電離度に対する More の近似式（文献 [2] の Table IV。相似変数（similarity variable）\(\rho/(ZA)\) と \(T_e/Z^{4/3}\) で表す。QEOS（quotidian equation of state）[1] の Thomas–Fermi の相似則と同じ変数である）を用いる <code>thomas_fermi</code> と、\(\bar Z(\rho,T_e)\) を補間する <code>tabular</code> である。動的なモデルは流体の各半ステップと熱伝導・輻射の各演算子の入口（1D ではレーザー演算子の前も）で、その時点の \((\rho,T_e)\) から評価し直される。したがって、流体による圧縮後の電離は熱伝導へ、熱伝導後の温度変化は輻射のクロージャへ反映される。</p>
+      <p>TMAT のファイルが任意項目である <code>/ionization</code> ブロックに元素ごとの電離段（charge state）の分率をもつ場合、単一の \(\bar Z\) だけでは失われてしまう衝突電荷のモーメントも利用できる。分率から \(r_2=\langle Z^2\rangle/\bar Z^2\) を作り、1〜10 にクランプしたうえで、Spitzer 熱伝導と SNB の電荷因子を <a href="#terms-zeff">\(\bar Z r_2=Z_{\rm eff}\)</a> に置き換える。表がなければ、この補正は働かない。表からモーメントを取るこの経路は <code>1D_SPH</code> に限られる。材料が複数ある<a href="../../use/namelist.html#terms-deck">デッキ（deck）</a>では各セルがその材料の分率表を使い、表のない材料のセルには補正がかからない。</p>
+      <p>ここで、材料側の <code>zbar.model</code> と、レーザーの逆制動輻射吸収に使う <code>Laser.ib.zeff_model</code> は別々の選択である。後者の既定である <code>auto</code> は構築時に解決される。TMAT の電離表があれば <code>table</code> になる。表がなく 1D 球対称であれば、<code>Laser.ib.species</code> の指定があるか、ボイド（void。<a href="index.html#void-materials">定義</a>）でない材料すべてが共通の多種組成（TMAT の組成。CD なら C と H）をもつ場合に、それを種のリストとする <a href="#terms-strip"><code>sequential_strip</code>（逐次剥離）</a>になる。それ以外は <code>off</code> になる（1D 球対称で混合物なら警告）。ボイドでない材料が 2 つ以上ある 1D 球対称のデッキでは、<code>auto</code> を材料ごとに解決する。その材料の電離表があれば <code>table</code>、種の指定か 2〜4 種の TMAT 組成があれば <code>sequential_strip</code>、それ以外は <code>off</code> である。したがって「固定の \(\bar Z\)」と「自動の \(Z_{\rm eff}\)」は競合する同じキーではなく、電子数密度と、多種イオンによる衝突補正をそれぞれ制御する。</p>
+    </section>
+
+    <section aria-labelledby="terms">
+      <h2 id="terms">この計算で使う用語</h2>
+      <p>衝突に効く有効電荷、混合セルの平均、多元素の電荷の配分（逐次剥離）は、TENRYU の実装に固有の意味で使うので、ここで定義する。</p>
+
+      <h3 id="terms-zeff">衝突に効く有効電荷と混合セルの平均</h3>
+      <p><strong>衝突に効く有効電荷（collisional effective charge）</strong> \(Z_{\rm eff}\) は、イオンの電荷の 2 乗平均を平均で割った \(Z_{\rm eff}=\langle Z^2\rangle/\langle Z\rangle\) である。\(\langle Z\rangle=\bar Z\)、\(r_2=\langle Z^2\rangle/\bar Z^2\) と置くと、\(Z_{\rm eff}=\bar Zr_2\) と書ける。電子とイオンの衝突率は \(Z\) ではなく \(Z^2\) に比例して効くので、同じ \(\bar Z\) でも、電荷の異なるイオンが混ざるほど衝突が強い。\(r_2\) は分散比なので \(r_2\ge1\) が構成上成り立ち、TENRYU は 1〜10 にクランプする。たとえば完全電離した CD（炭素と水素が 1:1）では、\(\bar Z=3.5\) に対し \(Z_{\rm eff}=(36+1)/(6+1)\approx5.29\)、\(r_2\approx1.51\) である。</p>
+      <p>\(Z_{\rm eff}\) の使い道は 2 つある。熱伝導では、TMAT に電離段の分率があるとき、Spitzer 熱伝導と SNB の電荷因子を \(Z_{\rm eff}\) に置き換える（<code>1D_SPH</code> 専用）。レーザーの逆制動輻射では、吸収係数の電荷への依存を \(\bar Z\) ではなく \(Z_{\rm eff}=\bar Zr_2\) で与え、\(r_2\) の求め方を <code>Laser.ib.zeff_model</code> が選ぶ。値は <code>auto</code>（既定。Studio はこのキーを書き出さない）、<code>off</code>（\(r_2=1\)）、<code>table</code>（TMAT の電離段の分率から作った表）、<code>sequential_strip</code>（後述）である。</p>
+      <p><strong>混合セルの平均 \(\bar Z_{\rm eff}\)・\(A_{\rm eff}\)（mixture averages）</strong>は、混合セルで、材料ごとの値を混ぜてセルの代表値にする平均である。名前が似ているが、上の \(Z_{\rm eff}\) とは別の量である。\(A_{\rm eff}\) は体積分率で重み付けした調和平均で、\(1/A_{\rm eff}=\sum_mf_m/A_m\) である。\(\bar Z_{\rm eff}\) は、材料ごとの平均電離度 \(\bar Z_m\) を、イオンの数 \(f_m/A_m\) で重み付けした平均 \(\bar Z_{\rm eff}=\sum_m(f_m/A_m)\bar Z_m\big/\sum_m(f_m/A_m)\) である。和は、ボイドでない材料にだけ取り、その体積分率の和で割り直す。この重みにより、\(n_e=\rho\bar Z_{\rm eff}/(A_{\rm eff}m_p)\) は、各材料の \(f_m\rho\bar Z_m/(A_mm_p)\) の和に等しくなる。熱伝導の係数と、電子とイオンのエネルギー交換は、この \(n_e\) と \(A_{\rm eff}\) をセルの値として読む。</p>
+
+      <h3 id="terms-strip">逐次剥離</h3>
+      <p><strong>逐次剥離（sequential stripping）</strong>は、複数の元素から成るプラズマで、平均電離度 \(\bar Z\)（原子 1 個あたりの自由電子数の平均）を、元素ごとの電荷 \(z_s\) へ配る近似である。原子番号の小さい元素から順に、電子を使い切るまで完全電離させ、残った電子を次の元素へ回す。元素 \(s\) の数分率を \(x_s\)、原子番号を \(Z_s\)（小さい順）として、残りの電子数を \(R\)（初めは \(\bar Z\)）とおき、\(z_s=\min(Z_s,\,R/x_s)\)、\(R\leftarrow R-x_sz_s\) を順に適用する。完全電離の極限で厳密になる。</p>
+      <p>得られた \(z_s\) から \(Z_{\rm eff}=\sum_sx_sz_s^2\big/\sum_sx_sz_s\) を作り、比 \(r_2=Z_{\rm eff}/\bar Z\) を 1〜10 にクランプして、\(Z_{\rm eff}=\bar Zr_2\) をレーザーの逆制動輻射の吸収係数に使う。元素は <code>Laser.ib.species=[[Z, x], …]</code> で与える。元素は 4 つまでで、1 つだけなら \(r_2=1\) である。原子番号は狭義に増加し、\(x_s>0\) で、総和は [0.99, 1.01] に入らなければならない。<code>Laser.ib.zeff_model="sequential_strip"</code> には <code>species</code> が必須である。<code>auto</code> では、<code>species</code> の指定があるとき、または 1D 球対称でボイドでない材料のすべてが共通の多種組成をもつときに、この近似を選ぶ（<a href="#ionization">平均電離度と衝突に効く有効電荷</a>）。</p>
+    </section>
+
+    <section aria-labelledby="controls">
+      <h2 id="controls">namelist による制御</h2>
+      <p>以下は、電離度と有効電荷に直接関係する設定の抜粋である。検証規則の全体は <a href="../../use/namelist.html">namelist リファレンス</a>を参照のこと。</p>
+      <table class="quick-facts">
+        <thead>
+          <tr><th>キー</th><th>値・既定</th><th>用途</th></tr>
+        </thead>
+        <tbody>
+          <tr><th><code>Materials.zbar.model</code></th><td><code>"fixed"</code></td><td><code>fixed</code>、<code>thomas_fermi</code>、<code>tabular</code> から \(\bar Z\) を選択。<code>fixed</code> は、<code>Materials.zbar.fixed_value</code>（既定は未指定。Studio はフォームで指定したときだけ書き出す）に 0 以上の値を与えればその値を全セルの \(\bar Z\) にし、与えなければ \(\bar Z=Z\) とする。</td></tr>
+          <tr><th><code>Laser.ib.zeff_model</code></th><td><code>"auto"</code></td><td>TMAT の電離分率があれば表による \(Z_{\rm eff}\)、1D 球対称では指定の種か共通の TMAT 組成による<a href="#terms-strip">逐次剥離</a>、それ以外は補正なし。ボイドでない材料が複数ある 1D 球対称のデッキでは材料ごとに解決する。Studio はこのキーを書き出さないので、既定の <code>auto</code> になる。</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section aria-labelledby="references">
+      <h2 id="references">参考文献</h2>
+      <ol class="references">
+        <li>R. M. More, K. H. Warren, D. A. Young, and G. B. Zimmerman, "A New Quotidian Equation of State (QEOS) for Hot Dense Matter," Phys. Fluids 31, 3059–3078 (1988). <a href="https://doi.org/10.1063/1.866963">doi:10.1063/1.866963</a></li>
+        <li>R. M. More, "Pressure Ionization, Resonances, and the Continuity of Bound and Free States," Adv. At. Mol. Phys. 21, 305–356 (1985). <a href="https://doi.org/10.1016/s0065-2199(08)60145-1">doi:10.1016/s0065-2199(08)60145-1</a></li>
+      </ol>
+    </section>
+
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["$$", "$$"], ["\\[", "\\]"]] } };</script>
+  <script defer src="../../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../../nav.js" data-page="ionization" data-root="../../"></script>
+</body>
+</html>

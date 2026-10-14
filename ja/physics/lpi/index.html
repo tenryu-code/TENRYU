@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="ja" data-lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LPI（レーザープラズマ相互作用） — TENRYU ドキュメント</title>
+  <link rel="stylesheet" href="../../../style.css">
+  <script src="../../../theme.js"></script>
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>LPI（レーザープラズマ相互作用）</h1>
+    <p class="abstract">レーザープラズマ相互作用（laser–plasma interaction、LPI）は、レーザー光とプラズマの波が結合して、逆制動輻射（inverse bremsstrahlung、IB）による吸収とは別の経路でエネルギーを移す過程の総称である。TENRYU が扱う LPI の効果は 2 つある。交差するビームのあいだでイオン音波（ion-acoustic wave）を介して光のパワーを移す交差ビームエネルギー転送（cross-beam energy transfer、CBET）と、四分の一臨界密度付近の不安定性が作るホット電子（hot electron）の生成、輸送、物質へのエネルギー付与である。どちらも<a href="../laser/index.html">光線追跡</a>の上に載るカーネルで、光線が運ぶパワーを受け取って書き換え、結果をレーザーの沈着として物質に返す。波の成長や飽和、後方散乱（backscatter）の反射光は解かない。この頁は 2 つの効果の位置づけ、光線追跡との受け渡し、演算子の列の中での位置、1D と 2D RZ の対応、入口となるキーを説明する。各効果の式とアルゴリズムは子の頁で説明する。</p>
+    <div class="card-grid">
+      <a class="card" href="cbet.html"><h3>CBET</h3><p>交差するビームのあいだで、イオン音波を介して光のパワーを移す保存型の交換。ポートの配置と波長離調を扱う。</p></a>
+      <a class="card" href="hot-electrons.html"><h3>ホット電子</h3><p>較正した変換効率とスペクトルによる、ホット電子の生成、直線輸送、予熱の付与。</p></a>
+    </div>
+
+    <section aria-labelledby="scope">
+      <h2 id="scope">扱う効果と扱わない効果</h2>
+      <p><strong>扱う効果。</strong>CBET とホット電子の 2 つである。</p>
+      <ul>
+        <li><strong>CBET：</strong>2 本のビームのビートがポンデロモーティブ力（ponderomotive force）でイオン音波を駆動し、その音波を介して一方のビームから他方へパワーが移る。TENRYU は、線形・定常・強減衰（strongly damped）の局所平面波の利得 [1] でこの交換を評価し、1 回の交換でパワーの総和を保つ。波長離調（wavelength detuning）があるときは、イオン音波へ渡したパワーを符号付きの台帳 <code>E_cbet_iaw</code> に記録する。</li>
+        <li><strong>ホット電子：</strong>2 プラズモン崩壊（two-plasmon decay、TPD）と誘導ラマン散乱（stimulated Raman scattering、SRS）が作る高エネルギー電子を、較正した変換効率と温度で与える [2]。生成した電子は直線に沿って輸送し、衝突による減速で失ったエネルギーを物質へ付与する。TPD と SRS は、生成源の機構（捕獲する密度、温度、角度帯の既定値）の違いとして現れる。</li>
+      </ul>
+      <p><strong>扱わない効果。</strong>実装で確かめた範囲で、次のものは含まない。</p>
+      <ul>
+        <li>TPD・SRS の波の成長と飽和。ホット電子の変換効率 η(t) は較正した入力で、<code>eta_mode="model"</code> を選んでも、局所のプラズマ量で駆動する縮約した緩和の式であり、波の方程式は解かない。</li>
+        <li>SRS・SBS（誘導ブリルアン散乱、stimulated Brillouin scattering）の後方散乱で失われる反射光。散乱光の反射率を与えるキーも、反射した光線を追跡する処理もない。CBET が SBS と同じ三波結合に基づくのは、相手のビームが種（seed）になる前方の交換に限る。</li>
+        <li>フィラメンテーション（filamentation）、自己集束（self-focusing）、スペックル（speckle）と波動光学（干渉、回折）。レーザーの経路は幾何光学の光線であり、コード内にこれらを扱う処理はない。</li>
+        <li>CBET の火面（caustic）補正、スペックル統計、偏光のダイナミクス、広帯域の照射（<a href="cbet.html#mechanism">CBET の頁</a>に理由を書いている）。</li>
+      </ul>
+      <p>結果は、指定した CBET 係数とホット電子の生成クロージャ（変換効率と温度）に対するプラズマの応答として読むこと。LPI の第一原理的な予測にはならない。</p>
+    </section>
+
+    <section aria-labelledby="laser-relation">
+      <h2 id="laser-relation">光線追跡との関係</h2>
+      <p>CBET もホット電子も、<a href="../laser/index.html">レーザー駆動と吸収</a>の頁の光線追跡が作る光線の記録を入力にする。独立の光線を別に追跡するのではない。</p>
+      <ul>
+        <li><strong>受け取るもの（CBET）：</strong>光線が通ったセルごとの経路長と方向余弦、光線の初期パワー、ビームのグループ。これに加えて、流体の状態から、イオン温度、流速、平均質量数を読む。電子密度、電子温度、平均電離度は光線追跡が元から使う場である。</li>
+        <li><strong>受け取るもの（ホット電子）：</strong>追跡した各光線が、電子密度が臨界密度の指定した割合（捕獲面。既定は 1/4）に初めて達する点と、その点まで IB 吸収を生き延びたパワー。</li>
+        <li><strong>返すもの（CBET）：</strong>交換後の光線のパワー。その後の IB 沈着は、交換を済ませたパワーで計算する。離調があるときは、イオン音波へ渡したパワーの台帳 <code>E_cbet_iaw</code> も返す。</li>
+        <li><strong>返すもの（ホット電子）：</strong>捕獲したパワーを光線のパワーから差し引いた残り（既定の <code>subtract_from_laser=True</code>）と、セルごとのホット電子の付与パワー。付与パワーは、レーザーの沈着パワーに加算して電子の内部エネルギーへ入る。メッシュの外へ逃げた分は、エネルギー台帳ではレーザーの逸出に数える。</li>
+      </ul>
+      <p>CBET とホット電子は、ふつう同じ実行で併用できない。併用できるのは、<code>Laser.cbet.geometry_mode="port_section"</code> と <code>Laser.hot_electron.eta_mode="model"</code> を同時に指定したときだけである。この組合せでは、ホット電子の捕獲が CBET の適用後の光線のパワーを使う。それ以外で両方を有効にすると、入力の検証がエラーで止める。</p>
+    </section>
+
+    <section aria-labelledby="operator-order">
+      <h2 id="operator-order">演算子の列の中での位置</h2>
+      <p>CBET もホット電子も、独立した演算子ではなく、レーザーの演算子の内部の段である。外側の 1 ステップの既定の列（Strang 型）では、レーザー、核燃焼、流体の前半、熱伝導、輻射、流体の後半の順に進む。レーザーの演算子は、光線の追跡、CBET の交換、ホット電子の捕獲・輸送・付与、そして IB の沈着とホット電子の付与パワーの電子エネルギーへの加算を含む。ホット電子の捕獲は光線の追跡の途中で行い、CBET と併用する組合せでは CBET を解いたあとで行う。列全体の分割の規律は<a href="../../overview/numerics-foundations.html#operator-splitting">演算子分割と再クロージャの規律</a>にある。</p>
+      <p>ホット電子の付与は陽的な源項なので、時間刻みの制限 <code>"hot_electron"</code> が次のステップの Δt を、付与パワーとセルの電子エネルギーの蓄えの比で制限する。CBET もホット電子も、単一の MPI ランクでしか動作しない。</p>
+    </section>
+
+    <section aria-labelledby="dimensions">
+      <h2 id="dimensions">1D と 2D RZ の対応</h2>
+      <table class="quick-facts">
+        <thead>
+          <tr><th>効果</th><th>1D（<code>Main.dimension="1D_SPH"</code>）</th><th>2D RZ（<code>"2D_RZ"</code>）</th></tr>
+        </thead>
+        <tbody>
+          <tr><th>CBET</th><td><code>Mesh.geometry_1d="spherical"</code> と <code>Laser.mode="raytrace_2d"</code> が前提。<code>geometry_mode="port_section"</code>（単一の参照トレースを実際のポートの方向へ回転する再構成）か、従来形式の <code>"legacy"</code>（ビーム対の光線による交換。既定）を選べる。<code>port_section</code> は 1D 専用である。</td><td><code>Laser.mode="raytrace_3d"</code> が前提。<code>"legacy"</code> だけが使える。固定点反復の加速（<code>anderson_depth</code>）とワークスペースの上限（<code>workspace_limit_gib</code>）のキーは 2D 専用である。</td></tr>
+          <tr><th>ホット電子</th><td><code>Laser.mode</code> は <code>"radial_absorption_1d"</code> か <code>"raytrace_2d"</code>。角度分布は <code>"cone"</code>（既定）か <code>"radial"</code>。円筒幾何（<code>Mesh.geometry_1d="cylindrical"</code>）では <code>"cone"</code> を使えない。</td><td><code>Laser.mode="raytrace_3d"</code> が前提。角度分布は <code>"cone"</code> だけで、<code>"radial"</code> と <code>inner_bc</code> の変更は 1D 専用である。</td></tr>
+        </tbody>
+      </table>
+      <p>詳細な式とアルゴリズムを子の頁が説明するのは、CBET では 1D の <code>port_section</code>、ホット電子では 1D と 2D RZ の両方である。2D RZ の CBET の従来形式は、子の頁には載せていない。</p>
+    </section>
+
+    <section aria-labelledby="controls">
+      <h2 id="controls">主なキー</h2>
+      <p>入口となるキーだけを挙げる。個々のキーの既定値と意味は子の頁の表を、完全なスキーマと組合せの制約は <a href="../../use/namelist.html">namelist リファレンス</a>を参照のこと。</p>
+      <table class="quick-facts">
+        <thead>
+          <tr><th>キー</th><th>既定値（パーサー）</th><th>用途</th></tr>
+        </thead>
+        <tbody>
+          <tr><th><code>Laser.enabled</code></th><td>—</td><td>レーザーの演算子を有効にする。CBET とホット電子は、これが真のときだけ動く。</td></tr>
+          <tr><th><code>Laser.cbet.enable</code></th><td><code>False</code></td><td>CBET を有効にする（<a href="cbet.html#controls">CBET の頁の表</a>）。</td></tr>
+          <tr><th><code>Laser.cbet.geometry_mode</code></th><td><code>"legacy"</code></td><td><code>"legacy"</code> か <code>"port_section"</code>。後者は <code>Laser.port_configuration.ports</code> とビームの原型 1 つが必要である。</td></tr>
+          <tr><th><code>Laser.port_configuration</code></th><td>—</td><td>ポートの配置（<code>port_section</code> の入力）。</td></tr>
+          <tr><th><code>Laser.hot_electron.enable</code></th><td><code>False</code></td><td>ホット電子を有効にする（<a href="hot-electrons.html#controls">ホット電子の頁の表</a>）。</td></tr>
+          <tr><th><code>Laser.hot_electron.eta_hot</code>、<code>eta_hot_table</code>、<code>sources</code></th><td><code>0.0</code>、なし、なし</td><td>変換効率 η(t) の与え方。<code>sources</code> は最大 4 チャネルの機構別の指定である。</td></tr>
+          <tr><th><code>Laser.hot_electron.eta_mode</code></th><td><code>"legacy"</code></td><td><code>"model"</code> で η(t) を局所量で駆動する緩和の式にする。CBET と併用できるのは、この値と <code>port_section</code> の組合せだけである。</td></tr>
+          <tr><th><code>Laser.hot_electron.subtract_from_laser</code></th><td><code>True</code></td><td>変換したパワーを光線のパワーから差し引く（二重計上の防止）。</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section aria-labelledby="references">
+      <h2 id="references">参考文献</h2>
+      <ol class="references">
+        <li>J. A. Marozas et al., "Wavelength-Detuning Cross-Beam Energy Transfer Mitigation Scheme for Direct Drive: Modeling and Evidence from National Ignition Facility Implosions," Phys. Plasmas 25, 056314 (2018). <a href="https://doi.org/10.1063/1.5022181">doi:10.1063/1.5022181</a></li>
+        <li>A. Colaïtis et al., "Coupled Hydrodynamic Model for Laser-Plasma Interaction and Hot Electron Generation," Phys. Rev. E 92, 041101(R) (2015). <a href="https://doi.org/10.1103/PhysRevE.92.041101">doi:10.1103/PhysRevE.92.041101</a></li>
+      </ol>
+    </section>
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["\\[", "\\]"]] } };</script>
+  <script defer src="../../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../../nav.js" data-page="lpi" data-root="../../"></script>
+</body>
+</html>

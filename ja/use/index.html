@@ -47,7 +47,7 @@ python3 -m tools.tenryu_plot profile outputs/template_1d_slab_radiation</code></
       <a class="card" href="namelist.html"><h3>namelist リファレンス</h3><p>最上位のブロック、代表的なキー、単位、正典となる既定値へ案内する。</p></a>
       <a class="card" href="gui.html"><h3>TENRYU Studio (GUI)</h3><p>フォーム形式のデスクトップアプリでデッキを作成、検証、保存、実行する。</p></a>
       <a class="card" href="examples.html"><h3>例題とプリセット</h3><p>実行可能なテンプレート、検証済みの Studio プリセット、検証用のデッキ集。</p></a>
-      <a class="card" href="outputs.html"><h3>出力と解析</h3><p>3 種の HDF5 ファイルのグループと主なデータセット、来歴（provenance。実行が受け取った設定・実行の要約・ログ）のファイル、その読み方を示す。</p></a>
+      <a class="card" href="outputs/index.html"><h3>出力と解析</h3><p>3 種の HDF5 ファイルのグループと主なデータセット、来歴（provenance。実行が受け取った設定・実行の要約・ログ）のファイル、その読み方を示す。</p></a>
     </div>
 
     <aside class="planned" aria-labelledby="first-run">
@@ -57,7 +57,7 @@ python3 -m tools.tenryu_plot profile outputs/template_1d_slab_radiation</code></
         <li><a href="building.html">ビルド</a>で、バイナリと <code>ctest</code> の通る環境を作る。</li>
         <li><a href="running.html">シミュレーションの実行</a>の手順どおり、テンプレートを validate → run で完走させる。</li>
         <li><a href="examples.html">例題とプリセット</a>の検証済みプリセット — まずは球殻の直接照射（direct drive）爆縮（implosion） — を、プリセットの条件のまま実行する。<code>laser_shell_implosion</code> は <code>examples/</code> のデッキではなく、<a href="gui.html">TENRYU Studio</a> のプリセット「球殻の直接照射爆縮 (GXII 級)」が書き出すデッキの名前（<code>Main.name</code>）である。Studio を<a href="gui.html#obtain-launch">入手して起動</a>し、このプリセットを適用してデッキを保存したのち、保存したデッキを <code>./build/tenryu run</code> に渡す。</li>
-        <li><a href="outputs.html">出力と解析</a>に沿って結果を読む。吸収率は、履歴の <code>energy/</code> にある<a href="../overview/numerics-foundations.html#energy-ledger">エネルギー台帳</a>（energy ledger。系のエネルギー変化を、レーザーの入射や境界からの流出などの出入りと突き合わせて積算した記録）の <code>laser_deposited</code> を <code>laser_incident</code> で割って求め、爆縮のピークはステップごとの履歴 <code>implosion/rho_peak</code> から読み取る。</li>
+        <li><a href="outputs/index.html">出力と解析</a>に沿って結果を読む。吸収率は、履歴の <code>energy/</code> にある<a href="../overview/numerics-foundations.html#energy-ledger">エネルギー台帳</a>（energy ledger。系のエネルギー変化を、レーザーの入射や境界からの流出などの出入りと突き合わせて積算した記録）の <code>laser_deposited</code> を <code>laser_incident</code> で割って求め、爆縮のピークはステップごとの履歴 <code>implosion/rho_peak</code> から読み取る。</li>
       </ol>
       <p>物理の詳細が必要になったら、物理演算子ごとの頁である<a href="../physics/index.html">物理カーネル</a>の該当ページへ。各ページの「物理機構」の節が、式に入る前の背景を説明する。時間刻みの決まり方は、CFL（Courant–Friedrichs–Lewy）条件を含めて<a href="../overview/timestep.html">時間刻み制御と CFL</a>にまとめてある。</p>
     </aside>

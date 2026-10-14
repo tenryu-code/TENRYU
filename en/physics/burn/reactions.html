@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en" data-lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Reaction rates and fuel depletion — TENRYU Documentation</title>
+  <link rel="stylesheet" href="../../../style.css">
+  <script src="../../../theme.js"></script>
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>Reaction rates and fuel depletion</h1>
+    <p class="abstract">This page describes the part of the burn stage that advances the species inventories: the evaluation of reaction rates from the Bosch–Hale reactivities and from screening, the reason the inventories are stored as specific inventories, fuel depletion by the explicit midpoint method, and the control of the time step by subcycling and by the deposited power. Terms specific to this calculation are defined in the <a href="#terms">terms section</a>.</p>
+
+    <section aria-labelledby="reactions">
+      <h2 id="reactions">Reactivities and fuel inventory</h2>
+      <p>The available reaction channels are DT = T(d,n)⁴He, both DD branches D(d,p)T and D(d,n)³He, and D³He = ³He(d,p)⁴He. Reactivities use the Bosch–Hale (1992) [1] Padé approximants. Cell ion temperature is converted from eV to keV exactly once at the kernel boundary. The volume rate is \(r=n_i n_j\langle\sigma v\rangle/(1+\delta_{ij})\), giving the required factor 1/2 for DD. Rates are zero below each fit floor and clamped at the high-temperature ceiling. The default <code>T_floor_keV=0.2</code> matches the DT/DD floor; the D³He fit begins at 0.5 keV.</p>
+      <p><code>fuel_materials</code> names the non-void (<a href="../eos-opacity/index.html#void-materials">defined here</a>) materials that receive inventories. <code>x_D</code>, <code>x_T</code>, and <code>x_He3</code> set their initial number fractions; all must be non-negative and sum to one. D, T, ³He, ⁴He, and proton inventories are stored as \(Y_s=n_s/\rho\), with \(n_s=\rho Y_s\) reconstructed for each rate evaluation. The specific inventory is the Lagrangian invariant, and storing it avoids the severe overburn caused by carrying a birth number density over into an expanding cell.</p>
+      <p><code>screening="none"</code> is the identity (no screening). <code>salpeter</code> applies weak screening with an electron-inclusive, two-temperature Debye length; <code>chugunov_dewitt</code> uses the Chugunov–DeWitt 2009 interpolation formula (their Eq. (A4)) [3] with a rigid electron background. The two-temperature Salpeter form is a TENRYU extension (<a href="#terms-screening">terms</a>). For invalid thermodynamic inputs the Salpeter factor falls back to unity, and its exponent \(h\) (the screening enhancement of the reaction rate is \(e^h\)) is capped at \(h\le2\) outside the weak-screening regime.</p>
+      <ul>
+        <li>\(r=n_i n_j\langle\sigma v\rangle/(1+\delta_{ij})\) — the channel reaction rate per volume; \(\delta_{ij}=1\) supplies the DD half factor for identical reactants.</li>
+        <li>\(Y_s=n_s/\rho\) — the Lagrangian specific inventory. Hydrodynamic compression or expansion changes \(n_s=\rho Y_s\), not \(Y_s\) itself.</li>
+        <li>Temperature boundary — ion temperature is converted from TENRYU's internal eV to keV exactly once before evaluating the Bosch–Hale fit.</li>
+        <li>Fit bounds — rates vanish below the inclusive floors (0.2 keV for DT/DD and 0.5 keV for D³He) and clamp above the Bosch–Hale fit-validity ceilings [1]: 100 keV for DT and both DD branches, 190 keV for D³He; <code>T_floor_keV</code> defaults to 0.2.</li>
+        <li>Screening — the selected factor multiplies each reaction pair's reactivity; for invalid inputs the Salpeter factor reverts to one, and its weak-model exponent \(h\) (the screening enhancement is \(e^h\)) is capped at \(h\le2\) outside the weak-screening regime.</li>
+        <li>Fraley retention — the point-source sphere kernel determines the locally retained fraction from the fuel-sphere areal density and the product's birth radius (<a href="products.html#terms-fraley">terms</a>).</li>
+        <li>\(f_i=1/(1+32/T_e[\mathrm{keV}])\) — the optional Fraley electron/ion split, restricted by validation to DT alphas.</li>
+      </ul>
+    </section>
+
+    <section aria-labelledby="depletion">
+      <h2 id="depletion">Depletion and explicit time control</h2>
+      <p>Each burn stage holds density and temperature constant and advances the per-cell species ODE with explicit-midpoint RK2 <a href="#terms-stage">subcycles</a>. The required number of subcycles is based on the larger of gross production and gross destruction for every reactant in an enabled channel, keeping the relative inventory change per subcycle below <code>eps_deplete</code>. Gross control resolves cases where DD breeds trace T while DT consumes it almost as quickly, even though the net T rate is small. A deterministic scale-back of reaction counts preserves positivity and the stoichiometric balance.</p>
+      <p>If the required number of subcycles exceeds <code>subcycle_max</code>, the current step uses the cap, reports saturation, and folds \(0.9\,dt\,M_{max}/M_{req}\) into the next burn time-step limit (\(M_{req}\) is the required number of subcycles and \(M_{max}\) the <code>subcycle_max</code> cap). Deposited power also imposes \(\Delta t\le f_E e_{cell}/P_{dep}\), where \(f_E=\)<code>explicit_source_limit</code> and \(e_{cell}=\rho_cV_c(e_e+e_i)\) is the cell's total internal energy — the same limiter form as the identically named key of the <a href="../lpi/hot-electrons.html">hot-electron</a> physics kernel, with the electron-plus-ion reservoir here (there it is the electron energy). It is a limit on the source that keeps self-heating small without updating the temperatures inside the stage.</p>
+    </section>
+
+    <section aria-labelledby="terms">
+      <h2 id="terms">Terms used in this calculation</h2>
+      <p>The advance of the burn stage, the bookkeeping of particle numbers, and the screening factor are built from units specific to this calculation. The terms below carry meanings specific to TENRYU's implementation, so they are defined here together.</p>
+
+      <h3 id="terms-stage">Burn stage and subcycling</h3>
+      <p>A <strong>burn stage</strong> is one update that the burn kernel performs over the time step \(\Delta t\). The outer step advances by operator splitting, and burn is one operator in that sequence (<a href="../../overview/numerics-foundations.html#operator-splitting">Operator splitting and the re-closure discipline</a>). Burn is placed right after the laser and before the first hydro half-step, and it advances the whole \(\Delta t\) in one go as an explicit source; \(\Delta t\) is not subdivided to alternate burn with the other operators. During a stage, each cell's density and electron and ion temperatures are held constant, and at the end of the stage the energy produced by the reactions is added to the electrons and ions as heating sources.</p>
+      <p><strong>Subcycling</strong> divides \(\Delta t\) inside a stage into \(M\) equal subintervals (each of length \(\Delta t/M\)) and advances the five-species network of each cell with the explicit midpoint method (second-order Runge–Kutta). Cells with fast reactions need finer subintervals, so \(M\) is set per cell by</p>
+      $$
+      M=\min\!\left[\max\!\left(\left\lceil\frac{\Delta t\,r_{max}}{\epsilon_{dep}}\right\rceil,1\right),M_{max}\right],\qquad
+      r_{max}=\max_s\frac{\max(q_s^{+},q_s^{-})}{\max(n_s,\,10^{-9}n_{tot},\,1\,\mathrm{cm^{-3}})}.
+      $$
+      <p>Here \(\epsilon_{dep}\) is <code>eps_deplete</code> (default 0.1; above 0 and at most 0.5), \(M_{max}\) is <code>subcycle_max</code> (default 64; from 1 to 4096), \(s\) runs over the reactant species (D, plus T and ³He according to the enabled channels), \(q_s^{+}\) and \(q_s^{-}\) are the gross production and gross destruction rates of species \(s\) by the reactions [cm⁻³ s⁻¹], and \(n_{tot}\) is the sum of the number densities of the five species. Because the larger of gross production and gross destruction is used rather than the net rate, a species whose production and destruction nearly cancel while turning over quickly (trace T that DD breeds and DT consumes at once, for example) is still resolved. When the reaction count of one subcycle would exhaust the inventory of a reactant, the count is scaled back deterministically to keep positivity. When the required number exceeds \(M_{max}\) in some cell, the stage proceeds with the cap, reports the required number, and limits the burn time step of the next step (<a href="#depletion">Depletion and explicit time control</a>).</p>
+
+      <h3 id="terms-inventory">Inventory and specific inventory</h3>
+      <p>The <strong>inventory</strong> is the number of particles of each of the five species D, T, ³He, ⁴He, and p that a cell holds. Neutrons are not part of the inventory; they are counted only in the ledger.</p>
+      <p>The <strong>specific inventory</strong> \(Y_s=n_s/\rho\) [1/g] is the number of particles of species \(s\) per gram. The inventory is stored as the specific inventory, not as the number density \(n_s\) [cm⁻³]. Because the cell mass does not change in pure Lagrangian motion, compression and expansion leave \(Y_s\) unchanged and change only \(n_s=\rho Y_s\); only nuclear reactions change \(Y_s\). Storing the number density would let an expanding cell carry over its number density from the time of birth and overburn the fuel; the specific inventory prevents this. The number density \(n_s=\rho Y_s\) is rebuilt from the current \(\rho\) only when the reaction rates are evaluated.</p>
+      <p>The initial inventory follows from the sum \(f_{fuel}\) of the volume fractions of the cell's fuel materials (<code>fuel_materials</code>) and the initial number fractions \(x_D\), \(x_T\), and \(x_{He3}\) (<code>x_D</code>, <code>x_T</code>, <code>x_He3</code>; the defaults are 0.5, 0.5, and 0, and the sum must be 1; set all three for any combination other than the default): \(Y_s=x_sf_{fuel}/(\bar Am_p)\) for \(s=\) D, T, ³He. Here \(\bar A=\sum_sx_sA_s\) is the mean mass of the fuel ions and \(A_s\) is the mass of species \(s\) in units of the proton mass (2.0141 for D, 3.0160 for T and ³He). ⁴He and p start at 0. A checkpoint writes the specific inventory to <code>burn_state/specific_inventory</code>, and a restart uses it (<a href="../../use/outputs/index.html">Outputs &amp; analysis</a>).</p>
+
+      <h3 id="terms-screening">Two-temperature Salpeter form</h3>
+      <p>The <strong>two-temperature Salpeter form</strong> is the enhancement factor applied to the reactivity when <code>screening="salpeter"</code>. For each pair \((i,j)\) of reacting species, \(\langle\sigma v\rangle\to F\langle\sigma v\rangle\) with \(F=\exp h\). The screening length \(\lambda\) is a Debye length in which the ions and the electrons have separate temperatures,</p>
+      $$
+      \lambda^{-2}=4\pi e^2\left[\frac{\sum_sn_sZ_s^2}{k_BT_i}+\frac{n_e}{k_BT_e}\right],\qquad
+      h=\frac{Z_iZ_je^2}{\lambda\,k_BT_i}
+      $$
+      <p>where \(e\) is the elementary charge, \(n_s\) are the number densities of the five species built from the inventory, \(Z_s\) their charges (1 for D, T, and p; 2 for ³He and ⁴He), \(n_e=\bar Z\rho/(Am_p)\) is the electron number density, and \(Z_i\) and \(Z_j\) are the charges of the two reacting species. Salpeter's formula [2] assumes an equilibrium in which ions and electrons share one temperature; TENRYU extended it to \(T_i\ne T_e\). The weak-screening approximation holds only for \(h\ll1\), so \(h\) is capped at 2 (an enhancement of at most \(e^2\approx7.4\)), with a warning the first time the cap acts. When an input (\(T_i\), \(T_e\), or \(n_e\)) is non-positive or not finite, \(F=1\). The option <code>chugunov_dewitt</code> uses the Chugunov–DeWitt interpolation formula [3] with a rigid electron background, not the two-temperature form defined here.</p>
+    </section>
+
+    <section aria-labelledby="controls">
+      <h2 id="controls">Namelist controls</h2>
+      <p>These are the keys of the top-level <code>Burn</code> block that concern reaction rates, inventories, and the time control of depletion. The keys that concern burn as a whole are on the <a href="index.html#controls">overview page</a>. The defaults in the table are the values used when a deck does not set the key. Studio writes the same defaults, except that <code>fuel_materials</code> is empty in Studio and the user must set it.</p>
+      <table class="quick-facts">
+        <thead><tr><th>Key</th><th>Default</th><th>Purpose</th></tr></thead>
+        <tbody>
+          <tr><th><code>screening</code></th><td><code>"none"</code></td><td><code>none</code>, <code>salpeter</code>, or <code>chugunov_dewitt</code>.</td></tr>
+          <tr><th><code>fuel_materials</code></th><td><code>["DT"]</code></td><td>Material names carrying the initial fuel inventory.</td></tr>
+          <tr><th><code>x_D / x_T / x_He3</code></th><td><code>0.5 / 0.5 / 0.0</code></td><td>Initial number fractions; non-negative and summing to one (to within \(10^{-6}\)). Set all three for any combination other than the default. They fix the initial <a href="#terms-inventory">inventory</a>.</td></tr>
+          <tr><th><code>T_floor_keV</code></th><td><code>0.2</code></td><td>Reactivity temperature floor [keV].</td></tr>
+          <tr><th><code>eps_deplete / subcycle_max</code></th><td><code>0.1 / 64</code></td><td>Target for the relative inventory change per subcycle, and the cap on the number of subcycles (<a href="#terms-stage">terms</a>).</td></tr>
+          <tr><th><code>explicit_source_limit</code></th><td><code>0.2</code></td><td>Explicit time-step fraction for deposited energy.</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section aria-labelledby="verification">
+      <h2 id="verification">Verification</h2>
+      <ul>
+        <li>The unit test <code>test_burn_reactivity</code> pins the Bosch–Hale reference reactivities (their Table VIII) at eight temperatures for four reactions to a relative \(1.5\times10^{-3}\), catching eV/keV errors. The unit test <code>test_burn_network</code> covers closed-form DT/DD depletion, coupled bred-species chains, gross-turnover subcycling, and reaction-count stoichiometry.</li>
+      </ul>
+    </section>
+
+    <section aria-labelledby="references">
+      <h2 id="references">References</h2>
+      <ol class="references">
+        <li>H. S. Bosch and G. M. Hale, "Improved Formulas for Fusion Cross-Sections and Thermal Reactivities," Nucl. Fusion 32, 611–631 (1992). <a href="https://doi.org/10.1088/0029-5515/32/4/I07">doi:10.1088/0029-5515/32/4/I07</a></li>
+        <li>E. E. Salpeter, "Electron Screening and Thermonuclear Reactions," Aust. J. Phys. 7, 373–388 (1954). <a href="https://doi.org/10.1071/PH540373">doi:10.1071/PH540373</a></li>
+        <li>A. I. Chugunov and H. E. DeWitt, "Nuclear Fusion Reaction Rates for Strongly Coupled Ionic Mixtures," Phys. Rev. C 80, 014611 (2009). <a href="https://doi.org/10.1103/PhysRevC.80.014611">doi:10.1103/PhysRevC.80.014611</a></li>
+      </ol>
+    </section>
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["$$", "$$"], ["\\[", "\\]"]] } };</script>
+  <script defer src="../../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../../nav.js" data-page="burn-reactions" data-root="../../"></script>
+</body>
+</html>

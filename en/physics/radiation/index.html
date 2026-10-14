@@ -13,7 +13,7 @@
   <main>
     <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
     <h1>Radiation transport</h1>
-    <p class="abstract">TENRYU solves multigroup radiation transport coupled to matter (the electron internal energy) with two production deterministic solvers, selected by <code>Radiation.mode</code>: multigroup flux-limited diffusion (FLD, <code>"multigroup_diffusion"</code>) and discrete-ordinates \(S_N\) transport (<code>"sn_transport"</code>). Both operate in the three coordinate geometries of 1D — spherical, cylindrical, and planar, set by <code>Mesh.geometry_1d</code> — and in 2D axisymmetric RZ geometry. They share the group structure and the material closure (the relations that give pressure, temperature, opacity, and similar quantities from the conserved quantities, explained on the <a href="../eos-opacity.html">EOS, opacity &amp; ionization</a> page), but differ in how angle is treated and how the coupling to matter is solved. This page explains each model, compares them, and points to the detailed model pages below.</p>
+    <p class="abstract">TENRYU solves multigroup radiation transport coupled to matter (the electron internal energy) with two production deterministic solvers, selected by <code>Radiation.mode</code>: multigroup flux-limited diffusion (FLD, <code>"multigroup_diffusion"</code>) and discrete-ordinates \(S_N\) transport (<code>"sn_transport"</code>). Both operate in the three coordinate geometries of 1D — spherical, cylindrical, and planar, set by <code>Mesh.geometry_1d</code> — and in 2D axisymmetric RZ geometry. They share the group structure and the material closure (the relations that give pressure, temperature, opacity, and similar quantities from the conserved quantities, explained on the <a href="../eos-opacity/index.html">EOS, opacity &amp; ionization</a> page), but differ in how angle is treated and how the coupling to matter is solved. This page explains each model, compares them, and points to the detailed model pages below.</p>
     <div class="card-grid">
       <a class="card" href="fld.html"><h3>Multigroup FLD</h3><p>Flux-limited diffusion with Fleck-linearized matter coupling.</p></a>
       <a class="card" href="sn.html"><h3>S<sub>N</sub> transport</h3><p>Discrete-ordinates transport with sweeps and an iteratively solved matter coupling.</p></a>
@@ -48,7 +48,7 @@
       <ul>
         <li>Shared photon-energy group bounds, Planck fractions \(b_g(T)\) (the fraction of the blackbody energy at temperature \(T\) that falls in group \(g\)), and the primitives evaluated from the electron equation of state (EOS), such as internal energy and heat capacity.</li>
         <li>Three boundary conditions — reflecting, vacuum, and Marshak (the Marshak boundary condition prescribes the flux incident from an external radiation field) — with face types nested under each mode's own block.</li>
-        <li><a href="../eos-opacity.html#void-materials">Void</a> cells (cells filled with a material whose <code>Material.is_void</code> is true) are excluded from matter exchange.</li>
+        <li><a href="../eos-opacity/index.html#void-materials">Void</a> cells (cells filled with a material whose <code>Material.is_void</code> is true) are excluded from matter exchange.</li>
         <li>The <a href="../../overview/numerics-foundations.html#energy-ledger">energy ledger</a> (the record, by item, of the energy exchanged between radiation and matter and across the boundary) closes to machine precision.</li>
         <li>Internal units cgs + eV.</li>
       </ul>

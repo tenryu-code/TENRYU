@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="ja" data-lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>熱伝導 — TENRYU ドキュメント</title>
+  <link rel="stylesheet" href="../../../style.css">
+  <script src="../../../theme.js"></script>
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>熱伝導 <span class="badge">reference</span></h1>
+    <p class="abstract">TENRYU の熱伝導は、電子熱伝導とイオン熱伝導から成る。電子熱伝導の基本は、局所の Spitzer–Härm（SH）モデルに調和型の流束制限（harmonic flux limiter）を掛けたものである。1D と 2D RZ では、SNB（Schurtz–Nicolaï–Busquet）多群モデル（multigroup model）による非局所補正（nonlocal correction）を選べる。イオン熱伝導は、Braginskii の伝導率による独立のオプションで、2 温度モデルの 1D と 2D RZ で使える。時間積分は、既定ではスーパータイムステッピング（super-time-stepping、STS）による陽解法で、1D には後退オイラー法（backward Euler method）の陰解法、2D RZ には離散最大値原理（discrete maximum principle）を満たす陰解法もある。この頁は熱伝導全体の物理機構と構成を述べ、項目ごとの詳細は下の 5 頁に分けて書く。</p>
+
+    <aside class="planned" aria-labelledby="at-a-glance">
+      <h3 id="at-a-glance">要点</h3>
+      <ul>
+        <li>Z 依存の γ<sub>0</sub> 補正は全経路で適用される。無効にする設定はない。</li>
+        <li>局所 SH モデルと SNB は、同じ調和型の流束制限を共有する。<code>f_lim</code> の既定値は 0.06 で、SNB と組み合わせるときは 0.5 を指定する（GUI は SNB を選ぶと 0.5 に切り替える）。</li>
+        <li>1D は保存型の有限体積（finite-volume）演算子を用いる。2D RZ は、対称なコンダクタンスをもつ節点局所の演算子（node-local operator）を用いる。STS が陽的（explicit）拡散を加速する。材料別の保存モード（per-material conservation mode。<code>per_material_conservation_enabled</code>）は 2D RZ だけで使える。これらの語は<a href="discretization.html#terms">空間離散化の頁の用語の節</a>と<a href="time-integration.html#terms">時間積分の頁の用語の節</a>で説明する。</li>
+        <li>ボイド（void）セルは κ<sub>eff</sub>=0 の断熱（adiabatic）領域である（<a href="../eos-opacity/index.html#void-materials">ボイド材料</a>）。SNB の多群補正もボイドを透過しない。</li>
+      </ul>
+    </aside>
+
+    <div class="card-grid">
+      <a class="card" href="local.html"><h3>局所 Spitzer–Härm モデルと流束制限</h3><p>伝導率の式、Z 依存の補正、調和型の流束制限。</p></a>
+      <a class="card" href="discretization.html"><h3>空間離散化</h3><p>面の伝導率の作り方、2D RZ の節点局所の演算子、材料別の保存モード、ボイド。</p></a>
+      <a class="card" href="time-integration.html"><h3>時間積分</h3><p>スーパータイムステッピングの手順と、1D と 2D RZ の陰解法。</p></a>
+      <a class="card" href="snb.html"><h3>SNB 非局所モデル</h3><p>多群の輸送場による非局所補正と、iSNB のピカール反復。</p></a>
+      <a class="card" href="ion.html"><h3>イオン熱伝導</h3><p>Braginskii の伝導率と流束制限によるイオン温度の熱伝導。</p></a>
+    </div>
+
+    <section aria-labelledby="mechanism">
+      <h2 id="mechanism">物理機構</h2>
+      <p>レーザー標的では、レーザーエネルギーが吸収される場所（臨界密度面（critical-density surface）より外側の希薄なコロナ）と、そのエネルギーがアブレーション圧（ablation pressure）として仕事をする場所（高密度側のアブレーション面（ablation front））が空間的に離れている。この二つの領域をつなぐ主要なエネルギー輸送が電子熱伝導である。その強さはアブレーション圧と質量アブレーション率（mass ablation rate）を決め、同時に、アブレーション面より前方の低温物質へどれだけ熱が先回りするか — 予熱（preheat）の量 — も決める。</p>
+      <p>出発点となるモデルは、熱流束を「その場の温度勾配」に比例させる拡散型の式 \(\mathbf q_{SH}=-\kappa_{SH}\nabla T_e\)、すなわちフーリエ則（Fourier's law）である。伝導率 \(\kappa_{SH}\) には、電子–イオンのクーロン衝突（Coulomb collision）に基づく Spitzer–Härm（SH）理論の値を使う。温度依存は次の連鎖で決まる。クーロン散乱は速い電子ほど曲げにくいので、衝突周波数（collision frequency）は \(\nu_{ei}\propto v^{-3}\) で急減する。これを熱的電子（thermal electron。\(v\sim v_{th,e}\propto T_e^{1/2}\)）で評価すると \(T_e^{-3/2}\) になり、平均自由行程（mean free path、mfp）\(\lambda_{ei}=v/\nu_{ei}\) は \(\lambda_{ei}\propto T_e^{2}/(n_e Z\ln\Lambda)\) と温度の 2 乗で伸びる。伝導率はおおよそ「電子密度 × 熱速度 × 平均自由行程」で見積もれるため、密度依存が打ち消し合い、\(\kappa_{SH}\propto T_e^{5/2}/(Z\ln\Lambda)\) が残る。温度が 2 倍になるだけで伝導率は約 5.7 倍という強い非線形である。したがってコロナが高温になるほど熱伝導は物理的に強くなり、同時に、後述するとおり陽的に解くには時間刻みが極端に小さくなる、数値的に「硬い（stiff）」拡散問題になる。ただしフーリエ則は「電子がその場の勾配だけを感じて流束が決まる」という局所近似なので、成り立つのは電子の平均自由行程が温度勾配のスケール長（scale length）\(L_T=T_e/|\nabla T_e|\) より十分短い場合に限られる。</p>
+      <p>一方、熱流束の大半を運ぶのは平均的な熱的電子ではない。流束への寄与を電子エネルギー別に分解すると（後述の SNB が使うスペクトル重み \(\beta^4e^{-\beta}/24\) がこの分布である）、寄与のピークはおよそ \(3–4\,v_{th,e}\) で動く超熱的な電子（suprathermal electron）にある。平均自由行程は \(\lambda=v/\nu\) と \(\nu\propto v^{-3}\) の帰結として \(v^4\) に比例するので、これらの電子の平均自由行程は熱的電子の 3<sup>4</sup>–4<sup>4</sup>、約 80–260 倍に達する。したがって局所近似の条件 \(\lambda\ll L_T\) は、熱的電子で評価すれば満たされていても、実際に熱を運ぶ電子でははるかに早く破れる。この破れは、勾配が最も急なアブレーション面付近から生じる。</p>
+      <p>局所近似が破れた強勾配の極限でも、プラズマが運べる熱流束には明確な物理上限がある。全熱エネルギーが熱速度で一方向へ流れると仮定した自由飛行の流束（free-streaming flux）\(n_e k_BT_ev_{th,e}\) である。実際に持続できる流束はその一部でしかないことが運動論（kinetic theory）に基づく計算と実験の双方で知られており、TENRYU はその割合を係数 \(f_{lim}\) に持たせて、上限 \(q_{max}=f_{lim}n_ek_BT_ev_{th,e}\) を課す。制限は係数 \(\theta=1/(1+|q_{raw}|/q_{max})\) を掛ける形で行い、適用後の流束 \(q=\theta q_{raw}\) は、大きさについて \(1/|q|=1/|q_{raw}|+1/q_{max}\) を満たす — 抵抗の並列合成と同じ「調和合成（harmonic composition）」であり、これが「調和型」の名の由来である。勾配が緩いところでは \(q\approx q_{raw}\) のまま、強勾配では折れ点を作らずに滑らかに \(q_{max}\) へ飽和する。局所 SH モデルの既定値 \(f_{lim}=0.06\) は、直接照射（direct drive）実験との比較で古くから使われてきた較正範囲の値である。SNB と組み合わせる値 0.5 が大きく緩いのは役割が違うためで、流束の抑制は SNB 自身が計算し、流束制限は、非局所補正を加えた合成流束が異常に大きくなったときにだけ働く（詳細は SNB の節）。</p>
+      <p>流束制限だけでは非局所（nonlocal）輸送は表せない。平均自由行程の \(v^4\) 依存は二つの帰結を同時にもたらす。第一に、勾配が最も急な点では、電子が勾配スケールを衝突なしに走り抜けるため、局所勾配から期待される流束は立たず、実流束は Spitzer–Härm 値を下回る。これを流束抑制（flux inhibition）と呼ぶ。第二に、同じ電子は停止するまでの数平均自由行程のあいだ前方へ熱を運び続けるため、アブレーション面より先の物質が加熱される（予熱）。流束制限は局所流束を減らすことしかできないので、第一の効果は近似できるが、熱を勾配の前方へ運ぶ第二の効果は原理的に表せない。両方を捉えるには、電子をエネルギー別に追い、どこまで届きどこで熱を落とすかを解く非局所モデルが必要である。</p>
+      <p>Schurtz–Nicolaï–Busquet（SNB）モデルは、この目的の標準的な簡約運動論モデル（reduced kinetic model）である。完全な運動論方程式を解く代わりに、SH 流束を電子エネルギー群（energy group）に分割し、各群の輸送場（transport field）\(H_g\)（次元は熱流束）に対して、その群の平均自由行程 \(\lambda_g\) を距離スケールとする拡散方程式を解く。\(H_g\) は、局所 SH 流束の群配分を源泉として周囲へ広がる。これは、その群の電子が局所の勾配から離れた位置まで熱を運ぶことを表す。そこから再構成した補正 \(\delta q=-\sum_g(\lambda_g^{tr}/3)\nabla H_g\) が、急勾配点の流束を減らすと同時に前方に予熱を作る。TENRYU の SNB は独立したソルバではなく、同じ制限付き SH 経路への加算補正である。補正後の合成流束は、局所経路と共通のただひとつの流束制限を通る。群、輸送場などの SNB の量は<a href="snb.html#terms-snb">用語の節</a>で定義する。また、既定の平均自由行程較正（Sherlock 2017 の \(r=2\)）は電場による流束抑制を実効的に含むため、明示的な電場項は二重計上を避ける目的で既定オフである。較正係数 \(r\) は Brodrick らの整理における群平均自由行程の縮尺パラメータで、採用した平均自由行程（Sherlock 2017）は \(r=2\) の選択と等価である。</p>
+      <p>数値面の主課題は、陽的な拡散更新に付く安定条件（stability condition）\(\Delta t\lesssim\Delta x^2/D\) である。熱拡散率（thermal diffusivity）\(D\propto T_e^{5/2}/\rho\) は高温・希薄なコロナで急増するため、安定に許される<a href="time-integration.html#terms-sts">部分ステップ（substep）</a>幅は流体の<a href="time-integration.html#terms-sts">大域ステップ（global step）</a>よりはるかに小さくなる。典型的な <a href="../../verification/index.html#gxii">GXII</a>（激光 XII 号、GEKKO XII）のコロナ（500 µm ベンチマークカプセルのコロナセル：\(T_e\approx2\) keV、\(\rho\approx10^{-3}\) g/cm³、\(\Delta l\approx50\,\mu\)m）では、大域のドライバステップ 1 回に対して通常の部分ステップが 130–340 回必要になる。STS は、この部分ステップの列を、長さの異なる \(s\) 個の段（stage）で置き換える。段を組み合わせた安定区間が \(O(s^2)\) で広がるため、必要な段数は部分ステップ数の平方根程度（\(s\approx\lceil\sqrt{2N_{sub}}\rceil\)）で済み、この例では 17–27 段になる。係数は入口の温度で固定し（2D RZ の <a href="discretization.html#terms-face-kappa">Kirchhoff 割線</a>（secant）だけは段の温度で評価する。<a href="time-integration.html#sts">スーパータイムステッピング</a>の節参照）、ステップの最後に 1 回だけ<a href="../../overview/numerics-foundations.html#operator-splitting">再クロージャ</a>（re-closure。\((\rho,e)\) から状態方程式（equation of state、EOS）で温度・圧力・比熱を求め直す操作）を行う。更新はすべて保存型であり、材料別の保存モードも同じ STS を使う。任意選択のイオン熱伝導は、1D では STS を使わず、同じ<a href="discretization.html#terms-face-kappa">面の伝導率の作り方（face-κ policy）</a>による後退オイラー（backward Euler）の三重対角（tridiagonal）系で別に解く。2D RZ では、電子と同じ節点局所の演算子にイオンの係数を入れ、電子と同じ STS で解く。</p>
+    </section>
+
+    <section aria-labelledby="position">
+      <h2 id="position">演算子の列の中での位置と、次元ごとの対応</h2>
+      <p>熱伝導は、外側の 1 ステップの演算子の列のなかで、流体の前半の半ステップのあと、輻射輸送の前に置く（<a href="../../overview/numerics-foundations.html#operator-splitting">演算子分割と再クロージャの規律</a>）。電子熱伝導は温度を直接更新するので、そのあとに電子温度から電子エネルギー、圧力、比熱を求め直す（再クロージャ）。イオン熱伝導が有効なときは、その直後にイオン温度の熱伝導を解き、イオンの内部エネルギーに記帳する。大域の時間刻みへの制約は、<a href="../../overview/timestep.html#conduction-dt">時間刻み制御</a>の頁にまとめてある。</p>
+      <p>次元ごとの対応を下の表に示す。</p>
+      <table class="quick-facts">
+        <thead>
+          <tr><th>項目</th><th>1D</th><th>2D RZ</th><th>詳細</th></tr>
+        </thead>
+        <tbody>
+          <tr><th>局所 SH モデルと流束制限</th><td>面ごとに適用する。</td><td>セルごとに適用する。</td><td><a href="local.html">局所モデル</a></td></tr>
+          <tr><th>空間離散化</th><td>保存型の有限体積。面の伝導率は <code>face_kappa_policy</code> が決める。</td><td>対称なコンダクタンスをもつ節点局所の演算子。</td><td><a href="discretization.html">空間離散化</a></td></tr>
+          <tr><th>材料別の保存モード</th><td>使えない。</td><td>使える。</td><td><a href="discretization.html#terms-per-material">材料別の保存モード</a></td></tr>
+          <tr><th>時間積分（既定）</th><td>STS（<code>solver="sts"</code>）。</td><td>STS。<code>sts_scheme</code> で RKL2 も選べる。</td><td><a href="time-integration.html#sts">スーパータイムステッピング</a></td></tr>
+          <tr><th>時間積分（陰解法）</th><td><code>solver="implicit"</code>（後退オイラー法の三重対角系）。</td><td><code>solver="dmp_implicit"</code>（離散最大値原理を満たす後退オイラー法）。</td><td><a href="time-integration.html#implicit">陰解法</a></td></tr>
+          <tr><th>SNB 非局所モデル</th><td>三重対角系。</td><td>節点局所の演算子と共役勾配法。</td><td><a href="snb.html">SNB</a></td></tr>
+          <tr><th>イオン熱伝導</th><td>後退オイラー法の三重対角系。</td><td>電子と同じ節点局所の演算子と STS。</td><td><a href="ion.html">イオン熱伝導</a></td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section aria-labelledby="verification">
+      <h2 id="verification">検証</h2>
+      <ul>
+        <li><strong>GXII の基準解：</strong>熱伝導を有効にした統合回帰試験が、吸収エネルギー、最大圧縮時刻、シェル最小半径、ピーク密度、面密度、中心温度を判定する。</li>
+      </ul>
+    </section>
+
+    <section aria-labelledby="references">
+      <h2 id="references">参考文献</h2>
+      <ol class="references">
+        <li>L. Spitzer, Jr. and R. Härm, "Transport Phenomena in a Completely Ionized Gas," Phys. Rev. 89, 977–981 (1953). <a href="https://doi.org/10.1103/PhysRev.89.977">doi:10.1103/PhysRev.89.977</a></li>
+        <li>S. I. Braginskii, "Transport Processes in a Plasma," Reviews of Plasma Physics 1, 205–311 (1965).</li>
+        <li>E. M. Epperlein and R. W. Short, "A Practical Nonlocal Model for Electron Heat Transport in Laser Plasmas," Phys. Fluids B 3, 3092–3098 (1991). <a href="https://doi.org/10.1063/1.859789">doi:10.1063/1.859789</a></li>
+        <li>R. E. Pattle, "Diffusion from an Instantaneous Point Source with a Concentration-Dependent Coefficient," Q. J. Mech. Appl. Math. 12, 407–409 (1959). <a href="https://doi.org/10.1093/qjmam/12.4.407">doi:10.1093/qjmam/12.4.407</a></li>
+        <li>V. Alexiades, G. Amiez, and P.-A. Gremaud, "Super-Time-Stepping Acceleration of Explicit Schemes for Parabolic Problems," Commun. Numer. Methods Eng. 12, 31–42 (1996). <a href="https://doi.org/10.1002/(SICI)1099-0887(199601)12:1%3C31::AID-CNM950%3E3.0.CO;2-5">doi:10.1002/(SICI)1099-0887(199601)12:1&lt;31::AID-CNM950&gt;3.0.CO;2-5</a></li>
+        <li>G. P. Schurtz, Ph. D. Nicolaï, and M. Busquet, "A Nonlocal Electron Conduction Model for Multidimensional Radiation Hydrodynamics Codes," Phys. Plasmas 7, 4238–4249 (2000). <a href="https://doi.org/10.1063/1.1289512">doi:10.1063/1.1289512</a></li>
+        <li>M. Sherlock, J. P. Brodrick, and C. P. Ridgers, "A Comparison of Non-Local Electron Transport Models for Laser-Plasmas Relevant to Inertial Confinement Fusion," Phys. Plasmas 24, 082706 (2017). <a href="https://doi.org/10.1063/1.4986095">doi:10.1063/1.4986095</a></li>
+        <li>D. Cao, G. Moses, and J. Delettrez, "Improved Non-Local Electron Thermal Transport Model for Two-Dimensional Radiation Hydrodynamics Simulations," Phys. Plasmas 22, 082308 (2015). <a href="https://doi.org/10.1063/1.4928445">doi:10.1063/1.4928445</a></li>
+        <li>A. Marocchino, M. Tzoufras, S. Atzeni, et al., "Comparison for Non-Local Hydrodynamic Thermal Conduction Models," Phys. Plasmas 20, 022702 (2013). <a href="https://doi.org/10.1063/1.4789878">doi:10.1063/1.4789878</a></li>
+      </ol>
+    </section>
+
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["$$", "$$"], ["\\[", "\\]"]] } };</script>
+  <script defer src="../../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../../nav.js" data-page="conduction" data-root="../../"></script>
+</body>
+</html>

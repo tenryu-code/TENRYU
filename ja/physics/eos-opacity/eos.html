@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="ja" data-lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>状態方程式 — TENRYU ドキュメント</title>
+  <link rel="stylesheet" href="../../../style.css">
+  <script src="../../../theme.js"></script>
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>状態方程式</h1>
+    <p class="abstract">TENRYU の状態方程式（equation of state、EOS）は、セルの密度とエネルギーから温度・圧力・比熱を閉じる。電子とイオンを独立に扱う解析的な 2 温度の理想気体（<code>ideal_gas</code>）と、TMAT-H5 の表形式 EOS（<code>tmat</code>）を選べる。流体が時間発展させるのは温度ではなくエネルギーなので、表形式 EOS では逆写像（inverse map）で温度を復元する。この頁は両モデルの式と、表の端の外のエネルギーの扱いを述べる。この計算に固有の用語は<a href="#terms">用語の節</a>で説明する。</p>
+
+    <aside class="planned" aria-labelledby="at-a-glance">
+      <h3 id="at-a-glance">要点</h3>
+      <ul>
+        <li><strong>理想気体：</strong><code>ideal_gas</code> は電子とイオンを独立に閉じる解析的な 2 温度 EOS で、<code>ideal_gas.gamma</code> の既定は 5/3 である。</li>
+        <li><strong>表形式：</strong><code>tmat</code> は TMAT-H5 のイオン・電子・全物質の表から圧力・エネルギー・比熱を構築し、実行時は \((\log\rho,\log T)\) の面上で双線形補間する。</li>
+        <li><strong>逆写像：</strong>温度は、密度を固定した区間でのエネルギーの行の二分探索と \(\log T\) の補間で求める。ニュートン反復は使わない。</li>
+        <li><strong>表の端：</strong>表の最低温度より低いエネルギーは端の温度へクランプする。最高温度より高いエネルギーは、1D の既定の閉じ方では理想気体の延長で閉じ、<code>"legacy"</code> と 2D RZ では最高温度でクランプする。</li>
+      </ul>
+    </aside>
+
+    <section aria-labelledby="eos-models">
+      <h2 id="eos-models">理想気体 EOS と TMAT の表形式 EOS</h2>
+      <p><code>eos.model="ideal_gas"</code> は、電子とイオンを独立に閉じる解析的な 2 温度 EOS である。既定の単原子気体では \(\gamma=5/3\) とし、イオンは \(P_i=\rho k_BT_i/(A m_p)\)、電子は \(P_e=\bar Z\rho k_BT_e/(A m_p)\) に従う（\(k_B\) は cgs + eV 単位系の常として <code>eV_to_erg</code> である）。これら温度側の枝が一次的なクロージャで、設定した <code>ideal_gas.gamma</code> による圧力–エネルギーの形 \(P=(\gamma-1)\rho e\) は同じ理想気体の等価な表現である — 枝ごとに、イオンは \(e_i=k_BT_i/[(\gamma-1)Am_p]\)、電子は \(e_e=\bar Z\,k_BT_e/[(\gamma-1)Am_p]\) が成り立つため、\(\bar Z\) が一定のとき両形式は構成上整合し、発展したエネルギーから閉じ直すときに後者を使う。温度に依存する \(\bar Z\) を選んだ場合も、電子の比熱は、その時点の \(\bar Z\) を使う \(\bar Z k_B/[(\gamma-1)Am_p]\) のままで、\(T_e\,d\bar Z/dT_e\) の寄与は含まない（既知の制限である）。</p>
+      <p><code>cv_e_override</code> は、解析解が一定の電子体積比熱を要求する Marshak 波（Marshak wave）や Su–Olson 問題（Su–Olson problem）の検証のためのものである。単位は erg/(cm³·eV) であり、通常の EOS の表が返す質量あたりの比熱 \(c_v\) [erg/(g·eV)] とは \(\rho\) 倍だけ異なる。指定すると、電子の \(C_{v,e}\) を一定値に置き換え、輻射側の Fleck 係数も同じ値を読む。一般の物質モデルを合わせ込むための自由パラメータではなく、\(C_v\) 一定という検証条件を表すためのキーである。</p>
+      <p><code>eos.model="tmat"</code> は、TMAT-H5 のイオン・電子・全物質（イオンと電子の和）の表から \(P(\rho,T)\)、\(e(\rho,T)\)、\(c_v(\rho,T)\) を構築する。TMAT の主たる密度軸であるイオン数密度（ion number density）\(n_i\) は \(\rho=n_i A m_p\) で質量密度へ変換し、実行時は \((\log\rho,\log T)\) の面上で双線形補間（bilinear interpolation）する。範囲外の参照は表の端へクランプする。温度の上端の扱いは次の段落に書く。正でない \(c_v\) には床を課し、表を作るときに 1 回だけ警告する。</p>
+      <p>流体が更新した \(e\) から温度を閉じ直す<a href="#terms-reclosure">逆写像</a>は、ニュートン反復ではない。密度を固定した区間の上でエネルギーの行を単調性を利用して二分探索し、隣り合う温度の添字のあいだを \(\log T\) で補間して \(T(\rho,e)\) を返す。同じ <code>RhoBracket</code> を逆写像と、その後の \(P,e,c_v\) の順方向参照が共有するため、ひとつの密度位置で往復のクロージャを構成できる。目標とするエネルギーが表の最低温度での値を下回るときは、端の温度へクランプする。最高温度 \(T_{top}\) での値 \(e_{top}\) を上回るときは、閉じ方によって扱いが違う。1D の既定の閉じ方（<code>Numerics.hydro.eos_closure_mode="energy_authoritative"</code>。進化させたエネルギーを正とする閉じ方）は、クランプせず、\(T_{top}\) の行につなげた理想気体の延長で閉じる。すなわち \(e=e_{top}+c_{v,top}(T-T_{top})\)、\(P=P_{top}T/T_{top}\)、\(c_v=c_{v,top}\) とし（添字 top は \(T_{top}\) での表の値）、進化させたエネルギーは書き換えない。<code>"legacy"</code> の閉じ方と 2D RZ の閉じ方は \(T_{top}\) でクランプし、<code>"legacy"</code> では超過分のエネルギーが表の値に置き換わって失われる。ただし低温平衡構成則（<code>Numerics.hydro.T_start_inactive_cells="cold_equilibrium"</code>）の逆写像は例外で、補正が消えていく温度範囲では解を区間で挟んだニュートン法（bracketed Newton method）を使う。</p>
+    </section>
+
+    <section aria-labelledby="terms">
+      <h2 id="terms">この計算で使う用語</h2>
+      <p>再クロージャの手順と材料の表の形式は、TENRYU の実装に固有の意味で使うので、ここで定義する。</p>
+
+      <h3 id="terms-reclosure">再クロージャと逆写像</h3>
+      <p><strong>再クロージャ（re-closure）</strong>は、演算子が状態を変えたあとに、\((\rho,e)\) から EOS で温度 \(T\)、圧力 \(P\)、比熱 \(c_v\) を求め直すことである。クロージャ（closure）は、保存量からこれらを決める関係で、この頁では EOS・平均電離度・不透明度を合わせて材料クロージャと呼ぶ（<a href="../../overview/numerics-foundations.html#operator-splitting">演算子分割と再クロージャの規律</a>）。流体が時間発展させるのは温度ではなくエネルギーなので、熱伝導・輻射・レーザーが読む \(T\)、\(P\)、\(c_v\) は、エネルギーが変わるたびに作り直す必要がある。この頁の手順では、流体の各半ステップのあとに、逆写像で \(T\) を復元し、順方向の参照で \(P\) と \(c_v\) を評価する（<a href="index.html#pipeline">クロージャを呼ぶ場所と順序</a>）。</p>
+      <p><strong>逆写像（inverse map）</strong>は、密度 \(\rho\) とエネルギー \(e\) から温度 \(T(\rho,e)\) を求める操作で、再クロージャの最初の段である。表形式の EOS では、\(e(\rho,T)\) の表を温度について逆に引く。密度の区間（density bracket。コードの名前は <code>RhoBracket</code>）は、表の密度の格子で、参照する密度をはさむ隣り合う 2 点の添字と補間の重みの組である。GPU 上の経路は、この区間の上でエネルギーの行を、エネルギーが温度とともに増えることを利用して二分探索し、温度の添字を決めたうえで、隣り合う添字のあいだを \(\log T\) で補間する。ニュートン反復を使わないので、結果は決定論的で、収束の判定に伴う分岐がない。同じ密度の区間を、そのあとの \(P\)、\(e\)、\(c_v\) の順方向の参照が共有する。</p>
+      <p>表の端の外のエネルギーの扱いは閉じ方で決まる。<code>Numerics.hydro.eos_closure_mode</code> の既定は <code>"energy_authoritative"</code>（1D。進化させたエネルギーを正とし、書き換えない）で、<code>"legacy"</code> と 2D RZ の閉じ方は表の端へクランプする。Studio はこのキーを書き出さないので、Studio のデッキもパーサーの既定を使う（詳細は<a href="#eos-models">理想気体 EOS と TMAT の表形式 EOS</a>）。逆写像の結果は、保存するエネルギーと、熱伝導・輻射が読む温度の整合に効く。</p>
+
+      <h3 id="terms-tmat">TMAT-H5</h3>
+      <p><strong>TMAT-H5</strong>は、TENRYU の物質表の HDF5 形式（ファイル拡張子 <code>.tmat.h5</code>）である。仕様書はリポジトリの <code>docs/TMAT_H5_SPEC.md</code> にある。1 つのファイルが 1 つの材料を表し、単位は cgs + eV に固定で、実行時に単位を換算しない。IONMIX（Fortran の非整形バイナリ）や SESAME（ASCII）の表を、単位・組成・来歴を自分で記述する 1 つの形式に置き換えるために作られ、EOS の表と不透明度の表を別々の格子に置け、片方だけのファイルも読める。</p>
+      <p>ファイルは次の塊から成る。材料の組成（<code>/material</code>。元素ごとの原子番号 \(Z\)、質量 \(A\)、質量分率）。EOS の表（<code>/eos</code>）は、イオン数密度 \(n_i\) [cm⁻³] と温度 \(T\) [eV] の格子の上で、平均電離度 \(\bar Z\)、イオンと電子の圧力 \(P_i\)、\(P_e\) [dyne/cm²]、比エネルギー \(e_i\)、\(e_e\) [erg/g] を与え、比熱 \(c_{v,i}\)、\(c_{v,e}\) [erg/(g·eV)] は任意である。不透明度の表（<code>/opacity</code>）は、群・イオン数密度・温度の 3 軸の上で、ロスランド平均 \(\kappa_R\)、プランク吸収 \(\kappa^{PA}\)、プランク放出 \(\kappa^{PE}\) [cm²/g] を与え、<code>@is_lte</code> が 1 なら LTE の表である。電離段の分率（<code>/ionization</code>）は任意である。</p>
+      <p>密度軸がイオン数密度なので、実行時に \(\rho=n_iAm_p\) で質量密度へ変換する。材料ごとに <code>eos.model="tmat"</code> と <code>opacity.model="tmat"</code> で選ぶ（<a href="#controls">namelist による制御</a>）。EOS の表からは、イオンと電子の和として全物質の表も作る。電離段の分率は、衝突に効く有効電荷の表に使う（<a href="ionization.html#terms-zeff">用語</a>）。</p>
+    </section>
+
+    <section aria-labelledby="controls">
+      <h2 id="controls">namelist による制御</h2>
+      <p>以下は、EOS に直接関係する設定の抜粋である。検証規則の全体は <a href="../../use/namelist.html">namelist リファレンス</a>を参照のこと。</p>
+      <table class="quick-facts">
+        <thead>
+          <tr><th>キー</th><th>値・既定</th><th>用途</th></tr>
+        </thead>
+        <tbody>
+          <tr><th><code>eos.model</code></th><td><code>ideal_gas</code>（既定）| <code>tmat</code></td><td>解析的な 2 温度クロージャ、または TMAT-H5 の表形式 EOS。このほか <code>sesame</code>（SESAME の表。Los Alamos 国立研究所の状態方程式ライブラリ）、<code>ionmix</code>（IONMIX の表）、<code>power_law_te</code>（べき乗則の電子エネルギーを初期化のときに表にした検証用のモデル）も受け付ける。Studio は <code>ideal_gas</code> と <code>tmat</code> だけを書き出す。</td></tr>
+          <tr><th><code>ideal_gas.gamma</code></th><td>5/3</td><td>理想気体の断熱指数（adiabatic index）。ソルバーが要求するのは \(\gamma&gt;1\) だけで、Studio は \(1&lt;\gamma\le3\) に限る。</td></tr>
+          <tr><th><code>eos.cv_e_override</code></th><td><code>None</code></td><td>検証用の、一定の電子体積比熱 [erg/(cm³·eV)]。有限で 1.0 以上でなければならない。</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section aria-labelledby="verification">
+      <h2 id="verification">検証</h2>
+      <ul>
+        <li>TMAT の参照に関する対の試験は、人工的に作った表に対する \((\log\rho,\log T)\) の順方向補間と、<a href="../../verification/index.html#gxii">GXII</a>（激光 XII 号、GEKKO XII）の CD の表に対する GPU での逆写像の簡易試験を組み合わせる。後者は \(\rho=1.05\) g/cm³、\(e_e=10^6\ldots10^{12}\) erg/g において、区間探索の失敗と代替経路への退避がいずれも 0 であることを要求する。</li>
+      </ul>
+    </section>
+
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["$$", "$$"], ["\\[", "\\]"]] } };</script>
+  <script defer src="../../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../../nav.js" data-page="eos" data-root="../../"></script>
+</body>
+</html>

@@ -1,0 +1,257 @@
+<!doctype html>
+<html lang="ja" data-lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ホット電子 — TENRYU ドキュメント</title>
+  <link rel="stylesheet" href="../../../style.css">
+  <script src="../../../theme.js"></script>
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>ホット電子 <span class="badge">reference</span></h1>
+    <p class="abstract">TENRYU のホット電子（hot electron）モデルは、Colaïtis ら [1] と、LLE（Laboratory for Laser Energetics、米国ロチェスター大学）の 1D 流体コード LILAC に倣った、あらかじめ与える形のレーザープラズマ不安定性（laser–plasma instability、LPI）予熱（preheat）を、レーザーのパワーの捕獲（capture）、指数スペクトル、円錐方向の求積（quadrature）、直線の弦（chord）に沿う輸送、衝突による減速（collisional slowing-down）、物質へのエネルギー付与（deposition）として組み立てたものである。LPI の波の成長や飽和を自己無撞着（self-consistent）に解くのではなく、ホット電子温度は較正（calibration）された入力として与え、変換効率（conversion efficiency）η(t) は較正された入力または縮約クロージャ（reduced closure）から与える。この計算に固有の用語は<a href="#terms">用語の節</a>で説明する。</p>
+
+    <aside class="planned" aria-labelledby="at-a-glance">
+      <h3 id="at-a-glance">要点</h3>
+      <ul>
+        <li>既定の<a href="#terms-capture">捕獲面（capture surface）</a>は \(n_e=0.25n_c\)（\(n_c\)：レーザーの臨界密度（critical density）。レーザーページでは \(n_{\rm crit}\) と表記）である。その面に届くまでに上流で吸収された分を差し引いたレーザーパワーに η(t) を掛けて、ホット電子へ変換する。</li>
+        <li>エネルギーは指数スペクトルを対数刻みで多群（multigroup）化し、方向は光線の進行方向を軸とする一様な円錐（機構によっては環。<a href="#terms-channel">角度帯（angular band）</a>）を決定論的に求積する。</li>
+        <li>各<a href="#terms-beamlet">微小ビーム（electron beamlet）</a>は直線の経路に沿ってシェルを通り、自由電子による減速で失ったエネルギーをセルへ付与する。</li>
+        <li><code>subtract_from_laser=True</code> は、変換したパワーを光線のパワーから差し引き、同じパワーをレーザー吸収とホット電子の両方に数える二重計上を防ぐ。</li>
+        <li>対応する次元は <code>1D_SPH</code> と <code>2D_RZ</code> で、どちらも単一の MPI（Message Passing Interface）ランクで実行する。1D_SPH では <code>Laser.mode</code> が <code>"radial_absorption_1d"</code> か <code>"raytrace_2d"</code> である。2D RZ では <code>Laser.mode="raytrace_3d"</code> が前提で、角度分布は <code>"cone"</code> だけが使える。<code>"radial"</code> は 1D 専用で、逆に 1D の円筒幾何（<code>Mesh.geometry_1d="cylindrical"</code>）では <code>"cone"</code> が使えない。</li>
+      </ul>
+    </aside>
+
+    <section aria-labelledby="mechanism">
+      <h2 id="mechanism">物理機構</h2>
+      <p>レーザー強度が閾値を超えると、パラメトリック不安定性（parametric instability） — 2 プラズモン崩壊（two-plasmon decay、TPD）と誘導ラマン散乱（stimulated Raman scattering、SRS） — が大振幅の電子プラズマ波（electron plasma wave）を励起する。これらの不安定性が主に起こる場所が四分の一臨界密度（quarter-critical density）付近になるのは、そこで娘波（daughter wave）の電子プラズマ波の振動数がレーザー振動数の約半分となり、TPD・SRS の周波数整合条件（frequency-matching condition）を満たせるからである。励起されたプラズマ波は電子を捕捉（trapping）し、熱的な主成分をはるかに超える数十〜数百 keV まで加速する。その飛程（range）は熱的な電子よりずっと長いため、衝撃波に先行してシェルを貫き、燃料を予熱して断熱度（adiabat）を上げ、圧縮性能を劣化させる。この予熱を定量化することが、この物理カーネルの目的である。</p>
+      <p>これらの不安定性は、輻射流体のメッシュでは解像できない運動論的（kinetic）かつ波長以下のスケールで起こるため、TENRYU は波の成長や飽和そのものを解かない。Colaïtis [1] と LILAC の考え方に従い、変換効率 η(t) とホット電子温度 \(T_h\)（namelist の <code>T_hot_eV</code>）は較正された入力とするか、局所のプラズマ量で駆動される縮約クロージャから η を与える。<a href="#terms-capture">生成源（source）</a>は物理が実際に起こる場所、すなわち追跡した各光線が最初に \(n_e=f_s n_c\) を横切る点に置き、そこまでの上流吸収を生き延びたパワーを使う。</p>
+      <p>観測されるホット電子のスペクトルは、単一温度の指数分布でおおよそ表せる。TENRYU はこの指数分布を対数刻みの群（group）に分け、解析的なモーメントから重みと流束平均の代表エネルギーを作る。各群の重みは累積分布の端点値の差として作るので、総和すると中間項が打ち消し合い、\(\sum_g W_g=1\) が数値求積なしで厳密に成り立つ。方向は光線の進行方向を軸とする決定論的な一様円錐で、無作為抽出ではなく求積を使うため、実行のたびにビット単位（bitwise）で再現する。</p>
+      <p>輸送の弦（<a href="#terms-chord">用語</a>）は直線である。対象は光ではなく 100 keV 程度の電子なので屈折はなく、v1 では角度散乱も含まない。自由電子による連続的な減速には、相対論的な運動学（relativistic kinematics）とクーロン対数（Coulomb logarithm）を使う。\(\Delta P=\dot N_g(E_{in}-E_{out})\) という記帳の仕方により、積分誤差は付与の位置を隣接セルのあいだで動かすだけで、群のパワーを生み出したり消したりはしない。ホット電子のパワーはすべて、セルへの付与か、メッシュの外縁からの逸出（escape）のどちらかになり、変換パワー \(P_h\) は付与 \(P_{dep}\) と逸出 \(P_{esc}\) の和に等しい。逸出したエネルギーは、全体の<a href="../../overview/numerics-foundations.html#energy-ledger">エネルギー台帳（energy ledger）</a>ではレーザーの逸出に数える。<a href="cbet.html">交差ビームエネルギー転送（cross-beam energy transfer、CBET）</a>と共存する経路（<code>cbet.geometry_mode="port_section"</code> と <code>eta_mode="model"</code> の組合せで、保存しておいた区間ごとの光学的厚さを順に適用して光線のパワー減衰を再現し、交差点での通過パワーを取り出す）では、レーザーのパワーの収支「レーザー光の吸収によるセルへの沈着（ホット電子の付与は含まない）+ 未吸収パワー + \(P_{hot}\)（全光線の変換パワー \(P_h\) の総和）= 入力」が相対 \(10^{-10}\) 以内で閉じることを、この結合経路の単体試験 <code>test_port_section_s3</code> の判定基準とする。波長離調があるときは、CBET がイオン音波へ渡したパワーもこの収支に加わる。</p>
+    </section>
+
+    <section aria-labelledby="scope-source">
+      <h2 id="scope-source">モデルの適用範囲と生成源</h2>
+      <p><code>Laser.hot_electron.enable=True</code> でモデルを有効にする。基本の処方では、追跡した各光線が外側から内側へ進み、初めて \(n_e=f_s n_c\) を上向きに横切る位置（<a href="#terms-capture">捕獲面</a>との交点）を生成源とする。既定の \(f_s=\)<code>source_nc_fraction</code> は 0.25 で、四分の一臨界密度付近の LPI 活性帯を表す。1D の光線追跡（<code>Laser.mode="raytrace_2d"</code>）では、交差を含む区間はその点で分割し、交差より手前の逆制動輻射（inverse bremsstrahlung、IB）吸収を先に適用する。したがって生成源のパワーは、区間の入口における値ではなく、捕獲面に実際に到達した値である。<code>Laser.mode="radial_absorption_1d"</code> は光線を追跡せず、全パワーを 1 本の動径方向の光線として外側のセルから内向きに進め、セルの中点で評価した \(n_e/n_c\) が \(f_s\) 以上になる最初のセルで、そのセルに入るパワーを使う。出発位置はそのセルの外側の面、\(\mu_{axis}=-1\) とする。2D RZ の捕獲は、現在も区間の入口におけるパワーを使う。</p>
+      $$
+      P_{h,ray}(t)=\eta(t)P_{ray}^{cross}(t).
+      $$
+      <p>\(P_{ray}^{cross}\) は上流の処理を終えたあとのパワーである。CBET と共存できる経路では、CBET 適用後の最終的な伝播記録から捕獲するため、まだ交換を受けていない公称のビームパワーを使うことはない。通常 CBET とホット電子は排他だが、<code>cbet.geometry_mode="port_section"</code> と <code>eta_mode="model"</code> の組合せのときだけ排他が解除され、この CBET 適用後の規則で動作する。</p>
+      <p>η(t) の与え方は 4 通りある。<a href="#terms-channel">スカラーの簡易指定（scalar shorthand）</a>では、<code>eta_hot</code> が一定値を、<code>eta_hot_table</code> が初期化時に<a href="../../use/running.html#terms-freeze">凍結（freeze）</a>する時間表を与える。<code>sources</code> は最大 4 つの cone / TPD / SRS の<a href="#terms-channel">チャネル（channel）</a>を定義し、チャネルごとに捕獲面、定数または表の η、温度、エネルギー窓、<a href="#terms-channel">角度帯</a>を設定できる。複数のチャネルは \(f_s\) の昇順に発火し、レーザーの減耗も同じ順で逐次適用する。さらに <code>eta_mode="model"</code> は、局所のプラズマ量で駆動される η の時間発展を選ぶ。いずれもホット電子生成の縮約処方であり、自己無撞着な LPI の求解にはならない。</p>
+    </section>
+
+    <section aria-labelledby="spectrum-angle">
+      <h2 id="spectrum-angle">多群スペクトルと円錐角度モデル</h2>
+      <p>生成源における電子数流束は、温度 \(T_h\) の指数分布に従う。<code>T_hot_eV</code> は eV 単位であり、keV の値ではない。</p>
+      $$
+      \frac{d\dot N}{dE}=\frac{P_h}{T_h^2}\exp(-E/T_h),
+      \qquad T_h=\texttt{T_hot_eV}\,\mathrm{eV\_to\_erg}.
+      $$
+      $$
+      W_g=\frac{\phi_1(u_{g-1/2})-\phi_1(u_{g+1/2})}
+      {\phi_1(u_{min})-\phi_1(u_{max})},
+      \qquad \phi_1(u)=(1+u)e^{-u},
+      $$
+      $$
+      E_g=T_h\frac{\phi_2(u_{g-1/2})-\phi_2(u_{g+1/2})}
+      {\phi_1(u_{g-1/2})-\phi_1(u_{g+1/2})},
+      \qquad \phi_2(u)=(2+2u+u^2)e^{-u}.
+      $$
+      <ul>
+        <li>\(P_h=\eta P^{cross}_{ray}\) — IB を適用したあとの交差点におけるパワーに η を掛けた値である。1D では交差を含む区間をその点で分割し上流の IB を先に適用するため、生成源が見るのは区間入口ではなく交差点のパワーになる。</li>
+        <li>\(T_h=\texttt{T_hot_eV}\,\mathrm{eV\_to\_erg}\) — 設定したスペクトル温度を eV から erg へ変換してから、エネルギーモーメントを評価する。</li>
+        <li>\(W_g\) と \(E_g\) — \(\phi_1\)、\(\phi_2\) から作る解析的なモーメントである。ここで \(u=E/T_h\) は規格化エネルギー、\(u_{g\pm1/2}\) は群の端、\(u_{min},u_{max}\) は窓の端である。差は打ち消し合って \(\sum_g W_g=1\) となり、\(E_g\) は各群の流束平均エネルギーである。</li>
+        <li>円錐の求積 — \(\mu\) についてのガウス–ルジャンドル求積（Gauss–Legendre quadrature）の点と \(\phi\) についての等間隔点の直積型の求積で、方向重みの総和は 1 である。</li>
+        <li>\(f_s=\texttt{source_nc_fraction}=0.25\) — 既定の捕獲面の位置である四分の一臨界密度である。</li>
+        <li><code>subtract_from_laser</code> — 変換したパワーを光線から差し引き、二重計上を防ぐ。捕獲のあとは \((1-\eta)P^{cross}\) がレーザーの経路を進む。</li>
+      </ul>
+      <p><code>n_energy_groups</code> 個の対数刻みの群を \([E_{min},E_{max}]=[\texttt{E_min_over_Th}T_h,\texttt{E_max_over_Th}T_h]\) に置き、指数分布の解析的なモーメントから、各群のパワー重みと流束平均の代表エネルギーを求める。既定は 30 群、\([0.2,8]T_h\) である。窓の外のパワーは捨てずに窓内の群へ再規格化するため、群重みの総和は 1 になる。</p>
+      <p><code>angular_model="cone"</code> は、光線の進行方向を軸として半角 <code>theta_div_deg</code> の立体角の円錐を作る。極角の余弦は <code>n_mu</code> 点のガウス–ルジャンドル求積、方位角は <code>n_phi</code> 点の等間隔求積で離散化し、方向重みの総和を 1 に規格化する。半角を広げると、同じ生成源のパワーが、長さと面密度の異なる弦へ分配される。<code>radial</code> は \(\mu=1\) で内向きに進む検証用のモードであり、円錐の有限の発散を置き換える実運用向けの近似ではない。TPD と SRS のチャネルの角度帯は<a href="#terms-channel">用語の節</a>に示す。</p>
+    </section>
+
+    <section aria-labelledby="terms">
+      <h2 id="terms">この計算で使う用語</h2>
+      <p>ホット電子がセルへ付与するエネルギーは、電子が出発する半径、出発する向き、電子のエネルギーに強く依存する。1D の流体計算が持つのは半径方向の分布だけなので、TENRYU は光線が運ぶパワーを、生成源、方向、エネルギー群に分けて、電子の輸送の計算へ渡す。この分け方に使う語は、TENRYU の実装に固有の意味をもつので、まとめて定義する。なお、この頁では、ホット電子がセルへエネルギーを渡すことを付与、レーザー光の吸収によってセルへエネルギーが入ることを沈着と書き分ける。</p>
+
+      <h3 id="terms-capture">捕獲面と生成源</h3>
+      <p><strong>捕獲面（capture surface）</strong>は、電子密度が臨界密度 \(n_c\) の割合 \(f_s\) になる面 \(n_e=f_s n_c\) である。光線は外側から内向きに進み、密度が上がる向きにこの面を横切る。光線が捕獲面を最初に上向きに横切る点を、交差点と呼ぶ。交差点で光線のパワー \(P_{ray}^{cross}\) の割合 η がホット電子へ移り、光線は残りの \((1-\eta)P_{ray}^{cross}\) で進み続ける。この移す操作を、この頁では捕獲（capture）と呼ぶ。捕獲はモデルの操作であり、プラズマ波が電子を捕らえて加速する物理過程の捕捉（trapping）とは別である。TENRYU は捕捉を解かず、捕獲する割合 η を較正された入力または縮約クロージャで与える（<a href="#mechanism">物理機構</a>）。</p>
+      <p>捕獲面の密度の割合 \(f_s\) は、スカラーの簡易指定では <code>source_nc_fraction</code>、チャネルでは <code>capture_nc_fraction</code> で与える（どちらも 0 より大きく 1 以下）。既定は 0.25、すなわち四分の一臨界密度で、SRS のチャネルだけは既定が 0.18 である。\(f_s\) は、光線が捕獲面に届くまでに上流で吸収されるパワーと、電子が出発する半径を決める。</p>
+      <p><strong>生成源（source）</strong>は、ホット電子が出発する位置、軸の向き、パワーの組である。位置は交差点の半径 \(r_s\)、軸の向きは交差点での光線の進行方向と外向きの動径方向のなす角の余弦 \(\mu_{axis}\)（動径方向に内向きの光線で \(-1\)）、パワーは \(P_h=\eta P^{cross}_{ray}\) である。光線 1 本が、チャネルごとに高々 1 つの生成源を作る。輸送の計算は、同じ<a href="#terms-bin">ビン（bin）</a>に入った生成源を 1 つにまとめたものを単位にする。</p>
+
+      <h3 id="terms-bin">ビン</h3>
+      <p><strong>ビン（bin）</strong>は、生成源を、その生成源を含むセルと \(\mu_{axis}\) の区間の組でまとめた集まりである。\(\mu_{axis}\in[-1,1]\) を 16 等分した区間（幅 0.125）のどれに入るかと、\(r_s\) を含む流体セルが、ビンを定める。メッシュの外にある生成源は、最も近い端のセルのビンに入れる。パワーが 0 のビンは作らない。ビンごとに、次の量をもつ生成源を 1 つ作る。</p>
+      $$
+      P=\sum_k P_k,\qquad
+      r_s=\frac{1}{P}\sum_k P_k\,r_{s,k},\qquad
+      \mu_{axis}=\frac{1}{P}\sum_k P_k\,\mu_{axis,k}.
+      $$
+      <p>ここで \(k\) はビンに入った生成源の添字、\(P_k\)、\(r_{s,k}\)、\(\mu_{axis,k}\) はその生成源のパワー、半径、方向余弦である。輸送はこの平均値から始めるので、出発点をセル面へ丸めることはない。ビンは (セル, 区間) の昇順に処理し、実行のたびに同じ順序になる。</p>
+      <p>ビンの数 16 は定数（コードの <code>kAxisBins</code>）で、namelist のキーではなく、変更できない。ビンにまとめる理由は、輸送の計算量を光線の本数から切り離すためである。1D の光線は 1 ビームあたり既定で 1000 本（<code>Laser.rays_per_beam</code>）あり、交差点ごとに輸送すると計算量が光線の本数に比例する。ビンにまとめると、輸送する生成源は 1 つのチャネルあたり高々 (セル数) × 16 個で、光線の本数に依らない。代償として、同じビンの光線は 1 つの平均の方向に束ねられるので、方向余弦の広がりは 0.125 の分解能でしか残らない。</p>
+      <p>2D RZ では、生成源の向きが 3 次元なので、ビンの切り方が異なる。セルごとに、子午面内の向き \(\chi=\operatorname{atan2}(k_R,k_Z)\) を \([-\pi,\pi]\) で 16 等分し（コードの <code>kChiBins</code>）、方位方向の成分 \(|k_\phi|\) が 0.3 未満か以上かで 2 つに分けて、1 セルあたり 32 個のビンにまとめる。ここで \(k_R\)、\(k_\phi\)、\(k_Z\) は、光線の進行方向の単位ベクトルの、動径方向、方位方向、軸方向の成分である。ビンごとの生成源は、パワーで重み付けした平均の位置と向き（向きは単位ベクトルに規格化する）をもつ。</p>
+
+      <h3 id="terms-beamlet">微小ビーム</h3>
+      <p><strong>微小ビーム（electron beamlet）</strong>は、1 つの生成源から、角度帯の 1 つの方向節点へ出る、1 つのエネルギー群の電子の束である。レーザーのビームではない。1 つの生成源は、方向節点（\(n_\mu\times n_\phi\) 個。\(n_\mu\) と \(n_\phi\) は角度帯の節点の数で、キーは <code>n_mu</code> と <code>n_phi</code>）とエネルギー群（<code>n_energy_groups</code> 個）の積だけの微小ビームに分けられ、既定では \(6\times8\times30=1440\) 本になる。方向節点が減る場合は、その分だけ減る（<code>theta_div_deg=0</code> では方向が 1 つ、TPD の <code>tpd_delta_deg=0</code> では \(n_\phi\) 個）。微小ビームのパワーは \(P\,w\,W_g\)（\(P\) は生成源のパワー、\(w\) は方向節点の重み、\(W_g\) は群 \(g\) の重み）、電子 1 個のエネルギーの初期値は群の代表エネルギー \(E_g\)、数流束は \(\dot N=P\,w\,W_g/E_g\) である。同じ方向節点の微小ビームは、同じ弦をたどる。</p>
+      <p>方向節点の数とエネルギー群の数は、それぞれ方向とスペクトルの分解能を決め、増やすと微小ビームの数、すなわち輸送の計算量が、積に比例して増える。radial モードは方向が 1 つで、チャネルの全パワーを最外の生成源に集めるので、微小ビームは群の数（既定では 30 本）になる。1D の GPU の実装は、微小ビームごとに全セル分の付与パワーの行（倍精度）を作業領域に持つので、微小ビームの数 × セル数 × 8 バイトが 4 GiB を超えると停止する。</p>
+
+      <h3 id="terms-channel">チャネルと角度帯</h3>
+      <p><strong>チャネル（channel）</strong>は、<code>Laser.hot_electron.sources</code> の 1 要素で、ホット電子を作る 1 つの機構を表す。機構（<code>mechanism</code>）は <code>"cone"</code>、<code>"tpd"</code>、<code>"srs"</code> のいずれかで、チャネルは最大 4 つ指定できる。チャネルごとに、捕獲面（<code>capture_nc_fraction</code>）、変換効率（<code>eta</code> または <code>eta_table</code>。<code>eta_mode="model"</code> ではモデルが与える）、温度（<code>T_hot_eV</code>）、エネルギー窓、角度帯を独立に決める。光線は外側から内向きに進むので、密度の低い捕獲面から順にチャネルを通り、光線のパワーの減耗も \(f_s\) の昇順に逐次適用する。同じ \(f_s\) のチャネルは <code>sources</code> に書いた順である。機構によって、ホット電子が生成される密度、温度、方向の分布が違う。チャネルは、この違いを機構ごとの較正入力として別々に与える仕組みである。</p>
+      <p><strong>スカラーの簡易指定（scalar shorthand）</strong>は、<code>sources</code> を使わず、<code>Laser.hot_electron</code> の直下のキー（<code>source_nc_fraction</code>、<code>eta_hot</code>、<code>eta_hot_table</code>、<code>T_hot_eV</code>、<code>n_energy_groups</code>、<code>E_min_over_Th</code>、<code>E_max_over_Th</code>、<code>theta_div_deg</code>、<code>n_mu</code>、<code>n_phi</code>）で、cone のチャネルを 1 つだけ指定する形である（エラー文でもこの名前で呼ぶ）。これらのキーと <code>sources</code> は同時に指定できず、指定するとエラーになる。</p>
+      <p><strong>角度帯（angular band）</strong>は、生成源の軸 — 交差点での光線の進行方向 — のまわりで、電子を出す方向の範囲である。軸からの極角の余弦 \(\mu\) の範囲と、軸のまわりの方位角 \(\phi\) で決まり、\(\phi\) については一様である。帯の中の方向は、立体角について一様な重みで、\(\mu\) を <code>n_mu</code> 点のガウス–ルジャンドル求積、\(\phi\) を <code>n_phi</code> 点の等間隔点で離散化した節点で表し、重みの総和は 1 である。節点の方向と動径方向の余弦 \(\mu_{dir}\) は次の式で決まる。</p>
+      $$
+      \mu_{dir}=\mu\,\mu_{axis}+\sqrt{1-\mu^2}\,\sqrt{1-\mu_{axis}^2}\,\cos\phi.
+      $$
+      <p>機構ごとの帯と既定値は次の表のとおりである。帯と節点の配置は<a href="#fig-hot-electron-angular-bands">図A</a>に示す。</p>
+      <table class="quick-facts">
+        <thead>
+          <tr><th>機構</th><th>角度帯（\(\mu\) の範囲）</th><th>\(f_s\) の既定</th><th>\(T_h\) の既定</th></tr>
+        </thead>
+        <tbody>
+          <tr><th><code>"cone"</code></th><td>\(\cos\theta_{div}\le\mu\le1\)（円錐）。\(\theta_{div}\) は <code>theta_div_deg</code>（既定 60°）。</td><td>0.25</td><td>50 keV（<code>T_hot_eV</code> = 5.0e4）</td></tr>
+          <tr><th><code>"srs"</code></th><td>同じ式（前方の細い円錐）。<code>theta_div_deg</code> の既定は 20°。</td><td>0.18</td><td>45 keV（4.5e4）</td></tr>
+          <tr><th><code>"tpd"</code></th><td>\(\cos(\theta_c+\Delta)\le\mu\le\cos(\theta_c-\Delta)\)（環）。\(\theta_c\) は <code>tpd_theta_deg</code>（既定 45°）、\(\Delta\) は <code>tpd_delta_deg</code>（既定 10°）。</td><td>0.25</td><td>60 keV（6.0e4）</td></tr>
+        </tbody>
+      </table>
+      <figure id="fig-hot-electron-angular-bands">
+        <img src="../../../assets/hot-electron-angular-bands-ja.png" width="900" height="640" style="max-width:100%;height:auto" alt="3 つの機構の角度帯。上段：生成源の軸を含む断面で、cone は半角 60°の円錐、SRS は半角 20°の前方の円錐、TPD は軸から 35°〜55°の環が、色を付けた扇形になり、その中に μ の節点の方向が線と点で示される。下段：方位角と μ の平面に、6×8 の節点が帯の範囲の内側に点で並ぶ">
+        <figcaption>図A. 3 つの機構の角度帯と求積の節点（既定値）。上段：生成源の軸（交差点での光線の進行方向、矢印）を含む断面。色を付けた扇形が帯で、cone は半角 \(60^\circ\)、SRS は半角 \(20^\circ\)、TPD は軸から \(35^\circ\) 以上 \(55^\circ\) 以下の環の断面である。線と点は、\(n_\mu=6\) 点のガウス–ルジャンドル節点 \(\mu_i\) の方向（\(\phi=0\) の面とその鏡映の面）である。下段：全節点 \(6\times8=48\) 点を方位角 \(\phi_j=(j+\tfrac12)\,2\pi/n_\phi\)（\(n_\phi=8\)）と \(\mu\) の平面に描いた。点線は帯の端、点の面積は重み \(w\) に比例し、重みの総和は 1 である。縦軸の範囲は機構ごとに帯に合わせて変えてある。\(\mu\) は生成源の軸からの極角の余弦であり、動径方向との余弦 \(\mu_{dir}\) は上の式で決まる。</figcaption>
+      </figure>
+      <p>既定値は機構ごとの較正入力で、文献上の根拠は TPD が [2]–[4]、SRS が [5]–[7] である（リポジトリの <code>docs/NUMERICS.md</code> §5.11.1 に表がある）。TPD の帯は円錐ではなく環で、軸からの極角が \(\theta_c-\Delta\) から \(\theta_c+\Delta\) の間にある方向全体である。軸に対して \(\pm\theta_c\) の向きにある 2 つの葉を、軸のまわりの方位角について平均した帯に等しく、1D では方位角を解像できないので、この環で表す。\(\theta_c-\Delta\le0\) のときは、環の内側の縁が軸に達し、半角 \(\theta_c+\Delta\) の円錐になる。\(\theta_{div}=0\) の円錐は方向が軸の 1 つだけ、\(\Delta=0\) の環は方位角の \(n_\phi\) 個の節点だけになる。</p>
+      <p>キー <code>angular_model</code> は、すべてのチャネルに共通の選択である。<code>"cone"</code> は上の角度帯に従う弦で電子を輸送し、<code>"radial"</code> は \(\mu=1\) の 1 方向だけを、チャネルの全パワーを集めた最外の生成源から内向きに進める検証用のモードである。機構の名前 <code>"cone"</code> はチャネルの種類を表し、<code>angular_model</code> の値とは別のものである。</p>
+
+      <h3 id="terms-chord">弦と近点</h3>
+      <p><strong>弦（chord）</strong>は、生成源から 1 つの方向へ出る電子の直線の経路である。レーザーの光線（<a href="../laser/raytrace.html#chord-raytrace">弦に沿う光線追跡</a>）と違い、屈折も散乱も受けない。球対称の格子では、弦は流体セルの境界の球面と交わり、交点で区間に分かれる。区間ごとの路程 \(ds\) とセルの密度 \(\rho\) から、電子が通る面密度 \(\rho\,ds\) が決まり、この面密度に沿って減速を積分する。</p>
+      <p><strong>近点（pericenter）</strong>は、弦が球の中心に最も近づく点である。生成源の半径が \(r_s\)、弦の方向と動径方向の余弦が \(\mu_{dir}\) のとき、近点の半径は次式で、これは弦と中心の距離に等しい。</p>
+      $$
+      r_{peri}=r_s\sqrt{1-\mu_{dir}^2}.
+      $$
+      <p>\(\mu_{dir}&lt;0\)（内向き）の弦は、近点まで内向きに進んで折り返し、外向きに抜ける。\(\mu_{dir}\ge0\) の弦は、すでに近点を過ぎているので、生成源から外向きにだけ進む。近点を含むセルは、内向きの部分と外向きの部分の 2 区間として数える。外側の境界を越えた電子は、逸出として数える。</p>
+
+      <h3 id="terms-ghost-corona">ゴーストコロナ</h3>
+      <p><strong>ゴーストコロナ（ghost corona、キー <code>Laser.lasermesh.ghost_corona</code>）</strong>は、最外の流体セルの外側に置く、光線追跡だけが使う合成の低密度プロファイルである。流体の初期条件が固体と真空の鋭い界面で、プレプラズマがないとき、レーザーの吸収が最外の固体セルに集中して、非物理的な加熱と数値不安定を起こす。これを避けるために、光線が通る格子 LaserMesh（<a href="../laser/raytrace.html#lasermesh-march">LaserMesh1D と光線の行進</a>）の上にだけ、電子密度が最外の流体セルの値から外向きに指数関数的に下がる帯を置く。密度の範囲は \(n_c\) の 0.03 倍から 0.99 倍（<code>ne_min_frac</code> と <code>ne_max_frac</code> の既定）で、流体の密度、温度、電荷数は変えない。1D_SPH の LaserMesh だけが使い、既定は無効（<code>enabled=False</code>）である。</p>
+      <p>ホット電子では、ゴーストコロナの密度の範囲に捕獲面の \(f_s\) が入ると、交差点がゴーストコロナの中、すなわち流体メッシュの外側にできる。この生成源は最外のセルのビンに入れ、その回数とパワーを警告に出す。</p>
+    </section>
+
+    <section aria-labelledby="transport-deposition">
+      <h2 id="transport-deposition">直線輸送とエネルギー付与</h2>
+      <figure id="fig-hot-electron-generation-deposition">
+        <img src="../../../assets/hot-electron-generation-deposition-ja.png" width="900" height="520" style="max-width:100%;height:auto" alt="コロナで屈折したレーザー光線が四分の一臨界密度の捕獲面を横切る点でホット電子を生成し、直線の弦の円錐に沿って内向きに送ってシェルに付与する図">
+        <figcaption>図B. 生成から付与まで。捕獲面で \(P_h=\eta(t)P^{cross}_{ray}\) を作り、多群・多方向の直線の弦としてシェルを通す。色付きの帯は衝突による減速で付与される領域、茶色の矢印は radial の検証経路で、その残りは最内セルへ付与される。弦の円錐は模式的に半角 \(20^\circ\)・5 本で描き、既定の半角は \(60^\circ\) である。</figcaption>
+      </figure>
+      <p>生成から付与までの全体を<a href="#fig-hot-electron-generation-deposition">図B</a>に示す。輸送の経路は、屈折も散乱も受けない直線の弦である。球幾何ではシェル面との交点を解析的に求め、内向き区間、近点（<a href="#terms-chord">用語</a>）、外向き区間の順にたどる。出発点がセルの内部にある場合も、最初の面までの部分区間を正確に扱う。各セルでは \(n_e,T_e,\rho\) を一定とみなし、相対論的な速度とクーロン対数を用いる連続減速近似（continuous slowing-down approximation、CSDA）で、自由電子による減速を積分する。エネルギー積分は適応刻みの 4 次ルンゲ–クッタ法（Runge–Kutta method）だが、セルへの付与パワーは常に電子数流束と入口・出口のエネルギー差から計算する。</p>
+      $$
+      \Delta P_{i,g}=\dot N_g\left(E_{in}-E_{out}\right).
+      $$
+      <p>この形にしておけば、積分誤差が付与位置のセル間の配分を変えることはあっても、群の総パワーを増減させることはない。電子のエネルギーが熱化（thermalization）の下限 \(\max(2T_e,\,10^{-3}T_h)\)（\(T_e\) はそのセルの電子温度）以下になったら、残りのエネルギーをそのセルへ付与し、外側へ抜けた分は逸出として数える。<code>inner_bc="deposit_residual"</code> は <code>radial</code> モード専用の境界規則で、内側境界へ届いた残りを、最も内側の<a href="../eos-opacity/index.html#void-materials">ボイド（void）</a>でないセルへ付与する。もう一方の <code>"escape"</code> は、残りを逸出として数える。円錐の弦は近点を回って外向きへ進むため、この radial 専用の境界指定は使わない。</p>
+    </section>
+
+    <section aria-labelledby="pipeline">
+      <h2 id="pipeline">捕獲から加熱までの手順</h2>
+      <ol>
+        <li>追跡した光線の上で、捕獲面を上向きに横切る交差点を検出する。交差する区間を分割し、上流側の IB を先に適用したうえで、交差点でのパワーを記録する。<a href="#terms-ghost-corona">ゴーストコロナ</a>の帯 — 最外の物理セルより外側にある、光線追跡だけが使う領域 — での捕獲は最外のセルへ寄せ、その回数を数えて報告する。</li>
+        <li>光線ごとの生成源を、生成源を含むセルと \(\mu_{axis}\)（交差点での光線の進行方向と動径方向の余弦）の 16 等分の区間の組、すなわち<a href="#terms-bin">ビン</a>へまとめる。各ビンは \(\mu_{axis}\) と生成源の半径 \(r_s\) の双方について、パワーで重み付けした連続的な代表値を保持し、出発点をセル面へ丸めることはしない。</li>
+        <li>空でない各ビンを、対数刻みのエネルギー群と決定論的な円錐方向へ展開して<a href="#terms-beamlet">微小ビーム</a>を作り、各微小ビームにスペクトル重みと角度重みの積を持たせる。</li>
+        <li>各微小ビームを弦に沿って進める。シェルとの解析的な交点により、内向き区間・近点・外向き区間の順序と、最初の部分区間を正確に保つ。セルごとに \(n_e,T_e,\rho\) を一定とみなし、部分ステップあたりのエネルギー変化 2% を目標、セルあたり最大 256 部分ステップとする適応 4 次ルンゲ–クッタ法で、CSDA による減速を積分する。上限に達したときは、残りのエネルギーをそのセルへ付与し、その回数を警告に出す。</li>
+        <li>各セルへ \(\Delta P=\dot N(E_{in}-E_{out})\) を付与する。熱化の下限に達した残りはその場で付与し、外側境界を横切る分は逸出とし、radial モードでの内側の残りは <code>inner_bc</code> に従う。</li>
+        <li>付与と逸出の収支を確かめ、物質へ連成する。セルごとのホット電子パワーは、平滑化（オプション）を適用したあとのレーザーの沈着パワーに加算し（ホット電子の付与分布自体は平滑化しない）、2 温度計算では電子の内部エネルギーを加熱する。時間刻みの制限 <code>"hot_electron"</code>（Δt を決めた制約の名前。<a href="../../overview/timestep.html#global-rule">時間刻み</a>参照）が、次のステップを \(\Delta t\le f_E\min_{P_i&gt;0}(m_i e_{e,i}/P_i)\)、\(f_E=\texttt{explicit_source_limit}\) で制限する。</li>
+      </ol>
+    </section>
+
+    <section aria-labelledby="coupling-timestep">
+      <h2 id="coupling-timestep">レーザーのパワーの収支、物質との連成、時間刻み</h2>
+      <p><code>subtract_from_laser=True</code> では、捕獲後の光線を \((1-\eta)P_{ray}^{cross}\) として継続する。これにより、同じパワーを熱的なレーザー吸収とホット電子予熱の両方に数えてしまうことを防げる。False は、レーザーを減耗させずに外から追加のホット電子エネルギーを加える、意図的な感度解析用のモードであり、通常の実行で、エネルギーの収支が閉じる設定ではない。チャネルが複数ある場合、下流のチャネルは上流のチャネルが減耗させたあとのパワーを受け取る。レーザーのパワーの収支は、「入力 = セルへの沈着（ホット電子の付与を含む）+ 未吸収パワー + ホット電子の逸出 + 受け手のセルがなく置けなかったパワー + CBET がイオン音波へ渡したパワー」で閉じる。</p>
+      <p>セルごとのホット電子パワーは、平滑化（オプション）を適用したあとのレーザーの沈着パワーに加算する。その先は標準の源項の注入が担当し、2 温度計算では電子の比内部エネルギーを、1 温度計算では単一の物質エネルギーを加熱する。陽的な源項（explicit source term）による 1 ステップあたりの過大な加熱を避けるため、時間刻みの制限 <code>"hot_electron"</code> が、前ステップの付与パワーから次の時間刻みを制限する。</p>
+      $$
+      \Delta t\le f_E\min_{P_i>0}\frac{m_i e_{e,i}}{P_i},
+      \qquad f_E=\texttt{explicit_source_limit}.
+      $$
+      <p>ここで \(m_i\) はセル \(i\) の質量（イオン質量ではない）、\(e_{e,i}\) はその比電子内部エネルギーで、\(m_ie_{e,i}\) がセルの電子エネルギーの蓄えである。核燃焼カーネルの同名キー <code>explicit_source_limit</code> と同じ構成 — Δt ≤ \(f_E\) × 利用可能な内部エネルギー / 付与パワー — であり、蓄えの取り方だけが違う（こちらは電子エネルギー、燃焼側は電子+イオンの内部エネルギー）。この制限はレーザーの CFL 条件の別名ではなく、ホット電子の陽的な源項に固有のものである。履歴（<a href="../../use/outputs/history.html#history">履歴のチャネル</a>）には、1 ステップあたりの変換エネルギー <code>laser/hot_e_in</code>、付与エネルギー <code>laser/hot_e_deposited</code>（radial モードの内側の残り <code>laser/hot_e_residual</code> を含む）、逸出エネルギー <code>laser/hot_e_escaped</code>（いずれも erg）と、収支の残差 <code>laser/hot_e_conservation_resid</code>（チャネルのうち最大の値）を書く。累積の付与と逸出は <code>laser/hot_e_E_deposited_cum</code> と <code>laser/hot_e_E_escaped_cum</code> である。チャネルが 2 つ以上のときは、チャネルごとの <code>laser/hot_e_ch&lt;i&gt;_in</code>、<code>_deposited</code>、<code>_escaped</code> も書く。<code>subtract_from_laser</code> による減耗は、レーザーのパワーの収支にも反映される。</p>
+    </section>
+
+    <section aria-labelledby="eta-model">
+      <h2 id="eta-model">η(t) の物理モデルという選択肢</h2>
+      <p><code>eta_mode="model"</code> は、定数や表で与える η を、TPD / SRS のチャネルごとの 1 次緩和方程式（first-order relaxation equation）へ置き換える、1D 球対称向けの明示指定オプションである。各ステップでチャネルの評価面（既定では捕獲面）付近の \(T_e\) と密度スケール長（density scale length）\(L_n\) を評価し、前ステップの交差点におけるパワーから照射強度を作る。規格化指標 \(g\)（エネルギー群の添字とは別の量）は、TPD では Simon ら [8] の閾値パラメータ（レーザー強度・密度スケール長・波長の積を電子温度で規格化した無次元数）を閾値係数 \(C_k\) で割った値、SRS では強度を、絶対閾値強度（密度スケール長と波長で決まる）の \(C_k\) 倍で割った値とする。\(g\le 1\) なら \(\eta_{eq}=0\) とし、\(g>1\) では超過分に対する \(1-e^{-a\sqrt{g-1}}\) 型の飽和形の平衡効率（equilibrium efficiency）を作って、チャネル個別の上限を適用する。時間更新は、固定または Vu ら [2] の型の緩和時間を用いる厳密な指数緩和であり、更新後の効率の合計が全チャネル合計の上限を超えると、各チャネルの効率を比例して縮小する。</p>
+      $$
+      \eta^{n+1}=\eta^n+\left[1-\exp(-\Delta t/\tau)\right]
+      \left(\eta_{eq}-\eta^n\right).
+      $$
+      <p>ここで \(\eta^n\) は \(n\) ステップ目の効率、\(\eta_{eq}\) は平衡効率、\(\tau\) は緩和時間である。平衡効率と緩和時間の係数は、<code>sources</code> のチャネルごとのキーで与え、既定値は機構で決まる（TPD、SRS の順に書く。Studio が書き出す値も同じである）。</p>
+      <ul>
+        <li>\(C_k\) — 閾値係数（<code>threshold_multiplier</code>、1 と 8）。</li>
+        <li>\(a\) — 飽和の形を決める係数（<code>shape_coefficient</code>、どちらも 1）。</li>
+        <li>\(\eta_\infty\) — \(g\) が大きいときに平衡効率が近づく値（<code>eta_inf</code>、0.01 と 0.08）。</li>
+        <li>チャネル個別の上限 — <code>eta_hard_cap</code>（0.03 と 0.08）。平衡効率はこの値を超えない。</li>
+        <li>\(\tau\) — TPD では \(1\,\mathrm{ps}/(0.05g+0.06)\) を 3〜10 ps に制限した値（<code>relaxation_model="vu2012"</code>。制限は <code>relaxation_tau_min_s</code> と <code>relaxation_tau_max_s</code>）、SRS では定数 <code>relaxation_tau_s</code>（既定 6 ps、<code>relaxation_model="fixed"</code>）である。SRS のチャネルに <code>"vu2012"</code> を指定すると、エラーになる。</li>
+      </ul>
+      <p>強度の計測は 1 ステップ遅れなので、初期の η は 0、最初のステップは交差点でのパワーの計測にあて、次のステップから 0 でない発展が始まる。このオプションは、<code>sources</code> による TPD / SRS チャネルと <code>subtract_from_laser=True</code> を必要とし、1D_SPH だけで使え、スカラーの簡易指定は受け付けない。局所条件に応じて η を変えはするが、解像されたプラズマ波、非線形な LPI の飽和、運動論的な電子生成を解いているわけではない。</p>
+    </section>
+
+    <section aria-labelledby="controls">
+      <h2 id="controls">namelist による制御</h2>
+      <p>以下は <code>Laser.hot_electron</code> の主要キーである。既定値は、<a href="../../use/namelist.html#terms-deck">デッキ（deck）</a>で指定しないときの値である。Studio は 1D のデッキにだけ <code>Laser.hot_electron</code> を書き出し、その既定値は表の値と同じである。ただし、<code>tpd_overlap_mode</code>、<code>srs_overlap_mode</code>、<code>illumination_metric</code>、<code>common_wave_delta_theta_deg</code> は Studio が扱わず、書き出さない。チャネル形式の <code>sources</code> は、スカラーの簡易指定（<a href="#terms-channel">用語</a>）のキーと同時には指定できない。</p>
+      <table class="quick-facts">
+        <thead>
+          <tr><th>キー / モード</th><th>既定値</th><th>用途</th></tr>
+        </thead>
+        <tbody>
+          <tr><th><code>enable</code></th><td><code>False</code></td><td>ホット電子による予熱を有効化。</td></tr>
+          <tr><th><code>eta_hot</code></th><td><code>0.0</code></td><td>スカラーの簡易指定における、一定の変換効率。</td></tr>
+          <tr><th><code>eta_hot_table</code></th><td>なし</td><td>初期化時に凍結する η(t) の表。指定時は定数より優先する。</td></tr>
+          <tr><th><code>sources</code></th><td>なし</td><td>cone / TPD / SRS の機構別チャネル列。各チャネルに定数または表の η を設定する。</td></tr>
+          <tr><th><code>eta_mode</code></th><td><code>"legacy"</code></td><td>η(t) の与え方。<code>"legacy"</code> は定数または表の η、<code>"model"</code> は TPD / SRS について、局所量で駆動される η(t) の緩和モデルを選ぶ。</td></tr>
+          <tr><th><code>source_nc_fraction</code></th><td><code>0.25</code></td><td>スカラーの簡易指定での捕獲面の密度 \(n_e/n_c\)（\(f_s\)）。チャネルでは <code>capture_nc_fraction</code>。</td></tr>
+          <tr><th><code>T_hot_eV</code></th><td><code>5.0e4</code></td><td>指数スペクトルの温度 [eV]。</td></tr>
+          <tr><th><code>n_energy_groups</code></th><td><code>30</code></td><td>対数刻みのエネルギー群数。</td></tr>
+          <tr><th><code>E_min_over_Th</code> / <code>E_max_over_Th</code></th><td><code>0.2</code> / <code>8.0</code></td><td>多群スペクトルの窓 \(E/T_h\)。</td></tr>
+          <tr><th><code>angular_model</code></th><td><code>"cone"</code></td><td>円錐角の輸送。<code>"radial"</code> は検証用である。</td></tr>
+          <tr><th><code>theta_div_deg</code></th><td><code>60.0</code></td><td>円錐の発散半角 [deg]。</td></tr>
+          <tr><th><code>n_mu</code> / <code>n_phi</code></th><td><code>6</code> / <code>8</code></td><td>極角余弦 / 方位角の求積点数。</td></tr>
+          <tr><th><code>subtract_from_laser</code></th><td><code>True</code></td><td>変換した分を光線のパワーから逐次差し引く。</td></tr>
+          <tr><th><code>inner_bc</code></th><td><code>"deposit_residual"</code></td><td>radial モードで内側境界に残った分を最内セルへ付与する。</td></tr>
+          <tr><th><code>explicit_source_limit</code></th><td><code>0.2</code></td><td><code>"hot_electron"</code> の時間刻み制限に使う \(f_E\)。</td></tr>
+          <tr><th><code>eta_model.eta_total_cap</code></th><td><code>0.08</code></td><td><code>eta_mode="model"</code> で、チャネルの η の合計の上限（範囲は 0 より大きく 0.5 以下）。超えたときは各チャネルを比例して縮小する。</td></tr>
+          <tr><th><code>eta_model.ln_filter_tau_s</code></th><td><code>5.0e-12</code></td><td><code>eta_mode="model"</code> で、\(1/L_n\) に掛ける指数フィルタの時定数 [s]。</td></tr>
+          <tr><th><code>tpd_overlap_mode</code></th><td><code>"single_beam"</code></td><td><code>eta_mode="model"</code> の TPD の駆動強度の求め方。<code>"common_wave_cluster"</code> は、共通の軸に対して極角の差が <code>common_wave_delta_theta_deg</code> 以内にあるビームを、1 つの電子プラズマ波を共通に駆動するビームの集まりとみなし、その強度の和から求める。<code>Laser.port_configuration.ports</code> と <code>common_wave_delta_theta_deg</code> が必要で、<code>Laser.cbet.geometry_mode="port_section"</code> のときだけ働く。</td></tr>
+          <tr><th><code>srs_overlap_mode</code></th><td><code>"per_beam_class"</code></td><td>SRS の駆動の求め方。現在の唯一の値で、ビームのクラスごとに駆動を求め、全ビームの和を 1 つの駆動にはしない。</td></tr>
+          <tr><th><code>illumination_metric</code></th><td><code>"fixed"</code></td><td>照射強度を求める面積に掛ける係数 \(f_{illum}\) の選択。<code>"fixed"</code> は \(f_{illum}=1\)、<code>"equivalent_area"</code> は球面のうち実効的に照射される面積の割合で、<code>eta_mode="model"</code> と <code>Laser.port_configuration.ports</code> が必要であり、<code>Laser.cbet.geometry_mode="port_section"</code> のときだけ働く。</td></tr>
+          <tr><th><code>common_wave_delta_theta_deg</code></th><td>なし</td><td><code>tpd_overlap_mode="common_wave_cluster"</code> で必須の角度の幅 [deg]（範囲は 0 より大きく 90 以下）。普遍的な既定値はなく、較正して使う。</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section aria-labelledby="verification-limits">
+      <h2 id="verification-limits">検証と適用上の制限</h2>
+      <ul>
+        <li>付与と逸出の和が変換パワーに等しいことを表す相対残差 \(|P_{dep}+P_{esc}-P_h|/P_h\) は、スカラーの簡易指定の 1D 計算で構成上閉じており、<a href="../../verification/index.html#gxii">GXII（激光 XII 号、GEKKO XII）</a>をもとにした簡易試験での実測最大値は \(7\times10^{-15}\) である。</li>
+        <li>機構別チャネルの検査（2026-07-10 の測定）では、機能を無効にしたときの GXII 基準解が 53/53 のスナップショットで相対差 0、スカラーの簡易指定と <code>sources=[cone]</code> が 55/55 のスナップショットで一致する。3 チャネル・20 ps の実行では各チャネルが \(1.6\times10^{-14}\) 以内で閉じ、チャネルごとの付与・逸出の総和と全体の値は \(3\times10^{-16}\) 以内で一致した。</li>
+        <li>平面配置で角度依存性を調べる検査（2026-07-10 の測定）— 200 セルの平面スラブで \(T_h\)・η・\(f_s\) を 4 つの計算すべてで同一に保ち、発射角だけを変える構成 — では、付与の 90% 深さが cone 0°、SRS 20°、cone 60°、TPD 45° の順にセル 154、152、144、142 となり、吸収割合はそれぞれ 0.734、0.742、0.805、0.820 で、実行の前に期待順序として決めていた単調な順のとおりである。</li>
+        <li>η(t) の物理モデルに対する検査は、緩和の更新と、捕獲・減耗・診断のつながりを確認する。</li>
+      </ul>
+      <p>現在のモデルは自由電子による減速だけを含み、束縛電子（bound electron）、プラズモン（plasmon）、縮退（degeneracy）、衝突による角度散乱、再流入（reflux：逃げた電子がシース電場（sheath electric field）で標的へ戻る過程）は扱わない。とくに低温で部分電離した物質では、減速を過小に、飛程を過大に評価し得る。η と \(T_h\) は較正に依存するため、結果は LPI の第一原理的な予測ではなく、指定した生成クロージャに対する予熱の応答として解釈すること。</p>
+    </section>
+
+    <section aria-labelledby="references">
+      <h2 id="references">参考文献</h2>
+      <ol class="references">
+        <li>A. Colaïtis et al., "Coupled Hydrodynamic Model for Laser-Plasma Interaction and Hot Electron Generation," Phys. Rev. E 92, 041101(R) (2015). <a href="https://doi.org/10.1103/PhysRevE.92.041101">doi:10.1103/PhysRevE.92.041101</a></li>
+        <li>H. X. Vu et al., "Hot-Electron Production and Suprathermal Heat Flux Scaling with Laser Intensity from the Two-Plasmon-Decay Instability," Phys. Plasmas 19, 102703 (2012). <a href="https://doi.org/10.1063/1.4757978">doi:10.1063/1.4757978</a></li>
+        <li>R. K. Follett et al., "Simulations and Measurements of Hot-Electron Generation Driven by the Multibeam Two-Plasmon-Decay Instability," Phys. Plasmas 24, 102134 (2017). <a href="https://doi.org/10.1063/1.4998934">doi:10.1063/1.4998934</a></li>
+        <li>E. Rovere et al., "Hot Electron Scaling for Two-Plasmon Decay in ICF Plasmas," Phys. Plasmas 30, 042104 (2023). <a href="https://doi.org/10.1063/5.0128052">doi:10.1063/5.0128052</a></li>
+        <li>M. J. Rosenberg et al., "Origins and Scaling of Hot-Electron Preheat in Ignition-Scale Direct-Drive Inertial Confinement Fusion Experiments," Phys. Rev. Lett. 120, 055001 (2018). <a href="https://doi.org/10.1103/PhysRevLett.120.055001">doi:10.1103/PhysRevLett.120.055001</a></li>
+        <li>M. J. Rosenberg et al., "Stimulated Raman Scattering Mechanisms and Scaling Behavior in Planar Direct-Drive Experiments at the National Ignition Facility," Phys. Plasmas 27, 042705 (2020). <a href="https://doi.org/10.1063/1.5139226">doi:10.1063/1.5139226</a></li>
+        <li>A. A. Solodov et al., "Hot-Electron Generation at Direct-Drive Ignition-Relevant Plasma Conditions at the National Ignition Facility," Phys. Plasmas 27, 052706 (2020). <a href="https://doi.org/10.1063/1.5134044">doi:10.1063/1.5134044</a></li>
+        <li>A. Simon, R. W. Short, E. A. Williams, and T. Dewandre, "On the Inhomogeneous Two-Plasmon Instability," Phys. Fluids 26, 3107–3118 (1983). <a href="https://doi.org/10.1063/1.864037">doi:10.1063/1.864037</a></li>
+      </ol>
+    </section>
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["$$", "$$"], ["\\[", "\\]"]] } };</script>
+  <script defer src="../../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../../nav.js" data-page="hot-electrons" data-root="../../"></script>
+</body>
+</html>

@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="en" data-lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ray tracing — TENRYU Documentation</title>
+  <link rel="stylesheet" href="../../../style.css">
+  <script src="../../../theme.js"></script>
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>Ray tracing <span class="badge">reference</span></h1>
+    <p class="abstract">This page describes how the launched rays are advanced through the plasma. In 1D spherical geometry, the ray motion is solved in a beam-fixed \((R,Z)\) plane. The default characteristic integration integrates segment by segment by quadrature from the conserved Bouguer invariant, while marching advances a ray in steps of a given length. In 2D RZ, rays are traced in three dimensions. The page also describes how beams with identical conditions share one trace, and the cache that reuses the previous result. Terms specific to this calculation are defined in the <a href="#terms">terms section</a>.</p>
+
+    <section aria-labelledby="terms">
+      <h2 id="terms">Terms used in this calculation</h2>
+      <p>TENRYU advances and reuses the bundle of rays in the units below. These terms carry meanings specific to this calculation, and to TENRYU's implementation in particular, so they are defined here together. The chord, ring, launch plane, and impact parameter are defined in the <a href="beams.html#terms">terms section of the beams page</a>.</p>
+
+      <h3 id="terms-march">Marching and segment</h3>
+      <p><strong>Marching</strong> is the solution of the ray equation (<a href="#chord-raytrace">next section</a>) in steps of length \(\Delta s\) (<code>Laser.raytrace.integrator="leapfrog"</code>). The step is based on the spacing of the radial nodes at the ray's position multiplied by <code>Laser.raytrace.cfl_ray</code> (default 0.8) and is adapted along the path (step 3 of <a href="index.html#pipeline">the procedure</a>); one ray takes at most <code>Laser.raytrace.max_steps</code> steps (default and upper limit 100000). Marching is the general method: it also advances the 3D rays of 2D RZ. In 1D spherical geometry the default is the characteristic integration (<a href="#characteristic">its section</a>), which has neither the step-size error of marching nor its step refinement near turning points.</p>
+      <p>A <strong>segment</strong> is one part of a ray's path over which the optical depth \(S\) and the deposition are evaluated. In marching, the path advanced in one step is a segment, and the loss of a segment that crosses a face of a fluid cell is deposited in the cell of its midpoint. In the characteristic integration, a segment is the path between break points such as the radial nodes and the faces of the fluid cells, and each segment lies in one fluid cell.</p>
+
+      <h3 id="terms-lasermesh">LaserMesh</h3>
+      <p>The <strong>LaserMesh</strong> is the structured \((R,Z)\) grid that the laser keeps separately from the fluid mesh for the ray tracing. The fluid density, electron temperature, and mean ionization \(\rho,T_e,\bar Z\) are mapped onto its nodes to form the electron density normalized to critical, \(\hat n\), and its gradient, and a ray reads these fields at its position by interpolation between nodes. The outer end \(R_{\rm max}\) of the LaserMesh is the position \(Z_{\rm init}\) of the launch plane. A ray that leaves the LaserMesh ends its trace, and its remaining power goes to the unabsorbed term (mesh exit).</p>
+      <p>In 1D spherical geometry the radial nodes are rebuilt at every call. A fine band of uniform spacing \(dR_{\rm fine}\) surrounds the critical radius, with a target width of \(64\,dR_{\rm fine}\) on each side, and outside the band the spacing grows geometrically (ratio 1.08 toward the core, 1.05 toward the corona). \(dR_{\rm fine}\) is the smallest fluid cell width near the critical surface multiplied by <code>Laser.lasermesh.mesh_factor</code>; the default of <code>mesh_factor</code> is 0.5, and the value that Studio writes together with the ghost corona is 0.1. The \(Z\) nodes mirror the \(R\) nodes about 0 (\(n_z=2n_r\)). The outer end is <code>Laser.lasermesh.r_max_factor</code> (default 1.5) times the outer face of the outermost cell with \(\hat n\) at or above <code>Laser.lasermesh.rmax_n_hat_threshold</code> (default 0.001), and the number of radial cells \(n_r\) is held at or below <code>Laser.lasermesh.nr_max</code> (default 4096) by enlarging \(dR_{\rm fine}\) when it would be exceeded. In 2D RZ one LaserMesh of \(n_r\times n_z\) cells (<code>Laser.lasermesh.nr</code> and <code>nz</code>; default 128 × 256) is built along the fluid symmetry axis, and its node geometry is fixed after initialization.</p>
+      <p>Because the LaserMesh is independent of the fluid cells, it can place nodes outside the outermost material cell (ghost corona and vacuum). Up to the outermost material cell, the radial reference array that the 1D ray kernel reads is built on nodes fixed to the faces and centers of the fluid cells (<a href="#lasermesh-march">LaserMesh and marching</a>), so changing <code>mesh_factor</code> does not move the nodes in that region. The LaserMesh spacing therefore affects the node spacing in the outer region (the base of the marching step and the number of segments in the characteristic integration) and the position of the launch plane; the GPU memory and the cost of mapping the fields grow with the node count \((n_r+1)(n_z+1)\).</p>
+
+      <h3 id="terms-beam-group">Beam group</h3>
+      <p>A <strong>beam group</strong> is a set of beams that share one trace in 2D RZ. Beams form one group when their polar angles (the angle between the beam direction and the symmetry axis) differ by less than \(10^{-6}\) rad and they have the same F-number, the same intensity profile, and the same focus. The focus is compared as a position relative to the beam direction, and positions that coincide under a rotation about the axis or a mirror reflection count as the same. In an axisymmetric field, beams with the same polar angle give the same absorption pattern when rotated about the axis, so only one representative beam per group is traced, and its rays carry the group power (the sum of the powers of the members). When CBET is on, only beams with the same wavelength offset \(\Delta\lambda\) are grouped. In 1D spherical geometry each beam is its own group, and the mechanism by which beams of identical conditions share one trace (<a href="#chord-raytrace">the chord section</a>) works separately from this.</p>
+
+      <h3 id="terms-reuse-cache">Reuse cache</h3>
+      <p>The <strong>reuse cache</strong> (<code>Laser.raytrace_skip</code>) stores the result of the last trace and uses it, without tracing the rays, while the plasma has changed little. It stores the deposition profile per unit power \(\hat f_{g,c}\) (the deposition in cell \(c\) divided by the power that produced it), together with the density \(\rho\), electron temperature \(T_e\), and mean ionization \(\bar Z\) of every cell at that time. There is one profile per beam in 1D (\(g\) numbers the beams) and a single profile in 2D RZ (the sum of the depositions of all beam groups divided by the total power). On a reused step the deposition in cell \(c\) is formed as \(\sum_g\hat f_{g,c}P_g\Delta t\), with the current power \(P_g\) (the power of beam \(g\) in 1D, the total power of all beams in 2D RZ).</p>
+      <p>The cache is off by default (<code>Laser.raytrace_skip.enabled=False</code>). When it is on, the trace is reused while the plasma change \(\delta\) since the cache was taken stays below <code>threshold</code> (default 0.01), for at most <code>max_consecutive</code> consecutive steps (default 10); the other conditions that force a new trace are listed in <a href="index.html#pipeline">step 7</a>. With <code>norm="max_relative"</code> (default), \(\delta\) is the largest relative change from the cached value of \(\rho\), \(T_e\), and \(\bar Z\) over all cells; with <code>"l2_relative"</code>, it is the root mean square over all cells and the three quantities of the relative change from the current value. The denominators have lower limits that avoid division by zero (the <a href="../../overview/numerics-foundations.html#floors-safety">floors</a> for \(\rho\) and \(T_e\), and 0.01 for \(\bar Z\)).</p>
+      <p>A reused step skips the cost of tracing the rays. Rescaling by the power is exact as long as the absorption coefficient does not depend on the power. The Langdon factor depends on the intensity, so while it is on the rescaling is approximate, and the limit of 1% on the change of the total power bounds the error. The 2D RZ profile is a single one for all beam groups, so a change in the ratio of the group powers does not update it, and the test sees only the change of the total power. The deposition profile stays that of the time the cache was taken while the plasma changes by up to \(\delta\).</p>
+    </section>
+
+    <section aria-labelledby="chord-raytrace">
+      <h2 id="chord-raytrace">The 1D spherical chord raytrace</h2>
+      <p>The fluid state depends only on radius, but ray kinematics are solved in a beam-local \((R,Z)\) plane to retain oblique path length and refraction. The radius \(r=\sqrt{R^2+Z^2}\) selects density, temperature, and ionization; absorbed power goes directly to the corresponding hydro cell. By spherical symmetry, the spatial direction of a beam does not change the absorption pattern. Only when all lit beams agree exactly in their power over the time step, F-number, focus on the axis, wavelength offset \(\Delta\lambda\), and intensity profile (kind, \(w_0\), \(m\), and the samples of a table profile) is one beam traced and its deposition added once per beam. If any one of these differs, each beam is traced separately with its own power. Each beam is also traced separately with the verbose log (<code>Main.verbosity="verbose"</code>), with ray output (<code>Laser.ray_output_count</code> above 0), on the steps that write a snapshot (the ray-density diagnostic needs them), and when CBET is on.</p>
+      <p>The plasma refractive index and ray equation are</p>
+      $$
+      n_{\rm refr}=\sqrt{\max(\varepsilon_n,1-\hat n)},\qquad
+      \hat n=\frac{n_e}{n_{\rm crit}},\qquad
+      \frac{d\mathbf v}{dt}=-\frac{c^2}{2}\nabla\hat n.
+      $$
+      <ul>
+        <li>\(\varepsilon_n\) (namelist <code>Laser.absorption.eps_n</code>, default \(10^{-4}\)) floors \(n_{\rm refr}\), keeping both the index and IB denominators finite at critical; the CBET prefactor uses the same floor.</li>
+        <li>\(d\mathbf v/dt=-\tfrac{c^2}{2}\nabla\hat n\) is the time-parametrized ray equation. It is motion in the effective potential \(c^2\hat n/2\), so symplectic steppers can integrate its trajectories.</li>
+        <li>\(B=n_{\rm refr}(r)r\sin\alpha\) is the spherical Bouguer invariant, expressing conservation of ray angular momentum in a radial index. Its drift is the trace-quality audit used by the verification checks (\(\alpha\) is the angle between the ray and the radial direction — defined in the next paragraph).</li>
+        <li>In \(\kappa_{\rm IB}=\hat n\nu_{ei}/[c\sqrt{1-\hat n}]\), \(\hat n\nu_{ei}\) is collisional conversion of quiver energy, \(1/\sqrt{1-\hat n}\) is group-velocity slowdown, and \(\nu_{ei}(T_e,\bar Z,\ln\Lambda)\) is evaluated in cgs + eV.</li>
+        <li>\(\Delta P=-P\operatorname{expm1}(-S)\) computes the absorption of the ray power \(P\) from the segment optical depth \(S\) (trapezoidal in marching, by quadrature in characteristic integration). Evaluating with <code>expm1</code> instead of subtracting \(1-e^{-S}\) directly avoids catastrophic cancellation in optically thin (\(S\ll1\)) segments. Each segment's loss is deposited (at its midpoint in marching) and the power updates by difference, so summing the losses along one ray telescopes — adjacent terms cancel — and reproduces the entry-minus-exit power exactly.</li>
+        <li>\(w_k\) is the profile value times the exact area of the rings that partition the aperture (<a href="beams.html#terms-launch">terms</a>), normalized over all rings, so the ray bundle carries the specified beam power. In 1D the profile is evaluated at the radius \(R_{{\rm ref},k}\) on the plane through the target center (<a href="beams.html#terms-impact">terms</a>). This plane does not move, unlike the launch plane, so the weights do not change as the launch plane moves out with the corona.</li>
+      </ul>
+      <p>For a spherically symmetric refractive index, the Bouguer invariant \(B=n_{\rm refr}(r)\,r\sin\alpha\) (with \(\alpha\) the angle between the ray and the radial direction) is constant along the path — the optical analogue of angular-momentum conservation in a central force field. At the turning point (where the radius of the ray is smallest) the ray runs perpendicular to the radius, \(\alpha=\pi/2\), so the radius of the turning point — the Bouguer radius \(r_B\) — is the solution of \(B=n_{\rm refr}(r_B)r_B\). Rays with different impact parameters \(b\) turn smoothly at different depths and undergo inverse-bremsstrahlung absorption on both the inbound and outbound legs; only a nearly head-on \(b\approx0\) ray reaches the critical surface without turning; the default characteristic integration reflects it there (marching and <code>terminate=True</code> terminate it). Example paths are shown in <a href="#fig-laser-chord-geometry">Figure A</a>.</p>
+
+      <figure id="fig-laser-chord-geometry">
+        <img src="../../../assets/laser-chord-geometry-en.png" width="900" height="560" style="max-width:100%;height:auto" alt="Chords in the meridional plane of a model spherical corona. Five rays enter from the right (the source side, Z positive) parallel to the beam axis, with impact parameters b = 0, 0.45, 0.80, 1.15, and 1.55. A ray with b not zero turns at its turning point (green dot, the Bouguer radius r_B) outside the critical surface (red dashed circle) and leaves toward the upper left; only the b = 0 ray reaches the critical surface. For the b = 0.80 ray the segment r_B from the target center to the turning point and the impact parameter b (purple dimension line) are drawn. Orange dots are inverse-bremsstrahlung deposition along each path, with area proportional to the local deposition rate, and the line width is proportional to the power the ray carries.">
+        <figcaption>Figure A. Chord geometry in the plane that contains the beam axis and the target center (the meridional plane), computed for a model corona. The abscissa is \(Z\) (target center at the origin, source side positive) and the ordinate is \(R\) (distance from the beam axis); the rays travel from right to left. For illustration the rays enter parallel to the beam axis and are distinguished by their impact parameter \(b\) (purple). Line width is the carried power, orange markers show IB deposition, the red dashed circle is the critical surface (\(\hat n=1\)), and the green dots are turning points, whose radius \(r_B\) (the Bouguer radius) solves \(n_{\rm refr}(r_B)\,r_B=B=b\). The corona is \(\hat n\approx\exp[-(r-r_c)/L]\) (\(L=0.35\,r_c\), \(r_c\) the critical radius), and the rays solve the ray equation \(d\mathbf v/dt=-\tfrac{c^2}{2}\nabla\hat n\). The \(b=0\) ray reaches the critical surface and is reflected (default characteristic integration; marching and <code>terminate=True</code> terminate it).</figcaption>
+      </figure>
+    </section>
+
+    <section aria-labelledby="lasermesh-march">
+      <h2 id="lasermesh-march">LaserMesh and marching</h2>
+      <p>In 1D spherical geometry, one beam-local \((R,Z)\) structure is induced from the radial nodes of the <a href="#terms-lasermesh">LaserMesh</a>: its \(Z\) nodes mirror the \(R\) nodes about zero. The ray kernel reads radial lookup arrays built on nodes anchored to the fluid cell faces and centers (beyond the fluid region, on the radial nodes of the LaserMesh). In 2D RZ, the single LaserMesh is aligned with the fluid symmetry axis and its node geometry remains fixed after initialization. Rays move on the LaserMesh either by the default characteristic integration in 1D (<a href="#characteristic">next section</a>) or by marching (<a href="#terms-march">terms</a>); the processing steps for these methods are listed in <a href="index.html#pipeline">the procedure section</a>.</p>
+    </section>
+
+    <section aria-labelledby="characteristic">
+      <h2 id="characteristic">Characteristic integration (the 1D default)</h2>
+      <p>By default in 1D (<code>Laser.raytrace.integrator="auto"</code>), rays are not marched in steps but integrated segment by segment along their characteristics (the <a href="#terms-march">marching</a> of step 3 below is selected with <code>"leapfrog"</code>, 1D spherical only). In a spherically symmetric field a ray conserves its angular momentum, the Bouguer invariant \(B\) defined above (the impact parameter of a ray entering from vacuum), so with \(\varepsilon=1-\hat n\) and \(Q(r)=r^2\varepsilon(r)-B^2\) (\(Q\ge0\) along the path)</p>
+      $$
+      \frac{ds}{|dr|}=\frac{\sqrt{\varepsilon}\,r}{\sqrt{Q}},\qquad
+      \frac{d\phi}{|dr|}=\frac{B}{r\sqrt{Q}},\qquad
+      d\tau=\kappa_{\rm IB}\,ds
+      $$
+      <p>are integrated over the radius (\(\phi\) is the polar angle in the meridional plane). The path is cut into segments at the nodes of the radial reference array, the hydro cell faces, and a few other radii; the turning point (\(Q=0\)), the critical surface, and the center are found exactly as events inside a segment. Each segment's path length, angle, and optical depth come from adaptive Gauss–Kronrod quadrature, with \(u=\sqrt{r-r_B}\) as the variable near the turning point at radius \(r_B\) to remove the \(1/\sqrt Q\) singularity. Every segment lies in one hydro cell, so its absorption goes directly into that cell. The method has neither the step-size error of marching nor its step refinement near turning points.</p>
+      <p>With this integrator a ray that reaches the critical radius (\(\hat n=1-\varepsilon_{\rm crit}\), with \(\varepsilon_{\rm crit}\) given by <code>Laser.absorption.eps_crit</code>) is reflected by default (<code>Laser.absorption.critical_handling.terminate=False</code>) and absorbs on the way in and out along the same segments; <code>terminate=True</code> closes the critical-layer tail analytically (the <a href="absorption.html#terms-tail-closure">tail closure</a>) and terminates the ray, as marching does. The 1D cylinder and slab (<code>Mesh.geometry_1d</code>) use the same form: the in-plane angular momentum and the axial velocity are conserved in the cylinder, the transverse velocity in the slab (a beam's <code>power</code> is per unit length in the cylinder and per unit area in the slab).</p>
+      <p>On the GPU one ray is traced by 32, 64, 128, or 256 lanes, each lane taking one segment along the path (<code>Laser.raytrace.lanes_per_ray</code>; the default 0 selects the largest lane count for which the number of rays times the lane count fits in the threads the GPU can run at once, else 32). The summation order depends on the lane count, so the rounding of the result does; for the same GPU and ray count, repeated runs are bitwise identical. Fix the lane count when comparing bitwise with a different GPU model.</p>
+      <p>A ray crosses the same segments on its way in and on its way out, and a segment's path length, angle, and optical depth depend only on its radius interval, so the outward segments take the values the inward leg computed (<code>Laser.raytrace.reuse_inward_integrals</code>, default <code>True</code>). For a ray reflected at the critical radius the results are bitwise those of integrating again. A ray that turns integrated a segment away from its turning point in \(r\) on the way in and in \(u=\sqrt{r-r_B}\) on the way out, so the reuse replaces one value of the same integral by another at the same tolerance (\(10^{-7}\) of the segment), and the absorption centroid at which the Langdon factor is evaluated moves at second order in the segment width. In 1D implosions of GXII (GEKKO XII) the results differ by as much as runs whose initial time step or laser energy differs in the 12th digit, and the runs take 7 to 12 % less time. The table takes 72 bytes of GPU memory per segment and ray (about 100 MiB for 300 cells and 1000 rays). With <code>False</code> the outward segments are integrated again.</p>
+    </section>
+
+    <section aria-labelledby="controls">
+      <h2 id="controls">Namelist controls</h2>
+      <p>The table lists the controls most directly involved in laser drive. See the <a href="../../use/namelist.html">namelist reference</a> for the full validation rules.</p>
+      <table class="quick-facts">
+        <thead><tr><th>Key</th><th>Value / unit</th><th>Purpose</th></tr></thead>
+        <tbody>
+          <tr><th><code>Laser.raytrace.integrator</code></th><td><code>"auto"</code></td><td>1D ray integrator: <code>"auto"</code> is characteristic integration (<code>"characteristic"</code>) in 1D and marching (<code>"leapfrog"</code>) otherwise.</td></tr>
+          <tr><th><code>Laser.raytrace.lanes_per_ray</code></th><td><code>0</code></td><td>Number of lanes that trace one ray in characteristic integration (32, 64, 128, or 256); 0 lets the launcher choose it from the ray count and the GPU.</td></tr>
+          <tr><th><code>Laser.raytrace.reuse_inward_integrals</code></th><td><code>True</code></td><td>In characteristic integration, take the inward leg's segment integrals for the outward segments; <code>False</code> integrates them again (the algorithm before 2026-10-03; the kernel gained arguments, so whether the results equal an earlier build's bit for bit depends on the compiler: they did with the nvcc of CUDA 12.6, while with 12.0 the multiply-add fusion changes and the last digits differ).</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section aria-labelledby="verification">
+      <h2 id="verification">Verification</h2>
+      <ul>
+        <li>Several impact parameters check the analytic Bouguer radii (the radii of the turning points) and bound the drift of the invariant.</li>
+        <li><code>test_ray_trace_characteristic</code> compares characteristic integration with closed forms for chords in a uniform medium and for radial rays through piecewise-linear profiles, and with an independent reference (a host Dormand–Prince integration of the ray equations) for the optical depth, exit point, and per-cell deposition of turning rays. It also checks agreement with a converged fine marching run, the 16/15 law, the round-trip absorption of reflection at the critical radius, closed forms in the cylinder and the slab, agreement across 32 to 256 lanes, and bitwise-identical repeated runs.</li>
+        <li>Interior \(\hat n\) and \(d\hat n/dr\) checks on a linear \(\hat n(r)\) profile independently verify the fidelity of the field and the force.</li>
+      </ul>
+    </section>
+
+    <section aria-labelledby="references">
+      <h2 id="references">References</h2>
+      <ol class="references">
+        <li>W. L. Kruer, <i>The Physics of Laser Plasma Interactions</i> (Addison-Wesley, Redwood City, 1988) — source of the linear-profile IB absorption laws and the ray-optics (Bouguer-invariant) treatment used by the analytic checks.</li>
+      </ol>
+    </section>
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["$$", "$$"], ["\\[", "\\]"]] } };</script>
+  <script defer src="../../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../../nav.js" data-page="laser-raytrace" data-root="../../"></script>
+</body>
+</html>

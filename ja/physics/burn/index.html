@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="ja" data-lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>核燃焼 — TENRYU ドキュメント</title>
+  <link rel="stylesheet" href="../../../style.css">
+  <script src="../../../theme.js"></script>
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>核燃焼 <span class="badge">reference</span></h1>
+    <p class="abstract">TENRYU の燃焼カーネル（中核は 1D 球対称で、2D RZ では <code>scheme="local"</code> と <code>"diffusion"</code> が使える）は、Bosch–Hale による DT・DD・D³He の反応率、燃料の減損（depletion）、荷電生成物の沈着または輸送、電子とイオンへのエネルギー分配を、ひとつの陽的な源（explicit source）の<a href="reactions.html#terms-stage">段階（stage）</a>としてまとめて進める。このほか、遮蔽効果（screening）、多群拡散（multigroup diffusion）とモンテカルロ（Monte Carlo）による荷電生成物の輸送、2 本の線スペクトル（line spectrum）による<a href="neutrons.html#terms-first-collision">初回衝突（first collision）</a>の中性子加熱も扱う。この頁は燃焼全体の物理機構と 1 回の段階の手順を述べ、項目ごとの詳細は下の 3 頁に分けて書く。この計算に固有の用語は、各頁の用語の節で説明する。</p>
+
+    <aside class="planned" aria-labelledby="at-a-glance">
+      <h3 id="at-a-glance">要点</h3>
+      <ul>
+        <li>既定では無効である。中核は <code>1D_SPH</code> の球面ラグランジュセルで、2D RZ への移植では <code>scheme="local"</code> と <code>"diffusion"</code> だけが使える。<code>"fraley"</code> の点源球の核（<a href="products.html#terms-fraley">用語</a>）は 1D 固有、<code>"mc"</code> は未移植、中性子加熱（<code>neutron_heating</code>）は 1D 専用なので、2D では設定検証が拒否する。<code>scheme</code> の既定値は <code>"fraley"</code> なので、2D では <code>scheme</code> を省略できず、<code>"local"</code> か <code>"diffusion"</code> を明示する。</li>
+        <li>在庫（inventory。セルごとの核種の粒子数）は密度ではなく比在庫（specific inventory）\(Y_s=n_s/\rho\) [1/g] で保持し、膨張・圧縮にともなう希釈を自動的に扱う（<a href="reactions.html#terms-inventory">在庫と比在庫</a>）。</li>
+        <li><code>scheme</code> は荷電生成物の扱いを選ぶ。中性子加熱は、これとは別の <code>neutron_heating</code> で有効にする。</li>
+        <li>核融合で解放された静止質量エネルギーは外部からの源として<a href="../../overview/numerics-foundations.html#energy-ledger">エネルギー台帳（energy ledger）</a>に記帳し、沈着分・逸出分・飛行中のエネルギーを別々に監査する（<a href="products.html#terms-ledger">飛行中と燃焼の台帳</a>）。</li>
+      </ul>
+    </aside>
+
+    <div class="card-grid">
+      <a class="card" href="reactions.html"><h3>反応率と燃料の減損</h3><p>Bosch–Hale の反応率係数、遮蔽、比在庫、部分サイクルによる燃料の減損。</p></a>
+      <a class="card" href="products.html"><h3>荷電生成物の輸送と付与</h3><p>点源球の核・多群拡散・モンテカルロ・局所沈着、電子とイオンへの分配、エネルギー台帳。</p></a>
+      <a class="card" href="neutrons.html"><h3>中性子加熱</h3><p>2 本の線スペクトルによる単一飛行・初回衝突の反跳加熱。</p></a>
+    </div>
+
+    <section aria-labelledby="mechanism">
+      <h2 id="mechanism">物理機構</h2>
+      <p>燃焼の<a href="reactions.html#terms-stage">段階</a>は、核融合の静止質量を高速の荷電生成物と中性子へ変換する。2 温度（two-temperature）のラグランジュ計算では、カーネルが Bosch–Hale の反応率係数（reactivity）による、反応チャネル（reaction channel）ごとの反応率 \(n_i n_j\langle\sigma v\rangle/(1+\delta_{ij})\) を進め、燃料を減らし、解放されたエネルギーを電子とイオンの加熱源として返す。在庫は、ラグランジュ的な不変量である<a href="reactions.html#terms-inventory">比在庫</a> \(Y_s=n_s/\rho\) として保持する。圧縮は \(\rho\) を通してのみ \(n_s\) を変えるため、流体計算が粒子を生成したり消滅させたりすることはない。比在庫で保持することで、生成時の密度を持ち越して膨張するセルを過剰に燃やす不具合を避けられる。</p>
+      <p>荷電生成物の輸送が重要なのは、3.5 MeV の α 粒子の飛程が面密度（areal density）で決まり、そのエネルギーがホットスポット（hot spot）の中に残るか外へ逃げるかで、自己加熱（self-heating）と点火余裕（ignition margin）が変わるためである。TENRYU は、意図的に階層をなす 3 つのモデルを用意している。Fraley の点源球（point-source sphere）[1] は、球幾何における局所の保持率を安価に解析的に求める（<a href="products.html#terms-fraley">点源球の核と保持率</a>）。多群拡散（multigroup diffusion）は、Corman らの多群方程式を、下端 <code>diffusion_E_min_keV</code>、上端 15.5 MeV の対数等間隔のエネルギー格子の上で解き、6 種類の生成物を、統計的なゆらぎなしに減速させる。モンテカルロ（Monte Carlo）の連続減速近似（continuous slowing-down approximation、CSDA）は、直線的に進む粒子をステップをまたいで保持する、統計的な参照解である。3 方式はいずれも同じ<a href="products.html#terms-ledger">エネルギー台帳</a>へ報告する。</p>
+      <p>高速のイオンは、エネルギーが高いうちは主にプラズマ中の電子へエネルギーを失い、減速して臨界エネルギー（critical energy。電子への損失とイオンへの損失がちょうど等しくなるエネルギー）を下回ると、イオンへの損失が支配的になる。この分配が重要なのは、イオンの加熱が次の燃焼を促す一方、電子の加熱は熱伝導と輻射へ漏れ得るからである。既定の Li–Petrasso の阻止能（stopping power）[2] に基づく分配は、初期化時に \(T_e,T_i,n_e\) の表にし、実行中は補間だけを行う。イオンへ渡るエネルギーの割合を \(f_i=1/(1+32/T_e[\mathrm{keV}])\) とする、より単純な Fraley の式 [1] は、DT の α 粒子に対してのみ残している。</p>
+      <p>中性子加熱のモデルは、燃料中の D/T に対する<a href="neutrons.html#terms-first-collision">単一飛行・初回衝突</a>の反跳（recoil）加熱で、14.049 MeV と 2.449 MeV の離散的な 2 本の線を使う。最初の衝突で平均の反跳エネルギーをその場に付与し、同じ Li–Petrasso の表で電子とイオンへ分配する。2 回目以降の飛行、カーマ（kerma。中性子相互作用が単位質量あたりに物質へ放出する運動エネルギー）、(n,2n) 反応、飛行時間（time of flight）、スペクトルの幅は明示的に省いているため、得られる分布は中性子輸送の解ではなく、燃料の自己加熱の近似である。Salpeter の 2 温度形 [3]（<a href="reactions.html#terms-screening">用語</a>）と Chugunov–DeWitt の遮蔽オプション [4] は、低温での反応率係数を変更する。Salpeter の 2 温度化は TENRYU による拡張である。核融合のエネルギーは外部からの静止質量の源として、沈着分・逸出分・飛行中の分に分けて監査する。</p>
+    </section>
+
+    <section aria-labelledby="pipeline">
+      <h2 id="pipeline">1 回の燃焼段階の手順</h2>
+      <ol>
+        <li>燃焼の段階のあいだ、各セルの密度と電子・イオン温度を一定に保つ。</li>
+        <li>有効なチャネルの反応率を計算し、2 次ルンゲ–クッタ（RK2）に必要な部分サイクルの数を各反応物の総生成率と総消費率から決めて、1 部分サイクルあたりの相対的な在庫変化を <code>eps_deplete</code> 以下に抑える。正味の変化ではなく総量を使うことで、微量の T が DD で生成され DT で消費される回転を解像できる。</li>
+        <li>5 核種のネットワークを陽的中点法で進める。提案された反応回数が反応物を使い切ってしまう場合は、在庫を再構成する前に回数を決定論的に縮小し、正値性と化学量論（stoichiometry）の収支を保つ。</li>
+        <li>必要な部分サイクルの数が <code>subcycle_max</code> に張り付いた場合は報告し、\(0.9\,dt\,M_{max}/M_{req}\) を次の燃焼の時間刻みの制限へ反映させる。これとは独立に、沈着する源のパワーに対して \(\Delta t\le f_E e_{cell}/P_{dep}\) を課す。</li>
+        <li>荷電生成物を、選択した方式（1D は <code>fraley</code>、<code>diffusion</code>、<code>mc</code>、2D RZ は <code>local</code>、<code>diffusion</code>）へ渡し、中性子は任意選択の初回衝突加熱の経路（1D 専用）へ渡す。</li>
+        <li>沈着したエネルギーを電子とイオンの源へ分配し、燃焼の台帳（沈着・逸出・飛行中）を更新して、まとめた燃焼の時間刻み制限をドライバへ渡す。</li>
+      </ol>
+    </section>
+
+    <section aria-labelledby="controls">
+      <h2 id="controls">namelist による制御</h2>
+      <p>以下は最上位の <code>Burn</code> ブロックのうち、燃焼全体に関わるキーである。ほかのキーは、そのキーを説明する頁の表にある（<a href="reactions.html#controls">反応率と燃料の減損</a>、<a href="products.html#controls">荷電生成物の輸送と付与</a>、<a href="neutrons.html#controls">中性子加熱</a>）。検証規則の全体は <a href="../../use/namelist.html">namelist リファレンス</a>を参照のこと。表の既定値は、デッキで指定しないときの値である。Studio が書き出す既定値も同じだが、<code>fuel_materials</code> は Studio では空で、利用者が指定する。Studio は燃焼を 1D 球対称の計算にだけ許し、<code>fraley</code>、<code>diffusion</code>、<code>mc</code> を書き出す。</p>
+      <table class="quick-facts">
+        <thead><tr><th>キー</th><th>既定値</th><th>用途</th></tr></thead>
+        <tbody>
+          <tr><th><code>enabled</code></th><td><code>False</code></td><td>燃焼全体の有効化スイッチ。1D では球面幾何が必須、2D RZ では <code>scheme="local"</code>/<code>"diffusion"</code> のみ有効である。</td></tr>
+          <tr><th><code>fuels</code></th><td><code>["DT","DD"]</code></td><td><code>DT</code>、<code>DD</code>、<code>D3He</code> から反応チャネルを選択。</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section aria-labelledby="verification">
+      <h2 id="verification">検証</h2>
+      <ul>
+        <li>機能を無効にした実行と基準の実行との A/B 対比較では、場が 53/53、履歴が 164/164 でビット単位に一致し、<a href="../../verification/index.html#gxii">GXII</a>（激光 XII 号、GEKKO XII）の基準解でも相対差 0 を 6 回確認した。燃焼段階の台帳の検査と、多群拡散・モンテカルロの輸送の検査は、「解放 = 沈着 + 逸出 + 飛行中の変化」という台帳の恒等式を、丸め誤差の範囲で課す。</li>
+      </ul>
+    </section>
+
+    <section aria-labelledby="references">
+      <h2 id="references">参考文献</h2>
+      <ol class="references">
+        <li>G. S. Fraley, E. J. Linnebur, R. J. Mason, and R. L. Morse, "Thermonuclear Burn Characteristics of Compressed Deuterium-Tritium Microspheres," Phys. Fluids 17, 474–489 (1974). <a href="https://doi.org/10.1063/1.1694739">doi:10.1063/1.1694739</a></li>
+        <li>C.-K. Li and R. D. Petrasso, "Charged-Particle Stopping Powers in Inertial Confinement Fusion Plasmas," Phys. Rev. Lett. 70, 3059–3062 (1993). <a href="https://doi.org/10.1103/PhysRevLett.70.3059">doi:10.1103/PhysRevLett.70.3059</a></li>
+        <li>E. E. Salpeter, "Electron Screening and Thermonuclear Reactions," Aust. J. Phys. 7, 373–388 (1954). <a href="https://doi.org/10.1071/PH540373">doi:10.1071/PH540373</a></li>
+        <li>A. I. Chugunov and H. E. DeWitt, "Nuclear Fusion Reaction Rates for Strongly Coupled Ionic Mixtures," Phys. Rev. C 80, 014611 (2009). <a href="https://doi.org/10.1103/PhysRevC.80.014611">doi:10.1103/PhysRevC.80.014611</a></li>
+      </ol>
+    </section>
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["$$", "$$"], ["\\[", "\\]"]] } };</script>
+  <script defer src="../../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../../nav.js" data-page="burn" data-root="../../"></script>
+</body>
+</html>

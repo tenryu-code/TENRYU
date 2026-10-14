@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en" data-lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Nuclear burn — TENRYU Documentation</title>
+  <link rel="stylesheet" href="../../../style.css">
+  <script src="../../../theme.js"></script>
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>Nuclear burn <span class="badge">reference</span></h1>
+    <p class="abstract">TENRYU's burn kernel (centered on 1D spherical geometry; 2D RZ accepts <code>scheme="local"</code> and <code>"diffusion"</code>) advances Bosch–Hale DT, DD, and D³He reactions, fuel depletion, charged-product deposition or transport, and electron/ion energy partition as one explicit-source <a href="reactions.html#terms-stage">burn stage</a>. The kernel also provides screening, multigroup-diffusion and Monte Carlo transport of the charged products, and two-line <a href="neutrons.html#terms-first-collision">first-collision</a> neutron heating. This page describes the physical mechanism of burn as a whole and the steps of one burn stage; the details are split over the three pages below. Terms specific to this calculation are defined in the terms section of each page.</p>
+
+    <aside class="planned" aria-labelledby="at-a-glance">
+      <h3 id="at-a-glance">At a glance</h3>
+      <ul>
+        <li>Burn is off by default. The core target is spherical <code>1D_SPH</code> Lagrangian cells; the 2D RZ port supports <code>scheme="local"</code> and <code>"diffusion"</code> only. The point-source sphere kernel (<a href="products.html#terms-fraley">terms</a>) of <code>"fraley"</code> is 1D-specific, <code>"mc"</code> is not ported, and neutron heating (<code>neutron_heating</code>) is 1D-only, so configuration validation rejects all three in 2D. The default of <code>scheme</code> is <code>"fraley"</code>, so a 2D deck cannot omit <code>scheme</code> and must name <code>"local"</code> or <code>"diffusion"</code>.</li>
+        <li>Inventories (the particle numbers of the species in a cell) are stored as specific inventories \(Y_s=n_s/\rho\) [1/g], so hydrodynamic compression and dilution do not create or destroy particles (<a href="reactions.html#terms-inventory">Inventory and specific inventory</a>).</li>
+        <li><code>scheme</code> selects charged-product treatment. Neutron heating has a separate <code>neutron_heating</code> switch.</li>
+        <li>Fusion rest-mass energy is an external source booked in the <a href="../../overview/numerics-foundations.html#energy-ledger">energy ledger</a>; deposited, escaped, and in-flight energy are audited separately (<a href="products.html#terms-ledger">In flight and the burn ledger</a>).</li>
+      </ul>
+    </aside>
+
+    <div class="card-grid">
+      <a class="card" href="reactions.html"><h3>Reaction rates and fuel depletion</h3><p>The Bosch–Hale reactivities, screening, specific inventories, and fuel depletion by subcycling.</p></a>
+      <a class="card" href="products.html"><h3>Charged-product transport and deposition</h3><p>The point-source sphere kernel, multigroup diffusion, Monte Carlo, local deposition, the electron/ion partition, and the energy ledger.</p></a>
+      <a class="card" href="neutrons.html"><h3>Neutron heating</h3><p>Single-flight first-collision recoil heating by two spectral lines.</p></a>
+    </div>
+
+    <section aria-labelledby="mechanism">
+      <h2 id="mechanism">Physical mechanism</h2>
+      <p>The burn <a href="reactions.html#terms-stage">stage</a> converts fusion rest mass into fast charged products and neutrons. In a two-temperature Lagrangian calculation, the kernel advances channel rates \(n_i n_j\langle\sigma v\rangle/(1+\delta_{ij})\) with Bosch–Hale reactivities, depletes the fuel, and returns the released energy as electron- and ion-heating sources. Inventories are <a href="reactions.html#terms-inventory">specific inventories</a> \(Y_s=n_s/\rho\), which are Lagrangian invariants: compression changes \(n_s\) through \(\rho\) alone, so hydrodynamics cannot create or destroy particles. Storing specific inventories removes the failure in which a carried-over birth density overburns an expanding cell.</p>
+      <p>Charged-product transport matters because a 3.5-MeV alpha has a range measured in areal density; whether that energy remains in the hot spot or escapes controls self-heating and ignition margin. TENRYU provides a deliberate hierarchy of three models: the Fraley point-sphere model [1] gives a cheap analytic locally retained fraction in spherical geometry (<a href="products.html#terms-fraley">Point-source sphere kernel and retained fraction</a>); multigroup diffusion solves the Corman multigroup equations [6] on a log-uniform energy grid from <code>diffusion_E_min_keV</code> to 15.5 MeV, slowing six products without statistical noise; and Monte Carlo CSDA (continuous slowing-down approximation) keeps straight-line particles between steps as the statistical reference. All three report through the same <a href="products.html#terms-ledger">energy ledgers</a>.</p>
+      <p>A fast ion initially loses energy mainly to plasma electrons; once it slows below the critical energy — the energy at which losses to electrons and to ions are exactly equal — ion losses take over. That partition matters because ion heating promotes further burn, whereas electron heating can leak through conduction and radiation. The default partition from the Li–Petrasso stopping power [2] is tabulated at initialization over \(T_e,T_i,n_e\), leaving interpolation only at runtime. The simpler Fraley law [1], which gives the fraction of the energy that goes to ions as \(f_i=1/(1+32/T_e[\mathrm{keV}])\), is retained only for DT alphas.</p>
+      <p>The neutron-heating model is single-flight, first-collision recoil heating on fuel D and T (<a href="neutrons.html#terms-first-collision">First collision and single flight</a>), with discrete 14.049- and 2.449-MeV lines. The first collision deposits the mean recoil locally and partitions it with the same Li–Petrasso table. Subsequent flights, kerma (the kinetic energy released in matter per unit mass by neutron interactions), (n,2n) breakup, time of flight, and spectrum width are omitted explicitly, so the resulting profile is a fuel-self-heating approximation rather than a neutronics answer. Salpeter two-temperature [3] (<a href="reactions.html#terms-screening">terms</a>) and Chugunov–DeWitt [4] screening modify low-temperature reactivities; the two-temperature Salpeter form is a TENRYU extension. Fusion energy is an external rest-mass source audited separately as deposited, escaped, or in-flight energy.</p>
+    </section>
+
+    <section aria-labelledby="pipeline">
+      <h2 id="pipeline">One burn stage, step by step</h2>
+      <ol>
+        <li>Hold each cell's density and electron/ion temperatures constant for the duration of the burn stage.</li>
+        <li>Compute the enabled channel rates, then the required number of RK2 subcycles from gross production and gross destruction for every reactant, targeting a relative inventory change below <code>eps_deplete</code> per subcycle. Gross rather than net control resolves the trace-tritium DD-to-DT turnover case.</li>
+        <li>Advance the five-species network with explicit-midpoint RK2. If a proposed reaction count would exhaust a reactant, deterministically scale the counts back before reconstructing inventories, preserving positivity and the stoichiometric balance.</li>
+        <li>If the required number of subcycles saturates <code>subcycle_max</code>, report it and fold \(0.9\,dt\,M_{max}/M_{req}\) into the next burn time-step limit. Independently impose \(\Delta t\le f_E e_{cell}/P_{dep}\) on deposited source power.</li>
+        <li>Hand charged products to the selected treatment (<code>fraley</code>, <code>diffusion</code>, or <code>mc</code> in 1D; <code>local</code> or <code>diffusion</code> in 2D RZ), and send neutron products through the optional first-collision heating path (1D only).</li>
+        <li>Partition deposited energy into electron and ion sources, update the burn ledger (deposited, escaped, and in-flight energy), and expose the combined burn time-step limiter to the driver.</li>
+      </ol>
+    </section>
+
+    <section aria-labelledby="controls">
+      <h2 id="controls">Namelist controls</h2>
+      <p>These are the keys of the top-level <code>Burn</code> block that concern burn as a whole. The other keys are in the tables of the pages that explain them (<a href="reactions.html#controls">Reaction rates and fuel depletion</a>, <a href="products.html#controls">Charged-product transport and deposition</a>, <a href="neutrons.html#controls">Neutron heating</a>). See the <a href="../../use/namelist.html">namelist reference</a> for complete validation rules. The defaults in the table are the values used when a deck does not set the key. Studio writes the same defaults, except that <code>fuel_materials</code> is empty in Studio and the user must set it. Studio allows burn only in 1D spherical runs and writes <code>fraley</code>, <code>diffusion</code>, or <code>mc</code>.</p>
+      <table class="quick-facts">
+        <thead><tr><th>Key</th><th>Default</th><th>Purpose</th></tr></thead>
+        <tbody>
+          <tr><th><code>enabled</code></th><td><code>False</code></td><td>Master switch; 1D requires spherical geometry, and 2D RZ accepts <code>scheme="local"</code>/<code>"diffusion"</code> only.</td></tr>
+          <tr><th><code>fuels</code></th><td><code>["DT","DD"]</code></td><td>Selects channels from <code>DT</code>, <code>DD</code>, and <code>D3He</code>.</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section aria-labelledby="verification">
+      <h2 id="verification">Verification</h2>
+      <ul>
+        <li>Disabled-versus-baseline A/B twins matched 53/53 field and 164/164 history datasets bitwise, and the <a href="../../verification/index.html#gxii">GXII</a> (GEKKO XII) golden reference showed a relative difference of 0 in six runs. The burn-stage ledger test and the diffusion and Monte Carlo transport tests require released = deposited + escaped + Δin-flight within floating-point closure.</li>
+      </ul>
+    </section>
+
+    <section aria-labelledby="references">
+      <h2 id="references">References</h2>
+      <ol class="references">
+        <li>G. S. Fraley, E. J. Linnebur, R. J. Mason, and R. L. Morse, "Thermonuclear Burn Characteristics of Compressed Deuterium-Tritium Microspheres," Phys. Fluids 17, 474–489 (1974). <a href="https://doi.org/10.1063/1.1694739">doi:10.1063/1.1694739</a></li>
+        <li>C.-K. Li and R. D. Petrasso, "Charged-Particle Stopping Powers in Inertial Confinement Fusion Plasmas," Phys. Rev. Lett. 70, 3059–3062 (1993). <a href="https://doi.org/10.1103/PhysRevLett.70.3059">doi:10.1103/PhysRevLett.70.3059</a></li>
+        <li>E. E. Salpeter, "Electron Screening and Thermonuclear Reactions," Aust. J. Phys. 7, 373–388 (1954). <a href="https://doi.org/10.1071/PH540373">doi:10.1071/PH540373</a></li>
+        <li>A. I. Chugunov and H. E. DeWitt, "Nuclear Fusion Reaction Rates for Strongly Coupled Ionic Mixtures," Phys. Rev. C 80, 014611 (2009). <a href="https://doi.org/10.1103/PhysRevC.80.014611">doi:10.1103/PhysRevC.80.014611</a></li>
+      </ol>
+    </section>
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["$$", "$$"], ["\\[", "\\]"]] } };</script>
+  <script defer src="../../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../../nav.js" data-page="burn" data-root="../../"></script>
+</body>
+</html>

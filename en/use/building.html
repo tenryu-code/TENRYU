@@ -37,7 +37,7 @@
           <tr><th>CMake</th><td>3.27 or newer</td><td>Configures C++20/CUDA targets, dependencies, and CTest.</td></tr>
           <tr><th>Ninja</th><td>Available on <code>PATH</code></td><td>Executes the generated build graph in parallel.</td></tr>
           <tr><th>Boost headers</th><td>Headers only. No version is specified; verified with 1.83</td><td>CMake searches for <code>boost/multiprecision/cpp_int.hpp</code> at configure time and stops when it is missing. On Debian/Ubuntu it can be installed with the package <code>libboost-dev</code>. For a header outside the standard locations, see <a href="requirements.html#toolchain">System requirements</a>.</td></tr>
-          <tr><th>HDF5</th><td>1.12 or newer (enabled by default)</td><td>Provides <a href="outputs.html">snapshot, history, and checkpoint</a> I/O. Rank 0 writes every file, so a serial HDF5 build suffices; a parallel HDF5 build also works but then needs MPI at link time.</td></tr>
+          <tr><th>HDF5</th><td>1.12 or newer (enabled by default)</td><td>Provides <a href="outputs/index.html">snapshot, history, and checkpoint</a> I/O. Rank 0 writes every file, so a serial HDF5 build suffices; a parallel HDF5 build also works but then needs MPI at link time.</td></tr>
           <tr><th>Python + pybind11</th><td>Python 3.10+, pybind11 2.11+ (enabled by default)</td><td>Supplies the embedded interpreter that reads the <a href="namelist.html#terms-deck">deck</a> (the single Python file that is the input to TENRYU) during initialization only.</td></tr>
           <tr><th>Optional features</th><td>MPI 3.1+ (<code>-DTENRYU_ENABLE_MPI=ON</code>); Hypre (<code>-DTENRYU_ENABLE_HYPRE=ON</code>), the linear-solver library from LLNL (Lawrence Livermore National Laboratory); the current version has no computation path that uses Hypre, so it is normally not needed</td><td>Each enabled CMake option needs its matching development package.</td></tr>
         </tbody>
@@ -89,7 +89,7 @@ ctest --test-dir build -R &lt;pattern&gt;
       <p>Add the MPI option to the same Release configuration for multi-rank runs. Run the configure command where CMake can find an MPI implementation and its headers.</p>
       <pre><code>cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DTENRYU_ENABLE_MPI=ON
 ninja -C build</code></pre>
-      <p><code>TENRYU_ENABLE_MPI</code> is a top-level CMake option whose default is <code>OFF</code>. If an existing <code>build/</code> tree is reconfigured with the option changed, run Ninja afterward so it can rebuild the affected targets. See the <a href="../physics/mpi.html">MPI decomposition</a> page for launch syntax and rank-to-GPU placement.</p>
+      <p><code>TENRYU_ENABLE_MPI</code> is a top-level CMake option whose default is <code>OFF</code>. If an existing <code>build/</code> tree is reconfigured with the option changed, run Ninja afterward so it can rebuild the affected targets. See the <a href="../overview/mpi.html">MPI decomposition</a> page for launch syntax and rank-to-GPU placement.</p>
     </section>
 
     <section aria-labelledby="ccache">

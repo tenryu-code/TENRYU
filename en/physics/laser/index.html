@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en" data-lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Laser drive &amp; absorption — TENRYU Documentation</title>
+  <link rel="stylesheet" href="../../../style.css">
+  <script src="../../../theme.js"></script>
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>Laser drive &amp; absorption <span class="badge">reference</span></h1>
+    <p class="abstract">TENRYU constructs ray bundles from beam optics and time waveforms, solves plasma refraction and inverse-bremsstrahlung (IB) absorption, and heats the electron system. The default 1D spherical path tracks chords in an \((R,Z)\) plane with radial field lookup; 2D RZ tracks 3D rays through an axisymmetric field. This page describes the physical mechanism of the whole laser drive and the procedure of one laser call; the details are split into the three pages below. Terms specific to this calculation are defined in the terms section of each page.</p>
+
+    <aside class="planned" aria-labelledby="at-a-glance">
+      <h3 id="at-a-glance">At a glance</h3>
+      <ul>
+        <li>Beam power callables are <a href="../../use/running.html#terms-freeze">frozen</a> into tables at initialization; no Python runs during the simulation.</li>
+        <li>1D <code>raytrace_2d</code> follows one chord per ring (<a href="beams.html#terms-launch">terms</a>); 2D RZ <code>raytrace_3d</code> follows 3D rays. In 1D the default characteristic integration advances each ray segment by segment (<a href="raytrace.html#terms-march">terms</a>) by quadrature from its conserved angular momentum and reflects rays at the critical radius.</li>
+        <li>IB segment losses are deposited conservatively; the power left at termination enters the balance according to the selected termination rule.</li>
+        <li>An underdense corona is required to start a cold-solid drive. It is placed either in the initial fluid mesh or, as a ghost corona, on the LaserMesh only (<a href="absorption.html#corona-requirement">practical requirement below</a>).</li>
+      </ul>
+    </aside>
+
+    <div class="card-grid">
+      <a class="card" href="beams.html"><h3>Beams &amp; ray launch</h3><p>The beam power waveform and intensity profile, the division of the launch plane into rings, and the launch radius, the radius on the plane through the target center, and the impact parameter.</p></a>
+      <a class="card" href="raytrace.html"><h3>Ray tracing</h3><p>Ray tracing along chords in 1D spherical geometry, the LaserMesh and marching, characteristic integration, beam groups, and the reuse cache.</p></a>
+      <a class="card" href="absorption.html"><h3>Absorption &amp; deposition</h3><p>The IB absorption coefficient and the deposition per segment, termination at the critical surface, the tail closure, and the requirement of a low-density corona layer.</p></a>
+    </div>
+
+    <section aria-labelledby="mechanism">
+      <h2 id="mechanism">Physical mechanism</h2>
+      <p>An electromagnetic wave in plasma obeys the dispersion relation \(\omega^2=\omega_{pe}^2+c^2k^2\). The plasma frequency \(\omega_{pe}\) rises with electron density, so to the laser the plasma is a refractive medium with index \(n=\sqrt{1-n_e/n_{\rm crit}}\) — smaller the denser the plasma. The critical density \(n_{\rm crit}\) is where the local plasma frequency reaches the laser frequency and propagation stops; it scales inversely with the square of the laser wavelength (\(\lambda^{-2}\)), so frequency-tripled 351 nm light reaches nine times higher density than the 1053 nm fundamental. As in ordinary optics, light bends toward the higher refractive index — here the low-density side — so rays bend down the density gradient, away from the dense core. Light cannot propagate beyond the critical surface: a normal-incidence ray reflects there, while an oblique ray turns around earlier, at its turning point (the radius of the turning point is the Bouguer radius, defined below). Geometric optics — treating the wave as a bundle of rays — applies because the wavelength is tiny compared with the corona's density-gradient lengths.</p>
+      <p>The plasma absorbs through inverse bremsstrahlung (IB): electrons quiver collectively in the wave field, and electron–ion collisions randomize that ordered quiver energy into heat. The conversion rate is set by the electron–ion collision frequency, giving the absorption coefficient \(\kappa_{\rm IB}\propto \hat n\,\nu_{ei}/\sqrt{1-\hat n}\) (where \(\hat n=n_e/n_{\rm crit}\) is the electron density normalized to critical) with \(\nu_{ei}\propto \bar Z n_eT_e^{-3/2}\ln\Lambda\). Since \(\nu_{ei}\) is itself proportional to \(n_e\), absorption grows as the density squared (\(\kappa_{\rm IB}\propto\hat n^2\) apart from the near-critical factor), and the \(T_e^{-3/2}\) makes cold plasma absorb more strongly. The factor \(1/\sqrt{1-\hat n}\) is the group-velocity slowdown near critical: light that travels more slowly lingers near the critical surface and absorbs more. An underdense corona represented on the grid is therefore a physical prerequisite, not a numerical convenience: at a hard vacuum–solid jump, rays reach critical with no low-density path along which absorption could have happened, and reflect essentially unabsorbed. <a href="absorption.html#corona-requirement">The practical-requirement box below</a> quantifies the consequence.</p>
+      <p>The v1 default drive is collisional IB along refracted geometric rays. On the 1D spherical raytrace path, the Langdon factor — the IB reduction from non-Maxwellian distributions — is applied by default (it turns on automatically when all beams share one gaussian / super_gaussian / flat_top profile, resolves itself to off otherwise, and can be switched off explicitly with <code>Laser.ib.langdon_model="off"</code>). Wave optics (interference and speckle) are not default terms. The collisional charge \(Z_{\rm eff}=\sum_sn_sZ_s^2/\sum_sn_sZ_s\) for mixed plasmas (\(n_s\) and \(Z_s\) are the number density and charge number of each ion species; <code>Laser.ib.zeff_model</code>) is also resolved automatically: it is on when a material supplies an <a href="../eos-opacity/ionization.html#ionization">ionization-stage table</a> or, in 1D spherical runs, a known multi-species composition (e.g. CD), and off otherwise. The remaining extended-absorption options — the Coulomb logarithm at the laser frequency (<code>Laser.ib.coulomb_log_model</code>) and resonance absorption at the turning point (<code>Laser.ra</code>) — are opt-in and off by default. All of these extensions are 1D-only; separate kernels for cross-beam energy transfer (CBET; see <a href="../lpi/cbet.html">the CBET page</a>) and for hot electrons (see <a href="../lpi/hot-electrons.html">the hot-electron page</a>) cover the laser–plasma-interaction channels that TENRYU does model.</p>
+      <p>The implementation keeps two promises: determinism and conservation. On the determinism side, beam-waveform callables are frozen into tables at initialization so no Python runs during the simulation, and per-ray deposits pass through fixed-order per-beam reductions, making the results bitwise reproducible. On the conservation side, every call closes the <a href="../../overview/numerics-foundations.html#energy-ledger">energy ledger</a> "incident = absorbed + unabsorbed" exactly; how each ray ended — critical-surface escape or deposit, mesh exit, or intensity cutoff — decides which side of that ledger receives its residual power.</p>
+    </section>
+
+    <section aria-labelledby="pipeline">
+      <h2 id="pipeline">One laser call, step by step</h2>
+      <ol>
+        <li><p><strong>Rebuild and map.</strong> Rebuild the LaserMesh (<a href="raytrace.html#terms-lasermesh">terms</a>) for the current fluid state. Around the critical surface place a fine band whose spacing is <code>mesh_factor</code> (namelist <code>Laser.lasermesh.mesh_factor</code>, default 0.5) times the smallest nearby hydro width, then coarsen geometrically toward both the core and corona. Map \(\rho,\bar Z,T_e\), form \(n_e\), and use the linear interpolant between nodes whose \(d\hat n/dr\) is its exact derivative.</p></li>
+        <li><p><strong>Build rays.</strong> Look up each beam's power from its frozen waveform table; in 1D this is the exact average \(\bar P_b\) of the piecewise-linear waveform over the time step \([t,t+\Delta t]\), so the step energies sum to the pulse integral. In 1D, launch from each ring (exact area and profile weight) a ray from its launch radius \(R_k\) along the line through the focus. When all beams have identical conditions, only one beam is traced and the others receive the same deposition (conditions: <a href="raytrace.html#chord-raytrace">the chord section</a>).</p></li>
+        <li><p><strong>Advance each ray.</strong> The 1D default characteristic integrator (section above) advances rays segment by segment by quadrature; the following describes <a href="raytrace.html#terms-march">marching</a> (<code>integrator="leapfrog"</code>) and 2D RZ. The 1D path uses variable-step velocity Verlet, re-centering the previous half-kick and current half-kick at the current position with no seed kick. The ray equation is Hamiltonian, so a symplectic integrator keeps the conserved quantity — the Bouguer invariant, in spherical symmetry — free of systematic drift. The earlier staggered leapfrog, which stores velocity a half-step apart, loses that property once the adaptive controller changes \(ds\): the phase centering breaks and each substep dissipates the Hamiltonian by \(O(|\nabla\hat n|\,|\Delta(\Delta s)|)\) (proportional to the product of the density-gradient magnitude and the change in step size) — measured as a turning point too shallow by 0.027 in \(\hat n\) and a 22% loss of round-trip optical depth. Re-taking both half-kicks at the current position removes the mismatch; the check against the analytic solution measures a turning-point error of \(1.1\times10^{-5}\) in \(\hat n\) and a 0.008% round-trip optical-depth error (the 2D RZ <code>raytrace_3d</code> also launches at speed \(\sqrt{1-\hat n}\) and advances by the same variable-step velocity Verlet). Gradient and optical-depth metrics can grow \(ds\); only the turning-angle target can shrink it. Vacuum legs end at exact chord–sphere intersections, and a vacuum-to-material hand-off pins the next lookup interval to the material side.</p></li>
+        <li><p><strong>Deposit each segment.</strong> In marching, form the trapezoidal optical depth \(S\), evaluate \(\Delta P=-P\operatorname{expm1}(-S)\), and deposit that loss at the segment midpoint. Characteristic integration evaluates the same expression with each segment's quadrature optical depth and deposits the loss in the segment's cell.</p></li>
+        <li><p><strong>Terminate.</strong> At \(\hat n\ge1-\varepsilon_{\rm crit}\) (<code>Laser.absorption.eps_crit</code>, default \(10^{-4}\)), apply the <a href="absorption.html#terms-tail-closure">tail closure</a> (the analytic closure of the near-critical remainder), then assign residual power according to the critical escape/deposit mode. The 1D default characteristic integrator instead reflects the ray at the critical radius and keeps tracing it. Mesh-exit and intensity-cutoff residuals go to unabsorbed.</p></li>
+        <li><p><strong>Reduce and check the balance.</strong> Reduce per-ray deposit rows in fixed order per beam, then heat radial hydro cells in 1D or the four bilinear neighbors in 2D RZ. Assert incident = absorbed + unabsorbed.</p></li>
+        <li><p><strong>Use or invalidate the reuse cache.</strong> When the reuse cache (<a href="raytrace.html#terms-reuse-cache">terms</a>) is enabled (<code>Laser.raytrace_skip.enabled=True</code>; off by default) and none of the conditions below holds, the rays are not traced: the deposition is formed from the stored deposition profile and the current power. If any of the conditions holds, the rays are traced again and the cache is taken anew.</p>
+          <ul>
+            <li>It is the first time step (step number 0), or no cache has been taken yet.</li>
+            <li>The plasma change \(\delta\) since the cache was taken reaches the threshold (<code>threshold</code>, default 0.01).</li>
+            <li>The cache has been reused for <code>max_consecutive</code> consecutive steps (default 10).</li>
+            <li>The total power, or in 1D the power of any single beam, changes between zero and nonzero.</li>
+            <li>The total power has changed by more than 1% since the cache was taken.</li>
+            <li>Any beam direction (the length of the unit-vector difference) changes by more than \(10^{-10}\), the focus position by more than \(10^{-10}\) cm, or the defocus (<code>defocus_DR</code>) by more than \(10^{-12}\).</li>
+            <li>An ALE (arbitrary Lagrangian–Eulerian) rezone or remap has just been performed (2D RZ only).</li>
+            <li>The test \(\hat n&gt;\hat n_{\rm margin}-\varepsilon_{\rm crit\_guard}\) gives a different result in any cell than at the cache time, i.e. that cell's \(\hat n\) crossed the band edge in either direction (\(\hat n_{\rm margin}\) is the critical clip value of the LaserMesh, <code>Laser.lasermesh.critical_margin</code>; the guard, <code>Laser.raytrace_skip.crit_guard</code>, defaults to 0.01).</li>
+            <li>CBET is on (1D only; 2D RZ runs with CBET do not use the cache) and the power of any beam has changed by more than 1% since the cache was taken (the exchange between beams makes the absorption nonlinear).</li>
+          </ul>
+          <p><code>radial_absorption_1d</code>, runs with hot electrons on, and 2D RZ runs with CBET on never use this cache.</p></li>
+      </ol>
+    </section>
+
+    <section aria-labelledby="other-modes">
+      <h2 id="other-modes">2D RZ and the simple radial mode</h2>
+      <p>In 2D RZ, <code>raytrace_3d</code> follows \((x,y,z)\), reading axisymmetric \(\hat n(R,Z)\) at \(R=\sqrt{x^2+y^2}\) and transforming its gradient by the chain rule. A circular 2D ray array represents each beam. Deposition maps through \((R,Z)=(\sqrt{x^2+y^2},z)\) to four bilinear neighbors. Beams of the same beam group (<a href="raytrace.html#terms-beam-group">terms</a>) share a trace.</p>
+      <p><code>radial_absorption_1d</code> instead attenuates \(P_{\rm total}(t)=\sum_bP_b(t)\) as one inward radial flux. Direction, F-number, focus, profile, and ray count do not affect deposition; there are no trajectories. In 1D cylindrical and planar geometries (<code>Mesh.geometry_1d</code>), <code>raytrace_2d</code> runs with the characteristic integrator (marching is spherical-only).</p>
+    </section>
+
+    <section aria-labelledby="controls">
+      <h2 id="controls">Namelist controls</h2>
+      <p>The table lists the controls most directly involved in laser drive. See the <a href="../../use/namelist.html">namelist reference</a> for the full validation rules.</p>
+      <table class="quick-facts">
+        <thead><tr><th>Key</th><th>Value / unit</th><th>Purpose</th></tr></thead>
+        <tbody>
+          <tr><th><code>Laser.enabled</code></th><td><code>bool</code></td><td>Enable the laser operator and LaserMesh.</td></tr>
+          <tr><th><code>Laser.wavelength_nm</code></th><td>nm</td><td>Vacuum wavelength used for \(n_{\rm crit}\), IB, and refraction.</td></tr>
+          <tr><th><code>Laser.mode</code></th><td><code>"raytrace_2d"</code> / <code>"radial_absorption_1d"</code> / <code>"raytrace_3d"</code></td><td>1D chord, simple 1D radial, or 3D tracing for 2D RZ.</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section aria-labelledby="verification">
+      <h2 id="verification">Verification</h2>
+      <ul>
+        <li><code>verify_gxii_1d_fld_regression</code> checks the golden absorption (about 96% under the regression deck's broad-spot twelve-beam irradiation — the golden absorbed energy, \(9.53\times10^{10}\) erg, divided by the deck's incident energy, \(9.9\times10^{10}\) erg (the integral of a trapezoidal pulse of total power \(10^{13}\) W); not comparable with the other absorption figures quoted in this documentation; <a href="../../use/examples.html#absorption-numbers">the Examples page</a> lists all three with their conditions) and implosion observables of an integrated deck that seeds a 10 µm <a href="absorption.html#corona-requirement">corona layer</a> (4 cells of 2.5 µm).</li>
+        <li>Of the L1 tests (single-physics laser tests for refraction, absorption, the energy ledger, and convergence in the ray count; see <a href="../../verification/index.html#tag-legend">test tags and terms</a>), <code>test_l1_oblique_incidence_refraction.cu</code> and <code>test_l1_beer_lambert_inverse_bremsstrahlung_slab.cu</code> only record that the deck features they need (setting the beam angle, setting the absorption coefficient in a uniform slab) are not implemented, and perform no check. <code>test_l1_laser_energy_balance_in_absorbed_escaped_reflected.cu</code> requires a relative energy-ledger error \(\le10^{-6}\), and <code>test_l1_ray_count_noise_convergence.cu</code> requires the relative difference (in the 2-norm) of the deposition map from the 257-rays-per-axis reference map to fall by a factor \(\ge1.2\) when the rays per axis increase from 65 to 129.</li>
+        <li>For L2 (laser–hydro coupling), <code>test_l2_planar_ablation_front_benchmark.cu</code> records the intended pressure comparison within 50% plus monotone front recession, and <code>test_l2_laser_to_hydro_energy_partition.cu</code> records the intended energy-partition criterion within 5% with \(f_{\rm thermal}&gt;0.3\) (the fraction of absorbed laser energy found in matter internal energy at measurement time); both remain explicit diagnostic feature gaps. <code>test_l2_oblique_beam_target_offset_symmetry.cu</code> likewise records the current offset-control feature gap.</li>
+      </ul>
+    </section>
+
+    <section aria-labelledby="references">
+      <h2 id="references">References</h2>
+      <ol class="references">
+        <li>J. P. Freidberg, R. W. Mitchell, R. L. Morse, and L. I. Rudsinski, "Resonant Absorption of Laser Light by Plasma Targets," Phys. Rev. Lett. 28, 795–799 (1972). <a href="https://doi.org/10.1103/PhysRevLett.28.795">doi:10.1103/PhysRevLett.28.795</a></li>
+        <li>D. W. Forslund, J. M. Kindel, K. Lee, et al., "Theory and Simulation of Resonant Absorption in a Hot Plasma," Phys. Rev. A 11, 679–683 (1975). <a href="https://doi.org/10.1103/PhysRevA.11.679">doi:10.1103/PhysRevA.11.679</a></li>
+        <li>A. Colaïtis, G. Duchateau, X. Ribeyre, et al., "Coupled Hydrodynamic Model for Laser-Plasma Interaction and Hot Electron Generation," Phys. Rev. E 92, 041101(R) (2015). <a href="https://doi.org/10.1103/PhysRevE.92.041101">doi:10.1103/PhysRevE.92.041101</a></li>
+      </ol>
+    </section>
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["$$", "$$"], ["\\[", "\\]"]] } };</script>
+  <script defer src="../../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../../nav.js" data-page="laser" data-root="../../"></script>
+</body>
+</html>

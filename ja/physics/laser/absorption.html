@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="ja" data-lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>吸収と沈着 — TENRYU ドキュメント</title>
+  <link rel="stylesheet" href="../../../style.css">
+  <script src="../../../theme.js"></script>
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>吸収と沈着 <span class="badge">reference</span></h1>
+    <p class="abstract">この頁は、光線に沿う逆制動輻射吸収と、吸収したパワーの沈着、臨界面での終端を述べる。吸収係数 \(\kappa_{\rm IB}\) は群速度の低下を含み、区間の光学的厚さから区間の損失を求めて、そのセルへ沈着する。臨界面に近づく光線の残りの吸収は、裾のクロージャ（tail closure）で解析的に閉じる。終端で残ったパワーは、終端の設定に従って「入射 = 吸収 + 未吸収」の台帳へ入れる。固体表面には臨界未満の低密度のコロナ層が必要で、その与え方もこの頁で述べる。この計算に固有の用語は<a href="#terms">用語の節</a>で説明する。</p>
+
+    <section aria-labelledby="terms">
+      <h2 id="terms">この計算で使う用語</h2>
+      <p>このページの計算に固有の用語は、裾のクロージャの 1 つである。</p>
+
+      <h3 id="terms-tail-closure">裾のクロージャ</h3>
+      <p><strong>裾のクロージャ（tail closure）</strong>は、臨界面に近づく光線の残りの吸収を、数値積分の代わりに解析式で閉じ、そこで光線を終える処理である。臨界面の近くでは \(\kappa_{\rm IB}\propto(1-\hat n)^{-1/2}\) が発散するので、臨界面までの経路を有限の刻みで追跡して打ち切ると、最後の刻みの吸収を過小評価する。ここで裾とは、臨界面の手前で \(\kappa_{\rm IB}\) が急に大きくなる最後の区間である。臨界面へ向けて密度勾配を上る光線について、\(\hat n\) が局所的に線形に増えて 1 に達するとみなし、残りの光学的厚さを次式で求める。</p>
+      $$
+      \tau_{\rm tail}=\frac{2A_0}{|\nabla\hat n|_0}\left(u_0-\tfrac23u_0^3+\tfrac15u_0^5\right),\qquad u_0=\sqrt{1-\hat n_0}.
+      $$
+      <p>添字 0 は処理を始める点での値、\(A_0\) は \(\kappa_{\rm IB}=A\hat n^2/\sqrt{1-\hat n}\) と書いたときの係数 \(A\) である。吸収パワー \(\Delta P=-P\operatorname{expm1}(-\tau_{\rm tail})\) を、始点を含む流体セルへ沈着する（\(\tau_{\rm tail}\) は 700 までに制限する）。光線の残りのパワーは終端の設定（<code>terminate_mode</code>。<a href="#absorption-critical">終端</a>の節）に従って扱う。</p>
+      <p>処理を始めるのは、光線が密度勾配を上っていて（\(\mathbf v\cdot\nabla\hat n&gt;0\)）、\(\hat n\ge0.5\)、\(1-\hat n&lt;A_0/|\nabla\hat n|\)、かつ局所の転回の隙間 \((1-\hat n)\sin^2\theta\) が \(4\times10^{-4}\) 未満のときである（\(\theta\) は光線の向きと密度勾配のなす角）。これより斜めの光線は閉じずに追跡を続け、自然に転回する。光線が臨界半径（\(\hat n=1-\varepsilon_{\rm crit}\)。<code>Laser.absorption.eps_crit</code>、既定 \(10^{-4}\)）に達するときは、ほかの条件を問わずに同じ式で閉じる。線形な層への垂直入射では、この式は解析積分と一致し、全吸収は 16/15 則（<a href="#verification">検証</a>）に一致する。行進と、<code>critical_handling.terminate=True</code> の特性曲線積分がこの処理を使う。既定の特性曲線積分（<code>terminate=False</code>）は、光線を臨界半径で反射させるので、この処理を評価しない。</p>
+    </section>
+
+    <section aria-labelledby="absorption-critical">
+      <h2 id="absorption-critical">IB 沈着、臨界面、終端</h2>
+      <p>逆制動輻射の吸収係数は、群速度の低下を含む \(\kappa_{\rm IB}=\hat n\,\nu_{ei}/[c\sqrt{1-\hat n}]\) である。\(\nu_{ei}\) は \(T_e\)、\(\bar Z\)、クーロン対数から cgs + eV で評価する。行進では各区間の光学的厚さ \(S=(\kappa_n+\kappa_{n+1})\Delta s/2\)（特性曲線積分では求積で求めた値）に対して、</p>
+      $$
+      \Delta P=-P_n\operatorname{expm1}(-S),\qquad P_{n+1}=P_n-\Delta P
+      $$
+      <p>とすることで、光学的に薄い領域での桁落ちを避ける。\(\Delta P\) は、行進では区間の中点へ、特性曲線積分では区間のセルへ沈着する。パワーを差分で更新しているため、1 本の光線に沿って損失を総和すると隣り合う項が打ち消し合い（望遠鏡和）、\(\sum\Delta P=P_0-P_{\rm final}\) が丸めを除いて厳密に成立する。</p>
+      <p>行進と <code>critical_handling.terminate=True</code> の特性曲線積分では、\(\hat n\ge1-\varepsilon_{\rm crit}\) で光線を終端し、係数が発散する領域へは進めない。1D の裾のクロージャ（<a href="#terms-tail-closure">用語</a>）は、進入時の係数と密度勾配から、残りの光学的厚さを解析的に閉じる。既定の <code>terminate_mode="escape"</code> は、終端時に残ったパワーを、反射・散乱で逃げた未吸収分として記帳する。<code>"deposit"</code> は、残った分を臨界面に隣接する許可された受け側へ沈着させる別のクロージャである。この投入は光路上の逆制動輻射吸収と物理的に同じではないため、意図して選ぶ必要がある。メッシュからの退出や強度の下限による打ち切りで残った分も未吸収へ入り、「入射 = 吸収 + 未吸収」の台帳を閉じる。1D の既定の特性曲線積分では <code>terminate</code> の既定が False で（<code>terminate_mode="deposit"</code> を選ぶと True のまま）、光線は臨界半径で反射し、臨界半径までの吸収を求積で数える。<code>terminate=False</code> と <code>"deposit"</code> は併用できない。</p>
+
+      <aside class="planned" aria-labelledby="corona-requirement">
+        <h3 id="corona-requirement">実務上必須：低密度のコロナ層</h3>
+        <p>低温の固体表面を、単一の密度の跳びとして置いてはならない。臨界未満の低密度のコロナ層がないと、351 nm の光線はほとんど吸収経路をもたないまま臨界面で反射する。<a href="../../verification/index.html#gxii">GXII</a> の回帰デッキからコロナ層を除くと、吸収率は 1 ns のパルス全体で約 \(4\times10^{-4}\) にとどまった（2026-07 の測定）。この状態では、加熱と膨張によるコロナを自力で立ち上げられない。コロナ層の与え方は 2 つある。</p>
+        <ul>
+          <li><strong>コロナ層（corona ramp）</strong>は、初期の流体のメッシュに置く、密度が指数関数的に下がる層である。質量をもつセルとして流体に入る。GXII の回帰デッキは、前駆プラズマ（preplasma）の種となる厚さ 10 µm の層を置く。このデッキの格子は幅 2.5 µm のセルなので、層は 4 セルで表され、臨界密度の位置は、外面に接する最初のセルの内側にある。TENRYU Studio の <a href="../../use/gui.html">Geometry セクション</a>でも同じ層を生成できる。</li>
+          <li><strong>ゴーストコロナ（ghost corona。<code>Laser.lasermesh.ghost_corona</code>）</strong>は、レーザー格子の最外の物質セルの外側にだけ置く仮想のコロナで、流体の密度、温度、質量には入らない（1D 専用）。ソルバーと Studio の既定は無効で、Studio のレーザー駆動のプリセットはすべて有効にする。</li>
+        </ul>
+        <p>2 つの違いは <a href="../mesh/1d.html#terms-ghost">1D メッシュ</a>の頁にまとめてある。</p>
+      </aside>
+    </section>
+
+    <section aria-labelledby="controls">
+      <h2 id="controls">namelist による制御</h2>
+      <p>以下は、レーザー駆動に直接関係するキーの抜粋である。検証規則の全体は <a href="../../use/namelist.html">namelist リファレンス</a>を参照のこと。</p>
+      <table class="quick-facts">
+        <thead><tr><th>キー</th><th>値 / 単位</th><th>用途</th></tr></thead>
+        <tbody>
+          <tr><th><code>Laser.absorption.critical_handling.terminate</code></th><td>特性曲線積分で <code>False</code>（<code>terminate_mode="deposit"</code> では <code>True</code>）、ほかは <code>True</code></td><td><code>False</code> では臨界半径で光線を反射させる（特性曲線積分のみ）。</td></tr>
+          <tr><th><code>Laser.absorption.critical_handling.terminate_mode</code></th><td><code>"escape"</code> / <code>"deposit"</code></td><td>臨界面での終端時に残ったパワーを、未吸収として扱うか、終端で沈着させるかを選ぶ。</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section aria-labelledby="verification">
+      <h2 id="verification">検証</h2>
+      <ul>
+        <li>線形な \(\hat n(r)\) 分布に対する通しの検査では、厚さ \(\ell\) にわたって臨界密度まで線形に上がる密度分布の 2 つの閉形式 [8] と吸収率を比較する：正面入射の細い光線に対する「Beer 16/15 則」— 片道の IB 光学的厚さが \(\tau=C\ell\int_0^1\hat n^2/\sqrt{1-\hat n}\,d\hat n=(16/15)C\ell\)（\(C\) はこの分布の IB 係数スケールで、検査は \(\sqrt{\varepsilon_n}\) の床の切り落としを差し引く）— と、斜入射のビームを積分した「\(\cos^5\) 則」— 入射角 \(\theta\) での往復吸収率 \(A=1-\exp[-(32/15)C\ell\cos^5\theta]\) — である。</li>
+      </ul>
+    </section>
+
+    <section aria-labelledby="references">
+      <h2 id="references">参考文献</h2>
+      <ol class="references">
+        <li>J. D. Huba, <i>NRL Plasma Formulary</i>, Naval Research Laboratory, NRL/PU/6770--19-652 (2019).</li>
+        <li>J. Dawson and C. Oberman, "High-Frequency Conductivity and the Emission and Absorption Coefficients of a Fully Ionized Plasma," Phys. Fluids 5, 517–524 (1962). <a href="https://doi.org/10.1063/1.1706652">doi:10.1063/1.1706652</a></li>
+        <li>T. W. Johnston and J. M. Dawson, "Correct Values for High-Frequency Power Absorption by Inverse Bremsstrahlung in Plasmas," Phys. Fluids 16, 722 (1973). <a href="https://doi.org/10.1063/1.1694419">doi:10.1063/1.1694419</a></li>
+        <li>A. B. Langdon, "Nonlinear Inverse Bremsstrahlung and Heated-Electron Distributions," Phys. Rev. Lett. 44, 575–579 (1980). <a href="https://doi.org/10.1103/PhysRevLett.44.575">doi:10.1103/PhysRevLett.44.575</a></li>
+        <li>J. P. Matte, M. Lamoureux, C. Moller, et al., "Non-Maxwellian Electron Distributions and Continuum X-Ray Emission in Inverse Bremsstrahlung Heated Plasmas," Plasma Phys. Control. Fusion 30, 1665–1689 (1988). <a href="https://doi.org/10.1088/0741-3335/30/12/004">doi:10.1088/0741-3335/30/12/004</a></li>
+        <li>D. Turnbull, J. Katz, M. Sherlock, et al., "Inverse Bremsstrahlung Absorption," Phys. Rev. Lett. 130, 145103 (2023). <a href="https://doi.org/10.1103/PhysRevLett.130.145103">doi:10.1103/PhysRevLett.130.145103</a></li>
+        <li>M. Sherlock, P. Michel, D. J. Strozzi, et al., "Inverse Bremsstrahlung Absorption Rate for Super-Gaussian Electron Distribution Functions Including Plasma Screening," Phys. Rev. E 109, 055201 (2024). <a href="https://doi.org/10.1103/PhysRevE.109.055201">doi:10.1103/PhysRevE.109.055201</a></li>
+        <li>W. L. Kruer, <i>The Physics of Laser Plasma Interactions</i> (Addison-Wesley, Redwood City, 1988) — 解析検査が使う線形分布の IB 吸収則と、Bouguer 不変量による光線光学の出典。</li>
+      </ol>
+    </section>
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["$$", "$$"], ["\\[", "\\]"]] } };</script>
+  <script defer src="../../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../../nav.js" data-page="laser-absorption" data-root="../../"></script>
+</body>
+</html>

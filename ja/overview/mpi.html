@@ -1,0 +1,215 @@
+<!doctype html>
+<html lang="ja" data-lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MPI 分割 — TENRYU ドキュメント</title>
+  <link rel="stylesheet" href="../../style.css">
+  <script src="../../theme.js"></script>
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>MPI 分割 <span class="badge">reference</span></h1>
+    <p class="abstract">TENRYU の MPI（Message Passing Interface）による領域分割（domain decomposition）は、1 ランク（rank。MPI のプロセス 1 個）に GPU（graphics processing unit）を 1 個割り当て、各ランクが全体サイズの配列を保持したまま、自分の<a href="#terms-window">所有ウィンドウ（owned window）</a>だけを更新する配置をとる。配列を所有ウィンドウだけに圧縮して局所添字で読み替える方式は採らない。分割の境界は、隣接ランクが所有する値の複製である<a href="#terms-ghost">ゴースト領域（ghost region）</a>の交換（halo exchange）で結ぶ。CUDA カーネル（GPU 上で並列に実行する関数）が作用する範囲を明示することで、1 ランクの実行は、全範囲が所有ウィンドウである同じ実装の特殊な場合になる。この計算に固有の用語は<a href="#terms">用語の節</a>で説明する。</p>
+
+    <aside class="planned" aria-labelledby="at-a-glance">
+      <h3 id="at-a-glance">要点</h3>
+      <ul>
+        <li>各ランクは同じ大域の添字空間をもち、セルと節点のうち自分が所有する範囲だけを書き換える。</li>
+        <li>ゴースト領域の幅は 2 層に固定である。交換では、所有ランクの値のビットパターンを、そのまま大域の添字位置へ上書きする。</li>
+        <li>所有部分の和をまとめる際には通常 <code>MPI_Allreduce(SUM)</code> を使うが、ランク数を変えたときのビット単位の一致（bitwise identity）は一般には保証しない。</li>
+        <li>複数ランクに対する監査（audit）が済んでいない機能は、<a href="#terms-deferral">先送りの保護（deferral guard）</a>によって黙って実行せず、ランク数が 2 以上なら、実行の開始時（一部は演算子の最初の呼び出し時）に明示的なエラーとして拒否する。2D の既定の設定（電子熱伝導が有効、輻射が多群拡散（multigroup diffusion）、中点法（midpoint scheme））はこの対象なので、そのままでは複数ランクで走らない。</li>
+      </ul>
+    </aside>
+
+    <section aria-labelledby="mechanism">
+      <h2 id="mechanism">設計原理</h2>
+      <p>前提となる制約は 3 つある。1 MPI ランクに 1 GPU を割り当てること、<a href="../physics/index.html">物理カーネル</a>が決定論的（deterministic）であること、CUDA カーネルが明示的な添字範囲の上に記述されていることである。採用した配置では、すべてのランクが全体サイズの配列を保持しつつ、各ランクはひとつのウィンドウだけを所有する。メモリと引き換えに、単純さと安全性を得る設計である。局所添字への読み替えの誤りが生じず、1 ランクでの実行は全範囲をウィンドウとする同一のコードそのものであり、演算子を MPI に対応させるには、その CUDA カーネルが作用できる範囲を狭めればよい。</p>
+      <p>それでも、ステンシル（stencil。1 つの値を求めるために読む近傍の点の組）を使う物理には、隣接ランクの状態が必要である。2 層のゴーストが、複数ランクでの検査（監査）を済ませたすべてのステンシルを覆う。幅を決めるステンシルは 2 つある。1 つは 1D の市松模様（checkerboard）の PQ フィルタで、圧力に人工粘性（artificial viscosity）による圧力を加えた全セル圧 \(P+Q\) に掛ける奇偶（odd–even）フィルタである。セル \(i\) の値を求めるのに、\(P+Q\)、密度 \(\rho\)、流体が有効なセルの印（<code>hydro_active</code>）を \(i\pm2\) のセルまで読む。もう 1 つは電子の奇偶流束（electron odd–even flux）で、1D の電子エネルギー \(e_e\) に適用する、市松ノイズ抑制の保存的な面のフィルタである。セル \(i-1\) とセル \(i\) のあいだの面に流束を立てるかどうかは、面の両側のセルに加えて、その外側のセルも 1 つずつ参照して判定するので、この面の流束はセル \(i-2\ldots i+1\) の \(e_e\) を読む。所有ウィンドウの端のセルの更新は、これらを所有ウィンドウの外側 2 セルまで読む。<a href="#terms-owner-overwrite">共有される節点の面</a>には所有側で上書きする規則を用いるので、節点の値がひとつに定まる。ゴーストは所有側の値の複製であり、所有側の値と併合されることはない。</p>
+      <p>再現性と対応範囲も明示している。所有部分は通常 <code>MPI_Allreduce(SUM)</code> で結合するため、ランク数が異なる実行のあいだでのビット単位の一致は一般には約束しない。ランク数を固定すれば、決定論的なカーネルは決定性を保つ。複数ランクに対する監査が済んでいない機能は、誤って実行されることがなく、実行の開始時にエラーで止まる。遠方のセルは設計上「<a href="#terms-stale-finite">古いが有限</a>」であってよい一方、物理の計算がそれを読んではならない。各 CUDA カーネルの起動範囲は、そのカーネルが読み書きしてよい範囲を表すので、範囲の外を読んでいないことを、ランク数を変えた実行の比較で検査できる。</p>
+      <ul>
+        <li><strong><code>cw</code>、<code>nw</code>、<code>pw</code>、<code>fw</code>:</strong> 配列の複製ではなく、CUDA カーネルを起動する範囲の役割を表す — ソースコードにだけ現れる局所変数名で、namelist にも出力ファイルにも現れない。各ウィンドウの範囲と用途は、<a href="#owned-window">所有ウィンドウによる分割の節</a>の表にある。</li>
+        <li><strong>2 層のゴースト:</strong> \(i\pm2\) を参照する市松模様の PQ フィルタと、\(i-2\ldots i+1\) に届く電子の奇偶流束が幅を決めており、監査済みの 1 層ステンシルもその内側に収まる。</li>
+        <li><strong>共有される節点の面:</strong> 隣り合うランクが同じ節点を計算する場合でも、所有側での上書きによって、節点の値がひとつに定まる。</li>
+        <li><strong>2D の配置:</strong> 平坦化した添字（flattened index）\(c=i\,n_z+j\) では、r 方向のスラブが大域配列の連続した領域になる。</li>
+      </ul>
+    </section>
+
+    <section aria-labelledby="terms">
+      <h2 id="terms">この計算で使う用語</h2>
+      <p>TENRYU の MPI 実装は、各ランクが全体サイズの配列を持つ配置をとるので、どの要素を誰が更新し、どの要素が誰からの複製であるかを表す語が要る。ここに挙げる用語は、この配置に固有の意味で使うので、まとめて定義する。ランク、集団通信、非ブロッキング通信など、MPI で一般に使う語は説明しない。</p>
+
+      <h3 id="terms-window">所有ウィンドウ</h3>
+      <p><strong>所有ウィンドウ（owned window）</strong>は、1 ランクが更新する、平坦化した添字の連続区間 <code>[begin, end)</code> である（<a href="#fig-mpi-owned-window">図A</a>の青いセル）。平坦化した添字は、2D_RZ では \(c=i\,n_z+j\)（\(i\)、\(j\) は r 方向と z 方向のセルの番号、\(n_z\) は z 方向のセル数）、1D_SPH では動径方向のセルの番号そのものである。r スラブに分けると、スラブが平坦化した添字の連続区間になるので、所有ウィンドウで表せる。所有ウィンドウはセルと節点にそれぞれあり、全ランクのセルの所有ウィンドウは、重ならずに全セルを覆う。節点の所有ウィンドウは、隣り合うランクの境界で 1 つの節点の面を共有する（<a href="#terms-owner-overwrite">共有される節点の面と所有側上書き</a>）。</p>
+      <p>各ランクは全体サイズの配列を持つので、CUDA カーネルには更新してよい範囲を <code>(begin, end)</code> で渡す必要がある。範囲を明示すると、所有ウィンドウで起動する CUDA カーネルは、各セルをちょうど 1 つのランクで更新する（全ランクが全線を計算する<a href="#terms-replicated">複製計算</a>の段を除く）。範囲の外の古い値を計算に使う誤りは、ランク数を変えた実行の比較で差として現れる（<a href="#verification">検証</a>）。1 ランクの実行では、所有ウィンドウは全範囲 <code>[0, n)</code> になる。</p>
+      <p>1D_SPH はセル列を、2D_RZ は r 方向を、ランク数（<code>mpirun</code> の <code>-n</code> に指定する値）に等しい枚数のスラブに分ける。2D_RZ で <code>Parallel.decomposition.dims</code> を指定するときは <code>[ランク数, 1]</code> に限り、指定しないときはドライバがこの値にする。セル数をスラブ数で割った余りは、番号の小さいランクから 1 セルずつ割り当てる。各ランクの所有セル数は <code>Parallel.decomposition.min_cells_per_rank</code>（既定 8）以上でなければならない。1D ではセル数がランク数とこの値の積に満たないとき、2D では r 方向のセル数をランク数で割った商（切り捨て）か z 方向のセル数がこの値に満たないとき、初期化で停止する。Studio は <code>Parallel</code> ブロックを書き出さないので、これらの既定値は<a href="../use/namelist.html#terms-deck">デッキ</a>（deck）で指定しないときの値である。</p>
+      <p>実装では、所有セルのウィンドウを <code>State::owned_cell_window(n)</code>、所有節点のウィンドウを <code>State::owned_node_window(n)</code>、所有セルの両端を隣接ランクのある側へ広げたウィンドウを <code>State::owned_cell_window_ghost(n, stride)</code> が返す。呼び出し箇所では、これらを受ける局所変数を <code>cw</code>、<code>nw</code>、<code>pw</code>、<code>fw</code> と書く（<code>pw</code> と <code>fw</code> は、流体と ALE（arbitrary Lagrangian–Eulerian、任意ラグランジュ・オイラー法）の実装で <code>owned_cell_window_ghost</code> の結果を受ける変数名である）。広げる幅は、隣接ランクがある側だけに、1D ではセル 1 個、2D では r 方向の 1 行（\(n_z\) 個のセル）である。各ウィンドウの用途は<a href="#owned-window">所有ウィンドウによる分割の節</a>の表にある。</p>
+
+      <h3 id="terms-ghost">ゴースト領域とゴースト幅</h3>
+      <p><strong>ゴースト領域（ghost region）</strong>は、所有ウィンドウのすぐ外側にある、隣接ランクが所有する値の複製である。別の局所配列ではなく、大域の添字位置にそのまま置く（<a href="#fig-mpi-owned-window">図A</a>の黄色のセル）。実装と namelist のキーでは halo という名前も使う（<code>halo_exchange</code>、<code>Parallel.halo</code>）。</p>
+      <p><strong>ゴースト幅（ghost width）</strong>は、所有ウィンドウの外側に持つ層の数である。1D ではセル 2 個、2D では r 方向の 2 行で、実装ではランク数が 2 以上のとき <code>PartitionInfo::ghost_layers</code> が 2 に固定され、1 ランクでは 0 である。リポジトリの <code>docs/NUMERICS.md</code> §12.2.1 はこの幅を \(n_{ghost}\) と書くが、コードに同名の識別子はない。namelist のキー <code>Parallel.halo.ghost_layers</code>（既定 1）は読み込まれて 1 以上かどうかを検査されるが、幅の決定には使われない。</p>
+      <p>幅 2 は、所有ウィンドウの端のセルの更新が読む最も遠い位置で決まる（<a href="#mechanism">設計原理</a>）。ゴースト領域は、所有ランクが書いたあと最初にゴーストを読む処理の前に、交換して更新する（<a href="#halo-exchange">ゴースト領域の交換</a>）。幅が 2 層より小さいと、最も広いステンシルが所有ウィンドウの外の古い値を読む。</p>
+
+      <h3 id="terms-owner-overwrite">共有される節点の面と所有側上書き</h3>
+      <p><strong>共有される節点の面（shared node plane）</strong>は、スラブの境界にあって、隣り合う 2 ランクの節点の所有ウィンドウの両方に入る節点の集まりである（r 方向の節点番号が一定の節点すべて。1D では節点 1 個）。節点の所有ウィンドウは、セルの所有ウィンドウより r 方向に節点 1 面だけ長いので、境界の節点の面は両側のランクに含まれる。両ランクは同じ入力から同じ式でこの節点を計算する。</p>
+      <p><strong>所有側上書き（owner overwrite）</strong>は、共有される節点の面の値を、2 ランクのうち番号の小さいランクの値に統一する規則である。節点の交換のとき、番号の小さいランクの値で、番号の大きいランクが持つ同じ節点の値を上書きする。この規則によって、境界の節点の位置と速度は、両側で同じビットパターンになる。セルの所有ウィンドウは重ならないので、セルにこの規則は要らず、ゴースト領域のセルが所有ランクの値で上書きされる。</p>
+
+      <h3 id="terms-stale-finite">遠方の領域と「古いが有限」</h3>
+      <p><strong>遠方の領域（far region）</strong>は、所有ウィンドウとゴースト領域の外側にある領域である。全ランクが全体サイズの配列を持つので、この領域の要素も存在するが、交換では更新されない（<a href="#fig-mpi-owned-window">図A</a>の斜線のセル）。</p>
+      <p><strong>古いが有限（stale-but-finite）</strong>は、遠方の領域の値に課す条件である。値は古くてよいが、有限でなければならず、所有ウィンドウの計算結果、収束の判定、再試行の判定、診断量のいずれにも影響してはならない。メッシュ全体を走査する CUDA カーネル（たとえばメッシュの幾何の再計算）は、遠方の領域に有限だが意味のない値を作ってよい。この条件が成り立つように、内積・最小・最大・総和の部分和は必ず所有ウィンドウに限り、メッシュの妥当性の検査も所有ウィンドウとゴースト領域だけで行う。</p>
+
+      <h3 id="terms-replicated">複製計算</h3>
+      <p><strong>複製計算（replicated computation）</strong>は、全ランクが同じ段を、同じ入力から同じ順序で重複して計算する方式である。実装の変数名（<code>replicated_radiation_1d</code> など）とリポジトリの <code>docs/NUMERICS.md</code> §12.4 は、replicated（複製）と呼ぶ。1D では、輻射（流束制限拡散（flux-limited diffusion、FLD）と離散座標法（discrete ordinates、S<sub>N</sub>））、燃焼、電子の陰解法とイオンの熱伝導、レーザーの光線追跡（ray tracing）の段に使い、2D ではレーザーの光線追跡に使う。段の前に、所有ランクの値を <code>MPI_Allgatherv</code> で全ランクの全線（2D では全メッシュ）に集めるので、入力は 1 ランクの実行と同じ値になる。結果がランク数の影響を受けず、<code>MPI_Allreduce(SUM)</code> の結合順序も入らないので、ビット単位の一致を検査できる。計算量は 1 ランクの実行と同じで、ランク数を増やしても、この段は速くならない。</p>
+
+      <h3 id="terms-deferral">先送りの保護と監査</h3>
+      <p><strong>先送りの保護（deferral guard）</strong>は、複数ランクでの使用に必要な検査をまだ終えていない機能を、ランク数が 2 以上のときにエラーとして拒否する処理である。検査を終えていない機能を実行すると、遠方の領域の古い値の参照や、ランク間の集団通信の不一致（デッドロックの原因になる）を見逃す。</p>
+      <p>この頁と実装の注釈が監査（audit）と呼ぶ検査は、その機能の CUDA カーネルが所有ウィンドウの外を読まないこと、交換が所有ウィンドウを書いた直後で最初に読む処理の前にあること、集団通信（collective communication）の呼び出しの順序と回数が全ランクで一致することの確認である。</p>
+      <p>エラー文は、現在の MPI 実装を「MPI v1」と呼ぶ（<code>MPI v1: 1D void regions are not supported multi-rank yet</code> など）。拒否は、ドライバが実行の開始時に行うものと、その機能の演算子が最初に呼ばれたときに行うものがある。拒否する機能の一覧は、<a href="#v1-scope">複数ランクで拒否する機能の節</a>の表にある。</p>
+
+      <h3 id="terms-tiers">判定の段階（ビット単位の一致、帯、包絡）</h3>
+      <p>ランク数を変えた実行の検査（ctest のラベル <code>mpi_gate</code>）は、実行の終了時に各ランクが書く所有ウィンドウのダンプ（<code>TENRYU_MPI_DUMP_OWNED</code> で出力する）を、1 ランクの実行の同じ範囲と比べる（<code>tests/parallel/run_parallel_gate.py</code>）。比べる場は、密度、電子とイオンのエネルギーと温度、質量、体積、節点の位置と速度、輻射エネルギー、レーザーの沈着、人工粘性圧である。比べ方には次の 3 つの段階があり、試験ごとに 1 つを割り当てる。</p>
+      <ul>
+        <li><strong>ビット単位の一致（bit）:</strong> すべての場の全要素が、1 ランクの実行と完全に等しい。1D の試験に使う。</li>
+        <li><strong>帯（band）:</strong> 各ランクの所有ウィンドウについて、場ごとに、1 ランクの実行との差の最大値を、1 ランクの実行の場全体の絶対値の最大値で割った値が、許容値以下である。許容値は、2D の S<sub>N</sub> と 2D の燃焼の試験で \(10^{-13}\) である。</li>
+        <li><strong>包絡（envelope）:</strong> 2D の LaserMesh の試験に使う。レーザーの沈着以外の場は、許容値 \(10^{-12}\) の帯で比べる。レーザーの沈着は、1 ランクの実行を 3 回行い、実行どうしの差から 3 つの統計量（差のある要素の ULP（unit in the last place、浮動小数点数の最下位ビットの 1 単位）距離の最大値、差のある要素の数、それらの要素が沈着量の総和に占める割合）を実行の組ごとに求め、それぞれの最大値に余裕係数 4 を掛けて上限を作る。この上限が下限（4 ULP、8 要素、割合 \(10^{-12}\)）より小さいときは、下限を使う。複数ランクの実行と 1 ランクの実行の沈着の差から同じ 3 つの統計量を求め、それがこの上限と、<code>tests/parallel/gate_caps.json</code> に記録した固定の上限（250 ULP、10500 要素、割合 1）の両方以下であれば合格である。光線の記録（<code>TENRYU_LM_INVARIANT_DUMP</code>）は、全ランクと 1 ランクの全実行で、バイト単位で一致しなければならない。</li>
+      </ul>
+      <p>1D のスナップショットの試験（<code>tests/parallel/run_snapshot_gate.py</code>）は、出力ファイルの全数値データ（metadata を除く）を、1 ランクの実行とビット単位で比べる。検証の頁の<a href="../verification/index.html#reproducibility">再現性の検査</a>に、再現性の検査の全体の分類がある。</p>
+    </section>
+
+    <section aria-labelledby="owned-window">
+      <h2 id="owned-window">所有ウィンドウによる分割</h2>
+      <p>1D_SPH は、大域のセル列を連続する動径方向のスラブへ静的に分割する。2D_RZ は r 方向のスラブで分割し、平坦化した添字 \(c=i\,n_z+j\) の上で各スラブが連続区間になるようにする。複数ランクの 2D の実行は r スラブに限り、z 方向の分割と 2 方向の分割はドライバが拒否する。局所的に詰めた配列への添字変換は行わない。すべてのランクが全体サイズの配列を確保するため、所有していない領域も同じ添字で参照できるが、物理状態を更新する権限は所有するランクだけがもつ。</p>
+      <p>実装中に現れる短いウィンドウ名（<a href="#terms-window">所有ウィンドウ</a>の用語）は、別々の配列を意味するのではなく、CUDA カーネルを起動する添字範囲の役割を表す。表に各ウィンドウの範囲と用途を示し、<a href="#fig-mpi-owned-window">図A</a>にランク 1 の範囲の例を示す。</p>
+
+      <table class="quick-facts">
+        <thead>
+          <tr><th>ウィンドウ</th><th>範囲と用途</th></tr>
+        </thead>
+        <tbody>
+          <tr><th><code>cw</code></th><td><code>State::owned_cell_window(n)</code>。所有セルの更新、診断量の部分和、内積・最小・最大の局所項に使う。</td></tr>
+          <tr><th><code>nw</code></th><td><code>State::owned_node_window(n)</code>。所有節点の位置と速度の更新に使う。共有される節点の面では両側で同じ式を評価し、交換時に所有側で上書きすることで節点の値を確定する。</td></tr>
+          <tr><th><code>pw</code></th><td><code>State::owned_cell_window_ghost(n, stride)</code> を受ける呼び出し箇所の名前の 1 つで、<code>fw</code> と同じ範囲である。所有ウィンドウの両端を、隣接ランクがある側だけ 1 セル（2D では r 方向の 1 行）広げた範囲で、近傍ステンシルの生成側や中間量を、所有ウィンドウのすぐ外側まで計算する段で使う。</td></tr>
+          <tr><th><code>fw</code></th><td><code>State::owned_cell_window_ghost(n, stride)</code> による所有+ゴーストの範囲である。所有ウィンドウの両端を、隣接ランクがある側だけ <code>stride</code> 個広げる（<code>stride</code> は 1 行のセル数で、1D では 1、2D のセルでは z 方向のセル数 \(n_z\)）ので、2 層のゴーストのうち、所有ウィンドウに隣り合う 1 層だけを含む。たとえば 1D で所有セルが <code>[4, 8)</code> のランクでは <code>[3, 9)</code> である。界面上の節点に両側のセルからの寄与が必要な力の散布や、ゴースト領域の派生量に使う。</td></tr>
+        </tbody>
+      </table>
+
+      <figure id="fig-mpi-owned-window">
+        <img src="../../assets/mpi-owned-window-decomposition-ja.png" width="960" height="530" style="max-width:100%;height:auto" alt="3 つの MPI ランクが同じ 12 セルの大域配列をもち、各ランクの所有ウィンドウ（青）、2 層のゴースト領域（濃い黄と薄い黄）、遠方の領域（灰色の斜線）に分かれる。矢印は所有ランクからゴースト領域への複製を表す。ランク 1 の下の 3 つの括弧は、所有ウィンドウにゴースト領域を加えた範囲 [2, 10)、pw / fw の範囲 [3, 9)、cw の範囲 [4, 8) を示し、pw / fw はゴースト領域のうち隣り合う 1 層だけを含む">
+        <figcaption>図A. 大域の添字空間と、ランク 1 のウィンドウの範囲（1D_SPH の模式図。12 セルを 3 ランクが 4 セルずつ所有する）。青が所有ウィンドウ、黄がゴースト領域（幅 2。濃い黄が所有ウィンドウに隣り合う層、薄い黄がその外側の層）、灰色の斜線が遠方の領域である。矢印は、所有ランクの値を隣接ランクのゴースト領域へ複製する交換を表す。括弧はランク 1 の範囲を表し、上から、所有ウィンドウにゴースト領域を加えた範囲 [2, 10)（メッシュの妥当性の検査が調べる範囲）、<code>pw</code> と <code>fw</code> の範囲 [3, 9)、<code>cw</code> の範囲 [4, 8) である。<code>pw</code> と <code>fw</code> が含むゴースト領域は隣り合う層だけで、外側の層（セル 2 と 9）は含まない。隣接ランクのない側は広げないので、ランク 0 の <code>pw</code> と <code>fw</code> は [0, 5)、ランク 2 は [7, 12) である。2D_RZ の r スラブでは、1 マスが r 方向の 1 行（\(n_z\) 個のセル）に当たる。所有セル数 4 は実装が許す最小値（ゴースト幅の 2 倍）で、既定の <code>Parallel.decomposition.min_cells_per_rank</code>（8）では 12 セルを 3 ランクに分けられない（この配置を走らせるには 4 以下に指定する）。</figcaption>
+      </figure>
+    </section>
+
+    <section aria-labelledby="halo-exchange">
+      <h2 id="halo-exchange">ゴースト領域の交換</h2>
+      <p>ゴースト幅は 2 層である（<a href="#terms-ghost">ゴースト領域とゴースト幅</a>）。1D の市松模様の PQ フィルタと電子の奇偶流束が所有ウィンドウの外側 2 セルまで参照し、1D の熱伝導の面の係数（所有ウィンドウに隣り合う 1 層のセルまで計算する。<a href="../physics/conduction/discretization.html">熱伝導の空間離散化</a>参照）、流体のコーナー力（corner force）の散布（<a href="../physics/hydrodynamics/index.html">ラグランジュ流体</a>参照）、Winslow リゾーン反復（Winslow rezoning iteration。<a href="../physics/ale/index.html">ALE</a> 参照）が必要とする 1 層も、この幅に含まれる。ゴーストは別の局所添字の領域ではなく、所有ウィンドウに隣接する大域の添字位置である。交換後は所有側の値とビット単位で一致する。</p>
+      <p>遠方の領域（<a href="#terms-stale-finite">古いが有限</a>）の値は、古くてよいが有限でなければならず、所有ウィンドウの計算結果、収束の判定、再試行の判定、診断量へ影響してはならない。このため、内積・最小・最大・総和の部分和も、必ず所有ウィンドウに限る。</p>
+      <p>交換は「所有ウィンドウを書いた直後、最初にゴーストを読む処理より前」の位置に段階的に置く。流体の入口では、エネルギー、質量、圧力、温度、密度、平均電離度といったセルの場を交換し、予測子・修正子（predictor–corrector）で位置を確定した直後には節点の位置と速度を交換する。交換の実装には、2 方向に分割した 2D のための、斜め隣接のランクとのコーナーの交換もある。ただし複数ランクの 2D の実行は r スラブに限られるので、実際に行う交換は左右の隣接ランクとの交換だけである。GPU 対応の MPI（CUDA-aware MPI）では、デバイス上で詰め込み（pack）、<code>MPI_Isend</code>/<code>MPI_Irecv</code>、<code>MPI_Waitall</code>、デバイス上での取り出し（unpack）の順に進む。GPU 対応の転送が使えない環境では、ホストを経由した中継（host staging）を挟む。</p>
+    </section>
+
+    <section aria-labelledby="windowed-kernels">
+      <h2 id="windowed-kernels">ウィンドウ化した CUDA カーネル</h2>
+      <p>更新用の CUDA カーネルは <code>(begin, end)</code> を受け取り、スレッド局所のオフセットではなく <code>absolute_index = begin + tid</code>（<code>tid</code> はスレッドの番号）を使う。したがって軸や外側境界の判定は大域の添字で行われ、1 ランクの実行と同じ意味をもつので、内部のランクが誤って物理境界用の分岐に入ることはない。セルの更新は <code>cw</code>、節点の更新は <code>nw</code> を使い、ステンシルの入力になる派生量や界面への散布では、必要な場合にかぎり <code>pw</code>/<code>fw</code> へ広げる。</p>
+      <p>2D 流体のコーナー力は <code>fw</code> の上で所有セルとゴーストセルの寄与を積み上げるため、共有する節点に必要な両側からの力が各ランクで局所的にそろい、コーナー力のための MPI 交換を追加する必要がない。2D の燃焼の荷電粒子拡散（<code>Burn.scheme="diffusion"</code>。<a href="../physics/burn/index.html">核燃焼</a>参照）の共役勾配法（conjugate gradient、CG）は、内積を所有ウィンドウの部分和と <code>MPI_Allreduce(SUM)</code> で求め、探索方向（search direction）を反復ごとにゴースト領域で交換する。2D の多群拡散輻射は、ランク分割を持たない演算子で解くので、複数ランクでは拒否する（<a href="#v1-scope">複数ランクで拒否する機能</a>参照）。1 ランクでは <code>cw</code>、<code>nw</code>、<code>pw</code>、<code>fw</code> がすべて <code>[0,n)</code> になり、全範囲での起動がそのまま逐次実行の特殊な場合になる。</p>
+    </section>
+
+    <section aria-labelledby="reductions">
+      <h2 id="reductions">縮約と再現性</h2>
+      <p>全体のエネルギー、時間刻み、ソルバの内積などは、各ランクが所有ウィンドウで部分値を作り、標準の <code>MPI_Allreduce</code> でまとめる。このように全ランクの値から 1 つの値を作る操作を、この頁では縮約（reduction）と呼ぶ。一般の <code>MPI_Allreduce(SUM)</code> は、ランク数をまたいだ浮動小数点のビット単位の一致を保証しない。加算の結合順序（summation order）は MPI の実装とランク構成に依存するため、ランク数を変えると最下位ビット（least-significant bit）が動く場合がある。リポジトリの <code>docs/NUMERICS.md</code> §12.7.3 は、この変動を許容し、結果の統計的な再現には影響しないとする。</p>
+      <p>一方、ランク数を変えてもビット単位の一致が要る 1D の段は、縮約に頼らず、各ランクが所有ランクの値を全線に集めて、同じ計算を重複して行う（<a href="#terms-replicated">複製計算</a>）。輻射（FLD、S<sub>N</sub>）、燃焼、電子の陰解法とイオンの熱伝導、レーザーの光線追跡がこれに当たり、<code>MPI_Allreduce(SUM)</code> の結合順序が結果に入らない。レーザーの沈着は、全ランクが同じ全線の配列をもつので、ランク間で足し合わせず、各ランクが所有するセルにだけ書く。CUDA カーネル内の協調グリッド（cooperative groups）による 2 段固定の縮約も、カーネルの起動構成（ブロック数）が同じであれば決定論的だが、グリッドサイズを変えれば加算の順序も変わるため、許容誤差の範疇の変更になる。したがって「MPI 実行はすべてビット単位で一致する」という包括的な主張はしない。</p>
+    </section>
+
+    <section aria-labelledby="v1-scope">
+      <h2 id="v1-scope">複数ランクで拒否する機能（先送りの保護）</h2>
+      <p>監査が済んでいない演算子を、ウィンドウ化した状態に対して暗黙のうちに実行すると、遠方領域の参照や集団通信の回数の不一致を見逃してしまう。このため、未対応の機能と <code>n_ranks&gt;1</code>（ランク数が 2 以上）の組合せは、<a href="#terms-deferral">先送りの保護</a>が明示的に失敗させる。拒否は、ドライバが実行の開始時に行うものと、その機能の演算子が最初に呼ばれたときに行うものがあり、namelist の検証では見つからない（検証はランク数を知らない）。次の表に、拒否する機能を示す。</p>
+
+      <table class="quick-facts">
+        <thead>
+          <tr><th>機能</th><th>namelist のキーと条件</th><th>備考</th></tr>
+        </thead>
+        <tbody>
+          <tr><th>多ブロックメッシュ（multiblock mesh。<a href="../physics/mesh/2d.html">2D メッシュ</a>）</th><td><code>Mesh.<wbr>topology_scheme</code> が <code>"single_block"</code> 以外</td><td>r スラブの交換が、単一ブロックの構造格子の添字空間を前提にするため。</td></tr>
+          <tr><th><code>reale_v2</code>（メッシュの接続関係を作り直すリゾーン・リマップ。<a href="../physics/ale/reale-v2.html#reale-v2">ALE</a> 参照）</th><td><code>Numerics.<wbr>ale.<wbr>mesh_mode="reale_v2"</code></td><td>1 ランクに限る。</td></tr>
+          <tr><th>帯 ALE（band ALE）の物理コーナー輸送（physical corner transport。<a href="../physics/ale/index.html">ALE</a> 参照）</th><td><code>Numerics.<wbr>ale.<wbr>band_ale.<wbr>transaction_transport</code> が解決後に <code>"physical_corner"</code> になる設定</td><td>1 ランクに限る。<code>"auto"</code> は、デッキから 1 回だけ解決した値で判定する。</td></tr>
+          <tr><th>PLIC（piecewise linear interface calculation、区分線形界面法）による材料体積のリマップ</th><td><code>Numerics.<wbr>plic.<wbr>enabled</code></td><td>ALE のステップを実行するときに拒否する。</td></tr>
+          <tr><th>中点法</th><td>2D_RZ の <code>Numerics.<wbr>hydro.<wbr>time_integration="midpoint_v1"</code>（既定）</td><td><code>"pc_v0"</code>（予測子・修正子法）を明示する。1D には適用されない。</td></tr>
+          <tr><th>Braginskii 粘性（<a href="../physics/hydrodynamics/plasma-viscosity.html">プラズマ粘性</a>）</th><td><code>Numerics.<wbr>hydro.<wbr>plasma_viscosity.<wbr>enabled</code></td><td>1D と 2D の両方で拒否する。</td></tr>
+          <tr><th>1D のボイド（void）セル（<a href="../physics/eos-opacity/index.html#void-materials">ボイド材料</a>）</th><td><code>cell_is_void</code> が立つセル（<code>Material.is_void</code> の材料だけで満たされたセル）を 1 つでも含む 1D の構成</td><td>ボイドの連なりを全線で走査する処理が、複数ランクに対応していないため。</td></tr>
+          <tr><th>1D の適応人工粘性（adaptive artificial viscosity）</th><td><code>Numerics.<wbr>hydro.<wbr>adaptive_av.<wbr>enabled</code>（<code>Numerics.<wbr>hydro.<wbr>av_type="vnr"</code> のとき）</td><td>先頭の衝撃波を全線から探す処理が、複数ランクに対応していないため。</td></tr>
+          <tr><th>CSW98（Caramana–Shashkov–Whalen 1998）の感度ガード（sensitivity guard）</th><td><code>Numerics.<wbr>hydro.<wbr>csw98_av_sensitivity_guard_enabled</code></td><td>1 ランクに限る。</td></tr>
+          <tr><th>材料別の保存（per-material conservation）</th><td><code>Numerics.<wbr>materials.<wbr>per_material_conservation_enabled</code></td><td>材料ごとの状態方程式（equation of state、EOS）への射影が、ランク分割を持たないため。1D と 2D の両方で拒否する。</td></tr>
+          <tr><th>2D の電子熱伝導（<a href="../physics/conduction/discretization.html">熱伝導の空間離散化</a>）</th><td>2D_RZ で <code>Numerics.<wbr>conduction.<wbr>enabled</code>（既定 True）</td><td>2D の熱伝導は節点局所の演算子（node-local operator）で動き、ランクをまたぐ交換を持たないため。</td></tr>
+          <tr><th>SNB（Schurtz–Nicolaï–Busquet）の非局所熱伝導（<a href="../physics/conduction/snb.html#snb">SNB</a>）</th><td><code>Numerics.<wbr>conduction.<wbr>nonlocal_model="snb"</code></td><td>1D と 2D の両方で拒否する。</td></tr>
+          <tr><th>2D の多群拡散輻射（<a href="../physics/radiation/fld.html">多群 FLD</a>）</th><td>2D_RZ で <code>Radiation.<wbr>enabled</code>（既定 True）かつ <code>Radiation.<wbr>mode="multigroup_diffusion"</code>（既定）</td><td>ランクをまたぐ交換を持たない演算子で解くため。2D の <code>"sn_transport"</code> と、1D の多群拡散は使える。</td></tr>
+          <tr><th>CBET（交差ビームエネルギー転送、cross-beam energy transfer。<a href="../physics/lpi/cbet.html">CBET</a>）</th><td><code>Laser.enabled</code> のとき <code>Laser.<wbr>cbet.<wbr>enable</code></td><td>全メッシュにわたる光線の計算を、ランクに分割していないため。</td></tr>
+          <tr><th>ホット電子（hot electron。<a href="../physics/lpi/hot-electrons.html">ホット電子</a>）</th><td><code>Laser.enabled</code> のとき <code>Laser.<wbr>hot_electron.<wbr>enable</code></td><td>全メッシュにわたる輸送の計算を、ランクに分割していないため。</td></tr>
+          <tr><th>個別ビーム（individual beams）</th><td><code>Laser.enabled</code> のとき <code>Laser.<wbr>individual_beams.<wbr>enable</code></td><td>ビームごとに別の方位角で光線を追跡する検証用の機能で、1 ランクに限る。</td></tr>
+        </tbody>
+      </table>
+
+      <p><code>midpoint_v1</code> は 2D 流体の既定の時間積分である。現在のドライバは、ランク数が 2 以上の 2D で <code>Numerics.hydro.time_integration="midpoint_v1"</code>（2D の既定値。1D には適用されない）を検出すると、中点法の内部がランク分割されていないことを示す明示的なエラーで拒否する。したがって複数ランクの 2D デッキでは <code>time_integration="pc_v0"</code> を明示する必要がある。電子熱伝導、多群拡散の輻射、中点法は 2D の既定でいずれも有効なので、2D のデッキを複数ランクで走らせるには、<code>Numerics.conduction.enabled=False</code> とし、輻射を <code>"sn_transport"</code> にするか無効にする必要もある。対応していない経路へ黙って退避せず、実行前に構成を止める。</p>
+    </section>
+
+    <section aria-labelledby="pipeline">
+      <h2 id="pipeline">MPI による 1 ステップ</h2>
+      <ol>
+        <li><p><strong>所有ウィンドウの処理を起動する。</strong> 各演算子は <code>cw</code> または <code>nw</code> を通じて、所有するセル・節点の範囲だけを更新し、所有する要素だけから部分和を作る。</p></li>
+        <li><p><strong>ステンシルの入力を作る範囲を広げる。</strong> ゴースト領域の最も内側の層で中間量を作る必要がある処理は、範囲を <code>pw</code> または <code>fw</code> へ広げる。遠方の領域の要素は、読み書きの対象外のままである。</p></li>
+        <li><p><strong>ゴースト領域を更新する。</strong> 所有ランクが書き込んだあと、最初にゴーストを読む処理より前に、場をデバイス上で詰め込み、非ブロッキングの送受信（non-blocking send/receive）、待ち合わせ、2 層のゴーストへの取り出し、という順で交換する。GPU 対応の MPI が使えない場合にかぎり、ホストを経由した中継を挟む。</p></li>
+        <li><p><strong>全体量をまとめる。</strong> 所有部分のエネルギー、時間刻みの制限、ソルバの内積を、適切な <code>MPI_Allreduce</code> でまとめる。加算する量には通常 <code>SUM</code> を使う。</p></li>
+        <li><p><strong>LaserMesh を同期する。</strong> LaserMesh は、レーザーの光線追跡に使う格子である（<a href="../physics/laser/raytrace.html#lasermesh-march">レーザー</a>参照）。光線追跡の前に、密度、電子温度、平均電離度、物質の体積分率、節点の位置を、1D では全線に、2D では全メッシュに <code>MPI_Allgatherv</code> で集める。1D では、全ランクがこの全線で光線を追跡し（<a href="#terms-replicated">複製計算</a>）、沈着は自ランクが所有するセルにだけ書く。2D の LaserMesh への写像では、各ランクが、所有するセルの値（電子密度、電子温度、平均電離度）、重心、面積、ボイドの印と、所有する節点列の座標を、ほかを 0 にした全格子の配列に書き、1 回の <code>MPI_Allreduce(SUM)</code> で全ランクに集める。各要素に寄与するランクは 1 つだけなので、和は所有ランクの値そのものである。全ランクが、集めた格子から LaserMesh の全節点を同じ手順で写像し、同じ場で光線を追跡する。沈着は、光線が通った流体のセルへ直接置き、自ランクが所有するセルの値だけを残す（ほかのセルは 0 にする）。</p></li>
+        <li><p><strong>対応範囲を検査する。</strong> 複数ランク向けに CUDA カーネル、交換、集団通信の順序が監査されていない機能は、ドライバが実行の開始時に、または演算子が最初に呼ばれたときに拒否する（<a href="#v1-scope">複数ランクで拒否する機能</a>）。</p></li>
+      </ol>
+    </section>
+
+    <section aria-labelledby="controls">
+      <h2 id="controls">ビルドと実行のメモ</h2>
+      <table class="quick-facts">
+        <thead>
+          <tr><th>項目</th><th>指定</th><th>意味</th></tr>
+        </thead>
+        <tbody>
+          <tr><th>MPI ビルド</th><td><code>cmake -S . -B build -DTENRYU_ENABLE_MPI=ON</code></td><td>標準の CMake のオプションで MPI 対応を有効にする（既定は OFF）。</td></tr>
+          <tr><th>起動</th><td><code>mpirun -n N ./build/tenryu run &lt;deck.py&gt;</code></td><td><code>N</code> 個のランクを起動する。基本の配置は 1 ランク = 1 GPU である。各ランクは、同じノードにあるランクの中での番号を、そのノードで見える GPU の数で割った余りの GPU を使う。</td></tr>
+          <tr><th>先送りの保護</th><td>未対応の機能 + <code>n_ranks&gt;1</code></td><td>ドライバが実行の開始時（一部は演算子の最初の呼び出し時）に明示的に停止する。黙って別経路へ退避したり、監査のないまま実行を続けたりはしない。</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section aria-labelledby="verification">
+      <h2 id="verification">検証</h2>
+      <ul>
+        <li>ランク数を変えた実行の検査は、1 ランクの実行を参照とし、デッキごとに<a href="#terms-tiers">判定の段階</a>（ビット単位の一致、帯、包絡）を割り当てる。1D の試験はビット単位の一致、2D の S<sub>N</sub> と燃焼の試験は帯（許容値 \(10^{-13}\)）、2D の LaserMesh の試験は包絡で判定する。</li>
+        <li><code>parallel_halo_exchange_np2</code> と <code>parallel_halo_exchange_np4</code> は、ゴースト領域の交換だけを検査する。各ランクが所有ウィンドウにランク番号を含む整数値を書き、交換後に、所有ウィンドウの外側 2 層が所有ランクの値と厳密に等しいこと、その外側が初期値のまま変わらないこと、共有される節点の面が番号の小さいランクの値になっていること（所有側での上書き）を、整数値の完全な一致で確かめる。調べる分割は、1D のスラブ、2D の r スラブ、2D の z スラブと、4 ランクのときの 2×2 分割（セルだけ。コーナーのゴーストを含む）である。</li>
+        <li>1D では、スナップショット・チェックポイント・履歴をランク 0 が全体サイズの配列から書く。各ステップの終わり（とステップ 0 の出力の前）に、所有ランクだけが更新する場（流体、状態方程式の計算結果、セルとともに動く輻射エネルギー、節点の位置と速度）を全ランクで集めるので、出力は所有ランクの値になる（2026-09-26。それより前に複数ランクで書いた 1D の出力とチェックポイントでは、他のランクの所有セルの値が古かった）。輻射駆動のカプセルのデッキ（FLD、燃焼とイオン熱伝導あり、360 セル、6 ns まで）では、1・2・4 ランクのスナップショットがビット単位で一致する。</li>
+        <li><code>ctest --test-dir build -L mpi_gate --output-on-failure</code> は、現在 13 ケースの MPI 試験を実行する。内訳を次の表に示す。1 ランクの実行との比較は、スナップショットの 2 件を除く 11 件が所有ウィンドウのダンプで行い、スナップショットの 2 件は出力ファイルの全数値データで行う。</li>
+      </ul>
+
+      <table class="quick-facts">
+        <thead>
+          <tr><th>試験（ctest の名前）</th><th>対象</th><th>ランク数</th><th>判定の段階</th></tr>
+        </thead>
+        <tbody>
+          <tr><th><code>parallel_gate_<wbr>rad1d_fld_np2</code>、<code>parallel_gate_<wbr>rad1d_fld_np4</code></th><td>1D の FLD（2 温度、流体あり）</td><td>2、4</td><td>ビット単位の一致</td></tr>
+          <tr><th><code>parallel_gate_<wbr>rad1d_fld_gap_np2</code></th><td>ランクの境界をまたぐ、ほぼ透明な層をもつ 1D の FLD</td><td>2</td><td>ビット単位の一致</td></tr>
+          <tr><th><code>parallel_gate_<wbr>rad1d_sn_np2</code></th><td>1D の S<sub>N</sub></td><td>2</td><td>ビット単位の一致</td></tr>
+          <tr><th><code>parallel_gate_<wbr>burn1d_np2</code></th><td>1D の燃焼（輻射なし）</td><td>2</td><td>ビット単位の一致</td></tr>
+          <tr><th><code>parallel_gate_<wbr>burn1d_conduction_implicit_np2</code>、<code>parallel_gate_<wbr>burn1d_conduction_sts_np2</code></th><td>1D の燃焼に、電子の熱伝導（陰解法、またはスーパータイムステッピング（super-time-stepping、STS）。<a href="../physics/conduction/time-integration.html#sts">熱伝導の時間積分</a>参照）とイオンの熱伝導を加える。電子温度は 5 keV から 1 keV へ直線的に下がり、イオン温度はその半分である</td><td>2</td><td>ビット単位の一致</td></tr>
+          <tr><th><code>parallel_gate_<wbr>gxii1d_np2</code></th><td>GXII（激光 XII 号、GEKKO XII。<a href="../verification/index.html#gxii">検証</a>参照）の 1D デッキ（レーザー、S<sub>N</sub>、流体、50 ステップ）</td><td>2</td><td>ビット単位の一致</td></tr>
+          <tr><th><code>parallel_snapshot_gate_<wbr>burn1d_conduction_implicit_np2</code>、<code>parallel_snapshot_gate_<wbr>gxii1d_np2</code></th><td>上の 2 つのデッキ（燃焼と電子の陰解法、GXII）のスナップショット</td><td>2</td><td>全数値データのビット単位の一致</td></tr>
+          <tr><th><code>parallel_gate_<wbr>sn2d_np2</code></th><td>2D の S<sub>N</sub>（高温の円板と低温の浴、2 温度の物質と流体を連成、25 ステップ）</td><td>2</td><td>帯（許容値 \(10^{-13}\)）</td></tr>
+          <tr><th><code>parallel_gate_<wbr>burn2d_np2</code></th><td>2D の燃焼（高温の DT（重水素・三重水素、deuterium–tritium）の円板、<code>Burn.scheme="diffusion"</code>、25 ステップ）</td><td>2</td><td>帯（許容値 \(10^{-13}\)）</td></tr>
+          <tr><th><code>parallel_gate_<wbr>lm2d_np4</code></th><td>2D の LaserMesh（<code>Laser.mode="raytrace_3d"</code>、軸方向の 1 ビーム、3 ステップ）</td><td>4</td><td>包絡（沈着以外の場は許容値 \(10^{-12}\) の帯）</td></tr>
+        </tbody>
+      </table>
+    </section>
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["\\[", "\\]"]] } };</script>
+  <script defer src="../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../nav.js" data-page="mpi" data-root="../"></script>
+</body>
+</html>

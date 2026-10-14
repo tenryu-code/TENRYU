@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="ja" data-lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>中性子加熱 — TENRYU ドキュメント</title>
+  <link rel="stylesheet" href="../../../style.css">
+  <script src="../../../theme.js"></script>
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>中性子加熱</h1>
+    <p class="abstract">この頁は、DT と DD の中性子による燃料の加熱を述べる。モデルは、2 本の線スペクトル（line spectrum）をもつ中性子の<a href="#terms-first-collision">単一飛行・初回衝突（single flight, first collision）</a>の反跳（recoil）加熱で、1D 専用である。この頁の計算に固有の用語は<a href="#terms">用語の節</a>で説明する。</p>
+
+    <section aria-labelledby="neutrons">
+      <h2 id="neutrons">中性子加熱</h2>
+      <p><code>neutron_heating=True</code>（1D 専用）にすると、DT の 14.049 MeV と DD の 2.449 MeV の中性子を等方に放出し、<code>neutron_heating_n_mu</code> 点のガウス–ルジャンドル求積（Gauss–Legendre quadrature）で球殻を横切る弦（chord）をたどる。減衰は燃料中の D/T による弾性散乱断面積（elastic-scattering cross section）だけから求め、最初の衝突で平均の反跳エネルギーをそのセルへ局所的に沈着させる（<a href="#terms-first-collision">初回衝突と単一飛行</a>）。反跳した D/T の電子・イオンへの分配には、Li–Petrasso の表を再利用する。散乱後に残る中性子のエネルギーは <em>degraded</em>（減速後）、外面から出る分は <em>escaped</em>（逸出）として記帳する。</p>
+      <p>このモデルは単一飛行である。減速した中性子の多重飛行、シェル材料のカーマ、(n,2n) 反応、飛行時間による遅れ、反跳スペクトルの幅は含まない。したがって中性子加熱の空間分布を解釈する際は、燃料の自己加熱に対する初回衝突の近似として扱うこと。</p>
+    </section>
+
+    <section aria-labelledby="terms">
+      <h2 id="terms">この計算で使う用語</h2>
+      <p>中性子加熱は、この計算に固有の取り扱いで組み立てる。ここに挙げる用語は、TENRYU の実装に固有の意味で使うので、まとめて定義する。</p>
+
+      <h3 id="terms-first-collision">初回衝突と単一飛行</h3>
+      <p><strong>初回衝突（first collision）</strong>は、中性子が燃料の D または T と起こす最初の弾性散乱である。</p>
+      <p><strong>単一飛行（single flight）</strong>は、各中性子を放出点から球の外面まで 1 本の直線（弦）に沿って 1 回だけ飛ばし、最初の衝突のあとで散乱した中性子を追跡しないという取り扱いである。</p>
+      <p>中性子は 2 本の線、DT の 14.049 MeV と DD の 2.449 MeV で放出する。放出するセルの中心の半径から、方向余弦 \(\mu\) を偶数次のガウス–ルジャンドル求積で刻んで等方に放出し（\(\mu\) の点の数は <code>neutron_heating_n_mu</code>。既定 16、2 以上 64 以下の偶数）、各方向の弦を球殻の境界ごとにたどる。殻の区間 \(\Delta s\) で衝突する割合は \(T_{rem}(1-e^{-\Sigma\Delta s})\) である。\(\Sigma=n_D\sigma_D+n_T\sigma_T\) は燃料の D と T の弾性散乱の巨視断面積（数密度 \(n_D\)、\(n_T\) は在庫 \(\rho Y_s\) から作る）、\(T_{rem}\) はそこまでの透過率である。燃料以外の材料、⁴He、p は透明として扱う。衝突した中性子のエネルギーのうち、反跳した核が受け取る平均の割合 \(f\) を、その殻のセルへ沈着させ、電子とイオンへの分配には Li–Petrasso の表の反跳用の項目を使う。残りの \(1-f\) は、散乱した中性子が持ち去る分として追跡せず、台帳に degraded（減速後）として記帳する。衝突しなかった分は escaped（逸出）として記帳する。</p>
+      <p>断面積 \(\sigma\) と平均の割合 \(f\) は、コードに固定した次の値である。</p>
+      <table class="quick-facts">
+        <thead><tr><th>中性子の線</th><th>標的</th><th>弾性散乱の断面積 \(\sigma\) [b]</th><th>反跳核が受け取る平均の割合 \(f\)</th></tr></thead>
+        <tbody>
+          <tr><th rowspan="2">DT、14.049 MeV</th><td>D</td><td>0.63</td><td>0.3157</td></tr>
+          <tr><td>T</td><td>0.94</td><td>0.2053</td></tr>
+          <tr><th rowspan="2">DD、2.449 MeV</th><td>D</td><td>2.31</td><td>0.4447</td></tr>
+          <tr><td>T</td><td>2.30</td><td>0.3756</td></tr>
+        </tbody>
+      </table>
+      <p>このモデルは、中性子輸送の解ではなく、燃料の自己加熱への初回衝突の寄与の近似である。1D 専用で、<code>partition="fraley"</code> とは併用できない。</p>
+    </section>
+
+    <section aria-labelledby="controls">
+      <h2 id="controls">namelist による制御</h2>
+      <p>以下は最上位の <code>Burn</code> ブロックのうち、中性子加熱に関わるキーである。燃焼全体のキーは<a href="index.html#controls">概要の頁</a>にある。表の既定値は、デッキで指定しないときの値である。</p>
+      <table class="quick-facts">
+        <thead><tr><th>キー</th><th>既定値</th><th>用途</th></tr></thead>
+        <tbody>
+          <tr><th><code>neutron_heating</code></th><td><code>False</code></td><td>2 本の線スペクトルによる初回衝突の中性子加熱。1D 専用で、2D RZ では拒否される。</td></tr>
+          <tr><th><code>neutron_heating_n_mu</code></th><td><code>16</code></td><td>等方放出の弦に対する μ 求積の点の数（2 以上 64 以下の偶数）。</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section aria-labelledby="verification">
+      <h2 id="verification">検証</h2>
+      <ul>
+        <li>単体試験 <code>test_burn_neutron_heating</code> は、中性子加熱に固定した定数表（断面積と反跳の割合）、光学的に薄い極限、球に対する解析的な減衰、「放出 = 沈着 + 減速後 + 逸出」を判定する。</li>
+      </ul>
+    </section>
+
+    <section aria-labelledby="references">
+      <h2 id="references">参考文献</h2>
+      <ol class="references">
+        <li>H. Brysk, "Fusion Neutron Energies and Spectra," Plasma Phys. 15, 611–617 (1973). <a href="https://doi.org/10.1088/0032-1028/15/7/001">doi:10.1088/0032-1028/15/7/001</a></li>
+      </ol>
+    </section>
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["$$", "$$"], ["\\[", "\\]"]] } };</script>
+  <script defer src="../../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../../nav.js" data-page="burn-neutrons" data-root="../../"></script>
+</body>
+</html>

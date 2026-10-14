@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en" data-lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Absorption &amp; deposition — TENRYU Documentation</title>
+  <link rel="stylesheet" href="../../../style.css">
+  <script src="../../../theme.js"></script>
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>Absorption &amp; deposition <span class="badge">reference</span></h1>
+    <p class="abstract">This page describes inverse-bremsstrahlung absorption along a ray, the deposition of the absorbed power, and termination at the critical surface. The absorption coefficient \(\kappa_{\rm IB}\) includes the reduction of the group velocity; the loss of each segment follows from its optical depth and is deposited in its cell. The remaining absorption of a ray approaching the critical surface is closed analytically by the tail closure. The power left at termination enters the “incident = absorbed + unabsorbed” ledger according to the termination setting. A solid surface needs an underdense, low-density corona layer, and the page also describes how to provide one. Terms specific to this calculation are defined in the <a href="#terms">terms section</a>.</p>
+
+    <section aria-labelledby="terms">
+      <h2 id="terms">Terms used in this calculation</h2>
+      <p>The one term specific to the calculation on this page is the tail closure.</p>
+
+      <h3 id="terms-tail-closure">Tail closure</h3>
+      <p>The <strong>tail closure</strong> closes the remaining absorption of a ray that approaches the critical surface with an analytic expression instead of numerical integration, and ends the ray there. Near critical \(\kappa_{\rm IB}\propto(1-\hat n)^{-1/2}\) diverges, so tracing the path to the critical surface in finite steps and cutting it off underestimates the absorption of the last step. The tail here is the last stretch before the critical surface, where \(\kappa_{\rm IB}\) grows quickly. For a ray that climbs the density gradient toward the critical surface, \(\hat n\) is taken to rise linearly to 1 locally, and the remaining optical depth is</p>
+      $$
+      \tau_{\rm tail}=\frac{2A_0}{|\nabla\hat n|_0}\left(u_0-\tfrac23u_0^3+\tfrac15u_0^5\right),\qquad u_0=\sqrt{1-\hat n_0}.
+      $$
+      <p>The subscript 0 denotes the value at the point where the closure starts, and \(A_0\) is the coefficient \(A\) in \(\kappa_{\rm IB}=A\hat n^2/\sqrt{1-\hat n}\). The absorbed power \(\Delta P=-P\operatorname{expm1}(-\tau_{\rm tail})\) is deposited in the fluid cell that contains the starting point (\(\tau_{\rm tail}\) is limited to 700), and the remaining power follows the termination mode (<code>terminate_mode</code>; see <a href="#absorption-critical">termination</a>).</p>
+      <p>The closure starts when the ray moves up the density gradient (\(\mathbf v\cdot\nabla\hat n&gt;0\)), \(\hat n\ge0.5\), \(1-\hat n&lt;A_0/|\nabla\hat n|\), and the local turning gap \((1-\hat n)\sin^2\theta\) is below \(4\times10^{-4}\) (\(\theta\) is the angle between the ray direction and the density gradient); a more oblique ray is not closed and keeps being traced until it turns by itself. When a ray reaches the critical radius (\(\hat n=1-\varepsilon_{\rm crit}\); <code>Laser.absorption.eps_crit</code>, default \(10^{-4}\)), it is closed with the same expression whatever the other conditions. In a linear layer at normal incidence the expression equals the analytic integral, so the total absorption follows the 16/15 law (<a href="#verification">verification</a>). Marching and the characteristic integration with <code>critical_handling.terminate=True</code> use this closure; the default characteristic integration (<code>terminate=False</code>) reflects the ray at the critical radius and does not evaluate it.</p>
+    </section>
+
+    <section aria-labelledby="absorption-critical">
+      <h2 id="absorption-critical">IB deposition, the critical surface, and termination</h2>
+      <p>The IB coefficient \(\kappa_{\rm IB}=\hat n\nu_{ei}/[c\sqrt{1-\hat n}]\) includes the slowing group velocity; \(\nu_{ei}\) uses \(T_e\), \(\bar Z\), and the Coulomb logarithm in cgs + eV. For marching, \(S=(\kappa_n+\kappa_{n+1})\Delta s/2\) (characteristic integration uses the quadrature value of each segment),</p>
+      $$
+      \Delta P=-P_n\operatorname{expm1}(-S),\qquad P_{n+1}=P_n-\Delta P,
+      $$
+      <p>avoids thin-segment cancellation; \(P_n\) is the ray's carried power at segment \(n\) (distinct from the beam-profile intensity \(I\) above). \(\Delta P\) is deposited at the segment midpoint in marching and in the segment's cell in characteristic integration. Because the power updates by difference, summing the losses along one ray telescopes — adjacent terms cancel — so \(\sum\Delta P=P_0-P_{\rm final}\) holds exactly up to rounding.</p>
+      <p>In marching, and in characteristic integration with <code>critical_handling.terminate=True</code>, a ray terminates at \(\hat n\ge1-\varepsilon_{\rm crit}\). The 1D <a href="#terms-tail-closure">tail closure</a> closes the remaining optical depth analytically. Default <code>terminate_mode="escape"</code> records residual power as unabsorbed reflection/scatter; <code>"deposit"</code> dumps it into an allowed critical-adjacent receiver. This dump is not path-integrated IB and should be intentional. Mesh-exit and intensity-cutoff remainders are unabsorbed, closing incident = absorbed + unabsorbed. With the 1D default characteristic integrator, <code>terminate</code> defaults to False (it stays True when <code>terminate_mode="deposit"</code> is chosen): rays reflect at the critical radius, and the quadrature counts the absorption up to it. <code>terminate=False</code> cannot be combined with <code>"deposit"</code>.</p>
+
+      <aside class="planned" aria-labelledby="corona-requirement">
+        <h3 id="corona-requirement">Practical requirement: a low-density corona layer</h3>
+        <p>Do not model a cold solid surface as one density jump. Without an underdense corona layer, 351 nm rays reach critical with almost no absorbing path and reflect. With the corona layer removed, the <a href="../../verification/index.html#gxii">GXII</a> regression deck absorbed only about \(4\times10^{-4}\) of the pulse over 1 ns (measured in 2026-07), too little to bootstrap a corona. There are two ways to supply the layer.</p>
+        <ul>
+          <li>The <strong>corona ramp</strong> is a layer of exponentially falling density placed in the initial fluid mesh; it enters the fluid as cells with mass. The GXII regression deck places a 10 µm layer that seeds a preplasma. The deck's cells are 2.5 µm wide, so the layer is represented by 4 cells, and the critical density lies inside the first cell that touches the outer surface. <a href="../../use/gui.html">Studio's Geometry section</a> can generate the same layer.</li>
+          <li>The <strong>ghost corona</strong> (<code>Laser.lasermesh.ghost_corona</code>) is a virtual corona placed only on the LaserMesh, outside the outermost material cell; it does not enter the fluid density, temperature, or mass (1D only). It is off by default in the solver and in Studio, and every laser-drive preset of Studio turns it on.</li>
+        </ul>
+        <p>The two are compared on the <a href="../mesh/1d.html#terms-ghost">1D mesh</a> page.</p>
+      </aside>
+    </section>
+
+    <section aria-labelledby="controls">
+      <h2 id="controls">Namelist controls</h2>
+      <p>The table lists the controls most directly involved in laser drive. See the <a href="../../use/namelist.html">namelist reference</a> for the full validation rules.</p>
+      <table class="quick-facts">
+        <thead><tr><th>Key</th><th>Value / unit</th><th>Purpose</th></tr></thead>
+        <tbody>
+          <tr><th><code>Laser.absorption.critical_handling.terminate</code></th><td><code>False</code> with characteristic integration (<code>True</code> with <code>terminate_mode="deposit"</code>), else <code>True</code></td><td><code>False</code> reflects rays at the critical radius (characteristic integration only).</td></tr>
+          <tr><th><code>Laser.absorption.critical_handling.terminate_mode</code></th><td><code>"escape"</code> / <code>"deposit"</code></td><td>Record critical-terminal power as unabsorbed or deposit it at termination.</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section aria-labelledby="verification">
+      <h2 id="verification">Verification</h2>
+      <ul>
+        <li>Linear-profile end-to-end checks compare with two closed forms for a density profile rising linearly to critical over thickness \(\ell\) [8]: the radial-pencil “Beer 16/15” law — the one-way IB optical depth is \(\tau=C\ell\int_0^1\hat n^2/\sqrt{1-\hat n}\,d\hat n=(16/15)C\ell\), with \(C\) the profile's IB coefficient scale and the check subtracting the \(\sqrt{\varepsilon_n}\) floor cut — and the beam-integrated oblique “\(\cos^5\)” law, round-trip absorption \(A=1-\exp[-(32/15)C\ell\cos^5\theta]\) at incidence angle \(\theta\).</li>
+      </ul>
+    </section>
+
+    <section aria-labelledby="references">
+      <h2 id="references">References</h2>
+      <ol class="references">
+        <li>J. D. Huba, <i>NRL Plasma Formulary</i>, Naval Research Laboratory, NRL/PU/6770--19-652 (2019).</li>
+        <li>J. Dawson and C. Oberman, "High-Frequency Conductivity and the Emission and Absorption Coefficients of a Fully Ionized Plasma," Phys. Fluids 5, 517–524 (1962). <a href="https://doi.org/10.1063/1.1706652">doi:10.1063/1.1706652</a></li>
+        <li>T. W. Johnston and J. M. Dawson, "Correct Values for High-Frequency Power Absorption by Inverse Bremsstrahlung in Plasmas," Phys. Fluids 16, 722 (1973). <a href="https://doi.org/10.1063/1.1694419">doi:10.1063/1.1694419</a></li>
+        <li>A. B. Langdon, "Nonlinear Inverse Bremsstrahlung and Heated-Electron Distributions," Phys. Rev. Lett. 44, 575–579 (1980). <a href="https://doi.org/10.1103/PhysRevLett.44.575">doi:10.1103/PhysRevLett.44.575</a></li>
+        <li>J. P. Matte, M. Lamoureux, C. Moller, et al., "Non-Maxwellian Electron Distributions and Continuum X-Ray Emission in Inverse Bremsstrahlung Heated Plasmas," Plasma Phys. Control. Fusion 30, 1665–1689 (1988). <a href="https://doi.org/10.1088/0741-3335/30/12/004">doi:10.1088/0741-3335/30/12/004</a></li>
+        <li>D. Turnbull, J. Katz, M. Sherlock, et al., "Inverse Bremsstrahlung Absorption," Phys. Rev. Lett. 130, 145103 (2023). <a href="https://doi.org/10.1103/PhysRevLett.130.145103">doi:10.1103/PhysRevLett.130.145103</a></li>
+        <li>M. Sherlock, P. Michel, D. J. Strozzi, et al., "Inverse Bremsstrahlung Absorption Rate for Super-Gaussian Electron Distribution Functions Including Plasma Screening," Phys. Rev. E 109, 055201 (2024). <a href="https://doi.org/10.1103/PhysRevE.109.055201">doi:10.1103/PhysRevE.109.055201</a></li>
+        <li>W. L. Kruer, <i>The Physics of Laser Plasma Interactions</i> (Addison-Wesley, Redwood City, 1988) — source of the linear-profile IB absorption laws and the ray-optics (Bouguer-invariant) treatment used by the analytic checks.</li>
+      </ol>
+    </section>
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["$$", "$$"], ["\\[", "\\]"]] } };</script>
+  <script defer src="../../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../../nav.js" data-page="laser-absorption" data-root="../../"></script>
+</body>
+</html>

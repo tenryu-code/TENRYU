@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en" data-lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Artificial viscosity and hourglass control — TENRYU Documentation</title>
+  <link rel="stylesheet" href="../../../style.css">
+  <script src="../../../theme.js"></script>
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>Artificial viscosity and hourglass control</h1>
+    <p class="abstract">This page describes the artificial viscosity (AV) used for shock capturing: the scalar vNR (von Neumann–Richtmyer) viscosity, the 1D CSW form, and the CSW98 (Caramana–Shashkov–Whalen 1998) edge AV of 2D RZ. It also describes the subzonal pressure and the legacy hourglass-suppression path, which suppress the zero-energy hourglass mode of bilinear quadrilaterals. Terms specific to this calculation (subzonal pressure and edge AV) are defined in the <a href="#terms">terms section</a>.</p>
+
+    <section aria-labelledby="terms">
+      <h2 id="terms">Terms used in this calculation</h2>
+      <p>Subzonal pressure and edge artificial viscosity use corners, subzones, and edges as the units in which the forces of a quadrilateral cell are distributed to its nodes. The terms below carry meanings specific to TENRYU's implementation, so they are defined here together. The symbols \(c\), \(k\), and \(n\) (cell, corner number, node) and the terms corner, subzone, corner mass, and median mesh are defined in the <a href="discretization.html#terms">terms section of the spatial discretization page</a>.</p>
+
+      <h3 id="terms-subzonal-pressure">Subzonal pressure</h3>
+      <p><strong>Subzonal pressure</strong> is a pressure perturbation built from the deviation of the density of each subzone; it supplies a force that resists the hourglass mode (Caramana–Shashkov [3]). If the corner masses \(m_{c,k}\) are held fixed during Lagrangian motion, the subzone density \(\rho^{sub}_{c,k}\) is determined by the subzone volume alone. The EOS gives the subzone pressure \(p^{sub}_{c,k}\) from this density and the specific internal energy of the cell, and the difference from the cell pressure \(P_c\) is \(\delta p_{c,k}=p^{sub}_{c,k}-P_c\). The force on the corner \(k\) is written with the median-mesh vectors \(\mathbf S^{med}_k\) (for the edge \(k\to k+1\)) as follows.</p>
+      $$
+      \begin{aligned}
+      \delta\mathbf f^{sub}_{c,k}=M_f\Bigl[&(\delta p_{c,k}+\delta p_{c,k+1})\,\mathbf S^{med}_k\\
+      &-(\delta p_{c,k}+\delta p_{c,k-1})\,\mathbf S^{med}_{k-1}\Bigr].
+      \end{aligned}
+      $$
+      <p>The cell-mean force left by round-off is subtracted so that \(\sum_k\delta\mathbf f^{sub}_{c,k}=0\). \(M_f\) is a weight that is zero when the density deviation \(x_c=(\max_k\rho^{sub}_{c,k}-\rho_c)/\rho_c\) of the subzones is zero and grows with \(x_c\). By default (<code>subzonal_merit_mode="caramana_auto"</code>), \(M_f=\bigl[\tfrac{\alpha_1}{2}\bigl(1-\cos\tfrac{\pi x_c}{2\alpha_2}\bigr)\bigr]^n\) for \(x_c\le2\alpha_2\) and \(M_f=\alpha_1^n\) for \(x_c>2\alpha_2\), with the defaults \(\alpha_1=\sqrt2\), \(\alpha_2=0.1\), and \(n=2\) (keys <code>subzonal_alpha1</code>, <code>subzonal_alpha2</code>, and <code>subzonal_merit_power</code>). The force acts only when the cell is distorted so that the ratios of the subzone volumes change, and it vanishes in a uniform expansion or compression.</p>
+      <p>The stiffness of the subzonal-pressure force gives a timestep limit \(\Delta t_c\le s\,\theta_*/\omega_c\), where \(\omega_c\) is an upper bound of the frequency of the oscillation that the subzonal-pressure force creates (<code>subzonal_dt_length_mode="corner_bound"</code>, the default), \(s\) is <code>subzonal_dt_spectral_safety</code> (default 0.5), and \(\theta_*\) is <code>subzonal_dt_omega_dt_limit</code> (default 2). <code>subzonal_dt_limiter_enabled=False</code> removes this limit. With subzonal pressure enabled, the limit also acts on the timestep of the run.</p>
+      <p>The subzonal-pressure force written here is that of the default model (<code>subzonal_force_model="legacy_median"</code>), which applies when the key is omitted. The key also accepts <code>hourglass_potential</code> and <code>merit_potential_v1</code>. <code>hourglass_potential</code> builds the force from a stiffness potential on the size of the hourglass modes of the quadrilateral instead of from the density deviation of the subzones; it requires <code>aw_compatible_force_work=True</code> (the stiffness coefficient is <code>hourglass_potential_kappa</code>, default 0.1). <code>merit_potential_v1</code> takes the exact gradient of a subzonal energy as its force; it cannot be combined with the area-weighted momentum scheme, and input validation rejects the combination. <code>work_conjugate_v1</code> is recognized by name only; it is not implemented, and input validation rejects it.</p>
+
+      <h3 id="terms-edge-av">Edge artificial viscosity</h3>
+      <p><strong>Edge-centered artificial viscosity</strong> (edge AV) is a viscous force that acts, edge by edge of a cell, along the velocity difference \(\Delta\mathbf v_e\) between the nodes at the two ends of the edge (CSW98 [2]). It is distributed to the two end nodes of the edge \(e\) as forces of equal magnitude and opposite direction, so the viscosity conserves momentum, and it only transfers kinetic energy to internal energy and never the other way. It acts only where the edge is compressing and is zero in expansion.</p>
+      <p>The <strong>edge vector</strong> \(\mathbf S_e\) is the median-mesh vector of the edge \(e\) (<a href="discretization.html#terms-median">median mesh</a>). In planar geometry it equals \(R(-90^\circ)(\mathbf x_c-\mathbf m_e)\) (\(\mathbf x_c\) is the cell center and \(\mathbf m_e\) the edge midpoint). In 2D RZ it is defined from the revolved-volume gradients \(\mathbf a_k=\partial V/\partial\mathbf x_k\): form \(\mathbf b_k=\mathbf a_k-\bar{\mathbf a}\) (\(\bar{\mathbf a}\) is the mean of the four \(\mathbf a_k\)) and take the vectors that satisfy \(\mathbf S_{k-1}-\mathbf S_k=\mathbf b_k\) and \(\sum_k\mathbf S_k=0\). The sum of their products with the velocity differences \(\Delta\mathbf v_k\) of the edges, \(\sum_k\mathbf S_k\cdot\Delta\mathbf v_k\), then equals the volume rate of the cell with the contribution of a uniform radial translation removed.</p>
+      <p>The <strong>compression switch</strong> is the condition \(\Delta\mathbf v_e\cdot\mathbf S_e&lt;0\) under which the viscous force of the edge acts. The left side is the contribution of the edge \(e\) to the volume rate of the cell (without the translation contribution in RZ), so the edge is compressing when it is negative. The force goes to zero continuously as \(\Delta\mathbf v_e\cdot\mathbf S_e\to0^-\).</p>
+      <p>The <strong>limiter</strong> \(\psi_e\) is a factor that reduces the viscous force of an edge by \((1-\psi_e)\): \(\psi_e=\max\bigl[0,\min\bigl(1,\,2r_L,\,2r_R,\,\tfrac12(r_L+r_R)\bigr)\bigr]\) (equations 12 and 18 of CSW98 [2]). \(r_L\) and \(r_R\) are the ratios of the velocity gradients of the two edges on either side along the same logical line (the same grid line of the mesh) to the velocity gradient of this edge. When the velocity is a linear function of the coordinates (self-similar compression, rigid rotation, linear shear), \(r_L=r_R=1\), \(\psi_e=1\), and the force of the edge vanishes. At the foot and the tail of a shock, where the neighboring edge is not compressing, \(\psi_e\) approaches 0 and the viscosity acts in full.</p>
+      <p>The <strong>Kuropatenko wave speed</strong> \(W_e\) is the speed that sets the magnitude of the viscous force of an edge. The force of an edge is given by the following expressions when \(\Delta\mathbf v_e\cdot\mathbf S_e&lt;0\) and is zero otherwise.</p>
+      $$
+      \begin{aligned}
+      W_e&=C_2\frac{\gamma+1}{4}|\Delta\mathbf v_e|+\sqrt{\Bigl(C_2\frac{\gamma+1}{4}\Bigr)^2|\Delta\mathbf v_e|^2+C_1^2c_{s,e}^2},\\
+      \mathbf f_e&=\rho_eW_e\,(1-\psi_e)\,(\Delta\mathbf v_e\cdot\mathbf S_e)\,\widehat{\Delta\mathbf v}_e.
+      \end{aligned}
+      $$
+      <p>For weak compression (\(|\Delta\mathbf v_e|\to0\)), \(W_e\to C_1c_{s,e}\), and for strong compression \(W_e\to2C_2\frac{\gamma+1}{4}|\Delta\mathbf v_e|\) [4]. \(\widehat{\Delta\mathbf v}_e\) is the unit vector along \(\Delta\mathbf v_e\); \(\rho_e\) and \(c_{s,e}\) are the harmonic means of the density and the sound speed of the two cells that share the edge (the value of the cell itself at a physical boundary); and \(\gamma\) is the ratio of specific heats (<code>ideal_gas_gamma</code>; in the 2D multi-material closure, the harmonic mean of the effective \(\gamma\) of the two cells).</p>
+      <p>The edge AV is selected by <code>av_model="csw_edge_csw98"</code> (the default when a 2D RZ deck omits the key). The coefficients \(C_1\) and \(C_2\) are <code>av_C1</code> and <code>av_C2</code>, and their default is 1 when a 2D edge model omits them. The forces of the edges are kept in a separate array, and the work on the internal energy is built from the same forces. For the timestep, every edge with a nonzero force imposes the limit \(\Delta t_e=C_{av}|\Delta\mathbf x_e|/\bigl[|\Delta\mathbf v_e|(1-\psi_e)\,|\widehat{\Delta\mathbf v}_e\cdot\hat{\mathbf S}_e|\bigr]\) (\(C_{av}\) is <code>av_cfl_coefficient</code>, default 0.25; \(\Delta\mathbf x_e\) is the vector of the edge and \(\hat{\mathbf S}_e\) is the unit vector of \(\mathbf S_e\)). A limit set by the stiffness at the nodes (<code>csw98_dt_stiffness_safety</code>, default 1) is added.</p>
+
+    </section>
+
+    <section aria-labelledby="artificial-viscosity">
+      <h2 id="artificial-viscosity">Artificial viscosity</h2>
+      <p>The legacy scalar von Neumann–Richtmyer viscosity [1] is active only in compression. The formula below is that of <code>scalar_vnr_legacy</code> in 2D RZ. TENRYU uses \(C_2^2\), rather than \(C_2\), as the quadratic coefficient:</p>
+      $$
+      Q_c=
+      \begin{cases}
+      \rho_c\left[C_2^2(\Delta l_c)^2(\nabla\!\cdot\!\mathbf u_c)^2
+      +C_1\Delta l_c\,c_{s,c}\lvert\nabla\!\cdot\!\mathbf u_c\rvert\right],
+      &amp; \nabla\!\cdot\!\mathbf u_c&lt;0,\\
+      0, &amp; \text{otherwise},
+      \end{cases}
+      \qquad \Delta l_c=\sqrt{A_c}.
+      $$
+      <p>Here \(c_{s,c}\) is the cell sound speed, \(\nabla\!\cdot\mathbf u_c\) is the cell-average velocity divergence, and \(C_1\), \(C_2\) are the linear and quadratic coefficients whose defaults follow. The 1D <code>vnr</code> uses, instead of \(\nabla\!\cdot\mathbf u_c\), a compression rate (the negative part of the cell velocity gradient, in 1/s) made from velocities reconstructed with limited nodal slopes, and multiplies it by weights that depend on shock detection.</p>
+      <p>The general defaults are <code>av_C1=0.1</code> and <code>av_C2=1.5</code>. In 1D, <code>av_type</code> selects <code>vnr</code>, the optional Riemann-solver-based form, or the 1D CSW form; a 1D deck that does not set it runs the CSW form (the structure default is <code>vnr</code>). The 1D CSW form (<code>av_type="csw"</code>) is a one-dimensional viscosity that uses the limiter of CSW98. It takes the compression rate \(\chi\) from cell-edge velocities reconstructed with limited nodal slopes, so a compression with a linear velocity has no viscosity. In a compressing cell the rate is floored at \(f\,(1-\psi)\) times the raw compression rate (\(f\) is <code>csw_shock_limiter_floor</code>, default 0.65; \(\psi\) is the Christensen limiter of CSW98 equation 12, 0 at the foot and the tail of a shock where the neighboring cell does not compress and 1 in a compression with a velocity linear over three cells). \(\psi\) is a continuous function of the velocity, and so is the viscosity. In 2D, the <code>av_model</code> key selects legacy <code>scalar_vnr_legacy</code> or a compatible edge-force model; a 2D RZ deck that omits it gets <code>csw_edge_csw98</code>.</p>
+      <p><code>csw_edge_csw98</code> is the 2D RZ default, a compatible edge AV that corrects the defect of the earlier <code>csw_edge</code> implementation — it used the area vector of the edge itself as the edge vector instead of the median-mesh vector of the original construction, so grid-aligned compression produced structurally zero force. It builds the force of an edge from the <a href="#terms-edge-av">edge vector on the median mesh</a>, a strict compression switch, the Kuropatenko wave speed [4], and signed compatible work. The limiter of a continuation edge (the neighboring edge on the same logical line) compares velocity gradients; self-similar compression, rigid rotation, and linear grid shear give limiter ratio one and suppress artificial dissipation. If a 2D CSW edge model (<code>csw_edge</code> or <code>csw_edge_csw98</code>) is used and <code>av_C1</code> and <code>av_C2</code> are omitted, the published values \(C_1=C_2=1\) are used. The earlier <code>csw_edge</code> mode is retained bit-identically so that earlier verification results carry over; the placeholder namelist value <code>csw_edge_plus_tensor_limited</code> is not implemented and is rejected by input validation.</p>
+    </section>
+
+    <section aria-labelledby="subzonal-hourglass">
+      <h2 id="subzonal-hourglass">Subzonal pressures and hourglass control</h2>
+      <p>Bilinear Lagrangian quadrilaterals can develop a zero-energy checkerboard, or hourglass, mode. Two mechanisms suppress this mode. Caramana–Shashkov subzonal pressure (<code>subzonal_pressure_enabled</code>) is on by default when a 2D RZ deck omits the key. The legacy <code>hourglass.enabled</code> path is off by default. Subzonal pressure (defined, with its formula, in the <a href="#terms-subzonal-pressure">terms section</a>) keeps the corner masses fixed during the Lagrangian step, computes each subzone density from the current volume of the subzone, evaluates an EOS pressure perturbation, and forms zero-net cell corner forces. It reacts to subzone volume change rather than filtering velocity, and its work is paired with those same forces.</p>
+      <p>The separate legacy <code>hourglass.enabled</code> path uses a linearized subzonal-pressure restoring force with force limiting and compatible work. It suppresses the bilinear checkerboard component while leaving translation and affine strain/shear untouched. This path acts only when subzonal pressure is disabled. Neither mechanism is a substitute for shock-capturing AV. Subzonal-pressure forces can be assembled only on the compatible path, which splits cell corner forces into separate buffers and closes the energy budget through their adjoint work. Subzonal pressure therefore cannot be combined with <code>av_model="scalar_vnr_legacy"</code> and requires <code>csw_edge</code>, <code>csw_edge_csw98</code>, <code>mimetic_tensor_v1</code>, or <code>mimetic_tensor_rz_v2</code>; <code>csw_edge_csw98</code> may itself run with subzonal pressure either on or off.</p>
+    </section>
+
+    <section aria-labelledby="controls">
+      <h2 id="controls">Namelist controls</h2>
+      <p>The following are selected keys under <code>Numerics.hydro</code>. A default is the value used when the deck omits the key. Where a 2D RZ deck that omits the key and the structure default (the value of a Config built in C++ code) differ, both are given. Except for meshes with <code>logical_mesh_2d="polar_in_box"</code>, Studio does not write the keys of this table for 2D RZ, so Studio decks run with the defaults for omitted 2D RZ keys. See the <a href="../../use/namelist.html">namelist reference</a> for all keys and their validation rules.</p>
+      <table class="quick-facts">
+        <thead>
+          <tr><th>Key</th><th>Default</th><th>Purpose</th></tr>
+        </thead>
+        <tbody>
+          <tr><th><code>av_type</code></th><td><code>"vnr"</code> (<code>"csw"</code> when a 1D deck does not set it)</td><td>1D shock-support selector: <code>vnr</code>, <code>riemann</code>, <code>riemann_compatible</code>, or <code>csw</code>.</td></tr>
+          <tr><th><code>csw_C1</code> / <code>csw_C2</code></th><td><code>0.5</code> / <code>2.0</code></td><td>Linear and quadratic coefficients of the 1D CSW form (separate from <code>av_C1</code>, <code>av_C2</code>).</td></tr>
+          <tr><th><code>csw_shock_limiter_floor</code></th><td><code>0.65</code></td><td>Shock floor \(f\) of the 1D CSW form; the floor is \(f(1-\psi)\) times the raw compression rate.</td></tr>
+          <tr><th><code>av_model</code></th><td><code>"csw_edge_csw98"</code> when a 2D RZ deck omits it; the structure default is <code>"scalar_vnr_legacy"</code></td><td>2D RZ shock-support selector: <code>scalar_vnr_legacy</code>, <code>csw_edge</code>, <code>csw_edge_csw98</code>, <code>mimetic_tensor_v1</code>, or <code>mimetic_tensor_rz_v2</code> (<code>csw_edge_plus_tensor_limited</code> is not implemented and is rejected). <code>csw_edge_csw98</code> is the compatible CSW98 edge AV with the defect above corrected.</td></tr>
+          <tr><th><code>av_C1</code></th><td><code>0.1</code></td><td>Linear AV coefficient; 1.0 when omitted with a 2D CSW edge model (including a 2D RZ deck that also omits <code>av_model</code>).</td></tr>
+          <tr><th><code>av_C2</code></th><td><code>1.5</code></td><td>Quadratic AV coefficient; scalar vNR uses \(C_2^2\); 1.0 when omitted with a 2D CSW edge model.</td></tr>
+          <tr><th><code>subzonal_pressure_enabled</code></th><td><code>True</code> when a 2D RZ deck omits it; the structure default is <code>False</code></td><td>Enables the Caramana–Shashkov subzonal-pressure forces (compatible).</td></tr>
+          <tr><th><code>hourglass.enabled</code></th><td><code>False</code></td><td>Enables the legacy linearized anti-hourglass path in 2D RZ. It acts only when subzonal pressure is disabled.</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section aria-labelledby="verification">
+      <h2 id="verification">Verification</h2>
+      <ul>
+        <li>Noh and Sod-class analytic checks cover strong-shock position and density plateaus, the exact planar Riemann three-wave structure, mass/impulse balances, and 1D energy conservation; the 2D RZ decks <code>2d_rz_h1_sod_planar</code> and <code>2d_rz_h2_noh_cyl</code> exercise planar Sod and cylindrical Noh layouts.</li>
+      </ul>
+    </section>
+
+    <section aria-labelledby="references">
+      <h2 id="references">References</h2>
+      <ol class="references">
+        <li>J. von Neumann and R. D. Richtmyer, "A Method for the Numerical Calculation of Hydrodynamic Shocks," J. Appl. Phys. 21, 232–237 (1950). <a href="https://doi.org/10.1063/1.1699639">doi:10.1063/1.1699639</a></li>
+        <li>E. J. Caramana, M. J. Shashkov, and P. P. Whalen, "Formulations of Artificial Viscosity for Multi-dimensional Shock Wave Computations," J. Comput. Phys. 144, 70–97 (1998). <a href="https://doi.org/10.1006/jcph.1998.5989">doi:10.1006/jcph.1998.5989</a></li>
+        <li>E. J. Caramana and M. J. Shashkov, "Elimination of Artificial Grid Distortion and Hourglass-Type Motions by Means of Lagrangian Subzonal Masses and Pressures," J. Comput. Phys. 142, 521–561 (1998). <a href="https://doi.org/10.1006/jcph.1998.5952">doi:10.1006/jcph.1998.5952</a></li>
+        <li>V. F. Kuropatenko, "On Difference Methods for the Equations of Hydrodynamics," in <i>Difference Methods for Solutions of Problems of Mathematical Physics, I</i>, edited by N. N. Janenko (American Mathematical Society, Providence, 1967), p. 116.</li>
+      </ol>
+    </section>
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["$$", "$$"], ["\\[", "\\]"]] } };</script>
+  <script defer src="../../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../../nav.js" data-page="hydro-av" data-root="../../"></script>
+</body>
+</html>

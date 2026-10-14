@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="ja" data-lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RZ 運動量スキーム — TENRYU ドキュメント</title>
+  <link rel="stylesheet" href="../../../style.css">
+  <script src="../../../theme.js"></script>
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>RZ 運動量スキーム</h1>
+    <p class="abstract">2D RZ の運動量式には、体積重み付き（<code>volume_weighted</code>）と面積重み付き（<code>area_weighted_symmetric</code>）の 2 つがある。この頁は、両者の違い、既定が面積重み付きである理由、エネルギー整合な仕事（<code>aw_compatible_force_work</code>）、BBSW のコーナー質量で測る運動エネルギー、ほかの設定との組み合わせの制約を述べる。この計算に固有の用語は<a href="#terms">用語の節</a>で説明する。</p>
+
+    <section aria-labelledby="terms">
+      <h2 id="terms">この計算で使う用語</h2>
+      <p>2D RZ の運動量式は、コーナーベクトル、コーナー質量、コーナー力から節点の加速度を求める。記号 \(c\)、\(k\)、\(n\)（セル、コーナーの番号、節点）と、これらの量の定義は、<a href="discretization.html#terms-corner">空間離散化の頁の用語の節</a>にある。この節は、運動量式に固有の用語を定義する。</p>
+
+      <h3 id="terms-momentum">面積重み付き・体積重み付きの運動量式と BBSW のコーナー質量</h3>
+      <p><strong>体積重み付き（volume-weighted）運動量式</strong>は、体積勾配のコーナーベクトル \(\mathbf S_{c,k}\) から作ったコーナー力を節点で足し合わせ、コーナー質量から作る真の RZ 節点質量 \(m_n\) で割って、節点の加速度を求める。力と体積変化率が同じベクトルを共有するので、エネルギー整合が成り立つ。</p>
+      <p><strong>面積重み付き（area-weighted）運動量式</strong>は、R–Z 面の平面で作ったコーナー力 \(\mathbf F^A_{c,k}=(P_c+Q_c)\,\mathbf S^A_{c,k}\) を節点で足し合わせ、平面の節点質量 \(M^A_n\)（既定では、下に定義する BBSW のコーナー質量から作る）で割って、節点の加速度を求める。この式を採る理由は<a href="#momentum-schemes">RZ 運動量スキーム</a>の節に述べた。2D RZ のデッキで省略したときの既定である（<code>rz_momentum_scheme="area_weighted_symmetric"</code>）。</p>
+      <p><strong>BBSW のコーナー質量（BBSW corner mass）</strong>\(m^B_{c,k}\) は、面積重み付きでエネルギー整合な運動量式が運動エネルギーを測る質量で、Barlow–Burton–Shashkov–Wendroff [1] の定義に従う。</p>
+      $$
+      m^B_{c,k}=M_c\,\frac{r_kA^k_c}{\sum_jr_jA^j_c},
+      \qquad
+      A^k_c=\frac{T_{k-1}+T_k}{3}+\frac{A_c}{12}.
+      $$
+      <p>ここで \(M_c\) はセル質量、\(r_k\) はコーナー \(k\) の節点の半径、\(T_k\) は辺 \(k\)（コーナー \(k\) と \(k+1\) を結ぶ辺）とセルの頂点平均を頂点にもつ三角形の面積、\(A_c=\sum_kT_k\) はセルの平面面積である（\(A^k_c\) の式は四辺形のもの）。\(\sum_km^B_{c,k}=M_c\) で、軸上の節点のコーナーでは \(m^B_{c,k}=0\) である。節点の質量は \(M^B_n=\sum_{(c,k)\to n}m^B_{c,k}\)、平面の節点質量は \(M^A_n=M^B_n/(2\pi r_n)\)、運動エネルギーは \(K^B=\tfrac12\sum_nM^B_n|\mathbf u_n|^2\) で測る。この質量と、内部エネルギーの仕事の重み \(2\pi r\) により、各段で \(\Delta K^B+\sum_c\Delta U_c=W_{ext}\) が満たされる。<code>aw_kinetic_measure="bbsw_subzonal"</code> が省略時の既定で、<code>"planar_v1"</code> は以前の測度であり、この恒等式を閉じない。</p>
+    </section>
+
+    <section aria-labelledby="momentum-schemes">
+      <h2 id="momentum-schemes">RZ 運動量スキーム</h2>
+      <p>2D RZ の運動量式は 2 つある（定義は<a href="#terms-momentum">用語の節</a>）。<code>volume_weighted</code> は、回転体体積の厳密な勾配である体積勾配のコーナーベクトルと、コーナー質量から作る真の RZ 節点質量を使う。<code>area_weighted_symmetric</code> は、R–Z 面の平面で作った平面コーナーベクトルと、平面の節点質量を使う。<code>rz_momentum_scheme</code> を省略したときの既定は、2D RZ のデッキで <code>area_weighted_symmetric</code>、構造体の既定（C++ のコードで組む Config の値）で <code>volume_weighted</code> である。</p>
+      <p>球対称な状態を等角（equal-angle）の極座標メッシュで解くとき、面積重みの力は全節点で動径方向を向く。体積重みの力は、極軸（polar axis。球座標メッシュの \(\theta=0\) と \(\theta=\pi\) の線）に隣接する節点で角度方向の成分をもち、膨張する爆風（blast wave）でそのまわりのセルを絡ませる。面積重みの式は、この絡みを避けるために採る。</p>
+      <p><code>aw_compatible_force_work=True</code>（2D RZ のデッキで省略したときの既定）では、運動量に平面のコーナー力を使い、内部エネルギーの仕事には、同じ力に \(2\pi r\) を掛けた回転体の力を使う。運動エネルギーは、<a href="#terms-momentum">BBSW のコーナー質量</a>から作る節点質量で測る（<code>aw_kinetic_measure="bbsw_subzonal"</code>、省略時の既定）。この組は、各段で \(\Delta K^B+\sum_c\Delta U_c=W_{ext}\) を満たすように構成する。ここで \(\Delta K^B\) は BBSW の節点質量で測った運動エネルギーの変化、\(\sum_c\Delta U_c\) はセルの内部エネルギーの変化の和、\(W_{ext}\) は外部の仕事である。<code>aw_kinetic_measure="planar_v1"</code> は以前の測度で、この恒等式を閉じない。</p>
+      <p><code>aw_compatible_force_work=True</code> は、<code>av_model</code> が <code>csw_edge</code>、<code>csw_edge_csw98</code>、<code>mimetic_tensor_v1</code>、<code>mimetic_tensor_rz_v2</code> のいずれかであること、<code>subzonal_pressure_enabled=True</code> であることを要求する。<code>False</code> のときは、<code>av_model="scalar_vnr_legacy"</code> で、サブゾーン圧力を無効にする必要がある。このとき内部エネルギーは従来どおり真の RZ 体積変化による \(p\,dV\) で更新するので、全エネルギーは構成上の恒等式では保存されない（エネルギー整合でない）。診断量、時間刻みの見積り、リマップは真の RZ 節点質量を使う。<code>time_integration</code> の既定の <code>midpoint_v1</code> はエネルギー整合な仕事を要するので、面積重み付きの運動量式で <code>aw_compatible_force_work=False</code> とするデッキは、<code>time_integration="pc_v0"</code> も明示する。<code>midpoint_v1</code> との組は入力検証が拒否する。</p>
+      <p><code>area_weighted_symmetric</code> は 2D RZ だけで使え、構造化された単一ブロックメッシュと、マルチブロックの CSR メッシュを対象とする。<code>aw_compatible_force_work=False</code> では、マルチブロックメッシュは全セルが四辺形のものに限る。三角形扇（triangular fan、tri-fan）を極冠（polar cap）にもつマルチブロックメッシュ（<code>multiblock_half_butterfly_trifan_cap_5block</code>）と、<code>Numerics.hydro.plasma_viscosity</code> を有効にした計算は、入力検証が拒否する。<code>aw_compatible_force_work=True</code> では、<code>Mesh.polar_center_treatment</code> が <code>tri_fan</code> または <code>button</code> の<a href="../mesh/2d.html#terms-center">中心</a>も拒否する。これらを使うデッキは、<code>rz_momentum_scheme="volume_weighted"</code> と <code>aw_compatible_force_work=False</code> を明示する。Studio は、<code>logical_mesh_2d="polar_in_box"</code>（中心が tri_fan）のデッキにだけ、この 2 つに加えて <code>av_model="scalar_vnr_legacy"</code> と <code>subzonal_pressure_enabled=False</code> を書き出す。ほかの 2D RZ のデッキには、流体のこれらのキーを書かず、省略したときの既定で走らせる。</p>
+    </section>
+
+    <section aria-labelledby="controls">
+      <h2 id="controls">namelist による制御</h2>
+      <p>以下は <code>Numerics.hydro</code> の主要キーの抜粋である。既定値は、デッキで省略したときの値である。2D RZ のデッキで省略したときと、構造体の既定（C++ のコードで組む Config の値）とで値の違うキーには、両方を書く。Studio は、<code>logical_mesh_2d="polar_in_box"</code> のメッシュを除いて、2D RZ の流体にこの表のキーを書かないので、Studio のデッキは 2D RZ で省略したときの既定で走る。全項目と検証規則は <a href="../../use/namelist.html">namelist リファレンス</a>を参照のこと。</p>
+      <table class="quick-facts">
+        <thead>
+          <tr><th>キー</th><th>既定値</th><th>用途</th></tr>
+        </thead>
+        <tbody>
+          <tr><th><code>rz_momentum_scheme</code></th><td>2D RZ のデッキで省略したとき <code>"area_weighted_symmetric"</code>、構造体の既定は <code>"volume_weighted"</code></td><td>運動量式の選択。<code>area_weighted_symmetric</code> の制約は前節に述べた。</td></tr>
+          <tr><th><code>aw_compatible_force_work</code></th><td>2D RZ のデッキで省略したとき <code>True</code>、構造体の既定は <code>False</code></td><td>面積重み付きの運動量式で、内部エネルギーの仕事を運動量と同じ力から作る（エネルギー整合）。<code>True</code> は、<code>av_model</code> の辺人工粘性またはテンソル粘性と、<code>subzonal_pressure_enabled=True</code> を要する。</td></tr>
+          <tr><th><code>aw_kinetic_measure</code></th><td>デッキで省略したとき <code>"bbsw_subzonal"</code>、構造体の既定は <code>"planar_v1"</code></td><td>エネルギー整合な面積重み付きの式が運動エネルギーを測る節点質量。<code>bbsw_subzonal</code> は BBSW のコーナー質量、<code>planar_v1</code> は以前の測度。</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section aria-labelledby="references">
+      <h2 id="references">参考文献</h2>
+      <ol class="references">
+        <li>A. Barlow, D. Burton, M. Shashkov, and B. Wendroff, "Compatible, Energy and Symmetry Preserving 2D Lagrangian Hydrodynamics in rz-Cylindrical Coordinates," Los Alamos National Laboratory report LA-UR 09-08130.</li>
+      </ol>
+    </section>
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["$$", "$$"], ["\\[", "\\]"]] } };</script>
+  <script defer src="../../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../../nav.js" data-page="hydro-momentum" data-root="../../"></script>
+</body>
+</html>

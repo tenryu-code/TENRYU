@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="ja" data-lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>反応率と燃料の減損 — TENRYU ドキュメント</title>
+  <link rel="stylesheet" href="../../../style.css">
+  <script src="../../../theme.js"></script>
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>反応率と燃料の減損</h1>
+    <p class="abstract">この頁は、燃焼の段階で核種の在庫を進める部分を述べる。Bosch–Hale の反応率係数（reactivity）と遮蔽効果（screening）による反応率の評価、在庫を比在庫（specific inventory）で保持する理由、陽的中点法（explicit midpoint method）による燃料の減損（depletion）と、部分サイクル（subcycling）および沈着パワーによる時間刻みの制御である。この頁の計算に固有の用語は<a href="#terms">用語の節</a>で説明する。</p>
+
+    <section aria-labelledby="reactions">
+      <h2 id="reactions">反応率と燃料在庫</h2>
+      <p>有効にできる反応チャネルは DT = T(d,n)⁴He、DD の D(d,p)T と D(d,n)³He、D³He = ³He(d,p)⁴He である。反応率係数には Bosch–Hale (1992) [1] のパデ近似式（Padé approximant）を使い、セルのイオン温度は入口で一度だけ eV から keV へ変換する。体積あたりの反応率は \(r=n_i n_j\langle\sigma v\rangle/(1+\delta_{ij})\) で、同種粒子どうしの DD には 1/2 が入る。近似式の下端より低温では反応率を 0 とし、上端より高温では上端の値で頭打ちにする。既定の <code>T_floor_keV=0.2</code> は DT/DD の下端であり、D³He の近似式自体の下端は 0.5 keV である。</p>
+      <p><code>fuel_materials</code> は、在庫をもつ、ボイド（void。<a href="../eos-opacity/index.html#void-materials">定義</a>）でない材料の名前を選ぶ。<code>x_D</code>、<code>x_T</code>、<code>x_He3</code> はその初期の数分率（number fraction）で、3 つの値は非負かつ総和が 1 でなければならない。D、T、³He、⁴He、p の在庫を \(Y_s=n_s/\rho\) として保持し、反応率を評価するときだけ \(n_s=\rho Y_s\) を再構成する。これにより、純ラグランジュ運動のもとで在庫が保存され、膨張するセルで生成時の数密度を持ち越してしまう誤りを避けられる。</p>
+      <p><code>screening="none"</code> は係数を 1 とする（遮蔽なし）。<code>salpeter</code> は電子を含む 2 温度のデバイ長（Debye length）による弱い遮蔽（weak screening）、<code>chugunov_dewitt</code> は剛体の電子背景（rigid electron background）を仮定した Chugunov–DeWitt 2009 の補間式（interpolation formula。文献 [3] の式 (A4)）を使う。前者の 2 温度化は TENRYU による拡張で（<a href="#terms-screening">用語</a>）、入力が正でない場合や有限でない場合は係数 1 へ戻り、弱結合（weak coupling）モデルからの逸脱を抑えるために、指数 \(h\)（遮蔽による反応率の増強は \(e^h\)）を \(h\le2\) に制限する。</p>
+      <ul>
+        <li>\(r=n_i n_j\langle\sigma v\rangle/(1+\delta_{ij})\) — 単位体積あたりのチャネル反応率で、反応物が同種の場合は \(\delta_{ij}=1\) が DD の 1/2 の因子を与える。</li>
+        <li>\(Y_s=n_s/\rho\) — ラグランジュ的な比在庫である。流体的な圧縮・膨張は、\(Y_s\) 自体ではなく \(n_s=\rho Y_s\) を変化させる。</li>
+        <li>温度の単位 — Bosch–Hale の近似式を評価する前に、TENRYU 内部のイオン温度を eV から keV へ一度だけ変換する。</li>
+        <li>近似式の適用範囲 — 下限（DT/DD は 0.2 keV、D³He は 0.5 keV）を下回ると反応率は 0、Bosch–Hale 近似式の適用上限 [1]（DT と DD 両分岐は 100 keV、D³He は 190 keV）を超えると頭打ちにする。<code>T_floor_keV</code> の既定値は 0.2 である。</li>
+        <li>遮蔽 — 選択した係数を、反応する対ごとの反応率係数へ掛ける。Salpeter は不正な入力に対して 1 へ戻り、弱結合モデルの指数 \(h\)（遮蔽による増幅は \(e^h\)）を \(h\le2\) に制限する。</li>
+        <li>Fraley の保持率 — 点源球の核が、燃料球の面密度と生成物の発生半径から局所の保持率を求める（<a href="products.html#terms-fraley">用語</a>）。</li>
+        <li>\(f_i=1/(1+32/T_e[\mathrm{keV}])\) — 任意選択の Fraley による電子・イオン分配で、設定検証により DT の α 粒子に限定される。</li>
+      </ul>
+    </section>
+
+    <section aria-labelledby="depletion">
+      <h2 id="depletion">燃料の減損と陽的な時間制御</h2>
+      <p>燃焼の各段階では温度と密度を一定に保ち、核種のネットワークを陽的中点法（explicit midpoint method、2 次ルンゲ–クッタ）でセルごとに<a href="#terms-stage">部分サイクル</a>に分けて進める。必要な部分サイクルの数は、有効な各反応物について総生成率と総消費率の大きい方から求め、1 部分サイクルあたりの相対的な在庫変化が <code>eps_deplete</code> 以下になるようにする。これにより、DD が作った微量の T を DT がただちに消費するような、正味の変化が小さい生成消費の回転も解像できる。正値性（positivity）は、反応回数を決定論的に縮小することで守る。</p>
+      <p>必要な部分サイクルの数が <code>subcycle_max</code> を超える場合は、上限の数のまま現在のステップを進めたうえで必要数を報告し、次のステップの燃焼の時間刻みへ \(0.9\,dt\,M_{max}/M_{req}\) を反映させる（\(M_{req}\) は要求された部分サイクルの数、\(M_{max}\) は <code>subcycle_max</code> で与える上限）。さらに沈着パワー \(P_{dep}\) に対して \(\Delta t\le f_E e_{cell}/P_{dep}\)、\(f_E=\)<code>explicit_source_limit</code> を課す。ここで \(e_{cell}=\rho_cV_c(e_e+e_i)\) はセルの全内部エネルギーで、<a href="../lpi/hot-electrons.html">ホット電子（hot electron）</a>の物理カーネルの同名キーと同じ形の制限（あちらは電子エネルギー、こちらは電子+イオン）である。これは、段階の内部で温度を更新し直すことなく自己加熱を小さく保つための、源に対する制限である。</p>
+    </section>
+
+    <section aria-labelledby="terms">
+      <h2 id="terms">この計算で使う用語</h2>
+      <p>燃焼の段階の進め方、在庫の持ち方、遮蔽の係数は、この計算に固有の単位で組み立てる。ここに挙げる用語は、TENRYU の実装に固有の意味で使うので、まとめて定義する。</p>
+
+      <h3 id="terms-stage">燃焼の段階と部分サイクル</h3>
+      <p><strong>燃焼の段階（burn stage）</strong>は、時間刻み \(\Delta t\) のあいだに燃焼のカーネルが行う更新 1 回である。外側の 1 ステップは演算子分割（operator splitting）で進み、燃焼はその列の中の 1 つの演算子に当たる（<a href="../../overview/numerics-foundations.html#operator-splitting">演算子分割と再クロージャの規律</a>）。燃焼は、レーザーの直後、流体の最初の半ステップの前に置かれ、\(\Delta t\) の全体を陽的な源（explicit source）として 1 回で進める。燃焼のために \(\Delta t\) を他の演算子と交互に刻むことはない。段階のあいだ、各セルの密度と電子・イオン温度は一定に保ち、反応で生じたエネルギーは、段階の終わりに電子とイオンへの加熱源として加える。</p>
+      <p><strong>部分サイクル（subcycling）</strong>は、段階の内部で \(\Delta t\) を \(M\) 個の等しい小区間（長さ \(\Delta t/M\)）に分け、セルごとに 5 核種のネットワークを陽的中点法（explicit midpoint method、2 次ルンゲ–クッタ）で進めることである。反応が速いセルほど細かく刻む必要があるので、\(M\) はセルごとに次の式で決める。</p>
+      $$
+      M=\min\!\left[\max\!\left(\left\lceil\frac{\Delta t\,r_{max}}{\epsilon_{dep}}\right\rceil,1\right),M_{max}\right],\qquad
+      r_{max}=\max_s\frac{\max(q_s^{+},q_s^{-})}{\max(n_s,\,10^{-9}n_{tot},\,1\,\mathrm{cm^{-3}})}.
+      $$
+      <p>ここで \(\epsilon_{dep}\) は <code>eps_deplete</code>（既定 0.1。0 より大きく 0.5 以下）、\(M_{max}\) は <code>subcycle_max</code>（既定 64。1 以上 4096 以下）、\(s\) は反応物の核種（D と、有効なチャネルに応じて T と ³He）、\(q_s^{+}\) と \(q_s^{-}\) は反応による核種 \(s\) の総生成率と総消費率 [cm⁻³ s⁻¹]、\(n_{tot}\) は 5 核種の数密度の和である。正味の変化率ではなく、総生成率と総消費率の大きい方を使うので、生成と消費がほぼ釣り合って入れ替わりの速い核種（DD が作った微量の T を DT がただちに消費するセルなど）も解像できる。1 部分サイクルの反応回数が反応物の在庫を使い切る場合は、回数を決定論的に縮小して正値性を保つ。必要な数が \(M_{max}\) を超えるセルがあると、上限の数で段階を進めたうえで必要数を報告し、次のステップの燃焼の時間刻みを制限する（<a href="#depletion">燃料の減損と陽的な時間制御</a>）。</p>
+
+      <h3 id="terms-inventory">在庫と比在庫</h3>
+      <p><strong>在庫（inventory）</strong>は、セルごとに持つ核種 D、T、³He、⁴He、p の 5 種の粒子数である。中性子は在庫に含めず、台帳にだけ数える。</p>
+      <p><strong>比在庫（specific inventory）</strong> \(Y_s=n_s/\rho\) [1/g] は、質量 1 g あたりの核種 \(s\) の粒子数である。在庫は、粒子数密度 \(n_s\) [cm⁻³] ではなく、比在庫で保持する。純ラグランジュ運動ではセルの質量が変わらないので、圧縮や膨張は \(Y_s\) を変えず、\(n_s=\rho Y_s\) だけを変える。\(Y_s\) を変えるのは核反応だけである。数密度で保持すると、膨張するセルが生成時の数密度を持ち越して燃料を過剰に燃やす。比在庫は、これを防ぐための量である。反応率を評価するときだけ、現在の密度 \(\rho\) から \(n_s=\rho Y_s\) を作り直す。</p>
+      <p>初期の在庫は、セルの燃料材料（<code>fuel_materials</code>）の体積分率の和 \(f_{fuel}\) と、初期の数分率 \(x_D\)、\(x_T\)、\(x_{He3}\)（<code>x_D</code>、<code>x_T</code>、<code>x_He3</code>。既定は 0.5、0.5、0 で、総和は 1 でなければならない。既定以外の組み合わせでは 3 つとも指定する）から、\(Y_s=x_sf_{fuel}/(\bar Am_p)\)（\(s=\) D、T、³He）と置く。\(\bar A=\sum_sx_sA_s\) は燃料イオンの平均質量、\(A_s\) は陽子質量を単位とする核種 \(s\) の質量（D は 2.0141、T と ³He は 3.0160）である。⁴He と p は 0 から始まる。チェックポイントは比在庫を <code>burn_state/specific_inventory</code> に書き、再開はこれを使う（<a href="../../use/outputs/index.html">出力と解析</a>）。</p>
+
+      <h3 id="terms-screening">Salpeter の 2 温度形</h3>
+      <p><strong>Salpeter の 2 温度形（two-temperature Salpeter form）</strong>は、<code>screening="salpeter"</code> のときに反応率係数へ掛ける増強係数である。反応する核種の対 \((i,j)\) ごとに \(\langle\sigma v\rangle\to F\langle\sigma v\rangle\)、\(F=\exp h\) と置く。遮蔽の長さ \(\lambda\) は、イオンと電子が別々の温度をもつデバイ長で、</p>
+      $$
+      \lambda^{-2}=4\pi e^2\left[\frac{\sum_sn_sZ_s^2}{k_BT_i}+\frac{n_e}{k_BT_e}\right],\qquad
+      h=\frac{Z_iZ_je^2}{\lambda\,k_BT_i}
+      $$
+      <p>である。ここで \(e\) は電気素量、\(n_s\) は在庫から作る 5 核種の数密度、\(Z_s\) はその電荷（D、T、p は 1、³He と ⁴He は 2）、\(n_e=\bar Z\rho/(Am_p)\) は電子数密度、\(Z_i\) と \(Z_j\) は反応する 2 核種の電荷である。Salpeter [2] の式は、イオンと電子が共通の温度をもつ平衡を仮定する。\(T_i\ne T_e\) の場合へ拡張したのは TENRYU である。弱遮蔽の近似は \(h\ll1\) でだけ成り立つので、\(h\le2\)（増強は \(e^2\approx7.4\) 倍まで）に制限し、制限が働くと初回だけ警告する。入力（\(T_i\)、\(T_e\)、\(n_e\)）が正でないか有限でないときは \(F=1\) とする。<code>chugunov_dewitt</code> は、剛体の電子背景を仮定した Chugunov–DeWitt の補間式 [3] で、ここで定義する 2 温度形ではない。</p>
+    </section>
+
+    <section aria-labelledby="controls">
+      <h2 id="controls">namelist による制御</h2>
+      <p>以下は最上位の <code>Burn</code> ブロックのうち、反応率・在庫・減損の時間制御に関わるキーである。燃焼全体のキーは<a href="index.html#controls">概要の頁</a>にある。表の既定値は、デッキで指定しないときの値である。Studio が書き出す既定値も同じだが、<code>fuel_materials</code> は Studio では空で、利用者が指定する。</p>
+      <table class="quick-facts">
+        <thead><tr><th>キー</th><th>既定値</th><th>用途</th></tr></thead>
+        <tbody>
+          <tr><th><code>screening</code></th><td><code>"none"</code></td><td><code>none</code>、<code>salpeter</code>、<code>chugunov_dewitt</code>。</td></tr>
+          <tr><th><code>fuel_materials</code></th><td><code>["DT"]</code></td><td>初期の燃料在庫をもつ材料の名前。</td></tr>
+          <tr><th><code>x_D / x_T / x_He3</code></th><td><code>0.5 / 0.5 / 0.0</code></td><td>初期の数分率。非負で、総和は 1（\(10^{-6}\) の誤差まで許す）。既定以外の組み合わせでは 3 つとも指定する。<a href="#terms-inventory">在庫</a>の初期値を決める。</td></tr>
+          <tr><th><code>T_floor_keV</code></th><td><code>0.2</code></td><td>反応率を評価する際の温度の下限 [keV]。</td></tr>
+          <tr><th><code>eps_deplete / subcycle_max</code></th><td><code>0.1 / 64</code></td><td>1 部分サイクルあたりの在庫変化の目標と、部分サイクルの数の上限（<a href="#terms-stage">用語</a>）。</td></tr>
+          <tr><th><code>explicit_source_limit</code></th><td><code>0.2</code></td><td>沈着エネルギーによる陽的な時間刻み制限の係数。</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section aria-labelledby="verification">
+      <h2 id="verification">検証</h2>
+      <ul>
+        <li>単体試験 <code>test_burn_reactivity</code> は、Bosch–Hale の Table VIII にある 8 温度 × 4 反応の基準値を相対 \(1.5\times10^{-3}\) 以内で固定し、keV と eV の取り違えを検出する。単体試験 <code>test_burn_network</code> は、閉じた形の DT/DD 解、生成された T を含む連鎖反応、総量に基づく部分サイクル、化学量論的な反応回数を検査する。</li>
+      </ul>
+    </section>
+
+    <section aria-labelledby="references">
+      <h2 id="references">参考文献</h2>
+      <ol class="references">
+        <li>H. S. Bosch and G. M. Hale, "Improved Formulas for Fusion Cross-Sections and Thermal Reactivities," Nucl. Fusion 32, 611–631 (1992). <a href="https://doi.org/10.1088/0029-5515/32/4/I07">doi:10.1088/0029-5515/32/4/I07</a></li>
+        <li>E. E. Salpeter, "Electron Screening and Thermonuclear Reactions," Aust. J. Phys. 7, 373–388 (1954). <a href="https://doi.org/10.1071/PH540373">doi:10.1071/PH540373</a></li>
+        <li>A. I. Chugunov and H. E. DeWitt, "Nuclear Fusion Reaction Rates for Strongly Coupled Ionic Mixtures," Phys. Rev. C 80, 014611 (2009). <a href="https://doi.org/10.1103/PhysRevC.80.014611">doi:10.1103/PhysRevC.80.014611</a></li>
+      </ol>
+    </section>
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["$$", "$$"], ["\\[", "\\]"]] } };</script>
+  <script defer src="../../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../../nav.js" data-page="burn-reactions" data-root="../../"></script>
+</body>
+</html>

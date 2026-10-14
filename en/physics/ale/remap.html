@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en" data-lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Conservative remap — TENRYU Documentation</title>
+  <link rel="stylesheet" href="../../../style.css">
+  <script src="../../../theme.js"></script>
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>Conservative remap</h1>
+    <p class="abstract">Conservative remap transfers extensive quantities (mass, momentum, internal energies, radiation-group energies) between an old and a new mesh of the same connectivity by the signed swept volume of each face. The default <code>legacy_split</code> is directionally split; the opt-in <code>ms2_moments</code> is a Margolin–Shashkov second-order moment remap [1]. This page gives the swept-region volume and the conserved-quantity update, the donor choice, the limiters, and the closure of the kinetic-energy budget.</p>
+
+    <section aria-labelledby="conservative-remap">
+      <h2 id="conservative-remap">Swept-region conservative remap</h2>
+      <p><a href="#fig-ale-swept-region">Figure A</a> shows the swept region and the transfer from the donor to the receiving cell in a one-dimensional strip. The default <code>legacy_split</code> alternates the ordering of R and Z swept-region sweeps. Revolving the meridional polygon \(P_f\) between an old and new face gives the signed volume</p>
+      $$
+      \Delta V_f=V(P_f)=\frac{\pi}{3}\sum_k(r_k+r_{k+1})
+      (r_kz_{k+1}-r_{k+1}z_k).
+      $$
+      <p>Here \((r_k,z_k)\) are the vertices of the meridional polygon \(P_f\) swept between the old and new face; the prefactor \(\pi/3\) comes from the exact revolution about the axis.</p>
+      <p>For each internal face, TENRYU chooses one donor and computes one flux, then applies equal-and-opposite updates. A conservative cell integral \(\bar q=qV\) changes as</p>
+      $$
+      \bar q_i^{new}=\bar q_i^{old}-F_{i+1/2}+F_{i-1/2}.
+      $$
+      <p>(\(F_{i\pm1/2}\) are the conserved-quantity fluxes through the two faces of cell \(i\), evaluated from the donor-side reconstructed state and the swept volume.) The transferred quantities are mass, R/Z momentum, electron/ion internal energy, material volume, and every radiation-group energy. Density is recovered as \(m^{new}/V^{new}\), velocity as remapped momentum/mass, and specific energy as remapped extensive energy/mass. Remap transports conservative integrals first, rather than directly averaging intensives such as \(\rho\), \(\mathbf u\), or \(e\).</p>
+
+      <ul>
+        <li><strong>Signed swept region \(P_f\):</strong> its sign records the direction of face motion, while its magnitude is the volume exchanged across that face.</li>
+        <li><strong>Donor selection:</strong> the sign of the swept volume selects the upwind donor cell; that same donor supplies the reconstructed state for the single face flux.</li>
+        <li><strong>MS2 limiter:</strong> the limited linear reconstruction is monotone second order and prevents the remap from creating new local extrema.</li>
+        <li><strong>Exact RZ geometry:</strong> polygon revolution evaluates both the swept volume and, for MS2, the swept polygon's exact first moment rather than a near-axis first-order approximation.</li>
+        <li><strong>Kinetic-energy budget:</strong> <code>ke_conservation_closure</code> adds the diagnostic-compatible kinetic-energy remap/projection discrepancy to material internal energy.</li>
+        <li><strong>Corner-mass timing:</strong> corner masses remain invariant through Lagrangian motion and rejected proposals, and are rebuilt only after an accepted conservative remap.</li>
+        <li><strong>Trigger metrics:</strong> cadence, cell quality, axis margin, and corner-J determine whether the geometry transaction is attempted.</li>
+      </ul>
+
+      <figure id="fig-ale-swept-region">
+        <img src="../../../assets/ale-remap-swept-region-en.png" width="820" height="440" style="max-width:100%;height:auto" alt="One-dimensional strip before (top) and after (bottom) rezoning: the face f between cells i and i+1 moves towards cell i+1. The hatched swept region P_f leaves cell i+1, the donor, and joins cell i, which gains exactly what cell i+1 loses">
+        <figcaption>Figure A. A one-dimensional strip view of swept-region remap. The top strip is the old mesh (after the Lagrangian step), the bottom strip the new mesh (after the rezone); the hatched region is the signed swept region <i>P</i><sub><i>f</i></sub> and the orange arrow is the transfer from the donor. The donor is the upwind cell of the face motion, here cell <i>i</i>+1 because the face moves towards it; the updates of cells <i>i</i> and <i>i</i>+1 are equal and opposite. The 2D RZ implementation uses the exact axisymmetric volume and first moment of the shaded polygon.</figcaption>
+      </figure>
+    </section>
+
+    <section aria-labelledby="ms2-energy">
+      <h2 id="ms2-energy">MS2 limiters and the kinetic-energy budget</h2>
+      <p>The opt-in <code>ms2_moments</code> path is a Margolin–Shashkov-style second-order moment remap. It reconstructs \(q(\mathbf x)=q_L+\nabla q_L\cdot(\mathbf x-\mathbf x_L)\) from a four-neighbor least-squares slope and limits it with <code>van_leer</code> or <code>barth_jespersen</code>. Using the exact first moment \(M_1(P_f)\), the donor integral is</p>
+      $$
+      I_f=\rho_L|P_f|+\nabla\rho_L\cdot
+      \left(M_1(P_f)-\mathbf x_L|P_f|\right).
+      $$
+      <p>(\(|P_f|\) is the revolved volume of the swept polygon \(P_f\), the same quantity as \(\Delta V_f\).) Legacy split and MS2 both use the same face flux with opposite signs on its two cells, so limiting preserves pairwise conservation. Per-sweep mass/internal/radiation positivity and final EOS re-closure remain separate checks.</p>
+      <p>Projecting cell momentum back to nodal velocity does not generally preserve kinetic energy exactly. The default-on <code>ke_fixup</code> is a control accepted for compatibility with legacy decks (<a href="../../use/namelist.html#terms-deck">definition</a>); the following <code>ke_conservation_closure</code> actually handles the post-projection kinetic-energy deficit. <code>ke_conservation_closure</code> remaps \(q_K=K_c^{diag}/V_c\) using the corner-mass/nodal-velocity measure (the result being \(K_c^{remap,*}\)), then deposits \(\Delta I_c=K_c^{remap,*}-K_c^{node,*}\) into material internal energy: all of it into the single energy in one temperature, all of it into the ions in two. It is read by the single-block ALE step only (a single-block 2D_RZ mesh with ALE enabled, outside the identity mode, with band ALE off or composed with the rezone). There it is off by default in one temperature and on by default in two (an explicit <code>False</code> is honored with a warning), because without it the remap and the node projection change the kinetic energy and the ions never receive the change. An optional positivity redistribution draws a deficit from global positive capacity and records any unresolved remainder in a ledger.</p>
+    </section>
+
+    <section aria-labelledby="controls">
+      <h2 id="controls">Namelist controls</h2>
+      <p>These are selected <code>Numerics.ale</code> controls. See the <a href="../../use/namelist.html">namelist reference</a> for all fields and validation rules.</p>
+      <table class="quick-facts">
+        <thead>
+          <tr><th>Key</th><th>Default</th><th>Purpose</th></tr>
+        </thead>
+        <tbody>
+          <tr><th><code>remap_scheme</code></th><td><code>"legacy_split"</code></td><td>Directional swept-region remap; opt-in <code>"ms2_moments"</code>.</td></tr>
+          <tr><th><code>remap_limiter</code></th><td><code>"van_leer"</code></td><td>Limiter for legacy-split donor reconstruction.</td></tr>
+          <tr><th><code>ke_fixup</code></th><td><code>True</code></td><td>Legacy post-remap kinetic-energy fixup compatibility control.</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section aria-labelledby="verification">
+      <h2 id="verification">Verification</h2>
+      <ul>
+        <li>Remap conservation ledgers track mass, R/Z momentum, material internal energy, radiation-group energy, and explicit floor or redistribution terms. The general remap mass criterion is \(\le 10^{-14}\) relative error. Managed axis-band unit tests use \(10^{-12}\) for mass/internal/radiation energy and \(10^{-14}\) for the changes of kinetic and total energy under a uniform translation. At runtime the band rolls back when the mass, radiation-energy (when the band holds radiation energy), cell-momentum, or nodal-momentum residual exceeds \(10^{-8}\), or when the residual of the band's total energy (internal plus kinetic) exceeds \(\min(10^{-10},\,2\times10^{-16}\sqrt{B})\) with \(B\) the number of band cells.</li>
+      </ul>
+    </section>
+
+    <section aria-labelledby="references">
+      <h2 id="references">References</h2>
+      <ol class="references">
+        <li>L. G. Margolin and M. J. Shashkov, "Second-Order Sign-Preserving Conservative Interpolation (Remapping) on General Grids," J. Comput. Phys. 184, 266–298 (2003). <a href="https://doi.org/10.1016/S0021-9991(02)00033-5">doi:10.1016/S0021-9991(02)00033-5</a></li>
+      </ol>
+    </section>
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["$$", "$$"], ["\\[", "\\]"]] } };</script>
+  <script defer src="../../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../../nav.js" data-page="ale-remap" data-root="../../"></script>
+</body>
+</html>

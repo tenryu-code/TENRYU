@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en" data-lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Local Spitzer–Härm model and flux limiting — TENRYU Documentation</title>
+  <link rel="stylesheet" href="../../../style.css">
+  <script src="../../../theme.js"></script>
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>Local Spitzer–Härm model and flux limiting</h1>
+    <p class="abstract">The local model of electron heat conduction consists of the Spitzer–Härm (SH) conductivity, which always includes the Z-dependent γ<sub>0</sub> correction, and a harmonic flux limiter. This page defines the conductivity, the flux limiter, and how the limiter is applied in 1D and 2D RZ. The physical mechanism is on the <a href="index.html#mechanism">overview page</a>, and the nonlocal correction is on the <a href="snb.html">SNB page</a>.</p>
+
+    <section aria-labelledby="local-model">
+      <h2 id="local-model">Conductivity and flux-limiter equations</h2>
+      <p>Electron conductivity is evaluated in the cgs + eV unit system. The mean ionization \(\bar Z\) comes from the material model. Because Coulomb collision rates are governed by the mean of the charge <em>squared</em>, materials that provide the charge-moment ratio \(r_2=\langle Z^2\rangle/\bar Z^2\) replace \(\bar Z\) with the collisional effective charge \(\bar Z r_2\). The tables that give \(r_2\) are read in 1D_SPH only, so 2D RZ electron conduction keeps \(\bar Z\) (see <a href="../eos-opacity/ionization.html#ionization">EOS, opacity &amp; ionization</a>). The conductivity is:</p>
+      $$
+      \kappa_{SH}=\kappa_0\,\xi(\bar Z)\,
+      \frac{T_e^{5/2}}{\bar Z\ln\Lambda},\qquad
+      \xi(Z)=\frac{(Z+0.24)/(Z+4.2)}{(1+0.24)/(1+4.2)},
+      $$
+      $$
+      \kappa_0=3.06\times10^9
+      \;\mathrm{erg/(cm\,s\,eV^{7/2})},\qquad
+      \mathbf q_{SH}=-\kappa_{SH}\nabla T_e.
+      $$
+      <p>Here \(\kappa_0\) is the Spitzer prefactor in cgs + eV units, \(\xi(\bar Z)\) is the Z-dependent correction detailed in the list below, \(\ln\Lambda\) is the Coulomb logarithm, and \(\mathbf q_{SH}\) is the resulting unlimited heat flux.</p>
+      <p>In 1D the flux limit is applied per face. The face electron density and temperature — each the arithmetic average of the adjacent cells — and the thermal speed at that temperature build \(q_{max}\), and the harmonic composition described in the mechanism section caps the flux (\(k_B\) is the eV→erg conversion constant <code>eV_to_erg</code>, as everywhere in the cgs + eV system):</p>
+      $$
+      v_{th,e}=\sqrt{\frac{k_BT_e}{m_e}},\qquad
+      q_{max}=f_{lim}n_ek_BT_ev_{th,e},\qquad
+      \theta=\frac{1}{1+|q_{raw}|/q_{max}},\qquad q=\theta q_{raw}.
+      $$
+      <p>In 2D RZ the flux limit is applied per cell. The cell's electron density and temperature give \(q_{max}\), the cell's temperature-gradient magnitude \(|\nabla T_e|\) (the mean of the gradient magnitudes at the cell's nodes) gives \(q_{raw}=\kappa_{SH}|\nabla T_e|\), and the effective cell conductivity is \(\kappa_{eff}=\theta\kappa_{SH}\).</p>
+      <ul>
+        <li><strong>\(\xi(Z)\).</strong> γ<sub>0</sub>(Z) is the dimensionless electron heat-conduction coefficient of Braginskii transport theory (the prefactor of the Spitzer-type conductivity; 3.16 at Z=1), and ξ(Z) is the Epperlein–Short fit of its Z dependence, normalized so that ξ(1)=1, with ξ(∞)=4.19. The Z=1 component (3.16) is already folded into κ<sub>0</sub>. The correction applies in 1D, 2D, the per-material conservation mode, and the SH base flux used by SNB; no setting turns it off.</li>
+        <li><strong>\(q_{max}\) and \(\theta\).</strong> \(q_{max}=f_{lim}n_ek_BT_ev_{th,e}\) sets the free-streaming fraction and θ provides harmonic interpolation. The local path uses \(q_{raw}=q_{SH}\), whereas SNB uses \(q_{raw}=q_{SH}+\delta q\); SH and SH+δq pass through one shared flux limiter, never a second one (<a href="#fig-conduction-flux-composition">Figure A</a>).</li>
+        <li><strong>Face-κ policy.</strong> In 1D, the rule that builds a face κ from the two adjacent cell values is set by <code>face_kappa_policy</code> (default: the Kirchhoff secant, <code>kirchhoff_same_material</code>). The <a href="discretization.html#terms-face-kappa">terms section</a> gives the definition and the formula, and the <a href="discretization.html#faces-materials">face-conductivity section</a> the usage. The limiter's SH estimate and the applied flux always use the same face κ.</li>
+        <li><strong>Voids.</strong> <code>cell_is_void</code> forces κ<sub>eff</sub>=0, forming an adiabatic boundary and preventing floor-density exterior cells from collapsing the <a href="time-integration.html#terms-sts">explicit stability limit</a> Δt<sub>exp</sub>. SNB gives voids an identity row and zeroes adjacent group diffusivities.</li>
+        <li><strong>SNB groups.</strong> In the temperature-normalized electron energy β̂=E/(k<sub>B</sub> max T<sub>e</sub>), the lowest group is [0, 0.1], and the group edges above it form a geometric progression from 0.1 to <code>snb_E_max_over_Te</code> (23 geometric intervals for the default 24 groups; <a href="snb.html#fig-conduction-snb-groups">Figure B</a>). The weights ξ<sub>g</sub>=P(β<sub>g</sub>)−P(β<sub>g−1</sub>) are formed as exact differences of the antiderivative P. The two mean-free-path variants are the default <code>geometric_r2</code> and the original Schurtz form. The definitions of groups and weights are in the <a href="snb.html#terms-snb">terms section</a>.</li>
+        <li><strong>iSNB Picard.</strong> The Cao 2015 coupling fixes (θ, δq), repeats the STS <a href="time-integration.html#terms-sts">superstep</a> from \(T_e^n\), and recomputes the correction. It performs at least two iterations and uses a flux max-norm relative tolerance; at convergence the amplification factor lies in (0,1) for every Δt, giving unconditional stability. The iteration is defined in the <a href="snb.html#terms-snb">terms section</a>.</li>
+      </ul>
+
+      <figure id="fig-conduction-flux-composition">
+        <img src="../../../assets/conduction-flux-composition-en.png" width="960" height="380" style="max-width:100%;height:auto" alt="Left: a flow chart in which the Spitzer–Härm flux q_SH and the SNB nonlocal correction δq are added to give the unlimited flux q_raw, which passes through one shared harmonic flux limit to give the applied flux q. Right: the response of the limit, |q|/q_max against |q_raw|/q_max; the solid blue curve follows the dotted line (q≈q_raw) at small q_raw and approaches the dashed line (q_max) at large q_raw">
+        <figcaption>Figure A. Flux composition and the harmonic flux limit. Left: the SH flux q<sub>SH</sub>, plus the nonlocal correction δq only when SNB is used, gives the unlimited flux q<sub>raw</sub>, which passes once through one shared harmonic flux limit (factor θ) to give the applied flux q. With <code>nonlocal_model="none"</code>, δq=0 and the path reduces to the limited SH flux of the local model. Right: the response of the limit, |q|/q<sub>max</sub>=x/(1+x) with x=|q<sub>raw</sub>|/q<sub>max</sub> (solid blue). The dotted line is the diffusive limit q≈q<sub>raw</sub> and the dashed line is the free-streaming cap q<sub>max</sub>; the solid curve lies below both for every x.</figcaption>
+      </figure>
+    </section>
+
+    <section aria-labelledby="controls">
+      <h2 id="controls">Namelist controls</h2>
+      <p>These are the keys of the local model under <code>Numerics.conduction</code>. See the <a href="../../use/namelist.html">namelist reference</a> for all keys and their validation rules. The defaults in the table are the values used when the deck does not set the key. Studio writes a different value only for <code>f_lim</code>, which is 0.5 when SNB is selected.</p>
+      <table class="quick-facts">
+        <thead>
+          <tr><th>Key</th><th>Default</th><th>Purpose</th></tr>
+        </thead>
+        <tbody>
+          <tr><th><code>conduction.enabled</code></th><td><code>True</code></td><td>Enables the electron-conduction operator.</td></tr>
+          <tr><th><code>f_lim</code></th><td><code>0.06</code></td><td>Coefficient of the harmonic flux limiter shared by the local model and SNB (a fraction of the free-streaming flux). With SNB, a deck sets 0.5 as a cap that stops anomalous composite fluxes, not as a value that tunes the nonlocal effect (the GUI switches automatically).</td></tr>
+        </tbody>
+      </table>
+
+    </section>
+
+    <section aria-labelledby="verification">
+      <h2 id="verification">Verification</h2>
+      <ul>
+        <li><strong>Agreement with SNB switched off:</strong> with <code>nonlocal_model="none"</code>, the six FLD metrics of the <a href="../../verification/index.html#gxii">GXII</a> run stay bit-identical (relative difference 0) to the run of the local model before SNB was added.</li>
+      </ul>
+    </section>
+
+    <section aria-labelledby="references">
+      <h2 id="references">References</h2>
+      <ol class="references">
+        <li>L. Spitzer, Jr. and R. Härm, "Transport Phenomena in a Completely Ionized Gas," Phys. Rev. 89, 977–981 (1953). <a href="https://doi.org/10.1103/PhysRev.89.977">doi:10.1103/PhysRev.89.977</a></li>
+        <li>S. I. Braginskii, "Transport Processes in a Plasma," Reviews of Plasma Physics 1, 205–311 (1965).</li>
+        <li>E. M. Epperlein and R. W. Short, "A Practical Nonlocal Model for Electron Heat Transport in Laser Plasmas," Phys. Fluids B 3, 3092–3098 (1991). <a href="https://doi.org/10.1063/1.859789">doi:10.1063/1.859789</a></li>
+      </ol>
+    </section>
+
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["$$", "$$"], ["\\[", "\\]"]] } };</script>
+  <script defer src="../../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../../nav.js" data-page="conduction-local" data-root="../../"></script>
+</body>
+</html>

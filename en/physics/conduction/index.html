@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en" data-lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Heat conduction — TENRYU Documentation</title>
+  <link rel="stylesheet" href="../../../style.css">
+  <script src="../../../theme.js"></script>
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>Heat conduction <span class="badge">reference</span></h1>
+    <p class="abstract">TENRYU's heat conduction consists of electron heat conduction and ion heat conduction. Electron conduction is based on the local Spitzer–Härm (SH) model with a harmonic flux limiter. In 1D and 2D RZ, the SNB (Schurtz–Nicolaï–Busquet) multigroup model can add a nonlocal correction. Ion conduction is a separate option based on the Braginskii conductivity, available for two-temperature runs in 1D and 2D RZ. By default the time integration is explicit super-time-stepping (STS); 1D also has a backward-Euler implicit solver, and 2D RZ has an implicit solver that satisfies the discrete maximum principle. This page describes the physical mechanism and the structure of the whole heat-conduction calculation; the details are split over the five pages below.</p>
+
+    <aside class="planned" aria-labelledby="at-a-glance">
+      <h3 id="at-a-glance">At a glance</h3>
+      <ul>
+        <li>The Z-dependent γ<sub>0</sub> correction applies on every path; no setting turns it off.</li>
+        <li>The local SH model and SNB share the same harmonic flux limiter. The default <code>f_lim</code> is 0.06; with SNB, a deck sets 0.5 (the GUI switches to 0.5 when SNB is selected).</li>
+        <li>1D uses a conservative finite-volume operator. 2D RZ uses a node-local operator with symmetric conductances. STS accelerates both explicit diffusion paths. The per-material conservation mode (<code>per_material_conservation_enabled</code>) is available only in 2D RZ. These terms are defined in the <a href="discretization.html#terms">terms section of the spatial-discretization page</a> and the <a href="time-integration.html#terms">terms section of the time-integration page</a>.</li>
+        <li><a href="../eos-opacity/index.html#void-materials">Void</a> cells are insulating (adiabatic) with κ<sub>eff</sub>=0. The SNB multigroup correction cannot cross a void either.</li>
+      </ul>
+    </aside>
+
+    <div class="card-grid">
+      <a class="card" href="local.html"><h3>Local Spitzer–Härm model and flux limiting</h3><p>The conductivity, its Z-dependent correction, and the harmonic flux limiter.</p></a>
+      <a class="card" href="discretization.html"><h3>Spatial discretization</h3><p>The face-conductivity policy, the node-local operator of 2D RZ, the per-material conservation mode, and voids.</p></a>
+      <a class="card" href="time-integration.html"><h3>Time integration</h3><p>The super-time-stepping procedure and the implicit solvers of 1D and 2D RZ.</p></a>
+      <a class="card" href="snb.html"><h3>SNB nonlocal model</h3><p>The multigroup nonlocal correction and the iSNB Picard iteration.</p></a>
+      <a class="card" href="ion.html"><h3>Ion heat conduction</h3><p>Heat conduction of the ion temperature with the Braginskii conductivity and a flux limiter.</p></a>
+    </div>
+
+    <section aria-labelledby="mechanism">
+      <h2 id="mechanism">Physical mechanism</h2>
+      <p>In a laser target, the place where laser energy is absorbed (the dilute corona outside the critical-density surface) and the place where that energy does work as ablation pressure (the dense ablation front) are spatially separate. Electron thermal conduction is the main energy transport that connects them. Its strength sets the ablation pressure and the mass ablation rate, and it also sets how much heat runs ahead of the front into cold material — the preheat.</p>
+      <p>The starting model makes the heat flux proportional to the local temperature gradient: \(\mathbf q_{SH}=-\kappa_{SH}\nabla T_e\), i.e. a Fourier law, with the conductivity \(\kappa_{SH}\) taken from Spitzer–Härm (SH) theory of electron–ion Coulomb collisions. The temperature scaling follows from a short chain. Coulomb scattering deflects fast electrons poorly, so the collision frequency drops steeply with speed, \(\nu_{ei}\propto v^{-3}\). Evaluated for thermal electrons (\(v\sim v_{th,e}\propto T_e^{1/2}\)), this gives \(T_e^{-3/2}\), and the mean free path (mfp) \(\lambda_{ei}=v/\nu_{ei}\) grows as \(\lambda_{ei}\propto T_e^{2}/(n_e Z\ln\Lambda)\) — quadratically in temperature. Since conductivity is roughly "density × thermal speed × mean free path," the density dependence cancels and \(\kappa_{SH}\propto T_e^{5/2}/(Z\ln\Lambda)\) remains. Doubling the temperature multiplies the conductivity by about 5.7 — a strongly nonlinear response. A hotter corona therefore conducts much more strongly, and, as discussed below, becomes numerically "stiff" to integrate explicitly, with a vanishing stable time step. The Fourier law itself is a local approximation — the electron is assumed to feel only the gradient at its own position — and it is justified only while the electron mean free path stays well below the temperature-gradient scale length \(L_T=T_e/|\nabla T_e|\).</p>
+      <p>Most of the heat, however, is not carried by average thermal electrons. When the flux is decomposed by electron energy (the SNB spectral weight \(\beta^4e^{-\beta}/24\) introduced below is this distribution), the contribution peaks for suprathermal electrons moving at roughly \(3–4\,v_{th,e}\). Because the mean free path scales as \(v^4\) (a consequence of \(\lambda=v/\nu\) with \(\nu\propto v^{-3}\)), these electrons have mean free paths 3<sup>4</sup>–4<sup>4</sup>, roughly 80–260 times longer than those of thermal electrons. The local condition \(\lambda\ll L_T\) can therefore hold when evaluated for thermal electrons while already being violated for the electrons that actually carry the heat. The violation sets in first near the ablation front, where the gradient is steepest.</p>
+      <p>Even in the strong-gradient limit where the local law fails, the flux has a firm physical ceiling: the free-streaming flux \(n_e k_BT_ev_{th,e}\), obtained if the entire thermal energy content streamed one way at the thermal speed. Kinetic calculations and experiments both show that only a fraction of it can actually be sustained, and TENRYU carries that fraction in the coefficient \(f_{lim}\), imposing the cap \(q_{max}=f_{lim}n_ek_BT_ev_{th,e}\). The cap is applied through the factor \(\theta=1/(1+|q_{raw}|/q_{max})\); the resulting flux \(q=\theta q_{raw}\) satisfies, in magnitude, \(1/|q|=1/|q_{raw}|+1/q_{max}\) — the same harmonic composition as resistors in parallel, hence the name harmonic flux limiter. Where gradients are gentle, \(q\approx q_{raw}\); at strong gradients it saturates smoothly toward \(q_{max}\) with no kink. The local-SH default \(f_{lim}=0.06\) lies in the calibration range long used against direct-drive experiments. The value 0.5 used with SNB is much looser because the flux limiter plays a different role there: SNB computes the flux suppression itself, and the flux limiter acts only when the composite flux, with the nonlocal correction added, becomes anomalously large (see the SNB section).</p>
+      <p>A flux limiter alone cannot represent nonlocal transport. The \(v^4\) mean-free-path scaling produces two consequences at once. First, at the steepest point, the electrons cross the gradient without colliding, so the flux never builds up to the local-gradient prediction: the real flux falls below the Spitzer–Härm value (flux inhibition). Second, the same electrons keep carrying heat forward for several mean free paths before stopping, heating material beyond the ablation front (preheat). Because a flux limiter can only reduce the local flux, it can approximate the first effect but cannot, in principle, represent the second — moving heat ahead of the gradient. Capturing both requires a nonlocal model that follows electrons by energy and resolves how far they travel and where they deposit their heat.</p>
+      <p>The Schurtz–Nicolaï–Busquet (SNB) model is the standard reduced-kinetic model for this purpose. Instead of solving the full kinetic equation, it splits the SH flux into electron-energy groups and, for each group, solves a diffusion equation for a transport field \(H_g\) (dimensionally a heat flux) whose spatial scale is the group's mean free path \(\lambda_g\). \(H_g\) spreads away from its source, the group's share of the local SH flux. This represents the electrons of the group carrying heat to positions away from the local gradient, and the reconstructed correction \(\delta q=-\sum_g(\lambda_g^{tr}/3)\nabla H_g\) both reduces the flux at the steep point and produces preheat ahead of it. In TENRYU, SNB is an additive correction to the same limited SH pipeline, not an alternative solver, and the corrected composite flux passes through the single shared flux limiter. The quantities of SNB, such as the groups and the transport field, are defined in the <a href="snb.html#terms-snb">terms section</a>. The default mean-free-path calibration (the \(r=2\) form of Sherlock 2017) already folds in electric-field flux suppression, so the optional explicit E-field term defaults off to avoid double counting. The calibration factor \(r\) is the scaling parameter of the group mean free path in the notation of Brodrick et al.; the adopted mean free path (Sherlock 2017) is equivalent to the choice \(r=2\).</p>
+      <p>The main numerical challenge is the stability limit of explicit diffusion, \(\Delta t\lesssim\Delta x^2/D\). The thermal diffusivity \(D\propto T_e^{5/2}/\rho\) grows rapidly in a hot, dilute corona, so the stable <a href="time-integration.html#terms-sts">substep</a> becomes far smaller than the hydrodynamic <a href="time-integration.html#terms-sts">global step</a>. In a representative <a href="../../verification/index.html#gxii">GXII</a> (GEKKO XII) corona (coronal cells of the 500 µm benchmark capsule at \(T_e\approx2\) keV, \(\rho\approx10^{-3}\) g/cm³, \(\Delta l\approx50\,\mu\)m), one global driver step would require 130–340 ordinary substeps. STS replaces that chain of substeps with \(s\) stages of different lengths whose combined stability interval grows as \(O(s^2)\), so the required stage count is only about the square root of the substep count (\(s\approx\lceil\sqrt{2N_{sub}}\rceil\)) — 17–27 stages in this example. Coefficients are fixed at the entry temperature (only the 2D RZ <a href="discretization.html#terms-face-kappa">Kirchhoff secant</a> is evaluated at the stage temperature; see the <a href="time-integration.html#sts">super-time-stepping</a> section), and one <a href="../../overview/numerics-foundations.html#operator-splitting">re-closure</a> (recomputing temperature, pressure, and specific heat from \((\rho,e)\) with the equation of state, EOS) ends the step. Every update is conservative, and the per-material conservation mode uses the same STS. In 1D the optional ion conduction does not use STS but solves a separate backward-Euler tridiagonal system with the same <a href="discretization.html#terms-face-kappa">face-κ policy</a>. In 2D RZ it puts the ion coefficients into the same node-local operator as the electrons and solves it with the same STS.</p>
+    </section>
+
+    <section aria-labelledby="position">
+      <h2 id="position">Position in the operator sequence and correspondence by dimension</h2>
+      <p>Within the operator sequence of one outer step, heat conduction follows the first half step of the hydrodynamics and precedes the radiation transport (<a href="../../overview/numerics-foundations.html#operator-splitting">operator splitting and the re-closure discipline</a>). Electron conduction updates the temperature directly, so the electron energy, pressure, and specific heat are recomputed from the electron temperature afterwards (re-closure). When ion conduction is enabled, the ion-temperature conduction is solved right after that and booked in the ion internal energy. The restrictions that conduction places on the global time step are collected on the <a href="../../overview/timestep.html#conduction-dt">time-step control</a> page.</p>
+      <p>The table below gives the correspondence by dimension.</p>
+      <table class="quick-facts">
+        <thead>
+          <tr><th>Item</th><th>1D</th><th>2D RZ</th><th>Details</th></tr>
+        </thead>
+        <tbody>
+          <tr><th>Local SH model and flux limiter</th><td>Applied face by face.</td><td>Applied cell by cell.</td><td><a href="local.html">Local model</a></td></tr>
+          <tr><th>Spatial discretization</th><td>Conservative finite volume. <code>face_kappa_policy</code> sets the face conductivity.</td><td>Node-local operator with symmetric conductances.</td><td><a href="discretization.html">Spatial discretization</a></td></tr>
+          <tr><th>Per-material conservation mode</th><td>Not available.</td><td>Available.</td><td><a href="discretization.html#terms-per-material">Per-material conservation mode</a></td></tr>
+          <tr><th>Time integration (default)</th><td>STS (<code>solver="sts"</code>).</td><td>STS. <code>sts_scheme</code> can also select RKL2.</td><td><a href="time-integration.html#sts">Super-time-stepping</a></td></tr>
+          <tr><th>Time integration (implicit)</th><td><code>solver="implicit"</code> (backward-Euler tridiagonal system).</td><td><code>solver="dmp_implicit"</code> (backward Euler satisfying the discrete maximum principle).</td><td><a href="time-integration.html#implicit">Implicit solvers</a></td></tr>
+          <tr><th>SNB nonlocal model</th><td>Tridiagonal system.</td><td>Node-local operator with conjugate gradients.</td><td><a href="snb.html">SNB</a></td></tr>
+          <tr><th>Ion heat conduction</th><td>Backward-Euler tridiagonal system.</td><td>Same node-local operator as the electrons, with STS.</td><td><a href="ion.html">Ion heat conduction</a></td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section aria-labelledby="verification">
+      <h2 id="verification">Verification</h2>
+      <ul>
+        <li><strong>GXII reference solution:</strong> with conduction active, an integrated regression test checks absorbed energy, bang time, minimum shell radius, peak density, areal density, and central temperature.</li>
+      </ul>
+    </section>
+
+    <section aria-labelledby="references">
+      <h2 id="references">References</h2>
+      <ol class="references">
+        <li>L. Spitzer, Jr. and R. Härm, "Transport Phenomena in a Completely Ionized Gas," Phys. Rev. 89, 977–981 (1953). <a href="https://doi.org/10.1103/PhysRev.89.977">doi:10.1103/PhysRev.89.977</a></li>
+        <li>S. I. Braginskii, "Transport Processes in a Plasma," Reviews of Plasma Physics 1, 205–311 (1965).</li>
+        <li>E. M. Epperlein and R. W. Short, "A Practical Nonlocal Model for Electron Heat Transport in Laser Plasmas," Phys. Fluids B 3, 3092–3098 (1991). <a href="https://doi.org/10.1063/1.859789">doi:10.1063/1.859789</a></li>
+        <li>R. E. Pattle, "Diffusion from an Instantaneous Point Source with a Concentration-Dependent Coefficient," Q. J. Mech. Appl. Math. 12, 407–409 (1959). <a href="https://doi.org/10.1093/qjmam/12.4.407">doi:10.1093/qjmam/12.4.407</a></li>
+        <li>V. Alexiades, G. Amiez, and P.-A. Gremaud, "Super-Time-Stepping Acceleration of Explicit Schemes for Parabolic Problems," Commun. Numer. Methods Eng. 12, 31–42 (1996). <a href="https://doi.org/10.1002/(SICI)1099-0887(199601)12:1%3C31::AID-CNM950%3E3.0.CO;2-5">doi:10.1002/(SICI)1099-0887(199601)12:1&lt;31::AID-CNM950&gt;3.0.CO;2-5</a></li>
+        <li>G. P. Schurtz, Ph. D. Nicolaï, and M. Busquet, "A Nonlocal Electron Conduction Model for Multidimensional Radiation Hydrodynamics Codes," Phys. Plasmas 7, 4238–4249 (2000). <a href="https://doi.org/10.1063/1.1289512">doi:10.1063/1.1289512</a></li>
+        <li>M. Sherlock, J. P. Brodrick, and C. P. Ridgers, "A Comparison of Non-Local Electron Transport Models for Laser-Plasmas Relevant to Inertial Confinement Fusion," Phys. Plasmas 24, 082706 (2017). <a href="https://doi.org/10.1063/1.4986095">doi:10.1063/1.4986095</a></li>
+        <li>D. Cao, G. Moses, and J. Delettrez, "Improved Non-Local Electron Thermal Transport Model for Two-Dimensional Radiation Hydrodynamics Simulations," Phys. Plasmas 22, 082308 (2015). <a href="https://doi.org/10.1063/1.4928445">doi:10.1063/1.4928445</a></li>
+        <li>A. Marocchino, M. Tzoufras, S. Atzeni, et al., "Comparison for Non-Local Hydrodynamic Thermal Conduction Models," Phys. Plasmas 20, 022702 (2013). <a href="https://doi.org/10.1063/1.4789878">doi:10.1063/1.4789878</a></li>
+      </ol>
+    </section>
+
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["$$", "$$"], ["\\[", "\\]"]] } };</script>
+  <script defer src="../../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../../nav.js" data-page="conduction" data-root="../../"></script>
+</body>
+</html>

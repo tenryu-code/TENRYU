@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en" data-lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ionization and collisional effective charge — TENRYU Documentation</title>
+  <link rel="stylesheet" href="../../../style.css">
+  <script src="../../../theme.js"></script>
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>Ionization and collisional effective charge</h1>
+    <p class="abstract">The mean ionization \(\bar Z\) sets the electron number density \(n_e\), which enters heat conduction, the inverse-bremsstrahlung absorption of the laser, the electron EOS, and the radiation–matter coupling. TENRYU offers a fixed \(\bar Z=Z\), More's approximation to the Thomas–Fermi ionization, and a tabulated \(\bar Z(\rho,T_e)\). The electron–ion collision rate scales with \(Z^2\), not \(Z\), so when the charge-state fractions are available the collisional effective charge \(Z_{\rm eff}\) is used for heat conduction and for the laser absorption. This page describes the ionization models and how the effective charge is obtained. Terms specific to this calculation are defined in the <a href="#terms">terms section</a>.</p>
+
+    <aside class="planned" aria-labelledby="at-a-glance">
+      <h3 id="at-a-glance">At a glance</h3>
+      <ul>
+        <li><strong>Ionization models:</strong> the default of <code>Materials.zbar.model</code> is <code>fixed</code>, which sets \(\bar Z=Z\) (full ionization). <code>thomas_fermi</code> and <code>tabular</code> are also available.</li>
+        <li><strong>When it is evaluated:</strong> a dynamic model is re-evaluated after each fluid half-step and at the entry of each conduction and radiation operator.</li>
+        <li><strong>Effect on conduction:</strong> when the TMAT file has charge-state fractions, the charge factor of Spitzer conduction and SNB is replaced by \(Z_{\rm eff}\). This path is limited to <code>1D_SPH</code>.</li>
+        <li><strong>Effect on the laser:</strong> <code>Laser.ib.zeff_model</code> (default <code>auto</code>) selects the \(Z_{\rm eff}\) of the inverse-bremsstrahlung absorption.</li>
+      </ul>
+    </aside>
+
+    <section aria-labelledby="ionization">
+      <h2 id="ionization">Mean ionization and collisional effective charge</h2>
+      <p>The default <code>Materials.zbar.model="fixed"</code> uses \(\bar Z=Z\), implying full ionization, unless <code>Materials.zbar.fixed_value</code> (unset by default) is given; a <code>fixed_value</code> of 0 or more is used as \(\bar Z\) in every non-void cell. State-dependent alternatives are <code>thomas_fermi</code>, which uses More's fit to the Thomas–Fermi ionization (Table IV of reference [2], in the similarity variables \(\rho/(ZA)\) and \(T_e/Z^{4/3}\), the same variables as the Thomas–Fermi scaling of QEOS [1]), and <code>tabular</code>, which interpolates \(\bar Z(\rho,T_e)\). Dynamic models are reevaluated at the entrances to the hydro half-steps and to the conduction and radiation operators, and in 1D also before the laser operator. Thus ionization after hydro compression reaches conduction, and the temperature change after conduction reaches radiation closure.</p>
+      <p>If a TMAT file contains optional per-element charge-state fractions under <code>/ionization</code>, TENRYU can retain a collisional moment that a single \(\bar Z\) loses. It reduces the fractions to \(r_2=\langle Z^2\rangle/\bar Z^2\), clamps that ratio to 1–10, and uses \(\bar Zr_2=Z_{\rm eff}\) (<a href="#terms-zeff">terms</a>) for Spitzer conduction and the SNB charge factor. With no fraction table, no correction is applied. This table-moment path is restricted to <code>1D_SPH</code>; in a <a href="../../use/namelist.html#terms-deck">deck</a> with several materials, each cell uses the fraction table of its own material, and a material without one gets no correction.</p>
+      <p>The material <code>zbar.model</code> and laser-IB <code>Laser.ib.zeff_model</code> are separate controls. The latter defaults to <code>auto</code>, which is resolved at build time. It becomes <code>table</code> when TMAT ionization fractions exist. Otherwise, in 1D spherical geometry, it becomes <a href="#terms-strip"><code>sequential_strip</code> (sequential stripping)</a> when <code>Laser.ib.species</code> is given or when every non-<a href="index.html#void-materials">void</a> material shares one multi-species TMAT composition (which then becomes the species list, such as C and H for CD). In all other cases it becomes <code>off</code>, with a warning for a mixture in 1D spherical geometry. In a 1D spherical deck with two or more non-void materials, <code>auto</code> is resolved per material: a material's own ionization fractions give <code>table</code>, given species or a TMAT composition of two to four species give <code>sequential_strip</code>, and any other material gets <code>off</code>. Fixed \(\bar Z\) and automatic \(Z_{\rm eff}\) therefore govern electron density and multispecies collision weighting, respectively.</p>
+    </section>
+
+    <section aria-labelledby="terms">
+      <h2 id="terms">Terms used in this calculation</h2>
+      <p>The collisional effective charge, the mixed-cell averages, and the distribution of charge over several elements (sequential stripping) carry meanings specific to TENRYU's implementation, so they are defined here.</p>
+
+      <h3 id="terms-zeff">Collisional effective charge and the mixed-cell averages</h3>
+      <p>The <strong>collisional effective charge</strong> \(Z_{\rm eff}\) is the mean square of the ion charge divided by the mean, \(Z_{\rm eff}=\langle Z^2\rangle/\langle Z\rangle\). With \(\langle Z\rangle=\bar Z\) and \(r_2=\langle Z^2\rangle/\bar Z^2\), this is \(Z_{\rm eff}=\bar Zr_2\). Electron–ion collision rates scale with \(Z^2\), not \(Z\), so for the same \(\bar Z\) the collisions are stronger the more the ion charges differ. Since \(r_2\) is a variance ratio, \(r_2\ge1\) holds by construction, and TENRYU clamps it to 1–10. For example, for fully ionized CD (carbon and hydrogen 1:1), \(\bar Z=3.5\) gives \(Z_{\rm eff}=(36+1)/(6+1)\approx5.29\) and \(r_2\approx1.51\).</p>
+      <p>\(Z_{\rm eff}\) is used in two places. In conduction, when the TMAT file has charge-state fractions, the Spitzer conduction and SNB charge factors are replaced by \(Z_{\rm eff}\) (<code>1D_SPH</code> only). In laser inverse bremsstrahlung, the charge dependence of the absorption coefficient is given by \(Z_{\rm eff}=\bar Zr_2\) instead of \(\bar Z\), and <code>Laser.ib.zeff_model</code> selects how \(r_2\) is obtained. The values are <code>auto</code> (the default; Studio does not write this key), <code>off</code> (\(r_2=1\)), <code>table</code> (a table built from the TMAT charge-state fractions), and <code>sequential_strip</code> (described below).</p>
+      <p>The <strong>mixed-cell averages \(\bar Z_{\rm eff}\) and \(A_{\rm eff}\)</strong> are the averages that combine the per-material values into the cell's representative values in a mixed cell. The names are similar, but they are different quantities from the \(Z_{\rm eff}\) above. \(A_{\rm eff}\) is the volume-fraction-weighted harmonic mean, \(1/A_{\rm eff}=\sum_mf_m/A_m\). \(\bar Z_{\rm eff}\) is the mean of the per-material mean ionizations \(\bar Z_m\) weighted by the ion number \(f_m/A_m\), \(\bar Z_{\rm eff}=\sum_m(f_m/A_m)\bar Z_m\big/\sum_m(f_m/A_m)\). The sums run over the non-void materials only and are renormalized by the sum of their volume fractions. With these weights, \(n_e=\rho\bar Z_{\rm eff}/(A_{\rm eff}m_p)\) equals the sum of \(f_m\rho\bar Z_m/(A_mm_p)\) over the materials. The conduction coefficients and the electron–ion energy exchange read this \(n_e\) and \(A_{\rm eff}\) as the cell values.</p>
+
+      <h3 id="terms-strip">Sequential stripping</h3>
+      <p><strong>Sequential stripping</strong> is an approximation that distributes the mean ionization \(\bar Z\) (the mean number of free electrons per atom) of a plasma of several elements over the charges \(z_s\) of the individual elements. Starting from the element of the lowest atomic number, it ionizes each element fully until the electrons run out and passes the remaining electrons on to the next element. With \(x_s\) the number fraction and \(Z_s\) the atomic number of element \(s\) (in ascending order) and \(R\) the remaining number of electrons (initially \(\bar Z\)), it applies \(z_s=\min(Z_s,\,R/x_s)\) and \(R\leftarrow R-x_sz_s\) in turn. It is exact in the fully ionized limit.</p>
+      <p>From the resulting \(z_s\) it forms \(Z_{\rm eff}=\sum_sx_sz_s^2\big/\sum_sx_sz_s\), clamps the ratio \(r_2=Z_{\rm eff}/\bar Z\) to 1–10, and uses \(Z_{\rm eff}=\bar Zr_2\) in the absorption coefficient of laser inverse bremsstrahlung. The elements are given by <code>Laser.ib.species=[[Z, x], …]</code>. There are at most four elements, and with only one, \(r_2=1\). The atomic numbers must be strictly increasing, each \(x_s>0\), and the sum must lie in [0.99, 1.01]. <code>Laser.ib.zeff_model="sequential_strip"</code> requires <code>species</code>. Under <code>auto</code> this approximation is chosen when <code>species</code> is given, or in 1D spherical geometry when all non-void materials share one multi-species composition (<a href="#ionization">Mean ionization and collisional effective charge</a>).</p>
+    </section>
+
+    <section aria-labelledby="controls">
+      <h2 id="controls">Namelist controls</h2>
+      <p>The table lists the controls that relate directly to the ionization and the effective charge. See the <a href="../../use/namelist.html">namelist reference</a> for complete validation rules.</p>
+      <table class="quick-facts">
+        <thead>
+          <tr><th>Key</th><th>Value/default</th><th>Purpose</th></tr>
+        </thead>
+        <tbody>
+          <tr><th><code>Materials.zbar.model</code></th><td><code>"fixed"</code></td><td>Selects <code>fixed</code>, <code>thomas_fermi</code>, or <code>tabular</code> \(\bar Z\). <code>fixed</code> takes \(\bar Z=Z\) unless <code>Materials.zbar.fixed_value</code> (unset by default; Studio writes it only when it is set in the form) is 0 or more, in which case that value is the \(\bar Z\) of every cell.</td></tr>
+          <tr><th><code>Laser.ib.zeff_model</code></th><td><code>"auto"</code></td><td>Table \(Z_{\rm eff}\) when TMAT fractions exist; in 1D spherical geometry, <a href="#terms-strip">sequential stripping</a> from given species or a shared TMAT composition; otherwise no correction. Resolved per material in a 1D spherical deck with several non-void materials. Studio does not write this key, so it takes the default <code>auto</code>.</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section aria-labelledby="references">
+      <h2 id="references">References</h2>
+      <ol class="references">
+        <li>R. M. More, K. H. Warren, D. A. Young, and G. B. Zimmerman, "A New Quotidian Equation of State (QEOS) for Hot Dense Matter," Phys. Fluids 31, 3059–3078 (1988). <a href="https://doi.org/10.1063/1.866963">doi:10.1063/1.866963</a></li>
+        <li>R. M. More, "Pressure Ionization, Resonances, and the Continuity of Bound and Free States," Adv. At. Mol. Phys. 21, 305–356 (1985). <a href="https://doi.org/10.1016/s0065-2199(08)60145-1">doi:10.1016/s0065-2199(08)60145-1</a></li>
+      </ol>
+    </section>
+
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["$$", "$$"], ["\\[", "\\]"]] } };</script>
+  <script defer src="../../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../../nav.js" data-page="ionization" data-root="../../"></script>
+</body>
+</html>

@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="ja" data-lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>レーザー駆動と吸収 — TENRYU ドキュメント</title>
+  <link rel="stylesheet" href="../../../style.css">
+  <script src="../../../theme.js"></script>
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>レーザー駆動と吸収 <span class="badge">reference</span></h1>
+    <p class="abstract">TENRYU は、入力されたビーム光学と時間波形から光線束を作り、プラズマによる屈折と逆制動輻射（inverse bremsstrahlung、IB）吸収を解いて、電子系へエネルギーを付与する。1D 球対称の既定経路は \((R,Z)\) 面上の弦（chord）を追跡しつつ、場の参照と沈着（deposition）を半径 \(r\) に縮約する。2D RZ では任意方向の光線を 3 次元で追跡し、軸対称の場へ写像する。この頁はレーザー駆動全体の物理機構と 1 回のレーザー呼び出しの手順を述べ、項目ごとの詳細は下の 3 頁に分けて書く。この計算に固有の用語は、各頁の用語の節で説明する。</p>
+
+    <aside class="planned" aria-labelledby="at-a-glance">
+      <h3 id="at-a-glance">要点</h3>
+      <ul>
+        <li>各ビームのパワーを与える関数は初期化時に表へ<a href="../../use/running.html#terms-freeze">凍結（freeze）</a>され、実行中に Python を呼ぶことはない。</li>
+        <li>1D の <code>raytrace_2d</code> は環（<a href="beams.html#terms-launch">用語</a>）ごとの弦、2D RZ の <code>raytrace_3d</code> は軸対称場の中を進む 3 次元の光線である。1D の既定は、角運動量の保存から光線を区間（<a href="raytrace.html#terms-march">用語</a>）ごとの求積（quadrature）で積分する特性曲線積分（characteristic integration）で、臨界半径（critical radius）に達した光線は反射する。</li>
+        <li>吸収は \(dI/ds=-\kappa_{\rm IB}I\) に従う。各区間で失ったパワーを保存的に沈着し、残った分は終端の規約に従って収支へ入れる。</li>
+        <li>低温の固体から駆動を始めるには、臨界面（critical surface）の外側に、低密度のコロナ層が必要である。初期の流体のメッシュに置くか、レーザー格子だけにゴーストコロナ（ghost corona）として置く（<a href="absorption.html#corona-requirement">下の実務上の要件</a>）。</li>
+      </ul>
+    </aside>
+
+    <div class="card-grid">
+      <a class="card" href="beams.html"><h3>ビームと光線の打ち出し</h3><p>ビームのパワー波形と強度分布、打ち出し面の環への分割、打ち出し半径・標的中心を通る面での半径・衝突径数。</p></a>
+      <a class="card" href="raytrace.html"><h3>光線追跡</h3><p>1D 球対称の弦に沿う光線追跡、LaserMesh と行進、特性曲線積分、ビームグループと再利用キャッシュ。</p></a>
+      <a class="card" href="absorption.html"><h3>吸収と沈着</h3><p>逆制動輻射の吸収係数と区間ごとの沈着、臨界面での終端、裾のクロージャ、低密度のコロナ層の要件。</p></a>
+    </div>
+
+    <section aria-labelledby="mechanism">
+      <h2 id="mechanism">物理機構</h2>
+      <p>プラズマ中の電磁波は分散関係（dispersion relation） \(\omega^2=\omega_{pe}^2+c^2k^2\) に従う。プラズマ周波数（plasma frequency） \(\omega_{pe}\) は電子密度とともに上がるので、レーザーから見たプラズマは屈折率（refractive index） \(n=\sqrt{1-n_e/n_{\rm crit}}\) — 密度が高いほど小さい — をもつ屈折媒質になる。臨界密度（critical density） \(n_{\rm crit}\) は、局所のプラズマ周波数がレーザー周波数に達して伝搬できなくなる密度で、レーザー波長の 2 乗に反比例（\(\lambda^{-2}\)）する。したがって 3 倍高調波の 351 nm 光は、基本波 1053 nm の 9 倍高い密度まで到達できる。光は屈折率の高い側へ曲がるという光学の一般則のとおり、光線は低密度側 = 高屈折率側へ、すなわち密度勾配を下って高密度のコアから離れる向きへ曲がる。臨界面を越えては伝搬できないため、正面から入射した光線はそこで反射し、斜めに入射した光線は臨界面より手前の転回点（turning point。その半径を後述の Bouguer 半径と呼ぶ）で折り返す。コロナでは波長が密度勾配長より十分短いので、波を光線の束として扱う幾何光学（geometrical optics）が有効である。</p>
+      <p>プラズマは逆制動輻射によって光を吸収する。波の電場で電子が集団的に振動し、電子–イオン衝突がその振動エネルギーを熱へ変換する。変換の速さは電子–イオン衝突周波数（electron–ion collision frequency）で決まり、吸収係数は \(\kappa_{\rm IB}\propto \hat n\,\nu_{ei}/\sqrt{1-\hat n}\)（\(\hat n=n_e/n_{\rm crit}\) は臨界密度で規格化した電子密度）、衝突周波数は \(\nu_{ei}\propto \bar Z n_eT_e^{-3/2}\ln\Lambda\)（\(\ln\Lambda\) はクーロン対数、Coulomb logarithm）である。\(\nu_{ei}\) が \(n_e\) に比例するため、臨界近傍の因子を除けば \(\kappa_{\rm IB}\propto\hat n^2\) と密度の 2 乗で増え、\(T_e^{-3/2}\) により低温ほど強く吸収する。因子 \(1/\sqrt{1-\hat n}\) は臨界面近傍での群速度（group velocity）の低下を表し、減速した光は臨界面の近くに長く留まってさらに吸収される。したがって、臨界未満のコロナを格子で表すことは、数値上の便宜ではなく物理的な前提条件である。真空と固体を不連続につなぐと、光線は吸収が起こるべき低密度の経路を持たないまま臨界密度に達し、ほぼ無吸収で反射する。<a href="absorption.html#corona-requirement">下の実務上の要件</a>が、その帰結を定量的に示す。</p>
+      <p>v1 の既定の駆動は、屈折する幾何光学の光線に沿った衝突性の逆制動輻射吸収である。1D 球の光線追跡の経路では、非マクスウェル分布による IB 低減を表す Langdon 因子（Langdon factor）を既定で適用する（全ビームが共通の gaussian / super_gaussian / flat_top プロファイルを持つ構成で自動的に有効になり、成立しない構成では自動的に無効へ解決される。<code>Laser.ib.langdon_model="off"</code> で明示的に切れる）。波動光学（干渉やスペックル）は既定では含まない。混合プラズマの衝突電荷 \(Z_{\rm eff}=\sum_sn_sZ_s^2/\sum_sn_sZ_s\)（\(n_s\)、\(Z_s\) は各イオン種の数密度と電荷数。<code>Laser.ib.zeff_model</code>）も既定で自動的に解決され、<a href="../eos-opacity/ionization.html#ionization">材料の電離段分率の表</a>があるか、球の 1D で多種組成（CD など）が分かる構成では有効に、それ以外では無効になる。残る拡張吸収 — レーザー周波数でのクーロン対数（<code>Laser.ib.coulomb_log_model</code>）と、転回点での共鳴吸収（resonance absorption。<code>Laser.ra</code>） — は明示的に有効化するオプションで、既定はオフである。これらの拡張はいずれも 1D 専用である。TENRYU が扱うそれ以外のレーザー・プラズマ相互作用のチャネルは、独立した交差ビームエネルギー転送（cross-beam energy transfer、CBET。<a href="../lpi/cbet.html">CBET の頁</a>）カーネルと、ホット電子（hot electron。<a href="../lpi/hot-electrons.html">ホット電子の頁</a>）カーネルが担当する。</p>
+      <p>実装が保証するのは二つ、決定論と保存である。決定論の側では、各ビームの波形を返す関数を初期化時に表へ凍結するので実行中に Python が動くことはなく、光線ごとの沈着もビーム単位の固定順序で総和するので、結果はビット単位で再現する。保存の側では、呼び出しのたびに<a href="../../overview/numerics-foundations.html#energy-ledger">エネルギー台帳（energy ledger）</a>「入射 = 吸収 + 未吸収」を厳密に閉じる。光線がどう終わったか — 臨界面での逸出（escape）または沈着、メッシュからの退出、強度の下限による打ち切り — の分類が、残ったパワーを台帳のどちら側へ入れるかを決める。</p>
+    </section>
+
+    <section aria-labelledby="pipeline">
+      <h2 id="pipeline">1 回のレーザー呼び出しの手順</h2>
+      <ol>
+        <li><p><strong>再構築と写像。</strong> LaserMesh（<a href="raytrace.html#terms-lasermesh">用語</a>）を現在の流体の状態に合わせて作り直す。臨界面の近くには、最小の流体セル幅に <code>mesh_factor</code>（namelist では <code>Laser.lasermesh.mesh_factor</code>、既定 0.5）を掛けた細かい間隔の細帯を置き、コア側とコロナ側の両方へ等比級数的に粗くする。\(\rho,\bar Z,T_e\) を写して \(n_e\) を作り、節点のあいだの線形補間と、その厳密な微分 \(d\hat n/dr\) を使う。</p></li>
+        <li><p><strong>光線の構築。</strong> 各ビームのパワーを、凍結した波形の表から参照する。1D ではその時間ステップ \([t,t+\Delta t]\) での区分線形波形の厳密な平均 \(\bar P_b\) を使うので、時間ステップのエネルギーの和はパルスの積分に一致する。1D では、厳密な面積と強度分布の重みをもつ環ごとに、打ち出し半径 \(R_k\) の点から焦点を通る直線に沿う光線を作る。全ビームが同じ条件のときは 1 本のビームだけを追跡し、残りのビームには同じ沈着を足す（<a href="raytrace.html#chord-raytrace">弦の節</a>）。</p></li>
+        <li><p><strong>光線を進める。</strong> 1D の既定の特性曲線積分（上の節）では区間ごとの求積で進める。以下は<a href="raytrace.html#terms-march">行進</a>（<code>integrator="leapfrog"</code>）と 2D RZ の場合である。光線の方程式はハミルトン系（Hamiltonian system）なので、シンプレクティックな積分器（symplectic integrator）を使えば保存量 — 球対称では Bouguer 不変量 — の系統的なドリフトを抑えられる。1D の経路は可変刻みの velocity-Verlet 法で、初期キックを別に置かず、前の副ステップぶんと現在の副ステップぶんの半キックをどちらも現在位置で評価し直す。この形にした理由は実測にある。速度を半ステップずらして持つ旧来のスタッガード型 leapfrog は、適応制御で \(ds\) が変わった瞬間に位相の中心がずれ、1 副ステップあたり \(O(|\nabla\hat n|\,|\Delta(\Delta s)|)\)（密度勾配の大きさと刻み幅の変化量の積に比例する）の系統的なハミルトニアン散逸を生んでいた。その結果、転回点が \(\hat n\) 換算で 0.027 浅くなり、往復の光学的厚さの 22% が失われていた。現行方式はこの不整合を除き、解析解との比較検査での転回点の誤差は \(\hat n\) 換算 \(1.1\times10^{-5}\)、往復光学的厚さの誤差は 0.008% である（2D RZ の <code>raytrace_3d</code> も、発射点の速さを \(\sqrt{1-\hat n}\) に合わせ、同じ形の可変刻みの velocity-Verlet 法で進める）。刻み幅の適応制御では、勾配と光学的厚さの指標は \(ds\) を広げる方向にだけ働き、\(ds\) を縮められるのは転回角の目標だけである。真空中の区間は弦と球面の厳密な交点で終え、真空から物質への受け渡しでは、次に参照する区間を物質側に固定する。</p></li>
+        <li><p><strong>区間ごとの沈着。</strong> 行進では台形則で光学的厚さ \(S\) を作り、\(\Delta P=-P\operatorname{expm1}(-S)\) を評価して、その損失分を区間の中点へ沈着する。特性曲線積分では、求積で求めた区間の光学的厚さで同じ式を評価し、損失を区間のセルへ沈着する。</p></li>
+        <li><p><strong>終端。</strong> \(\hat n\ge1-\varepsilon_{\rm crit}\)（<code>Laser.absorption.eps_crit</code>、既定 \(10^{-4}\)）となった時点で裾のクロージャ（<a href="absorption.html#terms-tail-closure">用語</a>）により臨界面近傍の残りの吸収を解析的に閉じ、残ったパワーを臨界面での逸出・沈着の指定に従って配分する。1D の既定の特性曲線積分では、光線を臨界半径で反射させて追跡を続ける。メッシュからの退出と強度の下限による打ち切りで残った分は、未吸収へ入れる。</p></li>
+        <li><p><strong>総和と収支の検査。</strong> 光線ごとの沈着の行をビーム単位の固定順序で総和し、1D では半径方向の流体セルへ、2D RZ では近傍 4 点へ双線形に加熱を渡す。そのうえで「入射 = 吸収 + 未吸収」を検査する。</p></li>
+        <li><p><strong>再利用キャッシュの利用、または無効化。</strong> 再利用キャッシュ（<a href="raytrace.html#terms-reuse-cache">用語</a>）を有効にし（<code>Laser.raytrace_skip.enabled=True</code>。既定は無効）、次のいずれにも該当しないときは、光線を追跡せず、保存した沈着の分布へ現在のパワーを掛けて沈着を作る。次のいずれかに該当すると、光線を追跡し直して、キャッシュを取り直す。</p>
+          <ul>
+            <li>最初の時間ステップ（ステップ番号 0）である、またはキャッシュをまだ取っていない。</li>
+            <li>キャッシュを取った時点からのプラズマの変化 \(\delta\) が、しきい値（<code>threshold</code>、既定 0.01）以上である。</li>
+            <li>連続して再利用した回数が <code>max_consecutive</code>（既定 10）に達した。</li>
+            <li>総パワーが、または 1D ではいずれかのビームのパワーが、0 と 0 でない値のあいだで遷移した。</li>
+            <li>総パワーが、キャッシュを取った時点から 1% を超えて変化した。</li>
+            <li>いずれかのビームの向き（単位ベクトルの差の長さ）が \(10^{-10}\) を超えて、または焦点の位置が \(10^{-10}\) cm を超えて、またはデフォーカス（<code>defocus_DR</code>）が \(10^{-12}\) を超えて変化した。</li>
+            <li>ALE（arbitrary Lagrangian–Eulerian、任意ラグランジュ・オイラー法）のリゾーン（rezone）またはリマップを行った直後である（2D RZ のみ）。</li>
+            <li>いずれかのセルで、判定 \(\hat n&gt;\hat n_{\rm margin}-\varepsilon_{\rm crit\_guard}\) の結果がキャッシュを取った時点から変わった（そのセルの \(\hat n\) が帯の境界をどちらかの向きに横切った。\(\hat n_{\rm margin}\) は LaserMesh の臨界クリップ値 <code>Laser.lasermesh.critical_margin</code>、保護幅 <code>Laser.raytrace_skip.crit_guard</code> の既定は 0.01）。</li>
+            <li>CBET が有効（1D のみ。2D RZ で CBET が有効な計算はキャッシュを使わない）で、いずれかのビームのパワーが、キャッシュを取った時点から 1% を超えて変化した（ビーム間の交換で吸収が非線形になるため）。</li>
+          </ul>
+          <p><code>radial_absorption_1d</code>、ホット電子が有効な計算、2D RZ で CBET が有効な計算は、このキャッシュを使わない。</p></li>
+      </ol>
+    </section>
+
+    <section aria-labelledby="other-modes">
+      <h2 id="other-modes">2D RZ と簡易な半径方向モード</h2>
+      <p>2D RZ の <code>raytrace_3d</code> は、各光線を \((x,y,z)\) で追跡する。場は軸対称の LaserMesh 上の \(\hat n(R,Z)\) から読み、\(R=\sqrt{x^2+y^2}\) と連鎖律で 3 次元の勾配へ変換する。任意方向のビーム断面を 2 次元の光線配列で覆い、逆制動輻射による沈着の位置を \((R,Z)=(\sqrt{x^2+y^2},z)\) へ戻して、近傍 4 節点へ双線形に分配する。同じビームグループ（<a href="raytrace.html#terms-beam-group">用語</a>）のビームは、1 回のトレースを共有する。</p>
+      <p><code>radial_absorption_1d</code> は 1D 専用の簡易な経路である。RZ での光線の運動を解かず、全ビームの \(P_{\rm total}(t)=\sum_bP_b(t)\) を、外側から内側へ向かう 1 本の半径方向の流束として、セルの順に逆制動輻射で減衰させる。このモードでは、方向・F 値・焦点・強度分布・光線数は吸収の分布を変えず、光線軌跡の出力もない。1D の円筒・平面幾何（<code>Mesh.geometry_1d</code>）の <code>raytrace_2d</code> は特性曲線積分で動く（行進は球のみ）。</p>
+    </section>
+
+    <section aria-labelledby="controls">
+      <h2 id="controls">namelist による制御</h2>
+      <p>以下は、レーザー駆動に直接関係するキーの抜粋である。検証規則の全体は <a href="../../use/namelist.html">namelist リファレンス</a>を参照のこと。</p>
+      <table class="quick-facts">
+        <thead><tr><th>キー</th><th>値 / 単位</th><th>用途</th></tr></thead>
+        <tbody>
+          <tr><th><code>Laser.enabled</code></th><td><code>bool</code></td><td>レーザー演算子と LaserMesh を有効化。</td></tr>
+          <tr><th><code>Laser.wavelength_nm</code></th><td>nm</td><td>\(n_{\rm crit}\)、IB、屈折率を決める真空中の波長。</td></tr>
+          <tr><th><code>Laser.mode</code></th><td><code>"raytrace_2d"</code> / <code>"radial_absorption_1d"</code> / <code>"raytrace_3d"</code></td><td>順に、1D の弦追跡、1D の簡易な半径方向、2D RZ の 3 次元追跡である。</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section aria-labelledby="verification">
+      <h2 id="verification">検証</h2>
+      <ul>
+        <li><code>verify_gxii_1d_fld_regression</code> は、厚さ 10 µm の<a href="absorption.html#corona-requirement">コロナ層</a>（幅 2.5 µm のセルで 4 セル）を種にもつ統合デッキで、基準となるレーザー吸収率（回帰デッキの広いスポットの 12 ビーム照射での約 96% — 基準値の吸収エネルギー \(9.53\times10^{10}\) erg を、デッキの入射エネルギー \(9.9\times10^{10}\) erg（総パワー \(10^{13}\) W の台形パルスの積分）で割った値で、本ドキュメントの他の吸収率とは比較できない。3 つの条件対照は<a href="../../use/examples.html#absorption-numbers">「例題とプリセット」ページ</a>参照）と、最大圧縮時刻、ピーク密度、面密度、中心温度を判定する。</li>
+        <li>単一物理のレーザー検査（L1。屈折、吸収、エネルギー台帳、光線数に対する収束を調べる試験群。記号の意味は<a href="../../verification/index.html#tag-legend">試験のタグと用語の凡例</a>）のうち、<code>test_l1_oblique_incidence_refraction.cu</code> と <code>test_l1_beer_lambert_inverse_bremsstrahlung_slab.cu</code> は、検査に必要なデッキの機能（ビーム角の指定、一様な平板での吸収係数の指定）が未実装であることを記録するだけで、判定は行わない。<code>test_l1_laser_energy_balance_in_absorbed_escaped_reflected.cu</code> はエネルギー台帳の相対誤差 \(\le10^{-6}\) を要求し、<code>test_l1_ray_count_noise_convergence.cu</code> は 1 辺あたり 257 本の光線を参照として、65 本から 129 本へ増やしたときに、参照との分布の差（二乗ノルムの相対値）が係数 \(\ge1.2\) で減少することを要求する。</li>
+        <li>レーザーと流体の連成検査（L2）では、<code>test_l2_planar_ablation_front_benchmark.cu</code> が圧力の 50% 以内での比較とアブレーション面の単調な後退という本来の判定基準を、<code>test_l2_laser_to_hydro_energy_partition.cu</code> が 5% 以内かつ \(f_{\rm thermal}&gt;0.3\)（\(f_{\rm thermal}\)：測定時点で物質の内部エネルギーに入っている吸収レーザーエネルギーの割合）という本来の配分の判定基準を記録しているが、いずれも診断機能が未実装の状態である。<code>test_l2_oblique_beam_target_offset_symmetry.cu</code> も、現時点でのオフセット制御機能の未実装を記録している。</li>
+      </ul>
+    </section>
+
+    <section aria-labelledby="references">
+      <h2 id="references">参考文献</h2>
+      <ol class="references">
+        <li>J. P. Freidberg, R. W. Mitchell, R. L. Morse, and L. I. Rudsinski, "Resonant Absorption of Laser Light by Plasma Targets," Phys. Rev. Lett. 28, 795–799 (1972). <a href="https://doi.org/10.1103/PhysRevLett.28.795">doi:10.1103/PhysRevLett.28.795</a></li>
+        <li>D. W. Forslund, J. M. Kindel, K. Lee, et al., "Theory and Simulation of Resonant Absorption in a Hot Plasma," Phys. Rev. A 11, 679–683 (1975). <a href="https://doi.org/10.1103/PhysRevA.11.679">doi:10.1103/PhysRevA.11.679</a></li>
+        <li>A. Colaïtis, G. Duchateau, X. Ribeyre, et al., "Coupled Hydrodynamic Model for Laser-Plasma Interaction and Hot Electron Generation," Phys. Rev. E 92, 041101(R) (2015). <a href="https://doi.org/10.1103/PhysRevE.92.041101">doi:10.1103/PhysRevE.92.041101</a></li>
+      </ol>
+    </section>
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["$$", "$$"], ["\\[", "\\]"]] } };</script>
+  <script defer src="../../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../../nav.js" data-page="laser" data-root="../../"></script>
+</body>
+</html>

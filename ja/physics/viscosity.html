@@ -3,173 +3,20 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>プラズマ粘性 — TENRYU ドキュメント</title>
-  <link rel="stylesheet" href="../../style.css">
-  <script src="../../theme.js"></script>
+  <meta name="robots" content="noindex">
+  <title>プラズマ粘性 — TENRYU</title>
+  <link rel="canonical" href="hydrodynamics/plasma-viscosity.html">
+  <meta http-equiv="refresh" content="0; url=hydrodynamics/plasma-viscosity.html">
+  <script>
+  (function () {
+    var map = {};
+    var frag = location.hash ? location.hash.slice(1) : "";
+    var page = (frag && map[frag]) ? map[frag] : "hydrodynamics/plasma-viscosity.html";
+    location.replace(page + (frag ? "#" + frag : ""));
+  })();
+  </script>
 </head>
 <body>
-  <div id="topbar"></div>
-  <div id="sidebar"></div>
-  <main>
-    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
-    <h1>プラズマ粘性 <span class="badge">reference</span></h1>
-    <p class="abstract">TENRYU のプラズマ粘性（plasma viscosity）は、非磁化（unmagnetized）の Braginskii の係数を使い、1D の平面・円筒・球および 2D RZ（軸対称の R–Z 座標、axisymmetric R–Z）のラグランジュ流体（Lagrangian hydrodynamics）に、物理的なせん断応力（shear stress）、運動量の拡散（momentum diffusion）、正定値（positive-definite）の粘性加熱（viscous heating）を加える。イオン、電子、またはその両方の<a href="#terms-channel">チャネル</a>（channel）を選べ、平均自由行程（mean free path）に対する<a href="#terms-mfp-cap">上限</a>と、専用の陽的（explicit）な時間刻み制限を備える。2D RZ では、既定の面積重みの運動量スキームと併用できず、<code>rz_momentum_scheme="volume_weighted"</code> と <code>aw_compatible_force_work=False</code> を明示する必要がある（<a href="#controls">namelist による制御</a>参照）。この計算に固有の用語（チャネル、平均自由行程の上限、ゲルシュゴリン（Gershgorin）の安定性検査）は<a href="#terms">用語の節</a>で説明する。</p>
-
-    <aside class="planned" aria-labelledby="at-a-glance">
-      <h3 id="at-a-glance">要点</h3>
-      <ul>
-        <li>既定では無効で、互換性を保つ既定のチャネルは <code>species="ion"</code> である。</li>
-        <li><code>species="both"</code> は \(\eta_{\mathrm{eff}}=\eta_i+\eta_e\) として足し合わせ、それぞれの散逸熱を対応する温度へ返す。</li>
-        <li>古典的な係数はおおむね \(\eta\propto T^{5/2}\) で、密度依存性はクーロン対数（Coulomb logarithm）と<a href="#terms-mfp-cap">平均自由行程の上限</a>を通じてのみ入る。</li>
-        <li>プラズマ粘性は人工粘性（artificial viscosity）を置き換えるものではない。衝撃波を捕捉する（shock capturing）人工粘性は従来どおり併用する。</li>
-      </ul>
-    </aside>
-
-    <section aria-labelledby="mechanism">
-      <h2 id="mechanism">物理機構</h2>
-      <p>このモジュールが表すのは、<a href="hydrodynamics.html#artificial-viscosity">流体のページ</a>で述べた人工粘性ではなく、非磁化 Braginskii のクロージャ（closure）によってクーロン衝突（Coulomb collision）から生じる実在の運動量拡散である。熱伝導と同様の温度スケーリングが現れる。粘性係数はおおよそ「圧力 × 衝突時間（collision time）」\(\eta\sim nkT\tau\) で、\(n\) は粒子の数密度、\(kT\) は温度のエネルギー（erg）、\(\tau\) は衝突時間である。衝突時間は \(\tau\propto T^{3/2}/(n\ln\Lambda)\)（\(\ln\Lambda\) はクーロン対数）なので、密度が打ち消し合って係数は \(T^{5/2}\) で急激に増える。解像されたせん断や音響構造を減衰させ、失われた運動エネルギーをチャネルごとの熱へ変換する。イオン側の散逸は \(T_i\) を、電子側の散逸は \(T_e\) を加熱する。</p>
-      <p>\(\eta_i=0.96\,n_i kT_i\tau_i\)（\(n_i\) はイオンの数密度、\(\tau_i\) はイオンの衝突時間）から \(\eta_i\propto\sqrt A\,T_i^{5/2}/(Z^4\ln\Lambda)\)（\(A\) は質量数、\(Z\) は電荷数）が得られる。電荷の 4 乗に反比例するため、\(Z\) が大きい物質ではイオンのチャネルがほぼ非粘性的（inviscid）になる。一方、電子側は Whitney の係数が \(Z\) とともに 0.733 から 1.81 へ増えるうえ、イオン側のような強い \(Z\) 抑制を受けないため、\(T_e\gg T_i\) や高い \(Z\) では電子のチャネルが支配し得る。効き方の目安になるのは \(R=\eta_e/\eta_i\propto(T_e/T_i)^{5/2}Z^3/\sqrt A\) で、低い \(Z\) の等温な燃料ではイオンが支配的である。</p>
-      <p>プラズマ粘性で人工粘性を置き換えてはいけない。実在の衝撃波面の厚さはイオンの平均自由行程の数倍にすぎず、\(\Delta x/\lambda_{ii}\gg1\)（\(\Delta x\) はセル幅、\(\lambda_{ii}\) はイオンの平均自由行程）となる現実的なメッシュではまったく解像できないため、プラズマ粘性だけでは捕捉した衝撃波を支えられない。その散逸は人工粘性が担い、プラズマ粘性は解像された勾配に作用する。平均自由行程がセルの大きさに近づけば、流体としてのクロージャ自体が破れる。既定で 20 セルとしている<a href="#terms-mfp-cap">平均自由行程の上限</a>は、衝突時間を解像できる尺度へ結び付けるための正則化（regularization）であって、モデルを運動論的（kinetic）にするものではない。</p>
-      <p>離散化では、無トレースのひずみ速度（traceless rate-of-strain tensor）\(W\)（定義は<a href="#numerics">応力、上限、時間刻み</a>）と応力 \(\boldsymbol\pi=-\eta_{\rm eff}W\) を構成する。曲線座標（curvilinear coordinates）の 1D ではフープ項（hoop term。曲率に由来する応力の寄与）を含む。2D RZ では、各コーナー（corner。<a href="hydrodynamics.html#terms-corner">流体のページ</a>で定義する）に働く粘性力を節点の運動量の式に足し、エネルギー整合な（energy-compatible）経路では、その力がセルへする仕事を内部エネルギーの式に入れる。更新は陽的なので、このモジュールは \(\rho\Delta l^2/\eta\)（\(\Delta l\) はセルの長さ、\(\rho\) は密度、\(\eta\) は粘性係数）に比例する拡散の時間刻みの制限を、ドライバが時間刻みを決めるときの候補のひとつとして渡す（<a href="../overview/timestep.html#global-rule">時間刻みの決まり方</a>参照）。1D では、さらにステップの終了時に、<a href="#terms-stability-check">ゲルシュゴリンの安定性検査</a>を行う。この検査は、組み上げた粘性の更新を節点速度の線形な演算子とみなし、その固有値（eigenvalue）の上界 \(\lambda_G\)（ゲルシュゴリンの円板定理（Gershgorin circle theorem）による行和の最大値）を求めて、そのステップの時間刻み \(\Delta t\) が \(\Delta t\le2/\lambda_G\) を満たすことを確かめる。満たさないとき、<code>Numerics.hydro.driver_full_step_retry_enabled</code> が真ならステップ全体を入口の状態から時間刻みを半分にしてやり直し（再試行は最大 <code>driver_full_step_retry_max_attempts</code> 回、既定 3 回で、使い切ると停止する）、偽ならエラーで停止する。このキーの既定は偽で、Studio が書き出す 1D のデッキ（deck。<a href="../use/namelist.html#terms-deck">TENRYU の入力となる Python ファイル</a>）は真にしている。入口の状態で評価するスカラーの制限では見えない、曲率に由来する硬さと、ステップの途中での係数の増大を捉える。</p>
-    </section>
-
-    <section aria-labelledby="model">
-      <h2 id="model">Braginskii の係数とチャネル</h2>
-      <p>イオン側チャネルの粘性係数は、cgs + eV 系で次のように書ける（\(kT\) の \(k\) は、他の物理ページと同じく eV→erg の換算 <code>eV_to_erg</code>）。</p>
-      $$
-      \eta_i=0.96\,n_i(kT_i)\tau_i\,s_\eta,
-      \qquad
-      \tau_i=2.0852\times10^7\,
-      \frac{\sqrt A\,T_i[\mathrm{eV}]^{3/2}}
-           {n_iZ^4\ln\Lambda_{ii}}\ \mathrm{s},
-      $$
-      <p>ここで \(A\) は質量数、\(Z\) は電荷数、\(\ln\Lambda_{ii}\) はイオン–イオンのクーロン対数、\(T_i[\mathrm{eV}]\) は eV 単位のイオン温度、\(n_i\) はイオンの数密度（cm⁻³）、\(s_\eta\) は下に挙げる倍率である。</p>
-      <ul>
-        <li>\(0.96\) と \(2.0852\times10^7\) — それぞれ Braginskii の単一種の係数と、\(\tau_i\) に使う cgs + eV での前置因子である。</li>
-        <li>\(s_\eta=\)<code>eta0_scale</code> — 両チャネルに掛ける、係数の不確かさのための倍率である。</li>
-        <li><code>mfp_cap_cells=20</code> — 各チャネルを \(\tau_s\le C\Delta l/v_{th,s}\)（\(C\) はこの値）に制限する。0 にすると上限は無効になるが、推奨しない。定義は<a href="#terms-mfp-cap">用語の節</a>にある。</li>
-        <li>\(\eta_{00}^e(Z)\) — \(Z=1\) での 0.733 から、高い \(Z\) での 1.81 へ近づく Whitney の電子係数である。</li>
-        <li><code>lnlambda_fixed</code> — 正の値を指定すると、NRL（Naval Research Laboratory Plasma Formulary [10]）のイオン–イオンおよび電子–イオンのクーロン対数を両方とも上書きする。</li>
-        <li>\(8/3\) と <code>dt_safety</code> — 陽的な時間刻みの上限に現れる縦方向の拡散係数と、安全係数である。後者は部分サイクル（subcycling）の数ではない。このモジュールにスーパータイムステッピング（super time-stepping、STS。<a href="conduction.html#sts">熱伝導</a>が陽的な拡散の加速に使う）はない。</li>
-      </ul>
-      <p>したがって上限を掛ける前は \(\eta_i\simeq3.21\times10^{-5}\sqrt A\,T_i^{5/2}/(Z^4\ln\Lambda_{ii})\) ポアズである。\(s_\eta=\)<code>eta0_scale</code> は、係数の不確かさに対する感度パラメータである。混合したセルには、そのセルの \(A_{\mathrm{eff}}\) と \(\bar Z\) による単一有効種（single effective species）の近似を使う。</p>
-      <p>電子側のチャネルは \(\eta_e=\eta_{00}^e(Z)n_e(kT_e)\tau_e s_\eta\) で、Whitney の \(Z\) 依存係数は \(Z=1\) で 0.733、高い \(Z\) の極限で 1.81 である。<code>species="ion"</code> と <code>"electron"</code> は一方だけを、<code>"both"</code> は両者の和を応力に使う。比 \(R=\eta_e/\eta_i\propto(T_e/T_i)^{5/2}Z^3/\sqrt A\) により、低い Z の等温な燃料ではイオンが、高い Z または \(T_e\gg T_i\) では電子が自然に支配し、その中間では両方が寄与する。2 温度（two-temperature、2T）計算では、散逸熱のうち \(\dot Q_i=\eta_iW{:}W/2\)（\(W{:}W\) は \(W\) の全成分の 2 乗和）をイオンへ、\(\dot Q_e=\eta_eW{:}W/2\) を電子へ返す。</p>
-    </section>
-
-    <section aria-labelledby="terms">
-      <h2 id="terms">この計算で使う用語</h2>
-      <p>このモジュールは、粘性応力へのイオンと電子の寄与を分けて扱い、衝突時間に上限を課し、1D ではステップの終了時に安定性を検査する。この 3 つは TENRYU の実装に固有の構成なので、定義をまとめる。</p>
-
-      <h3 id="terms-channel">チャネル</h3>
-      <p><strong>チャネル（channel）</strong>は、粘性応力の有効粘性 \(\eta_{\mathrm{eff}}\) に寄与する粒子種ごとの成分で、イオンのチャネル（\(s=i\)）と電子のチャネル（\(s=e\)）の 2 つがある。チャネル \(s\) は、前節の粘性係数 \(\eta_s\) と、単位体積あたりの散逸熱 \(\dot Q_s=\eta_sW{:}W/2\)（erg cm⁻³ s⁻¹）をもつ。\(W\) は<a href="#numerics">無トレースのひずみ速度</a>である。どのチャネルを \(\eta_{\mathrm{eff}}\) に入れるかは、キー <code>species</code>（既定 <code>"ion"</code>）が決める。</p>
-      <ul>
-        <li><code>species="ion"</code>（既定）：\(\eta_{\mathrm{eff}}=\eta_i\)。電子のチャネルを加える前の実装と同じ結果を出す。</li>
-        <li><code>species="electron"</code>：\(\eta_{\mathrm{eff}}=\eta_e\)。</li>
-        <li><code>species="both"</code>：\(\eta_{\mathrm{eff}}=\eta_i+\eta_e\)。</li>
-      </ul>
-      <p>2 つのチャネルを分けるのは、係数の依存性と熱の行き先が違うからである。\(\eta_i\propto\sqrt A\,T_i^{5/2}/(Z^4\ln\Lambda)\) は電荷の 4 乗に反比例し、\(\eta_e\) は \(Z\) にほとんど抑えられない。比 \(R=\eta_e/\eta_i\) は、低い \(Z\) の等温な燃料では 1 より小さく、高い \(Z\) や \(T_e\gg T_i\) では 1 より大きくなる。散逸熱は、イオンのチャネルの分がイオンの内部エネルギー（2 温度の計算では \(T_i\)）へ、電子のチャネルの分が電子の内部エネルギー（\(T_e\)）へ入る。1 温度の計算では、どちらの熱も 1 つの内部エネルギーへ入る。<code>model="constant"</code> では、どの <code>species</code> でも有効粘性は <code>eta_const</code> で、<code>"both"</code> は \(\eta_i=\eta_e=\)<code>eta_const</code>/2 を割り当てる。したがって、熱の行き先だけが違う。</p>
-      <p>どのチャネルが支配的かは、履歴ファイルの <code>/diagnostics/plasma_viscosity_history/</code> で追える。\(\eta_i\)、\(\eta_e\)、\(\eta_{\mathrm{eff}}\) の最大値（<code>eta_i_max</code>、<code>eta_e_max</code>、<code>eta_eff_max</code>、poise）、\(R\) の最小値・最大値・質量重み付きの幾何平均（<code>ratio_min</code>、<code>ratio_max</code>、<code>ratio_geomean_masswt</code>）、電子優勢（\(R\ge10\)）、イオン優勢（\(R\le0.1\)）、その中間のセル数（<code>n_cells_e_dom</code>、<code>n_cells_i_dom</code>、<code>n_cells_mixed</code>）、チャネルごとの散逸熱の総和（<code>heat_rate_i_tot</code>、<code>heat_rate_e_tot</code>、erg/s）を記録する。\(\eta_i\)、\(\eta_e\)、\(R\) は、<code>model</code>、<code>species</code>、<code>eta0_scale</code>、上限の設定によらず、上限なし、倍率 1、NRL のクーロン対数で評価した古典値である。\(\eta_{\mathrm{eff}}\) の最大値と散逸熱の総和は、実行の設定を反映する。</p>
-
-      <h3 id="terms-mfp-cap">平均自由行程の上限</h3>
-      <p><strong>平均自由行程の上限（mean-free-path cap）</strong>は、チャネル \(s\) の衝突時間を</p>
-      $$
-      \tau_{s,\mathrm{eff}}=\min\!\left(\tau_s,\ \frac{C\,\Delta l}{v_{th,s}}\right)
-      $$
-      <p>に抑え、粘性係数を \(\tau_{s,\mathrm{eff}}\) から作る操作である。ここで \(C\) は <code>mfp_cap_cells</code>、\(v_{th,i}=\sqrt{kT_i/(A\,m_p)}\)、\(v_{th,e}=\sqrt{kT_e/m_e}\)（\(m_p\)、\(m_e\) は陽子と電子の質量）、\(\Delta l\) は 1D ではセルの幅、2D RZ ではセルの辺のうち最短のものである。この操作により、平均自由行程 \(\lambda_s=v_{th,s}\tau_s\) は \(C\) セルの長さを超えない。</p>
-      <p>上限が要る理由は次のとおりである。粘性係数は衝突時間に比例し（\(\eta_s\propto\tau_s\)）、\(\tau_s\propto T^{3/2}/n\) なので、高温で希薄なセルでは \(\tau_s\) が大きくなり、平均自由行程がセルの長さ \(\Delta l\) を超える。このとき流体のクロージャは成り立たず、\(\eta\) が大きくなって陽的な時間刻みの上限 \(\rho\Delta l^2/\eta\) が極端に小さくなる。</p>
-      <p>既定は \(C=20\)（<code>Numerics.hydro.plasma_viscosity.mfp_cap_cells</code>）で、0 で上限が無効になる。負の値は拒否される。Studio の入力欄は正の値だけを受け付ける。上限が効いているセルでは、粘性係数が古典値より小さくなる。このとき、イオンのチャネルの時間刻みの制限は \(\Delta t_{visc}=\mathrm{dt\_safety}\,\Delta l/(2.56\,s_\eta\,C\,v_{th,i})\) になる（\(2.56=(8/3)\times0.96\)）。既定の \(C=20\)、\(\mathrm{dt\_safety}=0.3\)、\(s_\eta=1\) では、およそ \(\Delta l/(171\,v_{th,i})\) で、セルの長さと熱速度から決まる値を下回らない。</p>
-
-      <h3 id="terms-stability-check">ゲルシュゴリンの安定性検査</h3>
-      <p><strong>ゲルシュゴリンの安定性検査（Gershgorin stability check）</strong>は、1D でステップの終了時に行う検査で、そのステップの時間刻み \(\Delta t\) が、組み上げた粘性の陽的な更新の安定限界を満たすかを確かめる。節点 \(j\) の粘性による加速度 \(a_j\) は、係数 \(\eta\) を固定すると、節点速度 \(u_{j-1}\)、\(u_j\)、\(u_{j+1}\) の線形な式 \(a_j=\sum_kL_{jk}u_k\) になる（フープ項を含む）。行ごとの絶対値の和 \(\lambda_j=\sum_k|L_{jk}|\)（1/s）の最大値を \(\lambda_G=\max_j\lambda_j\) とする。ゲルシュゴリンの円板定理により、\(L\) の固有値の大きさは \(\lambda_G\) 以下である。陽的な拡散の更新が安定であるための条件は、\(\Delta t\) が 2 を固有値の大きさの最大値で割った値以下であることなので、\(\Delta t\le2/\lambda_G\) はその十分条件になる。</p>
-      <p>上の時間刻みの制限 \(\Delta t_{visc}\) は、各セルの \(\eta\) をステップの入口の状態で評価し、縦方向の拡散だけを見る。この検査は、そこに現れない 2 つの寄与を含む。ひとつは球・円筒のフープ項による硬さで、一様な格子の原点に最も近い節点の行では、平面の \((16/3)\eta/(\rho\Delta r^2)\) に対して \(8\eta/(\rho\Delta r^2)\) と 1.5 倍になる（\(\Delta r\) は格子幅）。もうひとつは、ステップの途中での \(\eta\propto T^{5/2}\) の増大で、予測段の衝撃加熱で温度が 2 倍になると、修正段の剛性は約 5.7 倍になる。</p>
-      <p>検査そのものにキーはなく、1D で <code>plasma_viscosity.enabled=True</code> のとき常に働く。既定の <code>dt_safety</code> = 0.3 では、一様な平面と球の格子でこの検査を通る（単体試験）。満たさないときの動作は <code>Numerics.hydro.driver_full_step_retry_enabled</code> が決める。既定は <code>False</code> で、Studio が書き出す 1D のデッキは <code>True</code> にしている。真なら、ステップ全体を入口の状態から時間刻みを半分にしてやり直す（再試行は最大 <code>driver_full_step_retry_max_attempts</code> 回、既定 3 回で、使い切ると停止する）。偽ならエラーで停止し、エラーの文は <code>dt_safety</code> を下げるか、このキーを真にするよう案内する。2D RZ にこの検査はない。</p>
-    </section>
-
-    <section aria-labelledby="numerics">
-      <h2 id="numerics">応力、上限、時間刻み</h2>
-      <p>無トレースのひずみ速度 \(W\) は、流体の速度 \(\mathbf u\) から</p>
-      $$
-      W_{ab}=\partial_au_b+\partial_bu_a-\tfrac23\,\delta_{ab}\,\nabla\!\cdot\!\mathbf u
-      $$
-      <p>で定義する（\(a,b\) は座標の方向を表す添字、\(\delta_{ab}\) はクロネッカーのデルタ（Kronecker delta））。\(\boldsymbol\pi=-\eta_{\mathrm{eff}}W\) と \(\dot Q_s=\eta_sW{:}W/2\) の係数は、この定義に依る（\(W{:}W=\sum_{ab}W_{ab}W_{ab}\)）。1D の曲線座標では、半径方向の流束にフープ項 \(\alpha(\pi_{rr}-\pi_{tt})/r\) を加え、平面・円筒・球を同じ式で扱う（\(\alpha\) は応力発散の幾何係数で、円筒で 1、球で 2、平面で 0 であり、Fleck の \(\alpha\) とは無関係である。\(\pi_{tt}\) は接線応力である）。2D RZ では、四辺形に対する靴ひも公式（shoelace formula）による速度の勾配と、方位角方向（azimuthal）のひずみを用いる。エネルギー整合な経路では、各コーナーの粘性力がセルへする仕事 \(-\sum_\ell\mathbf F_\ell\cdot\mathbf u_\ell\) を、そのまま内部エネルギーの収支に入れる（\(\mathbf F_\ell\) はコーナー \(\ell\) の粘性力、\(\mathbf u_\ell\) はそのコーナーの節点の速度）。<code>model="constant"</code> は一様な <code>eta_const</code> を使う検証用のモデルである。</p>
-      <p>古典的な係数の \(T^{5/2}\) 増大は、高温で希薄なセルにおいて、過大な平均自由行程と極端に小さい時間刻みを生む。既定の <code>mfp_cap_cells=20</code> は各チャネルの \(\tau\) を \(C\Delta l/v_{th}\) 以下に抑え、係数を流体モデルの空間解像度へ結び付ける（<a href="#terms-mfp-cap">平均自由行程の上限</a>）。<code>lnlambda_fixed&gt;0</code> は、NRL のイオン–イオンおよび電子–イオンのクーロン対数を同じ固定値で置き換える。</p>
-      <p>粘性は陽的に更新するため、このモジュールは</p>
-      $$
-      \Delta t_{visc}\le
-      \mathrm{dt\_safety}\,
-      \frac{\rho\,\Delta l^2}{(8/3)\eta_{\mathrm{eff}}}
-      $$
-      <p>を、ドライバが時間刻みを決めるときの候補のひとつとして渡す。ここで \(\Delta l\) は 1D ではセルの幅、2D RZ ではセルの辺のうち最短のもの、\(\rho\) は密度、\(\eta_{\mathrm{eff}}\) は有効粘性、<code>dt_safety</code> は安全係数（既定 0.3）である。この制限が時間刻みを決めたときは、時間刻みを決めた制約の名前（limiter 名）として <code>braginskii</code> が現れる（<a href="../overview/timestep.html#observing">観測手段</a>参照）。1D では、ステップの終了時に、ゲルシュゴリンの安定性検査が \(\Delta t\le2/\lambda_G\) を確かめ、曲率に由来する硬さとステップの途中での係数の増大も検査する。<code>dt_safety</code> は内部のスーパータイムステッピングや部分サイクルの数ではなく、時間刻みに掛ける安全係数である。</p>
-    </section>
-
-    <section aria-labelledby="pipeline">
-      <h2 id="pipeline">1 回の粘性適用の手順</h2>
-      <ol>
-        <li><p><strong>クーロン対数を評価する。</strong>NRL のイオン–イオンおよび電子–イオンのクーロン対数を計算するか、正の固定値による上書きを使う。</p></li>
-        <li><p><strong>チャネルごとの係数を作る。</strong>各チャネルの \(\tau_s\) を評価し、\(\tau_s\le C\Delta l/v_{th,s}\) を適用して \(\eta_i\) と \(\eta_e\) を作り、<code>species</code> に従って選択または加算し、\(\eta_{\rm eff}\) とする。</p></li>
-        <li><p><strong>ひずみ速度を構成する。</strong>速度勾配から \(W\) を計算する。1D では半径方向の微分と曲率の項、2D RZ では四辺形に対する靴ひも公式の勾配と方位角方向のひずみを使う。</p></li>
-        <li><p><strong>応力と力を適用する。</strong>\(\boldsymbol\pi=-\eta_{\rm eff}W\) とし、1D ではフープ項を伴う流束形式、2D ではエネルギー整合なコーナー力を使う。</p></li>
-        <li><p><strong>散逸エネルギーを返す。</strong>\(\dot Q_s=\eta_sW{:}W/2\) をチャネルごとに積み上げ、2 温度モードではイオン側の仕事を \(T_i\) へ、電子側の仕事を \(T_e\) へ渡す。</p></li>
-        <li><p><strong>次のステップを制限する。</strong><code>braginskii</code> の拡散による時間刻みの制限を、次のステップの \(\Delta t\) を決める候補としてドライバへ渡す。</p></li>
-        <li><p><strong>安定性を検査する（1D のみ）。</strong>ステップの終了時に、<a href="#terms-stability-check">ゲルシュゴリンの安定性検査</a>で \(\Delta t\le2/\lambda_G\) を確かめる。満たさないときは、<code>driver_full_step_retry_enabled</code> が真ならステップを再試行し、偽なら停止する。</p></li>
-      </ol>
-    </section>
-
-    <section aria-labelledby="physical-role">
-      <h2 id="physical-role">物理的に効く領域</h2>
-      <p>プラズマ粘性は、滑らかな速度のせん断や音響モードを物理的な輸送係数で減衰させ、失われた運動エネルギーをエントロピーを生む熱へ変換する。一方の人工粘性は、解像できない圧縮性の衝撃波を数セルで捕捉するための数値的な散逸であり、通常は膨張や滑らかなせん断には働かない。ICF（inertial confinement fusion、慣性閉じ込め核融合）の衝撃波のように \(\Delta x/\lambda_{ii}\) が大きい領域では、プラズマ粘性だけで衝撃波面を支えることはできないため、人工粘性を無効にして代用してはいけない。逆にクヌーセン数（Knudsen number）— 平均自由行程と勾配スケール長の比 — が 1 以上になると、Braginskii の流体クロージャ自体が破れ、上限を課しても運動論的な衝撃波構造の予測にはならない。</p>
-      <p>このモジュールは、非磁化、単一流体（single-fluid）\(V_e=V_i\)、単一の有効イオン種を仮定した古典的なモデルである。磁化された粘性、多種イオンの混合則（multi-species mixing rule）、温密物質（warm dense matter、WDM）・縮退（degeneracy）・強結合（strong coupling）の補正は含まない。とくに電子側のチャネルは完全電離（full ionization）\(Z\ge1\) を仮定した Whitney の近似式を使うため、縮退した領域では温度感度を過大に評価し得る。</p>
-    </section>
-
-    <section aria-labelledby="controls">
-      <h2 id="controls">namelist による制御</h2>
-      <p>以下は <code>Numerics.hydro.plasma_viscosity</code> のすべてのキーである。既定値は、Studio の入力欄の既定と、デッキで指定しないときの値で同じである。Studio は 1D のデッキにだけこのキーを書き出す。</p>
-      <p>2D RZ では、<code>Numerics.hydro.rz_momentum_scheme</code> の既定（<code>"area_weighted_symmetric"</code>）のまま <code>enabled=True</code> にすると、デッキの検査（<code>ConfigError</code>）で拒否される。粘性のコーナー力は、セルの RZ 体積に（応力の平面の発散 + フープ項）を掛けた体積重みの形で作るので、平面の節点質量で割る面積重みのスキームとは併用できない。<code>rz_momentum_scheme="volume_weighted"</code> と <code>aw_compatible_force_work=False</code> の両方を明示すること。</p>
-      <table class="quick-facts">
-        <thead><tr><th>キー</th><th>既定値</th><th>用途</th></tr></thead>
-        <tbody>
-          <tr><th><code>enabled</code></th><td><code>False</code></td><td>プラズマ粘性の全体の有効化スイッチ。</td></tr>
-          <tr><th><code>model</code></th><td><code>"braginskii"</code></td><td>Braginskii の係数、または検証用の <code>"constant"</code>。</td></tr>
-          <tr><th><code>species</code></th><td><code>"ion"</code></td><td>有効粘性に入れる<a href="#terms-channel">チャネル</a>。<code>ion</code>、<code>electron</code>、両者を足し合わせる <code>both</code>。</td></tr>
-          <tr><th><code>eta_const</code></th><td><code>0.0</code> P</td><td>constant モデルで使う一様な粘性係数。<code>species="both"</code> では各チャネルに半分ずつ割り当て、有効粘性は <code>eta_const</code> のままである。</td></tr>
-          <tr><th><code>eta0_scale</code></th><td><code>1.0</code></td><td>Braginskii の両チャネルに掛ける倍率。</td></tr>
-          <tr><th><code>mfp_cap_cells</code></th><td><code>20.0</code></td><td><a href="#terms-mfp-cap">平均自由行程の上限</a>に使うセル幅の数 \(C\)。0 で無効。Studio の入力欄は正の値だけを受け付ける。</td></tr>
-          <tr><th><code>lnlambda_fixed</code></th><td><code>0.0</code></td><td>0 なら NRL のクーロン対数、正の値なら両チャネル共通の固定値。</td></tr>
-          <tr><th><code>dt_safety</code></th><td><code>0.3</code></td><td>陽的な粘性の時間刻みに掛ける安全係数。パーサーは正の値を受け付け、Studio の入力欄は 0 より大きく 1 以下の値を受け付ける。</td></tr>
-        </tbody>
-      </table>
-    </section>
-
-    <section aria-labelledby="verification">
-      <h2 id="verification">検証</h2>
-      <ul>
-        <li>単体試験 <code>tests/hydro/test_braginskii_viscosity.cu</code> は、球対称な相似流（homologous flow）での \(W\equiv0\)、円筒・球の発散のない流れにおける流束項とフープ項の相殺、平面での一様ひずみ、イオンと電子の係数・上限・時間刻みの閉じた形の式、高い \(Z\) での電子の優勢と \(\eta_{\mathrm{both}}=\eta_i+\eta_e\)、種別ごとの熱の振り分け、チャネルごとの時間刻みの加法性（\(1/\Delta t_{both}=1/\Delta t_i+1/\Delta t_e\)）、ゲルシュゴリンの上界を検査する。ゲルシュゴリンの上界については、粘性係数 \(\eta\) が一定で格子幅 \(\Delta r\) が一様な格子で、平面では \(2/\lambda_G\) がスカラーの式の安定限界（<code>dt_safety</code> を掛ける前の値）と一致すること、球では原点に最も近い節点の行が \(\lambda_G=8\eta/(\rho\Delta r^2)\)（平面の値 \((16/3)\eta/(\rho\Delta r^2)\) の 1.5 倍）になること、既定の <code>dt_safety</code>=0.3 の時間刻みが球でもこの検査を通ることを確かめる。検証ケース <code>braginskii_planar_wave_decay</code> は、粘性ありの計算と粘性なしの計算の減衰率の差を、平面の定在音波（standing acoustic wave）の減衰率 \(\gamma=(2/3)(\eta/\rho)k^2\)（この \(k\) は定在波の波数であり、\(kT\) のボルツマン変換ではない）と比べ、5% の帯で判定する。</li>
-        <li>剛体壁（rigid wall）における第 1 動径固有モード（first radial eigenmode）では、粘性減衰率に入る幾何依存因子 \(\Lambda_{\mathrm{geom}}\) が平面・円筒・球のすべてで厳密に 1 になる（\(\Lambda_{\mathrm{geom}}\equiv1\) の定理）。検証ケース <code>braginskii_cylindrical_wave_decay</code> と <code>braginskii_spherical_wave_decay</code> は、平面の減衰試験とあわせて、実測の減衰率と予測値の比でこの定理を確かめ、3 つとも 5% の帯で判定する。2026-07-07 の実測の比は、平面・円筒・球の順に 1.000248、1.000046、0.9995975 で、1 からの差は球で最大の約 4.0×10⁻⁴ である。</li>
-        <li>電子チャネルと 2D RZ にも検査がある。<code>braginskii_electron_wave_decay</code> は、一定の粘性（<code>model="constant"</code>）で <code>species="electron"</code> と <code>"both"</code> の有効粘性 \(\eta_{\mathrm{eff}}\) が同じになることを、減衰率の比（5% の帯）、全エネルギーの相対ずれ（\(5\times10^{-9}\) 以下）、2 つの減衰率の差（\(10^{-6}\gamma_{th}\) 以内）で確かめる。2026-07-17 の実測では、2 つの比はどちらも 1.000248 で、イオンの値と全桁で一致した。<code>braginskii_regime_map</code> は、電子優勢（Z=50、1 keV の等温）、イオン優勢（DT、100 eV の等温）、混合（DT、\(T_e=700\) eV、\(T_i=100\) eV）の 3 つの静的なデッキで、\(R=\eta_e/\eta_i\) の範囲（順に \(R>50\)、\(R&lt;0.05\)、\(0.2&lt;R&lt;5\)）と、すべての有効セルが対応する領域に分類されること（\(R\ge10\) を電子優勢、\(R\le0.1\) をイオン優勢と数える）を確かめる。2D RZ では、<code>braginskii_2d_planar_wave_decay</code>、<code>braginskii_2d_cyl_wave_decay</code>、<code>braginskii_2d_electron_wave_decay</code> が減衰率の比を 5% の帯で、<code>braginskii_2d_two_temp_routing</code> と <code>braginskii_2d_electron_two_temp_routing</code> が 2 温度の計算での散逸熱の行き先を、<code>braginskii_2d_regime_diag_smoke</code> が履歴の診断の分類を確かめる。<code>species="ion"</code>（既定）の経路は、電子チャネルを加える前の実装と、1D ではビット単位で、2D では同じバイナリの再実行の雑音の範囲で一致した（2026-07-17 の実測）。</li>
-      </ul>
-    </section>
-
-    <section aria-labelledby="references">
-      <h2 id="references">参考文献</h2>
-      <ol class="references">
-        <li>S. I. Braginskii, "Transport Processes in a Plasma," Reviews of Plasma Physics 1, 205–311 (1965).</li>
-        <li>K. G. Whitney, "Momentum and Heat Conduction in Highly Ionizable Plasmas," Phys. Plasmas 6, 816–830 (1999). <a href="https://doi.org/10.1063/1.873321">doi:10.1063/1.873321</a></li>
-        <li>A. L. Velikovich, K. G. Whitney, and J. W. Thornhill, "A Role for Electron Viscosity in Plasma Shock Heating," Phys. Plasmas 8, 4524–4533 (2001). <a href="https://doi.org/10.1063/1.1400126">doi:10.1063/1.1400126</a></li>
-        <li>P. Hunana et al., "Generalized Fluid Models of the Braginskii Type," Astrophys. J. Suppl. Ser. 260, 26 (2022). <a href="https://doi.org/10.3847/1538-4365/ac5044">doi:10.3847/1538-4365/ac5044</a></li>
-        <li>E. L. Vold, A. S. Joglekar, M. I. Ortega, et al., "Plasma Viscosity with Mass Transport in Spherical Inertial Confinement Fusion Implosion Simulations," Phys. Plasmas 22, 112708 (2015). <a href="https://doi.org/10.1063/1.4935906">doi:10.1063/1.4935906</a></li>
-        <li>W. Manheimer and D. Colombant, "Effects of Viscosity in Modeling Laser Fusion Implosions," Laser Part. Beams 25, 541–547 (2007). <a href="https://doi.org/10.1017/S0263034607000663">doi:10.1017/S0263034607000663</a></li>
-        <li>R. J. Mason, R. C. Kirkpatrick, and R. J. Faehl, "Real Viscosity Effects in Inertial Confinement Fusion Target Deuterium–Tritium Micro-Implosions," Phys. Plasmas 21, 022705 (2014). <a href="https://doi.org/10.1063/1.4864641">doi:10.1063/1.4864641</a></li>
-        <li>D. S. Miller, "Splitting Shock Heating Between Ions and Electrons in an Ionized Gas," Comput. Fluids 210, 104672 (2020). <a href="https://doi.org/10.1016/j.compfluid.2020.104672">doi:10.1016/j.compfluid.2020.104672</a></li>
-        <li>B. M. Haines, "Charged Particle Transport Coefficient Challenges in High Energy Density Plasmas," Phys. Plasmas 31, 050501 (2024). <a href="https://doi.org/10.1063/5.0197128">doi:10.1063/5.0197128</a></li>
-        <li>J. D. Huba, <i>NRL Plasma Formulary</i>, Naval Research Laboratory, NRL/PU/6770--19-652 (2019) — イオン–イオンおよび電子–イオンのクーロン対数表式の出典。</li>
-      </ol>
-    </section>
-
-    <div id="page-footer"></div>
-  </main>
-  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["$$", "$$"], ["\\[", "\\]"]] } };</script>
-  <script defer src="../../math-tips.js"></script>
-  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
-  <script src="../../nav.js" data-page="viscosity" data-root="../"></script>
+  <p>この頁は移動しました。 <a href="hydrodynamics/plasma-viscosity.html">新しい頁へ: プラズマ粘性</a></p>
 </body>
 </html>

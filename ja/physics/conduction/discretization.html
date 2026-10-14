@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="ja" data-lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>空間離散化 — TENRYU ドキュメント</title>
+  <link rel="stylesheet" href="../../../style.css">
+  <script src="../../../theme.js"></script>
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>空間離散化</h1>
+    <p class="abstract">電子熱伝導の空間離散化は、1D では保存型の有限体積（finite-volume）演算子、2D RZ では対称なコンダクタンスをもつ節点局所の演算子（node-local operator）である。この頁は、1D の面の伝導率の作り方（face-κ policy）、2D RZ の節点局所の演算子、材料別の保存モード（per-material conservation mode）、ボイド（void）セルの扱いを定義する。</p>
+
+    <section aria-labelledby="terms">
+      <h2 id="terms">この計算で使う用語</h2>
+      <p>空間離散化には、TENRYU の実装に固有の意味で使う語がある。1D の面の伝導率の作り方、2D RZ の節点局所の演算子、材料別の保存モードである。これらをまとめて定義する。スーパータイムステッピングの時間刻みを表す語は<a href="time-integration.html#terms">時間積分の頁</a>、SNB の量は<a href="snb.html#terms">SNB の頁</a>にある。</p>
+
+      <h3 id="terms-face-kappa">面の伝導率の作り方</h3>
+      <p><strong>面の伝導率の作り方（face-κ policy）</strong>は、1D で、隣り合う 2 つのセルの κ から、その境にある面の熱伝導率 \(\kappa_f\) を決める規則である。キーは <code>Numerics.conduction.face_kappa_policy</code> で、値は <code>"kirchhoff_same_material"</code>（既定）と <code>"harmonic"</code> である。</p>
+      <p>\(\kappa\propto T^{5/2}\) は、急峻な熱波面（thermal wave front）を横切る温度区間で何桁も変わる。そのため \(\kappa_f\) の作り方が、波面の進み方を左右する。<code>"harmonic"</code> は、左右のセルの κ の調和平均（harmonic mean）\(2\kappa_L\kappa_R/(\kappa_L+\kappa_R)\) を \(\kappa_f\) とする。調和平均は小さいほうの κ に引かれるので、波面の前方では \(\kappa_f\) が過小になり、波面が格子に固着しがちである。片側の κ が 0 なら \(\kappa_f\) も 0 で、熱は通らない。</p>
+      <p><code>"kirchhoff_same_material"</code> は、左右の温度 \(T_L\)、\(T_R\) の区間で \(T^{5/2}\) を厳密に積分した割線（secant）を使う。Kirchhoff 変換（Kirchhoff transformation）に基づく面平均である。</p>
+      $$
+      \kappa_f=\tilde\kappa_f\,\frac27\,\frac{T_R^{7/2}-T_L^{7/2}}{T_R-T_L},\qquad
+      \tilde\kappa_f=\frac{2\tilde\kappa_L\tilde\kappa_R}{\tilde\kappa_L+\tilde\kappa_R},\qquad
+      \tilde\kappa=\frac{\kappa}{T^{5/2}}.
+      $$
+      <p>ここで \(\tilde\kappa\) は、セルの κ から取り出した Spitzer 前置因子である。左右の \(\tilde\kappa\) の比が 0.1 と 10 のあいだにあるときだけ、この割線を使う。比がこの範囲の外にあるとき（物質界面や、テーブル由来の \(\tilde\kappa\) の大きな跳び）と、κ か \(T\) が正でないとき（ボイド）は、調和平均にする。\(\kappa_f\) は、流束制限に使う SH の推定値、実際の流束、既定のときの \(\Delta t_{exp}\)（<a href="time-integration.html#sts">手順 3</a>）に、同じ値を使う。</p>
+      <p>2D RZ は節点局所の演算子（次項）を使い、面の \(\kappa_f\) を作らない。このキーは、演算子の各対に、2 つのセルの温度による割線（上の式の \(\tfrac27(T_R^{7/2}-T_L^{7/2})/(T_R-T_L)\)）を掛けるかどうかだけを選ぶ。<code>"kirchhoff_same_material"</code> では掛け、<code>"harmonic"</code> では掛けない。SNB の 2D RZ は割線を使わない。</p>
+
+      <h3 id="terms-node-local">節点局所の演算子</h3>
+      <p><strong>節点局所の演算子（node-local operator）</strong>は、2D RZ の熱伝導（電子、イオン、SNB の各群の方程式）で、セル中心の温度どうしを結ぶ対称な線形演算子である。2D RZ のメッシュは、子午面（meridional plane。r–z 面）の多角形のセルから成る。演算子は節点ごとの寄与の和で、節点の寄与は次のように作る。</p>
+      <p><strong>コーナー（corner）</strong>は、節点 \(p\) に集まるセルのそれぞれについて、セルのうち \(p\) に接する部分である。セルの基準点（凸なセルでは重心）、\(p\) の前の辺の中点、\(p\)、\(p\) の後の辺の中点を結ぶ四角形で、<a href="../hydrodynamics/discretization.html#terms-corner">流体の頁</a>のコーナーと同じ分割である。</p>
+      <p><strong>半辺（half-edge）</strong>は、\(p\) から出る各辺を中点で 2 つに分けたもののうち、\(p\) 側の部分である。半辺の温度 \(\Theta\) は未知数で、その半辺をはさむ 2 つのコーナー（境界では 1 つ）が共有する。各コーナーの温度勾配を、セルの温度と半辺の温度から Green–Gauss の式で表し、半辺を通る熱流を求める。内部の半辺では両側の熱流が等しく、境界の半辺では熱流が 0 であるという条件から、\(\Theta\) を節点を共有するセルの温度で表して消去する。残るのが、セル \(c\) から出る熱を、節点を共有するセルの温度の線形結合で表す行列 \(a\) である。</p>
+      <p>行列 \(a\) の行と列の和はどちらも 0 で（一様な温度に熱流はなく、熱流は連続である）、\(a\) は対称半正定値（symmetric positive semidefinite）である。セル \(c\) と、節点を共有するセル \(d\) の対の係数を \(G_{cd}=-(a_{cd}+a_{dc})/2\) とすると、セル \(c\) の熱容量 \((\rho c_vV)_c\) と温度の変化率の積は、隣のセルから流れ込む熱の和に等しい（\(V\) は回転体としての体積）。</p>
+      $$
+      (\rho c_vV)_c\,\frac{dT_{e,c}}{dt}=\sum_dG_{cd}\,(T_{e,d}-T_{e,c}).
+      $$
+      <p>割線を使うときは、右辺の各項に \(S_{cd}\) を掛ける（<a href="time-integration.html#sts">手順 6</a>）。\(G_{cd}=G_{dc}\) なので、対の電力 \(G_{cd}(T_d-T_c)\) はセル \(c\) と \(d\) で符号だけが違い、熱エネルギーは保存される。</p>
+      <p>この演算子はメッシュの添字 \((i,j)\) を使わないので、四角形でないセルや、複数のブロックから成るメッシュにも同じ手順で使える。異なる伝導率のセルのあいだの熱流は、半辺での熱流の連続から決まり、面の調和平均は使わない。境界の半辺の熱流は 0 である。ただし、状態供給（<code>state_supply</code>）が働く z_bottom と z_top の側の半辺は、供給温度に保つ（単一ブロックのメッシュ）。演算子を選ぶキーはなく、2D RZ の熱伝導はすべてこの演算子で解く。対の係数 \(G_{cd}\) が、STS の更新と、陽的な安定限界 \(\Delta t_{exp}\) の上界を決める。</p>
+
+      <h3 id="terms-per-material">材料別の保存モード</h3>
+      <p><strong>材料別の保存モード（per-material conservation mode）</strong>は、1 つのセルに複数の材料が混在するとき、材料ごとの質量、体積率（volume fraction）、電子エネルギーを状態として持ち、材料ごとのエネルギーを保存する設定である。材料ごとの EOS で、材料ごとの温度と圧力を扱うために使う。キーは <code>Numerics.materials.per_material_conservation_enabled</code>（既定 False、2D RZ のみ）である。混合セル（mixed cell）の扱いは <code>Numerics.materials.mixed_cell_closure</code> で選ぶ。既定の <code>"equal_compressibility"</code> は、体積率を固定し、セルの圧力を材料の圧力の体積率による和とする扱いである。<code>"pressure_relaxation"</code> は、材料の圧力を、速度を制限して緩和させる扱いである。</p>
+      <p>熱伝導では、セルの電子温度を 1 つだけ STS で進め、そのエネルギーの変化を材料に配る。配り方は<a href="#faces-materials">面の伝導率の節</a>にある。SNB とは併用できない（入力検査が拒否する）。2D RZ でイオン熱伝導と併用するときは、<code>mixed_cell_closure="pressure_relaxation"</code> が要る。</p>
+    </section>
+
+    <section aria-labelledby="faces-materials">
+      <h2 id="faces-materials">面の伝導率、材料別の保存モード、ボイド</h2>
+      <p>1D の面の κ の作り方（定義と式は<a href="#terms-face-kappa">用語の節</a>）は、既定の <code>kirchhoff_same_material</code> では、同じ材料の滑らかな Spitzer 面に限って Kirchhoff 割線を使う。単純な両端評価では急峻な熱波面の前面で面 κ が過小になり、波面が格子に固着しがちだが、割線はこの傾向を弱める。物質界面、ボイド、セルの伝導率から抽出した Spitzer 前置因子（\(\kappa_c/T_c^{5/2}\)）がテーブル由来で大きく跳ぶ箇所では、調和平均にする。<code>harmonic</code> も選べ、物質界面や伝導率の大きな跳びを保守的に扱う — 調和平均なので、片側の κ が 0 なら面の流束も 0 である。流束制限に使う SH の推定値と実際の流束は、必ず同じ面の κ を使う。2D RZ には面の κ がない。異なる伝導率のセルのあいだの熱流は、半辺での熱流の連続から決まり、調和平均は使わない。<code>face_kappa_policy</code> は、節点局所の演算子の各対に、その 2 つのセルの温度による割線を掛けるかどうかだけを選ぶ。</p>
+      <p>1D の平面・円筒・球の演算子は保存型の有限体積で、幾何の違いは面積 \(A_f\) とセル体積 \(V_i\) にしか現れない。材料別の保存モード（定義は<a href="#terms-per-material">用語の節</a>、2D RZ のみ）では、セルごとに電子温度を 1 つだけ STS で進め、そのエネルギー変化を材料に配る。セルの伝導率は、材料 \(m\) ごとにその温度、密度、\(\bar Z\)、lnΛ から作った制限済みの熱伝導率 κ<sub>eff,m</sub> を、体積率 α<sub>m</sub> で重み付けて足した和 Σ<sub>m</sub>α<sub>m</sub>κ<sub>eff,m</sub> とする。全段を終えたあと、セル \(c\) の電子エネルギーの変化 \(\Delta E_c=(\rho c_vV)_c(T_c^{n+1}-T_c^n)\) を、次の規則で材料に配る。\(\Delta E_c&gt;0\) は、ステップ入口の材料の電子熱容量に比例して配り、各材料の温度が同じだけ上がるようにする。\(\Delta E_c&lt;0\) は、材料の電子エネルギーの、温度の床（floor。<code>Numerics.floors.Te</code>。<a href="../../overview/numerics-foundations.html#floors-safety">定義</a>）における状態からの余剰に比例して配る。余剰の合計が \(-\Delta E_c\) に足りないときは、全材料が床の状態になり、不足分は床で加えたエネルギーとして<a href="../../overview/numerics-foundations.html#energy-ledger">エネルギー台帳</a>（energy ledger）に載せる。余剰が足りるときは、材料の電子エネルギーの和の変化がセルの変化に丸め誤差の範囲で一致する。<code>mixed_cell_closure="pressure_relaxation"</code> のときは、伝導は材料を区別しないセルの係数で進み、エネルギーの材料への配分はドライバが混合セルの圧力緩和の規則で行う。</p>
+      <p><code>cell_is_void</code> のセルでは κ<sub>eff</sub>=0 を強制する。これによりボイドの境界は熱を通さない断熱面になる。このマスクは性能の面でも必要である。下限密度しかもたないボイドのセルを通常の物質として評価すると、拡散率 κ/(ρc<sub>v</sub>) の分母が極端に小さいために巨大な拡散係数が生じ、それが安定限界 Δt<sub>exp</sub> を潰して STS を実質的に止めてしまうからである。SNB でも同じ扱いを徹底する。ボイドのセルは H<sub>g</sub>=0 の恒等行とし、隣接面の群拡散係数を 0 にして、群拡散がボイドを飛び越えて予熱を運ぶ経路を残さない。</p>
+    </section>
+
+    <section aria-labelledby="controls">
+      <h2 id="controls">namelist による制御</h2>
+      <p>以下は <code>Numerics.conduction</code> のうち、離散化に関わるキーである。全項目と検証規則は <a href="../../use/namelist.html">namelist リファレンス</a>を参照のこと。表の既定値は、デッキで指定しないときの値である。</p>
+      <table class="quick-facts">
+        <thead>
+          <tr><th>キー</th><th>既定値</th><th>用途</th></tr>
+        </thead>
+        <tbody>
+          <tr><th><code>face_kappa_policy</code></th><td><code>"kirchhoff_same_material"</code></td><td>面の κ の作り方。既定は、同一材料での Kirchhoff 割線。調和平均の <code>"harmonic"</code> も選べる。2D RZ では、節点局所の演算子の各対に割線を掛けるかどうかを選ぶ。</td></tr>
+        </tbody>
+      </table>
+
+    </section>
+
+    <section aria-labelledby="verification">
+      <h2 id="verification">検証</h2>
+      <ul>
+        <li><strong>Kirchhoff 割線の検査：</strong>同一材料の急峻な面を対象に、次を検査する。Kirchhoff 割線と調和平均とで熱流と時間刻みがどう変わるかの比、流束制限が効いた状態での \(|q|\le q_{max}\) の成立、固定した係数の演算子に対する Gershgorin 円板（Gershgorin disc）の対角優位性の検査による時間刻みの保護（体積 0 のセルは除外）、物質界面での調和平均への正しい切り替え。</li>
+      </ul>
+    </section>
+
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["$$", "$$"], ["\\[", "\\]"]] } };</script>
+  <script defer src="../../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../../nav.js" data-page="conduction-discretization" data-root="../../"></script>
+</body>
+</html>

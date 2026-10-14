@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en" data-lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Laser–plasma interaction (LPI) — TENRYU Documentation</title>
+  <link rel="stylesheet" href="../../../style.css">
+  <script src="../../../theme.js"></script>
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>Laser–plasma interaction (LPI)</h1>
+    <p class="abstract">Laser–plasma interaction (LPI) is the collective name for the processes in which the laser light couples to plasma waves and moves energy by a route other than inverse-bremsstrahlung (IB) absorption. TENRYU treats two LPI effects: cross-beam energy transfer (CBET), which moves light power between crossing beams through an ion-acoustic wave, and the generation, transport, and deposition of the hot electrons that instabilities near the quarter-critical density produce. Both are kernels built on the <a href="../laser/index.html">ray trace</a>: they take the power carried by the rays, rewrite it, and return the result to the matter as laser deposition. TENRYU does not solve the growth or saturation of the waves, and it does not model reflected light from backscatter. This page describes where the two effects sit, what they exchange with the ray trace, their place in the operator sequence, the correspondence between 1D and 2D RZ, and the entry-point keys. The equations and algorithms of each effect are on the child pages.</p>
+    <div class="card-grid">
+      <a class="card" href="cbet.html"><h3>CBET</h3><p>Conservative exchange of light power between crossing beams through an ion-acoustic wave, with port layouts and wavelength detuning.</p></a>
+      <a class="card" href="hot-electrons.html"><h3>Hot electrons</h3><p>Hot-electron generation from a calibrated conversion efficiency and spectrum, straight-line transport, and preheat deposition.</p></a>
+    </div>
+
+    <section aria-labelledby="scope">
+      <h2 id="scope">Effects included and not included</h2>
+      <p><strong>Included.</strong> CBET and hot electrons.</p>
+      <ul>
+        <li><strong>CBET:</strong> The beat of two beams drives an ion-acoustic wave through the ponderomotive force, and power moves from one beam to the other through that wave. TENRYU evaluates the exchange with the gain of a linear, steady, strongly damped local plane wave [1], and one exchange conserves the total power. When a wavelength detuning is present, the power handed to the ion-acoustic wave is recorded in the signed ledger <code>E_cbet_iaw</code>.</li>
+        <li><strong>Hot electrons:</strong> The energetic electrons produced by two-plasmon decay (TPD) and stimulated Raman scattering (SRS) are specified by a calibrated conversion efficiency and temperature [2]. The electrons travel along straight lines and deposit into the matter the energy they lose by collisional slowing-down. TPD and SRS appear as different source mechanisms (different default capture density, temperature, and angular band).</li>
+      </ul>
+      <p><strong>Not included.</strong> As far as the implementation shows, the following are absent.</p>
+      <ul>
+        <li>The growth and saturation of the TPD and SRS waves. The hot-electron conversion efficiency η(t) is a calibrated input; even with <code>eta_mode="model"</code> it is a reduced relaxation formula driven by local plasma quantities, and no wave equation is solved.</li>
+        <li>Light lost to SRS and SBS (stimulated Brillouin scattering) backscatter. There is no key for a scattered-light reflectivity and no code that traces reflected rays. CBET rests on the same three-wave coupling as SBS only for the forward exchange, in which the other beam is the seed.</li>
+        <li>Filamentation, self-focusing, speckle, and wave optics (interference, diffraction). The laser path is geometric-optics rays, and the code has no treatment of these.</li>
+        <li>The CBET caustic correction, speckle statistics, polarization dynamics, and broadband illumination (the <a href="cbet.html#mechanism">CBET page</a> gives the reasons).</li>
+      </ul>
+      <p>Read the results as the response of the plasma to the specified CBET coefficient and hot-electron source closure (conversion efficiency and temperature). They are not a first-principles prediction of LPI.</p>
+    </section>
+
+    <section aria-labelledby="laser-relation">
+      <h2 id="laser-relation">Relation to the ray trace</h2>
+      <p>CBET and hot electrons both take the ray records made by the ray trace on the <a href="../laser/index.html">Laser drive and absorption</a> page as input. They do not trace separate rays.</p>
+      <ul>
+        <li><strong>Received (CBET):</strong> the path length and direction cosine of each ray in each cell it crosses, the initial ray power, and the beam group. CBET also reads the ion temperature, flow velocity, and mean mass number from the hydrodynamic state. The electron density, electron temperature, and mean ionization are fields that the ray trace already uses.</li>
+        <li><strong>Received (hot electrons):</strong> the point where each traced ray first reaches the specified fraction of the critical density (the capture surface; default 1/4), and the power that survived IB absorption up to that point.</li>
+        <li><strong>Returned (CBET):</strong> the ray power after the exchange. The IB deposition that follows is computed from the exchanged power. When a detuning is present, CBET also returns the ledger <code>E_cbet_iaw</code> of the power handed to the ion-acoustic wave.</li>
+        <li><strong>Returned (hot electrons):</strong> the ray power with the captured power subtracted (default <code>subtract_from_laser=True</code>), and the hot-electron deposition power in each cell. The deposition power is added to the laser deposition power and enters the electron internal energy. The part that leaves the mesh counts as laser escape in the energy ledger.</li>
+      </ul>
+      <p>CBET and hot electrons cannot normally be used in the same run. They can be combined only when <code>Laser.cbet.geometry_mode="port_section"</code> and <code>Laser.hot_electron.eta_mode="model"</code> are specified together. In that combination the hot-electron capture uses the ray power after CBET. Enabling both in any other way makes the input validation stop with an error.</p>
+    </section>
+
+    <section aria-labelledby="operator-order">
+      <h2 id="operator-order">Position in the operator sequence</h2>
+      <p>CBET and hot electrons are stages inside the laser operator, not separate operators. The default sequence (Strang-type) of one outer step runs the laser, nuclear burn, the first half of hydrodynamics, conduction, radiation, and the second half of hydrodynamics, in that order. The laser operator contains the ray trace, the CBET exchange, the hot-electron capture, transport, and deposition, and the addition of the IB deposition and the hot-electron deposition power to the electron energy. The hot-electron capture happens during the ray trace; in the combination with CBET it happens after the CBET solve. The splitting discipline of the whole sequence is in <a href="../../overview/numerics-foundations.html#operator-splitting">Operator splitting and the re-closure discipline</a>.</p>
+      <p>The hot-electron deposition is an explicit source term, so the time-step limit <code>"hot_electron"</code> bounds the next Δt by the ratio of the deposition power to the electron-energy content of the cell. CBET and hot electrons both run only on a single MPI rank.</p>
+    </section>
+
+    <section aria-labelledby="dimensions">
+      <h2 id="dimensions">Correspondence between 1D and 2D RZ</h2>
+      <table class="quick-facts">
+        <thead>
+          <tr><th>Effect</th><th>1D (<code>Main.dimension="1D_SPH"</code>)</th><th>2D RZ (<code>"2D_RZ"</code>)</th></tr>
+        </thead>
+        <tbody>
+          <tr><th>CBET</th><td>Requires <code>Mesh.geometry_1d="spherical"</code> and <code>Laser.mode="raytrace_2d"</code>. <code>geometry_mode</code> is <code>"port_section"</code> (a reconstruction that rotates a single reference trace to the real port directions) or the conventional <code>"legacy"</code> (exchange between beam pairs through rays; default). <code>port_section</code> is 1D only.</td><td>Requires <code>Laser.mode="raytrace_3d"</code>. Only <code>"legacy"</code> is available. The keys for the acceleration of the fixed-point iteration (<code>anderson_depth</code>) and for the workspace limit (<code>workspace_limit_gib</code>) are 2D only.</td></tr>
+          <tr><th>Hot electrons</th><td><code>Laser.mode</code> is <code>"radial_absorption_1d"</code> or <code>"raytrace_2d"</code>. The angular model is <code>"cone"</code> (default) or <code>"radial"</code>. <code>"cone"</code> is not available in the cylindrical geometry (<code>Mesh.geometry_1d="cylindrical"</code>).</td><td>Requires <code>Laser.mode="raytrace_3d"</code>. The angular model is <code>"cone"</code> only; <code>"radial"</code> and a changed <code>inner_bc</code> are 1D only.</td></tr>
+        </tbody>
+      </table>
+      <p>The child pages describe the equations and algorithms for the 1D <code>port_section</code> in the case of CBET, and for both 1D and 2D RZ in the case of hot electrons. The conventional 2D RZ form of CBET is not covered on a child page.</p>
+    </section>
+
+    <section aria-labelledby="controls">
+      <h2 id="controls">Main keys</h2>
+      <p>Only the entry-point keys are listed. The defaults and meanings of the individual keys are in the tables of the child pages; the full schema and the combination constraints are in the <a href="../../use/namelist.html">namelist reference</a>.</p>
+      <table class="quick-facts">
+        <thead>
+          <tr><th>Key</th><th>Default (parser)</th><th>Purpose</th></tr>
+        </thead>
+        <tbody>
+          <tr><th><code>Laser.enabled</code></th><td>—</td><td>Enables the laser operator. CBET and hot electrons run only when it is true.</td></tr>
+          <tr><th><code>Laser.cbet.enable</code></th><td><code>False</code></td><td>Enables CBET (<a href="cbet.html#controls">table on the CBET page</a>).</td></tr>
+          <tr><th><code>Laser.cbet.geometry_mode</code></th><td><code>"legacy"</code></td><td><code>"legacy"</code> or <code>"port_section"</code>. The latter needs <code>Laser.port_configuration.ports</code> and exactly one beam prototype.</td></tr>
+          <tr><th><code>Laser.port_configuration</code></th><td>—</td><td>The port layout (the input of <code>port_section</code>).</td></tr>
+          <tr><th><code>Laser.hot_electron.enable</code></th><td><code>False</code></td><td>Enables hot electrons (<a href="hot-electrons.html#controls">table on the hot-electrons page</a>).</td></tr>
+          <tr><th><code>Laser.hot_electron.eta_hot</code>, <code>eta_hot_table</code>, <code>sources</code></th><td><code>0.0</code>, none, none</td><td>How the conversion efficiency η(t) is given. <code>sources</code> is a mechanism-by-mechanism specification of up to 4 channels.</td></tr>
+          <tr><th><code>Laser.hot_electron.eta_mode</code></th><td><code>"legacy"</code></td><td><code>"model"</code> makes η(t) a relaxation formula driven by local quantities. This value together with <code>port_section</code> is the only combination that can be used with CBET.</td></tr>
+          <tr><th><code>Laser.hot_electron.subtract_from_laser</code></th><td><code>True</code></td><td>Subtracts the converted power from the ray power (prevents double counting).</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section aria-labelledby="references">
+      <h2 id="references">References</h2>
+      <ol class="references">
+        <li>J. A. Marozas et al., "Wavelength-Detuning Cross-Beam Energy Transfer Mitigation Scheme for Direct Drive: Modeling and Evidence from National Ignition Facility Implosions," Phys. Plasmas 25, 056314 (2018). <a href="https://doi.org/10.1063/1.5022181">doi:10.1063/1.5022181</a></li>
+        <li>A. Colaïtis et al., "Coupled Hydrodynamic Model for Laser-Plasma Interaction and Hot Electron Generation," Phys. Rev. E 92, 041101(R) (2015). <a href="https://doi.org/10.1103/PhysRevE.92.041101">doi:10.1103/PhysRevE.92.041101</a></li>
+      </ol>
+    </section>
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["\\[", "\\]"]] } };</script>
+  <script defer src="../../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../../nav.js" data-page="lpi" data-root="../../"></script>
+</body>
+</html>

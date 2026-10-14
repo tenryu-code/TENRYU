@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en" data-lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Time integration — TENRYU Documentation</title>
+  <link rel="stylesheet" href="../../../style.css">
+  <script src="../../../theme.js"></script>
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>Time integration</h1>
+    <p class="abstract">The hydrodynamics runs as a half-step operator inside the operator sequence. This page describes the difference between the 1D integrators (<code>legacy_pc</code>, <code>midpoint_v2</code>) and the 2D RZ integrators (<code>midpoint_v1</code>, <code>pc_v0</code>), the steps of one hydro half-step with <code>midpoint_v1</code>, and the candidate time steps and mesh-quality checks that the driver applies before those steps.</p>
+
+    <section aria-labelledby="time-integration">
+      <h2 id="time-integration">Time integration</h2>
+      <p>At driver level, hydro is the half-step operator in the default laser full → hydro half → conduction full → radiation full → hydro half sequence. Each hydro half-step runs a complete cycle of the selected integrator over that half interval, with EOS re-closure before the next operator consumes the state. The integrator advances this half interval as one step of its own; below, the middle of that interval is the midpoint, and the update over the whole interval is the full-step update.</p>
+      <p>The 1D integrator is selected by the key <code>Numerics.hydro.time_integrator</code>, which is separate from the 2D key <code>time_integration</code>. When it is omitted, the default is <code>legacy_pc</code>, the legacy predictor–corrector. Its predictor does not advance the energy, and its energy work uses the averaged pressure \((P^n+P^{n+1/2})/2\), so the energy update is first order in time. <code>midpoint_v2</code> is a second-order midpoint scheme, available only in 1D, whose predictor also advances the energy to the midpoint and whose energy work uses the midpoint pressure and artificial viscosity directly. In 2D RZ, input validation rejects <code>midpoint_v2</code>.</p>
+      <p>In 2D RZ, <code>pc_v0</code> is retained to reproduce <a href="../../use/running.html#terms-freeze">frozen configurations</a> from the time before the <code>time_integration</code> key existed; a frozen configuration without the key is read as <code>pc_v0</code>. It predicts the position and velocity at the midpoint from old-time forces, evaluates the geometry and forces at the midpoint, then corrects the full-step update. Because its predictor does not advance internal energy, the pressure closure is stale during compression; the retained scheme measures approximately first order in smooth temporal convergence.</p>
+      <p><code>midpoint_v1</code> (the default on a single-block mesh) performs compatible work up to the midpoint, evaluates the exact midpoint-geometry density \(\rho^h=M_c/V(x^h)\), and re-closes the EOS at \((\rho^h,e^h)\). One midpoint corner-force set is shared by momentum, work, and the energy-budget check. A provisional full-step update is followed by exactly one deterministic force re-evaluation at the corrected midpoint; the final state is advanced again from \(t^n\), with \(\bar{\mathbf u}=(\mathbf u^n+\mathbf u^{n+1})/2\). The measured smooth-flow orders (2026-07-27, from the <code>2d_rz_v3_smooth_temporal</code> verification deck) are \(p_\rho=2.0000\) and \(p_e=1.9999\), versus about 1.0007 for <code>pc_v0</code>. On a multiblock (CSR, compressed-sparse-row connectivity) mesh, omitting <code>time_integration</code> gives <code>pc_v0</code>, and setting <code>midpoint_v1</code> explicitly selects the midpoint scheme; with the multiblock midpoint scheme, input validation rejects <code>av_model="scalar_vnr_legacy"</code> and <code>state_supply</code> boundaries. Pressure relaxation of mixed cells (cells in which several materials coexist; <code>Numerics.materials.mixed_cell_closure="pressure_relaxation"</code>, described on the <a href="../../overview/timestep.html#mixed-cell-dt">timestep control page</a>) has no midpoint stage, so input validation rejects its combination with <code>midpoint_v1</code>. The HLLC (Harten–Lax–van&nbsp;Leer-contact Riemann solver) path and the <a href="../mesh/2d.html#terms-center">center button</a> — the assembled polar-center “button” meshes — remain on <code>pc_v0</code> regardless of the <code>time_integration</code> setting. Under MPI (Message Passing Interface) with two or more ranks the driver rejects <code>midpoint_v1</code> outright, so multi-rank 2D decks must select <code>pc_v0</code> explicitly (see the <a href="../../overview/mpi.html">MPI page</a>).</p>
+
+      <figure id="fig-hydro-step-flow">
+        <img src="../../../assets/hydro-step-flow-en.png" width="840" height="340" style="max-width:100%;height:auto" alt="Flow diagram of one 2D RZ hydro half-step (midpoint_v1) as six boxes joined by arrows, in order: old-time corner forces, update to the midpoint, midpoint corner-force set, provisional full-step update, exactly one re-evaluation, and the final update.">
+        <figcaption>Figure A. One hydro half-step in 2D RZ (<code>midpoint_v1</code>). The box numbers match the numbers of the <a href="#pipeline">step-by-step list</a>. The top row goes from the old-time forces to the update to the midpoint and the midpoint force set; the bottom row has the provisional full-step update, the re-evaluation (orange box), and the final update (green box). The re-evaluation is done exactly once at the corrected midpoint, which fixes the number of corrections at one. The final state is advanced again from \(t^n\). The figure is a schematic and contains no numerical data.</figcaption>
+      </figure>
+    </section>
+
+    <section aria-labelledby="pipeline">
+      <h2 id="pipeline">One hydro half-step (<code>midpoint_v1</code>), step by step</h2>
+      <p>The flow of the steps is shown in <a href="#fig-hydro-step-flow">Figure A</a>.</p>
+      <ol>
+        <li>Enter with the post-EOS state at \(t^n\); assemble the old-time corner forces from \(P+Q\) and the cached corner vector \(\mathbf S\).</li>
+        <li>Take the compatible update to the midpoint: advance the midpoint position and velocity \(x^h,u^h\), accumulate the force work up to the midpoint into \(e^h\), form the exact midpoint-geometry density \(\rho^h=M_c/V(x^h)\), and re-close the EOS at \((\rho^h,e^h)\).</li>
+        <li>Assemble one midpoint corner-force set — pressure, subzonal pressure when enabled, and per-edge AV in separate buffers — and use it alike for momentum, work, and the energy-budget check.</li>
+        <li>Form the provisional full-step update \(x^{n+1,*},u^{n+1,*}\).</li>
+        <li>Re-evaluate exactly once: recompute geometry, energy, and forces at the corrected midpoint. This fixes the number of corrections at one, so the operation count is constant.</li>
+        <li>Advance the final state again from \(t^n\), using \(\bar{\mathbf u}=(\mathbf u^n+\mathbf u^{n+1})/2\); apply the boundary condition and re-close the EOS.</li>
+      </ol>
+      <p>The driver chooses the candidate interval before this cycle. Its hydro CFL (Courant–Friedrichs–Lewy) condition includes \(\Delta l_c/(|\mathbf u_c|+c_{s,c})\), where \(\Delta l_c\) is \(\sqrt{A_c}\) in 2D by default (<code>Numerics.dt.cfl_length_2d="sqrt_area"</code>) and a length based on the cell's minimum altitude for <code>"min_altitude"</code>. 2D RZ also has mesh-quality checks that inspect a candidate state before the node positions are committed; all of them are off by default. The quantities they check are the <a href="../mesh/index.html#terms-corner-jacobian">corner Jacobian</a>, the <a href="../mesh/index.html#terms-gauss-jacobian">Gauss-point Jacobian</a>, the revolved volume, and the <a href="../mesh/index.html#terms-axis-margin">axis margin</a>, which serve the <a href="../mesh/index.html#terms-admissibility">admissibility check</a>. When a quantity is predicted to fall below its floor, the check shortens the timestep or rejects the candidate state without committing the positions. The three main checks follow; the <a href="../../overview/timestep.html#hydro-guards">timestep control page</a> lists the others.</p>
+      <ul>
+        <li><code>mesh_quality_dt_cfl_enabled</code>: before the midpoint position and the final position are committed, it follows the candidate path obtained by advancing the positions linearly with the current node velocities, and finds the first point at which a checked quantity falls below its floor. If one does, the step fails without committing the positions and suggests a shorter timestep. The suggested timestep is the stage timestep times the fraction of the path that respects the floors and the safety factor <code>mesh_quality_dt_safety_alpha</code> (default 0.5). The floors are relative to the value at the start of the step, and the default is \(10^{-8}\).</li>
+        <li><code>corner_j_predict_cfl_enabled</code>: limits the timestep so that no corner Jacobian shrinks by more than <code>corner_j_predict_max_shrink</code> (default 0.25) in one step. It acts only on <code>multiblock_cart_core_polar_shell</code> meshes and, with a warning, does nothing on others.</li>
+        <li><code>in_hydro_corner_j_guard_enabled</code>, <code>in_hydro_gauss_j_guard_enabled</code>, and <code>in_hydro_rz_volume_guard_enabled</code>: check the candidate node positions before the geometry update.</li>
+      </ul>
+      <p>Pressure \(p\,dV\) work, subzonal-pressure work, and AV work enter the per-cell work buffers from the same force sets used by momentum. Those contributions feed the internal-energy update and the energy-budget check exactly once; boundary work goes to the boundary-work term of the <a href="../../overview/numerics-foundations.html#energy-ledger">energy ledger</a>, and trial states used inside a stage are not accumulated into the energy ledger.</p>
+    </section>
+
+    <section aria-labelledby="controls">
+      <h2 id="controls">Namelist controls</h2>
+      <p>The following are selected keys under <code>Numerics.hydro</code>. A default is the value used when the deck omits the key. Where a 2D RZ deck that omits the key and the structure default (the value of a Config built in C++ code) differ, both are given. Except for meshes with <code>logical_mesh_2d="polar_in_box"</code>, Studio does not write the keys of this table for 2D RZ, so Studio decks run with the defaults for omitted 2D RZ keys. See the <a href="../../use/namelist.html">namelist reference</a> for all keys and their validation rules.</p>
+      <table class="quick-facts">
+        <thead>
+          <tr><th>Key</th><th>Default</th><th>Purpose</th></tr>
+        </thead>
+        <tbody>
+          <tr><th><code>time_integration</code></th><td><code>"midpoint_v1"</code> (<code>"pc_v0"</code> when a multiblock mesh omits it)</td><td>2D RZ integrator; <code>pc_v0</code> retains the legacy path.</td></tr>
+          <tr><th><code>time_integrator</code></th><td><code>"legacy_pc"</code></td><td>1D integrator. <code>midpoint_v2</code> is 1D-only and is rejected in 2D RZ.</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section aria-labelledby="verification">
+      <h2 id="verification">Verification</h2>
+      <ul>
+        <li><code>2d_rz_v3_smooth_temporal</code> measures the <code>midpoint_v1</code> density and energy orders quoted above and distinguishes them from those of the retained <code>pc_v0</code>.</li>
+      </ul>
+    </section>
+
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["$$", "$$"], ["\\[", "\\]"]] } };</script>
+  <script defer src="../../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../../nav.js" data-page="hydro-time" data-root="../../"></script>
+</body>
+</html>

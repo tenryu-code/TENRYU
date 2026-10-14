@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en" data-lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Rezoning — TENRYU Documentation</title>
+  <link rel="stylesheet" href="../../../style.css">
+  <script src="../../../theme.js"></script>
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>Rezoning</h1>
+    <p class="abstract">ALE rezoning proposes node coordinates only, after the Lagrangian step and without moving material. The solvers are the Winslow family chosen by <code>rezone_solver</code> (the default <code>legacy_winslow</code> and the full R-Z metric version), the M1/TMOP (target-matrix optimization paradigm [3]) objective-function solver, and the reference barrier. A proposal from any solver passes the <a href="index.html#admissibility">admissibility test</a> before it goes to conservative remap. This page gives the equations and search procedures of each solver and defines the reference mesh, reference target, reference barrier, and M1 objective in the <a href="#terms">terms section</a>.</p>
+
+    <section aria-labelledby="terms">
+      <h2 id="terms">Terms used in this calculation</h2>
+      <p>This section defines the reference mesh, reference target, and reference barrier used by the rezone solvers, and the M1 objective. The quantities that measure mesh quality (the corner Jacobian, the Gauss-point Jacobian, and so on) are defined on the <a href="../mesh/index.html#terms-admissibility">Meshes &amp; geometry</a> page, and the acceptance test on the <a href="index.html#admissibility">ALE overview page</a>.</p>
+
+      <h3 id="terms-reference">Reference mesh, reference target, and reference barrier</h3>
+      <p>The <strong>reference mesh</strong> is the node coordinates held in the state (<code>x_r_reference</code>, <code>x_z_reference</code>). For multiblock meshes they keep the coordinates of the mesh at initialization and are not updated at each transaction. The target mesh of a remap is placed at these coordinates only for the duration of the transaction, and the original coordinates are restored after the remap. The shape measure of M1 and the relative floors of the reference barrier are taken against these coordinates.</p>
+      <p>The <strong>reference target</strong> is the mesh toward which the reference-barrier rezone moves the nodes, selected by <code>reference_target</code>. <code>"none"</code> (default) creates no displacement. <code>"eulerian_initial"</code> is the coordinates of the initial mesh (the Eulerian grid). <code>"spherical_equal_angle"</code> is the spherical mesh \((r,z)=(s_i\sin\theta_j,\;s_i\cos\theta_j)\) that keeps the radius \(s_i\) of shell \(i\) of the initial mesh (the distance of node \((i,0)\) from the origin) and spaces the nodes at equal angles \(\theta_j=\pi j/n_z\) in the axial direction.</p>
+      <p>The <strong>reference barrier</strong> is a protective rezone that starts without waiting for the cadence (<code>reference_barrier_enabled</code>, default False). It adds the displacement \(\Delta\mathbf x\) from the current mesh toward the reference target with a blend factor \(\lambda\). The line search halves \(\lambda\) from <code>reference_blend_default</code> (default 1.0), up to <code>reference_linesearch_max_iters</code> times (default 24), and takes the largest value at which the RZ volume, corner Jacobians, and Gauss-point Jacobian stay above floors relative to the reference mesh (default 1.0e-8). It starts under either of two conditions, both enabled by default. (a) The minimum of the cell-centroid \(\sin\theta=|r_c|/\sqrt{r_c^2+z_c^2}\) (\(\theta\) is the polar angle from the +z axis) falls below <code>reference_trigger_axis_margin_threshold</code> (default 1.0e-2). This \(\sin\theta\) is a different quantity from the axis margin (units cm²). (b) The minimum of the corner-Jacobian ratio (the current value of each corner divided by its value in the initial mesh) and the diagonal-corner length ratio (the ratio, to the initial mesh, of the mean \(b_{\rm eff}\) of the lengths of the two edges that meet at one corner of the cell) falls below <code>reference_trigger_corner_j_ratio_threshold</code> (default 0.5).</p>
+
+      <h3 id="terms-m1">The M1 objective</h3>
+      <p>The <strong>M1 objective</strong> is the mesh-quality function that the rezone solver <code>m1_tmop</code> minimizes. “M1” is the prefix of the keys of this objective (<code>m1_*</code>), and the objective follows TMOP (target-matrix optimization paradigm [3]). The equation is given in <a href="#rezone-solvers">Rezone solver family</a>. It is the sum of four terms, with default weights of 0 for the alignment weight \(\gamma_{\rm align}\) (<code>m1_gamma_align</code>), 0 for the tether weight \(\lambda_{\rm tether}\) (<code>m1_lambda_tether</code>), 0 for the polar-row spacing weight \(w_\theta\) (<code>m1_theta_reg</code>), and 1.0e-3 for the barrier weight \(\beta\) (<code>m1_barrier_beta</code>).</p>
+      <p>The shape-quality term (the M1 quality term) takes, at each quadrature point of a cell, the matrix \(T=A_{cq}W_{cq}^{-1}\), which measures the Jacobian matrix \(A_{cq}\) of the actual mesh against the Jacobian matrix \(W_{cq}\) of the reference mesh, and averages its shape measure \(\mu=\|T\|_F^2/(2\det T)\) with weights \(\omega_{cq}\det W_{cq}\). \(\mu\) is smaller the closer the cell's shape is to that of the corresponding reference-mesh cell (apart from scaling and rotation), and its minimum is 1. The alignment weight \(\gamma_{\rm align}\) adds \(\gamma_{\rm align}\|T-I\|_F^2\), which also brings the cell closer to the size and orientation of the reference cell. The tether term penalizes the movement of a node from its Lagrangian position. The polar-row spacing term penalizes the imbalance between the distances to the two neighboring nodes along a row of a polar-type block. The barrier term acts only at quadrature points where \(\det A_{cq}\) falls below 0.1 times the reference value, and strongly penalizes a cell collapsing (its determinant approaching zero).</p>
+      <p>An M1 transaction repeats the update of all nodes <code>m1_sweeps</code> times (default 8) and submits the resulting candidate as it is to the test. There is no search over the blend factor. The candidate is accepted only when it passes the admissibility test and the objective has decreased by more than the relative amount <code>m1_min_j_dec_rel</code> (default 0.0); otherwise the transaction is rolled back.</p>
+    </section>
+
+    <section aria-labelledby="rezone-solvers">
+      <h2 id="rezone-solvers">Rezone solver family</h2>
+      <p><code>legacy_winslow</code> preserves the simplified orthogonal Winslow update [1] bit-exactly. Metric coefficients are lagged from the current logical-grid coordinates in a Jacobi iteration, and the cross derivative is omitted (here \(\alpha\) and \(\beta\) are the Winslow metric coefficients — unrelated to the radiation pages' symbols):</p>
+      $$
+      r_{i,j}^{new}=\frac{\alpha(r_{i+1,j}+r_{i-1,j})+\beta(r_{i,j+1}+r_{i,j-1})}
+      {2(\alpha+\beta)}.
+      $$
+      <p>The same equation updates \(z\). An opt-in full R-Z metric variant (<code>rezone_solver="rz_full_metric_winslow"</code>) adds the mixed derivative and an R-weighted candidate. Its node-local line search, active when <code>rezone_local_admissibility_linesearch=True</code> (default False), tests incident-cell Gauss-J, corner-J, signed RZ volume, and non-axis radii.</p>
+      <p>The reference-barrier solver (<a href="#terms-reference">terms</a>) constructs displacements toward reference targets such as the initial Eulerian mesh or an equal-angle spherical mesh, then blends them with a global line search with reference-relative floors. The line search halves the blend factor \(\lambda\) from <code>reference_blend_default</code> (default 1.0), up to <code>reference_linesearch_max_iters</code> times (default 24), and takes the largest \(\lambda\) at which the candidate mesh's RZ volume, corner Jacobians, and Gauss-point Jacobian stay above floors relative to the reference mesh (<code>reference_volume_floor_rel</code>, <code>reference_corner_j_floor_rel</code>, <code>reference_gauss_j_floor_rel</code>; all default 1.0e-8). The Gauss-point Jacobian in this test is evaluated as the Jacobian at the cell center (the mean of the four corner Jacobians). In the multiblock center patch (<code>multiblock_lagrangian_bulk_center_patch_reference_enabled</code>, default False), a Winslow smoothing proposal is first moved by barrier optimization into the feasible set defined by the volume and corner-J floors, and then passes through the same kind of global line search.</p>
+      <p><code>m1_tmop</code> is an opt-in damped Gauss–Newton solver. Its objective (<a href="#terms-m1">the M1 objective</a>) combines M1 quality relative to a reference metric, a tether to the Lagrangian position, polar-row spacing regularization, and a small-determinant activation barrier:</p>
+      $$
+      \begin{aligned}
+      \mathcal J(\mathbf x)={}&
+      \frac{\sum_{c,q}\omega_{cq}\det(W_{cq})\,\mu(A_{cq}W_{cq}^{-1};\gamma_{\rm align})}
+           {\sum_{c,q}\omega_{cq}\det(W_{cq})}
+      +\frac{\lambda_{\rm tether}}{N_v}\sum_i\frac{\|\mathbf x_i-\mathbf x_i^L\|^2}{h_i^2}\\
+      &\quad+\frac{w_\theta}{N_v}\sum_{i\in\mathcal R}
+       \left(\frac{d_{iL}-d_{iR}}{d_{iL}+d_{iR}}\right)^2
+      +\beta\sum_{c,q}\left[\det A_{cq}&lt;\sigma_b\det W_{cq}\right]
+       \log\frac{\sigma_b\det W_{cq}}{\det A_{cq}}.
+      \end{aligned}
+      $$
+      <p>Here \(A_{cq}\) and \(W_{cq}\) are the Jacobian matrices of the actual and reference meshes' maps at quadrature point \(q\) of cell \(c\) (for a quadrilateral, one of the 2×2 Gauss points; \(\det A_{cq}\) is the Gauss-point Jacobian there), with weights \(\omega_{cq}\) and the shape-quality measure \(\mu\) at alignment weight \(\gamma_{\rm align}\) (the reciprocal of Knupp's shape measure [2] plus an alignment term) — the M1 quality term; \(\lambda_{\rm tether}\) penalizes displacement from the Lagrangian positions \(\mathbf x^L_i\) on the local scale \(h_i\) (the root-mean-square length of the reference-mesh edges meeting node \(i\)); \(N_v\) is the total node count; the \(w_\theta\) term regularizes polar-row spacing through the left/right neighbor distances \(d_{iL},d_{iR}\) over the row set \(\mathcal R\); and the barrier, with weight \(\beta\) (a different quantity from the Winslow coefficient \(\beta\); default 1.0e-3), acts only where \(\det A_{cq}&lt;\sigma_b\det W_{cq}\), that is, where \(\det A_{cq}\) falls below \(\sigma_b=0.1\) (a constant in the implementation) times the reference value.</p>
+      <p>Each node update caps the proposed displacement at 1/4 of the shortest distance from the node to its neighbors in the incident cells, then halves it up to 12 times until the local objective decreases. This update is repeated over all nodes <code>m1_sweeps</code> times (default 8). A transaction is accepted only when the candidate-mesh oracle finds the mesh admissible and</p>
+      $$
+      \frac{\mathcal J_{before}-\mathcal J_{after}}
+           {\max(|\mathcal J_{before}|,10^{-300})}
+      &gt;\texttt{m1\_min\_j\_dec\_rel}.
+      $$
+      <p>The 0.0 default requires a strict decrease while retaining small useful improvements. In the multiblock path, the M1 reference mesh is a fixed reference that keeps the coordinates of the mesh at initialization and does not move at each acceptance. The accepted coordinates are placed at the reference positions only for the duration of the conservative remap, as its target mesh, and the reference returns to its original coordinates after the remap. The configuration check rejects <code>rezone_solver="m1_tmop"</code> for the logical meshes <code>rectangular_rz</code> and <code>cone_shell</code> (the error message calls this restriction the scope of “M1 v1”). The polar-row spacing term acts only on rows of polar-type blocks.</p>
+    </section>
+
+    <section aria-labelledby="controls">
+      <h2 id="controls">Namelist controls</h2>
+      <p>These are selected <code>Numerics.ale</code> controls. See the <a href="../../use/namelist.html">namelist reference</a> for all fields and validation rules.</p>
+      <table class="quick-facts">
+        <thead>
+          <tr><th>Key</th><th>Default</th><th>Purpose</th></tr>
+        </thead>
+        <tbody>
+          <tr><th><code>rezone_solver</code></th><td><code>"legacy_winslow"</code></td><td><code>"legacy_winslow"</code> (legacy Winslow family), <code>"rz_full_metric_winslow"</code> (full R-Z metric variant), or <code>"m1_tmop"</code> (the M1 objective solver). The latter two are opt-in.</td></tr>
+          <tr><th><code>m1_min_j_dec_rel</code></th><td><code>0.0</code></td><td>Minimum relative objective decrease for M1.</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section aria-labelledby="references">
+      <h2 id="references">References</h2>
+      <ol class="references">
+        <li>A. M. Winslow, "Numerical Solution of the Quasilinear Poisson Equation in a Nonuniform Triangle Mesh," J. Comput. Phys. 1, 149–172 (1966). <a href="https://doi.org/10.1016/0021-9991(66)90001-5">doi:10.1016/0021-9991(66)90001-5</a></li>
+        <li>P. M. Knupp, "Algebraic Mesh Quality Metrics," SIAM J. Sci. Comput. 23, 193–218 (2001). <a href="https://doi.org/10.1137/S1064827500371499">doi:10.1137/S1064827500371499</a></li>
+        <li>V. A. Dobrev, P. Knupp, T. V. Kolev, K. Mittal, and V. Z. Tomov, "The Target-Matrix Optimization Paradigm for High-Order Meshes," SIAM J. Sci. Comput. 41, B50–B68 (2019). <a href="https://doi.org/10.1137/18M1167206">doi:10.1137/18M1167206</a></li>
+      </ol>
+    </section>
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["$$", "$$"], ["\\[", "\\]"]] } };</script>
+  <script defer src="../../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../../nav.js" data-page="ale-rezone" data-root="../../"></script>
+</body>
+</html>

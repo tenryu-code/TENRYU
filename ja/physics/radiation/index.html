@@ -13,7 +13,7 @@
   <main>
     <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
     <h1>輻射輸送</h1>
-    <p class="abstract">TENRYU は、物質（matter。電子の内部エネルギー）と連成した多群（multigroup）の輻射輸送（radiation transport）を、<code>Radiation.mode</code> で選ぶ 2 つの実運用向けの決定論的（deterministic）なソルバで解く。多群の流束制限拡散（flux-limited diffusion、FLD。<code>"multigroup_diffusion"</code>）と、離散座標法（discrete ordinates method）による \(S_N\) 輸送（<code>"sn_transport"</code>）である。どちらも、1D の 3 つの座標幾何（<code>Mesh.geometry_1d</code> の球・円筒・平面）と、2D の軸対称（axisymmetric）RZ の幾何で動作する。群の構造と材料クロージャ（material closure。保存量から圧力、温度、不透明度などを求める関係で、<a href="../eos-opacity.html">EOS・不透明度・電離</a>の頁で説明する）を共有するが、角度の扱い方と、物質との連成を解く方法が異なる。この頁では両モデルを説明して比較し、それぞれの詳細頁へ案内する。</p>
+    <p class="abstract">TENRYU は、物質（matter。電子の内部エネルギー）と連成した多群（multigroup）の輻射輸送（radiation transport）を、<code>Radiation.mode</code> で選ぶ 2 つの実運用向けの決定論的（deterministic）なソルバで解く。多群の流束制限拡散（flux-limited diffusion、FLD。<code>"multigroup_diffusion"</code>）と、離散座標法（discrete ordinates method）による \(S_N\) 輸送（<code>"sn_transport"</code>）である。どちらも、1D の 3 つの座標幾何（<code>Mesh.geometry_1d</code> の球・円筒・平面）と、2D の軸対称（axisymmetric）RZ の幾何で動作する。群の構造と材料クロージャ（material closure。保存量から圧力、温度、不透明度などを求める関係で、<a href="../eos-opacity/index.html">EOS・不透明度・電離</a>の頁で説明する）を共有するが、角度の扱い方と、物質との連成を解く方法が異なる。この頁では両モデルを説明して比較し、それぞれの詳細頁へ案内する。</p>
     <div class="card-grid">
       <a class="card" href="fld.html"><h3>多群 FLD</h3><p>Fleck 線形化（Fleck linearization）による物質との連成を用いる流束制限拡散。</p></a>
       <a class="card" href="sn.html"><h3>S<sub>N</sub> 輸送</h3><p>掃引（sweep）と、反復で解く物質との連成を用いる離散座標法の輸送。</p></a>
@@ -48,7 +48,7 @@
       <ul>
         <li>共有する光子エネルギー群の境界、プランク分率（Planck fraction）\(b_g(T)\)（温度 \(T\) の黒体輻射のエネルギーのうち、群 \(g\) に入る割合）、電子の状態方程式（equation of state、EOS）から評価する基本量（内部エネルギーや熱容量など）。</li>
         <li>反射（reflecting）、真空（vacuum）、Marshak（Marshak boundary condition。外部の輻射場から入射する流束を与える）の 3 種類の境界条件。面の種別は、モードごとのブロックの下に置く。</li>
-        <li><a href="../eos-opacity.html#void-materials">ボイド</a>（void）セル（<code>Material.is_void</code> が真の材料で満たしたセル）は、物質との交換から除外する。</li>
+        <li><a href="../eos-opacity/index.html#void-materials">ボイド</a>（void）セル（<code>Material.is_void</code> が真の材料で満たしたセル）は、物質との交換から除外する。</li>
         <li><a href="../../overview/numerics-foundations.html#energy-ledger">エネルギー台帳</a>（energy ledger。輻射と物質のあいだ、および境界を出入りするエネルギーを項目別に記録した帳簿）の収支が、機械精度（machine precision）で閉じる。</li>
         <li>内部の単位系 cgs + eV。</li>
       </ul>

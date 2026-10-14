@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="ja" data-lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>不透明度 — TENRYU ドキュメント</title>
+  <link rel="stylesheet" href="../../../style.css">
+  <script src="../../../theme.js"></script>
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>不透明度</h1>
+    <p class="abstract">TENRYU の不透明度（opacity）は、セルの密度と温度から、輻射輸送が使う質量不透明度（mass opacity）を与える。定数の係数、または TMAT-H5 などの表形式の係数を選べ、輸送では長さあたりの不透明度に変換して使う。2 つ以上の材料が体積を分け合う混合セルには、混合則を適用する。輻射の放出を群へ配るプランク分率（Planck fraction）は、初期化のときに表にする。この頁は不透明度のモデル、混合セルの扱い、プランク分率の表と、群の外にこぼれる裾の診断を述べる。この計算に固有の用語は<a href="#terms">用語の節</a>で説明する。</p>
+
+    <aside class="planned" aria-labelledby="at-a-glance">
+      <h3 id="at-a-glance">要点</h3>
+      <ul>
+        <li><strong>モデル：</strong><code>constant</code> は吸収 <code>kappa_a</code> と散乱 <code>kappa_s</code> を cm²/g で与え、表形式のモデルはロスランド平均・プランク吸収・プランク放出を読む。輸送では \(\sigma=\rho\kappa\) [cm⁻¹] に変換する。</li>
+        <li><strong>混合セル：</strong><code>Materials.opacity_mix_rule</code> の既定は <code>"linear_mass"</code> である。非線形の 2 つの規則（<code>"harmonic_mass_R"</code>、<code>"max"</code>）は 1D だけにある。</li>
+        <li><strong>多材料 1D：</strong>純セルでは支配材料が表を選び、界面の混合セルは各材料の表を部分密度で評価して合成する。</li>
+        <li><strong>プランク分率：</strong>群の和は 1 に規格化する。群の外にこぼれる裾の欠損が \(10^{-3}\) を超える温度が表のすべての温度に及ぶとき、初期化で警告する。</li>
+      </ul>
+    </aside>
+
+    <section aria-labelledby="opacity">
+      <h2 id="opacity">不透明度と材料の混合</h2>
+      <p><code>opacity.model="constant"</code> は、吸収 <code>kappa_a</code> と散乱 <code>kappa_s</code> を cm²/g で与え、すべての輻射群へ同じ値を割り当てる。1D の \(S_N\) ソルバは <code>kappa_s</code> を物理的な散乱の不透明度として使う。FLD は物理散乱をもたないので、<code>kappa_s</code> が 0 より大きいと入力の誤りとして拒否する。2D の \(S_N\) ソルバは物理散乱をゼロとして扱い、<code>kappa_s</code> を使わない。表形式のモデルは、密度・温度・群に依存するロスランド平均 \(\kappa_R\)、プランク吸収 \(\kappa^{PA}\)、そして利用できる場合はプランク放出 \(\kappa^{PE}\) を読む。内部の輸送係数へは \(\sigma=\rho\kappa\) によって cm⁻¹ に変換する。放出不透明度のブロックをもたない IONMIX の表は、LTE の表とみなし、警告を出して \(\kappa^{PE}=\kappa^{PA}\)（キルヒホッフの法則、Kirchhoff's law）とする。</p>
+      <p>混合セルでは <code>Materials.opacity_mix_rule</code> が材料の不透明度の混合則（mixing rule）を決め、重みは質量分率（材料ごとの質量を追跡しない場合は体積分率）である。既定の <code>"linear_mass"</code> は、プランクとロスランドの両方を \(\kappa_{P,mix}=\sum_\alpha f_{m,\alpha}\kappa_{P,\alpha}\) のように線形に混合する。<code>"harmonic_mass_R"</code> はプランクを線形のまま、ロスランドを調和平均 \(1/\kappa_{R,mix}=\sum_\alpha f_{m,\alpha}/\kappa_{R,\alpha}\) で混合し、<code>"max"</code> は両方とも材料の最大値をとる。非線形の 2 つの規則は 1D だけにあり、2D は <code>"linear_mass"</code> だけを受け付ける。診断用の環境スイッチ <code>TENRYU_MM_OPACITY_MIX=harmonic</code> は、定数不透明度を両方とも調和平均で混合する。</p>
+      <h3 id="per-material-table-opacities">材料ごとの表不透明度（多材料 1D）</h3>
+      <p><code>1D_SPH</code> の多群拡散デッキでは、ボイドでない各材料に固有の <code>tmat</code> 不透明度表 — LTE の表と、吸収とは独立の放出不透明度をもつ非 LTE（non-LTE、NLTE）の表のいずれも — または定数を指定できる。<code>table_nlte</code>（IONMIX の表）、<code>power_law</code>、<code>freq_dep_marshak</code> も材料ごとに指定でき、<code>sn_transport</code> のデッキも同じ材料ごとのモデルを受け付ける。純セルでは体積分率が最大の<a href="#terms-mixed">支配材料</a>が表を選び、その群ごとの不透明度をセルの \((\rho,T_e)\) で補間する。界面の混合セルは寄与材料をすべて厳密に合成する — 既定の線形の規則では \(\sigma = \rho \sum_m w_m \kappa_m(\rho_m, T_e)\)、重み \(w_m\) は質量分率（なければ体積分率）、各材料の表はその<a href="#terms-mixed">部分密度（partial density）</a> \(\rho_m = \rho\,w_m/f_m\) で評価する。NLTE が支配材料のセルだけは NLTE カーネルが支配材料近似で埋める。2D では、材料が複数ある \(S_N\) のデッキがボイドでない材料すべてに定数不透明度を要求する。2D の FLD は、各材料の不透明度（モデルは材料ごとに選べる）を部分密度で評価して混ぜる。混合則は <code>"linear_mass"</code> だけである。</p>
+    </section>
+
+    <section aria-labelledby="planck-table">
+      <h2 id="planck-table">PlanckTable と群の被覆に関する診断</h2>
+      <p>群 \(g=[E_{g-1},E_g)\) のプランク分率は、黒体スペクトルの全積分に対する、その群のなかでの積分の割合である。</p>
+      $$
+      b_g(T)=\frac{15}{\pi^4}\int_{E_{g-1}/T}^{E_g/T}\frac{x^3}{e^x-1}\,dx.
+      $$
+      <p><code>planck_fraction.method="compute"</code> では、初期化時に温度の格子上でこの積分を評価し、実行時の <code>PlanckTable</code> は、累積分率（cumulative fraction。またはその補数の裾）の対数を、その厳密な傾きとともに \(\ln T\) の三次 Hermite 多項式（cubic Hermite polynomial）で補間し、\(b_g\) を隣り合う値の差として求める（総和は構成上 1 になる）。光子エネルギーの定義域が有限であるため、素の重みの総和は 1 未満になり得る。そこで保存に使う重みは \(\sum_g b_g=1\) へ規格化し直す。ただし規格化は、不足しているスペクトルを復元するものではない。そのため裾の欠損 \(\delta(T)=1-\sum_g b_g^{raw}(T)\) を保持し、温度格子全体での最大値を初期化時に報告する。表のどの温度でも欠損が \(10^{-3}\) を超えるときは警告を出し、そうでないときは、欠損が \(10^{-3}\) 以下になる温度の範囲と欠損の最大値を、情報として記録する。</p>
+      <p><code>compute_T_range_eV</code> は、このプランク表の温度軸である。省略した場合は、有効な材料の電子 EOS の表の範囲、次に不透明度の表の範囲、最後に [0.01, 1000] eV の順で導く。輻射を有効にした Studio のデッキは <code>compute_T_range_eV</code> を必ず書き出し、群境界の下端と 0.1 eV の小さい方から、群境界の上端と \(10^5\) eV の大きい方までとする。実行時の温度が範囲外なら、端点の値へクランプする（外挿しない）。範囲外の参照の回数と超過率は記録しない。警告が出るのは、輻射の Marshak 境界の駆動温度 \(T_r\) について \(b_g\) をホスト側で引く経路だけで、初回の 1 回に限る。この温度軸は光子の群境界 \([E_0,E_G]\) とは別の量である。群境界を <code>"log_uniform"</code> で生成する場合と、群境界も表の群構造も与えない場合は、群境界がこの温度範囲から対数等間隔に作られる（下端は \(10^{-3}\) eV 以上にする）ので、二つの範囲は一致する。不透明度の表の群構造や、明示した <code>group_bounds_eV</code> を使う場合は、二つの範囲は独立である。群境界は想定するプラズマのスペクトルを覆うように、プランク表の温度軸は補間に必要な温度を覆うように、それぞれ設計すること。</p>
+    </section>
+
+    <section aria-labelledby="terms">
+      <h2 id="terms">この計算で使う用語</h2>
+      <p>群と温度の格子、プランク分率、混合セルの扱いは、TENRYU の実装に固有の意味で使うので、ここで定義する。</p>
+
+      <h3 id="terms-planck">群、プランク分率、裾の欠損</h3>
+      <p><strong>群（group）</strong>は、輻射輸送が光子のエネルギーを分ける区間 \([E_{g-1},E_g)\) で、\(g=1,\dots,G\) と数える。境界 \(E_0&lt;E_1&lt;\dots&lt;E_G\) [eV] は <code>Radiation.group_bounds_eV</code>（数値のリスト、または <code>"log_uniform"</code>）で、群の数 \(G\) は <code>Radiation.groups</code>（既定 1）で与える。群が 1 つならグレイ（gray）の計算になる。不透明度の係数も輻射のエネルギーも、群ごとに決まり、群ごとに輸送される。</p>
+      <p><strong>プランク分率（Planck fraction）</strong> \(b_g(T)\) は、温度 \(T\) の黒体スペクトルのうち、群 \(g\) に入る割合である（式は<a href="#planck-table">PlanckTable と群の被覆に関する診断</a>）。輻射の放出の源を群へ配る重みとして使い、群についての和が 1 になるように規格化する。初期化のとき、温度の格子（<code>planck_fraction.compute_N_T</code> 点。既定 200。温度の範囲を対数等間隔に刻む）の上で計算して表にする（<code>PlanckTable</code>）。温度の範囲は <code>Radiation.compute_T_range_eV</code> で与える。省略すると、有効な材料の電子 EOS の表の範囲、次に不透明度の表の範囲、最後に [0.01, 1000] eV の順で導く。輻射を有効にした Studio のデッキは <code>compute_T_range_eV</code> を必ず書き出す（既定の群境界 [0.1, \(10^5\)] eV では [0.1, \(10^5\)] eV）。</p>
+      <p><strong>裾の欠損（tail deficit）</strong> \(\delta(T)=1-\sum_g b_g^{raw}(T)\) は、群の全範囲 \([E_0,E_G]\) の外にこぼれる黒体スペクトルの割合である。\(b_g^{raw}\) は規格化する前の \(b_g\) である。光子エネルギーの範囲が有限なので、\(b_g^{raw}\) の和は 1 未満になり得る。規格化は欠けたスペクトルを復元せず、外にこぼれた分を群の中へ配り直すだけなので、群の範囲が狭いと、輻射の放出が実際より群の範囲に偏る。そこで初期化のとき、温度の格子の全体で \(\delta(T)\) の最大値を調べて記録する。\(\delta\) が \(10^{-3}\) を超える温度が表のすべての温度に及ぶときは警告し、そうでないときは、\(\delta\le10^{-3}\) となる温度の範囲と最大値を情報として記録する。群が 1 つのときは \(b_1=1\) で、欠損は調べない。</p>
+
+      <h3 id="terms-mixed">混合セル、支配材料、部分密度</h3>
+      <p><strong>混合セル（mixed cell）</strong>は、2 つ以上の材料が体積を分け合うセルである。材料 \(m\) の体積分率 \(f_m\)（<code>Geometry.volfrac</code> を正規化した値で、総和は 1）は、セルの体積のうち材料 \(m\) が占める割合を表す。ボイド（<a href="index.html#void-materials">定義</a>）は真空でイオンをもたないので、材料の平均には入れず、ボイドでない材料の体積分率の和で割り直す。ボイドでない材料のうち 1 つだけが体積分率をもつセルを、純セル（pure cell）と呼ぶ。</p>
+      <p><strong>支配材料（dominant material）</strong>は、セルのなかで体積分率が最大の、ボイドでない材料である。体積分率が等しいときは番号の小さい材料、ボイドでない材料の体積分率が正でないセルでは先頭のボイドでない材料とする。純セルでは、支配材料が不透明度の表を選ぶ。支配材料が NLTE（non-LTE）の表の材料であるセルは、混合セルでも、その材料の NLTE の計算が支配材料の表だけで埋める（支配材料近似）。</p>
+      <p><strong>部分密度（partial density）</strong>は、材料 \(m\) の質量をその材料が占める体積で割った、材料 \(m\) 自身の密度 \(\rho_m=\rho\,w_m/f_m\) である。\(w_m\) は質量分率（材料ごとの質量を追跡しないときは体積分率）。材料の表は密度の関数なので、混合セルでは、それぞれの表を、セルの密度ではなくその材料の部分密度で引く。\(f_m\le10^{-12}\) の材料は、部分密度をセルの密度とする（0 除算を避けるため）。既定の線形の規則 <code>Materials.opacity_mix_rule="linear_mass"</code>（Studio はこのキーを書き出さない）では、混合セルの長さ不透明度は \(\sigma=\rho\sum_mw_m\kappa_m(\rho_m,T_e)\) になる（<a href="#opacity">不透明度と材料の混合</a>）。</p>
+    </section>
+
+    <section aria-labelledby="controls">
+      <h2 id="controls">namelist による制御</h2>
+      <p>以下は、不透明度に直接関係する設定の抜粋である。検証規則の全体は <a href="../../use/namelist.html">namelist リファレンス</a>を参照のこと。</p>
+      <table class="quick-facts">
+        <thead>
+          <tr><th>キー</th><th>値・既定</th><th>用途</th></tr>
+        </thead>
+        <tbody>
+          <tr><th><code>opacity.model</code></th><td><code>constant</code>（既定）| <code>tmat</code> | <code>table_nlte</code> | <code>ionmix</code> | <code>power_law</code> | <code>freq_dep_marshak</code> | <code>free_free</code></td><td>群によらず一定の係数（<code>constant</code>）、表形式の係数（<code>tmat</code> は TMAT-H5 の表、<code>table_nlte</code> は衝突輻射コード Ionmix の <code>.cn4</code> 形式「IONMIX」の表。<code>ionmix</code> は、放出と吸収の不透明度が一致する LTE の IONMIX の表を <code>table_nlte</code> と同じ経路で扱う）、べき乗則（<code>power_law</code>）、周波数依存の Marshak 検証問題用の解析不透明度（<code>freq_dep_marshak</code>）、自由–自由吸収（free-free absorption。<code>free_free</code>、2D の FLD だけ）。<code>sesame</code> は受け付けるが未実装のため、入力の誤りになる。<code>none</code> は廃止予定で、<code>kappa_a</code> と <code>kappa_s</code> が 0 の <code>constant</code> に読み替える。Studio は <code>constant</code> と <code>tmat</code> だけを書き出す。</td></tr>
+          <tr><th><code>kappa_a</code>, <code>kappa_s</code></th><td>0.0 / 0.0</td><td>定数の吸収・散乱の質量不透明度。<code>kappa_a</code> は省略すると警告を出し、0（透明な媒質）になる。<code>kappa_s</code> は \(S_N\) だけが使い、FLD では 0 より大きい値が拒否される。</td></tr>
+          <tr><th><code>opacity.units</code></th><td><code>"cm2_per_g"</code></td><td>質量不透明度の固定された単位。変更できない。</td></tr>
+          <tr><th><code>Materials.opacity_mix_rule</code></th><td><code>"linear_mass"</code></td><td>混合セルの混合則。<code>"linear_mass"</code>（両方とも線形）、<code>"harmonic_mass_R"</code>（ロスランドを調和平均）、<code>"max"</code> から選ぶ。2D は <code>"linear_mass"</code> だけを受け付ける。</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section aria-labelledby="verification">
+      <h2 id="verification">検証</h2>
+      <ul>
+        <li>プランクの群和に対する検査は、1、4、16、64 群と \(T=1\ldots10^5\) eV で \(\sum_g b_g=1\)、端の累積分布（cumulative distribution function、CDF）、群について総和した \(aT^4\) を確認する。運用時には、これとは別に、初期化のときに裾の欠損の最大値を報告する。プランク表の温度範囲外の参照は記録しない。</li>
+        <li>不透明度の一致比較では、比較する双方の物理的な仮定をそろえることが先決である。HELIOS（輻射流体コード）との LTE 一致比較の A/B では、TENRYU 側の放出を <code>kappa_PE := kappa_PA</code> とするキルヒホッフの法則の分枝で評価し、素の衝突輻射平衡（collisional-radiative equilibrium、CRE）による非 LTE の放出の表との差を切り分けた。</li>
+      </ul>
+    </section>
+
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["$$", "$$"], ["\\[", "\\]"]] } };</script>
+  <script defer src="../../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../../nav.js" data-page="opacity" data-root="../../"></script>
+</body>
+</html>

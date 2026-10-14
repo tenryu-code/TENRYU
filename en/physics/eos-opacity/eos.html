@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en" data-lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Equation of state — TENRYU Documentation</title>
+  <link rel="stylesheet" href="../../../style.css">
+  <script src="../../../theme.js"></script>
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>Equation of state</h1>
+    <p class="abstract">TENRYU's equation of state (EOS) closes the temperature, pressure, and specific heat from the density and energy of a cell. The choices are an analytic two-temperature ideal gas (<code>ideal_gas</code>) that treats electrons and ions independently, and the tabulated TMAT-H5 EOS (<code>tmat</code>). The fluid evolves the energy, not the temperature, so the tabulated EOS recovers the temperature with an inverse map. This page describes the equations of both models and the treatment of energies outside the table. Terms specific to this calculation are defined in the <a href="#terms">terms section</a>.</p>
+
+    <aside class="planned" aria-labelledby="at-a-glance">
+      <h3 id="at-a-glance">At a glance</h3>
+      <ul>
+        <li><strong>Ideal gas:</strong> <code>ideal_gas</code> is an analytic two-temperature EOS that closes electrons and ions independently; the default of <code>ideal_gas.gamma</code> is 5/3.</li>
+        <li><strong>Tabulated:</strong> <code>tmat</code> builds the pressure, energy, and specific heat from the ion, electron, and total-matter tables of TMAT-H5, and interpolates bilinearly on the \((\log\rho,\log T)\) plane at run time.</li>
+        <li><strong>Inverse map:</strong> the temperature follows from a binary search of the energy row on a density-fixed bracket and a \(\log T\) interpolation. No Newton iteration is used.</li>
+        <li><strong>Table edges:</strong> an energy below the lowest table temperature is clamped to the edge temperature. An energy above the highest temperature is closed by an ideal-gas extension in the 1D default closure, and clamped at the highest temperature in <code>"legacy"</code> and in 2D RZ.</li>
+      </ul>
+    </aside>
+
+    <section aria-labelledby="eos-models">
+      <h2 id="eos-models">Ideal-gas and TMAT equations of state</h2>
+      <p><code>eos.model="ideal_gas"</code> independently closes the electron and ion branches. For the default monatomic gas, \(\gamma=5/3\), \(P_i=\rho k_BT_i/(A m_p)\), and \(P_e=\bar Z\rho k_BT_e/(A m_p)\), with \(k_B\) the <code>eV_to_erg</code> conversion as everywhere in the cgs + eV system. These temperature branches are the primary closure. The pressure–energy form \(P=(\gamma-1)\rho e\) with the configured <code>ideal_gas.gamma</code>, used when closing from evolved energy, is an equivalent statement of the same ideal gas: since \(e_i=k_BT_i/[(\gamma-1)Am_p]\) for the ion branch and \(e_e=\bar Z\,k_BT_e/[(\gamma-1)Am_p]\) for the electron branch, the two forms are consistent by construction when \(\bar Z\) is constant. When \(\bar Z\) depends on temperature, the electron heat capacity is still \(\bar Z k_B/[(\gamma-1)Am_p]\) with the current \(\bar Z\); the \(T_e\,d\bar Z/dT_e\) contribution is not included (a known limitation).</p>
+      <p><code>cv_e_override</code> supports verification problems, such as Marshak-wave or Su–Olson setups, that prescribe a constant electron volumetric heat capacity. Its unit is erg/(cm³·eV), unlike the mass-specific \(c_v\) in erg/(g·eV) returned by an EOS table. The override supplies the same constant \(C_{v,e}\) to the radiation Fleck factor. It therefore expresses the constant-\(C_v\) verification condition, not a general material-fitting parameter.</p>
+      <p><code>eos.model="tmat"</code> builds ion, electron, and total (the sum of ion and electron) \(P(\rho,T)\), \(e(\rho,T)\), and \(c_v(\rho,T)\) tables from <a href="#terms-tmat">TMAT-H5</a>. The native ion-number-density axis is converted with \(\rho=n_i A m_p\). Runtime evaluation is bilinear in \((\log\rho,\log T)\) and clamps to the table edge outside the tabulated domain (the treatment of the top of the temperature range is given in the next paragraph). A non-positive \(c_v\) is raised to a floor, with a single warning when the table is built.</p>
+      <p>Hydrodynamic re-closure from evolved energy does not run Newton iterations. At a fixed density bracket, the GPU path performs a monotone binary search of the energy row, then interpolates between adjacent temperature indices in \(\log T\). The <a href="#terms-reclosure">inverse map</a> \(T(\rho,e)\) and the subsequent forward \(P,e,c_v\) evaluations reuse the same density bracket. A target energy below the table's value at its lowest temperature returns the lowest temperature. A target energy above the value \(e_{top}\) at the highest temperature \(T_{top}\) is treated according to the closure. The default 1D closure (<code>Numerics.hydro.eos_closure_mode="energy_authoritative"</code>, which treats the evolved energy as authoritative) does not clamp; it closes with an ideal-gas extension attached to the \(T_{top}\) row, \(e=e_{top}+c_{v,top}(T-T_{top})\), \(P=P_{top}T/T_{top}\), \(c_v=c_{v,top}\) (the subscript top denotes the table value at \(T_{top}\)), and leaves the evolved energy unchanged. The <code>"legacy"</code> closure and the 2D RZ closure clamp at \(T_{top}\), and under <code>"legacy"</code> the excess energy is replaced by the table value and lost. The one exception to this Newton-free inverse is the cold-equilibrium constitutive model (<code>Numerics.hydro.T_start_inactive_cells="cold_equilibrium"</code>), whose inverse takes a bracketed Newton step in the temperature range where its correction fades out.</p>
+    </section>
+
+    <section aria-labelledby="terms">
+      <h2 id="terms">Terms used in this calculation</h2>
+      <p>The re-closure procedure and the format of the material tables carry meanings specific to TENRYU's implementation, so they are defined here.</p>
+
+      <h3 id="terms-reclosure">Re-closure and the inverse map</h3>
+      <p><strong>Re-closure</strong> is recomputing the temperature \(T\), pressure \(P\), and specific heat \(c_v\) from \((\rho,e)\) with the EOS after an operator has changed the state. A closure is the relation that fixes these quantities from the conserved ones; on this page the EOS, mean ionization, and opacity together are called the material closure (<a href="../../overview/numerics-foundations.html#operator-splitting">Operator splitting and the re-closure discipline</a>). Hydro advances energy, not temperature, so the \(T\), \(P\), and \(c_v\) read by conduction, radiation, and the laser must be rebuilt from the energy each time it changes. In this page's procedure, after each hydro half-step the inverse map recovers \(T\) and forward lookups evaluate \(P\) and \(c_v\) (<a href="index.html#pipeline">Where the closures are called, step by step</a>).</p>
+      <p>The <strong>inverse map</strong> computes the temperature \(T(\rho,e)\) from the density \(\rho\) and the energy \(e\), and is the first stage of a re-closure. For a tabulated EOS it looks the \(e(\rho,T)\) table up backwards in temperature. A density bracket (<code>RhoBracket</code> in the code) is the pair of adjacent indices of the table's density grid that enclose the queried density, together with the interpolation weight. The GPU path binary-searches the energy row at this bracket, relying on the energy increasing with temperature, to fix the temperature index, and then interpolates between adjacent indices in \(\log T\). It does not use Newton iteration, so the result is deterministic and has no convergence branch. The subsequent forward lookups of \(P\), \(e\), and \(c_v\) share the same density bracket.</p>
+      <p>The treatment of energies beyond the table edges depends on the closure. The default of <code>Numerics.hydro.eos_closure_mode</code> is <code>"energy_authoritative"</code> (1D; the evolved energy is authoritative and is never rewritten), while <code>"legacy"</code> and the 2D RZ closure clamp to the table edge. Studio does not write this key, so Studio decks also use the parser default (details in <a href="#eos-models">Ideal-gas and TMAT equations of state</a>). The inverse map keeps the conserved energy consistent with the temperature that conduction and radiation read.</p>
+
+      <h3 id="terms-tmat">TMAT-H5</h3>
+      <p><strong>TMAT-H5</strong> is TENRYU's HDF5 format for material tables (file extension <code>.tmat.h5</code>). Its specification is the repository file <code>docs/TMAT_H5_SPEC.md</code>. One file describes one material; the units are fixed to cgs + eV, and no unit conversion is done at run time. The format was created to replace IONMIX (Fortran unformatted binary) and SESAME (ASCII) tables with a single self-describing format for units, composition, and provenance; it lets the EOS table and the opacity table sit on separate grids, and a file with only one of them can be read.</p>
+      <p>A file consists of the following blocks. The material composition (<code>/material</code>: the atomic number \(Z\), mass \(A\), and mass fraction of each element). The EOS table (<code>/eos</code>) gives, on a grid of ion number density \(n_i\) [cm⁻³] and temperature \(T\) [eV], the mean ionization \(\bar Z\), the ion and electron pressures \(P_i\), \(P_e\) [dyne/cm²], and the specific energies \(e_i\), \(e_e\) [erg/g]; the specific heats \(c_{v,i}\), \(c_{v,e}\) [erg/(g·eV)] are optional. The opacity table (<code>/opacity</code>) gives, on three axes of group, ion number density, and temperature, the Rosseland mean \(\kappa_R\), the Planck absorption \(\kappa^{PA}\), and the Planck emission \(\kappa^{PE}\) [cm²/g]; the table is an LTE table when <code>@is_lte</code> is 1. The charge-state fractions (<code>/ionization</code>) are optional.</p>
+      <p>Because the density axis is the ion number density, it is converted at run time to the mass density with \(\rho=n_iAm_p\). A material selects TMAT-H5 with <code>eos.model="tmat"</code> and <code>opacity.model="tmat"</code> (<a href="#controls">Namelist controls</a>). From the EOS table a total table is also built as the sum of the ion and electron tables. The charge-state fractions are used to build the table of the collisional effective charge (<a href="ionization.html#terms-zeff">terms</a>).</p>
+    </section>
+
+    <section aria-labelledby="controls">
+      <h2 id="controls">Namelist controls</h2>
+      <p>The table lists the controls that relate directly to the EOS. See the <a href="../../use/namelist.html">namelist reference</a> for complete validation rules.</p>
+      <table class="quick-facts">
+        <thead>
+          <tr><th>Key</th><th>Value/default</th><th>Purpose</th></tr>
+        </thead>
+        <tbody>
+          <tr><th><code>eos.model</code></th><td><code>ideal_gas</code> (default) | <code>tmat</code></td><td>Analytic 2T closure or <a href="#terms-tmat">TMAT-H5</a> table EOS. The key also accepts <code>sesame</code> (a SESAME table, from the Los Alamos National Laboratory equation-of-state library), <code>ionmix</code> (an IONMIX table), and <code>power_law_te</code> (a power-law electron energy tabulated at initialization, for verification). Studio writes only <code>ideal_gas</code> and <code>tmat</code>.</td></tr>
+          <tr><th><code>ideal_gas.gamma</code></th><td>5/3</td><td>Ideal-gas adiabatic index. The solver requires only \(\gamma&gt;1\); Studio restricts it to \(1&lt;\gamma\le3\).</td></tr>
+          <tr><th><code>eos.cv_e_override</code></th><td><code>None</code></td><td>Constant electron volumetric heat capacity for verification [erg/(cm³·eV)]; must be finite and at least 1.0.</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section aria-labelledby="verification">
+      <h2 id="verification">Verification</h2>
+      <ul>
+        <li>The paired TMAT lookup tests combine forward \((\log\rho,\log T)\) interpolation against manufactured tables with a GPU smoke test of the inverse map on the <a href="../../verification/index.html#gxii">GXII</a> (GEKKO XII) CD table. At \(\rho=1.05\) g/cm³ and \(e_e=10^6\ldots10^{12}\) erg/g, the smoke test requires zero bracket failures and zero fallbacks.</li>
+      </ul>
+    </section>
+
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["$$", "$$"], ["\\[", "\\]"]] } };</script>
+  <script defer src="../../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../../nav.js" data-page="eos" data-root="../../"></script>
+</body>
+</html>

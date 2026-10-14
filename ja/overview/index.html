@@ -28,6 +28,10 @@
         <h3>時間刻み制御と CFL</h3>
         <p>大域時間刻み（global time step）Δt の決定則と、物理カーネルごとの CFL（Courant–Friedrichs–Lewy）条件・安定条件の式を一覧する。</p>
       </a>
+      <a class="card" href="mpi.html">
+        <h3>MPI 分割</h3>
+        <p>各ランク（rank。MPI の 1 プロセス）が更新を受け持つ範囲である所有ウィンドウ（owned window）、隣のランクの値の複製を受け取るゴースト交換（ghost exchange）、全ランクの部分値を 1 つにまとめる縮約（reduction）の再現性。</p>
+      </a>
       <a class="card" href="verification-philosophy.html">
         <h3>検証の哲学</h3>
         <p>解析解（analytic solution）による検査、基準解（golden）との回帰（regression）、再現性（reproducibility）の試験、ベンチマークによる証拠の積み上げを示す。</p>

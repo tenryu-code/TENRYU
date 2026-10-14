@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="en" data-lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Time integration — TENRYU Documentation</title>
+  <link rel="stylesheet" href="../../../style.css">
+  <script src="../../../theme.js"></script>
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>Time integration</h1>
+    <p class="abstract">By default the time integration of heat conduction is explicit super-time-stepping (STS). In a hot corona the explicit stability limit of thermal diffusion is far smaller than the global time step, but STS combines stages of different lengths and covers the global step in a small number of stages. 1D also has an implicit solver that solves a backward-Euler tridiagonal system (<code>solver="implicit"</code>), and 2D RZ has an implicit solver that satisfies the discrete maximum principle (<code>solver="dmp_implicit"</code>). This page describes the terms and the procedure of STS, the two implicit solvers, and the keys of the time integration.</p>
+
+    <section aria-labelledby="terms">
+      <h2 id="terms">Terms used in this calculation</h2>
+      <p>The time steps of STS use several words in the sense of TENRYU's implementation: the global step, the explicit stability limit, the substep, the superstep, and the stage. They are defined together here.</p>
+
+      <h3 id="terms-sts">Time steps of STS</h3>
+      <p>The <strong>global step</strong> is the time step \(\Delta t\) that the driver advances in one outer step; how it is chosen is described on the <a href="../../overview/timestep.html#global-rule">time-step control</a> page. Conduction proposes as the upper limit of the global step the largest interval that one STS cycle of Chebyshev stages can cover, \(s_{max}(s_{max}+1)\Delta t_{exp}/2\) (820 times \(\Delta t_{exp}\) by default; see the <a href="../../overview/timestep.html#conduction-dt">conduction section</a> of that page).</p>
+      <p>The <strong>explicit stability limit</strong> \(\Delta t_{exp}\) is the time step at which an explicit update of heat diffusion with the forward Euler method is stable, to within a safety factor. Because κ is proportional to \(T_e^{5/2}\), \(\Delta t_{exp}\) is several hundred times smaller than \(\Delta t\) in the corona. It is obtained from the cell width and the effective thermal diffusivity in 1D, and from the Gershgorin bound of the operator used in the update in 2D RZ (<a href="#sts">step 3</a>). The safety factor \(C_{cond}\) is the key <code>Numerics.dt.cfl_cond</code> (default 0.25, range (0, 1]). The ratio \(\Delta t/\Delta t_{exp}\) sets the number of STS stages.</p>
+      <p>A <strong>substep</strong> is one explicit update of size \(\Delta t_{exp}\) in the hypothetical case that STS is not used and \(\Delta t\) is divided into explicit updates. The number needed is \(N_{sub}=\lceil\Delta t/\Delta t_{exp}\rceil\), which is 130–340 in the GXII corona. TENRYU does not run substeps; \(N_{sub}\) is the reference quantity that measures the benefit of STS.</p>
+      <p>A <strong>superstep</strong> is the interval \(\Delta t_{sup}\) that STS advances in one sequence of stages. When \(\Delta t\) is at most \(\eta\,s_{max}(s_{max}+1)\Delta t_{exp}/2\), the global step is one superstep. Above that, \(\Delta t\) is divided into \(n_{sup}\) equal supersteps. Here \(s_{max}\) is the ceiling on the number of stages in one superstep (<code>sts_max_stages</code>, default 40, range 1–200) and \(\eta\) is the coefficient that decides the division (<code>sts_subcycle_eta</code>, default 0.9, range (0, 1]). By default one superstep covers up to about 738 times \(\Delta t_{exp}\) (\(0.9\times820\)).</p>
+      <p>A <strong>stage</strong> is one forward Euler update inside a superstep. A superstep consists of \(s\) stages, and the time step \(\tau_j\) of the \(j\)-th stage differs from stage to stage (formula in <a href="#sts">step 5</a>); the \(\tau_j\) sum to \(\Delta t_{sup}\). Combining long and short stages makes the interval over which the whole sequence is stable grow in proportion to \(s^2\), so that about \(\sqrt{2\Delta t_{sup}/\Delta t_{exp}}\) stages suffice. The distribution of the stage lengths is set by the number of stages and the damping \(\nu\) (<code>sts_damping</code>, default 0.01, range (0, 1)).</p>
+    </section>
+
+    <section aria-labelledby="sts">
+      <h2 id="sts">Super-time-stepping</h2>
+      <p>Because Spitzer conductivity scales as \(T_e^{5/2}\), marching the global step \(\Delta t\) in explicit substeps of size \(\Delta t_{exp}\) would require \(N_{sub}=\lceil\Delta t/\Delta t_{exp}\rceil\) CUDA kernel launches. In a representative GXII corona — the same \(T_e\approx2\) keV, \(\rho\approx10^{-3}\) g/cm³, \(\Delta l\approx50\,\mu\)m conditions quoted in the mechanism section — \(N_{sub}\) reaches 130–340. STS combines stages of different lengths to widen the stability interval and covers the same interval in 17–27 stages (\(s\approx\lceil\sqrt{2N_{sub}}\rceil\)). These terms are defined in the <a href="#terms-sts">terms section</a>. The procedure is as follows.</p>
+      <h3>One conduction step, step by step</h3>
+      <ol>
+        <li><p><strong>Build every face κ.</strong> In 1D, evaluate face κ with <code>kirchhoff_same_material</code> on eligible smooth same-material Spitzer faces and the harmonic mean on interfaces, voids, and strong table jumps. In 2D RZ there is no face κ, and the node-local operator is assembled from the cell κ<sub>eff</sub>. The conductivity that goes into the operator for each cell is κ<sub>eff</sub>/T<sub>e</sub><sup>5/2</sup> at the entry temperature when the secant is used, and κ<sub>eff</sub> otherwise.</p></li>
+        <li><p><strong>Apply the flux limiter to every face.</strong> In 1D, form the SH face estimate with the same face κ, evaluate \(q_{max}\), and fix \(\theta=1/(1+|q_{raw}|/q_{max})\). The product of θ and the face κ is the limited κ<sub>eff</sub> used by the step. In 2D RZ, \(\kappa_{eff}=\theta\kappa_{SH}\) is formed per cell (previous section), and this is the limited conductivity.</p></li>
+        <li>
+          <p><strong>Find the explicit stability limit.</strong> In 1D, form \(D_{eff}=\kappa_{eff}/(\rho c_v)\) and take the most restrictive cell value (\(\Delta l_c\): the cell width):</p>
+          $$
+          \Delta t_{exp}=C_{cond}\min_c\frac{(\Delta l_c)^2}{D_{eff,c}},\qquad C_{cond}=0.25\ \text{(default)}.
+          $$
+          <p>In 1D with the default Kirchhoff-secant face κ (<code>face_kappa_policy</code>), each cell also gives a second value, \(2(\rho c_vV)_c/\sum_fG_f\) (\(G_f=A_f\kappa_f/\Delta r_f\) is the conductance of one of the cell's two faces, \(\kappa_f\) the face κ before flux limiting, and \(\Delta r_f\) the distance between cell centers), and the smaller of the two values enters the minimum.</p>
+          <p>In 2D RZ, \(\Delta t_{exp}=4C_{cond}/\lambda_G\), where \(\lambda_G\) is the Gershgorin bound of the operator that the stages apply.</p>
+          $$
+          \lambda_G=\max_c\frac{w_c\left|\sum_dG_{cd}+b_c\right|+\sum_dw_d\left|G_{cd}\right|}{(\rho c_vV)_c}.
+          $$
+          <p>Here \(G_{cd}\) is the pair coefficient of cell \(c\) and its neighbor \(d\), and \(b_c\) is the sum of the conductances of the cell to the half-edges held at a fixed temperature (0 when no boundary is held). The sum over \(d\) leaves out void cells and cells with \(\rho c_v\le0\). The temperature weight \(w\) is \(w_c=T_{e,c}^{5/2}\) when the Kirchhoff secant is used (then \(G_{cd}\) is assembled from \(\kappa_{eff}/T_e^{5/2}\)) and \(w_c=1\) otherwise. The operator of the stages is the matrix \(M^{-1}K\) with \(M=\mathrm{diag}(\rho c_vV)\), \(K_{cd}=-G_{cd}\), and \(K_{cc}=\sum_dG_{cd}+b_c\). By the Gershgorin circle theorem, \(\lambda_G\) bounds every eigenvalue of \(M^{-1}K\), so \(\Delta t_{exp}\) guarantees by construction that \(\lambda\Delta t_{exp}\le4C_{cond}\) for every eigenvalue \(\lambda\). When the secant is used, the bound holds at the temperatures where it was computed, and every stage checks it again (step 6).</p>
+        </li>
+        <li>
+          <p><strong>Choose the stage count.</strong> The Chebyshev interval grows as \(O(s^2)\). Let \(\Delta t_{sup}\) be the interval that one superstep advances; the stage count is</p>
+          $$
+          s=\min\!\left(s_{max},\ \max\!\left(1,\left\lceil\sqrt{2\Delta t_{sup}/\Delta t_{exp}}\right\rceil\right)\right).
+          $$
+          <p>Here \(s_{max}\) is the stage ceiling (<code>sts_max_stages</code>, default 40). When \(\Delta t\) exceeds \(\eta\,s_{max}(s_{max}+1)\Delta t_{exp}/2\), it is divided into \(n_{sup}=\lceil\Delta t/(\eta\,s_{max}(s_{max}+1)\Delta t_{exp}/2)\rceil\) equal supersteps with \(\Delta t_{sup}=\Delta t/n_{sup}\), where \(\eta\) is <code>sts_subcycle_eta</code> (default 0.9). Otherwise \(n_{sup}=1\) and \(\Delta t_{sup}=\Delta t\). The stage count and the division for the RKL2 option of <code>sts_scheme</code> in 2D RZ are given in the <code>sts_scheme</code> row of the <a href="#controls">key table</a>.</p>
+        </li>
+        <li>
+          <p><strong>Build the stage lengths.</strong> With the default damping ν=0.01 (the Chebyshev damping parameter, <code>sts_damping</code> — distinct from the collision frequency \(\nu_{ei}\) of the mechanism section and the ion-acoustic damping rate \(\nu_a\) of the CBET page), construct</p>
+          $$
+          \tau_j=\frac{\Delta t_{exp}}
+          {\nu^2+(1-\nu^2)\cos^2\!\left(\frac{\pi(2j-1)}{4s+2}\right)},
+          \quad j=1,\ldots,s,
+          $$
+          <p>then rescale all τ<sub>j</sub> uniformly so the stage lengths sum to the superstep, \(\sum_j\tau_j=\Delta t_{sup}\). With the shipped defaults the sum before rescaling exceeds \(\Delta t_{sup}\), so this rescale shrinks the τ<sub>j</sub>.</p>
+        </li>
+        <li>
+          <p><strong>Apply all stages with fixed coefficients.</strong> \(D_{eff}\), κ<sub>eff</sub> (the face κ in 1D), and ρc<sub>v</sub> stay at their entry-\(T_e^n\) values, and only the temperature changes between stages. The 2D RZ Kirchhoff secant alone is evaluated at the stage temperature. Here \(\mathcal M_{1D}\) denotes the conservative 1D face-flux divergence operator at the fixed coefficients:</p>
+          $$
+          T_{e,j}=T_{e,j-1}+\frac{\tau_j}{\rho c_v}\mathcal M_{1D}(T_{e,j-1}),\qquad
+          T_{e,c,j}=T_{e,c,j-1}+\frac{\tau_j}{(\rho c_vV)_c}\sum_dG_{cd}S_{cd}\,(T_{e,d,j-1}-T_{e,c,j-1}).
+          $$
+          <p>\(G_{cd}=-(a_{cd}+a_{dc})/2\) is the pair coefficient built from the matrix \(a\) of the node-local operator (\(G_{cd}=G_{dc}\)), and \(d\) runs over the neighbors that share a node with \(c\) (void cells and cells with \(\rho c_v\le0\) are left out). \(S_{cd}\) is the \(T^{5/2}\) secant over the two cell temperatures, \(\tfrac27(T_d^{7/2}-T_c^{7/2})/(T_d-T_c)\), and \(S_{cd}=1\) for <code>face_kappa_policy="harmonic"</code>. In 1D, each face heat flow enters the two adjacent cells with opposite signs. In 2D RZ, the pair power \(G_{cd}S_{cd}(T_d-T_c)\) likewise differs between \(c\) and \(d\) only in sign. Both updates are therefore conservative (unless a temperature-floor clamp intervenes). The per-material conservation mode applies the same update to the fixed cell coefficients.</p>
+          <p>When the secant is used in 2D RZ, the spectrum of the operator changes between stages. Each stage therefore recomputes the row bound \(\lambda_G\) at its input temperatures and checks that it does not exceed \(1+\)<code>sts_bound_margin</code> times (default 1.1 times) the value the plan used. If a stage exceeds it, the step restarts from \(T_e^n\) on a replanned set of stages. The first attempt runs all stages to the end to measure the largest bound and replans for \(1+\)<code>sts_bound_margin</code> times that value. Later attempts stop at the stage that exceeds the plan and double the plan. At most <code>sts_bound_retries_max</code> restarts are made (default 4). If the plan is still exceeded, the step asks the driver for a <a href="../../overview/numerics-foundations.html#terms-retry">full-step retry</a> (the outer step is redone with the time step halved). When the retry is disabled (the default of <code>Numerics.hydro.driver_full_step_retry_enabled</code>), or the retry attempt limit (<code>driver_full_step_retry_max_attempts</code>, default 3) or the time-step floor is reached, the run stops. The SNB path uses no secant and has no such check.</p>
+        </li>
+        <li><p><strong>Re-close once.</strong> After all stages, the electron-energy change that corresponds to the temperature change, \(c_{v,e}(T_e^{n+1}-T_e^n)\) (with \(c_{v,e}\) at the step entry), is booked in e<sub>e</sub>, and for materials with an EOS table T<sub>e</sub>, P<sub>e</sub>, and C<sub>v,e</sub> are recomputed from \((\rho,e_e)\). For ideal-gas materials without a table, e<sub>e</sub> and P<sub>e</sub> are computed from the updated temperature. This is the default <code>Numerics.hydro.eos_closure_mode="energy_authoritative"</code>; with <code>"legacy"</code>, materials with a table also get e<sub>e</sub> and P<sub>e</sub> from the updated temperature.</p></li>
+      </ol>
+    </section>
+
+    <section aria-labelledby="implicit">
+      <h2 id="implicit">Implicit solvers</h2>
+      <p><code>solver="implicit"</code> solves, in 1D, one backward-Euler tridiagonal system instead of STS. The face conductivity (<code>face_kappa_policy</code>), the flux-limiter coefficient φ, and the cell-center spacing Δr are evaluated once at the step-entry temperature T<sub>e</sub><sup>n</sup> and frozen. Both end boundaries have zero heat flux, and <code>cell_is_void</code> cells become identity rows. The system is solved with cuSPARSE <code>cusparseDgtsv2</code>. This solver adds no conduction restriction to the global time step.</p>
+      $$
+      -w_{j-1/2}\,T_{e,j-1}^{n+1}
+      +\left(\frac{\rho c_{v,e}V_j}{\Delta t}+w_{j-1/2}+w_{j+1/2}\right)T_{e,j}^{n+1}
+      -w_{j+1/2}\,T_{e,j+1}^{n+1}
+      =\frac{\rho c_{v,e}V_j}{\Delta t}\,T_{e,j}^{n},\qquad
+      w_{j+1/2}=\frac{A_{j+1/2}\,\kappa_{j+1/2}\,\phi_{j+1/2}}{\Delta r_{j+1/2}}.
+      $$
+      <p>Here j is the cell, ρc<sub>v,e</sub>V<sub>j</sub> is the electron heat capacity of the cell, Δt is the global step, A<sub>j+1/2</sub> is the face area, κ<sub>j+1/2</sub> is the face conductivity, and φ<sub>j+1/2</sub> is the flux-limiter coefficient. The solved temperatures are booked by passing the face heat flow w<sub>j+1/2</sub>(T<sub>e,j+1</sub>−T<sub>e,j</sub>) to the two neighboring cells with opposite signs. The booked energies therefore sum to zero up to round-off, whatever the residual of the tridiagonal solve.</p>
+      <p>Setting <code>solver="implicit"</code> on a 2D single-block mesh issues a warning and solves with STS; on a multi-block mesh the input check rejects it. In 2D the input check rejects <code>"hypre"</code>; in 1D it is accepted only in a build with hypre enabled, but no implicit solve is run, and a warning is issued and STS is used. SNB requires <code>"sts"</code>.</p>
+      <p><code>solver="dmp_implicit"</code> solves the 2D RZ electron heat conduction in one backward-Euler step of a nonlinear two-point flux that satisfies the discrete maximum principle. The inputs are those of the <a href="discretization.html#terms-node-local">node-local operator</a> preparation (κ, ρc<sub>v,e</sub>, void cells, held boundaries). The nonlinear equation is solved by Picard iteration. In each iteration, every cell row is a sum of non-negative coefficients times temperature differences, so the linear system is a strictly diagonally dominant M-matrix and the discrete maximum principle holds. The linear system is solved by GMRES on the GPU, and the Picard iteration is accelerated by Anderson acceleration of depth <code>dmp_anderson_depth</code> (default 5). The iteration stops when the largest change of the face fluxes is at most <code>dmp_picard_rel_tol</code> (default 10<sup>−10</sup>) times the largest flux. A step that does not converge within <code>dmp_picard_max_iterations</code> (default 50) iterations, and a step that fails the acceptance check (the booked temperatures must be finite, lie within the range, and agree with the iterate), is retried with a smaller time step without changing the state. The electron conduction does not limit the global step. It cannot be combined with SNB. When ion heat conduction is used together with it, the ions are still solved with STS (or RKL2). The details of the algorithm are in <code>docs/NUMERICS.md</code> §4.3.2 of the repository.</p>
+    </section>
+
+    <section aria-labelledby="controls">
+      <h2 id="controls">Namelist controls</h2>
+      <p>These are the keys of the time integration under <code>Numerics.conduction</code>. See the <a href="../../use/namelist.html">namelist reference</a> for all keys and their validation rules. The defaults in the table are the values used when the deck does not set the key. Studio writes <code>"sts"</code> and, in 1D, <code>"implicit"</code> for <code>solver</code>.</p>
+      <table class="quick-facts">
+        <thead>
+          <tr><th>Key</th><th>Default</th><th>Purpose</th></tr>
+        </thead>
+        <tbody>
+          <tr><th><code>solver</code></th><td><code>"sts"</code></td><td>Accepted values: <code>"sts"</code> (default explicit Chebyshev super-time-stepping), <code>"implicit"</code>, <code>"hypre"</code>, and <code>"dmp_implicit"</code>. <code>"implicit"</code> solves a backward-Euler tridiagonal system in 1D, and conduction then does not limit the global step. In a 2D single-block mesh it warns and is solved with STS, and input validation rejects it on a multiblock mesh. Input validation rejects <code>"hypre"</code> in 2D. In 1D it is accepted only in a build with hypre enabled, but no implicit solve runs: it warns and is solved with STS. <code>"dmp_implicit"</code> solves 2D RZ electron conduction with a backward-Euler step of a nonlinear two-point flux that satisfies the discrete maximum principle. Electron conduction then does not limit the global step, and the solver cannot be combined with SNB. The iteration is controlled by <code>dmp_picard_rel_tol</code> (default 10<sup>−10</sup>), <code>dmp_picard_max_iterations</code> (50), and <code>dmp_anderson_depth</code> (5); a step that does not converge within the limit is redone with a smaller time step without changing the state. SNB requires <code>"sts"</code>. Studio writes <code>"sts"</code> and, in 1D, <code>"implicit"</code>.</td></tr>
+          <tr><th><code>sts_scheme</code></th><td><code>"chebyshev"</code></td><td>The stage scheme of STS. <code>"chebyshev"</code> uses the Chebyshev stages of the procedure above, <code>"rkl2"</code> uses the stages of the second-order Runge–Kutta–Legendre (RKL2) method, and <code>"auto"</code> uses RKL2 only when a superstep would take at least <code>sts_auto_rkl2_stages</code> Chebyshev stages (default 10). With C<sub>cond</sub>=0.25, the RKL2 stage count s is odd and is the smallest s ≥ 3 with Δt<sub>sup</sub> ≤ (s<sup>2</sup>+s−2)/2 · Δt<sub>exp</sub>, and the ceiling s<sub>cap</sub> is the largest odd number not above <code>sts_max_stages</code>. When Δt exceeds η(s<sub>cap</sub><sup>2</sup>+s<sub>cap</sub>−2)/2 · Δt<sub>exp</sub>, it is divided into equal supersteps in the same way as for the Chebyshev stages. <code>"rkl2"</code> and <code>"auto"</code> are accepted only for <code>solver="sts"</code> in 2D RZ.</td></tr>
+          <tr><th><code>sts_max_stages</code></th><td><code>40</code></td><td>Ceiling s<sub>max</sub> on the number of stages in one superstep (range 1–200).</td></tr>
+          <tr><th><code>sts_subcycle_eta</code></th><td><code>0.9</code></td><td>Coefficient η that decides when the global step is divided into supersteps (range (0, 1]).</td></tr>
+          <tr><th><code>sts_damping</code></th><td><code>0.01</code></td><td>Damping ν of the Chebyshev stages (range (0, 1)).</td></tr>
+          <tr><th><code>sts_bound_margin</code></th><td><code>0.1</code></td><td>In 2D RZ with the Kirchhoff secant, each stage compares its Gershgorin bound with 1 plus this value times the value used in the plan; if a stage exceeds it, the step is restarted.</td></tr>
+          <tr><th><code>sts_bound_retries_max</code></th><td><code>4</code></td><td>Maximum number of restarts of the step by that check.</td></tr>
+        </tbody>
+      </table>
+
+    </section>
+
+    <section aria-labelledby="verification">
+      <h2 id="verification">Verification</h2>
+      <ul>
+        <li><strong>STS comparisons:</strong> 1D zero-flux eigenmodes with analytic solutions test the spherical, planar, and cylindrical STS computations against the corresponding implicit and per-material computations, checking the spatial order of accuracy and closed-domain electron-energy conservation. In addition, <code>test_conduction_pattle_1d</code> checks the propagation of the \(T^{5/2}\) heat front against the Pattle nonlinear-diffusion similarity solution [2].</li>
+        <li><strong>Implicit solver satisfying the discrete maximum principle (<code>test_conduction_dmp_2d</code>):</strong> this test checks that a field linear in z is kept on a distorted mesh, the discrete maximum principle and energy conservation, the booking of the held-boundary energy and that a uniform field is kept, bitwise reproducibility and independence of the winding of the cell vertices, the implicit solution of cells with very different heat capacities, and the acceptance check of the booked temperatures.</li>
+      </ul>
+    </section>
+
+    <section aria-labelledby="references">
+      <h2 id="references">References</h2>
+      <ol class="references">
+        <li>V. Alexiades, G. Amiez, and P.-A. Gremaud, "Super-Time-Stepping Acceleration of Explicit Schemes for Parabolic Problems," Commun. Numer. Methods Eng. 12, 31–42 (1996). <a href="https://doi.org/10.1002/(SICI)1099-0887(199601)12:1%3C31::AID-CNM950%3E3.0.CO;2-5">doi:10.1002/(SICI)1099-0887(199601)12:1&lt;31::AID-CNM950&gt;3.0.CO;2-5</a></li>
+        <li>R. E. Pattle, "Diffusion from an Instantaneous Point Source with a Concentration-Dependent Coefficient," Q. J. Mech. Appl. Math. 12, 407–409 (1959). <a href="https://doi.org/10.1093/qjmam/12.4.407">doi:10.1093/qjmam/12.4.407</a></li>
+      </ol>
+    </section>
+
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["$$", "$$"], ["\\[", "\\]"]] } };</script>
+  <script defer src="../../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../../nav.js" data-page="conduction-time" data-root="../../"></script>
+</body>
+</html>

@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="en" data-lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ion heat conduction — TENRYU Documentation</title>
+  <link rel="stylesheet" href="../../../style.css">
+  <script src="../../../theme.js"></script>
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>Ion heat conduction</h1>
+    <p class="abstract">Ion heat conduction is an option that solves the heat conduction of the ion temperature T<sub>i</sub> in the two-temperature model. The Braginskii ion conductivity of an unmagnetized plasma is multiplied by a harmonic flux limiter whose cap is the ion free-streaming flux, and the result is booked in the ion internal energy after the electron heat conduction and its energy booking. In 1D (planar, cylindrical, spherical) one backward-Euler tridiagonal system is solved. In 2D RZ the ion coefficients are put into the same node-local operator as the electron heat conduction and solved with the same super-time-stepping (STS). It is off by default.</p>
+
+    <aside class="planned" aria-labelledby="at-a-glance">
+      <h3 id="at-a-glance">At a glance</h3>
+      <ul>
+        <li><strong>Physics:</strong> the Braginskii ion conductivity of an unmagnetized plasma, with a harmonic flux limiter whose cap is the ion free-streaming flux.</li>
+        <li><strong>Dimensions:</strong> 1D (planar, cylindrical, spherical) and 2D RZ. The two-temperature model (<code>Main.temperature_model="2T"</code>) is required; the input check rejects the one-temperature model.</li>
+        <li><strong>Time integration:</strong> 1D uses a backward-Euler tridiagonal system with no conduction restriction on the time step. 2D RZ uses the same STS as the electrons (<code>sts_scheme</code> can also select RKL2), with an upper limit on the time step.</li>
+        <li><strong>Conservation:</strong> the moved heat is booked in the ion internal energy, and the ion temperature and pressure are recomputed by the EOS re-closure.</li>
+        <li><strong>Default:</strong> off (<code>ion_conduction=False</code>).</li>
+      </ul>
+    </aside>
+
+    <section aria-labelledby="ion-overview">
+      <h2 id="ion-overview">Overview</h2>
+      <p><code>ion_conduction=True</code> (two-temperature runs, in 1D and 2D RZ) solves the ion temperature after the electron conduction with the Braginskii ion conductivity κ<sub>i</sub>=3.906 n<sub>i</sub>T<sub>i</sub>τ<sub>i</sub>/m<sub>i</sub>, where τ<sub>i</sub> is the ion collision time. In 1D it solves one backward-Euler tridiagonal system. Face κ is built with the same <code>face_kappa_policy</code> as for the electrons, and a harmonic flux limiter of the same form limits the face flux. In 2D RZ it puts the ion coefficients into the same node-local operator as the electrons and solves it with the same STS. The cell conductivity is limited by the same harmonic flux limiter with the cell's gradient magnitude of \(T_i\), and the Kirchhoff-secant setting (<code>face_kappa_policy</code>) is the same as for the electrons. In both cases the flux cap is <code>ion_f_lim</code> (default 1) times the ion free-streaming flux n<sub>i</sub>T<sub>i</sub>(T<sub>i</sub>/m<sub>i</sub>)<sup>1/2</sup>. The moved heat is booked in the ion internal energy and T<sub>i</sub> is recomputed by the same re-closure as in the hydrodynamics, so energy is conserved to round-off. For Z=1, κ<sub>i</sub> is about 1/(25√A) of the electron κ<sub>SH</sub>, so ion conduction is off by default, but ions carry the heat where T<sub>i</sub>≫T<sub>e</sub>, such as the center right after a shock converges. In 2D RZ, the time-step limit from the ions' explicit stability bound limits the global step alongside the electrons' limit.</p>
+    </section>
+
+    <section aria-labelledby="mechanism">
+      <h2 id="mechanism">Physical mechanism</h2>
+      <p>Ion heat conduction is normally much smaller than electron heat conduction, because the ion thermal speed is lower than the electron thermal speed by a factor (m<sub>e</sub>/m<sub>i</sub>)<sup>1/2</sup>; for Z=1, κ<sub>i</sub> is about 1/(25√A) of the electron κ<sub>SH</sub>. In regions where the ions and electrons are at the same temperature (T<sub>i</sub>≈T<sub>e</sub>), ion conduction can therefore stay off by default.</p>
+      <p>The ions carry the heat in regions with T<sub>i</sub>≫T<sub>e</sub>. The center right after a shock converges is an example: the shock heats only the ions, so the ion temperature at the center exceeds the electron temperature. In the two-temperature model the ion temperature is an independent variable, so the heat transport in such a region requires the ion heat-conduction equation.</p>
+      <p>Like the electron Spitzer–Härm conductivity, κ<sub>i</sub> is nearly proportional to T<sub>i</sub><sup>5/2</sup>, so where the local temperature gradient is steep the flux of the local diffusion approximation can exceed the ion free-streaming flux. A harmonic flux limiter of the same form as for the electrons suppresses this excess. The default of the limiter coefficient <code>ion_f_lim</code> is 1, unlike the electron <code>f_lim</code> default of 0.06: the cap is the ion free-streaming flux itself. When the magnitude of the local flux equals the cap, the harmonic limiter reduces the flux to half of the cap.</p>
+      <p>The anisotropy of the conductivity due to a magnetic field and nonlocal ion transport are not treated. A mixed cell is represented by a single pair of effective mass number A and mean ionization Z̄.</p>
+    </section>
+
+    <section aria-labelledby="conductivity">
+      <h2 id="conductivity">Conductivity</h2>
+      <p>The Braginskii ion heat conductivity of an unmagnetized plasma is</p>
+      $$
+      \kappa_i=3.906\,\frac{n_iT_i\tau_i}{m_i},\qquad
+      \tau_i=2.0852\times10^{7}\,\frac{\sqrt A\,T_i^{3/2}}{n_iZ^4\ln\Lambda_{ii}}\ \mathrm{s},\qquad
+      \ln\Lambda_{ii}=\max\!\left(2,\ 23-\ln\frac{Z^3\sqrt{2n_i}}{T_i^{3/2}}\right).
+      $$
+      <p>Here τ<sub>i</sub> is the ion collision time, ln Λ<sub>ii</sub> is the ion–ion Coulomb logarithm, n<sub>i</sub>=ρ/(A m<sub>p</sub>) is the ion number density (cm<sup>−3</sup>), m<sub>i</sub>=A m<sub>p</sub> is the ion mass, and T<sub>i</sub> is in eV in the formulas for τ<sub>i</sub> and ln Λ<sub>ii</sub>. A is the effective mass number of the cell and Z is the mean ionization Z̄ of the cell; both are floored at 1. The collision time and the Coulomb logarithm are the same formulas as for the ion viscosity (<a href="../hydrodynamics/plasma-viscosity.html">viscosity</a> page). The T<sub>i</sub> in the formula for κ<sub>i</sub> is evaluated in erg, and the result is converted to a value per eV of temperature gradient (erg/(s cm eV)), so the unit is the same as that of the electron Spitzer conductivity. Numerically κ<sub>i</sub>≈1.25×10<sup>8</sup> T<sub>i</sub><sup>5/2</sup>/(√A Z<sup>4</sup> ln Λ<sub>ii</sub>) erg/(s cm eV) with T<sub>i</sub> in eV.</p>
+      <ul>
+        <li><strong>Charge-moment correction:</strong> in 1D, a cell of a material that has a charge-moment table (see <a href="../eos-opacity/ionization.html#ionization">EOS, opacity, and ionization</a>) replaces Z<sup>4</sup> by Z̄<sup>4</sup>r<sub>4</sub>, as in the ion viscosity (r<sub>4</sub> is the ratio of the fourth charge moment). The 2D RZ coefficient uses r<sub>4</sub>=1.</li>
+        <li><strong>Voids and evacuated cells:</strong> void cells have κ<sub>i</sub>=0. In 2D RZ, evacuated cells also have κ<sub>i</sub>=0.</li>
+        <li><strong>Heat capacity:</strong> the ion specific heat c<sub>v,i</sub> is the value held by the EOS closure if it is finite and positive; otherwise the ideal-gas value (eV-to-erg conversion)/(A m<sub>p</sub>(γ−1)) is used, with γ the effective specific-heat ratio of the cell.</li>
+      </ul>
+    </section>
+
+    <section aria-labelledby="flux-limiter">
+      <h2 id="flux-limiter">Flux limiter</h2>
+      <p>The flux limiter has the same harmonic form as for the electrons, with the cap q<sub>max</sub> equal to <code>ion_f_lim</code> times the ion free-streaming flux n<sub>i</sub>T<sub>i</sub>(T<sub>i</sub>/m<sub>i</sub>)<sup>1/2</sup>.</p>
+      $$
+      \phi=\frac{1}{1+|q_{SH}|/q_{max}},\qquad
+      q_{max}=f_i\,n_iT_i\sqrt{T_i/m_i}.
+      $$
+      <p>Here q<sub>SH</sub> is the unlimited flux κ<sub>i</sub>∇T<sub>i</sub>, f<sub>i</sub> is <code>ion_f_lim</code>, and T<sub>i</sub> is in erg in q<sub>max</sub>. In 1D, φ is evaluated once per face at the step-entry T<sub>i</sub><sup>n</sup>. q<sub>SH</sub> is built from the face conductivity and the temperature difference of the cell centers; ρ and T<sub>i</sub> in q<sub>max</sub> are the arithmetic means of the two cells, and A is the harmonic mean. In 2D RZ, the conductivity of each cell is replaced, cell by cell, from κ<sub>i</sub> by κ=κ<sub>i</sub>/(1+κ<sub>i</sub>|∇T<sub>i</sub>|/q<sub>max</sub>). Here |∇T<sub>i</sub>| is the gradient magnitude of the cell built from the same nodal gradients as the electron local model, and A in q<sub>max</sub> is floored at 1. <code>ion_f_lim</code> must be finite and greater than 0; the input check verifies this.</p>
+    </section>
+
+    <section aria-labelledby="solver-1d">
+      <h2 id="solver-1d">1D discretization and solver</h2>
+      <p>The 1D ion equation is the same backward-Euler finite-volume form as the electron implicit solver. The subscript i denotes the ions and j the cell.</p>
+      $$
+      -w_{j-1/2}\,T_{i,j-1}^{n+1}
+      +\left(\frac{\rho c_{v,i}V_j}{\Delta t}+w_{j-1/2}+w_{j+1/2}\right)T_{i,j}^{n+1}
+      -w_{j+1/2}\,T_{i,j+1}^{n+1}
+      =\frac{\rho c_{v,i}V_j}{\Delta t}\,T_{i,j}^{n},\qquad
+      w_{j+1/2}=\frac{A_{j+1/2}\,\kappa_{j+1/2}\,\phi_{j+1/2}}{\Delta r_{j+1/2}}.
+      $$
+      <p>Here A<sub>j+1/2</sub> is the face area, κ<sub>j+1/2</sub> is the ion conductivity at the face, Δr<sub>j+1/2</sub> is the spacing of the neighboring cell centers, and V<sub>j</sub> is the cell volume. The face conductivity is built with the same <code>face_kappa_policy</code> as for the electrons. With the default <code>kirchhoff_same_material</code>, κ<sub>i</sub> also follows the T<sup>5/2</sup> law, so the same secant as for the electrons is used (<a href="discretization.html#terms-face-kappa">face-κ policy</a>). Both ends have zero heat flux, and <code>cell_is_void</code> cells become identity rows. The coefficient matrix is an M-matrix, so the solution satisfies min T<sub>i</sub><sup>n</sup> ≤ T<sub>i</sub><sup>n+1</sup> ≤ max T<sub>i</sub><sup>n</sup>.</p>
+      <p>The system is strictly diagonally dominant, because each coupled row has ρc<sub>v,i</sub>V/Δt&gt;0 on the diagonal, so no pivoting is needed. A line of at most 640 cells is solved by parallel cyclic reduction in one CUDA block, and a longer line by cuSPARSE <code>cusparseDgtsv2</code>. The difference between the solvers is of the order of round-off. Whatever the electron <code>solver</code> (STS or implicit), the 1D ions are always solved with this tridiagonal system. Because the solver is implicit, ion heat conduction does not limit the global time step.</p>
+      <p>After the solve, the face heat flow w<sub>j+1/2</sub>(T<sub>i,j+1</sub>−T<sub>i,j</sub>) is booked in the ion specific internal energy by passing it to the two neighboring cells with opposite signs. Each face flow is defined once, so the booked energies sum to zero up to round-off, whatever the residual of the tridiagonal solve. Only when the environment variable <code>TENRYU_ION_CONDUCTION_AUDIT=1</code> is set are the sum and the sum of absolute values of the booked energies computed, with a warning if the sum exceeds 10<sup>−10</sup> times the sum of absolute values. This audit is off by default so that a synchronizing read-back does not enter ordinary runs. After the booking, the ion temperature and pressure are recomputed from the booked energy by the same EOS closure as in the 1D hydrodynamics. In an MPI run every rank solves the whole line, so the required quantities are first gathered again from the owning ranks.</p>
+    </section>
+
+    <section aria-labelledby="solver-2d">
+      <h2 id="solver-2d">2D RZ discretization and solver</h2>
+      <p>In 2D RZ, the ions are assembled in the same <a href="discretization.html#terms-node-local">node-local operator</a> as the electron 2D heat conduction, with the ion coefficients. The cell coefficient is the κ replaced by the flux limiter above, and the heat capacity is ρc<sub>v,i</sub>. Void cells and evacuated cells do not conduct. When <code>face_kappa_policy</code> is <code>"kirchhoff_same_material"</code>, each pair is multiplied by the secant for κ<sub>i</sub>∝T<sub>i</sub><sup>5/2</sup> (exponent 5/2); with <code>"harmonic"</code> it is not (exponent 0). As for the electrons, the z_bottom and z_top sides on which <code>state_supply</code> is specified are held at the supply temperature (single-block mesh).</p>
+      <p>The time integration runs the same STS stage sequence as the electron 2D heat conduction (the <code>sts_*</code> keys; the RKL2 sequence when <code>sts_scheme</code> selects RKL2) on the ion temperature T<sub>i</sub>. The explicit stability limit follows from the Gershgorin bound λ<sub>G</sub> of the operator.</p>
+      $$
+      \Delta t_{exp}=\frac{4\,C_{cond}}{\lambda_G},\qquad C_{cond}=\texttt{Numerics.dt.cfl\_cond}.
+      $$
+      <p>Here C<sub>cond</sub> is the safety factor (<a href="time-integration.html#terms-sts">terms of STS</a>). When the secant is used, the bound is the value at the temperatures used in the computation, so the bound of each stage is compared with 1+<code>sts_bound_margin</code> times the value used in the plan. If a stage exceeds it, the plan is rebuilt and the step is restarted. The restart is repeated up to <code>sts_bound_retries_max</code> times; if the bound is still exceeded, a full-step retry is requested from the driver (the same as step 6 of <a href="time-integration.html#sts">super-time-stepping</a>). A full-step retry is also requested when the total number of stages exceeds <code>sts_total_stages_max</code>.</p>
+      <p><strong>Time-step limit.</strong> The limit that the 2D heat conduction places on the global step is the smaller of the electron limit and the ion limit. When the electron side uses <code>solver="dmp_implicit"</code>, the electron limit is infinite and only the ion limit remains, because the ions are not solved with <code>dmp_implicit</code> but always with STS (or RKL2).</p>
+      <p><strong>Booking.</strong> From the change of the solved temperatures, the ion energy change ρc<sub>v,i</sub>V(T<sub>i</sub><sup>new</sup>−T<sub>i</sub><sup>old</sup>) of each cell is computed, and in a single-material cell it is divided by the mass and booked in e<sub>i</sub>. The heat entering a side held at the supply temperature is added to the conduction booking of <code>bc_flux_z_bottom</code> and <code>bc_flux_z_top</code>, in the same form as for the electron heat conduction. The energy added at the ion-temperature floor (<code>floors.Ti</code>) and the number of clamps enter the floor booking of the step. After the solve, the 2D hydrodynamics closure is rebuilt and recomputes the ion temperature, pressure, and sound speed. The 2D ion heat conduction runs on a single rank only (a runtime assertion stops a run with two or more ranks).</p>
+    </section>
+
+    <section aria-labelledby="coupling">
+      <h2 id="coupling">Position in the step and conditions of combination</h2>
+      <p>Ion heat conduction is solved after the electron heat conduction and its EOS closure, within the same operator. In 2D, a step for which the electron side requested a full-step retry does not solve the ions. The ion side requests a full-step retry for two reasons: when the bound check of STS is exhausted (<code>sts_bound_exceeded</code>), and when the materials of a mixed cell could not be evaluated.</p>
+      <p>The input check requires the following of the combination of <code>ion_conduction=True</code> and <code>conduction.enabled=True</code> (when <code>enabled</code> is false, ion heat conduction does not act).</p>
+      <ul>
+        <li>The dimension is 1D_SPH (planar, cylindrical, or spherical by <code>Mesh.geometry_1d</code>) or 2D_RZ.</li>
+        <li>The model is two-temperature (<code>Main.temperature_model="2T"</code>).</li>
+        <li>In 1D, <code>Numerics.materials.per_material_conservation_enabled</code> is off (the ion solve books the cell ion energy, not the material energies).</li>
+        <li>In 2D, a combination with the per-material conservation mode requires <code>mixed_cell_closure="pressure_relaxation"</code>. The ion energy change of a mixed cell is then distributed to the materials by the pressure-relaxation rule.</li>
+        <li>No material has <code>eos.hydro_backend="mie_gruneisen"</code> (that closure does not define the ion temperature from the ion energy).</li>
+        <li><code>ion_f_lim</code> is finite and greater than 0.</li>
+      </ul>
+    </section>
+
+    <section aria-labelledby="controls">
+      <h2 id="controls">Namelist controls</h2>
+      <p>These are the keys of <code>Numerics.conduction</code> for ion heat conduction. The 2D RZ ion time integration follows the <code>sts_*</code> keys on the <a href="time-integration.html#controls">time-integration page</a>. See the <a href="../../use/namelist.html">namelist reference</a> for all keys and their validation rules. The defaults in the table are the values used when the deck does not set the key.</p>
+      <table class="quick-facts">
+        <thead>
+          <tr><th>Key</th><th>Default</th><th>Purpose</th></tr>
+        </thead>
+        <tbody>
+          <tr><th><code>ion_conduction</code></th><td><code>False</code></td><td>Solves Braginskii ion conduction (two-temperature runs, in 1D and 2D RZ; Studio accepts only 1D) after electron conduction.</td></tr>
+          <tr><th><code>ion_f_lim</code></th><td><code>1.0</code></td><td>Ion heat-flux cap as a multiple of the ion free-streaming flux.</td></tr>
+        </tbody>
+      </table>
+
+    </section>
+
+    <section aria-labelledby="verification">
+      <h2 id="verification">Verification</h2>
+      <ul>
+        <li><strong>1D (<code>test_conduction_ion_1d</code>):</strong> a planar discrete eigenmode decays at the decay rate given by the analytically derived Braginskii conductivity (in a setup where the amplitude halves in one step, the amplitude ratio is within 10<sup>−5</sup> of 0.5; both the 64-cell one-block reduction and the 1024-cell cuSPARSE solve). The electron fields are bitwise unchanged. A spherical hot spot advanced with a time step about 10<sup>4</sup> times the explicit stability limit conserves the total energy to 10<sup>−12</sup> of the sum of absolute values, and the temperature stays within the initial minimum and maximum. The heat through a temperature-step face does not exceed the cap q<sub>max</sub>Δt and is at least 0.8 times it, and without the limiter exceeds 10 times it. Heat does not cross a void cell (with a void cell in between, the energy gained by the cold side is at most 10<sup>−13</sup> relative; without it, at least 10<sup>−3</sup>). Two cells equilibrate to the mass-weighted mean temperature within 10<sup>−3</sup> in a long time step.</li>
+        <li><strong>2D RZ (<code>test_conduction_ion_2d</code>):</strong> a uniform ion temperature is kept bit for bit, the electrons are unchanged, and nothing happens without the key. One step is compared with a host implementation that writes the Braginskii conductivity from its definition and with the stage sequences (Chebyshev and RKL2), and the energy booking is checked (the booking in e<sub>i</sub> matches c<sub>v,i</sub>(T<sub>new</sub>−T<sub>old</sub>) to 10<sup>−13</sup> of the temperature amplitude, and the total ion energy changes by at most 10<sup>−13</sup> relative). A small Gaussian is compared with the exact solution of linear diffusion (error tolerance 0.01). The nonlinear thermal wave spreading from a point release is compared with its similarity solution (Barenblatt–Pattle type; the shape error and the front position within 5%, and the energy conserved to 10<sup>−12</sup> relative). The stage-wise bound check keeps the secant stage sequence within its plan. The flux limiter acts on the solution (below 0.5 times the unlimited flux for a steep front, above 0.95 times for a gentle gradient), and the result is bitwise reproducible. The signs of the off-diagonal entries of the operator, and hot cells in a background at the floor temperature, are checked. With the mixed-cell pressure relaxation, two twin materials reproduce the one-material run.</li>
+      </ul>
+    </section>
+
+    <section aria-labelledby="references">
+      <h2 id="references">References</h2>
+      <ol class="references">
+        <li>S. I. Braginskii, "Transport Processes in a Plasma," Reviews of Plasma Physics 1, 205–311 (1965).</li>
+      </ol>
+    </section>
+
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["$$", "$$"], ["\\[", "\\]"]] } };</script>
+  <script defer src="../../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../../nav.js" data-page="conduction-ion" data-root="../../"></script>
+</body>
+</html>

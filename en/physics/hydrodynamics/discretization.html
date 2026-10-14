@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="en" data-lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Spatial discretization — TENRYU Documentation</title>
+  <link rel="stylesheet" href="../../../style.css">
+  <script src="../../../theme.js"></script>
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>Spatial discretization</h1>
+    <p class="abstract">This page describes the spatial discretization of the hydrodynamics: the spherically symmetric cells of the pure Lagrangian 1D scheme, the quadrilateral cells and nodes of 2D RZ, the corner masses that distribute the cell mass to the <a href="#terms-corner">corners</a>, and the <a href="#terms-compatible">compatible</a> forces that build the momentum equation and the internal-energy equation from the same corner forces. Terms specific to this calculation (corner, subzone, corner mass, corner vector, corner force, and median mesh) are defined in the <a href="#terms">terms section</a>.</p>
+
+    <section aria-labelledby="terms">
+      <h2 id="terms">Terms used in this calculation</h2>
+      <p>2D RZ hydrodynamics uses corners, subzones, and edges as the units in which the forces of a quadrilateral cell are distributed to its nodes. The terms below carry meanings specific to compatible discretization and to TENRYU's implementation, so they are defined here together. In the symbols, \(c\) is a cell, \(k=0,1,2,3\) numbers the corners (vertices) of a cell, and \(n\) is a node. The numbering runs around the vertices of the quadrilateral, and \(k\pm1\) denotes the neighboring corner.</p>
+
+      <h3 id="terms-corner">Corner, subzone, corner mass, corner vector, and corner force</h3>
+      <p>A <strong>corner</strong> is the pair \((c,k)\) of a cell \(c\) and the node \(n_k\) at its \(k\)-th vertex. A quadrilateral has four corners and a triangle has three. A node belongs to as many corners as there are cells that have it as a vertex, and the momentum of the node is set by the sum of the forces on those corners.</p>
+      <p>A <strong>subzone</strong> is the small quadrilateral inside a cell that belongs to the corner \((c,k)\); its vertices are the node \(n_k\), the midpoints of the two edges adjacent to it, and the center of the cell (the mean of its vertices). The cell divides into four subzones (the colored regions of <a href="#fig-hydro-staggered-rz">Figure A</a>). The revolved volume of the subzone \((c,k)\) is written \(V^{sub}_{c,k}\), and \(\sum_kV^{sub}_{c,k}=V_c\). Subzones are the units in which the mass and the volume of a cell are assigned to its corners.</p>
+      <p>The <strong>corner mass</strong> \(m_{c,k}\) is the part of the cell mass \(M_c\) assigned to a corner, with \(\sum_km_{c,k}=M_c\). The mass of a node (the true RZ nodal mass) is the sum of the masses of the corners it belongs to. The corner mass sets the inertia of the node and is the numerator of the subzone density \(\rho^{sub}_{c,k}=m_{c,k}/V^{sub}_{c,k}\). The partition rule depends on the settings. By default (a 2D RZ deck with <code>subzonal_pressure_enabled=True</code>, and multiblock meshes), the cell mass is split in proportion to the revolved volumes of the subzones, \(m_{c,k}=M_c\,V^{sub}_{c,k}/\sum_jV^{sub}_{c,j}\). On a structured mesh with subzonal pressure disabled, the partition chosen by <code>corner_mass_convention</code> is used (<a href="#corner-masses">Corner masses and compatible forces</a>).</p>
+      <p>A <strong>corner vector</strong> is a vector that corresponds to an area and sets the direction and magnitude of the force at the corner \((c,k)\). There are two kinds.</p>
+      <p>The <strong>volume-gradient corner vector</strong> \(\mathbf S_{c,k}=\partial V_c/\partial\mathbf x_{c,k}\) is the derivative of the revolved volume of the cell \(c\) with respect to the position \(\mathbf x_{c,k}\) of the node \(n_k\); it points toward increasing volume. The volume-weighted momentum scheme uses it, and the force and the volume rate \(\dot V_c=\sum_k\mathbf u_{n_k}\cdot\mathbf S_{c,k}\) share the same vector.</p>
+      <p>The <strong>planar corner vector</strong> \(\mathbf S^A_{c,k}=\tfrac12(z_{k+1}-z_{k-1},\,r_{k-1}-r_{k+1})\) is the outward vector, in the R–Z plane, perpendicular to the segment that joins the two vertices adjacent to the node \(n_k\), with half its length. The vertices are numbered counterclockwise in the \((r,z)\) plane, and for a cell numbered clockwise the sign is reversed so that the vector points outward. The area-weighted momentum scheme uses it.</p>
+      <p>The <strong>corner force</strong> \(\mathbf F_{c\to n_k}\) is the force that the cell \(c\) exerts on the node \(n_k\). In the volume-weighted scheme the pressure and viscosity contribution is \(\mathbf F_{c\to n_k}=+(P_c+Q_c)\,\mathbf S_{c,k}\), positive outward. The momentum equation of a node \(n\) is \(m_n\,d\mathbf u_n/dt=\sum_{(c,k)\to n}\mathbf F_{c\to n_k}\), where the sum runs over all corners that belong to \(n\), and the internal-energy equation of a cell uses the same corner forces (<a href="#terms-compatible">compatible</a>). The subzonal-pressure force and the edge-AV force are also kept in separate arrays as corner forces of the same form.</p>
+
+      <h3 id="terms-median">Median mesh</h3>
+      <p>The <strong>median mesh</strong> is the auxiliary mesh made of the segments that join the center of a cell to the midpoint of each of its edges (Figure 1 of CSW98 [2]). A quadrilateral has four such segments, and each is the boundary between two adjacent subzones.</p>
+      <p>The <strong>median-mesh vector</strong> \(\mathbf S^{med}_k\) is the vector perpendicular to the segment from the cell center to the midpoint of the edge \(k\to k+1\), whose magnitude corresponds to that segment. In planar geometry it has the length of the segment: with the cell center \(\mathbf x_c\) and the edge midpoint \(\mathbf m_k\), \(\mathbf S^{med}_k=R(-90^\circ)(\mathbf x_c-\mathbf m_k)\), where \(R(-90^\circ)\) is a rotation by \(-90^\circ\) and the direction is made outward. In the volume-weighted RZ scheme its magnitude is the area of the surface swept by revolving the segment about the axis. The subzonal-pressure force is built with it. The edge vector of the edge AV is the same vector in planar geometry and is constructed differently in RZ (<a href="artificial-viscosity.html#terms-edge-av">edge AV</a> terms).</p>
+
+      <h3 id="terms-compatible">Compatible discretization</h3>
+      <p><strong>Compatible</strong> discretization builds the momentum equation of a node and the internal-energy equation of a cell from the same set of discrete corner forces (Caramana–Burton–Shashkov–Whalen [1]). The change of the kinetic energy, \(\sum_n\mathbf u_n\cdot\mathbf F_n\), and the change of the internal energy, \(-\sum_c\sum_k\mathbf F_{c,k}\cdot\mathbf u_{n_k}\), are sums of the same terms, so the total energy is conserved by construction, without an a posteriori correction.</p>
+      <p>When a 2D RZ deck omits the key, the default is to build the work of the area-weighted momentum scheme from the same force as the momentum (<code>aw_compatible_force_work=True</code>). With it off, the internal energy is updated with the true-RZ \(p\,dV\), and the scheme is no longer compatible. The edge AV <code>csw_edge_csw98</code> is computed on the compatible path that builds force and work from the same arrays, whichever momentum scheme is selected.</p>
+
+    </section>
+
+    <section aria-labelledby="discretization">
+      <h2 id="discretization">Discretization and state layout</h2>
+      <p>In 1D spherical geometry, node <em>j</em> carries the shell-boundary radius \(r_j\) and radial velocity \(u_j\), while cell <em>i</em> carries density, ion/electron specific energies, temperatures, pressures, and artificial viscosity. A pure Lagrangian cell keeps its mass \(\Delta M_i\) fixed, moves its bounding nodes, and obtains density from \(\rho_i=\Delta M_i/V_i\), with \(V_i=4\pi(r_{j+1}^3-r_j^3)/3\). Thus the mesh follows the mass coordinates instead of advecting mass through fixed faces.</p>
+      <p>1D hydrodynamics is pure Lagrangian. Spherical cells do not tangle and relaxation smears shocks, so a 1D run neither rezones its mesh nor remaps its state. The input section <code>Numerics.ale1d</code> is accepted and has no effect, and <code>enabled=True</code> is an error (there is no 1D ALE).</p>
+      <p>In 2D RZ, each axisymmetric cell is represented by a quadrilateral in the \((R,Z)\) meridian plane. Cell-centered \((\rho,e,P,T)\) is coupled to nodal position and velocity vectors. The volume-weighted momentum scheme (<code>volume_weighted</code>) uses the <a href="#terms-corner">volume-gradient corner vector</a>, the exact gradient of the revolved cell volume, \(\mathbf S_{c,k}=\partial V_c/\partial\mathbf x_{c,k}\). It supplies the geometry for force assembly and the chain-rule volume rate \(\dot V_c=\sum_k\mathbf u_{n_k}\cdot\mathbf S_{c,k}\). The area-weighted momentum scheme (<code>area_weighted_symmetric</code>), the 2D RZ default, builds the force from the <a href="#terms-corner">planar corner vector</a> and multiplies the same force by \(2\pi r\) (\(r\) is the node radius) for the work (<a href="momentum-schemes.html#momentum-schemes">RZ momentum schemes</a>). The equations below and Figure A show the construction of the volume-weighted scheme.</p>
+
+      <figure id="fig-hydro-staggered-rz">
+        <img src="../../../assets/hydro-staggered-rz-en.png" width="720" height="480" style="max-width:100%;height:auto" alt="One 2D RZ quadrilateral with four colored subzones; from each node a blue node-velocity arrow and an orange outward corner-force arrow. Cell-centered density, energy, pressure and temperature sit at the cell center. On the right: the corner force, the corner vector and the volume rate of change as equations, and a table of the two corner-mass distributions, the kinematic basis and the subzone volume ratio">
+        <figcaption>Figure A. Staggered state and the four subzones of one 2D RZ quadrilateral. Left: the colored regions are the subzones \((c,k)\), and the black dots are the nodes \(n_k\) and the cell center. Blue arrows are the node velocities \(\mathbf u_{n_k}\); orange arrows are the corner forces \(\mathbf F_{c\to n_k}\), which point along the corner vector \(\mathbf S_{c,k}\), that is, outward. \(\mathbf S_{c,k}\) is the exact gradient of the revolved volume, and the force arrows are drawn in proportion to it (the common factor, the sum of the pressure and the artificial-viscosity pressure, is absorbed in the scale). The scale of the velocity arrows is independent of the force, and the velocity values are arbitrary illustrative numbers. Right: the two distributions of the corner mass, computed for the drawn cell. The left column follows <code>corner_mass_convention="kinematic_basis_rz_v1"</code> (the R-weighted lump of the bilinear basis); the right column is the ratio of the revolved volumes of the subzones, the default distribution when subzonal pressure is enabled. The two distributions give different values.</figcaption>
+      </figure>
+    </section>
+
+    <section aria-labelledby="corner-masses">
+      <h2 id="corner-masses">Corner masses and compatible forces</h2>
+      <p>A cell mass is partitioned among its <a href="#terms-corner">corners</a>, and a node mass is the deterministic gather of all incident corner masses. The partition rule depends on the settings. With subzonal pressure enabled (the default when a 2D RZ deck omits the key), and on multiblock meshes, the cell mass is split in proportion to the revolved volumes of the subzones of its corners. On a structured mesh with subzonal pressure disabled, <code>corner_mass_convention</code> selects the partition, and the default <code>kinematic_basis_rz_v1</code> convention is the exact R-weighted lump of the bilinear Q1 (four-node quadrilateral finite-element) kinematic basis, evaluated by 2×2 Gauss quadrature:</p>
+      $$
+      m_{c,k}=M_c\,
+      \frac{\int N_k(\xi,\eta)\,R(\xi,\eta)\,J(\xi,\eta)\,d\xi\,d\eta}
+           {\int R(\xi,\eta)\,J(\xi,\eta)\,d\xi\,d\eta}.
+      $$
+      <p>Here \(N_k(\xi,\eta)\) is the bilinear Q1 basis function of corner \(k\) on the reference square, \(J\) is the Jacobian of the map from the reference square to the cell, and \(R\) is the radius. Each corner thus receives the part of the cell mass \(M_c\) that corresponds to the R-weighted integral of its basis function.</p>
+      <p>The <code>kinematic_basis_rz_v1</code> lump is exact for any bilinear quadrilateral, reduces to the earlier radial-linear BBSW (Barlow–Burton–Shashkov–Wendroff) lump on aligned rectangles, and gives the exact \([1/6,1/6,1/3,1/3]\) split in an axis-column cell. Corner masses are computed at initialization and remain invariant during pure Lagrangian motion. With subzonal pressure enabled, they are rebuilt only when a remap is accepted. A run that uses neither subzonal pressure nor hourglass control (<code>hourglass.enabled</code>) and enables ALE (<code>Mesh.motion="ale"</code>, <code>Numerics.ale.enabled=True</code>) recomputes them from the current geometry at every step. <code>bbsw_radial_v0</code> can also be selected, and a frozen configuration (the record of the settings fixed by <a href="../../use/running.html#terms-freeze">freezing</a>) without the key is read as <code>bbsw_radial_v0</code>; that convention degenerates to equal splitting on the axis. The partition with subzonal pressure enabled is set by the ratio of the subzone revolved volumes and differs from the lump above. Multiblock meshes are not controlled by <code>corner_mass_convention</code>.</p>
+      <p>With the volume-weighted momentum scheme, the compatible scalar pressure/viscosity pair uses exactly the same geometric vectors for the corner force and the work:</p>
+      $$
+      \mathbf F_{c\to n_k}=+(P_c+Q_c)\,\mathbf S_{c,k},
+      \qquad
+      \dot V_c=\sum_k\mathbf u_{n_k}\cdot\mathbf S_{c,k},
+      $$
+      $$
+      \sum_n\mathbf u_n\cdot\mathbf F_n
+      =\sum_c(P_c+Q_c)\dot V_c,
+      \qquad
+      \dot U_c=-\sum_k\mathbf F_{c,k}\cdot\mathbf u_{n_k}.
+      $$
+      <ul>
+        <li>\(\mathbf S_{c,k}\) is the exact revolved-volume gradient: the single geometry object shared by force assembly, the volume rate, and the energy-budget check.</li>
+        <li>\(m_{c,k}\) under <code>kinematic_basis_rz_v1</code> is the exact R-weighted lump of the bilinear Q1 basis. The R weighting accounts for the growth of an axisymmetric corner's mass with radius; the split is exactly \([1/6,1/6,1/3,1/3]\) in an axis-column cell. It remains invariant during Lagrangian motion.</li>
+        <li>The sign convention \(\mathbf F=+(P_c+Q_c)\mathbf S_{c,k}\) is outward because \(\mathbf S\) points toward increasing volume; compression therefore does positive internal-energy work.</li>
+        <li>The adjoint identity \(\sum_n\mathbf u_n\cdot\mathbf F_n=\sum_c(P_c+Q_c)\dot V_c\) is the discrete total-energy statement.</li>
+        <li>\(U_c\) is the cell's internal energy [erg] (the product of cell mass and specific internal energy).</li>
+        <li>Scalar vNR uses \(\Delta l_c=\sqrt{A_c}\), with \(A_c\) the cell's meridian-plane area, and the \(C_2^2\) convention for its quadratic term.</li>
+        <li>The Kuropatenko wave speed [3] in CSW98 (its formula is in the <a href="artificial-viscosity.html#terms-edge-av">edge AV</a> terms) is one expression that approaches the acoustic speed for weak compression and the strong-shock speed for large compression.</li>
+      </ul>
+      <p>In the compatible path of the CSW98 edge AV, pressure, subzonal-pressure, and per-edge AV forces occupy separate buffers, but each energy contribution is still computed from the same stored force set and the same time-centered velocity. This discrete adjoint pairing is the basis of the total-energy identity.</p>
+      <p>The area-weighted momentum scheme, the 2D RZ default, also builds momentum and the internal-energy work from one force set (<a href="momentum-schemes.html#momentum-schemes">RZ momentum schemes</a>).</p>
+    </section>
+
+    <section aria-labelledby="controls">
+      <h2 id="controls">Namelist controls</h2>
+      <p>The following are selected keys under <code>Numerics.hydro</code>. A default is the value used when the deck omits the key. Where a 2D RZ deck that omits the key and the structure default (the value of a Config built in C++ code) differ, both are given. Except for meshes with <code>logical_mesh_2d="polar_in_box"</code>, Studio does not write the keys of this table for 2D RZ, so Studio decks run with the defaults for omitted 2D RZ keys. See the <a href="../../use/namelist.html">namelist reference</a> for all keys and their validation rules.</p>
+      <table class="quick-facts">
+        <thead>
+          <tr><th>Key</th><th>Default</th><th>Purpose</th></tr>
+        </thead>
+        <tbody>
+          <tr><th><code>corner_mass_convention</code></th><td><code>"kinematic_basis_rz_v1"</code></td><td>Corner-mass partition on a structured mesh with subzonal pressure disabled; not used with subzonal pressure enabled or on multiblock meshes. The legacy alternative is <code>bbsw_radial_v0</code>.</td></tr>
+          <tr><th><code>boundary_1d</code></th><td><code>"free"</code></td><td>Outer 1D boundary: <code>free</code>, <code>fixed</code>, <code>reflect</code>, or <code>pressure</code>.</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section aria-labelledby="verification">
+      <h2 id="verification">Verification</h2>
+      <ul>
+        <li>Compatible-force tests lock \(\sum \mathbf u\cdot\mathbf F=\sum (P_c+Q_c)\dot V_c\), closed-hydro kinetic–internal exchange, deterministic gathers, and multiblock seam conservation; production-compatible smoke checks additionally bound the recorded energy residual.</li>
+      </ul>
+    </section>
+
+    <section aria-labelledby="references">
+      <h2 id="references">References</h2>
+      <ol class="references">
+        <li>E. J. Caramana, D. E. Burton, M. J. Shashkov, and P. P. Whalen, "The Construction of Compatible Hydrodynamics Algorithms Utilizing Conservation of Total Energy," J. Comput. Phys. 146, 227–262 (1998). <a href="https://doi.org/10.1006/jcph.1998.6029">doi:10.1006/jcph.1998.6029</a></li>
+        <li>E. J. Caramana, M. J. Shashkov, and P. P. Whalen, "Formulations of Artificial Viscosity for Multi-dimensional Shock Wave Computations," J. Comput. Phys. 144, 70–97 (1998). <a href="https://doi.org/10.1006/jcph.1998.5989">doi:10.1006/jcph.1998.5989</a></li>
+        <li>V. F. Kuropatenko, "On Difference Methods for the Equations of Hydrodynamics," in <i>Difference Methods for Solutions of Problems of Mathematical Physics, I</i>, edited by N. N. Janenko (American Mathematical Society, Providence, 1967), p. 116.</li>
+      </ol>
+    </section>
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["$$", "$$"], ["\\[", "\\]"]] } };</script>
+  <script defer src="../../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../../nav.js" data-page="hydro-discretization" data-root="../../"></script>
+</body>
+</html>

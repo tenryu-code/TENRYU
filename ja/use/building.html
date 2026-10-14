@@ -37,7 +37,7 @@
           <tr><th>CMake</th><td>3.27 以上</td><td>C++20 / CUDA のターゲット、依存関係、CTest を構成する。</td></tr>
           <tr><th>Ninja</th><td>利用できること</td><td>生成されたビルドの依存グラフを並列に実行する。</td></tr>
           <tr><th>Boost のヘッダ</th><td>ヘッダのみ。版の指定は無く、1.83 で検証している</td><td>構成時に <code>boost/multiprecision/cpp_int.hpp</code> を探し、見つからなければ構成が止まる。Debian/Ubuntu ではパッケージ <code>libboost-dev</code> で導入できる。標準の場所に無いときの指定は<a href="requirements.html#toolchain">動作環境と要求スペック</a>を参照のこと。</td></tr>
-          <tr><th>HDF5</th><td>1.12 以上 (既定でオン)</td><td><a href="outputs.html">スナップショット・履歴・チェックポイント</a>の入出力を担う。ファイルはすべてランク 0 が書くので、逐次版の HDF5 で足りる（並列版の HDF5 も使えるが、そのときはリンクに MPI が要る）。</td></tr>
+          <tr><th>HDF5</th><td>1.12 以上 (既定でオン)</td><td><a href="outputs/index.html">スナップショット・履歴・チェックポイント</a>の入出力を担う。ファイルはすべてランク 0 が書くので、逐次版の HDF5 で足りる（並列版の HDF5 も使えるが、そのときはリンクに MPI が要る）。</td></tr>
           <tr><th>Python + pybind11</th><td>Python 3.10 以上、pybind11 2.11 以上 (既定でオン)</td><td>初期化時にだけ<a href="namelist.html#terms-deck">デッキ</a>（deck。TENRYU の入力となる 1 個の Python ファイル）を読む組み込みインタープリタである。</td></tr>
           <tr><th>任意の機能</th><td>MPI 3.1 以上 (<code>-DTENRYU_ENABLE_MPI=ON</code>)、Hypre (<code>-DTENRYU_ENABLE_HYPRE=ON</code>。LLNL（Lawrence Livermore National Laboratory、米国ローレンス・リバモア国立研究所）の線形ソルバライブラリ。現行版には Hypre を使う計算の経路が無く、通常は要らない)</td><td>有効にした CMake のオプションに対応する開発用パッケージが必要である。</td></tr>
         </tbody>
@@ -89,7 +89,7 @@ ctest --test-dir build -R &lt;pattern&gt;
       <p>複数ランクでの実行用には、同じリリースビルドの構成コマンドに MPI のオプションを追加する。MPI の実装とヘッダが CMake から見える環境で実行すること。</p>
       <pre><code>cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DTENRYU_ENABLE_MPI=ON
 ninja -C build</code></pre>
-      <p><code>TENRYU_ENABLE_MPI</code> は最上位の CMake のオプションで、既定値は <code>OFF</code> である。すでに構成済みの <code>build/</code> に対してオプションを切り替えた場合も、CMake の再構成のあとに Ninja が必要なターゲットを再ビルドする。MPI 対応バイナリの実行方法と、ランクごとの GPU の割り当てについては、<a href="../physics/mpi.html">MPI 分割</a>のページを参照のこと。</p>
+      <p><code>TENRYU_ENABLE_MPI</code> は最上位の CMake のオプションで、既定値は <code>OFF</code> である。すでに構成済みの <code>build/</code> に対してオプションを切り替えた場合も、CMake の再構成のあとに Ninja が必要なターゲットを再ビルドする。MPI 対応バイナリの実行方法と、ランクごとの GPU の割り当てについては、<a href="../overview/mpi.html">MPI 分割</a>のページを参照のこと。</p>
     </section>
 
     <section aria-labelledby="ccache">

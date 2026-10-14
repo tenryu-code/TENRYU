@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="en" data-lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ALE (arbitrary Lagrangian–Eulerian) — TENRYU Documentation</title>
+  <link rel="stylesheet" href="../../../style.css">
+  <script src="../../../theme.js"></script>
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>ALE (arbitrary Lagrangian–Eulerian) <span class="badge">reference</span></h1>
+    <p class="abstract">TENRYU's 2D RZ (r–z axisymmetric) ALE (arbitrary Lagrangian–Eulerian) separates rezoning, which changes only the mesh shape after Lagrangian hydrodynamics, from conservative remap, which transfers the material state to that mesh. Whichever rezone solver is used, its target mesh passes the same admissibility test, and only an accepted target receives a conservative transfer of mass, momentum, internal energies, and radiation-group energies. Besides the methods that move nodes at fixed connectivity (mesh topology), an opt-in reconnection-based ALE (ReALE [2, 3]; <code>mesh_mode="reale_v2"</code>) changes the connectivity itself. This page describes the ALE mechanism, the cycle and its triggers, the admissibility test, axis bands and Euler windows, and the steps of an accepted cycle. Rezoning, remap, and the connectivity-changing method are detailed on the three pages below. The terms specific to this calculation are defined in the <a href="#terms">terms section</a>.</p>
+
+    <aside class="planned" aria-labelledby="at-a-glance">
+      <h3 id="at-a-glance">At a glance</h3>
+      <ul>
+        <li>A cycle is Lagrangian step → trigger → target mesh → <a href="../mesh/index.html#terms-admissibility">admissibility test</a> → conservative remap.</li>
+        <li>The default solver is bit-exact legacy Winslow; M1/TMOP and reference-barrier paths are opt-in.</li>
+        <li>Remap transports cell integrals, not intensive values, then recovers primitive state using the new volumes and masses.</li>
+        <li>A candidate that fails any of the RZ-volume, <a href="../mesh/index.html#terms-corner-jacobian">corner-Jacobian</a> (corner-J), <a href="../mesh/index.html#terms-gauss-jacobian">Gauss-point-Jacobian</a> (Gauss-J), <a href="../mesh/index.html#terms-axis-margin">axis-margin</a>, or sweep-positivity checks is reduced or rolled back.</li>
+        <li>The opt-in connectivity-changing ALE (<code>mesh_mode="reale_v2"</code>) is a separate mechanism that rebuilds the mesh connectivity through Voronoi re-partitioning rather than relaxing node coordinates; its convergence, welding, and projection decisions are driven by <a href="reale-v2.html#terms-certificate">certificates</a> derived from machine epsilon.</li>
+      </ul>
+    </aside>
+
+    <div class="card-grid">
+      <a class="card" href="rezone.html"><h3>Rezoning</h3><p>The equations and search procedures of the Winslow-family, reference-barrier, and M1/TMOP solvers; the reference target and the M1 objective.</p></a>
+      <a class="card" href="remap.html"><h3>Conservative remap</h3><p>Transfer of conserved quantities by swept regions, the donor choice, the MS2 limiters, and the kinetic-energy budget.</p></a>
+      <a class="card" href="reale-v2.html"><h3>Reconnection-based ALE (reale_v2)</h3><p>Rebuilding the connectivity by generators and Voronoi tessellation, certificates, velocity projection, and GPU tessellation.</p></a>
+    </div>
+
+    <section aria-labelledby="mechanism">
+      <h2 id="mechanism">Physical mechanism</h2>
+      <p>A mesh that follows the material keeps interfaces sharp, but shear, vorticity, and converging asymmetries progressively strain that Lagrangian mesh: cells shear, flatten, and eventually invert, while the timestep collapses with the smallest cell altitude long before the material physics itself fails. ALE is the escape. TENRYU retains Lagrangian fidelity while the mesh is healthy; when it is not, it moves the mesh without moving the material. Rezoning proposes better node coordinates, and remap conservatively transfers the state onto them. The “arbitrary” in the name refers to exactly this freedom: the mesh velocity is pinned neither to the material velocity (Lagrangian) nor to zero (Eulerian) but may be chosen at will — TENRYU's choice being the material velocity while the mesh is healthy, and the rezoner's proposal once it is not.</p>
+      <p>Rezoning is geometry, not physics: it constructs only a target mesh through the Winslow-type smoothing and its constrained variants in the <a href="rezone.html#rezone-solvers">rezone solver family</a>, and must not silently change the answer. RZ-volume positivity, corner-J floors, Gauss-point Jacobian floors, and line search with rollback enforce that separation. An unacceptable target is rejected and the cycle simply remains Lagrangian. Cadence, mesh-quality metrics, and axis/corner-J guards decide when a rezone is attempted at all.</p>
+      <p>Remap is a <a href="#terms-transaction">transaction</a> that moves conserved quantities between old and new meshes with the same connectivity. Exact bookkeeping uses the signed volumes swept between their faces. Each swept region takes one donor-cell state, with slope reconstruction and limiting for monotone second order (a van Leer limiter by default, or the limiters of the opt-in MS2 (Margolin–Shashkov second-order [1]) moment remap), and transfers every extensive ledger—mass, species masses, momentum, internal and kinetic energy, and radiation-group energy—with one signed volume, one donor, and equal-and-opposite cell updates. Mesh motion therefore conserves those transported ledgers to round-off by construction. The kinetic-energy closure (<code>ke_conservation_closure</code>; <a href="remap.html#ms2-energy">below</a>) deposits the kinetic-energy remap/projection discrepancy (projection: the operation that returns remapped cell momentum to nodal velocity — described below) into material internal energy, and subzonal corner masses (the masses of the subzones that split a cell around its nodes — used by the hourglass control and compatible energy bookkeeping of <a href="../hydrodynamics/discretization.html#corner-masses">hydrodynamics</a>) are rebuilt only after an accepted remap—the one point where their Lagrangian invariance may change.</p>
+      <p>The production <a href="#terms-axis-band">managed ALE</a> is a banded controller rather than a global relaxation. <a href="#terms-axis-band">Axis bands</a> and <a href="#terms-euler-window">Euler windows</a> confine where respacing acts—the axis is where RZ Lagrangian meshes fail first—and band-only swept-volume remap keeps the transaction local. The managed controller also preserves bitwise equality when the feature is off: if the controller is disabled or never triggered, the result is bitwise identical to the pure Lagrangian calculation.</p>
+    </section>
+
+    <section aria-labelledby="terms">
+      <h2 id="terms">Terms used in this calculation</h2>
+      <p>Running an ALE cycle involves terms of its own for the extent of mesh rearrangement and for the unit of a transaction. The quantities that measure mesh quality (the admissibility test, the corner Jacobian, the Gauss-point Jacobian, and the axis margin) are defined on the <a href="../mesh/index.html#terms-admissibility">Meshes &amp; geometry</a> page. This page describes only when and for what ALE uses them (<a href="#cycle-triggers">ALE cycle and triggers</a>, <a href="#admissibility">Admissibility and acceptance checks</a>). This section defines the transaction, the axis band, and the Euler window. The reference mesh, the reference barrier, and the M1 objective are defined on the <a href="rezone.html#terms">rezoning page</a>; the terms of the connectivity-changing method are defined on the <a href="reale-v2.html#terms">reale_v2 page</a>.</p>
+
+      <h3 id="terms-transaction">Transaction and rollback</h3>
+      <p>A <strong>transaction</strong> is the procedure that decides, with rezoning and remap taken as one unit, whether to commit or reject. At the start of a transaction a copy (snapshot) of the node coordinates and the state is taken. If anything fails — target-mesh generation, the admissibility test, the conservative remap, the corner-mass rebuild, or the re-closure (<a href="../../overview/numerics-foundations.html#operator-splitting">definition</a>) — both coordinates and state are restored from the snapshot (rollback), and the step stays Lagrangian. Only when everything passes are the coordinates and state committed together (acceptance). An intermediate state in which the coordinates have moved but the state has not been transferred, or the reverse, never leaves the transaction. The unit matters because a mismatch between mesh and state would break conservation when density is recovered from volume. For M1, acceptance additionally requires a test on the decrease of the objective (<a href="rezone.html#terms-m1">The M1 objective</a>).</p>
+
+      <h3 id="terms-axis-band">Axis band, row-K margin, and managed ALE</h3>
+      <p>An <strong>axis band</strong> is the band of \(K\) radial rows of cells (rows \(i=0,\dots,K-1\)) that touch the symmetry axis in a single-block 2D RZ mesh. A Lagrangian RZ mesh fails first near the axis, so only the inside of the axis band is returned to a configuration of equal RZ volumes (the equation is in <a href="#managed-regions">Axis bands, Euler windows, and corner mass</a>), and the state is remapped conservatively. Nodes and state outside the band are unchanged. The width \(K\) defaults to <code>axis_band_managed_remap_width</code> (default 3) and is capped by <code>axis_band_managed_remap_max_width</code> (default 6).</p>
+      <p>The <strong>row-\(K\) margin</strong> is a dimensionless quantity that tells how much the outermost cell of the axis band has shrunk relative to an equal-volume configuration. It is the minimum, over all axial columns, of the ratio of the volume \(V_{\rm actual}\) of the row-\(K-1\) cell to the volume per row \(V_{\rm target}=\pi R_K^2\Delta z/K\) obtained when the axis band is respaced to equal volumes, and it equals 1 for an equal-volume configuration (\(R_K\) is the mean radius of the two row-\(K\) nodes at the ends of the column, and \(\Delta z\) is the difference between the z coordinates of the midpoints of the upper and lower faces of the row-\(K-1\) cell). It is a different quantity from the axis margin (<a href="../mesh/index.html#terms-axis-margin">definition</a>; units cm²), which measures the headroom against inversion of the cells that touch the axis.</p>
+      <p><strong>Managed</strong> means that this respacing is done through a controller (<code>axis_band_managed_remap_enabled</code>, default False) that decides the trigger, the width \(K\), and acceptance. The controller evaluates the <a href="#managed-regions">trigger conditions</a> before each step and, when the operator splitting is a Strang splitting, also after each hydro half-step (<code>axis_band_managed_remap_every_hydro_half_step</code>, default True). The margin floor used in the trigger test is <code>axis_band_managed_remap_margin_trigger</code> (default 1.0e-4), and the cap on the kinetic-energy return is <code>axis_band_managed_remap_kinetic_return_max_fraction</code> (default 0.1).</p>
+
+      <h3 id="terms-euler-window">Euler window</h3>
+      <p>An <strong>Euler window</strong> is a region of space within which the mesh is kept fixed to a reference grid (the coordinates of the initial mesh). It is given as a rectangle (<code>shape="rectangle"</code>, with range <code>r0</code>, <code>r1</code>, <code>z0</code>, <code>z1</code>) or an annulus (<code>"annulus"</code>, with center <code>cr</code>, <code>cz</code>, inner radius <code>rad_in</code>, and outer radius <code>rad_out</code>). Nodes inside the window are placed on the reference grid, nodes outside on the Lagrangian coordinates, and a smooth transition of width <code>transition_width</code> joins them. The cell weight \(\eta\) is set from the signed distance \(d\) of the cell centroid outside the window (\(d\le0\) inside) and the transition width \(\delta\) (<code>transition_width</code>): \(\eta=1\) for \(d\le0\), \(\eta=1-t^2(3-2t)\) with \(t=d/\delta\) for \(0&lt;d&lt;\delta\), and \(\eta=0\) for \(d\ge\delta\). A node's weight is the mean of the weights of the cells that meet at it. The target coordinates are \(\mathbf x^{target}=\eta\,\mathbf x^{ref}+(1-\eta)\,\mathbf x^{L}\), with \(\mathbf x^{ref}\) the reference grid and \(\mathbf x^{L}\) the Lagrangian coordinates. Inside the window the resolution stays that of the reference grid; outside, the mesh follows the material. Several windows (<code>euler_windows</code>) are overlaid by taking the maximum of the node weights.</p>
+      <p>An Euler window can be used for a multiblock 2D RZ mesh with CSR (compressed sparse row) connectivity when <code>conservative_remap_enabled=True</code>, and not together with M1. The window acts only from <code>t_on_s</code> (default 0) to <code>t_off_s</code> (default −1; no end when negative).</p>
+    </section>
+
+    <section aria-labelledby="cycle-triggers">
+      <h2 id="cycle-triggers">ALE cycle and triggers</h2>
+      <p><a href="#fig-ale-cycle">Figure A</a> shows one cycle. The normal entry is the post-Lagrange point. The ALE stage runs on the steps set by the <code>every_n_steps</code> cadence (default 5; every step when it is 1 or less). For a single-block structured mesh with a Winslow-family solver (<code>legacy_winslow</code>, <code>rz_full_metric_winslow</code>), the cell quality is examined on a cadence step, and the mesh is rezoned only when quality has degraded. The quality of a quadrilateral cell, sampled with the bilinear map at the four 2×2 Gauss points, is defined as</p>
+      $$
+      q_c=\frac{J_{\min}}{J_{\max}},
+      \qquad \min_c q_c&lt;q_{\mathrm{threshold}}.
+      $$
+      <p>The default is <code>quality_threshold=0.2</code>; \(q_c=1\) denotes a parallelogram, while zero indicates degeneracy. The rezoning of M1 and of multiblock (CSR-connectivity) meshes does not use this threshold; it builds a target mesh on every cadence step. <code>spacing_ratio_threshold</code> is a parsed and validated reserved key with no runtime firing rule in the current implementation (<code>docs/NUMERICS.md</code> §3.3 in the repository defines none either), so it is not counted as an active trigger here.</p>
+      <p>Protective paths can bypass the cadence. The preventive axis guard (single-block meshes) forces rezoning when the minimum axis margin (<a href="../mesh/index.html#terms-axis-margin">definition</a>) falls below <code>preventive_axis_guard_fraction</code> (default 0.1) times its initial value. The default-off pre-hydro corner-J trigger (<code>Numerics.hydro.corner_jacobian_ale_trigger_enabled</code>) finds where a signed corner Jacobian reaches its floor (<code>corner_jacobian_floor_eps</code>, default 1.0e-6) along the predicted trajectory and invokes ALE before operator splitting when the admissible fraction of the predicted one-step node displacement — how far it can proceed before a corner Jacobian reaches its floor, minimized over all corners — falls below the threshold (<code>corner_jacobian_ale_trigger_scale</code>, default 0.5). The reference barrier (<a href="rezone.html#terms-reference">terms</a>) uses the cell-centroid \(\sin\theta\), the corner-J ratio, and the diagonal-corner length ratio as dedicated triggers.</p>
+
+      <figure id="fig-ale-cycle">
+        <img src="../../../assets/ale-remap-cycle-en.png" width="1080" height="380" style="max-width:100%;height:auto" alt="Flow chart of the ALE cycle. After the Lagrangian step come the trigger check (cadence, cell quality, axis guard, corner-Jacobian trigger), the rezone, the admissibility check (backtracking over the blend λ = 1, 1/2, …, 1/2048, at most 12 attempts), the conservative remap and the corner-mass rebuild, then the next step. An untriggered step, and a candidate rejected because no λ passes, stays Lagrangian (a rejection rolls the transaction back)">
+        <figcaption>Figure A. The ALE cycle. Rezoning proposes node coordinates only. State transfer and corner-mass rebuilding commit only when the candidate mesh and the remap pass every check. Rectangles are processing steps, diamonds are branches, and grey rectangles are paths that change nothing. The backtracking drawn in the admissibility check is the default single-block path (the blend λ halved from 1, at most 12 attempts, smallest 1/2048); it checks the candidate mesh only, not the node path. Triggering by the cell-quality threshold 0.2 applies to the single-block Winslow solvers only.</figcaption>
+      </figure>
+    </section>
+
+    <section aria-labelledby="admissibility">
+      <h2 id="admissibility">Admissibility and acceptance checks</h2>
+      <p>Rezoner convergence is not mesh acceptance. Acceptance is decided by the admissibility test (<a href="../mesh/index.html#terms-admissibility">definition</a>). Every active candidate cell must retain positive signed RZ volume and corner-J, satisfy the 2×2 Gauss-J floors, and, for axis cells, have a positive axis margin. The first directional-remap sweep must also keep intermediate volumes positive. For single-block meshes, the default backtracking tries the blend factor \(\lambda\) (which blends the Lagrangian mesh toward the proposed target) at 1, 1/2, 1/4, … in turn, halving at each rung for up to 12 rungs (the smallest is 1/2048), and takes the first value that passes. The opt-in safe backtracking (<code>safe_backtrack_enabled</code>) first validates the Lagrangian mesh at \(\lambda=0\). It then tries \(\lambda=2^{-e}\), with the exponent \(e\) running from 0 up to <code>safe_backtrack_min_exp</code> (default 20), from the largest value down, and takes the first value that passes as \(\lambda_{\rm lo}\). It then bisects between \(\lambda_{\rm lo}\) and twice that value (capped at 1) <code>safe_backtrack_binary_iters</code> times (default 8) to find the largest admissible blend. If no positive value passes, the mesh and state roll back to the pre-transaction snapshot.</p>
+      <p>The floors differ by method. In the default backtracking of single-block meshes, a candidate is rejected when any 2×2 Gauss-point Jacobian is negative, any corner Jacobian is zero or negative, or the axis margin is zero or negative (with <code>reject_zero_gauss_j=True</code>, default False, it is also rejected when the minimum Gauss-point Jacobian is at most \(\max(10^{-30},\,10^{-8}J_{\max})\)). The candidate-mesh oracle used by the reference barrier, M1, the center patch, and similar paths requires the RZ volume, corner Jacobians, and Gauss-point Jacobian each to stay above floors relative to the values of the reference mesh (default 1.0e-8; <a href="rezone.html#rezone-solvers">Rezone solver family</a>).</p>
+      <p>Thus, a smaller objective or Winslow residual alone never commits a mesh. Reference targets, M1 targets, and managed repairs all end at the same geometry oracle and remap-positivity checks.</p>
+    </section>
+
+    <section aria-labelledby="managed-regions">
+      <h2 id="managed-regions">Axis bands, Euler windows, and corner mass</h2>
+      <p><code>axis_band_managed_remap_enabled</code> is a default-off near-axis controller (<a href="#terms-axis-band">axis band</a>), usable only with a single-block mesh (<code>Mesh.topology_scheme="single_block"</code>). The band width \(K\) (number of rows) defaults to <code>axis_band_managed_remap_width</code> (default 3) and is capped by <code>axis_band_managed_remap_max_width</code> (default 6). When the row-\(K\) margin (<a href="#terms-axis-band">definition</a>) at the default width is below 1 and, for some \(K\) from that width up to the cap, the row-\(K\) margin is at least <code>axis_band_managed_remap_margin_trigger</code> (default 1.0e-4), the controller remaps only \(i\in[0,K-1]\), starting from the smallest such \(K\), to the equal-RZ-volume target</p>
+      $$
+      r_i^{target}(j)=R_K(j)\sqrt{i/K},\qquad
+      z_i^{target}(j)=z_K^{node}(j).
+      $$
+      <p>Here \(R_K(j)\) is the radius of the fixed row-\(K\) node at axial index \(j\), so the band nodes are respaced to equal revolved volumes while their axial coordinates follow row \(K\).</p>
+      <p>It widens \(K\) one row at a time from the chosen value up to the cap, trying the band remap at each \(K\). It checks positivity, the conservation ledgers, the cap on the kinetic-energy return (<code>axis_band_managed_remap_kinetic_return_max_fraction</code>, default 0.1, as a fraction of the internal energy of the band cell), and the re-closure through the EOS, and takes the first \(K\) that satisfies all of them. If every \(K\) fails, state is unchanged and control returns to legacy timestep reduction. Mass, momentum, electron/ion internal energy, and radiation groups are conserved; only the nodal-projection kinetic-energy delta is warning-level by construction.</p>
+      <p><code>euler_window.enabled</code> is an opt-in target mesh for multiblock regions with CSR connectivity (<a href="#terms-euler-window">Euler window</a>). A rectangle or annulus uses the fixed reference grid inside and Lagrangian coordinates outside, joined by a C¹-continuous transition weight. When the blended target passes the candidate-mesh check, it is placed at the reference positions as the target mesh of the remap, by the same procedure as an accepted M1 rezone, and it enters the conservative-remap transaction. After the remap, the reference coordinates return to their original values. It requires conservative remap and is mutually exclusive with M1/TMOP.</p>
+      <p>Hydrodynamic subzonal corner masses remain fixed during pure Lagrangian motion. A rejected geometric proposal does not change them; they are rebuilt from remapped cell mass and the post-remap mesh only after an accepted rezone/remap. This lifecycle preserves the Lagrangian invariance required by compatible work and anti-hourglass/subzonal-pressure terms.</p>
+    </section>
+
+    <section aria-labelledby="pipeline">
+      <h2 id="pipeline">One accepted ALE cycle, step by step</h2>
+      <ol>
+        <li><p><strong>Evaluate triggers.</strong> At the ALE entry point, evaluate scheduled cadence together with cell-quality, axis-margin, and corner-J guards. If nothing fires, retain the Lagrangian mesh and state unchanged.</p></li>
+        <li><p><strong>Construct a target.</strong> Run the selected Winslow, reference-barrier, or M1/TMOP solver to propose node coordinates only. The managed controller confines this proposal to its selected axis band or Euler window.</p></li>
+        <li><p><strong>Test admissibility.</strong> On the candidate mesh, test for positive signed RZ volume, the corner-J and 2×2 Gauss-J floors, and the applicable axis margin. Line search reduces the displacement when needed; the opt-in safe backtracking validates \(\lambda=0\), searches \(\lambda=2^{-e}\), and refines the largest admissible blend. If no positive blend passes, restore the pre-transaction snapshot and stay Lagrangian.</p></li>
+        <li><p><strong>Build swept regions.</strong> Between every old and new face, construct the oriented polygon and evaluate its exact axisymmetric signed volume and, for the second-order path, exact first moments. The first directional sweep's intermediate volumes must remain positive.</p></li>
+        <li><p><strong>Transfer conservative ledgers.</strong> Select the donor from the swept-volume sign, reconstruct its state with the selected Van Leer or MS2 limiter, and apply each face flux once with opposite signs to its two cells. Mass and species/material ledgers, R/Z momentum, electron/ion internal energy, radiation-group energy, and the enabled diagnostic kinetic-energy ledger all follow this transaction; sweep positivity remains a rollback condition.</p></li>
+        <li><p><strong>Close the kinetic-energy budget and commit.</strong> Project remapped momentum, deposit the kinetic-energy difference into internal energy through <code>ke_conservation_closure</code> when enabled, rebuild corner masses from the remapped cell mass and accepted mesh, and perform re-closure. Acceptance commits mesh and state together as one transaction; failure restores both.</p></li>
+        <li><p><strong>Check equality with the feature off.</strong> Conservation ledgers are a condition for accepting the transaction, and ALE-disabled, never-triggered, and identity-mode runs are checked for bitwise equality with pure Lagrangian evolution. Passing these OFF/bit-identity and conservation checks is the acceptance condition for the feature as a whole.</p></li>
+      </ol>
+    </section>
+
+    <section aria-labelledby="controls">
+      <h2 id="controls">Namelist controls</h2>
+      <p>These are selected <code>Numerics.ale</code> controls. See the <a href="../../use/namelist.html">namelist reference</a> for all fields and validation rules.</p>
+      <table class="quick-facts">
+        <thead>
+          <tr><th>Key</th><th>Default</th><th>Purpose</th></tr>
+        </thead>
+        <tbody>
+          <tr><th><code>enabled</code></th><td><code>False</code></td><td>Master enable for the 2D RZ rezone/remap cycle (a direct key of <code>Numerics.ale</code>; there is no <code>rezoning</code> sub-block).</td></tr>
+          <tr><th><code>every_n_steps</code></th><td><code>5</code></td><td>Scheduled rezone cadence.</td></tr>
+          <tr><th><code>quality_threshold</code></th><td><code>0.2</code></td><td>For a single-block structured mesh with a Winslow-family solver, quality trigger when \(\min q_c\) falls below it.</td></tr>
+          <tr><th><code>axis_band_managed_remap_enabled</code></th><td><code>False</code></td><td>Near-axis, band-only equal-volume remap controller.</td></tr>
+          <tr><th><code>euler_window.enabled</code></th><td><code>False</code></td><td>Local Eulerian reference target with a C1 transition.</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section aria-labelledby="verification">
+      <h2 id="verification">Verification</h2>
+      <ul>
+        <li>OFF-path bitwise checks require an ALE-disabled run to remain bit-identical in fields and history.</li>
+        <li><code>ale_identity_mode</code> returns from every ALE entry point after Lagrange; it is a null test against an ALE-disabled run at matched timesteps.</li>
+        <li>The integration tests of 2D RZ (the I-series of the <a href="../../verification/index.html#tag-legend">test-tag legend</a>) exercise production rezoning, admissibility, conservative remap, axis, and multiblock paths in coupled configurations.</li>
+      </ul>
+    </section>
+
+    <section aria-labelledby="references">
+      <h2 id="references">References</h2>
+      <ol class="references">
+        <li>L. G. Margolin and M. J. Shashkov, "Second-Order Sign-Preserving Conservative Interpolation (Remapping) on General Grids," J. Comput. Phys. 184, 266–298 (2003). <a href="https://doi.org/10.1016/S0021-9991(02)00033-5">doi:10.1016/S0021-9991(02)00033-5</a></li>
+        <li>R. Loubère, P.-H. Maire, M. Shashkov, J. Breil, and S. Galera, "ReALE: A Reconnection-Based Arbitrary-Lagrangian–Eulerian Method," J. Comput. Phys. 229, 4724–4761 (2010). <a href="https://doi.org/10.1016/j.jcp.2010.03.011">doi:10.1016/j.jcp.2010.03.011</a></li>
+        <li>R. Loubère, P.-H. Maire, and M. Shashkov, "ReALE: A Reconnection Arbitrary-Lagrangian–Eulerian Method in Cylindrical Geometry," Comput. Fluids 46, 59–69 (2011). <a href="https://doi.org/10.1016/j.compfluid.2010.08.024">doi:10.1016/j.compfluid.2010.08.024</a></li>
+      </ol>
+    </section>
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["$$", "$$"], ["\\[", "\\]"]] } };</script>
+  <script defer src="../../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../../nav.js" data-page="ale" data-root="../../"></script>
+</body>
+</html>

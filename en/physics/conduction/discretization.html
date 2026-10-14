@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en" data-lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Spatial discretization — TENRYU Documentation</title>
+  <link rel="stylesheet" href="../../../style.css">
+  <script src="../../../theme.js"></script>
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>Spatial discretization</h1>
+    <p class="abstract">The spatial discretization of electron heat conduction is a conservative finite-volume operator in 1D and a node-local operator with symmetric conductances in 2D RZ. This page defines the face-conductivity policy (face-κ policy) of 1D, the node-local operator of 2D RZ, the per-material conservation mode, and the treatment of void cells.</p>
+
+    <section aria-labelledby="terms">
+      <h2 id="terms">Terms used in this calculation</h2>
+      <p>The spatial discretization uses several words in the sense of TENRYU's implementation: the policy that builds the face conductivity in 1D, the node-local operator of 2D RZ, and the per-material conservation mode. They are defined together here. The words for the time steps of super-time-stepping are on the <a href="time-integration.html#terms">time-integration page</a>, and the quantities of SNB are on the <a href="snb.html#terms">SNB page</a>.</p>
+
+      <h3 id="terms-face-kappa">Face-κ policy</h3>
+      <p>The <strong>face-κ policy</strong> is the rule that decides, in 1D, the thermal conductivity \(\kappa_f\) of the face between two adjacent cells from the κ of the two cells. Its key is <code>Numerics.conduction.face_kappa_policy</code>, and its values are <code>"kirchhoff_same_material"</code> (default) and <code>"harmonic"</code>.</p>
+      <p>Because \(\kappa\propto T^{5/2}\) changes by orders of magnitude across a steep heat front, the way \(\kappa_f\) is built governs how the front advances. <code>"harmonic"</code> takes the harmonic mean \(2\kappa_L\kappa_R/(\kappa_L+\kappa_R)\) of the κ of the left and right cells as \(\kappa_f\). The harmonic mean is pulled toward the smaller κ, so \(\kappa_f\) is too small ahead of the front and the front tends to pin to the grid. If κ is zero on either side, \(\kappa_f\) is zero and no heat passes.</p>
+      <p><code>"kirchhoff_same_material"</code> uses the secant of the exact integral of \(T^{5/2}\) over the interval between the left and right temperatures \(T_L\) and \(T_R\), a face average based on the Kirchhoff transformation.</p>
+      $$
+      \kappa_f=\tilde\kappa_f\,\frac27\,\frac{T_R^{7/2}-T_L^{7/2}}{T_R-T_L},\qquad
+      \tilde\kappa_f=\frac{2\tilde\kappa_L\tilde\kappa_R}{\tilde\kappa_L+\tilde\kappa_R},\qquad
+      \tilde\kappa=\frac{\kappa}{T^{5/2}}.
+      $$
+      <p>Here \(\tilde\kappa\) is the Spitzer prefactor taken from the cell κ. The secant is used only when the ratio of the left and right \(\tilde\kappa\) lies between 0.1 and 10. When the ratio is outside this range (a material interface, or a strong table-driven jump of \(\tilde\kappa\)), or when κ or \(T\) is not positive (a void), the harmonic mean is used. The same \(\kappa_f\) is used for the SH estimate of the flux limiter, for the applied flux, and, by default, for \(\Delta t_{exp}\) (<a href="time-integration.html#sts">step 3</a>).</p>
+      <p>2D RZ uses the node-local operator (next item) and builds no face \(\kappa_f\). The key only chooses whether each pair of the operator is multiplied by the secant over the two cell temperatures (\(\tfrac27(T_R^{7/2}-T_L^{7/2})/(T_R-T_L)\) in the formula above): <code>"kirchhoff_same_material"</code> multiplies and <code>"harmonic"</code> does not. SNB in 2D RZ uses no secant.</p>
+
+      <h3 id="terms-node-local">Node-local operator</h3>
+      <p>The <strong>node-local operator</strong> is the symmetric linear operator that couples cell-centered temperatures in the 2D RZ conduction (electrons, ions, and the group equations of SNB). The 2D RZ mesh consists of polygonal cells in the meridian (r–z) plane. The operator is a sum of node contributions, and the contribution of a node is built as follows.</p>
+      <p>A <strong>corner</strong> is, for each cell that meets at a node \(p\), the part of the cell that touches \(p\). It is the quadrilateral through the cell's reference point (the centroid for a convex cell), the midpoint of the edge before \(p\), \(p\) itself, and the midpoint of the edge after \(p\), the same division as the corners of the <a href="../hydrodynamics/discretization.html#terms-corner">hydrodynamics page</a>.</p>
+      <p>A <strong>half-edge</strong> is the part on the side of \(p\) of an edge that leaves \(p\) and is split at its midpoint. The temperature \(\Theta\) of a half-edge is an unknown shared by the two corners on either side of it (one corner at a boundary). The temperature gradient in each corner is expressed with the Green–Gauss formula from the cell temperature and the half-edge temperatures, which gives the heat flow through the half-edges. The condition that the heat flows on the two sides of an interior half-edge are equal, and that the heat flow through a boundary half-edge is zero, lets one eliminate \(\Theta\) in favor of the temperatures of the cells that share the node. What remains is the matrix \(a\) that expresses the heat leaving cell \(c\) as a linear combination of the temperatures of the cells that share the node.</p>
+      <p>The rows and the columns of \(a\) both sum to zero (a uniform temperature carries no heat flow, and the heat flow is continuous), and \(a\) is symmetric positive semidefinite. With the pair coefficient \(G_{cd}=-(a_{cd}+a_{dc})/2\) of a cell \(c\) and a cell \(d\) that shares a node with it, the heat capacity \((\rho c_vV)_c\) of cell \(c\) times the rate of change of its temperature equals the sum of the heat flowing in from the neighboring cells (\(V\) is the volume of the solid of revolution).</p>
+      $$
+      (\rho c_vV)_c\,\frac{dT_{e,c}}{dt}=\sum_dG_{cd}\,(T_{e,d}-T_{e,c}).
+      $$
+      <p>When the secant is used, each term of the right-hand side is multiplied by \(S_{cd}\) (<a href="time-integration.html#sts">step 6</a>). Because \(G_{cd}=G_{dc}\), the pair power \(G_{cd}(T_d-T_c)\) differs between \(c\) and \(d\) only in sign, and thermal energy is conserved.</p>
+      <p>The operator does not use the mesh indices \((i,j)\), so the same procedure applies to cells that are not quadrilaterals and to meshes made of several blocks. The heat flow between cells of different conductivity follows from the continuity of the heat flow across the half-edge, and no harmonic mean of the face is used. The heat flow through a boundary half-edge is zero, except that the half-edges on the z_bottom and z_top sides where a state supply (<code>state_supply</code>) is active are held at the supply temperature (single-block meshes). There is no key that chooses the operator, and all 2D RZ conduction is solved with it. The pair coefficients \(G_{cd}\) determine the STS update and the bound that gives the explicit stability limit \(\Delta t_{exp}\).</p>
+
+      <h3 id="terms-per-material">Per-material conservation mode</h3>
+      <p>The <strong>per-material conservation mode</strong> is the setting in which, when several materials are mixed in one cell, the state keeps the mass, volume fraction, and electron energy of each material and conserves the energy of each material. It is used so that the EOS of each material handles the temperature and pressure of that material. Its key is <code>Numerics.materials.per_material_conservation_enabled</code> (default False, 2D RZ only). The treatment of mixed cells is chosen with <code>Numerics.materials.mixed_cell_closure</code>: the default <code>"equal_compressibility"</code> keeps the volume fractions fixed and takes the cell pressure as the volume-fraction-weighted sum of the material pressures, and <code>"pressure_relaxation"</code> relaxes the material pressures at a limited rate.</p>
+      <p>In conduction, one electron temperature per cell is advanced with STS, and the resulting energy change is distributed among the materials; the rule is given in the <a href="#faces-materials">face-conductivity section</a>. The mode cannot be combined with SNB (input validation rejects it). In 2D RZ it needs <code>mixed_cell_closure="pressure_relaxation"</code> when it is combined with ion conduction.</p>
+    </section>
+
+    <section aria-labelledby="faces-materials">
+      <h2 id="faces-materials">Face conductivity, per-material conservation, and voids</h2>
+      <p>The face-κ policy for 1D (definition and formula in the <a href="#terms-face-kappa">terms section</a>) uses, with the default <code>kirchhoff_same_material</code>, the Kirchhoff secant on smooth same-material Spitzer faces and only there. A naive two-point evaluation underestimates the face κ just ahead of a steep heat front, and this underestimate tends to pin the front to the grid; the secant reduces that tendency. Material interfaces, voids, and places where the Spitzer prefactor extracted from the cell conductivity (\(\kappa_c/T_c^{5/2}\)) takes a strong table-driven jump use the harmonic mean. <code>harmonic</code> remains selectable; it handles material interfaces and large conductivity jumps conservatively — because it is a harmonic mean, a zero conductivity on either side blocks the face. The SH estimate used by the flux limiter and the applied flux always use the same face κ. In 2D RZ there is no face κ: the heat flow between cells of different conductivity follows from the continuity of the heat flow across each half-edge, and no harmonic mean is used. <code>face_kappa_policy</code> only chooses whether each pair of the node-local operator is multiplied by the secant over its two cell temperatures.</p>
+      <p>The 1D planar, cylindrical, and spherical operators use a conservative finite-volume form; geometry appears only through face areas \(A_f\) and cell volumes \(V_i\). The per-material conservation mode (defined in the <a href="#terms-per-material">terms section</a>; 2D RZ only) advances one electron temperature per cell with STS and then distributes the energy change among the materials. The cell conductivity is the sum Σ<sub>m</sub>α<sub>m</sub>κ<sub>eff,m</sub> of the limited conductivities κ<sub>eff,m</sub> of the materials \(m\), each built from the material's own temperature, density, \(\bar Z\), and lnΛ and weighted by its volume fraction α<sub>m</sub>. After all stages, the electron-energy change of cell \(c\), \(\Delta E_c=(\rho c_vV)_c(T_c^{n+1}-T_c^n)\), is distributed by the following rule. For \(\Delta E_c&gt;0\), the energy is shared in proportion to the materials' electron heat capacities at the step entry, so that every material's temperature rises by the same amount. For \(\Delta E_c&lt;0\), it is shared in proportion to each material's electron energy above its state at the temperature floor (<code>Numerics.floors.Te</code>; <a href="../../overview/numerics-foundations.html#floors-safety">definition</a>). If the total excess is smaller than \(-\Delta E_c\), all materials go to their floor states and the shortfall is booked in the <a href="../../overview/numerics-foundations.html#energy-ledger">energy ledger</a> as floor-injected energy. When the excess suffices, the change in the sum of the materials' electron energies equals the cell's change to round-off. With <code>mixed_cell_closure="pressure_relaxation"</code>, conduction advances with cell coefficients that do not distinguish the materials, and the driver distributes the energy among the materials by the rule of the mixed-cell pressure relaxation.</p>
+      <p>A <code>cell_is_void</code> cell is forced to κ<sub>eff</sub>=0, making its boundary an insulating, adiabatic surface. The mask is also needed for performance: if a floor-density void cell were treated as ordinary matter, the tiny ρc<sub>v</sub> denominator of the diffusivity κ/(ρc<sub>v</sub>) would produce an enormous diffusion coefficient, collapse the stability limit Δt<sub>exp</sub>, and effectively stall STS. SNB applies the same discipline: a void cell becomes an identity row with H<sub>g</sub>=0 and the adjacent group diffusivities are zeroed, leaving no path for the group diffusion to carry preheat across a void.</p>
+    </section>
+
+    <section aria-labelledby="controls">
+      <h2 id="controls">Namelist controls</h2>
+      <p>This is the key of <code>Numerics.conduction</code> that concerns the discretization. See the <a href="../../use/namelist.html">namelist reference</a> for all keys and their validation rules. The default in the table is the value used when the deck does not set the key.</p>
+      <table class="quick-facts">
+        <thead>
+          <tr><th>Key</th><th>Default</th><th>Purpose</th></tr>
+        </thead>
+        <tbody>
+          <tr><th><code>face_kappa_policy</code></th><td><code>"kirchhoff_same_material"</code></td><td>How the face κ is built. The default is the same-material Kirchhoff secant; the harmonic mean, <code>"harmonic"</code>, is also selectable. In 2D RZ it chooses whether each pair of the node-local operator is multiplied by the secant.</td></tr>
+        </tbody>
+      </table>
+
+    </section>
+
+    <section aria-labelledby="verification">
+      <h2 id="verification">Verification</h2>
+      <ul>
+        <li><strong>Kirchhoff-secant checks:</strong> on steep same-material faces, four checks run: the ratio of heat flow and time step between the Kirchhoff secant and the harmonic mean, the bound \(|q|\le q_{max}\) while the flux limiter is active, the time-step protection given by a Gershgorin-disc diagonal-dominance check of the operator with fixed coefficients (zero-volume cells excluded), and the correct fallback to the harmonic mean at material interfaces.</li>
+      </ul>
+    </section>
+
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["$$", "$$"], ["\\[", "\\]"]] } };</script>
+  <script defer src="../../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../../nav.js" data-page="conduction-discretization" data-root="../../"></script>
+</body>
+</html>

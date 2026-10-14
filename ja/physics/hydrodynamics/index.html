@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="ja" data-lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ラグランジュ流体 — TENRYU ドキュメント</title>
+  <link rel="stylesheet" href="../../../style.css">
+  <script src="../../../theme.js"></script>
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>ラグランジュ流体 <span class="badge">reference</span></h1>
+    <p class="abstract">TENRYU は、1D（<code>Mesh.geometry_1d</code> で選ぶ球・円筒・平面の各測度（measure））と 2D 軸対称（axisymmetric）RZ（円筒座標の R, Z）の幾何で、スタッガード配置（staggered grid）のラグランジュ法（Lagrangian method）により物質の運動を更新する。熱力学状態をセルに、運動学量（kinematic quantities）を節点（node）に置き、2D のエネルギー整合（compatible）な経路では、節点に働く力と内部エネルギーの更新に使う仕事を同一の離散力から構成して、全エネルギーを構成上保存する。この頁は流体の物理機構を述べ、空間離散化、時間積分、人工粘性と砂時計モードの制御、RZ 運動量スキーム、プラズマ粘性は下の 5 頁に分けて書く。</p>
+
+    <aside class="planned" aria-labelledby="at-a-glance">
+      <h3 id="at-a-glance">要点</h3>
+      <ul>
+        <li>スタッガードかつエネルギー整合な配置：セル中心に密度 ρ、比内部エネルギー e、圧力 P、温度 T を、節点に位置 x と速度 u を置く。</li>
+        <li><a href="discretization.html#terms-corner">コーナー質量とコーナー力</a>により、運動エネルギーと内部エネルギーの交換を構成上保存する。</li>
+        <li><code>midpoint_v1</code> は 2 次精度の中点法（midpoint method）で、修正を必ず 1 回だけ行う。<code>pc_v0</code> は従来の予測子–修正子法（predictor–corrector method）である。<code>time_integration</code> を省略したときの既定は、単一ブロック（single-block）メッシュで <code>midpoint_v1</code>、マルチブロック（multiblock）メッシュで <code>pc_v0</code> である（<a href="time-integration.html">時間積分</a>）。</li>
+        <li>衝撃波の捕捉（shock capturing）には、従来のスカラー vNR（von Neumann–Richtmyer）人工粘性（artificial viscosity、AV）と、CSW98（Caramana–Shashkov–Whalen 1998 [3]）の辺人工粘性（edge-centered AV）を用意している。2D RZ の<a href="../../use/namelist.html#terms-deck">デッキ</a>（deck）で省略したときの既定は、CSW98 の辺人工粘性（<code>av_model="csw_edge_csw98"</code>）、面積重み付き（area-weighted）でエネルギー整合な運動量式（<code>rz_momentum_scheme="area_weighted_symmetric"</code>、<code>aw_compatible_force_work=True</code>）、およびサブゾーン圧力（subzonal pressure、<code>subzonal_pressure_enabled=True</code>）である。サブゾーン圧力は砂時計モード（hourglass mode）を抑える。これらの用語は<a href="artificial-viscosity.html#terms">人工粘性の頁</a>と<a href="momentum-schemes.html#terms">運動量スキームの頁</a>の用語の節で説明する。</li>
+      </ul>
+    </aside>
+
+    <div class="card-grid">
+      <a class="card" href="discretization.html"><h3>空間離散化</h3><p>状態量と節点の配置、コーナー質量の配分、エネルギー整合なコーナー力。</p></a>
+      <a class="card" href="time-integration.html"><h3>時間積分</h3><p>1D と 2D RZ の積分器、流体半ステップ 1 回の手順、時間刻みの候補。</p></a>
+      <a class="card" href="artificial-viscosity.html"><h3>人工粘性と砂時計モードの制御</h3><p>スカラー vNR と CSW98 の辺人工粘性、サブゾーン圧力による砂時計モードの抑制。</p></a>
+      <a class="card" href="momentum-schemes.html"><h3>RZ 運動量スキーム</h3><p>体積重み付きと面積重み付きの運動量式、BBSW のコーナー質量。</p></a>
+      <a class="card" href="plasma-viscosity.html"><h3>プラズマ粘性</h3><p>非磁化 Braginskii の係数による物理的なせん断応力、運動量の拡散、粘性加熱。イオンと電子のチャネルを選べる。</p></a>
+    </div>
+
+    <section aria-labelledby="mechanism">
+      <h2 id="mechanism">物理機構</h2>
+      <p>ラグランジュ・メッシュ（Lagrangian mesh）は物質とともに動くため、物質界面と接触不連続（contact discontinuity）はセル間へ拡散せず、セルの境界上に留まる。収束する球殻は解像度を保ち、体積が 1000 倍圧縮されても物質とともにセルが圧縮されるだけで、離散化すべき移流項（advection term）も現れない。その代償が 2D でのメッシュ歪みである。ずり流れ（shear flow）と渦度（vorticity）は移動メッシュを絡ませることがあるが、その扱いは本ページではなく、対になる <a href="../ale/index.html">ALE（arbitrary Lagrangian–Eulerian、任意ラグランジュ・オイラー法）のページ</a>で述べる。</p>
+      <p>熱力学状態をセルに、運動学量を節点に置くのは、古典的な von Neumann のスタッガード配置である。Caramana–Burton–Shashkov–Whalen のエネルギー整合流体 [2] では、節点へ働くコーナー力とセルの \(p\,dV\) 仕事を、同じコーナーベクトル \(\mathbf S_{c,k}=\partial V_c/\partial\mathbf x_{c,k}\)（\(c\) はセル、\(k\) はそのコーナーの番号）から構成する。こうすると「力 × 節点速度」で運動エネルギーが得る量と「圧力 × 体積変化率」で内部エネルギーが失う量が、同じ離散量の二通りの読み方になり（運動量式と内部エネルギー式が互いに転置 — 随伴（adjoint）— の関係）、運動エネルギーの変化と内部エネルギーの変化は恒等的に相殺する。その結果、全エネルギーは事後の補正によってではなく、構成上、丸め誤差（round-off error）の範囲まで保存される。RZ でも、回転体（solid of revolution）の体積の厳密な勾配を用いることで同じ考え方が成り立つ。</p>
+      <p>粘性のないスタッガード法には、衝撃波が必要とするエントロピーを生成する機構がない。人工粘性は圧縮時にだけ散逸的な圧力を加え、強い衝撃波には 2 次項、弱い衝撃波の裾には線形項を働かせることで、数セルにわたって捕捉された衝撃波が跳躍条件（Rankine–Hugoniot jump conditions）を満たすようにする。スカラー vNR 粘性 [1] は方向を区別しないため、収束流やずり流れを過剰に減衰させる。CSW98 の<a href="artificial-viscosity.html#terms-edge-av">辺人工粘性</a>は、<a href="discretization.html#terms-median">メディアンメッシュ</a>（median mesh） — セル中心と各辺の中点を結ぶ線分が作る補助メッシュ — 上で辺ごとに圧縮を測り、制限関数（limiter）が自己相似圧縮（self-similar compression）・剛体回転・線形ずりでは散逸を無効にする。双一次四辺形にはさらに、セル平均の発散からは見えないゼロエネルギーの市松模様（checkerboard）、すなわち砂時計モードも生じる。<a href="artificial-viscosity.html#terms-subzonal-pressure">サブゾーン圧力</a>は、セル内で正味 0 となるコーナー力によってこれに抵抗する安定化機構であり、衝撃波捕捉用の人工粘性の代用ではない。</p>
+      <p>2D RZ の単一ブロックメッシュの既定の積分器は、修正（corrector）を厳密に 1 回だけ行う中点法である。演算回数が固定されているため、許容誤差まで反復する修正子と違って、実行はビット単位（bitwise）で再現する。滑らかな流れでの精度次数（order of accuracy）の測定値（2026-07-27、検証デッキ <code>2d_rz_v3_smooth_temporal</code>）は、密度で \(p_\rho=2.0000\)、エネルギーで \(p_e=1.9999\) であり、従来の予測子–修正子法の約 1.0007 に対して 2 次である。従来法は圧縮の途中で古い圧力クロージャ（closure。密度と内部エネルギーから EOS で圧力などを求めること）を使うため、次数を 1 失う。ドライバ（driver）のレベルでは、<a href="../../overview/numerics-foundations.html#operator-splitting">演算子分割（operator splitting）</a>の中で、場に作用する演算子群を挟む 2 回の流体半ステップ（hydro half-step。ラグランジュ流体を、外側の 1 ステップの半分 \(\Delta t/2\) だけ進める演算子）として実行し、状態を読む各演算子の前に、EOS（equation of state、状態方程式）から温度・圧力・比熱を求め直す<a href="../../overview/numerics-foundations.html#operator-splitting">再クロージャ（re-closure）</a>を行う。</p>
+    </section>
+
+    <section aria-labelledby="verification">
+      <h2 id="verification">検証</h2>
+      <ul>
+        <li><code>verify_gxii_1d_fld_regression</code> は現行の <a href="../../verification/index.html#gxii">GXII（激光 XII 号、GEKKO XII）</a>基準回帰試験で、吸収エネルギーと、履歴から得られる最大圧縮時刻、ピーク密度、面密度、中心温度を判定する。</li>
+      </ul>
+    </section>
+
+    <section aria-labelledby="references">
+      <h2 id="references">参考文献</h2>
+      <ol class="references">
+        <li>J. von Neumann and R. D. Richtmyer, "A Method for the Numerical Calculation of Hydrodynamic Shocks," J. Appl. Phys. 21, 232–237 (1950). <a href="https://doi.org/10.1063/1.1699639">doi:10.1063/1.1699639</a></li>
+        <li>E. J. Caramana, D. E. Burton, M. J. Shashkov, and P. P. Whalen, "The Construction of Compatible Hydrodynamics Algorithms Utilizing Conservation of Total Energy," J. Comput. Phys. 146, 227–262 (1998). <a href="https://doi.org/10.1006/jcph.1998.6029">doi:10.1006/jcph.1998.6029</a></li>
+        <li>E. J. Caramana, M. J. Shashkov, and P. P. Whalen, "Formulations of Artificial Viscosity for Multi-dimensional Shock Wave Computations," J. Comput. Phys. 144, 70–97 (1998). <a href="https://doi.org/10.1006/jcph.1998.5989">doi:10.1006/jcph.1998.5989</a></li>
+      </ol>
+    </section>
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["$$", "$$"], ["\\[", "\\]"]] } };</script>
+  <script defer src="../../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../../nav.js" data-page="hydrodynamics" data-root="../../"></script>
+</body>
+</html>
