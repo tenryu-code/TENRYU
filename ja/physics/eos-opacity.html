@@ -13,66 +13,100 @@
   <main>
     <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
     <h1>EOS・不透明度・電離 <span class="badge">reference</span></h1>
-    <p class="abstract">TENRYU の材料クロージャは、材料組成 \(A,Z\)、EOS、平均電離度、不透明度を同じセルの状態へ結び付ける。解析的な 2 温度理想気体と TMAT の表形式 EOS、固定または状態依存の \(\bar Z\)、定数または表形式の質量不透明度を選び、電子数密度を熱伝導とレーザーへ、群ごとの係数とプランク重みを輻射輸送へ渡す。</p>
+    <p class="abstract">TENRYU の材料クロージャ（material closure）は、材料組成 \(A,Z\)、状態方程式（equation of state、EOS）、平均電離度（mean ionization）、不透明度（opacity）を同じセルの状態へ結び付ける。解析的な 2 温度（two-temperature）の理想気体と <a href="#terms-tmat">TMAT-H5</a> の表形式 EOS、固定または状態に依存する \(\bar Z\)、定数または表形式の質量不透明度（mass opacity）を選び、電子数密度を熱伝導とレーザーへ、群ごとの係数と<a href="#terms-planck">プランク分率（Planck fraction）</a>を輻射輸送（radiation transport）へ渡す。この計算に固有の用語は<a href="#terms">用語の節</a>で説明する。</p>
 
     <aside class="planned" aria-labelledby="at-a-glance">
       <h3 id="at-a-glance">要点</h3>
       <ul>
-        <li><code>ideal_gas</code> は解析的な 2 温度 EOS、<code>tmat</code> は \(P,e,c_v\) の表補間と \(T(\rho,e)\) の逆引きを提供する。</li>
+        <li><code>ideal_gas</code> は解析的な 2 温度 EOS、<code>tmat</code> は \(P,e,c_v\) の表補間と、\(T(\rho,e)\) を求める<a href="#terms-reclosure">逆写像（inverse map）</a>を提供する。</li>
         <li>\(n_e=\bar Z\rho/(A m_p)\) が、EOS と電離モデルを熱伝導・レーザーの物理へつなぐ中心的な量である。</li>
         <li>不透明度 \(\kappa\) は cm²/g の質量不透明度である。輸送で使う長さあたりの不透明度は \(\sigma=\rho\kappa\) [cm⁻¹] であり、両者を明確に区別する。</li>
-        <li><code>PlanckTable</code> は有限な群境界の上で \(b_g(T)\) を構築して規格化し、群の外へこぼれる裾と温度範囲外の参照も診断する。</li>
+        <li><code>PlanckTable</code> は有限な群境界の上でプランク分率 \(b_g(T)\) を構築して規格化し、群の外へこぼれる裾（<a href="#terms-planck">裾の欠損</a>）を診断する。温度範囲外の参照は端の値へ<a href="../overview/numerics-foundations.html#floors-safety">クランプ（clamp）</a>する。</li>
       </ul>
     </aside>
 
     <section aria-labelledby="mechanism">
       <h2 id="mechanism">物理機構</h2>
-      <p>各時間発展の演算子が進めるのは保存量であり、物理が必要とするそれ以外の量 — \(P\)、\(T\)、\(c_v\)、\(\bar Z\)、\(\kappa\) — は、セルの状態から材料クロージャによって再構成しなければならない。高エネルギー密度の物質は、ひとつのショットのなかでも冷たい固体から数 keV のプラズマまで巨大な範囲を横断し、不透明度も桁違いに変化する。したがって、解析式と表のどちらを使うかは、見通しのよさと忠実さのどちらを重視するかを材料ごとに決める選択になる。</p>
-      <p>解析的な基準となるのは、電子側とイオン側を独立に扱う 2 温度の理想気体だが、実在する標的材料には \(P\)、\(e\)、\(c_v\) の TMAT-H5 の表を使う（TMAT-H5 は TENRYU の表形式物質フォーマットとその HDF5 コンテナで、リポジトリの <code>docs/TMAT_H5_SPEC.md</code> が仕様書である）。流体側が閉じるのは温度ではなくエネルギーなので、逆写像 \(T(\rho,e)\) が中心的な役割を担う。再クロージャのたびに、密度を固定した区間でエネルギーの行を単調性を利用して二分探索し、\(\log T\) で補間する。デバイス側の経路は意図的にニュートン反復を使わない形にしてあり、頑健で決定論的、収束の分岐をもたず、表の端点で頭打ちにした事実も隠さずに可視化する。</p>
-      <p>電離度は、各物理を結ぶ結合の要である。平均電荷が \(n_e=\bar Z\rho/(A m_p)\) を定め、\(n_e\) は Spitzer の熱伝導、逆制動輻射の衝突率、電子側の EOS、輻射と物質の結合のすべてに入る。TENRYU は、固定の \(\bar Z=Z\)、Thomas–Fermi に対する More の近似式、または表形式の \(\bar Z(\rho,T_e)\) を選べる。動的なモデルは熱伝導と輻射の各演算子の入口で評価し直されるため、各演算子は開始時の状態と整合した電離度を見る。衝突率の重みは \(Z\) ではなく \(Z^2\) であり、電離段の分率が得られる場合は \(r_2=\langle Z^2\rangle/\bar Z^2\) によって、Spitzer と SNB（非局所電子熱伝導 — <a href="conduction.html#snb">伝導</a>参照）の電荷因子を \(Z_{\rm eff}=\bar Zr_2\) へ拡張する。</p>
-      <p>輸送が必要とするロスランド平均は、流束で重み付けした \(1/\kappa_\nu\) の平均（調和平均）である。輻射は全周波数チャネルを並列に流れるので、並列抵抗の合成と同じく最も通りやすい経路 — 透明なスペクトルの窓 — が全体を支配する。一方、放射と吸収が必要とするプランク平均は放射で重み付けした \(\kappa_\nu\) の線形平均であり、こちらは強い線スペクトルが支配する。混合セルの規則 <code>"harmonic_mass_R"</code> も同じ物理に従い、プランク不透明度は吸収体の足し合わせとして質量について線形に、ロスランド不透明度は透明な経路の足し合わせとして調和的に混合する。プランク重み \(b_g(T)\) は有限の群構造を閉じ、有限の境界と範囲外の参照を診断する。放射のブロックをもたない LTE（局所熱力学平衡）の表に対しては、警告を伴う \(\kappa^{PE}=\kappa^{PA}\) という代替が文書化されている。</p>
+      <p>各時間発展の演算子が進めるのは保存量であり、物理が必要とするそれ以外の量 — \(P\)、\(T\)、\(c_v\)、\(\bar Z\)、\(\kappa\) — は、セルの状態から材料クロージャによって再構成しなければならない。高エネルギー密度（high-energy-density、HED）の物質は、ひとつのショットのなかでも冷たい固体から数 keV のプラズマまで巨大な範囲を横断し、不透明度も桁違いに変化する。したがって、解析式と表のどちらを使うかは、見通しのよさと忠実さのどちらを重視するかを材料ごとに決める選択になる。</p>
+      <p>解析的な基準となるのは、電子側とイオン側を独立に扱う 2 温度の理想気体だが、実在する標的材料には \(P\)、\(e\)、\(c_v\) の TMAT-H5 の表を使う（TMAT-H5 は TENRYU の表形式物質フォーマットとその HDF5 コンテナで、リポジトリの <code>docs/TMAT_H5_SPEC.md</code> が仕様書である。<a href="#terms-tmat">用語</a>参照）。流体側が閉じるのは温度ではなくエネルギーなので、<a href="#terms-reclosure">逆写像</a> \(T(\rho,e)\) が中心的な役割を担う。<a href="../overview/numerics-foundations.html#operator-splitting">再クロージャ（re-closure）</a>のたびに、密度を固定した区間でエネルギーの行を単調性を利用して二分探索（binary search）し、\(\log T\) で補間する。GPU 上の経路は意図的にニュートン反復（Newton iteration）を使わない形にしてあり、頑健で決定論的、収束の分岐をもたない。表の最低温度より低いエネルギーは端の温度へクランプし、最高温度より高いエネルギーは、1D の既定の閉じ方ではクランプせず理想気体の延長で閉じる（<a href="#eos-models">理想気体 EOS と TMAT の表形式 EOS</a>参照）。</p>
+      <p>平均電離度は、各物理を結ぶ結合の要である。平均電離度 \(\bar Z\) が \(n_e=\bar Z\rho/(A m_p)\) を定め、\(n_e\) は Spitzer の熱伝導（Spitzer conduction）、逆制動輻射（inverse bremsstrahlung、IB）の衝突率、電子側の EOS、輻射と物質の結合のすべてに入る。TENRYU は、固定の \(\bar Z=Z\)、Thomas–Fermi モデル（Thomas–Fermi model）に対する More の近似式、または表形式の \(\bar Z(\rho,T_e)\) を選べる。動的なモデルは熱伝導と輻射の各演算子の入口で評価し直されるため、各演算子は開始時の状態と整合した電離度を見る。衝突率の重みは \(Z\) ではなく \(Z^2\) であり、電離段の分率が得られる場合は \(r_2=\langle Z^2\rangle/\bar Z^2\) によって、Spitzer と SNB（Schurtz–Nicolaï–Busquet の非局所（nonlocal）電子熱伝導 — <a href="conduction.html#snb">伝導</a>参照）の電荷因子を、衝突に効く有効電荷（<a href="#terms-zeff">\(Z_{\rm eff}=\bar Zr_2\)</a>）へ拡張する。</p>
+      <p>輸送が必要とするロスランド平均（Rosseland mean）は、流束で重み付けした \(1/\kappa_\nu\) の平均（調和平均、harmonic mean）である。輻射は全周波数チャネルを並列に流れるので、並列抵抗の合成と同じく最も通りやすい経路 — 透明なスペクトルの窓（spectral window）— が全体を支配する。一方、放出と吸収が必要とするプランク平均（Planck mean）は放出で重み付けした \(\kappa_\nu\) の線形平均であり、こちらは強いスペクトル線（spectral line）が支配する。<a href="#terms-mixed">混合セル（mixed cell）</a>の規則 <code>"harmonic_mass_R"</code> も同じ物理に従い、プランク不透明度は吸収体の足し合わせとして質量について線形に、ロスランド不透明度は透明な経路の足し合わせとして調和的に混合する。プランク分率 \(b_g(T)\) は、有限の群構造（group structure）の上で総和を 1 に閉じ、群の外へこぼれる裾を欠損として診断する（<a href="#terms-planck">群、プランク分率、裾の欠損</a>）。放出不透明度のブロックをもたない IONMIX（衝突輻射コード Ionmix の <code>.cn4</code> 形式の物質表）の表は、LTE（local thermodynamic equilibrium、局所熱力学平衡）の表とみなし、警告を出して \(\kappa^{PE}=\kappa^{PA}\) とする。</p>
     </section>
 
     <section aria-labelledby="closure-flow">
       <h2 id="closure-flow">材料から輸送係数まで</h2>
-      <p><code>Material.A</code> はイオン 1 個あたりの平均質量 [amu]、<code>Material.Z</code> は平均原子番号または代表値である。単一材料では \(n_i=\rho/(A m_p)\)、\(n_e=\bar Z n_i\) となる。ここで \(m_p=1.6726\times10^{-24}\) g は陽子質量である。TENRYU は原子質量単位を意図的に \(m_p\) と同一視する — 凍結した定数セットの固定規約であり、真の amu との約 0.73% のずれは材料の実効 \(A\) に吸収される。化合物の \(A\) は分子量ではなく、数分率で平均したイオン質量である。たとえば原子数が等しい CH は 6.5、CD は 7 になる。この規約により、EOS と不透明度の表の密度軸、および下流の衝突係数が、同じ粒子数密度に対応する。</p>
-      <p>EOS が圧力・温度・比熱を閉じ、電離モデルが \(\bar Z\) を与える。そこから得られる \(n_e\) が、電子熱伝導とレーザーの逆制動輻射吸収に使われる。もう一方の枝である不透明度は、温度に依存するプランクの群重みと組み合わされ、FLD または \(S_N\) の輻射輸送で使う群ごとの係数になる。この分離により、同じ材料の状態を共有しながら、EOS、衝突輸送、輻射係数を個別に検証できる。</p>
+      <p><code>Material.A</code> はイオン 1 個あたりの平均質量 [amu]、<code>Material.Z</code> は平均原子番号または代表値である。単一材料では \(n_i=\rho/(A m_p)\)、\(n_e=\bar Z n_i\) となる。ここで \(m_p=1.6726\times10^{-24}\) g は陽子質量である。TENRYU は原子質量単位（atomic mass unit、amu）を意図的に \(m_p\) と同一視する。これは物理定数の組を固定する取り決めであり、真の amu との約 0.73% のずれは材料の実効 \(A\) に吸収される。化合物の \(A\) は分子量ではなく、数分率（number fraction）で平均したイオン質量である。たとえば原子数が等しい CH は 6.5、CD は 7 になる。この規約により、EOS と不透明度の表の密度軸、および下流の衝突係数が、同じ粒子数密度に対応する。</p>
+      <p>EOS が圧力・温度・比熱を閉じ、電離モデルが \(\bar Z\) を与える（<a href="#fig-eos-opacity-flow">図A</a>）。そこから得られる \(n_e\) が、電子熱伝導とレーザーの逆制動輻射吸収に使われる。もう一方の枝である不透明度は、温度に依存するプランク分率と組み合わされ、<a href="radiation/fld.html">流束制限拡散（flux-limited diffusion、FLD）</a>または<a href="radiation/sn.html">離散座標法（discrete ordinates method、\(S_N\)）</a>の輻射輸送で使う群ごとの係数になる。この分離により、同じ材料の状態を共有しながら、EOS、衝突輸送、輻射係数を個別に検証できる。</p>
       <ul>
         <li>\(A\) — 数分率で平均したイオン質量で、CH は 6.5、CD は 7 である。この密度軸の規約により、EOS、不透明度、粒子数密度が一貫する。</li>
         <li>\(n_e=\bar Z\rho/(A m_p)\) — 組成と電離度から、衝突輸送と結合係数へ渡される電子数密度である。</li>
         <li>\(\kappa\) と \(\sigma=\rho\kappa\) — 質量不透明度は cm²/g で保持し、輸送では別の量である長さあたりの不透明度 cm⁻¹ を使う。</li>
-        <li><code>cv_e_override</code> — 単位が erg/(cm³·eV) の体積比熱である。同じ定数を Fleck 係数（輻射の放出・吸収を陰的に結合する線形化の係数 — <a href="radiation/fld.html">FLD</a>参照）にも渡す検証用の規約であり、材料を合わせ込むための調整つまみではない。</li>
-        <li>\(r_2=\langle Z^2\rangle/\bar Z^2\) — 衝突用の \(Z_{\rm eff}=\bar Zr_2\) を作る前に、1〜10 の範囲へ制限する。この制限は物理ではなく数値的なガードである：\(r_2\ge1\) は分散比なので構成上成り立ち、上限 10 は退化・破損した分率表に対して補正を抑える。</li>
-        <li>\(10^{-20}\) cm²/g — <code>"harmonic_mass_R"</code> のロスランド調和平均で 0 除算が起きないよう、混合の前に各成分へ適用する下限である。あらゆる物理的不透明度より何桁も小さく、成分が厳密に 0 のときに調和結合を有限に保つためだけに存在する。</li>
+        <li><code>cv_e_override</code> — 単位が erg/(cm³·eV) の体積比熱である。同じ定数を Fleck 係数（Fleck factor。輻射の放出・吸収を陰的に結合する線形化の係数 — <a href="radiation/fld.html">FLD</a>参照）にも渡す検証用の規約であり、材料を合わせ込むための調整つまみではない。</li>
+        <li>\(r_2=\langle Z^2\rangle/\bar Z^2\) — 衝突用の \(Z_{\rm eff}=\bar Zr_2\)（<a href="#terms-zeff">用語</a>）を作る前に、1〜10 の範囲へクランプする。このクランプは物理ではなく数値安全策（numerical safeguard）である：\(r_2\ge1\) は分散比なので構成上成り立ち、上限 10 は退化・破損した分率表に対して補正を抑える。</li>
+        <li>\(10^{-20}\) cm²/g — <code>"harmonic_mass_R"</code> のロスランド調和平均で 0 除算が起きないよう、混合の前に各成分へ課す床（floor。<a href="../overview/numerics-foundations.html#floors-safety">床・クランプ・数値安全策</a>参照）である。あらゆる物理的不透明度より何桁も小さく、成分が厳密に 0 のときに調和結合を有限に保つためだけに存在する。</li>
       </ul>
 
-      <figure>
-        <img src="../../assets/eos-opacity-flow.png" width="960" height="480" style="max-width:100%;height:auto" alt="材料の A と Z から EOS、電離、不透明度を経て熱伝導、レーザー、輻射へ至るデータの流れ">
-        <figcaption>図A. 材料クロージャにおけるデータの流れ。状態に依存する電離は EOS が閉じた \(\rho,T_e\) を読み、不透明度と PlanckTable が群ごとの輻射係数を構成する。</figcaption>
+      <figure id="fig-eos-opacity-flow">
+        <img src="../../assets/eos-opacity-flow-ja.png" width="960" height="560" style="max-width:100%;height:auto" alt="材料データとセルの状態から EOS の再クロージャで温度・圧力・比熱を閉じ、電離度、電子数密度、衝突に効く有効電荷を経て、熱伝導・レーザー吸収・電子の EOS へ渡す流れと、不透明度とプランク分率から群ごとの係数を作って輻射輸送へ渡す流れ。下端の破線の枠はボイド材料の扱い">
+        <figcaption>図A. 材料クロージャにおけるデータの流れ。実線の箱は処理または量、矢印はデータの向き、色は役割（灰：入力、青：EOS・電離・電子数密度、黄：不透明度と群の係数、緑：結合先の物理）、破線の箱は材料の例外（ボイド）である。EOS が閉じた \(\rho,T_e\) を電離と不透明度が読み、不透明度とプランク分率が群ごとの輻射の係数を作る。表の最高温度を超えるエネルギーは、1D の既定の閉じ方では最上行につないだ理想気体の延長で閉じ、legacy と 2D RZ では最高温度でクランプする。計算した図ではなく、本文の記述の模式図である。</figcaption>
       </figure>
+    </section>
+
+    <section aria-labelledby="terms">
+      <h2 id="terms">この計算で使う用語</h2>
+      <p>材料クロージャは、保存量からセルごとの圧力・温度・電離度・不透明度を作り直す。その過程にある再クロージャの手順、材料の表の形式、群と温度の格子、混合セルの扱い、衝突に効く電荷は、TENRYU の実装に固有の意味で使うので、ここにまとめて定義する。</p>
+
+      <h3 id="terms-reclosure">再クロージャと逆写像</h3>
+      <p><strong>再クロージャ（re-closure）</strong>は、演算子が状態を変えたあとに、\((\rho,e)\) から EOS で温度 \(T\)、圧力 \(P\)、比熱 \(c_v\) を求め直すことである。クロージャ（closure）は、保存量からこれらを決める関係で、この頁では EOS・平均電離度・不透明度を合わせて材料クロージャと呼ぶ（<a href="../overview/numerics-foundations.html#operator-splitting">演算子分割と再クロージャの規律</a>）。流体が時間発展させるのは温度ではなくエネルギーなので、熱伝導・輻射・レーザーが読む \(T\)、\(P\)、\(c_v\) は、エネルギーが変わるたびに作り直す必要がある。この頁の手順では、流体の各半ステップのあとに、逆写像で \(T\) を復元し、順方向の参照で \(P\) と \(c_v\) を評価する（<a href="#pipeline">クロージャを呼ぶ場所と順序</a>）。</p>
+      <p><strong>逆写像（inverse map）</strong>は、密度 \(\rho\) とエネルギー \(e\) から温度 \(T(\rho,e)\) を求める操作で、再クロージャの最初の段である。表形式の EOS では、\(e(\rho,T)\) の表を温度について逆に引く。密度の区間（density bracket。コードの名前は <code>RhoBracket</code>）は、表の密度の格子で、参照する密度をはさむ隣り合う 2 点の添字と補間の重みの組である。GPU 上の経路は、この区間の上でエネルギーの行を、エネルギーが温度とともに増えることを利用して二分探索し、温度の添字を決めたうえで、隣り合う添字のあいだを \(\log T\) で補間する。ニュートン反復を使わないので、結果は決定論的で、収束の判定に伴う分岐がない。同じ密度の区間を、そのあとの \(P\)、\(e\)、\(c_v\) の順方向の参照が共有する。</p>
+      <p>表の端の外のエネルギーの扱いは閉じ方で決まる。<code>Numerics.hydro.eos_closure_mode</code> の既定は <code>"energy_authoritative"</code>（1D。進化させたエネルギーを正とし、書き換えない）で、<code>"legacy"</code> と 2D RZ の閉じ方は表の端へクランプする。Studio はこのキーを書き出さないので、Studio のデッキもパーサーの既定を使う（詳細は<a href="#eos-models">理想気体 EOS と TMAT の表形式 EOS</a>）。逆写像の結果は、保存するエネルギーと、熱伝導・輻射が読む温度の整合に効く。</p>
+
+      <h3 id="terms-tmat">TMAT-H5</h3>
+      <p><strong>TMAT-H5</strong>は、TENRYU の物質表の HDF5 形式（ファイル拡張子 <code>.tmat.h5</code>）である。仕様書はリポジトリの <code>docs/TMAT_H5_SPEC.md</code> にある。1 つのファイルが 1 つの材料を表し、単位は cgs + eV に固定で、実行時に単位を換算しない。IONMIX（Fortran の非整形バイナリ）や SESAME（ASCII）の表を、単位・組成・来歴を自分で記述する 1 つの形式に置き換えるために作られ、EOS の表と不透明度の表を別々の格子に置け、片方だけのファイルも読める。</p>
+      <p>ファイルは次の塊から成る。材料の組成（<code>/material</code>。元素ごとの原子番号 \(Z\)、質量 \(A\)、質量分率）。EOS の表（<code>/eos</code>）は、イオン数密度 \(n_i\) [cm⁻³] と温度 \(T\) [eV] の格子の上で、平均電離度 \(\bar Z\)、イオンと電子の圧力 \(P_i\)、\(P_e\) [dyne/cm²]、比エネルギー \(e_i\)、\(e_e\) [erg/g] を与え、比熱 \(c_{v,i}\)、\(c_{v,e}\) [erg/(g·eV)] は任意である。不透明度の表（<code>/opacity</code>）は、群・イオン数密度・温度の 3 軸の上で、ロスランド平均 \(\kappa_R\)、プランク吸収 \(\kappa^{PA}\)、プランク放出 \(\kappa^{PE}\) [cm²/g] を与え、<code>@is_lte</code> が 1 なら LTE の表である。電離段の分率（<code>/ionization</code>）は任意である。</p>
+      <p>密度軸がイオン数密度なので、実行時に \(\rho=n_iAm_p\) で質量密度へ変換する。材料ごとに <code>eos.model="tmat"</code> と <code>opacity.model="tmat"</code> で選ぶ（<a href="#controls">namelist による制御</a>）。EOS の表からは、イオンと電子の和として全物質の表も作る。電離段の分率は、衝突に効く有効電荷の表に使う（<a href="#terms-zeff">用語</a>）。</p>
+
+      <h3 id="terms-planck">群、プランク分率、裾の欠損</h3>
+      <p><strong>群（group）</strong>は、輻射輸送が光子のエネルギーを分ける区間 \([E_{g-1},E_g)\) で、\(g=1,\dots,G\) と数える。境界 \(E_0&lt;E_1&lt;\dots&lt;E_G\) [eV] は <code>Radiation.group_bounds_eV</code>（数値のリスト、または <code>"log_uniform"</code>）で、群の数 \(G\) は <code>Radiation.groups</code>（既定 1）で与える。群が 1 つならグレイ（gray）の計算になる。不透明度の係数も輻射のエネルギーも、群ごとに決まり、群ごとに輸送される。</p>
+      <p><strong>プランク分率（Planck fraction）</strong> \(b_g(T)\) は、温度 \(T\) の黒体スペクトルのうち、群 \(g\) に入る割合である（式は<a href="#planck-table">PlanckTable と群の被覆に関する診断</a>）。輻射の放出の源を群へ配る重みとして使い、群についての和が 1 になるように規格化する。初期化のとき、温度の格子（<code>planck_fraction.compute_N_T</code> 点。既定 200。温度の範囲を対数等間隔に刻む）の上で計算して表にする（<code>PlanckTable</code>）。温度の範囲は <code>Radiation.compute_T_range_eV</code> で与える。省略すると、有効な材料の電子 EOS の表の範囲、次に不透明度の表の範囲、最後に [0.01, 1000] eV の順で導く。輻射を有効にした Studio のデッキは <code>compute_T_range_eV</code> を必ず書き出す（既定の群境界 [0.1, \(10^5\)] eV では [0.1, \(10^5\)] eV）。</p>
+      <p><strong>裾の欠損（tail deficit）</strong> \(\delta(T)=1-\sum_g b_g^{raw}(T)\) は、群の全範囲 \([E_0,E_G]\) の外にこぼれる黒体スペクトルの割合である。\(b_g^{raw}\) は規格化する前の \(b_g\) である。光子エネルギーの範囲が有限なので、\(b_g^{raw}\) の和は 1 未満になり得る。規格化は欠けたスペクトルを復元せず、外にこぼれた分を群の中へ配り直すだけなので、群の範囲が狭いと、輻射の放出が実際より群の範囲に偏る。そこで初期化のとき、温度の格子の全体で \(\delta(T)\) の最大値を調べて記録する。\(\delta\) が \(10^{-3}\) を超える温度が表のすべての温度に及ぶときは警告し、そうでないときは、\(\delta\le10^{-3}\) となる温度の範囲と最大値を情報として記録する。群が 1 つのときは \(b_1=1\) で、欠損は調べない。</p>
+
+      <h3 id="terms-mixed">混合セル、支配材料、部分密度</h3>
+      <p><strong>混合セル（mixed cell）</strong>は、2 つ以上の材料が体積を分け合うセルである。材料 \(m\) の体積分率 \(f_m\)（<code>Geometry.volfrac</code> を正規化した値で、総和は 1）は、セルの体積のうち材料 \(m\) が占める割合を表す。ボイド（<a href="#void-materials">定義</a>）は真空でイオンをもたないので、材料の平均には入れず、ボイドでない材料の体積分率の和で割り直す。ボイドでない材料のうち 1 つだけが体積分率をもつセルを、純セル（pure cell）と呼ぶ。</p>
+      <p><strong>支配材料（dominant material）</strong>は、セルのなかで体積分率が最大の、ボイドでない材料である。体積分率が等しいときは番号の小さい材料、ボイドでない材料の体積分率が正でないセルでは先頭のボイドでない材料とする。純セルでは、支配材料が不透明度の表を選ぶ。支配材料が NLTE（non-LTE）の表の材料であるセルは、混合セルでも、その材料の NLTE の計算が支配材料の表だけで埋める（支配材料近似）。</p>
+      <p><strong>部分密度（partial density）</strong>は、材料 \(m\) の質量をその材料が占める体積で割った、材料 \(m\) 自身の密度 \(\rho_m=\rho\,w_m/f_m\) である。\(w_m\) は質量分率（材料ごとの質量を追跡しないときは体積分率）。材料の表は密度の関数なので、混合セルでは、それぞれの表を、セルの密度ではなくその材料の部分密度で引く。\(f_m\le10^{-12}\) の材料は、部分密度をセルの密度とする（0 除算を避けるため）。既定の線形の規則 <code>Materials.opacity_mix_rule="linear_mass"</code>（Studio はこのキーを書き出さない）では、混合セルの長さ不透明度は \(\sigma=\rho\sum_mw_m\kappa_m(\rho_m,T_e)\) になる（<a href="#opacity">不透明度と材料の混合</a>）。</p>
+
+      <h3 id="terms-zeff">衝突に効く有効電荷と混合セルの平均</h3>
+      <p><strong>衝突に効く有効電荷（collisional effective charge）</strong> \(Z_{\rm eff}\) は、イオンの電荷の 2 乗平均を平均で割った \(Z_{\rm eff}=\langle Z^2\rangle/\langle Z\rangle\) である。\(\langle Z\rangle=\bar Z\)、\(r_2=\langle Z^2\rangle/\bar Z^2\) と置くと、\(Z_{\rm eff}=\bar Zr_2\) と書ける。電子とイオンの衝突率は \(Z\) ではなく \(Z^2\) に比例して効くので、同じ \(\bar Z\) でも、電荷の異なるイオンが混ざるほど衝突が強い。\(r_2\) は分散比なので \(r_2\ge1\) が構成上成り立ち、TENRYU は 1〜10 にクランプする。たとえば完全電離した CD（炭素と水素が 1:1）では、\(\bar Z=3.5\) に対し \(Z_{\rm eff}=(36+1)/(6+1)\approx5.29\)、\(r_2\approx1.51\) である。</p>
+      <p>\(Z_{\rm eff}\) の使い道は 2 つある。熱伝導では、TMAT に電離段の分率があるとき、Spitzer 熱伝導と SNB の電荷因子を \(Z_{\rm eff}\) に置き換える（<code>1D_SPH</code> 専用）。レーザーの逆制動輻射では、吸収係数の電荷への依存を \(\bar Z\) ではなく \(Z_{\rm eff}=\bar Zr_2\) で与え、\(r_2\) の求め方を <code>Laser.ib.zeff_model</code> が選ぶ。値は <code>auto</code>（既定。Studio はこのキーを書き出さない）、<code>off</code>（\(r_2=1\)）、<code>table</code>（TMAT の電離段の分率から作った表）、<code>sequential_strip</code>（後述）である。</p>
+      <p><strong>混合セルの平均 \(\bar Z_{\rm eff}\)・\(A_{\rm eff}\)（mixture averages）</strong>は、混合セルで、材料ごとの値を混ぜてセルの代表値にする平均である。名前が似ているが、上の \(Z_{\rm eff}\) とは別の量である。\(A_{\rm eff}\) は体積分率で重み付けした調和平均で、\(1/A_{\rm eff}=\sum_mf_m/A_m\) である。\(\bar Z_{\rm eff}\) は、材料ごとの平均電離度 \(\bar Z_m\) を、イオンの数 \(f_m/A_m\) で重み付けした平均 \(\bar Z_{\rm eff}=\sum_m(f_m/A_m)\bar Z_m\big/\sum_m(f_m/A_m)\) である。和は、ボイドでない材料にだけ取り、その体積分率の和で割り直す。この重みにより、\(n_e=\rho\bar Z_{\rm eff}/(A_{\rm eff}m_p)\) は、各材料の \(f_m\rho\bar Z_m/(A_mm_p)\) の和に等しくなる。熱伝導の係数と、電子とイオンのエネルギー交換は、この \(n_e\) と \(A_{\rm eff}\) をセルの値として読む。</p>
+
+      <h3 id="terms-strip">逐次剥離</h3>
+      <p><strong>逐次剥離（sequential stripping）</strong>は、複数の元素から成るプラズマで、平均電離度 \(\bar Z\)（原子 1 個あたりの自由電子数の平均）を、元素ごとの電荷 \(z_s\) へ配る近似である。原子番号の小さい元素から順に、電子を使い切るまで完全電離させ、残った電子を次の元素へ回す。元素 \(s\) の数分率を \(x_s\)、原子番号を \(Z_s\)（小さい順）として、残りの電子数を \(R\)（初めは \(\bar Z\)）とおき、\(z_s=\min(Z_s,\,R/x_s)\)、\(R\leftarrow R-x_sz_s\) を順に適用する。完全電離の極限で厳密になる。</p>
+      <p>得られた \(z_s\) から \(Z_{\rm eff}=\sum_sx_sz_s^2\big/\sum_sx_sz_s\) を作り、比 \(r_2=Z_{\rm eff}/\bar Z\) を 1〜10 にクランプして、\(Z_{\rm eff}=\bar Zr_2\) をレーザーの逆制動輻射の吸収係数に使う。元素は <code>Laser.ib.species=[[Z, x], …]</code> で与える。元素は 4 つまでで、1 つだけなら \(r_2=1\) である。原子番号は狭義に増加し、\(x_s>0\) で、総和は [0.99, 1.01] に入らなければならない。<code>Laser.ib.zeff_model="sequential_strip"</code> には <code>species</code> が必須である。<code>auto</code> では、<code>species</code> の指定があるとき、または 1D 球対称でボイドでない材料のすべてが共通の多種組成をもつときに、この近似を選ぶ（<a href="#ionization">平均電離度と衝突に効く有効電荷</a>）。</p>
     </section>
 
     <section aria-labelledby="eos-models">
       <h2 id="eos-models">理想気体 EOS と TMAT の表形式 EOS</h2>
-      <p><code>eos.model="ideal_gas"</code> は、電子とイオンを独立に閉じる解析的な 2 温度 EOS である。既定の単原子気体では \(\gamma=5/3\) とし、イオンは \(P_i=\rho k_BT_i/(A m_p)\)、電子は \(P_e=\bar Z\rho k_BT_e/(A m_p)\) に従う（\(k_B\) は cgs + eV 単位系の常として <code>eV_to_erg</code> である）。これら温度側の枝が一次的なクロージャで、設定した <code>ideal_gas.gamma</code> による圧力–エネルギーの形 \(P=(\gamma-1)\rho e\) は同じ理想気体の等価な表現である — 枝ごとに、イオンは \(e_i=k_BT_i/[(\gamma-1)Am_p]\)、電子は \(e_e=\bar Z\,k_BT_e/[(\gamma-1)Am_p]\) が成り立つため両形式は構成上整合し、発展したエネルギーから閉じ直すときに後者を使う。温度に依存する \(\bar Z\) を選ぶと、電子の比熱に \(T_e\,d\bar Z/dT_e\) の寄与を入れることでこの整合が保たれる。</p>
-      <p><code>cv_e_override</code> は、解析解が一定の電子体積比熱を要求する Marshak 波や Su–Olson 型の検証のためのものである。単位は erg/(cm³·eV) であり、通常の EOS の表が返す質量あたりの比熱 \(c_v\) [erg/(g·eV)] とは \(\rho\) 倍だけ異なる。指定すると、電子の \(C_{v,e}\) を一定値に置き換え、輻射側の Fleck 係数も同じ値を読む。一般の物質モデルを合わせ込むための自由パラメータではなく、\(C_v\) 一定という検証条件を表すためのキーである。</p>
-      <p><code>eos.model="tmat"</code> は、TMAT-H5 のイオン・電子・全物質の表から \(P(\rho,T)\)、\(e(\rho,T)\)、\(c_v(\rho,T)\) を構築する。TMAT の主たる密度軸である \(n_i\) は \(\rho=n_i A m_p\) で質量密度へ変換し、実行時は \((\log\rho,\log T)\) の面上で双線形に補間する。範囲外の参照は表の端で頭打ちにし、正でない \(c_v\) には安全のための下限と警告を適用する。</p>
-      <p>流体が更新した \(e\) から温度を閉じ直す逆引きは、ニュートン反復ではない。密度を固定した区間の上でエネルギーの行を単調性を利用して二分探索し、隣り合う温度の添字のあいだを \(\log T\) で補間して \(T(\rho,e)\) を返す。同じ <code>RhoBracket</code> を逆写像と、その後の \(P,e,c_v\) の順方向参照が共有するため、ひとつの密度位置で往復のクロージャを構成できる。目標とするエネルギーが表の範囲外なら、端の温度で頭打ちにする。ただし低温平衡構成則（<code>Numerics.hydro.T_start_inactive_cells="cold_equilibrium"</code>）の逆引きは例外で、補正が消えていく温度範囲では解を区間で挟んだニュートン法を使う。</p>
+      <p><code>eos.model="ideal_gas"</code> は、電子とイオンを独立に閉じる解析的な 2 温度 EOS である。既定の単原子気体では \(\gamma=5/3\) とし、イオンは \(P_i=\rho k_BT_i/(A m_p)\)、電子は \(P_e=\bar Z\rho k_BT_e/(A m_p)\) に従う（\(k_B\) は cgs + eV 単位系の常として <code>eV_to_erg</code> である）。これら温度側の枝が一次的なクロージャで、設定した <code>ideal_gas.gamma</code> による圧力–エネルギーの形 \(P=(\gamma-1)\rho e\) は同じ理想気体の等価な表現である — 枝ごとに、イオンは \(e_i=k_BT_i/[(\gamma-1)Am_p]\)、電子は \(e_e=\bar Z\,k_BT_e/[(\gamma-1)Am_p]\) が成り立つため、\(\bar Z\) が一定のとき両形式は構成上整合し、発展したエネルギーから閉じ直すときに後者を使う。温度に依存する \(\bar Z\) を選んだ場合も、電子の比熱は、その時点の \(\bar Z\) を使う \(\bar Z k_B/[(\gamma-1)Am_p]\) のままで、\(T_e\,d\bar Z/dT_e\) の寄与は含まない（既知の制限である）。</p>
+      <p><code>cv_e_override</code> は、解析解が一定の電子体積比熱を要求する Marshak 波（Marshak wave）や Su–Olson 問題（Su–Olson problem）の検証のためのものである。単位は erg/(cm³·eV) であり、通常の EOS の表が返す質量あたりの比熱 \(c_v\) [erg/(g·eV)] とは \(\rho\) 倍だけ異なる。指定すると、電子の \(C_{v,e}\) を一定値に置き換え、輻射側の Fleck 係数も同じ値を読む。一般の物質モデルを合わせ込むための自由パラメータではなく、\(C_v\) 一定という検証条件を表すためのキーである。</p>
+      <p><code>eos.model="tmat"</code> は、TMAT-H5 のイオン・電子・全物質（イオンと電子の和）の表から \(P(\rho,T)\)、\(e(\rho,T)\)、\(c_v(\rho,T)\) を構築する。TMAT の主たる密度軸であるイオン数密度（ion number density）\(n_i\) は \(\rho=n_i A m_p\) で質量密度へ変換し、実行時は \((\log\rho,\log T)\) の面上で双線形補間（bilinear interpolation）する。範囲外の参照は表の端へクランプする。温度の上端の扱いは次の段落に書く。正でない \(c_v\) には床を課し、表を作るときに 1 回だけ警告する。</p>
+      <p>流体が更新した \(e\) から温度を閉じ直す<a href="#terms-reclosure">逆写像</a>は、ニュートン反復ではない。密度を固定した区間の上でエネルギーの行を単調性を利用して二分探索し、隣り合う温度の添字のあいだを \(\log T\) で補間して \(T(\rho,e)\) を返す。同じ <code>RhoBracket</code> を逆写像と、その後の \(P,e,c_v\) の順方向参照が共有するため、ひとつの密度位置で往復のクロージャを構成できる。目標とするエネルギーが表の最低温度での値を下回るときは、端の温度へクランプする。最高温度 \(T_{top}\) での値 \(e_{top}\) を上回るときは、閉じ方によって扱いが違う。1D の既定の閉じ方（<code>Numerics.hydro.eos_closure_mode="energy_authoritative"</code>。進化させたエネルギーを正とする閉じ方）は、クランプせず、\(T_{top}\) の行につなげた理想気体の延長で閉じる。すなわち \(e=e_{top}+c_{v,top}(T-T_{top})\)、\(P=P_{top}T/T_{top}\)、\(c_v=c_{v,top}\) とし（添字 top は \(T_{top}\) での表の値）、進化させたエネルギーは書き換えない。<code>"legacy"</code> の閉じ方と 2D RZ の閉じ方は \(T_{top}\) でクランプし、<code>"legacy"</code> では超過分のエネルギーが表の値に置き換わって失われる。ただし低温平衡構成則（<code>Numerics.hydro.T_start_inactive_cells="cold_equilibrium"</code>）の逆写像は例外で、補正が消えていく温度範囲では解を区間で挟んだニュートン法（bracketed Newton method）を使う。</p>
     </section>
 
     <section aria-labelledby="ionization">
       <h2 id="ionization">平均電離度と衝突に効く有効電荷</h2>
-      <p><code>Materials.zbar.model</code> の既定である <code>fixed</code> は \(\bar Z=Z\) とし、完全電離を仮定する。状態に依存する選択肢は、Thomas–Fermi 電離度に対する More の近似式（Adv. At. Mol. Phys. 21, 305 (1985) の Table IV。相似変数 \(\rho/(ZA)\) と \(T_e/Z^{4/3}\) で表す）を用いる <code>thomas_fermi</code> と、\(\bar Z(\rho,T_e)\) を補間する <code>tabular</code> である。動的なモデルは流体の各半ステップと熱伝導・輻射の各演算子の入口（1D ではレーザー演算子の前も）で、その時点の \((\rho,T_e)\) から評価し直される。したがって、流体による圧縮後の電離は熱伝導へ、熱伝導後の温度変化は輻射のクロージャへ反映される。</p>
-      <p>TMAT のファイルが任意項目である <code>/ionization</code> ブロックに元素ごとの電離段の分率をもつ場合、単一の \(\bar Z\) だけでは失われてしまう衝突電荷のモーメントも利用できる。分率から \(r_2=\langle Z^2\rangle/\bar Z^2\) を作り、1〜10 に制限したうえで、Spitzer 熱伝導と SNB の電荷因子を \(\bar Z r_2=Z_{\rm eff}\) に置き換える。表がなければ、この補正は働かない。表からモーメントを取るこの経路は <code>1D_SPH</code> に限られる。材料が複数あるデッキでは各セルがその材料の分率表を使い、表のない材料のセルには補正がかからない。</p>
-      <p>ここで、材料側の <code>zbar.model</code> と、レーザーの逆制動輻射吸収に使う <code>Laser.ib.zeff_model</code> は別々の選択である。後者の既定である <code>auto</code> は構築時に解決される。TMAT の電離表があれば <code>table</code> になる。表がなく 1D 球対称であれば、<code>Laser.ib.species</code> の指定があるか、ボイドでない材料すべてが共通の多種組成（TMAT の組成。CD なら C と H）をもつ場合に、それを種のリストとする <code>sequential_strip</code> になる。それ以外は <code>off</code> になる（1D 球対称で混合物なら警告）。ボイドでない材料が 2 つ以上ある 1D 球対称のデッキでは、<code>auto</code> を材料ごとに解決する。その材料の電離表があれば <code>table</code>、種の指定か 2〜4 種の TMAT 組成があれば <code>sequential_strip</code>、それ以外は <code>off</code> である。したがって「固定の \(\bar Z\)」と「自動の \(Z_{\rm eff}\)」は競合する同じキーではなく、電子数密度と、多種イオンによる衝突補正をそれぞれ制御する。</p>
+      <p><code>Materials.zbar.model</code> の既定である <code>fixed</code> は、<code>Materials.zbar.fixed_value</code>（既定は未指定）を与えなければ \(\bar Z=Z\) とし、完全電離（full ionization）を仮定する。0 以上の <code>fixed_value</code> を与えると、その値をボイドでないすべてのセルの \(\bar Z\) にする。状態に依存する選択肢は、Thomas–Fermi 電離度に対する More の近似式（文献 [2] の Table IV。相似変数（similarity variable）\(\rho/(ZA)\) と \(T_e/Z^{4/3}\) で表す。QEOS（quotidian equation of state）[1] の Thomas–Fermi の相似則と同じ変数である）を用いる <code>thomas_fermi</code> と、\(\bar Z(\rho,T_e)\) を補間する <code>tabular</code> である。動的なモデルは流体の各半ステップと熱伝導・輻射の各演算子の入口（1D ではレーザー演算子の前も）で、その時点の \((\rho,T_e)\) から評価し直される。したがって、流体による圧縮後の電離は熱伝導へ、熱伝導後の温度変化は輻射のクロージャへ反映される。</p>
+      <p>TMAT のファイルが任意項目である <code>/ionization</code> ブロックに元素ごとの電離段（charge state）の分率をもつ場合、単一の \(\bar Z\) だけでは失われてしまう衝突電荷のモーメントも利用できる。分率から \(r_2=\langle Z^2\rangle/\bar Z^2\) を作り、1〜10 にクランプしたうえで、Spitzer 熱伝導と SNB の電荷因子を <a href="#terms-zeff">\(\bar Z r_2=Z_{\rm eff}\)</a> に置き換える。表がなければ、この補正は働かない。表からモーメントを取るこの経路は <code>1D_SPH</code> に限られる。材料が複数ある<a href="../use/namelist.html#terms-deck">デッキ（deck）</a>では各セルがその材料の分率表を使い、表のない材料のセルには補正がかからない。</p>
+      <p>ここで、材料側の <code>zbar.model</code> と、レーザーの逆制動輻射吸収に使う <code>Laser.ib.zeff_model</code> は別々の選択である。後者の既定である <code>auto</code> は構築時に解決される。TMAT の電離表があれば <code>table</code> になる。表がなく 1D 球対称であれば、<code>Laser.ib.species</code> の指定があるか、ボイド（void。<a href="#void-materials">定義</a>）でない材料すべてが共通の多種組成（TMAT の組成。CD なら C と H）をもつ場合に、それを種のリストとする <a href="#terms-strip"><code>sequential_strip</code>（逐次剥離）</a>になる。それ以外は <code>off</code> になる（1D 球対称で混合物なら警告）。ボイドでない材料が 2 つ以上ある 1D 球対称のデッキでは、<code>auto</code> を材料ごとに解決する。その材料の電離表があれば <code>table</code>、種の指定か 2〜4 種の TMAT 組成があれば <code>sequential_strip</code>、それ以外は <code>off</code> である。したがって「固定の \(\bar Z\)」と「自動の \(Z_{\rm eff}\)」は競合する同じキーではなく、電子数密度と、多種イオンによる衝突補正をそれぞれ制御する。</p>
     </section>
 
     <section aria-labelledby="opacity">
       <h2 id="opacity">不透明度と材料の混合</h2>
-      <p><code>opacity.model="constant"</code> は、吸収 <code>kappa_a</code> と散乱 <code>kappa_s</code> を cm²/g で与え、すべての輻射群へ同じ値を割り当てる。1D の \(S_N\) ソルバは <code>kappa_s</code> を物理的な散乱の不透明度として使い、FLD と 2D の \(S_N\) ソルバは物理散乱をゼロとして <code>kappa_s</code> を使わない。表形式のモデルは、密度・温度・群に依存するロスランド平均 \(\kappa_R\)、プランク吸収 \(\kappa^{PA}\)、そして利用できる場合はプランク放射 \(\kappa^{PE}\) を読む。内部の輸送係数へは \(\sigma=\rho\kappa\) によって cm⁻¹ に変換する。LTE の表で放射側が独立に与えられない場合には、警告を伴う \(\kappa^{PE}=\kappa^{PA}\) というキルヒホッフ則に基づく代替が定義されている。</p>
-      <p>混合セルでは <code>Materials.opacity_mix_rule</code> が材料の不透明度の混合則を決め、重みは質量分率（材料ごとの質量を追跡しない場合は体積分率）である。既定の <code>"linear_mass"</code> は、プランクとロスランドの両方を \(\kappa_{P,mix}=\sum_\alpha f_{m,\alpha}\kappa_{P,\alpha}\) のように線形に混合する。<code>"harmonic_mass_R"</code> はプランクを線形のまま、ロスランドを調和平均 \(1/\kappa_{R,mix}=\sum_\alpha f_{m,\alpha}/\kappa_{R,\alpha}\) で混合し、<code>"max"</code> は両方とも材料の最大値をとる。非線形の 2 つの規則は 1D だけにあり（2026-09-24 以降）、2D は <code>"linear_mass"</code> だけを受け付ける。診断用の環境スイッチ <code>TENRYU_MM_OPACITY_MIX=harmonic</code> は、定数不透明度を両方とも調和平均で混合する。</p>
+      <p><code>opacity.model="constant"</code> は、吸収 <code>kappa_a</code> と散乱 <code>kappa_s</code> を cm²/g で与え、すべての輻射群へ同じ値を割り当てる。1D の \(S_N\) ソルバは <code>kappa_s</code> を物理的な散乱の不透明度として使う。FLD は物理散乱をもたないので、<code>kappa_s</code> が 0 より大きいと入力の誤りとして拒否する。2D の \(S_N\) ソルバは物理散乱をゼロとして扱い、<code>kappa_s</code> を使わない。表形式のモデルは、密度・温度・群に依存するロスランド平均 \(\kappa_R\)、プランク吸収 \(\kappa^{PA}\)、そして利用できる場合はプランク放出 \(\kappa^{PE}\) を読む。内部の輸送係数へは \(\sigma=\rho\kappa\) によって cm⁻¹ に変換する。放出不透明度のブロックをもたない IONMIX の表は、LTE の表とみなし、警告を出して \(\kappa^{PE}=\kappa^{PA}\)（キルヒホッフの法則、Kirchhoff's law）とする。</p>
+      <p>混合セルでは <code>Materials.opacity_mix_rule</code> が材料の不透明度の混合則（mixing rule）を決め、重みは質量分率（材料ごとの質量を追跡しない場合は体積分率）である。既定の <code>"linear_mass"</code> は、プランクとロスランドの両方を \(\kappa_{P,mix}=\sum_\alpha f_{m,\alpha}\kappa_{P,\alpha}\) のように線形に混合する。<code>"harmonic_mass_R"</code> はプランクを線形のまま、ロスランドを調和平均 \(1/\kappa_{R,mix}=\sum_\alpha f_{m,\alpha}/\kappa_{R,\alpha}\) で混合し、<code>"max"</code> は両方とも材料の最大値をとる。非線形の 2 つの規則は 1D だけにあり、2D は <code>"linear_mass"</code> だけを受け付ける。診断用の環境スイッチ <code>TENRYU_MM_OPACITY_MIX=harmonic</code> は、定数不透明度を両方とも調和平均で混合する。</p>
       <h3 id="per-material-table-opacities">材料ごとの表不透明度（多材料 1D）</h3>
-      <p>2026-08-30 以降、<code>1D_SPH</code> の多群拡散デッキでは、ボイドでない各材料に固有の <code>tmat</code> 不透明度表 — LTE と、放射率を独立にもつ NLTE のいずれも — または定数を指定できる。2026-09-24 以降は、<code>table_nlte</code>（IONMIX の表）、<code>power_law</code>、<code>freq_dep_marshak</code> も材料ごとに指定でき、<code>sn_transport</code> のデッキも同じ材料ごとのモデルを受け付ける。純セルでは体積分率が最大の支配材料が表を選び、その群ごとの不透明度をセルの \((\rho,T_e)\) で補間する。界面の混合セル（2026-08-31 以降）は寄与材料をすべて厳密に合成する — 既定の線形の規則では \(\sigma = \rho \sum_m w_m \kappa_m(\rho_m, T_e)\)、重み \(w_m\) は質量分率（なければ体積分率）、各材料の表はその部分密度 \(\rho_m = \rho\,w_m/f_m\) で評価する。NLTE が支配材料のセルだけは NLTE カーネルが支配材料近似で埋める。2D で材料が複数ある輻射のデッキは、引き続きボイドでない材料すべてに定数不透明度を要求する。</p>
+      <p><code>1D_SPH</code> の多群拡散デッキでは、ボイドでない各材料に固有の <code>tmat</code> 不透明度表 — LTE の表と、吸収とは独立の放出不透明度をもつ非 LTE（non-LTE、NLTE）の表のいずれも — または定数を指定できる。<code>table_nlte</code>（IONMIX の表）、<code>power_law</code>、<code>freq_dep_marshak</code> も材料ごとに指定でき、<code>sn_transport</code> のデッキも同じ材料ごとのモデルを受け付ける。純セルでは体積分率が最大の<a href="#terms-mixed">支配材料</a>が表を選び、その群ごとの不透明度をセルの \((\rho,T_e)\) で補間する。界面の混合セルは寄与材料をすべて厳密に合成する — 既定の線形の規則では \(\sigma = \rho \sum_m w_m \kappa_m(\rho_m, T_e)\)、重み \(w_m\) は質量分率（なければ体積分率）、各材料の表はその<a href="#terms-mixed">部分密度（partial density）</a> \(\rho_m = \rho\,w_m/f_m\) で評価する。NLTE が支配材料のセルだけは NLTE カーネルが支配材料近似で埋める。2D では、材料が複数ある \(S_N\) のデッキがボイドでない材料すべてに定数不透明度を要求する。2D の FLD は、各材料の不透明度（モデルは材料ごとに選べる）を部分密度で評価して混ぜる。混合則は <code>"linear_mass"</code> だけである。</p>
     </section>
 
     <section aria-labelledby="planck-table">
@@ -81,19 +115,19 @@
       $$
       b_g(T)=\frac{15}{\pi^4}\int_{E_{g-1}/T}^{E_g/T}\frac{x^3}{e^x-1}\,dx.
       $$
-      <p><code>planck_fraction.method="compute"</code> では、初期化時に温度の格子上でこの積分を評価し、実行時の <code>PlanckTable</code> は、累積分率（またはその補数の裾）の対数を、その厳密な傾きとともに \(\ln T\) の三次 Hermite 多項式で補間し、\(b_g\) を隣り合う値の差として求める（総和は構成上 1 になる）。光子エネルギーの定義域が有限であるため、素の重みの総和は 1 未満になり得る。そこで保存に使う重みは \(\sum_g b_g=1\) へ規格化し直す。ただし規格化は、不足しているスペクトルを復元するものではない。そのため裾の欠損 \(\delta(T)=1-\sum_g b_g^{raw}(T)\) を保持し、温度格子全体での最大値を初期化時に報告する。欠損が \(10^{-3}\) を超えると警告になる。</p>
-      <p><code>compute_T_range_eV</code> は、このプランク表の温度軸である。省略した場合は、有効な材料の電子 EOS の表の範囲、次に不透明度の表の範囲、最後に [0.01, 1000] eV の順で導く。実行時の温度が範囲外なら端点で頭打ちにし、ステップごとの参照回数 \(N_{OOR}\) と最大の超過率を記録する。これは光子の群境界 \([E_0,E_G]\) とは別の範囲である。群境界は想定するプラズマのスペクトルを覆うように、プランク表の温度軸は補間に必要な温度を覆うように、それぞれ設計すること。</p>
+      <p><code>planck_fraction.method="compute"</code> では、初期化時に温度の格子上でこの積分を評価し、実行時の <code>PlanckTable</code> は、累積分率（cumulative fraction。またはその補数の裾）の対数を、その厳密な傾きとともに \(\ln T\) の三次 Hermite 多項式（cubic Hermite polynomial）で補間し、\(b_g\) を隣り合う値の差として求める（総和は構成上 1 になる）。光子エネルギーの定義域が有限であるため、素の重みの総和は 1 未満になり得る。そこで保存に使う重みは \(\sum_g b_g=1\) へ規格化し直す。ただし規格化は、不足しているスペクトルを復元するものではない。そのため裾の欠損 \(\delta(T)=1-\sum_g b_g^{raw}(T)\) を保持し、温度格子全体での最大値を初期化時に報告する。表のどの温度でも欠損が \(10^{-3}\) を超えるときは警告を出し、そうでないときは、欠損が \(10^{-3}\) 以下になる温度の範囲と欠損の最大値を、情報として記録する。</p>
+      <p><code>compute_T_range_eV</code> は、このプランク表の温度軸である。省略した場合は、有効な材料の電子 EOS の表の範囲、次に不透明度の表の範囲、最後に [0.01, 1000] eV の順で導く。輻射を有効にした Studio のデッキは <code>compute_T_range_eV</code> を必ず書き出し、群境界の下端と 0.1 eV の小さい方から、群境界の上端と \(10^5\) eV の大きい方までとする。実行時の温度が範囲外なら、端点の値へクランプする（外挿しない）。範囲外の参照の回数と超過率は記録しない。警告が出るのは、輻射の Marshak 境界の駆動温度 \(T_r\) について \(b_g\) をホスト側で引く経路だけで、初回の 1 回に限る。この温度軸は光子の群境界 \([E_0,E_G]\) とは別の量である。群境界を <code>"log_uniform"</code> で生成する場合と、群境界も表の群構造も与えない場合は、群境界がこの温度範囲から対数等間隔に作られる（下端は \(10^{-3}\) eV 以上にする）ので、二つの範囲は一致する。不透明度の表の群構造や、明示した <code>group_bounds_eV</code> を使う場合は、二つの範囲は独立である。群境界は想定するプラズマのスペクトルを覆うように、プランク表の温度軸は補間に必要な温度を覆うように、それぞれ設計すること。</p>
     </section>
 
     <section aria-labelledby="pipeline">
       <h2 id="pipeline">クロージャを呼ぶ場所と順序</h2>
       <ol>
-        <li><p><strong>初期化。</strong>材料の表を読み込み、設定された関数を凍結し、輻射の群境界の上で <code>PlanckTable</code> を構築する。</p></li>
-        <li><p><strong>流体の各半ステップ後の再クロージャ。</strong>時間発展した \((\rho,e)\) から逆向きの EOS で \(T\) を復元し、同じ密度の区間を再利用して \(P\) と \(c_v\) を順方向に評価する。</p></li>
+        <li><p><strong>初期化。</strong>材料の表を読み込み、設定された Python の関数を表にして設定を<a href="../use/running.html#terms-freeze">凍結（freeze）</a>し、輻射の群境界の上で <code>PlanckTable</code> を構築する。</p></li>
+        <li><p><strong>流体の各半ステップ後の再クロージャ。</strong>時間発展した \((\rho,e)\) から<a href="#terms-reclosure">逆写像</a>で \(T\) を復元し、同じ密度の区間を再利用して \(P\) と \(c_v\) を順方向に評価する。</p></li>
         <li><p><strong>熱伝導の入口。</strong>動的な \(\bar Z\) を更新し、\(n_e=\bar Z\rho/(A m_p)\) を作り、その入口の状態から伝導率を評価する。</p></li>
         <li><p><strong>輻射の入口。</strong>\(\bar Z\) と \(Z_{\rm eff}\) を更新し、\((\rho,T_e)\) で \(\kappa_R\)、\(\kappa^{PA}\)、\(\kappa^{PE}\) を評価し、各質量不透明度を \(\sigma=\rho\kappa\) へ変換して \(b_g(T_e)\) を評価する。</p></li>
-        <li><p><strong>材料ごとの寄与の混合。</strong>混合セルでは、材料ごとの不透明度を <code>Materials.opacity_mix_rule</code> に従って混合し、各材料の表はその部分密度で評価する。支配材料が NLTE のセルは、その材料の NLTE 係数で埋める。</p></li>
-        <li><p><strong>安全策を可視化する。</strong>正でない \(c_v\) には警告付きの安全な下限、表の定義域の外の参照には端点での頭打ち、ロスランド不透明度には下限を適用する。いずれも警告を出し、意図した物理を黙って書き換えることはない。</p></li>
+        <li><p><strong>材料ごとの寄与の混合。</strong>混合セルでは、材料ごとの不透明度を <code>Materials.opacity_mix_rule</code> に従って混合し、各材料の表はその<a href="#terms-mixed">部分密度</a>で評価する。<a href="#terms-mixed">支配材料</a>が NLTE のセルは、その材料の NLTE 係数で埋める。</p></li>
+        <li><p><strong>安全策を適用する。</strong>正でない \(c_v\) には床を課し（表を作るときに 1 回だけ警告する）、表の定義域の外の参照には端点の値へクランプし、ロスランド不透明度には床を課す。1D の既定の閉じ方では、エネルギーが表の最高温度での値を超えてもクランプせず、理想気体の延長で閉じる（<a href="#eos-models">理想気体 EOS と TMAT の表形式 EOS</a>参照）。</p></li>
       </ol>
     </section>
 
@@ -106,32 +140,32 @@
         </thead>
         <tbody>
           <tr><th><code>Material.A</code>, <code>Material.Z</code></th><td>材料ごとに指定</td><td>平均イオン質量 [amu] と代表的な核電荷。\(n_i\)、\(\bar Z\)、\(n_e\) の基礎になる。</td></tr>
-          <tr><th><code>eos.model</code></th><td><code>ideal_gas</code> | <code>tmat</code></td><td>解析的な 2 温度クロージャ、または TMAT-H5 の表形式 EOS。</td></tr>
-          <tr><th><code>ideal_gas.gamma</code></th><td>5/3</td><td>理想気体の比熱比。許容範囲は \(1&lt;\gamma\le3\)。</td></tr>
-          <tr><th><code>eos.cv_e_override</code></th><td><code>None</code></td><td>検証用の、一定の電子体積比熱 [erg/(cm³·eV)]。</td></tr>
-          <tr><th><code>opacity.model</code></th><td><code>constant</code> | table</td><td>群によらず一定の係数、または表形式の係数（TMAT-H5、または衝突輻射コード Ionmix の <code>.cn4</code> 形式「IONMIX」）。</td></tr>
-          <tr><th><code>kappa_a</code>, <code>kappa_s</code></th><td>必須 / 0.0</td><td>定数の吸収・散乱の質量不透明度。</td></tr>
+          <tr><th><code>eos.model</code></th><td><code>ideal_gas</code>（既定）| <code>tmat</code></td><td>解析的な 2 温度クロージャ、または TMAT-H5 の表形式 EOS。このほか <code>sesame</code>（SESAME の表。Los Alamos 国立研究所の状態方程式ライブラリ）、<code>ionmix</code>（IONMIX の表）、<code>power_law_te</code>（べき乗則の電子エネルギーを初期化のときに表にした検証用のモデル）も受け付ける。Studio は <code>ideal_gas</code> と <code>tmat</code> だけを書き出す。</td></tr>
+          <tr><th><code>ideal_gas.gamma</code></th><td>5/3</td><td>理想気体の断熱指数（adiabatic index）。ソルバーが要求するのは \(\gamma&gt;1\) だけで、Studio は \(1&lt;\gamma\le3\) に限る。</td></tr>
+          <tr><th><code>eos.cv_e_override</code></th><td><code>None</code></td><td>検証用の、一定の電子体積比熱 [erg/(cm³·eV)]。有限で 1.0 以上でなければならない。</td></tr>
+          <tr><th><code>opacity.model</code></th><td><code>constant</code>（既定）| <code>tmat</code> | <code>table_nlte</code> | <code>ionmix</code> | <code>power_law</code> | <code>freq_dep_marshak</code> | <code>free_free</code></td><td>群によらず一定の係数（<code>constant</code>）、表形式の係数（<code>tmat</code> は TMAT-H5 の表、<code>table_nlte</code> は衝突輻射コード Ionmix の <code>.cn4</code> 形式「IONMIX」の表。<code>ionmix</code> は、放出と吸収の不透明度が一致する LTE の IONMIX の表を <code>table_nlte</code> と同じ経路で扱う）、べき乗則（<code>power_law</code>）、周波数依存の Marshak 検証問題用の解析不透明度（<code>freq_dep_marshak</code>）、自由–自由吸収（free-free absorption。<code>free_free</code>、2D の FLD だけ）。<code>sesame</code> は受け付けるが未実装のため、入力の誤りになる。<code>none</code> は廃止予定で、<code>kappa_a</code> と <code>kappa_s</code> が 0 の <code>constant</code> に読み替える。Studio は <code>constant</code> と <code>tmat</code> だけを書き出す。</td></tr>
+          <tr><th><code>kappa_a</code>, <code>kappa_s</code></th><td>0.0 / 0.0</td><td>定数の吸収・散乱の質量不透明度。<code>kappa_a</code> は省略すると警告を出し、0（透明な媒質）になる。<code>kappa_s</code> は \(S_N\) だけが使い、FLD では 0 より大きい値が拒否される。</td></tr>
           <tr><th><code>opacity.units</code></th><td><code>"cm2_per_g"</code></td><td>質量不透明度の固定された単位。変更できない。</td></tr>
           <tr><th><code>Materials.opacity_mix_rule</code></th><td><code>"linear_mass"</code></td><td>混合セルの混合則。<code>"linear_mass"</code>（両方とも線形）、<code>"harmonic_mass_R"</code>（ロスランドを調和平均）、<code>"max"</code> から選ぶ。2D は <code>"linear_mass"</code> だけを受け付ける。</td></tr>
-          <tr><th><code>Materials.zbar.model</code></th><td><code>"fixed"</code></td><td><code>fixed</code>、<code>thomas_fermi</code>、<code>tabular</code> から \(\bar Z\) を選択。</td></tr>
-          <tr><th><code>Laser.ib.zeff_model</code></th><td><code>"auto"</code></td><td>TMAT の電離分率があれば表による \(Z_{\rm eff}\)、1D 球対称では指定の種か共通の TMAT 組成による逐次剥離、それ以外は補正なし。ボイドでない材料が複数ある 1D 球対称のデッキでは材料ごとに解決する。</td></tr>
-          <tr><th><code>Material.is_void</code></th><td><code>False</code></td><td>材料をボイドとして、EOS・不透明度の表の読み込みと物質結合から除外する。</td></tr>
-          <tr><th><code>Materials.void_config</code></th><td>ρ, \(T_e\), \(T_i\)</td><td>ボイドセルの既定の密度・電子温度・イオン温度。</td></tr>
+          <tr><th><code>Materials.zbar.model</code></th><td><code>"fixed"</code></td><td><code>fixed</code>、<code>thomas_fermi</code>、<code>tabular</code> から \(\bar Z\) を選択。<code>fixed</code> は、<code>Materials.zbar.fixed_value</code>（既定は未指定。Studio はフォームで指定したときだけ書き出す）に 0 以上の値を与えればその値を全セルの \(\bar Z\) にし、与えなければ \(\bar Z=Z\) とする。</td></tr>
+          <tr><th><code>Laser.ib.zeff_model</code></th><td><code>"auto"</code></td><td>TMAT の電離分率があれば表による \(Z_{\rm eff}\)、1D 球対称では指定の種か共通の TMAT 組成による<a href="#terms-strip">逐次剥離</a>、それ以外は補正なし。ボイドでない材料が複数ある 1D 球対称のデッキでは材料ごとに解決する。Studio はこのキーを書き出さないので、既定の <code>auto</code> になる。</td></tr>
+          <tr><th><code>Material.is_void</code></th><td><code>False</code></td><td>材料をボイドにする（定義は<a href="#void-materials">下の節</a>）。EOS・不透明度の表を読み込まず、熱伝導・輻射・レーザーとの結合から除く。</td></tr>
+          <tr><th><code>Materials.void_config</code></th><td><code>rho</code>、<code>Te</code>、<code>Ti</code> = \(10^{-10}\) g/cm³、\(10^{-3}\) eV、\(10^{-3}\) eV</td><td>ボイドセルの初期の密度・電子温度・イオン温度。デッキの <code>Geometry.rho</code>、<code>Te</code>、<code>Ti</code> より優先する。</td></tr>
         </tbody>
       </table>
     </section>
 
     <section aria-labelledby="void-materials">
       <h2 id="void-materials">ボイド材料</h2>
-      <p><code>is_void=True</code> の材料は、EOS と不透明度の表を読み込まず、既定として低密度の理想気体、<code>kappa_a=kappa_s=0</code>、\(A=1\)、\(Z=0\) を使う。ボイドは混合セルの組成平均 \(\bar Z_{\rm eff}\)・\(A_{\rm eff}\)（これらは混合平均であり、上の衝突用 \(Z_{\rm eff}=\bar Zr_2\) とは別物である）、EOS の平均、質量分率の混合から除外され、その体積分率は <code>cell_is_void</code> のマスクを導くためだけに使われる。ボイドのセルでは \(\bar Z=0\) を強制し、Thomas–Fermi の評価と、輻射・レーザー・熱伝導との結合を飛ばす。初期の \(\rho,T_e,T_i\) は <code>void_config</code> で与える。</p>
+      <p>ボイド（void）は、外側の真空のような、物質のない領域を格子の上で表すための材料である。<code>is_void=True</code> の材料（ボイド材料）は、EOS と不透明度の表を読み込まない。EOS は理想気体、不透明度は <code>kappa_a=kappa_s=0</code>、\(Z=0\) に固定され、\(A\) は指定がなければ 1 になる。ボイドでない材料の体積分率の和が \(10^{-12}\) 以下のセルがボイドセルで、初期化のときに <code>cell_is_void</code> のマスクが 1 になる。ボイド材料は、混合セルの平均 \(\bar Z_{\rm eff}\)・\(A_{\rm eff}\)（<a href="#terms-zeff">用語</a>。これらは混合平均であり、上の衝突用 \(Z_{\rm eff}=\bar Zr_2\) とは別物である）、EOS の平均、質量分率の混合から除外され、その体積分率は <code>cell_is_void</code> のマスクを導くためだけに使われる。ボイドセルでは \(\bar Z=0\) を強制し、Thomas–Fermi の評価を省く。ボイドセルは、熱伝導率を 0 にして断熱とし、吸収係数と放出係数を 0 にして輻射と物質のエネルギー交換をなくし、電子数密度が 0 なのでレーザーを吸収も屈折もしない。ボイドセルの初期の \(\rho,T_e,T_i\) は、デッキの <code>Geometry.rho</code>、<code>Te</code>、<code>Ti</code> ではなく <code>Materials.void_config</code> で与える。</p>
     </section>
 
     <section aria-labelledby="verification">
       <h2 id="verification">検証</h2>
       <ul>
-        <li>TMAT の参照に関する対の試験は、人工的に作った表に対する \((\log\rho,\log T)\) の順方向補間と、<a href="../verification/index.html#gxii">GXII</a> の CD の表に対する GPU での逆引きの簡易試験を組み合わせる。後者は \(\rho=1.05\) g/cm³、\(e_e=10^6\ldots10^{12}\) erg/g において、区間探索の失敗と代替経路への退避がいずれも 0 であることを要求する。</li>
-        <li>プランクの群和に対する検査は、1、4、16、64 群と \(T=1\ldots10^5\) eV で \(\sum_g b_g=1\)、端の累積分布、群について総和した \(aT^4\) を確認する。運用時にはこれとは別に、裾の欠損の最大値、温度範囲外となった回数、最大の超過率を診断する。</li>
-        <li>不透明度の一致比較では、比較する双方の物理的な仮定をそろえることが先決である。HELIOS との LTE 一致比較の A/B では、TENRYU 側の放射を <code>kappa_PE := kappa_PA</code> とするキルヒホッフの分枝で評価し、素の衝突輻射平衡による非 LTE の放射表との差を切り分けた。</li>
+        <li>TMAT の参照に関する対の試験は、人工的に作った表に対する \((\log\rho,\log T)\) の順方向補間と、<a href="../verification/index.html#gxii">GXII</a>（激光 XII 号、GEKKO XII）の CD の表に対する GPU での逆写像の簡易試験を組み合わせる。後者は \(\rho=1.05\) g/cm³、\(e_e=10^6\ldots10^{12}\) erg/g において、区間探索の失敗と代替経路への退避がいずれも 0 であることを要求する。</li>
+        <li>プランクの群和に対する検査は、1、4、16、64 群と \(T=1\ldots10^5\) eV で \(\sum_g b_g=1\)、端の累積分布（cumulative distribution function、CDF）、群について総和した \(aT^4\) を確認する。運用時には、これとは別に、初期化のときに裾の欠損の最大値を報告する。プランク表の温度範囲外の参照は記録しない。</li>
+        <li>不透明度の一致比較では、比較する双方の物理的な仮定をそろえることが先決である。HELIOS（輻射流体コード）との LTE 一致比較の A/B では、TENRYU 側の放出を <code>kappa_PE := kappa_PA</code> とするキルヒホッフの法則の分枝で評価し、素の衝突輻射平衡（collisional-radiative equilibrium、CRE）による非 LTE の放出の表との差を切り分けた。</li>
       </ul>
     </section>
 
@@ -139,6 +173,7 @@
       <h2 id="references">参考文献</h2>
       <ol class="references">
         <li>R. M. More, K. H. Warren, D. A. Young, and G. B. Zimmerman, "A New Quotidian Equation of State (QEOS) for Hot Dense Matter," Phys. Fluids 31, 3059–3078 (1988). <a href="https://doi.org/10.1063/1.866963">doi:10.1063/1.866963</a></li>
+        <li>R. M. More, "Pressure Ionization, Resonances, and the Continuity of Bound and Free States," Adv. At. Mol. Phys. 21, 305–356 (1985). <a href="https://doi.org/10.1016/s0065-2199(08)60145-1">doi:10.1016/s0065-2199(08)60145-1</a></li>
       </ol>
     </section>
 

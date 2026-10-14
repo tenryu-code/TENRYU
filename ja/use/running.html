@@ -13,12 +13,12 @@
   <main>
     <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
     <h1>シミュレーションの実行 <span class="badge">reference</span></h1>
-    <p class="abstract">このページは、ビルド済みの <code>build/tenryu</code> を前提に、「最初の 1 本を完走させる → 自分のデッキを書く → つまずいたら直す」までを通しで説明する。TENRYU の入力は 1 個の Python ファイル（namelist デッキ）である。Python の関数は初期化時に評価され、表へ凍結されるため、時間ループの最中に Python が呼ばれることはない。</p>
+    <p class="abstract">このページは、ビルド済みの <code>build/tenryu</code> を前提に、「最初の 1 本を完走させる → 自分のデッキを書く → つまずいたら直す」までを通しで説明する。TENRYU の入力は、1 個の Python ファイルである。このファイルを<a href="namelist.html#terms-deck">デッキ（deck）</a>と呼ぶ。TENRYU は、初期化の段階で、デッキの Python の関数を評価して表にし、設定を JSON（凍結設定、frozen configuration）に確定する。この操作を<a href="#terms-freeze">凍結（freeze）</a>と呼ぶ。凍結のあと、時間ループの最中に Python が呼ばれることはない。凍結のほか、実効値（effective value）、limiter、床（floor）の意味は<a href="#terms">用語の節</a>で説明する。</p>
 
     <aside class="planned" aria-labelledby="at-a-glance">
       <h3 id="at-a-glance">要点</h3>
       <ul>
-        <li>通常使う CLI サブコマンドは 4 つ: <code>run</code>（実行）・<code>validate</code>（実行せず検査）・<code>verify</code>（登録済み検証ケース）・<code>freeze</code>（凍結 JSON の出力）。run の前には必ず validate を実行する。設定ミスは実行前にほぼ全部見つかる。</li>
+        <li>通常使う CLI サブコマンドは 4 つ: <code>run</code>（実行）・<code>validate</code>（実行せず検査）・<code>verify</code>（登録済み検証ケース）・<code>freeze</code>（凍結設定の JSON の出力）。run の前には必ず validate を実行する。設定ミスは実行前にほぼ全部見つかる。</li>
         <li>最初の 1 本は <code>examples/templates/</code> のテンプレートをそのまま実行すればよい。編集せずに完走する。</li>
         <li><code>tenryu</code> とは常にビルドされた実行ファイル <code>build/tenryu</code> のことである — インストール手順はない。リポジトリのルートからパス指定で起動するか、<code>build/</code> を <code>PATH</code> に加える。</li>
         <li>スキーマは厳格である。未知のキー・型違い・不正な組合せは警告ではなくエラーで止まり、打ち間違いには <code>did you mean 'kappa_a'?</code> のような修正候補が出る。</li>
@@ -37,16 +37,16 @@
         <thead><tr><th>コマンド</th><th>入力</th><th>用途</th></tr></thead>
         <tbody>
           <tr><th><code>tenryu validate &lt;deck.py&gt;</code></th><td>任意のデッキ</td><td>実行せずに検査する（数秒）。スキーマ・組合せの検査に加え、次元・格子・材料・物理モジュールの ON/OFF・出力先をまとめた実行前の要約を表示する。run の前にこの要約を目で確認することが、最も安上がりなデバッグである。</td></tr>
-          <tr><th><code>tenryu run &lt;deck.py&gt;</code></th><td>任意のデッキ</td><td>本実行。デッキを読み、検証・凍結し、メッシュ・材料表・初期条件を作ってから時間ループに入る。<code>--output-dir &lt;dir&gt;</code> でデッキを編集せずに出力先を上書きできる（新規 run 専用。再開との併用は <code>ConfigError</code>）。再開では <code>--t-end &lt;s&gt;</code>・<code>--max-steps &lt;N&gt;</code> で終了時刻と step 上限を延ばせる（<a href="#continue">run の延長</a>）。</td></tr>
+          <tr><th><code>tenryu run &lt;deck.py&gt;</code></th><td>任意のデッキ</td><td>本実行。デッキを読み、入力を検査し、<a href="#terms-freeze">凍結</a>し、メッシュ・材料表・初期条件を作ってから時間ループに入る。<code>--output-dir &lt;dir&gt;</code> でデッキを編集せずに出力先を上書きできる（新規 run 専用。再開（restart）との併用は <code>ConfigError</code>）。再開では <code>--t-end &lt;s&gt;</code>・<code>--max-steps &lt;N&gt;</code> で終了時刻とステップ数の上限を延ばせる（<a href="#continue">run の延長</a>）。</td></tr>
           <tr><th><code>tenryu verify &lt;name&gt;</code></th><td>登録済みケース名</td><td>解析解・基準解・統合検査の再実行（例: <code>sedov</code>、<code>noh</code>、<code>gxii_1d_fld_regression</code>）。<a href="../verification/index.html">検証とベンチマーク</a>参照。</td></tr>
-          <tr><th><code>tenryu freeze &lt;deck.py&gt;</code></th><td>任意のデッキ</td><td>凍結後の設定 JSON を書き出す。実行せずに「実効値」を確認・差分比較したいときに使う。</td></tr>
+          <tr><th><code>tenryu freeze &lt;deck.py&gt;</code></th><td>任意のデッキ</td><td>凍結設定の JSON を書き出す。実行せずに<a href="#terms-effective">実効値</a>を確認し、デッキどうしで差分を比べたいときに使う。</td></tr>
         </tbody>
       </table>
     </section>
 
     <section aria-labelledby="first-run">
       <h2 id="first-run">最初の 1 本（テンプレートを完走させる）</h2>
-      <p><code>examples/templates/</code> に、全ブロックへコメントを付けた実行可能な雛形が 3 本ある。まずは一番軽い輻射スラブをそのまま動かす。</p>
+      <p><code>examples/templates/</code> に、全<a href="namelist.html#terms-block">ブロック（block）</a>へコメントを付けた実行可能な雛形が 3 本ある。まずは一番軽い輻射スラブをそのまま動かす。</p>
       <pre><code># ① 実行前検査（実行しない。数秒で終わる）
 ./build/tenryu validate examples/templates/template_1d_slab_radiation.py
 
@@ -61,9 +61,9 @@ python3 -m tools.tenryu_plot history outputs/template_1d_slab_radiation   # 時�
       <table class="quick-facts">
         <thead><tr><th>テンプレート</th><th>内容</th><th>学べること</th></tr></thead>
         <tbody>
-          <tr><th><code>template_1d_slab_radiation.py</code></th><td>平面 1D・グレイ FLD・Marshak 境界駆動・流体 OFF</td><td>輻射伝播の最小構成。validate → run → 可視化の流れ。</td></tr>
-          <tr><th><code>template_1d_laser_sphere.py</code></th><td>球 1D・レーザー直接照射・2 温度・伝導 ON</td><td>レーザー波形の書き方、複合物理。</td></tr>
-          <tr><th><code>template_1d_indirect_tr.py</code></th><td>球 1D・Tr(t) 間接照射駆動</td><td>時間依存 callable → 凍結された表の流儀。</td></tr>
+          <tr><th><code>template_1d_slab_radiation.py</code></th><td>平面 1D・グレイ（gray）の流束制限拡散（flux-limited diffusion、FLD）・Marshak 境界駆動・流体 OFF</td><td>輻射伝播の最小構成。validate → run → 可視化の流れ。</td></tr>
+          <tr><th><code>template_1d_laser_sphere.py</code></th><td>球 1D・レーザー直接照射（direct drive）・2 温度（two-temperature）・熱伝導 ON</td><td>レーザー波形の書き方、複合物理。</td></tr>
+          <tr><th><code>template_1d_indirect_tr.py</code></th><td>球 1D・輻射温度 Tr(t) で外側の Marshak 境界を駆動する間接照射（indirect drive）</td><td>時間に依存する関数（callable）を渡し、<a href="#terms-freeze">凍結</a>で表にする書き方。</td></tr>
         </tbody>
       </table>
       <p>改造の定番は、駆動温度・レーザーパワー（callable の返り値）を変える、<code>nr</code> を倍にして収束を見る、<code>Radiation(mode="sn_transport")</code> にして FLD と比べる、の 3 つである。テンプレートはコピーして名前を変えてから改造する。物理指標まで確認済みの Studio プリセット 3 種は<a href="examples.html">例題とプリセット</a>にある。</p>
@@ -71,7 +71,7 @@ python3 -m tools.tenryu_plot history outputs/template_1d_slab_radiation   # 時�
 
     <section aria-labelledby="deck-anatomy">
       <h2 id="deck-anatomy">デッキの構造</h2>
-      <p><code>Main</code> はケース名、次元、終了条件を定め、<code>Mesh</code> は計算領域とゾーニングを作る。<code>Materials</code> には EOS と不透明度をもつ材料を登録し、<code>Geometry</code> の関数が初期の体積分率、密度、温度、速度を空間へ割り当てる。<code>Radiation</code> と <code>Laser</code> は演算子を選び、<code>Numerics</code> は時間刻み、流体、熱伝導、ALE と安全のための制御をまとめる。<code>Output</code> はファイルの場所と出力の間隔を、<code>Diagnostics</code> は実行中に集計する量を決める。</p>
+      <p>デッキは、<a href="namelist.html#terms-block">ブロック</a>と呼ぶ関数を呼んで設定を書く。ブロックは 11 個ある。<code>Main</code> はケース名、次元、終了条件を定め、<code>Mesh</code> は計算領域とセルの分割（zoning）を作る。<code>Materials</code> には、状態方程式（equation of state、EOS）と不透明度（opacity）をもつ材料を登録し、<code>Geometry</code> の関数が初期の体積分率、密度、温度、速度を空間へ割り当てる。<code>Radiation</code> と <code>Laser</code> は演算子を選び、<code>Numerics</code> は時間刻み、流体、熱伝導、ALE（arbitrary Lagrangian–Eulerian、任意ラグランジュ・オイラー法）と安全のための制御をまとめる。<code>Output</code> はファイルの場所と出力の間隔を、<code>Diagnostics</code> は実行中に集計する量を決める。<code>Parallel</code> は MPI（Message Passing Interface）による領域分割（domain decomposition）を、<code>Burn</code> は核燃焼（nuclear burn）を設定する。</p>
       <p>次は、実在するキーだけで構成した最小の 1 次元球対称のデッキである。単一の理想気体の材料で一様に満たし、輻射・レーザー・熱伝導を無効にしてラグランジュ流体を進める。値は入力形式を説明するためのものであり、物理的なベンチマークではない。</p>
       <pre><code>from tenryu_namelist import *
 
@@ -112,17 +112,45 @@ Diagnostics(enabled=True, every=1)</code></pre>
       <h2 id="writing-decks">自分のデッキを書くときの原則</h2>
       <ul>
         <li><strong>単位は常に cgs + eV。</strong>長さ cm・時間 s・密度 g/cm³・温度 eV。µm で書きたいときは <code>um = 1.0e-4</code> を自分で定義して換算する。名前が単位を明示するキー（<code>wavelength_nm</code> など）だけが例外である。</li>
-        <li><strong>空間分布と時間波形は関数で与える。</strong><code>Geometry.rho</code>・<code>Te</code>・<code>Ti</code>・<code>volfrac</code> はセル中心座標に対して、レーザーパワーや Marshak 温度は時間に対して、初期化時に一度だけベクトル化評価され、凍結された表へ変換される。関数が外部状態を持ち続けることや、実行中に再評価されることを前提にしたデッキは正しくない。</li>
-        <li><strong>書かなかったキーは既定値になる。</strong>既定値の正典はリポジトリの <code>docs/SPECIFICATION.md</code> §9.1。迷ったら書かず、validate の要約と出力先の <code>config/*_frozen.json</code> で実効値を確認するのが安全である。</li>
+        <li><strong>空間分布と時間波形は関数で与える。</strong><code>Geometry.rho</code>・<code>Te</code>・<code>Ti</code>・<code>volfrac</code> はセル中心の座標を、レーザーパワーや Marshak 温度は時刻を、スカラー（float）で 1 つずつ渡して初期化時に評価し、<a href="#terms-freeze">凍結</a>された表へ変換する。関数は数値を受け取って数値を返せばよい。NumPy の関数は使えるが、スカラーの引数で動かなければならない。関数が外部状態を持ち続けることや、実行中に再評価されることを前提にしたデッキは正しくない。</li>
+        <li><strong>書かなかったキーは既定値になる。</strong>既定値の正典はリポジトリの <code>docs/SPECIFICATION.md</code> §9.1。迷ったら書かず、validate の要約と出力先の <code>config/*_frozen.json</code> で<a href="#terms-effective">実効値</a>を確認するのが安全である。</li>
         <li><strong>打ち間違いはエラーで止まる。</strong>未知のブロックやキー、文字列を要求する場所への数値、負のセル数、選んだ次元では対応していない組合せは、黙って無視されず <code>ConfigError</code> になる。修正候補（did you mean …?）が出たらそのまま直す。</li>
-        <li><strong>物理は 1 個ずつ足す。</strong>opt-in 群（CBET・ホット電子・SNB・粘性・燃焼など）は「書かなければ完全に不活性」という契約で実装されている。新しいデッキは、まず小さいメッシュと短い <code>t_end</code> で初期化と数ステップを確認し、そのあとで実運用の解像度と出力の間隔へ上げること。</li>
+        <li><strong>物理は 1 個ずつ足す。</strong>交差ビームエネルギー転送（cross-beam energy transfer、CBET）、ホット電子（hot electron）、Schurtz–Nicolaï–Busquet モデル（SNB）による非局所熱伝導、プラズマ粘性（plasma viscosity）、核燃焼は、デッキに有効化のキーを書いたときだけ働く。既定では無効である（有効化のキーは<a href="../physics/index.html#availability">次元と有効化の早見表</a>にある）。新しいデッキは、まず小さいメッシュと短い <code>t_end</code> で初期化と数ステップを確認し、そのあとで実運用の解像度と出力の間隔へ上げること。</li>
       </ul>
+    </section>
+
+    <section aria-labelledby="terms">
+      <h2 id="terms">この計算で使う用語</h2>
+      <p>このページで、TENRYU の実行に固有の意味で使う語は、凍結、実効値、limiter、床の 4 つである。デッキ、ブロック、キーは<a href="namelist.html#terms-deck">namelist のページ</a>で定義する。</p>
+
+      <h3 id="terms-freeze">凍結</h3>
+      <p><strong>凍結（freeze）</strong>は、デッキの内容を、時間ループに入る前に、ループの中で変わらない形に確定する操作である。このページでは、次の 2 つの意味で使う。</p>
+      <ul>
+        <li><strong>関数の評価と表への置き換え。</strong>デッキの Python の関数（callable）を、格子と時間軸の上で評価して、数値の表に置き換える。空間分布の関数 <code>Geometry.rho</code>・<code>Te</code>・<code>Ti</code>・<code>volfrac</code> は、既定では、各セルの中心（2D では重心）の座標をスカラー（float）で 1 つずつ渡して評価し、セルごとの初期値にする。<code>Geometry.velocity</code> は、節点の座標で評価する。時間の関数（<code>LaserBeam.power</code>、<code>Radiation.boundary.marshak_Tr</code> と面ごとの <code>marshak_Tr_map</code>、<code>Numerics.hydro.boundary_pressure</code>、<code>Laser.hot_electron.eta_hot_table</code> と生成源ごとの <code>eta_table</code>）は、時刻をスカラーで 1 つずつ渡して評価し、区分線形の表にする。表の時刻は、0 から <code>Main.t_end</code> までを \(2^{-40}\) s（約 \(9.1\times10^{-13}\) s）ごとに取る。区間の中点での関数の値が、両端の値の平均から、3 点の値の絶対値の最大値の \(10^{-6}\) 倍を超えて離れているときは、その区間を二分して点を足す（\(2^{-47}\) s の刻みまで）。<code>Main.t_end</code> が約 0.95 µs を超える run では、区間の数が \(2^{20}\) 以下になるまで、基本の刻みを 2 倍ずつ粗くする。時間ループの中では、この表を線形補間して使う。</li>
+        <li><strong>設定の JSON への確定。</strong>デッキの実行が終わると、各ブロックのキーを検査し、書かなかったキーに既定値を補って、設定の全体を 1 個の JSON（凍結設定）にする。関数は、値ではなく、関数の名前、<code>repr</code>（文字列表現）、ソースコードの SHA-256 ハッシュ（<code>source_hash</code>）で JSON に記録する。デッキ本文の SHA-256 ハッシュ（<code>_namelist_source_hash</code>）も入る。</li>
+      </ul>
+      <p>凍結する理由は 2 つある。第一に、時間ループの中で Python を呼ばないためである。TENRYU は、組み込みの Python インタプリタを、デッキの実行と凍結のためだけに起動し、時間ループに入る前に終了する。ステップごとに Python の関数を呼ぶ設計は、速度と再現性を損なうので、仕様が禁じている（リポジトリの <code>docs/SPECIFICATION.md</code> §6.3.1）。第二に、再開のときに、設定が元の run と同じであることを照合するためである。</p>
+      <p>凍結は、次の 3 つに効く。</p>
+      <ul>
+        <li><strong>凍結設定のファイル。</strong><code>tenryu run</code> は、凍結設定を出力先の <code>config/&lt;name&gt;_frozen.json</code> に書く（<code>Output.save_frozen_config</code>、既定 True）。デッキのコピーも <code>config/&lt;name&gt;_namelist.py</code> に置く（<code>Output.save_namelist_copy</code>、既定 True）。ファイルには、実行時の上書き（<code>--output-dir</code>、再開時の <code>--t-end</code>・<code>--max-steps</code>）を反映した値が入り、凍結した時刻（<code>_frozen_at</code>）、TENRYU の版（<code>_tenryu_version</code>）、評価した表の要約（<code>frozen_summary</code>）が加わる。要約には、初期の密度の最小値・最大値・平均値、電子温度とイオン温度の最小値と最大値、材料ごとの体積、時間の表の範囲・点数・最大値・積分値が入る。run の来歴の一次資料として使う（<a href="outputs.html#provenance">出力と解析</a>）。</li>
+        <li><strong><code>tenryu freeze</code>。</strong>デッキを実行して、凍結設定だけを書き出す。メッシュと初期状態を作らず、表も作らないので、<code>frozen_summary</code> は入らず、実行時の上書きもない。出力先は <code>-o &lt;file&gt;</code> で指定し、省略するとカレントディレクトリの <code>&lt;デッキのファイル名（拡張子なし）&gt;_frozen.json</code> に書く。デッキのコピーも、出力ファイルと同じディレクトリに置く（すでにそこにあるときを除く）。</li>
+        <li><strong>再開時の照合。</strong>チェックポイントは、凍結設定を <code>metadata/frozen_config</code> に、デッキ本文を <code>metadata/namelist_source</code> に保存する。再開では、この凍結設定と、再開に使うデッキから作った凍結設定を、<code>Main.restart_from</code> を除いて比べる（古いチェックポイントに無いキーには、既定値を補ってから比べる）。1 か所でも違えば、時間ループに入る前に停止する。デッキ本文が 1 文字でも違えば <code>_namelist_source_hash</code> が変わるので、再開は拒否される。拒否のメッセージ（<code>checkpoint frozen_config JSON mismatch</code>）は、違いのあるキーを <code>differs at:</code> に最大 8 個示す（<a href="#restart">チェックポイントと再開</a>）。照合に使う凍結設定は、実行時の上書きの前の値から作り、凍結の時刻・版・表の要約を含まない。そのため、<code>--output-dir</code> や <code>--t-end</code> で上書きして走らせた run のチェックポイントも、元のデッキを変えずに再開できる。</li>
+      </ul>
+
+      <h3 id="terms-effective">実効値</h3>
+      <p><strong>実効値（effective value）</strong>は、デッキに書いた値に、書かなかったキーの既定値を補い、実行時の上書き（<code>--output-dir</code>、再開時の <code>--t-end</code>・<code>--max-steps</code>）を反映した、実行が実際に使う値である。二乗平均平方根（root mean square、RMS）の意味ではない。デッキに書いた値だけでは、既定値の補完や上書きのために、実行が何を使ったかが分からない。設定が効いたか疑わしいときは、実効値を先に確かめる（<a href="#troubleshooting">うまくいかないとき</a>）。run が使った実効値は、出力先の <code>config/&lt;name&gt;_frozen.json</code> にある。run の前に確かめるには、<code>tenryu freeze</code> の出力を読む（実行時の上書きは入らない）。<code>tenryu validate</code> の要約は、実効値の主な項目を人間が読める形で示す。デッキに書いた値と実効値が違う例に、温度の床がある。デッキに温度の床（<code>Numerics.floors.Te_floor_eV</code>・<code>Ti_floor_eV</code>）を書かず、テーブル EOS の最低温度が既定の床 \(10^{-3}\) eV より高いときは、床がその最低温度に引き上げられ、凍結設定には引き上げた値が入る（リポジトリの <code>docs/NUMERICS.md</code> §1.1.5）。</p>
+
+      <h3 id="terms-limiter">limiter</h3>
+      <p><strong>limiter</strong>は、そのステップの時間刻み \(\Delta t\) を決めた制約の名前である。\(\Delta t\) は、各物理カーネルが提案する上限と、成長率の制限、<code>Numerics.dt.max_s</code>、出力時刻への着地、残り時間のうち最小のものに等しく、勝った候補の名前（<code>hydro</code>・<code>conduction</code>・<code>braginskii</code>・<code>burn</code>・<code>hot_electron</code>・<code>growth</code>・<code>max</code>・<code>output</code>・<code>t_end</code> など）が limiter になる。<code>Main.verbosity="verbose"</code> で実行すると、ログの <code>[dt_breakdown]</code> 行の <code>dt_winner=</code> に毎ステップ出る。履歴にも <code>dt_winner</code> として残る。\(\Delta t\) が縮み続けて進まないときは、limiter が原因のカーネルを示す（<a href="#during-run">実行中に見えるもの</a>）。名前の一覧と決定則は<a href="../overview/timestep.html#global-rule">時間刻み制御と CFL</a>にある。流束制限拡散の流束制限関数（flux limiter）や、ALE のリマップの勾配制限（<code>remap_limiter</code>）は、別のものである。</p>
+
+      <h3 id="terms-floor">床</h3>
+      <p><strong>床（floor）</strong>は、密度と温度の下限値である。計算の途中で値が下限を割ると、下限まで引き上げ（クランプ、clamp）、引き上げに要したエネルギーを<a href="../overview/numerics-foundations.html#energy-ledger">エネルギー台帳（energy ledger）</a>に記帳する。床は物理モデルではなく、NaN や負の温度で計算が壊れるのを防ぐ数値上の安全装置で、発動はすべて数えられる（<a href="../overview/numerics-foundations.html#floors-safety">床・クランプ・安全ガード</a>）。キーは <code>Numerics.floors</code> の <code>rho_floor_gcc</code>（既定 \(10^{-10}\) g/cm³）、<code>Te_floor_eV</code>・<code>Ti_floor_eV</code>（既定 \(10^{-3}\) eV）で、Studio も同じ値を書き出す。床は、時間刻みの下限 <code>Numerics.dt.min_s</code> とは別のものである。\(\Delta t\) がこの下限を割ると、run は FATAL で停止する（デッキで指定しないときの既定は \(10^{-20}\) s、Studio が書き出す値は \(10^{-22}\) s）。</p>
     </section>
 
     <section aria-labelledby="during-run">
       <h2 id="during-run">実行中に見えるもの</h2>
-      <p><code>run</code> は最初にデッキを検証・凍結し（validate と同じ検査）、メッシュと初期状態を構築してから時間ループへ入る。以後はステップの進行がログに流れ、スナップショットを書くたびに <code>[output] wrote snapshot (step=…, …)</code>、チェックポイントを書くたびに <code>[output] wrote checkpoint (step=…, …)</code> の行が出る。ログはコンソールと <code>outputs/&lt;name&gt;/log/</code> の双方に残る。</p>
-      <p>「\(\Delta t\) がどんどん小さくなって進まない」ときは、ログの limiter 名（<code>hydro</code>・<code>conduction</code>・<code>braginskii</code> など）で律速カーネルを特定し、該当物理の設定（床値・格子）を見直す。決定則と全カーネルの式は<a href="../overview/timestep.html">時間刻み制御と CFL</a> にまとめてある。</p>
+      <p><code>run</code> は最初にデッキを検査し（validate と同じ検査）、<a href="#terms-freeze">凍結</a>して、メッシュと初期状態を構築してから時間ループへ入る。以後はステップの進行がログに流れ、スナップショットを書くたびに <code>[output] wrote snapshot (step=…, …)</code>、チェックポイントを書くたびに <code>[output] wrote checkpoint (step=…, …)</code> の行が出る。ログはコンソールと <code>outputs/&lt;name&gt;/log/</code> の双方に残る。</p>
+      <p>「\(\Delta t\) がどんどん小さくなって進まない」ときは、ログの <a href="#terms-limiter">limiter</a> 名（<code>hydro</code>・<code>conduction</code>・<code>braginskii</code> など）で律速カーネルを特定し、該当物理の設定（<a href="#terms-floor">床</a>・格子）を見直す。決定則と全カーネルの式は<a href="../overview/timestep.html">時間刻み制御と CFL</a> にまとめてある。</p>
     </section>
 
     <section aria-labelledby="outputs">
@@ -132,22 +160,23 @@ Diagnostics(enabled=True, every=1)</code></pre>
 
     <section aria-labelledby="restart">
       <h2 id="restart">チェックポイントと再開</h2>
-      <p>再開は、元の run と同じデッキファイルを内容を変えずに使い、チェックポイントの接頭辞（ランクの接尾辞や <code>.h5</code> を除いたもの）を <code>--restart</code> で渡す。たとえば <code>./build/tenryu run minimal_1d.py --restart outputs/minimal_1d/checkpoints/minimal_1d_ckpt_0000</code> とする。チェックポイントの凍結設定にはデッキ本文のハッシュと、<code>Main.restart_from</code> を除くすべての設定が入っていて、再開に使うデッキと一致しなければ開始する前に失敗する（<code>checkpoint frozen_config JSON mismatch</code>）。デッキに <code>restart_from</code> を書き足す、<code>t_end</code> を延ばす、出力の間隔を変える、コメントを足すなど、本文を少しでも変えると再開できない。接頭辞をデッキに持たせたいときは、元の run のデッキから <code>restart_from=os.environ.get("RESTART_FROM", "")</code> のように環境変数から読み、本文を変えずに渡す。一致するチェックポイントがない場合も開始する前に失敗する。再開は、チェックポイントに保存された状態、時刻、時間刻み、次の出力時刻を引き継ぐ。出力はデッキの <code>Output.directory</code> に書き、そのディレクトリが既にあれば <code>_001</code> などの通し番号を付けた新しいディレクトリに書く。1D の run は、2026-09-26 以降に書いた途中のチェックポイントから再開すると、元の run とビット一致で続く。GXII の FLD・S<sub>N</sub> デッキと燃焼のあるデッキで、履歴の全列が一致することを確かめている。ただし、光線追跡を再利用する run（<code>Laser.raytrace_skip_config.enabled=True</code>）は、再開直後に全光線を追跡し直すので一致しない。2026-09-25 より前の 1D の S<sub>N</sub> の run を再開するときは、<code>Radiation.sn_transport.spatial_scheme="linear_characteristic"</code> を明示すると従来の空間離散化で続く。</p>
+      <p>再開は、元の run と同じデッキファイルを内容を変えずに使い、チェックポイントの接頭辞（ランクの接尾辞や <code>.h5</code> を除いたもの）を <code>--restart</code> で渡す。たとえば <code>./build/tenryu run minimal_1d.py --restart outputs/minimal_1d/checkpoints/minimal_1d_ckpt_0000</code> とする。再開の照合は、チェックポイントの凍結設定と、再開に使うデッキから作った凍結設定を、デッキ本文のハッシュと、<code>Main.restart_from</code> を除くすべての設定について比べる（<a href="#terms-freeze">凍結</a>）。一致しなければ開始する前に失敗する（<code>checkpoint frozen_config JSON mismatch</code>）。デッキに <code>restart_from</code> を書き足す、<code>t_end</code> を延ばす、出力の間隔を変える、コメントを足すなど、本文を少しでも変えると再開できない。接頭辞をデッキに持たせたいときは、元の run のデッキから <code>restart_from=os.environ.get("RESTART_FROM", "")</code> のように環境変数から読み、本文を変えずに渡す。一致するチェックポイントがない場合も開始する前に失敗する。再開は、チェックポイントに保存された状態、時刻、時間刻み、次の出力時刻を引き継ぐ。出力はデッキの <code>Output.directory</code> に書き、そのディレクトリが既にあれば <code>_001</code> などの通し番号を付けた新しいディレクトリに書く。1D の run は、2026-09-26 以降に書いた途中のチェックポイントから再開すると、元の run とビット一致（bitwise identical）で続く。GXII（激光 XII 号、GEKKO XII）の FLD・離散座標法（discrete ordinates、S<sub>N</sub>）のデッキと、核燃焼を含むデッキで、履歴の全列が一致することを確かめている。ただし、前回の光線追跡（ray tracing）の結果をパワーの比で再スケールして再利用する設定（<code>Laser.raytrace_skip_config.enabled=True</code>、既定は False）の run は、再開直後に全光線を追跡し直すので一致しない。2026-09-25 より前の 1D の S<sub>N</sub> の run を再開するときは、<code>Radiation.sn_transport.spatial_scheme="linear_characteristic"</code> を明示すると従来の空間離散化で続く。</p>
       <h3 id="continue">run の延長</h3>
-      <p>終えた run を、終了時刻や step 上限を延ばして続けるには、デッキは変えずに新しい値を CLI で渡す：<code>./build/tenryu run &lt;deck.py&gt; --restart &lt;checkpoint&gt; --t-end &lt;s&gt;</code>（または <code>--max-steps &lt;N&gt;</code>）。終えた run の最後から続けるには、元の run のデッキに <code>Output(..., write_final_checkpoint=True)</code> を入れておき、終了した step のチェックポイントを残す。途中のチェックポイントからも同じ方法で延ばせて、デッキの <code>t_end</code> より前から延ばした run は、延ばした値をデッキに書いて最初から走らせた run とビット一致する（1D の FLD で確認）。延ばした値はチェックポイントの凍結設定に入らない（デッキの値のまま）ので、延ばした run のチェックポイントから、同じデッキと新しい値でさらに続けられる。実際に使った値は <code>run_info.json</code> の <code>t_end</code>・<code>max_steps</code> に記録する。<code>--t-end</code>・<code>--max-steps</code> は再開専用で、チェックポイントがすでに終了時刻や step 上限に達しているのにこれらを渡さないと、どちらを渡せばよいかを示して開始前に止まる。<code>LaserBeam.energy_J</code> の正規化はデッキの <code>t_end</code> までの区間のままで、パルスがその後も続くと延ばした区間の分だけエネルギーが追加で入る（WARNING に量が出る）。延ばした run の出力はデッキの <code>Output.directory</code> の隣の <code>_001</code> などに書かれる。途中のチェックポイントから続けた場合、続きは元の出力の終わりの区間を計算し直すので、Studio の履歴のグラフと TENRYU Scope（スナップショットの一覧と時空図）は、その区間を続きの結果で表示する。</p>
+      <p>終えた run を、終了時刻やステップ数の上限を延ばして続けるには、デッキは変えずに新しい値を CLI で渡す：<code>./build/tenryu run &lt;deck.py&gt; --restart &lt;checkpoint&gt; --t-end &lt;s&gt;</code>（または <code>--max-steps &lt;N&gt;</code>）。終えた run の最後から続けるには、元の run のデッキに <code>Output(..., write_final_checkpoint=True)</code> を入れておき、終了したステップのチェックポイントを残す。途中のチェックポイントからも同じ方法で延ばせて、デッキの <code>t_end</code> より前から延ばした run は、延ばした値をデッキに書いて最初から走らせた run とビット一致する（1D の FLD で確認）。延ばした値はチェックポイントの凍結設定に入らない（デッキの値のまま）ので、延ばした run のチェックポイントから、同じデッキと新しい値でさらに続けられる。実際に使った値は <code>run_info.json</code> の <code>t_end</code>・<code>max_steps</code> に記録する。<code>--t-end</code>・<code>--max-steps</code> は再開専用で、チェックポイントがすでに終了時刻やステップ数の上限に達しているのにこれらを渡さないと、どちらを渡せばよいかを示して開始前に止まる。<code>LaserBeam.energy_J</code> の正規化はデッキの <code>t_end</code> までの区間のままで、パルスがその後も続くと延ばした区間の分だけエネルギーが追加で入る（WARNING に量が出る）。延ばした run の出力はデッキの <code>Output.directory</code> の隣の <code>_001</code> などに書かれる。途中のチェックポイントから続けた場合、続きは元の出力の終わりの区間を計算し直すので、Studio の履歴のグラフと TENRYU Scope（スナップショットの一覧と時空図）は、その区間を続きの結果で表示する。</p>
     </section>
 
     <section aria-labelledby="troubleshooting">
       <h2 id="troubleshooting">うまくいかないとき</h2>
+      <p>入力の誤りは、例外 <code>ConfigError</code> または <code>ValueError</code>（<a href="namelist.html#validation-defaults">検証と既定値</a>）として報告され、先頭が <code>TENRYU ERROR [namelist]:</code> の行で表示されて、終了コード 1 で止まる。デッキの実行中に見つかった誤りは、<code>Python execution failed: RuntimeError:</code> に原因の文が続き、<code>At:</code> の次の行にデッキの行が示される。出力の準備や時間ループの中で、それ以外の例外が出て止まるときは、先頭が <code>TENRYU ERROR [run]:</code> の行になる。表明（assertion）の失敗は、<code>TENRYU_ASSERT failed:</code> に条件と原因の文が続く行を出して、異常終了する。</p>
       <table class="quick-facts">
         <thead><tr><th>症状</th><th>原因と対処</th></tr></thead>
         <tbody>
-          <tr><th><code>ConfigError: ... is not a supported key (did you mean 'X'?)</code></th><td>キー名の打ち間違い。候補が出るのでそのまま直す。</td></tr>
-          <tr><th><code>ConfigError: eos.file is required for model=sesame</code></th><td>テーブル EOS はファイル必須。入門は <code>ideal_gas</code> にする。</td></tr>
-          <tr><th><code>Radiation.mode="imc_ddmc"</code> でエラー</th><td>旧 Monte Carlo 輸送は退役し、2026-09-29 にビルドから外した。書かない（= FLD 既定）か <code>sn_transport</code> にする。<code>imc=dict(...)</code>（<code>two_stage</code> 以外）・<code>ddmc=dict(...)</code>・<code>holo=dict(...)</code> は受理して WARNING を出し、無視する（<code>enabled=True</code> はエラー）。</td></tr>
+          <tr><th><code>... is not a supported key (did you mean 'X'?)</code></th><td>キー名の打ち間違い。候補が出るのでそのまま直す。</td></tr>
+          <tr><th><code>... eos.file is required for model=sesame</code></th><td>テーブル EOS はファイル必須。入門は <code>ideal_gas</code> にする。</td></tr>
+          <tr><th><code>Radiation.mode="imc_ddmc"</code> でエラー</th><td>モンテカルロ輻射輸送（Monte Carlo radiation transport）は退役し、現在のビルドに含まれない。<code>mode</code> を書かない（= FLD 既定）か <code>sn_transport</code> にする。<code>imc=dict(...)</code>（<code>two_stage</code> 以外）・<code>ddmc=dict(...)</code>・<code>holo=dict(...)</code> は、受理して WARNING を出し、何もしない（<code>enabled=True</code> はエラー）。</td></tr>
           <tr><th>実行したのに結果が古いまま</th><td>出力先の衝突で <code>_001</code> の連番ディレクトリへ書かれている。出力先を確認する。</td></tr>
           <tr><th>温度が上がらない / 波が進まない</th><td>まず validate の要約で有効な物理モジュールを確認し、次に <code>config/*_frozen.json</code> で境界・不透明度の実効値を確認する。</td></tr>
-          <tr><th>\(\Delta t\) が縮み続けて進まない</th><td>履歴の <code>dt_winner</code>、またはログの limiter 名（<code>Main.verbosity="verbose"</code> のとき出る）で律速カーネルを特定する（<a href="../overview/timestep.html">時間刻み制御</a>）。床（<code>dt.min_s</code>）を割ると FATAL 停止する。</td></tr>
+          <tr><th>\(\Delta t\) が縮み続けて進まない</th><td>履歴の <code>dt_winner</code>、またはログの <a href="#terms-limiter">limiter</a> 名（<code>Main.verbosity="verbose"</code> のとき出る）で律速カーネルを特定する（<a href="../overview/timestep.html">時間刻み制御</a>）。\(\Delta t\) が下限 <code>dt.min_s</code> を割ると FATAL 停止する（<a href="#terms-floor">床</a>とは別の下限である）。</td></tr>
           <tr><th>CMake・ビルド段階の失敗</th><td><a href="building.html">ビルド</a>と<a href="requirements.html">動作環境</a>のページを参照。</td></tr>
         </tbody>
       </table>

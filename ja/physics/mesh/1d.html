@@ -13,17 +13,17 @@
   <main>
     <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
     <h1>1D メッシュ: 格子と領域 <span class="badge">reference</span></h1>
-    <p class="abstract">TENRYU の 1D 計算領域は、一様または傾斜配置のゾーニングと、球・円筒・平面の測度を備えた半径方向の節点格子である。デッキ側の領域ペイントによって、材料、前駆プラズマのコロナ、外側の VOID を割り当てる。</p>
+    <p class="abstract">TENRYU の 1D の計算領域は、半径方向の節点（node）列で表す。節点は、等しい幅で並べる一様な配置か、区間（segment）ごとにセルの細かさを変える傾斜配置（graded zoning）で置く。座標は球・円筒・平面から選び、この選択が、同じ節点列に対する面積と体積の与え方、すなわち測度（measure）を決める。材料の分布は、<a href="../../use/namelist.html#terms-deck">デッキ（deck）</a>の関数 <code>Geometry.volfrac</code> が、セルごとの体積分率（volume fraction）として与える。格子の外側には、ボイド（void）セルと、前駆プラズマ（pre-plasma）に当たる低密度のコロナ層（corona ramp）を置ける。この計算に固有の用語は<a href="#terms">用語の節</a>で説明する。</p>
 
     <section aria-labelledby="mechanism">
       <h2 id="mechanism">物理機構</h2>
-      <p>ラグランジュ的な 1D 爆縮では、格子そのものが誤差の内訳の一部になる。各セルが質量を保ち続けるため、初期のゾーニングが全時刻の解像度分布を決める。アブレータの表面や、燃料とシェルの界面へ質量を配置すれば、最大圧縮時に急な勾配が現れる場所へ解像度が配置される。傾斜配置のゾーニングはそこへセルを配分し、スーパーガウス型の重み分布がセル幅を滑らかかつ単調に遷移させる。セル幅が急に跳ぶと、音波や衝撃波の信号を数値的に反射してしまうためである。</p>
-      <p>球・円筒・平面の違いは、節点の配置ではなく測度として入る。同じ節点列を、それぞれに対応する面の面積 \(A(r)\) と殻の体積 \(V(r_0,r_1)\) で解釈する。半径の大きな場所にある薄い球殻では、ほぼ等しい 3 乗の値を直接引くと破滅的な桁落ちが起きるため、因数分解した殻体積の式を使う。</p>
-      <p>材料の領域は体積分率でペイントするため、材料の配置を格子の構築から独立に定義できる。VOID は、正の状態の下限と <code>cell_is_void</code> のマスクを組み合わせ、熱伝導と輻射の結合から除外する。真空を通常の極低密度の材料として扱うと、代わりに巨大な拡散係数が生じてしまう。また、解像された指数関数的なコロナは、レーザーの計算を始めるための物理的な前提である。コロナは VOID まで狭義単調に減少しなければならず、平坦な部分があると共振器として働く。この共振は、<a href="#regions-corona">後述のコロナ層の節</a>で説明する反対称な節点対の不安定性として実証されている。</p>
+      <p>ラグランジュ法（Lagrangian）の 1D 爆縮では、格子そのものが誤差の内訳の一部になる。各セルが質量を保ち続けるため、初期のゾーニングが全時刻の解像度分布を決める。アブレータの表面や、燃料とシェルの界面へ質量を配置すれば、最大圧縮時に急な勾配が現れる場所へ解像度が配置される。傾斜配置のゾーニングはそこへセルを配分する（<a href="#terms-segment">区間と傾斜配置</a>）。スーパーガウス型（super-Gaussian）の重み（weight）は、区間の中央から端へ滑らかかつ単調に下がる（<a href="#terms-weight">重みとそのパラメータ</a>）。セルの質量をこの重みに比例させるので（比例の程度は写像（mapping）で異なる。<a href="#terms-mapping">写像と測度</a>）、セル幅は区間の中で滑らかに変わる。セル幅が急に跳ぶと、音波や衝撃波の信号を数値的に反射してしまうためである。</p>
+      <p>球・円筒・平面の違いは、おもに測度として入る。同じ節点列を、それぞれに対応する面の面積 \(A(r)\) と殻の体積 \(V(r_0,r_1)\) で解釈する（式は<a href="#one-d-geometry">次節</a>）。例外は <code>exact_measure_v2</code> の写像で、測度に応じて節点の位置も変わる。半径の大きな場所にある薄い球殻では、ほぼ等しい 3 乗の値を直接引くと破滅的な桁落ち（catastrophic cancellation）が起きるため、因数分解した殻体積の式を使う。</p>
+      <p>材料の領域（region）は体積分率で指定するので、材料の配置を格子の構築から独立に定義できる（<a href="#terms-region">領域と体積分率</a>）。ボイドセルは、<code>cell_is_void</code> のマスクで識別し、電子熱伝導、輻射、レーザーとの結合から除外する。ボイドセルの初期の密度と温度は <code>Materials.void_config</code> で与える（<a href="#terms-void">ボイドセル</a>）。真空を通常の極低密度の材料として扱うと、代わりに巨大な熱拡散率（thermal diffusivity）が生じてしまう。また、レーザーで冷たい固体を加熱するには、固体の表面の外側にコロナが要る。コロナの置き方は 2 つある。初期の流体の分布に置くコロナ層と、レーザー格子（laser mesh）だけに置くゴーストコロナ（ghost corona、キー <code>Laser.lasermesh.ghost_corona</code>）である。この頁が扱うのはコロナ層である（両者の違いは<a href="#terms-ghost">コロナ層とゴーストコロナの違い</a>）。コロナ層はボイドセルまで狭義単調（strictly monotonic）に減少させる。平坦な部分があると、レーザーを当てたときに数値不安定が成長した記録がある（<a href="#regions-corona">後述のコロナ層の節</a>）。</p>
       <ul>
-        <li><strong>スーパーガウス型のパラメータ:</strong> \(\epsilon_{\rm edge}\) は端における正の下限（<code>Mesh.grid.grading.edge_ratio</code>）、\(\sigma_{\rm sg}\) は分布の広がり（<code>grading.sg_sigma</code>）、偶数の指数 \(m_{\rm sg}\) は肩の鋭さ（<code>grading.sg_order</code>）を決める。</li>
-        <li><strong><code>exact_measure_v2</code></strong>（<code>grading.mapping</code>）：累積した重みを、球・円筒・平面それぞれの厳密な殻の測度で反転する。したがって密度が一定の場合、重みに従うのはセルの幅ではなくセルの<em>質量</em>である。</li>
-        <li><strong>生成時の検査:</strong> すべての幅が有限かつ正であること、組み立てた節点が狭義単調に増加すること、最後の節点が指定した外端と一致することを検査する。</li>
+        <li><strong>重みのパラメータ:</strong> \(\epsilon_{\rm edge}\)（<code>Mesh.grid.grading.edge_ratio</code>）、\(\sigma_{\rm sg}\)（<code>grading.sg_sigma</code>）、\(m_{\rm sg}\)（<code>grading.sg_order</code>）の 3 つが、区間の中の重みの形を決める。定義と既定値は<a href="#terms-weight">重みとそのパラメータ</a>に述べる。</li>
+        <li><strong>写像:</strong> 重みから節点の位置を決める手順を <code>grading.mapping</code> で選ぶ。既定は <code>legacy_estimated_radius</code> で、<code>exact_measure_v2</code> を選ぶと、密度が一定のとき、重みに従うのはセルの幅ではなくセルの質量になる（<a href="#terms-mapping">写像と測度</a>）。</li>
+        <li><strong>生成時の検査:</strong> すべての幅が有限かつ正であること、各区間の幅の和が区間の長さに一致すること、組み立てた節点が狭義単調に増加することを検査し、最後の節点を指定した外端に固定する。</li>
       </ul>
     </section>
 
@@ -35,58 +35,135 @@
       \qquad
       V(r_0,r_1)=\frac{4\pi}{3}(r_1^3-r_0^3)\;|\;\pi(r_1^2-r_0^2)\;|\;(r_1-r_0).
       $$
-      <p>節点 \(j=0,\ldots,N\) はセル境界の位置と速度をもち、セル \(i=0,\ldots,N-1\) は区間 \([r_i,r_{i+1}]\) の密度、内部エネルギー、温度、圧力などをもつ。球殻の薄いセルでは 3 乗の差による桁落ちを避けるため、実装は必要な箇所で因数分解した体積の式を使う。球面の既定経路は従来の演算順序を保ち、別の幾何を選んでも内部の単位系は cgs のままである。</p>
-      <p><code>Mesh.grid="uniform"</code> は領域を等しい幅のセルに分ける。<code>graded</code> は連続した半径方向の区間と、区間ごとのセル数を受け取り、区間のセル数を \(n_s\) として、規格化したセル中心 \(\xi_k=(k+1/2)/n_s\) に対するスーパーガウス型の重み</p>
+      <p>ここで \(r\) は半径、\(r_0\) と \(r_1\) は殻の内側と外側の半径である。節点 \(j=0,\ldots,N\) はセル境界の位置と速度をもち、セル \(i=0,\ldots,N-1\) は半径 \(r_i\) から \(r_{i+1}\) までの範囲の密度、内部エネルギー、温度、圧力などをもつ。球殻の薄いセルでは 3 乗の差による桁落ちを避けるため、実装は必要な箇所で因数分解した体積の式を使う。球面の既定経路は従来の演算順序を保ち、別の幾何を選んでも内部の単位系は cgs のままである。</p>
+      <p><code>Mesh.grid="uniform"</code> は、<code>Mesh.r_min</code> から <code>Mesh.r_max</code> までを、等しい幅の <code>Mesh.nr</code> 個のセルに分ける。<code>Mesh.grid</code> に <code>type="graded"</code> を与えると、連続する半径方向の区間の列と、区間ごとのセル数を受け取る（<a href="#terms-segment">区間と傾斜配置</a>）。区間のセル数を \(n_s\)、区間の中のセルの番号を \(k=0,\ldots,n_s-1\) として、規格化したセル中心 \(\xi_k=(k+1/2)/n_s\) に対するスーパーガウス型の重み</p>
       $$
       w_k=\epsilon_{\rm edge}+(1-\epsilon_{\rm edge})
       \exp\!\left[-\left(\frac{|2\xi_k-1|}{\sigma_{\rm sg}}\right)^{m_{\rm sg}}\right]
       $$
-      <p>から、幅または殻の測度を配分する。区間の長さは厳密に保存し、隣り合う区間の境界における幅は幾何平均を目標にそろえる。明示的に有効化する <code>exact_measure_v2</code> の写像は、累積した重みを球・円筒・平面それぞれの厳密な殻の測度で反転し、密度が一定の区間ではセルの質量を重みに対応させる。生成後は、節点列が有限で幅が正であること、狭義単調であること、そして指定した外端に一致することを検査する。</p>
+      <p>を作る。\(\epsilon_{\rm edge}\)、\(\sigma_{\rm sg}\)、\(m_{\rm sg}\) は重みの形を決める 3 つのパラメータである（<a href="#terms-weight">重みとそのパラメータ</a>）。この重みから、写像がセルの幅を決める（<a href="#terms-mapping">写像と測度</a>）。区間の長さは厳密に保存し、隣り合う区間の境界における幅は幾何平均を目標にそろえる。明示的に有効化する <code>exact_measure_v2</code> の写像は、累積した重みを球・円筒・平面それぞれの厳密な殻の測度で反転し、密度が一定の区間ではセルの質量を重みに対応させる。生成後は、すべての幅が有限で正であること、各区間の幅の和が区間の長さに一致すること、節点列が狭義単調であることを検査し、最後の節点を指定した外端に固定する。</p>
+    </section>
+
+    <section aria-labelledby="terms">
+      <h2 id="terms">この計算で使う用語</h2>
+      <p>1D の格子は、区間、重み、写像という単位で作る。材料の分布は、領域、ボイドセル、コロナ層で与える。これらは TENRYU の実装に固有の意味で使うので、まとめて定義する。</p>
+
+      <h3 id="terms-segment">区間と傾斜配置</h3>
+      <p><strong>区間（segment）</strong>は、傾斜配置の格子を作る単位となる、半径方向の範囲である。<code>Mesh.grid</code> の <code>segments</code> に、<code>{"r_start": …, "r_end": …, "nr": …}</code> の形で並べる。内端の半径を \(r_{\rm start}\)、外端の半径を \(r_{\rm end}\)、セル数を \(n_s\)（<code>nr</code>）とする。区間は隣り合う区間と端を共有して並び、節点列は先頭の区間の <code>r_start</code> から最後の区間の <code>r_end</code> までになる。区間のセル数の和が全セル数で、<code>Mesh.nr</code> と食い違うときは、警告を出して和を使う。全セル数は 4 以上でなければならない。<code>r_end</code> が <code>r_start</code> 以下の区間、セル数が 1 未満の区間、端が一致しない区間の列は、誤りとして拒否する。デッキ生成 GUI の <a href="../../use/gui.html">TENRYU Studio</a>（以下 Studio）の初期値は、区間なしの一様な格子で、<code>Mesh.nr</code> は 300 である。</p>
+      <p><strong>傾斜配置（graded zoning）</strong>は、区間ごとに重み（<a href="#terms-weight">次項</a>）に応じてセルの大きさを変え、区間の端に細かいセルを集める配置である。端を材料の界面や標的の表面に合わせると、最大圧縮時に急な勾配が現れる場所に解像度が置かれる。密度が一定のとき、セルの質量は重みに比例し（比例の程度は写像で異なる）、端のセルの質量は中央のセルより小さい。区間を指定しないときは、<code>Mesh.r_min</code> から <code>Mesh.r_max</code> までを 1 つの区間として、等しい幅の <code>Mesh.nr</code> 個のセルに分ける（<code>Mesh.grid="uniform"</code> と同じである）。等しい幅のセルは、球と円筒の測度では、外側のセルほど体積と質量が大きい。</p>
+      <p>隣り合う区間の境界では、セル幅を連続にするため、左の区間の最後のセルの幅と右の区間の最初のセルの幅の幾何平均を、両側の幅の目標にする。各区間は、端のセルの幅をこの目標に置き換え、残りのセルを共通の倍率で拡大・縮小して、区間の長さを保つ。区間のセル数が少なく、両端の目標幅と区間の長さを同時に満たせないときは、生成が assert で異常終了する。</p>
+
+      <h3 id="terms-weight">重みとそのパラメータ</h3>
+      <p><strong>重み（weight）</strong>\(w_k\) は、区間の中のセル \(k\) に配分する質量の相対値である（式は<a href="#one-d-geometry">1D の座標幾何とゾーニング</a>）。区間の中央でほぼ 1 になり、端に向かって下がり、端（\(|2\xi_k-1|\to1\)）では \(\epsilon_{\rm edge}+(1-\epsilon_{\rm edge})\exp[-(1/\sigma_{\rm sg})^{m_{\rm sg}}]\) になる（既定値で 0.114）。<code>exact_measure_v2</code> の写像では、密度が一定のとき、セル \(k\) の質量が区間の質量の \(w_k/\sum_lw_l\) になる。既定の写像では、この比例が近似になる。重みの形は、<code>Mesh.grid.grading</code> の 3 つのパラメータで決まる。指定しなければ既定値を使い、Studio も同じ値を書き出す。</p>
+      <ul>
+        <li>\(\epsilon_{\rm edge}\)（<code>edge_ratio</code>、既定 0.1、0 より大きく 1 より小さい）は、重みの下限である。端のセルの質量は、中央のセルの質量の \(\epsilon_{\rm edge}\) 倍より少し大きい。1 に近づけると、重みは区間の全体で一様になる。</li>
+        <li>\(\sigma_{\rm sg}\)（<code>sg_sigma</code>、既定 0.7、0 より大きく 1 より小さい）は、中央から端への下がり始めの位置を決める。中央からの規格化した距離 \(|2\xi_k-1|\) が \(\sigma_{\rm sg}\) に達する位置で、重みは \(\epsilon_{\rm edge}+(1-\epsilon_{\rm edge})/e\)（既定値で 0.431）になる。</li>
+        <li>\(m_{\rm sg}\)（<code>sg_order</code>、既定 4、2 以上の偶数）は、その下がり方の鋭さを決める。大きいほど、中央は平らで、\(\sigma_{\rm sg}\) の近くで急に下がる。</li>
+      </ul>
+      <p>3 つのパラメータが決めるのは、区間の中のセルの質量の配分だけである。区間の長さ、セル数、区間の境界の位置は変わらない。既定値での重みの曲線は<a href="#fig-weight-mapping">図A</a>(a) に示す。</p>
+
+      <h3 id="terms-mapping">写像と測度</h3>
+      <p><strong>測度（measure）</strong>は、座標が決める面積と体積の与え方である（式は<a href="#one-d-geometry">1D の座標幾何とゾーニング</a>）。半径 \(r\) の内側の体積は \(r^d\) に比例し、\(d\) は球で 3、円筒で 2、平面で 1 である。座標は <code>Mesh.geometry_1d</code>（既定 <code>"spherical"</code>）で選ぶ。</p>
+      <p><strong>写像（mapping）</strong>は、区間の重み \(w_k\) から節点の半径を決める手順で、<code>Mesh.grid.grading.mapping</code> で選ぶ。2 つある。</p>
+      <ul>
+        <li><code>"legacy_estimated_radius"</code>（既定）は、球の測度を仮定して、セル \(k\) の幅を \(\Delta r_k\propto w_k/(r_{{\rm est},k}^2+r_{\rm ref}^2)\) とし、区間の長さ \(\ell=r_{\rm end}-r_{\rm start}\) に合うよう規格化する。\(r_{{\rm est},k}=r_{\rm start}+\ell\xi_k\) は、等間隔に置いたセル中心の仮の半径で、最終的なセル中心とは一致しない。\(r_{\rm ref}=\ell/\sqrt{n_s}\) は、原点から始まる区間（\(r_{\rm start}&lt;10^{-12}\) cm）で \(1/r^2\) の発散を抑える項で、そのほかの区間では 0 である。\(\epsilon_{\rm edge}\) が 1 に十分近い（\(1-\epsilon_{\rm edge}\le10^{-12}\)）ときは、等しい幅のセルを返す。球の測度の仮定は、<code>Mesh.geometry_1d</code> が円筒や平面でも変わらない。仮の半径を使うので、密度が一定のときのセルの質量は、重みに比例する値から外れる。外れは、原点から遠い薄い殻では小さく（既定の重み、区間 0.023〜0.025 cm、セル数 60 の例で、質量と重みの比がセルの間で 4 % 以内にそろう）、原点から始まる区間では大きく、内側のセルほど小さくなる（既定の重み、区間 0〜1、セル数 32 の例で、最も内側のセルの質量は、中央のセルを基準にして、重みに比例する値の 0.5 % である）。</li>
+        <li><code>"exact_measure_v2"</code>（任意）は、重みの累積分率 \(W_k=\sum_{l\le k}w_l/\sum_lw_l\) を、測度の厳密な逆写像（inverse mapping）で節点の半径に変える。\(r_{k+1}^d=r_{\rm start}^d+W_k\,(r_{\rm end}^d-r_{\rm start}^d)\) で、\(d\) は <code>Mesh.geometry_1d</code> で決まる。密度が一定の区間では、セルの質量が丸め誤差の範囲で重みに比例し、原点から始まる区間でも同じである。\(\epsilon_{\rm edge}\to1\) の極限は、等しい質量のセルで、既定の写像の等しい幅とは異なる。1D 専用で、2D_RZ で指定すると誤りになる。Studio は <code>mapping</code> を書き出さないので、Studio のデッキは既定の写像になる。</li>
+      </ul>
+      <p>原点から始まる区間で、2 つの写像が作るセルの幅と質量を<a href="#fig-weight-mapping">図A</a>(b)(c) に比べる。どちらの写像でも、区間の境界の幅の補正（<a href="#terms-segment">区間と傾斜配置</a>）が最後に掛かる。<code>exact_measure_v2</code> でも、複数の区間をもつデッキでは境界の近くで、質量が重みに比例する関係が少し崩れる。</p>
+
+      <figure id="fig-weight-mapping">
+        <img src="../../../assets/mesh-1d-weight-mapping-ja.png" width="940" height="320" style="max-width:100%;height:auto" alt="左：区間内の規格化した位置に対する重みの曲線。中央で 1、端で 0.114 になり、下限を点線で、σ の位置の重み 0.431 を四角で示す。中・右：原点から始まる区間で 2 つの写像が作るセルの幅（対数軸）と質量の割合。橙の丸の legacy_estimated_radius は内側のセルの質量が重みに比例する値より小さく、青の四角の exact_measure_v2 は質量が重みの割合の点線に重なる">
+        <figcaption>図A. 重みと 2 つの写像（既定の \(\epsilon_{\rm edge}=0.1\)、\(\sigma_{\rm sg}=0.7\)、\(m_{\rm sg}=4\)）。(a) 区間内の規格化した位置 \(\xi\) に対する重み \(w\)。曲線は式の連続な値、白丸は \(n=32\) のセル中心、四角は \(|2\xi-1|=\sigma_{\rm sg}\) の位置（\(w=0.431\)）、ひし形は端（\(w=0.114\)）、点線は下限 \(\epsilon_{\rm edge}\) である。(b)(c) 原点から始まる区間（0〜1、\(n=32\)、球の測度、密度一定）で 2 つの写像が作るセルの幅 \(\Delta r_k\)（区間の長さ \(\ell\) で規格化、縦軸は対数）と質量の割合 \(m_k/\sum m\)。橙の丸は既定の <code>legacy_estimated_radius</code>、青の四角は <code>exact_measure_v2</code>、(b) の点線は等しい幅、(c) の点線は重みの割合 \(w_k/\sum w\) である。<code>exact_measure_v2</code> の質量は点線に重なる。<code>legacy_estimated_radius</code> の最も内側のセルの質量は、重みに比例する値の約 0.5 % しかない。薄い殻（0.023〜0.025 cm、\(n=60\)）では <code>legacy_estimated_radius</code> の質量と重みの比がセルの間で 4 % 以内（計算値 0.981〜1.017）にそろうので、図には描いていない。計算は、<code>build_graded_nodes</code> の式を 1 つの区間（隣の区間なし）に適用した。</figcaption>
+      </figure>
+
+      <h3 id="terms-region">領域と体積分率</h3>
+      <p><strong>領域（region）</strong>は、Studio で材料を置く単位で、半径方向に内側から外側へ積み重ねる層 1 枚である。外半径 <code>rOuter</code>、材料、密度、電子温度、イオン温度の組で与える。<code>rOuter</code> は内側から狭義単調に増える。Studio は、最後の領域の外半径が <code>Mesh.r_max</code> に一致すること（外側のボイドを使うときは <code>Mesh.r_max</code> より小さいこと）を要求する。</p>
+      <p>ソルバーは領域の表を読まず、デッキの関数を読む。<code>Geometry.volfrac</code> は材料ごとの体積分率（0 から 1 の無次元量）、<code>Geometry.rho</code> は密度、<code>Geometry.Te</code> と <code>Geometry.Ti</code> は電子とイオンの温度を、半径の関数として返す。Studio は、領域の表から、半径に対して区分的に一定（piecewise constant）な値を返すこれらの関数を書き出す。ソルバーは、関数をセルの中点の半径 \((r_i+r_{i+1})/2\) の 1 点で評価する。1D のセルは、関数が 0 と 1 の間の値を返さない限り、1 つの材料からなる。材料の体積分率の和が 1 を超えるセルは誤りである。和が 1 に満たないセルは、<code>Geometry.enforce_sum_to_one</code>（既定 <code>True</code>）のとき和が 1 になるよう規格化する（和が 0 のセルは誤りである）。<code>False</code> のときは規格化せず、足りない分をボイドとみなして、密度に和を掛ける。初期のセル質量は、評価した密度とセルの体積の積である。</p>
+
+      <h3 id="terms-void">ボイドセル</h3>
+      <p><strong>ボイドセル（void cell）</strong>は、ボイド材料（<code>Material(..., is_void=True)</code>）だけからなるセルである。ボイド材料でない材料の体積分率の和が \(10^{-12}\) 以下のセルがこれに当たり、<code>cell_is_void</code> のマスクで識別する。ボイドセルは、電子熱伝導、輻射、レーザーとの結合から除外する（定義と扱いは<a href="../eos-opacity.html#void-materials">ボイド材料</a>）。ボイドセルの初期の密度と温度は、デッキの <code>Geometry.rho</code>、<code>Te</code>、<code>Ti</code> の値ではなく、<code>Materials.void_config</code> から取る。既定は \(\rho=10^{-10}\,\mathrm{g\,cm^{-3}}\)、\(T_e=T_i=10^{-3}\) eV で、Studio も同じ値を書き出す。</p>
+      <p>ボイドセルは力を受けないので、連続する 2 セル以上のボイドセルの節点は、自分では動かない。1D の流体の更新は、各ステップで、この連なりの両端の節点（物質の表面、または計算領域の境界にある節点）の間に、内側の節点を等間隔に置き直し、その速度を 0 にして、セルの質量を <code>Materials.void_config</code> の密度と体積の積に保つ。これらのセルは物理から除外されているので、実在のセルの保存量には影響しない。</p>
+      <p>Studio では、「最終領域の外側を真空 (VOID) にする」（内部名 <code>vacuumOutside1d</code>、既定は無効）を有効にすると、最後の領域（コロナ層があればその外端）から <code>Mesh.r_max</code> までを、名前 <code>VOID</code> のボイド材料で埋める。名前 <code>VOID</code> は Studio が使う予約名で、外側の真空を有効にしたとき、同じ名前のユーザー材料は誤りになる。</p>
+
+      <h3 id="terms-corona">コロナ層</h3>
+      <p><strong>コロナ層（corona ramp）</strong>は、標的の外面 \(R\)（最後の領域の外半径）から外側へ、密度が指数関数的に下がる層で、初期の密度の分布として置く。層のセルは、最後の領域と同じ材料と温度をもつ流体のセルで、質量をもち、ほかのセルとともに動く。冷たい固体の表面の外にコロナがないと、レーザーはほとんど吸収される前に反射される（理由は<a href="#regions-corona">次節</a>）。層の密度は</p>
+      $$
+      \rho(r)=\max\bigl\{\rho_0\exp[-(r-R)/L],\ \rho_{\min}\bigr\},\qquad R\le r\le R_{\rm corona}
+      $$
+      <p>である。ここで \(r\) は半径、\(\rho_0\) は外面での密度、\(L\) は指数スケール長（exponential scale length。密度が \(1/e\) になる距離）、\(\rho_{\min}\) は床密度（floor density）、\(R_{\rm corona}\) は層の外端である。Studio では、フォームの「プリプラズマ・コロナ ramp」（内部名 <code>coronaRamp1d</code>、既定は無効）で、次の 4 つの入力欄から指定する。有効にしたときの初期値は、<a href="../../verification/index.html#gxii">GXII（激光 XII 号、GEKKO XII）</a>の回帰試験（regression test）のデッキと同じ値である。</p>
+      <table class="quick-facts">
+        <thead>
+          <tr><th>記号</th><th>Studio の入力欄（内部名）</th><th>初期値</th><th>意味</th></tr>
+        </thead>
+        <tbody>
+          <tr><th>\(\rho_0\)</th><td>「ramp 開始密度」（<code>rho0</code>）</td><td>0.05 g cm⁻³</td><td>外面 \(R\) での密度</td></tr>
+          <tr><th>\(L\)</th><td>「ramp スケール長 L」（<code>scaleUm</code>）</td><td>2.0 µm</td><td>指数スケール長</td></tr>
+          <tr><th>\(R_{\rm corona}-R\)</th><td>「ramp 域の長さ」（<code>extentUm</code>）</td><td>10.0 µm</td><td>層の厚さ</td></tr>
+          <tr><th>\(\rho_{\min}\)</th><td>「ramp 床密度」（<code>rhoMin</code>）</td><td>3×10⁻⁴ g cm⁻³</td><td>層の密度の下限</td></tr>
+        </tbody>
+      </table>
+      <p>コロナ層は、外側のボイドが有効なときだけ使える。層の外端が <code>Mesh.r_max</code> を超えてはならず、<code>rhoMin</code> は <code>rho0</code> より小さくなければならない。ソルバーにコロナ層のキーはなく、Studio がデッキの密度と体積分率の関数へ式を書き出す。床密度は、層の密度の下限として、デッキの関数の中に置く値である。ソルバーが状態に課す床（<a href="../../overview/numerics-foundations.html#floors-safety">床・クランプ・安全ガード</a>）とは別である。\(\rho_0\exp[-(r-R)/L]\) が \(\rho_{\min}\) を下回る位置から外側では、密度が \(\rho_{\min}\) で一様な平坦部になる。層が外端まで狭義単調に減少する条件は \(\rho_0\exp[-(R_{\rm corona}-R)/L]&gt;\rho_{\min}\) で、既定値では \(3.37\times10^{-4}\,\mathrm{g\,cm^{-3}}\) が \(3\times10^{-4}\,\mathrm{g\,cm^{-3}}\) を上回って満たされる。Studio はこの条件を検査しない。</p>
+
+      <h3 id="terms-ghost">コロナ層とゴーストコロナの違い</h3>
+      <p><strong>ゴーストコロナ（ghost corona）</strong>は、コロナ層とは別のものである。レーザーの光線追跡（ray tracing）のためだけに、レーザー格子の最外の物質セルの外側へ置く仮想のコロナで、流体の密度、温度、質量には入らない（1D 専用）。レーザー格子は、光線追跡のために流体の格子とは別に作る半径方向の格子で、臨界面（critical surface）の近くを細かくする（<a href="../laser.html#lasermesh-march">レーザー</a>参照）。ゴーストコロナで吸収されたパワーは、最外の物質セルから内向きの数セルへ再配分される（リポジトリの <code>docs/NUMERICS.md</code> §5.7.5）。キーは <code>Laser.lasermesh.ghost_corona</code> で、既定は無効である。Studio はこの機能を「合成コロナ (ghost corona)」と表示する。どちらも、冷たい固体の表面の外にコロナがないという、同じ問題を解く。</p>
+      <table class="quick-facts">
+        <thead>
+          <tr><th>項目</th><th>コロナ層（corona ramp）</th><th>ゴーストコロナ（ghost corona）</th></tr>
+        </thead>
+        <tbody>
+          <tr><th>置く場所</th><td>初期の流体のメッシュ（最後の領域とボイドの間）</td><td>レーザー格子だけ（最外の物質セルの外側）</td></tr>
+          <tr><th>流体への影響</th><td>質量をもつセルとして流体に入り、流体とともに動く</td><td>流体の密度、温度、質量には入らない</td></tr>
+          <tr><th>設定</th><td>デッキの <code>Geometry.rho</code> と <code>Geometry.volfrac</code>（Studio は <code>coronaRamp1d</code>）</td><td><code>Laser.lasermesh.ghost_corona</code>（1D 専用）</td></tr>
+          <tr><th>既定</th><td>Studio で無効。ソルバーにキーはない</td><td>ソルバーと Studio で無効</td></tr>
+          <tr><th>Studio のプリセット</th><td>使わない</td><td>レーザーで駆動するプリセットが使う</td></tr>
+        </tbody>
+      </table>
     </section>
 
     <section aria-labelledby="regions-corona">
-      <h2 id="regions-corona">領域のペイント、VOID、コロナ層</h2>
-      <p>1D のデッキは、外半径が狭義単調な同心の領域を、区分的に一定な材料の状態として記述する。各領域は半径に関する判定条件を体積分率の関数へ変換し、<code>Geometry.volfrac</code> がセルごとの材料の割り当てを与える。これにより、中心のガス、固体のシェル、外層を格子の生成から切り離して記述でき、体積分率の総和が 1 になることをデッキ側で強制できる。</p>
-      <p>外側の真空を単なる極低密度の通常材料にすると、レーザーで加熱したあとの熱伝導係数や輻射係数が数値の系に残ってしまう。そこで外側の帯には <code>Material(..., is_void=True)</code> の予約材料 <code>VOID</code> を塗り、<code>Materials.void_config</code> に正の \(\rho,T_e,T_i\) の下限を与える。下限は状態の配列を有限に保つための値だが、<code>cell_is_void</code> のマスクにより、VOID のセルは電子熱伝導と輻射における物質との結合や源の求解から除外される。</p>
-      <p>レーザー標的では、冷たい固体表面から VOID への 1 セル分の密度の跳びだけでは、351 nm の光がほとんど伝搬距離をもたないまま臨界密度で反射してしまい、逆制動輻射吸収が種となるコロナを作れない。デッキ生成 GUI である <a href="../../use/gui.html">TENRYU Studio</a> の <code>coronaRamp1d</code> は、標的の外面 \(R\) から</p>
-      $$
-      \rho(r)=\rho_0\exp[-(r-R)/L],\qquad R&lt;r\le R_{\rm corona},
-      $$
-      <p>という指数関数的な吹き出しを生成する。ここで \(\rho_0\) は標的の外面 \(R\) におけるランプの基部密度、\(L\) はその指数スケール長、\(R_{\rm corona}\) はランプの外端である。<a href="../../verification/index.html#gxii">GXII</a> の回帰試験では \(L=2\,\mu\mathrm m\)、広がり \(10\,\mu\mathrm m\)、\(\rho_0=0.05\,\mathrm{g\,cm^{-3}}\)、裾の下限 \(3\times10^{-4}\,\mathrm{g\,cm^{-3}}\) を使い、351 nm に対する CH の臨界密度 \(0.028\,\mathrm{g\,cm^{-3}}\)（完全電離 CH、\(\bar Z=3.5\)・\(\bar A=6.5\) を仮定した値）を、解像された傾斜層の内側に置いている。この傾斜層は VOID まで狭義単調でなければならず、一様な下限による平坦部を作ってはいけない。かつて存在した 3 セルの一様な低密度の平坦部が共振器として働き、わずかな逆制動輻射の沈着を種に、隣接する節点対が逆位相で動く市松型のモード（反対称な節点対）を指数関数的に成長させたためである（この数値不安定は、レーザーを切ると成長しない）。</p>
+      <h2 id="regions-corona">材料の領域、ボイド、コロナ層</h2>
+      <p>標的は、中心のガス、固体のシェル、外層のような、同心の材料の領域として与える。ソルバーは領域の関数をセルの中点の半径で評価するので、領域の境界がセルの内側にあると、そのセルの材料は中点の位置で決まり、界面はセル 1 個の精度で表される。界面を節点に合わせるには、傾斜配置の区間の端を領域の境界に置く（<a href="#terms-region">領域と体積分率</a>）。</p>
+      <p>外側の真空を単なる極低密度の通常材料にすると、レーザーで加熱したあとの低密度のセルに、熱伝導と輻射の係数が残る。熱拡散率 \(\kappa/(\rho c_v)\) は密度に反比例するので、このセルでは巨大になり、熱伝導の陽的な安定限界（時間刻みの上限）を極端に小さくして、スーパータイムステッピング（super time-stepping、STS）による計算を実質的に止める（<a href="../conduction.html#sts">電子・イオン熱伝導</a>参照）。そこで外側はボイドセルで表す。ボイドセルは熱伝導率を 0 にするので、この問題が起きない（定義は<a href="#terms-void">ボイドセル</a>）。</p>
+      <p>コロナがないと、レーザーの吸収が立ち上がらない。冷たい固体の表面が、1 セル分の密度の跳びでボイドセルに接すると、351 nm の光は伝搬距離をほとんどもたないまま臨界密度（critical density）で反射され、逆制動輻射（inverse bremsstrahlung）による吸収が起きず、加熱で育つコロナの種ができない。コロナ層を置かない GXII のデッキでは、1 ns のパルス全体の吸収率が約 \(4\times10^{-4}\) にとどまった（2026-07 の測定）。この問題を解く方法は、コロナ層を初期の流体の分布として置く方法と、ゴーストコロナをレーザー格子に置く方法の 2 つである（<a href="#terms-ghost">コロナ層とゴーストコロナの違い</a>）。以下は、コロナ層を扱う。</p>
+      <p><a href="../../verification/index.html#gxii">GXII</a> の回帰デッキは、コロナ層に \(L=2\,\mu\mathrm m\)、厚さ \(10\,\mu\mathrm m\)、\(\rho_0=0.05\,\mathrm{g\,cm^{-3}}\)、床密度 \(3\times10^{-4}\,\mathrm{g\,cm^{-3}}\) を使う。351 nm に対する CH の臨界密度は \(0.028\,\mathrm{g\,cm^{-3}}\)（完全電離の CH、\(\bar Z=3.5\)・\(\bar A=6.5\) を仮定した質量密度）で、コロナ層の密度の範囲（0.05 から \(3.4\times10^{-4}\,\mathrm{g\,cm^{-3}}\)）の内側にある（<a href="#fig-regions-corona">図B</a>）。このデッキの格子は、半径 0〜500 µm を 2.5 µm の等しい幅の 200 セルに分けるので、厚さ 10 µm のコロナ層は 4 セルで表され、臨界密度の位置（外面から 1.2 µm）は外面に接する最初のセルの内側にある。</p>
+      <p>コロナ層は、ボイドセルまで狭義単調に減少させ、一様な床密度の平坦部を作らないこと。ボイドセルの隣に \(\rho=10^{-4}\,\mathrm{g\,cm^{-3}}\) の一様な 3 セルの平坦部を置いた GXII のデッキ（2026-07）では、レーザーを当てると、隣り合う節点が逆向きに動く市松模様（checkerboard）のモードが指数関数的に成長した。レーザーを切ると成長しない。この現象は未解決の既知の問題として記録されており、現在のデッキはこの配置を避けている。</p>
 
-      <figure>
-        <img src="../../../assets/mesh-1d-regions-corona.png" width="940" height="440" style="max-width:100%;height:auto" alt="GXII 回帰の標的の領域ペイント（DT ガス、CH シェル、CH コロナランプ、VOID）と対数軸の密度分布。指数関数のランプは直線で、CH の臨界密度を横切り、VOID の境界まで下限値より上にある">
-        <figcaption>図A. 体積分率による 1D の領域ペイントと、解像された臨界面を含む前駆プラズマの密度。裾の下限は平坦部を作るためのものではなく安全のための値であり、実際の分布は VOID の境界まで減少する。</figcaption>
+      <figure id="fig-regions-corona">
+        <img src="../../../assets/mesh-1d-regions-corona-ja.png" width="940" height="440" style="max-width:100%;height:auto" alt="GXII の回帰デッキの標的の材料の領域（DT ガス、CH シェル、CH のコロナ層、ボイド）と、対数軸の密度分布。指数関数のコロナ層は直線で、CH の臨界密度を横切り、ボイドの境界まで床密度より上にある">
+        <figcaption>図B. GXII の回帰デッキの標的。上の帯は材料の領域（各領域で体積分率は 1）、下は密度の分布（縦軸は対数）である。コロナ層の密度は直線で下がり、CH の臨界密度（赤の破線）を横切って、ボイドの境界まで床密度（点線）より上にある。床密度は平坦部を作るための値ではなく、層の密度の下限である。横軸は 200 µm と 222 µm の間を省略した。</figcaption>
       </figure>
     </section>
 
     <section aria-labelledby="pipeline">
       <h2 id="pipeline">デッキから格子までの手順</h2>
       <ol>
-        <li><p><strong>読み込んで検証する。</strong> 連続する半径方向の区間と、区間ごとのセル数を読み、無効な端点・セル数・傾斜配置のパラメータを拒否する。</p></li>
-        <li><p><strong>重みを生成する。</strong> 各区間のすべての規格化セル中心で、スーパーガウス型の重みを評価する。</p></li>
-        <li><p><strong>区間へ配分する。</strong> 重みを幅へ変換し、<code>exact_measure_v2</code> では累積した重みを厳密な測度で反転する。内部の区間境界では、両側で隣り合う幅の幾何平均を目標にする。</p></li>
-        <li><p><strong>節点を組み立てる。</strong> 区間内のセルを積み上げ、幅が有限かつ正であること、狭義単調であること、外端が厳密に一致することを検査する。</p></li>
-        <li><p><strong>領域をペイントする。</strong> 節点の生成方法とは独立に、半径方向の材料の判定条件をセルごとの体積分率へ変換する。</p></li>
-        <li><p><strong>外側の物理を加える。</strong> Studio のキーから VOID の帯と、レーザー標的の場合は狭義単調に減少する指数関数的なコロナ層を生成する。</p></li>
-        <li><p><strong>在庫を確定する。</strong> こうして得られたセル質量が、ラグランジュ運動によって運ばれる材料の在庫になる。</p></li>
+        <li><p><strong>読み込んで検証する。</strong> 連続する半径方向の区間と、区間ごとのセル数を読み、無効な端点・セル数・傾斜配置のパラメータを誤りとして拒否する（<a href="#terms-segment">区間と傾斜配置</a>）。</p></li>
+        <li><p><strong>重みを生成する。</strong> 各区間のすべての規格化セル中心で、スーパーガウス型の重みを評価する（<a href="#terms-weight">重みとそのパラメータ</a>）。</p></li>
+        <li><p><strong>区間へ配分する。</strong> 重みを写像でセルの幅に変換し、<code>exact_measure_v2</code> では累積した重みを厳密な測度で反転する（<a href="#terms-mapping">写像と測度</a>）。内部の区間境界では、両側で隣り合う幅の幾何平均を目標にする。</p></li>
+        <li><p><strong>節点を組み立てる。</strong> 区間内のセルを積み上げ、幅が有限かつ正であること、各区間の幅の和が区間の長さに一致すること、狭義単調であることを検査し、最後の節点を外端に固定する。</p></li>
+        <li><p><strong>材料を割り当てる。</strong> 節点の生成方法とは独立に、セルの中点の半径で <code>Geometry.volfrac</code>、<code>rho</code>、<code>Te</code>、<code>Ti</code> を評価し、セルごとの体積分率、密度、温度を決める（<a href="#terms-region">領域と体積分率</a>）。ボイド材料だけからなるセルは、ボイドセルとして識別する（<a href="#terms-void">ボイドセル</a>）。</p></li>
+        <li><p><strong>外側の層を書き出す。</strong> Studio は、手順 5 で評価する関数に、外側のボイドと、有効にしたときは指数関数的なコロナ層を含めて書き出す（<a href="#terms-corona">コロナ層</a>）。</p></li>
+        <li><p><strong>セル質量を確定する。</strong> 各セルの質量は、中点での密度とセルの体積の積である。ラグランジュ運動では、セルの質量は変わらず、材料はセルとともに運ばれる。</p></li>
       </ol>
     </section>
 
     <section aria-labelledby="controls">
       <h2 id="controls">namelist による制御</h2>
-      <p>以下は、メッシュとデッキ側の幾何に関する代表的な入口である。検証規則の全体と段階ごとの対応範囲は <a href="../../use/namelist.html">namelist リファレンス</a>を参照のこと。</p>
+      <p>以下は、メッシュとデッキ側の幾何に関する代表的な入口である。入力の検査規則の全体は <a href="../../use/namelist.html">namelist リファレンス</a>を参照のこと。既定値は、デッキで指定しないときの値である。Studio が書き出す値が異なるものは、その値を添える。<code>vacuumOutside1d</code> と <code>coronaRamp1d</code> は、ソルバーのキーではなく、Studio のフォームの内部名である。</p>
       <table class="quick-facts">
         <thead>
-          <tr><th>キー</th><th>対象</th><th>用途</th></tr>
+          <tr><th>キー</th><th>既定値</th><th>用途</th></tr>
         </thead>
         <tbody>
-          <tr><th><code>Mesh.r_max</code>, <code>nr</code>, <code>grid</code></th><td>1D</td><td>外端、半径方向のセル数、一様または区間ごとの傾斜配置のゾーニング。</td></tr>
-          <tr><th><code>Mesh.geometry_1d</code></th><td>1D</td><td><code>"spherical"</code>（既定）、<code>"cylindrical"</code>、<code>"planar"</code> の座標測度。</td></tr>
-          <tr><th><code>Material.is_void</code>, <code>Materials.void_config</code></th><td>デッキ</td><td>外側の材料を VOID のマスクとして識別し、有限な下限の状態を指定する。</td></tr>
-          <tr><th><code>vacuumOutside1d</code></th><td>Studio 生成</td><td>最も外側の 1D 領域のさらに外へ、<code>VOID</code> 材料と体積分率を生成する。</td></tr>
-          <tr><th><code>coronaRamp1d.{scaleUm, extentUm, rho0, rhoMin}</code></th><td>Studio 生成</td><td>VOID の内側に置く、指数関数的な前駆プラズマ層の長さ、広がり、基部の密度、裾の下限。</td></tr>
-          <tr><th><code>Mesh.grid.grading.{edge_ratio, sg_sigma, sg_order, mapping}</code></th><td>1D 傾斜配置</td><td>スーパーガウスの端の下限 \(\epsilon_{\rm edge}\)、広がり \(\sigma_{\rm sg}\)、指数 \(m_{\rm sg}\)、および任意の <code>"exact_measure_v2"</code> 質量重み写像。</td></tr>
+          <tr><th><code>Mesh.r_min</code>, <code>r_max</code>, <code>nr</code></th><td>なし（必須）。<code>nr</code> は 4 以上。Studio の初期値は 0、500 µm、300</td><td>内端と外端の半径 [cm] と、半径方向のセル数（区間を指定すると区間のセル数の和）。</td></tr>
+          <tr><th><code>Mesh.grid</code></th><td>区間なし（<code>"uniform"</code> と同じ）</td><td><code>"uniform"</code>、または <code>dict(type="graded", segments=[…], grading=dict(…))</code>。等しい幅のセルか、区間ごとの傾斜配置を選ぶ。</td></tr>
+          <tr><th><code>Mesh.geometry_1d</code></th><td><code>"spherical"</code></td><td>座標の測度。<code>"spherical"</code>、<code>"cylindrical"</code>、<code>"planar"</code>。</td></tr>
+          <tr><th><code>Mesh.grid.<wbr>grading.<wbr>{edge_ratio, sg_sigma, sg_order, mapping}</code></th><td>0.1、0.7、4、<code>"legacy_<wbr>estimated_<wbr>radius"</code></td><td>傾斜配置の重みの下限 \(\epsilon_{\rm edge}\)、下がり始めの位置 \(\sigma_{\rm sg}\)、指数 \(m_{\rm sg}\) と、任意の <code>"exact_measure_v2"</code> の写像。Studio は <code>mapping</code> を書き出さない。</td></tr>
+          <tr><th><code>Geometry.volfrac</code>, <code>rho</code>, <code>Te</code>, <code>Ti</code></th><td>なし（必須）。<code>Geometry.<wbr>enforce_<wbr>sum_<wbr>to_<wbr>one</code> は <code>True</code></td><td>材料の体積分率、密度、温度を、半径の関数として返す。</td></tr>
+          <tr><th><code>Material.is_void</code>, <code>Materials.<wbr>void_config</code></th><td><code>False</code>。<code>void_config</code> は \(10^{-10}\,\mathrm{g\,cm^{-3}}\)、\(10^{-3}\) eV、\(10^{-3}\) eV</td><td>ボイド材料のセルを <code>cell_is_void</code> のマスクで識別し、ボイドセルの密度と温度を指定する。</td></tr>
+          <tr><th><code>vacuumOutside1d</code></th><td>無効</td><td>最後の領域（コロナ層があればその外端）の外側へ、<code>VOID</code> 材料と体積分率を生成する。</td></tr>
+          <tr><th><code>coronaRamp1d.<wbr>{scaleUm, extentUm, rho0, rhoMin}</code></th><td>無効。有効にしたときの初期値は 2.0 µm、10.0 µm、0.05 g cm⁻³、3×10⁻⁴ g cm⁻³</td><td>ボイドの内側に置くコロナ層の指数スケール長、厚さ、外面での密度、床密度。</td></tr>
+          <tr><th><code>Laser.<wbr>lasermesh.<wbr>ghost_corona</code></th><td>無効</td><td>ゴーストコロナ（1D 専用）。コロナ層とは別で、レーザー格子だけに仮想のコロナを置く。</td></tr>
         </tbody>
       </table>
     </section>
@@ -94,9 +171,9 @@
     <section aria-labelledby="verification">
       <h2 id="verification">検証</h2>
       <ul>
-        <li><code>test_mesh_create</code> のビルダ検査は、既定および区間指定の傾斜配置ゾーニングと、<code>exact_measure_v2</code> の契約を判定する。後者は、一定密度で各セルの質量の比が目標のスーパーガウス重みの比に丸め誤差の水準で一致すること（原点 \(r=0\) を含む区間でも同じ）と、等しい重みが（等幅ではなく）等質量のゾーニングを与えることである。</li>
-        <li>生成そのものは、非有限・非正の幅、単調でない節点列、外端の不一致で明示的に失敗するため、無効な傾斜配置が物理に到達することはない。</li>
-        <li>コロナ層の契約 — VOID まで狭義単調に減少し、臨界面を解像すること — は、上記のランプパラメータをデッキに固定した <a href="../../verification/index.html#gxii">GXII 基準回帰試験</a>が端から端まで検査する。</li>
+        <li><code>test_mesh_create</code> は、区間を指定しない既定のメッシュが等しい幅の節点列になることと、区間を指定したメッシュの区間境界の節点が指定した半径になることを判定し、<code>exact_measure_v2</code> の写像についても判定する。後者は、原点 \(r=0\) から始まる 1 つの区間で、一定密度のときの各セルの質量の比が目標のスーパーガウス重みの比に丸め誤差の水準で一致することと、等しい重みが（等幅ではなく）等質量の節点列を与えることである。</li>
+        <li>生成そのものは、非有限・非正の幅、区間の幅の和と区間の長さの不一致、単調でない節点列で assert により異常終了するため、無効な傾斜配置が物理に到達することはない。</li>
+        <li>コロナ層は、上記のコロナ層のパラメータをデッキに固定した <a href="../../verification/index.html#gxii">GXII 基準回帰試験</a>のデッキが使う。この試験が基準値と比べるのは、レーザーの吸収エネルギー、最大圧縮時刻、最大密度、面密度、中心温度で、コロナ層の形そのものは判定しない。</li>
       </ul>
     </section>
 

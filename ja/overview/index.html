@@ -13,28 +13,28 @@
   <main>
     <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
     <h1>概要</h1>
-    <p class="abstract">TENRYU は、エネルギー整合なラグランジュ流体を中核とし、複数の物理演算子をストラング分割で時間発展させる構成である。この節では、コードの対象範囲と設計原則、モジュール構成、全カーネルに共通する数値基盤、そしてすべての変更を判定する検証の哲学を説明する。</p>
+    <p class="abstract">TENRYU は、エネルギー整合（compatible）なラグランジュ流体（Lagrangian hydrodynamics）を中核とし、複数の物理演算子（physics operator）をストラング分割（Strang splitting）で時間発展させる構成である。この節では、コードの対象範囲と設計原則、モジュール構成、すべての<a href="../physics/index.html">物理カーネル</a>（1 つの物理演算子を扱うページの単位）に共通する数値基盤、そしてすべての変更を判定する検証（verification）の哲学を説明する。</p>
     <h2>概要ガイド</h2>
     <div class="card-grid">
       <a class="card" href="architecture.html">
         <h3>アーキテクチャとモジュール地図</h3>
-        <p>Python namelist から GPU 上の State、物理演算子、HDF5 出力までの流れをたどる。</p>
+        <p>入力の Python ファイル（デッキ、deck）から、GPU 上の状態（<code>State</code>）、物理演算子、HDF5（Hierarchical Data Format 5）形式の出力までの流れをたどる。</p>
       </a>
       <a class="card" href="numerics-foundations.html">
         <h3>数値基盤</h3>
-        <p>共通の方程式、変数配置、単位系、演算子順序、時間刻み制御を説明する。</p>
+        <p>単位系、共通の支配方程式とクロージャ（closure）、状態量の配置、演算子分割（operator splitting）、床（floor）とクランプ（clamp）、エネルギー台帳（energy ledger）を説明する。</p>
       </a>
       <a class="card" href="timestep.html">
         <h3>時間刻み制御と CFL</h3>
-        <p>大域 Δt の決定則と、カーネル別の CFL・安定条件の式を一覧する。</p>
+        <p>大域時間刻み（global time step）Δt の決定則と、物理カーネルごとの CFL（Courant–Friedrichs–Lewy）条件・安定条件の式を一覧する。</p>
       </a>
       <a class="card" href="verification-philosophy.html">
         <h3>検証の哲学</h3>
-        <p>解析解による検査、基準解との回帰、再現性の試験、ベンチマークによる証拠の積み上げを示す。</p>
+        <p>解析解（analytic solution）による検査、基準解（golden）との回帰（regression）、再現性（reproducibility）の試験、ベンチマークによる証拠の積み上げを示す。</p>
       </a>
       <a class="card" href="nomenclature.html">
         <h3>記号・用語集</h3>
-        <p>バージョン表記、略語、外部コード名、共有定数、記号の対照表。</p>
+        <p>バージョン表記、略語、外部コード名、共有定数、複数の意味をもつ記号と語の対照表。</p>
       </a>
     </div>
     <div id="page-footer"></div>

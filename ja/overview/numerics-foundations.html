@@ -13,22 +13,43 @@
   <main>
     <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
     <h1>数値基盤 <span class="badge">reference</span></h1>
-    <p class="abstract">このページは、個別の物理カーネルに属さない「全カーネルが共有する土台」をまとめる。凍結された cgs + eV の単位系、支配方程式とそのクロージャ（電子–イオン緩和を含む）、状態量の配置と「構成による保存」の設計、低密度フィル領域の活性マスク、演算子分割と再クロージャの規律、床・クランプ・安全ガード、そしてエネルギー台帳の恒等式である。時間刻みの決定則とカーネル別の CFL は<a href="timestep.html">時間刻み制御と CFL</a> の専用ページに分離した。数式の正典はリポジトリの <code>docs/NUMERICS.md</code>（§0–§2、§10–§11）である。</p>
+    <p class="abstract">このページは、個別の物理カーネルに属さない「全カーネルが共有する土台」をまとめる。固定した cgs + eV の単位系、支配方程式（governing equations）と、電子–イオン緩和（electron–ion relaxation）を含むクロージャ（closure）、状態量の配置（variable placement）と構成による保存（conservation by construction）の設計、低密度フィル領域（low-density fill region）の<a href="#hydro-active">活性マスク</a>（activity mask）、演算子分割（operator splitting）と<a href="#operator-splitting">再クロージャ</a>（re-closure）の規律、<a href="#floors-safety">床・クランプ・数値安全策</a>（floor、clamp、numerical safeguards）、そして<a href="#energy-ledger">エネルギー台帳</a>（energy ledger）の恒等式である。時間刻みの決定則とカーネル別の CFL（Courant–Friedrichs–Lewy）条件は<a href="timestep.html">時間刻み制御と CFL</a> の専用ページに分離した。このページに固有の用語は<a href="#terms">用語の節</a>に一覧する。数式の正典はリポジトリの <code>docs/NUMERICS.md</code>（§0–§2、§10–§11）である。</p>
 
     <aside class="planned" aria-labelledby="at-a-glance">
       <h3 id="at-a-glance">要点</h3>
       <ul>
-        <li>内部の単位は、長さ cm、時間 s、密度 g/cm³、温度と輻射群の境界 eV、エネルギー erg、圧力 dyne/cm² に固定している。式中の \(k_B\) は常に eV→erg の換算定数である。</li>
-        <li>物質は単一流体の運動量とイオン・電子に分けた比内部エネルギーをもち、PdV 仕事、熱伝導、レーザー、輻射、そして Spitzer 型の電子–イオン緩和 \(Q_{ei}\) で結合する。</li>
-        <li>保存は事後補正ではなく構成で守る: 質量はセル質量の不変、全エネルギーはエネルギー整合なコーナー力、リマップは保存量の転写、境界のやり取りは台帳で閉じる。破れは毎ステップ \(\varepsilon_{budget}\) として監視する。</li>
-        <li>半ステップに分けて前後を挟むのは流体だけである。4 つの演算子の列全体は、一般には 2 次精度ではない。棄却されたステップは状態を復元し、時間刻みを半分にして列全体をやり直せる。</li>
-        <li>床（温度・密度）とクランプは物理モデルではなく数値ガードであり、注入したエネルギーはすべて記帳されて保存誤差の分子から分離される。</li>
+        <li>内部の単位は、長さ cm、時間 s、密度 g/cm³、温度と輻射群（energy group）の境界 eV、エネルギー erg、圧力 dyne/cm² に固定している。式中の \(k_B\) は常に eV→erg の換算定数である。</li>
+        <li>物質は単一流体（single fluid）の運動量とイオン・電子に分けた比内部エネルギー（specific internal energy）をもち、PdV 仕事（PdV work）、熱伝導、レーザー、輻射、そして Spitzer 型の電子–イオン緩和 \(Q_{ei}\) で結合する。</li>
+        <li>保存は事後補正ではなく構成で守る: 質量はセル質量の不変、全エネルギーはエネルギー整合（compatible）なコーナー力（<a href="../physics/hydrodynamics.html#terms-corner">corner force</a>）、リマップ（remap）は保存量の転写、境界のやり取りは<a href="#energy-ledger">エネルギー台帳</a>で閉じる。破れは毎ステップ保存誤差（conservation error）\(\varepsilon_{budget}\) として監視する。</li>
+        <li>半ステップに分けて前後を挟むのは流体だけである。レーザー・核燃焼（nuclear burn）・流体・熱伝導・輻射の 5 つの演算子の列全体は、一般には 2 次精度ではない。<a href="#terms-retry">全ステップの再試行</a>（full-step retry）を有効にすると（既定は無効）、再試行を求める失敗が出たステップは、状態を復元し、時間刻みを縮めて列全体をやり直す。</li>
+        <li>床（温度・密度）とクランプは物理モデルではなく数値安全策であり、エネルギーを引き上げた分は人工項（artificial terms）として記帳されて、保存誤差の分子から分離される。</li>
       </ul>
     </aside>
 
+    <section aria-labelledby="terms">
+      <h2 id="terms">この計算で使う用語</h2>
+      <p>このページに固有の用語のうち、専用の節をもつものは、その節の冒頭で定義する。エネルギー台帳と人工項と保存誤差は<a href="#energy-ledger">エネルギー台帳と保存誤差</a>、再クロージャは<a href="#operator-splitting">演算子分割と再クロージャの規律</a>、活性マスクと低密度フィル領域は<a href="#hydro-active">低密度フィル領域の活性マスク</a>、床とクランプと数値安全策は<a href="#floors-safety">床・クランプ・数値安全策</a>にある。専用の節をもたない全ステップの再試行と受理（acceptance）は、次に定義する。</p>
+
+      <h3 id="terms-retry">全ステップの再試行</h3>
+      <p><strong>全ステップの再試行（full-step retry）</strong>は、いずれかの演算子が再試行を要求したとき、外側のステップの入口の状態を復元し、時間刻みを縮めて、演算子の列全体をやり直す仕組みである。時間刻みを先に小さく選ぶだけでは、非線形な<a href="../physics/mesh/index.html#terms-admissibility">メッシュの許容性</a>（admissibility）の破れをすべて予測することはできないので、この仕組みが要る。キーは <code>Numerics.hydro.driver_full_step_retry_enabled</code> で、既定は False である。True にすると、ドライバは演算子の列に入る前に状態をスナップショット（snapshot）として保存し、要求があれば、途中まで進んだレーザー、エネルギー、輻射、メッシュの状態を採用せずにスナップショットを復元する。Studio が書き出すデッキ（deck。TENRYU の入力となる 1 個の Python ファイル。<a href="../use/namelist.html#terms-deck">定義</a>）は、1D では True を書き、2D では書かない（既定の False のままである）。ALE の設定が許可された範囲にあるかを検査するプロファイル <code>Numerics.profile.icf_standard_ale</code>（<code>enabled</code> の既定は False）を有効にし、検査を強制する（<code>enforce</code>、既定は True）と、既定ではこのキーが True であることが要求され、満たさないデッキは入力の誤りになる。</p>
+      <p>再試行の回数の上限は <code>Numerics.hydro.driver_full_step_retry_max_attempts</code>（既定 3）で、1 回目の失敗のあとに許す再試行の回数である。時間刻みは、ほとんどの要求では半分にする。2D RZ（軸対称の (R, Z) 子午面）の流体がセルの形の判定で試行を棄却したときは、その判定を満たす見積りの時間刻み（下限は <code>Numerics.dt.min_s</code>）を使う。2D の核燃焼は、<code>Burn.subcycle_max</code>（既定 64）を、最も多くの<a href="../physics/burn.html">部分サイクル</a>（subcycling）を必要とするセルの必要数で割った比に \(0.9\Delta t\) を掛けた値を使う。再試行を要求する演算子は次のとおりである（全体の流れは<a href="#fig-numerics-step-flow">図A</a>）。</p>
+      <ul>
+        <li><strong>1D の流体:</strong> セルの体積が 0 以下になったとき（圧縮による節点の交差）と、Braginskii 粘性の陽的な安定条件の検査に落ちたとき。</li>
+        <li><strong>2D RZ の流体:</strong> 修正子（corrector）が、許容できないセルの形の試行（<a href="../physics/mesh/index.html#terms-corner-jacobian">コーナーヤコビアン</a>（corner Jacobian）、<a href="../physics/mesh/index.html#terms-gauss-jacobian">ガウス点ヤコビアン</a>（Gauss-point Jacobian）、RZ の体積、<a href="../physics/mesh/index.html#terms-axis-margin">軸マージン</a>（axis margin）、試行体積の下限）、陰的な人工粘性（artificial viscosity）の求解の失敗、混合セル（mixed cell。複数の材料を含むセル）の圧力緩和（pressure relaxation）の失敗を報告したとき。</li>
+        <li><strong>熱伝導:</strong> <a href="../physics/conduction.html#sts">STS</a>（super time-stepping）の段数の合計が上限 <code>Numerics.conduction.sts_total_stages_max</code> を超えたとき、または STS の安定限界の検査に落ちたとき。2D の陰的ソルバ（<code>solver="dmp_implicit"</code>）の線形求解が失敗したとき、ピカール反復（Picard iteration）が収束しないとき、結果の温度が最大値原理（maximum principle）の範囲に入らないとき。</li>
+        <li><strong>輻射:</strong> S<sub>N</sub>（離散座標法、discrete ordinates）の物質ニュートン法が温度の床より上に根を見つけられないとき。2D の FLD（flux-limited diffusion、流束制限拡散）の段が、停滞、反復の上限到達、無効な値、許容できない負のエネルギーのいずれかで棄却されたとき。</li>
+        <li><strong>核燃焼（2D）:</strong> あるセルの反応網が <code>Burn.subcycle_max</code> を超える部分サイクル数を必要とするとき。</li>
+        <li><strong>混合セルのクロージャ（mixed-cell closure。材料ごとの保存を有効にした 2D）:</strong> 熱伝導・輻射・電子–イオン交換・ALE（arbitrary Lagrangian–Eulerian、任意ラグランジュ・オイラー法）のリマップのあとに、混合セルの圧力緩和が失敗したとき。</li>
+      </ul>
+      <p>再試行を使えないとき（無効、または回数の使い切り）は、流体・熱伝導・核燃焼・混合セルのクロージャの要求がエラーで停止する。S<sub>N</sub> の物質ニュートン法の要求は、警告して局所的に補正した状態で続行する。2D の FLD の棄却は、<code>Radiation.multigroup_diffusion.cap_exit_policy</code> が <code>"fail"</code> なら停止し、<code>"warn"</code>（既定）なら警告して棄却した候補を採用する。</p>
+
+      <h3 id="terms-accept">受理</h3>
+      <p><strong>受理（acceptance）</strong>は、全演算子が終わり、どの演算子も再試行を要求しなかったステップを、確定してよいステップとして認めることである。時刻の更新、出力、累積のエネルギー台帳の確定は受理のあとに置かれているため、失敗した試行の履歴やエネルギーを二重に数えることはない。</p>
+    </section>
+
     <section aria-labelledby="units-symbols">
       <h2 id="units-symbols">単位と記号</h2>
-      <p>単位系をモジュールごとに変換しないことが、数値上の契約の出発点である。とくに温度 \(T\) は eV であり、式の中で \(P=nk_BT\) と書くときの \(k_B\) は <code>eV_to_erg</code> = \(1.6022\times10^{-12}\) erg/eV を意味する。ケルビン用の \(1.3807\times10^{-16}\) erg/K と混同しないこと。輻射定数も同じ規約で \(a_{\rm eV}=1.3720\times10^{2}\) erg cm⁻³ eV⁻⁴ と表され、平衡輻射エネルギー密度は \(T\) を eV として \(a_{\rm eV}T^4\) になる。また、質量あたりの比熱 \(c_v\) [erg/(g·eV)] と、体積あたりの比熱 \(C_v=\rho c_v\) [erg/(cm³·eV)] も書き分ける。これらの定数と多義記号の一覧は<a href="nomenclature.html">記号・用語集</a>にまとめている。</p>
+      <p>単位系をモジュールの境界で変換しないことが、全カーネルの数値の出発点である。とくに温度 \(T\) は eV であり、式の中で \(P=nk_BT\) と書くときの \(k_B\) は <code>eV_to_erg</code> = \(1.6022\times10^{-12}\) erg/eV を意味する。ケルビン用の \(1.3807\times10^{-16}\) erg/K と混同しないこと。輻射定数も同じ規約で \(a_{\rm eV}=1.3720\times10^{2}\) erg cm⁻³ eV⁻⁴ と表され、平衡輻射エネルギー密度は \(T\) を eV として \(a_{\rm eV}T^4\) になる。また、質量あたりの比熱 \(c_v\) [erg/(g·eV)] と、体積あたりの比熱 \(C_v=\rho c_v\) [erg/(cm³·eV)] も書き分ける。これらの定数と多義記号の一覧は<a href="nomenclature.html">記号・用語集</a>にまとめている。</p>
       <table class="quick-facts">
         <thead>
           <tr><th>量・記号</th><th>内部の単位 / 意味</th><th>取り違えを防ぐ注意</th></tr>
@@ -47,14 +68,14 @@
 
     <section aria-labelledby="governing-equations">
       <h2 id="governing-equations">支配方程式とクロージャ</h2>
-      <p>流体は、単一流体としてのラグランジュ的な物質運動と、2 温度の内部エネルギーを解く。物質微分 \(D/Dt\) を使うと、質量保存と運動量の式は</p>
+      <p>流体は、単一流体としてのラグランジュ的（Lagrangian）な物質運動と、2 温度の内部エネルギーを解く（<code>Main.temperature_model="2T"</code>。<code>"1T"</code> ではイオンと電子を 1 つの温度で扱い、既定の <code>"auto"</code> は、初期状態に \(T_e\ne T_i\) のセルがあれば 2T、なければ 1T にする）。物質微分（material derivative）\(D/Dt\) を使うと、質量保存と運動量の式は</p>
       $$
       \frac{D\rho}{Dt}=-\rho\nabla\!\cdot\mathbf u,
       \qquad
       \rho\frac{D\mathbf u}{Dt}
       =-\nabla(P_i+P_e+Q)+\mathbf f_{\mathrm{geom}}.
       $$
-      <p>ここで \(Q\) は人工粘性による圧力、\(\mathbf f_{\mathrm{geom}}\) は座標系に由来する幾何項である。v1.0 の運動量の式に、輻射圧による力は含めない。イオンと電子の比内部エネルギーの式は</p>
+      <p>ここで \(Q\) は人工粘性による圧力、\(\mathbf f_{\mathrm{geom}}\) は座標系に由来する幾何項である。輻射圧（radiation pressure）\(P_r=\tfrac13\sum_gE_g\)（\(E_g\) は群ごとの輻射エネルギー密度）による力は、1D の FLD で <code>Radiation.multigroup_diffusion.hydro_coupling="gamma_r_43"</code>（既定）のときだけ \(-\nabla P_r\) として運動量の式に加わり、その仕事は輻射場のエネルギーから支払われる。2D RZ と S<sub>N</sub> では、輻射圧の力を運動量の式に含めない。イオンと電子の比内部エネルギーの式は</p>
       $$
       \rho\frac{De_i}{Dt}=-(P_i+Q)\nabla\!\cdot\mathbf u+Q_{ei}+S_i,
       $$
@@ -62,7 +83,7 @@
       \rho\frac{De_e}{Dt}=-P_e\nabla\!\cdot\mathbf u
       -\nabla\!\cdot\mathbf q_e-Q_{ei}+S_e+S_L+S_r.
       $$
-      <p>\(\mathbf q_e\) は電子の熱流束、\(S_L\) はレーザーの吸収、\(S_r\) は輻射との交換である。\(S_i\)・\(S_e\) はそれ以外の追加源であり、v1.0 では 0 に固定されたプレースホルダである（核燃焼は独立の演算子段として、ホット電子はレーザーの源経路を通じて、それぞれ直接沈着する）。符号の規約として、\(Q_{ei}&gt;0\) は電子からイオンへのエネルギーの移動、すなわちイオンの加熱を表す。同じ \(Q_{ei}\) が両方の式に符号を変えて現れるため、セル内の交換だけでは物質の全エネルギーは変わらない。</p>
+      <p>\(\mathbf q_e\) は電子の熱流束（heat flux）、\(S_L\) はレーザーの吸収、\(S_r\) は輻射との交換である。\(S_i\)・\(S_e\) はそれ以外の追加源であり、v1.0 では 0 に固定されたプレースホルダである（核燃焼は独立の演算子段として、ホット電子（hot electron）はレーザーの源経路を通じて、それぞれ直接沈着する）。符号の規約として、\(Q_{ei}&gt;0\) は電子からイオンへのエネルギーの移動、すなわちイオンの加熱を表す。同じ \(Q_{ei}\) が両方の式に符号を変えて現れるため、セル内の交換だけでは物質の全エネルギーは変わらない。</p>
 
       <h3 id="qei">電子–イオン緩和 \(Q_{ei}\)</h3>
       <p>2 温度モデルの要となる交換項は、Spitzer–Braginskii の衝突緩和で閉じる。</p>
@@ -78,119 +99,133 @@
       \tau_{eq}=\frac{3.16\times10^{8}\;A\;T_e[\mathrm{eV}]^{3/2}}
       {\bar Z^{2}\;n_i[\mathrm{cm^{-3}}]\;\ln\Lambda_{ei}}\ \ [\mathrm s].
       $$
-      <p>この項は、温度差 \(T_e-T_i\) を電子の熱容量で重み付けし、平衡化時間 \(\tau_{eq}\) で緩和させる。1 回の衝突で移るエネルギーの割合は質量比 \(m_e/m_i\) 程度に抑えられるため、\(\tau_{eq}\) は電子衝突時間 \(\tau_e\) の \(Am_p/(2m_e)\) 倍になる。右の式はこの関係を cgs + eV の便利形式にまとめたものである。\(T_e^{3/2}\) 依存のため高温プラズマほど緩和は遅く、コロナでは電子とイオンの温度が長く分離する。この式は ICF の典型条件 \(T_e\gg(m_e/m_i)T_i\) での近似であり、\(T_e&gt;T_i\) のとき \(Q_{ei}&gt;0\)（イオン加熱）となって符号規約と整合する。適用位置は流体の各半ステップの修正子内で、後続の熱伝導は \(Q_{ei}\) 適用済みの \(T_e\) を初期値として受け取る。</p>
+      <p>ここで \(C_{v,e}\) は電子の体積あたりの比熱、\(A\) はイオンの質量数、\(\bar Z\) は平均電離度（mean ionization）、\(n_e\) と \(n_i\) は電子とイオンの数密度、\(\ln\Lambda_{ei}\) は電子–イオン衝突のクーロン対数（Coulomb logarithm。下限は 2）、\(m_p\) と \(m_e\) は陽子と電子の質量である。この項は、温度差 \(T_e-T_i\) を電子の熱容量で重み付けし、平衡化時間（equilibration time）\(\tau_{eq}\) で緩和させる。1 回の衝突で移るエネルギーの割合は質量比 \(m_e/m_i\) 程度に抑えられるため、\(\tau_{eq}\) は電子衝突時間（electron collision time）\(\tau_e\) の \(Am_p/(2m_e)\) 倍になる。右の式はこの関係を cgs + eV の数値係数で書いたものである。\(T_e^{3/2}\) 依存のため高温プラズマほど緩和は遅く、コロナでは電子とイオンの温度が長く分離する。この式は慣性核融合（inertial confinement fusion、ICF）の典型条件 \(T_e\gg(m_e/m_i)T_i\) での近似であり、\(T_e&gt;T_i\) のとき \(Q_{ei}&gt;0\)（イオン加熱）となって符号規約と整合する。適用位置は流体の各半ステップの修正子内で、後続の熱伝導は \(Q_{ei}\) 適用済みの \(T_e\) を初期値として受け取る。</p>
 
       <h3 id="lagrangian-divergence">発散の離散化とセル質量</h3>
       <p>ラグランジュ離散化では、これらの式に現れる発散 \(\nabla\!\cdot\mathbf u\) を独立に差分せず、セル体積の変化率として評価する：\((\nabla\!\cdot\mathbf u)_c=\dot V_c/V_c\)。1D 球対称では \(\dot V_i=A_{j+1}u_{j+1}-A_ju_j\)（\(A_j\) は節点 \(j\) の殻境界の面積で、セル \(i\) は節点 \(j=i\) と \(j+1\) のあいだにある）である。連続の式はこの恒等式のセル版そのものであり、セル質量 \(\Delta M_c=\rho_cV_c\) は構成上一定に保たれる。</p>
 
       <h3 id="radiation-eq">輻射の輸送方程式</h3>
-      <p>群 \(g\) の放射強度 \(I_g(\mathbf r,\mathbf\Omega,t)\) に対する連続の輸送方程式は</p>
+      <p>群 \(g\) の輻射強度（specific intensity）\(I_g(\mathbf r,\mathbf\Omega,t)\) に対する連続の輸送方程式（transport equation）は</p>
       $$
       \frac{1}{c}\frac{\partial I_g}{\partial t}
       +\mathbf\Omega\!\cdot\nabla I_g
       =\sigma_{a,g}B_g(T_e)-\sigma_{t,g}I_g+\mathcal S_{\mathrm{sca}},
       $$
-      <p>ここで \(B_g(T_e)\) は群のプランク放射関数、\(\sigma_{t,g}=\sigma_{a,g}+\sigma_{s,g}\) は全消衰係数、\(\mathcal S_{\mathrm{sca}}\) は散乱源（後述のとおり v1.0 では 0）である。電子との交換項は次のとおりである。</p>
+      <p>ここで \(B_g(T_e)\) は群のプランク関数（Planck function）、\(\sigma_{t,g}=\sigma_{a,g}+\sigma_{s,g}\) は全消衰係数（total extinction coefficient）、\(\mathcal S_{\mathrm{sca}}\) は散乱源（scattering source。後述）である。電子との交換項は次のとおりである。</p>
       $$
       S_r=\sum_g c\,\sigma_{a,g}
       \left[E_g-a_{\rm eV}T_e^4 b_g(T_e)\right].
       $$
-      <p>\(b_g(T_e)\) はプランクスペクトルの群ごとの分率で、全群の和が 1 になるよう規格化する。\(S_r&gt;0\) は輻射場から電子への正味の加熱を表す。現行の v1.0 は物理的な散乱を入れず、全セル・全群で \(\sigma_{s,g}=0\) とする — namelist は前方互換のために材料ごとの <code>kappa_s</code> を受理するが、v1.0 のプロダクションソルバはこれを物理散乱として消費しない（<a href="../physics/radiation/fld.html">FLD ページ</a>の Fleck 実効散乱 \((1-f)\sigma_a\) は陰的化の装置であり、物理散乱ではない）。輻射による力は診断に限定している。</p>
+      <p>\(b_g(T_e)\) はプランクスペクトルの群ごとの分率で、全群の和が 1 になるよう規格化する。\(S_r&gt;0\) は輻射場から電子への正味の加熱を表す。物理的な散乱 \(\sigma_{s,g}=\rho\kappa_s\)（<code>opacity.kappa_s</code> は全群で共通の定数）をもつのは、1D の S<sub>N</sub> だけである。FLD は散乱をもたず、<code>kappa_s</code> が正の材料があると入力の誤りになる。2D の S<sub>N</sub> は \(\sigma_{s,g}=0\) とする。<a href="../physics/radiation/fld.html">FLD ページ</a>の Fleck 実効散乱（Fleck effective scattering）\((1-f)\sigma_a\) は、輻射と物質の結合を陰的に扱うために現れる項であり、物理散乱ではない。</p>
     </section>
 
     <section aria-labelledby="staggering-conservation">
       <h2 id="staggering-conservation">状態量の配置と「構成による保存」</h2>
-      <p>状態量の置き場所は全カーネル共通である。熱力学量 — 密度、イオン・電子の比内部エネルギー、温度、圧力、人工粘性圧、材料の体積分率 — はセル中心に、運動学量 — 位置と速度 — は節点にもつ。1D の節点はセル境界（球・円筒形状では殻、平面形状では平面）、2D RZ の節点は四辺形の頂点である。時間発展の一次変数は保存量（質量・運動量・エネルギー）で、温度や圧力はそこから EOS で再構成する派生量である。HDF5 出力の <code>mesh/</code>・<code>hydro/</code> のデータセット名は、この内部 State のフィールド名と 1:1 に対応する（<a href="../use/outputs.html">出力と解析</a>）。</p>
+      <p>状態量の置き場所は全カーネル共通である。熱力学量 — 密度、イオン・電子の比内部エネルギー、温度、圧力、人工粘性圧、材料の体積分率 — はセル中心に、運動学量 — 位置と速度 — は節点にもつ。1D の節点はセル境界（球・円筒形状では殻、平面形状では平面）、2D RZ の節点は四辺形の頂点である。時間発展の一次変数は保存量（質量・運動量・エネルギー）で、温度や圧力はそこから状態方程式（equation of state、EOS）で再構成する派生量（derived quantity）である。HDF5（Hierarchical Data Format 5）出力の <code>mesh/</code>・<code>hydro/</code> のデータセット名は、この内部 State のフィールド名と 1:1 に対応する（<a href="../use/outputs.html">出力と解析</a>）。</p>
       <p>保存の方針は「事後に補正する」ではなく「構成上壊れない形に書く」である。どこで何がそれを保証しているかは次の表のとおりで、詳細は各カーネルページにある。</p>
       <table class="quick-facts">
         <thead><tr><th>保存量</th><th>構成上の機構</th><th>詳細</th></tr></thead>
         <tbody>
           <tr><th>質量</th><td>純ラグランジュ運動ではセル質量 \(\Delta M_c\) が定義により不変。密度は \(\rho=\Delta M/V\) の再構成でしか変わらない。</td><td>本ページ上記</td></tr>
-          <tr><th>運動量・全エネルギー（流体）</th><td>コーナー力と \(p\,dV\) 仕事を同じ幾何ベクトル \(\mathbf S_{c,k}\) から作るエネルギー整合（随伴対）構成。</td><td><a href="../physics/hydrodynamics.html">ラグランジュ流体</a></td></tr>
-          <tr><th>リマップ（ALE）</th><td>示強量ではなくセル積分量を、面ごとに 1 回だけ評価した流束の符号反転適用で転写する。</td><td><a href="../physics/mesh/ale-remap.html">ALE</a></td></tr>
-          <tr><th>輻射 ⇄ 物質</th><td>実際に適用した源 \(S^{used}\) を凍結して物質側の収支に使い、共有面の寄与は厳密に相殺する。</td><td><a href="../physics/radiation/fld.html">FLD</a>・<a href="../physics/radiation/sn.html">S<sub>N</sub></a></td></tr>
-          <tr><th>レーザー</th><td>呼び出しごとに「入射 = 吸収 + 未吸収」を厳密に閉じ、終端の分類が残余の帰属を決める。</td><td><a href="../physics/laser.html">レーザー</a></td></tr>
-          <tr><th>熱伝導・粘性・燃焼</th><td>面流束の符号反転適用（伝導・粘性）と、解放 = 沈着 + 逸出 + 飛行中の台帳（燃焼）。</td><td>各カーネルページ</td></tr>
+          <tr><th>運動量・全エネルギー（流体）</th><td>コーナー力と \(p\,dV\) 仕事を、同じ幾何ベクトル \(\mathbf S_{c,k}=\partial V_c/\partial\mathbf x_{c,k}\)（セル \(c\) の体積をコーナー \(k\) の位置で微分したもの）から作るエネルギー整合な構成で、運動量の式と内部エネルギーの式が互いに随伴（adjoint）の関係になる。</td><td><a href="../physics/hydrodynamics.html">ラグランジュ流体</a></td></tr>
+          <tr><th>リマップ（ALE）</th><td>示強量（intensive quantity）ではなくセル積分量（cell-integrated quantity。示量量に当たる）を、面ごとに 1 回だけ評価した流束の符号反転適用で転写する。</td><td><a href="../physics/mesh/ale-remap.html">ALE</a></td></tr>
+          <tr><th>輻射 ⇄ 物質</th><td>実際に適用した源 \(S^{used}\)（輻射の方程式に実際に入れた、セル・群ごとの 1 ステップ分の放出エネルギー [erg]）を、ステップのあいだ値を変えずに物質側の収支に使い、共有面の寄与は厳密に相殺する。</td><td><a href="../physics/radiation/fld.html">FLD</a>・<a href="../physics/radiation/sn.html">S<sub>N</sub></a></td></tr>
+          <tr><th>レーザー</th><td>呼び出しごとに「入射 = 吸収 + 未吸収」を厳密に閉じる。光線がどう終わったか（臨界面での終了、光線追跡（ray tracing）のメッシュの外での終了など）の分類が、残りの帰属先を決める。</td><td><a href="../physics/laser.html">レーザー</a></td></tr>
+          <tr><th>熱伝導・粘性・燃焼</th><td>面流束の符号反転適用（伝導・粘性）と、解放 = 沈着 + 逸出（escape）+ 飛行中という収支（燃焼）。</td><td>各カーネルページ</td></tr>
         </tbody>
       </table>
-      <p>それでも残る破れ — 床の注入、丸め、アルゴリズム限界 — は隠さず、<a href="#energy-ledger">後述のエネルギー台帳</a>で毎ステップ定量化する。</p>
+      <p>それでも残る破れ — 床補正、丸め、アルゴリズム限界 — は隠さず、<a href="#energy-ledger">後述のエネルギー台帳</a>で毎ステップ定量化する。</p>
     </section>
 
     <section aria-labelledby="hydro-active">
       <h2 id="hydro-active">低密度フィル領域の活性マスク（hydro_active）</h2>
-      <p>真空の代替として置く低密度フィル領域を通常の物質として動かすと、無意味な音波と極端な CFL 制限が生まれる。このため各セルは流体の活性フラグ <code>hydro_active</code> をもつ。既定の <code>Numerics.hydro.T_start_inactive_cells="passive_fill"</code> では、非活性セルは圧力・人工粘性による力の寄与をゼロとし、座標と速度は固定される。節点側は隣接セルのいずれかが活性なら動く（OR 伝播）。非活性セルは温度が起動しきい値に達した時点で活性化し、その際の密度と内部エネルギーは現在の体積から再計算される — 隣接活性節点の移動で体積が既に変わっていても、活性化直後の PdV 仕事が不連続にならないようにするためである。CFL の min は活性セルだけを対象とし、全セル非活性なら流体は時間刻みの制約から外れる（<a href="timestep.html">時間刻み制御</a>）。</p>
-      <p><strong>使用制約（重要）。</strong>既定の <code>passive_fill</code> では、このフラグは低密度フィル領域（\(\rho\ll\rho_{shell}\)）を静的に保持するための数値マスクであり、高密度物質の運動を温度条件で抑制する目的に使ってはならない。非活性セルは「動かされるが押し返さない」片務的な力学状態になるため、高密度物質に適用するとエネルギー・運動量の非物理的な注入・消失を引き起こす。なお、熱伝導・輻射との結合から除外する仕組みは別系統のボイド契約（<code>cell_is_void</code>、<a href="../physics/eos-opacity.html">EOS・不透明度・電離</a>）である。</p>
+      <p>活性マスク（activity mask）は、セルごとの流体の活性フラグ <code>hydro_active</code>（1 が活性、0 が非活性）の並びである（リポジトリの <code>docs/NUMERICS.md</code> §2.1.1「Hydro開始温度条件」）。非活性セルは、圧力と人工粘性の力を出さず、PdV 仕事を受けない。真空の代替として置く低密度フィル領域を通常の物質として動かすと、無意味な音波と極端な CFL 制限が生まれるので、活性マスクでこの領域を静かに保つ。セルの電子温度 \(T_e\) が起動しきい値 <code>Numerics.hydro.T_start_eV</code>（既定 0.0 eV）に達すると、非活性セルは活性になる。しきい値が 0 のときは温度による非活性化は行われず、別の規則で除かれるセル（ボイド（void）セルなど）を除く全セルが活性である。Studio の既定も 0.0 eV である。一度活性になったセルは、温度が下がっても非活性へ戻らない（別の規則で除かれるセルを除く）。</p>
+      <p>非活性セルの扱いは <code>Numerics.hydro.T_start_inactive_cells</code> が決める。既定の <code>"passive_fill"</code> では、節点は隣接セルのいずれかが活性なら動く（OR 伝播）。活性なセルに隣接しない節点の扱いは次元で異なる。2D RZ では位置と速度を固定する。1D では、活性な節点より外側に続く非活性な節点が、内側で最も近い活性な節点の変位と速度をそのまま写して動き、フィル領域がプラズマの端に追従する（内側に活性な節点がなければ固定される）。非活性セルの密度も毎ステップ \(\rho=\Delta M/V\) で現在の体積から求め直され、比内部エネルギーは流体の仕事で変わらない。したがって、温度が起動しきい値に達して活性化した時点の状態は現在の体積と整合しており、活性化直後の PdV 仕事は不連続にならない。<code>"rigid_wall"</code>（1D のみ）では、節点が両側のセルの活性のときだけ動き、非活性セルは剛体壁として体積を保ち、電子–イオン緩和もマスクしない。<code>"cold_equilibrium"</code>（1D、2 温度、表形式の EOS のみ）では、流体のマスクを行わない。Studio は <code>"passive_fill"</code> 以外のときだけこのキーを書き出す。CFL の min は活性セルだけを対象とし、全セル非活性なら流体は時間刻みの制約から外れる（<a href="timestep.html">時間刻み制御</a>）。</p>
+      <p><strong>使用制約（重要）。</strong>既定の <code>passive_fill</code> では、このフラグは低密度フィル領域（\(\rho\ll\rho_{shell}\)）を静的に保持するための数値マスクであり、高密度物質の運動を温度条件で抑制する目的に使ってはならない。非活性セルは「動かされるが押し返さない」片務的な力学状態になるため、高密度物質に適用するとエネルギー・運動量の非物理的な注入・消失を引き起こす。なお、熱伝導・輻射・レーザーとの結合からボイドセルを除く仕組みは、これとは別である（<code>Material.is_void</code> の材料のセルを <code>cell_is_void</code> のマスクで除く。<a href="../physics/eos-opacity.html#void-materials">EOS・不透明度・電離</a>）。</p>
     </section>
 
     <section aria-labelledby="operator-splitting">
       <h2 id="operator-splitting">演算子分割と再クロージャの規律</h2>
-      <p>外側の 1 ステップは次の写像で表される。合成は右から左へ作用するため、実行の順序は \(\mathcal L\)、\(\mathcal H/2\)、\(\mathcal C\)、\(\mathcal R\)、\(\mathcal H/2\) である。</p>
+      <p>演算子分割（operator splitting）は、外側の 1 ステップを物理ごとの演算子に分け、順に適用する時間積分の方法である。分割で最も事故が起きやすいのは、前の演算子が変えた状態を、次の演算子が古いクロージャで読むことである。クロージャは、保存量から温度・圧力・比熱を決める関係で、TENRYU では EOS が与える。再クロージャ（re-closure）は、演算子が状態を変えたあとに、\((\rho,e)\) から EOS で温度 \(T\)、圧力 \(P\)、比熱 \(c_v\)（体積あたりの比熱は \(C_v=\rho c_v\)）を求め直すことである。熱伝導のように \(T_e\) を直接更新する演算子のあとは、\(T_e\) から \(e_e\)、\(P_e\)、\(C_v\) を求め直す。</p>
+      <p>外側の 1 ステップは次の写像で表される。合成は右から左へ作用するため、実行の順序は \(\mathcal L\)、\(\mathcal B\)、\(\mathcal H/2\)、\(\mathcal C\)、\(\mathcal R\)、\(\mathcal H/2\) である。</p>
       $$
       \mathcal U^{n+1}=
       \mathcal H_{\Delta t/2}\circ
       \mathcal R_{\Delta t}\circ
       \mathcal C_{\Delta t}\circ
       \mathcal H_{\Delta t/2}\circ
+      \mathcal B_{\Delta t}\circ
       \mathcal L_{\Delta t}(\mathcal U^n).
       $$
-      <p>\(\mathcal H\) はラグランジュ流体と境界条件（各半ステップの修正子は \(Q_{ei}\) を含む）、\(\mathcal C\) は電子熱伝導、\(\mathcal L\) は光線追跡と沈着、\(\mathcal R\) は輻射輸送と物質との交換である。2D RZ の ALE によるリゾーンとリマップは、2 回目の流体の半ステップのあとにだけ、条件付きで行う。列に入る前の候補 \(\Delta t\) の決定は<a href="timestep.html">時間刻み制御と CFL</a> にまとめた。</p>
-      <p>分割で最も事故が起きやすいのは「前の演算子が変えた状態を、次の演算子が古いクロージャで読む」ことである。TENRYU はこれを規律で塞ぐ: 各演算子が \(T_e\) または \(e_e\) を変えたあとには EOS を閉じ直し、後続の演算子が古いままの \(T\)、\(e\)、\(P\)、\(C_v\) を読まないようにする。MPI 実行では、所有領域を書いた直後・最初にゴーストを読む処理より前に袖領域を交換する（<a href="../physics/mpi.html">MPI 分割</a>）。動的な平均電離度も各演算子の入口で評価し直される（<a href="../physics/eos-opacity.html">EOS ページ</a>）。</p>
-      <p>「ストラング型」という呼び方には、精度の面で限定が付く。流体は熱伝導と輻射のまとまりを半ステップで挟むため、その組合せに対しては対称である。一方でレーザーは、外部からの源としてステップの先頭に全ステップで 1 回だけ適用し、熱伝導と輻射も互いに全ステップの順で適用する。したがって、レーザーとそれ以外の連成、および熱伝導と輻射の連成は、演算子を単純に順番へ並べるリー分割と同じ 1 次精度にとどまり、4 つの演算子の列全体も一般には 2 次精度にならない。</p>
-      <p>この 1 次の結合を許容するのは、レーザーと他の演算子のあいだ、および熱伝導と輻射のあいだの分割誤差が、ICF の実行では支配的な誤差要因にならないためである — 各演算子が 1 ステップで進める物理量は互いに異なり、実用上の精度は時間刻みの制御が確保する。完全な 2 次精度が必要になった場合の多段分割 \(\mathcal H_{/2}\circ\mathcal C_{/2}\circ\mathcal L_{/2}\circ\mathcal R\circ\mathcal L_{/2}\circ\mathcal C_{/2}\circ\mathcal H_{/2}\) は、将来のオプションとしてリポジトリの数値契約 <code>docs/NUMERICS.md</code> §2.1 に記録されている。</p>
-      <p><strong>全ステップの再試行。</strong>時間刻みを先に小さく選ぶだけでは、非線形なメッシュの許容性の破れをすべて予測することはできない。ドライバ側で全ステップの再試行を有効にすると、ドライバは分割の列に入る前に状態をスナップショットとして保存する。流体の修正段が回復可能な失敗を返した場合は、途中まで進んだレーザー、エネルギー、輻射、メッシュの状態を採用せずにスナップショットを復元し、時間刻みを半分にして外側のステップ全体をやり直す。試行の回数には上限があり、上限を超えた場合は失敗として停止する。出力と累積の台帳の確定は受理のあとに置かれているため、失敗した試行の履歴やエネルギーを二重に数えることはない。</p>
+      <p>\(\mathcal H\) はラグランジュ流体と境界条件（各半ステップの修正子は \(Q_{ei}\) を含む）、\(\mathcal C\) は電子熱伝導、\(\mathcal L\) は光線追跡と沈着、\(\mathcal B\) は核燃焼（<code>Burn.enabled</code> が既定の False のときは何もしない）、\(\mathcal R\) は輻射輸送と物質との交換である。2D RZ の ALE によるリゾーン（rezone）とリマップは、通常は 2 回目の流体の半ステップのあとに条件付きで行う。コーナーヤコビアン ALE トリガ（corner-Jacobian ALE trigger。<code>Numerics.hydro.corner_jacobian_ale_trigger_enabled</code>、既定は False）が働くとき、および再試行のあとにメッシュを修復するときは、演算子の列に入る前にも ALE を実行することがある。列に入る前の候補 \(\Delta t\) の決定は<a href="timestep.html">時間刻み制御と CFL</a> にまとめた。</p>
+      <p>TENRYU は、各演算子が \(T_e\) または \(e_e\) を変えたあとに再クロージャを行い、後続の演算子が古いままの \(T\)、\(e\)、\(P\)、\(C_v\) を読まないようにする。MPI（Message Passing Interface）実行では、所有領域を書いた直後で、最初にゴースト領域（ghost region。隣のランクの境界セルの写しを持つ領域）を読む処理より前に、ゴースト領域を交換する（<a href="../physics/mpi.html#halo-exchange">MPI 分割</a>）。動的な平均電離度も各演算子の入口で評価し直される（<a href="../physics/eos-opacity.html#ionization">EOS ページ</a>）。</p>
+      <p>ストラング型分割（Strang-type splitting）という呼び方には、精度の面で限定が付く。流体は熱伝導と輻射のまとまりを半ステップで挟むため、その組合せに対しては対称である。一方でレーザーと核燃焼は、ステップの先頭に全ステップで 1 回ずつ適用し、熱伝導と輻射も互いに全ステップの順で適用する。したがって、レーザー・核燃焼とそれ以外の連成、および熱伝導と輻射の連成は、演算子を単純に順番へ並べるリー分割（Lie splitting）と同じ 1 次精度にとどまり、5 つの演算子の列全体も一般には 2 次精度にならない。</p>
+      <p>この 1 次の結合を許容するのは、レーザーと他の演算子のあいだ、および熱伝導と輻射のあいだの分割誤差が、ICF の実行では支配的な誤差要因にならないためである — 各演算子が 1 ステップで進める物理量は互いに異なり、実用上の精度は時間刻みの制御が確保する。完全な 2 次精度が必要になった場合の多段分割 \(\mathcal H_{/2}\circ\mathcal C_{/2}\circ\mathcal L_{/2}\circ\mathcal R\circ\mathcal L_{/2}\circ\mathcal C_{/2}\circ\mathcal H_{/2}\) は、将来のオプションとしてリポジトリの <code>docs/NUMERICS.md</code> §2.1 に記録されている。</p>
+      <p>全演算子が終わっても、いずれかの演算子が再試行を要求したステップは受理されず、入口の状態からやり直す。再試行の条件、時間刻みの縮め方、再試行を要求する演算子は、<a href="#terms-retry">用語の節</a>で定義した。全体の流れは<a href="#fig-numerics-step-flow">図A</a>に示す。</p>
 
-      <figure>
-        <img src="../../assets/overview-numerics-step-flow.png" width="1040" height="600" style="max-width:100%;height:auto" alt="1 ステップの流れ図。カーネルごとの時間刻みの上限と運用上の上限から刻みを決め、レーザー、流体の半ステップ、熱伝導、輻射、流体の半ステップ（2D RZ では ALE）を進める。流体の修正子が回復可能な失敗を報告したら入口の状態へ戻して半分の刻みでやり直し、そうでなければ確定する">
-        <figcaption>図A. 外側の 1 ステップ。時間刻みの制限をまとめてから分割の列を実行し、受理された場合にだけ時刻と出力を確定する。全ステップの再試行が有効なら、受理されなかったステップは入口のスナップショットへ戻り、縮めた時間刻みで列全体をやり直す。</figcaption>
+      <figure id="fig-numerics-step-flow">
+        <img src="../../assets/overview-numerics-step-flow-ja.png" width="1040" height="640" style="max-width:100%;height:auto" alt="1 ステップの流れ図。時間刻みの決定と入口のスナップショットの保存のあと、条件付きの ALE、レーザー、核燃焼、流体の前半の半ステップ、熱伝導、輻射、流体の後半の半ステップ、条件付きの ALE の順に進む（青い実線の箱が演算子、灰色の破線の箱が条件付きの ALE）。再試行を要求する演算子があれば（赤）、再試行を使えるときはスナップショットを復元して時間刻みを縮め、列の先頭からやり直し、使えないときはエラー停止・警告・cap_exit_policy による。要求がなければ（緑）受理して時刻・出力・エネルギー台帳を確定する。">
+        <figcaption>図A. 外側の 1 ステップ。上段: 時間刻みの決定と、全ステップの再試行が有効なときの入口のスナップショット。中段: 演算子の列を実行順に左から右へ並べた（実線の青い箱は演算子 \(\mathcal L\)・\(\mathcal B\)・\(\mathcal H\)・\(\mathcal C\)・\(\mathcal R\)、破線の灰色の箱は条件付きの ALE のリゾーンとリマップ）。下段: 緑は受理、赤は再試行の要求（再試行を使えるときは入口の状態を復元して時間刻みを縮め、列全体をやり直す。赤の破線の矢印がそのやり直し。使えないときの扱いは下の赤い箱）。順序は <code>src/coupling/driver.cpp</code> の呼び出しの順、既定値は <code>src/core/config.hpp</code> から確かめている。</figcaption>
       </figure>
     </section>
 
     <section aria-labelledby="floors-safety">
-      <h2 id="floors-safety">床・クランプ・安全ガード</h2>
-      <p>床とクランプは物理モデルではない。NaN や負温度で計算全体が崩壊する事故を防ぐための数値ガードであり、その介入はすべて数えられ、注入したエネルギーは台帳に記帳される。設計原則は「黙って直さない」ことである。</p>
+      <h2 id="floors-safety">床・クランプ・数値安全策</h2>
+      <p>床（floor）は、状態量が下回ってはならない下限値である。クランプ（clamp）は、下限または上限を越えた量を、限界の値へ戻す操作である。どちらも物理モデルではなく、NaN や負温度で計算全体が崩壊する事故を防ぐ数値安全策（numerical safeguards）である。設計の方針は、状態を直したら回数を数え、エネルギーを引き上げたらエネルギー台帳に記帳することである。例外は不透明度テーブルの範囲外の参照で、デバイス側では黙って処理し、回数を数えない（下記）。</p>
       <ul>
-        <li><strong>温度の床:</strong> \(T_e\ge T_{e,floor}\)、\(T_i\ge T_{i,floor}\)（既定はいずれも \(10^{-3}\) eV。<code>Numerics.floors</code> の <code>Te_floor_eV</code>/<code>Ti_floor_eV</code> で個別設定できる）。クランプは流体・熱伝導・レーザー・輻射の各演算子の温度更新後に適用され、注入エネルギーを \(\Delta E_{clamp}=\rho c_v(T_{floor}-T_{computed})V\) として計上する。</li>
-        <li><strong>クランプ回数の監視:</strong> <code>clamp_count</code> はステップ開始時に 0 へ戻し、各演算子のクランプごとに加算する。1 ステップあたり 100 回超で WARNING、10000 回超で FATAL（既定値）。時系列は履歴の <code>safety/clamp_count</code> に残る。</li>
-        <li><strong>不透明度テーブルの範囲外:</strong> 外挿はせず、\((\rho,T)\) をテーブルの定義域へクランプしてから補間する（入力クランプ方式）。発生時は WARNING を出すが、1 ステップ・1 ランクあたり 10 件で打ち切り、以降は件数のみ数える。</li>
-        <li><strong>エネルギー収支の監視:</strong> \(\varepsilon_{budget}\le10^{-3}\)（既定しきい値）を毎ステップ検査する。超過は既定では警告にとどめ、<code>Numerics.safety.energy_fatal=True</code> で致命的エラーに切り替えられる。NaN の扱いも同様に <code>nan_fatal</code> で方針を選ぶ。</li>
-        <li><strong>各カーネル固有のガード:</strong> レーザーの \(\varepsilon_n\) 下限とクーロン対数の下限 2、伝導のボイドマスクと床保護スロットル、EOS の非正 \(c_v\) クランプなどは、それぞれのカーネルページに記載がある。共通するのは「発動したら警告し、可能なら注入量を記帳する」という契約である。</li>
+        <li><strong>温度の床:</strong> \(T_e\ge T_{e,floor}\)、\(T_i\ge T_{i,floor}\)（<code>Numerics.floors</code> の <code>Te_floor_eV</code>/<code>Ti_floor_eV</code>。既定はいずれも \(10^{-3}\) eV で、Studio も同じ値を書き出す）。表形式の EOS を使うデッキで床を指定しないと、表の最低温度が \(10^{-3}\) eV より高い場合に、床はその温度へ引き上げられる。指定した床が表の最低温度を下回ると入力の誤りになる（低温平衡の枝 <code>T_start_inactive_cells="cold_equilibrium"</code> を使うときを除く）。1D の既定のクロージャ（<code>Numerics.hydro.eos_closure_mode="energy_authoritative"</code>）は、床を温度にだけ適用する。比内部エネルギーは、次の項の下限処理を除いて書き換えないので、温度の床そのものはエネルギーを注入しない。</li>
+        <li><strong>密度の床:</strong> セルの密度 \(\rho=\Delta M/V\) が <code>Numerics.floors.rho_floor_gcc</code>（既定 \(10^{-10}\) g/cm³、Studio も同じ値）を下回るときは、密度の値をその床へ引き上げる。セル質量は変えないので、引き上げたセルの \(\rho\) は \(\Delta M/V\) と異なり、エネルギーは注入されない。引き上げの回数は、ボイドセルを除いてクランプ回数に数える。</li>
+        <li><strong>比内部エネルギーの下限:</strong> 流体の更新は、理想気体のセルの比内部エネルギーが負になったとき 0 へ切り上げ、切り上げた分を床補正 \(E_{floor}\) に記帳する。表 EOS の負のエネルギーは有効な値なので切り上げない。伝導の床による制限、レーザー・輻射・核燃焼の注入のあとの下限処理、ALE のリマップの床も、同じく \(E_{floor}\) に記帳する。</li>
+        <li><strong>クランプ回数の監視:</strong> <code>clamp_count</code> はステップ開始時に 0 へ戻し、各演算子のクランプごとに加算する。1 ステップあたり <code>Numerics.safety.clamp_warn_threshold</code>（既定 100）を超えると警告し、<code>clamp_fatal_threshold</code>（既定 10000）を超えると致命的エラーで停止する。時系列は履歴の <code>safety/clamp_count</code> に残る。</li>
+        <li><strong>不透明度テーブルの範囲外:</strong> 参照する経路によって扱いが異なる。多材料セルの LTE（local thermodynamic equilibrium、局所熱力学平衡）の表の参照は、\((\rho,T)\) を表の定義域へクランプしてから補間する。単一材料の表不透明度を使う非 LTE（non-LTE）の係数の計算は、表の最高温度より高い側と、表の最小イオン密度より低い側で、\(\log\kappa\) を表の端の勾配で外挿する。どちらもデバイス側では黙って処理し、件数を数えない。警告を出すのは、ホスト側の IONMIX の読み取りがクランプしたときだけで、プロセスあたり 10 件で打ち切る。</li>
+        <li><strong>エネルギー収支と非有限値の監視:</strong> \(\varepsilon_{budget}\) が <code>Diagnostics.energy_budget.warn_threshold</code>（既定 \(10^{-3}\)）を超えると警告する（最初のステップは検査しない）。<code>Numerics.safety.energy_fatal</code>（既定は False）を True にすると、\(\varepsilon_{budget}\) が <code>Numerics.safety.energy_budget_tol</code>（既定 \(10^{-3}\)）を超えた時点で致命的エラーにする。人工項の相対寄与 \(E_{floor}/E_{denom}\)、\(E_{safety}/E_{denom}\)、\(E_{redist}/E_{denom}\)（各項と \(E_{denom}\) は<a href="#energy-ledger">エネルギー台帳</a>の節で定義する）が \(10^{-3}\) を超えたときも警告する。温度・密度・比内部エネルギーに NaN や無限大が現れると、演算子ごとの検査が致命的エラーで停止する（<code>Numerics.safety.nan_fatal</code>、既定は True）。</li>
+        <li><strong>各カーネル固有の安全策:</strong> レーザーの屈折率の下限 \(\varepsilon_n\) とクーロン対数の下限 2、伝導でボイドセルを除くマスクと床保護スロットル（floor-protection throttle。温度が床を割るおそれのあるセルの流出流束を、面の両側に共通の係数で絞る処理）、EOS の非正の \(c_v\) のクランプなどは、それぞれのカーネルページに記載がある。共通する方針は、発動したら警告し、可能なら注入量を記帳することである。</li>
       </ul>
     </section>
 
     <section aria-labelledby="energy-ledger">
       <h2 id="energy-ledger">エネルギー台帳と保存誤差 \(\varepsilon_{budget}\)</h2>
-      <p>毎ステップ、系の全エネルギー変化を出入りと突き合わせる恒等式を積算する。</p>
+      <p>エネルギー台帳（energy ledger）は、系の全エネルギーの変化を、その原因である出入りと補正の項ごとに、ステップごとに積算した記録である。保存は構成で守る（<a href="#staggering-conservation">状態量の配置と構成による保存</a>）が、丸め、床、アルゴリズムの限界による破れは残る。エネルギー台帳は、全エネルギーの変化が各項の和に一致するかを毎ステップ検査し、一致しない分を保存誤差 \(\varepsilon_{budget}\) として測るために要る。項は、レーザーの入射や輻射の境界流出のような物理的な出入りと、床補正のように数値的な操作が状態へ加えた人工項に分かれる。人工項を物理的な出入りから分けて積算するので、数値安全策が結果を支配していないかを別に調べられる。</p>
+      <p>エネルギー台帳の各項は、次の恒等式で結ばれる。</p>
       $$
       \Delta E_{total}=\Delta E_{int,e}+\Delta E_{int,i}+\Delta E_{kin}+\Delta E_{rad}
       $$
       $$
-      =E_{laser,in}-E_{laser,esc}+E_{Marshak,in}-E_{rad,esc}
-      -E_{pdV}^{bdry}-E_{num.loss}
-      +E_{floor}+E_{safety}+E_{redist}+E_{solver}.
+      =E_{source}-E_{sink}+E_{supply}+E_{rad,mesh\_adv}+E_{artificial}.
       $$
-      <p>左辺は電子・イオン内部、運動、輻射場の各エネルギー変化の和である。右辺の前半が物理的な出入り（レーザーの入射と未吸収、Marshak 入射、輻射の境界流出、境界 PdV 仕事、数値的喪失）、後半の 4 項が人工的な注入 — 床補正、伝導の安全補正、ALE 再分配の未解決分、陰的ソルバの残差 — である。\(E_{num.loss}\) はアルゴリズム上の限界で系外へ落ち、喪失として記帳されるエネルギー（例: SNB が電子温度を、伝導の適用前の大域最大値で頭打ちにしたときに除いた分）である。床補正や安全補正のようにエネルギーを注入する人工補正とは異なり、既知の流出として物理的な出入りの側で数える。人工項は物理源と明確に分離して積算され、保存誤差</p>
+      <p>左辺は電子・イオン内部、運動、輻射場の各エネルギー変化の和である。右辺の各項は次のとおりである。</p>
+      <ul>
+        <li><strong>流入:</strong> \(E_{source}=E_{laser,in}+E_{Marshak,in}+E_{volume,in}+E_{burn,in}+\max(E_{solver},0)\)。\(E_{laser,in}\) はレーザーの入射エネルギー、\(E_{Marshak,in}\) は Marshak 境界（Marshak boundary）から入る輻射のエネルギー、\(E_{volume,in}\) は輻射の体積線源 <code>Radiation.volume_source_rate</code> が注入したエネルギー、\(E_{burn,in}\) は核燃焼が物質へ沈着したエネルギー（荷電粒子の沈着と、<code>Burn.neutron_heating</code> が有効なときの中性子の最初の衝突による加熱）である。</li>
+        <li><strong>流出:</strong> \(E_{sink}=E_{laser,esc}+E_{CBET,IAW}+E_{rad,esc}+E_{num.loss}+E_{pdV}^{bdry}+\max(-E_{solver},0)\)。\(E_{laser,esc}\) は物質に沈着しなかったレーザーのエネルギー（臨界面で終了した光線と、光線追跡のメッシュの外で終了した光線の未吸収分、および領域から逸出したホット電子のエネルギー）、\(E_{CBET,IAW}\) は<a href="../physics/cbet.html">CBET</a>（cross-beam energy transfer、交差ビームエネルギー転送）が光から取り除いてイオン音波（ion-acoustic wave）へ渡したエネルギー（CBET が有効なときだけ 0 でない）、\(E_{rad,esc}\) は輻射が境界から出ていったエネルギー、\(E_{pdV}^{bdry}\) は境界の圧力が外へした PdV 仕事（膨張で正）である。</li>
+        <li><strong>数値的喪失:</strong> \(E_{num.loss}\)（numerical loss）は、アルゴリズム上の限界のために物質へ入れられなかった、または系から落ちたエネルギーで、既知の流出として物理的な出入りの側で数える。たとえば、SNB（Schurtz–Nicolaï–Busquet）が電子温度を伝導の適用前の大域最大値で頭打ちにしたときに除いた分と、注入先のセルが見つからない、または質量 \(\rho V\) が \(10^{-30}\) g 未満で注入できなかったレーザー・核燃焼のエネルギーがある。</li>
+        <li><strong>状態供給:</strong> \(E_{supply}\) は、2D RZ の状態供給（state supply）の面が出し入れしたエネルギーである。状態供給は、<code>Numerics.hydro.boundary_2d</code> の <code>z_bottom</code>・<code>z_top</code> に <code>type="state_supply"</code> で指定する z 面で、面に接するセルの密度・温度・z 方向の速度を指定した値に保つ境界である。\(E_{supply}\) は、その上書きと速度の復元とリマップの境界流束として記帳した変化と、面を通る流れの仕事の和で、領域へ入る向きを正とする。状態供給の面がなければ 0 である。</li>
+        <li><strong>メッシュの動きによる輻射場エネルギーの変化:</strong> \(E_{rad,mesh\_adv}\) は、流体の各半ステップのあいだに輻射場の全エネルギー \(\sum_{c,g}E_{g,c}V_c\)（\(E_{g,c}\) は群 \(g\)、セル \(c\) の輻射エネルギー密度、\(V_c\) はセル体積）が変わった量の和である。輻射のエネルギー密度が体積変化に追従しない設定（<code>Radiation.multigroup_diffusion.hydro_coupling="none"</code>）では、体積変化がそのまま輻射エネルギーの増減になる。この項は物理的な境界流束ではないので、保存誤差の計算で全エネルギー変化から差し引く。</li>
+        <li><strong>人工項:</strong> \(E_{artificial}=E_{floor}+\max(E_{safety}-E_{floor},0)+E_{redist}\)。人工項は、物理的な出入りではなく、数値的な操作が状態へ加えたエネルギーである。\(E_{floor}\)（床補正）は、各演算子がエネルギーそのものを引き上げた量の和である（<a href="#floors-safety">床・クランプ・数値安全策</a>）。\(E_{safety}\)（安全補正）は伝導の安全補正の記帳欄だが、現在の実装は伝導の補正を \(E_{floor}\) に含めて記帳し、\(E_{safety}\) に \(E_{floor}\) と同じ値を入れるので、\(\max(E_{safety}-E_{floor},0)\) は 0 である。\(E_{redist}\)（ALE 再分配の未解決分）は、2D RZ の ALE のリマップが、質量の床に落ちたセルを床の状態に置いたときのエネルギー差と、運動エネルギーのクロージャ（kinetic-energy closure）の再配分（<code>Numerics.ale.ke_closure_redistribute_floor</code>、既定は False）が吸収しきれなかった不足の和で、ALE を使わなければ 0 である。</li>
+        <li><strong>陰的ソルバの残差:</strong> \(E_{solver}\) は、記帳の欄だけがあり、どの演算子も加算しないので常に 0 である。符号に応じて流入または流出へ数える。</li>
+      </ul>
+      <p>保存誤差は、人工項と、メッシュの動きによる輻射場エネルギーの変化を除いた全エネルギー変化と、物理的な出入りとの差を、ステップ開始時のエネルギーの大きさと流入の大きさのうち大きい方（下限つき）で規格化した量である。</p>
       $$
       \begin{aligned}
-      \varepsilon_{budget}&=\frac{\bigl|(\Delta E_{total}-E_{artificial})-(E_{source}-E_{sink})\bigr|}{E_{denom}},\\
+      \varepsilon_{budget}&=\frac{\bigl|(\Delta E_{total}-E_{artificial}-E_{rad,mesh\_adv})-(E_{source}-E_{sink}+E_{supply})\bigr|}{E_{denom}},\\
       E_{denom}&=\max\bigl(|E_{int,e}^{\,n}|+|E_{int,i}^{\,n}|+|E_{kin}^{\,n}|+|E_{rad}^{\,n}|,\,E_{source},\,10^{-20}\ \mathrm{erg}\bigr)
       \end{aligned}
       $$
-      <p>の分子には含めない。ここで \(E_{source}=E_{laser,in}+E_{Marshak,in}+E_{volume,in}+\max(E_{solver},0)\)（\(E_{volume,in}\) は輻射の体積線源 <code>Radiation.volume_source_rate</code> が注入したエネルギー）、\(E_{sink}=E_{laser,esc}+E_{rad,esc}+E_{num.loss}+E_{pdV}^{bdry}+\max(-E_{solver},0)\)、\(E_{artificial}=E_{floor}+\max(E_{safety}-E_{floor},0)+E_{redist}\) である。上の恒等式で人工の側に並べたソルバ残差は、この分組みでは符号に応じて源か流出のどちらかへ数え、安全補正は床補正と重なる分を除いて人工項に数える。すなわち \(\varepsilon_{budget}\) は物理的な保存の破れを測り、人工補正の寄与（\(E_{floor}/E_{denom}\) など）は独立に監視して、数値安全策が結果を支配していないかを別途検出する。分母の床はコールドスタート（全エネルギー ≈ 0）での 0 除算と偽 FATAL を防ぐ。</p>
-      <p>これらの項はすべて履歴の <code>energy/</code> 群にそのまま現れる — <code>laser_incident</code>・<code>marshak_in</code>・<code>radiation_escaped</code>・<code>pdv_boundary</code>・<code>floor_injected</code>・<code>safety_injected</code>・<code>conservation_error</code> など（チャネルの一覧は<a href="../use/outputs.html">出力と解析</a>）。読み方の指針: \(\varepsilon_{budget}\) が跳ねたらまず人工項の比率を見る。人工項が支配的なら床・クランプの発動源（どの演算子か、<code>clamp_count</code> の推移）を、そうでなければ境界と源の帰属（吸収率・逸出）を疑う。</p>
+      <p>ここで \(E^{\,n}\) は、そのステップの開始時の値である。\(\varepsilon_{budget}\) は物理的な保存の破れを測り、人工項の寄与（\(E_{floor}/E_{denom}\) など）は独立に監視して、数値安全策が結果を支配していないかを別途検出する。分母の \(10^{-20}\) erg の下限は、コールドスタート（全エネルギー ≈ 0）での 0 除算と偽の致命的エラーを防ぐ。</p>
+      <p>多くの項は履歴の <code>energy/</code> 群に現れる — <code>laser_incident</code>・<code>laser_escaped</code>・<code>marshak_in</code>・<code>E_volume_in</code>・<code>E_cbet_iaw</code>・<code>radiation_escaped</code>・<code>pdv_boundary</code>・<code>numerical_loss</code>・<code>floor_injected</code>・<code>safety_injected</code>・<code>redistribution_unresolved</code>・<code>solver_residual</code>、状態供給の面があるときは <code>state_supply</code>・<code>supply_flow_work</code>、そして \(\varepsilon_{budget}\) の <code>conservation_error</code> である（チャネルの一覧は<a href="../use/outputs.html">出力と解析</a>）。\(E_{burn,in}\) の累積は <code>burn/</code> 群の <code>E_dep_e_cum</code> と <code>E_dep_i_cum</code> の和に等しく、\(E_{rad,mesh\_adv}\) は出力しない。読み方の指針: \(\varepsilon_{budget}\) が跳ねたらまず人工項の比率を見る。人工項が支配的なら床・クランプの発動源（どの演算子か、<code>clamp_count</code> の推移）を、そうでなければ境界と源の帰属（吸収率・逸出）を疑う。</p>
     </section>
 
     <section aria-labelledby="contracts">
-      <h2 id="contracts">数値契約の早見</h2>
-      <p>個々のページに散らばる横断的な約束を一覧する。いずれもコードベースが公開している契約であり、変更は検証の関門を通る（<a href="verification-philosophy.html">検証の哲学</a>）。</p>
+      <h2 id="contracts">全カーネルに共通する保証と要求</h2>
+      <p>個々のページに散らばる、全カーネルに共通する保証と要求を一覧する。いずれもコードベースが守る仕様であり、変更は検証の検査（<a href="verification-philosophy.html">検証の哲学</a>）に通らなければならない。</p>
       <table class="quick-facts">
-        <thead><tr><th>契約</th><th>内容</th><th>詳細</th></tr></thead>
+        <thead><tr><th>項目</th><th>内容</th><th>詳細</th></tr></thead>
         <tbody>
-          <tr><th>単位系の凍結</th><td>内部は cgs + eV に固定。モジュール境界での単位変換はしない。</td><td>本ページ</td></tr>
-          <tr><th>実行時 Python 禁止</th><td>namelist の関数は初期化時に表へ凍結され、時間ループでは呼ばれない。</td><td><a href="../use/running.html">実行</a>・<a href="architecture.html">アーキテクチャ</a></td></tr>
+          <tr><th>単位系の固定</th><td>内部は cgs + eV に固定。モジュール境界での単位変換はしない。</td><td>本ページ</td></tr>
+          <tr><th>実行時 Python 禁止</th><td>namelist の Python 関数は、初期化時に表にして設定を凍結（freeze。<a href="../use/running.html#terms-freeze">定義</a>）するので、時間ループでは呼ばれない。</td><td><a href="../use/running.html">実行</a>・<a href="architecture.html">アーキテクチャ</a></td></tr>
           <tr><th>厳格な入力検証</th><td>未知キー・型違い・不正な組合せは警告ではなくエラー。既定値は仕様書が正典。</td><td><a href="../use/namelist.html">namelist</a></td></tr>
-          <tr><th>決定論</th><td>決定論的な 1D 経路は実行ごとにビット単位一致。2D の <code>atomicAdd</code> 順序差だけを文書化された雑音帯として扱う。</td><td><a href="verification-philosophy.html">検証の哲学</a></td></tr>
-          <tr><th>保存の台帳</th><td>境界・源のやり取りは台帳で閉じ、人工注入は分離して記帳する。</td><td>本ページ・各カーネル</td></tr>
-          <tr><th>時間刻み</th><td>大域 \(\Delta t\) は全カーネル提案の最小。床割れは FATAL。</td><td><a href="timestep.html">時間刻み制御</a></td></tr>
+          <tr><th>決定論</th><td>決定論的（deterministic）な 1D 経路は、同じバイナリ・入力・GPU 構成の反復実行で、ビット単位（bitwise）で一致する。2D RZ も、1 ステップ内の浮動小数点の和を固定順にしており、順序に依存する <code>atomicAdd</code> は状態・時間刻み・エネルギー台帳・診断の和に残っていない。このため同じ構成の 2 本の実行は、状態、時間刻み、エネルギー台帳、診断のすべてがビット単位で一致しなければならない。反復実行の差が 0 でない経路だけは、雑音帯（noise band。反復実行どうしの差から決めた許容の帯）で判定する（<a href="../verification/index.html#reproducibility">再現性の検査</a>）。</td><td><a href="verification-philosophy.html">検証の哲学</a></td></tr>
+          <tr><th>エネルギー台帳</th><td>境界と源のやり取りは<a href="#energy-ledger">エネルギー台帳</a>で閉じ、人工項は別に記帳する。</td><td>本ページ・各カーネル</td></tr>
+          <tr><th>時間刻み</th><td>大域 \(\Delta t\) は各カーネルが提案する上限の最小値である。\(\Delta t\) が <code>Numerics.dt.min_s</code>（既定 \(10^{-20}\) s、Studio の既定は \(10^{-22}\) s）を下回った状態が <code>Numerics.dt.min_consecutive_steps</code>（既定 1）回続くと、致命的エラーになる。</td><td><a href="timestep.html">時間刻み制御</a></td></tr>
           <tr><th>出力スキーマ</th><td>データセット名は State と 1:1、全数値に units 属性、schema_version で互換管理。</td><td><a href="../use/outputs.html">出力と解析</a></td></tr>
         </tbody>
       </table>

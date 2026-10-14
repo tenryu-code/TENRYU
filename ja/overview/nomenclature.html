@@ -13,19 +13,19 @@
   <main>
     <div id="breadcrumb" class="breadcrumb" aria-label="パンくずリスト"></div>
     <h1>記号・用語集 <span class="badge">reference</span></h1>
-    <p class="abstract">このページは、ドキュメント全体が前提とする語彙をまとめたものである：バージョン表記、略語、外部コード・施設名、凍結された cgs + eV 単位系の共有定数、そしてページによって意味の変わる記号の対照表。各カーネルページは記号を使用箇所で定義するが、近くに定義が見当たらないときはここを参照のこと。</p>
+    <p class="abstract">このページは、ドキュメント全体が前提とする語彙をまとめたものである：バージョン表記、略語、外部コード・施設名、固定した cgs + eV 単位系の共有定数、そしてページによって意味の変わる記号と語の対照表。各物理カーネルのページは記号を使用箇所で定義するが、近くに定義が見当たらないときはここを参照のこと。</p>
 
     <section aria-labelledby="versions">
       <h2 id="versions">バージョン表記</h2>
-      <p>本ドキュメントが記述するのは TENRYU v1（v1.0 とも表記）— 現行のプロダクション世代である。小文字の「v」はコード全体のリリースではなく、モデル・機能の<em>世代</em>を表す。</p>
+      <p>本ドキュメントが記述するのは TENRYU v1（v1.0 とも表記）である。公開版 v1.0.0-beta.1（<code>tenryu --version</code> が表示する <code>1.0.0-beta.1</code>）に対応する。下の表の v2-E、MPI v1、M1 v1 は、コード全体の版ではなく機能ごとの呼び名で、コードのエラー文に出る。</p>
       <table class="quick-facts">
         <thead><tr><th>表記</th><th>意味</th></tr></thead>
         <tbody>
-          <tr><th>v1 / v1.0</th><td>本サイトが記述する TENRYU のプロダクション世代。「v1 は輻射圧を省く」等の記述はこの世代へのスコープ宣言。</td></tr>
-          <tr><th>v2-E</th><td>2 本の線スペクトルによる初回衝突の中性子加熱モデル（<code>Burn.neutron_heating</code>）を、2D RZ で拒否するエラーメッセージが使う呼び名。</td></tr>
-          <tr><th>MPI v1</th><td>第 1 世代 MPI 移植（監査済みの機能範囲と先送りの保護は MPI ページ参照）。</td></tr>
-          <tr><th>M1 v1</th><td>ALE ページの M1/TMOP リゾーンソルバの第 1 世代。</td></tr>
-          <tr><th><code>pc_v0</code>, <code>midpoint_v1</code>, <code>bbsw_radial_v0</code> …</th><td>接尾辞がそのアルゴリズムの世代を記録する namelist 値。旧世代は凍結構成の互換のため保持される。</td></tr>
+          <tr><th>v1 / v1.0</th><td>本サイトが記述する TENRYU の版。公開版 v1.0.0-beta.1 に対応する。「v1 は輻射圧を省く」のように、この版が扱う範囲を述べる文に使う。</td></tr>
+          <tr><th>v2-E</th><td>核燃焼の中性子加熱モデル <code>Burn.neutron_heating</code> の呼び名。DT 反応の中性子（14.049 MeV）と DD 反応の中性子（2.449 MeV）の 2 本の線スペクトルについて、燃料の D、T との最初の衝突での加熱を、1 回の飛行で評価する。2D RZ では <code>Burn.neutron_heating=True</code> を拒否するエラー文に、この呼び名が出る。</td></tr>
+          <tr><th>MPI v1</th><td>MPI（Message Passing Interface）のランク（rank）数が 2 以上のとき、未対応の機能を拒否するエラー文に出る呼び名。拒否するのは、1D の<a href="../physics/eos-opacity.html#void-materials">ボイド</a>（void）領域、適応人工粘性（adaptive artificial viscosity）、Braginskii 粘性である（ソースは <code>src/hydro/hydro_1d.cu</code>）。複数ランクで使えない機能の一覧は、MPI のページの<a href="../physics/mpi.html#v1-scope">適用範囲と先送りの保護</a>の節にある。</td></tr>
+          <tr><th>M1 v1</th><td>ALE（arbitrary Lagrangian–Eulerian）のリゾーン（rezone）ソルバ <code>Numerics.ale.rezone_solver="m1_tmop"</code>（M1/TMOP。TMOP は target-matrix optimization paradigm の略）の、入力検査と実行時のエラー文に出る呼び名。対象は極座標族の論理メッシュ（polar-family logical mesh）だけで、<code>Mesh.logical_mesh_2d</code> が <code>rectangular_rz</code> または <code>cone_shell</code> のときは、入力検査が「not supported in M1 v1」で拒否する。実行時には四角形メッシュだけを受け付ける（ソースは <code>src/hydro/ale_driver.cu</code>）。</td></tr>
+          <tr><th><code>pc_v0</code>, <code>midpoint_v1</code>, <code>bbsw_radial_v0</code>, <code>kinematic_basis_rz_v1</code></th><td>末尾に <code>_v0</code>、<code>_v1</code> が付く namelist の値。接尾辞は値の名前の一部で、版を表す記号ではない。<code>Numerics.hydro.time_integration</code> は、<code>pc_v0</code>（予測子–修正子法、predictor–corrector method）か <code>midpoint_v1</code>（中点法、midpoint method）を選ぶ。<code>Numerics.hydro.corner_mass_convention</code> は、<code>bbsw_radial_v0</code>（半径方向に線形な従来のコーナー質量の集中化、lumping）か <code>kinematic_basis_rz_v1</code>（双一次の運動学基底を R で重み付けした集中化）を選ぶ。既定と使い分けは、ラグランジュ流体のページの<a href="../physics/hydrodynamics.html#time-integration">時間積分</a>と<a href="../physics/hydrodynamics.html#corner-masses">コーナー質量</a>の節にある。</td></tr>
         </tbody>
       </table>
     </section>
@@ -35,51 +35,51 @@
       <table class="quick-facts">
         <thead><tr><th>略語</th><th>展開</th></tr></thead>
         <tbody>
-          <tr><th>1T / 2T</th><td>1 温度 / 2 温度物質モデル（単一物質温度 vs 独立な \(T_e\)・\(T_i\)）。</td></tr>
-          <tr><th>ALE</th><td>Arbitrary Lagrangian–Eulerian：メッシュのリゾーニングと保存的リマップ。</td></tr>
+          <tr><th>1T / 2T</th><td>1 温度（one-temperature）/ 2 温度（two-temperature）物質モデル（単一の物質温度か、独立な \(T_e\)・\(T_i\) か）。</td></tr>
+          <tr><th>ALE</th><td>Arbitrary Lagrangian–Eulerian（任意ラグランジュ・オイラー法）：メッシュのリゾーニング（rezoning）と保存的リマップ（conservative remap）。</td></tr>
           <tr><th>AV</th><td>Artificial viscosity（人工粘性）。物理的な Braginskii 粘性と対をなす。</td></tr>
-          <tr><th>BBSW</th><td>Barlow–Burton–Shashkov–Wendroff：<code>bbsw_radial_v0</code> 規約の旧・径方向線形コーナー質量集中化。</td></tr>
+          <tr><th>BBSW</th><td>Barlow–Burton–Shashkov–Wendroff：<code>bbsw_radial_v0</code> が選ぶ、半径方向に線形な従来のコーナー質量の集中化。</td></tr>
           <tr><th>CBET</th><td>Cross-beam energy transfer（交差ビームエネルギー転送）。</td></tr>
           <tr><th>CFL</th><td>Courant–Friedrichs–Lewy 安定条件。</td></tr>
-          <tr><th>CG</th><td>共役勾配法（Jacobi-PCG = Jacobi 前処理付き CG）。</td></tr>
-          <tr><th>CRE</th><td>Collisional-radiative equilibrium（衝突輻射平衡；テーブル生成側の非 LTE 閉包）。</td></tr>
+          <tr><th>CG</th><td>共役勾配法（conjugate gradient method）。Jacobi-PCG は Jacobi 前処理（preconditioner）付きの CG。</td></tr>
+          <tr><th>CRE</th><td>Collisional-radiative equilibrium（衝突輻射平衡）。テーブル生成側が使う、非 LTE の原子過程のクロージャ。</td></tr>
           <tr><th>CSDA</th><td>Continuous slowing-down approximation（連続減速近似）。</td></tr>
-          <tr><th>CSR</th><td>Compressed sparse row：マルチブロック接続と 2D 行列の格納形式。</td></tr>
-          <tr><th>CSW98</th><td>Caramana–Shashkov–Whalen 1998 のエッジ/テンソル人工粘性族。</td></tr>
-          <tr><th>CV</th><td>変動係数 \(\sigma/|\mu|\)（モンテカルロ再現性ゲート）。</td></tr>
-          <tr><th>DD</th><td>2 義：輻射では非推奨の diamond-difference \(S_N\) 空間スキーム、燃焼では D–D 融合チャネル。</td></tr>
+          <tr><th>CSR</th><td>Compressed sparse row（圧縮行格納形式）：マルチブロックメッシュの接続と 2D 行列の格納形式。</td></tr>
+          <tr><th>CSW98</th><td>Caramana–Shashkov–Whalen 1998 の、辺（edge）型・テンソル型の人工粘性。</td></tr>
+          <tr><th>CV</th><td>変動係数（coefficient of variation）\(\sigma/|\mu|\)。モンテカルロ計算の再現性の判定に使う。</td></tr>
+          <tr><th>DD</th><td>2 義：輻射ではダイヤモンド差分（diamond difference。\(S_N\) の空間離散化で、回帰確認用に残した非推奨の選択肢）、燃焼では D–D 融合チャネル。</td></tr>
           <tr><th>DSA</th><td>Diffusion synthetic acceleration（\(S_N\) ソース反復の拡散加速）。</td></tr>
           <tr><th>DT / D³He</th><td>D–T、D–³He 融合チャネル（DT は燃料材名でもある）。</td></tr>
-          <tr><th>EOS</th><td>状態方程式。</td></tr>
+          <tr><th>EOS</th><td>状態方程式（equation of state）。</td></tr>
           <tr><th>FLD</th><td>Flux-limited diffusion（流束制限拡散）。</td></tr>
-          <tr><th>FV</th><td>有限体積。</td></tr>
-          <tr><th>GMG</th><td>幾何マルチグリッド前処理（2D FLD）。</td></tr>
+          <tr><th>FV</th><td>有限体積（finite volume）。</td></tr>
+          <tr><th>GMG</th><td>幾何マルチグリッド（geometric multigrid）前処理（2D FLD）。</td></tr>
           <tr><th>HED</th><td>High energy density（高エネルギー密度）。</td></tr>
-          <tr><th>HLLC</th><td>Harten–Lax–van Leer-contact 近似リーマン解法（流体の任意のサブモード）。</td></tr>
-          <tr><th>IAW</th><td>イオン音波。</td></tr>
-          <tr><th>IB</th><td>逆制動輻射（衝突性レーザー吸収）。</td></tr>
-          <tr><th>ICF</th><td>慣性閉じ込め核融合。</td></tr>
-          <tr><th>iSNB</th><td>Implicit SNB：Cao 2015 の Picard 結合による SNB 補正の時間結合。</td></tr>
-          <tr><th>LC</th><td>Linear characteristic（線形特性法）：2D RZ の既定の \(S_N\) 空間スキーム（<code>linear_characteristic</code>）。1D の既定は線形不連続法（<code>linear_discontinuous</code>）。</td></tr>
-          <tr><th>LP</th><td>Levermore–Pomraning（FLD 既定リミッタ）。</td></tr>
-          <tr><th>LPI</th><td>Laser–plasma instability（ホット電子を駆動するパラメトリック不安定性）。</td></tr>
-          <tr><th>LTE / NLTE</th><td>局所熱力学平衡 / 非 LTE。</td></tr>
-          <tr><th>mfp</th><td>平均自由行程。</td></tr>
-          <tr><th>MS2</th><td>Margolin–Shashkov 2 次モーメントリマップ（<code>ms2_moments</code>）。</td></tr>
-          <tr><th>PQ フィルタ</th><td>全セル圧 \(P+Q\)（圧力＋人工粘性圧）に適用する 1D 奇偶（市松）フィルタ。\(i\pm2\) を参照し MPI ゴースト幅を規定。</td></tr>
-          <tr><th>Q1</th><td>双一次 4 節点四辺形有限要素基底。</td></tr>
-          <tr><th>RK2 / RK4</th><td>2 次 / 4 次 Runge–Kutta。</td></tr>
-          <tr><th>RZ</th><td>円筒軸対称座標 \((R,Z)\)。2D RZ メッシュは \(R=0\) 軸まわりの回転体。</td></tr>
-          <tr><th>SBS</th><td>誘導ブリルアン散乱（CBET の基礎となる 3 波過程）。</td></tr>
+          <tr><th>HLLC</th><td>Harten–Lax–van Leer-contact 近似リーマン解法（approximate Riemann solver）。流体で選べる任意の方式。</td></tr>
+          <tr><th>IAW</th><td>イオン音波（ion-acoustic wave）。</td></tr>
+          <tr><th>IB</th><td>逆制動輻射（inverse bremsstrahlung）。衝突によるレーザー吸収。</td></tr>
+          <tr><th>ICF</th><td>慣性閉じ込め核融合（inertial confinement fusion）。</td></tr>
+          <tr><th>iSNB</th><td>Implicit SNB：Cao 2015 の、ピカール反復（Picard iteration）で SNB の補正を熱伝導の時間積分へ結合する方法。</td></tr>
+          <tr><th>LC</th><td>Linear characteristic（線形特性法）：2D RZ の既定の \(S_N\) 空間離散化（<code>linear_characteristic</code>）。1D の既定は線形不連続法（linear discontinuous、<code>linear_discontinuous</code>）。</td></tr>
+          <tr><th>LP</th><td>Levermore–Pomraning（FLD の既定の流束リミッタ、flux limiter）。</td></tr>
+          <tr><th>LPI</th><td>Laser–plasma instability（ホット電子（hot electron）を駆動するパラメトリック不安定性）。</td></tr>
+          <tr><th>LTE / NLTE</th><td>局所熱力学平衡（local thermodynamic equilibrium、LTE）/ 非 LTE（non-LTE、NLTE）。</td></tr>
+          <tr><th>mfp</th><td>平均自由行程（mean free path）。</td></tr>
+          <tr><th>MS2</th><td>Margolin–Shashkov の 2 次モーメントのリマップ（second-moment remap。<code>ms2_moments</code>）。</td></tr>
+          <tr><th>PQ フィルタ</th><td>全セル圧 \(P+Q\)（圧力＋人工粘性圧）に適用する 1D の奇偶（市松）フィルタ（odd–even / checkerboard filter）。\(i\pm2\) を参照するので、MPI のゴースト幅（ghost width）を規定する。</td></tr>
+          <tr><th>Q1</th><td>双一次 4 節点四辺形有限要素（bilinear quadrilateral finite element）の基底。</td></tr>
+          <tr><th>RK2 / RK4</th><td>2 次 / 4 次の Runge–Kutta 法。</td></tr>
+          <tr><th>RZ</th><td>円筒軸対称座標（axisymmetric cylindrical coordinates）\((R,Z)\)。2D RZ メッシュは \(R=0\) の軸のまわりの回転体。</td></tr>
+          <tr><th>SBS</th><td>誘導ブリルアン散乱（stimulated Brillouin scattering）。CBET の基礎となる 3 波過程。</td></tr>
           <tr><th>SH</th><td>Spitzer–Härm（局所電子伝導）。</td></tr>
-          <tr><th>S<sub>N</sub></th><td>離散座標法。\(S_N\)・S<sub>N</sub>・S_N（プレーンテキスト文脈）はすべて同じ手法。</td></tr>
-          <tr><th>SNB</th><td>Schurtz–Nicolaï–Busquet 非局所電子伝導モデル。</td></tr>
-          <tr><th>SpMV</th><td>疎行列ベクトル積。</td></tr>
-          <tr><th>SRS / TPD</th><td>誘導ラマン散乱 / 2 プラズモン崩壊（ホット電子モデルの LPI チャネル）。</td></tr>
+          <tr><th>S<sub>N</sub></th><td>離散座標法（discrete ordinates method）。\(S_N\)・S<sub>N</sub>・S_N（プレーンテキスト文脈）はすべて同じ手法。</td></tr>
+          <tr><th>SNB</th><td>Schurtz–Nicolaï–Busquet の非局所（nonlocal）電子熱伝導モデル。</td></tr>
+          <tr><th>SpMV</th><td>疎行列ベクトル積（sparse matrix–vector product）。</td></tr>
+          <tr><th>SRS / TPD</th><td>誘導ラマン散乱（stimulated Raman scattering）/ 2 プラズモン崩壊（two-plasmon decay）。ホット電子のモデルが扱う LPI の過程。</td></tr>
           <tr><th>STS</th><td>Super-time-stepping（Chebyshev 段による陽的拡散の加速）。</td></tr>
-          <tr><th>VFP</th><td>Vlasov–Fokker–Planck（運動論参照計算）。</td></tr>
-          <tr><th>vNR</th><td>von Neumann–Richtmyer（旧スカラー人工粘性）。</td></tr>
-          <tr><th>VOID</th><td>予約された外部真空材：正の状態フロア＋伝導・輻射結合から除外する <code>cell_is_void</code> マスク。</td></tr>
+          <tr><th>VFP</th><td>Vlasov–Fokker–Planck（運動論、kinetic の参照計算）。</td></tr>
+          <tr><th>vNR</th><td>von Neumann–Richtmyer（従来のスカラー人工粘性）。</td></tr>
+          <tr><th>ボイド（void）</th><td><code>Material.is_void</code> を真にした材料のセルで、外側の真空の帯に使う。EOS と不透明度の表を読み込まず、<code>cell_is_void</code> のマスクで、熱伝導・輻射・レーザーとの結合から除外する（<a href="../physics/eos-opacity.html#void-materials">ボイド材料</a>）。</td></tr>
           <tr><th>WDM</th><td>Warm dense matter（温かい高密度物質）。</td></tr>
         </tbody>
       </table>
@@ -90,18 +90,18 @@
       <table class="quick-facts">
         <thead><tr><th>名称</th><th>説明</th></tr></thead>
         <tbody>
-          <tr><th>GXII（激光 XII 号 / GEKKO XII）</th><td>大阪大学レーザー科学研究所の 12 ビーム Nd:ガラスレーザー。TENRYU の常設ベンチマークは GXII 相当爆縮 — 凍結デッキ諸元は<a href="../verification/index.html#gxii">GXII ベンチマーク</a>を参照。</td></tr>
-          <tr><th>OMEGA</th><td>ロチェスター大学 LLE の 60 ビームレーザー。60 ポートの CBET プリセットとして登場。</td></tr>
-          <tr><th>NIF</th><td>National Ignition Facility（LLNL、192 ビーム）。192 ポートの CBET プリセットとして登場。</td></tr>
-          <tr><th>HELIOS</th><td>Prism Computational Sciences の商用 1D ラグランジュ輻射流体コード。クロスコード比較の相手。</td></tr>
+          <tr><th>GXII（激光 XII 号、GEKKO XII）</th><td>大阪大学レーザー科学研究所の 12 ビーム Nd:ガラスレーザー。TENRYU の常設ベンチマークは GXII 相当爆縮 — 回帰試験に固定したデッキの諸元は<a href="../verification/index.html#gxii">GXII ベンチマーク</a>を参照。</td></tr>
+          <tr><th>OMEGA</th><td>米国ロチェスター大学の LLE（Laboratory for Laser Energetics）にある 60 ビームのレーザー。60 ポートの CBET プリセットとして登場。</td></tr>
+          <tr><th>NIF</th><td>National Ignition Facility（国立点火施設）。LLNL（Lawrence Livermore National Laboratory）にある 192 ビームのレーザー。192 ポートの CBET プリセットとして登場。</td></tr>
+          <tr><th>HELIOS</th><td>Prism Computational Sciences の商用 1D ラグランジュ輻射流体コード。コード間ベンチマークの相手。</td></tr>
           <tr><th>LILAC / DRACO</th><td>LLE の 1D / 2D 輻射流体コード。TENRYU の CBET 応答・ホット電子処方はこれらの公刊モデル系譜（Marozas、Colaïtis — CBET・ホット電子ページの文献）に従う。</td></tr>
-          <tr><th>Hypre / BoomerAMG</th><td>LLNL の線形ソルバライブラリとその代数マルチグリッド前処理。伝導の任意 <code>solver="hypre"</code> 経路が使用。</td></tr>
+          <tr><th>Hypre / BoomerAMG</th><td>LLNL の線形ソルバのライブラリ hypre と、その代数マルチグリッド（algebraic multigrid）前処理 BoomerAMG。現行版には hypre を使う計算の経路が無く、CMake のオプション <code>TENRYU_ENABLE_HYPRE</code>（既定 OFF）を ON にしてもリンクされるだけである。<code>Numerics.conduction.solver="hypre"</code> は、ON のビルドの 1D で警告のうえ STS で解かれ、OFF のビルドと 2D では入力検査が拒否する。</td></tr>
           <tr><th>Catch2</th><td>CTest 登録テストの C++ テストフレームワーク（<code>[.expensive]</code> 等のタグは CTest ラベルに変換される）。</td></tr>
-          <tr><th>Philox</th><td>カウンタ型乱数生成器（Philox4x32-10、cuRAND）。粒子ごとのストリームは <code>global_id</code> で独立。</td></tr>
-          <tr><th>TMAT / TMAT-H5</th><td>TENRYU の物質テーブル形式（EOS・不透明度・任意の電離分率ブロック）。TMAT-H5 はその HDF5 コンテナ（リポジトリ <code>docs/TMAT_H5_SPEC.md</code>）。</td></tr>
+          <tr><th>Philox</th><td>カウンタ型乱数生成器（counter-based random number generator。Philox4x32-10、cuRAND）。粒子ごとのストリームは <code>global_id</code> で独立。</td></tr>
+          <tr><th>TMAT / TMAT-H5</th><td>TENRYU の物質テーブル形式（EOS・不透明度・任意の電離分率ブロック）。TMAT-H5 はその HDF5（Hierarchical Data Format 5）コンテナ（リポジトリ <code>docs/TMAT_H5_SPEC.md</code>）。</td></tr>
           <tr><th>IONMIX</th><td>衝突輻射コード Ionmix の <code>.cn4</code> 不透明度/EOS テーブル形式。</td></tr>
           <tr><th>SESAME</th><td>ロスアラモスの EOS テーブルライブラリ。GXII ベンチマークのテーブル EOS 変種で推奨。</td></tr>
-          <tr><th>NRL Plasma Formulary</th><td>粘性・レーザー物理が使うクーロン対数表式の出典（米海軍研究所の参照集）。</td></tr>
+          <tr><th>NRL Plasma Formulary</th><td>粘性・レーザー物理が使うクーロン対数表式の出典（米海軍研究所 NRL、Naval Research Laboratory の参照集）。</td></tr>
           <tr><th>Tauri</th><td>TENRYU Studio のデスクトップアプリ基盤。</td></tr>
         </tbody>
       </table>
@@ -109,7 +109,7 @@
 
     <section aria-labelledby="constants">
       <h2 id="constants">cgs + eV 単位系の共有定数</h2>
-      <p>単位系は凍結：長さ cm、時間 s、質量 g、エネルギー erg、密度 g/cm³、温度・光子群境界は eV。全物理ページに共通する規約は次の 3 つである。</p>
+      <p>単位系は固定である：長さ cm、時間 s、質量 g、エネルギー erg、密度 g/cm³、温度・光子群境界は eV。全物理ページに共通する規約は次の 3 つである。</p>
       <ul>
         <li><strong>\(k_B\) は <code>eV_to_erg</code> \(=1.6022\times10^{-12}\) erg/eV を意味する。</strong>温度が eV で保持されるため、本ドキュメントの \(k_BT\) はすべて eV→erg 変換であり、ケルビン系のボルツマン定数は現れない。</li>
         <li><strong>\(a_{\rm eV}=1.3720\times10^{2}\) erg cm⁻³ eV⁻⁴ は eV 単位系で表した輻射定数。</strong>平衡輻射エネルギー密度は \(T\) を eV として \(a_{\rm eV}T^4\)。</li>
@@ -118,39 +118,56 @@
     </section>
 
     <section aria-labelledby="symbols">
-      <h2 id="symbols">複数の意味を持つ記号</h2>
+      <h2 id="symbols">複数の意味を持つ記号と語</h2>
       <p>複数の分野で標準になっている文字の対照表である。文脈（ページ）が意味を選ぶ。</p>
       <table class="quick-facts">
         <thead><tr><th>記号</th><th>文脈ごとの意味</th></tr></thead>
         <tbody>
           <tr><th>\(\alpha\)</th><td>Fleck の陰的パラメータ（既定 1.0、FLD）／曲率フープ項の幾何係数（粘性：円筒 1・球 2）／Winslow 計量係数（ALE）／\(\alpha_{iaw}\) は CBET のイオン音波減衰率。</td></tr>
-          <tr><th>\(\beta\)</th><td>輻射–物質剛性比 \(4a_{\rm eV}T_e^3/C_{v,e}\)（FLD）／SNB の規格化電子エネルギー \(E/(k_BT_e)\)（\(\hat\beta\) は大域 max \(T_e\) で規格化した群境界値）／Winslow 計量係数・M1 バリア重み（ALE）。</td></tr>
+          <tr><th>\(\beta\)</th><td>輻射–物質剛性比 \(4a_{\rm eV}T_e^3/C_{v,e}\)（FLD）／SNB の規格化電子エネルギー \(E/(k_BT_e)\)（\(\hat\beta\) は大域 max \(T_e\) で規格化した群境界値）／Winslow 計量係数・M1 バリア重み（ALE）／CBET では、状態 \(A=(i,\sigma,\beta)\) の<a href="../physics/cbet.html#terms-impact-bin">衝突径数ビン</a>の番号（集計群では \(a\)）。</td></tr>
           <tr><th>\(\lambda\)</th><td>FLD リミッタ関数 \(\lambda(R)\)／SNB 群停止長 \(\lambda_g\)（abs/tr 変種）／ALE ラインサーチのブレンド係数／\(\lambda_0\) はレーザー真空波長。</td></tr>
-          <tr><th>\(\theta\)</th><td>伝導の調和フラックス制限係数／CBET の <code>theta_cap</code>／\(S_N\) の donor-\(\theta\) リミッタ／極角。</td></tr>
+          <tr><th>\(\theta\)</th><td>伝導の調和フラックス制限係数 \(1/(1+|q|/q_{max})\)／CBET の <code>theta_cap</code>（1 回の交差で供給側が失える割合の上限）／\(S_N\) の供給セル（上流で輻射エネルギーを送り出す側のセル）が、そのステップで使える輻射エネルギーを超えて送り出さないよう、送出量を縮小する 1 以下の係数（定義は<a href="../physics/radiation/sn.html#terms-donor-theta">S<sub>N</sub> のページの用語</a>）／極角。</td></tr>
           <tr><th>\(\kappa\)</th><td>質量不透明度 [cm²/g]（輻射・EOS/不透明度）。伝導の文脈では電子熱伝導率（\(\kappa\propto T_e^{5/2}\)）。\(\kappa_{\rm IB}\) は逆制動輻射の吸収係数（レーザー）。</td></tr>
+          <tr><th>\(\sigma\)</th><td>長さあたりの不透明度（length opacity）\(\sigma=\rho\kappa\) [cm⁻¹]（添字 a は吸収、s は散乱、t は全消衰（total extinction）、R はロスランド平均（Rosseland mean）、P はプランク平均（Planck mean）。輻射・EOS/不透明度）／標準偏差（変動係数 \(\sigma/|\mu|\)）／\(\langle\sigma v\rangle\) では核反応の断面積（燃焼）／CBET では<a href="../physics/cbet.html#terms-sheet">シート</a>の添字（0 = 入射側、1 = 出射側）／1D メッシュのページの \(\sigma_{\rm sg}\) はスーパーガウス型の重みの幅（<code>grading.sg_sigma</code>）／ALE のページの \(\sigma_b\) は、障壁項（barrier term）が働き始めるヤコビアンの比（0.1）。</td></tr>
+          <tr><th>\(\chi\)</th><td>CBET では<a href="../physics/cbet.html#pair-exchange-s3">結合係数</a>（coupling coefficient。対の交換 \(\Delta P_{A\leftarrow B,c}=\chi\,L_{A,c}L_{B,c}/V_c\) の比例係数）／ALE のページの \(\chi_e\) は、短辺の融合の判定量 \(\ell_e^2/(\delta_e h_e)\)（辺の長さの二乗を、座標の表現間隔 \(\delta_e\) と局所スケール \(h_e\) の積で割った値。4 以下の辺を融合する）。</td></tr>
+          <tr><th>\(\psi\)</th><td>\(S_N\) の方向別の輻射強度（specific intensity）\(\psi_{g,m}\)（群 \(g\)、方向 \(m\)）／流体の CSW 形式の人工粘性では Christensen の制限関数（衝撃波の足元と後端で 0、速度が線形な圧縮で 1）／CBET では 2 本のビームの交差角（\(\cos\psi=\hat k_q\cdot\hat k_p\)）。</td></tr>
           <tr><th>\(g\)</th><td>光子・電子エネルギー群添字（輻射・SNB・ホット電子・燃焼）／CBET では利得曲線 \(P(g)\) の規格化離調 — CBET ページの集計「群」添字は第 3 の無関係な整理番号。</td></tr>
-          <tr><th>\(f\)</th><td>Fleck 因子 \(f_{c,g}\)／伝導の自由流フラックス割合 <code>f_lim</code>／陽的ソース時間刻み割合 \(f_E\)（<code>explicit_source_limit</code>）／CBET 較正係数 <code>f_cbet</code>／ホット電子捕獲密度割合 \(f_s\)（<code>source_nc_fraction</code>）／燃焼のイオン加熱割合 \(f_i\)／CBET のドナーキャップ係数 \(f_g\)。</td></tr>
-          <tr><th>\(R\)</th><td>FLD リミッタ引数 \(|\nabla E_g|/(\sigma_{R,g}E_g)\)／\((R,Z)\) の径座標／SNB の局所極限の試験（G2）のフラックス応答比／粘性のチャネル比 \(\eta_e/\eta_i\)。</td></tr>
+          <tr><th>\(f\)</th><td>Fleck 因子 \(f_{c,g}\)／伝導の自由流フラックス割合 <code>f_lim</code>／陽的ソース時間刻み割合 \(f_E\)（<code>explicit_source_limit</code>）／CBET 較正係数 <code>f_cbet</code>／ホット電子捕獲密度割合 \(f_s\)（<code>source_nc_fraction</code>）／燃焼のイオン加熱割合 \(f_i\)／CBET の供給側の上限（donor cap）の係数 \(f_g\)。</td></tr>
+          <tr><th>\(R\)</th><td>FLD リミッタ引数 \(|\nabla E_g|/(\sigma_{R,g}E_g)\)／\((R,Z)\) の径座標／SNB の局所極限の試験（<a href="../verification/index.html#tag-legend">タグ G2</a>）のフラックス応答比／粘性のチャネル比 \(\eta_e/\eta_i\)。</td></tr>
           <tr><th>\(E\)</th><td>群輻射エネルギー密度 \(E_{c,g}\)／粒子運動エネルギー（ホット電子・燃焼の群格子）／2D 伝導更新の保存的セル熱エネルギー \(E_c\)／筆記体 \(\mathcal E\) は SNB 電場オプションの静電場。</td></tr>
           <tr><th>\(e\)</th><td>比内部エネルギー \(e_i,e_e\) [erg/g]（添字はイオン種・電子）／臨界密度 \(m_e\omega_0^2/(4\pi e^2)\) や衝突率の式では素電荷／\(e^{-2}\) スポット半径などでは指数の底。</td></tr>
+          <tr><th>\(a\)</th><td>CBET では<a href="../physics/cbet.html#terms-impact-bin">衝突径数ビン</a>（impact-parameter bin）の番号（集計群の添字 \(g=b(2N_{bin})+\sigma N_{bin}+a\)）／\(a_{\rm eV}\) は輻射定数（下の共有定数）／添字の a は、\(\mathbf{k}_a\)・\(c_a\)・\(\nu_a\) ではイオン音波（acoustic）、\(\sigma\) の添字では吸収（absorption）／ALE のページの辺 \(e=(a,b)\) は、節点 \(a\) と \(b\) を結ぶ／ホット電子の飽和形 \(1-e^{-a\sqrt{g-1}}\) では係数。</td></tr>
           <tr><th>\(u\)</th><td>流体速度 \(\mathbf u\)／ホット電子スペクトル式では規格化エネルギー \(u=E/T_h\)（\(u_{g\pm1/2}\) は群端、\(u_{min},u_{max}\) は窓端）。</td></tr>
           <tr><th>\(k\)</th><td>\(k_BT\) の eV→erg 変換（上記定数）／分散・減衰式の摂動波数／\(\mathbf k\) は CBET の光波ベクトル。</td></tr>
           <tr><th>\(m_i\)</th><td>ホット電子 dt リミッタではセル \(i\) の質量／CBET の音速では平均イオン質量 \(\bar m_i=A_{eff}m_p\)。</td></tr>
           <tr><th>添字 \(i\), \(j\)</th><td>\(T_i,e_i,P_i\) ではイオン種／1D の離散化ではセル添字 \(i\)（\(V_i,\Delta M_i\)）と節点添字 \(j\)（\(r_j,u_j\)）。種別か格子かは文脈が選ぶ。</td></tr>
-          <tr><th>\(M\), \(M_c\), \(\Delta M_i\)</th><td>いずれもラグランジュセル質量（1D は \(\Delta M_i\)、2D は \(M_c\)）。燃焼の \(M_{req}/M_{max}\) はサブサイクル数（要求値 vs <code>subcycle_max</code>）。</td></tr>
+          <tr><th>\(M\), \(M_c\), \(\Delta M_i\)</th><td>いずれもラグランジュセル質量（1D は \(\Delta M_i\)、2D は \(M_c\)）。燃焼の \(M_{req}/M_{max}\) は部分サイクル数（要求値と <code>subcycle_max</code>）。</td></tr>
           <tr><th>\(\Delta l_c\)</th><td>dt 制限が使うセル代表長：1D はセル幅、2D は \(\sqrt{A_c}\)（\(A_c\) は子午面セル面積）。</td></tr>
           <tr><th>\(T_h\)（= \(T_{hot}\)）</th><td>ホット電子指数スペクトル温度（<code>T_hot_eV</code>、内部で erg に変換）。</td></tr>
           <tr><th>\(n_c\), \(n_{\rm crit}\)</th><td>同一量 — レーザー臨界密度 \(m_e\omega_0^2/(4\pi e^2)\)。ホット電子ページは \(n_c\)、レーザーページは \(n_{\rm crit}\) と表記。</td></tr>
-          <tr><th>\(Z_{\rm eff}\), \(\bar Z_{\rm eff}\)</th><td>\(Z_{\rm eff}=\bar Z r_2\) は電荷状態モーメントによる衝突実効電荷（\(r_2=\langle Z^2\rangle/\bar Z^2\)）；\(\bar Z_{\rm eff}\)（と \(A_{\rm eff}\)）は混合セルの組成平均。検証タグ R2（S<sub>N</sub> の求積と Marshak 分布の試験群）は \(r_2\) と無関係。</td></tr>
-          <tr><th>L1 / L2</th><td>レーザー検証ゲート階層（<a href="../verification/index.html#tag-legend">ゲートタグ凡例</a>）；\(L_2\)/\(L_\infty\)（\(\varepsilon_{L2}\), \(\varepsilon_{L\infty}\)）は相対誤差ノルム（場全体の RMS / 最大値）。</td></tr>
-          <tr><th>\(w_m\), \(w_k\), \(w_0\)</th><td>\(w_m\)：\(S_N\) 求積重み（1D Gauss–Legendre 集合は \(\int_{-1}^1d\mu=2\) に規格化、方位角は \(\psi\) に畳み込み；よって \(\sum_{\mu_m>0}w_m\mu_m=1/2\)）；\(w_k\)：レーザー環状レイ重み（プロファイル×厳密面積、総和 1）；\(w_0\)：ビームの \(e^{-2}\) スポット半径。</td></tr>
+          <tr><th>\(Z_{\rm eff}\), \(\bar Z_{\rm eff}\)</th><td>\(Z_{\rm eff}=\bar Z r_2\) は電荷状態モーメントによる衝突実効電荷（\(r_2=\langle Z^2\rangle/\bar Z^2\)）；\(\bar Z_{\rm eff}\)（と \(A_{\rm eff}\)）は混合セルの組成平均。試験のタグ R2（<a href="../verification/index.html#tag-legend">2D RZ の S<sub>N</sub> 輻射の試験群</a>）は \(r_2\) と無関係。</td></tr>
+          <tr><th>L1 / L2</th><td>レーザーの検査の 2 つの水準（<a href="../verification/index.html#tag-legend">タグ凡例</a>）；\(L_2\)/\(L_\infty\)（\(\varepsilon_{L2}\), \(\varepsilon_{L\infty}\)）は相対誤差ノルム（場全体の RMS / 最大値）。</td></tr>
+          <tr><th>\(w_m\), \(w_k\), \(w_0\)</th><td>\(w_m\)：\(S_N\) 求積重み（1D Gauss–Legendre 集合は \(\int_{-1}^1d\mu=2\) に規格化、方位角は \(\psi\) に畳み込み；よって \(\sum_{\mu_m>0}w_m\mu_m=1/2\)）；\(w_k\)：レーザーの環状光線の重み（プロファイル×厳密面積、総和 1）；\(w_0\)：ビームの \(e^{-2}\) スポット半径。</td></tr>
+        </tbody>
+      </table>
+      <h3 id="words">複数の意味を持つ語</h3>
+      <p>記号のほかに、同じ語がページによって別のものを指す場合がある。次の表は、その語の意味と、この文書での書き分けを示す。</p>
+      <table class="quick-facts">
+        <thead><tr><th>語</th><th>文脈ごとの意味</th></tr></thead>
+        <tbody>
+          <tr><th>カーネル</th><td>物理カーネル（physics kernel）は、1 つの物理演算子とそのページである（<a href="../physics/index.html">物理カーネル</a>のページの定義）。CUDA カーネルは、GPU 上で並列に実行される関数である。積分核（kernel）は数学の用語で、核燃焼のページの Fraley の保持率に使う「点源球のカーネル」がこれに当たる。この文書は、前者を「物理カーネル」、後者を「CUDA カーネル」と書き分ける。</td></tr>
+          <tr><th>凍結</th><td>凍結（freeze）は、デッキの内容を、時間ループに入る前に、ループの中で変わらない形に確定する操作である（<a href="../use/running.html#terms-freeze">実行のページ</a>の用語）。デッキの Python の関数を数値の表に置き換えることと、既定値を補った設定の全体を 1 個の JSON（凍結設定）にすることを指す。凍結設定は HDF5 の出力の <code>metadata/frozen_config</code> にも保存され、<code>tenryu freeze</code> は凍結設定だけを書き出す。値を変えずに保つこと（段のあいだ係数を変えない、など）は「固定する」と書き、凍結とは書かない。</td></tr>
+          <tr><th>シード</th><td>CBET のページのシード（seed）は、対の結合係数を求めるとき標本点を出す側の状態で、もう一方がポンプである（<a href="../physics/cbet.html#terms-section">区画、シードとポンプ、影</a>）。乱数の種は「乱数の種（random seed）」と書き、<code>Main.seed</code> で与える。GXII の回帰デッキが外側に置く低密度の指数ランプは、シード・コロナ（seed corona）である（<a href="../verification/index.html#tag-legend">試験のタグと用語の凡例</a>）。</td></tr>
+          <tr><th>基準解</th><td>基準解（golden）は、承認した実行の指標値を保存した参照値で、同じ格子と実行条件での変化の検出器である（<a href="../verification/index.html#tag-legend">凡例</a>）。独立に用意した解 — 閉じた形の解、半解析的な解、ODE の数値解 — は参照解（reference solution）と書き、基準解とは別のものとして使い分ける。</td></tr>
+          <tr><th>部分サイクル</th><td>部分サイクル（subcycling）は、1 つの時間刻み \(\Delta t\) を、より小さい刻みに分けて進めることである。核燃焼では、反応ネットワークを陽的中点法で進めるのに要る分割数 \(M_{req}\)（上限は <code>Burn.subcycle_max</code>）を指す。電子熱伝導では、陽的な安定限界 \(\Delta t_{exp}\) の刻みで \(\Delta t\) を進める回数を指す。同じ名前で別の量なので、ページごとの意味を読むこと。この文書は「サブサイクル」ではなく「部分サイクル」と書く。</td></tr>
+          <tr><th>クロージャ</th><td>クロージャ（closure）は、方程式の未知量を決める関係式やモデルである。物質のクロージャは、EOS で密度 \(\rho\) と比内部エネルギー \(e\) から温度 \(T\)、圧力 \(P\)、比熱 \(c_v\) を求める関係で、再クロージャ（re-closure）は、演算子が状態を変えるたびにこれを求め直すことである（<a href="numerics-foundations.html#operator-splitting">演算子分割と再クロージャ</a>）。輸送のクロージャは、面の熱伝導率を左右のセルの値から作る規則、拡散のフラックスリミッタ、エディントン因子などである。エネルギーなどの収支が誤差の範囲で成り立つことは「収支が閉じる」と書き、クロージャとは書かない。</td></tr>
         </tbody>
       </table>
     </section>
 
     <section aria-labelledby="tags">
-      <h2 id="tags">検証タグ</h2>
-      <p>検証の語彙 — 再現性の契約（ビット単位、縮約順序の帯、雑音帯、機能オフの一致、envelope）と、試験名と各カーネルページに現れるゲートタグ族（L1/L2、G1–G5、G-R/K/P、H1/H2、I1/I2/I3/I6、R2、LR07/LE08/FLD-CED）— は<a href="../verification/index.html#reproducibility">検証とベンチマーク</a>ページの再現性凡例と<a href="../verification/index.html#tag-legend">ゲートタグ凡例</a>で一元的に定義されている。</p>
+      <h2 id="tags">試験のタグと再現性の判定方式</h2>
+      <p>試験名と各物理カーネルのページに現れるタグ — L1/L2（レーザー）、G1–G5（SNB の熱伝導）、G-R/G-K/G-P（核燃焼）、H1/H2（2D 流体）、I1/I2/I3/I5/I6（2D RZ の統合試験群）、R2（2D RZ の S<sub>N</sub> 輻射の試験群）、LR07/LE08/FLD-CED（I1 の参照解）— の意味と、再現性の判定方式（ビット単位、縮約順序の帯、雑音帯、機能オフの一致、envelope）は、<a href="../verification/index.html#tag-legend">検証とベンチマークのページのタグ凡例</a>と<a href="../verification/index.html#reproducibility">再現性の検査</a>で定義している。</p>
     </section>
 
     <div id="page-footer"></div>

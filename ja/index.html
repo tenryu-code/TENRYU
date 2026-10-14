@@ -13,8 +13,8 @@
   <main>
     <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
     <h1>TENRYU</h1>
-    <p class="tagline">レーザー駆動の高エネルギー密度 (HED)・慣性閉じ込め核融合 (ICF) 物理を対象とする CUDA ネイティブのラグランジュ/ALE (任意ラグランジュ・オイラー) 輻射流体コード。1D の球・円筒・平面形状と、2D 軸対称 (RZ) 形状に対応する。</p>
-    <p class="abstract">TENRYU は、エネルギー整合なラグランジュ流体、多群輻射輸送 (流束制限拡散および離散座標法 S<sub>N</sub>)、非局所電子熱伝導、逆制動輻射吸収を伴うレーザー光線追跡、交差ビームエネルギー転送 (CBET)、ホット電子の生成・輸送、表形式または解析的な EOS・不透明度、核燃焼を連成する。すべての計算は GPU 上で実行され、単位系は cgs + eV に固定されている。フォーム形式の GUI (TENRYU Studio) では、入力デッキの生成と往復編集が可能である。本ドキュメントが記述するのは現行プロダクション世代の TENRYU バージョン 1 (v1) である。全体で使うバージョン表記・略語・記号は<a href="overview/nomenclature.html">記号・用語集</a>にまとめている。</p>
+    <p class="tagline">レーザー駆動の高エネルギー密度（high energy density、HED）・慣性閉じ込め核融合（inertial confinement fusion、ICF）物理を対象とする CUDA ネイティブのラグランジュ/ALE（arbitrary Lagrangian–Eulerian、任意ラグランジュ・オイラー法）輻射流体（radiation hydrodynamics）コード。1D の球・円筒・平面形状と、2D 軸対称（RZ）形状に対応する。</p>
+    <p class="abstract">TENRYU は、エネルギー整合（compatible）なラグランジュ流体、多群輻射輸送（multigroup radiation transport）、非局所電子熱伝導（nonlocal electron conduction）、逆制動輻射吸収（inverse bremsstrahlung absorption）を伴うレーザーの光線追跡（ray tracing）、交差ビームエネルギー転送（cross-beam energy transfer、CBET）、ホット電子（hot electron）の生成・輸送、表形式または解析的な状態方程式（equation of state、EOS）と不透明度（opacity）、核燃焼（nuclear burn）を連成する。輻射輸送の解法は、流束制限拡散（flux-limited diffusion、FLD）と離散座標法（discrete ordinates、S<sub>N</sub>）である。主要な計算は GPU 上で実行される。メッシュの接続関係を組み替える再接続型 ALE（reconnection-based ALE）の試験段階の機能 <a href="physics/mesh/ale-remap.html#reale-v2"><code>reale_v2</code></a> は、主にホスト側（CPU）で動く。単位系は cgs + eV に固定されている。フォーム形式の GUI（TENRYU Studio）では、<a href="use/namelist.html#terms-deck">デッキ</a>（deck。TENRYU の入力となる 1 個の Python ファイル）の生成と、コードと GUI のあいだの往復編集（round-trip editing）が可能である。本ドキュメントが記述するのは TENRYU バージョン 1（v1）である。全体で使うバージョン表記・略語・記号は<a href="overview/nomenclature.html">記号・用語集</a>にまとめている。</p>
 
     <h2>ドキュメント</h2>
     <div class="card-grid">
@@ -28,16 +28,16 @@
       </a>
       <a class="card" href="physics/index.html">
         <h3>物理カーネル</h3>
-        <p>全 11 カーネルページ — 9 つの物理演算子と、それを支えるメッシュ・MPI 基盤 — のモデル、離散化、制御項目、検証。</p>
+        <p>物理演算子 9 つ（流体、輻射、熱伝導など）と、それを支えるメッシュ・MPI（Message Passing Interface）基盤の、計 11 のカーネル。モデル、離散化、制御項目、検証を説明する。ここでの「カーネル」は、演算子（またはその基盤）ごとの解説頁の単位であり、GPU の関数（CUDA カーネル）ではない。</p>
       </a>
       <a class="card" href="verification/index.html">
         <h3>検証とベンチマーク</h3>
-        <p>解析解による検査、基準解との回帰、統合試験、ベンチマーク。</p>
+        <p>解析解（analytic solution）による検査、基準解（golden reference）との回帰（regression）、統合試験（integrated test）、ベンチマーク。</p>
       </a>
     </div>
     <a class="card compact" href="develop/index.html">
       <h3>開発者ガイド</h3>
-      <p>コントリビューション規則、テスト手順、再現性契約。</p>
+      <p>コントリビューション規則、テスト手順、再現性の要求。</p>
     </a>
     <a class="card compact" href="overview/nomenclature.html">
       <h3>記号・用語集</h3>
@@ -47,13 +47,13 @@
     <h2>クイックファクト</h2>
     <table class="quick-facts">
       <tbody>
-        <tr><th scope="row">バージョン</th><td>TENRYU v1 (本ドキュメントの基準。MPI v1 などカーネル別の世代の表記は<a href="overview/nomenclature.html#versions">記号・用語集</a>で説明する)</td></tr>
-        <tr><th scope="row">幾何</th><td><code>1D_SPH</code> (球・円筒・平面 — <code>Mesh.geometry_1d</code> で選択)、<code>2D_RZ</code> (軸対称 RZ)</td></tr>
-        <tr><th scope="row">メッシュ</th><td>ラグランジュおよび ALE、構造格子・極座標・マルチブロック</td></tr>
-        <tr><th scope="row">計算基盤</th><td>CUDA(検証済み実機は <code>sm_80</code> 以降 — <a href="use/requirements.html">要求スペック</a>)、単一・複数ランク MPI</td></tr>
-        <tr><th scope="row">単位</th><td>cgs + eV (固定)</td></tr>
-        <tr><th scope="row">入力</th><td>Python namelist デッキ</td></tr>
-        <tr><th scope="row">出力</th><td>HDF5 スナップショットと履歴、Studio および <a href="overview/architecture.html">Scope</a> ビューア</td></tr>
+        <tr><th scope="row">バージョン</th><td>TENRYU v1（本ドキュメントの基準。<code>tenryu --version</code> は版（1.0.0-beta.1）と元のソースの版を表示する。表記の規則は<a href="overview/nomenclature.html#versions">記号・用語集</a>で説明する）</td></tr>
+        <tr><th scope="row">幾何</th><td><code>1D_SPH</code>（球・円筒・平面 — <code>Mesh.geometry_1d</code> で選択）、<code>2D_RZ</code>（軸対称 RZ）</td></tr>
+        <tr><th scope="row">メッシュ</th><td>ラグランジュおよび ALE、構造格子（structured grid）・極座標・マルチブロック</td></tr>
+        <tr><th scope="row">計算基盤</th><td>CUDA（検証済み実機は <code>sm_80</code> 以降 — <a href="use/requirements.html">要求スペック</a>）、単一または複数のランク（rank。MPI のプロセス）での MPI 並列</td></tr>
+        <tr><th scope="row">単位</th><td>cgs + eV（固定）</td></tr>
+        <tr><th scope="row">入力</th><td>デッキ（Python ファイル）</td></tr>
+        <tr><th scope="row">出力</th><td>HDF5 の<a href="use/outputs.html#snapshots">スナップショット</a>（snapshot。ある時刻の空間場）と<a href="use/outputs.html#history">履歴</a>（history。ステップごとのスカラー量の時系列）。<a href="use/gui.html">Studio</a> と <a href="overview/architecture.html#desktop-apps">Scope</a>（Studio の姉妹アプリで、HDF5 の場と履歴を観察して比較する）で見る</td></tr>
       </tbody>
     </table>
     <div id="page-footer"></div>

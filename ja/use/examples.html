@@ -13,15 +13,15 @@
   <main>
     <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
     <h1>例題とプリセット <span class="badge">reference</span></h1>
-    <p class="abstract">TENRYU Studio の 1 次元プリセットは、圧力で駆動する衝撃波・輻射熱波・平面の箔のレーザー照射・球殻の直接照射爆縮・輻射温度による間接照射という基本の構成と、S_N 輸送・非局所電子熱伝導 (SNB)・CBET と高速電子・核燃焼・物性表と多群輻射・低温平衡の構成則というオプションのカーネルを使う構成を収める。CBET のもの以外は 2026-10-01 に RTX 4090 で終了時刻まで計算し、2 倍細かいメッシュの計算と比べて確かめた。典型実験を扱うコミッショニング済みデッキは <code>examples/laser_plasma_1d/</code> に、検証項目を再現する独立したデッキ集は <code>examples/verification/</code> にある。</p>
+    <p class="abstract">TENRYU Studio の 1 次元プリセットは、基本の構成と、オプションの<a href="../physics/index.html">物理カーネル</a>（physics kernel）を使う構成を収める。基本の構成は、圧力で駆動する衝撃波、輻射熱波（radiative heat wave、Marshak 波）、平面の箔のレーザー照射、球殻の直接照射（direct drive）爆縮（implosion）、輻射温度（radiation temperature）による間接照射（indirect drive）である。オプションの物理カーネルを使う構成は、<a href="../physics/radiation/sn.html">離散座標法</a>（discrete ordinates、S<sub>N</sub>）の輻射輸送、<a href="../physics/conduction.html#snb">非局所電子熱伝導</a>（nonlocal electron heat conduction）の SNB モデル（Schurtz–Nicolaï–Busquet）、<a href="../physics/cbet.html">交差ビームエネルギー転送</a>（cross-beam energy transfer、CBET）と<a href="../physics/hot-electrons.html">ホット電子</a>（hot electron）、核燃焼（fusion burn）、<a href="#terms-tmat">物性表</a>（material table）と多群輻射（multigroup radiation）、<a href="#terms-cold-equilibrium">低温平衡の構成則</a>（cold-equilibrium constitutive law）である。どのプリセットも RTX 4090 で終了時刻まで計算し（CBET のものは 2026-10-05、ほかは 2026-10-01）、2 倍細かいメッシュの計算と比べて確かめた（CBET のものは 0.5 ns まで比べた）。典型実験を扱う<a href="#terms-commissioned">コミッショニング済み</a>（commissioned）の<a href="namelist.html#terms-deck">デッキ</a>（deck）は <code>examples/laser_plasma_1d/</code> に、検証項目を再現する独立したデッキ集は <code>examples/verification/</code> にある。この頁に固有の用語は<a href="#terms">用語の節</a>で説明する。</p>
 
     <aside class="planned" aria-labelledby="at-a-glance">
       <h3 id="at-a-glance">要点</h3>
       <ul>
-        <li>CBET のもの以外のプリセットは、終了時刻までの計算と、2 倍細かいメッシュの計算との比較まで済ませてある。Studio の各カードの「検証の run」にその結果が出る。</li>
-        <li>メッシュはメッシュ推薦スキル (tenryu-mesh-1d) で作った: レーザー照射のものは推薦メッシュ、輻射温度や圧力で駆動するものは層ごとの指定である。</li>
-        <li>既知の問題も結果と一緒に書いてある: 球の Marshak 駆動で細かいメッシュの外側の境界のセルが加速し続けること、SNB の箔の吸収エネルギーのメッシュ依存、物性表の箔の値の切り詰め、衝撃波の後ろの密度の 0.6 % の差。</li>
-        <li>回帰試験の標準的な参照は <code>examples/verification/gxii_1d_fld_regression.py</code> — <a href="../verification/index.html#gxii">GXII ベンチマークデッキ</a>（GXII = 激光 XII 号、大阪大学レーザー科学研究所の 12 ビームレーザー）である。</li>
+        <li>どのプリセットも、終了時刻までの計算と、2 倍細かいメッシュの計算との比較まで済ませてある（CBET のものは 0.5 ns までの比較）。Studio の各カードの「検証の run」（verification run）にその結果が出る（<a href="#terms-mesh-difference">用語</a>）。</li>
+        <li>メッシュは、レーザー照射の 6 個では<a href="#terms-mesh">推薦メッシュ</a>（recommended mesh。<code>tools/<wbr>assist/<wbr>assist.py recommend-mesh</code> が実験の条件から作る）、輻射温度や圧力で駆動する 5 個では<a href="#terms-mesh">層ごとの指定</a>（per-layer table）で作った。</li>
+        <li>既知の問題も結果と一緒に書いてある: 球の Marshak 駆動で細かいメッシュの外側の境界のセルが加速し続けること、SNB の箔の吸収エネルギーのメッシュ依存、物性表の箔での値の<a href="../overview/numerics-foundations.html#floors-safety">クランプ</a>（clamp）、衝撃波の後ろの密度の 0.6 % の差。</li>
+        <li>回帰試験（regression test）の標準的な参照は <code>examples/verification/gxii_1d_fld_regression.py</code> — <a href="../verification/index.html#gxii">GXII ベンチマークデッキ</a>（GXII = 激光 XII 号、GEKKO XII。大阪大学レーザー科学研究所の 12 ビームレーザー）である。</li>
       </ul>
     </aside>
 
@@ -29,87 +29,137 @@
       <h2 id="templates">実行可能なテンプレート（<code>examples/templates/</code>）</h2>
       <p>最初の 1 本には、全ブロックへコメントを付けた実行可能な雛形をそのまま使うのが早い。編集不要で完走する。コピーして名前を変えてから改造すること。実行手順は<a href="running.html#first-run">シミュレーションの実行</a>にある。</p>
       <table class="quick-facts">
+        <colgroup><col style="width:30%"><col style="width:34%"><col style="width:36%"></colgroup>
         <thead><tr><th>テンプレート</th><th>内容</th><th>学べること</th></tr></thead>
         <tbody>
-          <tr><th><code>template_1d_slab_radiation.py</code></th><td>平面 1D・グレイ FLD・Marshak 境界駆動・流体 OFF</td><td>放射伝播の最小構成。validate → run → 可視化の流れ。</td></tr>
-          <tr><th><code>template_1d_laser_sphere.py</code></th><td>球 1D・レーザー直接照射・2 温度・伝導 ON</td><td>レーザー波形の書き方、複合物理。</td></tr>
-          <tr><th><code>template_1d_indirect_tr.py</code></th><td>球 1D・Tr(t) 間接照射駆動</td><td>時間依存 callable → 凍結テーブルの流儀。</td></tr>
+          <tr><th><code>template_1d_slab_radiation.py</code></th><td>平面 1D・グレイ（gray）流束制限拡散（flux-limited diffusion、FLD）・Marshak 境界（Marshak boundary condition）による駆動・流体は止める</td><td>輻射の伝播の最小構成。<code>tenryu validate</code> → <code>tenryu run</code> → 可視化の流れ。</td></tr>
+          <tr><th><code>template_1d_laser_sphere.py</code></th><td>球 1D・レーザー直接照射・2 温度（two-temperature）・熱伝導あり</td><td>レーザー波形の書き方と、複数の物理を組み合わせた構成。</td></tr>
+          <tr><th><code>template_1d_indirect_tr.py</code></th><td>球 1D・輻射温度 Tr(t) による間接照射の駆動</td><td>時間に依存する駆動を Python の関数で書き、初期化時に表へ<a href="running.html#terms-freeze">凍結</a>（freeze）する書き方。</td></tr>
         </tbody>
       </table>
     </section>
 
     <section aria-labelledby="laser-plasma-1d">
       <h2 id="laser-plasma-1d">1 次元レーザープラズマ例題集（<code>examples/laser_plasma_1d/</code>）</h2>
-      <p>典型的なレーザープラズマ実験をモデル化した、コミッショニング済みの 1 次元デッキをまとめている。</p>
+      <p>典型的なレーザープラズマ実験をモデル化した、<a href="#terms-commissioned">コミッショニング済み</a>の 1 次元デッキをまとめている。</p>
       <ul>
-        <li>収録する 10 本は、箔の衝撃波ブレークアウト、2 パルス衝撃波タイミング、インピーダンス整合、爆発箔、Kr 中の輻射衝撃波、円筒ライナー、固体球収束（600/900/1350 セルの調査）、D2 充填シェル爆縮、CBET とホット電子を含むコロナ、Marshak 駆動の DT 燃焼を扱う。</li>
-        <li>各デッキの状態、測定したコミッショニング指標、注意点は、例題集の README に記録している。</li>
-        <li>固体材料が用いる <code>tmat</code> EOS 表は、ライセンスされた PrOpacEOS 由来のため配布しない。利用者は自身の PrOpacEOS/SESAME ワークフローから <code>tools/tmat/propaceos_to_tmat.py</code> で生成する必要があり、うち 1 本のデッキには SESAME ASCII ライブラリも必要である。</li>
+        <li>収録する 10 本は、箔の衝撃波ブレークアウト（shock breakout）、2 パルスの衝撃波タイミング（two-pulse shock timing）、インピーダンス整合（impedance matching）、爆発箔（exploding foil）、Kr 中の輻射衝撃波（radiative shock）、円筒ライナー（cylindrical liner）、固体球の収束（solid-sphere convergence。600/900/1350 セルの調査）、D2 を充填したシェルの爆縮、CBET とホット電子を含むコロナ、Marshak 駆動の DT 燃焼を扱う。</li>
+        <li>各デッキの状態、測定したコミッショニング指標（commissioning metrics）、注意点は、例題集の README に記録している。</li>
+        <li>固体材料が用いる <a href="#terms-tmat">tmat</a> の状態方程式（equation of state、EOS）の表は、ライセンスされた PrOpacEOS（EOS と不透明度の表を作るコード）のデータに由来するため配布しない。利用者は自身の PrOpacEOS／SESAME のワークフローから <code>tools/<wbr>tmat/<wbr>propaceos_to_tmat.py</code> で生成する必要があり、うち 1 本のデッキ（ex06）には SESAME の ASCII ライブラリも必要である（SESAME は<a href="../overview/nomenclature.html#external-names">用語集</a>）。</li>
       </ul>
+    </section>
+
+    <section aria-labelledby="terms">
+      <h2 id="terms">この計算で使う用語</h2>
+      <p>この頁のプリセットと例題集は、メッシュの作り方、レーザーが当たる前の冷たい物質の扱い、爆縮の指標、物性表に、TENRYU の実装に固有の意味をもつ語を使う。ここに挙げる語は、その意味で使うので、まとめて定義する。</p>
+
+      <h3 id="terms-commissioned">コミッショニング済みのデッキ</h3>
+      <p><strong>コミッショニング済みのデッキ（commissioned deck）</strong>は、実際に走らせて測った指標が README に記録されているデッキである。コミッショニング（commissioning）は、装置や設定を実際に動かして、設計どおりに動くかを確かめる作業をいう。<code>examples/laser_plasma_1d/</code> の 10 本は、<code>tools/assist</code> のデッキ生成（<code>generate-deck</code>）で作って調整したあと、設計の段階で決めた指標の目標範囲（README は design window と呼ぶ。たとえば衝撃波が後面に届く時刻の許容範囲）に対して、1 本ずつ走らせている。README の表は、各デッキについて、完走したか、測定した指標、目標範囲に対する位置を載せる。</p>
+      <p>目標範囲に収まらなかった指標も記録してある。たとえば ex08 の<a href="#terms-implosion">停滞</a>（stagnation）の時刻は、目標範囲 3.6〜4.5 ns に対して 5.03 ns で、遅い。したがって、コミッショニング済みであることは、指標がすべて目標範囲に入っていることを意味しない。記録があるので、デッキを改造したあとの結果の変化を、元のデッキの測定値と比べて読める。自分の条件へ改造するときは、README の測定値と注意点を先に読み、どの指標が設計の意図どおりかを確かめること。</p>
+
+      <h3 id="terms-tmat">物性表（tmat）</h3>
+      <p><strong>tmat</strong>は、TENRYU の物性表（material table）の形式 TMAT-H5 を選ぶ <code>model</code> の値である（<a href="../overview/nomenclature.html#external-names">TMAT-H5</a>）。HDF5 のファイル（拡張子 <code>.tmat.h5</code>）に、状態方程式（EOS）と多群の不透明度（opacity）を表にして入れる。デッキは、材料の <code>eos=dict(model="tmat", file="TMAT-H5/&lt;材料&gt;.tmat.h5")</code> と <code>opacity=dict(model="tmat", file=…)</code> で表を指す。理想気体の EOS（<code>model="ideal_gas"</code>）や一定の不透明度（<code>model="constant"</code>）と違い、物質ごとに、密度と温度に対する圧力とエネルギーと、光子エネルギーの群ごとの不透明度を、表の補間で与える（<a href="../physics/eos-opacity.html#eos-models">EOS・不透明度・電離</a>）。</p>
+      <p>Studio のプリセットでは、<code>table_radiation_foil</code> が <code>TMAT-H5/CD.tmat.h5</code> の EOS と 80 群の不透明度を使い、<code>cold_equilibrium_layers</code> が <code>TMAT-H5/CD.tmat.h5</code> と <code>TMAT-H5/D2.tmat.h5</code> の EOS を使う（不透明度は一定）。例題集の 10 本は、固体の材料に tmat の EOS の表を使う。tmat の表は、ライセンスされた PrOpacEOS のデータに由来するので配布しない。利用者は、自分の PrOpacEOS または SESAME のワークフローから <code>tools/<wbr>tmat/<wbr>propaceos_to_tmat.py</code> で作る。</p>
+
+      <h3 id="terms-mesh">推薦メッシュと層ごとの指定</h3>
+      <p><strong>推薦メッシュ（recommended mesh）</strong>は、レーザー照射の 1D のデッキについて、実験の条件から決定論的（deterministic）に作る初期メッシュである。<code>tools/<wbr>assist/<wbr>assist.py recommend-mesh</code> が、レーザーの波長、パルスの形と強度、標的の層（材料、原子量と原子番号、密度、厚さ）、幾何、終了時刻を読み、メッシュの収束を測った計算の参照表（<code>tools/<wbr>assist/<wbr>data/<wbr>mesh_convergence_reference.json</code>）から、表面のセルの質量を標的の外面の面積で割った量（面密度、areal density。単位は g/cm²）の上限を決めて、<code>Mesh</code> ブロックを書き出す。LLM は使わない。レーザー照射の計算では、表面のセルの大きさが、吸収とアブレーション（ablation）の結果を左右するので、この上限が要る。</p>
+      <p>推薦メッシュのデッキは、セルの配置を宣言する <code>Mesh.zoning_intent</code> と、上限をソルバーに課す <code>Mesh.<wbr>resolution_requirement</code>（<code>apply="enforce"</code> と、推薦の根拠にした測定を記す <code>empirical</code>）を書く。サーバーの <code>tenryu</code> があるときは、<code>tenryu validate</code> を通るまで作り直し、通ったものだけを推薦とする。推薦は、参照表が測った範囲の条件に対して作る。範囲の外では、較正した先験的（a priori）な上限を使って <code>extrapolation</code> の印を付けるので、表面のセルの質量を半分にしたデッキを作り、元のデッキと比べて収束を確かめること。Studio のプリセットでは、レーザー照射の 6 個（<code>laser_foil</code>、<code>laser_shell_implosion</code>、<code>snb_nonlocal_foil</code>、<code>cbet_hot_electrons</code>、<code>table_radiation_foil</code>、<code>cold_equilibrium_layers</code>）が、その条件で作った推薦メッシュを保存している（操作は <a href="gui.html#terms-recommended-mesh">TENRYU Studio</a> の頁にある）。</p>
+      <p><strong>層ごとの指定（per-layer table）</strong>は、層（材料の領域）ごとにセル数と並べ方を決めるメッシュの作り方である。並べ方は等幅・等質量・等比の 3 つで、等比のときは端のセルの幅か隣のセルとの幅の比を与える。Studio が節点を計算して <code>Mesh.explicit_nodes</code> に書くので、画面に表示した格子がそのまま計算に使われる。推薦メッシュは、レーザーの条件から上限を決めるので、レーザー照射のデッキにしか作れない。輻射温度や圧力で駆動する 5 個（<code>pressure_driven_shock</code>、<code>marshak_wave</code>、<code>indirect_drive_capsule</code>、<code>sn_radiation_foil</code>、<code>burn_exploding_pusher</code>）は、層ごとの指定を使う。駆動が入る側に最も細かいセルを置き、材料の界面でセルの幅が連続になるようにして、メッシュを 2 倍細かくしたデッキと比べて収束を確かめてある。</p>
+
+      <h3 id="terms-mesh-difference">メッシュの差と検証の run</h3>
+      <p><strong>メッシュの差（mesh difference）</strong>は、同じ条件を 2 倍細かいメッシュで計算した結果と、プリセットの結果との、観測量ごとの差（%）である。2 倍細かいメッシュは、セルの数を 2 倍にして、全セル（表面のセルを含む）の質量を半分にしたメッシュで、細かくしても観測量が変わらなければ、プリセットのメッシュで量が収束している。吸収エネルギーの収束の目安は 3 % である。SNB のプリセットの吸収エネルギー（7.0 %）のように、目安を超えた差も、そのまま書いてある。</p>
+      <p><strong>検証の run（verification run）</strong>は、Studio のカードで結果を載せる欄の名前で、プリセットを終了時刻まで計算し、メッシュの差を測った run である。入力を検査する <code>tenryu validate</code> や、ソルバーの検証を走らせる <code>tenryu verify</code> とは別のものである。Studio の「収束確認用の組」は、自分のデッキについて同じ細かいメッシュのデッキ（ケース名の末尾に <code>_fine</code>）を作り、同じ確かめを行えるようにする（<a href="gui.html#terms-preset">TENRYU Studio</a> の頁にある）。</p>
+
+      <h3 id="terms-corona">コロナ層、ゴーストコロナ、径方向吸収</h3>
+      <p>冷たい固体の表面が、1 セル分の密度の跳びで真空に接していると、351 nm の光は、吸収される経路をほとんどもたないまま臨界面（critical surface。電子密度が臨界密度に達する面）で反射し、加熱で育つコロナの種ができない（<a href="../physics/mesh/1d.html#regions-corona">1D メッシュ</a>）。これを避けるには、コロナ層（corona ramp）かゴーストコロナ（ghost corona）のどちらかを置く。また、1D のレーザーの吸収には、光線追跡（ray tracing）の <code>raytrace_2d</code> と、簡易な径方向吸収（radial absorption）の 2 つのモードがある。以下の 3 語は、この頁のレーザー照射のプリセットがどれを使うかを区別するために定義する。</p>
+      <p><strong>コロナ層（corona ramp）</strong>は、標的の外面から外側へ密度が指数関数的に下がる層で、初期の密度の分布として置く。層のセルは質量をもつ流体のセルで、ほかのセルとともに動く。ソルバーにこの層のキーはなく、Studio のフォーム「プリプラズマ・コロナ ramp」が、デッキの密度と体積分率の関数へ書き出す。既定は無効で、プリセットは使わない（<a href="../physics/mesh/1d.html#terms-corona">1D メッシュ</a>）。</p>
+      <p><strong>ゴーストコロナ（ghost corona、<code>Laser.<wbr>lasermesh.<wbr>ghost_corona</code>）</strong>は、光線追跡のためだけに、レーザー格子（光線を追跡する半径方向の格子）の上へ置く仮想の低密度の層で、流体の密度、温度、質量は変えない（1D 専用）。層は最外の物質セルの外側にあり、電子密度は、最外の物質セルの値（臨界密度 \(n_c\) の <code>ne_max_frac</code> 倍が上限）から外へ向かって指数関数的に下がり、<code>ne_min_frac</code> 倍で終わる。幅は、レーザー格子の細かいセル <code>n_out</code> 個分と、音速にレーザーの立ち上がりからの時間を掛けた長さの大きい方で、流体の側でコロナが解像されるにつれて縮み、消える。ゴーストコロナで吸収されたパワーは、最外の物質セルから内向きの数セルへ再配分される（リポジトリの <code>docs/NUMERICS.md</code> §5.7.5）。<code>n_out</code> の既定は 12、<code>ne_min_frac</code> は 0.03、<code>ne_max_frac</code> は 0.99 で、デッキで指定しないときの既定と Studio の既定は同じである。<code>enabled</code> の既定は、デッキで指定しないときも Studio も無効で、Studio のレーザー照射のプリセットは有効にする。Studio はこの機能を「合成コロナ」と表示する（<a href="../physics/mesh/1d.html#terms-ghost">コロナ層との違い</a>）。</p>
+      <p><strong>径方向吸収（radial absorption、<code>Laser.mode=<wbr>"radial_absorption_1d"</code>）</strong>は、1D 専用のレーザーの簡易な吸収のモードで、光線を追跡しない。全ビームのパワーの和を、外側から内側へ向かう 1 本の半径方向の流束として、セルの順に逆制動輻射（inverse bremsstrahlung）で減衰させ、電子密度が臨界密度に達したところで止めて、残りを未吸収として記帳する。ビームの方向、F 値、焦点、強度分布、光線の数は、吸収の分布を変えない（<a href="../physics/laser.html#other-modes">2D RZ と簡易な半径方向モード</a>）。もう 1 つのモード <code>raytrace_2d</code> は光線を追跡する。Studio のプリセットでは、平面の箔の 4 個（<code>laser_foil</code>、<code>snb_nonlocal_foil</code>、<code>table_radiation_foil</code>、<code>cold_equilibrium_layers</code>）が径方向吸収を、球殻の 2 個（<code>laser_shell_implosion</code>、<code>cbet_hot_electrons</code>）が <code>raytrace_2d</code> を使う。6 個のプリセットは、どちらもゴーストコロナを使う。</p>
+
+      <h3 id="terms-cold-equilibrium">低温平衡の構成則</h3>
+      <p><strong>低温平衡の構成則（cold-equilibrium constitutive law）</strong>は、電子温度の低い冷たい状態で、表の状態方程式に補正を加え、指定した参照状態を力学平衡に置く構成則である。表の状態方程式は、極低温側（冷たい固体や液体）で、外力のない物質の全圧 0 からずれることがある（平坦な cold curve、張力、スピノーダル。リポジトリの <code>docs/NUMERICS.md</code> §1 (b)）。そのまま使うと、層の間の圧力の差で、衝撃波が来る前に界面が動く。この構成則は、参照状態 \((\rho_0,T_{e0},T_{i0})\) の全圧を \(P_0\)、体積弾性率（bulk modulus）を \(K_0\) に置き、冷たい物質の圧力を</p>
+      \[
+      P_{\rm cold}(v)=P_0+K_0\left(\frac{v_0}{v}-1\right)
+      \]
+      <p>とする。ここで \(v=1/\rho\) は比体積、\(v_0=1/\rho_0\) である。電子側の自由エネルギーに密度の関数の補正を足して、参照温度・参照密度の近くで全圧が \(P_{\rm cold}\) に一致するようにする。</p>
+      <p>補正は、電子温度 \(T_e\) が <code>T_start_eV</code> の <code>transition_begin_fraction</code> 倍（既定 0.5）以下で全量、<code>T_start_eV</code> 以上で 0 になり、その間を滑らかに（2 階微分まで連続に）つなぐ。<code>T_start_eV</code> を \(T_*\) と書くと、\(T_*\) 以上に加熱された部分は元の表の結果に戻る。密度の側でも、参照密度の 1/1.10 倍から 1.10 倍（<code>density_core_ratio</code>）では全量をかけ、1/1.50 倍と 1.50 倍（<code>density_outer_ratio</code>）で 0 に絞る。冷たいセルを剛体壁として固定するのではなく、全セルが力学的に応答するので、衝撃波は冷たい層を透過する。</p>
+      <p>デッキでは、<code>Numerics.<wbr>hydro.<wbr>T_start_inactive_cells=<wbr>"cold_equilibrium"</code>（既定は <code>"passive_fill"</code>）で有効にし、<code>Numerics.<wbr>hydro.<wbr>T_start_eV</code>（0 より大きい値が必要。既定は 0）で \(T_*\) を与える。各材料に <code>eos=dict(…, cold_reference=dict(rho_gcc, Te0_eV, Ti0_eV, P0_dyn_cm2, bulk_modulus_dyn_cm2))</code> を書く（<code>P0_dyn_cm2</code> の既定は 0、ほかは必須）。条件は、1D_SPH、2 温度、ボイド（void）でないすべての材料が表の EOS、<code>Numerics.<wbr>hydro.<wbr>qei_heat_capacity=<wbr>"table"</code>（電子とイオンの熱交換に表の比熱を使う）である。</p>
+      <p>補正の形を決める <code>Numerics.<wbr>hydro.<wbr>cold_equilibrium</code> の 4 つのキー（<code>transition_begin_fraction</code> 0.5、<code>density_core_ratio</code> 1.10、<code>density_outer_ratio</code> 1.50、<code>inverse_max_iterations</code> 80）は、デッキで指定しないときと Studio で既定が同じである。Studio は、この方式を選ぶと熱交換の比熱を <code>"table"</code> にし、各材料の参照状態の密度と温度を、その材料の最初の領域の初期状態で埋める（全圧は 0、体積弾性率は未入力のまま）。<code>cold_equilibrium_layers</code> は <code>T_start_eV</code> = 2 eV で、参照状態を、液体 D2 が密度 0.17 g/cm³・0.1 eV・体積弾性率 0.12 GPa、CD が 1.05 g/cm³・0.1 eV・5.8 GPa とし、衝撃波が来るまで 2 層の界面が動かないことと、衝撃波の伝わり方を見る（<a href="gui.html#cold-equilibrium">TENRYU Studio</a> の頁にある）。</p>
+
+      <h3 id="terms-implosion">停滞、バン時刻、収束比</h3>
+      <p><strong>停滞（stagnation）</strong>は、爆縮するシェルが内向きの運動を止める時期で、シェルの半径が最小に、密度が最大になる。TENRYU は、ピーク密度 \(\rho_{\rm peak}\) を履歴の <code>implosion/rho_peak</code> に、シェルの平均半径を <code>implosion/shell_radius_mean</code> に、ステップごとに記録する。1D のシェルは、密度が \(\rho_{\rm peak}\) の 0.1 倍以上のセルの集まりで、平均半径は、そのセルの中心の半径を質量で重みを付けて平均した値である。停滞のピークは短く（2026-07-31 の GXII 級のレーザー爆縮の計算で約 15 ps）、間引かれたスナップショットでは最大密度を過小評価するので、値と時刻は履歴から読む（<a href="outputs.html#history">出力と解析</a>）。</p>
+      <p><strong>バン時刻（bang time）</strong>は、核燃焼のある爆縮で、核反応の発生率が最大になる時刻である。核燃焼のあるデッキは、DT の中性子の累積数を履歴の <code>burn/N_neutrons_dt_cum</code> に書く。発生率は、この累積数の時間微分である。検証の頁の基準解（golden）にある <code>bang_time_s</code> は、核燃焼のない GXII のデッキで、<code>implosion/shell_radius_min</code> が最小になる時刻（最大圧縮の時刻）を指す名前で（<code>src/drivers/cmd_verify.cpp</code>）、この意味のバン時刻ではない。</p>
+      <p><strong>収束比（convergence ratio、CR）</strong>は、爆縮による半径の縮み方で、初期のシェルの半径 \(R_{\rm initial}\) を、その時刻のシェルの半径 \(R_{\rm shell}\) で割った値である。</p>
+      \[
+      \mathrm{CR}=\frac{R_{\rm initial}}{R_{\rm shell}},\qquad
+      R_{\rm shell}=\frac{\sum_{c}m_c\,r_c}{\sum_{c}m_c}\quad(\rho_c\ge0.1\,\rho_{\rm peak})
+      \]
+      <p>ここで \(m_c\)、\(r_c\)、\(\rho_c\) はセル \(c\) の質量、中心の半径、密度で、和は、密度が \(\rho_{\rm peak}\) の 0.1 倍以上のセルについてとる。\(R_{\rm initial}\) は、run の最初の有効なステップでの \(R_{\rm shell}\) である（<code>src/diagnostics/diagnostics.cu</code>）。ステップごとの値は、<code>Numerics.diagnostics.icf</code> を有効にしたとき、履歴の <code>diagnostics/icf/v1/CR</code> に入る。下の表の最小半径は \(R_{\rm shell}\) の最小値で、収束比は \(R_{\rm initial}\) をその最小半径で割った値である。たとえば <code>laser_shell_implosion</code> では、初期のシェル（半径 243〜250 µm）の \(R_{\rm initial}\) が約 247 µm で、最小半径 49 µm で割ると 5.0 になる。Studio のカードは、収束比を「収縮比」と表示する。</p>
     </section>
 
     <section aria-labelledby="validated-presets">
       <h2 id="validated-presets">実際の計算で検証したプリセット</h2>
-      <p>実行手順: <a href="gui.html">TENRYU Studio</a> でプリセットを適用してデッキ（namelist）を保存し、<a href="running.html">実行</a>の手順どおり <code>tenryu run</code> に渡す。</p>
-      <p>表の値は、プリセットが意図したとおりの問題を構成できているかを判断するための、観測の目安である。GPU、バイナリ、解像度、終了条件、物性値を変えたデッキに対してまで通用する基準解ではない。「メッシュの差」は、同じ条件を 2 倍細かいメッシュで計算した結果との差である。平面のプリセットでは後面 (r = 0) が固定の壁で、両面から照射した箔の中央面にあたる。</p>
+      <p>実行手順: <a href="gui.html">TENRYU Studio</a> でプリセットを適用して<a href="namelist.html#terms-deck">デッキ</a>を保存し、<a href="running.html">実行</a>の手順どおり <code>tenryu run</code> に渡す。</p>
+      <p>表の値は、プリセットが意図したとおりの問題を構成できているかを判断するための、観測の目安である。GPU、バイナリ、解像度、終了条件、物性値を変えたデッキに対してまで通用する基準解ではない。「メッシュの差」は、同じ条件を 2 倍細かいメッシュで計算した結果との差である（<a href="#terms-mesh-difference">用語</a>）。平面のプリセットでは後面（r = 0）が固定の壁で、両面から照射した箔の中央面にあたる。</p>
       <table class="quick-facts">
+        <colgroup><col style="width:21%"><col style="width:33%"><col style="width:46%"></colgroup>
         <thead>
-          <tr><th>プリセット</th><th>主な条件</th><th>2026-10-01 の計算結果</th></tr>
+          <tr><th>プリセット</th><th>主な条件</th><th>計算結果（2026-10-01。CBET のものは 2026-10-05）</th></tr>
         </thead>
         <tbody>
           <tr>
             <th><code>pressure_driven_shock</code><br>圧力で駆動する衝撃波</th>
-            <td>平面、理想気体の平板 100 µm の外面に 1 Mbar の一定の圧力。流体だけ・1 温度。5 ns。</td>
-            <td>衝撃波の速さは Rankine–Hugoniot の厳密な値 11.27 km/s と 0.01 % で一致。衝撃波の後ろの流速は 0.14 %、密度は 0.6 % 厳密な値より大きく、密度の差はメッシュを細かくしても縮まらない (原因は未特定)。</td>
+            <td>平面、理想気体の平板 100 µm の外面に 1 Mbar の一定の圧力。流体だけ・1 温度（one-temperature）。5 ns。</td>
+            <td>衝撃波の速さは Rankine–Hugoniot の厳密な値 11.27 km/s と 0.01 % で一致。衝撃波の後ろの流速は 0.14 %、密度は 0.6 % 厳密な値より大きく、密度の差はメッシュを細かくしても縮まらない（原因は未特定）。</td>
           </tr>
           <tr>
             <th><code>marshak_wave</code><br>輻射熱波</th>
-            <td>平面、密度 0.2 g/cm³ の平板に外側から 120 eV の輻射。流体は止める。灰色 FLD・1 温度。1 ns。</td>
-            <td>1 ns で壁の電子温度 104 eV、熱波の先端は壁から 37.9 µm (0.5 ns で 20.6 µm)。メッシュの差は先端の位置で 0.16 %。</td>
+            <td>平面、密度 0.2 g/cm³ の平板に外側から 120 eV の輻射。流体は止める。グレイ FLD・1 温度。1 ns。</td>
+            <td>1 ns で壁の電子温度 104 eV、熱波の先端は壁から 37.9 µm（0.5 ns で 20.6 µm）。メッシュの差は先端の位置で 0.16 %。</td>
           </tr>
           <tr>
             <th><code>laser_foil</code><br>平面の箔のレーザー照射</th>
-            <td>平面、CH の箔 25 µm に 351 nm・1×10<sup>14</sup> W/cm² を 1 ns。径方向吸収・合成コロナ・2 温度の陰的な電子熱伝導。1.5 ns。</td>
-            <td>吸収率 89 %。衝撃波は 0.62 ns に後面の壁に届き、それまでのアブレーション圧の平均は 17 Mbar。メッシュの差は吸収エネルギー 3.3 %・アブレーション圧 2.2 %。</td>
+            <td>平面、CH の箔 25 µm に 351 nm・1×10<sup>14</sup> W/cm² を 1 ns。<a href="#terms-corona">径方向吸収</a>・<a href="#terms-corona">ゴーストコロナ</a>・2 温度の陰的（implicit）な電子熱伝導。1.5 ns。</td>
+            <td>吸収率 89 %。衝撃波は 0.62 ns に後面の壁に届き、それまでのアブレーション圧（ablation pressure）の平均は 17 Mbar。メッシュの差は吸収エネルギー 3.3 %・アブレーション圧 2.2 %。</td>
           </tr>
           <tr>
             <th><code>laser_shell_implosion</code><br>球殻の直接照射爆縮</th>
-            <td>球、外半径 250 µm・厚さ 7 µm の CD 殻と 0.02 g/cm³ の D2 ガス。527 nm のガウス波形 (ピーク 3×10<sup>14</sup> W/cm²、半値幅 1 ns) をレイトレースで吸収。2.4 ns。</td>
-            <td>吸収率 67 %、停滞 1.83 ns、収縮比 5.0 (最小半径 49 µm)、最大密度 141 g/cm³。メッシュの差は 0.5 % 以内。</td>
+            <td>球、外半径 250 µm・厚さ 7 µm の CD 殻と 0.02 g/cm³ の D2 ガス。527 nm のガウス波形（ピーク 3×10<sup>14</sup> W/cm²、半値幅 1 ns）を光線追跡で吸収。2.4 ns。</td>
+            <td>吸収率 67 %、<a href="#terms-implosion">停滞</a>の時刻 1.83 ns、<a href="#terms-implosion">収束比</a> 5.0（最小半径 49 µm）、最大密度 141 g/cm³。メッシュの差は 0.5 % 以内。</td>
           </tr>
           <tr>
             <th><code>indirect_drive_capsule</code><br>間接照射の爆縮</th>
-            <td>球、CH のアブレータ 30 µm と DT ガスのカプセルを、外側の境界の輻射温度 Tr(t) (120 eV のフット、200 eV の主駆動、2.6 ns で終了) で駆動。灰色 FLD・2 温度。3 ns。</td>
-            <td>停滞 2.42 ns、最小半径 47 µm、収縮比 6.7、最大密度 38 g/cm³。メッシュの差は最小半径 1.8 %。細かいメッシュでは駆動を切った後も外側の境界のセルが加速し続け、境界から入るエネルギーが 110 倍になる (既知の欠陥)。</td>
+            <td>球、CH のアブレータ（ablator）30 µm と DT ガスのカプセルを、外側の境界の輻射温度 Tr(t)（120 eV のフット（foot）、200 eV の主駆動（main drive）、2.6 ns で終了）で駆動。グレイ FLD・2 温度。3 ns。</td>
+            <td>停滞の時刻 2.42 ns、最小半径 47 µm、収束比 6.7、最大密度 38 g/cm³。メッシュの差は最小半径 1.8 %。細かいメッシュでは駆動を切った後も外側の境界のセルが加速し続け、境界から入るエネルギーが 110 倍になる（既知の欠陥）。</td>
           </tr>
           <tr>
-            <th><code>sn_radiation_foil</code><br>輻射駆動の平面箔 (S_N)</th>
-            <td>平面、CH の箔 40 µm を外側から 150 eV の輻射で駆動。S_N 輸送 (16 方向・4 群)。2 ns。</td>
-            <td>衝撃波が後面の壁に届くのは 0.74 ns、アブレーションした質量 3.1 mg/cm²。S_N の反復はすべての step で収束。メッシュの差はアブレーションした質量 0.6 %。</td>
+            <th><code>sn_radiation_foil</code><br>輻射駆動の平面箔（S<sub>N</sub>）</th>
+            <td>平面、CH の箔 40 µm を外側から 150 eV の輻射で駆動。S<sub>N</sub> 輸送（16 方向・4 群）。2 ns。</td>
+            <td>衝撃波が後面の壁に届くのは 0.74 ns、アブレーションした質量 3.1 mg/cm²。S<sub>N</sub> の反復はすべてのステップで収束。メッシュの差はアブレーションした質量 0.6 %。</td>
           </tr>
           <tr>
-            <th><code>snb_nonlocal_foil</code><br>非局所電子熱伝導 (SNB)</th>
+            <th><code>snb_nonlocal_foil</code><br>非局所電子熱伝導（SNB）</th>
             <td>平面、CH の箔 25 µm に 351 nm・5×10<sup>14</sup> W/cm² を 1 ns。電子の熱流束を SNB の非局所モデルで解く。1.2 ns。</td>
-            <td>吸収率 86 %。衝撃波は 0.36 ns に後面の壁に届き、それまでのアブレーション圧の平均は 58 Mbar。吸収エネルギーのメッシュの差が 7.0 % で、収束の目安 (3 %) に届いていない。</td>
+            <td>吸収率 86 %。衝撃波は 0.36 ns に後面の壁に届き、それまでのアブレーション圧の平均は 58 Mbar。吸収エネルギーのメッシュの差が 7.0 % で、収束の目安（3 %）に届いていない。</td>
           </tr>
           <tr>
-            <th><code>cbet_hot_electrons</code><br>CBET と高速電子</th>
-            <td>球、GXII の 12 ビームの配置で CBET と、TPD・SRS からの高速電子 (しきい値のモデル)。CD 殻 20 µm、351 nm・5×10<sup>14</sup> W/cm²・1 ns。光線はビームあたり 200 本。1.2 ns。</td>
-            <td>終了時刻までの計算はまだない (GPU 1 枚で数時間かかる)。CBET と高速電子は照射の最初の十数 ps でだけ確かめている。</td>
+            <th><code>cbet_hot_electrons</code><br>CBET とホット電子</th>
+            <td>球、GXII の 12 ビームの配置で、CBET と、2 プラズモン崩壊（two-plasmon decay、TPD）・誘導ラマン散乱（stimulated Raman scattering、SRS）によるホット電子（しきい値のモデル）。CD 殻 20 µm、351 nm・5×10<sup>14</sup> W/cm²・1 ns。光線はビームあたり 200 本。1.2 ns。Studio のカードの題は「CBET と高速電子の直接照射」である。</td>
+            <td>1.2 ns まで計算（RTX 4090 で 2.6 時間・11 万ステップ。1 ステップは照射の始めの約 5 ms から、コロナが広がるにつれて長くなり、終わりには約 200 ms）。吸収率 74 %。CBET の反復はすべてのステップで収束（平均 3 回）。この条件ではホット電子は生じない: TPD のしきい値の指標 I14·Ln·λ/(82 Te)（I14 はレーザー強度を 10<sup>14</sup> W/cm² で割った値、Ln は密度スケール長 [µm]、λ は波長 [µm]、Te は電子温度 [keV]。<a href="gui.html#tpd-threshold">定義</a>）の最大は 0.79（1.1 ns）で 1 に届かず、レーザーからホット電子への変換率は全時刻で 0。2 倍細かいメッシュとは 0.5 ns まで比べた: 吸収エネルギーは細かいメッシュが 1.3 % 少なく、殻の平均半径の差 0.2 %・最大密度 1.6 %・面密度（areal density）ρR 0.4 %・TPD のしきい値の指標 2.0 %。終了時刻までの比較は、細かいメッシュの計算に約 11 時間かかるため、まだしていない。</td>
           </tr>
           <tr>
             <th><code>burn_exploding_pusher</code><br>核燃焼する exploding pusher</th>
-            <td>球、CD 殻 10 µm と 0.004 g/cm³ の DT ガスを段階的な Tr(t) (60・120・180 eV) で駆動。DT の核燃焼、イオンのプラズマ粘性、イオン熱伝導、8 群の輻射拡散。4 ns。</td>
-            <td>DT の中性子の収量 3.9×10<sup>10</sup>、バン 2.74 ns、停滞 2.92 ns、収縮比 4.2。メッシュの差は収量 1.5 %・バンの時刻 0.2 %。細かいメッシュでは外側の境界のセルの既知の欠陥が出る (境界から入るエネルギーが約 5 倍)。</td>
+            <td>球、CD 殻 10 µm と 0.004 g/cm³ の DT ガスを段階的な Tr(t)（60・120・180 eV）で駆動。DT の核燃焼、イオンのプラズマ粘性（plasma viscosity）、イオン熱伝導、8 群の輻射拡散（radiation diffusion）。4 ns。</td>
+            <td>DT の中性子の収量（neutron yield）3.9×10<sup>10</sup>、<a href="#terms-implosion">バン時刻</a> 2.74 ns、停滞の時刻 2.92 ns、収束比 4.2。メッシュの差は収量 1.5 %・バン時刻 0.2 %。細かいメッシュでは外側の境界のセルの既知の欠陥が出る（境界から入るエネルギーが約 5 倍）。</td>
           </tr>
           <tr>
             <th><code>table_radiation_foil</code><br>物性表と多群輻射</th>
-            <td>平面、CD の表 (状態方程式と 80 群の不透明度) で厚さ 25 µm の箔に 351 nm・1×10<sup>14</sup> W/cm²。コロナの X 線を多群 FLD で解く。1.5 ns。</td>
-            <td>吸収率 87 %。衝撃波は 0.64 ns に後面の壁に届き、それまでのアブレーション圧の平均は 16 Mbar。メッシュの差は吸収エネルギー 2.8 %。計算中に値の切り詰め (クランプ) が 940 万回起きており、何の量かは未特定。</td>
+            <td>平面、CD の物性表（<a href="#terms-tmat">tmat</a>。状態方程式と 80 群の不透明度）で厚さ 25 µm の箔に 351 nm・1×10<sup>14</sup> W/cm²。コロナの X 線を多群 FLD で解く。1.5 ns。</td>
+            <td>吸収率 87 %。衝撃波は 0.64 ns に後面の壁に届き、それまでのアブレーション圧の平均は 16 Mbar。メッシュの差は吸収エネルギー 2.8 %。計算中に値のクランプが 940 万回起きており、何の量かは未特定。</td>
           </tr>
           <tr>
             <th><code>cold_equilibrium_layers</code><br>低温平衡の 2 層の標的</th>
-            <td>平面、CD のアブレータ 25 µm と液体 D2 50 µm を表の状態方程式で置き、低温平衡の構成則で初期状態を力学平衡に保つ。レーザー照射。1.5 ns。</td>
+            <td>平面、CD のアブレータ 25 µm と液体 D2 50 µm を物性表（tmat）の状態方程式で置き、<a href="#terms-cold-equilibrium">低温平衡の構成則</a>で初期状態を力学平衡に保つ。レーザー照射。1.5 ns。</td>
             <td>吸収率 88 %、アブレーション圧の平均 16 Mbar、衝撃波が後面の壁に届くのは 1.36 ns。比べた量のメッシュの差はすべて 2.4 % 以内。</td>
           </tr>
         </tbody>
@@ -118,23 +168,23 @@
     <section aria-labelledby="reading-results">
       <h2 id="reading-results">結果の読み方</h2>
       <p>圧力で駆動する衝撃波は、計算の基本的な確かめ方の手本になる: 衝撃波の位置の時間変化から速さを測り、衝撃波の後ろの密度・流速とともに Rankine–Hugoniot の厳密な値と比べる。輻射熱波では、壁の温度だけでなく温度分布の全体を見る。先端の位置は、密度・不透明度・比熱のどれを変えても同じ値には保たれない。</p>
-      <p>レーザー照射のプリセットでは、入射したレーザーエネルギーと沈着したレーザーエネルギーの比から吸収率を読み、アブレーション圧は衝撃波が後面の壁に届くまでの平均で評価する。平面の箔の後面は固定の壁なので、壁に届いた後の圧縮は反射した衝撃波によるもので、爆縮の停滞ではない。球の爆縮では、最大密度と停滞の時刻を <code>implosion/rho_peak</code> などのステップごとの履歴から読む。爆縮の最大密度は短時間しか続かないため、間引かれたスナップショットの最大値ではなく履歴を使うこと。冷たい固体表面だけを置いて合成コロナもコロナ層も外すと、光線は吸収される経路をもたず臨界面の近くで反射し、駆動が成立しない。</p>
-      <p>結果がメッシュに依存しないかは、同じ条件を 2 倍細かいメッシュで計算して確かめる (Studio のメッシュの節の「収束確認用の組」)。上の表のメッシュの差はその比較の結果である。差が目安を超えるものと、細かいメッシュでだけ現れる欠陥は、表と Studio のカードに書いてある。</p>
+      <p>レーザー照射のプリセットでは、入射したレーザーエネルギーと沈着したレーザーエネルギーの比から吸収率を読む（履歴の <code>energy/laser_deposited</code> と <code>energy/laser_incident</code> は、どちらも run の累積値である）。アブレーション圧は、衝撃波が後面の壁に届くまでの平均で評価する。平面の箔の後面は固定の壁なので、壁に届いた後の圧縮は反射した衝撃波によるもので、爆縮の停滞ではない。球の爆縮では、最大密度と停滞の時刻を <code>implosion/rho_peak</code> などのステップごとの履歴から読む。爆縮の最大密度は短時間しか続かないため、間引かれたスナップショットの最大値ではなく履歴を使うこと。冷たい固体表面だけを置き、<a href="#terms-corona">ゴーストコロナ</a>もコロナ層も使わないと、レーザー（光線追跡では光線、径方向吸収では半径方向の流束）は吸収される経路をほとんどもたないまま臨界面で反射し、駆動が成立しない。Studio のレーザー照射のプリセットは、ゴーストコロナを使う。</p>
+      <p>結果がメッシュに依存しないかは、同じ条件を 2 倍細かいメッシュで計算して確かめる（Studio のジオメトリータブの「収束確認用の組」）。上の表のメッシュの差はその比較の結果である。差が目安を超えるものと、細かいメッシュでだけ現れる欠陥は、表と Studio のカードに書いてある。</p>
       <aside class="planned" aria-labelledby="absorption-numbers">
         <h3 id="absorption-numbers">吸収率の数字と、その異なる条件</h3>
         <p>本ドキュメントには条件の異なるレーザー吸収率がいくつも登場するが、照射幾何と不透明度モデルが異なるため、<em>互いに比較できない</em>。</p>
         <ul>
-          <li><strong>約 93%</strong> — <a href="../verification/index.html#gxii">GXII 基準回帰デッキ</a>（2026-09-25 の基準解）：f/3 の 12 ビームが 200 µm の super-Gaussian スポットで半径 250 µm のターゲットを覆う広い照射。固定不透明度・理想気体のベンチマーク物理。</li>
-          <li><strong>89% と 67%</strong> — Studio の平面の箔のプリセット (351 nm・1×10<sup>14</sup> W/cm² の平面照射) と球殻の爆縮のプリセット (527 nm のガウス波形、外半径 250 µm の CD 殻)。どちらも 2026-10-01 の計算で、波長・強度・ターゲットが回帰デッキとは異なる。</li>
-          <li><strong>約 45%</strong> — HELIOS とのコード間ベンチマーク（照射条件をそろえた LTE 比較。2026 年 7 月の測定）：意図的に狭い約 113 µm のガウススポットをほぼ平行ビーム（f/191）で与え、LTE テーブル不透明度を使用（<a href="../verification/index.html">検証とベンチマーク</a>参照）。</li>
+          <li><strong>約 96%</strong> — <a href="../verification/index.html#gxii">GXII 基準回帰デッキ</a>（2026-09-29 の基準解）：基準解の吸収エネルギー 9.53 kJ を、デッキのパルスの入射エネルギー 9.9 kJ（1×10<sup>13</sup> W の台形パルス。立ち上がりと立ち下がりが各 10 ps で、全幅 1 ns）で割った値。f/3 の 12 ビームを、強度が e<sup>−2</sup> になる半径 200 µm の 4 次の super-Gaussian スポットで、半径 250 µm のターゲットに当てる広い照射。固定不透明度・理想気体のベンチマーク物理。</li>
+          <li><strong>89% と 67%</strong> — Studio の平面の箔のプリセット（351 nm・1×10<sup>14</sup> W/cm² の平面照射）と球殻の爆縮のプリセット（527 nm のガウス波形、外半径 250 µm の CD 殻）。どちらも 2026-10-01 の計算で、波長・強度・ターゲットが回帰デッキとは異なる。</li>
+          <li><strong>約 45%</strong> — HELIOS（Prism Computational Sciences の商用 1D ラグランジュ輻射流体コード）とのコード間ベンチマーク（照射条件をそろえた LTE（local thermodynamic equilibrium、局所熱力学平衡）比較。2026 年 7 月の測定）：意図的に狭い約 113 µm のガウススポットをほぼ平行ビーム（f/191）で与え、LTE テーブル不透明度を使用（<a href="../verification/index.html">検証とベンチマーク</a>参照）。</li>
         </ul>
         <p>吸収率は波長、強度、スポット径、ビーム開口、不透明度モデルに強く依存するため、これらの数字が一致することは期待されず、一致しないことに意味もない。</p>
       </aside>
     </section>
     <section aria-labelledby="verification-library">
       <h2 id="verification-library">検証用のデッキ集</h2>
-      <p><code>examples/verification/</code> は、解析解、保存則、演算子の単体、統合的な回帰といった検査を再現するためのデッキ集である。ここではすべてのケースを列挙しない。レーザー直接照射、2 温度、流体、熱伝導、多群 FLD を、ひとつの実用的な 1 次元の経路で確認する標準的な参照が <code>gxii_1d_fld_regression.py</code> である。このデッキは基準解との回帰試験の入力であると同時に、初期のコロナ層がなぜ必要かという実装上の教訓をコメントに記録している。新しいレーザーのデッキを作るときは、設定の名前だけを写すのではなく、そのコメントと、パルス、材料の境界、出力の履歴を合わせて参照のこと。</p>
-      <p>プリセットは学習と新しいデッキ作成の出発点、検証用のデッキは契約の再現と変化の検出が主な目的である。前者の代表値が妥当に見えることと、後者の検査が通ることは互いに補い合う関係であり、どちらか一方で他方を代用できるものではない。</p>
+      <p><code>examples/verification/</code> は、解析解、保存則、演算子の単体（single-operator）、統合的な回帰（integrated regression）といった検査を再現するためのデッキ集である。ここではすべてのケースを列挙しない。レーザー直接照射、2 温度、流体、熱伝導、多群 FLD を、ひとつの実用的な 1 次元の経路で確認する標準的な参照が <code>gxii_1d_fld_regression.py</code> である。このデッキは基準解との回帰試験の入力であると同時に、初期のコロナ層がなぜ必要かという実装上の教訓をコメントに記録している。新しいレーザーのデッキを作るときは、設定の名前だけを写すのではなく、そのコメントと、パルス、材料の境界、出力の履歴を合わせて参照のこと。</p>
+      <p>プリセットは、学習と新しいデッキを作る出発点である。検証用のデッキの目的は、解析解や保存則が要求する結果の再現と、変更による結果の変化の検出である。前者の代表値が妥当に見えることと、後者の検査が通ることは互いに補い合う関係であり、どちらか一方で他方を代用できるものではない。</p>
     </section>
     <div id="page-footer"></div>
   </main>

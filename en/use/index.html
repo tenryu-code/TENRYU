@@ -13,7 +13,7 @@
   <main>
     <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
     <h1>Using TENRYU</h1>
-    <p class="abstract">This section covers the whole practical workflow: checking the system requirements, building, completing a first run, writing Python namelist decks (or generating them with TENRYU Studio), and reading the HDF5 outputs. If you follow the quick start and the path below, this section alone takes you to a completed first run.</p>
+    <p class="abstract">This section covers the whole practical workflow: checking the system requirements, building, completing a first run, writing <a href="namelist.html#terms-deck">decks</a> (a deck is the single Python file that is the input to TENRYU) or generating them with <a href="gui.html">TENRYU Studio</a>, a GUI application, and reading the HDF5 outputs. If you follow the quick start and the path below, this section alone takes you to a completed first run.</p>
 
     <section aria-labelledby="quickstart">
       <h2 id="quickstart">Quick start (copy and run)</h2>
@@ -42,12 +42,12 @@ python3 -m tools.tenryu_plot profile outputs/template_1d_slab_radiation</code></
     <h2>Workflow guides</h2>
     <div class="card-grid">
       <a class="card" href="requirements.html"><h3>System requirements</h3><p>GPU, compiler, and library requirements, plus pre-flight check commands.</p></a>
-      <a class="card" href="building.html"><h3>Building</h3><p>Configure a CUDA Release build, run tests, and enable MPI or ccache.</p></a>
+      <a class="card" href="building.html"><h3>Building</h3><p>Configure a CUDA Release build, run tests, and enable MPI (Message Passing Interface) or ccache.</p></a>
       <a class="card" href="running.html"><h3>Running simulations</h3><p>Complete a template, write decks, use validate/run/verify/freeze, and troubleshoot.</p></a>
       <a class="card" href="namelist.html"><h3>Namelist reference</h3><p>Navigate top-level blocks, representative keys, units, and authoritative defaults.</p></a>
       <a class="card" href="gui.html"><h3>TENRYU Studio (GUI)</h3><p>Create, validate, save, and run decks from the form-based desktop application.</p></a>
       <a class="card" href="examples.html"><h3>Examples &amp; presets</h3><p>Runnable templates, verified Studio presets, and the verification deck library.</p></a>
-      <a class="card" href="outputs.html"><h3>Outputs &amp; analysis</h3><p>The three HDF5 file kinds, their groups and main datasets, the provenance files, and how to read them.</p></a>
+      <a class="card" href="outputs.html"><h3>Outputs &amp; analysis</h3><p>The three HDF5 file kinds, their groups and main datasets, the provenance files (the settings the run received, a run summary, and the logs), and how to read them.</p></a>
     </div>
 
     <aside class="planned" aria-labelledby="first-run">
@@ -56,10 +56,10 @@ python3 -m tools.tenryu_plot profile outputs/template_1d_slab_radiation</code></
         <li><a href="requirements.html">System requirements</a> — confirm the GPU and toolchain prerequisites.</li>
         <li><a href="building.html">Building</a> — get a binary and a passing <code>ctest</code>.</li>
         <li><a href="running.html">Running simulations</a> — complete a template through validate → run, exactly as written there.</li>
-        <li><a href="examples.html">Examples &amp; presets</a> — run a verified preset, starting with the shell implosion <code>laser_shell_implosion</code>, exactly as distributed.</li>
-        <li><a href="outputs.html">Outputs &amp; analysis</a> — read the result: absorption from the energy ledgers (incident versus deposited) and the implosion peak from the per-step history <code>implosion/rho_peak</code>.</li>
+        <li><a href="examples.html">Examples &amp; presets</a> — run a verified preset, starting with the direct-drive shell implosion, with the preset's conditions unchanged. <code>laser_shell_implosion</code> is not a deck under <code>examples/</code>: it is the name (<code>Main.name</code>) of the deck that the <a href="gui.html">TENRYU Studio</a> preset “Direct-drive shell implosion (GXII class)” writes. <a href="gui.html#obtain-launch">Obtain and launch</a> Studio, apply this preset, save the deck, and pass the saved deck to <code>./build/tenryu run</code>.</li>
+        <li><a href="outputs.html">Outputs &amp; analysis</a> — read the result. The absorption is <code>laser_deposited</code> divided by <code>laser_incident</code> in the <code>energy/</code> group of the history, which holds the <a href="../overview/numerics-foundations.html#energy-ledger">energy ledger</a>: the record that matches the change of the system's energy against the energy that enters and leaves it, such as the incident laser energy and the outflow through the boundary. The implosion peak comes from the per-step history <code>implosion/rho_peak</code>.</li>
       </ol>
-      <p>When you need the physics behind a result, go to the matching <a href="../physics/index.html">physics kernel</a> page; each page's mechanism section explains the background before the equations. <a href="../overview/timestep.html">Time-step control &amp; CFL</a> explains how the time step is chosen.</p>
+      <p>When you need the physics behind a result, go to the matching page of the <a href="../physics/index.html">physics kernels</a>, which document one physics operator each; each page's mechanism section explains the background before the equations. <a href="../overview/timestep.html">Time-step control &amp; CFL</a> explains how the time step is chosen, including the Courant–Friedrichs–Lewy (CFL) condition.</p>
     </aside>
 
     <div id="page-footer"></div>

@@ -13,40 +13,40 @@
   <main>
     <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
     <h1>物理カーネル</h1>
-    <p class="abstract">各カーネルのページでは、物理モデル、実装されている離散化、namelist の制御項目、適用される検証ゲートを説明する。ここでの「カーネル」とは文書化された演算子ページのことで、9 つの物理演算子と、それを支えるメッシュ生成・MPI 分割の基盤を指す。1 ステップ内の既定の実行順序は、レーザー（核燃焼はその直後）→ 流体半ステップ → 電子熱伝導 → 輻射 → 流体半ステップであり、ALE のリゾーン/リマップは後半の流体半ステップの後に条件付きで入る。以下の一覧は、物理カーネルを学びやすい順に並べている。</p>
+    <p class="abstract">この節では、文書化された物理演算子（operator）の頁を物理カーネル（physics kernel）と呼ぶ。物理演算子とは、流体、電子熱伝導、輻射のように、1 ステップのなかで 1 つの物理過程を受け持つ処理で、9 つある。これを支える基盤として、メッシュ生成と、MPI（Message Passing Interface）による領域分割（domain decomposition）の頁も物理カーネルに含める。GPU 上で動く関数は、物理カーネルと区別して CUDA カーネルと書く。各物理カーネルの頁では、物理モデル、実装している離散化（discretization）、namelist の制御項目、適用する検証を説明する。幾何は 1D と 2D RZ の 2 つである。1D は球・円筒・平面のいずれか（<code>Mesh.geometry_1d</code> で選ぶ）で、2D RZ は軸（R=0）のまわりに軸対称な、円筒座標 \((R,Z)\) の 2 次元である。1 ステップのなかで、流体だけは時間刻みを半分ずつの 2 回（半ステップ、half step）に分け、その間に電子熱伝導と輻射を挟む。既定の実行順序は、レーザー、その直後の核燃焼（nuclear burn）、流体の半ステップ、電子熱伝導、輻射、流体の半ステップである。演算子をこのように並べて 1 ステップを進める方法を演算子分割（operator splitting）と呼ぶ（<a href="../overview/numerics-foundations.html#operator-splitting">演算子分割と再クロージャの規律</a>）。既定では、ALE（arbitrary Lagrangian–Eulerian、任意ラグランジュ・オイラー法）のリゾーニングとリマップは後半の流体の半ステップの後に入り、<a href="mesh/ale-remap.html#cycle-triggers">発動条件</a>（trigger condition）を満たしたときだけ実行する。以下の一覧は、物理カーネルを学びやすい順に並べている。</p>
     <div class="card-grid physics-grid">
-      <a class="card" href="hydrodynamics.html"><h3>ラグランジュ流体</h3><p>エネルギー整合なスタッガード流体、時間積分、衝撃波の捕捉。</p></a>
-      <a class="card" href="mesh/index.html"><h3>メッシュと幾何</h3><p>1D 格子と領域、2D RZ メッシュ族、ALE リゾーニングとリマップ。</p></a>
-      <a class="card" href="radiation/index.html"><h3>輻射輸送</h3><p>Fleck 線形化で陰的に物質と結合する多群 FLD と、Picard 反復で物質を閉じる離散座標法 S<sub>N</sub>。</p></a>
-      <a class="card" href="conduction.html"><h3>電子・イオン熱伝導</h3><p>局所 Spitzer–Härm と非局所 SNB 熱輸送。</p></a>
-      <a class="card" href="laser.html"><h3>レーザー駆動と吸収</h3><p>屈折光線追跡と逆制動輻射によるエネルギー付与。</p></a>
-      <a class="card" href="cbet.html"><h3>CBET (交差ビームエネルギー転送)</h3><p>離調と波作用の収支を含む、ビーム対ごとの連成。</p></a>
-      <a class="card" href="hot-electrons.html"><h3>ホット電子</h3><p>レーザー生成源モデル、角度輸送、エネルギー付与。</p></a>
-      <a class="card" href="eos-opacity.html"><h3>EOS・不透明度・電離</h3><p>解析的または表形式の物性閉包と電離モデル。</p></a>
-      <a class="card" href="burn.html"><h3>核燃焼</h3><p>核融合反応、荷電粒子への配分、中性子加熱。</p></a>
-      <a class="card" href="viscosity.html"><h3>プラズマ粘性</h3><p>安定性制御を備えた Braginskii 運動量拡散。</p></a>
-      <a class="card" href="mpi.html"><h3>MPI 分割</h3><p>所有ウィンドウ、ゴースト交換、決定論的な縮約。</p></a>
+      <a class="card" href="hydrodynamics.html"><h3>ラグランジュ流体</h3><p>エネルギー整合な（compatible）スタッガード流体、時間積分、衝撃波の捕捉（shock capturing）。</p></a>
+      <a class="card" href="mesh/index.html"><h3>メッシュと幾何</h3><p>1D 格子と領域、2D RZ メッシュ族（mesh family）、ALE リゾーニングとリマップ。</p></a>
+      <a class="card" href="radiation/index.html"><h3>輻射輸送</h3><p>Fleck 線形化（Fleck linearization）で物質と陰的（implicit）に結合する多群（multigroup）の流束制限拡散（flux-limited diffusion、FLD）と、ピカール反復（Picard iteration）などの反復で物質との連成を解く離散座標法（discrete ordinates method）S<sub>N</sub>。</p></a>
+      <a class="card" href="conduction.html"><h3>電子・イオン熱伝導</h3><p>局所（local）の Spitzer–Härm と、非局所（nonlocal）の SNB（Schurtz–Nicolaï–Busquet）熱輸送。</p></a>
+      <a class="card" href="laser.html"><h3>レーザー駆動と吸収</h3><p>屈折光線追跡（refractive ray tracing）と、逆制動輻射（inverse bremsstrahlung）によるエネルギー付与（energy deposition）。</p></a>
+      <a class="card" href="cbet.html"><h3>CBET (交差ビームエネルギー転送)</h3><p>ビームどうしの波長差を与える波長離調（wavelength detuning）と、光子数に当たる波作用（wave action）の収支を含む、ビーム対（beam pair）ごとの連成。</p></a>
+      <a class="card" href="hot-electrons.html"><h3>ホット電子</h3><p>レーザーが生成するホット電子（hot electron）の源モデル、角度輸送（angular transport）、エネルギー付与。</p></a>
+      <a class="card" href="eos-opacity.html"><h3>EOS・不透明度・電離</h3><p>材料クロージャ（material closure。保存量から圧力、温度、電離度、不透明度などを求める関係）として、状態方程式（equation of state、EOS）と不透明度（opacity）を解析的または表形式（tabulated）で与え、電離（ionization）モデルを選ぶ。</p></a>
+      <a class="card" href="burn.html"><h3>核燃焼</h3><p>核融合反応、荷電粒子への配分、中性子加熱（neutron heating）。</p></a>
+      <a class="card" href="viscosity.html"><h3>プラズマ粘性</h3><p>安定性制御を備えた Braginskii の運動量拡散（momentum diffusion）。</p></a>
+      <a class="card" href="mpi.html"><h3>MPI 分割</h3><p>各ランク（rank。MPI の 1 プロセス）が更新を受け持つ範囲である所有ウィンドウ（owned window）、隣のランクの値の複製を受け取るゴースト交換（ghost exchange）、全ランクの部分値を 1 つにまとめる縮約（reduction）の再現性。</p></a>
     </div>
 
     <section aria-labelledby="availability">
       <h2 id="availability">次元と有効化の早見表</h2>
-      <p>どのカーネルがどの次元で動き、既定で有効か、何で有効化するかの一覧である。各行の詳細と例外は各カーネルページが正典で、既定値の完全な一覧はリポジトリの仕様書 <code>docs/SPECIFICATION.md</code> §9.1 である。</p>
+      <p>どの物理カーネルがどの次元で動き、既定で有効か、何で有効化するかの一覧である。各行の詳細と例外は各物理カーネルの頁が正典で、既定値の完全な一覧はリポジトリの仕様書 <code>docs/SPECIFICATION.md</code> §9.1 である。</p>
       <table class="quick-facts">
-        <thead><tr><th>カーネル</th><th>1D</th><th>2D RZ</th><th>既定 / 有効化</th></tr></thead>
+        <thead><tr><th>物理カーネル</th><th>1D</th><th>2D RZ</th><th>既定 / 有効化</th></tr></thead>
         <tbody>
           <tr><th><a href="hydrodynamics.html">ラグランジュ流体</a></th><td>球・円筒・平面</td><td>対応</td><td><code>Numerics.hydro.enabled=True</code> が既定（中核）。</td></tr>
-          <tr><th><a href="mesh/ale-remap.html">ALE リゾーン・リマップ</a></th><td>純ラグランジュ（実験的な解適応の経路 <code>Numerics.ale1d</code> は 2026-10-02 に退役）</td><td>対応</td><td>2D で <code>Numerics.ale.enabled=True</code> の明示指定。</td></tr>
+          <tr><th><a href="mesh/ale-remap.html">ALE リゾーニングとリマップ</a></th><td>純ラグランジュ（pure Lagrangian）。実験的な解適応（solution-adaptive）の経路 <code>Numerics.ale1d</code> は 2026-10-02 に退役（retired）した。指定しても効果はなく、<code>enabled=True</code> は設定エラーになる。</td><td>対応</td><td>2D で <code>Numerics.ale.enabled=True</code> の明示指定。</td></tr>
           <tr><th><a href="radiation/fld.html">多群 FLD</a></th><td>球・円筒・平面</td><td>対応</td><td><code>Radiation.enabled=True</code>・<code>mode="multigroup_diffusion"</code> が既定。</td></tr>
-          <tr><th><a href="radiation/sn.html">S<sub>N</sub> 輸送</a></th><td>球・平面（円筒は直積型の求積）</td><td>対応</td><td><code>Radiation.mode="sn_transport"</code> で選択。</td></tr>
-          <tr><th><a href="conduction.html">電子熱伝導（Spitzer–Härm）</a></th><td>球・円筒・平面</td><td>対応（Kershaw 9 点）</td><td><code>Numerics.conduction.enabled=True</code> が既定。イオン伝導は明示指定（1D・2 温度のみ）。</td></tr>
+          <tr><th><a href="radiation/sn.html">S<sub>N</sub> 輸送</a></th><td>球・平面（円筒は<a href="radiation/sn.html#angular-discretization">直積型の求積</a>（product quadrature））</td><td>対応（直積型の求積）</td><td><code>Radiation.mode="sn_transport"</code> で選択。</td></tr>
+          <tr><th><a href="conduction.html">電子熱伝導（Spitzer–Härm）</a></th><td>球・円筒・平面</td><td>対応。節点局所の演算子（node-local operator。各セルの辺を中点で 2 つの半辺に分け、節点ごとに、その節点側の半辺の値を消去して得る、セル中心の値どうしを結ぶ対称な演算子）で解く</td><td><code>Numerics.conduction.enabled=True</code> が既定。イオン伝導は <code>Numerics.conduction.ion_conduction=True</code> の明示指定（2 温度のみ。1D と 2D RZ）。</td></tr>
           <tr><th><a href="conduction.html#snb">SNB 非局所補正</a></th><td>球・円筒・平面</td><td>対応</td><td><code>nonlocal_model="snb"</code> の明示指定。</td></tr>
-          <tr><th><a href="laser.html">レーザー駆動</a></th><td>弦追跡 <code>raytrace_2d</code>（円筒・平面は特性曲線積分のみ）または <code>radial_absorption_1d</code></td><td><code>raytrace_3d</code></td><td>デッキで <code>Laser.enabled=True</code> とビーム列を構成。</td></tr>
-          <tr><th><a href="cbet.html">CBET</a></th><td>球対称の <code>port_section</code>（単一ランク）</td><td><code>geometry_mode="legacy"</code> のペア交換（<code>raytrace_3d</code> 前提）</td><td><code>Laser.cbet.enable=True</code> の明示指定。</td></tr>
-          <tr><th><a href="hot-electrons.html">ホット電子</a></th><td>対応（円筒測度では <code>"cone"</code> 不可）</td><td>対応（<code>raytrace_3d</code>+<code>"cone"</code> が前提）</td><td><code>Laser.hot_electron.enable=True</code> の明示指定。</td></tr>
-          <tr><th><a href="eos-opacity.html">EOS・不透明度・電離</a></th><td>全測度</td><td>対応</td><td>常時有効（材料クロージャ）。</td></tr>
-          <tr><th><a href="burn.html">核燃焼</a></th><td>球対称（<code>fraley</code>・<code>diffusion</code>・<code>mc</code>）</td><td><code>local</code>・<code>diffusion</code> のみ</td><td><code>Burn.enabled=True</code> の明示指定。</td></tr>
+          <tr><th><a href="laser.html">レーザー駆動</a></th><td><a href="laser.html#chord-raytrace">弦追跡</a>（chord tracing。ビーム軸を含む 1 つの平面の中で、屈折して曲がる光線の経路（弦）を追跡する）<code>raytrace_2d</code>（円筒・平面は<a href="laser.html#characteristic">特性曲線積分</a>（integration along characteristics）のみ）、または<a href="laser.html#other-modes">簡易な半径方向のモード</a> <code>radial_absorption_1d</code></td><td><code>raytrace_3d</code></td><td><a href="../use/namelist.html#terms-deck">デッキ</a>（deck）で <code>Laser.enabled=True</code> とビーム列を構成。</td></tr>
+          <tr><th><a href="cbet.html">CBET</a>（cross-beam energy transfer）</th><td>球対称（<code>raytrace_2d</code> 前提）。<code>geometry_mode</code> は、<code>"legacy"</code>（既定。2 本の光線のあいだの方位角を平均する<a href="cbet.html#spherical-reduction">従来の縮約</a>（legacy reduction））か、<code>"port_section"</code>（実際の<a href="cbet.html#terms">ポート</a>（port。照射装置でビームが標的へ入射する口）の配置を使う）である</td><td><code>raytrace_3d</code> 前提のビーム対ごとの交換。<code>geometry_mode</code> は既定の <code>"legacy"</code> だけで、<code>"port_section"</code> は使えない</td><td><code>Laser.cbet.enable=True</code> の明示指定。1D・2D とも単一ランクだけ。</td></tr>
+          <tr><th><a href="hot-electrons.html">ホット電子</a></th><td>対応。角度分布 <code>angular_model</code> の既定 <code>"cone"</code>（<a href="hot-electrons.html#spectrum-angle">円錐角度モデル</a>）は、円筒の幾何では使えない</td><td>対応（<code>raytrace_3d</code> と <code>"cone"</code> が前提）</td><td><code>Laser.hot_electron.enable=True</code> の明示指定。</td></tr>
+          <tr><th><a href="eos-opacity.html">EOS・不透明度・電離</a></th><td>球・円筒・平面のすべて</td><td>対応</td><td>常時有効（材料クロージャ）。</td></tr>
+          <tr><th><a href="burn.html">核燃焼</a></th><td>球対称。荷電生成物の扱い（<code>scheme</code>）を <code>fraley</code>（α 粒子の飛程の近似式）、<code>diffusion</code>（多群拡散）、<code>mc</code>（モンテカルロ）から選ぶ</td><td><code>local</code>（発生したセルへ全量を沈着）と <code>diffusion</code> のみ</td><td><code>Burn.enabled=True</code> の明示指定。</td></tr>
           <tr><th><a href="viscosity.html">プラズマ粘性</a></th><td>球・円筒・平面</td><td>対応</td><td><code>Numerics.hydro.<wbr>plasma_viscosity.<wbr>enabled=True</code> の明示指定。</td></tr>
-          <tr><th><a href="mpi.html">MPI 分割</a></th><td>r スラブ</td><td>r スラブ（複数ランクは <code>time_integration="pc_v0"</code> 必須）</td><td><code>Parallel</code> ブロックで構成。</td></tr>
+          <tr><th><a href="mpi.html">MPI 分割</a></th><td>r スラブ（r-slab。半径方向 r の帯に領域を分ける分割）</td><td>r スラブ。複数ランクは <code>time_integration="pc_v0"</code> が必須で、電子熱伝導（既定で有効）と多群 FLD（輻射の既定のモード）は 2D の複数ランクでは拒否される。したがって既定のままの 2D のデッキは複数ランクでは走らない。ほかに拒否される機能は<a href="mpi.html#v1-scope">MPI 分割</a>の頁にある。</td><td><code>Parallel</code> ブロックで構成。</td></tr>
         </tbody>
       </table>
     </section>

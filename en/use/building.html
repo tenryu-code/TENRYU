@@ -13,32 +13,33 @@
   <main>
     <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
     <h1>Building <span class="badge">reference</span></h1>
-    <p class="abstract">TENRYU configures its C++20 and CUDA C++ sources with CMake and Ninja. The supported build target is an NVIDIA GPU (by default, the local GPU detected at configure time; continuously exercised hardware is sm_80 or newer) with a CUDA 12.x toolkit. This page covers a Release build, three levels of testing, the MPI option, and ccache for faster rebuilds.</p>
+    <p class="abstract">TENRYU configures its C++20 and CUDA C++ sources with CMake and Ninja. The supported build target is an NVIDIA GPU (by default, the local GPU detected at configure time; continuously exercised hardware is sm_80 or newer) with a CUDA 12.x toolkit. This page covers a Release build, three levels of testing, the MPI (Message Passing Interface) option, and ccache for faster rebuilds.</p>
 
     <aside class="planned" aria-labelledby="at-a-glance">
       <h3 id="at-a-glance">At a glance</h3>
       <ul>
-        <li>Install a CUDA 12.x toolkit, CMake 3.27 or newer, and Ninja, and use an NVIDIA GPU (exercised hardware is sm_80+).</li>
+        <li>Install a CUDA 12.x toolkit, CMake 3.27 or newer, Ninja, and the Boost headers, and use an NVIDIA GPU (exercised hardware is sm_80+).</li>
         <li>The standard workflow configures <code>build/</code> with <code>cmake</code>, then compiles it with <code>ninja -C build</code>.</li>
         <li>Use the complete CTest suite, a targeted <code>-R</code> selection, or a named <code>tenryu verify</code> case according to the scope of the check.</li>
-        <li>MPI is OFF by default. Configure with <code>-DTENRYU_ENABLE_MPI=ON</code> for a multi-rank executable.</li>
+        <li>MPI is OFF by default. Configure with <code>-DTENRYU_ENABLE_MPI=ON</code> for an executable that runs on several ranks (a rank is one MPI process).</li>
       </ul>
     </aside>
 
     <section aria-labelledby="prerequisites">
       <h2 id="prerequisites">Prerequisites</h2>
       <p>Build on a system where the NVIDIA driver and CUDA compiler are available and CMake can discover the selected dependencies. HDF5 and Python support are enabled by default in the top-level CMake configuration; MPI is disabled by default. An optional feature also requires its development package to be visible during configuration; after enabling or disabling one, configure again, then build. The complete requirement picture — supported GPU generations, compilers, minimum library versions, CMake option defaults, and pre-flight check commands — is on <a href="requirements.html">System requirements</a>; the table below restates the essentials.</p>
-      <p><strong>About networking.</strong> The small test, logging, CLI, and Python-binding dependencies (Catch2, spdlog, CLI11, pybind11) are fetched automatically by CMake's FetchContent at configure time when missing. On offline machines, preinstall them or run the first configure where the network is available. CUDA, HDF5, Python, MPI, and Hypre are never auto-fetched.</p>
+      <p><strong>About networking.</strong> The small test, logging, CLI, and Python-binding dependencies (Catch2, spdlog, CLI11, pybind11) are fetched automatically by CMake's FetchContent at configure time when missing. On offline machines, preinstall them or run the first configure where the network is available. CUDA, the Boost headers, HDF5, Python, MPI, and Hypre are never auto-fetched.</p>
       <table class="quick-facts">
         <thead><tr><th>Component</th><th>Requirement</th><th>Role</th></tr></thead>
         <tbody>
-          <tr><th>GPU</th><td>NVIDIA. By default the build targets the local GPUs detected at configure time (the sm_70;80;89;90 fatbin when no GPU is visible); exercised hardware is sm_80 or newer.</td><td>Runs CUDA kernels and verification cases.</td></tr>
+          <tr><th>GPU</th><td>NVIDIA. By default the build targets the local GPUs detected at configure time (when no GPU is visible, it builds one fatbin that carries the machine code for sm_70, 80, 89, and 90); exercised hardware is sm_80 or newer.</td><td>Runs CUDA kernels and verification cases.</td></tr>
           <tr><th>CUDA Toolkit</th><td>12.x (12.0 or newer)</td><td>Provides <code>nvcc</code>, CUDA headers, and runtime libraries.</td></tr>
           <tr><th>CMake</th><td>3.27 or newer</td><td>Configures C++20/CUDA targets, dependencies, and CTest.</td></tr>
           <tr><th>Ninja</th><td>Available on <code>PATH</code></td><td>Executes the generated build graph in parallel.</td></tr>
-          <tr><th>HDF5</th><td>1.12 or newer (enabled by default)</td><td>Provides snapshot, history, and checkpoint I/O. Rank 0 writes every file, so a serial HDF5 build suffices; a parallel HDF5 build also works but then needs MPI at link time.</td></tr>
-          <tr><th>Python + pybind11</th><td>Python 3.10+, pybind11 2.11+ (enabled by default)</td><td>Supplies the embedded interpreter that reads the namelist during initialization only.</td></tr>
-          <tr><th>Optional features</th><td>MPI 3.1+ (<code>-DTENRYU_ENABLE_MPI=ON</code>); Hypre — the LLNL linear-solver library whose BoomerAMG preconditioner backs the optional conduction <code>solver="hypre"</code> path</td><td>Each enabled CMake option needs its matching development package.</td></tr>
+          <tr><th>Boost headers</th><td>Headers only. No version is specified; verified with 1.83</td><td>CMake searches for <code>boost/multiprecision/cpp_int.hpp</code> at configure time and stops when it is missing. On Debian/Ubuntu it can be installed with the package <code>libboost-dev</code>. For a header outside the standard locations, see <a href="requirements.html#toolchain">System requirements</a>.</td></tr>
+          <tr><th>HDF5</th><td>1.12 or newer (enabled by default)</td><td>Provides <a href="outputs.html">snapshot, history, and checkpoint</a> I/O. Rank 0 writes every file, so a serial HDF5 build suffices; a parallel HDF5 build also works but then needs MPI at link time.</td></tr>
+          <tr><th>Python + pybind11</th><td>Python 3.10+, pybind11 2.11+ (enabled by default)</td><td>Supplies the embedded interpreter that reads the <a href="namelist.html#terms-deck">deck</a> (the single Python file that is the input to TENRYU) during initialization only.</td></tr>
+          <tr><th>Optional features</th><td>MPI 3.1+ (<code>-DTENRYU_ENABLE_MPI=ON</code>); Hypre (<code>-DTENRYU_ENABLE_HYPRE=ON</code>), the linear-solver library from LLNL (Lawrence Livermore National Laboratory); the current version has no computation path that uses Hypre, so it is normally not needed</td><td>Each enabled CMake option needs its matching development package.</td></tr>
         </tbody>
       </table>
     </section>
@@ -77,7 +78,7 @@ ctest --test-dir build -R &lt;pattern&gt;
         <tbody>
           <tr><th>Complete CTest</th><td>Before integration or after a broad change.</td><td>Runs every test registered in the build tree, with eight-way parallelism.</td></tr>
           <tr><th>Targeted CTest</th><td>Fast iteration during development.</td><td>Replace <code>&lt;pattern&gt;</code> with a test-name regular expression, such as a module or verification name.</td></tr>
-          <tr><th>Named verify</th><td>One analytic case, benchmark, or golden regression.</td><td>Replace <code>&lt;name&gt;</code> with a registered name such as <code>sedov</code> or <code>gxii_1d_fld_regression</code>.</td></tr>
+          <tr><th>Named verify</th><td>One analytic case, benchmark, or <a href="../verification/index.html#golden">golden regression</a>.</td><td>Replace <code>&lt;name&gt;</code> with a registered name such as <code>sedov</code> or <code>gxii_1d_fld_regression</code>.</td></tr>
         </tbody>
       </table>
       <p>Because <code>-R</code> performs regular-expression matching, it can select more tests than an exact name would. Inspect the CTest listing (<code>ctest --test-dir build -N -R &lt;pattern&gt;</code>) first when the boundary matters. Also distinguish skips from passes in the log: a test that did not run because a GPU or optional dependency was unavailable is not evidence that the tested behavior passed.</p>

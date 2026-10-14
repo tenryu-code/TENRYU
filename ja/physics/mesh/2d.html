@@ -13,78 +13,164 @@
   <main>
     <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
     <h1>2D RZ メッシュ: 構造格子とマルチブロック <span class="badge">reference</span></h1>
-    <p class="abstract">2D では、構造矩形、球面極座標、箱の中の極座標、そして CSR（compressed sparse row）接続によるマルチブロックの各系統を、同じ RZ 幾何の契約へ写像する。</p>
+    <p class="abstract">2D のメッシュは、論理格子と接続関係（mesh topology）の組合せでできる。論理格子は <code>Mesh.logical_mesh_2d</code> で選び、構造矩形（structured rectangular）、球面極座標（spherical polar）、<a href="#terms-polar-in-box">箱の中の極座標（polar-in-box）</a>、<a href="#terms-cone-shell">円錐殻（cone shell）</a>がある。接続関係は <code>Mesh.topology_scheme</code> で選び、単一ブロックか、CSR（compressed sparse row）で接続するマルチブロックである。いずれの系統（family）も、回転体としての RZ 体積、コーナーの幾何、節点・セル・面の接続関係を流体へ渡す。この計算に固有の用語は<a href="#terms">用語の節</a>で説明する。</p>
 
     <section aria-labelledby="mechanism">
       <h2 id="mechanism">物理機構</h2>
-      <p>矩形、極座標、箱の中の極座標、シェルと襟のマルチブロック、五角形帯のいずれの 2D 系統であっても、物理へ渡すものは同じでなければならない。すなわち、回転体としての RZ セル体積、正確なコーナーの幾何、そして節点・セル・面の一貫した接続関係である。物理カーネルは、どの生成器がメッシュを作ったかを知らない。この独立性が「RZ 幾何の契約はひとつ」という言い方の意味であり、問題ごとに系統を差し替えられる理由でもある。</p>
-      <p>各系統は、それぞれ異なる幾何の問題を解く。矩形 RZ は頑健な既定である。極座標は球状の収束に沿う。球状の収束流では質量流束が立体角に比例するため、等立体角の分割は各角度リングの担う質量流束を均等にする。箱の中の極座標は、球形の標的と矩形の外周を両立させる。シェルと襟からなるマルチブロックの組み立ては、実際の標的の構造に沿う。極座標の中心近傍では、五角形の帯が角度分割数の変化を接続関係の側へ吸収する。中心に近づくと角度方向のセル幅が縮み、軸近傍に細長いセルが生じる。この細長化は節点の平滑化では解消できず、角度の分割数そのものを途中で減らす必要がある。入れ子になった 2:1 の段列の上に置く 5 辺の遷移セルが、退化した <code>TWO_TO_ONE</code> の接合（粗いセルの辺の上に細かい側の節点が乗る形の 2:1 接合）を置き換え、この切替を正規の多角形セルとして扱う。</p>
-      <p>メッシュの品質は見栄えの指標ではなく、許容されるための条件である。最小高さとコーナーのヤコビアンは、体積・力・リマップの各演算子が必要とする不変量である。このため保護判定は、時間刻みを予測的に制限したり、候補となる状態を拒否したりすることがある。生成器も、向きや体積が正であるという契約を守れないメッシュは返さず、明示的に失敗する。</p>
+      <p>矩形、極座標、箱の中の極座標、円錐殻、<a href="#terms-pentagon-belt">五角形帯（pentagon belt）</a>のいずれの 2D 系統であっても、物理へ渡すものは同じでなければならない。すなわち、回転体としての RZ セル体積、正確な<a href="../hydrodynamics.html#terms-corner">コーナー</a>の幾何、そして節点・セル・面の一貫した接続関係である。生成器は、この 3 つを流体へ渡す。ただし、使える物理の組合せは系統ごとに異なり、入力の検査が未対応の組合せを拒否する。たとえば、<code>spherical_polar_halfplane</code>（半平面、half-plane）のメッシュで 2D のレーザーが動くのは、<code>multiblock_polar_tier_cart_center</code> の、中心が直交座標の箱（<code>polar_tier_center_kind="cart_box"</code>）で <code>polar_tier_native_pentagon</code> と <code>shell_polar_cap_dendrite</code> を使わない構成だけである。<code>polar_in_box</code> と <code>cone_shell</code> は、メッシュの生成、初期化、初期出力までで、時間発展の最初のステップが <code>ConfigError</code> で止まる。</p>
+      <p>各系統は、それぞれ異なる幾何の問題を解く。矩形 RZ は頑健な既定である。極座標は球状の収束に沿う。球状の収束流では質量流束が立体角（solid angle）に比例するため、等立体角の分割は、\(\theta\) 方向の各区間（球面上で軸のまわりに一周する帯）を通る質量流束を均等にする。箱の中の極座標は、球形の標的と矩形の外周を両立させる。円錐殻は、先端を切り落とした円錐形の壁をもつ標的の構造に沿う。極座標の中心近傍では、五角形帯が角度分割数の変化を接続関係の側へ吸収する。中心に近づくと角度方向のセル幅が縮み、軸近傍に細長いセルが生じる。この細長化は節点の平滑化（smoothing）では解消できず、角度の分割数そのものを途中で減らす必要がある。五角形帯は、角度方向のセル数を 2 倍に切り替える境界に、粗い側の 1 辺と細かい側の 2 辺に接する 5 頂点のセルを置く。四辺形だけで 2:1 に切り替えると、細かい側の中央の節点が粗いセルの辺の途中に乗る（ハンギングノード、hanging node）。五角形のセルはこの節点を自分の頂点のひとつにするので、接続関係は適合したままである。</p>
+      <p>メッシュの品質は見栄えの指標ではなく、許容されるための条件である。この<a href="index.html#terms-admissibility">許容性の判定（admissibility check）</a>は、<a href="index.html#terms-corner-jacobian">コーナーヤコビアン（corner Jacobian）</a>、<a href="index.html#terms-gauss-jacobian">ガウス点ヤコビアン（Gauss-point Jacobian）</a>、回転体としての RZ 体積、<a href="index.html#terms-axis-margin">軸マージン（axis margin）</a>を使う。これらは、セルが反転せず、体積・力・リマップの各演算子が意味をもつための条件を測る量である（ヤコビアンに基づく品質尺度の背景は文献 [1]）。流体の入力でこれらの判定を有効にすると、判定は時間刻みを予測的に制限したり、候補となる状態を拒否したりする。判定のスイッチ（<code>Numerics.hydro.mesh_quality_dt_cfl_enabled</code>、<code>in_hydro_corner_j_guard_enabled</code> など）は、いずれも既定では無効である。ALE（arbitrary Lagrangian–Eulerian、任意ラグランジュ・オイラー法）のリゾーン（rezone）の候補にも、同じ種類の受理の判定がある（<a href="ale-remap.html#admissibility">許容性と受理判定</a>）。生成器は、セルの向きや RZ 体積が正でないメッシュを返さず、明示的に失敗する。</p>
       <ul>
-        <li><strong>接続関係:</strong> 単一ブロックの構造格子セルは、暗黙の 4 コーナーの添字付けを使う。マルチブロックの系統は CSR 形式のセル→節点、逆向きの節点→セル、面の隣接関係を使い、各接合部では単一の所有側が書き込む節点 ID を共有する。</li>
-        <li><strong>コーナーの容量:</strong> 通常の四辺形の配置では <code>corner_stride=4</code>、五角形帯の方式では <code>corner_stride=8</code> を使い、<code>cell_nverts</code> が有効な枠の数を指定する。</li>
-        <li><strong>極座標の切り詰め:</strong> <code>polar_theta_min</code> が正のとき、切断する半直線が鏡映境界になり、反対側の辺は \(R=0\) の軸へ厳密に合わせられる。</li>
-        <li><strong>等 \(\mu\) 分割:</strong> <code>polar_equal_mu_zoning</code> は角度方向の節点を \(\mu=\cos\theta\) について等間隔に配置し、\(\theta\) 等間隔ではなく等立体角を与える。</li>
+        <li><strong>接続関係:</strong> 単一ブロックの構造格子（structured grid）のセルは、暗黙の 4 コーナーの添字付けを使う。マルチブロックの系統は、セル→節点、逆向きの節点→セル、面の隣接関係を CSR 形式で持ち、各接合部（seam）では、座標を書き込む所有ブロック（owner block）が 1 つだけ決まる節点 ID を共有する（<a href="#terms-seam-owner">接合部と所有ブロック</a>）。</li>
+        <li><strong>中心の扱い:</strong> 極座標メッシュの原点まわりの作り方（<a href="#terms-center">中心の扱い、polar center treatment</a>）は、環状（annular）、三角形扇（tri-fan）、ボタン（button）から選ぶ。キーは <code>polar_center_treatment</code> で、既定は環状である。</li>
+        <li><strong>コーナーの容量:</strong> <code>corner_stride</code> は、四辺形の配置と既定のマルチブロックでは 4、五角形帯（<code>pentagon_belt_shell</code>）と <code>polar_tier_native_pentagon=True</code> では 8、<code>Numerics.ale.mesh_mode="reale_v2"</code> では 16 である。<code>cell_nverts</code> が、そのセルで有効な枠の数（頂点の数）を指定する。</li>
+        <li><strong>極座標の切り詰め:</strong> <code>polar_theta_min</code> が正のとき、切断する半直線が鏡映境界（mirror boundary）になり、反対側の辺は \(R=0\) の軸へ厳密に合わせられる。</li>
+        <li><strong>等 \(\mu\) 分割:</strong> <code>polar_equal_mu_zoning</code> は角度方向の節点を \(\mu=\cos\theta\) について等間隔に配置し、\(\theta\) 等間隔ではなく等立体角を与える。働くのは、三角形扇の中心（<code>polar_center_treatment="tri_fan"</code>）と五角形帯（<code>pentagon_belt_shell</code>）のときである。環状とボタンの中心では、キーを受理しても \(\theta\) は等間隔のままである。<code>grid_theta</code> と <code>explicit_nodes_theta</code> とは併用できず、<code>multiblock_polar_tier</code> と <code>multiblock_polar_tier_cart_center</code> は拒否する。</li>
       </ul>
     </section>
 
     <section aria-labelledby="two-d-layout">
       <h2 id="two-d-layout">2D RZ の構造的な配置</h2>
-      <p>2D の既定である <code>logical_mesh_2d="rectangular_rz"</code> は、\(N_rN_z\) 個の四辺形セルと \((N_r+1)(N_z+1)\) 個の節点をもつ行優先の構造格子である。セル \((i,j)\) は 4 つの節点 \((i,j),(i+1,j),(i+1,j+1),(i,j+1)\) に囲まれ、熱力学量をセルに、位置と速度を節点に置く。断面上の四辺形は、単なる平面の面積ではなく、方位角方向へ回転させた RZ 体積として評価する。ラグランジュ運動や ALE のリゾーンで物理座標が動いても、単一ブロックにおける論理的な \((i,j)\) の接続は変わらない。</p>
+      <p>2D の既定である <code>logical_mesh_2d="rectangular_rz"</code> は、\(N_rN_z\) 個の四辺形セルと \((N_r+1)(N_z+1)\) 個の節点をもつ行優先（row-major）の構造格子である。セル \((i,j)\) は 4 つの節点 \((i,j),(i+1,j),(i+1,j+1),(i,j+1)\) に囲まれ、熱力学量をセルに、位置と速度を節点に置く。断面上の四辺形は、単なる平面の面積ではなく、方位角方向へ回転させた RZ 体積として評価する。ラグランジュ運動や ALE のリゾーンで物理座標が動いても、単一ブロックにおける論理的な \((i,j)\) の接続は変わらない。ただし、<code>Numerics.ale.mesh_mode="reale_v2"</code> のリゾーンは、接続関係そのものを作り直す（<a href="ale-remap.html#reale-v2">ALE: リゾーニングとリマップ</a>参照）。</p>
     </section>
 
     <section aria-labelledby="mesh-families">
       <h2 id="mesh-families">極座標とマルチブロックの系統</h2>
-      <p>構造化された極座標メッシュは \((s,\theta)\mapsto(R,Z)=(s\sin\theta,s\cos\theta)\) によって半平面へ写像する。\(\theta\) は一様、区間ごとの指定、または <code>polar_equal_mu_zoning</code> による等立体角の配置から選べる。<code>polar_theta_min&gt;0</code> は三角形扇のメッシュを \([\theta_{\min},\pi]\) に切り、切断する半直線を鏡映境界、その反対側を厳密な \(R=0\) の軸とする。半径座標の下限を正に取り内側に核領域を残すものが環状、内側のリング群を単一の中心セルに置き換えて原点まで能動にするものがボタンである。箱の中の極座標は、内側の極座標部分を滑らかに矩形の外周へ変形させ、箱に沿う襟状のリングで閉じる。物体に沿ったシェルと襟の組み立て（コーンのような、截断円錐殻の壁を持つ実標的を想定した系統）は、殻の壁、壁近傍の帯、充填ガスを、隙間のないブロックとして組み合わせる。中心側で角度分割数を変える五角形帯の接続は、一般的な <code>TWO_TO_ONE</code> の接合の代わりに 5 頂点の遷移セルを置き、細かい \(\theta\) の段列を 2:1 で間引く。構造格子が暗黙の 4 コーナーの添字付けを使うのに対し、マルチブロックはセル→節点、逆向きの節点→セル、面の隣接関係を CSR 形式で保持し、接合部の節点は単一の所有側がもつ共有 ID になる。各セルは <code>cell_nverts</code> として有効な頂点数をもち、通常は <code>corner_stride=4</code>、五角形帯における多角形の容量は <code>corner_stride=8</code> である。各生成器が段階ごとに対応する物理と制約は namelist リファレンスに従う。</p>
+      <p>構造化された極座標メッシュは \((s,\theta)\mapsto(R,Z)=(s\sin\theta,s\cos\theta)\) によって半平面（half-plane）へ写像する。\(s\) が同じ節点の列を、この頁ではリング（ring）と呼ぶ。\(\theta\) の節点列は、一様、区間ごとの指定（<code>grid_theta</code>）、または <code>polar_equal_mu_zoning</code> による等立体角の配置から選べる。<code>polar_theta_min&gt;0</code> は三角形扇のメッシュを \([\theta_{\min},\pi]\) に切り、切断する半直線を鏡映境界、その反対側を厳密な \(R=0\) の軸とする。原点まわりは<a href="#terms-center">中心の扱い</a>で選ぶ。半径座標の下限を正に取り内側に核領域を残すものが環状、原点にセルの頂点を置くものが三角形扇、内側のリング群を単一の中心セルに置き換えるものがボタンである。</p>
+      <p>箱の中の極座標は、内側の極座標部分（polar prefix）を滑らかに矩形の外周へ変形させ、箱に沿う襟リング（collar ring）で閉じる（<a href="#terms-polar-in-box">用語</a>）。円錐殻は、壁、壁に接する帯、壁から軸と箱までの領域を、隙間のないブロックとして組み合わせる（<a href="#terms-cone-shell">用語</a>）。中心側で角度分割数を変える五角形帯は、粗い側の 1 辺に細かい側の 2 辺が接する境界に 5 頂点のセルを置き、粗い側の \(\theta\) の節点は、隣り合う細かい側の節点を 1 つおきに取ったものにする（<a href="#terms-pentagon-belt">用語</a>）。</p>
+      <p>接続関係の持ち方と <code>corner_stride</code> は、<a href="#mechanism">物理機構</a>の箇条に述べた。各系統の小さな例を<a href="#fig-mesh-2d-families">図A</a>に示す。各生成器が対応する物理の組合せと制約は、<a href="../../use/namelist.html">namelist リファレンス</a>に従う。</p>
 
-      <figure>
-        <img src="../../../assets/mesh-2d-family-gallery.png" width="1000" height="340" style="max-width:100%;height:auto" alt="矩形 RZ、構造化された極座標、箱の中の極座標、五角形帯の 4 種類の 2D メッシュの模式図">
-        <figcaption>図A. 2D メッシュの系統の小さな例（生成器の規則で計算）。左の 3 つは単一の論理ブロックの代表例、右端は五角形のセルで粗いリングと細かいリングを接続する CSR の接続関係で、中心部を空ける環状の極座標メッシュの上に作る。</figcaption>
+      <figure id="fig-mesh-2d-families">
+        <img src="../../../assets/mesh-2d-family-gallery-ja.png" width="1000" height="360" style="max-width:100%;height:auto" alt="左から、矩形 RZ、構造化された極座標（中心は三角形扇）、箱の中の極座標（中心は三角形扇）、五角形帯（中心は環状）の 4 種類の 2D メッシュの模式図。各パネルの題の 2 行目が中心の扱いを示す">
+        <figcaption>図A. 2D メッシュの系統の小さな例（生成器の規則で計算）。各パネルの題の 2 行目は中心の扱いを示す。左の 3 つは単一の論理ブロックの代表例で、構造化された極座標と箱の中の極座標（2 番目と 3 番目）は三角形扇の中心をもつ。右端は、五角形のセルが、角度分割数の粗いリングと細かいリングを接続する CSR の接続関係で、中心部を空ける環状の極座標メッシュの上に作る。</figcaption>
       </figure>
+    </section>
+
+    <section aria-labelledby="terms">
+      <h2 id="terms">この計算で使う用語</h2>
+      <p>2D のメッシュには、極座標の原点まわりの作り方、箱への接続、標的の壁、角度方向の分割数の切り替え、ブロックの接合といった、この計算に固有の構成要素がある。ここに挙げる用語は、TENRYU の生成器と入力の検査が使う意味で定義する。</p>
+
+      <h3 id="terms-center">中心の扱い</h3>
+      <p><strong>中心の扱い（polar center treatment）</strong>は、極座標メッシュで原点のまわりのセルをどう作るかの選択で、<code>Mesh.polar_center_treatment</code> が決める。極座標メッシュを原点（\(s=0\)）まで延ばすと、そこで \(\theta\) 方向に並ぶ \(N_z+1\) 個の節点が 1 点に重なり、四辺形のセルが退化する。中心の扱いは、この退化をどう避けるかを決める。選択肢は環状、三角形扇、ボタンの 3 つで（<a href="#fig-mesh-2d-polar-center">図B</a>）、既定は環状である。<code>Mesh.topology_scheme</code> がマルチブロックのとき（<code>pentagon_belt_shell</code> を除く）は、原点まわりを接続関係が作る（<a href="#controls">下の表</a>）。Studio は <code>polar_center_treatment</code> を書き出さない。</p>
+      <p><strong>環状（annular）</strong>は、原点を含めず、半径 \(s_0&gt;0\) の内側の球面から外側へセルを並べる。径方向の節点は \(s_i=(i+\kappa)\Delta s\)（\(i=0,\dots,N_r\)）、\(\Delta s=s_{\max}/(N_r+\kappa)\) で、内側の球面の半径は \(s_0=\kappa\Delta s\) になる。\(N_r\) は <code>Mesh.nr</code>、\(s_{\max}\) は <code>Mesh.spherical_polar_s_max</code>（既定 1.0 cm）、\(\kappa\) は <code>Mesh.spherical_polar_kappa</code>（既定 0.5）である。<code>Mesh.explicit_nodes</code> や <code>Mesh.grid_r</code> で径方向の節点を与えるときは \(\kappa\) を使わず、先頭の節点が \(s_0\) になる。内側の球面は壁として扱い、流速の法線成分を取り除く。原点の退化は避けられるが、内側の球の内部は計算領域に含まれない。</p>
+      <p><strong>三角形扇（tri-fan）</strong>は、原点にセルの頂点を置く。径方向の節点は \(s_i=i\,s_{\max}/N_r\)（<code>Mesh.explicit_nodes</code> で与えるときは先頭を 0 にする）で、\(i=0\) のリングの \(N_z+1\) 個の節点がすべて原点に重なる。\(i=0\) のセルは 3 頂点の三角形（<code>cell_nverts=3</code>）になり、\(N_z\) 個の三角形が原点のまわりに扇状に並ぶ。原点に重なる節点は別々の節点番号のままで、境界条件が、その半径方向の速度を 0 に、軸方向の速度を共通の平均値にそろえる。<code>Mesh.polar_theta_min&gt;0</code> による切り詰めは、この中心の扱いを要する。</p>
+      <p><strong>ボタン（button）</strong>は、原点まわりの内側のセルをまとめて 1 つの大きなセルにする。径方向の節点は三角形扇と同じ \(s_i=i\,s_{\max}/N_r\) である。リング \(i=I_{\rm btn}\)（<code>Mesh.center_button_outer_node_ring</code>、既定 2、\(1\le I_{\rm btn}&lt;N_r\)）の \(N_z+1\) 個の節点を頂点とし、軸（\(R=0\)）を 1 辺とする \((N_z+1)\) 角形のセルが 1 つできる。このセルは活性（<code>hydro_active</code>。<a href="../../overview/numerics-foundations.html#hydro-active">活性マスク</a>参照）で、\(i&lt;I_{\rm btn}\) の構造格子のセルは休止（dormant）セルとして、流体が働かず、状態量が 0 になる。ボタンのセルの時間刻みには、代表長 \(h=\min(2A_{\rm btn}/P_{\rm btn},\,h_\triangle)\) を使う。\(A_{\rm btn}\) と \(P_{\rm btn}\) はセルの子午面の面積と周長、\(h_\triangle\) は重心と隣り合う 2 頂点がつくる三角形の 3 つの高さの最小値である。</p>
+      <figure id="fig-mesh-2d-polar-center">
+        <img src="../../../assets/mesh-2d-polar-center-ja.png" width="1000" height="460" style="max-width:100%;height:auto" alt="極座標メッシュの原点のまわりの 3 つの作り方。左は環状で、半径 κΔs の内側の球面（赤）の内側が領域外。中央は三角形扇で、原点に重なる節点から 8 個の三角形（橙）が扇状に並ぶ。右はボタンで、リング i=2 の 9 個の節点を頂点とする 9 角形（橙）が 1 つのセルになり、軸を 1 辺とする。その内側の格子（破線）は休止セル">
+        <figcaption>図B. 中心の扱い 3 種の比較（Mesh.nr=4、Mesh.nz=8、\(s_{\max}=1\) の半平面、生成器の式で計算）。左：環状。\(s_i=(i+\kappa)\Delta s\)（\(\kappa=0.5\)）で、内側の球面（赤い線、半径 \(\kappa\Delta s\)）より内側は計算領域に含まれない（斜線）。中央：三角形扇。\(s_i=i\,s_{\max}/N_r\) で、原点に重なる 9 個の節点のまわりに、3 頂点の三角形（橙）が 8 個並ぶ。右：ボタン。同じ \(s_i\) で、リング \(i=I_{\rm btn}=2\) の 9 個の節点（橙の点）を頂点とする 9 角形のセル（橙）が 1 つでき、軸（\(R=0\)、一点鎖線）が 1 辺になる。\(i&lt;I_{\rm btn}\) の 15 個の休止セルの格子は、灰色の破線で重ねて示した。橙のセルと赤い線は、中心のセルと内側の壁を示す。</figcaption>
+      </figure>
+      <p>三角形扇とボタンは、2D の既定の流体の組（<code>rz_momentum_scheme="area_weighted_symmetric"</code>、<code>aw_compatible_force_work=True</code> など。<a href="../hydrodynamics.html#momentum-schemes">RZ 運動量スキーム</a>参照）と併用できない。デッキで <code>rz_momentum_scheme="volume_weighted"</code> と <code>aw_compatible_force_work=False</code> を明示する。このほか、砂時計モードの抑制（<code>hourglass.enabled</code>）、サブゾーン質量（<code>subzonal_mass_enabled</code>）、HLLC の z 方向流束（<code>hllc_z_flux_2d_rz</code>）、精密な RZ 幾何 CFL（<code>rz_geometric_cfl_precise_u_half_enabled</code>）、総エネルギーのリマップ（<code>total_energy_remap_2d_rz</code>）は、入力の検査が拒否する。ボタンでは、輻射と電子熱伝導も、入力の検査が拒否する。</p>
+
+      <h3 id="terms-polar-in-box">箱の中の極座標</h3>
+      <p><strong>箱の中の極座標（polar-in-box）</strong>は、球形の標的を極座標のメッシュで表し、その外側を矩形の計算領域（箱）で閉じるメッシュで、<code>Mesh.logical_mesh_2d="polar_in_box"</code> で選ぶ。径方向のセルは、内側から次の 3 つの部分に分かれる。径方向のセル数の合計 \(N_r=N_{\rm prefix}+N_{\rm morph}+N_{\rm collar}\) は生成器が決め、\(\theta\) 方向のセル数 \(N_z\) は <code>Mesh.nz</code> で与える。</p>
+      <ul>
+        <li><strong>極座標部分（polar prefix）：</strong>半径 \(0\le s\le s_b\) の通常の極座標メッシュである。径方向の節点は <code>Mesh.explicit_nodes</code>（必須）で与え、そのセル数が \(N_{\rm prefix}\)、最後の節点が \(s_b=\)<code>spherical_polar_s_max</code> である。</li>
+        <li><strong>遷移リング（morph ring）：</strong><code>Mesh.morph_rings</code> 個（既定 16、4 以上）である。各角度の線に沿って、半径 \(s_b\) から、箱を襟の厚さだけ内側へ縮めた長方形の周の上にある目標点まで、極座標部分の最後の間隔から始めて、節点を等比数列の間隔で並べる。間隔の公比は線ごとに決まり、<code>Mesh.morph_growth_max</code>（既定 1.20、1 より大きく 2 以下）を超えると <code>ConfigError</code> になる。節点の角度は、\(k/N_{\rm morph}\le0.2\) のリング（\(k\) は内側から数えた番号）では \(\theta_j\) のままで、その後は 5 次多項式 \(u^3(10-15u+6u^2)\)（\(u=(k/N_{\rm morph}-0.2)/0.8\)）で目標点の角度へ移る。</li>
+        <li><strong>襟リング（collar ring）：</strong><code>Mesh.collar_rings</code> 個（既定 6、2 から 32）である。目標点から箱の縁までを、箱を内側へ縮めた長方形の周で埋める。縮める幅は外側のリングほど小さく、最後のリングは箱の縁に一致する。</li>
+      </ul>
+      <p>箱は <code>Mesh.box_r_max</code>、<code>box_z_min</code>、<code>box_z_max</code>（いずれも必須）で与え、極座標の中心の Z 座標は <code>Mesh.box_center_z</code>（既定 0.0 cm、箱の内側）である。箱は極座標部分を厳密に含まなければならず、<code>r_max</code>、<code>z_min</code>、<code>z_max</code> は箱から決まる（デッキに書くときは一致させる）。箱の右側の 2 つの角には、その方向に最も近い \(\theta\) の節点の線が当たる。<code>Mesh.nz</code> が小さくて 2 つの角が区別できないと <code>ConfigError</code> になる。接続関係は <code>single_block</code>（中心の扱いは環状か三角形扇）か <code>multiblock_cart_core_polar_shell</code> である。円錐形の壁をもつ標的には、極座標部分を変えずに、その外側のリングだけを作り直して、壁の線を角度 <code>Mesh.cone_theta_wall</code> に厳密に合わせる後処理がある（<code>cone_tip_radius</code> などのキーと組になり、<code>polar_in_box</code> だけで使える）。Studio が書き出す値は、<a href="#controls">namelist による制御</a>の節に述べた。<code>polar_in_box</code> は、メッシュの生成、初期化、初期出力までで、時間発展の最初のステップが <code>ConfigError</code> で止まる。</p>
+
+      <h3 id="terms-cone-shell">円錐殻</h3>
+      <p><strong>円錐殻（cone shell）</strong>は、先端を切り落とした円錐形の薄い殻（壁）をもつ標的のメッシュで、<code>Mesh.logical_mesh_2d="cone_shell"</code> で選ぶ。円錐の軸は対称軸（\(R=0\)）で、壁の厚さ \(t_w\)、軸から測った半角 \(\alpha\)、先端の位置、壁の長さ \(L_w\) を与えると、壁を 1 つの写像ブロックで作り、壁に接する帯と、壁から軸と箱までの領域を、壁に適合した四辺形セルで隙間なく埋める。ブロックは次の 11 個である。</p>
+      <table class="quick-facts">
+        <thead>
+          <tr><th>ブロック</th><th>内容</th></tr>
+        </thead>
+        <tbody>
+          <tr><th><code>WALL</code></th><td>壁。壁の中央面に沿って先端から測った長さ \(q\) と、壁の法線方向の位置 \(n\) の写像で作る 1 つの構造格子ブロックである。厚さ方向のセル数は <code>cone_shell_n_cells</code>（既定 10、6 以上の偶数）で、壁の両面で最も細かく、中央面へ向かって公比 <code>cone_shell_n_growth</code>（既定 1.25）で広がる。壁に沿うセルの幅は、先端付近で細かく（壁の面のセル幅の <code>cone_shell_tip_size_factor</code> 倍、既定 3）、根元で粗く（<code>cone_shell_base_size_factor</code> 倍、既定 8）なり、隣り合うセルの幅の比は <code>cone_shell_l_ratio_max</code>（既定 1.12）以下である。壁に沿うセル数が <code>nr</code>、厚さ方向のセル数が <code>nz</code> になる。</td></tr>
+          <tr><th><code>OUTER_NF</code>、<code>INNER_NF</code>、<code>END_NF</code></th><td>壁の外面、内面、先端面に接する帯（near-face strip）。壁の面の節点は壁が所有し、帯はそれを共有する。層の数は <code>cone_shell_outer_vac_layers</code>、<code>cone_shell_inner_vac_layers</code>、<code>cone_shell_end_vac_layers</code>（既定はいずれも 10 で、3 つは等しくなければならない）である。最初の層の厚さは壁の面のセル幅の 0.8、1.0、1.0 倍で、層の厚さは公比 1.18、1.15、1.15 で増える。</td></tr>
+          <tr><th><code>TIP_CORNER_O</code>、<code>TIP_CORNER_I</code></th><td>先端の外側の角と内側の角で、外面または内面の帯と先端面の帯が出会う所を埋める 2 つのブロック。2 つの帯の同じ層の外縁線の交点を節点とし、各帯の節点をそのまま参照する。</td></tr>
+          <tr><th><code>CAVITY_CORE</code></th><td>内面の帯の外縁から軸までを埋める。壁に沿う各位置から、軸上の対応する点へ 3 次エルミート曲線を引き、曲線に沿って並べたセルが 1 列になる。軸上の点は先端から根元まで等間隔（<code>cone_shell_farfield_target_measure="station_uniform"</code>、既定）に並び、曲線に沿うセル数は 6 から 32 である。</td></tr>
+          <tr><th><code>EXTERIOR_CORE</code></th><td>外面の帯の外縁から、箱の半径方向の面（\(R=\)<code>box_r_max</code>）までを、同じ方法で埋める。</td></tr>
+          <tr><th><code>TIP_FILL_WEST</code>、<code>TIP_FILL_MID</code>、<code>TIP_FILL_EAST</code></th><td>先端の先（根元と反対側）の領域を、先端側の箱の面まで埋める 3 つのブロック。</td></tr>
+        </tbody>
+      </table>
+      <p>必須のキーは、<code>cone_shell_alpha</code>（\(0&lt;\alpha&lt;\pi/2\)、かつ \(\cos\alpha\ge0.2\)）、<code>cone_shell_wall_thickness</code>、<code>cone_shell_tip_radius</code>、<code>cone_shell_tip_z</code>、<code>cone_shell_wall_length</code> と、箱の <code>box_r_max</code>、<code>box_z_min</code>、<code>box_z_max</code> である。<code>cone_shell_tip_radius</code> は、<code>cone_shell_tip_radius_kind</code> が <code>"inner_face"</code>（既定）なら先端の平面での壁の内面の半径、<code>"mid_surface"</code> なら壁の中央面の半径である。<code>cone_shell_axis_sign</code>（既定 +1）の符号 \(\sigma_z\) が、根元が軸の +Z 側か −Z 側かを決める。根元の側の箱の Z 面（\(\sigma_z=+1\) なら <code>box_z_max</code>、\(\sigma_z=-1\) なら <code>box_z_min</code>）は、\(z_{\rm base}=z_{\rm tip}+\sigma_zL_w\cos\alpha\) に厳密に一致させる。先端側の箱の Z 面は、先端から、先端面の帯の厚さと \(8t_w\) を合わせた距離より遠くに置く。<code>nr</code>、<code>nz</code>、<code>explicit_nodes</code>、<code>grid_r</code>、<code>auto_regions</code>、<code>box_center_z</code> はデッキに書けない。<code>cone_shell_*</code> のキーは円錐殻専用で、<code>polar_in_box</code> の円錐用の後処理（<code>cone_theta_wall</code> など）とは別である。</p>
+      <p>既定の <code>cone_shell_base_cut="planar"</code>（根元の切断面が \(z=z_{\rm base}\) の平面）では、組み上がったメッシュの境界は軸と箱の面だけである。<code>"wall_normal"</code>（根元を壁に垂直に切る）では、根元の曲面が開いたままになる。円錐殻は、メッシュの生成、初期化、初期出力までで、時間発展の最初のステップが <code>ConfigError</code> で止まる。</p>
+
+      <h3 id="terms-pentagon-belt">五角形帯</h3>
+      <p><strong>五角形帯（pentagon belt）</strong>は、極座標の殻（shell）で、角度方向のセル数を中心へ向かって段階的に半分にする構成で、<code>Mesh.topology_scheme="pentagon_belt_shell"</code> で選ぶ。四辺形のセルを同じ角度分割数のまま中心へ並べると、半径 \(s\) でのセルの \(\theta\) 方向の幅 \(s\Delta\theta\) が小さくなり、細長いセルができる。角度分割数を減らせば、この細長いセルを防げる。</p>
+      <p>五角形のセルを置く層は、<code>Mesh.pentagon_belt_layers</code> に並べた番号 \(b_1&lt;\dots&lt;b_K\)（\(1\le K\le4\)）のセルの層で、層 \(b\) は、リング \(b\) とリング \(b+1\) のあいだにある。リング \(i\) の角度分割数は \(N_z/2^{k(i)}\)（\(k(i)\) は \(b_j\ge i\) を満たす層の数）で、最も外側は \(N_z\)（<code>Mesh.nz</code>）、最も内側は \(N_z/2^K\) である。層 \(b\) の五角形のセル \(m\) は、粗い側のリング \(b\) の節点 \(m\) と \(m+1\)、細かい側のリング \(b+1\) の節点 \(2m\)、\(2m+1\)、\(2m+2\) の 5 つを頂点にもつ。節点 \(2m+1\) は、四辺形だけで 2:1 に切り替えたときのハンギングノードに当たる。</p>
+      <p>\(\theta\) の節点列は、一様か等 \(\mu\)（<code>polar_equal_mu_zoning</code>）に限る。粗いリングの \(j\) 番目の節点の \(\theta\) は、最も細かい節点列の \(jN_z/N\) 番目の節点の \(\theta\) に（\(N\) はそのリングの角度分割数）、ビット単位（bitwise）で一致する。中心は環状に限る。径方向の節点は、既定では環状の式 \(s_i=(i+\kappa)\Delta s\) で作り、<code>Mesh.explicit_nodes</code> や <code>Mesh.grid_r</code> でも与えられる（先頭は正）。セルの頂点は 4 または 5 で、<code>corner_stride</code> は 8、<code>cell_nverts</code> は五角形のセルで 5、そのほかのセルで 4 である。</p>
+      <p>流体は、内側の境界 <code>Numerics.hydro.boundary_2d.r_inner</code> を <code>"axis"</code> か <code>"pinned"</code> にする。旧来の <code>av_model="csw_edge"</code>（五角形に対応する対の面がない）、<code>subzonal_mass_enabled</code>、<code>hllc_z_flux_2d_rz</code>、離散座標法（\(S_N\)）の輻射輸送（<code>Radiation.mode="sn_transport"</code>）は拒否される。ALE を使うときは、<code>Numerics.ale.rezone_solver="m1_tmop"</code> と保存的リマップ（<code>conservative_remap_enabled</code>）の組だけが使える。</p>
+
+      <h3 id="terms-seam-owner">接合部と所有ブロック</h3>
+      <p><strong>接合部（seam）</strong>は、隣り合う 2 つのブロックが共有する辺とその節点の列である。マルチブロックのメッシュは、構造格子のブロックをいくつか組み合わせ、ブロックごとに独立な添字 \((i,j)\) をもつ。</p>
+      <p><strong>所有ブロック（owner block）</strong>は、接合部の節点の座標を決めて書き込むブロックで、ブロックの表に節点ごとに 1 つだけ記録される。接合部の節点には節点番号が 1 つだけあり、もう一方のブロックは、同じ節点番号を参照する。座標を二重にもたないので、接合部で隙間や食い違いが生じず、節点質量や節点力を接するセルから集める和は、接合部の節点を 1 回だけ数える。セルの頂点は CSR 形式（セルごとの頂点の節点番号を、セルの先頭位置を示すオフセット配列と、節点番号を並べた配列の 2 本で持つ形式）で持つ。逆向きの節点→セルの対応と、面の隣接関係も、同じ形式の配列で持つ。</p>
     </section>
 
     <section aria-labelledby="pipeline">
       <h2 id="pipeline">namelist から受理されたメッシュまで</h2>
       <ol>
         <li><p><strong>選択して検証する。</strong> メッシュの系統を選び、半径方向・軸方向・角度方向のうち該当する区間の数と端点を検証する。</p></li>
-        <li><p><strong>節点を生成する。</strong> 該当する一様・傾斜配置・等 \(\mu\) の段列を構築し、必要な軸上の節点を厳密に \(R=0\) へ合わせる。</p></li>
-        <li><p><strong>接続関係を組み立てる。</strong> 構造ブロックでは暗黙の添字付けを、マルチブロックのセルでは CSR の接続を使い、共有される接合部の節点について所有側を明示する。</p></li>
+        <li><p><strong>節点を生成する。</strong> 該当する一様・傾斜配置（graded）・等 \(\mu\) の節点列を構築し、必要な軸上の節点を厳密に \(R=0\) へ合わせる。</p></li>
+        <li><p><strong>接続関係を組み立てる。</strong> 構造ブロックでは暗黙の添字付けを、マルチブロックのセルでは CSR の接続を使い、共有される接合部の節点について所有ブロックを明示する。</p></li>
         <li><p><strong>セルを検査する。</strong> メッシュを次の段へ渡す前に、向きと、厳密な回転体としての RZ 体積が正であることを検証する。</p></li>
-        <li><p><strong>コーナーの幾何を保持する。</strong> エネルギー整合な演算子（<a href="../hydrodynamics.html">流体</a>）と品質検査が使うコーナー面積ベクトル \(\mathbf S\) と、最小高さのデータを構築する。</p></li>
-        <li><p><strong>流体へ引き渡す。</strong> 共通の幾何・接続の契約を公開し、予測的な最小高さの保護判定と、コーナーヤコビアンの保護判定を有効にする。</p></li>
+        <li><p><strong>コーナーの幾何を保持する。</strong> セルごとの体積、面積、重心と、エネルギー整合（compatible）な演算子（<a href="../hydrodynamics.html">流体</a>）が使うコーナーベクトル \(\mathbf S\)（セル体積の、そのコーナー節点の位置に対する勾配。<a href="../hydrodynamics.html#terms-corner">コーナー</a>の項を参照）を求める。</p></li>
+        <li><p><strong>流体へ引き渡す。</strong> 体積、コーナーの幾何、接続関係を流体へ公開する。メッシュ品質の判定は、流体の入力（<code>Numerics.hydro.mesh_quality_dt_cfl_enabled</code>、<code>in_hydro_corner_j_guard_enabled</code> など。いずれも既定は False）で有効にすると働く。</p></li>
       </ol>
     </section>
 
     <section aria-labelledby="controls">
       <h2 id="controls">namelist による制御</h2>
-      <p>以下は、メッシュとデッキ側の幾何に関する代表的な入口である。検証規則の全体と段階ごとの対応範囲は <a href="../../use/namelist.html">namelist リファレンス</a>を参照のこと。</p>
+      <p>以下は、メッシュとデッキ側の幾何に関する代表的な入口である。検証規則の全体は <a href="../../use/namelist.html">namelist リファレンス</a>を参照のこと。表の既定値は、デッキで指定しないときの値（パーサーの既定）である。Studio が書き出す値が異なるキーは、表の後に述べる。</p>
       <table class="quick-facts">
         <thead>
-          <tr><th>キー</th><th>対象</th><th>用途</th></tr>
+          <tr><th>キー</th><th>対象</th><th>既定値</th><th>用途</th></tr>
         </thead>
         <tbody>
-          <tr><th><code>Mesh.nr</code>, <code>nz</code>, <code>logical_mesh_2d</code></th><td>2D</td><td>論理的な解像度と、<code>rectangular_rz</code>、<code>spherical_polar_halfplane</code>、<code>polar_in_box</code>、<code>cone_shell</code> の選択。</td></tr>
-          <tr><th><code>Mesh.grid_r</code>, <code>grid_z</code>, <code>grid_theta</code></th><td>2D</td><td>方向ごとの一様・傾斜配置の区間。極座標の θ 区間は、材料や壁の境界を面に合わせて固定できる。</td></tr>
-          <tr><th><code>Mesh.polar_equal_mu_zoning</code></th><td>2D 極座標</td><td>一様な θ の代わりに、等立体角の節点を生成する。</td></tr>
-          <tr><th><code>Mesh.polar_theta_min</code></th><td>2D 極座標</td><td>既定は 0。正の値では三角形扇の範囲を \([\theta_{\min},\pi]\) に切断する。</td></tr>
+          <tr><th><code>Mesh.nr</code>, <code>nz</code></th><td>2D</td><td>なし（<code>nr</code> ≥ 4、<code>nz</code> ≥ 4）</td><td>径方向（極座標では \(s\) 方向）と軸方向（極座標では \(\theta\) 方向）のセル数。<code>polar_in_box</code> では <code>nr</code> を生成器が決める。<code>cone_shell</code> では <code>nr</code> と <code>nz</code> を生成器が決め、デッキに書くと <code>ConfigError</code> になる。</td></tr>
+          <tr><th><code>Mesh.<wbr>logical_<wbr>mesh_<wbr>2d</code></th><td>2D</td><td><code>"rectangular_rz"</code></td><td>論理格子の選択。<code>rectangular_rz</code>、<code>spherical_<wbr>polar_<wbr>halfplane</code>、<code>polar_in_box</code>、<code>cone_shell</code> のいずれか。</td></tr>
+          <tr><th><code>Mesh.<wbr>topology_<wbr>scheme</code></th><td>2D</td><td><code>"single_block"</code></td><td>接続関係の選択（下の表）。</td></tr>
+          <tr><th><code>Mesh.grid_r</code>, <code>grid_z</code>, <code>grid_theta</code></th><td>2D</td><td>一様</td><td>方向ごとの一様・傾斜配置の区間。<code>grid_r</code> は径方向（極座標では \(s\) 方向）、<code>grid_z</code> は <code>rectangular_rz</code> の Z 方向、<code>grid_theta</code> は極座標の \(\theta\) 方向である。\(\theta\) 区間は <code>polar_theta_min</code> から \(\pi\) までを覆い、材料や壁の境界を面に合わせて固定できる。</td></tr>
+          <tr><th><code>Mesh.explicit_nodes</code></th><td>2D 極座標</td><td>なし</td><td>径方向の節点座標 [cm] を直接与える。最後の節点は <code>spherical_<wbr>polar_<wbr>s_<wbr>max</code> に一致させる。先頭は、環状では正、三角形扇とボタンでは 0 でなければならない。<code>polar_in_box</code> では必須である。</td></tr>
+          <tr><th><code>Mesh.<wbr>spherical_<wbr>polar_<wbr>s_<wbr>max</code></th><td>2D 極座標</td><td>1.0 cm</td><td>極座標の外半径 \(s_{\max}\)。<code>polar_in_box</code> では、極座標部分の外半径 \(s_b\) であり、最後の <code>explicit_nodes</code> に一致させる。</td></tr>
+          <tr><th><code>Mesh.<wbr>polar_<wbr>center_<wbr>treatment</code></th><td>2D 極座標</td><td><code>"annular"</code></td><td>原点まわりの扱い（<a href="#terms-center">中心の扱い</a>）。<code>"annular"</code>、<code>"tri_fan"</code>、<code>"button"</code> のいずれか。<code>tri_fan</code> と <code>button</code> は極座標の論理格子（<code>spherical_<wbr>polar_<wbr>halfplane</code>、<code>polar_in_box</code>）でだけ使え、<code>button</code> は単一ブロックの <code>spherical_<wbr>polar_<wbr>halfplane</code> に限る。<code>pentagon_belt_shell</code> と <code>multiblock_<wbr>polar_<wbr>tier</code> 系は <code>annular</code> を要する。</td></tr>
+          <tr><th><code>Mesh.<wbr>center_<wbr>button_<wbr>outer_<wbr>node_<wbr>ring</code></th><td><a href="#terms-center">ボタン</a></td><td>2</td><td>ボタンのセルの外側の境界になる節点の列の番号 \(I_{\rm btn}\)（\(1\le I_{\rm btn}&lt;\)<code>nr</code>）。</td></tr>
+          <tr><th><code>Mesh.<wbr>spherical_<wbr>polar_<wbr>kappa</code></th><td><a href="#terms-center">環状</a></td><td>0.5</td><td>径方向の節点 \(s_i=(i+\kappa)\Delta s\) の \(\kappa\)。正でなければならない。内側の球面の半径は \(\kappa\Delta s\) になる。</td></tr>
+          <tr><th><code>Mesh.<wbr>polar_<wbr>equal_<wbr>mu_<wbr>zoning</code></th><td>2D 極座標</td><td>False</td><td>一様な \(\theta\) の代わりに、等立体角の節点を生成する。働くのは <code>tri_fan</code> と <code>pentagon_belt_shell</code> のときである。<code>grid_theta</code> および <code>explicit_<wbr>nodes_<wbr>theta</code> とは併用できない。</td></tr>
+          <tr><th><code>Mesh.<wbr>polar_<wbr>theta_<wbr>min</code></th><td>2D 極座標</td><td>0.0 rad</td><td>正の値では、三角形扇の範囲を \([\theta_{\min},\pi]\) に切断する。<code>spherical_<wbr>polar_<wbr>halfplane</code> と <code>tri_fan</code> を要し、有効範囲は \(0\le\theta_{\min}&lt;2.6\) である。</td></tr>
+          <tr><th><code>Mesh.<wbr>pentagon_<wbr>belt_<wbr>layers</code></th><td><a href="#terms-pentagon-belt">五角形帯</a></td><td><code>[]</code>（指定が必要）</td><td>角度方向のセル数が半分になる五角形のセルの層の番号 \(b_j\)（層 \(b\) は、節点の列 \(b\) と \(b+1\) のあいだ）。1 個から 4 個で、狭義単調増加、隣り合う値は 2 以上離し、\(1\le b_j\le\)<code>nr</code>\(-2\) を満たす。<code>nz</code> は \(2^K\)（\(K\) は個数）で割り切れ、\(N_z/2^K\ge4\) でなければならない。</td></tr>
+          <tr><th><code>Mesh.box_r_max</code>, <code>box_z_min</code>, <code>box_z_max</code>, <code>box_center_z</code></th><td><a href="#terms-polar-in-box"><code>polar_in_box</code></a>、<a href="#terms-cone-shell"><code>cone_shell</code></a></td><td>前の 3 つは必須、<code>box_center_z</code> は 0.0 cm</td><td>箱の半径方向の端と、軸方向の下端と上端 [cm]、極座標の中心の Z 座標。<code>polar_in_box</code> では、箱が極座標部分を厳密に含み、中心は箱の内側にある。<code>box_center_z</code> は <code>polar_in_box</code> だけが使い、<code>cone_shell</code> は拒否する。</td></tr>
+          <tr><th><code>Mesh.morph_rings</code>, <code>collar_rings</code>, <code>morph_growth_max</code></th><td><a href="#terms-polar-in-box"><code>polar_in_box</code></a></td><td>16、6、1.20</td><td>遷移リングの数（4 以上）、襟リングの数（2 から 32）、遷移リングの間隔の公比の上限（1 より大きく 2 以下）。</td></tr>
+          <tr><th><code>Mesh.<wbr>cone_<wbr>shell_<wbr>alpha</code>, <code>cone_<wbr>shell_<wbr>wall_<wbr>thickness</code>, <code>cone_<wbr>shell_<wbr>tip_<wbr>radius</code>, <code>cone_shell_tip_z</code>, <code>cone_<wbr>shell_<wbr>wall_<wbr>length</code></th><td><a href="#terms-cone-shell"><code>cone_shell</code></a></td><td>必須</td><td>円錐の半角 [rad]、壁の厚さ、先端の半径、先端の Z 座標、壁の長さ [cm]。</td></tr>
         </tbody>
       </table>
+      <p><code>Mesh.<wbr>topology_<wbr>scheme</code> の値は次のとおりである。</p>
+      <table class="quick-facts">
+        <thead>
+          <tr><th>値</th><th>構成</th></tr>
+        </thead>
+        <tbody>
+          <tr><th><code>single_block</code>（既定）</th><td>構造格子の 1 ブロック。</td></tr>
+          <tr><th><code>multiblock_<wbr>cart_<wbr>core_<wbr>polar_<wbr>shell</code></th><td>原点まわりの直交座標の半コア（Cartesian half-core）、半コアの境界から外側の半円へ補間する橋渡し層（bridge layer）、外側の極座標の殻の 3 ブロック。</td></tr>
+          <tr><th><code>multiblock_<wbr>half_<wbr>butterfly_<wbr>5block</code></th><td>上の橋渡し層を、北・東・南の扇形（fan）の 3 ブロックに分けた 5 ブロック（半コア、扇 3 つ、殻）。</td></tr>
+          <tr><th><code>multiblock_<wbr>half_<wbr>butterfly_<wbr>trifan_<wbr>cap_<wbr>5block</code></th><td>上の 5 ブロックの半コアを、原点に頂点を固定した三角形扇のキャップに置き換えたもの。</td></tr>
+          <tr><th><code>multiblock_<wbr>polar_<wbr>tier</code></th><td>殻、角度方向のセル数を中心へ向かって 2:1 で減らす層（tier）、その間の遷移帯（belt）、原点まわりの扇からなる。流体を走らせるには <code>Mesh.<wbr>polar_<wbr>tier_<wbr>hydro_<wbr>enabled=True</code> が要る。</td></tr>
+          <tr><th><code>multiblock_<wbr>polar_<wbr>tier_<wbr>cart_<wbr>center</code></th><td><code>multiblock_<wbr>polar_<wbr>tier</code> を <code>polar_<wbr>tier_<wbr>cart_<wbr>cut_<wbr>ring</code> の節点の列で切り、内側を橋渡し層と中心部で置き換えたもの。中心部は、<code>polar_<wbr>tier_<wbr>center_<wbr>kind="cart_<wbr>box"</code>（既定）では直交座標の箱、<code>"trifan_cap"</code> では三角形扇のキャップである。</td></tr>
+          <tr><th><code>pentagon_belt_shell</code></th><td><a href="#terms-pentagon-belt">五角形帯</a>。</td></tr>
+          <tr><th><code>cone_shell_spine</code></th><td><code>cone_shell</code> が内部で設定する値で、デッキでは指定できない。</td></tr>
+        </tbody>
+      </table>
+      <p>Studio が書き出す 2D のメッシュは 2 種類である。「矩形テンソル」は、<code>Mesh.<wbr>logical_<wbr>mesh_<wbr>2d</code> を書かず（既定の <code>rectangular_rz</code>）、<code>r_min</code>、<code>r_max</code>、<code>z_min</code>、<code>z_max</code>、<code>nr</code>、<code>nz</code> を書き、その既定は 0 cm、500 µm、−500 µm、500 µm、300、64 である。「polar_in_box（改良版）」は、<code>logical_<wbr>mesh_<wbr>2d="polar_<wbr>in_<wbr>box"</code> に加えて、メッシュ計画ツール <code>tools/mesh_<wbr>planner.<wbr>py</code> が作る <code>explicit_nodes</code> と <code>topology_<wbr>scheme="multiblock_<wbr>cart_<wbr>core_<wbr>polar_<wbr>shell"</code> などを書き、<code>nz</code>（\(\theta\) 方向のセル数）、<code>morph_rings</code>、<code>collar_rings</code>、<code>morph_growth_max</code> を書く。その既定は 48、36、5、1.30 で、パーサーの既定（<code>morph_rings</code>、<code>collar_rings</code>、<code>morph_growth_max</code> は 16、6、1.20）と異なる。Studio は <code>polar_<wbr>center_<wbr>treatment</code> を書かない。polar_in_box のデッキは時間発展できないので、Studio は実行ボタンを無効にする。</p>
     </section>
 
     <section aria-labelledby="verification">
       <h2 id="verification">検証</h2>
       <ul>
-        <li><code>test_mesh_quality_dt_limiter</code> と流体内での保護判定の試験は、最小高さとコーナー \(J\) の下限、膨張時には制限しないこと、反転する候補を拒否すること、そして決定性を検査する。</li>
-        <li><code>test_polar_truncated_span</code> は、\(\theta_{\min}\) からの開始、鏡映による切断、体積が正であること、解析的なくさび体積、閉じた中心の扇、ビット単位の決定性を固定する。</li>
-        <li><code>test_h02_axis_exact_snap</code> は、環状・三角形扇・ボタンのいずれについても両極の行が厳密に \(R=0\) となり、赤道と南北の鏡映が必要な経路で厳密になることを検査する。</li>
-        <li>マルチブロックの接続に関する試験は、接合部で共有される節点 ID、CSR の面隣接関係の対における双方向・相互の整合性、逆向きの接続、五角形帯における頂点数・向き・2:1 の θ の入れ子を検査する。</li>
+        <li><code>test_mesh_quality_dt_limiter</code> は、メッシュ品質による時間刻みの制限が、軸近傍の半径方向のつぶれ、ガウス点ヤコビアンの下限割れ、コーナーヤコビアンの途中での最小、RZ 体積の途中での符号反転を、許容できない候補として検出し、縮めた時間刻みを返すことを検査する。穏やかな変形を受理すること、スイッチが切れているときは何もしないことも検査する。<code>test_in_hydro_gauss_j_rz_vol_guard</code> は、流体の中の候補検査について、ガウス点ヤコビアンと RZ 体積の判定が既定で無効であること、有効にすると下限割れと符号反転を検出すること、穏やかなメッシュを受理することを検査する。</li>
+        <li><code>test_polar_truncated_span</code> は、\(\theta_{\min}\) からの開始、鏡映による切断、体積が正であること、解析的なくさび体積（analytic wedge volume）との一致（相対差 2 % 以内）、閉じた中心の扇、ビット単位の決定性を固定する。</li>
+        <li><code>test_h02_axis_exact_snap</code> は、環状・三角形扇・ボタンのそれぞれで、両極（\(\theta=0,\pi\)）の節点が厳密に \(R=0\) にあること、赤道の節点が厳密に \(Z=0\) にあること、南半球の節点が北半球の節点の厳密な鏡像であることを検査する。\(\theta\) の節点を明示したときは、鏡映を強制しないことも検査する。</li>
+        <li><code>test_multiblock_gamma_topology</code>（直交座標の半コアを使う 3 ブロックと、半バタフライ 5 ブロックの試験）は、セル体積がすべて正であること、総体積が球の体積に一致すること、接合部の面隣接が双方向であること、半バタフライ 5 ブロックの面隣接が完全であることを検査する。<code>test_pentagon_belt_builder</code> は、<code>corner_stride</code> が 8 であること、セル数と節点数、五角形のセルの頂点数と面積が正であること、粗い側の \(\theta\) の節点が細かい側の節点とビット単位で一致すること、面隣接が相互であること、境界面の分類、HDF5 の書き出しと読み込みで接続関係が保たれることを検査する。</li>
+        <li><code>test_polar_in_box_mesh</code> は、セルのヤコビアンと体積が正であること、リングが入れ子で自己交差しないこと、軸の座標が厳密であること、最後のリングが箱に厳密に一致すること、極座標部分が通常の極座標メッシュとビット単位で一致すること、遷移リングの公比が <code>morph_growth_max</code> 以下であること、遷移リングの角度が狭義単調であることを検査する。</li>
+        <li><code>test_cone_shell_mesh</code> は、壁の面が解析的な位置にあること、帯が壁の面の節点を共有すること、角のブロックが帯の側面の節点を再利用すること、根元の平面で全ブロックが閉じること、空洞側の列が軸に届くこと、先端の先の 3 ブロックが隙間なく決定的に作られること、不正な入力が拒否されること、生成がバイト単位で決定的であることを検査する。</li>
       </ul>
     </section>
 
     <section aria-labelledby="references">
       <h2 id="references">参考文献</h2>
       <ol class="references">
-        <li>P. M. Knupp, "Algebraic Mesh Quality Metrics," SIAM J. Sci. Comput. 23, 193–218 (2001). <a href="https://doi.org/10.1137/S1064827500371499">doi:10.1137/S1064827500371499</a> — 許容性判定に使う最小高さ・ヤコビアン型の品質尺度の背景文献。</li>
+        <li>P. M. Knupp, "Algebraic Mesh Quality Metrics," SIAM J. Sci. Comput. 23, 193–218 (2001). <a href="https://doi.org/10.1137/S1064827500371499">doi:10.1137/S1064827500371499</a> — ヤコビアンに基づくメッシュ品質尺度の背景文献。</li>
       </ol>
     </section>
 

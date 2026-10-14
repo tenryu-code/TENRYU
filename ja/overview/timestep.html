@@ -13,15 +13,15 @@
   <main>
     <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
     <h1>時間刻み制御と CFL <span class="badge">reference</span></h1>
-    <p class="abstract">TENRYU は全カーネルがひとつの大域時間刻み \(\Delta t\) を共有する。毎ステップ、各カーネルが自分の安定条件・精度条件から「これ以上は進めない」という上限を提案し、ドライバがその最小値を採用する。したがって CFL 的な制約はカーネルごとに式が違い、どのカーネルが律速しているかはステップごとに変わる。このページは、決定則の全体像と、カーネル別の \(\Delta t\) 上限の式を一箇所にまとめた正典要約である（数式の正典はリポジトリの <code>docs/NUMERICS.md</code> §2.2）。</p>
+    <p class="abstract">TENRYU は、すべての<a href="../physics/index.html">物理カーネル</a>（physical kernel。1 つの物理演算子とその頁）が、ひとつの大域時間刻み（global time step）\(\Delta t\) を共有する。毎ステップ、各カーネルが自分の安定条件（stability condition）・精度条件（accuracy condition）から「これ以上は進めない」という上限を提案し、ドライバ（driver）がその最小値を採用する。したがって、CFL（Courant–Friedrichs–Lewy）条件にあたる制約はカーネルごとに式が違い、どのカーネルの上限が \(\Delta t\) を決めるかはステップごとに変わる。このページは、決定則の全体像と、カーネル別の \(\Delta t\) 上限の式を一箇所にまとめた正典要約である（数式の正典はリポジトリの <code>docs/NUMERICS.md</code> §2.2）。</p>
 
     <aside class="planned" aria-labelledby="at-a-glance">
       <h3 id="at-a-glance">要点</h3>
       <ul>
-        <li>大域則は \(\Delta t=\min(\Delta t_{hydro},\Delta t_{cond},\Delta t_{rad},\Delta t_{burn},\Delta t_{hot\,e},\Delta t_{visc},\ldots)\) に、成長率制限・上限 <code>dt.max_s</code>・出力時刻への着地・残り時間を重ねたものである。勝った制約の名前（<code>hydro</code>/<code>conduction</code>/<code>radiation</code>…）が limiter としてログ（<code>Main.verbosity="verbose"</code> のとき）と診断に記録される。</li>
-        <li>流体は音響 CFL（\(C_{CFL}=0.3\)）。熱伝導は、陽的な安定限界をスーパータイムステッピング（STS）で \(s_{max}(s_{max}+1)/2\) 倍 — 既定 \(s_{max}=40\) で 820 倍 — に緩めた値を提案し、陰解法では ∞（制約から外れる）。輻射（FLD と S<sub>N</sub>）は上限を提案しない（∞）。Fleck 因子の下限から導く上限は、退役したモンテカルロ輻射のもので、2026-09-29 にコードとともに外した。</li>
-        <li>レーザーと CBET は独立の \(\Delta t\) を持たない。核燃焼とホット電子は「前ステップの沈着」から次ステップを制限する後追い型である。</li>
-        <li>MPI 実行では、ランク局所の最小値を 1 回の <code>MPI_Allreduce(MPI_MIN)</code> で全ランク共有の \(\Delta t\) にする。</li>
+        <li>大域則は \(\Delta t_{phys}=\min(\Delta t_{hydro},\Delta t_{cond},\Delta t_{visc},\Delta t_{burn},\Delta t_{hot\,e},\Delta t_{mixed})\) に、成長率制限（growth limit）・上限 <code>dt.max_s</code>・出力時刻への着地（landing on output times）・残り時間を重ねたものである。\(\Delta t\) を決めた制約の名前（<code>hydro</code>、<code>conduction</code>、<code>burn</code> など。各項と名前の一覧は<a href="#global-rule">決定則</a>の節）が、ログ（<code>Main.verbosity="verbose"</code> のとき）と診断（diagnostics）に記録される。</li>
+        <li>流体は音響 CFL（acoustic CFL。\(C_{CFL}=0.3\)）。熱伝導（thermal conduction）は、陽的（explicit）な安定限界を<a href="../physics/conduction.html#sts">スーパータイムステッピング（super-time-stepping、STS）</a>で \(s_{max}(s_{max}+1)/2\) 倍 — 既定 \(s_{max}=40\) で 820 倍 — に緩めた値を提案し、電子の陰解法（implicit method。1D の <code>"implicit"</code>、2D の <code>"dmp_implicit"</code>。<a href="#conduction-dt">熱伝導の節</a>）では ∞（制約から外れる）。流束制限拡散（flux-limited diffusion、FLD）と離散座標法（discrete ordinates、S<sub>N</sub>）の輻射は上限を提案しない（∞）。</li>
+        <li>レーザーと CBET（cross-beam energy transfer、交差ビームエネルギー転送）は独立の \(\Delta t\) を持たない。核燃焼（nuclear burn）とホット電子（hot electron）は、前のステップの沈着（deposition）から次のステップを制限する後追い型（trailing）の制限をもつ（<a href="#source-dt">後述</a>）。2D の核燃焼は、部分サイクル（subcycling）数の超過を、ステップの棄却と再試行で処理する。</li>
+        <li>MPI（Message Passing Interface）実行では、ランク（rank）局所の最小値を 1 回の <code>MPI_Allreduce(MPI_MIN)</code> で全ランク共有の \(\Delta t\) にする。</li>
       </ul>
     </aside>
 
@@ -29,26 +29,26 @@
       <h2 id="global-rule">決定則の全体像</h2>
       <p>時間刻みの決定は「候補を集めて最小を取る」の一段構えである。まずカーネル群が提案する上限の最小値</p>
       $$
-      \Delta t_{phys}=\min\bigl(\Delta t_{hydro},\;\Delta t_{cond},\;\Delta t_{rad},\;
-      \Delta t_{burn},\;\Delta t_{hot\,e},\;\Delta t_{visc}\bigr)
+      \Delta t_{phys}=\min\bigl(\Delta t_{hydro},\;\Delta t_{cond},\;\Delta t_{visc},\;
+      \Delta t_{burn},\;\Delta t_{hot\,e},\;\Delta t_{mixed}\bigr)
       $$
-      <p>を作り、そこへ物理によらない運用上の制約を重ねる。</p>
+      <p>を作る。添字は上限を提案するカーネルを表し（visc は Braginskii 粘性（Braginskii viscosity）、mixed は 2D の混合セル（mixed cell）の圧力緩和（pressure relaxation））、各上限の式は<a href="#per-kernel">次の節</a>の表にある。そこへ物理によらない運用上の制約を重ねる。</p>
       $$
       \Delta t=\min\bigl(\Delta t_{phys},\;
       g_{dt}\,\Delta t^{n},\;
-      \texttt{dt.max\_s},\;
+      \texttt{dt.max_s},\;
       \Delta t_{output},\;
       t_{end}-t\bigr),\qquad g_{dt}=1.2\;(\text{既定})
       $$
       <p>それぞれの意味は次のとおりである。</p>
       <ul>
-        <li><strong>成長率制限 \(g_{dt}\)：</strong>前ステップからの急拡大を抑える（<code>Numerics.dt.growth_factor</code>、既定 1.2）。物理側の上限が緩んでも \(\Delta t\) は 1 ステップに 2 割ずつしか伸びない。1D では、前ステップの \(\Delta t\) を出力時刻や \(t_{end}\) に合わせて切り詰める前の値を基準にするので、出力に合わせた後のステップが伸び遅れない。輻射の項で述べる「係数の 1 ステップ遅れ」を実用上吸収するのもこの制限である。</li>
-        <li><strong>上限・下限：</strong><code>dt.max_s</code> は利用者が課す上限。\(\Delta t\) が下限 <code>dt.min_s</code>（既定 \(10^{-20}\) s）を下回った場合は、失速（ストーリング）防止のため FATAL 停止する。</li>
-        <li><strong>初期値：</strong><code>dt.initial_s</code> は step 0 だけで使われる（前ステップが存在せず成長率制限を適用できないため）。step 1 以降は無視され、リスタート時はチェックポイントに保存された \(\Delta t\) を初期値として引き継ぐ。</li>
+        <li><strong>成長率制限 \(g_{dt}\)：</strong>前ステップからの急拡大を抑える（<code>Numerics.dt.growth_factor</code>、既定 1.2。設定できる範囲は 1 以上 2 以下）。物理側の上限が緩んでも \(\Delta t\) は 1 ステップに 2 割ずつしか伸びない。式の \(\Delta t^{n}\) は成長の基準で、前ステップの \(\Delta t\) を出力時刻や \(t_{end}\) に合わせて切り詰める前の値である。このため、出力に合わせて縮めたあとのステップが伸び遅れない。</li>
+        <li><strong>上限と床（floor）：</strong><code>dt.max_s</code> は利用者が課す上限（<a href="../use/namelist.html#terms-deck">デッキ（deck）</a>で指定しないときの既定は \(10^{-9}\) s、<a href="../use/gui.html">Studio</a> の既定は \(2\times10^{-12}\) s）。\(\Delta t\) が<a href="numerics-foundations.html#floors-safety">床</a> <code>dt.min_s</code>（指定しないときの既定は \(10^{-20}\) s、Studio の既定は \(10^{-22}\) s）を下回ったときの扱いは<a href="#stall">床・失速の扱い</a>の節に述べる。</li>
+        <li><strong>初期値：</strong><code>dt.initial_s</code>（指定しないときの既定は \(10^{-15}\) s、Studio の既定は \(10^{-14}\) s）は最初のステップだけで使う（前ステップが存在せず、成長率制限を適用できないため）。最初のステップの \(\Delta t\) は、<code>initial_s</code> と、成長率制限を除く各上限との最小値である。<code>initial_s</code> に <code>None</code> を指定すると、<code>initial_s</code> の代わりに流体の \(\Delta t\) の 0.1 倍（流体が無効なら <code>dt.max_s</code>）を使う。2 ステップ目以降は <code>initial_s</code> を無視する。再開（restart）では、チェックポイントに保存された成長の基準（<code>time_state/dt_growth_ref</code>）から続ける。</li>
         <li><strong>出力への着地と終端：</strong>時間間隔ベースの出力が有効なら、次の出力時刻を飛び越えないよう \(\Delta t_{output}\) を候補に含める（<a href="#output-landing">後述</a>）。残り時間 \(t_{end}-t\) も同様である。</li>
-        <li><strong>再試行：</strong>全ステップ再試行が有効な構成で流体の修正段が棄却されると、入口のスナップショットへ戻り、\(\Delta t\) を半分にして分割の列全体をやり直す（<a href="numerics-foundations.html">数値基盤</a>参照）。このとき limiter は <code>driver_retry</code> と記録される。</li>
+        <li><strong>再試行：</strong><a href="numerics-foundations.html#terms-retry">全ステップの再試行（full-step retry）</a>が有効な構成（<code>Numerics.hydro.driver_full_step_retry_enabled</code>。デッキで指定しないときの既定は False、Studio が書き出す 1D のデッキでは True（2D のデッキには書かない）。1 ステップあたりの再試行の上限は <code>driver_full_step_retry_max_attempts</code>、既定 3 回）では、流体の修正段（corrector stage）、核燃焼、輻射、熱伝導のいずれかがステップの試行を受理せず棄却（reject）するとき、入口のスナップショットへ戻って \(\Delta t\) を縮め、<a href="numerics-foundations.html#operator-splitting">演算子分割</a>（operator splitting）の列全体をやり直す。縮める幅は棄却した判定で決まる。多くは半分で、2D の幾何の判定（<a href="#hydro-guards">試行体積の床</a>など）と 2D の核燃焼（<a href="#source-dt">後追い制限</a>）は、その判定が求める幅にする。やり直したステップで \(\Delta t\) を決めた制約は <code>driver_retry</code> と記録される。</li>
       </ul>
-      <p>採用された \(\Delta t\) がどの候補と一致したか — <code>hydro</code>、<code>conduction</code>、<code>burn</code>、<code>hot_electron</code>、<code>braginskii</code>、<code>radiation</code>、<code>growth</code>、<code>output</code>、<code>t_end</code>、<code>max</code>、<code>init</code>、<code>driver_retry</code> — が limiter 名としてログに出る（<code>Main.verbosity="verbose"</code> のとき、毎ステップの <code>[dt_breakdown]</code> 行）。「\(\Delta t\) がどんどん小さくなる」ときは、まずこの名前を見て律速カーネルを特定するのが定石である（<a href="#observing">観測手段</a>参照）。<code>mesh_mode="reale_v2"</code> の実行では、リゾーン確定直後の 1 ステップに限り、成長率制限を超えて \(\Delta t\) を引き上げたことを表す <code>rezone_reanchor</code> が履歴の <code>dt_winner</code> に現れることもある（<a href="../physics/mesh/ale-remap.html#reale-reanchor">ALE ページ</a>参照）。</p>
+      <p>採用された \(\Delta t\) がどの候補と一致したか（\(\Delta t\) を決めた制約）は、次の名前で記録される。<code>hydro</code>、<code>conduction</code>、<code>burn</code>、<code>hot_electron</code>、<code>mixed_cell</code>、<code>braginskii</code>（粘性）、<code>growth</code>、<code>output</code>、<code>t_end</code>、<code>max</code>、<code>init</code>（最初のステップの <code>dt.initial_s</code>）、<code>driver_retry</code> である。複数の候補が同じ値のとき、<code>driver_retry</code> を先頭に、ここに挙げた順（<code>hydro</code> から <code>init</code> まで）で最初に一致した名前を記録する。どれにも一致しないときは <code>unknown</code> と記録する。名前は、ログ（<code>Main.verbosity="verbose"</code> のとき、毎ステップの <code>[dt_breakdown]</code> 行の <code>dt_winner=</code>）と履歴の <code>dt_winner</code> にある。「\(\Delta t\) がどんどん小さくなる」ときは、まずこの名前を見て、\(\Delta t\) を決めているカーネルを特定する（<a href="#observing">観測手段</a>参照）。<code>mesh_mode="reale_v2"</code> の実行では、リゾーン（rezone）確定直後の 1 ステップに限り、成長率制限を超えて \(\Delta t\) を引き上げたことを表す <code>rezone_reanchor</code> が履歴の <code>dt_winner</code> に記録されることもある（ログの <code>[dt_breakdown]</code> 行には現れない。<a href="../physics/mesh/ale-remap.html#reale-reanchor">ALE（arbitrary Lagrangian–Eulerian、任意ラグランジュ・オイラー法）のページ</a>参照）。</p>
       <p>MPI 実行では各 CFL の \(\min_c\) はランク局所のセルに対して計算され、ランク局所の \(\Delta t\) を 1 回の <code>MPI_Allreduce(MPI_MIN)</code> で全ランク共通の値にする。時刻・出力予定時刻は全ランクで同一に保たれるため、\(\Delta t_{output}\) に追加の通信は要らない。</p>
     </section>
 
@@ -57,77 +57,94 @@
       <p>各行の式の導出と文脈は、それぞれのカーネルページにある。ここでは「何が・どの式で・どの既定係数で」制限するかを一覧する。</p>
       <table class="quick-facts">
         <thead>
-          <tr><th>カーネル</th><th>提案する上限</th><th>主要な既定値</th><th>備考</th></tr>
+          <tr><th>物理カーネル</th><th>提案する上限</th><th>主要な既定値</th><th>備考</th></tr>
         </thead>
         <tbody>
-          <tr><th><a href="../physics/hydrodynamics.html">流体</a></th><td>\(C_{CFL}\min_c[\Delta l_c/(|\mathbf u_c|+c_{s,c})]\)</td><td><code>cfl_hydro</code> = 0.3</td><td>音響 CFL。\(\Delta l_c\) は 1D でセル幅、2D で \(\sqrt{A_c}\)。<a href="#hydro-guards">保護族は後述</a>。</td></tr>
-          <tr><th><a href="../physics/conduction.html">電子熱伝導</a></th><td>STS: \(\dfrac{s_{max}(s_{max}+1)}{2}\Delta t_{exp}\)<br>陰解法・Hypre: \(\infty\)</td><td>\(C_{cond}\)（<code>cfl_cond</code>）= 0.25、<code>sts_max_stages</code> = 40</td><td>\(\Delta t_{exp}=C_{cond}\min_c[(\Delta l_c)^2/D_{eff,c}]\)。既定では陽的限界の 820 倍まで緩和。</td></tr>
-          <tr><th><a href="../physics/radiation/index.html">輻射</a></th><td>FLD・S<sub>N</sub>: \(\infty\)</td><td>—</td><td>輻射は大域 \(\Delta t\) を制約しない。Fleck 因子の下限から導く上限は、退役したモンテカルロ輻射とともに 2026-09-29 に外した（<code>Numerics.dt.f_min_fleck</code> は受理して無視する）。</td></tr>
-          <tr><th><a href="../physics/viscosity.html">Braginskii 粘性</a></th><td>\(\texttt{dt\_safety}\cdot\dfrac{\rho\,\Delta l^2}{(8/3)\,\eta_{\rm eff}}\)</td><td><code>dt_safety</code> = 0.3</td><td>陽的な運動量拡散の安定限界。粘性有効時のみ。</td></tr>
-          <tr><th><a href="../physics/burn.html">核燃焼</a></th><td>\(0.9\,\Delta t\,M_{max}/M_{req}\) と \(f_E\,e_{cell}/P_{dep}\) の min</td><td><code>explicit_source_limit</code> = 0.2</td><td>前ステップの燃焼段が計算した後追い型の制限。部分サイクル逼迫と自己加熱の双方を抑える。</td></tr>
-          <tr><th><a href="../physics/hot-electrons.html">ホット電子</a></th><td>\(f_E\min_{P_i>0}(m_ie_{e,i}/P_i)\)</td><td><code>explicit_source_limit</code> = 0.2</td><td>前ステップの付与パワーからの後追い型の制限。</td></tr>
+          <tr><th><a href="../physics/hydrodynamics.html">流体</a></th><td>\(C_{CFL}\min_c[\Delta l_c/(c_{s,c}+w_c)]\)</td><td><code>cfl_hydro</code> = 0.3</td><td>音響 CFL。\(\Delta l_c\) は 1D でセル幅、2D で \(\sqrt{A_c}\)、\(w_c\) は人工粘性（artificial viscosity）が加える速さで、分母に流速は入らない。これに加わる制約は<a href="#hydro-guards">後述</a>。</td></tr>
+          <tr><th><a href="../physics/conduction.html">電子熱伝導</a></th><td>STS: \(\dfrac{s_{max}(s_{max}+1)}{2}\Delta t_{exp}\)<br>電子の陰解法（1D の <code>"implicit"</code>、2D の <code>"dmp_implicit"</code>）: \(\infty\)</td><td>\(C_{cond}\)（<code>cfl_cond</code>）= 0.25、<code>sts_max_stages</code> = 40</td><td>1D は \(\Delta t_{exp}=C_{cond}\min_c[(\Delta l_c)^2/D_{eff,c}]\)、2D は \(\Delta t_{exp}=4C_{cond}/\lambda_G\)（<a href="#conduction-dt">熱伝導の節</a>）。既定では陽的限界の 820 倍まで緩和。2D のイオン熱伝導（<code>conduction.ion_conduction</code>）は独自の上限を加える。</td></tr>
+          <tr><th><a href="../physics/radiation/index.html">輻射</a></th><td>FLD・S<sub>N</sub>: \(\infty\)</td><td>—</td><td>輻射は大域 \(\Delta t\) を制約しない（<a href="#radiation-dt">輻射の節</a>）。<code>Numerics.dt.f_min_fleck</code> は受理するが無視する。</td></tr>
+          <tr><th><a href="../physics/viscosity.html">Braginskii 粘性</a></th><td>\(\texttt{dt_safety}\cdot\dfrac{\rho\,\Delta l^2}{(8/3)\,\eta_{\rm eff}}\)</td><td><code>Numerics.hydro.<wbr>plasma_viscosity.<wbr>dt_safety</code> = 0.3</td><td>陽的な運動量拡散（momentum diffusion）の安定限界。粘性が有効なとき（<code>Numerics.hydro.plasma_viscosity.enabled</code>）だけ働く。</td></tr>
+          <tr><th><a href="../physics/burn.html">核燃焼</a></th><td>1D: \(0.9\,\Delta t\,M_{max}/M_{req}\)（部分サイクル数が上限に達したときだけ）と \(f_E\,e_{cell}/P_{dep}\) の小さい方<br>2D: \(0.9\,M_{max}\,\epsilon_{dep}/r\) と \(f_E\,e_{cell}/P_{dep}\) の小さい方</td><td><code>Burn.explicit_source_limit</code> = 0.2、<code>Burn.subcycle_max</code> = 64、<code>Burn.eps_deplete</code> = 0.1</td><td>前ステップの燃焼段が計算した後追い型の制限（記号は<a href="#source-dt">後述</a>）。部分サイクル数の逼迫と自己加熱（self-heating）の双方を抑える。2D では、部分サイクル数が上限を超えたステップは棄却して再試行する。</td></tr>
+          <tr><th><a href="../physics/hot-electrons.html">ホット電子</a></th><td>\(f_E\min_{P_i>0}(m_ie_{e,i}/P_i)\)</td><td><code>Laser.hot_electron.<wbr>explicit_source_limit</code> = 0.2</td><td>前ステップの沈着パワーからの後追い型の制限。</td></tr>
           <tr><th><a href="../physics/laser.html">レーザー</a></th><td>なし</td><td>—</td><td>吸収は流体 \(\Delta t\) の内側で処理されるため独立の制約を持たない（NUMERICS §2.2 (d)）。</td></tr>
           <tr><th><a href="../physics/cbet.html">CBET</a></th><td>なし</td><td>—</td><td>レーザー呼び出しの内部で解くため独立の制約を持たない。</td></tr>
-          <tr><th><a href="../physics/conduction.html#snb">SNB</a></th><td>なし</td><td>—</td><td>iSNB ピカール連成は収束時に無条件安定（伝導ページ参照）。</td></tr>
-          <tr><th><a href="../physics/mesh/ale-remap.html">ALE</a></th><td>直接は提案しない</td><td>—</td><td>発動はトリガ制で、\(\Delta t\) には流体側の保護（軸マージン・メッシュ品質）を通じて間接的に効く。</td></tr>
+          <tr><th><a href="../physics/conduction.html#snb">SNB</a></th><td>なし</td><td>—</td><td>SNB（Schurtz–Nicolaï–Busquet の非局所モデル）の iSNB（implicit SNB）ピカール反復（Picard iteration）は、収束したとき無条件安定（unconditionally stable）である（<a href="../physics/conduction.html#snb">伝導ページ</a>参照）。</td></tr>
+          <tr><th><a href="../physics/mesh/ale-remap.html">ALE</a></th><td>直接は提案しない</td><td>—</td><td>発動はトリガ（trigger）制で、\(\Delta t\) には流体側の追加の制約（<a href="../physics/mesh/index.html#terms-axis-margin">軸マージン（axis margin）</a>・メッシュ品質）を通じて間接的に効く。</td></tr>
+          <tr><th>混合セルの圧力緩和（2D）</th><td>\(\Delta t_{h}\,f_{mix}/\delta_{max}\)</td><td><code>Numerics.materials.<wbr>mixed_cell_volume_change_limit</code> = 0.2</td><td>後追い型。複数の材料が 1 つのセルに共存する混合セルで、直前の流体ステップにおける材料の体積の相対変化の最大値 \(\delta_{max}\) から決める（記号は<a href="#mixed-cell-dt">後述</a>）。</td></tr>
         </tbody>
       </table>
     </section>
 
     <section aria-labelledby="hydro-guards">
-      <h2 id="hydro-guards">流体 CFL とその保護族</h2>
-      <p>基本形は音響 CFL である。情報（音波と物質の運動）が 1 ステップでセルを飛び越えないことを要求する。</p>
+      <h2 id="hydro-guards">流体 CFL と追加の制約</h2>
+      <p>基本形は音響 CFL である。情報（音波と物質の運動）が 1 ステップでセルを飛び越えないことを要求する。ラグランジュ段ではメッシュが物質とともに動くので、分母に流速は入らない。</p>
       $$
-      \Delta t_{hydro}=C_{CFL}\cdot\min_c\!\left(\frac{\Delta l_c}{|\mathbf u_c|+c_{s,c}}\right),
+      \Delta t_{acoustic}=C_{CFL}\cdot\min_c\!\left(\frac{\Delta l_c}{c_{s,c}+w_c}\right),
       \qquad C_{CFL}=0.3\;(\text{既定})
       $$
-      <p>\(\Delta l_c\) はセル代表長で、1D ではセル幅 \(\Delta r_i\)、2D では子午面セル面積の平方根 \(\sqrt{A_c}\) である。min は <a href="numerics-foundations.html#hydro-active">hydro が活性なセル</a>だけを対象とし、\(c_s=0\) のセル（未加熱のフィル領域など）は \(\Delta t_{hydro}\to\infty\) 相当として他セルに律速を委ねる。全セルが非活性なら流体は制約から外れる。1D では分母に人工粘性の項も加わり、一次の項 \(C_1c_s\) は人工粘性が働く圧縮中のセルにだけ加える。</p>
-      <p>この基本形に、構成に応じて次の保護が加わる。いずれも \(\Delta t\) を縮める方向（またはリゾーンの強制）にのみ働く。</p>
+      <p>\(\Delta l_c\) はセル代表長（cell length scale）で、1D ではセル幅 \(\Delta r_i\)、2D では子午面（meridian plane）のセル面積の平方根 \(\sqrt{A_c}\) である。\(c_{s,c}\) はセルの音速、\(w_c\) は人工粘性が分母に加える速さである。1D の VNR（von Neumann–Richtmyer）形式と CSW（Caramana–Shashkov–Whalen）形式（<code>av_type</code> が <code>vnr</code> か <code>csw</code>）では \(w_c=C_1c_{s,c}+C_2\,\Delta l_c\,\chi_c\)、2D では \(w_c=C_1c_{s,c}\) とする。ここで \(C_1\)・\(C_2\) は人工粘性の線形項・2 次項の係数（1D では、<code>av_type</code> が <code>vnr</code> なら <code>av_linear</code> = 0.1・<code>av_quadratic</code> = 1.5、<code>csw</code> なら <code>csw_C1</code> = 0.5・<code>csw_C2</code> = 2.0。2D では <code>av_linear</code> で、デッキで省略したときの既定は、2D RZ の CSW 辺モデル（2D RZ のデッキで <code>av_model</code> も省略したときを含む）で 1.0、それ以外で 0.1）、\(\chi_c\) は節点速度の傾きを制限して再構成したセル端の速度から作ったセルの圧縮率 [1/s] である。1D の \(C_1c_s\) の項は、人工粘性が働く圧縮中のセルにだけ加える。1D のリーマン（Riemann）形式（<code>riemann</code>、<code>riemann_compatible</code>）では、\(w_c\) に圧縮側の節点速度の跳びが入る。min は <a href="numerics-foundations.html#hydro-active">hydro が活性なセル</a>だけを対象とし、\(c_s=0\) のセル（未加熱のフィル領域（fill region）など）は \(\Delta t_{hydro}\to\infty\) 相当として、他のセルが \(\Delta t_{hydro}\) を決める。全セルが非活性なら流体は制約から外れる。</p>
+      <p>この基本形に、構成に応じて次の制約が加わる。いずれも \(\Delta t\) を縮める方向（またはリゾーンの強制）にのみ働く。1D では、これらを合わせた上限が \(\Delta t_{hydro}=\min(\Delta t_{acoustic},\Delta t_{cross},\Delta t_H,\Delta t_{ps})\) になる。</p>
       <ul>
-        <li><strong>post-shock heat（1D、opt-in）：</strong><code>post_shock_heat=True</code> のとき、陽的に解く衝撃波後面の熱流束の安定制約 \(\Delta t_{ps}\) を評価し、\(\Delta t_{hydro}=\min(\Delta t_{acoustic+AV},\Delta t_{ps})\) とする。</li>
-        <li><strong>軸マージン（2D、opt-in）：</strong><code>axis_margin_dt_floor_fraction&gt;0</code> のとき、軸近傍セルの余裕から導いた縮小側制約を \(\Delta t_{hydro}\) に含める。既定 0.0 では無効で、既存の hydro \(\Delta t\) とビット単位で同一である。</li>
-        <li><strong>体積変化率 CFL（2D、opt-in）：</strong><code>volume_rate_cfl_enabled=True</code> のとき、直前の流体ステップで実測したセル体積の相対変化率 \(r_{V,c}=f_{V,c}/\Delta t_{used}\) から、次ステップを \(\min_c(f_{V,max}/r_{V,c})\)（\(f_{V,max}\) は 1 ステップに許す相対変化 <code>volume_rate_cfl_threshold</code>）で頭打ちにする。標準の \(|v|/\Delta x\) 型 CFL が過小評価しうる「源駆動の体積変化」への 1 ステップ遅れの安全網であり、受理された ALE の直後は基準体積をリセットして ALE 変位を流れと誤認しない。</li>
-        <li><strong>試行体積フロア（2D、opt-in）：</strong><code>trial_volume_cfl_enabled=True</code> のとき、修正子が確定させる直前の試行体積が \(V_c^{trial}\ge f_{trial}V_c^n\) を満たすかを検査し、違反時は推奨再試行幅 \(f_{shrink}\Delta t\) を警告する。全ステップ再試行が無効な既定では警告だけでステップはやり直さず、再試行が有効なら違反は全ステップの再試行を要求する。</li>
-        <li><strong>コーナーヤコビアン ALE トリガ（2D、opt-in）：</strong><code>corner_jacobian_ale_trigger_enabled=True</code> のとき、候補 \(\Delta t_*\) に沿った試行軌道 \(\mathbf x^n+\tau\mathbf v^n\) 上で符号付きコーナーヤコビアンが下限 \(\epsilon_JJ^n_{c,k}\) を割り込む時刻を二分法で探し、許容できる倍率がしきい値未満なら、演算子分割へ入る前に ALE リゾーンを強制する。\(\Delta t\) を直接は縮めない。</li>
-        <li><strong>再試行時の静的メッシュ修復（2D、opt-in）：</strong><code>driver_retry_active_mesh_repair_enabled=True</code> のとき、再試行の各回でコーナーヤコビアンの均衡度 \(q_{bal,c}=\min_kJ_{c,k}/\max_kJ_{c,k}\) を検査し、不許容なら強制リゾーンを行ってから再試行する。</li>
+        <li><strong>節点交差（node crossing）の上限（1D、既定で有効）：</strong><code>Numerics.hydro.crossing_dt_safety</code>（\(C_{cross}\)、既定 0.5。0 で無効）が正のとき、面が閉じていく（\(u_i&gt;u_{i+1}\)）セルについて \(\Delta t_{cross}=C_{cross}\min_i[\Delta r_i/(u_i-u_{i+1})]\) を加える。\(u_i\) は節点 \(i\) の速度である。1 ステップで面がセル幅の \(C_{cross}\) 倍を超えて進まないようにする上限で、音速が 0 に近い冷たい圧縮のように音響 CFL の分母が 0 に近づくときに、節点の交差を防ぐ。<code>cfl_hydro</code> は掛けない。</li>
+        <li><strong>人工熱流束（artificial heat flux）の上限（1D、VNR 形式、既定で無効）：</strong><code>Numerics.hydro.av_heat_C</code>（\(C_H\)、既定 0）が正で <code>av_type="vnr"</code> のとき、人工熱流束の陽的な安定条件 \(\Delta t_H=0.5\,m_i/\sum_fG_f\) を加える。\(m_i\) はセル質量、和はセルの 2 つの面にわたり、\(G_f=A_fC_H\rho_fl_f\chi_f\) は面 \(f\) のコンダクタンスである（\(A_f\) は面積、\(\rho_f\)・\(l_f\) は両側のセルの密度・幅の平均、\(\chi_f\) は両側の圧縮率の大きい方）。</li>
+        <li><strong>衝撃波後面の熱流束（post-shock heat。1D、既定で無効）：</strong><code>post_shock_heat=True</code>（既定 False）のとき、最近衝撃波を通ったセルだけに人工熱流束 \(H^{ps}=-C_{ps}\rho\,c_s\,l\,\psi\,\partial e_{tot}/\partial r\) を加える（\(C_{ps}\) は <code>post_shock_heat_C</code>、既定 0.1。\(e_{tot}=e_e+e_i\) はセルの全比内部エネルギー、\(l\) は面の両側のセル幅の平均）。\(\psi=\exp[-(t-t_{shock})/\tau]\) は、衝撃波の通過からの経過を表す重みである。\(t_{shock}\) は、そのセルの人工粘性の圧力が全セルの最大値の 1 % を超えた最後の時刻、\(\tau=C_{decay}\Delta r/c_s\) は減衰の時間（\(C_{decay}\) は <code>post_shock_heat_decay</code>、既定 3.0）である。この熱流束を陽的に解くため、安定条件 \(\Delta t_{ps}=0.5\,m_i/\sum_fG_f\)（\(G_f=A_fC_{ps}\rho_fc_{s,f}\psi_f\)。面の \(\rho_f\)・\(c_{s,f}\)・\(\psi_f\) は両側のセルの平均）を評価し、\(\Delta t_{hydro}\) に含める。</li>
+        <li><strong><a href="../physics/mesh/index.html#terms-axis-margin">軸マージン</a>の上限（2D、既定で無効）：</strong><code>axis_margin_dt_floor_fraction</code>（\(f_{axis}\)、既定 0.0）が正のとき、軸に接するセル行の軸マージン \(M_j\)（その行が節点の移動で反転しないための幾何的な余裕。単位 cm²）が、ステップ開始時の値 \(M_j^n\) の \(f_{axis}\) 倍を割り込まない最大の \(\Delta t\) を二分法（bisection）で求め、\(\Delta t_{hydro}\) の上限に含める。既定 0.0 では無効で、既存の hydro \(\Delta t\) とビット単位で同一である。</li>
+        <li><strong>体積変化率 CFL（volume-rate CFL。2D、既定で無効）：</strong><code>volume_rate_cfl_enabled=True</code>（既定 False）のとき、直前の流体ステップで実測したセル体積の相対変化 \(f_{V,c}=|V_c^{new}-V_c^{old}|/V_c^{old}\) を、そのステップの長さ \(\Delta t_{used}\) で割った相対変化率 \(r_{V,c}=f_{V,c}/\Delta t_{used}\) から、次のステップを \(\min_c(f_{V,max}/r_{V,c})\) で頭打ちにする（\(f_{V,max}\) は 1 ステップに許す相対変化 <code>volume_rate_cfl_threshold</code>、既定 0.5）。音響 CFL が過小評価しうる「源駆動の体積変化」への 1 ステップ遅れの安全網であり、受理された ALE の直後は基準体積をリセットして ALE 変位を流れと誤認しない。</li>
+        <li><strong><a href="../physics/mesh/index.html#terms-admissibility">試行体積の床（trial-volume floor）</a>（2D、既定で無効）：</strong><code>trial_volume_cfl_enabled=True</code>（既定 False）のとき、流体の修正段が節点位置を確定させる直前に、全セルの試行体積 \(V_c^{trial}\)（確定させようとする節点位置から求めたセル体積）が \(V_c^{trial}\ge f_{trial}V_c^n\) を満たすかを検査する（\(V_c^n\) はステップ開始時の体積、\(f_{trial}\) は <code>trial_volume_cfl_floor_fraction</code>、既定 0.05）。違反したときは、推奨する再試行の刻み \(f_{shrink}\Delta t\)（\(f_{shrink}\) は <code>trial_volume_cfl_shrink_fraction</code>、既定 0.5）を警告する。全ステップの再試行が無効な構成では警告だけでステップはやり直さず、有効な構成では違反が全ステップの再試行を要求する。</li>
+        <li><strong><a href="../physics/mesh/index.html#terms-corner-jacobian">コーナーヤコビアン（corner Jacobian）</a>の ALE トリガ（2D、既定で無効）：</strong><code>corner_jacobian_ale_trigger_enabled=True</code>（既定 False）のとき、候補の \(\Delta t_*\) について、節点が現在の速度で動く試行軌道 \(\mathbf x^n+\tau\mathbf v^n\)（\(0\le\tau\le\Delta t_*\)）を考える。この軌道上で、セル \(c\) の角 \(k\) のコーナーヤコビアン \(J_{c,k}\)（符号付き。角に接する 2 辺のベクトルの 2 次元の外積）が、ステップ開始時の値 \(J^n_{c,k}\) の \(\epsilon_J\) 倍（\(\epsilon_J\) は <code>corner_jacobian_floor_eps</code>、既定 \(10^{-6}\)）を割り込む最初の \(\tau\) を、二分法で探す。\(\Delta t_*\) のうち割り込まずに進める割合 \(\tau/\Delta t_*\)（全コーナーの最小）が <code>corner_jacobian_ale_trigger_scale</code>（既定 0.5）未満なら、演算子分割に入る前に ALE のリゾーンを強制する（<a href="../physics/mesh/ale-remap.html#cycle-triggers">ALE の発動条件</a>）。\(\Delta t\) を直接は縮めない。</li>
+        <li><strong>再試行時の静的メッシュ修復（static mesh repair at retry。2D、既定で無効）：</strong><code>driver_retry_active_mesh_repair_enabled=True</code>（既定 False。全ステップの再試行と ALE が有効なときに働く）のとき、ステップ入口（\(\tau=0\)）のコーナーヤコビアンだけを使う判定を、再試行の各回に行う。判定が \(\Delta t\) に依らないので「静的」という。4 つのコーナーヤコビアンがすべて正で有限なセルについて、均衡度（corner balance）\(q_{bal,c}=\min_kJ_{c,k}/\max_kJ_{c,k}\) を求める。\(q_{bal,c}\) が <code>driver_retry_corner_balance_threshold</code>（既定 0.01）を下回るセルがあるか、コーナーヤコビアンが 0 以下か有限でないセルがあるとき、判定は不許容となる。不許容なら、ALE のリゾーンを強制してから再試行する。最初の試行では判定を記録するだけで、リゾーンは強制しない。</li>
       </ul>
-      <p>このほか、メッシュ品質（最小高さ・コーナーヤコビアン）の保護判定が予測的に時間刻みを制限しうることは<a href="../physics/mesh/index.html">メッシュと幾何</a>のページに述べたとおりである。観測面では、hydro \(\Delta t\) の内訳（acoustic・axis_margin・volume_rate・post_shock）を<a href="#observing">後述の dt 内訳診断</a>で分離して記録できる。</p>
+      <p>このほか、メッシュ品質（最小高さ・コーナーヤコビアン）の許容性（admissibility）の判定が、予測的に時間刻みを制限しうることは<a href="../physics/mesh/index.html#terms-admissibility">メッシュと幾何</a>のページに述べたとおりである。観測面では、hydro \(\Delta t\) の内訳（acoustic・axis_margin・volume_rate・post_shock）を<a href="#observing">後述の dt 内訳診断</a>で分離して記録できる。</p>
     </section>
 
     <section aria-labelledby="conduction-dt">
       <h2 id="conduction-dt">熱伝導：STS による緩和と陰解法</h2>
-      <p>陽的な拡散の安定限界そのものは</p>
+      <p>陽的な拡散の安定限界そのものは、1D では</p>
       $$
       \Delta t_{exp}=C_{cond}\cdot\min_c\!\left(\frac{(\Delta l_c)^2}{D_{eff,c}}\right),
       \qquad C_{cond}=0.25\;(\text{既定})
       $$
-      <p>だが、既定の STS ソルバ（<code>conduction.solver="sts"</code>）はこの値を大域 \(\Delta t\) に直接は要求しない（\(D_{eff}\) は実効熱拡散率 — <a href="../physics/conduction.html">伝導</a>参照）。STS は \(s\) 段のチェビシェフ段列で安定領域を \(O(s^2)\) に広げるため、大域 \(\Delta t\) への提案は段数上限 \(s_{max}\)（<code>sts_max_stages</code>、既定 40）まで緩和した</p>
+      <p>である（\(\Delta l_c\) はセル幅、\(D_{eff}\) は実効熱拡散率 — <a href="../physics/conduction.html">伝導</a>参照）。2D では、組み上げた伝導演算子の固有値の上界 \(\lambda_G\)（Gershgorin の円板定理（Gershgorin circle theorem）による。単位 1/s）から</p>
+      $$
+      \Delta t_{exp}=\frac{4\,C_{cond}}{\lambda_G}
+      $$
+      <p>とする。既定の STS ソルバ（<code>conduction.solver="sts"</code>）は、この値を大域 \(\Delta t\) に直接は要求しない。STS は \(s\) 段のチェビシェフ段列（Chebyshev stage sequence）で安定領域を \(O(s^2)\) に広げるため、大域 \(\Delta t\) への提案は段数上限 \(s_{max}\)（<code>sts_max_stages</code>、既定 40）まで緩和した</p>
       $$
       \Delta t_{cond}=\frac{s_{max}(s_{max}+1)}{2}\,\Delta t_{exp}
       $$
-      <p>である。既定では \(40\times41/2=820\) 倍で、多くの構成では熱伝導は律速から外れる。仮に \(\Delta t_{exp}\) 自体を大域 min に入れると \(N_{sub}=\lceil\Delta t/\Delta t_{exp}\rceil=1\) が常に成立してサブサイクリングが無効化される、という設計上の矛盾を避けるための形である。陰解法（1D の <code>"implicit"</code>、2D の <code>"hypre"</code>）は後退オイラーで無条件安定なので \(\Delta t_{cond}=\infty\) とし、伝導は大域 \(\Delta t\) を制約しない。</p>
+      <p>である。既定では \(40\times41/2=820\) 倍で、多くの構成では熱伝導は \(\Delta t\) を決めない。この上限には、STS がステップを分けるときの安全係数 \(\eta\)（<code>sts_subcycle_eta</code>、既定 0.9）が入っていない。そのため、伝導が \(\Delta t\) を決めるステップでは、STS は 1 ステップを \(n_{sup}=2\) 個の大ステップ（superstep）に分け、既定では各 29 段、計 58 段で \(820\,\Delta t_{exp}\) を進める（大ステップと段の定義は<a href="../physics/conduction.html#terms-sts">伝導ページの用語の節</a>）。2D で <code>sts_scheme="rkl2"</code> を選ぶと、チェビシェフの段列の代わりに 2 次のルンゲ–クッタ–ルジャンドル法（Runge–Kutta–Legendre method、RKL2）の段列を使い、上限の倍率が変わる（既定の <code>sts_max_stages</code> = 40、<code>cfl_cond</code> = 0.25 では 779 倍）。<code>"auto"</code> は上限の計算にチェビシェフの倍率を使う。</p>
+      <p>電子の陰解法（1D の <code>"implicit"</code>、2D RZ の <code>"dmp_implicit"</code>）は後退オイラー法（backward Euler method）で無条件安定なので \(\Delta t_{cond}=\infty\) とし、電子の伝導は大域 \(\Delta t\) を制約しない。<code>"dmp_implicit"</code> は、離散最大値原理（discrete maximum principle）を満たす非線形な 2 点流束を使う、2D RZ の電子伝導の後退オイラー法である（<a href="../physics/conduction.html">伝導ページ</a>のキーの表）。<code>"hypre"</code> は陰解法として実行されない（2D では入力検査が拒否し、1D では警告を出して STS で解く）ので、STS の上限を使う。イオン熱伝導（<code>conduction.ion_conduction</code>）は、1D では陰解法で上限を持たない。2D では電子とは別に、同じ形の STS の上限を加える（<code>"dmp_implicit"</code> では電子の上限が \(\infty\) なので、イオンの上限だけが残る）。</p>
     </section>
 
     <section aria-labelledby="radiation-dt">
       <h2 id="radiation-dt">輻射：大域 Δt を制約しない</h2>
-      <p>輻射と物質の結合は Fleck 線形化（<a href="../physics/radiation/fld.html">FLD ページ</a>参照）の Fleck 因子</p>
+      <p>FLD は輻射と物質の結合を Fleck 線形化（Fleck linearization。<a href="../physics/radiation/fld.html">FLD ページ</a>参照）で陰的に解く。Fleck 因子（Fleck factor）は</p>
       $$
       f_c=\frac{1}{1+\alpha\,c\,\beta_c\,\sigma_{P,c}\,\Delta t},\qquad
       \beta_c=\frac{4a_{\rm eV}T_{e,c}^3}{C_{v,e,c}},\qquad
       \sigma_{P,c}=\rho_c\kappa_{P,c}
       $$
-      <p>で特徴づけられる。\(\alpha\) は Fleck 線形化の時間中心化パラメータで、FLD と S<sub>N</sub> では 1（完全陰的）である。\(\Delta t\) が大きいほど \(f_c\) は小さくなり、刻み内の放出・再吸収を実効散乱として表す割合が増える。FLD と S<sub>N</sub> は \(f_c\) に下限を課さない（FLD は硬いセルの極限を保つため）ので、輻射は大域 \(\Delta t\) の候補を出さない。</p>
-      <p>下限 \(f_{min}\)（<code>Numerics.dt.f_min_fleck</code>、既定 0.01）を割らないように \(\Delta t_{rad}=\min_c[(1-f_{min})/f_{min}\cdot 1/(\alpha c\,\beta_c\sigma_{P,c})]\) で刻みを制限していたのは、退役したモンテカルロ輻射（<code>Radiation.mode="imc_ddmc"</code>）である。FLD と S<sub>N</sub> では 2026-09-15 から常に ∞ で、2026-09-29 にモンテカルロ輻射とともに時間刻みの候補と履歴の <code>dt_rad</code> から外した。<code>Numerics.dt.f_min_fleck</code> は受理して WARNING を出し、無視する。</p>
+      <p>である。\(\alpha\) は Fleck 線形化の時間中心化（time centering）のパラメータで、FLD では 1（完全陰的、fully implicit）である。\(\Delta t\) が大きいほど \(f_c\) は小さくなり、刻み内の放出・再吸収を実効散乱（effective scattering）として表す割合が増える。FLD は \(f_c\) に下限を課さない（硬い（stiff）セルの極限を保つため）ので、輻射は大域 \(\Delta t\) の候補を出さない。S<sub>N</sub> は Fleck 線形化を使わず（\(f=1\)）、物質との結合をニュートン反復（Newton iteration）などで陰的に解く。この場合も輻射は \(\Delta t\) の候補を出さない。</p>
+      <p><code>Numerics.dt.f_min_fleck</code> は、旧版のモンテカルロ輻射（Monte Carlo radiation）が Fleck 因子の下限として使ったキーである。現行の版は受理するが効果がなく、警告を出す。</p>
     </section>
 
     <section aria-labelledby="source-dt">
       <h2 id="source-dt">陽的な源による後追い制限：燃焼・ホット電子・粘性</h2>
       <p>核燃焼とホット電子は「そのステップで沈着したパワー」を根拠に、<em>次の</em>ステップへの上限を残す後追い型である。ステップ内で温度を更新し直さない陽的な源が、1 ステップで内部エネルギーの蓄えを使い尽くさないようにする制限で、いずれも係数は <code>explicit_source_limit</code>（既定 0.2、各ブロックに同名キー）である。</p>
       <ul>
-        <li><strong>核燃焼：</strong>\(\Delta t\le f_E\,e_{cell}/P_{dep}\)（\(e_{cell}=\rho_cV_c(e_e+e_i)\) はセルの全内部エネルギー）に加え、部分サイクル数が上限 \(M_{max}\) に張り付いた場合は \(0.9\,\Delta t\,M_{max}/M_{req}\) を次ステップへ反映する（<a href="../physics/burn.html">核燃焼ページ</a>）。</li>
+        <li><strong>核燃焼：</strong>全セルにわたる \(f_E\,e_{cell}/P_{dep}\) の最小値が、次のステップの上限になる（\(f_E\) は <code>Burn.explicit_source_limit</code>、\(e_{cell}=\rho_cV_c(e_e+e_i)\) はセルの全内部エネルギー、\(P_{dep}\) はそのセルへの核燃焼による沈着パワー [erg/s]）。これに加えて、部分サイクル数に対する制限がある。反応網（reaction network）は 1 ステップを \(M_{req}\) 個の部分サイクルに分ける必要があるとし、\(M_{req}\) が上限 \(M_{max}\)（<code>Burn.subcycle_max</code>）を超えたとき、1D ではそのステップを上限のまま進め、次のステップの上限に \(0.9\,\Delta t\,M_{max}/M_{req}\) を入れる。2D ではそのステップを受理せず、入口の状態へ戻して、\(\Delta t\) を全セルの最小の \(0.9\,\Delta t\,M_{max}/M_{req}\) にしてやり直す（全ステップの再試行が無効なら停止する）。2D の次のステップの上限には、ステップ末の反応網の相対反応率 \(r\) から決まる \(0.9\,M_{max}\,\epsilon_{dep}/r\) も入る（\(\epsilon_{dep}\) は <code>Burn.eps_deplete</code>、既定 0.1。\(r\) は、各反応物について総生成率と総消費率の大きい方をその存在量で割った値の最大 [1/s]。<a href="../physics/burn.html">核燃焼ページ</a>）。</li>
         <li><strong>ホット電子：</strong>\(\Delta t\le f_E\min_{P_i&gt;0}(m_ie_{e,i}/P_i)\)。蓄えとして電子エネルギーだけを使う点が燃焼側（電子+イオン）と違う（<a href="../physics/hot-electrons.html">ホット電子ページ</a>）。</li>
-        <li><strong>Braginskii 粘性：</strong>こちらは後追いではなく、ステップ冒頭にその場で評価する陽的拡散の安定限界 \(\Delta t_{visc}\le\texttt{dt\_safety}\cdot\rho\Delta l^2/[(8/3)\eta_{\rm eff}]\) である（<a href="../physics/viscosity.html">粘性ページ</a>）。</li>
+        <li><strong>Braginskii 粘性：</strong>こちらは後追いではなく、ステップ冒頭にその場で評価する陽的拡散の安定限界 \(\Delta t_{visc}\le\texttt{dt_safety}\cdot\rho\Delta l^2/[(8/3)\eta_{\rm eff}]\) である（<a href="../physics/viscosity.html">粘性ページ</a>）。</li>
       </ul>
+    </section>
+
+    <section aria-labelledby="mixed-cell-dt">
+      <h2 id="mixed-cell-dt">混合セルの圧力緩和による後追い制限（2D）</h2>
+      <p>2D で <code>Numerics.materials.per_material_conservation_enabled=True</code> かつ <code>Numerics.materials.mixed_cell_closure="pressure_relaxation"</code> のとき、複数の材料が 1 つのセルに共存する混合セルでは、材料ごとの体積と圧力を持たせ、圧力を緩和させながら体積を配分する（リポジトリの <code>docs/NUMERICS.md</code> §3.2.10b）。硬い材料と軟らかい材料が共存するセルでは、軟らかい材料の体積がセル全体よりずっと速く変わりうるので、次の上限を課す。</p>
+      $$
+      \Delta t_{mixed}=\Delta t_{h}\,\frac{f_{mix}}{\delta_{max}}
+      $$
+      <p>ここで \(\Delta t_{h}\) は直前の流体ステップの長さ（流体は 1 ステップに半ステップを 2 回行うので、前ステップの \(\Delta t\) の半分。<a href="numerics-foundations.html#operator-splitting">演算子分割</a>参照）、\(\delta_{max}\) はそのステップで混合セルのいずれかの材料の体積が変わった割合（相対変化）の最大値、\(f_{mix}\) は <code>Numerics.materials.mixed_cell_volume_change_limit</code>（既定 0.2。0 より大きく 1 より小さい）である。混合セルが無いとき、または別のクロージャ（closure。既定の <code>"equal_compressibility"</code>）のときは \(\infty\) である。直前のステップから決まる後追い型で、\(\Delta t\) を決めた制約としては <code>mixed_cell</code> と記録される。</p>
     </section>
 
     <section aria-labelledby="output-landing">
@@ -136,22 +153,22 @@
       $$
       \Delta t_{output}=\min\bigl(t_{next,plot}-t,\;t_{next,history}-t,\;t_{next,ckpt}-t\bigr)
       $$
-      <p>を候補に含める（有効な系列だけを min に入れ、すべて無効なら \(\infty\)）。出力の判定には浮動小数点許容差 \(\varepsilon=10^{-14}\times\max(|t|,X\_every\_s)\) を使い、\(t\ge t_{next}-\varepsilon\) で発火する。発火後は while ループで \(t_{next}\) を \(X\_every\_s\) 刻みに前進させるので、極端な設定（\(\Delta t\) が出力間隔より大きい）でも予定時刻を取りこぼさない。初期値は \(t_{start}+X\_every\_s\)、リスタート時はチェックポイントの <code>output_state/</code> から復元する。\(\Delta t_{output}\) は常に縮小方向にのみ働くため、安定性を害することはない。</p>
+      <p>を候補に含める（有効な系列だけを min に入れ、すべて無効なら \(\infty\)）。出力の判定には浮動小数点許容差（floating-point tolerance）\(\varepsilon=10^{-14}\times\max(|t|,X\_every\_s)\) を使い、\(t\ge t_{next}-\varepsilon\) で発火する。\(\Delta t_{output}\) の各項は、予定時刻までの残り \(t_{next}-t\) が \(2\varepsilon\) と \(2\,\texttt{dt.min_s}\) の大きい方より小さいときは、その大きい方にする（\(\Delta t\) が床を割らず、予定時刻を確実にまたぐため）。発火後は while ループで \(t_{next}\) を \(X\_every\_s\) 刻みに前進させるので、極端な設定（\(\Delta t\) が出力間隔より大きい）でも予定時刻を取りこぼさない。初期値は \(t_{start}+X\_every\_s\)、再開時はチェックポイントの <code>output_state/</code> から復元する。\(\Delta t_{output}\) は常に縮小方向にのみ働くため、安定性を害することはない。</p>
     </section>
 
     <section aria-labelledby="stall">
       <h2 id="stall">床・失速の扱い</h2>
-      <p>\(\Delta t&lt;\texttt{dt.min\_s}\)（既定 \(10^{-20}\) s）になった場合は FATAL 停止する。黙って極小ステップを刻み続ける「見かけ上動いているが進まない」状態を作らないためである。さらに opt-in の失速検出器 <code>Numerics.dt.floor_stall_max_consecutive_steps=N</code>（既定 0 = 無効）で \(N\) を正にすると、コミットされたステップのうち (i) \(\Delta t\) が床の \(1+10^{-6}\) 倍以下、(ii) 残り時間が床の \(10^3\) 倍超、(iii) limiter が <code>output</code>/<code>t_end</code> でない、をすべて満たすものを連続カウントし、\(N\) 回を超えた時点で診断（床値・現在の \(\Delta t\)・残り時刻・limiter・無効化方法）付きで FATAL 停止する。</p>
+      <p>\(\Delta t&lt;\texttt{dt.min_s}\)（指定しないときの既定は \(10^{-20}\) s）になったステップが <code>Numerics.dt.min_consecutive_steps</code>（既定 1）回連続すると、FATAL 停止する。既定では最初の 1 回で停止する。黙って極小ステップを刻み続ける失速（stall）、つまり「見かけ上動いているが進まない」状態を作らないためである。回数に満たないあいだは、警告を出して \(\Delta t\) を床まで引き上げて続ける（床より小さい物理側の上限があれば、その上限まで）。停止しない主な場合は次の 2 つである。(a) \(\Delta t\) を決めた制約が <code>growth</code> で、流体の \(\Delta t\) は床以上のとき（再試行で縮めたあとの回復）は、\(\Delta t\) を床まで引き上げて続ける。(b) 最後の着地、つまり採用した \(\Delta t\) が残り時間 \(t_{end}-t\) に等しいときは、床の検査を免除する。さらに、既定で無効の失速検出器（stall detector）<code>Numerics.dt.floor_stall_max_consecutive_steps=N</code>（既定 0 = 無効）で \(N\) を正にすると、受理したステップのうち (i) \(\Delta t\) が床の \(1+10^{-6}\) 倍以下、(ii) 残り時間が床の \(10^3\) 倍超、(iii) \(\Delta t\) を決めた制約が <code>output</code>/<code>t_end</code> でない、をすべて満たすものを連続カウントし、\(N\) 回を超えた時点で診断（床の値・現在の \(\Delta t\)・残り時刻・\(\Delta t\) を決めた制約・無効化の方法）付きで FATAL 停止する。</p>
     </section>
 
     <section aria-labelledby="observing">
-      <h2 id="observing">どの制約が勝ったかを観測する</h2>
+      <h2 id="observing">\(\Delta t\) を決めた制約を観測する</h2>
       <ul>
         <li><strong>履歴の <code>/dt</code>：</strong>採用された \(\Delta t\) の時系列は常に <code>&lt;case&gt;_history.h5</code> に記録される（<a href="../use/outputs.html">出力と解析</a>）。</li>
-        <li><strong>ログの limiter 名：</strong><code>Main.verbosity="verbose"</code> で実行すると、実行ログの <code>[dt_breakdown]</code> 行に、そのステップの \(\Delta t\) と勝った制約の名前（<code>dt_winner=</code>）が毎ステップ出る。まずここを見る。</li>
-        <li><strong>dt 内訳診断（既定で有効）：</strong><code>Numerics.diagnostics.dt_breakdown_history_enabled</code>（既定 True）が有効なら、履歴に <code>diagnostics/dt_breakdown_history/</code> が毎ステップ書かれ（1D で毎ステップ書くのはこの群と後述の <code>diagnostics/cfl_winner/</code> だけで、他の系列の行は <code>Output.history_every</code> に従う）、<code>dt_chosen</code>・<code>dt_hydro</code>・<code>dt_cond</code>・<code>dt_post_shock</code>・<code>dt_growth</code>・<code>dt_max</code>・<code>dt_output</code>・<code>dt_remaining</code> と、hydro 内訳（acoustic・axis_margin・volume_rate）、勝者名 <code>dt_winner</code> を記録する（2026-09-29 まであった <code>dt_rad</code> の列は、退役したモンテカルロ輻射の上限の列で、削除した）。あわせて <code>diagnostics/cfl_winner/</code> が音響 CFL の勝者セル（位置・\(\Delta l\)・\(c_s\)・\(\rho\)）を残す。</li>
+        <li><strong>ログの制約名：</strong><code>Main.verbosity="verbose"</code> で実行すると、実行ログの <code>[dt_breakdown]</code> 行に、そのステップの \(\Delta t\) と、\(\Delta t\) を決めた制約の名前（<code>dt_winner=</code>）が毎ステップ出る。まずここを見る。</li>
+        <li><strong>dt 内訳診断（既定で有効）：</strong><code>Numerics.diagnostics.dt_breakdown_history_enabled</code>（既定 True）が有効なら、履歴に <code>diagnostics/dt_breakdown_history/</code> が毎ステップ書かれ（1D で毎ステップ書くのはこの群と後述の <code>diagnostics/cfl_winner/</code> だけで、他の系列の行は <code>Output.history_every</code> に従う）、<code>dt_chosen</code>・<code>dt_hydro</code>・<code>dt_cond</code>・<code>dt_post_shock</code>・<code>dt_growth</code>・<code>dt_max</code>・<code>dt_output</code>・<code>dt_remaining</code> と、hydro 内訳（acoustic・axis_margin・volume_rate）、\(\Delta t\) を決めた制約の名前 <code>dt_winner</code> を記録する（旧版の履歴にある <code>dt_rad</code> の列は、旧版のモンテカルロ輻射の上限で、現行の版は書かない）。あわせて <code>diagnostics/cfl_winner/</code> が、音響 CFL の最小を与えるセル（位置・\(\Delta l\)・\(c_s\)・\(\rho\)）を残す。</li>
       </ul>
-      <p>典型的な読み方：律速が <code>hydro</code> で <code>cfl_winner</code> が特定セルに張り付くなら、そのセルの格子（つぶれ・微小セル）か音速（過熱・床）を疑う。<code>conduction</code> ならコロナの \(D_{eff}\) 急増（<a href="../physics/conduction.html">伝導ページ</a>の κ∝\(T^{5/2}\)）、<code>growth</code> が続くだけなら単に立ち上がり中である。</p>
+      <p>典型的な読み方：\(\Delta t\) を決めた制約が <code>hydro</code> で <code>cfl_winner</code> が特定セルに張り付くなら、そのセルの格子（つぶれ・微小セル）か音速（過熱・床）を疑う。<code>conduction</code> ならコロナの \(D_{eff}\) 急増（<a href="../physics/conduction.html">伝導ページ</a>の κ∝\(T^{5/2}\)）、<code>growth</code> が続くだけなら単に立ち上がり中である。</p>
     </section>
 
     <div id="page-footer"></div>

@@ -13,7 +13,7 @@
   <main>
     <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
     <h1>TENRYU を使う</h1>
-    <p class="abstract">この節は、要求環境の確認からビルド、最初の実行、Python namelist デッキの記述 (または TENRYU Studio による生成)、HDF5 出力の読み取りまでの実用ワークフロー全体を扱う。以下のクイックスタートと順路に沿えば、この節のページだけで最初の 1 本を完走できる。</p>
+    <p class="abstract">この節は、要求環境の確認からビルド、最初の実行、<a href="namelist.html#terms-deck">デッキ</a>（deck。TENRYU の入力となる 1 個の Python ファイル）の記述、または GUI アプリ <a href="gui.html">TENRYU Studio</a> による生成、HDF5 出力の読み取りまでの実用ワークフロー全体を扱う。以下のクイックスタートと順路に沿えば、この節のページだけで最初の 1 本を完走できる。</p>
 
     <section aria-labelledby="quickstart">
       <h2 id="quickstart">クイックスタート（コピーして実行）</h2>
@@ -42,12 +42,12 @@ python3 -m tools.tenryu_plot profile outputs/template_1d_slab_radiation</code></
     <h2>ワークフローガイド</h2>
     <div class="card-grid">
       <a class="card" href="requirements.html"><h3>動作環境と要求スペック</h3><p>GPU・コンパイラ・ライブラリの要求と、事前チェックのコマンド。</p></a>
-      <a class="card" href="building.html"><h3>ビルド</h3><p>CUDA のリリースビルドの構成、テスト、MPI と ccache の有効化を説明する。</p></a>
+      <a class="card" href="building.html"><h3>ビルド</h3><p>CUDA のリリースビルドの構成、テスト、MPI（Message Passing Interface）と ccache の有効化を説明する。</p></a>
       <a class="card" href="running.html"><h3>シミュレーションの実行</h3><p>テンプレートの完走、デッキの書き方、validate/run/verify/freeze、トラブル対処。</p></a>
       <a class="card" href="namelist.html"><h3>namelist リファレンス</h3><p>最上位のブロック、代表的なキー、単位、正典となる既定値へ案内する。</p></a>
       <a class="card" href="gui.html"><h3>TENRYU Studio (GUI)</h3><p>フォーム形式のデスクトップアプリでデッキを作成、検証、保存、実行する。</p></a>
       <a class="card" href="examples.html"><h3>例題とプリセット</h3><p>実行可能なテンプレート、検証済みの Studio プリセット、検証用のデッキ集。</p></a>
-      <a class="card" href="outputs.html"><h3>出力と解析</h3><p>3 種の HDF5 ファイルのグループと主なデータセット、来歴ファイル、その読み方を示す。</p></a>
+      <a class="card" href="outputs.html"><h3>出力と解析</h3><p>3 種の HDF5 ファイルのグループと主なデータセット、来歴（provenance。実行が受け取った設定・実行の要約・ログ）のファイル、その読み方を示す。</p></a>
     </div>
 
     <aside class="planned" aria-labelledby="first-run">
@@ -56,10 +56,10 @@ python3 -m tools.tenryu_plot profile outputs/template_1d_slab_radiation</code></
         <li><a href="requirements.html">動作環境と要求スペック</a>で GPU・ツールチェーンの前提を確認する。</li>
         <li><a href="building.html">ビルド</a>で、バイナリと <code>ctest</code> の通る環境を作る。</li>
         <li><a href="running.html">シミュレーションの実行</a>の手順どおり、テンプレートを validate → run で完走させる。</li>
-        <li><a href="examples.html">例題とプリセット</a>の検証済みプリセット — まずは球殻の直接照射爆縮 <code>laser_shell_implosion</code> — を、配布された条件のまま実行する。</li>
-        <li><a href="outputs.html">出力と解析</a>に沿って結果を読む。吸収率はエネルギーの台帳（入射と沈着の比）から、爆縮のピークはステップごとの履歴 <code>implosion/rho_peak</code> から読み取る。</li>
+        <li><a href="examples.html">例題とプリセット</a>の検証済みプリセット — まずは球殻の直接照射（direct drive）爆縮（implosion） — を、プリセットの条件のまま実行する。<code>laser_shell_implosion</code> は <code>examples/</code> のデッキではなく、<a href="gui.html">TENRYU Studio</a> のプリセット「球殻の直接照射爆縮 (GXII 級)」が書き出すデッキの名前（<code>Main.name</code>）である。Studio を<a href="gui.html#obtain-launch">入手して起動</a>し、このプリセットを適用してデッキを保存したのち、保存したデッキを <code>./build/tenryu run</code> に渡す。</li>
+        <li><a href="outputs.html">出力と解析</a>に沿って結果を読む。吸収率は、履歴の <code>energy/</code> にある<a href="../overview/numerics-foundations.html#energy-ledger">エネルギー台帳</a>（energy ledger。系のエネルギー変化を、レーザーの入射や境界からの流出などの出入りと突き合わせて積算した記録）の <code>laser_deposited</code> を <code>laser_incident</code> で割って求め、爆縮のピークはステップごとの履歴 <code>implosion/rho_peak</code> から読み取る。</li>
       </ol>
-      <p>物理の詳細が必要になったら<a href="../physics/index.html">物理カーネル</a>の該当ページへ。各ページの「物理機構」の節が、式に入る前の背景を説明する。時間刻みの決まり方は<a href="../overview/timestep.html">時間刻み制御と CFL</a> にまとめてある。</p>
+      <p>物理の詳細が必要になったら、物理演算子ごとの頁である<a href="../physics/index.html">物理カーネル</a>の該当ページへ。各ページの「物理機構」の節が、式に入る前の背景を説明する。時間刻みの決まり方は、CFL（Courant–Friedrichs–Lewy）条件を含めて<a href="../overview/timestep.html">時間刻み制御と CFL</a>にまとめてある。</p>
     </aside>
 
     <div id="page-footer"></div>

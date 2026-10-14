@@ -18,23 +18,23 @@
     <aside class="planned" aria-labelledby="at-a-glance">
       <h3 id="at-a-glance">要点</h3>
       <ul>
-        <li>必須: NVIDIA GPU + CUDA Toolkit 12.x（12.0 以上）、C++20 コンパイラ（GCC 12+ / Clang 15+）、CMake 3.27+、Ninja、Python 3.10+（開発ヘッダ含む）。</li>
-        <li>既定ビルドの CUDA アーキテクチャは、構成時に <code>nvidia-smi</code> で検出したローカル GPU の世代である（GPU が見えないホストでは <code>70;80;89;90</code>、すなわち Volta/Ampere/Ada/Hopper の fatbin）。継続的に検証している実機は A100（40/80 GB）・RTX 4090・RTX 3090 である。</li>
-        <li>MPI と Hypre は opt-in（既定 OFF）。HDF5 と Python は既定 ON。テスト・ログ・CLI・Python バインディングの小依存（Catch2・spdlog・CLI11・pybind11）は未導入なら CMake 構成時に自動取得される — オフライン環境では事前導入が要る。</li>
+        <li>必須: NVIDIA GPU + CUDA Toolkit 12.x（12.0 以上）、C++20 コンパイラ（GCC 12+ / Clang 15+）、CMake 3.27+、Ninja、Python 3.10+（開発ヘッダ含む）、Boost のヘッダ。</li>
+        <li>既定ビルドの CUDA アーキテクチャは、構成時に <code>nvidia-smi</code> で検出したローカル GPU の世代である（GPU が見えないホストでは <code>70;80;89;90</code>、すなわち Volta/Ampere/Ada/Hopper の 4 世代向けの機械語を 1 つにまとめた fatbin）。継続的に検証している実機は A100（40/80 GB）・RTX 4090・RTX 3090 である。</li>
+        <li>MPI（Message Passing Interface）と Hypre（線形ソルバのライブラリ）は任意（既定 OFF）。HDF5 と Python は既定 ON。現行版には Hypre を使う計算の経路が無いので、Hypre は通常は要らない。テスト・ログ・CLI・Python バインディングの小依存（Catch2・spdlog・CLI11・pybind11）は未導入なら CMake 構成時に自動取得される — オフライン環境では事前導入が要る。Boost のヘッダは自動取得されず、常に事前導入が要る。</li>
         <li>開発・検証の実績はすべて Linux x86_64 上である。他 OS は未検証。</li>
       </ul>
     </aside>
 
     <section aria-labelledby="platform">
       <h2 id="platform">プラットフォームと GPU</h2>
-      <p>対応バックエンドは NVIDIA CUDA のみである（HIP 等の他バックエンドは設計上の非対象）。GPU がなければビルドはできても実行はできない。基本の実行形態は 1 プロセス = 1 GPU で、単一 GPU なら MPI なしで動く。複数 GPU は MPI ビルド（後述）で 1 ランク = 1 GPU として使う。</p>
+      <p>対応バックエンドは NVIDIA CUDA のみである。HIP（AMD の GPU 向けのプログラミング環境）など、他のバックエンドは設計上の非対象である。GPU がなければビルドはできても実行はできない。基本の実行形態は 1 プロセス = 1 GPU で、単一 GPU なら MPI なしで動く。複数 GPU は MPI ビルド（後述）で 1 ランク（rank。MPI のプロセス）= 1 GPU として使う。</p>
       <table class="quick-facts">
         <thead><tr><th>項目</th><th>要求 / 既定</th><th>備考</th></tr></thead>
         <tbody>
           <tr><th>GPU ベンダ</th><td>NVIDIA のみ</td><td>CUDA 専用。他ベンダ GPU・CPU 単独実行は非対応。</td></tr>
           <tr><th>GPU アーキテクチャ</th><td>既定: 構成時に検出したローカル GPU（GPU が見えなければ fatbin <code>70;80;89;90</code>）</td><td><code>CMAKE_CUDA_ARCHITECTURES</code> で変更可。理論上の下限は倍精度 <code>atomicAdd</code> が要る compute capability 6.0+（ARCHITECTURE §2.2）。sm_86（RTX 30 系）は sm_80 バイナリの前方互換で動く。</td></tr>
           <tr><th>検証済みの実機</th><td>A100 40/80 GB、RTX 4090（24 GB）、RTX 3090（24 GB）</td><td>回帰・ベンチマークを継続実行している構成。VRAM の必要量は格子規模に依存する — 1D の基準問題は小さく、大規模 2D ほど要る。</td></tr>
-          <tr><th>OS</th><td>Linux x86_64（実績）</td><td>開発・CI 相当の検証・本番実行はすべて Linux。他 OS は未検証。</td></tr>
+          <tr><th>OS</th><td>Linux x86_64（実績）</td><td>開発・CI（continuous integration、継続的インテグレーション）相当の検証・本番実行はすべて Linux。他 OS は未検証。</td></tr>
           <tr><th>GPU ドライバ</th><td>CUDA 12.x 対応版</td><td><code>nvidia-smi</code> が表示する CUDA Version が 12.x 以上であること。</td></tr>
         </tbody>
       </table>
@@ -42,27 +42,27 @@
 
     <section aria-labelledby="toolchain">
       <h2 id="toolchain">ツールチェーンとライブラリ</h2>
-      <p>最低バージョンの正典はリポジトリの <code>docs/ARCHITECTURE.md</code> §2.2（CMake のみ最上位の <code>CMakeLists.txt</code>）である。要求は主に「必須」「既定 ON（外せるが通常は使う）」「opt-in」の三層に分かれ、ほかにテスト用・内部依存・解析用の依存がある。</p>
+      <p>最低バージョンの正典はリポジトリの <code>docs/ARCHITECTURE.md</code> §2.2（CMake のみ最上位の <code>CMakeLists.txt</code>）である。要求は主に「必須」「既定 ON（外せるが通常は使う）」「任意（既定 OFF）」の三層に分かれ、ほかにテスト用・内部依存・解析用の依存がある。</p>
       <table class="quick-facts">
         <thead><tr><th>依存</th><th>最低バージョン</th><th>層</th><th>役割・注意</th></tr></thead>
         <tbody>
-          <tr><th>CUDA Toolkit</th><td>12.0+</td><td>必須</td><td><code>nvcc</code>・ランタイム・cuSPARSE。cuRAND device API（Philox4x32-10）と NVTX（NVIDIA Tools Extension、プロファイル用の注釈）はツールキット同梱でリンク不要。</td></tr>
+          <tr><th>CUDA Toolkit</th><td>12.0+</td><td>必須</td><td><code>nvcc</code>・ランタイム・cuSPARSE・cuSOLVER・cuBLAS。cuRAND device API（Philox4x32-10）と NVTX（NVIDIA Tools Extension、プロファイル用の注釈）はツールキット同梱でリンク不要。</td></tr>
           <tr><th>C++ コンパイラ</th><td>GCC 12+ / Clang 15+</td><td>必須</td><td>C++20 対応が条件（<code>nvcc</code> のホストコンパイラとして使う）。</td></tr>
           <tr><th>CMake</th><td>3.27+</td><td>必須</td><td>構成・依存検出・CTest。</td></tr>
           <tr><th>Ninja</th><td>—</td><td>必須</td><td>ビルド実行系（本ドキュメントの手順は <code>-GNinja</code> 前提）。</td></tr>
-          <tr><th>Python 3 + 開発ヘッダ</th><td>3.10+</td><td>既定 ON</td><td>namelist（入力デッキ）を初期化時に読む埋め込みインタプリタ。<code>python3-dev</code> 相当が必要。</td></tr>
-          <tr><th>numpy / matplotlib / h5py</th><td>—</td><td>解析用（任意）</td><td>付属の解析ツール <code>tools.tenryu_plot</code> が使う。本体のビルド・実行には不要。</td></tr>
-          <tr><th>pybind11</th><td>2.11+</td><td>既定 ON</td><td>namelist → Config 変換。未導入なら自動取得。</td></tr>
-          <tr><th>HDF5</th><td>1.12+</td><td>既定 ON</td><td>スナップショット・履歴・チェックポイントの入出力。ファイルはすべてランク 0 が書くので、逐次版の HDF5 で足りる。並列版（<code>--enable-parallel</code>）も使えるが、そのときはリンクに MPI が要る。</td></tr>
-          <tr><th>MPI</th><td>3.1+</td><td>opt-in（<code>-DTENRYU_ENABLE_MPI=ON</code>）</td><td>複数ランク実行。GPU-aware MPI 推奨（なければホスト経由で中継）。</td></tr>
-          <tr><th>Hypre</th><td>2.25+</td><td>opt-in（<code>-DTENRYU_ENABLE_HYPRE=ON</code>）</td><td>熱伝導の <code>solver="hypre"</code>（BoomerAMG+PCG）用。<code>--with-cuda --with-gpu-aware-mpi</code> でビルドされた Hypre が必要。</td></tr>
-          <tr><th>AmgX</th><td>—</td><td>opt-in（自動検出）</td><td>2D FLD の線形ソルバ選択肢。<code>find_package(amgx)</code> が見つかれば既定で有効。</td></tr>
+          <tr><th>Boost（Multiprecision のヘッダ）</th><td>指定なし（1.83 で検証）</td><td>必須</td><td><code>boost/multiprecision/cpp_int.hpp</code> だけを使い、Boost のライブラリのビルドは要らない。CMake は版を検査しない。2D の ALE（arbitrary Lagrangian–Eulerian、任意ラグランジュ・オイラー法）の<a href="../physics/mesh/ale-remap.html">リマップ</a>で、多角形の厳密な切り取りと、その体積・モーメントの参照計算、および総和の順序に依らない厳密な和に使う（いずれも任意精度の整数・有理数）。1D だけを使う場合でも、CMake が構成時にこのヘッダを探し、見つからなければ構成が止まる。自動取得はしない。標準の場所に無いときは、<code>-DTENRYU_EXACT_GEOMETRY_BOOST_INCLUDE_DIR=&lt;dir&gt;</code>（<code>&lt;dir&gt;/boost/multiprecision/cpp_int.hpp</code> がある include ディレクトリ）で指定する。Debian/Ubuntu ではパッケージ <code>libboost-dev</code> で導入できる。</td></tr>
+          <tr><th>Python 3 + 開発ヘッダ</th><td>3.10+</td><td>既定 ON</td><td><a href="namelist.html#terms-deck">デッキ</a>（deck。TENRYU の入力となる 1 個の Python ファイル）を初期化時に読む埋め込みインタプリタ。<code>python3-dev</code> 相当が必要。</td></tr>
+          <tr><th>numpy / matplotlib / h5py</th><td>—</td><td>解析用</td><td>付属の解析ツール <code>tools.tenryu_plot</code> が使う。本体のビルド・実行には不要。</td></tr>
+          <tr><th>pybind11</th><td>2.11+</td><td>既定 ON</td><td>デッキから <code>Config</code>（C++ の設定構造体）への変換。未導入なら自動取得。</td></tr>
+          <tr><th>HDF5</th><td>1.12+</td><td>既定 ON</td><td><a href="outputs.html">スナップショット・履歴・チェックポイント</a>の入出力。ファイルはすべてランク 0 が書くので、逐次版の HDF5 で足りる。並列版（<code>--enable-parallel</code>）も使えるが、そのときはリンクに MPI が要る。</td></tr>
+          <tr><th>MPI</th><td>3.1+</td><td>任意（<code>-DTENRYU_ENABLE_MPI=ON</code>）</td><td>複数ランク実行。GPU-aware MPI 推奨（なければホスト経由で中継）。</td></tr>
+          <tr><th>Hypre</th><td>2.25+</td><td>任意（<code>-DTENRYU_ENABLE_HYPRE=ON</code>）</td><td>線形ソルバのライブラリ。現行版には Hypre を使う計算の経路が無く、ON にすると Hypre がリンクされるだけである。ON のビルドでは、熱伝導の <code>solver="hypre"</code> は 1D で警告のうえ<a href="../physics/conduction.html#sts">スーパータイムステッピング（super-time-stepping、STS）</a>で解かれる。OFF のビルドと 2D では、入力検査が拒否する。ON のとき CMake は、CUDA 対応でビルドした Hypre（<code>HYPRE_config.h</code> に <code>HYPRE_USING_CUDA</code> があること）を要求する。</td></tr>
           <tr><th>spdlog (fmt 同梱)</th><td>1.12+ (fmt 9.0+)</td><td>内部依存</td><td>ログ系。未導入なら自動取得（fmt は spdlog の同梱版を使う）。</td></tr>
           <tr><th>Catch2</th><td>3.0+</td><td>テスト用</td><td><code>ctest</code> の単体・統合テスト。未導入なら自動取得。</td></tr>
           <tr><th>CLI11</th><td>2.4+</td><td>内部依存</td><td><code>run/verify/validate/freeze</code> のサブコマンド CLI。未導入なら自動取得。</td></tr>
         </tbody>
       </table>
-      <p><strong>ネットワークについて。</strong>Catch2・spdlog・CLI11・pybind11 はシステムに見つからない場合、CMake の FetchContent が構成時にダウンロードする。したがって初回の <code>cmake</code> はインターネット接続があると楽である。オフライン環境（計算機センターの計算ノード等）では、これらをあらかじめ導入するか、ネットワークのあるログインノードで構成を済ませること。CUDA・HDF5・Python・MPI・Hypre は自動取得の対象外で、常に事前導入が要る。</p>
+      <p><strong>ネットワークについて。</strong>Catch2・spdlog・CLI11・pybind11 はシステムに見つからない場合、CMake の FetchContent が構成時にダウンロードする。したがって初回の <code>cmake</code> はインターネット接続があると楽である。オフライン環境（計算機センターの計算ノード等）では、これらをあらかじめ導入するか、ネットワークのあるログインノードで構成を済ませること。CUDA・Boost のヘッダ・HDF5・Python・MPI・Hypre は自動取得の対象外で、常に事前導入が要る。</p>
     </section>
 
     <section aria-labelledby="cmake-options">
@@ -71,19 +71,19 @@
         <thead><tr><th>オプション</th><th>既定</th><th>意味</th></tr></thead>
         <tbody>
           <tr><th><code>CMAKE_CUDA_ARCHITECTURES</code></th><td>検出したローカル GPU（GPU が見えなければ <code>70;80;89;90</code>）</td><td>生成する GPU 機械語（SASS）の対象世代。GPU が見えないホストで構成するときは、実行する GPU 1 種に絞るとビルドが速くなる（例: RTX 4090 なら <code>89</code>）。</td></tr>
-          <tr><th><code>TENRYU_ENABLE_HDF5</code></th><td><code>ON</code></td><td>HDF5 入出力。OFF では出力・リスタートが使えない。</td></tr>
-          <tr><th><code>TENRYU_ENABLE_PYTHON</code></th><td><code>ON</code></td><td>Python namelist の読込。OFF では <code>.py</code> デッキを読めない。</td></tr>
+          <tr><th><code>TENRYU_ENABLE_HDF5</code></th><td><code>ON</code></td><td>HDF5 入出力。OFF では出力・再開（restart）が使えない。</td></tr>
+          <tr><th><code>TENRYU_ENABLE_PYTHON</code></th><td><code>ON</code></td><td>デッキ（Python ファイル）の読込。OFF では <code>.py</code> のデッキを読めない。</td></tr>
           <tr><th><code>TENRYU_ENABLE_MPI</code></th><td><code>OFF</code></td><td>複数ランク実行。単一 GPU 利用なら OFF のままでよい。</td></tr>
-          <tr><th><code>TENRYU_ENABLE_HYPRE</code></th><td><code>OFF</code></td><td>熱伝導の陰的ソルバ経路。</td></tr>
+          <tr><th><code>TENRYU_ENABLE_HYPRE</code></th><td><code>OFF</code></td><td>Hypre のリンク。Hypre を使う計算の経路は無い（上の表を参照）。</td></tr>
           <tr><th><code>TENRYU_ENABLE_NVTX</code></th><td><code>OFF</code></td><td>プロファイル計装（Nsight 用）。</td></tr>
-          <tr><th><code>TENRYU_ENABLE_AMGX</code></th><td>自動（検出時 ON）</td><td>2D FLD の AmgX ソルバ。</td></tr>
+          <tr><th><code>TENRYU_EXACT_GEOMETRY_BOOST_INCLUDE_DIR</code></th><td>標準の場所を探す</td><td>Boost のヘッダ <code>boost/multiprecision/cpp_int.hpp</code> がある include ディレクトリ。標準の場所に無いときに指定する。</td></tr>
         </tbody>
       </table>
     </section>
 
     <section aria-labelledby="preflight">
       <h2 id="preflight">事前チェックの実行例</h2>
-      <p>ビルドに入る前に、次の 4 つが通れば必須要件はほぼ満たしている。</p>
+      <p>ビルドに入る前に、次の 5 つが通れば必須要件はほぼ満たしている。</p>
       <pre><code># GPU とドライバ（CUDA Version が 12.x 以上であること）
 nvidia-smi
 
@@ -96,7 +96,10 @@ ninja --version
 
 # Python（3.10 以上・開発ヘッダの有無）
 python3 --version
-python3 -c "import sysconfig, pathlib; p = pathlib.Path(sysconfig.get_paths()['include'], 'Python.h'); print(p, 'OK' if p.exists() else 'MISSING')"</code></pre>
+python3 -c "import sysconfig, pathlib; p = pathlib.Path(sysconfig.get_paths()['include'], 'Python.h'); print(p, 'OK' if p.exists() else 'MISSING')"
+
+# Boost のヘッダ（標準の場所にある場合。他の場所に置いたときは、その場所を CMake に指定する）
+ls /usr/include/boost/multiprecision/cpp_int.hpp</code></pre>
       <p>ここまで確認できたら<a href="building.html">ビルド</a>のページへ進む。CMake の構成段階で「パッケージが見つからない」と出た場合の対処も同ページにある。</p>
     </section>
 
