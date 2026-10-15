@@ -343,6 +343,27 @@ a:hover {
   display: none;
 }
 
+.nav-top-link {
+  display: block;
+  padding: 0.6rem 0.65rem;
+  border-radius: 0.35rem;
+  color: var(--text-soft);
+  font-size: 0.78rem;
+  font-weight: 750;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.nav-top-link:hover {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+.nav-top-link.active {
+  color: var(--accent-strong);
+  background: var(--nav-active-bg);
+}
+
 .nav-link {
   display: block;
   margin: 0.08rem 0;

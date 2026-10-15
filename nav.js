@@ -267,11 +267,46 @@
     if (themeSlot && window.TenryuTheme) window.TenryuTheme.mountToggle(themeSlot, lang);
   }
 
+  // Sidebar groups that the reader has opened, keyed by the id of the group's
+  // first page (the same in both languages). Every group starts closed, and
+  // following a link keeps each group as the reader left it.
+  const NAV_OPEN_KEY = "tenryu-docs-nav-open";
+
+  function readOpenGroups() {
+    try {
+      const value = JSON.parse(window.localStorage.getItem(NAV_OPEN_KEY) || "[]");
+      return new Set(Array.isArray(value) ? value.filter((key) => typeof key === "string") : []);
+    } catch (err) {
+      return new Set();
+    }
+  }
+
+  function writeOpenGroups(openGroups) {
+    try {
+      window.localStorage.setItem(NAV_OPEN_KEY, JSON.stringify([...openGroups]));
+    } catch (err) {
+      /* storage unavailable: the state lasts until the page is left */
+    }
+  }
+
   function renderSidebar() {
     const target = document.getElementById("sidebar");
     if (!target) return;
 
+    const openGroups = readOpenGroups();
     const groups = NAV_TREE.map((group, groupIndex) => {
+      // A group with a single page is that page: a top-level link, no toggle.
+      if (group.pages.length === 1) {
+        const page = group.pages[0];
+        const active = page.id === currentPageId;
+        return `
+        <section class="nav-group nav-single">
+          <a class="nav-top-link${active ? " active" : ""}" href="${hrefFromRoot(page.href)}"${active ? ' aria-current="page"' : ""}>${group.title}</a>
+        </section>`;
+      }
+
+      const key = group.pages[0].id;
+      const open = openGroups.has(key);
       const groupHasActivePage = group.pages.some((page) => page.id === currentPageId);
       const links = group.pages.map((page) => {
         const active = page.id === currentPageId;
@@ -279,8 +314,8 @@
       }).join("");
 
       return `
-        <section class="nav-group${groupHasActivePage ? " active-group" : ""}">
-          <button class="nav-group-toggle" type="button" aria-expanded="true" aria-controls="nav-group-${groupIndex}">
+        <section class="nav-group${open ? "" : " collapsed"}${groupHasActivePage ? " active-group" : ""}" data-group="${key}">
+          <button class="nav-group-toggle" type="button" aria-expanded="${open}" aria-controls="nav-group-${groupIndex}">
             <span>${group.title}</span><span class="nav-chevron" aria-hidden="true">▾</span>
           </button>
           <div class="nav-pages" id="nav-group-${groupIndex}">${links}</div>
@@ -293,6 +328,10 @@
         const group = button.closest(".nav-group");
         const collapsed = group.classList.toggle("collapsed");
         button.setAttribute("aria-expanded", String(!collapsed));
+        const stored = readOpenGroups();
+        if (collapsed) stored.delete(group.dataset.group);
+        else stored.add(group.dataset.group);
+        writeOpenGroups(stored);
       });
     });
   }
