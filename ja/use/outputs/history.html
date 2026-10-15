@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="ja" data-lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>履歴 — TENRYU ドキュメント</title>
+  <link rel="stylesheet" href="../../../style.css">
+  <script src="../../../theme.js"></script>
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>履歴 <span class="badge">reference</span></h1>
+    <p class="abstract">履歴 <code>&lt;name&gt;_history.h5</code> は、スカラー診断量の時系列を出力のたびに追記する HDF5 である。この頁は、履歴のチャネルを、グループ（<code>energy/</code>・物理サマリ・<code>laser/</code>・<code>radiation/</code> と、有効にしたときだけ書く診断）ごとに一覧にする。エネルギー台帳の人工項、シェルの半径・厚さ・IFAR・収束比、ホットスポットのガスの定義は<a href="#terms">用語の節</a>に置く。爆縮の停滞期のピークは履歴から読むこと（<a href="#cadence-warning">警告</a>）。</p>
+
+    <section aria-labelledby="terms">
+      <h2 id="terms">この計算で使う用語</h2>
+      <p>履歴の読み方に固有の用語を、以下で定義する。<a href="../../overview/numerics-foundations.html#energy-ledger">エネルギー台帳</a>（energy ledger）の人工項、シェルの半径・厚さ・IFAR・収束比、ホットスポットのガスとその半径である。Δt を決めた制約（履歴の <code>dt_winner</code> などの「勝者」）は、<a href="../../overview/timestep.html#observing">時間刻み制御</a>で定義する。</p>
+
+      <h3 id="terms-ledger">エネルギー台帳と人工項</h3>
+      <p><strong>エネルギー台帳</strong>は、毎ステップ、系の全エネルギーの変化を、出入りと補正の各項と突き合わせる恒等式である。履歴の <code>energy/</code> の各チャネルがその項を持ち、<code>conservation_error</code> がその相対誤差 ε_budget である。恒等式と各項の定義は<a href="../../overview/numerics-foundations.html#energy-ledger">数値基盤のエネルギー台帳の節</a>にある。以下は、数値的な操作が状態へ加えたエネルギーを記帳する 4 項である。</p>
+      <p><strong>床補正（floor correction）</strong>は、各演算子がエネルギーそのものを下限まで引き上げた量の和である（<a href="../../overview/numerics-foundations.html#floors-safety">床・クランプ・安全ガード</a>）。<code>floor_injected</code> が run 全体の累積、<code>floor_injected_step</code> がそのステップの値である。</p>
+      <p><strong>安全補正（safety correction）</strong>は、伝導の安全補正を記帳する欄である。現在の実装は伝導の補正を床補正に含めて記帳し、この欄に床補正と同じ値を入れるので、<code>safety_injected</code> は <code>floor_injected</code> と同じ値になる。</p>
+      <p><strong>ALE 再分配の未解決分（unresolved ALE redistribution）</strong>は、2D RZ の ALE（arbitrary Lagrangian–Eulerian、任意ラグランジュ・オイラー法）のリマップが、質量の床に落ちたセルを床の状態に置いたときのエネルギー差と、運動エネルギー・クロージャの再配分（<code>Numerics.ale.ke_closure_redistribute_floor</code>、既定は False）が吸収しきれなかった不足の和である。ALE を使わなければ 0 である。<code>redistribution_unresolved</code> には、そのステップの値だけを書く。</p>
+      <p><strong>ソルバ残差（solver residual）</strong>は、陰的ソルバの残差を符号つきで記帳する欄である。どの演算子も加算しないので、<code>solver_residual</code> は常に 0 である。0 以外の値は、符号に応じて流入または流出の項になる。</p>
+      <p>保存誤差 ε_budget の計算では、床補正と ALE 再分配の未解決分の和を人工項として全エネルギー変化から差し引く（安全補正は床補正と同じ値なので、加えない）。人工項は、物理的な出入りではなく数値的な操作がもたらしたエネルギーなので、ε_budget には数えない。ε_budget は <code>Diagnostics.energy_budget.warn_threshold</code>（既定 \(10^{-3}\)）を超えると警告する（最初のステップは検査しない）。床補正・安全補正・ALE 再分配の未解決分は、それぞれステップ開始時のエネルギーの大きさ <code>E_denom</code> との比が \(10^{-3}\) を超えると警告する。ε_budget が跳ねたときは、まず人工項の比を見る。人工項が支配的なら床とクランプの発動源を、そうでなければ境界と源の帰属（吸収率・逸出）を疑う。</p>
+
+
+      <h3 id="terms-shell">シェルの半径・厚さ・IFAR・収束比</h3>
+      <p><strong>シェル（shell）</strong>は、爆縮するカプセルの高密度の殻である。履歴の <code>diagnostics/icf/v1/</code> は、密度の分布からシェルの位置と形を次の規則で測る。1D の規則を述べる。\(\rho_{peak}\) は全セルの密度の最大値である。</p>
+      <p><strong>シェル半径（shell radius）</strong> \(R_{shell}\)（<code>shell_radius_cm</code>）は、\(\rho\ge0.1\rho_{peak}\) のセルについて、セル中心の半径（両側の節点の半径の平均）を質量で重み付けして平均した値である。</p>
+      <p><strong>シェルの厚さ（shell thickness）</strong> \(\Delta R_{shell}=R_{outer}-R_{inner}\)（<code>shell_thickness_cm</code>）の \(R_{outer}\) は、密度が外側のしきい値以上のセルのうち最も外側のセルの、外側の節点の半径である。\(R_{inner}\) は、密度が内側のしきい値以上のセルのうち最も内側のセルの、内側の節点の半径である。しきい値は <code>Numerics.diagnostics.icf.rho_outer_threshold_g_per_cc</code> と <code>rho_inner_threshold_g_per_cc</code> で指定する。0（既定）なら、外側は \(\rho_{peak}\) の 0.1 倍、内側は 0.5 倍になる。</p>
+      <p><strong>IFAR（in-flight aspect ratio、飛行中のアスペクト比）</strong> \(\mathrm{IFAR}=R_{shell}/\Delta R_{shell}\)（<code>IFAR</code>）は、殻が薄いほど大きい。</p>
+      <p><strong>収束比（convergence ratio、CR）</strong> \(\mathrm{CR}=R_{initial}/R_{shell}\)（<code>CR</code>）の \(R_{initial}\) は、シェルを有効に測れた最初のステップのシェル半径で、履歴の <code>diagnostics/icf/v1/</code> の属性 <code>R_initial_cm</code> に書く。CR の最初の値は 1 であり、殻が縮むほど大きくなる。再開した run は、再開元の run の履歴ファイルから \(R_{initial}\) を読み戻す。</p>
+      <p>2D の構造格子では、\(R_{shell}\) の重みの半径にセルの r 座標（両側の節点の r の平均）を使い、\(R_{outer}\) と \(R_{inner}\) は赤道面（\(z=0\)）で r を 0 から外縁まで 1024 区間に分けた線上の密度から求める（\(R_{inner}\) は、中心側から見て密度が内側のしきい値を最初に越える点を線形補間する）。履歴の <code>implosion/shell_radius_mean</code> は、同じ \(\rho\ge0.1\rho_{peak}\) のセルについて、セル重心の半径を質量で重み付けして平均する。両者の値は、重心と中点の違いのぶんだけ異なる。</p>
+
+      <h3 id="terms-hotspot">ホットスポットのガスと R50…R99</h3>
+      <p><strong>ホットスポットのガス（hotspot gas）</strong>は、初期に標的の中心部にあったガスを、流れとともに運ぶ受動トレーサで印を付けたものである。<code>Numerics.diagnostics.hotspot_gas.enabled=True</code> にすると、ステップ 0 で、セル重心の中心からの距離 \(\sqrt{r^2+z^2}\)（1D は \(r\)）が <code>Numerics.diagnostics.hotspot_gas.R_g_cm</code>（\(R_g\) [cm]。有効なら 0 より大きくする）より小さいセルにトレーサ \(Y_g=1\) を付け、ほかのセルは 0 とする。トレーサは、ラグランジュ流体ではセルとともに動き、ALE のリマップでは質量 \(mY_g\) を流体の質量流束と同じ風上の規則と制限子で運ぶ。値は <code>hydro/gas_tracer_Y</code> に残る。印を付けた最初の質量が <code>gas_mass_initial_g</code>、各時刻の質量 \(M_g=\sum_c m_cY_{g,c}\) の初期値との相対差が <code>gas_mass_rel_drift</code> で、その絶対値が <code>Numerics.diagnostics.hotspot_gas.mass_drift_warn_rel</code>（既定 \(10^{-10}\)）を超えると警告する。</p>
+      <p><strong>ガスの半径 R50・R90・R95・R99</strong> は、ガスの質量で重み付けした半径の分位数である。トレーサを持つセルをセル重心の中心からの距離で昇順に並べ、質量 \(mY_g\) の累積が \(M_g\) の p %（p = 50・90・95・99）に最初に達するセルの距離を、それぞれ \(R_{p}\)（<code>R50_cm</code>・<code>R90_cm</code>・<code>R95_cm</code>・<code>R99_cm</code>）とする。ガスの収束比 \(\mathrm{CR}_{p}=R_g/R_{p}\)（<code>CR50</code>・<code>CR90</code>・<code>CR95</code>・<code>CR99</code>）は、初期の半径 \(R_g\) を現在の半径で割った量である。シェルの収束比 <code>CR</code> とは別の量である。\(\mathrm{CR}_{50}\) の初期値は 1 でない（密度が一様な球では \(2^{1/3}\simeq1.26\)）ので、その初期値で割った <code>C_R50_norm</code> も書く。</p>
+      <p>そのほかの量を次のように定義する。rms 半径 \(R_{rms}=\sqrt{(5/3)\langle r^2\rangle}\)（<code>Rrms_cm</code>。一様な球では球の半径に等しい）とその収束比 <code>CRrms</code>。ガスの体積平均密度 \(M_g/\sum_c Y_{g,c}V_c\)（<code>rho_bar_volume_gcc</code>）の初期値に対する比の 1/3 乗 <code>CR_V</code>。ガスの質量中央値の密度 <code>rho50_gcc</code> の初期値に対する比の 1/3 乗 <code>CR_rho50</code>。圧力 \(p\)（電子 + イオン）と、断熱線を表す量 \(K=p/\rho^{\gamma}\)（<code>K_mean</code>・<code>K50</code>・<code>K90</code>・<code>K95</code>・<code>K99</code>。\(\gamma\) は最初のボイドでない理想気体材料の断熱指数で、定義できなければ 5/3）の質量重みの平均と分位数。電子温度とイオン温度（イオン温度は 2 温度のときだけ）の質量重みの平均と p10・p50・p90。エネルギー（内部・運動・合計）と、その初期値からの変化である仕事プロキシ（work proxy）<code>hotspot_work_proxy_*_erg</code>。仕事プロキシは、トレーサで定義した領域の全エネルギー \(\sum_c Y_gm(e_e+e_i+\tfrac12|\mathbf{u}|^2)\) の変化であり、境界の圧力仕事の積分ではない（<code>hotspot_work_definition</code> に同じ定義を書く）。</p>
+    </section>
+
+    <section aria-labelledby="history">
+      <h2 id="history">履歴のチャネル</h2>
+      <p><code>results/&lt;name&gt;_history.h5</code> は追記型の時系列である。履歴の個々の時系列を、このページではチャネル（channel）と呼ぶ。ルートには <code>t</code>・<code>cycle</code>・<code>dt</code> の 3 本が入る。停止理由は <code>run_info.json</code> の <code>termination_reason</code>（<code>"t_end_reached"</code>・<code>"max_steps_reached"</code> など）に記録される。</p>
+
+      <h3>energy/ — エネルギー台帳（常時。条件つきのチャネルは行に条件を書く）</h3>
+      <table class="quick-facts">
+        <thead><tr><th>チャネル</th><th>内容</th></tr></thead>
+        <tbody>
+          <tr><th><code>laser_incident</code> / <code>laser_deposited</code> / <code>laser_escaped</code></th><td>レーザーの入射・吸収・未吸収の累積 [erg]。吸収を入射で割った値が吸収率になる。</td></tr>
+          <tr><th><code>E_cbet_iaw</code> / <code>E_cbet_iaw_step</code></th><td>CBET が光から取り除いてイオン音波（IAW）へ渡したエネルギーの、符号付きの累積と、そのステップの値 [erg]。常に書き出す（CBET が無効のとき、または離調が 0 のときは 0）。</td></tr>
+          <tr><th><code>laser_ra_deposited</code></th><td>共鳴吸収（<code>Laser.ra.enable=True</code>）で吸収されたレーザーエネルギーの累積 [erg]。<code>laser_deposited</code> の内数である。常に書き出す（共鳴吸収が無効なら 0）。</td></tr>
+          <tr><th><code>marshak_in</code> / <code>radiation_escaped</code></th><td>Marshak 境界から入射したエネルギーの累積と、輻射が境界から逸出（escape）したエネルギーの累積 [erg]（全輻射群の合算）。</td></tr>
+          <tr><th><code>pdv_boundary</code></th><td>境界の圧力が外へした PdV 仕事（PdV work。膨張で正）の累積 [erg]。</td></tr>
+          <tr><th><code>state_supply</code> / <code>state_supply_step</code> / <code>supply_flow_work</code> / <code>supply_flow_work_step</code></th><td>2D RZ の run が状態供給の面（<code>Numerics.hydro.boundary_2d</code> の <code>z_bottom</code>・<code>z_top</code> に <code>type="state_supply"</code> を指定した面）を持つときだけ書く。面が出し入れしたエネルギー（上書き・速度の復元・リマップの境界流束として記帳した変化）と、面を通る流れの仕事の、領域へ入る向きを正とする符号付きの累積と、そのステップの値 [erg]。保存誤差では流入として数える。</td></tr>
+          <tr><th><code>kinetic</code> / <code>internal_electron</code> / <code>internal_ion</code> / <code>radiation_field</code></th><td>運動・電子内部・イオン内部・輻射場の各エネルギー合計 [erg]。</td></tr>
+          <tr><th><code>numerical_loss</code></th><td>数値的喪失（numerical loss）の累積 [erg]。アルゴリズム上の限界のために物質へ入れられなかった、または系から落ちたエネルギー（たとえば受け皿がなく捨てられたレーザーパワー）で、保存誤差では既知の流出として数える。</td></tr>
+          <tr><th><code>floor_injected</code> / <code>safety_injected</code></th><td>床補正・安全補正（<a href="#terms-ledger">用語</a>）の累積 [erg]。現在の実装は伝導の補正も床補正に含めて記帳し、安全補正に床補正と同じ値を入れるので、2 つの系列は同じ値になる。保存誤差では人工項として全エネルギー変化から差し引くので、保存誤差に数えない。</td></tr>
+          <tr><th><code>redistribution_unresolved</code></th><td>ALE 再分配の未解決分（<a href="#terms-ledger">用語</a>）の、そのステップの値 [erg]。累積ではなく、<code>_step</code> の系列もない。2D RZ の ALE のリマップが質量の床に落ちたセルを床の状態に置いたときのエネルギー差と、運動エネルギー・クロージャの再配分（<code>Numerics.ale.ke_closure_redistribute_floor</code>）が吸収しきれなかった不足の和で、ALE を使わなければ 0 である。保存誤差では人工項として差し引く。</td></tr>
+          <tr><th><code>solver_residual</code></th><td>陰的ソルバの残差（<a href="#terms-ledger">用語</a>）の累積 [erg]。記帳の欄だけがあり、どの演算子も加算しないので常に 0 である。0 以外の値は、符号に応じて流入または流出として保存誤差に入る。</td></tr>
+          <tr><th><code>void_excision_residue_dissipation</code> / <code>contact_impact_dissipation</code></th><td>2D RZ の、<a href="../../physics/eos-opacity/index.html#void-materials">ボイドセル</a>（void cell）の切除（void excision。<code>Numerics.ale.evacuated_cell.closure_contact.void_excision_apply_enabled</code>）で退役させた節点を併合するときと、表面の接触（surface contact）の衝突のときに失われる運動エネルギーを、イオン内部エネルギーへ保存的に変換した量の、そのステップの値 [erg]。常に書き出すが、機能を有効にしなければ 0 である（<code>void_excision_apply_enabled</code> と <code>surface_contact_authority_enabled</code> は同時に True にする）。全エネルギーを変えないので、保存誤差では流入にも流出にも数えない。</td></tr>
+          <tr><th><code>node_merge_dissipation</code></th><td><code>surface_contact_authority_enabled=True</code> のときだけ書く。記帳の欄だけがあり、どの演算子も加算しないので常に 0 である。</td></tr>
+          <tr><th><code>hllc_cell_kinetic_off_nodes</code></th><td><code>Numerics.hydro.hllc_z_flux_2d_rz=True</code> のときだけ書く。HLLC（Harten–Lax–van Leer-contact 近似リーマン解法、approximate Riemann solver）の z 方向の流束が持つセルの z 運動量から求めた運動エネルギー（Σ ½p²/m）のうち、節点の z 運動エネルギーに載っていない分 [erg]（0 以上。全エネルギー <code>E_total</code> に含める）。</td></tr>
+          <tr><th><code>conservation_error</code></th><td>相対保存誤差 ε_budget（<code>docs/NUMERICS.md</code> §10.2 の恒等式に基づく。<a href="../../overview/numerics-foundations.html#energy-ledger">数値基盤</a>に式がある）。</td></tr>
+          <tr><th><code>E_volume_in</code> / <code>E_total</code> / <code>dE_total</code> / <code>E_denom</code></th><td>内部診断（外部輻射体積源 <code>Radiation.volume_source_rate</code> の入力累積・全エネルギー・その差分・保存誤差分母）。</td></tr>
+          <tr><th><code>*_step</code></th><td><code>marshak_in</code>・<code>radiation_escaped</code>・<code>pdv_boundary</code>・<code>numerical_loss</code>・<code>floor_injected</code>・<code>safety_injected</code>・<code>solver_residual</code>・<code>E_volume_in</code>・<code>E_cbet_iaw</code>（状態供給の面があるときは <code>state_supply</code>・<code>supply_flow_work</code> も）の、そのステップの値 [erg]。元の名前の系列は run 全体の累積値である（<code>radiation_escaped</code> は 2026-08-30 から、<code>marshak_in</code>・<code>pdv_boundary</code>・<code>numerical_loss</code>・<code>floor_injected</code>・<code>safety_injected</code>・<code>solver_residual</code>・<code>E_volume_in</code> は 2026-09-24 から。それ以前のファイルはステップの値を元の名前で持つので、<code>energy/radiation_escaped_step</code>、<code>energy/marshak_in_step</code> の有無で見分ける）。</td></tr>
+          <tr><th><code>phase_diagnostic/</code></th><td>optional（<code>Numerics.diagnostics.phase_resolved_energy=True</code>）。流体の段（hydro）の前後と ALE の段の後の物質エネルギーと、段ごとの内部/運動エネルギーの差分。</td></tr>
+          <tr><th><code>ale_closure_audit/</code></th><td>optional（<code>Numerics.ale.ke_conservation_closure_audit=True</code>）。ALE の運動エネルギー・クロージャ（kinetic-energy closure。ALE の段が変えた運動エネルギーを内部エネルギーへ戻す操作 <code>Numerics.ale.ke_conservation_closure</code>）の監査（運動エネルギー K と内部エネルギー I への分解と残差、床補正のカウンタ）。</td></tr>
+        </tbody>
+      </table>
+
+      <h3>物理サマリのグループ（常時）</h3>
+      <table class="quick-facts">
+        <thead><tr><th>グループ / チャネル</th><th>内容</th></tr></thead>
+        <tbody>
+          <tr><th><code>mesh/ale_rezone_invocations</code></th><td>ALE のリゾーン（rezone）を実行した回数の累積。</td></tr>
+          <tr><th><code>plasma/Zbar_mean</code>, <code>Zbar_max</code></th><td>質量重み平均と最大の電離度。</td></tr>
+          <tr><th><code>implosion/rho_peak</code></th><td>ピーク密度 [g/cm³]。最大圧縮の値と時刻はここから読む。</td></tr>
+          <tr><th><code>implosion/rho_R</code>（+ optional <code>rho_R_hotspot_tracer</code>）</th><td>角度別の面密度 [g/cm²]（属性 <code>angles_deg</code>）。後方互換の角度別スカラー <code>rhoR_deg_&lt;角度&gt;</code> も併記される。</td></tr>
+          <tr><th><code>implosion/shell_radius_mean</code>, <code>shell_radius_min</code></th><td>シェルの平均・最小半径 [cm]（ρ ≥ 0.1×ρ_max のセルについて、セル重心の半径（2D は r 座標）の質量重み平均と最小値）。1D では <code>shell_radius_min</code> も <code>shell_radius_mean</code> と同じ値である。</td></tr>
+          <tr><th><code>implosion/center_temperature</code></th><td>中心電子温度 [eV]。</td></tr>
+          <tr><th><code>modes/P_ell</code>, <code>ell_values</code></th><td>2D のみ。Legendre モード振幅と次数（後方互換の <code>a&lt;ℓ&gt;</code> スカラーも併記）。</td></tr>
+          <tr><th><code>safety/clamp_count</code></th><td>温度・エネルギーのクランプ（clamp。<a href="../../overview/numerics-foundations.html#floors-safety">定義</a>）の発生回数。</td></tr>
+        </tbody>
+      </table>
+
+      <h3>laser/ — レーザーの時系列（常時。レーザーが無効なら 0）</h3>
+      <table class="quick-facts">
+        <thead><tr><th>チャネル</th><th>内容</th></tr></thead>
+        <tbody>
+          <tr><th><code>critical_surface_r</code></th><td>臨界面（critical surface）の半径 [cm]。</td></tr>
+          <tr><th><code>absorbed_total</code> / <code>absorbed_power_total</code></th><td>当該ステップの吸収エネルギー [erg] とパワー [erg/s]。</td></tr>
+          <tr><th><code>commanded_power_total</code> / <code>unabsorbed_power_total</code> / <code>trace_unabsorbed_power_total</code></th><td>入射・未吸収（最終／光線追跡の直後）の各パワー [erg/s]。</td></tr>
+          <tr><th><code>absorption_efficiency_total</code> / <code>trace_absorption_efficiency_total</code></th><td>総吸収効率（最終／光線追跡の直後）。</td></tr>
+          <tr><th><code>transfer_blocked_power_total</code></th><td>受け皿がなく捨てられたパワー [erg/s]。</td></tr>
+          <tr><th><code>tail_closure_count</code> / <code>tail_closure_absorbed_power_total</code> / <code>critical_surface_hit_count</code></th><td>臨界面近傍の裾のクロージャ（tail closure。残存パワーを解析的に沈着させて光線を終端する処理 — <a href="../../physics/laser/index.html">レーザー</a>参照）で終端した光線の数とその吸収パワー、臨界面で打ち切られた光線の数。1D の既定の特性曲線積分は臨界半径で光線を反射させるので、裾のクロージャは使わない。</td></tr>
+          <tr><th><code>ghost_corona_width</code></th><td>1D のゴーストコロナ（ghost corona、キー <code>Laser.lasermesh.ghost_corona</code>）の幅 [cm]（無効なら 0）。ゴーストコロナは、最外の物質セルの外側に光線追跡のためだけにレーザー格子上へ置く仮想の低密度コロナで、流体の状態は変えない。</td></tr>
+          <tr><th><code>cbet_exchanged_power_total</code> / <code>cbet_ledger_residual_rel</code> / <code>cbet_iterations</code> / <code>cbet_clamp_count</code></th><td>CBET の交換パワー・エネルギー台帳の残差・反復数・クランプ数。CBET 無効でも 0 値で常に出力される。</td></tr>
+          <tr><th><code>absorbed_fraction_beam_&lt;i&gt;</code></th><td>ビーム別の吸収配分重み（単一ビームでは常に 1）。</td></tr>
+        </tbody>
+      </table>
+
+      <h3>radiation/ と、有効にしたときだけ書く診断のグループ</h3>
+      <table class="quick-facts">
+        <thead><tr><th>グループ</th><th>有効条件と内容</th></tr></thead>
+        <tbody>
+          <tr><th><code>radiation/fld_outer_*</code></th><td>常時（FLD 無効時 0）。外側のピカール反復（Picard iteration）の回数・終了残差・収束フラグ。</td></tr>
+          <tr><th><code>radiation/sn_*</code></th><td><code>mode="sn_transport"</code> の run だけ。外側反復（1D の線形不連続法（linear discontinuous method）は節点温度のニュートン法（Newton's method）、ほかは物質のピカール反復）と内側反復（線形不連続法は GMRES（generalized minimal residual method）の Krylov 反復、ほかは源反復（source iteration））のステップ内の合計、外側反復の終了残差、収束フラグ（<code>sn_outer_iterations</code>・<code>sn_inner_iterations</code>・<code>sn_outer_residual</code>・<code>sn_converged</code>）。</td></tr>
+          <tr><th><code>radiation/overshoot_count</code>・<code>overshoot_max</code></th><td>常時（輻射が無効なら 0）。最大値原理（maximum principle）の超過を記録する。輻射の段（演算子分割の 1 段。<a href="../../overview/numerics-foundations.html#operator-splitting">定義</a>）の後の電子温度が \(T_{max}=\max\)（段の前の最大電子温度、Marshak 駆動温度）を超えたセルの数と、最大の \((T_e-T_{max})/T_{max}\)。<code>Numerics.safety.overshoot_warn</code> はこの値で判定する。2026-09-29 までは <code>mc/overshoot_*</code> にあった。</td></tr>
+          <tr><th><code>diagnostics/icf/v1/</code></th><td><code>Numerics.diagnostics.icf.enabled</code>（または <code>Numerics.profile.icf_standard_ale.enabled</code>）。シェル半径 <code>shell_radius_cm</code>・厚さ <code>shell_thickness_cm</code>・IFAR・シェルの収束比 <code>CR</code>（<a href="#terms-shell">用語</a>）。</td></tr>
+          <tr><th><code>diagnostics/hotspot_gas/v1/</code></th><td><code>Numerics.diagnostics.hotspot_gas.enabled</code>。ホットスポットのガス（<a href="#terms-hotspot">用語</a>）の質量、半径 R50・R90・R95・R99 とそれぞれの収束比、密度・圧力・K の統計、Te/Ti の統計、エネルギーと仕事プロキシ。</td></tr>
+          <tr><th><code>diagnostics/ale_provenance/v1/</code></th><td><code>Numerics.diagnostics.ale_provenance_emission.enabled</code>（または <code>Numerics.profile.icf_standard_ale.enabled</code>）。<code>Numerics.profile.icf_standard_ale</code> は、ALE の設定を標準の組に限り、メッシュを修復する機構（セルの緊急無効化、境界と内部の局所修復、軸の変分射影など）を禁じるプロファイルである。このグループは、禁じた設定を有効にした数（<code>forbidden_config_violations</code>）、メッシュの救済処理（mesh rescue。許可した上で、禁じた修復機構が実際に動いたこと）の回数（<code>escape_valve_activations</code>）、メッシュの幾何の失敗のカウンタ、救済処理ごとのイベント表（<code>escape_valve_events/</code>）、run 終了時の状態を記す属性（<code>final_claim_level</code>・<code>reached_t_end</code> など）を持つ。</td></tr>
+          <tr><th><code>diagnostics/mesh_quality_min/v1/</code></th><td><code>Numerics.diagnostics.mesh_quality_min.enabled</code>。受理したメッシュの、<a href="../../physics/mesh/index.html#terms-corner-jacobian">コーナーヤコビアン</a>とガウス点ヤコビアン（Jacobian。<a href="../../physics/mesh/index.html#terms-gauss-jacobian">定義</a>）J の最小、最小体積、最小の辺長と高さ（初期値との比）、条件数（condition number）の最大。</td></tr>
+          <tr><th><code>diagnostics/ale_lambda_sweep/v1/</code></th><td>ALE の後退探索（backtracking line search）で、リゾーンの移動量に掛ける割合 λ を掃引（sweep）する診断（ガウス点とコーナーの J と体積について、メッシュの許容性（admissibility。<a href="../../physics/mesh/index.html#terms-admissibility">定義</a>）を λ ごとに記す）。</td></tr>
+          <tr><th><code>diagnostics/radial_fourier_audit/v1/</code>・<code>_v2/v1/</code></th><td>演算子の段ごとの動径フーリエ監査（radial Fourier audit。v1: 最大振幅、v2: 固定した動径モード m と z 方向の行 j の複素係数）。</td></tr>
+          <tr><th><code>diagnostics/dt_breakdown_history/</code></th><td><code>Numerics.diagnostics.dt_breakdown_history_enabled</code>（既定で有効）。毎ステップの Δt の内訳と、Δt を決めた制約の名前 <code>dt_winner</code>（<a href="../../overview/timestep.html#observing">時間刻み制御</a>参照）。</td></tr>
+          <tr><th><code>diagnostics/cfl_winner/</code>・<code>corner_bc_audit/v1/</code></th><td>音響 CFL の最小を与えたセル（Δt を決めたセル。グループ名の winner はこの意味）の記録と、そのセルが特定のコーナーハローに入った場合の境界値の監査。</td></tr>
+          <tr><th><code>diagnostics/per_row_mass/</code>・<code>av_max/</code></th><td>Δt の内訳の診断（<code>dt_breakdown_history_enabled</code>）が有効のとき。z 行ごとの質量・密度サマリと、最大人工粘性セルの記録。</td></tr>
+          <tr><th><code>diagnostics/conservation/v1/</code></th><td><code>Numerics.diagnostics.conservation.enabled</code>（または <code>Numerics.profile.icf_standard_ale.enabled</code>）。演算子別の保存残差 ε_E と前後エネルギー。</td></tr>
+          <tr><th><code>diagnostics/material_interface/v1/</code></th><td>PLIC（piecewise linear interface calculation、区分線形の界面再構成）による材料界面の診断（属性・サンプルごとの統計・イベント表。<code>schema_version</code> を変えずに追加したグループ）。</td></tr>
+          <tr><th><code>mc/</code>・<code>difference/</code>・<code>holo/</code></th><td>2026-09-29（schema 2）に削除した。退役したモンテカルロ輻射の統計で、FLD・S<sub>N</sub> では最大値原理の 2 列（現在の <code>radiation/overshoot_*</code>）を除いて 0 だった。それより前に始めた履歴ファイルへ追記するときは、その 2 列を <code>mc/overshoot_*</code> に書き続ける。</td></tr>
+        </tbody>
+      </table>
+      <p>検証ページで引用される基準回帰の要約指標は、これらの時系列の時間方向の縮約である: <code>rho_peak_max</code> = <code>implosion/rho_peak</code> の最大、<code>rhoR_max</code> = <code>implosion/rho_R</code> の最初の角度（<code>angles_deg</code> の先頭）の最大、<code>Tc_max_eV</code> = <code>implosion/center_temperature</code> の最大、<code>shell_r_min_cm</code> = <code>implosion/shell_radius_min</code> の最小。</p>
+      <aside class="planned" aria-labelledby="cadence-warning">
+        <h3 id="cadence-warning">警告: 出力間隔によるピークの取り逃がし</h3>
+        <p>スナップショットの出力間隔はデッキごとに設定するが、爆縮の停滞期のピークは非常に短いことがある — GXII 級のレーザー爆縮の計算での実測（2026-07-31）では約 15 ps。出力の時刻がピークの前後に来てしまうと、スナップショット中の最大密度は真のピークを大きく過小評価する。鋭いピークの値とその時刻はステップごとの履歴にある <code>implosion/rho_peak</code> から読み、スナップショットはピーク前後の空間構造を調べるために使うこと。</p>
+      </aside>
+    </section>
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["\\[", "\\]"]] } };</script>
+  <script defer src="../../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../../nav.js" data-page="outputs-history" data-root="../../"></script>
+</body>
+</html>

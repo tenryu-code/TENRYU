@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en" data-lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Checkpoints and restart — TENRYU Documentation</title>
+  <link rel="stylesheet" href="../../../style.css">
+  <script src="../../../theme.js"></script>
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>Checkpoints and restart <span class="badge">reference</span></h1>
+    <p class="abstract">A checkpoint <code>&lt;name&gt;_ckpt_NNNN.h5</code> is an HDF5 file that stores, in addition to the contents of a snapshot, the internal state needed for a restart. This page describes the groups added to the snapshot content and the restart compatibility rules (<code>schema_version</code> and the check of the frozen configuration). File naming, the number of files kept, and the stop-request file are on the <a href="index.html#files">Outputs &amp; analysis page</a>; how to specify a restart is on the <a href="../running.html#restart">running page</a>.</p>
+
+    <section aria-labelledby="checkpoints">
+      <h2 id="checkpoints">Checkpoint additions and restart compatibility</h2>
+      <p>Checkpoints store the snapshot content plus the internal state needed to resume.</p>
+      <table class="quick-facts">
+        <thead><tr><th>Group</th><th>Content</th></tr></thead>
+        <tbody>
+          <tr><th><code>hydro_flags/hydro_active</code></th><td>Per-cell hydro activity mask.</td></tr>
+          <tr><th><code>time_state/</code></th><td>The <code>step</code>, <code>t</code>, and <code>dt</code> that the snapshot also holds, plus the cumulative energy terms and <code>user_seed</code> (the value of <code>Main.seed</code>). The restart Δt comes from here. A restart is refused with a <code>ConfigError</code> when <code>Main.seed</code> differs from <code>user_seed</code>.</td></tr>
+          <tr><th><code>output_state/</code></th><td>Next scheduled output times (<code>t_next_plot</code>, <code>t_next_history</code>, <code>t_next_checkpoint</code>).</td></tr>
+          <tr><th><code>hydro/cv_e</code>, <code>cv_i</code>, <code>cs</code> (1D)</th><td>Heat capacities and sound speed obtained from the equation of state (EOS). A 1D restart from a checkpoint that has them does not redo the re-closure (<a href="../../overview/numerics-foundations.html#operator-splitting">definition</a>), and the restarted run continues bitwise identical to the original run (except runs that reuse ray traces, <code>Laser.raytrace_skip_config.enabled=True</code>).</td></tr>
+          <tr><th><code>hydro_flags/cell_is_void</code> (1D)</th><td>Flags that mark the void cells (cells of a <code>Material.is_void</code> material; <a href="../../physics/eos-opacity/index.html#void-materials">definition</a>). A 1D run always writes it (zeros when there are no void cells); a 2D run writes it only when the run holds the mask.</td></tr>
+          <tr><th><code>conduction_state/</code></th><td>Run-cumulative statistics of the conduction solver (maxima of the iteration count, the residual, and the condition number, among others).</td></tr>
+          <tr><th><code>burn_state/specific_inventory</code></th><td>Nuclear-burn specific inventories \(Y_s\) [1/g] (per cell D, T, He3, He4, p). A restart uses these rather than the snapshot number densities <code>hydro/burn_n_*</code> divided by the density (since 2026-09-26).</td></tr>
+          <tr><th><code>radiation_sn/</code> (1D S<sub>N</sub>)</th><td>Angular distributions of the linear-discontinuous scheme (<code>psi_prev</code>, <code>psi_sd_prev</code>) and the in-cell electron-energy offset (<code>ee_node_offset</code>); without them a run starts isotropic and flat in the cell.</td></tr>
+          <tr><th><code>particles/</code>, <code>rng/</code></th><td>Only in schema-1 checkpoints. <code>particles/</code> is the particle pool of the retired Monte Carlo radiation: read when empty, and a checkpoint holding particles is refused. <code>rng/</code> is the RNG state, which a restart does not read. Neither is written from schema 2 (2026-09-29).</td></tr>
+        </tbody>
+      </table>
+      <p>Restart compatibility: a checkpoint with the current <code>schema_version</code> (2 since 2026-09-29) is read normally, one with an older (or missing) version is read with backward-compatible defaults, and one with a newer version is refused. A restart is refused when the checkpoint's frozen configuration (the hash of the deck text and every setting except <code>Main.restart_from</code>) does not match the restarting deck. The <a href="../running.html#restart">running page</a> explains how to specify a restart.</p>
+    </section>
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["\\[", "\\]"]] } };</script>
+  <script defer src="../../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../../nav.js" data-page="outputs-checkpoints" data-root="../../"></script>
+</body>
+</html>

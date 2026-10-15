@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="ja" data-lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>出力と解析 — TENRYU ドキュメント</title>
+  <link rel="stylesheet" href="../../../style.css">
+  <script src="../../../theme.js"></script>
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>出力と解析 <span class="badge">reference</span></h1>
+    <p class="abstract">TENRYU の 1 回の実行は、スナップショット（空間場）・履歴（history。スカラー時系列）・チェックポイント（再開（restart）用）の 3 種の HDF5 と、<a href="#terms-provenance">来歴</a>（provenance）のファイル（<a href="../running.html#terms-freeze">凍結設定</a>（frozen configuration）・実行情報・ログ）を生成する。この頁は出力の全体を述べる。ファイルの種類・命名・出力間隔と出力ディレクトリの配置、来歴のファイル、出力の読み方（CLI・付属ツール・Scope）である。3 種の HDF5 の中身は、<a href="snapshots.html">スナップショット</a>・<a href="history.html">履歴</a>・<a href="checkpoints.html">チェックポイントと再開</a>の頁に分けて一覧にする。データ型・配列形状まで含む正典はリポジトリの <code>docs/SPECIFICATION.md</code> §7（要約は <code>docs/OUTPUT_SCHEMA.md</code>）である。この頁の来歴に固有の用語は<a href="#terms">用語の節</a>で説明する。</p>
+
+    <aside class="planned" aria-labelledby="at-a-glance">
+      <h3 id="at-a-glance">要点</h3>
+      <ul>
+        <li>3 種の HDF5: スナップショット <code>&lt;name&gt;_NNNN.h5</code>、履歴 <code>&lt;name&gt;_history.h5</code>（追記型）、チェックポイント <code>&lt;name&gt;_ckpt_NNNN.h5</code>。出力間隔は「N ステップごと」（<code>plot_every</code> 等）と「T 秒ごと」（<code>plot_every_s</code> 等）の OR で発火する。</li>
+        <li>全数値データセットに <code>units</code> 属性が付く。<code>mesh/</code>・<code>hydro/</code> のデータセット名は内部の State フィールド名と 1:1 対応する。</li>
+        <li>爆縮（implosion）の停滞期（stagnation phase）のピークは短い — 2026-07-31 の <a href="../../verification/index.html#gxii">GXII</a>（激光 XII 号、GEKKO XII）級のレーザー爆縮の計算では約 15 ps — ため、ピーク値はスナップショットではなくステップごとの履歴（<code>implosion/*</code>）から読む。</li>
+        <li>同じ出力ディレクトリへ再実行すると、上書きせず <code>_001</code> のような連番ディレクトリに書かれる。「結果が変わらない」と思ったらまず出力先を確認する。</li>
+      </ul>
+    </aside>
+
+    <div class="card-grid">
+      <a class="card" href="snapshots.html"><h3>スナップショット</h3><p>ルート属性と、metadata・mesh・hydro・diagnostics・radiation・laser の各グループのデータセット。</p></a>
+      <a class="card" href="history.html"><h3>履歴</h3><p>energy・物理サマリ・laser・radiation などのチャネルと、エネルギー台帳・シェル・ホットスポットのガスの用語。</p></a>
+      <a class="card" href="checkpoints.html"><h3>チェックポイントと再開</h3><p>再開用に追加されるグループと、schema_version・凍結設定による再開の互換規約。</p></a>
+    </div>
+
+    <section aria-labelledby="files">
+      <h2 id="files">ファイル構成・命名・出力間隔</h2>
+      <table class="quick-facts">
+        <thead><tr><th>ファイル</th><th>命名</th><th>出力頻度</th><th>用途</th></tr></thead>
+        <tbody>
+          <tr><th>スナップショット</th><td><code>&lt;name&gt;_NNNN.h5</code>（4 桁ゼロ詰めの通し番号）</td><td><code>plot_every</code> ステップごと <em>または</em> <code>plot_every_s</code> 秒ごと（OR 論理）</td><td>場の可視化・後処理。物理時刻はルート属性 <code>t</code>、ステップ番号は <code>step</code>（同じ値を <code>cycle</code> にも書く）。</td></tr>
+          <tr><th>履歴</th><td><code>&lt;name&gt;_history.h5</code></td><td><code>history_every</code> / <code>history_every_s</code>（OR、追記）</td><td>スカラー診断量の時系列。拡張可能なデータセット（extensible dataset）に出力のたびに追記する。</td></tr>
+          <tr><th>チェックポイント</th><td><code>&lt;name&gt;_ckpt_NNNN.h5</code>（4 桁ゼロ詰めの通し番号）</td><td><code>checkpoint_every</code> / <code>checkpoint_every_s</code>（OR）</td><td>再開用。<code>checkpoint_keep_last</code> 個だけ保持し、古いものは自動削除する。</td></tr>
+        </tbody>
+      </table>
+      <p><code>&lt;name&gt;</code> は <code>Main.name</code>、未指定ならデッキ（deck。<a href="../namelist.html#terms-deck">定義</a>）のファイル名（拡張子なし）である。MPI（message passing interface）並列の run でも、スナップショット・履歴・チェックポイントはすべてランク 0（MPI のプロセス番号 0）が書き、ランクごとのファイルは作らない。ディレクトリ全体の配置は次のとおりである。</p>
+      <pre><code>outputs/&lt;name&gt;/
+├── results/                  ← スナップショットと履歴
+│   ├── &lt;name&gt;_0000.h5
+│   ├── &lt;name&gt;_0001.h5
+│   └── &lt;name&gt;_history.h5
+├── config/                   ← 来歴（凍結設定とデッキの写し）
+│   ├── &lt;name&gt;_frozen.json
+│   └── &lt;name&gt;_namelist.py
+├── checkpoints/              ← 再開用
+│   └── &lt;name&gt;_ckpt_0000.h5
+├── log/                      ← 実行ログ（tenryu.log）
+├── run_info.json             ← 実行の要約（終了状態など）
+└── mesh_requirement.json     ← 初期メッシュの分解能要求の判定（1D の新規 run のみ）</code></pre>
+      <p>スナップショットとチェックポイントのファイル名の番号は、その出力ディレクトリへ書き出した順に 0 から数える通し番号であり、ステップ番号ではない。たとえば 100 ステップごとにチェックポイントを書く run の最初のチェックポイントは <code>&lt;name&gt;_ckpt_0000.h5</code> である。ステップ番号はルート属性 <code>step</code>（同じ値を <code>cycle</code> にも書く）にある。出力ディレクトリに <code>stop_request</code> というファイルを置いて run を止めたときは、通し番号の代わりにステップ番号を付けた <code>event_stop_&lt;ステップ番号&gt;.h5</code> を <code>checkpoints/</code> に書く。このファイルは <code>checkpoint_keep_last</code> による自動削除の対象にならない。</p>
+      <p><code>mesh_requirement.json</code> は、1D の新規 run だけが書く。初期メッシュが、物理から要る分解能を満たすかどうかの見積もりと判定の記録である。対象外のとき（レーザーが無効など）は <code>applicable</code> が false になり、理由を <code>reason</code> に記す。</p>
+      <p>出力先が既に存在して衝突する場合は、上書きせず <code>outputs/&lt;name&gt;_001/</code> のような 3 桁連番の別ディレクトリへ書く。デッキを編集せずに出力先を変えたいときは <code>tenryu run &lt;deck&gt; --output-dir &lt;dir&gt;</code> で実行時に上書きできる（新規 run 専用。再開との併用は <code>ConfigError</code>）。</p>
+    </section>
+
+    <section aria-labelledby="terms">
+      <h2 id="terms">この計算で使う用語</h2>
+<p>この頁の来歴に固有の用語を、以下で定義する。来歴と凍結設定である。エネルギー台帳の人工項、シェルの半径・厚さ・IFAR・収束比、ホットスポットのガスは、<a href="history.html#terms">履歴の頁の用語の節</a>で定義する。</p>
+
+      <h3 id="terms-provenance">来歴と凍結設定</h3>
+      <p><strong>来歴（provenance）</strong>は、ある出力がどの入力とどの実行環境から生まれたかを、後から確かめるための記録である。TENRYU は、デッキの写し <code>config/&lt;name&gt;_namelist.py</code>（<code>Output.save_namelist_copy</code>、既定は True）、凍結設定の JSON <code>config/&lt;name&gt;_frozen.json</code>（<code>Output.save_frozen_config</code>、既定は True）、実行の要約 <code>run_info.json</code>、実行ログ <code>log/tenryu.log</code>、各 HDF5 の <code>metadata/</code> グループ（デッキ全文 <code>namelist_source</code>、凍結設定 <code>frozen_config</code>、輻射群の境界 <code>group_bounds_eV</code> など）を来歴として残す。「入力したつもりの値」ではなく、実行が実際に受け取った構成を監査する一次資料である。各ファイルの中身は<a href="#provenance">来歴の節</a>に書く。再開が元の run の厳密な継続でないときは、ルート属性 <code>restart_provenance</code> にその印を書き、再開した run の出力を継続した run の出力と区別できるようにする。グループ名に provenance を含む <code>diagnostics/ale_provenance/v1/</code> は別の記録で、ALE の設定が標準のプロファイルに沿っていたかを記す（<a href="history.html">履歴の頁</a>の表）。</p>
+      <p><strong>凍結設定（frozen configuration）</strong>は、初期化時に Python の関数を表にし、既定値を補って確定した設定である。定義は<a href="../running.html#terms-freeze">実行ページ</a>にある。来歴の凍結設定は、解決した設定の全体と実行時の値の要約を持つ <code>config/&lt;name&gt;_frozen.json</code> と、再開時の照合に使う HDF5 の <code>metadata/frozen_config</code> の 2 つの形で残る。HDF5 の属性 <code>git_hash</code> は常に <code>"unknown"</code> なので、HDF5 からは実行したコミットが分からない。<code>config/&lt;name&gt;_frozen.json</code> の <code>_tenryu_version</code> は、公開版の番号である。</p>
+    </section>
+
+    <section aria-labelledby="provenance">
+      <h2 id="provenance">来歴: 凍結設定の JSON・run_info・ログ</h2>
+      <p><code>config/&lt;name&gt;_frozen.json</code> は、既定値を解決した設定の全体（<code>main</code>・<code>mesh</code>・<code>materials</code>・<code>laser</code>・<code>numerics</code> などの節。Python の関数は <code>name</code>・<code>repr</code>・<code>source_hash</code>（ソースコードのハッシュ）で記す）に、TENRYU のバージョン <code>_tenryu_version</code>、凍結した UTC 時刻 <code>_frozen_at</code>、デッキ本文のハッシュ <code>_namelist_source_hash</code>、<code>frozen_summary</code> を加えた JSON である。<code>frozen_summary</code> には、初期の密度（最小・最大・平均）、電子温度とイオン温度（最小・最大）、材料ごとの体積、および初期化時に表へ変換した関数ごとの時間の範囲（<code>t_min</code>・<code>t_max</code>）・点数 <code>n_points</code>・最大値 <code>peak_value</code>・積分値 <code>integrated_value</code> が入る。HDF5 の <code>metadata/frozen_config</code> は、同じ設定から <code>_tenryu_version</code>・<code>_frozen_at</code>・<code>frozen_summary</code> を除いた JSON である。<code>--output-dir</code>（新規 run）や <code>--t-end</code>・<code>--max-steps</code>（再開）で上書きした値は、<code>config/&lt;name&gt;_frozen.json</code> には実際に使った値が入り、<code>metadata/frozen_config</code> にはデッキの値が残る。「入力したつもりの値」ではなく実行が実際に受け取った構成を監査する一次資料であり、再現・比較の際はデッキとともに保管する。<code>run_info.json</code> は実行の要約、<code>log/</code> には実行ログが残る。「設定が効いたか怪しい」ときは、凍結設定の JSON → ログの warning の順に見るのが早い。</p>
+    </section>
+
+    <section aria-labelledby="analysis-tools">
+      <h2 id="analysis-tools">読み方: CLI・付属ツール・Scope</h2>
+      <p>構造の確認は HDF5 標準ツールで足りる。</p>
+      <pre><code>h5ls  outputs/&lt;name&gt;/results/&lt;name&gt;_0010.h5          # グループ一覧
+h5dump -H outputs/&lt;name&gt;/results/&lt;name&gt;_history.h5  # ヘッダ構造</code></pre>
+      <p>最短の可視化は付属の <code>tenryu_plot</code>（<code>tools/</code>）である。サブコマンドに <code>profile</code>（空間プロファイル）・<code>history</code>（時系列）・<code>spacetime</code>・<code>summary</code>・<code>compare</code>・<code>spectrum</code> などがある。</p>
+      <pre><code>python3 -m tools.tenryu_plot --help                  # 一覧
+python3 -m tools.tenryu_plot profile outputs/&lt;name&gt;  # 空間プロファイル
+python3 -m tools.tenryu_plot history outputs/&lt;name&gt;  # 時系列</code></pre>
+      <p>Python で直接読むなら h5py が最短である。全数値データセットに <code>units</code> 属性が付き、配列長は場の配置（セル数・節点数・セル×材料・セル×輻射群）に応じて変わるため、ルート属性・形状・単位を合わせて読み取ること。</p>
+      <pre><code>import h5py
+f = h5py.File("outputs/&lt;name&gt;/results/&lt;name&gt;_0010.h5")
+Te = f["hydro/Te"][:]; r = f["mesh/x_r"][:]
+print(f["hydro/Te"].attrs["units"])   # -&gt; "eV"</code></pre>
+      <p>対話的な探索と実行どうしの比較には TENRYU Scope（<a href="../../overview/architecture.html">アーキテクチャ</a>参照）を使う。ビューアで着目すべき時刻と量を見つけ、最終的な図は凍結設定と明示したスクリプト引数から作ると、対話的な解析と再現性を両立できる。</p>
+    </section>
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["\\[", "\\]"]] } };</script>
+  <script defer src="../../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../../nav.js" data-page="outputs" data-root="../../"></script>
+</body>
+</html>

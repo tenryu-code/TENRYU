@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="ja" data-lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>チェックポイントと再開 — TENRYU ドキュメント</title>
+  <link rel="stylesheet" href="../../../style.css">
+  <script src="../../../theme.js"></script>
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>チェックポイントと再開 <span class="badge">reference</span></h1>
+    <p class="abstract">チェックポイント <code>&lt;name&gt;_ckpt_NNNN.h5</code> は、スナップショットの内容に加えて、再開（restart）に必要な内部状態を保存する HDF5 である。この頁は、スナップショットに追加されるグループと、再開の互換規約（<code>schema_version</code> と凍結設定の照合）を述べる。ファイルの命名・保持数・停止要求のファイルは<a href="index.html#files">出力と解析の頁</a>、再開の指定方法は<a href="../running.html#restart">実行の頁</a>にある。</p>
+
+    <section aria-labelledby="checkpoints">
+      <h2 id="checkpoints">チェックポイントの追加内容と再開の互換性</h2>
+      <p>チェックポイントはスナップショットの内容に加えて、再開に必要な内部状態を保存する。</p>
+      <table class="quick-facts">
+        <thead><tr><th>グループ</th><th>内容</th></tr></thead>
+        <tbody>
+          <tr><th><code>hydro_flags/hydro_active</code></th><td>セルの流体活性マスク。</td></tr>
+          <tr><th><code>time_state/</code></th><td>スナップショットと共通の <code>step</code>・<code>t</code>・<code>dt</code> に、累積エネルギー項と <code>user_seed</code>（<code>Main.seed</code> の値）が加わる。再開時の Δt はここから引き継がれる。<code>Main.seed</code> が <code>user_seed</code> と違うと、再開は <code>ConfigError</code> で拒否される。</td></tr>
+          <tr><th><code>output_state/</code></th><td>次回出力予定時刻（<code>t_next_plot</code>・<code>t_next_history</code>・<code>t_next_checkpoint</code>）。</td></tr>
+          <tr><th><code>hydro/cv_e</code>・<code>cv_i</code>・<code>cs</code>（1D）</th><td>状態方程式（equation of state、EOS）から求めた比熱と音速。これらがあるチェックポイントからの 1D の再開は再クロージャ（re-closure。<a href="../../overview/numerics-foundations.html#operator-splitting">定義</a>）をやり直さず、途中から再開した run が元の run とビット一致で続く（光線追跡の再利用 <code>Laser.raytrace_skip_config.enabled=True</code> の run を除く）。</td></tr>
+          <tr><th><code>hydro_flags/cell_is_void</code>（1D）</th><td>ボイドセル（<code>Material.is_void</code> の材料のセル。<a href="../../physics/eos-opacity/index.html#void-materials">定義</a>）の印。1D は常に書き（空セルがなければ 0）、2D は実行がマスクを持つときだけ書く。</td></tr>
+          <tr><th><code>conduction_state/</code></th><td>熱伝導ソルバの run 全体の累積統計（反復数・残差・条件数の最大など）。</td></tr>
+          <tr><th><code>burn_state/specific_inventory</code></th><td>核燃焼の比インベントリ（specific inventory）\(Y_s\) [1/g]（セルごとに D・T・He3・He4・p の順）。再開は、スナップショットの数密度 <code>hydro/burn_n_*</code> を密度で割った値ではなくこれを使う（2026-09-26 から）。</td></tr>
+          <tr><th><code>radiation_sn/</code>（1D S<sub>N</sub>）</th><td>線形不連続法の角度分布（<code>psi_prev</code>・<code>psi_sd_prev</code>）とセル内の電子エネルギーの差（<code>ee_node_offset</code>）。無いチェックポイントからは等方・一様で始める。</td></tr>
+          <tr><th><code>particles/</code>・<code>rng/</code></th><td>schema 1 のチェックポイントだけが持つ。<code>particles/</code> は退役したモンテカルロ輻射の粒子プールで、空なら読み、粒子があれば再開を拒否する。<code>rng/</code> は乱数状態で、再開では読まない。schema 2（2026-09-29）ではどちらも書かない。</td></tr>
+        </tbody>
+      </table>
+      <p>再開の互換規約: <code>schema_version</code>（現行は 2026-09-29 からの 2）が現行と同じなら通常読込、古い（または欠落）なら不足項目を既定値で補う後方互換読込、新しいなら読込拒否。チェックポイントの凍結設定（デッキ本文のハッシュと、<code>Main.restart_from</code> を除くすべての設定）が再開に使うデッキと一致しなければ、再開は拒否される。再開の指定方法は<a href="../running.html#restart">実行ページ</a>を参照のこと。</p>
+    </section>
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["\\[", "\\]"]] } };</script>
+  <script defer src="../../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../../nav.js" data-page="outputs-checkpoints" data-root="../../"></script>
+</body>
+</html>

@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="ja" data-lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>スナップショット — TENRYU ドキュメント</title>
+  <link rel="stylesheet" href="../../../style.css">
+  <script src="../../../theme.js"></script>
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>スナップショット <span class="badge">reference</span></h1>
+    <p class="abstract">スナップショット <code>&lt;name&gt;_NNNN.h5</code> は、ある時刻の空間場を書いた HDF5 である。この頁は、ルート属性と、グループ（<code>metadata/</code>・<code>mesh/</code>・<code>hydro/</code>・<code>diagnostics/</code>・<code>radiation/</code>・<code>laser/</code>）ごとの主なデータセットを一覧にする。ファイルの命名と出力間隔は<a href="index.html#files">出力と解析の頁</a>、時系列の診断量は<a href="history.html">履歴の頁</a>にある。データ型・配列形状まで含む正典はリポジトリの <code>docs/SPECIFICATION.md</code> §7（要約は <code>docs/OUTPUT_SCHEMA.md</code>）である。</p>
+
+    <section aria-labelledby="snapshots">
+      <h2 id="snapshots">スナップショットのデータセット</h2>
+      <p>ルート属性は <code>t</code>（時刻 [s]）、<code>dt</code>（Δt [s]）、<code>cycle</code> と <code>step</code>（どちらもステップ番号）、<code>geometry</code>（<code>"1D_SPH"</code>|<code>"2D_RZ"</code>）、<code>nr</code>・<code>nz</code>（<code>Mesh.nr</code> と、2D の <code>Mesh.nz</code>。1D の <code>nz</code> は 1）、<code>n_cells</code>、<code>n_nodes</code>、<code>n_groups</code>、<code>n_materials</code>、<code>two_temperature</code>（常に 1）、<code>schema_version</code> である。再開が元の run の厳密な継続でないとき（たとえば、<code>Numerics.ale.band_ale</code> の状態を保存した補助ファイル、すなわちチェックポイントの名前に <code>.band-state</code> を付けたファイルが無いチェックポイントから再開したとき）は、その印を文字列のルート属性 <code>restart_provenance</code>（例: <code>RESTART_WITHOUT_BAND_STATE</code>）に書く。<code>geometry</code> は 1D では平面・円筒でも <code>"1D_SPH"</code> なので、1D のファイルは座標系を表す <code>geometry_1d</code>（<code>"spherical"</code>|<code>"cylindrical"</code>|<code>"planar"</code>）も持つ。1D では配列は 1 次元フラット、<code>mesh/x_z</code>・<code>v_z</code> は省略される。以下、グループごとに列挙する（「optional」は生成条件付き）。</p>
+
+      <h3>metadata/ — 来歴</h3>
+      <table class="quick-facts">
+        <thead><tr><th>データセット</th><th>内容</th></tr></thead>
+        <tbody>
+          <tr><th><code>namelist_source</code></th><td>実行したデッキ（Python ソース全文）。</td></tr>
+          <tr><th><code>frozen_config</code></th><td>凍結設定の JSON（<code>config/&lt;name&gt;_frozen.json</code> との違いは<a href="index.html#provenance">来歴の節</a>）。属性として <code>build_type</code>（<code>Release</code> または <code>Debug</code>）・<code>gpu_name</code>（デバイス 0 の GPU 名）・<code>rng_seed</code>（<code>Main.seed</code> の値）を持つ。<code>git_hash</code> と <code>cuda_arch</code> は常に <code>"unknown"</code>、<code>n_ranks</code> は常に 1 であり、実行の同定には使えない。</td></tr>
+          <tr><th><code>group_bounds_eV</code></th><td>輻射群（radiation energy group）の境界 [eV]（長さ G+1）。</td></tr>
+        </tbody>
+      </table>
+
+      <h3>mesh/ — 節点と接続</h3>
+      <table class="quick-facts">
+        <thead><tr><th>データセット</th><th>内容</th></tr></thead>
+        <tbody>
+          <tr><th><code>x_r</code>, <code>x_z</code></th><td>節点座標 [cm]。<code>x_z</code> は 2D のみ。</td></tr>
+          <tr><th><code>v_r</code>, <code>v_z</code></th><td>節点速度 [cm/s]。<code>v_z</code> は 2D のみ。</td></tr>
+          <tr><th><code>cell_material_id</code></th><td>セルの代表材料インデックス（多材料セルは体積分率最大、同率なら小さい方）。</td></tr>
+          <tr><th><code>topology/v2/</code>・<code>v3/</code>・<code>v4/</code></th><td>optional。マルチブロックメッシュ（multiblock mesh）の接続関係（mesh topology。v2: 3 ブロック、v3: half-butterfly 5 ブロック — block/seam 表と CSR（compressed sparse row、圧縮行格納）形式の接続関係、v4: 五角形帯の <code>cell_nverts</code> と <code>corner_stride</code> 属性）。単一ブロックでは省略。構成の詳細は <a href="../../physics/mesh/2d.html">2D メッシュ</a>参照。</td></tr>
+        </tbody>
+      </table>
+
+      <h3>hydro/ — セル中心の流体・熱力学状態</h3>
+      <table class="quick-facts">
+        <thead><tr><th>データセット</th><th>内容</th></tr></thead>
+        <tbody>
+          <tr><th><code>rho</code>, <code>Te</code>, <code>Ti</code></th><td>密度 [g/cm³]・電子/イオン温度 [eV]。</td></tr>
+          <tr><th><code>ee</code>, <code>ei</code></th><td>電子/イオン比内部エネルギー（specific internal energy）[erg/g]。</td></tr>
+          <tr><th><code>Pe</code>, <code>Pi</code>, <code>Qvisc</code></th><td>電子/イオン圧力・人工粘性圧（artificial viscosity pressure）[dyne/cm²]。</td></tr>
+          <tr><th><code>mass</code>, <code>vol</code></th><td>セル質量 [g]・体積 [cm³]。</td></tr>
+          <tr><th><code>zbar</code></th><td>平均電離度（mean ionization）。</td></tr>
+          <tr><th><code>volFrac</code></th><td>材料の体積分率（volume fraction）[N_cell, N_mat]（多材料時）。</td></tr>
+          <tr><th><code>burn_rate</code>, <code>burn_Q_e</code>, <code>burn_Q_i</code>, <code>burn_eps_cum</code>, <code>burn_n_*</code></th><td>optional（核燃焼（nuclear burn）を有効にした <code>Burn.enabled=True</code> のとき）。反応率密度 [1/cm³/s]、燃焼生成物による電子・イオンの加熱率 [erg/cm³/s]、累積の比沈着エネルギー [erg/g]、D・T・He3・He4・p の数密度 [1/cm³]。1D では、セルで生まれた中性子の累積数 <code>burn_neutron_cum</code> も書く。</td></tr>
+          <tr><th><code>shock_time</code></th><td>optional。最後に衝撃波を検知した時刻 [s]（post-shock 系機能の有効時）。</td></tr>
+          <tr><th><code>adaptive_av_gate</code>, <code>adaptive_av_mode_cell</code></th><td>optional。適応人工粘性（adaptive artificial viscosity、AV）のセルごとの重み g_i（データセット名の gate。無次元）と、g_i &gt; 10<sup>-6</sup> のセルを 1 とする可視化用マスク（<code>Numerics.hydro.adaptive_av.enabled=True</code> のとき。1D の <code>av_type="vnr"</code> 専用）。</td></tr>
+          <tr><th><code>corner_mass</code></th><td>optional。2D のサブゾーンコーナー質量（subzonal corner mass。<a href="../../physics/hydrodynamics/discretization.html#terms-corner">定義</a>）[g]（ラグランジュ不変量）。</td></tr>
+          <tr><th><code>eta_compatible</code></th><td>optional。旧 compatible 診断の体積差不整合 [cm³]。</td></tr>
+          <tr><th><code>per_material/v1/</code></th><td>optional。材料別の質量 <code>mass</code> [g] と電子・イオンの内部エネルギー <code>Ee</code>・<code>Ei</code> [erg]（セルと材料の組ごと。<code>Numerics.materials.per_material_conservation_enabled=True</code> 時）。</td></tr>
+          <tr><th><code>gas_tracer_Y</code></th><td>optional。ホットスポットのガストレーサ Y_g（<a href="history.html#terms-hotspot">用語</a>。無次元、セルごと）。<code>Numerics.diagnostics.hotspot_gas.enabled=True</code> でトレーサを初期化した run が書く。チェックポイントから再開した run は、これを読み戻して続ける。</td></tr>
+        </tbody>
+      </table>
+
+      <h3>diagnostics/ — スナップショット側の物理診断（optional）</h3>
+      <table class="quick-facts">
+        <thead><tr><th>グループ</th><th>有効条件と内容</th></tr></thead>
+        <tbody>
+          <tr><th><code>areal_density/v1/</code></th><td><code>Diagnostics.areal_density.enabled=True</code>。角度列 <code>angles_deg</code> と面密度（areal density）<code>rhoR</code> [g/cm²]、optional の <code>rhoR_hotspot_tracer</code>（密度にホットスポットのガストレーサ Y_g を掛けた積分 ∫ρY_g ds。<a href="history.html#terms-hotspot">用語</a>）。</td></tr>
+          <tr><th><code>hotspot_gas/v1/</code></th><td><code>Numerics.diagnostics.hotspot_gas.enabled=True</code>。ホットスポットのガス（<a href="history.html#terms-hotspot">用語</a>）の Te/Ti 統計（質量重みの mean/p10/p50/p90。Ti は 2 温度のときだけ）、エネルギー（internal/kinetic/total とその初期値）、仕事プロキシ（work proxy）、その定義の文字列 <code>hotspot_work_definition</code>。</td></tr>
+        </tbody>
+      </table>
+
+      <h3>radiation/ — 輻射場と輻射診断</h3>
+      <table class="quick-facts">
+        <thead><tr><th>データセット</th><th>内容</th></tr></thead>
+        <tbody>
+          <tr><th><code>energy_density</code></th><td>群別輻射エネルギー密度 E_g [erg/cm³]（[N_cell, G]）。</td></tr>
+          <tr><th><code>rad_dep</code>, <code>rad_emit</code></th><td>当該ステップ累積の吸収・放出 [erg]（群別）。</td></tr>
+          <tr><th><code>deposited_power</code></th><td>吸収パワー密度 [erg/cm³/s]（= rad_dep/(VΔt)、可視化用）。</td></tr>
+          <tr><th><code>fleck_factor</code></th><td>2D の FLD（flux-limited diffusion、流束制限拡散）のみ。セルの Fleck 因子（Fleck factor）。診断はグレイ（gray）の G=1 のときだけ有効である。</td></tr>
+          <tr><th><code>sn_tau_R</code>, <code>sn_reduced_flux</code>, <code>sn_ap_alpha</code></th><td>2D の S<sub>N</sub>（discrete ordinates、離散座標法）のみ。面の流束を S<sub>N</sub> と拡散で混ぜる漸近保存（asymptotic-preserving、AP）処理の診断（光学的厚さ（optical depth）・換算流束（reduced flux）・混合の重みの各プロキシ）。</td></tr>
+          <tr><th><code>diag_*</code>（12 種）</th><td>1D S<sub>N</sub> の出力専用診断: <code>diag_rad_</code> に続く <code>E_pre</code>/<wbr><code>E_post</code>/<wbr><code>emission_at_Tn</code>/<wbr><code>emission_at_Tnp1</code>/<wbr><code>absorption</code> と、<code>diag_</code> に続く <code>clip_energy</code>/<wbr><code>clip_full_deficit</code>/<wbr><code>chi_opacity</code>/<wbr><code>F_first_moment</code>/<wbr><code>E_star_flux</code>/<wbr><code>stream_theta</code>/<wbr><code>ap_alpha_face</code>。再開の状態復元には使われない。</td></tr>
+        </tbody>
+      </table>
+
+      <h3>laser/ — レーザー（<code>Laser.enabled=True</code> 時のみ）</h3>
+      <table class="quick-facts">
+        <thead><tr><th>データセット</th><th>内容</th></tr></thead>
+        <tbody>
+          <tr><th><code>deposited_power</code></th><td>レーザー沈着パワー密度 [erg/cm³/s]。</td></tr>
+          <tr><th><code>absorption_fraction</code></th><td>全体吸収率。吸収の累積を、吸収・未吸収・<code>E_cbet_iaw</code> の累積の和で割った値で、受け皿がなく捨てられたレーザーエネルギーがなければ吸収 / 入射に等しい。</td></tr>
+          <tr><th><code>E_ra</code>, <code>E_cbet_iaw</code>, <code>E_cbet_iaw_step</code></th><td>スカラー [erg]。共鳴吸収（resonance absorption）で吸収されたレーザーエネルギーの累積、<a href="../../physics/lpi/cbet.html">CBET</a>（cross-beam energy transfer、交差ビームエネルギー転送）がイオン音波（ion-acoustic wave、IAW）へ渡したエネルギーの符号付きの累積とそのステップの値。履歴の <code>energy/laser_ra_deposited</code>・<code>energy/E_cbet_iaw</code>・<code>energy/E_cbet_iaw_step</code> と同じ量である。</td></tr>
+          <tr><th><code>ray_density</code></th><td>光線の初期配置密度 [1/cm³]。</td></tr>
+          <tr><th><code>A_Q_r_shells</code>, <code>A_Q_z_shells</code></th><td>2D の単一ブロックのメッシュのみ（マルチブロックのメッシュには書かない）。セル列（<code>A_Q_r_shells</code> は r 添字を固定した z 方向のセルの列、<code>A_Q_z_shells</code> は z 添字を固定した r 方向のセルの列。データセット名の shells はこの列を指し、カプセルのシェルではない）ごとの沈着非対称度 \((q_{max}-q_{min})/(q_{max}+q_{min})\)。q は各セルにそのステップで沈着したレーザーエネルギー [erg]。</td></tr>
+          <tr><th><code>mesh/</code></th><td><code>ray_output_trajectory=True</code> の非 skip ステップ（= 光線追跡（ray tracing）を実行したステップ。<code>Laser.raytrace_skip</code> の間引き再利用ステップでは出力されない）のみ。レーザー専用の独立格子 LaserMesh（流体メッシュとは別の 2D RZ 構造格子 — <a href="../../physics/laser/index.html">レーザー</a>参照）の節点座標・\(\hat n_e\)（電子密度の臨界密度（critical density）に対する比）・T_e・Z̄・密度勾配・<code>n_crit</code>。</td></tr>
+          <tr><th><code>rays/</code></th><td><code>ray_output_count&gt;0</code> の非 skip ステップのみ。光線の初期位置・方向・パワー（1D: R0/Z0/vR0/vZ0、2D: x0/y0/z0/vx0/vy0/vz0）とビーム ID。</td></tr>
+          <tr><th><code>rays/trajectory/</code></th><td><code>ray_output_trajectory=True</code> 時。CSR 形式の軌跡（offsets・step_count・位置列・残存パワー列）。可視化で光線を重ねて描くときの元データ。</td></tr>
+        </tbody>
+      </table>
+      <p><code>mode="radial_absorption_1d"</code> では物理的な光線の軌跡がないため、<code>deposited_power</code> と <code>absorption_fraction</code> は通常どおり出力されるが <code>rays/</code> 系は空または未作成となる。なお、退役したモンテカルロ輻射（Monte Carlo radiation）の出力（<code>radiation/ddmc_flag</code>・<code>radiation/delta_E_rad_prev</code>・<code>holo/</code>・<code>difference/</code>）は schema 2（2026-09-29）から書かない。それより前のファイルには残っていることがある。</p>
+    </section>
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["\\[", "\\]"]] } };</script>
+  <script defer src="../../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../../nav.js" data-page="outputs-snapshots" data-root="../../"></script>
+</body>
+</html>

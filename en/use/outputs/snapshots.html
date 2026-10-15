@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en" data-lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Snapshots — TENRYU Documentation</title>
+  <link rel="stylesheet" href="../../../style.css">
+  <script src="../../../theme.js"></script>
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>Snapshots <span class="badge">reference</span></h1>
+    <p class="abstract">A snapshot <code>&lt;name&gt;_NNNN.h5</code> is an HDF5 file that holds the spatial fields at one time. This page lists the root attributes and the main datasets of each group (<code>metadata/</code>, <code>mesh/</code>, <code>hydro/</code>, <code>diagnostics/</code>, <code>radiation/</code>, and <code>laser/</code>). File naming and cadence are on the <a href="index.html#files">Outputs &amp; analysis page</a>; the scalar diagnostics in time are on the <a href="history.html">History page</a>. The canonical source including dtypes and array shapes is <code>docs/SPECIFICATION.md</code> §7 in the repository (summarized in <code>docs/OUTPUT_SCHEMA.md</code>).</p>
+
+    <section aria-labelledby="snapshots">
+      <h2 id="snapshots">Snapshot datasets</h2>
+      <p>Root attributes: <code>t</code> (time [s]), <code>dt</code> (Δt [s]), <code>cycle</code> and <code>step</code> (both are the step number), <code>geometry</code> (<code>"1D_SPH"</code>|<code>"2D_RZ"</code>), <code>nr</code> and <code>nz</code> (<code>Mesh.nr</code> and, in 2D, <code>Mesh.nz</code>; <code>nz</code> is 1 in 1D), <code>n_cells</code>, <code>n_nodes</code>, <code>n_groups</code>, <code>n_materials</code>, <code>two_temperature</code> (always 1), <code>schema_version</code>. When a restart is not an exact continuation of the original run (for example, when the checkpoint has no state file for <code>Numerics.ale.band_ale</code>, the file named like the checkpoint with <code>.band-state</code> appended), the run writes a mark to the string root attribute <code>restart_provenance</code> (for example, <code>RESTART_WITHOUT_BAND_STATE</code>). Because <code>geometry</code> reads <code>"1D_SPH"</code> for every 1D geometry, 1D files also carry <code>geometry_1d</code> (<code>"spherical"</code>|<code>"cylindrical"</code>|<code>"planar"</code>). In 1D, arrays are flat and <code>mesh/x_z</code>, <code>v_z</code> are omitted. Group by group ("optional" = written conditionally):</p>
+
+      <h3>metadata/ — provenance</h3>
+      <table class="quick-facts">
+        <thead><tr><th>Dataset</th><th>Content</th></tr></thead>
+        <tbody>
+          <tr><th><code>namelist_source</code></th><td>The executed deck (full Python source).</td></tr>
+          <tr><th><code>frozen_config</code></th><td>Frozen-configuration JSON (for the difference from <code>config/&lt;name&gt;_frozen.json</code>, see the <a href="index.html#provenance">provenance section</a>); attributes <code>build_type</code> (<code>Release</code> or <code>Debug</code>), <code>gpu_name</code> (the name of GPU 0), and <code>rng_seed</code> (the value of <code>Main.seed</code>). <code>git_hash</code> and <code>cuda_arch</code> are always <code>"unknown"</code> and <code>n_ranks</code> is always 1, so none of them identifies a run.</td></tr>
+          <tr><th><code>group_bounds_eV</code></th><td>Radiation energy group edges [eV] (length G+1).</td></tr>
+        </tbody>
+      </table>
+
+      <h3>mesh/ — nodes and connectivity</h3>
+      <table class="quick-facts">
+        <thead><tr><th>Dataset</th><th>Content</th></tr></thead>
+        <tbody>
+          <tr><th><code>x_r</code>, <code>x_z</code></th><td>Node coordinates [cm]; <code>x_z</code> 2D only.</td></tr>
+          <tr><th><code>v_r</code>, <code>v_z</code></th><td>Node velocities [cm/s]; <code>v_z</code> 2D only.</td></tr>
+          <tr><th><code>cell_material_id</code></th><td>Representative material index per cell (largest volume fraction; ties go to the smaller index).</td></tr>
+          <tr><th><code>topology/v2/</code>, <code>v3/</code>, <code>v4/</code></th><td>optional. Multiblock mesh connectivity (mesh topology; v2: 3-block; v3: half-butterfly 5-block — block/seam tables plus CSR (compressed sparse row) connectivity; v4: pentagon-belt <code>cell_nverts</code> with a <code>corner_stride</code> attribute). Omitted for single-block meshes. See <a href="../../physics/mesh/2d.html">2D meshes</a> for the configuration details.</td></tr>
+        </tbody>
+      </table>
+
+      <h3>hydro/ — cell-centered state</h3>
+      <table class="quick-facts">
+        <thead><tr><th>Dataset</th><th>Content</th></tr></thead>
+        <tbody>
+          <tr><th><code>rho</code>, <code>Te</code>, <code>Ti</code></th><td>Density [g/cm³], electron/ion temperatures [eV].</td></tr>
+          <tr><th><code>ee</code>, <code>ei</code></th><td>Electron/ion specific internal energies [erg/g].</td></tr>
+          <tr><th><code>Pe</code>, <code>Pi</code>, <code>Qvisc</code></th><td>Electron/ion pressures and artificial-viscosity pressure [dyne/cm²].</td></tr>
+          <tr><th><code>mass</code>, <code>vol</code></th><td>Cell mass [g] and volume [cm³].</td></tr>
+          <tr><th><code>zbar</code></th><td>Mean ionization.</td></tr>
+          <tr><th><code>volFrac</code></th><td>Material volume fractions [N_cell, N_mat] (multi-material).</td></tr>
+          <tr><th><code>burn_rate</code>, <code>burn_Q_e</code>, <code>burn_Q_i</code>, <code>burn_eps_cum</code>, <code>burn_n_*</code></th><td>optional (nuclear burn on, <code>Burn.enabled=True</code>). Reaction-rate density [1/cm³/s], electron and ion heating rates by the burn products [erg/cm³/s], cumulative specific deposited energy [erg/g], and the D, T, He3, He4, and p number densities [1/cm³]. 1D files also carry <code>burn_neutron_cum</code>, the cumulative number of neutrons born in each cell.</td></tr>
+          <tr><th><code>shock_time</code></th><td>optional. Time of last detected shock [s] (post-shock features active).</td></tr>
+          <tr><th><code>adaptive_av_gate</code>, <code>adaptive_av_mode_cell</code></th><td>optional. The per-cell weight g_i of the adaptive artificial viscosity (AV) (the dataset name says gate; dimensionless), and a visualization mask that is 1 in the cells with g_i &gt; 10<sup>-6</sup> (with <code>Numerics.hydro.adaptive_av.enabled=True</code>; 1D, <code>av_type="vnr"</code> only).</td></tr>
+          <tr><th><code>corner_mass</code></th><td>optional. 2D subzonal corner masses (<a href="../../physics/hydrodynamics/discretization.html#terms-corner">definition</a>) [g] (Lagrangian invariant).</td></tr>
+          <tr><th><code>eta_compatible</code></th><td>optional. Legacy volume-form compatibility mismatch diagnostic [cm³].</td></tr>
+          <tr><th><code>per_material/v1/</code></th><td>optional. Per-material mass <code>mass</code> [g] and electron and ion internal energies <code>Ee</code>, <code>Ei</code> [erg], one value per cell and material (<code>Numerics.materials.per_material_conservation_enabled=True</code>).</td></tr>
+          <tr><th><code>gas_tracer_Y</code></th><td>optional. The hotspot-gas tracer Y_g (<a href="history.html#terms-hotspot">term</a>; dimensionless, per cell), written by a run that initialized the tracer with <code>Numerics.diagnostics.hotspot_gas.enabled=True</code>. A run restarted from a checkpoint reads it back and continues.</td></tr>
+        </tbody>
+      </table>
+
+      <h3>diagnostics/ — snapshot-side physics diagnostics (optional)</h3>
+      <table class="quick-facts">
+        <thead><tr><th>Group</th><th>Trigger and content</th></tr></thead>
+        <tbody>
+          <tr><th><code>areal_density/v1/</code></th><td><code>Diagnostics.areal_density.enabled=True</code>. Angle list <code>angles_deg</code> and areal densities <code>rhoR</code> [g/cm²]; optional <code>rhoR_hotspot_tracer</code> (the integral ∫ρY_g ds of the density times the hotspot-gas tracer Y_g; <a href="history.html#terms-hotspot">term</a>).</td></tr>
+          <tr><th><code>hotspot_gas/v1/</code></th><td><code>Numerics.diagnostics.hotspot_gas.enabled=True</code>. Te/Ti statistics of the hotspot gas (<a href="history.html#terms-hotspot">term</a>; mass-weighted mean/p10/p50/p90; Ti only in two-temperature runs), energies (internal/kinetic/total plus initial values), work proxies, and the definition string <code>hotspot_work_definition</code>.</td></tr>
+        </tbody>
+      </table>
+
+      <h3>radiation/ — radiation field and diagnostics</h3>
+      <table class="quick-facts">
+        <thead><tr><th>Dataset</th><th>Content</th></tr></thead>
+        <tbody>
+          <tr><th><code>energy_density</code></th><td>Group radiation energy density E_g [erg/cm³] ([N_cell, G]).</td></tr>
+          <tr><th><code>rad_dep</code>, <code>rad_emit</code></th><td>Per-step accumulated absorption and emission [erg] (per group).</td></tr>
+          <tr><th><code>deposited_power</code></th><td>Absorbed power density [erg/cm³/s] (= rad_dep/(VΔt); for visualization).</td></tr>
+          <tr><th><code>fleck_factor</code></th><td>2D flux-limited diffusion (FLD) only: per-cell Fleck factor. The diagnostic is meaningful only for gray G=1.</td></tr>
+          <tr><th><code>sn_tau_R</code>, <code>sn_reduced_flux</code>, <code>sn_ap_alpha</code></th><td>2D S<sub>N</sub> (discrete ordinates) only: diagnostics of the asymptotic-preserving (AP) blend of S<sub>N</sub> and diffusion face fluxes (optical-depth, reduced-flux, and blend-weight proxies).</td></tr>
+          <tr><th><code>diag_*</code> (12 kinds)</th><td>1D S<sub>N</sub> output-only diagnostics: <code>diag_rad_</code> followed by <code>E_pre</code>/<wbr><code>E_post</code>/<wbr><code>emission_at_Tn</code>/<wbr><code>emission_at_Tnp1</code>/<wbr><code>absorption</code>, and <code>diag_</code> followed by <code>clip_energy</code>/<wbr><code>clip_full_deficit</code>/<wbr><code>chi_opacity</code>/<wbr><code>F_first_moment</code>/<wbr><code>E_star_flux</code>/<wbr><code>stream_theta</code>/<wbr><code>ap_alpha_face</code>. Never used to restore the state at a restart.</td></tr>
+        </tbody>
+      </table>
+
+      <h3>laser/ — laser (only with <code>Laser.enabled=True</code>)</h3>
+      <table class="quick-facts">
+        <thead><tr><th>Dataset</th><th>Content</th></tr></thead>
+        <tbody>
+          <tr><th><code>deposited_power</code></th><td>Laser deposition power density [erg/cm³/s].</td></tr>
+          <tr><th><code>absorption_fraction</code></th><td>Overall absorption fraction: the cumulative absorbed energy divided by the sum of the cumulative absorbed energy, unabsorbed energy, and <code>E_cbet_iaw</code>; it equals absorbed/incident when no laser energy was dropped for lack of a receiver.</td></tr>
+          <tr><th><code>E_ra</code>, <code>E_cbet_iaw</code>, <code>E_cbet_iaw_step</code></th><td>Scalars [erg]: the cumulative laser energy absorbed by resonance absorption, and the signed cumulative energy that <a href="../../physics/lpi/cbet.html">CBET</a> (cross-beam energy transfer) gave to the ion-acoustic wave (IAW) with its value for this step. The same quantities as the history channels <code>energy/laser_ra_deposited</code>, <code>energy/E_cbet_iaw</code>, and <code>energy/E_cbet_iaw_step</code>.</td></tr>
+          <tr><th><code>ray_density</code></th><td>Initial ray placement density [1/cm³].</td></tr>
+          <tr><th><code>A_Q_r_shells</code>, <code>A_Q_z_shells</code></th><td>2D, single-block meshes only (not written for multiblock meshes): deposition asymmetry \((q_{max}-q_{min})/(q_{max}+q_{min})\) per cell line (<code>A_Q_r_shells</code>: a z-direction column of cells at fixed r index; <code>A_Q_z_shells</code>: an r-direction row of cells at fixed z index; "shells" in the dataset names means these lines, not the shell of the capsule). q is the laser energy [erg] deposited in each cell during that step.</td></tr>
+          <tr><th><code>mesh/</code></th><td>Only on non-skip steps (= steps that executed the ray tracing; not written on the thinned reuse steps of <code>Laser.raytrace_skip</code>) with <code>ray_output_trajectory=True</code>: node coordinates of the LaserMesh (the laser-dedicated independent grid — a 2D RZ structured grid separate from the hydro mesh; see <a href="../../physics/laser/index.html">Laser</a>), \(\hat n_e\) (electron density over the critical density), T_e, Z̄, density gradients, <code>n_crit</code>.</td></tr>
+          <tr><th><code>rays/</code></th><td>Only on non-skip steps with <code>ray_output_count&gt;0</code>: initial ray positions/directions/powers (1D: R0/Z0/vR0/vZ0; 2D: x0/y0/z0/vx0/vy0/vz0) and beam IDs.</td></tr>
+          <tr><th><code>rays/trajectory/</code></th><td>With <code>ray_output_trajectory=True</code>: CSR-format trajectories (offsets, step counts, position columns, residual power) — the source data for ray overlays.</td></tr>
+        </tbody>
+      </table>
+      <p>Under <code>mode="radial_absorption_1d"</code> there are no physical ray trajectories: <code>deposited_power</code> and <code>absorption_fraction</code> are written as usual but the <code>rays/</code> family is empty or absent. The outputs of the retired Monte Carlo radiation (<code>radiation/ddmc_flag</code>, <code>radiation/delta_E_rad_prev</code>, <code>holo/</code>, <code>difference/</code>) are no longer written from schema 2 (2026-09-29); files written before may still hold them.</p>
+    </section>
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["\\[", "\\]"]] } };</script>
+  <script defer src="../../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../../nav.js" data-page="outputs-snapshots" data-root="../../"></script>
+</body>
+</html>

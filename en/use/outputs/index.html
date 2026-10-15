@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en" data-lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Outputs &amp; analysis — TENRYU Documentation</title>
+  <link rel="stylesheet" href="../../../style.css">
+  <script src="../../../theme.js"></script>
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>Outputs &amp; analysis <span class="badge">reference</span></h1>
+    <p class="abstract">One TENRYU run produces three kinds of HDF5 — snapshots (spatial fields), a history (scalar time series), and checkpoints (for restart) — plus <a href="#terms-provenance">provenance</a> files (the <a href="../running.html#terms-freeze">frozen configuration</a>, run info, logs). This page gives the overview of the outputs: file kinds, naming, cadence, and the layout of the output directory; the provenance files; and how to read the data (CLI, bundled tools, Scope). The contents of the three HDF5 kinds are listed on the pages <a href="snapshots.html">Snapshots</a>, <a href="history.html">History</a>, and <a href="checkpoints.html">Checkpoints and restart</a>. The canonical source including dtypes and array shapes is <code>docs/SPECIFICATION.md</code> §7 in the repository (summarized in <code>docs/OUTPUT_SCHEMA.md</code>). The terms of provenance used on this page are defined in the <a href="#terms">terms section</a>.</p>
+
+    <aside class="planned" aria-labelledby="at-a-glance">
+      <h3 id="at-a-glance">At a glance</h3>
+      <ul>
+        <li>Three HDF5 kinds: snapshots <code>&lt;name&gt;_NNNN.h5</code>, the history <code>&lt;name&gt;_history.h5</code> (append-only), and checkpoints <code>&lt;name&gt;_ckpt_NNNN.h5</code>. Cadence fires on step-based (<code>plot_every</code> …) OR seconds-based (<code>plot_every_s</code> …) triggers.</li>
+        <li>Every numeric dataset carries a <code>units</code> attribute. <code>mesh/</code> and <code>hydro/</code> dataset names map 1:1 to the internal State field names.</li>
+        <li>Stagnation peaks are short — about 15 ps in a <a href="../../verification/index.html#gxii">GXII (GEKKO XII)</a>-class laser implosion run of 2026-07-31 — so peak values are read from the per-step history (<code>implosion/*</code>), not from snapshots.</li>
+        <li>Re-running into the same output directory does not overwrite: results go to a numbered sibling like <code>_001</code>. If "nothing changed", check the output location first.</li>
+      </ul>
+    </aside>
+
+    <div class="card-grid">
+      <a class="card" href="snapshots.html"><h3>Snapshots</h3><p>The root attributes and the datasets of the metadata, mesh, hydro, diagnostics, radiation, and laser groups.</p></a>
+      <a class="card" href="history.html"><h3>History</h3><p>The channels of energy, the physics summary, laser, radiation, and more, and the terms of the energy ledger, the shell, and the hotspot gas.</p></a>
+      <a class="card" href="checkpoints.html"><h3>Checkpoints and restart</h3><p>The groups added for restart and the restart compatibility rules by schema_version and the frozen configuration.</p></a>
+    </div>
+
+    <section aria-labelledby="files">
+      <h2 id="files">Files, naming, cadence</h2>
+      <table class="quick-facts">
+        <thead><tr><th>File</th><th>Naming</th><th>Cadence</th><th>Purpose</th></tr></thead>
+        <tbody>
+          <tr><th>Snapshot</th><td><code>&lt;name&gt;_NNNN.h5</code> (4-digit zero-padded sequence number)</td><td>every <code>plot_every</code> steps <em>or</em> every <code>plot_every_s</code> seconds (OR logic)</td><td>Field visualization and post-processing. Physical time in root attribute <code>t</code>, step number in <code>step</code> (the same value is also written as <code>cycle</code>).</td></tr>
+          <tr><th>History</th><td><code>&lt;name&gt;_history.h5</code></td><td><code>history_every</code> / <code>history_every_s</code> (OR, appended)</td><td>Scalar diagnostics time series; extensible datasets appended each output.</td></tr>
+          <tr><th>Checkpoint</th><td><code>&lt;name&gt;_ckpt_NNNN.h5</code> (4-digit zero-padded sequence number)</td><td><code>checkpoint_every</code> / <code>checkpoint_every_s</code> (OR)</td><td>Used to restart a run. Only <code>checkpoint_keep_last</code> files are kept; older ones are deleted automatically.</td></tr>
+        </tbody>
+      </table>
+      <p><code>&lt;name&gt;</code> is <code>Main.name</code>, falling back to the file name of the deck (<a href="../namelist.html#terms-deck">definition</a>) without its extension. In MPI (message passing interface) runs, rank 0 (MPI process number 0) writes the snapshots, the history, and the checkpoints; no per-rank files are written. The directory layout:</p>
+      <pre><code>outputs/&lt;name&gt;/
+├── results/                  ← snapshots and history
+│   ├── &lt;name&gt;_0000.h5
+│   ├── &lt;name&gt;_0001.h5
+│   └── &lt;name&gt;_history.h5
+├── config/                   ← provenance (frozen configuration, deck copy)
+│   ├── &lt;name&gt;_frozen.json
+│   └── &lt;name&gt;_namelist.py
+├── checkpoints/              ← for restart
+│   └── &lt;name&gt;_ckpt_0000.h5
+├── log/                      ← run logs (tenryu.log)
+├── run_info.json             ← run summary (termination state etc.)
+└── mesh_requirement.json     ← verdict on the initial-mesh resolution requirement (fresh 1D runs only)</code></pre>
+      <p>The number in the names of the snapshot and checkpoint files counts the files written to that output directory in order, starting from 0; it is not the step number. For example, the first checkpoint of a run that writes a checkpoint every 100 steps is <code>&lt;name&gt;_ckpt_0000.h5</code>. The step number is in the root attribute <code>step</code> (the same value is also written as <code>cycle</code>). When a run is stopped by placing a file named <code>stop_request</code> in the output directory, the checkpoint goes to <code>checkpoints/</code> as <code>event_stop_&lt;step number&gt;.h5</code>, named by the step number instead of a sequence number; <code>checkpoint_keep_last</code> does not delete it.</p>
+      <p><code>mesh_requirement.json</code> is written by fresh 1D runs only. It records the estimate and the verdict of whether the initial mesh meets the resolution that the physics requires. When the requirement does not apply (for example, the laser is disabled), <code>applicable</code> is false and <code>reason</code> gives the reason.</p>
+      <p>If the output directory already exists and collides, nothing is overwritten: results are written to a 3-digit numbered sibling such as <code>outputs/&lt;name&gt;_001/</code>. To redirect output without editing the deck, use <code>tenryu run &lt;deck&gt; --output-dir &lt;dir&gt;</code> (new runs only; combining with a restart is a <code>ConfigError</code>).</p>
+    </section>
+
+    <section aria-labelledby="terms">
+      <h2 id="terms">Terms used in this page</h2>
+<p>The terms of provenance used on this page are defined below: provenance and the frozen configuration. The artificial terms of the energy ledger, the shell radius, thickness, IFAR, and convergence ratio, and the hotspot gas are defined in the <a href="history.html#terms">terms section of the History page</a>.</p>
+
+      <h3 id="terms-provenance">Provenance and the frozen configuration</h3>
+      <p><strong>Provenance</strong> is the record that lets you check later which input and which execution environment produced an output. TENRYU keeps as provenance the copy of the deck <code>config/&lt;name&gt;_namelist.py</code> (<code>Output.save_namelist_copy</code>, default True), the frozen-configuration JSON <code>config/&lt;name&gt;_frozen.json</code> (<code>Output.save_frozen_config</code>, default True), the run summary <code>run_info.json</code>, the run log <code>log/tenryu.log</code>, and the <code>metadata/</code> group of each HDF5 file (the full deck text <code>namelist_source</code>, the frozen configuration <code>frozen_config</code>, the radiation group edges <code>group_bounds_eV</code>, and so on). It is the primary audit of what the run actually received, not of what you think you typed. The <a href="#provenance">provenance section</a> describes each file. When a restart is not an exact continuation of the original run, the root attribute <code>restart_provenance</code> records the mark so that the output of the restarted run can be told from that of a continued run. The group <code>diagnostics/ale_provenance/v1/</code>, whose name also contains "provenance", is a different record: it states whether the ALE settings followed the standard profile (see the tables on the <a href="history.html">History page</a>).</p>
+      <p>The <strong>frozen configuration</strong> is the configuration fixed at initialization, after Python functions are tabulated and defaults are filled in. It is defined on the <a href="../running.html#terms-freeze">running page</a>. The provenance keeps it in two forms: <code>config/&lt;name&gt;_frozen.json</code>, which holds the whole resolved configuration and a summary of the runtime values, and the HDF5 dataset <code>metadata/frozen_config</code>, which is used to check a restart. The HDF5 attribute <code>git_hash</code> is always <code>"unknown"</code>, so the commit that was run cannot be read from the HDF5 file. <code>_tenryu_version</code> in <code>config/&lt;name&gt;_frozen.json</code> is the number of the released version.</p>
+    </section>
+
+    <section aria-labelledby="provenance">
+      <h2 id="provenance">Provenance: frozen-configuration JSON, run_info, logs</h2>
+      <p><code>config/&lt;name&gt;_frozen.json</code> is a JSON of the fully resolved configuration (the sections <code>main</code>, <code>mesh</code>, <code>materials</code>, <code>laser</code>, <code>numerics</code>, and so on, in which a Python function is recorded by its <code>name</code>, <code>repr</code>, and <code>source_hash</code>, the hash of its source code), plus the TENRYU version <code>_tenryu_version</code>, the UTC time of the freeze <code>_frozen_at</code>, the hash of the deck text <code>_namelist_source_hash</code>, and <code>frozen_summary</code>. <code>frozen_summary</code> holds the initial density (minimum, maximum, and mean), electron and ion temperatures (minimum and maximum), the volume of each material, and, for each function frozen into a table at initialization, the time range (<code>t_min</code> and <code>t_max</code>), the point count <code>n_points</code>, the peak <code>peak_value</code>, and the integral <code>integrated_value</code>. The HDF5 dataset <code>metadata/frozen_config</code> is the same configuration without <code>_tenryu_version</code>, <code>_frozen_at</code>, and <code>frozen_summary</code>. A value overridden by <code>--output-dir</code> (a fresh run) or <code>--t-end</code> and <code>--max-steps</code> (a restart) enters <code>config/&lt;name&gt;_frozen.json</code> as the value actually used, while <code>metadata/frozen_config</code> keeps the value of the deck. It is the primary audit of what the run actually received (rather than what you think you typed); keep it with the deck for reproduction and comparison. <code>run_info.json</code> summarizes the run and <code>log/</code> holds the run logs. When you doubt that a setting took effect, read the frozen-configuration JSON first, then the warnings in the log.</p>
+    </section>
+
+    <section aria-labelledby="analysis-tools">
+      <h2 id="analysis-tools">Reading the data: CLI, bundled tools, Scope</h2>
+      <p>Structure inspection needs only the standard HDF5 tools:</p>
+      <pre><code>h5ls  outputs/&lt;name&gt;/results/&lt;name&gt;_0010.h5          # group listing
+h5dump -H outputs/&lt;name&gt;/results/&lt;name&gt;_history.h5  # header structure</code></pre>
+      <p>The fastest plots come from the bundled <code>tenryu_plot</code> (<code>tools/</code>), with subcommands including <code>profile</code> (spatial profiles), <code>history</code> (time series), <code>spacetime</code>, <code>summary</code>, <code>compare</code>, and <code>spectrum</code>:</p>
+      <pre><code>python3 -m tools.tenryu_plot --help                  # list
+python3 -m tools.tenryu_plot profile outputs/&lt;name&gt;  # spatial profiles
+python3 -m tools.tenryu_plot history outputs/&lt;name&gt;  # time series</code></pre>
+      <p>For direct reading, h5py is shortest. Every numeric dataset has a <code>units</code> attribute, and array lengths follow the field layout (cells, nodes, cells×materials, cells×radiation groups) — read root attributes, shapes, and units together:</p>
+      <pre><code>import h5py
+f = h5py.File("outputs/&lt;name&gt;/results/&lt;name&gt;_0010.h5")
+Te = f["hydro/Te"][:]; r = f["mesh/x_r"][:]
+print(f["hydro/Te"].attrs["units"])   # -&gt; "eV"</code></pre>
+      <p>For interactive exploration and run-to-run comparison, use TENRYU Scope (see <a href="../../overview/architecture.html">Architecture</a>). Find the interesting times and quantities in the viewer, then make the final figures from the frozen configuration and explicit script arguments to combine interactivity with reproducibility.</p>
+    </section>
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["\\[", "\\]"]] } };</script>
+  <script defer src="../../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../../nav.js" data-page="outputs" data-root="../../"></script>
+</body>
+</html>
