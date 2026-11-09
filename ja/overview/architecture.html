@@ -35,7 +35,7 @@
 
       <figure id="fig-architecture-flow">
         <img src="../../assets/overview-architecture-flow-ja.png" width="1040" height="670" style="max-width:100%;height:auto" alt="上段は初期化。TENRYU Studio が作るデッキ（Python ファイル）を凍結して Config と凍結した表にし、State を作る。下段は時間ループ。Δt の候補の最小と成長率の制限で Δt を選び、入口の状態を保存して、レーザー、核燃焼、流体（前半の半ステップ）、電子熱伝導、輻射、流体（後半の半ステップ）を順に実行する。受理なら HDF5 のスナップショット・履歴・チェックポイントを書き、棄却なら入口の状態へ戻して Δt を縮め、演算子の列全体をやり直す">
-        <figcaption>図A. 入力と実行状態の境界と、1 ステップの流れ。上段（初期化）でだけ Python を実行し、デッキを Config と凍結した表へ凍結する。下段（時間ループ）は Python を呼ばない。青の箱は演算子の列で、駆動のコード（<code>src/coupling/driver.cpp</code>）の呼び出しの順（レーザー、核燃焼、流体の前半、電子熱伝導、輻射、流体の後半）をそのまま描いた。赤の矢印と赤の箱は棄却したときの再試行、緑の箱と矢印は受理したあとにだけ書く出力である。</figcaption>
+        <figcaption>図A. 入力と実行状態の境界と、1 ステップの流れ。上段（初期化）でだけ Python を実行し、デッキを Config と凍結した表へ凍結する。下段（時間ループ）は Python を呼ばない。青の箱は演算子の列で、駆動のコード（<code>src/coupling/driver.cpp</code>）の呼び出しの順（レーザー、核燃焼、流体の前半、電子熱伝導、輻射、流体の後半）をそのまま描いた。橙の矢印と橙の箱は棄却したときの再試行、緑の箱と矢印は受理したあとにだけ書く出力である。</figcaption>
       </figure>
     </section>
 

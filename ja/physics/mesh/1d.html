@@ -75,8 +75,8 @@
       <p>原点から始まる区間で、2 つの写像が作るセルの幅と質量を<a href="#fig-weight-mapping">図A</a>(b)(c) に比べる。どちらの写像でも、区間の境界の幅の補正（<a href="#terms-segment">区間と傾斜配置</a>）が最後に掛かる。<code>exact_measure_v2</code> でも、複数の区間をもつデッキでは境界の近くで、質量が重みに比例する関係が少し崩れる。</p>
 
       <figure id="fig-weight-mapping">
-        <img src="../../../assets/mesh-1d-weight-mapping-ja.png" width="940" height="320" style="max-width:100%;height:auto" alt="左：区間内の規格化した位置に対する重みの曲線。中央で 1、端で 0.114 になり、下限を点線で、σ の位置の重み 0.431 を四角で示す。中・右：原点から始まる区間で 2 つの写像が作るセルの幅（対数軸）と質量の割合。橙の丸の legacy_estimated_radius は内側のセルの質量が重みに比例する値より小さく、青の四角の exact_measure_v2 は質量が重みの割合の点線に重なる">
-        <figcaption>図A. 重みと 2 つの写像（既定の \(\epsilon_{\rm edge}=0.1\)、\(\sigma_{\rm sg}=0.7\)、\(m_{\rm sg}=4\)）。(a) 区間内の規格化した位置 \(\xi\) に対する重み \(w\)。曲線は式の連続な値、白丸は \(n=32\) のセル中心、四角は \(|2\xi-1|=\sigma_{\rm sg}\) の位置（\(w=0.431\)）、ひし形は端（\(w=0.114\)）、点線は下限 \(\epsilon_{\rm edge}\) である。(b)(c) 原点から始まる区間（0〜1、\(n=32\)、球の測度、密度一定）で 2 つの写像が作るセルの幅 \(\Delta r_k\)（区間の長さ \(\ell\) で規格化、縦軸は対数）と質量の割合 \(m_k/\sum m\)。橙の丸は既定の <code>legacy_estimated_radius</code>、青の四角は <code>exact_measure_v2</code>、(b) の点線は等しい幅、(c) の点線は重みの割合 \(w_k/\sum w\) である。<code>exact_measure_v2</code> の質量は点線に重なる。<code>legacy_estimated_radius</code> の最も内側のセルの質量は、重みに比例する値の約 0.5 % しかない。薄い殻（0.023〜0.025 cm、\(n=60\)）では <code>legacy_estimated_radius</code> の質量と重みの比がセルの間で 4 % 以内（計算値 0.981〜1.017）にそろうので、図には描いていない。計算は、<code>build_graded_nodes</code> の式を 1 つの区間（隣の区間なし）に適用した。</figcaption>
+        <img src="../../../assets/mesh-1d-weight-mapping-ja.png" width="940" height="320" style="max-width:100%;height:auto" alt="左：区間内の規格化した位置に対する重みの曲線。中央で 1、端で 0.114 になり、下限を点線で、σ の位置の重み 0.431 を四角で示す。中・右：原点から始まる区間で 2 つの写像が作るセルの幅（対数軸）と質量の割合。朱の丸の legacy_estimated_radius は内側のセルの質量が重みに比例する値より小さく、青の四角の exact_measure_v2 は質量が重みの割合の点線に重なる">
+        <figcaption>図A. 重みと 2 つの写像（既定の \(\epsilon_{\rm edge}=0.1\)、\(\sigma_{\rm sg}=0.7\)、\(m_{\rm sg}=4\)）。(a) 区間内の規格化した位置 \(\xi\) に対する重み \(w\)。曲線は式の連続な値、白丸は \(n=32\) のセル中心、四角は \(|2\xi-1|=\sigma_{\rm sg}\) の位置（\(w=0.431\)）、ひし形は端（\(w=0.114\)）、点線は下限 \(\epsilon_{\rm edge}\) である。(b)(c) 原点から始まる区間（0〜1、\(n=32\)、球の測度、密度一定）で 2 つの写像が作るセルの幅 \(\Delta r_k\)（区間の長さ \(\ell\) で規格化、縦軸は対数）と質量の割合 \(m_k/\sum m\)。朱の丸は既定の <code>legacy_estimated_radius</code>、青の四角は <code>exact_measure_v2</code>、(b) の点線は等しい幅、(c) の点線は重みの割合 \(w_k/\sum w\) である。<code>exact_measure_v2</code> の質量は点線に重なる。<code>legacy_estimated_radius</code> の最も内側のセルの質量は、重みに比例する値の約 0.5 % しかない。薄い殻（0.023〜0.025 cm、\(n=60\)）では <code>legacy_estimated_radius</code> の質量と重みの比がセルの間で 4 % 以内（計算値 0.981〜1.017）にそろうので、図には描いていない。計算は、<code>build_graded_nodes</code> の式を 1 つの区間（隣の区間なし）に適用した。</figcaption>
       </figure>
 
       <h3 id="terms-region">領域と体積分率</h3>
@@ -133,7 +133,7 @@
 
       <figure id="fig-regions-corona">
         <img src="../../../assets/mesh-1d-regions-corona-ja.png" width="940" height="440" style="max-width:100%;height:auto" alt="GXII の回帰デッキの標的の材料の領域（DT ガス、CH シェル、CH のコロナ層、ボイド）と、対数軸の密度分布。指数関数のコロナ層は直線で、CH の臨界密度を横切り、ボイドの境界まで床密度より上にある">
-        <figcaption>図B. GXII の回帰デッキの標的。上の帯は材料の領域（各領域で体積分率は 1）、下は密度の分布（縦軸は対数）である。コロナ層の密度は直線で下がり、CH の臨界密度（赤の破線）を横切って、ボイドの境界まで床密度（点線）より上にある。床密度は平坦部を作るための値ではなく、層の密度の下限である。横軸は 200 µm と 222 µm の間を省略した。</figcaption>
+        <figcaption>図B. GXII の回帰デッキの標的。上の帯は材料の領域（各領域で体積分率は 1）、下は密度の分布（縦軸は対数）である。コロナ層の密度は直線で下がり、CH の臨界密度（橙の破線）を横切って、ボイドの境界まで床密度（点線）より上にある。床密度は平坦部を作るための値ではなく、層の密度の下限である。横軸は 200 µm と 222 µm の間を省略した。</figcaption>
       </figure>
     </section>
 

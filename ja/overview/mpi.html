@@ -52,7 +52,7 @@
       <p>実装では、所有セルのウィンドウを <code>State::owned_cell_window(n)</code>、所有節点のウィンドウを <code>State::owned_node_window(n)</code>、所有セルの両端を隣接ランクのある側へ広げたウィンドウを <code>State::owned_cell_window_ghost(n, stride)</code> が返す。呼び出し箇所では、これらを受ける局所変数を <code>cw</code>、<code>nw</code>、<code>pw</code>、<code>fw</code> と書く（<code>pw</code> と <code>fw</code> は、流体と ALE（arbitrary Lagrangian–Eulerian、任意ラグランジュ・オイラー法）の実装で <code>owned_cell_window_ghost</code> の結果を受ける変数名である）。広げる幅は、隣接ランクがある側だけに、1D ではセル 1 個、2D では r 方向の 1 行（\(n_z\) 個のセル）である。各ウィンドウの用途は<a href="#owned-window">所有ウィンドウによる分割の節</a>の表にある。</p>
 
       <h3 id="terms-ghost">ゴースト領域とゴースト幅</h3>
-      <p><strong>ゴースト領域（ghost region）</strong>は、所有ウィンドウのすぐ外側にある、隣接ランクが所有する値の複製である。別の局所配列ではなく、大域の添字位置にそのまま置く（<a href="#fig-mpi-owned-window">図A</a>の黄色のセル）。実装と namelist のキーでは halo という名前も使う（<code>halo_exchange</code>、<code>Parallel.halo</code>）。</p>
+      <p><strong>ゴースト領域（ghost region）</strong>は、所有ウィンドウのすぐ外側にある、隣接ランクが所有する値の複製である。別の局所配列ではなく、大域の添字位置にそのまま置く（<a href="#fig-mpi-owned-window">図A</a>の朱と薄い黄のセル）。実装と namelist のキーでは halo という名前も使う（<code>halo_exchange</code>、<code>Parallel.halo</code>）。</p>
       <p><strong>ゴースト幅（ghost width）</strong>は、所有ウィンドウの外側に持つ層の数である。1D ではセル 2 個、2D では r 方向の 2 行で、実装ではランク数が 2 以上のとき <code>PartitionInfo::ghost_layers</code> が 2 に固定され、1 ランクでは 0 である。リポジトリの <code>docs/NUMERICS.md</code> §12.2.1 はこの幅を \(n_{ghost}\) と書くが、コードに同名の識別子はない。namelist のキー <code>Parallel.halo.ghost_layers</code>（既定 1）は読み込まれて 1 以上かどうかを検査されるが、幅の決定には使われない。</p>
       <p>幅 2 は、所有ウィンドウの端のセルの更新が読む最も遠い位置で決まる（<a href="#mechanism">設計原理</a>）。ゴースト領域は、所有ランクが書いたあと最初にゴーストを読む処理の前に、交換して更新する（<a href="#halo-exchange">ゴースト領域の交換</a>）。幅が 2 層より小さいと、最も広いステンシルが所有ウィンドウの外の古い値を読む。</p>
 
@@ -100,8 +100,8 @@
       </table>
 
       <figure id="fig-mpi-owned-window">
-        <img src="../../assets/mpi-owned-window-decomposition-ja.png" width="960" height="530" style="max-width:100%;height:auto" alt="3 つの MPI ランクが同じ 12 セルの大域配列をもち、各ランクの所有ウィンドウ（青）、2 層のゴースト領域（濃い黄と薄い黄）、遠方の領域（灰色の斜線）に分かれる。矢印は所有ランクからゴースト領域への複製を表す。ランク 1 の下の 3 つの括弧は、所有ウィンドウにゴースト領域を加えた範囲 [2, 10)、pw / fw の範囲 [3, 9)、cw の範囲 [4, 8) を示し、pw / fw はゴースト領域のうち隣り合う 1 層だけを含む">
-        <figcaption>図A. 大域の添字空間と、ランク 1 のウィンドウの範囲（1D_SPH の模式図。12 セルを 3 ランクが 4 セルずつ所有する）。青が所有ウィンドウ、黄がゴースト領域（幅 2。濃い黄が所有ウィンドウに隣り合う層、薄い黄がその外側の層）、灰色の斜線が遠方の領域である。矢印は、所有ランクの値を隣接ランクのゴースト領域へ複製する交換を表す。括弧はランク 1 の範囲を表し、上から、所有ウィンドウにゴースト領域を加えた範囲 [2, 10)（メッシュの妥当性の検査が調べる範囲）、<code>pw</code> と <code>fw</code> の範囲 [3, 9)、<code>cw</code> の範囲 [4, 8) である。<code>pw</code> と <code>fw</code> が含むゴースト領域は隣り合う層だけで、外側の層（セル 2 と 9）は含まない。隣接ランクのない側は広げないので、ランク 0 の <code>pw</code> と <code>fw</code> は [0, 5)、ランク 2 は [7, 12) である。2D_RZ の r スラブでは、1 マスが r 方向の 1 行（\(n_z\) 個のセル）に当たる。所有セル数 4 は実装が許す最小値（ゴースト幅の 2 倍）で、既定の <code>Parallel.decomposition.min_cells_per_rank</code>（8）では 12 セルを 3 ランクに分けられない（この配置を走らせるには 4 以下に指定する）。</figcaption>
+        <img src="../../assets/mpi-owned-window-decomposition-ja.png" width="960" height="530" style="max-width:100%;height:auto" alt="3 つの MPI ランクが同じ 12 セルの大域配列をもち、各ランクの所有ウィンドウ（青）、2 層のゴースト領域（朱と薄い黄）、遠方の領域（灰色の斜線）に分かれる。矢印は所有ランクからゴースト領域への複製を表す。ランク 1 の下の 3 つの括弧は、所有ウィンドウにゴースト領域を加えた範囲 [2, 10)、pw / fw の範囲 [3, 9)、cw の範囲 [4, 8) を示し、pw / fw はゴースト領域のうち隣り合う 1 層だけを含む">
+        <figcaption>図A. 大域の添字空間と、ランク 1 のウィンドウの範囲（1D_SPH の模式図。12 セルを 3 ランクが 4 セルずつ所有する）。青が所有ウィンドウ、朱と薄い黄がゴースト領域（幅 2。朱が所有ウィンドウに隣り合う層、薄い黄がその外側の層）、灰色の斜線が遠方の領域である。矢印は、所有ランクの値を隣接ランクのゴースト領域へ複製する交換を表す。括弧はランク 1 の範囲を表し、上から、所有ウィンドウにゴースト領域を加えた範囲 [2, 10)（メッシュの妥当性の検査が調べる範囲）、<code>pw</code> と <code>fw</code> の範囲 [3, 9)、<code>cw</code> の範囲 [4, 8) である。<code>pw</code> と <code>fw</code> が含むゴースト領域は隣り合う層だけで、外側の層（セル 2 と 9）は含まない。隣接ランクのない側は広げないので、ランク 0 の <code>pw</code> と <code>fw</code> は [0, 5)、ランク 2 は [7, 12) である。2D_RZ の r スラブでは、1 マスが r 方向の 1 行（\(n_z\) 個のセル）に当たる。所有セル数 4 は実装が許す最小値（ゴースト幅の 2 倍）で、既定の <code>Parallel.decomposition.min_cells_per_rank</code>（8）では 12 セルを 3 ランクに分けられない（この配置を走らせるには 4 以下に指定する）。</figcaption>
       </figure>
     </section>
 
